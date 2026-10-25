@@ -1,0 +1,161 @@
+;; verify-kotoba-golden.cljk -- the typed encoder COMPILED BY KOTOBA against
+;; the golden corpus (adr-2609242330 S1c).
+;;
+;; verify-pure-leaves.cljk evaluates the Kotoba reading of cbor.core on nbb
+;; with emulated builtins. This goes one step further: every golden value the
+;; typed API can express is written as a Kotoba expression over the typed
+;; functions (a map as encode-map of map-entry, an array as encode-array of
+;; array-item, ...), the expressions are linked with cbor.core by amu's own
+;; project linker, analyzed by kotoba-sema, lowered to KIR by osaho and RUN
+;; on the KIR reference interpreter. The bytes each one returns must be the
+;; golden bytes (test/cbor/golden.edn, written by the pre-S1 host encoder).
+;;
+
+;;   node --stack-size=65500 <amu>/node_modules/nbb/cli.js \
+;;     --classpath "src:test:scripts:<amu>/src:<amu>/resources:<amu's locked classpath>" \
+;;     scripts/verify-kotoba-golden.cljk <kotoba-lang>/lang/compat
+;;
+;; A value is SKIPPED, by named reason, when the typed API cannot say it:
+;; an integer outside i64, a map key that is not a string, a string holding
+;; a lone surrogate or a character this script does not escape, a byte
+;; string above the 128-item vector literal bound. The skip counts are
+;; printed: a run that compared nothing is exit 2, not agreement.
+;;
+;; Exit 0 = every compared value matched; 1 = at least one differed or
+;; trapped; 2 = nothing was compared.
+
+(ns verify-kotoba-golden
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [cbor.core :as cbor]
+            [cbor.golden-values :as g]
+            [kotoba.compiler.project :as project]
+            [kotoba.compiler.project-files :as project-files]
+            [kotoba.sema :as sema]
+            [kotoba.kir :as ir]))
+
+(def ^:private i64-max (js/BigInt "9223372036854775807"))
+(def ^:private i64-min (js/BigInt "-9223372036854775808"))
+
+(defn- skip! [reason] (throw (ex-info "skip" {::skip reason})))
+
+(defn- f64-bits [x]
+  (let [v (js/DataView. (js/ArrayBuffer. 8))]
+    (.setFloat64 v 0 x false)
+    (str (.getBigInt64 v 0 false))))
+
+(defn- text-literal [s]
+  (let [cps (js/Array.from s)]
+    (when (some (fn [c] (let [n (.codePointAt c 0)]
+                          (or (< n 0x20) (= n 0x7f) (<= 0xD800 n 0xDFFF))))
+                cps)
+      (skip! :text-control-or-surrogate))
+    (when (> (.-length (.encode (js/TextEncoder.) s)) 65536) (skip! :text-above-literal-bound))
+    (str "\"" (-> s (.replaceAll "\\" "\\\\") (.replaceAll "\"" "\\\"")) "\"")))
+
+(defn- host-bytes? [x] (or (instance? js/Uint8Array x) (instance? js/Int8Array x)))
+
+(declare expr)
+
+(defn- entries-expr [pairs]
+  (reduce (fn [acc [k v]]
+            (let [k (cond (string? k) k (keyword? k) (name k) :else (skip! :non-string-map-key))]
+              (str "(cbor/map-entry " acc " " (text-literal k) " " (expr v) ")")))
+          "(cbor/map-entries)" pairs))
+
+(defn- expr [x]
+  (cond
+    (nil? x) "(cbor/encode-null)"
+    (true? x) "(cbor/encode-bool true)"
+    (false? x) "(cbor/encode-bool false)"
+    (integer? x) (let [b (js/BigInt x)]
+                   (when (or (> b i64-max) (< b i64-min)) (skip! :integer-outside-i64))
+                   ;; the golden bytes of an integer the host holds only as
+                   ;; a double were computed in doubles: -2^63 was written
+                   ;; with the argument -1 - n rounded to 2^63 (3b 80 00..),
+                   ;; where the i64 answer is 2^63 - 1 (3b 7f ff..)
+                   (when (> (js/Math.abs x) 9007199254740992) (skip! :integer-beyond-double-exact))
+                   (str "(cbor/encode-int " b ")"))
+    (number? x) (str "(cbor/encode-f64 (f64-from-bits " (f64-bits x) "))")
+    (string? x) (str "(cbor/encode-text " (text-literal x) ")")
+    (keyword? x) (str "(cbor/encode-text " (text-literal (name x)) ")")
+    (host-bytes? x) (let [v (mapv #(bit-and % 0xff) (array-seq x))]
+                      (when (> (count v) 128) (skip! :bytes-above-literal-bound))
+                      (str "(cbor/encode-bytes [" (apply str (interpose " " v)) "])"))
+    (cbor/tagged? x) (let [n (cbor/tag-number x)]
+                       (when-not (and (integer? n) (<= 0 n) (<= (js/BigInt n) i64-max)) (skip! :tag-outside-i64))
+                       (str "(cbor/encode-tag " (js/BigInt n) " " (expr (cbor/tag-value x)) ")"))
+    (instance? cbor/OrderedMap x) (str "(cbor/encode-map-ordered " (entries-expr (:pairs x)) ")")
+    (map? x) (str "(cbor/encode-map " (entries-expr (seq x)) ")")
+    (sequential? x) (str "(cbor/encode-array "
+                         (reduce (fn [acc v] (str "(cbor/array-item " acc " " (expr v) ")")) "(cbor/array-items)" x)
+                         ")")
+    :else (skip! :unsupported-host-type)))
+
+(def ^:private frames
+  "The interpreter's call-depth budget for one value. Its default (32) is
+  sized for the host stack of an arbitrary program; a `loop` over a long
+  string or byte string here is deeper, and this runs on --stack-size=65500.
+  A value that still runs out traps by name and is counted as trapped."
+  100000)
+(def ^:private fuel 9007199254740991)
+
+(def ^:private max-depth
+  "Parenthesis depth above which a value is skipped (:expression-too-deep):
+  an N-item array is an N-deep chain of array-item calls here, and the
+  frontend's desugaring recursion runs out of host stack on a deep one --
+  a bound of this harness's spelling, not of the encoder."
+  96)
+
+(defn- depth [s]
+  (first (reduce (fn [[mx d] c] (case c "(" [(max mx (inc d)) (inc d)] ")" [mx (dec d)] [mx d]))
+                 [0 0] (js/Array.from s))))
+
+(defn- hex [ints] (apply str (map #(let [h (.toString % 16)] (if (= 1 (count h)) (str "0" h) h)) ints)))
+
+(let [compat (first *command-line-args*)
+      values (g/corpus)
+      want (edn/read-string (str (fs/readFileSync "test/cbor/golden.edn" "utf8")))
+      _ (when-not (= (count values) (count want)) (println "corpus/golden length differ") (js/process.exit 2))
+      planned (map-indexed (fn [i v]
+                             (try (let [e (expr v)]
+                                    (when (> (depth e) max-depth) (skip! :expression-too-deep))
+                                    {:i i :expr e})
+                                  (catch :default e
+                                    (if-let [r (::skip (ex-data e))] {:i i :skip r} (throw e)))))
+                           values)
+      skips (frequencies (keep :skip planned))
+      rows (vec (filter :expr planned))
+      dir (fs/mkdtempSync (path/join (os/tmpdir) "cbor-kotoba-golden-"))
+      src-root (path/join dir "src")
+      _ (fs/mkdirSync (path/join src-root "cborgolden") #js {:recursive true})
+      results (atom {:compared 0 :differ [] :trapped []})]
+  (println "golden values:" (count values) "expressible:" (count rows) "skipped:" skips)
+  (doseq [[ci chunk] (map-indexed vector (partition-all 150 rows))]
+    (let [nm (str "chunk" ci)
+          file (path/join src-root "cborgolden" (str nm ".cljk"))
+          fname #(str "enc-" (:i %))
+          source (str "(ns cborgolden." nm "\n  {:kotoba/export [" (apply str (interpose " " (map fname chunk))) "]}\n"
+                      "  (:require [cbor.core :as cbor]))\n"
+                      (apply str (map #(str "(defn " (fname %) " [] :vector-i64 " (:expr %) ")\n") chunk)))
+          _ (fs/writeFileSync file source)
+          graph (project-files/load-closed-graph file [src-root "src" compat])
+          linked (project/link-source (:sources graph) (:root graph))
+          kir (ir/lower (sema/analyze (:source linked) {:admit-linked-synthetics? true}))]
+      (doseq [row chunk]
+        (let [i (:i row)]
+          (try
+            (let [got (hex (map js/Number (ir/execute kir (symbol (fname row)) [] {:frames frames :fuel fuel})))]
+              (swap! results update :compared inc)
+              (when (not= got (nth want i)) (swap! results update :differ conj i)))
+            (catch :default e
+              (swap! results update :trapped conj [i (ex-message e)])))))
+      (println (str "  " nm ": " (count chunk) " values, running total compared " (:compared @results)))))
+  (let [{:keys [compared differ trapped]} @results]
+    (println "compared:" compared "differ:" (count differ) (vec (take 10 differ))
+             "trapped:" (count trapped) (vec (take 3 trapped)))
+    (js/process.exit (cond (zero? compared) 2
+                           (or (seq differ) (seq trapped)) 1
+                           :else 0))))

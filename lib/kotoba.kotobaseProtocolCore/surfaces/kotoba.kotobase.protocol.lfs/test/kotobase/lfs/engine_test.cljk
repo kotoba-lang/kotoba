@@ -1,0 +1,213 @@
+(ns kotobase.lfs.engine-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is testing]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is testing]])
+            [kotobase.lfs.batch :as batch]
+            [kotobase.lfs.engine :as engine]
+            [kotobase.storage.object :as object]
+            [kotobase.storage.object-memory :as memory]))
+
+;; sha2-256 of [1 2 3] and of [4 5] — the oid IS the CID's digest, so these
+;; are the same objects the storage contract suite uses.
+(def oid-a "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81")
+(def cid-a "bafkreiadsbmmn4waznesyuz3bjgrj33xzqhxrk6mz3ksq7meugrachh3qe")
+(def oid-b "2fa1b377bf67309f65e5e7bc9d924345ca648dec4e601a398a9cb497dcba3765")
+
+(def base "https://kotobase.net/git/v1/repos/demo/info/lfs/objects")
+
+(defn- bytes-of [ints]
+  #?(:clj (byte-array ints) :cljs (js/Uint8Array. (clj->js ints))))
+
+(defn- ctx-with
+  "The synchronous wiring: stat and grant resolved from a sync store."
+  [store & {:as extra}]
+  (let [base-ctx (merge {:objects-base base :expires-in 900} extra)]
+    (assoc base-ctx
+           :stat (engine/stat-fn store)
+           :grant (engine/proxy-grant-fn base-ctx))))
+
+(defn- stored []
+  (let [s (memory/memory-object-store)]
+    (object/-put-object! s cid-a (bytes-of [1 2 3]))
+    s))
+
+(defn- objects [resp] (get-in resp [:body :objects]))
+(defn- only [resp] (first (objects resp)))
+
+;; ── download ────────────────────────────────────────────────────────────────
+
+(deftest download-of-a-present-object-gets-a-href
+  (let [resp (engine/handle-batch (ctx-with (stored))
+                                  {:operation "download"
+                                   :objects [{:oid oid-a :size 3}]})]
+    (is (= 200 (:status resp)))
+    (is (= "basic" (get-in resp [:body :transfer])))
+    (is (= "sha256" (get-in resp [:body :hash_algo])))
+    (let [o (only resp)]
+      (is (= oid-a (:oid o)))
+      (is (= (str base "/" oid-a) (get-in o [:actions :download :href])))
+      (is (= 900 (get-in o [:actions :download :expires_in]))))))
+
+(deftest download-of-a-missing-object-is-a-per-object-404
+  (testing "not a request-level failure: the rest of the batch still answers"
+    (let [resp (engine/handle-batch (ctx-with (stored))
+                                    {:operation "download"
+                                     :objects [{:oid oid-a :size 3}
+                                               {:oid oid-b :size 2}]})
+          [a b] (objects resp)]
+      (is (= 200 (:status resp)))
+      (is (some? (:actions a)))
+      (is (= 404 (get-in b [:error :code])))
+      (is (nil? (:actions b))))))
+
+(deftest a-size-that-disagrees-with-the-store-is-refused
+  (testing "the digest is the name, so one of the two sizes is wrong about
+            the same bytes — serving either would be a guess"
+    (let [resp (engine/handle-batch (ctx-with (stored))
+                                    {:operation "download"
+                                     :objects [{:oid oid-a :size 9}]})]
+      (is (= 422 (get-in (only resp) [:error :code]))))))
+
+;; ── upload ──────────────────────────────────────────────────────────────────
+
+(deftest upload-of-a-new-object-gets-upload-and-verify
+  (let [resp (engine/handle-batch (ctx-with (memory/memory-object-store))
+                                  {:operation "upload"
+                                   :objects [{:oid oid-a :size 3}]})
+        o (only resp)]
+    (is (= (str base "/" oid-a) (get-in o [:actions :upload :href])))
+    (is (= (str base "/" oid-a "/verify") (get-in o [:actions :verify :href])))))
+
+(deftest upload-of-a-present-object-omits-actions-entirely
+  (testing "omission is how the protocol says `already uploaded`. An empty
+            actions map, or an upload href the client is expected to skip,
+            makes every client re-push everything it already pushed"
+    (let [o (only (engine/handle-batch (ctx-with (stored))
+                                       {:operation "upload"
+                                        :objects [{:oid oid-a :size 3}]}))]
+      (is (= {:oid oid-a :size 3 :authenticated true} o))
+      (is (not (contains? o :actions))))))
+
+(deftest upload-over-the-plane-limit-is-a-per-object-413
+  (let [o (only (engine/handle-batch
+                 (ctx-with (memory/memory-object-store) :max-object-bytes 2)
+                 {:operation "upload" :objects [{:oid oid-a :size 3}]}))]
+    (is (= 413 (get-in o [:error :code])))))
+
+(deftest quota-is-decided-before-any-grant-is-issued
+  (testing "once a presigned grant is out the server has no further say in
+            whether those bytes arrive, so the decision cannot come later"
+    (let [seen (atom nil)
+          resp (engine/handle-batch
+                (ctx-with (stored)
+                          :quota (fn [ask]
+                                   (reset! seen ask)
+                                   {:status 507 :body {:message "quota exhausted"}}))
+                {:operation "upload"
+                 :objects [{:oid oid-a :size 3}   ; already held
+                           {:oid oid-b :size 2}]})]
+      (is (= 507 (:status resp)))
+      (is (= {:new-bytes 2 :new-objects 1} @seen)
+          "and it is asked about the bytes not yet stored, not the whole batch"))))
+
+;; ── request validation ──────────────────────────────────────────────────────
+
+(deftest malformed-requests-are-422-with-an-lfs-error-body
+  (doseq [body [{}
+                {:operation "delete" :objects [{:oid oid-a :size 1}]}
+                {:operation "download" :objects []}
+                {:operation "download" :objects [{:oid "ABC" :size 1}]}
+                {:operation "download" :objects [{:oid oid-a :size -1}]}
+                {:operation "download" :objects [{:oid oid-a :size 1.5}]}
+                {:operation "download" :objects [{:oid oid-a :size 1}]
+                 :hash_algo "sha512"}
+                {:operation "download" :objects [{:oid oid-a :size 1}]
+                 :transfers ["tus"]}]]
+    (let [resp (engine/handle-batch (ctx-with (stored)) body)]
+      (is (= 422 (:status resp)) (pr-str body))
+      (is (string? (get-in resp [:body :message]))))))
+
+(deftest an-oversized-batch-is-refused
+  (let [many (vec (repeat (inc batch/max-objects) {:oid oid-a :size 3}))]
+    (is (= 422 (:status (engine/handle-batch (ctx-with (stored))
+                                             {:operation "download"
+                                              :objects many}))))))
+
+;; ── verify ──────────────────────────────────────────────────────────────────
+
+(deftest verify-reports-the-store-not-the-client
+  (let [ctx (ctx-with (stored))]
+    (is (= 200 (:status (engine/handle-verify ctx oid-a 3))))
+    (is (= 404 (:status (engine/handle-verify ctx oid-b 2))))
+    (is (= 422 (:status (engine/handle-verify ctx oid-a 99))))
+    (is (= 422 (:status (engine/handle-verify ctx "not-an-oid" 3))))))
+
+(deftest locks-are-501-not-a-fake-empty-list
+  (is (= 501 (:status (engine/locks-not-implemented)))))
+
+;; ── the Worker shape: everything asynchronous resolved outside ──────────────
+
+(defrecord Presigned [state]
+  object/IObjectStore
+  (-stat-object [_ cid] (get @state cid))
+  (-delete-object! [_ _] {:deleted? false :reason :not-supported})
+  object/IPresignedTransfer
+  (-presign-put [_ cid opts]
+    (object/grant {:href (str "https://b2.invalid/put/" cid "?len=" (:size-bytes opts))
+                   :method :put :expires-at 1
+                   :headers {"content-length" (str (:size-bytes opts))}
+                   :signed-headers ["host" "content-length"]}))
+  (-presign-get [_ cid _]
+    (object/grant {:href (str "https://b2.invalid/get/" cid)
+                   :method :get :expires-at 1 :signed-headers ["host"]}))
+  object/IObjectCapabilities
+  (-object-capabilities [_] #{:large-objects :presigned-transfer}))
+
+(deftest a-worker-resolves-stats-and-grants-first-then-decides
+  (testing "on a Worker every one of these calls returns a Promise, so the
+            engine must be handed resolved values — an engine that called
+            the store inline would work here and return unresolved promises
+            in production"
+    (let [store (->Presigned (atom {cid-a {:size-bytes 3}}))
+          parsed (batch/parse-request {:operation "upload"
+                                       :objects [{:oid oid-a :size 3}
+                                                 {:oid oid-b :size 2}]})
+          ;; step 1: what the caller would await
+          stats {oid-a {:size-bytes 3} oid-b nil}
+          stat #(get stats %)
+          ctx {:objects-base base :expires-in 900 :stat stat}
+          ;; step 2: only the objects that need a grant, so the caller
+          ;; presigns exactly those and nothing more
+          needs (engine/grants-needed parsed ctx stat)
+          _ (do (is (= [oid-b] (mapv :oid needs))
+                    "the object already held needs no grant")
+                (is (= [:upload] (mapv :op needs))))
+          ;; step 3: resolved grants, keyed the way the caller likes
+          grants (into {} (map (fn [{:keys [op oid cid size]}]
+                                 [oid (let [g (object/-presign-put store cid
+                                                                   {:size-bytes size})]
+                                        {:href (:href g)
+                                         :headers (:headers g)
+                                         :expires-in 900
+                                         :op op})]))
+                       needs)
+          resp (engine/handle-batch (assoc ctx :grant #(get grants (:oid %))) parsed)
+          [a b] (objects resp)]
+      (is (not (contains? a :actions)) "already held → actions omitted")
+      (is (= (str "https://b2.invalid/put/"
+                  "bafkreibpugzxpp3hgcpwlzphxsozeq2fzjsi33comandtcu4wsl5zorxmu?len=2")
+             (get-in b [:actions :upload :href])))
+      (is (= "2" (get-in b [:actions :upload :header "content-length"]))
+          "and the grant carries the length it was signed for")
+      (is (= (str base "/" oid-b "/verify") (get-in b [:actions :verify :href]))
+          "verify still points back at this server — it is the only place
+           that learns an upload finished when bytes bypass us"))))
+
+(deftest a-sync-store-that-declares-nothing-is-caught-at-wiring-time
+  (let [broken (reify
+                 object/IObjectStore
+                 (-stat-object [_ _] nil)
+                 (-delete-object! [_ _] {:deleted? false})
+                 object/IObjectCapabilities
+                 (-object-capabilities [_] #{:large-objects}))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (engine/stat-fn broken)))))

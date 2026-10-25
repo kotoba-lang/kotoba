@@ -1,0 +1,199 @@
+(ns woff.woff2-test
+  "Runtime-agnostic WOFF2 suite: decodes a real WOFF2 file (recorded in
+   `woff.woff2-fixtures`) with no shell and no filesystem, and checks it against
+   the *original* font the fixture was compressed from.
+
+   That comparison is the end-to-end statement worth making: original TTF →
+   reference `woff2_compress` → this decoder → outlines identical to the original.
+   Bytes are deliberately *not* compared for `glyf`/`loca`/`head`, because §5.1
+   allows a reconstruction to re-encode points however it likes and the checksums
+   must be recomputed over the result.
+
+   The wider sweep across system fonts, CFF flavours and composite glyphs lives in
+   `woff.woff2-oracle-test`."
+  (:require [kotoba.bytes :as kbytes] [woff.glyf :as glyf]
+            [woff.sfnt-compare :as cmp]
+            [woff.woff2 :as w2]
+            [woff.woff2-data :as data]
+            [woff.woff2-fixtures :as fixtures]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- b64->bytes [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff)
+                (kbytes/base64-decode-bytes ^String s))
+     :cljs (let [d (js/atob s)]
+             (vec (map-indexed (fn [i _] (.charCodeAt d i)) (repeat (.-length d) nil))))))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(def ^:private woff2-bytes (delay (b64->bytes fixtures/woff2)))
+(def ^:private original (delay (b64->bytes fixtures/original-ttf)))
+
+;; ---------------------------------------------------------------------------
+;; Tables from the specification
+;; ---------------------------------------------------------------------------
+
+(deftest spec-tables-are-well-formed
+  (testing "63 known table tags, each four characters"
+    (is (= 63 (count data/known-tags)))
+    (is (every? #(= 4 (count %)) data/known-tags))
+    (is (= "cmap" (first data/known-tags)))
+    (is (= "glyf" (nth data/known-tags 10)))
+    (is (= "loca" (nth data/known-tags 11)))
+    (testing "tags shorter than four characters keep their padding"
+      (is (= "cvt " (nth data/known-tags 8)))
+      (is (= "CFF " (nth data/known-tags 13)))
+      (is (= "SVG " (nth data/known-tags 36)))))
+  (testing "128 triplet rows, each consistent with its byte count"
+    (is (= 128 (count data/triplets)))
+    (doseq [[i [xb yb _ _ xs ys]] (map-indexed vector data/triplets)]
+      (is (contains? #{0 4 8 12 16} xb) (str "row " i))
+      (is (contains? #{0 4 8 12 16} yb) (str "row " i))
+      (is (contains? #{-1 0 1} xs))
+      (is (contains? #{-1 0 1} ys)))
+    (testing "the documented corners"
+      (is (= [0 8 0 0 0 -1] (nth data/triplets 0)))
+      (is (= [8 0 0 0 -1 0] (nth data/triplets 10)))
+      (is (= [4 4 1 1 -1 -1] (nth data/triplets 20)))
+      (is (= [8 8 1 1 -1 -1] (nth data/triplets 84)))
+      (is (= [16 16 0 0 1 1] (nth data/triplets 127))))))
+
+;; ---------------------------------------------------------------------------
+;; Variable-length integers
+;; ---------------------------------------------------------------------------
+
+(deftest uint-base128
+  (is (= [0 1] (w2/read-uint-base128 [0x00] 0)))
+  (is (= [63 1] (w2/read-uint-base128 [0x3f] 0)))
+  (is (= [128 2] (w2/read-uint-base128 [0x81 0x00] 0)))
+  (is (= [4294967295 5] (w2/read-uint-base128 [0x8f 0xff 0xff 0xff 0x7f] 0)))
+  (testing "the specification's explicit rejections"
+    (is (= :bad-uint-base128 (reason-of #(w2/read-uint-base128 [0x80 0x3f] 0)))
+        "a leading zero byte")
+    (is (= :bad-uint-base128
+           (reason-of #(w2/read-uint-base128 [0x81 0x81 0x81 0x81 0x81 0x00] 0)))
+        "longer than five bytes")
+    (is (= :bad-uint-base128
+           (reason-of #(w2/read-uint-base128 [0x9f 0xff 0xff 0xff 0x7f] 0)))
+        "past 2^32-1")))
+
+(deftest read-255u16
+  (is (= [0 1] (glyf/read-255u16 [0] 0)))
+  (is (= [252 1] (glyf/read-255u16 [252] 0)))
+  (is (= [253 2] (glyf/read-255u16 [255 0] 0)))
+  (is (= [506 2] (glyf/read-255u16 [254 0] 0)))
+  (is (= [1000 3] (glyf/read-255u16 [253 0x03 0xe8] 0)))
+  (testing "the encoding is not unique and every form must be accepted"
+    (is (= 506 (first (glyf/read-255u16 [255 253] 0))))
+    (is (= 506 (first (glyf/read-255u16 [254 0] 0))))
+    (is (= 506 (first (glyf/read-255u16 [253 0x01 0xfa] 0))))))
+
+;; ---------------------------------------------------------------------------
+;; Header and directory
+;; ---------------------------------------------------------------------------
+
+(deftest reads-the-header-and-directory
+  (let [h (w2/header @woff2-bytes)
+        {:keys [entries]} (w2/tables @woff2-bytes)]
+    (is (= 0x00010000 (:flavor h)) "a TrueType flavour")
+    (is (= (count @woff2-bytes) (:length h)))
+    (is (= 10 (:num-tables h)))
+    (is (= 10 (count entries)))
+    (is (= #{"OS/2" "cmap" "glyf" "loca" "head" "hhea" "hmtx" "maxp" "name" "post"}
+           (set (map :tag entries))))
+    (testing "glyf and loca are transformed (version 0) and carry a transformLength"
+      (let [g (first (filter #(= "glyf" (:tag %)) entries))
+            l (first (filter #(= "loca" (:tag %)) entries))]
+        (is (:transformed? g))
+        (is (= 0 (:transform-version g)))
+        (is (pos? (:transform-length g)))
+        (is (:transformed? l))
+        (is (zero? (:transform-length l))
+            "§5.3: a transformed loca always has zero transformLength")))
+    (testing "untransformed tables have no transformLength"
+      (is (every? #(nil? (:transform-length %))
+                  (remove :transformed? entries))))))
+
+(deftest rejects-non-woff2
+  (is (= :not-woff2 (reason-of #(w2/header (vec (repeat 64 0x41))))))
+  (is (= :truncated (reason-of #(w2/header [0x77 0x4f 0x46 0x32]))))
+  (is (= :truncated (reason-of #(w2/->sfnt (subvec @woff2-bytes 0 100))))))
+
+;; ---------------------------------------------------------------------------
+;; End-to-end: original → woff2_compress → this decoder
+;; ---------------------------------------------------------------------------
+
+(deftest reconstructs-the-original-font
+  (let [ours @(delay (w2/->sfnt @woff2-bytes))
+        orig @original]
+    (testing "the sfnt shell is right"
+      (is (= (subvec orig 0 4) (subvec ours 0 4)) "same sfnt version")
+      (is (= (cmp/glyph-count orig) (cmp/glyph-count ours)))
+      (is (= (set (keys (cmp/table-directory orig)))
+             (set (keys (cmp/table-directory ours))))))
+    (testing "every table except glyf/loca/head is byte-identical to the original"
+      (doseq [tag (sort (keys (cmp/table-directory orig)))
+              :when (not (contains? #{"glyf" "loca" "head"} tag))]
+        (is (= (cmp/table orig tag) (cmp/table ours tag)) tag)))
+    (testing "head differs only where the format says it must"
+      ;; Two fields legitimately differ from the original: checkSumAdjustment,
+      ;; which a decoder recomputes over the reconstructed font, and flags bit 11,
+      ;; which §6 requires a WOFF2 *encoder* to set to record that the font was
+      ;; put through a lossless modifying transform.
+      (let [a (cmp/table orig "head") b (cmp/table ours "head")]
+        (is (= (subvec a 0 8) (subvec b 0 8)) "up to checkSumAdjustment")
+        (is (= (subvec a 12 16) (subvec b 12 16)) "magicNumber")
+        (is (= (subvec a 18) (subvec b 18)) "everything after flags")
+        (is (= 0x0800 (bit-xor (+ (* 256 (nth a 16)) (nth a 17))
+                               (+ (* 256 (nth b 16)) (nth b 17))))
+            "flags differ in bit 11 only")))
+    (testing "and every glyph outline is identical"
+      ;; Points, on/off-curve flags, contour ends, bounding boxes, instructions.
+      (is (= (cmp/outlines orig) (cmp/outlines ours))))))
+
+(deftest table-checksums-are-recomputed
+  (let [ours (w2/->sfnt @woff2-bytes)
+        dir  (cmp/table-directory ours)]
+    (doseq [[tag {:keys [checksum]}] dir
+            :when (not= tag "head")]
+      (is (= checksum
+             (#?(:clj identity :cljs identity)
+              (let [bs (cmp/table ours tag)
+                    n  (count bs)]
+                (loop [i 0 sum 0]
+                  (if (>= i n)
+                    (mod sum 4294967296)
+                    (let [b #(if (< (+ i %) n) (nth bs (+ i %)) 0)]
+                      (recur (+ i 4)
+                             (mod (+ sum (* 16777216 (b 0)) (* 65536 (b 1))
+                                    (* 256 (b 2)) (b 3))
+                                  4294967296))))))))
+          tag))))
+
+;; ---------------------------------------------------------------------------
+;; hmtx transform (no fixture exercises it, so it gets a unit test)
+;; ---------------------------------------------------------------------------
+
+(deftest hmtx-transform-reconstruction
+  ;; §5.4 with flags = 1: advanceWidth[] present, lsb[] omitted and taken from the
+  ;; glyph bounding boxes. woff2_compress does not apply this transform to any
+  ;; font available here, so it is checked directly rather than through a fixture.
+  ;; flags = 3: both the proportional lsb[] and the monospaced leftSideBearing[]
+  ;; arrays are omitted, so every value comes from a glyph bounding box.
+  (let [transformed (into [0x03] (mapcat (fn [w] [(quot w 256) (mod w 256)]) [500 600]))
+        x-mins      [10 -20 33]
+        result      (#'w2/reconstruct-hmtx transformed 2 3 x-mins)]
+    (is (= [0x01 0xf4 0x00 0x0a                             ; advance 500, lsb 10
+            0x02 0x58 0xff 0xec                             ; advance 600, lsb -20
+            0x00 0x21]                                      ; monospaced tail: lsb 33
+           result))
+    (testing "reserved flag bits are rejected"
+      (is (= :bad-hmtx-transform
+             (reason-of #(#'w2/reconstruct-hmtx (into [0x04] (repeat 4 0)) 2 3 x-mins)))))
+    (testing "a transform that omits nothing is rejected"
+      (is (= :bad-hmtx-transform
+             (reason-of #(#'w2/reconstruct-hmtx (into [0x00] (repeat 4 0)) 2 3 x-mins)))))))

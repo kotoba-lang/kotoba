@@ -1,0 +1,375 @@
+(ns kotobase.query.surfaces
+  "The four query-protocol surfaces — SPARQL 1.1, openCypher, Gremlin and GraphQL —
+  composed onto ONE router ctx, as a library.
+
+  Extracted verbatim on 2026-09-17 from the private deployment shell
+  `cloud-kotoba/control-plane/protocols-worker` (`kotobase-protocols-worker.query`,
+  root ADR-2609171500: every kotobase capability is an OSS library; graph.kotoba.cloud
+  and yataverse.com are two deployments of the same libraries). Nothing here knows
+  about Cloudflare, R2 or a tenant: a deployment hands `enrich` a store and gets
+  back a ctx the shared `kotobase.protocols.router` can serve.
+
+  They live in their own repositories (`org-w3-sparql-protocol`,
+  `org-opencypher-cypher`, `org-apache-tinkerpop-gremlin`), each a consumer
+  of the shared query bridge, and `kotobase.protocols.router`
+  does not know they exist. It does not have to: the router takes
+  `:surfaces` and `:path-surfaces` from ctx, and **the shell that already
+  depends on both is where they meet** — the same arrangement
+  `drive.object/store-of` and `storj.store` prescribe for object stores.
+
+  ## Which repository the bridge comes from
+
+  `ayatori.query`, from kotoba-lang/ayatori. The four surfaces above still
+  require `kotobase.query.bridge` by name from inside their own
+  repositories, and they keep resolving, because ayatori ships that
+  namespace too — byte-identical apart from one docstring line, measured
+  2026-08-29 at ayatori@d50ff25 against kotobase-query@dcc5ab5. This shell
+  is a NEW caller, so it takes the `ayatori.*` name; the surfaces are old
+  callers and are not rewritten from here.
+
+  **What this did not turn on.** `ayatori.discovery` and `ayatori.remote`
+  are not on this path and are not reachable from `ayatori.query`, which is
+  a pure alias namespace over the bridge. IPNI provider discovery and
+  verified remote block reads remain separate effects that this request
+  path does not perform. Serving the bridge from ayatori is a change of
+  ownership, not evidence of a connected read path.
+
+  ## `:visible?` is (constantly true) HERE, and that is not a default
+
+  All four handlers REQUIRE a `:visible?` predicate over materialized
+  datoms and refuse to run without one (ADR-2607050500) — deliberately no
+  permissive default, because a query surface that shows everything by
+  accident is the worst possible accident.
+
+  Supplying `(constantly true)` here is a decision about *this deployment*,
+  not a shrug: the store handed to a request is already the graph
+  the deployment shell (e.g. `kotobase-protocols-worker.graph/for-request`) resolved for it, so the
+  isolation boundary is the store itself and a per-datom filter on top would
+  be filtering a set that is already the tenant's own. If this shell ever
+  serves more than one tenant's datoms out of one store, this is the line
+  that has to change, and it is written out rather than hidden behind a
+  default so that change is a visible edit rather than a discovered gap.
+
+  ## Collections come from the store, not from configuration
+
+  SPARQL needs `:coll-keys` (its RDF dataset) and Gremlin needs
+  `:vertex-colls`. Both are read off the hydrated state, so a graph exposes
+  exactly what it holds. A configured list would drift from the data the
+  first time anyone wrote a new collection, and drift in the direction of
+  *querying something that is not there* is silent — you get an empty
+  result, not an error.
+
+  ## What these surfaces are NOT
+
+  Each is an explicitly-scoped subset, documented in its own repository, and
+  deploying them does not widen any of it. All three can walk an edge now, and
+  Cypher's `WHERE` does comparisons, booleans, `IS NULL`, string predicates and
+  `count()` — but variable-length paths (`-[:R*1..3]->`), `OPTIONAL MATCH`,
+  `WITH` and `UNION` are still absent, and each repository's README is the list
+  that is kept true rather than this paragraph.
+
+  Materialization is memoized per isolate (`memo-version` below) rather than
+  redone per query, which is a floor and not a fix: the first query against a
+  given `:docs` still rebuilds every requested collection, so the cost scales
+  with the graph and not with the answer. Only a persisted index (ADR-2607310900
+  L2) changes that, and none of it is fixed by putting a hostname in front."
+  (:require [kotoba.lang.text :as str]
+            [graphql.sdl :as sdl]
+            [kotobase.gremlin.envelope :as gremlin-envelope]
+            [ayatori.query :as bridge]
+            [kotobase.protocols.cypher :as cypher]
+            [kotobase.protocols.graphql :as graphql]
+            [kotobase.protocols.http :as http]
+            [kotobase.protocols.json :as json]
+            [kotobase.protocols.sparql :as sparql]
+            [kotobase.store :as st]))
+
+(def visible-everything
+  "See the ns docstring — a decision about this deployment, made explicit."
+  (constantly true))
+
+(defn collections
+  "Collection keys present in a hydrated LocalStore-shaped `state`.
+
+  Ordered by `pr-str` rather than by `compare`, because a collection key is
+  whatever the surface that wrote it chose, and this graph holds more than
+  one surface's choices: s3 writes the vector `[:kotobase.s3/objects
+  \"<bucket>\"]`, the lake catalog writes the string `\"lake-catalog\"`, and
+  `compare` throws on a String against a PersistentVector — `Cannot compare
+  lake-catalog to [:kotobase.s3/objects \"lake-proof\"]`, measured on the
+  live surface 2026-08-17.
+
+  That made the failure land nowhere near its cause. `enrich` runs on every
+  request through `run-once`, on the state as HYDRATED, so the PUT that
+  wrote the first catalog document still succeeded — it saw the empty seed —
+  and the bucket became unreadable AND unwritable on the request after it,
+  answering `502 BlobStoreUnavailable` on a write and `500` on a read.
+
+  Sorting at all is only for a deterministic listing; `pr-str` gives a total
+  order over every printable key and leaves the order of same-typed keys
+  exactly as it was. The alternative — legislating one shape for collection
+  keys — would mean a surface can crash the graph by choosing a key, which
+  is the property being removed here."
+  [state]
+  (vec (sort-by pr-str (keys (:docs state)))))
+
+(defn gremlin-http-handle
+  "Gremlin's transport is WebSocket. A plain HTTP request to the surface gets
+  426, which is what the status code is for — answering 200 with a JSON
+  explanation would let a client believe it had a working endpoint."
+  [_ctx _req]
+  (http/response 426
+                 {"content-type" "text/plain; charset=utf-8"
+                  "upgrade" "websocket"
+                  "cache-control" "no-store"}
+                 (str "gremlin speaks WebSocket (GraphSON RequestMessage per text frame).\n"
+                      "Connect with Upgrade: websocket; op must be \"bytecode\" (no \"eval\").\n")))
+
+(defn rdf4j-default-path?
+  "True only for the one RDF4J repository path Kotobase actually models."
+  [path]
+  (contains? #{"/repositories/default" "/repositories/default/"} path))
+
+(defn sparql-handle
+  "Serve the canonical SPARQL endpoint and RDF4J's default-repository path.
+
+  Kotobase has one request-selected content-addressed graph, not an RDF4J
+  repository registry.  Accepting arbitrary `/repositories/<id>` values and
+  silently querying the same graph would claim an isolation boundary that
+  does not exist, so only the documented `default` compatibility path is
+  admitted."
+  [ctx req]
+  (let [path (or (:path req) "")]
+    (if (and (str/starts-with? path "/repositories/")
+             (not (rdf4j-default-path? path)))
+      (http/response 404
+                     {"content-type" "text/plain; charset=utf-8"
+                      "cache-control" "no-store"}
+                     "unknown RDF4J repository; use /repositories/default\n")
+      (sparql/handle ctx req))))
+
+(def graphql-schema
+  "Stable v1 schema. Values remain JSON strings so arbitrary Kotobase
+  documents are not silently coerced into a guessed application schema."
+  (sdl/parse-schema
+   "type Query {
+      document(collection: String!, key: ID!): Document
+      documents(collection: String!, limit: Int): [Document]
+      collections: [String]
+    }
+    type Document { collection: String!, key: ID!, json: String! }"))
+
+(defn- document [store coll key]
+  (when-some [value (st/-get store coll key)]
+    {:collection coll :key key :json (json/encode value)}))
+
+(defn graphql-resolvers [colls]
+  {["Query" "collections"] (fn [_ _ _] colls)
+   ["Query" "document"]
+   (fn [_ args {:keys [store]}]
+     (document store (str (get args "collection")) (str (get args "key"))))
+   ["Query" "documents"]
+   (fn [_ args {:keys [store]}]
+     (let [coll (str (get args "collection"))
+           limit (min 1000 (max 0 (or (get args "limit") 100)))]
+       (->> (st/-list store coll)
+            sort
+            (take limit)
+            (keep #(document store coll %))
+            vec)))})
+
+(def surfaces
+  "Host label -> handler, for `kotobase.protocols.router`'s ctx."
+  {"sparql" sparql-handle
+   "cypher" cypher/handle
+   "gremlin" gremlin-http-handle
+   "graphql" graphql/handle})
+
+(def path-surfaces
+  "Path prefix -> surface label, for deploys serving one hostname.
+
+  The prefixes are each protocol's own absolute path, not a mount point we
+  chose: SPARQL 1.1 Protocol puts the query at the service endpoint, and
+  Neo4j's HTTP Cypher API is `/db/data/transaction/commit`. The router does
+  not strip them, because the handlers check those paths themselves."
+  {"/sparql" "sparql"
+   "/repositories/" "sparql"
+   "/db/data/" "cypher"
+   "/gremlin" "gremlin"
+   "/graphql" "graphql"})
+
+(def capabilities
+  "Machine-readable, deliberately conservative compatibility contract.
+
+  This belongs beside the handlers rather than in marketing copy so adding a
+  feature and claiming it are reviewed in the same change.  `subset` is a
+  compatibility level, not a product weakness: clients can branch on it
+  instead of mistaking a familiar hostname for complete wire compatibility."
+  {"schema_version" 1
+   "service" "kotobase-query-protocols"
+   "canonical_model" "content-addressed datoms"
+   "surfaces"
+   {"sparql" {"transport" "SPARQL Protocol over HTTP"
+              "rdf4j_path_compatibility" "/repositories/default"
+              "operations" ["SELECT" "ASK"]
+              "compatibility" "documented-subset"
+              "read_only" true
+              "not_claimed" ["full SPARQL 1.1 grammar" "SPARQL Update" "RDF 1.2"]}
+    "cypher" {"transport" "Neo4j-shaped transactional HTTP"
+              "operations" ["MATCH" "WHERE" "RETURN" "ORDER BY" "UNION" "count"]
+              "compatibility" "documented-subset"
+              "read_only" true
+              "not_claimed" ["Bolt" "full openCypher grammar" "mutations"
+                               "variable-length paths" "OPTIONAL MATCH" "WITH"]}
+    "gremlin" {"transport" "WebSocket GraphSON RequestMessage"
+               "operations" ["bytecode"]
+               "compatibility" "documented-subset"
+               "read_only" true
+               "not_claimed" ["script eval" "full TinkerPop step set" "mutations"]}
+    "graphql" {"transport" "GraphQL over HTTP POST"
+               "operations" ["query" "document" "documents" "collections"]
+               "compatibility" "documented-subset"
+               "read_only" true
+               "schema" "kotobase-document-v1"
+               "not_claimed" ["mutations" "subscriptions" "variables" "introspection"]}}
+   "isolation" {"unit" "one hydrated content-addressed graph per request"
+                "cross_tenant_default" "deny"
+                "visibility_filter_required" true}
+   ;; Which credential to present. Until 2026-08-29 this document described
+   ;; every transport and every limit and never once named a credential, so a
+   ;; client could read it end to end, learn the exact GraphSON shape a Gremlin
+   ;; request takes, and still have no way to find out that the surface would
+   ;; answer 401 — discovery stopped one step before the door.
+   ;;
+   ;; `not_accepted` is not padding. Biscuit is this workspace's delegation
+   ;; centre (ADR-2608180200) and the datom plane already requires it
+   ;; (ADR-2608291700), so a reader who knows that will reasonably assume these
+   ;; surfaces take one too. They do not, today. Saying so here is cheaper for
+   ;; that reader than a 401 that enumerates three credentials and leaves them
+   ;; wondering whether they held the fourth one wrong.
+   "authentication"
+   {"required" true
+    "accepted" [{"scheme" "Bearer"
+                 "header" "Authorization: Bearer <token>"
+                 "note" "WRITE_TOKEN grants full admin; reads accept it too"}
+                {"scheme" "AWS4-HMAC-SHA256"
+                 "header" "Authorization: AWS4-HMAC-SHA256 …"
+                 "note" "SigV4 over the raw payload"}
+                {"scheme" "CACAO"
+                 "note" "an operator CACAO (ADR-2608291700 keeps CACAO as the session origin)"}]
+    "not_accepted" [{"scheme" "Biscuit"
+                     "why" "these query surfaces do not read Authorization: Biscuit yet — the datom plane does. Tracked by 90-docs/kotobase_auth_maturity (axes :surfaces-accept-biscuit and :surface-reads-the-header)."}]
+    "on_refusal" "401 with a body that names the accepted schemes"}
+   "limits" {"query_cost_controls" "adapter-defined"
+             "capability_discovery" "/.well-known/kotobase-capabilities"}})
+
+
+(defonce ^{:doc "The query memo for this isolate (ADR-2607310900 L1).
+
+  `defonce` in module scope: a Cloudflare isolate survives across requests, so
+  this is where a memo can live at all. It is per-isolate and per-colo, which is
+  the RIGHT scope for it — the memo holds derived data, so losing one costs
+  time and never correctness, and that is exactly why it does not justify a
+  Durable Object or any other shared writer."}
+  isolate-memo
+  (bridge/memo))
+
+
+(defn memo-stats
+  "This isolate's memo counters, as a JSON-shaped map. A thin projection of
+  `bridge/memo-stats` so the shell does not have to know the memo's shape."
+  []
+  (let [{:keys [size capacity hits misses]} (bridge/memo-stats isolate-memo)
+        total (+ hits misses)]
+    {"size" size "capacity" capacity "hits" hits "misses" misses
+     "hit_rate" (if (pos? total) (/ (Math/round (* 10000.0 (/ hits total))) 10000.0) nil)}))
+
+(defn queryable?
+  "Whether this request will land on a read-only query surface.
+
+  The memo names the state a query READS, not the state a write leaves behind,
+  so it is only supplied where nothing the caller directs can write. These three
+  surfaces are read-only in that sense (the shell's `core/query-
+  surfaces` says why, including the audit append that is not), and tying the
+  memo to that same set means the guarantee is checked in one place rather than
+  assumed in two."
+  [surface]
+  (contains? surfaces surface))
+
+(defn memo-version
+  "What the memo keys on: `:docs`, and nothing else.
+
+  MEASURED, 2026-07-31, `wrangler dev --local` with a seeded graph and the
+  `/_diag/query-memo` counters, when this keyed on the CHAIN HEAD instead:
+
+      SPARQL  2 hits / 3 queries
+      Cypher  0 hits / 3 queries
+
+  Cypher's zero was not a tuning problem. `kotobase.protocols.cypher` appends an
+  audit event per statement, which changes `:streams`, which advances the chain
+  head — so every Cypher query hydrated from a head the previous Cypher query
+  had created, and could never hit. The memo was doing exactly what it promised;
+  the KEY named more state than `materialize` reads.
+
+  `materialize` reads `:docs` and only `:docs`, so that is the whole key. An
+  audit append no longer invalidates anything, because it does not touch `:docs`.
+
+  **This is a value, not a digest, and that is deliberate.** Hashing it would be
+  a second content address to keep honest, and a 32-bit one at that; a Clojure
+  map lookup already hashes for the bucket and then compares with `=`, so equal
+  docs hit and unequal docs cannot, with no collision window to reason about.
+  What it costs is the hash, and that was measured too (JVM, 5-property docs):
+
+      docs     materialize    hash(:docs)
+      1000         8.1 ms         0.2 ms     35x
+      5000        34.0 ms         0.4 ms     83x
+      20000      123.9 ms         2.1 ms     58x
+
+  The retained reference is the same map the request already built, and the memo
+  is bounded at `bridge/memo`'s capacity, so this holds no more graphs alive than
+  the materialized indices beside them already do.
+
+  Conservative in one direction on purpose: a write to a collection the query
+  never touches still changes `:docs` and still misses. Narrowing that to the
+  queried collections would mean keying per collection subset, which trades a
+  rare miss for a key that is harder to prove right."
+  [state]
+  (:docs state))
+
+(defn enrich
+  "Add the query surfaces and everything they require to `ctx`, given the
+  hydrated `state` the request's store was built from.
+
+  The memo version is derived from `state` here rather than passed in, so there
+  is no way for a caller to hand it a version that names something other than
+  what `materialize` will read."
+  ([ctx state] (enrich ctx state nil))
+  ([ctx state surface]
+   (let [colls (collections state)]
+     (cond-> (assoc ctx
+                    :surfaces surfaces
+                    :path-surfaces path-surfaces
+                    :visible? visible-everything
+                    :schema graphql-schema
+                    :resolvers (graphql-resolvers colls)
+                    :coll-keys colls
+                    :vertex-colls colls)
+       ;; Both halves or neither: `bridge/db-for` builds fresh unless it has a
+       ;; memo AND a version, so a surface that can write simply never gets one.
+       (queryable? surface)
+       (assoc :query-memo isolate-memo :query-version (memo-version state))))))
+
+(defn gremlin-error
+  "A ResponseMessage carrying a server-side failure, for the case where the
+  shell itself broke before the envelope could. Code 597 is Gremlin's
+  server-error, and the request id is empty because the frame that would have
+  carried it is what failed."
+  [message]
+  (gremlin-envelope/encode-response "" 597 {:message message}))
+
+(defn gremlin-message
+  "One GraphSON RequestMessage text frame -> one ResponseMessage text frame,
+  against the store built from `state`. The socket belongs to the shell; this
+  is the whole of what the shell has to call."
+  [ctx state text]
+  (gremlin-envelope/handle-request-text (enrich ctx state "gremlin") text))

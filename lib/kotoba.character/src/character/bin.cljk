@@ -1,0 +1,166 @@
+(ns character.bin
+  "Zero-dep portable binary IO for the `.dna` / `.kgr` / `.ksm` wire
+  formats used by `character.dna`, `character.groom` and
+  `character.skeletal-mesh`. Buffers are represented as plain Clojure
+  vectors of unsigned bytes (0-255) rather than native byte arrays, so
+  the same code runs unchanged on JVM and JS (no typed-array / byte[]
+  divergence needed for the container type — only IEEE754 float
+  bit-conversion needs a `#?(:clj ... :cljs ...)` split). Restored as
+  part of the kami-character port (kami-engine, deleted PR #82),
+  ADR-2607010930, com-junkawasaki/root.
+
+  A read cursor is `{:data [byte ...] :pos int}`. Read functions take
+  and return the cursor. Write functions append bytes to a plain
+  output vector."
+  (:require [kotoba.bytes :as kbytes]))
+
+;; ── IEEE754 f32 <-> bits (platform divergence) ───
+
+(defn f32->bits [f]
+  #?(:clj (Integer/toUnsignedLong (Float/floatToIntBits (float f)))
+     :cljs (let [buf (js/ArrayBuffer. 4)
+                 view (js/DataView. buf)]
+             (.setFloat32 view 0 f false)
+             (.getUint32 view 0 false))))
+
+(defn bits->f32 [bits]
+  #?(:clj (Float/intBitsToFloat (unchecked-int bits))
+     :cljs (let [buf (js/ArrayBuffer. 4)
+                 view (js/DataView. buf)]
+             (.setUint32 view 0 bits false)
+             (.getFloat32 view 0 false))))
+
+;; ── Cursor construction ───────────────────────────
+
+(defn cursor [data] {:data (vec data) :pos 0})
+(defn seek [c pos] (assoc c :pos pos))
+(defn pos [c] (:pos c))
+(defn remaining [c] (- (count (:data c)) (:pos c)))
+
+;; ── Big-endian reads (.dna) ───────────────────────
+
+(defn read-u8 [{:keys [data pos] :as c}]
+  [(nth data pos) (assoc c :pos (inc pos))])
+
+(defn read-u16-be [{:keys [data pos] :as c}]
+  (let [b0 (nth data pos) b1 (nth data (+ pos 1))]
+    [(bit-or (bit-shift-left b0 8) b1) (assoc c :pos (+ pos 2))]))
+
+(defn read-u32-be [{:keys [data pos] :as c}]
+  (let [b0 (nth data pos) b1 (nth data (+ pos 1))
+        b2 (nth data (+ pos 2)) b3 (nth data (+ pos 3))]
+    [(bit-or (bit-shift-left b0 24) (bit-shift-left b1 16)
+             (bit-shift-left b2 8) b3)
+     (assoc c :pos (+ pos 4))]))
+
+(defn read-f32-be [c]
+  (let [[bits c'] (read-u32-be c)]
+    [(bits->f32 bits) c']))
+
+(defn read-string-be
+  "Read a u32-length-prefixed UTF-8 string (BE length)."
+  [c]
+  (let [[len c'] (read-u32-be c)]
+    (if (zero? len)
+      ["" c']
+      (let [{:keys [data pos]} c'
+            bytes (subvec data pos (+ pos len))
+            s #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte bytes)))
+                 :cljs (js/decodeURIComponent
+                        (apply str (map (fn [b] (str "%" (.toUpperCase (.padStart (.toString b 16) 2 "0")))) bytes))))]
+        [s (assoc c' :pos (+ pos len))]))))
+
+(defn read-array-be
+  "Read a u32-count-prefixed array, calling `(read-elem c)` for each
+  element. Returns `[elems c']`."
+  [read-elem c]
+  (let [[n c'] (read-u32-be c)]
+    (loop [i 0 c c' acc (transient [])]
+      (if (= i n)
+        [(persistent! acc) c]
+        (let [[v c2] (read-elem c)]
+          (recur (inc i) c2 (conj! acc v)))))))
+
+(defn read-array-u16-be [c] (read-array-be read-u16-be c))
+(defn read-array-u32-be [c] (read-array-be read-u32-be c))
+(defn read-array-f32-be [c] (read-array-be read-f32-be c))
+(defn read-array-string-be [c] (read-array-be read-string-be c))
+
+(defn read-soa-vec3-be
+  "Read a struct-of-arrays Vec3 (xs then ys then zs), each u32-prefixed."
+  [c]
+  (let [[xs c1] (read-array-f32-be c)
+        [ys c2] (read-array-f32-be c1)
+        [zs c3] (read-array-f32-be c2)]
+    [{:xs xs :ys ys :zs zs} c3]))
+
+;; ── Little-endian reads (.kgr / .ksm) ─────────────
+
+(defn read-u32-le [{:keys [data pos] :as c}]
+  (let [b0 (nth data pos) b1 (nth data (+ pos 1))
+        b2 (nth data (+ pos 2)) b3 (nth data (+ pos 3))]
+    [(bit-or b0 (bit-shift-left b1 8) (bit-shift-left b2 16) (bit-shift-left b3 24))
+     (assoc c :pos (+ pos 4))]))
+
+(defn read-u16-le [{:keys [data pos] :as c}]
+  (let [b0 (nth data pos) b1 (nth data (+ pos 1))]
+    [(bit-or b0 (bit-shift-left b1 8)) (assoc c :pos (+ pos 2))]))
+
+(defn read-f32-le [c]
+  (let [[bits c'] (read-u32-le c)]
+    [(bits->f32 bits) c']))
+
+(defn read-bytes [{:keys [data pos] :as c} n]
+  [(subvec data pos (+ pos n)) (assoc c :pos (+ pos n))])
+
+(defn read-string-le
+  "Read a u32-length-prefixed UTF-8 string (LE length)."
+  [c]
+  (let [[len c'] (read-u32-le c)]
+    (let [[bytes c2] (read-bytes c' len)
+          s #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte bytes)))
+               :cljs (js/decodeURIComponent
+                      (apply str (map (fn [b] (str "%" (.toUpperCase (.padStart (.toString b 16) 2 "0")))) bytes))))]
+      [s c2])))
+
+;; ── Writes (append to a plain output vector) ──────
+
+(defn write-u8 [out v] (conj out (bit-and v 0xFF)))
+
+(defn write-u16-be [out v]
+  (conj out (bit-and (bit-shift-right v 8) 0xFF) (bit-and v 0xFF)))
+
+(defn write-u32-be [out v]
+  (conj out
+        (bit-and (bit-shift-right v 24) 0xFF)
+        (bit-and (bit-shift-right v 16) 0xFF)
+        (bit-and (bit-shift-right v 8) 0xFF)
+        (bit-and v 0xFF)))
+
+(defn write-f32-be [out f] (write-u32-be out (f32->bits f)))
+
+(defn write-u32-le [out v]
+  (conj out
+        (bit-and v 0xFF)
+        (bit-and (bit-shift-right v 8) 0xFF)
+        (bit-and (bit-shift-right v 16) 0xFF)
+        (bit-and (bit-shift-right v 24) 0xFF)))
+
+(defn write-u16-le [out v]
+  (conj out (bit-and v 0xFF) (bit-and (bit-shift-right v 8) 0xFF)))
+
+(defn write-f32-le [out f] (write-u32-le out (f32->bits f)))
+
+(defn write-bytes [out bytes] (into out bytes))
+
+(defn str->bytes [s]
+  #?(:clj (vec (map #(bit-and (int %) 0xFF) (kbytes/utf8-bytes (str s))))
+     :cljs (vec (js/Array.from (js/TextEncoder.) s))))
+
+(defn write-string-le [out s]
+  (let [bs (str->bytes s)]
+    (write-bytes (write-u32-le out (count bs)) bs)))
+
+(defn write-string-be [out s]
+  (let [bs (str->bytes s)]
+    (write-bytes (write-u32-be out (count bs)) bs)))

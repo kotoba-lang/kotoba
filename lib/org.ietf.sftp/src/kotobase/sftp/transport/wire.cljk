@@ -1,0 +1,468 @@
+(ns kotobase.sftp.transport.wire
+  "SSH Binary Packet Protocol primitives (RFC 4253 §6), KEXINIT algorithm
+  negotiation (§7.1), a single curve25519-sha256 key-exchange method
+  (RFC 8731) and its key derivation (§4253 §7.2). This is the HARD,
+  security-sensitive part of this repo's Phase-1 transport — see
+  `kotobase.sftp.transport.ssh`'s docstring for the overall EXPERIMENTAL /
+  pending-security-review framing this entire transport/ subtree is
+  under. `.cljs`-only (node:crypto + Buffer): cannot run on the JVM, and
+  is never `:require`d by anything under `kotobase.sftp.fs` (the pure
+  Phase-1 core) — see that namespace's own docstring for why the
+  decoupling matters.
+
+  HONESTY NOTE ON RFC/INTEROP SCOPE: these primitives are written to be
+  RFC-4253/8731-SHAPED and self-consistent (this repo's own client and
+  server, both implemented here, genuinely key-exchange and decrypt each
+  other's traffic — see test/kotobase/sftp/transport/ssh_demo.cljk for
+  the real cross-process proof). They have NOT been tested for byte-exact
+  interop against a real OpenSSH client or server, and this repo makes NO
+  claim that they would pass such a test today. IETF's own secsh WG draft
+  this whole repo is named after was never ratified to an RFC in the
+  first place (see README) — RFC 4253/8731 (the transport layer this
+  namespace borrows its shape from) are separate, ratified specs that ARE
+  real RFCs, referenced here only for the wire-format shape, not as a
+  compliance claim for this implementation."
+  (:require [kotoba.lang.text :as str]
+            ["node:crypto" :as crypto]))
+
+;; ---------------------------------------------------------------------------
+;; base64url <-> Buffer, used only to round-trip raw 32-byte X25519/Ed25519
+;; keys through node:crypto's JWK import/export (Node has no `raw` KeyObject
+;; import format for OKP curves; JWK is the least-code way in, without
+;; hand-rolling ASN.1 DER SubjectPublicKeyInfo wrapping).
+;; ---------------------------------------------------------------------------
+
+(defn- b64url [^js buf]
+  (-> (.toString buf "base64")
+      (str/replace "+" "-")
+      (str/replace "/" "_")
+      (str/replace #"=+$" "")))
+
+(defn- from-b64url [s]
+  (let [s (-> s (str/replace "-" "+") (str/replace "_" "/"))
+        pad (mod (- 4 (mod (count s) 4)) 4)]
+    (js/Buffer.from (str s (apply str (repeat pad "="))) "base64")))
+
+;; ---------------------------------------------------------------------------
+;; SSH primitive wire encodings (RFC 4251 §5)
+;; ---------------------------------------------------------------------------
+
+(defn uint32 [n]
+  (let [b (js/Buffer.alloc 4)]
+    (.writeUInt32BE b (bit-and n 0xffffffff) 0)
+    b))
+
+(defn read-uint32 [^js buf offset]
+  (.readUInt32BE buf offset))
+
+(defn ssh-byte [n]
+  (let [b (js/Buffer.alloc 1)]
+    (.writeUInt8 b (bit-and n 0xff) 0)
+    b))
+
+(defn ssh-boolean [b]
+  (ssh-byte (if b 1 0)))
+
+(defn ssh-string
+  "SSH `string`: uint32 length + raw bytes. `s` may be a JS string (UTF-8
+  encoded) or already a Buffer (used as-is)."
+  [s]
+  (let [b (if (string? s) (js/Buffer.from s "utf8") s)]
+    (js/Buffer.concat #js [(uint32 (.-length b)) b])))
+
+(defn read-ssh-string
+  "-> [payload-buf next-offset]. `payload-buf` is the raw bytes (a
+  Buffer), not decoded to a JS string — callers that want text call
+  `(.toString b \"utf8\")` themselves; SFTP path/name bytes are treated as
+  opaque UTF-8 by kotobase.sftp.fs, same 'string body' convention as the
+  rest of this protocol family."
+  [^js buf offset]
+  (let [len (read-uint32 buf offset)
+        start (+ offset 4)]
+    [(.subarray buf start (+ start len)) (+ start len)]))
+
+(defn mpint
+  "SSH `mpint` (RFC 4251 §5) of an unsigned big-endian integer given as
+  raw bytes `b` (leading zero bytes are stripped first, then a single
+  0x00 byte is prepended iff the remaining high bit is set, so the value
+  is unambiguously non-negative per the two's-complement convention)."
+  [^js b]
+  (let [len (.-length b)
+        first-nonzero (loop [i 0] (if (and (< i len) (zero? (aget b i))) (recur (inc i)) i))
+        trimmed (.subarray b first-nonzero len)]
+    (if (zero? (.-length trimmed))
+      (ssh-string (js/Buffer.alloc 0))
+      (if (pos? (bit-and (aget trimmed 0) 0x80))
+        (ssh-string (js/Buffer.concat #js [(js/Buffer.from #js [0]) trimmed]))
+        (ssh-string trimmed)))))
+
+(defn ssh-name-list [coll]
+  (ssh-string (str/join "," coll)))
+
+(defn read-ssh-name-list [^js buf offset]
+  (let [[payload next] (read-ssh-string buf offset)
+        s (.toString payload "utf8")]
+    [(if (str/blank? s) [] (str/split s #",")) next]))
+
+;; ---------------------------------------------------------------------------
+;; curve25519 (X25519) ECDH — raw 32-byte points on the wire, per RFC 8731
+;; ---------------------------------------------------------------------------
+
+(defn x25519-keypair []
+  (crypto/generateKeyPairSync "x25519"))
+
+(defn x25519-raw-pub [key-obj]
+  (from-b64url (.-x (.export key-obj #js {:format "jwk"}))))
+
+(defn x25519-pub-from-raw [^js raw]
+  (crypto/createPublicKey #js {:key #js {:kty "OKP" :crv "X25519" :x (b64url raw)}
+                                :format "jwk"}))
+
+(defn x25519-shared-secret
+  "Raw 32-byte shared secret between our private key and the peer's raw
+  32-byte public key."
+  [our-priv-key-obj peer-raw-pub]
+  (crypto/diffieHellman #js {:privateKey our-priv-key-obj
+                              :publicKey (x25519-pub-from-raw peer-raw-pub)}))
+
+;; ---------------------------------------------------------------------------
+;; Ed25519 host key
+;; ---------------------------------------------------------------------------
+
+(defn ed25519-keypair []
+  (crypto/generateKeyPairSync "ed25519"))
+
+(defn ed25519-raw-pub [key-obj]
+  (from-b64url (.-x (.export key-obj #js {:format "jwk"}))))
+
+(defn ed25519-pub-from-raw [^js raw]
+  (crypto/createPublicKey #js {:key #js {:kty "OKP" :crv "Ed25519" :x (b64url raw)}
+                                :format "jwk"}))
+
+(defn ed25519-sign [priv-key-obj ^js msg-buf]
+  (crypto/sign nil msg-buf priv-key-obj))
+
+(defn ed25519-verify [pub-key-obj ^js msg-buf ^js sig-buf]
+  (crypto/verify nil msg-buf pub-key-obj sig-buf))
+
+(defn host-key-blob
+  "The SSH `ssh-ed25519` public-key blob (RFC 8709 §4): string(\"ssh-ed25519\")
+  + string(raw 32-byte pubkey). Callers wrap this once more in
+  `ssh-string` wherever the spec embeds K_S as a length-prefixed blob
+  (e.g. inside the exchange hash)."
+  [ed25519-raw-pub-bytes]
+  (js/Buffer.concat #js [(ssh-string "ssh-ed25519") (ssh-string ed25519-raw-pub-bytes)]))
+
+;; ---------------------------------------------------------------------------
+;; SSH_MSG_KEXINIT (msg code 20) — build / parse / negotiate
+;; ---------------------------------------------------------------------------
+
+(def msg-kexinit 20)
+(def msg-newkeys 21)
+(def msg-kex-ecdh-init 30)
+(def msg-kex-ecdh-reply 31)
+(def msg-service-request 5)
+(def msg-service-accept 6)
+(def msg-disconnect 1)
+(def msg-userauth-request 50)
+(def msg-userauth-failure 51)
+(def msg-userauth-success 52)
+(def msg-channel-open 90)
+(def msg-channel-open-confirmation 91)
+(def msg-channel-open-failure 92)
+(def msg-channel-window-adjust 93)
+(def msg-channel-data 94)
+(def msg-channel-eof 96)
+(def msg-channel-close 97)
+(def msg-channel-request 98)
+(def msg-channel-success 99)
+(def msg-channel-failure 100)
+
+;; This repo's Phase-1 supported algorithm SET — a single choice per
+;; category, per the task scope ("a single supported key-exchange
+;; method... a single supported cipher... and MAC"). Both this repo's own
+;; client and server offer exactly these, so negotiation always succeeds
+;; between them; a real-world peer offering a different set would fail
+;; negotiation here (SSH_MSG_DISCONNECT), which is correct, honest
+;; behavior for an implementation that only ever claims to support one
+;; algorithm per category.
+(def supported-kex-algorithms ["curve25519-sha256"])
+(def supported-server-host-key-algorithms ["ssh-ed25519"])
+(def supported-ciphers ["aes128-ctr"])
+(def supported-macs ["hmac-sha2-256"])
+(def supported-compressions ["none"])
+
+(defn build-kexinit
+  "-> Buffer, the full SSH_MSG_KEXINIT payload (msg code + cookie +
+  10 name-lists + first_kex_packet_follows boolean + uint32 reserved)."
+  []
+  (js/Buffer.concat
+   (into-array
+    (concat
+     [(ssh-byte msg-kexinit) (crypto/randomBytes 16)]
+     (map ssh-name-list [supported-kex-algorithms
+                          supported-server-host-key-algorithms
+                          supported-ciphers supported-ciphers
+                          supported-macs supported-macs
+                          supported-compressions supported-compressions
+                          [] []])
+     [(ssh-boolean false) (uint32 0)]))))
+
+(defn parse-kexinit
+  "payload -> {:kex-algorithms [...] :server-host-key-algorithms [...]
+  :encryption-c2s [...] :encryption-s2c [...] :mac-c2s [...] :mac-s2c
+  [...] :compression-c2s [...] :compression-s2c [...]}. Assumes payload's
+  first byte is the msg-kexinit code (caller already dispatched on it)."
+  [^js payload]
+  (let [off0 (+ 1 16) ;; msg code + 16-byte cookie
+        fields [:kex-algorithms :server-host-key-algorithms
+                :encryption-c2s :encryption-s2c :mac-c2s :mac-s2c
+                :compression-c2s :compression-s2c :languages-c2s :languages-s2c]]
+    (loop [flds fields off off0 acc {}]
+      (if (empty? flds)
+        acc
+        (let [[names next] (read-ssh-name-list payload off)]
+          (recur (rest flds) next (assoc acc (first flds) names)))))))
+
+(defn negotiate
+  "First entry of `client-prefs` that also appears in `server-offers`
+  (RFC 4253 §7.1: the CLIENT's preference order decides ties), or nil."
+  [client-prefs server-offers]
+  (let [server-set (set server-offers)]
+    (first (filter server-set client-prefs))))
+
+;; ---------------------------------------------------------------------------
+;; Binary packet framing (RFC 4253 §6)
+;; ---------------------------------------------------------------------------
+
+(defn- padding-length-for [payload-len block-size]
+  (let [min-total (+ 1 payload-len 4) ;; padding_length byte + payload, at least 4 bytes padding
+        block-size (max block-size 8)
+        total-unpadded (+ 1 payload-len)
+        pad (- block-size (mod total-unpadded block-size))
+        pad (if (< pad 4) (+ pad block-size) pad)]
+    pad))
+
+(defn build-plaintext-packet
+  "payload (Buffer) -> the full framed packet (Buffer): uint32
+  packet_length + byte padding_length + payload + random padding. No MAC
+  (pre-kex only — every packet up to and including NEWKEYS on each side
+  is sent this way, per RFC 4253 §7: no encryption/MAC is active until a
+  side has both sent AND received NEWKEYS)."
+  [^js payload & [block-size]]
+  (let [block-size (or block-size 8)
+        pad-len (padding-length-for (.-length payload) block-size)
+        padding (crypto/randomBytes pad-len)
+        packet-length (+ 1 (.-length payload) pad-len)]
+    (js/Buffer.concat #js [(uint32 packet-length) (ssh-byte pad-len) payload padding])))
+
+(defn parse-plaintext-packet
+  "buf must contain at least one full packet at offset 0. -> {:payload
+  Buffer :consumed n}."
+  [^js buf]
+  (let [packet-length (read-uint32 buf 0)
+        pad-len (aget buf 4)
+        payload-len (- packet-length 1 pad-len)
+        payload (.subarray buf 5 (+ 5 payload-len))]
+    {:payload payload :consumed (+ 4 packet-length)}))
+
+(defn hmac-sha256 [^js key ^js data]
+  (let [h (crypto/createHmac "sha256" key)]
+    (.update h data)
+    (.digest h)))
+
+;; ---------------------------------------------------------------------------
+;; Key exchange: curve25519-sha256 exchange hash (RFC 8731 §3) + key
+;; derivation (RFC 4253 §7.2), specialized to this repo's fixed choice of
+;; hash (SHA-256), cipher (aes128-ctr: 16-byte key + 16-byte IV) and MAC
+;; (hmac-sha2-256: 32-byte key).
+;; ---------------------------------------------------------------------------
+
+(defn exchange-hash
+  "H = SHA256(string(V_C) || string(V_S) || string(I_C) || string(I_S) ||
+  string(K_S) || string(Q_C) || string(Q_S) || mpint(K)). V_C/V_S are the
+  identification strings WITHOUT the trailing CR-LF (RFC 4253 §8). I_C/I_S
+  are the raw SSH_MSG_KEXINIT payload bytes each side sent. K_S is the
+  host-key-blob. Q_C/Q_S are raw 32-byte ECDH public values. K is the raw
+  32-byte X25519 shared secret."
+  [{:keys [v-c v-s i-c i-s k-s q-c q-s k]}]
+  (let [buf (js/Buffer.concat
+             #js [(ssh-string v-c) (ssh-string v-s)
+                  (ssh-string i-c) (ssh-string i-s)
+                  (ssh-string k-s) (ssh-string q-c) (ssh-string q-s)
+                  (mpint k)])
+        h (crypto/createHash "sha256")]
+    (.update h buf)
+    (.digest h)))
+
+(defn derive-key
+  "One `HASH(K || H || tag-char || session-id)` round, truncated to
+  `len` bytes. SHA-256 always yields >= the 16 (aes128 key/iv) or 32
+  (hmac-sha2-256 key) bytes every derived key in this repo's fixed
+  algorithm set needs, so — unlike the general RFC 4253 §7.2 algorithm,
+  which must concatenate additional HASH(K || H || K1 || K2 || ...)
+  rounds when more bytes are needed — a single round always suffices
+  here; that generalization is deliberately NOT implemented (documented
+  narrowing, not an oversight: this repo supports exactly one cipher and
+  one MAC, both SHA-256-sized-or-smaller)."
+  [^js k ^js h tag-char ^js session-id len]
+  (let [buf (js/Buffer.concat #js [(mpint k) h (js/Buffer.from tag-char "ascii") session-id])
+        d (crypto/createHash "sha256")]
+    (.update d buf)
+    (.subarray (.digest d) 0 len)))
+
+(defn derive-keys
+  "-> {:iv-c2s :iv-s2c :enc-key-c2s :enc-key-s2c :mac-key-c2s
+  :mac-key-s2c}, all Buffers, per this repo's fixed aes128-ctr (16-byte
+  key + 16-byte IV) / hmac-sha2-256 (32-byte key) choice."
+  [k h session-id]
+  {:iv-c2s (derive-key k h "A" session-id 16)
+   :iv-s2c (derive-key k h "B" session-id 16)
+   :enc-key-c2s (derive-key k h "C" session-id 16)
+   :enc-key-s2c (derive-key k h "D" session-id 16)
+   :mac-key-c2s (derive-key k h "E" session-id 32)
+   :mac-key-s2c (derive-key k h "F" session-id 32)})
+
+;; ---------------------------------------------------------------------------
+;; Incremental packet reader / writer — the stateful glue between raw TCP
+;; byte chunks (which have NO relationship to packet boundaries) and
+;; complete SSH_MSG_* payloads, for BOTH the pre-NEWKEYS plaintext phase
+;; and the post-NEWKEYS encrypted-and-MAC'd phase (RFC 4253 §6). Kept
+;; here (not in ssh.cljs) because it's still squarely wire-FRAMING
+;; concern, not session/channel orchestration.
+;;
+;; A reader/writer only ever arms encryption ONCE per connection (this
+;; repo does not implement SSH re-keying / a second SSH_MSG_KEXINIT
+;; mid-session — a real long-lived production SSH implementation would;
+;; a single kex for the lifetime of one TCP connection is a deliberate,
+;; documented v0.1 narrowing, consistent with this whole transport/
+;; subtree's experimental scope).
+;; ---------------------------------------------------------------------------
+
+(defn new-reader []
+  (atom {:raw (js/Buffer.alloc 0)
+         :stage :header ;; :header -> :body -> :mac -> :header ...
+         :block-size 8
+         :mac-len 0
+         :encrypted? false
+         :decipher nil
+         :mac-key nil
+         :seq-in 0
+         :packet-length nil
+         :plain-accum nil}))
+
+(defn arm-reader-encryption!
+  "Call exactly once, synchronously, right after this side has decoded
+  and handled the PEER's SSH_MSG_NEWKEYS payload (RFC 4253 §7: decryption
+  of the receive direction begins with the packet immediately following
+  NEWKEYS, not with NEWKEYS itself). `decipher` is an already-created
+  node:crypto Decipheriv (aes-128-ctr) seeded with this direction's key
+  and IV from `derive-keys`."
+  [reader-atom {:keys [decipher mac-key block-size mac-len]}]
+  (swap! reader-atom assoc
+         :encrypted? true :decipher decipher :mac-key mac-key
+         :block-size block-size :mac-len mac-len))
+
+(defn- take-raw!
+  "Split the first `n` bytes off `(:raw state)`, returning [taken state']."
+  [state n]
+  (let [raw (:raw state)]
+    [(.subarray raw 0 n) (assoc state :raw (.subarray raw n))]))
+
+(defn- decrypt-if-armed [state ^js buf]
+  (if (:encrypted? state) (.update (:decipher state) buf) buf))
+
+(defn feed!
+  "Feed newly-arrived raw bytes `chunk` into `reader-atom`. Calls
+  `(on-packet payload-buf)` synchronously, once per complete packet
+  decoded — SYNCHRONOUSLY, and one at a time (not batched), specifically
+  so a caller that sees an SSH_MSG_NEWKEYS payload can
+  `arm-reader-encryption!` from inside `on-packet` and have that decision
+  take effect before this same `feed!` call goes on to look at any
+  FURTHER bytes already sitting in `chunk` (a real risk: a single TCP
+  'data' event can easily contain the tail of the plaintext NEWKEYS
+  packet AND the start of the very next, now-encrypted, packet
+  concatenated together — see test/kotobase/sftp/transport/wire_test.cljk
+  for a test proving this exact boundary case). Throws
+  `:kotobase.sftp.transport/mac-mismatch` if an encrypted packet's MAC
+  doesn't verify — callers should treat that as fatal (close the
+  connection), never as a retryable condition."
+  [reader-atom chunk on-packet]
+  (swap! reader-atom update :raw (fn [prev] (js/Buffer.concat #js [prev chunk])))
+  (loop []
+    (let [{:keys [raw stage block-size mac-len packet-length
+                  plain-accum encrypted? mac-key seq-in] :as state} @reader-atom]
+      (case stage
+        :header
+        (when (>= (.-length raw) 4)
+          (let [[hdr-raw state1] (take-raw! state 4)
+                hdr-plain (decrypt-if-armed state1 hdr-raw)
+                plen (read-uint32 hdr-plain 0)]
+            ;; Guard against a corrupted/malicious packet_length claiming an
+            ;; absurd size: without this, a single tampered/garbage length
+            ;; field (whether from a real attacker or, e.g., a MAC-covered
+            ;; field getting corrupted in transit) would make this reader
+            ;; wait forever for bytes that will never arrive, growing an
+            ;; unbounded `:raw` buffer in the meantime. 256 KiB is generous
+            ;; for this repo's v0.1 SFTP packet sizes (whole-file
+            ;; string-body writes only, no chunked streaming) while still
+            ;; being a real bound.
+            (when (> plen (* 256 1024))
+              (throw (ex-info "SSH packet_length exceeds this reader's maximum (256 KiB) — dropping connection"
+                               {:type :kotobase.sftp.transport/packet-too-large :packet-length plen})))
+            (reset! reader-atom (assoc state1 :stage :body :packet-length plen :plain-accum hdr-plain))
+            (recur)))
+
+        :body
+        (let [need (- (+ 4 packet-length) (.-length plain-accum))]
+          (when (>= (.-length raw) need)
+            (let [[body-raw state1] (take-raw! state need)
+                  body-plain (decrypt-if-armed state1 body-raw)
+                  full-plain (js/Buffer.concat #js [plain-accum body-plain])]
+              (reset! reader-atom (assoc state1 :stage :mac :plain-accum full-plain))
+              (recur))))
+
+        :mac
+        (when (>= (.-length raw) mac-len)
+          (let [[mac-raw state1] (take-raw! state mac-len)]
+            (when (and encrypted? (pos? mac-len))
+              (let [expected (hmac-sha256 mac-key (js/Buffer.concat #js [(uint32 seq-in) plain-accum]))]
+                (when-not (.equals expected mac-raw)
+                  (throw (ex-info "SSH MAC verification failed — dropping connection"
+                                  {:type :kotobase.sftp.transport/mac-mismatch})))))
+            (let [pad-len (aget plain-accum 4)
+                  payload-len (- packet-length 1 pad-len)
+                  payload (.subarray plain-accum 5 (+ 5 payload-len))]
+              (reset! reader-atom (assoc state1 :stage :header :packet-length nil
+                                          :plain-accum nil :seq-in (inc seq-in)))
+              (on-packet payload)
+              (recur))))))))
+
+(defn new-writer []
+  (atom {:encrypted? false :cipher nil :mac-key nil :block-size 8 :mac-len 0 :seq-out 0}))
+
+(defn arm-writer-encryption!
+  "Call exactly once, synchronously, right after this side has SENT its
+  own SSH_MSG_NEWKEYS payload (encryption of the send direction begins
+  with the packet immediately following the one carrying NEWKEYS)."
+  [writer-atom {:keys [cipher mac-key block-size mac-len]}]
+  (swap! writer-atom assoc
+         :encrypted? true :cipher cipher :mac-key mac-key
+         :block-size block-size :mac-len mac-len))
+
+(defn encode-packet
+  "-> Buffer ready to `.write` to the socket (or to feed straight into a
+  reader in a same-process test), for `payload` given writer-atom's
+  CURRENT state — does not mutate `writer-atom`; call `advance-writer!`
+  after actually writing it."
+  [writer-atom payload]
+  (let [{:keys [block-size encrypted? cipher mac-key seq-out]} @writer-atom
+        framed (build-plaintext-packet payload block-size)]
+    (if encrypted?
+      (let [ciphertext (.update cipher framed)
+            mac (hmac-sha256 mac-key (js/Buffer.concat #js [(uint32 seq-out) framed]))]
+        (js/Buffer.concat #js [ciphertext mac]))
+      framed)))
+
+(defn advance-writer! [writer-atom]
+  (swap! writer-atom update :seq-out inc))

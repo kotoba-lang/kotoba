@@ -1,0 +1,162 @@
+(ns collect-kanpou-kessan
+  "官報の会社決算公告から非上場企業の決算期を集める。
+
+   The only public route to 決算期 for a company that files no securities
+   report — and it is a *window*, not an archive: kanpou.npb.go.jp serves the
+   last 90 days free and nothing before that. So this is data you start
+   accumulating, and a day not collected is a day lost.
+
+   Yield is reported, not hidden: the summary prints how many 決算公告 headlines
+   were found and how many became records. A parser that quietly dropped two
+   thirds of them would look identical to a quiet day.
+
+   Requires `pdftotext` (poppler). Fails closed if it is missing rather than
+   writing an empty file.
+
+   Usage:
+     kbb --backend sci -cp src scripts/collect_kanpou_kessan.cljk --dates 20260818,20260817 --out /tmp/k.edn
+     kbb --backend sci -cp src scripts/collect_kanpou_kessan.cljk --back 7 --out <repo>/data/kanpou-kessan.datoms.edn"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.kanpou-kessan :as kk]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["stream" :as stream]))
+
+(def cache-dir (.join path (or (.-HOME js/process.env) ".") ".cache" "kanpou"))
+(def base "https://kanpou.npb.go.jp")
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- pdftotext? []
+  (try (.execFileSync cp "pdftotext" #js ["-v"] #js {:stdio "ignore"}) true
+       (catch :default _ false)))
+
+(defn- yyyymmdd [^js d]
+  (str (.getFullYear d)
+       (let [m (inc (.getMonth d))] (str (when (< m 10) "0") m))
+       (let [x (.getDate d)] (str (when (< x 10) "0") x))))
+
+(defn- recent-dates [n]
+  (let [now (js/Date.)]
+    (vec (for [i (range n)]
+           (yyyymmdd (js/Date. (- (.getTime now) (* i 86400000))))))))
+
+(defn- fetch-text [url]
+  (-> (js/fetch url)
+      (.then (fn [res] (if (.-ok res) (.text res) "")))
+      (.catch (fn [_] ""))))
+
+(defn- issue-pdf-urls
+  "The site's front page lists every issue in the 90-day window, so one fetch
+   yields the whole window rather than one request per day. (`/YYYYMMDD/` is a
+   404 — there is no per-day index.)"
+  [html date]
+  (->> (re-seq #"href=\"\./([0-9]{8})/([0-9a-z]+)/([0-9a-z]+full[0-9]+)f\.html\"" html)
+       (filter (fn [[_ d _ _]] (= d date)))
+       (map (fn [[_ d issue full]] (str base "/" d "/" issue "/pdf/" full ".pdf")))
+       distinct
+       vec))
+
+(defn- download! [url dest]
+  (js/Promise.
+   (fn [resolve* _reject*]
+     (-> (js/fetch url)
+         (.then (fn [res]
+                  (if-not (.-ok res)
+                    (resolve* nil)
+                    (let [sink (.createWriteStream fs dest)]
+                      (-> (.-Readable stream) (.fromWeb (.-body res)) (.pipe sink))
+                      (.on sink "finish" (fn [] (resolve* dest)))
+                      (.on sink "error" (fn [_] (resolve* nil)))))))
+         (.catch (fn [_] (resolve* nil)))))))
+
+(defn- pdf->text [pdf]
+  (try (.toString (.execFileSync cp "pdftotext" #js [pdf "-"]
+                                 #js {:maxBuffer (* 256 1024 1024)}))
+       (catch :default _ "")))
+
+(defn- process-pdf! [state url date-iso]
+  (let [dest (.join path cache-dir (last (str/split url #"/")))]
+    (-> (if (.existsSync fs dest)
+          (js/Promise.resolve dest)
+          (download! url dest))
+        (.then (fn [file]
+                 (when file
+                   (let [text (pdf->text file)
+                         blocks (count (kk/split-blocks text))
+                         recs (vec (kk/parse-section text date-iso))]
+                     (swap! state #(-> %
+                                       (update :records into recs)
+                                       (update :blocks + blocks)
+                                       (update :pdfs inc)))
+                     (when (pos? blocks)
+                       (println (str "    " (last (str/split url #"/"))
+                                     ": " blocks " headline(s) -> " (count recs) " record(s)"))))))))))
+
+(defn- process-date! [state front-page date]
+  (let [date-iso (str (subs date 0 4) "-" (subs date 4 6) "-" (subs date 6 8))
+        urls (issue-pdf-urls front-page date)]
+    (println (str "  " date ": " (count urls) " issue pdf(s)"))
+    (-> (reduce (fn [q url] (.then q (fn [_] (process-pdf! state url date-iso))))
+                (js/Promise.resolve nil)
+                urls)
+        (.then (fn [_] (swap! state update :issues conj date))))))
+
+(defn- finish! [state out dates]
+  (let [{:keys [records blocks issues pdfs]} @state
+        manifest (kk/corpus-manifest {:observed-at (.toISOString (js/Date.))
+                                      :issues issues
+                                      :record-count (count records)
+                                      :window-days 90})]
+    (.mkdirSync fs (.dirname path out) #js {:recursive true})
+    (.writeFileSync fs out
+                    (str (pr-str (assoc manifest :corpus/headlines blocks)) "\n"
+                         (str/join "\n" (map pr-str records))
+                         (when (seq records) "\n"))
+                    "utf8")
+    (println (pr-str {:out out
+                      :dates (count dates)
+                      :pdfs pdfs
+                      ;; Both numbers, always: a parser that dropped most
+                      ;; headlines and a quiet day produce the same record count
+                      ;; and nothing else says which.
+                      :headlines blocks
+                      :records (count records)
+                      :yield (when (pos? blocks)
+                               (str (js/Math.round (* 100 (/ (count records) blocks))) "%"))
+                      :bytes (.-size (.statSync fs out))}))
+    (when (and (pos? blocks) (zero? (count records)))
+      (js/console.error "collect-kanpou-kessan: headlines were found but nothing parsed — the layout changed")
+      (.exit js/process 2))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        out (arg-value args "--out" nil)
+        dates (if-let [d (arg-value args "--dates" nil)]
+                (vec (remove str/blank? (map str/trim (str/split d #","))))
+                (recent-dates (js/parseInt (arg-value args "--back" "3") 10)))]
+    (when-not out
+      (println "usage: collect_kanpou_kessan.cljs (--dates 20260818,... | --back N) --out <out.edn>")
+      (.exit js/process 2))
+    (when-not (pdftotext?)
+      (println "pdftotext (poppler) is required and was not found — refusing to write an empty file")
+      (.exit js/process 2))
+    (coverage/assert-collectable! kk/source-id)
+    (.mkdirSync fs cache-dir #js {:recursive true})
+    (let [state (atom {:records [] :blocks 0 :issues [] :pdfs 0})]
+      (-> (fetch-text (str base "/"))
+          (.then (fn [front-page]
+                   (when (str/blank? front-page)
+                     (throw (ex-info "the front page returned nothing — no issue list, so nothing can be collected" {})))
+                   (reduce (fn [p date] (.then p (fn [_] (process-date! state front-page date))))
+                           (js/Promise.resolve nil)
+                           dates)))
+          (.then (fn [_] (finish! state out dates)))
+          (.catch (fn [e]
+                    (js/console.error (str "collect-kanpou-kessan failed: " (.-message e)))
+                    (.exit js/process 1)))))))
+
+(-main)

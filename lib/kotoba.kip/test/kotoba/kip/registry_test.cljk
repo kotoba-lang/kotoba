@@ -1,0 +1,169 @@
+(ns kotoba.kip.registry-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kip.registry :as registry]))
+
+(def process
+  {:guards {:last-call-elapsed {:min-days 14}
+            :quorum-met {:threshold 2}}
+   ;; Mirrors lang/kip-process.edn :tracks. The per-track ladder reads these,
+   ;; and a fixture that omitted them defaulted every track to standards —
+   ;; which is exactly the bug being tested for.
+   :tracks {:standards {:requires-last-call true :requires-quorum true}
+            :process {:requires-last-call false :requires-quorum false}
+            :informational {:requires-last-call false :requires-quorum false}}
+   :track-gated-fields {:requires-last-call #{:kip/last-call-started}
+                        :requires-quorum #{:kip/quorum}}
+   :requirements {:draft #{:kip/number :kip/title :kip/track :kip/status :kip/author :kip/created}
+                  :review #{:kip/abstract :kip/motivation :kip/specification}
+                  :last-call #{:kip/surfaces :kip/last-call-started}
+                  :final #{:kip/evidence :kip/migration :kip/quorum}}})
+
+;; `format` is JVM-only; these files are .cljc and the suite is meant to stay
+;; runnable under a ClojureScript host.
+(defn- pad4 [n] (let [s (str n)] (str (subs "0000" 0 (- 4 (count s))) s)))
+
+(defn- doc
+  "tx-data for a KIP that satisfies :draft, plus whatever you override."
+  [n & {:as over}]
+  [(merge {:db/id -1
+           :kip/id (str "kip-" (pad4 n))
+           :kip/number n
+           :kip/title (str "kip " n)
+           :kip/track :process
+           :kip/status :draft
+           :kip/author "a"
+           :kip/created "2026-08-16"}
+          over)])
+
+(defn- entry [n & {:as over}]
+  {:path (str "kips/kip-" (pad4 n) ".edn")
+   :tx-data (apply doc n (mapcat identity over))})
+
+(defn- kinds [result]
+  (into #{} (map :kind) (:findings result)))
+
+;; ------------------------------------------------------------------ the floor
+(deftest an-empty-registry-is-scanned-zero-not-clean
+  (let [r (registry/check process [])]
+    (is (zero? (:scanned r)))
+    (is (empty? (:findings r)))
+    (testing "empty findings is exactly why callers must read :scanned —
+              this result is indistinguishable from a healthy registry"
+      (is (zero? (:read-ok r))))))
+
+(deftest a-healthy-registry-is-clean
+  (let [r (registry/check process [(entry 0) (entry 1)])]
+    (is (= 2 (:scanned r)))
+    (is (= 2 (:read-ok r)))
+    (is (empty? (registry/errors r)))
+    (is (empty? (registry/warnings r)))))
+
+;; --------------------------------------------------------------- numbering
+(deftest filename-and-number-must-agree
+  (let [r (registry/check process [{:path "kips/kip-0007.edn" :tx-data (doc 8)}])]
+    (is (contains? (kinds r) :kip/filename-number-mismatch))))
+
+(deftest an-unnumbered-filename-is-an-error
+  (let [r (registry/check process [{:path "kips/draft-idea.edn" :tx-data (doc 3)}])]
+    (is (contains? (kinds r) :kip/unnumbered-filename))))
+
+(deftest duplicate-numbers-are-caught-across-files
+  (let [r (registry/check process [(entry 4)
+                                   {:path "kips/kip-0004.edn" :tx-data (doc 4 :kip/id "kip-0004b")}])]
+    (is (contains? (kinds r) :kip/duplicate-number))
+    (testing "reported once for the pair, naming both files"
+      (let [f (first (filter #(= :kip/duplicate-number (:kind %)) (:findings r)))]
+        (is (= 2 (count (:path f))))))))
+
+(deftest a-gap-is-a-warning-not-an-error
+  (let [r (registry/check process [(entry 0) (entry 3)])]
+    (is (empty? (registry/errors r)))
+    (is (= #{1 2} (into #{} (map :number) (registry/warnings r))))))
+
+;; ------------------------------------------------------------------ status
+(deftest a-document-must-satisfy-the-state-it-claims
+  (testing "writing straight into :final with no specification"
+    (let [r (registry/check process [(entry 5 {:kip/status :final})])]
+      (is (contains? (kinds r) :kip/missing-required-fields))
+      (let [f (first (filter #(= :kip/missing-required-fields (:kind %)) (:findings r)))]
+        (is (some #{:kip/specification} (:missing f)))
+        (is (some #{:kip/evidence} (:missing f)))))))
+
+(deftest unknown-status-and-track-are-reported
+  (is (contains? (kinds (registry/check process [(entry 6 {:kip/status :cooking})]))
+                 :kip/unknown-status))
+  (is (contains? (kinds (registry/check process [(entry 6 {:kip/track :vibes})]))
+                 :kip/unknown-track)))
+
+(deftest last-call-needs-a-parseable-start
+  (let [r (registry/check process
+                          [(entry 7 {:kip/status :last-call
+                                     :kip/track :standards
+                                     :kip/abstract "a" :kip/motivation "m" :kip/specification "s"
+                                     :kip/surfaces "[:value-codec]"
+                                     :kip/last-call-started "soon"})])]
+    (is (contains? (kinds r) :kip/last-call-start-unparseable))))
+
+;; ------------------------------------------------------------------ quorum
+(def final-standards
+  {:kip/status :final :kip/track :standards
+   :kip/abstract "a" :kip/motivation "m" :kip/specification "s"
+   :kip/surfaces "[:value-codec]" :kip/last-call-started "2026-01-01"
+   :kip/evidence "[\"ran it\"]" :kip/migration "none"})
+
+(deftest a-final-standards-kip-below-quorum-is-an-error
+  (testing "this is the one failure that would make the process decorative"
+    (let [r (registry/check process
+                            [(entry 8 (assoc final-standards
+                                             :kip/quorum "[{:signer \"did:key:zA\"}]"))])]
+      (is (contains? (kinds r) :kip/final-below-quorum))))
+  (testing "two distinct signers clears it"
+    (let [r (registry/check process
+                            [(entry 8 (assoc final-standards
+                                             :kip/quorum "[{:signer \"did:key:zA\"} {:signer \"did:key:zB\"}]"))])]
+      (is (empty? (registry/errors r)))))
+  (testing "the same signer twice does not"
+    (let [r (registry/check process
+                            [(entry 8 (assoc final-standards
+                                             :kip/quorum "[{:signer \"did:key:zA\"} {:signer \"did:key:zA\"}]"))])]
+      (is (contains? (kinds r) :kip/final-below-quorum)))))
+
+;; -------------------------------------------------------------- references
+(deftest dangling-references-are-caught
+  (testing ":kip/superseded-by pointing at nothing"
+    (let [r (registry/check process [(entry 9 {:kip/superseded-by "kip-0099"})])]
+      (is (contains? (kinds r) :kip/dangling-superseded-by))))
+  (testing ":kip/requires is allowed to dangle while still a draft"
+    (let [r (registry/check process [(entry 9 {:kip/requires "[\"kip-0099\"]"})])]
+      (is (empty? (registry/errors r)))))
+  (testing "but not once it is in review"
+    (let [r (registry/check process [(entry 9 {:kip/status :review
+                                               :kip/abstract "a" :kip/motivation "m"
+                                               :kip/specification "s"
+                                               :kip/requires "[\"kip-0099\"]"})])]
+      (is (contains? (kinds r) :kip/dangling-requires))))
+  (testing "and resolves when the target is in the set"
+    (let [r (registry/check process [(entry 0)
+                                     (entry 9 {:kip/status :review
+                                               :kip/abstract "a" :kip/motivation "m"
+                                               :kip/specification "s"
+                                               :kip/requires "[\"kip-0000\"]"})])]
+      (is (empty? (registry/errors r))))))
+
+(deftest superseded-without-a-target
+  (let [r (registry/check process [(entry 10 {:kip/status :superseded})])]
+    (is (contains? (kinds r) :kip/superseded-without-target))))
+
+;; ----------------------------------------------------------- broken input
+(deftest an-unparseable-document-is-a-finding-not-a-crash
+  (let [r (registry/check process [{:path "kips/kip-0011.edn" :tx-data {:not "tx-data"}}
+                                   (entry 0)])]
+    (is (= 2 (:scanned r)))
+    (is (= 1 (:read-ok r)) "the good one is still checked")
+    (is (contains? (kinds r) :kip/not-tx-data))))
+
+(deftest number-from-path
+  (is (= 0 (registry/number-from-path "lib/kotoba.kip/kips/kip-0000.edn")))
+  (is (= 123 (registry/number-from-path "/abs/kips/kip-0123.edn")))
+  (is (nil? (registry/number-from-path "kips/kip-12.edn")))
+  (is (nil? (registry/number-from-path "README.md"))))

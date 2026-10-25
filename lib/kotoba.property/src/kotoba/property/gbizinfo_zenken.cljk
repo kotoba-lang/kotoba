@@ -1,0 +1,214 @@
+(ns kotoba.property.gbizinfo-zenken
+  "gBizINFO の**全件データ**（データダウンロード）の行契約。
+
+   `kotoba.property.gbizinfo` は同じ authority の *lookup* 経路（REST v2、
+   1 社ずつ）を持つ。ここは *ingest* 経路である —— ADR-2608181000 が国税庁について
+   引いたのと同じ線で、gBizINFO でも同じ形になる。
+
+   ## なぜ lookup ではなく bulk なのか（実測 2026-08-19）
+
+   `scripts/gbizinfo_refresh.cljk` は面が持つ法人番号を全部引き直す。面には
+   **9,132 件**あり、aspect は 7 つ、つまり **63,924 リクエスト**。一方この全件
+   経路は **5 ファイル・約 30 秒**で 1,027,940 行が落ちてくる:
+
+     補助金     545,877 行 / 131,760 社
+     調達       308,661 行 /  23,598 社
+     届出認定   132,500 行 /  80,571 社
+     財務        24,294 行 /   4,883 社
+     表彰        16,711 行 /  10,182 社
+
+   lookup は「この 1 社について今どうなっているか」に、bulk は「面に載せる」に
+   使う。どちらも他方を置き換えない。
+
+   ## トークンは bulk にも要る（国税庁と違う点）
+
+   国税庁の全件は Application ID 不要だった。gBizINFO は **API も bulk も同じ
+   アクセストークンを要求する**（実測 2026-08-19: token 無しの POST は 200 で
+   「ダウンロードにはアクセストークンが必要です。」という HTML を返す —— つまり
+   **失敗が 200 で返る**ので、status code を成功判定に使ってはいけない）。
+
+   ## 出す属性
+
+   面が既に join している名前をそのまま使う（ADR-2607252000 / ADR-2608181000）:
+
+   - `:company/houjin-bangou` — 13 桁、曖昧さが無い
+   - `:company/registration-no` — **同じ値**。GLEIF Golden Copy が JP entity の
+     `RegistrationAuthorityEntityID` に持つのがこれなので、両方出しておくと
+     GLEIF・国税庁・gBizINFO が翻訳層なしで一致する。
+
+   活動そのものは **`:grant/*`** に置く。この語彙は API 経路（`collect_gbizinfo.cljs`）
+   が既に `jp-go-gbiz-info` に commit しているものと**同一**にしてある —— 同じ
+   authority の同じ事実を 2 つの語彙で持つと、片方だけが直る mirror になる
+   （AGENTS.md）。会社そのものの属性（決算期・売上）だけが `:company/*`。"
+  (:require [kotoba.lang.text :as str]))
+
+(def source-id "gbizinfo-zenken")
+(def authority-id "JP/METI-gBizINFO")
+(def dataset "gbizinfo")
+(def licence "gBizINFO API・データダウンロード利用規約 (経済産業省)")
+(def attribution
+  "出典：gBizINFO（経済産業省）https://info.gbiz.go.jp/ を加工して作成")
+
+(def download-endpoint "https://info.gbiz.go.jp/hojin/Download")
+(def download-page "https://info.gbiz.go.jp/hojin/DownloadTop")
+
+(def sections
+  "ダウンロードできる 11 種のうち、面に載せる 5 つ。
+
+   `:downfile` はフォームの radio value そのもの。`:columns` は**ファイルに
+   ヘッダ行がある**ので確認用であって位置契約ではない —— が、書いておくのは、
+   列が入れ替わったときに黙って別の列を読まないため（`row->record` はヘッダを
+   見て名前で引き、`:columns` と食い違えば拒否する）。"
+  [{:key :subsidy      :downfile "Hojokinjoho"
+    :label "補助金"
+    :columns ["法人番号" "商号または名称" "登記住所" "証明日" "名称" "金額" "対象" "発行元"]}
+   {:key :procurement  :downfile "Chotatsujoho"
+    :label "調達"
+    :columns ["法人番号" "商号または名称" "登記住所" "受注日" "件名" "落札価格" "組織名" "備考"]}
+   {:key :certification :downfile "TodokedeNinteijoho"
+    :label "届出認定"
+    :columns ["法人番号" "商号または名称" "登記住所" "証明日" "名称" "対象" "部門" "発行元"]}
+   {:key :finance      :downfile "Zaimujoho"
+    :label "財務"
+    :columns ["法人番号" "商号または名称" "登記住所" "会計基準" "事業年度" "回次" "売上高"]}
+   {:key :commendation :downfile "Hyoshojoho"
+    :label "表彰"
+    :columns ["法人番号" "商号または名称" "登記住所" "証明日" "名称" "対象" "部門" "発行元" "備考"]}])
+
+(def section-by-key (into {} (map (juxt :key identity)) sections))
+
+(defn section-for [k] (get section-by-key k))
+
+;; ─────────────────────────────────────────────────────────────── numbers
+
+(def ^:private houjin-bangou-re
+  "`\\A`/`\\z` を使わない。**Java だけの構文**で、JavaScript の RegExp では
+   ただの文字 `A`/`z` になる —— cljs では `\"A1234567890123z\"` にしか一致せず、
+   本番（nbb）で全件が弾かれる。JVM のテストは通ったまま。実測 2026-08-19、
+   9,141 件の法人番号ファイルが `no 13-digit numbers` で拒否された。
+   `re-matches` はどちらの host でも全体一致なので、アンカーは要らない。"
+  #"[0-9]{13}")
+
+(defn houjin-bangou?
+  "13 桁であることだけを見る（検査数字は国税庁側の projection が全件検証済み）。"
+  [s]
+  (boolean (and (string? s) (re-matches houjin-bangou-re s))))
+
+(defn- blank->nil [s]
+  (let [t (some-> s str/trim)]
+    (when-not (str/blank? t) t)))
+
+(defn parse-amount
+  "金額文字列 -> 整数、または nil。
+
+   カンマと全角スペースを落とすだけで、**単位は解釈しない** —— gBizINFO の財務は
+   金額と単位を別の列で持つので、ここで掛け算をすると単位列が付いていない他の
+   dataset と混ざる。`:gbiz/amount` は「そのファイルが書いた数」であって円ではない。"
+  [s]
+  (when-let [t (blank->nil s)]
+    (let [digits (-> t (str/replace #"[,\s　]" ""))]
+      (when (re-matches #"\A-?[0-9]+\z" digits)
+        #?(:clj (Long/parseLong digits)
+           :cljs (js/parseInt digits 10))))))
+
+;; ────────────────────────────────────────────────────────────── records
+
+(def ^:private field-map
+  "section -> {出力キー ヘッダ名}。ヘッダ名で引くので列順の変更では壊れない。"
+  {:subsidy       {:grant/title "名称" :grant/date "証明日" :grant/amount-yen "金額"
+                   :grant/target "対象" :grant/ministry "発行元"}
+   :procurement   {:grant/title "件名" :grant/date "受注日" :grant/amount-yen "落札価格"
+                   :grant/ministry "組織名" :grant/note "備考"}
+   :certification {:grant/title "名称" :grant/date "証明日" :grant/target "対象"
+                   :grant/division "部門" :grant/ministry "発行元"}
+   :commendation  {:grant/title "名称" :grant/date "証明日" :grant/target "対象"
+                   :grant/division "部門" :grant/ministry "発行元" :grant/note "備考"}
+   :finance       {:company/accounting-standard "会計基準" :company/fiscal-year "事業年度"
+                   :company/fiscal-period "回次" :company/net-sales-yen "売上高"}})
+
+(defn row->record
+  "1 行 -> datom map、または nil。
+
+   `row` はヘッダ名 -> 値の map（呼び出し側が CSV から作る）。法人番号が 13 桁で
+   なければ nil を返す —— gBizINFO には法人番号を持たない行があり、それは
+   「番号が空の会社」ではなく**この面に載せられない行**である。"
+  [section-key row]
+  (when-let [hb (houjin-bangou? (blank->nil (get row "法人番号")))]
+    (let [hb (str/trim (get row "法人番号"))
+          fields (get field-map section-key)
+          base {:company/houjin-bangou hb
+                :company/registration-no hb
+                :company/jurisdiction "JP"
+                :grant/kind section-key
+                :source/dataset dataset
+                :source/authority authority-id}
+          ;; `:company/legal-name` は API 経路が使っている名前。`:company/name`
+          ;; ではない —— 面の他の dataset（GLEIF）も legal-name で持つ。
+          named (when-let [n (blank->nil (get row "商号または名称"))]
+                  {:company/legal-name n})]
+      (reduce-kv (fn [acc k header]
+                   (if-let [v (blank->nil (get row header))]
+                     (assoc acc k (if (contains? #{:grant/amount-yen :company/net-sales-yen} k)
+                                    (or (parse-amount v) v)
+                                    v))
+                     acc))
+                 (merge base named)
+                 fields))))
+
+(defn summary-manifest
+  "畳んだ側（government summary）の 1 entity。
+
+   **畳んだ projection は、畳む前が何行だったかを自分では答えられない。** 実測
+   2026-08-19、この summary ファイルは manifest 行を 1 本も持っておらず、
+   2,358 件の集計が「125,144 行を畳んだ結果」であることがファイルから読めなかった
+   （出所・ライセンス・観測時刻も無い）。件数だけの projection が全件のうち何かを
+   答えられないのと同じ欠陥で、畳んだ側では**分母が 2 つ**要る:
+   何社に畳んだか（`:projection/company-count`）と、何行を畳んだか
+   （`:projection/folded-rows`）。
+
+   section ごとの `:source/content-sha256` はここには複製しない —— 同じ pass の
+   もう一方のファイルに在り、複製すれば必ず片方だけ古くなる。代わりに
+   `:corpus/sha256-recorded-in` でその名前を指す。**この key は検査器が読む**
+   （`verify-projections.cljs` が、指された兄弟ファイルが実在し section を
+   網羅していることを確かめる）—— 誰も読まない key は、機能が在るという嘘になる。"
+  [{:keys [summaries folded-rows companies sections observed-at publishes joined-file]}]
+  {:corpus/manifest true
+   :corpus/summarised true
+   :corpus/record-count summaries
+   :projection/folded-rows folded-rows
+   :projection/company-count companies
+   :corpus/sections (vec sections)
+   :corpus/sha256-recorded-in joined-file
+   :source/dataset dataset
+   :source/authority authority-id
+   :source/licence licence
+   :source/attribution attribution
+   :source/observed-at observed-at
+   :source/publish (vec publishes)})
+
+(defn manifest
+  "この pass が何を読んだかの 1 entity。**projection と一緒に commit する** ——
+   件数だけの projection は、それが全件のうち何かを答えられない。
+
+   ⚠ **`:corpus/record-count` は「このファイルに書いた件数」で固定する。**
+   ここは以前**読んだ元ファイルの行数**（section あたり数十万）を入れており、
+   同じ key が dataset によって別のものを指していた（実測 2026-08-20: この面の
+   `:corpus/record-count` を合計すると gbizinfo だけ 1,035,804 になり、ファイルの
+   実体 3,034 と 2 桁以上違った）。**key が 2 つの意味を持つと、それを使う検査は
+   全部不健全になる。** 読んだ行数は `:projection/source-rows` に移した。"
+  [{:keys [section rows matched companies observed-at content-sha256 publish
+           records]}]
+  {:corpus/manifest true
+   :corpus/section (:key section)
+   :corpus/section-label (:label section)
+   :corpus/record-count records
+   :projection/source-rows rows
+   :projection/matched-rows matched
+   :projection/company-count companies
+   :source/dataset dataset
+   :source/authority authority-id
+   :source/licence licence
+   :source/attribution attribution
+   :source/observed-at observed-at
+   :source/publish publish
+   :source/content-sha256 content-sha256})

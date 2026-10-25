@@ -1,0 +1,136 @@
+(ns saifu.tx
+  "Cosmos SIGN_MODE_DIRECT の正準化。**bytes → bytes の純粋関数だけ。**
+  鍵にも網にも触らない（ADR-2608039900 の実装順 3 番目 — 資金ゼロで
+  正しさを証明できる範囲）。
+
+  ## byte 単位で厳密、oracle は cosmjs
+
+  SIGN_MODE_DIRECT は protobuf のフィールド順・省略規則を 1 つ間違えると
+  署名が通らないか、最悪『別の tx に署名する』。だからこの ns の出力は
+  **cosmjs（参照実装）が生成した実ベクタと byte 一致**で検査する
+  （`test/saifu/direct_test.cljk`。ベクタの再生成は
+  `test/saifu/cosmjs_oracle.cljk` — nbb + npm の @cosmjs/proto-signing）。
+
+  ## proto3 の既定値は『書かない』
+
+  proto3 は zero/empty の scalar を serialize しない。sequence 0・空 memo・
+  account-number 0 を varint 0 として書くと **cosmjs と別の bytes** になり、
+  署名は互いに検証できない。この ns は既定値を明示的に落とす。
+
+  ## schema は data（dev-protobuf / protobuf.wire）
+
+  cosmos-sdk の .proto から写した EDN schema を、spec の隣でレビューできる
+  形で持つ。コード生成は無い。"
+  (:require [protobuf.wire :as pb]))
+
+;; ── cosmos-sdk proto schemas (cosmos/tx/v1beta1/tx.proto,
+;;    cosmos/bank/v1beta1/tx.proto, cosmos/base/v1beta1/coin.proto,
+;;    cosmos/crypto/secp256k1/keys.proto, google/protobuf/any.proto) ────────
+
+(def Coin
+  {1 {:name :denom :type :string}
+   2 {:name :amount :type :string}})
+
+(def Any
+  {1 {:name :type-url :type :string}
+   2 {:name :value :type :bytes}})
+
+(def MsgSend
+  {1 {:name :from-address :type :string}
+   2 {:name :to-address :type :string}
+   3 {:name :amount :type :message :schema Coin :repeated true}})
+
+(def TxBody
+  {1 {:name :messages :type :message :schema Any :repeated true}
+   2 {:name :memo :type :string}
+   3 {:name :timeout-height :type :uint64}})
+
+(def PubKey
+  {1 {:name :key :type :bytes}})
+
+(def ModeInfo-Single
+  {1 {:name :mode :type :enum}})
+
+(def ModeInfo
+  {1 {:name :single :type :message :schema ModeInfo-Single}})
+
+(def SignerInfo
+  {1 {:name :public-key :type :message :schema Any}
+   2 {:name :mode-info :type :message :schema ModeInfo}
+   3 {:name :sequence :type :uint64}})
+
+(def Fee
+  {1 {:name :amount :type :message :schema Coin :repeated true}
+   2 {:name :gas-limit :type :uint64}
+   3 {:name :payer :type :string}
+   4 {:name :granter :type :string}})
+
+(def AuthInfo
+  {1 {:name :signer-infos :type :message :schema SignerInfo :repeated true}
+   2 {:name :fee :type :message :schema Fee}})
+
+(def SignDoc
+  {1 {:name :body-bytes :type :bytes}
+   2 {:name :auth-info-bytes :type :bytes}
+   3 {:name :chain-id :type :string}
+   4 {:name :account-number :type :uint64}})
+
+(def TxRaw
+  {1 {:name :body-bytes :type :bytes}
+   2 {:name :auth-info-bytes :type :bytes}
+   3 {:name :signatures :type :bytes :repeated true}})
+
+(def sign-mode-direct
+  "cosmos.tx.signing.v1beta1.SignMode SIGN_MODE_DIRECT."
+  1)
+
+;; ── builders (each returns an octet vector) ──────────────────────────────
+
+(defn msg-send-any
+  "bank MsgSend を Any に包む。`coins` は [{:denom \"uakt\" :amount \"500000\"} …]
+  — amount は文字列（cosmos の sdk.Int は 10 進文字列で wire に載る）。"
+  [from to coins]
+  {:type-url "/cosmos.bank.v1beta1.MsgSend"
+   :value (pb/encode MsgSend {:from-address from :to-address to :amount coins})})
+
+(defn body-bytes
+  "TxBody bytes。空 memo と timeout-height 0 は proto3 の既定値なので書かない。"
+  [{:keys [messages memo timeout-height]}]
+  (pb/encode TxBody
+             (cond-> {:messages (vec messages)}
+               (seq memo) (assoc :memo memo)
+               (and timeout-height (pos? (long timeout-height)))
+               (assoc :timeout-height timeout-height))))
+
+(defn auth-info-bytes
+  "AuthInfo bytes（single signer / SIGN_MODE_DIRECT）。
+  `pubkey33` は 33 byte の compressed secp256k1、`fee` は
+  {:amount coins :gas-limit n :payer? :granter?}。sequence 0 は書かない。"
+  [{:keys [pubkey33 sequence fee]}]
+  (pb/encode AuthInfo
+             {:signer-infos
+              [(cond-> {:public-key {:type-url "/cosmos.crypto.secp256k1.PubKey"
+                                     :value (pb/encode PubKey {:key (vec pubkey33)})}
+                        :mode-info {:single {:mode sign-mode-direct}}}
+                 (and sequence (pos? (long sequence))) (assoc :sequence sequence))]
+              :fee (cond-> {:amount (vec (:amount fee))
+                            :gas-limit (:gas-limit fee)}
+                     (seq (:payer fee)) (assoc :payer (:payer fee))
+                     (seq (:granter fee)) (assoc :granter (:granter fee)))}))
+
+(defn sign-doc-bytes
+  "SignDoc bytes — これの sha256 が署名対象。account-number 0 は書かない。"
+  [{:keys [body auth-info chain-id account-number]}]
+  (pb/encode SignDoc
+             (cond-> {:body-bytes (vec body)
+                      :auth-info-bytes (vec auth-info)}
+               (seq chain-id) (assoc :chain-id chain-id)
+               (and account-number (pos? (long account-number)))
+               (assoc :account-number account-number))))
+
+(defn tx-raw-bytes
+  "broadcast する TxRaw bytes（signatures は 64 byte r‖s の列）。"
+  [{:keys [body auth-info signatures]}]
+  (pb/encode TxRaw {:body-bytes (vec body)
+                    :auth-info-bytes (vec auth-info)
+                    :signatures (mapv vec signatures)}))

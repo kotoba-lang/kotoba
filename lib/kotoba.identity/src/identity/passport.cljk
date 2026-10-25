@@ -1,0 +1,448 @@
+(ns identity.passport
+  "Kotoba Passport: proof of unique personhood without a central scorer.
+
+  Gitcoin's Human Passport answers \"is this address one human?\" with a score
+  its own attester signs on-chain. Every verifier then trusts that attester.
+  This namespace answers the same question so that no single party has to be
+  trusted, in the shape Holochain gives a DHT application:
+
+  | Human Passport            | Kotoba Passport                                  |
+  |---------------------------|--------------------------------------------------|
+  | stamp from a provider     | `stamp`: a signed claim, one of four classes     |
+  | stamp dedup in their DB   | `nullifier` claims in a ledger every witness     |
+  |                           | applies with the same rule (`registry-apply`)    |
+  | scorer weights (private)  | content-addressed `policy` (weights, caps,       |
+  |                           | threshold), so anyone can recompute `score`      |
+  | GitcoinAttester on EAS    | `record` signed by a witness quorum (validation  |
+  |                           | receipts); EAS anchoring is optional, not needed |
+
+  Stamp classes, and what a verifier checks for each:
+
+  - `:issuer` — signed by one allowlisted issuer key (an OAuth or document
+    check run by an issuer the policy names).
+  - `:quorum` — signed by k of the provider's n issuers (an in-person or
+    video ceremony; no single witness can mint one).
+  - `:vouch`  — signed by a subject whose own certified passport passes. A
+    voucher's budget is a ledger rule, and a policy caps how much of the
+    threshold vouches can supply, so a ring of fresh accounts cannot vouch
+    each other in.
+  - `:chain`  — a fact on Bitcoin, Ethereum/Base or Filecoin (account age,
+    activity, storage deals) plus the subject's proof that it controls that
+    account. The host re-derives it from the chain (`:chain-verify`); no
+    issuer is trusted at all. Gitcoin's own Human Passport score is one such
+    fact: an EAS attestation on Base, which `identity.adapters.human-passport`
+    already verifies, so it can count as a stamp without being the authority.
+
+  Pure and portable: no I/O, no clock, no crypto library. The host passes an
+  `env` of `:ed25519-verify` (pubkey-bytes, message-string, sig-bytes -> bool),
+  `:sha256-hex` (string -> lowercase hex of its UTF-8 bytes), and, only for
+  chain stamps, `:chain-verify` (stamp -> bool)."
+  (:require [kotoba.lang.text :as str]
+            [identity.causal :as causal]
+            [identity.model :as model]))
+
+;; ─── canonical encoding ──────────────────────────────────────────────
+;; RFC 8785 (JCS) for the values a stamp or record holds: maps with string or
+;; keyword keys, vectors, strings, integers, booleans, nil. Keys sort by their
+;; string form; non-ASCII is left as UTF-8; floats are refused rather than
+;; rendered two different ways by two hosts.
+
+(def ^:private escapes
+  {\" "\\\"" \\ "\\\\" \backspace "\\b" \formfeed "\\f" \newline "\\n" \return "\\r" \tab "\\t"})
+
+(defn- json-string [s]
+  (str "\""
+       (apply str (map (fn [c]
+                         (or (escapes c)
+                             (let [n #?(:clj (int c) :cljs (.charCodeAt c 0))]
+                               (if (< n 0x20)
+                                 (str "\\u00" (when (< n 16) "0") #?(:clj (Integer/toHexString n) :cljs (.toString n 16)))
+                                 (str c)))))
+                       s))
+       "\""))
+
+(defn- key-str [k] (if (keyword? k) (subs (str k) 1) (str k)))
+
+(defn canonical
+  "The canonical JSON text of `v`."
+  [v]
+  (cond
+    (nil? v) "null"
+    (boolean? v) (str v)
+    (string? v) (json-string v)
+    (keyword? v) (json-string (key-str v))
+    (integer? v) (str v)
+    (map? v) (str "{" (str/join "," (map (fn [[k x]] (str (json-string (key-str k)) ":" (canonical x)))
+                                         (sort-by (comp key-str key) v)))
+                  "}")
+    (or (vector? v) (seq? v) (set? v))
+    (str "[" (str/join "," (map canonical (if (set? v) (sort-by canonical v) v))) "]")
+    :else (throw (ex-info "value has no canonical form" {:type :passport/not-canonical :value v}))))
+
+;; ─── did:key (Ed25519) ───────────────────────────────────────────────
+
+(def ^:private b58 "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
+
+(defn- b58-decode [s]
+  (let [digits (map #(str/index-of b58 (str %)) s)]
+    (when (every? some? digits)
+      (let [zeros (count (take-while zero? digits))
+            bytes (reduce (fn [acc d]
+                            ;; acc = big-endian bytes; acc*58 + d
+                            (loop [i (dec (count acc)) carry d acc acc]
+                              (if (neg? i)
+                                (if (zero? carry) acc (recur i (quot carry 256) (into [(mod carry 256)] acc)))
+                                (let [x (+ (* 58 (nth acc i)) carry)]
+                                  (recur (dec i) (quot x 256) (assoc acc i (mod x 256)))))))
+                          [] (drop zeros digits))]
+        (into (vec (repeat zeros 0)) bytes)))))
+
+(defn- b58-encode [bs]
+  (let [zeros (count (take-while zero? bs))
+        digits (reduce (fn [acc b]
+                         (loop [i (dec (count acc)) carry b acc acc]
+                           (if (neg? i)
+                             (if (zero? carry) acc (recur i (quot carry 58) (into [(mod carry 58)] acc)))
+                             (let [x (+ (* 256 (nth acc i)) carry)]
+                               (recur (dec i) (quot x 58) (assoc acc i (mod x 58)))))))
+                       [] (drop zeros bs))]
+    (apply str (concat (repeat zeros "1") (map #(nth b58 %) digits)))))
+
+(defn did-key
+  "did:key for a 32-byte Ed25519 public key (seq of 0..255)."
+  [pubkey]
+  (str "did:key:z" (b58-encode (into [0xed 0x01] pubkey))))
+
+(defn did-key->pubkey
+  "The 32-byte Ed25519 public key in a did:key, or nil."
+  [did]
+  (when (and (string? did) (str/starts-with? did "did:key:z"))
+    (let [bs (b58-decode (subs did 9))]
+      (when (and (= 34 (count bs)) (= [0xed 0x01] (subvec bs 0 2)))
+        (subvec bs 2)))))
+
+(defn- hex->bytes [h]
+  (when (and (string? h) (re-matches #"[0-9a-f]*" h) (even? (count h)))
+    (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (subs h % (+ % 2)) 16) (range 0 (count h) 2))))
+
+;; ─── stamps ──────────────────────────────────────────────────────────
+
+(def stamp-tag "kotoba/passport-stamp/v1\n")
+(def record-tag "kotoba/passport-record/v1\n")
+
+(def stamp-classes #{"issuer" "quorum" "vouch" "chain"})
+
+(defn stamp-body
+  "The signed part of a stamp: everything but `proofs`."
+  [stamp]
+  (dissoc stamp "proofs"))
+
+(defn stamp-message [stamp] (str stamp-tag (canonical (stamp-body stamp))))
+
+(defn stamp-id
+  "urn:sha256 of the stamp's canonical body. Proofs are not part of the id: a
+  quorum stamp gathers signatures without changing what it is."
+  [env stamp]
+  (str "urn:sha256:" ((:sha256-hex env) (canonical (stamp-body stamp)))))
+
+(defn vouch-nullifier
+  "A vouch's nullifier is public and recomputable: one vouch per voucher per
+  subject, however many times it is signed."
+  [env voucher subject]
+  ((:sha256-hex env) (str "kotoba/passport-vouch/v1\n" voucher "\n" subject)))
+
+(defn- signed-by?
+  "Does `proof` carry a valid Ed25519 signature of `message` by `signer`?"
+  [env message {:strs [signer sig]}]
+  (let [pk (did-key->pubkey signer)
+        sb (hex->bytes sig)]
+    (boolean (and pk (= 64 (count sb))
+                  (try ((:ed25519-verify env) pk message sb)
+                       (catch #?(:clj Exception :cljs :default) _ false))))))
+
+(defn- valid-signers
+  "The distinct signers in `stamp`'s proofs whose signatures verify."
+  [env stamp]
+  (let [msg (stamp-message stamp)]
+    (into #{} (comp (filter #(signed-by? env msg %)) (map #(get % "signer")))
+          (get stamp "proofs"))))
+
+(defn stamp-problems
+  "Reasons `stamp` cannot count for `subject` under `policy` at `now`, before
+  the ledger is consulted. Empty when it can.
+
+  `certified` maps a voucher DID to its own `verify-record` result; a vouch
+  counts only while its voucher's passport passes."
+  [env policy subject now stamp certified]
+  (let [{:strs [v provider class nullifier issued_at expires_at issuer]} stamp
+        p (get-in policy [:providers provider])
+        signers (when (map? stamp) (valid-signers env stamp))]
+    (cond
+      (not (map? stamp)) [:stamp/malformed]
+      (not= 1 v) [:stamp/version]
+      (nil? p) [:stamp/provider-not-in-policy]
+      (not= (name (:class p)) class) [:stamp/class-mismatch]
+      (not= subject (get stamp "subject")) [:stamp/subject-mismatch]
+      (not (and (string? nullifier) (re-matches #"[0-9a-f]{64}" nullifier))) [:stamp/nullifier]
+      (not (and (integer? issued_at) (integer? expires_at) (< issued_at expires_at))) [:stamp/times]
+      (> issued_at now) [:stamp/not-yet-valid]
+      (<= expires_at now) [:stamp/expired]
+      (> (- now issued_at) (:max-age-seconds policy)) [:stamp/too-old]
+      :else
+      (case class
+        "issuer" (cond-> []
+                   (not (contains? (:issuers p) issuer)) (conj :stamp/issuer-not-allowed)
+                   (not (contains? signers issuer)) (conj :stamp/bad-signature))
+        "quorum" (let [ok (filter (:issuers p) signers)]
+                   (cond-> []
+                     (< (count ok) (:quorum p)) (conj :stamp/quorum-not-met)))
+        "vouch" (let [voucher (get certified issuer)]
+                  (cond-> []
+                    (= issuer subject) (conj :stamp/self-vouch)
+                    (not (contains? signers issuer)) (conj :stamp/bad-signature)
+                    (not= nullifier (vouch-nullifier env issuer subject)) (conj :stamp/nullifier)
+                    (not (:passing voucher)) (conj :stamp/voucher-not-passing)))
+        "chain" (cond-> []
+                  (not (try ((:chain-verify env) stamp)
+                            (catch #?(:clj Exception :cljs :default) _ false)))
+                  (conj :stamp/chain-fact-unverified))
+        [:stamp/class-mismatch]))))
+
+(defn add-proof
+  "`stamp` with one more signature. `sign-hex` is the signer's own function
+  (message string -> 64-byte Ed25519 signature as hex); the key never enters
+  this namespace."
+  [stamp signer sign-hex]
+  (update stamp "proofs" (fnil conj []) {"signer" signer "sig" (sign-hex (stamp-message stamp))}))
+
+;; ─── the nullifier ledger ────────────────────────────────────────────
+;; One rule every witness applies in ledger order, so every witness holds the
+;; same answer to "whose is this credential?" — Holochain's integrity zome,
+;; with the witness quorum standing in for the DHT's validators.
+
+(def empty-registry {:nullifiers {} :vouches {} :revoked #{}})
+
+(defn registry-apply
+  "Apply one ledger entry. Returns [registry' result]; a rejected entry leaves
+  the registry unchanged. Entries:
+
+    {:op :claim  :stamp-id :nullifier :subject :provider :class :issuer}
+    {:op :revoke :stamp-id :by}   ; an issuer withdrawing a stamp it signed
+
+  First claim of a nullifier wins and later claims by another subject are
+  refused, which is the whole of the dedup. A voucher's claims beyond the
+  policy's `:vouch-budget` are refused."
+  [policy registry {:keys [op stamp-id nullifier subject class issuer by] :as entry}]
+  (case op
+    :claim
+    (let [held (get-in registry [:nullifiers nullifier])]
+      (cond
+        (and held (not= subject (:subject held))) [registry {:rejected :nullifier/claimed-by-other}]
+        held [registry {:accepted :nullifier/already-held}]
+        (and (= "vouch" class) (>= (get-in registry [:vouches issuer] 0) (:vouch-budget policy)))
+        [registry {:rejected :vouch/budget-spent}]
+        :else
+        [(cond-> (assoc-in registry [:nullifiers nullifier]
+                           (select-keys entry [:stamp-id :subject :provider :class :issuer]))
+           (= "vouch" class) (update-in [:vouches issuer] (fnil inc 0)))
+         {:accepted :nullifier/claimed}]))
+    :revoke
+    (let [owner (some (fn [[_ h]] (when (= stamp-id (:stamp-id h)) h)) (:nullifiers registry))]
+      (if (and owner (= by (:issuer owner)))
+        [(update registry :revoked conj stamp-id) {:accepted :stamp/revoked}]
+        [registry {:rejected :revoke/not-issuer}]))
+    [registry {:rejected :entry/unknown-op}]))
+
+(defn registry-replay
+  "Fold `entries` in ledger order. Returns {:registry :results}."
+  [policy entries]
+  (reduce (fn [{:keys [registry results]} e]
+            (let [[r res] (registry-apply policy registry e)]
+              {:registry r :results (conj results res)}))
+          {:registry empty-registry :results []}
+          entries))
+
+(defn claim-entry
+  "The ledger entry that claims `stamp`'s nullifier for its subject."
+  [env stamp]
+  {:op :claim
+   :stamp-id (stamp-id env stamp)
+   :nullifier (get stamp "nullifier")
+   :subject (get stamp "subject")
+   :provider (get stamp "provider")
+   :class (get stamp "class")
+   :issuer (get stamp "issuer")})
+
+;; ─── score ───────────────────────────────────────────────────────────
+
+(defn score
+  "Score `stamps` for `subject` under `policy`, against the ledger `registry`.
+
+  A stamp counts when it has no `stamp-problems`, is not revoked, and its
+  nullifier is held in the registry by this subject under this very stamp id.
+  Each provider counts once, except a vouch, which counts once per voucher.
+  Each class's total is capped by `:class-caps`.
+  Every stamp appears in the result as counted or with its reasons."
+  [env policy registry subject now stamps certified]
+  (let [judged (for [s stamps]
+                 (let [id (try (stamp-id env s) (catch #?(:clj Exception :cljs :default) _ nil))
+                       held (get-in registry [:nullifiers (get s "nullifier")])
+                       problems (stamp-problems env policy subject now s certified)
+                       problems (cond-> problems
+                                  (and (empty? problems) (contains? (:revoked registry) id)) (conj :stamp/revoked)
+                                  (and (empty? problems) (nil? held)) (conj :nullifier/unclaimed)
+                                  (and (empty? problems) held (not= subject (:subject held)))
+                                  (conj :nullifier/claimed-by-other)
+                                  (and (empty? problems) held (= subject (:subject held)) (not= id (:stamp-id held)))
+                                  (conj :nullifier/held-by-another-stamp))]
+                   {:stamp-id id :provider (get s "provider") :class (get s "class")
+                    :issuer (get s "issuer") :problems problems}))
+        valid (->> judged (filter (comp empty? :problems)) (sort-by :stamp-id))
+        ;; one per provider, except vouches: one per voucher, so several
+        ;; people's vouches stack up to the class cap
+        dedupe-key (fn [j] (if (= "vouch" (:class j)) [(:provider j) (:issuer j)] (:provider j)))
+        firsts (vals (reduce (fn [m j] (let [k (dedupe-key j)] (if (contains? m k) m (assoc m k j)))) {} valid))
+        weight #(get-in policy [:providers (:provider %) :weight] 0)
+        by-class (group-by :class firsts)
+        class-total (fn [c js] (let [t (reduce + 0 (map weight js))]
+                                 (if-let [cap (get-in policy [:class-caps (keyword c)])] (min cap t) t)))
+        total (reduce + 0 (map (fn [[c js]] (class-total c js)) by-class))
+        counted (set (map :stamp-id firsts))]
+    {:subject subject
+     :policy-id (:id policy)
+     :score total
+     :threshold (:threshold policy)
+     :passing (>= total (:threshold policy))
+     :counted (vec (sort (map :stamp-id firsts)))
+     :by-class (into (sorted-map) (map (fn [[c js]] [c (class-total c js)]) by-class))
+     :rejected (vec (keep (fn [j]
+                            (cond
+                              (seq (:problems j)) (select-keys j [:stamp-id :provider :problems])
+                              (not (counted (:stamp-id j))) (assoc (select-keys j [:stamp-id :provider])
+                                                                   :problems [:stamp/provider-already-counted])))
+                          judged))}))
+
+;; ─── the passport record and its witness certificate ────────────────
+
+(defn record
+  "The passport record witnesses sign: a scored result, minus the per-stamp
+  reasons, valid until the earliest counted stamp expires or the policy's
+  maximum age, whichever is first."
+  [policy {:keys [subject score threshold passing counted]} stamps-by-id now]
+  {"v" 1
+   "subject" subject
+   "policy" (:id policy)
+   "score" score
+   "threshold" threshold
+   "passing" passing
+   "stamps" counted
+   "issued_at" now
+   "valid_until" (reduce min (+ now (:max-age-seconds policy))
+                         (keep #(get-in stamps-by-id [% "expires_at"]) counted))})
+
+(defn record-message [rec] (str record-tag (canonical rec)))
+
+(defn witness-proof
+  "One witness's signature over `rec`, for the certificate `verify-record`
+  checks. A witness signs only after recomputing `score` itself."
+  [rec witness sign-hex]
+  {"signer" witness "sig" (sign-hex (record-message rec))})
+
+(defn verify-record
+  "Check a witness certificate over `rec`: `proofs` must carry valid signatures
+  by at least `:witness-quorum` distinct keys from the policy's `:witnesses`.
+  Returns the record's facts with `:passing` true only when the certificate
+  holds, the record is unexpired, and it names this policy."
+  [env policy rec proofs now]
+  (let [msg (record-message rec)
+        witnesses (into #{} (comp (filter #(signed-by? env msg %)) (map #(get % "signer"))
+                                  (filter (:witnesses policy)))
+                        proofs)
+        problems (cond-> []
+                   (not= (:id policy) (get rec "policy")) (conj :record/policy-mismatch)
+                   (< (count witnesses) (:witness-quorum policy)) (conj :record/quorum-not-met)
+                   (<= (get rec "valid_until" 0) now) (conj :record/expired)
+                   (not (get rec "passing")) (conj :record/not-passing))]
+    {:subject (get rec "subject")
+     :score (get rec "score")
+     :passing (empty? problems)
+     :witnesses (vec (sort witnesses))
+     :valid-until (get rec "valid_until")
+     :problems problems}))
+
+;; ─── policy ──────────────────────────────────────────────────────────
+
+(defn policy-id
+  "urn:sha256 of the policy's canonical form without its `:id`."
+  [env policy]
+  (str "urn:sha256:" ((:sha256-hex env) (canonical (dissoc policy :id)))))
+
+(defn policy-problems
+  "Structural reasons a policy cannot be used. A vouch-only or chain-only
+  passport is the Sybil hole; every policy must cap the classes a fresh
+  account can produce on its own below the threshold."
+  [env policy]
+  (let [{:keys [threshold providers class-caps witnesses witness-quorum vouch-budget max-age-seconds]} policy
+        ;; the most a class can contribute: its cap, or the sum of its
+        ;; providers' weights. Vouches stack per voucher, so only a cap bounds them.
+        cap-or-sum (fn [c] (let [s (reduce + 0 (for [[_ p] providers :when (= c (:class p))] (:weight p)))]
+                             (if-let [cap (get class-caps c)] (min cap (if (= c :vouch) cap s)) s)))
+        vouching? (some (fn [[_ p]] (= :vouch (:class p))) providers)]
+    (cond-> []
+      (not= (:id policy) (policy-id env policy)) (conj :policy/id-mismatch)
+      (not (pos-int? threshold)) (conj :policy/threshold)
+      (not (pos-int? max-age-seconds)) (conj :policy/max-age)
+      (not (pos-int? vouch-budget)) (conj :policy/vouch-budget)
+      (not (and (set? witnesses) (pos-int? witness-quorum)
+                ;; a majority quorum: two disjoint certificates cannot both exist
+                (> (* 2 witness-quorum) (count witnesses))
+                (<= witness-quorum (count witnesses))))
+      (conj :policy/witness-quorum)
+      (some (fn [[_ p]] (not (contains? stamp-classes (name (:class p))))) providers) (conj :policy/class)
+      (some (fn [[_ p]] (and (= :quorum (:class p)) (not (<= 2 (:quorum p) (count (:issuers p)))))) providers)
+      (conj :policy/provider-quorum)
+      (and vouching? (not (pos-int? (:vouch class-caps)))) (conj :policy/vouch-uncapped)
+      (>= (+ (cap-or-sum :vouch) (cap-or-sum :chain)) threshold) (conj :policy/self-mintable-classes-reach-threshold))))
+
+;; ─── into the identity model ─────────────────────────────────────────
+
+(defn ->identity
+  "A verified, passing passport as the evidence, attestation and scoped
+  sybil-resistance claim the rest of `identity` consumes — the same shape
+  `identity.adapters.human-passport/verify!` produces, sourced from the
+  witness quorum instead of one attester."
+  [policy rec verified issued-at]
+  (when (:passing verified)
+    (let [subject (get rec "subject")
+          pid (str "kotoba-passport:" (:id policy) ":" subject ":" (get rec "issued_at"))
+          ;; the issuer is the policy's witness set; who signed is in the evidence
+          issuer (str "kotoba-passport-witnesses:" (:id policy))
+          evidence (model/evidence-ref
+                    pid :humanity-proof
+                    {:ref {:policy (:id policy) :stamps (get rec "stamps")}
+                     :source (:witnesses verified)
+                     :observed-at (get rec "issued_at")
+                     :claims {:passing-score true :score (get rec "score") :threshold (get rec "threshold")}
+                     :non-adjudicating true})]
+      {:identity/subject (model/subject subject :person {:did subject :source :kotoba-passport})
+       :identity/evidence [evidence]
+       :identity/attestations [(model/attestation (str pid ":unique-humanity") subject
+                                                  :kotoba-passport/unique-humanity
+                                                  {:issuer issuer :evidence [pid]
+                                                   :issued-at issued-at :non-adjudicating true})]
+       :identity/trust-claims [(causal/trust-claim (str pid ":sybil-resistance") subject
+                                                   :kotoba-passport/passed
+                                                   {:scope [:identity :sybil-resistance]
+                                                    :issuer issuer
+                                                    :evaluator {:evaluator/id (str "kotoba-passport:" (:id policy))
+                                                                :evaluator/kind :witness-quorum}
+                                                    :evidence [pid]
+                                                    :policy-cid (:id policy)
+                                                    :confidence 1.0
+                                                    :issued-at issued-at
+                                                    :valid-until (str (get rec "valid_until"))})]
+       :sekisho/evidence {:sekisho.assurance/evidence :evidence/humanity-verified
+                          :sekisho.assurance/at (get rec "issued_at")
+                          :sekisho.assurance/strength :verified
+                          :sekisho.assurance/source pid
+                          :sekisho.assurance/note "Kotoba Passport passed under a witness-quorum certificate"}})))

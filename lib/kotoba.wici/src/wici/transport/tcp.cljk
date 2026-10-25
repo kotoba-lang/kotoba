@@ -1,0 +1,68 @@
+;; wici.transport.tcp — WiCi protocol over real sockets, on kotoba.wire.tcp.
+;;
+;; Node-only (nbb), like kotoba.wire.tcp itself. Sockets are asynchronous, so
+;; this side cannot satisfy the synchronous `IDevice`; it gives the same calls
+;; as functions returning js/Promise (`device`), matched to replies by `:id`.
+(ns wici.transport.tcp
+  (:require [kotoba.wire.tcp :as tcp]
+            [wici.protocol :as p]))
+
+(defn serve!
+  "Expose local device `dev` on `port` (0 = pick one). Returns the net.Server;
+  read the bound port with `(port server)`."
+  [dev port]
+  (tcp/start-server! port
+                     (fn [req socket]
+                       (tcp/send-framed! socket (p/serve dev req)))))
+
+(defn port [server] (.-port (.address server)))
+
+(defn connect
+  "Open a client to `host:port`. Returns {:call (fn [op & kvs]) -> Promise,
+  :close (fn [])}. Pending calls reject if the socket closes."
+  [host port]
+  (let [pool (atom {})
+        pending (atom {})
+        next-id (atom 0)
+        sock (tcp/connect-or-reuse! pool :peer host port)
+        fail-all (fn [msg]
+                   (doseq [[_ {:keys [reject]}] @pending]
+                     (reject (js/Error. msg)))
+                   (reset! pending {}))]
+    ;; connect-or-reuse! installs no 'data' listener: replies are read here,
+    ;; framed with the same codec the server side uses.
+    (let [read! (#'tcp/make-frame-reader
+                 sock
+                 (fn [resp _]
+                   (when-let [{:keys [resolve]} (get @pending (:id resp))]
+                     (swap! pending dissoc (:id resp))
+                     (resolve resp))))]
+      (.on sock "data" read!))
+    (.on sock "error" (fn [e] (fail-all (str "wici.transport.tcp: " (.-message e)))))
+    (.on sock "close" (fn [] (fail-all "wici.transport.tcp: connection closed")))
+    {:call (fn [op & kvs]
+             (js/Promise.
+              (fn [resolve reject]
+                (let [id (swap! next-id inc)]
+                  (swap! pending assoc id {:resolve resolve :reject reject})
+                  (tcp/send-framed! sock (assoc (apply p/request op kvs) :id id))))))
+     :close (fn [] (tcp/close-all! pool))}))
+
+(defn device
+  "Promise-returning mirror of `wici.device/IDevice` over a `connect`ion.
+  Remote failures reject, like a local throw."
+  [{:keys [call]}]
+  (let [unwrap (fn [pr op]
+                 (.then pr (fn [{:keys [ok result error]}]
+                             (if ok
+                               result
+                               (throw (ex-info (str "wici.remote: " error)
+                                               {:op op :error error}))))))]
+    {:info     (fn [] (unwrap (call :info) :info))
+     :alloc!   (fn [n] (unwrap (call :alloc :bytes n) :alloc))
+     :free!    (fn [h] (unwrap (call :free :handle h) :free))
+     :write!   (fn [h data] (unwrap (call :write :handle h :data (vec data)) :write))
+     :read     (fn [h] (unwrap (call :read :handle h) :read))
+     :dispatch! (fn [k ins out args]
+                  (unwrap (call :dispatch :kernel k :in (vec ins) :out out :args args)
+                          :dispatch))}))

@@ -1,0 +1,171 @@
+(ns kotoba.dsl.problem-parity-test
+  "Parity gate between `src/kotoba/dsl/problem.kotoba` (the semantic authority)
+  and `src/kotoba/dsl/problem.cljk` (the load path consumers require).
+
+  Shape follows `kotoba-lang/css` (`css.kotoba-parity-test`, ADR-2607270100
+  §10): the `.kotoba` is compiled here and executed through the KIR interpreter
+  in this same JVM, so nothing crosses a runtime boundary. Unlike css, the
+  functions under test take and return typed `:document` values rather than
+  strings, so the comparison is done by encoding the `.cljc` output into the
+  same tagged document form the interpreter hands back (`->doc` below) — the
+  encoding is the one `kotoba.kir.value/bounded-document!` validates, and the
+  in-repo `kotoba.dsl.problem-test` already asserts the interpreter produces
+  exactly it.
+
+  WHAT THIS DOES NOT CLAIM. The guest is bounded by the KIR document budget:
+  32 items per container, 256 nodes, depth 8, 64 KiB of text. This namespace is
+  not bounded. Every corpus below therefore stays inside the guest's bounds,
+  and parity is asserted *inside those bounds only* — a 40-problem validation
+  run is representable in the `.cljc` and is not representable as one document
+  at all. That is a stated divergence, not an untested claim.
+
+  Likewise the failure *mechanism* differs and is compared as `both refuse`,
+  not as `both throw the same thing`: the guest fails closed by trapping and
+  surfaces as `ExceptionInfo` at the execution boundary, while the `.cljc`
+  throws `ex-info` directly."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [kotoba.dsl.problem :as problem]))
+
+(def ^:private source (slurp "src/kotoba/dsl/problem.kotoba"))
+
+(def ^:private kir (delay (:kir (compiler/compile-source source :js-kotoba-v1))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(defn- ->doc
+  "Encode an EDN value as the tagged canonical document the KIR interpreter
+  returns. Map keys are themselves tagged (`[\"keyword\" k]`) and entries are
+  sorted by key text, which is what `bounded-document!` canonicalises to."
+  [value]
+  (cond
+    (nil? value) ["null"]
+    (boolean? value) ["bool" value]
+    (keyword? value) ["keyword" value]
+    (string? value) ["string" value]
+    (integer? value) ["i64" value]
+    (map? value) ["map" (->> value
+                             (sort-by (comp str key))
+                             (mapv (fn [[k v]] [["keyword" k] (->doc v)])))]
+    (sequential? value) ["vector" (mapv ->doc value)]
+    :else (throw (ex-info "value has no document encoding" {:value value}))))
+
+;; --- the corpus -----------------------------------------------------------
+;; Real (domain, code) pairs taken from the eleven consumers of this namespace,
+;; so the gate exercises the shapes actually in production rather than
+;; invented ones.
+
+(def ^:private problem-corpus
+  [[:sc      :error :chart/bad-initial      "door"                  "initial state is not a child"]
+   [:sc      :warn  :chart/unreachable      "idle"                  "state is unreachable"]
+   [:policy  :error :policy/unknown-field   "rule-7"                "condition references an unknown field"]
+   [:policy  :warn  :policy/shadowed        "rule-2"                "rule is shadowed by an earlier rule"]
+   [:states  :error :states/dangling-target "s3"                    "transition target does not exist"]
+   [:sigma   :warn  :sigma/empty-selection   "sel-0"                "selection matches nothing"]
+   [:rdf     :error :rdf/bad-iri            "http:// example"       "subject IRI is not absolute"]
+   [:xmile   :warn  :xmile/unit-mismatch    "stock.population"      "units differ across the flow"]
+   [:uml     :error :uml/dangling-type      "Order::customer"       "property type is not defined"]
+   [:owl     :error :owl/arity              "EquivalentClasses#0"   "needs at least two members"]
+   [:sbml    :error :sbml/duplicate-id      "s1"                    "SId is declared twice"]
+   [:sysml   :warn  :sysml/kind-mismatch    "part-usage#4"          "usage kind does not match definition"]])
+
+(def ^:private field-corpus
+  [[:torch :error :module/bad-arity   :path ["layers" "0"]            "linear needs two positional args"]
+   [:torch :warn  :module/empty       :path []                        "module has no layers"]
+   [:xmile :error :xmile/missing-eqn  :path ["model" "stock" "pop"]   "stock has no equation"]])
+
+(deftest severities-agree
+  (let [[shape items] (call 'severities)]
+    (is (= [:set :keyword] shape))
+    (is (= problem/severities (set items)))))
+
+(deftest domain-key-agrees
+  (doseq [domain [:sc :policy :states :sigma :rdf :xmile :uml :owl :sbml :sysml :torch]
+          k [:severity :code :msg :id :path]]
+    (testing (str domain " " k)
+      (is (= (problem/domain-key domain k) (call 'domain-key domain k))))))
+
+(deftest problem-agrees
+  (doseq [[domain severity code subject msg] problem-corpus]
+    (testing (str domain " " code)
+      (is (= (->doc (problem/problem domain severity code subject msg))
+             (call 'problem domain severity code (->doc subject) msg))))))
+
+(deftest problem-field-agrees-and-matches-the-six-argument-overload
+  (doseq [[domain severity code subject-key subject msg] field-corpus]
+    (testing (str domain " " code)
+      (let [guest (call 'problem-field domain severity code
+                        (->doc [subject-key subject]) msg)]
+        (is (= (->doc (problem/problem-field domain severity code
+                                             [subject-key subject] msg))
+               guest))
+        (testing "the six-argument problem overload torch calls is the same thing"
+          (is (= (->doc (problem/problem domain subject-key severity code subject msg))
+                 guest)))))))
+
+(deftest severity-and-predicates-agree
+  (doseq [[domain severity code subject msg] problem-corpus]
+    (testing (str domain " " code)
+      (let [host (problem/problem domain severity code subject msg)
+            guest (->doc host)]
+        (is (= (problem/severity domain host) (call 'severity domain guest)))
+        (is (= (problem/error? domain host) (call 'error? domain guest)))
+        (is (= (problem/warning? domain host) (call 'warning? domain guest)))))))
+
+(deftest predicates-agree-when-the-domain-does-not-match
+  (testing "a problem from another domain is neither an error nor a warning"
+    (let [host (problem/problem :sc :error :chart/bad-initial "door" "msg")
+          guest (->doc host)]
+      (is (false? (problem/error? :torch host)))
+      (is (false? (call 'error? :torch guest)))
+      (is (false? (problem/warning? :torch host)))
+      (is (false? (call 'warning? :torch guest))))))
+
+(deftest filtering-agrees
+  ;; Every list stays at or below the guest's 32-item container limit.
+  (let [lists [[]
+               [(problem/problem :sc :error :chart/bad-initial "door" "a")]
+               [(problem/problem :sc :warn :chart/unreachable "idle" "b")]
+               (mapv (fn [[d s c subj m]] (problem/problem d s c subj m))
+                     (filter #(= :sc (first %)) problem-corpus))
+               (into [] (for [i (range 16)]
+                          (problem/problem :sc (if (even? i) :error :warn)
+                                           :chart/generated (str "s" i) (str "msg " i))))
+               (into [] (for [i (range 32)]
+                          (problem/problem :sc :warn :chart/generated
+                                           (str "s" i) (str "msg " i))))]]
+    (doseq [[i problems] (map-indexed vector lists)]
+      (testing (str "list " i " (" (count problems) " problems)")
+        (let [guest (->doc problems)]
+          (is (= (->doc (problem/errors :sc problems)) (call 'errors :sc guest)))
+          (is (= (->doc (problem/warnings :sc problems)) (call 'warnings :sc guest)))
+          (is (= (problem/valid? :sc problems) (call 'valid? :sc guest)))
+          (testing "and for a domain none of them belong to"
+            (is (= (->doc (problem/errors :torch problems)) (call 'errors :torch guest)))
+            (is (= (problem/valid? :torch problems) (call 'valid? :torch guest)))))))))
+
+(deftest both-refuse-an-unsupported-severity
+  (doseq [bad [:info :fatal :debug :Error :warning]]
+    (testing (str bad)
+      (is (thrown? kerror/ExceptionInfo
+                   (problem/problem :sc bad :note "x" "msg")))
+      (is (thrown? kerror/ExceptionInfo
+                   (call 'problem :sc bad :note (->doc "x") "msg")))
+      (is (thrown? kerror/ExceptionInfo
+                   (problem/problem-field :sc bad :note [:path "x"] "msg")))
+      (is (thrown? kerror/ExceptionInfo
+                   (call 'problem-field :sc bad :note (->doc [:path "x"]) "msg"))))))
+
+(deftest both-refuse-a-problem-with-no-severity-field
+  (let [malformed {:sc/code :bad :sc/msg "no severity here"}]
+    (is (thrown? kerror/ExceptionInfo (problem/severity :sc malformed)))
+    (is (thrown? kerror/ExceptionInfo (call 'severity :sc (->doc malformed))))
+    (testing "but the predicates report false rather than failing, on both sides"
+      (is (false? (problem/error? :sc malformed)))
+      (is (false? (call 'error? :sc (->doc malformed))))
+      (is (false? (problem/warning? :sc malformed)))
+      (is (false? (call 'warning? :sc (->doc malformed)))))))
+
+(deftest the-guest-still-declares-no-effects
+  (is (= #{} (set (:effects @kir)))))

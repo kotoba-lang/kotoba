@@ -1,0 +1,177 @@
+(ns kotoba.dtn.discovery.presence
+  "Pure, transport-independent helpers factored out of `kotoba.dtn.discovery`
+  (the `.cljs`, Node-only namespace that actually wires a dtn node handle to
+  a real `kotoba-lang/io-libp2p` gossip node handle): presence-announcement
+  shape construction/validation, self-announcement detection, translating an
+  announcement into the `{:host .. :port ..}` shape `kotoba.dtn.transport.tcp`'s
+  own `:peers`/`links-for` already expect, and the dedup-index math used to
+  scan an ever-growing `:received-messages` vector without reprocessing an
+  entry twice.
+
+  None of this needs a real socket, a real clock read, or a real
+  `js/setInterval` — every function here is deterministic given its
+  arguments — so it stays portable `.cljc` and testable under plain JVM
+  `kbb -M:test`, mirroring the pure/impure split
+  `kotoba-lang/io-libp2p`'s own `kotoba.net.transport.envelope` uses
+  alongside its impure `kotoba.net.transport.tcp`, and the split
+  `kotoba.dtn.auth`/`kotoba.dtn.store` already use between their portable
+  format logic and their Node-only I/O calls.
+
+  ANNOUNCEMENT SHAPE — a plain EDN map:
+
+    {:dtn/e164 \"+819012345678\"
+     :dtn/host \"localhost\"
+     :dtn/port 5100
+     :dtn/transport-kind :internet-overlay
+     :dtn/announce-ts 1234567890}
+
+  `:dtn/host`/`:dtn/port` are exactly the `{:host .. :port ..}` shape a
+  `kotoba.dtn.link/link` record's fields need (and exactly the shape
+  `kotoba.dtn.transport.tcp/start-node!`'s own `:peers` option and
+  `links-for` already consume) — see `announcement->peer-entry`, which is
+  close to mechanical because of that.
+
+  `:dtn/announce-ts` exists for a real, non-obvious reason discovered while
+  wiring this module up against `kotoba-lang/io-libp2p`'s actual gossip
+  semantics (`kotoba.net.gossip/route-message`, `content-hash`): a gossip
+  node's dedup is purely CONTENT-hash based (`content-hash` hashes the
+  payload alone, nothing else — see `kotoba.net.gossip`), and a
+  locally-originated `publish!` marks its own payload's hash `seen` on the
+  PUBLISHING node's own seen-cache the moment it's first sent (see
+  `kotoba.net.transport.tcp/publish!`'s docstring). Two consequences that
+  matter for a PERIODIC presence broadcast specifically:
+
+    1. If a node re-announced the exact same `{:dtn/e164 :dtn/host
+       :dtn/port :dtn/transport-kind}` map on every tick with no varying
+       field, every re-announcement after the very first would hash
+       IDENTICALLY to the first — `route-message` would see it as
+       already-seen on the announcing node's OWN seen-cache and return an
+       EMPTY `:forward` list, meaning `publish!` would silently stop
+       actually writing to any peer's socket at all after the first tick.
+    2. That would break exactly the scenario this whole module exists to
+       prove: a NODE THAT JOINS THE GOSSIP MESH LATE (after the first,
+       only-ever-delivered broadcast already happened) would never
+       discover an already-running peer, because that peer's later
+       re-broadcasts — the only ones with a chance of actually reaching a
+       socket that didn't exist yet at broadcast #1 — would all be no-ops.
+
+  Including a monotonically-varying `:dtn/announce-ts` (the impure
+  `kotoba.dtn.discovery/announce!` stamps `js/Date.now()` here, the same
+  seam `kotoba.dtn.transport.tcp/send-message!` already uses to stamp a
+  real wall-clock value from the one layer that actually has a clock) makes
+  every tick's payload content-hash genuinely distinct, so `route-message`
+  never short-circuits a re-announcement as an already-seen duplicate on
+  the SENDING side — every periodic tick is a real, fresh fanout attempt,
+  which is what lets a late-joining node actually receive a presence
+  announcement broadcast strictly after it joined. This is deliberately
+  NOT fixed by editing `kotoba.net.gossip` itself (out of scope — a pure
+  consumer relationship, see `kotoba.dtn.discovery`'s namespace docstring);
+  it's accommodated here, in the shape of the data this module chooses to
+  broadcast, exactly the same kind of external workaround
+  `kotoba.net.transport.tcp`'s own `safe-from` already is for a different
+  `kotoba.net.gossip` landmine."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.phone :as phone]))
+
+(def default-topic
+  "The well-known gossip topic dtn presence announcements are published on
+  by default. A caller can override this per-call (see
+  `kotoba.dtn.discovery`'s `:topic` option) — nothing here hardcodes it
+  beyond this default."
+  "dtn-presence")
+
+;; ---------------------------------------------------------------------------
+;; Announcement construction / validation
+;; ---------------------------------------------------------------------------
+
+(defn presence-announcement
+  "Construct a presence-announcement map for a dtn node identified by
+  e164, reachable at host:port over transport-kind (default
+  :internet-overlay — the only transport kind kotoba-lang/dtn's real TCP
+  transport actually implements). announce-ts is caller-supplied (this
+  function reads no clock of its own — see this namespace's docstring for
+  why a varying value here matters) — pass the same value on repeat calls
+  and this function is a pure, referentially-transparent constructor like
+  every other record constructor in this library (kotoba.dtn/bundle,
+  kotoba.dtn.link/link)."
+  [e164 host port announce-ts & {:keys [transport-kind] :or {transport-kind :internet-overlay}}]
+  {:dtn/e164 e164
+   :dtn/host host
+   :dtn/port port
+   :dtn/transport-kind transport-kind
+   :dtn/announce-ts announce-ts})
+
+(defn valid-presence-announcement?
+  "True iff m is structurally usable as a discovered peer entry: a valid
+  E.164 :dtn/e164 (kotoba.phone/e164-valid?), a non-blank string
+  :dtn/host, and a positive-integer :dtn/port. Deliberately does NOT
+  require :dtn/transport-kind or :dtn/announce-ts to be present/valid —
+  those aren't needed to turn this announcement into a usable
+  {:host .. :port ..} peer entry (see announcement->peer-entry), and this
+  module's whole trust posture is 'accept a presence announcement at face
+  value once its shape is usable' (see kotoba.dtn.discovery's namespace
+  docstring: explicitly NOT authenticated)."
+  [m]
+  (boolean
+   (and (map? m)
+        (phone/e164-valid? (:dtn/e164 m))
+        (string? (:dtn/host m))
+        (not (str/blank? (:dtn/host m)))
+        (integer? (:dtn/port m))
+        (pos? (:dtn/port m)))))
+
+(defn self-announcement?
+  "True iff announcement's claimed :dtn/e164 equals own-e164 — a dtn node
+  should never treat its own presence broadcast as a discovered peer.
+  Straight equality on the E.164 string, no normalization — both sides of
+  this comparison originate from kotoba.dtn.transport.tcp node handles'
+  own :e164, which is already validated/canonical (kotoba.dtn/eid, and
+  this repo's own dtn node handles, never store an un-normalized E.164)."
+  [announcement own-e164]
+  (= (:dtn/e164 announcement) own-e164))
+
+(defn announcement->peer-entry
+  "Translate a (valid) presence-announcement into the {:host .. :port ..}
+  shape kotoba.dtn.transport.tcp/start-node!'s own :peers option (and
+  links-for, which derives kotoba.dtn.link/link records straight from
+  :peers) already expect — i.e. exactly what a caller would assoc into a
+  running node handle's :peers map keyed by the announced :dtn/e164."
+  [announcement]
+  {:host (:dtn/host announcement) :port (:dtn/port announcement)})
+
+;; ---------------------------------------------------------------------------
+;; Dedup-index math over an ever-growing :received-messages vector
+;; ---------------------------------------------------------------------------
+
+(defn new-entries
+  "received-messages is a gossip node handle's full :received-messages
+  vector (kotoba.net.transport.tcp's own node-handle field — see that
+  namespace's handle-gossip! docstring: it only ever grows, appended to in
+  arrival order, existing entries never mutated or reordered).
+  already-processed is how many of THOSE entries (by raw index into the
+  full vector, not filtered by topic) a prior scan already looked at.
+
+  Returns {:entries [...] :processed N}:
+    :entries — the entries at index >= already-processed whose :topic
+               equals topic, in arrival order (every OTHER topic's new
+               entries are skipped, not queued for later — a caller
+               polling a different topic would do its own independent
+               scan).
+    :processed — the new high-water mark the caller should remember for
+                 its NEXT call (always (count received-messages) — i.e.
+                 every entry below this index, whether or not its :topic
+                 matched, has now been looked at once and must never be
+                 rescanned; this is what makes repeat polling calls
+                 amortized-cheap instead of O(total-messages-ever) every
+                 tick).
+
+  already-processed is clamped to (count received-messages) so a stale or
+  bogus caller-supplied value larger than the vector's current length
+  can never make this function return a negative-length slice or throw."
+  [received-messages already-processed topic]
+  (let [total (count received-messages)
+        start (min (max 0 (or already-processed 0)) total)]
+    {:entries (into []
+                     (comp (drop start) (filter #(= topic (:topic %))))
+                     received-messages)
+     :processed total}))

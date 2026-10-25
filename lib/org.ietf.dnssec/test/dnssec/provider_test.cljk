@@ -1,0 +1,117 @@
+(ns dnssec.provider-test
+  "Real crypto, end to end. The rest of the suite proves *which bytes* get
+  signed with an echo signer; this proves those bytes actually verify — which
+  is the only thing that distinguishes a signer from a byte shuffler."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [dnssec.canonical :as c]
+            [dnssec.provider :as p]
+            [dnssec.sign :as sign]))
+
+(def seed (vec (range 32)))                 ; a fixed key, so failures reproduce
+(def pubkey (p/public-key seed))
+
+(defn- a-rr [nm addr & [ttl]]
+  {:zone/name nm :zone/ttl (or ttl 300) :zone/class "IN" :zone/type "A"
+   :zone/rdata {:zone/address addr}})
+
+;; ── bytes ─────────────────────────────────────────────────────────────────
+
+(deftest octet-conversion-round-trips-including-the-high-bit
+  (let [v [0 1 0x7F 0x80 0xFE 0xFF]]
+    (is (= v (p/->octets (p/->host-bytes v)))
+        "on the JVM `vec` of a byte-array gives -128 for 0x80; the mask is what stops that"))
+  (is (= 32 (count pubkey)))
+  (is (every? #(<= 0 % 255) pubkey)))
+
+;; ── digests ───────────────────────────────────────────────────────────────
+
+(deftest sha256-matches-the-known-digest-of-the-empty-input
+  ;; e3b0c442… is SHA-256 of zero bytes — the standard smoke value.
+  (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+         (c/hex (p/digest-fn :sha256 []))))
+  (is (= 48 (count (p/digest-fn :sha384 []))) "SHA-384 is 48 octets"))
+
+(deftest an-unknown-digest-type-raises-rather-than-defaulting
+  (is (thrown? js/Error
+               (p/digest-fn :sha1 [])))
+  (is (thrown? js/Error
+               (p/digest-fn :md5 [])))
+  (testing "a DS whose digest field and digest bytes disagree fails everywhere, silently"
+    (is (= 32 (count (p/digest-fn 2 []))) "the numeric spelling works too")))
+
+;; ── signing, verified ─────────────────────────────────────────────────────
+
+(deftest a-signature-this-provider-produces-verifies
+  (let [msg [1 2 3 4 5]
+        sig (p/sign-fn :ed25519 seed msg)]
+    (is (= 64 (count sig)) "Ed25519 signatures are 64 octets")
+    (is (true? (p/verify-fn :ed25519 pubkey msg sig)))
+    (testing "and does not verify against a different message"
+      (is (false? (p/verify-fn :ed25519 pubkey [1 2 3 4 6] sig))))
+    (testing "or a different key"
+      (is (false? (p/verify-fn :ed25519 (p/public-key (vec (range 1 33))) msg sig))))))
+
+(deftest verification-returns-false-rather-than-throwing-on-garbage
+  (is (false? (p/verify-fn :ed25519 [1] [2] [3])))
+  (is (false? (p/verify-fn :ed25519 pubkey [1 2 3] (vec (repeat 64 0))))))
+
+(deftest algorithms-this-provider-does-not-cover-are-refused-not-mis-signed
+  (doseq [a [:ecdsap256sha256 :rsasha256 13 8]]
+    (is (thrown? js/Error
+                 (p/sign-fn a seed [1 2 3]))
+        (str a " is a legitimate DNSSEC algorithm this provider does not implement"))))
+
+;; ── the whole path ────────────────────────────────────────────────────────
+
+(deftest an-rrsig-signed-here-verifies-against-the-blob-a-validator-rebuilds
+  ;; This is the end-to-end claim. A validator does not receive the signed
+  ;; blob; it reconstructs it from the RRSIG's own rdata plus the RRset, and
+  ;; checks the signature against that. So the test rebuilds it the same way.
+  (let [rrs [(a-rr "www.example.com." "192.0.2.2") (a-rr "www.example.com." "192.0.2.1")]
+        params {:algorithm :ed25519 :key seed :key-tag 12345
+                :signer "example.com." :original-ttl 3600
+                :inception 1700000000 :expiration 1702592000}
+        sig (p/sign-rrset rrs params)
+        raw (get-in sig [:zone/rdata :zone/raw])
+        prefix (sign/rrsig-rdata-prefix (assoc params :type-covered "A"
+                                               :name "www.example.com."))
+        signature (subvec raw (count prefix))
+        rebuilt (sign/signing-blob rrs (assoc params :type-covered "A"
+                                              :name "www.example.com."))]
+    (is (= 64 (count signature)))
+    (is (true? (p/verify-fn :ed25519 pubkey rebuilt signature))
+        "signed here, reconstructed the way a resolver would, and it verifies")
+    (testing "and a single changed octet in the RRset breaks it"
+      (let [tampered (sign/signing-blob [(a-rr "www.example.com." "192.0.2.3")
+                                         (a-rr "www.example.com." "192.0.2.1")]
+                                        (assoc params :type-covered "A"
+                                               :name "www.example.com."))]
+        (is (false? (p/verify-fn :ed25519 pubkey tampered signature)))))
+    (testing "as does signing with the record's own TTL instead of the original"
+      (let [wrong-ttl (sign/signing-blob rrs (assoc params :type-covered "A"
+                                                    :name "www.example.com."
+                                                    :original-ttl 300))]
+        (is (false? (p/verify-fn :ed25519 pubkey wrong-ttl signature))
+            "the failure that validates at the origin and fails from every cache")))))
+
+(deftest a-ds-record-built-here-carries-a-real-digest
+  (let [k (sign/dnskey {:name "example.com." :algorithm :ed25519
+                        :public-key pubkey :ksk? true})
+        d (p/delegation-signer k {:algorithm :ed25519 :digest-type :sha256})
+        raw (get-in d [:zone/rdata :zone/raw])]
+    (is (= "DS" (:zone/type d)))
+    (is (= 36 (count raw)) "2 tag + 1 algorithm + 1 digest-type + 32 digest")
+    (is (= 15 (nth raw 2)))
+    (is (= 2 (nth raw 3)))
+    (testing "and the digest is SHA-256 of owner-name || DNSKEY rdata, not of something else"
+      (is (= (vec (drop 4 raw))
+             (p/digest-fn :sha256 (sign/ds-digest-input k)))))))
+
+(deftest the-key-tag-in-the-ds-matches-the-dnskey-it-points-at
+  (let [k (sign/dnskey {:name "example.com." :algorithm :ed25519
+                        :public-key pubkey :ksk? true})
+        d (p/delegation-signer k {:algorithm :ed25519})
+        raw (get-in d [:zone/rdata :zone/raw])
+        tag-in-ds (+ (* 256 (nth raw 0)) (nth raw 1))]
+    (is (= (sign/dnskey-tag k :ed25519) tag-in-ds)
+        "a DS whose tag does not match any DNSKEY is a delegation nothing can follow")))

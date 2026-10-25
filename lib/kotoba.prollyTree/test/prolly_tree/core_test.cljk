@@ -1,0 +1,375 @@
+(ns prolly-tree.core-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
+            [prolly-tree.core :as pt]
+            [kotoba.lang.text :as str]
+            [ipld.core :as ipld]))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+(defn- key-str
+  "Zero-padded \"key-NNNN\", portable (no `format`, which is :clj-only)."
+  [i]
+  (let [s (str i)]
+    (str "key-" (apply str (repeat (- 4 (count s)) "0")) s)))
+
+(deftest round-trip-small
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first [["a" 1] ["b" 2] ["c" 3]])
+        root (pt/build-tree put! entries)]
+    (is (some? root))
+    (doseq [[k v] entries]
+      (is (= v (pt/lookup get-fn root k))))
+    (is (nil? (pt/lookup get-fn root "zzz-missing")))))
+
+(deftest round-trip-many-multi-level
+  (let [{:keys [put! get-fn store]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)]
+    (is (some? root))
+    (doseq [[k v] entries]
+      (is (= v (pt/lookup get-fn root k))))
+    (testing "2000 entries at ~1/256 chunking builds a multi-node tree"
+      (is (> (count @store) 8)))))
+
+(deftest empty-tree
+  (let [{:keys [put! get-fn]} (mem-store)]
+    (is (nil? (pt/build-tree put! [])))
+    (is (nil? (pt/lookup get-fn nil "anything")))))
+
+(deftest scan-prefix-finds-matching-keys
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first [["app/1" 1] ["app/2" 2] ["zzz/1" 3]])
+        root (pt/build-tree put! entries)
+        found (pt/scan-prefix get-fn root "app/")]
+    (is (= #{["app/1" 1] ["app/2" 2]} (set found)))))
+
+(deftest sync-tree-read-rejects-bytes-stored-under-wrong-cid
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! [["a" 1]])
+        alien (:bytes (ipld/node->block {"kind" "leaf" "entries" [["evil" 9]]}))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (pt/lookup (fn [cid] (if (= cid root) alien (get-fn cid))) root "a")))))
+
+(deftest internal-children-are-real-ipld-links
+  ;; decode a multi-level tree's root straight off the block store: children
+  ;; must be [max-key <tag-42 Link>], walkable by generic ipld/links with no
+  ;; prolly-specific schema knowledge.
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        node (ipld/decode (get-fn root))]
+    (is (= "internal" (get node "kind")))
+    (is (seq (ipld/links node)))
+    (is (every? ipld/link? (map second (get node "children"))))
+    ;; every linked CID is fetchable and re-derives its own address
+    (doseq [cid (ipld/links node)]
+      (is (= cid (ipld/cid (get-fn cid)))))))
+
+(deftest scan-prefix-prunes-blocks
+  ;; Range-pruning: a prefix scan must return the SAME matches as before, but
+  ;; fetch far fewer blocks than a full walk (ADR-2607022330 addendum 3 / #16).
+  (let [store (atom {})
+        gets  (atom 0)
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (swap! gets inc) (get @store cid))
+        ;; 3000 keys across 3 prefixes → a multi-level tree with many leaves
+        entries (sort-by first
+                         (for [p ["aaa/" "mmm/" "zzz/"], i (range 1000)]
+                           [(str p (key-str i)) (str "v" i)]))
+        root (pt/build-tree put! entries)
+        total-blocks (count @store)]
+    (testing "correctness: prefix returns exactly its 1000 matches"
+      (let [rows (pt/scan-prefix get-fn root "mmm/")]
+        (is (= 1000 (count rows)))
+        (is (every? (fn [[k _]] (str/starts-with? k "mmm/")) rows))))
+    (testing "pruning fetches fewer blocks than a full scan"
+      (let [pruned @gets]
+        (reset! gets 0)
+        (pt/scan-prefix get-fn root "")            ; full scan touches every block
+        (let [full @gets]
+          (is (< pruned full)
+              (str "pruned=" pruned " must be < full=" full " (total-blocks=" total-blocks ")")))))
+    (testing "absent prefix fetches only the path, returns nothing"
+      (reset! gets 0)
+      (is (= [] (pt/scan-prefix get-fn root "nope/")))
+      (is (< @gets total-blocks) "absent-prefix scan is pruned, not a full walk"))))
+
+(deftest scan-prefix-limit-stops-the-walk
+  (let [store (atom {})
+        gets  (atom 0)
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (swap! gets inc) (get @store cid))
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        full-keys (mapv first (pt/scan-prefix get-fn root ""))]
+    (reset! gets 0)
+    (let [one (pt/scan-prefix get-fn root "" 1)
+          limited-gets @gets]
+      (is (= [(first full-keys)] (mapv first one)))
+      (reset! gets 0)
+      (pt/scan-prefix get-fn root "")
+      (let [full-gets @gets]
+        (is (< limited-gets full-gets)
+            (str "limit=1 gets=" limited-gets " must be < full gets=" full-gets))))
+    (is (= (take 5 full-keys) (mapv first (pt/scan-prefix get-fn root "" 5))))
+    (is (= [] (pt/scan-prefix get-fn root "" 0)))
+    (is (empty? (or (pt/scan-prefix get-fn nil "" 1) [])))))
+
+(deftest scan-range-cuts-the-tree-not-the-result
+  ;; Value-interval analogue of `scan-prefix-prunes-blocks`. A `[lo, hi)`
+  ;; walk must return the same pairs as filtering a full scan, and must
+  ;; fetch fewer blocks than that full scan.
+  (let [store (atom {})
+        gets  (atom 0)
+        put!  (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (swap! gets inc) (get @store cid))
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 3000)))
+        root (pt/build-tree put! entries)
+        total-blocks (count @store)
+        lo (key-str 1000)
+        hi (key-str 1100)
+        want (filterv (fn [[k _]] (and (not (neg? (compare k lo)))
+                                       (neg? (compare k hi))))
+                      entries)]
+    (testing "correctness: [lo, hi) matches a filtered full scan"
+      (is (= want (pt/scan-range get-fn root lo hi))))
+    (testing "hi is exclusive"
+      (is (not (some (fn [[k _]] (= k hi)) (pt/scan-range get-fn root lo hi)))))
+    (testing "pruning fetches fewer blocks than a full walk"
+      (let [pruned @gets]
+        (reset! gets 0)
+        (pt/scan-range get-fn root nil nil)
+        (let [full @gets]
+          (is (< pruned full)
+              (str "pruned=" pruned " must be < full=" full
+                   " (total-blocks=" total-blocks ")")))))
+    (testing "an empty interval fetches a path, not the tree"
+      (reset! gets 0)
+      (is (= [] (pt/scan-range get-fn root (key-str 500) (key-str 500))))
+      (is (< @gets total-blocks)))
+    (testing "nil bounds are a full ordered scan"
+      (is (= (mapv first entries)
+             (mapv first (pt/scan-range get-fn root nil nil)))))))
+
+(deftest delete-many-is-history-independent
+  (let [entries (mapv (fn [i] [(key-str i) i]) (range 2000))
+        removed (set (concat (range 0 17) (range 911 938) (range 1980 2000)))
+        remaining (filterv (fn [[_ v]] (not (contains? removed v))) entries)
+        incremental (mem-store)
+        rebuilt (mem-store)
+        root (pt/build-tree (:put! incremental) entries)
+        deleted (pt/delete-many (:put! incremental) (:get-fn incremental)
+                                root (map key-str removed))
+        expected (pt/build-tree (:put! rebuilt) remaining)]
+    (is (= expected deleted) "delete history must not affect the root CID")
+    (doseq [i removed]
+      (is (nil? (pt/lookup (:get-fn incremental) deleted (key-str i)))))
+    (is (= 500 (pt/lookup (:get-fn incremental) deleted (key-str 500))))))
+
+(deftest delete-many-handles-noops-and-empty-result
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! [["a" 1] ["b" 2]])]
+    (is (= root (pt/delete-many put! get-fn root [])))
+    (is (= root (pt/delete-many put! get-fn root ["missing" "missing"])))
+    (is (nil? (pt/delete-many put! get-fn root ["a" "b"])))
+    (is (nil? (pt/delete-many put! get-fn nil ["a"])))))
+
+(deftest delete-many-writes-less-than-a-full-rebuild
+  (let [{:keys [put! get-fn store]} (mem-store)
+        entries (mapv (fn [i] [(key-str i) i]) (range 3000))
+        root (pt/build-tree put! entries)
+        before (count @store)
+        _ (pt/delete-many put! get-fn root (map key-str (range 1400 1420)))
+        delta-writes (- (count @store) before)
+        full (mem-store)
+        remaining (filterv (fn [[_ v]] (not (<= 1400 v 1419))) entries)
+        _ (pt/build-tree (:put! full) remaining)
+        full-writes (count @(:store full))]
+    (is (< delta-writes (/ full-writes 2))
+        (str "delete wrote " delta-writes " new blocks; rebuild wrote "
+             full-writes))))
+
+(deftest delete-then-insert-is-history-independent
+  (let [entries (->> (range 2000)
+                     (map (fn [i] [(pr-str [(str "s" i) "p" (str "o" i)]) i]))
+                     (sort-by first)
+                     vec)
+        removals (mapv (fn [i] (pr-str [(str "s" i) "p" (str "o" i)]))
+                       (range 900 920))
+        additions (mapv (fn [i]
+                          [(pr-str [(str "s" i) "p" (str "o" i)]) i])
+                        (range 2000 2020))
+        incremental (mem-store)
+        root (pt/build-tree (:put! incremental) entries)
+        deleted (pt/delete-many (:put! incremental) (:get-fn incremental)
+                                root removals)
+        actual (pt/insert-many (:put! incremental) (:get-fn incremental)
+                               deleted additions)
+        removal-set (set removals)
+        rebuilt (mem-store)
+        deleted-expected (pt/build-tree
+                          (:put! rebuilt)
+                          (sort-by first
+                                   (remove #(contains? removal-set (first %)) entries)))
+        expected (pt/build-tree
+                  (:put! rebuilt)
+                  (sort-by first
+                           (concat (remove #(contains? removal-set (first %)) entries)
+                                   additions)))]
+    (is (= deleted-expected deleted) "delete alone must match a rebuild")
+    (is (= expected actual))))
+
+#?(:cljs
+   (defn- async-mem-store []
+     (let [store (atom {})
+           gets (atom 0)]
+       {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+        :get-fn (fn [cid] (swap! gets inc) (js/Promise.resolve (get @store cid)))
+        :gets gets
+        :store store})))
+
+#?(:cljs
+   (deftest scan-prefix-async-matches-scan-prefix-correctness
+     (async done
+       (let [{:keys [put! store]} (async-mem-store)
+             sync-get-fn (fn [cid] (get @store cid))
+             async-get-fn (fn [cid] (js/Promise.resolve (get @store cid)))
+             entries (sort-by first
+                              (for [p ["aaa/" "mmm/" "zzz/"], i (range 300)]
+                                [(str p (key-str i)) (str "v" i)]))
+             root (pt/build-tree put! entries)
+             expected (set (pt/scan-prefix sync-get-fn root "mmm/"))]
+         (-> (pt/scan-prefix-async async-get-fn root "mmm/")
+             (.then (fn [rows]
+                      (is (= 300 (count rows)))
+                      (is (= expected (set rows))
+                          "scan-prefix-async returns exactly what scan-prefix returns")
+                      (done))))))))
+
+#?(:cljs
+   (deftest scan-prefix-async-full-scan-matches-and-visits-each-node-once
+     ;; ADR-2607120730 follow-up: the whole point of scan-prefix-async is O(N)
+     ;; node visits (each node fetched/decoded exactly once), not O(N^2) --
+     ;; unlike scan-prefix run over a retry-from-root trampoline (with-blocks),
+     ;; which re-walks/re-decodes every already-fetched node on every retry.
+     (async done
+       (let [{:keys [put! get-fn gets store]} (async-mem-store)
+             sync-get-fn (fn [cid] (get @store cid))
+             entries (sort-by first (map (fn [i] [(key-str i) (str "v" i)]) (range 2000)))
+             root (pt/build-tree put! entries)
+             total-blocks (count @store)
+             expected (set (pt/scan-prefix sync-get-fn root ""))]
+         (reset! gets 0)
+         (-> (pt/scan-prefix-async get-fn root "")
+             (.then (fn [rows]
+                      (is (= 2000 (count rows)))
+                      (is (= expected (set rows))
+                          "scan-prefix-async's full scan matches scan-prefix's full scan exactly")
+                      (is (= total-blocks @gets)
+                          (str "each of the " total-blocks " blocks is fetched EXACTLY once, "
+                               "not re-fetched/re-decoded per retry (actual gets=" @gets ")"))
+                      (done))))))))
+
+#?(:cljs
+   (deftest scan-prefix-async-limit-stops-the-walk
+     (async done
+       (let [{:keys [put! get-fn gets store]} (async-mem-store)
+             sync-get-fn (fn [cid] (get @store cid))
+             entries (sort-by first (map (fn [i] [(key-str i) (str "v" i)]) (range 2000)))
+             root (pt/build-tree put! entries)
+             want (mapv first (pt/scan-prefix sync-get-fn root "" 1))]
+         (reset! gets 0)
+         (-> (pt/scan-prefix-async get-fn root "" 1)
+             (.then (fn [rows]
+                      (let [limited-gets @gets]
+                        (is (= want (mapv first rows)))
+                        (reset! gets 0)
+                        (-> (pt/scan-prefix-async get-fn root "")
+                            (.then (fn [_]
+                                     (is (< limited-gets @gets)
+                                         (str "limit=1 gets=" limited-gets
+                                              " must be < full gets=" @gets))
+                                     (done))))))))))))
+
+#?(:cljs
+   (deftest async-tree-read-rejects-bytes-stored-under-wrong-cid
+     (async done
+       (let [{:keys [put! store]} (async-mem-store)
+             root (pt/build-tree put! [["a" 1]])
+             alien (:bytes (ipld/node->block {"kind" "leaf" "entries" [["evil" 9]]}))]
+         (-> (pt/scan-prefix-async
+              (fn [cid] (js/Promise.resolve (if (= cid root) alien (get @store cid))))
+              root "")
+             (.then (fn [_] (is false "wrong-CID bytes must reject") (done)))
+             (.catch (fn [e]
+                       ;; Both levels, because nbb wraps and compiled
+                       ;; ClojureScript does not. SCI rethrows anything raised
+                       ;; inside a promise callback as its own `{:type
+                       ;; :sci/error …}` and hangs the original off `ex-cause`;
+                       ;; on a compiled build (and on the JVM) there is no
+                       ;; wrapper and the cause is nil. Measured 2026-08-18 --
+                       ;; asserting only the top level made this the one red
+                       ;; test in an otherwise green nbb run, for a difference
+                       ;; that does not exist in the Worker this ships to.
+                       (let [types (keep #(:type (ex-data %)) [e (ex-cause e)])]
+                         (is (some #{:ipld/cid-mismatch} types)
+                             (str "expected :ipld/cid-mismatch, saw " (pr-str types))))
+                       (done))))))))
+
+#?(:cljs
+   (deftest delete-many-async-matches-rebuild
+     (async done
+       (let [{:keys [put! store]} (async-mem-store)
+             entries (mapv (fn [i] [(key-str i) i]) (range 600))
+             root (pt/build-tree put! entries)
+             rebuilt (mem-store)
+             expected (pt/build-tree (:put! rebuilt)
+                                     (filterv (fn [[_ v]] (not (<= 200 v 229)))
+                                              entries))]
+         (-> (pt/delete-many-async
+              (fn [cid bytes]
+                (js/Promise.resolve (do (swap! store assoc cid bytes) cid)))
+              (fn [cid] (js/Promise.resolve (get @store cid)))
+              root (map key-str (range 200 230)))
+             (.then (fn [deleted]
+                      (is (= expected deleted))
+                      (done)))
+             (.catch (fn [e] (is false (str "delete-many-async threw: " e))
+                       (done))))))))
+
+#?(:cljs
+   (deftest async-mutation-does-not-prefetch-every-leaf
+     (async done
+       (let [base-store (mem-store)
+             entries (mapv (fn [i] [(key-str i) i]) (range 8000))
+             base-root (pt/build-tree (:put! base-store) entries)
+             total-blocks (count @(:store base-store))
+             expected-store (mem-store)
+             expected (pt/build-tree
+                       (:put! expected-store)
+                       (conj (filterv (fn [[_ v]] (not= 4000 v)) entries)
+                             [(key-str 8000) 8000]))
+             {:keys [put! get-fn gets store]} (async-mem-store)]
+         (reset! store @(:store base-store))
+         (reset! gets 0)
+         (-> (pt/mutate-many-async put! get-fn base-root
+                                   [[(key-str 8000) 8000]]
+                                   [(key-str 4000)])
+             (.then
+              (fn [root]
+                (is (= expected root) "cold mutation remains CID-identical")
+                (is (> total-blocks 20))
+                (println "  [cold mutation]" @gets "GETs over"
+                         total-blocks "stored blocks")
+                (is (< @gets (/ total-blocks 3))
+                    (str "cold mutation fetched " @gets " of "
+                         total-blocks " blocks; leaf prefetch regressed"))
+                (done)))
+             (.catch (fn [e]
+                       (is false (str "cold mutation threw: " e))
+                       (done))))))))

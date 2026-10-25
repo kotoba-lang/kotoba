@@ -1,0 +1,234 @@
+(ns kotoba.dtn.discovery
+  "Gossip-based presence broadcast/discovery for kotoba-lang/dtn nodes,
+  built directly on kotoba-lang/io-libp2p's real gossip transport
+  (kotoba.net.transport.tcp). This is a REAL, DIRECT dependency on
+  kotoba-lang/io-libp2p — unlike this repo's deliberately duck-typed,
+  dependency-free relationship to kotoba-lang/rcs (see kotoba.dtn.gateway's
+  docstring), io-libp2p already exists, is independently stable and
+  versioned, and there is no build-order reason to avoid depending on it
+  directly here.
+
+  THE GAP THIS CLOSES. Every version of kotoba.dtn.transport.tcp's own
+  docstring/README has named the same limitation: 'a peer's host:port must
+  already be known (passed to start-node! as :peers) ... No discovery, no
+  NAT traversal, no gossip routing.' This namespace closes the discovery
+  half of that: a dtn node ANNOUNCES its own reachability
+  (announce!/start-announcing!) over an io-libp2p gossip node it's also
+  running, and every listening dtn node CONSUMES those announcements
+  (process-presence-updates!/start-discovering!) to populate its OWN
+  :peers map dynamically — a live mutation of a RUNNING node handle's
+  :peers, not a restart-time configuration step. Two dtn nodes that were
+  never told about each other's host:port in advance can still exchange a
+  real bundle over kotoba.dtn.transport.tcp, purely because gossip-based
+  discovery told them how to reach each other. See
+  test/kotoba/dtn/discovery_demo.cljk for the end-to-end proof (three real
+  dtn nodes, three real gossip nodes, zero static :peers config).
+
+  EXPLICITLY NOT:
+
+    - A DHT. There is no distributed routing table, no key-based lookup,
+      no notion of 'closest node to a key' — just a flat gossip broadcast
+      of 'here is how to reach me' on a well-known topic
+      (presence/default-topic, \"dtn-presence\"), consumed by every dtn
+      node polling that same topic on the same gossip mesh.
+    - Authenticated. A presence announcement is trusted at face value —
+      this namespace does not sign, verify, or even sanity-check that the
+      gossip :from peer-id has any real relationship to the announced
+      :dtn/e164; see kotoba.dtn.discovery.presence/valid-presence-announcement?
+      for the (structural-only) validation that IS done. Combining a
+      newly-discovered peer with kotoba.dtn.auth's :peer-secrets for the
+      ACTUAL bundle traffic once it's discovered — so a forged discovery
+      announcement can, at worst, get itself added as an unauthenticated
+      :peers entry (which kotoba.dtn.transport.tcp already treats exactly
+      like any other unauthenticated peer: bundles TO it are sent
+      unsigned, bundles CLAIMING to be FROM it are accepted unsigned only
+      if this node has no :peer-secrets entry for that e164 either) — is
+      the CALLER's job. This module never configures :peer-secrets on
+      anyone's behalf.
+    - Push/callback-based. kotoba-lang/io-libp2p's transport currently
+      exposes no inbound-message callback/hook for a consumer outside its
+      own namespace — its only observable integration surface for 'what
+      has this gossip node received so far' is the plain
+      :received-messages vector living on its own node handle atom (see
+      kotoba.net.transport.tcp's handle-gossip! docstring: appended to,
+      in order, only on a FRESH — non-duplicate — delivery). Modifying
+      io-libp2p to add a push hook was explicitly out of scope for this
+      work (io-libp2p is treated here as a stable, already-built
+      dependency to consume, not to extend) — this namespace instead
+      POLLS that vector on a plain js/setInterval, the same mechanism
+      start-announcing! already uses for its own periodic broadcast. A
+      deliberate simplicity choice given io-libp2p's current
+      observable-state-only integration surface, not an oversight, and
+      exactly why io-libp2p itself never needed to change for this to
+      work.
+
+  .cljs, NOT .cljc: depends on kotoba.net.transport.tcp (itself Node-only
+  .cljs, real socket I/O) and on js/setInterval/js/clearInterval/js/Date.now.
+  Never loaded by the JVM `kbb -M:test` suite, so it cannot regress
+  this repo's existing pure `.cljc` assertion count — see this repo's
+  README for the current count. Only runs under a Node-hosted
+  ClojureScript runtime (nbb in this repo), same as
+  kotoba.dtn.transport.tcp and kotoba.net.transport.tcp themselves.
+
+  PURE HELPERS live in kotoba.dtn.discovery.presence (portable .cljc,
+  covered by kbb -M:test) — announcement shape construction/
+  validation, self-announcement detection, translating an announcement
+  into the {:host .. :port ..} shape kotoba.dtn.transport.tcp's own
+  :peers already expects, and the :received-messages dedup-index math.
+  This namespace is the impure wiring on top: reading/writing real node
+  handle atoms, calling io-libp2p's real publish!, and driving the two
+  periodic loops via real JS timers."
+  (:require [kotoba.net.transport.tcp :as net-tcp]
+            [kotoba.dtn.discovery.presence :as presence]))
+
+(def default-topic
+  "Re-exported for callers that want the default without requiring
+  kotoba.dtn.discovery.presence directly."
+  presence/default-topic)
+
+;; ---------------------------------------------------------------------------
+;; Announce
+;; ---------------------------------------------------------------------------
+
+(defn announce!
+  "Publish ONE presence announcement for dtn-node-handle-atom's own
+  reachability over gossip-node-handle-atom's real gossip network
+  (kotoba.net.transport.tcp/publish!), on topic (default default-topic).
+
+  The announcement is built from dtn-node-handle-atom's own :e164/:port
+  plus advertise-host (default \"localhost\" — the host OTHER dtn nodes
+  should use to reach THIS one; this module has no way to auto-detect a
+  node's own externally-reachable address, so pass :advertise-host
+  explicitly for anything beyond same-host demo/test use, exactly the same
+  caveat kotoba.dtn.transport.tcp's own :peers config already has — a
+  peer's host has always been caller-supplied, this module only automates
+  telling OTHER nodes what that host is). announce-ts is stamped from
+  js/Date.now() right here — see kotoba.dtn.discovery.presence's namespace
+  docstring for why a varying value per call matters (gossip content-hash
+  dedup would otherwise silently suppress every re-announcement after the
+  first).
+
+  Returns whatever kotoba.net.transport.tcp/publish! returns: the fanout
+  vector of {:to peer-id :payload payload} entries actually written to
+  just now (empty if this gossip node currently has no peers subscribed
+  to topic)."
+  [dtn-node-handle-atom gossip-node-handle-atom
+   & {:keys [topic advertise-host] :or {topic default-topic advertise-host "localhost"}}]
+  (let [{:keys [e164 port]} (deref dtn-node-handle-atom)
+        announcement (presence/presence-announcement e164 advertise-host port (js/Date.now))]
+    (net-tcp/publish! gossip-node-handle-atom topic announcement)))
+
+(defn start-announcing!
+  "Wrap announce! in a periodic js/setInterval. Calls announce! once
+  immediately (so a freshly-started node's peers don't wait a full
+  interval-ms before hearing about it for the first time) and again every
+  interval-ms after that.
+
+  interval-ms defaults to 1500 — reasonable for this repo's own demo/test
+  iteration speed. A REAL, non-demo deployment's presence cadence would be
+  much slower (tens of seconds to minutes is typical for a
+  gossip-presence system in the wild) to keep steady-state gossip traffic
+  light; this default is deliberately fast only so a test/demo doesn't
+  have to wait long for a discovery cycle to land.
+
+  Returns the raw JS interval handle (an opaque value — pass it to
+  stop-discovery! to clear it; do not assume it's a plain integer, Node's
+  own return type for setInterval is a Timeout object, not a number)."
+  [dtn-node-handle-atom gossip-node-handle-atom
+   & {:keys [topic advertise-host interval-ms]
+      :or {topic default-topic advertise-host "localhost" interval-ms 1500}}]
+  (announce! dtn-node-handle-atom gossip-node-handle-atom
+             :topic topic :advertise-host advertise-host)
+  (js/setInterval
+   (fn [] (announce! dtn-node-handle-atom gossip-node-handle-atom
+                      :topic topic :advertise-host advertise-host))
+   interval-ms))
+
+;; ---------------------------------------------------------------------------
+;; Discover
+;; ---------------------------------------------------------------------------
+
+(defn process-presence-updates!
+  "Scan gossip-node-handle-atom's :received-messages (READ-ONLY — this
+  namespace never mutates io-libp2p's own node handle, treating it purely
+  as an external observable data source, per this namespace's docstring)
+  for presence announcements on topic that dtn-node-handle-atom hasn't
+  already processed, and merge each genuinely new, structurally-valid,
+  NON-SELF one into dtn-node-handle-atom's OWN :peers map.
+
+  Dedup bookkeeping (:discovery/processed-count — how many raw
+  :received-messages entries have already been looked at) is tracked on
+  DTN-NODE-HANDLE-ATOM itself, not on the gossip node handle: this dtn
+  node is the one doing the scanning/consuming, and tracking the
+  high-water mark on its own handle means a single gossip node could, in
+  principle, be polled by more than one independent scanner (this
+  function, or a future different consumer) without their progress
+  colliding — kotoba.dtn.discovery.presence/new-entries is the pure
+  function that actually does this index math (see its docstring).
+
+  For each new entry whose :topic matches AND whose :payload passes
+  kotoba.dtn.discovery.presence/valid-presence-announcement? AND is NOT a
+  self-announcement (kotoba.dtn.discovery.presence/self-announcement?,
+  compared against this dtn node's own :e164 — a node must never add
+  itself as its own discovered peer): dtn-node-handle-atom's :peers is
+  updated (assoc, keyed by the announced :dtn/e164) with
+  kotoba.dtn.discovery.presence/announcement->peer-entry's
+  {:host .. :port ..} — exactly the shape kotoba.dtn.transport.tcp's
+  start-node! :peers option and links-for already consume, so this is a
+  LIVE update to a RUNNING node's peer table (the very next
+  route-and-send!/links-for call on this node handle sees it), not
+  something that requires a restart. A structurally-invalid payload (see
+  valid-presence-announcement?) is silently skipped — this module's trust
+  posture (see namespace docstring) is 'usable at face value once its
+  shape is usable', not 'log and reject a malformed one loudly' (a
+  malformed presence broadcast is not a security event the way a failed
+  bundle-signature check is over in kotoba.dtn.transport.tcp — it's just
+  not usable).
+
+  Returns the vector of e164s actually added/updated into :peers this
+  call, in the order their announcements were processed (empty if nothing
+  new was discovered) — for a caller/test that wants to confirm real
+  discovery happened without reaching into :peers directly."
+  [dtn-node-handle-atom gossip-node-handle-atom & {:keys [topic] :or {topic default-topic}}]
+  (let [own-e164 (:e164 (deref dtn-node-handle-atom))
+        already-processed (or (:discovery/processed-count (deref dtn-node-handle-atom)) 0)
+        received (:received-messages (deref gossip-node-handle-atom))
+        {:keys [entries processed]} (presence/new-entries received already-processed topic)
+        discovered (atom [])]
+    (doseq [{:keys [payload]} entries]
+      (when (and (presence/valid-presence-announcement? payload)
+                 (not (presence/self-announcement? payload own-e164)))
+        (swap! dtn-node-handle-atom update :peers assoc
+               (:dtn/e164 payload) (presence/announcement->peer-entry payload))
+        (swap! discovered conj (:dtn/e164 payload))))
+    (swap! dtn-node-handle-atom assoc :discovery/processed-count processed)
+    @discovered))
+
+(defn start-discovering!
+  "Wrap process-presence-updates! in a periodic js/setInterval. Calls it
+  once immediately, then again every interval-ms (default 1000) after
+  that.
+
+  Returns the raw JS interval handle (see stop-discovery!)."
+  [dtn-node-handle-atom gossip-node-handle-atom
+   & {:keys [topic interval-ms] :or {topic default-topic interval-ms 1000}}]
+  (process-presence-updates! dtn-node-handle-atom gossip-node-handle-atom :topic topic)
+  (js/setInterval
+   (fn [] (process-presence-updates! dtn-node-handle-atom gossip-node-handle-atom :topic topic))
+   interval-ms))
+
+;; ---------------------------------------------------------------------------
+;; Lifecycle
+;; ---------------------------------------------------------------------------
+
+(defn stop-discovery!
+  "Clear every JS interval handle in handles (a coll of js/setInterval
+  return values, e.g. [announcing-handle discovering-handle] — the two
+  handles start-announcing!/start-discovering! each return) via
+  js/clearInterval. nil entries are skipped explicitly (rather than
+  relying on js/clearInterval's own nil-argument behavior) so a caller
+  that conditionally started only one of the two loops can pass a vector
+  with a nil in it without needing its own filtering first."
+  [handles]
+  (doseq [h handles]
+    (when (some? h) (js/clearInterval h))))

@@ -1,0 +1,145 @@
+#!/usr/bin/env kbb
+;; etzhayyim-project-common-crawl — Phase 4 domain-intel extraction (clj/cljc port of
+;; scripts/phase4_intel_risingwave.py; ADR-2606280030).
+;;
+;; Faithful port of the LLM-intel core: prompt construction, response JSON parsing
+;; (markdown-fence tolerant), field clamping, and the enriched-description builder.
+;;
+;; SUBSTRATE/INFERENCE boundary changes vs the .py:
+;;   * LLM   → Murakumo loopback ONLY (ADR-2605215000): the RunPod fallback path +
+;;             its hard-coded gateway key are NOT ported (Murakumo is the default
+;;             and preferred inference path; commercial-GPU fallback is dropped).
+;;   * STORE → the RisingWave vertex_domain read/UPDATE is replaced by the injectable
+;;             `common-crawl.store/Store` seam (RisingWave is forbidden canonical state).
+(ns common-crawl.intel
+  "Phase 4 — structured domain-intel extraction (pure helpers + Murakumo loopback call)."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [cheshire.core :as json])
+            #?(:clj [babashka.http-client :as http])))
+
+;; ── pure helpers ──────────────────────────────────────────────────────────────
+
+(defn strip-think
+  "Remove <think>…</think> spans (qwen reasoning) and trim, matching the Python re.sub."
+  [text]
+  (-> (or text "")
+      (str/replace #"(?s)<think>.*?</think>" "")
+      str/trim))
+
+(defn- clamp [v n]
+  (let [s (str (or v ""))]
+    (if (> (count s) n) (subs s 0 n) s)))
+
+(defn parse-json
+  "Extract a JSON object from an LLM response, tolerating ``` fences and surrounding
+   prose. Returns a map (string keys) or {} on failure. Mirrors phase4 parse_json."
+  [text]
+  #?(:clj
+     (if (str/blank? text)
+       {}
+       (let [t       (str/trim text)
+             t       (if (str/starts-with? t "```")
+                       (->> (str/split-lines t) rest (str/join "\n"))
+                       t)
+             t       (if (str/ends-with? (str/trim t) "```")
+                       (let [tt (str/trim t)] (subs tt 0 (str/last-index-of tt "```")))
+                       t)
+             t       (str/trim t)
+             start   (str/index-of t "{")
+             end     (when-let [i (str/last-index-of t "}")] (inc i))]
+         (if (and start end (> end start))
+           (try (json/parse-string (subs t start end))
+                (catch Exception _ {}))
+           {})))
+     :cljs (throw (ex-info "parse-json: cljs JSON not wired" {}))))
+
+(defn clamp-intel
+  "Clamp the extracted-intel map's fields to the column limits (mirror of the
+   phase4 extract_intel post-processing). Returns {} unless `entityType` is present."
+  [result]
+  (if (and (map? result) (seq (str (or (get result "entityType") ""))))
+    {"entityType"   (clamp (get result "entityType") 40)
+     "industry"     (clamp (get result "industry") 80)
+     "operator"     (clamp (get result "operator") 120)
+     "jurisdiction" (clamp (get result "jurisdiction") 8)
+     "description"  (clamp (get result "description") 300)
+     "services"     (->> (get result "services") (take 3) (mapv #(clamp % 60)))
+     "trustLevel"   (clamp (or (get result "trustLevel") "unknown") 20)}
+    {}))
+
+(defn intel-prompt
+  "Build the extraction prompt for one domain (verbatim port of phase4 extract_intel)."
+  [domain page-count sample-titles]
+  (let [titles-str #?(:clj (json/generate-string (vec (take 5 (or sample-titles []))))
+                      :cljs (pr-str (vec (take 5 (or sample-titles [])))))]
+    (str "Extract structured intelligence for this internet domain. Return JSON only (English).\n\n"
+         "Domain: " domain "\n"
+         "Page count: " page-count "\n"
+         "Sample page titles: " titles-str "\n\n"
+         "Extract these fields:\n"
+         "- entityType: one of [organization, platform, media, government, database, marketplace, community, academic, ngo, personal]\n"
+         "- industry: primary industry/sector (string, max 40 chars)\n"
+         "- operator: organization name that operates this domain (max 60 chars)\n"
+         "- jurisdiction: country ISO 3166-1 alpha-2 code (e.g., \"JP\", \"US\")\n"
+         "- description: one-sentence English description of this domain (max 200 chars)\n"
+         "- services: list of services/functions (max 3 strings)\n"
+         "- trustLevel: one of [high, medium, low, unknown]\n\n"
+         "Return a single JSON object. No explanation.")))
+
+(defn enriched-description
+  "Build the enriched profile description from clamped intel
+   (verbatim port of phase4 main's description assembly)."
+  [intel]
+  (let [parts (cond-> ["[AI Agent — unofficial]"]
+                (seq (get intel "entityType"))   (conj (get intel "entityType"))
+                (seq (get intel "industry"))     (conj (str "(" (get intel "industry") ")"))
+                (seq (get intel "operator"))     (conj (str "— " (get intel "operator")))
+                (seq (get intel "jurisdiction")) (conj (str "[" (get intel "jurisdiction") "]")))
+        header (str/join " " parts)
+        base   (str header "\n" (get intel "description"))]
+    (if (seq (get intel "services"))
+      (str base "\nServices: " (str/join ", " (get intel "services")))
+      base)))
+
+;; ── Murakumo loopback inference (clj only) ────────────────────────────────────
+
+#?(:clj
+   (defn murakumo-config
+     "Murakumo endpoint config from env (loopback/default-preferred inference,
+      ADR-2605215000). No RunPod fallback."
+     [getenv]
+     {:url     (or (getenv "MURAKUMO_URL") "https://murakumo.etzhayyim.com")
+      :model   (or (getenv "MURAKUMO_MODEL") "qwen3.5-9b")
+      :api-key (or (getenv "MURAKUMO_API_KEY") "")}))
+
+#?(:clj
+   (defn murakumo-call
+     "POST `prompt` to the Murakumo OpenAI-compatible endpoint; return the content
+      string with <think> spans stripped, or \"\" on failure. Throws via ex-info if
+      no API key is configured (parity with the Python RuntimeError)."
+     ([cfg prompt] (murakumo-call cfg prompt 32000))
+     ([{:keys [url model api-key]} prompt max-tokens]
+      (when (str/blank? api-key)
+        (throw (ex-info "MURAKUMO_API_KEY required" {:url url})))
+      (try
+        (let [resp (http/post (str url "/api/openai/v1/chat/completions")
+                              {:headers {"x-api-key" api-key
+                                         "Content-Type" "application/json"}
+                               :body    (json/generate-string
+                                         {:model model
+                                          :messages [{:role "user" :content prompt}]
+                                          :max_tokens max-tokens
+                                          :temperature 0.1})
+                               :timeout 180000})
+              choices (get (json/parse-string (:body resp)) "choices")]
+          (strip-think (get-in (first choices) ["message" "content"] "")))
+        (catch Exception _ "")))))
+
+#?(:clj
+   (defn extract-intel
+     "Full extract for one domain via Murakumo: prompt → call → parse → clamp.
+      Returns clamped intel map or {}."
+     [cfg domain page-count sample-titles]
+     (-> (murakumo-call cfg (intel-prompt domain page-count sample-titles))
+         parse-json
+         clamp-intel)))

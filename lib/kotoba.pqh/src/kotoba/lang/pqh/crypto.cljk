@@ -1,0 +1,312 @@
+(ns kotoba.lang.pqh.crypto
+  "Tahoe-pattern AEAD envelope for AT Protocol MST -- port of pqh's
+   src/crypto.ts. Per ADR-2605181100 (etzhayyim/root). Algorithm:
+   XChaCha20-Poly1305 (24-byte nonce, 16-byte tag) over dag-cbor, with an
+   ISO/IEC-7816-4 padding-bucket scheme.
+
+   .cljc per ADR-2607012200 (\"no unguarded java.*/js.* in core\"): the
+   IAead protocol, seam bookkeeping, generate-key/-nonce, key-id-of,
+   pick-bucket, and ISO/IEC-7816-4 pad-iso7816/unpad-iso7816 are genuine
+   dual :clj/:cljs implementations (pure arithmetic + util.cljc's portable
+   byte-array helpers) -- 'ISO-7816 pad/unpad, pickBucket, keyIdOf' are
+   real cljs today, not stubs.
+
+   The HChaCha20 subkey derivation + the XChaCha20-Poly1305 pipeline, and
+   the envelope encrypt/decrypt, stay :clj-only with throwing cljs stubs:
+   HChaCha20's fixed-width 32-bit-wraparound math (unchecked-add-int,
+   Integer/rotateLeft) would need a from-scratch ToInt32-coerced cljs
+   rewrite this repo has no build/test tooling to verify against, and
+   encrypt/decrypt call `cbor.core` (kotoba-lang/dag-cbor), itself a
+   JVM-only .clj peer lib with no cljs port yet -- so those two are blocked
+   on a peer-lib port regardless of this namespace. Deferred, not attempted
+   unverified. See README \"Clojure/CLJC port\".
+
+   XChaCha20-Poly1305 is composed from two verified building blocks:
+   HChaCha20 subkey derivation (hand-rolled here, cross-checked byte-for-byte
+   against @noble/ciphers' exported `hchacha()` for the same key/nonce) plus
+   an injected `IAead` capability (RFC 8439 ChaCha20-Poly1305, 12-byte nonce)
+   for the inner AEAD step -- bind `*aead*` to a host impl (JVM BouncyCastle
+   in the test fixture `kotoba.lang.pqh.aead-bc`; cljs would use
+   @noble/ciphers). This namespace imports no vendor SDK. The full pipeline
+   (key, 24-byte nonce, aad, plaintext) is verified byte-identical to
+   @noble/ciphers' xchacha20poly1305 in this port's test suite
+   (kotoba.lang.pqh.crypto-test)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.pqh.util :as u]
+            #?(:clj [cbor.core :as cbor]))
+  #?(:clj (:import (java.time Instant)
+                    (java.util Arrays))))
+
+(def AEAD-ALG "xchacha20poly1305")
+(def ENVELOPE-VERSION 1)
+(def NONCE-BYTES 24)
+(def KEY-BYTES 32)
+(def AEAD-TAG-BYTES 16)
+
+;; Padding bucket schedule. Originally ADR-2605181200's [1024 4096 16384 65536];
+;; extended 2026-08-08 per superproject ADR-2608070400 D6.
+;;
+;; Why it was extended: the bucket ladder and `kotobase-peer`'s Merkle block
+;; size classes [16384 32768 65536 131072] are chosen by different owners for
+;; different reasons (padding hides length; block classes tune sync
+;; granularity), and nothing checked that a block could actually be padded.
+;; Measured 2026-08-07, all four classes were pathological — a class sitting
+;; exactly ON a bucket boundary is the worst case, because `pick-bucket` needs
+;; `len + 1 + 16` and so overflows to the next bucket:
+;;
+;;   16384 -> needs 16401 -> 65536   (+300%)
+;;   32768 -> needs 32785 -> 65536   (+100%)
+;;   65536 -> needs 65553 -> none    (ciphertextBlob; inline padding bypassed)
+;;   131072 -> needs 131089 -> none  (same)
+;;
+;; Adding 32768/131072/262144 lets each class sit just under a bucket instead
+;; (`kotobase-peer` moved to [16367 32751 65519 131055], 0.0-0.1% overhead).
+;;
+;; **This is backward compatible for reads.** `unpad-iso7816` scans backwards
+;; for the 0x80 delimiter and never consults this list, so ciphertext padded
+;; to the old ladder still decrypts unchanged. Only future writes pick the
+;; tighter bucket.
+;;
+;; **The cost is length privacy.** Seven buckets resolve a plaintext's length
+;; more finely than four. That is the deliberate trade recorded in
+;; ADR-2608070400 (option B): keep the performance ladder's four classes and
+;; accept a finer length oracle, rather than drop classes to fit four buckets.
+;; The `block-sizing-pad-alignment-check` fleet gate enforces the pairing.
+(def PAD-BUCKETS [1024 4096 16384 32768 65536 131072 262144])
+(def PAD-SCHEME-ISO7816 "iso7816-4")
+
+;; ── AEAD capability seam ──────────────────────────────────────────────────
+;; The pure core never imports a vendor crypto SDK; the raw IETF
+;; ChaCha20-Poly1305 primitive is supplied by the host via IAead. Bind
+;; `*aead*` (e.g. to kotoba.lang.pqh.aead-bc/bc-aead) before AEAD calls.
+;; Pure data/interface -- unconditional on both platforms.
+
+(defprotocol IAead
+  "Raw IETF ChaCha20-Poly1305 AEAD -- 32-byte key, 12-byte nonce, 128-bit tag.
+   Host supplies a vetted impl (JVM BouncyCastle, cljs @noble/ciphers)."
+  (-aead12-encrypt [this key nonce12 aad plaintext])
+  (-aead12-decrypt [this key nonce12 aad ciphertext]))
+
+(def ^:dynamic *aead*
+  "Current IAead impl. Bind via `(binding [crypto/*aead* impl] ...)` before any
+   AEAD call; nil by default (calling unbound throws).")
+
+(defn- assert-aead []
+  (or *aead*
+      (throw (ex-info
+               "[kotoba.lang.pqh/crypto] *aead* not bound -- bind an IAead impl (e.g. kotoba.lang.pqh.aead-bc/bc-aead) before AEAD calls"
+               {}))))
+
+;; ── portable: keygen, key-id, padding-bucket selection, ISO/IEC 7816-4 ─────
+
+(defn generate-key
+  "Fresh 32-byte XChaCha20-Poly1305 key."
+  ^bytes [] (u/random-bytes KEY-BYTES))
+
+(defn generate-nonce
+  "Fresh 24-byte XChaCha20-Poly1305 nonce."
+  ^bytes [] (u/random-bytes NONCE-BYTES))
+
+(defn key-id-of
+  "keyId = first 16 hex chars of SHA-256(key)."
+  ^String [^bytes key]
+  (subs (u/bytes->hex (u/sha256 key)) 0 16))
+
+(defn pick-bucket
+  "Smallest bucket from PAD-BUCKETS that holds plaintext-len bytes plus the
+   ISO/IEC 7816-4 delimiter and the AEAD tag."
+  ^long [^long plaintext-len]
+  (let [need (+ plaintext-len 1 AEAD-TAG-BYTES)]
+    (or (first (filter #(<= need %) PAD-BUCKETS))
+        (throw (ex-info
+                 (str "[kotoba.lang.pqh/crypto] plaintext " plaintext-len
+                      " bytes exceeds largest inline bucket "
+                      (last PAD-BUCKETS) "; store via ciphertextBlob.")
+                 {:plaintext-len plaintext-len})))))
+
+(defn pad-iso7816
+  "ISO/IEC 7816-4 padding: append 0x80 then 0x00s to reach target-len."
+  ^bytes [^bytes plain ^long target-len]
+  (when (> (inc (alength plain)) target-len)
+    (throw (ex-info
+             (str "[kotoba.lang.pqh/crypto] padding target " target-len
+                  " too small for plaintext " (alength plain) " + delimiter")
+             {:target-len target-len :plain-len (alength plain)})))
+  (let [out (u/new-bytes target-len)
+        plain-len (alength plain)]
+    (dotimes [i plain-len] (aset out i (aget plain i)))
+    (aset out plain-len (unchecked-byte 0x80))
+    out))
+
+(defn unpad-iso7816
+  "Inverse of pad-iso7816. Throws on malformed padding."
+  ^bytes [^bytes padded]
+  (loop [i (dec (alength padded))]
+    (cond
+      (and (>= i 0) (zero? (aget padded i))) (recur (dec i))
+      (or (< i 0) (not= (unchecked-byte 0x80) (aget padded i)))
+      (throw (ex-info "[kotoba.lang.pqh/crypto] invalid ISO/IEC 7816-4 padding" {}))
+      :else (u/copy-of-range padded 0 i))))
+
+;; ── HChaCha20 + XChaCha20-Poly1305 pipeline + envelope (:clj-only, see ns
+;; docstring) ────────────────────────────────────────────────────────────
+
+#?(:clj
+(do
+
+;; HChaCha20 (hand-rolled; matches @noble/ciphers' hchacha() 1:1). Pure
+;; permutation, NO feedforward addition (unlike a normal ChaCha20 block).
+;; All words are Java `int` (32-bit wraparound) -- unchecked-int/-add-int
+;; throughout, never the range-checked `int`/`+`.
+
+(def ^:private sigma32-words
+  ;; "expand 32-byte k" as 4 little-endian u32 words.
+  (let [b (kbytes/utf8-bytes "expand 32-byte k")]
+    (mapv (fn [i] (unchecked-int
+                    (bit-or (bit-and (aget b i) 0xff)
+                            (bit-shift-left (bit-and (aget b (+ i 1)) 0xff) 8)
+                            (bit-shift-left (bit-and (aget b (+ i 2)) 0xff) 16)
+                            (bit-shift-left (bit-and (aget b (+ i 3)) 0xff) 24))))
+          [0 4 8 12])))
+
+(defn- bytes->le-words [^bytes b n]
+  (vec (for [i (range n)]
+         (let [o (* i 4)]
+           (unchecked-int
+             (bit-or (bit-and (aget b o) 0xff)
+                     (bit-shift-left (bit-and (aget b (+ o 1)) 0xff) 8)
+                     (bit-shift-left (bit-and (aget b (+ o 2)) 0xff) 16)
+                     (bit-shift-left (bit-and (aget b (+ o 3)) 0xff) 24)))))))
+
+(defn- word->le-bytes [^long w]
+  (let [uw (bit-and w 0xffffffff)]
+    [(unchecked-byte (bit-and w 0xff))
+     (unchecked-byte (bit-and (bit-shift-right uw 8) 0xff))
+     (unchecked-byte (bit-and (bit-shift-right uw 16) 0xff))
+     (unchecked-byte (bit-and (bit-shift-right uw 24) 0xff))]))
+
+(defn- rotl ^long [^long x ^long n]
+  (Integer/rotateLeft (unchecked-int x) (unchecked-int n)))
+
+(defn- hchacha20
+  "HChaCha20(key[32], nonce16[16]) -> subkey[32]."
+  ^bytes [^bytes key ^bytes nonce16]
+  (when (not= 32 (alength key)) (throw (ex-info "key must be 32 bytes" {})))
+  (when (not= 16 (alength nonce16)) (throw (ex-info "nonce16 must be 16 bytes" {})))
+  (let [k (bytes->le-words key 8)
+        n (bytes->le-words nonce16 4)
+        ^ints x (int-array 16)]
+    (dotimes [i 4] (aset x i (unchecked-int (nth sigma32-words i))))
+    (dotimes [i 8] (aset x (+ 4 i) (unchecked-int (nth k i))))
+    (dotimes [i 4] (aset x (+ 12 i) (unchecked-int (nth n i))))
+    (letfn [(qround! [a b c d]
+              (aset x a (unchecked-add-int (aget x a) (aget x b)))
+              (aset x d (rotl (bit-xor (aget x d) (aget x a)) 16))
+              (aset x c (unchecked-add-int (aget x c) (aget x d)))
+              (aset x b (rotl (bit-xor (aget x b) (aget x c)) 12))
+              (aset x a (unchecked-add-int (aget x a) (aget x b)))
+              (aset x d (rotl (bit-xor (aget x d) (aget x a)) 8))
+              (aset x c (unchecked-add-int (aget x c) (aget x d)))
+              (aset x b (rotl (bit-xor (aget x b) (aget x c)) 7)))]
+      (dotimes [_ 10]
+        (qround! 0 4 8 12) (qround! 1 5 9 13) (qround! 2 6 10 14) (qround! 3 7 11 15)
+        (qround! 0 5 10 15) (qround! 1 6 11 12) (qround! 2 7 8 13) (qround! 3 4 9 14)))
+    (let [out (byte-array 32)]
+      (doseq [[oi xi] (map vector (range 8) [0 1 2 3 12 13 14 15])]
+        (let [bs (word->le-bytes (aget x xi))]
+          (dotimes [j 4] (aset out (+ (* oi 4) j) (nth bs j)))))
+      out)))
+
+;; ── XChaCha20-Poly1305 (pure HChaCha20 subkey + injected IETF ChaCha20-Poly1305)
+
+(defn xchacha20poly1305-encrypt
+  "key must be 32 bytes, nonce24 must be 24 bytes. aad may be nil.
+   Requires `*aead*` bound to an IAead impl."
+  ^bytes [^bytes key ^bytes nonce24 aad ^bytes plaintext]
+  (when (not= NONCE-BYTES (alength nonce24))
+    (throw (ex-info (str "[kotoba.lang.pqh/crypto] nonce must be " NONCE-BYTES " bytes") {})))
+  (let [subkey (hchacha20 key (Arrays/copyOfRange nonce24 0 16))
+        inner-nonce (byte-array 12)]
+    (System/arraycopy nonce24 16 inner-nonce 4 8)
+    (-aead12-encrypt (assert-aead) subkey inner-nonce aad plaintext)))
+
+(defn xchacha20poly1305-decrypt
+  "Throws on AEAD tag verification failure. Requires `*aead*` bound."
+  ^bytes [^bytes key ^bytes nonce24 aad ^bytes ciphertext]
+  (when (not= NONCE-BYTES (alength nonce24))
+    (throw (ex-info (str "[kotoba.lang.pqh/crypto] nonce must be " NONCE-BYTES " bytes") {})))
+  (let [subkey (hchacha20 key (Arrays/copyOfRange nonce24 0 16))
+        inner-nonce (byte-array 12)]
+    (System/arraycopy nonce24 16 inner-nonce 4 8)
+    (-aead12-decrypt (assert-aead) subkey inner-nonce aad ciphertext)))
+
+;; ── envelope encrypt/decrypt ─────────────────────────────────────────────
+
+(defn encrypt
+  "opts: {:key bytes, :sender string, :plaintext any-cbor-encodable,
+          :aad bytes?, :inner-type string?, :nonce bytes?, :created-at string?,
+          :pad (:none | :bucket | {:bucket n})}
+   Returns the envelope map: {:v :alg :nonce :ciphertext :key-id :sender
+   :inner-type :pad :created-at}."
+  [{:keys [key sender plaintext aad inner-type nonce created-at pad]
+    :or {pad :none}}]
+  (when (not= KEY-BYTES (alength ^bytes key))
+    (throw (ex-info (str "[kotoba.lang.pqh/crypto] key must be " KEY-BYTES " bytes") {})))
+  (let [nonce (or nonce (generate-nonce))]
+    (when (not= NONCE-BYTES (alength ^bytes nonce))
+      (throw (ex-info (str "[kotoba.lang.pqh/crypto] nonce must be " NONCE-BYTES " bytes") {})))
+    (let [plaintext-bytes (cbor/encode plaintext)
+          [to-encrypt pad-scheme]
+          (cond
+            (= pad :none)
+            [plaintext-bytes nil]
+
+            (= pad :bucket)
+            (let [target (- (pick-bucket (alength plaintext-bytes)) AEAD-TAG-BYTES)]
+              [(pad-iso7816 plaintext-bytes target) PAD-SCHEME-ISO7816])
+
+            (and (map? pad) (:bucket pad))
+            (let [b (:bucket pad)]
+              (when (<= b (inc AEAD-TAG-BYTES))
+                (throw (ex-info (str "[kotoba.lang.pqh/crypto] explicit bucket " b " too small") {})))
+              [(pad-iso7816 plaintext-bytes (- b AEAD-TAG-BYTES)) PAD-SCHEME-ISO7816])
+
+            :else (throw (ex-info "[kotoba.lang.pqh/crypto] invalid pad option" {:pad pad})))
+          ciphertext (xchacha20poly1305-encrypt key nonce aad to-encrypt)]
+      {:v ENVELOPE-VERSION
+       :alg AEAD-ALG
+       :nonce nonce
+       :ciphertext ciphertext
+       :key-id (key-id-of key)
+       :sender sender
+       :inner-type inner-type
+       :pad pad-scheme
+       :created-at (or created-at (.toString (Instant/now)))})))
+
+(defn decrypt
+  "opts: {:key bytes, :envelope envelope-map, :aad bytes?}. Throws on AEAD tag
+   failure, version mismatch, or algorithm mismatch."
+  [{:keys [key envelope aad]}]
+  (when (not= ENVELOPE-VERSION (:v envelope))
+    (throw (ex-info (str "[kotoba.lang.pqh/crypto] unsupported envelope version: " (:v envelope)) {})))
+  (when (not= AEAD-ALG (:alg envelope))
+    (throw (ex-info (str "[kotoba.lang.pqh/crypto] unsupported AEAD algorithm: " (:alg envelope)) {})))
+  (when (not= (key-id-of key) (:key-id envelope))
+    (throw (ex-info "[kotoba.lang.pqh/crypto] key does not match envelope key-id" {})))
+  (let [padded (xchacha20poly1305-decrypt key (:nonce envelope) aad (:ciphertext envelope))
+        plaintext-bytes (if (= (:pad envelope) PAD-SCHEME-ISO7816) (unpad-iso7816 padded) padded)]
+    (cbor/decode plaintext-bytes)))
+
+)) ;; end #?(:clj (do ...))
+
+#?(:cljs
+(do
+  (defn- nope [n]
+    (throw (ex-info (str "kotoba.lang.pqh.crypto/" n " is :clj-only for now "
+                         "(HChaCha20's 32-bit-wraparound math and the cbor.core "
+                         "peer lib have no cljs port yet -- see README \"Clojure/"
+                         "CLJC port\")")
+                    {})))
+  (defn xchacha20poly1305-encrypt [& _] (nope "xchacha20poly1305-encrypt"))
+  (defn xchacha20poly1305-decrypt [& _] (nope "xchacha20poly1305-decrypt"))
+  (defn encrypt [& _] (nope "encrypt"))
+  (defn decrypt [& _] (nope "decrypt"))))

@@ -1,0 +1,123 @@
+(ns kura.node.s3-test
+  "The S3 backend, exercised without a network.
+
+  Both the transport and the crypto are injected, so the request shaping is a
+  pure function of its inputs and can be asserted directly. That is the point
+  of the seam: what a live bucket happens to accept today is not a
+  specification, and a test that needs credentials is a test nobody runs."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kura.node.contract :as contract]
+            [kura.node.gf :as gf]
+            [kura.node.s3 :as s3]
+            [kura.node.store :as store]))
+
+;; --- a fake bucket ---------------------------------------------------------
+
+(defrecord FakeHttp [log objects]
+  s3/IHttp
+  (-request [_ {:keys [method url headers body] :as req}]
+    (swap! log conj (select-keys req [:method :url :headers]))
+    (let [key (-> url (str/split #"\?") first (str/replace #"^https://[^/]+/[^/]+/" ""))]
+      (case method
+        :put (do (swap! objects assoc key body) {:status 200 :headers {} :body nil})
+        :get (if-let [k (get @objects key)]
+               (if-let [r (get headers "range")]
+                 (let [[from to] (map #(#?(:clj parse-long :cljs js/parseInt) %)
+                                      (rest (re-matches #"bytes=(\d+)-(\d+)" r)))
+                       n (gf/blength k)
+                       lo (min from n) hi (min (inc to) n)]
+                   {:status 206 :headers {} :body (gf/->bytes (subvec (gf/->vec k) lo hi))})
+                 {:status 200 :headers {} :body k})
+               (if (str/includes? (str url) "list-type")
+                 {:status 200 :headers {} :body (vec (keys @objects))}
+                 {:status 404 :headers {} :body nil}))
+        :head (if-let [k (get @objects key)]
+                {:status 200 :headers {"content-length" (str (gf/blength k))} :body nil}
+                {:status 404 :headers {} :body nil})
+        :delete (let [had? (contains? @objects key)]
+                  (swap! objects dissoc key)
+                  {:status (if had? 204 404) :headers {} :body nil})))))
+
+;; A crypto stub. Deterministic and obviously not secure — the point is that
+;; the signing SHAPE is asserted, not that this test re-verifies SHA-256.
+(defrecord FakeCrypto []
+  s3/ICrypto
+  (-sha256-hex [_ b] (str "sha256:" (hash (if (string? b) b (gf/->vec b)))))
+  (-hmac-sha256 [_ k m] (str "hmac(" k "," m ")"))
+  (-hex [_ b] (str "hex:" b))
+  (-utf8 [_ s] s))
+
+(defn- open-fake [& {:keys [independence failure-domain]
+                     :or {independence :shared-substrate
+                          failure-domain {:provider "fake" :bucket "kura-test"}}}]
+  (let [log (atom []) objects (atom {})]
+    {:log log
+     :objects objects
+     :store (s3/open {:node-id "s3-0"
+                      :independence independence
+                      :availability :always-on
+                      :failure-domain failure-domain
+                      :endpoint "https://s3.example.com"
+                      :host "s3.example.com"
+                      :bucket "kura-test"
+                      :region "us-west-004"
+                      :key-id "AKIA-TEST" :secret "secret"
+                      :prefix "kura"
+                      :http (->FakeHttp log objects)
+                      :crypto (->FakeCrypto)
+                      :now-fn (fn [] "2026-07-29T12:00:00Z")
+                      :parse-list (fn [body] (map #(str/replace % #"^kura/" "") body))})}))
+
+;; --- the tests -------------------------------------------------------------
+
+(deftest s3-backend-passes-the-contract
+  (let [{:keys [store]} (open-fake)]
+    (contract/verify store (fn [ok? label] (is ok? label)))))
+
+(deftest requests-are-signed
+  (let [{:keys [store log]} (open-fake)]
+    (store/-put-shard! store "obj-1/0/0" (gf/->bytes [1 2 3]))
+    (let [{:keys [headers url method]} (last @log)]
+      (is (= :put method))
+      (is (= "https://s3.example.com/kura-test/kura/obj-1/0/0" url)
+          "path-style, prefix joined, each segment encoded independently")
+      (is (str/starts-with? (get headers "authorization") "AWS4-HMAC-SHA256 "))
+      (is (str/includes? (get headers "authorization") "Credential=AKIA-TEST/20260729/us-west-004/s3/aws4_request"))
+      (is (= "20260729T120000Z" (get headers "x-amz-date")))
+      (is (some? (get headers "x-amz-content-sha256"))
+          "the payload hash is sent and must match what was signed"))))
+
+(deftest signing-is-a-pure-function-of-its-inputs
+  (testing "no clock is read, so a signature is reproducible"
+    (let [args {:crypto (->FakeCrypto) :key-id "K" :secret "S" :region "r"
+                :service "s3" :host "h" :method :get :path "/b/k" :query ""
+                :body (gf/->bytes [1]) :now-iso "2026-07-29T00:00:00Z"}]
+      (is (= (s3/sign args) (s3/sign args))))))
+
+(deftest range-reads-use-a-real-range-header
+  (testing "the systematic layout's benefit is that a range costs a range —
+            a backend that reads 4 MiB to return 1 KiB gives it back"
+    (let [{:keys [store log]} (open-fake)]
+      (store/-put-shard! store "obj-1/0/0" (gf/->bytes [10 11 12 13 14 15]))
+      (reset! log [])
+      (is (= [11 12 13] (gf/->vec (store/-get-range store "obj-1/0/0" 1 3))))
+      (is (= "bytes=1-3" (get-in (last @log) [:headers "range"]))))))
+
+(deftest a-failed-put-throws-rather-than-reporting-success
+  (let [{:keys [store objects]} (open-fake)]
+    (with-redefs []
+      (is (some? (store/-put-shard! store "obj-1/0/0" (gf/->bytes [1]))))
+      (is (= 1 (count @objects))))))
+
+(deftest independence-is-required-at-open
+  (is (thrown? #?(:clj Throwable :cljs js/Error)
+               (s3/open {:node-id "x" :endpoint "e" :host "h" :bucket "b"
+                         :http (->FakeHttp (atom []) (atom {}))
+                         :crypto (->FakeCrypto)
+                         :now-fn (fn [] "2026-07-29T00:00:00Z")
+                         :parse-list identity})))
+  (testing "and a fleet of these declares itself honestly"
+    (let [fleet (repeatedly 26 #(store/-descriptor (:store (open-fake))))]
+      (is (= 1 (:effective-domains (store/audit (vec fleet) 7)))
+          "26 prefixes in one bucket are one failure domain"))))

@@ -1,0 +1,250 @@
+(ns collect-eu-intent-pool
+  "CORDIS Horizon Europe の**一括 zip 1 本**から、EU の intent プールを作る。
+
+   判断は `kotoba.property.eu-cordis` と `kotoba.property.eu-intent-score`
+   （どちらも純 cljc）が持つ。ここは I/O だけ。
+
+   ## 日本側との対応
+
+     JP  gBizINFO 届出認定 全件 -> 税制優遇に紐づく認定を持つ法人  （SKU A / オンプレ機）
+     EU  CORDIS Horizon Europe -> 最近の民間営利参加法人           （SKU B / 推論 API）
+
+   EU に SKU A は出せない（購入導線が JP shipping の Stripe リンク 1 本）ので、
+   母集団の意味が違う。詳細は `eu-intent-score` の docstring。
+
+   ## 出力の TSV が『登記』も兼ねる（ここが日本と一番違う）
+
+   日本の収集器は法人番号だけを次段に渡し、商号・住所・URL は gBizINFO API から
+   引き直す。**EU にはその API が無い** —— 住所も VAT も URL も一括ファイルの中に
+   しかない。だからこの TSV は候補リストではなく**registry のスナップショット**で、
+   次段（`collect_eu_contact_points.cljs`）は検索も詳細取得もしない。
+
+   ## 認証は要らない
+
+   CORDIS の zip は認証不要（実測 2026-08-25、HTTP 200 / 36,672,015 bytes）。
+   日本側の `GBIZINFO_TOKEN` に当たるものは無いので exit 3 の経路も無い。
+
+   usage:
+     node --max-old-space-size=8192 $(which nbb) -cp src \\
+       scripts/collect_eu_intent_pool.cljk --out pool.tsv \\
+       [--since 2025-01-01] [--limit 3000] [--as-of 2026-08-25] [--cache /tmp/eu-bulk] [--refresh]
+
+   ⚠ 既定の node heap では落ちる（organization.csv 60MB + project.csv 54MB）。
+   `--max-old-space-size` を上げること。⚠ `npx --yes nbb` はこのマシンで壊れている。
+
+   出典：CORDIS（欧州委員会）https://cordis.europa.eu/（CC BY 4.0）を加工して作成。"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.bulk-csv :as csv]
+            [kotoba.property.eu-cordis :as eu]
+            [kotoba.property.eu-intent-score :as sc]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- flag? [n] (boolean (some #{n} argv)))
+(defn- int-arg [n d] (let [v (arg n nil)] (if v (js/parseInt v 10) d)))
+
+(defn- die! [code msg]
+  (js/console.error msg) (set! (.-exitCode js/process) code) (throw (ex-info msg {:exit code})))
+
+(defn- sh [args]
+  (let [r (.spawnSync cp (first args) (clj->js (vec (rest args)))
+                      #js {:encoding "utf8" :maxBuffer 67108864})]
+    {:exit (or (.-status r) 1) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+(def bulk-url "https://cordis.europa.eu/data/cordis-HORIZONprojects-csv.zip")
+
+(defn- fetch-bulk!
+  "zip を落として展開し、CSV の在るディレクトリを返す。既に在れば落とし直さない。"
+  [cache refresh?]
+  (.mkdirSync fs cache #js {:recursive true})
+  (let [dir (.join path cache "cordis.d")
+        want ["project.csv" "organization.csv" "euroSciVoc.csv"]
+        have? (and (not refresh?) (.existsSync fs dir)
+                   (every? #(.existsSync fs (.join path dir %)) want))]
+    (if have?
+      (do (js/console.error (str "  cached: " dir)) dir)
+      (let [zip (.join path cache "cordis-horizon.zip")
+            hdr (.join path cache "cordis.hdr")]
+        (js/console.error (str "  downloading " bulk-url))
+        (sh ["curl" "-sS" "-L" "-o" zip "-D" hdr bulk-url])
+        ;; **status を見るだけにしない。** 落ちてきたものが何かを言うのは magic だけ。
+        (when-not (.existsSync fs zip) (die! 1 "curl wrote no file"))
+        (let [head (.readFileSync fs zip)]
+          (when-not (and (> (.-length head) 1) (= 0x50 (aget head 0)) (= 0x4b (aget head 1)))
+            (die! 1 (str "not a zip (" (.-length head) " bytes). Headers:\n"
+                         (when (.existsSync fs hdr) (str (.readFileSync fs hdr "utf8")))))))
+        (js/console.error (str "  downloaded: " (.-size (.statSync fs zip)) " bytes"))
+        (sh ["unzip" "-o" "-q" zip "-d" dir])
+        (doseq [f want]
+          (when-not (.existsSync fs (.join path dir f))
+            (die! 1 (str "zip had no " f))))
+        dir))))
+
+(defn- read-section!
+  "CSV -> `{:rows [...] :get (fn [row col])}`。要求した列が無ければ止まる。
+   **区切りはセミコロン** —— カンマで読むと 1 行 1 フィールドとして静かに通る。"
+  [csv-path required]
+  (let [rows (csv/parse (str (.readFileSync fs csv-path "utf8")) eu/delimiter)
+        header (first rows)
+        g (csv/getter header)]
+    (doseq [c required]
+      (when-not (some #{c} header)
+        (die! 1 (str "column missing from " csv-path ": " c
+                     " (have: " (str/join ", " (take 12 header)) ")"))))
+    {:rows (rest rows) :get g}))
+
+(def ai-path-re
+  "euroSciVoc のパスが AI / 計算機を指すか。
+
+   ⚠ **これは『AI をやっているか』の判定ではなく、『EU の分類器がこのプロジェクトに
+   計算機科学のタグを付けたか』の観測**である。タグは 86.0% のプロジェクトにしか
+   付いていない（実測 2026-08-25、20,161/23,451）ので、付いていないことは
+   『AI ではない』ではない —— だからこのシグナルは boost にしか置けない。"
+  #"(?i)computer and information sciences|artificial intelligence|machine learning|data science|computer hardware|computer software")
+
+(defn- project-facts!
+  "project.csv -> 小さい lookup 3 本だけを返す。**巨大な行ベクタをここで捨てる**
+   （`objective` の本文が 54MB の大半で、この後のどこにも要らない）。"
+  [dir]
+  (let [{:keys [rows get]} (read-section! (.join path dir "project.csv")
+                                          ["id" "startDate" "ecSignatureDate" "topics"])]
+    (reduce (fn [m r]
+              (let [id (get r "id")]
+                (assoc m id {:start-date (get r "startDate")
+                             :signature-date (get r "ecSignatureDate")
+                             :topic (get r "topics")})))
+            {} rows)))
+
+(defn- ai-projects!
+  "euroSciVoc.csv -> `{projectID true/false}`。**タグが 1 行も無いプロジェクトは
+   この map に現れない** = nil = 測れなかった。`false` と混ぜない。"
+  [dir]
+  (let [{:keys [rows get]} (read-section! (.join path dir "euroSciVoc.csv")
+                                          ["euroSciVocPath" "projectID"])]
+    (reduce (fn [m r]
+              (let [pid (get r "projectID")
+                    hit (boolean (re-find ai-path-re (str (get r "euroSciVocPath"))))]
+                (assoc m pid (or (get m pid false) hit))))
+            {} rows)))
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        cache (arg "--cache" "/tmp/eu-bulk")
+        since (arg "--since" "2025-01-01")
+        as-of (arg "--as-of" (subs (.toISOString (js/Date.)) 0 10))
+        limit (int-arg "--limit" 3000)
+        refresh? (flag? "--refresh")]
+    (when-not out (die! 3 "--out is required"))
+    (js/console.error "sections:")
+    (let [dir (fetch-bulk! cache refresh?)
+          proj (project-facts! dir)
+          ai (ai-projects! dir)
+          _ (js/console.error (str "  projects=" (count proj)
+                                   "  with-euroSciVoc=" (count ai)))
+          {orows :rows og :get}
+          (read-section! (.join path dir "organization.csv")
+                         ["organisationID" "projectID" "name" "shortName" "vatNumber"
+                          "street" "postCode" "city" "country" "organizationURL"
+                          "contactForm" "role" "activityType" "SME" "ecContribution"])
+
+          ;; 1 行 = 1 (法人, プロジェクト) の参加。母集団は PRC かつ最近。
+          parts (->> orows
+                     (filter #(= eu/private-for-profit (og % "activityType")))
+                     (map (fn [r]
+                            (let [pid (og r "projectID")
+                                  pf (get proj pid)]
+                              (eu/->participation
+                               {:organisation-id (og r "organisationID")
+                                :project-id pid
+                                :name (og r "name") :short-name (og r "shortName")
+                                :vat (og r "vatNumber")
+                                :street (og r "street") :post-code (og r "postCode")
+                                :city (og r "city") :country (og r "country")
+                                :url (og r "organizationURL")
+                                :contact-form (og r "contactForm")
+                                :role (og r "role") :activity-type (og r "activityType")
+                                :sme (og r "SME") :ec-contribution (og r "ecContribution")
+                                :topic (:topic pf)
+                                :signature-date (:signature-date pf)
+                                :start-date (:start-date pf)
+                                ;; **map に無い = nil = 測れなかった。**
+                                :ai-tagged? (get ai pid)}))))
+                     (filter #(eu/recent? % since))
+                     vec)
+          by-org (group-by :organisation-id parts)
+          scored (->> by-org
+                      (map (fn [[oid ps]]
+                             (let [o (eu/organisation ps)
+                                   s (sc/score {:participations ps
+                                                :coordinator? (:coordinator? o)
+                                                :sme (:sme o)
+                                                :ai-tagged? (:ai-tagged? o)
+                                                :ec-contribution (:ec-contribution o)}
+                                               as-of)]
+                               (merge s o {:organisation-id oid}))))
+                      sc/rank
+                      (take limit)
+                      vec)]
+      (when (zero? (count scored))
+        (die! 2 (str "Refusing to report a pass: 0 private-for-profit organisations "
+                     "participate in a project signed or started since " since ".")))
+      (let [n (count scored)
+            pct (fn [k] (str (count (filter k scored)) "/" n))
+            signal (fn [r]
+                     (str (str/join "|" (map name (:topic-classes r)))
+                          " (" (:latest-event-date r)
+                          ", proj" (:project-count r) ")"
+                          " intent=" (:intent/base r)
+                          (when (pos? (:intent/boost r)) (str "+" (:intent/boost r)))))]
+        (fs/writeFileSync
+         out
+         (str "# CORDIS Horizon Europe の一括 zip から作った EU intent プール。生成物。手で編集しない。\n"
+              "# as-of=" as-of "  since=" since "  activityType=" eu/private-for-profit "\n"
+              "# ⚠ base と boost を足さないこと。boost は被覆率の低いシグナル"
+              "（euroSciVoc の AI タグ / SME / EC 拠出額）由来で、足すと『測れた社』が\n"
+              "#   『測れなかった社』の上に、シグナルの強さではなく被覆の差で乗る。並べるのは base。\n"
+              "# ⚠ シグナルは『いつ・どの call で採択されたか』の記録であって、その企業が\n"
+              "#   推論を買う意思を持つという主張ではない。\n"
+              "# ⚠ contact-form 列は欧州委員会 Funding & Tenders ポータルのフォーム。\n"
+              "#   **営業には使わない**（その会社が公開した窓口ではない）。理由は eu-contact の docstring。\n"
+              "# 出典：CORDIS（欧州委員会）https://cordis.europa.eu/（CC BY 4.0）を加工して作成\n"
+              "# 列: organisation-id <TAB> signal <TAB> name <TAB> street <TAB> postcode <TAB> city"
+              " <TAB> country <TAB> vat <TAB> url <TAB> contact-form <TAB> sme <TAB> base <TAB> boost"
+              " <TAB> measured <TAB> unmeasured\n"
+              (str/join
+               "\n"
+               (map (fn [r]
+                      (str/join "\t"
+                                [(:organisation-id r) (signal r) (str (:name r))
+                                 (str (:street r)) (str (:post-code r)) (str (:city r))
+                                 (str (:country r)) (str (:vat r)) (str (:url r))
+                                 (str (:contact-form r))
+                                 ;; **3 値を 2 値に潰さない。** 空欄 = 測れなかった。
+                                 (case (:sme r) true "true" false "false" "")
+                                 (:intent/base r) (:intent/boost r)
+                                 (str/join "," (:intent/measured r))
+                                 (str/join "," (:intent/unmeasured r))]))
+                    scored))
+              "\n"))
+        (println (str "PARTICIPATIONS\t" (count parts)))
+        (println (str "ORGANISATIONS\t" (count by-org)))
+        (println (str "WRITTEN\t" n))
+        (println (str "BASE-RANGE\t" (:intent/base (first scored)) " .. " (:intent/base (last scored))))
+        (println (str "COV-VAT\t" (pct :vat)))
+        (println (str "COV-STREET\t" (pct :street)))
+        (println (str "COV-CITY\t" (pct :city)))
+        (println (str "COV-POSTCODE\t" (pct :post-code)))
+        (println (str "COV-OWN-URL\t" (pct :url)))
+        (println (str "COV-EU-PORTAL-FORM\t" (pct :contact-form)))
+        (println (str "COV-SME-MEASURED\t" (count (filter #(some? (:sme %)) scored)) "/" n))
+        (println (str "COV-AI-TAG-MEASURED\t" (count (filter #(some? (:ai-tagged? %)) scored)) "/" n))
+        (println (str "COV-EC-CONTRIB-MEASURED\t" (count (filter #(some? (:ec-contribution %)) scored)) "/" n))
+        (println (str "SME-TRUE\t" (count (filter #(true? (:sme %)) scored)) "/" n))
+        (println (str "AI-TAG-TRUE\t" (count (filter #(true? (:ai-tagged? %)) scored)) "/" n))
+        (println (str "COORDINATOR\t" (count (filter :coordinator? scored)) "/" n))
+        (println (str "OUT\t" out))))))
+
+(-main)

@@ -1,0 +1,163 @@
+(ns kotobase.engine.identity
+  "Engine-independent Kotobase logical identity and engine-specific
+  publication envelopes. Cryptographic hashing and signing remain injected;
+  this namespace fixes the values and domains they receive."
+  (:require [kotobase.engine.canonical :as canonical]))
+
+(def logical-commit-format "kotobase.logical-commit/v1")
+(def merge-commit-format
+  "Multi-parent logical commit. Only merge commits use v2; a zero- or
+  one-parent commit MUST stay v1 so a linear commit has exactly one identity."
+  "kotobase.logical-commit/v2")
+(def merge-policy "kotobase.merge/v1")
+(def max-merge-parents
+  "Fan-in bound. Verification of a merge recomputes every parent's closure, so
+  an unbounded parent vector would be an amplification vector."
+  16)
+(def physical-publication-format "kotobase.physical-publication/v1")
+(def signature-format "kotobase.logical-signature/v1")
+
+(def logical-commit-keys
+  #{:format :database-id :epoch :parents :tx-root
+    :logical-checkpoint-root :schema-root :model-contract-root
+    :admission-policy-root})
+
+(def merge-commit-keys
+  (conj logical-commit-keys :merge-policy))
+
+(def physical-publication-keys
+  #{:format :logical-commit-root :engine-profile :engine-format
+    :physical-root})
+
+(defn- nonblank-string? [x]
+  (and (string? x) (not= "" x)))
+
+(defn- invalid! [message data]
+  (throw (ex-info message (assoc data :type :kotobase.engine/invalid-identity))))
+
+(defn- ascii-cid? [x]
+  (and (string? x) (some? (re-matches #"[\x21-\x7e]+" x))))
+
+(defn canonical-parents
+  "The only admissible v2 parent encoding: distinct CID strings in ascending
+  string (CID byte) order. Constructors call this; validators reject anything
+  that is not already in this form rather than silently normalizing a value a
+  signer may have signed in another order.
+
+  Parents must be printable ASCII (multibase CID alphabet), because only then
+  is host string order equal to CID byte order on every runtime."
+  [parents]
+  (when-not (every? ascii-cid? parents)
+    (invalid! "parent CIDs must be nonblank printable ASCII strings"
+              {:parents parents}))
+  (vec (sort (distinct parents))))
+
+(defn- validate-common! [{:keys [database-id epoch] :as commit}]
+  (when-not (nonblank-string? database-id)
+    (invalid! "logical commit requires database-id" {:database-id database-id}))
+  (when-not (and (integer? epoch) (not (neg? epoch)))
+    (invalid! "logical commit requires a non-negative epoch" {:epoch epoch}))
+  (doseq [field [:tx-root :logical-checkpoint-root :schema-root
+                 :model-contract-root :admission-policy-root]]
+    (when-not (nonblank-string? (get commit field))
+      (invalid! "logical commit root must be a nonblank string"
+                {:field field :value (get commit field)}))))
+
+(defn- logical-commit-v1 [{:keys [parents] :as commit}]
+  (when-not (= logical-commit-keys (set (keys commit)))
+    (invalid! "logical commit has missing or unknown v1 fields"
+              {:expected logical-commit-keys :actual (set (keys commit))}))
+  (when-not (and (vector? parents) (<= (count parents) 1)
+                 (every? nonblank-string? parents))
+    (invalid! "v1 logical commit requires zero or one parent" {:parents parents}))
+  (validate-common! commit)
+  commit)
+
+(defn- logical-commit-v2 [{:keys [parents epoch] :as commit}]
+  (when-not (= merge-commit-keys (set (keys commit)))
+    (invalid! "logical commit has missing or unknown v2 fields"
+              {:expected merge-commit-keys :actual (set (keys commit))}))
+  (when-not (= merge-policy (:merge-policy commit))
+    (invalid! "unsupported merge policy" {:merge-policy (:merge-policy commit)}))
+  (when-not (and (vector? parents)
+                 (<= 2 (count parents) max-merge-parents)
+                 (every? nonblank-string? parents))
+    (invalid! "v2 logical commit requires 2..max-merge-parents parents"
+              {:parents parents :max max-merge-parents}))
+  (when-not (= parents (canonical-parents parents))
+    (invalid! "v2 parents must be distinct and in ascending CID order"
+              {:parents parents :canonical (canonical-parents parents)}))
+  (validate-common! commit)
+  (when-not (pos? epoch)
+    (invalid! "a merge commit cannot be at epoch 0" {:epoch epoch}))
+  commit)
+
+(defn merge-commit? [commit]
+  (= merge-commit-format (:format commit)))
+
+(defn logical-commit
+  "Validate a logical commit and return it unchanged.
+
+  V1 (`kotobase.logical-commit/v1`) admits zero or one parent and is the
+  format of every non-merge commit; its canonical bytes, and therefore its
+  CID, are unchanged by the introduction of v2.
+
+  V2 (`kotobase.logical-commit/v2`) is a deterministic merge commit: two or
+  more parents in canonical order plus the `:merge-policy` that produced its
+  resolution transaction. See kotobase ADR-2610101200 and
+  `kotobase.engine.merge`."
+  [commit]
+  (when-not (map? commit)
+    (invalid! "logical commit must be a map" {:commit commit}))
+  (let [format (:format commit)]
+    (cond
+      (= logical-commit-format format) (logical-commit-v1 commit)
+      (= merge-commit-format format) (logical-commit-v2 commit)
+      :else (invalid! "unsupported logical commit format" {:format format}))))
+
+(defn logical-commit-string [commit]
+  (canonical/canonical-domain-string :logical-commit (logical-commit commit)))
+
+(defn signature-payload
+  "Domain-separated canonical string signed for one logical commit root.
+  Issuer and key id are included so a valid signature cannot be transplanted
+  between authorities or interpreted under an ambient key choice."
+  [{:keys [logical-commit-root issuer key-id]}]
+  (doseq [[field value] [[:logical-commit-root logical-commit-root]
+                         [:issuer issuer]
+                         [:key-id key-id]]]
+    (when-not (nonblank-string? value)
+      (invalid! "logical signature field must be a nonblank string"
+                {:field field :value value})))
+  (canonical/canonical-domain-string
+   :signature
+   {:format signature-format
+    :logical-commit-root logical-commit-root
+    :issuer issuer
+    :key-id key-id}))
+
+(defn physical-publication
+  "Validate the engine-specific availability witness for a logical commit.
+  This value is intentionally not the logical database identity."
+  [{:keys [format logical-commit-root engine-profile engine-format physical-root]
+    :as publication}]
+  (when-not (= physical-publication-keys (set (keys publication)))
+    (invalid! "physical publication has missing or unknown v1 fields"
+              {:expected physical-publication-keys
+               :actual (set (keys publication))}))
+  (when-not (= physical-publication-format format)
+    (invalid! "unsupported physical publication format" {:format format}))
+  (when-not (nonblank-string? logical-commit-root)
+    (invalid! "physical publication requires logical commit root" {}))
+  (when-not (keyword? engine-profile)
+    (invalid! "physical publication requires engine profile" {}))
+  (when-not (and (integer? engine-format) (pos? engine-format))
+    (invalid! "physical publication requires positive engine format" {}))
+  (when-not (nonblank-string? physical-root)
+    (invalid! "physical publication requires physical root" {}))
+  publication)
+
+(defn physical-publication-string [publication]
+  (canonical/canonical-domain-string
+   :physical-publication
+   (physical-publication publication)))

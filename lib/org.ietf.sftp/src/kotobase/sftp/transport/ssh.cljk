@@ -1,0 +1,428 @@
+(ns kotobase.sftp.transport.ssh
+  "EXPERIMENTAL, PENDING SECURITY REVIEW. Do not expose this on a network
+  you don't fully trust; do not use it to protect anything sensitive. See
+  this repo's README for the full warning — this docstring restates the
+  essential part: a hand-rolled SSH transport-protocol implementation is
+  security-sensitive even when the underlying crypto primitives
+  (node:crypto's X25519/Ed25519/AES/HMAC) are library-provided and
+  correct, because the FRAMING, STATE MACHINE, and NEGOTIATION LOGIC
+  around those primitives is exactly where real-world SSH implementation
+  vulnerabilities have historically lived. This implementation has NOT
+  had that kind of review.
+
+  A minimal, RFC-4253-SHAPED SSH transport (version exchange, KEXINIT
+  negotiation, curve25519-sha256 key exchange, aes128-ctr encryption +
+  hmac-sha2-256 integrity — see kotobase.sftp.transport.wire for all of
+  that machinery) carrying a minimal 'ssh-connection' layer (accept-any
+  'none' userauth, ONE channel, ONE 'subsystem sftp' request) that feeds
+  kotobase.sftp.transport.sftp-subsystem, which in turn calls
+  kotobase.sftp.fs — the pure Phase-1 core this whole repo's transport
+  question is secondary to (ADR-2607172210's own framing).
+
+  VERIFIED, NOT JUST SHAPED: test/kotobase/sftp/transport/ssh_demo.cljk
+  spawns a real second `nbb` OS process running this code as a server and
+  drives it as a client from this process, over a real TCP socket — the
+  full chain (version exchange, KEXINIT, curve25519-sha256 ECDH with a
+  verified ed25519 host-key signature, NEWKEYS, aes128-ctr+hmac-sha2-256
+  encrypted transport, accept-any userauth, channel+subsystem setup, and
+  a real mkdir/write/close/open/read/stat/readdir/rename/remove/rmdir
+  SFTP session) genuinely completes and the encrypted READ response
+  genuinely contains the exact bytes an earlier encrypted WRITE sent to
+  the OTHER process. What is NOT verified is interop with anything other
+  than this repo's own client/server talking to each other — see the
+  HONESTLY NARROWED list below and the README.
+
+  `.cljs`-only: node:net + node:crypto + Buffer. Never `:require`d by
+  kotobase.sftp.fs (the pure core) or by the JVM `kbb -M:test` compat
+  suite — see fs.cljc's own docstring for why that decoupling matters,
+  and deps.edn for how CI keeps the JVM suite from ever touching this
+  file.
+
+  HONESTLY NARROWED, ON PURPOSE (v0.1 — this list is the single source of
+  truth for what this transport does NOT do; do not assume anything not
+  listed here is safe just because it isn't listed as broken):
+    - NO SSH_MSG_DEBUG/IGNORE handling, NO SSH_MSG_UNIMPLEMENTED
+      responses to unrecognized messages (an unrecognized message during
+      the connected phase is just ignored, not politely NAK'd).
+    - NO re-keying (SSH_MSG_KEXINIT is sent/expected exactly once, at
+      connection start — a long-lived production SSH connection would
+      re-key periodically per RFC 4253 §9; this repo's connections are
+      short-lived demo/test sessions where that doesn't matter, but it
+      would matter for any real deployment).
+    - NO real user authentication. `none` is unconditionally accepted.
+      This is explicitly NOT a security boundary — see README.
+    - NO host-key persistence/known_hosts/TOFU-with-pinning on the
+      client side — the demo client accepts whatever ed25519 host key
+      the server presents, on every connection, with no memory across
+      connections. A real client MUST NOT do this.
+    - Exactly ONE channel per connection, of type 'session', used for
+      exactly ONE 'subsystem sftp' request. No shell, no exec, no
+      port-forwarding, no multiple channels.
+    - NO SSH_MSG_CHANNEL_WINDOW_ADJUST — a single large fixed initial
+      window (1 MiB) is granted once and never replenished; this repo's
+      v0.1 file sizes never approach that, so it's never exercised for
+      real, which is itself a limitation worth naming rather than hiding.
+    - Byte-exact interop with a real OpenSSH client/server has NOT been
+      tested and is NOT claimed."
+  (:require ["node:net" :as net]
+            ["node:crypto" :as crypto]
+            [kotobase.sftp.transport.wire :as w]
+            [kotobase.sftp.transport.sftp-subsystem :as sftp]))
+
+(def ^:private our-version-string "SSH-2.0-kotobase_org-ietf-sftp_0.1")
+(def ^:private initial-channel-window (* 1024 1024))
+
+;; ---------------------------------------------------------------------------
+;; Connection state helpers
+;; ---------------------------------------------------------------------------
+
+(defn- new-connection-state [role socket]
+  (atom {:role role
+         :socket socket
+         :line-buf (js/Buffer.alloc 0)
+         :got-peer-version? false
+         :our-version our-version-string
+         :peer-version nil
+         :reader (w/new-reader)
+         :writer (w/new-writer)
+         :our-kexinit nil
+         :peer-kexinit nil
+         :ephemeral nil
+         :session-id nil
+         :phase :version
+         :client-channel-id nil
+         :server-channel-id nil
+         :closed? false}))
+
+(defn- send-raw! [state-atom ^js buf]
+  (.write (:socket @state-atom) buf))
+
+(defn- send-payload! [state-atom payload]
+  (let [writer (:writer @state-atom)
+        bytes (w/encode-packet writer payload)]
+    (send-raw! state-atom bytes)
+    (w/advance-writer! writer)))
+
+(defn- close! [state-atom]
+  (when-not (:closed? @state-atom)
+    (swap! state-atom assoc :closed? true)
+    (try (.destroy (:socket @state-atom)) (catch :default _ nil))))
+
+;; ---------------------------------------------------------------------------
+;; Key exchange (shared by both roles — the math is symmetric; only WHO
+;; sends SSH_MSG_KEX_ECDH_INIT vs SSH_MSG_KEX_ECDH_REPLY, and which
+;; derived key goes into which cipher direction, differs by role)
+;; ---------------------------------------------------------------------------
+
+(defn- key-material-for
+  "Pick the c2s or s2c key/iv/mac-key trio out of `keys` (derive-keys's
+  result) for THIS side's `role` sending/receiving in `direction`
+  (:out = this side transmitting, :in = this side receiving)."
+  [role direction keys]
+  (let [{:keys [enc-key-c2s enc-key-s2c iv-c2s iv-s2c mac-key-c2s mac-key-s2c]} keys
+        s2c? (or (and (= role :server) (= direction :out))
+                 (and (= role :client) (= direction :in)))]
+    (if s2c?
+      {:enc-key enc-key-s2c :iv iv-s2c :mac-key mac-key-s2c}
+      {:enc-key enc-key-c2s :iv iv-c2s :mac-key mac-key-c2s})))
+
+(defn- do-kex-ecdh-init! [state-atom]
+  ;; CLIENT sends SSH_MSG_KEX_ECDH_INIT (msg 30): string(Q_C)
+  (let [kp (w/x25519-keypair)
+        raw-pub (w/x25519-raw-pub (.-publicKey kp))]
+    (swap! state-atom assoc :ephemeral {:keypair kp :raw-pub raw-pub})
+    (send-payload! state-atom
+                   (js/Buffer.concat #js [(w/ssh-byte w/msg-kex-ecdh-init) (w/ssh-string raw-pub)]))))
+
+(defn- finish-kex-and-newkeys!
+  "Both sides call this once they have everything needed (K, H) to derive
+  keys and send their own NEWKEYS. `k` and `h` are the shared secret and
+  exchange hash (both Buffers)."
+  [state-atom k h]
+  (let [{:keys [role]} @state-atom
+        session-id (or (:session-id @state-atom) h) ;; first kex only — see ns docstring (no re-key)
+        keys (w/derive-keys k h session-id)
+        out-material (key-material-for role :out keys)
+        in-material (key-material-for role :in keys)]
+    (swap! state-atom assoc :session-id session-id :pending-in-material in-material)
+    (send-payload! state-atom (js/Buffer.from #js [w/msg-newkeys]))
+    (let [cipher (crypto/createCipheriv "aes-128-ctr" (:enc-key out-material) (:iv out-material))]
+      (w/arm-writer-encryption! (:writer @state-atom)
+                                 {:cipher cipher :mac-key (:mac-key out-material)
+                                  :block-size 16 :mac-len 32}))
+    (swap! state-atom assoc :phase :awaiting-peer-newkeys)))
+
+;; ---------------------------------------------------------------------------
+;; Channel / subsystem (server side: responds to CHANNEL_OPEN and the
+;; 'subsystem sftp' CHANNEL_REQUEST; client side: sends them)
+;; ---------------------------------------------------------------------------
+
+(defn- server-handle-channel-open! [state-atom ^js payload]
+  ;; SSH_MSG_CHANNEL_OPEN (RFC 4254 §5.1): byte + string channel-type +
+  ;; uint32 sender-channel + uint32 initial-window-size + uint32 max-packet-size.
+  (let [[_chan-type-buf off] (w/read-ssh-string payload 1)
+        sender-channel (w/read-uint32 payload off)]
+    (swap! state-atom assoc :client-channel-id sender-channel :server-channel-id 0
+           :sftp-session (sftp/new-session))
+    (send-payload!
+     state-atom
+     (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-open-confirmation)
+                             (w/uint32 sender-channel) (w/uint32 0)
+                             (w/uint32 initial-channel-window) (w/uint32 32768)]))))
+
+(defn- server-handle-channel-request! [state-atom ^js payload]
+  (let [off 1
+        recipient-channel (w/read-uint32 payload off)
+        off (+ off 4)
+        [req-type-buf off] (w/read-ssh-string payload off)
+        req-type (.toString req-type-buf "utf8")
+        want-reply? (pos? (aget payload off))
+        off (+ off 1)]
+    (if (and (= req-type "subsystem")
+             (let [[name-buf _] (w/read-ssh-string payload off)]
+               (= "sftp" (.toString name-buf "utf8"))))
+      (do (swap! state-atom assoc :phase :sftp)
+          (when want-reply?
+            (send-payload! state-atom
+                           (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-success)
+                                                   (w/uint32 recipient-channel)]))))
+      (when want-reply?
+        (send-payload! state-atom
+                       (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-failure)
+                                               (w/uint32 recipient-channel)]))))))
+
+(defn- server-handle-channel-data! [state-atom ^js payload]
+  (let [off 1
+        _recipient-channel (w/read-uint32 payload off)
+        off (+ off 4)
+        [data-buf _off] (w/read-ssh-string payload off)
+        {:keys [fs-ctx share sftp-session client-channel-id]} @state-atom
+        response (sftp/handle-packet-bytes fs-ctx share sftp-session data-buf)]
+    (send-payload!
+     state-atom
+     (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-data)
+                             (w/uint32 client-channel-id) (w/ssh-string response)]))))
+
+;; ---------------------------------------------------------------------------
+;; Shared packet dispatch (role-specific branches inline where behavior
+;; genuinely differs)
+;; ---------------------------------------------------------------------------
+
+(defn- dispatch-packet!
+  [state-atom ^js payload]
+  (let [{:keys [role phase our-version peer-version our-kexinit]} @state-atom
+        msg (aget payload 0)]
+    (when js/process.env.SSH_DEBUG
+      (js/console.error (str "[" (name role) "] dispatch msg=" msg " phase=" phase)))
+    (cond
+      (= msg w/msg-kexinit)
+      (do (swap! state-atom assoc :peer-kexinit payload)
+          (when (= role :client) (do-kex-ecdh-init! state-atom)))
+
+      ;; --- SERVER: receives KEX_ECDH_INIT, replies KEX_ECDH_REPLY ---
+      (and (= role :server) (= msg w/msg-kex-ecdh-init))
+      (let [[q-c _off] (w/read-ssh-string payload 1)
+            eph (w/x25519-keypair)
+            q-s (w/x25519-raw-pub (.-publicKey eph))
+            k (w/x25519-shared-secret (.-privateKey eph) q-c)
+            {:keys [host-keypair]} @state-atom
+            host-raw-pub (:raw-pub host-keypair)
+            k-s (w/host-key-blob host-raw-pub)
+            h (w/exchange-hash {:v-c peer-version :v-s our-version
+                                 :i-c (:peer-kexinit @state-atom) :i-s our-kexinit
+                                 :k-s k-s :q-c q-c :q-s q-s :k k})
+            sig (w/ed25519-sign (:priv host-keypair) h)]
+        (send-payload!
+         state-atom
+         (js/Buffer.concat #js [(w/ssh-byte w/msg-kex-ecdh-reply)
+                                 (w/ssh-string k-s) (w/ssh-string q-s)
+                                 (w/ssh-string (js/Buffer.concat #js [(w/ssh-string "ssh-ed25519") (w/ssh-string sig)]))]))
+        (finish-kex-and-newkeys! state-atom k h))
+
+      ;; --- CLIENT: receives KEX_ECDH_REPLY, verifies host-key signature,
+      ;; derives keys, sends its own NEWKEYS ---
+      (and (= role :client) (= msg w/msg-kex-ecdh-reply))
+      (let [[k-s off] (w/read-ssh-string payload 1)
+            [q-s off] (w/read-ssh-string payload off)
+            [sig-blob _off] (w/read-ssh-string payload off)
+            [_algo off2] (w/read-ssh-string sig-blob 0)
+            [sig _off2] (w/read-ssh-string sig-blob off2)
+            [_algo2 off3] (w/read-ssh-string k-s 0)
+            [host-raw-pub _off3] (w/read-ssh-string k-s off3)
+            {:keys [ephemeral]} @state-atom
+            q-c (:raw-pub ephemeral)
+            k (w/x25519-shared-secret (.-privateKey (:keypair ephemeral)) q-s)
+            h (w/exchange-hash {:v-c our-version :v-s peer-version
+                                 :i-c our-kexinit :i-s (:peer-kexinit @state-atom)
+                                 :k-s k-s :q-c q-c :q-s q-s :k k})
+            host-pub (w/ed25519-pub-from-raw host-raw-pub)
+            verified? (w/ed25519-verify host-pub h sig)]
+        (when-not verified?
+          ;; TOFU-with-no-pinning (see ns docstring) — we still check the
+          ;; signature actually matches what was just negotiated, which
+          ;; catches a corrupted/mismatched exchange even though it
+          ;; can't catch a genuine MITM with no prior pin to compare
+          ;; against.
+          (throw (ex-info "SSH host key signature did not verify"
+                          {:type :kotobase.sftp.transport/host-key-signature-invalid})))
+        (finish-kex-and-newkeys! state-atom k h))
+
+      (= msg w/msg-newkeys)
+      (let [in-material (:pending-in-material @state-atom)
+            decipher (crypto/createDecipheriv "aes-128-ctr" (:enc-key in-material) (:iv in-material))]
+        (w/arm-reader-encryption! (:reader @state-atom)
+                                  {:decipher decipher :mac-key (:mac-key in-material)
+                                   :block-size 16 :mac-len 32})
+        (swap! state-atom assoc :phase :service)
+        (when (= role :client)
+          (send-payload! state-atom
+                         (js/Buffer.concat #js [(w/ssh-byte w/msg-service-request) (w/ssh-string "ssh-userauth")]))))
+
+      ;; --- SERVER service/userauth (accept-any 'none' — see ns docstring) ---
+      (and (= role :server) (= msg w/msg-service-request))
+      (send-payload! state-atom
+                     (js/Buffer.concat #js [(w/ssh-byte w/msg-service-accept) (w/ssh-string "ssh-userauth")]))
+
+      (and (= role :server) (= msg w/msg-userauth-request))
+      (send-payload! state-atom (js/Buffer.from #js [w/msg-userauth-success]))
+
+      ;; --- CLIENT: service accepted -> send userauth 'none' request ---
+      (and (= role :client) (= msg w/msg-service-accept))
+      (send-payload!
+       state-atom
+       (js/Buffer.concat #js [(w/ssh-byte w/msg-userauth-request) (w/ssh-string "kotobase")
+                               (w/ssh-string "ssh-connection") (w/ssh-string "none")]))
+
+      (and (= role :client) (= msg w/msg-userauth-success))
+      (do (swap! state-atom assoc :client-channel-id 0)
+          (send-payload!
+           state-atom
+           (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-open) (w/ssh-string "session")
+                                   (w/uint32 0) (w/uint32 initial-channel-window) (w/uint32 32768)])))
+
+      (and (= role :client) (= msg w/msg-channel-open-confirmation))
+      (let [server-channel (w/read-uint32 payload 5)]
+        (swap! state-atom assoc :server-channel-id server-channel)
+        (send-payload!
+         state-atom
+         (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-request) (w/uint32 server-channel)
+                                 (w/ssh-string "subsystem") (w/ssh-boolean true) (w/ssh-string "sftp")])))
+
+      (and (= role :client) (= msg w/msg-channel-success))
+      (do (swap! state-atom assoc :phase :sftp)
+          (when-let [cb (:on-ready @state-atom)] (cb)))
+
+      (and (= role :client) (= msg w/msg-channel-data))
+      (let [[data-buf _off] (w/read-ssh-string payload 5)]
+        (when-let [cb (:on-sftp-response @state-atom)]
+          (swap! state-atom assoc :on-sftp-response nil)
+          (cb data-buf)))
+
+      (and (= role :server) (= msg w/msg-channel-open))
+      (server-handle-channel-open! state-atom payload)
+
+      (and (= role :server) (= msg w/msg-channel-request))
+      (server-handle-channel-request! state-atom payload)
+
+      (and (= role :server) (= msg w/msg-channel-data))
+      (server-handle-channel-data! state-atom payload)
+
+      (= msg w/msg-disconnect)
+      (close! state-atom)
+
+      :else nil))) ;; unrecognized message — silently ignored, see ns docstring
+
+;; ---------------------------------------------------------------------------
+;; Version exchange + wiring a socket's 'data' events to the reader
+;; ---------------------------------------------------------------------------
+
+(defn- send-kexinit! [state-atom]
+  (let [payload (w/build-kexinit)]
+    (swap! state-atom assoc :our-kexinit payload)
+    (send-payload! state-atom payload)))
+
+(defn- on-data! [state-atom ^js chunk]
+  (try
+    (if (:got-peer-version? @state-atom)
+      (w/feed! (:reader @state-atom) chunk (fn [payload] (dispatch-packet! state-atom payload)))
+      (let [combined (js/Buffer.concat #js [(:line-buf @state-atom) chunk])
+            nl (.indexOf combined "\n")]
+        (if (neg? nl)
+          (swap! state-atom assoc :line-buf combined)
+          (let [line (.toString (.subarray combined 0 nl) "utf8")
+                line (.trim line)
+                rest (.subarray combined (inc nl))]
+            (swap! state-atom assoc :peer-version line :got-peer-version? true :line-buf (js/Buffer.alloc 0))
+            (send-kexinit! state-atom)
+            (when (pos? (.-length rest))
+              (w/feed! (:reader @state-atom) rest (fn [payload] (dispatch-packet! state-atom payload)))))))
+      )
+    (catch :default e
+      (js/console.error "kotobase.sftp.transport.ssh: fatal error, closing connection:" (.-message e))
+      (close! state-atom))))
+
+;; ---------------------------------------------------------------------------
+;; Public API — server
+;; ---------------------------------------------------------------------------
+
+(defn generate-host-keypair []
+  (let [kp (w/ed25519-keypair)]
+    {:priv (.-privateKey kp) :pub (.-publicKey kp) :raw-pub (w/ed25519-raw-pub (.-publicKey kp))}))
+
+(defn start-server!
+  "opts: {:port :share :store :now :host-keypair (optional, generated if
+  omitted) :on-connection (optional, called with the per-connection
+  state-atom right when a socket connects, for test/demo introspection)}.
+  Returns the node:net Server."
+  [{:keys [port share store now host-keypair on-connection]}]
+  (let [host-keypair (or host-keypair (generate-host-keypair))
+        server (net/createServer
+                (fn [socket]
+                  (let [state (new-connection-state :server socket)]
+                    (swap! state assoc :share share :fs-ctx {:store store :now now}
+                           :host-keypair host-keypair)
+                    (when on-connection (on-connection state))
+                    (send-raw! state (js/Buffer.from (str our-version-string "\r\n")))
+                    (.on socket "data" (fn [chunk] (on-data! state chunk)))
+                    (.on socket "error" (fn [_e] (close! state)))
+                    (.on socket "close" (fn [] (swap! state assoc :closed? true))))))]
+    (.listen server port)
+    server))
+
+;; ---------------------------------------------------------------------------
+;; Public API — client (used by the demo/test only — see ns docstring;
+;; this is not offered as a general-purpose SFTP client library)
+;; ---------------------------------------------------------------------------
+
+(defn connect!
+  "opts: {:host :port :on-ready (fn [state-atom] called once the SFTP
+  subsystem channel is ready)}. Returns the connection state-atom."
+  [{:keys [host port on-ready]}]
+  (let [socket (net/createConnection #js {:host host :port port})
+        state (new-connection-state :client socket)]
+    (swap! state assoc :on-ready (fn [] (when on-ready (on-ready state))))
+    (.on socket "connect"
+         (fn [] (send-raw! state (js/Buffer.from (str our-version-string "\r\n")))))
+    (.on socket "data" (fn [chunk] (on-data! state chunk)))
+    (.on socket "error" (fn [_e] (close! state)))
+    (.on socket "close" (fn [] (swap! state assoc :closed? true)))
+    state))
+
+(defn send-sftp-request!
+  "Wrap `sftp-packet-bytes` (build with kotobase.sftp.transport.sftp-subsystem's
+  own packet builders, or hand-rolled by the caller for INIT) in a
+  SSH_MSG_CHANNEL_DATA and send it, registering `on-response` to be
+  called with the raw decoded SFTP response packet bytes. Client-side
+  only. v0.1: ONE request in flight at a time (see ns docstring) — the
+  caller must wait for `on-response` before sending the next request."
+  [state-atom ^js sftp-packet-bytes on-response]
+  (swap! state-atom assoc :on-sftp-response on-response)
+  (send-payload!
+   state-atom
+   (js/Buffer.concat #js [(w/ssh-byte w/msg-channel-data) (w/uint32 (:server-channel-id @state-atom))
+                           (w/ssh-string sftp-packet-bytes)])))
+
+(defn close-connection! [state-atom] (close! state-atom))
+
+(defn stop-server! [server]
+  (js/Promise. (fn [resolve _] (.close server (fn [_err] (resolve true))))))

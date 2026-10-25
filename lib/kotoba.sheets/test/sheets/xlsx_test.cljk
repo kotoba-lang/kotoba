@@ -1,0 +1,648 @@
+(ns sheets.xlsx-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [ooxml.core :as ooxml]
+            [sheets.model :as m]
+            [sheets.xlsx :as xlsx]))
+
+(defn- plan []
+  (-> (m/workbook "wb" {:sheets/title "計画"})
+      (m/add-tab (-> (m/tab "plan" {:sheets/title "Plan"})
+                     (m/put-cell 1 1 "Quarter")
+                     (m/put-cell 1 2 "Revenue")
+                     (m/put-cell 2 1 "Q1")
+                     (m/put-cell 2 2 "1200")
+                     (m/put-formula 3 2 "SUM(B2:B2)")))))
+
+(deftest column-names-are-bijective-base-26
+  ;; There is no zero digit, so the usual division has to borrow one. Getting
+  ;; it wrong gives a workbook whose 27th column is BA, which Excel opens
+  ;; without complaint and reads wrong.
+  (is (= "A" (xlsx/column-name 1)))
+  (is (= "Z" (xlsx/column-name 26)))
+  (is (= "AA" (xlsx/column-name 27)))
+  (is (= "AB" (xlsx/column-name 28)))
+  (is (= "AZ" (xlsx/column-name 52)))
+  (is (= "BA" (xlsx/column-name 53)))
+  (is (= "ZZ" (xlsx/column-name 702)))
+  (is (= "AAA" (xlsx/column-name 703)))
+  (is (= "B2" (xlsx/cell-ref 2 2))))
+
+(deftest column-letters-are-letters-on-every-host
+  ;; Both directions used to compute a character from `(int \A)`, which is a
+  ;; code point on the JVM and 0 in ClojureScript. Under cljs that wrote
+  ;; control characters into every cell reference and read every column as 1.
+  ;; The JVM cannot see either — these assertions passed throughout — so what
+  ;; keeps them honest is `scripts/test-cljs.cljk` running them on the other
+  ;; host, not the assertions themselves.
+  (is (every? #(re-matches #"[A-Z]+" (xlsx/column-name %)) [1 2 26 27 53 702 703 16384]))
+  (is (= 2 (xlsx/column-number "B")) "not 1, which is what a zero code point gives")
+  (is (= 16384 (xlsx/column-number "XFD")) "the last column Excel has")
+  (is (nil? (xlsx/column-number "A1")) "not a column reference")
+  (is (nil? (xlsx/column-number "")))
+  (is (= [12 2] (xlsx/parse-ref "B12"))))
+
+(deftest a-package-has-every-part-a-reader-will-look-for
+  (let [files (xlsx/xlsx-files (plan))]
+    ;; `xl/styles.xml` is written even by a workbook with no styles: a cell
+    ;; with no `s` means cellXfs position 0, and a package whose styles part
+    ;; is missing is one Excel opens with a repair prompt.
+    (is (= #{"[Content_Types].xml" "_rels/.rels" "xl/workbook.xml"
+             "xl/_rels/workbook.xml.rels" "xl/worksheets/sheet1.xml"
+             "xl/styles.xml"}
+           (set (keys files))))
+    ;; The relationship the workbook is reached by, and the one the sheet is.
+    (is (str/includes? (get files "_rels/.rels") "xl/workbook.xml"))
+    (is (str/includes? (get files "xl/_rels/workbook.xml.rels")
+                       "worksheets/sheet1.xml"))
+    (is (str/includes? (get files "xl/workbook.xml") "name=\"Plan\""))))
+
+(deftest every-cell-is-written-as-text
+  (let [sheet (get (xlsx/xlsx-files (plan)) "xl/worksheets/sheet1.xml")]
+    ;; Including one that looks like a number. Deciding on the workbook's
+    ;; behalf that "1200" is twelve hundred, at the moment it leaves for
+    ;; Excel, would be the guess arriving late rather than not at all.
+    (is (str/includes? sheet "<c r=\"B2\" t=\"inlineStr\"><is><t xml:space=\"preserve\">1200</t></is></c>"))
+    (is (str/includes? sheet "<c r=\"A1\" t=\"inlineStr\">"))
+    (is (not (str/includes? sheet "sharedStrings")))))
+
+(deftest a-formula-writes-no-cached-value
+  (let [sheet (get (xlsx/xlsx-files (plan)) "xl/worksheets/sheet1.xml")]
+    ;; There is no evaluator here, so a cached <v> is not something this
+    ;; could write. Excel recalculates on open.
+    (is (str/includes? sheet "<c r=\"B3\"><f>SUM(B2:B2)</f></c>"))
+    (is (not (str/includes? sheet "<f>SUM(B2:B2)</f><v>")))))
+
+(deftest xml-is-escaped
+  (let [tab (-> (m/tab "t") (m/put-cell 1 1 "a & b < c > \"d\""))
+        sheet (xlsx/sheet-xml tab)]
+    (is (str/includes? sheet "a &amp; b &lt; c &gt; &quot;d&quot;"))))
+
+(deftest a-sparse-tab-stays-sparse
+  (let [tab (-> (m/tab "t") (m/put-cell 1 1 "a") (m/put-cell 5 3 "b"))
+        sheet (xlsx/sheet-xml tab)]
+    ;; Rows 2-4 have nothing to say, so they are absent rather than emitted
+    ;; as rows of empty cells.
+    (is (str/includes? sheet "<row r=\"1\">"))
+    (is (str/includes? sheet "<row r=\"5\">"))
+    (is (not (str/includes? sheet "<row r=\"2\">")))
+    (is (str/includes? sheet "<c r=\"C5\""))))
+
+(deftest an-empty-workbook-still-opens
+  (let [files (xlsx/xlsx-files (m/workbook "wb"))]
+    ;; A workbook with no tabs is a file Excel refuses, so one is supplied.
+    (is (contains? files "xl/worksheets/sheet1.xml"))
+    (is (str/includes? (get files "xl/workbook.xml") "sheetId=\"1\""))))
+
+(deftest tabs-come-out-in-a-stable-order
+  (let [wb (-> (m/workbook "wb")
+               (m/add-tab (m/tab "zebra" {:sheets/title "Zebra"}))
+               (m/add-tab (m/tab "alpha" {:sheets/title "Alpha"}))
+               (m/add-tab (m/tab "mid" {:sheets/title "Mid"})))
+        names (re-seq #"name=\"([^\"]+)\"" (get (xlsx/xlsx-files wb) "xl/workbook.xml"))]
+    ;; `:sheets/tabs` is a map, so without an order the sheet Excel opens on
+    ;; would depend on hash order and change between runs.
+    (is (= ["Alpha" "Mid" "Zebra"] (mapv second names)))
+    (is (= 3 (count (filter #(str/starts-with? % "xl/worksheets/")
+                            (keys (xlsx/xlsx-files wb))))))))
+
+#?(:clj
+   (deftest the-bytes-are-a-zip-a-reader-can-walk
+     (let [bytes (xlsx/xlsx-bytes (plan))]
+       (is (= [0x50 0x4b] (mapv #(bit-and (int %) 0xff) (take 2 bytes)))
+           "PK, so it is a zip")
+       (with-open [zip (java.util.zip.ZipInputStream.
+                        (java.io.ByteArrayInputStream. bytes))]
+         (let [entries (loop [acc []]
+                         (if-let [e (.getNextEntry zip)]
+                           (recur (conj acc (.getName e)))
+                           acc))]
+           (is (contains? (set entries) "[Content_Types].xml"))
+           (is (contains? (set entries) "xl/worksheets/sheet1.xml"))
+           ;; `[Content_Types].xml` must be findable; OPC readers look for it
+           ;; by name, and `part-sort-key` keeps the order deterministic.
+           (is (= (sort entries) (sort (keys (xlsx/xlsx-files (plan)))))))))))
+
+#?(:clj
+   (deftest sheet-ten-is-ordered-after-sheet-two
+     ;; Lexical order would put sheet10 between sheet1 and sheet2. A workbook
+     ;; with ten tabs is where that stops being theoretical.
+     (let [wb (reduce (fn [wb n] (m/add-tab wb (m/tab (format "t%02d" n))))
+                      (m/workbook "wb") (range 1 12))
+           files (xlsx/xlsx-files wb)
+           sheets (filter #(str/starts-with? % "xl/worksheets/") (keys files))]
+       (is (= 11 (count sheets)))
+       (is (= ["xl/worksheets/sheet1.xml" "xl/worksheets/sheet2.xml"]
+              (take 2 (sort-by ooxml/part-sort-key sheets)))))))
+
+;; ── reading one back ────────────────────────────────────────────────────────
+
+(deftest column-numbers-invert-column-names
+  (doseq [n [1 26 27 28 52 53 702 703 16384]]
+    (is (= n (xlsx/column-number (xlsx/column-name n))) (str "column " n)))
+  (is (= [12 2] (xlsx/parse-ref "B12")))
+  (is (= [1 27] (xlsx/parse-ref "AA1")))
+  ;; Nil rather than [0 0], so a malformed reference is dropped instead of
+  ;; landing somewhere.
+  (is (nil? (xlsx/parse-ref "12B")))
+  (is (nil? (xlsx/parse-ref ""))))
+
+(deftest what-this-writes-it-can-read
+  (let [back (xlsx/workbook-from-files (xlsx/xlsx-files (plan)) "wb")
+        tab (m/tab-by-id back "Plan")]
+    (is (= ["Plan"] (keys (:sheets/tabs back))))
+    (is (= {:sheets/value "Quarter"} (m/get-cell tab 1 1)))
+    (is (= {:sheets/value "1200"} (m/get-cell tab 2 2)))
+    (is (= {:sheets/formula "SUM(B2:B2)"} (m/get-cell tab 3 2)))))
+
+(def ^:private excel-style
+  "The shapes Excel actually writes, none of which this namespace produces:
+  a shared string table, a bare number with no `t`, and a formula carrying
+  the value Excel last calculated."
+  {"xl/workbook.xml"
+   (str "<workbook xmlns:r=\"x\"><sheets>"
+        "<sheet name=\"予算\" sheetId=\"1\" r:id=\"rId1\"/>"
+        "</sheets></workbook>")
+   "xl/_rels/workbook.xml.rels"
+   "<Relationships><Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\"/></Relationships>"
+   "xl/sharedStrings.xml"
+   (str "<sst><si><t>四半期</t></si>"
+        ;; A run-split string: a reader that took the first <t> would
+        ;; silently truncate it to "売".
+        "<si><r><t>売</t></r><r><t>上</t></r></si></sst>")
+   "xl/worksheets/sheet1.xml"
+   (str "<worksheet><sheetData><row r=\"1\">"
+        "<c r=\"A1\" t=\"s\"><v>0</v></c>"
+        "<c r=\"B1\" t=\"s\"><v>1</v></c></row>"
+        "<row r=\"2\"><c r=\"A2\"><v>1200</v></c>"
+        "<c r=\"B2\"><f>A2*2</f><v>2400</v></c>"
+        "<c r=\"C2\" t=\"str\"><f>UPPER(\"x\")</f><v>X</v></c></row>"
+        "</sheetData></worksheet>")})
+
+(deftest a-workbook-from-excel-reads
+  (let [wb (xlsx/workbook-from-files excel-style "wb")
+        tab (m/tab-by-id wb "予算")]
+    (is (= ["予算"] (keys (:sheets/tabs wb))) "the tab is keyed by the name a reader sees")
+    (is (= {:sheets/value "四半期"} (m/get-cell tab 1 1)) "a shared string")
+    (is (= {:sheets/value "売上"} (m/get-cell tab 1 2)) "and one split across runs")
+    ;; Kept as text. This model has no number type, and turning 1200 into a
+    ;; long here is the guess arriving from the other side of the document.
+    (is (= {:sheets/value "1200"} (m/get-cell tab 2 1)))
+    ;; The formula wins over its cached value: the formula is what the
+    ;; document says, the value is what Excel last thought.
+    (is (= {:sheets/formula "A2*2"} (m/get-cell tab 2 2)))
+    (is (= {:sheets/formula "UPPER(\"x\")"} (m/get-cell tab 2 3)))))
+
+(deftest sheets-come-in-the-order-the-workbook-declares
+  ;; Not by file number: a workbook may relate rId1 to sheet3.xml, and what
+  ;; Excel shows is the order in <sheets>.
+  (let [files {"xl/workbook.xml"
+               (str "<workbook xmlns:r=\"x\"><sheets>"
+                    "<sheet name=\"Second\" r:id=\"rId1\"/>"
+                    "<sheet name=\"First\" r:id=\"rId2\"/></sheets></workbook>")
+               "xl/_rels/workbook.xml.rels"
+               (str "<Relationships>"
+                    "<Relationship Id=\"rId1\" Target=\"worksheets/sheet3.xml\"/>"
+                    "<Relationship Id=\"rId2\" Target=\"worksheets/sheet1.xml\"/>"
+                    "</Relationships>")
+               "xl/worksheets/sheet1.xml"
+               "<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>one</t></is></c></row></sheetData></worksheet>"
+               "xl/worksheets/sheet3.xml"
+               "<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>three</t></is></c></row></sheetData></worksheet>"}
+        wb (xlsx/workbook-from-files files "wb")]
+    (is (= {:sheets/value "three"} (m/get-cell (m/tab-by-id wb "Second") 1 1)))
+    (is (= {:sheets/value "one"} (m/get-cell (m/tab-by-id wb "First") 1 1)))))
+
+(deftest a-package-with-no-relationships-still-comes-in
+  ;; Rather than coming in empty, which is the failure that looks like a
+  ;; working import of an empty file.
+  (let [wb (xlsx/workbook-from-files
+            {"xl/worksheets/sheet1.xml"
+             "<worksheet><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>hi</t></is></c></row></sheetData></worksheet>"}
+            "wb")]
+    (is (= {:sheets/value "hi"} (m/get-cell (m/tab-by-id wb "Sheet1") 1 1)))))
+
+#?(:clj
+   (deftest the-bytes-round-trip
+     (let [back (xlsx/workbook-from-bytes (xlsx/xlsx-bytes (plan)) "wb")]
+       (is (= {:sheets/value "Q1"} (m/get-cell (m/tab-by-id back "Plan") 2 1)))
+       (is (= {:sheets/formula "SUM(B2:B2)"} (m/get-cell (m/tab-by-id back "Plan") 3 2))))))
+
+;; ── dates ───────────────────────────────────────────────────────────────────
+
+(deftest serials-land-on-the-dates-excel-shows
+  ;; Anchors, not arithmetic restated. Each was read off a calendar: if the
+  ;; epoch constant is wrong these all move together, which is exactly the
+  ;; failure a single anchor would hide.
+  (is (= "1900-01-01" (xlsx/serial->text 1 false)))
+  (is (= "2023-01-01" (xlsx/serial->text 44927 false)))
+  (is (= "2023-03-15" (xlsx/serial->text 45000 false)))
+  (is (= "2025-01-01" (xlsx/serial->text 45658 false))))
+
+(deftest the-1900-leap-bug-is-honoured
+  ;; Excel believes 1900-02-29 existed. Below serial 60 the sheet and the
+  ;; calendar agree; above it everything is one day further along than the
+  ;; arithmetic says.
+  (is (= "1900-02-28" (xlsx/serial->text 59 false)))
+  (is (= "1900-03-01" (xlsx/serial->text 61 false))))
+
+(deftest the-1904-workbook-counts-from-1904
+  ;; 1462 days apart — four years and a day. Read as the wrong system this
+  ;; produces a plausible date rather than an obvious error, which is why the
+  ;; workbook is asked.
+  (is (= "1904-01-01" (xlsx/serial->text 0 true)))
+  (is (= "2023-03-15" (xlsx/serial->text 43538 true))))
+
+(deftest a-fraction-of-a-day-is-a-time
+  (is (= "2023-03-15T12:00:00" (xlsx/serial->text 45000.5 false)))
+  (is (= "2023-03-15T09:30:00" (xlsx/serial->text 45000.395833 false)))
+  ;; Midnight has no time to show, so it is a plain date.
+  (is (= "2023-03-15" (xlsx/serial->text 45000.0 false))))
+
+(deftest format-codes-are-read-not-scanned
+  (is (xlsx/date-format-code? "yyyy-mm-dd"))
+  (is (xlsx/date-format-code? "h:mm:ss"))
+  (is (xlsx/date-format-code? "[$-409]d\\-mmm;@"))
+  ;; A quoted literal is a word, not four format tokens.
+  (is (not (xlsx/date-format-code? "\"month\" 0")))
+  ;; A backslash escapes what follows it.
+  (is (not (xlsx/date-format-code? "\\d 0")))
+  ;; A colour condition is not a format.
+  (is (not (xlsx/date-format-code? "[Red]0.00")))
+  (is (not (xlsx/date-format-code? "#,##0")))
+  (is (not (xlsx/date-format-code? "General"))))
+
+(def ^:private styled-package
+  "A package shaped the way Excel writes one: shared strings, a style table,
+  and cells that carry a position in `cellXfs` rather than a format id."
+  {"xl/workbook.xml"
+   (str "<workbook><workbookPr date1904=\"0\"/>"
+        "<sheets><sheet name=\"Log\" r:id=\"rId1\"/></sheets></workbook>")
+   "xl/_rels/workbook.xml.rels"
+   "<Relationships><Relationship Id=\"rId1\" Target=\"worksheets/sheet1.xml\"/></Relationships>"
+   "xl/styles.xml"
+   (str "<styleSheet><numFmts>"
+        "<numFmt numFmtId=\"164\" formatCode=\"yyyy&quot;年&quot;m&quot;月&quot;\"/>"
+        "<numFmt numFmtId=\"165\" formatCode=\"0.00&quot;円&quot;\"/>"
+        "</numFmts><cellXfs>"
+        "<xf numFmtId=\"0\"/><xf numFmtId=\"14\"/><xf numFmtId=\"164\"/>"
+        "<xf numFmtId=\"165\"/><xf numFmtId=\"22\"/>"
+        "</cellXfs></styleSheet>")
+   "xl/sharedStrings.xml" "<sst><si><t>締切</t></si></sst>"
+   "xl/worksheets/sheet1.xml"
+   (str "<worksheet><sheetData><row r=\"1\">"
+        "<c r=\"A1\" t=\"s\"><v>0</v></c>"
+        "<c r=\"B1\" s=\"1\"><v>45000</v></c>"
+        "<c r=\"C1\" s=\"2\"><v>45000</v></c>"
+        "<c r=\"D1\" s=\"3\"><v>45000</v></c>"
+        "<c r=\"E1\" s=\"4\"><v>45000.5</v></c>"
+        "<c r=\"F1\" s=\"0\"><v>45000</v></c>"
+        "<c r=\"G1\" t=\"s\" s=\"1\"><v>0</v></c>"
+        "<c r=\"H1\" s=\"1\"><v>hello</v></c>"
+        "</row></sheetData></worksheet>")})
+
+(deftest a-styled-number-comes-in-as-the-date-it-is
+  (let [tab (m/tab-by-id (xlsx/workbook-from-files styled-package) "Log")]
+    (is (= {:sheets/value "2023-03-15"} (m/get-cell tab 1 2)) "builtin numFmtId 14")
+    ;; The style comes back as well now, so this asks about the value.
+    (is (= "2023-03-15" (:sheets/value (m/get-cell tab 1 3)))
+        "custom code with a date token")
+    (is (= {:sheets/value "2023-03-15T12:00:00"} (m/get-cell tab 1 5)) "date and time")))
+
+(deftest a-number-under-any-other-format-stays-a-number
+  (let [tab (m/tab-by-id (xlsx/workbook-from-files styled-package) "Log")]
+    ;; The currency code's only letters are inside a quoted literal.
+    (is (= "45000" (:sheets/value (m/get-cell tab 1 4))) "0.00\"円\"")
+    (is (= {:sheets/value "45000"} (m/get-cell tab 1 6)) "General")))
+
+(deftest a-date-format-does-not-make-text-a-date
+  (let [tab (m/tab-by-id (xlsx/workbook-from-files styled-package) "Log")]
+    ;; A shared string is a string whatever the style claims.
+    (is (= {:sheets/value "締切"} (m/get-cell tab 1 7)))
+    ;; And a word under a date format is that word, not 1899-12-30.
+    (is (= {:sheets/value "hello"} (m/get-cell tab 1 8)))))
+
+(deftest the-style-index-is-a-position-not-a-format-id
+  ;; `s="3"` is the fourth entry of cellXfs, which points at numFmtId 165.
+  ;; Read as an id it would be 3 — a builtin number format — and the cell
+  ;; would come in as a number by accident rather than on purpose. Read as a
+  ;; position it points at the currency format, which is also not a date, so
+  ;; this asks the table directly.
+  (let [st (xlsx/styles styled-package)]
+    (is (= ["0" "14" "164" "165" "22"] (:formats st)))
+    (is (xlsx/date-style? st "1"))
+    (is (xlsx/date-style? st "2"))
+    (is (not (xlsx/date-style? st "3")))
+    (is (xlsx/date-style? st "4"))
+    ;; A cell with no style, and a style index past the end of the table.
+    (is (not (xlsx/date-style? st nil)))
+    (is (not (xlsx/date-style? st "99")))))
+
+(deftest a-package-with-no-styles-reads-numbers-as-numbers
+  ;; What this namespace writes has no styles.xml at all, so the absence has
+  ;; to be ordinary rather than an error.
+  (let [wb (xlsx/workbook-from-files (dissoc styled-package "xl/styles.xml"))
+        tab (m/tab-by-id wb "Log")]
+    (is (= {:sheets/value "45000"} (m/get-cell tab 1 2)))
+    (is (= {:sheets/value "締切"} (m/get-cell tab 1 1)))))
+
+(deftest the-workbook-is-asked-which-epoch-it-uses
+  (is (not (xlsx/date1904? styled-package)))
+  (is (xlsx/date1904?
+       (assoc styled-package "xl/workbook.xml"
+              "<workbook><workbookPr date1904=\"1\"/></workbook>")))
+  ;; A workbook that says nothing counts from 1900, which is the default and
+  ;; the overwhelming majority of files.
+  (is (not (xlsx/date1904? (assoc styled-package "xl/workbook.xml" "<workbook/>"))))
+  ;; And the 1904 flag actually reaches the cells.
+  (let [wb (xlsx/workbook-from-files
+            (assoc styled-package "xl/workbook.xml"
+                   (str "<workbook><workbookPr date1904=\"1\"/>"
+                        "<sheets><sheet name=\"Log\" r:id=\"rId1\"/></sheets></workbook>")))]
+    (is (= {:sheets/value "2027-03-16"}
+           (m/get-cell (m/tab-by-id wb "Log") 1 2)))))
+
+;; ── what a .xlsx cannot carry ───────────────────────────────────────────────
+
+(deftest a-workbook-with-nothing-to-lose-says-nothing
+  (is (= [] (xlsx/unexpressed (plan))))
+  (is (= [] (xlsx/unexpressed (m/workbook "empty")))))
+
+(deftest unwritable-style-parts-are-named-once-per-tab
+  ;; Once per tab, not once per cell: the answer is the same for every one,
+  ;; and a styled header row would otherwise report a column's worth of
+  ;; identical warnings. Bold is written now, so the entry is about what is
+  ;; left rather than about the style.
+  (let [wb (m/add-tab (m/workbook "wb")
+                      (-> (m/tab "売上" {:sheets/title "売上"})
+                          (m/put-cell 1 1 "四半期")
+                          (m/put-cell 1 2 "金額")
+                          (m/put-cell-style 1 1 {:bold true :color "red"})
+                          (m/put-cell-style 1 2 {:bold true :color "blue"})))
+        entries (xlsx/unexpressed wb)]
+    (is (= 1 (count entries)))
+    (is (= :xlsx/cell-style-parts-dropped (:sheets/code (first entries))))
+    (is (= "売上" (:sheets/id (first entries))))
+    (is (= :info (:sheets/severity (first entries)))
+        "a format not carrying something is a property of the format")))
+
+(deftest what-a-name-or-a-chart-still-loses-is-having-nowhere-to-go
+  ;; Both are written now, so what is reported is the one case that cannot
+  ;; be: pointing at a tab the workbook does not have. A name like that
+  ;; becomes a reference to a missing sheet and a chart like that has no
+  ;; sheet for its drawing to sit on — both open as something broken rather
+  ;; than as something absent.
+  (let [wb (-> (m/workbook "wb")
+               (m/add-tab (m/tab "t" {:sheets/title "t"}))
+               (m/add-named-range "総計" {:sheets/tab "無い表" :sheets/range "A1:B9"})
+               (m/add-chart {:sheets/id "c1" :sheets/tab "無い表"
+                             :sheets/data-range "A1:B9"}))
+        codes (set (map :sheets/code (xlsx/unexpressed wb)))]
+    (is (contains? codes :xlsx/named-ranges-dropped))
+    (is (contains? codes :xlsx/charts-dropped))))
+
+(deftest a-formula-is-not-a-loss
+  ;; Written and not evaluated, which is correct — Excel recalculates on
+  ;; open. Reporting it would be reporting the format working.
+  (let [wb (m/add-tab (m/workbook "wb")
+                      (-> (m/tab "t" {:sheets/title "t"})
+                          (m/put-formula 1 1 "SUM(A2:A9)")))]
+    (is (= [] (xlsx/unexpressed wb)))))
+
+(deftest unexpressed-does-not-throw-on-a-half-built-workbook
+  ;; Workbooks arrive from a wire projection and a hand-edited JSON pane.
+  (doseq [wb [{} {:sheets/tabs nil} {:sheets/tabs {"t" {}}}
+              {:sheets/tabs {"t" {:sheets/cells nil}}}
+              {:sheets/named-ranges {}} {:sheets/charts []}]]
+    (is (vector? (xlsx/unexpressed wb)) (pr-str wb))))
+
+(deftest named-ranges-are-written
+  ;; They used to be dropped, and `unexpressed` said so. Written as the
+  ;; reference a formula would use, with the sheet name quoted always —
+  ;; the rule for when it must be is about spaces and punctuation, and
+  ;; getting it wrong produces a file Excel refuses to open.
+  (let [wb (-> (m/workbook "wb")
+               (m/add-tab (m/tab "売上表" {:sheets/title "売上表"}))
+               (m/add-named-range "売上" {:sheets/tab "売上表"
+                                          :sheets/range "A1:A3"}))
+        xml (get (xlsx/xlsx-files wb) "xl/workbook.xml")]
+    (is (str/includes? xml "<definedNames>"))
+    (is (str/includes? xml "<definedName name=\"売上\">"))
+    (is (str/includes? xml "'売上表'!$A$1:$A$3"))
+    ;; After </sheets>: the schema fixes the order and Excel refuses a file
+    ;; that gets it wrong.
+    (is (< (.indexOf xml "</sheets>") (.indexOf xml "<definedNames>"))))
+  ;; A workbook with none writes no element at all rather than an empty one.
+  (is (not (str/includes? (get (xlsx/xlsx-files (m/workbook "wb")) "xl/workbook.xml")
+                          "definedNames"))))
+
+(deftest a-name-pointing-at-a-missing-tab-is-dropped-and-reported
+  ;; Writing a reference to a sheet that is not there is a file that opens
+  ;; with a broken name in it, which is worse than a file without the name.
+  (let [wb (-> (m/workbook "wb")
+               (m/add-tab (m/tab "売上表" {:sheets/title "売上表"}))
+               (m/add-named-range "良い" {:sheets/tab "売上表" :sheets/range "A1:A3"})
+               (m/add-named-range "迷子" {:sheets/tab "無い表" :sheets/range "A1:A3"}))
+        xml (get (xlsx/xlsx-files wb) "xl/workbook.xml")]
+    (is (str/includes? xml "良い"))
+    (is (not (str/includes? xml "迷子")))
+    ;; And only that one is reported as a loss now.
+    (let [entries (xlsx/unexpressed wb)]
+      (is (= [:xlsx/named-ranges-dropped] (mapv :sheets/code entries)))
+      (is (str/includes? (:sheets/msg (first entries)) "1 件")))))
+
+;; ── cell styles ─────────────────────────────────────────────────────────────
+
+(defn- styled []
+  (m/add-tab (m/workbook "wb")
+             (-> (m/tab "売上" {:sheets/title "売上"})
+                 (m/put-cell 1 1 "四半期") (m/put-cell-style 1 1 {:bold true})
+                 (m/put-cell 1 2 "金額")
+                 (m/put-cell-style 1 2 {:bold true :italic true :align :center})
+                 (m/put-cell 2 2 "1200")
+                 (m/put-cell-style 2 2 {:number-format "#,##0\"円\""}))))
+
+(deftest a-style-survives-the-round-trip
+  ;; The largest of the losses `unexpressed` used to report. A file whose
+  ;; header row was bold came back plain, and going out again lost it for
+  ;; good.
+  (let [tab (m/tab-by-id (xlsx/workbook-from-files (xlsx/xlsx-files (styled))) "売上")]
+    (is (= {:bold true} (:sheets/style (m/get-cell tab 1 1))))
+    (is (= {:bold true :italic true :align :center} (:sheets/style (m/get-cell tab 1 2))))
+    (is (= {:number-format "#,##0\"円\""} (:sheets/style (m/get-cell tab 2 2))))
+    ;; And the values are still the values.
+    (is (= "四半期" (:sheets/value (m/get-cell tab 1 1))))
+    (is (= "1200" (:sheets/value (m/get-cell tab 2 2))))))
+
+(deftest a-cell-points-at-a-style-rather-than-carrying-one
+  ;; Two levels of indirection — cell → xf → font/numFmt — and this is what
+  ;; made styles the largest loss: a writer that emits a <font b="1"/> and
+  ;; nothing else produces a file Excel opens with no bold in it, because
+  ;; nothing pointed at the font.
+  (let [files (xlsx/xlsx-files (styled))
+        sheet (get files "xl/worksheets/sheet1.xml")
+        styles (get files "xl/styles.xml")]
+    (is (str/includes? sheet "s=\"1\"") "the cell carries an index")
+    (is (str/includes? styles "<cellXfs") "and cellXfs is what it indexes")
+    (is (str/includes? styles "<b/>"))
+    (is (str/includes? styles "applyFont=\"1\"") "without which Excel ignores the font")
+    (is (str/includes? styles "numFmtId=\"164\"") "custom formats start at 164")
+    (is (str/includes? styles "applyNumberFormat=\"1\""))))
+
+(deftest position-zero-is-the-default-and-always-exists
+  ;; A cell with no `s` means cellXfs position 0, so a workbook with no
+  ;; styles still needs the part — one without it opens with a repair
+  ;; prompt.
+  (let [files (xlsx/xlsx-files (plan))
+        styles (get files "xl/styles.xml")]
+    (is (some? styles))
+    (is (str/includes? styles "<cellXfs count=\"1\">"))
+    ;; On a `<c>`, not anywhere — `xmlns="` contains `s="`, which is what
+    ;; the first version of this assertion was matching.
+    (is (nil? (re-find #"<c [^>]*s=\"" (get files "xl/worksheets/sheet1.xml"))))))
+
+(deftest two-cells-with-one-style-share-one-entry
+  ;; Otherwise a header row of twenty bold cells writes twenty identical
+  ;; cellXfs entries.
+  (let [wb (m/add-tab (m/workbook "wb")
+                      (reduce (fn [tab c] (-> tab (m/put-cell 1 c "x")
+                                              (m/put-cell-style 1 c {:bold true})))
+                              (m/tab "t" {:sheets/title "t"})
+                              (range 1 6)))
+        styles (get (xlsx/xlsx-files wb) "xl/styles.xml")]
+    (is (str/includes? styles "<cellXfs count=\"2\">") "the default and one style")))
+
+(deftest a-formatted-empty-cell-keeps-its-format
+  ;; Formatting applied to a column nobody has filled in yet. A writer that
+  ;; only emits cells with content loses it.
+  (let [wb (m/add-tab (m/workbook "wb")
+                      (m/put-cell-style (m/tab "t" {:sheets/title "t"}) 1 1 {:bold true}))
+        back (m/tab-by-id (xlsx/workbook-from-files (xlsx/xlsx-files wb)) "t")]
+    (is (= {:bold true} (:sheets/style (m/get-cell back 1 1))))
+    (is (nil? (:sheets/value (m/get-cell back 1 1))))))
+
+(deftest what-a-style-still-loses-is-named-by-key
+  ;; Not "the style is dropped" any more — weight, slant, underline,
+  ;; alignment and a number format are written. What is left is named.
+  (let [wb (m/add-tab (m/workbook "wb")
+                      (-> (m/tab "t" {:sheets/title "t"})
+                          (m/put-cell 1 1 "x")
+                          (m/put-cell-style 1 1 {:bold true :color "red"
+                                                 :border :thin})))
+        [entry] (xlsx/unexpressed wb)]
+    (is (= :xlsx/cell-style-parts-dropped (:sheets/code entry)))
+    (is (str/includes? (:sheets/msg entry) "border"))
+    (is (str/includes? (:sheets/msg entry) "color"))
+    (is (not (str/includes? (:sheets/msg entry) "bold")) "which is written"))
+  ;; A style made only of things that are written reports nothing.
+  (is (= [] (xlsx/unexpressed (styled)))))
+
+(deftest a-date-and-a-style-can-be-on-the-same-cell
+  ;; Both are read from the same `s` index, so this is the case where one
+  ;; could quietly shadow the other.
+  (let [files (assoc (xlsx/xlsx-files (m/workbook "wb"))
+                     "xl/styles.xml"
+                     (str "<styleSheet><fonts><font/><font><b/></font></fonts>"
+                          "<cellXfs><xf numFmtId=\"0\" fontId=\"0\"/>"
+                          "<xf numFmtId=\"14\" fontId=\"1\" applyFont=\"1\"/>"
+                          "</cellXfs></styleSheet>")
+                     "xl/worksheets/sheet1.xml"
+                     (str "<worksheet><sheetData><row r=\"1\">"
+                          "<c r=\"A1\" s=\"1\"><v>45000</v></c>"
+                          "</row></sheetData></worksheet>"))
+        tab (first (vals (:sheets/tabs (xlsx/workbook-from-files files))))
+        cell (m/get-cell tab 1 1)]
+    (is (= "2023-03-15" (:sheets/value cell)) "read as a date")
+    (is (= {:bold true} (:sheets/style cell)) "and as bold")))
+
+;; ── charts in the file ──────────────────────────────────────────────────────
+
+(defn- charted [& [kind]]
+  (-> (m/workbook "wb")
+      (m/add-tab (-> (m/tab "sheet1" {:sheets/title "売上"})
+                     (m/put-cell 1 1 "Q1") (m/put-cell 1 2 "1200")
+                     (m/put-cell 2 1 "Q2") (m/put-cell 2 2 "800")
+                     (m/put-formula 3 1 "\"合計\"") (m/put-formula 3 2 "SUM(B1:B2)")))
+      (m/add-chart {:sheets/id "c1" :sheets/title "四半期" :sheets/tab "売上"
+                    :sheets/data-range "A1:B3"
+                    :sheets/chart-type (or kind :bar)})))
+
+(deftest every-link-in-the-chain-is-written
+  ;; Sheet → drawing → chart → cells. A link missing anywhere gives a file
+  ;; that opens with no chart and no complaint, which is the failure worth
+  ;; testing for rather than the chart XML looking plausible.
+  (let [files (xlsx/xlsx-files (charted))]
+    (is (contains? files "xl/charts/chart1-1.xml"))
+    (is (contains? files "xl/drawings/drawing1.xml"))
+    (is (contains? files "xl/drawings/_rels/drawing1.xml.rels"))
+    (is (contains? files "xl/worksheets/_rels/sheet1.xml.rels"))
+    ;; The sheet points at the drawing…
+    (is (str/includes? (get files "xl/worksheets/sheet1.xml") "<drawing r:id=\"rId1\"/>"))
+    (is (str/includes? (get files "xl/worksheets/_rels/sheet1.xml.rels")
+                       "../drawings/drawing1.xml"))
+    ;; …the drawing at the chart…
+    (is (str/includes? (get files "xl/drawings/_rels/drawing1.xml.rels")
+                       "../charts/chart1-1.xml"))
+    ;; …and the chart at the cells.
+    (is (str/includes? (get files "xl/charts/chart1-1.xml") "'売上'!$B$1:$B$3"))
+    ;; Both new parts have a content type; one without is a part Excel does
+    ;; not read.
+    (let [types (get files "[Content_Types].xml")]
+      (is (str/includes? types "/xl/drawings/drawing1.xml"))
+      (is (str/includes? types "/xl/charts/chart1-1.xml"))
+      (is (str/includes? types "drawingml.chart+xml")))))
+
+(deftest the-drawing-comes-after-the-sheet-data
+  ;; The schema fixes the order and a `<drawing>` before `</sheetData>` is a
+  ;; file Excel refuses.
+  (let [sheet (get (xlsx/xlsx-files (charted)) "xl/worksheets/sheet1.xml")]
+    (is (< (.indexOf sheet "</sheetData>") (.indexOf sheet "<drawing")))))
+
+(deftest the-series-names-its-cells-and-caches-what-they-hold
+  ;; Both: the reference is what Excel recalculates from, and the cache is
+  ;; what every other reader draws — a chart with only the reference is
+  ;; blank in anything that does not evaluate formulas.
+  (let [chart (get (xlsx/xlsx-files (charted)) "xl/charts/chart1-1.xml")]
+    (is (str/includes? chart "<c:f>'売上'!$B$1:$B$3</c:f>"))
+    (is (str/includes? chart "<c:numCache>"))
+    ;; The formula's total, cached — reading :sheets/value would cache
+    ;; nothing for that cell.
+    ;; 2000, not 2000.0 — and the same on both hosts, which `(str (double
+    ;; v))` was not.
+    (is (str/includes? chart "<c:v>2000</c:v>"))
+    ;; And the headings became the category axis.
+    (is (str/includes? chart "'売上'!$A$1:$A$3"))
+    (is (str/includes? chart "<c:v>Q1</c:v>"))))
+
+(deftest each-kind-writes-its-own-plot
+  (is (str/includes? (get (xlsx/xlsx-files (charted :bar)) "xl/charts/chart1-1.xml")
+                     "<c:barChart>"))
+  (is (str/includes? (get (xlsx/xlsx-files (charted :line)) "xl/charts/chart1-1.xml")
+                     "<c:lineChart>"))
+  (is (str/includes? (get (xlsx/xlsx-files (charted :pie)) "xl/charts/chart1-1.xml")
+                     "<c:pieChart>"))
+  ;; A bar and a line need axes; naming an axId without defining it is a
+  ;; file Excel refuses. A pie has neither.
+  (is (str/includes? (get (xlsx/xlsx-files (charted :bar)) "xl/charts/chart1-1.xml")
+                     "<c:catAx>"))
+  (is (not (str/includes? (get (xlsx/xlsx-files (charted :pie)) "xl/charts/chart1-1.xml")
+                          "<c:catAx>"))))
+
+(deftest a-workbook-with-no-charts-has-no-drawing-parts
+  (let [files (xlsx/xlsx-files (plan))]
+    (is (not-any? #(str/includes? % "drawing") (keys files)))
+    (is (not-any? #(str/includes? % "chart") (keys files)))
+    (is (not (str/includes? (get files "xl/worksheets/sheet1.xml") "<drawing")))))
+
+(deftest a-chart-on-a-tab-that-is-not-there-is-dropped-and-reported
+  ;; There is no sheet for its drawing to sit on, and one anchored to
+  ;; nothing opens as an empty frame.
+  (let [wb (m/add-chart (charted) {:sheets/id "orphan" :sheets/tab "無い表"
+                                   :sheets/data-range "A1:B3"})
+        files (xlsx/xlsx-files wb)]
+    (is (contains? files "xl/charts/chart1-1.xml"))
+    (is (not (contains? files "xl/charts/chart1-2.xml")))
+    (is (= [:xlsx/charts-dropped] (mapv :sheets/code (xlsx/unexpressed wb))))
+    (is (str/includes? (:sheets/msg (first (xlsx/unexpressed wb))) "1 件")))
+  ;; And a workbook whose charts all have a home reports nothing.
+  (is (= [] (xlsx/unexpressed (charted)))))

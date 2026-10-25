@@ -1,0 +1,187 @@
+(ns quarantine.host-test
+  "Real filesystem round trips. The library's central claim is that removal is
+  reversible, and a claim like that tested against a mock is worth nothing — so
+  these move actual files and read them back.
+
+  Everything happens under a fresh temp directory; no test touches a path
+  outside its own tree."
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.test :refer [deftest is testing use-fixtures]]
+            [quarantine.core :as q]
+            [quarantine.host :as h]))
+
+(def ^:const now 1753500000000)
+(def ^:const day 86400000)
+
+(def scratch (atom nil))
+(defn- home [] (path/join @scratch "app-data"))
+
+(use-fixtures :each
+  {:before (fn [] (reset! scratch (fs/mkdtempSync (path/join (os/tmpdir) "quarantine-test-"))))
+   :after (fn [] (when-let [d @scratch] (fs/rmSync d #js {:recursive true :force true})))})
+
+(defn- write! [rel content]
+  (let [p (path/join @scratch rel)]
+    (fs/mkdirSync (path/dirname p) #js {:recursive true})
+    (fs/writeFileSync p content "utf8")
+    p))
+
+(defn- entry [p] {:path p :bytes (.-size (fs/lstatSync p)) :rule/id :test/rule})
+
+(defn- quarantine-one! [p]
+  (h/quarantine! (home) [(entry p)] {:now-ms now :policy-id "p" :plan-id "pl"}))
+
+;; ---------------------------------------------------------------------------
+
+(deftest quarantine-moves-rather-than-deletes
+  (let [p (write! "junk/blob.bin" "junk-bytes")
+        r (quarantine-one! p)]
+    (is (= 1 (count (:moves r))))
+    (is (empty? (:failures r)))
+    (is (not (fs/existsSync p)) "the original path is gone")
+    (let [vp (:vault-path (first (:moves r)))]
+      (is (fs/existsSync vp))
+      (is (= "junk-bytes" (fs/readFileSync vp "utf8")) "the bytes are unchanged"))))
+
+(deftest restore-puts-the-file-back-exactly
+  (let [p (write! "junk/blob.bin" "junk-bytes")
+        before (fs/lstatSync p)
+        r (quarantine-one! p)
+        back (h/restore! (home) (:run-id r))]
+    (is (= 1 (count (:restored back))))
+    (is (empty? (:failures back)))
+    (is (= "junk-bytes" (fs/readFileSync p "utf8")))
+    (testing "mode and mtime survive the round trip"
+      (let [after (fs/lstatSync p)]
+        (is (= (.-mode before) (.-mode after)))
+        (is (= (js/Math.round (/ (.getTime (.-mtime before)) 1000))
+               (js/Math.round (/ (.getTime (.-mtime after)) 1000))))))))
+
+(deftest restore-never-overwrites-newer-state
+  (let [p (write! "junk/blob.bin" "old")
+        r (quarantine-one! p)
+        _ (write! "junk/blob.bin" "new")
+        back (h/restore! (home) (:run-id r))]
+    (is (empty? (:restored back)))
+    (is (= :occupied (:reason (first (:failures back)))))
+    (is (= "new" (fs/readFileSync p "utf8")) "the newer file is untouched")))
+
+(deftest a-vanished-source-is-a-failure-not-a-crash
+  (let [p (write! "junk/blob.bin" "junk")
+        e (entry p)
+        _ (fs/rmSync p)
+        r (h/quarantine! (home) [e] {:now-ms now})]
+    (is (empty? (:moves r)))
+    (is (= :vanished (:reason (first (:failures r)))))))
+
+(deftest the-manifest-describes-the-run
+  (let [p (write! "junk/blob.bin" "junk")
+        r (quarantine-one! p)
+        m (h/read-manifest (home) (:run-id r))]
+    (is (= q/manifest-schema (:vault/schema m)))
+    (is (= now (:vault/created-ms m)))
+    (is (= p (:original-path (first (:vault/items m)))))
+    (is (= :test/rule (:rule/id (first (:vault/items m)))))))
+
+;; --- purge ------------------------------------------------------------------
+
+(deftest purge-refuses-without-acknowledgement-and-keeps-the-bytes
+  (let [p (write! "junk/blob.bin" "junk")
+        r (quarantine-one! p)
+        out (h/purge! (home) (:run-id r)
+                      {:now-ms (+ now (* 30 day)) :retention-days 7 :acknowledged? false})]
+    (is (not (:purged? out)))
+    (is (= :not-acknowledged (:reason out)))
+    (is (fs/existsSync (:vault-path (first (:moves r)))))))
+
+(deftest purge-refuses-within-retention-and-keeps-the-bytes
+  (let [p (write! "junk/blob.bin" "junk")
+        r (quarantine-one! p)
+        out (h/purge! (home) (:run-id r)
+                      {:now-ms (+ now (* 2 day)) :retention-days 7 :acknowledged? true})]
+    (is (not (:purged? out)))
+    (is (= :within-retention (:reason out)))
+    (is (fs/existsSync (:vault-path (first (:moves r)))))))
+
+(deftest purge-after-retention-removes-bytes-but-keeps-the-record
+  (let [p (write! "junk/blob.bin" "junk")
+        r (quarantine-one! p)
+        out (h/purge! (home) (:run-id r)
+                      {:now-ms (+ now (* 30 day)) :retention-days 7 :acknowledged? true})]
+    (is (:purged? out))
+    (is (= 1 (:item-count out)))
+    (is (not (fs/existsSync (:vault-path (first (:moves r))))))
+    (testing "a purged run stays visible as having existed"
+      (let [m (h/read-manifest (home) (:run-id r))]
+        (is (q/purged? m))
+        (is (empty? (:vault/items m)))))))
+
+(deftest purge-with-overwrite-destroys-the-content-before-unlinking
+  (let [p (write! "junk/secret.bin" "top-secret-content")
+        r (quarantine-one! p)
+        vp (:vault-path (first (:moves r)))
+        out (h/purge! (home) (:run-id r)
+                      {:now-ms (+ now (* 30 day)) :retention-days 7
+                       :acknowledged? true :overwrite-passes 2})]
+    (is (:purged? out))
+    (is (true? (:overwritten? out)))
+    (is (= 2 (:overwrite-passes out)))
+    (is (pos? (:overwritten-file-count out)))
+    (is (not (fs/existsSync vp)))))
+
+(deftest purge-without-overwrite-reports-that-it-did-not-overwrite
+  (testing "claiming a secure erase that did not happen would be the worst
+            possible lie for this library to tell"
+    (let [p (write! "junk/blob.bin" "junk")
+          r (quarantine-one! p)
+          out (h/purge! (home) (:run-id r)
+                        {:now-ms (+ now (* 30 day)) :retention-days 7 :acknowledged? true})]
+      (is (:purged? out))
+      (is (false? (:overwritten? out)))
+      (is (= 0 (:overwrite-passes out))))))
+
+(deftest purging-twice-is-refused-the-second-time
+  (let [p (write! "junk/blob.bin" "junk")
+        r (quarantine-one! p)
+        opts {:now-ms (+ now (* 30 day)) :retention-days 7 :acknowledged? true}]
+    (is (:purged? (h/purge! (home) (:run-id r) opts)))
+    (is (= :already-purged (:reason (h/purge! (home) (:run-id r) opts))))))
+
+;; --- listing / gc -----------------------------------------------------------
+
+(deftest list-runs-reports-purgeability-against-the-floor
+  (let [p (write! "junk/blob.bin" "junk")
+        _ (quarantine-one! p)
+        held (h/list-runs (home) {:now-ms (+ now day) :retention-days 7})
+        aged (h/list-runs (home) {:now-ms (+ now (* 20 day)) :retention-days 7})]
+    (is (= 1 (count held)))
+    (is (not (:purgeable? (first held))))
+    (is (:purgeable? (first aged)))))
+
+(deftest gc-purges-only-what-is-past-the-floor
+  (let [a (write! "junk/a.bin" "aaa")
+        _ (h/quarantine! (home) [(entry a)] {:now-ms now})
+        b (write! "junk/b.bin" "bbb")
+        _ (h/quarantine! (home) [(entry b)] {:now-ms (+ now (* 29 day))})
+        out (h/gc! (home) {:now-ms (+ now (* 30 day)) :retention-days 7
+                           :acknowledged? true})]
+    (is (= 1 (:considered out)) "only the older run is past the floor")
+    (is (= 1 (count (:purged-runs out))))))
+
+(deftest gc-without-acknowledgement-purges-nothing
+  (let [p (write! "junk/blob.bin" "junk")
+        _ (quarantine-one! p)
+        out (h/gc! (home) {:now-ms (+ now (* 30 day)) :retention-days 7
+                           :acknowledged? false})]
+    (is (= 1 (:considered out)))
+    (is (empty? (:purged-runs out)))
+    (is (= :not-acknowledged (:reason (first (:refused out)))))))
+
+(deftest the-ledger-is-append-only
+  (let [_ (h/append-ledger! (home) {:receipt/kind :quarantine :n 1})
+        _ (h/append-ledger! (home) {:receipt/kind :purge :n 2})
+        lines (-> (fs/readFileSync (h/ledger-path (home)) "utf8") (.trim) (.split "\n"))]
+    (is (= 2 (count lines)))
+    (is (re-find #":quarantine" (first lines)) "the first entry is still first")))

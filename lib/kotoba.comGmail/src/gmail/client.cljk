@@ -1,0 +1,125 @@
+(ns gmail.client
+  "Portable core for talking to the Gmail API v1 -- one auth/HTTP boundary
+  for every gmail.* namespace in this library.
+
+  Query construction and response parsing are pure .cljc. The actual HTTP
+  call is JVM-only by default (java.net.http) but always takes an
+  injectable `:http-fn` -- the same `{:url :method :headers :body} ->
+  {:status :body}` convention as cloudflare.client (kotoba-lang/com-cloudflare)
+  and cloud-itonami.runtime/jvm-http-fn -- so every namespace here is
+  testable with a stub, never only against a live account.
+
+  Auth is a bearer OAuth2 access token. Obtaining/refreshing that token (the
+  OAuth2 consent flow itself) is out of scope for this library -- callers
+  pass a valid token, the same way cloudflare.client expects a
+  CLOUDFLARE_API_TOKEN rather than performing its own auth flow."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            #?(:clj [gmail.retry :as retry])
+            #?(:clj [json.data-json :as json])))
+
+(def api-base "https://gmail.googleapis.com/gmail/v1/users/me")
+
+#?(:clj
+(defn jvm-http-fn
+  "Real java.net.http transport. {:url :method :headers :body} ->
+  {:status :body}, same convention as cloudflare.client/jvm-http-fn."
+  ([] (jvm-http-fn {}))
+  ([{:keys [timeout-seconds] :or {timeout-seconds 30}}]
+   (fn [{:keys [url method headers body]}]
+     (let [builder (-> (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                       (.timeout (java.time.Duration/ofSeconds timeout-seconds))
+                       (as-> b (reduce-kv (fn [b k v] (.header b k v)) b headers)))
+           request (case method
+                     :post (-> builder
+                              (.POST (java.net.http.HttpRequest$BodyPublishers/ofString (or body "")))
+                              .build)
+                     :get (-> builder .GET .build)
+                     :put (-> builder
+                             (.PUT (java.net.http.HttpRequest$BodyPublishers/ofString (or body "")))
+                             .build)
+                     :delete (-> builder .DELETE .build)
+                     (throw (ex-info "Unsupported HTTP method" {:method method})))
+           resp (.send (java.net.http.HttpClient/newHttpClient) request
+                      (java.net.http.HttpResponse$BodyHandlers/ofString))]
+       {:status (.statusCode resp) :body (.body resp)})))))
+
+#?(:clj
+(defn access-token
+  "GMAIL_ACCESS_TOKEN from the environment, or throw. Callers can always
+  override via an explicit :token in opts instead of relying on env."
+  []
+  (or (System/getenv "GMAIL_ACCESS_TOKEN")
+      (throw (ex-info "GMAIL_ACCESS_TOKEN is required" {})))))
+
+#?(:clj
+(defn- auth-headers [token]
+  {"Authorization" (str "Bearer " token)
+   "Content-Type" "application/json"}))
+
+#?(:clj
+(defn- encode-query-value
+  "Percent-encode a query-param VALUE so a Gmail search string like
+  \"after:2024/01/01 in:inbox\" (spaces) or any value carrying `&`/`+`/`=`/
+  non-ASCII survives intact in the URL instead of corrupting the
+  query-string syntax. java.net.URLEncoder is deliberately NOT used: it is
+  application/x-www-form-urlencoded, which serializes a space as `+` (a
+  literal `+` in a URI, not a space -- ambiguous) and over-encodes `:`/`/`,
+  the two characters Gmail search syntax (`from:`, `after:2024/01/01`) most
+  needs to stay readable and that RFC 3986 already permits unencoded in a
+  query component. Instead: keep RFC 3986 `unreserved` (ALPHA/DIGIT/`-._~`)
+  plus the query-legal `:`/`/`, and percent-encode every other byte (UTF-8),
+  so the delimiters space/`&`/`=`/`+`/`#` can never be misread as syntax.
+  Keys are left unencoded on purpose -- in this codebase they are always
+  simple identifiers (q/maxResults/pageToken). This does NOT add repeated-key
+  support (still one value per key) -- that larger design decision stays
+  documented as out of scope in gmail.history's ADR addendum."
+  ^String [v]
+  (let [sb (StringBuilder.)]
+    (doseq [b (kbytes/utf8-bytes (str v))]
+      (let [c (bit-and b 0xff)
+            ch (char c)]
+        (if (or (and (>= c (int \A)) (<= c (int \Z)))
+                (and (>= c (int \a)) (<= c (int \z)))
+                (and (>= c (int \0)) (<= c (int \9)))
+                (contains? #{\- \. \_ \~ \: \/} ch))
+          (.append sb ch)
+          (.append sb (format "%%%02X" c)))))
+    (.toString sb))))
+
+#?(:clj
+(defn request!
+  "Call a Gmail API v1 endpoint. `path` is relative to api-base (e.g.
+  \"/threads\" or (str \"/threads/\" thread-id)). `opts` accepts :method
+  (default :get), :body (a map, JSON-encoded), :query (a map of query
+  params), :http-fn, :token. Returns the parsed JSON body, or nil for an
+  empty body (Gmail returns an empty 200 for some modify calls). Throws on
+  a transport-level non-2xx status.
+
+  `:retry` (optional, OPT-IN) turns on retry/backoff for transient failures
+  via gmail.retry/with-retry: pass `true` for the defaults (5 attempts,
+  full-jitter exponential backoff) or a map of gmail.retry/with-retry opts
+  (`{:max-attempts N :base-ms M :max-ms K :sleep-fn f}`). OMITTING `:retry`
+  entirely preserves the exact prior behavior byte-for-byte -- one request,
+  throw immediately on the first non-2xx -- so this is additive/non-breaking
+  for every existing caller (and for com-cloudflare/com-wise, which share the
+  sync `:http-fn` convention). Only the transient statuses 429/5xx are
+  retried; a 401/403/404 still throws on the first try."
+  ([path] (request! path {}))
+  ([path {:keys [method body http-fn token query retry]
+          :or {method :get http-fn (jvm-http-fn)}}]
+   (let [query-string (when (seq query)
+                        (str "?" (str/join "&" (map (fn [[k v]] (str (name k) "=" (encode-query-value v))) query))))
+         req (cond-> {:url (str api-base path query-string)
+                      :method method
+                      :headers (auth-headers (or token (access-token)))}
+               body (assoc :body (json/write-str body)))
+         do-request (fn []
+                      (let [resp (http-fn req)]
+                        (when-not (< (:status resp) 300)
+                          (throw (ex-info "Gmail API request failed"
+                                          {:status (:status resp) :path path :body (:body resp)})))
+                        (when (seq (:body resp))
+                          (json/read-str (:body resp) :key-fn keyword))))]
+     (if retry
+       (retry/with-retry do-request (if (map? retry) retry {}))
+       (do-request))))))

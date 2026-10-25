@@ -1,0 +1,344 @@
+;; kotoba.card.lifecycle as a Kotoba component -- the card lifecycle state
+;; machine (ADR-q9-whole-component-build-migration, `:migration-unit
+;; :whole-component`).
+;;
+;; The whole namespace moves: the state and event tables, terminality,
+;; reachability, the landing state, the successor-minting flag, the issue
+;; reasons, `apply-event` and `describe`. There is no host mechanism in it --
+;; the point of the namespace is that the question "is this transition even
+;; reachable" is answered with no I/O, no model and no policy.
+;;
+;; ⚠ THIS TABLE IS A MIRROR of the deployed issuer side
+;; (cloud-itonami-card-issuing `cardissuing.governor/legal-predecessor` and
+;; `cardissuing.store/lifecycle!`), and the `.cljc` oracle says a mirror that
+;; disagrees with its subject is worse than no mirror. This file is now a
+;; THIRD copy of the same table, which is exactly the drift the oracle warns
+;; about -- so the parity test compares every state x event pair against the
+;; oracle, and the oracle keeps its own mirror test against the issuer side.
+;; Two tables, one check between each pair.
+;;
+;; ## Design changes, each measured
+;;
+;; 1. SETS AND SEQS BECOME DOCUMENTS OR SCALARS. `states`, `terminal-states`
+;;    and each event's `:from` are sets in the oracle; they are membership
+;;    predicates here. `transition-issues` returns a seq of issue maps, which
+;;    is a document vector of documents -- and by construction it is always
+;;    empty or one element, because the oracle's `cond` returns a single
+;;    vector.
+;;
+;; 2. NO `name` ON A KEYWORD. `describe` renders "activate: issued -> active".
+;;    A runtime keyword cannot be turned into a string, so the rendering is a
+;;    `cond` over the closed sets -- five states and four events, which is
+;;    every keyword this component admits. An unknown state or event renders
+;;    "" where the oracle still prints the unknown name; that boundary is
+;;    asserted in the parity test rather than left to be discovered.
+;;
+;; 3. NO KWARGS. The oracle takes `& {:keys [card-reference]}`; the guest takes
+;;    the reference as a fourth parameter and treats "" as absent, which is
+;;    what a missing kwarg means to `apply-event`.
+;;
+;; `.cljc` remains the oracle. Clojure-shaped twin: lifecycle.cljk.
+;;
+;; Compile / run (the CLI needs -M and an ABSOLUTE path):
+;;   kotoba -M test /abs/kotoba/kotoba/card/lifecycle.kotoba --json
+
+(ns kotoba.card.lifecycle
+  (:export [state? event? state-count state-at event-count event-at
+            terminal? reachable? next-state mints-successor?
+            issue-kind transition-issues apply-event describe
+            state-name event-name reachable-from
+            test-states test-events test-enumeration test-reachable test-next-state
+            test-terminal test-issues test-apply test-describe]))
+
+;; --- the tables -----------------------------------------------------------
+;;
+;; `#{:intake :issued :active :blocked :closed}` and the four events, as
+;; membership predicates. An unrecognised input is never permissive, which is
+;; the oracle's stated posture.
+
+(defn state? [s :keyword] :bool
+  (or (= s :intake)
+      (or (= s :issued) (or (= s :active) (or (= s :blocked) (= s :closed))))))
+
+(defn event? [e :keyword] :bool
+  (or (= e :activate) (or (= e :block) (or (= e :reissue) (= e :close)))))
+
+;; --- enumeration ------------------------------------------------------------
+;;
+;; `states` and `events` are PUBLIC data in the oracle, and a consumer reads them
+;; as data: `kotoba.card.actuation/state-mapping-complete?` requires a provider to
+;; give every lifecycle STATE a representation, and a provider's own coverage check
+;; compares its event table against every lifecycle EVENT. A guest that exposed
+;; only predicates would force such a consumer to hard-code both sides, and then
+;; its check would compare a constant to itself -- which is not a check.
+;;
+;; So the enumeration is part of this component's surface, in the order the oracle
+;; sorts them (`(sort states)` / `(sort (keys events))`), which the parity test
+;; pins. Measured 2026-09-09: a second Kotoba module can call these across a
+;; `--source-path` boundary and iterate them -- `module-lock` links two roots
+;; (repeat the flag; a colon-joined path fails), and the linked artifact runs.
+;;
+;; `:none` is the out-of-range answer, the same sentinel `next-state` uses for
+;; "there isn't one".
+
+(defn state-count [] :i64 5)
+
+(defn state-at [i :i64] :keyword
+  (cond
+    (= i 0) :active
+    (= i 1) :blocked
+    (= i 2) :closed
+    (= i 3) :intake
+    (= i 4) :issued
+    :else :none))
+
+(defn event-count [] :i64 4)
+
+(defn event-at [i :i64] :keyword
+  (cond
+    (= i 0) :activate
+    (= i 1) :block
+    (= i 2) :close
+    (= i 3) :reissue
+    :else :none))
+
+;; Only :closed. There is no separate "reissued" state -- a reissue lands back
+;; in :active under a new card reference.
+(defn terminal? [s :keyword] :bool
+  (= s :closed))
+
+;; The allowlist, mirroring `legal-predecessor`. :activate is legal ONLY from
+;; :issued -- unblocking is not an activate, the recovery path from :blocked is
+;; :reissue -- and :reissue is legal ONLY from :blocked. Both are easy to guess
+;; wrong, which is why the oracle has a test named after them.
+(defn reachable? [s :keyword e :keyword] :bool
+  (and (state? s)
+       (cond
+         (= e :activate) (= s :issued)
+         (= e :block) (= s :active)
+         (= e :reissue) (= s :blocked)
+         (= e :close) (or (= s :issued) (or (= s :active) (= s :blocked)))
+         :else false)))
+
+;; The landing state, or :none where the oracle answers nil.
+(defn next-state [s :keyword e :keyword] :keyword
+  (if (not (reachable? s e))
+    :none
+    (cond
+      (= e :activate) :active
+      (= e :block) :blocked
+      (= e :reissue) :active
+      (= e :close) :closed
+      :else :none)))
+
+;; Only :reissue creates a new card reference as part of the same operation.
+(defn mints-successor? [e :keyword] :bool
+  (= e :reissue))
+
+;; --- issues ---------------------------------------------------------------
+;;
+;; The oracle's `cond` produces AT MOST ONE issue, in this order: unknown
+;; event, unknown state, terminal state, unreachable transition. The order
+;; matters -- a close from :closed is reported as terminal, not unreachable.
+
+(defn issue-kind [s :keyword e :keyword] :keyword
+  (cond
+    (not (event? e)) :event/unknown
+    (not (state? s)) :state/unknown
+    (terminal? s) :state/terminal
+    (not (reachable? s e)) :transition/unreachable
+    :else :none))
+
+;; The `:from` set as the oracle renders it in `describe`: names, sorted,
+;; comma-joined. A closed table, so it is written out rather than derived.
+(defn reachable-from [e :keyword] :string
+  (cond
+    (= e :activate) "issued"
+    (= e :block) "active"
+    (= e :reissue) "blocked"
+    (= e :close) "active, blocked, issued"
+    :else ""))
+
+(defn state-name [s :keyword] :string
+  (cond
+    (= s :intake) "intake"
+    (= s :issued) "issued"
+    (= s :active) "active"
+    (= s :blocked) "blocked"
+    (= s :closed) "closed"
+    :else ""))
+
+(defn event-name [e :keyword] :string
+  (cond
+    (= e :activate) "activate"
+    (= e :block) "block"
+    (= e :reissue) "reissue"
+    (= e :close) "close"
+    :else ""))
+
+;; A vector of 0 or 1 issue documents, matching the oracle's seq. The keys are
+;; the oracle's: every issue carries `:card/issue`, and each kind carries the
+;; fields the oracle attaches to it -- a governor cites one rather than
+;; re-deriving it, so the fields are the payload.
+(defn transition-issues [s :keyword e :keyword] :document
+  (let [kind (issue-kind s e)]
+    (cond
+      (= kind :none) (document-vector)
+
+      (= kind :event/unknown)
+      (document-vector-conj (document-vector)
+                            (document-map :card/issue (document-keyword :event/unknown)
+                                          :card/event (document-keyword e)))
+
+      (= kind :state/unknown)
+      (document-vector-conj (document-vector)
+                            (document-map :card/issue (document-keyword :state/unknown)
+                                          :card/state (document-keyword s)))
+
+      (= kind :state/terminal)
+      (document-vector-conj (document-vector)
+                            (document-map :card/issue (document-keyword :state/terminal)
+                                          :card/state (document-keyword s)
+                                          :card/event (document-keyword e)))
+
+      :else
+      (document-vector-conj
+        (document-vector)
+        (document-map :card/issue (document-keyword :transition/unreachable)
+                      :card/state (document-keyword s)
+                      :card/event (document-keyword e)
+                      :card/from (document-string (reachable-from e)))))))
+
+;; --- apply-event ----------------------------------------------------------
+;;
+;; Never throws on either side. `card-reference` is "" for absent, which is
+;; what a missing kwarg means to the oracle -- and a reissue echoes it, because
+;; the issuer side creates the replacement in the same operation and a caller
+;; that treats a reissue as a pure state change misses the new reference.
+
+(defn apply-event [s :keyword e :keyword card-reference :string] :document
+  (if (not (= (issue-kind s e) :none))
+    (document-map :card/ok? (document-bool false)
+                  :card/issues (transition-issues s e))
+    (if (mints-successor? e)
+      (document-map :card/ok? (document-bool true)
+                    :card/from (document-keyword s)
+                    :card/to (document-keyword (next-state s e))
+                    :card/mints-successor? (document-bool true)
+                    :card/supersedes-reference (document-string card-reference))
+      (document-map :card/ok? (document-bool true)
+                    :card/from (document-keyword s)
+                    :card/to (document-keyword (next-state s e))))))
+
+;; --- describe -------------------------------------------------------------
+;;
+;; One operator-log line. "" for an unknown state or event, where the oracle
+;; still prints the unknown keyword's name -- a keyword cannot be turned into a
+;; string at runtime, and the closed tables above cover every keyword this
+;; component admits. The parity test asserts that boundary.
+
+(defn describe [s :keyword e :keyword] :string
+  (if (or (not (state? s)) (not (event? e)))
+    ""
+    (let [to (next-state s e)]
+      (if (= to :none)
+        (string-concat
+          (string-concat (event-name e) ": refused from ")
+          (string-concat (state-name s)
+                         (string-concat " (reachable from " 
+                                        (string-concat (reachable-from e) ")"))))
+        (string-concat
+          (string-concat (event-name e) ": ")
+          (string-concat
+            (string-concat (state-name s) " -> ")
+            (string-concat (state-name to)
+                           (if (mints-successor? e) " (new card reference)" ""))))))))
+
+;; --- tests ----------------------------------------------------------------
+;;
+;; `test-*` returns i64 1 on pass and these run on jvm-kir, js AND wasm. The
+;; full state x event table against the oracle is the JVM parity test; these are
+;; the three-target evidence, and each is cheap -- every input is a keyword, so
+;; nothing here scans a string except `describe`.
+;;
+;; `truth` exists for the reason measured in org-w3-webcodecs: a keyword
+;; comparison placed directly inside an `and` fails on jvm-kir with `value is
+;; not a boolean` while js and wasm accept it.
+
+(defn- truth [b :bool] :bool (if b true false))
+
+(defn test-states [] :i64
+  (if (and (truth (state? :intake))
+           (and (truth (state? :closed))
+                (and (not (state? :nope)) (not (state? :reissued)))))
+    1 0))
+
+(defn test-events [] :i64
+  (if (and (truth (event? :activate))
+           (and (truth (event? :close))
+                (and (not (event? :issue)) (not (event? :unblock)))))
+    1 0))
+
+;; The two easy guesses, which the oracle has a test named after: activate is
+;; NOT legal from :blocked, and reissue is ONLY legal from :blocked.
+;; The enumeration and the predicates must agree in BOTH directions: every index
+;; names something `state?`/`event?` admits, and the count is exactly the number
+;; the predicates admit. A count that was too small would make a consumer's
+;; coverage check pass while missing an event.
+(defn test-enumeration [] :i64
+  (if (and (= (state-count) 5)
+           (and (= (event-count) 4)
+                (and (truth (state? (state-at 0)))
+                     (and (truth (state? (state-at 4)))
+                          (and (= (state-at 5) :none)
+                               (and (truth (event? (event-at 0)))
+                                    (and (truth (event? (event-at 3)))
+                                         (= (event-at 4) :none))))))))
+    1 0))
+
+(defn test-reachable [] :i64
+  (if (and (truth (reachable? :issued :activate))
+           (and (not (reachable? :blocked :activate))
+                (and (truth (reachable? :blocked :reissue))
+                     (and (not (reachable? :active :reissue))
+                          (not (reachable? :intake :activate))))))
+    1 0))
+
+(defn test-next-state [] :i64
+  (if (and (= (next-state :issued :activate) :active)
+           (and (= (next-state :blocked :reissue) :active)
+                (and (= (next-state :active :close) :closed)
+                     (= (next-state :closed :close) :none))))
+    1 0))
+
+(defn test-terminal [] :i64
+  (if (and (truth (terminal? :closed))
+           (and (not (terminal? :active)) (not (terminal? :intake))))
+    1 0))
+
+(defn test-issues [] :i64
+  ;; The ORDER of the cond: a close from :closed is terminal, not unreachable.
+  (if (and (= (issue-kind :active :block) :none)
+           (and (= (issue-kind :closed :close) :state/terminal)
+                (and (= (issue-kind :active :activate) :transition/unreachable)
+                     (and (= (issue-kind :active :frob) :event/unknown)
+                          (= (issue-kind :nope :close) :state/unknown)))))
+    1 0))
+
+(defn test-apply [] :i64
+  (let [ok (apply-event :issued :activate "")
+        re (apply-event :blocked :reissue "card_1")
+        no (apply-event :closed :close "")]
+    (if (and (= (document-count ok) 3)
+             (and (= (document-count re) 5)
+                  (= (document-count no) 2)))
+      1 0)))
+
+(defn test-describe [] :i64
+  (if (and (string=? (describe :issued :activate) "activate: issued -> active")
+           (and (string=? (describe :blocked :reissue)
+                          "reissue: blocked -> active (new card reference)")
+                (and (string=? (describe :active :activate)
+                               "activate: refused from active (reachable from issued)")
+                     (string=? (describe :nope :activate) ""))))
+    1 0))

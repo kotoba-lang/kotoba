@@ -1,0 +1,262 @@
+(ns kotobase.authn-test
+  "The Authn exchange end to end against `kotobase.fake-authn` (in-process):
+  a did:key signs in at auth.kotoba.cloud, the session becomes a Biscuit, the
+  data edge sees only the Biscuit, expiry re-mints, a CACAO never leaves for a
+  non-Authn host, and the legacy path still works when chosen."
+  (:require [cljs.test :refer-macros [deftest is testing async]]
+            ["@noble/curves/ed25519.js" :refer [ed25519]]
+            [cacao.edge.verify :as cacao-verify]
+            [kotobase.attenuate :as att]
+            [kotobase.authn :as authn]
+            [kotobase.cacao :as legacy-cacao]
+            [kotobase.cid :as cid]
+            [kotobase.client :as kc]
+            [kotobase.fake-authn :as fake]))
+
+(def seed (js/Uint8Array.from (clj->js (range 32))))
+(def did (cid/did-key-from-ed25519-pub (.getPublicKey ed25519 seed)))
+(def tenant "t_abcdefabcdef12")
+(def t0 (js/Date.parse "2026-09-24T09:00:00Z"))
+
+(defn- root-cause
+  "nbb/SCI wraps a throw raised inside `.then` (see blocks-test/error-type);
+  the original is the innermost cause."
+  [e]
+  (loop [e e] (if-let [c (ex-cause e)] (recur c) e)))
+
+(defn- fail-and [done]
+  (fn [e] (is (nil? e) (str "unexpected rejection: " (.-message (root-cause e)))) (done)))
+
+(defn- carries-cacao? [{:keys [headers body]}]
+  (boolean (or (some-> (get headers "authorization") (.startsWith "CACAO "))
+               (some-> body (.includes "cacao_b64")))))
+
+(defn- requests [f] (:requests @(:state f)))
+(defn- data-requests [f] (remove #(= fake/authn-host (:host %)) (requests f)))
+(defn- authn-paths [f] (mapv :path (filter #(= fake/authn-host (:host %)) (requests f))))
+
+(defn- setup
+  ([] (setup {}))
+  ([{:keys [members ex-opts client-opts]}]
+   (let [f (fake/make {:now-ms t0 :members (or members #{did})})
+         ex (authn/authn (merge {:tenant-id tenant :secret-key seed :db-name "store-db"
+                                 :fetch-fn (:fetch f) :now-fn #(fake/now f)}
+                                ex-opts))
+         c (kc/make-client (merge {:endpoint "https://kotobase.net"
+                                   :operator-did "did:web:kotobase.net"
+                                   :secret-key seed :authn ex :fetch-fn (:fetch f)}
+                                  client-opts))]
+     {:f f :ex ex :c c})))
+
+;; ── (a)+(b)+(c): sign in, exchange, carry ───────────────────────────────────
+
+(deftest exchange-yields-a-biscuit-and-requests-carry-it
+  (async done
+    (let [{:keys [f ex c]} (setup)]
+      (is (= :biscuit (kc/auth-mode c)))
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then
+           (fn [_]
+             (testing "the round trips, in order"
+               (is (= ["/v1/cacao/session" "/v1/biscuit/token"] (authn-paths f)))
+               (is (= 1 (count (data-requests f)))))
+             (let [[session-req token-req] (filter #(= fake/authn-host (:host %)) (requests f))
+                   data-req (first (data-requests f))
+                   minted (first (:minted @(:state f)))]
+               (testing "biscuit/token was asked with the session cookie, same-origin JSON"
+                 (is (re-find #"^gftd_session=" (get-in token-req [:headers "cookie"])))
+                 (is (= "https://auth.kotoba.cloud" (get-in token-req [:headers "origin"])))
+                 (is (nil? (get-in token-req [:headers "authorization"])))
+                 (is (= {"tenantId" tenant "dbName" "db1"}
+                        (js->clj (js/JSON.parse (:body token-req))))))
+               (testing "the data request carries exactly that Biscuit, and no CACAO"
+                 (is (= (str "Biscuit " minted) (get-in data-req [:headers "authorization"])))
+                 (is (not (carries-cacao? data-req))))
+               (testing "the Biscuit is real: its key chain verifies from Authn's root"
+                 (is (true? (fake/verifies? minted))))
+               (is (= {:mints 1 :sign-ins 1} (authn/stats ex)))
+               (-> (cacao-verify/verify (aget (js/JSON.parse (:body session-req)) "cacao_b64")
+                                        (js/Math.floor (/ t0 1000)))
+                   (.then (fn [r]
+                            (testing "the sign-in CACAO is the actor's, addressed to Authn"
+                              (is (true? (aget r "valid")))
+                              (is (= did (aget r "iss")))
+                              (is (= "https://auth.kotoba.cloud" (aget r "payload" "aud")))
+                              (is (= "auth.kotoba.cloud" (aget r "payload" "domain"))))
+                            (done)))))))
+          (.catch (fail-and done))))))
+
+;; ── a CACAO never goes to a non-Authn host ──────────────────────────────────
+
+(deftest cacao-only-ever-goes-to-authn
+  (async done
+    (let [{:keys [f ex c]} (setup)
+          v1 (kc/make-client {:endpoint "https://storage.kotoba.cloud" :secret-key seed
+                              :transport :direct-v1 :authn ex
+                              :fetch-fn (:fetch f)})]
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then #(kc/q c "db1" "[nil nil nil]"))
+          (.then #(kc/pull c "db1" "e1" nil))
+          (.then #(kc/transact c "db1" "[]"))
+          (.then #(kc/fold c "db1"))
+          (.then #(kc/store-put c "coll" "k" {:v 1}))
+          (.then #(kc/datoms v1 "db1" ":eavt"))
+          (.then
+           (fn [_]
+             (let [with-cacao (filter carries-cacao? (requests f))]
+               (is (pos? (count (data-requests f))))
+               (is (= 1 (count with-cacao)) "one sign-in, one CACAO")
+               (is (every? #(and (= "auth.kotoba.cloud" (:host %))
+                                 (= "/v1/cacao/session" (:path %)))
+                           with-cacao)
+                   "every CACAO went to auth.kotoba.cloud/v1/cacao/session and nowhere else")
+               (is (every? #(.startsWith (str (get-in % [:headers "authorization"])) "Biscuit ")
+                           (data-requests f))
+                   "every data request carried a Biscuit"))
+             (done)))
+          (.catch (fail-and done))))))
+
+(deftest non-authn-hosts-are-refused-by-name-before-any-request
+  (let [f (fake/make {:now-ms t0 :members #{did}})
+        attempt (fn [endpoint cred]
+                  (try (authn/exchanger (merge {:tenant-id tenant :endpoint endpoint
+                                                :fetch-fn (:fetch f)} cred))
+                       nil
+                       (catch :default e (:type (ex-data e)))))]
+    (is (= :kotobase.authn/cacao-not-for-this-host
+           (attempt "https://graph.kotoba.cloud" {:secret-key seed})))
+    (is (= :kotobase.authn/cacao-not-for-this-host
+           (attempt "https://kotobase.net" {:secret-key seed})))
+    (is (= :kotobase.authn/cacao-not-for-this-host
+           (attempt "https://auth.kotobase.net" {:secret-key seed}))
+        "the retiring hostname is not an Authn host for this client")
+    (is (= :kotobase.authn/cacao-not-for-this-host
+           (attempt "http://auth.kotoba.cloud" {:secret-key seed}))
+        "plain http is refused")
+    (is (= :kotobase.authn/bearer-not-for-this-host
+           (attempt "https://graph.kotoba.cloud"
+                    {:service-account-token "kb_sa_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})))
+    (is (nil? (attempt "https://auth.kotoba.cloud" {:secret-key seed})) "the Authn host is accepted")
+    (is (= [] (requests f)) "no request was made by any refused exchanger")))
+
+(deftest a-biscuit-mode-client-refuses-to-carry-a-cacao-to-the-data-edge
+  ;; Nothing on the Biscuit path mints one; this pins the guard that keeps it so.
+  (let [{:keys [c]} (setup)
+        post (fn [] (try (#'kc/post c "datoms" {:db_name "db1"} "Zm9v") nil
+                         (catch :default e (:type (ex-data e)))))]
+    (is (= :kotobase.client/cacao-not-for-this-host (post)))))
+
+;; ── expiry re-mints ─────────────────────────────────────────────────────────
+
+(deftest expiry-triggers-a-re-mint
+  (async done
+    (let [{:keys [f ex c]} (setup)
+          token-of (fn [req] (get-in req [:headers "authorization"]))]
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then (fn [_] (fake/advance! f (* 5 60 1000)) (kc/datoms c "db1" ":eavt")))
+          (.then (fn [_]
+                   (is (= 1 (:mints (authn/stats ex))) "5 min in: the cached token is reused")
+                   ;; 14.5 min: inside the 60 s refresh skew of a 15 min token
+                   (fake/advance! f (* 9.5 60 1000))
+                   (kc/datoms c "db1" ":eavt")))
+          (.then (fn [_]
+                   (let [[a b c3] (mapv token-of (data-requests f))
+                         minted (:minted @(:state f))]
+                     (is (= {:mints 2 :sign-ins 1} (authn/stats ex))
+                         "re-minted from the same session, no second sign-in")
+                     (is (= a b) "same token before the refresh point")
+                     (is (not= b c3) "a new token after it")
+                     (is (= (str "Biscuit " (second minted)) c3)))
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest a-revoked-session-signs-in-once-more
+  (async done
+    (let [{:keys [f ex c]} (setup)]
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then (fn [_]
+                   (fake/revoke-sessions! f)
+                   (fake/advance! f (* 16 60 1000))
+                   (kc/datoms c "db1" ":eavt")))
+          (.then (fn [_]
+                   (is (= {:mints 2 :sign-ins 2} (authn/stats ex)))
+                   (is (= ["/v1/cacao/session" "/v1/biscuit/token"
+                           "/v1/biscuit/token" "/v1/cacao/session" "/v1/biscuit/token"]
+                          (authn-paths f)))
+                   (done)))
+          (.catch (fail-and done))))))
+
+(deftest a-non-member-is-told-so-not-served
+  (async done
+    (let [{:keys [c]} (setup {:members #{}})]
+      (-> (kc/datoms c "db1" ":eavt")
+          (.then (fn [_] (is false "a non-member must not get a token") (done)))
+          (.catch (fn [e]
+                    (let [e (root-cause e)]
+                      (is (= 401 (.-status e)))
+                      (is (re-find #"biscuit/token 401" (.-message e))))
+                    (done)))))))
+
+;; ── service-account path ────────────────────────────────────────────────────
+
+(deftest service-account-token-is-a-bearer-at-authn-only
+  (async done
+    (let [sa "kb_sa_0123456789abcdefghijklmnopqrstuvwxyzAB"
+          f (fake/make {:now-ms t0 :service-accounts {sa "did:web:kotoba.cloud:tenant:t_x:service:sa_1"}})
+          ex (authn/authn {:tenant-id tenant :service-account-token sa
+                           :fetch-fn (:fetch f) :now-fn #(fake/now f)})
+          c (kc/make-client {:endpoint "https://kotobase.net" :did did :authn ex :fetch-fn (:fetch f)})]
+      (-> (kc/transact c "db1" "[]")
+          (.then (fn [_]
+                   (is (= ["/v1/biscuit/token"] (authn-paths f)) "no sign-in round trip")
+                   (let [token-req (first (requests f))]
+                     (is (= (str "Bearer " sa) (get-in token-req [:headers "authorization"])))
+                     (is (nil? (get-in token-req [:headers "cookie"]))))
+                   (is (not-any? carries-cacao? (requests f)))
+                   (is (every? #(not (.includes (str (get-in % [:headers "authorization"])) sa))
+                               (data-requests f))
+                       "the kb_sa_ secret never reaches the data edge")
+                   (done)))
+          (.catch (fail-and done))))))
+
+;; ── legacy, when chosen ─────────────────────────────────────────────────────
+
+(deftest legacy-cacao-path-still-works-when-explicitly-chosen
+  (async done
+    (let [{:keys [f ex c]} (setup {:client-opts {:auth-mode :legacy-cacao}})]
+      (is (= :legacy-cacao (kc/auth-mode c)))
+      (-> (kc/transact c "db1" "[]")
+          (.then (fn [_]
+                   (let [req (first (requests f))
+                         cacao-b64 (aget (js/JSON.parse (:body req)) "cacao_b64")]
+                     (is (= [] (authn-paths f)) "Authn is not contacted")
+                     (is (= {:mints 0 :sign-ins 0} (authn/stats ex)))
+                     (is (= (str "CACAO " cacao-b64) (get-in req [:headers "authorization"])))
+                     (is (= did (get-in req [:headers "x-kotoba-did"])))
+                     (is (some? (legacy-cacao/base64->bytes cacao-b64))))
+                   (done)))
+          (.catch (fail-and done))))))
+
+;; ── (d) offline attenuation ─────────────────────────────────────────────────
+
+(deftest attenuation-is-offline-and-keeps-the-chain
+  (async done
+    (let [{:keys [f ex]} (setup)]
+      (-> (authn/biscuit-token! ex {:db-name "db1"})
+          (.then
+           (fn [{:keys [token]}]
+             (let [before-count (count (requests f))
+                   delegate "did:key:z6MkwDelegateDelegateDelegateDelegateDelegate"
+                   narrowed (att/attenuate token {:before "2026-09-24T09:05:00Z"})
+                   blocks (att/blocks narrowed)]
+               (is (= before-count (count (requests f))) "no request was made")
+               (is (= 2 (count blocks)))
+               (is (= [["before" "2026-09-24T09:05:00Z"]] (:facts (second blocks))))
+               (is (true? (fake/verifies? narrowed)) "the appended block chains from Authn's root")
+               (is (not= token narrowed))
+               (testing "a holder already set cannot be re-addressed by a delegate, but the
+                         block is still well-formed — the verifier is what refuses it"
+                 (is (true? (fake/verifies? (att/attenuate narrowed {:holder delegate})))))
+               (is (thrown? js/Error (att/attenuate token {}))))
+             (done)))
+          (.catch (fail-and done))))))

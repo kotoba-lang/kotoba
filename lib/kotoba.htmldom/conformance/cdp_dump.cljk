@@ -1,0 +1,195 @@
+(ns conformance.cdp-dump
+  "Reads the conformance measurement block out of a Chromium browser that
+   cannot be driven with `--dump-dom`, by driving it over the DevTools
+   protocol instead.
+
+   Why this exists: `--dump-dom` is a *headless-shell* facility, and Brave
+   151 (Chromium 151) produces nothing from it — not on a 200-case page,
+   not on `<p>hello</p>`, not in `--headless=old`, `--headless=new` or
+   plain `--headless`, and with no error on stderr. `--screenshot` is dead
+   the same way. Chrome 150 on the same machine dumps all three fine. The
+   harness's browser loop treats a silent browser as unusable and falls
+   through to the next candidate, so the oracle silently stopped being
+   Brave — the browser this comparison is supposed to be against — and
+   became Chrome, with nothing in the output saying so beyond one line.
+
+   What still works in Brave is CDP: launched with
+   `--headless=new --remote-debugging-port`, it serves `/json/version` and
+   `/json/list` and answers `Runtime.evaluate` normally. So this script
+   launches the browser that way, navigates to the corpus page, polls for
+   the measurement block the page's own script writes, prints it wrapped in
+   the same `<pre id=\"kotoba-htmldom-conformance-out\">` shape `--dump-dom` would
+   have produced (so run.cljs parses one format, not two), and kills the
+   browser.
+
+   Usage: kbb --backend sci conformance/cdp_dump.cljk <browser-binary> <file-path>
+                                        [<out-file>]
+   Writes the wrapped block to <out-file> (stdout if omitted -- see emit!,
+   stdout is only safe for a human at a terminal); exits non-zero with a
+   reason on stderr if the browser never produced one.
+
+   Node's WebSocket global (Node 22+, this runs on 26) is used directly —
+   no `ws` dependency, and no dependency at all beyond what nbb already
+   has."
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(def ^:private launch-timeout-ms 30000)
+(def ^:private measure-timeout-ms 120000)
+
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+(defn- emit!
+  "Delivers the block to the caller: to `out-file` when one was given,
+   otherwise to stdout.
+
+   The file is not a convenience, it is the only reliable channel to
+   another process, and the harness always passes one. A 124 KB block does
+   not survive a pipe here, in three distinct ways, each of which only
+   appears when the reader is a process rather than a shell redirect:
+   `println` loses the tail because Node buffers pipe writes and
+   `process.exit` drops whatever has not flushed; a single `fs/writeSync`
+   to a non-blocking pipe writes one buffer's worth and reports it
+   (measured: 65536 of 124036 bytes, truncating mid-base64); and looping on
+   the returned count then throws EAGAIN as soon as the pipe fills faster
+   than the reader drains it. This is the same reason the `--dump-dom`
+   path already redirects to a file — Chromium's stdout is unusable for a
+   different reason, and pipes turn out to be unusable for this one."
+  [out-file s]
+  (if out-file
+    (fs/writeFileSync out-file s "utf8")
+    (println s)))
+
+(defn- devtools-port
+  "Chromium writes the port it actually bound to into DevToolsActivePort in
+   the profile dir. Asking for port 0 and reading it back is what makes
+   concurrent runs safe — a hardcoded port collides with any other agent
+   session doing the same thing."
+  [profile]
+  (let [f (path/join profile "DevToolsActivePort")]
+    (js/Promise.
+     (fn [resolve reject]
+       (let [deadline (+ (js/Date.now) launch-timeout-ms)]
+         (letfn [(poll []
+                   (cond
+                     (fs/existsSync f)
+                     (let [line (first (.split (fs/readFileSync f "utf8") "\n"))]
+                       (resolve (js/parseInt line 10)))
+
+                     (> (js/Date.now) deadline)
+                     (reject (js/Error. "browser never wrote DevToolsActivePort"))
+
+                     :else (js/setTimeout poll 100)))]
+           (poll)))))))
+
+(defn- cdp-targets [port]
+  (-> (js/fetch (str "http://127.0.0.1:" port "/json/list"))
+      (.then #(.json %))))
+
+(defn- ws-session
+  "One CDP command channel over a page target's WebSocket. Returns a
+   promise of `(fn [method params] -> promise of result)`, plus a `close!`."
+  [url]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [ws (js/WebSocket. url)
+           next-id (atom 0)
+           pending (atom {})]
+       (set! (.-onerror ws) (fn [e] (reject (js/Error. (str "cdp socket error: " (.-message e))))))
+       (set! (.-onmessage ws)
+             (fn [ev]
+               (let [msg (js/JSON.parse (.-data ev))
+                     id (.-id msg)]
+                 (when-let [{:keys [res rej]} (get @pending id)]
+                   (swap! pending dissoc id)
+                   (if-let [err (.-error msg)]
+                     (rej (js/Error. (str "cdp error: " (js/JSON.stringify err))))
+                     (res (.-result msg)))))))
+       (set! (.-onopen ws)
+             (fn [_]
+               (resolve
+                {:send (fn [method params]
+                         (let [id (swap! next-id inc)]
+                           (js/Promise.
+                            (fn [res rej]
+                              (swap! pending assoc id {:res res :rej rej})
+                              (.send ws (js/JSON.stringify
+                                         (clj->js {:id id :method method :params (or params {})})))))))
+                 :close! (fn [] (.close ws))})))))))
+
+(defn- read-block
+  "Polls the page for the block the corpus page's own script writes. Polling
+   rather than waiting on Page.loadEventFired because the page measures
+   synchronously during load in some paths and after it in others; the
+   block's presence is the only signal that means what it says."
+  [send]
+  (let [deadline (+ (js/Date.now) measure-timeout-ms)]
+    (letfn [(attempt []
+              (-> (send "Runtime.evaluate"
+                        {:expression "(function(){var e=document.getElementById('kotoba-htmldom-conformance-out');return e?e.textContent:null})()"
+                         :returnByValue true})
+                  (.then (fn [r]
+                           (let [v (some-> r .-result .-value)]
+                             (cond
+                               (and (string? v) (seq v)) v
+                               (> (js/Date.now) deadline)
+                               (throw (js/Error. "browser never produced a measurement block over CDP"))
+                               :else (.then (sleep 250) attempt)))))))]
+      (attempt))))
+
+(defn- run! [browser file out-file]
+  (let [profile (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-cdp-"))
+        proc (cp/spawn browser
+                       #js ["--headless=new" "--disable-gpu" "--no-first-run"
+                            "--no-default-browser-check" "--disable-extensions"
+                            "--disable-background-networking" "--disable-sync"
+                            (str "--user-data-dir=" profile)
+                            "--remote-debugging-port=0"
+                            "about:blank"]
+                       #js {:stdio "ignore"})
+        cleanup! (fn []
+                   (try (.kill proc "SIGKILL") (catch :default _ nil))
+                   (try (fs/rmSync profile #js {:recursive true :force true}) (catch :default _ nil)))]
+    (-> (devtools-port profile)
+        (.then (fn [port]
+                 (-> (cdp-targets port)
+                     (.then (fn [targets]
+                              (or (some #(when (and (= "page" (.-type %)) (.-webSocketDebuggerUrl %))
+                                           (.-webSocketDebuggerUrl %))
+                                        targets)
+                                  (throw (js/Error. "no CDP page target"))))))))
+        (.then ws-session)
+        (.then (fn [{:keys [send close!]}]
+                 (-> (send "Page.enable" {})
+                     (.then #(send "Page.navigate" {:url (str "file://" file)}))
+                     (.then #(read-block send))
+                     (.then (fn [block]
+                              (close!)
+                              ;; same shape --dump-dom would have produced,
+                              ;; so run.cljs keeps exactly one parser.
+                              ;;
+                              ;; writeSync to fd 1, not println: when stdout
+                              ;; is a PIPE (i.e. whenever run.cljs is the
+                              ;; caller rather than a shell redirect), Node
+                              ;; buffers the write and `process.exit` drops
+                              ;; whatever has not flushed. Measured: the
+                              ;; 124 KB block arrived complete through a
+                              ;; file redirect and truncated mid-base64
+                              ;; through spawnSync, surfacing as a JSON
+                              ;; parse error on decoded garbage.
+                              (emit! out-file (str "<pre id=\"kotoba-htmldom-conformance-out\">" block "</pre>\n"))))
+                     (.catch (fn [e] (close!) (throw e))))))
+        (.then (fn [_] (cleanup!) (js/process.exit 0)))
+        (.catch (fn [e]
+                  (cleanup!)
+                  (binding [*print-fn* *print-err-fn*] (println (.-message e)))
+                  (js/process.exit 1))))))
+
+(let [[browser file out-file] *command-line-args*]
+  (if (and browser file)
+    (run! browser file out-file)
+    (do (binding [*print-fn* *print-err-fn*]
+          (println "usage: kbb --backend sci conformance/cdp_dump.cljk <browser-binary> <file-path> [<out-file>]"))
+        (js/process.exit 2))))

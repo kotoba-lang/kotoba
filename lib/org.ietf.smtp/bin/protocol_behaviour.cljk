@@ -1,0 +1,214 @@
+#!/usr/bin/env kbb
+;; `kotoba/smtp/protocol.kotoba` against a REAL EHLO response, and against the
+;; fuel budget that decides how it has to be written.
+;;
+;; ## Why this exists next to `kotoba -M test`
+;;
+;; `-M test` runs the component's `test-*` exports on jvm-kir, js AND wasm, which
+;; is the only evidence that it works on the runtime it ships to. But the harness
+;; runs the whole suite in ONE module instance, and an instance has 512 fuel
+;; units charged per FUNCTION ENTRY (`let fuel=512` in the emitted artifact;
+;; amu's `fuel_estimate.cljc` calls it a function-entry charge model). One
+;; `extension-value` over a real 175-character EHLO block costs roughly 250, so a
+;; suite that touches a real block more than twice cannot fit however the tests
+;; are split -- the budget belongs to the SUITE.
+;;
+;; So the in-language tests use a small block and say IT RUNS EVERYWHERE, and this
+;; script instantiates a FRESH module per call, uses the real Gmail EHLO response,
+;; and says IT IS RIGHT. Neither claim substitutes for the other: a green
+;; `-M test` alone is not evidence that this component can parse an EHLO reply.
+;;
+;; ## What it does NOT do
+;;
+;; This is not the repository's parity standard. That is a JVM test compiling the
+;; guest to KIR and executing it against `smtp.protocol` with a mutation control
+;; (`test/smtp/protocol_response_kotoba_parity_test.cljk` is the pattern), plus a
+;; `.cljk` twin. Both are OWED for this component and are named in its header.
+;; The expected values below were transcribed from the oracle by hand, which is
+;; weaker: it catches drift in the guest and not drift in the oracle.
+;;
+;; Usage (needs the kotoba CLI on PATH; skips loudly if it is absent):
+;;   kbb --backend sci bin/protocol_behaviour.cljk
+
+(ns protocol-behaviour
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+;; `js/import.meta` is unavailable under nbb/SCI, so the component is located
+;; from argv with the working directory as a fallback. Absolute either way: the
+;; compiler answers `:decode` / `input could not be read` for a relative path,
+;; which reads like a broken source file rather than a broken invocation.
+(def ^:private component
+  (let [self (some->> (js->clj (.-argv js/process))
+                      (filter #(.endsWith % "protocol_behaviour.cljk"))
+                      first)]
+    (path/join (if self
+                 (path/dirname (path/dirname (path/resolve self)))
+                 (js/process.cwd))
+               "kotoba" "smtp" "protocol.kotoba")))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8"})]
+    {:exit (or (.-status r) -1) :out (str (.-stdout r) (.-stderr r))}))
+
+;; Availability is measured by RUNNING the binary and reading its exit code, not
+;; by `which`: a shim that resolves and then fails to exec turns a skip into a
+;; red for the wrong reason (measured 2026-08-26 in this repository).
+(defn- cli-usable? [] (zero? (:exit (sh "kotoba" ["--help"]))))
+
+(defn- compile-js []
+  (let [out (path/join (fs/mkdtempSync (path/join (os/tmpdir) "smtp-behaviour-")) "protocol.mjs")]
+    (when (zero? (:exit (sh "kotoba" ["-M" "compile" component
+                                      "--target" "js-browser" "--output" out])))
+      out)))
+
+;; NUL is built, never typed: a literal one in this file is invisible in a diff
+;; and in a terminal.
+(def ^:private nul (js/String.fromCharCode 0))
+
+;; A real Gmail EHLO response, 175 characters. The number matters: an earlier
+;; draft of the component passed every assertion against a 40-character fixture
+;; and exhausted the fuel budget on this one.
+(def ^:private gmail
+  (.join #js ["smtp.gmail.com at your service, [1.2.3.4]"
+              "SIZE 35882577"
+              "8BITMIME"
+              "AUTH LOGIN PLAIN XOAUTH2 PLAIN-CLIENTTOKEN OAUTHBEARER XOAUTH"
+              "ENHANCEDSTATUSCODES"
+              "PIPELINING"
+              "CHUNKING"
+              "SMTPUTF8"]
+         "\n"))
+
+(def ^:private no-auth "greeting\nSTARTTLS")
+
+(def ^:private rows
+  [["extension-count"                "extension-count"       [gmail] 7]
+   ["extension-value SIZE"           "extension-value"       [gmail "SIZE"] "35882577"]
+   ["extension-value size (folded)"  "extension-value"       [gmail "size"] "35882577"]
+   ["extension-value CHUNKING"       "extension-value"       [gmail "CHUNKING"] ""]
+   ;; The VALUE keeps its case while the KEYWORD is matched case-insensitively.
+   ;; RFC 1869 4.5 makes keywords case-insensitive and nothing makes values so;
+   ;; the oracle upper-cases the keyword and returns the value untouched. A first
+   ;; version of the component folded the whole block and answered
+   ;; `login plain xoauth2` here. Mechanism matching folds both sides, so nothing
+   ;; else in this table noticed.
+   ["extension-value AUTH keeps case" "extension-value"      [gmail "auth"]
+    "LOGIN PLAIN XOAUTH2 PLAIN-CLIENTTOKEN OAUTHBEARER XOAUTH"]
+   ["has-extension? CHUNKING"        "has-extension?"        [gmail "CHUNKING"] true]
+   ["has-extension? STARTTLS"        "has-extension?"        [gmail "STARTTLS"] false]
+   ["has-extension? 8bitmime"        "has-extension?"        [gmail "8bitmime"] true]
+   ;; the greeting is line 0 and is not an extension. With it left in the block
+   ;; this answered TRUE, because a domain begins its own line and so matches the
+   ;; needle an extension-with-a-value matches.
+   ["has-extension? the greeting"    "has-extension?"        [gmail "smtp.gmail.com"] false]
+   ["mechanism-count"                "mechanism-count"       [gmail] 6]
+   ["advertises XOAUTH2"             "advertises-mechanism?" [gmail "XOAUTH2"] true]
+   ["advertises PLAIN"               "advertises-mechanism?" [gmail "PLAIN"] true]
+   ["advertises PLAIN-CLIENTTOKEN"   "advertises-mechanism?" [gmail "PLAIN-CLIENTTOKEN"] true]
+   ["advertises CRAM-MD5"            "advertises-mechanism?" [gmail "CRAM-MD5"] false]
+   ;; whole-token matching: CLIENTTOKEN and OAUTH are substrings of advertised
+   ;; names and were never offered. A client that tries one authenticates with a
+   ;; mechanism the server does not have.
+   ["advertises CLIENTTOKEN"         "advertises-mechanism?" [gmail "CLIENTTOKEN"] false]
+   ["advertises OAUTH"               "advertises-mechanism?" [gmail "OAUTH"] false]
+   ["max-size"                       "max-size"              [gmail] 35882577]
+   ["max-size, SIZE absent"          "max-size"              [no-auth] -1]
+   ["auth-code, token only"          "auth-code"             [gmail 1] 1]
+   ["auth-code, password only"       "auth-code"             [gmail 2] 2]
+   ["auth-code, no credentials"      "auth-code"             [gmail 0] 4]
+   ["auth-code, server named none"   "auth-code"             [no-auth 2] 0]
+   ["plain-credentials"              "plain-credentials"     ["user" "secret"]
+    (str nul "user" nul "secret")]
+   ["xoauth2-credentials"            "xoauth2-credentials"   ["u" "t"]
+    (str "user=u" nul "auth=Bearer t" nul nul)]])
+
+(defn- ->js [x] (if (int? x) (js/BigInt x) x))
+;; i64 comes back as a BigInt, and neither `goog/typeOf` nor `js*` exists under
+;; nbb/SCI to test for it. Comparison is therefore textual: `(str 7)` and
+;; `(str (js/BigInt 7))` are both "7", booleans are "true"/"false", and a string
+;; is itself. Coercing with `js/Number` instead would make `true` equal to 1 and
+;; "35882577" equal to the number -- three different values collapsing into one is
+;; exactly what this script exists to catch.
+(defn- norm [x] (str x))
+
+(defn -main []
+  (if-not (cli-usable?)
+    (do (println "SKIP: the kotoba CLI did not run (non-zero exit).")
+        (println "      A skip, not a pass: this component is UNVERIFIED today.")
+        (js/process.exit 0))
+    (if-let [artifact (compile-js)]
+      (-> (js/import artifact)
+          (.then
+           (fn [m]
+             (let [instantiate (.-instantiateKotoba m)
+                   ;; A FRESH instance per call. The budget is per instance, so a
+                   ;; shared one would report the 512 rather than the component.
+                   call (fn [f args]
+                          (try {:v (apply (aget (instantiate) f) (map ->js args))}
+                               (catch :default e {:threw (.-message e)})))
+                   results (mapv (fn [[label f args want]]
+                                   (let [r (call f args)]
+                                     {:label label
+                                      :ok? (and (contains? r :v) (= (str want) (norm (:v r))))
+                                      :got (if (contains? r :v) (norm (:v r))
+                                             (str "THREW " (:threw r)))
+                                      :want want}))
+                                 rows)
+                   bad (remove :ok? results)]
+               (doseq [{:keys [label ok? got want]} results]
+                 (println (if ok? "  ok  " "  BAD ")
+                          (.padEnd label 31)
+                          (pr-str got)
+                          (if ok? "" (str "   want " (pr-str want)))))
+               (println)
+               (println (- (count results) (count bad)) "of" (count results)
+                        "behaviours match the oracle, on a real 175-character EHLO response")
+               ;; The budget, reported beside the values so the shape of the
+               ;; component stays explainable. Not an assertion about the
+               ;; language: when it changes, this line changes and nothing breaks.
+               ;; What each export and each in-language test costs, so the
+               ;; component's own comments about the budget cannot go stale: the
+               ;; number is measured here and printed, never asserted.
+               (println)
+               (println "fuel, measured now (512 units per instance, one per function entry):")
+               (let [runs (fn [f args]
+                            (let [k (instantiate)
+                                  g (aget k f)
+                                  jsargs (map ->js args)]
+                              (loop [n 0]
+                                (if (> n 4096)
+                                  n
+                                  (if (try (apply g jsargs) true (catch :default _ false))
+                                    (recur (inc n))
+                                    n)))))]
+                 (doseq [[label f args]
+                         [["extension-value, real block" "extension-value" [gmail "SIZE"]]
+                          ["has-extension?, real block"  "has-extension?"  [gmail "CHUNKING"]]
+                          ["auth-code, real block"       "auth-code"       [gmail 1]]
+                          ["extension-count, real block" "extension-count" [gmail]]
+                          ["plain-credentials"           "plain-credentials" ["user" "secret"]]]]
+                   (let [n (runs f args)]
+                     (println "  " (.padEnd label 30)
+                              (str (.padStart (str n) 4) " calls/instance")
+                              (str "  approx " (if (pos? n) (js/Math.round (/ 512 n)) ">512") " units"))))
+                 (doseq [[label f] [["test-normalize" "test-normalize"]
+                                    ["test-greeting-is-not-an-extension" "test-greeting-is-not-an-extension"]
+                                    ["test-whole-token" "test-whole-token"]
+                                    ["test-auth-code" "test-auth-code"]
+                                    ["test-max-size" "test-max-size"]
+                                    ["test-sasl" "test-sasl"]]]
+                   (let [n (runs f [])]
+                     (println "  " (.padEnd label 30)
+                              (str (.padStart (str n) 4) " runs/instance")
+                              (str "  approx " (if (pos? n) (js/Math.round (/ 512 n)) ">512") " units")))))
+               (js/process.exit (if (seq bad) 1 0)))))
+          (.catch (fn [e]
+                    (println "REFUSED: the compiled artifact would not load:" (str e))
+                    (js/process.exit 2))))
+      (do (println "REFUSED: the component did not compile, so nothing here was measured.")
+          (js/process.exit 2)))))
+
+(-main)

@@ -1,0 +1,173 @@
+(ns gmail.drafts
+  "Gmail draft creation (plain-text reply drafts, optionally with binary
+  attachments). REST v1, JVM-only."
+  (:require [kotoba.bytes :as kbytes] [gmail.client :as client]
+            [kotoba.lang.text :as str])
+  #?(:clj (:import [java.util Base64])))
+
+#?(:clj
+(defn- base64url-encode
+  "URL-safe base64 for the OUTER message -- the encoding Gmail's
+  message.raw field itself requires."
+  ^String [^String s]
+  (.encodeToString (Base64/getUrlEncoder) (kbytes/utf8-bytes s))))
+
+#?(:clj
+(defn- std-base64-encode
+  "Standard (not URL-safe) base64 with RFC 2045-style 76-char line
+  wrapping, for a MIME *part*'s own body -- a different encoding layer
+  than base64url-encode, which only ever wraps the OUTER message for
+  Gmail's message.raw field. Mixing these up produces a draft Gmail
+  silently fails to render correctly."
+  ^String [^bytes bs]
+  (.encodeToString (Base64/getMimeEncoder) bs)))
+
+#?(:clj
+(defn- addr-list
+  "Normalizes a Cc/To-style value to one comma-separated header string.
+  Accepts a single address string or a collection of address strings --
+  reply threads with multiple recipients (e.g. Cc'ing co-counsel) need the
+  collection form."
+  [v]
+  (cond
+    (nil? v) nil
+    (string? v) v
+    (coll? v) (str/join ", " v)
+    :else (str v))))
+
+#?(:clj
+(defn- headers-block
+  [{:keys [to cc subject in-reply-to references]}]
+  (str "To: " to "\r\n"
+       (when-let [cc-line (addr-list cc)] (str "Cc: " cc-line "\r\n"))
+       "Subject: " subject "\r\n"
+       (when in-reply-to (str "In-Reply-To: " in-reply-to "\r\n"))
+       (when-let [refs (or references in-reply-to)] (str "References: " refs "\r\n")))))
+
+#?(:clj
+(defn- multipart-boundary
+  "A boundary string vanishingly unlikely to collide with anything in the
+  body/attachments -- doesn't need to be cryptographically random, just
+  unique per message."
+  []
+  (str "kotoba_" (str/replace (str (java.util.UUID/randomUUID)) "-" ""))))
+
+#?(:clj
+(defn- attachment-part
+  "One MIME part for a single attachment. `content-type` is the caller's
+  responsibility (e.g. \"image/svg+xml\", \"application/pdf\") -- this
+  namespace doesn't guess MIME types from filenames, keep that mapping at
+  the call site where the actual file semantics are known."
+  [boundary {:keys [filename content-type bytes]}]
+  (str "--" boundary "\r\n"
+       "Content-Type: " content-type "; name=\"" filename "\"\r\n"
+       "Content-Disposition: attachment; filename=\"" filename "\"\r\n"
+       "Content-Transfer-Encoding: base64\r\n"
+       "\r\n"
+       (std-base64-encode bytes)
+       "\r\n")))
+
+#?(:clj
+(defn ->raw-message
+  "Build an RFC 2822 message and base64url-encode it, the shape Gmail's
+  `drafts.create` `message.raw` field expects.
+
+  `cc` accepts one address string or a collection of address strings.
+  `references` overrides the default References-mirrors-In-Reply-To
+  behavior with a full RFC 2822 References chain (space-separated
+  Message-IDs) when replying deep into a thread that has more than one
+  prior message -- Gmail's own threading heuristic (and other clients')
+  uses the whole chain, not just the immediate parent.
+
+  `attachments` (optional): a collection of
+  `{:filename \"...\" :content-type \"...\" :bytes <byte-array>}`. When
+  present, the message becomes multipart/mixed (a text/plain part plus one
+  part per attachment); when absent, the message stays the original
+  single-part plain-text shape (byte-identical to before this option
+  existed, for backward compatibility). Callers read the file themselves
+  (e.g. `(.readAllBytes (java.io.FileInputStream. path))`) -- this
+  namespace does no filesystem I/O, staying testable with plain byte
+  arrays."
+  [{:keys [body attachments] :as message}]
+  (base64url-encode
+   (if (seq attachments)
+     (let [boundary (multipart-boundary)]
+       (str (headers-block message)
+            "MIME-Version: 1.0\r\n"
+            "Content-Type: multipart/mixed; boundary=\"" boundary "\"\r\n"
+            "\r\n"
+            "--" boundary "\r\n"
+            "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
+            "\r\n"
+            body "\r\n"
+            "\r\n"
+            (str/join "" (map #(attachment-part boundary %) attachments))
+            "--" boundary "--\r\n"))
+     (str (headers-block message)
+          "Content-Type: text/plain; charset=\"UTF-8\"\r\n"
+          "\r\n"
+          body)))))
+
+#?(:clj
+(defn create-draft!
+  "Create a Gmail draft. `thread-id` (optional) attaches the draft to an
+  existing thread instead of starting a new one -- the same shape manimani's
+  reply_llm policy needs (file the draft under the original conversation)."
+  ([message] (create-draft! message {}))
+  ([{:keys [thread-id] :as message} http-opts]
+   (client/request! "/drafts"
+                    (assoc http-opts
+                           :method :post
+                           :body {:message (cond-> {:raw (->raw-message message)}
+                                             thread-id (assoc :threadId thread-id))})))))
+
+#?(:clj
+(defn delete-draft!
+  "Permanently delete a draft by id (Gmail's drafts.delete -- irreversible,
+  unlike moving a message to trash). Gmail returns an empty 204 body on
+  success, which client/request! already treats as nil rather than trying
+  to parse it as JSON."
+  ([draft-id] (delete-draft! draft-id {}))
+  ([draft-id http-opts]
+   (client/request! (str "/drafts/" draft-id) (assoc http-opts :method :delete)))))
+
+#?(:clj
+(defn get-draft!
+  "Fetch a draft by id (Gmail's drafts.get -- returns `{:id :message ...}`).
+  Read-side complement to create/update, so a caller can re-read what it
+  filed (e.g. to show the current body before editing it)."
+  ([draft-id] (get-draft! draft-id {}))
+  ([draft-id http-opts]
+   (client/request! (str "/drafts/" draft-id) http-opts))))
+
+#?(:clj
+(defn list-drafts!
+  "List drafts (Gmail's drafts.list), paginated via `:max-results`/
+  `:page-token` -- forwarded as `maxResults`/`pageToken`, the exact
+  query-param shape gmail.threads/list-threads uses -- so a caller can page
+  through outstanding drafts without re-deriving the pagination convention."
+  ([] (list-drafts! {}))
+  ([{:keys [max-results page-token] :as http-opts}]
+   (client/request! "/drafts"
+                    (assoc (dissoc http-opts :max-results :page-token)
+                           :query (cond-> {}
+                                    max-results (assoc :maxResults max-results)
+                                    page-token (assoc :pageToken page-token)))))))
+
+#?(:clj
+(defn update-draft!
+  "Replace a draft's content in place (Gmail's drafts.update -- PUT
+  /drafts/{id}) with a freshly built `->raw-message`, same `message` shape
+  as create-draft!. This closes the gap that previously forced a
+  delete-draft! + create-draft! cycle just to edit a draft's body: that
+  churned the draft id (breaking any reference a caller held) and briefly
+  left the thread with no draft at all. update-draft! keeps the id stable
+  and the edit atomic. Requires the :put transport branch added to
+  client/jvm-http-fn alongside this."
+  ([draft-id message] (update-draft! draft-id message {}))
+  ([draft-id {:keys [thread-id] :as message} http-opts]
+   (client/request! (str "/drafts/" draft-id)
+                    (assoc http-opts
+                           :method :put
+                           :body {:message (cond-> {:raw (->raw-message message)}
+                                             thread-id (assoc :threadId thread-id))})))))

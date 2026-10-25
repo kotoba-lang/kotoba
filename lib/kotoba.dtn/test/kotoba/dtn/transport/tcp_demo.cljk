@@ -1,0 +1,461 @@
+;; Not a unit test — an EXECUTABLE end-to-end demo that must genuinely
+;; pass when run. It proves kotoba.dtn.transport.tcp actually moves bytes
+;; between real OS processes over a real socket, and that the
+;; store-and-forward resilience property the whole design exists for is
+;; real. Run from this repo's root:
+;;
+;;   kbb --backend sci --classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src" \
+;;     test/kotoba/dtn/transport/tcp_demo.cljk
+;;
+;; (relative --classpath entries mean this must run with cwd at this
+;; repo's root, with kotoba-lang/phone, /html, /css, /wire, /bytes checked
+;; out as siblings — same layout deps.edn already assumes (/wire and
+;; /bytes are needed because kotoba.dtn.transport.tcp delegates its wire
+;; framing/socket-pool mechanics to kotoba.wire, built on kotoba.bytes,
+;; instead of implementing them inline). Scenario 1 also `spawn`s a second
+;; real `nbb` process, found via $PATH, running bin/dtn_node.cljk with the
+;; same --classpath.)
+;;
+;; Scenarios 4a/4b (added alongside this repo's durable-store +
+;; bundle-integrity hardening) prove the two gaps that used to undercut
+;; this library's own stated disaster/carrier-outage resilience purpose
+;; are actually closed: 4a proves the on-disk :store-path log survives a
+;; real (simulated) process restart, not just that the pure
+;; serialize/deserialize functions round-trip in isolation; 4b proves an
+;; HMAC-signed peer accepts a legitimately signed bundle and REJECTS a
+;; bundle forged with the wrong secret sent directly over a raw socket
+;; (bypassing send-message!'s normal signing path entirely).
+;;
+;; Scenario 5 (added alongside this repo's static multi-hop relay
+;; routing) proves an A -> B -> C relay actually happens over real TCP,
+;; not just at the pure kotoba.dtn.router/route-decision level: node A
+;; has NO direct link/peer entry for node C at all, only a configured
+;; :routes entry saying 'reach C via B', and node B has a genuine direct
+;; link to C. It confirms the message actually flows A -> B -> C (C's
+;; :inbox gets it for real), that B does NOT silently absorb a bundle
+;; addressed to someone else into its own :inbox (the destination-mismatch
+;; fix), and that B's relay was a real routing decision (not an
+;; out-of-band cheat) by capturing B's own DTN-RELAY log line.
+;;
+;; Scenario 6 (added alongside this repo's per-source sequence-number
+;; replay protection) proves a captured, legitimately HMAC-signed bundle
+;; cannot be re-sent later and accepted a second time: two nodes exchange
+;; one real signed message over TCP, the demo captures the EXACT bundle
+;; node B actually decoded off the wire (from B's own :inbox — not a
+;; hand-rolled reconstruction), re-sends those exact same signed bytes a
+;; second time over a fresh raw socket (bypassing send-message!'s normal
+;; fresh-sequence-number stamping entirely), and confirms B's :inbox still
+;; has exactly ONE copy of that message (not two) and logged
+;; DTN-REPLAY-REJECTED. It then confirms a genuinely NEW message (a fresh
+;; sequence number, via a normal send-message! call) is still accepted
+;; right after — proving replay rejection doesn't wrongly block
+;; legitimate subsequent traffic from the same authenticated source.
+;;
+;; Prints PASS/FAIL per scenario, a final "RESULT: N/7 scenarios passed"
+;; line, and exits 0 iff all 7 passed (else 1).
+
+(ns kotoba.dtn.transport.tcp-demo
+  (:require ["node:child_process" :as cp]
+            ["node:net" :as net]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [kotoba.dtn :as dtn]
+            [kotoba.dtn.link :as link]
+            [kotoba.dtn.router :as router]
+            [kotoba.dtn.auth :as auth]
+            [kotoba.dtn.gateway :as gateway]
+            [kotoba.dtn.transport.tcp :as tcp]))
+
+(def classpath "src:../phone/src:../html/src:../css/src:../wire/src:../bytes/src")
+
+(defn- sleep-ms [ms]
+  (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- try-connect-once [host port]
+  (js/Promise.
+   (fn [resolve _]
+     (let [sock (net/createConnection #js {:host host :port port})]
+       (.on sock "connect" (fn [] (.destroy sock) (resolve true)))
+       (.on sock "error" (fn [_e] (.destroy sock) (resolve false)))))))
+
+(defn- wait-for-port
+  "Poll host:port with real connection attempts (not a blind sleep) until
+  one succeeds or attempts run out. Returns a Promise<boolean>."
+  [host port attempts interval-ms]
+  (p/let [ok? (try-connect-once host port)]
+    (cond
+      ok? true
+      (<= attempts 0) false
+      :else (p/let [_ (sleep-ms interval-ms)]
+              (wait-for-port host port (dec attempts) interval-ms)))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 1 — real cross-process delivery
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-1 []
+  (println "\n--- Scenario 1: real cross-process delivery (spawned child `listen` process) ---")
+  (let [b-e164 "+818098765432" b-port 5202
+        a-e164 "+819012345678" a-port 5201
+        out-chunks (atom [])
+        err-chunks (atom [])
+        child (cp/spawn "nbb" #js ["--classpath" classpath "lib/kotoba.dtn/bin/dtn_node.cljk" "listen"
+                                    "--e164" b-e164 "--port" (str b-port)]
+                         #js {:cwd (js/process.cwd)})]
+    (.on (.-stdout child) "data" (fn [chunk] (swap! out-chunks conj (str chunk))))
+    (.on (.-stderr child) "data" (fn [chunk] (swap! err-chunks conj (str chunk))))
+    (p/let [up? (wait-for-port "127.0.0.1" b-port 50 100)]
+      (if-not up?
+        (do (println "FAIL scenario 1: child `listen` process never bound port" b-port)
+            (.kill child)
+            false)
+        (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                          :peers {b-e164 {:host "127.0.0.1" :port b-port}}})
+                delivered? (tcp/send-message! node-a b-e164
+                                               {:rcs/message-id (str (random-uuid))
+                                                :rcs/from a-e164 :rcs/to b-e164
+                                                :rcs/body "hello-scenario-1"
+                                                :rcs/content-type "text/plain"})
+                _ (sleep-ms 400) ;; let the child's own event loop print + update :inbox
+                _ (tcp/stop-node! node-a)]
+          (.kill child)
+          (let [child-stdout (str/join "" @out-chunks)
+                arrived? (and (str/includes? child-stdout "DTN-RECV")
+                               (str/includes? child-stdout "hello-scenario-1"))
+                pass? (and delivered? arrived?)]
+            (println "  send-message! returned delivered?=" delivered?)
+            (println "  child (node B, separate OS process) stdout:")
+            (doseq [line (str/split-lines child-stdout)]
+              (when (seq (str/trim line)) (println "   >" line)))
+            (println (if pass? "PASS" "FAIL")
+                      " scenario 1: cross-process TCP delivery, verified via child process's own stdout+inbox")
+            pass?))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 2 — store-and-forward across a disconnect (in-process)
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-2 []
+  (println "\n--- Scenario 2: store-and-forward across a disconnect (in-process) ---")
+  (let [a-e164 "+819012345678" a-port 5301
+        b-e164 "+818098765432" b-port 5302]
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port :peers {}})
+            _ (tcp/stop-node! node-b) ;; simulate B going offline before A ever sends
+            delivered-1? (tcp/send-message! node-a b-e164
+                                             {:rcs/message-id (str (random-uuid))
+                                              :rcs/from a-e164 :rcs/to b-e164
+                                              :rcs/body "resilience-check"
+                                              :rcs/content-type "text/plain"})]
+      (let [stored-while-down? (and (not delivered-1?) (= 1 (count (:store (deref node-a)))))]
+        (println "  while B is down: delivered?=" delivered-1?
+                  " A's :store size=" (count (:store (deref node-a))))
+        (p/let [node-b2 (tcp/start-node! {:e164 b-e164 :port b-port :peers {}}) ;; B restarts, same port
+                _ (tcp/retry-store! node-a)
+                _ (sleep-ms 300)]
+          (let [store-empty? (empty? (:store (deref node-a)))
+                arrived? (some #(= "resilience-check" (get-in % [:message :rcs/body]))
+                                (:inbox (deref node-b2)))
+                pass? (and stored-while-down? store-empty? (boolean arrived?))]
+            (println "  after B restarts + retry-store!: A's :store size="
+                      (count (:store (deref node-a))) " B's :inbox has message?" (boolean arrived?))
+            (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b2)]
+              (println (if pass? "PASS" "FAIL")
+                        " scenario 2: message survived B's downtime via store, delivered on retry-store!")
+              pass?)))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 3 — multi-transport-kind priority (pure router only)
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-3 []
+  (println "\n--- Scenario 3: multi-transport-kind priority (pure router.route-decision) ---")
+  (println "  NOTE: no real mesh-radio hardware exists in this environment. The")
+  (println "  mesh-radio link below is a hand-built, simulated link record used ONLY")
+  (println "  to prove kotoba.dtn.router's priority ordering is real and honors an")
+  (println "  overridden :priority — it does not exercise any real mesh-radio I/O.")
+  (let [b (dtn/bundle "+819012345678" "+818098765432" {:body "multi-transport-check"})
+        internet-link (link/link "internet-link" "+818098765432" :internet-overlay :reachable? true)
+        ;; simulated — no real mesh-radio hardware exists in this environment;
+        ;; this link exists only to prove kotoba.dtn.router's priority ordering
+        ;; picks internet-overlay first by default, and would pick mesh-radio
+        ;; first if the caller passed a resilience-first :priority override.
+        mesh-link (link/link "simulated-mesh-link" "+818098765432" :mesh-radio :reachable? true)
+        default-decision (router/route-decision b [internet-link mesh-link])
+        resilience-decision (router/route-decision b [internet-link mesh-link]
+                                                     :priority [:mesh-radio :satellite :internet-overlay])
+        default-ok? (and (= :forward (:dtn/action default-decision))
+                          (= :internet-overlay (get-in default-decision [:dtn/via :dtn/transport-kind])))
+        resilience-ok? (and (= :forward (:dtn/action resilience-decision))
+                             (= :mesh-radio (get-in resilience-decision [:dtn/via :dtn/transport-kind])))
+        pass? (and default-ok? resilience-ok?)]
+    (println "  default priority picked:" (get-in default-decision [:dtn/via :dtn/transport-kind]))
+    (println "  resilience-first priority ([:mesh-radio :satellite :internet-overlay]) picked:"
+              (get-in resilience-decision [:dtn/via :dtn/transport-kind]))
+    (println (if pass? "PASS" "FAIL")
+              " scenario 3: router priority ordering honored (routing logic only, no real radio)")
+    pass?))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 4a — durable store survives a (simulated) process restart
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-4a []
+  (println "\n--- Scenario 4a: durable (:store-path) store survives a process restart ---")
+  (let [a-e164 "+819012345678" a-port 5401
+        ;; Nobody listens here — attempt-forward! will fail every time,
+        ;; guaranteeing the bundle falls into :store (and, with
+        ;; :store-path configured, gets durably appended to disk too).
+        unreachable-e164 "+10000000000" unreachable-port 5499
+        store-path (path/join (os/tmpdir) (str "dtn-store-demo-" (random-uuid) ".edn"))]
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :store-path store-path
+                                      :peers {unreachable-e164 {:host "127.0.0.1" :port unreachable-port}}})
+            delivered? (tcp/send-message! node-a unreachable-e164
+                                           {:rcs/message-id (str (random-uuid))
+                                            :rcs/from a-e164 :rcs/to unreachable-e164
+                                            :rcs/body "durable-store-check"
+                                            :rcs/content-type "text/plain"})]
+      (let [store-before (:store (deref node-a))
+            file-contents (when (fs/existsSync store-path) (str (fs/readFileSync store-path "utf8")))
+            stored-and-on-disk? (and (not delivered?)
+                                      (= 1 (count store-before))
+                                      (str/includes? (or file-contents "") "durable-store-check"))]
+        (println "  before restart: delivered?=" delivered?
+                  " in-memory :store size=" (count store-before)
+                  " store file on disk contains bundle?" (boolean (and file-contents (str/includes? file-contents "durable-store-check"))))
+        ;; "Restart" the node for real: stop-node! (closes the server,
+        ;; discards the old in-memory atom entirely — nothing carries
+        ;; over in-process) then start-node! again with the SAME
+        ;; :store-path. A fresh atom, loaded fresh from disk.
+        (p/let [_ (tcp/stop-node! node-a)
+                node-a2 (tcp/start-node! {:e164 a-e164 :port a-port :store-path store-path :peers {}})]
+          (let [store-after (:store (deref node-a2))
+                reloaded? (some #(= "durable-store-check" (get-in % [:dtn/payload :rcs/body])) store-after)
+                pass? (and stored-and-on-disk? (boolean reloaded?))]
+            (println "  after \"restart\" (fresh start-node!, same :store-path): reloaded :store size="
+                      (count store-after) " contains the original undelivered bundle?" (boolean reloaded?))
+            (p/let [_ (tcp/stop-node! node-a2)]
+              (fs/unlinkSync store-path)
+              (println (if pass? "PASS" "FAIL")
+                        " scenario 4a: durable store round-trips a bundle across a simulated process restart")
+              pass?)))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 4b — bundle integrity (HMAC-SHA256, kotoba.dtn.auth) is enforced
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-4b []
+  (println "\n--- Scenario 4b: bundle integrity (:peer-secrets HMAC-SHA256) is enforced ---")
+  (let [a-e164 "+819012345678" a-port 5402
+        b-e164 "+818098765432" b-port 5403
+        shared-secret "correct-horse-battery-staple"
+        wrong-secret  "an-attackers-guess"]
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}
+                                      :peer-secrets {b-e164 shared-secret}})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port :peers {}
+                                      :peer-secrets {a-e164 shared-secret}})
+            delivered? (tcp/send-message! node-a b-e164
+                                           {:rcs/message-id (str (random-uuid))
+                                            :rcs/from a-e164 :rcs/to b-e164
+                                            :rcs/body "authentic-message"
+                                            :rcs/content-type "text/plain"})
+            _ (sleep-ms 300)]
+      (let [legit-arrived? (boolean (some #(= "authentic-message" (get-in % [:message :rcs/body]))
+                                           (:inbox (deref node-b))))]
+        (println "  legitimately signed message: send delivered?=" delivered?
+                  " arrived (and verified) in B's inbox?" legit-arrived?)
+        ;; Build a bundle signed with the WRONG secret, and write it
+        ;; directly to a raw net.Socket using tcp/encode-frame — this
+        ;; deliberately bypasses send-message!/route-and-send!'s normal
+        ;; signing path so we're proving the RECEIVING node's own
+        ;; verification actually runs against real bytes on a real
+        ;; socket, not just that kotoba.dtn.auth's pure functions agree
+        ;; with each other in isolation.
+        (let [forged (-> (gateway/rcs-shaped->bundle
+                           {:rcs/message-id (str (random-uuid))
+                            :rcs/from a-e164 :rcs/to b-e164
+                            :rcs/body "forged-message-should-be-rejected"
+                            :rcs/content-type "text/plain"}
+                           b-e164 a-e164)
+                          (assoc :dtn/creation-timestamp (js/Date.now))
+                          (auth/sign-bundle wrong-secret))
+              frame (tcp/encode-frame forged)]
+          (p/let [_ (js/Promise.
+                     (fn [resolve _reject]
+                       (let [sock (net/createConnection #js {:host "127.0.0.1" :port b-port})]
+                         (.on sock "connect" (fn [] (.write sock frame (fn [_err] (resolve true))))))))
+                  _ (sleep-ms 300)]
+            (let [forged-arrived? (boolean (some #(= "forged-message-should-be-rejected"
+                                                       (get-in % [:message :rcs/body]))
+                                                  (:inbox (deref node-b))))
+                  pass? (and (boolean delivered?) legit-arrived? (not forged-arrived?))]
+              (println "  forged (wrong-secret) bundle sent over a raw socket, bypassing send-message!'s signing")
+              (println "  forged bundle arrived in B's inbox?" forged-arrived? "(must be false — rejected)")
+              (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b)]
+                (println (if pass? "PASS" "FAIL")
+                          " scenario 4b: HMAC-SHA256 signature verification enforced — forged bundle rejected, not accepted")
+                pass?))))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 5 — static multi-hop relay routing, real TCP (A -[relay]-> B -[forward]-> C)
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-5 []
+  (println "\n--- Scenario 5: static multi-hop relay routing, real TCP (A -[relay via B]-> B -[forward]-> C) ---")
+  (let [a-e164 "+819012345678" a-port 5501
+        b-e164 "+818098765432" b-port 5502
+        c-e164 "+447700900123" c-port 5503
+        ;; Capture this process's own console output (this scenario runs
+        ;; all three nodes in-process, unlike scenario 1's spawned child)
+        ;; so we can prove B's relay decision was real by finding its own
+        ;; DTN-RELAY log line — not an out-of-band cheat, just observing
+        ;; the same log! calls handle-inbound-bundle! makes for real.
+        orig-console-log (.-log js/console)
+        captured-lines (atom [])]
+    (set! (.-log js/console)
+          (fn [& args]
+            (swap! captured-lines conj (apply str args))
+            (apply orig-console-log args)))
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      ;; A has a direct peer entry for B only —
+                                      ;; deliberately NO peer/link entry for C at all.
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}
+                                      ;; ...but DOES have a static configured route:
+                                      ;; "to reach C, go via B".
+                                      :routes [{:dtn/destination (dtn/eid c-e164)
+                                                :dtn/next-hop (dtn/eid b-e164)}]})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port
+                                      ;; B genuinely CAN reach C directly.
+                                      :peers {c-e164 {:host "127.0.0.1" :port c-port}}})
+            node-c (tcp/start-node! {:e164 c-e164 :port c-port :peers {}})
+            delivered? (tcp/send-message! node-a c-e164
+                                           {:rcs/message-id (str (random-uuid))
+                                            :rcs/from a-e164 :rcs/to c-e164
+                                            :rcs/body "relay-scenario-check"
+                                            :rcs/content-type "text/plain"})
+            _ (sleep-ms 500)] ;; let B's relay hop (B -> C) actually land
+      (set! (.-log js/console) orig-console-log)
+      (let [log-output (str/join "\n" @captured-lines)
+            c-arrived? (boolean (some #(= "relay-scenario-check" (get-in % [:message :rcs/body]))
+                                       (:inbox (deref node-c))))
+            b-not-absorbed? (not (some #(= "relay-scenario-check" (get-in % [:message :rcs/body]))
+                                        (:inbox (deref node-b))))
+            b-relay-logged? (and (str/includes? log-output (str "[" b-e164 "] DTN-RELAY"))
+                                  (str/includes? log-output (str "to=" (dtn/eid c-e164))))]
+        (println "  A's :peers has NO entry for C at all — only for B — plus a :routes entry (C -> via B)")
+        (println "  send-message! (A -> C) returned delivered?=" delivered? "(A's wire write to next-hop B)")
+        (println "  C's :inbox actually contains the relayed message?" c-arrived?)
+        (println "  B's :inbox does NOT contain it (correctly relayed, not absorbed as its own)?" b-not-absorbed?)
+        (println "  B logged its own DTN-RELAY line for this bundle (real routing decision, not a cheat)?"
+                  (boolean b-relay-logged?))
+        (doseq [line (str/split-lines log-output)]
+          (when (str/includes? line "DTN-RELAY") (println "   >" line)))
+        (let [pass? (and (boolean delivered?) c-arrived? b-not-absorbed? (boolean b-relay-logged?))]
+          (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b) _ (tcp/stop-node! node-c)]
+            (println (if pass? "PASS" "FAIL")
+                      " scenario 5: static relay routing — A relays via B (router :relay action), B forwards on to C, B's own :inbox untouched")
+            pass?))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 6 — replay protection: per-source :dtn/sequence-number high-water mark
+;; ---------------------------------------------------------------------------
+
+(defn- scenario-6 []
+  (println "\n--- Scenario 6: replay protection (per-source :dtn/sequence-number high-water mark) ---")
+  (let [a-e164 "+819012345678" a-port 5601
+        b-e164 "+818098765432" b-port 5602
+        shared-secret "correct-horse-battery-staple"
+        orig-console-log (.-log js/console)
+        captured-lines (atom [])]
+    (set! (.-log js/console)
+          (fn [& args]
+            (swap! captured-lines conj (apply str args))
+            (apply orig-console-log args)))
+    (p/let [node-a (tcp/start-node! {:e164 a-e164 :port a-port
+                                      :peers {b-e164 {:host "127.0.0.1" :port b-port}}
+                                      :peer-secrets {b-e164 shared-secret}})
+            node-b (tcp/start-node! {:e164 b-e164 :port b-port :peers {}
+                                      :peer-secrets {a-e164 shared-secret}})
+            delivered-1? (tcp/send-message! node-a b-e164
+                                             {:rcs/message-id (str (random-uuid))
+                                              :rcs/from a-e164 :rcs/to b-e164
+                                              :rcs/body "replay-scenario-original"
+                                              :rcs/content-type "text/plain"})
+            _ (sleep-ms 300)]
+      (let [inbox-after-first (:inbox (deref node-b))
+            original-copies (filter #(= "replay-scenario-original" (get-in % [:message :rcs/body]))
+                                     inbox-after-first)
+            original-count (count original-copies)
+            ;; The exact signed bundle B actually decoded off the wire —
+            ;; not a hand-rolled reconstruction — is the most honest thing
+            ;; to resend for a replay attempt: node-b's own :inbox entry
+            ;; carries {:message ... :bundle <the literal bundle map that
+            ;; arrived, :dtn/signature and :dtn/sequence-number included>}.
+            captured-bundle (:bundle (first original-copies))]
+        (println "  original message delivered?=" delivered-1?
+                  " arrived once in B's inbox?" (= 1 original-count)
+                  " captured signed bundle's :dtn/sequence-number=" (:dtn/sequence-number captured-bundle))
+        (p/let [;; Replay: resend the EXACT captured signed bundle over a
+                ;; fresh raw socket — literally the same old signed bytes
+                ;; going back out — bypassing send-message!'s normal
+                ;; fresh-sequence-number stamping entirely.
+                _ (js/Promise.
+                   (fn [resolve _reject]
+                     (let [sock (net/createConnection #js {:host "127.0.0.1" :port b-port})]
+                       (.on sock "connect"
+                            (fn [] (.write sock (tcp/encode-frame captured-bundle) (fn [_err] (resolve true))))))))
+                _ (sleep-ms 300)]
+          (let [inbox-after-replay (:inbox (deref node-b))
+                replay-count (count (filter #(= "replay-scenario-original" (get-in % [:message :rcs/body]))
+                                             inbox-after-replay))
+                log-output (str/join "\n" @captured-lines)
+                replay-rejected-logged? (str/includes? log-output "DTN-REPLAY-REJECTED")
+                replay-blocked? (and (= 1 replay-count) replay-rejected-logged?)]
+            (println "  replayed the EXACT same signed bundle over a raw socket (bypassing send-message!)")
+            (println "  B's inbox copies of the original message after the replay attempt=" replay-count
+                      " (must stay 1 — a replay must not appear as a 2nd delivery)")
+            (println "  DTN-REPLAY-REJECTED logged?" replay-rejected-logged?)
+            (set! (.-log js/console) orig-console-log)
+            (p/let [delivered-2? (tcp/send-message! node-a b-e164
+                                                      {:rcs/message-id (str (random-uuid))
+                                                       :rcs/from a-e164 :rcs/to b-e164
+                                                       :rcs/body "replay-scenario-followup"
+                                                       :rcs/content-type "text/plain"})
+                    _ (sleep-ms 300)]
+              (let [followup-arrived? (boolean (some #(= "replay-scenario-followup" (get-in % [:message :rcs/body]))
+                                                       (:inbox (deref node-b))))
+                    pass? (and (boolean delivered-1?) (= 1 original-count)
+                               replay-blocked?
+                               (boolean delivered-2?) followup-arrived?)]
+                (println "  genuinely NEW message (fresh sequence number) delivered?=" delivered-2?
+                          " arrived in B's inbox?" followup-arrived?
+                          " (must be true — replay rejection must not block legitimate follow-up traffic)")
+                (p/let [_ (tcp/stop-node! node-a) _ (tcp/stop-node! node-b)]
+                  (println (if pass? "PASS" "FAIL")
+                            " scenario 6: replay protection — captured signed bundle rejected on resend, legitimate follow-up still accepted")
+                  pass?)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Driver
+;; ---------------------------------------------------------------------------
+
+(-> (p/let [r1  (scenario-1)
+            r2  (scenario-2)
+            r3  (scenario-3)
+            r4a (scenario-4a)
+            r4b (scenario-4b)
+            r5  (scenario-5)
+            r6  (scenario-6)]
+      (let [results [r1 r2 r3 r4a r4b r5 r6]
+            passed (count (filter true? results))]
+        (println (str "\nRESULT: " passed "/7 scenarios passed"))
+        (js/process.exit (if (= passed 7) 0 1))))
+    (.catch (fn [e]
+              (println "DEMO CRASHED:" e)
+              (js/process.exit 1))))

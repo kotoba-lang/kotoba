@@ -1,0 +1,202 @@
+(ns kotoba.robotics.safety-invariants-test
+  "Invariants a robot-safety policy library has to keep, stated independently
+  of how `kotoba.robotics` currently computes them.
+
+  Almost every assertion here is derived from the vocabulary itself
+  (`action-kinds`, `safety-classes`, `human-sign-off-classes`, `stop-reasons`)
+  rather than from a hand-written list of examples, because the regression
+  this library actually risks is drift: a kind is added to the vocabulary and
+  one of the two places that classify kinds is not updated, and every
+  example-based test stays green because it never mentions the new kind.
+
+  Each `deftest` below is named in `scripts/maturity-loop/mutations.edn` in the
+  superproject, under the `orgs/kotoba-lang/robotics` suite, together with the
+  one edit that makes it go red. A test whose failure has never been observed
+  is not evidence that it holds anything up."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.robotics :as rob]
+            [kotoba.robotics.export :as ex]))
+
+;; ---------------------------------------------------------------------------
+;; Vocabulary coherence — the two places that classify a kind must agree
+;; ---------------------------------------------------------------------------
+
+(deftest hardware-classification-covers-the-whole-kind-vocabulary
+  ;; `actuates-hardware?` carries its own literal set, duplicated from
+  ;; `action-kinds`. Add a kind to the vocabulary and forget the classifier,
+  ;; and the new kind reports "does not actuate hardware" -- which is what the
+  ;; CSV/JSON export writes into the audit record, and what a reader uses to
+  ;; tell a read-only sense from something that moves a motor. Derived from
+  ;; `action-kinds`, so the addition itself is what catches the drift.
+  (testing "every kind except :sense actuates hardware"
+    (is (= (disj rob/action-kinds :sense)
+           (into #{} (filter #(rob/actuates-hardware? {:action/kind %})) rob/action-kinds))))
+  (testing ":sense is the only read-only kind"
+    (is (not (rob/actuates-hardware? {:action/kind :sense})))))
+
+(deftest every-sign-off-class-is-a-constructible-safety-class
+  ;; A sign-off class that is not also a safety class is dead policy: `action`
+  ;; refuses to build an action carrying it, so the sign-off rule can never
+  ;; fire, and nothing anywhere says so out loud.
+  (testing "the sign-off set is a subset of the safety-class set"
+    (is (= #{} (into #{} (remove rob/safety-classes) rob/human-sign-off-classes))))
+  (testing "each sign-off class survives construction and still demands sign-off"
+    (doseq [s rob/human-sign-off-classes]
+      (let [a (rob/action "A" "M" :grasp s)]
+        (is (some? a) (str s " is not a constructible safety class"))
+        (is (rob/requires-sign-off? a) (str s " lost its sign-off requirement"))))))
+
+;; ---------------------------------------------------------------------------
+;; The gate — fail closed, and say which kind of "no" this is
+;; ---------------------------------------------------------------------------
+
+(deftest an-unconfigured-governor-denies-instead-of-permitting
+  ;; The allowed set is an allowlist. When it is empty or absent -- a governor
+  ;; that has not been configured yet, a caller that passed the wrong key --
+  ;; the answer has to be :deny for everything. The failure this pins is the
+  ;; one this workspace keeps meeting: an allowlist quietly reinterpreted as
+  ;; "empty means unrestricted", which turns an unconfigured governor into an
+  ;; open one, and reads as working software until something moves.
+  (doseq [allowed [nil #{} [] '()]
+          k rob/action-kinds
+          s rob/safety-classes]
+    (let [a (rob/action "A" "M" k s)]
+      (is (= :deny (:gate/decision (rob/gate a allowed)))
+          (str "kind " k " / safety " s " / allowed " (pr-str allowed)))
+      (is (false? (rob/action-permitted? a allowed))
+          (str "kind " k " / safety " s " / allowed " (pr-str allowed))))))
+
+(deftest an-unconstructible-action-is-invalid-not-denied
+  ;; `action` returns nil for a kind or class outside the vocabulary. That nil
+  ;; must reach the governor as :invalid, not as :deny. Both are red, but they
+  ;; are different sentences: :deny says policy refused a real action, :invalid
+  ;; says the robot asked for something that is not in the vocabulary at all.
+  ;; An operator reading :deny for a mistyped kind goes looking for the policy
+  ;; that refused it, and there is no such policy.
+  (testing "an unknown kind or class does not construct"
+    (is (nil? (rob/action "A" "M" :teleport :low)))
+    (is (nil? (rob/action "A" "M" :move :extreme))))
+  (testing "the resulting nil is :invalid, and names that as its reason"
+    (let [g (rob/gate (rob/action "A" "M" :teleport :low) rob/safety-classes)]
+      (is (= :invalid (:gate/decision g)))
+      (is (= :not-an-action (:gate/reason g)))))
+  (testing "and it is not permitted"
+    (is (false? (rob/action-permitted? (rob/action "A" "M" :teleport :low)
+                                       rob/safety-classes)))))
+
+(defn- expected-decision
+  "The gate's specification, restated here independently of `rob/gate`: an
+  action is denied when its class is outside the allowlist, held when its
+  class is one a human has to sign off, and permitted otherwise. Written out
+  rather than delegated, so that an implementation which drifts from the
+  specification disagrees with this and not merely with itself."
+  [safety allowed]
+  (cond
+    (not (contains? allowed safety))              :deny
+    (contains? rob/human-sign-off-classes safety) :require-sign-off
+    :else                                         :permit))
+
+(deftest gate-matches-its-specification-for-every-kind-and-class
+  (doseq [allowed [#{:none :low}
+                   #{:none :low :medium}
+                   #{:none :low :medium :high :safety-critical}
+                   #{:safety-critical}
+                   #{:high}]
+          k rob/action-kinds
+          s rob/safety-classes]
+    (let [a    (rob/action "A1" "M1" k s)
+          want (expected-decision s allowed)]
+      (is (= want (:gate/decision (rob/gate a allowed)))
+          (str "kind " k " / safety " s " / allowed " (pr-str allowed)))
+      (is (= (= :permit want) (rob/action-permitted? a allowed))
+          (str "action-permitted? disagrees with gate — kind " k
+               " / safety " s " / allowed " (pr-str allowed))))))
+
+(deftest a-sign-off-action-is-never-permitted-whatever-its-kind
+  ;; This library already had this regression once: `action-permitted?`
+  ;; treated every sign-off-required action as permitted by default. It was
+  ;; fixed, and pinned for :grasp and :actuate -- the two kinds the example
+  ;; tests happen to use. This covers the whole vocabulary, with the class in
+  ;; the allowlist, so the only thing standing between the action and a
+  ;; :permit is the sign-off rule itself.
+  (doseq [k rob/action-kinds
+          s rob/human-sign-off-classes]
+    (let [a (rob/action "A" "M" k s)]
+      (is (= :require-sign-off (:gate/decision (rob/gate a rob/safety-classes)))
+          (str k " / " s))
+      (is (false? (rob/action-permitted? a rob/safety-classes))
+          (str k " / " s " was waved through")))))
+
+;; ---------------------------------------------------------------------------
+;; Safety-stop
+;; ---------------------------------------------------------------------------
+
+(deftest every-declared-stop-reason-round-trips
+  ;; A reason dropped from `stop-reasons` makes `safety-stop` return nil for
+  ;; it, and a nil safety-stop is a halt with nothing to append to the ledger:
+  ;; the robot stops and the audit trail cannot say why.
+  (doseq [r rob/stop-reasons]
+    (let [s (rob/safety-stop "M1" r :source "operator")]
+      (is (some? s) (str r " did not construct"))
+      (is (= r (:stop/reason s)))
+      (is (= "M1" (:stop/mission s)))))
+  (testing "a reason outside the vocabulary does not construct"
+    (is (nil? (rob/safety-stop "M1" :for-fun)))))
+
+;; ---------------------------------------------------------------------------
+;; Export — the audit record has to carry each action's own answers
+;; ---------------------------------------------------------------------------
+
+(defn- csv-rows
+  "Read an export back as a vector of column->value maps. The fixtures below
+  carry no commas, quotes or newlines, so a plain split is a faithful reader
+  for them; the quoting rules themselves are covered in export_test."
+  [csv]
+  (let [[header & rows] (str/split-lines csv)
+        ks (str/split header #",")]
+    (mapv #(zipmap ks (str/split % #",")) rows)))
+
+(deftest exported-rows-carry-each-actions-own-answers
+  ;; The document-wide greps in export_test cannot distinguish a correct
+  ;; export from one whose every data row is wrong: #"yes" is satisfied by any
+  ;; row, and #"requires_sign_off" is satisfied by the HEADER LINE, which is
+  ;; present whatever the rows say. These read the row belonging to the action
+  ;; they name.
+  (let [as      [(rob/action "A1" "M1" :sense :none)
+                 (rob/action "A2" "M1" :move :low)
+                 (rob/action "A3" "M1" :grasp :safety-critical)
+                 (rob/action "A4" "M1" :actuate :high)]
+        allowed #{:none :low :safety-critical}
+        by-id   (into {} (map (juxt #(get % "action_id") identity))
+                      (csv-rows (ex/actions->csv as allowed)))]
+    (testing "one row per action, and no more"
+      (is (= #{"A1" "A2" "A3" "A4"} (set (keys by-id)))))
+    (testing ":sense is the only row that does not actuate hardware"
+      (is (= "no"  (get-in by-id ["A1" "actuates_hardware"])))
+      (is (= "yes" (get-in by-id ["A2" "actuates_hardware"])))
+      (is (= "yes" (get-in by-id ["A3" "actuates_hardware"])))
+      (is (= "yes" (get-in by-id ["A4" "actuates_hardware"]))))
+    (testing "the sign-off column is per row, not per document"
+      (is (= "no"  (get-in by-id ["A2" "requires_sign_off"])))
+      (is (= "yes" (get-in by-id ["A3" "requires_sign_off"])))
+      (is (= "yes" (get-in by-id ["A4" "requires_sign_off"]))))
+    (testing "the gate column records this action's decision under this allowlist"
+      (is (= "permit"           (get-in by-id ["A1" "gate"])))
+      (is (= "permit"           (get-in by-id ["A2" "gate"])))
+      (is (= "require-sign-off" (get-in by-id ["A3" "gate"])))
+      ;; :high is outside `allowed`, so it is denied before sign-off is reached
+      (is (= "deny"             (get-in by-id ["A4" "gate"]))))))
+
+(deftest exported-json-carries-each-actions-own-answers
+  (let [as [(rob/action "A2" "M1" :move :low)
+            (rob/action "A3" "M1" :grasp :safety-critical)]
+        j  (ex/actions->json as #{:none :low :safety-critical})]
+    (is (str/includes? j (str "{\"action_id\":\"A2\",\"mission\":\"M1\",\"kind\":\"move\","
+                              "\"safety\":\"low\",\"actuates_hardware\":true,"
+                              "\"requires_sign_off\":false,\"gate\":\"permit\"}"))
+        j)
+    (is (str/includes? j (str "{\"action_id\":\"A3\",\"mission\":\"M1\",\"kind\":\"grasp\","
+                              "\"safety\":\"safety-critical\",\"actuates_hardware\":true,"
+                              "\"requires_sign_off\":true,\"gate\":\"require-sign-off\"}"))
+        j)))

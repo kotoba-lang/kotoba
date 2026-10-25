@@ -1,0 +1,199 @@
+(ns libp2p.transport-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [libp2p.multistream :as ms]
+            [libp2p.yamux :as y]))
+
+;; ── multistream-select ────────────────────────────────────────────────────
+
+(deftest the-newline-is-inside-the-length
+  ;; The single most common multistream bug, and it presents as the peer
+  ;; speaking an unknown protocol rather than as a framing error.
+  (let [e (ms/encode "/noise")]
+    (is (= 7 (first e)) "6 characters plus the newline")
+    (is (= 0x0A (last e)))
+    (is (= 8 (count e)) "one length octet plus seven"))
+  (is (= "/noise" (:message (ms/decode (ms/encode "/noise"))))))
+
+(deftest a-message-without-its-newline-is-refused
+  ;; varint 6, then "/noise" with no \n.
+  (let [bad (into [6] (map int "/noise"))]
+    (is (= :missing-newline (:error (ms/decode bad))))))
+
+(deftest a-short-buffer-asks-for-more-rather-than-failing
+  ;; A stream reader gets partial reads constantly; treating one as an error
+  ;; would fail every connection split across two packets.
+  (let [e (ms/encode "/ipfs/kad/1.0.0")]
+    (doseq [n (range 1 (count e))]
+      (let [r (ms/decode (subvec e 0 n))]
+        (is (nil? (:message r)) (str "prefix of " n))
+        (is (nil? (:error r)))
+        (is (some? (:rest r)))))
+    (is (= "/ipfs/kad/1.0.0" (:message (ms/decode e))))))
+
+(deftest an-absurd-declared-length-is-refused-before-allocation
+  (is (= :message-too-long (:error (ms/decode [0xFF 0xFF 0xFF 0x7F]))))
+  (testing "a protocol name is tens of octets; nothing legitimate is near the bound"
+    (is (:message (ms/decode (ms/encode (apply str (repeat 200 "a"))))))))
+
+(deftest several-messages-drain-from-one-buffer
+  (let [buf (into (ms/encode ms/protocol-id) (ms/encode "/noise"))
+        {:keys [messages rest]} (ms/decode-all buf)]
+    (is (= [ms/protocol-id "/noise"] messages))
+    (is (empty? rest))))
+
+(deftest the-dialer-sends-the-header-and-its-first-proposal-together
+  ;; One round trip per layer instead of two, and there are three layers.
+  (let [{:keys [out]} (ms/dialer-start (ms/dialer ["/noise" "/tls"]))
+        {:keys [messages]} (ms/decode-all out)]
+    (is (= [ms/protocol-id "/noise"] messages))))
+
+(deftest negotiation-agrees-on-the-dialers-first-choice-both-sides-support
+  (is (= {:protocol "/noise"}
+         (ms/negotiate (ms/dialer ["/noise" "/tls"]) (ms/listener #{"/noise" "/tls"})))))
+
+(deftest order-is-the-whole-of-the-preference-expression
+  (is (= {:protocol "/tls"}
+         (ms/negotiate (ms/dialer ["/tls" "/noise"]) (ms/listener #{"/noise" "/tls"})))
+      "no scoring, no negotiation beyond the order the dialer listed"))
+
+(deftest na-moves-the-dialer-to-its-next-choice
+  (is (= {:protocol "/tls"}
+         (ms/negotiate (ms/dialer ["/noise" "/tls"]) (ms/listener #{"/tls"})))))
+
+(deftest no-common-protocol-fails-with-a-reason
+  (let [r (ms/negotiate (ms/dialer ["/noise"]) (ms/listener #{"/tls"}))]
+    (is (= :no-common-protocol (:failed r)))
+    (is (re-find #"/noise" (:detail r)))))
+
+(deftest the-echo-is-the-acceptance
+  ;; There is no ok. A responder that sends anything else has ended the
+  ;; negotiation, and a dialer that treats an unexpected message as success
+  ;; proceeds to speak a protocol nobody agreed to.
+  (let [d (:dialer (ms/dialer-start (ms/dialer ["/noise"])))
+        d (:dialer (ms/dialer-recv d ms/protocol-id))]
+    (is (= "/noise" (:done (ms/dialer-recv d "/noise"))))
+    (is (= :unexpected-message (:failed (ms/dialer-recv d "ok"))))
+    (is (= :unexpected-message (:failed (ms/dialer-recv d "/tls"))))))
+
+(deftest a-peer-that-does-not-open-with-the-header-is-not-multistream
+  (let [d (:dialer (ms/dialer-start (ms/dialer ["/noise"])))]
+    (is (= :not-multistream (:failed (ms/dialer-recv d "hello")))))
+  (is (= :not-multistream (:failed (ms/listener-recv (ms/listener #{"/noise"}) "hello")))))
+
+(deftest ls-is-answered-na-rather-than-enumerating-what-we-speak
+  (let [l (:listener (ms/listener-recv (ms/listener #{"/noise"}) ms/protocol-id))
+        r (ms/listener-recv l ms/ls)]
+    (is (= :ls (:refused r)))
+    (is (= [ms/na] (:messages (ms/decode-all (:out r))))
+        "free reconnaissance, and every real negotiation works without it")))
+
+;; ── yamux ─────────────────────────────────────────────────────────────────
+
+(deftest the-header-is-twelve-octets
+  (let [h (y/header {:type :data :flags #{:syn} :stream-id 1 :length 0})]
+    (is (= 12 (count h)))
+    (is (= 0 (nth h 0)) "version")
+    (is (= 0 (nth h 1)) "DATA")
+    (is (= [0 1] (subvec h 2 4)) "SYN")
+    (is (= [0 0 0 1] (subvec h 4 8)) "stream 1")
+    (is (= [0 0 0 0] (subvec h 8 12)))))
+
+(deftest length-means-a-byte-count-only-for-data
+  ;; The overloading that desynchronizes a connection permanently: reading
+  ;; `length` octets after a WINDOW_UPDATE consumes the next frame's header as
+  ;; payload, with no error, because the bytes are structurally valid.
+  (let [wu (y/window-update 1 #{} 65536)
+        next-frame (y/data-frame 1 #{} [0xAA 0xBB])
+        buf (into wu next-frame)
+        {:keys [frames rest]} (y/decode-all buf)]
+    (is (= 12 (count wu)) "header only — nothing follows a window update")
+    (is (= 2 (count frames)))
+    (is (= :window-update (:type (first frames))))
+    (is (= 65536 (:length (first frames))) "a credit delta, not a byte count")
+    (is (= [0xAA 0xBB] (:payload (second frames))))
+    (is (empty? rest))))
+
+(deftest a-data-frame-round-trips-with-its-payload
+  (let [f (y/data-frame 3 #{:syn} [1 2 3 4 5])
+        {:keys [frame rest]} (y/decode f)]
+    (is (= :data (:type frame)))
+    (is (= 3 (:stream-id frame)))
+    (is (= #{:syn} (:flags frame)))
+    (is (= [1 2 3 4 5] (:payload frame)))
+    (is (empty? rest))))
+
+(deftest a-partial-data-frame-waits
+  (let [f (y/data-frame 1 #{} [1 2 3 4 5])]
+    (is (nil? (:frame (y/decode (subvec f 0 11)))) "header incomplete")
+    (is (nil? (:frame (y/decode (subvec f 0 14)))) "payload incomplete")
+    (is (some? (:frame (y/decode f))))))
+
+(deftest stream-ids-encode-who-opened-the-stream
+  ;; The entire collision-avoidance mechanism. Without it both ends eventually
+  ;; pick the same ID for different streams and each reads the other's data.
+  (let [d (y/session :dialer) l (y/session :listener)]
+    (is (= 1 (:stream-id (y/open-stream d))))
+    (is (= 3 (:stream-id (y/open-stream (:session (y/open-stream d))))))
+    (is (= 2 (:stream-id (y/open-stream l))))
+    (testing "and each side rejects a peer opening with its own parity"
+      (is (y/valid-peer-id? d 2))
+      (is (not (y/valid-peer-id? d 1)) "a dialer must never see the peer open an odd stream")
+      (is (y/valid-peer-id? l 1))
+      (is (not (y/valid-peer-id? l 2)))
+      (is (not (y/valid-peer-id? d 0)) "0 is reserved for session frames"))))
+
+(deftest a-ping-is-always-stream-zero
+  (let [{:keys [frame]} (y/decode (y/ping 42))]
+    (is (= :ping (:type frame)))
+    (is (= 0 (:stream-id frame))
+        "a ping on a real stream ID is a frame the peer routes to that stream")
+    (is (= 42 (:length frame)) "the opaque value, not a byte count")))
+
+(deftest flow-control-refuses-an-oversized-send
+  (let [{:keys [session stream-id]} (y/open-stream (y/session :dialer))]
+    (is (y/can-send? session stream-id y/initial-window))
+    (is (not (y/can-send? session stream-id (inc y/initial-window))))
+    (let [s (y/record-sent session stream-id y/initial-window)]
+      (is (not (y/can-send? s stream-id 1)) "the window is spent")
+      (testing "and a window update from the peer restores it"
+        (is (y/can-send? (y/apply-window-update s stream-id 1000) stream-id 1000))))))
+
+(deftest credit-is-returned-lazily-not-per-frame
+  (let [{:keys [session stream-id]} (y/open-stream (y/session :dialer))
+        small (y/record-received session stream-id 100)]
+    (is (nil? (:out small)) "one update per packet would be its own flood")
+    (let [big (y/record-received session stream-id (inc (quot y/initial-window 2)))]
+      (is (some? (:out big)))
+      (let [{:keys [frame]} (y/decode (:out big))]
+        (is (= :window-update (:type frame)))
+        (is (pos? (:length frame)))))))
+
+(deftest fin-is-a-half-close-not-a-close
+  ;; Treating FIN as a full close drops data the peer was entitled to send.
+  (let [{:keys [session stream-id]} (y/open-stream (y/session :dialer))
+        {:keys [session out]} (y/close-stream session stream-id)]
+    (is (= :half-closed (y/stream-state session stream-id)))
+    (is (= #{:fin} (:flags (:frame (y/decode out)))))
+    (is (contains? (set (y/open-stream-ids session)) stream-id)
+        "the stream is still there; the peer may still send to us")))
+
+(deftest reset-removes-the-stream
+  (let [{:keys [session stream-id]} (y/open-stream (y/session :dialer))
+        {:keys [session out]} (y/reset-stream session stream-id)]
+    (is (nil? (y/stream-state session stream-id)))
+    (is (= #{:rst} (:flags (:frame (y/decode out)))))))
+
+(deftest a-frame-with-an-unknown-version-or-type-is-refused
+  (is (= :bad-version (:error (y/decode (assoc (y/header {:type :data}) 0 9)))))
+  (is (= :unknown-type (:error (y/decode (assoc (y/header {:type :data}) 1 0x7F))))))
+
+(deftest many-streams-interleave-on-one-connection
+  ;; The whole reason a muxer exists: without it each of these needs its own
+  ;; TCP handshake, Noise handshake and NAT entry.
+  (let [buf (-> (y/data-frame 1 #{} [1])
+                (into (y/data-frame 3 #{} [2]))
+                (into (y/data-frame 1 #{} [3]))
+                (into (y/window-update 3 #{} 100)))
+        {:keys [frames]} (y/decode-all buf)]
+    (is (= [1 3 1 3] (mapv :stream-id frames)))
+    (is (= [[1] [2] [3] nil] (mapv :payload frames)))))

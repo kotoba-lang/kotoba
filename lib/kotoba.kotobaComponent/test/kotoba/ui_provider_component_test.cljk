@@ -1,0 +1,467 @@
+(ns kotoba.ui-provider-component-test
+  "W5 remaining wasm packaging: synthetic ui-v1 dual-export component provider.
+   Multi-step Wasmtime: commit sequence and commit+next-event dual-export walk."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.component.composition :as composition]
+            [kotoba.component.core :as component-core]
+            [kotoba.wasm.tools :as wasm-tools])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(def ^:private wasmtime-binary
+  (let [pinned (io/file ".tools" "wasmtime" "wasmtime")]
+    (if (io/can-execute? pinned) (io/path pinned) "wasmtime")))
+
+(defn- ref-ify-record
+  [descriptor]
+  (let [schemas (atom {})]
+    (letfn [(walk [d]
+              (cond
+                (and (vector? d) (= :record (first d)))
+                (let [[_ name fields] d
+                      walked (mapv (fn [[f t]] [f (walk t)]) fields)
+                      rec [:record name walked]]
+                  (swap! schemas assoc name rec)
+                  [:ref name])
+                (and (vector? d) (#{:set :list :option} (first d)))
+                [(first d) (walk (second d))]
+                :else d))]
+      (let [root (walk descriptor)]
+        {:descriptor root :schemas @schemas}))))
+
+(defn- ui-v1-descriptors
+  []
+  (let [node [:record :kotoba.ui/node
+              [[:id :keyword] [:parent [:option :keyword]]
+               [:kind :keyword] [:text :string]]]
+        commit-req-raw
+        [:record :kotoba.ui/commit-request
+         [[:base-revision :i64] [:nodes [:set node]]]]
+        commit-res-raw
+        [:record :kotoba.ui/commit-result
+         [[:revision :i64] [:node-count :i64]]]
+        event-req-raw
+        [:record :kotoba.ui/event-request [[:after-revision :i64]]]
+        event-raw
+        [:record :kotoba.ui/event
+         [[:revision :i64] [:target :keyword] [:kind :keyword] [:value :string]]]
+        commit-req (ref-ify-record commit-req-raw)
+        commit-res (ref-ify-record commit-res-raw)
+        event-req (ref-ify-record event-req-raw)
+        event (ref-ify-record event-raw)
+        schemas (merge (:schemas commit-req) (:schemas commit-res)
+                       (:schemas event-req) (:schemas event))]
+    {:commit-req (:descriptor commit-req)
+     :commit-res (:descriptor commit-res)
+     :event-req (:descriptor event-req)
+     :event-res [:option (:descriptor event)]
+     :schemas schemas}))
+
+(deftest ui-provider-rejects-wrong-shape
+  (let [d (ui-v1-descriptors)
+        bad (assoc (:schemas d)
+                   :kotoba.ui/commit-result
+                   [:record :kotoba.ui/commit-result [[:revision :bool]]])]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"ui-v1's own literal request/result shapes"
+         (composition/package-ui-provider
+          (:commit-req d) (:commit-res d)
+          (:event-req d) (:event-res d)
+          bad)))))
+
+(deftest ui-provider-packages-and-validates
+  (let [d (ui-v1-descriptors)
+        provider (composition/package-ui-provider
+                  (:commit-req d) (:commit-res d)
+                  (:event-req d) (:event-res d)
+                  (:schemas d))]
+    (is (= :wasm-component-provider/v1 (:format provider)))
+    (is (= :ui/commit (:capability provider)))
+    (is (= [:ui/commit :ui/next-event :ui-host/enqueue] (:capabilities provider)))
+    (is (= [0 97 115 109 13 0 1 0]
+           (mapv #(bit-and (int %) 0xff) (take 8 (:bytes provider)))))
+    (let [dir (java.nio.file.Files/createTempDirectory
+               "ui-provider-validate-"
+               (make-array java.nio.file.attribute.FileAttribute 0))
+          path (.resolve dir "provider.component.wasm")]
+      (try
+        (java.nio.file.Files/write path (:bytes provider)
+                                   (make-array java.nio.file.OpenOption 0))
+        (is (string? (wasm-tools/run-command! ["wasm-tools" "validate" (str path)])))
+        (finally
+          (java.nio.file.Files/deleteIfExists path)
+          (java.nio.file.Files/deleteIfExists dir))))))
+
+(deftest ui-provider-wat-exports-commit-and-event
+  (let [d (ui-v1-descriptors)
+        wat (component-core/ui-provider-wat
+             {:interface "ui" :function "commit"}
+             {:interface "ui" :function "next-event"}
+             (:commit-req d) (:commit-res d)
+             (:event-req d) (:event-res d)
+             (:schemas d))]
+    (is (re-find #"cm32p2\|kotoba:application/ui@1\|commit" wat))
+    (is (re-find #"cm32p2\|kotoba:application/ui@1\|next-event" wat))
+    (is (re-find #"global \$rev" wat))))
+
+(defn- ui-commit-sequence-driver-wit
+  "Application WIT importing ui.commit only; exports scalar multi-step run."
+  []
+  (str
+   "package kotoba:application@1.0.0;\n\n"
+   "interface types {\n"
+   "  record kotoba-ui-node {\n"
+   "    id: string,\n"
+   "    parent: option<string>,\n"
+   "    kind: string,\n"
+   "    text: string,\n"
+   "  }\n"
+   "  record kotoba-ui-commit-request {\n"
+   "    base-revision: s64,\n"
+   "    nodes: list<kotoba-ui-node>,\n"
+   "  }\n"
+   "  record kotoba-ui-commit-result {\n"
+   "    revision: s64,\n"
+   "    node-count: s64,\n"
+   "  }\n"
+   "}\n\n"
+   "interface ui {\n"
+   "  use types.{kotoba-ui-commit-request, kotoba-ui-commit-result};\n"
+   "  commit: func(request: kotoba-ui-commit-request) -> kotoba-ui-commit-result;\n"
+   "}\n\n"
+   "world driver {\n"
+   "  import ui;\n"
+   "  export run: func() -> s64;\n"
+   "}\n"))
+
+(defn- ui-commit-sequence-driver-wat
+  "Two empty commits with advancing base-revision; return (rev2 - rev1).
+  Canonical ABI: MAX_FLAT_RESULTS=1 so record{s64,s64} uses retptr as last
+  param (base-rev i64, nodes ptr/len i32, retptr i32) -> [].
+  revision sits at retptr + 0."
+  []
+  (let [mod "cm32p2|kotoba:application/ui@1"
+        export-run "cm32p2||run"
+        r1-base 64
+        r2-base 128]
+    (str
+     "(module\n"
+     "  (import \"" mod "\" \"commit\""
+     " (func $commit (param i64 i32 i32 i32)))\n"
+     "  (memory (export \"cm32p2_memory\") 1 1)\n"
+     "  (func (export \"cm32p2_realloc\")\n"
+     "    (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32)\n"
+     "    (result i32)\n"
+     "    local.get $old i32.eqz if (result i32) i32.const 256 else local.get $old end)\n"
+     "  (func (export \"" export-run "\") (result i64)\n"
+     "    (local $r1 i64) (local $r2 i64)\n"
+     ;; commit base-rev=0, empty nodes → revision 1
+     "    i64.const 0 i32.const 0 i32.const 0 i32.const " r1-base " call $commit\n"
+     "    i32.const " r1-base " i64.load offset=0 local.set $r1\n"
+     ;; commit base-rev=1, empty nodes → revision 2
+     "    i64.const 1 i32.const 0 i32.const 0 i32.const " r2-base " call $commit\n"
+     "    i32.const " r2-base " i64.load offset=0 local.set $r2\n"
+     "    local.get $r2 local.get $r1 i64.sub)\n"
+     "  (func (export \"" export-run "_post\") (param i64))\n"
+     "  (func (export \"cm32p2_initialize\"))\n"
+     ")\n")))
+
+(defn- package-ui-commit-sequence-driver
+  []
+  (let [dir (Files/createTempDirectory "kotoba-ui-commit-sequence-driver-"
+                                       (make-array FileAttribute 0))
+        world (.resolve dir "driver.wit")
+        core (.resolve dir "driver.wasm")
+        embedded (.resolve dir "embedded.wasm")
+        component (.resolve dir "driver.component.wasm")]
+    (try
+      (Files/writeString world (ui-commit-sequence-driver-wit)
+                         (make-array java.nio.file.OpenOption 0))
+      (Files/write core (wasm-tools/parse-wat (ui-commit-sequence-driver-wat))
+                   (make-array java.nio.file.OpenOption 0))
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "embed" (str world) (str core)
+        "--encoding" "utf8" "-o" (str embedded)])
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "new" (str embedded)
+        "--reject-legacy-names" "-o" (str component)])
+      {:format :wasm-component/v1
+       :imports [:ui/commit]
+       :bytes (Files/readAllBytes component)}
+      (finally
+        (doseq [path [component embedded core world]]
+          (Files/deleteIfExists path))
+        (Files/deleteIfExists dir)))))
+
+(deftest ui-commit-sequence-driver-closes-and-wasmtime-advances-revision
+  "Multi-step deepen (ADR 0104): compose real ui provider with a driver that
+   performs two empty commits; Wasmtime returns revision delta 1."
+  (let [d (ui-v1-descriptors)
+        provider (composition/package-ui-provider
+                  (:commit-req d) (:commit-res d)
+                  (:event-req d) (:event-res d)
+                  (:schemas d))
+        driver (package-ui-commit-sequence-driver)
+        closed (composition/compose-closed driver [provider])
+        path (Files/createTempFile "kotoba-ui-commit-sequence-" ".wasm"
+                                   (make-array FileAttribute 0))]
+    (try
+      (is (= :wasm-component-closed/v1 (:format closed)))
+      (is (= [:ui/commit] (:application-imports closed)))
+      (Files/write path ^bytes (:bytes closed)
+                   (make-array java.nio.file.OpenOption 0))
+      (is (string? (wasm-tools/run-command! ["wasm-tools" "validate" (str path)])))
+      (let [run (shell/sh wasmtime-binary "run" "--invoke" "run()" (str path))]
+        (is (zero? (:exit run)) (str "wasmtime err: " (:err run)))
+        (is (= "1" (str/trim (:out run)))))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(defn- ui-commit-event-sequence-driver-wit
+  "Application WIT importing ui.commit + ui.next-event; multi-step walk."
+  []
+  (str
+   "package kotoba:application@1.0.0;\n\n"
+   "interface types {\n"
+   "  record kotoba-ui-node {\n"
+   "    id: string,\n"
+   "    parent: option<string>,\n"
+   "    kind: string,\n"
+   "    text: string,\n"
+   "  }\n"
+   "  record kotoba-ui-commit-request {\n"
+   "    base-revision: s64,\n"
+   "    nodes: list<kotoba-ui-node>,\n"
+   "  }\n"
+   "  record kotoba-ui-commit-result {\n"
+   "    revision: s64,\n"
+   "    node-count: s64,\n"
+   "  }\n"
+   "  record kotoba-ui-event-request {\n"
+   "    after-revision: s64,\n"
+   "  }\n"
+   "  record kotoba-ui-event {\n"
+   "    revision: s64,\n"
+   "    target: string,\n"
+   "    kind: string,\n"
+   "    value: string,\n"
+   "  }\n"
+   "}\n\n"
+   "interface ui {\n"
+   "  use types.{kotoba-ui-commit-request, kotoba-ui-commit-result,\n"
+   "             kotoba-ui-event-request, kotoba-ui-event};\n"
+   "  commit: func(request: kotoba-ui-commit-request) -> kotoba-ui-commit-result;\n"
+   "  next-event: func(request: kotoba-ui-event-request) -> option<kotoba-ui-event>;\n"
+   "}\n\n"
+   "world driver {\n"
+   "  import ui;\n"
+   "  export run: func() -> s64;\n"
+   "}\n"))
+
+(defn- ui-commit-event-sequence-driver-wat
+  "One empty commit (base-rev 0) then next-event (after-rev 0).
+  Return revision + none-count: rev=1, next-event always none (disc 0) → 2.
+  Requires dual-export compose-closed (ADR 0111)."
+  []
+  (let [mod "cm32p2|kotoba:application/ui@1"
+        export-run "cm32p2||run"
+        commit-ret 64
+        event-ret 128]
+    (str
+     "(module\n"
+     "  (import \"" mod "\" \"commit\""
+     " (func $commit (param i64 i32 i32 i32)))\n"
+     "  (import \"" mod "\" \"next-event\""
+     " (func $next-event (param i64 i32)))\n"
+     "  (memory (export \"cm32p2_memory\") 1 1)\n"
+     "  (func (export \"cm32p2_realloc\")\n"
+     "    (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32)\n"
+     "    (result i32)\n"
+     "    local.get $old i32.eqz if (result i32) i32.const 256 else local.get $old end)\n"
+     "  (func (export \"" export-run "\") (result i64)\n"
+     "    (local $rev i64) (local $disc i32)\n"
+     ;; commit base-rev=0, empty nodes
+     "    i64.const 0 i32.const 0 i32.const 0 i32.const " commit-ret " call $commit\n"
+     "    i32.const " commit-ret " i64.load offset=0 local.set $rev\n"
+     ;; next-event after-rev=0 → option none
+     "    i64.const 0 i32.const " event-ret " call $next-event\n"
+     "    i32.const " event-ret " i32.load8_u offset=0 local.set $disc\n"
+     ;; rev + (1 - disc) when disc is 0 for none
+     "    local.get $rev\n"
+     "    i32.const 1 local.get $disc i32.sub i64.extend_i32_s\n"
+     "    i64.add)\n"
+     "  (func (export \"" export-run "_post\") (param i64))\n"
+     "  (func (export \"cm32p2_initialize\"))\n"
+     ")\n")))
+
+(defn- package-ui-commit-event-sequence-driver
+  []
+  (let [dir (Files/createTempDirectory "kotoba-ui-commit-event-sequence-driver-"
+                                       (make-array FileAttribute 0))
+        world (.resolve dir "driver.wit")
+        core (.resolve dir "driver.wasm")
+        embedded (.resolve dir "embedded.wasm")
+        component (.resolve dir "driver.component.wasm")]
+    (try
+      (Files/writeString world (ui-commit-event-sequence-driver-wit)
+                         (make-array java.nio.file.OpenOption 0))
+      (Files/write core (wasm-tools/parse-wat (ui-commit-event-sequence-driver-wat))
+                   (make-array java.nio.file.OpenOption 0))
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "embed" (str world) (str core)
+        "--encoding" "utf8" "-o" (str embedded)])
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "new" (str embedded)
+        "--reject-legacy-names" "-o" (str component)])
+      {:format :wasm-component/v1
+       :imports [:ui/commit :ui/next-event]
+       :bytes (Files/readAllBytes component)}
+      (finally
+        (doseq [path [component embedded core world]]
+          (Files/deleteIfExists path))
+        (Files/deleteIfExists dir)))))
+
+(deftest ui-commit-event-sequence-driver-closes-and-wasmtime-returns-rev-plus-none
+  "Multi-step deepen (ADR 0113): dual-export commit then next-event;
+   Wasmtime returns rev(1)+none(1)=2."
+  (let [d (ui-v1-descriptors)
+        provider (composition/package-ui-provider
+                  (:commit-req d) (:commit-res d)
+                  (:event-req d) (:event-res d)
+                  (:schemas d))
+        driver (package-ui-commit-event-sequence-driver)
+        closed (composition/compose-closed driver [provider])
+        path (Files/createTempFile "kotoba-ui-commit-event-sequence-" ".wasm"
+                                   (make-array FileAttribute 0))]
+    (try
+      (is (= :wasm-component-closed/v1 (:format closed)))
+      (is (= [:ui/commit :ui/next-event] (:application-imports closed)))
+      (Files/write path ^bytes (:bytes closed)
+                   (make-array java.nio.file.OpenOption 0))
+      (is (string? (wasm-tools/run-command! ["wasm-tools" "validate" (str path)])))
+      (let [run (shell/sh wasmtime-binary "run" "--invoke" "run()" (str path))]
+        (is (zero? (:exit run)) (str "wasmtime err: " (:err run)))
+        (is (= "2" (str/trim (:out run)))))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(defn- wat-data [bytes]
+  (apply str (map #(format "\\%02x" (bit-and (int %) 0xff)) bytes)))
+
+(defn- ui-enqueue-event-driver-wit []
+  (str
+   "package kotoba:application@1.0.0;\n\n"
+   "interface types {\n"
+   "  record kotoba-ui-node {\n"
+   "    id: string, parent: option<string>, kind: string, text: string,\n"
+   "  }\n"
+   "  record kotoba-ui-commit-request { base-revision: s64, nodes: list<kotoba-ui-node>, }\n"
+   "  record kotoba-ui-commit-result { revision: s64, node-count: s64, }\n"
+   "  record kotoba-ui-event-request { after-revision: s64, }\n"
+   "  record kotoba-ui-event {\n"
+   "    revision: s64, target: string, kind: string, value: string,\n"
+   "  }\n"
+   "}\n\n"
+   "interface ui {\n"
+   "  use types.{kotoba-ui-commit-request, kotoba-ui-commit-result,\n"
+   "             kotoba-ui-event-request, kotoba-ui-event};\n"
+   "  commit: func(request: kotoba-ui-commit-request) -> kotoba-ui-commit-result;\n"
+   "  next-event: func(request: kotoba-ui-event-request) -> option<kotoba-ui-event>;\n"
+   "}\n\n"
+   "interface ui-host {\n"
+   "  use types.{kotoba-ui-event};\n"
+   "  enqueue: func(event: kotoba-ui-event);\n"
+   "}\n\n"
+   "world driver {\n"
+   "  import ui;\n"
+   "  import ui-host;\n"
+   "  export run: func() -> s64;\n"
+   "}\n"))
+
+(defn- ui-enqueue-event-driver-wat []
+  (let [ui "cm32p2|kotoba:application/ui@1"
+        host "cm32p2|kotoba:application/ui-host@1"
+        target-bytes (vec (kbytes/utf8-bytes "btn"))
+        kind-bytes (vec (kbytes/utf8-bytes "click"))
+        value-bytes (vec (kbytes/utf8-bytes "x"))
+        tptr 8
+        kptr (+ tptr (count target-bytes))
+        vptr (+ kptr (count kind-bytes))
+        event-ret 128]
+    (str
+     "(module\n"
+     "  (import \"" ui "\" \"next-event\" (func $next-event (param i64 i32)))\n"
+     "  (import \"" host "\" \"enqueue\""
+     " (func $enqueue (param i64 i32 i32 i32 i32 i32 i32)))\n"
+     "  (memory (export \"cm32p2_memory\") 1 1)\n"
+     "  (func (export \"cm32p2_realloc\")\n"
+     "    (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32)\n"
+     "    (result i32)\n"
+     "    local.get $old i32.eqz if (result i32) i32.const 256 else local.get $old end)\n"
+     "  (func (export \"cm32p2||run\") (result i64)\n"
+     "    (local $disc i32)\n"
+     "    i64.const 7\n"
+     "    i32.const " tptr " i32.const " (count target-bytes) "\n"
+     "    i32.const " kptr " i32.const " (count kind-bytes) "\n"
+     "    i32.const " vptr " i32.const " (count value-bytes) "\n"
+     "    call $enqueue\n"
+     "    i64.const 0 i32.const " event-ret " call $next-event\n"
+     "    i32.const " event-ret " i32.load8_u offset=0 local.set $disc\n"
+     "    local.get $disc i32.eqz if (result i64) i64.const 0\n"
+     "    else i32.const " event-ret " i64.load offset=8 end)\n"
+     "  (func (export \"cm32p2||run_post\") (param i64))\n"
+     "  (func (export \"cm32p2_initialize\"))\n"
+     "  (data (i32.const " tptr ") \"" (wat-data target-bytes) "\")\n"
+     "  (data (i32.const " kptr ") \"" (wat-data kind-bytes) "\")\n"
+     "  (data (i32.const " vptr ") \"" (wat-data value-bytes) "\")\n"
+     ")\n")))
+
+(defn- package-ui-enqueue-event-driver []
+  (let [dir (Files/createTempDirectory "kotoba-ui-enqueue-event-driver-"
+                                       (make-array FileAttribute 0))
+        world (.resolve dir "driver.wit")
+        core (.resolve dir "driver.wasm")
+        embedded (.resolve dir "embedded.wasm")
+        component (.resolve dir "driver.component.wasm")]
+    (try
+      (Files/writeString world (ui-enqueue-event-driver-wit)
+                         (make-array java.nio.file.OpenOption 0))
+      (Files/write core (wasm-tools/parse-wat (ui-enqueue-event-driver-wat))
+                   (make-array java.nio.file.OpenOption 0))
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "embed" (str world) (str core)
+        "--encoding" "utf8" "-o" (str embedded)])
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "new" (str embedded)
+        "--reject-legacy-names" "-o" (str component)])
+      {:format :wasm-component/v1
+       :imports [:ui/next-event :ui-host/enqueue]
+       :bytes (Files/readAllBytes component)}
+      (finally
+        (doseq [path [component embedded core world]]
+          (Files/deleteIfExists path))
+        (Files/deleteIfExists dir)))))
+
+(deftest ui-host-enqueue-then-next-event-returns-the-injected-revision
+  (let [d (ui-v1-descriptors)
+        provider (composition/package-ui-provider
+                  (:commit-req d) (:commit-res d)
+                  (:event-req d) (:event-res d)
+                  (:schemas d))
+        driver (package-ui-enqueue-event-driver)
+        closed (composition/compose-closed driver [provider])
+        path (Files/createTempFile "kotoba-ui-enqueue-event-" ".wasm"
+                                   (make-array FileAttribute 0))]
+    (try
+      (is (= :wasm-component-closed/v1 (:format closed)))
+      (Files/write path ^bytes (:bytes closed)
+                   (make-array java.nio.file.OpenOption 0))
+      (let [run (shell/sh wasmtime-binary "run" "--invoke" "run()" (str path))]
+        (is (zero? (:exit run)) (str "wasmtime err: " (:err run)))
+        (is (= "7" (str/trim (:out run)))
+            "host enqueue(revision=7) must be the next-event payload, not none"))
+      (finally
+        (Files/deleteIfExists path)))))

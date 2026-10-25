@@ -1,0 +1,111 @@
+(ns kami.ongaku.sampler.e2e.main-driver
+  "E2E-only, main-thread bundle for kami-ongaku-sampler's real-browser
+   AudioWorkletProcessor trigger proof. Uses org-w3-webaudio's own
+   src/w3/webaudio.cljs binding layer (not raw AudioContext calls) --
+   reusing its proven OfflineAudioContext + audioWorklet.addModule +
+   AudioWorkletNode recipe rather than reinventing it -- to run one fresh
+   OfflineAudioContext render PER (note, velocity, trigger-count) input
+   (OfflineAudioContext.startRendering() can only be called once per
+   context, so a sequence of trigger inputs means a sequence of contexts,
+   not one context reused).
+
+   For each input: creates the context, loads the worklet DSP bundle
+   (test/e2e/page/worklet-processor.js), creates the AudioWorkletNode,
+   listens on node.port for the {decision: ...} message the worklet posts
+   back (the worklet's process() return value only controls audio output,
+   not arbitrary data -- the decision has to cross the MessagePort, which is
+   exactly why org-w3-webaudio's binding layer exposes port/on-message!),
+   renders, and captures the actual PCM. Returns an array of
+   {input, decision, pcm, sampleRate} for test/e2e/run_e2e.cljk (nbb) to
+   cross-check against its own, independently-computed offline decision +
+   measured frequency.
+
+   Compiled the same way as worklet_dsp.cljs (:optimizations advanced +
+   self-polyfill.js) for consistency -- see that namespace's docstring.
+
+   IMPORTANT (found empirically here, not previously documented by
+   org-w3-webaudio, whose own E2E never reads an app-level property off an
+   incoming postMessage payload): reading a property off a value that
+   crossed INTO this compilation unit from outside (a MessagePort message,
+   here) must use bracket/string-keyed access (`aget`), NOT dot-interop
+   (`.-foo`/`..`). `worklet_dsp.cljs` and this namespace are compiled by
+   TWO SEPARATE `cljs.main -c` invocations (two independent Closure
+   compilations, each with its OWN property-renaming map). An object
+   literal returned from an `^:export`-ed function is left with its
+   property names intact (Closure knows it 'escapes' the compilation unit),
+   which is why worklet_dsp's `#js {:decision ...}` correctly still says
+   `decision:` in the compiled bundle -- but a plain dot-access read of an
+   *incoming* value of unknown/native shape (`ev.data.decision`, where
+   `ev.data` is a generically-externed `MessageEvent.data`) is NOT treated
+   as escaping, and Closure's ordinary internal property-renaming pass DOES
+   rename it (empirically: `.decision` was renamed to `.bc` in one build
+   here) -- to a name that has nothing to do with the ACTUAL property name
+   the other, independently-compiled bundle produced. Symptom: `.-decision`
+   silently reads `undefined` (a data race, decision was actually there in
+   the runtime object) despite the underlying render/PCM data being
+   perfectly correct. Fix applied below: `(aget (.-data ev) \"decision\")`
+   -- bracket access with a string literal is never renamed by Closure,
+   because it can't statically know the key at rename time."
+  (:require [w3.webaudio :as w3a]))
+
+(defn- run-one [worklet-url processor-name input]
+  ;; The worklet posts its {decision: ...} message over the MessagePort
+  ;; during the AudioWorkletProcessor's constructor (before rendering even
+  ;; starts), but cross-thread postMessage delivery to the main thread is
+  ;; still a genuinely separate, asynchronously-scheduled task -- it is NOT
+  ;; guaranteed to have already run by the time OfflineAudioContext's
+  ;; startRendering() promise resolves (verified empirically: reading an
+  ;; atom snapshotted only in the startRendering().then callback raced and
+  ;; lost the message on every single input in first-pass testing here).
+  ;; Fix: build a genuine decision-promise (resolved from the port's
+  ;; onmessage handler) and Promise.all it together with the render
+  ;; promise, rather than assuming message delivery precedes render
+  ;; completion.
+  (let [{:keys [note velocity triggerCount sr durSamples gateOff
+                attack decay sustain release]}
+        input
+        ctx (w3a/new-offline-audio-context! 1 durSamples sr)]
+    (-> (w3a/add-worklet-module! ctx worklet-url)
+        (.then
+          (fn [_]
+            (let [node (w3a/create-worklet-node!
+                         ctx processor-name
+                         #js {:numberOfInputs 0
+                              :numberOfOutputs 1
+                              :outputChannelCount #js [1]
+                              :processorOptions
+                              #js {:note note :velocity velocity
+                                   :triggerCount triggerCount
+                                   :sr sr :durSamples durSamples
+                                   :gateOff gateOff :attack attack
+                                   :decay decay :sustain sustain
+                                   :release release}})
+                  decision-promise
+                  (js/Promise.
+                    (fn [resolve _reject]
+                      (w3a/on-message! (w3a/port node)
+                        (fn [ev] (resolve (aget (.-data ev) "decision"))))))]
+              (w3a/connect! node (w3a/destination ctx))
+              (js/Promise.all
+                #js [decision-promise (w3a/start-rendering! ctx)]))))
+        (.then
+          (fn [pair]
+            (let [decision (aget pair 0)
+                  audio-buffer (aget pair 1)
+                  ch0 (.getChannelData audio-buffer 0)]
+              #js {:input (clj->js input)
+                   :decision decision
+                   :pcm (js/Array.from ch0)
+                   :sampleRate (w3a/sample-rate ctx)}))))))
+
+(defn ^:export run-e2e [params]
+  (let [{:keys [workletUrl processorName inputs]}
+        (js->clj params :keywordize-keys true)]
+    (reduce
+      (fn [acc-promise input]
+        (.then acc-promise
+               (fn [results]
+                 (.then (run-one workletUrl processorName input)
+                        (fn [r] (.concat results #js [r]))))))
+      (js/Promise.resolve #js [])
+      inputs)))

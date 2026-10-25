@@ -1,0 +1,132 @@
+(ns particles-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [kotoba.physics.particles :as p]))
+
+(defn- abs* [x] (#?(:clj Math/abs :cljs js/Math.abs) (double x)))
+(defn- round9 [x] (/ (#?(:clj Math/round :cljs js/Math.round) (* 1.0e9 (double x))) 1.0e9))
+
+(deftest emission-is-a-rate-not-a-per-frame-count
+  ;; 30 particles per second at 60 fps is half a particle per frame. A system
+  ;; that emits floor(rate * dt) emits ZERO, forever, and looks like a tuning
+  ;; problem rather than a bug. The count over a duration has to be the same
+  ;; whatever the step size is.
+  (doseq [dt [(/ 1.0 30.0) (/ 1.0 60.0) (/ 1.0 240.0)]]
+    (let [sys (p/system {:rate 30.0 :lifetime 100.0 :seed 7})
+          steps (#?(:clj Math/round :cljs js/Math.round) (/ 2.0 dt))
+          [_ done] (p/simulate sys {:dt dt :gravity [0.0 0.0 0.0]} steps)]
+      (is (= 60 (:particles/emitted done))
+          (str "two seconds at 30/s with dt=" dt))))
+
+  (testing "a rate below one per frame still emits"
+    ;; Nine and eleven seconds rather than ten: at exactly ten the answer is
+    ;; 5.0 particles owed, and 600 additions of 1/60 land a few ulp below it,
+    ;; so `floor` gives 4. That is the accumulator being honest about a
+    ;; boundary, not the rate being wrong — asserting 5 there would be
+    ;; asserting that a sum of binary fractions is exact.
+    (let [run (fn [steps] (let [sys (p/system {:rate 0.5 :lifetime 1000.0 :seed 7})
+                                [_ done] (p/simulate sys {:dt (/ 1.0 60.0)
+                                                          :gravity [0.0 0.0 0.0]} steps)]
+                            (:particles/emitted done)))]
+      (is (= 4 (run 540)) "nine seconds at one every two seconds")
+      (is (= 5 (run 660)) "eleven seconds")
+      (is (<= 4 (run 600) 5) "and at the boundary, within one particle"))))
+
+(deftest the-integrator-matches-its-own-closed-form
+  ;; Semi-implicit Euler under constant acceleration is exactly
+  ;; x_n = x_0 + n dt v_0 + g dt^2 n(n+1)/2. Not approximately — so an
+  ;; off-by-one in the update order shows up as a real difference here while
+  ;; being invisible in any picture.
+  (let [x0 [0.0 0.0 0.0] v0 [1.0 5.0 0.0] g [0.0 -9.81 0.0] dt 0.01 n 100
+        sys (-> (p/system {:rate 0.0 :lifetime 1.0e6 :seed 1})
+                (update :particles/particles conj
+                        {:particle/position x0 :particle/velocity v0
+                         :particle/age 0.0 :particle/lifetime 1.0e6}))
+        [_ done] (p/simulate sys {:dt dt :gravity g} n)
+        got (get-in done [:particles/particles 0 :particle/position])
+        want (p/ballistic-position x0 v0 g dt n)]
+    (is (every? true? (map #(< (abs* (- %1 %2)) 1.0e-12) got want))
+        (str got " vs closed form " want))))
+
+(deftest a-constant-emitter-settles-at-rate-times-lifetime
+  (let [sys (p/system {:rate 200.0 :lifetime 0.5 :seed 3})
+        [_ done] (p/simulate sys {:dt 0.002 :gravity [0.0 0.0 0.0]} 1000)]
+    (is (= 100 (p/count-alive done)))
+    (is (= (long (p/steady-state-count sys)) (p/count-alive done)))
+    (testing "and it empties once emission stops"
+      (let [[_ empty] (p/simulate done {:dt 0.002 :gravity [0.0 0.0 0.0] :emitting? false} 400)]
+        (is (zero? (p/count-alive empty)))))))
+
+(deftest the-same-seed-gives-the-same-particles-on-every-host
+  ;; These are golden values, asserted in a .cljc so BOTH suites check the same
+  ;; constants. Three separate places where JVM long arithmetic and JavaScript
+  ;; int32 arithmetic disagreed were found this way, each producing entirely
+  ;; plausible particles on both hosts — different ones. A shot that cannot be
+  ;; re-rendered identically cannot be re-rendered.
+  (let [sys (p/system {:rate 50.0 :lifetime 2.0 :seed 20260822 :spread 3.0})
+        [_ done] (p/simulate sys {:dt 0.01} 100)]
+    (is (= 50 (p/count-alive done)))
+    (is (= [-2.338524675 -5.963974813 -2.028965738]
+           (mapv round9 (get-in done [:particles/particles 0 :particle/velocity]))))
+    (is (= [0.005969995 0.031954839 -0.004097723]
+           (mapv round9 (:particle/position (last (:particles/particles done))))))
+    (testing "and a different seed gives different particles"
+      (let [[_ other] (p/simulate (p/system {:rate 50.0 :lifetime 2.0 :seed 20260823 :spread 3.0})
+                                  {:dt 0.01} 100)]
+        (is (not= (mapv round9 (get-in done [:particles/particles 0 :particle/velocity]))
+                  (mapv round9 (get-in other [:particles/particles 0 :particle/velocity]))))))
+    (testing "and re-running the same system reproduces it exactly"
+      (let [[_ again] (p/simulate (p/system {:rate 50.0 :lifetime 2.0 :seed 20260822 :spread 3.0})
+                                  {:dt 0.01} 100)]
+        (is (= (mapv :particle/position (:particles/particles done))
+               (mapv :particle/position (:particles/particles again))))))))
+
+(deftest drag-converges-on-the-analytic-decay
+  ;; dv/dt = -k v has the solution v0 exp(-k t), which this integrator
+  ;; approximates to first order. First order means halving dt halves the
+  ;; error — a claim with a shape, not just a bound.
+  (let [k 2.0 t 1.0 v0 4.0
+        analytic (* v0 (#?(:clj Math/exp :cljs js/Math.exp) (- (* k t))))
+        error-at (fn [dt]
+                   (let [n (#?(:clj Math/round :cljs js/Math.round) (/ t dt))
+                         sys (-> (p/system {:rate 0.0 :lifetime 1.0e6 :seed 1})
+                                 (update :particles/particles conj
+                                         {:particle/position [0.0 0.0 0.0]
+                                          :particle/velocity [v0 0.0 0.0]
+                                          :particle/age 0.0 :particle/lifetime 1.0e6}))
+                         [_ done] (p/simulate sys {:dt dt :gravity [0.0 0.0 0.0] :drag k} n)]
+                     (abs* (- (get-in done [:particles/particles 0 :particle/velocity 0]) analytic))))
+        e1 (error-at 0.01) e2 (error-at 0.005) e3 (error-at 0.0025)]
+    (is (> e1 e2 e3))
+    (is (< (abs* (- (/ e1 e2) 2.0)) 0.05) (str "e1/e2 = " (/ e1 e2) ", expected 2 for first order"))
+    (is (< (abs* (- (/ e2 e3) 2.0)) 0.05))))
+
+(deftest a-bounce-returns-the-square-of-the-restitution
+  (let [floor {:collider/kind :plane :collider/point [0.0 0.0 0.0]
+               :collider/normal [0.0 1.0 0.0] :collider/restitution 0.5}
+        sys (-> (p/system {:rate 0.0 :lifetime 1.0e6 :seed 1})
+                (update :particles/particles conj
+                        {:particle/position [0.0 1.0 0.0] :particle/velocity [0.0 0.0 0.0]
+                         :particle/age 0.0 :particle/lifetime 1.0e6}))
+        ys (loop [c sys i 0 out []]
+             (if (= i 2000)
+               out
+               (let [[_ n] (p/step c {:dt 0.001 :colliders [floor]})]
+                 (recur n (inc i) (conj out (get-in n [:particles/particles 0 :particle/position 1]))))))
+        apex (apply max (drop 500 ys))]
+    (is (< (abs* (- apex (* 0.25 1.0))) 1.0e-3) (str "apex " apex ", expected 0.25"))
+    (is (every? #(> % -1.0e-9) ys) "and it never goes through the floor")))
+
+(deftest it-refuses-what-it-cannot-reproduce-or-integrate
+  (let [sys (p/system {:rate 10.0 :lifetime 1.0 :seed 1})]
+    (is (= :error (first (p/step sys {:dt 0.0}))))
+    (is (= :error (first (p/step sys {:dt -0.01}))))
+    (is (= :error (first (p/step (assoc sys :particles/rate -1.0) {:dt 0.01}))))
+    (testing "a zero lifetime is an emitter that emits nothing while reporting a rate"
+      (let [[status msg] (p/step (assoc sys :particles/lifetime 0.0) {:dt 0.01})]
+        (is (= :error status))
+        (is (string/includes? msg "emits nothing"))))
+    (testing "an unseeded system is refused, because a shot has to re-render"
+      (let [[status msg] (p/step (assoc sys :particles/rng nil) {:dt 0.01})]
+        (is (= :error status))
+        (is (string/includes? msg "re-rendered"))))))

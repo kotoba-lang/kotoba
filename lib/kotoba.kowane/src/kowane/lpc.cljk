@@ -1,0 +1,215 @@
+(ns kowane.lpc
+  "A linear-prediction vocoder for 8 kHz speech at 2400 and 1200 bit/s —
+  voice small enough for a LoRa frame.
+
+  Each frame is described by ten reflection coefficients (the vocal tract), a
+  pitch period or 'unvoiced' (the source), and a gain; 48 bits in all:
+
+      field     bits   quantiser
+      voicing+pitch  7    0 = unvoiced, else lag 20..146 samples (55–400 Hz)
+      gain      5      log RMS, 10–72 dB in 2 dB steps (0 = silence)
+      k1  k2    5 5    arcsine domain, ±1.40
+      k3  k4    4 4    arcsine domain, ±1.00
+      k5        4      arcsine domain, ±0.90
+      k6..k8    3 3 3  arcsine domain, ±0.80
+      k9 k10    2 2    arcsine domain, ±0.60
+      spare     1
+
+  `:lpc-2400` analyses 20 ms frames (160 samples, 48 bits = 6 bytes), and
+  `:lpc-1200` 40 ms frames (320 samples, same 48 bits). The decoder excites
+  an all-pole lattice filter with a pulse train (voiced) or noise (unvoiced).
+
+  This is a classic LPC-10-family design written from the textbook method,
+  not a port of any codec, and it is not bit-compatible with LPC-10, MELP or
+  Codec2. It trades naturalness for intelligibility, as every vocoder at
+  these rates does.")
+
+(def order 10)
+(def frame-bits 48)
+(def modes {:lpc-2400 {:frame 160} :lpc-1200 {:frame 320}})
+(def ^:private k-bits [5 5 4 4 4 3 3 3 2 2])
+(def ^:private k-range [1.40 1.40 1.00 1.00 0.90 0.80 0.80 0.80 0.60 0.60])
+(def ^:private min-lag 20)
+(def ^:private max-lag 146)
+
+;; ---------------------------------------------------------------------------
+;; Analysis
+
+(defn- pre-emphasis [xs]
+  (let [xs (vec xs)]
+    (vec (cons (first xs) (map (fn [a b] (- b (* 0.9375 a))) xs (rest xs))))))
+
+(defn- hamming [n]
+  (mapv #(- 0.54 (* 0.46 (Math/cos (/ (* 2 Math/PI %) (dec n))))) (range n)))
+
+(defn autocorrelation [xs lags]
+  (let [xs (vec xs) n (count xs)]
+    (mapv (fn [k] (loop [i k acc 0.0]
+                    (if (< i n) (recur (inc i) (+ acc (* (nth xs i) (nth xs (- i k))))) acc)))
+          (range (inc lags)))))
+
+(defn levinson
+  "Reflection coefficients from autocorrelation `r` (Levinson–Durbin).
+  Answers `{:k [...] :a [...] :error e}`; a = predictor coefficients."
+  [r p]
+  (if (<= (nth r 0) 0)
+    {:k (vec (repeat p 0.0)) :a (vec (repeat p 0.0)) :error 0.0}
+    (loop [i 1 a (vec (repeat (inc p) 0.0)) e (nth r 0) ks []]
+      (if (> i p)
+        {:k ks :a (subvec a 1) :error e}
+        (let [acc (reduce + (map (fn [j] (* (nth a j) (nth r (- i j)))) (range 1 i)))
+              k (/ (- (nth r i) acc) e)
+              k (max -0.999 (min 0.999 k))
+              a' (reduce (fn [a' j] (assoc a' j (- (nth a j) (* k (nth a (- i j))))))
+                         (assoc a i k) (range 1 i))]
+          (recur (inc i) a' (* e (- 1 (* k k))) (conj ks k)))))))
+
+(defn- pitch
+  "Lag of the strongest normalised autocorrelation peak, and its strength."
+  [xs]
+  (let [xs (vec xs) n (count xs)
+        energy (fn [from to] (reduce + (map #(* % %) (subvec xs from to))))
+        score (fn [lag]
+                (let [num (loop [i lag acc 0.0]
+                            (if (< i n) (recur (inc i) (+ acc (* (nth xs i) (nth xs (- i lag))))) acc))
+                      den (Math/sqrt (* (energy lag n) (energy 0 (- n lag))))]
+                  (if (pos? den) (/ num den) 0.0)))
+        hi (min max-lag (- n 20))
+        scored (mapv (fn [lag] [lag (score lag)]) (range min-lag (inc hi)))
+        [best-lag best] (reduce (fn [a b] (if (> (second b) (second a)) b a)) scored)
+        ;; prefer the shortest lag whose peak is nearly as strong (avoids
+        ;; picking a multiple of the true period)
+        short (some (fn [[lag s]] (when (and (>= s (* 0.85 best))
+                                              (> s (score (max min-lag (dec lag))))
+                                              (>= s (score (min hi (inc lag)))))
+                                     [lag s]))
+                    scored)]
+    (or short [best-lag best])))
+
+(defn analyse
+  "Parameters of one frame of samples (numbers, any scale ±32768)."
+  [samples]
+  (let [x (pre-emphasis samples)
+        n (count x)
+        w (mapv * x (hamming n))
+        r (autocorrelation w order)
+        r (assoc r 0 (* (nth r 0) 1.0001))                  ; white-noise correction
+        {:keys [k error]} (levinson r order)
+        rms (Math/sqrt (/ (max error 0.0) (max 1 (reduce + (map #(* % %) (hamming n))))))
+        ;; voicing on the low-passed raw signal
+        lp (vec (map (fn [a b c] (/ (+ a b b c) 4)) (cons 0 samples) samples (concat (rest samples) [0])))
+        [lag strength] (pitch lp)
+        zc (count (filter neg? (map * (rest samples) samples)))
+        voiced? (and (> strength 0.45) (< zc (* 0.25 n)) (> rms 20))]
+    {:k k :gain rms :pitch (when voiced? lag)}))
+
+;; ---------------------------------------------------------------------------
+;; Quantisation
+
+(defn- q-uniform [x lo hi bits]
+  (let [levels (bit-shift-left 1 bits)
+        t (/ (- (max lo (min hi x)) lo) (- hi lo))]
+    (min (dec levels) (int (Math/floor (* t levels))))))
+
+(defn- dq-uniform [q lo hi bits]
+  (let [levels (bit-shift-left 1 bits)]
+    (+ lo (* (- hi lo) (/ (+ q 0.5) levels)))))
+
+(defn- q-gain [g]
+  (let [db (if (pos? g) (* 20 (Math/log10 g)) -100)]
+    (if (< db 10) 0 (min 31 (inc (int (Math/floor (/ (- db 10) 2))))))))
+(defn- dq-gain [q] (if (zero? q) 0.0 (Math/pow 10 (/ (+ 10 (* 2 (- q 0.5))) 20))))
+
+(defn quantise [{:keys [k gain pitch]}]
+  {:pitch (if pitch (inc (- pitch min-lag)) 0)
+   :gain (q-gain gain)
+   :k (mapv (fn [kv bits rng] (q-uniform (Math/asin kv) (- rng) rng bits)) k k-bits k-range)})
+
+(defn dequantise [{:keys [k gain pitch]}]
+  {:pitch (when (pos? pitch) (+ min-lag (dec pitch)))
+   :gain (dq-gain gain)
+   :k (mapv (fn [q bits rng] (Math/sin (dq-uniform q (- rng) rng bits))) k k-bits k-range)})
+
+;; ---------------------------------------------------------------------------
+;; Bit packing
+
+(defn- push-bits [acc v bits]
+  (into acc (map #(bit-and (bit-shift-right v (- bits 1 %)) 1) (range bits))))
+
+(defn pack
+  "48 bits → 6 bytes."
+  [{:keys [k gain pitch]}]
+  (let [bits (-> [] (push-bits pitch 7) (push-bits gain 5)
+                 (#(reduce (fn [acc [v b]] (push-bits acc v b)) % (map vector k k-bits)))
+                 (push-bits 0 1))]
+    (mapv (fn [byte-bits] (reduce (fn [a b] (+ (* 2 a) b)) 0 byte-bits)) (partition 8 bits))))
+
+(defn unpack [bs]
+  (let [bits (vec (mapcat (fn [b] (map #(bit-and (bit-shift-right b (- 7 %)) 1) (range 8))) bs))
+        take-v (fn [[at acc] n] [(+ at n) (conj acc (reduce (fn [a b] (+ (* 2 a) b)) 0 (subvec bits at (+ at n))))])
+        [_ vs] (reduce take-v [0 []] (into [7 5] k-bits))]
+    {:pitch (nth vs 0) :gain (nth vs 1) :k (subvec vs 2)}))
+
+;; ---------------------------------------------------------------------------
+;; Synthesis
+
+(defn decoder [] {:mem (vec (repeat order 0.0)) :phase 0 :noise 0xACE1 :de-emph 0.0})
+
+(defn- lfsr [s]
+  (let [bit (bit-and (bit-xor s (bit-shift-right s 2) (bit-shift-right s 3) (bit-shift-right s 5)) 1)]
+    (bit-or (bit-shift-right s 1) (bit-shift-left bit 15))))
+
+(defn- lattice
+  "All-pole lattice synthesis for one sample. `mem` holds backward errors."
+  [k mem e]
+  (let [p (count k)
+        [f mem'] (reduce (fn [[f b'] i]
+                           (let [f (+ f (* (nth k i) (nth mem i)))
+                                 b (- (nth mem i) (* (nth k i) f))]
+                             [f (assoc b' (inc i) b)]))
+                         [e (vec (repeat (inc p) 0.0))]
+                         (range (dec p) -1 -1))]
+    [f (assoc (subvec mem' 0 p) 0 f)]))
+
+(defn synthesise
+  "`n` samples for dequantised parameters `params`. Answers `[decoder samples]`."
+  [dec {:keys [k gain pitch]} n]
+  (loop [i 0 dec dec out []]
+    (if (= i n)
+      [dec out]
+      (let [[exc dec] (if pitch
+                        (let [ph (:phase dec)]
+                          [(if (zero? ph) (* gain (Math/sqrt pitch)) 0.0)
+                           (assoc dec :phase (rem (inc ph) pitch))])
+                        (let [s (lfsr (:noise dec))]
+                          [(* gain 1.7 (- (/ s 32768.0) 1.0)) (assoc dec :noise s :phase 0)]))
+            [y mem] (lattice k (:mem dec) exc)
+            ;; de-emphasis, inverse of the analysis pre-emphasis
+            d (+ y (* 0.9375 (:de-emph dec)))
+            d (max -32767.0 (min 32767.0 d))]
+        (recur (inc i) (assoc dec :mem mem :de-emph d) (conj out d))))))
+
+;; ---------------------------------------------------------------------------
+;; Codec API
+
+(defn encode
+  "Samples → bytes, 6 per frame. Trailing samples short of a frame are dropped."
+  [mode samples]
+  (let [n (get-in modes [mode :frame])]
+    (into [] (mapcat #(pack (quantise (analyse (vec %))))) (partition n samples))))
+
+(defn decode
+  "Bytes → samples. Answers `[decoder samples]` so state carries across calls."
+  ([mode bs] (decode mode (decoder) bs))
+  ([mode dec bs]
+   (let [n (get-in modes [mode :frame])]
+     (reduce (fn [[dec acc] fb]
+               (let [[dec out] (synthesise dec (dequantise (unpack (vec fb))) n)]
+                 [dec (into acc out)]))
+             [dec []]
+             (partition 6 bs)))))
+
+(defn conceal
+  "A frame of output for a lost frame: the previous parameters faded."
+  [mode dec last-params]
+  (synthesise dec (update last-params :gain * 0.5) (get-in modes [mode :frame])))

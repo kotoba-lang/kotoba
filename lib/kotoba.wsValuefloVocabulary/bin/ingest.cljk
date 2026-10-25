@@ -1,0 +1,251 @@
+#!/usr/bin/env kbb
+;; TTL -> canonical EDN. The only writer of resources/valueflows/vocabulary.edn.
+;;
+;;   kbb --backend sci bin/ingest.cljk           ; write
+;;   kbb --backend sci bin/ingest.cljk --check   ; compare, write nothing
+;;
+;; Exit codes are three-valued on purpose (ADR-2608136000, "検査を書く前の 5 問"):
+;;   0  generated / identical
+;;   1  STALE — the committed EDN disagrees with the TTL
+;;   2  COULD NOT ANSWER — the TTL is missing, the wrong bytes, or parsed to
+;;      fewer terms than the floor. This is NOT 0. A mirror that cannot read
+;;      its upstream must not report a pass.
+
+(ns ingest
+  (:require ["fs" :as fs]
+            ["crypto" :as crypto]
+            [kotoba.lang.text :as str]
+            [kotoba.pprint :as pprint]
+            [kotoba.lang.edn :as edn]))
+
+(def ttl-path "resources/valueflows/all_vf.ttl")
+(def upstream-path "resources/valueflows/upstream.edn")
+(def out-path "resources/valueflows/vocabulary.edn")
+;; The same value inlined as portable source. The library must not read a
+;; resource at runtime: `.cljc` here has to load on the kotoba wasm / cljs /
+;; nbb hosts as well as the JVM, and only the JVM has io/resource + slurp.
+;; One generator, two outputs, both checked.
+(def data-path "src/valueflows/data.cljk")
+
+;; ── evidence floor ────────────────────────────────────────────────────────
+;; Upstream may grow; it may not silently shrink past these. A parser that
+;; stops matching returns 2 here instead of an empty, clean-looking mirror.
+;;
+;; These are MEASURED, not guessed: against the pinned TTL, `grep -c` reports
+;; 19 `vf:Action` typings, 67 `owl:Class`, 85 `owl:ObjectProperty` + 26
+;; `owl:DatatypeProperty` = 111, and 38 `owl:NamedIndividual` (19 actions +
+;; 19 enum members). The reader recovers all of them. A floor is not a claim
+;; that the vocabulary is complete — it is the line below which the reader is
+;; provably broken. The first guessed value here (individuals 20, one above
+;; reality) failed on the first run, which is the behaviour being bought.
+(def floor {:actions 19 :classes 67 :properties 111 :individuals 19})
+
+;; ── turtle subset reader ──────────────────────────────────────────────────
+;; Quoted literals are masked before any splitting, so a comment containing
+;; ';' ',' or ' .' cannot be mistaken for syntax.
+
+(defn- mask-literals [s]
+  (let [lits (atom [])
+        masked (str/replace s #"\"(?:[^\"\\]|\\.)*\""
+                            (fn [m]
+                              (swap! lits conj m)
+                              (str "\u0000" (dec (count @lits)) "\u0000")))]
+    [masked @lits]))
+
+(defn- unmask [s lits]
+  (str/replace s #"\u0000(\d+)\u0000" (fn [[_ i]] (nth lits (js/parseInt i)))))
+
+(defn- literal-text [s]
+  (when-let [[_ body] (re-find #"^\"((?:[^\"\\]|\\.)*)\"" s)]
+    (-> body (str/replace "\\\"" "\"") (str/replace "\\n" "\n"))))
+
+(defn- local-name
+  "vf:produce -> :produce, rdfs:label -> :rdfs/label, <#x> -> :x."
+  [tok]
+  (let [t (str/trim tok)]
+    (cond
+      (str/starts-with? t "vf:") (keyword (subs t 3))
+      (str/includes? t ":") (let [[p l] (str/split t #":" 2)] (keyword p l))
+      :else (keyword t))))
+
+(defn- parse-block
+  "One turtle statement -> {:subject kw :po {pred [objs]}}. Literals stay masked."
+  [block]
+  (let [b (-> block (str/replace #"\s+" " ") str/trim)]
+    (when (seq b)
+      (let [[_ subj rest-s] (re-find #"^(\S+)\s*([\s\S]*)$" b)]
+        (when (and subj (seq (str/trim (or rest-s ""))))
+          {:subject subj
+           :po (reduce
+                (fn [m part]
+                  (let [p (str/trim part)]
+                    (if (str/blank? p)
+                      m
+                      (if-let [[_ pred objs] (re-find #"^(\S+)\s+([\s\S]*)$" p)]
+                        (assoc m pred
+                               (mapv str/trim
+                                     (if (str/starts-with? (str/trim objs) "\u0000")
+                                       [objs]                 ; single masked literal
+                                       (str/split objs #","))))
+                        m))))
+                {} (str/split rest-s #";"))})))))
+
+(defn- read-ttl [text]
+  (let [stripped (->> (str/split-lines text)
+                      (remove #(str/starts-with? (str/trim %) "#"))
+                      (remove #(str/starts-with? (str/trim %) "@"))
+                      (str/join "\n"))
+        [masked lits] (mask-literals stripped)]
+    {:blocks (keep parse-block (str/split masked #"\s\.\s*(?:\n|$)"))
+     :literals lits}))
+
+;; ── projection ────────────────────────────────────────────────────────────
+
+(defn- lit [lits po pred]
+  (some-> (first (get po pred)) (unmask lits) literal-text))
+
+(defn- types [po] (set (map str/trim (get po "a" []))))
+
+(def action-behaviour
+  ;; predicate -> key. These eleven are the whole operative table: what an
+  ;; action does to a resource. Everything else about an Action is prose.
+  {"vf:inputOutput"       :input-output
+   "vf:pairsWith"         :pairs-with
+   "vf:createResource"    :create-resource
+   "vf:eventQuantity"     :event-quantity
+   "vf:accountingEffect"  :accounting-effect
+   "vf:onhandEffect"      :onhand-effect
+   "vf:locationEffect"    :location-effect
+   "vf:containedEffect"   :contained-effect
+   "vf:accountableEffect" :accountable-effect
+   "vf:stageEffect"       :stage-effect
+   "vf:stateEffect"       :state-effect})
+
+(defn- common [lits po]
+  (cond-> {}
+    (lit lits po "rdfs:label")     (assoc :label (lit lits po "rdfs:label"))
+    (lit lits po "rdfs:comment")   (assoc :comment (lit lits po "rdfs:comment"))
+    (lit lits po "vs:term_status") (assoc :term-status (lit lits po "vs:term_status"))
+    (first (get po "vf:layer"))    (assoc :layer (local-name (first (get po "vf:layer"))))))
+
+(defn- project [{:keys [blocks literals]}]
+  (reduce
+   (fn [acc {:keys [subject po]}]
+     (let [k (local-name subject)
+           ty (types po)
+           base (common literals po)]
+       (cond
+         ;; an Action named individual: class membership plus the behaviour row
+         (contains? ty "vf:Action")
+         (assoc-in acc [:actions k]
+                   (reduce (fn [m [pred key]]
+                             (if-let [v (first (get po pred))]
+                               (assoc m key (local-name v))
+                               m))
+                           base action-behaviour))
+
+         (contains? ty "owl:Class")
+         (assoc-in acc [:classes k] base)
+
+         (or (contains? ty "owl:ObjectProperty") (contains? ty "owl:DatatypeProperty"))
+         (assoc-in acc [:properties k]
+                   (cond-> (assoc base :kind (if (contains? ty "owl:ObjectProperty")
+                                               :object :datatype))
+                     (first (get po "rdfs:domain")) (assoc :domain (local-name (first (get po "rdfs:domain"))))
+                     (first (get po "rdfs:range")) (assoc :range (local-name (first (get po "rdfs:range"))))))
+
+         ;; every other named individual is an enum member of its classes
+         (contains? ty "owl:NamedIndividual")
+         (-> acc
+             (assoc-in [:individuals k]
+                       (assoc base :member-of (into (sorted-set)
+                                                    (comp (remove #{"owl:NamedIndividual"})
+                                                          (map local-name))
+                                                    ty)))
+             (update :enums
+                     (fn [e]
+                       (reduce (fn [e' c]
+                                 (if (= c "owl:NamedIndividual")
+                                   e'
+                                   (update e' (local-name c) (fnil conj (sorted-set)) k)))
+                               (or e {}) ty))))
+         :else acc)))
+   {} blocks))
+
+(defn- sorted-deep [x]
+  (cond
+    (map? x) (into (sorted-map) (map (fn [[k v]] [k (sorted-deep v)])) x)
+    (vector? x) (mapv sorted-deep x)
+    :else x))
+
+(defn- build []
+  (when-not (fs/existsSync ttl-path)
+    (println (str "CANNOT ANSWER: " ttl-path " is absent. Nothing was parsed;"
+                  " refusing to report a vocabulary."))
+    (js/process.exit 2))
+  (let [text (str (fs/readFileSync ttl-path "utf8"))
+        sha (-> (crypto/createHash "sha256") (.update text "utf8") (.digest "hex"))
+        upstream (edn/read-string (str (fs/readFileSync upstream-path "utf8")))
+        pinned (get-in upstream [:ontology :sha256])
+        _ (when (not= sha pinned)
+            (println (str "CANNOT ANSWER: all_vf.ttl sha256 " sha
+                          " does not match the pin " pinned " in " upstream-path
+                          ". Either the mirror drifted or the pin was not updated."))
+            (js/process.exit 2))
+        parsed (read-ttl text)
+        v (project parsed)
+        counts {:actions (count (:actions v))
+                :classes (count (:classes v))
+                :properties (count (:properties v))
+                :individuals (count (:individuals v))}
+        short (keep (fn [[k n]] (when (< n (get floor k)) [k n (get floor k)])) counts)]
+    (when (seq short)
+      (println (str "CANNOT ANSWER: parsed below the evidence floor "
+                    (pr-str (vec short))
+                    " — the reader stopped matching upstream. A shrunken"
+                    " vocabulary must not be written as if it were complete."))
+      (js/process.exit 2))
+    (sorted-deep
+     (merge {:schema "valueflows.vocabulary.v1"
+             :generated-by "bin/ingest.cljk — DO NOT EDIT BY HAND"
+             :upstream (:ontology upstream)
+             :counts counts}
+            (select-keys v [:classes :properties :actions :individuals :enums])))))
+
+(def ^:private banner
+  (str ";; GENERATED by bin/ingest.cljk from resources/valueflows/all_vf.ttl.\n"
+       ";; DO NOT EDIT BY HAND. Regenerate: kbb --backend sci bin/ingest.cljk\n"))
+
+(defn- render-edn [m]
+  (str banner (with-out-str (pprint/pprint m))))
+
+(defn- render-data [m]
+  (str banner
+       ";;\n"
+       ";; The vocabulary as portable source, so no host I/O is needed to read it.\n"
+       ";; resources/valueflows/vocabulary.edn is the same value.\n\n"
+       "(ns valueflows.data)\n\n"
+       "(def vocabulary\n"
+       (with-out-str (pprint/pprint m))
+       ")\n"))
+
+(let [v (build)
+      outputs [[out-path (render-edn v)] [data-path (render-data v)]]
+      args (vec (drop 2 (js->clj js/process.argv)))]
+  (if (some #{"--check"} args)
+    (let [bad (keep (fn [[path want]]
+                      (let [have (when (fs/existsSync path) (str (fs/readFileSync path "utf8")))]
+                        (cond
+                          (nil? have) [path "absent"]
+                          (not= have want) [path "disagrees with the TTL"]
+                          :else nil)))
+                    outputs)]
+      (if (seq bad)
+        (do (doseq [[path why] bad] (println (str "STALE: " path " " why)))
+            (println "run: kbb --backend sci bin/ingest.cljk")
+            (js/process.exit 1))
+        (println (str "OK: " (str/join ", " (map first outputs))
+                      " match the pinned TTL (" (:counts v) ")"))))
+    (doseq [[path content] outputs]
+      (fs/writeFileSync path content)
+      (println (str "wrote " path " (" (count content) " bytes)")))))

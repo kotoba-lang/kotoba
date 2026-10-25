@@ -1,0 +1,129 @@
+(ns kotoba.lang.mst-projector.indexer-test
+  "Pure indexer-logic tests (record flattening, upsert semantics,
+  delete-before-any-create no-op, count/list-collections) against the
+  reference `mem-index` IIndex implementation."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.mst-projector.indexer :as indexer]
+            [kotoba.lang.mst-projector.mem-index :as mem-index])
+  (:import (java.io File)))
+
+;; ---------------------------------------------------------------------------
+;; flatten-record / build-row
+;; ---------------------------------------------------------------------------
+
+(deftest flatten-record-test
+  (testing "top-level scalars stay typed"
+    (is (= {"a" "x" "b" 1 "c" true "d" nil}
+           (indexer/flatten-record {"a" "x" "b" 1 "c" true "d" nil}))))
+  (testing "nested maps/vectors are JSON-stringified into string columns"
+    (is (= {"a" "{\"b\":1}"} (indexer/flatten-record {"a" {"b" 1}})))
+    (is (= {"a" "[1,2,3]"} (indexer/flatten-record {"a" [1 2 3]})))))
+
+(deftest build-row-test
+  (testing "base columns + flattened fields"
+    (let [row (indexer/build-row "did:plc:x" "rkey1" "cid1" {"text" "hi" "nested" {"k" "v"}})]
+      (is (= "did:plc:x" (get row "did")))
+      (is (= "rkey1" (get row "rkey")))
+      (is (= "cid1" (get row "record_cid")))
+      (is (string? (get row "indexed_at")))
+      (is (= "{\"nested\":{\"k\":\"v\"},\"text\":\"hi\"}" (get row "record_json")))
+      (is (= "hi" (get row "text")))
+      (is (= "{\"k\":\"v\"}" (get row "nested")))))
+  (testing "a flattened field with the same name as a base column wins (quirk preserved from python's {**base, **flat} spread order)"
+    (let [row (indexer/build-row "did:plc:x" "rkey1" "cid1" {"did" "spoofed-did"})]
+      (is (= "spoofed-did" (get row "did"))))))
+
+;; ---------------------------------------------------------------------------
+;; index-op! / delete-op! / count-rows / list-collections / query
+;; ---------------------------------------------------------------------------
+
+(deftest index-op-upsert-test
+  (testing "a second index-op! with the same (did, rkey) replaces the row"
+    (let [idx (mem-index/make-mem-index)]
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "v1"})
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid2" {"text" "v2"})
+      (is (= 1 (indexer/count-rows idx "app.bsky.feed.post")))
+      (let [[row] (indexer/query idx "app.bsky.feed.post")]
+        (is (= "cid2" (get row "record_cid")))
+        (is (= "v2" (get row "text"))))))
+  (testing "distinct (did, rkey) pairs coexist"
+    (let [idx (mem-index/make-mem-index)]
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey2" "cid2" {"text" "b"})
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:y" "rkey1" "cid3" {"text" "c"})
+      (is (= 3 (indexer/count-rows idx "app.bsky.feed.post"))))))
+
+(deftest delete-op-test
+  (testing "delete removes the row"
+    (let [idx (mem-index/make-mem-index)]
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/delete-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1")
+      (is (= 0 (indexer/count-rows idx "app.bsky.feed.post")))
+      (is (= [] (indexer/query idx "app.bsky.feed.post")))))
+  (testing "delete-before-any-create is a no-op AND does not create the collection"
+    (let [idx (mem-index/make-mem-index)]
+      (indexer/delete-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1")
+      (is (= 0 (indexer/count-rows idx "app.bsky.feed.post")))
+      (is (= [] (indexer/list-collections idx)))))
+  (testing "a collection remains listed after all its rows are deleted (never implicitly dropped)"
+    (let [idx (mem-index/make-mem-index)]
+      (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/delete-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1")
+      (is (= ["app.bsky.feed.post"] (indexer/list-collections idx)))
+      (is (= 0 (indexer/count-rows idx "app.bsky.feed.post"))))))
+
+(deftest count-rows-and-list-collections-test
+  (let [idx (mem-index/make-mem-index)]
+    (testing "unindexed collection: count 0, not listed"
+      (is (= 0 (indexer/count-rows idx "app.bsky.feed.post")))
+      (is (= [] (indexer/list-collections idx))))
+    (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+    (indexer/index-op! idx "app.bsky.feed.like" "did:plc:x" "rkey1" "cid2" {"subject" "s"})
+    (testing "after indexing into two collections"
+      (is (= 1 (indexer/count-rows idx "app.bsky.feed.post")))
+      (is (= 1 (indexer/count-rows idx "app.bsky.feed.like")))
+      (is (= #{"app.bsky.feed.post" "app.bsky.feed.like"} (set (indexer/list-collections idx)))))))
+
+(deftest query-filter-and-limit-test
+  (let [idx (mem-index/make-mem-index)]
+    (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+    (indexer/index-op! idx "app.bsky.feed.post" "did:plc:y" "rkey2" "cid2" {"text" "b"})
+    (indexer/index-op! idx "app.bsky.feed.post" "did:plc:x" "rkey3" "cid3" {"text" "c"})
+    (testing "no filter returns everything up to limit"
+      (is (= 3 (count (indexer/query idx "app.bsky.feed.post" nil 100))))
+      (is (= 2 (count (indexer/query idx "app.bsky.feed.post" nil 2)))))
+    (testing "equality filter on a flattened field"
+      (let [rows (indexer/query idx "app.bsky.feed.post" {:field "did" :value "did:plc:x"} 100)]
+        (is (= 2 (count rows)))
+        (is (every? #(= "did:plc:x" (get % "did")) rows))))
+    (testing "query on an unindexed collection returns empty"
+      (is (= [] (indexer/query idx "app.bsky.feed.like" nil 100))))))
+
+;; ---------------------------------------------------------------------------
+;; mem-index EDN persistence
+;; ---------------------------------------------------------------------------
+
+(deftest mem-index-persistence-test
+  (let [tmp (File/createTempFile "mst-projector-test" ".edn")]
+    (.deleteOnExit tmp)
+    (let [path (.getAbsolutePath tmp)
+          idx1 (mem-index/make-mem-index {:persist-path path})]
+      (indexer/index-op! idx1 "app.bsky.feed.post" "did:plc:x" "rkey1" "cid1" {"text" "a"})
+      (indexer/index-op! idx1 "app.bsky.feed.post" "did:plc:x" "rkey2" "cid2" {"text" "b"})
+      (testing "a fresh index constructed with the same persist-path reloads prior state"
+        (let [idx2 (mem-index/make-mem-index {:persist-path path})]
+          (is (= 2 (indexer/count-rows idx2 "app.bsky.feed.post")))
+          (is (= ["app.bsky.feed.post"] (indexer/list-collections idx2)))))
+      (testing "deletes are also persisted"
+        (indexer/delete-op! idx1 "app.bsky.feed.post" "did:plc:x" "rkey1")
+        (let [idx3 (mem-index/make-mem-index {:persist-path path})]
+          (is (= 1 (indexer/count-rows idx3 "app.bsky.feed.post"))))))))
+
+(deftest describe-test
+  (testing "in-memory, no persistence"
+    (is (= "in-memory" (indexer/describe (mem-index/make-mem-index)))))
+  (testing "in-memory with persistence mentions the path"
+    (let [tmp (File/createTempFile "mst-projector-describe-test" ".edn")]
+      (.deleteOnExit tmp)
+      (is (re-find (re-pattern (java.util.regex.Pattern/quote (.getAbsolutePath tmp)))
+                   (indexer/describe (mem-index/make-mem-index {:persist-path (.getAbsolutePath tmp)})))))))

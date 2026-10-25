@@ -1,0 +1,112 @@
+(ns kotoba.annex.archive
+  "kotobase.net の **blob 面**（`PUT/GET /ipfs/:cid` → B2 archive）を backend にする
+   store（ADR-2607175000 follow-up (a)）。kotoba.annex.kotobase（istore/KV 面）の
+   置き換えで、**層としてはこちらが正**。
+
+   なぜこちらが正か（ADR-2607175000 の設計評価）:
+     - istore（`net.kotobase.store.*`）の実体は Cloudflare KV（TENANT_STATE、
+       billing/funnel と同居）＝ドキュメント面。chunk 必須 / ~25KB/s / max 900KB /
+       bytes→base64(+33%)→DAG-CBOR→KV の二重無駄は、全てその層ミスの症状。
+     - `/ipfs/:cid` は B2 archive へ**そのままのバイト列**を置く。base64 も CBOR も
+       挟まらず、上限は 4MiB（archive-put/max-object-bytes）。
+
+   ⚠ **istore 経路と性質が違う点（実測。使う前に必ず読む）**:
+   1. **認証は 2 credential** — 静的な `Authorization: Bearer
+      <KOTOBASE_ARCHIVE_TOKEN{,_2}>` に加えて、**`Authorization: Biscuit …` を
+      受理する**（`b2_write/authorize-archive-put`、要求権限は既存の `data:write`。
+      ADR-2608262600 で着地。実測 2026-08-30）。発行は
+      `POST auth.kotobase.net/v1/biscuit/token`（principal は passkey / SIWE /
+      service-account）で、検証は root の**公開鍵**だけで済む。
+      したがって『operator 専用の静的トークンしか無い』はもう当たらない ——
+      principal ごとの credential を発行でき、**発行者に訊かずに 1 CID・数分へ
+      減衰させて渡せる**。ただし tenant 分離は依然この面には無い（key は CID
+      単体で、tenant scope は holding 側が持つ）。
+   2. **置いたものは公開される** — `GET /ipfs/:cid` は**未認証の public gateway**
+      （worker.cljc の GET /ipfs/ 経路。実測で未認証 GET が通る）。CID を知る者は
+      誰でも読める。**秘匿が要る素材は git-annex 側で暗号化する**
+      （`encryption=shared`。git-annex が STORE 前に暗号化するので、公開面に置かれる
+      のは暗号文。実測: block sha256 5d1d4b… ≠ 平文 975cf8…）。
+   3. **扱えるのは CID 導出可能な key だけ** — `encryption=shared` / `chunk=` を使うと
+      key から CID を導出できない（kotoba.annex.cid の docstring 参照、実測済み）。
+      その構成では key→CID の対応表が要る（kotobase datom 面に置くのが正しい層 —
+      follow-up）。本 ns は**導出不可なら黙って代替せず throw する**（fail-closed）。
+   4. **REMOVE は未対応** — `/ipfs/:cid` に delete 面が無い。`drop --from` は失敗する
+      （成功と偽らない）。"
+  (:require [kotoba.annex.cid :as cid]))
+
+(def ^:const default-endpoint "https://kotobase.net")
+;; archive-put/max-object-bytes と一致させる（超過は本番が 413 を返す）
+(def ^:const max-object-bytes (* 4 1024 1024))
+
+(defn- sha256-hex [bytes]
+  (-> (js/require "crypto") (.createHash "sha256") (.update bytes) (.digest "hex")))
+
+(defn- require-cid
+  "key → CID。導出不可なら **throw**（黙って別 CID に流さない）。"
+  [key]
+  (or (cid/key->cid key)
+      (throw (js/Error.
+              (str "annex key からは CID を導出できない: " key
+                   " — /ipfs/:cid backend は encryption=none かつ chunk 無しの "
+                   "SHA256E key だけを扱える（chunk key は元ファイルの hash を "
+                   "持ち回り、GPGHMAC* key は HMAC。どちらも保存バイト列の "
+                   "sha256 と一致しない）。key→CID 対応表は follow-up。")))))
+
+(defn archive-store
+  "opts: {:endpoint :token :fetch}。token 省略時は KOTOBASE_ARCHIVE_TOKEN。
+   store 契約（kotoba.annex.store）と同形。関数は Promise を返す。"
+  [{:keys [endpoint token fetch]
+    :or {endpoint default-endpoint fetch js/fetch}}]
+  (let [tok (or token js/process.env.KOTOBASE_ARCHIVE_TOKEN)
+        url (fn [c] (str endpoint "/ipfs/" c))
+        auth-headers (fn [extra]
+                       (clj->js (merge {"authorization" (str "Bearer " tok)} extra)))]
+    {:endpoint endpoint
+     :store!
+     (fn [key bytes]
+       (let [c (require-cid key)]
+         (when (> (.-length bytes) max-object-bytes)
+           (throw (js/Error. (str "object > archive max-object-bytes ("
+                                  max-object-bytes ") — 本番は 413 を返す"))))
+         ;; 防御: key 由来の CID と実バイト列の sha256 が食い違うなら送らない。
+         ;; （食い違ったまま送っても本番は 422 digest mismatch で弾くが、
+         ;;   こちらの誤用をこちらで検出する方が原因が分かる）
+         (let [actual (sha256-hex bytes)
+               expect (:hash (cid/parse-key key))]
+           (when (not= actual expect)
+             (throw (js/Error. (str "key の hash と実バイト列の sha256 が不一致: key="
+                                    expect " bytes=" actual)))))
+         (-> (fetch (url c) #js {:method "PUT"
+                                 :headers (auth-headers {"content-type" "application/octet-stream"})
+                                 :body bytes})
+             ;; 201 = 保存成功（archive-put-store!）。それ以外は成功と report しない。
+             (.then (fn [r] (= 201 (.-status r)))))))
+     ;; ⚠ present? の意味は『この endpoint から取得できるか』。GET /ipfs は B2 に
+     ;; 無ければ **public IPFS gateway に proxy** するので、:yes は「B2 に自分の
+     ;; コピーがある」ではなく「その CID が取得できる」を意味する。git-annex に
+     ;; とっての present の意味（RETRIEVE が成功するか）とは一致する。
+     :present?
+     (fn [key]
+       (-> (fetch (url (require-cid key)) #js {:method "GET"})
+           (.then (fn [r] (if (.-ok r) :yes :no)))
+           (.catch (fn [_] :unknown))))
+     :retrieve
+     (fn [key]
+       (let [c (require-cid key)]
+         (-> (fetch (url c) #js {:method "GET"})
+             (.then (fn [r] (when (.-ok r) (.arrayBuffer r))))
+             (.then (fn [buf]
+                      (when buf
+                        (let [b (js/Buffer.from buf)]
+                          ;; fail-closed: gateway が別物を返したら nil（黙って壊れた
+                          ;; データを git-annex に渡さない）
+                          (when (= (sha256-hex b) (:hash (cid/parse-key key))) b))))))))
+     ;; /ipfs/:cid に delete 面は無い。false を返して REMOVE-FAILURE にする
+     ;; （tombstone で「消えたことにする」誤魔化しをしない — 実体は残るのだから）。
+     :remove! (fn [_key] (js/Promise.resolve false))
+     :init! (fn [] true)
+     :prepare!
+     (fn [_config]
+       (when (or (nil? tok) (= tok ""))
+         (throw (js/Error. "KOTOBASE_ARCHIVE_TOKEN が未設定 — /ipfs/:cid は Bearer 認証が要る")))
+       true)}))

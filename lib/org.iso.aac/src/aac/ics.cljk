@@ -1,0 +1,428 @@
+(ns aac.ics
+  "AAC-LC `individual_channel_stream()` side-info + spectral data decode
+   (ISO/IEC 14496-3:2005 §4.4.2.7 Tables 4.44/4.6/4.46/4.47/4.50, §4.6.3
+   noiseless coding), plus `channel_pair_element()` (Table 4.4, §4.4.1.1)
+   for stereo. Scope (see `aac.decode`'s namespace docstring for the full
+   statement): **mono OR stereo (CPE, incl. mid/side but NOT intensity
+   stereo), all four `window_sequence` values** — the optional tools this
+   repo doesn't implement (`predictor_data_present`, `pulse_data_present`,
+   `tns_data_present`, `gain_control_data_present`, and per-scalefactor-band
+   PNS/intensity-stereo pseudo-codebooks NOISE_HCB/INTENSITY_HCB/
+   INTENSITY_HCB2) are read (so the bitstream position stays correct up to
+   the point they're detected) and then throw immediately if set, rather
+   than silently mis-decoding.
+
+   PNS in particular is near-ubiquitous in real `ffmpeg -c:a aac`-encoded
+   streams (perceptual noise substitution replaces sparse high-frequency
+   content with synthesized noise, and is on by default) — real fixtures
+   for this repo's tests were generated with `-aac_pns 0` for exactly this
+   reason (see `test/aac/decode_test.cljk`'s docstring). PNS is also
+   fundamentally not bit-exact-comparable across independent decoders even
+   when implemented: the spec does not mandate a specific noise generator,
+   so any two spec-compliant decoders synthesize DIFFERENT sample values
+   for a PNS-coded band (only the target energy is normative) — throwing
+   here rather than fabricating a decoder-specific noise generator keeps
+   this repo's 'decode this and compare against real ffmpeg PCM' validation
+   methodology honest.
+
+   ## Block switching / window grouping (§4.5.2.3.2, §4.6.11.3.1)
+
+   `EIGHT_SHORT_SEQUENCE` replaces the frame's single 1024-line transform
+   with eight 128-line ones. It does NOT change how many spectral
+   coefficients a frame carries (still 1024) — it changes their MEANING and
+   their ORDER, and it makes every piece of side info below two-dimensional
+   (window group x scalefactor band) where a long frame's is
+   one-dimensional:
+
+   - `ics_info()` reads a 4-bit `max_sfb` and a 7-bit
+     `scale_factor_grouping` instead of a 6-bit `max_sfb` and
+     `predictor_data_present` (Table 4.6). `scale_factor_grouping` says
+     which of the eight short windows share a set of scalefactors:
+     `window-group-lengths` below turns it into group lengths summing to 8.
+   - `section_data()` runs its section loop once PER GROUP, and its
+     `sect_len_incr` field is 3 bits with escape value 7 rather than 5 bits
+     with escape value 31 (Table 4.46).
+   - `scale_factor_data()` runs over (group, band) pairs, with ONE DPCM
+     chain continuing across the whole frame (Table 4.47).
+   - `ms_mask` (in `channel_pair_element()`) likewise carries one bit per
+     (group, band) pair, not per band.
+   - the 1024 coefficients are stored GROUPED: within a group, a band's
+     coefficients for every window in that group are contiguous
+     (§4.5.2.3.4's `sect_sfb_offset`). `deinterleave-short-spectrum` below
+     puts them back into transform order for `aac.imdct`.
+
+   This namespace expresses all of that with one flat vector of
+   `[start end)` coefficient ranges — `band-ranges` — indexed
+   `(g * max_sfb + sfb)`, which for a long window degenerates to exactly the
+   `swb_offset` pairs the long-only version of this code used. `sfb-cb`,
+   `scale-factors` and `ms-mask` are all indexed the same way, so
+   `aac.dequant` and `aac.stereo` need no window-sequence knowledge at all.
+
+   ## `channel_pair_element()` (Table 4.4) — `decode-channel-pair-element!`
+
+   Verified against FFmpeg's `libavcodec/aac/aacdec.c` `decode_cpe`/
+   `ff_aac_decode_ics` (algorithm/bitstream-order only consulted, not
+   copied — same reimplement-from-understanding policy as `aac.imdct`'s KBD
+   window; FFmpeg is LGPL, this repo is Apache-2.0):
+
+   - `element_instance_tag` is NOT read here — it's consumed by the caller
+     (`aac.decode/decode-raw-data-block-cpe!`), same as SCE's tag handling.
+   - `common_window` (1 bit). If 1: a SINGLE shared `ics_info()` (window_seq/
+     window_shape/max_sfb/scale_factor_grouping) is read once for the pair,
+     immediately followed by `ms_mask_present` (2 bits) + (if 1) one
+     `ms_used` bit per (window group, scalefactor band) (`ms-mask!`) —
+     Table 4.4's ms_mask_present==3 is reserved and throws. If
+     `common_window` is 0, each channel reads its own independent
+     `ics_info()` inside its own `individual_channel_stream()` (no M/S is
+     possible in this case — mid/side stereo coding requires common_window,
+     §4.6.8.1).
+   - Both channels' `individual_channel_stream(common_window, scale_flag=0)`
+     are then decoded in turn (each with its OWN global_gain/section_data/
+     scale_factor_data/pulse/tns/gain-control-presence/spectral_data,
+     regardless of common_window — only the ics_info() read itself is
+     conditionally skipped and shared).
+   - Empirically verified against `ffmpeg -c:a aac`-encoded real stereo
+     content (see `test/aac/decode_test.cljk`'s stereo golden-vector tests):
+     `common_window=1`, `ms_mask_present=1` with a genuine MIX of 0/1
+     per-band `ms_used` bits (not all-0 or all-1) — i.e. the real fixtures
+     exercise both the M/S-applied and M/S-not-applied code paths in
+     `aac.stereo/apply-ms` (see that namespace), under both long and
+     EIGHT_SHORT window sequences."
+  (:require [aac.bits :as bits]
+            [aac.tables :as tables]
+            [aac.huffman :as huffman]))
+
+(def ^:private zero-hcb 0)
+(def ^:private noise-hcb 13)
+(def ^:private intensity-hcb2 14)
+(def ^:private intensity-hcb 15)
+(def ^:private out-of-scope-cbs #{noise-hcb intensity-hcb2 intensity-hcb})
+
+(def only-long-sequence 0)
+(def long-start-sequence 1)
+(def eight-short-sequence 2)
+(def long-stop-sequence 3)
+
+(def ^:private short-transform-half 128)
+
+(defn window-group-lengths
+  "Turn `scale_factor_grouping` (7 bits, §4.5.2.3.2's `window_grouping_info`)
+   into the frame's window group lengths — a vector summing to 8. Bit `i`
+   (counted from the MSB of the 7-bit field) says whether short window
+   `i+1` continues the current group (1) or starts a new one (0); window 0
+   always starts group 0, which is why only 7 bits are needed for 8
+   windows. Returns [8] for a fully-merged frame, [1 1 1 1 1 1 1 1] for a
+   fully-split one, and e.g. [1 3 3 1] for the mixed groupings real encoders
+   actually emit."
+  [scale-factor-grouping]
+  (loop [i 0 groups [1]]
+    (if (>= i 7)
+      groups
+      (let [continues? (pos? (bit-and scale-factor-grouping (bit-shift-left 1 (- 6 i))))]
+        (recur (inc i)
+               (if continues?
+                 (update groups (dec (count groups)) inc)
+                 (conj groups 1)))))))
+
+(defn ics-info!
+  "ics_info() (Table 4.6). Returns {:window-sequence :window-shape :max-sfb
+   :scale-factor-grouping :window-group-lengths} — the last two are nil/[1]
+   respectively for the three long sequences, which have exactly one window
+   group by definition (§4.6.11.3.1). All four `window_sequence` values are
+   accepted (it is a 2-bit field, so there is no fifth). Throws on
+   `predictor_data_present`, which is out of scope (see namespace
+   docstring) — note EIGHT_SHORT_SEQUENCE has no predictor field at all
+   (Table 4.6), prediction being defined only for long windows, so that
+   branch reads `max_sfb` (4 bits) and `scale_factor_grouping` (7) where the
+   long branch reads `max_sfb` (6) and `predictor_data_present` (1)."
+  [r]
+  (let [ics-reserved-bit (bits/bit! r)
+        _ (when-not (zero? ics-reserved-bit)
+            (throw (ex-info "aac.ics: ics_reserved_bit must be 0" {})))
+        window-sequence (bits/bits! r 2)
+        window-shape (bits/bit! r)]
+    (if (= window-sequence eight-short-sequence)
+      (let [max-sfb (bits/bits! r 4)
+            grouping (bits/bits! r 7)]
+        {:window-sequence window-sequence
+         :window-shape window-shape
+         :max-sfb max-sfb
+         :scale-factor-grouping grouping
+         :window-group-lengths (window-group-lengths grouping)})
+      (let [max-sfb (bits/bits! r 6)
+            predictor-data-present (bits/bit! r)]
+        (when-not (zero? predictor-data-present)
+          (throw (ex-info "aac.ics: predictor_data_present is out of scope" {})))
+        {:window-sequence window-sequence
+         :window-shape window-shape
+         :max-sfb max-sfb
+         :scale-factor-grouping nil
+         :window-group-lengths [1]}))))
+
+(defn band-ranges
+  "The frame's `[start end)` coefficient ranges, one per (window group,
+   scalefactor band) pair in bitstream order — index `(g * max-sfb + sfb)`,
+   `(count …)` = `num_window_groups * max_sfb`. Ranges index into the
+   1024-length GROUPED coefficient vector as the bitstream stores it (see
+   namespace docstring; `deinterleave-short-spectrum` converts to transform
+   order afterwards).
+
+   For a long `window-sequence` this is just `swb_offset[sfb]` ..
+   `swb_offset[sfb+1]` for the single group. For EIGHT_SHORT_SEQUENCE it is
+   §4.5.2.3.4's `sect_sfb_offset`: group `g` (of length `L`) occupies
+   `L*128` consecutive coefficients, within which band `sfb` occupies
+   `swb_offset_short[sfb]*L` .. `swb_offset_short[sfb+1]*L` — all `L`
+   windows' copies of that band, back to back.
+
+   Throws if `max_sfb` exceeds the table's `num_swb`, which would otherwise
+   read past the end of the band table and mis-attribute coefficients."
+  [sfi window-sequence max-sfb window-group-lengths]
+  (let [swb (tables/swb-offsets-for sfi window-sequence)
+        num-swb (tables/num-swb-for sfi window-sequence)]
+    (when (> max-sfb num-swb)
+      (throw (ex-info "aac.ics: max_sfb exceeds num_swb for this window_sequence"
+                       {:max-sfb max-sfb :num-swb num-swb :window-sequence window-sequence})))
+    (if (= window-sequence eight-short-sequence)
+      (loop [g 0 base 0 out []]
+        (if (>= g (count window-group-lengths))
+          out
+          (let [len (nth window-group-lengths g)]
+            (recur (inc g)
+                   (+ base (* len short-transform-half))
+                   (into out (mapv (fn [sfb]
+                                     [(+ base (* len (nth swb sfb)))
+                                      (+ base (* len (nth swb (inc sfb))))])
+                                   (range max-sfb)))))))
+      (mapv (fn [sfb] [(nth swb sfb) (nth swb (inc sfb))]) (range max-sfb)))))
+
+(defn section-data!
+  "section_data() (Table 4.46). Runs the section loop once per window group
+   (one group for the three long sequences, `num_window_groups` for
+   EIGHT_SHORT_SEQUENCE), reading `sect_cb` (4 bits) then a run length in
+   `sect_len_incr` units — **3 bits with escape value 7 for
+   EIGHT_SHORT_SEQUENCE, 5 bits with escape value 31 otherwise**, which is
+   the one field width in this whole namespace that block switching
+   changes. Returns `sfb_cb` — a flat vector of length
+   `num_window_groups * max_sfb`, one Huffman codebook index (or ZERO_HCB)
+   per (group, band), indexed the same way as `band-ranges`."
+  [r max-sfb num-window-groups short?]
+  (let [len-bits (if short? 3 5)
+        sect-esc-val (if short? 7 31)]
+    (loop [g 0 out []]
+      (if (>= g num-window-groups)
+        out
+        (let [group-cb
+              (loop [k 0 sfb-cb (vec (repeat max-sfb nil))]
+                (if (>= k max-sfb)
+                  sfb-cb
+                  (let [sect-cb (bits/bits! r 4)
+                        sect-len (loop [total 0]
+                                   (let [incr (bits/bits! r len-bits)]
+                                     (if (= incr sect-esc-val)
+                                       (recur (+ total incr))
+                                       (+ total incr))))]
+                    (when (> (+ k sect-len) max-sfb)
+                      (throw (ex-info "aac.ics: section runs past max_sfb (bitstream desync or corrupt data)"
+                                       {:group g :start k :sect-len sect-len :max-sfb max-sfb})))
+                    (recur (+ k sect-len)
+                           (reduce (fn [v i] (assoc v i sect-cb))
+                                   sfb-cb
+                                   (range k (+ k sect-len)))))))]
+          (recur (inc g) (into out group-cb)))))))
+
+(defn scale-factor-data!
+  "scale_factor_data() (Table 4.47), non-ER path (`aacScalefactorDataResilienceFlag`
+   == 0, always true for plain AAC-LC ADTS). `global-gain` seeds the DPCM
+   chain (§4.6.3.3: 'Global gain ... is typically the value of the first
+   active scalefactor ... The first active scalefactor is differentially
+   coded relative to the global gain'). Under EIGHT_SHORT_SEQUENCE that ONE
+   chain continues across all window groups in bitstream order, which is
+   exactly what iterating the flat `sfb-cb` from `section-data!` does.
+   Returns a vector of length `(count sfb-cb)`, the absolute scalefactor per
+   (group, band) (0 for ZERO_HCB entries, unused). Throws if an entry is
+   coded with NOISE_HCB/INTENSITY_HCB/INTENSITY_HCB2 (PNS / intensity
+   stereo, out of scope — see namespace docstring)."
+  [r sfb-cb global-gain]
+  (loop [sfb 0 running global-gain out []]
+    (if (>= sfb (count sfb-cb))
+      out
+      (let [cb (nth sfb-cb sfb)]
+        (cond
+          (= cb zero-hcb)
+          (recur (inc sfb) running (conj out 0))
+
+          (contains? out-of-scope-cbs cb)
+          (throw (ex-info "aac.ics: PNS/intensity-stereo codebook is out of scope"
+                           {:sfb sfb :codebook cb}))
+
+          :else
+          (let [delta (huffman/decode-scalefactor-dpcm! r)
+                sf (+ running delta)]
+            (recur (inc sfb) sf (conj out sf))))))))
+
+(defn spectral-data!
+  "spectral_data() (Table 4.50). Decodes n-tuples per (window group,
+   scalefactor band) per `sfb-cb`'s codebook over that entry's `band-ranges`
+   range (skipping ZERO_HCB entries, whose coefficients are implicitly
+   zero), and returns the full 1024-length quantized-coefficient vector in
+   the bitstream's own GROUPED order. Anything not covered by a range — the
+   coefficients at and above `max_sfb` in every group — is left zero per
+   §4.6.3.3: 'spectral information for all scalefactor bands at and above
+   max_sfb ... is zero'.
+
+   Table 4.50 iterates SECTIONS rather than bands; iterating bands is
+   equivalent here because a section is a run of consecutive bands sharing
+   one codebook and every band width in Table 4.110 (both window lengths,
+   times any group length) is a multiple of 4, hence of both tuple
+   dimensions — so no n-tuple ever straddles a band boundary and the two
+   loops read identical bits."
+  [r sfb-cb band-ranges frame-len]
+  (loop [i 0 coeffs (vec (repeat frame-len 0))]
+    (if (>= i (count sfb-cb))
+      coeffs
+      (let [cb (nth sfb-cb i)
+            [start end] (nth band-ranges i)]
+        (if (= cb zero-hcb)
+          (recur (inc i) coeffs)
+          (let [dim (:dim (get huffman/codebook-params cb))
+                _ (when (nil? dim) (throw (ex-info "aac.ics: unsupported spectral codebook" {:cb cb :index i})))
+                coeffs (loop [bin start coeffs coeffs]
+                         (if (>= bin end)
+                           coeffs
+                           (let [tuple (huffman/decode-spectral-tuple! r cb)]
+                             (recur (+ bin dim)
+                                    (reduce (fn [c j] (assoc c (+ bin j) (nth tuple j)))
+                                            coeffs (range (min dim (- end bin))))))))]
+            (recur (inc i) coeffs)))))))
+
+(defn deinterleave-short-spectrum
+  "Reorder an EIGHT_SHORT_SEQUENCE frame's 1024 coefficients from the
+   bitstream's GROUPED order (§4.5.2.3.4: per group, per band, all of that
+   group's windows' copies of the band back to back) into TRANSFORM order
+   (the eight 128-line short blocks laid end to end), which is what
+   `aac.imdct/decode-frame` consumes.
+
+   Runs over the FULL short band table rather than only `max_sfb` bands:
+   bands at and above `max_sfb` are zero on both sides, so copying them is
+   harmless, and it keeps this function independent of `max_sfb` — the
+   mapping is a property of the grouping alone."
+  [spec sfi window-group-lengths]
+  (let [swb (tables/swb-offsets-short sfi)
+        num-swb (tables/num-swb-short sfi)]
+    (loop [g 0 base 0 w0 0 out (vec (repeat (count spec) 0.0))]
+      (if (>= g (count window-group-lengths))
+        out
+        (let [len (nth window-group-lengths g)
+              out (reduce
+                   (fn [acc sfb]
+                     (let [lo (nth swb sfb)
+                           width (- (nth swb (inc sfb)) lo)]
+                       (reduce
+                        (fn [acc w]
+                          (reduce (fn [acc i]
+                                    (assoc acc
+                                           (+ (* short-transform-half (+ w0 w)) lo i)
+                                           (nth spec (+ base (* len lo) (* w width) i))))
+                                  acc (range width)))
+                        acc (range len))))
+                   out (range num-swb))]
+          (recur (inc g) (+ base (* len short-transform-half)) (+ w0 len) out))))))
+
+(defn decode-individual-channel-stream!
+  "`individual_channel_stream(common_window, scale_flag=false)` (Table 4.44).
+   Reads `global_gain` (always per-channel, even under `common_window`),
+   then EITHER this channel's own `ics_info()` (when `shared-ics-info` is
+   nil — the single_channel_element() case, where `common_window` is always
+   false, OR a CPE with `common_window=0`) OR reuses the pair's already-read
+   `shared-ics-info` (a CPE with `common_window=1` — Table 4.4 reads
+   `ics_info()` only ONCE for the pair; see `aac.ics`'s namespace docstring
+   and `decode-channel-pair-element!`). Then `section_data()`,
+   `scale_factor_data()`, the three optional-tool presence flags (pulse/tns/
+   gain-control — throws if any is 1, out of scope; these are read
+   PER-CHANNEL regardless of `common_window`, per FFmpeg's
+   `ff_aac_decode_ics`), then `spectral_data()`. `sfi` is the ADTS
+   `sampling_frequency_index` (drives the scalefactor-band table,
+   `aac.tables`). Returns {:window-sequence :window-shape :max-sfb
+   :window-group-lengths :band-ranges :sfb-cb :scale-factors :coeffs} —
+   `:coeffs` in the bitstream's grouped order (see
+   `deinterleave-short-spectrum`).
+
+   Note that `pulse_data_present` is read for EVERY window_sequence — the
+   bit is unconditional in Table 4.44, and it is only the pulse tool's USE
+   that EIGHT_SHORT_SEQUENCE forbids (a conformant encoder always writes 0
+   there; FFmpeg's `decode_ics` likewise reads the bit first and only then
+   rejects it under a short sequence). Skipping the read on short frames
+   would desync the bitstream by one bit. It is out of scope either way,
+   so this throws if it is set."
+  ([r sfi frame-len] (decode-individual-channel-stream! r sfi frame-len nil))
+  ([r sfi frame-len shared-ics-info]
+   (let [global-gain (bits/bits! r 8)
+         {:keys [window-sequence window-shape max-sfb window-group-lengths]}
+         (or shared-ics-info (ics-info! r))
+         short? (= window-sequence eight-short-sequence)
+         num-groups (count window-group-lengths)
+         sfb-cb (section-data! r max-sfb num-groups short?)
+         scale-factors (scale-factor-data! r sfb-cb global-gain)
+         pulse-data-present (bits/bit! r)
+         _ (when-not (zero? pulse-data-present)
+             (throw (ex-info "aac.ics: pulse_data_present is out of scope" {})))
+         tns-data-present (bits/bit! r)
+         _ (when-not (zero? tns-data-present)
+             (throw (ex-info "aac.ics: tns_data_present is out of scope" {})))
+         gain-control-data-present (bits/bit! r)
+         _ (when-not (zero? gain-control-data-present)
+             (throw (ex-info "aac.ics: gain_control_data_present is out of scope" {})))
+         ranges (band-ranges sfi window-sequence max-sfb window-group-lengths)
+         coeffs (spectral-data! r sfb-cb ranges frame-len)]
+     {:window-sequence window-sequence
+      :window-shape window-shape
+      :max-sfb max-sfb
+      :window-group-lengths window-group-lengths
+      :band-ranges ranges
+      :sfb-cb sfb-cb
+      :scale-factors scale-factors
+      :coeffs coeffs})))
+
+(defn ms-mask!
+  "`ms_mask_present` (2 bits) +, if 1, one `ms_used[g][sfb]` bit per (window
+   group, scalefactor band) pair (Table 4.4, `channel_pair_element()`'s
+   `common_window` branch). Returns a boolean vector of length
+   `num-window-groups * max-sfb` (indexed the same way as `band-ranges` and
+   `section-data!`'s output), or nil if `ms_mask_present`==0 (no M/S
+   anywhere in this frame — the pair's channels are already coded as plain
+   L/R). `ms_mask_present`==2 means 'all bands' (per-spec shorthand, no
+   further bits read) — represented the same as an all-true vector so
+   callers (`aac.stereo/apply-ms`) don't need a separate case. Throws on
+   `ms_mask_present`==3 (reserved)."
+  [r max-sfb num-window-groups]
+  (let [n (* max-sfb num-window-groups)
+        ms-mask-present (bits/bits! r 2)]
+    (case ms-mask-present
+      0 nil
+      1 (mapv (fn [_] (= 1 (bits/bit! r))) (range n))
+      2 (vec (repeat n true))
+      (throw (ex-info "aac.ics: ms_mask_present=3 is reserved" {:ms-mask-present ms-mask-present})))))
+
+(defn decode-channel-pair-element!
+  "`channel_pair_element()` (Table 4.4) minus `element_instance_tag` (already
+   consumed by the caller — `aac.decode/decode-raw-data-block-cpe!` — same
+   convention as SCE's tag handling in `decode-raw-data-block!`). Reads
+   `common_window`, then (if set) the pair's single shared `ics_info()` +
+   `ms_mask!`, then both channels' `individual_channel_stream()`s (each
+   sharing `shared-ics-info` when `common_window`==1, per-channel
+   independent otherwise — see `decode-individual-channel-stream!`'s
+   docstring). Returns {:ch0 :ch1 (each `decode-individual-channel-stream!`'s
+   result) :ms-mask (boolean vector-or-nil, indexed against the SHARED
+   `band-ranges` — meaningful only when `common_window` is true; always nil
+   otherwise, since M/S requires `common_window`, §4.6.8.1) :common-window?}.
+   `aac.decode`/`aac.stereo` consume `:ms-mask` alongside both channels' own
+   dequantized coefficients to reconstruct L/R (see `aac.stereo/apply-ms`)."
+  [r sfi frame-len]
+  (let [common-window? (= 1 (bits/bit! r))
+        shared-ics-info (when common-window? (ics-info! r))
+        ms-mask (when common-window?
+                  (ms-mask! r (:max-sfb shared-ics-info)
+                            (count (:window-group-lengths shared-ics-info))))
+        ch0 (decode-individual-channel-stream! r sfi frame-len shared-ics-info)
+        ch1 (decode-individual-channel-stream! r sfi frame-len shared-ics-info)]
+    {:ch0 ch0 :ch1 ch1 :ms-mask ms-mask :common-window? common-window?}))

@@ -1,0 +1,135 @@
+(ns diameter.avps-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [diameter.avp :as avp]
+            [diameter.avps :as a]
+            [diameter.message :as msg]))
+
+;; Host-IP-Address (RFC 6733 §5.3.5) is of type Address, which this repo
+;; scopes out (see diameter.types). This fixture hand-builds the Address
+;; wire bytes per §4.3.1's AddressType-then-address layout (AddressType 1
+;; = IPv4, per the IANA Address Family Numbers registry that §4.3.1 refers
+;; to but this repo does not vendor) purely for wire realism —
+;; constructed, not a published spec vector — and this repo does not
+;; decode that layout back into a semantic address; it only round-trips
+;; the bytes as opaque OctetString data (see decode-cer/decode-cea below,
+;; which hand back :host-ip-address as raw bytes).
+(def ^:private host-ip-address-fixture
+  (into [0x00 0x01] [192 0 2 1])) ; AddressType=1 (IPv4), 192.0.2.1 (TEST-NET-1, RFC 5737)
+
+;; The CER and CEA fixtures below are constructed, not a published spec
+;; vector — RFC 6733 publishes the CCF grammar for both commands (§5.3.1,
+;; §5.3.2) and the AVP codes each one carries, but no complete worked
+;; byte-level example of either message. The AVP codes, command code 257,
+;; and Result-Code 2001 in these fixtures ARE the RFC's (cited in
+;; diameter.avps); the particular hostnames, realms, product names and
+;; identifiers are this test's own.
+(def ^:private cer-fixture
+  {:origin-host "client.example.com"
+   :origin-realm "example.com"
+   :host-ip-address host-ip-address-fixture
+   :vendor-id 0
+   :product-name "org-ietf-diameter-test"
+   :origin-state-id 1
+   :hop-by-hop 0x00000001
+   :end-to-end 0x00000001})
+
+(deftest cer-round-trip
+  (let [encoded (a/encode-cer cer-fixture)
+        [status decoded] (msg/decode-message encoded)]
+    (is (= :ok status))
+    (is (true? (:diameter.message/request? decoded)))
+    (is (= a/cer-cea-command-code (:diameter.message/command-code decoded)))
+    (is (= a/base-application-id (:diameter.message/application-id decoded)))
+    (let [fields (a/decode-cer (:diameter.message/avps decoded))]
+      (is (= "client.example.com" (:origin-host fields)))
+      (is (= "example.com" (:origin-realm fields)))
+      (is (= host-ip-address-fixture (:host-ip-address fields)))
+      (is (= 0 (:vendor-id fields)))
+      (is (= "org-ietf-diameter-test" (:product-name fields)))
+      (is (= 1 (:origin-state-id fields))))))
+
+(def ^:private cea-fixture
+  {:result-code a/diameter-success
+   :origin-host "server.example.com"
+   :origin-realm "example.com"
+   :host-ip-address host-ip-address-fixture
+   :vendor-id 0
+   :product-name "org-ietf-diameter-test-server"
+   :hop-by-hop 0x00000001
+   :end-to-end 0x00000001})
+
+(deftest cea-round-trip
+  (let [encoded (a/encode-cea cea-fixture)
+        [status decoded] (msg/decode-message encoded)]
+    (is (= :ok status))
+    (is (false? (:diameter.message/request? decoded)))
+    (is (= a/cer-cea-command-code (:diameter.message/command-code decoded)))
+    (let [fields (a/decode-cea (:diameter.message/avps decoded))]
+      (is (= 2001 (:result-code fields)))
+      (is (= "server.example.com" (:origin-host fields)))
+      (is (= "org-ietf-diameter-test-server" (:product-name fields))))))
+
+(deftest cer-cea-full-wire-round-trip
+  ;; A CER goes out, comes back as bytes over "the wire" (here: just the
+  ;; same byte vector), and a CEA answering it is built and round-tripped
+  ;; too — the two full command messages this repo builds from real
+  ;; RFC 6733 §5.3.1/§5.3.2 AVPs, encoded and decoded end to end.
+  (let [cer-bytes (a/encode-cer cer-fixture)
+        [cer-status cer-msg] (msg/decode-message cer-bytes)
+        cer-fields (a/decode-cer (:diameter.message/avps cer-msg))
+        cea-bytes (a/encode-cea (assoc cea-fixture
+                                       :hop-by-hop (:diameter.message/hop-by-hop cer-msg)
+                                       :end-to-end (:diameter.message/end-to-end cer-msg)))
+        [cea-status cea-msg] (msg/decode-message cea-bytes)]
+    (is (= :ok cer-status cea-status))
+    (is (= "client.example.com" (:origin-host cer-fields)))
+    (is (= (:diameter.message/hop-by-hop cer-msg) (:diameter.message/hop-by-hop cea-msg)))))
+
+;; ── property sweep across AVP flag combinations and data lengths on and
+;;    off the 4-byte boundary, plus grouped-AVP nesting — the specific
+;;    sweep the task asks for, expressed at the full-message level rather
+;;    than just diameter.avp's own narrower unit sweep. ─────────────────
+
+(defn- roundtrip-ok? [avps]
+  (let [encoded (msg/encode-message
+                 {:diameter.message/command-code 257
+                  :diameter.message/application-id 0
+                  :diameter.message/request? true
+                  :diameter.message/hop-by-hop 1
+                  :diameter.message/end-to-end 1
+                  :diameter.message/avps avps})
+        [status decoded] (msg/decode-message encoded)]
+    (letfn [;; decode always hands back explicit `:diameter.avp/m?`/`:p?`
+            ;; (defaulted `false` if absent on the wire) — normalize the
+            ;; *input* fixtures the same way before comparing, so an input
+            ;; map that simply omitted `:m?`/`:p?` (relying on
+            ;; `encode-avp`'s own `:or` defaults) isn't reported as a
+            ;; mismatch against decode's always-explicit output.
+            (normalize [a]
+              (select-keys (merge {:diameter.avp/m? false :diameter.avp/p? false} a)
+                            [:diameter.avp/code :diameter.avp/m? :diameter.avp/p?
+                             :diameter.avp/vendor-id :diameter.avp/data]))]
+      (and (= :ok status)
+           (= (mapv normalize avps)
+              (mapv normalize (:diameter.message/avps decoded)))))))
+
+(deftest sweep-flag-combinations-and-data-lengths
+  (doseq [v? [false true] m? [false true] p? [false true]
+          data-len [0 1 2 3 4 5 7 8 11 16]]
+    (testing (str "V=" v? " M=" m? " P=" p? " data-len=" data-len)
+      (is (roundtrip-ok?
+           [(cond-> {:diameter.avp/code 1
+                     :diameter.avp/m? m? :diameter.avp/p? p?
+                     :diameter.avp/data (vec (range data-len))}
+              v? (assoc :diameter.avp/vendor-id 10415))])))))
+
+(deftest sweep-grouped-nesting-depths
+  (doseq [depth [1 2 3]]
+    (testing (str "nesting depth=" depth)
+      (let [leaf {:diameter.avp/code 999 :diameter.avp/data [1 2 3 4 5]}
+            nested (reduce (fn [inner _]
+                              {:diameter.avp/code 998
+                               :diameter.avp/data (avp/encode-avps [inner])})
+                            leaf
+                            (range depth))]
+        (is (roundtrip-ok? [nested]))))))

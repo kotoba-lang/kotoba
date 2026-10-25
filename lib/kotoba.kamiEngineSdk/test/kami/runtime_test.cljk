@@ -1,0 +1,84 @@
+(ns kami.runtime-test
+  "GPU-free integration test of the orchestration layer (kami.sim + kami.gpu)
+  using a mock IGpuBackend that records calls. Proves the loop wiring —
+  defsystem → step → render-IR → pack → submit, asset registration, and the
+  commit-on-save path — without a real GPU."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kami.scene :as scene]
+            [kami.ecs   :as ecs]
+            [kami.gpu   :as gpu]
+            [kami.sim   :as sim :refer [defsystem]]))
+
+;; --- mock backend -----------------------------------------------------------
+
+(defrecord MockBackend [log]
+  gpu/IGpuBackend
+  (register-mesh!     [_ id _v _i] (swap! log conj [:mesh id]) 1)
+  (register-material! [_ id _p]    (swap! log conj [:material id]) 1)
+  (register-shader!   [_ id _w _l] (swap! log conj [:shader id]) 1)
+  (submit-frame!      [_ packed] (swap! log conj [:submit (:ncols packed) (:len packed)]))
+  (resize!            [_ w h]    (swap! log conj [:resize w h])))
+
+(defn mock [] (->MockBackend (atom [])))
+
+;; --- fixtures ---------------------------------------------------------------
+
+(def cam  #uuid "00000000-0000-0000-0000-0000000000c1")
+(def tree #uuid "00000000-0000-0000-0000-000000000a01")
+
+(def snap
+  (scene/build-snapshot
+   [{:kami/eid cam :camera/active? true :camera/fov 60.0 :camera/near 0.1
+     :camera/far 100.0 :transform/translation [0.0 0.0 5.0]}
+    {:kami/eid tree :transform/translation [0.0 0.0 0.0]
+     :transform/rotation [0.0 0.0 0.0 1.0]
+     :mesh/asset {:asset/id "mesh/conifer"} :material/asset {:asset/id "mat/bark"}}]
+   [{:asset/id "mesh/conifer" :asset/kind :mesh :asset/data {:vertices [0.0] :indices [0]}}
+    {:asset/id "mat/bark" :asset/kind :material :asset/data {:params [1.0 1.0 1.0 1.0]}}]
+   {:t 1 :scene "rt" :env {}}))
+
+;; --- systems ----------------------------------------------------------------
+
+(defsystem nudge {:order 10} [world _dt]
+  "Move the tree +1x each step."
+  (reduce (fn [w [e c]] (ecs/set-component w e :transform/translation
+                                           (update (vec (:transform/translation c)) 0 inc)))
+          world (ecs/query world #{:mesh/asset})))
+
+;; --- tests ------------------------------------------------------------------
+
+(deftest ensure-assets-dispatch
+  (let [b (mock)
+        ids (gpu/ensure-assets! b snap)]
+    (is (= #{"mesh/conifer" "mat/bark"} ids))
+    (is (= [[:mesh "mesh/conifer"] [:material "mat/bark"]] @(:log b)))))
+
+(deftest step-threads-systems
+  (let [w0 (ecs/load-snapshot snap)
+        w1 (sim/step w0 16.0 [:kami.runtime-test/nudge])]
+    (is (= [1.0 0.0 0.0] (-> (ecs/get-entity w1 tree) :transform/translation)))))
+
+(deftest render-once-submits-packed-frame
+  (let [b  (mock)
+        w  (ecs/load-snapshot snap)
+        fr (sim/render-once w b {:n 5 :aspect 1.0})]
+    (is (= 5 (:frame/n fr)))
+    (let [[ev ncols len] (last @(:log b))]
+      (is (= :submit ev))
+      (is (= 2 ncols))                       ; camera + 1 instanced draw
+      (is (and (pos? len) (zero? (mod len 16)))))))
+
+(deftest commit-path
+  (let [w0 (ecs/load-snapshot snap)
+        w1 (sim/step w0 16.0 [:kami.runtime-test/nudge])
+        committed (atom nil)
+        transact  (fn [tx] (reset! committed tx) 2) ; returns new basis-t
+        w2 (sim/commit! w1 transact)]
+    (testing "commit emits a tx for the moved tree"
+      (is (= 1 (count @committed)))
+      (is (= tree (:kami/eid (first @committed)))))
+    (testing "post-commit the world is clean (re-anchored)"
+      (is (empty? (ecs/->tx w2)))
+      (is (= 2 (:basis-t w2))))
+    (testing "commit with no changes is a no-op"
+      (is (= w0 (sim/commit! w0 (fn [_] (throw (ex-info "should not transact" {})))))))))

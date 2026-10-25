@@ -1,0 +1,90 @@
+(ns kotoba.p2p.graphsync-stream-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ed25519.core :as ed]
+            [ipld.core :as ipld]
+            [kotoba.net.libp2p.dial :as dial]
+            [kotoba.net.libp2p.handshake :as handshake]
+            [kotoba.net.libp2p.keys :as keys]
+            [kotoba.net.libp2p.node :as node]
+            [kotoba.p2p.graphsync :as gs]
+            [kotoba.p2p.graphsync-stream :as stream]
+            [multiformats.core :as mf]))
+
+(def wire-limits
+  {:max-message-bytes 65536 :max-requests 8 :max-responses 8 :max-blocks 8})
+
+(defn- seed [n]
+  (byte-array (map unchecked-byte (repeat 32 n))))
+
+(defn- test-identity [n]
+  (let [seed (seed n)
+        public-key (ed/pubkey-from-seed seed)
+        protobuf (handshake/public-key-protobuf public-key)]
+    {:identity-public-key public-key
+     :sign-fn (fn [octets]
+                (ed/sign seed (byte-array (map unchecked-byte octets))))
+     :verify-fn (keys/verifier)
+     :peer-id (handshake/peer-id mf/sha256 protobuf)}))
+
+(defn- put-block! [store node]
+  (let [{:keys [cid bytes]} (ipld/node->block node)]
+    (swap! store assoc cid bytes)
+    cid))
+
+(deftest graphsync-crosses-an-authenticated-real-libp2p-stream
+  (let [source (atom {})
+        sink (atom {})
+        root (put-block! source {"kind" "root" "value" 42})
+        authorized-peer (promise)
+        server-config
+        {:authorize-fn (fn [{:keys [peer-id]}]
+                         (deliver authorized-peer peer-id)
+                         true)
+         :get-fn #(get @source %)
+         :wire-limits wire-limits
+         :scheduler-config {:max-active 4
+                            :max-extensions 4
+                            :max-blocks-per-message 2
+                            :max-block-bytes-per-message 65536
+                            :max-traversal-work-per-step 32}
+         :traversal-limits {:max-blocks 8 :max-bytes 65536
+                            :max-depth 8 :max-matches 8}
+         :max-response-messages 16}
+        server (node/node
+                (assoc (test-identity 41) :protocol-handlers
+                       {gs/protocol-id (stream/responder-handler server-config)}))
+        listener (node/listen! server {:host "127.0.0.1" :port 0})
+        client-identity (test-identity 42)
+        live (dial/dial! (str "/ip4/127.0.0.1/tcp/" (:port listener))
+                         client-identity)
+        request {:id (byte-array (range 16)) :type :new :root root
+                 :selector {:selector :matcher}}]
+    (try
+      (let [result (stream/request!
+                    live request
+                    {:wire-limits wire-limits
+                     :put-fn #(swap! sink assoc %1 %2)
+                     :max-messages 16})]
+        (is (= [root] (:landed-cids result)))
+        (is (= (vec (get @source root)) (vec (get @sink root))))
+        (is (= (:completed-full gs/status)
+               (:status (last (:responses result)))))
+        (testing "authorization uses the PeerId proven by Noise"
+          (is (= (:peer-id client-identity)
+                 (deref authorized-peer 2000 nil)))))
+      (finally
+        ((:close! live))
+        ((:stop! listener))))))
+
+(deftest responder-denies-before-reading-application-bytes
+  (let [reads (atom 0)
+        error (try
+                (stream/serve-once!
+                 {:peer-id [1 2 3]
+                  :port {:read! (fn [_] (swap! reads inc) [])
+                         :write! (fn [_])}}
+                 {:authorize-fn (constantly false)})
+                nil
+                (catch clojure.lang.ExceptionInfo error error))]
+    (is (= :graphsync/unauthorized (:type (ex-data error))))
+    (is (zero? @reads))))

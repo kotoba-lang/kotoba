@@ -1,0 +1,200 @@
+(ns one-time-link.core
+  "一度きりのリンクの寿命の判断。**トークンそのものは受け取らない。**
+
+  サインインリンク・招待・アドレス確認・パスワード再設定 —— 形はどれも同じで、
+  『秘密をメールに載せて送り、開いた 1 回だけ効かせる』。同じものを 2 回書くと
+  必ず片方に穴が空くので、判断をここに 1 本化する。
+
+  ## この repo が持つのは判断だけ
+
+  乱数も、ハッシュも、KV も、メール送信も無い。呼び出し側が
+
+    - トークンを作り（CSPRNG）
+    - その **digest** をここに渡し
+    - 返った record を保存し
+    - リンクを配る
+
+  という機構を持つ。ここは『いま出してよいか』『これは通してよいか』だけを答える。
+
+  ## digest しか見ないのは、型で強制するため
+
+  実測（2026-08-06、cloud-itonami / cloud-itonami-app の両方）で、独立に書かれた
+  2 つの実装が**どちらも同じ結論**に達していた: 保存するのはトークンではなく
+  SHA-256 の digest。理由も同じ —— リンクはメールを通るので、送信側・受信側・
+  その間のプロバイダのどこかに平文が残る。保管側も漏れたときに、そこから生きた
+  リンクを組み立てられる状態にしない。
+
+  その結論を docstring ではなく**引数の形**にした。この ns の関数はトークンを
+  受け取らないので、うっかり平文を保存する経路が書けない。
+
+  ## 種類は発行時に決まる
+
+  `:kind` を record に焼き、`redeem` はそれで分岐する。**いまの状態から推測
+  しない** —— リンクが飛んでいる 10 分の間に状態が変われば、送ったつもりのものと
+  違うものが渡る（cloud-itonami で実際にこの分岐が要った: 根が出来た口座に
+  『新しい根を作れる』リンクが通ってしまう）。
+
+  ## 冷却は安全性ではなく受信箱のため
+
+  第三者に受信箱を埋めさせない（mail bombing）ためで、リンクの強度とは無関係。
+  だから冷却中の refusal は**利用者には見せない** —— `public-outcome` が常に
+  同じ形を返す。"
+  (:require [kotoba.lang.text :as str]))
+
+(def schema "one-time-link.core.v1")
+
+(def default-policy
+  "実測から来た既定値。cloud-itonami と cloud-itonami-app が**独立に**同じ数字
+  （10 分 / 60 秒）に着地していたので、それを既定にした。
+
+  `:ttl-ms` が 10 分なのは『人がメールを開いてリンクを踏むのに要る時間』で、
+  それ以上長くしても攻撃面が広がるだけ。`:cooldown-ms` は受信箱の保護。"
+  {:one-time-link/ttl-ms (* 10 60 1000)
+   :one-time-link/cooldown-ms (* 60 1000)})
+
+(defn policy
+  "配備の上書きを既定に重ねる。未指定の項目は既定のまま。"
+  [overrides]
+  (merge default-policy (or overrides {})))
+
+;; ---------------------------------------------------------------------------
+;; 発行
+;; ---------------------------------------------------------------------------
+
+(defn cooling-down?
+  "直前の発行からまだ冷却中か。`last-issued-at` が nil なら冷却していない。"
+  [{:keys [:one-time-link/cooldown-ms]} last-issued-at now]
+  (boolean (and (integer? last-issued-at) (integer? now) (integer? cooldown-ms)
+                (< (- now last-issued-at) cooldown-ms))))
+
+(defn issue-plan
+  "いまリンクを 1 本出してよいか、出すならどんな record を保存するか。
+
+  `:digest` は呼び出し側が作ったトークンの digest。**トークンは渡さない。**
+  `:subject` は誰に対するリンクか（口座 id / テナント + アドレス等、呼び出し側の
+  語彙のまま持つ）。`:target` は種類ごとの補助値（確認しようとしているアドレス等）。
+
+  出さない理由（`:one-time-link/refused`）は運用者向けで、**利用者には見せない**
+  —— `public-outcome` を使うこと。"
+  [{:keys [policy digest kind subject target now last-issued-at]}]
+  (let [p (one-time-link.core/policy policy)]
+    (cond
+      (str/blank? (str digest))
+      {:one-time-link/issue? false :one-time-link/refused :no-digest}
+
+      (nil? kind)
+      {:one-time-link/issue? false :one-time-link/refused :no-kind}
+
+      (not (integer? now))
+      {:one-time-link/issue? false :one-time-link/refused :no-clock}
+
+      (cooling-down? p last-issued-at now)
+      {:one-time-link/issue? false
+       :one-time-link/refused :cooling-down
+       :one-time-link/retry-after-ms
+       (- (:one-time-link/cooldown-ms p) (- now last-issued-at))}
+
+      :else
+      {:one-time-link/issue? true
+       :one-time-link/record
+       {:one-time-link/schema schema
+        :one-time-link/digest (str digest)
+        :one-time-link/kind kind
+        :one-time-link/subject subject
+        :one-time-link/target target
+        :one-time-link/issued-at now
+        ;; 期限の正本は**この record**。保管側の TTL（KV は下限 60 秒で実装
+        ;; 依存）を期限として当てにしない —— 実測でどちらの実装も同じ結論に
+        ;; 達していた。
+        :one-time-link/expires-at (+ now (:one-time-link/ttl-ms p))}})))
+
+;; ---------------------------------------------------------------------------
+;; 消費
+;; ---------------------------------------------------------------------------
+
+(defn digest=?
+  "digest 同士の比較。長さが違えば即 false、同じなら全文字を見てから返す。
+
+  ホストが定数時間比較を持っているならそちらを使ってよい（JVM の
+  `MessageDigest/isEqual` 等）。ここに置くのは、**持っていないホストが
+  `=` に落ちないようにする**ため。
+
+  ⚠ 文字を**コード値に変換しない**。最初の実装は `(bit-xor (int (nth a i))
+  (int (nth b i)))` だったが、ClojureScript では `nth` が 1 文字の**文字列**を
+  返し `(int \"a\")` が NaN になるため、`bit-xor` が常に 0 になって
+  **長さの同じ digest が全て一致した**。JVM では正しく、ブラウザと Worker
+  でだけ壊れる。この repo が両ホストでテストを回している理由がこれで、
+  実際に初回の cljs 実行が捕まえた。
+
+  文字の等値比較なら両ホストで同じ答えになり、`reduce` が早期脱出しないので
+  比較回数は入力の内容に依らない。"
+  [a b]
+  (let [a (str a) b (str b)]
+    (and (pos? (count a))
+         (= (count a) (count b))
+         (zero? (reduce (fn [acc i]
+                          (bit-or acc (if (= (nth a i) (nth b i)) 0 1)))
+                        0
+                        (range (count a)))))))
+
+(def refusals
+  "通さない理由。**どれも利用者には同じ 1 つの応答になる**（`public-outcome`）。
+  分けているのは運用者の台帳のためで、出し分けると当てずっぽうの入力に対して
+  『この record は在る』が漏れる。"
+  #{:not-found :expired :consumed :digest-mismatch :wrong-kind :no-clock})
+
+(defn redeem
+  "提示された digest を、保管されていた record に照らす。
+
+  `expect-kind` を渡すと種類も見る。**保管された種類が正**で、いまの状態から
+  推測しない（この ns の docstring）。
+
+  返るのは
+    {:one-time-link/redeemed? true  :one-time-link/kind k :one-time-link/subject s
+     :one-time-link/target t}
+  か
+    {:one-time-link/redeemed? false :one-time-link/refused r}"
+  [record presented-digest now & {:keys [expect-kind]}]
+  (let [refuse (fn [r] {:one-time-link/redeemed? false :one-time-link/refused r})]
+    (cond
+      (nil? record) (refuse :not-found)
+      (not (integer? now)) (refuse :no-clock)
+      (true? (:one-time-link/consumed? record)) (refuse :consumed)
+
+      (not (integer? (:one-time-link/expires-at record))) (refuse :expired)
+      (>= now (:one-time-link/expires-at record)) (refuse :expired)
+
+      (not (digest=? (:one-time-link/digest record) presented-digest))
+      (refuse :digest-mismatch)
+
+      (and expect-kind (not= expect-kind (:one-time-link/kind record)))
+      (refuse :wrong-kind)
+
+      :else
+      {:one-time-link/redeemed? true
+       :one-time-link/kind (:one-time-link/kind record)
+       :one-time-link/subject (:one-time-link/subject record)
+       :one-time-link/target (:one-time-link/target record)})))
+
+(defn consume
+  "使い切った印を付けた record。保管側が消せるなら消す方がよい（結果整合の
+  ストアでは『消す』が唯一の単回性）。消せない保管側のために印も用意する。"
+  [record now]
+  (when record
+    (assoc record :one-time-link/consumed? true :one-time-link/consumed-at now)))
+
+;; ---------------------------------------------------------------------------
+;; 外に見せる形
+;; ---------------------------------------------------------------------------
+
+(defn public-outcome
+  "利用者に返す形。**発行できたかどうかで変えない。**
+
+  未登録・存在しない・停止中・冷却中・送信失敗 —— どれも同じ応答にする。
+  出し分けると、当てずっぽうのアドレスに対して『この人は在籍している』が漏れる。
+  実測で 2 つの実装がどちらも独立にこの規律に達していた。
+
+  メッセージは呼び出し側が渡す（言語と語彙はプロダクトのもの）。"
+  [message]
+  {:one-time-link/accepted true
+   :one-time-link/message message})

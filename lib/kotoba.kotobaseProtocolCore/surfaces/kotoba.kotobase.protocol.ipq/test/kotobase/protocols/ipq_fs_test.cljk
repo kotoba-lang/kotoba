@@ -1,0 +1,464 @@
+(ns kotobase.protocols.ipq-fs-test
+  (:require [kotoba.bytes :as kbytes] #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing use-fixtures]])
+            [ipld.car.bytes :as bytes]
+            [ipld.car :as car]
+            [ipld.core :as ipld]
+            [ipld.dag-json :as dag-json]
+            [kotoba.lang.text :as str]
+            [kotobase.protocols.ipq :as ipq]
+            [kotobase.protocols.ipq.fs :as fs]
+            [multiformats.core :as mf]))
+
+#?(:cljs (def node-fs-test (js/require "node:fs")))
+#?(:cljs (def node-path-test (js/require "node:path")))
+#?(:cljs (def node-crypto-test (js/require "node:crypto")))
+#?(:cljs
+   (defn test-make-writable! [path]
+     (when (.existsSync node-fs-test path)
+       (let [stat (.lstatSync node-fs-test path)]
+         (if (.isDirectory stat)
+           (do (.chmodSync node-fs-test path 493)
+               (doseq [name (js->clj (.readdirSync node-fs-test path))]
+                 (test-make-writable! (.join node-path-test path name))))
+           (.chmodSync node-fs-test path 420))))))
+
+#?(:cljs
+   (let [node-os (js/require "node:os")
+         root (.join node-path-test (.tmpdir node-os) (str "ipq-fs-test-" (.-pid js/process)))]
+     (set! (.. js/process -env -KOTOBA_IPQ_FS_CACHE) root)
+     (use-fixtures :once
+       (fn [run]
+         (try (run)
+              (finally (test-make-writable! root)
+                       (.rmSync node-fs-test root #js {:recursive true :force true})))))))
+
+(def snapshot
+  {"version" 1
+   "entries" [{"path" "/workspace" "type" "directory"}
+              {"path" "/workspace/docs" "type" "directory"}
+              {"path" "/workspace/docs/readme.txt" "type" "file"
+               "text" "alpha\nbeta\nalpha\n"}
+              {"path" "/workspace/root.txt" "type" "file" "text" "root 😀\n"}]})
+
+(defn snapshot-adl []
+  {:version 1
+   :validate-representation (fn [value]
+                              (try (do (bytes/bcount value) true)
+                                   (catch #?(:clj Exception :cljs :default) _ false)))
+   :decode ipld/decode
+   :encode ipld/encode
+   :validate-logical map?
+   :fuel-costs {:validate-representation 1 :decode 1 :encode 1 :validate-logical 1}})
+
+(defn base64url [b]
+  (-> (dag-json/base64-encode b)
+      (str/replace "+" "-")
+      (str/replace "/" "_")
+      (str/replace "=" "")))
+
+(defn fixture-for [logical]
+  (let [representation (ipld/encode logical)
+        root (mf/cidv1-raw representation)
+        ctx {:blocks {:get (fn [cid]
+                             (when (= cid root)
+                               {:bytes representation
+                                :content-type "application/vnd.ipld.raw"}))}}
+        response (ipq/handle ctx
+                             {:method :get
+                              :path (str "/ipq/v1/selection/" root)
+                              :headers {}
+                              :query {"selector" (base64url fs/snapshot-selector-bytes)}})
+        car-bytes (bytes/as-bytes (dag-json/base64-decode (:body response)))]
+    {:root root :response response :car-bytes car-bytes}))
+
+(defn fixture [] (fixture-for snapshot))
+
+(defn mounted []
+  (let [{:keys [root car-bytes]} (fixture)]
+    (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+               :adl-capability (snapshot-adl)})))
+
+(defn problem [f]
+  (try (do (f) nil)
+       (catch #?(:clj Exception :cljs js/Error) e
+         (or (:problem (ex-data e)) (:type (ex-data e))))))
+
+(deftest ipq-car-adl-and-filesystem-capabilities-form-one-verified-path
+  (let [{:keys [response]} (fixture)
+        mount (mounted)
+        providers (fs/provider-registry mount)]
+    (is (= 200 (:status response)) "the fixture really crossed the IPQ handler")
+    (is (= #?(:clj :kotobase.ipq/fs-mount-v1
+              :cljs :kotobase.ipq/fs-disk-mount-v1)
+           (:format mount)))
+    #?(:cljs (do (is (string? (:local-root mount)))
+                 (is (nil? (get-in mount [:entries "/workspace/root.txt" "text"])))
+                 (is (every? #(nil? (get % "text"))
+                             (mapcat val (:children-by-parent mount))))
+                 (is (= "root 😀\n"
+                        (.readFileSync node-fs-test
+                                       (.join node-path-test (:local-root mount) "root.txt")
+                                       "utf8"))))
+       :clj nil)
+    (is (= 1 (:ipq-profile mount)))
+    (is (= [(:root mount)] (get-in mount [:receipt :loaded])))
+    (is (true? (get-in mount [:receipt :adl-determinism-checked?])))
+    (is (= #{34 35} (set (keys providers))))
+    (is (= "docs\t1\nroot.txt\t0" (fs/browse mount "/workspace")))
+    (is (= "readme.txt\t0" (fs/browse mount "/workspace/docs")))
+    (is (= "alpha\nbeta\nalpha\n"
+           (fs/app-data mount "/workspace/docs/readme.txt")))
+    (is (= "1" (fs/app-data mount "/workspace/docs/readme.txtEXISTS_SEP")))
+    (is (= "0" (fs/app-data mount "/workspace/missingEXISTS_SEP")))
+    (is (= "0 10 0 0" (fs/app-data mount "/workspace/root.txtSTAT_SEP")))
+    (is (= "0 0 0 1" (fs/app-data mount "/workspace/docsSTAT_SEP")))
+    (is (= "readme.txt\t0"
+           ((get-in providers [34 :invoke]) "/workspace/docs")))
+    (is (= "alpha\nbeta\nalpha\n"
+           ((get-in providers [35 :invoke]) "/workspace/docs/readme.txt")))))
+
+(deftest mount-and-provider-refuse-distinct-invalid-states
+  (let [{:keys [root car-bytes]} (fixture)]
+    (testing "ADL version mismatch is not accepted as a snapshot"
+      (is (= :adl-version-mismatch
+             (problem #(fs/mount {:car-bytes car-bytes :root root
+                                  :scope-root "/workspace"
+                                  :adl-capability (assoc (snapshot-adl) :version 2)})))))
+    (let [mount (mounted)]
+      (is (= :request-outside-scope (problem #(fs/browse mount "/etc"))))
+      (is (= :not-directory (problem #(fs/browse mount "/workspace/root.txt"))))
+      (is (= :is-directory (problem #(fs/app-data mount "/workspace/docs"))))
+      (is (= :not-found (problem #(fs/app-data mount "/workspace/missing"))))
+      (is (= :read-only-profile
+             (problem #(fs/app-data mount "/workspace/root.txtRANGE_SEP0:4")))))))
+
+(deftest a-car-with-bytes-that-do-not-match-the-requested-root-never-reaches-adl
+  (let [{:keys [root]} (fixture)
+        invoked (atom 0)
+        wrong (ipld/encode (assoc snapshot "version" 99))
+        tampered (:bytes (car/encode {:roots [root]
+                                      :blocks [{:cid root :bytes wrong}]}))
+        adl (assoc (snapshot-adl) :decode
+                   (fn [value] (swap! invoked inc) (ipld/decode value)))]
+    (is (= :ipld/cid-mismatch
+           (problem #(fs/mount {:car-bytes tampered :root root
+                                :scope-root "/workspace" :adl-capability adl}))))
+    (is (= 0 @invoked) "CID verification happens before ADL execution")))
+
+(deftest malformed-logical-snapshots-fail-closed
+  (letfn [(attempt [logical]
+            (let [representation (ipld/encode logical)
+                  root (mf/cidv1-raw representation)
+                  ctx {:blocks {:get (fn [cid] (when (= cid root) {:bytes representation}))}}
+                  response (ipq/handle ctx {:method :get
+                                            :path (str "/ipq/v1/selection/" root)
+                                            :headers {}
+                                            :query {"selector" (base64url fs/snapshot-selector-bytes)}})
+                  car-bytes (bytes/as-bytes (dag-json/base64-decode (:body response)))]
+              (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+                         :adl-capability (snapshot-adl)})))]
+    (is (= :duplicate-path
+           (problem #(attempt (update snapshot "entries" conj
+                                      {"path" "/workspace/root.txt"
+                                       "type" "file" "text" "other"})))))
+    (is (= :noncanonical-path
+           (problem #(attempt (update snapshot "entries" conj
+                                      {"path" "/workspace/../secret"
+                                       "type" "file" "text" "no"})))))
+    (is (= :parent-directory-required
+           (problem #(attempt (update snapshot "entries" conj
+                                      {"path" "/workspace/missing/child"
+                                       "type" "file" "text" "no"})))))))
+
+(deftest verified-mount-cache-is-explicit-bounded-and-capability-scoped
+  (let [{:keys [root car-bytes]} (fixture)
+        decodes (atom 0)
+        capability (assoc (snapshot-adl) :decode
+                          (fn [value] (swap! decodes inc) (ipld/decode value)))
+        options {:car-bytes car-bytes :root root :scope-root "/workspace"
+                 :adl-capability capability}
+        cache (fs/create-mount-cache 1)]
+    (is (= :miss (get-in (fs/mount-cached cache options) [:receipt :cache])))
+    (let [after-miss @decodes]
+      (is (pos? after-miss))
+      (is (= :hit
+             (get-in (fs/lookup-mount cache (dissoc options :car-bytes)) [:receipt :cache])))
+      (is (= after-miss @decodes) "a cache hit does not replay CAR or ADL work"))
+    (is (= :unknown-option
+           (problem #(fs/mount-cached cache (assoc options :unreviewed true))))
+        "a hit cannot bypass exact mount-option validation")
+    (testing "a different capability identity cannot reuse the verified result"
+      (is (= :miss
+             (get-in (fs/mount-cached cache (assoc options :adl-capability (snapshot-adl)))
+                     [:receipt :cache]))))
+    (testing "capacity one evicted the original capability-scoped entry"
+      (is (nil? (fs/lookup-mount cache (dissoc options :car-bytes))))
+      (is (= :miss (get-in (fs/mount-cached cache options) [:receipt :cache]))))))
+
+(deftest declared-entry-limit-is-reachable-before-adl-output-budget
+  (letfn [(logical [file-count]
+            {"version" 1
+             "entries"
+             (into [{"path" "/workspace" "type" "directory"}]
+                   (map (fn [i] {"path" (str "/workspace/f" i)
+                                 "type" "file" "text" ""})
+                        (range file-count)))})
+          (attempt [file-count]
+            (let [{:keys [root car-bytes]} (fixture-for (logical file-count))]
+              (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+                         :adl-capability (snapshot-adl)})))]
+    (is (= 4096 (count (:entries (attempt 4095))))
+        "the documented 4096-entry ceiling is admitted")
+    (is (= :entry-limit (problem #(attempt 4096)))
+        "the next entry is refused by the named logical limit")))
+
+(deftest provider-registry-defaults-to-fetch-before-cache-only-once
+  (let [{:keys [root car-bytes]} (fixture)
+        fetches (atom 0)
+        identity {:root root :scope-root "/workspace"
+                  :adl-capability (snapshot-adl)}
+        fetch-car (fn [] (swap! fetches inc) car-bytes)
+        first-registry (fs/provider-registry identity fetch-car)
+        second-registry (fs/provider-registry identity fetch-car)]
+    (is (= 1 @fetches) "all filesystem commands share one verified default mount")
+    (is (= "docs\t1\nroot.txt\t0"
+           ((get-in first-registry [34 :invoke]) "/workspace")))
+    (is (= "alpha\nbeta\nalpha\n"
+           ((get-in second-registry [35 :invoke]) "/workspace/docs/readme.txt")))))
+
+#?(:cljs
+   (deftest changed-disk-cache-file-is-refused
+     (let [logical (update snapshot "entries"
+                           (fn [entries]
+                             (mapv (fn [entry]
+                                     (if (= "/workspace/root.txt" (get entry "path"))
+                                       (assoc entry "text" "unique cache text") entry)) entries)))
+           {:keys [root car-bytes]} (fixture-for logical)
+           capability (snapshot-adl)
+           identity {:root root :scope-root "/workspace" :adl-capability capability}
+           cache (fs/create-mount-cache 1)
+           mount (fs/mount-cached cache (assoc identity :car-bytes car-bytes))
+           file (.join node-path-test (:local-root mount) "root.txt")]
+       (.chmodSync node-fs-test file 420)
+       (.writeFileSync node-fs-test file "tampered")
+       (is (= :cache-digest
+              (problem #(fs/app-data mount "/workspace/root.txt"))))
+       (let [receipt-path (.join node-path-test (.dirname node-path-test (:local-root mount))
+                                 "receipt.json")
+             receipt (js/JSON.parse (.readFileSync node-fs-test receipt-path "utf8"))
+             row (first (filter #(= "root.txt" (.-path %)) (array-seq (.-files receipt))))
+             sha (-> (.createHash node-crypto-test "sha256")
+                     (.update "tampered" "utf8") (.digest "hex"))]
+         (set! (.-size row) 8)
+         (set! (.-sha256 row) sha)
+         (.chmodSync node-fs-test receipt-path 420)
+         (.writeFileSync node-fs-test receipt-path (js/JSON.stringify receipt))
+         (is (= :cache-receipt-mismatch
+                (problem #(fs/lookup-mount cache identity))))))))
+
+;; ── version 2: content named by CID ──────────────────────────────────────────
+;;
+;; Version 1 inlines every file, so the largest tree it can DESCRIBE is the
+;; largest answer IPQ will return — 4 MiB. That is a ceiling on the subject
+;; rather than on the response, and it is the one measured against a real site
+;; on 2026-09-23: 40.65 MiB across 600 documents, ten times over, with no
+;; arrangement of selectors that would have helped.
+;;
+;; These fix the two halves that make version 2 safe to add. The manifest is
+;; not trusted — every block is checked against the CID it was asked for, the
+;; size the manifest declared, and the text contract it will be served under.
+;; And the budget that decides whether to fetch at all is answered from the
+;; manifest, before the first fetch.
+
+(defn text->bytes [t]
+  #?(:clj (kbytes/utf8-bytes ^String t)
+     :cljs (.encode (js/TextEncoder.) t)))
+
+(defn text-cid [t] (mf/cidv1-raw (text->bytes t)))
+(defn text-size [t] (bytes/bcount (text->bytes t)))
+
+(def referenced-text "alpha\nbeta\nalpha\n")
+(def inline-text "root 😀\n")
+
+(defn port
+  "A block port plus the call counter, so a test can assert that nothing was
+   fetched as well as that something was."
+  [blocks]
+  (let [calls (atom 0)]
+    {:blocks {:get (fn [cid] (swap! calls inc) (get blocks cid))}
+     :calls calls}))
+
+(defn text-port [& texts]
+  (port (into {} (map (fn [t] [(text-cid t) {:bytes (text->bytes t)}])) texts)))
+
+(defn v2-snapshot
+  ([] (v2-snapshot {}))
+  ([{:keys [size cid version]}]
+   {"version" (or version 2)
+    "entries" [{"path" "/workspace" "type" "directory"}
+               {"path" "/workspace/docs" "type" "directory"}
+               {"path" "/workspace/docs/readme.txt" "type" "file"
+                "cid" (or cid (text-cid referenced-text))
+                "size" (or size (text-size referenced-text))}
+               {"path" "/workspace/root.txt" "type" "file" "text" inline-text}]}))
+
+(defn mount-v2 [snapshot options]
+  (let [{:keys [root car-bytes]} (fixture-for snapshot)]
+    (fs/mount (merge {:car-bytes car-bytes :root root :scope-root "/workspace"
+                      :adl-capability (snapshot-adl)}
+                     options))))
+
+(deftest referenced-content-is-fetched-verified-and-served-as-one-entry-shape
+  (let [{:keys [blocks calls]} (text-port referenced-text)
+        mount (mount-v2 (v2-snapshot) {:blocks blocks})]
+    (testing "the referenced file reads exactly like an inline one"
+      (is (= referenced-text (fs/app-data mount "/workspace/docs/readme.txt")))
+      (is (= inline-text (fs/app-data mount "/workspace/root.txt"))))
+    (testing "both forms appear in the same directory listing"
+      (is (= "docs\t1\nroot.txt\t0" (fs/browse mount "/workspace"))))
+    (testing "one block was fetched — the inline entry did not go to the port"
+      (is (= 1 @calls)))
+    (testing "the receipt says what was fetched beyond the root"
+      (is (= {"/workspace/docs/readme.txt" (text-cid referenced-text)}
+             (get-in mount [:receipt :content-cids])))
+      (is (= (text-size referenced-text) (get-in mount [:receipt :referenced-bytes]))))))
+
+(deftest a-manifest-without-a-port-is-refused-by-name-not-mounted-unreadable
+  (is (= :blocks-port-required (problem #(mount-v2 (v2-snapshot) {}))))
+  (testing "a version-1 snapshot still needs no port at all"
+    (is (some? (fs/app-data (mounted) "/workspace/root.txt")))))
+
+(deftest every-block-is-checked-against-the-manifest-that-named-it
+  (testing "bytes that are not the ones named"
+    (let [{:keys [blocks]} (text-port "something else entirely")
+          wrong (:get blocks)]
+      (is (= :content-cid-mismatch
+             (problem #(mount-v2 (v2-snapshot)
+                                 {:blocks {:get (fn [_] (wrong (text-cid "something else entirely")))}}))))))
+  (testing "a size the manifest got wrong"
+    (let [{:keys [blocks]} (text-port referenced-text)]
+      (is (= :content-size-mismatch
+             (problem #(mount-v2 (v2-snapshot {:size (inc (text-size referenced-text))})
+                                 {:blocks blocks}))))))
+  (testing "a block the port does not have"
+    (let [{:keys [blocks]} (text-port "unrelated")]
+      (is (= :content-block-missing
+             (problem #(mount-v2 (v2-snapshot) {:blocks blocks}))))))
+  (testing "a size the manifest got right for bytes that are not text"
+    ;; Non-UTF-8 is not a refusal here — see the binary test below — so the
+    ;; size check has to be what catches a wrong one, on any bytes.
+    (let [raw #?(:clj (byte-array [-1 -2]) :cljs (js/Uint8Array.from #js [255 254]))
+          cid (mf/cidv1-raw raw)]
+      (is (= :content-size-mismatch
+             (problem #(mount-v2 (v2-snapshot {:cid cid :size 3})
+                                 {:blocks {:get (fn [_] {:bytes raw})}})))))))
+
+(deftest a-binary-file-is-described-and-listed-and-refused-only-where-it-cannot-be-served
+  (let [raw #?(:clj (byte-array [-1 -2 0 -3])
+               :cljs (js/Uint8Array.from #js [255 254 0 253]))
+        cid (mf/cidv1-raw raw)
+        mount (mount-v2 (v2-snapshot {:cid cid :size 4})
+                        {:blocks {:get (fn [_] {:bytes raw})}})]
+    (testing "it is in the tree, listed, and STATs at its real size"
+      (is (= "1" (fs/app-data mount "/workspace/docs/readme.txtEXISTS_SEP")))
+      (is (= "0 4 0 0" (fs/app-data mount "/workspace/docs/readme.txtSTAT_SEP")))
+      (is (= "readme.txt\t0" (fs/browse mount "/workspace/docs"))))
+    (testing "the string port refuses it by name instead of serving U+FFFD"
+      (is (= :binary-content (problem #(fs/app-data mount "/workspace/docs/readme.txt")))))
+    (testing "and its bytes on the materialized tree are the bytes"
+      ;; The point of keeping it: ADR-2609063500 has agents read the
+      ;; materialized tree with ordinary tools. A byte that did not survive
+      ;; the write would make that tree a different tree from the one whose
+      ;; CID was verified.
+      #?(:cljs
+         (let [on-disk (.readFileSync node-fs-test
+                                      (.join node-path-test (:local-root mount)
+                                             "docs" "readme.txt"))]
+           (is (= 4 (.-length on-disk)))
+           (is (= [255 254 0 253] (vec (array-seq on-disk)))))))))
+
+(deftest a-manifest-that-disagrees-with-itself-is-refused-before-any-fetch
+  (testing "version 1 cannot name content by CID"
+    (let [{:keys [blocks calls]} (text-port referenced-text)]
+      (is (= :referenced-entry-unsupported
+             (problem #(mount-v2 (v2-snapshot {:version 1}) {:blocks blocks}))))
+      (is (= 0 @calls))))
+  (testing "an entry carrying both text and cid is not a shape with a tie-break"
+    (let [snapshot (update (v2-snapshot) "entries"
+                           (fn [entries]
+                             (mapv (fn [e] (cond-> e
+                                             (contains? e "cid") (assoc "text" "both")))
+                                   entries)))]
+      (is (= :entry-fields (problem #(mount-v2 snapshot {:blocks {:get (fn [_] nil)}}))))))
+  (testing "a CID this provider cannot serve as file bytes is refused as its form"
+    (is (= :content-cid-form
+           (problem #(mount-v2 (v2-snapshot {:cid "bafyreibvjvcv745gig4mvqs4hctx4zfkono4rjejm2ta6gtyzkqxfjeily"})
+                               {:blocks {:get (fn [_] nil)}}))))))
+
+(deftest the-referenced-budget-is-answered-from-the-manifest-before-fetching
+  ;; Both numbers are DERIVED from the published limits: the largest a single
+  ;; referenced file may be, and one more of them than the mount budget
+  ;; admits. Writing either as a literal would make this test pass for the
+  ;; wrong reason the day a limit moves — the first draft chose 8 MiB per
+  ;; file and was refused as :content-size, by the per-file ceiling, before
+  ;; the total was ever reached.
+  (let [per-file (:max-file-bytes fs/limits)
+        n (inc (quot (:max-referenced-bytes fs/limits) per-file))
+        entries (into [{"path" "/workspace" "type" "directory"}]
+                      (map (fn [i]
+                             {"path" (str "/workspace/f" i ".txt") "type" "file"
+                              "cid" (text-cid (str "file-" i)) "size" per-file}))
+                      (range n))
+        {:keys [blocks calls]} (text-port referenced-text)]
+    (testing "one file past the budget is refused, and nothing was fetched"
+      (is (> (* n per-file) (:max-referenced-bytes fs/limits)))
+      (is (= :referenced-content-limit
+             (problem #(mount-v2 {"version" 2 "entries" entries} {:blocks blocks}))))
+      (is (= 0 @calls)))))
+
+(deftest a-tree-larger-than-one-response-is-now-describable
+  (let [per-file 1048576
+        n 8
+        total (* per-file n)
+        entries (into [{"path" "/workspace" "type" "directory"}]
+                      (map (fn [i]
+                             {"path" (str "/workspace/big" i ".txt") "type" "file"
+                              "cid" (text-cid (str "big-" i)) "size" per-file}))
+                      (range n))
+        {:keys [blocks calls]} (text-port "nothing this manifest names")]
+    (testing "the manifest totals more content than version 1 could hold at all"
+      (is (> total (:max-inline-content-bytes fs/limits))))
+    (testing "and it passes every ceiling, reaching the fetch it cannot satisfy here"
+      ;; :content-block-missing rather than a limit refusal is the assertion:
+      ;; an 8 MiB tree got past the ceiling that would have stopped it in
+      ;; version 1 and was refused only for the block this test declines to
+      ;; provide.
+      (is (= :content-block-missing
+             (problem #(mount-v2 {"version" 2 "entries" entries} {:blocks blocks}))))
+      (is (= 1 @calls)))))
+
+(deftest the-entry-limit-decides-for-referenced-entries-too
+  ;; The v1 case is covered above. This is the same claim for the WIDEST
+  ;; entry shape, which is the one that broke it: a referenced entry is nine
+  ;; logical nodes where an inline one is seven, so a literal output-node
+  ;; budget sized for inline entries refused a full referenced manifest
+  ;; before `:max-entries` could speak. Both numbers here come from the
+  ;; published limit so the test cannot drift away from it.
+  (letfn [(logical [file-count]
+            {"version" 2
+             "entries"
+             (into [{"path" "/workspace" "type" "directory"}]
+                   (map (fn [i] {"path" (str "/workspace/f" i) "type" "file"
+                                 "cid" (text-cid referenced-text)
+                                 "size" (text-size referenced-text)}))
+                   (range file-count))})
+          (attempt [file-count]
+            (let [{:keys [root car-bytes]} (fixture-for (logical file-count))
+                  {:keys [blocks]} (text-port referenced-text)]
+              (fs/mount {:car-bytes car-bytes :root root :scope-root "/workspace"
+                         :adl-capability (snapshot-adl) :blocks blocks})))]
+    (is (= fs/max-entries (count (:entries (attempt (dec fs/max-entries)))))
+        "a full manifest of the widest entry shape is admitted")
+    (is (= :entry-limit (problem #(attempt fs/max-entries)))
+        "and one more is refused by the DECLARED limit, not by an expansion budget")))

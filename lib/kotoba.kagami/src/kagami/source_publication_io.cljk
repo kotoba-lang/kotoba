@@ -1,0 +1,383 @@
+(ns kagami.source-publication-io
+  "Git transaction adapter. Preparation writes private objects/custody refs;
+   apply revalidates proofs and uses one non-forced expected-parent ref update."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:crypto" :as crypto]
+            [kotoba.lang.text :as str]
+            [kagami.source :as s]
+            [kagami.source-io :as io]
+            [kagami.source-publication :as pub]
+            [kagami.west :as west]
+            [kagami.db :as db]
+            [kagami.pin :as pin]
+            [kagami.did :as did]
+            [kagami.ci :as ci]))
+
+(defn sha256 [text] (-> (crypto/createHash "sha256") (.update text "utf8") (.digest "hex")))
+(defn signer [pem]
+  (s/require! (= "ed25519" (.-asymmetricKeyType (crypto/createPrivateKey pem))) :unsupported-signing-key {})
+  (let [der (.export (crypto/createPublicKey pem) #js {:type "spki" :format "der"})]
+    (s/require! (= 44 (.-length der)) :unsupported-signing-key {})
+    (did/pubkey-hex->did (.toString (.subarray der 12) "hex"))))
+(defn sign [pem text] (.toString (crypto/sign nil (js/Buffer.from text "utf8") pem) "hex"))
+(defn verify [signer text signature]
+  (try
+    (let [hex (did/did->pubkey-hex signer)
+          key (crypto/createPublicKey #js {:key (js/Buffer.from (str "302a300506032b6570032100" hex) "hex")
+                                          :type "spki" :format "der"})]
+      (boolean (and (re-matches #"[0-9a-f]{128}" signature)
+                    (crypto/verify nil (js/Buffer.from text "utf8") key (js/Buffer.from signature "hex")))))
+    (catch :default _ false)))
+
+(defn key! [{:keys [key kagi root kagi-command]}]
+  (s/require! (not= (boolean key) (boolean kagi)) :one-key-provider-required {})
+  (when kagi (s/require! (string? root) :kagi-root-required {}))
+  (when kagi-command
+    (s/require! (and kagi (string? kagi-command) (path/isAbsolute kagi-command)) :invalid-key-provider {}))
+  (if key (io/read-text key)
+      (io/run [(or kagi-command (path/join root "kotoba-lang/kagi/bin/kagi")) "get" kagi "--compartment" "personal"] root)))
+
+(defn at [repo oid file] (io/git repo "show" (str oid ":" file)))
+(defn optional-at [repo oid file]
+  ;; Only a successful tree lookup can establish absence. An object/transport
+  ;; failure must not turn an enrolled channel into a bootstrap candidate.
+  (when-not (empty? (io/git repo "ls-tree" "-z" oid "--" file))
+    (at repo oid file)))
+(defn read-at [repo oid file] (s/read-edn! (at repo oid file)))
+
+(defn policy-at! [repo expected]
+  (s/require! (s/oid? expected) :invalid-expected-parent {})
+  (let [p (pub/policy! (read-at repo expected pub/policy-path))]
+    (io/git repo "check-ref-format" (:policy/ref p)) p))
+
+(defn remote-url [repo remote]
+  (s/require! (s/segment? remote) :invalid-remote {})
+  (let [url (str/trim (io/git repo "config" "--get" (str "remote." remote ".url")))]
+    (s/require! (or (s/remote-url? url) (re-matches #"file:///[^\s]+" url)) :unsafe-remote-url {}) url))
+
+(defn head-at-url [repo url ref]
+  (s/require! (or (s/remote-url? url) (re-matches #"file:///[^\s]+" url)) :unsafe-remote-url {})
+  (let [lines (str/split-lines (str/trim (io/git repo "ls-remote" "--refs" url ref)))
+        [oid actual] (when (= 1 (count lines)) (str/split (first lines) #"\s+"))]
+    (s/require! (and (s/oid? oid) (= ref actual)) :remote-head-unverified {}) oid))
+
+(defn remote-head [repo remote ref] (head-at-url repo (remote-url repo remote) ref))
+
+(defn source-authorities!
+  "Ask the approved source authority, never the occupied canonical checkout.
+   GitHub uses the same compare predicates as west-pin-put. A policy may name
+   a sovereign Git remote; it is freshly fetched with full history in scratch."
+  [revision policy scratch]
+  (mapv
+   (fn [c]
+     (let [id (:repo/id c) old (get-in c [:revision/old :hex]) new (get-in c [:revision/new :hex])
+           provider (get (:policy/sources policy) id {:provider :github})]
+       (case (:provider provider)
+         :github
+         (let [metadata (js->clj (js/JSON.parse (io/run ["gh" "api" (str "repos/" id)] scratch)) :keywordize-keys true)
+               branch (:default_branch metadata)
+               _ (s/require! (and (= id (:full_name metadata)) (string? branch)) :source-unverified {:repo id})
+               compare (fn [a b]
+                         (js->clj (js/JSON.parse
+                           (io/run ["gh" "api" (str "repos/" id "/compare/" (js/encodeURIComponent a) "..." (js/encodeURIComponent b))] scratch))
+                           :keywordize-keys true))
+               reachable (compare branch new) forward (compare old new)]
+           (s/require! (and (#{"identical" "behind"} (:status reachable))
+                            (= "ahead" (:status forward)) (= 0 (:behind_by forward)))
+                       :source-unverified-or-nonforward {:repo id})
+           {:repo/id id :provider :github :default branch :new new})
+         :git
+         (let [dir (path/join scratch (str "authority-" (s/value-cid id)))
+               _ (fs/mkdirSync dir)
+               _ (io/git dir "init" "--bare" "-q")
+               _ (io/git dir "fetch" "--no-tags" (:url provider) (:ref provider))
+               head (str/trim (io/git dir "rev-parse" "FETCH_HEAD"))]
+           (s/require! (= "false" (str/trim (io/git dir "rev-parse" "--is-shallow-repository"))) :source-history-incomplete {})
+           (io/git dir "merge-base" "--is-ancestor" new head)
+           (io/git dir "merge-base" "--is-ancestor" old new)
+           {:repo/id id :provider :git :head head :new new})
+         (throw (ex-info "unsupported source authority" {:reason :unsupported-source-authority})))))
+   (get-in revision [:source/value :revision/changes])))
+
+(defn ledger [text]
+  (let [events (mapv s/read-edn! (remove str/blank? (str/split-lines text)))]
+    (s/require! (or (empty? text) (str/ends-with? text "\n")) :ledger-missing-newline {})
+    (s/require! (= (mapv :event/seq events) (vec (range 1 (inc (count events))))) :ledger-sequence-invalid {}) events))
+
+(defn head-value [repo expected policy db-text]
+  (let [h (sha256 db-text)]
+    (if-let [delta (:policy/delta-path policy)]
+      (do (s/require! (and (string? delta) (not (str/includes? delta ".."))
+                           (not (str/starts-with? delta "/"))) :invalid-delta-path {})
+          (sha256 (str h "|delta:" (sha256 (at repo expected delta))))) h)))
+
+(defn basis!
+  [repo expected base candidate revision policy candidate-lock]
+  (pub/verify-candidate! base candidate revision candidate-lock)
+  (let [texts (into {} (map (fn [file] [file (at repo expected file)])) pub/state-paths)
+        west-text (get texts "manifest/west.yml") db-text (get texts "manifest/fleet-db.edn")
+        db-value (s/read-edn! db-text) old-head (s/read-edn! (get texts "manifest/fleet-head.edn"))
+        lock-text (at repo expected pub/lock-path)
+        captured (s/from-west west-text (at repo expected "manifest/repos.edn") expected lock-text (s/read-edn! lock-text))
+        snapshot-fields [:snapshot/registry :snapshot/lock :snapshot/graph :snapshot/repos]
+        stored (optional-at repo expected pub/snapshot-path)]
+    (s/require! (= west-text (west/emit db-value)) :genpon-projection-drift {})
+    (s/require! (= (select-keys (:source/value captured) snapshot-fields)
+                    (select-keys (s/kind! base :snapshot) snapshot-fields)) :base-snapshot-drift {})
+    (if stored
+      (s/require! (= base (s/verify! (s/read-edn! stored))) :stale-base-snapshot {})
+      (s/require! (and (nil? (get-in base [:source/value :snapshot/parent]))
+                       (= expected (get-in base [:source/value :snapshot/basis]))) :invalid-bootstrap-snapshot {}))
+    (s/fields! old-head #{:record :signature :signer} #{})
+    (s/fields! (:record old-head) #{:pin/name :pin/value :pin/sequence :pin/parent :pin/valid-until} #{})
+    (s/require! (and (= "fleet-db" (get-in old-head [:record :pin/name]))
+                     (integer? (get-in old-head [:record :pin/sequence]))
+                     (<= 1 (get-in old-head [:record :pin/sequence]) 9007199254740990)
+                     (or (nil? (get-in old-head [:record :pin/parent]))
+                         (re-matches #"[0-9a-f]{64}" (get-in old-head [:record :pin/parent])))
+                     (nil? (get-in old-head [:record :pin/valid-until]))
+                     (= (head-value repo expected policy db-text) (get-in old-head [:record :pin/value]))
+                     ((set (:policy/publishers policy)) (:signer old-head))
+                     (verify (:signer old-head) (pin/canonical-str (:record old-head)) (:signature old-head)))
+                 :base-head-invalid-or-untrusted {})
+    {:texts texts :db db-value :ledger (ledger (get texts "manifest/fleet-db.ledger.edn")) :head old-head}))
+
+(defn scratch! [root out prefix]
+  (let [root (fs/realpathSync root) out (io/safe-child! root (path/resolve out))]
+    (s/require! (io/inside? out (path/join root "workspaces")) :report-outside-workspaces {})
+    (fs/mkdirSync (path/dirname out) #js {:recursive true})
+    (fs/mkdtempSync (path/join (path/dirname out) prefix))))
+
+(defn proof! [snapshot revision policy evidence reviews]
+  (pub/verify-evidence! evidence snapshot revision policy sha256 verify)
+  (pub/verify-reviews! reviews snapshot revision policy verify))
+
+(defn git-commit!
+  [repo expected files scratch message]
+  (let [index (path/join scratch "index") env {"GIT_INDEX_FILE" index}
+        g (fn [args input] (str/trim (io/run-with (into ["git" "-C" repo] args) repo {:env env :input input})))]
+    (g ["read-tree" expected] nil)
+    (doseq [[file text] (sort-by key files)]
+      (let [blob (g ["hash-object" "-w" "--stdin"] text)]
+        (g ["update-index" "--add" "--cacheinfo" (str "100644," blob "," file)] nil)))
+    (let [tree (g ["write-tree"] nil)]
+      (g ["commit-tree" tree "-p" expected "-m" message] nil))))
+
+(defn prepare!
+  [{:keys [manifest expected base snapshot revision lock evidence reviews remote out root message] :as opts}]
+  (let [root (fs/realpathSync root) repo (fs/realpathSync manifest)
+        _ (io/safe-child! root repo)
+        _ (s/require! (fs/existsSync (path/join root ".west/config")) :forest-config-missing {})
+        _ (io/safe-child! root (path/resolve out))
+        _ (s/require! (io/inside? (path/resolve out) (path/join root "workspaces")) :report-outside-workspaces {})
+        policy (policy-at! repo expected) remote (or remote "origin") target (remote-url repo remote)
+        _ (s/require! (= expected (head-at-url repo target (:policy/ref policy))) :stale-manifest-parent {})
+        base (io/read-record base) candidate (io/read-record snapshot) revision (io/read-record revision)
+        lock-text (io/read-text lock) candidate-lock {:text lock-text :value (s/read-edn! lock-text)}
+        evidence (io/read-edn evidence) reviews (io/read-edn reviews)
+        reviews (if (map? reviews) [reviews] reviews)
+        b (basis! repo expected base candidate revision policy candidate-lock)
+        _ (proof! candidate revision policy evidence reviews)
+        pem (key! opts) signer (signer pem)
+        _ (s/require! ((set (:policy/publishers policy)) signer) :publisher-not-authorized {})
+        scratch (scratch! root out "prepare-")
+        witnesses (source-authorities! revision policy scratch)
+        at (.toISOString (js/Date.))
+        changed (pub/advance (:db b) (:ledger b) candidate revision signer #(sign pem %) sha256 verify at)
+        db-text (pr-str (:db changed))
+        added (subvec (:ledger changed) (count (:ledger b)))
+        ledger-text (str (get-in b [:texts "manifest/fleet-db.ledger.edn"])
+                         (str/join "" (map #(str (pr-str %) "\n") added)))
+        old-head (:head b)
+        head-record (pin/make-record
+                     {:repo "fleet-db" :value (head-value repo expected policy db-text)
+                      :sequence (inc (get-in old-head [:record :pin/sequence]))
+                      :parent (pin/record-hash sha256 (:record old-head) (:signature old-head))})
+        head {:record head-record :signature (sign pem (pin/canonical-str head-record)) :signer signer}
+        state {"manifest/west.yml" (west/emit (:db changed)) "manifest/fleet-db.edn" db-text
+               "manifest/fleet-db.ledger.edn" ledger-text "manifest/fleet-head.edn" (pr-str head)
+               pub/lock-path lock-text}
+        prior (some-> (optional-at repo expected pub/publication-path) s/read-edn!)
+        publication (pub/sign-publication
+                     {:publication/parent (:publication/cid prior) :publication/manifest-parent expected
+                      :publication/remote-url target
+                      :publication/base (:source/cid base) :publication/snapshot (:source/cid candidate)
+                      :publication/revision (:source/cid revision) :publication/policy (s/value-cid policy)
+                      :publication/projections (into {} (map (fn [[p t]] [p (s/content-cid t)])) state)
+                      :publication/evidence [(:evidence/cid evidence)] :publication/reviews (mapv :review/cid reviews)}
+                     signer #(sign pem %))
+        files (merge state
+                     {pub/snapshot-path (pr-str candidate) pub/publication-path (pr-str publication)
+                      (str "manifest/source-snapshots/" (:source/cid base) ".edn") (pr-str base)
+                      (str "manifest/source-snapshots/" (:source/cid candidate) ".edn") (pr-str candidate)
+                      (str "manifest/source-revisions/" (:source/cid revision) ".edn") (pr-str revision)
+                      (str "manifest/source-evidence/" (:evidence/cid evidence) ".edn") (pr-str evidence)}
+                     (into {} (map (fn [r] [(str "manifest/source-reviews/" (:review/cid r) ".edn") (pr-str r)])) reviews))
+        commit (git-commit! repo expected files scratch (or message (str "source: publish " (get-in revision [:source/value :revision/change]))))
+        custody (str "refs/source/prepared/" (:publication/cid publication))
+        prepared {:prepared/version 1 :prepared/manifest repo :prepared/parent expected :prepared/commit commit
+                  :prepared/custody-ref custody
+                  :prepared/remote remote :prepared/ref (:policy/ref policy) :prepared/publication (:publication/cid publication)
+                  :prepared/files (into {} (map (fn [[p t]] [p (s/content-cid t)])) files)
+                  :prepared/source-witnesses witnesses}
+        prepared (assoc prepared :prepared/cid (s/value-cid prepared))]
+    (io/git repo "update-ref" custody commit (apply str (repeat 40 "0")))
+    (io/write-new! out (str (pr-str prepared) "\n")) prepared))
+
+(defn verify-generated-state!
+  [repo commit expected base candidate revision policy publication b]
+  (let [state (into {} (map (fn [p] [p (at repo commit p)])) pub/state-paths)
+        by-id (into {} (map (juxt :repo/id identity)) (get-in candidate [:source/value :snapshot/repos]))
+        changes (get-in revision [:source/value :revision/changes])
+        expected-db (reduce (fn [d c]
+                              (db/apply-pin-advance d {:repo/name (:repo/name (by-id (:repo/id c)))
+                                                       :pin/new (get-in c [:revision/new :hex])})) (:db b) changes)
+        db-text (get state "manifest/fleet-db.edn")
+        events (ledger (get state "manifest/fleet-db.ledger.edn"))
+        old-count (count (:ledger b))
+        new-head (s/read-edn! (get state "manifest/fleet-head.edn"))
+        signer (:publication/signer publication) pin-signer (str "ed25519:" (did/did->pubkey-hex signer))]
+    (s/require! (= (:publication/projections publication)
+                    (into {} (map (fn [[p t]] [p (s/content-cid t)])) state)) :projection-digest-mismatch {})
+    (s/require! (and (= expected-db (s/read-edn! db-text))
+                     (= (get state "manifest/west.yml") (west/emit expected-db))) :group-projection-mismatch {})
+    (s/require! (and (str/starts-with? (get state "manifest/fleet-db.ledger.edn")
+                                      (get-in b [:texts "manifest/fleet-db.ledger.edn"]))
+                     (= (+ old-count (count changes)) (count events))
+                     (= (:ledger b) (subvec events 0 old-count))) :group-ledger-mismatch {})
+    (reduce
+     (fn [prior [c event]]
+       (let [name (:repo/name (by-id (:repo/id c))) current (pub/last-pin prior name)
+             expected-record (pin/make-record
+                              {:repo name :value (get-in c [:revision/new :hex])
+                               :sequence (inc (get-in current [:record :pin/sequence] 0))
+                               :parent (when current (pin/record-hash sha256 (:record current) (:signature current)))})
+             verdict (pin/admit {:record (:pin/record event) :signature (:pin/signature event) :signer (:event/signer event)}
+                       {:repo-path (:repo/id c) :current current :reachable? true :value-advance? true
+                        :keyring {:keys {pin-signer {:grants #{(:repo/id c)}}}}
+                        :hash-fn sha256 :verify-fn #(verify (did/pubkey-hex->did %1) %2 %3)})]
+         (s/require! (and (= :accept (:verdict verdict)) (= expected-record (:pin/record event))
+                          (= :pin/advance-signed (:event/type event)) (= name (:repo/name event))
+                          (= (get-in c [:revision/old :hex]) (:pin/old event))
+                          (= (get-in c [:revision/new :hex]) (:pin/new event))
+                          (= (:source/cid candidate) (:source/snapshot event))
+                          (= (:source/cid revision) (:source/revision event))) :group-pin-event-invalid {})
+         (conj prior event))) (:ledger b) (map vector changes (subvec events old-count)))
+    (let [old (:head b) expected-head
+          (pin/make-record {:repo "fleet-db" :value (head-value repo expected policy db-text)
+                            :sequence (inc (get-in old [:record :pin/sequence]))
+                            :parent (pin/record-hash sha256 (:record old) (:signature old))})]
+      (s/require! (and (= expected-head (:record new-head)) (= signer (:signer new-head))
+                       (verify signer (pin/canonical-str expected-head) (:signature new-head))) :group-head-invalid {}))
+    state))
+
+(defn validate-prepared!
+  [repo prepared]
+  (s/fields! prepared #{:prepared/version :prepared/manifest :prepared/parent :prepared/commit
+                        :prepared/remote :prepared/ref :prepared/publication :prepared/files
+                        :prepared/source-witnesses :prepared/custody-ref :prepared/cid} #{})
+  (s/require! (and (= 1 (:prepared/version prepared))
+                   (= (:prepared/cid prepared) (s/value-cid (dissoc prepared :prepared/cid)))
+                   (= repo (:prepared/manifest prepared))
+                   (s/oid? (:prepared/parent prepared)) (s/oid? (:prepared/commit prepared))) :prepared-record-invalid {})
+  (let [expected (:prepared/parent prepared) commit (:prepared/commit prepared)
+        policy (policy-at! repo expected)
+        _ (s/require! (= (:policy/ref policy) (:prepared/ref prepared)) :publication-ref-mismatch {})
+        parents (str/split (str/trim (io/git repo "rev-list" "--parents" "-n" "1" commit)) #"\s+")
+        _ (s/require! (= [commit expected] parents) :prepared-parent-mismatch {})
+        publication (pub/verify-publication! (read-at repo commit pub/publication-path) policy verify)
+        _ (s/require! (= (:publication/remote-url publication) (remote-url repo (:prepared/remote prepared)))
+                       :publication-remote-mismatch {})
+        _ (s/require! (= (str "refs/source/prepared/" (:publication/cid publication)) (:prepared/custody-ref prepared))
+                       :invalid-custody-reference {})
+        _ (doseq [cid (concat [(:publication/base publication) (:publication/snapshot publication)
+                               (:publication/revision publication)] (:publication/evidence publication) (:publication/reviews publication))]
+            (s/require! (s/cid? cid) :invalid-proof-reference {}))
+        _ (s/require! (and (= expected (:publication/manifest-parent publication))
+                           (= (:prepared/publication prepared) (:publication/cid publication))
+                           (= 1 (count (:publication/evidence publication)))
+                           (seq (:publication/reviews publication))) :publication-subject-mismatch {})
+        record-path (fn [kind cid] (str "manifest/source-" kind "/" cid ".edn"))
+        base-file (record-path "snapshots" (:publication/base publication))
+        candidate-file (record-path "snapshots" (:publication/snapshot publication))
+        revision-file (record-path "revisions" (:publication/revision publication))
+        evidence-file (record-path "evidence" (first (:publication/evidence publication)))
+        review-files (mapv #(record-path "reviews" %) (:publication/reviews publication))
+        allowed (into (set (concat pub/state-paths [pub/snapshot-path pub/publication-path base-file candidate-file revision-file evidence-file])) review-files)
+        modified (set (remove str/blank? (str/split-lines (io/git repo "diff-tree" "--no-renames" "--no-commit-id" "--name-only" "-r" expected commit))))
+        _ (s/require! (and (= allowed (set (keys (:prepared/files prepared))))
+                           (every? allowed modified)) :unexpected-publication-file {})
+        _ (doseq [[file cid] (:prepared/files prepared)]
+            (s/require! (str/starts-with? (io/git repo "ls-tree" commit "--" file) "100644 blob ")
+                        :unexpected-publication-file-mode {:path file})
+            (s/require! (= cid (s/content-cid (at repo commit file))) :prepared-file-substitution {:path file}))
+        base (s/verify! (read-at repo commit base-file)) candidate (s/verify! (read-at repo commit pub/snapshot-path))
+        revision (s/verify! (read-at repo commit revision-file)) evidence (read-at repo commit evidence-file)
+        reviews (mapv #(read-at repo commit %) review-files)
+        _ (s/require! (and (= (:source/cid base) (:publication/base publication))
+                           (= (:source/cid candidate) (:publication/snapshot publication))
+                           (= candidate (s/verify! (read-at repo commit candidate-file)))
+                           (= (:source/cid revision) (:publication/revision publication))
+                           (= [(:evidence/cid evidence)] (:publication/evidence publication))
+                           (= (mapv :review/cid reviews) (:publication/reviews publication))) :proof-substitution {})
+        lock-text (at repo commit pub/lock-path)
+        b (basis! repo expected base candidate revision policy {:text lock-text :value (s/read-edn! lock-text)})
+        prior (some-> (optional-at repo expected pub/publication-path) s/read-edn!)]
+    (s/require! (= (:publication/cid prior) (:publication/parent publication)) :publication-chain-mismatch {})
+    (proof! candidate revision policy evidence reviews)
+    (verify-generated-state! repo commit expected base candidate revision policy publication b)
+    {:candidate candidate :revision revision :policy policy :publication publication}))
+
+(defn receipt! [out receipt]
+  (when out
+    (try (io/write-new! out (str (pr-str receipt) "\n"))
+         (catch :default _
+           (throw (ex-info "publication succeeded but local receipt write failed"
+                           {:reason :published-receipt-write-failed :published receipt}))))))
+
+(defn publish!
+  [{:keys [manifest prepared root out]}]
+  (let [root (fs/realpathSync root) repo (fs/realpathSync manifest)
+        _ (io/safe-child! root repo)
+        _ (when out
+            (io/safe-child! root (path/resolve out))
+            (s/require! (io/inside? (path/resolve out) (path/join root "workspaces")) :report-outside-workspaces {}))
+        prepared (io/read-edn prepared)
+        {:keys [candidate revision policy publication]} (validate-prepared! repo prepared)
+        target (:publication/remote-url publication) ref (:prepared/ref prepared) commit (:prepared/commit prepared)
+        current (head-at-url repo target ref)
+        receipt {:publication/state :published :publication/cid (:publication/cid publication)
+                 :snapshot/cid (:source/cid candidate) :manifest/commit commit}
+        _ (when (and out (io/lexists? out))
+            (s/require! (= (str (pr-str receipt) "\n") (io/read-text out)) :destination-occupied {:path out}))]
+    (if (= current commit)
+      (do (receipt! out receipt) (assoc receipt :publication/already-published true))
+      (do
+        (s/require! (= current (:prepared/parent prepared)) :stale-manifest-parent {})
+        (let [scratch (scratch! root (or out (path/join root "workspaces/source-publication/receipt.edn")) "apply-")]
+          (source-authorities! revision policy scratch))
+        ;; Push/read back the signed URL, not a mutable remote name or its pushurl.
+        (try (io/git repo "push" "--porcelain" "--no-follow-tags" "--recurse-submodules=no" target (str commit ":" ref))
+             (catch :default e
+               ;; An interrupted acknowledgement may follow a successful durable update.
+               (when-not (= commit (head-at-url repo target ref)) (throw e))))
+        (s/require! (= commit (head-at-url repo target ref)) :publication-readback-indeterminate {})
+        (receipt! out receipt) receipt))))
+
+(defn attest!
+  [kind {:keys [manifest expected snapshot revision checks repos out] :as opts}]
+  (let [policy (policy-at! manifest expected) snapshot (io/read-record snapshot) revision (io/read-record revision)
+        pem (key! opts) signer (signer pem)
+        value (case kind
+                :ci (let [receipt (ci/make-receipt
+                                   {:subject (pub/subject snapshot revision policy) :checks (io/read-edn checks)
+                                    :required (set (:policy/required policy)) :policy (s/value-cid policy)
+                                    :at (.toISOString (js/Date.)) :parent nil})
+                          e (pub/evidence snapshot revision policy (ci/sign-receipt sha256 #(sign pem %) signer receipt))]
+                      (pub/verify-evidence! e snapshot revision policy sha256 verify))
+                :review (let [r (pub/review snapshot revision policy (str/split repos #",") signer #(sign pem %))]
+                          ;; Individual review may cover only a subset; group completeness is checked on prepare.
+                          (doseq [id (:review/repos r)]
+                            (s/require! ((set (get-in policy [:policy/reviewers id])) signer) :reviewer-not-authorized {:repo id})) r))]
+    (io/write-new! out (str (pr-str value) "\n")) value))

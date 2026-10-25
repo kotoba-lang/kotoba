@@ -1,0 +1,111 @@
+(ns pay.eip3009-test
+  "Vectors from foundry `cast` (2026-10-07), not from this code: the signature
+  is `cast wallet sign --data` of the EIP-712 TransferWithAuthorization below
+  with anvil's published test key 0, and the calldata is `cast calldata` of
+  USDC's `transferWithAuthorization(…, v, r, s)` over the same values."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [eth-crypto.core :as eth]
+            [kotoba.lang.text :as str]
+            [pay.eip3009 :as e]
+            [pay.x402 :as x402]))
+
+(def anvil-0 "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+(def anvil-0-key "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")
+(def anvil-1 "0x70997970C51812dc3A010C7d01b50e0d17dc79C8")
+
+(def auth {:from anvil-0 :to anvil-1 :value "10000" :validAfter "0"
+           :validBefore "1783000600"
+           :nonce "0x1111111111111111111111111111111111111111111111111111111111111111"})
+
+(def cast-sig
+  "0xe0883fc8440a23435946f31cd28023be8a10704f27aa89c76e793e8c23970b294b359d4ce6ebd90733779a853b5dcf0a33349877503fe797dbd16df98ed89e7e1c")
+
+(def cast-calldata
+  "0xe3ee160e000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb9226600000000000000000000000070997970c51812dc3a010c7d01b50e0d17dc79c800000000000000000000000000000000000000000000000000000000000027100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006a466e181111111111111111111111111111111111111111111111111111111111111111000000000000000000000000000000000000000000000000000000000000001ce0883fc8440a23435946f31cd28023be8a10704f27aa89c76e793e8c23970b294b359d4ce6ebd90733779a853b5dcf0a33349877503fe797dbd16df98ed89e7e")
+
+(def now 1783000000)
+
+(def requirements
+  (x402/v2-payment-requirements {:pay-to anvil-1 :usd "0.01" :network "eip155:8453"}))
+
+(defn- payload [a sig]
+  {:x402Version 2 :accepted requirements :payload {:authorization a :signature sig}})
+
+(deftest selectors-match-cast
+  (is (= "e3ee160e" (e/selector e/transfer-with-authorization-sig)))
+  (is (= "e94a0102" (e/selector "authorizationState(address,bytes32)")))
+  (is (= "70a08231" (e/selector "balanceOf(address)"))))
+
+(deftest cast-signature-recovers-to-from
+  (is (= (str/lower anvil-0) (e/recover-signer "eip155:8453" auth cast-sig)))
+  (testing "the same signature under the testnet domain is someone else's"
+    (is (not= (str/lower anvil-0) (e/recover-signer "eip155:84532" auth cast-sig))))
+  (testing "changing any field breaks it"
+    (is (not= (str/lower anvil-0) (e/recover-signer "eip155:8453" (assoc auth :value "10001") cast-sig)))
+    (is (not= (str/lower anvil-0) (e/recover-signer "eip155:8453" (assoc auth :to anvil-0) cast-sig)))))
+
+(deftest calldata-matches-cast
+  (is (= cast-calldata (e/settle-calldata auth cast-sig))))
+
+(deftest own-signature-round-trips
+  (let [sig (eth/signature->bytes (eth/secp256k1-sign (eth/hex->bytes anvil-0-key)
+                                                     (e/digest "eip155:8453" auth)))]
+    (is (= cast-sig (str "0x" (eth/bytes->hex sig))))))
+
+(deftest offline-verification
+  (testing "the cast payload passes"
+    (is (= [] (e/offline-errors (payload auth cast-sig) requirements now)))
+    (is (= [] (e/signature-errors (payload auth cast-sig) requirements))))
+  (testing "a payload signed by someone else is refused as a bad signature"
+    (let [p (payload (assoc auth :from anvil-1) cast-sig)]
+      (is (= [] (e/offline-errors p requirements now)))
+      (is (= [:eip3009/invalid-signature] (e/signature-errors p requirements)))))
+  (testing "about to expire"
+    (is (some #{:eip3009/expires-before-settlement}
+              (e/offline-errors (payload auth cast-sig) requirements (- 1783000600 3)))))
+  (testing "high s is refused (malleable twin of a valid signature)"
+    (is (nil? (e/split-signature
+               (str "0x" (subs cast-sig 2 66) "ffffffffffffffffffffffffffffffffbaaedce6af48a03bbfd25e8cd0364140" "1b")))))
+  (testing "an asset that is not USDC"
+    (let [r (assoc requirements :asset anvil-0)]
+      (is (some #{:eip3009/asset-not-usdc}
+                (e/offline-errors (assoc (payload auth cast-sig) :accepted r) r now))))))
+
+(deftest chain-verification
+  (let [p (payload auth cast-sig)]
+    (is (= [] (e/chain-errors p {:balance-word "0x2710" :state-word "0x00"})))
+    (is (= [:eip3009/insufficient-funds] (e/chain-errors p {:balance-word "0x270f" :state-word "0x0"})))
+    (is (= [:eip3009/nonce-used] (e/chain-errors p {:balance-word "0xffff" :state-word "0x1"})))
+    (is (= [:eip3009/balance-unknown :eip3009/nonce-state-unknown] (e/chain-errors p {})))
+    (is (= {:to x402/usdc-base
+            :data "0xe94a0102000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb922661111111111111111111111111111111111111111111111111111111111111111"}
+           (e/authorization-state-call "eip155:8453" anvil-0 (:nonce auth))))
+    (is (= {:isValid false :payer anvil-0 :invalidReason "insufficient_funds"}
+           (e/verify-response p [:eip3009/insufficient-funds])))
+    (is (= {:isValid true :payer anvil-0} (e/verify-response p [])))))
+
+(deftest settle-transaction-shape
+  (let [tx (e/settle-tx "eip155:84532" cast-calldata {:nonce 0 :gas 90000 :max-fee 2000000 :tip 1000000})]
+    (is (= 84532 (:chain-id tx)))
+    (is (= (str/lower x402/usdc-base-sepolia) (str "0x" (eth/bytes->hex (:to tx)))))
+    (is (= (subs cast-calldata 2) (eth/bytes->hex (:data tx))))
+    (is (string? (eth/sign-tx-eip1559 tx (eth/hex->bytes anvil-0-key))))))
+
+(deftest domain-separators-match-chain
+  ;; DOMAIN_SEPARATOR() read from both USDC contracts, 2026-10-07
+  (is (= "02fa7265e7c5d81118673727957699e4d68f74cd74b7db77da710fe8a2c7834f"
+         (eth/bytes->hex (eth/domain-separator (e/domain "eip155:8453")))))
+  (is (= "71f17a3b2ff373b803d70a5a07c046c1a2bc8e89c09ef722fcb047abe94c9818"
+         (eth/bytes->hex (eth/domain-separator (e/domain "eip155:84532"))))))
+
+(deftest simulation-verdicts
+  (is (= [] (e/simulation-errors nil)))
+  (is (= [:eip3009/invalid-signature]
+         (e/simulation-errors "eth_call: execution reverted: FiatTokenV2: invalid signature")))
+  (is (= [:eip3009/insufficient-funds]
+         (e/simulation-errors "execution reverted: ERC20: transfer amount exceeds balance")))
+  (is (= [:eip3009/nonce-used]
+         (e/simulation-errors "execution reverted: FiatTokenV2: authorization is used or canceled")))
+  (is (= [:eip3009/simulation-reverted] (e/simulation-errors "execution reverted")))
+  (is (= {:from anvil-1 :to x402/usdc-base :data cast-calldata}
+         (e/simulation-call "eip155:8453" anvil-1 cast-calldata))))

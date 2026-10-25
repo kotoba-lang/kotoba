@@ -1,0 +1,151 @@
+(ns kotoba.wasm-bounded-map-test
+  "The bounded `:map` value type reaches wasm32.
+
+  KIR carries two map vocabularies. `typed-map-*` names its own
+  `[:map K V]` descriptor at every use and this backend has emitted it since
+  the typed value ABI landed. `map-new` / `map-get` / `map-assoc` are the
+  BOUNDED map -- what a bare `{:k 1}` literal desugars to -- and until
+  `kotoba.wasm.typed/lower-bounded-maps` they reached neither table.
+
+  They refused in two DIFFERENT places with two DIFFERENT messages, and which
+  one a program got depended on whether it bound the map to a local:
+
+    (map-get (map-new :value 9) :value 0)          `emit*`'s fallthrough in
+                                                   kotoba.wasm.core:
+                                                   \"typed Wasm operation is
+                                                   not qualified\"
+    (let [m (map-new :value 9)] (map-get m ...))   `infer-type` in
+                                                   kotoba.wasm.typed:
+                                                   \"unsupported typed Wasm
+                                                   expression\"
+
+  Closing one alone left the other standing, so both shapes are asserted
+  here and neither is a duplicate of the other. Measured 2026-09-01 against
+  amu 27d82d8: the first exited 70 with the first message, the second with
+  the second, and `(match 5 0 100 5 200 :else 300)` -- no map anywhere --
+  compiled and answered 200. The refusal was the map, not `match`."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.wasm.core :as wasm]
+            [kotoba.wasm.typed :as typed]))
+
+(defn- i64
+  "N as this host's i64: a Long on the JVM, a BigInt on ClojureScript."
+  [n]
+  #?(:clj (long n) :cljs (js/BigInt n)))
+
+(defn- module [body]
+  {:format :kotoba.kir/v4
+   :exports ['main]
+   :schemas {}
+   :effects #{}
+   :functions [{:name 'main :params [] :param-types [] :result :i64
+                :effects #{} :body body}]})
+
+(def ^:private wasm-preamble
+  ;; "\0asm" and version 1, little-endian.
+  [0x00 0x61 0x73 0x6d 0x01 0x00 0x00 0x00])
+
+(defn- emitted-preamble [kir]
+  (vec (take 8 (wasm/emit kir :wasm32-kotoba-v1 {:fuel 512}))))
+
+(defn- lowered-body [kir]
+  (:body (first (:functions (typed/lower-bounded-maps kir)))))
+
+(defn- operations
+  "Every operator symbol in a lowered body, so a test can say which
+  vocabulary survived rather than merely that emission did not throw."
+  [form]
+  (cond
+    (and (seq? form) (seq form))
+    (into (if (symbol? (first form)) #{(first form)} #{})
+          (mapcat operations (rest form)))
+    (coll? form) (into #{} (mapcat operations form))
+    :else #{}))
+
+;; --- the two refusal paths, one test each ---------------------------------
+
+(deftest a-bounded-map-read-that-binds-no-local-emits
+  (testing "the `emit*` fallthrough path: map-get straight onto map-new"
+    (is (= wasm-preamble
+           (emitted-preamble
+            (module (list 'map-get (list 'map-new :value (i64 9))
+                          :value (i64 0)))))))) 
+
+(deftest a-bounded-map-bound-to-a-local-emits
+  (testing "the `infer-type` path: a let needs the static type of map-new"
+    (is (= wasm-preamble
+           (emitted-preamble
+            (module (list 'let ['m (list 'map-new :value (i64 9))]
+                          (list 'map-get 'm :value (i64 0))))))))) 
+
+(deftest a-bounded-map-write-emits
+  (testing "map-assoc folds onto the canonical typed-map assoc"
+    (is (= wasm-preamble
+           (emitted-preamble
+            (module (list 'map-get
+                          (list 'map-assoc (list 'map-new) :a (i64 4))
+                          :a (i64 0))))))))
+
+;; --- what the lowering actually produces -----------------------------------
+
+(deftest the-bounded-map-becomes-the-canonical-typed-map
+  (testing "no bounded operation survives, and the descriptor is fixed"
+    (let [body (lowered-body
+                (module (list 'map-get
+                              (list 'map-assoc (list 'map-new :value (i64 9))
+                                    :other (i64 4))
+                              :value (i64 0))))
+          ops (operations body)]
+      (is (= [:map :keyword :i64] typed/bounded-map-descriptor)
+          "the frontend checks every key as :keyword and every value as :i64")
+      (is (empty? (filter '#{map-new map-get map-assoc} ops))
+          (str "a bounded operation survived lowering: " (pr-str ops)))
+      (is (contains? ops 'typed-map-new))
+      (is (contains? ops 'typed-map-assoc))
+      (is (contains? ops 'typed-map-get))
+      (is (contains? ops 'option-value-of)
+          "map-get answers a default for an absent key; typed-map-get answers an option"))))
+
+(deftest lowering-a-module-without-a-bounded-map-changes-nothing
+  (testing "the control: this is applied to every module, including yours"
+    (let [kir (module (list '+ (i64 1) (i64 2)))]
+      (is (= kir (typed/lower-bounded-maps kir))))))
+
+(deftest lowering-is-idempotent
+  (testing "requires-host-runtime? and emit each apply it, independently"
+    (let [kir (module (list 'map-get (list 'map-new :value (i64 9))
+                            :value (i64 0)))
+          once (typed/lower-bounded-maps kir)]
+      (is (= once (typed/lower-bounded-maps once))))))
+
+;; --- why the lowering is also applied inside requires-host-runtime? --------
+
+(deftest an-empty-bounded-map-still-declares-a-host-value
+  (testing "(map-new) carries no keyword literal and no descriptor of its own"
+    (let [kir (module (list 'map-get (list 'map-new) :a (i64 0)))]
+      (is (true? (boolean (typed/requires-host-runtime? kir)))
+          "answering false here would emit kotoba:typed imports with no reference-types feature"))))
+
+;; --- the ceiling this lowering inherits, refused by name -------------------
+
+(defn- literal-map-of [entries]
+  (module (list 'map-get
+                (apply list 'map-new
+                       (mapcat (fn [index]
+                                 [(keyword (str "k" index)) (i64 index)])
+                               (range entries)))
+                :k0 (i64 0))))
+
+(deftest a-bounded-map-literal-at-the-typed-map-ceiling-emits
+  (is (= 31 typed/bounded-map-wasm-entry-limit))
+  (is (= wasm-preamble (emitted-preamble (literal-map-of 31)))))
+
+(deftest a-bounded-map-literal-past-the-typed-map-ceiling-is-refused-by-name
+  (testing "kotoba.kir.value/map-entry-limit admits 128 on the KIR oracle; the
+            typed value runtime rejects a 32nd entry. The two numbers differ,
+            so the refusal is here and named rather than a trap at run time."
+    (is (thrown-with-msg?
+         js/Error
+         #"bounded map exceeds the typed map entry budget"
+         (wasm/emit (literal-map-of 32) :wasm32-kotoba-v1 {:fuel 512})))))

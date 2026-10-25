@@ -1,0 +1,365 @@
+(ns maturity-test
+  (:require [clojure.string :as str]
+            ["node:assert/strict" :as assert]
+            ["node:buffer" :refer [Buffer]]
+            ["node:child_process" :as child-process]
+            ["node:fs/promises" :refer [readFile]]
+            ["node:zlib" :refer [inflateRawSync]]
+            ["@xmldom/xmldom" :refer [DOMParser XMLSerializer]]))
+
+(defn exec-file
+  ([command args] (exec-file command args #js {}))
+  ([command args options]
+   (.execFileSync child-process command args
+                  (if-let [max-buffer (aget options "maxBuffer")]
+                    #js {:encoding "utf8" :maxBuffer max-buffer}
+                    #js {:encoding "utf8"}))))
+(def tests (atom []))
+(def app (atom nil))
+
+(def semantic-svg
+  "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 420 240\">
+  <metadata><![CDATA[{\"presentation\":{\"slideSize\":{\"width\":420,\"height\":240},\"guides\":[{\"orientation\":\"vertical\",\"position\":210}],\"rulers\":{\"unit\":\"px\"},\"textStyles\":{\"title\":{\"fontSize\":28}}}}]]></metadata>
+  <defs><linearGradient id=\"grad\"><stop offset=\"0\" stop-color=\"#0f766e\"/></linearGradient></defs>
+  <g id=\"slide-a\" data-kind=\"slide\" data-title=\"Intro\">
+    <rect id=\"title-box\" data-role=\"title\" x=\"20\" y=\"20\" width=\"120\" height=\"48\" fill=\"url(#grad)\"/>
+    <line id=\"rel-title-body\" data-kind=\"relation\" data-source=\"title-box\" data-target=\"body-box\" x1=\"140\" y1=\"44\" x2=\"220\" y2=\"44\"/>
+    <rect id=\"body-box\" data-role=\"body\" x=\"220\" y=\"20\" width=\"140\" height=\"48\" fill=\"#dbeafe\"/>
+    <g id=\"table-a\" data-kind=\"table\">
+      <g data-kind=\"cell\" data-row=\"0\" data-col=\"0\" data-text=\"Role\"><rect x=\"20\" y=\"110\" width=\"90\" height=\"32\" fill=\"#e0f2fe\" stroke=\"#0f766e\"/></g>
+      <g data-kind=\"cell\" data-row=\"0\" data-col=\"1\" data-text=\"Output\"><rect x=\"110\" y=\"110\" width=\"120\" height=\"32\" fill=\"#ffffff\" stroke=\"#0f766e\"/></g>
+    </g>
+  </g>
+</svg>")
+
+(defn register-test! [name f]
+  (swap! tests conj [name f]))
+
+(defmacro deftest [name & body]
+  `(register-test! ~(str name) (fn [] ~@body)))
+
+(defn fail! [message]
+  (throw (js/Error. message)))
+
+(defn ok [value & [message]]
+  (when-not value (fail! (or message "assertion failed"))))
+
+(defn eq [actual expected & [message]]
+  (.equal assert actual expected (or message "")))
+
+(defn deep-eq [actual expected & [message]]
+  (.deepEqual assert (clj->js actual) (clj->js expected) (or message "")))
+
+(defn match [value pattern]
+  (.match assert value pattern))
+
+(defn includes [value expected]
+  (ok (.includes value expected) (str "missing expected text: " expected)))
+
+(defn not-includes [value forbidden]
+  (ok (not (.includes value forbidden)) (str "unexpected text: " forbidden)))
+
+(defn arr [value]
+  (array-seq (or value #js [])))
+
+(defn call [name & args]
+  (apply (aget @app name) args))
+
+(defn parse-json [value]
+  (js/JSON.parse value))
+
+(defn js->data [value]
+  (js->clj value :keywordize-keys true))
+
+(defn patch-selector-api [document]
+  (letfn [(find-by-simple-selector [root selector]
+            (let [normalized (str/trim selector)
+                  name (last (str/split normalized #":"))
+                  matches (array)]
+              (when-not (re-matches #"^[A-Za-z_][A-Za-z0-9_.:-]*$" normalized)
+                (fail! (str "unsupported selector: " selector)))
+              (letfn [(visit [node]
+                        (when node
+                          (when (and (= 1 (.-nodeType node))
+                                     (= name (last (str/split (or (.-localName node) (.-nodeName node)) #":"))))
+                            (.push matches node))
+                          (doseq [child (arr (.-childNodes node))]
+                            (visit child))))]
+                (visit (or (.-documentElement root) root))
+                matches)))
+          (install [node]
+            (when node
+              (when-not (.-querySelectorAll node)
+                (set! (.-querySelectorAll node) (fn [selector] (this-as this (find-by-simple-selector this selector)))))
+              (when-not (.-querySelector node)
+                (set! (.-querySelector node) (fn [selector] (this-as this (aget (find-by-simple-selector this selector) 0)))))
+              (doseq [child (arr (.-childNodes node))]
+                (install child))))]
+    (install document)
+    document))
+
+(defn install-dom-shim! []
+  (set! (.-__svgraphPatchSelectorApi js/globalThis) patch-selector-api)
+  (set! (.-DOMParser js/globalThis)
+        (js/eval "class QueryDomParser extends globalThis.__SVGraphBaseDOMParser { parseFromString(text, mimeType) { return globalThis.__svgraphPatchSelectorApi(super.parseFromString(text, mimeType)); } }; QueryDomParser"))
+  (set! (.-XMLSerializer js/globalThis) XMLSerializer)
+  (set! (.-Node js/globalThis) #js {:ELEMENT_NODE 1 :TEXT_NODE 3}))
+
+(set! (.-__SVGraphBaseDOMParser js/globalThis) DOMParser)
+(install-dom-shim!)
+
+(defn find-node-or-nil [node id]
+  (cond
+    (= id (aget (.-attributes node) "id")) node
+    :else (some #(find-node-or-nil % id) (arr (.-children node)))))
+
+(defn collect-ids [node]
+  (concat (when-let [id (aget (.-attributes node) "id")] [id])
+          (mapcat collect-ids (arr (.-children node)))))
+
+(defn find-node [node id]
+  (or (find-node-or-nil node id)
+      (fail! (str "missing node: " id "; available ids: " (str/join ", " (collect-ids node))))))
+
+(defn unzip [bytes]
+  (let [buffer (Buffer.from bytes)
+        entries (atom {})]
+    (loop [offset 0]
+      (when (<= (+ offset 30) (.-length buffer))
+        (let [signature (.readUInt32LE buffer offset)]
+          (when (= signature 0x04034b50)
+            (let [flags (.readUInt16LE buffer (+ offset 6))
+                  compression (.readUInt16LE buffer (+ offset 8))
+                  compressed-size (.readUInt32LE buffer (+ offset 18))
+                  name-length (.readUInt16LE buffer (+ offset 26))
+                  extra-length (.readUInt16LE buffer (+ offset 28))
+                  name-start (+ offset 30)
+                  data-start (+ name-start name-length extra-length)
+                  name (.toString (.subarray buffer name-start (+ name-start name-length)) "utf8")
+                  compressed (.subarray buffer data-start (+ data-start compressed-size))
+                  value (case compression
+                          0 compressed
+                          8 (inflateRawSync compressed)
+                          (fail! (str "unsupported zip compression " compression " for " name)))]
+              (ok (= 0 (bit-and flags 0x08)) "data descriptors are not supported by this test unzipper")
+              (swap! entries assoc name value)
+              (recur (+ data-start compressed-size)))))))
+    @entries))
+
+(defn text-entry [entries name]
+  (if-let [value (get entries name)]
+    (.toString value "utf8")
+    (fail! (str "missing ZIP entry: " name))))
+
+(defn xml-entity-decode [value]
+  (-> value
+      (.replaceAll "&quot;" "\"")
+      (.replaceAll "&lt;" "<")
+      (.replaceAll "&gt;" ">")
+      (.replaceAll "&amp;" "&")))
+
+(defn some-js [pred values]
+  (boolean (some pred (arr values))))
+
+(deftest svg-feature-fixture-records-dependencies-and-unsupported-diagnostics-separately
+  (let [svg "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 240 120\"><defs><linearGradient id=\"g\" gradientUnits=\"userSpaceOnUse\"><stop offset=\"0\" stop-color=\"#0f766e\"/></linearGradient><marker id=\"arrow\"><path d=\"M 0 0 L 10 5 L 0 10 z\"/></marker><filter id=\"blur\"></filter><mask id=\"m\"></mask></defs><style>.accent{fill:var(--brand);stroke:#111827;stroke-width:2}:root{--brand:#38bdf8}</style><rect id=\"styled\" class=\"accent\" x=\"10\" y=\"10\" width=\"40\" height=\"20\"/><rect id=\"gradient\" x=\"60\" y=\"10\" width=\"40\" height=\"20\" fill=\"url(#g)\"/><line id=\"arrow-line\" x1=\"10\" y1=\"60\" x2=\"120\" y2=\"60\" stroke=\"#111827\" marker-end=\"url(#arrow)\"/><rect id=\"diagnostic\" x=\"130\" y=\"10\" width=\"20\" height=\"20\" filter=\"url(#blur)\" mask=\"url(#m)\"/><path id=\"unsupported-path\" d=\"M 0 0 R 10 10\"/></svg>"
+        svgraph (call "buildSVGraph" svg)
+        styled (find-node (.-root svgraph) "styled")
+        gradient (find-node (.-root svgraph) "gradient")
+        arrow-line (find-node (.-root svgraph) "arrow-line")]
+    (eq (aget (.-attributes styled) "class") "accent")
+    (eq (.-target (aget (.-dependencies gradient) 0)) "#g")
+    (eq (.-target (aget (.-dependencies arrow-line) 0)) "#arrow")
+    (deep-eq (js->data (.-unsupported_elements (.-coverage svgraph))) {})
+    (deep-eq (js->data (.-unsupported_attributes (.-coverage svgraph))) {:filter 1 :mask 1})
+    (deep-eq (js->data (.-unsupported_path_commands (.-coverage svgraph))) {:R 1})))
+
+(deftest svg-to-drawingml-fixture-exports-editable-geometry-lines-and-rich-text
+  (let [svg "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 320 160\"><defs><linearGradient id=\"g\"><stop offset=\"0\" stop-color=\"#0f766e\"/></linearGradient></defs><rect id=\"gradient-rect\" x=\"10\" y=\"10\" width=\"80\" height=\"30\" fill=\"url(#g)\" stroke=\"#111827\"/><path id=\"freeform\" d=\"M 120 10 L 180 10 Q 200 30 180 50 Z\" fill=\"#fde68a\" stroke=\"#92400e\"/><line id=\"connector\" data-kind=\"relation\" data-source=\"gradient-rect\" data-target=\"freeform\" x1=\"90\" y1=\"25\" x2=\"120\" y2=\"25\" stroke=\"#2563eb\"/><text id=\"rich\" x=\"10\" y=\"90\" font-family=\"Aptos\" font-size=\"20\" fill=\"#111827\">Base<tspan font-weight=\"700\" font-style=\"italic\" text-decoration=\"underline\" baseline-shift=\"super\" fill=\"#dc2626\">Run</tspan><tspan x=\"10\" dy=\"1.2em\">Next</tspan></text></svg>"
+        drawing-ml (call "svgToDrawingMl" svg)]
+    (doseq [pattern [#"name=\"gradient-rect\"" #"<a:srgbClr val=\"0F766E\"" #"name=\"freeform\"" #"<a:custGeom>" #"<p:cxnSp>" #"name=\"connector\"" #"<a:stCxn id=\"\d+\" idx=\"0\"/>" #"<a:endCxn id=\"\d+\" idx=\"0\"/>" #"<a:rPr lang=\"en-US\" sz=\"2000\" b=\"1\" i=\"1\" u=\"sng\" baseline=\"30000\">" #"<a:br/><a:r>"]]
+      (match drawing-ml pattern))))
+
+(deftest drawingml-import-fixtures-recover-editable-svg-semantics-by-feature-group
+  (-> (js/Promise.all #js [(readFile "examples/line-arrow.dml" "utf8") (readFile "examples/text-style.dml" "utf8") (readFile "examples/table-rich.dml" "utf8")])
+      (.then (fn [values]
+               (let [line-arrow (call "drawingMlToSvg" (aget values 0))
+                     text-style (call "drawingMlToSvg" (aget values 1))
+                     table-rich (call "drawingMlToSvg" (aget values 2))]
+                 (doseq [pattern [#"<marker id=\"svgraph-arrow" #"marker-start=\"url\(#svgraph-arrow\)\"" #"marker-end=\"url\(#svgraph-arrow\)\""]]
+                   (match line-arrow pattern))
+                 (doseq [pattern [#"<tspan" #"font-weight=\"bold\"" #"font-style=\"italic\"" #"text-decoration=\"underline\"" #"baseline-shift=\"super\""]]
+                   (match text-style pattern))
+                 (doseq [pattern [#"data-kind=\"table\"" #"data-kind=\"cell\"" #"font-weight=\"bold\"" #"stroke-dasharray=\"4 2\""]]
+                   (match table-rich pattern)))))))
+
+(deftest cli-fixture-exposes-package-api-paths-used-by-browser-only-deployments
+  (let [version (exec-file "nbb" #js ["./bin/svgraph.cljk" "--version"])
+        analysis (exec-file "nbb" #js ["./bin/svgraph.cljk" "analyze" "examples/coverage.svg"] #js {:maxBuffer (* 1024 1024)})
+        coverage (parse-json analysis)
+        jsonl (exec-file "nbb" #js ["./bin/svgraph.cljk" "office-causal-jsonl" "examples/svgraph.svg"] #js {:maxBuffer (* 1024 1024)})]
+    (match version #"^svgraph 0\.1\.\d+\n$")
+    (ok (number? (.-estimated_element_coverage coverage)))
+    (ok (> (.-total_elements coverage) 0))
+    (match jsonl #"\"t\":\"node\"")
+    (match jsonl #"\"t\":\"edge\"")))
+
+(deftest svgraph-preserves-svg-metadata-data-semantics-dependencies-and-presentation-state
+  (let [svgraph (call "buildSVGraph" semantic-svg)
+        slide (find-node (.-root svgraph) "slide-a")
+        title (find-node (.-root svgraph) "title-box")
+        relation (find-node (.-root svgraph) "rel-title-body")
+        table (find-node (.-root svgraph) "table-a")]
+    (eq (.-kind svgraph) "svgraph")
+    (eq (.-width (.-slideSize (.-presentation (.-json (.-metadata svgraph))))) 420)
+    (eq (aget (.-slide_size (.-presentation svgraph)) 0) 420)
+    (eq (aget (.-slide_size (.-presentation svgraph)) 1) 240)
+    (eq (.-length (.-slides (.-presentation svgraph))) 1)
+    (eq (.-title (aget (.-slides (.-presentation svgraph)) 0)) "Intro")
+    (deep-eq (js->data (.-guides (.-presentation svgraph))) [{:guide_id "guide-1" :orientation "vertical" :position 210 :unit "px" :node_id nil}])
+    (deep-eq (js->data (.-rulers (.-presentation svgraph))) [])
+    (deep-eq (js->data (.-text_styles (.-presentation svgraph))) [{:style_id "title" :role "title" :properties {:fontSize 28} :node_id nil}])
+    (eq (aget (.-data slide) "kind") "slide")
+    (eq (aget (.-data title) "role") "title")
+    (eq (aget (.-data relation) "kind") "relation")
+    (eq (aget (.-data relation) "source") "title-box")
+    (eq (aget (.-data relation) "target") "body-box")
+    (eq (aget (.-data table) "kind") "table")
+    (deep-eq (js->data (.-dependencies title)) [{:kind "paint-server" :source "title-box" :target "#grad" :attribute "fill"}])
+    (deep-eq (js->data (.-dependencies svgraph)) [{:kind "paint-server" :source "title-box" :target "#grad" :attribute "fill"}])
+    (eq (or (aget (.-unsupported_elements (.-coverage svgraph)) "filter") 0) 0)))
+
+(deftest drawingml-export-keeps-semantic-relations-as-editable-connectors
+  (let [drawing-ml (call "svgToDrawingMl" semantic-svg)]
+    (doseq [pattern [#"<p:cxnSp>" #"name=\"rel-title-body\"" #"<a:stCxn id=\"\d+\" idx=\"0\"/>" #"<a:endCxn id=\"\d+\" idx=\"0\"/>" #"<a:prstGeom prst=\"line\">"]]
+      (match drawing-ml pattern))))
+
+(deftest drawingml-import-recovers-connectors-and-native-tables-as-svgraph-svg-semantics
+  (-> (js/Promise.all #js [(readFile "examples/connector-style-ref.dml" "utf8") (readFile "examples/table-rich.dml" "utf8")])
+      (.then (fn [values]
+               (let [connector-svg (call "drawingMlToSvg" (aget values 0))
+                     table-svg (call "drawingMlToSvg" (aget values 1))]
+                 (match connector-svg #"data-kind=\"relation\"")
+                 (match connector-svg #"stroke=\"#dc2626\"")
+                 (match table-svg #"data-kind=\"table\"")
+                 (match table-svg #"data-kind=\"cell\"")
+                 (match table-svg #"<tspan")
+                 (match table-svg #"font-weight=\"bold\""))))))
+
+(deftest pptx-export-contains-recoverable-source-svgraph-sidecar-office-causal-jsonl-and-native-table-xml
+  (let [entries (unzip (call "svgToPptx" semantic-svg))
+        content-types (text-entry entries "[Content_Types].xml")
+        slide (text-entry entries "ppt/slides/slide1.xml")
+        sidecar (text-entry entries "customXml/item1.xml")
+        causal (text-entry entries "ocz/causal.jsonl")]
+    (match content-types #"/customXml/item1\.xml")
+    (match content-types #"ContentType=\"application/jsonl\"")
+    (match slide #"<p:cxnSp>")
+    (match slide #"<a:tbl>")
+    (match slide #"Role")
+    (match slide #"Output")
+    (let [payload (parse-json (xml-entity-decode (or (second (re-find #"<svgraph:json>([\s\S]*?)</svgraph:json>" sidecar)) "")))]
+      (eq (.-kind payload) "svgraph-presentation")
+      (eq (.-source_svg payload) semantic-svg)
+      (eq (.-title (aget (.-slides payload) 0)) "Intro"))
+    (let [lines (map parse-json (str/split (str/trim causal) #"\n"))]
+      (ok (some #(and (= (.-t %) "node") (= (.-kind %) "slide")) lines))
+      (ok (some #(and (= (.-t %) "node") (= (.-kind %) "table")) lines))
+      (ok (some #(and (= (.-t %) "edge") (= (.-kind %) "contains")) lines)))))
+
+(deftest pptx-export-includes-stable-package-relationships-for-presentation-sidecar-office-causal-masters-and-layouts
+  (let [entries (unzip (call "svgToPptx" semantic-svg))
+        content-types (text-entry entries "[Content_Types].xml")
+        root-rels (text-entry entries "_rels/.rels")
+        presentation (text-entry entries "ppt/presentation.xml")
+        presentation-rels (text-entry entries "ppt/_rels/presentation.xml.rels")
+        master (text-entry entries "ppt/slideMasters/slideMaster1.xml")
+        master-rels (text-entry entries "ppt/slideMasters/_rels/slideMaster1.xml.rels")
+        layout (text-entry entries "ppt/slideLayouts/slideLayout1.xml")
+        layout-rels (text-entry entries "ppt/slideLayouts/_rels/slideLayout1.xml.rels")
+        theme (text-entry entries "ppt/theme/theme1.xml")
+        sidecar (text-entry entries "customXml/item1.xml")
+        causal (text-entry entries "ocz/causal.jsonl")]
+    (doseq [pattern [#"PartName=\"/ppt/presentation\.xml\"" #"PartName=\"/ppt/slideMasters/slideMaster1\.xml\"" #"PartName=\"/ppt/slideLayouts/slideLayout1\.xml\"" #"PartName=\"/ppt/slides/slide1\.xml\"" #"PartName=\"/customXml/item1\.xml\"" #"Default Extension=\"jsonl\" ContentType=\"application/jsonl\""]]
+      (match content-types pattern))
+    (doseq [pattern [#"Target=\"ppt/presentation\.xml\"" #"Target=\"customXml/item1\.xml\"" #"Target=\"ocz/causal\.jsonl\""]]
+      (match root-rels pattern))
+    (match presentation #"<p:sldMasterId id=\"2147483648\" r:id=\"rId1\"/>")
+    (match presentation #"<p:sldId id=\"256\" r:id=\"rId2\"/>")
+    (match presentation #"<p:sldSz cx=\"4000500\" cy=\"2286000\" type=\"screen16x9\"/>")
+    (match presentation-rels #"Target=\"slideMasters/slideMaster1\.xml\"")
+    (match presentation-rels #"Target=\"slides/slide1\.xml\"")
+    (match presentation-rels #"Target=\"theme/theme1\.xml\"")
+    (match master #"<p:sldMaster")
+    (match master #"<p:titleStyle>")
+    (match master-rels #"Target=\"\.\./slideLayouts/slideLayout1\.xml\"")
+    (match master-rels #"Target=\"\.\./theme/theme1\.xml\"")
+    (match layout #"<p:sldLayout")
+    (match layout-rels #"Target=\"\.\./slideMasters/slideMaster1\.xml\"")
+    (match theme #"<a:theme")
+    (match sidecar #"<svgraph:presentation")
+    (match causal #"\"t\":\"analysis\"")))
+
+(deftest office-causal-projection-is-deterministic-and-linked-to-svgraph-ids
+  (let [svgraph (call "buildSVGraph" semantic-svg)
+        payload (call "buildOfficeCausalPayload" svgraph)
+        jsonl (call "buildOfficeCausalJsonl" svgraph)]
+    (eq (.-generator payload) "office-causal")
+    (ok (some-js #(and (= (.-id %) "ocz1:svgraph-slide-a") (= (.-kind %) "slide")) (.-nodes payload)))
+    (ok (some-js #(and (= (.-id %) "ocz1:svgraph-table-a") (= (.-kind %) "table")) (.-nodes payload)))
+    (ok (some-js #(= (.-kind %) "contains") (.-edges payload)))
+    (match jsonl #"\"t\":\"node\"")
+    (match jsonl #"\"t\":\"edge\"")))
+
+(deftest office-causal-projection-emits-causal-hypothesis-edges-from-causal-semantic-nodes
+  (let [svg "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 360 160\"><g id=\"slide-1\" data-kind=\"slide\"><rect id=\"cause\" data-kind=\"entity\" data-label=\"Cause\" x=\"20\" y=\"20\" width=\"80\" height=\"40\"/><rect id=\"effect\" data-kind=\"claim\" data-label=\"Effect\" x=\"240\" y=\"20\" width=\"80\" height=\"40\"/><text id=\"causal-edge\" data-kind=\"causal\" data-from=\"cause\" data-to=\"effect\" data-polarity=\"+\" data-confidence=\"0.8\" data-mechanism=\"Raises likelihood\" x=\"120\" y=\"45\">Evidence quote</text></g></svg>"
+        payload (call "buildOfficeCausalPayload" (call "buildSVGraph" svg))
+        cause (some #(when (= (.-kind %) "causes") %) (arr (.-edges payload)))]
+    (ok cause "expected a causes edge")
+    (eq (.-from cause) "ocz1:svgraph-cause")
+    (eq (.-to cause) "ocz1:svgraph-effect")
+    (eq (.-polarity (.-causal cause)) "+")
+    (eq (.-mechanism (.-causal cause)) "Raises likelihood")
+    (eq (.-confidence (.-causal cause)) 0.8)
+    (deep-eq (js->data (.-evidence (.-causal cause))) [{:nodeId "ocz1:svgraph-causal-edge" :quote "Evidence quote"}])
+    (ok (some-js #(and (= (.-kind %) "references") (= (.-from %) "ocz1:svgraph-causal-edge") (= (.-to %) "ocz1:svgraph-cause")) (.-edges payload)))
+    (ok (some-js #(and (= (.-kind %) "references") (= (.-from %) "ocz1:svgraph-causal-edge") (= (.-to %) "ocz1:svgraph-effect")) (.-edges payload)))))
+
+(deftest svgraph-sidecar-is-sufficient-to-recover-presentation-metadata-and-original-svg-source
+  (let [svgraph (call "buildSVGraph" semantic-svg)
+        sidecar (call "buildSVGraphSidecar" svgraph semantic-svg)]
+    (eq (.-kind sidecar) "svgraph-sidecar")
+    (eq (.-source_svg sidecar) semantic-svg)
+    (eq (aget (.-slide_size (.-presentation sidecar)) 0) 420)
+    (eq (.-length (.-dependencies sidecar)) 1)
+    (eq (.-estimated_element_coverage (.-coverage sidecar)) (.-estimated_element_coverage (.-coverage svgraph)))))
+
+(defn run-one [[name f]]
+  (-> (js/Promise.resolve)
+      (.then f)
+      (.then (fn []
+               (js/console.log (str "✓ " name))
+               true)
+             (fn [error]
+               (js/console.error (str "✗ " name))
+               (js/console.error (or (.-stack error) error))
+               (set! (.-exitCode js/process) 1)
+               false))))
+
+(defn run-tests! []
+  (-> (js/import "../docs/app.js")
+      (.then (fn [module]
+               (reset! app module)
+               (reduce (fn [chain test]
+                         (.then chain (fn [] (run-one test))))
+                       (js/Promise.resolve true)
+                       @tests)))
+      (.then (fn []
+               (let [failed (= 1 (.-exitCode js/process))]
+                 (when-not failed
+                   (js/console.log (str "tests " (count @tests) ", pass " (count @tests)))))))
+      (.catch (fn [error]
+                (js/console.error (or (.-stack error) error))
+                (set! (.-exitCode js/process) 1)))))
+
+(run-tests!)

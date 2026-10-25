@@ -1,0 +1,350 @@
+(ns mlkem.core
+  "ML-KEM-768 (NIST FIPS 203, the module-lattice key-encapsulation mechanism),
+   in portable `.cljk`. The only dependency is `sha3.core` (org-nist-sha3).
+
+   ```clojure
+   (require '[mlkem.core :as mlkem])
+
+   ;; The caller supplies the randomness. The library has no random source.
+   (let [{:keys [ek dk]} (mlkem/keygen d z)         ; d, z: 32 random bytes each
+         {:keys [k c]}   (mlkem/encaps ek m)        ; m: 32 random bytes
+         k2              (mlkem/decaps dk c)]       ; (= k k2)
+     ...)
+   ```
+
+   Everything is a vector of unsigned bytes (0-255). Sizes for ML-KEM-768:
+   ek 1184, dk 2400, c 1088, shared key 32.
+
+   Implicit rejection: `decaps` of a well-formed but wrong ciphertext does not
+   fail. It returns `J(z || c)`, a key that looks random and differs from the
+   encapsulator's, as FIPS 203 Algorithm 18 requires. Malformed inputs of the
+   wrong *length* are a different thing: they are refused with an exception,
+   because the standard's input checks (section 7) say so.
+
+   `keygen`, `encaps` and `decaps` are the internal algorithms of FIPS 203
+   (Algorithms 16, 17, 18) taking explicit randomness, which is what the NIST ACVP
+   vectors exercise, plus the input checks of sections 7.2 and 7.3.
+
+   Number theory is computed, not typed: the NTT constants are `17^BitRev7(i)`
+   mod 3329. Arithmetic uses only `+ - * mod quot` on small values (below 2^40)
+   so that ClojureScript doubles and JVM longs agree; bit operators are used on
+   values below 2^21 only.
+
+   Not constant time. See the README."
+  (:require [sha3.core :as sha3]))
+
+;; ---------------------------------------------------------------------------
+;; Parameters (ML-KEM-768, Table 2)
+;; ---------------------------------------------------------------------------
+
+(def ^:private q 3329)
+(def ^:private k 3)
+(def ^:private eta1 2)
+(def ^:private eta2 2)
+(def ^:private du 10)
+(def ^:private dv 4)
+
+(def ek-size (+ (* 384 k) 32))                 ; 1184
+(def dk-size (+ (* 768 k) 96))                 ; 2400
+(def ciphertext-size (* 32 (+ (* du k) dv)))   ; 1088
+
+(def ^:private pow2 (vec (take 40 (iterate #(* 2 %) 1))))
+
+;; ---------------------------------------------------------------------------
+;; Hash functions of section 4.1
+;; ---------------------------------------------------------------------------
+
+(defn- H [bytes] (sha3/sha3-256 bytes))
+(defn- J [bytes] (sha3/shake256 bytes 32))
+(defn- G [bytes] (let [h (sha3/sha3-512 bytes)] [(subvec h 0 32) (subvec h 32 64)]))
+(defn- PRF [eta s b] (sha3/shake256 (conj (vec s) b) (* 64 eta)))
+
+;; ---------------------------------------------------------------------------
+;; Constants, computed
+;; ---------------------------------------------------------------------------
+
+(defn- modpow [base e]
+  (loop [r 1 b (mod base q) e e]
+    (cond (zero? e) r
+          (odd? e) (recur (mod (* r b) q) (mod (* b b) q) (quot e 2))
+          :else (recur r (mod (* b b) q) (quot e 2)))))
+
+(defn- bitrev7 [i]
+  (loop [n 0 v i r 0]
+    (if (= n 7) r (recur (inc n) (quot v 2) (+ (* 2 r) (mod v 2))))))
+
+(def ^:private zetas
+  "zetas[i] = 17^BitRev7(i) mod q, i = 0..127 (Appendix A)."
+  (vec (for [i (range 128)] (modpow 17 (bitrev7 i)))))
+
+(def ^:private gammas
+  "gammas[i] = 17^(2 BitRev7(i) + 1) mod q, used by MultiplyNTTs."
+  (vec (for [i (range 128)] (modpow 17 (+ (* 2 (bitrev7 i)) 1)))))
+
+;; ---------------------------------------------------------------------------
+;; Polynomials: vectors of 256 integers in [0, q)
+;; ---------------------------------------------------------------------------
+
+(defn- poly-add [a b] (mapv (fn [x y] (mod (+ x y) q)) a b))
+(defn- poly-sub [a b] (mapv (fn [x y] (mod (- x y) q)) a b))
+
+(defn- ntt
+  "Algorithm 9."
+  [f]
+  (loop [f f len 128 i 1]
+    (if (< len 2)
+      f
+      (let [[f i]
+            (loop [f f start 0 i i]
+              (if (>= start 256)
+                [f i]
+                (let [zeta (nth zetas i)
+                      f (loop [f f j start]
+                          (if (>= j (+ start len))
+                            f
+                            (let [t (mod (* zeta (nth f (+ j len))) q)
+                                  fj (nth f j)]
+                              (recur (-> f
+                                         (assoc (+ j len) (mod (- fj t) q))
+                                         (assoc j (mod (+ fj t) q)))
+                                     (inc j)))))]
+                  (recur f (+ start (* 2 len)) (inc i)))))]
+        (recur f (quot len 2) i)))))
+
+(defn- ntt-inv
+  "Algorithm 10."
+  [f]
+  (let [f (loop [f f len 2 i 127]
+            (if (> len 128)
+              f
+              (let [[f i]
+                    (loop [f f start 0 i i]
+                      (if (>= start 256)
+                        [f i]
+                        (let [zeta (nth zetas i)
+                              f (loop [f f j start]
+                                  (if (>= j (+ start len))
+                                    f
+                                    (let [t (nth f j)
+                                          u (nth f (+ j len))]
+                                      (recur (-> f
+                                                 (assoc j (mod (+ t u) q))
+                                                 (assoc (+ j len) (mod (* zeta (- u t)) q)))
+                                             (inc j)))))]
+                          (recur f (+ start (* 2 len)) (dec i)))))]
+                (recur f (* 2 len) i))))]
+    (mapv (fn [x] (mod (* x 3303) q)) f)))
+
+(defn- multiply-ntts
+  "Algorithms 11 and 12: the product of two polynomials in the NTT domain."
+  [f g]
+  (vec (mapcat
+        (fn [i]
+          (let [a0 (nth f (* 2 i)) a1 (nth f (inc (* 2 i)))
+                b0 (nth g (* 2 i)) b1 (nth g (inc (* 2 i)))
+                gam (nth gammas i)]
+            [(mod (+ (* a0 b0) (mod (* (mod (* a1 b1) q) gam) q)) q)
+             (mod (+ (* a0 b1) (* a1 b0)) q)]))
+        (range 128))))
+
+;; ---------------------------------------------------------------------------
+;; Encoding (Algorithms 5 and 6), compression (section 4.2.1)
+;; ---------------------------------------------------------------------------
+
+(defn- byte-encode
+  "Pack 256 coefficients of d bits each, least significant bit first."
+  [d f]
+  (loop [coeffs (seq f) buf 0 nb 0 out (transient [])]
+    (cond
+      (>= nb 8) (recur coeffs (quot buf 256) (- nb 8) (conj! out (mod buf 256)))
+      (nil? coeffs) (persistent! out)
+      :else (recur (next coeffs) (+ buf (* (first coeffs) (nth pow2 nb))) (+ nb d) out))))
+
+
+(defn- byte-decode
+  "Unpack 256 coefficients of d bits each. For d = 12 the value is reduced mod q."
+  [d bytes]
+  (let [m (nth pow2 d)]
+    (loop [bs (seq bytes) buf 0 nb 0 out (transient [])]
+      (cond
+        (>= nb d) (let [x (mod buf m)]
+                    (recur bs (quot buf m) (- nb d) (conj! out (if (= d 12) (mod x q) x))))
+        (nil? bs) (persistent! out)
+        :else (recur (next bs) (+ buf (* (first bs) (nth pow2 nb))) (+ nb 8) out)))))
+
+(defn- compress
+  "round(2^d / q * x) mod 2^d, in exact integer arithmetic."
+  [d x]
+  (mod (quot (+ (* 2 x (nth pow2 d)) q) (* 2 q)) (nth pow2 d)))
+
+(defn- decompress
+  "round(q / 2^d * y)."
+  [d y]
+  (quot (+ (* 2 q y) (nth pow2 d)) (* 2 (nth pow2 d))))
+
+;; ---------------------------------------------------------------------------
+;; Sampling (Algorithms 7 and 8)
+;; ---------------------------------------------------------------------------
+
+(defn- sample-ntt
+  "Rejection-sample 256 coefficients from SHAKE128(B), B = rho || j || i."
+  [b]
+  (loop [x (sha3/xof-absorb (sha3/xof :shake128) b)
+         buf [] pos 0 out (transient [])]
+    (cond
+      (= 256 (count out)) (persistent! out)
+      (> (+ pos 3) (count buf)) (let [[x blk] (sha3/xof-squeeze x 168)]
+                                  (recur x (into (subvec buf pos) blk) 0 out))
+      :else
+      (let [c0 (nth buf pos) c1 (nth buf (+ pos 1)) c2 (nth buf (+ pos 2))
+            d1 (+ c0 (* 256 (mod c1 16)))
+            d2 (+ (quot c1 16) (* 16 c2))
+            out (if (< d1 q) (conj! out d1) out)
+            out (if (and (< d2 q) (< (count out) 256)) (conj! out d2) out)]
+        (recur x buf (+ pos 3) out)))))
+
+(defn- bit [bytes idx]
+  (mod (quot (nth bytes (quot idx 8)) (nth pow2 (mod idx 8))) 2))
+
+(defn- sample-poly-cbd
+  "Centered binomial distribution with parameter eta, from 64*eta bytes."
+  [eta bytes]
+  (vec (for [i (range 256)]
+         (let [x (reduce + (for [j (range eta)] (bit bytes (+ (* 2 i eta) j))))
+               y (reduce + (for [j (range eta)] (bit bytes (+ (* 2 i eta) eta j))))]
+           (mod (- x y) q)))))
+
+;; ---------------------------------------------------------------------------
+;; K-PKE (Algorithms 13, 14, 15)
+;; ---------------------------------------------------------------------------
+
+(defn- gen-matrix
+  "A-hat[i][j] = SampleNTT(rho || j || i)."
+  [rho]
+  (vec (for [i (range k)]
+         (vec (for [j (range k)]
+                (sample-ntt (into (vec rho) [j i])))))))
+
+(defn- vec-dot
+  "Sum of NTT-domain products: sum_j (a[j] * b[j])."
+  [as bs]
+  (reduce poly-add (map multiply-ntts as bs)))
+
+(defn- kpke-keygen [d]
+  (let [[rho sigma] (G (conj (vec d) k))
+        a (gen-matrix rho)
+        s (mapv (fn [n] (sample-poly-cbd eta1 (PRF eta1 sigma n))) (range k))
+        e (mapv (fn [n] (sample-poly-cbd eta1 (PRF eta1 sigma n))) (range k (* 2 k)))
+        s-hat (mapv ntt s)
+        e-hat (mapv ntt e)
+        t-hat (mapv (fn [i] (poly-add (vec-dot (nth a i) s-hat) (nth e-hat i))) (range k))]
+    {:ek (into (vec (mapcat #(byte-encode 12 %) t-hat)) rho)
+     :dk (vec (mapcat #(byte-encode 12 %) s-hat))}))
+
+(defn- kpke-encrypt [ek m r]
+  (let [t-hat (mapv (fn [i] (byte-decode 12 (subvec ek (* 384 i) (* 384 (inc i))))) (range k))
+        rho (subvec ek (* 384 k) (+ (* 384 k) 32))
+        a (gen-matrix rho)
+        y (mapv (fn [n] (sample-poly-cbd eta1 (PRF eta1 r n))) (range k))
+        e1 (mapv (fn [n] (sample-poly-cbd eta2 (PRF eta2 r n))) (range k (* 2 k)))
+        e2 (sample-poly-cbd eta2 (PRF eta2 r (* 2 k)))
+        y-hat (mapv ntt y)
+        ;; u = NTT^-1(A^T y-hat) + e1: column i of A-hat is a[j][i]
+        u (mapv (fn [i]
+                  (poly-add (ntt-inv (vec-dot (map #(nth % i) a) y-hat)) (nth e1 i)))
+                (range k))
+        mu (mapv (fn [x] (decompress 1 x)) (byte-decode 1 m))
+        v (poly-add (poly-add (ntt-inv (vec-dot t-hat y-hat)) e2) mu)
+        c1 (vec (mapcat (fn [p] (byte-encode du (mapv #(compress du %) p))) u))
+        c2 (byte-encode dv (mapv #(compress dv %) v))]
+    (into c1 c2)))
+
+(defn- kpke-decrypt [dk c]
+  (let [c1 (subvec c 0 (* 32 du k))
+        c2 (subvec c (* 32 du k))
+        u' (mapv (fn [i]
+                   (mapv #(decompress du %)
+                         (byte-decode du (subvec c1 (* 32 du i) (* 32 du (inc i))))))
+                 (range k))
+        v' (mapv #(decompress dv %) (byte-decode dv c2))
+        s-hat (mapv (fn [i] (byte-decode 12 (subvec dk (* 384 i) (* 384 (inc i))))) (range k))
+        w (poly-sub v' (ntt-inv (vec-dot s-hat (mapv ntt u'))))]
+    (byte-encode 1 (mapv #(compress 1 %) w))))
+
+;; ---------------------------------------------------------------------------
+;; Input checks (sections 7.2 and 7.3)
+;; ---------------------------------------------------------------------------
+
+(defn- bytes? [x n]
+  (and (sequential? x) (= n (count x)) (every? #(and (integer? %) (<= 0 % 255)) x)))
+
+(defn valid-encapsulation-key?
+  "Type check (length) and modulus check: every 12-bit coefficient of the encoded
+   vector must already be reduced mod q, i.e. ByteEncode12(ByteDecode12(ek)) = ek."
+  [ek]
+  (and (bytes? ek ek-size)
+       (let [ek (vec ek) body (subvec ek 0 (* 384 k))]
+         (= body (vec (mapcat (fn [i]
+                                (byte-encode 12 (byte-decode 12 (subvec body (* 384 i) (* 384 (inc i))))))
+                              (range k)))))))
+
+(defn valid-decapsulation-key?
+  "Type check (length) and hash check: dk contains H(ek) at the position FIPS 203 says."
+  [dk]
+  (and (bytes? dk dk-size)
+       (let [dk (vec dk)]
+         (= (H (subvec dk (* 384 k) (+ (* 768 k) 32)))
+            (subvec dk (+ (* 768 k) 32) (+ (* 768 k) 64))))))
+
+;; ---------------------------------------------------------------------------
+;; ML-KEM (Algorithms 16, 17, 18)
+;; ---------------------------------------------------------------------------
+
+(defn keygen
+  "d and z are 32 random bytes each. Returns {:ek 1184 bytes, :dk 2400 bytes}."
+  [d z]
+  (when-not (and (bytes? d 32) (bytes? z 32))
+    (throw (ex-info "keygen needs two 32-byte seeds" {})))
+  (let [{:keys [ek dk]} (kpke-keygen d)]
+    {:ek ek
+     :dk (-> dk (into ek) (into (H ek)) (into (vec z)))}))
+
+(defn encaps
+  "m is 32 random bytes. Returns {:k shared key (32 bytes), :c ciphertext (1088 bytes)}.
+   Refuses an encapsulation key that fails the length or modulus check."
+  [ek m]
+  (when-not (valid-encapsulation-key? ek)
+    (throw (ex-info "invalid encapsulation key" {:reason :ek-check})))
+  (when-not (bytes? m 32)
+    (throw (ex-info "encaps needs a 32-byte message" {})))
+  (let [ek (vec ek) m (vec m)
+        [kk r] (G (into m (H ek)))]
+    {:k kk :c (kpke-encrypt ek m r)}))
+
+(defn- ct-select
+  "Return a if differ? is 0, else b, without branching on the data."
+  [differ a b]
+  (let [mask (if (zero? differ) 0 255)]
+    (mapv (fn [x y] (bit-xor x (bit-and (bit-xor x y) mask))) a b)))
+
+(defn decaps
+  "Returns the 32-byte shared key. A well-formed but wrong ciphertext does not
+   throw: the result is J(z || c) (implicit rejection). A decapsulation key or
+   ciphertext of the wrong length, or a decapsulation key whose hash check fails,
+   is refused with an exception."
+  [dk c]
+  (when-not (valid-decapsulation-key? dk)
+    (throw (ex-info "invalid decapsulation key" {:reason :dk-check})))
+  (when-not (bytes? c ciphertext-size)
+    (throw (ex-info "invalid ciphertext length" {:reason :c-length})))
+  (let [dk (vec dk) c (vec c)
+        dk-pke (subvec dk 0 (* 384 k))
+        ek-pke (subvec dk (* 384 k) (+ (* 768 k) 32))
+        h (subvec dk (+ (* 768 k) 32) (+ (* 768 k) 64))
+        z (subvec dk (+ (* 768 k) 64) (+ (* 768 k) 96))
+        m' (kpke-decrypt dk-pke c)
+        [k' r'] (G (into m' h))
+        k-bar (J (into z c))
+        c' (kpke-encrypt ek-pke m' r')
+        differ (reduce bit-or 0 (map bit-xor c c'))]
+    (ct-select differ k' k-bar)))

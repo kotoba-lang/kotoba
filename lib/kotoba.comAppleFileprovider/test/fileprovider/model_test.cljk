@@ -1,0 +1,233 @@
+(ns fileprovider.model-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [fileprovider.model :as model]))
+
+(deftest modes-are-independent
+  (let [base model/defaults]
+    (is (model/valid? base))
+    (is (= :manual (:sync/schedule (model/set-schedule base :manual))))
+    (is (= :pinned (:sync/residency (model/set-residency base :pinned))))
+    (is (false? (model/should-poll? (model/set-schedule base :manual))))
+    (is (= [:scan-local :fetch-remote]
+           (model/command (model/set-schedule base :manual) :sync-now)))
+    (is (= [:fail-paused]
+           (model/command (model/set-schedule base :paused) :sync-now)))))
+
+(deftest open-materialises-placeholder
+  (is (= [:download] (model/command model/defaults :open)))
+  (is (= :materialized
+         (:sync/local-state
+          (model/transition
+           (model/transition model/defaults :download-started)
+           :download-succeeded)))))
+
+(deftest eviction-is-lossless
+  (testing "verified clean automatic materialisation may be evicted"
+    (let [clean (assoc model/defaults :sync/local-state :materialized)]
+      (is (model/can-evict? clean))
+      (is (= [:evict] (model/command clean :disk-pressure)))))
+  (testing "dirty, unverified and pinned bytes are never evicted"
+    (doseq [item [(assoc model/defaults :sync/local-state :dirty
+                        :sync/pending-local? true)
+                  (assoc model/defaults :sync/local-state :materialized
+                        :sync/remote-verified? false)
+                  (assoc model/defaults :sync/local-state :materialized
+                        :sync/residency :pinned)]]
+      (is (false? (model/can-evict? item)))
+      (is (empty? (model/command item :disk-pressure))))))
+
+(deftest badges-expose-real-state
+  (is (= :cloud (model/badge model/defaults)))
+  (is (= :available-offline
+         (model/badge (assoc model/defaults
+                             :sync/local-state :materialized
+                             :sync/residency :pinned))))
+  (is (= :pending-upload
+         (model/badge (model/transition model/defaults :local-edited))))
+  (is (= :conflict
+         (model/badge (model/transition model/defaults :remote-conflict)))))
+
+;; ── What the four tests above do not hold ────────────────────────────────────
+;;
+;; The tests above walk the happy path of each mode. They pin what the model
+;; does when asked to do the obvious thing, which leaves the interesting half
+;; unheld: the model's whole job is deciding when an operation is *refused*,
+;; and a refusal that quietly stops refusing looks exactly like one that still
+;; works. Everything below pins a refusal, a boundary, or a total mapping.
+
+(deftest eviction-requires-exactly-materialized
+  (testing "materialized is the one state whose bytes may be discarded"
+    ;; Every other field is held at its most permissive value, so local-state
+    ;; is the only thing deciding. `can-evict?` asks for equality with
+    ;; :materialized rather than 'not a placeholder', and this is the input
+    ;; that tells those two readings apart: an item mid-upload, mid-download,
+    ;; in conflict or in error carries bytes, and discarding them loses either
+    ;; the local edit or the only account of what went wrong.
+    (let [permissive (assoc model/defaults
+                            :sync/residency :automatic
+                            :sync/remote-verified? true
+                            :sync/pending-local? false)]
+      (is (model/can-evict? (assoc permissive :sync/local-state :materialized)))
+      (doseq [state (disj model/local-states :materialized)]
+        (let [item (assoc permissive :sync/local-state state)]
+          (is (false? (model/can-evict? item))
+              (str "local-state " state " must not be evictable"))
+          (is (empty? (model/command item :disk-pressure))
+              (str "disk pressure must not evict a " state " item")))))))
+
+(deftest upload-success-clears-the-pending-flag
+  (testing "a completed upload returns the item to a discardable state"
+    ;; If :upload-succeeded leaves :sync/pending-local? set, nothing else ever
+    ;; clears it. The item stays badged as pending-upload forever and can never
+    ;; be evicted again, so the disk fills with files the server already holds.
+    (let [uploaded (-> model/defaults
+                       (model/transition :local-edited)
+                       (model/transition :upload-started)
+                       (model/transition :upload-succeeded))]
+      (is (= :materialized (:sync/local-state uploaded)))
+      (is (false? (:sync/pending-local? uploaded)))
+      (is (true? (:sync/remote-verified? uploaded)))
+      (is (= :available (model/badge uploaded)))
+      (is (model/can-evict? uploaded))))
+  (testing "an edit that has not been uploaded is still held"
+    (let [edited (model/transition model/defaults :local-edited)]
+      (is (true? (:sync/pending-local? edited)))
+      (is (false? (model/can-evict? edited))))))
+
+(deftest paused-refuses-both-directions
+  (testing "paused declines every event that would touch the network"
+    (let [paused (model/set-schedule model/defaults :paused)]
+      (is (false? (model/should-poll? paused)))
+      (is (false? (model/sync-now-allowed? paused)))
+      (doseq [event [:open :download-request :sync-now]]
+        (is (= [:fail-paused] (model/command paused event))
+            (str event " must be refused while paused")))))
+  (testing "pausing outranks pinning"
+    ;; Pinned residency is what makes an item materialise without being asked.
+    ;; Paused has to win, or pausing a pinned folder would still download it.
+    (let [pinned-paused (-> model/defaults
+                            (model/set-residency :pinned)
+                            (model/set-schedule :paused))]
+      (is (false? (model/should-materialize? pinned-paused :open)))
+      (is (= [:fail-paused] (model/command pinned-paused :download-request)))))
+  (testing "manual still permits an explicit sync, it only stops the poll"
+    (let [manual (model/set-schedule model/defaults :manual)]
+      (is (false? (model/should-poll? manual)))
+      (is (true? (model/sync-now-allowed? manual)))
+      (is (= [:download] (model/command manual :open))))))
+
+(deftest residency-decides-what-materialises-unasked
+  (testing "pinned materialises on its own, the others wait to be asked"
+    (let [pinned (model/set-residency model/defaults :pinned)]
+      (is (true? (model/should-materialize? pinned :disk-pressure)))
+      (is (true? (model/should-materialize? pinned :sync-now))))
+    (doseq [residency [:automatic :online-only]]
+      (let [item (model/set-residency model/defaults residency)]
+        (is (false? (model/should-materialize? item :disk-pressure))
+            (str residency " must not materialise unprompted"))
+        (is (false? (model/should-materialize? item :sync-now))
+            (str residency " must not materialise on a poll")))))
+  (testing "an explicit request materialises at any residency"
+    (doseq [residency model/residencies
+            event [:open :download-request]]
+      (is (true? (model/should-materialize?
+                  (model/set-residency model/defaults residency) event))
+          (str event " must materialise a " residency " item"))))
+  (testing "an online-only item still opens"
+    ;; Online-only means 'do not keep it', not 'do not fetch it'.
+    (is (= [:download]
+           (model/command (model/set-residency model/defaults :online-only)
+                          :download-request)))))
+
+(deftest pin-and-unpin-move-only-what-must-move
+  (testing "pinning fetches a placeholder and leaves present bytes alone"
+    (is (= [:download] (model/command model/defaults :pin)))
+    (is (empty? (model/command (assoc model/defaults
+                                      :sync/local-state :materialized)
+                               :pin))))
+  (testing "unpinning frees bytes it was only holding because they were pinned"
+    ;; The item is still :pinned when :unpin arrives — the effect has to be
+    ;; decided against the residency the item is moving to, not the one it is
+    ;; leaving, or unpin would never free anything.
+    (let [pinned (assoc model/defaults
+                        :sync/local-state :materialized
+                        :sync/residency :pinned)]
+      (is (false? (model/can-evict? pinned)))
+      (is (= [:evict] (model/command pinned :unpin)))))
+  (testing "unpinning never discards an unuploaded edit"
+    (let [dirty (assoc model/defaults
+                       :sync/local-state :dirty
+                       :sync/residency :pinned
+                       :sync/pending-local? true)]
+      (is (empty? (model/command dirty :unpin))))))
+
+(deftest validity-is-checked-field-by-field
+  (testing "a well-formed item is accepted"
+    (is (model/valid? model/defaults)))
+  (testing "each field is rejected on its own"
+    ;; Checked one field at a time. A single case with several fields wrong is
+    ;; still rejected when all but one of the checks have been dropped, so it
+    ;; cannot tell which check is doing the work.
+    (doseq [[k v] {:sync/schedule :hourly
+                   :sync/residency :offline
+                   :sync/local-state :syncing
+                   :sync/remote-verified? "yes"
+                   :sync/pending-local? nil}]
+      (is (false? (model/valid? (assoc model/defaults k v)))
+          (str k " = " (pr-str v) " must be rejected"))))
+  (testing "the vocabularies are closed"
+    (doseq [schedule model/schedules]
+      (is (model/valid? (model/set-schedule model/defaults schedule))))
+    (doseq [residency model/residencies]
+      (is (model/valid? (model/set-residency model/defaults residency))))
+    (doseq [state model/local-states]
+      (is (model/valid? (assoc model/defaults :sync/local-state state)))))
+  (testing "a value outside the vocabulary is refused at the setter"
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (model/set-schedule model/defaults :hourly)))
+    (is (thrown? #?(:clj AssertionError :cljs js/Error)
+                 (model/set-residency model/defaults :offline))))
+  (testing "something that is not an item is not an item"
+    (is (false? (model/valid? nil)))
+    (is (false? (model/valid? {})))))
+
+(deftest every-local-state-has-its-own-badge
+  (testing "the badge vocabulary is total"
+    ;; Finder and the web UI share this vocabulary, so a state that falls
+    ;; through to the default is shown to a person as a synced file.
+    (is (= {:placeholder :cloud
+            :downloading :downloading
+            :materialized :available
+            :dirty :pending-upload
+            :uploading :uploading
+            :conflict :conflict
+            :error :error}
+           (into {} (for [state model/local-states]
+                      [state (model/badge (assoc model/defaults
+                                                 :sync/local-state state))])))))
+  (testing "trouble outranks residency"
+    ;; :available-offline reads as 'this is safe on your disk'. A conflicted or
+    ;; failed pinned file must not claim that.
+    (doseq [state [:conflict :error :uploading :downloading :dirty]]
+      (is (not= :available-offline
+                (model/badge (assoc model/defaults
+                                    :sync/local-state state
+                                    :sync/residency :pinned)))
+          (str "a pinned " state " item must not read as available offline"))))
+  (testing "a pinned materialized item is the one that reads as offline"
+    (is (= :available-offline
+           (model/badge (assoc model/defaults
+                               :sync/local-state :materialized
+                               :sync/residency :pinned))))))
+
+(deftest unknown-events-change-nothing
+  (testing "an event the model does not know produces no effect"
+    (is (empty? (model/command model/defaults :defenestrate))))
+  (testing "an event the model does not know does not move the item"
+    ;; The transport adapter is free to report events this model has not been
+    ;; taught. Silently rewriting state on one of them would be worse than
+    ;; ignoring it.
+    (doseq [item [model/defaults
+                  (assoc model/defaults :sync/local-state :dirty
+                         :sync/pending-local? true)]]
+      (is (= item (model/transition item :defenestrate))))))

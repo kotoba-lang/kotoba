@@ -1,0 +1,165 @@
+(ns karakuri.methods.test-command
+  "Tests for the karakuri ServiceOp parser/planner (ADR-2606039200).
+
+  1:1 Clojure port of `methods/test_command.py`.
+  Stdlib + clojure.test only. Parametrized Python cases are expanded into
+  separate `(is ...)` forms."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text] [kotoba.test :refer [deftest is testing]]
+            [karakuri.methods.command :as sut]))
+
+;; ── parsing (G8: never guesses the shape) ───────────────────────────────────────────
+
+(deftest test-parse-basic-command
+  (let [[service noun verb args] (sut/parse-command "karakuri squarespace pages.list")]
+    (is (= [service noun verb] ["squarespace" "pages" "list"]))
+    (is (= args {}))))
+
+(deftest test-parse-strips-optional-leading-karakuri
+  (let [[s1] (sut/parse-command "squarespace pages.list")
+        [s2] (sut/parse-command "karakuri squarespace pages.list")]
+    (is (= s1 s2 "squarespace"))))
+
+(deftest test-parse-flags
+  (let [[_ _ _ args] (sut/parse-command "karakuri notion database.query --filter status --limit 50")]
+    (is (= args {"filter" "status", "limit" "50"}))))
+
+(deftest test-parse-boolean-flag
+  (let [[_ _ _ args] (sut/parse-command "karakuri github repos.list --archived")]
+    (is (= args {"archived" true}))))
+
+(deftest test-parse-malformed-raises
+  (is (thrown? kerror/ExceptionInfo (sut/parse-command "")))
+  (is (thrown? kerror/ExceptionInfo (sut/parse-command "squarespace")))
+  (is (thrown? kerror/ExceptionInfo (sut/parse-command "karakuri")))
+  (is (thrown? kerror/ExceptionInfo (sut/parse-command "notion pageslist")))
+  (is (thrown? kerror/ExceptionInfo (sut/parse-command "notion ."))))
+
+;; ── safety classification (G5) ──────────────────────────────────────────────────
+
+(deftest test-classify-safety-reads-and-mutations
+  (is (= (sut/classify-safety "list") sut/SAFETY-READ))
+  (is (= (sut/classify-safety "get") sut/SAFETY-READ))
+  (is (= (sut/classify-safety "export") sut/SAFETY-READ))
+  (is (= (sut/classify-safety "update") sut/SAFETY-UPDATE))
+  (is (= (sut/classify-safety "delete") sut/SAFETY-DELETE)))
+
+(deftest test-unknown-verb-is-conservatively-mutating
+  ;; G5: never assume an unknown verb is safe.
+  (is (= (sut/classify-safety "frobnicate") sut/SAFETY-UPDATE)))
+
+(deftest test-is-destructive-only-delete
+  (is (= (sut/is-destructive sut/SAFETY-DELETE) true))
+  (is (= (sut/is-destructive sut/SAFETY-READ) false))
+  (is (= (sut/is-destructive sut/SAFETY-UPDATE) false)))
+
+;; ── tier selection (G2: official-API-first; default-deny browser automation) ───
+
+(deftest test-select-tier-prefers-official-api
+  (is (= (sut/select-tier (sut/resolve-service "squarespace")) sut/TIER-T1))
+  (is (= (sut/select-tier (sut/resolve-service "notion")) sut/TIER-T1)))
+
+(deftest test-select-tier-headless-when-no-api-but-tos-allows
+  (is (= (sut/select-tier (sut/resolve-service "legacy-portal")) sut/TIER-T2)))
+
+(deftest test-select-tier-export-when-automation-prohibited
+  (is (= (sut/select-tier (sut/resolve-service "noauto-saas")) sut/TIER-T3)))
+
+(deftest test-mutate-gate-read-allowed-mutate-awaits-sig
+  (is (= (sut/mutate-gate sut/SAFETY-READ) sut/MUTATE-READ-ALLOWED))
+  (is (= (sut/mutate-gate sut/SAFETY-UPDATE) sut/MUTATE-AWAIT-SIG))
+  (is (= (sut/mutate-gate sut/SAFETY-DELETE) sut/MUTATE-AWAIT-SIG)))
+
+;; ── end-to-end plans (G5/G6 invariants) ────────────────────────────────────────
+
+(deftest test-plan-read-op-is-allowed-dry-run-t1
+  (let [op (sut/plan "karakuri squarespace pages.list")]
+    (is (= (:service-known op) true))
+    (is (= (:adapter-tier op) sut/TIER-T1))
+    (is (= (:safety op) sut/SAFETY-READ))
+    (is (= (:mutate-gate op) sut/MUTATE-READ-ALLOWED))
+    (is (= (:tos-gate op) sut/TOS-OK))
+    (is (= (:dry-run op) true))))          ; G6 — never executes at R0
+
+(deftest test-plan-mutate-op-awaits-member-sig
+  (let [op (sut/plan "karakuri notion database.update --title Hello")]
+    (is (= (:safety op) sut/SAFETY-UPDATE))
+    (is (= (:mutate-gate op) sut/MUTATE-AWAIT-SIG))   ; G5
+    (is (= (:dry-run op) true))))
+
+(deftest test-plan-delete-is-destructive-and-gated
+  (let [op (sut/plan "karakuri shopify products.delete --id 42")]
+    (is (= (:safety op) sut/SAFETY-DELETE))
+    (is (= (:destructive op) true))                   ; G5 — explicit member confirm
+    (is (= (:mutate-gate op) sut/MUTATE-AWAIT-SIG))))
+
+(deftest test-g2-refuses-headless-on-automation-prohibited-service
+  ;; Forcing the T2 headless adapter on a ToS-automation-prohibited service is refused (G2).
+  (let [op (sut/plan "karakuri noauto-saas records.list" :prefer-tier sut/TIER-T2)]
+    (is (= (:tos-gate op) sut/TOS-REFUSED))
+    (is (kotoba.lang.text/includes? (:note op) "G2"))))
+
+(deftest test-g8-unknown-service-degrades-honestly
+  (let [op (sut/plan "karakuri totally-made-up-service things.list")]
+    (is (= (:service-known op) false))
+    (is (= (:note op) sut/UNKNOWN-SERVICE))
+    (is (= (:adapter-tier op) ""))))               ; no guess
+
+;; ── Google + Facebook: api-ok yet browser-automation-prohibited ───────────────
+
+(deftest test-google-resolves-and-defaults-to-official-api
+  (let [rec (sut/resolve-service "google")]
+    (is (some? rec))
+    (is (= (sut/select-tier rec) sut/TIER-T1))          ; drive the API, not the browser
+    (is (= (sut/t2-stance rec) "prohibited"))))
+
+(deftest test-facebook-resolves-and-defaults-to-official-api
+  (let [rec (sut/resolve-service "facebook")]
+    (is (some? rec))
+    (is (= (sut/select-tier rec) sut/TIER-T1))
+    (is (= (sut/t2-stance rec) "prohibited"))))
+
+(deftest test-google-gmail-read-plans-via-t1-not-browser
+  (let [op (sut/plan "karakuri google messages.list")]
+    (is (= (:adapter-tier op) sut/TIER-T1))
+    (is (= (:t2-engine op) ""))                        ; browser-use NOT engaged for Google
+    (is (= (:mutate-gate op) sut/MUTATE-READ-ALLOWED))))
+
+(deftest test-g2-browser-automation-refused-on-google
+  ;; Forcing T2 browser-use on Google is refused by construction (api-ok but browser-prohibited).
+  (let [op (sut/plan "karakuri google search.query --q hello" :prefer-tier sut/TIER-T2)]
+    (is (= (:tos-gate op) sut/TOS-REFUSED))
+    (is (= (:t2-engine op) ""))
+    (is (kotoba.lang.text/includes? (:note op) "G2"))))
+
+(deftest test-g2-browser-automation-refused-on-facebook
+  (let [op (sut/plan "karakuri facebook posts.list" :prefer-tier sut/TIER-T2)]
+    (is (= (:tos-gate op) sut/TOS-REFUSED))
+    (is (= (:t2-engine op) ""))))
+
+;; ── browser-use engine selection (the T2 path on a ToS-permitting service) ───
+
+(deftest test-browser-use-engine-selected-on-permitted-t2-service
+  (let [op (sut/plan "karakuri legacy-portal records.list")]     ; no API, automation permitted → T2
+    (is (= (:adapter-tier op) sut/TIER-T2))
+    (is (= (:t2-engine op) sut/T2-ENGINE))                       ; "browser-use"
+    (is (= (:tos-gate op) sut/TOS-OK))))
+
+(deftest test-no-engine-on-t1-service
+  (let [op (sut/plan "karakuri squarespace pages.list")]
+    (is (= (:adapter-tier op) sut/TIER-T1))
+    (is (= (:t2-engine op) ""))))
+
+(deftest test-t2-engine-helper-empty-when-gate-refused
+  (let [rec (sut/resolve-service "noauto-saas")]
+    (is (= (sut/t2-engine rec sut/TIER-T2 sut/TOS-REFUSED) ""))
+    (is (= (sut/t2-engine rec sut/TIER-T2 sut/TOS-OK) ""))))    ; stance still prohibited
+
+(deftest test-missing-t2-stance-defaults-prohibited
+  ;; default-deny browser automation when the stance is absent (G2).
+  (is (= (sut/t2-stance {"official_api" false}) "prohibited")))
+
+;; ── prefer-tier validation ───────────────────────────────────────────────────
+
+(deftest test-unknown-prefer-tier-raises
+  (is (thrown? kerror/ExceptionInfo
+               (sut/plan "karakuri squarespace pages.list" :prefer-tier "t9-magic"))))

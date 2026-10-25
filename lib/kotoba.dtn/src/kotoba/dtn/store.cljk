@@ -1,0 +1,118 @@
+(ns kotoba.dtn.store
+  "A durable (disk-backed) log format for a DTN node's :store — the
+  bundles it is holding but has not yet delivered (RFC 9171
+  store-and-carry custody). Closes a real resilience gap:
+  `kotoba.dtn.transport.tcp`'s node handle previously kept `:store` in an
+  in-memory atom only, so a process crash or restart silently lost every
+  undelivered bundle — directly contradicting this library's own
+  disaster/carrier-outage resilience purpose.
+
+  FORMAT — newline-delimited `pr-str`'d EDN, one bundle per line (an
+  append-only log, same shape as this workspace's other append-only
+  ledgers): human-diffable, and a partially-written last line from a
+  crash mid-append can never corrupt earlier, already-flushed lines.
+
+  This namespace splits pure logic from Node I/O so the format and
+  compaction logic stay testable under plain JVM `kbb -M:test`, same
+  as every other namespace in this library except
+  `kotoba.dtn.transport.tcp` itself:
+
+    serialize-bundle / deserialize-line / compact   -- pure, .cljc, both
+                                                        platforms
+    load-store / append-bundle! / rewrite-store!    -- Node-only I/O,
+                                                        #?(:cljs ...),
+                                                        node:fs core
+                                                        module, no npm
+                                                        dependency
+
+  NOT crash-atomic. `append-bundle!` uses `fs.appendFileSync`, which is
+  safe against corrupting prior lines (an interrupted append can only
+  leave a truncated LAST line, and `deserialize-line` tolerates that by
+  returning nil rather than throwing). `rewrite-store!` uses
+  `fs.writeFileSync`, which truncates-then-writes the whole file: a crash
+  during that specific call can leave the file empty or partially
+  written, losing bundles that were already durably appended earlier in
+  the SAME rewrite pass (though never bundles from a completed prior
+  append/rewrite). This is a real, disclosed limitation, not a full
+  write-ahead-log with fsync+rename durability guarantees — see the
+  README's Internet-overlay transport section for the same caveat in
+  context.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM for the
+  pure half; the I/O half is Node-only (mirrors
+  kotoba.dtn.transport.tcp's own .cljs-only-behind-a-reader-conditional
+  split)."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.dtn :as dtn]
+            #?(:cljs ["node:fs" :as fs])))
+
+;; ---------------------------------------------------------------------------
+;; Pure format + compaction logic — testable under `kbb -M:test`
+;; ---------------------------------------------------------------------------
+
+(defn serialize-bundle
+  "bundle -> a single newline-terminated `pr-str` EDN line, ready to
+  append to (or be one line within) a store log file."
+  [bundle]
+  (str (pr-str bundle) "\n"))
+
+(defn deserialize-line
+  "line -> the bundle it encodes, or nil when line is blank, nil, fails to
+  parse as EDN, or parses to something other than a map (a bundle is
+  always a map — `edn/read-string` on garbage like \"not-edn-{{{\" reads
+  a leading symbol without throwing, so the map? check is required, not
+  just the try/catch). Malformed/truncated input is tolerated (returns
+  nil) rather than throwing, so a partially-written last line from a
+  crash mid-append does not corrupt reads of the rest of the log."
+  [line]
+  (let [trimmed (when (string? line) (str/trim line))]
+    (when (seq trimmed)
+      (let [parsed (try
+                     (edn/read-string trimmed)
+                     (catch #?(:clj Exception :cljs :default) _e
+                       nil))]
+        (when (map? parsed) parsed)))))
+
+(defn compact
+  "Drop bundles expired as of now-ms (kotoba.dtn/expired?), keeping the
+  rest in their original order. This is the eviction pass a node runs
+  before rewrite-store! so the on-disk log reflects current truth rather
+  than growing unboundedly with delivered/expired entries."
+  [bundles now-ms]
+  (into [] (remove #(dtn/expired? % now-ms)) bundles))
+
+;; ---------------------------------------------------------------------------
+;; Node-only I/O — node:fs core module, no npm dependency
+;; ---------------------------------------------------------------------------
+
+#?(:cljs
+   (defn load-store
+     "Read path (a store log file) if it exists, deserializing each line
+     (kept-only — malformed lines are dropped, see deserialize-line).
+     Returns [] when path doesn't exist yet (a node's first-ever run with
+     this :store-path, or one that has never had anything stored)."
+     [path]
+     (if (fs/existsSync path)
+       (into [] (keep deserialize-line) (str/split-lines (str (fs/readFileSync path "utf8"))))
+       [])))
+
+#?(:cljs
+   (defn append-bundle!
+     "Append bundle, as one serialize-bundle line, to path (creating the
+     file if it doesn't exist yet). Synchronous (fs.appendFileSync) so the
+     write is durable on disk before this call returns — matches the
+     synchronous in-memory :store swap! it accompanies in
+     kotoba.dtn.transport.tcp, so the two never observably disagree."
+     [path bundle]
+     (fs/appendFileSync path (serialize-bundle bundle))))
+
+#?(:cljs
+   (defn rewrite-store!
+     "Overwrite path with exactly bundles (one serialize-bundle line
+     each), replacing whatever was there before. Used after a
+     retry-store! pass to drop entries that were just delivered or
+     expired, so the log doesn't grow forever and reflects the node's
+     current :store. NOT crash-atomic — see namespace docstring."
+     [path bundles]
+     (fs/writeFileSync path (apply str (map serialize-bundle bundles)))))

@@ -1,0 +1,143 @@
+(ns okugai.site-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [okugai.datoms :as datoms]
+            [okugai.facts :as facts]
+            [okugai.order :as order]
+            [okugai.pricing :as pricing]
+            [okugai.site :as site]))
+
+(defn- obs [source id lat lon med & [tags]]
+  {:obs/source source :obs/source-id id :obs/lat lat :obs/lon lon
+   :obs/medium med :obs/tags (or tags {})})
+
+(deftest fuse-merges-across-sources-within-radius
+  (let [{:keys [sites]} (site/fuse [(obs :osm "node/1" 35.68120 139.76710 :billboard
+                                         {"operator" "株式会社アトレ"})
+                                    (obs :mapillary "mly-1" 35.681205 139.767105 :billboard)])]
+    (is (= 1 (count sites)))
+    (let [s (first sites)]
+      (is (= "株式会社アトレ" (:site/operator s)))
+      (is (= ["mapillary" "osm"] (:site/sources s)))
+      (is (< 0.94 (:site/confidence s) 0.96))
+      (is (= :unknown (:site/ad-eligible s)))
+      (testing "高さは観測から埋まらない"
+        (is (nil? (:site/height-m s)))))))
+
+(deftest fuse-does-not-merge-different-media
+  (let [{:keys [sites]} (site/fuse [(obs :osm "node/1" 35.6812 139.7671 :billboard)
+                                    (obs :osm "node/2" 35.681201 139.767101 :board)])]
+    (is (= 2 (count sites)))))
+
+(deftest site-id-encodes-the-medium
+  (is (= "okugai:billboard:35.681200,139.767100" (site/site-id :billboard 35.6812 139.7671)))
+  (testing "同じ座標でも媒体が違えば別 id"
+    (is (not= (site/site-id :billboard 35.6812 139.7671)
+              (site/site-id :board 35.6812 139.7671)))))
+
+(deftest fuse-is-order-independent
+  (let [a (obs :osm "node/1" 35.68120 139.76710 :screen)
+        b (obs :mapillary "mly-1" 35.681205 139.767105 :screen)
+        c (obs :osm "node/2" 35.6900 139.7700 :screen)]
+    (is (= (:sites (site/fuse [a b c])) (:sites (site/fuse [c b a]))))))
+
+(deftest invalid-observations-are-returned-not-dropped
+  (let [{:keys [sites rejected]} (site/fuse [(obs :osm "node/1" 35.6812 139.7671 :board)
+                                             {:obs/source :osm :obs/source-id "bad"}
+                                             (obs :osm "node/3" 35.6 139.7 :not-a-medium)])]
+    (is (= 1 (count sites)))
+    (is (= 2 (count rejected)))))
+
+(deftest operator-resolver-is-supplied-by-the-medium-repo
+  (let [{:keys [sites]} (site/fuse [(obs :osm "node/1" 35.6812 139.7671 :utility-pole
+                                         {"operator" "東京電力パワーグリッド"})]
+                                   {:operator-resolver (fn [s med]
+                                                        (if (and (= med :utility-pole)
+                                                                 (= s "東京電力パワーグリッド"))
+                                                          :tepco-pg :unknown))})]
+    (is (= :tepco-pg (:site/operator (first sites))))
+    (is (= "東京電力パワーグリッド" (:site/operator-raw (first sites))))))
+
+;; ── order ───────────────────────────────────────────────────────────
+
+(def billboard-site
+  {:site/id "okugai:billboard:35.681200,139.767100" :site/lat 35.6812 :site/lon 139.7671
+   :site/medium :billboard :site/operator :unknown :site/ad-eligible :unknown})
+
+(defn- draft [& {:as over}]
+  (merge (order/new-order (merge {:site billboard-site :route-status :routable} over))))
+
+(deftest permit-is-blocked-while-applicability-is-undetermined
+  (let [o (assoc (draft) :order/state :agency-confirmed)]
+    (testing "高さも区域も未確定のままでは申請に進めない"
+      (is (some #(re-find #"undetermined" %) (order/violations o :permit-filed))))
+    (testing "条件を確定させ、そこで要る証跡を揃えれば通る"
+      (let [o2 (assoc o :order/height-m 3.0 :order/special-zones #{}
+                      :order/overhangs-road? false :order/highway-adjacent? false)
+            need (facts/required-evidence "JPN" (order/placement o2))
+            o3 (assoc o2 :order/evidence (zipmap need (repeat true)))]
+        (is (empty? (order/violations o3 :permit-filed)))))))
+
+(deftest regulatory-summary-does-not-hide-undetermined
+  (let [s (order/regulatory-summary (draft))]
+    (is (seq (:regulatory/undetermined s)))
+    (is (re-find #"確定していない" (:regulatory/note s))))
+  (let [s (order/regulatory-summary (assoc (draft) :order/height-m 6.0
+                                           :order/special-zones #{:fire-prevention-district}
+                                           :order/overhangs-road? false
+                                           :order/highway-adjacent? false))]
+    (is (= "JPN" (:regulatory/jurisdiction s)))
+    (is (empty? (:regulatory/undetermined s)))
+    (is (some #{"jp-building-code-88"} (:regulatory/required s)))
+    (is (some #{"jp-building-code-64"} (:regulatory/required s))))
+  (testing "未収録法域は :no-spec-basis を返して隠さない"
+    (let [s (order/regulatory-summary (assoc (draft) :order/jurisdiction "BGD"))]
+      (is (= :no-spec-basis (:regulatory/status s))))))
+
+(deftest unreachable-route-blocks-inquiry
+  (let [o (assoc (draft :route-status :unknown-owner)
+                 :order/state :quoted :order/quote {:quote/total 1})]
+    (is (some #(re-find #"no reachable agency" %) (order/violations o :inquiry-proposed))))
+  (testing "候補経路なら組める"
+    (let [o (assoc (draft :route-status :candidate-by-area)
+                   :order/state :quoted :order/quote {:quote/total 1})]
+      (is (empty? (order/violations o :inquiry-proposed))))))
+
+;; ── pricing ─────────────────────────────────────────────────────────
+
+(def card
+  {:rate/agency :example :rate/currency "JPY" :rate/tax :excluded
+   :rate/zones {:A {:zone/monthly 50000}} :rate/setup 100000
+   :rate/source-url "https://example.test/rates" :rate/as-of "2026-08-04"})
+
+(deftest quote-is-always-indicative
+  (let [q (pricing/quote-order {:rate-card card :zone :A :units 2 :months 6
+                                :medium :billboard})]
+    (is (= :indicative (:quote/confidence q)))
+    (is (= (+ (* 50000 2 6) (* 100000 2)) (:quote/total q)))
+    (is (empty? (:quote/unknowns q))))
+  (testing "地域未指定は総額を出さない"
+    (let [q (pricing/quote-order {:rate-card card :units 1 :months 6})]
+      (is (nil? (:quote/total q)))
+      (is (seq (:quote/unknowns q)))))
+  (testing "出典の無い料金表は使わせない"
+    (let [q (pricing/quote-order {:rate-card (dissoc card :rate/source-url)
+                                  :zone :A :units 1 :months 6})]
+      (is (nil? (:quote/total q)))
+      (is (some #(re-find #"出典" %) (:quote/unknowns q))))))
+
+;; ── datoms ──────────────────────────────────────────────────────────
+
+(deftest inventory-shard-declares-what-it-cannot-see
+  (let [sites [(assoc billboard-site :site/confidence 0.6 :site/sources ["osm"]
+                      :site/observations [{}])]
+        shard (datoms/inventory-shard {:sites sites :areas ["a"] :sources #{:osm}
+                                       :media-requested [:billboard :board]
+                                       :generated-at "2026-08-04"})
+        cov (first (filter :okugai.coverage/sites shard))]
+    (is (= 1 (:okugai.coverage/sites cov)))
+    (is (= ["billboard" "board"] (:okugai.coverage/media-requested cov)))
+    (is (seq (:okugai.coverage/media-unobservable cov)))
+    (is (zero? (:okugai.coverage/sites-with-known-height cov)))
+    (is (re-find #"屋上看板" (:okugai.coverage/note cov)))
+    (testing "カタログは area shard に混ぜない"
+      (is (empty? (filter :medium/id shard))))))

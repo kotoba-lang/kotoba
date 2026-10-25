@@ -1,0 +1,121 @@
+(ns kudaki.integrate-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kudaki.mesh :as mesh]
+            [kudaki.integrate :as itg]))
+
+(defn- close? [a b tol] (< (Math/abs (- a b)) tol))
+
+(defn- bar [n a area mat]
+  {:nodes (into {} (map (fn [i] [i [(* i a) 0.0 0.0]]) (range (inc n))))
+   :elements (mapv (fn [i] {:type :truss :nodes [i (inc i)]
+                            :mat :m :section {:area area}})
+                   (range n))
+   :materials {:m mat}})
+
+(deftest lumped-mass-conserves-total
+  (testing "Σ lumped nodal mass = ρ·Σ element volume"
+    (let [model (bar 10 0.01 1e-4 {:type :elastic :E 200e9 :density 7800.0})
+          total (mesh/total-mass model)
+          expect (* 7800.0 1e-4 (* 10 0.01))]
+      (is (close? expect total 1e-9)))))
+
+(deftest elastic-energy-balance
+  (testing "an undamped elastic bar conserves KE + internal energy"
+    (let [E 200e9, rho 7800.0
+          model (bar 20 0.01 1e-4 {:type :elastic :E E :density rho})
+          ;; Δt ≈ 0.2·CFL: small enough that the leapfrog half-step energy ripple
+          ;; (∝ (ωΔt)²) is a few %; near the CFL limit the ripple is O(1).
+          res (itg/run model {:v0 {0 [5.0 0.0 0.0]} :dt 2e-7 :steps 3000 :sample-every 600})
+          eng (:energy res)]
+      (testing "energy ledger residual is a small fraction of the total energy"
+        (is (< (Math/abs (:residual-rel eng)) 0.03)))
+      (testing "kinetic energy is bounded by the initial energy (no blow-up)"
+        (is (< (:kinetic eng) (* 1.5 (:kinetic0 eng))))))))
+
+(deftest wave-speed-matches-sqrt-E-over-rho
+  (testing "the elastic front propagates at c = √(E/ρ)"
+    (let [E 200e9, rho 7800.0, area 1e-4
+          n 100, a 0.005, L (* n a)
+          c (Math/sqrt (/ E rho))
+          model (bar n a area {:type :elastic :E E :density rho})
+          v0 10.0
+          res (itg/run model {:v0 {0 [v0 0.0 0.0]} :steps 220 :sample-every 1})
+          thresh (* 0.01 v0 (:dt res))
+          arrival (some (fn [f]
+                          (let [dx (- (get-in f [:pos n 0]) L)]
+                            (when (> (Math/abs dx) thresh) (:t f))))
+                        (:history res))
+          c-meas (/ L arrival)]
+      (is (some? arrival))
+      (testing "measured wave speed is within 20% of √(E/ρ)"
+        (is (< (Math/abs (- (/ c-meas c) 1.0)) 0.20))))))
+
+(deftest hex-solid-accumulates-plasticity-through-integrator
+  (testing "a J2 hex compressed through the explicit loop accumulates plastic strain
+            and dissipates plastic energy — the end-to-end check that the hex now
+            THREADS material state across steps (regression for the mat-state fix)"
+    (let [E 200e9, nu 0.3, sy0 250e6, H 1e9, rho 7800.0
+          coords (mapv (fn [lc] (mapv #(* 0.01 (* 0.5 (+ 1.0 %))) lc)) mesh/hex-local)
+          model {:nodes (into {} (map-indexed vector coords))
+                 :elements [{:type :hex :nodes (vec (range 8)) :mat :m}]
+                 :materials {:m {:type :j2 :E E :nu nu :yield sy0 :hardening H :density rho}}}
+          bottom (filter #(< (nth (nth coords %) 2) 1e-9) (range 8))   ; z≈0 face
+          top    (remove (set bottom) (range 8))
+          fixed  (into {} (map (fn [id] [id [true true true]]) bottom))
+          v0     (into {} (map (fn [id] [id [0.0 0.0 -50.0]]) top))    ; compress in −z
+          res (itg/run model {:v0 v0 :fixed fixed :steps 400 :dt 1e-8 :sample-every 200})
+          ep  (get-in (first (:elem-states res)) [:mat-state :eq-plastic-strain])]
+      (is (number? ep) "material state survives the loop (was nil before the fix)")
+      (is (pos? ep) "the hex accumulated equivalent plastic strain over the run")
+      (is (pos? (:plastic (:energy res))) "plastic energy was dissipated"))))
+
+(deftest mass-scaling-raises-step-and-mass
+  (testing "mass scaling adds non-physical mass to sub-critical elements to lift Δt
+            (a quasi-static device — it trades physical fidelity for a bigger step)"
+    (let [model (bar 20 0.01 1e-4 {:type :elastic :E 200e9 :density 7800.0})
+          plain  (itg/run model {:v0 {0 [1.0 0.0 0.0]} :steps 20})
+          target 3e-6
+          scaled (itg/run model {:v0 {0 [1.0 0.0 0.0]} :steps 20 :mass-scale-dt target})
+          mtot (fn [r] (reduce + (vals (:mass r))))]
+      (testing "the scaled run takes a larger (but still ≤ target) time step"
+        (is (> (:dt scaled) (:dt plain)))
+        (is (<= (:dt scaled) target)))
+      (testing "scaling has added mass to the model"
+        (is (> (mtot scaled) (mtot plain))))
+      (testing "the run produces finite results (no NaN/Inf)"
+        (is (every? (fn [[_ v]] (every? #(Double/isFinite %) v)) (:pos scaled)))))))
+
+(deftest fixed-dof-constraint
+  (testing "a clamped node stays put under load while the free end is pulled out"
+    (let [model (bar 5 0.01 1e-4 {:type :elastic :E 200e9 :density 7800.0})
+          res (itg/run model {:steps 300 :dt 1e-7
+                              :f-ext {5 [1e3 0.0 0.0]}        ; pull the free end +x
+                              :fixed {0 [true true true]}})    ; clamp node 0
+          pos (:pos res)]
+      (testing "the clamped node never leaves the origin (all DOF held)"
+        (is (close? 0.0 (get-in pos [0 0]) 1e-15))
+        (is (close? 0.0 (get-in pos [0 1]) 1e-15))
+        (is (close? 0.0 (get-in pos [0 2]) 1e-15)))
+      (testing "the free end has displaced along the pull"
+        (is (> (Math/abs (- (get-in pos [5 0]) (* 5 0.01))) 1e-6))))))
+
+(deftest taylor-bar-plastic-shortening
+  (testing "a J2 rod impacting a rigid wall shortens plastically and balances energy"
+    (let [E 200e9, rho 7800.0, area 1e-4
+          n 10, a 0.005, L0 (* n a), v0 -100.0
+          model (bar n a area {:type :j2 :E E :density rho :yield 2.5e8 :hardening 1e9})
+          res (itg/run model
+                       {:v0 (into {} (map (fn [i] [i [v0 0.0 0.0]]) (range (inc n))))
+                        :dt 2e-8 :steps 3000 :sample-every 1000
+                        :contacts [{:type :plane :point [0.0 0.0 0.0]
+                                    :normal [1.0 0.0 0.0] :stiffness 8e9 :nodes [0]}]})
+          pos (:pos res)
+          Lres (- (get-in pos [n 0]) (get-in pos [0 0]))
+          eng (:energy res)]
+      (testing "the rod is measurably shorter (plastic mushrooming)"
+        (is (< Lres L0))
+        (is (> (- L0 Lres) (* 0.01 L0))))
+      (testing "plastic energy was dissipated"
+        (is (pos? (:plastic eng))))
+      (testing "energy ledger closes within a few percent"
+        (is (< (Math/abs (:residual-rel eng)) 0.05))))))

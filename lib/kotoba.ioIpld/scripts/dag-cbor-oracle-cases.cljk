@@ -1,0 +1,214 @@
+;; scripts/dag-cbor-oracle-cases.cljk -- ipld.dag-cbor (pure Kotoba, a DAG-CBOR
+;; encoder over :document values; root ADR-2610092310 S5) against ipld.core/encode
+;; (the .cljk oracle). Writes test/ipld/dag_cbor_cases.kotoba:
+;;
+;;   test-corpus-<name>  every :canonical row of resources/ipld/dag-cbor-corpus.edn,
+;;                       built as a document; expected = the row's bytes, which
+;;                       this script first checks ipld.core/encode still writes
+;;   test-oracle-<nnn>   seeded random IPLD values (null, bool, i64, non-integral
+;;                       f64, strings with 1..4-byte UTF-8, bytes, links, vectors,
+;;                       string-keyed maps up to the 32-entry bound, nesting to
+;;                       the depth bound); expected = ipld.core/encode's bytes
+;;   test-refuse-<name>  documents that are not IPLD data; expected = the named
+;;                       refusal. The script also records what the oracle does
+;;                       with the host value nearest to each.
+;;
+;;   NODE_PATH=<node_modules with @noble/hashes> \
+;;     kbb --backend sci --classpath "src:$(kbb -Spath)" scripts/dag-cbor-oracle-cases.cljk [seed] [count]
+;;
+;; The generated module is run with amu (KIR today; see README).
+
+(require '[ipld.core :as ipld]
+         '[clojure.edn :as edn]
+         '[clojure.string :as str])
+
+(def args (vec *command-line-args*))
+(def seed (if (seq args) (js/parseInt (first args)) 2610092310))
+(def n-random (if (> (count args) 1) (js/parseInt (second args)) 160))
+
+;; --- deterministic PRNG (xorshift32), so the file is reproducible ----------
+(def state (atom (bit-or (mod seed 4294967296) 1)))
+(defn- next-u32! []
+  (let [x @state
+        x (bit-xor x (bit-shift-left x 13))
+        x (bit-xor x (unsigned-bit-shift-right x 17))
+        x (bit-xor x (bit-shift-left x 5))
+        x (unsigned-bit-shift-right x 0)]
+    (reset! state x) x))
+(defn- rnd [n] (mod (next-u32!) n))
+(defn- pick [xs] (nth xs (rnd (count xs))))
+
+;; --- host values -----------------------------------------------------------
+(defn- byte-vec [b] (mapv #(bit-and % 0xff) (seq b)))
+(defn- hex [v] (apply str (map #(.padStart (.toString % 16) 2 "0") v)))
+(defn- enc [x] (byte-vec (ipld/encode x)))
+
+(def boundary-ints
+  [0 1 23 24 25 255 256 65535 65536 4294967295 4294967296 9007199254740991
+   -1 -24 -25 -256 -257 -65536 -65537 -4294967296 -4294967297 -9007199254740991])
+
+(defn- rand-int64 []
+  (case (rnd 4)
+    0 (pick boundary-ints)
+    1 (- (rnd 60) 30)
+    2 (* (if (zero? (rnd 2)) 1 -1) (rnd 4294967296))
+    3 (* (if (zero? (rnd 2)) 1 -1) (+ (* (rnd 2097152) 4294967296) (rnd 4294967296)))))
+
+(defn- rand-f64 []
+  ;; non-integral and finite only: a host integer-valued double is an int to
+  ;; the JS oracle, and a document refuses a non-finite f64
+  (loop []
+    (let [x (case (rnd 3)
+              0 (/ (- (rnd 2000001) 1000000) (+ 1 (rnd 997)) 1.0)
+              1 (* (- (rnd 2) 0.5) (js/Math.pow 2 (- (rnd 80) 70)) (+ 1 (/ (rnd 1000) 1000.0)))
+              2 (/ (next-u32!) 4294967296.0))]
+      (if (and (js/Number.isFinite x) (not (js/Number.isInteger x))) x (recur)))))
+
+(def chars ["a" "b" "z" "A" "0" "9" " " "-" "_" "\"" "\\" "é" "ß" "ж" "日" "本" "€" "😀" "𝄞"])
+(defn- rand-string [max-len]
+  (apply str (repeatedly (rnd (inc max-len)) #(pick chars))))
+
+(def fixed-cids ["bafkqaaa"
+                 "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"
+                 "bafyreifqadrc6zsb42yzhekvsxvaiab7shq4bdeh74elm62s5ntweuip74"])
+(defn- rand-cid []
+  (if (zero? (rnd 3))
+    (pick fixed-cids)
+    (ipld/cid (ipld/encode {"n" (rnd 1000000)}))))
+
+(declare rand-value)
+(defn- rand-map [depth width]
+  (let [n (rnd (inc width))
+        ks (distinct (repeatedly n #(rand-string 6)))]
+    (into {} (map (fn [k] [k (rand-value (inc depth))]) ks))))
+
+(defn- rand-value [depth]
+  (let [leaf? (or (>= depth 4) (< (rnd 10) 5))]
+    (if leaf?
+      (case (rnd 8)
+        0 nil
+        1 (zero? (rnd 2))
+        2 (rand-int64)
+        3 (rand-int64)
+        4 (rand-f64)
+        5 (rand-string 8)
+        6 {:bytes (vec (repeatedly (rnd 40) #(rnd 256)))}
+        7 {:link (rand-cid)})
+      (if (zero? (rnd 2))
+        (vec (repeatedly (rnd 6) #(rand-value (inc depth))))
+        (rand-map depth 6)))))
+
+;; a value as the host oracle takes it (bytes / links are tagged maps above)
+(defn- ->host [v]
+  (cond
+    (and (map? v) (contains? v :bytes) (= 1 (count v))) (js/Uint8Array.from (clj->js (:bytes v)))
+    (and (map? v) (contains? v :link) (= 1 (count v))) (ipld/link (:link v))
+    (map? v) (into {} (map (fn [[k x]] [k (->host x)])) v)
+    (vector? v) (mapv ->host v)
+    :else v))
+
+;; --- Kotoba source of the same value as a :document ------------------------
+(defn- f64-bits [x]
+  (let [dv (js/DataView. (js/ArrayBuffer. 8))]
+    (.setFloat64 dv 0 x)
+    (str (.getBigInt64 dv 0))))
+
+(defn- ->doc [v]
+  (cond
+    (nil? v) "(document-null)"
+    (boolean? v) (str "(document-bool " v ")")
+    (and (number? v) (js/Number.isInteger v)) (str "(document-i64 " v ")")
+    (number? v) (str "(document-f64 (f64-from-bits " (f64-bits v) "))")
+    (string? v) (str "(document-string " (pr-str v) ")")
+    (and (map? v) (contains? v :bytes) (= 1 (count v)))
+    (str "(document-bytes (bytes-from-vector-i64 (cid/hex->bytes " (pr-str (hex (:bytes v))) ")))")
+    (and (map? v) (contains? v :link) (= 1 (count v))) (str "(c/link-document " (pr-str (:link v)) ")")
+    (map? v) (str "(document-map" (apply str (map (fn [[k x]] (str " (document-string " (pr-str k) ") " (->doc x))) v)) ")")
+    (vector? v) (str "(document-vector" (apply str (map #(str " " (->doc %)) v)) ")")
+    :else (throw (ex-info "no document for" {:v v}))))
+
+;; --- cases -----------------------------------------------------------------
+(def corpus (edn/read-string (slurp "resources/ipld/dag-cbor-corpus.edn")))
+
+(defn- corpus-value [row]
+  (cond
+    (contains? row :bytes-node) {:bytes (:bytes-node row)}
+    (contains? row :link-node) {:link (:link-node row)}
+    :else (:node row)))
+
+(def corpus-cases
+  (for [row (:canonical corpus)]
+    (let [v (corpus-value row)
+          oracle (enc (->host v))]
+      (when-not (= oracle (:bytes row))
+        (println "CORPUS-ORACLE-DISAGREE" (:name row) (:bytes row) oracle))
+      {:name (str "corpus-" (name (:name row))) :value v :bytes (:bytes row)
+       :oracle-agrees (= oracle (:bytes row))})))
+
+(def special-values
+  ;; the bounds: a 32-entry map (keys of 1..6 chars, mixed scripts), a
+  ;; 32-item vector, and nesting to the document depth bound
+  [(into {} (map (fn [i] [(str (nth ["" "a" "日" "😀" "zz" "é"] (mod i 6)) i) i])) (range 32))
+   (vec (range -16 16))
+   (reduce (fn [acc _] [acc]) 1 (range 7))
+   (reduce (fn [acc i] {(str "k" i) acc}) "leaf" (range 7))])
+
+(def random-cases
+  (doall
+   (map-indexed
+    (fn [i v] {:name (str "oracle-" (.padStart (str i) 3 "0")) :value v :bytes (enc (->host v))})
+    (concat special-values (repeatedly n-random #(rand-value 0))))))
+
+(def refusal-cases
+  ;; [name kotoba-document refusal host-value-nearest]
+  [["keyword-key" "(document-map :a (document-i64 1))" :keyword-key {:a 1}]
+   ["nested-keyword-key" "(document-vector (document-map (document-string \"k\") (document-map :b (document-null))))" :keyword-key [{"k" {:b nil}}]]
+   ["integer-key" "(document-map (document-i64 1) (document-i64 1))" :non-string-key {1 1}]
+   ["bytes-key" "(document-map (document-bytes (bytes-from-vector-i64 (cid/hex->bytes \"01\"))) (document-i64 1))" :non-string-key nil]
+   ["vector-key" "(document-map (document-vector) (document-i64 1))" :non-string-key {[] 1}]
+   ["keyword-value" "(document-keyword :a)" :keyword-value :a]
+   ["keyword-in-map" "(document-map (document-string \"k\") (document-keyword :v))" :keyword-value {"k" :v}]
+   ["symbol" "(document-symbol 'a)" :symbol 'a]
+   ["set" "(document-set (document-i64 1))" :set #{1}]
+   ["list" "(document-list (document-i64 1) (document-i64 2))" :list '(1 2)]
+   ["list-in-vector" "(document-vector (document-i64 0) (document-list))" :list [0 '()]]])
+
+(defn- oracle-on [v]
+  (if (nil? v) :not-applicable
+      (try (enc v) :encodes (catch :default _ :refuses))))
+
+;; --- emit ------------------------------------------------------------------
+(defn- test-fn [{:keys [name value bytes]}]
+  (str "(defn test-" name " [] :bool\n  (same? (c/encoded " (->doc value) ")\n         (cid/hex->bytes " (pr-str (hex bytes)) ")))\n"))
+
+(defn- refuse-fn [[name doc why _]]
+  (str "(defn test-refuse-" name " [] :bool\n  (= (result-error-of [:result :bytes :keyword] (c/dag-cbor-encode " doc ") :ok) " why "))\n"))
+
+(def all-names (concat (map :name corpus-cases) (map :name random-cases) (map first (map (fn [[n]] [(str "refuse-" n)]) refusal-cases))))
+
+(def source
+  (str ";; GENERATED by scripts/dag-cbor-oracle-cases.cljk (seed " seed ", " n-random " random) -- do not edit.\n"
+       ";; ipld.dag-cbor against resources/ipld/dag-cbor-corpus.edn and ipld.core/encode.\n\n"
+       "(ns ipld.dag-cbor-cases\n  (:require [ipld.dag-cbor :as c]\n            [multiformats.cid :as cid])\n"
+       "  (:export [main " (str/join " " (map #(str "test-" %) all-names)) "]))\n\n"
+       "(defn- same? [a :vector-i64 b :vector-i64] :bool\n"
+       "  (let [n (vector-count a)]\n    (if (not (= n (vector-count b)))\n      false\n"
+       "      (loop [i 0] (if (>= i n) true (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false))))))\n\n"
+       (str/join "\n" (map test-fn corpus-cases)) "\n"
+       (str/join "\n" (map test-fn random-cases)) "\n"
+       (str/join "\n" (map refuse-fn refusal-cases)) "\n"
+       "(defn- one [b :bool] :i64 (if b 1 0))\n\n"
+       ";; main: the number of test-* that pass (" (count all-names) " when all do).\n"
+       "(defn main [] :i64\n  (+ 0\n"
+       (str/join "\n" (map #(str "     (one (test-" % "))") all-names)) "))\n"))
+
+(spit "test/ipld/dag_cbor_cases.kotoba" source)
+
+(let [disagree (remove :oracle-agrees corpus-cases)]
+  (println (str "CORPUS\t" (count corpus-cases) " canonical rows; oracle writes the row's bytes for "
+                (- (count corpus-cases) (count disagree))))
+  (println (str "ORACLE\t" (count random-cases) " values encoded by ipld.core/encode (seed " seed ")"))
+  (doseq [[n _ why host] refusal-cases]
+    (println (str "REFUSE\t" n "\texpects " why "\toracle on nearest host value: " (name (oracle-on host)))))
+  (println (str "WROTE\ttest/ipld/dag_cbor_cases.kotoba\t" (count all-names) " test-*"))
+  (when (seq disagree) (js/process.exit 1)))

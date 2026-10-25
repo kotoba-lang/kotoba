@@ -1,0 +1,515 @@
+(ns paging.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [machine.core :as m]
+            [paging.core :as p]))
+
+(def mach
+  {:format m/format-id
+   :machine/id "fixture"
+   :machine/provenance :measured
+   :machine/source "test fixture"
+   :cpu {:arch :x86-64 :cores 4
+         :cache [{:level 1 :kind :data :bytes 32768 :line-bytes 64 :ways 8 :shared-by 1}]}
+   :page {:base-bytes 4096 :huge [2097152]}})
+
+(defn- c [& {:as opts}]
+  (p/cache mach (merge {:page-bytes 4096
+                        :segments [{:id :default :capacity-pages 4 :policy :lru}]}
+                       opts)))
+
+(defn- access [k & {:as o}] (merge {:event :access :key k} o))
+(defn- fill [k] {:event :fill :key k})
+
+(defn- fetches [effects] (mapv :key (filter #(= :fetch (:effect %)) effects)))
+
+;; ── construction ─────────────────────────────────────────────────────────
+
+(deftest cache-page-must-be-whole-hardware-pages
+  (is (p/cache mach {:page-bytes 4096}))
+  (is (p/cache mach {:page-bytes 16384}))
+  (testing "a partial hardware page produces writebacks a host cannot express"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (p/cache mach {:page-bytes 1024}))))
+  (testing "a machine that declares no page size does not get to veto"
+    (is (p/cache m/unknown {:page-bytes 1024}))))
+
+(deftest unknown-policy-and-segment-are-refused
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (p/cache mach {:page-bytes 4096
+                              :segments [{:id :x :capacity-pages 4 :policy :arc}]})))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (p/step (c) (access [:f 0] :segment :nope)))))
+
+(deftest keys-are-stream-and-index
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (p/step (c) (access :not-a-vector))))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (p/step (c) (access [:f :not-an-index])))))
+
+;; ── miss, fetch, fill ────────────────────────────────────────────────────
+
+(deftest a-miss-emits-a-fetch-and-the-fill-makes-it-resident
+  (let [r1 (p/step (c) (access [:f 0]))]
+    (is (= [{:effect :fetch :key [:f 0] :segment :default :reason :demand}] (:effects r1)))
+    (is (not (p/resident? (:state r1) :default [:f 0])))
+    (let [r2 (p/step (:state r1) (fill [:f 0]))]
+      (is (p/resident? (:state r2) :default [:f 0]))
+      (is (empty? (:effects r2)))
+      (testing "and the second access hits"
+        (let [r3 (p/step (:state r2) (access [:f 0]))]
+          (is (empty? (:effects r3)))
+          (is (= 1 (:hits (p/stats (:state r3))))))))))
+
+(deftest an-in-flight-page-is-not-refetched
+  (let [{s :state} (p/step (c) (access [:f 0]))
+        r (p/step s (access [:f 0]))]
+    (testing "a second miss on a page already requested emits nothing"
+      (is (empty? (:effects r)))
+      (is (= 2 (:misses (p/stats (:state r)))))
+      (is (= 1 (:demand-fetches (p/stats (:state r)))))
+      (is (= 1 (:in-flight-hits (p/stats (:state r))))))))
+
+(deftest a-fill-nobody-asked-for-is-a-host-bug
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (p/step (c) (fill [:f 9])))))
+
+;; ── determinism ──────────────────────────────────────────────────────────
+
+(deftest the-same-events-give-the-same-evictions-forever
+  (testing "recency is a logical sequence, not a wall clock"
+    (let [evs (mapv (fn [i] (access [:f (mod i 7)])) (range 40))
+          a (p/run-with-host (c) evs)
+          b (p/run-with-host (c) evs)]
+      (is (= (:effects a) (:effects b)))
+      (is (= (p/resident-keys (:state a) :default)
+             (p/resident-keys (:state b) :default)))
+      (is (= (:stats (:state a)) (:stats (:state b)))))))
+
+;; ── replacement ──────────────────────────────────────────────────────────
+
+(deftest lru-evicts-the-least-recently-used
+  ;; Non-consecutive indices on purpose: a 0,1,2,3 walk would confirm a stride
+  ;; and the readahead would do the evicting, which is a different test.
+  (let [{s :state} (p/run-with-host (c) (map access [[:f 0] [:f 5] [:f 2] [:f 9]]))]
+    (is (= 4 (count (p/resident-keys s :default))))
+    (let [{s2 :state} (p/run-with-host s [(access [:f 0])        ; refresh 0
+                                          (access [:f 30])])]    ; forces an eviction
+      (testing "5 was least recently used, so 5 goes and 0 stays"
+        (is (p/resident? s2 :default [:f 0]))
+        (is (not (p/resident? s2 :default [:f 5])))
+        (is (p/resident? s2 :default [:f 30]))))))
+
+(deftest clock-gives-a-second-chance-and-keeps-its-hand
+  (let [cc (p/cache mach {:page-bytes 4096
+                          :segments [{:id :default :capacity-pages 3 :policy :clock}]})
+        {s :state} (p/run-with-host cc (map access [[:c 0] [:c 5] [:c 2]]))]
+    (is (= 3 (count (p/resident-keys s :default))))
+    (let [{s2 :state} (p/run-with-host s [(access [:c 9])])]
+      (testing "every frame had its bit set, so the sweep clears them and takes
+                the first — the page at the hand"
+        (is (= 3 (count (p/resident-keys s2 :default))))
+        (is (p/resident? s2 :default [:c 9]))
+        (is (not (p/resident? s2 :default [:c 0]))))
+      (testing "the ring keeps its length: a replacement takes the victim's slot"
+        (is (= 3 (count (get-in s2 [:segments :default :order])))))
+      (let [{s3 :state} (p/run-with-host s2 [(access [:c 14])])]
+        (testing "the hand carries on from where it stopped rather than restarting,
+                  so the freshly admitted page is not the one it takes next"
+          (is (= 3 (count (p/resident-keys s3 :default))))
+          (is (p/resident? s3 :default [:c 9]))
+          (is (p/resident? s3 :default [:c 14]))
+          (is (not (p/resident? s3 :default [:c 5]))))))))
+
+;; ── writeback ────────────────────────────────────────────────────────────
+
+(deftest a-dirty-eviction-writes-back-before-it-drops
+  (let [{s :state} (p/run-with-host (c) [(access [:f 0] :op :write)
+                                         (access [:f 7]) (access [:f 3]) (access [:f 12])])]
+    (testing "the write intent rides in the in-flight record, so the page that
+              arrives after a write miss lands dirty rather than clean"
+      (is (= #{[:f 0]} (p/dirty-keys s :default))))
+    (let [{effects :effects} (p/run-with-host s [(access [:f 7]) (access [:f 3])
+                                                 (access [:f 12]) (access [:f 99])])
+          relevant (filterv #(= [:f 0] (:key %)) effects)]
+      (testing "order is the whole statement: dropping a dirty page without a
+                writeback is data loss"
+        (is (= [:writeback :drop] (mapv :effect relevant)))))))
+
+(deftest flush-is-deterministic-and-clears-dirt
+  (let [{s :state} (p/run-with-host (c) [(access [:f 2] :op :write)
+                                         (access [:f 0] :op :write)
+                                         (access [:f 1])])
+        r (p/step s {:event :flush})]
+    (is (= [[:f 0] [:f 2]] (mapv :key (:effects r))))
+    (is (every? #(= :writeback (:effect %)) (:effects r)))
+    (is (empty? (p/dirty-keys (:state r) :default)))
+    (testing "pages stay resident — a flush is not an eviction"
+      (is (p/resident? (:state r) :default [:f 0])))))
+
+(deftest invalidate-discards-rather-than-writing-back
+  (let [{s :state} (p/run-with-host (c) [(access [:f 0] :op :write)])
+        r (p/step s {:event :invalidate :key [:f 0]})]
+    (is (= [{:effect :drop :key [:f 0] :segment :default}] (:effects r)))
+    (is (not (p/resident? (:state r) :default [:f 0])))
+    (testing "a caller that wanted the bytes kept wanted :flush"
+      (is (empty? (filter #(= :writeback (:effect %)) (:effects r)))))))
+
+;; ── full-page write ──────────────────────────────────────────────────────
+
+(deftest a-full-page-write-does-not-read-first
+  (let [r (p/step (c) (access [:f 0] :op :write :full-page? true))]
+    (testing "fetching would pull bytes that are about to be overwritten"
+      (is (empty? (fetches (:effects r))))
+      (is (p/resident? (:state r) :default [:f 0]))
+      (is (= #{[:f 0]} (p/dirty-keys (:state r) :default)))
+      (is (= 1 (:full-page-write-allocations (p/stats (:state r))))))))
+
+;; ── readahead ────────────────────────────────────────────────────────────
+
+(deftest readahead-waits-for-a-confirmed-stride
+  (let [c0 (c)
+        r1 (p/run-with-host c0 [(access [:f 0])])
+        r2 (p/run-with-host (:state r1) [(access [:f 1])])
+        r3 (p/run-with-host (:state r2) [(access [:f 2])])
+        r4 (p/run-with-host (:state r3) [(access [:f 3])])]
+    (testing "nothing speculative until a stride has repeated"
+      (is (= [[:f 0]] (fetches (:effects r1))))
+      (is (= [[:f 1]] (fetches (:effects r2))))
+      (is (= [[:f 2]] (fetches (:effects r3)))))
+    (testing "then it gets ahead"
+      (is (= [[:f 3] [:f 4] [:f 5]] (fetches (:effects r4))))
+      (is (= 2 (:readahead-fetches (p/stats (:state r4))))))))
+
+(deftest readahead-follows-a-non-unit-stride
+  (let [{:keys [effects]} (p/run-with-host (c) (map #(access [:f %]) [0 4 8 12]))]
+    (testing "stride 4 is a stream too"
+      (is (= [[:f 16] [:f 20]] (drop 4 (fetches effects)))))))
+
+(deftest readahead-collapses-the-moment-the-stride-breaks
+  (let [{s :state} (p/run-with-host (c) (map #(access [:f %]) [0 1 2 3]))
+        {effects :effects} (p/run-with-host s [(access [:f 500])])]
+    (testing "credit resets to zero, not down by one — a stream that alternates
+              is not a stream"
+      (is (= [[:f 500]] (fetches effects))))))
+
+(deftest random-access-never-speculates
+  (let [{s :state} (p/run-with-host (c) (map #(access [:f %]) [17 3 92 41 6 58]))]
+    (testing "readahead on random access multiplies the I/O of the workload
+              least able to afford it"
+      (is (zero? (:readahead-fetches (p/stats s)))))))
+
+(deftest readahead-does-not-reissue-what-is-already-coming
+  (let [{s :state} (p/run-with-host (c) (map #(access [:f %]) [0 1 2 3]))
+        before (:readahead-fetches (p/stats s))
+        {s2 :state} (p/run-with-host s [(access [:f 4])])]
+    (testing "4 and 5 were already fetched, so only the new tail is requested"
+      (is (< (- (:readahead-fetches (p/stats s2)) before) 4)))))
+
+(deftest readahead-accuracy-separates-help-from-pollution
+  (testing "a clean sequential scan uses what it speculated on"
+    (let [big (p/cache mach {:page-bytes 4096
+                             :segments [{:id :default :capacity-pages 8 :policy :slru}]})
+          {s :state} (p/run-with-host big (map #(access [:f %]) (range 12)))
+          st (p/stats s)]
+      (is (pos? (:readahead-used st)))
+      (is (< 0.5 (:readahead-accuracy st)))))
+  (testing "and nil rather than a fake 1.0 when nothing was speculated"
+    (let [{s :state} (p/run-with-host (c) [(access [:f 7])])]
+      (is (nil? (:readahead-accuracy (p/stats s)))))))
+
+;; ── scan resistance ──────────────────────────────────────────────────────
+
+(defn- hot-survivors [policy]
+  (let [cache (p/cache mach {:page-bytes 4096
+                             :segments [{:id :default :capacity-pages 8 :policy policy}]})
+        ;; Touch a three-page working set three times, so it is twice-demanded.
+        {s :state} (p/run-with-host cache (mapcat (fn [_] (map #(access [:hot %]) (range 3)))
+                                                  (range 3)))
+        before (count (filter #(= :hot (first %)) (p/resident-keys s :default)))
+        ;; Then a 40-page sequential scan on another stream: it triggers
+        ;; readahead and cannot possibly revisit anything.
+        {s2 :state} (p/run-with-host s (map #(access [:scan %]) (range 40)))]
+    [before (count (filter #(= :hot (first %)) (p/resident-keys s2 :default)))]))
+
+(deftest slru-keeps-a-working-set-through-a-streaming-scan
+  (let [[before after] (hot-survivors :slru)]
+    (is (= 3 before))
+    (testing "scan pages are demanded exactly once each, so they never leave
+              probation and are always the next thing evicted"
+      (is (= 3 after)))))
+
+(deftest plain-lru-does-not-and-the-tests-say-so
+  (testing "this is the failure mode :slru exists for; asserting otherwise
+            would be claiming scan resistance nobody implemented"
+    (let [[before after] (hot-survivors :lru)]
+      (is (= 3 before))
+      (is (zero? after)))))
+
+(deftest segments-stop-one-workload-evicting-another
+  (let [two (p/cache mach {:page-bytes 4096
+                           :segments [{:id :meta :capacity-pages 4 :policy :lru}
+                                      {:id :data :capacity-pages 4 :policy :clock}]})
+        {s :state} (p/run-with-host two (map #(access [:m %] :segment :meta) (range 4)))
+        meta-before (p/resident-keys s :meta)
+        {s2 :state} (p/run-with-host s (map #(access [:d %] :segment :data) (range 50)))]
+    (testing "50 pages of streaming data leave the metadata segment byte-identical"
+      (is (= 4 (count meta-before)))
+      (is (= meta-before (p/resident-keys s2 :meta)))
+      (is (= 4 (count (p/resident-keys s2 :data)))))))
+
+;; ── stats ────────────────────────────────────────────────────────────────
+
+(deftest hit-rate-counts-accesses-not-fetches
+  (let [{s :state} (p/run-with-host (c) [(access [:f 0]) (access [:f 0]) (access [:f 0])])
+        st (p/stats s)]
+    (is (= 2 (:hits st)))
+    (is (= 1 (:misses st)))
+    (is (< 0.66 (:hit-rate st) 0.67))))
+
+(deftest a-repeated-scan-larger-than-the-cache-still-misses
+  (testing "the honest LRU result: a cyclic scan bigger than capacity is the
+            worst case, and nothing here pretends otherwise"
+    (let [{s :state} (p/run-with-host (c) (map #(access [:f (mod % 6)]) (range 30)))
+          st (p/stats s)]
+      (is (pos? (:misses st)))
+      (is (< (:hit-rate st) 1.0)))))
+
+;; ── how much is there to win? ────────────────────────────────────────────
+
+(deftest compulsory-is-one-miss-per-distinct-page
+  (is (= 3 (p/compulsory-misses [[:f 0] [:f 1] [:f 0] [:f 2] [:f 1]])))
+  (is (= 1 (p/compulsory-misses (repeat 100 [:f 0])))))
+
+(deftest belady-beats-lru-on-the-textbook-trace
+  (testing "the cyclic scan that is LRU's worst case"
+    (let [trace (mapv (fn [i] [:f (mod i 5)]) (range 20))
+          cap 4]
+      (testing "LRU evicts exactly the page about to be needed, every time —
+                measured with readahead off, since OPT bounds replacement only"
+        (let [{s :state} (p/run-with-host
+                          (p/demand-only
+                           (p/cache mach {:page-bytes 4096
+                                          :segments [{:id :default :capacity-pages cap
+                                                      :policy :lru}]}))
+                          (mapv (fn [k] {:event :access :key k}) trace))]
+          (is (= 20 (:misses (p/stats s))))))
+      (testing "OPT keeps four of the five and misses far less"
+        (is (< (p/optimal-misses trace cap) 20))
+        (is (>= (p/optimal-misses trace cap) (p/compulsory-misses trace)))))))
+
+(deftest optimal-never-beats-compulsory-and-never-loses-to-a-policy
+  (doseq [trace [[[:f 0]]
+                 (mapv (fn [i] [:f (mod i 7)]) (range 40))
+                 (mapv (fn [i] [:f (mod (* i 3) 11)]) (range 50))
+                 (mapv (fn [i] [:f i]) (range 12))]
+          cap [2 4 8]]
+    (let [opt (p/optimal-misses trace cap)
+          comp (p/compulsory-misses trace)
+          {s :state} (p/run-with-host
+                      (p/demand-only
+                       (p/cache mach {:page-bytes 4096
+                                      :segments [{:id :default :capacity-pages cap
+                                                  :policy :lru}]}))
+                      (mapv (fn [k] {:event :access :key k}) trace))]
+      (is (<= comp opt) (str "OPT below compulsory: " trace " cap " cap))
+      (is (<= opt (:misses (p/stats s)))
+          (str "a real policy beat OPT: " trace " cap " cap)))))
+
+(deftest comparing-a-prefetching-cache-to-opt-is-meaningless
+  (testing "readahead makes a policy appear to beat the clairvoyant bound,
+            which is why headroom disables it"
+    (let [trace (mapv (fn [i] [:f i]) (range 12))
+          with-ra (p/cache mach {:page-bytes 4096
+                                 :segments [{:id :default :capacity-pages 2 :policy :lru}]})
+          {a :state} (p/run-with-host with-ra
+                                      (mapv (fn [k] {:event :access :key k}) trace))
+          {b :state} (p/run-with-host (p/demand-only with-ra)
+                                      (mapv (fn [k] {:event :access :key k}) trace))
+          opt (p/optimal-misses trace 2)]
+      (is (< (:misses (p/stats a)) opt) "prefetching 'beats' the replacement bound")
+      (is (= opt (:misses (p/stats b))) "demand-only cannot")
+      (testing "and headroom reports which game it is scoring"
+        (is (= :replacement-only (:bounds (p/headroom with-ra trace {}))))))))
+
+(deftest a-cache-larger-than-the-working-set-has-no-headroom
+  (testing "everything fits, so every miss is compulsory and tuning is pointless"
+    (let [trace (mapv (fn [i] [:f (mod i 3)]) (range 30))
+          h (p/headroom (p/cache mach {:page-bytes 4096
+                                       :segments [{:id :default :capacity-pages 8
+                                                   :policy :lru}]})
+                        trace {})]
+      (is (= 3 (:compulsory-misses h) (:optimal-misses h) (:policy-misses h)))
+      (is (= 0.0 (:headroom h)))
+      (is (re-find #"tuning cannot help" (:note h))))))
+
+(deftest a-cyclic-scan-has-headroom-and-says-so
+  (let [trace (mapv (fn [i] [:f (mod i 5)]) (range 30))
+        h (p/headroom (p/cache mach {:page-bytes 4096
+                                     :segments [{:id :default :capacity-pages 4
+                                                 :policy :lru}]})
+                      trace {})]
+    (testing "LRU misses every time; OPT does not"
+      (is (= 30 (:policy-misses h)))
+      (is (< (:optimal-misses h) 30)))
+    (testing "so the headroom is real and the note says to chase it"
+      (is (< 0.3 (:headroom h)))
+      (is (re-find #"real headroom" (:note h))))))
+
+;; ── the regime the fixtures never entered: a trace of real size ──────────
+
+(deftest optimal-misses-handles-a-trace-of-real-size
+  (testing "the first version precomputed next-use and then never read it,
+            rescanning the trace tail for every resident key on every eviction.
+            That is O(n^2 * capacity): invisible on the fifty-access fixtures
+            here and hopeless past a few thousand.
+
+            No wall-clock assertion -- those are flaky in CI. The guard is that
+            this completes at all: the quadratic version needs on the order of
+            20000 * 20000 * 256 steps for the case below and would hang the
+            suite long before failing it."
+    (let [trace (mapv (fn [i] [:f (mod (* i 7919) 4096)]) (range 20000))
+          misses (p/optimal-misses trace 256)]
+      (is (pos? misses))
+      (is (<= (p/compulsory-misses trace) misses))
+      (testing "and 4096 distinct pages cannot all miss more than once each
+                beyond what capacity forces"
+        (is (<= 4096 misses 20000))))))
+
+(deftest optimal-still-agrees-with-the-small-cases-after-the-rewrite
+  (testing "the fast path must produce identical answers, not merely fast ones"
+    (doseq [[trace cap expected-le] [[(mapv (fn [i] [:f (mod i 5)]) (range 20)) 4 20]
+                                     [(mapv (fn [i] [:f (mod i 3)]) (range 30)) 8 3]
+                                     [(mapv (fn [i] [:f i]) (range 12)) 4 12]]]
+      (let [opt (p/optimal-misses trace cap)]
+        (is (<= (p/compulsory-misses trace) opt))
+        (is (<= opt expected-le))))))
+
+;; ── a real trace, computed rather than timed ─────────────────────────────
+;;
+;; Every other test here uses a trace written by hand to exercise one branch.
+;; This one comes from a real workload -- blocked and unblocked matmul -- and
+;; it is COMPUTED, not measured, so it says the same thing on a quiet machine
+;; and on one running at a load average of 68. That property is why it exists:
+;; the timing harness in machine-probe could not qualify anything on the day
+;; this was written, and miss counts did not care.
+
+(def ^:private trace-page 512)
+(def ^:private doubles-per-page (quot trace-page 8))
+
+(defn- page-key [mat n r c]
+  [mat (quot (+ (* r n) c) doubles-per-page)])
+
+(defn- squash
+  "Drop consecutive repeats. A page touched twice in a row is a hit under
+  every policy here and cannot change an eviction order, so this shortens the
+  trace without changing a single miss count."
+  [tr]
+  (persistent! (:out (reduce (fn [{:keys [out last] :as a} k]
+                               (if (= k last) a {:out (conj! out k) :last k}))
+                             {:out (transient []) :last ::none} tr))))
+
+(defn- matmul-trace
+  "Page accesses of `C += A*B` under `order`, tiled by `t` when given."
+  ([n order] (matmul-trace n order nil))
+  ([n order t]
+   (let [idx (case order
+               :ijk (for [i (range n) j (range n) k (range n)] [i j k])
+               :ikj (for [i (range n) k (range n) j (range n)] [i k j])
+               :tiled (for [i0 (range 0 n t) k0 (range 0 n t) j0 (range 0 n t)
+                            i (range i0 (min n (+ i0 t)))
+                            k (range k0 (min n (+ k0 t)))
+                            j (range j0 (min n (+ j0 t)))]
+                        [i k j]))
+         ;; :ijk yields [i j k]; the other two yield [i k j]
+         swap? (= order :ijk)]
+     (squash
+      (persistent!
+       (reduce (fn [acc [a b cc]]
+                 (let [[i k j] (if swap? [a cc b] [a b cc])]
+                   (-> acc (conj! (page-key :a n i k))
+                       (conj! (page-key :b n k j))
+                       (conj! (page-key :c n i j)))))
+               (transient []) idx))))))
+
+(def ^:private trace-mach (assoc mach :page {:base-bytes trace-page :huge []}))
+
+(defn- trace-cache [cap]
+  (p/cache trace-mach {:page-bytes trace-page
+                       :segments [{:id :default :capacity-pages cap :policy :lru}]}))
+
+(deftest bounds-order-holds-on-a-real-trace
+  (testing "compulsory <= optimal <= policy, which is the invariant a hand-run
+            comparison broke: run a PREFETCHING cache against a bound that
+            assumes demand paging and LRU 'beats' the clairvoyant optimum.
+            headroom disables readahead for exactly this reason, and going
+            around it reproduced the bug"
+    (doseq [order [:ijk :ikj]
+            cap [6 12]]
+      (let [tr (matmul-trace 24 order)
+            h (p/headroom (trace-cache cap) tr {})]
+        (is (<= (:compulsory-misses h) (:optimal-misses h) (:policy-misses h))
+            (str order " at capacity " cap))
+        (is (= :replacement-only (:bounds h)))
+        (is (= :disabled-for-this-comparison (:readahead h)))))))
+
+(deftest loop-order-shows-up-in-miss-counts-without-a-clock
+  (testing "ikj is what traversal/loop-order derives from first principles.
+            On this trace it takes an order of magnitude fewer misses than the
+            textbook ijk -- a claim about ORDER, established with no timing at
+            all, on a machine too loaded to time anything"
+    (let [cap 6
+          ijk (:policy-misses (p/headroom (trace-cache cap) (matmul-trace 24 :ijk) {}))
+          ikj (:policy-misses (p/headroom (trace-cache cap) (matmul-trace 24 :ikj) {}))]
+      (is (< (* 5 ikj) ijk)
+          (str "ikj " ikj " should be far below ijk " ijk)))))
+
+(deftest a-tile-too-large-for-the-level-loses-to-not-tiling
+  (testing "tiling is not free: sized past what the cache holds it re-traverses
+            blocks and takes MORE misses than the untiled good order. This is
+            the failure mode a capacity rule exists to avoid, and it is worth a
+            regression test because the obvious reading -- more blocking is
+            more locality -- is wrong"
+    (let [cap 6
+          n 24
+          untiled (:policy-misses (p/headroom (trace-cache cap) (matmul-trace n :ikj) {}))
+          oversized (:policy-misses (p/headroom (trace-cache cap)
+                                                (matmul-trace n :tiled 16) {}))]
+      (is (< untiled oversized)
+          (str "untiled ikj " untiled " should beat an oversized tile " oversized)))))
+
+(deftest a-tile-sized-for-the-level-beats-not-tiling
+  (testing "the other side of the same rule. Oversized tiling loses; correctly
+            sized tiling wins, and by a lot. Both directions are pinned because
+            a model that only knows one of them will happily recommend the
+            wrong tile and still look right in the tests"
+    (let [cap 6
+          n 24
+          untiled (:policy-misses (p/headroom (trace-cache cap) (matmul-trace n :ikj) {}))
+          sized (:policy-misses (p/headroom (trace-cache cap) (matmul-trace n :tiled 4) {}))]
+      (is (< sized untiled)
+          (str "a tile that fits (" sized ") should beat untiled ikj (" untiled ")"))
+      (is (< (* 2 sized) untiled) "and not marginally"))))
+
+(deftest a-recorder-turns-a-live-read-path-into-something-headroom-can-judge
+  (testing "the point of the recorder: a running cache reports counters, and
+            headroom needs the sequence. Wrapping a read path yields a trace
+            that goes straight into the bound"
+    (let [rec (p/recorder)
+            ;; stand-in for a real read path -- block-cache's wrap-get-fn, a
+            ;; merkle-lsm effect handler, anything that can call through
+          get' (fn [k] (p/record! rec k) k)]
+      (doseq [k (matmul-trace 16 :ikj)] (get' k))
+      (let [{:keys [trace]} (p/recorded rec)
+            h (p/headroom (trace-cache 6) trace {})]
+        (is (pos? (count trace)))
+        (is (<= (:compulsory-misses h) (:optimal-misses h) (:policy-misses h)))))))
+
+(deftest an-overflowed-trace-refuses-rather-than-truncating
+  (testing "a trace that quietly lost its tail gives a headroom figure wrong in
+            the optimistic direction, so overflow is reported instead"
+    (let [rec (p/recorder 5)]
+      (doseq [k (range 20)] (p/record! rec k))
+      (let [r (p/recorded rec)]
+        (is (nil? (:trace r)))
+        (is (= 15 (:overflowed r)))
+        (is (= 5 (:recorded r)))))))

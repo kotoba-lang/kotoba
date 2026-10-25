@@ -1,0 +1,121 @@
+(ns kotoba.selfhost.native-parity-test
+  "The shipped decisions, executed as machine code on this host's ISA.
+
+      kbb -M:native
+
+  Why this is a separate suite: it needs a C toolchain to build the measured
+  loader and about a minute to compile two modules, so it does not belong in
+  the suite you run while editing. It is also the only place that answers the
+  question the rest of the repo cannot — whether the decision that ships gives
+  the same answers when nothing is interpreting it.
+
+  What it binds:
+
+    EDN table  ==  native ISA  ==  reference interpreter
+
+  All three, per op, in both directions. Two of those pairs are already bound
+  by `safe_analyzer_core_test`; the native column is what is new. If native and
+  the interpreter ever disagree, exactly one of them is what shipped, and this
+  is the only thing that would say so."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.kir :as ir]
+            [kotoba.selfhost.native-build :as native-build]
+            [kotoba.selfhost.oracle :as oracle]))
+
+(def ^:private facts
+  (edn/read-string (slurp (io/resource "kotoba/selfhost/safe_analyzer_facts.edn"))))
+
+(def ^:private classes
+  "Fact table -> the export that decides membership in it."
+  {:non-executable-forms   "non-executable-form?"
+   :numeric-result-ops     "numeric-result-op?"
+   :effect-ops             "effect-op?"
+   :user-call-excluded-ops "user-call-excluded-op?"})
+
+(def ^:private strangers
+  "Names in no table. A predicate that answered `true` for everything would
+  satisfy every membership assertion above and nothing else."
+  ["kgraph-drop!" "defn" "recur" "" "не-оп" "user/thing"])
+
+(defn- interpreted [id export args]
+  (ir/execute (oracle/kir id) (symbol export) (vec args)))
+
+(use-fixtures :once
+  (fn [suite]
+    (let [directory (io/file (System/getProperty "java.io.tmpdir")
+                             (str "kotoba-selfhost-native-" (System/nanoTime)))]
+      (try
+        (native-build/build! directory)
+        (oracle/open-native! directory)
+        (suite)
+        (finally
+          (oracle/close-native!)
+          (doseq [file (reverse (file-seq directory))] (io/delete-file file true)))))))
+
+(deftest the-native-build-is-what-the-oracle-runs
+  (is (true? (oracle/native?)))
+  (is (= (:schema facts) (oracle/call :safe-analyzer "facts-schema" [])))
+  (is (= (:schema facts) (oracle/call :capability-admission "facts-schema" []))
+      "both cores answer for the same fact table"))
+
+(deftest every-op-classifies-the-same-on-the-native-isa
+  (doseq [[table export] classes
+          :let [members (set (get facts table))]]
+    (testing (str export " over " (count members) " entries")
+      (doseq [op (concat (get facts table) strangers)
+              :let [expected (contains? members op)
+                    native (oracle/call :safe-analyzer export [op])]]
+        (is (= expected native)
+            (str export " (native) disagrees with " table " for " (pr-str op)))
+        (is (= (interpreted :safe-analyzer export [op]) native)
+            (str export " (native) disagrees with the interpreter for " (pr-str op)))))))
+
+(deftest every-op-in-any-table-classifies-the-same-against-every-predicate
+  ;; The loop above asks each predicate only about its own table and the
+  ;; strangers. Classes overlap by design, so an op that belongs to two tables
+  ;; is the case where a native miscompile would be least visible: it is a
+  ;; `true` either way for its own predicate.
+  (let [every-op (into (sorted-set) (mapcat #(get facts %)) (keys classes))]
+    (doseq [op every-op
+            [table export] classes]
+      (is (= (contains? (set (get facts table)) op)
+             (oracle/call :safe-analyzer export [op]))
+          (str export " (native) for " (pr-str op))))))
+
+(deftest the-effect-algebra-agrees-word-for-word
+  (let [mask (oracle/call :capability-admission "known-effect-mask" [])
+        effects (get facts :effect-ops)]
+    (is (= (interpreted :capability-admission "known-effect-mask" []) mask))
+    (is (= (bit-shift-left 1 (count effects)) (inc mask))
+        "the universe is exactly the effect ops, so its mask is dense")
+    (doseq [op (concat effects strangers)]
+      (is (= (interpreted :capability-admission "effect-bit" [op])
+             (oracle/call :capability-admission "effect-bit" [op]))
+          (str "effect-bit (native) for " (pr-str op))))
+    ;; `infer-step` is the fold's whole decision (ADR-2608110200): classify,
+    ;; then union, in one call the host cannot get the order of wrong. Folding
+    ;; every effect op through it natively must reach the same mask the
+    ;; interpreter reaches.
+    (let [fold (fn [call] (reduce (fn [acc op] (call "infer-step" [acc op])) 0 effects))]
+      (is (= mask (fold #(oracle/call :capability-admission %1 %2)))
+          "every effect op folds to the full universe")
+      (is (= (fold #(interpreted :capability-admission %1 %2))
+             (fold #(oracle/call :capability-admission %1 %2)))))))
+
+(deftest the-cores-self-tests-pass-on-the-native-isa
+  ;; Each core carries `test-*` exports that assert its own invariants and
+  ;; return a count. Running them here executes those assertions as machine
+  ;; code rather than as interpreted KIR.
+  (doseq [id (sort (keys oracle/oracles))
+          :let [tests (->> (:functions (oracle/kir id))
+                           (map :name)
+                           (filter #(str/starts-with? (str %) "test-"))
+                           sort)]]
+    (is (seq tests) (str id " must carry self-tests"))
+    (doseq [test tests]
+      (is (= (interpreted id (str test) [])
+             (oracle/call id (str test) []))
+          (str id "/" test " (native) disagrees with the interpreter")))))

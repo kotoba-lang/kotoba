@@ -1,0 +1,171 @@
+(ns kotoba.plm.phase2-test
+  "Next-phase coverage: effectivity resolution, MRP→PO, revision supersede,
+   and the production (kotoba XRPC) backend round-trip."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [datomic.client.api :as d]
+            [kotoba.lang.edn :as edn]
+            [kotoba.plm.db :as db]
+            [kotoba.plm.db-host :as db-host]
+            [kotoba.plm.item :as plm]
+            [kotoba.plm.cost :as cost]
+            [kotoba.plm.erp :as erp]
+            [kotoba.plm.thread :as thread]
+            [kotoba.plm.mrp :as mrp]
+            [kotoba.plm.production :as prod]
+            [kotoba.plm.store :as store]))
+
+;; ─────────────────────────── effectivity ───────────────────────────────────
+
+(deftest effectivity-asof-picks-the-right-child
+  (let [conn (db-host/fresh-conn (str "eff-" (System/nanoTime)))]
+    (db/tx! conn
+      [(plm/item {:part-no "ASM" :make-buy :make})
+       (plm/item {:part-no "OLD" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "NEW" :make-buy :buy :std-unit-cost 130})])
+    ;; OLD effective until 2026-06-01, NEW from 2026-06-01 (ECO-style replacement)
+    (db/tx! conn
+      [(plm/bom-edge {:parent "ASM@A" :child "OLD@A" :qty 1 :find-no 1
+                      :eff-to #inst "2026-06-01"})
+       (plm/bom-edge {:parent "ASM@A" :child "NEW@A" :qty 1 :find-no 2
+                      :eff-from #inst "2026-06-01"})])
+    (let [d (db/db conn)]
+      (testing "as-of before the cutover rolls the OLD component"
+        (is (= 100M (cost/rolled-cost d "ASM@A" #inst "2026-05-01"))))
+      (testing "as-of after the cutover rolls the NEW component"
+        (is (= 130M (cost/rolled-cost d "ASM@A" #inst "2026-07-01"))))
+      (testing "effectivity-agnostic roll sees both (1×100 + 1×130)"
+        (is (= 230M (cost/rolled-cost d "ASM@A")))))))
+
+;; ─────────────────────────── MRP → PO ──────────────────────────────────────
+
+(defn- mrp-world []
+  (let [conn (db-host/fresh-conn (str "mrp-" (System/nanoTime)))]
+    (db/tx! conn erp/chart)
+    (db/tx! conn
+      [(plm/item {:part-no "P"  :make-buy :make})
+       (plm/item {:part-no "RR" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "CC" :make-buy :buy :std-unit-cost 50})])
+    (db/tx! conn
+      [(plm/bom-edge {:parent "P@A" :child "RR@A" :qty 4 :find-no 1})
+       (plm/bom-edge {:parent "P@A" :child "CC@A" :qty 2 :find-no 2})])
+    (doseq [iid ["RR@A" "CC@A" "P@A"]] (thread/release-item! conn iid))
+    conn))
+
+(deftest mrp-explodes-and-nets-on-hand
+  (let [conn (mrp-world)]
+    (testing "no on-hand → PO for full gross (4×10 and 2×10)"
+      (let [r (mrp/mrp-run! conn "P@A" 10)
+            by (into {} (map (juxt :item :net)) (:ordered r))]
+        (is (= 40M (by "RR@A")))
+        (is (= 20M (by "CC@A")))))
+    (testing "receive 15 RR into stock → next run nets it (40-15=25)"
+      (thread/receive-goods! conn "RR@A" 15)
+      (let [r (mrp/mrp-run! conn "P@A" 10)
+            by (into {} (map (juxt :item :net)) (:ordered r))]
+        (is (= 25M (by "RR@A")))
+        (is (= 20M (by "CC@A")))))
+    (testing "open POs were actually written to the ERP graph"
+      (let [n (ffirst (db/q '[:find (count ?po) :where [?po :erp.po/state :open]] (db/db conn)))]
+        (is (= 4 n) "2 items × 2 runs")))))
+
+;; ─────────────────────────── revision supersede ────────────────────────────
+
+(deftest revision-supersede-obsoletes-prior
+  (let [conn (db-host/fresh-conn (str "rev-" (System/nanoTime)))]
+    (db/tx! conn
+      [(plm/item {:part-no "SUB" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "ASM" :make-buy :make})])
+    (db/tx! conn [(plm/bom-edge {:parent "ASM@A" :child "SUB@A" :qty 2 :find-no 1})])
+    (thread/release-item! conn "SUB@A")
+    (thread/release-item! conn "ASM@A")
+    ;; revise ASM A→B (copies the 2×SUB structure), then release the new rev
+    (db/tx! conn (plm/revise-item-tx (db/db conn) "ASM@A" "B"))
+    (testing "new rev is a draft superseding the old"
+      (is (= :draft (plm/lifecycle (db/db conn) "ASM@B")))
+      (is (= 200M (cost/rolled-cost (db/db conn) "ASM@B")) "inherited 2×100"))
+    (let [res (thread/release-item! conn "ASM@B")]
+      (testing "release finalises the supersede"
+        (is (= "ASM@A" (:superseded res)))
+        (is (= :released (plm/lifecycle (db/db conn) "ASM@B")))
+        (is (= :obsolete (plm/lifecycle (db/db conn) "ASM@A")))))))
+
+;; ─────────────────────────── production completion (backflush) ─────────────
+
+(deftest production-backflush-closes-wip
+  (let [conn (mrp-world)]                       ; P ← 4×RR(100) + 2×CC(50)
+    (thread/receive-goods! conn "RR@A" 40)      ; stock components
+    (thread/receive-goods! conn "CC@A" 20)
+    (let [r (prod/complete-production! conn "P@A" 10)]
+      (is (:ok r))
+      (is (= 5000M (:wip-cleared r)) "4×100×10 + 2×50×10")
+      (is (= 5000M (:finished-value r)) "10 × std 500"))
+    (let [d (db/db conn)]
+      (testing "components consumed, finished good in stock"
+        (is (= 0M  (db/attr d :erp.inventory/qty-on-hand [:erp.inventory/id "INV-RR@A"])))
+        (is (= 0M  (db/attr d :erp.inventory/qty-on-hand [:erp.inventory/id "INV-CC@A"])))
+        (is (= 10M (db/attr d :erp.inventory/qty-on-hand [:erp.inventory/id "INV-P@A"]))))
+      (testing "and the ownership register moved with it, through the real posting path"
+        ;; kotoba.plm.registers has unit tests, but they do not go through
+        ;; receive-goods! or complete-production!. Without these four
+        ;; assertions the suite would pass while qty-accounting was never
+        ;; written at all -- nothing else here reads it.
+        (doseq [inv ["INV-RR@A" "INV-CC@A" "INV-P@A"]]
+          (is (= (db/attr d :erp.inventory/qty-on-hand [:erp.inventory/id inv])
+                 (db/attr d :erp.inventory/qty-accounting [:erp.inventory/id inv]))
+              (str inv ": every plm posting is a full-title movement, so the two registers agree")))
+        (is (some? (db/attr d :erp.inventory/qty-accounting [:erp.inventory/id "INV-P@A"]))
+            "recorded, not merely equal to a nil onhand"))
+      (testing "WIP closes to zero and GL stays balanced"
+        (let [tb (erp/trial-balance d)]
+          (is (= 0M (get-in tb ["1500" :balance])) "WIP cleared")
+          (is (= (reduce + 0M (map (comp :debit val) tb))
+                 (reduce + 0M (map (comp :credit val) tb)))))))))
+
+;; ─────────────────────────── production backend (kotoba) ───────────────────
+
+(defn- fake-kotoba-postfn
+  "A post-fn backed by a raw Datomic Local conn that mimics the kyber-datomic /
+   mangaka.store.kotoba XRPC wire contract (tx_edn / rows_edn / entity_edn)."
+  [conn]
+  (fn [method {:keys [tx_edn query_edn args_edn pattern_edn entity]}]
+    (case method
+      "transact" (do (d/transact conn {:tx-data (edn/read-string tx_edn)}) {:ok true})
+      "q" (let [res (apply d/q (edn/read-string query_edn) (d/db conn)
+                           (edn/read-string (or args_edn "[]")))]
+            {:rows_edn (mapv (fn [row] (mapv pr-str row)) res)})
+      "pull" (let [m (try (d/pull (d/db conn) (edn/read-string pattern_edn)
+                                  (edn/read-string entity))
+                          (catch Exception _ nil))]
+               {:entity_edn (pr-str m)}))))
+
+(deftest kotoba-store-roundtrips-the-wire-contract
+  (let [raw  (let [c (d/client {:server-type :datomic-local :storage-dir :mem :system "kyber-plm"})]
+               (d/delete-database c {:db-name "kt"})
+               (d/create-database c {:db-name "kt"})
+               (d/connect c {:db-name "kt"}))
+        s    (store/kotoba (fake-kotoba-postfn raw) "kt-graph")]  ; installs schema over XRPC
+    (store/transact! s [(plm/item {:part-no "PN-1" :make-buy :buy :std-unit-cost 7})])
+    (testing "q* round-trips through EDN-encoded rows"
+      (is (= #{["PN-1@A"]}
+             (store/q s '[:find ?id :where [?e :plm.item/id ?id]]))))
+    (testing "pull*/attr round-trip through entity_edn"
+      (is (= :buy (store/attr s :plm.item/make-buy [:plm.item/id "PN-1@A"])))
+      (is (= "PN-1" (:plm.item/part-no
+                     (store/pull* s [:plm.item/part-no] [:plm.item/id "PN-1@A"])))))))
+
+(deftest whole-domain-runs-on-kotoba-backend
+  ;; The proof of the Store abstraction: thread/cost/erp run unchanged on a
+  ;; KotobaStore (XRPC), because they only touch the graph via kotoba.plm.db,
+  ;; which delegates to the Store protocol.
+  (let [raw (let [c (d/client {:server-type :datomic-local :storage-dir :mem :system "kyber-plm"})]
+              (d/delete-database c {:db-name "dom"})
+              (d/create-database c {:db-name "dom"})
+              (d/connect c {:db-name "dom"}))
+        s   (store/kotoba (fake-kotoba-postfn raw) "dom-graph")]
+    (db/tx! s [(plm/item {:part-no "B" :make-buy :buy :std-unit-cost 100})
+               (plm/item {:part-no "A" :make-buy :make})])
+    (db/tx! s [(plm/bom-edge {:parent "A@A" :child "B@A" :qty 3 :find-no 1})])
+    (thread/release-item! s "B@A")
+    (is (= 300M (:rolled-cost (thread/release-item! s "A@A"))) "3×100 rolled over XRPC backend")
+    (thread/receive-goods! s "A@A" 5)
+    (is (= 1500M (erp/inventory-value s)) "5×300 valued through the kotoba store")))

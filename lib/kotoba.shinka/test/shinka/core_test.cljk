@@ -1,0 +1,224 @@
+(ns shinka.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [shinka.rng :as rng]
+            [shinka.genome :as genome]
+            [shinka.variation :as var]
+            [shinka.evolve :as evolve]))
+
+(defn- close? [a b eps] (< (abs (- (double a) (double b))) eps))
+
+;; ---------------------------------------------------------------------------
+;; rng
+;; ---------------------------------------------------------------------------
+
+;; These literals are the contract between the JVM and ClojureScript builds.
+;; They were produced by running the generator under BOTH hosts and comparing,
+;; not by copying one host's output. A host that ever disagrees fails here
+;; instead of silently making an evolutionary run unreproducible.
+(def jvm+js-doubles [0.002643900066 0.110957073868 0.875439327054
+                     0.864609034615 0.726482033011])
+(def jvm+js-gaussians [3.236042436309 0.839791010134 1.124257970712])
+
+(deftest rng-is-portable-and-pinned
+  (let [[xs _] (rng/doubles-n (rng/seed 42) 5)
+        [gs _] (rng/gaussians-n (rng/seed 7) 3)]
+    (doseq [[got want] (map vector xs jvm+js-doubles)]
+      (is (close? got want 1e-11) "uniform stream must match the pinned host-parity values"))
+    (doseq [[got want] (map vector gs jvm+js-gaussians)]
+      (is (close? got want 1e-11) "gaussian stream must match the pinned host-parity values"))))
+
+(deftest rng-is-deterministic-and-in-range
+  (let [[a _] (rng/doubles-n (rng/seed 5) 200)
+        [b _] (rng/doubles-n (rng/seed 5) 200)]
+    (is (= a b) "same seed, same stream")
+    (is (every? #(and (<= 0.0 %) (< % 1.0)) a))
+    (is (apply distinct? (take 50 a)) "no short cycle in the first draws"))
+  (let [[a _] (rng/doubles-n (rng/seed 5) 50)
+        [b _] (rng/doubles-n (rng/seed 6) 50)]
+    (is (not= a b) "different seeds, different streams")))
+
+(deftest rng-zero-seed-does-not-freeze
+  ;; xorshift32 cannot leave state 0. seed must map it away.
+  (let [[xs _] (rng/doubles-n (rng/seed 0) 10)]
+    (is (apply distinct? xs) "seed 0 must not produce a constant stream")))
+
+(deftest gaussian-has-the-right-moments
+  (let [[gs _] (rng/gaussians-n (rng/seed 1234) 4000)
+        mean (/ (reduce + 0.0 gs) (count gs))
+        var (/ (reduce + 0.0 (map #(* % %) gs)) (count gs))]
+    (is (close? mean 0.0 0.06) (str "mean was " mean))
+    (is (close? var 1.0 0.08) (str "variance was " var))))
+
+(deftest split-gives-independent-streams
+  (let [st (rng/seed 3)
+        [c1 st1] (rng/split st)
+        [c2 _] (rng/split st1)
+        [a _] (rng/doubles-n c1 20)
+        [b _] (rng/doubles-n c2 20)]
+    (is (not= a b))
+    (is (< (count (filter true? (map = a b))) 3) "children must not share draws")))
+
+;; ---------------------------------------------------------------------------
+;; genome
+;; ---------------------------------------------------------------------------
+
+(def spec4 (genome/normalize-spec {:dim 4 :lo -2.0 :hi 2.0}))
+
+(deftest spec-expands-and-validates
+  (let [s (genome/normalize-spec {:dim 3 :lo [-1 0 -5] :hi [1 2 5]})]
+    (is (= [-1.0 0.0 -5.0] (:lo s)))
+    (is (= [1.0 2.0 5.0] (:hi s))))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (genome/normalize-spec {:dim 0 :lo 0 :hi 1})))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (genome/normalize-spec {:dim 2 :lo 1 :hi 1}))
+      "lo must be strictly below hi"))
+
+(deftest random-genomes-stay-in-the-box
+  (let [[pop _] (genome/random-population spec4 50 (rng/seed 11))]
+    (is (= 50 (count pop)))
+    (is (every? (fn [g] (every? #(and (<= -2.0 %) (<= % 2.0)) g)) pop))))
+
+(deftest clamp-pulls-into-the-box
+  (is (= [-2.0 2.0 0.5 -2.0] (genome/clamp spec4 [-9.0 9.0 0.5 -2.0]))))
+
+(deftest diversity-is-zero-for-a-collapsed-population
+  (let [g [0.0 0.0 0.0 0.0]]
+    (is (= 0.0 (genome/diversity spec4 [g g g g]))))
+  (let [[pop _] (genome/random-population spec4 30 (rng/seed 2))]
+    (is (> (genome/diversity spec4 pop) 0.15) "a uniform random population is diverse")))
+
+(deftest diversity-is-normalized-to-the-box
+  ;; opposite corners of the box = 1.0 regardless of dimension or width
+  (is (close? (genome/distance spec4 [-2.0 -2.0 -2.0 -2.0] [2.0 2.0 2.0 2.0]) 1.0 1e-12))
+  (let [wide (genome/normalize-spec {:dim 4 :lo -1000.0 :hi 1000.0})]
+    (is (close? (genome/distance wide (vec (repeat 4 -1000.0)) (vec (repeat 4 1000.0))) 1.0 1e-12))))
+
+;; ---------------------------------------------------------------------------
+;; variation
+;; ---------------------------------------------------------------------------
+
+(deftest uniform-crossover-takes-genes-from-parents
+  (let [a [1.0 1.0 1.0 1.0] b [0.0 0.0 0.0 0.0]
+        [c _] (var/uniform-crossover a b (rng/seed 9))]
+    (is (every? #(or (= % 1.0) (= % 0.0)) c))
+    (is (not= c a))
+    (is (not= c b))))
+
+(deftest blend-crossover-can-leave-the-parents-interval
+  (let [a [0.0 0.0 0.0 0.0] b [1.0 1.0 1.0 1.0]
+        outside (loop [st (rng/seed 4) i 0 n 0]
+                  (if (= i 200)
+                    n
+                    (let [[c st'] (var/blend-crossover a b 0.5 st)]
+                      (recur st' (inc i) (+ n (count (filter #(or (< % 0.0) (> % 1.0)) c)))))))]
+    (is (pos? outside) "BLX-alpha must be able to explore outside both parents")))
+
+(deftest mutation-rate-zero-is-identity
+  (let [g [0.1 -0.2 0.3 -0.4]
+        [m _] (var/mutate spec4 g 0.0 0.5 (rng/seed 1))]
+    (is (= g m))))
+
+(deftest mutation-respects-the-box
+  (let [g [2.0 2.0 2.0 2.0]
+        [m _] (var/mutate spec4 g 1.0 5.0 (rng/seed 1))]
+    (is (every? #(<= % 2.0) m) "a huge sigma must still clamp")))
+
+(deftest mutation-sigma-scales-with-gene-width
+  ;; one sigma must mean the same *fraction* of the range for both genes
+  (let [s (genome/normalize-spec {:dim 2 :lo [-1.0 -100.0] :hi [1.0 100.0]})
+        moves (loop [st (rng/seed 21) i 0 acc []]
+                (if (= i 400)
+                  acc
+                  (let [[m st'] (var/mutate s [0.0 0.0] 1.0 0.1 st)]
+                    (recur st' (inc i) (conj acc m)))))
+        frac (fn [idx w] (/ (reduce + 0.0 (map #(abs (nth % idx)) moves)) (count moves) w))]
+    (is (close? (frac 0 2.0) (frac 1 200.0) 0.01)
+        "mean |move| as a fraction of gene width must match across widths")))
+
+(deftest tournament-with-k-equal-n-always-picks-the-best
+  (let [scored [{:genome [:a] :fitness 1.0}
+                {:genome [:b] :fitness 5.0}
+                {:genome [:c] :fitness 3.0}]]
+    (dotimes [i 20]
+      (let [[g _] (var/tournament scored 40 (rng/seed (+ 100 i)))]
+        (is (= [:b] g))))))
+
+(deftest elites-are-the-best-n
+  (let [scored [{:genome :a :fitness 1.0} {:genome :b :fitness 9.0} {:genome :c :fitness 5.0}]]
+    (is (= [:b :c] (var/elites scored 2)))))
+
+;; ---------------------------------------------------------------------------
+;; evolve
+;; ---------------------------------------------------------------------------
+
+(defn- sphere
+  "Maximised at `target`. Negative squared error, so 0.0 is perfect."
+  [target g]
+  (- (reduce + 0.0 (map (fn [x t] (let [d (- x t)] (* d d))) g target))))
+
+(deftest ask-tell-is-deterministic
+  (let [mk #(evolve/init {:spec {:dim 6 :lo -1.0 :hi 1.0} :population 12 :seed 77})
+        f (partial sphere [0.5 -0.5 0.25 0.0 -0.75 0.9])
+        [_ r1] (evolve/run (mk) f 8)
+        [_ r2] (evolve/run (mk) f 8)]
+    (is (= (map :best-fitness r1) (map :best-fitness r2))
+        "same seed must replay the same run")))
+
+(deftest tell-rejects-a-mismatched-fitness-count
+  (let [s (evolve/init {:spec {:dim 3 :lo -1.0 :hi 1.0} :population 5 :seed 1})]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (evolve/tell s [1.0 2.0])))))
+
+(deftest all-time-best-is-monotone
+  (let [s (evolve/init {:spec {:dim 5 :lo -1.0 :hi 1.0} :population 16 :seed 3})
+        [_ recs] (evolve/run s (partial sphere [0.3 0.3 -0.3 -0.3 0.0]) 15)
+        ats (map :all-time-best recs)]
+    (is (= ats (sort ats)) "all-time best must never go down")))
+
+(deftest it-actually-optimizes
+  (let [target [0.6 -0.4 0.2 -0.8 0.35 0.9 -0.1 0.5]
+        s (evolve/init {:spec {:dim 8 :lo -1.0 :hi 1.0}
+                        :population 40 :elites 2 :sigma 0.2 :seed 2026})
+        [s' recs] (evolve/run s (partial sphere target) 40)
+        first-best (:best-fitness (first recs))
+        final (:fitness (evolve/best s'))]
+    (is (< first-best -0.5) "a random population should start well away from the optimum")
+    (is (> final -0.02) (str "40 generations should nearly solve an 8-d sphere; got " final))
+    (is (> final (* 10 first-best)) "and it must be a large improvement, not noise")))
+
+(deftest elites-are-never-lost
+  ;; With elitism the best genome of generation N must still be present in N+1.
+  (let [s (evolve/init {:spec {:dim 4 :lo -1.0 :hi 1.0} :population 10 :elites 1 :seed 8})
+        {:keys [genomes]} (evolve/ask s)
+        fs (map-indexed (fn [i _] (double i)) genomes)   ; last genome is best
+        [s' rec] (evolve/tell s fs)]
+    (is (= (:best-genome rec) (last genomes)))
+    (is (some #(= % (last genomes)) (:genomes (evolve/ask s')))
+        "the elite must survive into the next generation unchanged")))
+
+(deftest collapse-guard-fires-and-is-recorded
+  ;; Force collapse: report identical fitness for a population we have made
+  ;; identical, so diversity is exactly 0 and below any floor.
+  (let [s0 (evolve/init {:spec {:dim 4 :lo -1.0 :hi 1.0} :population 12 :seed 4})
+        flat (assoc s0 :population (vec (repeat 12 [0.0 0.0 0.0 0.0])))
+        [s1 rec] (evolve/tell flat (repeat 12 1.0))]
+    (is (:collapsed? rec))
+    (is (pos? (:immigrants rec)) "a collapsed population must get fresh immigrants")
+    (is (> (genome/diversity (:spec s1) (:population s1)) 0.0)
+        "and the next population must actually be diverse again")))
+
+(deftest healthy-population-gets-no-immigrants
+  (let [s (evolve/init {:spec {:dim 4 :lo -1.0 :hi 1.0} :population 12 :seed 4})
+        [_ rec] (evolve/tell s (map (fn [_] (rand)) (range 12)))]
+    (is (false? (:collapsed? rec)))
+    (is (zero? (:immigrants rec)))))
+
+(deftest record-carries-the-stats-a-run-is-judged-on
+  (let [s (evolve/init {:spec {:dim 3 :lo -1.0 :hi 1.0} :population 8 :seed 1})
+        [_ rec] (evolve/tell s [1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0])]
+    (is (= 0 (:generation rec)))
+    (is (= 8.0 (:best-fitness rec)))
+    (is (= 4.5 (:mean rec)))
+    (is (= 8.0 (:max rec)))
+    (is (= 1.0 (:min rec)))
+    (is (= 8 (:evaluations rec)))
+    (is (contains? rec :diversity))
+    (is (contains? rec :sigma))))

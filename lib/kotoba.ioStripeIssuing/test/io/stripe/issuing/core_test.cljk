@@ -1,0 +1,275 @@
+(ns io.stripe.issuing.core-test
+  "Every test drives a recorded transport. Nothing here touches the network and
+  nothing needs a Stripe key -- which is also what makes the guards testable: the
+  point of `precheck` is that it refuses BEFORE a call would be made, and the only
+  way to prove that is to assert no call was recorded."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.card.actuation :as actuation]
+            [kotoba.card.lifecycle :as lifecycle]
+            [io.stripe.issuing.core :as stripe]
+            [io.stripe.issuing.state :as state]))
+
+(def approval {:by "operator@example" :reference "commit-p1-abc"})
+(def key-1 "idem-1")
+
+(defn- provider-with [responses]
+  (let [calls (atom [])]
+    [(stripe/provider :transport (stripe/recorded-transport responses calls))
+     calls]))
+
+(def card-created
+  {[:post "/v1/issuing/cards"]
+   {:status 200 :body {:id "ic_123" :status "inactive" :type "virtual"}}})
+
+(def cardholder-created
+  {[:post "/v1/issuing/cardholders"]
+   {:status 200 :body {:id "ich_123" :name "Example" :status "active"}}})
+
+;; ---------------------------------------------------------------------------
+;; the guards refuse before anything is sent
+;; ---------------------------------------------------------------------------
+
+(deftest an-unnamed-approval-is-refused-without-any-call
+  (doseq [bad [{:reference "r"} {:by "op"} {} nil]]
+    (let [[p calls] (provider-with card-created)
+          out (actuation/issue-card! p "ich_123" {} bad key-1)]
+      (is (false? (:card/ok? out)) (str (pr-str bad)))
+      (is (= :approval-invalid (get-in out [:card/refusal :rule])))
+      (is (empty? @calls)
+          "a provider that reaches the network and THEN finds the approval unnamed
+           has already acted"))))
+
+(deftest a-missing-idempotency-key-is-refused-without-any-call
+  (doseq [bad [nil ""]]
+    (let [[p calls] (provider-with card-created)
+          out (actuation/issue-card! p "ich_123" {} approval bad)]
+      (is (= :idempotency-key-missing (get-in out [:card/refusal :rule])))
+      (is (empty? @calls)))))
+
+(deftest the-key-reaches-stripe-as-an-idempotency-header
+  (let [[p calls] (provider-with card-created)]
+    (actuation/issue-card! p "ich_123" {} approval key-1)
+    (is (= key-1 (:idempotency-key (first @calls)))
+        "a retried issue must not produce a second live card, which is Stripe's
+         job only if we actually send the header")))
+
+(deftest every-write-path-is-guarded
+  (testing "cardholder creation and state changes refuse on the same terms"
+    (let [[p calls] (provider-with {})]
+      (is (= :approval-invalid
+             (get-in (actuation/create-cardholder! p {} {} key-1)
+                     [:card/refusal :rule])))
+      (is (= :approval-invalid
+             (get-in (actuation/set-card-state! p "ic_1" :activate {} key-1)
+                     [:card/refusal :rule])))
+      (is (empty? @calls)))))
+
+;; ---------------------------------------------------------------------------
+;; issuing
+;; ---------------------------------------------------------------------------
+
+(deftest a-new-card-is-created-inactive-not-active
+  (testing "which is the provider side of lifecycle :issued -- creating it active
+            would skip the activation the issuer side models as its own gated event"
+    (let [[p calls] (provider-with card-created)
+          out (actuation/issue-card! p "ich_123" {} approval key-1)]
+      (is (true? (:card/ok? out)))
+      (is (= "ic_123" (:card/reference out)))
+      (is (= :issued (:card/state out)))
+      (is (= "inactive" (get-in (first @calls) [:body :status]))))))
+
+(deftest an-unsupported-card-type-is-refused-locally
+  (let [[p calls] (provider-with card-created)
+        out (actuation/issue-card! p "ich_123" {:card-type "metal"} approval key-1)]
+    (is (= :card-type-unsupported (get-in out [:card/refusal :rule])))
+    (is (empty? @calls) "no point asking Stripe about a type it does not have")))
+
+(deftest a-spending-limit-is-nested-the-way-stripe-expects
+  (let [[p calls] (provider-with card-created)]
+    (actuation/issue-card! p "ich_123"
+                           {:spending-limit-minor 50000
+                            :spending-limit-interval "daily"}
+                           approval key-1)
+    (is (= 50000 (get-in (first @calls)
+                         [:body :spending_controls :spending_limits 0 :amount])))))
+
+(deftest a-stripe-error-comes-back-as-a-refusal-not-an-exception
+  (let [[p _] (provider-with
+               {[:post "/v1/issuing/cards"]
+                {:status 402 :body {:error {:code "card_declined"
+                                            :message "Your card was declined."}}}})
+        out (actuation/issue-card! p "ich_123" {} approval key-1)]
+    (is (false? (:card/ok? out)))
+    (is (= :stripe-error (get-in out [:card/refusal :rule])))
+    (is (= "card_declined" (get-in out [:card/refusal :detail :code])))
+    (is (= 402 (get-in out [:card/refusal :detail :status])))))
+
+(deftest a-transport-failure-is-also-a-refusal
+  (let [[p _] (provider-with {[:post "/v1/issuing/cards"]
+                              {:status 0 :error "connection refused"}})
+        out (actuation/issue-card! p "ich_123" {} approval key-1)]
+    (is (= :stripe-error (get-in out [:card/refusal :rule])))
+    (is (= "connection refused" (get-in out [:card/refusal :detail :detail])))))
+
+;; ---------------------------------------------------------------------------
+;; state changes
+;; ---------------------------------------------------------------------------
+
+(deftest each-lifecycle-event-maps-to-the-right-stripe-status
+  (doseq [[event status to] [[:activate "active" :active]
+                             [:block "inactive" :blocked]
+                             [:close "canceled" :closed]]]
+    (let [[p calls] (provider-with
+                     {[:post "/v1/issuing/cards/ic_1"]
+                      {:status 200 :body {:id "ic_1" :status status}}})
+          out (actuation/set-card-state! p "ic_1" event approval key-1)]
+      (is (true? (:card/ok? out)) (str event))
+      (is (= status (get-in (first @calls) [:body :status])) (str event))
+      (is (= to (:card/state out))
+          (str event " must report the lifecycle's own resulting state")))))
+
+(deftest a-reissue-is-refused-because-it-is-not-a-status-change
+  (testing "Stripe replaces a card by creating a new one with replacement_for and
+            cancelling the original -- two calls. Approximating it with a cancel
+            would leave a caller believing a replacement exists when none does."
+    (let [[p calls] (provider-with {})
+          out (actuation/set-card-state! p "ic_1" :reissue approval key-1)]
+      (is (= :reissue-not-a-status-change (get-in out [:card/refusal :rule])))
+      (is (some? (get-in out [:card/refusal :detail :hint])))
+      (is (empty? @calls)))))
+
+(deftest an-unknown-event-is-refused
+  (let [[p calls] (provider-with {})]
+    (is (= :event-unknown
+           (get-in (actuation/set-card-state! p "ic_1" :incinerate approval key-1)
+                   [:card/refusal :rule])))
+    (is (empty? @calls))))
+
+;; ---------------------------------------------------------------------------
+;; reading state back -- the ambiguity is the interesting part
+;; ---------------------------------------------------------------------------
+
+(deftest reading-inactive-back-does-not-guess-which-state-it-means
+  (let [[p _] (provider-with {[:get "/v1/issuing/cards/ic_1"]
+                              {:status 200 :body {:id "ic_1" :status "inactive"}}})
+        out (actuation/card-state p "ic_1")]
+    (is (= #{:issued :blocked} (:card/candidates out))
+        "a card that never worked and a card that was deliberately stopped are both
+         'inactive' at Stripe; answering with one of them would tell a caller a
+         blocked card is merely un-activated")
+    (is (nil? (:card/unambiguous out)))))
+
+(deftest an-unambiguous-status-is-reported-as-such
+  (doseq [[status expected] [["active" :active] ["canceled" :closed]]]
+    (let [[p _] (provider-with {[:get "/v1/issuing/cards/ic_1"]
+                                {:status 200 :body {:id "ic_1" :status status}}})
+          out (actuation/card-state p "ic_1")]
+      (is (= expected (:card/unambiguous out)) status))))
+
+(deftest reading-state-needs-no-approval
+  (testing "learning a state is not actuating"
+    (let [[p _] (provider-with {[:get "/v1/issuing/cards/ic_1"]
+                                {:status 200 :body {:status "active"}}})]
+      (is (some? (actuation/card-state p "ic_1"))))))
+
+;; ---------------------------------------------------------------------------
+;; the mapping is published, and complete
+;; ---------------------------------------------------------------------------
+
+(deftest the-state-mapping-satisfies-the-contract
+  (is (actuation/state-mapping-complete? state/mapping)
+      "every lifecycle state must have a provider-side representation, even if it
+       is nil -- folding two into one is how :issued and :active become the same
+       thing and a card that was never activated starts working")
+  (is (= #{:intake} (actuation/unrepresentable-states state/mapping)))
+  (is (= #{"inactive"} (state/ambiguous-statuses))))
+
+(deftest every-lifecycle-event-has-a-provider-operation
+  (is (state/covers-every-event?))
+  (is (= (set (keys lifecycle/events)) (set (keys state/events)))))
+
+(deftest the-mapping-only-uses-statuses-stripe-actually-has
+  (doseq [[k v] state/mapping :when (some? v)]
+    (is (contains? state/statuses v) (str k " -> " v))))
+
+(deftest describe-carries-no-secret-and-states-what-is-unexercised
+  (let [[p _] (provider-with {})
+        d (stripe/describe p)]
+    (is (= :test (:mode d)) "test mode is the default, deliberately")
+    (is (true? (:write-paths-unexercised d))
+        "the write bodies were not verifiable through the available tooling and
+         this must not be presented as if they were")
+    (is (= #{:intake} (:unrepresentable d)))
+    (is (not-any? #(re-find #"(?i)sk_|secret|bearer" (str %)) (vals d)))))
+
+;; ---------------------------------------------------------------------------
+;; form encoding -- the one wire detail that is easy to get subtly wrong
+;; ---------------------------------------------------------------------------
+
+(deftest nested-maps-encode-as-stripe-expects
+  (is (= "a=1" (stripe/form-encode {:a 1})))
+  (is (= "billing%5Baddress%5D%5Bcity%5D=Tokyo"
+         (stripe/form-encode {:billing {:address {:city "Tokyo"}}})))
+  (testing "a sequence is indexed"
+    (is (= "l%5B0%5D=x&l%5B1%5D=y" (stripe/form-encode {:l ["x" "y"]}))))
+  (testing "nils are dropped rather than sent as empty strings"
+    (is (= "a=1" (stripe/form-encode {:a 1 :b nil}))))
+  (testing "values are escaped, and a space is + not %20 -- Stripe takes
+            application/x-www-form-urlencoded, where + IS the space encoding.
+            %20 is path encoding, and asserting it here was my mistake, not the
+            encoder's."
+    (is (= "name=a+b" (stripe/form-encode {:name "a b"})))
+    (is (= "e=a%40b.com" (stripe/form-encode {:e "a@b.com"})))))
+
+(deftest a-provider-with-no-key-refuses-rather-than-sending-an-unauthenticated-call
+  (let [t (stripe/http-transport "DEFINITELY_NOT_SET_STRIPE_KEY_12345")
+        res (t :get "/v1/issuing/cards" nil nil)]
+    (is (= 0 (:status res)))
+    (is (re-find #"未設定" (:error res)))))
+
+;; ---------------------------------------------------------------------------
+;; mode is a constraint, not a note
+;; ---------------------------------------------------------------------------
+
+(deftest a-key-declares-its-own-mode
+  (testing "Stripe's own prefixes, not a convention invented here -- which is what
+            makes this checkable instead of a matter of trust"
+    (is (= :test (stripe/key-mode "sk_test_abc")))
+    (is (= :live (stripe/key-mode "sk_live_abc")))
+    (is (= :test (stripe/key-mode "rk_test_abc")) "restricted keys split the same way")
+    (is (= :live (stripe/key-mode "rk_live_abc")))
+    (is (nil? (stripe/key-mode "pk_test_abc")) "a publishable key is not a secret key")
+    (is (nil? (stripe/key-mode "")) )
+    (is (nil? (stripe/key-mode nil)))))
+
+(deftest a-test-provider-refuses-a-live-key
+  (testing "the dangerous direction: it would issue REAL cards while every log line
+            said test"
+    (let [r (stripe/mode-mismatch :test "sk_live_abc")]
+      (is (some? r))
+      (is (= 0 (:status r)))
+      (is (re-find #"live" (:error r))))))
+
+(deftest a-live-provider-refuses-a-test-key
+  (testing "the quiet direction, and still wrong: nothing real happens while a
+            deployment believes it is issuing"
+    (is (some? (stripe/mode-mismatch :live "sk_test_abc")))))
+
+(deftest an-unrecognised-key-is-refused-rather-than-attempted
+  (testing "a truncated or pasted-wrong key must not reach Stripe to find out"
+    (is (some? (stripe/mode-mismatch :test "sk_abc")))
+    (is (some? (stripe/mode-mismatch :test "")))
+    (is (some? (stripe/mode-mismatch :test nil)))))
+
+(deftest a-matching-key-is-not-refused
+  (is (nil? (stripe/mode-mismatch :test "sk_test_abc")))
+  (is (nil? (stripe/mode-mismatch :live "sk_live_abc"))))
+
+(deftest the-mismatch-is-caught-before-anything-is-sent
+  (testing "through the transport itself: HOME is set and is not a Stripe key, so the
+            mode check refuses it and no HTTP request is attempted"
+    (let [t (stripe/http-transport "HOME" :test)
+          r (t :post "/v1/issuing/cards" {} "idem-1")]
+      (is (= 0 (:status r)))
+      (is (re-find #"prefix" (:error r))
+          "an unrecognised key is named as such rather than sent to Stripe to find out"))))

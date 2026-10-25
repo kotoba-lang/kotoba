@@ -1,0 +1,169 @@
+(ns data-integrity.eddsa-rdfc-test
+  "Pinned to W3C's own `eddsa-rdfc-2022` test vector — [vc-di-eddsa Appendix
+   B.1](https://www.w3.org/TR/vc-di-eddsa/#representation-eddsa-rdfc-2022) —
+   committed under `test/fixtures/` so the suite needs no network.
+
+   This is the strongest validation in the whole `-rdfc-` stack, because the vector
+   pins every intermediate value: the canonical document, its SHA-256, the canonical
+   proof configuration, its SHA-256, the concatenated `hashData`, the raw signature
+   bytes and the multibase `proofValue`. Reproducing the final `proofValue` alone
+   would be weaker — a single number that happened to match could hide two errors
+   that cancelled. Checking each stage says *where* a divergence is.
+
+   It has already earned that: the vector caught a real bug in property-scoped
+   context handling, and a test of mine in `org-w3-json-ld-api` that had asserted a
+   wrong IRI and passed on it for want of a reference."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.json :as json]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [data-integrity.bytes :as b]
+            [data-integrity.eddsa-rdfc :as rdfc]
+            [multiformats.core :as mf]))
+
+(defn- multibase->raw
+  "Multibase base58-btc + a 2-byte multicodec prefix -> the raw key bytes. The same
+   decoding `core_test` uses for the jcs vector; ed25519-priv is 0x80 0x26 and
+   ed25519-pub is 0xed 0x01."
+  [s expected-prefix]
+  (let [bs (b/->ints (mf/base58btc-decode (subs s 1)))]
+    (assert (= expected-prefix (subvec bs 0 2))
+            (str "unexpected multicodec prefix: " (subvec bs 0 2)))
+    (b/ints->bytes (subvec bs 2))))
+
+(def ^:private test-vector
+  (delay (json/read-str (slurp (io/resource "fixtures/vc-di-eddsa-b1-vector.json")))))
+
+(def ^:private contexts
+  (delay {"https://www.w3.org/ns/credentials/v2"
+          (json/read-str (slurp (io/resource "fixtures/credentials-v2.jsonld")))
+          "https://www.w3.org/ns/credentials/examples/v2"
+          (json/read-str (slurp (io/resource "fixtures/credentials-examples-v2.jsonld")))}))
+
+(defn- opts [] {:contexts @contexts})
+
+(defn- hex [bs]
+  (apply str (map #(let [i (bit-and % 0xff)]
+                     (str (when (< i 16) "0") (Integer/toHexString i)))
+                  (seq bs))))
+
+;; ── every intermediate value, against W3C's ──────────────────────────────────
+
+(deftest the-canonical-document-matches-w3c-byte-for-byte
+  (let [v @test-vector
+        mine (kbytes/utf8-string (rdfc/transform (get v "unsecured") (get v "proof_options") (opts)))]
+    (is (= (str/trim (get v "canonical_doc")) (str/trim mine))
+        "canonical N-Quads of the credential")
+    (testing "and so does its SHA-256, which is half of what gets signed"
+      (is (= (get v "doc_hash") (hex (mf/sha256 (kbytes/utf8-bytes mine))))))))
+
+(deftest the-canonical-proof-configuration-matches-w3c-byte-for-byte
+  (let [v @test-vector
+        mine (kbytes/utf8-string (rdfc/proof-configuration (get v "proof_options") (opts)))]
+    (is (= (str/trim (get v "canonical_proof")) (str/trim mine)))
+    (testing "the proof is a blank node, because a proof has no id — RDFC-1.0 names
+              it _:c14n0, and that label is part of what gets hashed"
+      (is (str/starts-with? (str/trim mine) "_:c14n0 ")))
+    (testing "and its SHA-256 is the other half"
+      (is (= (get v "proof_hash") (hex (mf/sha256 (kbytes/utf8-bytes mine))))))))
+
+(deftest hash-data-puts-the-proof-configuration-first
+  (testing "getting this backwards fails identically to a wrong key, so it is pinned
+            to W3C's concatenation rather than reasoned about"
+    (let [v @test-vector
+          td (rdfc/transform (get v "unsecured") (get v "proof_options") (opts))
+          pc (rdfc/proof-configuration (get v "proof_options") (opts))
+          h (rdfc/hash-data td pc)]
+      (is (= 64 (b/byte-count h)) "two SHA-256 digests")
+      (is (= (get v "hash_data") (hex h)))
+      (testing "which is proof-config-hash followed by document-hash, in that order"
+        (is (= (str (get v "proof_hash") (get v "doc_hash")) (hex h))))
+      (testing "and the reverse order is NOT it — the assertion above would pass a
+                symmetric function, so the asymmetry is checked directly"
+        (is (not= (str (get v "doc_hash") (get v "proof_hash")) (hex h)))))))
+
+(deftest the-signature-and-proof-value-match-w3c
+  (testing "the end of the chain: signing W3C's hashData with W3C's key must
+            reproduce W3C's proofValue exactly"
+    (let [v @test-vector
+          ;; both keys are from the same appendix as the vector
+          seed (multibase->raw "z3u2en7t5LR2WtQH5PfFqMqwVHBeXouLzo6haApm8XHqvjxq"
+                               [0x80 0x26])
+          pub (multibase->raw "z6MkrJVnaZkeFzdQyMZu1cgjg7k1pZZ6pvBQ7XJPt4swbTQ2"
+                              [0xed 0x01])
+          td (rdfc/transform (get v "unsecured") (get v "proof_options") (opts))
+          pc (rdfc/proof-configuration (get v "proof_options") (opts))
+          h (rdfc/hash-data td pc)
+          sig ((:sign rdfc/suite) seed h)]
+      (is (= 64 (b/byte-count sig)) "Ed25519 signature is 64 bytes")
+      (is (= (get v "signature_hex") (hex sig))
+          "raw signature bytes")
+      (is (= (get v "proof_value") ((:encode-proof-value rdfc/suite) sig))
+          "multibase base58-btc proofValue")
+      (testing "and it verifies against the public key from the same vector"
+        (is (true? ((:verify rdfc/suite) pub h sig))))
+      (testing "and hashData's ORDER matters cryptographically, not merely in a hex
+                comparison: the same two digests concatenated the other way round
+                produce a hash this signature does not verify. Returns false rather
+                than throwing, so `invalid` cannot be confused with `malformed`."
+        (let [reversed (b/concat-bytes (mf/sha256 td) (mf/sha256 pc))]
+          (is (not= (hex reversed) (hex h)) "the two orders really do differ")
+          (is (false? ((:verify rdfc/suite) pub reversed sig))))))))
+
+;; ── what distinguishes this suite from eddsa-jcs-2022 ────────────────────────
+
+(deftest rdfc-signs-the-graph-so-reserialization-survives
+  (testing "the whole reason to pay for canonicalization: any JSON-LD that expands
+            to the same dataset hashes the same, so a credential survives being
+            reordered or re-serialized in transit"
+    (let [v @test-vector
+          doc (get v "unsecured")
+          reordered (into (sorted-map-by #(compare %2 %1)) doc)
+          h1 (rdfc/transform doc (get v "proof_options") (opts))
+          h2 (rdfc/transform reordered (get v "proof_options") (opts))]
+      (is (= (hex (mf/sha256 h1)) (hex (mf/sha256 h2))))
+      (testing "while a changed VALUE still changes the hash"
+        (let [changed (assoc-in doc ["credentialSubject" "alumniOf"] "Another School")]
+          (is (not= (hex (mf/sha256 h1))
+                    (hex (mf/sha256 (rdfc/transform changed (get v "proof_options")
+                                                    (opts)))))))))))
+
+;; ── the refusals, which jcs does not have ────────────────────────────────────
+
+(deftest a-missing-context-is-refused-rather-than-fetched
+  (testing "an issuer and a verifier who pin different bytes for the same context
+            URL disagree about the graph, and the signature fails with no
+            indication why. So the contexts are an explicit input, and a missing
+            one is an error rather than a network call."
+    (let [v @test-vector
+          e (try (rdfc/transform (get v "unsecured") (get v "proof_options") {})
+                 (catch kerror/ExceptionInfo ex ex))]
+      (is (= "context-not-provided" (:json-ld/error (ex-data e)))))))
+
+(deftest a-wrong-cryptosuite-or-type-is-refused
+  (let [v @test-vector
+        po (get v "proof_options")]
+    (is (= :data-integrity/bad-cryptosuite
+           (:data-integrity/error
+            (ex-data (try (rdfc/transform (get v "unsecured")
+                                          (assoc po "cryptosuite" "eddsa-jcs-2022")
+                                          (opts))
+                          (catch kerror/ExceptionInfo e e))))))
+    (is (= :data-integrity/bad-proof-type
+           (:data-integrity/error
+            (ex-data (try (rdfc/proof-configuration (assoc po "type" "Ed25519Signature2020")
+                                                    (opts))
+                          (catch kerror/ExceptionInfo e e))))))
+    (testing "and a malformed `created` is refused, since it lands in the signed graph"
+      (is (= :data-integrity/bad-created
+             (:data-integrity/error
+              (ex-data (try (rdfc/proof-configuration (assoc po "created" "yesterday")
+                                                      (opts))
+                            (catch kerror/ExceptionInfo e e)))))))))
+
+(deftest the-suite-value-declares-that-it-needs-contexts
+  (testing "so a caller wiring suites generically can tell that this one takes an
+            extra input, instead of discovering it as a runtime failure"
+    (is (true? (:needs-contexts? rdfc/suite)))
+    (is (= "eddsa-rdfc-2022" (:cryptosuite rdfc/suite)))
+    (is (= "DataIntegrityProof" (:type rdfc/suite)))))

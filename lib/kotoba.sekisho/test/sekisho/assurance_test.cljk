@@ -1,0 +1,223 @@
+(ns sekisho.assurance-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [sekisho.assurance :as a]))
+
+(def now 1785000000)                                    ; epoch 秒
+(def day (* 24 60 60))
+
+(defn- ago [days] (- now (* days day)))
+
+(defn- at [kind days & opts]
+  (apply a/evidence kind (ago days) opts))
+
+(defn- tier-of [& evidences]
+  (:sekisho.assurance/tier (a/assess {:evidences evidences :now now})))
+
+(def email (at :evidence/email-controlled 100))
+(def passkey (at :evidence/passkey-enrolled 100))
+(def hardware (at :evidence/passkey-hardware 100))
+(def humanity (at :evidence/humanity-verified 10))
+(def document (at :evidence/document-verified 100))
+(def liveness (at :evidence/liveness-checked 10))
+(def face-match (at :evidence/document-matches-face 10))
+
+;; ---------------------------------------------------------------------------
+;; 段階
+;; ---------------------------------------------------------------------------
+
+(deftest tiers-climb-in-order
+  (is (= :anonymous (tier-of)))
+  (is (= :contactable (tier-of email)))
+  (is (= :rooted (tier-of email passkey)))
+  (is (= :attested (tier-of email passkey hardware)))
+  (is (= :identified (tier-of email passkey hardware document liveness face-match))))
+
+(deftest a-tier-cannot-be-skipped
+  (testing "身分証と顔だけあってパスキーが無い口座は :contactable 止まり"
+    (is (= :contactable (tier-of email document liveness face-match))))
+  (testing "連絡先すら無ければ何を持っていても :anonymous"
+    (is (= :anonymous (tier-of passkey hardware document liveness face-match))))
+  (testing "飛び級を許すと、鍵を持たない口座が身分証だけで支払い上限を得る"
+    (is (zero? (get-in (a/assess {:evidences [email document liveness face-match]
+                                  :now now})
+                       [:sekisho.assurance/entitlements
+                        :sekisho.entitlement/payment-ceiling])))))
+
+(deftest either-contact-channel-reaches-contactable
+  (is (= :contactable (tier-of (at :evidence/phone-controlled 5))))
+  (is (= :contactable (tier-of email))))
+
+(deftest a-document-substitutes-for-hardware-at-attested
+  (is (= :attested (tier-of email passkey document)))
+  (is (= :attested (tier-of email passkey hardware)))
+  (is (= :attested (tier-of email passkey humanity))
+      "allowlisted Human Passport evidence is Sybil resistance, not identity"))
+
+(deftest humanity-evidence-neither-skips-lower-tiers-nor-identifies-a-person
+  (is (= :anonymous (tier-of humanity)))
+  (is (= :contactable (tier-of email humanity)))
+  (let [r (a/assess {:evidences [email passkey humanity] :now now})]
+    (is (= :attested (:sekisho.assurance/tier r)))
+    (is (= :identified (:sekisho.assurance/next-tier r)))
+    (is (= #{:evidence/document-verified
+             :evidence/liveness-checked
+             :evidence/document-matches-face}
+           (set (:sekisho.assurance/needs-all
+                 (:sekisho.assurance/shortfall r)))))))
+
+;; ---------------------------------------------------------------------------
+;; 期限
+;; ---------------------------------------------------------------------------
+
+(deftest liveness-goes-stale-and-says-so
+  (let [stale (at :evidence/liveness-checked 200)
+        r (a/assess {:evidences [email passkey hardware document stale face-match]
+                     :now now})]
+    (is (= :attested (:sekisho.assurance/tier r))
+        "180 日を過ぎた liveness は段階に効かない")
+    (is (= [:evidence/liveness-checked]
+           (map :sekisho.assurance/evidence (:sekisho.assurance/expired r)))
+        "『やっていない』ではなく『切れた』として報告する —— UI が『本人確認を』と『更新を』を出し分けられるように")
+    (is (not (contains? (:sekisho.assurance/held r) :evidence/liveness-checked)))))
+
+(deftest human-passport-evidence-expires-after-90-days
+  (let [stale (at :evidence/humanity-verified 91)
+        r (a/assess {:evidences [email passkey stale] :now now})]
+    (is (= :rooted (:sekisho.assurance/tier r)))
+    (is (= [:evidence/humanity-verified]
+           (map :sekisho.assurance/evidence (:sekisho.assurance/expired r))))))
+
+(deftest evidence-without-an-expiry-never-goes-stale
+  (is (= :rooted (tier-of (at :evidence/email-controlled 5000)
+                          (at :evidence/passkey-enrolled 5000)))))
+
+(deftest evidence-without-a-timestamp-is-ignored-not-trusted
+  (let [r (a/assess {:evidences [email (a/evidence :evidence/passkey-enrolled nil)]
+                     :now now})]
+    (is (= :contactable (:sekisho.assurance/tier r)))
+    (is (= [:sekisho.assurance/no-timestamp]
+           (map :sekisho.assurance/reason (:sekisho.assurance/ignored r))))))
+
+;; ---------------------------------------------------------------------------
+;; 自己申告 / 未知
+;; ---------------------------------------------------------------------------
+
+(deftest self-declared-evidence-is-recorded-but-does-not-lift-the-tier
+  (let [r (a/assess {:evidences [email (at :evidence/passkey-enrolled 1
+                                           :strength :self-declared)]
+                     :now now})]
+    (is (= :contactable (:sekisho.assurance/tier r)))
+    (is (= 1 (count (:sekisho.assurance/self-declared r))))
+    (is (not (contains? (:sekisho.assurance/held r) :evidence/passkey-enrolled)))))
+
+(deftest unknown-evidence-kinds-are-reported-not-silently-dropped
+  (let [r (a/assess {:evidences [email (at :evidence/vibes-good 1)] :now now})]
+    (is (= :contactable (:sekisho.assurance/tier r)))
+    (is (= [:sekisho.assurance/unknown-kind]
+           (map :sekisho.assurance/reason (:sekisho.assurance/ignored r))))))
+
+;; ---------------------------------------------------------------------------
+;; 足りていないものを名指しする
+;; ---------------------------------------------------------------------------
+
+(deftest shortfall-names-what-is-missing-for-the-next-step
+  (let [r (a/assess {:evidences [email] :now now})]
+    (is (= :rooted (:sekisho.assurance/next-tier r)))
+    (is (= {:sekisho.assurance/needs-all [:evidence/passkey-enrolled]}
+           (:sekisho.assurance/shortfall r))))
+  (let [r (a/assess {:evidences [email passkey] :now now})]
+    (is (= :attested (:sekisho.assurance/next-tier r)))
+    (is (= {:sekisho.assurance/needs-one-of
+            [[:evidence/document-verified
+              :evidence/humanity-verified
+              :evidence/passkey-hardware]]}
+           (:sekisho.assurance/shortfall r)))))
+
+(deftest the-top-tier-has-no-next-step
+  (let [r (a/assess {:evidences [email passkey hardware document liveness face-match]
+                     :now now})]
+    (is (nil? (:sekisho.assurance/next-tier r)))
+    (is (nil? (:sekisho.assurance/shortfall r)))))
+
+;; ---------------------------------------------------------------------------
+;; 解放されるもの
+;; ---------------------------------------------------------------------------
+
+(deftest entitlements-widen-with-the-tier
+  (let [caps (map #(a/persona-cap (a/assess {:evidences % :now now}))
+                  [[] [email] [email passkey] [email passkey hardware]
+                   [email passkey hardware document liveness face-match]])]
+    (is (= [0 1 5 25 100] caps))
+    (is (apply < caps) "単調に増える")))
+
+(deftest refusals-say-what-would-fix-them
+  (let [r (a/assess {:evidences [email] :now now})
+        [issue] (a/refusals r :persona/issue)]
+    (is (= :sekisho.assurance/not-permitted-at-tier (:sekisho.assurance/issue issue)))
+    (is (= :rooted (:sekisho.assurance/next-tier issue)))
+    (is (= {:sekisho.assurance/needs-all [:evidence/passkey-enrolled]}
+           (:sekisho.assurance/shortfall issue))
+        "断るときに次の一手を返す —— 『72 点なので不可』では動けない")))
+
+(deftest a-permitted-action-has-no-refusals
+  (is (= [] (a/refusals (a/assess {:evidences [email passkey] :now now})
+                        :persona/issue))))
+
+(deftest the-ceiling-is-an-amount-not-a-permission
+  (let [attested (a/assess {:evidences [email passkey hardware] :now now})]
+    (testing "上限内でも approve 自体が段階に無ければ断る"
+      (is (= [:sekisho.assurance/not-permitted-at-tier]
+             (map :sekisho.assurance/issue
+                  (a/refusals attested :authority/approve :amount 10000)))))
+    (testing "propose は通り、額の判定は別に出る"
+      (is (= [] (a/refusals attested :authority/propose :amount 10000)))
+      (is (= [:sekisho.assurance/over-ceiling]
+             (map :sekisho.assurance/issue
+                  (a/refusals attested :authority/propose :amount 60000)))))))
+
+;; ---------------------------------------------------------------------------
+;; 順序と fail closed
+;; ---------------------------------------------------------------------------
+
+(deftest at-least-compares-by-position
+  (is (a/at-least? :identified :rooted))
+  (is (a/at-least? :rooted :rooted))
+  (is (not (a/at-least? :contactable :rooted))))
+
+(deftest an-unknown-floor-is-unsatisfiable
+  (testing "設定の綴り間違いが門を静かに無効化しないこと"
+    (is (not (a/at-least? :identified :Rooted)))
+    (is (not (a/at-least? :identified :roooted)))))
+
+(deftest an-unknown-tier-unlocks-nothing
+  (is (zero? (a/rank :nonsense)))
+  (is (not (a/at-least? :nonsense :contactable))))
+
+;; ---------------------------------------------------------------------------
+;; 方針の上書き
+;; ---------------------------------------------------------------------------
+
+(deftest a-deployment-can-tighten-the-policy
+  (let [strict (assoc-in a/default-policy
+                         [:sekisho.assurance/max-age :evidence/document-verified]
+                         (* 30 day))
+        r (a/assess {:evidences [email passkey (at :evidence/document-verified 100)]
+                     :now now :policy strict})]
+    (is (= :rooted (:sekisho.assurance/tier r))
+        "100 日前の身分証は、30 日で切る配備では :attested に届かない")
+    (is (= 1 (count (:sekisho.assurance/expired r))))))
+
+(deftest policy-for-layers-overrides-onto-the-default
+  (let [p (a/policy-for {:assurance-policy
+                         {:sekisho.assurance/entitlements
+                          {:contactable {:sekisho.entitlement/personas 3
+                                         :sekisho.entitlement/outbound-per-day 20
+                                         :sekisho.entitlement/payment-ceiling 0
+                                         :sekisho.entitlement/may #{:mail/receive}}}}})]
+    (is (= 3 (get-in p [:sekisho.assurance/entitlements :contactable
+                        :sekisho.entitlement/personas])))
+    (is (= 100 (get-in p [:sekisho.assurance/entitlements :identified
+                          :sekisho.entitlement/personas]))
+        "触っていない段階は既定のまま")
+    (is (some? (get-in p [:sekisho.assurance/requirements :rooted]))
+        "触っていない節も残る")))

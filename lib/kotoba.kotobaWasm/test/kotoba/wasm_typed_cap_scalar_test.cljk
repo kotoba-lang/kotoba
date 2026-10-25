@@ -1,0 +1,220 @@
+(ns kotoba.wasm-typed-cap-scalar-test
+  "Three gaps measured 2026-09-24 through `amu compile --target wasm32-browser
+  --jvm-free` (amu a6f1d90e, this repo f5fdbc5):
+
+  1. A generic `typed-cap-call` whose request or result is a scalar
+     (`:i64` `:bool` `:f64` `:f32`) emitted an externref where the body
+     expected a word, or a word where the import expected an externref. The
+     compile answered `:ok true`; `wasm-tools validate` refused the module.
+  2. Nothing between the emitter and the caller asked whether the module
+     validates, so (1) reached disk as a success.
+  3. `bytes-count` / `bytes-at` / `bytes-slice` / `bytes-concat` and
+     `string-index-of`, admitted by kotoba-sema, were refused here as
+     `typed Wasm operation is not qualified`.
+
+  Validation on ClojureScript is the host engine (`WebAssembly.validate`), on
+  the JVM the pinned `wasm-tools`. The execution tests instantiate the module
+  against a stub `kotoba:typed` host written here -- enough to show which
+  values cross each import and in which order; the real host semantics are
+  amu's `runtime/browser-host.mjs`."
+  (:require [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.wasm.core :as wasm]
+            [kotoba.wasm.tools :as wasm-tools]))
+
+(defn- validation-error
+  "nil when `module` validates, otherwise the validator's sentence."
+  [module]
+  #?(:clj
+     (let [file (java.io.File/createTempFile "kotoba-typed-cap-scalar-" ".wasm")]
+       (try
+         (kio/write-bytes file ^bytes module)
+         (try (wasm-tools/run-command! ["wasm-tools" "validate" (str file)]) nil
+              (catch clojure.lang.ExceptionInfo error
+                (or (:output (ex-data error)) (ex-message error))))
+         (finally (.delete file))))
+     :cljs
+     (when-not (js/WebAssembly.validate module)
+       (try (js/WebAssembly.Module. module) "refused without a message"
+            (catch :default error (.-message error))))))
+
+(defn- emitted
+  "The module, or the refusal message when the emitter refuses."
+  [kir]
+  (try (wasm/emit kir :wasm32-browser-kotoba-v1 {:fuel 512})
+       (catch :default error
+         {:refused (ex-message error) :data (ex-data error)})))
+
+(defn- cap-module [request-type result-type param-type]
+  {:format :kotoba.kir/v4
+   :exports ['call]
+   :schemas {}
+   :effects #{[:cap/call 15]}
+   :functions [{:name 'call :params ['request] :param-types [param-type]
+                :result result-type
+                :body (list 'typed-cap-call 15 request-type result-type 'request)}]})
+
+(def ^:private scalar-contracts
+  ;; [request result param] -- every direction a scalar crosses the generic
+  ;; import, and the i64/i64 word ABI as the control that never took it.
+  [[:string :i64 :string]
+   [:string :bool :string]
+   [:string :f64 :string]
+   [:string :f32 :string]
+   [:i64 :bool :i64]
+   [:i64 :string :i64]
+   [:bool :i64 :bool]
+   [:f64 :string :f64]
+   [:i64 :i64 :i64]])
+
+(deftest scalar-typed-cap-call-modules-validate
+  (doseq [[request result param] scalar-contracts]
+    (testing (pr-str [:request request :result result])
+      (let [module (emitted (cap-module request result param))]
+        (is (not (map? module)) (str "emit refused: " (:refused module)))
+        (when-not (map? module)
+          (is (nil? (validation-error module))))))))
+
+(deftest untyped-kir-refuses-a-non-word-typed-cap-call-by-name
+  ;; Every value of a v3 module is an i64 word; the generic import takes an
+  ;; externref. The emitter used to write the call anyway.
+  (let [kir {:format :kotoba.kir/v3
+             :exports ['call]
+             :effects #{[:cap/call 15]}
+             :functions [{:name 'call :params ['request] :result :i64
+                          :body '(typed-cap-call 15 :string :i64 request)}]}
+        result (emitted kir)]
+    (is (map? result))
+    (is (= "untyped KIR cannot lower a non-word typed capability call"
+           (:refused result)))))
+
+(defn- bytes-module [body param-types result]
+  {:format :kotoba.kir/v4
+   :exports ['call]
+   :schemas {}
+   :effects #{}
+   :functions [{:name 'call :params (vec (take (count param-types) '[a b c d]))
+                :param-types param-types :result result :body body}]})
+
+(def ^:private bytes-cases
+  [["bytes-count" '(bytes-count a) [:bytes] :i64]
+   ["bytes-at" '(bytes-at a b) [:bytes :i64] :i64]
+   ["bytes-slice" '(bytes-slice a b c) [:bytes :i64 :i64] :bytes]
+   ["bytes-concat" '(bytes-concat a b) [:bytes :bytes] :bytes]
+   ["string-index-of" '(string-index-of a b) [:string :string] :i64]
+   ;; 2026-09-25 (superproject adr-2609242330): the bytes constructor, its
+   ;; inverse and the string constructor -- each one host intrinsic.
+   ["bytes-from-vector-i64" '(bytes-from-vector-i64 a) [:vector-i64] :bytes]
+   ["vector-i64-from-bytes" '(vector-i64-from-bytes a) [:bytes] :vector-i64]
+   ["string-from-utf8" '(string-from-utf8 a) [:bytes] :string]])
+
+(defn- import-names [module]
+  #?(:clj (let [text (String. ^bytes module "ISO-8859-1")]
+            (set (filter #(.contains text (str "kotoba:typed" (char (count %)) %))
+                         (map first bytes-cases))))
+     :cljs (set (map #(.-name %) (js/WebAssembly.Module.imports
+                                  (js/WebAssembly.Module. module))))))
+
+(deftest bytes-and-string-index-operations-lower-and-validate
+  (doseq [[import body param-types result] bytes-cases]
+    (testing import
+      (let [module (emitted (bytes-module body param-types result))]
+        (is (not (map? module)) (str "emit refused: " (:refused module)))
+        (when-not (map? module)
+          (is (nil? (validation-error module)))
+          (is (contains? (import-names module) import)
+              "the operation's intrinsic is imported")
+          (is (= #{import}
+                 (into #{} (filter (set (map first bytes-cases)))
+                       (import-names module)))
+              "and no other operation's intrinsic is"))))))
+
+#?(:cljs
+   (do
+     (defn- stub-host
+       "A `kotoba:typed` host sufficient for the sequences under test. Builders
+       are JS arrays; `seal` of an option answers [true, payload]."
+       [bytes provider calls]
+       (let [module (js/WebAssembly.Module. bytes)
+             imports (js-obj)]
+         (doseq [entry (js/WebAssembly.Module.imports module)]
+           (let [module-name (.-module entry)
+                 field (.-name entry)
+                 table (or (aget imports module-name)
+                           (let [t (js-obj)] (aset imports module-name t) t))
+                 record! (fn [& args] (.push calls (clj->js (into [field] args))))]
+             (aset table field
+                   (case field
+                     "new" (fn [_ tag] #js [tag])
+                     ("push-i64" "push-f64" "push-f32" "push-ref")
+                     (fn [builder item] (.concat builder #js [item]))
+                     "seal" (fn [_ builder] builder)
+                     "assert-ref" (fn [_ value] value)
+                     ("get-i64" "get-f64" "get-f32" "get-ref")
+                     (fn [_ value index] (aget value (inc index)))
+                     "bool" (fn [value] (not= 0 value))
+                     "bool-value" (fn [value] (if value 1 0))
+                     "cap-call" (fn [id request] (record! id request) (provider request))
+                     "bytes-slice" (fn [d value start end]
+                                     (record! d start end)
+                                     (.slice value (js/Number start) (js/Number end)))
+                     "string-index-of" (fn [d haystack needle]
+                                         (record! d haystack needle)
+                                         (js/BigInt (.indexOf haystack needle)))
+                     (fn [& _] (throw (js/Error. (str "stub has no " field))))))))
+         (js/WebAssembly.Instance. module imports)))
+
+     (deftest a-scalar-cap-result-arrives-as-the-word-the-host-returned
+       (let [big (js/BigInt "-9007199254740993")
+             calls #js []
+             i64-call (-> (stub-host (emitted (cap-module :string :i64 :string))
+                                     (fn [_] big) calls)
+                          .-exports .-call)
+             bool-call (-> (stub-host (emitted (cap-module :string :bool :string))
+                                      (fn [request] (= request "yes")) calls)
+                           .-exports .-call)
+             request-call (-> (stub-host (emitted (cap-module :i64 :string :i64))
+                                         (fn [request] (str "got " request)) calls)
+                              .-exports .-call)]
+         (is (= big (i64-call "x")) "an i64 past 2^53 survives the crossing")
+         (is (true? (bool-call "yes")))
+         (is (false? (bool-call "no")))
+         (is (= "got 42" (request-call (js/BigInt 42)))
+             "an i64 request reaches the provider as the host's i64")))
+
+     (deftest bytes-slice-and-string-index-of-pass-operands-in-order
+       (let [calls #js []
+             slice (-> (stub-host (emitted (bytes-module '(bytes-slice a b c)
+                                                         [:bytes :i64 :i64] :bytes))
+                                  nil calls)
+                       .-exports .-call)
+             index-of (-> (stub-host (emitted (bytes-module '(string-index-of a b)
+                                                            [:string :string] :i64))
+                                     nil calls)
+                          .-exports .-call)]
+         (is (= [11 12] (vec (slice (js/Uint8Array.of 10 11 12 13)
+                                    (js/BigInt 1) (js/BigInt 3)))))
+         (is (= (js/BigInt 2) (index-of "a/b/" "b")))
+         (is (= ["bytes-slice" "string-index-of"]
+                (mapv first (js->clj calls))))))
+
+     ;; The self-check. A v3 self-call with the wrong arity is lowered as an
+     ;; ordinary call and cannot validate (wasm_test.cljk
+     ;; `malformed-loop-helper-arity-is-not-structured` pins that on the JVM
+     ;; through wasm-tools). Here the emitter itself must refuse it, with the
+     ;; engine's reason attached, instead of returning the bytes.
+     (deftest an-emitted-module-that-does-not-validate-is-refused
+       (let [kir {:format :kotoba.kir/v3
+                  :exports ['__kotoba_loop_10]
+                  :effects #{}
+                  :functions
+                  [{:name '__kotoba_loop_10 :params ['remaining 'total]
+                    :result :i64 :effects #{}
+                    :body '(if (= remaining 0)
+                             total
+                             (__kotoba_loop_10 (- remaining 1)))}]}
+             result (emitted kir)]
+         (is (map? result) "the emitter must not answer with the module")
+         (is (= "emitted Wasm module does not validate" (:refused result)))
+         (is (= :wasm-self-validation (get-in result [:data :phase])))
+         (is (seq (get-in result [:data :engine-message]))
+             "the engine's reason travels with the refusal")))))

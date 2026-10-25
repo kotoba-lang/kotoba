@@ -1,0 +1,83 @@
+(ns kotoba.annex.kotobase-test
+  "kotobase.net store client のテスト。実 kotobase.net は叩かず、
+   `net.kotobase.store.{put,get}` の JSON 契約を mock fetch で模す。
+   identity は注入して実鍵を作らない（テストが .kotoba-annex を汚さない）。"
+  (:require [kotoba.test :refer [deftest is testing async]]
+            [ed25519.core :as ed]
+            [kotoba.annex.kotobase :as kb]))
+
+;; テスト用の固定 seed（本番鍵ではない。テスト専用の使い捨て）
+(def test-seed (ed/unhex (apply str (repeat 64 "a"))))
+(def test-identity {:seed test-seed :did (ed/did-key-from-seed test-seed)})
+
+(defn mock-fetch
+  "net.kotobase.store.{put,get} の JSON 契約を模す in-memory サーバ。"
+  [backing]
+  (fn [u & [opts]]
+    (let [o (or opts #js {})
+          body (js->clj (js/JSON.parse (.-body o)) :keywordize-keys true)
+          k (:key body)]
+      (js/Promise.resolve
+       (cond
+         (re-find #"store\.put" u)
+         (do (swap! backing assoc k (:val body)) #js {:ok true})
+         (re-find #"store\.get" u)
+         ;; ⚠ 実 kotobase は **キー不在でも HTTP 200** を返し body が {:ok false}。
+         ;; mock もその実挙動を模す（HTTP status だけ見る実装を回帰で殺すため）。
+         (if (contains? @backing k)
+           #js {:ok true :json (fn [] (js/Promise.resolve
+                                       (clj->js {:ok true :val (get @backing k)})))}
+           #js {:ok true :json (fn [] (js/Promise.resolve
+                                       (clj->js {:ok false :error "NotFound"})))})
+         :else #js {:ok false})))))
+
+(deftest kotobase-store-roundtrip
+  (testing "store→present?→retrieve が net.kotobase.store 契約で回る"
+    (async done
+      (let [backing (atom {})
+            s (kb/kotobase-store {:endpoint "https://kotobase.net"
+                                  :identity test-identity
+                                  :fetch (mock-fetch backing)})
+            key "SHA256E-s3--abc"
+            bytes (js/Buffer.from #js [1 2 3])]
+        (-> ((:store! s) key bytes)
+            (.then (fn [ok] (is ok "store! ok")))
+            (.then (fn [_] ((:present? s) key)))
+            (.then (fn [p] (is (= :yes p) "present after store")))
+            (.then (fn [_] ((:retrieve s) key)))
+            (.then (fn [b] (is (= (vec (js/Array.from b)) (vec (js/Array.from bytes)))
+                               "retrieved bytes match")))
+            (.then (fn [_] ((:present? s) "no-such-key")))
+            (.then (fn [p] (is (= :no p) "absent key") (done))))))))
+
+(deftest max-value-guard
+  (testing "istore の max-value-bytes を超える値は投げる（git-annex chunk を促す）"
+    (let [s (kb/kotobase-store {:identity test-identity :fetch (fn [& _])})]
+      (is (thrown? js/Error
+                   ((:store! s) "K" (js/Buffer.alloc (inc kb/max-value-bytes))))))))
+
+(deftest resources-and-aud
+  (testing "CACAO の aud は did:web:kotobase.net（pod が enforce）、resources は graph scope"
+    (is (= "did:web:kotobase.net" kb/kotobase-aud))
+    (let [r (kb/kotobase-resources "did:key:zTest")]
+      (is (some #(= "kotoba://op/datom:read" %) r))
+      (is (some #(= "kotoba://op/datom:transact" %) r))
+      (is (some #(= "kotoba://graph/did:key:zTest" %) r)))))
+
+(deftest mint-auth-shape
+  (testing "自己 mint した CACAO が Authorization/x-kotoba-did ヘッダを返す"
+    (let [auth (kb/mint-auth {:identity test-identity})]
+      (is (re-find #"^CACAO " (:authorization auth)))
+      (is (= (:did test-identity) (:x-kotoba-did auth)) "iss = 自分の did:key")
+      (is (= (:did test-identity) (:graph auth)) "graph 既定 = 自分の did（自己所有）"))))
+
+(deftest absent-key-returns-http200-with-error-body
+  (testing "**回帰テスト**: 実 kotobase は不在キーでも HTTP 200 + {:ok false} を返す。
+            HTTP status だけで判定すると present? が誤って :yes を返し、git-annex が
+            STORE を丸ごとスキップして『保存したのに空』になる（2026-07-17 実測の不具合）"
+    (async done
+      (let [s (kb/kotobase-store {:identity test-identity :fetch (mock-fetch (atom {}))})]
+        (-> ((:present? s) "absent-key")
+            (.then (fn [p] (is (= :no p) "HTTP200+{:ok false} を :no と判定すること")))
+            (.then (fn [_] ((:retrieve s) "absent-key")))
+            (.then (fn [b] (is (nil? b) "不在キーの retrieve は nil") (done))))))))

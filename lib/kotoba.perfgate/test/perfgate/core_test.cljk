@@ -1,0 +1,223 @@
+(ns perfgate.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [machine.core :as m]
+            [perfgate.core :as g]))
+
+(def mach
+  {:format m/format-id
+   :machine/id "fixture-a"
+   :machine/provenance :measured
+   :machine/source "test fixture"
+   :cpu {:arch :x86-64 :cores 8
+         :cache [{:level 1 :kind :data :bytes 32768 :line-bytes 64 :ways 8 :shared-by 1}]}
+   :page {:base-bytes 4096 :huge [2097152]}})
+
+(def other-mach (assoc mach :machine/id "fixture-b" :cpu (assoc (:cpu mach) :cores 16)))
+
+(defn- obs [id samples & {:as o}]
+  (g/observation (merge {:id id :plan-id :soa-particle :machine mach
+                         :metric :wall-ns :unit :ns :samples samples
+                         :source "test harness"}
+                        o)))
+
+(def baseline (obs :aos [100 102 98 101 99]))
+(def candidate (obs :soa [80 81 79 80 80]))
+
+;; ── observations ─────────────────────────────────────────────────────────
+
+(deftest an-observation-needs-evidence-of-how-it-was-made
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (obs :x [1 2 3] :source "")))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (obs :x [])))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (obs :x [1 2 3] :metric "wall-ns")))
+  (testing "and a machine descriptor that validates"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (obs :x [1 2 3] :machine {:format :wrong})))))
+
+(deftest summaries-are-computed-not-declared
+  (let [s (:observation/summary baseline)]
+    (is (= 5 (:n s)))
+    (is (= 100.0 (:mean s)))
+    (is (< 1.58 (:stdev s) 1.59))
+    (is (< 0.015 (:relative-stdev s) 0.016))
+    (is (= 100 (:median s)))
+    (is (= 98 (:min s)))
+    (is (= 102 (:max s)))))
+
+(deftest a-single-sample-has-no-spread-and-says-so
+  (let [s (:observation/summary (obs :one [42]))]
+    (is (= 0.0 (:stdev s)))
+    (testing "and the gate refuses it anyway"
+      (is (not (:qualified? (g/qualify (obs :one [42]) baseline)))))))
+
+;; ── the passing case ─────────────────────────────────────────────────────
+
+(deftest a-clean-twenty-percent-win-qualifies
+  (let [v (g/qualify candidate baseline)]
+    (is (:qualified? v))
+    (is (empty? (:reasons v)))
+    (is (< 0.199 (:improvement v) 0.201))
+    (is (:separated? (:separation v)))))
+
+;; ── every refusal ────────────────────────────────────────────────────────
+
+(defn- reasons [v] (set (map :reason (:reasons v))))
+
+(deftest too-few-samples
+  (is (contains? (reasons (g/qualify (obs :short [80 81 79]) baseline))
+                 :insufficient-samples)))
+
+(deftest too-noisy-to-mean-anything
+  (let [noisy (obs :noisy [80 40 120 60 100])]
+    (is (contains? (reasons (g/qualify noisy baseline)) :too-noisy))))
+
+(deftest a-real-looking-ratio-inside-the-noise-is-refused
+  (testing "6% improvement, but the arms overlap within their own spread"
+    (let [b (obs :b [100 90 110 95 105])
+          c (obs :c [94 88 100 90 98])
+          v (g/qualify c b)]
+      (is (< 0.059 (:improvement v) 0.061))
+      (is (not (:qualified? v)))
+      (is (contains? (reasons v) :not-separated-from-noise))
+      (testing "the ratio is still reported — hiding it would be its own dishonesty"
+        (is (some? (:improvement v)))))))
+
+(deftest an-improvement-below-the-threshold
+  (let [c (obs :marginal [99 99 99 99 99])
+        v (g/qualify c baseline)]
+    (is (contains? (reasons v) :improvement-below-threshold))))
+
+(deftest no-baseline-at-all
+  (let [v (g/qualify candidate nil)]
+    (is (contains? (reasons v) :no-baseline))
+    (is (not (:qualified? v))))
+  (testing "unless the policy says a bare measurement is enough"
+    (let [v (g/qualify candidate nil {:policy/require-baseline? false})]
+      (is (:qualified? v)))))
+
+(deftest arms-measured-on-different-machines
+  (testing "the difference between them is not the change you made"
+    (let [c (obs :soa-elsewhere [80 81 79 80 80] :machine other-mach)
+          v (g/qualify c baseline)]
+      (is (contains? (reasons v) :machine-mismatch))
+      (is (not (:qualified? v))))))
+
+(deftest arms-measuring-different-things
+  (let [c (obs :soa-misses [80 81 79 80 80] :metric :cache-misses)
+        v (g/qualify c baseline)]
+    (is (contains? (reasons v) :metric-mismatch))))
+
+(deftest hardware-numbers-nobody-read-off-a-device
+  (testing "portable-64 is the shipped conservative floor, marked :assumed"
+    (let [b (obs :aos-guessed [100 102 98 101 99] :machine m/portable-64)
+          c (obs :soa-guessed [80 81 79 80 80] :machine m/portable-64)
+          v (g/qualify c b)]
+      (is (contains? (reasons v) :provenance-too-weak))
+      (is (not (:qualified? v)))))
+  (testing "and the policy can be relaxed deliberately, which is the point of
+            it being a policy"
+    (let [b (obs :aos-guessed [100 102 98 101 99] :machine m/portable-64)
+          c (obs :soa-guessed [80 81 79 80 80] :machine m/portable-64)
+          v (g/qualify c b {:policy/require-provenance :assumed})]
+      (is (:qualified? v)))))
+
+(deftest higher-is-better-metrics-invert-correctly
+  (let [b (g/observation {:id :b :plan-id :p :machine mach :metric :throughput
+                          :unit :ops-per-s :samples [100 101 99 100 100]
+                          :source "t" :lower-is-better? false})
+        c (g/observation {:id :c :plan-id :p :machine mach :metric :throughput
+                          :unit :ops-per-s :samples [140 141 139 140 140]
+                          :source "t" :lower-is-better? false})]
+    (is (:qualified? (g/qualify c b)))
+    (is (< 0.39 (:improvement (g/qualify c b)) 0.41))
+    (testing "and a regression on the same metric is refused"
+      (is (not (:qualified? (g/qualify b c)))))))
+
+;; ── claims ───────────────────────────────────────────────────────────────
+
+(deftest an-unqualified-result-gets-no-artifact-at-all
+  (testing "a record marked :qualified? false ends up in a slide deck"
+    (let [v (g/qualify (obs :short [80 81 79]) baseline)]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (g/claim v (obs :short [80 81 79]) baseline))))))
+
+(deftest a-claim-round-trips-and-detects-tampering
+  (let [v (g/qualify candidate baseline)
+        c (g/claim v candidate baseline)]
+    (is (= :soa-particle (:claim/plan-id c)))
+    (is (= (g/verify-claim c) c))
+    (testing "editing a sample breaks the fingerprint"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (g/verify-claim (assoc-in c [:claim/candidate :observation/samples]
+                                             [1 1 1 1 1])))))
+    (testing "and so does editing the headline number"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (g/verify-claim (assoc c :claim/improvement 0.9)))))))
+
+(deftest a-claim-knows-which-hardware-it-was-proved-on
+  (let [c (g/claim (g/qualify candidate baseline) candidate baseline)]
+    (is (not (g/stale-on? c mach)))
+    (testing "one more core and the proof no longer covers the machine"
+      (is (g/stale-on? c other-mach)))
+    (testing "this is what retires an optimization, rather than nobody noticing"
+      (let [a (g/applicable [c] other-mach)]
+        (is (empty? (:applicable a)))
+        (is (= [:machine-changed] (mapv :reason (:stale a))))
+        (is (= "fixture-a" (:measured-on (first (:stale a)))))))
+    (let [a (g/applicable [c] mach)]
+      (is (= 1 (count (:applicable a))))
+      (is (empty? (:stale a))))))
+
+;; ── output ───────────────────────────────────────────────────────────────
+
+(deftest explain-leads-with-the-verdict
+  (let [pass (g/explain (g/qualify candidate baseline))
+        fail (g/explain (g/qualify (obs :short [80 81 79]) baseline))]
+    (is (re-find #"^QUALIFIED" (first pass)))
+    (is (re-find #"20% improvement" (first pass)))
+    (is (re-find #"^REFUSED" (first fail)))
+    (is (some #(re-find #"insufficient-samples" %) fail))))
+
+(deftest qualifying-is-deterministic
+  (is (= (g/qualify candidate baseline) (g/qualify candidate baseline)))
+  (is (= (g/claim (g/qualify candidate baseline) candidate baseline)
+         (g/claim (g/qualify candidate baseline) candidate baseline))))
+
+;; ── power, before the experiment ─────────────────────────────────────────
+
+(deftest the-noise-floor-is-the-separation-rule-run-backwards
+  (testing "clean arms: the policy floor binds, not the noise"
+    (is (= 0.05 (g/minimum-detectable-improvement candidate baseline))))
+  (testing "noisy arms: the noise binds instead"
+    (let [b (obs :noisy-b [100 90 110 95 105])
+          c (obs :noisy-c [94 88 100 90 98])
+          floor (g/minimum-detectable-improvement c b)]
+      (is (< 0.12 floor 0.14))
+      (testing "and that is exactly the 6% result the gate refused"
+        (is (not (:qualified? (g/qualify c b))))
+        (is (< 0.06 floor))))))
+
+(deftest an-experiment-can-be-known-unrunnable-before-it-is-run
+  (let [b (obs :pilot-b [100 90 110 95 105])
+        c (obs :pilot-c [94 88 100 90 98])
+        d (g/detectable? c b 0.05)]
+    (is (not (:detectable? d)))
+    (is (pos? (:shortfall d)))
+    (is (re-find #"cannot pass anything under" (:remedy d))))
+  (testing "a large enough effect clears the same noise"
+    (let [b (obs :pilot-b [100 90 110 95 105])
+          c (obs :pilot-c [94 88 100 90 98])]
+      (is (:detectable? (g/detectable? c b 0.5)))
+      (is (nil? (:shortfall (g/detectable? c b 0.5)))))))
+
+(deftest samples-needed-scales-with-the-square-of-the-shortfall
+  (let [b (obs :pilot-b [100 90 110 95 105])
+        c (obs :pilot-c [94 88 100 90 98])
+        s (g/samples-needed c b 0.05)]
+    (is (> (:needed s) 5))
+    (testing "and it says out loud when more sampling is the wrong answer"
+      (is (re-find #"migrating threads" (:note s)))))
+  (testing "an already-detectable effect needs no more"
+    (is (= 5 (:needed (g/samples-needed candidate baseline 0.2))))))

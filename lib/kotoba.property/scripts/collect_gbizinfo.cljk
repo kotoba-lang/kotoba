@@ -1,0 +1,145 @@
+(ns collect-gbizinfo
+  "gBizINFO の法人活動情報を、**この面が既に持っている法人番号**に対して引く。
+
+   One request per company per aspect, so the allowlist is the cost: 8,124
+   numbers × 3 aspects is 24k requests, which is a real pass and needs the
+   operator's own token in `GBIZINFO_TOKEN`.
+
+   `--demo` uses the token the public OpenAPI document publishes for 動作確認
+   and **caps the run at `--max-requests` (default 120)**. That cap is the
+   point: a verification that could silently become a bulk pass on a shared
+   token is not a verification.
+
+   Token acquisition (owner action, ~2 minutes, self-serve):
+     https://content.info.gbiz.go.jp/api/index.html → 利用申請 → メールで token
+
+   Usage:
+     GBIZINFO_TOKEN=... kbb --backend sci -cp src scripts/collect_gbizinfo.cljk \\
+       --numbers /tmp/plane-hb-numbers.txt --aspects subsidy,procurement,finance \\
+       --out <repo>/data/gbizinfo-joined.datoms.edn
+     kbb --backend sci -cp src scripts/collect_gbizinfo.cljk --numbers <f> --demo --out /tmp/sample.edn"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.gbizinfo :as gb]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- read-numbers [f]
+  (->> (str/split-lines (.readFileSync fs f "utf8"))
+       (map str/trim)
+       (remove str/blank?)
+       (remove #(str/starts-with? % "#"))
+       (filter #(re-matches #"[0-9]{13}" %))
+       vec))
+
+(defn- fetch-aspect [token n aspect]
+  (-> (js/fetch (gb/aspect-url n aspect)
+                #js {:headers (clj->js {gb/token-header token})})
+      (.then (fn [res]
+               (if (.-ok res)
+                 (-> (.json res) (.then (fn [j] {:ok true :body (js->clj j)})))
+                 ;; 404 here means "gBizINFO has nothing of this kind for this
+                 ;; company", which is an answer, not a failure. Anything else
+                 ;; is a failure and is counted as one.
+                 {:ok false :status (.-status res)})))
+      (.catch (fn [e] {:ok false :error (str (.-message e))}))))
+
+(defn- records-of [aspect n body]
+  (let [info (first (get body "hojin-infos"))]
+    (when info
+      (case aspect
+        :basic (some-> (gb/basic-record n info) vector)
+        :subsidy (gb/subsidy-records n info)
+        :procurement (gb/procurement-records n info)
+        :finance (some-> (gb/finance-record n info) vector)
+        :patent (gb/patent-records n info)
+        :workplace (some-> (gb/workplace-record n info) vector)
+        :certification (gb/certification-records n info)
+        (throw (ex-info "unknown aspect" {:aspect aspect :known (keys gb/aspects)}))))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        out (arg-value args "--out" nil)
+        numbers-file (arg-value args "--numbers" nil)
+        demo? (flag? args "--demo")
+        max-requests (js/parseInt (arg-value args "--max-requests" (if demo? "120" "0")) 10)
+        aspects (mapv keyword (str/split (arg-value args "--aspects" "basic,subsidy,procurement,finance,patent,workplace,certification") #","))
+        env-token (.. js/process -env -GBIZINFO_TOKEN)
+        token (if demo? gb/demo-token env-token)]
+    (when-not (and out numbers-file)
+      (println "usage: collect_gbizinfo.cljs --numbers <file> --out <out.edn> [--aspects subsidy,procurement,finance] [--demo] [--max-requests N]")
+      (.exit js/process 2))
+    (when (str/blank? (str token))
+      (println (str "GBIZINFO_TOKEN is not set.\n"
+                    "  A real pass needs the operator's own token — it registers the operator's\n"
+                    "  identity with 経済産業省 and cannot be self-served by an agent:\n"
+                    "    https://content.info.gbiz.go.jp/api/index.html → 利用申請 → token by email\n"
+                    "  For a bounded verification without one, pass --demo (capped at --max-requests)."))
+      (.exit js/process 2))
+    (coverage/assert-collectable! gb/source-id)
+    (let [all (read-numbers numbers-file)
+          budget (if (pos? max-requests) (quot max-requests (count aspects)) (count all))
+          numbers (vec (take (max 1 budget) all))
+          observed-at (.toISOString (js/Date.))
+          state (atom {:records [] :requests 0 :empty 0 :failed 0})]
+      (when (< (count numbers) (count all))
+        (println (str "  capped: " (count numbers) " of " (count all) " companies ("
+                      (count aspects) " aspect(s) each, max " max-requests " requests)")))
+      (-> (reduce
+           (fn [p n]
+             (.then p (fn [_]
+                        (reduce (fn [q aspect]
+                                  (.then q (fn [_]
+                                             (-> (fetch-aspect token n aspect)
+                                                 (.then (fn [{:keys [ok body status]}]
+                                                          (swap! state update :requests inc)
+                                                          (if ok
+                                                            (let [recs (records-of aspect n body)]
+                                                              (if (seq recs)
+                                                                (swap! state update :records into recs)
+                                                                (swap! state update :empty inc)))
+                                                            (if (= 404 status)
+                                                              (swap! state update :empty inc)
+                                                              (swap! state update :failed inc)))))))))
+                                (js/Promise.resolve nil)
+                                aspects))))
+           (js/Promise.resolve nil)
+           numbers)
+          (.then
+           (fn [_]
+             (let [{:keys [records requests empty failed]} @state
+                   manifest (gb/corpus-manifest {:observed-at observed-at
+                                                 :aspects aspects
+                                                 :numbers (count numbers)
+                                                 :record-count (count records)
+                                                 :token-kind (if demo? :published-demo :operator)})]
+               (.mkdirSync fs (.dirname path out) #js {:recursive true})
+               (.writeFileSync fs out
+                               (str (pr-str manifest) "\n"
+                                    (str/join "\n" (map pr-str records))
+                                    (when (seq records) "\n"))
+                               "utf8")
+               (println (pr-str {:out out
+                                 :companies (count numbers)
+                                 :aspects aspects
+                                 :requests requests
+                                 :records (count records)
+                                 :nothing-recorded empty
+                                 :failed failed
+                                 :token (if demo? :published-demo :operator)
+                                 :bytes (.-size (.statSync fs out))}))
+               ;; A run where every request failed writes the same well-formed
+               ;; empty file as a run where every company simply has nothing.
+               (when (and (pos? requests) (= failed requests))
+                 (js/console.error "collect-gbizinfo: every request failed — this file is empty because nothing was read, not because nothing was found")
+                 (.exit js/process 2)))))
+          (.catch (fn [e]
+                    (js/console.error (str "collect-gbizinfo failed: " (.-message e)))
+                    (.exit js/process 1)))))))
+
+(-main)

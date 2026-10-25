@@ -1,0 +1,68 @@
+(ns kotoba.fleet.agent-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.fleet.agent :as agent]
+            [kotoba.fleet.governor :as gov]
+            [kotoba.fleet.lease :as lease]
+            [kotoba.fleet.store :as store]))
+
+(deftest enqueue-and-open
+  (testing "enqueued work is open until leased"
+    (let [db (store/mem-store)]
+      (agent/enqueue! db {:unit "src/a.clj" :created-by "root"})
+      (is (= ["src/a.clj"] (map :work/unit (agent/open-work db 0))))
+      (lease/claim! db {:work "src/a.clj" :agent "A" :ttl-ms 999 :now 0})
+      (is (empty? (agent/open-work db 1)) "leased unit is no longer open"))))
+
+(deftest claim-and-propose-happy
+  (testing "an agent leases open work, runs, and proposes"
+    (let [db (store/mem-store)]
+      (agent/enqueue! db {:unit "src/a.clj" :created-by "root"})
+      (let [r (agent/claim-and-propose!
+               db {:unit "src/a.clj" :agent "A" :ttl-ms 999 :now 0
+                   :run (fn [u] {:file u :patch "…"})})]
+        (is (= :proposed (:status r)))
+        (is (= 1 (count (gov/pending-proposals db))) "proposal is queued for the governor")
+        (is (= "A" (lease/holder db "src/a.clj" 1)) "lease held through the proposal")))))
+
+(deftest lease-race-backs-off
+  (testing "the agent that loses the lease race proposes nothing"
+    (let [db (store/mem-store)
+          ran (atom 0)]
+      (lease/claim! db {:work "src/a.clj" :agent "A" :ttl-ms 999 :now 0}) ; A already holds
+      (let [r (agent/claim-and-propose!
+               db {:unit "src/a.clj" :agent "B" :ttl-ms 999 :now 1
+                   :run (fn [_] (swap! ran inc) {:x 1})})]
+        (is (= :contended (:status r)))
+        (is (= "A" (:holder r)))
+        (is (zero? @ran) "B never runs work it does not own")
+        (is (empty? (gov/pending-proposals db)))))))
+
+(deftest no-op-run-releases
+  (testing "when run yields nothing the lease is released, no proposal"
+    (let [db (store/mem-store)
+          r  (agent/claim-and-propose!
+              db {:unit "src/a.clj" :agent "A" :ttl-ms 999 :now 0 :run (fn [_] nil)})]
+      (is (= :no-op (:status r)))
+      (is (nil? (lease/holder db "src/a.clj" 1)) "lease released")
+      (is (empty? (gov/pending-proposals db))))))
+
+(deftest close-work-removes-from-open
+  (testing "a closed (done) work-unit no longer appears as open"
+    (let [db (store/mem-store)]
+      (agent/enqueue! db {:unit "src/a.clj" :created-by "root"})
+      (is (seq (agent/open-work db 0)))
+      (agent/close-work! db "src/a.clj")
+      (is (empty? (agent/open-work db 1)) "done work is not re-picked"))))
+
+(deftest end-to-end-agent-then-governor
+  (testing "agent proposes → governor drains → materialized once"
+    (let [db    (store/mem-store)
+          wrote (atom [])]
+      (agent/enqueue! db {:unit "src/a.clj" :created-by "root"})
+      (agent/claim-and-propose! db {:unit "src/a.clj" :agent "A" :ttl-ms 999 :now 0
+                                    :run (fn [u] {:file u})})
+      (gov/drain! db {:gate (constantly true)
+                      :materialize #(swap! wrote conj (:proposal/work %))})
+      (is (= ["src/a.clj"] @wrote) "the agent's write reached git via the governor")
+      (agent/complete! db {:unit "src/a.clj" :agent "A" :now 1})
+      (is (nil? (lease/holder db "src/a.clj" 2)) "unit freed for the next round"))))

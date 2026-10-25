@@ -1,0 +1,114 @@
+(ns shitsuke.kotoba-guest-test
+  "The SEAM around a Kotoba guest: registration, subscriptions, and what
+  happens to the effects a guest handler asks for.
+
+  Scope, stated because it is easy to overclaim: this test does NOT verify the
+  guest. It verifies that `install-guest!` puts a guest behind `rf/dispatch`
+  and `rf/subscribe` without those call sites changing, and that an effect the
+  guest returned is performed exactly once, in order, AFTER the handler has
+  returned -- which on the mini runtime means outside the `swap!`.
+
+  The guest here is therefore a text function, not the compiled artifact. What
+  the compiled artifact actually answers is pinned separately and end to end by
+  `test/kotoba/guest_acceptance.cljk`, which builds
+  `kotoba/example_counter.kotoba` with amu and calls the emitted ESM. Neither
+  test is sufficient alone: this one would pass against a guest that never
+  compiled, and that one says nothing about re-frame registration."
+  (:require [kotoba.test :refer [deftest is use-fixtures]]
+            [kotoba.lang.edn :as edn]
+            [shitsuke.kotoba.guest :as kg]
+            [shitsuke.re-frame.core :as rf]
+            [shitsuke.reagent.core :as r]))
+
+(use-fixtures :each (fn [t] (rf/clear!) (t) (rf/clear!)))
+
+;; A stand-in for the compiled guest: same text contract (EDN in, EDN out),
+;; the counter's semantics. `example_counter.kotoba` is the real one.
+(defn- counter-call [export & args]
+  (let [[a b] (map edn/read-string args)]
+    (pr-str
+     (case export
+       "init-text" {:count 0 :label "clicks"}
+       "step-text" (:db (edn/read-string (apply counter-call "handle-text" args)))
+       "fx-text" (:fx (edn/read-string (apply counter-call "handle-text" args)))
+       "handle-text" (let [db a
+                           [id arg] b]
+                       (case id
+                         :counter/inc {:db (update db :count inc) :fx []}
+                         :counter/set {:db (assoc db :count arg) :fx []}
+                         :counter/reset {:db (assoc db :count 0)
+                                         :fx [[:dispatch [:ui/focus]]]}
+                         {:db db :fx []}))
+       "query-text" (let [db a
+                          [id] b]
+                      (case id
+                        :counter/count (:count db)
+                        :counter/label (:label db)
+                        :counter/positive? (> (:count db) 0)
+                        nil))
+       "view-text" {:tag "div" :attrs {:class "shitsuke__counter"}
+                    :children [{:tag "h1" :attrs {} :text (:label a)}]}))))
+
+(def ^:private g (kg/guest counter-call))
+
+(deftest install-guest-keeps-call-sites-test
+  (rf/install-guest! g {:events #{:counter/inc :counter/set :counter/reset}
+                        :queries #{:counter/count :counter/positive?}})
+  (rf/init-db! g)
+  (is (= 0 @(rf/subscribe [:counter/count])))
+  ;; the call sites below are the ones app code already had
+  (rf/dispatch [:counter/inc])
+  (is (= 1 @(rf/subscribe [:counter/count])))
+  (rf/dispatch [:counter/set 5])
+  (is (= 5 @(rf/subscribe [:counter/count])))
+  ;; the boundary of the guest's own comparison, from both sides
+  (is (true? @(rf/subscribe [:counter/positive?])))
+  (rf/dispatch [:counter/set 0])
+  (is (false? @(rf/subscribe [:counter/positive?]))))
+
+(deftest guest-effects-are-performed-after-the-handler-test
+  (let [seen (atom [])]
+    (rf/install-guest! g {:events #{:counter/reset :counter/set}
+                          :queries #{:counter/count}
+                          :performers {:dispatch (fn [event] (swap! seen conj event))}})
+    (rf/init-db! g)
+    (rf/dispatch [:counter/set 9])
+    (is (= [] @seen) "a handler that asks for nothing performs nothing")
+    (rf/dispatch [:counter/reset])
+    (is (= 0 @(rf/subscribe [:counter/count])) "the db half still landed")
+    (is (= [[:ui/focus]] @seen) "the effect half was performed exactly once")))
+
+(deftest an-unperformable-effect-is-not-dropped-test
+  (rf/install-guest! g {:events #{:counter/reset} :queries #{:counter/count}})
+  (rf/init-db! g)
+  ;; :dispatch has a default performer; anything else must be given one. An
+  ;; effect nobody performs is the failure this shape exists to prevent, so it
+  ;; throws rather than being silently skipped.
+  (let [answer (kg/handle g {:count 1} [:counter/reset])]
+    (is (= [[:dispatch [:ui/focus]]] (:fx answer))))
+  (is (thrown? js/Error
+               (#'shitsuke.re-frame.core/perform-fx! {} [[:mail/send {:to "x"}]]))))
+
+(deftest install-guest-fails-closed-on-an-empty-registration-test
+  ;; Installing nothing leaves every dispatch answering exactly as before,
+  ;; which is indistinguishable from a guest that works.
+  (is (thrown? js/Error
+               (rf/install-guest! g {})))
+  (is (thrown? js/Error
+               (rf/install-guest! g {:events #{} :queries #{}}))))
+
+(deftest kotoba-view-renders-through-the-existing-renderers-test
+  (rf/install-guest! g {:events #{:counter/inc}})
+  (rf/init-db! g)
+  (let [hic (r/kotoba-view g @rf/app-db)]
+    (is (= [:div {:class "shitsuke__counter"} [:h1 {} "clicks"]] hic))
+    #?(:clj
+       ;; the same value the SSR renderer already takes -- no second renderer
+       (is (= "<div class=\"shitsuke__counter\"><h1>clicks</h1></div>"
+              (r/render hic))))))
+
+(deftest document-hiccup-passes-plain-values-through-test
+  (is (= "text" (kg/document->hiccup "text")))
+  (is (= 42 (kg/document->hiccup 42)))
+  (is (= [:span {} "leaf"] (kg/document->hiccup {:tag "span" :attrs {} :text "leaf"})))
+  (is (= {:no :tag} (kg/document->hiccup {:no :tag}))))

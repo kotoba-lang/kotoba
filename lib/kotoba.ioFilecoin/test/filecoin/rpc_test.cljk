@@ -1,0 +1,97 @@
+(ns filecoin.rpc-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [filecoin.chain-vectors :as cv]
+            [filecoin.message :as msg]
+            [filecoin.rpc :as rpc]
+            [filecoin.signature :as sig]))
+
+(deftest base64-round-trips
+  ;; RFC 4648 standard alphabet with padding — what Go's encoding/json emits
+  ;; for a []byte, which is what `Params` is.
+  (doseq [[bytes encoded]
+          [[[] ""]
+           [[0x66] "Zg=="]
+           [[0x66 0x6f] "Zm8="]
+           [[0x66 0x6f 0x6f] "Zm9v"]
+           [[0x66 0x6f 0x6f 0x62] "Zm9vYg=="]
+           [[0x66 0x6f 0x6f 0x62 0x61] "Zm9vYmE="]
+           [[0x66 0x6f 0x6f 0x62 0x61 0x72] "Zm9vYmFy"]
+           [[0xff 0xff 0xff] "////"]
+           [[0xfb 0xff 0xbf] "+/+/"]]]
+    (testing encoded
+      (is (= encoded (rpc/base64 bytes)))
+      (is (= bytes (rpc/base64-decode encoded)))))
+  (testing "and mainnet's own params survive the trip"
+    (doseq [{:keys [message]} cv/bls-messages]
+      (when-let [p (get message "Params")]
+        (is (= p (rpc/base64 (rpc/base64-decode p))))))))
+
+(deftest a-raw-map-is-normalised-before-it-becomes-json
+  ;; `message->json` used to skip normalisation when `:to` was present —
+  ;; true of exactly the map a caller writes by hand — and then passed the
+  ;; string straight to the address encoder. A node answers that with
+  ;; "unknown address protocol", which looks like a malformed request.
+  (let [a "f1xpbyy4tkdx5si2bgo37dubc2xwv6fum5tk57mia"
+        raw {:to a :from a :value "1" :nonce 3 :method 0}]
+    (is (= a (get (rpc/message->json raw) "To")))
+    (is (= (rpc/message->json (msg/message raw)) (rpc/message->json raw)))))
+
+(deftest message-json-round-trips
+  (doseq [{:keys [message]} cv/bls-messages]
+    (testing (get message "To")
+      (is (= message (rpc/message->json (rpc/json->message message)))))))
+
+(deftest json-and-cbor-are-different-encodings
+  ;; The RPC form is an object with capitalised keys and decimal-string
+  ;; amounts; the chain form is a 10-element array with sign-magnitude byte
+  ;; strings. Neither is a rename of the other, and only one of them has a
+  ;; CID.
+  (let [m (rpc/json->message (:message (first cv/bls-messages)))
+        j (rpc/message->json m)]
+    (is (string? (get j "Value")))
+    (is (= 0x8a (bit-and (int (first (seq (msg/encode m)))) 0xff)))))
+
+(deftest requests-are-json-rpc-2
+  (let [r (rpc/chain-head)]
+    (is (= "2.0" (get r "jsonrpc")))
+    (is (= "Filecoin.ChainHead" (get r "method")))
+    (is (= [] (get r "params"))))
+  (testing "a CID parameter is an IPLD link object, not a bare string"
+    (is (= [{"/" "bafy2bzacea"}]
+           (get (rpc/chain-get-message "bafy2bzacea") "params"))))
+  (testing "an address parameter may be given either way"
+    (is (= (get (rpc/wallet-balance "f01") "params")
+           (get (rpc/wallet-balance
+                 {:protocol 0 :payload [1] :network :mainnet}) "params")))))
+
+(deftest mpool-push-carries-the-signature-as-type-and-data
+  (let [{:keys [message signature]} (first cv/secp256k1-messages)
+        sm (sig/signed-message (rpc/json->message message)
+                               (sig/signature (:type signature)
+                                              (rpc/base64-decode (:data signature))))
+        params (first (get (rpc/mpool-push sm) "params"))]
+    ;; Type is whatever the chain recorded — 1 for secp256k1, 3 for the
+    ;; delegated (FEVM) signatures that now make up most of mainnet's
+    ;; non-BLS traffic. Both take the signed-wrapper CID.
+    (is (= (:type signature) (get-in params ["Signature" "Type"])))
+    (is (= (:data signature) (get-in params ["Signature" "Data"])))
+    (is (= (get message "From") (get-in params ["Message" "From"])))))
+
+(deftest a-jsonrpc-error-is-not-a-result
+  ;; JSON-RPC errors arrive with HTTP 200. A caller that only checks the
+  ;; status code reads nil as an answer.
+  (is (= 42 (rpc/parse-response {"result" 42})))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (rpc/parse-response {"error" {"code" -32601
+                                             "message" "method not found"}}))))
+
+(deftest http-request-is-a-post-with-a-json-body
+  (let [r (rpc/http-request (:mainnet rpc/endpoints) (rpc/chain-head))]
+    (is (= :post (:method r)))
+    (is (= "application/json" (get-in r [:headers "content-type"])))
+    (is (nil? (get-in r [:headers "authorization"])))
+    (is (re-find #"Filecoin\.ChainHead" (:body r))))
+  (testing "with a bearer token when one is given"
+    (is (= "Bearer abc"
+           (get-in (rpc/http-request "u" (rpc/chain-head) "abc")
+                   [:headers "authorization"])))))

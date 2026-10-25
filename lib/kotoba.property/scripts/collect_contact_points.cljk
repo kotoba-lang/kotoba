@@ -1,0 +1,467 @@
+(ns collect-contact-points
+  "法人番号 -> 公開連絡点（問い合わせフォーム URL・窓口メール・所在地・代表者名）。
+
+   判断は `kotoba.property.contact-point`（純 cljc）が持つ。ここは I/O だけ:
+   gBizINFO を引き、robots.txt を見て、サイトを取りに行き、EDN を書く。
+
+   ## 候補の作り方が 2 つある
+
+     --names <file>   1 行 1 社名。gBizINFO の検索で法人番号に解決する。
+                      既に名前で決めてある ICP（lead-list.md）を機械可読にする経路。
+     --numbers <file> 1 行 `法人番号<TAB>シグナル<TAB>...`。**検索が 0 回になる。**
+                      母集団を別の面（届出認定など）から作れるならこれが速い。
+     --discover       prefecture + 従業員数レンジで gBizINFO を歩く。⚠ 業種で
+                      絞れないので、候補の大半を捨てるために 1 件ずつ払う。
+
+   ⚠ **gBizINFO の `industry` / `business_item` パラメータは絞らない**（2026-08-25 実測。
+   `industry=A`（農業）と `industry=G`（情報通信業）が同一の結果を返した）。だから
+   業種の絞り込みは `--industry` でこちら側でやる —— 詳細レスポンスの `industry`
+   （JSIC 大分類）を見て落とす。**サーバに絞らせたつもりで絞れていない、が一番安い
+   間違いなので、ここに書いておく。**
+
+   ## 測れなかったことを 0 件と書かない
+
+   1 社 1 行、`:lead/status` は 5 値（`:ok` `:no-website` `:fetch-failed`
+   `:no-contact-point` `:robots-disallowed`）。**失敗した社も行として残す。**
+   最後に `SCANNED<TAB>n` を出し、1 件も歩けなかった run は **exit 2**
+   （0 でも 1 でもない = 「答えられなかった」）で終わる。
+
+   ## 追記できる（--merge-into）
+
+   intent は増える —— 新しい認定が毎週載る。だから収集は 1 回きりの job ではなく
+   **繰り返す動作**で、既に持っている会社を毎回取り直すのは丸ごと無駄である。
+   `--merge-into <既存 edn>` を渡すと、その台帳に居る法人番号を候補から外し、
+   最後に**既存 + 新規**を書き出す（coverage は和集合で計算し直す）。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_contact_points.cljk --out <f> --names <f> [--limit N]
+     kbb --backend sci -cp src scripts/collect_contact_points.cljk --out <f> --discover \\
+         --prefecture 13 --employee-from 10 --employee-to 300 --industry G --limit 200
+
+   Requires GBIZINFO_TOKEN（env か Keychain `gbizinfo-api-token`）。無ければ exit 3。"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]
+            [kotoba.property.contact-point :as cp]
+            [kotoba.property.site-probe :as probe]
+            ["child_process" :as cp-node]
+            ["fs" :as fs]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- flag? [n] (boolean (some #{n} argv)))
+(defn- int-arg [n d] (let [v (arg n nil)] (if v (js/parseInt v 10) d)))
+
+(defn- die! [code msg]
+  ;; ⚠ `exitCode` を立ててから throw しない。**この throw は `-main` の同期部分から
+  ;; 外へ抜けるので nbb の既定 exit 1 になり、契約した 2/3 が一度も出なかった**
+  ;; （実測 2026-08-26: 3 本とも `--out is required` で exit 1）。
+  ;; `.exit` で即座に落とす。ここまでで stdout には何も書いていない
+  ;; （SCANNED 等の println は成功経路にしか無い）ので、切り捨てられる出力は無い。
+  (js/console.error msg)
+  (.exit js/process code))
+
+(defn- token []
+  (or (not-empty (.. js/process -env -GBIZINFO_TOKEN))
+      ;; 既知の識別子 1 件だけを狙い撃ちする（総当たり dump をしない）
+      (let [r (.spawnSync cp-node "security"
+                          #js ["find-generic-password" "-s" "gbizinfo-api-token" "-w"]
+                          #js {:encoding "utf8"})]
+        (when (zero? (or (.-status r) 1)) (not-empty (str/trim (str (.-stdout r))))))))
+
+(def ^{:doc "origin -> robots.txt 本文。**プロセス全体で 1 つ。** 会社をまたいで
+  同じホストを何度も引かないため、かつ cross-origin の候補でもその host の
+  robots が引かれることを保証するため。"} robots-cache (atom {}))
+
+(defn- now [] (.toISOString (js/Date.)))
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+;; ---------------------------------------------------------------------------
+;; fetch — 落ちても例外にしない。1 社のタイムアウトで全体を止めない。
+
+(defn- fetch-text
+  "[status body final-url] を返す。取りに行けなかったときは [nil nil nil]。
+
+   **status 0 と status 404 を同じ nil に畳まない** —— 前者は測れなかった、
+   後者は測って無かった。
+
+   `final-url` を返すのは、**リクエストした URL と、実際に連絡点を出した URL が
+   別物だから**である（実測 2026-08-25: 記録した 10 件中 8 件が 301/307/308 を
+   返していた —— `redirect: follow` で中身は取れているので収集は成功して見えるが、
+   台帳に載っていたのはリダイレクト元だった）。載せるのは応答した URL にする。"
+  ([url ms] (fetch-text url ms nil))
+  ([url ms headers]
+   (let [ctl (js/AbortController.)
+         t (js/setTimeout #(.abort ctl) ms)]
+     (-> (js/fetch url (clj->js {:signal (.-signal ctl)
+                                 :redirect "follow"
+                                 :headers (merge {"user-agent" cp/user-agent
+                                                  "accept-language" "ja,en;q=0.8"}
+                                                 headers)}))
+         (.then (fn [^js res]
+                  (-> (.text res)
+                      (.then (fn [body] [(.-status res) body (.-url res)]))
+                      (.catch (fn [_] [(.-status res) nil (.-url res)])))))
+         (.catch (fn [_] [nil nil nil]))
+         (.finally (fn [] (js/clearTimeout t)))))))
+
+;; ---------------------------------------------------------------------------
+;; gBizINFO
+
+(def api-base "https://api.info.gbiz.go.jp/hojin/v2/hojin")
+
+(defn- gbiz-json [url tok]
+  (-> (fetch-text url 25000 {"X-hojinInfo-api-token" tok})
+      (.then (fn [[status body]]
+               (when (and (= 200 status) body)
+                 (try (js->clj (js/JSON.parse body)) (catch :default _ nil)))))))
+
+(defn- search-by-name [name tok]
+  (-> (gbiz-json (str api-base "?name=" (js/encodeURIComponent name) "&limit=10") tok)
+      (.then (fn [d] (vec (get d "hojin-infos"))))))
+
+(defn- search-page
+  "prefecture + 従業員数レンジで 1 ページ。**この 3 つは discriminate することを
+   実測済み**（industry と business_item は無視される）。"
+  [{:keys [prefecture employee-from employee-to page limit]} tok]
+  (-> (gbiz-json (str api-base "?prefecture=" prefecture
+                      "&employee_number_from=" employee-from
+                      "&employee_number_to=" employee-to
+                      "&page=" page "&limit=" limit)
+                 tok)
+      (.then (fn [d] (vec (get d "hojin-infos"))))))
+
+(defn- detail [corporate-number tok]
+  (-> (gbiz-json (str api-base "/" corporate-number) tok)
+      (.then (fn [d] (first (get d "hojin-infos"))))))
+
+;; ---------------------------------------------------------------------------
+;; 1 社を観測する
+
+(defn- probe-contact
+  "homepage を起点に連絡点を探す。見つかったら {:contact-url .. :html ..}。
+   robots.txt に拒まれたパスには行かない。"
+  [site-url robots-cache delay-ms]
+  ;; ⚠ 以前はここで**種の origin の robots だけ**を使い、path を `^org` の
+  ;; str/replace で切り出していた。cross-origin の候補では replace が効かず
+  ;; **path が URL 丸ごとになり、どの Disallow にも前方一致しない** ——
+  ;; つまり判定が常に「許可」に倒れ、別ホストの robots.txt は一度も読まれなかった
+  ;; （実測 2026-08-26: TKC 会員事務所の窓口が cms.tkcnf.com に在った）。
+  ;; **拒否できない検査は、検査していないのと同じ値を返す。**
+  ;; 判定は `site-probe/blocked?*`（origin ごとに robots を引いてキャッシュする）に
+  ;; 寄せた。probe 全体は寄せていない —— 直したのは拒否できなかった 1 点だけ。
+  (let [org (cp/origin site-url)]
+    (-> (probe/blocked?* robots-cache site-url)
+      (.then (fn [seed-blocked?]
+       (if seed-blocked?
+         {:status :robots-disallowed}
+      (-> (fetch-text site-url 20000)
+          (.then
+           (fn [[hstatus home]]
+             (if-not (and hstatus home)
+               {:status :fetch-failed :note (str "homepage status=" (or hstatus "none"))}
+               ;; **fetch の前に順位を決める。** 1 件目が通った時点で止めるので、
+             ;; 順序が精度そのものになる（実測: 順位付け無しでは Stockmark の
+             ;; `/company/information` が本物の窓口を押しのけた）。
+             (let [candidates (->> (concat (cp/discover-contact-links home site-url)
+                                           (map #(str org %) cp/common-contact-paths))
+                                   cp/rank-contact-candidates
+                                   (take 8)
+                                   vec)]
+                 (-> (reduce
+                      (fn [p url]
+                        (.then p (fn [found]
+                                   (if found
+                                     found
+                                     (-> (sleep delay-ms)
+                                         ;; **候補ごとに、その URL のホストの robots で判定する。**
+                                         ;; 事前の一括 filter では cross-origin を判定できなかった。
+                                         (.then (fn [] (probe/blocked?* robots-cache url)))
+                                         (.then (fn [blocked?]
+                                                  (if blocked? [nil nil nil] (fetch-text url 20000))))
+                                         ;; **応答した URL を載せる。** リダイレクト先が
+                                         ;; 実際の窓口なので、要求した URL を台帳に書くと
+                                         ;; 次に開いた人が 301 を踏む。
+                                         (.then (fn [[st body final-url]]
+                                                  (when (and (= 200 st) body (cp/contact-page? body))
+                                                    ;; ⚠ ここで `normalise-url` を通さない。
+                                                    ;; 末尾スラッシュを落とすのが 301 の原因
+                                                    ;; そのものだった（`/contact/` -> `/contact`）。
+                                                    ;; 応答した URL を一字も変えずに載せる。
+                                                    {:contact-url (or (not-empty (str final-url)) url)
+                                                     :html body}))))))))
+                      (js/Promise.resolve nil)
+                      candidates)
+                     (.then (fn [found]
+                              (if found
+                                (assoc found :status :ok :home-html home)
+                                {:status :no-contact-point :home-html home
+                                 :note (str "probed " (count candidates) " candidate path(s)")}))))))))))))))) 
+
+(defn- observe
+  "registry レコード -> observation map（`cp/->record` に渡す形）。
+
+   `fallback-url` は names ファイルが `社名<TAB>URL` で与えたもの。登記に URL が
+   無い会社（実測: JAPAN AI）を `:no-website` のまま捨てないための口だが、
+   **出所は分けて記録する** —— 登記の自己申告ではなく、こちらが当てた URL である。"
+  [registry fallback-url delay-ms]
+  (let [reg-url (cp/normalise-url (get registry "company_url"))
+        site (or reg-url (cp/normalise-url fallback-url))
+        url-source (if reg-url :gbizinfo :operator-supplied)]
+    (if-not site
+      (js/Promise.resolve {:status :no-website :observed-at (now)})
+      ;; robots は `site-probe/blocked?*` が origin ごとに引く。ここでは cache を渡すだけ。
+      (-> (probe-contact site robots-cache delay-ms)
+          (.then (fn [{:keys [status contact-url html home-html note]}]
+                   (let [pages (remove nil? [html home-html])
+                         emails (->> pages (mapcat cp/extract-emails) distinct vec)]
+                     (cond-> {:status status :observed-at (now) :note note
+                              :web-url-source url-source}
+                       contact-url (assoc :contact-url contact-url)
+                       (seq emails) (assoc :emails emails)
+                       html (assoc :solicitation-forbidden? (cp/solicitation-forbidden? html)
+                                   :site-postal-code (cp/extract-site-postal-code html))))))))))
+
+;; ---------------------------------------------------------------------------
+;; 候補づくり
+
+(defn- candidates-from-numbers
+  "`法人番号<TAB>シグナル<TAB>...` の行 -> 候補。**検索を 1 回もしない。**
+   2 列目が在れば `:lead/intent-signal` として行に残す —— 営業する人が
+   「なぜこの会社がここに居るか」を行だけで読めるようにするため。"
+  [lines limit]
+  (->> lines
+       (map (fn [line]
+              (let [cells (str/split line #"\t")]
+                {:corporate-number (str/trim (str (first cells)))
+                 :intent-signal (some-> (second cells) str/trim not-empty)})))
+       (filter #(re-find #"^\d{13}$" (:corporate-number %)))
+       (take limit)
+       vec))
+
+(defn- candidates-from-names
+  "`names` は `{:name .. :url ..}` の列。`:url` は任意（登記に URL が無いとき用）。"
+  [names tok delay-ms]
+  (reduce (fn [p {nm :name url :url}]
+            (.then p (fn [acc]
+                       (-> (sleep delay-ms)
+                           (.then (fn [] (search-by-name nm tok)))
+                           ;; **1 件目を採らない。** 完全一致だけを採り、外れたら
+                           ;; 理由を持って `:unresolved` の行として残す（実測で
+                           ;; リコー -> 閉鎖子会社、ABEJA -> 別会社を掴んだ）。
+                           (.then (fn [hits]
+                                    (let [{:keys [hit match rejected]} (cp/resolve-hit nm hits)]
+                                      (if hit
+                                        (conj acc {:corporate-number (get hit "corporate_number")
+                                                   :asked-name nm
+                                                   :name-match match
+                                                   :fallback-url url})
+                                        (do (js/console.error
+                                             (str "  unresolved  " nm
+                                                  (when (seq rejected)
+                                                    (str "  (rejected: "
+                                                         (str/join ", " (map #(str (:name %) "/" (name (:reason %))) rejected))
+                                                         ")"))))
+                                            (conj acc {:unresolved true
+                                                       :asked-name nm
+                                                       :rejected-candidates (vec rejected)})))))))))) 
+          (js/Promise.resolve [])
+          names))
+
+(defn- candidates-from-discovery [opts tok delay-ms limit]
+  (let [per-page 100]
+    (letfn [(step [page acc]
+              (if (>= (count acc) limit)
+                (js/Promise.resolve (vec (take limit acc)))
+                (-> (sleep delay-ms)
+                    (.then (fn [] (search-page (assoc opts :page page :limit per-page) tok)))
+                    (.then (fn [hits]
+                             (if (empty? hits)
+                               (js/Promise.resolve (vec acc))
+                               (step (inc page)
+                                     (into acc (map (fn [h] {:corporate-number (get h "corporate_number")}) hits)))))))))]
+      (step 1 []))))
+
+;; ---------------------------------------------------------------------------
+;; 1 候補を最後まで通す
+
+(defn- industry-ok? [registry wanted]
+  (or (str/blank? (str wanted))
+      (contains? (set (map str (get registry "industry"))) (str wanted))))
+
+(defn- process-one
+  "候補 1 件 -> `{:record ..}` か `{:skipped true}`。"
+  [{:keys [corporate-number asked-name fallback-url name-match intent-signal
+           unresolved rejected-candidates]}
+   tok delay-ms industry]
+  (if unresolved
+    (js/Promise.resolve
+     {:record (cp/->record {} {:status :unresolved
+                               :observed-at (now)
+                               :rejected-candidates rejected-candidates
+                               :note (str "asked: " asked-name)})})
+    (-> (sleep delay-ms)
+        (.then (fn [] (detail corporate-number tok)))
+        (.then (fn [reg]
+                 (cond
+                   (nil? reg)
+                   (do (js/console.error (str "  detail unavailable: " corporate-number))
+                       {:skipped true})
+
+                   (not (industry-ok? reg industry))
+                   {:skipped true}
+
+                   :else
+                   (-> (observe reg fallback-url delay-ms)
+                       (.then (fn [obs]
+                                (let [reg (if (and fallback-url
+                                                   (str/blank? (str (get reg "company_url"))))
+                                            (assoc reg "company_url" fallback-url)
+                                            reg)
+                                      rec (cond-> (cp/->record reg (assoc obs :name-match name-match))
+                                            asked-name (assoc :lead/asked-name asked-name)
+                                            intent-signal (assoc :lead/intent-signal intent-signal))]
+                                  (js/console.error
+                                   (str "  " (name (:lead/status rec)) "  "
+                                        (:company/legal-name rec)
+                                        (when-let [u (:contact/form-url rec)] (str "  " u))))
+                                  {:record rec})))))))
+        (.catch (fn [e]
+                  ;; 1 社の失敗で run 全体を落とさない。**ただし黙って消さない** ——
+                  ;; 行として残さないなら、せめて skipped として数える。
+                  (js/console.error (str "  worker error on " corporate-number ": " (.-message e)))
+                  {:skipped true})))))
+
+(defn- process-all
+  "候補列を、同時に走る worker `n` 本で処理する。
+
+   逐次だと 1 社あたり『gBizINFO 1 回 + robots + homepage + 窓口候補を最大 8 回』の
+   往復をすべて直列に待つので、壁時計は候補数 × その合計になる。ホストが違う
+   fetch は並べても互いを待たないので、ここが効く。
+
+   **`n` を上げすぎない。** gBizINFO は 1 つのホストで、worker ごとの `delay-ms`
+   しか間隔を保証しない —— 実効レートは `n / delay-ms` である。"
+  [cands tok delay-ms industry n]
+  (let [pending (atom (vec cands))
+        records (atom [])
+        skipped (atom 0)
+        done (atom 0)
+        total (count cands)
+        take-one! (fn []
+                    (let [[head & tail] @pending]
+                      (when head (reset! pending (vec tail)) head)))]
+    (letfn [(worker []
+              (if-let [c (take-one!)]
+                (-> (process-one c tok delay-ms industry)
+                    (.then (fn [{:keys [record skipped?] :as r}]
+                             (if record (swap! records conj record) (swap! skipped inc))
+                             (let [d (swap! done inc)]
+                               (when (zero? (mod d 50))
+                                 (js/console.error (str "  ... " d "/" total
+                                                        "  records=" (count @records)))))
+                             (worker))))
+                (js/Promise.resolve nil)))]
+      (-> (js/Promise.all (clj->js (vec (repeatedly (max 1 n) worker))))
+          (.then (fn [] {:records @records :skipped @skipped}))))))
+
+;; ---------------------------------------------------------------------------
+;; main
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        tok (token)
+        delay-ms (int-arg "--delay-ms" 400)
+        limit (int-arg "--limit" 50)
+        concurrency (int-arg "--concurrency" 1)
+        industry (arg "--industry" nil)
+        names-file (arg "--names" nil)
+        numbers-file (arg "--numbers" nil)
+        merge-into (arg "--merge-into" nil)
+        existing (when (and merge-into (.existsSync fs merge-into))
+                   (vec (remove :coverage/scanned
+                                (edn/read-string (str (fs/readFileSync merge-into "utf8"))))))
+        already (set (keep :company/houjin-bangou existing))]
+    (when merge-into
+      (js/console.error (str "merge-into: " (count existing) " existing record(s), "
+                             (count already) " corporate number(s) will be skipped")))
+    (when-not out (die! 3 "--out is required"))
+    (when-not tok (die! 3 "GBIZINFO_TOKEN not in env and not in Keychain (gbizinfo-api-token)"))
+    (when-not (or names-file numbers-file (flag? "--discover"))
+      (die! 3 "give one of --names <file> / --numbers <file> / --discover"))
+    (-> (cond
+          numbers-file
+          (let [lines (->> (str (fs/readFileSync numbers-file "utf8"))
+                           str/split-lines
+                           (map str/trim)
+                           (remove str/blank?)
+                           (remove #(str/starts-with? % "#")))
+                cands (candidates-from-numbers lines limit)]
+            (when (zero? (count cands))
+              (die! 2 (str "Refusing to report a pass: no 13-digit corporate number in "
+                           numbers-file " (" (count lines) " non-comment line(s) read).")))
+            (js/console.error (str "using " (count cands) " corporate number(s) — no search needed"))
+            (js/Promise.resolve cands))
+
+          names-file
+          ;; 1 行 1 社。`社名` だけでも、`社名<TAB>URL` でもよい。
+          (let [names (->> (str (fs/readFileSync names-file "utf8"))
+                           str/split-lines
+                           (map str/trim)
+                           (remove str/blank?)
+                           (remove #(str/starts-with? % "#"))
+                           (map (fn [line]
+                                  (let [[nm url] (str/split line #"\t" 2)]
+                                    {:name (str/trim nm)
+                                     :url (some-> url str/trim not-empty)})))
+                           (take limit)
+                           vec)]
+            (js/console.error (str "resolving " (count names) " name(s) via gBizINFO search"))
+            (candidates-from-names names tok delay-ms))
+
+          :else
+          (do (js/console.error "discovering candidates via gBizINFO search")
+              (candidates-from-discovery {:prefecture (arg "--prefecture" "13")
+                                          :employee-from (int-arg "--employee-from" 10)
+                                          :employee-to (int-arg "--employee-to" 300)}
+                                         tok delay-ms limit)))
+        (.then (fn [cands]
+                 ;; **既に台帳に在る会社を候補から外す。** limit はここより前に
+                 ;; 効いているので、外した分だけ候補が減る（黙って別の会社で
+                 ;; 埋めない —— 埋めると『上位 N 件を見た』が嘘になる）。
+                 (let [cands (vec (remove #(contains? already (:corporate-number %)) cands))]
+                   (js/console.error (str "candidates: " (count cands)
+                                          (when (seq already) (str " (after merge-skip)"))
+                                          "  concurrency=" concurrency))
+                   (when (zero? (count cands))
+                     (die! 2 (str "Refusing to report a pass: every candidate was already in "
+                                  merge-into ". Nothing new was measured.")))
+                   (process-all cands tok delay-ms industry concurrency))))
+        (.then
+         (fn [{:keys [records skipped]}]
+           (if (zero? (count records))
+             (die! 2 (str "Refusing to report a pass: 0 companies scanned"
+                          " (skipped=" skipped "). Nothing was measured."))
+             (let [new-n (count records)
+                   records (into (vec existing) records)
+                   cov (assoc (cp/coverage records)
+                              :coverage/skipped-by-filter skipped
+                              :coverage/collected-at (now)
+                              :source/attribution cp/attribution)]
+               (fs/writeFileSync out (with-out-str
+                                       (println ";; 生成物。手で編集しない。")
+                                       (println ";; 再生成: kbb --backend sci -cp src scripts/collect_contact_points.cljk")
+                                       (println (str ";; " cp/attribution))
+                                       (prn (into [cov] records))))
+               (println (str "SCANNED\t" (count records)))
+               (when merge-into
+                 (println (str "PRE-EXISTING\t" (count existing)))
+                 (println (str "NEW\t" new-n)))
+               (println (str "CONTACTABLE\t" (:coverage/contactable cov)))
+               (println (str "FORBIDDEN\t" (:coverage/solicitation-forbidden cov)))
+               (println (str "SKIPPED\t" skipped))
+               (println (str "OUT\t" out))))))
+        (.catch (fn [e]
+                  (when-not (:exit (ex-data e))
+                    (js/console.error (str "collector failed: " (.-message e)))
+                    (set! (.-exitCode js/process) 2)))))))
+
+(-main)

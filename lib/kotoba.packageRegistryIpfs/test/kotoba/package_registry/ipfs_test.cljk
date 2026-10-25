@@ -1,0 +1,200 @@
+(ns kotoba.package-registry.ipfs-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.package-registry.ipfs :as ipfs]
+            [multiformats.core :as mf]))
+
+(defn utf8
+  "A string as the platform byte container `multiformats.core/cidv1-raw`
+  hashes: `byte[]` on the JVM, `Uint8Array` on ClojureScript. Both branches
+  are the host's own UTF-8 encoder — `js/TextEncoder` is a global in Node
+  and in browsers, not a Node-only import."
+  [s]
+  #?(:clj (kbytes/utf8-bytes ^String s)
+     :cljs (.encode (js/TextEncoder.) s)))
+
+(defn cid [value]
+  (mf/cidv1-raw (utf8 (str value))))
+
+(def registry
+  {:kotoba.registry/version 1
+   :records
+   [{:registry/name "kotoba/example"
+     :registry/version "1.2.3"
+     :registry/repo-rid (cid "repo")
+     :registry/commit "0123456789abcdef"
+     :registry/tree-cid (cid "tree")
+     :registry/manifest-cid (cid "manifest")
+     :registry/signers ["did:key:publisher"]
+     :registry/capabilities []}]})
+
+(deftest verified-bytes-enter-the-pure-registry
+  (let [bytes (utf8 (pr-str registry))
+        registry-cid (mf/cidv1-raw bytes)
+        result (ipfs/lock-from-requests
+                registry-cid
+                [{:name "kotoba/example" :version "1.2.3"}]
+                {:fetch-fn (fn [_ _] {:status 200 :bytes bytes})})]
+    (is (:ok? result))
+    (is (= registry-cid (mf/cidv1-raw bytes)))
+    (is (= "0123456789abcdef" (get-in result [:deps 0 :dep/commit])))))
+
+(deftest transport-fails-closed
+  (let [bytes (utf8 (pr-str registry))
+        requested (cid "different")]
+    (is (= :registry/cid-mismatch
+           (get-in (ipfs/lock-from-requests
+                    requested []
+                    {:fetch-fn (fn [_ _] {:status 200 :bytes bytes})})
+                   [:problems 0 :problem])))
+    (is (= :registry/fetch-http-status
+           (get-in (ipfs/lock-from-requests
+                    requested []
+                    {:fetch-fn (fn [_ _] {:status 503 :bytes (utf8 "")})})
+                   [:problems 0 :problem])))
+    (testing "and the status itself is carried, not just the fact that one was
+              wrong. Found by mutation `:the-refused-status-is-carried-in-the-problem`,
+              which survived the first run of the table: dropping `:status`
+              from the problem map broke nothing, because every assertion here
+              read `:problem` and none read the number. A caller told only
+              that the fetch failed cannot tell a 404 from a 502."
+      (is (= 503
+             (get-in (ipfs/lock-from-requests
+                      requested []
+                      {:fetch-fn (fn [_ _] {:status 503 :bytes (utf8 "")})})
+                     [:problems 0 :status]))))))
+
+(deftest the-two-argument-form-delegates-to-the-three-argument-one
+  (testing "found by mutation `:the-two-argument-form-uses-the-defaults`,
+            which survived the first run: nothing on the JVM side called the
+            short arity at all. A malformed CID is the one case that can be
+            driven through it without a transport — the shape check runs
+            before any I/O — so it is what pins the delegation here."
+    (is (= :registry/cid-invalid
+           (get-in (ipfs/lock-from-requests "not-a-cid" [])
+                   [:problems 0 :problem])))))
+
+;; ── Added with the 2026-08-18 `.clj` → `.cljc` conversion ────────────────
+
+(deftest a-malformed-cid-is-refused-before-any-io
+  (testing "the shape check runs first, so a bad CID never reaches a
+            transport at all. The fetch-fn here throws: if it were called,
+            the answer would be :registry/fetch-failed instead."
+    (let [never (fn [_ _] (throw (ex-info "the transport must not run" {})))]
+      (doseq [bad ["" "not-a-cid" "bafkrei" nil]]
+        (is (= :registry/cid-invalid
+               (get-in (ipfs/lock-from-requests bad [] {:fetch-fn never})
+                       [:problems 0 :problem]))
+            (str "expected a shape refusal for " (pr-str bad)))))))
+
+(deftest a-missing-transport-is-a-refusal-and-not-a-pass
+  (testing "on ClojureScript there is no default fetch-fn — there is no
+            synchronous portable HTTP and this namespace does not pretend
+            otherwise. Omitting it must be a NAMED refusal: an
+            unavailable transport and a transport that ran and found
+            nothing are different answers, and `{:ok? true}` over bytes
+            nobody fetched would be the worse of the two failures.
+
+            On the JVM the default is still `http-fetch`, so this states
+            the platform difference rather than hiding it."
+    (let [good (mf/cidv1-raw (utf8 "anything"))
+          result (ipfs/lock-from-requests good [] {:fetch-fn nil})]
+      (is (false? (:ok? result)))
+      (is (= :registry/no-transport (get-in result [:problems 0 :problem])))
+      #?(:cljs
+         (testing "and omitting the option entirely, which is the case that
+                   actually happens on ClojureScript — there is no default to
+                   fall back to. This assertion exists only on `:cljs`
+                   because the same call on the JVM would reach for
+                   `http-fetch` and open a socket."
+           (is (= :registry/no-transport
+                  (get-in (ipfs/lock-from-requests good [])
+                          [:problems 0 :problem]))))))))
+
+(deftest a-throwing-transport-becomes-a-problem-not-an-escape
+  (testing "the catch is the reason this returns a value rather than
+            propagating: a gateway timeout is a registry answer, not a
+            caller's exception. `ex-message` is portable; the caught type
+            is `Exception` on the JVM and `:default` on ClojureScript,
+            which is the only reader conditional in the control flow."
+    (let [good (mf/cidv1-raw (utf8 "anything"))
+          result (ipfs/lock-from-requests
+                  good [] {:fetch-fn (fn [_ _]
+                                       (throw (ex-info "gateway unreachable" {})))})]
+      (is (false? (:ok? result)))
+      (is (= :registry/fetch-failed (get-in result [:problems 0 :problem])))
+      (is (= "gateway unreachable" (get-in result [:problems 0 :message]))
+          "dropping the message would leave the cause written down nowhere"))))
+
+(deftest the-bytes-are-decoded-as-utf-8-before-being-read-as-edn
+  (testing "the platform's own decoder, on both sides. A record whose
+            fields are multi-byte is where a wrong decode shows: an
+            ASCII-only registry would round-trip through latin-1 unharmed
+            and this test would stay green over a broken decoder."
+    (let [jp (assoc-in registry [:records 0 :registry/commit] "0123456789abcdef")
+          jp (assoc-in jp [:records 0 :registry/name] "kotoba/例え")
+          bytes (utf8 (pr-str jp))
+          registry-cid (mf/cidv1-raw bytes)
+          result (ipfs/lock-from-requests
+                  registry-cid
+                  [{:name "kotoba/例え" :version "1.2.3"}]
+                  {:fetch-fn (fn [_ _] {:status 200 :bytes bytes})})]
+      (is (:ok? result)
+          "a mis-decoded name would not match the request and resolution would fail")
+      (is (= "0123456789abcdef" (get-in result [:deps 0 :dep/commit]))))))
+
+(deftest the-cid-checked-is-the-cid-that-was-asked-for
+  (testing "not merely that the bytes hash to SOMETHING. Swapping in a
+            different registry whose bytes are internally consistent must
+            still be refused, because the caller asked for one address."
+    (let [other (assoc registry :kotoba.registry/version 2)
+          bytes (utf8 (pr-str other))
+          asked (mf/cidv1-raw (utf8 (pr-str registry)))]
+      (is (not= asked (mf/cidv1-raw bytes)) "sanity: the two differ")
+      (is (= :registry/cid-mismatch
+             (get-in (ipfs/lock-from-requests
+                      asked [] {:fetch-fn (fn [_ _] {:status 200 :bytes bytes})})
+                     [:problems 0 :problem]))))))
+
+(deftest the-gateway-options-reach-the-transport
+  (testing "defaults included — a caller that overrides neither still gets a
+            gateway and a timeout, and `lock-from-requests`'s two-argument
+            form must not drop the options map it builds"
+    (let [seen (atom nil)
+          bytes (utf8 (pr-str registry))
+          registry-cid (mf/cidv1-raw bytes)
+          spy (fn [_ opts] (reset! seen opts) {:status 200 :bytes bytes})]
+      (ipfs/lock-from-requests registry-cid [] {:fetch-fn spy})
+      (is (= {:gateway-base "http://127.0.0.1:8080/ipfs/" :timeout-ms 10000} @seen))
+      (ipfs/lock-from-requests registry-cid []
+                               {:fetch-fn spy
+                                :gateway-base "https://ipfs.example/ipfs/"
+                                :timeout-ms 250})
+      (is (= {:gateway-base "https://ipfs.example/ipfs/" :timeout-ms 250} @seen)))))
+
+(deftest a-float-in-the-fetched-bytes-does-not-move-the-address
+  (testing "raised by a sibling agent, 2026-08-18: ClojureScript has no
+            distinct floating-point type, so `(pr-str 1.0)` is \"1\" there and
+            \"1.0\" on the JVM. Anything that re-prints a number it has read
+            produces different bytes on the two runtimes and therefore a
+            different content address.
+
+            This adapter never does. It has no number→string conversion at
+            all: the CID is computed over the bytes the transport returned,
+            and `edn/read-string` runs only AFTER that check, on the way to
+            the pure registry. The EDN below is built as a string literal so
+            that no Clojure double exists anywhere in this test — the point
+            is that the float never becomes a value on the identity path.
+
+            If the address were ever computed from re-printed values instead,
+            the first assertion would fail on exactly one of the two
+            runtimes."
+    (let [text "{:kotoba.registry/version 1 :records [] :weight 1.0}"
+          bytes (utf8 text)
+          asked (mf/cidv1-raw bytes)
+          result (ipfs/lock-from-requests
+                  asked [] {:fetch-fn (fn [_ _] {:status 200 :bytes bytes})})]
+      (is (not= :registry/cid-mismatch (get-in result [:problems 0 :problem]))
+          "the fetched bytes verified against the address asked for")
+      (testing "and the two lexical spellings of the same number are different
+                addresses, which is what makes the check above meaningful"
+        (is (not= asked (mf/cidv1-raw (utf8 "{:kotoba.registry/version 1 :records [] :weight 1}"))))))))

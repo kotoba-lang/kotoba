@@ -1,0 +1,152 @@
+(ns shugyo.reach-test
+  "Port of `reach_env.rs`'s `#[cfg(test)] mod tests` (8 tests) 1:1, using the
+  same ARM2 URDF-text fixture run through the duck-typed URDF-XML extractor."
+  (:require [kotoba.test :refer [deftest is]]
+            [shugyo.reach :as reach]
+            [shugyo.traits :as t]))
+
+(def arm2-urdf
+  "<robot name=\"arm2\">
+<link name=\"base\"><inertial><mass value=\"1\"/><inertia ixx=\"0.01\" iyy=\"0.01\" izz=\"0.01\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial></link>
+<joint name=\"shoulder\" type=\"revolute\"><parent link=\"base\"/><child link=\"upper\"/><origin xyz=\"0 0 0\"/><axis xyz=\"0 1 0\"/><limit lower=\"-3.14\" upper=\"3.14\" effort=\"80\" velocity=\"10\"/><dynamics damping=\"0\"/></joint>
+<link name=\"upper\"><inertial><origin xyz=\"0 0 -0.5\"/><mass value=\"1\"/><inertia ixx=\"0.02\" iyy=\"0.02\" izz=\"0.001\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial></link>
+<joint name=\"elbow\" type=\"revolute\"><parent link=\"upper\"/><child link=\"fore\"/><origin xyz=\"0 0 -1\"/><axis xyz=\"0 1 0\"/><limit lower=\"-3.14\" upper=\"3.14\" effort=\"80\" velocity=\"10\"/><dynamics damping=\"0\"/></joint>
+<link name=\"fore\"><inertial><origin xyz=\"0 0 -0.5\"/><mass value=\"1\"/><inertia ixx=\"0.02\" iyy=\"0.02\" izz=\"0.001\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial></link>
+</robot>")
+
+(defn env [num-envs]
+  (reach/vectorized-reach-env-new num-envs arm2-urdf (reach/reach-cfg-default)))
+
+(deftest shapes-and-dof-names
+  (let [e (env 4)]
+    (is (= (t/action-dim-per-env e) 2))
+    (is (= (t/observation-dim-per-env e) 6))
+    (is (= (reach/dof-names e) ["shoulder" "elbow"]))
+    (let [obs (t/reset-all! e 0)]
+      (is (= (count obs) (* 4 6)))
+      (is (every? #(not (Double/isNaN %)) obs)))))
+
+(deftest reset-is-seed-deterministic
+  (let [a (env 3) b (env 3)
+        oa (t/reset-all! a 42) ob (t/reset-all! b 42)]
+    (is (= oa ob) "same seed must give identical reset")
+    (let [oc (t/reset-all! a 7)]
+      (is (not= oa oc) "different seed should differ"))
+    (let [g (reach/goals a)]
+      (is (or (not= (subvec g 0 2) (subvec g 2 4))
+              (not= (subvec g 2 4) (subvec g 4 6)))
+          "per-env goals identical"))))
+
+(deftest oracle-policy-reaches-goal-and-rewards-rise
+  (let [e (env 4)]
+    (t/reset-all! e 1)
+    (let [goals (reach/goals e)
+          first-r (t/step-all! e goals)
+          r0 (reduce + 0.0 (map :reward first-r))
+          last-r (loop [i 0 last first-r]
+                   (if (= i 299) last (recur (inc i) (t/step-all! e goals))))
+          r1 (reduce + 0.0 (map :reward last-r))]
+      (is (> r1 r0) (str "reward did not improve: " r0 " -> " r1))
+      (is (every? :terminated? last-r) "not all envs reached goal")
+      (is (every? #(every? (fn [v] (not (Double/isNaN v))) (:observation %)) last-r)))))
+
+(deftest normalized-actions-rescale-to-limits-and-reach-goal
+  (let [cfg (assoc (reach/reach-cfg-default) :normalized-actions? true)
+        e (reach/vectorized-reach-env-new 4 arm2-urdf cfg)]
+    (t/reset-all! e 5)
+    (let [goals (reach/goals e)
+          limits (reach/dof-limits e)
+          n (t/num-envs e)
+          ndof (t/action-dim-per-env e)
+          norm (vec (for [ev (range n) d (range ndof)]
+                       (let [g (nth goals (+ (* ev ndof) d))
+                             [lo hi] (nth limits d)
+                             v (- (* 2.0 (/ (- g lo) (- hi lo))) 1.0)]
+                         (is (<= (Math/abs v) 1.0) "goal outside limits")
+                         v)))
+          last-r (loop [i 0 last (t/step-all! e norm)]
+                   (if (= i 299) last (recur (inc i) (t/step-all! e norm))))]
+      (is (every? :terminated? last-r) "normalized control did not reach goal"))))
+
+(deftest gravity-dr-diverges-envs-and-is-reproducible
+  (let [ndof 2
+        run (fn [dr seed]
+              (let [cfg (assoc (reach/reach-cfg-default)
+                                :gravity-dr dr :computed-torque? false :kp 50.0 :kd 8.0)
+                    e (reach/vectorized-reach-env-new 4 arm2-urdf cfg)]
+                (t/reset-all! e seed)
+                (let [target (vec (repeat (* (t/num-envs e) (t/action-dim-per-env e)) 0.5))]
+                  (dotimes [_ 400] (t/step-all! e target))
+                  (t/observations-flat e))))
+        od (* 3 ndof)
+        env-q (fn [obs e] (subvec obs (* e od) (+ (* e od) ndof)))
+        with-dr (run [0.3 1.7] 5)]
+    (is (some #(> (Math/abs (- (nth (env-q with-dr 0) %) (nth (env-q with-dr 1) %))) 1e-3) (range ndof))
+        "gravity DR did not diverge the envs")
+    (is (= with-dr (run [0.3 1.7] 5)) "gravity DR not reproducible")
+    (let [no-dr (run nil 5)]
+      (doseq [e (range 1 4)]
+        (is (every? #(< (Math/abs (- (nth (env-q no-dr e) %) (nth (env-q no-dr 0) %))) 1e-6) (range ndof))
+            "envs differ without gravity DR")))))
+
+(deftest mass-dr-diverges-envs-under-fixed-torque
+  (let [ndof 2
+        run (fn [dr]
+              (let [cfg (assoc (reach/reach-cfg-default)
+                                :mass-dr dr :gravity-z 0.0 :computed-torque? false :kp 40.0 :kd 4.0)
+                    e (reach/vectorized-reach-env-new 4 arm2-urdf cfg)]
+                (t/reset-all! e 2)
+                (let [target (vec (repeat (* (t/num-envs e) (t/action-dim-per-env e)) 0.6))]
+                  (dotimes [_ 200] (t/step-all! e target))
+                  (t/observations-flat e))))
+        od (* 3 ndof)
+        env-q (fn [obs e] (subvec obs (* e od) (+ (* e od) ndof)))
+        with-dr (run [0.4 2.0])]
+    (is (some #(> (Math/abs (- (nth (env-q with-dr 0) %) (nth (env-q with-dr 1) %))) 1e-3) (range ndof))
+        "mass DR did not diverge the envs")
+    (let [no-dr (run nil)]
+      (doseq [e (range 1 4)]
+        (is (every? #(< (Math/abs (- (nth (env-q no-dr e) %) (nth (env-q no-dr 0) %))) 1e-6) (range ndof))
+            "envs differ without mass DR")))))
+
+(deftest obs-noise-dr-noises-stepresult-but-keeps-ground-truth-clean
+  (let [cfg (assoc (reach/reach-cfg-default) :obs-noise-std 0.1)
+        e (reach/vectorized-reach-env-new 2 arm2-urdf cfg)]
+    (t/reset-all! e 5)
+    (let [cmd (vec (repeat (* (t/num-envs e) (t/action-dim-per-env e)) 0.2))
+          res (t/step-all! e cmd)
+          clean (t/observations-flat e)
+          od (t/observation-dim-per-env e)
+          noisy (vec (mapcat :observation res))]
+      (is (= (count noisy) (* (t/num-envs e) od)))
+      (is (some #(> (Math/abs (- (nth noisy %) (nth clean %))) 1e-4) (range (count noisy)))
+          "obs noise did not perturb the StepResult")
+      (is (every? #(< (Math/abs (- (nth noisy %) (nth clean %))) 0.11) (range (count noisy))))
+      (let [e2 (reach/vectorized-reach-env-new 2 arm2-urdf cfg)]
+        (t/reset-all! e2 5)
+        (let [res2 (t/step-all! e2 cmd)
+              noisy2 (vec (mapcat :observation res2))]
+          (is (= noisy noisy2) "obs noise not reproducible under a fixed seed"))))))
+
+(deftest action-noise-dr-is-reproducible-and-perturbs-the-trajectory
+  (let [run (fn [std seed]
+              (let [cfg (assoc (reach/reach-cfg-default) :action-noise-std std)
+                    e (reach/vectorized-reach-env-new 2 arm2-urdf cfg)]
+                (t/reset-all! e seed)
+                (let [cmd (vec (repeat (* (t/num-envs e) (t/action-dim-per-env e)) 0.3))]
+                  (dotimes [_ 50] (t/step-all! e cmd))
+                  (t/observations-flat e))))
+        a (run 0.2 99) b (run 0.2 99)]
+    (is (= a b) "action-noise DR not reproducible under a fixed seed")
+    (let [clean (run 0.0 99)]
+      (is (not= a clean) "action noise had no effect on the trajectory"))
+    (is (every? #(not (Double/isNaN %)) a) "noisy rollout went non-finite")))
+
+(deftest truncates-at-episode-cap-when-goal-unreachable
+  (let [cfg (assoc (reach/reach-cfg-default) :max-steps 5 :goal-range 1.0 :goal-tol 1e-4)
+        e (reach/vectorized-reach-env-new 2 arm2-urdf cfg)]
+    (t/reset-all! e 3)
+    (let [zeros (vec (repeat (* (t/num-envs e) (t/action-dim-per-env e)) 0.0))
+          res (loop [i 0 res (t/step-all! e zeros)]
+                (if (= i 4) res (recur (inc i) (t/step-all! e zeros))))]
+      (is (every? :truncated? res) "episode did not truncate at cap"))))

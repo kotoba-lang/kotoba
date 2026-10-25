@@ -1,0 +1,184 @@
+#!/usr/bin/env kbb
+;; Acceptance for `runtime/reframe-worker.mjs`: build the example guest, serve
+;; it from workerd (the runtime Cloudflare actually runs), and check the
+;; answers over HTTP.
+;;
+;; Why this exists rather than a unit test of the host: the host is 135 lines
+;; of mechanism, and every claim worth making about it -- that a Kotoba guest
+;; runs on Cloudflare at all, that an i64 survives the boundary, that a
+;; malformed body becomes a 400 instead of a 500 -- is a claim about workerd,
+;; not about the JavaScript. A test that stubbed the runtime would pass on a
+;; day when nothing deployed.
+;;
+;; It is nbb (.cljs) rather than a shell script or a hand-written .mjs: the
+;; workspace retired both for new tooling. kbb would be first now (owner
+;; instruction 2026-09-07); it is not installed on this machine, measured by
+;; running it, so this stays nbb.
+;;
+;; Exit codes are three-valued on purpose. 0 passed, 1 a real failure, and
+;; 2 REFUSED -- the tools needed to answer are missing, which is not a pass.
+;;
+;;   kbb --backend sci test/worker/reframe_worker_acceptance.cljk
+
+(ns reframe-worker-acceptance
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+;; The script is the first .cljs in argv, not argv[2]: measured twice, because
+;; argv[1] is nbb itself and argv[2] is `--classpath` as soon as one is passed.
+;; Both times the wrong element resolved a repo root that does not exist, and
+;; the failure surfaced two steps later as "project path is not readable".
+(def script (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+                "lib/kotoba.shitsuke/test/worker/reframe_worker_acceptance.cljk"))
+(def root (path/resolve (path/dirname (path/resolve script)) ".." ".."))
+(def port 8791)
+(def base (str "http://127.0.0.1:" port))
+
+;; workerd refuses a compatibility date newer than the binary knows: measured
+;; 2026-09-09, wrangler 4.103.0 answered "the newest date supported by this
+;; server binary is 2026-06-24" and started nothing. A date the binary has is
+;; the honest floor; a newer binary still accepts it.
+(def compatibility-date "2026-06-24")
+
+(defn sh [cmd args opts]
+  (let [r (cp/spawnSync cmd (clj->js args)
+                        (clj->js (merge {:encoding "utf8" :timeout 900000} opts)))]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn runnable? [cmd args]
+  (zero? (:exit (sh cmd args {}))))
+
+(defn build-guest!
+  "module-lock + compile the example app to restricted ESM. Returns the path."
+  [dir]
+  (let [entry (path/join root "kotoba" "example_counter.kotoba")
+        src (path/join root "kotoba")
+        blocks (path/join dir "blocks")
+        lock (path/join dir "counter.lock.edn")
+        out (path/join dir "counter.mjs")
+        l (sh "kotoba" ["-M" "module-lock" entry "--source-path" src
+                        "--blocks" blocks "--output" lock] {})]
+    (when-not (zero? (:exit l))
+      (println "module-lock failed:" (:err l)) (js/process.exit 1))
+    (let [c (sh "kotoba" ["-M" "compile" "--module-lock" lock "--blocks" blocks
+                          "--target" "js" "--output" out] {})]
+      (when-not (zero? (:exit c))
+        (println "compile failed:" (:err c)) (js/process.exit 1)))
+    out))
+
+(defn write-project! [dir]
+  ;; Three lines of entry, because the host is the library and the guest is
+  ;; the artifact. Anything more here would be logic in a .mjs.
+  (fs/writeFileSync
+   (path/join dir "entry.mjs")
+   (str "import { installReframeWorker } from "
+        (js/JSON.stringify (path/join root "runtime" "reframe-worker.mjs")) ";\n"
+        "import * as guest from \"./counter.mjs\";\n"
+        "export default installReframeWorker(guest);\n"))
+  (fs/writeFileSync
+   (path/join dir "wrangler.jsonc")
+   (js/JSON.stringify #js {:name "shitsuke-reframe-acceptance"
+                           :main "entry.mjs"
+                           :compatibility_date compatibility-date}
+                      nil 2)))
+
+(defn post [p body]
+  (js/fetch (str base p)
+            #js {:method "POST"
+                 :headers #js {"content-type" "application/json"}
+                 :body (js/JSON.stringify (clj->js body))}))
+
+(defn text [res] (.text res))
+
+(defn wait-ready [attempts]
+  (js/Promise.
+   (fn [resolve _]
+     (letfn [(try-once [n]
+               (if (zero? n)
+                 (resolve false)
+                 (-> (js/fetch (str base "/api/init"))
+                     (.then (fn [r] (if (.-ok r) (resolve true) (js/setTimeout #(try-once (dec n)) 500))))
+                     (.catch (fn [_] (js/setTimeout #(try-once (dec n)) 500))))))]
+       (try-once attempts)))))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check! [label expected actual]
+  (swap! checks inc)
+  (when-not (= expected actual)
+    (swap! failures inc)
+    (println "  FAIL" label "\n    expected:" (pr-str expected) "\n    actual:  " (pr-str actual))))
+
+(defn main []
+  (when-not (runnable? "kotoba" ["--help"])
+    (println "REFUSED: the kotoba CLI is not runnable here (measured by running it, not by `which`)")
+    (js/process.exit 2))
+  (when-not (runnable? "npx" ["wrangler" "--version"])
+    (println "REFUSED: wrangler is not runnable here")
+    (js/process.exit 2))
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "shitsuke-reframe-"))]
+    (build-guest! dir)
+    (write-project! dir)
+    (let [server (cp/spawn "npx" #js ["wrangler" "dev" "--port" (str port) "--local"]
+                           #js {:cwd dir :stdio "ignore"})]
+      (-> (wait-ready 60)
+          (.then
+           (fn [ready]
+             (if-not ready
+               (do (println "REFUSED: workerd never became ready on" base)
+                   (.kill server) (js/process.exit 2))
+               (-> (js/Promise.resolve)
+                   ;; the four verbs
+                   (.then (fn [_] (-> (js/fetch (str base "/api/init")) (.then text))))
+                   (.then (fn [db]
+                            (check! "init-text" "{:count 0 :label \"clicks\"}" db)
+                            (-> (post "/api/step" {:db db :event "[:counter/set 5]"}) (.then text))))
+                   (.then (fn [db5]
+                            ;; the i64 crossed the boundary and came back a number
+                            (check! "step-text carries an i64" "{:count 5 :label \"clicks\"}" db5)
+                            (-> (post "/api/query" {:db db5 :query "[:counter/count]"}) (.then text))))
+                   (.then (fn [n]
+                            (check! "query-text" "5" n)
+                            (-> (post "/api/dispatch" {:db "{:count 5 :label \"clicks\"}"
+                                                       :event "[:counter/reset]"})
+                                (.then text))))
+                   (.then (fn [fx]
+                            ;; an effect the handler asked for, still inert
+                            (check! "dispatch returns db and ordered effects"
+                                    "{:db {:count 0 :label \"clicks\"} :fx [[:dispatch [:ui/focus]]]}" fx)
+                            (-> (post "/api/view" {:db "{:count 0 :label \"clicks\"}"}) (.then text))))
+                   (.then (fn [v]
+                            (check! "view-text is an element document"
+                                    true (str/starts-with? v "{:attrs {:class \"shitsuke__counter\"}"))
+                            ;; the refusals
+                            (-> (post "/api/step" {:db "{:count 0}" :event "not an event ("}) )))
+                   (.then (fn [r]
+                            (check! "malformed event text is a 400" 400 (.-status r))
+                            (-> (.text r) (.then (fn [b]
+                                                   (check! "the trap code is reported" true
+                                                           (str/includes? b "guest-trap:document-edn-read"))
+                                                   (post "/api/step" {:db "{:count 0}"})))))) 
+                   (.then (fn [r]
+                            (check! "a missing envelope field is a 400" 400 (.-status r))
+                            (js/fetch (str base "/api/nope"))))
+                   (.then (fn [r]
+                            (check! "an unknown route is a 404" 404 (.-status r))
+                            (js/fetch (str base "/api/dispatch"))))
+                   (.then (fn [r]
+                            (check! "GET on a POST route is a 405" 405 (.-status r))
+                            (println (str "SCANNED\t" @checks))
+                            (println (if (zero? @failures)
+                                       (str "reframe-worker acceptance: " @checks "/" @checks " passed on workerd")
+                                       (str "reframe-worker acceptance: " (- @checks @failures) "/" @checks " FAILED")))
+                            (.kill server)
+                            (js/process.exit (if (zero? @failures) 0 1))))
+                   (.catch (fn [e]
+                             (println "ERROR" (str e))
+                             (.kill server)
+                             (js/process.exit 1))))))))))) 
+
+(main)

@@ -1,0 +1,86 @@
+(ns kagami.source-export-io
+  (:require ["node:fs" :as fs] ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [kagami.source :as s] [kagami.source-io :as io]
+            [kagami.source-export :as export] [kagami.west :as west]))
+
+(defn git-at [repo oid file] (io/git repo "show" (str oid ":" file)))
+(defn optional-at [repo oid file]
+  (when-let [entry (not-empty (io/git repo "ls-tree" "-z" oid "--" file))]
+    (s/require! (str/starts-with? entry "100644 blob ") :unsupported-descriptor-mode {:file file})
+    (git-at repo oid file)))
+
+(defn descriptor! [forest entry]
+  (let [id (:repo/path entry) oid (:repo/revision entry)
+        _ (s/require! (not (or (:repo/submodules? entry) (seq (:repo/submodule-paths entry))
+                               (get-in entry [:repo/userdata :datalad]))) :unsupported-materialization {:repo id})
+        r {:repo/id id :repo/path id :repo/name (:repo/name entry) :repo/url (:source/url entry)
+           :repo/oid {:algorithm :sha1 :hex oid} :repo/materialization :git}
+        _ (s/repo! r) {:keys [owner remote before]} (io/owner! forest r)
+        present? (try (= oid (str/trim (io/git owner "rev-parse" (str oid "^{commit}")))) (catch :default _ false))]
+    (when-not present? (io/git owner "fetch" "--no-tags" "--no-recurse-submodules" "--no-write-fetch-head" remote oid))
+    (s/require! (= oid (str/trim (io/git owner "rev-parse" (str oid "^{commit}")))) :object-unverified {:repo id})
+    (let [files (keep (fn [file] (when-let [text (optional-at owner oid file)] [file text]))
+                      (:resolver/descriptors export/contract))]
+      (s/require! (seq files) :unsupported-source-profile {:repo id})
+      (let [local-id (fn [relative]
+                       (s/require! (string? relative) :invalid-local-dependency {})
+                       (let [target (path/resolve forest id relative)]
+                         (s/require! (io/inside? target forest) :local-dependency-outside-forest {:repo id})
+                         (let [resolved (path/relative forest target)]
+                           (if (or (= resolved id) (str/starts-with? resolved (str id "/"))) id resolved))))
+            descriptors
+            (mapv (fn [[file text]]
+                    {:file file :cid (s/content-cid text)
+                     :dependencies (export/declarations (s/read-edn! text) local-id)}) files)]
+        (s/require! (= before (io/owner-state owner)) :owner-changed-during-export {:repo id})
+        {:repo/id id :repo/commit oid :descriptors descriptors}))))
+
+(defn export!
+  [{:keys [manifest at root roots pins out]}]
+  (let [root (fs/realpathSync root) manifest (fs/realpathSync manifest)
+        _ (io/safe-child! root manifest)
+        _ (s/require! (s/oid? at) :invalid-manifest-basis {})
+        out (io/safe-child! root (path/resolve out))
+        _ (s/require! (io/inside? out (path/join root "workspaces")) :report-outside-workspaces {})
+        db (west/parse (git-at manifest at "manifest/west.yml"))
+        registry (s/read-edn! (git-at manifest at "manifest/repos.edn"))
+        overrides (if pins (io/read-edn pins) {})
+        _ (s/require! (map? overrides) :invalid-pin-overrides {})
+        entries (into {} (map (fn [r] [(:repo/path r) (assoc r :source/url (west/remote-url db r))])) (:fleet/repos db))
+        _ (doseq [[id oid] overrides]
+            (s/require! (and (contains? entries id) (s/oid? oid)) :invalid-pin-overrides {:repo id}))
+        entries (reduce-kv #(assoc-in %1 [%2 :repo/revision] %3) entries overrides)
+        roots (str/split roots #",")
+        _ (s/unique-vector! roots #(contains? entries %))
+        _ (s/require! (seq roots) :empty-working-set {})
+        resolved
+        (loop [todo roots graph {} reports []]
+          (if-let [id (first todo)]
+            (if (contains? graph id) (recur (subvec todo 1) graph reports)
+                (let [entry (entries id)
+                      _ (s/require! entry :unregistered-source-dependency {:repo id})
+                      report (descriptor! root entry)
+                      deps (->> (:descriptors report) (mapcat :dependencies) (keep :source) (remove #{id}) distinct sort vec)]
+                  (recur (into (subvec todo 1) deps) (assoc graph id deps) (conj reports report))))
+            {:graph graph :reports reports}))
+        selected (filterv #(contains? (:graph resolved) (:repo/path %)) (:fleet/repos db))
+        selected (mapv #(dissoc (entries (:repo/path %)) :source/url) selected)
+        projected (assoc db :fleet/repos selected)
+        registry (mapv #(assoc % :manifest.repos/extra-projects (pr-str (mapv :repo/path selected))) registry)
+        lock {:lock/version 1 :lock/resolver (s/value-cid export/contract) :lock/complete? true
+              :lock/dependencies (:graph resolved)
+              :lock/revisions (into {} (map (juxt :repo/path :repo/revision)) selected)}
+        west-text (west/emit projected) registry-text (str (pr-str registry) "\n") lock-text (str (pr-str lock) "\n")
+        snapshot (s/from-west west-text registry-text at lock-text lock)
+        report {:export/version 1 :export/profile export/contract :export/manifest at
+                :export/roots roots :export/pins overrides :export/repositories (:reports resolved)
+                :export/west (s/content-cid west-text) :export/registry (s/content-cid registry-text)
+                :export/lock (s/content-cid lock-text) :export/snapshot (:source/cid snapshot)}]
+    (doseq [[file text] {"west.yml" west-text "repos.edn" registry-text "source-lock.edn" lock-text
+                        "export.edn" (str (pr-str report) "\n")}]
+      (io/safe-child! root (path/join out file)) (io/write-new! (path/join out file) text))
+    report))
+
+(defn main [args]
+  (export! (io/needed! (io/options args #{:manifest :at :root :roots :pins :out}) [:manifest :at :root :roots :out])))

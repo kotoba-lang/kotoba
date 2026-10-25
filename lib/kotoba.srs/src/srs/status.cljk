@@ -1,0 +1,169 @@
+(ns srs.status
+  "EPP object status values (RFC 5731 §2.3) and RGP grace-period statuses
+  (RFC 3915 §3.1), as data — plus the one thing the RFCs state in prose and
+  every registry then re-implements by hand: **which operations each status
+  actually prohibits**.
+
+  Status is not decoration. `clientTransferProhibited` is the single flag
+  standing between a domain and a hostile transfer, and `serverHold` is the
+  difference between a name resolving and not. A registry that stores these as
+  opaque strings has to spell the policy out again at every call site, and the
+  call sites drift. Here the prohibition is attached to the status itself, so
+  `blocked-ops` is the only place that knowledge lives.
+
+  Two axes the RFC keeps deliberately separate, and so do we:
+
+  - **who set it** — `client*` statuses are set by the sponsoring registrar and
+    may be cleared by it; `server*` statuses are set by the registry and the
+    registrar cannot clear them. Same prohibition, different authority. A
+    registry that collapses the two lets a registrar clear a registry lock.
+  - **prohibition vs. pending** — `pendingTransfer` is a state, not a policy;
+    it blocks other transforms because the object is mid-operation, not because
+    anyone forbade anything.
+
+  `ok` is not a status like the others: RFC 5731 §2.3 defines it as the value
+  an object carries when it has *no* other status. It is derived, never stored
+  — see `normalize`."
+  (:require [kotoba.lang.coll :as set]))
+
+;; ── the vocabulary ────────────────────────────────────────────────────────
+
+(def client-prohibitions
+  "Set by the sponsoring registrar; the registrar may also clear them."
+  #{:clientDeleteProhibited
+    :clientHold
+    :clientRenewProhibited
+    :clientTransferProhibited
+    :clientUpdateProhibited})
+
+(def server-prohibitions
+  "Set by the registry. A registrar cannot clear these — that asymmetry is the
+  whole point of having both halves (RFC 5731 §2.3)."
+  #{:serverDeleteProhibited
+    :serverHold
+    :serverRenewProhibited
+    :serverTransferProhibited
+    :serverUpdateProhibited})
+
+(def pending-statuses
+  "The object is mid-operation. Not a prohibition anyone chose, but it still
+  blocks concurrent transforms (RFC 5731 §2.3)."
+  #{:pendingCreate
+    :pendingDelete
+    :pendingRenew
+    :pendingTransfer
+    :pendingUpdate})
+
+(def rgp-statuses
+  "Registry Grace Period statuses (RFC 3915 §3.1). These overlay the EPP
+  statuses rather than replacing them: a domain in `redemptionPeriod` also
+  carries `pendingDelete`."
+  #{:addPeriod
+    :autoRenewPeriod
+    :renewPeriod
+    :transferPeriod
+    :redemptionPeriod
+    :pendingRestore
+    :pendingDelete})
+
+(def ^{:doc "`inactive` means the domain has no delegated nameservers, so it
+  does not resolve. Like `ok` it is derived from the object, not chosen — but
+  unlike `ok` it can coexist with prohibitions."}
+  derived-statuses
+  #{:ok :inactive})
+
+(def all-statuses
+  (set/union client-prohibitions server-prohibitions pending-statuses
+             rgp-statuses derived-statuses))
+
+;; ── what each status prohibits ────────────────────────────────────────────
+
+(def operations
+  "The transforms a status can block. `:publish` is not an EPP command — it is
+  whether the registry publishes the delegation into DNS at all, which is
+  exactly what `clientHold`/`serverHold` control (RFC 5731 §2.3: \"the domain
+  name is not published in the zone\"). Modeling it alongside the commands
+  keeps the hold statuses from being the one policy expressed elsewhere."
+  #{:delete :renew :transfer :update :publish})
+
+(def prohibits
+  "status → the set of operations it blocks.
+
+  `pendingDelete` blocks everything including renew: RFC 3915 §3.2.4 is
+  explicit that a domain in `pendingDelete` (past redemption) is beyond
+  restore, and permitting a renew there would resurrect it through a door the
+  RGP deliberately closed."
+  {:clientDeleteProhibited   #{:delete}
+   :clientRenewProhibited    #{:renew}
+   :clientTransferProhibited #{:transfer}
+   :clientUpdateProhibited   #{:update}
+   :clientHold               #{:publish}
+   :serverDeleteProhibited   #{:delete}
+   :serverRenewProhibited    #{:renew}
+   :serverTransferProhibited #{:transfer}
+   :serverUpdateProhibited   #{:update}
+   :serverHold               #{:publish}
+   :pendingCreate            #{:delete :renew :transfer :update}
+   :pendingDelete            #{:delete :renew :transfer :update :publish}
+   :pendingRenew             #{:delete :renew :transfer :update}
+   :pendingTransfer          #{:delete :renew :transfer :update}
+   :pendingUpdate            #{:delete :renew :transfer :update}
+   ;; RGP overlays. `redemptionPeriod` withdraws the name from DNS and admits
+   ;; only a restore request — which is not an EPP transform on this list.
+   :redemptionPeriod         #{:delete :renew :transfer :update :publish}
+   ;; A restore has been requested but the restore *report* is not in yet
+   ;; (RFC 3915 §4.2). The name is still dark and still untransformable.
+   :pendingRestore           #{:delete :renew :transfer :update :publish}
+   ;; RFC 3915: transfers are prohibited for 5 days after a create, and for 60
+   ;; days after a transfer. Those windows are enforced by srs.lifecycle from
+   ;; dates; the statuses themselves only mark that the window is open.
+   :addPeriod                #{}
+   :autoRenewPeriod          #{}
+   :renewPeriod              #{}
+   :transferPeriod           #{}
+   :ok                       #{}
+   :inactive                 #{:publish}})
+
+(defn blocked-ops
+  "The union of everything `statuses` prohibits. Unknown statuses contribute
+  nothing rather than throwing — a registry that meets an unrecognized status
+  from an extension should not lose the prohibitions it *does* understand."
+  [statuses]
+  (reduce (fn [acc s] (into acc (get prohibits s))) #{} statuses))
+
+(defn allows?
+  "Is `op` permitted given `statuses`?"
+  [statuses op]
+  (not (contains? (blocked-ops statuses) op)))
+
+(defn blocking
+  "Which of `statuses` block `op` — for error messages that name the actual
+  cause instead of saying \"prohibited\". A registrar hitting
+  `serverTransferProhibited` needs to know it is a *registry* lock, because
+  clearing it is not something they can do."
+  [statuses op]
+  (into (sorted-set) (filter #(contains? (get prohibits %) op)) statuses))
+
+;; ── derived status ────────────────────────────────────────────────────────
+
+(defn normalize
+  "Compute the status set as it should be reported over EPP.
+
+  `ok` is present exactly when nothing else is (RFC 5731 §2.3), so it is
+  stripped from the input and re-derived. Storing `ok` alongside a prohibition
+  is the classic EPP bug: it reports a locked domain as unlocked to anyone who
+  checks for `ok` rather than for the absence of locks.
+
+  `inactive` is added when the domain delegates no nameservers. It coexists
+  with prohibitions, so it is not part of the `ok` calculation — a domain can
+  be both `inactive` and `clientTransferProhibited`."
+  [statuses {:keys [nameservers]}]
+  (let [real (disj (set statuses) :ok :inactive)
+        real (if (seq nameservers) real (conj real :inactive))]
+    (if (empty? real) #{:ok} real)))
+
+(defn client-settable?
+  "May the sponsoring registrar set or clear this status itself? Everything
+  else is the registry's to move."
+  [status]
+  (contains? client-prohibitions status))

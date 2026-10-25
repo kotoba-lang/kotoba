@@ -1,0 +1,95 @@
+(ns kotoba.net.libp2p.serve-test
+  "Answering: what a node replies, and the wire-shape mistake that made both
+  of its replies unreadable."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [ed25519.core :as ed]
+            [kad.message :as kad]
+            [kotoba.net.libp2p.dnsaddr :as dnsaddr]
+            [kotoba.net.libp2p.identify :as identify]
+            [kotoba.net.libp2p.serve :as serve]
+            [kotoba.net.libp2p.store :as store]
+            [multiformats.multiaddr :as multiaddr]))
+
+(defn- seed [n] (byte-array (map unchecked-byte (repeat 32 n))))
+
+(deftest an-identify-response-round-trips-and-advertises-what-we-answer
+  (let [octets (serve/identify-response
+                {:identity-public-key (ed/pubkey-from-seed (seed 1))
+                 :listen-addrs ["/ip4/127.0.0.1/tcp/45021"]})
+        parsed (identify/parse octets)]
+    (is (= "kotoba-libp2p/0.1" (:agent-version parsed)))
+    (is (= (vec serve/supported-protocols) (:protocols parsed))
+        "what we advertise must be what the listener accepts; a peer that
+         believes an advertisement and gets `na` has been lied to")))
+
+(deftest listen-addrs-go-on-the-wire-as-multiaddr-octets
+  ;; The regression, twice over. protobuf length-prefixes a string into a
+  ;; `bytes` field without complaint, so the message encodes, parses on our
+  ;; side, and go-libp2p reports only `error reading identify message`.
+  (let [address "/ip4/127.0.0.1/tcp/45021"
+        parsed (identify/parse
+                (serve/identify-response
+                 {:identity-public-key (ed/pubkey-from-seed (seed 1))
+                  :listen-addrs [address]}))]
+    (is (= [(vec (multiaddr/->octets address))]
+           (mapv vec (:listen-addrs parsed))))
+    (is (= address (multiaddr/->string (vec (first (:listen-addrs parsed))))))))
+
+(defn- answer [request context]
+  (serve/respond request (merge {:closest (constantly [])
+                                 :store (store/store {})
+                                 :now-ms 0
+                                 :peer-id [7]}
+                                context)))
+
+(deftest find-node-is-answered-with-the-peers-we-were-given
+  (let [closest [{:id [1 2 3] :addrs [(vec (multiaddr/->octets "/ip4/1.2.3.4/tcp/4001"))]
+                  :connection 0}]
+        reply (kad/decode (:reply (answer (kad/find-node [9 9 9])
+                                          {:closest (constantly closest)})))]
+    (is (= (kad/message-type :find-node) (:type reply)))
+    (is (= 1 (count (:closer-peers reply))))
+    (is (= [1 2 3] (vec (:id (first (:closer-peers reply))))))))
+
+(deftest a-record-the-validator-refuses-is-not-answered-as-stored
+  ;; Answering as though it were stored would make this node advertise itself
+  ;; as a replica it is not.
+  (let [{:keys [reply store]} (answer (kad/put-value [1] [2]) {})]
+    (is (nil? reply))
+    (is (nil? (store/get-record store [1])))))
+
+(deftest a-provider-is-recorded-under-the-connections-peer-id
+  ;; Never the one in the message: a node that took it from the payload would
+  ;; let anyone advertise anyone else as a provider.
+  (let [{:keys [store]} (answer {:type (kad/message-type :add-provider) :key [5]}
+                                {:peer-id [9 9] :peer-addrs []})]
+    (is (= [[9 9]] (mapv :id (store/providers store [5] 0))))))
+
+(deftest a-dnsaddr-is-filtered-to-the-peer-it-named
+  ;; A host may answer for several peers. Taking the first record because it
+  ;; parsed is how a dialer authenticates a peer it did not mean to reach --
+  ;; and that peer verifies correctly, being simply the wrong node.
+  (with-redefs [dnsaddr/resolve-address
+                (fn [_] ["/ip4/1.1.1.1/tcp/4001/p2p/12D3KooWWanted"
+                         "/ip4/2.2.2.2/tcp/4001/p2p/12D3KooWOther"])]
+    (is (= 2 (count (dnsaddr/resolve-dialable "/dnsaddr/example" (constantly true)))))
+    (is (= 1 (count (dnsaddr/resolve-dialable "/dnsaddr/example"
+                                              #(str/includes? % "1.1.1.1")))))))
+
+(deftest dnsaddr-recognises-only-what-it-can-resolve
+  (is (true? (dnsaddr/dnsaddr? "/dnsaddr/bootstrap.libp2p.io")))
+  (is (false? (dnsaddr/dnsaddr? "/ip4/1.2.3.4/tcp/4001")))
+  (is (nil? (dnsaddr/resolve-address "/ip4/1.2.3.4/tcp/4001"))))
+
+(deftest a-node-without-an-agent-version-still-reports-one
+  ;; `:or` applies when a key is ABSENT. A node built without an agent version
+  ;; passes it as an explicit nil, which encodes as "" and makes the peer report
+  ;; `AgentVersion: ""` -- indistinguishable from a broken identify.
+  (let [parsed (identify/parse
+                (serve/identify-response {:identity-public-key (ed/pubkey-from-seed (seed 1))
+                                          :agent-version nil}))]
+    (is (= serve/default-agent-version (:agent-version parsed)))))
+
+(deftest ping-is-advertised-because-it-is-answered
+  (is (some #{serve/ping-protocol} serve/supported-protocols)))

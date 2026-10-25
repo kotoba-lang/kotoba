@@ -1,0 +1,177 @@
+;; ipld.dag-cbor-write -- DAG-CBOR encoding primitives in pure Kotoba.
+;;
+;; root ADR-2610082200 §16, plan C step A. A guest cannot encode an arbitrary
+;; value to DAG-CBOR yet: the language has no document traversal (no way to list
+;; a map's keys or a list's items; step B adds it). What a guest CAN do is encode
+;; a value whose shape it knows, item by item. This module is those items, so a
+;; typed node -- a chain commit, an artifact node -- is a short composition of
+;; them. ipld.core (core.cljk) stays as the oracle for every byte written here.
+;;
+;; Encoded values are :vector-i64 of bytes (0..255). The rules are DAG-CBOR's:
+;;   - integers in the shortest head (major 0 for n >= 0, major 1 for n < 0)
+;;   - text is UTF-8 (major 3), bytes major 2, arrays major 4, maps major 5
+;;   - null f6, true f5, false f4; no floats, no undefined
+;;   - a link is tag 42 (d8 2a) over a byte string 00 ++ the binary CID
+;;   - map keys are text, sorted by encoded length first, then bytewise
+;;
+;; A map is given as its key set and a map from key to the key's ENCODED value,
+;; so values of any shape compose; this module sorts the keys and writes them.
+
+(ns ipld.dag-cbor-write
+  (:require [multiformats.cid :as cid])
+  (:export [head int-item text-item bytes-item null-item bool-item link-item
+            link-bytes-item array-head map-item append key-less?
+            main test-ints test-scalars test-link test-array test-map test-key-order-utf8]))
+
+(defn append [a :vector-i64 b :vector-i64] :vector-i64
+  (let [n (vector-count b)]
+    (loop [i 0 acc a]
+      (if (>= i n) acc (recur (+ i 1) (vector-conj acc (vector-at b i)))))))
+
+(defn- be [n :i64 width :i64] :vector-i64
+  ;; n as WIDTH big-endian bytes
+  (loop [i (- width 1) acc (vector-i64)]
+    (if (< i 0)
+      acc
+      (recur (- i 1) (vector-conj acc (bit-and (i64-shift-right n (* 8 i)) 255))))))
+
+(defn head [major :i64 n :i64] :vector-i64
+  (let [m (i64-shift-left major 5)]
+    (if (< n 24) (vector-i64 (+ m n))
+        (if (< n 256) (append (vector-i64 (+ m 24)) (be n 1))
+            (if (< n 65536) (append (vector-i64 (+ m 25)) (be n 2))
+                (if (< n 4294967296) (append (vector-i64 (+ m 26)) (be n 4))
+                    (append (vector-i64 (+ m 27)) (be n 8))))))))
+
+(defn int-item [n :i64] :vector-i64
+  (if (< n 0) (head 1 (- -1 n)) (head 0 n)))
+
+(defn text-item [s :string] :vector-i64
+  (let [b (vector-i64-from-bytes (string-to-utf8 s))]
+    (append (head 3 (vector-count b)) b)))
+
+(defn bytes-item [b :vector-i64] :vector-i64
+  (append (head 2 (vector-count b)) b))
+
+(defn null-item [] :vector-i64 (vector-i64 246))
+
+(defn bool-item [b :bool] :vector-i64 (if b (vector-i64 245) (vector-i64 244)))
+
+(defn link-bytes-item [c :vector-i64] :vector-i64
+  ;; a link given as its BINARY CID (no multibase prefix), e.g. what
+  ;; document-link-value answers: tag 42 over the byte string 00 ++ c
+  (append (vector-i64 216 42) (bytes-item (append (vector-i64 0) c))))
+
+(defn link-item [c :string] :vector-i64
+  ;; "" for an invalid CID string: the caller checks cid/cid-valid? first
+  (if (cid/cid-valid? c)
+    (link-bytes-item (cid/cid->bytes c))
+    (vector-i64)))
+
+(defn array-head [n :i64] :vector-i64 (head 4 n))
+
+(defn- utf8-width [cp :i64] :i64
+  (if (< cp 128) 1 (if (< cp 2048) 2 (if (< cp 65536) 3 4))))
+
+(defn key-less? [a :string b :string] :bool
+  ;; DAG-CBOR map key order: shorter encoded key first, then bytewise. Keys of
+  ;; equal UTF-8 length compare by code point, which is UTF-8's byte order.
+  ;; string-code-point-at takes a UTF-8 BYTE offset (string-length is the byte
+  ;; length), so the walk steps by each code point's width; up to the first
+  ;; difference both keys share their code points, hence their offsets.
+  (let [la (string-byte-length a) lb (string-byte-length b)]
+    (if (< la lb) true
+        (if (> la lb) false
+            (loop [i 0]
+              (if (>= i la)
+                false
+                (let [ca (string-code-point-at a i) cb (string-code-point-at b i)]
+                  (if (< ca cb) true
+                      (if (> ca cb) false (recur (+ i (utf8-width ca))))))))))))
+
+(defn- smallest-unused [keys [:set :string] used [:set :string]] :string
+  (let [n (typed-set-count [:set :string] keys)]
+    (loop [i 0 best "" found false]
+      (if (>= i n)
+        best
+        (let [k (typed-set-nth [:set :string] keys i)]
+          (if (typed-set-contains [:set :string] used k)
+            (recur (+ i 1) best found)
+            (if (or (not found) (key-less? k best))
+              (recur (+ i 1) k true)
+              (recur (+ i 1) best found))))))))
+
+(defn map-item [keys [:set :string] values [:map :string :bytes]] :vector-i64
+  ;; values: each key's ENCODED value, as :bytes (bytes-from-vector-i64 of an item)
+  (let [n (typed-set-count [:set :string] keys)]
+    (loop [i 0 used (typed-set-new [:set :string]) acc (head 5 n)]
+      (if (>= i n)
+        acc
+        (let [k (smallest-unused keys used)]
+          (recur (+ i 1) (typed-set-conj [:set :string] used k)
+                 (append (append acc (text-item k))
+                         (vector-i64-from-bytes (get values k (bytes-from-vector-i64 (null-item)))))))))))
+
+;; --- tests: every expected vector is ipld.core/encode's, 2026-10-09 ---------
+
+(defn- pass [b :bool] :i64 (if b 1 0))
+
+(defn- same? [a :vector-i64 b :vector-i64] :bool
+  (let [n (vector-count a)]
+    (if (not (= n (vector-count b)))
+      false
+      (loop [i 0] (if (>= i n) true (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false))))))
+
+(defn test-ints [] :i64
+  (pass (and (same? (int-item 0) (vector-i64 0)) (same? (int-item 23) (vector-i64 23))
+             (same? (int-item 24) (vector-i64 24 24)) (same? (int-item 255) (vector-i64 24 255))
+             (same? (int-item 256) (vector-i64 25 1 0)) (same? (int-item 65536) (vector-i64 26 0 1 0 0))
+             (same? (int-item -1) (vector-i64 32)) (same? (int-item -100) (vector-i64 56 99)))))
+
+(defn test-scalars [] :i64
+  (pass (and (same? (text-item "") (vector-i64 96)) (same? (text-item "seq") (vector-i64 99 115 101 113))
+             (same? (text-item "日本") (vector-i64 102 230 151 165 230 156 172))
+             (same? (null-item) (vector-i64 246)) (same? (bool-item true) (vector-i64 245))
+             (same? (bool-item false) (vector-i64 244)))))
+
+(defn test-link [] :i64
+  (pass (and (same? (link-item "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+                    (vector-i64 216 42 88 37 0 1 85 18 32 227 176 196 66 152 252 28 20 154 251 244 200
+                                153 111 185 36 39 174 65 228 100 155 147 76 164 149 153 27 120 82 184 85))
+             (= (vector-count (link-item "not-a-cid")) 0))))
+
+(defn test-array [] :i64
+  (pass (same? (append (append (append (array-head 3) (int-item 1)) (text-item "a")) (null-item))
+               (vector-i64 131 1 97 97 246))))
+
+(defn test-map [] :i64
+  (let [three (map-item (typed-set-new [:set :string] "state" "prev" "seq")
+                        (typed-map-new [:map :string :bytes]
+                                       "state" (bytes-from-vector-i64 (text-item "s"))
+                                       "prev" (bytes-from-vector-i64 (null-item))
+                                       "seq" (bytes-from-vector-i64 (int-item 0))))
+        seven (map-item (typed-set-new [:set :string] "authority" "lamport" "causes" "actor" "state" "prev" "seq")
+                        (typed-map-new [:map :string :bytes]
+                                       "authority" (bytes-from-vector-i64 (int-item 1))
+                                       "lamport" (bytes-from-vector-i64 (int-item 2))
+                                       "causes" (bytes-from-vector-i64 (int-item 3))
+                                       "actor" (bytes-from-vector-i64 (int-item 4))
+                                       "state" (bytes-from-vector-i64 (int-item 5))
+                                       "prev" (bytes-from-vector-i64 (int-item 6))
+                                       "seq" (bytes-from-vector-i64 (int-item 7))))]
+    (pass (and (same? three (vector-i64 163 99 115 101 113 0 100 112 114 101 118 246 101 115 116 97 116 101 97 115))
+               (same? seven (vector-i64 167 99 115 101 113 7 100 112 114 101 118 6 101 97 99 116 111 114 4
+                                        101 115 116 97 116 101 5 102 99 97 117 115 101 115 3 103 108 97 109
+                                        112 111 114 116 2 105 97 117 116 104 111 114 105 116 121 1))))))
+
+(defn test-key-order-utf8 [] :i64
+  ;; equal UTF-8 length, multi-byte code points: bytewise (2026-10-09, S5 --
+  ;; the walk stepped one byte at a time and trapped on "éa" vs "éb": the
+  ;; second offset splits é)
+  (pass (and (key-less? "é1" "日") (not (key-less? "日" "é1"))
+             (key-less? "日b" "a😀") (key-less? "日b" "😀") (key-less? "😀a" "😀b")
+             (key-less? "ab" "é") (not (key-less? "é" "é")) (key-less? "éa" "éb"))))
+
+;; main: the number of test-* that pass (6 when all do).
+(defn main [] :i64
+  (+ (test-ints) (test-scalars) (test-link) (test-array) (test-map) (test-key-order-utf8)))

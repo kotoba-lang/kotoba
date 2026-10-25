@@ -1,0 +1,153 @@
+(ns saifu.policy
+  "何に署名してよいかの判定。**純粋関数だけ。鍵にも網にも触らない。**
+
+  ## Keplr の popup を値に置き換える
+
+  Keplr / Leap は権限を『人間が popup で 1 件ずつ承認する』ことで解いている。
+  Worker・CLI・routine・agent には popup を出す相手がいないので、普通に起きるのは
+  『鍵を環境変数に置く』——その瞬間に権限は **ambient authority**（持っているだけで
+  何でもできる）に退化する。
+
+  ここでは権限を **値** にする。agent に渡すのは鍵ではなく、狭められた policy。
+
+  ## 単調性: attenuate は緩められない
+
+  `kagi/phase.kotoba` の不変条件をそのまま継承する ——『caution は足せるが policy は
+  緩められない』。`attenuate` は緩い child を **無視せず error にする**。無視すると
+  『狭めたつもりが狭まっていない』が沈黙で成立してしまい、委譲の意味が消える。
+
+  ## disposition は UI ではない
+
+  `:commit` / `:escalate` / `:hold` は判断であって画面ではない。`:escalate` は
+  『人間が承認するまで進めない』を意味するだけで、どう見せるか（CLI プロンプト /
+  push / Slack）は host の関心事。だから同じ policy が Worker でも CLI でも通る。
+
+  ## 上限は台帳に対して評価する
+
+  `gate` は累計消費 `spent` を **引数で受け取る**。プロセス内のカウンタを持たない
+  のは意図的で、同じ鍵を 2 プロセスが使えば内部カウンタは黙って 2 倍を許す。
+  呼び出し側は kagi の append-only 台帳から `spent` を出す（ADR-2608039900 決定 3）。"
+  (:require [kotoba.lang.coll :as set]))
+
+(def dispositions
+  "厳しい順。**index が大きいほど厳しい** —— 比較で『少なくとも同じだけ厳しい』を
+   表現するために順序を持たせている。"
+  [:commit :escalate :hold])
+
+(defn- caution-level
+  "順序の index。未知の disposition は -1 = **最も緩い**扱いにしない ——
+   下の `at-least-as-cautious?` で parent 側が -1 になると何でも通ってしまう。
+   未知は呼び出し側で弾く前提。"
+  [d]
+  (loop [i 0]
+    (cond (>= i (count dispositions)) -1
+          (= d (nth dispositions i)) i
+          :else (recur (inc i)))))
+
+(defn at-least-as-cautious?
+  "`child` が `parent` と同じかそれ以上に厳しいか。"
+  [parent child]
+  (>= (caution-level child) (caution-level parent)))
+
+(defn- subset-or-any?
+  "parent が `:any` なら何でも許す。集合なら child ⊆ parent。"
+  [parent child]
+  (cond
+    (= :any parent) true
+    (= :any child) false                 ; parent が限定しているのに child が :any は拡大
+    :else (set/subset? (set child) (set parent))))
+
+(defn- amounts-within?
+  "denom ごとに child ≤ parent。**parent に無い denom を child が持つのは拡大**
+   —— 『指定が無い = 無制限』にすると、狭めたつもりが穴になる。"
+  [parent child]
+  (every? (fn [[denom v]]
+            (let [p (get parent denom)]
+              (and (number? p) (<= v p))))
+          child))
+
+(defn widens
+  "`child` が `parent` より緩い点を全部返す（空 = 緩めていない）。
+
+   真偽値ではなく **理由の列** を返す。委譲が拒否されたとき『どこが緩いのか』が
+   分からないと、呼び出し側は総当たりで狭めることになる。"
+  [parent child]
+  (cond-> []
+    (not (subset-or-any? (:chains parent) (:chains child)))
+    (conj {:field :chains :parent (:chains parent) :child (:chains child)})
+
+    (not (subset-or-any? (:msg-types parent) (:msg-types child)))
+    (conj {:field :msg-types :parent (:msg-types parent) :child (:msg-types child)})
+
+    (not (subset-or-any? (:recipients parent) (:recipients child)))
+    (conj {:field :recipients :parent (:recipients parent) :child (:recipients child)})
+
+    (not (amounts-within? (:max-spend parent) (:max-spend child)))
+    (conj {:field :max-spend :parent (:max-spend parent) :child (:max-spend child)})
+
+    (not (amounts-within? (:max-per-tx parent) (:max-per-tx child)))
+    (conj {:field :max-per-tx :parent (:max-per-tx parent) :child (:max-per-tx child)})
+
+    (and (:expires-at parent)
+         (or (nil? (:expires-at child)) (> (:expires-at child) (:expires-at parent))))
+    (conj {:field :expires-at :parent (:expires-at parent) :child (:expires-at child)})
+
+    (not (at-least-as-cautious? (:disposition parent) (:disposition child)))
+    (conj {:field :disposition :parent (:disposition parent) :child (:disposition child)})))
+
+(defn attenuate
+  "`parent` を `child` で狭める。
+
+   → 狭められた policy、または `{:error :widens :widens [...]}`。
+
+   **緩い child を黙って落とさない。** 落とすと『狭めたつもりが狭まっていない』が
+   沈黙で成立し、委譲の意味が消える。"
+  [parent child]
+  (let [w (widens parent child)]
+    (if (seq w)
+      {:error :widens :widens w}
+      (merge parent child))))
+
+(defn- amount-of [coins denom] (get coins denom 0))
+
+(defn gate
+  "この要求に署名してよいか。
+
+   `policy`  … 権限（値）
+   `request` … `{:chain :akash :msg-type :MsgSend :recipient \"akash1...\"
+                 :amount {:uakt 500000}}`
+   `spent`   … 台帳から出した累計消費（denom → 数量）
+   `now`     … epoch ms
+
+   → `{:disposition :commit|:escalate|:hold :reason kw}`
+
+   **理由を必ず付ける。** disposition だけ返すと、拒否されたときに policy の
+   どの条件に当たったのかが分からず、運用者は当てずっぽうで policy を広げる
+   ——『分からないから緩める』が一番危ない直し方になる。"
+  [policy request spent now]
+  (let [{:keys [chains msg-types recipients max-spend max-per-tx expires-at disposition]} policy
+        {:keys [chain msg-type recipient amount]} request
+        over-per-tx (some (fn [[d v]] (when (> v (amount-of max-per-tx d)) d)) amount)
+        over-total (some (fn [[d v]]
+                           (when (> (+ v (amount-of spent d)) (amount-of max-spend d)) d))
+                         amount)]
+    (cond
+      (nil? policy)                          {:disposition :hold :reason :no-policy}
+      (and expires-at (>= now expires-at))   {:disposition :hold :reason :expired}
+      (not (subset-or-any? chains [chain]))  {:disposition :hold :reason :chain-not-allowed}
+      (not (subset-or-any? msg-types [msg-type])) {:disposition :hold :reason :msg-type-not-allowed}
+      (and recipient (not (subset-or-any? recipients [recipient])))
+      {:disposition :hold :reason :recipient-not-allowed}
+      over-per-tx                            {:disposition :hold :reason :over-per-tx}
+      over-total                             {:disposition :hold :reason :over-max-spend}
+      :else                                  {:disposition (or disposition :escalate)
+                                              :reason :allowed})))
+
+(def agent-default
+  "agent に渡す既定。**価値が動くものは人間承認**（ADR-2608039900）。
+
+   `:commit` に落としてよいのは、chains / msg-types / max-spend / expires-at の
+   4 つをすべて狭めた場合だけ。ここを既定にしないのは、既定が緩いと『とりあえず
+   既定で』が事故になるから。"
+  {:chains #{} :msg-types #{} :recipients #{}
+   :max-spend {} :max-per-tx {} :disposition :escalate})

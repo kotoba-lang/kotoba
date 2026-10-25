@@ -1,0 +1,81 @@
+(ns ekyc.identity-session-test
+  (:require [cljs.test :refer-macros [deftest is async]] [ekyc.identity-session :as s]
+            [ekyc.identity-authority :as authority] [ekyc.identity-crypto :as crypto]
+            [ekyc.identity-policy :as policy] [ekyc.identity-policy-test :as f]
+            [ekyc.identity-passport-test :refer [rejects]]))
+(def initial {:observers {"authn" {:status :active :key-id "key-1" :key-thumbprint "thumb-1" :kinds s/kinds}}})
+(def event {:op :observe-session :policy-version s/version :session-id "session-a" :principal "alice" :holder-key-id "holder-key"
+            :kind :authenticated :event-id "open" :observer "authn" :at f/now :evidence-ref "private:authn"
+            :observer-key-id "key-1" :observer-key-thumbprint "thumb-1" :observer-signature-verified true})
+(defn apply-event [state e] (:state (s/transition state e f/now)))
+(def opened (apply-event initial event))
+(defn decide [state at] (s/decision state "session-a" "alice" "holder-key" :code-review at))
+(deftest event-boundaries-and-decay
+  (is (nil? (decide opened f/now)))
+  (is (= :session-not-active (decide (assoc-in opened [:sessions "session-a" :status] :suspended) f/now)))
+  (is (= (s/opinion (get-in opened [:sessions "session-a"]) f/now)
+         (s/opinion (assoc-in (get-in opened [:sessions "session-a"]) [:controller :mass] js/Infinity) f/now)))
+  (let [o (s/opinion (get-in opened [:sessions "session-a"]) f/now)]
+    (is (= 0.9 (:belief o))) (is (= 0.1 (:uncertainty o))) (is (= 0.95 (:projected-value o)))
+    (is (false? (:calibrated o))))
+  (is (= :step-up-required (decide opened (+ f/now 1500000))))
+  (is (= :session-expired (decide opened (+ f/now 1800000))))
+  (is (= :session-event-limit (decide (assoc-in opened [:sessions "session-a" :events] (zipmap (range 1024) (repeat {}))) f/now)))
+  (is (= :observer-reverification-required (decide (assoc-in opened [:observers "authn" :status] :revoked) f/now)))
+  (is (= :observer-reverification-required (decide (assoc-in opened [:observers "authn" :key-thumbprint] "rotated") f/now)))
+  (doseq [change [{:observer-signature-verified false} {:observer "unknown"} {:observer-key-id "old"}
+                  {:observer-key-thumbprint "other"} {:at (+ f/now 1)} {:at (- f/now 120001)} {:kind :unknown}]]
+    (is (false? (:ok (s/transition initial (merge event change) f/now)))))
+  (is (= :duplicate-session-event (:reason (s/transition opened event f/now))))
+  (is (= :session-binding-mismatch (:reason (s/transition opened (assoc event :event-id "other" :principal "bob") f/now))))
+  (is (= :out-of-order-session-event (:reason (s/transition opened (assoc event :event-id "late" :at (dec f/now)) f/now))))
+  (is (= :session-revoked (decide (apply-event opened (assoc event :kind :revoke :event-id "late-revoke" :at (dec f/now))) f/now)))
+  (is (= :session-mismatch (s/decision opened "session-a" "alice" "another-key" :code-review f/now))))
+(deftest no-farming-no-time-based-risk-forgiveness
+  (let [alert (assoc event :kind :behavior-alert :event-id "alert")
+        flagged (apply-event opened alert)
+        stepped (apply-event flagged (assoc event :kind :step-up :event-id "step"))
+        repeated (reduce (fn [state n] (apply-event state (assoc event :kind :step-up :event-id (str "step-" n)))) stepped (range 20))
+        resolved (apply-event repeated (assoc event :kind :resolve :event-id "resolved" :target-event-id "alert" :resolution-ref "private:review" :benign-confirmed true))
+        revoked (apply-event resolved (assoc event :kind :revoke :event-id "revoked"))]
+    (is (= :step-up-required (decide flagged f/now)))
+    (is (= :step-up-required (decide repeated f/now)))
+    (is (= (s/opinion (get-in stepped [:sessions "session-a"]) f/now) (s/opinion (get-in repeated [:sessions "session-a"]) f/now)))
+    (is (pos? (:disbelief (s/opinion (get-in repeated [:sessions "session-a"]) (+ f/now 9999999)))))
+    (is (nil? (decide resolved f/now)))
+    (is (= :session-revoked (decide revoked f/now)))
+    (is (false? (:ok (s/transition revoked (assoc event :kind :step-up :event-id "try-again") f/now))))
+    (is (false? (:ok (s/transition repeated (assoc event :kind :resolve :event-id "fake" :target-event-id "other" :resolution-ref "private:r" :benign-confirmed true) f/now))))))
+(deftest current-session-is-required-before-quota-effects
+  (let [request {:op :reserve :id "app" :principal "alice" :session-verified true :session-id "session-a" :scope-id "scope"
+                 :task :code-review :utc-day (quot f/now 86400000) :request-id "first"}
+        good (policy/transition f/approved request f/now)
+        bad (policy/transition (assoc-in f/approved [:sessions "session-a" :status] :revoked) request f/now)]
+    (is (= :infer (get-in good [:effects 0 :type])))
+    (is (= :session-revoked (:reason bad))) (is (nil? (:effects bad)))
+    (is (= :session-mismatch (:reason (policy/transition f/approved (assoc request :session-id "other") f/now))))))
+(deftest real-observer-signature-and-key-rotation
+  (async done
+    (-> (.generateKey (.-subtle js/crypto) "Ed25519" true #js ["sign" "verify"])
+        (.then (fn [keys]
+                 (-> (.exportKey (.-subtle js/crypto) "jwk" (.-publicKey keys))
+                     (.then (fn [raw]
+                              (let [jwk (select-keys (js->clj raw :keywordize-keys true) [:kty :crv :x])]
+                                (-> (crypto/holder-key-id jwk)
+                                    (.then (fn [thumb]
+                                             (let [state (-> initial (assoc-in [:observers "authn" :public-jwk] jwk)
+                                                             (assoc-in [:observers "authn" :key-thumbprint] thumb))
+                                                   command (assoc event :aud "https://kotoba.cloud" :nonce "open"
+                                                                  :iat (crypto/seconds f/now) :exp (+ (crypto/seconds f/now) 120))
+                                                   read! #(js/Promise.resolve {:revision 0 :state state})
+                                                   cas! (fn [_ saved]
+                                                          (is (nil? (decide saved f/now)))
+                                                          (js/Promise.resolve {:status :committed :revision 1 :receipt-ref "private:commit"}))]
+                                               (-> (crypto/sign (.-privateKey keys) "key-1" "kotoba-session-event+jwt" command)
+                                                   (.then (fn [token]
+                                                            (-> (authority/observe-session "authn" token f/now read! cas!)
+                                                                (.then (fn [result]
+                                                                         (is (true? (:ok result)))
+                                                                         (rejects #(authority/observe-session "authn" token f/now
+                                                                                    (fn [] (js/Promise.resolve {:revision 1 :state (assoc-in state [:observers "authn" :key-id] "rotated")})) cas!))))))))))))))))))
+        (.catch #(is false (str %))) (.finally done))))

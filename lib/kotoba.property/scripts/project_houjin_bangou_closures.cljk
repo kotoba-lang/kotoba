@@ -1,0 +1,137 @@
+(ns project-houjin-bangou-closures
+  "全件 corpus から**登記記録が閉じた法人**の projection を作る。
+
+   ## なぜ官報とは別に要るか
+
+   官報の解散公告は「解散を決議した」（手続の入口）で 90 日窓しか無い。国税庁の
+   全件は「登記記録が閉じた」（出口）で、**日付を持つ全履歴**が毎月出る。実測
+   2026-08-19: 閉鎖 773,796 件 = 登記の 13%。同じ会社が両方に出るとき、
+   2 つの日付は数年離れうる —— 潰さない。
+
+   ## 全件を commit しない
+
+   773,796 行を面に置くと**クエリのたびに** DataScript へ load される。commit するのは
+   与えた番号集合（= 我々が関心を持つ会社）に一致した分だけ。**捨てるのではない** ——
+   corpus は cache に在り、`--numbers` を変えればいつでも切り直せる。
+
+   ## 分母は manifest に載せる
+
+   一致 0 件でも「閉鎖が無い」とは言えない（番号集合が開いている会社ばかりなら
+   当然 0 になる）。事由ごとの全件分布と、承継先を持つ件数を manifest に出す ——
+   **`11`（合併）だけが承継先を持つ**ことが `close-cause-labels` の対応付けの裏付けで、
+   毎回それを測り直す。
+
+   usage:
+     kbb --backend sci -cp src scripts/project_houjin_bangou_closures.cljk --corpus <c>
+       --numbers <file of 13-digit numbers> --out <repo>/data/closures.datoms.edn"
+  (:require [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kotoba.property.houjin-bangou-zenken :as hb]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["readline" :as readline]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+
+(defn- read-numbers [f]
+  (when (and f (.existsSync fs f))
+    (->> (str/split (.readFileSync fs f "utf8") #"\n")
+         (map str/trim)
+         (filter #(re-matches #"[0-9]{13}" %))
+         set)))
+
+(defn -main []
+  (let [corpus (arg "--corpus" nil)
+        numbers-file (arg "--numbers" nil)
+        out (arg "--out" nil)
+        wanted (read-numbers numbers-file)]
+    (when-not (and corpus out)
+      (println "usage: project_houjin_bangou_closures.cljs --corpus <c> [--numbers <f>] --out <o>")
+      (js/process.exit 2))
+    (when-not (.existsSync fs corpus)
+      (println (str "corpus not found: " corpus))
+      (js/process.exit 2))
+    (let [;; corpus の 1 行目は cut 元を言う manifest。**その publish と sha を
+          ;; projection に運ぶ** —— 運ばないと「どの月の全件から切ったか」が
+          ;; artifact から読めず、古い publish から切った projection が
+          ;; 「過去についての正しい答え」を返し続ける（verify-projections が
+          ;; 45 日を超えた publish を赤にする根拠もこれ）。
+          ;; ⚠ 1 行目だけが要る。2.6 GB を読み込まない（`readFileSync` は
+          ;; ヒープに全部載せる）—— 先頭 8 KB を読んで最初の改行までを取る。
+          corpus-head (try
+                        (let [fd (.openSync fs corpus "r")
+                              buf (js/Buffer.alloc 8192)
+                              n (.readSync fs fd buf 0 8192 0)]
+                          (.closeSync fs fd)
+                          (reader/read-string (first (str/split (.toString buf "utf8" 0 n) #"\n"))))
+                        (catch :default _ nil))
+          state (atom {:scanned 0 :closed 0 :with-successor 0
+                       :by-cause {} :kept [] :unreadable 0
+                       :earliest nil :latest nil})
+          rl (.createInterface readline #js {:input (.createReadStream fs corpus)
+                                             :crlfDelay js/Infinity})]
+      (.on rl "line"
+           (fn [line]
+             (when-not (str/blank? line)
+               ;; ⚠ corpus の 1 行は **EDN の record**（`:company/*`）であって生の
+               ;; JSON 行ではない。最初の版は `JSON.parse` して `:company/close-cause`
+               ;; を探し、**773,796 件在るのに 0 件**と報告した（evidence floor が
+               ;; 止めた。0 を「閉鎖が無い」として書き出していたら誰も気付かない）。
+               (if-let [rec (try (reader/read-string line) (catch :default _ nil))]
+                 (when-not (:corpus/manifest rec)
+                   (swap! state update :scanned inc)
+                   (when (hb/closed? rec)
+                     (let [cause (:company/close-cause rec)
+                           at (:company/closed-at rec)]
+                       (swap! state #(cond-> (-> % (update :closed inc)
+                                                 (update-in [:by-cause cause] (fnil inc 0)))
+                                       (:company/successor-houjin-bangou rec)
+                                       (update :with-successor inc)
+                                       (and at (or (nil? (:earliest %)) (neg? (compare at (:earliest %)))))
+                                       (assoc :earliest at)
+                                       (and at (or (nil? (:latest %)) (pos? (compare at (:latest %)))))
+                                       (assoc :latest at)))
+                       (when (or (nil? wanted) (contains? wanted (:company/houjin-bangou rec)))
+                         (swap! state update :kept conj rec)))))
+                 (swap! state update :unreadable inc)))))
+      (.on rl "close"
+           (fn []
+             (let [{:keys [scanned closed with-successor by-cause kept unreadable earliest latest]} @state
+                   labelled (into {} (for [[c n] by-cause]
+                                       [(or (get hb/close-cause-labels c) (str "unknown:" c)) n]))
+                   manifest {:corpus/manifest true
+                             :corpus/projection true
+                             :corpus/format :edn-lines
+                             :source/dataset "houjin-bangou"
+                             :source/authority "JP/NTA-HoujinBangou"
+                             :source/licence "国税庁法人番号公表サイト — 利用規約に基づく再配布可"
+                             :source/attribution "出典：国税庁法人番号公表サイト（全件データ）を加工して作成"
+                             :source/observed-at (.toISOString (js/Date.))
+                             :source/publish (:source/publish corpus-head)
+                             :source/content-sha256 (:source/content-sha256 corpus-head)
+                             :corpus/section :closures
+                             ;; 分母。一致 0 件でも「閉鎖が無い」とは言えない。
+                             :projection/scanned scanned
+                             :projection/closed-total closed
+                             :projection/closed-with-successor with-successor
+                             :projection/closed-by-cause (pr-str labelled)
+                             :projection/queried (count (or wanted #{}))
+                             :corpus/closed-at-range (str earliest " .. " latest)
+                             :corpus/record-count (count kept)}]
+               (when (zero? closed)
+                 (js/console.error "project-closures: scanned the corpus and found no closed record at all — that is a failure here, not a fact about the registry")
+                 (js/process.exit 2))
+               (.mkdirSync fs (.dirname path out) #js {:recursive true})
+               (.writeFileSync fs out
+                               (str (pr-str manifest) "\n"
+                                    (str/join "\n" (map pr-str kept))
+                                    (when (seq kept) "\n"))
+                               "utf8")
+               (println (pr-str {:out out :scanned scanned :closed closed
+                                 :with-successor with-successor
+                                 :by-cause labelled
+                                 :kept (count kept) :unreadable unreadable
+                                 :closed-at-range (str earliest " .. " latest)}))))))))
+
+(-main)

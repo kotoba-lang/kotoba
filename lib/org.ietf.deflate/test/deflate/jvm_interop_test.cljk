@@ -1,0 +1,166 @@
+(ns deflate.jvm-interop-test
+  "Conformance against a reference implementation, in both directions.
+
+   `java.util.zip` is used *only* here, and only as an oracle: the library never
+   touches it. Two directions matter for different reasons —
+
+   - reference → us proves the decoder reads real streams (this is what the
+     original suite covered),
+   - us → reference proves the encoder writes real streams. An encoder that only
+     its own decoder can read is the failure mode this file exists to prevent,
+   and self-round-trips cannot detect it.
+
+   Also pins the compression ratio against zlib's. The greedy+lazy matcher here
+   is not zopfli; the point of the assertion is to catch a *collapse* (a bug
+   that silently stops emitting matches), not to claim parity."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [deflate.core :as deflate])
+  (:import [java.io ByteArrayOutputStream ByteArrayInputStream]
+           [java.util.zip Deflater Inflater CRC32 Adler32 GZIPInputStream GZIPOutputStream]))
+
+(defn- ->ubytes [^bytes ba] (mapv #(bit-and (int %) 0xff) ba))
+(defn- ->ba ^bytes [bytes] (byte-array (map unchecked-byte bytes)))
+
+(defn- java-deflate
+  "Reference compressor → vector of unsigned bytes."
+  [bytes level nowrap]
+  (let [d   (Deflater. level nowrap)
+        out (ByteArrayOutputStream.)
+        buf (byte-array 65536)]
+    (.setInput d (->ba bytes))
+    (.finish d)
+    (while (not (.finished d))
+      (let [n (.deflate d buf)] (.write out buf 0 n)))
+    (.end d)
+    (->ubytes (.toByteArray out))))
+
+(defn- java-inflate
+  "Reference decompressor. Throws if the stream is not valid DEFLATE/zlib, which
+   is the whole point when the input came from our encoder."
+  [bytes nowrap]
+  (let [inf (Inflater. nowrap)
+        out (ByteArrayOutputStream.)
+        buf (byte-array 65536)]
+    (.setInput inf (->ba bytes))
+    (loop []
+      (cond
+        (.finished inf) nil
+        :else (let [n (.inflate inf buf)]
+                (cond
+                  (pos? n) (do (.write out buf 0 n) (recur))
+                  (.finished inf) nil
+                  (.needsInput inf)
+                  (throw (ex-info "reference inflater ran out of input" {}))
+                  (.needsDictionary inf)
+                  (throw (ex-info "reference inflater wants a dictionary" {}))
+                  :else (recur)))))
+    (.end inf)
+    (->ubytes (.toByteArray out))))
+
+(defn- java-gzip [bytes]
+  (let [out (ByteArrayOutputStream.)]
+    (with-open [g (GZIPOutputStream. out)] (.write g (->ba bytes)))
+    (->ubytes (.toByteArray out))))
+
+(defn- java-gunzip [bytes]
+  (let [out (ByteArrayOutputStream.)
+        buf (byte-array 65536)]
+    (with-open [g (GZIPInputStream. (ByteArrayInputStream. (->ba bytes)))]
+      (loop []
+        (let [n (.read g buf)]
+          (when (pos? n) (.write out buf 0 n) (recur)))))
+    (->ubytes (.toByteArray out))))
+
+(defn- rand-bytes [n seed]
+  (let [r (java.util.Random. seed)]
+    (vec (repeatedly n #(.nextInt r 256)))))
+
+(def ^:private corpus
+  {:empty      []
+   :one        [42]
+   :all-bytes  (vec (range 256))
+   :runs       (vec (repeat 10000 97))
+   :text       (mapv int (seq (apply str (repeat 500 "the quick brown fox jumps over the lazy dog. "))))
+   :source     (mapv int (seq (apply str (repeat 200 "(defn foo [x] (let [y (inc x)] (str \"y=\" y)))\n"))))
+   :binary-ish (vec (mapcat (fn [i] [0 0 (mod i 256) 255 (mod i 17)]) (range 4000)))
+   :random     (rand-bytes 40000 42)
+   :mixed      (vec (concat (repeat 5000 7) (rand-bytes 5000 1) (repeat 20000 7)))})
+
+;; ---------------------------------------------------------------------------
+;; us → reference (the direction a self-round-trip cannot check)
+;; ---------------------------------------------------------------------------
+
+(deftest our-raw-deflate-is-read-by-the-reference-inflater
+  (doseq [level [0 1 4 6 9]
+          [name data] corpus]
+    (testing (str "level " level " / " name)
+      (is (= data (java-inflate (deflate/deflate-raw data {:level level}) true))))))
+
+(deftest our-zlib-stream-is-read-by-the-reference-inflater
+  (doseq [[name data] corpus]
+    (testing name
+      ;; nowrap=false makes the reference parse the header and verify Adler-32.
+      (is (= data (java-inflate (deflate/deflate data) false))))))
+
+(deftest our-gzip-member-is-read-by-the-reference
+  (doseq [[name data] corpus]
+    (testing name
+      (is (= data (java-gunzip (deflate/gzip data))))))
+  (testing "with a filename in the header"
+    (is (= (:text corpus)
+           (java-gunzip (deflate/gzip (:text corpus) {:filename "corpus.txt"}))))))
+
+;; ---------------------------------------------------------------------------
+;; reference → us
+;; ---------------------------------------------------------------------------
+
+(deftest we-read-reference-raw-deflate
+  (doseq [level (range 0 10)
+          [name data] corpus]
+    (testing (str "level " level " / " name)
+      (is (= data (deflate/inflate-raw (java-deflate data level true)))))))
+
+(deftest we-read-reference-zlib-streams
+  (doseq [level (range 0 10)
+          [name data] corpus]
+    (testing (str "level " level " / " name)
+      (is (= data (deflate/inflate (java-deflate data level false)))))))
+
+(deftest we-read-reference-gzip-files
+  (doseq [[name data] corpus]
+    (testing name
+      (is (= data (deflate/gunzip (java-gzip data)))))))
+
+;; ---------------------------------------------------------------------------
+;; Checksums against the reference
+;; ---------------------------------------------------------------------------
+
+(deftest checksums-match-the-reference
+  (doseq [[name data] corpus]
+    (testing name
+      (let [crc (CRC32.) adl (Adler32.)]
+        (.update crc (->ba data))
+        (.update adl (->ba data))
+        (is (= (.getValue crc) (long (deflate/crc32 data))))
+        (is (= (.getValue adl) (long (deflate/adler32 data))))))))
+
+;; ---------------------------------------------------------------------------
+;; Ratio and scale
+;; ---------------------------------------------------------------------------
+
+(deftest ratio-is-in-the-same-league-as-zlib
+  (doseq [[name data] (select-keys corpus [:text :source :runs :binary-ish :mixed])]
+    (testing name
+      (let [ours   (count (deflate/deflate-raw data {:level 9}))
+            theirs (count (java-deflate data 9 true))]
+        (is (<= ours (* 1.5 theirs))
+            (str name ": ours " ours " vs zlib " theirs))))))
+
+(deftest handles-a-megabyte
+  (let [data (vec (mapcat (fn [i] (mapv int (seq (str "line " i " of a log file with some repeated shape\n"))))
+                          (range 20000)))]
+    (is (> (count data) 900000))
+    (let [z (deflate/deflate data)]
+      (is (< (count z) (quot (count data) 4)))
+      (is (= data (java-inflate z false)))
+      (is (= data (deflate/inflate z))))))

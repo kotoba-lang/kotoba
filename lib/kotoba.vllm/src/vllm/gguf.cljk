@@ -1,0 +1,347 @@
+(ns vllm.gguf
+  "Validated, lazy JVM GGUF v3 reader for local inference runtimes."
+  (:import [java.io Closeable RandomAccessFile]
+           [java.nio ByteBuffer ByteOrder]
+           [java.nio.channels FileChannel FileChannel$MapMode])
+  (:require [kotoba.bytes :as kbytes]))
+
+(def ^:private value-types
+  {0 :uint8 1 :int8 2 :uint16 3 :int16 4 :uint32 5 :int32
+   6 :float32 7 :bool 8 :string 9 :array 10 :uint64 11 :int64 12 :float64})
+
+(def ^:private tensor-types
+  {0 {:name :f32 :block 1 :bytes 4}
+   1 {:name :f16 :block 1 :bytes 2}
+   2 {:name :q4-0 :block 32 :bytes 18}
+   3 {:name :q4-1 :block 32 :bytes 20}
+   6 {:name :q5-0 :block 32 :bytes 22}
+   7 {:name :q5-1 :block 32 :bytes 24}
+   8 {:name :q8-0 :block 32 :bytes 34}
+   9 {:name :q8-1 :block 32 :bytes 36}
+   10 {:name :q2-k :block 256 :bytes 84}
+   11 {:name :q3-k :block 256 :bytes 110}
+   12 {:name :q4-k :block 256 :bytes 144}
+   13 {:name :q5-k :block 256 :bytes 176}
+   14 {:name :q6-k :block 256 :bytes 210}
+   15 {:name :q8-k :block 256 :bytes 292}
+   24 {:name :i8 :block 1 :bytes 1}
+   25 {:name :i16 :block 1 :bytes 2}
+   26 {:name :i32 :block 1 :bytes 4}
+   27 {:name :i64 :block 1 :bytes 8}
+   28 {:name :f64 :block 1 :bytes 8}
+   30 {:name :bf16 :block 1 :bytes 2}})
+
+(defrecord GGUFFile [^RandomAccessFile file ^FileChannel channel path version
+                     metadata tensors data-start]
+  Closeable
+  (close [_] (.close channel) (.close file)))
+
+(defn- read-buffer! [^FileChannel channel position size]
+  (when (> size Integer/MAX_VALUE)
+    (throw (ex-info "GGUF read window exceeds JVM buffer limit" {:bytes size})))
+  (let [buffer (doto (ByteBuffer/allocate (int size))
+                 (.order ByteOrder/LITTLE_ENDIAN))]
+    (loop [position (long position)]
+      (when (.hasRemaining buffer)
+        (let [n (.read channel buffer position)]
+          (when (neg? n) (throw (ex-info "truncated GGUF file" {:position position})))
+          (recur (+ position n)))))
+    (.flip buffer)
+    buffer))
+
+(defn- u8 [^RandomAccessFile f] (.readUnsignedByte f))
+(defn- u16 [^RandomAccessFile f] (Short/toUnsignedInt (Short/reverseBytes (.readShort f))))
+(defn- i16 [^RandomAccessFile f] (Short/reverseBytes (.readShort f)))
+(defn- i32 [^RandomAccessFile f] (Integer/reverseBytes (.readInt f)))
+(defn- u32 [^RandomAccessFile f] (Integer/toUnsignedLong (i32 f)))
+(defn- i64 [^RandomAccessFile f] (Long/reverseBytes (.readLong f)))
+(defn- f32 [^RandomAccessFile f] (Float/intBitsToFloat (i32 f)))
+(defn- f64 [^RandomAccessFile f] (Double/longBitsToDouble (i64 f)))
+
+(defn- gguf-string [^RandomAccessFile f]
+  (let [n (i64 f)]
+    (when (or (neg? n) (> n Integer/MAX_VALUE))
+      (throw (ex-info "invalid GGUF string length" {:length n})))
+    (let [bytes (byte-array (int n))]
+      (.readFully f bytes)
+      (kbytes/utf8-string bytes))))
+
+(declare read-value)
+(defn- read-value [^RandomAccessFile f type-id]
+  (case (get value-types type-id)
+    :uint8 (u8 f) :int8 (.readByte f) :uint16 (u16 f) :int16 (i16 f)
+    :uint32 (u32 f) :int32 (i32 f) :float32 (f32 f)
+    :bool (case (u8 f) 0 false 1 true
+                (throw (ex-info "invalid GGUF boolean" {})))
+    :string (gguf-string f) :uint64 (i64 f) :int64 (i64 f) :float64 (f64 f)
+    :array (let [element-type (u32 f) n (i64 f)]
+             (when (or (neg? n) (> n Integer/MAX_VALUE))
+               (throw (ex-info "invalid GGUF array length" {:length n})))
+             (mapv (fn [_] (read-value f element-type)) (range n)))
+    (throw (ex-info "unsupported GGUF metadata type" {:type-id type-id}))))
+
+(defn- align [position alignment]
+  (+ position (mod (- alignment (mod position alignment)) alignment)))
+
+(defn- tensor-byte-count [dimensions type-id]
+  (let [{:keys [block bytes] :as type} (get tensor-types type-id)
+        elements (reduce * 1 dimensions)]
+    (when-not type (throw (ex-info "unsupported GGML tensor type" {:type-id type-id})))
+    (when-not (zero? (mod elements block))
+      (throw (ex-info "GGML tensor element count is not block aligned"
+                      {:dimensions dimensions :type (:name type) :block block})))
+    (* (quot elements block) bytes)))
+
+(defn open-file [path]
+  (let [file (RandomAccessFile. (str path) "r") channel (.getChannel file)]
+    (try
+      (let [magic (byte-array 4)]
+        (.readFully file magic)
+        (when-not (= [71 71 85 70] (mapv #(bit-and 0xff %) magic))
+          (throw (ex-info "invalid GGUF magic" {:path (str path)})))
+        (let [version (u32 file) tensor-count (i64 file) metadata-count (i64 file)]
+          (when-not (= 3 version)
+            (throw (ex-info "only GGUF v3 is supported" {:version version})))
+          (when (or (neg? tensor-count) (neg? metadata-count)
+                    (> tensor-count Integer/MAX_VALUE) (> metadata-count Integer/MAX_VALUE))
+            (throw (ex-info "invalid GGUF catalog counts"
+                            {:tensors tensor-count :metadata metadata-count})))
+          (let [metadata (into {}
+                               (for [_ (range metadata-count)]
+                                 (let [key (gguf-string file) type-id (u32 file)]
+                                   [key (read-value file type-id)])))
+                alignment (long (get metadata "general.alignment" 32))
+                _ (when-not (and (pos? alignment) (zero? (mod alignment 8)))
+                    (throw (ex-info "invalid GGUF alignment" {:alignment alignment})))
+                catalog (mapv
+                         (fn [_]
+                           (let [name (gguf-string file) rank (u32 file)
+                                 _ (when (> rank 8)
+                                     (throw (ex-info "unsupported GGUF tensor rank"
+                                                     {:name name :rank rank})))
+                                 dimensions (mapv (fn [_] (i64 file)) (range rank))
+                                 type-id (u32 file) offset (i64 file)
+                                 byte-count (tensor-byte-count dimensions type-id)]
+                             {:name name :dimensions dimensions
+                              :shape (vec (reverse dimensions))
+                              :type (:name (get tensor-types type-id))
+                              :type-id type-id :offset offset :byte-count byte-count}))
+                         (range tensor-count))
+                data-start (align (.getFilePointer file) alignment)
+                file-size (.size channel)
+                tensors (into {}
+                              (map (fn [{:keys [name offset byte-count] :as info}]
+                                     (let [absolute (+ data-start offset)]
+                                       (when (or (neg? offset) (not (zero? (mod offset alignment)))
+                                                 (> (+ absolute byte-count) file-size))
+                                         (throw (ex-info "invalid GGUF tensor window"
+                                                         {:tensor name :offset offset
+                                                          :bytes byte-count :file-size file-size})))
+                                       [name (assoc info :absolute-offset absolute)])))
+                              catalog)]
+            (->GGUFFile file channel (str path) version metadata tensors data-start))))
+      (catch Throwable error (.close channel) (.close file) (throw error)))))
+
+(defn tensor-names [gguf] (vec (sort (keys (:tensors gguf)))))
+(defn tensor-info [gguf name] (get (:tensors gguf) name))
+(defn read-tensor-bytes [gguf name]
+  (if-let [{:keys [absolute-offset byte-count]} (tensor-info gguf name)]
+    (read-buffer! (:channel gguf) absolute-offset byte-count)
+    (throw (ex-info "GGUF tensor not found" {:tensor name :path (:path gguf)}))))
+
+(defn tensor-view
+  "Memory-map one tensor window without copying or decoding its payload."
+  [gguf name]
+  (if-let [{:keys [absolute-offset byte-count] :as info} (tensor-info gguf name)]
+    (assoc info :buffer (doto (.map ^FileChannel (:channel gguf)
+                                    FileChannel$MapMode/READ_ONLY
+                                    absolute-offset byte-count)
+                          (.order ByteOrder/LITTLE_ENDIAN)))
+    (throw (ex-info "GGUF tensor not found" {:tensor name :path (:path gguf)}))))
+
+(defn- half->float [bits]
+  (let [sign (bit-shift-left (bit-and bits 0x8000) 16)
+        exponent (bit-and (unsigned-bit-shift-right bits 10) 0x1f)
+        fraction (bit-and bits 0x3ff)
+        float-bits
+        (cond
+          (zero? exponent)
+          (if (zero? fraction)
+            sign
+            (loop [fraction fraction exponent -14]
+              (if (zero? (bit-and fraction 0x400))
+                (recur (bit-shift-left fraction 1) (dec exponent))
+                (bit-or sign (bit-shift-left (+ exponent 127) 23)
+                        (bit-shift-left (bit-and fraction 0x3ff) 13)))))
+          (= exponent 31)
+          (bit-or sign 0x7f800000 (bit-shift-left fraction 13))
+          :else
+          (bit-or sign (bit-shift-left (+ (- exponent 15) 127) 23)
+                  (bit-shift-left fraction 13)))]
+    (Float/intBitsToFloat (unchecked-int float-bits))))
+
+(defn decode-half
+  "Decode one IEEE-754 binary16 bit pattern to a JVM float."
+  [bits]
+  (half->float (bit-and 0xffff bits)))
+
+(defn decode-f32
+  "Decode one GGML tensor payload into an unboxed JVM float array.
+
+  Supports the dense types used by non-quantized models and the foundational
+  32-value Q4_0/Q4_1/Q8_0 and 256-value Q4_K/Q5_K/Q6_K block formats.
+  Importance-matrix formats remain catalog-readable but fail explicitly until
+  their kernels land."
+  [type ^ByteBuffer buffer element-count]
+  (.order buffer ByteOrder/LITTLE_ENDIAN)
+  (let [out (float-array (int element-count))
+        half! (fn [] (half->float (bit-and 0xffff (int (.getShort buffer)))))]
+    (case type
+      :f32 (dotimes [i element-count] (aset-float out i (.getFloat buffer)))
+      :f16 (dotimes [i element-count] (aset-float out i (half!)))
+      :bf16 (dotimes [i element-count]
+              (aset-float out i
+                          (Float/intBitsToFloat
+                           (unchecked-int
+                            (bit-shift-left (bit-and 0xffff (int (.getShort buffer))) 16)))))
+      :q4-0
+      (doseq [base (range 0 element-count 32)]
+        (let [scale (half!)]
+          (dotimes [i 16]
+            (let [packed (bit-and 0xff (int (.get buffer)))]
+              (aset-float out (+ base i)
+                          (float (* scale (- (bit-and packed 0x0f) 8))))
+              (aset-float out (+ base i 16)
+                          (float (* scale (- (unsigned-bit-shift-right packed 4) 8))))))))
+      :q4-1
+      (doseq [base (range 0 element-count 32)]
+        (let [scale (half!) minimum (half!)]
+          (dotimes [i 16]
+            (let [packed (bit-and 0xff (int (.get buffer)))]
+              (aset-float out (+ base i)
+                          (float (+ minimum (* scale (bit-and packed 0x0f)))))
+              (aset-float out (+ base i 16)
+                          (float (+ minimum (* scale (unsigned-bit-shift-right packed 4)))))))))
+      :q5-0
+      (doseq [base (range 0 element-count 32)]
+        (let [scale (half!) high (bit-and 0xffffffff (.getInt buffer))]
+          (dotimes [i 16]
+            (let [packed (bit-and 0xff (int (.get buffer)))
+                  low-q (+ (bit-and packed 15)
+                           (if (bit-test high i) 16 0))
+                  high-q (+ (unsigned-bit-shift-right packed 4)
+                            (if (bit-test high (+ i 16)) 16 0))]
+              (aset-float out (+ base i) (float (* scale (- low-q 16))))
+              (aset-float out (+ base i 16) (float (* scale (- high-q 16))))))))
+      :q5-1
+      (doseq [base (range 0 element-count 32)]
+        (let [scale (half!) minimum (half!) high (bit-and 0xffffffff (.getInt buffer))]
+          (dotimes [i 16]
+            (let [packed (bit-and 0xff (int (.get buffer)))
+                  low-q (+ (bit-and packed 15)
+                           (if (bit-test high i) 16 0))
+                  high-q (+ (unsigned-bit-shift-right packed 4)
+                            (if (bit-test high (+ i 16)) 16 0))]
+              (aset-float out (+ base i) (float (+ minimum (* scale low-q))))
+              (aset-float out (+ base i 16) (float (+ minimum (* scale high-q))))))))
+      :q8-0
+      (doseq [base (range 0 element-count 32)]
+        (let [scale (half!)]
+          (dotimes [i 32]
+            (aset-float out (+ base i) (float (* scale (.get buffer)))))))
+      :q4-k
+      (doseq [base (range 0 element-count 256)]
+        (let [d (half!) dmin (half!) scales (byte-array 12) quants (byte-array 128)]
+          (.get buffer scales) (.get buffer quants)
+          (dotimes [group 8]
+            (let [scale (if (< group 4)
+                          (bit-and 63 (aget scales group))
+                          (bit-or (bit-and 15 (aget scales (+ group 4)))
+                                  (bit-shift-left
+                                   (bit-and 3 (unsigned-bit-shift-right
+                                               (bit-and 0xff (aget scales (- group 4))) 6)) 4)))
+                  minimum (if (< group 4)
+                            (bit-and 63 (aget scales (+ group 4)))
+                            (bit-or (bit-and 15 (unsigned-bit-shift-right
+                                                (bit-and 0xff (aget scales (+ group 4))) 4))
+                                    (bit-shift-left
+                                     (bit-and 3 (unsigned-bit-shift-right
+                                                 (bit-and 0xff (aget scales group)) 6)) 4)))
+                  quant-base (* (quot group 2) 32) high? (odd? group)]
+              (dotimes [i 32]
+                (let [packed (bit-and 0xff (aget quants (+ quant-base i)))
+                      q (if high? (unsigned-bit-shift-right packed 4)
+                            (bit-and packed 15))]
+                  (aset-float out (+ base (* group 32) i)
+                              (float (- (* d scale q) (* dmin minimum))))))))))
+      :q5-k
+      (doseq [base (range 0 element-count 256)]
+        (let [d (half!) dmin (half!) scales (byte-array 12)
+              high (byte-array 32) quants (byte-array 128)]
+          (.get buffer scales) (.get buffer high) (.get buffer quants)
+          (dotimes [group 8]
+            (let [scale (if (< group 4)
+                          (bit-and 63 (aget scales group))
+                          (bit-or (bit-and 15 (aget scales (+ group 4)))
+                                  (bit-shift-left
+                                   (bit-and 3 (unsigned-bit-shift-right
+                                               (bit-and 0xff (aget scales (- group 4))) 6)) 4)))
+                  minimum (if (< group 4)
+                            (bit-and 63 (aget scales (+ group 4)))
+                            (bit-or (bit-and 15 (unsigned-bit-shift-right
+                                                (bit-and 0xff (aget scales (+ group 4))) 4))
+                                    (bit-shift-left
+                                     (bit-and 3 (unsigned-bit-shift-right
+                                                 (bit-and 0xff (aget scales group)) 6)) 4)))
+                  pair (quot group 2) quant-base (* pair 32) high? (odd? group)
+                  high-mask (bit-shift-left 1 group)]
+              (dotimes [i 32]
+                (let [packed (bit-and 0xff (aget quants (+ quant-base i)))
+                      low (if high? (unsigned-bit-shift-right packed 4)
+                              (bit-and packed 15))
+                      q (+ low (if (zero? (bit-and (bit-and 0xff (aget high i))
+                                                   high-mask)) 0 16))]
+                  (aset-float out (+ base (* group 32) i)
+                              (float (- (* d scale q) (* dmin minimum))))))))))
+      :q6-k
+      (doseq [base (range 0 element-count 256)]
+        (let [low (byte-array 128) high (byte-array 64) scales (byte-array 16)]
+          (.get buffer low) (.get buffer high) (.get buffer scales)
+          (let [d (half!)]
+            (dotimes [half-block 2]
+              (let [out-base (+ base (* half-block 128))
+                    low-base (* half-block 64) high-base (* half-block 32)
+                    scale-base (* half-block 8)]
+                (dotimes [i 32]
+                  (let [lo-a (bit-and 0xff (aget low (+ low-base i)))
+                        lo-b (bit-and 0xff (aget low (+ low-base 32 i)))
+                        hi (bit-and 0xff (aget high (+ high-base i)))
+                        qs [(dec (+ (bit-and lo-a 15)
+                                   (bit-shift-left (bit-and hi 3) 4) -31))
+                            (dec (+ (bit-and lo-b 15)
+                                   (bit-shift-left (bit-and (unsigned-bit-shift-right hi 2) 3) 4) -31))
+                            (dec (+ (unsigned-bit-shift-right lo-a 4)
+                                   (bit-shift-left (bit-and (unsigned-bit-shift-right hi 4) 3) 4) -31))
+                            (dec (+ (unsigned-bit-shift-right lo-b 4)
+                                   (bit-shift-left (bit-and (unsigned-bit-shift-right hi 6) 3) 4) -31))]]
+                    (doseq [[segment q] (map-indexed vector qs)]
+                      (let [scale-index (+ scale-base (* segment 2) (quot i 16))
+                            scale (aget scales scale-index)]
+                        (aset-float out (+ out-base (* segment 32) i)
+                                    (float (* d scale q))))))))))))
+      (throw (ex-info "GGML tensor type has no F32 decoder yet" {:type type})))
+    (when (.hasRemaining buffer)
+      (throw (ex-info "GGML decoder did not consume the complete tensor window"
+                      {:type type :remaining (.remaining buffer)})))
+    out))
+
+(defn read-tensor-f32
+  "Lazily read and dequantize one tensor. Returns
+  `{:shape [...], :source-type keyword, :data float-array}`."
+  [gguf name]
+  (if-let [{:keys [shape type dimensions] :as info} (tensor-info gguf name)]
+    (let [elements (reduce * 1 dimensions)]
+      {:shape shape :source-type type
+       :data (decode-f32 type (read-tensor-bytes gguf name) elements)
+       :tensor-info info})
+    (throw (ex-info "GGUF tensor not found" {:tensor name :path (:path gguf)}))))

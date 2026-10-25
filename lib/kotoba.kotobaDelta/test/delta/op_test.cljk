@@ -1,0 +1,144 @@
+(ns delta.op-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [delta.op :as op]
+            [delta.anchor]))
+
+(def fake-hash #(str "H" (hash %)))
+(defn fake-sign [pub payload] (str "SIG:" pub ":" (fake-hash payload)))
+(defn fake-verify [pub payload sig] (= sig (fake-sign pub payload)))
+
+(defn signed [prev-op m]
+  (let [o (op/make-op (assoc m :parent (when prev-op (op/op-id fake-hash prev-op))
+                             :actor "did:key:zA" :at "2026-07-16T00:00:00Z"))]
+    {:op o :sig (fake-sign "pkA" (op/canonical-str o))}))
+
+(def ctx {:verify-fn fake-verify :hash-fn fake-hash
+          :actor-pubkey "pkA" :grant-ok? true})
+
+(deftest op-chain-admission
+  (let [w (signed nil {:kind :write :file "a.cljc" :new "(ns a)\n(def x 1)\n"})
+        e (signed (:op w) {:kind :edit :file "a.cljc" :old "(def x 1)" :new "(def x 2)"})]
+    (testing "genesis + chained accept"
+      (is (= :accept (:verdict (op/admit w (assoc ctx :head nil)))))
+      (is (= :accept (:verdict (op/admit e (assoc ctx :head w))))))
+    (testing "parent mismatch (replay) rejected"
+      (is (some #{:parent-mismatch} (:reasons (op/admit e (assoc ctx :head e))))))
+    (testing "tamper rejected"
+      (let [t (assoc-in e [:op :op/new] "(def x 666)")]
+        (is (some #{:bad-signature} (:reasons (op/admit t (assoc ctx :head w)))))))
+    (testing "no grant rejected"
+      (is (some #{:unauthorized-actor}
+                (:reasons (op/admit w (assoc ctx :head nil :grant-ok? false))))))
+    (testing "secret material rejected before entering the log"
+      (let [s (signed (:op e) {:kind :write :file ".env"
+                               :new "API_KEY=abcdefghijklmnopqrstuvwx1234"})]
+        (is (some #{:secret-material} (:reasons (op/admit s (assoc ctx :head e)))))))))
+
+(deftest replay-determinism-and-conflicts
+  (let [ops [(op/make-op {:actor "a" :at "t" :kind :write :file "a" :new "one two three"})
+             (op/make-op {:actor "a" :at "t" :kind :edit :file "a" :old "two" :new "2"})
+             (op/make-op {:actor "a" :at "t" :kind :write :file "b" :new "bee"})]]
+    (testing "deterministic: same ops -> same files -> same content hash"
+      (let [r1 (op/replay {} ops) r2 (op/replay {} ops)]
+        (is (= 3 (:applied r1)))
+        (is (= {"a" "one 2 three" "b" "bee"} (:files r1)))
+        (is (= (op/content-hash fake-hash (:files r1))
+               (op/content-hash fake-hash (:files r2))))))
+    (testing "explicit conflict: old-not-found stops replay, never guesses"
+      (let [bad (conj ops (op/make-op {:actor "a" :at "t" :kind :edit :file "a"
+                                       :old "two" :new "again"}))
+            r (op/replay {} bad)]
+        (is (= 3 (:applied r)))
+        (is (= :old-not-found (get-in r [:conflict :reason])))))
+    (testing "ambiguous old is a conflict (Edit-tool semantics)"
+      (let [r (op/replay {"f" "x x"} [(op/make-op {:actor "a" :at "t" :kind :edit
+                                                   :file "f" :old "x" :new "y"})])]
+        (is (= :ambiguous-old (get-in r [:conflict :reason])))))
+    (testing "remove missing file is a conflict"
+      (is (= :file-not-found
+             (get-in (op/replay {} [(op/make-op {:actor "a" :at "t" :kind :remove :file "z"})])
+                     [:conflict :reason]))))))
+
+;; ---------------------------------------------------------------------------
+;; ⑱ structural anchors — references survive code motion
+
+(deftest anchor-survives-code-motion
+  (let [h #(str "H" (hash %))
+        v1 "(ns app.core)\n\n(defn foo [x] (* x 2))\n\n(defn bar [y] (+ y 1))\n"
+        ;; unrelated code inserted ABOVE foo — every line number shifts
+        v2 "(ns app.core)\n\n(def config {:a 1 :b 2})\n\n(defn helper [] :ok)\n\n(defn foo [x] (* x 2))\n\n(defn bar [y] (+ y 1))\n"
+        ;; foo's body edited
+        v3 "(ns app.core)\n\n(defn foo [x] (* x 3))\n\n(defn bar [y] (+ y 1))\n"
+        ;; foo removed
+        v4 "(ns app.core)\n\n(defn bar [y] (+ y 1))\n"
+        a (delta.anchor/anchor-of h v1 "foo")]
+    (testing "anchor captures the definition, not a line"
+      (is (= "foo" (:anchor/name a)))
+      (is (= "defn" (:anchor/kind a))))
+    (testing "definitions enumerated"
+      (is (= ["foo" "bar"] (map :name (delta.anchor/definitions h v1)))))
+    (testing "unchanged source resolves :unchanged at same offset"
+      (let [s0 (:start (first (filter #(= "foo" (:name %)) (delta.anchor/definitions h v1))))]
+        (is (= :unchanged (:status (delta.anchor/resolve-anchor h v1 a s0))))))
+    (testing "code inserted above -> :moved (line anchor would break, this doesn't)"
+      (let [s0 (:start (first (filter #(= "foo" (:name %)) (delta.anchor/definitions h v1))))
+            r (delta.anchor/resolve-anchor h v2 a s0)]
+        (is (:found? r))
+        (is (= :moved (:status r)))
+        (is (not= s0 (:start r)))))
+    (testing "body edited -> :edited"
+      (is (= :edited (:status (delta.anchor/resolve-anchor h v3 a)))))
+    (testing "definition removed -> :gone"
+      (is (= :gone (:status (delta.anchor/resolve-anchor h v4 a)))))
+    (testing "strings/comments don't confuse the splitter"
+      (let [tricky "(defn s [] \"a ) b ( c\") ; (defn fake [])\n(defn real [] 1)\n"]
+        (is (= ["s" "real"] (map :name (delta.anchor/definitions h tricky))))))))
+
+(deftest op-anchor-and-log-head
+  (let [h #(str "H" (hash %))
+        src "(ns a)\n(defn foo [x] (* x 2))\n"
+        anc (delta.anchor/anchor-of h src "foo")
+        o1 (op/make-op {:actor "a" :at "t" :kind :edit :file "a.cljc"
+                        :old "(* x 2)" :new "(* x 3)" :anchor anc})
+        o2 (op/make-op {:parent (op/op-id h o1) :actor "a" :at "t2"
+                        :kind :write :file "b.cljc" :new "x"})]
+    (testing "op carries the structural anchor and it's in the signed payload"
+      (is (= anc (:op/anchor o1)))
+      (is (re-find #"foo" (op/canonical-str o1)))
+      (is (re-find #"kotoba-delta/v2" (op/canonical-str o1))))
+    (testing "log-head is the last op's id; nil for empty log"
+      (is (nil? (op/log-head h [])))
+      (is (= (op/op-id h o2) (op/log-head h [o1 o2]))))))
+
+(deftest ops-by-actor-filters
+  (let [ops [(op/make-op {:actor "alice" :at "t1" :kind :write :file "a" :new "1"})
+             (op/make-op {:actor "bob"   :at "t2" :kind :write :file "b" :new "2"})
+             (op/make-op {:actor "alice" :at "t3" :kind :edit :file "a" :old "1" :new "11"})
+             (op/make-op {:actor "bob"   :at "t4" :kind :write :file "c" :new "3"})]]
+    (testing "known actor yields only that actor's ops, in order"
+      (let [result (op/ops-by-actor ops "alice")]
+        (is (= 2 (count result)))
+        (is (= ["alice" "alice"] (map :op/actor result)))
+        ;; the ORDER claim needs a field that differs between the two kept ops:
+        ;; asserting both are alice holds under any ordering
+        (is (= ["t1" "t3"] (map :op/at result)))))
+    (testing "unknown actor yields empty result"
+      (is (= [] (op/ops-by-actor ops "charlie"))))))
+
+(deftest anchor-code-graph-ref
+  (let [h #(str "cid" (hash %))
+        src "(ns a)\n(defn foo [x] (* x 2))\n"
+        a (delta.anchor/anchor-of h src "foo")]
+    (testing "anchor carries a code_graph-compatible definition CID"
+      (is (= (:anchor/hash a) (:anchor/def-cid a)))
+      (is (str/starts-with? (:anchor/def-cid a) "cid")))
+    (testing "code-graph-ref shape joins delta provenance to code_graph definitions"
+      (let [ref (delta.anchor/code-graph-ref a)]
+        (is (= (:anchor/def-cid a) (:code.definition/cid ref)))
+        (is (= "foo" (:code.definition/name ref)))
+        (is (= "defn" (:code.definition/kind ref)))))
+    (testing "same definition text -> same def-cid in delta and code_graph (the join key)"
+      (let [a2 (delta.anchor/anchor-of h "(ns b)\n\n(defn foo [x] (* x 2))\n" "foo")]
+        ;; identical def body -> identical def-cid regardless of surrounding code
+        (is (= (:anchor/def-cid a) (:anchor/def-cid a2)))))))

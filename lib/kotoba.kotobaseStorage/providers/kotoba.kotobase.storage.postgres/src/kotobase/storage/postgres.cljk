@@ -1,0 +1,127 @@
+(ns kotobase.storage.postgres
+  "PostgreSQL implementation of immutable blocks and linearizable refs."
+  (:require [kotoba.sql.conn :as conn] [kotoba.lang.text :as str]
+            [kotobase.storage.core :as storage]))
+
+(def schema-statements
+  ["CREATE TABLE IF NOT EXISTS kotobase_blocks (
+      cid TEXT PRIMARY KEY, bytes BYTEA NOT NULL, byte_length BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+   "CREATE TABLE IF NOT EXISTS kotobase_refs (
+      name TEXT PRIMARY KEY, cid TEXT NOT NULL, revision BIGINT NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"])
+
+(defn- bind! [statement params]
+  (doseq [[index value] (map-indexed vector params)]
+    (if (conn/blob? value)
+      (conn/set-bytes! statement (inc index) value)
+      (conn/set-object! statement (inc index) value)))
+  statement)
+
+(defn- execute! [connection sql params]
+  (with-open [statement (bind! (conn/prepare connection sql) params)]
+    (conn/execute-update! statement)))
+
+(defn- rows [connection sql params row-fn]
+  (with-open [statement (bind! (conn/prepare connection sql) params)
+              result (conn/execute-query statement)]
+    (loop [out []]
+      (if (conn/next! result)
+        (recur (conj out (row-fn result)))
+        out))))
+
+(defn initialize! [datasource]
+  (with-open [connection (conn/connection datasource)]
+    (doseq [statement schema-statements]
+      (execute! connection statement [])))
+  datasource)
+
+(defrecord PostgreSQLStorage [datasource]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks]
+    (with-open [connection (conn/connection datasource)]
+      (let [auto (conn/auto-commit? connection)]
+        (try
+          (conn/set-auto-commit! connection false)
+          (doseq [{:keys [cid bytes]} blocks]
+            (execute! connection
+                      "INSERT INTO kotobase_blocks(cid, bytes, byte_length)
+                       VALUES (?, ?, ?) ON CONFLICT (cid) DO NOTHING"
+                      [cid bytes (alength bytes)]))
+          (doseq [{:keys [cid bytes]} blocks
+                  :let [stored
+                        (first
+                         (rows connection
+                               "SELECT bytes FROM kotobase_blocks WHERE cid = ?"
+                               [cid]
+                               #(conn/get-bytes % 1)))]
+                  :when (not (conn/bytes-equal? ^bytes bytes ^bytes stored))]
+            (throw
+             (ex-info "CID already has different bytes"
+                      {:type :kotobase.storage/cid-collision :cid cid})))
+          (conn/commit! connection)
+          (mapv :cid blocks)
+          (catch Throwable error
+            (conn/rollback! connection)
+            (throw error))
+          (finally (conn/set-auto-commit! connection auto))))))
+  (-get-blocks [_ cids]
+    (if (empty? cids)
+      {}
+      (with-open [connection (conn/connection datasource)]
+        (let [placeholders (str/join "," (repeat (count cids) "?"))]
+          (into {}
+                (rows connection
+                      (str "SELECT cid, bytes FROM kotobase_blocks WHERE cid IN ("
+                           placeholders ")")
+                      cids
+                      (fn [result]
+                        [(conn/get-string result 1) (conn/get-bytes result 2)])))))))
+
+  storage/IRefStore
+  (-read-ref [_ name]
+    (with-open [connection (conn/connection datasource)]
+      (first
+       (rows connection
+             "SELECT cid, revision FROM kotobase_refs WHERE name = ?"
+             [name]
+             (fn [result]
+               {:cid (conn/get-string result 1)
+                :version (conn/get-long result 2)})))))
+  (-compare-and-set-ref! [this name expected next]
+    (with-open [connection (conn/connection datasource)]
+      (let [published
+            (first
+             (rows
+              connection
+              (if (nil? expected)
+                "INSERT INTO kotobase_refs(name, cid) VALUES (?, ?)
+                 ON CONFLICT (name) DO NOTHING RETURNING cid, revision"
+                "UPDATE kotobase_refs
+                 SET cid = ?, revision = revision + 1, updated_at = now()
+                 WHERE name = ? AND cid = ? RETURNING cid, revision")
+              (if (nil? expected)
+                [name next]
+                [next name expected])
+              (fn [result]
+                {:published? true
+                 :current (conn/get-string result 1)
+                 :version (conn/get-long result 2)})))]
+        (or published
+            (let [current (storage/-read-ref this name)]
+              {:published? false :current (:cid current)
+               :version (:version current)})))))
+
+  storage/IBackendCapabilities
+  (-capabilities [_]
+    #{:immutable-blocks :cid-addressed-read :conditional-ref
+      :linearizable-ref :batch-get :batch-put :server-transaction}))
+
+(defn open
+  [{:keys [datasource initialize?] :or {initialize? true}}]
+  (when-not (conn/datasource? datasource)
+    (throw (ex-info "PostgreSQL storage requires javax.sql.DataSource"
+                    {:type :kotobase.storage/invalid-configuration
+                     :backend :postgresql})))
+  (when initialize? (initialize! datasource))
+  (->PostgreSQLStorage datasource))

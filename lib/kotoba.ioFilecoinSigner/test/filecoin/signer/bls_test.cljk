@@ -1,0 +1,112 @@
+(ns filecoin.signer.bls-test
+  "ClojureScript only — see `filecoin.signer.bls`. The JVM suite loads this
+  namespace and asserts the refusal; the real checks run under nbb."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [filecoin.address :as addr]
+            [filecoin.message :as msg]
+            [filecoin.rpc :as rpc]
+            [filecoin.signer.bls :as bls]
+            [filecoin.signer.bls-vectors :as v]))
+
+(def messages (delay (mapv rpc/json->message v/bls-messages)))
+(def aggregate (delay (rpc/base64-decode (:data v/aggregate))))
+
+;; ── the parameters, which are the whole of it ────────────────────────────────
+
+(deftest the-shapes-are-fixed
+  (is (= 2 (:type v/aggregate)) "SigTypeBLS")
+  (is (= 96 (count @aggregate)) "a G2 signature")
+  (is (< 1 (count @messages)) "an aggregate over one message proves less")
+  (doseq [m @messages]
+    (is (= addr/bls-protocol (addr/protocol (:from m))))
+    (is (= 48 (count (bls/public-key (:from m)))) "a G1 key, carried verbatim")))
+
+(deftest an-f3-address-is-the-key-not-a-hash-of-it
+  (let [m (first @messages)
+        pk (bls/public-key (:from m))]
+    (is (= (:payload (:from m)) pk))
+    (testing "and it round-trips back to the same address"
+      (is (= (addr/to-string (:from m))
+             (addr/to-string (bls/address pk :mainnet)))))
+    (testing "while an f1 has no key to give"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (bls/public-key "f1xpbyy4tkdx5si2bgo37dubc2xwv6fum5tk57mia"))))))
+
+;; ── against mainnet ──────────────────────────────────────────────────────────
+
+#?(:cljs
+   (do
+     (deftest the-block-aggregate-verifies
+       ;; The one assertion that is not this library talking to itself: a real
+       ;; miner's header signature over every BLS message in a real block.
+       ;; Passing it requires the message CID, the f3→key extraction, the DST,
+       ;; the G1/G2 placement and the aggregate scheme to all be right at once.
+       (is (true? (bls/verify-block-aggregate @aggregate @messages))))
+
+     (deftest the-dst-is-load-bearing
+       ;; noble defaults to the proof-of-possession DST; Filecoin uses the
+       ;; basic one. Getting it wrong fails every verification with no
+       ;; indication that the tag is why — so it is asserted directly.
+       (is (= "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_" bls/dst))
+       (let [pop-dst "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_"
+             L (.-longSignatures (.-bls12_381 (js/require "@noble/curves/bls12-381.js")))
+             items (clj->js (mapv (fn [m]
+                                    #js {:message (.hash L (js/Uint8Array.from
+                                                            (clj->js (vec (msg/signing-bytes m))))
+                                                         pop-dst)
+                                         :publicKey (js/Uint8Array.from
+                                                     (clj->js (vec (bls/public-key (:from m)))))})
+                                  @messages))]
+         (is (false? (.verifyBatch L (js/Uint8Array.from (clj->js (vec @aggregate))) items))
+             "the same signature under the POP domain must NOT verify")))
+
+     (deftest a-corrupted-aggregate-is-rejected-as-malformed-not-as-invalid
+       ;; Worth distinguishing. Flipping a bit does not produce a wrong
+       ;; signature — it produces bytes that are not a point on the curve at
+       ;; all, and the library throws ("Cannot find square root") rather than
+       ;; answering false. A caller that treats any exception as a transport
+       ;; problem would therefore mis-handle a tampered block; the two cases
+       ;; below are what "false" actually looks like.
+       (let [bad (assoc (vec @aggregate) 8 (bit-xor (nth @aggregate 8) 0x01))]
+         (is (thrown? js/Error (bls/verify-block-aggregate bad @messages)))))
+
+     (deftest dropping-a-message-does-not-verify
+       ;; The aggregate covers *every* BLS message in the block. Verifying a
+       ;; subset would mean a miner could drop one and keep the signature.
+       (is (false? (bls/verify-block-aggregate @aggregate (butlast @messages)))))
+
+     (deftest changing-a-message-does-not-verify
+       (let [tampered (conj (vec (rest @messages))
+                            (update (first @messages) :nonce inc))]
+         (is (false? (bls/verify-block-aggregate @aggregate tampered)))))
+
+     (deftest the-signed-bytes-are-the-cid-unhashed
+       ;; secp256k1 hashes the CID a second time; BLS does not. Using the
+       ;; secp digest here fails, which is what pins the difference.
+       (let [wrong (mapv (fn [m] {:public-key (bls/public-key (:from m))
+                                  :message (msg/digest-for-secp256k1 m)})
+                         @messages)]
+         (is (false? (bls/verify-aggregate @aggregate wrong)))))
+
+     (deftest a-signature-that-is-not-96-bytes-is-refused
+       (is (thrown? js/Error (bls/verify-aggregate (vec (repeat 64 0))
+                                                   [{:public-key (bls/public-key
+                                                                  (:from (first @messages)))
+                                                     :message [1 2 3]}])))
+       (is (thrown? js/Error (bls/verify-aggregate @aggregate []))))))
+
+#?(:clj
+   (deftest the-jvm-path-refuses-rather-than-pretending
+     ;; No pure-Java BLS12-381 exists here and the JVM options are JNI
+     ;; bindings to blst, which would pin a native library. Throwing is the
+     ;; honest state; returning false would look like a bad signature.
+     (is (thrown? Exception (bls/verify-block-aggregate @aggregate @messages)))
+     (is (thrown? Exception (bls/hashed [1 2 3])))
+     (testing "and the refusal names the operation it was asked for"
+       (is (= "verify-aggregate"
+              (:op (ex-data (try (bls/verify-aggregate (vec (repeat 96 0)) [{}])
+                                 (catch Exception e e)))))))
+     (testing "while the pure parts still work on both"
+       (is (= 48 (count (bls/public-key (:from (first @messages))))))
+       (is (= 38 (count (msg/signing-bytes (first @messages)))) "the CID BLS signs")
+       (is (= "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_" bls/dst)))))

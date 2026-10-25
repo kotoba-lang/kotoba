@@ -1,0 +1,440 @@
+(ns jp-go-dds.kotoba-oracle-test
+  "What keeps the shipped artifacts honest, now that they are what runs.
+
+  Every `*-parity-test` in this repository compiles a `.kotoba` fresh and
+  compares it to the `.cljc`. That was the whole check while the host had its
+  own copy of every rule. It is not the whole check any more, because on the
+  JVM the host no longer computes them — it reads
+  `resources/jp_go_dds/oracle/*.kir.edn`, and a fresh compile is not those
+  files. Three things have to hold that did not have to before:
+
+    1. the shipped artifact IS the current source, compiled;
+    2. the host actually reads it, rather than having quietly kept a copy;
+    3. the ClojureScript path, which is NOT delegated, still agrees with it.
+
+  The second is the one that is easy to lose and impossible to see. A
+  delegation that fell back to a host implementation would pass every parity
+  test ever written, because a host copy is exactly what those tests compare
+  against. So this asks the only question that separates them — swap in a core
+  that answers differently and see whether the host follows.
+
+  The third exists because this library is the base design system of the
+  workspace and ~170 repositories depend on it, most of them building for
+  ClojureScript, where there is no classpath and `kotoba.kir` is not on the
+  path. `jp-go-dds.kotoba-oracle` is therefore `.clj` and the `:cljs` branches
+  still compute. Those branches are a second implementation, and rather than
+  leave them checked by nothing, `the-cljs-fallback-agrees-with-the-shipped-core`
+  runs them against the guest directly."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
+            [jp-go-dds.core :as core]
+            [jp-go-dds.css :as dcss]
+            [jp-go-dds.dark :as dark]
+            [jp-go-dds.kotoba-oracle :as oracle]
+            [jp-go-dds.kotoba-oracle-gen :as gen]
+            [jp-go-dds.tokens :as tokens]
+            [kotoba.compiler.core :as compiler]))
+
+;; ── 1. drift ─────────────────────────────────────────────────────────
+
+(defn- renumber-gensyms
+  "Rewrite compiler-generated names to a per-artifact counter.
+
+  Compiled KIR can carry gensyms — `and` and `or` lower to a `let` over
+  `or-tmp__11099` — and the suffix comes from a JVM-wide counter, so it differs
+  between the run that produced an artifact and the run comparing against it.
+  Where that happens a raw `=` fails ALWAYS, which is the same as not checking.
+  Renumbering in encounter order keeps the check exact about structure while
+  ignoring the one thing that is legitimately not reproducible.
+
+  **Measured 2026-08-12: none of this repository's eight cores contains a
+  single gensym**, because they are written in nested `if` rather than `and` /
+  `or`. So today this function is the identity, and
+  `the-gensym-normalizer-is-not-masking-anything-today` says so out loud. It is
+  kept rather than deleted because the first core to use `and` would otherwise
+  turn the drift gate red for a reason that has nothing to do with drift — but
+  a normalizer nobody has measured is also how a real difference gets
+  swallowed, so the fact that it currently collapses NOTHING is asserted rather
+  than assumed."
+  [kir]
+  (let [seen (volatile! {})]
+    (walk/postwalk
+     (fn [x]
+       (if (and (symbol? x) (re-find #"__\d+$" (name x)))
+         (let [n (or (get @seen x)
+                     (let [n (count @seen)] (vswap! seen assoc x n) n))]
+           (symbol (str (str/replace (name x) #"__\d+$" "") "__" n)))
+         x))
+     kir)))
+
+(deftest the-shipped-artifact-is-the-current-source-compiled
+  (doseq [[id source] (sort-by key oracle/cores)]
+    (testing (str id " <- " source)
+      (let [shipped (edn/read-string (slurp (io/resource (oracle/resource-path id))))
+            fresh (:kir (compiler/compile-source (slurp (io/file source)) gen/target))]
+        (is (= (renumber-gensyms fresh) (renumber-gensyms shipped))
+            (str "shipped KIR for " id " is stale — run `kbb -M:test:gen`"))))))
+
+(deftest the-gensym-normalizer-is-not-masking-anything-today
+  ;; If this ever fails, the drift gate above stopped comparing raw structure
+  ;; and started comparing a normalized form -- which is fine and intended, but
+  ;; is worth knowing on the day it starts being true rather than discovering
+  ;; later that a difference was being folded away.
+  (doseq [id (sort (keys oracle/cores))]
+    (let [shipped (edn/read-string (slurp (io/resource (oracle/resource-path id))))]
+      (is (= shipped (renumber-gensyms shipped))
+          (str id " now contains compiler gensyms; the normalizer has become "
+               "load-bearing for the drift gate")))))
+
+(deftest every-declared-core-actually-ships
+  (doseq [id (keys oracle/cores)]
+    (is (some? (io/resource (oracle/resource-path id))) (str "no artifact for " id))
+    (is (some? (oracle/kir id)))))
+
+(deftest a-missing-artifact-throws-rather-than-deciding-anything
+  ;; The seam's one refusal. If it fell back instead, the first thing anyone
+  ;; would notice is that a decision quietly stopped being the shipped one.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"shipped decision core is missing"
+                        (oracle/kir :not-a-core)))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not declare that export"
+                        (oracle/param-types :table 'no-such-export)))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"declares no such schema"
+                        (oracle/record-type :table [:ref :nope/nope]))))
+
+;; ── 2. delegation ────────────────────────────────────────────────────
+;;
+;; Same exports, same signatures, deliberately different answers. A host that
+;; had kept its own copy answers identically with these installed, and nothing
+;; else in this repository would say so.
+
+(def ^:private substitutes
+  {:components
+   (str "(ns components (:export [main heading-tag]))"
+        "(defn heading-tag [level :i64] :string \"hZZ\")"
+        "(defn main [] :i64 0)")
+
+   :select-banner
+   (str "(ns select-banner"
+        "  (:export [main heading-tag icon-type icon-label placeholder? selected?])"
+        "  (:schemas {:sb/option [:record :sb/option"
+        "                         [[:value :string] [:label :string]"
+        "                          [:current :string] [:has-current :bool]]]}))"
+        "(defn heading-tag [level :i64] :string \"hZZ\")"
+        ;; every type resolves to the WRONG icon, including the known ones
+        "(defn icon-type [t :string] :string \"error\")"
+        "(defn icon-label [t :string] :string \"ラベルではない\")"
+        ;; inverted: a non-empty value is the placeholder
+        "(defn placeholder? [v :string] :bool (if (string=? v \"\") false true))"
+        ;; inverted: a MATCHING option is the one that is NOT selected
+        "(defn selected? [x [:ref :sb/option]] :bool"
+        "  (if (string=? (record-get x :value) (record-get x :current)) false true))"
+        "(defn main [] :i64 0)")
+
+   :table
+   (str "(ns table (:export [main row-header-cell?])"
+        "  (:schemas {:tbl/cell [:record :tbl/cell"
+        "                        [[:row-header :bool] [:index :i64]]]}))"
+        ;; inverted: cell zero is the only PLAIN cell, every other one is a
+        ;; row header -- so a host that kept `(and row-header? (zero? i))`
+        ;; answers 1 where this answers 2.
+        "(defn row-header-cell? [cell [:ref :tbl/cell]] :bool"
+        "  (if (record-get cell :row-header)"
+        "    (if (= (record-get cell :index) 0) false true)"
+        "    false))"
+        "(defn main [] :i64 0)")
+
+   :button
+   (str "(ns button (:export [main tag])"
+        "  (:schemas {:btn/opts [:record :btn/opts"
+        "                        [[:type :string] [:size :string] [:href :string]"
+        "                         [:id :string] [:aria-label :string]"
+        "                         [:submit :bool] [:disabled :bool]"
+        "                         [:extra :document]]]}))"
+        ;; inverted: an href makes it a <button>, no href makes it an <a>
+        "(defn tag [o [:ref :btn/opts]] :string"
+        "  (if (string=? (record-get o :href) \"\") \"a\" \"button\"))"
+        "(defn main [] :i64 0)")
+
+   :bridge-document
+   (str "(ns bridge-document"
+        "  (:export [main custom-property custom-property-of-keyword hig-var]))"
+        "(defn custom-property [t :string] :string \"--zz-wrong\")"
+        "(defn custom-property-of-keyword [k :keyword] :string \"--zz-wrong-kw\")"
+        "(defn hig-var [t :string] :string \"var(--zz-wrong)\")"
+        "(defn main [] :i64 0)")
+
+   :sheet-plan
+   (str "(ns sheet-plan"
+        "  (:export [main global-path component-path component-path-of-keyword]))"
+        "(defn global-path [] :string \"zz/wrong-global.css\")"
+        "(defn component-path [c :string] :string \"zz/wrong.css\")"
+        "(defn component-path-of-keyword [c :keyword] :string \"zz/wrong-kw.css\")"
+        "(defn main [] :i64 0)")
+
+   :dark-mirror
+   (str "(ns dark-mirror (:export [main mirror-index]))"
+        ;; identity instead of reversal: every step mirrors to itself
+        "(defn mirror-index [n :i64 i :i64] :i64 i)"
+        "(defn main [] :i64 0)")
+
+   :dark-declarations
+   (str "(ns dark-declarations (:export [main invert-scrim]))"
+        "(defn invert-scrim [v :string] :string \"rgba(1, 2, 3, 0.99)\")"
+        "(defn main [] :i64 0)")})
+
+(def ^:private wrong-kir
+  (delay (into {} (map (fn [[id src]]
+                         [id (:kir (compiler/compile-source src gen/target))]))
+               substitutes)))
+
+(defn- with-core
+  "Run `f` against a substituted core, then put the shipped one back."
+  [id f]
+  (try
+    (oracle/register-kir! id (get @wrong-kir id))
+    (f)
+    (finally (oracle/deregister-kir! id))))
+
+(defn- heading-tags
+  "Every hiccup tag in `h` that looks like a heading, in document order."
+  [h]
+  (->> (tree-seq vector? seq h)
+       (keep (fn [x] (when (and (vector? x) (keyword? (first x))
+                                (re-matches #"h.+" (name (first x))))
+                       (first x))))
+       vec))
+
+(defn- svg-aria-label [h]
+  (->> (tree-seq vector? seq h)
+       (keep (fn [x] (when (and (vector? x) (= :svg (first x)) (map? (second x)))
+                       (:aria-label (second x)))))
+       first))
+
+(deftest the-host-follows-a-substituted-components-core
+  (testing "shipped"
+    (is (= :h2 (first (core/heading 2 "T")))))
+  (with-core :components
+    (fn []
+      (is (= :hZZ (first (core/heading 2 "T"))) "heading followed the substituted core")
+      (is (= [:hZZ] (heading-tags (core/accordion "S" "C" {})))
+          "accordion's heading level goes through the same rule")))
+  (testing "restored"
+    (is (= :h2 (first (core/heading 2 "T"))))))
+
+(deftest the-host-follows-a-substituted-table-core
+  (let [row-headers #(->> (tree-seq vector? seq %)
+                          (filter (fn [x] (and (vector? x) (= :th (first x))
+                                               (= "dads-table__row-header"
+                                                  (:class (second x))))))
+                          count)
+        t #(core/table {:headers [] :rows [["a" "b" "c"]] :row-header? true})]
+    (testing "shipped: exactly cell zero is the row header"
+      (is (= 1 (row-headers (t)))))
+    (with-core :table
+      (fn []
+        ;; A host that had kept `(and row-header? (zero? i))` would still say 1.
+        (is (= 2 (row-headers (t)))
+            "the substituted rule made every cell BUT zero a row header")))
+    (testing "restored"
+      (is (= 1 (row-headers (t)))))))
+
+(deftest the-host-follows-a-substituted-button-core
+  (testing "shipped"
+    (is (= :a (first (core/button "OK" {:href "/x"}))))
+    (is (= :button (first (core/button "OK")))))
+  (with-core :button
+    (fn []
+      (is (= :button (first (core/button "OK" {:href "/x"})))
+          "an href no longer makes an <a> because the shipped core says so")
+      (is (= :a (first (core/button "OK"))))))
+  (testing "restored"
+    (is (= :a (first (core/button "OK" {:href "/x"}))))))
+
+(deftest an-empty-href-does-not-reach-the-guest
+  ;; The stated boundary, as a test rather than a docstring, and said in the
+  ;; direction that can fail: under a core that gets every href answer wrong,
+  ;; an empty-string href is expected to be UNCHANGED -- which is the same
+  ;; statement as "this call is still answered by host code".
+  (is (= :a (first (core/button "OK" {:href ""})))
+      "an empty href is a present href here, as it has always been")
+  (with-core :button
+    (fn []
+      (is (= :button (first (core/button "OK" {:href "/x"})))
+          "a real href does reach the substituted core")
+      (is (= :a (first (core/button "OK" {:href ""})))
+          "an empty one does not"))))
+
+(deftest the-host-follows-a-substituted-select-banner-core
+  (let [opts #(->> (tree-seq vector? seq %)
+                   (filter (fn [x] (and (vector? x) (= :option (first x)))))
+                   (mapv second))
+        sel #(core/select {:value 18} [[nil "選択"] [12 "12mm"] [18 "18mm"]])
+        banner #(core/notification-banner {:type :warning :heading "H"} "b")
+        aria #(svg-aria-label %)]
+    (testing "shipped: the placeholder and the matching option are selected"
+      (is (= [{:value "" :disabled true :selected true}
+              {:value 12}
+              {:value 18 :selected true}]
+             (opts (sel)))
+          "18 matches 18 even though one is a number and one is text")
+      (is (= "警告" (aria (banner)))))
+    (with-core :select-banner
+      (fn []
+        ;; A host that had kept `(or (nil? v) (= "" v))` and
+        ;; `(= (str v) (str value))` would answer exactly as above. Both rules
+        ;; show separately here: `placeholder?` decides which options get the
+        ;; disabled/blank treatment, and `selected?` decides the rest.
+        (is (= [{:value nil :selected true}
+                {:value "" :disabled true :selected true}
+                {:value "" :disabled true :selected true}]
+               (opts (sel)))
+            "both option rules followed the substituted core")
+        (is (= "ラベルではない" (aria (banner))) "the icon label followed it")
+        (is (= [:hZZ] (heading-tags (banner))) "and so did the banner heading tag")))
+    (testing "restored"
+      (is (= [{:value "" :disabled true :selected true}
+              {:value 12}
+              {:value 18 :selected true}]
+             (opts (sel))))
+      (is (= "警告" (aria (banner)))))))
+
+(deftest the-host-follows-a-substituted-bridge-document-core
+  (testing "shipped"
+    (is (= "var(--hig-color-tint)" (tokens/hig-var :color-tint)))
+    (is (true? (tokens/bridged? :color-tint))))
+  (with-core :bridge-document
+    (fn []
+      (is (= "var(--zz-wrong)" (tokens/hig-var :color-tint))
+          "hig-var followed the substituted core")
+      (is (false? (tokens/bridged? :color-tint))
+          "bridged? normalizes through the same rule, so it followed too")))
+  (testing "restored"
+    (is (= "var(--hig-color-tint)" (tokens/hig-var :color-tint)))))
+
+(deftest the-host-follows-a-substituted-sheet-plan-core
+  (testing "shipped"
+    (is (= "jp_go_dds/components/select.css" (dcss/component-path :select))))
+  (with-core :sheet-plan
+    (fn []
+      (is (= "zz/wrong-kw.css" (dcss/component-path :select)))
+      (is (= "zz/wrong.css" (dcss/component-path "select"))
+          "the string and keyword arms are separate exports and both delegate")))
+  (testing "restored"
+    (is (= "jp_go_dds/components/select.css" (dcss/component-path :select)))))
+
+(deftest the-global-path-constant-comes-from-the-artifact
+  ;; `global-path` is a top-level def, so a runtime substitution cannot reach
+  ;; it and the delegation gate above cannot be the check. What can be checked
+  ;; is that the value the library publishes is the value the shipped core
+  ;; answers — which, with the drift gate holding, means it is the value
+  ;; `sheet_plan.kotoba` states. Before this change the `.cljc` held its own
+  ;; literal and a parity test kept the two EQUAL; equal is not the same as
+  ;; one (ADR-2608120200 decision 3).
+  (is (= (oracle/call :sheet-plan 'global-path []) dcss/global-path)))
+
+(deftest the-host-follows-a-substituted-dark-core
+  (testing "shipped: a ramp mirrors end to end"
+    (is (= {50 300, 100 200, 200 100, 300 50} (dark/mirror [50 100 200 300]))))
+  (with-core :dark-mirror
+    (fn []
+      (is (= {50 50, 100 100, 200 200, 300 300} (dark/mirror [50 100 200 300]))
+          "mirror followed the substituted index rule")))
+  (testing "restored"
+    (is (= {50 300, 100 200, 200 100, 300 50} (dark/mirror [50 100 200 300])))))
+
+;; ── 3. the ClojureScript path, which is not delegated ────────────────
+
+(defn- host-fn [sym] (deref (requiring-resolve sym)))
+
+(deftest the-cljs-fallback-agrees-with-the-shipped-core
+  ;; These `-host` functions are what a browser build runs. They are a second
+  ;; implementation of rules whose authority now lives in the artifact, so they
+  ;; are checked against the artifact rather than against nothing. This is the
+  ;; stated cost of not narrowing 170 dependents; see `jp-go-dds.kotoba-oracle`.
+  (testing "heading tag"
+    (let [f (host-fn 'jp-go-dds.core/heading-tag-host)]
+      (doseq [level (range 1 10)]
+        (is (= (oracle/call :components 'heading-tag [(long level)]) (f level))
+            (str "level " level))
+        (is (= (oracle/call :select-banner 'heading-tag [(long level)]) (f level))
+            (str "banner level " level)))))
+
+  (testing "button element choice"
+    (let [f (host-fn 'jp-go-dds.core/button-tag-host)
+          descriptor (oracle/record-type :button (first (oracle/param-types :button 'tag)))]
+      ;; "" is deliberately absent: the guest type collapses empty and absent,
+      ;; so that input never reaches it. Its boundary is pinned by
+      ;; `an-empty-href-does-not-reach-the-guest`.
+      (doseq [href [nil "/x" "https://example.com"]]
+        (is (= (oracle/call :button 'tag
+                            [(oracle/record descriptor
+                                            ["" "" (if href (str href) "") "" ""
+                                             false false (oracle/document [])])])
+               (f href))
+            (str "href " (pr-str href))))))
+
+  (testing "row header cells"
+    (let [f (host-fn 'jp-go-dds.core/row-header-cell?-host)
+          descriptor (oracle/record-type :table (first (oracle/param-types :table 'row-header-cell?)))]
+      (doseq [rh [true false] i (range 4)]
+        (is (= (oracle/call :table 'row-header-cell?
+                            [(oracle/record descriptor [rh (long i)])])
+               (f rh i))
+            (str "row-header? " rh " index " i)))))
+
+  (testing "option state"
+    (let [p (host-fn 'jp-go-dds.core/option-placeholder?-host)
+          s (host-fn 'jp-go-dds.core/option-selected?-host)
+          descriptor (oracle/record-type :select-banner
+                                         (first (oracle/param-types :select-banner 'selected?)))]
+      (doseq [v [nil "" "18" 18 :eighteen false]]
+        (is (= (oracle/call :select-banner 'placeholder? [(if (nil? v) "" (str v))])
+               (p v))
+            (str "placeholder? " (pr-str v))))
+      ;; `selected?` is only reached for a non-placeholder, which is the same
+      ;; condition the host's `cond` arranges.
+      (doseq [v ["18" 18 :eighteen 12] value [nil "18" 18 :eighteen]]
+        (is (= (oracle/call :select-banner 'selected?
+                            [(oracle/record descriptor
+                                            [(str v) ""
+                                             (if (some? value) (str value) "")
+                                             (some? value)])])
+               (s v value))
+            (str "selected? " (pr-str v) " vs " (pr-str value))))))
+
+  (testing "banner icon type and label"
+    (let [t (host-fn 'jp-go-dds.core/banner-icon-type-host)
+          l (host-fn 'jp-go-dds.core/banner-icon-label-host)]
+      (doseq [k ["success" "error" "warning" "info-1" "info-2" "info" "" "nope"]]
+        (is (= (oracle/call :select-banner 'icon-type [k]) (t k)) (str "icon-type " k))
+        (is (= (oracle/call :select-banner 'icon-label [k]) (l k)) (str "icon-label " k)))))
+
+  (testing "token normalization"
+    (let [f (host-fn 'jp-go-dds.tokens/->custom-property-host)]
+      (doseq [token [:color-tint "color-tint" "--hig-color-tint" :hairline "spacing-4"]]
+        (is (= (if (keyword? token)
+                 (oracle/call :bridge-document 'custom-property-of-keyword [token])
+                 (oracle/call :bridge-document 'custom-property [(str token)]))
+               (f token))
+            (str "token " (pr-str token))))))
+
+  (testing "mirror index"
+    (let [f (host-fn 'jp-go-dds.dark/mirror-index-host)]
+      (doseq [n (range 1 14) i (range n)]
+        (is (= (oracle/call :dark-mirror 'mirror-index [(long n) (long i)]) (f n i))
+            (str "n " n " i " i)))))
+
+  (testing "scrim inversion, over the WHOLE vendored palette"
+    ;; The guest replaces a literal `rgba(0, 0, 0,` and the host uses a
+    ;; whitespace-tolerant regex. Whether that difference matters is a question
+    ;; about the actual corpus, so it is asked against the actual corpus rather
+    ;; than against a handful of chosen strings.
+    (let [f (host-fn 'jp-go-dds.dark/opacity-inverted-host)
+          lits (dark/light-literals (slurp (io/resource "jp_go_dds/dds.css")))]
+      (is (< 100 (count lits)) "the vendored palette is actually loaded")
+      (doseq [[k v] lits]
+        (is (= (oracle/call :dark-declarations 'invert-scrim [v]) (f v))
+            (str k " = " v))))))

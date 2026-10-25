@@ -1,0 +1,178 @@
+(ns reference-app
+  "The reference app: every shinkansen contract driven by one small todo
+  app, on the reference host, with the REAL pieces bound at the seams —
+
+    cid-fn        content-address (sha2-256 → raw CIDv1, the same library
+                  the publish path uses), so every ETag is a real CID
+    authorize-fn  Ed25519 Biscuit (node:crypto) verified with the root
+                  PUBLIC key, decided by biscuit.kotoba/authorize with the
+                  kind set closed to the effect's one kind — the binding
+                  scripts/verify-invoke-authority.cljk proved
+    grant wire    `Authorization: Bearer <base64 of the token model as EDN>`
+                  — this app's wire, decoded in ITS grant-fn; the framework
+                  carries the string and reads nothing (host/default-grant-fn)
+    state         an atom {:db :chain} — the host's persistence, in memory
+
+  Routes: `/` (:ssg, the shell + a form whose control names `todo/add`),
+  `/todos` (:ssr — a query over the chain's current db, rendered per
+  request, CID computed after), `/todos/:id` (:ssr with a path param).
+  `POST /invoke` drives the chain.
+
+  `npm run host` starts it and prints a dev token for app A, minted from a
+  root seed that is FIXED for the demo (`reference-root-seed`); a real
+  deployment mints from `auth.kotoba.cloud/v1/biscuit/token` and never
+  ships a root private key.
+
+  Requires the sibling repos at their west pins on the classpath:
+    src:examples:../content-address/src:../org-biscuitsec/src:../org-biscuitsec/test:../authority/src:../text/src"
+  (:require [biscuit.ed25519 :as e]
+            [biscuit.kotoba :as bk]
+            [biscuit.token :as bt]
+            [cljs.reader :as edn]
+            [kotoba.lang.text :as str]
+            [content-address.core :as ca]
+            [content-address.digest :as d]
+            [shinkansen.host :as host]
+            [shinkansen.interaction :as interaction]
+            [shinkansen.serve :as serve]))
+
+;; ── identity: real CIDs ───────────────────────────────────────────────────
+
+(defn cid-fn [text] (ca/cid-string (d/sha256 (str text))))
+
+;; ── the app's declaration and step ───────────────────────────────────────
+
+(def decl
+  {:events {:todo/add {:validate (fn [[_ item]] (and (string? item) (not (str/blank? item))))}
+            :todo/done {:validate (fn [[_ id]] (string? id))}
+            :todo/clear {}}})
+
+(defn state-fn
+  "db + event → db (the re-frame step; a shitsuke guest would answer this
+  across the EDN text boundary — shinkansen.bridge — the reference app
+  answers it inline so the host is the thing under test)."
+  [db [id & args]]
+  (case id
+    :todo/add (update db :todos conj {:id (str "t" (inc (count (:todos db)))) :text (first args) :done false})
+    :todo/done (update db :todos (fn [ts] (mapv #(if (= (:id %) (first args)) (assoc % :done true) %) ts)))
+    :todo/clear (assoc db :todos [])
+    db))
+
+(def init-db {:todos []})
+
+;; the artifact: what this app IS, by content — its declaration + step + shell
+(def app-cid (cid-fn (pr-str {:events (sort (keys (:events decl))) :init init-db :v 1})))
+
+;; ── documents ─────────────────────────────────────────────────────────────
+
+(def head
+  (str "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<title>shinkansen reference</title>"
+       "<style>body{font-family:system-ui;margin:0;padding:16px;max-width:40rem}"
+       "@media (max-width:480px){body{padding:8px}}pre{overflow-x:auto}</style></head><body>"))
+
+(defn esc [s] (-> (str s) (str/replace "&" "&amp;") (str/replace "<" "&lt;")))
+
+(def home-html
+  (str head
+       "<h1>shinkansen reference app</h1>"
+       "<p>artifact <code>" app-cid "</code></p>"
+       "<p><a href=\"/todos\">todos (ssr)</a></p>"
+       "<form data-action=\"todo/add\"><label>token <input name=\"token\" placeholder=\"Bearer token from the console\"></label>"
+       "<label>todo <input name=\"text\" required></label><button>add</button></form>"
+       "<pre id=\"out\" data-lang=\"json\"></pre>"
+       "<script>" interaction/runtime "</script>"
+       "<script>shinkansen.on('todo/add',function(p,el){var f=new FormData(el);"
+       "fetch('/invoke',{method:'POST',headers:{'content-type':'application/json','authorization':'Bearer '+f.get('token')},"
+       "body:JSON.stringify({artifact:'" app-cid "',input:{kind:'action',event:['todo/add',f.get('text')]}})})"
+       ".then(function(r){return r.text();}).then(function(t){document.getElementById('out').textContent=t;});});</script>"
+       "</body></html>"))
+
+(defn- todos-html [_params data]
+  (str head "<h1>todos</h1><p>height " (:height data) "</p><ul>"
+       (apply str (for [t (:todos data)]
+                    (str "<li><a href=\"/todos/" (:id t) "\">" (esc (:text t)) "</a>"
+                         (when (:done t) " ✓") "</li>")))
+       "</ul><p><a href=\"/\">home</a></p></body></html>"))
+
+(defn- todo-html [params data]
+  (if-let [t (:todo data)]
+    (str head "<h1>" (esc (:text t)) "</h1><p>id " (:id t) (when (:done t) " — done") "</p></body></html>")
+    (str head "<h1>no such todo</h1><p>" (esc (:id params)) "</p></body></html>")))
+
+(def tree
+  {:path "/" :document :home
+   :children [{:path "todos" :document :todos
+               :children [{:path ":id" :document :todo}]}]})
+
+(defn documents [state]
+  {:home {:html home-html :mode :ssg :artifact app-cid
+          ;; a :query on the artifact answers the current db as a station
+          :load-fn (fn [_] (let [{:keys [db chain]} @state] {:todos (:todos db) :height (count chain)}))}
+   :todos {:mode :ssr :render-fn todos-html
+           :load-fn (fn [_] (let [{:keys [db chain]} @state]
+                              {:todos (:todos db) :height (count chain)}))}
+   :todo {:mode :ssr :render-fn todo-html
+          :load-fn (fn [{:keys [id]}]
+                     {:todo (first (filter #(= (:id %) id) (get-in @state [:db :todos])))})}})
+
+;; ── authority: real Biscuit, real Ed25519 ────────────────────────────────
+
+(def reference-root-seed (vec (range 32)))
+(def root (e/keypair reference-root-seed))
+(def k1 (e/keypair (vec (range 32 64))))
+
+(defn mint-dev-token
+  "A root-issued token narrowed to this app's chain and query, as the wire
+  string the demo speaks (base64 EDN of the token model)."
+  []
+  (let [t (bt/authority {:facts [['cap "chain/append" (str "kotoba://app/" app-cid "/chain")]
+                                 ['cap "app/query" (str "kotoba://app/" app-cid)]]
+                         :next-public-key (:public k1)
+                         :root-private-key (:private root) :sign-fn e/sign-fn})]
+    (.toString (js/Buffer.from (pr-str t) "utf8") "base64")))
+
+(defn grant-fn
+  "This app's wire: Bearer <base64 EDN> → token model. Anything else is a
+  grant the authorizer will refuse by name (it is not a map)."
+  [headers]
+  (when-let [b64 (host/default-grant-fn headers)]
+    (try (edn/read-string (.toString (js/Buffer.from b64 "base64") "utf8"))
+         (catch :default _ {:unreadable true}))))
+
+(defn authorize-fn [{:keys [grant effect]}]
+  (cond
+    (not (map? grant)) {:ok false :reason :no-grant-presented}
+    (:unreadable grant) {:ok false :reason :grant-unreadable}
+    :else
+    (let [v (bt/verify grant (:public root) e/verify-fn)]
+      (if-not (:ok? v)
+        {:ok false :reason (:reason v) :index (:index v)}
+        (let [dd (bk/authorize {:token-model grant :kinds #{(:effect effect)} :verified? true
+                                :requested (:resource effect) :now (.toISOString (js/Date.))})]
+          {:ok (boolean (:pass/allowed? dd)) :reason (:pass/reason dd) :depth (:pass/depth dd)})))))
+
+;; ── ctx ───────────────────────────────────────────────────────────────────
+
+(defn make-ctx [& [{:keys [dev?]}]]
+  (let [state (atom {:db init-db :chain []})]
+    {:tree tree
+     :documents (documents state)
+     :cid-fn cid-fn
+     :decl decl
+     :app {:state state :state-fn state-fn}
+     :authorize-fn authorize-fn
+     :grant-fn grant-fn
+     :principal-fn (fn [_] nil)
+     :dev? (boolean dev?)}))
+
+(defn -main [& _]
+  (let [port (js/parseInt (or (.-PORT js/process.env) "8787"))]
+    (-> (serve/start {:ctx (make-ctx {:dev? true}) :port port :host "127.0.0.1"})
+        (.then (fn [{:keys [port]}]
+                 (println (str "shinkansen reference host: http://127.0.0.1:" port "/"))
+                 (println (str "artifact: " app-cid))
+                 (println (str "dev token (app A, chain/append + app/query):"))
+                 (println (mint-dev-token))
+                 (println (str "try: curl -s -X POST http://127.0.0.1:" port "/invoke -H 'content-type: application/json' -H \"Authorization: Bearer $TOKEN\" -d '{\"artifact\":\"" app-cid "\",\"input\":{\"kind\":\"action\",\"event\":[\"todo/add\",\"milk\"]}}'")))))))

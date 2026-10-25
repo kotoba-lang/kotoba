@@ -1,0 +1,118 @@
+(ns bench.ipq-fs
+  "Reproduce mount-cache and recursive-browse costs on the SCI runtime.
+
+  The legacy walker deliberately reproduces the pre-index implementation: every
+  directory browse scans every mounted entry.  Output is EDN and medians are in ms."
+  (:require [clojure.string :as str]
+            [ipld.car :as car]
+            [ipld.car.bytes :as bytes]
+            [ipld.core :as ipld]
+            [kotobase.protocols.ipq.fs :as fs]
+            [multiformats.core :as mf]))
+
+(def perf (js/require "node:perf_hooks"))
+
+(defn adl []
+  {:version 1
+   :validate-representation (fn [value]
+                              (try (bytes/bcount value) true
+                                   (catch :default _ false)))
+   :decode ipld/decode :encode ipld/encode :validate-logical map?
+   :fuel-costs {:validate-representation 1 :decode 1 :encode 1 :validate-logical 1}})
+
+(defn snapshot [directories files-per-directory]
+  {"version" 1
+   "entries"
+   (into [{"path" "/bench" "type" "directory"}]
+         (mapcat
+          (fn [directory]
+            (let [parent (str "/bench/d" directory)]
+              (into [{"path" parent "type" "directory"}]
+                    (map (fn [file]
+                           {"path" (str parent "/f" file ".txt")
+                            "type" "file" "text" "needle payload"})
+                         (range files-per-directory)))))
+          (range directories)))})
+
+(defn fixture [logical]
+  (let [representation (ipld/encode logical)
+        root (mf/cidv1-raw representation)]
+    {:root root
+     :car-bytes (:bytes (car/encode
+                         {:roots [root]
+                          :blocks [{:cid root :bytes representation}]}))}))
+
+(defn parent-path [path]
+  (when-not (= path "/")
+    (let [parts (str/split path #"/")]
+      (if (= 2 (count parts)) "/"
+          (apply str (interpose "/" (butlast parts)))))))
+
+(defn base-name [path] (last (str/split path #"/")))
+
+(defn legacy-browse [mount path]
+  (->> (vals (:entries mount))
+       (filter (fn [entry] (= path (parent-path (get entry "path")))))
+       (sort-by (fn [entry] (get entry "path")))
+       (map (fn [entry]
+              (str (base-name (get entry "path")) "\t"
+                   (if (= "directory" (get entry "type")) "1" "0"))))
+       (str/join "\n")))
+
+(defn child-path [parent name]
+  (if (= parent "/") (str "/" name) (str parent "/" name)))
+
+(defn walk-count [browse mount]
+  (loop [pending ["/bench"] seen 0]
+    (if-let [path (peek pending)]
+      (let [wire (browse mount path)
+            rows (if (str/blank? wire) [] (str/split-lines wire))
+            directories
+            (into [] (keep (fn [row]
+                             (let [[name directory?] (str/split row #"\t")]
+                               (when (= "1" directory?) (child-path path name))))) rows)]
+        (recur (into (pop pending) directories) (+ seen (count rows))))
+      seen)))
+
+(defn elapsed-ms [f]
+  (let [started (.. perf -performance now)]
+    (f)
+    (- (.. perf -performance now) started)))
+
+(defn median [values]
+  (let [ordered (vec (sort values))]
+    (nth ordered (quot (count ordered) 2))))
+
+(defn sample [repetitions f]
+  (f)
+  (median (repeatedly repetitions #(elapsed-ms f))))
+
+(let [logical (snapshot 200 10)
+      {:keys [root car-bytes]} (fixture logical)
+      capability (adl)
+      options {:car-bytes car-bytes :root root :scope-root "/bench"
+               :adl-capability capability}
+      cold-ms (sample 5 #(fs/mount options))
+      cache (fs/create-mount-cache)
+      miss (fs/mount-cached cache options)
+      identity-options (dissoc options :car-bytes)
+      hit-ms (sample 31 #(fs/lookup-mount cache identity-options))
+      indexed-visits (walk-count fs/browse miss)
+      legacy-visits (walk-count legacy-browse miss)
+      indexed-ms (sample 31 #(walk-count fs/browse miss))
+      legacy-ms (sample 11 #(walk-count legacy-browse miss))]
+  (when-not (= 2200 indexed-visits legacy-visits)
+    (throw (ex-info "benchmark walkers did not visit the same complete tree"
+                    {:expected 2200 :indexed indexed-visits :legacy legacy-visits})))
+  (println
+   (pr-str
+    {:runtime :sci
+     :directories 200 :files-per-directory 10
+     :entries (count (:entries miss))
+     :visited indexed-visits
+     :cold-mount-ms cold-ms
+     :cached-mount-hit-ms hit-ms
+     :recursive-browse-indexed-ms indexed-ms
+     :recursive-browse-legacy-ms legacy-ms
+     :mount-speedup (/ cold-ms hit-ms)
+     :browse-speedup (/ legacy-ms indexed-ms)})))

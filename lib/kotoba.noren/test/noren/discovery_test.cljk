@@ -1,0 +1,183 @@
+(ns noren.discovery-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [noren.discovery :as d]
+            [noren.prospect :as prospect]))
+
+(def source-text
+  "そば処 まる｜手打ちそば
+   営業時間 11:00〜15:00（水曜定休）
+   東京都新宿区神楽坂1-1-1
+   ご予約・お問い合わせは info@soba-maru.example.jp までお願いします。
+   TEL 03-1234-5678")
+
+(def obs
+  {:obs/source-id "node/1234"
+   :obs/isic "5610"
+   :obs/evidence-url "https://www.openstreetmap.org/node/1234"
+   :obs/tags {"amenity" "restaurant" "name" "そば処 まる"
+              "website" "https://soba-maru.example.jp/"}})
+
+(def good-extraction
+  {:business-name "そば処 まる"
+   :email "info@soba-maru.example.jp"
+   :email-context "ご予約・お問い合わせは info@soba-maru.example.jp までお願いします。"
+   :opt-out-text nil
+   :kind :organization
+   :own-site? true
+   :closed? false
+   :confidence 0.9})
+
+;; ── OSM 側 ───────────────────────────────────────────────────────────────
+
+(deftest isic-comes-from-a-declared-tag-not-a-guess
+  (is (= "5610" (d/osm-tags->isic {"amenity" "restaurant"})))
+  (is (= "5630" (d/osm-tags->isic {"amenity" "bar"})))
+  (testing "表に無いタグは分類しない（推測しない）"
+    (is (nil? (d/osm-tags->isic {"amenity" "pharmacy"})))
+    (is (nil? (d/osm-tags->isic {"shop" "bakery"}))))
+  (testing "宣言された ISIC は接触対象の部分集合"
+    (is (every? #(contains? prospect/eligible-isic %) (vals d/osm-tag->isic)))))
+
+(deftest candidates-need-a-website
+  (is (some? (d/observation->candidate obs)))
+  (is (nil? (d/observation->candidate (update obs :obs/tags dissoc "website")))
+      "website タグが無い POI は candidate にならない")
+  (is (nil? (d/observation->candidate (assoc-in obs [:obs/tags "website"] "soba-maru.example.jp")))
+      "scheme の無い値は URL として扱わない")
+  (testing "チェーン店舗は candidate にならない（website が本部を指すため）"
+    (is (d/chain-outlet? {"brand:wikidata" "Q37158"}))
+    (is (d/chain-outlet? {"brand" "スターバックス"}))
+    (is (not (d/chain-outlet? {"name" "そば処 まる"})))
+    (is (nil? (d/observation->candidate
+               (assoc-in obs [:obs/tags "brand:wikidata"] "Q37158"))))
+    (testing "**店名からは判定しない** —— OSM 自身の宣言だけを見る"
+      (is (some? (d/observation->candidate
+                  (assoc-in obs [:obs/tags "name"] "スターバックス風 まる"))))))
+
+  (testing "contact:website も見る"
+    (is (some? (d/observation->candidate
+                (-> obs
+                    (update :obs/tags dissoc "website")
+                    (assoc-in [:obs/tags "contact:website"] "https://x.example.jp/")))))))
+
+(deftest a-404-page-is-not-the-shops-page
+  (testing "status で決める。実測 2026-08-11 に踏んだ欠陥（404 の本文を店の本文として読んでいた）"
+    (is (d/usable-page-text? 200 "そば処 まる"))
+    (is (not (d/usable-page-text? 404 "Page not found - ル ブルターニュ")))
+    (is (not (d/usable-page-text? 503 "一時的にご利用いただけません")))
+    (is (not (d/usable-page-text? nil "本文はあるが status が分からない")))
+    (is (not (d/usable-page-text? 200 "   "))))
+  (testing "内容からエラーページを推測しない（404 と書いてあるトップページを捨てない）"
+    (is (d/usable-page-text? 200 "404 の思い出｜居酒屋よんまるよん"))))
+
+;; ── LLM 出力の取り扱い ───────────────────────────────────────────────────
+
+(deftest parse-tolerates-fences-and-prose
+  (is (= {:email "a@b.jp"} (d/parse-extraction "```edn\n{:email \"a@b.jp\"}\n```")))
+  (is (= {:email "a@b.jp"} (d/parse-extraction "はい。{:email \"a@b.jp\"} です。")))
+  (is (:parse-error (d/parse-extraction "すみません、分かりません")))
+  (is (:parse-error (d/parse-extraction "[1 2 3]")))
+  (is (:parse-error (d/parse-extraction "{:email"))))
+
+(deftest extraction-is-checked_against_the_source
+  (testing "原文に在る主張は通る"
+    (let [{:keys [verified dropped]} (d/verify-extraction good-extraction source-text)]
+      (is (empty? dropped))
+      (is (= "info@soba-maru.example.jp" (:email verified)))))
+
+  (testing "**原文に無い主張は落ちる。ここが健全性の要**"
+    (let [hallucinated (assoc good-extraction
+                              :email "sales@soba-maru.example.jp"
+                              :business-name "株式会社まるホールディングス")
+          {:keys [verified dropped]} (d/verify-extraction hallucinated source-text)]
+      (is (= #{:business-name :email} (set (map :field dropped))))
+      (is (nil? (:email verified)))
+      (testing "落とした値は捨てず残す（モデルを替えたときに比較できるように）"
+        (is (= "sales@soba-maru.example.jp"
+               (:value (first (filter #(= :email (:field %)) dropped))))))))
+
+  (testing "全角・空白の揺れは吸収するが、それ以上は畳まない"
+    (is (empty? (:dropped (d/verify-extraction
+                           {:email "ｉｎｆｏ＠soba-maru.example.jp"} source-text))))
+    (is (seq (:dropped (d/verify-extraction
+                        {:email "info@soba-maru.example.co.jp"} source-text))))))
+
+;; ── DiscoveryGovernor ────────────────────────────────────────────────────
+
+(defn review [extraction & [text]]
+  (let [c (d/observation->candidate obs)]
+    (d/review-candidate c (d/verify-extraction extraction (or text source-text)))))
+
+(deftest governor-accepts-a-verified-business
+  (is (= :accept (:decision (review good-extraction)))))
+
+(deftest governor-rejects
+  (testing "原文に無い主張が 1 つでもあれば受理しない"
+    (let [rules (set (map :rule (:violations (review (assoc good-extraction :email "x@y.jp")))))]
+      (is (contains? rules :unverifiable-extraction))
+      ;; 落とした結果アドレスが無くなるので、こちらも同時に立つ。**別の rule で
+      ;; 立つのが正しい** —— 「幻覚だった」と「そもそも公表が無い」は直し方が違う。
+      (is (contains? rules :no-published-email))))
+
+  (testing "自信が閾値未満"
+    (is (contains? (set (map :rule (:violations (review (assoc good-extraction :confidence 0.3)))))
+                   :low-confidence)))
+
+  (testing "confidence が数値で返っていない"
+    (is (contains? (set (map :rule (:violations (review (assoc good-extraction :confidence "high")))))
+                   :no-confidence)))
+
+  (testing "個人"
+    (is (contains? (set (map :rule (:violations (review (assoc good-extraction :kind :individual)))))
+                   :not-a-business)))
+
+  (testing "まとめサイト・ポータル"
+    (is (contains? (set (map :rule (:violations (review (assoc good-extraction :own-site? false)))))
+                   :not-own-site)))
+
+  (testing "閉店"
+    (is (contains? (set (map :rule (:violations (review (assoc good-extraction :closed? true)))))
+                   :closed)))
+
+  (testing "公表アドレスが無い"
+    (is (contains? (set (map :rule (:violations (review (dissoc good-extraction :email)))))
+                   :no-published-email)))
+
+  (testing "アドレスの周辺文が無い（公表の文脈を後から検証できない）"
+    (is (contains? (set (map :rule (:violations (review (dissoc good-extraction :email-context)))))
+                   :no-email-context)))
+
+  (testing "受信拒否が書かれている"
+    (let [text (str source-text "\n営業メールはお断りしております。")]
+      (is (contains? (set (map :rule (:violations
+                                      (review (assoc good-extraction
+                                                     :opt-out-text "営業メールはお断りしております。")
+                                              text))))
+                     :opt-out-declared)))))
+
+;; ── prospect への変換 ────────────────────────────────────────────────────
+
+(deftest accepted-candidate-becomes-a-contactable-prospect
+  (let [c (d/observation->candidate obs)
+        v (d/verify-extraction good-extraction source-text)
+        p (d/->prospect c v {:now "2026-08-11" :text-source {:kind :common-crawl}
+                             :model "murakumo-main=qwen" :raw-reply "{…}"})]
+    (testing "発見した prospect は、接触の gate をそのまま通れる形をしている"
+      (is (:ok? (prospect/eligible p "2026-08-11"))))
+    (is (= :osm-llm (:prospect/source p)))
+    (is (= "5610" (:prospect/isic p)))
+    (testing "証拠は第三者が引ける形で残る"
+      (is (str/starts-with? (get-in p [:prospect/evidence :evidence/osm-url])
+                            "https://www.openstreetmap.org/"))
+      (is (= {:kind :common-crawl} (get-in p [:prospect/evidence :evidence/text-source])))
+      (is (some? (get-in p [:prospect/evidence :evidence/raw-reply]))
+          "生返答を残す —— parser を直したときに引き直せるのはこれがある場合だけ"))))
+
+(deftest fast-food-is-5610-because-5613-does-not-exist
+  (testing "5613 は ISIC のどの版にも無い符号（org-un-isic: rev5 463 / rev4-mirror 428）"
+    (is (= "5610" (get d/osm-tag->isic ["amenity" "fast_food"])))
+    (is (not (some #{"5613"} (vals d/osm-tag->isic))))
+    (is (= "5610" (d/osm-tags->isic {"amenity" "fast_food"}))))
+  (testing "表の全符号が eligible-isic に在る（『blueprint が実在する業種に限る』）"
+    (is (every? #(contains? prospect/eligible-isic %) (vals d/osm-tag->isic)))))

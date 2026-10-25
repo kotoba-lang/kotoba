@@ -1,0 +1,85 @@
+(ns game.cloud-save
+  "Immutable revisioned cloud-save lifecycle with deterministic three-way merge.
+  Hosts own authentication, size limits, encryption and durable persistence."
+  (:require [kotoba.lang.coll :as set]))
+
+(def contract-version 1)
+(def max-history 50)
+(def deleted ::deleted)
+(defn store [] {:cloud-save/version contract-version :games {} :tombstones #{}})
+(defn- path [player game] [player game])
+(defn snapshot [s player game]
+  (let [entry (get-in s (into [:games] (path player game))) head (:head entry)]
+    (when head (get-in entry [:revisions head]))))
+(defn history [s player game limit]
+  (let [entry (get-in s (into [:games] (path player game)))]
+    (->> (:order entry) reverse (take (min max-history (max 0 limit)))
+         (mapv #(get-in entry [:revisions %])))))
+
+(defn commit
+  [s {:save/keys [id player game expected-rev device data checksum created-at parents]}]
+  (let [p (path player game) entry (get-in s (into [:games] p)) head (or (:head entry) 0)]
+    (cond
+      (or (not (string? id)) (empty? id) (not (string? player)) (not (string? game))
+          (not (integer? expected-rev)) (neg? expected-rev) (not (string? device))
+          (not (map? data)) (not (string? checksum)) (not (integer? created-at)))
+      [:error :invalid-save s]
+      (contains? (:tombstones s) id) [:error :save-erased s]
+      (some #(= id (:save/id %)) (vals (:revisions entry)))
+      [:duplicate (first (filter #(= id (:save/id %)) (vals (:revisions entry)))) s]
+      (not= expected-rev head) [:conflict {:expected expected-rev :head head
+                                           :remote (snapshot s player game)} s]
+      :else
+      (let [revision (inc head)
+            record #:save{:id id :player player :game game :revision revision
+                          :parents (vec (or parents (if (zero? head) [] [head])))
+                          :device device :data data :checksum checksum :created-at created-at}
+            entry' (-> (or entry {:head 0 :revisions {} :order []})
+                       (assoc :head revision)
+                       (assoc-in [:revisions revision] record)
+                       (update :order (fn [order] (->> (conj (vec order) revision)
+                                                        (take-last max-history) vec))))]
+        [:ok record (assoc-in s (into [:games] p) entry')]))))
+
+(defn three-way-merge
+  "Return {:data merged :conflicts {path {:base :local :remote}}}. Missing map
+  keys are represented internally by `deleted`; resolutions use the path vector."
+  ([base local remote] (three-way-merge [] base local remote))
+  ([prefix base local remote]
+   (cond
+     (= local remote) {:data local :conflicts {}}
+     (= local base) {:data remote :conflicts {}}
+     (= remote base) {:data local :conflicts {}}
+     (and (map? base) (map? local) (map? remote))
+     (reduce (fn [{:keys [data conflicts]} key]
+               (let [b (get base key deleted) l (get local key deleted) r (get remote key deleted)
+                     result (three-way-merge (conj prefix key) b l r)]
+                 {:data (if (= deleted (:data result)) (dissoc data key)
+                            (assoc data key (:data result)))
+                  :conflicts (merge conflicts (:conflicts result))}))
+             {:data {} :conflicts {}}
+             (sort-by str (set/union (set (keys base)) (set (keys local)) (set (keys remote)))))
+     :else {:data remote :conflicts {prefix {:base base :local local :remote remote}}})))
+
+(defn resolve-merge [merge-result resolutions]
+  (reduce (fn [data [path value]]
+            (if (= value deleted) (update-in data (butlast path) dissoc (last path))
+                (assoc-in data path value)))
+          (:data merge-result) resolutions))
+
+(defn rollback
+  "Rollback creates a new revision; history is never rewritten."
+  [s {:keys [player game target-rev id device checksum created-at]}]
+  (let [entry (get-in s (into [:games] (path player game))) target (get-in entry [:revisions target-rev])]
+    (if-not target [:error :revision-not-found s]
+      (commit s #:save{:id id :player player :game game :expected-rev (:head entry)
+                       :device device :data (:save/data target) :checksum checksum
+                       :created-at created-at :parents [(:head entry) target-rev]}))))
+
+(defn export-player [s player]
+  {:cloud-save/version contract-version :player player
+   :games (get-in s [:games player] {})})
+(defn erase-player [s player now]
+  (let [entries (get-in s [:games player]) ids (for [[_ entry] entries [_ record] (:revisions entry)] (:save/id record))]
+    [:ok {:player player :erased-at now :revisions (count ids)}
+     (-> s (update :games dissoc player) (update :tombstones into ids))]))

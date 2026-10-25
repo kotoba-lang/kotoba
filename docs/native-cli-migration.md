@@ -1,65 +1,95 @@
-# Native CLI migration (JUN-198)
+# Native CLI migration
 
-The intended normal CLI, build and required CI run through Amu-produced native
-code, without JVM, GraalVM, Node or nbb. CLJ remains an explicitly selected
-bootstrap/compatibility tool. Authority and resource boundaries remain in
-force; selfhost never grants capabilities. Track completion in
-[JUN-198](https://linear.app/com-junkawasaki/issue/JUN-198).
+Tracking: [AWAI-24](https://linear.app/kotobalabs/issue/AWAI-24),
+[AWAI-43](https://linear.app/kotobalabs/issue/AWAI-43),
+[AWAI-48](https://linear.app/kotobalabs/issue/AWAI-48) and
+[JUN-290](https://linear.app/kotobalabs/issue/JUN-290).
 
-## Reproducible compiler and runtime gate
+## Current CI boundary
 
-`scripts/build-selfhost-toolchain.sh` takes a clean source snapshot at the
-exact Amu revision in `scripts/native-toolchain.env` and a new output directory.
-It verifies the manifest, concatenated 16-module source, native bootstrap and
-trusted C supervisor source before executing them. The native bootstrap builds
-G1; G1 builds G2; G2 builds G3. Every compiler image must match the reviewed
-fixed-point digest, and G2/G3 containers and images must be byte-identical.
-No hosted language implementation participates in compilation.
+CI uses Amu selfhost and canonical Kotoba on native Linux kernels. Immutable
+Amu/contract revisions and source/image digests are recorded in
+`scripts/native-ci-inputs.json`. Amu's adopted frontend, checker, project
+loader and backend compile the actual multi-module CLI fixture. No host
+namespace rewriting or second semantic compiler is involved.
 
-```sh
-bash scripts/build-selfhost-toolchain.sh \
-  --amu-source /absolute/path/to/pinned-amu \
-  --output /absolute/path/to/new-selfhost-build
-```
+The ARM job rebuilds the loaderless compiler, checks its combined closure and
+executes `test/kotoba/native_cli_request.kotoba`. The fixture reads the opaque
+contract bytes itself and checks all12 commands, every flag/alias, defaults,
+repeated options, integer bounds and named refusals. A changed runtime enum
+and a denied capability set are negative controls. The x86 job rebuilds three
+complete compiler generations and executes the sealed Amu/Kotoba controller,
+including its complete24 result/fuel corpus, refusals and child cleanup.
 
-The gate currently qualifies macOS arm64. Other hosts refuse explicitly. The
-C supervisor remains trusted bootstrap infrastructure; this is not a C-free
-claim. Self-build has a finite arena, CPU and wall budget; compiler fuel is
-disabled for this build only. Input and tool digests are checked around each
-invocation. Outputs and logs never share a directory writable by the compiled
-program with the host supervisor.
+Python stages immutable bytes, hashes files and observes processes. Native
+Kotoba owns the request assertions and controller verdict. No C compiler or
+loader, JVM, Node, NBB, KBB or hosted fallback participates. The required `CI`
+context retains its name and requires both native jobs. Branch protection and
+production routes are not modified by this source change.
 
-`scripts/test-selfhost-runtime.sh` uses the fresh G3 to compile the complete
-19-module native runtime fixture from this repository and two immutable source
-snapshots (the same pinned Amu checkout and portable bytes). It executes seven checks of
-typed values, scalar compatibility, reader/policy refusal and runtime fuel,
-then verifies native fuel exhaustion and unsupported target/policy refusal.
-Source digests and execution reports are retained. The workflow pins all input
-revisions and denies `java`, `javac`, `clojure`, `clj`, `bb`, `node`, `nbb`, `kbb`,
-`npm`, `native-image`, `python` and `python3` during these steps.
+## Retired checks
 
-The `CI` aggregate requires the native gate and the existing CLJ compatibility
-gate during migration. The empty Python SDK packaging gate is retired.
+The former `clj-launcher` job and C-loader-based `native-selfhost` scripts are
+removed. Their complete bytes and hashes are in
+`docs/retired/native-ci-20261024/manifest.json`; these text archives are not
+executable. The retired launcher lint/JavaScript/library/Q9/runtime-value,
+SDK packaging and package-admission checks are no longer CI coverage. Their
+source fixtures remain available for native porting. Documentation Pages
+deployment is a separate workflow.
 
-## Public CLI cutover remains open
+## Public command execution remains open
 
-The toolchain gate proves native compiler self-build and this runtime fixture;
-it does **not** claim that `bin/kotoba`, `scripts/build-native.sh` or all public
-CLI targets are migrated. In particular:
+An isolated native execution slice now validates `check --kind cli-contract`
+and `check --kind lock` inside the Kotoba guest. The contract check covers the
+exact twelve command IDs, command and option uniqueness, option types and flag
+shapes. The lock check reads an explicitly named file through Amu's bounded
+FS2 provider and uses an explicit `--blocks` directory to resolve the complete
+declared source closure by CID. It verifies every fetched source byte, the
+namespace and dependency graph, and returns the canonical lock CID to the
+internal caller. The native fixture checks the frozen two-module CID. Invalid
+pins, tampered or missing blocks, undeclared dependencies, and missing or extra
+lock paths are refused; the fixture also denies the FS grant and filesystem scope.
+Mutated version/command-set inputs are refused, and unimplemented verbs return
+`:cli/native-execution-unavailable`. The source is
+`src/kotoba/cli_exec.kotoba`; the native ARM fixture executes it through the
+Amu selfhost compiler and pins Kotoba Lang main `6621519576f91624ae79a62b73a81246351a2567`
+for the `--blocks` contract. These are internal check modes. The lock mode does not
+yet perform full semantic admission or compilation, nor expose the CID on the
+public CLI. The public launcher, other `check` modes, and the remaining command
+execution paths are still open.
 
-* `bin/kotoba` still dispatches most commands through `kotoba-clj`.
-* `scripts/build-native.sh` still builds the CLJ implementation with GraalVM.
-* The native seed emits AArch64 macOS. It refuses the Wasm/Web targets used by
-  the normal public package build. A compiler's self-build does not establish
-  those targets or command parity.
-* The previous 59-module combined native CLI depends on source overlays in its
-  historical build records. Amu #1426 restores its 27 native modules and
-  fixtures; frontend dependency integration and the full CLI build remain open.
-  The compiler seed and native reader used by CI now share merged Amu
-  `1b0687a5997c35fec1d3903840eecc76b934589e`.
+An input path for `cli-contract` and unsupported `--source-path`, `--json`,
+`--safe=false`, or non-Kotoba target forms are refused rather than silently accepted.
 
-The normal CLI and build switch, and removal of CLJ from required CI, must wait
-for a reproducible complete native command graph and equivalent admission,
-target, package-lock and execution checks. Do not replace those checks with
-scalar shadows, omit source roots/locks, silently select another target or use
-a hosted fallback to turn an unsupported route green.
+`src/kotoba/cli.kotoba` produces validated requests. Parsing a command does
+not execute it, approve a provider operation, admit a package or qualify a
+target. The public `bin/kotoba` still has legacy dispatch and must not be used
+for this migration's execution proofs. The native implementation must finish
+all12 command/provider paths, caller-wide CID/lock integration and general FS
+fault/cleanup checks before public CLI parity can be claimed. Existing Web,
+Wasm, signature and package contracts remain acceptance criteria.
+
+The native request fixture currently exercises every command name and option,
+but has no product execution receipt for any command. The completion ledger is:
+
+| Command | Native execution acceptance still required |
+| --- | --- |
+| `id` | Create or inspect a principal with the declared identity and approval boundary. |
+| `run` | Compile and execute the selected Kotoba entry with admitted inputs and capabilities. |
+| `compile` | Produce and verify the requested Web or Wasm artifact. |
+| `check` | Validate source, package, lock and CLI contract inputs with named refusals. |
+| `graph` | Execute connect, query, transact, pull and status against an admitted graph. |
+| `git` | Execute init, status, commit and sync against a selected repository. |
+| `rad` | Execute new, build, test and export against a selected project. |
+| `build` | Build a locked project and verify its target artifact. |
+| `test` | Execute admitted project tests and report their verdict. |
+| `deploy` | Execute plan, apply, status and rollback with explicit target authority. |
+| `library` | Resolve, inspect and publish pinned library definitions. |
+| `hinshitsu` | Execute evidence, gate, coverage and visual checks. |
+
+Each row needs positive execution, refusal, resource and cleanup evidence on
+the exact Amu/Kotoba source revision before public launcher replacement.
+
+The Amu/Kotoba controller's two roles remain build infrastructure. A passing
+controller gate is distinct from complete product command execution and from
+a production route cutover. See `AGENTS.md` for uncovered checks and limits.

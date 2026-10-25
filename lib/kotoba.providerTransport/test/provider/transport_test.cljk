@@ -1,0 +1,111 @@
+(ns provider.transport-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
+            [provider.transport :as transport]))
+
+(deftest transport-admission-uses-shared-four-axis-abac
+  (let [attributes {:subject {:id :workload/payment :tenant "alpha"}
+                    :resource {:tenant "alpha" :trust :private-service}
+                    :environment {:surface :fleet :network-zone :prod
+                                  :device-trusted? true}}
+        policy {:policy/id :transport/payment-db
+                :subject/ids #{:workload/payment}
+                :resource/ids #{"db.internal:5432"}
+                :resource/tenants #{"alpha"}
+                :resource/trust #{:private-service}
+                :action/ids #{:transport/connect}
+                :action/capabilities #{:transport-connect}
+                :environment/surfaces #{:fleet}
+                :environment/network-zones #{:prod}
+                :environment/require-device-trust? true
+                :tenant/isolation? true}
+        allowed (transport/transport-decision policy attributes "db.internal" 5432)
+        denied (transport/transport-decision policy attributes "metadata.internal" 80)]
+    (is (true? (:abac/allowed? allowed)))
+    (is (= :transport/payment-db (:abac/policy-id allowed)))
+    (is (false? (:abac/allowed? denied)))
+    (is (= [:resource-id] (mapv :abac/control (:abac/violations denied))))))
+
+(deftest transport-egress-prevents-implicit-downgrade
+  (let [context {:subject :workload/payment :purpose :database-sync
+                 :now "2026-07-19T12:00:00Z"
+                 :input-classifications [:restricted]
+                 :output-classification :internal}
+        denied (transport/egress-decision context)
+        grant {:id :redacted-export :subject :workload/payment
+               :purpose :database-sync :from :restricted :to :internal
+               :expires-at "2026-07-20T00:00:00Z"}
+        allowed (transport/egress-decision
+                 (assoc context :declassification-grant grant))]
+    (is (false? (:information-flow/allowed? denied)))
+    (is (true? (:information-flow/allowed? allowed)))))
+
+(deftest production-transport-rejects-hybrid-label-without-pq-component
+  (let [policy {:kotoba.security/crypto-policy-version 1
+                :mode :hybrid-required :hybrid-epoch-floor 1}
+        envelope {:envelope/provider {:provider/id :kagi
+                                      :provider/fips-validated false}
+                  :envelope/kem? true :envelope/hybrid? true
+                  :envelope/epoch 2
+                  :envelope/algorithms [:x25519 :ml-kem-768]}]
+    (is (:valid? (transport/crypto-decision policy envelope)))
+    (is (false? (:valid?
+                 (transport/crypto-decision
+                 policy (assoc envelope :envelope/algorithms [:x25519])))))))
+
+(deftest production-transport-requires-hardware-backed-client-signing
+  (let [evidence {:provider-id :apple-secure-enclave
+                  :hardware-backed? true :provider-origin-verified? true
+                  :private-exported? false :sign-verified? true
+                  :unavailable-failed-closed? true}]
+    (is (:hardware-signing/qualified?
+         (transport/enforce-hardware-signing! true evidence)))
+    (doseq [bad [(assoc evidence :private-exported? true)
+                 (assoc evidence :provider-origin-verified? false)
+                 (assoc evidence :unavailable-failed-closed? false)]]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"hardware signing policy denies"
+           (transport/enforce-hardware-signing! true bad))))
+    (is (false? (:hardware-signing/qualified?
+                 (transport/enforce-hardware-signing!
+                  false (assoc evidence :private-exported? true))))
+        "development profile may observe failure but production required mode denies")))
+
+(def approval-digest "sha256:db.internal:5432")
+
+(defn signed-approval [approver role]
+  {:approval/version 1 :approval/approver approver :approval/role role
+   :approval/request-digest approval-digest
+   :approval/not-before-ms 1000 :approval/expires-at-ms 2000
+   :approval/signature [:valid approver approval-digest]})
+
+(def approval-context
+  {:initiator :workload/payment :required-roles #{:security :database-owner}
+   :min-approvals 2 :now-ms 1500
+   :verify-signature-fn
+   (fn [body signature]
+     (= signature [:valid (:approval/approver body)
+                   (:approval/request-digest body)]))})
+
+(deftest sensitive-transport-requires-independent-bound-approval
+  (let [approvals [(signed-approval :alice :security)
+                   (signed-approval :bob :database-owner)]
+        digest-fn (fn [endpoint] (str "sha256:" endpoint))]
+    (is (:approval/allowed?
+         (transport/enforce-approval! true approvals approval-context
+                                      "db.internal:5432" digest-fn)))
+    (doseq [bad [[(first approvals)]
+                 [(first approvals) (assoc (second approvals)
+                                           :approval/approver :alice)]
+                 [(first approvals) (assoc (second approvals)
+                                           :approval/request-digest
+                                           "sha256:other")]
+                 [(first approvals) (assoc (second approvals)
+                                           :approval/signature [:forged])]]]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"approval quorum denies transport"
+           (transport/enforce-approval! true bad approval-context
+                                        "db.internal:5432" digest-fn))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"approval quorum denies transport"
+         (transport/enforce-approval! true approvals approval-context
+                                      "other.internal:5432" digest-fn)))))

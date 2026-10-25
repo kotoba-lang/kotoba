@@ -1,0 +1,107 @@
+(ns kami.gen.sdf-agent.critique
+  "Default v0 `:critique` implementation -- a heuristic pixel-analysis of the
+  actual rendered PNG, NOT a vision-LLM call. This is the documented
+  injection seam: `kami.gen.sdf-agent/generate` takes `:critique` as a
+  `(fn [render-path brief] -> {:score n :accept? bool :edit-suggestion m})`
+  and this namespace's `default-critique` is only the fixture/fallback wired
+  in by default. A real deployment swaps in a vision-LLM-backed function with
+  the exact same signature (render-path + brief in, score/accept/edit out) --
+  no other code in this repo needs to change.
+
+  `default-critique` deliberately only looks at the same two things a real
+  vision-LLM critique call would get: the rendered image and the text brief
+  -- it does not receive privileged 3D mesh data. It re-reads the PNG
+  `kami.gen.sdf-agent.render` wrote, and scores it on:
+    - aspect ratio of the rendered silhouette's 2D bounding box vs. a
+      target (a crude proxy for \"looks proportioned like the brief\"),
+    - presence of a plausible-sized yellow-accent region when `brief`
+      mentions \"yellow\",
+    - the silhouette not being degenerate (something actually rendered).
+  and returns an `:edit-suggestion` that `kami.gen.sdf-agent.propose`'s
+  default `apply-edit` knows how to interpret, targeting whichever
+  sub-score is worst."
+  (:require [kotoba.image :as image] [kotoba.io :as kio] [kami.gen.sdf-agent.render :as render]))
+
+(defn- read-image [path] (image/read-file (kio/file (str path))))
+
+(defn- yellow-ish?
+  "Crude yellow classifier on 0-255 RGB: bright, red+green dominant, low blue."
+  [r g b]
+  (and (> r 140) (> g 110) (< b 120) (> (- r b) 40) (> (- g b) 20)))
+
+(defn- pixel-stats
+  "Scans the rendered image's pixels (skipping the known solid background
+  color `kami.gen.sdf-agent.render/background-rgb`) for: how many pixels are
+  foreground (the rendered silhouette), how many of those look yellow, and
+  the foreground's 2D bounding box."
+  [img]
+  (let [w (image/width img) h (image/height img)
+        [bg-r bg-g bg-b] render/background-rgb
+        bg-argb (bit-or (bit-shift-left 255 24) (bit-shift-left bg-r 16) (bit-shift-left bg-g 8) bg-b)]
+    (reduce
+     (fn [acc [x y]]
+       (let [argb (image/get-rgb img (int x) (int y))]
+         (if (= argb bg-argb)
+           acc
+           (let [r (bit-and (bit-shift-right argb 16) 0xFF)
+                 g (bit-and (bit-shift-right argb 8) 0xFF)
+                 b (bit-and argb 0xFF)]
+             (cond-> acc
+               true (update :foreground inc)
+               (yellow-ish? r g b) (update :yellow inc)
+               true (update :minx min x)
+               true (update :maxx max x)
+               true (update :miny min y)
+               true (update :maxy max y))))))
+     {:foreground 0 :yellow 0 :minx w :maxx -1 :miny h :maxy -1}
+     (for [y (range h) x (range w)] [x y]))))
+
+(defn- clamp01 [x] (max 0.0 (min 1.0 x)))
+
+(defn default-critique
+  "`(fn [render-path brief] -> {:score :accept? :edit-suggestion :details})`
+  -- the default v0 injection for `:critique`. Accepts an optional 3rd
+  options map (`:target-aspect` default 1.15, `:accept-threshold` default
+  0.72) for tests / tuning; `generate` calls the 2-arg form."
+  ([render-path brief] (default-critique render-path brief {}))
+  ([render-path brief {:keys [target-aspect accept-threshold]
+                        :or {target-aspect 1.15 accept-threshold 0.72}}]
+   (let [img (read-image render-path)
+         {:keys [foreground yellow minx maxx miny maxy]} (pixel-stats img)
+         non-degenerate? (pos? foreground)
+         bbox-w (if non-degenerate? (inc (- maxx minx)) 0)
+         bbox-h (if non-degenerate? (inc (- maxy miny)) 0)
+         aspect (if (pos? bbox-w) (/ (double bbox-h) bbox-w) 0.0)
+         aspect-score (if non-degenerate?
+                        (- 1.0 (clamp01 (/ (Math/abs (- aspect target-aspect)) target-aspect)))
+                        0.0)
+         yellow-fraction (if (pos? foreground) (/ (double yellow) foreground) 0.0)
+         wants-yellow? (boolean (and brief (re-find #"(?i)yellow" brief)))
+         color-score (cond
+                       (not wants-yellow?) 1.0
+                       (< yellow-fraction 0.003) 0.15
+                       (> yellow-fraction 0.35) 0.4
+                       :else 1.0)
+         size-score (if (>= foreground 50) 1.0 0.0)
+         score (+ (* 0.4 aspect-score) (* 0.3 color-score) (* 0.3 size-score))
+         accept? (and non-degenerate? (>= score accept-threshold))
+         worst (cond
+                 (not non-degenerate?) :size
+                 (<= aspect-score (min color-score size-score)) :aspect
+                 (<= color-score size-score) :color
+                 :else :size)
+         edit-suggestion (cond
+                            accept? nil
+                            (= worst :size) {:op :noop :reason "degenerate/empty render"}
+                            (= worst :aspect) {:op :scale-axis :axis :z
+                                                :factor (if (< aspect target-aspect) 1.12 0.9)}
+                            (= worst :color) {:op :resize-part :part :beak
+                                               :factor (if (< yellow-fraction 0.003) 1.4 0.75)}
+                            :else {:op :noop})]
+     {:score score
+      :accept? (boolean accept?)
+      :edit-suggestion edit-suggestion
+      :details {:aspect aspect :target-aspect target-aspect
+                :yellow-fraction yellow-fraction :wants-yellow? wants-yellow?
+                :foreground-pixels foreground
+                :aspect-score aspect-score :color-score color-score :size-score size-score}})))

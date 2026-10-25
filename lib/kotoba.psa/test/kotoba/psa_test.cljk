@@ -1,0 +1,626 @@
+(ns kotoba.psa-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.psa :as psa]))
+
+(def ^:private day 86400000)
+(def ^:private t0 1767225600000) ;; 2026-01-01T00:00:00Z
+
+(defn- d [n] (+ t0 (* n day)))
+
+(defn- ts [worker date project role hours]
+  {:ts/worker worker :ts/date date :ts/project project :ts/role role :ts/hours hours})
+
+(def ^:private cards
+  [(psa/rate-card "alpha" :engineer 15000 :cost 9000)
+   (psa/rate-card "alpha" :designer 12000 :cost 8000)
+   (psa/rate-card "beta" nil 10000)])          ;; project-wide, no cost declared
+
+;; ---------------------------------------------------------------------------
+;; Rate lookup
+;; ---------------------------------------------------------------------------
+
+(deftest exact-role-beats-the-project-wide-fallback
+  (is (= 15000 (:rate/billable (psa/rate-for cards "alpha" :engineer))))
+  (is (= 10000 (:rate/billable (psa/rate-for cards "beta" :engineer))))
+  (testing "a project-wide card covers a role it never named"
+    (is (nil? (:rate/role (psa/rate-for cards "beta" :designer))))))
+
+(deftest an-unknown-project-has-no-rate-not-a-zero-one
+  (is (nil? (psa/rate-for cards "gamma" :engineer))))
+
+;; ---------------------------------------------------------------------------
+;; Invariant 1 — no rate, no line
+;; ---------------------------------------------------------------------------
+
+(deftest unpriced-time-is-reported-not-billed-at-zero
+  (let [p (psa/price-entry cards (ts "w-1" "2026-01-01" "gamma" :engineer 8))]
+    (is (:priced/unpriced? p))
+    (testing "nil is the absence of a price; zero would be a price"
+      (is (nil? (:priced/billable p)))
+      (is (not= 0 (:priced/billable p))))))
+
+(deftest an-invoice-excludes-unpriced-time-and-says-so
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-1" "2026-01-02" "alpha" :architect 8)] ;; no such card... falls to none
+        inv (psa/invoice "inv-1" "alpha" entries cards)]
+    (testing "alpha has no project-wide fallback, so :architect is unpriced"
+      (is (= 1 (count (:invoice/unpriced inv))))
+      (is (= 120000 (:invoice/total inv))))
+    (is (= "1 entries had no rate card and were not billed" (psa/describe-gap inv)))))
+
+(deftest billable?-lets-a-caller-check-before-drafting
+  (is (psa/billable? cards (ts "w-1" "2026-01-01" "alpha" :engineer 8)))
+  (is (not (psa/billable? cards (ts "w-1" "2026-01-01" "alpha" :architect 8)))))
+
+;; ---------------------------------------------------------------------------
+;; Invariant 2 — margin needs both sides
+;; ---------------------------------------------------------------------------
+
+(deftest margin-is-computed-when-every-entry-is-costed
+  (let [priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 10)
+                     (ts "w-2" "2026-01-01" "alpha" :designer 10)])
+        m (psa/margin priced)]
+    (is (= 270000 (:margin/revenue m)))        ;; 150000 + 120000
+    (is (= 170000 (:margin/cost m)))           ;;  90000 +  80000
+    (is (= 100000 (:margin/amount m)))
+    (is (< 0.37 (:margin/ratio m) 0.371))))
+
+(deftest margin-is-unknown-when-any-cost-rate-is-missing
+  (testing "a bill rate with no cost rate would read as pure profit"
+    (let [priced (map #(psa/price-entry cards %)
+                      [(ts "w-1" "2026-01-01" "beta" :engineer 10)])
+          m (psa/margin priced)]
+      (is (= 100000 (:margin/revenue m)))
+      (is (= :unknown (:margin/cost m)))
+      (is (= :unknown (:margin/amount m)))
+      (is (= :unknown (:margin/ratio m)))
+      (is (= 1 (:margin/uncosted-count m))))))
+
+(deftest one-uncosted-entry-poisons-the-whole-margin
+  (testing "a partially costed set produces a number that is really missing data"
+    (let [priced (map #(psa/price-entry cards %)
+                      [(ts "w-1" "2026-01-01" "alpha" :engineer 10)
+                       (ts "w-1" "2026-01-02" "beta" :engineer 10)])
+          m (psa/margin priced)]
+      (is (= 250000 (:margin/revenue m)))
+      (is (= :unknown (:margin/amount m)))
+      (is (= 1 (:margin/uncosted-count m))))))
+
+(deftest margin-of-nothing-is-unknown-not-zero
+  (is (= :unknown (:margin/amount (psa/margin [])))))
+
+;; ---------------------------------------------------------------------------
+;; Invariant 3 — utilization needs a denominator
+;; ---------------------------------------------------------------------------
+
+(def ^:private date->ms {"2026-01-01" (d 0) "2026-01-02" (d 1) "2026-01-05" (d 4)})
+
+(deftest utilization-against-declared-capacity
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-1" "2026-01-02" "alpha" :engineer 8)]
+        caps [(psa/capacity "w-1" (d 0) (d 5) 40)]
+        u (psa/utilization entries caps "w-1" [(d 0) (d 5)] date->ms)]
+    (is (= 16.0 (:utilization/billable-hours u)))
+    (is (= 0.4 (:utilization/ratio u)))))
+
+(deftest utilization-is-unknown-without-capacity
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)]
+        u (psa/utilization entries [] "w-1" [(d 0) (d 5)] date->ms)]
+    (is (= 8.0 (:utilization/billable-hours u)))
+    (testing "no denominator, so no ratio — not 1.0"
+      (is (= :unknown (:utilization/ratio u))))))
+
+(deftest utilization-ignores-entries-outside-the-window
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-1" "2026-01-05" "alpha" :engineer 8)]
+        caps [(psa/capacity "w-1" (d 0) (d 2) 16)]
+        u (psa/utilization entries caps "w-1" [(d 0) (d 2)] date->ms)]
+    (is (= 8.0 (:utilization/billable-hours u)))))
+
+;; ---------------------------------------------------------------------------
+;; Staffing
+;; ---------------------------------------------------------------------------
+
+(deftest an-assignment-inside-the-window-counts-in-full
+  (let [a (psa/assignment "a-1" "w-1" "alpha" :engineer (d 0) (d 5) 40)]
+    (is (= 40.0 (psa/hours-in-window a [(d 0) (d 5)])))))
+
+(deftest a-partial-overlap-is-prorated
+  (let [a (psa/assignment "a-1" "w-1" "alpha" :engineer (d 0) (d 10) 80)]
+    (is (= 40.0 (psa/hours-in-window a [(d 0) (d 5)])))
+    (is (= 16.0 (psa/hours-in-window a [(d 8) (d 10)])))))
+
+(deftest a-disjoint-assignment-contributes-nothing
+  (let [a (psa/assignment "a-1" "w-1" "alpha" :engineer (d 0) (d 5) 40)]
+    (is (zero? (psa/hours-in-window a [(d 6) (d 10)])))))
+
+(deftest over-allocation-is-detected-against-declared-capacity
+  (let [as [(psa/assignment "a-1" "w-1" "alpha" :engineer (d 0) (d 5) 30)
+            (psa/assignment "a-2" "w-1" "beta" :engineer (d 0) (d 5) 20)]
+        caps [(psa/capacity "w-1" (d 0) (d 5) 40)]
+        al (psa/allocation as caps "w-1" [(d 0) (d 5)])]
+    (is (= 50.0 (:allocation/committed-hours al)))
+    (is (:allocation/over? al))
+    (is (= ["a-1" "a-2"] (:allocation/assignments al)))))
+
+(deftest an-undeclared-capacity-is-neither-infinite-nor-a-violation
+  (let [as [(psa/assignment "a-1" "w-1" "alpha" :engineer (d 0) (d 5) 200)]
+        al (psa/allocation as [] "w-1" [(d 0) (d 5)])]
+    (is (= 200.0 (:allocation/committed-hours al)))
+    (is (not (:allocation/capacity-known? al)))
+    (testing "not reported as over-allocated, because nothing said what over means"
+      (is (not (:allocation/over? al))))))
+
+(deftest allocation-only-counts-the-named-person
+  (let [as [(psa/assignment "a-1" "w-1" "alpha" :engineer (d 0) (d 5) 40)
+            (psa/assignment "a-2" "w-2" "alpha" :engineer (d 0) (d 5) 40)]
+        al (psa/allocation as [] "w-1" [(d 0) (d 5)])]
+    (is (= 40.0 (:allocation/committed-hours al)))))
+
+;; ---------------------------------------------------------------------------
+;; Invoicing
+;; ---------------------------------------------------------------------------
+
+(deftest an-invoice-groups-lines-by-role
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-2" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-3" "2026-01-01" "alpha" :designer 4)]
+        inv (psa/invoice "inv-1" "alpha" entries cards)]
+    (is (= 2 (count (:invoice/lines inv))))
+    (testing "two rates make two checkable lines, not one blended figure"
+      (is (= [:designer :engineer] (mapv :line/role (:invoice/lines inv))))
+      (is (= [48000 240000] (mapv :line/amount (:invoice/lines inv)))))
+    (is (= 288000 (:invoice/total inv)))))
+
+(deftest an-invoice-only-covers-its-own-project
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-1" "2026-01-02" "beta" :engineer 8)]
+        inv (psa/invoice "inv-1" "alpha" entries cards)]
+    (is (= 120000 (:invoice/total inv)))
+    (is (= 1 (count (:invoice/entries inv))))))
+
+(deftest already-billed-time-is-excluded-and-reported
+  (let [entries [(ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                 (ts "w-1" "2026-01-02" "alpha" :engineer 8)]
+        first-inv (psa/invoice "inv-1" "alpha" entries cards)
+        billed (set (:invoice/entries first-inv))
+        second-inv (psa/invoice "inv-2" "alpha" entries cards billed)]
+    (is (= 240000 (:invoice/total first-inv)))
+    (testing "re-running the same timesheet bills nothing a second time"
+      (is (zero? (:invoice/total second-inv)))
+      (is (= 2 (count (:invoice/excluded-already-billed second-inv))))
+      (is (= "2 entries were already billed and were excluded"
+             (psa/describe-gap second-inv))))))
+
+(deftest entry-key-is-content-derived-so-a-reimport-cannot-double-bill
+  (testing "the same day's work read from two systems collides on purpose"
+    (is (= (psa/entry-key (ts "w-1" "2026-01-01" "alpha" :engineer 8))
+           (psa/entry-key (assoc (ts "w-1" "2026-01-01" "alpha" :engineer 8)
+                                 :ts/observed-ms 28800000))))))
+
+(deftest describe-gap-is-empty-when-nothing-was-left-out
+  (let [inv (psa/invoice "inv-1" "alpha" [(ts "w-1" "2026-01-01" "alpha" :engineer 8)] cards)]
+    (testing "no reassuring 'no problems' line — absence of text is the signal"
+      (is (= "" (psa/describe-gap inv))))))
+
+;; ---------------------------------------------------------------------------
+;; Composition with the sibling libraries' shape
+;; ---------------------------------------------------------------------------
+
+(deftest entries-emitted-by-kotoba-activity-price-unchanged
+  (testing "the :ts/* shape kotoba.activity emits, with a role attached"
+    (let [from-activity {:ts/worker "w-1" :ts/date "2026-01-01"
+                         :ts/project "alpha" :ts/hours 1.5 :ts/observed-ms 6000000}
+          p (psa/price-entry cards (assoc from-activity :ts/role :engineer))]
+      (is (not (:priced/unpriced? p)))
+      (is (= 22500.0 (:priced/billable p))))))
+
+(deftest hours-and-ms-round-trip
+  (is (= 1.5 (psa/ms->hours (psa/hours->ms 1.5)))))
+
+;; ---------------------------------------------------------------------------
+;; Invariant 4 — no rate, no conversion
+;; ---------------------------------------------------------------------------
+
+(def ^:private rates
+  [(psa/fx-rate "EUR" "USD" 1.08 "2026-01-01")
+   (psa/fx-rate "JPY" "USD" 0.0064 "2026-01-01")])
+
+(deftest same-currency-converts-at-one-without-a-rate-lookup
+  (let [m (psa/convert [] 1000 "USD" "USD")]
+    (is (= 1000 (:money/amount m)))
+    (is (= 1 (:money/rate m)))))
+
+(deftest a-conversion-carries-the-rate-and-the-date-it-came-from
+  (let [m (psa/convert rates 1000 "EUR" "USD")]
+    (is (= 1080.0 (:money/amount m)))
+    (is (= 1.08 (:money/rate m)))
+    (testing "an invoice total that cannot say which rate it used is uncheckable"
+      (is (= "2026-01-01" (:money/as-of m))))))
+
+(deftest rates-are-directional-and-not-inverted-automatically
+  (testing "a buy rate is not a sell rate; inferring one invents a spread"
+    (is (:money/unconvertible? (psa/convert rates 1000 "USD" "EUR")))))
+
+(deftest an-unpriced-currency-is-neither-converted-at-one-nor-dropped
+  (let [t (psa/total-in rates [{:amount 1000 :currency "USD"}
+                               {:amount 1000 :currency "EUR"}
+                               {:amount 1000 :currency "GBP"}]
+                        "USD")]
+    (is (= 2080.0 (:total/amount t)))
+    (testing "the GBP amount is absent from the total AND named"
+      (is (= 1 (count (:total/unconvertible t))))
+      (is (= "GBP" (:currency (first (:total/unconvertible t))))))
+    (testing "and the total says it is incomplete rather than looking finished"
+      (is (not (:total/complete? t))))))
+
+(deftest a-fully-convertible-total-says-so-and-lists-its-rates
+  (let [t (psa/total-in rates [{:amount 1000 :currency "USD"}
+                               {:amount 1000 :currency "EUR"}]
+                        "USD")]
+    (is (:total/complete? t))
+    (is (= 1 (count (:total/rates-used t))))))
+
+;; ---------------------------------------------------------------------------
+;; Expenses
+;; ---------------------------------------------------------------------------
+
+(deftest a-billable-expense-carries-its-markup
+  (let [e (psa/expense "e-1" "alpha" 10000 "USD" :billable? true :markup 0.1)]
+    (is (= 11000.0 (psa/expense-billable-amount e)))))
+
+(deftest a-non-billable-expense-bills-nothing-but-still-costs
+  (let [e (psa/expense "e-1" "alpha" 10000 "USD" :billable? false)
+        m (psa/project-margin [] [e] [])]
+    (is (zero? (psa/expense-billable-amount e)))
+    (testing "absorbing a cost decides who pays, not whether to count it"
+      (is (= 10000 (:margin/expense-cost m))))))
+
+(deftest markup-applies-only-to-billable-expenses
+  (let [e (psa/expense "e-1" "alpha" 10000 "USD" :billable? false :markup 0.5)]
+    (is (zero? (psa/expense-billable-amount e)))))
+
+;; ---------------------------------------------------------------------------
+;; Subcontractors
+;; ---------------------------------------------------------------------------
+
+(deftest a-subcontractor-carries-both-rates-explicitly
+  (let [s (psa/subcontract "s-1" "alpha" "vendor-a" :engineer 10 8000 14000 "USD")
+        m (psa/subcontract-margin s)]
+    (is (= 140000 (:sub/billable m)))
+    (is (= 80000 (:sub/cost m)))
+    (is (= 60000 (:sub/amount m)))))
+
+(deftest project-margin-separates-where-the-money-went
+  (let [priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 10)])
+        expenses [(psa/expense "e-1" "alpha" 20000 "USD" :billable? true :markup 0.1)]
+        subs [(psa/subcontract "s-1" "alpha" "vendor-a" :engineer 10 8000 14000 "USD")]
+        m (psa/project-margin priced expenses subs)]
+    (is (= 312000.0 (:margin/revenue m)))     ;; 150000 labour + 22000 expense + 140000 sub
+    (is (= 190000 (:margin/cost m)))          ;;  90000 labour + 20000 expense +  80000 sub
+    (is (= 122000.0 (:margin/amount m)))
+    (testing "each source is visible, not just the net"
+      (is (= 22000.0 (:margin/expense-revenue m)))
+      (is (= 140000 (:margin/subcontract-revenue m))))))
+
+(deftest invariant-2-survives-the-extra-cost-sources
+  (testing "one uncosted labour entry still poisons the whole project margin"
+    (let [priced (map #(psa/price-entry cards %)
+                      [(ts "w-1" "2026-01-01" "beta" :engineer 10)])   ;; no cost rate
+          m (psa/project-margin priced
+                                [(psa/expense "e-1" "beta" 100 "USD" :billable? true)]
+                                [(psa/subcontract "s-1" "beta" "v" :engineer 1 1 2 "USD")])]
+      (is (= :unknown (:margin/amount m)))
+      (is (= :unknown (:margin/ratio m)))
+      (testing "and the expense and subcontract figures are still reported"
+        (is (= 100 (:margin/expense-revenue m)))))))
+
+;; ---------------------------------------------------------------------------
+;; Revenue recognition
+;; ---------------------------------------------------------------------------
+
+(deftest as-delivered-recognises-what-was-billed
+  (let [c (psa/contract "alpha" :as-delivered)
+        priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 10)])]
+    (is (= 150000 (:revenue/amount (psa/recognize c priced false))))))
+
+(deftest percent-complete-needs-a-budget-and-a-fee
+  (let [priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 40)])]
+    (testing "with both, progress is measured"
+      (let [c (psa/contract "alpha" :percent-complete :fee 1000000 :budget-hours 100)
+            r (psa/recognize c priced false)]
+        (is (= 0.4 (:revenue/progress r)))
+        (is (= 400000.0 (:revenue/amount r)))))
+    (testing "without a budget, 'about 80% done' is an estimate this refuses to supply"
+      (let [c (psa/contract "alpha" :percent-complete :fee 1000000)
+            r (psa/recognize c priced false)]
+        (is (= :unknown (:revenue/amount r)))
+        (is (= :no-budget-hours (:revenue/reason r)))))
+    (testing "without a fee either"
+      (let [c (psa/contract "alpha" :percent-complete :budget-hours 100)
+            r (psa/recognize c priced false)]
+        (is (= :unknown (:revenue/amount r)))
+        (is (= :no-fee (:revenue/reason r)))))))
+
+(deftest progress-is-capped-at-one
+  (testing "an over-budget project delivered its scope, not 130% of the contract"
+    (let [c (psa/contract "alpha" :percent-complete :fee 1000000 :budget-hours 100)
+          priced (map #(psa/price-entry cards %)
+                      [(ts "w-1" "2026-01-01" "alpha" :engineer 130)])
+          r (psa/recognize c priced false)]
+      (is (= 1.0 (:revenue/progress r)))
+      (is (= 1000000.0 (:revenue/amount r)))
+      (testing "the overrun shows up in margin, which is where it belongs —
+                130h billed against a fee that recognises only 100h of it"
+        (is (= 1950000 (:margin/revenue (psa/margin priced))))))))
+
+(deftest on-completion-recognises-nothing-until-it-is-done
+  (let [c (psa/contract "alpha" :on-completion :fee 500000)
+        priced (map #(psa/price-entry cards %)
+                    [(ts "w-1" "2026-01-01" "alpha" :engineer 90)])]
+    (is (zero? (:revenue/amount (psa/recognize c priced false))))
+    (is (= 500000 (:revenue/amount (psa/recognize c priced true))))))
+
+(deftest an-unknown-recognition-method-does-not-construct
+  (is (nil? (psa/contract "alpha" :vibes-based))))
+
+;; ---------------------------------------------------------------------------
+;; Tax categories — the grouping, never the rate
+;;
+;; What the taxing rule needs and cannot infer is which rate CATEGORY a line
+;; falls in. 消費税法施行令 第七十条の十 taxes 「税率の異なるごとに区分して
+;; 合計した金額」 — the per-category subtotal, multiplied once and rounded
+;; once — so a caller must hand it subtotals, and this is where the lines are.
+;; The rate itself is a jurisdiction's fact with a date on it and stays out.
+;; ---------------------------------------------------------------------------
+
+(def ^:private jp-cards
+  [(psa/rate-card "kappa" :engineer 15000 :cost 9000 :currency "JPY" :tax-category :standard)
+   (psa/rate-card "kappa" :designer 12000 :cost 8000 :currency "JPY" :tax-category :standard)
+   (psa/rate-card "kappa" :caterer   5000 :cost 3000 :currency "JPY" :tax-category :reduced)])
+
+(defn- kappa-entries []
+  [(ts "w-1" "2026-01-01" "kappa" :engineer 8)     ;; 120000 standard
+   (ts "w-2" "2026-01-01" "kappa" :designer 4)     ;;  48000 standard
+   (ts "w-3" "2026-01-01" "kappa" :caterer 2)])    ;;  10000 reduced
+
+(deftest a-rate-card-carries-an-opaque-tax-category
+  (is (= :standard (:rate/tax-category (first jp-cards))))
+  (testing "opaque here — this library does not know what any of them mean"
+    (is (= :vat-zero-rated
+           (:rate/tax-category (psa/rate-card "x" :r 1 :tax-category :vat-zero-rated)))))
+  (testing "omitted is nil, and nil is not a default category"
+    (is (nil? (:rate/tax-category (psa/rate-card "x" :r 1))))))
+
+(deftest card-key-identifies-a-card-by-project-and-role
+  (is (= ["kappa" :engineer] (psa/card-key (first jp-cards))))
+  (testing "two roles on one project are two different cards"
+    (is (not= (psa/card-key (nth jp-cards 0)) (psa/card-key (nth jp-cards 1)))))
+  (testing "a project-wide fallback card says nil rather than naming a role"
+    (is (= ["lambda" nil] (psa/card-key (psa/rate-card "lambda" nil 10000))))))
+
+(deftest a-line-carries-its-tax-category
+  (let [inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)]
+    (testing "so a 適格請求書 can print 区分記載 per line without re-deriving it"
+      (is (= [:reduced :standard :standard]
+             (mapv :line/tax-category (:invoice/lines inv)))))))
+
+(deftest subtotals-add-the-lines-in-each-category
+  (let [inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)]
+    (testing "two roles in one category are added, not one of them chosen"
+      (is (= {:standard 168000 :reduced 10000}
+             (:invoice/subtotals-by-tax-category inv))))
+    (is (:invoice/subtotals-complete? inv))
+    (is (= #{} (:invoice/subtotals-gaps inv)))
+    (is (= [] (:invoice/uncategorised inv)))
+    (testing "and they state the unit they are in"
+      (is (= "JPY" (:invoice/subtotals-currency inv))))))
+
+(deftest the-subtotals-account-for-the-whole-invoice-total
+  (let [inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)]
+    (is (= 178000 (:invoice/total inv)))
+    (testing "a complete subtotal map sums to the total it partitions"
+      (is (= (:invoice/total inv)
+             (reduce + 0 (vals (:invoice/subtotals-by-tax-category inv))))))))
+
+(deftest one-uncategorised-card-refuses-the-whole-subtotal-map
+  (let [cards (conj jp-cards (psa/rate-card "kappa" :architect 20000 :currency "JPY"))
+        entries (conj (kappa-entries) (ts "w-4" "2026-01-01" "kappa" :architect 3))
+        inv (psa/invoice "inv-1" "kappa" entries cards)]
+    (testing "not a partial map — there is nothing shaped like an answer to misread"
+      (is (= :unknown (:invoice/subtotals-by-tax-category inv)))
+      (is (not (map? (:invoice/subtotals-by-tax-category inv)))))
+    (testing "and the caller can tell which case it is without counting lines"
+      (is (false? (:invoice/subtotals-complete? inv)))
+      (is (= #{:uncategorised-cards} (:invoice/subtotals-gaps inv))))
+    (testing "the card is named, the way :invoice/unpriced names an entry"
+      (is (= [["kappa" :architect]] (:invoice/uncategorised inv))))
+    (testing "the line is still billed — it is untaxable, not unbillable"
+      (is (= 238000 (:invoice/total inv)))
+      (is (= 4 (count (:invoice/lines inv))))
+      (is (= "" (psa/describe-gap inv))))))
+
+(deftest a-partial-subtotal-map-would-have-understated-the-tax
+  (let [cards (conj jp-cards (psa/rate-card "kappa" :architect 20000 :currency "JPY"))
+        entries (conj (kappa-entries) (ts "w-4" "2026-01-01" "kappa" :architect 3))
+        inv (psa/invoice "inv-1" "kappa" entries cards)
+        categorised (reduce + 0 (map :line/amount
+                                     (filter :line/tax-category (:invoice/lines inv))))]
+    (testing "the categorised part is 60000 short of the total, so a map of it
+              would have been taxed as a smaller invoice"
+      (is (= 178000 categorised))
+      (is (< categorised (:invoice/total inv))))
+    (is (= :unknown (:invoice/subtotals-by-tax-category inv)))))
+
+(deftest contributing-cards-that-disagree-on-a-currency-refuse
+  (testing "one invoice is not one currency by construction; nothing enforces it"
+    (let [cards [(psa/rate-card "mu" :engineer 15000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "mu" :designer 120 :currency "USD" :tax-category :standard)]
+          entries [(ts "w-1" "2026-01-01" "mu" :engineer 8)
+                   (ts "w-2" "2026-01-01" "mu" :designer 8)]
+          inv (psa/invoice "inv-1" "mu" entries cards)]
+      (is (= :unknown (:invoice/subtotals-by-tax-category inv)))
+      (is (= #{:mixed-currency} (:invoice/subtotals-gaps inv)))
+      (is (= :unknown (:invoice/subtotals-currency inv)))
+      (testing "nothing was uncategorised — the two refusals are distinguishable"
+        (is (= [] (:invoice/uncategorised inv)))))))
+
+(deftest both-refusals-are-reported-at-once
+  (testing "fixing one should not be how you discover the other"
+    (let [cards [(psa/rate-card "mu" :engineer 15000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "mu" :designer 120 :currency "USD")]
+          entries [(ts "w-1" "2026-01-01" "mu" :engineer 8)
+                   (ts "w-2" "2026-01-01" "mu" :designer 8)]
+          inv (psa/invoice "inv-1" "mu" entries cards)]
+      (is (= #{:uncategorised-cards :mixed-currency} (:invoice/subtotals-gaps inv)))
+      (is (= [["mu" :designer]] (:invoice/uncategorised inv))))))
+
+(deftest unpriced-entries-do-not-make-the-subtotals-incomplete
+  (testing "the subtotals partition the LINES; what never became a line is
+            :invoice/unpriced's business"
+    (let [entries (conj (kappa-entries) (ts "w-4" "2026-01-01" "kappa" :architect 3))
+          inv (psa/invoice "inv-1" "kappa" entries jp-cards)]
+      (is (= 1 (count (:invoice/unpriced inv))))
+      (is (:invoice/subtotals-complete? inv))
+      (is (= {:standard 168000 :reduced 10000}
+             (:invoice/subtotals-by-tax-category inv))))))
+
+(deftest already-billed-entries-do-not-make-the-subtotals-incomplete
+  (let [first-inv (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards)
+        billed (set (:invoice/entries first-inv))
+        second-inv (psa/invoice "inv-2" "kappa" (kappa-entries) jp-cards billed)]
+    (is (= 3 (count (:invoice/excluded-already-billed second-inv))))
+    (is (:invoice/subtotals-complete? second-inv))
+    (is (= {} (:invoice/subtotals-by-tax-category second-inv)))))
+
+(deftest an-invoice-with-no-lines-owes-no-tax-and-says-so
+  (testing "{} is a real answer, not a refusal: it sums to the total, zero"
+    (let [inv (psa/invoice "inv-1" "kappa" [] jp-cards)]
+      (is (= {} (:invoice/subtotals-by-tax-category inv)))
+      (is (:invoice/subtotals-complete? inv))
+      (is (zero? (:invoice/total inv)))
+      (testing "and no card declared a unit, so none is claimed"
+        (is (nil? (:invoice/subtotals-currency inv)))))))
+
+(deftest a-project-wide-card-categorises-a-role-it-never-named
+  (let [cards [(psa/rate-card "lambda" nil 10000 :currency "JPY" :tax-category :standard)]
+        inv (psa/invoice "inv-1" "lambda" [(ts "w-1" "2026-01-01" "lambda" :engineer 8)] cards)]
+    (is (= {:standard 80000} (:invoice/subtotals-by-tax-category inv)))
+    (is (= [:standard] (mapv :line/tax-category (:invoice/lines inv))))))
+
+(deftest an-exact-role-card-does-not-inherit-the-project-wide-category
+  (testing "the card that priced the line is the card that categorises it —
+            there is no project-level default that leaks past an override"
+    (let [cards [(psa/rate-card "lambda" nil 10000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "lambda" :engineer 15000 :currency "JPY")]
+          inv (psa/invoice "inv-1" "lambda" [(ts "w-1" "2026-01-01" "lambda" :engineer 8)] cards)]
+      (is (= 120000 (:invoice/total inv)))          ;; the role card won the rate
+      (testing "so it wins the category too, and it declared none"
+        (is (= :unknown (:invoice/subtotals-by-tax-category inv)))
+        (is (= [["lambda" :engineer]] (:invoice/uncategorised inv)))))))
+
+(deftest describe-tax-gap-is-empty-when-every-line-is-categorised
+  (testing "no reassuring 'all categorised' line — absence of text is the signal"
+    (is (= "" (psa/describe-tax-gap (psa/invoice "inv-1" "kappa" (kappa-entries) jp-cards))))))
+
+(deftest describe-tax-gap-names-each-way-it-can-refuse
+  (let [cards [(psa/rate-card "mu" :engineer 15000 :currency "JPY" :tax-category :standard)
+               (psa/rate-card "mu" :designer 120 :currency "USD")]
+        entries [(ts "w-1" "2026-01-01" "mu" :engineer 8)
+                 (ts "w-2" "2026-01-01" "mu" :designer 8)]
+        both (psa/describe-tax-gap (psa/invoice "inv-1" "mu" entries cards))]
+    (is (= (str "1 rate cards declared no tax category, so no per-category"
+                " subtotals were stated"
+                "; the rate cards used declare more than one currency, so"
+                " per-category subtotals would add two units")
+           both))))
+
+(deftest every-uncategorised-card-is-named-once-and-in-a-stable-order
+  (testing "a consumer diffing two drafts should not see a reordering that
+            is not a change, and a card that priced two entries is one card"
+    ;; The entries arrive designer, engineer, auditor, so neither the order
+    ;; they were declared in NOR its reverse is the sorted order — an
+    ;; assertion that held for either of those would not be measuring a sort.
+    (let [cards [(psa/rate-card "nu" :engineer 15000 :currency "JPY")
+                 (psa/rate-card "nu" :designer 12000 :currency "JPY")
+                 (psa/rate-card "nu" :auditor 18000 :currency "JPY")
+                 (psa/rate-card "nu" :caterer 5000 :currency "JPY" :tax-category :reduced)]
+          entries [(ts "w-1" "2026-01-01" "nu" :designer 4)
+                   (ts "w-2" "2026-01-01" "nu" :engineer 8)
+                   (ts "w-2" "2026-01-02" "nu" :engineer 8)   ;; same card, second entry
+                   (ts "w-3" "2026-01-01" "nu" :auditor 1)
+                   (ts "w-4" "2026-01-01" "nu" :caterer 2)]
+          inv (psa/invoice "inv-1" "nu" entries cards)]
+      (is (= [["nu" :auditor] ["nu" :designer] ["nu" :engineer]]
+             (:invoice/uncategorised inv)))
+      (testing "and the summary counts cards, not entries and not one"
+        (is (= (str "3 rate cards declared no tax category, so no per-category"
+                    " subtotals were stated")
+               (psa/describe-tax-gap inv)))))))
+
+;; ---------------------------------------------------------------------------
+;; `:invoice/total` and the currencies it may have added together
+;;
+;; Measured 2026-08-18 while verifying the subtotals: an invoice drawing on a
+;; ¥10,000/h card and a $100/h card reports `:invoice/total` 100500, which is
+;; ¥100,000 and $500 added together. The subtotals refuse that case; the total
+;; does not, and predates them.
+;;
+;; The total's meaning is not changed — consumers read it, and silently
+;; redefining a key is worse than a wrong number somebody can detect. What is
+;; added is the detection.
+;; ---------------------------------------------------------------------------
+
+(defn- ts* [role d h]
+  {:ts/project "p1" :ts/worker (str role "-w") :ts/role role :ts/date d :ts/hours h})
+
+(deftest a-total-that-added-unlike-things-says-so
+  (let [mixed [(psa/rate-card "p1" "dev" 10000 :currency "JPY" :tax-category :standard)
+               (psa/rate-card "p1" "designer" 100 :currency "USD" :tax-category :standard)]
+        inv (psa/invoice "i" "p1" [(ts* "dev" "2026-08-01" 10)
+                                   (ts* "designer" "2026-08-01" 5)] mixed)]
+    (testing "the total is still what it always was — this is not a fix"
+      (is (= 100500 (:invoice/total inv))
+          "¥100,000 + $500, and no arithmetic here disagrees with that"))
+    (testing "but it can no longer be read as a single-currency figure"
+      (is (false? (:invoice/total-is-one-currency? inv)))
+      (is (= ["JPY" "USD"] (:invoice/currencies inv))))
+    (testing "and `:invoice/currency` is the first CARD's, which need not be
+              either of them — that is why it cannot be the detector"
+      (is (= "JPY" (:invoice/currency inv))))))
+
+(deftest a-single-currency-total-says-that-too
+  (let [ok [(psa/rate-card "p1" "dev" 10000 :currency "JPY" :tax-category :standard)
+            (psa/rate-card "p1" "designer" 8000 :currency "JPY" :tax-category :reduced)]
+        inv (psa/invoice "i" "p1" [(ts* "dev" "2026-08-01" 10)
+                                   (ts* "designer" "2026-08-01" 5)] ok)]
+    (is (true? (:invoice/total-is-one-currency? inv)))
+    (is (= ["JPY"] (:invoice/currencies inv)))
+    (is (= 140000 (:invoice/total inv)))))
+
+(deftest an-invoice-with-nothing-billable-added-nothing-wrongly
+  (testing "true, not false: nothing was summed, so nothing was summed across
+            currencies. Deliberately NOT the reading
+            `bookkeeping.trial-balance/balanced?` takes of an empty set —
+            that function asserts the books balance and this one only says no
+            unlike things were added"
+    (let [inv (psa/invoice "i" "p1" [] [(psa/rate-card "p1" "dev" 10000 :currency "JPY")])]
+      (is (true? (:invoice/total-is-one-currency? inv)))
+      (is (= [] (:invoice/currencies inv)))
+      (is (= 0 (:invoice/total inv))))))
+
+(deftest the-currencies-are-the-ones-USED-not-the-ones-offered
+  (testing "a card the caller passed but this invoice never priced against
+            must not make the total look mixed — the same reason
+            `:invoice/subtotals` counts contributing cards and not all cards"
+    (let [cards [(psa/rate-card "p1" "dev" 10000 :currency "JPY" :tax-category :standard)
+                 (psa/rate-card "p1" "auditor" 200 :currency "USD" :tax-category :standard)]
+          inv (psa/invoice "i" "p1" [(ts* "dev" "2026-08-01" 10)] cards)]
+      (is (true? (:invoice/total-is-one-currency? inv))
+          "no auditor hours were billed, so no dollars entered the total")
+      (is (= ["JPY"] (:invoice/currencies inv)))
+      (is (= {:standard 100000} (:invoice/subtotals-by-tax-category inv))))))

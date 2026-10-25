@@ -1,0 +1,213 @@
+;; Native whole-root allocation source cases. Compilation/execution/resource
+;; qualification is required; source inspection does not run these cases.
+(ns kotoba.mir-allocator-cases
+  {:kotoba/export [main large-main]}
+  (:require [kotoba.mir :as mir] [kotoba.gmir.node :as node] [kotoba.mir.outcome :as outcome]
+            [kotoba.mir.catalog :as catalog] [kotoba.mir.table :as table] [kotoba.mir.operands :as operands]
+            [kotoba.mir.allocator-data :as data] [kotoba.mir.allocator-cfg :as cfg]
+            [kotoba.mir.allocator-phi :as phi] [kotoba.mir.allocator-spill :as spill]
+            [kotoba.mir-module-cases :as check]))
+(defn- kw [value :keyword] [:ref :gmir.node/value] (node/keyword-literal value))
+(defn- sym [value :string] [:ref :gmir.node/value]
+  (node/symbol-parts (option-none-of [:option [:ref :gmir.node/text]]) (node/string-text value)))
+(defn- v [index :i64] [:ref :gmir.node/value]
+  (node/keyword-parts (option-some-of [:option [:ref :gmir.node/text]] (node/string-text "kotoba.gmir.vreg")) (node/string-text (string-from-i64 index))))
+(defn- ins [op :keyword] [:ref :gmir.node/value] (node/put-key (node/empty-map) :mir/op (kw op)))
+(defn- constant [dst :i64 value :i64] [:ref :gmir.node/value]
+  (-> (ins :mir/constant) (node/put-key :mir/dst (v dst)) (node/put-key :mir/value (node/i64-value value))))
+(defn- arg [index :i64] [:ref :gmir.node/value]
+  (-> (ins :mir/argument) (node/put-key :mir/dst (v index)) (node/put-key :mir/index (node/i64-value index))))
+(defn- binary [op :keyword dst :i64 left :i64 right :i64] [:ref :gmir.node/value]
+  (-> (ins op) (node/put-key :mir/dst (v dst)) (node/put-key :mir/left (v left)) (node/put-key :mir/right (v right))))
+(defn- ret [value :i64] [:ref :gmir.node/value] (node/put-key (ins :mir/return) :mir/value (v value)))
+(defn- flat [target :keyword code [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (-> (node/empty-map) (node/put-key :mir/version (node/i64-value 2)) (node/put-key :mir/target (kw target))
+      (node/put-key :mir/registers (kw :virtual)) (node/put-key :mir/instructions code)))
+(defn- function [name :string arity :i64 code [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (-> (node/empty-map) (node/put-key :mir/name (sym name)) (node/put-key :mir/arity (node/i64-value arity)) (node/put-key :mir/instructions code)))
+(defn- module [target :keyword functions [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (-> (node/empty-map) (node/put-key :mir/version (node/i64-value 3)) (node/put-key :mir/target (kw target))
+      (node/put-key :mir/registers (kw :virtual)) (node/put-key :mir/entry (sym "f")) (node/put-key :mir/functions functions)))
+(defn- value [result [:result [:ref :gmir.node/value] [:ref :mir/refusal]]] [:ref :gmir.node/value]
+  (result-value-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (node/nil-value)))
+(defn- ok? [result [:result [:ref :gmir.node/value] [:ref :mir/refusal]]] :bool
+  (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result))
+(defn- allocated? [result [:result [:ref :gmir.node/value] [:ref :mir/refusal]]] :bool
+  (arena-scope
+  (and (ok? result) (data/named? (node/key (value result) :mir/registers) :physical) (ok? (mir/validate! (value result))))))
+(defn- bank [target :keyword banks [:list [:ref :mir.catalog/bank]]] [:ref :gmir.node/value]
+  (let [all (option-value-of [:option [:list :keyword]] (catalog/registers-for banks target :all) (typed-list-new [:list :keyword]))]
+    (loop [index 0 out (node/empty-vector)]
+      (if (>= index (vector-count all)) out (recur (+ index 1) (node/append out (kw (typed-list-nth [:list :keyword] all index))))))))
+(defn- op-count [code [:ref :gmir.node/value] op :keyword] :i64
+  (loop [index 0 count 0]
+    (if (>= index (node/child-count code)) count (recur (+ index 1) (+ count (if (data/op? (data/at code index) op) 1 0))))))
+(defn- simple? [target :keyword] :bool
+  (arena-scope
+  (let [code (-> (node/empty-vector) (node/append (constant 0 11)) (node/append (constant 1 3))
+                (node/append (binary :mir/add 2 0 1)) (node/append (ret 2)))
+        result (mir/allocate-registers (flat target code)) regs (bank target (mir/physical-registers))
+        expected (-> (node/empty-vector)
+          (node/append (node/put-key (constant 0 11) :mir/dst (data/at regs 0)))
+          (node/append (node/put-key (constant 1 3) :mir/dst (data/at regs 1)))
+          (node/append (-> (ins :mir/add) (node/put-key :mir/dst (data/at regs 2))
+            (node/put-key :mir/left (data/at regs 0)) (node/put-key :mir/right (data/at regs 1))))
+          (node/append (node/put-key (ret 2) :mir/value (data/at regs 2))))]
+    (and (allocated? result) (= (node/number (node/key (value result) :mir/frame-slots)) 0)
+         (check/same-value? (node/key (value result) :mir/instructions) expected)
+         (check/same-value? (value (mir/allocate-registers (flat target code))) (value result))))))
+(defn- copy [dst :keyword src :keyword] [:ref :gmir.node/value]
+  (-> (node/empty-map) (node/put-key :mir/dst (kw dst)) (node/put-key :mir/src (kw src))))
+(defn- parallel-cycles? [] :bool
+  (arena-scope
+  (let [copies (-> (node/empty-vector) (node/append (copy :x86-64/rax :x86-64/rcx)) (node/append (copy :x86-64/rcx :x86-64/rax)))
+        result (phi/parallel-copies copies 7)
+        expected (-> (node/empty-vector)
+          (node/append (-> (ins :mir/spill-store) (node/put-key :mir/src (kw :x86-64/rcx)) (node/put-key :mir/slot (node/i64-value 7))))
+          (node/append (-> (ins :mir/move) (node/put-key :mir/dst (kw :x86-64/rcx)) (node/put-key :mir/src (kw :x86-64/rax))))
+          (node/append (-> (ins :mir/spill-load) (node/put-key :mir/dst (kw :x86-64/rax)) (node/put-key :mir/slot (node/i64-value 7)))))
+        identity (phi/parallel-copies (node/append (node/empty-vector) (copy :x86-64/rax :x86-64/rax)) 0)]
+    (and (phi/used-temp? result) (check/same-value? (phi/instructions result) expected)
+         (not (phi/used-temp? identity)) (= (node/child-count (phi/instructions identity)) 0)))))
+(defn- pressure-code [count :i64] [:ref :gmir.node/value]
+  (let [constants (loop [index 0 out (node/empty-vector)]
+                    (if (>= index count) out (recur (+ index 1) (node/append out (constant index (+ index 1))))))
+        code (loop [index 1 previous 0 out constants]
+               (if (>= index count) (node/append out (ret previous))
+                 (recur (+ index 1) (+ count index) (node/append out (binary :mir/add (+ count index) previous index)))))] code))
+(defn- interpret-sum [code [:ref :gmir.node/value]] :i64
+  ;; A deterministic semantic check for the integer pressure fixture only.
+  ;; Unknown operations fail the fixture; this is not a whole-MIR interpreter.
+  (loop [index 0 registers (table/empty) slots (table/empty)]
+    (if (>= index (node/child-count code)) -1
+      (let [instruction (data/at code index) dst (operands/key-of (node/key instruction :mir/dst))]
+        (cond (data/op? instruction :mir/constant) (recur (+ index 1) (data/put-number registers dst (node/number (node/key instruction :mir/value))) slots)
+              (data/op? instruction :mir/add) (recur (+ index 1) (data/put-number registers dst
+                (+ (data/get-number registers (operands/key-of (node/key instruction :mir/left)) -100000)
+                   (data/get-number registers (operands/key-of (node/key instruction :mir/right)) -100000))) slots)
+              (data/op? instruction :mir/spill-store) (recur (+ index 1) registers
+                (data/put-number slots (table/index-key (node/number (node/key instruction :mir/slot))) (data/get-number registers (operands/key-of (node/key instruction :mir/src)) -100000)))
+              (data/op? instruction :mir/spill-load) (recur (+ index 1)
+                (data/put-number registers dst (data/get-number slots (table/index-key (node/number (node/key instruction :mir/slot))) -100000)) slots)
+              (data/op? instruction :mir/return) (data/get-number registers (operands/key-of (node/key instruction :mir/value)) -100000)
+              :else -1)))))
+(defn- pressure? [target :keyword count :i64] :bool
+  (arena-scope
+  (let [code (pressure-code count) result (mir/allocate-registers (flat target code))
+        allocated (node/key (value result) :mir/instructions)]
+    (and (allocated? result) (> (node/number (node/key (value result) :mir/frame-slots)) 0)
+         (> (op-count allocated :mir/spill-store) 0) (> (op-count allocated :mir/spill-load) 0)
+         (= (interpret-sum allocated) (quot (* count (+ count 1)) 2))))))
+(defn- call [tail :bool name :string arguments [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [base (-> (ins (if tail :mir/tail-call :mir/call)) (node/put-key :mir/callee (sym name)) (node/put-key :mir/arguments arguments))]
+    (if tail base (node/put-key base :mir/dst (v 30)))))
+(defn- call-live? [target :keyword] :bool
+  (arena-scope
+  (let [caller (-> (node/empty-vector) (node/append (arg 0))
+                  (node/append (call false "helper" (node/append (node/empty-vector) (v 0))))
+                  (node/append (binary :mir/add 31 0 30)) (node/append (ret 31)))
+        helper (-> (node/empty-vector) (node/append (arg 0)) (node/append (ret 0)))
+        result (mir/allocate-registers (module target (-> (node/empty-vector)
+          (node/append (function "f" 1 caller)) (node/append (function "helper" 1 helper)))))
+        allocated (data/at (node/key (value result) :mir/functions) 0)]
+    (and (allocated? result) (data/named? (node/key allocated :mir/frame-policy) :call-live)
+         (= (op-count (node/key allocated :mir/instructions) :mir/call) 1)
+         (if (= target :x86-64) (> (op-count (node/key allocated :mir/instructions) :mir/spill-store) 0)
+           (= (op-count (node/key allocated :mir/instructions) :mir/spill-store) 0))))))
+(defn- direct-reentry? [target :keyword] :bool
+  (arena-scope
+  (let [aarch64-code (-> (node/empty-vector) (node/append (arg 0)) (node/append (arg 1))
+          (node/append (-> (ins :mir/branch-nonzero) (node/put-key :mir/test (v 0)) (node/put-key :mir/target (kw :test/body))))
+          (node/append (ret 1)) (node/append (node/put-key (ins :mir/label) :mir/id (kw :test/body)))
+          (node/append (constant 3 1)) (node/append (binary :mir/subtract 4 0 3)) (node/append (binary :mir/add 5 1 3))
+          (node/append (call true "f" (-> (node/empty-vector) (node/append (v 4)) (node/append (v 5))))))
+        ;; x86 uses its canonical branch-zero flow; its ordinary direct recur
+        ;; transport is valid, while the AArch64-only bulk proof stays absent.
+        code (if (= target :aarch64) aarch64-code
+               (-> (node/empty-vector) (node/append (arg 0)) (node/append (arg 1))
+                 (node/append (-> (ins :mir/branch-zero) (node/put-key :mir/test (v 0)) (node/put-key :mir/target (kw :test/done))))
+                 (node/append (label :test/body)) (node/append (constant 3 1))
+                 (node/append (binary :mir/subtract 4 0 3)) (node/append (binary :mir/add 5 1 3))
+                 (node/append (call true "f" (-> (node/empty-vector) (node/append (v 4)) (node/append (v 5)))))
+                 (node/append (label :test/done)) (node/append (ret 1))))
+        input (module target (node/append (node/empty-vector) (function "f" 2 code)))
+        proof (mir/counted-self-recur-plan (data/at (node/key input :mir/functions) 0)) result (mir/allocate-registers input)
+        out (node/key (data/at (node/key (value result) :mir/functions) 0) :mir/instructions)]
+    (and (= (option-some?-of [:option [:ref :gmir.node/value]] proof) (= target :aarch64)) (allocated? result)
+         (= (op-count out :mir/reentry) 1) (= (op-count out :mir/recur) 1) (= (op-count out :mir/tail-call) 0)))))
+(defn- stack-call? [target :keyword] :bool
+  (arena-scope
+  (let [prefix (loop [index 0 out (node/empty-vector)]
+                 (if (>= index 7) out (recur (+ index 1) (node/append out (arg index)))))
+        arguments (loop [index 0 out (node/empty-vector)]
+                    (if (>= index 7) out (recur (+ index 1) (node/append out (v index)))))
+        caller (-> prefix (node/append (call false "helper" arguments)) (node/append (ret 30)))
+        helper (node/append prefix (ret 6))
+        result (mir/allocate-registers (module target (-> (node/empty-vector)
+          (node/append (function "f" 7 caller)) (node/append (function "helper" 7 helper)))))
+        functions (node/key (value result) :mir/functions) out (node/key (data/at functions 0) :mir/instructions)
+        helper-out (node/key (data/at functions 1) :mir/instructions)]
+    (and (allocated? result) (= (op-count out :mir/outgoing-argument) 2)
+         (= (op-count out :mir/incoming-load) 2) (= (op-count helper-out :mir/incoming-load) 2)
+         (= (op-count out :mir/argument) 5) (= (op-count helper-out :mir/argument) 5)))))
+(defn- refusals? [target :keyword] :bool
+  (arena-scope
+  (let [code (-> (node/empty-vector) (node/append (constant 0 1)) (node/append (ret 0)))
+        physical (value (mir/allocate-registers (flat target code))) result (mir/allocate-registers physical)
+        error (result-error-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] result (outcome/refusal :unexpected-success physical))
+        missing (flat target (node/append (node/empty-vector) (ret 0)))
+        ordered (cfg/definition-order (node/key missing :mir/instructions))]
+    (and (not (ok? result)) (= (outcome/problem error) :registers-not-virtual)
+         (check/same-value? (outcome/instruction error) physical)
+         (not (result-ok?-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] ordered))))))
+(defn- label [name :keyword] [:ref :gmir.node/value] (node/put-key (ins :mir/label) :mir/id (kw name)))
+(defn- jump [name :keyword] [:ref :gmir.node/value] (node/put-key (ins :mir/jump) :mir/target (kw name)))
+(defn- branch [value :i64 target :keyword] [:ref :gmir.node/value]
+  (-> (ins :mir/branch-zero) (node/put-key :mir/test (v value)) (node/put-key :mir/target (kw target))))
+(defn- cfg-cases? [] :bool
+  (arena-scope
+  (let [code (-> (node/empty-vector) (node/append (constant 0 1)) (node/append (branch 0 :test/else))
+                (node/append (constant 1 3)) (node/append (jump :test/join)) (node/append (label :test/else))
+                (node/append (constant 2 4)) (node/append (label :test/join)) (node/append (ret 0)))
+        flow (cfg/flow code) dom (cfg/dominance flow) live (cfg/liveness code flow false (table/empty))
+        colored (cfg/spill-slots code 0 (table/empty)) slots (result-value-of [:result [:ref :mir.table/tree] [:ref :mir/refusal]] colored (table/empty))
+        loop-code (-> (node/empty-vector) (node/append (arg 0)) (node/append (label :test/loop))
+          (node/append (constant 1 1)) (node/append (binary :mir/add 2 0 1)) (node/append (branch 2 :test/loop)) (node/append (ret 2)))
+        uses (cfg/last-uses loop-code)]
+    (and (= (node/child-count (cfg/blocks flow)) 4)
+         (= (table/count (data/members (cfg/successors flow) (table/index-key 0))) 2)
+         (= (table/count (data/members (cfg/predecessors flow) (table/index-key 3))) 2)
+         (cfg/dominates? dom 0 3) (not (cfg/dominates? dom 1 3)) (not (cfg/dominates? dom 2 3))
+         (= (data/get-number (cfg/immediate-dominators dom) (table/index-key 3) -1) 0)
+         (= (table/count (data/members (cfg/live-in live) (table/index-key 0))) 0)
+         (data/member? (data/members (cfg/live-out live) (table/index-key 1)) (operands/key-of (v 0)))
+         (result-ok?-of [:result [:ref :mir.table/tree] [:ref :mir/refusal]] colored)
+         (= (data/get-number slots (operands/key-of (v 0)) -1) 0)
+         (= (data/get-number slots (operands/key-of (v 1)) -1) 1)
+         (= (data/get-number slots (operands/key-of (v 2)) -1) 1)
+         (= (data/get-number uses (operands/key-of (v 0)) -1) 4)
+         (= (data/get-number uses (operands/key-of (v 1)) -1) 3)))))
+(defn- phi-cases? [target :keyword] :bool
+  (arena-scope
+  (let [incomings (-> (node/empty-vector)
+          (node/append (-> (node/empty-map) (node/put-key :mir/predecessor (kw :test/left)) (node/put-key :mir/value (v 1))))
+          (node/append (-> (node/empty-map) (node/put-key :mir/predecessor (kw :test/right)) (node/put-key :mir/value (v 2)))))
+        code (-> (node/empty-vector) (node/append (constant 0 1)) (node/append (branch 0 :test/right))
+          (node/append (label :test/left)) (node/append (constant 1 11)) (node/append (jump :test/join))
+          (node/append (label :test/right)) (node/append (constant 2 13)) (node/append (jump :test/join)) (node/append (label :test/join))
+          (node/append (-> (ins :mir/phi) (node/put-key :mir/dst (v 3)) (node/put-key :mir/incomings incomings))) (node/append (ret 3)))
+        lowered (phi/lower (flat target code)) lowered-code (node/key (phi/program lowered) :mir/instructions)
+        result (mir/allocate-registers (module target (node/append (node/empty-vector) (function "f" 0 code))))
+        function (data/at (node/key (value result) :mir/functions) 0) out (node/key function :mir/instructions)]
+    (and (= (phi/merge-slots lowered) 1) (= (op-count lowered-code :mir/merge-store) 2) (= (op-count lowered-code :mir/merge-load) 1)
+         (allocated? result) (= (node/number (node/key function :mir/frame-slots)) 0)
+         (= (op-count out :mir/phi) 0) (= (op-count out :mir/merge-store) 0) (= (op-count out :mir/merge-load) 0)))))
+(defn main [] :i64
+  (cond (not (simple? :x86-64)) 1 (not (simple? :aarch64)) 2 (not (parallel-cycles?)) 3
+        (not (pressure? :x86-64 40)) 4 (not (pressure? :aarch64 40)) 5
+        (not (call-live? :x86-64)) 6 (not (call-live? :aarch64)) 7
+        (not (direct-reentry? :x86-64)) 8 (not (direct-reentry? :aarch64)) 9
+        (not (stack-call? :x86-64)) 10 (not (stack-call? :aarch64)) 11
+        (not (refusals? :x86-64)) 12 (not (refusals? :aarch64)) 13
+        (not (cfg-cases?)) 14 (not (phi-cases? :x86-64)) 15 (not (phi-cases? :aarch64)) 16 :else 0))
+(defn large-main [] :i64 (if (and (pressure? :x86-64 128) (pressure? :aarch64 128)) 0 1))

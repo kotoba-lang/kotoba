@@ -1,0 +1,206 @@
+(ns kami.fsm-oracle-test
+  "What keeps the shipped artifact honest, now that it is what runs.
+
+  `fsm-parity-test` compiles `src/kami/fsm.kotoba` fresh and compares it to
+  `kami.fsm/advance` over `default-player-fsm`. That was the whole check while
+  the host had its own copy of the transition table. It is not the whole check
+  any more, because for that machine the host no longer computes it — it reads
+  `resources/kami/fsm/oracle/player.kir.edn`, and a fresh compile is not that
+  file. Two things have to hold that did not have to before:
+
+    1. the shipped artifact IS the current source, compiled
+    2. the host actually reads it, rather than having quietly kept a copy
+
+  The second is the one that is easy to lose and impossible to see: a
+  delegation that fell back to a host implementation would pass every parity
+  test ever written, because a host copy is exactly what those tests compare
+  against. So this asks the only question that separates them — swap in a core
+  that answers differently and see whether the host follows.
+
+  It asks the mirror question too. `kami.fsm` is a GENERIC engine and the
+  profile is a bounded slice of it, so most of this namespace's public surface
+  must NOT follow the substituted core. `the-generic-engine-does-not-reach-the-guest`
+  states that in the direction that can fail: under a core that gets every
+  profile answer wrong, a call outside the profile is expected to be
+  UNCHANGED."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kami.fsm :as fsm]
+            [kami.fsm-oracle :as oracle]
+            [kami.fsm-oracle-gen :as gen]
+            [kotoba.compiler.core :as compiler]))
+
+(deftest the-shipped-artifact-is-the-current-source-compiled
+  (doseq [[id source] (sort-by key oracle/cores)]
+    (testing (str id " <- " source)
+      (let [shipped (edn/read-string (slurp (io/resource (oracle/resource-path id))))
+            fresh (:kir (compiler/compile-source (slurp (io/file "src" source))
+                                                 gen/target {}))]
+        (is (= fresh shipped)
+            (str "shipped KIR for " id " is stale — run `kbb -M:test:gen`"))))))
+
+(deftest every-declared-core-actually-ships
+  (doseq [id (keys oracle/cores)]
+    (is (some? (io/resource (oracle/resource-path id)))
+        (str "no artifact for " id))
+    (is (some? (oracle/kir id)))))
+
+(deftest a-missing-artifact-throws-rather-than-deciding-anything
+  ;; The seam's one refusal. If it fell back instead, the first thing anyone
+  ;; would notice is that a decision quietly stopped being the shipped one.
+  (is (thrown-with-msg? kerror/ExceptionInfo #"shipped decision core is missing"
+                        (oracle/kir :not-a-core)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"does not declare that export"
+                        (oracle/param-types :player 'advance))))
+
+(deftest the-variant-abi-is-read-out-of-the-artifact
+  ;; `kami.fsm` writes neither descriptor down; it asks the shipped core which
+  ;; cases exist, what payload each declares, and what the events parameter's
+  ;; member type is, and builds from that. Pinned here so that a rename or a
+  ;; new case in `fsm.kotoba` shows up as this failing rather than as guest
+  ;; values that no longer match their declared type.
+  (is (= [[:variant :kami.fsm/player-state-v1
+           [[:idle :i64] [:move :i64] [:jump :i64]]]
+          [:set :keyword]]
+         (oracle/param-types :player 'advance-player-v1)))
+  (let [state-type (first (oracle/param-types :player 'advance-player-v1))]
+    (is (= [:idle :move :jump] (mapv first (oracle/variant-cases state-type))))
+    (is (= :i64 (oracle/case-payload-type state-type :idle)))
+    (is (nil? (oracle/case-payload-type state-type :crouch))))
+  (is (= :keyword (oracle/set-member-type
+                   (second (oracle/param-types :player 'advance-player-v1))))))
+
+(def ^:private state-type
+  "`[:variant …]` as `fsm.kotoba` declares it. Spelled out HERE, unlike in
+  `kami.fsm`, because the substitute core below has to declare the same type
+  for the swap to be a swap and not a different module."
+  "[:variant :kami.fsm/player-state-v1 [[:idle :i64] [:move :i64] [:jump :i64]]]")
+
+(def ^:private wrong-source
+  "Same exports, same signatures, deliberately different answers: every event
+  goes somewhere the shipped profile does not send it, and an empty event set
+  does not stay put. It ignores `state` entirely, which is what makes each
+  assertion below name one input rather than a pair."
+  (str "(ns kami.fsm (:export [idle-state move-state jump-state advance-player-v1]))"
+       "(def player-state-type " state-type ")"
+       "(defn idle-state [] [:alias player-state-type]"
+       "  (variant-new player-state-type :idle 0))"
+       "(defn move-state [] [:alias player-state-type]"
+       "  (variant-new player-state-type :move 0))"
+       "(defn jump-state [] [:alias player-state-type]"
+       "  (variant-new player-state-type :jump 0))"
+       "(defn advance-player-v1 [state [:alias player-state-type]"
+       "                         events [:set :keyword]] [:alias player-state-type]"
+       "  (if (typed-set-contains [:set :keyword] events :jumping)"
+       "    (idle-state)"                    ; shipped: :jump
+       "    (if (typed-set-contains [:set :keyword] events :moving)"
+       "      (jump-state)"                  ; shipped: :move
+       "      (if (typed-set-contains [:set :keyword] events :still)"
+       "        (move-state)"                ; shipped: :idle from :move
+       "        (jump-state)))))"))          ; shipped: stay put
+
+(defn- with-core
+  "Run `f` against a substituted core, then put the shipped one back."
+  [kir f]
+  (try
+    (oracle/register-kir! :player kir)
+    (f)
+    (finally (oracle/deregister-kir! :player))))
+
+(defn- wrong-kir []
+  (:kir (compiler/compile-source wrong-source gen/target {})))
+
+(deftest the-host-reads-the-artifact-rather-than-keeping-a-copy
+  (let [wrong (wrong-kir)]
+    (testing "the shipped answers"
+      (is (= :move (fsm/advance fsm/default-player-fsm :idle #{:moving})))
+      (is (= :idle (fsm/advance fsm/default-player-fsm :move #{:still})))
+      (is (= :jump (fsm/advance fsm/default-player-fsm :idle #{:jumping})))
+      (is (= :idle (fsm/advance fsm/default-player-fsm :idle #{})))
+      (is (= :move (fsm/advance fsm/default-player-fsm :jump #{:moving}))))
+    (with-core wrong
+      (fn []
+        ;; A host that had kept `(some … (:transitions fsm))` would answer
+        ;; exactly as it did above, and nothing else in this repository would
+        ;; say so.
+        (is (= :jump (fsm/advance fsm/default-player-fsm :idle #{:moving}))
+            ":moving followed the substituted core")
+        (is (= :move (fsm/advance fsm/default-player-fsm :move #{:still}))
+            ":still followed it")
+        (is (= :idle (fsm/advance fsm/default-player-fsm :idle #{:jumping}))
+            ":jumping followed it, including where :from :any used to decide")
+        (is (= :jump (fsm/advance fsm/default-player-fsm :idle #{}))
+            "and staying put is a decision too — the substituted core does not")
+        (testing "an event the alphabet never declared still goes to the guest"
+          ;; `[:set :keyword]` accepts any keyword, so this is inside what the
+          ;; profile can express even though the profile ignores it.
+          (is (= :jump (fsm/advance fsm/default-player-fsm :move #{:crouch}))))
+        (testing "the returned tag is the guest's, for every declared case"
+          (is (= :idle (fsm/advance fsm/default-player-fsm :jump #{:jumping})))
+          (is (= :move (fsm/advance fsm/default-player-fsm :jump #{:still})))
+          (is (= :jump (fsm/advance fsm/default-player-fsm :jump #{:moving}))))))
+    (testing "restored"
+      (is (= :move (fsm/advance fsm/default-player-fsm :idle #{:moving})))
+      (is (= :idle (fsm/advance fsm/default-player-fsm :idle #{}))))))
+
+(def ^:private toggle-fsm
+  "A machine that is not `default-player-fsm`, which is the whole public point
+  of `kami.fsm`: `advance` takes ANY machine map."
+  {:initial :on
+   :states {:on {} :off {}}
+   :transitions [{:from :on :to :off :on :toggle}
+                 {:from :off :to :on :on :toggle}]})
+
+(deftest the-generic-engine-does-not-reach-the-guest
+  ;; The stated boundary, as a test rather than a docstring. `fsm.kotoba` is a
+  ;; bounded profile of ONE machine over three states and a keyword event set;
+  ;; this namespace has always taken any machine map, any state value and any
+  ;; collection. Under a substituted core that gets every profile answer wrong,
+  ;; each of these is expected to be UNCHANGED — which is the same statement as
+  ;; "these calls are still answered by host code", said in the direction that
+  ;; can fail.
+  (let [wrong (wrong-kir)]
+    (with-core wrong
+      (fn []
+        (testing "a different machine"
+          (is (= :off (fsm/advance toggle-fsm :on #{:toggle})))
+          (is (= :on (fsm/advance toggle-fsm :on #{})))
+          (is (= :on (fsm/advance toggle-fsm :on #{:moving})))
+          (is (= :on (fsm/advance toggle-fsm :on #{:jumping}))))
+        (testing "the same transitions under different per-state params"
+          ;; Delegation is decided by whole-map equality, not by the
+          ;; transitions alone. Asserting "only :transitions matter" would be
+          ;; the host claiming to know what the guest models; the guest
+          ;; declares a transition profile and says nothing about params.
+          (let [retuned (assoc-in fsm/default-player-fsm [:states :idle :emissive] 0.1)]
+            (is (= :move (fsm/advance retuned :idle #{:moving})))
+            (is (= :idle (fsm/advance retuned :idle #{})))))
+        (testing "a state the shipped variant does not declare"
+          (is (= :jump (fsm/advance fsm/default-player-fsm :crouch #{:jumping})))
+          (is (= :crouch (fsm/advance fsm/default-player-fsm :crouch #{:moving})))
+          (is (nil? (fsm/advance fsm/default-player-fsm nil #{:moving}))))
+        (testing "events that are not a set of keywords"
+          ;; A vector is not a set, and `contains?` on a vector asks about
+          ;; INDICES — so this has always answered :idle, and still does.
+          (is (= :idle (fsm/advance fsm/default-player-fsm :idle [:moving])))
+          (is (= :idle (fsm/advance fsm/default-player-fsm :idle #{"moving"})))
+          (is (= :idle (fsm/advance fsm/default-player-fsm :idle nil))))
+        (testing "an event set larger than the interpreter accepts"
+          ;; 32 crosses and 33 does not, so this pins the bound from both
+          ;; sides: the same call answered by the guest and by the host.
+          (let [filler (fn [n] (set (map #(keyword (str "e" %)) (range n))))
+                at-bound (conj (filler (dec oracle/max-typed-set-items)) :moving)
+                over-bound (conj (filler oracle/max-typed-set-items) :moving)]
+            (is (= oracle/max-typed-set-items (count at-bound)))
+            (is (= (inc oracle/max-typed-set-items) (count over-bound)))
+            (is (= :jump (fsm/advance fsm/default-player-fsm :idle at-bound))
+                "at the bound the guest answers")
+            (is (= :move (fsm/advance fsm/default-player-fsm :idle over-bound))
+                "over it the generic engine does, unchanged")))
+        (testing "and the two exports the profile never modelled"
+          (is (= {:emissive 0.35 :scale 1.0}
+                 (fsm/params fsm/default-player-fsm :idle)))
+          (is (= :idle (fsm/initial fsm/default-player-fsm))))))
+    (testing "restored"
+      (is (= :move (fsm/advance fsm/default-player-fsm :idle #{:moving}))))))

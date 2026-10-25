@@ -1,0 +1,252 @@
+(ns search.bounded-search-kotoba-parity-test
+  "Parity between `search.model`'s search machinery (.cljc) and
+  `search.bounded-search` (.kotoba).
+
+  The same inputs are driven through both sides: the Clojure namespace is
+  called directly, the Kotoba side is compiled with the repo's own `:kotoba`
+  alias (js-browser target) and executed by node. What is asserted:
+
+    * token-count  == (count (model/tokenize text))
+    * token-text n == (nth (model/tokenize text) n), for every n
+    * token-start / token-end name a BYTE range of the ORIGINAL text whose
+      lower-cased slice IS that token -- re-sliced here on the JVM, so a
+      guest that returned plausible-looking offsets cannot pass
+    * term-count   == (model/term-count term text)
+    * score-doc    == (model/score-doc default-weights (tokenize q) doc)
+
+  The one structural divergence the guest documents in its header is honored:
+  the .cljc tokenize returns a VECTOR and this backend admits no readable
+  collection of strings, so the guest exposes the INDEXED face (count + nth
+  token + its byte range) that segment-text / segment-count-text already use
+  for split. Everything built ON tokenize is a number and ports exactly.
+
+  The guest also REFUSES two code points rather than answering wrongly:
+  U+0130 and U+212A are the only non-ASCII code points that lower-case into
+  [a-z0-9] (enumerated over all of Unicode on both hosts, 2026-09-08), and
+  the guest folds ASCII only. `refuses-exactly-where-the-fold-diverges`
+  pins BOTH halves -- the guest takes the error arm, AND the oracle really
+  does answer differently there. A refusal nobody can show a divergence for
+  is decoration."
+  (:require [kotoba.io :as kio] [kotoba.process :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [search.model :as model]))
+
+(def ^:private repo-dir (System/getProperty "user.dir"))
+
+(def ^:private kotoba-path
+  (str repo-dir "/src/search/bounded_search.kotoba"))
+
+(def ^:private artifact
+  (str repo-dir "/target/kotoba-search-parity/bounded_search.mjs"))
+
+(def ^:private runner
+  (str repo-dir "/target/kotoba-search-parity/run.mjs"))
+
+;; The kernel DECLARES this budget (amu --fuel); 512 is the historical
+;; default and this kernel does not fit in it. Measured 2026-09-08 against
+;; amu 9092ee34: `main` is refused at compile time at 7000 and runs at 7500,
+;; so 8192 is the declared floor with headroom, not a guess. The runner
+;; re-imports the module per case because the fuel global is module-scoped:
+;; one instance would spend the whole budget on the first few cases.
+(def ^:private declared-fuel "8192")
+
+;; --- the corpus, one table for both sides -----------------------------------
+
+(def ^:private texts
+  ["GFTD Slides"
+   "Decks scenes notes publishing"
+   "GFTD Slides deck slides"
+   ""
+   "  ,.- "
+   "abc漢字def"
+   "欧州連合理事会"
+   "ミツトヨ"
+   "本"
+   "人々"
+   "ABC Xyz 123"
+   "a1 2b"
+   "kotoba 検索 engine"
+   "日本語の全文検索"
+   "Ａｌｐｈａ beta"
+   "tabs\tand\nnewlines"
+   "理事会"
+   ;; Every class EDGE, on the line and one code point outside it. Measured
+   ;; 2026-09-08: without these, narrowing the CJK upper bound from U+9FFF to
+   ;; U+9C3F changed no answer in this corpus and the whole suite stayed
+   ;; green. A comparison with no input on its boundary tests no boundary.
+   "\u3040\u3040" "\u303f\u303f" "\u30ff\u30ff" "\u3100\u3100"
+   "\u3400\u3400" "\u33ff\u33ff" "\u9fff\u9fff" "\ua000\ua000"
+   "/09:" "`az{" "\u3040a\u9fff"])
+
+(def ^:private term-cases
+  [["slides" "GFTD Slides deck slides"]
+   ["Slides" "GFTD Slides"]
+   ["gftd" "GFTD Slides"]
+   ["州連" "欧州連合"]
+   ["本" "本"]
+   ["zzz" "GFTD Slides"]
+   ["漢字" "abc漢字def"]
+   ["ツト" "ミツトヨ"]
+   ["a" ""]])
+
+(def ^:private score-cases
+  [{:q "slides" :title "GFTD Slides" :tags ["slides" "deck"] :body "a slides b"}
+   {:q "検索 engine" :title "全文検索" :tags ["検索"] :body "engine 検索"}
+   {:q "zzz" :title "GFTD Slides" :tags ["deck"] :body "body"}
+   {:q "gftd slides" :title "GFTD Slides" :tags [] :body "gftd"}
+   {:q "理事会" :title "欧州連合理事会" :tags ["理事会"] :body ""}])
+
+;; U+0130 and U+212A: the entire divergence set, measured.
+(def ^:private refusal-cases
+  [{:name "kelvin-in-query" :q "\u212A" :title "k" :tags [] :body ""}
+   {:name "kelvin-in-title" :q "k" :title "\u212A" :tags [] :body ""}
+   {:name "dotted-I-in-body" :q "i" :title "" :tags [] :body "\u0130"}])
+
+(defn- doc-of [{:keys [title tags body]}]
+  {:search/title title :search/tags tags :search/body body})
+
+(defn- tags-text [{:keys [tags]}] (str/join " " tags))
+
+;; --- guest ------------------------------------------------------------------
+
+(defn- js-str [s] (str "\"" (str/escape s {\\ "\\\\" \" "\\\"" \newline "\\n"
+                                           \tab "\\t" \return "\\r"}) "\""))
+
+(defn- runner-source []
+  (str "const A=" (js-str (str "file://" artifact)) ";\n"
+       "const fresh=async k=>(await import(A+'?case='+k)).instantiateKotoba();\n"
+       "const out=[];\n"
+       "const TEXTS=[" (str/join "," (map js-str texts)) "];\n"
+       "const TERMS=[" (str/join "," (map (fn [[t x]]
+                                            (str "[" (js-str t) "," (js-str x) "]"))
+                                          term-cases)) "];\n"
+       "const SCORES=[" (str/join "," (map (fn [c]
+                                             (str "[" (js-str (:q c)) ","
+                                                  (js-str (:title c)) ","
+                                                  (js-str (tags-text c)) ","
+                                                  (js-str (:body c)) "]"))
+                                           (concat score-cases refusal-cases))) "];\n"
+       "let k=0;\n"
+       "for (let i=0;i<TEXTS.length;i++){\n"
+       "  const m=await fresh(k++); const t=TEXTS[i];\n"
+       "  const n=m['token-count'](t);\n"
+       "  out.push(['count',i,n].join('\\t'));\n"
+       "  for (let j=0n;j<n;j++)\n"
+       "    out.push(['token',i,j,m['token-text'](t,j),m['token-start'](t,j),m['token-end'](t,j)].join('\\t'));\n"
+       "  out.push(['oob',i,m['token-text'](t,n),m['token-start'](t,n),m['token-text'](t,-1n)].join('\\t'));\n"
+       "  out.push(['subset',i,m['in-fold-subset?'](t)].join('\\t'));\n"
+       "}\n"
+       "for (let i=0;i<TERMS.length;i++){\n"
+       "  const m=await fresh(k++);\n"
+       "  out.push(['term',i,m['term-count'](TERMS[i][0],TERMS[i][1])].join('\\t'));\n"
+       "}\n"
+       "for (let i=0;i<SCORES.length;i++){\n"
+       "  const m=await fresh(k++); const s=SCORES[i];\n"
+       "  const r=m['score-doc'](s[0],s[1],s[2],s[3]);\n"
+       "  out.push(['score',i,r[0],r[1]].join('\\t'));\n"
+       "}\n"
+       "out.push(['main',0,(await fresh(k++)).main()].join('\\t'));\n"
+       "console.log(out.join('\\n'));\n"))
+
+(defn- compile-guest! []
+  (kio/mkdirs (kio/file (kio/parent (kio/file artifact))))
+  (let [{:keys [exit err out]}
+        (shell/sh "kbb" "-M:kotoba" "compile" kotoba-path
+                  "--target" "js-browser" "--output" artifact
+                  "--fuel" declared-fuel :dir repo-dir)]
+    (when-not (zero? exit)
+      (throw (ex-info "guest compile failed" {:exit exit :err err :out out})))))
+
+(defn- run-guest []
+  (spit runner (runner-source))
+  (let [{:keys [exit out err]} (shell/sh "node" runner :dir repo-dir)]
+    (when-not (zero? exit)
+      (throw (ex-info "guest run failed" {:exit exit :err err :out out})))
+    (reduce (fn [acc line]
+              (let [[kind & fields] (str/split line #"\t" -1)]
+                (update acc kind (fnil conj []) (vec fields))))
+            {}
+            (remove str/blank? (str/split-lines out)))))
+
+(def ^:private guest (delay (do (compile-guest!) (run-guest))))
+
+(defn- rows [kind] (get @guest kind []))
+
+(defn- i64 [s] (parse-long (str/replace s #"n$" "")))
+
+;; The guest's edges are BYTE offsets into the original text. Re-slice here
+;; rather than trusting them: a guest that answered [0, byte-length) for
+;; every token would still match token-text, and would fail this.
+(defn- byte-slice [^String text start end]
+  (let [b (.getBytes text "UTF-8")]
+    (String. b start (- end start) "UTF-8")))
+
+;; --- the assertions ---------------------------------------------------------
+
+(deftest ^:parity token-face-matches-tokenize
+  (println "search.bounded-search-kotoba-parity-test running")
+  (let [counts (into {} (map (fn [[i n]] [(parse-long i) (i64 n)])) (rows "count"))]
+    (doseq [[i text] (map-indexed vector texts)]
+      (testing (str "text " i " " (pr-str text))
+        (is (= (count (model/tokenize text)) (get counts i))
+            "token-count differs from (count (tokenize text))")))
+    (doseq [[i j tok start end] (rows "token")]
+      (let [i (parse-long i) j (i64 j) text (nth texts i)
+            expected (nth (model/tokenize text) j)]
+        (testing (str "text " i " token " j)
+          (is (= expected tok) "nth token text differs from the oracle")
+          (is (= expected (str/lower (byte-slice text (i64 start) (i64 end))))
+              "token-start/token-end do not bound that token in the original bytes"))))
+    (doseq [[i oob-text oob-start neg-text] (rows "oob")]
+      (testing (str "text " i " out of range")
+        (is (= "" oob-text) "out-of-range token-text is not empty")
+        (is (= -1 (i64 oob-start)) "out-of-range token-start is not -1")
+        (is (= "" neg-text) "negative token-text is not empty")))))
+
+(deftest ^:parity term-count-matches-oracle
+  (doseq [[i n] (rows "term")]
+    (let [[term text] (nth term-cases (parse-long i))]
+      (testing (str "term-count " (pr-str term) " in " (pr-str text))
+        (is (= (model/term-count term text) (i64 n))
+            "term-count differs from the oracle")))))
+
+(deftest ^:parity score-doc-matches-oracle
+  (doseq [[i ok value] (take (count score-cases) (rows "score"))]
+    (let [c (nth score-cases (parse-long i))]
+      (testing (str "score-doc " (pr-str (:q c)))
+        (is (= "true" ok) "guest refused an in-subset document")
+        (is (= (model/score-doc model/default-weights
+                                (model/tokenize (:q c))
+                                (doc-of c))
+               (i64 value))
+            "score differs from the oracle")))))
+
+(deftest ^:parity refuses-exactly-where-the-fold-diverges
+  ;; Both halves. The guest must take the error arm, AND the oracle must
+  ;; really answer differently there -- otherwise the refusal is decoration.
+  (doseq [[i ok value] (drop (count score-cases) (rows "score"))]
+    (let [c (nth refusal-cases (- (parse-long i) (count score-cases)))
+          oracle (model/score-doc model/default-weights
+                                  (model/tokenize (:q c))
+                                  (doc-of c))]
+      (testing (:name c)
+        (is (= "false" ok) "guest answered instead of refusing")
+        (is (str/includes? value "outside the ASCII-fold subset")
+            "refusal does not name its reason")
+        (is (pos? oracle)
+            "the oracle does not actually diverge here, so this refusal guards nothing"))))
+  (doseq [[i in-subset] (rows "subset")]
+    (testing (str "in-fold-subset? on text " i)
+      (is (= "true" in-subset)
+          "a corpus text was reported outside the fold subset")))
+  (is (= 0 (count (filter #(or (str/includes? % "\u0130") (str/includes? % "\u212A"))
+                          texts)))
+      "corpus text carries a divergent code point; the subset assertion above would be vacuous"))
+
+(deftest ^:parity kernel-self-check-runs-every-check
+  ;; failures * 1000 + checks-run. A boolean cannot tell one regression apart
+  ;; from a build that ran nothing; 52 is 0 failures over 52 checks.
+  (let [v (i64 (second (first (rows "main"))))]
+    (is (= 0 (quot v 1000)) (str "kernel self-check reported " (quot v 1000) " failure(s)"))
+    (is (= 52 (rem v 1000)) "kernel self-check ran a different number of checks")))

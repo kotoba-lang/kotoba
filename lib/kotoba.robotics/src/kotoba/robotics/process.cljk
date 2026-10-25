@@ -1,0 +1,148 @@
+(ns kotoba.robotics.process
+  "Robot process physics, declared as data and run by one probe.
+
+  A cloud-itonami vertical does not hand-roll a simulation: it declares in
+  `physics.edn` which physical process its robot performs, with what
+  parameters, swept over what, and judged against what limit. This namespace
+  validates that declaration and runs it on the solvers under
+  `kotoba.robotics.process.*`:
+
+    :transport     mobile robot carrying a payload (force/accel/brake-limited
+                   longitudinal dynamics, tip-over margin)
+    :manipulator   two-link arm pick-and-place (IK, quintic trajectory,
+                   rigid-body inverse dynamics)
+    :material      tension/compression test of a specimen (kudaki explicit
+                   J2-plastic truss)
+    :thermal       transient 1-D conduction through a slab (FTCS)
+    :tank-drain    Torricelli drain / fill of a tank (RK2)
+    :pipe-flow     Darcy-Weisbach pipe flow, Colebrook friction, pump power
+
+  Spec schema `itonami.physical-ai.spec.v1`:
+
+    {:physics/schema \"itonami.physical-ai.spec.v1\"
+     :repo \"cloud-itonami/<repo>\"
+     :cases [{:id :courier-leg :kind :transport
+              :procedure \"what the robot does, in the domain's words\"
+              :params {...}                       ; solver parameters (defaults fill the rest)
+              :sweep {:param :payload-kg :values [5 10 20 40]}
+              :quantity :cycle-time-s             ; the output the limit judges
+              :limit {:max 60.0 :basis \"estimate: ...\" }   ; or :min; :basis names the source
+              :boundary {:lo 0.0 :hi 200.0}}]}    ; optional: bisect :param for the limit crossing
+
+  The probe's output is `itonami.physical-ai.probe.v1` (the same contract the
+  physical-AI bots' ledger reads). A run whose solver threw is not counted;
+  a run whose physics answers 'cannot' (stalled, unreachable, never drains)
+  IS a measurement and is out of tolerance by definition."
+  (:require [kotoba.robotics.process.transport :as transport]
+            [kotoba.robotics.process.manipulator :as manipulator]
+            [kotoba.robotics.process.material :as material]
+            [kotoba.robotics.process.thermal :as thermal]
+            [kotoba.robotics.process.fluid :as fluid]))
+
+(def spec-schema "itonami.physical-ai.spec.v1")
+(def probe-schema "itonami.physical-ai.probe.v1")
+
+(def kinds
+  {:transport {:run transport/move :solver "kotoba.robotics.process.transport (semi-implicit Euler)"
+               :cannot #(or (:stalled? %) (false? (:reached? %)))}
+   :manipulator {:run manipulator/pick-place :solver "kotoba.robotics.process.manipulator (2-link inverse dynamics)"
+                 :cannot #(false? (:reachable? %))}
+   :material {:run material/tensile-test :solver "kudaki explicit J2 truss (kotoba.robotics.process.material)"
+              :cannot (constantly false)}
+   :thermal {:run thermal/simulate :solver "kotoba.robotics.process.thermal (1-D FTCS)"
+             :cannot (constantly false)}
+   :tank-drain {:run fluid/tank-drain :solver "kotoba.robotics.process.fluid/tank-drain (RK2 Torricelli)"
+                :cannot (constantly false)}
+   :pipe-flow {:run fluid/pipe-flow :solver "kotoba.robotics.process.fluid/pipe-flow (Colebrook)"
+               :cannot (constantly false)}})
+
+(defn- blank? [s] (or (nil? s) (and (string? s) (= "" (.trim ^String s)))))
+
+(defn spec-problems
+  "Every reason `spec` cannot be run as declared; empty = runnable."
+  [spec]
+  (let [cases (:cases spec)]
+    (cond-> []
+      (not= spec-schema (:physics/schema spec)) (conj (str "schema is not " spec-schema))
+      (blank? (:repo spec)) (conj "no :repo")
+      (empty? cases) (conj "no :cases")
+      (seq cases)
+      (into (mapcat
+             (fn [{:keys [id kind sweep quantity limit procedure]}]
+               (let [who (str "case " id ": ")]
+                 (cond-> []
+                   (not (keyword? id)) (conj (str who ":id must be a keyword"))
+                   (not (contains? kinds kind)) (conj (str who "unknown :kind " kind))
+                   (blank? procedure) (conj (str who "no :procedure"))
+                   (not (keyword? (:param sweep))) (conj (str who ":sweep :param must be a keyword"))
+                   (or (empty? (:values sweep)) (not-every? number? (:values sweep))) (conj (str who ":sweep :values must be numbers"))
+                   (not (keyword? quantity)) (conj (str who ":quantity must be a keyword"))
+                   (not (or (number? (:max limit)) (number? (:min limit)))) (conj (str who ":limit needs :max or :min"))
+                   (blank? (:basis limit)) (conj (str who ":limit :basis must say where the number comes from")))))
+             cases))
+      (and (seq cases) (not (apply distinct? (map :id cases)))) (conj "duplicate case :id"))))
+
+(defn- scalars [m] (into (sorted-map) (filter (fn [[_ v]] (or (number? v) (boolean? v)))) m))
+
+(defn out-of-tolerance?
+  "Does result `r` of `case` violate its limit? A physical 'cannot' does."
+  [{:keys [kind quantity limit]} r]
+  (let [q (get r quantity)
+        ;; a time-to-reach quantity that never reached is +infinity, not
+        ;; 'unknown': it satisfies a :min ('takes at least') and fails a :max
+        never-reached? (and (nil? q) (#{:time-to-threshold-s :time-to-target-s} quantity))]
+    (cond ((:cannot (kinds kind)) r) true
+          never-reached? (not (and (number? (:min limit)) (nil? (:max limit))))
+          (not (number? q)) true
+          (and (number? (:max limit)) (> q (:max limit))) true
+          (and (number? (:min limit)) (< q (:min limit))) true
+          :else false)))
+
+(defn run-case
+  "Run `case` at sweep value `x`. {:input :quantities :out-of-tolerance?} or
+  {:input :error} when the solver threw."
+  [{:keys [kind params sweep] :as c} x]
+  (let [input {(:param sweep) x}]
+    (try
+      (let [r ((:run (kinds kind)) (merge params input))]
+        {:case (:id c) :input input :quantities (scalars r) :out-of-tolerance? (out-of-tolerance? c r)})
+      (catch #?(:cljs :default :default Throwable) e
+        {:case (:id c) :input input :error (ex-message e)}))))
+
+(defn boundary
+  "Bisect the sweep parameter between `:lo` and `:hi` for the point where the
+  limit verdict flips. nil when the bracket does not straddle a flip. 20
+  halvings resolve the bracket to 1e-6 of its width; each is a full solver
+  run, so a slow kind (a quasi-static :material ramp) pays 20x."
+  [{:keys [kind params sweep] :as c} {:keys [lo hi iterations] :or {iterations 20}}]
+  (let [bad? (fn [x] (out-of-tolerance? c ((:run (kinds kind)) (merge params {(:param sweep) x}))))
+        blo (bad? lo) bhi (bad? hi)]
+    (when (not= blo bhi)
+      (loop [lo (double lo) hi (double hi) i 0]
+        (if (>= i iterations)
+          {:param (:param sweep) :value (/ (+ lo hi) 2.0) :out-of-tolerance-below? blo}
+          (let [mid (/ (+ lo hi) 2.0)]
+            (if (= (bad? mid) blo) (recur mid hi (inc i)) (recur lo mid (inc i)))))))))
+
+(defn probe
+  "Run every case of `spec` over its sweep; the probe.v1 map."
+  [spec]
+  (let [problems (spec-problems spec)]
+    (if (seq problems)
+      {:physics-probe/schema probe-schema :repo (:repo spec) :problems problems
+       :runs [] :count 0 :expected 0}
+      (let [runs (vec (for [c (:cases spec) x (get-in c [:sweep :values])] (run-case c x)))
+            derived (into (sorted-map)
+                          (for [c (:cases spec) :when (:boundary c)]
+                            [(:id c) (merge {:quantity (:quantity c) :limit (:limit c)}
+                                            (try (boundary c (:boundary c))
+                                                 (catch #?(:cljs :default :default Throwable) e
+                                                   {:error (ex-message e)})))]))]
+        {:physics-probe/schema probe-schema
+         :repo (:repo spec)
+         :procedure (->> (:cases spec) (map :procedure) distinct (interpose " / ") (apply str))
+         :solver (->> (:cases spec) (map #(:solver (kinds (:kind %)))) distinct (interpose " / ") (apply str))
+         :runs runs
+         :derived derived
+         :count (count (remove :error runs))
+         :expected (count runs)}))))

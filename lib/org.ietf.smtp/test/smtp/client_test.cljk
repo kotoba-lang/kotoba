@@ -1,0 +1,226 @@
+(ns smtp.client-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [smtp.client :as client]
+            [smtp.fake-transport :as fake]
+            [smtp.protocol :as p]))
+
+(deftest connect-reads-the-greeting-and-throws-on-a-negative-one
+  (let [{:keys [transport]} (fake/make ["220 smtp.example.com ESMTP ready"])]
+    (is (some? (:transport (client/connect! "smtp.example.com" {:transport transport})))))
+  (let [{:keys [transport]} (fake/make ["421 service not available"])]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"greeting"
+         (client/connect! "smtp.example.com" {:transport transport})))))
+
+(deftest full-session-happy-path
+  (let [script ["220 smtp.example.com ESMTP ready"                 ; greeting
+               "250-smtp.example.com at your service"              ; ehlo! (multi-line)
+               "250-AUTH LOGIN PLAIN"
+               "250 8BITMIME"
+               "334 VXNlcm5hbWU6"                                  ; auth-login! username prompt
+               "334 UGFzc3dvcmQ6"                                  ; password prompt
+               "235 2.7.0 Authentication successful"               ; authenticated
+               "250 OK"                                            ; MAIL FROM
+               "250 OK"                                            ; RCPT TO
+               "354 Start mail input; end with <CRLF>.<CRLF>"      ; DATA
+               "250 OK: queued as 12345"                           ; DATA payload accepted
+               "221 2.0.0 Bye"]                                    ; QUIT
+        {:keys [transport written]} (fake/make script)
+        session (client/connect! "smtp.example.com" {:transport transport})
+        session (client/ehlo! session "my-client.example.com")]
+    (is (= ["smtp.example.com at your service" "AUTH LOGIN PLAIN" "8BITMIME"] (:capabilities session)))
+    (let [session (client/auth-login! session "you@gmail.com" "app-password")
+          session (assoc session :from "you@gmail.com")
+          session (client/send-mail! session {:to "friend@example.com" :subject "hi" :body "hello"})]
+      (is (nil? (client/quit! session))))
+    (testing "the exact wire commands sent, in order"
+      (is (= ["EHLO my-client.example.com\r\n"
+             "AUTH LOGIN\r\n"
+             "eW91QGdtYWlsLmNvbQ==\r\n"                            ; base64("you@gmail.com")
+             "YXBwLXBhc3N3b3Jk\r\n"                                ; base64("app-password")
+             "MAIL FROM:<you@gmail.com>\r\n"
+             "RCPT TO:<friend@example.com>\r\n"
+             "DATA\r\n"
+             "From: you@gmail.com\r\nTo: friend@example.com\r\nSubject: hi\r\nContent-Type: text/plain; charset=UTF-8\r\nMIME-Version: 1.0\r\n\r\nhello\r\n.\r\n"
+             "QUIT\r\n"
+             :closed]
+             @written)))))
+
+(deftest auth-failure-throws-with-the-servers-text
+  (let [script ["220 ready" "250 OK" "535 5.7.8 Authentication failed"]
+        {:keys [transport]} (fake/make script)
+        session (client/connect! "smtp.example.com" {:transport transport})
+        session (client/ehlo! session "client")]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"AUTH LOGIN failed"
+         (client/auth-login! session "u" "wrong")))))
+
+;; --- RFC 5321 coverage ------------------------------------------------------
+
+(defn- connected [script]
+  (let [{:keys [transport written]} (fake/make script)]
+    {:session (client/connect! "smtp.example.com" {:transport transport})
+     :written written}))
+
+(def ^:private ehlo-lines
+  ["250-smtp.example.com Hello"
+   "250-SIZE 35882577"
+   "250-8BITMIME"
+   "250-AUTH LOGIN PLAIN XOAUTH2"
+   "250 STARTTLS"])
+
+(deftest ehlo-parses-the-extensions-rather-than-handing-back-strings
+  (let [{:keys [session]} (connected (cons "220 ready" ehlo-lines))
+        s (client/ehlo! session "me.example.com")]
+    (is (= #{"LOGIN" "PLAIN" "XOAUTH2"} (:auth-mechanisms s)))
+    (is (= 35882577 (:max-size s))
+        "worth reading before sending: an oversized message is otherwise
+         rejected after the whole body has gone up a slow link")
+    (is (client/supports? s "8BITMIME"))
+    (is (client/supports? s "starttls") "case-insensitive per RFC 1869 §4.5")
+    (is (not (client/supports? s "CHUNKING")))))
+
+(deftest every-recipient-goes-in-one-transaction
+  (testing "one transaction per recipient is not the same message sent
+            several times: each copy carries only its own address in the
+            header, so nobody can see who else got it and reply-all reaches
+            one person"
+    (let [{:keys [session written]} (connected
+                                     ["220 ready"
+                                      "250 MAIL OK"
+                                      "250 RCPT OK"
+                                      "250 RCPT OK"
+                                      "250 RCPT OK"
+                                      "354 go ahead"
+                                      "250 queued as ABC"])
+          result (client/send-mail! (assoc session :from "me@example.com")
+                                    {:to ["a@example.com" "b@example.com"]
+                                     :cc "c@example.com"
+                                     :subject "s" :body "hi"})]
+      (is (= ["a@example.com" "b@example.com" "c@example.com"] (:accepted result)))
+      (is (= ["MAIL FROM:<me@example.com>\r\n"
+              "RCPT TO:<a@example.com>\r\n"
+              "RCPT TO:<b@example.com>\r\n"
+              "RCPT TO:<c@example.com>\r\n"
+              "DATA\r\n"]
+             (take 5 @written))
+          "one MAIL FROM, three RCPT TO, one DATA — RFC 5321 §3.3"))))
+
+(deftest a-refused-recipient-does-not-lose-the-mail-that-did-go-out
+  (testing "RFC 5321 §3.3 permits some RCPT TO to fail while others succeed;
+            throwing on the first would turn a partial success into a total
+            failure and discard the delivery that actually happened"
+    (let [{:keys [session]} (connected
+                             ["220 ready" "250 MAIL OK"
+                              "250 RCPT OK"
+                              "550 5.1.1 No such user here"
+                              "354 go ahead" "250 queued"])
+          result (client/send-mail! (assoc session :from "me@example.com")
+                                    {:to ["good@example.com" "gone@example.com"]
+                                     :subject "s" :body "hi"})]
+      (is (= ["good@example.com"] (:accepted result)))
+      (is (= 1 (count (:rejected result))))
+      (testing "and the enhanced status says which kind of refusal it was"
+        (is (= "5.1.1" (:status (first (:rejected result)))))))))
+
+(deftest every-recipient-refused-is-a-real-failure
+  (let [{:keys [session]} (connected
+                           ["220 ready" "250 MAIL OK" "550 5.1.1 No such user"])]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"every recipient"
+         (client/send-mail! (assoc session :from "me@example.com")
+                            {:to "gone@example.com" :subject "s" :body "hi"})))))
+
+(deftest a-send-with-no-recipient-is-refused-before-mail-from
+  (let [{:keys [session]} (connected ["220 ready"])]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"no recipient"
+         (client/send-mail! (assoc session :from "me@example.com")
+                            {:subject "s" :body "hi"})))))
+
+(deftest bcc-is-a-recipient-and-never-a-header
+  (testing "a blind carbon copy is blind because the address is in RCPT TO
+            and not in the message; writing it into a header hands every
+            recipient the list of people who were meant to be invisible"
+    (let [{:keys [session written]} (connected
+                                     ["220 ready" "250 MAIL OK" "250 RCPT OK"
+                                      "250 RCPT OK" "354 go" "250 queued"])]
+      (client/send-mail! (assoc session :from "me@example.com")
+                         {:to "a@example.com" :bcc "secret@example.com"
+                          :subject "s" :body "hi"})
+      (is (some #(= "RCPT TO:<secret@example.com>\r\n" %) @written)
+          "delivered to")
+      (is (not-any? #(str/includes? (str %) "Bcc:") @written)
+          "and not named in the message"))))
+
+(deftest auth-plain-is-one-round-trip-where-login-is-three
+  (let [{:keys [session written]} (connected ["220 ready" "235 accepted"])]
+    (client/auth-plain! session "me@example.com" "secret")
+    (is (= (str "AUTH PLAIN "
+                (p/base64 (str (char 0) "me@example.com" (char 0) "secret"))
+                "\r\n")
+           (first @written)))))
+
+(deftest auth-xoauth2-finishes-the-exchange-before-believing-a-334
+  (testing "a rejected token answers 334 with a base64 JSON error rather than
+            a failure code, and the protocol wants an empty line before the
+            real status — treating the 334 as success reports a send that
+            never happened"
+    (let [{:keys [session written]} (connected
+                                     ["220 ready"
+                                      "334 eyJzdGF0dXMiOiI0MDEifQ=="
+                                      "535 5.7.8 Bad credentials"])]
+      (is (thrown? kerror/ExceptionInfo
+                   (client/auth-xoauth2! session "me@example.com" "expired")))
+      (is (= "\r\n" (second @written)) "the empty line that finishes it")))
+  (testing "and a good token just succeeds"
+    (let [{:keys [session]} (connected ["220 ready" "235 accepted"])]
+      (is (some? (client/auth-xoauth2! session "me@example.com" "ya29.good"))))))
+
+(deftest authenticate-picks-the-strongest-mechanism-offered
+  (testing "XOAUTH2 when there is a token"
+    (let [{:keys [session written]} (connected ["220 ready" "235 ok"])
+          s (assoc session :auth-mechanisms #{"LOGIN" "PLAIN" "XOAUTH2"})]
+      (client/authenticate! s {:user "me" :access-token "tok"})
+      (is (str/starts-with? (first @written) "AUTH XOAUTH2"))))
+  (testing "PLAIN over LOGIN when there is only a password"
+    (let [{:keys [session written]} (connected ["220 ready" "235 ok"])
+          s (assoc session :auth-mechanisms #{"LOGIN" "PLAIN"})]
+      (client/authenticate! s {:user "me" :password "pw"})
+      (is (str/starts-with? (first @written) "AUTH PLAIN"))))
+  (testing "a server advertising no AUTH is left alone -- some submission
+            servers authenticate by IP or client certificate, and refusing
+            to proceed would break them"
+    (let [{:keys [session written]} (connected ["220 ready"])
+          s (assoc session :auth-mechanisms #{})]
+      (is (some? (client/authenticate! s {:user "me" :password "pw"})))
+      (is (empty? @written))))
+  (testing "and one offering only mechanisms this does not implement says so
+            rather than sending a password in a form it cannot"
+    (let [{:keys [session]} (connected ["220 ready"])
+          s (assoc session :auth-mechanisms #{"GSSAPI" "NTLM"})]
+      (is (thrown? kerror/ExceptionInfo
+                   (client/authenticate! s {:user "me" :password "pw"}))))))
+
+(deftest raw-sends-a-prebuilt-message
+  (testing "for a caller that has composed headers this library does not
+            model -- MIME parts, transfer encodings, RFC 2047 subjects"
+    (let [{:keys [session written]} (connected
+                                     ["220 ready" "250 MAIL OK" "250 RCPT OK"
+                                      "354 go" "250 queued"])]
+      (client/send-mail! (assoc session :from "me@example.com")
+                         {:to "a@example.com"
+                          :raw "Subject: =?UTF-8?B?5pel?=\r\n\r\nbody"})
+      (is (= "Subject: =?UTF-8?B?5pel?=\r\n\r\nbody\r\n.\r\n" (last @written))))))
+
+(deftest rset-abandons-a-failed-transaction
+  (testing "a session left mid-transaction rejects the next MAIL FROM with an
+            error about sequencing rather than about what actually went wrong"
+    (let [{:keys [session written]} (connected ["220 ready" "250 flushed"])]
+      (client/rset! session)
+      (is (= ["RSET\r\n"] @written)))))

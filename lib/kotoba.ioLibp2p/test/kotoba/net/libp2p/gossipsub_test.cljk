@@ -1,0 +1,154 @@
+(ns kotoba.net.libp2p.gossipsub-test
+  (:require [kotoba.test :refer [deftest is]]
+            [kotoba.net.libp2p.gossipsub :as gs]))
+
+(def topic "/record/a")
+(defn peer [state id topics outbound?]
+  (-> (gs/add-peer state id {:outbound? outbound?})
+      (assoc-in [:peers id :topics] (set topics))))
+
+(deftest adding-the-reverse-stream-preserves-peer-subscriptions
+  (let [inbound (-> (gs/init)
+                    (gs/add-peer "p" {:outbound? false :ip "203.0.113.7"})
+                    (assoc-in [:peers "p" :topics] #{topic}))
+        bidirectional (gs/add-peer inbound "p" {:outbound? true})]
+    (is (= #{topic} (get-in bidirectional [:peers "p" :topics])))
+    (is (true? (get-in bidirectional [:peers "p" :outbound?])))
+    (is (= "203.0.113.7" (get-in bidirectional [:peers "p" :ip])))))
+
+(deftest join-announces-subscription-and-grafts-a-bounded-mesh
+  (let [state (-> (gs/init {:d 2 :d-low 1 :d-high 3})
+                  (peer "a" [topic] true)
+                  (peer "b" [topic] false)
+                  (peer "c" [topic] true))
+        result (gs/subscribe state topic 1000)]
+    (is (= #{"a" "b"} (get-in result [:state :mesh topic])))
+    (is (= 3 (count (filter #(get-in % [:rpc :subscriptions]) (:effects result)))))
+    (is (= 2 (count (filter #(get-in % [:rpc :control :graft]) (:effects result)))))))
+
+(deftest accepted-message-is-deduped-cached-delivered-and-forwarded
+  (let [state (-> (gs/init {:d 2})
+                  (peer "a" [topic] true)
+                  (peer "b" [topic] false)
+                  (peer "c" [topic] true)
+                  (assoc :subscriptions #{topic})
+                  (assoc-in [:mesh topic] #{"a" "b" "c"}))
+        message {:topic topic :data [1 2 3]}
+        first (gs/receive state "a" {:messages [message]} 1000 (fn [_ _] :accept))
+        duplicate (gs/receive (:state first) "b" {:messages [message]} 1001
+                              (fn [_ _] :accept))]
+    (is (= 1 (count (filter #(= :deliver (:op %)) (:effects first)))))
+    (is (= #{"b" "c"} (set (map :peer (filter #(= :send (:op %)) (:effects first))))))
+    (is (empty? (:effects duplicate)))
+    (is (= 1.0 (get-in first [:state :scores "a" :topics topic :first])))
+    (is (= 1.0 (get-in first [:state :scores "a" :topics topic :mesh-deliveries])))))
+
+(deftest invalid-message-penalizes-and-graylist-fails-closed
+  (let [state (-> (gs/init {:score {:invalid-weight -100.0}
+                            :thresholds {:graylist -50.0}})
+                  (peer "bad" [topic] false))
+        rejected (gs/receive state "bad" {:messages [{:topic topic :data [9]}]}
+                             1000 (fn [_ _] :reject))
+        ignored (gs/receive (:state rejected) "bad"
+                            {:subscriptions [{:topic topic :subscribe? true}]}
+                            1001 (fn [_ _] :accept))]
+    (is (= :rejected (get-in rejected [:effects 0 :op])))
+    (is (neg? (gs/peer-score (:state rejected) "bad" 1001)))
+    (is (:graylisted? ignored))
+    (is (empty? (:effects ignored)))))
+
+(deftest graft-prune-backoff-and-explicit-peer-rules
+  (let [state (-> (gs/init {:backoff-ms 60000})
+                  (peer "p" [topic] true)
+                  (assoc :subscriptions #{topic}))
+        accepted (gs/receive state "p" {:control {:graft [{:topic topic}]}}
+                             1000 (fn [_ _] :accept))
+        pruned (gs/receive (:state accepted) "p"
+                           {:control {:prune [{:topic topic :backoff-seconds 60}]}}
+                           2000 (fn [_ _] :accept))
+        early (gs/receive (:state pruned) "p" {:control {:graft [{:topic topic}]}}
+                          3000 (fn [_ _] :accept))]
+    (is (contains? (get-in accepted [:state :mesh topic]) "p"))
+    (is (not (contains? (get-in pruned [:state :mesh topic]) "p")))
+    (is (= topic (get-in early [:effects 0 :rpc :control :prune 0 :topic])))
+    (is (pos? (get-in early [:state :scores "p" :behaviour]))))
+  (let [explicit (-> (gs/init) (gs/add-peer "direct" {:explicit? true})
+                     (assoc :subscriptions #{topic}))
+        result (gs/receive explicit "direct" {:control {:graft [{:topic topic}]}}
+                           0 (fn [_ _] :accept))]
+    (is (= topic (get-in result [:effects 0 :rpc :control :prune 0 :topic])))))
+
+(deftest ihave-iwant-recovers-a-missing-message
+  (let [message {:topic topic :data [4 5 6]}
+        published (gs/publish (-> (gs/init) (peer "p" [topic] true)) message 1000)
+        id (:message-id published)
+        receiver (-> (gs/init) (peer "p" [topic] true))
+        want (gs/receive receiver "p" {:control {:ihave [{:topic topic
+                                                           :message-ids [id]}]}}
+                         1001 (fn [_ _] :accept))
+        response (gs/receive (:state published) "p"
+                             {:control {:iwant [{:message-ids [id]}]}}
+                             1002 (fn [_ _] :accept))]
+    (is (= [id] (get-in want [:effects 0 :rpc :control :iwant 0 :message-ids])))
+    (is (= [message] (get-in response [:effects 0 :rpc :messages])))))
+
+(deftest heartbeat-prunes-negative-peers-grafts-replacements-and-decays
+  (let [state (-> (gs/init {:d 2 :d-low 1 :d-high 2})
+                  (peer "bad" [topic] false)
+                  (peer "good-a" [topic] true)
+                  (peer "good-b" [topic] true)
+                  (assoc :subscriptions #{topic})
+                  (assoc-in [:mesh topic] #{"bad"})
+                  (assoc-in [:scores "bad" :topics topic :invalid] 1.0))
+        result (gs/heartbeat state 20000)]
+    (is (= #{"good-a" "good-b"} (get-in result [:state :mesh topic])))
+    (is (= #{"bad"} (set (map :peer (filter #(get-in % [:rpc :control :prune])
+                                               (:effects result))))))
+    (is (= #{"good-a" "good-b"}
+           (set (map :peer (filter #(get-in % [:rpc :control :graft])
+                                  (:effects result))))))))
+
+(deftest heartbeat-enforces-the-v1-1-outbound-quota
+  (let [state (-> (gs/init {:d 4 :d-low 3 :d-high 5 :d-out 2 :d-score 2})
+                  (peer "in-a" [topic] false)
+                  (peer "in-b" [topic] false)
+                  (peer "in-c" [topic] false)
+                  (peer "out-a" [topic] true)
+                  (peer "out-b" [topic] true)
+                  (assoc :subscriptions #{topic})
+                  (assoc-in [:mesh topic] #{"in-a" "in-b" "in-c"}))
+        result (gs/heartbeat state 1000)
+        mesh (get-in result [:state :mesh topic])]
+    (is (= 5 (count mesh)))
+    (is (= 2 (count (filter #(get-in result [:state :peers % :outbound?]) mesh))))))
+
+(deftest ip-colocation-contributes-the-v1-1-p6-penalty
+  (let [state (reduce #(gs/add-peer %1 %2 {:ip "203.0.113.1"})
+                      (gs/init {:score {:ip-colocation-threshold 1
+                                        :ip-colocation-weight -2.0}})
+                      ["a" "b" "c"])]
+    (is (= -8.0 (gs/peer-score state "a" 0)))))
+
+(deftest negative-prune-sticks-the-active-mesh-delivery-deficit
+  (let [state (-> (gs/init {:d 1 :d-low 1 :d-high 2 :d-out 0})
+                  (peer "bad" [topic] false)
+                  (assoc :subscriptions #{topic})
+                  (assoc-in [:mesh topic] #{"bad"})
+                  (assoc-in [:scores "bad" :application] -5.0)
+                  (assoc-in [:scores "bad" :topics topic :mesh-since] 0))
+        result (gs/heartbeat state 20000)]
+    (is (not (contains? (get-in result [:state :mesh topic]) "bad")))
+    (is (pos? (get-in result [:state :scores "bad" :topics topic :mesh-failures])))))
+
+(deftest periodic-opportunistic-graft-adds-a-peer-above-the-mesh-median
+  (let [state (-> (gs/init {:d 1 :d-low 1 :d-high 2 :d-out 0
+                            :opportunistic-graft-ticks 60})
+                  (peer "mesh" [topic] true)
+                  (peer "better" [topic] true)
+                  (assoc :subscriptions #{topic} :heartbeat-ticks 59)
+                  (assoc-in [:mesh topic] #{"mesh"})
+                  (gs/set-application-score "better" 5.0))
+        result (gs/heartbeat state 1000)]
+    (is (contains? (get-in result [:state :mesh topic]) "better"))
+    (is (= "better" (:peer (first (filter #(get-in % [:rpc :control :graft])
+                                            (:effects result))))))))

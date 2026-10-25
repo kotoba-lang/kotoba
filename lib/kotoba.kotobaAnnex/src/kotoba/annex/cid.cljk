@@ -1,0 +1,114 @@
+(ns kotoba.annex.cid
+  "git-annex key ⇄ CIDv1(raw, sha2-256) の純変換（ADR-2607175000 follow-up (a)）。
+
+   kotobase の blob 面 `PUT /ipfs/:cid`（net-kotobase の kotobase.archive-put）は
+   **raw CIDv1(sha2-256)** で addressing し、`CID の digest == body の sha256` を
+   fail-closed で検証する。git-annex の SHA256E key も内容の sha256 なので、
+   **条件付きで** key から CID を機械的に導出できる。
+
+   ⚠ **導出できるのは『SHA256E backend・chunk 無し・暗号化無し』の key だけ**
+   （2026-07-17 実 git-annex v10 で実測）:
+     - `SHA256E-s100000--975cf8….bin`（無 chunk/無暗号）
+         → 保存 block の sha256 == key の hash == 平文の sha256。**導出可**。
+     - `SHA256E-s100000-S32768-C1..C4--975cf8….bin`（chunk=32KiB）
+         → **全 chunk が「元ファイル」の hash を持ち回る**（C1..C4 で同一）。
+           chunk の実バイト列の sha256 とは一致しない。**導出不可**。
+     - `GPGHMACSHA1--c51589…`（encryption=shared）
+         → key は HMAC であって内容ハッシュではない。保存 block は暗号文
+           （sha256 = 5d1d4b… ≠ 平文 975cf8…）。**導出不可**。
+   導出不可の key は `key->cid` が nil を返す。その場合の正しい設計は
+   『CID は**保存バイト列**から計算し、key→CID の対応表を kotobase の datom 面
+   （小さい値 = KV の適正用途）に置く』——本 ns は導出可能ケースのみを扱い、
+   対応表は follow-up とする（ADR-2607175000）。
+
+   No IO — protocol.cljc と同じく純関数のみ。"
+  (:require [kotoba.lang.text :as str]))
+
+;; ── base32 (RFC 4648 lowercase, unpadded — CIDv1 の 'b' multibase) ───────────
+;; net-kotobase の kotobase.archive-put/base32-decode の逆変換。あちらの decode が
+;; 本 encode の出力を digest に戻せることを round-trip テストで固定する。
+
+(def ^:private b32-alphabet "abcdefghijklmnopqrstuvwxyz234567")
+
+(defn base32-encode
+  "byte int seq → lower-case unpadded base32。"
+  [bytes]
+  (loop [bs (seq bytes) acc 0 bits 0 out ""]
+    (cond
+      ;; 5 bit たまったら 1 文字吐く
+      (>= bits 5)
+      (recur bs
+             (bit-and acc (dec (bit-shift-left 1 (- bits 5))))
+             (- bits 5)
+             (str out (nth b32-alphabet (bit-and (bit-shift-right acc (- bits 5)) 0x1f))))
+      ;; 足りなければ 1 byte 取り込む
+      bs
+      (recur (next bs) (bit-or (bit-shift-left acc 8) (bit-and (first bs) 0xff))
+             (+ bits 8) out)
+      ;; 端数は左詰めで吐く（unpadded）
+      (pos? bits)
+      (str out (nth b32-alphabet (bit-and (bit-shift-left acc (- 5 bits)) 0x1f)))
+      :else out)))
+
+(defn hex->bytes
+  "hex 文字列 → byte int vector | nil（奇数長・不正文字）。"
+  [s]
+  (when (and (string? s) (even? (count s)) (re-matches #"[0-9a-fA-F]*" s))
+    (mapv #(js/parseInt (apply str %) 16) (partition 2 s))))
+
+(defn digest->cid
+  "32 byte の sha2-256 digest → raw CIDv1 文字列（bafkrei…）。
+   prefix は archive-put/parse-raw-cid が要求する 01(version) 55(raw) 12(sha2-256)
+   20(32 byte) と一致させる。"
+  [digest]
+  (when (= 32 (count digest))
+    (str "b" (base32-encode (concat [0x01 0x55 0x12 0x20] digest)))))
+
+(defn hex->cid
+  "sha256 hex(64 桁) → raw CIDv1 | nil。"
+  [hex]
+  (when-let [d (hex->bytes hex)]
+    (digest->cid d)))
+
+;; ── git-annex key の解釈 ─────────────────────────────────────────────────────
+
+(defn parse-key
+  "annex key → {:backend :size :chunk-size :chunk-n :hash :ext} | nil。
+   形式: <backend>-s<size>[-S<chunksize>-C<n>]--<hash>[.ext]"
+  [key]
+  (when (string? key)
+    (when-let [[_ backend fields hash+ext] (re-matches #"([A-Z0-9]+)-([^-]*(?:-[^-]+)*)--(.+)" key)]
+      (let [fmap (into {} (for [f (str/split fields #"-")
+                                :let [[_ k v] (re-matches #"([a-zA-Z])(.*)" f)]
+                                :when k]
+                            [k v]))
+            [hash ext] (let [i (str/index-of hash+ext ".")]
+                         (if i [(subs hash+ext 0 i) (subs hash+ext i)] [hash+ext nil]))]
+        {:backend backend
+         :size (some-> (get fmap "s") js/parseInt)
+         :chunk-size (some-> (get fmap "S") js/parseInt)
+         :chunk-n (some-> (get fmap "C") js/parseInt)
+         :hash hash
+         :ext ext}))))
+
+(defn cid-derivable?
+  "その key から CID を導出してよいか。
+   SHA256E/SHA256 backend かつ **chunk されておらず**、hash が 64 桁 hex の時だけ真。
+   （chunk key は元ファイルの hash を持ち回るので保存バイト列と一致しない＝導出不可。
+     GPGHMAC* key はそもそも backend が一致しない＝導出不可。実測済み）"
+  [key]
+  (boolean
+   (when-let [{:keys [backend chunk-n chunk-size hash]} (parse-key key)]
+     (and (contains? #{"SHA256E" "SHA256"} backend)
+          (nil? chunk-n)
+          (nil? chunk-size)
+          (some? hash)
+          (re-matches #"[0-9a-f]{64}" hash)))))
+
+(defn key->cid
+  "annex key → raw CIDv1 | **nil（導出不可 = chunk / 暗号化 / 別 backend）**。
+   nil を『エラー』でなく『この経路では扱えない』の意味で返す — 呼び出し側は
+   fail-closed に倒す（黙って別の CID をでっち上げない）。"
+  [key]
+  (when (cid-derivable? key)
+    (hex->cid (:hash (parse-key key)))))

@@ -1,0 +1,189 @@
+(ns kotoba.ledger.core
+  "Event construction, JSONL encode/decode, and last-line-wins projections for
+  an append-only issue/proposal/review/run ledger — pure, host-independent.
+
+  Generalizes manimani's `ledger.cljc` (already pure and cross-platform) to the
+  vocabulary shared with `kotoba-issue-clj`: an issue/proposal/review/run
+  event log instead of manimani's own decision/outcome/agent-step shape.
+  I/O (file append, git commit, kotobase transact) lives in
+  `kotoba.ledger.file-git` / `kotoba.ledger.kotobase` -- this namespace never
+  touches disk or a network."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj  [json.compat :as json]
+               :cljs [kotoba.lang.coll :as walk])))
+
+;; ---------- JSON encode/decode (host-independent) ----------
+
+(defn parse-line
+  "JSONL line -> map (keyword keys). Blank/invalid lines -> nil."
+  [line]
+  (let [s (str/trim line)]
+    (when (seq s)
+      #?(:clj  (try (json/parse-string s true) (catch Exception _ nil))
+         :cljs (try (js->clj (js/JSON.parse s) :keywordize-keys true) (catch :default _ nil))))))
+
+(defn parse-jsonl
+  "JSONL text -> [event ...] (invalid lines dropped, order preserved)."
+  [text]
+  (into [] (keep parse-line) (str/split-lines (or text ""))))
+
+(defn ->line
+  "event map -> JSONL line (no trailing newline)."
+  [event]
+  #?(:clj  (json/generate-string event)
+     :cljs (js/JSON.stringify (clj->js event))))
+
+;; ---------- event construction ----------
+
+(defn- kw->str
+  "Keyword -> its full \"namespace/name\" string (unlike `name`, which drops
+  the namespace)."
+  [kind]
+  (when kind (if (keyword? kind) (subs (str kind) 1) kind)))
+
+(defn issue-event
+  [{:keys [ts issue-id kind source source-id title note]
+    :or {source ""}}]
+  (cond-> {:ts ts :issueId issue-id :kind "issue" :issueKind (kw->str kind)
+           :source source :sourceId source-id :title title}
+    (seq note) (assoc :note note)))
+
+(defn proposal-event
+  [{:keys [ts issue-id proposal-id kind risk status rationale note]
+    :or {status "proposed"}}]
+  (cond-> {:ts ts :issueId issue-id :proposalId proposal-id :kind "proposal"
+           :proposalKind (kw->str kind) :risk (some-> risk name) :status (name status)}
+    rationale (assoc :rationale rationale)
+    (seq note) (assoc :note note)))
+
+(defn review-event
+  [{:keys [ts proposal-id verdict decider note]}]
+  (cond-> {:ts ts :proposalId proposal-id :kind "review" :verdict (name verdict) :decider decider}
+    (seq note) (assoc :note note)))
+
+(defn run-step
+  "A single step of a run. phase in #{:plan :act :observe :done :error
+  :awaiting-approval :cancelled}."
+  [{:keys [ts run-id issue-id phase note effect result error]}]
+  (cond-> {:ts ts :runId run-id :issueId issue-id :kind "run" :phase (name phase)}
+    note (assoc :note note)
+    effect (assoc :effect (kw->str effect))
+    result (assoc :result result)
+    error (assoc :error error)))
+
+;; ---------- projections (last-line-wins) ----------
+
+(defn latest-by-issue
+  "events -> {issueId -> latest proposal/review event}. run/issue events excluded."
+  [events]
+  (reduce (fn [m e]
+            (if (and (:issueId e) (#{"proposal" "review"} (:kind e)))
+              (assoc m (:issueId e) e)
+              m))
+          {} events))
+
+(defn pending-issue-ids
+  "issueIds whose latest proposal/review event is not yet a terminal status."
+  [events]
+  (into #{}
+        (comp (filter #(not (#{"merged" "rejected" "failed" "cancelled"} (:status %))))
+              (map :issueId)
+              (filter some?))
+        (vals (latest-by-issue events))))
+
+(defn run-events
+  "This run-id's steps, time-ordered."
+  [events run-id]
+  (->> events
+       (filter #(and (= "run" (:kind %)) (= run-id (:runId %))))
+       (sort-by :ts)
+       vec))
+
+(defn run-status
+  "Supervisor-facing projected state for one run-id. Unknown run -> {:exists? false}."
+  [events run-id]
+  (let [steps (run-events events run-id)
+        state-steps (remove #(= "note" (:phase %)) steps)
+        last-step (peek (vec state-steps))
+        plan-step (some #(when (= "plan" (:phase %)) %) steps)
+        notes (->> steps
+                   (keep #(when (= "note" (:phase %))
+                            {:ts (:ts %) :note (:note %) :result (:result %)}))
+                   vec)
+        observe (some #(when (= "observe" (:phase %)) %) steps)
+        approval (some #(when (= "awaiting-approval" (:phase %)) %) steps)]
+    (if-not last-step
+      {:run-id run-id :exists? false :ok? false :phase :missing :steps []}
+      (cond-> {:run-id run-id
+               :exists? true
+               :ok? (not= "error" (:phase last-step))
+               :issue-id (:issueId last-step)
+               :phase (keyword (:phase last-step))
+               :updated-at (:ts last-step)
+               :reached (set (map (comp keyword :phase) steps))
+               :steps (mapv #(select-keys % [:ts :phase :note :effect :error]) steps)
+               :summary (get-in observe [:result :summary])
+               :alerts (or (get-in approval [:result :alerts])
+                           (get-in observe [:result :alerts]))
+               :error (:error last-step)}
+        (:note plan-step) (assoc :plan-note (:note plan-step))
+        (seq notes) (assoc :notes notes)
+        (= "cancelled" (:phase last-step)) (assoc :cancelled? true :cancellation (:result last-step))
+        (= "error" (:phase last-step)) (assoc :failure (select-keys (:result last-step)
+                                                                     [:summary :error :exit :timeout?
+                                                                      :exception? :process-timeout-ms]))))))
+
+(defn run-statuses
+  "All run-ids' projected states, most-recently-updated first."
+  [events]
+  (->> events
+       (keep #(when (= "run" (:kind %)) (:runId %)))
+       distinct
+       (map #(run-status events %))
+       (sort-by :updated-at compare)
+       reverse
+       vec))
+
+(defn run-log
+  "Run-kind events, time-ordered. limit keeps the last N."
+  ([events] (run-log events nil))
+  ([events limit]
+   (let [xs (->> events (filter #(= "run" (:kind %))) (sort-by :ts) vec)
+         n (when limit (max 0 limit))]
+     (if (some? n) (subvec xs (max 0 (- (count xs) n))) xs))))
+
+(def active-phases #{:plan :act :observe})
+
+(defn- instant-ms [ts]
+  (when ts
+    #?(:clj  (try (.toEpochMilli (java.time.Instant/parse (str ts))) (catch Exception _ nil))
+       :cljs (let [n (js/Date.parse (str ts))] (when-not (js/isNaN n) n)))))
+
+(defn- age-ms [now-ts then-ts]
+  (let [now* (instant-ms now-ts) then* (instant-ms then-ts)]
+    (when (and now* then*) (max 0 (- now* then*)))))
+
+(defn- annotate-stale [run {:keys [now stale-after-ms]}]
+  (let [age (when (and now stale-after-ms (contains? active-phases (:phase run)))
+              (age-ms now (:updated-at run)))
+        stale? (boolean (and age (> age stale-after-ms)))]
+    (cond-> run age (assoc :age-ms age) stale? (assoc :stale? true))))
+
+(defn supervisor-snapshot
+  "Lightweight snapshot for an external supervisor to poll. Never shells out."
+  ([events] (supervisor-snapshot events 20))
+  ([events event-limit] (supervisor-snapshot events event-limit {}))
+  ([events event-limit opts]
+   (let [runs (mapv #(annotate-stale % opts) (run-statuses events))
+         phase-counts (frequencies (map :phase runs))]
+     {:ok? (and (every? :ok? runs) (not-any? :stale? runs))
+      :counts {:total (count runs)
+               :ok (count (filter :ok? runs))
+               :error (get phase-counts :error 0)
+               :cancelled (get phase-counts :cancelled 0)
+               :stale (count (filter :stale? runs))
+               :awaiting-approval (get phase-counts :awaiting-approval 0)
+               :done (get phase-counts :done 0)
+               :active (+ (get phase-counts :plan 0) (get phase-counts :act 0) (get phase-counts :observe 0))}
+      :runs runs
+      :events (run-log events event-limit)})))

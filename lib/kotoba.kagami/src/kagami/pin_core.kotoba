@@ -1,0 +1,156 @@
+;; The pin admission gate's DECISION CORE — `kagami.pin/admit` and the
+;; trailing-* grant convention, as a Kotoba module.
+;;
+;; `pin.cljc` keeps the halves that are not decisions: reading the keyring map,
+;; walking a grant set, canonical-str/record-hash (format mechanism), and the
+;; two injected crypto fns (`:verify-fn`, `:hash-fn`). Those stay host. What
+;; moves here is exactly the judgement: which reasons a proposed signed pin
+;; advance accumulates, in which order, and how they fold into
+;; accept / warn-accept / reject — including the one deliberate fail-open
+;; (unverifiable reachability warns instead of rejecting, matching
+;; verify-west-pins.cljs).
+;;
+;; ## Authority has NOT moved yet (deliberately)
+;;
+;; This module is step 1 of the handoff §2 pattern: dual source bound by
+;; `kagami.pin-kotoba-parity-test`, which compiles this file at test time and
+;; requires answer-for-answer agreement with `pin.cljc` — including the reason
+;; literals, pinned so a rename upstream is caught rather than absorbed.
+;; The `.cljc` is still what runs, on both runtimes.
+;;
+;; Moving the authority (the cloud-itonami-app `kotoba-oracle` pattern, where
+;; the shipped KIR is what runs) is the recorded follow-up, NOT part of this
+;; slice, because kagami's production entry point is `bin/kagami.cljk` under
+;; nbb with `--classpath <repo>/src` — the invocation contract written into
+;; the superproject AGENTS.md and the fleet reconcile/sync runbooks. A runtime
+;; KIR interpreter dependency changes that classpath for every caller, and a
+;; change to the operator contract of the fleet's pin registry deserves its own
+;; reviewed slice, not a rider on this one.
+;;
+;; ## Why it is written this narrowly
+;;
+;; Everything stays inside the native word-typed slice: `:string` / `:bool` /
+;; `:i64` scalars, one sealed record, `[:option :string]` (one word),
+;; `string=?` / `string-substring` / `string-byte-length`, `and` / `or` /
+;; `not`, `<`, `=`. Temporary shapes, with removal conditions:
+;;
+;; - **The facts record** instead of ten parameters: max-parameters is 5
+;;   (ADR-reliability-t54) and that one is a keeper; the record is also the
+;;   T5.2 native record wire, so this shape is not expected to change.
+;; - **Verdict and reasons as one `:string`** ("<verdict> <reason> <reason>…")
+;;   instead of `[:vector :keyword]`: heterogeneous return collections are not
+;;   in the native word-typed slice. When they are, the return type can become
+;;   structured; the token spellings are the protocol either way.
+;; - **`starts-with?` / `ends-with-star?` spelled from substring**: no
+;;   admitted starts-with builtin. Same helpers as murakumo's cores.
+;;
+;; Byte offsets, not codepoints: grants and repo paths in the keyring are
+;; ASCII (org/repo paths); the parity corpus pins that assumption honestly
+;; rather than claiming UTF-8 generality.
+
+(ns kagami.pin-core
+  (:schemas {;; Everything `admit` needs, flattened out of the maps the cljc
+             ;; reads it from. Crypto results arrive as booleans because the
+             ;; crypto itself is host-injected (`:verify-fn` / `:hash-fn`) —
+             ;; the guest judges what the results MEAN, not the signatures.
+             ;;
+             ;; `signer` is the raw id: whether it is well-formed
+             ;; ("ed25519:<hex>") is a decision, so it is made here, not
+             ;; pre-chewed on the host.
+             ;;
+             ;; `signature-valid` is false when the host could not verify
+             ;; (malformed signer means no pubkey to verify with); the guest
+             ;; only reads it when the signer is well-formed, matching the
+             ;; cljc's `(and pubkey (not (verify-fn …)))`.
+             ;;
+             ;; `current-sequence` is meaningful only when `has-current`;
+             ;; `expected-parent` likewise ("" otherwise). The guard is
+             ;; `has-current`, kept explicit instead of encoding both as
+             ;; options — one boolean guards both, and two options could
+             ;; disagree with it.
+             ;;
+             ;; `reachable` / `value-advance` are the tri-state judgments the
+             ;; caller computes server-side (GitHub API, never local shallow
+             ;; ancestry): "ok" | "fail" | "unknown". The cljc spells them
+             ;; true | false | :unknown with anything-else-is-ok semantics;
+             ;; the host adapter maps false→"fail", :unknown→"unknown",
+             ;; everything else→"ok", so the total mapping is honest about
+             ;; nil (absent means not-flagged, same as the cljc).
+             :pin/admission-facts
+             [:record :pin/admission-facts
+              [[:signer :string]
+               [:authorized :bool]
+               [:signature-valid :bool]
+               [:has-current :bool]
+               [:sequence :i64]
+               [:current-sequence :i64]
+               [:parent [:option :string]]
+               [:expected-parent :string]
+               [:reachable :string]
+               [:value-advance :string]]]})
+  (:export [covers? admit-verdict]))
+
+(defn starts-with? [s :string prefix :string] :bool
+  (let [n (string-byte-length s)
+        p (string-byte-length prefix)]
+    (if (< n p)
+      false
+      (string=? (string-substring s 0 p) prefix))))
+
+(defn ends-with-star? [g :string] :bool
+  (let [n (string-byte-length g)]
+    (if (< n 1)
+      false
+      (string=? (string-substring g (- n 1) n) "*"))))
+
+;; Trailing-* wildcard path grant, same convention as cacao-clj resources.
+;; "orgs/kotoba-lang/*" covers "orgs/kotoba-lang/kagami"; a bare "*" covers
+;; everything (empty prefix); "" covers only "".
+(defn covers? [grant :string path :string] :bool
+  (if (ends-with-star? grant)
+    (starts-with? path (string-substring grant 0 (- (string-byte-length grant) 1)))
+    (string=? grant path)))
+
+;; The admission decision. Returns "<verdict>" or "<verdict> <reason> …":
+;;   "accept"
+;;   "warn-accept reachability-unverifiable-fail-open"
+;;   "reject malformed-signer bad-signature"
+;; Reason order is part of the protocol and mirrors pin.cljc's cond-> order.
+;; Fail-open ONLY on unverifiable reachability / value-advance (warn-accept);
+;; every other failure rejects.
+(defn admit-verdict [f [:ref :pin/admission-facts]] :string
+  (let [malformed (not (starts-with? (record-get f :signer) "ed25519:"))
+        has-cur (record-get f :has-current)
+        r0 ""
+        r1 (if malformed (string-concat r0 " malformed-signer") r0)
+        r2 (if (not (record-get f :authorized))
+             (string-concat r1 " unauthorized-signer") r1)
+        r3 (if (and (not malformed) (not (record-get f :signature-valid)))
+             (string-concat r2 " bad-signature") r2)
+        r4 (if (and has-cur
+                    (not (< (record-get f :current-sequence)
+                            (record-get f :sequence))))
+             (string-concat r3 " sequence-rollback") r3)
+        r5 (if (and (not has-cur) (not (= (record-get f :sequence) 1)))
+             (string-concat r4 " genesis-sequence-not-1") r4)
+        r6 (if (and has-cur
+                    (if-some [p (record-get f :parent)]
+                      (not (string=? p (record-get f :expected-parent)))
+                      true))
+             (string-concat r5 " parent-mismatch") r5)
+        r7 (if (and (not has-cur) (option-some? (record-get f :parent)))
+             (string-concat r6 " genesis-has-parent") r6)
+        r8 (if (string=? (record-get f :reachable) "fail")
+             (string-concat r7 " unreachable-from-upstream-default-branch") r7)
+        r9 (if (and has-cur (string=? (record-get f :value-advance) "fail"))
+             (string-concat r8 " value-regression") r8)]
+    (if (not (string=? r9 ""))
+      (string-concat "reject" r9)
+      (let [w1 (if (string=? (record-get f :reachable) "unknown")
+                 " reachability-unverifiable-fail-open" "")
+            w2 (if (string=? (record-get f :value-advance) "unknown")
+                 " value-advance-unverifiable-fail-open" "")
+            w (string-concat w1 w2)]
+        (if (string=? w "")
+          "accept"
+          (string-concat "warn-accept" w))))))

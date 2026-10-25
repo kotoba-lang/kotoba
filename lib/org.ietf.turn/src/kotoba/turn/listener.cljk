@@ -1,0 +1,686 @@
+;; kotoba.turn.listener — the real UDP relay listener: the piece every other
+;; namespace in this repo (`kotoba.turn.stun` / `kotoba.turn.credential` /
+;; `kotoba.turn.allocation` / `kotoba.turn.channeldata` / `kotoba.turn.demux`)
+;; was deliberately pure/socket-free so a listener could wire them together
+;; against real `node:dgram` sockets without any of them needing to change.
+;; This is that wiring. Before this namespace, this repo was "the protocol +
+;; state contract a future listener phase must implement against" (README);
+;; after it, `start-listener!` actually relays real UDP datagrams between a
+;; client and a peer end to end (RFC 8656 §5-§12).
+;;
+;; `.cljs`, NOT `.cljc` — like `kotoba.dtn.transport.tcp` in
+;; `kotoba-lang/dtn` (the sibling repo this namespace's shape was modeled
+;; after), real socket I/O only exists on a Node-hosted ClojureScript
+;; runtime (nbb, in this repo's test/demo tooling). `kbb -M:test` cannot
+;; load `.cljs` files at all, so this file can never regress the existing
+;; 41-test/94-assertion pure `.cljc` suite — see this repo's README.
+;;
+;; FIVE-TUPLE SIMPLIFICATION (read this before touching :turn/five-tuple
+;; below). RFC 8656's allocation five-tuple is (client IP, client port,
+;; server IP, server port, transport). This listener runs exactly ONE
+;; server-facing UDP socket on one port, so the server-address half of the
+;; tuple is a process-wide constant for every allocation this listener will
+;; ever create — it carries zero information as a map KEY. This namespace
+;; therefore indexes `:allocations`/`:relay-sockets` by just
+;; `{:address <client-ip-string> :port <client-port>}` (see `client-key`,
+;; below) rather than a literal 5-field map. This is a real, disclosed
+;; simplification specific to "one listener, one UDP transport" — a future
+;; listener phase that also opened a TCP-relayed-client-facing socket (out
+;; of scope here, see the bottom of this docstring) would need to widen this
+;; key back out to a genuine 5-tuple (adding :transport) so a UDP and a TCP
+;; client sharing the same IP:port pair on their respective transports don't
+;; collide.
+;;
+;; STATE. One atom: `{:allocations {client-key allocation} :relay-sockets
+;; {client-key dgram-socket}}`. `allocation` is exactly the plain EDN map
+;; `kotoba.turn.allocation/allocate` returns/updates — this namespace never
+;; reimplements allocation/permission/channel-binding logic, it only calls
+;; into `kotoba.turn.allocation`'s pure functions and stores what comes
+;; back. `relay-sockets` holds the live `node:dgram` socket opened for that
+;; client's allocation (the "relayed transport address" side) — this is the
+;; one piece of real, mutable, non-pure state this repo has ever needed, and
+;; it lives here, not in `kotoba.turn.allocation`.
+;;
+;; PEER-ADDRESS SHAPE — a deliberate, disclosed choice within what
+;; `kotoba.turn.allocation` itself documents as an opaque, caller-chosen
+;; value (`create-permission`'s docstring: "typically just the peer's IP,
+;; per §9 — permissions are IP-only, not IP:port"; `channel-bind` never
+;; commits to a shape at all). This namespace uses TWO different shapes for
+;; the two different RFC 8656 concepts, because they need different
+;; information to do their real job here:
+;;   - permissions (`:turn/permissions`) are keyed by peer IP ONLY — a
+;;     4-int byte vector like `[8 8 8 8]` — matching RFC 8656 §9's actual
+;;     semantics (a permission authorizes a peer HOST, any port).
+;;   - channel bindings (`:turn/channel-bindings`) are keyed by channel
+;;     number and store a FULL `{:ip [.. .. .. ..] :port n}` peer transport
+;;     address, because ChannelData framing (`kotoba.turn.channeldata`)
+;;     carries no address info on the wire at all — the only way this
+;;     listener can know which exact port to relay a client's ChannelData
+;;     payload to is by remembering the full address the ChannelBind
+;;     request supplied.
+;; Per RFC 8656 §11 ("a channel binding also acts as an implicit channel
+;; permission"), a successful ChannelBind here also installs/refreshes a
+;; plain-IP permission for the same peer (see `handle-channel-bind!`) — so
+;; the peer's *first* return datagram doesn't get dropped by the permission
+;; check on the relay-socket's inbound path (below) for lack of a separate
+;; CreatePermission call. Its lifetime is the normal
+;; `alloc/default-permission-lifetime-s` (300s), independent of the
+;; channel's own 600s lifetime — same "independent expiry" model
+;; `kotoba.turn.allocation`'s own tests already pin; this listener does not
+;; keep the two in lockstep beyond that one implicit install.
+;;
+;; AUTHENTICATION SCOPE. Only the Allocate request is cryptographically
+;; verified here (USERNAME + MESSAGE-INTEGRITY against a server-configured
+;; `:shared-secret`, via `kotoba.turn.credential/verify-credential` +
+;; `kotoba.turn.stun/verify-message-integrity` — see `handle-allocate!` for
+;; exactly how those two compose). Refresh / CreatePermission / ChannelBind
+;; are authorized purely by "does a live allocation exist for this client's
+;; observed source address/port" — they do NOT re-verify MESSAGE-INTEGRITY.
+;; This is narrower than a production TURN server (coturn verifies MI on
+;; every request) and is a disclosed limitation, not an oversight: an
+;; on-path or source-address-spoofing attacker who can inject a UDP
+;; datagram appearing to originate from an already-allocated client's
+;; address/port could manipulate that allocation's permissions/channel
+;; bindings without re-presenting credentials. Closing this gap (verifying
+;; MI on every request type, not just Allocate) is straightforward future
+;; work — every request already carries a real MESSAGE-INTEGRITY attribute
+;; in the wire format (see `test/kotoba/turn/listener_demo.cljk`, which
+;; signs every request including Refresh/CreatePermission/ChannelBind) —
+;; but is out of scope for this phase to keep the reviewable surface
+;; matched to what was actually asked for.
+;;
+;; WHAT THIS NAMESPACE COVERS (real, not simulated):
+;;   - Allocate (verified) -> opens a real ephemeral-port `node:dgram`
+;;     relay socket, replies with XOR-RELAYED-ADDRESS / XOR-MAPPED-ADDRESS /
+;;     LIFETIME.
+;;   - Refresh (including lifetime-0 -> delete, closing the relay socket).
+;;   - CreatePermission (one or more XOR-PEER-ADDRESS attributes per
+;;     request).
+;;   - ChannelBind (range-validated via `kotoba.turn.allocation/channel-bind`
+;;     itself; also installs an implicit permission, see above).
+;;   - Send indication -> real client -> peer relay over the allocation's
+;;     relay socket, gated by `alloc/permission-active?`.
+;;   - ChannelData from the client -> real client -> peer relay via
+;;     `alloc/peer-for-channel`.
+;;   - The OTHER direction (this is the direction most integrations get
+;;     lazy about, and the task that produced this namespace was explicit
+;;     that skipping it is not acceptable): each relay socket's own
+;;     `"message"` handler relays real peer -> client traffic back out the
+;;     MAIN listening socket, as a Data indication when no channel is bound
+;;     for that exact peer address, or as (lighter) ChannelData when one is
+;;     — gated by the same `alloc/permission-active?` check RFC 8656 §9
+;;     requires for inbound-from-peer traffic, not just outbound.
+;;   - A periodic expiry sweep (`alloc/expired?`) that closes and drops
+;;     allocations whose lifetime has actually elapsed, reusing the pure
+;;     expiry check rather than reimplementing it.
+;;
+;; WHAT THIS NAMESPACE DELIBERATELY DOES NOT COVER (same gaps the founding
+;; ADR and every earlier phase already named — this listener does not
+;; silently close any of them):
+;;   - The long-term credential mechanism (RFC 8489 §9.2) — only the
+;;     coturn-style ephemeral short-term scheme
+;;     (`kotoba.turn.credential`) is implemented.
+;;   - IPv6 — `kotoba.turn.stun`'s XOR-address codec is IPv4-only
+;;     (family 0x01), and so is this listener's `ip-str->vec`/`ip-vec->str`.
+;;   - Per-client allocation quotas / DoS / rate limits of any kind.
+;;   - `REQUESTED-TRANSPORT` / `DONT-FRAGMENT` / `EVEN-PORT` /
+;;     `RESERVATION-TOKEN` request-validation logic — an Allocate request's
+;;     REQUESTED-TRANSPORT attribute (if present) is never inspected; this
+;;     listener always allocates a UDP relay socket.
+;;   - Exact RFC 8489 §14.8 ERROR-CODE payload fidelity beyond the minimal
+;;     shape `kotoba.turn.stun/encode-error-code` already provides (class +
+;;     number + UTF-8 reason phrase) — error RESPONSE TYPE codes for
+;;     Refresh/CreatePermission/ChannelBind failures are derived locally
+;;     here (`error-response-type`) via the same request-type|0x0110 = error
+;;     -type arithmetic the codec's own `allocate-error` constant already
+;;     encodes (0x0003|0x0110 = 0x0113 — checked against that existing
+;;     constant, not invented from nothing), since `kotoba.turn.stun` itself
+;;     only defines the one (Allocate) error-response type constant. Error
+;;     responses here never carry MESSAGE-INTEGRITY (only success responses
+;;     to a verified Allocate do) — a disclosed simplification, not a
+;;     completed long-term-credential NONCE/REALM challenge flow.
+;;   - TCP or TLS on the client-facing side — this listener's main socket is
+;;     UDP (`udp4`) only, matching this repo's existing IPv4-only scope.
+(ns kotoba.turn.listener
+  (:require ["node:dgram" :as dgram]
+            [kotoba.lang.text :as str]
+            [kotoba.bytes :as b]
+            [kotoba.turn.stun :as stun]
+            [kotoba.turn.credential :as cred]
+            [kotoba.turn.allocation :as alloc]
+            [kotoba.turn.channeldata :as cd]
+            [kotoba.turn.demux :as demux]))
+
+;; ---------------------------------------------------------------------------
+;; byte-vector <-> Node Buffer, and dotted-quad <-> [o1 o2 o3 o4] conversions.
+;; kotoba.bytes deliberately has no Buffer/Node dependency (it's shared with
+;; the browser-hosted cljs consumers of this repo's pure namespaces) and no
+;; UTF-8 *decode* (only *encode* — see its own namespace docstring for why);
+;; this file is already Node-only, so it uses `js/Buffer` directly for both,
+;; rather than growing kotoba-lang/bytes an API surface no pure consumer of
+;; this repo has ever needed.
+;; ---------------------------------------------------------------------------
+
+(defn- buf->vec
+  "Node Buffer -> kotoba.bytes-convention byte vector (vector<int 0..255>)."
+  [buf]
+  (vec buf))
+
+(defn- vec->buf
+  "kotoba.bytes-convention byte vector -> Node Buffer, ready to hand to a
+   dgram socket's `.send`."
+  [v]
+  (js/Buffer.from (clj->js v)))
+
+(defn- utf8-decode
+  "byte vector -> UTF-8 string, via Node's own Buffer#toString. The
+   inverse of `kotoba.bytes/utf8-encode`, needed here to turn a parsed
+   USERNAME attribute's raw bytes back into the string
+   `kotoba.turn.credential/verify-credential` expects."
+  [bs]
+  (.toString (vec->buf bs) "utf8"))
+
+(defn- ip-str->vec
+  "Dotted-quad IPv4 string (as Node's dgram `rinfo.address`/`.address()`
+   report it) -> a `kotoba.turn.stun`-shaped `[o1 o2 o3 o4]` byte vector."
+  [s]
+  (mapv #(js/parseInt % 10) (str/split s #"\.")))
+
+(defn- ip-vec->str
+  "Inverse of `ip-str->vec` — `[o1 o2 o3 o4]` -> a dotted-quad string, ready
+   to hand to a dgram socket's `.send` as a destination address."
+  [v]
+  (str/join "." v))
+
+;; ---------------------------------------------------------------------------
+;; Small attribute encode/decode helpers this listener needs that
+;; kotoba.turn.stun doesn't already expose a dedicated function for (it does
+;; expose the generic TLV/XOR-address primitives these are built on).
+;; ---------------------------------------------------------------------------
+
+(defn- encode-lifetime [seconds] (stun/encode-u32-attr seconds))
+(defn- decode-lifetime [v] (b/bytes->u32 v))
+
+;; No encode-channel-number here: this listener only ever DECODES a
+;; CHANNEL-NUMBER attribute (from an incoming ChannelBind request) — it
+;; never originates one itself (ChannelBind is a client -> server request;
+;; see test/kotoba/turn/listener_demo.cljk for the client-side encoder,
+;; which builds one by hand for exactly that reason).
+(defn- decode-channel-number [v]
+  (b/bytes->u16 (subvec (vec v) 0 2)))
+
+(defn- rand-txid
+  "A fresh random 12-byte STUN transaction id, for messages this listener
+   originates that aren't a direct reply to a specific request (a Data
+   indication relayed from a peer has no client-supplied txid to echo)."
+  []
+  (vec (repeatedly 12 #(rand-int 256))))
+
+(defn- find-attr
+  "The first attribute value in `attrs` (a `kotoba.turn.stun/attributes`
+   result) matching `typ`, or nil."
+  [attrs typ]
+  (some (fn [[t v]] (when (= t typ) v)) attrs))
+
+(defn- find-attrs
+  "Every attribute value in `attrs` matching `typ`, in order (CreatePermission
+   may legally carry more than one XOR-PEER-ADDRESS)."
+  [attrs typ]
+  (into [] (keep (fn [[t v]] (when (= t typ) v))) attrs))
+
+;; ---------------------------------------------------------------------------
+;; STUN request/response message construction.
+;; ---------------------------------------------------------------------------
+
+(defn- error-response-type
+  "The STUN error-class response type for `request-type` (RFC 8489 §5's
+   class-bits arithmetic: error = request | 0x0110 — checked against
+   `kotoba.turn.stun/allocate-error`, the one such constant the codec
+   already defines: 0x0003 | 0x0110 = 0x0113, matching `stun/allocate-error`
+   exactly). Used for Refresh/CreatePermission/ChannelBind error responses,
+   which `kotoba.turn.stun` has no dedicated constant for."
+  [request-type]
+  (bit-or request-type 0x0110))
+
+(defn- build-success-response
+  "header+attrs -> a complete STUN success response: `resp-type`, echoing
+   `request-header`'s transaction id, `extra-attrs` (a coll of [type value]
+   pairs) pushed in order, then FINGERPRINT. No MESSAGE-INTEGRITY — only
+   `handle-allocate!`'s success response signs with the verified
+   credential; every other response type here is unauthenticated (see the
+   AUTHENTICATION SCOPE section of this namespace's docstring)."
+  [request-header resp-type extra-attrs]
+  (-> (stun/encode-header {:typ resp-type :length 0 :txid (:txid request-header)})
+      (as-> msg (reduce (fn [m [t v]] (stun/push-attr m t v)) msg extra-attrs))
+      stun/set-attr-length
+      stun/append-fingerprint))
+
+(defn- build-error-response
+  "header -> a minimal STUN error response: ERROR-CODE(`code`, `reason`)
+   only, then FINGERPRINT. See this namespace's docstring (\"Exact RFC 8489
+   §14.8 ERROR-CODE payload fidelity\") for what's deliberately NOT here
+   (REALM/NONCE challenge attributes, MESSAGE-INTEGRITY)."
+  [request-header request-type code reason]
+  (-> (stun/encode-header {:typ (error-response-type request-type) :length 0 :txid (:txid request-header)})
+      (stun/push-attr stun/attr-error-code (stun/encode-error-code code reason))
+      stun/set-attr-length
+      stun/append-fingerprint))
+
+(defn- send-stun!
+  "Write `msg` (a complete, already-framed STUN byte vector) to `rinfo`'s
+   address/port over `sock`."
+  [sock msg rinfo]
+  (.send sock (vec->buf msg) (.-port rinfo) (.-address rinfo)))
+
+;; ---------------------------------------------------------------------------
+;; client-key — see this namespace's docstring's FIVE-TUPLE SIMPLIFICATION
+;; section for why this (not a literal RFC 8656 5-tuple) is the index this
+;; listener uses for :allocations / :relay-sockets.
+;; ---------------------------------------------------------------------------
+
+(defn- client-key [rinfo]
+  {:address (.-address rinfo) :port (.-port rinfo)})
+
+;; ---------------------------------------------------------------------------
+;; Per-request-type handlers. Each takes the shared `state` atom, the MAIN
+;; listening socket (`main-sock` — the socket every response/indication to
+;; the CLIENT goes out on, regardless of which handler is running), the
+;; parsed STUN header/attrs, and the sender's `rinfo`.
+;; ---------------------------------------------------------------------------
+
+(defn- handle-binding!
+  "RFC 8489 §3 Binding — answer with XOR-MAPPED-ADDRESS.
+
+  A TURN server has to be a STUN server too, and not as a courtesy: a real
+  WebRTC ICE agent sends a Binding request to the configured server FIRST and
+  only proceeds to Allocate once it answers. Dropping type 0x0001 as
+  \"unhandled\" therefore does not merely skip a nicety — the client concludes
+  the server is unreachable and never asks for a relay candidate at all, so
+  every relay-only call fails with no error on either side.
+
+  Measured 2026-07-30 with headless Chromium against kaigi: the listener logged
+  nothing but `unhandled STUN message type 1` from each of the browser's local
+  interfaces, and `iceTransportPolicy: \"relay\"` never produced a candidate.
+
+  Unauthenticated, like every other response here except Allocate's: RFC 8489
+  §9.1 makes authentication optional for Binding, and an ICE agent sends this
+  before it has any reason to hold credentials."
+  [main-sock header rinfo]
+  (send-stun! main-sock
+              (build-success-response
+               header stun/binding-response
+               [[stun/attr-xor-mapped-address
+                 (stun/encode-xor-mapped-v4 (ip-str->vec (.-address rinfo))
+                                            (.-port rinfo))]])
+              rinfo))
+
+(defn- handle-relay-inbound!
+  "Installed as the `\"message\"` handler on ONE allocation's relay-side
+   dgram socket at Allocate time (see `handle-allocate!`). Fires when a
+   datagram arrives FROM a peer address on that relay socket — the
+   peer -> relay -> client half of the data path, symmetric with (and just
+   as load-bearing as) `handle-send-indication!`/`handle-channel-data!`'s
+   client -> relay -> peer half.
+
+   Looks up `ck`'s current allocation (permissions/channel-bindings can
+   have changed since the relay socket was opened, so this re-reads state
+   rather than closing over a stale allocation value), and — gated by
+   `alloc/permission-active?` for the peer's IP, per RFC 8656 §9's
+   requirement that a permission authorizes traffic FROM a peer to be
+   relayed back to the client, not just TO a peer — relays `msg` back to
+   the client on `main-sock`: as ChannelData (lighter framing) if a channel
+   is currently bound to this exact peer address
+   (`alloc/channel-for-peer`), or as a Data indication (XOR-PEER-ADDRESS +
+   DATA) otherwise."
+  [state main-sock ck msg peer-rinfo]
+  (let [now-ms (js/Date.now)
+        allocation (get-in @state [:allocations ck])]
+    (when allocation
+      (let [peer-ip (ip-str->vec (.-address peer-rinfo))
+            peer-port (.-port peer-rinfo)
+            peer-addr {:ip peer-ip :port peer-port}
+            data (buf->vec msg)]
+        (when (alloc/permission-active? allocation peer-ip now-ms)
+          (if-let [chan (alloc/channel-for-peer allocation peer-addr now-ms)]
+            (when-let [framed (cd/encode chan data)]
+              (.send main-sock (vec->buf framed) (:port ck) (:address ck)))
+            (let [ind (-> (stun/encode-header {:typ stun/data-indication :length 0 :txid (rand-txid)})
+                          (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+                          (stun/push-attr stun/attr-data data)
+                          stun/set-attr-length
+                          stun/append-fingerprint)]
+              (.send main-sock (vec->buf ind) (:port ck) (:address ck)))))))))
+
+(defn- handle-allocate!
+  "RFC 8656 §7.2 Allocate. Verifies USERNAME + MESSAGE-INTEGRITY in two
+   steps: `kotoba.turn.credential/verify-credential` (well-formed,
+   unexpired username; the \"credential\" it compares against is derived
+   fresh from `shared-secret` + the presented username via the exact same
+   HMAC formula `mint-credential` uses — there is no separate stored
+   per-user secret to look up), then
+   `kotoba.turn.stun/verify-message-integrity` against that SAME derived
+   credential string (UTF-8-encoded) as the MI key — this second step is
+   the actual cryptographic proof the requester really knows the password
+   implied by the username, not just a syntactically-valid-and-unexpired
+   username string. Only both together count as verified.
+
+   On failure: a minimal 401 error response (see `build-error-response`),
+   no allocation created, no relay socket opened.
+
+   On success: opens a real ephemeral-port `node:dgram` relay socket, bound
+   EXPLICITLY to `relay-host` (never left to default to the OS's `0.0.0.0`
+   wildcard — a relayed transport address of literally `0.0.0.0` would be
+   non-functional/non-routable in any context, not merely a public-vs-
+   private-IP nuance, so this listener always binds relay sockets to a
+   concrete, configured address; see `start-listener!`'s docstring for the
+   `:relay-host` option and its default), `{:port 0}` (OS-assigned ephemeral
+   port — queried back via `.address` after bind to learn the actual
+   relayed port), installs its own `\"message\"` handler
+   (`handle-relay-inbound!`) for the peer -> client direction, calls
+   `alloc/allocate`, stores both the allocation and the relay socket in
+   `state` keyed by the client's `client-key`, and replies with
+   XOR-RELAYED-ADDRESS (the relay socket's own bound address), XOR-MAPPED-
+   ADDRESS (the client's own observed source address/port, standard STUN
+   reflexive-address behavior — this is what the client looks like FROM
+   the server, exactly like a plain STUN Binding response would report),
+   and LIFETIME — signed with MESSAGE-INTEGRITY under the verified
+   credential, then FINGERPRINT."
+  [state main-sock {:keys [shared-secret relay-host]} header attrs raw rinfo]
+  (let [ck (client-key rinfo)
+        now-ms (js/Date.now)
+        now-s (quot now-ms 1000)
+        username-bytes (find-attr attrs stun/attr-username)
+        username (when username-bytes (utf8-decode username-bytes))
+        expected-credential (when username (cred/hmac-sha1-base64 shared-secret username))
+        verified? (boolean
+                    (and username expected-credential
+                         (cred/verify-credential shared-secret username expected-credential now-s)
+                         (stun/verify-message-integrity raw (b/utf8-encode expected-credential))))]
+    (if-not verified?
+      (send-stun! main-sock (build-error-response header stun/allocate-request 401 "Unauthorized") rinfo)
+      (let [relay-sock (dgram/createSocket "udp4")]
+        (.on relay-sock "error"
+             (fn [err] (println "TURN-LISTENER relay socket error for" ck "->" err)))
+        (.on relay-sock "message"
+             (fn [msg peer-rinfo] (handle-relay-inbound! state main-sock ck msg peer-rinfo)))
+        (.bind relay-sock 0 relay-host
+               (fn []
+                 (let [relay-addr (.address relay-sock)
+                       relayed-address {:ip (ip-str->vec (.-address relay-addr)) :port (.-port relay-addr)}
+                       allocation (alloc/allocate now-ms ck relayed-address)]
+                   (swap! state (fn [s] (-> s
+                                             (assoc-in [:allocations ck] allocation)
+                                             (assoc-in [:relay-sockets ck] relay-sock))))
+                   (let [resp (-> (stun/encode-header {:typ stun/allocate-response :length 0 :txid (:txid header)})
+                                  (stun/push-attr stun/attr-xor-relayed-address
+                                                   (stun/encode-xor-mapped-v4 (:ip relayed-address) (:port relayed-address)))
+                                  (stun/push-attr stun/attr-xor-mapped-address
+                                                   (stun/encode-xor-mapped-v4 (ip-str->vec (.-address rinfo)) (.-port rinfo)))
+                                  (stun/push-attr stun/attr-lifetime (encode-lifetime alloc/default-lifetime-s))
+                                  stun/set-attr-length
+                                  (stun/append-message-integrity (b/utf8-encode expected-credential))
+                                  stun/append-fingerprint)]
+                     (send-stun! main-sock resp rinfo)))))))))
+
+(defn- handle-refresh!
+  "RFC 8656 §7.3 Refresh. No existing allocation for this client -> 437
+   Allocation Mismatch. Otherwise `alloc/refresh`; a `nil` result (the
+   client requested LIFETIME 0, i.e. delete) closes and drops the
+   allocation's relay socket and confirms with a LIFETIME-0 response;
+   otherwise stores the refreshed allocation and replies with its new
+   remaining lifetime in seconds."
+  [state main-sock header attrs rinfo]
+  (let [ck (client-key rinfo)
+        now-ms (js/Date.now)
+        lifetime-attr (find-attr attrs stun/attr-lifetime)
+        requested-lifetime-s (when lifetime-attr (decode-lifetime lifetime-attr))
+        allocation (get-in @state [:allocations ck])]
+    (if-not allocation
+      (send-stun! main-sock (build-error-response header stun/refresh-request 437 "Allocation Mismatch") rinfo)
+      (let [refreshed (alloc/refresh allocation now-ms :lifetime-s requested-lifetime-s)]
+        (if (nil? refreshed)
+          (do
+            (when-let [relay-sock (get-in @state [:relay-sockets ck])] (.close relay-sock))
+            (swap! state (fn [s] (-> s (update :allocations dissoc ck) (update :relay-sockets dissoc ck))))
+            (send-stun! main-sock (build-success-response header stun/refresh-response
+                                                            [[stun/attr-lifetime (encode-lifetime 0)]])
+                        rinfo))
+          (do
+            (swap! state assoc-in [:allocations ck] refreshed)
+            (let [remaining-s (quot (- (:turn/expiry refreshed) now-ms) 1000)]
+              (send-stun! main-sock (build-success-response header stun/refresh-response
+                                                              [[stun/attr-lifetime (encode-lifetime remaining-s)]])
+                          rinfo))))))))
+
+(defn- handle-create-permission!
+  "RFC 8656 §9 CreatePermission. No existing allocation -> 437. No
+   XOR-PEER-ADDRESS attribute at all -> 400. Otherwise installs/refreshes a
+   permission (`alloc/create-permission`, keyed by peer IP only — see this
+   namespace's docstring) for every XOR-PEER-ADDRESS attribute present (the
+   RFC permits more than one per request) and replies success."
+  [state main-sock header attrs rinfo]
+  (let [ck (client-key rinfo)
+        now-ms (js/Date.now)
+        allocation (get-in @state [:allocations ck])
+        peer-attrs (find-attrs attrs stun/attr-xor-peer-address)]
+    (cond
+      (not allocation)
+      (send-stun! main-sock (build-error-response header stun/create-permission-request 437 "Allocation Mismatch") rinfo)
+
+      (empty? peer-attrs)
+      (send-stun! main-sock (build-error-response header stun/create-permission-request 400 "Bad Request") rinfo)
+
+      :else
+      (let [updated (reduce (fn [a v] (alloc/create-permission a (:ip (stun/decode-xor-mapped-v4 v)) now-ms))
+                             allocation peer-attrs)]
+        (swap! state assoc-in [:allocations ck] updated)
+        (send-stun! main-sock (build-success-response header stun/create-permission-response []) rinfo)))))
+
+(defn- handle-channel-bind!
+  "RFC 8656 §11 ChannelBind. No existing allocation -> 437. Missing
+   CHANNEL-NUMBER or XOR-PEER-ADDRESS -> 400. Otherwise
+   `alloc/channel-bind` (keyed by the FULL peer transport address — see
+   this namespace's docstring); a `nil` result (channel number out of
+   `alloc/channel-number-valid?` range) -> 400. On success, also installs
+   an implicit plain-IP permission for the same peer (per RFC 8656 §11 —
+   see this namespace's docstring) and replies success."
+  [state main-sock header attrs rinfo]
+  (let [ck (client-key rinfo)
+        now-ms (js/Date.now)
+        allocation (get-in @state [:allocations ck])
+        chan-attr (find-attr attrs stun/attr-channel-number)
+        peer-attr (find-attr attrs stun/attr-xor-peer-address)]
+    (cond
+      (not allocation)
+      (send-stun! main-sock (build-error-response header stun/channel-bind-request 437 "Allocation Mismatch") rinfo)
+
+      (or (nil? chan-attr) (nil? peer-attr))
+      (send-stun! main-sock (build-error-response header stun/channel-bind-request 400 "Bad Request") rinfo)
+
+      :else
+      (let [chan-num (decode-channel-number chan-attr)
+            peer (stun/decode-xor-mapped-v4 peer-attr)
+            bound (alloc/channel-bind allocation chan-num peer now-ms)]
+        (if (nil? bound)
+          (send-stun! main-sock (build-error-response header stun/channel-bind-request 400
+                                                        "Bad Request (channel number out of range)")
+                      rinfo)
+          (let [with-permission (alloc/create-permission bound (:ip peer) now-ms)]
+            (swap! state assoc-in [:allocations ck] with-permission)
+            (send-stun! main-sock (build-success-response header stun/channel-bind-response []) rinfo)))))))
+
+(defn- handle-send-indication!
+  "RFC 8656 §10.3 Send indication — an INDICATION, never a response
+   (success or failure). Requires an existing allocation, XOR-PEER-ADDRESS,
+   and DATA; relays `DATA`'s payload out the allocation's relay socket to
+   the peer address ONLY if `alloc/permission-active?` for that peer's IP —
+   otherwise silently drops, exactly as RFC 8656 specifies (no error
+   indication exists for a Send indication)."
+  [state attrs rinfo]
+  (let [ck (client-key rinfo)
+        now-ms (js/Date.now)
+        allocation (get-in @state [:allocations ck])
+        peer-attr (find-attr attrs stun/attr-xor-peer-address)
+        data-attr (find-attr attrs stun/attr-data)]
+    (when (and allocation peer-attr data-attr)
+      (let [{:keys [ip port]} (stun/decode-xor-mapped-v4 peer-attr)]
+        (when (alloc/permission-active? allocation ip now-ms)
+          (when-let [relay-sock (get-in @state [:relay-sockets ck])]
+            (.send relay-sock (vec->buf data-attr) port (ip-vec->str ip))))))))
+
+(defn- handle-channel-data!
+  "RFC 8656 §12.4 ChannelData arriving FROM the client (the lighter,
+   post-ChannelBind fast path — no STUN header at all). Requires an
+   existing allocation and a currently-bound, unexpired channel
+   (`alloc/peer-for-channel`); relays the payload out the allocation's
+   relay socket to that channel's bound peer address. Silently drops on
+   any decode failure or unbound/expired channel, per RFC 8656 (ChannelData
+   has no error-indication mechanism either)."
+  [state raw rinfo]
+  (when-let [{:keys [channel-number data]} (cd/decode raw)]
+    (let [ck (client-key rinfo)
+          now-ms (js/Date.now)
+          allocation (get-in @state [:allocations ck])]
+      (when allocation
+        (when-let [{:keys [ip port]} (alloc/peer-for-channel allocation channel-number now-ms)]
+          (when-let [relay-sock (get-in @state [:relay-sockets ck])]
+            (.send relay-sock (vec->buf data) port (ip-vec->str ip))))))))
+
+;; ---------------------------------------------------------------------------
+;; Top-level datagram dispatch (main listening socket).
+;; ---------------------------------------------------------------------------
+
+(defn- handle-stun!
+  "`raw` has already classified as `:stun` (`kotoba.turn.demux`). Parses the
+   header + attributes (may throw on a garbage-but-STUN-shaped datagram —
+   caught by `handle-datagram!`'s wrapper, below) and dispatches on message
+   type. An unrecognized STUN message type is logged and dropped, not an
+   error — a real listener sees traffic it doesn't have a handler for.
+
+   Binding (0x0001) IS handled: an earlier version of this comment named it as
+   the example of harmless unhandled traffic, and that was wrong. An ICE agent
+   probes with Binding before it will send Allocate, so dropping it makes the
+   server look unreachable and relay candidates never appear."
+  [state main-sock opts raw rinfo]
+  (let [header (stun/decode-header raw)
+        body (subvec (vec raw) 20)
+        attrs (stun/attributes body)
+        typ (:typ header)]
+    (cond
+      (= typ stun/binding-request) (handle-binding! main-sock header rinfo)
+      (= typ stun/allocate-request) (handle-allocate! state main-sock opts header attrs raw rinfo)
+      (= typ stun/refresh-request) (handle-refresh! state main-sock header attrs rinfo)
+      (= typ stun/create-permission-request) (handle-create-permission! state main-sock header attrs rinfo)
+      (= typ stun/channel-bind-request) (handle-channel-bind! state main-sock header attrs rinfo)
+      (= typ stun/send-indication) (handle-send-indication! state attrs rinfo)
+      :else (println "TURN-LISTENER unhandled STUN message type" typ "from" (.-address rinfo) (.-port rinfo)))))
+
+(defn- handle-datagram!
+  "Main listening socket's `\"message\"` handler. Classifies via
+   `kotoba.turn.demux/classify-datagram` (real bit-level STUN-vs-ChannelData
+   classification, not a length guess) and dispatches. Wraps the whole
+   thing in try/catch: a malformed-but-plausibly-STUN-shaped or
+   malformed-but-plausibly-ChannelData-shaped datagram from the network is
+   an expected, routine occurrence for a listener to see (an attacker, a
+   buggy client, a stray unrelated packet that happened to classify as one
+   of these two shapes) — it must never crash the listener process, only
+   get logged and dropped."
+  [state main-sock opts msg rinfo]
+  (try
+    (let [raw (buf->vec msg)]
+      (case (demux/classify-datagram raw)
+        :stun (handle-stun! state main-sock opts raw rinfo)
+        :channel-data (handle-channel-data! state raw rinfo)
+        :unknown (println "TURN-LISTENER dropping :unknown datagram from" (.-address rinfo) (.-port rinfo))))
+    (catch :default e
+      (println "TURN-LISTENER error handling datagram from" (.-address rinfo) (.-port rinfo) "->" e))))
+
+;; ---------------------------------------------------------------------------
+;; Expiry sweep.
+;; ---------------------------------------------------------------------------
+
+(defn- sweep-expired!
+  "Periodic pass (see `start-listener!`'s `js/setInterval`): closes and
+   drops every allocation `alloc/expired?` reports true for as of now.
+   Reuses the pure expiry check rather than reimplementing it — this
+   namespace owns storage/GC, `kotoba.turn.allocation` owns the expiry
+   rule itself, same division of responsibility its own docstring
+   specifies (\"Garbage-collecting anything `expired?` reports true for...
+   is also the caller's job\")."
+  [state]
+  (let [now-ms (js/Date.now)
+        {:keys [allocations relay-sockets]} @state
+        expired-keys (into [] (keep (fn [[ck a]] (when (alloc/expired? a now-ms) ck))) allocations)]
+    (doseq [ck expired-keys]
+      (when-let [relay-sock (get relay-sockets ck)] (.close relay-sock))
+      (swap! state (fn [s] (-> s (update :allocations dissoc ck) (update :relay-sockets dissoc ck)))))
+    (when (seq expired-keys)
+      (println "TURN-LISTENER expiry sweep dropped" (count expired-keys) "allocation(s)"))))
+
+;; ---------------------------------------------------------------------------
+;; Public lifecycle.
+;; ---------------------------------------------------------------------------
+
+(defn start-listener!
+  "Start the TURN relay: binds a `udp4` `node:dgram` socket on `:host`
+   (default `\"0.0.0.0\"` — accept client datagrams on any interface, the
+   usual server posture) / `:port` (0 = OS-assigned ephemeral port, the
+   default) and begins dispatching received datagrams per this namespace's
+   docstring. `:shared-secret` (required — throws synchronously if omitted)
+   is the server-side secret
+   `kotoba.turn.credential/mint-credential`/`verify-credential` use for the
+   ephemeral short-term credential scheme; it must never be sent to a
+   client.
+
+   `:relay-host` (default `\"127.0.0.1\"`) is the address every per-
+   allocation relay socket (see `handle-allocate!`) binds to — deliberately
+   NOT defaulted to the `0.0.0.0` wildcard, because a relayed transport
+   address of literally `0.0.0.0` reported in XOR-RELAYED-ADDRESS would be
+   non-functional in any context. `127.0.0.1` is an honest default for
+   local dev/demo use (this repo's own demo runs entirely on loopback); a
+   real deployment doing actual NAT traversal for remote peers MUST
+   override this to the server's real, externally-reachable IP (the same
+   \"internal bind address can differ from the externally-reachable
+   relay address\" split every production TURN server, e.g. coturn's
+   `--relay-ip`, needs — this listener does not attempt to auto-detect a
+   public IP).
+
+   Binding a UDP socket is inherently asynchronous (the OS only assigns
+   the actual port once `bind` completes), so this returns a
+   `Promise<handle>` rather than a bare handle — callers (see
+   `test/kotoba/turn/listener_demo.cljk`) `p/let`/`.then` it. `handle` is
+   `{:state <atom, the state described in this namespace's docstring>
+     :socket <the main node:dgram socket, e.g. for callers who want to
+              read (.address socket) themselves> :port <the actual bound
+              port> :sweep-id <the js/setInterval id, for stop-listener!>}`.
+
+   `:sweep-interval-ms` (default 5000) controls how often the expiry sweep
+   (`sweep-expired!`) runs; exposed mainly so a demo/test doesn't have to
+   wait a full 5s to observe an expiry."
+  [{:keys [host port shared-secret relay-host sweep-interval-ms]
+    :or {host "0.0.0.0" port 0 relay-host "127.0.0.1" sweep-interval-ms 5000}}]
+  (when-not shared-secret
+    (throw (ex-info "kotoba.turn.listener/start-listener!: :shared-secret is required" {})))
+  (let [opts {:shared-secret shared-secret :relay-host relay-host}]
+    (js/Promise.
+      (fn [resolve reject]
+        (let [state (atom {:allocations {} :relay-sockets {}})
+              main-sock (dgram/createSocket "udp4")]
+          (.on main-sock "error" (fn [err] (println "TURN-LISTENER main socket error:" err) (reject err)))
+          (.on main-sock "message" (fn [msg rinfo] (handle-datagram! state main-sock opts msg rinfo)))
+          (.bind main-sock port host
+                 (fn []
+                   (let [bound-port (.-port (.address main-sock))
+                         sweep-id (js/setInterval #(sweep-expired! state) sweep-interval-ms)]
+                     (resolve {:state state :socket main-sock :port bound-port :sweep-id sweep-id})))))))))
+
+(defn stop-listener!
+  "Close `handle`'s main socket AND every allocation's relay socket, and
+   cancel the expiry-sweep interval. Returns a `Promise<true>` resolved
+   once the main socket has actually finished closing (relay sockets are
+   closed synchronously alongside it, best-effort — a demo/test that needs
+   to reuse a specific port right after should still await this)."
+  [{:keys [state socket sweep-id]}]
+  (js/clearInterval sweep-id)
+  (doseq [[_ relay-sock] (:relay-sockets @state)] (.close relay-sock))
+  (js/Promise. (fn [resolve _reject] (.close socket (fn [] (resolve true))))))

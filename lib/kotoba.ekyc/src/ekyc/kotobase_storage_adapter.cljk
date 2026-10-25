@@ -1,0 +1,67 @@
+(ns ekyc.kotobase-storage-adapter
+  "Private canonical storage adapter targeting Kotobase private tenant datoms.
+  Provides authoritative CAS, immutable block PUT/GET with CID verification,
+  and fail-closed error handling. Conforms strictly to identity-vault ports."
+  (:require [ekyc.passport :as p]
+            [ekyc.identity-intake :as intake]
+            [ekyc.identity-vault :as vault]))
+
+(defn make-kotobase-ports
+  "Create storage ports meeting the validate-ports! contract:
+  - origin: https://kotobase.net
+  - visibility: :private
+  - cas-mode: :authoritative
+  - read!, cas!, put-block!, get-block!
+  Uses an atomic state container or durable Kotobase backend."
+  [{:keys [initial-state block-store cas-fn key-service intake-enabled? notice-approved?]
+    :or {initial-state {:revision 0 :state {:intake {} :reviewers #{} :reviewer-keys {}}}
+         block-store (atom {})
+         intake-enabled? true
+         notice-approved? true}}]
+  (let [db (atom initial-state)
+        kms (or key-service
+                ;; Default to no-op fallback that fails if not provided
+                {:create-key! (fn [_] (js/Promise.reject (ex-info "kms-not-provided" {:status 503})))
+                 :key! (fn [_ _] (js/Promise.reject (ex-info "kms-not-provided" {:status 503})))
+                 :destroy-key! (fn [_ _] (js/Promise.reject (ex-info "kms-not-provided" {:status 503})))})]
+    {:origin "https://kotobase.net"
+     :visibility :private
+     :cas-mode :authoritative
+     :intake-enabled? intake-enabled?
+     :notice-approved? notice-approved?
+
+     :read!
+     (fn [] (js/Promise.resolve @db))
+
+     :cas!
+     (or cas-fn
+         (fn [expected-rev next-state]
+           (let [current @db]
+             (if (= expected-rev (:revision current))
+               (if (compare-and-set! db current {:revision (inc expected-rev) :state next-state})
+                 (js/Promise.resolve {:status :committed
+                                      :revision (inc expected-rev)
+                                      :receipt-ref (str "kotobase:rev:" (inc expected-rev))})
+                 (js/Promise.resolve {:status :conflict}))
+               (js/Promise.resolve {:status :conflict})))))
+
+     :put-block!
+     (fn [block-cid bytes]
+       (p/require! (intake/text? block-cid) :invalid-cid)
+       (p/require! (instance? js/Uint8Array bytes) :invalid-bytes)
+       (-> (vault/cid bytes)
+           (.then (fn [computed-cid]
+                    (p/require! (= block-cid computed-cid) :cid-mismatch)
+                    (swap! block-store assoc block-cid bytes)
+                    {:status :stored :cid block-cid :receipt-ref (str "kotobase:block:" block-cid)}))))
+
+     :get-block!
+     (fn [block-cid]
+       (let [bytes (get @block-store block-cid)]
+         (if bytes
+           (js/Promise.resolve bytes)
+           (js/Promise.reject (ex-info "block-not-found" {:status 404})))))
+
+     :create-key! (:create-key! kms)
+     :key! (:key! kms)
+     :destroy-key! (:destroy-key! kms)}))

@@ -1,0 +1,133 @@
+(ns oidc.adapters.jwt-edge-test
+  "Real-key proof for the WebCrypto RS256 verifier.
+
+  The JVM adapter is covered by `jwt_rsa_test.clj` under the cognitect
+  runner; this one needs an actual WebCrypto implementation, so it runs on
+  nbb (Node's global `crypto.subtle`) rather than on the JVM:
+
+    kbb --backend sci --classpath src:test -m oidc.adapters.jwt-edge-test
+
+  It generates a keypair, signs a token with it, and then attacks the token —
+  a verifier that only ever sees valid input has not been tested."
+  (:require [oidc.adapters.jwt-edge :as edge]))
+
+(def ^:private now 1785000000)
+
+(defn- b64url [buf]
+  (let [bin (apply str (map js/String.fromCharCode (array-seq (js/Uint8Array. buf))))]
+    (-> (js/btoa bin)
+        (.replace (js/RegExp. "\\+" "g") "-")
+        (.replace (js/RegExp. "/" "g") "_")
+        (.replace (js/RegExp. "=+$") ""))))
+
+(defn- b64url-str [s]
+  (b64url (.-buffer (.encode (js/TextEncoder.) s))))
+
+(defn- json-seg [m] (b64url-str (js/JSON.stringify (clj->js m))))
+
+(defn- sign! [priv header claims]
+  (let [input (str (json-seg header) "." (json-seg claims))]
+    (-> (js/crypto.subtle.sign #js {:name "RSASSA-PKCS1-v1_5"} priv
+                               (.encode (js/TextEncoder.) input))
+        (.then (fn [sig] (str input "." (b64url sig)))))))
+
+(defn- err-name [r]
+  (let [m (js->clj r :keywordize-keys true)]
+    (if-let [e (:error m)] (name e) "none")))
+
+(def ^:private results (atom []))
+
+(defn- check [label pass?]
+  (swap! results conj [label (boolean pass?)])
+  (println (if pass? "  ok   " "  FAIL ") label))
+
+(defn- flip-signature
+  "Change one character of the signature segment, leaving the length intact."
+  [token]
+  (let [i (.lastIndexOf token ".")
+        sig (subs token (inc i))
+        c (if (= "A" (subs sig 0 1)) "B" "A")]
+    (str (subs token 0 (inc i)) c (subs sig 1))))
+
+(defn- swap-claims
+  "Replace the claims segment, keeping the original header and signature —
+  the classic 'edit the payload of a token you captured' attack."
+  [token claims]
+  (let [[h _ s] (.split token ".")]
+    (str h "." (json-seg claims) "." s)))
+
+(defn- attack-cases
+  "Every verification the suite performs, as one flat vector of promises so
+  the control flow is readable rather than a promise pyramid."
+  [pub jwks opts token alg-none]
+  [(edge/verify-rs256! token opts)
+   (edge/verify-rs256! (flip-signature token) opts)
+   (edge/verify-rs256! (swap-claims token {:iss "https://idp.example" :aud "client-1"
+                                           :sub "admin" :exp (+ now 300)}) opts)
+   (edge/verify-rs256! token (assoc opts :jwks {:keys [{:kty "RSA" :kid "other"
+                                                        :n (:n pub) :e (:e pub)}]}))
+   (edge/verify-rs256! token (assoc opts :now (+ now 3600)))
+   (edge/verify-rs256! token (assoc opts :audience "client-2"))
+   (edge/verify-rs256! token (assoc opts :issuer "https://evil.example"))
+   (edge/verify-rs256! "not-a-jwt" opts)
+   (edge/verify-rs256! alg-none opts)])
+
+(defn- report! [token rs]
+  (let [[good bad-sig bad-claims no-kid expired bad-aud bad-iss junk alg-none] rs]
+    (check "a signed token verifies and returns its claims"
+           (and (nil? (:error good)) (= "user-1" (:sub good))))
+    (check "the verified token is echoed back as :jwt-ref"
+           (= token (:jwt-ref good)))
+    (check "a flipped signature character is :invalid-signature"
+           (= "invalid-signature" (err-name bad-sig)))
+    (check "claims edited after signing are refused, not accepted"
+           (and (= "invalid-signature" (err-name bad-claims))
+                (not= "admin" (:sub bad-claims))))
+    (check "an unpublished kid is :missing-jwk (no fallback to another key)"
+           (= "missing-jwk" (err-name no-kid)))
+    (check "an expired token is refused even though its signature is good"
+           (= "expired" (err-name expired)))
+    (check "a token minted for another audience is refused"
+           (= "audience" (err-name bad-aud)))
+    (check "a token from another issuer is refused"
+           (= "issuer" (err-name bad-iss)))
+    (check "a non-JWT is :invalid-jwt"
+           (= "invalid-jwt" (err-name junk)))
+    (check "alg:none is refused before any key is touched"
+           (= "unsupported-algorithm" (err-name alg-none)))
+    (let [fails (remove second @results)]
+      (println)
+      (println (count @results) "checks," (count fails) "failed")
+      (when (seq fails) (js/process.exit 1)))))
+
+(defn -main [& _]
+  (let [claims {:iss "https://idp.example" :aud "client-1"
+                :sub "user-1" :exp (+ now 300)}
+        state (atom {})]
+    (-> (js/crypto.subtle.generateKey
+         #js {:name "RSASSA-PKCS1-v1_5" :modulusLength 2048
+              :publicExponent (js/Uint8Array. #js [1 0 1]) :hash "SHA-256"}
+         true #js ["sign" "verify"])
+        (.then (fn [kp]
+                 (swap! state assoc :kp kp)
+                 (js/crypto.subtle.exportKey "jwk" (.-publicKey kp))))
+        (.then (fn [jwk]
+                 (swap! state assoc :pub (js->clj jwk :keywordize-keys true))
+                 (js/Promise.all
+                  #js [(sign! (.-privateKey (:kp @state)) {:alg "RS256" :kid "k1"} claims)
+                       (sign! (.-privateKey (:kp @state)) {:alg "none" :kid "k1"} claims)])))
+        (.then (fn [signed]
+                 (let [pub (:pub @state)
+                       jwks {:keys [{:kty "RSA" :kid "k1" :n (:n pub) :e (:e pub)}]}
+                       opts {:jwks jwks :issuer "https://idp.example"
+                             :audience "client-1" :now now}]
+                   (swap! state assoc :token (aget signed 0))
+                   (js/Promise.all (clj->js (attack-cases pub jwks opts
+                                                          (aget signed 0)
+                                                          (aget signed 1)))))))
+        (.then (fn [rs]
+                 (report! (:token @state)
+                          (map #(js->clj % :keywordize-keys true) (array-seq rs)))))
+        (.catch (fn [e]
+                  (println "ERROR" (or (.-stack e) e))
+                  (js/process.exit 1))))))

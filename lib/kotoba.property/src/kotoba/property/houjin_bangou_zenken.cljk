@@ -1,0 +1,309 @@
+(ns kotoba.property.houjin-bangou-zenken
+  "Portable parsing/normalisation for the National Tax Agency 法人番号 (Corporate
+   Number) 全件データ (zenken) CSV — every corporate entity Japan has issued a
+   number to, published monthly by 国税庁法人番号公表サイト.
+
+   Kept free of I/O so the row contract can be tested without a 266 MB
+   download: `scripts/collect_houjin_bangou_zenken.cljk` owns the streaming and
+   this namespace owns the meaning of a row. Same split as
+   `kotoba.property.gleif-golden-copy`.
+
+   ## Why the bulk file and not the Web-API
+
+   `cloud-itonami-isic-8291`'s `dossier.houjin-bangou` is a real client for
+   https://api.houjin-bangou.nta.go.jp — a *lookup* path: one company you
+   already have a name or a number for, and it needs an Application ID the
+   National Tax Agency issues to a named operator over ~2-4 weeks. The 全件
+   download is the *ingest* path: the same authority, the same three basic
+   facts (商号・所在地・法人番号), no account, no Application ID, one POST.
+   Neither replaces the other, and this namespace is only about the second.
+
+   ## Emitted attributes
+
+   Deliberately the names the workspace query plane already joins on
+   (ADR-2607252000). Two of them matter most:
+
+   - `:company/houjin-bangou` — the 13-digit number, unambiguous.
+   - `:company/registration-no` — the *same* value, because that is the
+     attribute GLEIF's Golden Copy already carries for JP entities
+     (`Entity.RegistrationAuthority.RegistrationAuthorityEntityID`). Emitting
+     both means a GLEIF record and an NTA record unify without a translation
+     layer, while `:company/houjin-bangou` stays available for queries that
+     must not risk a collision with another jurisdiction's registry number.
+
+   `dossier`'s canonical entity id is `jpn-<corporateNumber>`
+   (ADR-2607182200); it is `(str \"jpn-\" (:company/houjin-bangou rec))` and is
+   deliberately not stored — a derived value in a 5.8M-record corpus is 5.8M
+   copies of a `str` call.
+
+   ## Corpus shape
+
+   Line 1 is a manifest map carrying the provenance constant for the whole file
+   (authority, licence, publish, source hash); every later line is one entity.
+   Same reason as GLEIF: repeating five constant values on millions of records
+   costs hundreds of MB for information that cannot vary within a file.
+
+   出典：国税庁法人番号公表サイト（国税庁）
+   https://www.houjin-bangou.nta.go.jp/download/zenken/ を加工して作成"
+  (:require [kotoba.lang.text :as str]))
+
+(def source-id
+  "Collector-level source id. Distinct from the Web-API client's source
+   (`dossier.houjin-bangou`) because the two read different endpoints of the
+   same authority and their audit rows must not overwrite each other."
+  "nta-houjin-bangou-zenken")
+
+(def authority-id "JP/NTA-Houjin-Bangou")
+
+(def dataset "houjin-bangou")
+
+(def licence
+  "公共データ利用規約（第1.0版）. Attribution is required, and a derived work must
+   say it is derived — see this namespace's docstring and DATA-GOVERNANCE.md."
+  "公共データ利用規約（第1.0版）(NTA)")
+
+(def attribution
+  "The exact wording the terms of use ask a derived work to carry."
+  "出典：国税庁法人番号公表サイト（国税庁）https://www.houjin-bangou.nta.go.jp/download/zenken/ を加工して作成")
+
+(def columns
+  "The 30 columns of the 全件データ CSV, in file order.
+
+   The file has **no header row** — unlike GLEIF, where every lookup can go
+   through a header. Position is the only contract, so it is written down here
+   and checked: `row->record` refuses a row whose column count is not 30 rather
+   than reading the next release's column N as if it were this one's."
+  [:sequence-no :houjin-bangou :process :correction :updated-at :changed-at
+   :name :name-image-id :kind
+   :prefecture :city :street :address-image-id
+   :prefecture-code :city-code :postal-code
+   :foreign-address :foreign-address-image-id
+   :closed-at :close-cause :successor-houjin-bangou :change-detail
+   :assigned-at :latest
+   :name-en :prefecture-en :address-en :foreign-address-en
+   :name-kana :search-excluded])
+
+(def column-count (count columns))
+
+(def ^:private index-of-column
+  (into {} (map-indexed (fn [i c] [c i]) columns)))
+
+(def kind-labels
+  "法人種別 codes. The labels come from the NTA resource definition
+   (`k-resource-dl.xlsx`); the code->label pairing was confirmed against the
+   2026-07-31 file itself, because the spreadsheet lists the labels without
+   putting each one next to its number."
+  {"101" :national-government      ; 国の機関
+   "201" :local-government         ; 地方公共団体
+   "301" :kabushiki-kaisha         ; 株式会社
+   "302" :yugen-kaisha             ; 有限会社
+   "303" :gomei-kaisha             ; 合名会社
+   "304" :goshi-kaisha             ; 合資会社
+   "305" :godo-kaisha              ; 合同会社
+   "399" :other-registered         ; その他の設立登記法人（社団・財団・NPO 等）
+   "401" :foreign-company          ; 外国会社等
+   "499" :other})                  ; その他（健康保険組合・共済組合 等）
+
+(def close-cause-labels
+  "登記記録の閉鎖等の事由（`closeCause`）。
+
+   仕様（`k-resource-dl.pdf`）は 4 つの意味を**番号を添えずに並べる**だけなので、
+   `kind-labels` と同じやり方で 2026-07-31 の全件ファイル自身に当てて確かめた
+   （実測 2026-08-19、5,816,535 行）:
+
+     01  501,684 件  清算の結了等（設立登記法人）
+     11   60,710 件  合併による解散等（設立登記法人）—— 承継先法人番号を伴う
+     21  209,995 件  商業登記規則第 81 条による閉鎖（休眠会社のみなし解散）
+     31    1,407 件  清算の結了等に類する事由（設立登記法人以外）
+
+   裏付けは**承継先を持つ行の事由の内訳**（実測 2026-08-19、
+   `report_closure_vs_kanpou.cljs`）:
+
+     承継先を持つ 60,753 件 = `11` 60,703 + `31` 50
+     `11` の閉鎖 60,710 件のうち **7 件は承継先を持たない**
+
+   「合併 = 承継先あり」はほぼ成り立つが**双方向とも例外がある** —— `31`
+   （設立登記法人以外）にも承継が 50 件在り、合併なのに承継先が空の行が 7 件ある。
+   **「11 だけが承継先を持つ」とは書かない。** 対応付けが崩れたら報告器が気付く。
+
+   閉鎖は 773,796 件 = 登記の **13%**。官報の解散公告（90 日窓で 5,777 件）とは
+   桁が違うが、**別のことを言っている** —— 官報は「解散を決議した」（手続の入口）、
+   ここは「登記記録が閉じた」（出口）。同じ会社が両方に出る場合、日付は数年離れうる。"
+  {"01" :liquidation-completed
+   "11" :dissolved-by-merger
+   "21" :closed-by-registrar
+   "31" :liquidation-equivalent-non-registered})
+
+(defn closed?
+  "登記記録が閉じているか。**閉鎖日と事由のどちらかでも在れば閉じている**
+   （片方だけ入っている行が実在するため、両方を要求すると見落とす）。"
+  [rec]
+  (boolean (or (:company/closed-at rec) (:company/close-cause rec))))
+
+(def ^:private record-start-re
+  ;; Every data row opens with a running number and the 13-digit corporate
+  ;; number. A physical line that does not is the continuation of a quoted
+  ;; value containing a newline.
+  #"^\d+,[0-9]{13},")
+
+(defn record-start? [line]
+  (boolean (re-find record-start-re line)))
+
+(defn parse-line
+  "Full RFC-4180 line splitter: honours quoted fields, doubled quotes as a
+   literal quote, and commas inside quotes. Returns a vector of strings with
+   the surrounding quotes removed and empty cells as nil.
+
+   30 columns is small enough that the sparse-materialisation trick
+   `gleif-golden-copy/row->cells` needs for a 338-column row would buy nothing
+   here; measured, the whole-row split is not the bottleneck (unzip is)."
+  [line]
+  (let [n (count line)]
+    (loop [i 0 run-start 0 cell "" cells [] in-quotes? false]
+      (if (>= i n)
+        (mapv #(when-not (str/blank? %) %)
+              (conj cells (str cell (subs line run-start n))))
+        (let [c (nth line i)]
+          (cond
+            (and in-quotes? (= c \") (< (inc i) n) (= (nth line (inc i)) \"))
+            (recur (+ i 2) (+ i 2) (str cell (subs line run-start i) "\"") cells true)
+
+            (= c \")
+            (recur (inc i) (inc i) (str cell (subs line run-start i))
+                   cells (not in-quotes?))
+
+            (and (= c \,) (not in-quotes?))
+            (recur (inc i) (inc i) ""
+                   (conj cells (str cell (subs line run-start i))) false)
+
+            :else
+            (recur (inc i) run-start cell cells in-quotes?)))))))
+
+(defn cell [cells column] (nth cells (index-of-column column) nil))
+
+(defn check-digit
+  "The check digit the NTA algorithm computes for a 12-digit 会社法人等番号:
+   `9 - (Σ Pn·Qn mod 9)`, Pn the n-th digit from the right, Qn 1 for odd n and
+   2 for even n. Returns nil for anything that is not 12 digits."
+  [twelve]
+  (when (and twelve (= 12 (count twelve)) (re-matches #"\d{12}" twelve))
+    (let [sum (reduce + (map-indexed
+                         (fn [i c]
+                           ;; i counts from the right, 0-based, so n = i+1.
+                           (let [d (- (int c) (int \0))]
+                             (* d (if (odd? (inc i)) 1 2))))
+                         (reverse twelve)))]
+      (- 9 (mod sum 9)))))
+
+(defn valid-houjin-bangou?
+  "Does this 13-digit string carry the check digit the NTA algorithm computes
+   for its 12-digit body? Used to *count* anomalies in an ingest, never to drop
+   a row: the authority's own file is the authority on what a number is."
+  [s]
+  (boolean
+   (when (and s (= 13 (count s)) (re-matches #"\d{13}" s))
+     (= (- (int (nth s 0)) (int \0)) (check-digit (subs s 1))))))
+
+(defn- put [m k v] (if (str/blank? v) m (assoc m k v)))
+
+(defn row->record
+  "One parsed row (vector of 30 cells) -> one portable company entity, or nil
+   if the row cannot be trusted positionally (wrong column count, or no
+   13-digit corporate number in column 2).
+
+   A nil is an anomaly the caller must count and report, not silently drop —
+   a corpus that quietly lost rows looks exactly like a small month."
+  [cells]
+  (when (and (= column-count (count cells))
+             (let [n (cell cells :houjin-bangou)]
+               (and n (re-matches #"[0-9]{13}" n))))
+    (let [n (cell cells :houjin-bangou)
+          pref-code (cell cells :prefecture-code)]
+      (-> {:company/houjin-bangou n
+           ;; Same value under GLEIF's attribute name — see ns docstring.
+           :company/registration-no n
+           :company/jurisdiction "JP"
+           :company/country "JP"}
+          (put :company/legal-name (cell cells :name))
+          (put :company/legal-name-kana (cell cells :name-kana))
+          (put :company/legal-name-en (cell cells :name-en))
+          ;; ISO 3166-2:JP is exactly "JP-" + the NTA prefecture code, so
+          ;; `:company/region` stays comparable with GLEIF's "US-IL" shape.
+          (put :company/region (when pref-code (str "JP-" pref-code)))
+          (put :company/prefecture (cell cells :prefecture))
+          (put :company/city (cell cells :city))
+          (put :company/street (cell cells :street))
+          (put :company/postal-code (cell cells :postal-code))
+          (put :company/address-en (cell cells :address-en))
+          (put :company/foreign-address (cell cells :foreign-address))
+          (put :company/nta-kind (cell cells :kind))
+          (put :company/nta-assigned-at (cell cells :assigned-at))
+          (put :company/nta-last-update (cell cells :updated-at))
+          (put :company/closed-at (cell cells :closed-at))
+          (put :company/close-cause (cell cells :close-cause))
+          (put :company/successor-houjin-bangou (cell cells :successor-houjin-bangou))
+          ;; Booleans, not the raw "1"/"0": a query plane reader should not have
+          ;; to know which way the authority's flags point.
+          (assoc :company/nta-latest? (= "1" (cell cells :latest)))
+          (assoc :company/nta-search-excluded? (= "1" (cell cells :search-excluded)))))))
+
+(defn line->record
+  "Convenience for tests and small inputs: raw CSV line -> record."
+  [line]
+  (row->record (parse-line line)))
+
+(def ^:private corporate-forms
+  ["株式会社" "有限会社" "合同会社" "合名会社" "合資会社"
+   "一般社団法人" "一般財団法人" "公益社団法人" "公益財団法人"
+   "特定非営利活動法人" "社会福祉法人" "医療法人社団" "医療法人財団" "医療法人"
+   "学校法人" "宗教法人" "協同組合" "農業協同組合" "生活協同組合"
+   "独立行政法人" "国立大学法人" "地方独立行政法人"])
+
+(defn normalize-name
+  "NFKC + case-fold + drop every space, so \"ＧＦＴＤ Ｊａｐａｎ株式会社\" and
+   \"GFTD Japan株式会社\" are one key.
+
+   Deliberately does NOT drop the corporate form: 株式会社A and 有限会社A are
+   different companies. Form-insensitive matching is `name-core`, and the
+   matcher keeps the two apart so a caller can see which one answered."
+  [s]
+  (when-not (str/blank? s)
+    (-> #?(:clj (java.text.Normalizer/normalize s java.text.Normalizer$Form/NFKC)
+           :cljs (.normalize s "NFKC"))
+        (str/replace #"[\s　]" "")
+        (str/lower))))
+
+(defn name-core
+  "`normalize-name` with the corporate form removed, wherever it sits (Japanese
+   company names carry it as a prefix *or* a suffix). Ambiguous by
+   construction — two companies can share a core — so callers must treat a
+   multi-hit as unresolved rather than picking one."
+  [s]
+  (when-let [n (normalize-name s)]
+    (let [stripped (reduce (fn [acc form]
+                             (str/replace acc (normalize-name form) ""))
+                           n
+                           corporate-forms)]
+      (when-not (str/blank? stripped) stripped))))
+
+(defn publish-id
+  "NTA names its members `00_zenkoku_all_20260731.csv`; keep the stamp so a
+   corpus row can be traced to a publish."
+  [entry-name]
+  (when entry-name
+    (str/replace entry-name #"\.csv$" "")))
+
+(defn corpus-manifest
+  "Line 1 of a corpus file: the provenance every record in it shares."
+  [{:keys [publish content-sha256 observed-at source-archive record-count]}]
+  (cond-> {:corpus/manifest true
+           :corpus/format :edn-lines
+           :source/dataset dataset
+           :source/authority authority-id
+           :source/licence licence
+           :source/attribution attribution
+           :source/publish publish
+           :source/content-sha256 content-sha256
+           :source/observed-at observed-at}
+    source-archive (assoc :source/archive source-archive)
+    record-count (assoc :corpus/record-count record-count)))

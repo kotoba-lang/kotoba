@@ -1,0 +1,103 @@
+#!/usr/bin/env kbb
+;; fleet kdb — live backend flip (ADR-2607160005): persist fleet-db through
+;; the real kotobase-peer commit chain (content-addressed, verifiable), with
+;; a durable file-backed block store, instead of a re-imported EDN blob. The
+;; chain head CID is the fleet-db's durable identity; hydrate reconstructs it.
+;; Run with the kotobase classpath (see kdb-run below).
+;;   persist --db fleet-db.edn --blocks <dir> --head <head-ptr.edn>
+;;   hydrate --blocks <dir> --head <head-ptr.edn> [--out fleet-db-hydrated.edn]
+;;   verify  --db fleet-db.edn --blocks <dir> --head <head-ptr.edn>
+(ns kagami.kdb-cli
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kotobase-peer.core :as kb]
+            [kagami.kdb :as kdb]
+            [kagami.west :as west]
+            [promesa.core :as p]))
+
+(defn die-usage [] (js/console.error "kdb {persist|hydrate|verify} --db --blocks --head [--out]") (js/process.exit 1))
+
+(defn parse-args [argv]
+  (loop [o {} [a & m] argv]
+    (cond (nil? a) o
+          (str/starts-with? a "--")
+          (let [k (keyword (subs a 2))]
+            (if (or (nil? (first m)) (str/starts-with? (first m) "--"))
+              (recur (assoc o k true) m) (recur (assoc o k (first m)) (rest m))))
+          :else (recur o m))))
+
+(defn file-store
+  "Durable content-addressed block store: CID -> file under dir. Blocks are
+  immutable (content-addressed), so writes are idempotent."
+  [dir]
+  (fs/mkdirSync dir #js {:recursive true})
+  {:put! (fn [cid bytes]
+           (let [f (path/join dir (str cid))]
+             (when-not (fs/existsSync f)
+               (fs/writeFileSync f bytes))
+             cid))
+   :get-fn (fn [cid]
+             (let [f (path/join dir (str cid))]
+               (when (fs/existsSync f) (fs/readFileSync f))))})
+
+(defn load-fleet [db] (reader/read-string (fs/readFileSync db "utf8")))
+
+(defn cmd-persist [{:keys [db blocks head]}]
+  (when-not (and db blocks head) (die-usage))
+  (let [{:keys [put! get-fn]} (file-store blocks)
+        fleet-db (load-fleet db)
+        prev (when (fs/existsSync head)
+               (:chain-cid (reader/read-string (fs/readFileSync head "utf8"))))
+        tx (mapcat kdb/repo->tx (:fleet/repos fleet-db))]
+    (-> (kb/commit! put! get-fn tx prev kdb/id-encrypt)
+        (p/then (fn [chain-cid]
+                  (fs/writeFileSync head (pr-str {:chain-cid (str chain-cid)
+                                                  :repos (count (:fleet/repos fleet-db))
+                                                  :prev prev}))
+                  (println "persisted" (count (:fleet/repos fleet-db)) "repos ->"
+                           "chain" (subs (str chain-cid) 0 20) "... (blocks:" blocks ")")
+                  (println "head:" head))))))
+
+(defn cmd-hydrate [{:keys [blocks head out]}]
+  (when-not (and blocks head) (die-usage))
+  (let [{:keys [get-fn]} (file-store blocks)
+        chain-cid (:chain-cid (reader/read-string (fs/readFileSync head "utf8")))]
+    (p/let [rows (kb/hot-datoms get-fn chain-cid (constantly true)
+                                kdb/id-blind kdb/id-decrypt)]
+      ;; regroup datoms by subject (repo path) into entity maps
+      (let [by-s (reduce (fn [m {:keys [e a v_edn]}]
+                           (update m e (fnil conj []) [a (reader/read-string v_edn)]))
+                         {} rows)
+            repos (mapv (fn [[s attrs]]
+                          (reduce (fn [ent [a v]]
+                                    (assoc ent (keyword (subs a 1)) v))
+                                  {} attrs))
+                        by-s)]
+        (println "hydrated" (count repos) "repos from chain" (subs (str chain-cid) 0 16))
+        (when out
+          (fs/writeFileSync out (pr-str {:fleet/repos repos}))
+          (println "wrote" out))
+        (count repos)))))
+
+(defn cmd-verify [{:keys [db blocks head]}]
+  (when-not (and db blocks head) (die-usage))
+  (let [{:keys [get-fn]} (file-store blocks)
+        fleet-db (load-fleet db)
+        chain-cid (:chain-cid (reader/read-string (fs/readFileSync head "utf8")))
+        expect (into (sorted-set)
+                     (map (juxt :repo/name :repo/revision) (:fleet/repos fleet-db)))]
+    (p/let [ok (kb/verify-chain get-fn chain-cid)
+            rows (kb/hot-datoms get-fn chain-cid (constantly true) kdb/id-blind kdb/id-decrypt)]
+      (let [names (into #{} (comp (filter #(= ":repo/name" (:a %)))
+                                  (map #(reader/read-string (:v_edn %)))) rows)]
+        (println "chain verify (tamper/gapless):" (if ok "OK" "FAIL"))
+        (println "repos in chain:" (count names) "/ in db:" (count (:fleet/repos fleet-db)))
+        (if (and ok (= (count names) (count (:fleet/repos fleet-db))))
+          (println "LIVE BACKEND OK: fleet-db durably persisted in a verifiable kotobase commit chain")
+          (do (println "MISMATCH") (js/process.exit 1)))))))
+
+(let [[cmd & rest] *command-line-args*
+      f ({"persist" cmd-persist "hydrate" cmd-hydrate "verify" cmd-verify} cmd)]
+  (if f (f (parse-args rest)) (die-usage)))

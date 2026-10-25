@@ -1,0 +1,160 @@
+(ns collect-gleif-golden-copy
+  "Bulk ingest of the GLEIF LEI-CDF v3.1 Golden Copy (full file, ~3.4M legal
+   entities) into the portable EDN corpus this workspace queries with Datalog.
+
+   Why a bulk file and not the paginated API: `scripts/collect_gleif.cljk` walks
+   https://api.gleif.org/api/v1 at 200 records per request. The LEI universe is
+   >3.3M records, i.e. >16k requests for one refresh — that is not an ingest
+   path, it is a lookup path. GLEIF publishes the same data as a daily Golden
+   Copy file under the same licence (CC0), which is the supported way to obtain
+   the whole universe.
+
+   Coverage gate: this collector goes through `coverage/assert-collectable!` on
+   the same GLOBAL/GLEIF authority entry as the API collector, so it fails
+   closed if that entry ever stops being :allow-login-free.
+
+   Output is newline-delimited EDN (one map per line), NOT a single EDN vector:
+   at this record count a whole-file `read-string` is not workable, and the
+   query plane's `slurp-edn-lines` reader already expects this shape.
+
+   The corpus is a cache artifact, not a git artifact (~850 MB) — see
+   `--out` default and DATA-GOVERNANCE.md. Commit the *projections* built from
+   it by `scripts/project_gleif_corpus.cljk`, not the corpus.
+
+   `--skip`/`--limit` make the ingest shardable. Parsing a row costs ~1.2 ms of
+   ClojureScript and skipping one costs a regex, so N shards over disjoint row
+   ranges finish in ~1/N of the time and concatenate, in order, into the same
+   corpus — worth it on a loaded machine where one process gets a fraction of a
+   core. Only shard 0 writes the manifest line.
+
+   Usage:
+     kbb --backend sci scripts/collect_gleif_golden_copy.cljk --zip <path-to-golden-copy.csv.zip>
+     kbb --backend sci scripts/collect_gleif_golden_copy.cljk --zip <path> --out <corpus.edn> --limit 1000
+     kbb --backend sci scripts/collect_gleif_golden_copy.cljk --zip <path> --out <shard-1.edn> \\
+       --skip 850000 --limit 850000 --no-manifest"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.gleif-golden-copy :as gc]
+            ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["readline" :as readline]))
+
+(def default-out
+  (.join path (or (.-HOME js/process.env) ".") ".cache" "gleif" "gleif-lei-corpus.edn"))
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- sha256-file
+  "Content hash of the source archive, so a corpus can be traced back to the
+   exact publish it came from (the audit contract every other collector honours)."
+  [p]
+  (-> (.createHash crypto "sha256")
+      (.update (.readFileSync fs p))
+      (.digest "hex")))
+
+(defn- zip-entry-name
+  "The Golden Copy archive holds exactly one CSV; read its name rather than
+   assuming the date-stamped filename convention holds."
+  [zip]
+  (let [out (.toString (.execFileSync cp "unzip" #js ["-Z1" zip]))]
+    (first (remove empty? (map str/trim (str/split-lines out))))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        zip (arg-value args "--zip" nil)
+        out (arg-value args "--out" default-out)
+        limit (when-let [l (arg-value args "--limit" nil)] (js/parseInt l 10))
+        skip (js/parseInt (arg-value args "--skip" "0") 10)
+        manifest? (not (flag? args "--no-manifest"))
+        quiet? (flag? args "--quiet")]
+    (when-not zip
+      (println "usage: collect_gleif_golden_copy.cljs --zip <golden-copy.csv.zip> [--out <corpus.edn>] [--limit N]")
+      (.exit js/process 2))
+    (coverage/assert-collectable! gc/source-id)
+    (let [entry (zip-entry-name zip)
+          content-sha256 (sha256-file zip)
+          observed-at (.toISOString (js/Date.))
+          publish (gc/publish-id entry)
+          _ (.mkdirSync fs (.dirname path out) #js {:recursive true})
+          tmp (str out ".partial")
+          sink (.createWriteStream fs tmp)
+          ;; `unzip -p` streams the member to stdout; nothing ever materialises
+          ;; the 2.4 GB CSV on disk, and Node never holds more than one chunk.
+          proc (.spawn cp "unzip" #js ["-p" zip entry]
+                       #js {:stdio #js ["ignore" "pipe" "inherit"]})
+          rl (.createInterface readline #js {:input (.-stdout proc) :crlfDelay ##Inf})
+          state (atom {:header nil :rows 0 :written 0 :skipped 0 :pending nil})
+          manifest (gc/corpus-manifest {:publish publish
+                                        :content-sha256 content-sha256
+                                        :observed-at observed-at
+                                        :source-archive zip})]
+      (when manifest? (.write sink (str (pr-str manifest) "\n")))
+      (let [emit!
+            (fn [line]
+              (let [{:keys [header rows]} @state]
+                (if-not header
+                  (swap! state assoc :header
+                         (gc/selection (gc/header-index (gc/parse-csv-line line))))
+                  (if (and limit (>= rows (+ skip limit)))
+                    (.close rl)
+                    ;; A skipped row is counted but never parsed: that is what
+                    ;; makes sharding cheap.
+                    (if (< rows skip)
+                      (swap! state update :rows inc)
+                      (let [rec (gc/row->record line header)]
+                        (swap! state update :rows inc)
+                        (if rec
+                          (do (.write sink (str (pr-str rec) "\n"))
+                              (swap! state update :written inc))
+                          (swap! state update :skipped inc))
+                        (when (and (not quiet?)
+                                   (zero? (mod (:rows @state) 250000)))
+                          (println "  ..." (:rows @state) "rows"))))))))]
+        (.on rl "line"
+             (fn [line]
+               ;; A quoted field may contain a newline (GLEIF address lines do),
+               ;; so a record is complete only once the *next* record starts.
+               (let [pending (:pending @state)]
+                 (cond
+                   (gc/record-start? line)
+                   (do (when pending (emit! pending))
+                       (swap! state assoc :pending line))
+
+                   pending
+                   (swap! state assoc :pending (str pending "\n" line))
+
+                   ;; The header row does not look like a record start.
+                   :else (emit! line)))))
+        (.on rl "close"
+             (fn []
+               (when-let [pending (:pending @state)]
+                 (swap! state assoc :pending nil)
+                 (emit! pending)))))
+      (.on rl "close"
+           (fn []
+             ;; `--limit` closes the reader early; without killing the producer
+             ;; the process sits until `unzip` has streamed all 2.4 GB.
+             (try (.kill proc) (catch :default _ nil))
+             (.end sink
+                  (fn []
+                    (.renameSync fs tmp out)
+                    (let [{:keys [rows written skipped]} @state]
+                      (println (pr-str {:corpus out
+                                        :source-archive zip
+                                        :zip-entry entry
+                                        :publish publish
+                                        :content-sha256 content-sha256
+                                        :observed-at observed-at
+                                        :rows rows
+                                        :skip-rows skip
+                                        :written written
+                                        :skipped skipped
+                                        :bytes (.-size (.statSync fs out))})))))))
+      nil)))
+
+(-main)

@@ -1,0 +1,330 @@
+(ns deflate.portable-test
+  "Runtime-agnostic suite: no `java.util.zip`, no Node `zlib`, no fixtures from
+   another implementation. Runs under `kbb -M:test` and under
+   `kbb --backend sci run-tests.cljk`, which is what makes the two-runtime claim in the README
+   testable rather than aspirational.
+
+   Conformance *against* another implementation lives in
+   `deflate.jvm-interop-test` — a round-trip against yourself proves the two
+   halves agree, not that either matches RFC 1951. Sizes here are kept modest
+   because nbb interprets rather than compiles; the multi-megabyte stress cases
+   live in the JVM suite."
+  (:require [deflate.bits :as bits]
+            [deflate.compress :as compress]
+            [deflate.core :as deflate]
+            [deflate.huffman :as huffman]
+            [deflate.inflate :as inflate]
+            [deflate.tables :as tables]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+;; ---------------------------------------------------------------------------
+;; Sample data
+;; ---------------------------------------------------------------------------
+
+(defn- char-code [c]
+  #?(:clj (int c) :cljs (.charCodeAt c 0)))
+
+(defn- ->bytes
+  "ASCII string → byte vector. Every sample below is ASCII, so one code unit is
+   one byte."
+  [s]
+  (mapv #(bit-and (char-code %) 0xff) (seq s)))
+
+(defn- lcg
+  "Deterministic pseudo-random bytes (Numerical Recipes LCG) — no
+   `java.util.Random`, so both runtimes see identical input."
+  [n seed]
+  (loop [i 0 s seed out (transient [])]
+    (if (= i n)
+      (persistent! out)
+      (let [s (mod (+ (* 1664525 s) 1013904223) 4294967296)]
+        (recur (inc i) s (conj! out (bit-and (quot s 65536) 0xff)))))))
+
+(def ^:private samples
+  {:empty      []
+   :one        [0]
+   :two        [255 0]
+   :all-bytes  (vec (range 256))
+   :runs       (vec (repeat 4000 97))
+   :text       (->bytes (apply str (repeat 200 "the quick brown fox jumps over the lazy dog. ")))
+   :json       (->bytes (apply str (repeat 120 "{\"key\":\"value\",\"n\":12345,\"nested\":{\"a\":[1,2,3]}}")))
+   :structured (vec (mapcat (fn [i] [(mod i 251) (mod i 7) 0 0 (mod i 13)]) (range 2000)))
+   :random     (lcg 8000 12345)
+   :mixed      (vec (concat (repeat 300 1) (lcg 2000 7) (repeat 8000 2) (lcg 500 9)))})
+
+(def ^:private small-samples
+  (select-keys samples [:empty :one :all-bytes :runs :text]))
+
+;; ---------------------------------------------------------------------------
+;; Checksums
+;; ---------------------------------------------------------------------------
+
+(deftest checksum-known-vectors
+  (testing "the standard check values"
+    (is (= 0x091e01de (deflate/adler32 (->bytes "123456789"))))
+    (is (= 0xcbf43926 (deflate/crc32 (->bytes "123456789"))))
+    (is (= 1 (deflate/adler32 [])))
+    (is (= 0 (deflate/crc32 []))))
+  (testing "results stay in the unsigned 32-bit domain"
+    ;; A leading 0xff drives the CRC register's high bit; a signed int32 leak on
+    ;; ClojureScript would surface here as a negative number.
+    (doseq [[_ data] samples]
+      (let [c (deflate/crc32 data)
+            a (deflate/adler32 data)]
+        (is (and (<= 0 c) (< c 4294967296)))
+        (is (and (<= 0 a) (< a 4294967296)))))
+    (is (= 0xd202ef8d (deflate/crc32 [0])) "a single zero byte")))
+
+;; ---------------------------------------------------------------------------
+;; Round-trips
+;; ---------------------------------------------------------------------------
+
+(deftest raw-roundtrip-default-level
+  (doseq [[name data] samples]
+    (testing name
+      (is (= data (deflate/inflate-raw (deflate/deflate-raw data)))))))
+
+(deftest raw-roundtrip-every-level
+  (doseq [level [0 1 4 9]
+          [name data] small-samples]
+    (testing (str "level " level " / " name)
+      (is (= data (deflate/inflate-raw (deflate/deflate-raw data {:level level})))))))
+
+(deftest zlib-roundtrip
+  (doseq [[name data] samples]
+    (testing name
+      (let [z (deflate/deflate data)]
+        (is (= 0x78 (first z)) "CM=8, CINFO=7")
+        (is (zero? (mod (+ (* 256 (nth z 0)) (nth z 1)) 31)) "header check bits")
+        (is (= data (deflate/inflate z)))))))
+
+(deftest gzip-roundtrip
+  (doseq [[name data] samples]
+    (testing name
+      (let [g (deflate/gzip data)]
+        (is (= [0x1f 0x8b 8] (subvec g 0 3)))
+        (is (= data (deflate/gunzip g)))))))
+
+(deftest gzip-metadata
+  (let [data (:text samples)
+        g    (deflate/gzip data {:filename "hello.txt" :comment "note" :mtime 1234567890 :os 3})
+        [m]  (deflate/gzip-members g)]
+    (is (= "hello.txt" (:filename m)))
+    (is (= "note" (:comment m)))
+    (is (= 1234567890 (:mtime m)))
+    (is (= 3 (:os m)))
+    (is (= (deflate/crc32 data) (:crc32 m)))
+    (is (= (count data) (:isize m)))
+    (is (= data (:bytes m)))))
+
+(deftest gzip-is-deterministic
+  (is (= (deflate/gzip (:text samples)) (deflate/gzip (:text samples))))
+  (is (not= (deflate/gzip (:text samples) {:mtime 1})
+            (deflate/gzip (:text samples) {:mtime 2}))))
+
+(deftest gzip-multi-member
+  (testing "a gzip file may be several members concatenated"
+    (let [a (deflate/gzip (->bytes "first "))
+          b (deflate/gzip (->bytes "second"))
+          g (into a b)]
+      (is (= 2 (count (deflate/gzip-members g))))
+      (is (= (->bytes "first second") (deflate/gunzip g)))))
+  (testing "trailing zero padding is ignored"
+    (let [g (into (deflate/gzip (->bytes "padded")) (repeat 8 0))]
+      (is (= (->bytes "padded") (deflate/gunzip g))))))
+
+;; ---------------------------------------------------------------------------
+;; Compression behaviour
+;; ---------------------------------------------------------------------------
+
+(deftest compresses-compressible-data
+  (testing "repetitive input shrinks by orders of magnitude"
+    (let [runs (:runs samples)]
+      (is (< (count (deflate/deflate-raw runs)) (quot (count runs) 100)))))
+  (testing "text shrinks by at least half"
+    (let [text (:text samples)]
+      (is (< (count (deflate/deflate-raw text)) (quot (count text) 2)))))
+  (testing "deeper levels never lose to shallower ones on repetitive input"
+    (let [mixed (:mixed samples)]
+      (is (<= (count (deflate/deflate-raw mixed {:level 9}))
+              (count (deflate/deflate-raw mixed {:level 1})))))))
+
+(deftest never-expands-much
+  (testing "incompressible input falls back to stored blocks"
+    ;; Per block: 3 bits, padding to a byte, and 4 bytes of LEN/NLEN.
+    (let [r   (lcg 40000 999)
+          out (deflate/deflate-raw r)]
+      (is (<= (count out) (+ (count r) 64))
+          (str "expanded from " (count r) " to " (count out))))))
+
+(deftest block-strategies-are-all-exercised
+  (testing "stored is chosen for random data, dynamic for text"
+    (let [random-block (deflate/deflate-raw (lcg 4000 42))
+          text-block   (deflate/deflate-raw (:text samples))]
+      ;; bit 0 of the stream is BFINAL, bits 1–2 are BTYPE
+      (is (= 0 (bit-and (unsigned-bit-shift-right (first random-block) 1) 3)) "stored")
+      (is (= 2 (bit-and (unsigned-bit-shift-right (first text-block) 1) 3)) "dynamic")))
+  (testing "whatever the encoder picks for tiny inputs round-trips"
+    ;; The fixed/dynamic/stored crossover is a cost comparison, so assert the
+    ;; invariant rather than the choice.
+    (doseq [n (range 1 40)]
+      (let [d (vec (repeat n 65))]
+        (is (= d (deflate/inflate-raw (deflate/deflate-raw d))))))))
+
+(deftest cross-block-back-references
+  (testing "matches may reach back into earlier blocks"
+    (let [half (lcg 20000 5)
+          data (into (vec half) half)
+          out  (deflate/deflate-raw data)]
+      (is (= data (deflate/inflate-raw out)))
+      (is (< (count out) (+ (count half) 2000))
+          "the repeated half should cost almost nothing"))))
+
+;; ---------------------------------------------------------------------------
+;; Strictness — every failure mode carries a :reason
+;; ---------------------------------------------------------------------------
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(deftest rejects-bad-zlib-headers
+  (is (= :truncated (reason-of #(deflate/inflate [0x78]))))
+  (is (= :bad-header (reason-of #(deflate/inflate [0x77 0x9c 0x03 0x00])))
+      "CM must be 8")
+  (is (= :bad-header (reason-of #(deflate/inflate [0x78 0x9d 0x03 0x00])))
+      "check bits must validate")
+  (is (= :dictionary-required (reason-of #(deflate/inflate [0x78 0x20 0x03 0x00 0x00 0x00])))))
+
+(deftest verifies-checksums
+  (let [data (->bytes "checksummed payload")]
+    (testing "zlib Adler-32"
+      (let [z (deflate/deflate data)
+            corrupt (assoc z (dec (count z)) (bit-xor (peek z) 0xff))]
+        (is (= data (deflate/inflate z)))
+        (is (= :checksum-mismatch (reason-of #(deflate/inflate corrupt))))
+        (is (= data (deflate/inflate corrupt {:verify-checksum false}))
+            "opt-out is available for recovery")))
+    (testing "gzip CRC-32 and ISIZE"
+      (let [g (deflate/gzip data)
+            bad-crc (assoc g (- (count g) 8) (bit-xor (nth g (- (count g) 8)) 0xff))
+            bad-len (assoc g (- (count g) 4) (bit-xor (nth g (- (count g) 4)) 0xff))]
+        (is (= :checksum-mismatch (reason-of #(deflate/gunzip bad-crc))))
+        (is (= :size-mismatch (reason-of #(deflate/gunzip bad-len))))))
+    (testing "a truncated zlib stream is reported, not silently accepted"
+      (let [z (deflate/deflate data)]
+        (is (= :truncated (reason-of #(deflate/inflate (subvec z 0 (- (count z) 2))))))))))
+
+(deftest rejects-bad-gzip-headers
+  (is (= :bad-header (reason-of #(deflate/gunzip (assoc (deflate/gzip [1 2 3]) 0 0x1e)))))
+  (is (= :bad-header (reason-of #(deflate/gunzip (assoc (deflate/gzip [1 2 3]) 2 9))))
+      "only CM=8 (deflate) exists")
+  (is (= :truncated (reason-of #(deflate/gunzip [0x1f 0x8b 8 0 0 0 0 0])))))
+
+(deftest rejects-bad-deflate-streams
+  (is (= :bad-block-type (reason-of #(deflate/inflate-raw [0x07 0x00 0x00 0x00])))
+      "block type 3 is reserved")
+  (is (= :bad-stored-length (reason-of #(deflate/inflate-raw [0x01 0x05 0x00 0x00 0x00 65 66 67 68 69])))
+      "NLEN must be the one's complement of LEN")
+  (is (= :truncated (reason-of #(deflate/inflate-raw [0x01 0x05 0x00 0xfa 0xff 65])))))
+
+(deftest rejects-back-reference-before-the-stream
+  ;; Hand-built fixed-Huffman block: one literal, then length 3 at distance 7 —
+  ;; six bytes further back than the stream has history for.
+  (let [lit  (huffman/codes-from-lengths tables/fixed-lit-lengths)
+        dist (huffman/codes-from-lengths tables/fixed-dist-lengths)
+        w    (bits/writer)]
+    (bits/write-bits! w 1 1)                                  ; BFINAL
+    (bits/write-bits! w 1 2)                                  ; BTYPE = fixed
+    (bits/write-code! w (nth lit 65) (nth tables/fixed-lit-lengths 65))
+    (bits/write-code! w (nth lit 257) (nth tables/fixed-lit-lengths 257))  ; length 3
+    (bits/write-code! w (nth dist 5) 5)                       ; distance base 7
+    (bits/write-bits! w 0 1)                                  ; extra bit → 7
+    (bits/write-code! w (nth lit 256) (nth tables/fixed-lit-lengths 256))
+    (is (= :bad-distance (reason-of #(deflate/inflate-raw (bits/finish! w)))))))
+
+(deftest enforces-the-output-ceiling
+  (let [bomb (deflate/deflate-raw (vec (repeat 100000 0)))]
+    (is (< (count bomb) 500) "100 KB of zeros is a few hundred bytes")
+    (is (= 100000 (count (deflate/inflate-raw bomb))))
+    (is (= :output-limit (reason-of #(deflate/inflate-raw bomb {:max-output 1000}))))
+    (is (= 100000 (count (deflate/inflate-raw bomb {:max-output nil}))))
+    (testing "the default ceiling is generous but present"
+      (is (= inflate/default-max-output (* 128 1024 1024))))))
+
+;; ---------------------------------------------------------------------------
+;; Internals worth pinning
+;; ---------------------------------------------------------------------------
+
+(deftest stream-end-is-reported
+  (testing "containers need to know where the deflate stream stopped"
+    (let [d      (->bytes "payload")
+          raw    (deflate/deflate-raw d)
+          padded (into raw [1 2 3 4])
+          {:keys [bytes end]} (inflate/raw* padded nil)]
+      (is (= d bytes))
+      (is (= (count raw) end)))))
+
+(deftest level-zero-only-stores
+  (let [data (:text samples)
+        out  (compress/raw data {:level 0})]
+    (is (= 0 (bit-and (unsigned-bit-shift-right (first out) 1) 3)))
+    (is (= data (deflate/inflate-raw out)))
+    (is (> (count out) (count data)) "storing adds framing and nothing else")))
+
+(deftest huffman-length-limit-is-respected
+  (testing "a skewed histogram still yields codes within the 15-bit ceiling"
+    ;; Fibonacci frequencies are the classic worst case for tree depth.
+    (let [fib   (loop [v [1 1] i 2] (if (= i 40) v (recur (conj v (+ (nth v (- i 1)) (nth v (- i 2)))) (inc i))))
+          lens  (huffman/lengths-from-freqs fib tables/max-code-length)]
+      (is (some? lens))
+      (is (<= (reduce max 0 lens) tables/max-code-length))
+      (is (every? pos? lens) "every symbol with a frequency gets a code"))))
+
+;; ---------------------------------------------------------------------------
+;; Cross-runtime byte determinism
+;; ---------------------------------------------------------------------------
+;;
+;; Every other test above is satisfied by ANY valid encoder: they inflate what
+;; they deflate, so a JVM tree and a ClojureScript tree both pass while
+;; disagreeing byte for byte. They did disagree — `huffman-depths` sorted its
+;; initial node list on frequency alone, and `sort-by` being stable left equal
+;; frequencies in the seq order of a HASH MAP, which is platform-specific.
+;;
+;; For every consumer this repo had (PNG, ZIP, WOFF, PDF, bonsai) that was
+;; harmless: nothing addressed the compressed bytes. `kotobase-block-codec`
+;; puts them inside a CID, where two encodings of one input are two different
+;; objects. Hence a test that fails on a difference no round-trip can see.
+
+(deftest huffman-tie-break-is-total
+  (testing "equal frequencies order by symbol, not by hash-map iteration"
+    ;; 40 symbols, all frequency 1: every comparison is a tie, so this is the
+    ;; maximally order-sensitive histogram.
+    (let [flat (vec (repeat 40 1))
+          lens (huffman/lengths-from-freqs flat tables/max-code-length)]
+      (is (= lens (huffman/lengths-from-freqs flat tables/max-code-length)))
+      (is (= [6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 5 5 5 5
+              5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5]
+             lens)
+          "pinned: a change here re-encodes every stream this repo produces"))))
+
+(deftest compressed-bytes-are-pinned
+  (testing "the exact zlib stream for a fixed input, on whichever runtime runs
+            this — the property a content address depends on"
+    (is (= [120 1 75 76 74 78 73 77 75 135 82 0 40 218 5 121]
+           (deflate/deflate (->bytes "abcdefgabcdefg") {:level 1})))
+    (is (= [120 1 237 193 49 1 0 0 0 194 160 172 246 47 97 140 61 192 0 0 0
+            128 220 1 141 138 235 236]
+           (deflate/deflate (vec (repeat 4000 97)) {:level 1})))
+    (is (= [120 1 99 100 98 102 97 5 0 0 40 0 16]
+           (deflate/deflate [1 2 3 4 5] {:level 1}))
+        "a five-byte payload, encoded identically everywhere"))
+  (testing "and a histogram full of near-equal frequencies, which is where the
+            two runtimes actually diverged — pinned by length and CRC because
+            the stream is 5 KB"
+    (let [z (deflate/deflate (:structured samples) {:level 1})]
+      (is (= 5414 (count z)))
+      (is (= 1638761810 (deflate/crc32 z)))
+      (is (= (:structured samples) (deflate/inflate z))))))

@@ -1,0 +1,121 @@
+(ns nostr.crypto-test
+  "Verifies nostr.crypto/schnorr-verify against the OFFICIAL BIP-340 test
+  vectors (bitcoin/bips, bip-0340/test-vectors.csv, fetched directly from
+  https://raw.githubusercontent.com/bitcoin/bips/master/bip-0340/test-vectors.csv
+  — not hand-derived, not self-consistency-only). Vectors 0-14 are included
+  (5 positive, 10 negative, all with a 32-byte message); vectors 15-18
+  (variable-length 0/1/17/100-byte messages, added to the BIP-340 vector set
+  in 2022-12) are intentionally EXCLUDED — nostr.crypto/schnorr-verify
+  requires exactly a 32-byte message by design, matching how Nostr always
+  uses it (msg is always a NIP-01 event id or NIP-98 auth event id, both
+  32-byte sha256 hashes), so those variable-length vectors exercise an input
+  domain this repo's verify function deliberately doesn't accept.
+
+  Finding an actual bug in the process: the first draft of nostr.crypto's
+  hardcoded secp256k1 Gy constant was missing its final hex digit (a
+  transcription error — 63 hex chars instead of 64), which put G off the
+  curve entirely. Every point-arithmetic operation still ran (no exception),
+  producing consistently-wrong-but-plausible-looking output — self-signed
+  round-trip tests alone would NOT have caught this, since sign and verify
+  used the same wrong G consistently. Only cross-checking against the
+  official, independently-authored BIP-340 vectors caught it. Left here as
+  the concrete reason this test suite insists on real spec vectors, not only
+  self-consistency."
+  (:require [clojure.test :refer [deftest is testing]]
+            [nostr.crypto :as crypto]))
+
+(defn- v [pub msg sig expect] {:pub pub :msg msg :sig sig :expect expect})
+
+;; index -> {:pub :msg :sig :expect}, transcribed from the official CSV
+;; (index, public key, message, signature, verification result columns only
+;; — secret key / aux_rand are irrelevant to verification and several
+;; negative-test rows leave them blank in the source CSV too).
+(def official-vectors
+  {0  (v "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"
+         "0000000000000000000000000000000000000000000000000000000000000000"
+         "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"
+         true)
+   1  (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE33418906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A"
+         true)
+   2  (v "DD308AFEC5777E13121FA72B9CC1B7CC0139715309B086C960E18FD969774EB8"
+         "7E2D58D8B3BCDF1ABADEC7829054F90DDA9805AAB56C77333024B9D0A508B75C"
+         "5831AAEED7B44BB74E5EAB94BA9D4294C49BCF2A60728D8B4C200F50DD313C1BAB745879A5AD954A72C45A91C3A51D3C7ADEA98D82F8481E0E1E03674A6F3FB7"
+         true)
+   3  (v "25D1DFF95105F5253C4022F628A996AD3A0D95FBF21D468A1B33F8C160D8F517"
+         "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+         "7EB0509757E246F19449885651611CB965ECC1A187DD51B64FDA1EDC9637D5EC97582B9CB13DB3933705B32BA982AF5AF25FD78881EBB32771FC5922EFC66EA3"
+         true) ;; comment: test fails if msg is reduced modulo p or n
+   4  (v "D69C3509BB99E412E68B0FE8544E72837DFA30746D8BE2AA65975F29D22DC7B9"
+         "4DF3C3F68FCC83B27E9D42C90431A72499F17875C81A599B566C9889B9696703"
+         "00000000000000000000003B78CE563F89A0ED9414F5AA28AD0D96D6795F9C6376AFB1548AF603B3EB45C9F8207DEE1060CB71C04E80F593060B07D28308D7F4"
+         true)
+   5  (v "EEFDEA4CDB677750A420FEE807EACF21EB9898AE79B9768766E4FAA04A2D4A34"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E17776969E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B"
+         false) ;; public key not on the curve
+   6  (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "FFF97BD5755EEEA420453A14355235D382F6472F8568A18B2F057A14602975563CC27944640AC607CD107AE10923D9EF7A73C643E166BE5EBEAFA34B1AC553E2"
+         false) ;; has_even_y(R) is false
+   7  (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "1FA62E331EDBC21C394792D2AB1100A7B432B013DF3F6FF4F99FCB33E0E1515F28890B3EDB6E7189B630448B515CE4F8622A954CFE545735AAEA5134FCCDB2BD"
+         false) ;; negated message
+   8  (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769961764B3AA9B2FFCB6EF947B6887A226E8D7C93E00C5ED0C1834FF0D0C2E6DA6"
+         false) ;; negated s value
+   9  (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "0000000000000000000000000000000000000000000000000000000000000000123DDA8328AF9C23A94C1FEECFD123BA4FB73476F0D594DCB65C6425BD186051"
+         false) ;; sG - eP is infinite
+   10 (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "00000000000000000000000000000000000000000000000000000000000000017615FBAF5AE28864013C099742DEADB4DBA87F11AC6754F93780D5A1837CF197"
+         false) ;; sG - eP is infinite
+   11 (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "4A298DACAE57395A15D0795DDBFD1DCB564DA82B0F269BC70A74F8220429BA1D69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B"
+         false) ;; sig[0:32] is not an X coordinate on the curve
+   12 (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F69E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B"
+         false) ;; sig[0:32] is equal to field size
+   13 (v "DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E177769FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"
+         false) ;; sig[32:64] is equal to curve order
+   14 (v "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30"
+         "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"
+         "6CFF5C3BA86C69EA4B7376F31A9BCB4F74C1976089B2D9963DA2E5543E17776969E89B4C5564D00349106B8497785DD7D1D713A8AE82B32FA79D5F7FC407D39B"
+         false)}) ;; public key is not a valid X coordinate because it exceeds the field size
+
+(deftest official-bip340-vectors
+  (doseq [[idx {:keys [pub msg sig expect]}] official-vectors]
+    (testing (str "BIP-340 official test vector " idx)
+      (is (= expect (crypto/schnorr-verify pub (crypto/hex->bytes msg) sig))
+          (str "vector " idx)))))
+
+(deftest sha256-known-answer
+  ;; SHA-256("") — universally known test vector.
+  (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+         (crypto/sha256-of-str "")))
+  ;; SHA-256("abc") — from FIPS 180-4.
+  (is (= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+         (crypto/sha256-of-str "abc"))))
+
+(deftest sign-verify-round-trip
+  (testing "genuinely signing (test-fixture-only path) then verifying with the real verifier"
+    (let [d (crypto/big 3)
+          msg (vec (repeat 32 0))
+          aux (vec (repeat 32 0))
+          pub (crypto/pubkey-for d)
+          sig (crypto/schnorr-sign d msg aux)]
+      (is (= "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9" pub)
+          "matches official vector 0's pubkey for the same private key")
+      (is (crypto/schnorr-verify pub msg sig))
+      (testing "tampering is detected"
+        (is (not (crypto/schnorr-verify pub (assoc msg 0 1) sig)))
+        (is (not (crypto/schnorr-verify pub msg (str (subs sig 0 127) "0"))))))))

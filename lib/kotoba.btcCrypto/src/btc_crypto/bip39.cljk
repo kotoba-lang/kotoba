@@ -1,0 +1,134 @@
+(ns btc-crypto.bip39
+  "BIP-39 mnemonic seed phrases. `mnemonic->seed` (PBKDF2-HMAC-SHA512) needs no
+  wordlist and is implemented first — it is the safety-critical wallet-restore
+  path. Entropy<->mnemonic additionally needs the 2048-word list, which ships
+  as `resources/bip39/english.txt`: fetched verbatim from the canonical source
+  (github.com/bitcoin/bips bip-0039/english.txt, sha256
+  2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda — checked
+  in the ADR guardrails) rather than hand-transcribed, because one wrong word
+  in a hand-typed 2048-word list would silently corrupt real recovery
+  phrases. `load-wordlist` re-verifies that checksum at load time.
+
+  PORTABILITY: :clj-only (wrapped #?(:clj (do ...)) with throwing :cljs
+  stubs of the same names, matching eth-crypto.core's precedent) — needs
+  javax.crypto HMAC, java.text.Normalizer, and java.security.MessageDigest."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kotoba.lang.crypto :as kc])
+  #?(:clj (:import (javax.crypto Mac)
+                    (javax.crypto.spec SecretKeySpec)
+                    (java.text Normalizer Normalizer$Form)
+                    (java.security MessageDigest))))
+
+(def wordlist-sha256
+  "Expected SHA-256 of the canonical BIP-39 English wordlist (2048 lines,
+  bitcoin/bips bip-0039/english.txt)."
+  "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda")
+
+#?(:clj
+(do
+
+(defn- sha256-hex [^String s]
+  (let [md (MessageDigest/getInstance "SHA-256")]
+    (apply str (map #(format "%02x" (bit-and (long %) 0xff)) (.digest md (kbytes/utf8-bytes s))))))
+
+(defn load-wordlist
+  "Parse `text` (2048 newline-separated words) into an index. Throws if the
+  SHA-256 doesn't match `wordlist-sha256` — a corrupt/tampered/wrong-language
+  wordlist must never silently produce wrong mnemonics."
+  [^String text]
+  (let [digest (sha256-hex text)]
+    (when (not= digest wordlist-sha256)
+      (throw (ex-info "bip39: wordlist checksum mismatch" {:got digest :want wordlist-sha256})))
+    (let [words (vec (remove str/blank? (str/split-lines text)))]
+      (when (not= 2048 (count words)) (throw (ex-info "bip39: wordlist must have 2048 words" {:count (count words)})))
+      {:words words :index (into {} (map-indexed (fn [i w] [w i]) words))})))
+
+(defn- nfkd ^String [^String s] (Normalizer/normalize s Normalizer$Form/NFKD))
+
+(defn- hmac-sha512 ^bytes [^bytes key ^bytes data]
+  (let [mac (Mac/getInstance "HmacSHA512")]
+    (.init mac (SecretKeySpec. key "HmacSHA512"))
+    (.doFinal mac data)))
+
+(defn- pbkdf2-hmac-sha512
+  "PBKDF2 (RFC 8018) with HMAC-SHA512, per BIP-39 (2048 iterations, 64-byte
+  derived key)."
+  ^bytes [^bytes password ^bytes salt ^long iterations ^long dklen]
+  (let [hlen 64
+        blocks (long (Math/ceil (/ dklen (double hlen))))]
+    (letfn [(u1 [^long i]
+              (hmac-sha512 password
+                            (byte-array (concat salt [(unchecked-byte (bit-shift-right i 24))
+                                                       (unchecked-byte (bit-shift-right i 16))
+                                                       (unchecked-byte (bit-shift-right i 8))
+                                                       (unchecked-byte i)]))))
+            (f [^long i]
+              (loop [j 1 u (u1 i) acc u]
+                (if (= j iterations)
+                  acc
+                  (let [u' (hmac-sha512 password u)]
+                    (recur (inc j) u' (byte-array (map bit-xor acc u')))))))]
+      (let [out (byte-array (* blocks hlen))]
+        (dotimes [b blocks]
+          (System/arraycopy (f (inc b)) 0 out (* b hlen) hlen))
+        (java.util.Arrays/copyOfRange out 0 dklen)))))
+
+(defn mnemonic->seed
+  "The BIP-39 512-bit seed for `mnemonic` (space-joined words) + optional
+  `passphrase` (default \"\"). Wordlist-independent: any UTF-8 mnemonic
+  string round-trips deterministically, whether or not it is a *valid* BIP-39
+  mnemonic — validation is `mnemonic->entropy`'s job."
+  (^bytes [mnemonic] (mnemonic->seed mnemonic ""))
+  (^bytes [^String mnemonic ^String passphrase]
+   (pbkdf2-hmac-sha512 (kbytes/utf8-bytes (nfkd mnemonic))
+                       (kbytes/utf8-bytes (nfkd (str "mnemonic" passphrase)))
+                       2048 64)))
+
+;; ─── entropy <-> mnemonic (wordlist-dependent) ───────────────────────────────
+
+(defn- bits->bytes [bits] ; bits: seq of 0/1, length a multiple of 8
+  (byte-array (map (fn [byte-bits] (unchecked-byte (reduce (fn [acc b] (bit-or (bit-shift-left acc 1) b)) 0 byte-bits)))
+                    (partition 8 bits))))
+
+(defn- bytes->bits [^bytes b]
+  (mapcat (fn [x] (map #(bit-and (bit-shift-right (long x) %) 1) (range 7 -1 -1))) (seq b)))
+
+(defn entropy->mnemonic
+  "Entropy (16/20/24/28/32 bytes) -> BIP-39 mnemonic using `wordlist` (from
+  `load-wordlist`)."
+  [{:keys [words]} ^bytes entropy]
+  (let [ent-bits (* 8 (alength entropy))
+        _ (when-not (contains? #{128 160 192 224 256} ent-bits)
+            (throw (ex-info "bip39: entropy must be 16/20/24/28/32 bytes" {:bytes (alength entropy)})))
+        cs-bits (quot ent-bits 32)
+        hash-bits (bytes->bits (kc/hash :sha256 entropy))
+        all-bits (concat (bytes->bits entropy) (take cs-bits hash-bits))]
+    (str/join " " (map (fn [group] (nth words (reduce (fn [acc b] (bit-or (bit-shift-left acc 1) b)) 0 group)))
+                        (partition 11 all-bits)))))
+
+(defn mnemonic->entropy
+  "Inverse of `entropy->mnemonic`: validates the checksum, throws on any
+  out-of-wordlist word or bad checksum. Returns the entropy byte array."
+  ^bytes [{:keys [index]} ^String mnemonic]
+  (let [ws (str/split (str/trim mnemonic) #"\s+")
+        n (count ws)
+        _ (when-not (contains? #{12 15 18 21 24} n) (throw (ex-info "bip39: wrong word count" {:n n})))
+        idxs (map (fn [w] (or (get index w) (throw (ex-info "bip39: word not in wordlist" {:word w})))) ws)
+        all-bits (vec (mapcat (fn [i] (map #(bit-and (bit-shift-right i %) 1) (range 10 -1 -1))) idxs))
+        total-bits (count all-bits)
+        cs-bits (quot total-bits 33)
+        ent-bits (- total-bits cs-bits)
+        entropy (bits->bytes (subvec all-bits 0 ent-bits))
+        given-cs (subvec all-bits ent-bits total-bits)
+        want-cs (take cs-bits (bytes->bits (kc/hash :sha256 entropy)))]
+    (when-not (= given-cs (vec want-cs))
+      (throw (ex-info "bip39: checksum mismatch" {})))
+    entropy))
+
+) ;; end do
+:cljs
+(do
+  (defn load-wordlist [& _] (throw (ex-info "btc-crypto.bip39/load-wordlist is :clj-only (java.security.MessageDigest)" {})))
+  (defn mnemonic->seed [& _] (throw (ex-info "btc-crypto.bip39/mnemonic->seed is :clj-only (javax.crypto HMAC)" {})))
+  (defn entropy->mnemonic [& _] (throw (ex-info "btc-crypto.bip39/entropy->mnemonic is :clj-only" {})))
+  (defn mnemonic->entropy [& _] (throw (ex-info "btc-crypto.bip39/mnemonic->entropy is :clj-only" {})))))

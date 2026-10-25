@@ -1,0 +1,297 @@
+(ns kotoba.dtn.transport.turn-relay
+  "Pure, portable (.cljc) helpers for kotoba.dtn.transport.udp's NAT-traversal
+  path — constructing the client-side STUN messages a NAT'd dtn node sends to
+  a kotoba-lang/org-ietf-turn relay (Allocate, CreatePermission, Send
+  indication), parsing STUN responses/indications, and classifying an inbound
+  UDP datagram as a relayed Data indication vs. a directly-received raw
+  bundle datagram. Zero I/O, zero socket/dgram/Node dependency — every
+  function here takes bytes (plus a caller-injected STUN transaction id) in
+  and returns a value out, so this is testable under plain JVM
+  `kbb -M:test`, same pure/impure split kotoba.turn.stun /
+  kotoba.turn.credential / kotoba.turn.allocation already establish in
+  org-ietf-turn itself (and the same split kotoba.dtn.auth / kotoba.dtn.store
+  already establish in this repo).
+
+  WHY THIS EXISTS AS A SEPARATE .cljc FILE, NOT INLINE IN
+  kotoba.dtn.transport.udp. kotoba.dtn.transport.udp is .cljs-only (real
+  node:dgram socket I/O, same split as kotoba.dtn.transport.tcp). The actual
+  wire-construction sequence below mirrors org-ietf-turn's own
+  test/kotoba/turn/listener_demo.cljs client-side helpers
+  (build-allocate-request / build-create-permission-request /
+  build-send-indication) almost exactly — this namespace is dtn's own copy
+  of that same 'how do I speak TURN client-side' logic (org-ietf-turn's demo
+  code is test-only and deliberately not a reusable library surface — see
+  its own namespace docstring: 'never by calling into kotoba.turn.listener's
+  own internal handler functions... the only honest way to prove the
+  LISTENER's own parsing/dispatch/relay logic is real'), adapted here to
+  take an externally-supplied STUN transaction id (so this stays
+  deterministic/testable) rather than generating one internally with
+  `rand-int` — kotoba.dtn.transport.udp is the impure .cljs caller that
+  supplies a real random txid and a real dgram socket.
+
+  SCOPED, NOT FULL ICE (see kotoba.dtn.transport.udp's own namespace
+  docstring for the complete, honest disclosure of what this whole
+  NAT-traversal capability does and does not cover). Specifically in THIS
+  namespace: only Allocate + CreatePermission + Refresh + Send/Data
+  indication are modeled — no ChannelBind fast-path construction (a NAT'd
+  dtn node's outbound traffic always goes as a full STUN Send indication, a
+  few more bytes per message than a bound channel would cost once
+  amortized — a disclosed, deliberate scope cut, not an oversight;
+  org-ietf-turn's own listener still supports ChannelBind server-side, this
+  namespace's client just never uses it).
+
+  Refresh-request construction (`build-refresh-request`, below) was added
+  alongside kotoba.dtn.transport.udp's automatic periodic allocation/
+  permission refresh — closing the gap this namespace's docstring used to
+  name here ('no Refresh-request construction... no automatic re-Allocate
+  before expiry'). See kotoba.dtn.transport.udp's own docstring for the
+  full design (cadence, failure handling) and README.md's 'NAT traversal'
+  section for a verified-by-reading-the-source disclosure of an important
+  asymmetry: org-ietf-turn's `kotoba.turn.listener/handle-allocate!` never
+  inspects a LIFETIME attribute on the original Allocate request at all (it
+  always grants its own fixed `kotoba.turn.allocation/default-lifetime-s`,
+  600s, regardless of what a client asks for), but its `handle-refresh!`
+  genuinely DOES read and honor a client-requested LIFETIME on Refresh."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.bytes :as b]
+            [kotoba.turn.stun :as stun]
+            [kotoba.turn.demux :as demux]))
+
+;; ---------------------------------------------------------------------------
+;; IPv4 dotted-quad <-> [o1 o2 o3 o4] byte-vector conversion. Same convention
+;; org-ietf-turn's own kotoba.turn.listener / listener_demo.cljs use
+;; (`ip-str->vec` / `ip-vec->str`), duplicated here rather than depended on:
+;; those two namespaces are .cljs-only (listener.cljs is real socket I/O,
+;; listener_demo.cljs is test-only demo code), and this is two portable
+;; one-liners, not worth a cross-repo dependency on a .cljs-only namespace
+;; from a .cljc file that needs to load under the JVM.
+;; ---------------------------------------------------------------------------
+
+(defn ip-str->vec
+  "Dotted-quad IPv4 string (e.g. \"127.0.0.1\") -> a kotoba.turn.stun-shaped
+  [o1 o2 o3 o4] byte vector."
+  [s]
+  (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) %) (str/split s #"\.")))
+
+(defn ip-vec->str
+  "Inverse of ip-str->vec — [o1 o2 o3 o4] -> a dotted-quad string."
+  [v]
+  (str/join "." v))
+
+;; ---------------------------------------------------------------------------
+;; Client-side STUN request/indication construction — mirrors
+;; org-ietf-turn's test/kotoba/turn/listener_demo.cljs build-* helpers, see
+;; namespace docstring.
+;; ---------------------------------------------------------------------------
+
+(defn build-allocate-request
+  "STUN Allocate request (RFC 8656 §7.1): USERNAME + REQUESTED-TRANSPORT
+  (UDP, included for wire realism only — kotoba.turn.listener never inspects
+  it), signed with MESSAGE-INTEGRITY under `credential` (a
+  kotoba.turn.credential/mint-credential-minted short-term credential
+  string) and closed with FINGERPRINT. `txid` is caller-supplied (a 12-byte
+  STUN transaction id byte vector) so this function is deterministic —
+  kotoba.dtn.transport.udp supplies a real random one at call time."
+  [username credential txid]
+  (-> (stun/encode-header {:typ stun/allocate-request :length 0 :txid txid})
+      (stun/push-attr stun/attr-username (b/utf8-encode username))
+      (stun/push-attr stun/attr-requested-transport [0x11 0 0 0])
+      stun/set-attr-length
+      (stun/append-message-integrity (b/utf8-encode credential))
+      stun/append-fingerprint))
+
+(defn build-create-permission-request
+  "STUN CreatePermission request (RFC 8656 §9) for peer-ip/peer-port,
+  signed with MESSAGE-INTEGRITY under the SAME verified credential the
+  preceding Allocate used (RFC 8656 requires the same short-term credential
+  for every request within one allocation's lifetime)."
+  [username credential peer-ip peer-port txid]
+  (-> (stun/encode-header {:typ stun/create-permission-request :length 0 :txid txid})
+      (stun/push-attr stun/attr-username (b/utf8-encode username))
+      (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+      stun/set-attr-length
+      (stun/append-message-integrity (b/utf8-encode credential))
+      stun/append-fingerprint))
+
+(defn build-refresh-request
+  "STUN Refresh request (RFC 8656 §7.3): USERNAME + optional LIFETIME,
+  signed with MESSAGE-INTEGRITY under the SAME verified credential the
+  original Allocate used (RFC 8656 requires the same short-term credential
+  for every request within one allocation's lifetime), closed with
+  FINGERPRINT — structurally near-identical to build-allocate-request
+  (minus REQUESTED-TRANSPORT, which is meaningless on a Refresh), plus an
+  OPTIONAL LIFETIME attribute.
+
+  `lifetime-s`, when given (a non-negative integer, seconds), is sent as an
+  explicit LIFETIME attribute — per RFC 8656 §7.3 this REQUESTS that many
+  seconds. kotoba.turn.listener's `handle-refresh!` genuinely reads and
+  honors this (confirmed by reading its source: it decodes the request's
+  LIFETIME attribute, if present, and passes it straight through to
+  `kotoba.turn.allocation/refresh`'s own `:lifetime-s`) — a real asymmetry
+  with `handle-allocate!`, which never inspects a LIFETIME attribute on the
+  ORIGINAL Allocate request at all and always grants its own fixed
+  `kotoba.turn.allocation/default-lifetime-s` (600s) regardless of what a
+  client requests at Allocate time. See kotoba.dtn.transport.udp's own
+  docstring for why this asymmetry matters for how this repo's E2E demo
+  constructs a short, real, observable expiry window for its survival
+  proof (Scenario 4) despite being unable to shrink the ORIGINAL
+  Allocate's granted lifetime directly.
+
+  `lifetime-s` of `0` is a valid RFC 8656 request too (§7.3: a client that
+  wants to immediately delete an allocation sends a Refresh with LIFETIME
+  0) — this function does not special-case it, it is just another u32
+  value pushed as the LIFETIME attribute; deciding whether/when to send
+  zero is the caller's job. When `lifetime-s` is omitted (2-arg call, or an
+  explicit `nil` in the 3-arg form below), no LIFETIME attribute is sent at
+  all — RFC 8656 §7.3: an absent LIFETIME on a Refresh means 'use the
+  server's default lifetime' (currently equivalent to re-requesting 600s
+  against this listener)."
+  ([username credential txid] (build-refresh-request username credential txid nil))
+  ([username credential txid lifetime-s]
+   (-> (stun/encode-header {:typ stun/refresh-request :length 0 :txid txid})
+       (stun/push-attr stun/attr-username (b/utf8-encode username))
+       (cond-> (some? lifetime-s) (stun/push-attr stun/attr-lifetime (stun/encode-u32-attr lifetime-s)))
+       stun/set-attr-length
+       (stun/append-message-integrity (b/utf8-encode credential))
+       stun/append-fingerprint)))
+
+(defn build-send-indication
+  "STUN Send indication (RFC 8656 §10.3) wrapping payload-bytes (a
+  kotoba.bytes-convention byte vector — the UTF-8 encoding of a dtn
+  bundle's pr-str, in kotoba.dtn.transport.udp's actual usage) addressed to
+  peer-ip/peer-port. No MESSAGE-INTEGRITY: RFC 8656 indications have no
+  error-response mechanism to challenge a bad credential with, so — same as
+  org-ietf-turn's own kotoba.turn.listener/handle-send-indication! and its
+  demo's build-send-indication — this is never signed, only FINGERPRINT'd."
+  [peer-ip peer-port payload-bytes txid]
+  (-> (stun/encode-header {:typ stun/send-indication :length 0 :txid txid})
+      (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+      (stun/push-attr stun/attr-data payload-bytes)
+      stun/set-attr-length
+      stun/append-fingerprint))
+
+;; ---------------------------------------------------------------------------
+;; STUN response/indication parsing.
+;; ---------------------------------------------------------------------------
+
+(defn parse-stun-message
+  "raw byte vector -> {:header ... :attrs ...}, or nil if it doesn't decode
+  as a well-formed STUN message (too short, or a bad magic cookie — either
+  genuinely not a STUN message at all, or a truncated/corrupt one). Never
+  throws — same nil-on-failure idiom kotoba.turn.channeldata/decode and
+  org-ietf-turn's own listener_demo.cljs parse-response already use for
+  'this datagram might not actually be what I expected'."
+  [raw]
+  (try
+    (let [header (stun/decode-header raw)]
+      {:header header :attrs (stun/attributes (subvec (vec raw) 20))})
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn find-attr
+  "The first attribute value in `attrs` (a kotoba.turn.stun/attributes
+  result) matching `typ`, or nil."
+  [attrs typ]
+  (some (fn [[t v]] (when (= t typ) v)) attrs))
+
+(defn allocate-response-relayed-address
+  "Given a parsed Allocate SUCCESS response's :attrs, decode its
+  XOR-RELAYED-ADDRESS -> {:ip [o1 o2 o3 o4] :port n}, or nil when the
+  attribute is missing (e.g. this was actually an error response)."
+  [attrs]
+  (some-> (find-attr attrs stun/attr-xor-relayed-address) stun/decode-xor-mapped-v4))
+
+(defn response-lifetime
+  "Given a parsed STUN response's :attrs — an Allocate SUCCESS response OR a
+  Refresh SUCCESS response, both of which carry the server's ACTUAL granted
+  lifetime the same way (RFC 8656 §7.2 / §7.3) — decode its LIFETIME
+  attribute (a big-endian u32, seconds) into a plain integer, or nil when
+  the attribute is missing (e.g. this was actually an error response).
+  Never assumed/hardcoded by any caller — kotoba.dtn.transport.udp reads
+  the REAL granted lifetime via this function both right after the initial
+  Allocate (to compute its once-only refresh cadence) and after every
+  scheduled Refresh (purely for logging what the server actually granted;
+  see that namespace's docstring for why the refresh CADENCE itself is
+  deliberately NOT recomputed from later Refresh responses)."
+  [attrs]
+  (some-> (find-attr attrs stun/attr-lifetime) b/bytes->u32))
+
+(defn data-indication-payload
+  "Given a parsed Data indication's :attrs, the DATA attribute's raw byte
+  vector (the relayed peer's actual bytes), or nil if missing."
+  [attrs]
+  (find-attr attrs stun/attr-data))
+
+(defn data-indication-peer
+  "Given a parsed Data indication's :attrs, the relayed peer's address (from
+  XOR-PEER-ADDRESS) as {:ip [o1 o2 o3 o4] :port n}, or nil if missing."
+  [attrs]
+  (some-> (find-attr attrs stun/attr-xor-peer-address) stun/decode-xor-mapped-v4))
+
+;; ---------------------------------------------------------------------------
+;; Inbound-datagram classification — the "is this a relayed Data indication
+;; or a raw bundle datagram" decision kotoba.dtn.transport.udp needs on a
+;; TURN-relay-configured node's socket (see its namespace docstring).
+;; ---------------------------------------------------------------------------
+
+(defn classify-inbound-datagram
+  "Classify a raw inbound UDP datagram (byte vector), for a TURN-relayed
+  dtn node's socket handler, as one of:
+
+    :data-indication — kotoba.turn.demux/classify-datagram says :stun AND it
+        decodes as a well-formed STUN message of type
+        kotoba.turn.stun/data-indication. This is the expected, common case
+        for a NAT'd node's ongoing inbound traffic once its Allocate +
+        CreatePermission handshake has completed: unwrap via
+        data-indication-payload and treat the result exactly like a
+        directly-received raw bundle datagram.
+
+    :other-stun — kotoba.turn.demux/classify-datagram says :stun AND it
+        decodes as a well-formed STUN message, but NOT a Data indication
+        (e.g. a stray Allocate/CreatePermission response arriving after
+        this node's startup handshake already consumed the one it was
+        waiting for, or — now that kotoba.dtn.transport.udp performs
+        periodic automatic Refresh, see that namespace's docstring — a
+        Refresh/CreatePermission-renewal response the node's OWN dedicated
+        refresh-reply listener already consumed by transaction id before
+        this classification/dispatch path ever sees it; either way this
+        branch's caller (the node's ONGOING, always-installed inbound
+        handler, a separate listener on the same socket) still observes
+        the same datagram too — Node's EventEmitter calls every registered
+        listener for an event, not just one — and correctly has nothing to
+        do with it. Not an error; the caller logs and drops it rather than
+        crashing. ChannelBind responses remain unreachable in practice —
+        this client still never sends ChannelBind requests.
+
+    :raw-bundle — either kotoba.turn.demux/classify-datagram already says
+        :channel-data or :unknown (this repo's UDP client never sends
+        ChannelBind, so a genuine ChannelData datagram arriving here would
+        be unexpected too, but is still routed to this branch rather than
+        :other-stun — there is no 'other channel-data' case to distinguish
+        it from), OR classify-datagram said :stun (its check is only the
+        leading-2-bits + minimum-length heuristic from RFC 8489 §5, not a
+        full parse) but the datagram then fails to actually decode as a
+        well-formed STUN message (bad magic cookie) — the correct reading
+        of THAT combination is 'not actually STUN, coincidentally started
+        with a 00-leading-bits byte', not 'a corrupt STUN message'. A
+        directly-received raw pr-str'd EDN bundle can legitimately land in
+        this second sub-case: ClojureScript's *print-namespace-maps*-shorthand
+        printing of a bundle's namespaced keys begins with '#' (0x23 —
+        binary 00100011, top 2 bits 00), which is exactly the leading-bits
+        pattern RFC 8489 §5 reserves for STUN; the magic-cookie check at
+        bytes 4-8 is what actually disambiguates the two in practice (an
+        astronomically unlikely, not practically occurring, coincidental
+        false-negative is theoretically possible here, same as any 32-bit
+        checksum/magic-number collision anywhere in this whole protocol
+        stack — an honest, disclosed limitation, not a claim of zero
+        collision risk). This branch's caller (kotoba.dtn.transport.udp)
+        then attempts the ordinary UTF-8-decode + edn/read-string a
+        non-relayed node's inbound handler already does, itself tolerant of
+        genuinely-malformed input.
+
+  Never throws."
+  [raw]
+  (case (demux/classify-datagram raw)
+    :stun (if-let [{:keys [header]} (parse-stun-message raw)]
+            (if (= (:typ header) stun/data-indication) :data-indication :other-stun)
+            :raw-bundle)
+    (:channel-data :unknown) :raw-bundle))

@@ -1,0 +1,433 @@
+(ns kotoba.live.scene
+  "Dance scene loader — build a `LiveShow` + VRM avatar binding from EDN.
+
+  This is the clj/edn authoring surface for VRM dance scenes. A designer
+  authors the venue tempo, the avatar, and the choreography as plain EDN
+  data; this module parses it the tolerant way games parse `scene.edn`
+  (missing keys fall back to defaults, ints coerce to floats) and assembles
+  the deterministic `LiveShow` that `kotoba.live.show` already drives. The
+  actual VRM mesh load + skinning stays host-side; this module only resolves
+  the *binding* (which avatar, where it stands, which features) and the
+  *choreography* clock.
+
+  ## EDN shape
+
+  ```edn
+  {:game/title \"KAMI VRM Dance\"
+   :dance/show    {:bpm 128.0 :stage :hall :swing 0.0 :meter [4 8] :performer \"Mitama\"}
+   :dance/avatar  {:vrm \"models/mitama.vrm\" :home [0.0 1.0 0.0] :scale 1.0}
+   :dance/setlist [{:title \"Opening\" :bpm 128.0 :bars 16 :dance :wota
+                    :cues [{:beat 0 :kind :callout :tag \"intro\"}
+                           {:beat 32 :kind :drop :tag \"drop-1\"}]}]}
+  ```"
+  (:require [kotoba.live.audio :as audio]
+            [kotoba.live.avatar :as avatar]
+            [kotoba.live.beat :as beat]
+            [kotoba.live.camera :as camera]
+            [kotoba.live.crowd :as crowd]
+            [kotoba.live.director :as director]
+            [kotoba.live.edn-util :as eu]
+            [kotoba.live.live2d :as live2d]
+            [kotoba.live.render :as render]
+            [kotoba.live.show :as show]
+            [kotoba.live.vj :as vj]
+            #?(:clj [kotoba.io :as io])))
+
+;; ── by-name lookups (unknown / missing -> a documented default) ────────────
+
+(defn stage-preset-by-name [name]
+  (case name "club" :club "festival" :festival :hall))
+
+(defn cue-kind-by-name [name]
+  (case name "drop" :drop "breakdown" :breakdown "callout" :callout :custom))
+
+(defn lighting-fixture-by-name [name]
+  (case name "back-par" :back-par "spot" :spot "blinder" :blinder "laser" :laser
+        "strobe" :strobe :front-par))
+
+(defn vj-pattern-by-name [name]
+  (case name "stripes" :stripes "pulse" :pulse "rings" :rings "scope" :scope
+        "noise" :noise :solid))
+
+(defn- drum-slot-by-name [name]
+  (case name
+    "kick" :kick "snare" :snare "closed-hat" :closed-hat "open-hat" :open-hat
+    "clap" :clap "crash" :crash "tom" :tom "rim" :rim
+    nil))
+
+;; ── default sound bank (resource-mirrored from kami-scene-contracts) ───────
+
+#?(:clj
+   (def default-audio-edn
+     (slurp (io/resource "kotoba/live/audio.edn"))))
+
+#?(:clj
+   (defn- merge-sound-bank [bank root]
+     (if-let [bm (get-in root [:dance/audio :bank])]
+       (reduce-kv
+        (fn [b k cm]
+          (let [name (eu/ident k)]
+            (if (and name (map? cm))
+              (assoc b name (audio/sound-cue
+                              (or (eu/ident (:wave cm)) "sine")
+                              (eu/num (:freq cm) 440.0)
+                              (when (:to cm) (eu/num (:to cm)))
+                              (eu/num (:dur cm) 0.1)
+                              (eu/num (:gain cm) 0.2)))
+              b)))
+        bank bm)
+       bank)))
+
+#?(:clj
+   (defn parse-sound-bank [root]
+     (-> {}
+         (merge-sound-bank (eu/root-map default-audio-edn))
+         (merge-sound-bank root)))
+   :cljs
+   (defn parse-sound-bank [_root] {}))
+
+(defn- sound-cue->edn [c at vel freq]
+  (cond-> {:wave (:wave c) :freq (or freq (:freq c)) :dur (:dur c)
+           :gain (* (:gain c) (max 0.05 0.0 (min 1.0 vel))) :at at}
+    (:to c) (assoc :to (:to c))))
+
+;; ── audio pattern parsing ───────────────────────────────────────────────────
+
+(defn- audio-pattern-by-name [name]
+  (case name "opener" (audio/opener) "ballad" (audio/ballad-pattern) "encore" (audio/encore) nil))
+
+(defn- midi-list [v]
+  (if (sequential? v) (mapv #(max 0 (min 127 (long (eu/num % 0)))) v) []))
+
+(defn- drum-pattern-from-edn [v]
+  (cond
+    (or (keyword? v) (string? v))
+    (case (eu/ident v)
+      "ballad" (audio/ballad)
+      "pumping" (audio/pumping)
+      "empty" (audio/empty-drum-pattern)
+      (audio/four-on-floor))
+
+    (map? v)
+    (reduce-kv (fn [p k steps]
+                 (if-let [slot (drum-slot-by-name (eu/ident k))]
+                   (reduce (fn [p [i sv]] (audio/set-step p slot i (eu/num sv)))
+                           p (map-indexed vector (take 8 steps)))
+                   p))
+               (audio/empty-drum-pattern) v)
+
+    :else nil))
+
+(defn- bass-line-from-edn [v]
+  (cond
+    (or (keyword? v) (string? v))
+    (if (= "empty" (eu/ident v)) (audio/empty-bass-line) (audio/root-pattern-c-minor))
+
+    (sequential? v)
+    {:notes (mapv (fn [nm]
+                     (audio/bass-note (max 0 (long (eu/num (:beat nm) 0)))
+                                       (max 0 (min 127 (long (eu/num (:midi nm) 60))))
+                                       (let [l (eu/num (:len nm))] (if (pos? l) l 1.0))
+                                       (max 0.0 (min 1.0 (eu/num (:vel nm) 0.85))))
+                     )
+                   v)}
+
+    :else nil))
+
+(defn- audio-from-edn [v]
+  (cond
+    (or (keyword? v) (string? v)) (audio-pattern-by-name (eu/ident v))
+    (map? v) (audio/audio-pattern :drums (drum-pattern-from-edn (:drums v))
+                                   :bass (bass-line-from-edn (:bass v))
+                                   :lead-arp (midi-list (:lead-arp v))
+                                   :pad-chord (midi-list (:pad-chord v)))
+    :else nil))
+
+;; ── lighting / vj ───────────────────────────────────────────────────────────
+
+(defn- envelope-from-edn [v]
+  (cond
+    (or (keyword? v) (string? v))
+    (case (eu/ident v)
+      "breathe" {:kind :breathe}
+      "ramp" {:kind :ramp}
+      "pulse" {:kind :pulse :decay 0.5}
+      "strobe" {:kind :strobe :duty 0.5}
+      {:kind :hold})
+
+    (map? v)
+    (cond
+      (contains? v :pulse) {:kind :pulse :decay (eu/num (:pulse v))}
+      (contains? v :strobe) {:kind :strobe :duty (eu/num (:strobe v))}
+      :else {:kind :hold})
+
+    :else {:kind :hold}))
+
+(defn- palette-from-edn [v]
+  (cond
+    (or (keyword? v) (string? v))
+    (get vj/palettes (keyword (eu/ident v)) (:cool-wave vj/palettes))
+
+    (map? v)
+    {:primary (eu/vec3 (:primary v)) :secondary (eu/vec3 (:secondary v)) :accent (eu/vec3 (:accent v))}
+
+    :else (:cool-wave vj/palettes)))
+
+(defn- parse-vj [root]
+  (when-let [steps (get root :dance/vj)]
+    (vj/new-deck
+     (mapv (fn [m]
+             [(if-let [n (eu/ident (:pattern m))] (vj-pattern-by-name n) :solid)
+              (palette-from-edn (:palette m))])
+           steps))))
+
+;; ── avatar / crowd / lighting-cue / track parsing ───────────────────────────
+
+(defn- parse-expression-drives [m]
+  (vec (keep (fn [[k v]]
+               (when-let [nm (eu/ident k)]
+                 (let [dm (when (map? v) v)
+                       source (case (eu/ident (:from dm))
+                                "cheer" :cheer
+                                "blink" :blink
+                                :beat)
+                       gain (eu/num (:gain dm) 1.0)]
+                   {:name nm :source source :gain gain})))
+             m)))
+
+(defn- parse-avatar [m]
+  (let [scale (let [s (eu/num (:scale m))] (when (pos? s) s))]
+    {:vrm (or (:vrm m) "")
+     :home (eu/opt-vec3 (:home m))
+     :scale (or scale 1.0)
+     :look-at (eu/flag (:look-at m) true)
+     :spring-bones (eu/flag (:spring-bones m) true)
+     :clip (eu/ident (:clip m))
+     :spring (when-let [sm (:spring m)]
+               {:stiffness (eu/num (:stiffness sm) 0.05)
+                :drag (eu/num (:drag sm) 0.4)
+                :gravity (eu/num (:gravity sm) 0.3)})
+     :look-at-target (when-let [lm (when (map? (:look-at m)) (:look-at m))]
+                        (if-let [target (eu/opt-vec3 (:target lm))]
+                          {:kind :fixed :point target}
+                          {:kind :camera}))
+     :expressions (let [exprs (some-> (:expressions m) parse-expression-drives)]
+                    (if (seq exprs) exprs (avatar/default-expressions)))
+     :vmd (:vmd m)
+     :voice (when-let [ps (get-in m [:voice :phonemes])]
+              (avatar/new-voice-line
+               (keep (fn [pm]
+                       (when-let [vowel (some-> (eu/ident (:vowel pm)) avatar/vowel-by-name)]
+                         (avatar/phoneme (eu/num (:at-beat pm) 0.0) vowel
+                                          (let [d (eu/num (:dur pm))] (if (pos? d) d 0.5)))))
+                     ps)))}))
+
+(defn- parse-crowd [m]
+  (let [d (crowd/default-config)]
+    {:fans-target (max 0 (long (eu/num (:fans m) (:fans-target d))))
+     :cap (max 0 (long (eu/num (:cap m) (:cap d))))
+     :pit-bias (max 0.0 (min 1.0 (eu/num (:pit-bias m) (:pit-bias d))))
+     :seed (max 0 (long (eu/num (:seed m) (:seed d))))}))
+
+(defn- parse-lighting-cue [m]
+  (let [fixture (if-let [n (eu/ident (:fixture m))] (lighting-fixture-by-name n) :front-par)
+        color (let [c (:color m)] (if (nil? c) [1.0 1.0 1.0] (eu/vec3 c)))
+        intensity (max 0.0 (min 1.0 (eu/num (:intensity m) 0.8)))
+        bars (max 1 (long (eu/num (:bars m) 16)))
+        at-bar (max 0 (long (eu/num (:at-bar m) 0)))]
+    [{:fixture fixture :color color :intensity intensity :envelope (envelope-from-edn (:envelope m)) :bars bars}
+     at-bar]))
+
+(defn- parse-track [m id show-bpm beats-per-bar]
+  (let [bpm (let [b (eu/num (:bpm m))] (if (pos? b) b show-bpm))
+        length-beats (if-let [b (:beats m)]
+                       (max 0 (long (eu/num b (* 16 beats-per-bar))))
+                       (* (max 0 (long (eu/num (:bars m) 16))) beats-per-bar))
+        title (or (:title m) "")
+        dance (eu/ident (:dance m))
+        audio-pat (audio-from-edn (:audio m))
+        cues (mapv (fn [cm]
+                     {:at-beat (max 0 (long (eu/num (:beat cm) 0)))
+                      :kind (if-let [k (eu/ident (:kind cm))] (cue-kind-by-name k) :custom)
+                      :tag (or (:tag cm) "")})
+                   (or (:cues m) []))]
+    {:id id :title title :bpm bpm :length-beats length-beats :cues cues :dance dance :audio audio-pat}))
+
+;; ── top-level scene assembly ─────────────────────────────────────────────
+
+(defn from-root
+  "Parse a `DanceScene` from an already-read EDN root map."
+  [root]
+  (let [title (or (:game/title root) "KAMI VRM Dance")
+        show-map (:dance/show root)
+        bpm (let [b (eu/num (:bpm show-map))] (if (pos? b) b 128.0))
+        stage-p (stage-preset-by-name (or (eu/ident (:stage show-map)) "hall"))
+        swing (eu/num (:swing show-map) 0.0)
+        performer-name (or (:performer show-map) "Mitama")
+        [beats-per-bar bars-per-phrase]
+        (if-let [mtr (:meter show-map)]
+          [(max 1 (long (eu/num (nth mtr 0 4) 4))) (max 1 (long (eu/num (nth mtr 1 8) 8)))]
+          [4 8])
+        crowd-cfg (some-> (:dance/crowd root) parse-crowd)
+        builder (cond-> (show/builder)
+                  true (show/bpm bpm)
+                  true (show/stage-preset stage-p)
+                  true (show/performer-name performer-name)
+                  crowd-cfg (show/crowd-cfg crowd-cfg)
+                  true (show/swing swing)
+                  true (show/meter beats-per-bar bars-per-phrase))
+        builder (if-let [deck (parse-vj root)] (show/vj-deck builder deck) builder)
+        base-show (show/build builder)
+        base-show (reduce (fn [sh [cue at-bar]] (show/lighting-push sh cue at-bar))
+                           base-show
+                           (map parse-lighting-cue (or (:dance/lighting root) [])))
+        base-show (reduce (fn [sh [i tm]] (show/setlist-push sh (parse-track tm i bpm beats-per-bar)))
+                           base-show
+                           (map-indexed vector (or (:dance/setlist root) [])))
+        avatar-b (some-> (:dance/avatar root) parse-avatar)
+        avatar-b (merge (avatar/default-binding) avatar-b)
+        dir (director/from-root root)
+        live2d-b (some-> (:dance/live2d root) live2d/from-edn)
+        clips (vec (filter map? (or (:dance/clips root) [])))
+        post (vec (filter map? (or (:dance/post root) [])))
+        cam-default (camera/default-rig)
+        cam (if-let [cm (:dance/camera root)]
+              (let [shots (vec (sort-by :at-bar
+                                        (map (fn [sm]
+                                               (camera/shot (max 0 (long (eu/num (:at-bar sm) 0)))
+                                                            (or (eu/opt-vec3 (:offset sm)) (:offset cam-default))
+                                                            (or (eu/opt-vec3 (:look sm)) (:look cam-default))))
+                                             (or (:shots cm) []))))]
+                {:offset (or (eu/opt-vec3 (:offset cm)) (:offset cam-default))
+                 :look (or (eu/opt-vec3 (:look cm)) (:look cam-default))
+                 :fov (let [f (eu/num (:fov cm))] (if (pos? f) f (:fov cam-default)))
+                 :shots shots})
+              cam-default)
+        stage-props (vec (keep (fn [pm]
+                                  (when (map? pm)
+                                    (let [sz (eu/vec3 (:size pm))
+                                          col (:color pm)]
+                                      {:kind (or (eu/ident (:kind pm)) "prop")
+                                       :pos (or (eu/opt-vec3 (:pos pm)) [0.0 0.0 0.0])
+                                       :size [(if (pos? (nth sz 0)) (nth sz 0) 1.0)
+                                              (if (pos? (nth sz 1)) (nth sz 1) 1.0)]
+                                       :color (if (nil? col) [0.15 0.15 0.18] (eu/vec3 col))
+                                       :emissive (eu/num (:emissive pm) 0.0)})))
+                                (get-in root [:dance/stage :props] [])))]
+    {:title title :avatar avatar-b :show base-show :director dir :live2d live2d-b
+     :clips clips :post post :active-camera nil :camera cam :stage stage-props
+     :sound-bank (parse-sound-bank root)}))
+
+(defn from-edn
+  "Parse a `DanceScene` from EDN source. `nil` only when the top form isn't
+  a map; every field is otherwise tolerant with sensible defaults."
+  [src]
+  (when-let [root (eu/root-map src)]
+    (from-root root)))
+
+(defn clip-names
+  "The names of the authored animation clips (`:dance/clips ... :name`)."
+  [scene]
+  (vec (keep :name (:clips scene))))
+
+;; ── particle bursts for fired `:fx` reactions ───────────────────────────────
+
+(defn- burst [color count speed life gravity size pos]
+  {:pos pos :color color :count count :speed speed :life life :gravity gravity :size size})
+
+(defn- fx-particle-burst [fx pos]
+  (case fx
+    "confetti" (burst [1.0 0.6 0.2] 40.0 4.0 2.0 2.0 0.04 pos)
+    ("pyro" "fire" "flame") (burst [1.0 0.4 0.1] 36.0 7.0 1.4 -1.2 0.07 pos)
+    ("sparkle" "sparkles") (burst [1.0 1.0 0.6] 20.0 2.0 1.0 0.0 0.03 pos)
+    "sparkle-blast" (burst [1.0 1.0 0.8] 60.0 6.0 1.2 0.2 0.04 pos)
+    ("fireworks" "firework") (burst [0.6 0.8 1.0] 80.0 9.0 2.2 1.5 0.05 pos)
+    ("laser" "laser-burst") (burst [0.4 1.0 0.6] 24.0 14.0 0.7 0.0 0.02 pos)
+    ("smoke" "haze") (burst [0.6 0.6 0.66] 18.0 1.2 3.0 -0.6 0.18 pos)
+    "bubbles" (burst [0.6 0.85 1.0] 28.0 1.6 2.6 -0.8 0.06 pos)
+    "hearts" (burst [1.0 0.4 0.6] 16.0 1.8 2.4 -0.5 0.07 pos)
+    ("stars" "star-shower") (burst [1.0 0.95 0.7] 30.0 3.0 2.0 1.2 0.04 pos)
+    "snow" (burst [0.95 0.97 1.0] 40.0 0.8 4.0 0.4 0.05 pos)
+    ("petals" "sakura") (burst [1.0 0.7 0.8] 30.0 1.0 3.5 0.5 0.05 pos)
+    "glitter" (burst [1.0 0.9 0.5] 50.0 3.0 1.6 0.6 0.025 pos)
+    "embers" (burst [1.0 0.5 0.2] 26.0 2.4 2.8 -0.7 0.035 pos)
+    nil))
+
+;; ── per-frame tick ────────────────────────────────────────────────────────
+
+(defn frame
+  "Advance `scene` by `dt` seconds; returns `[scene' dance-frame]`. Ties
+  together the whole data path: `show/tick` -> `director/resolve-event` ->
+  `render/show->render-ir`."
+  [scene dt]
+  (let [[sh events] (show/tick (:show scene) dt)
+        scene (assoc scene :show sh)
+        audio-events (keep (fn [ev] (when (= :audio (:type ev)) (:cue ev))) events)
+        resolved (mapcat (fn [ev] (map (fn [t] [ev t]) (director/resolve-event (:director scene) ev))) events)
+        actions (mapv (fn [[_ t]] {:on (:on t) :actions (:actions t)}) resolved)
+        new-shot (some #(director/action % "camera") (map second resolved))
+        scene (if new-shot (assoc scene :active-camera new-shot) scene)
+        [sh2 snap] (show/snapshot (:show scene))
+        scene (assoc scene :show sh2)
+        bank (:sound-bank scene)
+        sounds (vec
+                (concat
+                 (keep (fn [cue]
+                         (case (:type cue)
+                           :drum (when-let [c (get bank (audio/bank-name (:slot cue)))]
+                                   (sound-cue->edn c (:at-time cue) (:velocity cue) nil))
+                           :note (when-let [c (get bank "bass")]
+                                   (sound-cue->edn c (:at-time cue) (:velocity cue) (audio/midi->hz (:midi cue))))
+                           :pad (when-let [c (get bank "pad")]
+                                  (sound-cue->edn c (:at-time cue) 1.0 (audio/midi->hz (first (:midis cue)))))
+                           nil))
+                       audio-events)
+                 (keep (fn [a] (when-let [nm (director/action a "sound")]
+                                 (when-let [c (get bank nm)]
+                                   (sound-cue->edn c (:time (:phase snap)) 1.0 nil))))
+                       actions)))
+        render-ir (render/show->render-ir snap (:avatar scene) (:camera scene) (:stage scene))
+        render-ir (cond-> render-ir
+                    (seq (:post scene)) (assoc :post (:post scene))
+                    (seq sounds) (assoc :sounds sounds)
+                    (:active-camera scene) (assoc :camera-shot (keyword (:active-camera scene))))
+        [px py pz] (:root-translation (:performer-pose snap))
+        bursts (vec (keep (fn [a] (when-let [fx (director/action a "fx")]
+                                     (fx-particle-burst fx [px (+ py 1.0) pz])))
+                           actions))
+        render-ir (cond-> render-ir (seq bursts) (assoc :particles bursts))
+        live2d-entry (when-let [l2 (:live2d scene)]
+                       (let [phase (beat/phase (get-in scene [:show :grid]))
+                             voice-mouth (when-let [v (:voice (:avatar scene))]
+                                           (let [beat (+ (:beat phase) (:beat-frac phase))]
+                                             (second (avatar/vowel-weight v beat))))]
+                         (live2d/render-entry l2 (live2d/drive l2 (:performer-pose snap) phase voice-mouth))))]
+    [scene {:render-ir render-ir :actions actions :live2d live2d-entry
+            :audio (vec audio-events) :sounds sounds}]))
+
+(defn render-ir-edn
+  "The frame's render-IR serialised to an EDN string (`pr-str` — the domain
+  reads/writes plain `clojure.edn` data, no custom writer needed)."
+  [dance-frame]
+  (pr-str (:render-ir dance-frame)))
+
+;; ── headless run (no renderer — golden-test / CLI basis) ────────────────────
+
+(defn run-headless
+  "Drive `scene` for `frames` ticks at `fps` with no renderer. Starts the
+  show, accumulates fired `:fx` reactions, keeps the last frame's render-IR.
+  Deterministic: same scene + args -> same report."
+  [scene frames fps]
+  (let [dt (/ 1.0 (max 1.0 fps))
+        scene (update scene :show show/start)]
+    (loop [i 0 scene scene fx-counts {} total-actions 0 last-frame nil]
+      (if (>= i frames)
+        (let [phase (beat/phase (get-in scene [:show :grid]))]
+          {:frames frames :total-actions total-actions :fx-counts fx-counts
+           :final-render-ir (:render-ir last-frame) :final-beat (:beat phase) :final-bar (:bar phase)
+           :mesh-count (count (get-in last-frame [:render-ir :meshes]))
+           :live2d-params (count (get-in last-frame [:live2d :params]))})
+        (let [[scene' fr] (frame scene dt)
+              fx-counts' (reduce (fn [m a] (if-let [fx (director/action a "fx")] (update m fx (fnil inc 0)) m))
+                                  fx-counts (:actions fr))]
+          (recur (inc i) scene' fx-counts' (+ total-actions (count (:actions fr))) fr))))))

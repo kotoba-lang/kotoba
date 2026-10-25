@@ -1,0 +1,114 @@
+(ns repair-shiropico
+  "Bring every stored object back to full redundancy.
+
+  This supersedes a separate verify pass rather than complementing it:
+  `repair-object!>` reads, checks the reconstruction against the receipt's
+  digest, and only then writes back — so a clean repair run IS a verification,
+  and a verification that did not repair would leave the fleet exactly as
+  degraded as it found it.
+
+  Reports absent and unreachable separately for every object, because that is
+  the difference between a disk that lost data and a network that dropped a
+  fetch, and only one of them means anything about durability."
+  (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            [kotoba.lang.text :as str]
+            [erasure.lrc :as lrc]
+            [kura.manifest :as manifest]
+            [kura.node.crypto-noble :as nc]
+            [kura.node.http-fetch :as hf]
+            [kura.node.http-node :as hn]
+            [kura.node.object :as obj]
+            [kura.node.s3-async :as s3a]
+            [kura.node.store :as store]
+            [kura.placement :as pl]))
+
+(def layout (lrc/layout {:k 16 :r 4 :g 12}))
+(defn- env [k] (aget (.-env js/process) k))
+(defn- digest [b] (-> (.createHash crypto "sha256") (.update b) (.digest "hex")))
+(defn- object-id [k] (str "shiropico_" (str/replace k "/" "_")))
+
+(defn- fleet> []
+  (let [http (hf/fetch-http)
+        b2 (s3a/open {:node-id "b2" :http http :crypto (nc/noble-crypto)
+                      :key-id (env "B2_KEY_ID") :secret (env "B2_APP_KEY")
+                      :endpoint "https://s3.us-west-004.backblazeb2.com"
+                      :host "s3.us-west-004.backblazeb2.com" :bucket "kura-phase0-b2"
+                      :region "us-west-004" :prefix "kura" :now-fn hf/now-iso
+                      :independence :shared-provider :availability :always-on
+                      :failure-domain {:provider "backblaze-b2" :account "kura-phase0"}})]
+    (-> (js/Promise.all
+         (clj->js (map (fn [[nm base hdrs]]
+                         (-> (hn/descriptor> http base hdrs)
+                             (.then (fn [d] [nm (hn/open {:http http :base base
+                                                          :descriptor d :headers hdrs})]))))
+                       [["judah" "http://100.113.200.45:8410" {}]
+                        ["air-ssd" "http://127.0.0.1:8411" {}]
+                        ["gad" "http://100.82.98.110:8410" {}]
+                        ["r2" "https://kura-r2-node.04-feasts-minded.workers.dev"
+                         {"authorization" (str "Bearer " (env "KURA_NODE_TOKEN"))}]])))
+        (.then (fn [pairs] (into {"b2" b2} (vec pairs)))))))
+
+(defn- assign [stores]
+  (let [tol (lrc/max-tolerated-erasures layout)
+        domain-of (fn [s] (let [d (store/-descriptor s)]
+                            (str/join "/" (map str (vals (:failure-domain d))))))
+        domains (into #{} (map (fn [[_ s]] (domain-of s))) stores)
+        cap (js/Math.ceil (/ (:n layout) (count domains)))
+        slots (vec (for [[nm s] stores i (range (:n layout))]
+                     (pl/node {:id (str nm "#" i)
+                               :availability (:availability (store/-descriptor s))
+                               :domains {:site (domain-of s)}})))
+        picked (:nodes (pl/select "pg-shiropico" slots (:n layout)
+                                  (pl/policy {:caps {:site cap} :max-intermittent tol})))]
+    (mapv (fn [n] (get stores (first (str/split (:id n) #"#")))) picked)))
+
+(defn -main []
+  (let [receipts (js->clj (js/JSON.parse (.readFileSync fs "/tmp/shiropico-receipts.json" "utf8"))
+                          :keywordize-keys true)]
+    (println "objects:" (count receipts))
+    (println "degraded at write:" (count (filter :degraded? receipts)))
+    (println)
+    (-> (fleet>)
+        (.then (fn [stores]
+                 (let [ring (assign stores)
+                       store-for (fn [_s i] (nth ring i))]
+                   (reduce
+                    (fn [p {:keys [key size stripe-bytes digest]}]
+                      (.then p (fn [acc]
+                        (let [plan (manifest/plan {:object-id (object-id key)
+                                                   :size size :stripe-bytes stripe-bytes}
+                                                  layout)]
+                          (-> (obj/repair-object!> {:plan plan :store-for store-for
+                                                    :digest repair-shiropico/digest
+                                                    :expect-digest digest})
+                              (.then (fn [r]
+                                       (when (pos? (:was-missing r))
+                                         (println (str "  " key ": rebuilt " (:rewritten r)
+                                                       " of " (:was-missing r)
+                                                       (when (pos? (:still-failing r))
+                                                         (str ", " (:still-failing r) " still failing"))
+                                                       " (unreachable on read " (:unreachable-on-read r) ")")))
+                                       (-> acc
+                                           (update :ok inc)
+                                           (update :rebuilt + (:rewritten r))
+                                           (update :was-missing + (:was-missing r))
+                                           (update :still-failing + (:still-failing r))
+                                           (update :unreachable + (:unreachable-on-read r)))))
+                              (.catch (fn [e]
+                                        (println "  FAIL" key "-" (.-message e))
+                                        (update acc :failed inc))))))))
+                    (js/Promise.resolve {:ok 0 :failed 0 :rebuilt 0 :was-missing 0
+                                         :still-failing 0 :unreachable 0})
+                    receipts))))
+        (.then (fn [r]
+                 (println)
+                 (println "verified+repaired:" (:ok r) "· failed" (:failed r))
+                 (println "shards rebuilt   :" (:rebuilt r) "of" (:was-missing r) "not in hand")
+                 (println "still failing    :" (:still-failing r))
+                 (println "unreachable reads:" (:unreachable r)
+                          "(transport, not loss)")
+                 (when (pos? (:failed r)) (set! (.-exitCode js/process) 1))))
+        (.catch (fn [e] (println "FATAL" (.-message e)) (set! (.-exitCode js/process) 1))))))
+
+(-main)

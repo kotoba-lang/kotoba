@@ -1,0 +1,223 @@
+(ns kekkai.cli.main
+  "Argument parsing and dispatch.
+
+  Hand-rolled rather than pulled from a library because the surface is small
+  and the alternative is a dependency this repository would carry for one
+  function. The rule it follows: **everything after the subcommand's own
+  arguments is passed through untouched**, which is what lets `kekkai ssh judah
+  -A -L 8080:localhost:80` mean what an ssh user expects."
+  (:require [kotoba.lang.text :as str]
+            [kekkai.cli.commands :as commands]
+            [kekkai.cli.desired :as desired]
+            [kekkai.cli.publish :as publish]
+            [kekkai.cli.ssh :as ssh]))
+
+(def usage
+  "kekkai — a zero-trust mesh you can drive from a shell
+
+USAGE
+  kekkai ssh <node> [--user U] [ssh args…]
+                                    open a session over the overlay
+  kekkai up [--forward L:NODE:R]… [--verbose]
+                                    run this node; keep forwards open
+  kekkai status                     peers, sessions, paths
+  kekkai relay --tailnet T --version N
+                                    run a relay (put it where peers can reach it)
+
+  kekkai keygen [--node-id ID] [--out FILE]
+  kekkai keygen authority [--out FILE]
+  kekkai netmap publish --plane FILE --authority FILE [--out DIR] [--node ID]
+  kekkai netmap verify <file> --authority SPKI_B64
+  kekkai desired publish --input FILE --authority FILE --roots A,B [--min-copies N]
+  kekkai desired pull --subject ID --authority FILE_OR_SPKI --roots A,B [--kind K]
+
+COMMON OPTIONS
+  --config FILE     node config (default ./kekkai-node.edn, then ~/.kekkai/node.edn)
+  --port N, -p N    remote port for ssh (default 22)
+
+The netmap decides reachability. Nothing here can grant what it does not.")
+
+(defn- flag
+  "-> the value after `name`, or nil. Flags are removed from `args` by
+   `strip-flags`; both walk the same list so they cannot disagree."
+  [args name]
+  (second (drop-while #(not= name %) args)))
+
+(defn- flag? [args name] (boolean (some #{name} args)))
+
+(defn- collect
+  "Every value following each occurrence of `name` — for repeatable flags."
+  [args name]
+  (loop [xs args out []]
+    (if-let [rest* (seq (drop-while #(not= name %) xs))]
+      (recur (drop 2 rest*) (conj out (second rest*)))
+      out)))
+
+(defn- strip-flags
+  "Positional arguments only: drop every `--flag value` pair and bare `--flag`."
+  [args flags-with-values]
+  (loop [xs args out []]
+    (if (empty? xs)
+      out
+      (let [x (first xs)]
+        (cond
+          (contains? flags-with-values x) (recur (drop 2 xs) out)
+          (str/starts-with? (str x) "--") (recur (rest xs) out)
+          :else (recur (rest xs) (conj out x)))))))
+
+(defn- parse-ssh-port [option value]
+  (let [port (when (re-matches #"[0-9]+" (str value))
+               (parse-long value))]
+    (when-not (and port (<= 1 port 65535))
+      (throw (ex-info (str option " expects a port from 1 to 65535")
+                      {:type :kekkai/invalid-ssh-port
+                       :exit-code 64
+                       :option option
+                       :value value})))
+    port))
+
+(defn parse-ssh-options
+  "Split Kekkai's leading flags from the OpenSSH argument vector.
+
+  Kekkai owns `--config`, `--port`, and `--user`; OpenSSH `-p` is an alias for
+  the remote port carried by the overlay. OpenSSH owns the remaining flags and
+  everything from its destination or remote command onward. Keeping the
+  boundary here prevents Kekkai-only options from leaking into `ssh`, and
+  preserves option values such as `-o BatchMode=yes` as a pair."
+  [args]
+  (loop [xs (seq args)
+         result {:config-file nil :port nil :login nil :ssh-args []}]
+    (if-not xs
+      result
+      (let [arg (first xs)
+            value (second xs)]
+        (cond
+          (contains? #{"--config" "--port" "--user" "-p"} arg)
+          (if value
+            (recur (nnext xs)
+                   (case arg
+                     "--config" (assoc result :config-file value)
+                     ("--port" "-p") (assoc result :port
+                                               (parse-ssh-port arg value))
+                     "--user" (assoc result :login value)))
+            (throw (ex-info (str arg " needs a value")
+                            {:type :kekkai/missing-option-value
+                             :exit-code 64
+                             :option arg})))
+
+          (contains? ssh/ssh-options-taking-a-value arg)
+          (if value
+            (recur (nnext xs) (update result :ssh-args into [arg value]))
+            (recur nil (update result :ssh-args conj arg)))
+
+          (str/starts-with? (str arg) "-")
+          (recur (next xs) (update result :ssh-args conj arg))
+
+          :else
+          (update result :ssh-args into xs))))))
+
+(def value-flags
+  #{"--config" "--port" "--out" "--node-id" "--node" "--plane" "--authority"
+    "--forward" "--tailnet" "--version" "--host" "--user" "--input" "--roots"
+    "--min-copies" "--subject" "--min-epoch" "--kind"})
+
+(defn- die [msg code]
+  (println (str "kekkai: " msg))
+  (.exit js/process code))
+
+(defn dispatch [args]
+  (let [[cmd & rest*] args
+        positional (strip-flags (vec rest*) value-flags)]
+    (case cmd
+      ("ssh")
+      (let [node (first positional)]
+        (when-not node (die "kekkai ssh needs a node id" 64))
+        ;; Consume Kekkai's leading flags; the remaining SSH options and
+        ;; destination/command belong to OpenSSH.
+        (ssh/run (assoc (parse-ssh-options (rest rest*)) :node node)))
+
+      ("up")
+      (commands/up {:config-file (flag rest* "--config")
+                    :forwards (collect rest* "--forward")
+                    :verbose? (flag? rest* "--verbose")})
+
+      ("status")
+      (commands/status {:config-file (flag rest* "--config")})
+
+      ("relay")
+      (let [tailnet (flag rest* "--tailnet")
+            version (some-> (flag rest* "--version") parse-long)]
+        (when-not (and tailnet version)
+          (die (str "kekkai relay needs --tailnet and --version: the relay "
+                    "handshake is bound to the same prologue the netmap "
+                    "defines, so a mismatch has to fail loudly") 64))
+        (commands/relay {:port (some-> (flag rest* "--port") parse-long)
+                         :host (flag rest* "--host")
+                         :static-file (or (flag rest* "--config")
+                                          "kekkai-node.edn")
+                         :tailnet tailnet :version version}))
+
+      ("keygen")
+      (commands/keygen {:kind (if (= "authority" (first positional))
+                                :authority :node)
+                        :node-id (flag rest* "--node-id")
+                        :out (flag rest* "--out")})
+
+      ("netmap")
+      (case (first positional)
+        "publish"
+        (let [plane (flag rest* "--plane")
+              authority (flag rest* "--authority")]
+          (when-not (and plane authority)
+            (die "kekkai netmap publish needs --plane and --authority" 64))
+          (publish/run {:plane-file plane
+                        :authority-file authority
+                        :out-dir (or (flag rest* "--out") ".")
+                        :only (flag rest* "--node")}))
+
+        "verify"
+        (let [file (second positional)
+              authority (flag rest* "--authority")]
+          (when-not file (die "kekkai netmap verify needs a file" 64))
+          (when-not authority
+            (die (str "kekkai netmap verify needs --authority <spki-b64>. It is "
+                      "not read from the envelope on purpose: an envelope "
+                      "carrying the only copy of its signer's key would "
+                      "authenticate itself.") 64))
+          (commands/verify {:netmap-file file :authority authority}))
+
+        (die "kekkai netmap: expected `publish` or `verify`" 64))
+
+      ("desired")
+      (case (first positional)
+        "publish"
+        (let [input (flag rest* "--input") authority (flag rest* "--authority")
+              roots (flag rest* "--roots")]
+          (when-not (and input authority roots)
+            (die "kekkai desired publish needs --input, --authority, and --roots" 64))
+          (desired/publish-command
+           {:input input :authority-file authority :roots-csv roots
+            :min-copies (some-> (flag rest* "--min-copies") parse-long)}))
+
+        "pull"
+        (let [subject (flag rest* "--subject") authority (flag rest* "--authority")
+              roots (flag rest* "--roots")]
+          (when-not (and subject authority roots)
+            (die "kekkai desired pull needs --subject, --authority, and --roots" 64))
+          (desired/pull-command
+           {:subject subject :authority-value authority :roots-csv roots
+            :min-epoch (some-> (flag rest* "--min-epoch") parse-long)
+            :kind (flag rest* "--kind")}))
+
+        (die "kekkai desired: expected `publish` or `pull`" 64))
+
+      ("help" "--help" "-h" nil) (println usage)
+
+      (die (str "unknown command '" cmd "'\n\n" usage) 64))))
+
+(defn -main [& args]
+  (try
+    (dispatch (vec args))
+    (catch :default e
+      (println (str "kekkai: " (or (ex-message e) (str e))))
+      (.exit js/process (or (:exit-code (ex-data e)) 70)))))

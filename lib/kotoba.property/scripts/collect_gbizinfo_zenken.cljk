@@ -1,0 +1,276 @@
+(ns collect-gbizinfo-zenken
+  "gBizINFO 全件データを落として、corpus と committed projection を作る。
+
+   ## 形は国税庁の全件と同じ（ADR-2608181000）
+
+   corpus（約 103 万行）は git に入れない —— cache に置く。commit するのは、
+   **面が既に持っている法人番号に一致した行だけ**の projection。選んだ番号の集合
+   そのものが「我々が関心を持つ会社」なので、国税庁の projection と同じく private
+   repo に置く。
+
+   ## トークン
+
+   API と同じ token を bulk も要求する。無いときは **exit 3** で、なぜ走れないかを
+   印字する —— 0 で終われば「引いた結果 0 件」と区別がつかない
+   （`gbizinfo_refresh.cljs` と同じ規律）。
+
+     security add-generic-password -s gbizinfo-api-token -a $USER -w '<token>'
+     または export GBIZINFO_TOKEN=...
+
+   ## 失敗が 200 で返ることに注意
+
+   token 無しの POST は **200 と HTML** を返す（実測 2026-08-19）。だから
+   status code ではなく **Content-Disposition の filename** と ZIP magic を見る。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_gbizinfo_zenken.cljk
+       --numbers <file of 13-digit numbers>
+       --out <repo>/data/gbizinfo-joined.datoms.edn
+       [--sections subsidy,procurement,certification,finance,commendation]
+       [--cache <dir>] [--keep-zip]"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.gbizinfo-zenken :as gz]
+            ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def argv (vec (drop 2 (js->clj js/process.argv))))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- flag? [n] (boolean (some #(= n %) argv)))
+
+(def cache-dir (arg "--cache" (.join path (or (.-HOME js/process.env) "/tmp") ".cache" "gbizinfo")))
+
+(defn- die [code msg] (println msg) (js/process.exit code))
+
+(defn- token []
+  (or (.. js/process -env -GBIZINFO_TOKEN)
+      (.. js/process -env -GBIZ_TOKEN)
+      (let [r (.spawnSync cp "security"
+                          #js ["find-generic-password" "-s" "gbizinfo-api-token" "-w"]
+                          #js {:encoding "utf8"})]
+        (when (zero? (or (.-status r) 1))
+          (str/trim (str (.-stdout r)))))))
+
+(defn- sh [args]
+  (let [r (.spawnSync cp (first args) (clj->js (rest args))
+                      #js {:encoding "utf8" :maxBuffer (* 512 1024 1024)})]
+    {:exit (or (.-status r) 1) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+(defn- sha256-file [p]
+  (let [h (.createHash crypto "sha256")]
+    (.update h (.readFileSync fs p))
+    (.digest h "hex")))
+
+;; ── download ──────────────────────────────────────────────────────────────
+
+(defn- download! [tok section]
+  (let [zip (.join path cache-dir (str (:downfile section) ".zip"))
+        cookie (.join path cache-dir "session.txt")
+        page (.join path cache-dir "page.html")]
+    (.mkdirSync fs cache-dir #js {:recursive true})
+    ;; セッションはダウンロードごとに取り直す。使い回すと 2 本目以降が静かに
+    ;; HTML を返す（同じ jsessionid で連続 POST すると弾かれる、実測 2026-08-19）。
+    (sh ["curl" "-s" "-c" cookie "-o" page "-A" "Mozilla/5.0" gz/download-page])
+    (let [html (.readFileSync fs page "utf8")
+          sid (second (re-find #"jsessionid=([A-F0-9]+)" html))
+          hdr (.join path cache-dir "headers.txt")
+          r (sh ["curl" "-s" "-b" cookie "-o" zip "-D" hdr "-A" "Mozilla/5.0"
+                 "-X" "POST" (str gz/download-endpoint ";jsessionid=" sid)
+                 "--data-urlencode" (str "downfile=" (:downfile section))
+                 "--data-urlencode" "meta="
+                 "--data-urlencode" "downenc=UTF-8"
+                 "--data-urlencode" (str "apiToken=" tok)
+                 "--data-urlencode" "downtype=zip"
+                 "--data-urlencode" "isZip=on"])
+          headers (if (.existsSync fs hdr) (.readFileSync fs hdr "utf8") "")
+          fname (second (re-find #"filename=\"([^\"]+)\"" headers))]
+      (when (pos? (:exit r)) (die 1 (str "curl failed: " (:err r))))
+      ;; status ではなく filename と ZIP magic を見る（失敗が 200 で返るため）。
+      (when-not fname
+        (die 3 (str "no attachment for " (:label section)
+                    " — the server answered a page, which is what it does when the "
+                    "token is missing or rejected. Nothing was written.")))
+      (let [head (.readFileSync fs zip)]
+        (when-not (and (> (.-length head) 1)
+                       (= 0x50 (aget head 0)) (= 0x4b (aget head 1)))
+          (die 1 (str "not a zip: " fname))))
+      {:zip zip :filename fname :sha256 (sha256-file zip)})))
+
+(defn- unzip-csv! [zip]
+  (let [dir (str zip ".d")]
+    (sh ["rm" "-rf" dir])
+    (.mkdirSync fs dir #js {:recursive true})
+    (sh ["unzip" "-o" "-q" zip "-d" dir])
+    (let [f (first (filter #(str/ends-with? % ".csv") (js->clj (.readdirSync fs dir))))]
+      (when-not f (die 1 (str "no csv inside " zip)))
+      (.join path dir f))))
+
+;; ── csv ───────────────────────────────────────────────────────────────────
+
+(defn split-csv-line
+  "RFC4180 の 1 行を分解する。gBizINFO の値には引用符入りのカンマがある。"
+  [line]
+  (loop [i 0 cur "" acc [] q? false]
+    (if (>= i (count line))
+      (conj acc cur)
+      (let [c (nth line i)]
+        (cond
+          (and q? (= c \") (= (get line (inc i)) \")) (recur (+ i 2) (str cur \") acc true)
+          (= c \") (recur (inc i) cur acc (not q?))
+          (and (= c \,) (not q?)) (recur (inc i) "" (conj acc cur) false)
+          :else (recur (inc i) (str cur c) acc q?))))))
+
+(defn- strip-bom [s] (str/replace s #"﻿" ""))
+
+;; ── main ──────────────────────────────────────────────────────────────────
+
+(def out (arg "--out" nil))
+(def numbers-file (arg "--numbers" nil))
+(def wanted-sections
+  (let [ks (set (map keyword (str/split (arg "--sections" "subsidy,procurement,certification,finance,commendation") #",")))]
+    (filterv #(ks (:key %)) gz/sections)))
+
+(when (or (str/blank? (str out)) (str/blank? (str numbers-file)))
+  (die 2 "usage: collect_gbizinfo_zenken.cljs --numbers <file> --out <file> [--sections a,b] [--cache dir]"))
+
+(def tok (token))
+(when (str/blank? (str tok))
+  (die 3 (str "no gBizINFO token — refusing to run and refusing to exit 0.\n"
+              "  security add-generic-password -s gbizinfo-api-token -a $USER -w '<token>'\n"
+              "  or export GBIZINFO_TOKEN=...\n"
+              "  申請: https://content.info.gbiz.go.jp/api/index.html")))
+
+(def wanted
+  (let [ns (->> (str/split-lines (.readFileSync fs numbers-file "utf8"))
+                (map str/trim) (filter gz/houjin-bangou?) set)]
+    (when (empty? ns) (die 2 (str "no 13-digit numbers in " numbers-file)))
+    ns))
+
+(println (str "gbizinfo-zenken " (.toISOString (js/Date.))))
+(println (str "  wanted 法人番号: " (count wanted)))
+
+(def observed-at (.toISOString (js/Date.)))
+
+(def results
+  (vec (for [section wanted-sections]
+         (let [{:keys [zip filename sha256]} (download! tok section)
+               csv (unzip-csv! zip)
+               lines (str/split-lines (strip-bom (.readFileSync fs csv "utf8")))
+               header (split-csv-line (first lines))
+               rows (rest lines)
+               matched (->> rows
+                            (keep (fn [l]
+                                    (let [cells (split-csv-line l)]
+                                      (when (= (count cells) (count header))
+                                        (let [m (zipmap header cells)]
+                                          (when (wanted (str/trim (str (get m "法人番号"))))
+                                            (gz/row->record (:key section) m)))))))
+                            vec)]
+           (println (str "  " (:label section) ": " (count rows) " rows -> "
+                         (count matched) " matched, "
+                         (count (distinct (map :company/houjin-bangou matched))) " companies"
+                         "  [" filename "]"))
+           ;; corpus をどこかに残すなら、消す前にそこへ置く。`--archive-to <dir>` は
+           ;; `<dir>/<配布ファイル名>` に zip をそのまま置く —— 配布名が publish の
+           ;; 日付を持っているので、あとから「いつの版か」を receipt 無しで言える。
+           (when-let [ar (arg "--archive-to" nil)]
+             (.mkdirSync fs ar #js {:recursive true})
+             (sh ["cp" zip (.join path ar filename)]))
+           (when-not (flag? "--keep-zip") (sh ["rm" "-rf" zip (str zip ".d")]))
+           {:section section :rows (count rows) :matched matched
+            ;; manifest は**畳んだ後**に作る（下記）。ここでは材料だけ返す ——
+            ;; 「このファイルに書いた件数」は、government を畳んでからでないと出ない。
+            :manifest-input {:section section :rows (count rows)
+                             :matched (count matched)
+                             :companies (count (distinct (map :company/houjin-bangou matched)))
+                             :observed-at observed-at
+                             :content-sha256 sha256
+                             :publish filename}}))))
+
+(def all-records (into [] (mapcat :matched) results))
+
+;; ── 列挙する行と、集計に畳む行を分ける ───────────────────────────────────
+;;
+;; 実測 2026-08-19: 面の 9,142 番号に一致した 125,820 行のうち **125,144 行
+;; (99.5%) は国税庁 government tier の団体**（交付金を受ける自治体）で、
+;; 我々が追っている会社の行は 676 しかない。全部を列挙すると 45 MB になり、
+;; 面は**クエリのたびに**それを DataScript へ load する。
+;;
+;; だから government は 1 団体 1 entity の集計に畳む。捨てるのではない ——
+;; 行は corpus に在り、`--summarise` を外せばいつでも列挙できる。
+(def summarise
+  (let [f (arg "--summarise" nil)]
+    (if (and f (.existsSync fs f))
+      (->> (str/split-lines (.readFileSync fs f "utf8"))
+           (map str/trim) (filter gz/houjin-bangou?) set)
+      #{})))
+
+(defn- summarise-company [[hb rows]]
+  (reduce (fn [acc [aspect rs]]
+            (let [amounts (keep #(when (number? (:grant/amount-yen %)) (:grant/amount-yen %)) rs)]
+              (cond-> (assoc acc (keyword "grant" (str (name aspect) "-count")) (count rs))
+                (seq amounts)
+                (assoc (keyword "grant" (str (name aspect) "-amount-total"))
+                       (reduce + amounts)))))
+          {:company/houjin-bangou hb
+           :company/registration-no hb
+           :company/jurisdiction "JP"
+           :company/legal-name (some :company/legal-name rows)
+           :grant/summary? true
+           :source/dataset gz/dataset
+           :source/authority gz/authority-id}
+          (group-by :grant/kind rows)))
+
+(def enumerated (vec (remove #(summarise (:company/houjin-bangou %)) all-records)))
+(def summarised
+  (->> all-records
+       (filter #(summarise (:company/houjin-bangou %)))
+       (group-by :company/houjin-bangou)
+       (mapv summarise-company)))
+
+(def records enumerated)
+
+;; ⚠ **`:corpus/record-count` は「このファイルに書いた件数」**。以前は読んだ元
+;; ファイルの行数を入れており、同じ key が dataset によって別のものを指していた
+;; （実測 2026-08-20: 合計すると 1,035,804、ファイルの実体は 3,034）。
+;; section ごとの件数は `:grant/kind` で数える（記録は section を kind として持つ）。
+(def per-section-records
+  (frequencies (keep :grant/kind enumerated)))
+
+(def manifests
+  (mapv (fn [{:keys [manifest-input]}]
+          (gz/manifest (assoc manifest-input
+                              :records (get per-section-records
+                                            (:key (:section manifest-input)) 0))))
+        results))
+
+;; 1 行 1 entity（面のローダが読む形）。
+(.mkdirSync fs (.dirname path out) #js {:recursive true})
+(.writeFileSync fs out (str/join "\n" (map pr-str (concat manifests enumerated))))
+
+(when-let [sout (arg "--summary-out" nil)]
+  ;; 畳んだ結果が空なのに黙って戻ると、**前回のファイルがそのまま残る** ——
+  ;; 古い集計が今回の結果として読まれる。書かない理由をここで言う。
+  (if-not (seq summarised)
+    (println (str "  WARNING no summaries folded — leaving " sout " untouched"
+                  " (the file on disk is from an earlier pass, not from this one)"))
+    (let [folded (- (count all-records) (count enumerated))
+          smanifest (gz/summary-manifest
+                     {:summaries (count summarised)
+                      :folded-rows folded
+                      :companies (count (distinct (map :company/houjin-bangou summarised)))
+                      :sections (mapv :corpus/section manifests)
+                      :observed-at observed-at
+                      :publishes (mapv :source/publish manifests)
+                      :joined-file (.basename path out)})]
+      (.mkdirSync fs (.dirname path sout) #js {:recursive true})
+      (.writeFileSync fs sout (str/join "\n" (map pr-str (cons smanifest summarised))))
+      (println (str "  wrote " (count summarised) " summaries + 1 manifest (folded from "
+                    folded " rows) -> " sout)))))
+
+(println (str "  wrote " (count enumerated) " records + " (count manifests)
+              " manifest(s) -> " out))
+(when (zero? (count records))
+  (die 1 "0 records matched — a pass that matches nothing is a failure, not an empty day"))
+(println "gbizinfo-zenken done")

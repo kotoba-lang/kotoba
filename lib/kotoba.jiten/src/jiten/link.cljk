@@ -1,0 +1,227 @@
+(ns jiten.link
+  "Cross-references between entries, as data rather than markup.
+
+   A wikilink in Wikipedia is a piece of syntax inside prose (`[[Target]]`) that
+   a parser has to recover. Here a link is a value with a declared kind, so
+   'what does this entry point at, and why' is a query rather than a regex.
+   Statements may also carry `:jiten.statement/links`, which are the inline
+   mentions; those resolve through the same index and are reported the same way.
+
+   Three outcomes matter and they are deliberately not the same severity:
+
+     * resolved  -- the target exists in the corpus.
+     * RED LINK  -- the target does not exist yet. `:warn`, never an error. A red
+                    link is how an encyclopedia states what it is missing; making
+                    it fatal would force writers to either stub everything or
+                    stop cross-referencing, and both are worse than the gap.
+     * ALIEN     -- the link target is not an entry-id keyword at all. `:error`,
+                    because that is a typo or a category mistake, not a gap.
+
+   `:part-of` is checked for cycles. A subject that is part of a subject that is
+   part of the first one is not a hierarchy, and an index built by walking it
+   would not terminate."
+  (:require [kotoba.lang.text :as str]))
+
+(def link-kinds
+  "Each entry states what `from -> to` means, so a reader never has to guess.
+   Directionality is fixed per kind and reads left to right."
+  {:see-also       {:doc "from suggests to as related reading. Carries no claim about the relation."}
+   :part-of        {:doc "from's subject is a part or sub-topic of to's subject. Acyclic."
+                    :acyclic? true}
+   :translation-of {:doc "from is the same subject as to, written in another language. Must differ in :jiten.entry/lang and agree on :jiten.entry/subject."}
+   :disambiguates  {:doc "from (a :disambiguation entry) offers to as one reading of its title."}
+   :supersedes     {:doc "from replaces to, which is kept for the record. to should say so."}})
+
+(defn- problem [severity code msg data]
+  (merge {:jiten/severity severity :jiten/code code :jiten/message msg} data))
+
+(defn- blank? [s] (or (nil? s) (and (string? s) (str/blank? s))))
+
+(defn declared-links
+  "The explicit `:jiten.entry/links` of one entry, normalised to
+   `{:from :to :kind :note}` maps."
+  [{:jiten.entry/keys [id links]}]
+  (vec (for [l links]
+         {:jiten.link/from id
+          :jiten.link/to   (:jiten.link/to l)
+          :jiten.link/kind (:jiten.link/kind l)
+          :jiten.link/note (:jiten.link/note l)})))
+
+(defn inline-links
+  "The mentions carried by statements, as links of kind `:see-also`. They are
+   reported separately from declared links because a mention is a weaker act
+   than a stated relation, and `statement` is kept so a broken mention can be
+   traced to the sentence that made it."
+  [{:jiten.entry/keys [id body]}]
+  (vec (for [sec (filter map? body)
+             s (:jiten.section/statements sec)
+             t (:jiten.statement/links s)]
+         {:jiten.link/from      id
+          :jiten.link/to        t
+          :jiten.link/kind      :see-also
+          :jiten.link/inline?   true
+          :jiten.link/statement (:jiten.statement/id s)})))
+
+(defn all-links
+  "Declared plus inline links across a collection of entries."
+  [entries]
+  (into (vec (mapcat declared-links entries))
+        (mapcat inline-links entries)))
+
+(defn index
+  "`{:ids #{} :by-id {} :links [] :out {id [links]} :in {id [links]}}`.
+
+   Built once and passed to the query fns below so a corpus of any size is
+   walked once rather than per question."
+  [entries]
+  (let [by-id (into {} (map (juxt :jiten.entry/id identity)) entries)
+        links (all-links entries)]
+    {:ids   (set (keys by-id))
+     :by-id by-id
+     :links links
+     :out   (group-by :jiten.link/from links)
+     :in    (group-by :jiten.link/to links)}))
+
+(defn red-links
+  "Links whose target is a well-formed entry id that is not in the corpus.
+   These are the gaps, and they are the most useful thing an encyclopedia can
+   tell you about itself: every one is a specific entry a specific writer
+   already believed should exist."
+  [{:keys [ids links]}]
+  (vec (for [l links
+             :when (and (keyword? (:jiten.link/to l))
+                        (not (contains? ids (:jiten.link/to l))))]
+         l)))
+
+(defn missing-targets
+  "Red links collapsed to the distinct targets, most-referenced first. This is
+   the work queue: the target six entries already point at is more worth writing
+   than the one only mentioned once."
+  [idx]
+  (->> (red-links idx)
+       (group-by :jiten.link/to)
+       (map (fn [[target ls]]
+              {:jiten.link/to target
+               :jiten/referenced-by (count ls)
+               :jiten/from (vec (sort (map :jiten.link/from ls)))}))
+       (sort-by (juxt (comp - :jiten/referenced-by) (comp str :jiten.link/to)))
+       vec))
+
+(defn backlinks
+  "Entries pointing at `id`."
+  [{:keys [in]} id]
+  (vec (sort (distinct (map :jiten.link/from (get in id))))))
+
+(defn orphans
+  "Entries nothing points at. Not an error -- a new entry is an orphan until
+   something mentions it -- but an orphan that stays one is unreachable by
+   browsing, which for an encyclopedia is close to not existing."
+  [{:keys [ids in]}]
+  (vec (sort (remove #(seq (get in %)) ids))))
+
+(defn- cycles-from
+  "Depth-first walk of one kind of edge from `start`, returning the cycle path
+   if the walk returns to a node already on the current path. Iterative so a
+   deep hierarchy does not blow the stack."
+  [adj start]
+  (loop [stack [[start [start]]]
+         seen #{}]
+    (when-let [[node path] (peek stack)]
+      (let [rest-stack (pop stack)
+            nexts (get adj node)]
+        (if-let [hit (first (filter (set (butlast path)) nexts))]
+          (conj (vec path) hit)
+          (recur (into rest-stack
+                       (for [n nexts :when (not (seen n))]
+                         [n (conj path n)]))
+                 (conj seen node)))))))
+
+(defn part-of-cycles
+  "Cycles in the `:part-of` graph, as paths. Empty when the hierarchy is sane.
+
+   Deduplicated by the SET of nodes involved, not by the path. Walking a
+   three-node cycle from each of its three members finds the same cycle three
+   times with different starting points, and reporting one problem as three
+   would make a fixed hierarchy look like it still had two faults left."
+  [{:keys [links]}]
+  (let [adj (reduce (fn [m {:jiten.link/keys [from to kind]}]
+                      (if (= :part-of kind) (update m from (fnil conj []) to) m))
+                    {} links)]
+    (->> (sort-by str (keys adj))
+         (keep #(cycles-from adj %))
+         (reduce (fn [{:keys [seen out]} path]
+                   (let [k (set path)]
+                     (if (contains? seen k)
+                       {:seen seen :out out}
+                       {:seen (conj seen k) :out (conj out path)})))
+                 {:seen #{} :out []})
+         :out)))
+
+(defn problems
+  "Link-level problems across the corpus. Complements `jiten.schema/problems`,
+   which cannot see other entries and so cannot judge a reference."
+  [entries]
+  (let [{:keys [by-id links] :as idx} (index entries)]
+    (-> []
+        ;; alien targets: not even the right shape
+        (into (for [l links
+                    :when (not (keyword? (:jiten.link/to l)))]
+                (problem :error :link/target-not-keyword
+                         (str "link target must be an entry-id keyword, got " (pr-str (:jiten.link/to l)))
+                         {:jiten/link l})))
+        ;; unknown kinds
+        (into (for [l links
+                    :when (not (contains? link-kinds (:jiten.link/kind l)))]
+                (problem :error :link/unknown-kind
+                         (str "unknown link kind " (pr-str (:jiten.link/kind l))
+                              "; one of " (pr-str (set (keys link-kinds))))
+                         {:jiten/link l})))
+        ;; self links
+        (into (for [l links
+                    :when (= (:jiten.link/from l) (:jiten.link/to l))]
+                (problem :error :link/self
+                         "an entry cannot link to itself"
+                         {:jiten/link l})))
+        ;; red links -- a gap, not a fault
+        (into (for [l (red-links idx)]
+                (problem :warn :link/red
+                         (str "link target " (pr-str (:jiten.link/to l)) " has no entry yet")
+                         {:jiten/link l})))
+        ;; translation-of has to actually be a translation
+        (into (for [{:jiten.link/keys [from to kind] :as l} links
+                    :when (= :translation-of kind)
+                    :let [a (get by-id from) b (get by-id to)]
+                    :when (and a b)
+                    p (cond-> []
+                        (= (:jiten.entry/lang a) (:jiten.entry/lang b))
+                        (conj (problem :error :link/translation-same-lang
+                                       (str "a :translation-of link must cross languages; both entries are "
+                                            (pr-str (:jiten.entry/lang a)))
+                                       {:jiten/link l}))
+
+                        (not= (:jiten.entry/subject a) (:jiten.entry/subject b))
+                        (conj (problem :error :link/translation-different-subject
+                                       "a :translation-of link must join entries with the same :jiten.entry/subject; different subjects are two entries, not two languages"
+                                       {:jiten/link l})))]
+                p))
+        ;; disambiguation links may only come from a :disambiguation entry
+        (into (for [{:jiten.link/keys [from kind] :as l} links
+                    :when (= :disambiguates kind)
+                    :let [a (get by-id from)]
+                    :when (and a (not= :disambiguation (:jiten.entry/form a)))]
+                (problem :error :link/disambiguates-from-non-disambiguation
+                         "only an entry of form :disambiguation may declare a :disambiguates link"
+                         {:jiten/link l})))
+        ;; cycles in the hierarchy
+        (into (for [c (part-of-cycles idx)]
+                (problem :error :link/part-of-cycle
+                         (str "cycle in the :part-of hierarchy: " (str/join " -> " (map pr-str c)))
+                         {:jiten/cycle c})))
+        ;; a note on a link is optional, but a blank one is a writer who started
+        ;; and stopped
+        (into (for [{:jiten.link/keys [note] :as l} links
+                    :when (and (some? note) (blank? note))]
+                (problem :warn :link/blank-note
+                         "link :jiten.link/note is present but blank"
+                         {:jiten/link l})))
+        vec)))

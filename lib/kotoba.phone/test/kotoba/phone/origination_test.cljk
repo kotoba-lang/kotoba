@@ -1,0 +1,125 @@
+(ns kotoba.phone.origination-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.phone :as phone]
+            [kotoba.phone.numbering :as numbering]
+            [kotoba.phone.origination :as origination]))
+
+(def ^:private records
+  [(numbering/record "+819012340000" :active :subject "did:key:z6Sub")
+   (numbering/record "+819012340001" :suspended :subject "did:key:z6Sub")
+   (numbering/record "+819012340002" :active :subject "did:key:z6Other")])
+
+(defn- request [& {:as overrides}]
+  (merge {:records records
+          :subject "did:key:z6Sub"
+          :calling-number "+819012340000"
+          :destination "+819098765432"
+          :home-country-code "81"
+          :estimated-minutes 10
+          :rate-minor-per-minute 20
+          :daily-limit-minor 100000
+          :spent-today-minor 0}
+         overrides))
+
+(deftest classify-test
+  (is (= :domestic (origination/classify "+819098765432" "81")))
+  (is (= :international (origination/classify "+442079460958" "81")))
+  (is (= :premium-rate (origination/classify "+819901234567" "81")))
+  (is (= :toll-free (origination/classify "+811201234567" "81")))
+  (is (= :emergency (origination/classify "110" "81")))
+  (is (= :emergency (origination/classify "112" "81")))
+  (is (= :short-code (origination/classify "104" "81")))
+  (testing "unparseable is reported, never defaulted"
+    (is (= :malformed (origination/classify "not-a-number" "81")))))
+
+(deftest emergency-is-never-a-destination-test
+  (testing "bare and international spellings are both caught"
+    (is (some? (origination/emergency-issue "110" "81")))
+    (is (some? (origination/emergency-issue "+81110" "81")))
+    (is (some? (origination/emergency-issue "119" "81"))))
+  (testing "112 and 911 are refused regardless of the caller's country"
+    (is (some? (origination/emergency-issue "112" "44")))
+    (is (some? (origination/emergency-issue "911" "81")))
+    (is (some? (origination/emergency-issue "112" "999"))))
+  (testing "it wins over every other refusal that also applies"
+    (is (= [:origination/emergency-destination]
+           (mapv :phone/issue
+                 (origination/origination-issues
+                  (request :destination "110" :calling-number "+819012340002"
+                           :daily-limit-minor nil))))))
+  (testing "another country's emergency number is refused too, not just the home one"
+    (is (some? (origination/emergency-issue "18" "81")))    ; FR
+    (is (some? (origination/emergency-issue "000" "81"))))  ; AU
+  (testing "a country missing from the table fails CLOSED as an unlisted short code"
+    ;; 998 is absent from emergency-numbers; its 3-digit numbers are still not
+    ;; dialable without an explicit allowlist.
+    (is (= [:origination/short-code-not-allowed]
+           (mapv :phone/issue
+                 (origination/origination-issues
+                  (request :home-country-code "998" :destination "137")))))))
+
+(deftest short-codes-need-an-allowlist-test
+  (is (= [:origination/short-code-not-allowed]
+         (mapv :phone/issue (origination/origination-issues (request :destination "104")))))
+  (is (empty? (origination/origination-issues
+               (request :destination "104" :allowed-short-codes ["104"]))))
+  (testing "an allowlist never admits an emergency number"
+    (is (= [:origination/emergency-destination]
+           (mapv :phone/issue
+                 (origination/origination-issues
+                  (request :destination "110" :allowed-short-codes ["110"])))))))
+
+(deftest calling-number-must-be-held-and-active-test
+  (testing "a number the subject does not hold is spoofing"
+    (is (= [:origination/calling-number-not-held]
+           (mapv :phone/issue
+                 (origination/origination-issues (request :calling-number "+819012340002"))))))
+  (testing "a number they hold but suspended is not presentable either"
+    (is (= [:origination/calling-number-not-held]
+           (mapv :phone/issue
+                 (origination/origination-issues (request :calling-number "+819012340001"))))))
+  (testing "one they hold and have active is"
+    (is (empty? (origination/origination-issues (request))))))
+
+(deftest premium-rate-needs-explicit-opt-in-test
+  (is (= [:origination/premium-rate-not-allowed]
+         (mapv :phone/issue
+               (origination/origination-issues (request :destination "+819901234567")))))
+  (is (empty? (origination/origination-issues
+               (request :destination "+819901234567" :allow-premium-rate? true)))))
+
+(deftest cost-test
+  (testing "an absent limit refuses, and names what was missing"
+    (let [issues (origination/origination-issues (request :daily-limit-minor nil))]
+      (is (= [:origination/cost-unknown] (mapv :phone/issue issues)))
+      (is (= [:daily-limit-minor] (:phone/missing (first issues))))))
+  (testing "an absent rate refuses too -- unknown is not free"
+    (is (= [:origination/cost-unknown]
+           (mapv :phone/issue (origination/origination-issues
+                               (request :rate-minor-per-minute nil))))))
+  (testing "the estimate is checked against what is left, not against zero"
+    (is (empty? (origination/origination-issues
+                 (request :estimated-minutes 10 :rate-minor-per-minute 20
+                          :spent-today-minor 99800 :daily-limit-minor 100000))))
+    (let [issues (origination/origination-issues
+                  (request :estimated-minutes 10 :rate-minor-per-minute 20
+                           :spent-today-minor 99900 :daily-limit-minor 100000))]
+      (is (= [:origination/daily-limit-exceeded] (mapv :phone/issue issues)))
+      (is (= 200 (:phone/estimate-minor (first issues)))))))
+
+(deftest recording-consent-is-one-rule-for-both-directions-test
+  (testing "retention without consent refuses"
+    (is (= [:recording/consent-missing]
+           (mapv :phone/issue
+                 (origination/origination-issues (request :retain-recording? true)))))
+    (is (= [:recording/consent-missing]
+           (mapv :phone/issue
+                 (phone/recording-retention-issues {:phone/retain? true})))))
+  (testing "with consent it passes, and a transient recording needs no consent"
+    (is (empty? (origination/origination-issues
+                 (request :retain-recording? true :caller-consented-to-recording? true))))
+    (is (empty? (phone/recording-retention-issues {:phone/retain? false})))))
+
+(deftest describe-test
+  (is (= "+819012340000 -> +819098765432 (domestic)"
+         (origination/describe (request)))))

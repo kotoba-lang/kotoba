@@ -1,0 +1,88 @@
+(ns object-r2
+  "The large-object contract, including its range half, against a real
+  R2Bucket binding.
+
+  `test/object_run.cljk` runs the same contract against in-memory clients
+  written in this repo. That verifies `object-s3`'s wiring and nothing about
+  R2: the question a ranged read raises is precisely whether the R2 API means
+  what this adapter assumes it means. R2 takes an **offset and a length**; the
+  storage contract is **half-open `[start, end)`**. The conversion is one
+  subtraction, and a mock written from the same assumption would agree with
+  it whether or not it was right.
+
+  Miniflare implements the R2 API, so it can disagree."
+  (:require ["miniflare" :refer [Miniflare]]
+            [kotobase.storage.object :as object]
+            [kotobase.storage.object-async-contract :as contract]
+            [kotobase.storage.object-s3 :as objs3]
+            [kotobase.storage.s3 :as s3]))
+
+(def ^:private failures (atom 0))
+
+(defn- expect [ok? message]
+  (if ok?
+    (println (str "ok  - " message))
+    (do (js/console.error (str "FAIL: " message)) (swap! failures inc))))
+
+(defn- store-on [bucket]
+  (objs3/open-objects {:client (s3/r2-client bucket) :prefix "kotobase"}))
+
+(defn- off-by-one-store
+  "`r2-client` with the half-open conversion done wrong — length `end - start
+  + 1` instead of `end - start`.
+
+  The teeth check. Without it, a green contract run would show only that
+  miniflare can return bytes, which it can whatever this adapter computes."
+  [bucket]
+  (let [client (s3/r2-client bucket)]
+    (objs3/open-objects
+     {:client (assoc client
+                     :get-object-range
+                     (fn [{:keys [key start end]}]
+                       ((:get-object-range client)
+                        {:key key :start start :end (inc end)})))
+      :prefix "kotobase"})))
+
+(defn- run-checks [bucket oracle]
+  (-> (contract/verify (store-on bucket))
+      (.then
+       (fn [result]
+         (expect (= :verified (:range-read result))
+                 (str "the R2-backed object store verifies the range half: "
+                      (pr-str result)))
+         (expect (= :proxied-transfer (:profile result))
+                 "a binding has no credentials, so the store is proxied")))
+      ;; teeth: the same contract must REJECT a wrong conversion
+      (.then
+       (fn [_]
+         (-> (contract/verify (off-by-one-store oracle))
+             (.then (fn [result]
+                      (expect false
+                              (str "an off-by-one range conversion passed the "
+                                   "contract — the range half has no teeth: "
+                                   (pr-str result)))))
+             (.catch (fn [error]
+                       (expect true
+                               (str "an off-by-one range conversion is caught: "
+                                    (.-message error))))))))))
+
+(defn -main [& _]
+  (let [mf (Miniflare. #js {:modules true
+                            :script "export default {};"
+                            :r2Buckets #js {:BUCKET "kotobase-object-contract"
+                                            :ORACLE "kotobase-object-oracle"}})]
+    (-> (js/Promise.all #js [(.getR2Bucket mf "BUCKET") (.getR2Bucket mf "ORACLE")])
+        (.then (fn [[bucket oracle]] (run-checks bucket oracle)))
+        (.catch (fn [error]
+                  (js/console.error (str "FAIL: " (.-message error)))
+                  (swap! failures inc)))
+        (.then (fn [_]
+                 (-> (.dispose mf)
+                     (.then (fn [_]
+                              (if (zero? @failures)
+                                (println "kotobase-storage-s3 objects (R2): all green")
+                                (println (str "kotobase-storage-s3 objects (R2): "
+                                              @failures " FAILURE(S) above")))
+                              (.exit js/process (if (zero? @failures) 0 1))))))))))
+
+(-main)

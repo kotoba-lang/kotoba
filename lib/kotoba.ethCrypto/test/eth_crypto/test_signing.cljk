@@ -1,0 +1,219 @@
+(ns eth-crypto.test-signing
+  "VERIFICATION GATE (mandatory) for the secp256k1 SIGNING side: RFC-6979
+  deterministic ECDSA + EIP-2 low-s + EIP-155 legacy transaction signing.
+  Asserts the canonical EIP-155 spec example (the worked example in EIP-155
+  itself) byte-for-byte: the signing hash, v/r/s, and the full raw signed tx.
+  Plus a sign→ecrecover roundtrip and an address-from-privkey known vector.
+  If this fails, the signing crypto must NOT ship."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [eth-crypto.core :as eth]))
+
+(defn- pad64
+  "A BigInteger/BigInt as 64 hex digits."
+  [n]
+  (let [h #?(:clj (.toString ^java.math.BigInteger n 16) :cljs (.toString n 16))]
+    (str (apply str (repeat (- 64 (count h)) "0")) h)))
+
+;; ── EIP-155 canonical worked example ──
+;; privkey 0x4646...46, the tx below, chainId 1.
+(def eip155-privkey
+  (eth/hex->bytes "0x4646464646464646464646464646464646464646464646464646464646464646"))
+
+(def eip155-tx
+  {:nonce     9
+   :gas-price 20000000000
+   :gas       21000
+   :to        "0x3535353535353535353535353535353535353535"
+   :value     1000000000000000000
+   :data      "0x"
+   :chain-id  1})
+
+(deftest eip155-signing-hash
+  (testing "keccak of RLP([nonce,gasPrice,gas,to,value,data,chainId,0,0])"
+    ;; via the public `legacy-digest` rather than assembling RLP fields with
+    ;; private vars, so this runs identically on both platforms.
+    (is (= "0xdaf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53"
+           (str "0x" (eth/bytes->hex (eth/legacy-digest eip155-tx)))))))
+
+(deftest eip155-signature-values
+  (testing "RFC-6979 deterministic v/r/s for the EIP-155 example"
+    (let [sighash (eth/hex->bytes
+                   "0xdaf5a779ae972f972197303d7b574746c7ef83eadac0f2791ad23db92e4c8e53")
+          sig (eth/secp256k1-sign eip155-privkey sighash)
+          ;; r‖s‖v via the public helper — r and s here are both exactly 32
+          ;; bytes, so their padded and minimal encodings coincide.
+          rsv (eth/signature->bytes sig)
+          v (+ (:recovery-id sig) (* 2 1) 35)]
+      (is (= 37 v) "v = recovery-id + chainId*2 + 35")
+      (is (= "28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276"
+             (eth/bytes->hex (take 32 rsv))) "r")
+      (is (= "67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83"
+             (eth/bytes->hex (take 32 (drop 32 rsv)))) "s"))))
+
+(deftest eip155-raw-signed-tx
+  (testing "full raw signed tx matches EIP-155 spec byte-for-byte"
+    (is (= "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83"
+           (eth/sign-tx-legacy eip155-tx eip155-privkey)))))
+
+;; ── address from private key (known vector) ──
+(deftest address-of-privkey-vector
+  (is (= "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+         (eth/address-of-privkey
+          (eth/hex->bytes
+           "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")))))
+
+;; ── sign → ecrecover roundtrip ──
+(deftest sign-ecrecover-roundtrip
+  (testing "ecrecover of our own signature recovers the signer address"
+    ;; Both platforms now really sign and really recover -- there is no :cljs
+    ;; stub left to short-circuit this, so the assertion is meaningful on both.
+    (let [digest (eth/keccak256 (eth/utf8 "the founder authorized self-implementing clj"))
+          sig (eth/signature->bytes (eth/secp256k1-sign eip155-privkey digest))]
+      (is (= (eth/address-of-privkey eip155-privkey)
+             (eth/ecrecover-checksum digest sig))))))
+
+(deftest secp256k1-verify-compressed-and-uncompressed-public-keys
+  (let [digest (eth/keccak256 (eth/utf8 "bitcoin consensus verification"))
+        signature (eth/secp256k1-sign eip155-privkey digest)
+        point (vec (map #(bit-and % 0xff)
+                        (seq (eth/private->public eip155-privkey))))
+        compressed
+        (into [(if (even? (peek point)) 2 3)] (take 32 point))
+        uncompressed (into [4] point)
+        compressed #?(:clj (byte-array (map unchecked-byte compressed))
+                      :cljs compressed)
+        uncompressed #?(:clj (byte-array (map unchecked-byte uncompressed))
+                        :cljs uncompressed)
+        changed (assoc (vec (map #(bit-and % 0xff) (seq digest))) 0
+                       (bit-xor 1 (bit-and 0xff (first digest))))
+        changed #?(:clj (byte-array (map unchecked-byte changed))
+                   :cljs changed)]
+    (is (eth/secp256k1-low-s? (:s signature)))
+    (is (eth/secp256k1-verify digest signature compressed))
+    (is (eth/secp256k1-verify digest signature uncompressed))
+    (is (false? (eth/secp256k1-verify changed signature compressed)))
+    (is (false? (eth/secp256k1-verify digest signature
+                                      #?(:clj (byte-array [2 1])
+                                         :cljs [2 1]))))))
+
+;; ── EIP-1559 (type-2) signing ──
+;; EIP-1559 has no worked example in the EIP text itself (unlike EIP-155), so
+;; these vectors are generated by an INDEPENDENT implementation — viem 2.x
+;; (`serializeTransaction` / `keccak256` / `privateKeyToAccount.signTransaction`,
+;; secp256k1 via @noble) — rather than by this library, so the assertion is a
+;; genuine cross-implementation check and not a snapshot of our own output.
+;; Same private key as the EIP-155 example above. Regenerate with:
+;;   kbb --backend sci scratch.cljk  (viem: signTransaction {type:'eip1559', …})
+;; viem independently agrees this key's address is the one asserted below,
+;; which is also the address the EIP-155 canonical example is signed by.
+
+(def eip1559-address "0x9d8A62f656a8d1615C1294fd71e9CFb3E4855A4F")
+
+(deftest eip1559-privkey-address-cross-impl
+  (testing "viem derives the same address from the EIP-155 example key"
+    (is (= eip1559-address (eth/address-of-privkey eip155-privkey)))))
+
+;; plain: no calldata, empty access list (exercises yParity 0 -> RLP 0x80)
+(def eip1559-tx
+  {:nonce                     9
+   :max-priority-fee-per-gas  1000000000
+   :max-fee-per-gas           20000000000
+   :gas                       21000
+   :to                        "0x3535353535353535353535353535353535353535"
+   :value                     1000000000000000000
+   :data                      "0x"
+   :chain-id                  1})
+
+(deftest eip1559-digest-vector
+  (testing "keccak(0x02 || rlp(payload)) matches viem's serialize+hash"
+    (is (= "0x577f072b4be21dbe73cdd90f32675d67d2fdfefdecfbc579f52025caf096400a"
+           (str "0x" (eth/bytes->hex (eth/eip1559-digest eip1559-tx)))))))
+
+(deftest eip1559-raw-signed-tx
+  (testing "raw signed type-2 tx matches viem byte-for-byte (yParity 0)"
+    (is (= (str "0x02f8730109843b9aca008504a817c8008252089435353535353535353535"
+                "35353535353535353535880de0b6b3a764000080c080"
+                "a04e87ced8b47d801c979c6baa52bbd78b42c9db2515c9d1f473e06f65d49aaa90"
+                "a02357671517c59544ebd95012d1988c102292eb570cc840ac9af72bb4c52e5edd")
+           (eth/sign-tx-eip1559 eip1559-tx eip155-privkey)))))
+
+;; access-list variant: non-empty calldata + one [address [2 slots]] entry
+;; (exercises the nested-list RLP shape and yParity 1 -> RLP 0x01)
+(def eip1559-tx-access-list
+  (assoc eip1559-tx
+         :data "0xdeadbeef"
+         :access-list [{:address "0x1111111111111111111111111111111111111111"
+                        :storage-keys
+                        ["0x0000000000000000000000000000000000000000000000000000000000000001"
+                         "0x0000000000000000000000000000000000000000000000000000000000000002"]}]))
+
+(deftest eip1559-access-list-digest-vector
+  (testing "access-list payload digest matches viem"
+    (is (= "0x97d49716c1e28be9970d3954a6a930d40a2dbcbb219a7e269160d38d7accaae0"
+           (str "0x" (eth/bytes->hex (eth/eip1559-digest eip1559-tx-access-list)))))))
+
+(deftest eip1559-access-list-raw-signed-tx
+  (testing "raw signed type-2 tx with access list matches viem (yParity 1)"
+    (is (= (str "0x02f8d30109843b9aca008504a817c8008252089435353535353535353535"
+                "35353535353535353535880de0b6b3a764000084deadbeef"
+                "f85bf859941111111111111111111111111111111111111111f842"
+                "a00000000000000000000000000000000000000000000000000000000000000001"
+                "a00000000000000000000000000000000000000000000000000000000000000002"
+                "01"
+                "a0096d3679b73bb61fc20f418acb3413116969690cb2cb083dbbc356451fb26e83"
+                "a047dee43da2b2c92113d07969ef207f51c9b436188efb8a8081649ae749537302")
+           (eth/sign-tx-eip1559 eip1559-tx-access-list eip155-privkey)))))
+
+(deftest eip1559-tx-hash-vector
+  (testing "raw-tx-hash of the signed type-2 txs matches viem's keccak"
+    (is (= "0x85c29adc6584224bbd5a304d2e7a3a2f26ca67e4e4dd69e64cc0c71a028a12a3"
+           (eth/raw-tx-hash (eth/sign-tx-eip1559 eip1559-tx eip155-privkey))))
+    (is (= "0x8d1030fa3161884cc448aa08d3f856922f67e3b183beb61b480450d4c4f61d31"
+           (eth/raw-tx-hash (eth/sign-tx-eip1559 eip1559-tx-access-list eip155-privkey))))))
+
+(deftest eip1559-legacy-hash-still-works
+  (testing "raw-tx-hash also hashes a legacy (untyped) raw tx"
+    ;; keccak of the EIP-155 canonical raw tx asserted above.
+    (is (= 66 (count (eth/raw-tx-hash (eth/sign-tx-legacy eip155-tx eip155-privkey))))
+        "0x + 64 hex chars")))
+
+(deftest eip1559-digest-recovers-signer
+  (testing "the type-2 digest + our signature recovers the signer's address"
+    (let [digest (eth/eip1559-digest eip1559-tx)
+          sig (eth/signature->bytes (eth/secp256k1-sign eip155-privkey digest))]
+      (is (= eip1559-address (eth/ecrecover-checksum digest sig))))))
+
+(deftest eip1559-out-of-process-signer-assembly
+  (testing "eip1559-raw assembles the same tx from a detached signature"
+    ;; The hardware-wallet / passkey / KMS path: digest is handed out, r/s/parity
+    ;; come back, and only assembly happens here.
+    (let [sig (eth/secp256k1-sign eip155-privkey (eth/eip1559-digest eip1559-tx))]
+      (is (= (eth/sign-tx-eip1559 eip1559-tx eip155-privkey)
+             (eth/eip1559-raw eip1559-tx sig))))))
+
+(deftest ecrecover-pubkey-returns-the-key-not-an-address
+  ;; The step Ethereum hides. `ecrecover` keccaks the recovered key and keeps
+  ;; 20 bytes; a Filecoin f1 address is BLAKE2b-160 of `0x04` ‖ the same key,
+  ;; so the recovery has to be reachable on its own — otherwise every chain
+  ;; that derives an address differently has to re-derive the curve maths.
+  (let [priv (eth/hex->bytes
+              "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+        pub (eth/private->public priv)
+        digest (eth/keccak256 (eth/utf8 "filecoin"))
+        {:keys [r s recovery-id]} (eth/secp256k1-sign priv digest)
+        sig (vec (concat (seq (eth/hex->bytes (pad64 r)))
+                         (seq (eth/hex->bytes (pad64 s)))
+                         [(+ 27 recovery-id)]))
+        sig #?(:clj (byte-array (map unchecked-byte sig)) :cljs sig)]
+    (is (= 64 (count (seq pub))))
+    (is (= (map #(bit-and % 0xff) (seq pub))
+           (map #(bit-and % 0xff) (seq (eth/ecrecover-pubkey digest sig))))
+        "recovers exactly the key that signed")
+    (testing "and ecrecover is still that key, keccaked to its last 20 bytes"
+      (is (= (map #(bit-and % 0xff) (seq (eth/ecrecover digest sig)))
+             (map #(bit-and % 0xff) (drop 12 (seq (eth/keccak256 pub)))))))
+    (testing "a different digest recovers a different key"
+      (is (not= (map #(bit-and % 0xff) (seq pub))
+                (map #(bit-and % 0xff)
+                     (seq (eth/ecrecover-pubkey
+                           (eth/keccak256 (eth/utf8 "filecoin!")) sig))))))))

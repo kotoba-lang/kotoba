@@ -1,0 +1,156 @@
+#!/usr/bin/env kbb
+;; verify-cljs.cljs — two-runtime parity check.
+;;
+;; `kbb -M:test` proves the library on the JVM, where `storj.core/then` is
+;; identity-application and every crypto call returns a value. That leaves the
+;; half that actually ships to browsers and Workers untested: WebCrypto is
+;; Promise-based, so the *same* code takes a completely different path through
+;; `then`. A green JVM suite says nothing about it.
+;;
+;; So this script re-runs the client-level assertions — the request and presign
+;; signatures cross-checked against an independent implementation in
+;; `core_test` — through nbb, on crypto.subtle. Identical expected values,
+;; different runtime. If the async composition in `then` were wrong, these
+;; would fail while the JVM suite stayed green.
+;;
+;; SigV4 itself (AWS's published reference vectors, the digests, the encoder)
+;; is `kotoba-lang/sigv4`'s to prove, and its CI does — on this same runtime.
+;; What is left here is the S3 surface composed over it.
+;;
+;; The library is a git dep, so nbb needs it on the classpath:
+;;
+;;   kbb --backend sci --classpath "$(kbb -Spath)" scripts/verify-cljs.cljk
+
+(require '[kotoba.lang.text :as str]
+         '[sigv4.core :as v4]
+         '[sigv4.crypto :as crypto]
+         '[sigv4.protocols :as p]
+         '[storj.core :as storj]
+         '[storj.protocols :as http]
+         '[storj.store :as store])
+
+(def failures (atom 0))
+
+(defn check [label expected actual]
+  (if (= expected actual)
+    (println "  ok  " label)
+    (do (swap! failures inc)
+        (println "  FAIL" label)
+        (println "        expected:" (pr-str expected))
+        (println "        actual:  " (pr-str actual)))))
+
+(def c (crypto/crypto))
+
+;; ── The full client, on the same vectors core_test uses ─────────────────────
+(defrecord CapturingHttp [sent]
+  http/IHttp
+  (-request [_ req] (reset! sent req) #js {}))
+
+(def now "2026-07-25T12:00:00.000Z")
+
+(defn- signature-of [req]
+  (second (re-find #"Signature=([0-9a-f]+)" (get-in req [:headers "authorization"]))))
+
+(defn check-client []
+  (let [sent   (atom nil)
+        client (storj/client {:bucket "my-bucket" :access-key "jwtest" :secret-key "supersecret"}
+                             {:crypto c :http (->CapturingHttp sent)})]
+    (-> (storj/sign client {:method :get :key "docs/readme.txt" :now now})
+        (.then (fn [req]
+                 (check "signed GET url"
+                        "https://gateway.storjshare.io/my-bucket/docs/readme.txt" (:url req))
+                 (check "signed GET signature (matches JVM + independent impl)"
+                        "2f164e6a8b8805003436d9150ca22b2ed89f4bdcfa505bb0bcfe36d42d2ca528"
+                        (signature-of req))))
+        (.then (fn [_] (storj/sign client {:method :put :key "docs/readme.txt"
+                                           :body "hello storj" :now now
+                                           :headers {"content-type" "text/plain"}})))
+        (.then (fn [req]
+                 (check "PUT body hash"
+                        "275a8f4e11cbf657431976aba8402192cd60919fede551e0a9bc59ea001a43bf"
+                        (get-in req [:headers "x-amz-content-sha256"]))
+                 (check "signed PUT signature"
+                        "b1433226d0b4bd5f58abdba0d533a353997dca3ab90bf3fdee6aa43c7527cf6b"
+                        (signature-of req))))
+        (.then (fn [_] (storj/presign client {:key "docs/readme.txt" :now now})))
+        (.then (fn [url]
+                 (check "presigned URL"
+                        (str "https://gateway.storjshare.io/my-bucket/docs/readme.txt"
+                             "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                             "&X-Amz-Credential=jwtest%2F20260725%2Fus-east-1%2Fs3%2Faws4_request"
+                             "&X-Amz-Date=20260725T120000Z"
+                             "&X-Amz-Expires=3600"
+                             "&X-Amz-SignedHeaders=host"
+                             "&X-Amz-Signature=8890b75c4127c944b41ade4dcacb46afd437ab9ce89678bf3d9139c9e1b78fb9")
+                        url))))))
+
+;; ── The pure bits this library still owns ────────────────────────────────────
+(defn check-pure []
+  (check "object-path is path-style" "/b/a%20b/c.txt" (v4/object-path "b" "a b/c.txt"))
+  (check "list result parsing"
+         ["docs/b & c.txt"]
+         (:keys (storj/parse-list-result "<Contents><Key>docs/b &amp; c.txt</Key></Contents>")))
+  (js/Promise.resolve nil))
+
+;; ── storj.store, whose sync/async duality only shows up on this side ────────
+;;
+;; On a JVM `then` is identity application and every one of these functions
+;; returns a value; here each returns a Promise. The JVM suite says nothing
+;; about that composition — which is the whole reason this script exists — and
+;; `storj.store` has its own copy of `then`, so it has its own way to be wrong.
+
+(defrecord ScriptedHttp [responses]
+  http/IHttp
+  (-request [_ _]
+    (let [r (first @responses)]
+      (swap! responses rest)
+      ;; a Clojure map, not clj->js: the library reads :status with a keyword
+      (js/Promise.resolve r))))
+
+(defn- fns-for [responses]
+  (-> (storj/client {:bucket "my-bucket" :access-key "jwtest" :secret-key "supersecret"}
+                    {:crypto c :http (->ScriptedHttp (atom responses))})
+      (store/store-fns {:now (constantly "2026-07-25T12:00:00.000Z")
+                        :prefix "drive/"})))
+
+(defn check-store []
+  (let [found   ((:get-object (fns-for [{:status 200 :headers {} :body [1 2 250]}])) "obj-1")
+        ;; what a real transport hands back here, as opposed to the vector the
+        ;; stub above uses — a Uint8Array is not a vector and not sequential?
+        typed   ((:get-object (fns-for [{:status 200 :headers {}
+                                         :body (js/Uint8Array.from #js [7 8 200])}]))
+                 "typed")
+        missing ((:get-object (fns-for [{:status 404 :headers {} :body nil}])) "gone")
+        empty   ((:get-object (fns-for [{:status 200 :headers {} :body []}])) "empty")
+        present ((:exists?    (fns-for [{:status 200 :headers {} :body nil}])) "obj-1")
+        absent  ((:exists?    (fns-for [{:status 404 :headers {} :body nil}])) "gone")]
+    (check "store fns return promises here, not values" true (instance? js/Promise found))
+    (-> found
+        (.then #(check "a get resolves to a vector of unsigned ints" [1 2 250] %))
+        (.then (fn [_] typed))
+        (.then (fn [v]
+                 (check "a Uint8Array body becomes a vector too" [7 8 200] v)
+                 (check "and it really is a vector, not the container" true (vector? v))))
+        (.then (fn [_] missing))
+        (.then #(check "a 404 resolves to nil rather than a status" nil %))
+        (.then (fn [_] empty))
+        (.then #(check "an empty object is not a missing one" [] %))
+        (.then (fn [_] present))
+        (.then #(check "exists? resolves true" true %))
+        (.then (fn [_] absent))
+        (.then #(check "exists? resolves false" false %)))))
+
+(println "storj — ClojureScript / WebCrypto parity check (nbb)\n")
+(-> (js/Promise.resolve nil)
+    (.then check-pure)
+    (.then check-client)
+    (.then check-store)
+    (.then (fn [_]
+             (println)
+             (if (zero? @failures)
+               (println "all checks passed on the ClojureScript path")
+               (do (println @failures "check(s) FAILED")
+                   (set! (.-exitCode js/process) 1)))))
+    (.catch (fn [e]
+              (println "verification threw:" (str/trim (str (or (.-stack e) e))))
+              (set! (.-exitCode js/process) 1))))

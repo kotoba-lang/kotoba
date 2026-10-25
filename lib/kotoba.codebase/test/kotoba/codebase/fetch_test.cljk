@@ -1,0 +1,129 @@
+(ns kotoba.codebase.fetch-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [cbor.core :as cbor]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.authoring :as authoring]
+            [kotoba.codebase.evaluator :as evaluator]
+            [kotoba.codebase.fetch :as fetch]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-fetch-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- serving
+  "A fetch source backed by another local store."
+  [remote]
+  (fn [cid]
+    (try (cbor/encode (store/get-block remote cid))
+         (catch kerror/ExceptionInfo _ nil))))
+
+(deftest hydrates-a-closure-from-a-remote-source-and-runs-it
+  (let [remote (temp-store) local (temp-store)]
+    (try
+      (store/initialize! remote)
+      (store/initialize! local)
+      (let [committed (authoring/update-namespace!
+                       remote "scratch" '[(defn double [x] (* x 2))
+                                          (defn quadruple [x] (double (double x)))])
+            cid (get-in committed [:bindings "quadruple"])
+            result (fetch/hydrate! local [cid] {:fetch-block (serving remote)})]
+        (is (true? (:complete? result)))
+        (testing "the definition runs locally with no source and no namespace"
+          (is (= 12 (:value (evaluator/invoke local cid [3]))))))
+      (finally (delete-tree remote) (delete-tree local)))))
+
+(deftest rejects-bytes-that-do-not-hash-to-the-requested-cid
+  (let [remote (temp-store) local (temp-store)]
+    (try
+      (store/initialize! remote)
+      (store/initialize! local)
+      (let [committed (authoring/update-namespace!
+                       remote "scratch" '[(defn double [x] (* x 2))])
+            cid (get-in committed [:bindings "double"])
+            lying (fn [_] (cbor/encode {"schema" "not-what-you-asked-for"}))]
+        (is (= :codebase/fetched-cid-mismatch
+               (:problem (ex-data (try (fetch/hydrate! local [cid] {:fetch-block lying})
+                                       (catch kerror/ExceptionInfo e e)))))))
+      (finally (delete-tree remote) (delete-tree local)))))
+
+(deftest reports-what-the-source-did-not-have
+  (let [remote (temp-store) local (temp-store)]
+    (try
+      (store/initialize! remote)
+      (store/initialize! local)
+      (let [committed (authoring/update-namespace!
+                       remote "scratch" '[(defn double [x] (* x 2))
+                                          (defn quadruple [x] (double (double x)))])
+            cid (get-in committed [:bindings "quadruple"])
+            dependency (get-in committed [:bindings "double"])
+            partial-source (fn [wanted]
+                             (when-not (= wanted dependency)
+                               ((serving remote) wanted)))
+            result (fetch/hydrate! local [cid] {:fetch-block partial-source})]
+        (is (false? (:complete? result)))
+        (is (= [dependency] (:missing result)))
+        (testing "an incomplete closure fails closed at evaluation, not silently"
+          (is (= :codebase/block-not-found
+                 (:problem (ex-data (try (evaluator/invoke local cid [3])
+                                         (catch kerror/ExceptionInfo e e))))))))
+      (finally (delete-tree remote) (delete-tree local)))))
+
+(deftest bounds-the-number-of-blocks-one-request-can-pull
+  (let [remote (temp-store) local (temp-store)]
+    (try
+      (store/initialize! remote)
+      (store/initialize! local)
+      (let [committed (authoring/update-namespace!
+                       remote "scratch" '[(defn a [x] (+ x 1))
+                                          (defn b [x] (a (a x)))
+                                          (defn c [x] (b (b x)))])
+            cid (get-in committed [:bindings "c"])]
+        (is (= :codebase/fetch-budget-exceeded
+               (:problem (ex-data (try (fetch/hydrate! local [cid]
+                                                       {:fetch-block (serving remote)
+                                                        :max-blocks 1})
+                                       (catch kerror/ExceptionInfo e e)))))))
+      (finally (delete-tree remote) (delete-tree local)))))
+
+(deftest hydrating-from-a-namespace-commit-brings-the-whole-namespace
+  ;; The shape a follower actually uses: it is handed a HEAD, not a definition
+  ;; CID. A traversal that only knew `dependencies` and `type` fetched the
+  ;; commit and stopped, and every definition it named stayed missing.
+  (let [remote (temp-store) local (temp-store)]
+    (try
+      (store/initialize! remote)
+      (store/initialize! local)
+      (let [committed (authoring/update-namespace!
+                       remote "scratch" '[(defn double [x] (* x 2))
+                                          (defn quadruple [x] (double (double x)))])
+            head (store/head remote "scratch")
+            result (fetch/hydrate! local [head] {:fetch-block (serving remote)})]
+        (is (true? (:complete? result)))
+        (is (< 1 (count (:fetched result))))
+        (is (= 12 (:value (evaluator/invoke local (get-in committed [:bindings "quadruple"])
+                                            [3])))))
+      (finally (delete-tree remote) (delete-tree local)))))
+
+(deftest hydrates-a-release-manifest-and-its-raw-wasm-artifact
+  (let [remote (temp-store) local (temp-store)]
+    (try
+      (doseq [root [remote local]] (store/initialize! root))
+      (let [wasm (byte-array (map unchecked-byte [0 97 115 109 1 0 0 0]))
+            artifact (store/put-artifact! remote wasm)
+            manifest {"schema" "kotoba.library-release.v1"
+                      "version" 1
+                      "artifact" (semantic/cid-link artifact)}
+            root-cid (semantic/block-cid manifest)]
+        (store/put-block! remote root-cid manifest)
+        (let [source (fn [cid]
+                       (or (store/get-artifact remote cid)
+                           (try (cbor/encode (store/get-block remote cid))
+                                (catch kerror/ExceptionInfo _ nil))))
+              result (fetch/hydrate! local [root-cid] {:fetch-block source})]
+          (is (:complete? result))
+          (is (= (seq wasm) (seq (store/get-artifact local artifact))))))
+      (finally (delete-tree remote) (delete-tree local)))))

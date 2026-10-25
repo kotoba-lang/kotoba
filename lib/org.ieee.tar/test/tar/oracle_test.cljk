@@ -1,0 +1,225 @@
+(ns tar.oracle-test
+  "Conformance against real tar implementations, in both directions, using
+   python3's `tarfile` (which writes all three header dialects on demand) and the
+   system `tar`.
+
+   Both directions matter for different reasons: *them → us* proves the reader
+   handles headers we would never write (GNU `L`/`K` entries, base-256 numerics,
+   PAX global blocks), and *us → them* proves the writer's field offsets, octal
+   padding and checksum are right — a self-round-trip agrees with itself no
+   matter where the fields sit.
+
+   These tests are skipped, loudly, when python3 is unavailable rather than
+   silently passing."
+  (:require [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [tar.bytes :as b]
+            [tar.core :as tar])
+  (:import [java.io File]
+           [java.nio.file Files]
+           [java.security MessageDigest]))
+
+(defn- python3? []
+  (try (zero? (:exit (shell/sh "python3" "--version"))) (catch Exception _ false)))
+
+(defn- py
+  "Run `script` with python3, `cwd` as working directory. Throws on failure so a
+   broken fixture cannot masquerade as a passing test."
+  [cwd script]
+  (let [{:keys [exit out err]} (shell/sh "python3" "-" :in script :dir cwd)]
+    (when-not (zero? exit)
+      (throw (ex-info (str "python3 fixture failed: " err) {:script script})))
+    out))
+
+(defn- temp-dir []
+  (.toFile (Files/createTempDirectory "org-ieee-tar-" (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(defn- rm-rf [^File f]
+  (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+
+(defn- write-bytes [^File f bytes]
+  (with-open [o (io/output-stream f)]
+    (.write o (byte-array (map unchecked-byte bytes)))))
+
+(defn- read-ubytes [^File f]
+  (mapv #(bit-and (int %) 0xff) (Files/readAllBytes (.toPath f))))
+
+(defn- sha256-hex [bytes]
+  (let [d (.digest (MessageDigest/getInstance "SHA-256") (byte-array (map unchecked-byte bytes)))]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) d))))
+
+(def ^:private members
+  [["a.txt" "hello"]
+   ["dir/b.json" (apply str (repeat 40 "{\"k\":\"v\"}"))]
+   ["dir/nested/c.txt" "third"]
+   ["empty.txt" ""]
+   ["unicode-日本語.txt" "日本語の中身"]
+   [(str (apply str (repeat 150 "x")) ".txt") "needs pax"]])
+
+;; ---------------------------------------------------------------------------
+;; us → them
+;; ---------------------------------------------------------------------------
+
+(deftest our-archive-is-read-by-python-tarfile
+  (if-not (python3?)
+    (println "SKIP tar.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (write-bytes (io/file dir "ours.tar")
+                     (tar/build (mapv (fn [[n c]] {:name n :bytes (b/str->utf8 c)}) members)))
+        (let [out (py dir "
+import tarfile, hashlib
+with tarfile.open('ours.tar') as t:
+    for m in t.getmembers():
+        data = t.extractfile(m).read() if m.isfile() else b''
+        print('%s\\t%d\\t%s\\t%o\\t%s' % (m.name, m.size, hashlib.sha256(data).hexdigest(), m.mode, 'f' if m.isfile() else ('d' if m.isdir() else 'o')))
+")
+              rows (into {} (for [line (str/split-lines (str/trim out))
+                                 :let [[n size sha mode kind] (str/split line #"\t")]]
+                              [n {:size (Long/parseLong size) :sha sha :mode mode :kind kind}]))]
+          (is (= (set (map first members)) (set (keys rows))))
+          (doseq [[n c] members]
+            (let [bs (b/str->utf8 c)]
+              (is (= (count bs) (:size (get rows n))) n)
+              (is (= (sha256-hex bs) (:sha (get rows n))) n)
+              (is (= "f" (:kind (get rows n))) n)
+              (is (= "644" (:mode (get rows n))) n))))
+        (finally (rm-rf dir))))))
+
+(deftest our-archive-extracts-with-the-system-tar
+  (if-not (python3?)
+    (println "SKIP tar.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (write-bytes (io/file dir "ours.tar")
+                     (tar/build [{:name "top/" :type :directory}
+                                 {:name "top/f.txt" :bytes (b/str->utf8 "extracted")}
+                                 {:name "top/l" :type :symlink :linkname "f.txt"}]))
+        (let [{:keys [exit err]} (shell/sh "tar" "-xf" "ours.tar" :dir dir)]
+          (is (zero? exit) err))
+        (is (= "extracted" (slurp (io/file dir "top/f.txt"))))
+        (is (.exists (io/file dir "top/l")))
+        (testing "the symlink points where we said"
+          (is (= "f.txt" (str (Files/readSymbolicLink (.toPath (io/file dir "top/l")))))))
+        (finally (rm-rf dir))))))
+
+(deftest our-directories-and-modes-survive-a-round-trip-through-tar
+  (if-not (python3?)
+    (println "SKIP tar.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (write-bytes (io/file dir "ours.tar")
+                     (tar/build [{:name "bin/" :type :directory :mode 0755}
+                                 {:name "bin/run" :bytes (b/str->utf8 "#!/bin/sh\n") :mode 0755}]))
+        (let [out (py dir "
+import tarfile
+with tarfile.open('ours.tar') as t:
+    for m in t.getmembers():
+        print('%s %o %s' % (m.name, m.mode, m.isdir()))
+")]
+          (is (str/includes? out "bin 755 True"))
+          (is (str/includes? out "bin/run 755 False")))
+        (finally (rm-rf dir))))))
+
+;; ---------------------------------------------------------------------------
+;; them → us
+;; ---------------------------------------------------------------------------
+
+(defn- python-archive
+  "Build an archive with python3 in the requested dialect and return its bytes."
+  [dir format-name]
+  (py dir (str "
+import tarfile, io, os
+fmt = {'gnu': tarfile.GNU_FORMAT, 'ustar': tarfile.USTAR_FORMAT, 'pax': tarfile.PAX_FORMAT}['" format-name "']
+with tarfile.open('theirs.tar', 'w', format=fmt) as t:
+    def add(name, data, **kw):
+        ti = tarfile.TarInfo(name)
+        ti.size = len(data)
+        ti.mtime = 1700000000
+        ti.uid, ti.gid = 501, 20
+        ti.uname, ti.gname = 'someone', 'staff'
+        for k, v in kw.items(): setattr(ti, k, v)
+        t.addfile(ti, io.BytesIO(data))
+    add('a.txt', b'hello')
+    add('dir/b.json', b'{\"k\":\"v\"}' * 40)
+    add('empty.txt', b'')
+    add('unicode-日本語.txt', '日本語の中身'.encode())
+    # A 154-byte single component cannot be expressed in ustar at all (python
+    # raises), so the long-name case only exists for the dialects that have an
+    # escape hatch: GNU's L entry and PAX's path record.
+    if fmt is not tarfile.USTAR_FORMAT:
+        add('" (apply str (repeat 150 "x")) ".txt', b'long name')
+    d = tarfile.TarInfo('adir/'); d.type = tarfile.DIRTYPE; d.mode = 0o755; d.mtime = 0
+    t.addfile(d)
+    l = tarfile.TarInfo('alink'); l.type = tarfile.SYMTYPE; l.linkname = 'a.txt'; l.mtime = 0
+    t.addfile(l)
+print('ok')"))
+  (read-ubytes (io/file dir "theirs.tar")))
+
+(deftest we-read-every-header-dialect
+  (if-not (python3?)
+    (println "SKIP tar.oracle-test: python3 not available")
+    (doseq [fmt ["gnu" "ustar" "pax"]]
+      (let [dir (temp-dir)]
+        (try
+          (testing fmt
+            (let [parsed (tar/parse (python-archive dir fmt))
+                  by     (into {} (map (juxt :name identity) parsed))]
+              (is (= "hello" (b/utf8->str (:bytes (get by "a.txt")))))
+              (is (= 360 (count (:bytes (get by "dir/b.json")))))
+              (is (= [] (:bytes (get by "empty.txt"))))
+              (is (= "日本語の中身" (b/utf8->str (:bytes (get by "unicode-日本語.txt")))))
+              (when-not (= "ustar" fmt)
+                (is (= "long name"
+                       (b/utf8->str (:bytes (get by (str (apply str (repeat 150 "x")) ".txt")))))
+                    "a 154-byte name: GNU writes an L entry, PAX a path record"))
+              (is (= :directory (:type (get by "adir/"))))
+              (is (= :symlink (:type (get by "alink"))))
+              (is (= "a.txt" (:linkname (get by "alink"))))
+              (testing "ownership metadata"
+                (is (= 501 (:uid (get by "a.txt"))))
+                (is (= "someone" (:uname (get by "a.txt"))))
+                (is (= 1700000000 (long (:mtime (get by "a.txt"))))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-a-real-tar-of-a-real-directory-tree
+  (if-not (python3?)
+    (println "SKIP tar.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        ;; The system tar on macOS writes PAX by default; on Linux, GNU. Either
+        ;; way this is a header dialect nobody chose deliberately.
+        (py dir "
+import os
+os.makedirs('tree/sub', exist_ok=True)
+open('tree/one.txt','w').write('one')
+open('tree/sub/two.txt','w').write('two' * 500)
+print('ok')")
+        (let [{:keys [exit err]} (shell/sh "tar" "-cf" "theirs.tar" "tree" :dir dir)]
+          (is (zero? exit) err))
+        (let [parsed (tar/parse (read-ubytes (io/file dir "theirs.tar")))
+              by     (into {} (map (juxt :name identity) parsed))]
+          (is (contains? by "tree/one.txt"))
+          (is (= "one" (b/utf8->str (:bytes (get by "tree/one.txt")))))
+          (is (= 1500 (count (:bytes (get by "tree/sub/two.txt"))))))
+        (finally (rm-rf dir))))))
+
+(deftest a-tar-gz-composed-with-the-gzip-codec
+  ;; tar does not compress; this is the composition the README documents, checked
+  ;; against `tar -xzf` so the claim is not hypothetical.
+  (if-not (python3?)
+    (println "SKIP tar.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (py dir "
+import gzip, sys
+sys.stdout.write('ok')")
+        (let [archive (tar/build [{:name "in-gz.txt" :bytes (b/str->utf8 "compressed by us")}])
+              gz      (requiring-resolve 'deflate.core/gzip)]
+          (write-bytes (io/file dir "ours.tar.gz") (gz archive))
+          (let [{:keys [exit err]} (shell/sh "tar" "-xzf" "ours.tar.gz" :dir dir)]
+            (is (zero? exit) err))
+          (is (= "compressed by us" (slurp (io/file dir "in-gz.txt")))))
+        (finally (rm-rf dir))))))

@@ -1,0 +1,122 @@
+(ns custody.shamir-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [custody.shamir :as s]))
+
+(defn det-rand
+  "Deterministic stand-in for the caller's CSPRNG. Real callers inject one;
+  tests need reproducibility more than they need entropy."
+  [n]
+  (vec (take n (cycle [7 199 42 3 251 88 17 130 64 5]))))
+
+(def secret [0 1 42 255 128 7])
+
+(defn- by-x [shares xs]
+  (mapv (fn [x] (first (filter #(= x (:share/x %)) shares))) xs))
+
+(defn- combinations [n coll]
+  (cond
+    (zero? n) [[]]
+    (empty? coll) []
+    :else (concat (map #(cons (first coll) %) (combinations (dec n) (rest coll)))
+                  (combinations n (rest coll)))))
+
+(deftest gf-is-a-field
+  (testing "every nonzero element has a multiplicative inverse, and div undoes mul"
+    (is (every? (fn [a] (= a (s/gf-div (s/gf-mul a 173) 173))) (range 1 256))))
+  (testing "multiplication by a nonzero element is a bijection — this is the
+            reason one share short of the threshold determines nothing"
+    (is (= 256 (count (set (map #(s/gf-mul % 173) (range 256)))))))
+  (testing "addition is XOR, so it is its own inverse"
+    (is (= 42 (s/gf-add (s/gf-add 42 199) 199))))
+  (testing "zero absorbs, one is the identity"
+    (is (= 0 (s/gf-mul 0 199)))
+    (is (= 199 (s/gf-mul 1 199))))
+  (testing "division by zero is refused rather than returning a plausible 0"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (s/gf-div 1 0)))))
+
+(deftest any-quorum-reconstructs-and-every-quorum-agrees
+  (let [shares (s/split secret 3 5 det-rand)]
+    (is (= 5 (count shares)))
+    (is (= [1 2 3 4 5] (mapv :share/x shares)))
+    (testing "all ten 3-subsets of the five shares return the same secret"
+      (let [subsets (combinations 3 [1 2 3 4 5])]
+        (is (= 10 (count subsets)))
+        (is (every? (fn [xs] (= secret (s/combine (by-x shares xs)))) subsets))))
+    (testing "more than the threshold is still correct, not merely accepted"
+      (is (= secret (s/combine shares))))))
+
+(deftest one-share-short-of-the-threshold-determines-nothing
+  ;; The information-theoretic claim, exhibited rather than asserted: with a
+  ;; 2-of-3 split of a one-byte secret, hold share 1 and let share 2 range
+  ;; over every value it could possibly have. If the 256 results are 256
+  ;; DISTINCT secrets, then holding one share leaves all 256 secrets exactly
+  ;; as possible as they were before — which is what "reveals nothing" means.
+  (let [shares (s/split [42] 2 3 det-rand)
+        s1 (first (by-x shares [1]))
+        outcomes (set (for [y2 (range 256)]
+                        (first (s/combine [s1 {:share/x 2 :share/y [y2]}]))))]
+    (is (= 256 (count outcomes)))
+    (is (contains? outcomes 42))))
+
+(deftest a-wrong-quorum-returns-a-plausible-secret-instead-of-an-error
+  ;; Shamir has no redundancy to notice with. This test exists so the
+  ;; behaviour is documented by a passing assertion rather than discovered
+  ;; during a recovery — and so the reason custody.model carries a digest is
+  ;; visible from the test suite alone.
+  (let [shares (s/split secret 3 5 det-rand)
+        short-of-quorum (by-x shares [1 2])]
+    (let [wrong (s/combine short-of-quorum)]
+      (is (= (count secret) (count wrong)))
+      (is (not= secret wrong))))
+  (testing "one flipped byte in one share yields a different secret, silently"
+    (let [shares (s/split secret 3 5 det-rand)
+          [a b c] (by-x shares [1 2 3])
+          tampered (update-in c [:share/y 0] #(bit-xor % 1))]
+      (is (not= secret (s/combine [a b tampered]))))))
+
+(deftest split-refuses-parameters-that-cannot-mean-what-they-say
+  (is (= :threshold-below-2 (s/split-error secret 1 5)))
+  (is (= :threshold-above-total (s/split-error secret 6 5)))
+  (is (= :total-above-255 (s/split-error secret 3 256)))
+  (is (= :secret-empty (s/split-error [] 3 5)))
+  (is (= :secret-not-bytes (s/split-error [0 256] 3 5)))
+  (is (nil? (s/split-error secret 3 5)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (s/split secret 1 5 det-rand))))
+
+(deftest randomness-is-drawn-once-and-its-length-is-checked
+  (is (= (* (count secret) 2) (s/shares-needed-random-bytes secret 3)))
+  (testing "a short or over-long draw is refused, not padded or truncated"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (s/split secret 3 5 (fn [_] [1 2 3]))))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (s/split secret 3 5 (fn [n] (vec (repeat (inc n) 1)))))))
+  (testing "non-byte randomness is refused"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (s/split secret 3 5 (fn [n] (vec (repeat n 999))))))))
+
+(deftest combine-refuses-share-sets-it-cannot-interpret
+  (let [shares (s/split secret 3 5 det-rand)]
+    (is (= :duplicate-share-x
+           (s/combine-error (conj (by-x shares [1 2]) (first (by-x shares [1]))))))
+    (is (= :too-few-shares (s/combine-error (by-x shares [1]))))
+    (is (= :share-length-mismatch
+           (s/combine-error [{:share/x 1 :share/y [1 2]} {:share/x 2 :share/y [1]}])))
+    (is (= :share-x-out-of-range
+           (s/combine-error [{:share/x 0 :share/y [1]} {:share/x 2 :share/y [1]}])))))
+
+(deftest the-secret-may-contain-any-byte-including-zero
+  ;; x = 0 is the secret's own coordinate, so a zero BYTE is unremarkable —
+  ;; but a naive implementation that conflates "zero byte" with "no share"
+  ;; breaks here rather than in review.
+  (let [z (vec (repeat 8 0))
+        shares (s/split z 2 3 det-rand)]
+    (is (= z (s/combine (by-x shares [2 3])))))
+  (let [ff (vec (repeat 8 255))
+        shares (s/split ff 2 3 det-rand)]
+    (is (= ff (s/combine (by-x shares [1 3]))))))
+
+(deftest share-length-equals-secret-length
+  ;; Not a nicety: it is the leak the namespace docstring admits to, pinned
+  ;; so nobody later claims the scheme hides length.
+  (let [shares (s/split secret 3 5 det-rand)]
+    (is (every? #(= (count secret) (count (:share/y %))) shares))))

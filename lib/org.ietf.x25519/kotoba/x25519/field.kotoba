@@ -1,0 +1,364 @@
+;; x25519.field -- GF(2^255-19) arithmetic as a pure Kotoba guest
+;; (oracle: this repo, src/x25519/field.cljk).
+;;
+;; A field element is a :vector-i64 of 16 limbs of 16 bits -- the TweetNaCl
+;; shape the oracle gives for the same reason: no big integer exists that both
+;; runtimes name, and every intermediate of the schoolbook product stays well
+;; inside an i64.
+;;
+;; ## Why :vector-i64 rather than :document
+;;
+;; This module was written against :document (a vector of document-i64) and
+;; changed on 2026-09-08. Two reasons, one of them a correctness one:
+;;
+;;   - the native backend admits no typed document CONSTRUCTOR. Measured on
+;;     amu with the osaho gate at 73243145: `(document-i64 42)` alone is
+;;     refused for aarch64-macos, so nothing built on :document could ever be
+;;     a native binary, while :vector-i64 compiles and runs there today.
+;;   - a document vector has no fixed length, so a write past its end grows or
+;;     truncates it silently. `set-limb` rebuilt exactly 16 slots, and `mul`
+;;     used it on the 31-slot product vector -- which therefore lost limbs 16
+;;     to 30 on every multiply. `vector-alloc` fixes the length and
+;;     `vector-assoc` keeps it.
+;;
+;; ## Bounds this guest was shaped by (measured on amu)
+;;
+;;   max-parameters 5   -- loops carry (state, index, one argument) at most
+;;   i64 shift counts   -- must be integer literals in [0,63]
+;;   no rem / mod       -- spelled as bit-and, or as an arithmetic shift
+;;
+;; A :vector-i64 is immutable here, so every write is a new vector; the
+;; oracle's in-place `wr` and `swap!*` have no guest reading.
+;;
+;; ## Not constant-time
+;;
+;; `carry` and `pack` branch on the sign of an intermediate, and `swap-p` /
+;; `swap-q` are data-independent only in the sense that they always run. A
+;; timing side channel is a property of machine code, and this file promises
+;; nothing about that -- the oracle says the same where a caller reads it.
+;;
+;; ## Executed, not merely compiled
+;;
+;; `main` is a self-check that returns the NUMBER of bytes that disagree with
+;; the oracle, over seven known answers. It returns 0 on wasm32 and on
+;; aarch64-macos under kexe_loader. The previous revision of this file
+;; compiled and had no entry to run: measured 2026-09-08 before the fix,
+;; `pack` returned thirty-two zeros for every input, because `swap` returns a
+;; PAIR and `sub-round` used that pair as an element.
+
+(ns x25519.field
+  (:export [one zero copy rd set-limb add sub carry mul square
+            is-negative invert swap-p swap-q unpack pack main]))
+
+;; --- element access ---------------------------------------------------------
+
+(defn rd [a :vector-i64 i :i64] :i64
+  (vector-at a i))
+
+(defn set-limb [a :vector-i64 i :i64 v :i64] :vector-i64
+  (vector-assoc a i v))
+
+;; --- constructors -----------------------------------------------------------
+
+(defn zero [] :vector-i64
+  (vector-alloc 16))
+
+(defn one [] :vector-i64
+  (vector-assoc (vector-alloc 16) 0 1))
+
+(defn- copy-loop [a :vector-i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (copy-loop a (vector-assoc! acc i (vector-at a i)) (+ i 1))))
+
+(defn copy [a :vector-i64] :vector-i64
+  (copy-loop a (vector-alloc 16) 0))
+
+;; --- limbwise add / sub (no carry; callers carry) ---------------------------
+
+(defn- add-loop [a :vector-i64 b :vector-i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (add-loop a b (vector-assoc! acc i (+ (vector-at a i) (vector-at b i))) (+ i 1))))
+
+(defn add [a :vector-i64 b :vector-i64] :vector-i64
+  (add-loop a b (vector-alloc 16) 0))
+
+(defn- sub-loop [a :vector-i64 b :vector-i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (sub-loop a b (vector-assoc! acc i (- (vector-at a i) (vector-at b i))) (+ i 1))))
+
+(defn sub [a :vector-i64 b :vector-i64] :vector-i64
+  (sub-loop a b (vector-alloc 16) 0))
+
+;; --- carry ------------------------------------------------------------------
+;; The oracle spells floor division by 65536 out, because `quot` truncates
+;; toward zero and subtraction leaves limbs negative. An arithmetic right
+;; shift IS floor division on a two's-complement i64, so the guest says that
+;; instead -- one operation, and exact for the negative case the oracle's
+;; comment is about.
+;;
+;; The carry out of limb 15 re-enters at limb 0 multiplied by 38: limb 15 has
+;; weight 2^240, a carry from it has weight 2^256, and 2^255 = 19, so
+;; 2^256 = 38.
+
+(defn- carry-loop [o :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    o
+    (let [x (vector-at o i)
+          c (i64-shift-right x 16)
+          stripped (vector-assoc o i (- x (i64-shift-left c 16)))]
+      (carry-loop
+       (if (< i 15)
+         (vector-assoc stripped (+ i 1) (+ (vector-at stripped (+ i 1)) c))
+         (vector-assoc stripped 0 (+ (vector-at stripped 0) (* 38 c))))
+       (+ i 1)))))
+
+(defn carry [o :vector-i64] :vector-i64
+  (carry-loop o 0))
+
+;; --- schoolbook multiplication ----------------------------------------------
+;; The oracle's exact shape: a 31-slot product vector t, limb 16+i folded back
+;; with weight 38, then carried twice -- the first pass can push limb 0 back
+;; over 2^16 because the wrap-around carry multiplies by 38.
+
+(defn- mul-inner [a :vector-i64 b :vector-i64 i :i64 j :i64 t :vector-i64] :vector-i64
+  ;; `vector-assoc!`, and the bang is earned rather than asserted: this
+  ;; accumulator is returned, `mul-outer` hands it straight back, and `mul`
+  ;; allocates it and reads a value out of it -- which is what
+  ;; `module-linear-returning` checks before admitting the write (kotoba-sema
+  ;; a2ee65ac). Measured on aarch64: the same loop costs 3001 vector handles
+  ;; and 48,016 arena items copying and 1 handle and 16 items in place, and
+  ;; this one runs 256 times per multiply.
+  (if (>= j 16)
+    t
+    (mul-inner a b i (+ j 1)
+               (vector-assoc! t (+ i j)
+                              (+ (vector-at t (+ i j))
+                                 (* (vector-at a i) (vector-at b j)))))))
+
+(defn- mul-outer [a :vector-i64 b :vector-i64 i :i64 t :vector-i64] :vector-i64
+  (if (>= i 16)
+    t
+    (mul-outer a b (+ i 1) (mul-inner a b i 0 t))))
+
+(defn- fold38 [t :vector-i64 p :i64] :vector-i64
+  (if (>= p 15)
+    t
+    (fold38 (vector-assoc t p (+ (vector-at t p) (* 38 (vector-at t (+ p 16))))) (+ p 1))))
+
+(defn- first-16 [t :vector-i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (first-16 t (vector-assoc! acc i (vector-at t i)) (+ i 1))))
+
+(defn mul [a :vector-i64 b :vector-i64] :vector-i64
+  (let [t (mul-outer a b 0 (vector-alloc 31))
+        folded (fold38 t 0)]
+    (carry (carry (first-16 folded (vector-alloc 16) 0)))))
+
+(defn square [a :vector-i64] :vector-i64
+  (mul a a))
+
+(defn is-negative [a :vector-i64] :bool
+  (< (vector-at a 0) 0))
+
+;; --- invert -----------------------------------------------------------------
+;; a^(p-2) = a^-1, by square-and-multiply over the fixed exponent 2^255-21.
+;; Bits 2 and 4 are the only zeros: the loop skips exactly those two
+;; multiplications, verbatim from the oracle.
+
+(defn- inv-step [c :vector-i64 a :vector-i64 i :i64] :vector-i64
+  (let [sqd (square c)]
+    (if (if (= i 2) true (= i 4))
+      sqd
+      (mul sqd a))))
+
+(defn- inv-loop [c :vector-i64 a :vector-i64 i :i64] :vector-i64
+  (if (< i 0)
+    c
+    (inv-loop (inv-step c a i) a (- i 1))))
+
+(defn invert [a :vector-i64] :vector-i64
+  (inv-loop (copy a) a 253))
+
+;; --- conditional swap -------------------------------------------------------
+;; Exchange p and q when b is 1, by arithmetic mask -- the same mask the
+;; oracle uses, over immutable vectors instead of in-place writes.
+;;
+;; Two functions rather than one, because a guest function returns ONE value
+;; and a swap produces two. The previous revision returned a two-element
+;; vector holding both, and its one caller used that pair as if it were a
+;; field element; `pack` then read limbs past the end and answered zero for
+;; every input. Splitting makes that shape unspellable.
+
+(defn- swap-limb [p :vector-i64 q :vector-i64 mask :i64 i :i64] :i64
+  (bit-and mask (bit-xor (vector-at p i) (vector-at q i))))
+
+(defn- swap-p-loop [p :vector-i64 q :vector-i64 mask :i64 i :i64] :vector-i64
+  (if (>= i 16)
+    p
+    (swap-p-loop (vector-assoc p i (bit-xor (vector-at p i) (swap-limb p q mask i)))
+                 q mask (+ i 1))))
+
+(defn- swap-q-loop [p :vector-i64 q :vector-i64 mask :i64 i :i64] :vector-i64
+  (if (>= i 16)
+    q
+    (swap-q-loop p
+                 (vector-assoc q i (bit-xor (vector-at q i) (swap-limb p q mask i)))
+                 mask (+ i 1))))
+
+(defn swap-p [p :vector-i64 q :vector-i64 b :i64] :vector-i64
+  (swap-p-loop p q (- 0 b) 0))
+
+(defn swap-q [p :vector-i64 q :vector-i64 b :i64] :vector-i64
+  (swap-q-loop p q (- 0 b) 0))
+
+;; --- unpack / pack ----------------------------------------------------------
+;; unpack masks the top bit of the last byte, which RFC 7748 section 5's
+;; decodeUCoordinate requires: a u-coordinate is 255 bits and a sender that
+;; sets bit 255 must not change the result.
+
+(defn- unpack-loop [bs :vector-i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (let [limb (+ (vector-at bs (* 2 i)) (* 256 (vector-at bs (+ (* 2 i) 1))))]
+      (unpack-loop bs
+                   (vector-assoc! acc i (if (= i 15) (bit-and limb 32767) limb))
+                   (+ i 1)))))
+
+(defn unpack [bs :vector-i64] :vector-i64
+  (unpack-loop bs (vector-alloc 16) 0))
+
+;; pack: fully reduced 32 bytes. The two subtraction rounds are what make the
+;; output canonical -- after carrying a value can still be in [p, 2^255), and
+;; two different limb vectors for the same element must encode identically.
+
+(defn- sub-round [t :vector-i64 round :i64] :vector-i64
+  (let [m0 (- (vector-at t 0) 65517)
+        m1 (- (- (vector-at t 1) 65535) (if (< m0 0) 1 0))
+        m2 (- (- (vector-at t 2) 65535) (if (< m1 0) 1 0))
+        m3 (- (- (vector-at t 3) 65535) (if (< m2 0) 1 0))
+        m4 (- (- (vector-at t 4) 65535) (if (< m3 0) 1 0))
+        m5 (- (- (vector-at t 5) 65535) (if (< m4 0) 1 0))
+        m6 (- (- (vector-at t 6) 65535) (if (< m5 0) 1 0))
+        m7 (- (- (vector-at t 7) 65535) (if (< m6 0) 1 0))
+        m8 (- (- (vector-at t 8) 65535) (if (< m7 0) 1 0))
+        m9 (- (- (vector-at t 9) 65535) (if (< m8 0) 1 0))
+        m10 (- (- (vector-at t 10) 65535) (if (< m9 0) 1 0))
+        m11 (- (- (vector-at t 11) 65535) (if (< m10 0) 1 0))
+        m12 (- (- (vector-at t 12) 65535) (if (< m11 0) 1 0))
+        m13 (- (- (vector-at t 13) 65535) (if (< m12 0) 1 0))
+        m14 (- (- (vector-at t 14) 65535) (if (< m13 0) 1 0))
+        m15 (- (- (vector-at t 15) 32767) (if (< m14 0) 1 0))
+        borrow (if (< m15 0) 1 0)
+        m (vector-assoc
+           (vector-assoc
+            (vector-assoc
+             (vector-assoc
+              (vector-assoc
+               (vector-assoc
+                (vector-assoc
+                 (vector-assoc
+                  (vector-assoc
+                   (vector-assoc
+                    (vector-assoc
+                     (vector-assoc
+                      (vector-assoc
+                       (vector-assoc
+                        (vector-assoc
+                         (vector-assoc (vector-alloc 16) 0 (bit-and m0 65535))
+                         1 (bit-and m1 65535))
+                        2 (bit-and m2 65535))
+                       3 (bit-and m3 65535))
+                      4 (bit-and m4 65535))
+                     5 (bit-and m5 65535))
+                    6 (bit-and m6 65535))
+                   7 (bit-and m7 65535))
+                  8 (bit-and m8 65535))
+                 9 (bit-and m9 65535))
+                10 (bit-and m10 65535))
+               11 (bit-and m11 65535))
+              12 (bit-and m12 65535))
+             13 (bit-and m13 65535))
+            14 (bit-and m14 65535))
+           15 m15)
+        ;; No borrow means t was at least p, so the reduced value m is the
+        ;; canonical one and replaces it.
+        chosen (swap-p t m (- 1 borrow))]
+    (if (= round 0)
+      (sub-round chosen 1)
+      chosen)))
+
+(defn- pack-bytes [t :vector-i64 acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 16)
+    acc
+    (let [limb (vector-at t i)]
+      (pack-bytes t
+                  ;; Chained, and the chain is what keeps `acc` to ONE use:
+                  ;; the outer write's target is the inner call's RESULT, not
+                  ;; the name, so the analysis sees one consuming use of the
+                  ;; handle rather than two.
+                  (vector-assoc! (vector-assoc! acc (* 2 i) (bit-and limb 255))
+                                 (+ (* 2 i) 1)
+                                 (bit-and (i64-shift-right limb 8) 255))
+                  (+ i 1)))))
+
+(defn pack [a :vector-i64] :vector-i64
+  (pack-bytes (sub-round (carry (carry (carry a))) 0) (vector-alloc 32) 0))
+
+;; --- self-check --------------------------------------------------------------
+;; Known answers from the oracle (src/x25519/field.cljk), taken by running it:
+;;   a = unpack [0 1 2 ... 31]      b = unpack [255 254 ... 224]
+;; `main` returns the NUMBER of disagreeing bytes, not a boolean: a count
+;; distinguishes one regression from a build that answers nothing right.
+
+(defn- want-round [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 1 1) 2 2) 3 3) 4 4) 5 5) 6 6) 7 7) 8 8) 9 9) 10 10) 11 11) 12 12) 13 13) 14 14) 15 15) 16 16) 17 17) 18 18) 19 19) 20 20) 21 21) 22 22) 23 23) 24 24) 25 25) 26 26) 27 27) 28 28) 29 29) 30 30) 31 31))
+
+(defn- want-add [] :vector-i64
+  (vector-assoc (vector-alloc 32) 0 18))
+
+(defn- want-sub [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 238) 1 1) 2 4) 3 6) 4 8) 5 10) 6 12) 7 14) 8 16) 9 18) 10 20) 11 22) 12 24) 13 26) 14 28) 15 30) 16 32) 17 34) 18 36) 19 38) 20 40) 21 42) 22 44) 23 46) 24 48) 25 50) 26 52) 27 54) 28 56) 29 58) 30 60) 31 62))
+
+(defn- want-mul [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 116) 1 37) 2 247) 3 215) 4 236) 5 90) 6 71) 7 215) 8 47) 9 118) 10 207) 11 96) 12 79) 13 192) 14 216) 15 189) 16 148) 17 130) 18 172) 19 55) 20 73) 21 6) 22 148) 23 23) 24 182) 25 148) 26 216) 27 166) 28 36) 29 119) 30 195) 31 46))
+
+(defn- want-sq [] :vector-i64
+  (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-assoc (vector-alloc 32) 0 216) 1 236) 2 44) 3 94) 4 91) 5 255) 6 36) 7 167) 8 96) 9 44) 10 229) 11 101) 12 137) 13 42) 14 36) 15 81) 16 140) 17 176) 18 152) 19 31) 20 32) 21 117) 22 249) 23 135) 24 251) 25 46) 26 253) 27 64) 28 213) 29 148) 30 90) 31 1))
+
+(defn- a-bytes-loop [acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 32) acc (a-bytes-loop (vector-assoc acc i i) (+ i 1))))
+
+(defn- b-bytes-loop [acc :vector-i64 i :i64] :vector-i64
+  (if (>= i 32) acc (b-bytes-loop (vector-assoc acc i (- 255 i)) (+ i 1))))
+
+(defn- a-in [] :vector-i64 (unpack (a-bytes-loop (vector-alloc 32) 0)))
+(defn- b-in [] :vector-i64 (unpack (b-bytes-loop (vector-alloc 32) 0)))
+
+(defn- diff [got :vector-i64 want :vector-i64 n :i64 i :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (diff got want n (+ i 1)
+          (if (= (vector-at got i) (vector-at want i)) acc (+ acc 1)))))
+
+(defn main [] :i64
+  ;; a and b are bound once. Every call to `a-in` mints about fifty vectors,
+  ;; and a native artifact's vector arena is bounded (KEXE_VECTOR_CAPACITY /
+  ;; KEXE_VECTOR_ITEM_CAPACITY in amu's kexe_loader.c): measured 2026-09-08,
+  ;; recomputing them per check exhausted it after seven of the nine and the
+  ;; loader reported `{:kind :signal :signal :SIGILL}` -- an unnamed trap, not
+  ;; a wrong answer.
+  (let [a (a-in)
+        b (b-in)]
+    (+ (diff (pack a) (want-round) 32 0 0)
+       (+ (diff (pack (add a b)) (want-add) 32 0 0)
+          (+ (diff (pack (sub a b)) (want-sub) 32 0 0)
+             (+ (diff (pack (mul a b)) (want-mul) 32 0 0)
+                (+ (diff (pack (square a)) (want-sq) 32 0 0)
+                   (+ (diff (swap-p a b 1) b 16 0 0)
+                      (+ (diff (swap-q a b 1) a 16 0 0)
+                         (+ (diff (swap-p a b 0) a 16 0 0)
+                            (diff (swap-q a b 0) b 16 0 0)))))))))))

@@ -1,0 +1,708 @@
+(ns arrangement.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:cljs [cljs.test :refer [async]])
+            [kotoba.lang.text :as str]
+            #?(:clj [kotoba.lang.edn :as edn] :cljs [cljs.reader :as edn])
+            [arrangement.core :as qs]
+            [multiformats.core :as mf]
+            [prolly-tree.core :as pt]
+            [ipld.core :as ipld]
+            [ipld.value :as v])
+  #?(:clj (:import [javax.crypto Cipher Mac]
+                   [javax.crypto.spec SecretKeySpec GCMParameterSpec]
+                   [java.util Base64])))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+;; ── ADR-2607051000 test crypto (accepted 2026-07-06; cljs/crypto.subtle
+;; sibling added per the ADR's Worker-addendum follow-up) ────────────────────
+;; Real AES-256-GCM + HMAC-SHA256, not a mock, on BOTH platforms now:
+;; `javax.crypto` on the JVM (synchronous), `crypto.subtle` on cljs
+;; (Promise-based -- Web Crypto has no synchronous AEAD/HMAC primitive, see
+;; `arrangement.core`'s platform-contract note on `index-root`). Same
+;; algorithm choice, same deterministic-nonce construction, same key
+;; material (byte-identical `test-dek`/`test-blind-key`/`test-nonce-key`
+;; ranges) on both sides -- only the calling convention (direct value vs.
+;; `js/Promise`) differs.
+#?(:clj
+   (def ^:private test-dek
+     (SecretKeySpec. (byte-array (range 1 33)) "AES")))
+
+#?(:clj
+   (def ^:private test-blind-key
+     (SecretKeySpec. (byte-array (range 33 65)) "HmacSHA256")))
+
+#?(:clj
+   (def ^:private test-nonce-key
+     (SecretKeySpec. (byte-array (range 65 97)) "HmacSHA256")))
+
+#?(:clj
+   (defn test-encrypt-fn
+     "AES-256-GCM seal: 12-byte nonce ++ ciphertext-with-tag, one combined
+     byte blob (same wire shape kotoba-crypto's own hpke.rs uses: nonce ++
+     ciphertext, no separate framing needed).
+
+     The nonce is DERIVED, not random: HMAC-SHA256(test-nonce-key,
+     plaintext) truncated to 12 bytes -- a simplified synthetic-IV /
+     deterministic-AEAD construction (a known-good composition of two
+     standard primitives, not a hand-rolled cipher). This matters for
+     `arrangement.core/commit!`'s content-addressing: a RANDOM-nonce
+     encrypt-fn would make even a byte-identical db produce a different
+     snapshot CID on every commit, silently breaking `fold!`'s documented
+     'concurrent folds of the same state are... cheap [no-op-restore]'
+     property. Nonce-uniqueness-per-plaintext (what GCM actually requires)
+     still holds: two DIFFERENT plaintexts under the same key get
+     different HMAC outputs, hence different nonces, with overwhelming
+     probability -- only *identical* plaintexts intentionally reuse the
+     same nonce, which is safe (same ciphertext both times, not a
+     different-plaintext collision)."
+     [^bytes plaintext]
+     (let [mac (Mac/getInstance "HmacSHA256")
+           _ (.init mac test-nonce-key)
+           nonce (byte-array (take 12 (.doFinal mac plaintext)))
+           cipher (Cipher/getInstance "AES/GCM/NoPadding")]
+       (.init cipher Cipher/ENCRYPT_MODE test-dek (GCMParameterSpec. 128 nonce))
+       (byte-array (concat nonce (.doFinal cipher plaintext))))))
+
+#?(:clj
+   (defn test-decrypt-fn
+     "Inverse of `test-encrypt-fn`: split the leading 12-byte nonce back off,
+     decrypt the rest."
+     [^bytes blob]
+     (let [nonce (byte-array (take 12 blob))
+           ct (byte-array (drop 12 blob))
+           cipher (Cipher/getInstance "AES/GCM/NoPadding")]
+       (.init cipher Cipher/DECRYPT_MODE test-dek (GCMParameterSpec. 128 nonce))
+       (.doFinal cipher ct))))
+
+#?(:clj
+   (defn test-blind-fn
+     "Keyed, deterministic MAC (HMAC-SHA256 -> base64) over the printed
+     component -- same value in, same blinded token out, so a caller who
+     knows the plaintext prefix can independently re-derive it to seek."
+     [component]
+     (let [mac (Mac/getInstance "HmacSHA256")]
+       (.init mac test-blind-key)
+       (let [digest (.doFinal mac (.getBytes (pr-str component) "UTF-8"))]
+         (.encodeToString (Base64/getEncoder) digest)))))
+
+#?(:cljs
+   (def ^:private subtle (.-subtle js/crypto)))
+
+#?(:cljs
+   (def ^:private test-dek-bytes (js/Uint8Array. (clj->js (vec (range 1 33))))))
+
+#?(:cljs
+   (def ^:private test-blind-key-bytes (js/Uint8Array. (clj->js (vec (range 33 65))))))
+
+#?(:cljs
+   (def ^:private test-nonce-key-bytes (js/Uint8Array. (clj->js (vec (range 65 97))))))
+
+#?(:cljs
+   (defn- import-aes-key []
+     (.importKey subtle "raw" test-dek-bytes #js {:name "AES-GCM"} false #js ["encrypt" "decrypt"])))
+
+#?(:cljs
+   (defn- import-hmac-key [key-bytes]
+     (.importKey subtle "raw" key-bytes #js {:name "HMAC" :hash "SHA-256"} false #js ["sign"])))
+
+#?(:cljs
+   (defn- concat-bytes [^js a ^js b]
+     (let [out (js/Uint8Array. (+ (.-byteLength a) (.-byteLength b)))]
+       (.set out a 0)
+       (.set out b (.-byteLength a))
+       out)))
+
+#?(:cljs
+   (defn- bytes->base64 [^js buf]
+     (let [bytes (js/Uint8Array. buf)
+           bin (.. js/Array -prototype -reduce
+                   (call bytes (fn [acc b] (str acc (.fromCharCode js/String b))) ""))]
+       (js/btoa bin))))
+
+#?(:cljs
+   (defn- bytes->latin1-str
+     "Every byte value 0-255 maps to a char with no decode errors -- the
+     cljs sibling of the JVM tests' `(String. bytes \"ISO-8859-1\")`, used
+     only to substring-search arbitrary ciphertext bytes for plaintext
+     leakage, never to recover real text."
+     [^js bytes]
+     (.. js/Array -prototype -reduce
+         (call (js/Uint8Array. bytes) (fn [acc b] (str acc (.fromCharCode js/String b))) ""))))
+
+#?(:cljs
+   (defn test-encrypt-fn
+     "cljs sibling of the JVM `test-encrypt-fn` -- same AES-256-GCM seal,
+     same HMAC-derived deterministic-nonce construction (see the JVM
+     version's docstring for why determinism matters here), via
+     `crypto.subtle` (this platform's only AEAD/HMAC primitive -- no
+     synchronous alternative exists in a Worker/browser runtime). Returns
+     a `js/Promise` of nonce ++ ciphertext-with-tag as one `js/Uint8Array`
+     (same combined wire shape the JVM side produces)."
+     [plaintext]
+     (-> (js/Promise.all #js [(import-hmac-key test-nonce-key-bytes) (import-aes-key)])
+         (.then (fn [[nonce-key aes-key]]
+                  (-> (.sign subtle #js {:name "HMAC"} nonce-key plaintext)
+                      (.then (fn [mac] (.slice (js/Uint8Array. mac) 0 12)))
+                      (.then (fn [nonce]
+                               (-> (.encrypt subtle #js {:name "AES-GCM" :iv nonce :tagLength 128} aes-key plaintext)
+                                   (.then (fn [ct] (concat-bytes nonce (js/Uint8Array. ct)))))))))))))
+
+#?(:cljs
+   (defn test-decrypt-fn
+     "Inverse of `test-encrypt-fn`: split the leading 12-byte nonce back
+     off, decrypt the rest. Returns a `js/Promise` of the plaintext bytes."
+     [^js blob]
+     (let [bytes (js/Uint8Array. blob)
+           nonce (.slice bytes 0 12)
+           ct (.slice bytes 12)]
+       (-> (import-aes-key)
+           (.then (fn [aes-key] (.decrypt subtle #js {:name "AES-GCM" :iv nonce :tagLength 128} aes-key ct)))
+           (.then (fn [pt] (js/Uint8Array. pt)))))))
+
+#?(:cljs
+   (defn test-blind-fn
+     "Keyed, deterministic MAC (HMAC-SHA256 -> base64) over the printed
+     component -- same value in, same blinded token out. Returns a
+     `js/Promise<string>`."
+     [component]
+     (-> (import-hmac-key test-blind-key-bytes)
+         (.then (fn [key] (.sign subtle #js {:name "HMAC"}
+                                 key (.encode (js/TextEncoder.) (pr-str component)))))
+         (.then bytes->base64))))
+
+(deftest assert-and-lookup
+  (let [db (-> (qs/empty-db)
+               (qs/assert-quad {:s "alice" :p "role" :o "admin"})
+               (qs/assert-quad {:s "alice" :p "name" :o "Alice"})
+               (qs/assert-quad {:s "bob" :p "role" :o "user"}))]
+    (is (= {"role" #{"admin"} "name" #{"Alice"}} (qs/entity-attrs db "alice")))
+    (is (= {"alice" #{"admin"} "bob" #{"user"}} (qs/by-predicate db "role")))
+    (is (= #{"alice"} (qs/by-predicate-value db "role" "admin")))
+    (is (= #{"bob"} (qs/by-predicate-value db "role" "user")))))
+
+(deftest retract-removes-from-all-4-indices
+  (let [db (-> (qs/empty-db)
+               (qs/assert-quad {:s "alice" :p "role" :o "admin"})
+               (qs/retract-quad {:s "alice" :p "role" :o "admin"}))]
+    (is (= {} (qs/entity-attrs db "alice")))
+    (is (= {} (qs/by-predicate db "role")))
+    (is (= #{} (qs/by-predicate-value db "role" "admin")))))
+
+(deftest ref-indexing-is-opt-in
+  (let [ref? #(str/starts-with? % "bafy")
+        db (-> (qs/empty-db)
+               (qs/assert-quad {:s "alice" :p "knows" :o "bafybob"} ref?)
+               (qs/assert-quad {:s "alice" :p "name" :o "Alice"} ref?))]
+    (is (= {"knows" #{"alice"}} (qs/refs-to db "bafybob")))
+    (is (= {} (qs/refs-to db "Alice")) "non-ref object is not reverse-indexed")))
+
+(def ^:private bafy-link
+  (ipld/link "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m"))
+
+(deftest ref-indexing-naturalizes-to-ipld-link
+  ;; ADR-2607050200: ref? defaults to ipld/link? instead of requiring every
+  ;; caller to pass its own predicate (ADR-2607023200 §6-4).
+  (let [db (-> (qs/empty-db)
+               (qs/assert-quad {:s "alice" :p "knows" :o bafy-link})
+               (qs/assert-quad {:s "alice" :p "name" :o "Alice"}))]
+    (testing "default ref? indexes Link values automatically"
+      (is (= {"knows" #{"alice"}} (qs/refs-to db bafy-link))))
+    (testing "a plain string is never mistaken for a ref, even one shaped like a CID"
+      (is (= {} (qs/refs-to db "Alice"))))
+    (testing "retract-quad's matching default un-indexes it"
+      (let [db2 (qs/retract-quad db {:s "alice" :p "knows" :o bafy-link})]
+        (is (= {} (qs/refs-to db2 bafy-link)))))))
+
+(deftest link-edn-safe-roundtrip
+  (testing "a Link survives pr-str/edn-read-string via the edn-safe form"
+    (is (= bafy-link (qs/edn->link (edn/read-string (pr-str (qs/link->edn bafy-link)))))))
+  (testing "non-Link values pass through both directions unchanged"
+    (is (= "alice" (qs/link->edn "alice")))
+    (is (= "alice" (qs/edn->link "alice")))))
+
+;; ── ADR-2607051000 (accepted 2026-07-06): ciphertext-over-CID persistence ───
+;; `qs/commit!`/`index-root` now REQUIRE `blind-fn`/`encrypt-fn` -- no silent
+;; default, matching this codebase's established `schema-version`/`visible?`
+;; discipline (ADR-2607050700). JVM block below is synchronous, as merged;
+;; the cljs mirror (further down, same test names/assertions) is
+;; Promise-based via `cljs.test/async`, since `qs/commit!`/`index-root`
+;; return a `js/Promise` on that platform (see `arrangement.core`'s
+;; platform-contract note).
+#?(:clj
+   (deftest test-crypto-helpers-are-deterministic-and-round-trip
+     (testing "encrypt-fn is deterministic per plaintext (required for commit! idempotency, see commit-is-content-addressed)"
+       (is (= (seq (test-encrypt-fn (.getBytes "same input" "UTF-8")))
+              (seq (test-encrypt-fn (.getBytes "same input" "UTF-8"))))))
+     (testing "encrypt-fn output differs for different plaintexts (nonce doesn't collide in practice)"
+       (is (not= (seq (test-encrypt-fn (.getBytes "input a" "UTF-8")))
+                 (seq (test-encrypt-fn (.getBytes "input b" "UTF-8"))))))
+     (testing "decrypt-fn inverts encrypt-fn"
+       (is (= "round-trip me" (String. ^bytes (test-decrypt-fn (test-encrypt-fn (.getBytes "round-trip me" "UTF-8"))) "UTF-8"))))
+     (testing "blind-fn is deterministic and one-way (doesn't leak the plaintext in the token)"
+       (is (= (test-blind-fn "alice") (test-blind-fn "alice")))
+       (is (not (str/includes? (test-blind-fn "alice") "alice"))))))
+
+#?(:clj
+   (deftest commit-preserves-link-values-through-index-root
+     (let [{:keys [put! get-fn]} (mem-store)
+           db (qs/assert-quad (qs/empty-db) {:s "alice" :p "knows" :o bafy-link})
+           cid (qs/commit! put! db nil qs/current-schema-version
+                            test-blind-fn test-encrypt-fn)
+           node (ipld/decode (get-fn cid))
+           spo-root (ipld/link-cid (get-in node ["index-roots" "spo"]))
+           [[_ leaf-val]] (pt/scan-prefix get-fn spo-root "")
+           ;; schema-version 2: no `edn->link` on the value path. `kotoba.value.v1`
+           ;; carries a Link as a real tag-42 value, so it decodes straight back
+           ;; to a Link -- the `["ipld/link" cid]` textual stand-in is only the
+           ;; KEY path's concern now (and the version-1 read path's).
+           [_ _ o] (v/decode-value (test-decrypt-fn leaf-val))]
+       (is (= bafy-link o)
+           "the Link comes back out of the persisted, encrypted index VALUE intact -- not the key, which is one-way blinded and cannot be inverted"))))
+
+#?(:clj
+   (deftest index-root-key-is-blinded-value-is-encrypted-not-plaintext
+     ;; The correctness bug this test guards against: ADR-2607051000's
+     ;; original text claimed "no separate value encryption step is needed
+     ;; -- the datom's actual payload... is exactly the s/p/o triple that's
+     ;; now blinded." That's wrong (HMAC is one-way); the addendum
+     ;; (ADR-2607061800/2607061900 follow-up) corrected it: the VALUE now
+     ;; carries the encrypted triple, the KEY stays blind-only. This test
+     ;; asserts both halves of that correction directly against real
+     ;; persisted bytes, not just the round-trip.
+     (let [{:keys [put! get-fn]} (mem-store)
+           secret "admin-secret-value"
+           db (qs/assert-quad (qs/empty-db) {:s "alice" :p "role" :o secret})
+           cid (qs/commit! put! db nil qs/current-schema-version
+                            test-blind-fn test-encrypt-fn)
+           node (ipld/decode (get-fn cid))
+           spo-root (ipld/link-cid (get-in node ["index-roots" "spo"]))
+           [[leaf-key leaf-val]] (pt/scan-prefix get-fn spo-root "")]
+       (testing "the leaf key never contains any plaintext component"
+         (is (not (str/includes? leaf-key "alice")))
+         (is (not (str/includes? leaf-key "role")))
+         (is (not (str/includes? leaf-key secret))))
+       (testing "the leaf value is opaque ciphertext bytes, not the plaintext triple"
+         (is (bytes? leaf-val))
+         (is (not (str/includes? (String. ^bytes leaf-val "ISO-8859-1") secret))))
+       (testing "decrypting the value recovers the real triple"
+         ;; schema-version 2: the value slot is `kotoba.value.v1`, not the node
+         ;; codec. Decoding it with `ipld/decode` now yields the codec's own
+         ;; `[type-code payload]` form rather than the triple — which is the
+         ;; point: the value is self-describing about each component's TYPE.
+         (is (= ["alice" "role" secret]
+                (v/decode-value (test-decrypt-fn leaf-val))))))))
+
+#?(:clj
+   (deftest commit-is-content-addressed
+     (let [{:keys [put! store]} (mem-store)
+           db (-> (qs/empty-db)
+                  (qs/assert-quad {:s "alice" :p "role" :o "admin"})
+                  (qs/assert-quad {:s "bob" :p "role" :o "user"}))
+           cid1 (qs/commit! put! db nil qs/current-schema-version
+                             test-blind-fn test-encrypt-fn)
+           cid2 (qs/commit! put! db nil qs/current-schema-version
+                             test-blind-fn test-encrypt-fn)]
+       (testing "same db + prev -> same commit CID"
+         ;; Preserved as `=` (not `not=`) specifically because
+         ;; `test-encrypt-fn` derives its nonce deterministically from the
+         ;; plaintext -- content-addressing idempotency (which `fold!`'s
+         ;; own docstring relies on: "concurrent folds of the same state
+         ;; are safe, redundant, and cheap") only survives encryption if
+         ;; the encrypt-fn a caller supplies is itself deterministic per
+         ;; plaintext. A random-nonce encrypt-fn would make this `not=`
+         ;; instead -- a real, silent regression this test would have
+         ;; caught if `test-encrypt-fn` had stayed random-nonce.
+         (is (= cid1 cid2)))
+       (testing "different prev -> different commit CID"
+         (is (not= cid1 (qs/commit! put! db (mf/kotoba-cid "some-other-prev") qs/current-schema-version
+                                     test-blind-fn test-encrypt-fn))))
+       (testing "different db -> different commit CID"
+         (let [db2 (qs/assert-quad db {:s "carol" :p "role" :o "user"})]
+           (is (not= cid1 (qs/commit! put! db2 nil qs/current-schema-version
+                                       test-blind-fn test-encrypt-fn)))))
+       (testing "different schema-version -> different commit CID"
+         ;; must be a version that is NOT `current-schema-version` — this read
+         ;; `2` back when current was 1, and silently became a no-op assertion
+         ;; the moment VC3 bumped current to 2.
+         (is (not= qs/current-schema-version 99))
+         (is (not= cid1 (qs/commit! put! db nil 99 test-blind-fn test-encrypt-fn))))
+       (is (contains? @store cid1)))))
+
+#?(:clj
+   (deftest commit-block-is-real-ipld
+     (let [{:keys [put! get-fn]} (mem-store)
+           db (-> (qs/empty-db)
+                  (qs/assert-quad {:s "alice" :p "role" :o "admin"}))
+           prev (qs/commit! put! (qs/empty-db) nil qs/current-schema-version
+                             test-blind-fn test-encrypt-fn)
+           cid (qs/commit! put! db prev qs/current-schema-version
+                            test-blind-fn test-encrypt-fn)
+           node (ipld/decode (get-fn cid))]
+       (testing "index roots and prev are tag-42 links (nil for empty indexes)"
+         (is (ipld/link? (get-in node ["index-roots" "spo"])))
+         (is (ipld/link? (get node "prev")))
+         (is (= prev (ipld/link-cid (get node "prev")))))
+       (testing "generic ipld/links walk reaches every root + prev, all fetchable"
+         (is (seq (ipld/links node)))
+         (doseq [c (ipld/links node)]
+           (is (= c (ipld/cid (get-fn c))))))
+       (testing "empty db commit has null roots"
+         (let [n0 (ipld/decode (get-fn prev))]
+           (is (nil? (get-in n0 ["index-roots" "spo"])))
+           (is (nil? (get n0 "prev"))))))))
+
+#?(:clj
+   (deftest commit-schema-version-is-required-and-caller-declared
+     ;; ADR-2607050500 "Schema evolution": the caller states the version being
+     ;; written -- no silent default, and a different version really does
+     ;; produce a different persisted node.
+     (let [{:keys [put! get-fn]} (mem-store)
+           cid (qs/commit! put! (qs/empty-db) nil qs/current-schema-version
+                            test-blind-fn test-encrypt-fn)
+           node (ipld/decode (get-fn cid))]
+       (is (= qs/current-schema-version (get node "schema-version")))
+       (is (= 2 (get (ipld/decode (get-fn (qs/commit! put! (qs/empty-db) nil 2
+                                                        test-blind-fn test-encrypt-fn)))
+                     "schema-version"))))))
+
+;; ── cljs mirror of the block above: same test names/assertions, Promise-
+;; based via `cljs.test/async` since `qs/commit!`/`index-root`/the crypto
+;; helpers all return a `js/Promise` on this platform.
+#?(:cljs
+   (deftest test-crypto-helpers-are-deterministic-and-round-trip
+     (async done
+       (-> (js/Promise.all
+            #js [(test-encrypt-fn (.encode (js/TextEncoder.) "same input"))
+                 (test-encrypt-fn (.encode (js/TextEncoder.) "same input"))
+                 (test-encrypt-fn (.encode (js/TextEncoder.) "input a"))
+                 (test-encrypt-fn (.encode (js/TextEncoder.) "input b"))
+                 (test-encrypt-fn (.encode (js/TextEncoder.) "round-trip me"))])
+           (.then (fn [results]
+                    (let [[e1 e2 ea eb ert] (js->clj results)]
+                      (testing "encrypt-fn is deterministic per plaintext (required for commit! idempotency, see commit-is-content-addressed)"
+                        (is (= (vec e1) (vec e2))))
+                      (testing "encrypt-fn output differs for different plaintexts (nonce doesn't collide in practice)"
+                        (is (not= (vec ea) (vec eb))))
+                      (-> (test-decrypt-fn ert)
+                          (.then (fn [pt]
+                                   (testing "decrypt-fn inverts encrypt-fn"
+                                     (is (= "round-trip me" (.decode (js/TextDecoder.) pt))))
+                                   (-> (js/Promise.all #js [(test-blind-fn "alice") (test-blind-fn "alice")])
+                                       (.then (fn [[b1 b2]]
+                                                (testing "blind-fn is deterministic and one-way (doesn't leak the plaintext in the token)"
+                                                  (is (= b1 b2))
+                                                  (is (not (str/includes? b1 "alice"))))
+                                                (done))))))))))))))
+
+#?(:cljs
+   (deftest commit-preserves-link-values-through-index-root
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             db (qs/assert-quad (qs/empty-db) {:s "alice" :p "knows" :o bafy-link})]
+         (-> (qs/commit! put! db nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+             (.then (fn [cid]
+                      (let [node (ipld/decode (get-fn cid))
+                            spo-root (ipld/link-cid (get-in node ["index-roots" "spo"]))
+                            [[_ leaf-val]] (pt/scan-prefix get-fn spo-root "")]
+                        (-> (test-decrypt-fn leaf-val)
+                            (.then (fn [pt-bytes]
+                                     ;; schema-version 2: no `edn->link` on the
+                                     ;; value path -- kotoba.value.v1 carries a
+                                     ;; Link as a real tag-42 value.
+                                     (let [[_ _ o] (v/decode-value pt-bytes)]
+                                       (is (= bafy-link o)
+                                           "the Link comes back out of the persisted, encrypted index VALUE intact -- not the key, which is one-way blinded and cannot be inverted"))
+                                     (done))))))))))))
+
+#?(:cljs
+   (deftest index-root-key-is-blinded-value-is-encrypted-not-plaintext
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             secret "admin-secret-value"
+             db (qs/assert-quad (qs/empty-db) {:s "alice" :p "role" :o secret})]
+         (-> (qs/commit! put! db nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+             (.then (fn [cid]
+                      (let [node (ipld/decode (get-fn cid))
+                            spo-root (ipld/link-cid (get-in node ["index-roots" "spo"]))
+                            [[leaf-key leaf-val]] (pt/scan-prefix get-fn spo-root "")]
+                        (testing "the leaf key never contains any plaintext component"
+                          (is (not (str/includes? leaf-key "alice")))
+                          (is (not (str/includes? leaf-key "role")))
+                          (is (not (str/includes? leaf-key secret))))
+                        (testing "the leaf value is opaque ciphertext bytes, not the plaintext triple"
+                          (is (instance? js/Uint8Array leaf-val))
+                          (is (not (str/includes? (bytes->latin1-str leaf-val) secret))))
+                        (-> (test-decrypt-fn leaf-val)
+                            (.then (fn [pt-bytes]
+                                     (testing "decrypting the value recovers the real triple"
+                                       ;; schema-version 2: value slot is
+                                       ;; kotoba.value.v1, not the node codec.
+                                       (is (= ["alice" "role" secret] (v/decode-value pt-bytes))))
+                                     (done))))))))))))
+
+#?(:cljs
+   (deftest commit-is-content-addressed
+     (async done
+       (let [{:keys [put! store]} (mem-store)
+             db (-> (qs/empty-db)
+                    (qs/assert-quad {:s "alice" :p "role" :o "admin"})
+                    (qs/assert-quad {:s "bob" :p "role" :o "user"}))
+             db2 (qs/assert-quad db {:s "carol" :p "role" :o "user"})]
+         (-> (js/Promise.all
+              #js [(qs/commit! put! db nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+                   (qs/commit! put! db nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+                   (qs/commit! put! db (mf/kotoba-cid "some-other-prev") qs/current-schema-version test-blind-fn test-encrypt-fn)
+                   (qs/commit! put! db2 nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+                   ;; must NOT be `current-schema-version`; this read `2`
+                   ;; back when current was 1 and became a no-op at VC3.
+                   (qs/commit! put! db nil 99 test-blind-fn test-encrypt-fn)])
+             (.then (fn [results]
+                      (let [[cid1 cid2 cid-other-prev cid-other-db cid-other-schema] (js->clj results)]
+                        (testing "same db + prev -> same commit CID"
+                          ;; See the JVM test's comment: this only holds
+                          ;; because `test-encrypt-fn` derives its nonce
+                          ;; deterministically from the plaintext.
+                          (is (= cid1 cid2)))
+                        (testing "different prev -> different commit CID"
+                          (is (not= cid1 cid-other-prev)))
+                        (testing "different db -> different commit CID"
+                          (is (not= cid1 cid-other-db)))
+                        (testing "different schema-version -> different commit CID"
+                          (is (not= cid1 cid-other-schema)))
+                        (is (contains? @store cid1))
+                        (done)))))))))
+
+#?(:cljs
+   (deftest commit-block-is-real-ipld
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             db (-> (qs/empty-db) (qs/assert-quad {:s "alice" :p "role" :o "admin"}))]
+         (-> (qs/commit! put! (qs/empty-db) nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+             (.then (fn [prev]
+                      (-> (qs/commit! put! db prev qs/current-schema-version test-blind-fn test-encrypt-fn)
+                          (.then (fn [cid]
+                                   (let [node (ipld/decode (get-fn cid))]
+                                     (testing "index roots and prev are tag-42 links (nil for empty indexes)"
+                                       (is (ipld/link? (get-in node ["index-roots" "spo"])))
+                                       (is (ipld/link? (get node "prev")))
+                                       (is (= prev (ipld/link-cid (get node "prev")))))
+                                     (testing "generic ipld/links walk reaches every root + prev, all fetchable"
+                                       (is (seq (ipld/links node)))
+                                       (doseq [c (ipld/links node)]
+                                         (is (= c (ipld/cid (get-fn c))))))
+                                     (testing "empty db commit has null roots"
+                                       (let [n0 (ipld/decode (get-fn prev))]
+                                         (is (nil? (get-in n0 ["index-roots" "spo"])))
+                                         (is (nil? (get n0 "prev")))))
+                                     (done))))))))))))
+
+#?(:cljs
+   (deftest commit-schema-version-is-required-and-caller-declared
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (js/Promise.all
+              #js [(qs/commit! put! (qs/empty-db) nil qs/current-schema-version test-blind-fn test-encrypt-fn)
+                   (qs/commit! put! (qs/empty-db) nil 2 test-blind-fn test-encrypt-fn)])
+             (.then (fn [results]
+                      (let [[cid cid2] (js->clj results)
+                            node (ipld/decode (get-fn cid))
+                            node2 (ipld/decode (get-fn cid2))]
+                        (is (= qs/current-schema-version (get node "schema-version")))
+                        (is (= 2 (get node2 "schema-version")))
+                        (done)))))))))
+
+;; ── VC3: typed leaf values + schema-version 2 migration ──────────────────────
+;; ADR-kotoba-canonical-value-codec. `restore` had NO coverage before this
+;; block, which is why the version dispatch it now carries is tested here
+;; rather than assumed.
+
+#?(:clj
+   (defn- v1-commit!
+     "Hand-build a schema-version 1 snapshot: leaf values encoded with the NODE
+     codec, exactly as `index-root` did before VC3. Needed because `commit!`
+     can only write the current version, so a migration test has no other way
+     to obtain genuine old bytes."
+     [put! db]
+     (let [entries (sort-by first
+                            (for [[a m2] (:eavt db) [b os] m2 o os
+                                  :let [a' (qs/link->edn a) b' (qs/link->edn b)
+                                        o' (qs/link->edn o)]]
+                              [(pr-str [(test-blind-fn a') (test-blind-fn b') (test-blind-fn o')])
+                               (test-encrypt-fn (ipld/encode [a' b' o']))]))
+           root (pt/build-tree put! entries)]
+       (ipld/put-node! put! {"schema-version" 1
+                             "index-roots" {"spo" (some-> root ipld/link)
+                                            "pso" nil "pos" nil "ocp" nil}
+                             "prev" nil}))))
+
+#?(:clj
+   (deftest typed-components-survive-commit-and-restore
+     ;; The defect VC3 closes: through the node codec a keyword persisted and
+     ;; came back a string, so the value READ was not the value WRITTEN even
+     ;; though its CID verified.
+     (let [{:keys [put! get-fn]} (mem-store)
+           db (-> (qs/empty-db)
+                  (qs/assert-quad {:s :person/alice :p :role :o :admin})
+                  (qs/assert-quad {:s :person/alice :p :age :o 34})
+                  (qs/assert-quad {:s :person/alice :p :label :o "Alice"})
+                  (qs/assert-quad {:s :person/alice :p :knows :o bafy-link}))
+           cid (qs/commit! put! db nil qs/current-schema-version
+                            test-blind-fn test-encrypt-fn)
+           back (qs/restore get-fn cid test-decrypt-fn)]
+       (testing "a keyword stays a keyword, not the string it prints as"
+         (is (= {:role #{:admin} :age #{34} :label #{"Alice"} :knows #{bafy-link}}
+                (qs/entity-attrs back :person/alice)))
+         (is (keyword? (first (qs/by-predicate-value back :role :admin))))
+         (is (= #{:person/alice} (qs/by-predicate-value back :role :admin))))
+       (testing "a keyword and its printed form are DIFFERENT values, both ways"
+         (is (empty? (qs/by-predicate-value back :role "admin")))
+         (is (empty? (qs/by-predicate-value back "role" :admin))))
+       (testing "an integer stays an integer"
+         (is (= #{34} (get (qs/entity-attrs back :person/alice) :age)))
+         (is (integer? (first (get (qs/entity-attrs back :person/alice) :age)))))
+       (testing "a Link stays a Link and is still reverse-indexed"
+         (is (= {:knows #{:person/alice}} (qs/refs-to back bafy-link)))))))
+
+#?(:clj
+   (deftest restore-reads-a-version-1-snapshot-without-reinterpreting-it
+     (let [{:keys [put! get-fn]} (mem-store)
+           db (-> (qs/empty-db)
+                  (qs/assert-quad {:s "alice" :p "role" :o "admin"})
+                  (qs/assert-quad {:s "alice" :p "knows" :o bafy-link}))
+           v1-cid (v1-commit! put! db)
+           back (qs/restore get-fn v1-cid test-decrypt-fn)]
+       (testing "an existing store still opens after the bump"
+         (is (= {"role" #{"admin"} "knows" #{bafy-link}}
+                (qs/entity-attrs back "alice"))))
+       (testing "its leaves are decoded with the codec that WROTE them"
+         ;; decoding version-1 bytes as kotoba.value.v1 would fail closed
+         (let [spo-root (ipld/link-cid (get-in (ipld/decode (get-fn v1-cid))
+                                               ["index-roots" "spo"]))
+               [[_ leaf]] (pt/scan-prefix get-fn spo-root "")]
+           (is (thrown? clojure.lang.ExceptionInfo
+                        (v/decode-value (test-decrypt-fn leaf))))))
+       (testing "but a type version 1 never persisted is NOT retroactively recovered"
+         ;; honest boundary: old data reads back as what it was stored as
+         (is (string? (first (keys (qs/entity-attrs back "alice")))))))))
+
+#?(:clj
+   (deftest restore-rejects-a-schema-version-this-build-does-not-know
+     (let [{:keys [put! get-fn]} (mem-store)
+           future-cid (ipld/put-node! put! {"schema-version" 99
+                                            "index-roots" {"spo" nil "pso" nil
+                                                           "pos" nil "ocp" nil}
+                                            "prev" nil})
+           thrown (try (qs/restore get-fn future-cid test-decrypt-fn) nil
+                       (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+       (is (= :arrangement/unsupported-schema-version (:problem thrown)))
+       (is (= 99 (:actual thrown)))
+       (is (= #{1 2} (:supported thrown)))
+       (is (= #{1 2} qs/supported-schema-versions))
+       (is (= 2 qs/current-schema-version)))))
+
+#?(:clj
+   (deftest key-path-admits-only-blindable-scalars
+     (let [{:keys [put!]} (mem-store)
+           commit-with (fn [o]
+                         (try (qs/commit! put!
+                                          (qs/assert-quad (qs/empty-db) {:s "s" :p "p" :o o})
+                                          nil qs/current-schema-version
+                                          test-blind-fn test-encrypt-fn)
+                              nil
+                              (catch clojure.lang.ExceptionInfo e (:problem (ex-data e)))))]
+       (testing "values whose pr-str is not canonical are rejected, not silently blinded"
+         ;; a set/map has undefined iteration order; a byte array prints with an
+         ;; identity hash, so two arrays with the SAME bytes blind differently
+         (is (= :arrangement/component-not-blindable (commit-with #{1 2})))
+         (is (= :arrangement/component-not-blindable (commit-with {:a 1})))
+         (is (= :arrangement/component-not-blindable (commit-with (byte-array [1 2]))))
+         (is (= :arrangement/component-not-blindable (commit-with (v/float64 1.5)))))
+       (testing "scalars and Links are admitted"
+         (doseq [o [nil true 42 "admin" :admin 'admin bafy-link]]
+           (is (nil? (commit-with o)) (str "should be blindable: " (pr-str o)))))
+       (testing "vectors of blindable components are admitted (bonsai tree entries, commit parents)"
+         (doseq [o [[] [1 "a" :k] [bafy-link bafy-link] [["a.txt" bafy-link "blob"]] [[[]]]]]
+           (is (nil? (commit-with o)) (str "should be blindable: " (pr-str o)))))
+       (testing "a vector is only as blindable as its elements"
+         (is (= :arrangement/component-not-blindable (commit-with [1 #{2}])))
+         (is (= :arrangement/component-not-blindable (commit-with [[{:a 1}]])))
+         (is (= :arrangement/component-not-blindable (commit-with [(byte-array [1])]))))
+       (testing "lists and other sequentials are still rejected"
+         (is (= :arrangement/component-not-blindable (commit-with '(1 2))))
+         (is (= :arrangement/component-not-blindable (commit-with (seq [1 2]))))))))
+
+(deftest blind-input-keeps-a-link-and-a-literal-pair-apart
+  ;; A Link becomes ["ipld/link" cid]; a literal vector of that same shape must
+  ;; not derive the same key input, or two different datoms would collide.
+  (let [cid (ipld/link-cid bafy-link)]
+    (is (= ["ipld/link" cid] (qs/blind-input bafy-link)))
+    (is (= ["arrangement/vector" [["ipld/link" cid]]] (qs/blind-input [bafy-link])))
+    (is (= ["arrangement/vector" ["ipld/link" cid]] (qs/blind-input ["ipld/link" cid])))
+    (is (not= (qs/blind-input bafy-link) (qs/blind-input ["ipld/link" cid])))
+    (is (= "s" (qs/blind-input "s")) "scalars pass through unchanged")
+    (is (= ["arrangement/vector" [["arrangement/vector" ["a.txt" ["ipld/link" cid] "blob"]]]]
+           (qs/blind-input [["a.txt" bafy-link "blob"]]))
+        "a bonsai tree-entries vector has one canonical key input")
+    (is (= (qs/blind-input [1 "a" :k]) (qs/blind-input [1 "a" :k])))
+    (is (not= (qs/blind-input [1 2]) (qs/blind-input [2 1])) "order is part of the key")
+    (doseq [bad [[1 #{2}] [[{:a 1}]] '(1 2)]]
+      (is (= :arrangement/component-not-blindable
+             (try (qs/blind-input bad) nil
+                  (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                    (:problem (ex-data e)))))
+          (str "must be rejected: " (pr-str bad))))))
+
+#?(:cljs
+   (deftest restore-rejects-a-schema-version-this-build-does-not-know-cljs
+     ;; The version gate runs BEFORE any decrypt, so it is synchronous on both
+     ;; platforms and needs no crypto — which makes it the one part of the new
+     ;; `restore` dispatch that is cheap to cover on this tier too.
+     (let [{:keys [put! get-fn]} (mem-store)
+           future-cid (ipld/put-node! put! {"schema-version" 99
+                                            "index-roots" {"spo" nil "pso" nil
+                                                           "pos" nil "ocp" nil}
+                                            "prev" nil})
+           thrown (try (qs/restore get-fn future-cid identity) nil
+                       (catch :default e (ex-data e)))]
+       (is (= :arrangement/unsupported-schema-version (:problem thrown)))
+       (is (= 99 (:actual thrown)))
+       (is (= #{1 2} qs/supported-schema-versions))
+       (is (= 2 qs/current-schema-version)))))
+
+;; ── The in-memory rename must not reach the wire ────────────────────────────
+;; The four index keys became :eavt/:aevt/:avet/:vaet on 2026-08-20. The four
+;; names INSIDE a snapshot did not, because they are hashed into the commit
+;; CID: renaming them would give every graph a new name, and a fleet with
+;; writers on both sides would produce two CIDs for one graph and diverge
+;; without erroring.
+;;
+;; The literal below was measured on kotoba-lang/main d1ef17e -- the commit
+;; BEFORE the rename -- by committing exactly this fixture. It is written out
+;; rather than computed so that this test cannot agree with a regression.
+
+#?(:clj
+   (deftest snapshot-bytes-are-unchanged-by-the-in-memory-rename
+     (let [{:keys [put! get-fn store]} (mem-store)
+           db (reduce (fn [d q] (qs/assert-quad d q))
+                      (qs/empty-db)
+                      [{:s "alice" :p "role"  :o "admin"}
+                       {:s "alice" :p "name"  :o "Alice"}
+                       {:s "bob"   :p "role"  :o "user"}
+                       {:s "carol" :p "knows" :o "alice"}
+                       {:s "dave"  :p "age"   :o 41}])
+           cid (qs/commit! put! db nil qs/current-schema-version
+                           test-blind-fn test-encrypt-fn)]
+       (testing "the commit CID is the one the pre-rename code produced"
+         (is (= "bafyreidegazchntq6w7qpfula72xzgawa4ae7hcysohzhydgrb3xzmabda" cid))
+         (is (= 4 (count @store))))
+       (testing "and the roots are still named by the wire vocabulary"
+         (is (= ["ocp" "pos" "pso" "spo"]
+                (sort (keys (get (ipld/decode (get-fn cid)) "index-roots"))))))
+       (testing "which the in-memory db no longer uses"
+         (is (= [:aevt :avet :eavt :vaet] (sort (keys db))))
+         (is (not (qs/legacy-db? db)))))))

@@ -1,0 +1,111 @@
+#!/usr/bin/env kbb
+;; bin/predict.cljk -- cloud-itonami-specific adapter over pricing-oracle.core.
+;;
+;; Loads com-junkawasaki/root's 90-docs/pricing-intelligence/{pricing-intelligence.datoms.edn,
+;; pricing-intelligence-ledger.edn} (read-only -- this repo never writes into that dataset),
+;; joins each :vertical/* catalog entry with its latest :rec/* ledger fact into the generic
+;; {:id :cluster :unit :band-low :band-high} shape pricing-oracle.core understands, and runs
+;; the market-analogy predictor over every vertical whose real research left band-low/band-high
+;; both nil ("no self-serve band" / enterprise-contract-only markets).
+;;
+;; Output is this repo's OWN artifact (predictions.edn), namespaced :pred/* -- deliberately NOT
+;; written back into cloud-itonami's pricing-intelligence-ledger.edn. That ledger's whole point is
+;; "every number is either real vendor pricing, a labeled third-party estimate, or explicitly
+;; opaque" -- a model-derived median-of-comparables number is none of those, so it gets its own
+;; namespace and its own file, always carrying :pred/basis-vertical-codes so a human can see
+;; exactly which real, independently-researched verticals a prediction rests on.
+;;
+;; Usage:
+;;   kbb --backend sci --classpath src bin/predict.cljk /path/to/com-junkawasaki [out.edn]
+;; (root defaults to the conventional sibling path if omitted; out.edn defaults to ./predictions.edn)
+
+(require '["fs" :as fs]
+         '[kotoba.lang.text :as str]
+         '[clojure.edn :as edn]
+         '[pricing-oracle.core :as po])
+
+(defn slurp [path] (fs/readFileSync path "utf8"))
+(defn spit [path content] (fs/writeFileSync path content "utf8"))
+
+(def root (or (first *command-line-args*) "../../../com-junkawasaki"))
+(def out-path (or (second *command-line-args*) "predictions.edn"))
+
+(def datoms-path (str root "/90-docs/pricing-intelligence/pricing-intelligence.datoms.edn"))
+(def ledger-path (str root "/90-docs/pricing-intelligence/pricing-intelligence-ledger.edn"))
+
+(defn read-ledger-lines
+  "One EDN map per non-comment, non-blank line (this dataset's ledger convention)."
+  [path]
+  (->> (str/split-lines (slurp path))
+       (map str/trim)
+       (remove #(or (= "" %) (str/starts-with? % ";;")))
+       (mapv edn/read-string)))
+
+(def base-entries (edn/read-string (slurp datoms-path)))
+(def ledger-entries (read-ledger-lines ledger-path))
+
+(def verticals (filter :vertical/id base-entries))
+
+;; latest :rec/* per vertical, by :rec/seq (ledger is append-only; a vertical could in principle
+;; accumulate more than one :rec/* across re-benchmark runs -- always take the newest)
+(def rec-by-vertical
+  (->> ledger-entries
+       (filter :rec/vertical)
+       (group-by #(second (:rec/vertical %)))   ; [:vertical/id :vertical/isic-XXXX] -> :vertical/isic-XXXX
+       (reduce-kv (fn [m k recs] (assoc m k (last (sort-by :rec/seq recs)))) {})))
+
+(defn cluster-kw [vertical]
+  ;; :vertical/cluster is stored as a lookup-ref [:cluster/id :cluster/some-cluster]
+  (second (:vertical/cluster vertical)))
+
+(def items
+  (mapv (fn [v]
+          (let [vid (:vertical/id v)
+                rec (get rec-by-vertical vid)]
+            {:id (name vid)
+             :name (:vertical/name v)
+             :cluster (cluster-kw v)
+             :unit (:rec/unit rec)
+             :band-low (:rec/band-low rec)
+             :band-high (:rec/band-high rec)}))
+        verticals))
+
+(println "loaded" (count items) "verticals from pricing-intelligence")
+(println "of which" (count (filter po/known? items)) "have a real researched band (comparables)")
+(println "and" (count (remove po/known? items)) "are gaps (no self-serve band found in research)")
+
+(def predictions (po/predict-all-gaps items))
+
+(def id->name (into {} (map (juxt :id :name)) items))
+
+(defn pred->edn-map [p]
+  {:pred/vertical-id (keyword "vertical" (:id p))
+   :pred/vertical-name (get id->name (:id p))
+   :pred/cluster (:cluster p)
+   :pred/unit (:unit p)
+   :pred/predicted-band-low (:predicted-band-low p)
+   :pred/predicted-band-high (:predicted-band-high p)
+   :pred/method (:method p)
+   :pred/confidence (:confidence p)
+   :pred/basis-count (:basis-count p)
+   :pred/basis-vertical-ids (mapv #(keyword "vertical" %) (:basis-ids p))
+   :pred/note (str "Model-predicted via pricing-oracle (median-of-real-comparables market analogy), "
+                    "NOT independently researched. See :pred/basis-vertical-ids for the real, "
+                    "researched verticals this estimate rests on. Method=" (name (or (:method p) :none))
+                    ", confidence=" (name (:confidence p)) ".")})
+
+(def output-lines
+  (into [(str ";; predictions.edn -- pricing-oracle output over com-junkawasaki/root's "
+              "90-docs/pricing-intelligence dataset.")
+         (str ";; Generated " (count predictions) " predictions for verticals with no real "
+              "self-serve price band. Every :pred/* line is a MODEL ESTIMATE, not a researched "
+              "price -- see :pred/note and :pred/basis-vertical-ids on each line.")
+         ";; One EDN map per line (same append-only-ledger convention as the source dataset)."]
+        (map pr-str (map pred->edn-map predictions))))
+
+(spit out-path (str (str/join "\n" output-lines) "\n"))
+
+(println "\nwrote" (count predictions) "predictions to" out-path)
+(println "\nconfidence breakdown:")
+(doseq [[conf n] (sort-by (comp - second) (frequencies (map :confidence predictions)))]
+  (println " " conf n))

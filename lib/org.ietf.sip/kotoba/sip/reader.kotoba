@@ -1,0 +1,488 @@
+;; Reading a SIP message off the wire, as a Kotoba application
+;; (ADR-2608261100). The contract is the one `examples/todo-app.kotoba`,
+;; `org-ietf-smtp`, `org-ietf-pop3` and `org-ietf-imap` use —
+;;
+;;   init     (config)       -> state
+;;   step     (state, line)  -> state    ; one line in
+;;   closed   (state)        -> state    ; the host saw EOF
+;;
+;; SIP is not a session protocol like the mail three: `sip.message` is a
+;; codec, not a driver. So the slice is the reader — start line, headers,
+;; and the point where headers stop and a body of a declared length
+;; begins.
+;;
+;; ## What this slice is for
+;;
+;; A SIP response is matched to the request it answers by the topmost
+;; Via's `branch` parameter together with the CSeq method (RFC 3261
+;; §17.1.3). Get that wrong and a UA attributes a response to the wrong
+;; request — the failure is silent and looks like the far end
+;; misbehaving. Three things have to be right before that identity can
+;; even be read, and each is a negative control below:
+;;
+;;   * **compact header forms** (§7.3.3): `v` IS Via, `f` From, `t` To,
+;;     `i` Call-ID, `l` Content-Length. A reader without the table sees a
+;;     message with no mandatory headers at all and cannot say why;
+;;   * **obs-fold** (§7.3.1): a line beginning with SP or HTAB continues
+;;     the previous header. A reader that treats it as a new header loses
+;;     the tail of every folded value — and Via, the one that matters
+;;     most, is the one most often folded;
+;;   * **the magic cookie** (§8.1.1.7): an RFC 3261 branch begins
+;;     `z9hG4bK`. One that does not is an RFC 2543 branch and is not
+;;     globally unique, so it cannot be used as a transaction key. The
+;;     guest reports the branch AND whether it carries the cookie, rather
+;;     than quietly treating the two as the same thing.
+;;
+;; ## The body passes through; it is not held
+;;
+;; `Content-Length` (§20.14) is an OCTET count, and the octets are a body
+;; — SDP, or a vCard, or anything else. A `:document` cannot hold one:
+;; `:container-items` is 32 and the aggregate is 65536 UTF-8 bytes. So
+;; this is the same passthrough `org-ietf-imap`'s FETCH literal uses, and
+;; for the same reason (ADR-2608039970: bytes do not go through the value
+;; plane):
+;;
+;;   body-state  :none -> :open -> :closed
+;;   body-bytes  how many octets the host must read; 0 for none
+;;
+;; The guest reads the count and never the content.
+;; `reader-carries-no-body-bytes` is the negative control.
+;;
+;; ## Headers this slice does not keep
+;;
+;; Only the headers that carry the transaction identity are kept, each in
+;; its own field. Everything else is counted and dropped, because a
+;; general header map cannot be a `:document`: keyword identity is a
+;; compile-time FNV-1a hash, so a guest cannot build a key from a name it
+;; read at run time, and a vector of pairs would meet `:container-items`
+;; 32 on an ordinary INVITE. Counting what was dropped is honest;
+;; pretending to hold it would not be.
+;;
+;; No regular expressions: `sip.message` reaches for `re-matches` on the
+;; start line and `sip.grammar` scans by hand; the scans here are all
+;; positional (ADR-2608650000 decision 6).
+;;
+;; The byte-scanning helpers are the third copy in this workspace
+;; (`org-ietf-pop3` and `org-ietf-imap` have the others, and
+;; `org-ietf-smtp` has an earlier one under different names). They cannot
+;; be shared: the only linking route is the project route, which the CLI
+;; runs on the JVM, which Q9 forbids. adr-2608302100 has the measurement
+;; and the removal conditions.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/sip/reader.kotoba \
+;;     --target wasm32-browser --output reader.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 9525-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns sip.reader
+  (:export [init step closed
+            phase error-text
+            kind method request-uri status-code reason-phrase
+            call-id via-raw via-branch rfc3261-branch?
+            cseq-number cseq-method from-tag to-tag
+            max-forwards content-length
+            body-state body-bytes
+            header-count other-header-count]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+;; --- byte scanning --------------------------------------------------------
+;; `string-substring` indexes are checked UTF-8 byte boundaries, and RFC
+;; 3261's wire grammar is US-ASCII, so byte offsets are the right unit.
+;; Body octets are not scanned here at all.
+
+(defn- space? [c :i64] :bool (or (= c 32) (= c 9)))
+
+(defn- digit? [c :i64] :bool (and (>= c 48) (<= c 57)))
+
+(defn- at-byte [s :string i :i64] :i64
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- starts-with? [s :string prefix :string] :bool
+  (let [n (string-byte-length prefix)]
+    (if (> n (string-byte-length s))
+      false
+      (string=? (string-substring s 0 n) prefix))))
+
+(defn- skip-spaces [s :string i :i64] :i64
+  (if (space? (at-byte s i)) (skip-spaces s (+ i 1)) i))
+
+(defn- skip-token [s :string i :i64] :i64
+  (let [c (at-byte s i)]
+    (if (or (= c -1) (space? c)) i (skip-token s (+ i 1)))))
+
+(defn- read-i64 [s :string i :i64 acc :i64] :i64
+  (let [c (at-byte s i)]
+    (if (digit? c)
+      (read-i64 s (+ i 1) (+ (* (if (< acc 0) 0 acc) 10) (- c 48)))
+      acc)))
+
+(defn- parse-i64-at [s :string i :i64] :i64
+  (if (digit? (at-byte s i)) (read-i64 s i -1) -1))
+
+(defn- index-of [s :string c :i64 i :i64] :i64
+  (let [x (at-byte s i)]
+    (cond (= x -1) -1
+          (= x c) i
+          :else (index-of s c (+ i 1)))))
+
+(defn- trim-right [s :string n :i64] :string
+  (cond
+    (<= n 0) ""
+    (space? (at-byte s (- n 1))) (trim-right s (- n 1))
+    :else (string-substring s 0 n)))
+
+(defn- trim [s :string] :string
+  (let [i (skip-spaces s 0)]
+    (trim-right (string-substring s i (string-byte-length s))
+                (- (string-byte-length s) i))))
+
+;; --- ASCII case folding ---------------------------------------------------
+;; RFC 3261 §7.3.1 makes header names case-insensitive: `Content-Length`,
+;; `l`, `L` and `CONTENT-LENGTH` all name the same header. The oracle
+;; lower-cases into a map key; there is no code-point-to-string builtin in
+;; the guest, so this compares without constructing a string.
+
+(defn- fold [c :i64] :i64 (if (and (>= c 97) (<= c 122)) (- c 32) c))
+
+(defn- ci-eq-from? [a :string ai :i64 b :string bi :i64 n :i64] :bool
+  (cond
+    (<= n 0) true
+    (not (= (fold (at-byte a ai)) (fold (at-byte b bi)))) false
+    :else (ci-eq-from? a (+ ai 1) b (+ bi 1) (- n 1))))
+
+(defn- ci-slice=? [a :string from :i64 to :i64 b :string] :bool
+  (and (= (- to from) (string-byte-length b))
+       (ci-eq-from? a from b 0 (string-byte-length b))))
+
+;; --- header names ---------------------------------------------------------
+;; The compact forms of RFC 3261 §7.3.3 / §20. `v` is not an abbreviation a
+;; reader may skip: it IS Via on the wire, and a message using it has the
+;; same mandatory headers as one that spells them out.
+
+(defn- name-end [line :string] :i64 (index-of line 58 0))
+
+(defn- name-is? [line :string full :string compact :string] :bool
+  (let [e (name-end line)]
+    (if (< e 0)
+      false
+      (let [s (skip-spaces line 0)
+            t (trim-right (string-substring line s e) (- e s))
+            n (string-byte-length t)]
+        (or (ci-slice=? t 0 n full) (ci-slice=? t 0 n compact))))))
+
+(defn- header-value [line :string] :string
+  (let [e (name-end line)]
+    (if (< e 0) "" (trim (string-substring line (+ e 1) (string-byte-length line))))))
+
+;; --- parameters -----------------------------------------------------------
+;; `;branch=z9hG4bK776asdhds`, `;tag=1928301774`. The value runs to the next
+;; `;` or the end. Quoted values are not handled here and are not needed:
+;; branch and tag are `token`s (§25.1), which cannot contain `;`.
+
+(defn- param-value-end [s :string i :i64] :i64
+  (let [c (at-byte s i)]
+    (cond (= c -1) i
+          (= c 59) i
+          (= c 32) i
+          :else (param-value-end s (+ i 1)))))
+
+(defn- param-from [s :string i :i64 name :string] :string
+  (let [semi (index-of s 59 i)]
+    (if (< semi 0)
+      ""
+      (let [start (skip-spaces s (+ semi 1))
+            eq (index-of s 61 start)]
+        (cond
+          (< eq 0) ""
+          (ci-slice=? s start eq name)
+          (string-substring s (+ eq 1) (param-value-end s (+ eq 1)))
+          :else (param-from s (+ semi 1) name))))))
+
+(defn- param [s :string name :string] :string (param-from s 0 name))
+
+;; --- start line -----------------------------------------------------------
+;; `SIP/2.0 200 OK` is a response; anything else is `METHOD SP URI SP
+;; SIP/2.0`. The version prefix is what separates them (§7.1 / §7.2), not
+;; the shape of the first token.
+
+(defn- first-token [line :string] :string
+  (let [s (skip-spaces line 0)] (string-substring line s (skip-token line s))))
+
+(defn- second-token [line :string] :string
+  (let [s (skip-spaces line (skip-token line (skip-spaces line 0)))]
+    (string-substring line s (skip-token line s))))
+
+(defn- third-onward [line :string] :string
+  (let [a (skip-spaces line 0)
+        b (skip-spaces line (skip-token line a))]
+    (trim (string-substring line (skip-spaces line (skip-token line b))
+                            (string-byte-length line)))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn init [_config :document] :document
+  (document-map :phase (document-keyword :start-line)
+                :kind (document-keyword :none)
+                :method (document-string "")
+                :uri (document-string "")
+                :status (document-i64 -1)
+                :reason (document-string "")
+                :via (document-string "")
+                :have-via (document-bool false)
+                :to (document-string "")
+                :from (document-string "")
+                :call-id (document-string "")
+                :cseq (document-string "")
+                :max-forwards (document-i64 -1)
+                :content-length (document-i64 -1)
+                :pending (document-string "")
+                :pending-kind (document-keyword :none)
+                :headers (document-i64 0)
+                :others (document-i64 0)
+                :body-state (document-keyword :none)
+                :body (document-i64 0)
+                :error (document-string "")))
+
+(defn- clear-body [state :document] :document
+  (document-assoc state :body (document-i64 0)))
+
+(defn- fail [state :document message :string] :document
+  (clear-body
+   (document-assoc
+    (document-assoc state :phase (document-keyword :failed))
+    :error (document-string message))))
+
+;; --- the folded header buffer ---------------------------------------------
+;; §7.3.1. A line beginning with SP or HTAB continues the previous header, so
+;; a header is not complete until the line after it has been seen. The value
+;; is held in `:pending` until then and committed by `flush-pending`.
+
+(defn- commit [state :document] :document
+  (let [k (dk state :pending-kind)
+        v (ds state :pending)]
+    (cond
+      (= k :none) state
+      (= k :via) (document-assoc state :via (document-string v))
+      (= k :to) (document-assoc state :to (document-string v))
+      (= k :from) (document-assoc state :from (document-string v))
+      (= k :call-id) (document-assoc state :call-id (document-string v))
+      (= k :cseq) (document-assoc state :cseq (document-string v))
+      (= k :max-forwards)
+      (document-assoc state :max-forwards (document-i64 (parse-i64-at v 0)))
+      (= k :content-length)
+      (document-assoc state :content-length (document-i64 (parse-i64-at v 0)))
+      :else state)))
+
+(defn- flush-pending [state :document] :document
+  (document-assoc
+   (document-assoc (commit state) :pending (document-string ""))
+   :pending-kind (document-keyword :none)))
+
+(defn- hold [state :document k :keyword value :string] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc (flush-pending state) :pending (document-string value))
+    :pending-kind (document-keyword k))
+   :headers (document-i64 (+ (di state :headers) 1))))
+
+;; Via is kept only for the topmost value (§17.1.3 reads the top one), and a
+;; later Via does not overwrite it.
+;; RFC 3261 17.1.3 reads the TOP Via; a proxy adds its own on the way, so a
+;; reader that keeps the last one keys the transaction on a hop that is not
+;; ours. `:via` alone cannot answer "have we seen one yet": the first is
+;; still in `:pending` when the second line arrives, so it would be
+;; overwritten. The flag is what makes the question answerable at that
+;; moment -- which the parity test caught on its first run.
+(defn- hold-via [state :document value :string] :document
+  (if (db state :have-via)
+    (document-assoc (flush-pending state)
+                    :headers (document-i64 (+ (di state :headers) 1)))
+    (document-assoc (hold state :via value) :have-via (document-bool true))))
+
+(defn- classify [state :document line :string] :document
+  (let [v (header-value line)]
+    (cond
+      (name-is? line "via" "v") (hold-via state v)
+      (name-is? line "to" "t") (hold state :to v)
+      (name-is? line "from" "f") (hold state :from v)
+      (name-is? line "call-id" "i") (hold state :call-id v)
+      (name-is? line "cseq" "cseq") (hold state :cseq v)
+      (name-is? line "max-forwards" "max-forwards") (hold state :max-forwards v)
+      (name-is? line "content-length" "l") (hold state :content-length v)
+      :else
+      (document-assoc
+       (document-assoc (flush-pending state)
+                       :others (document-i64 (+ (di state :others) 1)))
+       :headers (document-i64 (+ (di state :headers) 1))))))
+
+;; --- end of headers -------------------------------------------------------
+
+(defn- finish [state :document] :document
+  (let [done (flush-pending state)
+        n (di done :content-length)]
+    (if (> n 0)
+      (document-assoc
+       (document-assoc
+        (document-assoc done :phase (document-keyword :body))
+        :body-state (document-keyword :open))
+       :body (document-i64 n))
+      (clear-body (document-assoc done :phase (document-keyword :done))))))
+
+;; --- transitions ----------------------------------------------------------
+
+(defn- on-start-line [state :document line :string] :document
+  (cond
+    (starts-with? line "SIP/")
+    (let [code (parse-i64-at (second-token line) 0)]
+      (if (< code 0)
+        (fail state "SIP status line has no status code")
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc state :phase (document-keyword :headers))
+           :kind (document-keyword :response))
+          :status (document-i64 code))
+         :reason (document-string (third-onward line)))))
+
+    (string=? (trim line) "") (fail state "SIP message began with an empty line")
+
+    :else
+    (let [m (first-token line)
+          u (second-token line)]
+      (if (string=? u "")
+        (fail state "SIP request line has no Request-URI")
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc state :phase (document-keyword :headers))
+           :kind (document-keyword :request))
+          :method (document-string m))
+         :uri (document-string u))))))
+
+(defn- continuation? [line :string] :bool (space? (at-byte line 0)))
+
+(defn step [state :document line :string] :document
+  (let [p (dk state :phase)]
+    (cond
+      (= p :done) (clear-body state)
+      (= p :failed) (clear-body state)
+
+      ;; The host read the declared octets between these two steps; this is
+      ;; the line after the body.
+      (= p :body)
+      (clear-body
+       (document-assoc
+        (document-assoc state :phase (document-keyword :done))
+        :body-state (document-keyword :closed)))
+
+      (= p :start-line) (clear-body (on-start-line state line))
+
+      ;; §7.3.1. A continuation belongs to the header before it, joined by a
+      ;; single space -- the fold is whitespace, not structure.
+      (and (= p :headers) (continuation? line))
+      (clear-body
+       (document-assoc state :pending
+                       (document-string
+                        (string-concat (ds state :pending)
+                                       (string-concat " " (trim line))))))
+
+      (and (= p :headers) (string=? (trim line) "")) (finish state)
+
+      (= p :headers) (clear-body (classify state line))
+
+      :else (clear-body state))))
+
+;; EOF. A message whose headers never ended is truncated; one that ended is
+;; complete even if the socket then closed.
+(defn closed [state :document] :document
+  (let [p (dk state :phase)]
+    (cond
+      (= p :done) (clear-body state)
+      (= p :failed) (clear-body state)
+      (= p :body)
+      (clear-body (document-assoc
+                   (document-assoc state :phase (document-keyword :done))
+                   :body-state (document-keyword :closed)))
+      :else (fail state "SIP message ended before its headers did"))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn error-text [state :document] :string (ds state :error))
+
+(defn kind [state :document] :keyword (dk state :kind))
+
+(defn method [state :document] :string (ds state :method))
+
+(defn request-uri [state :document] :string (ds state :uri))
+
+(defn status-code [state :document] :i64 (di state :status))
+
+(defn reason-phrase [state :document] :string (ds state :reason))
+
+(defn call-id [state :document] :string (ds state :call-id))
+
+(defn via-raw [state :document] :string (ds state :via))
+
+;; §17.1.3 matches a response to a client transaction on the topmost Via's
+;; branch together with the CSeq method.
+(defn via-branch [state :document] :string (param (ds state :via) "branch"))
+
+;; §8.1.1.7. An RFC 3261 branch begins with the magic cookie; one that does
+;; not is an RFC 2543 branch, is not globally unique, and must not be used
+;; as a transaction key. Reporting the branch without reporting this would
+;; hand a caller a key it cannot trust.
+(defn rfc3261-branch? [state :document] :bool
+  (starts-with? (via-branch state) "z9hG4bK"))
+
+(defn cseq-number [state :document] :i64 (parse-i64-at (ds state :cseq) 0))
+
+(defn cseq-method [state :document] :string (second-token (ds state :cseq)))
+
+(defn from-tag [state :document] :string (param (ds state :from) "tag"))
+
+(defn to-tag [state :document] :string (param (ds state :to) "tag"))
+
+(defn max-forwards [state :document] :i64 (di state :max-forwards))
+
+;; §20.14: an octet count, and -1 when the message declared none.
+(defn content-length [state :document] :i64 (di state :content-length))
+
+(defn body-state [state :document] :keyword (dk state :body-state))
+
+;; How many octets the host must read next, 0 for none. Valid only for the
+;; step that produced it. The octets themselves are never a guest value.
+(defn body-bytes [state :document] :i64 (di state :body))
+
+(defn header-count [state :document] :i64 (di state :headers))
+
+;; Headers this slice does not keep. Counted rather than dropped silently:
+;; a caller that needs one of them should learn that it existed.
+(defn other-header-count [state :document] :i64 (di state :others))

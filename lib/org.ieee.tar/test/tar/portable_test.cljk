@@ -1,0 +1,156 @@
+(ns tar.portable-test
+  "Runtime-agnostic suite: builds and reads archives with no shell, no
+   `java.util.zip`, no fixtures from another implementation. Runs under
+   `kbb -M:test` and `kbb --backend sci run-tests.cljk`.
+
+   Conformance against real tars (GNU, ustar and PAX dialects, plus the system
+   `tar`) lives in `tar.oracle-test`, which shells out to python3."
+  (:require [tar.bytes :as b]
+            [tar.core :as tar]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- ->bytes [s] (b/str->utf8 s))
+(defn- text [e] (b/utf8->str (:bytes e)))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(def ^:private sample
+  [{:name "a.txt" :bytes (->bytes "hello")}
+   {:name "dir/" :type :directory}
+   {:name "dir/b.bin" :bytes (vec (range 256))}
+   {:name "empty" :bytes []}
+   {:name "link" :type :symlink :linkname "a.txt"}])
+
+;; ---------------------------------------------------------------------------
+;; Round-trips
+;; ---------------------------------------------------------------------------
+
+(deftest builds-and-reads-back
+  (let [archive (tar/build sample)
+        parsed  (tar/parse archive)]
+    (is (= ["a.txt" "dir/" "dir/b.bin" "empty" "link"] (tar/names parsed)))
+    (is (= "hello" (text (tar/entry parsed "a.txt"))))
+    (is (= (vec (range 256)) (:bytes (tar/entry parsed "dir/b.bin"))))
+    (is (= [] (:bytes (tar/entry parsed "empty"))))
+    (is (= :directory (:type (tar/entry parsed "dir/"))))
+    (testing "a symlink carries its target and no data"
+      (let [l (tar/entry parsed "link")]
+        (is (= :symlink (:type l)))
+        (is (= "a.txt" (:linkname l)))
+        (is (= [] (:bytes l)))))))
+
+(deftest archive-is-block-structured
+  (let [archive (tar/build sample)]
+    (is (zero? (mod (count archive) 10240)) "padded to the default record size")
+    (is (= 1024 (count (tar/build [] {:record-size 0})))
+        "an empty archive is exactly two zero blocks")
+    (is (zero? (mod (count (tar/build sample {:record-size 0})) 512)))))
+
+(deftest output-is-reproducible
+  (is (= (tar/build sample) (tar/build sample)))
+  (testing "nothing reads the clock: mtime/uid/gid default to 0"
+    (let [e (first (tar/entries (tar/build sample)))]
+      (is (= 0 (:mtime e)))
+      (is (= 0 (:uid e)))
+      (is (= 0 (:gid e))))))
+
+(deftest metadata-round-trips
+  (let [archive (tar/build [{:name "x" :bytes [1] :mode 0755 :mtime 1234567890
+                             :uid 501 :gid 20 :uname "junkawasaki" :gname "staff"}])
+        e       (first (tar/entries archive))]
+    (is (= 0755 (:mode e)))
+    (is (= 1234567890 (:mtime e)))
+    (is (= 501 (:uid e)))
+    (is (= 20 (:gid e)))
+    (is (= "junkawasaki" (:uname e)))
+    (is (= "staff" (:gname e)))))
+
+;; ---------------------------------------------------------------------------
+;; Long names: ustar prefix split, then PAX
+;; ---------------------------------------------------------------------------
+
+(deftest long-names-use-the-ustar-prefix-when-they-can
+  (let [name    (str (apply str (repeat 12 "directory/")) "file.txt")  ; 128 bytes, splits
+        archive (tar/build [{:name name :bytes (->bytes "deep")}])
+        parsed  (tar/parse archive)]
+    (is (> (count name) 100))
+    (is (= [name] (tar/names parsed)))
+    (is (= "deep" (text (first parsed))))
+    (testing "no PAX header was needed"
+      (is (= 1 (count parsed)))
+      (is (nil? (:pax (first parsed))))
+      (is (= "ustar" (:magic (first parsed)))))))
+
+(deftest names-that-cannot-split-escalate-to-pax
+  ;; A single 150-byte path component cannot be split at a '/'.
+  (let [name    (str (apply str (repeat 150 "x")) ".txt")
+        archive (tar/build [{:name name :bytes (->bytes "paxed")}])
+        parsed  (tar/parse archive)]
+    (is (= [name] (tar/names parsed)) "the PAX record supplies the real name")
+    (is (= "paxed" (text (first parsed))))
+    (is (= name (get (:pax (first parsed)) "path")))))
+
+(deftest long-link-targets-escalate-to-pax
+  (let [target  (str (apply str (repeat 40 "up/")) "target.txt")       ; 130 bytes
+        archive (tar/build [{:name "l" :type :symlink :linkname target}])
+        parsed  (tar/entries archive)]
+    (is (= target (:linkname (first parsed))))))
+
+(deftest deep-but-splittable-and-unicode-names
+  (doseq [name ["日本語/ファイル.txt"
+                "emoji-🗜.bin"
+                (str (apply str (repeat 30 "seg/")) "leaf")]]
+    (let [parsed (tar/parse (tar/build [{:name name :bytes (->bytes "x")}]))]
+      (is (= [name] (tar/names parsed)) name)
+      (is (= "x" (text (first parsed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Header field encodings
+;; ---------------------------------------------------------------------------
+
+(deftest reads-gnu-base-256-numerics
+  ;; GNU escapes a field it cannot express in octal by setting the high bit and
+  ;; storing a big-endian two's-complement integer in the rest.
+  (is (= 8589934592 (b/read-numeric [0x80 0 0 0 0 0 0 0x02 0 0 0 0] 0 12)))
+  (is (= -1 (b/read-numeric [0xff 0xff 0xff 0xff] 0 4)))
+  (testing "an empty field is zero, not an error"
+    (is (= 0 (b/read-numeric [0 0 0 0 0 0 0 0] 0 8)))
+    (is (= 0 (b/read-numeric [0x20 0x20 0x20 0x20 0x20 0x20 0x20 0x20] 0 8)))))
+
+(deftest octal-fields-are-fixed-width
+  (is (= [48 48 48 48 54 52 52 0] (b/octal-field 0644 8)))
+  (is (= :field-overflow (reason-of #(b/octal-field 8589934592 12)))))
+
+(deftest pax-records-parse
+  (let [bs (b/str->utf8 "30 mtime=1755043200.123456789\n12 uid=1000\n")]
+    (is (= {"mtime" "1755043200.123456789" "uid" "1000"} (tar/parse-pax bs))))
+  (testing "a malformed tail ends the block instead of losing the archive"
+    (is (= {"a" "1"} (tar/parse-pax (b/str->utf8 "6 a=1\ngarbage"))))))
+
+;; ---------------------------------------------------------------------------
+;; Strictness
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-a-corrupt-header
+  (let [archive (tar/build sample)
+        broken  (assoc archive 0 (bit-xor (nth archive 0) 0xff))]
+    (is (= :bad-checksum (reason-of #(tar/entries broken))))))
+
+(deftest rejects-a-truncated-archive
+  (let [archive (tar/build [{:name "big" :bytes (vec (repeat 2000 65))}] {:record-size 0})]
+    (is (= :truncated (reason-of #(tar/entries (subvec archive 0 900)))))))
+
+(deftest stops-at-the-end-of-archive-marker
+  (let [archive (tar/build sample)
+        ;; anything after the two zero blocks must be ignored
+        trailing (into archive (repeat 512 0x41))]
+    (is (= (tar/names (tar/entries archive)) (tar/names (tar/entries trailing))))))
+
+(deftest accepts-a-single-trailing-zero-block
+  ;; Sloppy but common: some writers emit one terminator instead of two.
+  (let [full (tar/build [{:name "a" :bytes [1]}] {:record-size 0})]
+    (is (= ["a"] (tar/names (tar/entries (subvec full 0 (- (count full) 512))))))))

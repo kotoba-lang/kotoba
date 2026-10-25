@@ -1,0 +1,122 @@
+(ns live-contract
+  "Run the shared storage contract against a REAL S3-compatible endpoint, and
+  probe conditional writes directly.
+
+  The only existing test drives `s3/open` with an in-memory fake that
+  reimplements S3 semantics as the author understood them. It proves the
+  adapter agrees with that model -- not with S3. The two behaviours a fake
+  cannot check are exactly the two this backend's correctness rests on:
+
+    * `If-None-Match: *` on PUT -- how block creation rejects a CID/bytes
+      collision;
+    * `If-Match: <etag>` on PUT -- the ref compare-and-set the single-writer
+      head model is built on.
+
+  Conditional-write support genuinely differs across S3-compatible providers.
+  A provider that silently IGNORES those headers returns 200 to BOTH writers,
+  so the loser is told it won. From a fake that is invisible; in production it
+  means storage enforces nothing and two heads can diverge.
+
+  The probes below therefore do not go through the contract: they call the
+  client directly, so the result is about the PROVIDER rather than about the
+  adapter's interpretation of it.
+
+  Usage (credentials come from a credential tool, never typed here):
+
+    S3_ENDPOINT=... S3_BUCKET=... S3_REGION=... \\
+    S3_ACCESS_KEY_ID=... S3_SECRET_ACCESS_KEY=... \\
+    node out/live-contract.js
+
+  Writes only under S3_PREFIX (default: a timestamped probe prefix). Nothing
+  outside that prefix is read or modified."
+  (:require [kotoba.lang.text :as str]
+            [kotobase.storage.async-contract :as contract]
+            [kotobase.storage.s3 :as s3]))
+
+(defn- env [name]
+  (let [v (aget (.-env js/process) name)]
+    (when (and v (not (str/blank? v))) v)))
+
+(def ^:private results (atom []))
+
+(defn- record! [ok? label detail]
+  (swap! results conj [(boolean ok?) label])
+  (println (str (if ok? "PASS " "FAIL ") label (when detail (str "  — " detail)))))
+
+(defn- bytes-of [& xs] (js/Uint8Array. (clj->js (vec xs))))
+
+(defn- probe-conditional-writes [client prefix]
+  (let [key (str prefix "probe/conditional-" (.now js/Date))]
+    (-> ((:put-object! client) {:key key :body (bytes-of 1 2 3) :if-none-match "*"})
+        (.then (fn [created]
+                 (record! (some? created)
+                          "If-None-Match:* creates a new object"
+                          (when created (str "etag " (:etag created))))
+                 created))
+        (.then (fn [created]
+                 (-> ((:put-object! client)
+                      {:key key :body (bytes-of 9 9 9) :if-none-match "*"})
+                     (.then (fn [again]
+                              (record! (nil? again)
+                                       "If-None-Match:* REJECTS an overwrite"
+                                       (when again
+                                         "provider accepted it — collision detection is not enforced"))
+                              created)))))
+        (.then (fn [created]
+                 (-> ((:put-object! client)
+                      {:key key :body (bytes-of 7 7 7)
+                       :if-match "\"0000000000000000000000000000dead\""})
+                     (.then (fn [stale]
+                              (record! (nil? stale)
+                                       "If-Match with a STALE etag is rejected"
+                                       (when stale
+                                         "provider accepted it — ref CAS is last-write-wins"))
+                              created)))))
+        (.then (fn [created]
+                 (-> ((:put-object! client)
+                      {:key key :body (bytes-of 4 4 4) :if-match (:etag created)})
+                     (.then (fn [ok]
+                              (record! (some? ok)
+                                       "If-Match with the CURRENT etag succeeds"
+                                       nil)))))))))
+
+(defn ^:export main [& _]
+  (let [missing (remove env ["S3_ENDPOINT" "S3_BUCKET" "S3_REGION"
+                             "S3_ACCESS_KEY_ID" "S3_SECRET_ACCESS_KEY"])]
+    (when (seq missing)
+      (println "missing env:" (str/join ", " missing))
+      (.exit js/process 2)))
+  (let [prefix (or (env "S3_PREFIX")
+                   (str "kotobase-contract-probe/" (.now js/Date) "/"))
+        cfg {:endpoint (env "S3_ENDPOINT")
+             :bucket (env "S3_BUCKET")
+             :region (env "S3_REGION")
+             :access-key (env "S3_ACCESS_KEY_ID")
+             :secret-key (env "S3_SECRET_ACCESS_KEY")}
+        client (s3/signed-client cfg)]
+    (println (str "live storage contract\n  endpoint " (:endpoint cfg)
+                  "\n  bucket   " (:bucket cfg)
+                  "\n  prefix   " prefix))
+    (println)
+    (println "── provider probes (client called directly) ──")
+    (-> (probe-conditional-writes client prefix)
+        (.then (fn [_]
+                 (println)
+                 (println "── shared storage contract (kotobase.storage.async-contract) ──")
+                 (-> (contract/verify (s3/open {:client client :prefix prefix}))
+                     (.then (fn [_] (record! true "async-contract/verify" nil)))
+                     (.catch (fn [e]
+                               ;; verify throws at the FIRST failing check, so
+                               ;; the message names the property that broke
+                               (record! false "async-contract/verify"
+                                        (or (.-message e) (str e))))))))
+        (.then (fn [_]
+                 (let [failed (remove first @results)]
+                   (println)
+                   (println (str (count @results) " checks, " (count failed) " failed"))
+                   (when (seq failed)
+                     (set! (.-exitCode js/process) 1)))))
+        (.catch (fn [e]
+                  (println "LIVE CONTRACT ERROR:" (or (.-message e) (str e)))
+                  (when-let [d (ex-data e)] (println "  data:" (pr-str d)))
+                  (set! (.-exitCode js/process) 1))))))

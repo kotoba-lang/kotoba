@@ -1,0 +1,567 @@
+(ns game.social-test
+  (:require [kotoba.test :refer [deftest is]]
+            [game.social :as social]))
+
+(deftest notification-inbox-is-recipient-scoped-idempotent-and-bounded
+  (let [notification (fn [id recipient kind created-at & [expires-at]]
+                       (cond-> #:notification{:id id :recipient recipient :kind kind
+                                              :title (str "title-" id) :body "body"
+                                              :source-id (str "source-" id)
+                                              :created-at created-at}
+                         expires-at (assoc :notification/expires-at expires-at)))
+        [_ s] (social/issue-notification (social/platform-state)
+                                         (notification "old" "did:a" :mail 10))
+        [_ s] (social/issue-notification s (notification "new" "did:a" :purchase 20))
+        [_ s] (social/issue-notification s (notification "other" "did:b" :system 30))
+        [_ s] (social/issue-notification s (notification "expired" "did:a" :match 5 15))]
+    (is (= :duplicate (first (social/issue-notification
+                              s (notification "old" "did:a" :mail 10)))))
+    (is (= 2 (social/unread-notification-count s "did:a" 25)))
+    (is (= ["new" "old"]
+           (mapv :notification/id (last (social/notification-inbox s "did:a" 25 10)))))
+    (is (= :not-notification-recipient
+           (second (social/mark-notification-read s "new" "did:b" 26))))
+    (let [[_ s] (social/mark-notification-read s "new" "did:a" 26)]
+      (is (= ["old" "new"]
+             (mapv :notification/id (last (social/notification-inbox s "did:a" 27 10)))))
+      (is (= 1 (social/unread-notification-count s "did:a" 27)))
+      (let [[_ s] (social/mark-all-notifications-read s "did:a" 28)
+            [_ s] (social/dismiss-notification s "new" "did:a" 29)]
+        (is (zero? (social/unread-notification-count s "did:a" 30)))
+        (is (= ["old"]
+               (mapv :notification/id
+                     (last (social/notification-inbox s "did:a" 30 10))))))))
+  (is (= :invalid-notification
+         (second (social/issue-notification
+                  (social/platform-state)
+                  #:notification{:id "bad" :recipient "did:a" :kind :unknown
+                                  :title "bad" :body "" :source-id "x" :created-at 1}))))
+  (is (= :invalid-notification-query
+         (second (social/notification-inbox (social/platform-state) "did:a" 1 101)))))
+
+(deftest platform-hud-projects-notification-badge-and-inbox
+  (let [model (social/platform-hud-model
+               {:did "did:a"
+                :notifications [{:id "read" :created_at 30 :read_at 31}
+                                {:id "unread" :created_at 20 :read_at nil}
+                                {:id "dismissed" :created_at 40 :dismissed_at 41}]})]
+    (is (= ["unread" "read"] (mapv :id (:notifications/items model))))
+    (is (= 1 (:notifications/unread model)))
+    (is (= {:tab/id :notifications :tab/count 1}
+           (first (:hud/tabs model))))))
+
+(deftest saves-are-revisioned
+  (let [[ok save s] (social/put-save (social/platform-state)
+                                     {:player "did:p1" :game "g/a" :expected-rev 0
+                                      :data {:level 2} :updated-at 10})]
+    (is (= :ok ok))
+    (is (= 1 (:save/rev save)))
+    (is (= :revision-conflict
+           (second (social/put-save s {:player "did:p1" :game "g/a" :expected-rev 0
+                                       :data {} :updated-at 11}))))))
+
+(deftest cross-game-profile-achievement-title-and-activity
+  (let [definition (social/achievement
+                    #:achievement{:id "drive-100" :game "gftd/drive" :metric :score
+                                  :reducer :sum :threshold 100 :title "Drive Centurion"
+                                  :title-reward "Road Runner"})
+        event (fn [id value verified]
+                #:event{:id id :player "did:p1" :game "gftd/drive" :metric :score
+                        :value value :verified verified :at 10})
+        state (social/platform-state)]
+    (is (= :achievement-event-unverified
+           (second (social/observe-achievement state definition (event "bad" 100 false)))))
+    (let [[_ state] (social/observe-achievement state definition (event "a" 40 true))
+          [_ state] (social/observe-achievement state definition (event "b" 60 true))]
+      (is (= :duplicate
+             (first (social/observe-achievement state definition (event "b" 60 true)))))
+      (is (= "Road Runner"
+             (get-in state [:achievement-unlocks "did:p1" "drive-100" :achievement/title])))
+      (is (= :title-not-unlocked
+             (second (social/update-player-profile state "did:p1"
+                                                   {:display-name "P1" :bio "hi" :avatar nil
+                                                    :visibility :public
+                                                    :equipped-title "Unknown"}))))
+      (let [[_ state] (social/update-player-profile state "did:p1"
+                                                    {:display-name "P1" :bio "hi" :avatar nil
+                                                     :visibility :friends
+                                                     :equipped-title "Road Runner"})
+            activity #:activity{:id "act-1" :player "did:p1" :kind :achievement
+                                :visibility :friends :at 11}
+            [_ state] (social/record-activity state activity)]
+        (is (= "Road Runner" (get-in state [:profiles "did:p1" :equipped-title])))
+        (is (social/visible-activity? "did:p2" true activity))
+        (is (not (social/visible-activity? "did:p2" false activity)))
+        (is (= :duplicate (first (social/record-activity state activity))))))))
+
+(deftest wallet-is-idempotent-and-non-negative
+  (let [[_ credited] (social/apply-transaction (social/wallet)
+                                               #:tx{:id "award-1" :currency :free-gem
+                                                    :amount 20 :kind :award})]
+    (is (= 20 (social/balance credited :free-gem)))
+    (is (= :duplicate (first (social/apply-transaction credited
+                                                       #:tx{:id "award-1" :currency :free-gem
+                                                            :amount 20}))))
+    (is (= :insufficient-funds
+           (second (social/apply-transaction credited
+                                             #:tx{:id "buy" :currency :free-gem :amount -21}))))))
+
+(deftest purchase-is-atomic
+  (let [p #:product{:id :hat :currency :free-gem :price 30
+                    :grants [#:item{:id :hat :quantity 1}]}
+        [_ w] (social/apply-transaction (social/wallet)
+                                        #:tx{:id "seed" :currency :free-gem :amount 50})
+        state (assoc-in (social/platform-state) [:wallets "did:p1"] w)
+        [ok receipt bought] (social/purchase state {:player "did:p1" :receipt-id "r1"
+                                                    :product p :purchased-at 12})]
+    (is (= :ok ok))
+    (is (= :hat (:receipt/product receipt)))
+    (is (= 20 (social/balance (get-in bought [:wallets "did:p1"]) :free-gem)))
+    (is (social/owned? (get-in bought [:inventories "did:p1"]) :hat))
+    (is (= :duplicate (first (social/purchase bought {:player "did:p1" :receipt-id "r1"
+                                                       :product p :purchased-at 13}))))))
+
+(deftest paid-gem-payment-and-refund-lifecycle
+  (let [pack #:pack{:id :gem-100 :gems 100 :fiat-currency :jpy :fiat-amount 160}
+        [_ intent s] (social/create-payment-intent
+                      (social/platform-state)
+                      {:intent-id "pi-1" :player "did:p1" :pack pack :created-at 10})]
+    (is (= :pending (:payment/status intent)))
+    (is (= :duplicate (first (social/create-payment-intent
+                              s {:intent-id "pi-1" :player "did:p1"
+                                 :pack pack :created-at 11}))))
+    (is (= :payment-unverified
+           (second (social/settle-payment s {:intent-id "pi-1" :provider-ref "provider-1"
+                                             :verified? false :settled-at 12}))))
+    (let [[_ settled paid] (social/settle-payment
+                            s {:intent-id "pi-1" :provider-ref "provider-1"
+                               :verified? true :settled-at 12})]
+      (is (= :settled (:payment/status settled)))
+      (is (= 100 (social/balance (get-in paid [:wallets "did:p1"]) :paid-gem)))
+      (is (= :duplicate (first (social/settle-payment
+                                paid {:intent-id "pi-1" :provider-ref "provider-1"
+                                      :verified? true :settled-at 13}))))
+      (let [[_ refund refunded] (social/refund-payment
+                                 paid {:refund-id "re-1" :intent-id "pi-1"
+                                       :provider-ref "provider-refund-1"
+                                       :verified? true :refunded-at 14})]
+        (is (= 100 (:refund/gems refund)))
+        (is (zero? (social/balance (get-in refunded [:wallets "did:p1"]) :paid-gem)))
+        (is (= :refunded (get-in refunded [:payment-intents "pi-1" :payment/status])))
+        (is (= :duplicate (first (social/refund-payment
+                                  refunded {:refund-id "re-1" :intent-id "pi-1"
+                                            :provider-ref "provider-refund-1"
+                                            :verified? true :refunded-at 15})))))))
+  (let [pack #:pack{:id :gem-10 :gems 10 :fiat-currency :usd :fiat-amount 99}
+        [_ _ s] (social/create-payment-intent (social/platform-state)
+                                              {:intent-id "pi-spent" :player "did:p2"
+                                               :pack pack :created-at 1})
+        [_ _ s] (social/settle-payment s {:intent-id "pi-spent" :provider-ref "pay"
+                                          :verified? true :settled-at 2})
+        [_ wallet] (social/apply-transaction (get-in s [:wallets "did:p2"])
+                                             #:tx{:id "spend" :currency :paid-gem
+                                                  :amount -1 :kind :purchase})
+        s (assoc-in s [:wallets "did:p2"] wallet)]
+    (is (= :refund-balance-spent
+           (second (social/refund-payment s {:refund-id "re-spent" :intent-id "pi-spent"
+                                             :provider-ref "refund" :verified? true
+                                             :refunded-at 3}))))))
+
+(deftest daily-free-gem-reward-is-verified-idempotent-and-streaked
+  (let [claim (fn [state day at]
+                (social/claim-daily-reward state {:player "did:p1" :day day
+                                                  :schedule [10 20 30]
+                                                  :verified? true :claimed-at at}))
+        [_ first-day s] (claim (social/platform-state) 100 1)]
+    (is (= {:reward/day 100 :reward/streak 1 :reward/currency :free-gem
+            :reward/amount 10 :reward/claimed-at 1} first-day))
+    (is (= :duplicate (first (claim s 100 2))))
+    (let [[_ second-day s] (claim s 101 3)]
+      (is (= [2 20] [(:reward/streak second-day) (:reward/amount second-day)]))
+      (let [[_ reset-day s] (claim s 103 4)]
+        (is (= [1 10] [(:reward/streak reset-day) (:reward/amount reset-day)]))
+        (is (= 40 (social/balance (get-in s [:wallets "did:p1"]) :free-gem)))
+        (is (= :stale-reward-day (second (claim s 102 5)))))))
+  (is (= :daily-reward-unverified
+         (second (social/claim-daily-reward
+                  (social/platform-state)
+                  {:player "did:p1" :day 100 :verified? false :claimed-at 1})))))
+
+(deftest system-mail-and-friend-gift-are-atomic-and-idempotent
+  (let [[_ wallet] (social/apply-transaction (social/wallet)
+                                             #:tx{:id "seed" :currency :free-gem
+                                                  :amount 50 :kind :seed})
+        state (assoc-in (social/platform-state) [:wallets "a"] wallet)
+        [_ gift sent] (social/send-free-gem-gift
+                       state {:id "gift-1" :sender "a" :recipient "b" :amount 20
+                              :created-at 10 :expires-at 100 :friendship-verified? true})]
+    (is (= :pending (:mail/status gift)))
+    (is (= 30 (social/balance (get-in sent [:wallets "a"]) :free-gem)))
+    (is (= :duplicate (first (social/send-free-gem-gift
+                              sent {:id "gift-1" :sender "a" :recipient "b" :amount 20
+                                    :created-at 10 :expires-at 100
+                                    :friendship-verified? true}))))
+    (is (= :not-mail-recipient
+           (second (social/claim-mail sent {:mail-id "gift-1" :player "c" :now 20}))))
+    (let [[_ claimed received] (social/claim-mail
+                                sent {:mail-id "gift-1" :player "b" :now 20})]
+      (is (= :claimed (:mail/status claimed)))
+      (is (= 20 (social/balance (get-in received [:wallets "b"]) :free-gem)))
+      (is (= :duplicate (first (social/claim-mail
+                                received {:mail-id "gift-1" :player "b" :now 21}))))))
+  (let [[_ wallet] (social/apply-transaction (social/wallet)
+                                             #:tx{:id "seed" :currency :free-gem :amount 20})
+        state (assoc-in (social/platform-state) [:wallets "a"] wallet)
+        [_ _ sent] (social/send-free-gem-gift
+                    state {:id "gift-expire" :sender "a" :recipient "b" :amount 20
+                           :created-at 10 :expires-at 30 :friendship-verified? true})
+        [_ expired refunded] (social/expire-mail sent "gift-expire" 30)]
+    (is (= :expired (:mail/status expired)))
+    (is (= 20 (social/balance (get-in refunded [:wallets "a"]) :free-gem)))
+    (is (= :duplicate (first (social/expire-mail refunded "gift-expire" 31)))))
+  (let [[_ _ state] (social/issue-mail
+                     (social/platform-state)
+                     {:id "system-1" :recipient "b" :kind :system :subject "Launch"
+                      :attachments [{:currency :free-gem :amount 10}
+                                    {:item :potion :quantity 2}]
+                      :created-at 1 :expires-at 100 :verified? true})
+        [_ _ claimed] (social/claim-mail state {:mail-id "system-1" :player "b" :now 2})]
+    (is (= 10 (social/balance (get-in claimed [:wallets "b"]) :free-gem)))
+    (is (= 2 (get-in claimed [:inventories "b" :inventory/items :potion])))))
+
+(deftest matchmaking-queue-ready-decline-and-timeout
+  (let [entry (fn [id player rating joined]
+                #:queue{:id id :player player :game "g/drive" :mode :casual
+                        :region :global :rating rating :joined-at joined})
+        [_ _ s] (social/enqueue-match (social/platform-state) (entry "q1" "a" 1000 1))
+        [_ _ s] (social/enqueue-match s (entry "q2" "b" 1100 2))
+        [_ match s] (social/form-match s {:match-id "m1" :now 3 :ready-until 30
+                                          :rating-window 200})]
+    (is (= ["a" "b"] (:match/players match)))
+    (is (= :already-queued (second (social/enqueue-match s (entry "q3" "a" 1000 4)))))
+    (let [[_ waiting s] (social/answer-match s {:match-id "m1" :player "a"
+                                                :accept? true :at 4})]
+      (is (= #{"a"} (:match/accepted waiting)))
+      (let [[_ active s] (social/answer-match s {:match-id "m1" :player "b"
+                                                 :accept? true :at 5})]
+        (is (= :active (:match/status active)))
+        (is (= :duplicate (first (social/answer-match
+                                  s {:match-id "m1" :player "b" :accept? true :at 6})))))))
+  (let [entry (fn [id player] #:queue{:id id :player player :game "g/x" :mode :ranked
+                                       :region :jp :rating 1000 :joined-at 1})
+        [_ _ s] (social/enqueue-match (social/platform-state) (entry "qa" "a"))
+        [_ _ s] (social/enqueue-match s (entry "qb" "b"))
+        [_ _ s] (social/form-match s {:match-id "decline" :now 2 :ready-until 20})
+        [_ declined s] (social/answer-match s {:match-id "decline" :player "a"
+                                               :accept? false :at 3})]
+    (is (= :declined (:match/status declined)))
+    (is (= :cancelled (get-in s [:match-queues "qa" :queue/status])))
+    (is (= :queued (get-in s [:match-queues "qb" :queue/status]))))
+  (let [entry (fn [id player] #:queue{:id id :player player :game "g/x" :mode :casual
+                                       :region :global :rating 1000 :joined-at 1})
+        [_ _ s] (social/enqueue-match (social/platform-state) (entry "qx" "x"))
+        [_ _ s] (social/enqueue-match s (entry "qy" "y"))
+        [_ _ s] (social/form-match s {:match-id "timeout" :now 2 :ready-until 20})
+        [_ _ s] (social/answer-match s {:match-id "timeout" :player "x"
+                                        :accept? true :at 3})
+        [_ expired s] (social/expire-match s "timeout" 20)]
+    (is (= :expired (:match/status expired)))
+    (is (= :queued (get-in s [:match-queues "qx" :queue/status])))
+    (is (= :cancelled (get-in s [:match-queues "qy" :queue/status])))))
+
+(deftest party-invite-queue-ready-reconnect-and-penalty
+  (let [[_ s] (social/create-group (social/platform-state)
+                                   #:group{:id "party-a" :kind :party :owner "a"
+                                           :capacity 4})
+        [_ invite s] (social/invite-party
+                      s #:invite{:id "i1" :party "party-a" :from "a" :to "b"
+                                 :created-at 1 :expires-at 20})
+        [_ accepted s] (social/answer-party-invite
+                        s {:invite-id "i1" :player "b" :accept? true :at 2})]
+    (is (= :pending (:invite/status invite)))
+    (is (= :accepted (:invite/status accepted)))
+    (is (= :member (get-in s [:groups "party-a" :group/members "b"])))
+    (is (= :not-party-leader
+           (second (social/enqueue-party-match
+                    s #:queue{:id "bad" :party "party-a" :player "b" :game "g/drive"
+                               :mode :ranked :region :jp :rating 1000 :joined-at 3}))))
+    (let [[_ qa s] (social/enqueue-party-match
+                    s #:queue{:id "qa" :party "party-a" :player "a" :game "g/drive"
+                               :mode :ranked :region :jp :rating 1000 :joined-at 3})
+          [_ s] (social/create-group s #:group{:id "party-c" :kind :party :owner "c"
+                                               :capacity 2})
+          [_ s] (social/join-group s "party-c" "d" :member)
+          [_ _ s] (social/enqueue-party-match
+                   s #:queue{:id "qc" :party "party-c" :player "c" :game "g/drive"
+                              :mode :ranked :region :jp :rating 1050 :joined-at 4})
+          [_ match s] (social/form-match s {:match-id "pm" :now 5 :ready-until 20})]
+      (is (= ["a" "b"] (:queue/players qa)))
+      (is (= #{"a" "b" "c" "d"} (set (:match/players match))))
+      (let [[_ _ s] (social/answer-match s {:match-id "pm" :player "a" :accept? true :at 6})
+            [_ _ s] (social/answer-match s {:match-id "pm" :player "b" :accept? true :at 7})
+            [_ _ s] (social/answer-match s {:match-id "pm" :player "c" :accept? true :at 8})
+            [_ active s] (social/answer-match s {:match-id "pm" :player "d" :accept? true :at 9})]
+        (is (= :active (:match/status active)))
+        (let [[_ disconnected s] (social/disconnect-match-player
+                                  s {:match-id "pm" :player "b" :at 10
+                                     :reconnect-until 20})]
+          (is (= :disconnected
+                 (get-in disconnected [:match/connections "b" :connection/status])))
+          (let [[_ reconnected s] (social/reconnect-match-player
+                                   s {:match-id "pm" :player "b" :at 15})]
+            (is (= :connected
+                   (get-in reconnected [:match/connections "b" :connection/status])))
+            (let [[_ _ s] (social/disconnect-match-player
+                           s {:match-id "pm" :player "b" :at 21 :reconnect-until 30})]
+              (is (= :reconnect-window-active
+                     (second (social/abandon-match-player
+                              s {:match-id "pm" :player "b" :at 29 :penalty-until 60
+                                 :reason :disconnect-timeout}))))
+              (let [[_ penalty s] (social/abandon-match-player
+                                   s {:match-id "pm" :player "b" :at 30 :penalty-until 60
+                                      :reason :disconnect-timeout})]
+                (is (= 60 (:penalty/until penalty)))
+                (is (= :match-penalty-active
+                       (second (social/enqueue-match
+                                s #:queue{:id "blocked" :player "b" :game "g/drive"
+                                           :mode :casual :region :jp :rating 1000
+                                           :joined-at 31}))))
+                (is (= :ok
+                       (first (social/enqueue-match
+                               s #:queue{:id "after" :player "b" :game "g/drive"
+                                          :mode :casual :region :jp :rating 1000
+                                          :joined-at 60}))))))))))))
+
+(deftest ranking-and-chat-contracts
+  (let [b (social/leaderboard #:board{:id :weekly :game :drive :season "2026-W29"})
+        [_ b] (social/submit-score b #:score{:submission "s1" :player "did:p1"
+                                             :value 10 :verified true})
+        [_ b] (social/submit-score b #:score{:submission "s2" :player "did:p1"
+                                             :value 8 :verified true})]
+    (is (= 10 (:score/value (first (social/standings b)))))
+    (is (= :unverified (second (social/submit-score b #:score{:submission "bad"
+                                                               :player "did:p2" :value 99
+                                                               :verified false})))))
+  (let [p (assoc (social/player-profile "did:to" "To" 1) :player/blocked #{"did:from"})
+        state (assoc-in (social/platform-state) [:profiles "did:to"] p)]
+    (is (= :blocked
+           (second (social/admit-chat state #:message{:id "m1" :from "did:from"
+                                                       :to "did:to" :text "hi"
+                                                       :moderation :approved}
+                                      #:room{:max-length 20}))))))
+
+(deftest royalty-contract
+  (is (= [["parent" 10] ["root" 5]]
+         (social/royalties 100 ["parent" "root"]))))
+
+(deftest friendship-block-and-group-contract
+  (let [s (social/platform-state)
+        [_ s] (social/request-friend s {:request-id "r1" :from "a" :to "b" :at 1})
+        [_ s] (social/answer-friend s {:request-id "r1" :player "b" :accept? true :at 2})]
+    (is (contains? (:friendships s) ["a" "b"]))
+    (let [[_ blocked] (social/block-player s "a" "b" 3)]
+      (is (social/blocked? blocked "a" "b"))
+      (is (empty? (:friendships blocked)))
+      (is (= :blocked (second (social/request-friend blocked
+                                                     {:request-id "r2" :from "b" :to "a" :at 4}))))))
+  (let [[_ s] (social/create-group (social/platform-state)
+                                   #:group{:id "p1" :kind :party :owner "a" :capacity 2})
+        [_ s] (social/join-group s "p1" "b" :member)]
+    (is (= {"a" :owner "b" :member} (get-in s [:groups "p1" :group/members])))
+    (is (= :group-full (second (social/join-group s "p1" "c" :member))))))
+
+(deftest room-chat-is-member-only-moderated-and-bounded
+  (let [[_ s] (social/create-room (social/platform-state)
+                                  #:room{:id "room" :kind :party :members #{"a" "b"}
+                                         :max-length 10 :history-limit 2})
+        msg (fn [id from text] #:message{:id id :room "room" :from from :text text
+                                         :moderation :approved})
+        [_ _ s] (social/admit-room-message s (msg "m1" "a" "one"))
+        [_ _ s] (social/admit-room-message s (msg "m2" "b" "two"))
+        [_ _ s] (social/admit-room-message s (msg "m3" "a" "three"))]
+    (is (= ["m2" "m3"] (mapv :message/id (get-in s [:rooms "room" :room/messages]))))
+    (is (= :not-room-member (second (social/admit-room-message s (msg "m4" "c" "hi")))))
+    (is (= :message-too-long (second (social/admit-room-message s (msg "m5" "a" "way too long")))))
+    (is (= :moderation-rejected
+           (second (social/admit-room-message s (assoc (msg "m6" "a" "no")
+                                                       :message/moderation :rejected)))))))
+
+(deftest season-ranking-lifecycle-ties-and-rewards
+  (let [season (social/season #:season{:id "s1" :starts-at 10 :ends-at 20
+                                       :reward-tiers [{:through 1 :reward {:free-gem 100}}
+                                                      {:through 3 :reward {:free-gem 25}}]})
+        board (social/leaderboard #:board{:id :weekly :game :drive :season "s1"})
+        score (fn [id player value at]
+                #:score{:submission id :player player :value value :at at :verified true})]
+    (is (= :scheduled (social/season-status season 9)))
+    (is (= :season-not-active
+           (second (social/submit-season-score board season 9 (score "x" "a" 9 9)))))
+    (let [[_ b] (social/submit-season-score board season 12 (score "a" "a" 10 12))
+          [_ b] (social/submit-season-score b season 13 (score "b" "b" 10 13))
+          [_ b] (social/submit-season-score b season 14 (score "c" "c" 8 14))
+          ranked (social/ranked-standings b)]
+      (is (= [["a" 1] ["b" 1] ["c" 3]]
+             (mapv (juxt :score/player :score/rank) ranked)))
+      (is (= :season-not-closed (second (social/close-season b season 19))))
+      (let [[ok snapshot] (social/close-season b season 20)]
+        (is (= :ok ok))
+        (is (= {"a" {:free-gem 100} "b" {:free-gem 100} "c" {:free-gem 25}}
+               (:season/rewards snapshot)))))))
+
+(deftest platform-hud-projects-provider-snapshot
+  (let [hud (social/platform-hud-model
+             {:did "did:me"
+              :profile {:display_name "Me" :equipped_title "Road Runner"}
+              :achievements [{:id "a1" :unlocked_at 4}]
+              :activity [{:id "act1" :at 5}]
+              :balances [{:currency "free-gem" :balance 80}
+                         {:currency :paid-gem :balance 5}]
+              :transactions [{:id "tx1"}]
+              :inventory [{:item "hat" :quantity 1 :entitlement 0}
+                          {:item "skin" :quantity 0 :entitlement 1}
+                          {:item "spent" :quantity 0 :entitlement 0}]
+              :products [{:id "cheap" :currency "free-gem" :price 30}
+                         {:id "premium" :currency "paid-gem" :price 10}]
+              :gem-packs [{:id "gem-100" :gems 100}]
+              :payments [{:id "pi-1" :status "pending"}]
+              :server-day 101
+              :daily-reward {:day 100 :streak 2 :amount 10}
+              :economy-debts [{:currency "paid-gem" :amount 80}]
+              :economy-holds [{:capability "store" :reason "economy-debt"}]
+              :mail [{:id "mail-1" :status "pending" :created_at 2}
+                     {:id "mail-old" :status "claimed" :created_at 1}]
+              :match-queue {:id "q1" :status "queued"}
+              :matches [{:id "m1" :status "ready"}]
+              :guild-events [{:id "raid-1" :status "active"}]
+              :guild-standings [{:event_id "raid-1" :guild "g2" :total 80 :rank 2}
+                                {:event_id "raid-1" :guild "g1" :total 100 :rank 1}]
+              :friendships [{:a "did:me" :b "did:friend"}]
+              :friend-requests [{:id "in" :sender "did:new" :recipient "did:me"
+                                 :status "pending" :created_at 1}
+                                {:id "out" :sender "did:me" :recipient "did:other"
+                                 :status "pending" :created_at 2}]
+              :groups [{:id "guild"}]
+              :group-members [{:group_id "guild" :player "did:friend"
+                               :role "member" :joined_at 2}
+                              {:group_id "guild" :player "did:me"
+                               :role "owner" :joined_at 1}]})]
+    (is (= {:free-gem 80 :paid-gem 5} (:wallet/balances hud)))
+    (is (:wallet/daily-claimable? hud))
+    (is (= 2 (get-in hud [:wallet/daily-reward :streak])))
+    (is (= 80 (get-in hud [:wallet/debts 0 :amount])))
+    (is (:wallet/restricted? hud))
+    (is (= ["hat" "skin"] (mapv :item (:inventory/items hud))))
+    (is (= [false true] (mapv :entitlement (:inventory/items hud))))
+    (is (= [true false] (mapv :affordable? (:store/products hud))))
+    (is (= ["gem-100"] (mapv :id (:store/gem-packs hud))))
+    (is (= ["pi-1"] (mapv :id (:store/payments hud))))
+    (is (= ["mail-1"] (mapv :id (:mail/inbox hud))))
+    (is (= "q1" (get-in hud [:matchmaking/queue :id])))
+    (is (= ["m1"] (mapv :id (:matchmaking/matches hud))))
+    (is (= ["raid-1"] (mapv :id (:guild-events/items hud))))
+    (is (= ["g1" "g2"]
+           (mapv :guild (get-in hud [:guild-events/standings "raid-1"]))))
+    (is (= ["did:friend"] (:social/friends hud)))
+    (is (= ["in"] (mapv :id (:social/pending-in hud))))
+    (is (= ["did:me" "did:friend"]
+           (mapv :player (get-in hud [:social/group-members "guild"]))))
+    (is (= "Me" (get-in hud [:profile/data :display_name])))
+    (is (= ["a1"] (mapv :id (:profile/achievements hud))))
+    (is (= [] (:saves/items hud)))
+    (is (= [0 1 1 2 3 0 0 0 0 1 2 1 2 1] (mapv :tab/count (:hud/tabs hud))))))
+
+(deftest platform-hud-projects-cloud-save-heads
+  (let [hud (social/platform-hud-model
+             {:saves [{:game "gftd/drive" :rev 2}
+                      {:game "gftd/ghosthacker-echoes" :rev 5}]})]
+    (is (= ["gftd/drive" "gftd/ghosthacker-echoes"]
+           (mapv :game (:saves/items hud))))
+    (is (= 2 (->> (:hud/tabs hud)
+                  (filter #(= :saves (:tab/id %))) first :tab/count)))))
+
+(deftest platform-hud-projects-missions-and-battle-pass
+  (let [hud (social/platform-hud-model
+             {:missions [{:id "m2" :starts_at 2 :claimed_at 10}
+                         {:id "m1" :starts_at 1 :claimed_at nil}]
+              :battle-pass {:id "s1" :xp 15}
+              :battle-pass-tiers [{:level 2 :xp 20} {:level 1 :xp 10}]
+              :battle-pass-claims [{:level 1 :track "free"}]})]
+    (is (= ["m1" "m2"] (mapv :id (:missions/items hud))))
+    (is (= "s1" (get-in hud [:battle-pass/data :id])))
+    (is (= [1 2] (mapv :level (:battle-pass/tiers hud))))
+    (is (= #{[1 "free"]} (:battle-pass/claims hud)))))
+
+(deftest platform-hud-projects-memberships
+  (let [hud (social/platform-hud-model
+             {:subscription-plans [{:id "plus" :title "Isekai Plus"}]
+              :subscriptions [{:plan "plus" :status "active" :started_at 10}]})]
+    (is (= ["plus"] (mapv :id (:subscription/plans hud))))
+    (is (= "active" (get-in hud [:subscription/items 0 :status])))
+    (is (= 1 (->> (:hud/tabs hud)
+                  (filter #(= :membership (:tab/id %))) first :tab/count)))))
+
+(deftest guild-event-contribution-ranking-and-rewards
+  (let [event (social/guild-event
+               #:event{:id "raid-1" :game "gftd/drive" :starts-at 10 :ends-at 20
+                       :target 1000
+                       :reward-tiers [{:through 1 :free-gem-per-contributor 100}
+                                      {:through 3 :free-gem-per-contributor 25}]})
+        state (social/guild-event-state event)
+        contribution (fn [id guild player amount]
+                       #:contribution{:submission id :guild guild :player player
+                                      :amount amount :verified true
+                                      :member-verified true :at 12})]
+    (is (= :guild-event-not-active
+           (second (social/contribute-guild-event state event 9
+                                                  (contribution "early" "g1" "a" 5)))))
+    (is (= :contribution-unverified
+           (second (social/contribute-guild-event
+                    state event 12 (assoc (contribution "bad" "g1" "a" 5)
+                                          :contribution/verified false)))))
+    (let [[_ state] (social/contribute-guild-event state event 12
+                                                   (contribution "a1" "g1" "a" 40))
+          [_ state] (social/contribute-guild-event state event 13
+                                                   (contribution "b1" "g1" "b" 60))
+          [_ state] (social/contribute-guild-event state event 14
+                                                   (contribution "c1" "g2" "c" 100))]
+      (is (= :duplicate
+             (first (social/contribute-guild-event state event 15
+                                                   (contribution "a1" "g1" "a" 40)))))
+      (is (= [["g1" 100 1] ["g2" 100 1]]
+             (mapv (juxt :guild/id :guild/total :guild/rank)
+                   (social/guild-event-standings state))))
+      (is (= :guild-event-not-closed
+             (second (social/close-guild-event state event 19))))
+      (let [[ok closed] (social/close-guild-event state event 20)]
+        (is (= :ok ok))
+        (is (= {"a" {:free-gem 100 :guild "g1" :rank 1}
+                "b" {:free-gem 100 :guild "g1" :rank 1}
+                "c" {:free-gem 100 :guild "g2" :rank 1}}
+               (:event/rewards closed)))))))
+
+(deftest friendship-and-group-lifecycle
+  (let [base (social/platform-state)
+        [_ s] (social/request-friend base {:request-id "r" :from "a" :to "b" :at 1})
+        [_ s] (social/answer-friend s {:request-id "r" :player "b" :accept? true :at 2})
+        [_ s] (social/remove-friend s "a" "b")]
+    (is (empty? (:friendships s)))
+    (is (empty? (:friend-requests s)))
+    (is (= :duplicate (first (social/remove-friend s "a" "b")))))
+  (let [[_ s] (social/create-group (social/platform-state)
+                                   #:group{:id "g" :kind :guild :owner "a" :capacity 4})
+        [_ s] (social/join-group s "g" "b" :member)
+        [_ s] (social/join-group s "g" "c" :member)]
+    (is (= :owner-transfer-required (second (social/leave-group s "g" "a"))))
+    (let [[_ s] (social/change-group-role s "g" "a" "b" :moderator)]
+      (is (= :insufficient-group-role
+             (second (social/remove-group-member s "g" "c" "b"))))
+      (let [[_ s] (social/remove-group-member s "g" "b" "c")
+            [_ s] (social/transfer-group-owner s "g" "a" "b")]
+        (is (= "b" (get-in s [:groups "g" :group/owner])))
+        (is (= {:moderator "a" :owner "b"}
+               (into {} (map (fn [[player role]] [role player])
+                             (get-in s [:groups "g" :group/members])))))
+        (is (= :not-group-owner
+               (second (social/change-group-role s "g" "a" "b" :member))))
+        (let [[_ s] (social/leave-group s "g" "a")]
+          (is (= {"b" :owner} (get-in s [:groups "g" :group/members]))))))))

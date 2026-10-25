@@ -1,0 +1,172 @@
+;; publish_r2.cljs — publish the committed watchlist snapshot to an R2 bucket.
+;; nbb only (repo-wide toolchain rule: no bb/babashka, no .sh, no hand-written
+;; .mjs).
+;;
+;; Usage (from this repo's root):
+;;   kbb --backend sci -cp "$(kbb -Spath)" scripts/publish_r2.cljk --bucket <name> [--dir DIR] [--prefix P] [--dry-run]
+;;
+;; WHAT THIS IS, AND WHAT IT IS NOT.
+;;
+;; Git is the source of truth for this data (superproject ADR-2608039700:
+;; the agent-facing durable plane is Git + canonical EDN, and a database is a
+;; query projection over it). R2 here is a SERVING copy: delete the bucket and
+;; nothing is lost, because `git checkout` plus scripts/refresh_lists.cljk
+;; rebuilds every byte. That is the whole test that decides whether a store is
+;; premise or projection, and this one is a projection.
+;;
+;; This is NOT R2 Data Catalog. R2 Data Catalog is an Iceberg REST catalog:
+;; it serves Parquet tables with Iceberg metadata and manifest lists, and
+;; needs a client that speaks that protocol to create a namespace, create a
+;; table, and commit snapshots. This script writes plain objects. Publishing
+;; these entities as an Iceberg table is a real and reachable follow-up --
+;; kotoba-lang/org-apache-parquet can already WRITE Parquet
+;; (parquet.write/file, /of-columns) -- but the catalog protocol is a
+;; separate piece of work with its own tests, and calling an object PUT a
+;; catalog would misname what a caller is querying.
+;;
+;; ADDRESSING. Entities are written under the sha256 of their own bytes, so
+;; an object is immutable once written and a re-publish of unchanged data is
+;; a no-op at the same key. One mutable pointer per source
+;; (<prefix>/<source>/latest.edn) and one index (<prefix>/index.edn) name the
+;; current object. A reader that wants a stable answer reads the pointer once
+;; and then fetches by hash.
+;;
+;; VERIFICATION. Every put is read back and its sha256 compared before this
+;; script reports the source as published. A PUT that returned 0 is not
+;; evidence that the bytes arrived.
+
+(ns publish-r2
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(defn- die [msg] (println "ERROR:" msg) (js/process.exit 1))
+
+(defn- sha256-file [p]
+  (-> (crypto/createHash "sha256") (.update (fs/readFileSync p)) (.digest "hex")))
+
+(defn- wrangler!
+  "Run wrangler and return {:status :stdout :stderr}. Never throws -- the
+   caller decides what a non-zero status means, and every call site here
+   keeps the stderr rather than reducing it to the status code."
+  [args]
+  (let [r (cp/spawnSync "npx" (clj->js (into ["wrangler"] args))
+                        #js {:encoding "utf8"})]
+    {:status (or (.-status r) 1)
+     :stdout (str (.-stdout r))
+     :stderr (str (.-stderr r))}))
+
+(defn- put! [bucket key file content-type]
+  (let [{:keys [status stderr]} (wrangler! ["r2" "object" "put" (str bucket "/" key)
+                                            "--file" file "--content-type" content-type
+                                            "--remote"])]
+    (when-not (zero? status)
+      (die (str "put " key " failed (exit " status ")\n" stderr)))))
+
+(defn- get-sha256!
+  "Fetch `key` back out of R2 and hash the bytes that arrived. nil when the
+   object is not readable -- distinguished from 'readable but different', so
+   a caller can tell 'the put never landed' from 'the put landed wrong'."
+  [bucket key]
+  (let [tmp (path/join (fs/mkdtempSync (path/join (os/tmpdir) "watchlist-verify-")) "obj")
+        {:keys [status stderr]} (wrangler! ["r2" "object" "get" (str bucket "/" key)
+                                            "--file" tmp "--remote"])]
+    (if (and (zero? status) (fs/existsSync tmp))
+      (sha256-file tmp)
+      (do (println "  read-back failed for" key "--" (str/trim stderr)) nil))))
+
+(defn- sources-in
+  "Every source with BOTH files present in `dir`. A source missing one of the
+   two is reported and skipped rather than published half -- an entities file
+   with no manifest is a snapshot no reader can date."
+  [dir]
+  (let [files (set (fs/readdirSync dir))
+        names (->> files
+                   (keep #(second (re-matches #"(.+)\.entities\.edn" %)))
+                   sort)]
+    (vec (keep (fn [n]
+                 (if (contains? files (str n ".manifest.edn"))
+                   n
+                   (do (println "SKIP" n "-- entities file present, manifest missing") nil)))
+               names))))
+
+(defn- publish-source! [{:keys [bucket dir prefix dry-run]} source]
+  (let [ent-file (path/join dir (str source ".entities.edn"))
+        man-file (path/join dir (str source ".manifest.edn"))
+        ent-sha (sha256-file ent-file)
+        manifest (edn/read-string (fs/readFileSync man-file "utf8"))
+        ent-key (str prefix "/" source "/" ent-sha ".entities.edn")
+        ptr-key (str prefix "/" source "/latest.edn")
+        pointer (assoc manifest
+                       :object/entities-key ent-key
+                       :object/entities-sha256 ent-sha
+                       :object/entities-bytes (.-size (fs/statSync ent-file))
+                       :object/published-by "scripts/publish_r2.cljk")
+        ptr-file (path/join (fs/mkdtempSync (path/join (os/tmpdir) "watchlist-ptr-")) "latest.edn")]
+    (fs/writeFileSync ptr-file (str ";; GENERATED by scripts/publish_r2.cljk -- do not hand-edit.\n"
+                                    (pr-str pointer) "\n"))
+    (println (str source ": " (:manifest/entity-count manifest) " entities, "
+                  (.-size (fs/statSync ent-file)) " bytes, sha256 " ent-sha))
+    (if dry-run
+      (do (println "  DRY RUN -- would put" ent-key "and" ptr-key)
+          (assoc pointer :object/verified :dry-run))
+      (do
+        (put! bucket ent-key ent-file "application/edn")
+        (put! bucket ptr-key ptr-file "application/edn")
+        (let [back (get-sha256! bucket ent-key)]
+          (when-not (= back ent-sha)
+            (die (str source ": read-back sha256 " (pr-str back) " != " ent-sha
+                      " -- the object in R2 is not the file on disk")))
+          (println "  verified" ent-key)
+          (assoc pointer :object/verified true))))))
+
+(defn- parse-args [argv]
+  (loop [args (seq argv) out {:dir "resources/watchlist/lists" :prefix "watchlist" :dry-run false}]
+    (if-not args
+      out
+      (let [[flag value & more] args]
+        ;; `next`, not `rest`: rest returns () at the end, () is truthy in
+        ;; ClojureScript, and `(if-not args ...)` then never fires -- the loop
+        ;; spins forever on the first flag it does not consume in pairs.
+        (case flag
+          "--bucket" (recur more (assoc out :bucket value))
+          "--dir" (recur more (assoc out :dir value))
+          "--prefix" (recur more (assoc out :prefix value))
+          "--dry-run" (recur (next args) (assoc out :dry-run true))
+          (recur (next args) out))))))
+
+(defn -main [& argv]
+  (let [{:keys [bucket dir prefix dry-run] :as opts} (parse-args argv)]
+    ;; No default bucket. Guessing one would publish this data to whichever
+    ;; bucket happened to match a name in some other repo's config.
+    (when-not (or bucket dry-run) (die "--bucket is required (or pass --dry-run)"))
+    (when-not (fs/existsSync dir) (die (str "no such directory: " dir)))
+    (let [sources (sources-in dir)]
+      ;; Evidence floor. An empty directory must not be reported as a
+      ;; successful publish of nothing.
+      (when (empty? sources) (die (str "no publishable sources in " dir)))
+      (let [pointers (mapv #(publish-source! opts %) sources)
+            index {:index/prefix prefix
+                   :index/sources (mapv (fn [p] {:manifest/source (:manifest/source p)
+                                                 :object/entities-key (:object/entities-key p)
+                                                 :object/entities-sha256 (:object/entities-sha256 p)
+                                                 :manifest/entity-count (:manifest/entity-count p)
+                                                 :manifest/fetched-at (:manifest/fetched-at p)
+                                                 :manifest/source-published-at (:manifest/source-published-at p)})
+                                        pointers)}
+            idx-file (path/join (fs/mkdtempSync (path/join (os/tmpdir) "watchlist-idx-")) "index.edn")]
+        (fs/writeFileSync idx-file (str ";; GENERATED by scripts/publish_r2.cljk -- do not hand-edit.\n"
+                                        (pr-str index) "\n"))
+        (if dry-run
+          (println "DRY RUN -- would put" (str prefix "/index.edn"))
+          (do (put! bucket (str prefix "/index.edn") idx-file "application/edn")
+              (println "verified" (str prefix "/index.edn")
+                       "->" (get-sha256! bucket (str prefix "/index.edn")))))
+        (println (str "PUBLISHED\t" (count sources) "\tsources to "
+                      (if dry-run "(dry run)" bucket)))))))
+
+(apply -main *command-line-args*)

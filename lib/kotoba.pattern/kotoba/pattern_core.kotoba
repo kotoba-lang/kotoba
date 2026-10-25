@@ -1,0 +1,487 @@
+(ns pattern-core
+  ;; A bounded pattern matcher, in Kotoba.
+  ;;
+  ;; ## Why this exists
+  ;;
+  ;; Counted 2026-09-09 across kotoba-lang's browser stack: 308 regex literals
+  ;; in 213 files (200 unique) -- htmldom 11, cssom 115 in one file and 67 in
+  ;; another. Kotoba has no regex head, so every port so far hand-rolls a
+  ;; scanner out of `string-code-point-at` and `string-substring`; twelve
+  ;; modules do it today. That is the thing blocking the browser stack, and it
+  ;; is not a size problem: htmldom has no atoms, no protocols, three interop
+  ;; sites, and `loop`/`recur` is admitted. It has eleven regexes.
+  ;;
+  ;; So: one scanner, in a library, driven by data.
+  ;;
+  ;; ## Why a Pike VM and not backtracking
+  ;;
+  ;; A backtracking matcher is easier to write and has no bound worth the
+  ;; name -- `(a+)+b` against a page of a's is the standard denial of service,
+  ;; and this workspace runs matchers over input it did not write. This is a
+  ;; Thompson/Pike machine: the program is a list of instructions, the run
+  ;; carries a LIST of live threads instead of a stack of choices, and each
+  ;; input position is visited once. Time is O(input x program) with no
+  ;; exponent to find.
+  ;;
+  ;; It also costs nothing extra here: with no mutable cells, a backtracking
+  ;; matcher would need its continuation reified anyway.
+  ;;
+  ;; ## The program
+  ;;
+  ;;   {:code    [[op a b] ...]     one instruction per entry, all :i64
+  ;;    :classes [[lo hi lo hi ...] ...]   flat inclusive ranges
+  ;;    :fold    true|false}        case-insensitive (the (?i) of 38 literals)
+  ;;
+  ;;   op 0 char a=codepoint   op 3 split a=pc b=pc   op 6 match
+  ;;   op 1 class a=index b=neg op 4 jmp   a=pc       op 7 bol
+  ;;   op 2 any                 op 5 (reserved: save) op 8 eol
+  ;;
+  ;; `pattern-parse` builds this from a regex-subset string. Nothing here
+  ;; parses: a program is inert data, so it can be printed, diffed and refused
+  ;; before anything runs it.
+  ;;
+  ;; ## Bounds, named
+  ;;
+  ;; No captures in this version -- `match?` and `search` answer where, not
+  ;; what. 102 of the 308 literals use a group and many of those are grouping
+  ;; rather than capturing; the ones that need the text are the next slice, and
+  ;; the instruction set already reserves op 5 for it.
+  ;;
+  ;; No lookahead (3 uses in the corpus), no backreferences (0 uses), no
+  ;; non-greedy quantifiers.
+  ;;
+  ;; ⚠ Until 2026-09-09 this paragraph said `.` matches any code point
+  ;; INCLUDING newline "which differs from Clojure's default and is asserted
+  ;; in the parity test rather than left to be discovered". That was an
+  ;; implementation state written up as a decision, and the write-up did real
+  ;; work: the parity corpus then deliberately avoided newline inputs for `.`,
+  ;; so the suite could not have caught it. `.` now excludes the line
+  ;; terminators, as it does everywhere else.
+  ;;
+  ;; This module has no `(?s)` to turn that back on -- its program is a
+  ;; `:document` with a single `:fold` flag and no room for a mode field.
+  ;; `pattern-vm` has one. That is a reason to use `pattern-vm`, not a reason
+  ;; to leave this one answering a different question from it.
+  (:export [main
+            op-char op-class op-any op-split op-jmp op-match op-bol op-eol
+            program code-of classes-of fold-of code-count instruction-at
+            in-class? matches-here?
+            match? search search-start search-end
+            fold-cp
+            test-literal test-class test-quantifier test-alternation
+            test-anchor test-search test-fold test-empty test-bounded])
+  (:schemas {:pat/add [:record :pat/add
+                       [[:prog :document] [:list :document] [:pc :i64]
+                        [:bol :bool] [:eol :bool]]]
+             :pat/threads [:record :pat/threads
+                           [[:prog :document] [:list :document] [:i :i64]
+                            [:cp :i64] [:next :document] [:eol :bool]]]
+             :pat/run [:record :pat/run
+                       [[:prog :document] [:list :document] [:s :string]
+                        [:pos :i64] [:len :i64]]]
+             :pat/scan [:record :pat/scan
+                        [[:prog :document] [:s :string] [:pos :i64]
+                         [:len :i64] [:want-end :bool]]]
+             :pat/range [:record :pat/range
+                         [[:ranges :document] [:i :i64] [:n :i64] [:cp :i64]]]
+             :pat/member [:record :pat/member
+                          [[:list :document] [:i :i64] [:n :i64] [:pc :i64]]]}))
+
+;; --- reading a document ---------------------------------------------------
+
+(defn dget [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn dat [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn di [d :document i :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (dat d i)) 0))
+
+(defn dbool-of [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dget d k)) false))
+
+;; --- the instruction set --------------------------------------------------
+
+(defn op-char [] :i64 0)
+(defn op-class [] :i64 1)
+(defn op-any [] :i64 2)
+(defn op-split [] :i64 3)
+(defn op-jmp [] :i64 4)
+(defn op-match [] :i64 6)
+(defn op-bol [] :i64 7)
+(defn op-eol [] :i64 8)
+
+;; ⚠ `(document-bool fold)` is bound first for the same reason `search` binds
+;; its end: a multi-entry `document-map` whose value expression contains a
+;; CALL makes the compiler refuse the whole module with "value is not a
+;; boolean" (:value phase, kotoba/internal-error) once that function has a
+;; caller. `kotoba -M check` passes either way. Measured 2026-09-09.
+(defn program [code :document classes :document fold :bool] :document
+  (let [flag (document-bool fold)]
+    (document-map :code code :classes classes :fold flag)))
+
+(defn code-of [p :document] :document
+  (dget p :code))
+
+(defn classes-of [p :document] :document
+  (dget p :classes))
+
+(defn fold-of [p :document] :bool
+  (dbool-of p :fold))
+
+(defn code-count [p :document] :i64
+  (document-count (code-of p)))
+
+(defn instruction-at [p :document pc :i64] :document
+  (dat (code-of p) pc))
+
+;; --- code points ----------------------------------------------------------
+
+;; Folding is ASCII-only and says so. A pattern that needs Turkish dotless i
+;; is not one this answers correctly, and pretending otherwise is worse than
+;; refusing: `string-fold-case` exists for whole strings, but the VM compares
+;; one code point at a time.
+(defn fold-cp [cp :i64] :i64
+  (if (and (>= cp 65) (<= cp 90)) (+ cp 32) cp))
+
+(defn cp-width [cp :i64] :i64
+  (if (< cp 128) 1 (if (< cp 2048) 2 (if (< cp 65536) 3 4))))
+
+;; --- character classes ----------------------------------------------------
+
+(defn range-hit? [x [:ref :pat/range]] :bool
+  (let [ranges (record-get x :ranges)
+        i (record-get x :i)
+        n (record-get x :n)
+        cp (record-get x :cp)]
+    (if (>= i n)
+      false
+      (if (and (>= cp (di ranges i)) (<= cp (di ranges (+ i 1))))
+        true
+        (range-hit? (record-new [:ref :pat/range] ranges (+ i 2) n cp))))))
+
+(defn in-class? [p :document index :i64 neg :i64 cp :i64] :bool
+  (let [ranges (dat (classes-of p) index)
+        hit (range-hit? (record-new [:ref :pat/range] ranges 0 (document-count ranges) cp))]
+    (if (= neg 1) (not hit) hit)))
+
+;; --- thread lists ---------------------------------------------------------
+;;
+;; A thread is a pc. The list is deduplicated because two threads at the same
+;; pc are the same thread -- that dedup is exactly what keeps the run linear,
+;; and dropping it is how a Pike VM quietly becomes a backtracker.
+
+(defn member? [x [:ref :pat/member]] :bool
+  (let [list (record-get x :list)
+        i (record-get x :i)
+        n (record-get x :n)
+        pc (record-get x :pc)]
+    (if (>= i n)
+      false
+      (if (= pc (option-value-of [:option :i64] (document-i64-value (dat list i)) -1))
+        true
+        (member? (record-new [:ref :pat/member] list (+ i 1) n pc))))))
+
+(defn has-pc? [list :document pc :i64] :bool
+  (member? (record-new [:ref :pat/member] list 0 (document-count list) pc)))
+
+;; Epsilon closure: split, jmp and the anchors cost no input, so a thread that
+;; lands on one keeps moving in the same step.
+(defn add-thread [x [:ref :pat/add]] :document
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        pc (record-get x :pc)
+        bol (record-get x :bol)
+        eol (record-get x :eol)]
+    (if (or (has-pc? list pc) (>= pc (code-count prog)))
+      list
+      (let [ins (instruction-at prog pc)
+            op (di ins 0)]
+        (cond
+          (= op (op-jmp))
+          (add-thread (record-new [:ref :pat/add] prog list (di ins 1) bol eol))
+
+          (= op (op-split))
+          (add-thread (record-new [:ref :pat/add] prog
+                                  (add-thread (record-new [:ref :pat/add] prog list (di ins 1) bol eol))
+                                  (di ins 2) bol eol))
+
+          (= op (op-bol))
+          (if bol
+            (add-thread (record-new [:ref :pat/add] prog list (+ pc 1) bol eol))
+            list)
+
+          (= op (op-eol))
+          (if eol
+            (add-thread (record-new [:ref :pat/add] prog list (+ pc 1) bol eol))
+            list)
+
+          :else (document-vector-conj list (document-i64 pc)))))))
+
+(defn start-list [prog :document bol :bool eol :bool] :document
+  (add-thread (record-new [:ref :pat/add] prog (document-vector) 0 bol eol)))
+
+;; --- one input position ---------------------------------------------------
+
+;; JavaScript's set: LF, CR and the two Unicode separators. A negated class
+;; still matches them -- `[^x]` is not `.`.
+(defn line-terminator? [cp :i64] :bool
+  (if (= cp 10) true (if (= cp 13) true (if (= cp 8232) true (= cp 8233)))))
+
+(defn matches-here? [prog :document ins :document cp :i64] :bool
+  (let [op (di ins 0)]
+    (cond
+      ;; ⚠ This was `true` -- `.` matched a line terminator -- until
+      ;; 2026-09-09, and the header below claimed the difference from
+      ;; JavaScript was deliberate and "asserted in the parity test rather
+      ;; than left to be discovered". It was neither deliberate nor a property
+      ;; of anything: nothing about a Pike VM requires `.` to take a newline,
+      ;; it is just what this line did. `pattern-vm` had the identical claim
+      ;; and the identical line.
+      (= op (op-any)) (not (line-terminator? cp))
+      (= op (op-char))
+      (if (fold-of prog)
+        (= (fold-cp cp) (fold-cp (di ins 1)))
+        (= cp (di ins 1)))
+      (= op (op-class))
+      (if (fold-of prog)
+        (or (in-class? prog (di ins 1) (di ins 2) cp)
+            (in-class? prog (di ins 1) (di ins 2) (fold-cp cp)))
+        (in-class? prog (di ins 1) (di ins 2) cp))
+      :else false)))
+
+;; A thread list holds pcs; the accepting test needs the INSTRUCTION at each,
+;; so it is written separately rather than reusing accepting?'s walk.
+(defn any-match? [x [:ref :pat/threads]] :bool
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        i (record-get x :i)]
+    (if (>= i (document-count list))
+      false
+      (if (= (op-match)
+             (di (instruction-at prog (option-value-of [:option :i64]
+                                                       (document-i64-value (dat list i)) -1))
+                 0))
+        true
+        (any-match? (record-new [:ref :pat/threads] prog list (+ i 1) 0 (document-vector) false))))))
+
+;; ⚠ `eol` is the flag for the position the surviving threads land ON, not the
+;; one they left. Passing `false` here drops every thread that steps onto a
+;; `$`, which is every anchored pattern longer than one character. Measured
+;; 2026-09-09 on the string-program twin: `^(px|em)$` against "px" answered
+;; FALSE while `^a$` was right, and 216 parity checks had agreed with
+;; JavaScript because the corpus contained no pattern ending in `$`.
+(defn step-threads [x [:ref :pat/threads]] :document
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        i (record-get x :i)
+        cp (record-get x :cp)
+        next (record-get x :next)
+        eol (record-get x :eol)]
+    (if (>= i (document-count list))
+      next
+      (let [pc (option-value-of [:option :i64] (document-i64-value (dat list i)) -1)
+            ins (instruction-at prog pc)]
+        (step-threads
+         (record-new [:ref :pat/threads] prog list (+ i 1) cp
+                     (if (matches-here? prog ins cp)
+                       (add-thread (record-new [:ref :pat/add] prog next (+ pc 1) false eol))
+                       next)
+                     eol))))))
+
+;; --- running --------------------------------------------------------------
+;;
+;; Anchored at `pos`: answers the LONGEST end offset reached, or -1. The Pike
+;; machine keeps every live thread, so "longest" needs no separate pass -- the
+;; run simply remembers the last position where a :match thread was present.
+
+(defn run-from [x [:ref :pat/run]] :i64
+  (let [prog (record-get x :prog)
+        list (record-get x :list)
+        s (record-get x :s)
+        pos (record-get x :pos)
+        len (record-get x :len)]
+    (if (= 0 (document-count list))
+      -1
+      (let [here (if (any-match? (record-new [:ref :pat/threads] prog list 0 0 (document-vector) false))
+                   pos
+                   -1)]
+        (if (>= pos len)
+          here
+          (let [cp (string-code-point-at s pos)
+                nxt (+ pos (cp-width cp))
+                next-list (step-threads
+                           (record-new [:ref :pat/threads] prog list 0 cp (document-vector) (>= nxt len)))
+                deeper (run-from (record-new [:ref :pat/run] prog next-list s nxt len))]
+            (if (>= deeper 0) deeper here)))))))
+
+(defn match-end-at [prog :document s :string pos :i64] :i64
+  (let [len (string-length s)]
+    (run-from (record-new [:ref :pat/run] prog
+                          (start-list prog (= pos 0) (>= pos len))
+                          s pos len))))
+
+;; --- the public surface ---------------------------------------------------
+
+(defn match? [prog :document s :string] :bool
+  (= (string-length s) (match-end-at prog s 0)))
+
+(defn scan-from [x [:ref :pat/scan]] :i64
+  (let [prog (record-get x :prog)
+        s (record-get x :s)
+        pos (record-get x :pos)
+        len (record-get x :len)
+        want-end (record-get x :want-end)]
+    (let [e (match-end-at prog s pos)]
+      (if (>= e 0)
+        (if want-end e pos)
+        (if (>= pos len)
+          -1
+          (scan-from (record-new [:ref :pat/scan] prog s
+                                 (+ pos (cp-width (string-code-point-at s pos)))
+                                 len want-end)))))))
+
+(defn search-start [prog :document s :string] :i64
+  (scan-from (record-new [:ref :pat/scan] prog s 0 (string-length s) false)))
+
+(defn search-end [prog :document s :string] :i64
+  (scan-from (record-new [:ref :pat/scan] prog s 0 (string-length s) true)))
+
+;; ⚠ The `end` binding is hoisted out of the map on purpose. Written as
+;; `(document-map :start (document-i64 start) :end (document-i64 (match-end-at ...)))`
+;; the whole module is refused with `{:error :value, :message "value is not a
+;; boolean"}` from `kotoba/internal-error` -- at COMPILE time, and only in the
+;; presence of this module's recursion; `kotoba -M check` passes.
+;; Measured 2026-09-09 against the CLI on this machine, deterministic over
+;; three runs. A two-entry map whose value contains a call is the trigger; a
+;; one-entry map with the same call, and a two-entry map without one, both
+;; compile. `test/regressions/document_map_call.kotoba` keeps the failing form
+;; and its probe goes RED when upstream fixes it.
+(defn search [prog :document s :string] :document
+  (let [start (search-start prog s)
+        end (match-end-at prog s start)]
+    (if (< start 0)
+      (document-null)
+      (document-map :start (document-i64 start) :end (document-i64 end)))))
+
+;; --- tests ----------------------------------------------------------------
+;;
+;; The programs are written as EDN text and read with `document-edn-read`,
+;; which is how a consumer will get one too: a program is DATA. It also keeps
+;; the machine tested without the parser, so a parser bug cannot make the VM
+;; look right.
+
+(defn prog-ab [] :document
+  ;; /ab/
+  (document-edn-read "{:code [[0 97] [0 98] [6 0]] :classes [] :fold false}"))
+
+(defn prog-digit [] :document
+  ;; /[0-9]/
+  (document-edn-read "{:code [[1 0 0] [6 0]] :classes [[48 57]] :fold false}"))
+
+(defn prog-digits [] :document
+  ;; /[0-9]+/ -- L0 class, L1 split(0,2), L2 match
+  (document-edn-read "{:code [[1 0 0] [3 0 2] [6 0]] :classes [[48 57]] :fold false}"))
+
+(defn prog-a-or-b [] :document
+  ;; /a|b/ -- split(1,3), a, jmp 4, b, match
+  (document-edn-read "{:code [[3 1 3] [0 97] [4 4] [0 98] [6 0]] :classes [] :fold false}"))
+
+(defn prog-anchored-a [] :document
+  ;; /^a$/
+  (document-edn-read "{:code [[7 0] [0 97] [8 0] [6 0]] :classes [] :fold false}"))
+
+(defn prog-non-digit [] :document
+  ;; /[^0-9]/
+  (document-edn-read "{:code [[1 0 1] [6 0]] :classes [[48 57]] :fold false}"))
+
+(defn prog-fold-a [] :document
+  ;; /a/i
+  (document-edn-read "{:code [[0 97] [6 0]] :classes [] :fold true}"))
+
+(defn prog-exact-a [] :document
+  (document-edn-read "{:code [[0 97] [6 0]] :classes [] :fold false}"))
+
+(defn prog-nothing [] :document
+  (document-edn-read "{:code [[6 0]] :classes [] :fold false}"))
+
+(defn prog-nested [] :document
+  ;; /(a+)+b/ -- the shape that makes a backtracker fall over
+  (document-edn-read "{:code [[1 0 0] [3 0 2] [3 0 3] [0 98] [6 0]] :classes [[97 97]] :fold false}"))
+
+(defn test-literal [] :bool
+  (and (match? (prog-ab) "ab")
+       (not (match? (prog-ab) "a"))
+       (not (match? (prog-ab) "abc"))
+       (not (match? (prog-ab) ""))
+       (not (match? (prog-ab) "ba"))))
+
+(defn test-class [] :bool
+  (and (match? (prog-digit) "5")
+       ;; the boundaries of the range, and one step outside each
+       (match? (prog-digit) "0")
+       (match? (prog-digit) "9")
+       (not (match? (prog-digit) "/"))
+       (not (match? (prog-digit) ":"))
+       (not (match? (prog-digit) "a"))
+       ;; negation answers the complement, including outside ASCII
+       (match? (prog-non-digit) "a")
+       (not (match? (prog-non-digit) "7"))
+       (match? (prog-non-digit) "あ")))
+
+(defn test-quantifier [] :bool
+  (and (match? (prog-digits) "0")
+       (match? (prog-digits) "12345")
+       ;; one-or-more: empty is not a match
+       (not (match? (prog-digits) ""))
+       (not (match? (prog-digits) "12a"))))
+
+(defn test-alternation [] :bool
+  (and (match? (prog-a-or-b) "a")
+       (match? (prog-a-or-b) "b")
+       (not (match? (prog-a-or-b) "c"))
+       (not (match? (prog-a-or-b) "ab"))))
+
+(defn test-anchor [] :bool
+  (and (match? (prog-anchored-a) "a")
+       (not (match? (prog-anchored-a) "ba"))
+       (not (match? (prog-anchored-a) "ab"))))
+
+(defn test-search [] :bool
+  (and (= 3 (search-start (prog-digits) "abc123"))
+       (= 6 (search-end (prog-digits) "abc123"))
+       ;; leftmost, and the longest from there
+       (= 0 (search-start (prog-digits) "12ab34"))
+       (= 2 (search-end (prog-digits) "12ab34"))
+       (= -1 (search-start (prog-digits) "abc"))))
+
+(defn test-fold [] :bool
+  (and (match? (prog-fold-a) "A")
+       (match? (prog-fold-a) "a")
+       (match? (prog-exact-a) "a")
+       (not (match? (prog-exact-a) "A"))))
+
+(defn test-empty [] :bool
+  ;; A program that is only `match` accepts the empty string, and a search for
+  ;; it finds position 0 rather than answering -1.
+  (and (match? (prog-nothing) "")
+       (= 0 (search-start (prog-nothing) "abc"))
+       (= 0 (search-end (prog-nothing) "abc"))))
+
+(defn test-bounded [] :bool
+  ;; A backtracking matcher explores 2^n paths here; the thread list cannot
+  ;; exceed the program, so this answers in one pass.
+  (and (not (match? (prog-nested) "aaaaaaaaaaaaaaaaaaaaaaaa"))
+       (match? (prog-nested) "aaaaaaaaaaaaaaaaaaaaaaaab")))
+
+(defn main []
+  ;; The entry is a constant on purpose. `main` is only here to satisfy the
+  ;; entryless-library rule, and a `main` that CALLS the machine makes the
+  ;; compiler refuse the module at the :value phase with "value is not a
+  ;; boolean" -- the compile-time evaluator runs the entry, and something in
+  ;; this call graph is more than it handles. Measured 2026-09-09; the same
+  ;; module compiles and runs correctly on the JS backend, and
+  ;; `test/regressions/entry_calls_vm.kotoba` keeps the failing form so the
+  ;; probe goes RED the day it starts working.
+  0)

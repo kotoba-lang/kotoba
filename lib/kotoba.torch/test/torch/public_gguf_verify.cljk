@@ -1,0 +1,71 @@
+(ns torch.public-gguf-verify
+  "Opt-in, network-independent verification against a downloaded public GGUF."
+  (:require [num.array :as arr]
+            [num.cpu :as cpu]
+            [num.quantized :as quantized]
+            [torch.generate :as generate]
+            [torch.gguf-resource :as resource]
+            [torch.num-backend :as nb]
+            [torch.tokenizer :as tokenizer]))
+
+(defn- elapsed-ms [started]
+  (/ (- (System/nanoTime) started) 1.0e6))
+
+(defn -main [& [path]]
+  (when-not path
+    (throw (ex-info "usage: kbb -M:public-gguf-verify /path/model.gguf" {})))
+  (let [backend (cpu/cpu-backend)
+        load-start (System/nanoTime)
+        loaded (resource/load-resource
+                backend (resource/descriptor "tiny-random-llama" path))
+        load-ms (elapsed-ms load-start)
+        prompt "Hello"
+        prompt-ids (tokenizer/encode (:tokenizer loaded) prompt)
+        packed-q5 (filter #(and (or (quantized/matrix? %)
+                                    (quantized/table? %))
+                                (= :q5-0 (:quant-type %)))
+                          (mapcat vals (:weights loaded)))
+        caches* (atom (nb/init-llama-caches backend (:model loaded) 32))
+        inference-start (System/nanoTime)]
+    (try
+      (let [_ (when-not (= 13 (count packed-q5))
+                (throw (ex-info "public GGUF Q5_0 weights were expanded"
+                                {:packed-q5 (count packed-q5)})))
+            prefill
+            (reduce (fn [_ token-id]
+                      (let [step (nb/llama-lm-step
+                                  (:model loaded) (:weights loaded)
+                                  (arr/from-vec backend [token-id] [1]) @caches*)]
+                        (reset! caches* (:caches step))
+                        step))
+                    nil prompt-ids)
+            result
+            (loop [logits (:logits prefill) generated []]
+              (if (= 4 (count generated))
+                generated
+                (let [token-id (generate/sample-token
+                                (arr/->vec logits) {:temperature 0.0})
+                      step (nb/llama-lm-step
+                            (:model loaded) (:weights loaded)
+                            (arr/from-vec backend [token-id] [1]) @caches*)]
+                  (reset! caches* (:caches step))
+                  (recur (:logits step) (conj generated token-id)))))]
+        (when-not (and (seq prompt-ids)
+                       (every? #(<= 0 % 31999) result)
+                       (every? #(Double/isFinite (double %))
+                               (arr/->vec (:logits prefill))))
+          (throw (ex-info "public GGUF produced invalid inference output" {})))
+        (prn {:status :passed
+              :architecture (select-keys (get-in loaded [:gguf :metadata])
+                                         ["general.architecture" "general.name"])
+              :file-bytes (get-in loaded [:descriptor :size])
+              :tensor-types (frequencies (map :type (get-in loaded [:gguf :tensors])))
+              :packed-q5-weights (count packed-q5)
+              :load-ms load-ms
+              :inference-ms (elapsed-ms inference-start)
+              :prompt-ids prompt-ids
+              :generated-ids result
+              :generated-text (tokenizer/decode (:tokenizer loaded) result)}))
+      (finally
+        (nb/release-llama-caches! @caches*)
+        (resource/unload-resource! loaded)))))

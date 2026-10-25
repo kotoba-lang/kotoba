@@ -1,0 +1,324 @@
+(ns kotoba.codebase.typed-code-test
+  "Identity computed from checked KIR.
+
+  The input here is KIR, hand-written to the shape the compiler emits, because
+  that IS this namespace's contract -- it consumes the IR and never parses
+  source. The source-to-KIR half is covered where both the compiler and the
+  codebase are on the classpath."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.authoring :as authoring]
+            [kotoba.codebase.render :as render]
+            [kotoba.codebase.store :as store]
+            [kotoba.codebase.typed-code :as typed]
+            [kotoba.codebase.typed-eval :as typed-eval]
+            [kotoba.kir.alpha-normalization :as an]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-typed-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- with-store [body-fn]
+  (let [root (temp-store)]
+    (try (store/initialize! root) (body-fn root)
+         (finally (delete-tree root)))))
+
+(defn- kir [functions & {:keys [schemas format] :or {format :kotoba.kir/v3}}]
+  {:format format
+   :exports (mapv :name functions)
+   :schemas schemas
+   :functions (vec functions)})
+
+(def double-fn
+  {:name 'double :params '[x] :param-types [:i64] :result :i64 :effects #{}
+   :body '(* x 2)})
+
+(def quadruple-fn
+  {:name 'quadruple :params '[x] :param-types [:i64] :result :i64 :effects #{}
+   :body '(double (double x))})
+
+(defn- store-all! [root compiled]
+  (doseq [[_ {:keys [cid block interface-cid interface-block group-cid group-block]}]
+          (:definitions compiled)]
+    (store/put-block! root interface-cid interface-block)
+    (when group-cid (store/put-block! root group-cid group-block))
+    (store/put-block! root cid block))
+  (into {} (map (fn [[name {:keys [cid]}]] [(str name) cid])) (:definitions compiled)))
+
+(deftest identity-is-independent-of-parameter-names
+  (let [a (typed/compile-module (kir [double-fn]))
+        b (typed/compile-module
+           (kir [{:name 'double :params '[value] :param-types [:i64] :result :i64
+                  :effects #{} :body '(* value 2)}]))]
+    (is (= (get-in a [:definitions 'double :cid])
+           (get-in b [:definitions 'double :cid])))))
+
+(deftest identity-is-independent-of-the-definitions-own-name
+  (let [a (typed/compile-module (kir [double-fn]))
+        b (typed/compile-module (kir [(assoc double-fn :name 'twice)]))]
+    (is (= (get-in a [:definitions 'double :cid])
+           (get-in b [:definitions 'twice :cid])))))
+
+(deftest a-changed-dependency-changes-every-dependent
+  (let [before (typed/compile-module (kir [double-fn quadruple-fn]))
+        after (typed/compile-module
+               (kir [(assoc double-fn :body '(* x 3)) quadruple-fn]))]
+    (is (not= (get-in before [:definitions 'double :cid])
+              (get-in after [:definitions 'double :cid])))
+    (testing "the caller's body is textually identical and its identity still moved"
+      (is (not= (get-in before [:definitions 'quadruple :cid])
+                (get-in after [:definitions 'quadruple :cid]))))))
+
+(deftest the-typed-interface-participates-in-identity
+  (let [i64 (typed/compile-module (kir [double-fn]))
+        bool (typed/compile-module (kir [(assoc double-fn :result :bool)]))
+        effectful (typed/compile-module (kir [(assoc double-fn :effects #{:log/write})]))]
+    (is (not= (get-in i64 [:definitions 'double :cid])
+              (get-in bool [:definitions 'double :cid]))
+        "a different result type is a different definition")
+    (is (not= (get-in i64 [:definitions 'double :cid])
+              (get-in effectful [:definitions 'double :cid]))
+        "a declared effect is part of what a definition is")))
+
+(deftest a-definition-links-only-the-schemas-it-reaches
+  (let [used {:point [:record [[:x :i64]]]}
+        compiled-a (typed/compile-module
+                    (kir [{:name 'f :params '[p] :param-types [[:ref :point]] :result :i64
+                           :effects #{} :body '(record-field-of [:ref :point] p :x)}]
+                         :schemas used))
+        compiled-b (typed/compile-module
+                    (kir [{:name 'f :params '[p] :param-types [[:ref :point]] :result :i64
+                           :effects #{} :body '(record-field-of [:ref :point] p :x)}]
+                         :schemas (assoc used :unrelated [:record [[:z :i64]]])))]
+    (is (= (get-in compiled-a [:definitions 'f :cid])
+           (get-in compiled-b [:definitions 'f :cid]))
+        "an unrelated schema elsewhere in the module must not move this identity")))
+
+(deftest an-unhandled-binding-form-fails-closed-instead-of-hashing-a-source-name
+  ;; `[:ref x]` is skipped as a type position, so a binder that reaches one
+  ;; survives normalization -- exactly the shape a sixth binding form would
+  ;; produce, and exactly what must not be hashed silently.
+  (is (= :typed-code/binder-not-normalized
+         (:problem (ex-data (try (typed/compile-module
+                                  (kir [{:name 'f :params '[x] :param-types [:i64]
+                                         :result :i64 :effects #{}
+                                         :body '(let [q x] [:ref q])}]))
+                                 (catch kerror/ExceptionInfo e e)))))))
+
+(deftest runs-a-hydrated-closure-through-the-kir-oracle
+  (with-store
+    (fn [root]
+      (let [cids (store-all! root (typed/compile-module (kir [double-fn quadruple-fn])))]
+        (is (= 12 (:value (typed-eval/invoke root (get cids "quadruple") [3]))))
+        (testing "the dependency is reachable by hash with no name bound to it"
+          (is (= 8 (:value (typed-eval/invoke root (get cids "double") [4])))))))))
+
+(deftest the-assembled-module-contains-no-source-names
+  (with-store
+    (fn [root]
+      (let [cids (store-all! root (typed/compile-module (kir [double-fn quadruple-fn])))
+            {:keys [kir]} (typed-eval/assemble root (get cids "quadruple"))
+            names (set (map :name (:functions kir)))]
+        (is (= 2 (count names)))
+        (is (every? #(re-matches #"kotoba_def_b[a-z0-9]+" (str %)) names))
+        (is (not-any? #{'double 'quadruple} names))))))
+
+(deftest evaluates-a-self-recursive-group
+  (with-store
+    (fn [root]
+      (let [cids (store-all!
+                  root (typed/compile-module
+                        (kir [{:name 'countdown :params '[n] :param-types [:i64] :result :i64
+                               :effects #{}
+                               :body '(if (= n 0) 0 (countdown (- n 1)))}])))]
+        (is (= 0 (:value (typed-eval/invoke root (get cids "countdown") [5]))))))))
+
+(deftest evaluates-a-mutually-recursive-group
+  (with-store
+    (fn [root]
+      (let [cids (store-all!
+                  root (typed/compile-module
+                        (kir [{:name 'even-n :params '[n] :param-types [:i64] :result :i64
+                               :effects #{} :body '(if (= n 0) 1 (odd-n (- n 1)))}
+                              {:name 'odd-n :params '[n] :param-types [:i64] :result :i64
+                               :effects #{} :body '(if (= n 0) 0 (even-n (- n 1)))}])))]
+        (is (= 1 (:value (typed-eval/invoke root (get cids "even-n") [4]))))
+        (is (= 0 (:value (typed-eval/invoke root (get cids "odd-n") [4]))))))))
+
+(deftest a-missing-dependency-fails-closed
+  (with-store
+    (fn [root]
+      (let [compiled (typed/compile-module (kir [double-fn quadruple-fn]))
+            {:keys [cid block interface-cid interface-block]}
+            (get-in compiled [:definitions 'quadruple])]
+        (store/put-block! root interface-cid interface-block)
+        (store/put-block! root cid block)
+        (is (= :codebase/block-not-found
+               (:problem (ex-data (try (typed-eval/invoke root cid [3])
+                                       (catch kerror/ExceptionInfo e e))))))))))
+
+(deftest a-capability-call-without-a-dispatcher-is-denied-not-skipped
+  (with-store
+    (fn [root]
+      (let [cids (store-all!
+                  root (typed/compile-module
+                        (kir [{:name 'emit :params '[x] :param-types [:i64] :result :i64
+                               :effects #{:log/write}
+                               :body '(typed-cap-call 9 :i64 :i64 x)}])))
+            outcome (try (typed-eval/invoke root (get cids "emit") [1])
+                         (catch kerror/ExceptionInfo e (ex-data e)))]
+        (is (= :capability-denied (or (:trap outcome) (:kotoba.trap/kind outcome)
+                                      (:problem outcome) outcome))
+            (str "expected a denial, got " (pr-str outcome)))))))
+
+(deftest a-dispatcher-may-be-injected-and-is-the-only-way-effects-happen
+  (with-store
+    (fn [root]
+      (let [cids (store-all!
+                  root (typed/compile-module
+                        (kir [{:name 'emit :params '[x] :param-types [:i64] :result :i64
+                               :effects #{:log/write}
+                               :body '(typed-cap-call 9 :i64 :i64 x)}])))
+            seen (atom [])
+            result (typed-eval/invoke
+                    root (get cids "emit") [7]
+                    {:typed-cap-call (fn [id _ _ request]
+                                       (swap! seen conj [id request])
+                                       request)})]
+        (is (= 7 (:value result)))
+        (is (= #{:log/write} (:effects result)))
+        (is (= 1 (count @seen)))))))
+
+(deftest typed-eval-admission-separates-identity-authority-and-result-evidence
+  (with-store
+    (fn [root]
+      (let [cids (store-all! root (typed/compile-module (kir [double-fn])))
+            cid (get cids "double")
+            admission-a (typed-eval/admit root cid {:expected-result :i64})
+            admission-b (typed-eval/admit root cid {:expected-result :i64})
+            result-a (typed-eval/invoke-admitted root admission-a [21])
+            result-b (typed-eval/invoke-admitted root admission-b [21])]
+        (is (= cid (:cid admission-a)))
+        (is (= (:admission-cid admission-a) (:admission-cid admission-b)))
+        (is (= 42 (:value result-a)))
+        (is (= (:value-cid result-a) (:value-cid result-b)))
+        (is (string? (:value-cid result-a)))
+        (is (= typed-eval/admission-schema
+               (get (store/get-block root (:admission-cid result-a)) "schema")))
+        (is (= typed-eval/result-schema
+               (get (store/get-block root (:value-cid result-a)) "schema")))))))
+
+(deftest typed-eval-admission-fails-before-an-ungranted-effect
+  (with-store
+    (fn [root]
+      (let [cids (store-all!
+                  root (typed/compile-module
+                        (kir [{:name 'emit :params '[x] :param-types [:i64]
+                               :result :i64 :effects #{:log/write}
+                               :body '(typed-cap-call 9 :i64 :i64 x)}])))
+            cid (get cids "emit")]
+        (is (= :typed-eval/effect-not-admitted
+               (:problem
+                (ex-data
+                 (try (typed-eval/admit root cid)
+                      (catch kerror/ExceptionInfo e e))))))
+        (let [admission (typed-eval/admit root cid
+                                          {:allowed-effects #{:log/write}})]
+          (is (= 7 (:value
+                    (typed-eval/invoke-admitted
+                     root admission [7]
+                     {:typed-cap-call (fn [_ _ _ request] request)
+                      :receipt-sink (fn [_])})))))))))
+
+(deftest typed-eval-admission-binds-limits-and-refuses-tampering
+  (with-store
+    (fn [root]
+      (let [cids (store-all! root (typed/compile-module (kir [double-fn])))
+            cid (get cids "double")
+            shallow (typed-eval/admit root cid {:fuel 99 :max-depth 1})
+            deeper (typed-eval/admit root cid {:fuel 99 :max-depth 2})]
+        (is (not= (:admission-cid shallow) (:admission-cid deeper)))
+        (is (= :typed-eval/admission-drift
+               (:problem
+                (ex-data
+                 (try (typed-eval/invoke-admitted root (assoc shallow :fuel 100) [2])
+                      (catch kerror/ExceptionInfo e e))))))))))
+
+(deftest an-update-propagates-across-typed-definitions-too
+  (with-store
+    (fn [root]
+      (let [plan-for (fn [functions]
+                       (authoring/plan-with
+                        root "demo"
+                        (fn [seeded]
+                          (typed/compile-module (kir functions) {:definitions seeded}))))]
+        (authoring/commit! root (plan-for [double-fn quadruple-fn]))
+        (let [before (:bindings (store/namespace-view root (store/head root "demo")))
+              ;; Only `double` is re-authored; `quadruple` is not in this module
+              ;; at all, so its dependency CID has to be rewritten rather than
+              ;; recompiled.
+              after (authoring/commit! root (plan-for [(assoc double-fn :body '(* x 3))]))]
+          (is (= :updated (get-in after [:definitions "double" :status])))
+          (is (= :propagated (get-in after [:propagated "quadruple" :status])))
+          (is (not= (get before "quadruple") (get-in after [:bindings "quadruple"])))
+          (is (= 18 (:value (typed-eval/invoke root (get-in after [:bindings "quadruple"])
+                                               [2])))))))))
+
+(deftest a-typed-definition-views-as-its-checked-ir-with-names-restored
+  (with-store
+    (fn [root]
+      (let [cids (store-all! root (typed/compile-module (kir [double-fn quadruple-fn])))
+            names {(get cids "double") "double" (get cids "quadruple") "quadruple"}
+            viewed (render/view root (get cids "quadruple") {:names names})]
+        (is (= "quadruple" (:name viewed)))
+        (is (= '(double (double k0)) (:form viewed))
+            "the dependency renders as the name this reader selects")
+        (testing "and as a hash for a reader who has no name for it"
+          (let [anonymous (render/view root (get cids "quadruple") {:name "q"})]
+            (is (re-find #"^#b" (str (first (:form anonymous)))))))))))
+
+(deftest a-recursive-typed-definition-views-with-its-own-name
+  (with-store
+    (fn [root]
+      (let [cids (store-all!
+                  root (typed/compile-module
+                        (kir [{:name 'countdown :params '[n] :param-types [:i64] :result :i64
+                               :effects #{}
+                               :body '(if (= n 0) 0 (countdown (- n 1)))}])))
+            viewed (render/view root (get cids "countdown")
+                                {:names {(get cids "countdown") "countdown"}})]
+        (is (= '(if (= k0 0) 0 (countdown (- k0 1))) (:form viewed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Alpha-normalization is kotoba-kir's, not a copy of it
+
+(deftest alpha-normalization-is-delegated-not-reimplemented
+  (testing "this repository and kotoba.compiler.definition-identity each
+  carried the same five-binder walk against the same KIR, which kotoba-lang
+  lang/code-identity.edn recorded as a residual risk of :ci8. The walk now lives
+  in kotoba-kir. Asserting the var IS kir's is what stops it being forked again
+  by a later edit that only looks locally correct."
+    (is (identical? an/alpha-normalize typed/alpha-normalize))))
+
+(deftest the-refusal-keeps-this-repositorys-problem-keyword
+  (testing "a refusal reason is part of this repository's diagnostic
+  vocabulary; kir takes it as an argument rather than renaming it"
+    (let [ex (try (#'typed/verify-normalized!
+                   (an/alpha-normalize {:params '[] :body '(pair (let [a 1] a) a)})
+                   #{})
+                  nil
+                  (catch Exception e e))]
+      (is (some? ex) "refused")
+      (is (= :typed-code/binder-not-normalized (:problem (ex-data ex)))))))
+
+(deftest the-desugar-contract-default-stays-1-for-a-stated-reason
+  (testing "kotoba-lang lang/elaboration-pipeline.edn now reads 2, and layer 1
+  deliberately does not follow it: this constant is one of the six inputs the
+  published, signed and served layer-1 CID seals. A layer-2 caller passes the
+  authority's value. Silently behind and deliberately held have to be tellable
+  apart from the output, so the reason is on the var and this pins the value."
+    (is (= 1 typed/default-desugar-contract-version))
+    (is (re-find #"published" (:doc (meta #'typed/default-desugar-contract-version)))
+        "the var says why it does not follow the authority")))

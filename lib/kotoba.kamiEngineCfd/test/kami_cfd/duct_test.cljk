@@ -1,0 +1,142 @@
+(ns kami-cfd.duct-test
+  "Verification for `kami-cfd.duct` (internal / duct flow).
+
+  The first test is the one that matters: force-driven plane Poiseuille flow
+  has a closed-form steady solution, so it is a real *verification* case, not
+  a smoke test. If it fails, the bounce-back walls or the tau<->nu mapping are
+  wrong and every enclosure number the namespace produces is meaningless.
+
+  Runtime note. These run on the JVM (`kbb -M:test`), matching this repo's
+  existing `kami-cfd.runner` host-runner pattern. The namespace itself is
+  portable `.cljc` and loads on nbb, but nbb executes via SCI (an
+  interpreter), so a tight 19-velocity lattice loop is orders of magnitude
+  slower there — portable does not mean fast. Numerics belong on a compiled
+  host; nbb stays for orchestration."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kami-cfd.duct :as duct]
+            [kami-cfd.d3 :as d3]))
+
+(deftest bool-array-is-portable-and-false-filled
+  (testing "the portability shim keeps ClojureScript truthiness semantics"
+    (let [a (d3/bool-array 8)]
+      (is (= 8 (count (seq a))))
+      (is (every? false? (seq a)) "must be false-filled, not 0-filled")
+      (aset a 3 true)
+      (is (true? (aget a 3)))
+      (is (false? (aget a 4))))))
+
+(deftest domain-marks-solid-cells
+  (let [d (duct/domain 4 4 4 (duct/boxes->solid-fn [[[1 1 1] [3 3 3]]]))]
+    (is (= 8 (:solid-count d)) "2x2x2 box = 8 cells")
+    (is (true? (aget (:solid d) (+ (* (+ (* 1 4) 1) 4) 1))))
+    (is (false? (aget (:solid d) 0)))))
+
+(deftest poiseuille-matches-closed-form
+  (testing "force-driven plane Poiseuille vs u(y)=(g/2nu)*y*(h-y)"
+    (let [r (duct/validate-poiseuille 21 1.0e-6 0.05 4000 0.02)]
+      (println "  poiseuille: L2-rel =" (:l2-rel r)
+               " u-max sim =" (:u-max-sim r)
+               " exact =" (:u-max-exact r))
+      (is (:pass? r)
+          (str "relative L2 error " (:l2-rel r) " exceeds tol " (:tol r)
+               " — bounce-back walls or the viscosity mapping are wrong"))
+      (is (pos? (:u-max-sim r)) "flow must actually develop")
+      (is (< (Math/abs (- (double (:u-max-sim r)) (double (:u-max-exact r))))
+             (* 0.05 (double (:u-max-exact r))))
+          "centreline peak within 5% of analytic"))))
+
+(deftest walls-are-sealed-without-patches
+  (testing "with no inlet/outlet patch, a driven box conserves mass (sealed)"
+    (let [d (duct/domain 6 6 6 (fn [_ _ _] false))
+          lbm (duct/run (duct/duct-new d {:nu 0.05 :u0 0.05 :patches []}) 50)
+          total (reduce + 0.0
+                        (for [z (range 6) y (range 6) x (range 6)]
+                          (first (duct/cell-macros lbm x y z))))]
+      ;; initialised at rho=1 in 216 cells; no source, no sink
+      (is (< (Math/abs (- total 216.0)) 1.0)
+          (str "sealed box lost/gained mass: total rho = " total)))))
+
+(deftest inlet-drives-flow-through-outlet
+  (testing "an inlet patch and an opposite outlet patch produce through-flow"
+    (let [nx 8 ny 8 nz 24
+          d (duct/domain nx ny nz (fn [_ _ _] false))
+          lbm (duct/run
+               (duct/duct-new d {:nu 0.02 :u0 0.05
+                                 :patches [(duct/full-face :z-min :inlet 0.05)
+                                           (duct/full-face :z-max :outlet nil)]})
+               600)
+          fin (duct/patch-flux lbm :inlet)
+          fout (duct/patch-flux lbm :outlet)
+          mid (duct/speed-at lbm (quot nx 2) (quot ny 2) (quot nz 2))]
+      (println "  duct: inlet flux =" fin " outlet flux =" fout " mid speed =" mid)
+      (is (pos? fin) "inlet must push air in")
+      (is (pos? mid) "air must reach the middle of the duct")
+      ;; outlet flux is measured along its own inward normal, so through-flow
+      ;; leaving the domain reads negative there
+      (is (neg? fout) "outlet must carry air out"))))
+
+(deftest stagnant-fraction-detects-a-blocked-branch
+  (testing "a blind pocket shows up as stagnant, an open duct does not"
+    (let [nx 8 ny 8 nz 20
+          open (duct/domain nx ny nz (fn [_ _ _] false))
+          ;; a solid slab across most of the duct leaves a blind pocket behind it
+          blocked (duct/domain nx ny nz
+                               (duct/boxes->solid-fn [[[0 0 8] [nx (dec ny) 10]]]))
+          mk (fn [d] (duct/run
+                      (duct/duct-new d {:nu 0.02 :u0 0.05
+                                        :patches [(duct/full-face :z-min :inlet 0.05)
+                                                  (duct/full-face :z-max :outlet nil)]})
+                      600))
+          s-open (duct/stagnant-fraction (mk open) 0.1)
+          s-blocked (duct/stagnant-fraction (mk blocked) 0.1)]
+      (println "  stagnant fraction: open =" s-open " blocked =" s-blocked)
+      (is (> s-blocked s-open)
+          "an obstructed duct must have more dead volume than an open one"))))
+
+(deftest engineering-conversions-are-explicit
+  (testing "lattice->cfm and bulk-delta-t"
+    (let [{:keys [q-m3s cfm]} (duct/lattice->cfm 100.0 4.0 0.05 2.0)]
+      (is (pos? q-m3s))
+      (is (< (Math/abs (- cfm (* q-m3s 2118.88))) 1e-6))
+      ;; 334 W into that flow
+      (let [dt (duct/bulk-delta-t 334.0 q-m3s)]
+        (is (pos? dt))
+        (is (= ##Inf (duct/bulk-delta-t 334.0 0.0)) "no flow = unbounded rise")))))
+
+(deftest run-until-steady-reports-which-happened
+  (testing "a small duct converges and says so"
+    (let [d (duct/domain 6 6 14 (fn [_ _ _] false))
+          r (duct/run-until-steady
+             (duct/duct-new d {:nu 0.05 :u0 0.05
+                               :patches [(duct/full-face :z-min :inlet 0.05)
+                                         (duct/full-face :z-max :outlet nil)]})
+             {:tol 1.0e-7 :max-steps 8000 :check-every 50})]
+      (println "  run-until-steady:" (:status r) "steps" (:steps r) "residual" (:residual r))
+      (is (= :converged (:status r)))
+      (is (<= (:residual r) (:tol r)))
+      (is (pos? (:steps r)))))
+  (testing "an impossible tolerance reports :max-steps, not silence"
+    (let [d (duct/domain 6 6 14 (fn [_ _ _] false))
+          r (duct/run-until-steady
+             (duct/duct-new d {:nu 0.05 :u0 0.05
+                               :patches [(duct/full-face :z-min :inlet 0.05)
+                                         (duct/full-face :z-max :outlet nil)]})
+             {:tol 1.0e-30 :max-steps 200 :check-every 50})]
+      (is (= :max-steps (:status r)))
+      (is (> (:residual r) (:tol r))
+          "a non-converged run must expose its residual so the caller can refuse it"))))
+
+(deftest reynolds-envelope-refuses-an-out-of-regime-target
+  (testing "the MK-1 enclosure case is correctly reported as infeasible"
+    (let [d (duct/domain 6 6 10 (fn [_ _ _] false))
+          lbm (duct/duct-new d {:nu 0.02 :u0 0.05 :patches []})
+          env (duct/reachable-reynolds lbm 31 18400)]
+      (println "  Re envelope:" (select-keys env [:re-current :tau-for-target
+                                                 :settling-steps-for-target :feasible?]))
+      (is (< 70.0 (:re-current env) 85.0) "lattice Re ~78 at these settings")
+      (is (false? (:feasible? env))
+          "Re 18400 needs tau ~0.5003 and ~1e7 settling steps — must be refused")))
+  (testing "a genuinely low-Re target is feasible"
+    (let [d (duct/domain 6 6 10 (fn [_ _ _] false))
+          lbm (duct/duct-new d {:nu 0.02 :u0 0.05 :patches []})]
+      (is (true? (:feasible? (duct/reachable-reynolds lbm 31 100)))))))

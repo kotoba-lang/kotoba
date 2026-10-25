@@ -1,0 +1,198 @@
+(ns valueflows.commitment-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [valueflows.commitment :as c]))
+
+(defn m [n u] {:has-numerical-value n :has-unit u})
+
+(def order
+  {:id "po-1" :action :transfer :provider :mill :receiver :bakery
+   :resource-conforms-to :flour :resource-quantity (m 100 :kg)
+   :due 10})
+
+(defn delivery [n] {:action :transfer :provider :mill :receiver :bakery
+                    :fulfills "po-1" :resource-quantity (m n :kg)
+                    :has-point-in-time 8})
+
+(deftest an-unfulfilled-promise-is-open
+  (let [r (c/fulfilment order [] {})]
+    (is (:ok? r))
+    (is (= :open (:state r)))
+    (is (= 0 (:has-numerical-value (:fulfilled r))))
+    (is (= 100 (:has-numerical-value (:outstanding r))))
+    (is (= 0 (:ratio r)))
+    (is (= 0 (:events r)))))
+
+(deftest partial-exact-and-over-fulfilment-are-three-states
+  (is (= :partially-fulfilled (:state (c/fulfilment order [(delivery 60)] {}))))
+  (is (= :fulfilled (:state (c/fulfilment order [(delivery 100)] {}))))
+  (is (= :over-fulfilled (:state (c/fulfilment order [(delivery 120)] {}))))
+  (testing "several deliveries accumulate"
+    (let [r (c/fulfilment order [(delivery 40) (delivery 35) (delivery 25)] {})]
+      (is (= :fulfilled (:state r)))
+      (is (= 100 (:has-numerical-value (:fulfilled r))))
+      (is (= 3 (:events r)))))
+  (testing "outstanding never goes negative"
+    (is (= 0 (:has-numerical-value (:outstanding (c/fulfilment order [(delivery 120)] {})))))))
+
+(deftest finished-does-not-mean-fulfilled
+  ;; Upstream: finished is "irrespective of if the original goal has been met,
+  ;; and indicates simply that no more will be done". A commitment closed at
+  ;; 60% is an ordinary outcome, not an error and not a fulfilment.
+  (let [closed (assoc order :finished true)]
+    (is (= :closed-short (:state (c/fulfilment closed [(delivery 60)] {}))))
+    (is (= :closed-exact (:state (c/fulfilment closed [(delivery 100)] {}))))
+    (is (= :closed-over (:state (c/fulfilment closed [(delivery 130)] {}))))
+    (testing "and it is still reported as 40 kg short"
+      (is (= 40 (:has-numerical-value (:outstanding (c/fulfilment closed [(delivery 60)] {}))))))))
+
+(deftest effort-promises-settle-in-effort
+  (let [shift {:id "shift-1" :action :work :provider :aki
+               :effort-quantity (m 8 :hour) :due 3}
+        worked {:action :work :provider :aki :fulfills "shift-1"
+                :effort-quantity (m 6 :hour)}
+        r (c/fulfilment shift [worked] {})]
+    (is (:ok? r))
+    (is (= 3/4 (:ratio r)))
+    (is (= :hour (:has-unit (:outstanding r))))))
+
+(deftest overdue-needs-an-as-of-and-a-due-date
+  (testing "no as-of: unknown, never false"
+    (is (= :unknown (:overdue (c/fulfilment order [] {})))))
+  (testing "with an as-of"
+    (is (false? (:overdue (c/fulfilment order [] {:as-of 9}))))
+    (is (true? (:overdue (c/fulfilment order [] {:as-of 11}))))
+    (is (false? (:overdue (c/fulfilment order [] {:as-of 10})) )
+        "due today is not yet late"))
+  (testing "a promise with no deadline cannot be late"
+    (is (= :unknown (:overdue (c/fulfilment (dissoc order :due) [] {:as-of 999})))))
+  (testing "ISO-8601 strings compare chronologically without a date library"
+    (let [iso (assoc order :due "2026-09-01T00:00:00Z")]
+      (is (true? (:overdue (c/fulfilment iso [] {:as-of "2026-09-02T00:00:00Z"}))))
+      (is (false? (:overdue (c/fulfilment iso [] {:as-of "2026-08-31T23:59:59Z"}))))))
+  (testing "mixing a number and a timestamp is not silently ordered"
+    (let [iso (assoc order :due "2026-09-01T00:00:00Z")]
+      (is (= :unknown (:overdue (c/fulfilment iso [] {:as-of 12})))))))
+
+;; ── refusals ──────────────────────────────────────────────────────────────
+
+(deftest a-promise-with-no-quantity-cannot-be-settled
+  (let [r (c/fulfilment (dissoc order :resource-quantity) [] {})]
+    (is (false? (:ok? r)))
+    (is (= :promise-not-measured (:insufficient r)))))
+
+(deftest a-consume-does-not-settle-a-promise-to-produce
+  (let [r (c/fulfilment order [(assoc (delivery 50) :action :consume)] {})]
+    (is (false? (:ok? r)))
+    (is (= :action-mismatch (:insufficient r)))
+    (is (= :transfer (:commitment-action (:detail r))))
+    (is (= #{:consume} (set (:event-actions (:detail r)))))))
+
+(deftest hours-do-not-settle-kilograms
+  (let [r (c/fulfilment order [(assoc (delivery 5) :resource-quantity (m 5 :hour))] {})]
+    (is (false? (:ok? r)))
+    (is (= :unit-mismatch (:insufficient r)))))
+
+(deftest an-unknown-action-is-refused
+  (is (= :unknown-action (:insufficient (c/fulfilment (assoc order :action :teleport) [] {})))))
+
+;; ── batches ───────────────────────────────────────────────────────────────
+
+(def two-orders
+  [order
+   {:id "po-2" :action :transfer :provider :farm :receiver :bakery
+    :resource-conforms-to :grain :resource-quantity (m 500 :kg) :due 4}])
+
+(deftest a-batch-reports-scanned-and-state-counts
+  (let [f (c/fulfilments two-orders [(delivery 100)] {:as-of 6})]
+    (is (:ok? f))
+    (is (= 2 (:scanned f)))
+    (is (= 2 (:settled f)))
+    (is (= {:fulfilled 1 :open 1} (:by-state f)))
+    (is (= ["po-2"] (mapv :commitment (:overdue-open f)))
+        "po-2 was due at 4 and nothing arrived")))
+
+(deftest an-empty-batch-is-not-a-pass
+  (let [f (c/fulfilments [] [] {})]
+    (is (= 0 (:scanned f)))
+    (is (false? (:ok? f)) "0 scanned must not read as 0 problems")
+    (is (:empty-input? f))
+    (is (false? (:complete? f)))))
+
+(deftest an-event-fulfilling-a-commitment-nobody-has-is-reported
+  ;; The remaining commitments settle correctly, which is exactly why the
+  ;; orphan has to be surfaced: nothing else about the result looks wrong.
+  (let [f (c/fulfilments two-orders
+                         [(delivery 100) (assoc (delivery 7) :fulfills "po-999")]
+                         {})]
+    (is (= 2 (:settled f)))
+    (is (false? (:complete? f)) "settled, but not complete")
+    (is (= 1 (count (:orphan-fulfilments f))))
+    (is (= "po-999" (:fulfills (first (:orphan-fulfilments f)))))))
+
+(deftest one-unsettleable-commitment-does-not-hide-the-rest
+  (let [f (c/fulfilments (conj two-orders {:id "po-3" :action :transfer}) [] {})]
+    (is (= 3 (:scanned f)))
+    (is (= 2 (:settled f)))
+    (is (= 1 (:unsettleable f)))
+    (is (false? (:ok? f)))
+    (is (= :promise-not-measured (:insufficient (first (:failures f)))))))
+
+(deftest outstanding-sorts-soonest-first-and-marks-the-undated
+  (let [dateless {:id "po-4" :action :transfer :resource-quantity (m 9 :kg)}
+        o (c/outstanding (conj two-orders dateless) [] {:as-of 6})]
+    (is (= ["po-2" "po-1" "po-4"] (mapv :commitment (:rows o)))
+        "due 4, then due 10, then the one with no date")
+    (is (= ["po-4"] (mapv :commitment (:undated o))))))
+
+(deftest deadlines-are-never-ordered-as-strings
+  ;; "10" sorts before "4", so stringifying a numeric due date reorders the
+  ;; queue while looking like it worked. Two-digit vs one-digit is the whole
+  ;; test: it passes under both orderings if every due date has the same width.
+  (let [mk (fn [id due] {:id id :action :transfer :resource-quantity (m 1 :kg) :due due})
+        o (c/outstanding [(mk "a" 10) (mk "b" 4) (mk "c" 9) (mk "d" 100) (mk "e" 2)] [] {})]
+    (is (= ["e" "b" "c" "a" "d"] (mapv :commitment (:rows o)))))
+  (testing "ISO-8601 due dates order among themselves without touching the numbers"
+    (let [mk (fn [id due] {:id id :action :transfer :resource-quantity (m 1 :kg) :due due})
+          o (c/outstanding [(mk "iso-late" "2026-10-01T00:00:00Z")
+                            (mk "num" 5)
+                            (mk "iso-early" "2026-09-01T00:00:00Z")
+                            (mk "undated" nil)] [] {})]
+      (is (= ["num" "iso-early" "iso-late" "undated"] (mapv :commitment (:rows o)))
+          "no comparison between a number and a string ever happens"))))
+
+(deftest a-finished-commitment-is-no-longer-outstanding
+  (let [o (c/outstanding [(assoc order :finished true)] [(delivery 60)] {})]
+    (is (empty? (:rows o))
+        "still 40 kg short, but nothing more will be done, so it is not owed")))
+
+;; ── intents ───────────────────────────────────────────────────────────────
+
+(def offer
+  {:id "offer-1" :action :transfer :provider :bakery
+   :resource-conforms-to :loaf :resource-quantity (m 200 :each)
+   :minimum-quantity (m 50 :each) :available-quantity (m 200 :each)})
+
+(deftest an-intent-is-satisfied-by-commitments-or-events-or-both
+  (let [commit {:id "po-9" :action :transfer :satisfies "offer-1"
+                :resource-quantity (m 120 :each)}
+        event {:action :transfer :satisfies "offer-1" :resource-quantity (m 30 :each)}
+        s (c/satisfaction offer [commit event] {})]
+    (is (:ok? s))
+    (is (= 150 (:has-numerical-value (:satisfied s))))
+    (is (= 50 (:has-numerical-value (:unsatisfied s))))
+    (is (= 3/4 (:ratio s)))
+    (is (= 2 (:satisfiers s)))
+    (is (= :partially-fulfilled (:state s)))))
+
+(deftest below-the-stated-minimum-is-its-own-fact
+  (let [small {:id "po-8" :action :transfer :satisfies "offer-1"
+               :resource-quantity (m 20 :each)}]
+    (is (true? (:below-minimum? (c/satisfaction offer [small] {})))
+        "20 against a minimum of 50 is not merely 10% progress")
+    (is (false? (:below-minimum? (c/satisfaction offer [(assoc small :resource-quantity (m 60 :each))] {})))))
+  (testing "no minimum stated: nil, not false"
+    (is (nil? (:below-minimum? (c/satisfaction (dissoc offer :minimum-quantity) [] {}))))))
+
+(deftest an-unmeasured-intent-is-refused
+  (is (= :intent-not-measured
+         (:insufficient (c/satisfaction (dissoc offer :resource-quantity) [] {})))))

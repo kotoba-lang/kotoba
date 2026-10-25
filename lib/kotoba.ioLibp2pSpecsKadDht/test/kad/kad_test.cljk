@@ -1,0 +1,628 @@
+(ns kad.kad-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kad.key :as kkey]
+            [kad.lookup :as lookup]
+            [kad.message :as msg]
+            [kad.table :as table]
+            [kad.routing :as routing]
+            [protobuf.wire :as pb]))
+
+;; A deterministic 32-octet "hash" — the keyspace properties under test are
+;; about XOR and ordering, not about SHA-256.
+(defn- fake-sha256 [b]
+  (let [v (mapv #(bit-and % 0xFF) (vec (seq #?(:clj b :cljs (array-seq b)))))]
+    #?(:clj (byte-array (map unchecked-byte (take 32 (concat v (repeat 0)))))
+       :cljs (js/Uint8Array.from (clj->js (take 32 (concat v (repeat 0))))))))
+
+(defn- k [& octets] (vec (take 32 (concat octets (repeat 0)))))
+
+;; ── keyspace ──────────────────────────────────────────────────────────────
+
+(deftest a-dht-key-is-always-thirty-two-octets
+  (is (= 32 (count (kkey/dht-key fake-sha256 (vec (pb/utf8-bytes "/ipns/x"))))))
+  (testing "a hash of the wrong length is refused rather than truncated"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (kkey/dht-key (fn [_] #?(:clj (byte-array 8) :cljs (js/Uint8Array. 8)))
+                               [1 2 3])))))
+
+(deftest xor-distance-is-a-metric-not-a-number
+  (is (= (k 0) (kkey/xor-distance (k 1 2 3) (k 1 2 3))) "distance to self is zero")
+  (is (= (kkey/xor-distance (k 1) (k 2)) (kkey/xor-distance (k 2) (k 1)))
+      "symmetric")
+  (is (= 32 (count (kkey/xor-distance (k 0xFF) (k 0x00))))))
+
+(deftest distances-compare-as-unsigned-big-endian
+  (is (neg? (kkey/compare-distance (k 0x01) (k 0x02))))
+  (is (pos? (kkey/compare-distance (k 0x80) (k 0x7F)))
+      "0x80 is 128, not -128; a signed comparison gets this backwards")
+  (is (zero? (kkey/compare-distance (k 5) (k 5))))
+  (testing "the first differing octet decides"
+    (is (neg? (kkey/compare-distance (k 1 0xFF) (k 2 0x00))))))
+
+(deftest sorting-by-closeness-to-a-target
+  (let [target (k 0x00)
+        peers [(k 0x0F) (k 0x01) (k 0xF0)]]
+    (is (= [(k 0x01) (k 0x0F) (k 0xF0)] (kkey/sort-closest target peers)))
+    (is (kkey/closer? target (k 0x01) (k 0x0F)))
+    (is (not (kkey/closer? target (k 0xF0) (k 0x01))))))
+
+(deftest the-common-prefix-length-is-the-bucket-index
+  (is (= 256 (kkey/leading-zeros (k 0))) "identical keys share every bit")
+  (is (= 0 (kkey/leading-zeros (k 0x80))) "top bit differs")
+  (is (= 7 (kkey/leading-zeros (k 0x01))))
+  (is (= 8 (kkey/leading-zeros (k 0x00 0x80))))
+  (is (= 3 (kkey/common-prefix-length (k 0x10) (k 0x00)))))
+
+(deftest hashing-is-what-makes-the-keyspace-uniform
+  ;; Two IPNS keys share the six-octet "/ipns/" prefix. Measured on the raw
+  ;; record keys they are adjacent; hashed, they are not.
+  (let [a (vec (pb/utf8-bytes "/ipns/aaaa"))
+        b (vec (pb/utf8-bytes "/ipns/bbbb"))]
+    ;; six identical octets = 48 bits, then 'a' (0x61) vs 'b' (0x62) differ
+    ;; only in the second-lowest bit, so six more.
+    (is (= 54 (kkey/common-prefix-length (vec (take 32 (concat a (repeat 0))))
+                                         (vec (take 32 (concat b (repeat 0))))))
+        "unhashed, they agree for 54 bits — every IPNS name piles into one corner")))
+
+;; ── wire messages ─────────────────────────────────────────────────────────
+
+(deftest a-get-value-round-trips
+  (let [rk (vec (pb/utf8-bytes "/ipns/somekey"))
+        m (msg/get-value rk)
+        bs (msg/encode m)]
+    (is (= m (msg/decode bs)))
+    (is (= 1 (:type (msg/decode bs))) "GET_VALUE is 1")
+    (is (pb/round-trips? msg/schema bs))))
+
+(deftest a-get-providers-round-trips
+  (let [cid-key [1 2 3 4]
+        m (msg/get-providers cid-key)
+        back (msg/decode (msg/encode m))]
+    (is (= 3 (:type back)) "GET_PROVIDERS is 3")
+    (is (= cid-key (:key back)))
+    (is (= [] (msg/provider-peers back)))
+    (is (pb/round-trips? msg/schema (msg/encode m)))))
+
+(deftest an-add-provider-carries-provider-peers
+  (let [peer {:id [9 9 9] :addrs [[10 11]]}
+        m (msg/add-provider [1 2 3] peer)
+        back (msg/decode (msg/encode m))]
+    (is (= 2 (:type back)) "ADD_PROVIDER is 2")
+    (is (= [peer] (msg/provider-peers back))
+        "who serves the CID is overlay, not a rewrite of the CID")))
+
+(deftest a-put-value-carries-the-ipns-record-nested-inside-a-libp2p-record
+  (let [rk (vec (pb/utf8-bytes "/ipns/somekey"))
+        ipns-bytes [0x0A 0x03 1 2 3]
+        m (msg/put-value rk ipns-bytes)
+        bs (msg/encode m)
+        back (msg/decode bs)]
+    (is (= 0 (:type back)) "PUT_VALUE is 0")
+    (is (= rk (get-in back [:record :key])))
+    (is (= ipns-bytes (msg/ipns-record-of back))
+        "the inner protobuf is the IPNS record — hand it to ipns.record/parse")
+    (is (pb/round-trips? msg/schema bs))))
+
+(deftest the-publisher-does-not-fill-in-time-received
+  (let [m (msg/put-value [1] [2])]
+    (is (nil? (get-in m [:record :time-received]))
+        "it is the receiving node's note about its own clock")))
+
+(deftest field-numbers-are-the-protocol
+  (is (= 2 (first (keep (fn [[n d]] (when (= :key (:name d)) n)) msg/schema))))
+  (is (= 8 (first (keep (fn [[n d]] (when (= :closer-peers (:name d)) n)) msg/schema))))
+  (is (= 9 (first (keep (fn [[n d]] (when (= :provider-peers (:name d)) n)) msg/schema)))
+      "providerPeers is 9; the gap after key(2) is removed fields, not a mistake")
+  (is (= 10 (first (keep (fn [[n d]] (when (= :cluster-level-raw (:name d)) n)) msg/schema)))
+      "declaration order in the .proto is not wire order"))
+
+(deftest a-response-answering-a-different-key-is-detectable
+  (let [asked (vec (pb/utf8-bytes "/ipns/mine"))
+        answer (msg/put-value (vec (pb/utf8-bytes "/ipns/theirs")) [1 2 3])]
+    (is (not (msg/key-matches? answer asked))
+        "a signature proves who wrote a record, never which question it answered")
+    (is (msg/key-matches? (msg/put-value asked [1 2 3]) asked))))
+
+(deftest deprecated-record-fields-round-trip-as-unknown
+  ;; A peer sending the removed author(3)/signature(4) fields.
+  (let [legacy {1 {:name :key :type :bytes}
+                3 {:name :author :type :bytes}
+                4 {:name :signature :type :bytes}}
+        bs (pb/encode legacy {:key [1] :author [2] :signature [3]})]
+    (is (pb/round-trips? msg/record-schema bs)
+        "not declared, so they survive rather than being silently dropped")))
+
+;; ── the lookup state machine ──────────────────────────────────────────────
+
+(defn- peer [n] {:peer/id (str "p" n) :peer/dht-key (k n)})
+
+(deftest a-lookup-queries-alpha-peers-at-a-time
+  (let [s (lookup/start (k 0) (map peer [10 20 30 40 50]) {:alpha 3})]
+    (is (= ["p10" "p20" "p30"] (mapv :peer/id (lookup/next-queries s)))
+        "closest three, and only three")
+    (testing "and does not re-issue an outstanding query"
+      (let [s' (lookup/issue s (lookup/next-queries s))]
+        (is (= ["p40" "p50"] (mapv :peer/id (lookup/next-queries s'))))))))
+
+(deftest a-failed-peer-is-never-selected-again
+  (let [s (-> (lookup/start (k 0) (map peer [10 20 30]) {:alpha 1})
+              (lookup/issue [(peer 10)])
+              (lookup/failure "p10"))]
+    (is (= ["p20"] (mapv :peer/id (lookup/next-queries s)))
+        "otherwise the closest unreachable peer is chosen every round forever")
+    (is (contains? (:lookup/failed s) "p10"))
+    (testing "but it stays in the shortlist — it is still a fact about the topology"
+      (is (some #(= "p10" (:peer/id %)) (:lookup/shortlist s))))))
+
+(deftest responses-merge-and-re-sort-the-shortlist
+  (let [s (-> (lookup/start (k 0) [(peer 50)] {:alpha 3})
+              (lookup/issue [(peer 50)])
+              (lookup/response "p50" [(peer 90) (peer 5)]))]
+    (is (= ["p5" "p50" "p90"] (mapv :peer/id (:lookup/shortlist s)))
+        "appending without re-sorting makes next-queries pick the wrong peers")
+    (is (contains? (:lookup/queried s) "p50"))
+    (is (empty? (:lookup/in-flight s)))))
+
+(deftest progress-is-measured-against-the-closest-peer-not-the-shortlist-size
+  (let [before (lookup/start (k 0) [(peer 10)] {})
+        ;; fifty new peers, none closer than p10
+        no-progress (lookup/response before "p10" (map peer (range 100 150)))
+        progress (lookup/response before "p10" [(peer 1)])]
+    (is (false? (:lookup/progress? (lookup/round before no-progress)))
+        "a big round that got no closer is not progress — measuring growth never terminates")
+    (is (true? (:lookup/progress? (lookup/round before progress))))))
+
+(deftest a-value-lookup-stops-once-the-quorum-of-validated-records-is-met
+  (let [s (-> (lookup/start (k 0) (map peer [10 20 30]) {:quorum 2})
+              (lookup/record! "p10" {:seq 1}))]
+    (is (not (lookup/done? s)))
+    (is (lookup/done? (lookup/record! s "p20" {:seq 2})))))
+
+(deftest a-lookup-terminates-when-the-k-closest-have-all-answered
+  (let [peers (map peer (range 1 6))
+        s (reduce (fn [acc p] (lookup/response acc (:peer/id p) []))
+                  (lookup/start (k 0) peers {:k 5})
+                  peers)]
+    (is (lookup/done? s))
+    (is (= 5 (:queried (lookup/result s))))))
+
+(deftest a-full-lookup-converges-on-a-simulated-network
+  ;; Every peer knows the two peers immediately closer to the target than
+  ;; itself. A lookup started far away must walk in.
+  (let [all (into {} (map (fn [n] [(str "p" n) (peer n)])) (range 1 200))
+        query (fn [p]
+                (let [n #?(:clj (Long/parseLong (subs (:peer/id p) 1))
+                           :cljs (js/parseInt (subs (:peer/id p) 1) 10))]
+                  {:closer-peers (keep #(get all (str "p" %)) [(quot n 2) (dec (quot n 2))])
+                   :record (when (= 1 n) {:found true})}))
+        r (lookup/run (lookup/start (k 0) [(get all "p199")] {:alpha 3 :k 20 :quorum 1})
+                      query)]
+    (is (:done? r))
+    (is (= [{:found true}] (:records r)))
+    (is (< (:rounds r) 20) "it walks in, it does not scan")
+    (is (= "p1" (:peer/id (first (:closest r)))))))
+
+(deftest an-unreachable-network-terminates-rather-than-spinning
+  (let [r (lookup/run (lookup/start (k 0) (map peer [1 2 3]) {})
+                      (fn [_] (throw (ex-info "unreachable" {}))))]
+    (is (:done? r))
+    (is (= 3 (:failed r)))
+    (is (empty? (:records r)))))
+
+;; ── delegated routing ─────────────────────────────────────────────────────
+
+(defn- http-stub [responses]
+  (fn [{:keys [url method]}]
+    (let [r (get responses [method url])]
+      (cond
+        (nil? r) {:status 404}
+        (= :throw r) (throw (ex-info "connection refused" {}))
+        :else r))))
+
+(deftest a-record-is-fetched-with-the-ipns-record-media-type
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200 :body [1 2 3]})
+        r (routing/get-ipns http "https://r1/routing/v1" "k51abc")]
+    (is (:ok? r))
+    (is (= [1 2 3] (:record r)))
+    (is (= "https://r1/routing/v1/ipns/k51abc" (:url @seen)))
+    (is (= routing/ipns-record-content-type (get-in @seen [:headers "Accept"]))
+        "asking for application/json returns a summary you cannot verify a signature over")))
+
+(deftest a-router-that-fails-is-an-outcome-not-an-exception
+  (let [http (http-stub {[:get "https://down/routing/v1/ipns/k51abc"] :throw})]
+    (is (= :transport-error (:reason (routing/get-ipns http "https://down/routing/v1" "k51abc"))))
+    (is (= :not-found (:reason (routing/get-ipns (http-stub {}) "https://r/routing/v1" "k51abc"))))))
+
+(deftest resolution-requires-a-quorum-of-validated-records
+  (let [good [0x0A 0x01 0x01]
+        http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://r3")
+                 {:status 404}
+                 {:status 200 :body good}))
+        validate (fn [octets] (when (= good octets) {:sequence 5}))
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://r1" "https://r2" "https://r3"]
+                            :quorum 2 :validate-fn validate})]
+    (is (:ok? r))
+    (is (= 2 (:agreed r)))
+    (is (= ["https://r1" "https://r2"] (:routers r)))))
+
+(deftest one-router-alone-cannot-satisfy-a-quorum-of-two
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://r1")
+                 {:status 200 :body [1]} {:status 404}))
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://r1" "https://r2"]
+                            :quorum 2 :validate-fn (constantly {:sequence 1})})]
+    (is (false? (:ok? r)))
+    (is (= 1 (:agreed r)))
+    (is (= :no-valid-record (:reason r)))))
+
+(deftest a-record-that-does-not-validate-does-not-count
+  (let [http (constantly {:status 200 :body [9 9 9]})
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://r1" "https://r2"]
+                            :quorum 1 :validate-fn (constantly nil)})]
+    (is (false? (:ok? r)))
+    (is (= 0 (:agreed r)))
+    (is (= :no-valid-record (:reason r))
+        "a router's answer is never trusted on the strength of having answered")))
+
+(deftest not-found-everywhere-is-distinguishable-from-everything-being-down
+  (let [nf (routing/resolve (constantly {:status 404}) "k51abc"
+                            {:routers ["https://r1"] :validate-fn (constantly nil)})
+        down (routing/resolve (fn [_] (throw (ex-info "x" {}))) "k51abc"
+                              {:routers ["https://r1"] :validate-fn (constantly nil)})]
+    (is (= :not-found (:reason nf)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest selection-runs-over-the-validated-records
+  (let [http (fn [{:keys [url]}]
+               {:status 200 :body (if (str/starts-with? url "https://old") [1] [2])})
+        r (routing/resolve http "k51abc"
+                           {:routers ["https://old" "https://new"]
+                            :quorum 1
+                            :validate-fn (fn [o] {:sequence (if (= [1] o) 1 9)})
+                            :select-fn (fn [rs] (apply max-key :sequence rs))})]
+    (is (= 9 (get-in r [:record :sequence]))
+        "a stale but validly-signed record loses to a newer one")))
+
+(deftest publishing-succeeds-if-any-router-accepted
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://ok") {:status 200} {:status 400}))
+        r (routing/publish http "k51abc" [1 2 3]
+                           {:routers ["https://ok" "https://bad"]})]
+    (is (:ok? r))
+    (is (= ["https://ok"] (:accepted r)))
+    (is (= 1 (count (:rejected r))))
+    (testing "and fails only when every router refused"
+      (is (false? (:ok? (routing/publish http "k51abc" [1]
+                                         {:routers ["https://bad"]})))))))
+
+(def ^:private provider-cid
+  "bafybeidl5t4ztktqmfcqrfqpio6qf64n6t65a7inkz2pa6jq4tyqwfjfhy")
+
+(deftest get-providers-does-not-rewrite-the-cid
+  (let [http (constantly {:status 200
+                          :body {:Providers [{:ID "12D3KooWpeer"
+                                              :Addrs ["/ip4/127.0.0.1/tcp/4001"]}]}})
+        r (routing/get-providers http "https://r/routing/v1" provider-cid)]
+    (is (:ok? r))
+    (is (= provider-cid (:cid r)))
+    (is (= provider-cid (:cid (first (:providers r)))))
+    (is (false? (:mutates-cid? (first (:providers r)))))
+    (is (= :discovery (:plane (first (:providers r)))))))
+
+(deftest get-providers-asks-for-json-not-an-ipns-record
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200 :body {:Providers []}})
+        _ (routing/get-providers http "https://r/routing/v1" provider-cid)]
+    (is (= (str "https://r/routing/v1/providers/" provider-cid) (:url @seen)))
+    (is (= routing/providers-accept (get-in @seen [:headers "Accept"])))))
+
+(deftest a-404-from-providers-is-answered-empty-not-an-outage
+  (let [r (routing/get-providers (http-stub {}) "https://r/routing/v1" provider-cid)]
+    (is (:ok? r))
+    (is (= [] (:providers r)))
+    (is (true? (:empty? r)))))
+
+(deftest providers-json-octets-need-an-injected-parser
+  (let [http (constantly {:status 200 :body "{\"Providers\":[{\"ID\":\"12D3KooWpeer\"}]}"})
+        no-parse (routing/get-providers http "https://r/routing/v1" provider-cid)
+        parsed (routing/get-providers http "https://r/routing/v1" provider-cid
+                                      {:parse-fn (fn [_] {:Providers [{:ID "12D3KooWpeer"}]})})]
+    (is (false? (:ok? no-parse)))
+    (is (= :body-not-map (:reason no-parse))
+        "this library holds no JSON parser; a string body without parse-fn is not a pass")
+    (is (:ok? parsed))
+    (is (= "12D3KooWpeer" (:peer (first (:providers parsed)))))))
+
+(deftest find-providers-unions-by-peer-across-routers
+  (let [http (fn [{:keys [url]}]
+               {:status 200
+                :body {:Providers (if (str/starts-with? url "https://r1")
+                                    [{:ID "12D3KooWa" :Addrs ["/ip4/1.1.1.1/tcp/4001"]}
+                                     {:ID "12D3KooWshared"}]
+                                    [{:ID "12D3KooWb"}
+                                     {:ID "12D3KooWshared"}])}})
+        r (routing/find-providers http provider-cid
+                                  {:routers ["https://r1/routing/v1" "https://r2/routing/v1"]
+                                   :quorum 2})]
+    (is (:ok? r))
+    (is (= 2 (:answered r)))
+    (is (= #{"12D3KooWa" "12D3KooWb" "12D3KooWshared"}
+           (set (map :peer (:providers r)))))
+    (is (every? #(= provider-cid (:cid %)) (:providers r)))
+    (is (false? (:mutates-cid? r)))))
+
+(deftest find-providers-tells-empty-from-down
+  (let [empty (routing/find-providers (constantly {:status 404}) provider-cid
+                                      {:routers ["https://r1/routing/v1"]})
+        down (routing/find-providers (fn [_] (throw (ex-info "x" {}))) provider-cid
+                                     {:routers ["https://r1/routing/v1"]})]
+    (is (:ok? empty))
+    (is (= [] (:providers empty))
+        "we asked; nobody provides. that is not an outage")
+    (is (false? (:ok? down)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest find-providers-quorum-counts-routers-that-answered
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://r1")
+                 {:status 200 :body {:Providers [{:ID "12D3KooWpeer"}]}}
+                 (throw (ex-info "down" {}))))
+        r (routing/find-providers http provider-cid
+                                  {:routers ["https://r1/routing/v1" "https://r2/routing/v1"]
+                                   :quorum 2})]
+    (is (false? (:ok? r)))
+    (is (= :quorum-unmet (:reason r)))
+    (is (= 1 (:answered r)))))
+
+(deftest score-providers-is-find-without-a-transport
+  (let [cid provider-cid
+        responses [{:ok? true :providers [{:peer "12D3KooWa" :cid cid :plane :discovery
+                                           :addrs [] :mutates-cid? false}]
+                    :router "https://r1"}
+                   {:ok? true :providers [{:peer "12D3KooWb" :cid cid :plane :discovery
+                                           :addrs [] :mutates-cid? false}]
+                    :router "https://r2"}]
+        r (routing/score-providers cid responses {:quorum 2})]
+    (is (:ok? r))
+    (is (= 2 (:answered r)))
+    (is (= #{"12D3KooWa" "12D3KooWb"} (set (map :peer (:providers r)))))))
+
+(def ^:private provider-rec
+  {:cid provider-cid :peer "12D3KooWpeer" :addrs ["/ip4/127.0.0.1/tcp/4001"]})
+
+(deftest provider-envelope-puts-cid-in-keys-not-the-url
+  (let [env (routing/provider-envelope provider-rec)
+        rec (first (get-in env [:envelope :Providers]))]
+    (is (:ok? env))
+    (is (= provider-cid (:cid env)))
+    (is (false? (:mutates-cid? env)))
+    (is (= [provider-cid] (get-in rec [:Payload :Keys])))
+    (is (= "12D3KooWpeer" (get-in rec [:Payload :ID])))
+    (is (= "bitswap" (:Schema rec)))
+    (is (nil? (:Signature rec))
+        "this library holds no crypto; a missing signature is omitted, not forged")
+    (is (nil? (get-in rec [:Payload :Timestamp]))
+        "this library holds no clock")))
+
+(deftest put-providers-does-not-rewrite-the-cid
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200})
+        r (routing/put-providers http "https://r/routing/v1" provider-rec)]
+    (is (:ok? r))
+    (is (= provider-cid (:cid r)))
+    (is (false? (:mutates-cid? r)))
+    (is (= "https://r/routing/v1/providers" (:url @seen))
+        "historic PUT has no CID in the path; GET does")
+    (is (= :put (:method @seen)))
+    (is (= routing/providers-accept (get-in @seen [:headers "Content-Type"])))
+    (is (= [provider-cid] (get-in @seen [:body :Providers 0 :Payload :Keys])))))
+
+(deftest provide-succeeds-if-any-router-accepted
+  (let [http (fn [{:keys [url]}]
+               (if (str/starts-with? url "https://ok") {:status 200} {:status 400}))
+        r (routing/provide http provider-rec
+                           {:routers ["https://ok/routing/v1" "https://bad/routing/v1"]})]
+    (is (:ok? r))
+    (is (= ["https://ok/routing/v1"] (:accepted r)))
+    (is (= 1 (count (:rejected r))))
+    (is (= provider-cid (:cid r)))
+    (testing "and fails only when every router refused"
+      (is (false? (:ok? (routing/provide http provider-rec
+                                         {:routers ["https://bad/routing/v1"]})))))))
+
+(deftest provide-json-octets-need-an-injected-encoder
+  (let [seen (atom nil)
+        http (fn [req] (reset! seen req) {:status 200})
+        _ (routing/put-providers http "https://r/routing/v1" provider-rec
+                                 {:encode-fn (fn [_] "{\"Providers\":[]}")})]
+    (is (= "{\"Providers\":[]}" (:body @seen))
+        "this library holds no JSON encoder")))
+
+(deftest an-injected-sign-fn-is-not-a-kad-signer
+  (let [env (routing/provider-envelope (assoc provider-rec :sign-fn (constantly "caller-bytes")))]
+    (is (= "caller-bytes" (get-in env [:envelope :Providers 0 :Signature]))
+        "kad attaches whatever the caller returned; it does not hash or encode")))
+
+(def ^:private routing-peer-id "12D3KooWpeer")
+
+(deftest get-peer-does-not-rewrite-the-peer-id
+  (let [seen (atom nil)
+        http (fn [req]
+               (reset! seen req)
+               {:status 200
+                :body {:Peers [{:Schema "peer"
+                                :ID routing-peer-id
+                                :Addrs ["/ip4/127.0.0.1/tcp/4001"]
+                                :Protocols ["transport-bitswap"]}]}})
+        r (routing/get-peer http "https://r/routing/v1" routing-peer-id)]
+    (is (:ok? r))
+    (is (= routing-peer-id (:asked r)))
+    (is (= routing-peer-id (:peer (first (:peers r)))))
+    (is (= :routing (:plane (first (:peers r)))))
+    (is (= (str "https://r/routing/v1/peers/" routing-peer-id) (:url @seen)))
+    (is (= :get (:method @seen)))))
+
+(deftest a-404-from-peers-is-answered-empty-not-an-outage
+  (let [r (routing/get-peer (http-stub {}) "https://r/routing/v1" routing-peer-id)]
+    (is (:ok? r))
+    (is (= [] (:peers r)))
+    (is (true? (:empty? r)))))
+
+(deftest find-peers-tells-empty-from-down
+  (let [empty (routing/find-peers (constantly {:status 404}) routing-peer-id
+                                  {:routers ["https://r1/routing/v1"]})
+        down (routing/find-peers (fn [_] (throw (ex-info "x" {}))) routing-peer-id
+                                 {:routers ["https://r1/routing/v1"]})]
+    (is (:ok? empty))
+    (is (= [] (:peers empty)))
+    (is (false? (:ok? down)))
+    (is (= :all-routers-failed (:reason down)))))
+
+(deftest find-peers-unions-by-peer-across-routers
+  (let [http (fn [{:keys [url]}]
+               {:status 200
+                :body {:Peers (if (str/starts-with? url "https://r1")
+                                [{:ID routing-peer-id :Addrs ["/ip4/1.1.1.1/tcp/4001"]}]
+                                [{:ID "12D3KooWother"}])}})
+        r (routing/find-peers http routing-peer-id
+                              {:routers ["https://r1/routing/v1" "https://r2/routing/v1"]
+                               :quorum 2})]
+    (is (:ok? r))
+    (is (= 2 (:answered r)))
+    (is (= #{routing-peer-id "12D3KooWother"} (set (map :peer (:peers r)))))))
+
+;; ── the pure scoring half ─────────────────────────────────────────────────
+
+(deftest score-is-resolve-without-a-transport
+  ;; A Cloudflare Worker cannot supply a synchronous http-fn — fetch is a
+  ;; Promise and there is no way to await it inside a sync function — so it
+  ;; does its own concurrent fetches and calls score with the results.
+  (let [responses [{:ok? true :record [1] :router "https://r1"}
+                   {:ok? true :record [1] :router "https://r2"}]
+        r (routing/score responses {:quorum 2 :validate-fn (constantly {:sequence 3})})]
+    (is (:ok? r))
+    (is (= 2 (:agreed r)))
+    (is (= ["https://r1" "https://r2"] (:routers r)))))
+
+(deftest score-tells-the-three-failures-apart
+  (let [nf [{:ok? false :reason :not-found :router "https://r1"}]
+        down [{:ok? false :reason :transport-error :router "https://r1"}]
+        bad [{:ok? true :record [9] :router "https://r1"}]]
+    (is (= :not-found (:reason (routing/score nf {:validate-fn (constantly nil)}))))
+    (is (= :all-routers-failed (:reason (routing/score down {:validate-fn (constantly nil)}))))
+    (is (= :no-valid-record (:reason (routing/score bad {:validate-fn (constantly nil)})))
+        "routers answered and nothing verified — neither absence nor an outage")))
+
+(deftest resolve-and-score-agree
+  ;; resolve is score plus fetching, so the same inputs must give the same
+  ;; verdict through either door.
+  (let [http (fn [{:keys [url]}] (if (str/starts-with? url "https://r1")
+                                   {:status 200 :body [7]} {:status 404}))
+        via-resolve (routing/resolve http "k51abc"
+                                     {:routers ["https://r1" "https://r2"]
+                                      :quorum 1 :validate-fn (constantly {:sequence 1})})
+        via-score (routing/score [(routing/get-ipns http "https://r1" "k51abc")
+                                  (routing/get-ipns http "https://r2" "k51abc")]
+                                 {:quorum 1 :validate-fn (constantly {:sequence 1})})]
+    (is (= (:ok? via-resolve) (:ok? via-score)))
+    (is (= (:agreed via-resolve) (:agreed via-score)))
+    (is (= (:routers via-resolve) (:routers via-score)))))
+
+;; ── the k-bucket routing table ────────────────────────────────────────────
+
+(defn- tpeer [n] {:peer/id (str "p" n) :peer/dht-key (k n)})
+(def self (k 0))
+
+(deftest a-peer-lands-in-the-bucket-for-its-shared-prefix
+  (let [t (table/create self)]
+    (is (= 0 (table/bucket-index t (k 0x80))) "top bit differs")
+    (is (= 7 (table/bucket-index t (k 0x01))))
+    (is (= 8 (table/bucket-index t (k 0x00 0x80))))
+    (is (nil? (table/bucket-index t self))
+        "our own key has no bucket; returning 256 would put the node in its own table")))
+
+(deftest the-table-holds-k-peers-at-every-distance-scale
+  ;; Not the k globally-closest — that table would know nothing about the far
+  ;; half of the keyspace and could not route a query there at all.
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  (map tpeer [0x80 0xC0 0x01 0x02]))]
+    (is (= 2 (count (table/peers-in t 0))) "the far half")
+    (is (pos? (count (table/all-peers t))))
+    (is (> (count (table/bucket-sizes t)) 1) "peers spread across scales")))
+
+(deftest seeing-a-known-peer-moves-it-to-the-recent-end
+  (let [t (-> (table/create self) (table/note-seen (tpeer 0x80) 1) :table
+              (table/note-seen (tpeer 0x81) 2) :table
+              (table/note-seen (tpeer 0x80) 3) :table)]
+    (is (= ["p129" "p128"] (mapv :peer/id (table/peers-in t 0)))
+        "order in the bucket IS the recency record, so there is no timestamp to drift from it")
+    (is (= 3 (:peer/last-seen (last (table/peers-in t 0)))))))
+
+(deftest a-full-bucket-asks-for-a-probe-rather-than-evicting
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        r (table/note-seen t (tpeer 0x82) 5)]
+    (is (= "p128" (:peer/id (:probe r))) "the least recently seen")
+    (is (= "p130" (:peer/id (:pending r))))
+    (is (= t (:table r)) "nothing changed until the probe is answered")))
+
+(deftest an-answering-incumbent-keeps-its-place-and-the-newcomer-is-discarded
+  ;; Kademlia §2.2, and the reason it looks backwards: long-lived peers are
+  ;; more likely to stay up, and an attacker who can mint identities must not
+  ;; be able to displace them just by showing up. That is the eclipse defence.
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        {:keys [probe pending]} (table/note-seen t (tpeer 0x82) 5)
+        t' (table/probe-alive t probe 5)]
+    (is (= #{"p128" "p129"} (set (mapv :peer/id (table/peers-in t' 0)))))
+    (is (nil? (table/find-peer t' (:peer/id pending)))
+        "showing up is not enough to enter a full bucket")
+    (is (= "p128" (:peer/id (last (table/peers-in t' 0))))
+        "and the incumbent is now the most recently seen")))
+
+(deftest a-silent-incumbent-is-replaced
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        {:keys [probe pending]} (table/note-seen t (tpeer 0x82) 5)
+        t' (table/probe-dead t probe pending 5)]
+    (is (nil? (table/find-peer t' "p128")))
+    (is (some? (table/find-peer t' "p130")))
+    (is (= 2 (count (table/peers-in t' 0))))))
+
+(deftest a-flood-of-newcomers-cannot-take-over-a-table
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self {:k 2})
+                  [(tpeer 0x80) (tpeer 0x81)])
+        ;; 50 fresh identities, every probe answered by the incumbent
+        flooded (reduce (fn [acc n]
+                          (let [{:keys [probe table]} (table/note-seen acc (tpeer (+ 0x82 n)) 9)]
+                            (if probe (table/probe-alive acc probe 9) table)))
+                        t (range 50))]
+    (is (= #{"p128" "p129"} (set (mapv :peer/id (table/peers-in flooded 0))))
+        "eviction on arrival would have replaced the node's whole view of the network")))
+
+(deftest closest-searches-the-whole-table-not-one-bucket
+  (let [t (reduce (fn [acc p] (:table (table/note-seen acc p 1)))
+                  (table/create self)
+                  (map tpeer [0x01 0x02 0x80 0xC0]))
+        c (table/closest t (k 0x00) 3)]
+    (is (= 3 (count c)))
+    (is (= ["p1" "p2" "p128"] (mapv :peer/id c))
+        "answering from the target's own bucket returns fewer peers than we have")))
+
+(deftest removal-and-staleness
+  (let [t (-> (table/create self) (table/note-seen (tpeer 0x80) 100) :table
+              (table/note-seen (tpeer 0x01) 900) :table)]
+    (is (= 2 (table/size t)))
+    (is (= ["p128"] (mapv :peer/id (table/stale-peers t 500))))
+    (is (= 1 (table/size (table/remove-peer t "p128"))))))

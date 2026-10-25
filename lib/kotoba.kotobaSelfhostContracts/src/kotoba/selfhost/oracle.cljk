@@ -1,0 +1,153 @@
+(ns kotoba.selfhost.oracle
+  "Loads and calls the shipped Kotoba decisions.
+
+  `kotoba/*.kotoba` holds the decisions; `resources/kotoba/selfhost/oracle/*.kir.edn`
+  is the compiled artifact that ships. This namespace is the seam between them,
+  and it is deliberately thin: it resolves a resource, executes an export, and
+  does not decide anything itself.
+
+  The compiler is NOT here. It produced the artifacts under `:test` and is not
+  on this classpath (ADR-reliability-t63: the compiler is a build/analysis tool;
+  the artifact is what runs). Regenerate with `kbb -M:test:gen`.
+
+  A missing or unreadable artifact throws rather than falling back to a host
+  reimplementation. A silent fallback is how a decision stops being the one that
+  shipped, and this repo already lost an analyzer that way once.
+
+  TWO ENGINES, ONE DECISION
+  -------------------------
+  By default the shipped KIR runs on the reference interpreter, in this JVM.
+  `open-native!` points this process at a native build of the same `.kotoba`
+  instead, and every caller of `call` — `kotoba.selfhost.analyzer` is the whole
+  of it — follows without changing a line. That is the point of keeping this
+  namespace thin: the choice of engine is not a fact any consumer should have
+  to know.
+
+  It is opt-in, never a fallback in either direction. If a native build is
+  requested and anything about it is missing or unverifiable, this throws. Two
+  engines are only worth having if something binds them to the same answers,
+  which is what `test-native/` does across the whole fact table.
+
+  Cost, measured on an M4 for `safe_analyzer_core` (19k-word module): the
+  interpreter answers in about 2 ms; a native session costs ~4 s to open once
+  and then ~20-50 ms per call, nearly all of it process spawn. Native is the
+  right engine when the work per call is large, and the interpreter is the
+  right one for a word-typed predicate. Neither is `faster` unqualified."
+  (:require [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.kir :as ir]))
+
+(def oracles
+  "Artifact id -> the .kotoba it was compiled from."
+  {:safe-analyzer       "kotoba/safe_analyzer_core.kotoba"
+   :capability-admission "kotoba/capability_admission_core.kotoba"})
+
+(defn resource-path [id]
+  (str "kotoba/selfhost/oracle/" (name id) ".kir.edn"))
+
+(defn- load-kir [id]
+  (let [path (resource-path id)
+        r (io/resource path)]
+    (when-not r
+      (throw (ex-info "missing shipped oracle artifact — run `kbb -M:test:gen`"
+                      {:oracle id :path path})))
+    (edn/read-string (slurp r))))
+
+(def ^:private kir-cache (atom {}))
+
+(defn kir
+  "The shipped KIR for `id`, read once."
+  [id]
+  (or (get @kir-cache id)
+      (let [k (load-kir id)]
+        (swap! kir-cache assoc id k)
+        k)))
+
+;; ── native engine ────────────────────────────────────────────────────
+;;
+;; A native build directory holds, for each oracle id, `<id>.signed.kexe`, plus
+;; one `trust.edn`, `runtime.edn`, and the measured `kotoba-loader` they were
+;; produced against. `test-native/kotoba/selfhost/native_build.cljk` writes one.
+;;
+;; tender-native is resolved at call time rather than required, so consuming
+;; this library does not drag a native toolchain onto every classpath. A caller
+;; that never opens a native build never touches it.
+
+(def ^:private native (atom nil))
+
+(defn native?
+  "Is this process running the oracles natively?"
+  []
+  (some? @native))
+
+(defn- native-fn [name]
+  (or (try (requiring-resolve (symbol "kototama.native.executor" (str name)))
+           (catch java.io.FileNotFoundException _ nil))
+      (throw (ex-info "a native oracle needs the kotoba-lang/tender-native host"
+                      {:dependency 'io.github.kotoba-lang/tender-native}))))
+
+(defn- read-edn [^java.io.File file what]
+  (when-not (.isFile file)
+    (throw (ex-info (str "native oracle build is missing its " what)
+                    {:path (.getPath file)})))
+  (edn/read-string (slurp file)))
+
+(defn close-native!
+  "Close every open native session and go back to the interpreter."
+  []
+  (let [sessions @native]
+    (reset! native nil)
+    (run! (native-fn 'close!) (vals sessions))
+    nil))
+
+(defn open-native!
+  "Run the oracles from the native build in `directory` for the rest of this
+  process, or until `close-native!`.
+
+  Every artifact is verified here, once per session, rather than once per call:
+  that is what makes calling a native decision more than once affordable at all
+  (tender-native `prepare`). Expiry, revocation and capability admission are
+  still re-checked on every call by the host."
+  [directory]
+  (when (native?) (close-native!))
+  (let [dir (io/file directory)
+        prepare (native-fn 'prepare)
+        trust (read-edn (io/file dir "trust.edn") "trust")
+        runtime (read-edn (io/file dir "runtime.edn") "runtime measurement")
+        loader (io/file dir "kotoba-loader")
+        _ (when-not (.isFile loader)
+            (throw (ex-info "native oracle build is missing its measured loader"
+                            {:path (.getPath loader)})))
+        now (quot (System/currentTimeMillis) 1000)
+        sessions (into {}
+                       (map (fn [id]
+                              (let [envelope (read-edn (io/file dir (str (name id) ".signed.kexe"))
+                                                       (str "signed artifact for " id))]
+                                [id (prepare envelope trust
+                                             {:now now
+                                              :runtime (:runtime runtime)
+                                              :loader-path (.getPath loader)})])))
+                       (keys oracles))]
+    (reset! native sessions)
+    (set (keys sessions))))
+
+(defn- call-native [id export args]
+  (let [session (or (get @native id)
+                    (throw (ex-info "no native session for this oracle" {:oracle id})))
+        {:keys [evidence]} ((native-fn 'invoke) session {} {:args (vec args)}
+                            {:now (quot (System/currentTimeMillis) 1000)
+                             :entry (symbol (name export))})]
+    (if (= :ok (:status evidence))
+      (:result evidence)
+      (throw (ex-info "native oracle did not answer"
+                      {:oracle id :export export :evidence evidence})))))
+
+(defn call
+  "Execute an export of a shipped oracle. Args and result are plain values.
+
+  Which engine runs it is `native?`; the answer is the same either way, and
+  `test-native/` is what keeps that true."
+  [id export args]
+  (if (native?)
+    (call-native id export args)
+    (ir/execute (kir id) (symbol (name export)) (vec args))))

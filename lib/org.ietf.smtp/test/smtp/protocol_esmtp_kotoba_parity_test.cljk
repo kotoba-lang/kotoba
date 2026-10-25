@@ -1,0 +1,182 @@
+;; `kotoba/smtp/protocol.{kotoba,cljk}` against `smtp.protocol` -- the ESMTP
+;; capability surface (RFC 1869 / 1870) and the SASL payload framing (RFC 4616 /
+;; XOAUTH2).
+;;
+;; The guest is positional where the oracle returns a map and a set: a map cannot
+;; be a Kotoba return type, so `parse-extensions` becomes `extension-value` +
+;; `has-extension?` + `extension-count` and `auth-mechanisms` becomes
+;; `mechanism-count` + `advertises-mechanism?`. Parity therefore means the
+;; positional answers agree with what the oracle's map and set say, over the same
+;; block. That is a stronger comparison than a shape check: it is the only place
+;; that notices the two drifting apart, in either direction.
+;;
+;; `.cljc` stays the oracle and is not required from the guest (require-graph).
+;;
+;; The negative control is `keeping-the-greeting-must-go-red`: the greeting line
+;; is line 0 of an EHLO reply and is not an extension, and a guest that keeps it
+;; answers TRUE for the server's own domain. That was a real defect in this
+;; component before it landed. The control asserts the mutation actually changed
+;; the emitted value BEFORE asserting disagreement, so a guest that fails to
+;; compile, or fails for another reason, is not counted as the control firing.
+
+(ns smtp.protocol-esmtp-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [smtp.protocol :as p]))
+
+(def ^:private kotoba-file
+  (io/file (System/getProperty "user.dir") "kotoba" "smtp" "protocol.kotoba"))
+
+(def ^:private cljk-file
+  (io/file (System/getProperty "user.dir") "kotoba" "smtp" "protocol.cljk"))
+
+(defn- source-available? []
+  (let [k? (io/exists? kotoba-file) c? (io/exists? cljk-file)]
+    (is k? (str "kotoba object not found at " kotoba-file))
+    (is c? (str "cljk object not found at " cljk-file))
+    (and k? c?)))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp kotoba-file) :wasm32-kotoba-v1 {}))))
+
+(def ^:private cljk-kir
+  (delay (:kir (compiler/compile-source (slurp cljk-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [compiled f args] (ir/execute compiled f args))
+
+;; Every shape a real EHLO reply takes, plus the ones that decide the edges:
+;; a keyword with no value, no AUTH line at all, lower-case keywords, CRLF
+;; endings, and a greeting that looks like a keyword line.
+(def ^:private blocks
+  {"gmail"      (str/join "\n" ["smtp.gmail.com at your service, [1.2.3.4]"
+                                "SIZE 35882577" "8BITMIME"
+                                "AUTH LOGIN PLAIN XOAUTH2 PLAIN-CLIENTTOKEN OAUTHBEARER XOAUTH"
+                                "ENHANCEDSTATUSCODES" "PIPELINING" "CHUNKING" "SMTPUTF8"])
+   "minimal"    "mail.example.com\nSIZE 10\nAUTH PLAIN"
+   "no-auth"    "mail.example.com\nSTARTTLS\nSIZE 0"
+   "no-size"    "mail.example.com\nAUTH LOGIN\n8BITMIME"
+   "lower-case" "mail.example.com\nsize 4096\nauth plain login"
+   "crlf"       "mail.example.com\r\nSIZE 99\r\nAUTH XOAUTH2"
+   "bare-only"  "mail.example.com\nSTARTTLS"
+   "greeting-only" "mail.example.com Hello [10.0.0.1]"
+   "size-no-value" "mail.example.com\nSIZE\nAUTH PLAIN"})
+
+(defn- oracle-ext [block] (p/parse-extensions (str/split-lines block)))
+
+(def ^:private keywords-probed
+  ["SIZE" "size" "AUTH" "STARTTLS" "8BITMIME" "CHUNKING" "PIPELINING" "SMTPUTF8"
+   "CRAM-MD5" "mail.example.com" "smtp.gmail.com"])
+
+(deftest kotoba-esmtp-objects-are-present
+  (source-available?))
+
+(deftest extension-lookup-agrees-with-the-oracle
+  (when (source-available?)
+    (doseq [[label block] blocks]
+      (let [ext (oracle-ext block)]
+        (is (= (count ext) (call @kir 'extension-count [block]))
+            (str "extension-count on " label))
+        (doseq [k keywords-probed]
+          (is (= (contains? ext (str/upper k)) (call @kir 'has-extension? [block k]))
+              (str "has-extension? " k " on " label))
+          (is (= (get ext (str/upper k) "") (call @kir 'extension-value [block k]))
+              (str "extension-value " k " on " label)))))))
+
+(deftest mechanisms-agree-with-the-oracle
+  (when (source-available?)
+    (doseq [[label block] blocks]
+      (let [mechs (p/auth-mechanisms (oracle-ext block))]
+        (is (= (count mechs) (call @kir 'mechanism-count [block]))
+            (str "mechanism-count on " label))
+        (doseq [m ["PLAIN" "plain" "LOGIN" "XOAUTH2" "PLAIN-CLIENTTOKEN"
+                   "CLIENTTOKEN" "OAUTH" "OAUTHBEARER" "CRAM-MD5"]]
+          (is (= (contains? mechs (str/upper m)) (call @kir 'advertises-mechanism? [block m]))
+              (str "advertises-mechanism? " m " on " label)))))))
+
+(deftest max-size-agrees-with-the-oracle
+  (when (source-available?)
+    (doseq [[label block] blocks]
+      ;; `nil` is the oracle's absent; the guest cannot return nil and says -1.
+      (is (= (or (p/max-size (oracle-ext block)) -1) (call @kir 'max-size [block]))
+          (str "max-size on " label)))))
+
+(deftest auth-code-agrees-with-auth-pick-from
+  (when (source-available?)
+    (doseq [[label block] blocks
+            [token password] [[nil nil] ["tok" nil] [nil "pw"] ["tok" "pw"]]]
+      (let [mechs (p/auth-mechanisms (oracle-ext block))
+            want (p/auth-pick-from mechs {:access-token token :password password})
+            creds (call @kir 'creds-code [(boolean token) (boolean password)])]
+        (is (= (p/creds-code (boolean token) (boolean password)) creds)
+            (str "creds-code " (pr-str [token password])))
+        (is (= want (call @kir 'auth-code [block creds]))
+            (str "auth-code on " label " with " (pr-str [token password])))))))
+
+(deftest sasl-framing-agrees-with-the-oracle
+  (when (source-available?)
+    (doseq [[user secret] [["user" "secret"] ["" ""] ["a@b.example" "p ss"]
+                           ["u" "very-long-application-password-0123456789"]]]
+      (is (= (p/plain-credentials user secret)
+             (call @kir 'plain-credentials [user secret]))
+          (str "plain-credentials " (pr-str [user secret])))
+      (is (= (p/xoauth2-credentials user secret)
+             (call @kir 'xoauth2-credentials [user secret]))
+          (str "xoauth2-credentials " (pr-str [user secret]))))))
+
+(deftest cljk-twin-agrees-with-the-kotoba-guest
+  (when (source-available?)
+    (doseq [[_ block] blocks]
+      (doseq [f '[normalize normalize-raw extension-count max-size mechanism-count]]
+        (is (= (call @kir f [block]) (call @cljk-kir f [block]))
+            (str "cljk drifted on " f)))
+      (doseq [f '[extension-value has-extension? advertises-mechanism?]
+              arg ["SIZE" "auth" "STARTTLS"]]
+        (is (= (call @kir f [block arg]) (call @cljk-kir f [block arg]))
+            (str "cljk drifted on " f " " arg))))
+    ;; `creds-code` is the one export whose annotations could NOT come off the
+    ;; twin. Inference typed its two booleans as i64 -- visible only in the
+    ;; emitted artifact, as `assertI64` where the annotated build has
+    ;; `assertBool` -- and both test harnesses passed with the divergence in
+    ;; place. It is annotated in the twin for that reason, and asserted here so
+    ;; the reason cannot be quietly undone.
+    (doseq [t [true false] pw [true false]]
+      (is (= (call @kir 'creds-code [t pw]) (call @cljk-kir 'creds-code [t pw]))
+          (str "cljk drifted on creds-code " (pr-str [t pw]))))))
+
+(deftest keeping-the-greeting-must-go-red
+  (when (source-available?)
+    (let [original (slurp kotoba-file)
+          ;; `after-first-line` is what drops the greeting. Make it a no-op and
+          ;; the greeting becomes line 1 of the normalised block, where a domain
+          ;; followed by a space matches the needle an extension with a value
+          ;; matches.
+          mutated (str/replace original
+                               "(string-substring s (+ i 1) (string-length s))"
+                               "s")
+          _ (is (not= mutated original)
+                "the greeting-dropping substring was not found -- the control mutated nothing")
+          mutated-kir (:kir (compiler/compile-source mutated :wasm32-kotoba-v1 {}))
+          block (get blocks "minimal")
+          kept (call mutated-kir 'has-extension? [block "mail.example.com"])]
+      (is (true? kept)
+          "the mutation has to actually make the greeting look like an extension")
+      (is (false? (contains? (oracle-ext block) "MAIL.EXAMPLE.COM"))
+          "the oracle never treats the greeting as an extension")
+      (is (not= (contains? (oracle-ext block) "MAIL.EXAMPLE.COM") kept)
+          "a greeting must not pass as an extension"))))
+
+(deftest a-repeated-keyword-is-a-stated-boundary
+  "The oracle collapses a repeated keyword into one map entry and keeps the LAST
+  value; the guest counts lines and finds the FIRST. RFC 1869 does not permit a
+  server to repeat a keyword, and no server does, so this is recorded rather
+  than reconciled -- the difference is on the record instead of hiding inside a
+  passing suite."
+  (when (source-available?)
+    (let [block "mail.example.com\nSIZE 10\nSIZE 20"]
+      (is (= 1 (count (oracle-ext block))) "the oracle sees one extension")
+      (is (= 2 (call @kir 'extension-count [block])) "the guest sees two lines")
+      (is (= "20" (get (oracle-ext block) "SIZE")) "the oracle keeps the last value")
+      (is (= "10" (call @kir 'extension-value [block "SIZE"])) "the guest finds the first"))))

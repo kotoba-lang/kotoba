@@ -1,0 +1,125 @@
+(ns kotoba.lang.atproto-client.atproto
+  "AT Protocol client facade -- PURE core over an injected IHttp transport.
+
+  Ports atproto.ts's two executing helpers (createAgent, xrpc) plus the
+  shared URL/header/query helpers. The library performs ZERO network I/O:
+  every request goes through a host-supplied IHttp (defprotocol below).
+  The TS-only AtpAgent class + Bluesky lexicon *type* re-exports have no
+  Clojure equivalent and nothing to port -- a plain map is the 'agent' here.
+
+  The 'agent' is an immutable map {:service <url> :http <IHttp> :headers
+  {...} :session? {...}}; :http carries the injected transport. Authenticated
+  calls thread a :session {:accessJwt ...} so xrpc can set the Bearer header.
+
+  JVM synchronous (returns plain values); CLJS async (js/Promise, matching
+  the original TS). JSON: json.data-json (JVM) / js/JSON (CLJS), keywordized
+  keys to match the wire shapes callers inspect.
+
+  Kotoba-lang layer contract: pure .cljc, zero network I/O, zero vendor SDK
+  (ADR-2606302300 §Step-1). The host backs IHttp with java.net /
+  babashka.http-client (JVM) or fetch (CLJS/WASM)."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] #?(:clj [json.data-json :as json])
+            [kotoba.lang.text :as str]))
+
+;; ─── Capability seam ─────────────────────────────────────────────────────
+
+(defprotocol IHttp
+  "Host-injected HTTP transport. Core builds every URL, header, and JSON
+  body, and parses every response; the host only carries bytes over the wire.
+  req  = {:method :get|:post :url String :headers {Str Str} :body String|nil}
+  resp = {:status Int :body String} (UTF-8 response body; \"\" if empty)."
+  (-request [this req] "Perform the request; return {:status :body}."))
+
+;; ─── Pure helpers (portable) ─────────────────────────────────────────────
+
+(defn- strip-trailing-slashes [s] (str/replace s #"/+$" ""))
+
+(defn- normalize-method
+  "Accepts :get/:post or \"GET\"/\"POST\" (case-insensitive)."
+  [method]
+  (cond
+    (keyword? method) method
+    (string? method) (keyword (str/lower method))
+    :else (throw (ex-info (str "[kotoba.lang.atproto-client] invalid xrpc method: " (pr-str method))
+                          {:method method}))))
+
+(defn- qs-encode [v] (cond (keyword? v) (name v) :else (str v)))
+
+(defn- url-encode-component [s]
+  #?(:clj (form-urlencoded/form-encode ^String s)
+     :cljs (js/encodeURIComponent s)))
+
+(defn- query-string [params]
+  (->> params
+       (remove (fn [[_ v]] (nil? v)))
+       (map (fn [[k v]]
+              (str (url-encode-component (name k)) "=" (url-encode-component (qs-encode v)))))
+       (str/join "&")))
+
+(defn- xrpc-url
+  "`{service}/xrpc/{nsid}`, appending `params` as a query string when non-empty."
+  [service nsid params]
+  (let [base (str (strip-trailing-slashes service) "/xrpc/" nsid)
+        qs (when (seq params) (query-string params))]
+    (if (seq qs) (str base "?" qs) base)))
+
+(defn- auth-header [agent]
+  (when-let [jwt (get-in agent [:session :accessJwt])]
+    {"Authorization" (str "Bearer " jwt)}))
+
+(defn- merged-headers [agent opts]
+  (merge (:headers agent) (auth-header agent) (:headers opts)))
+
+(defn- json-write [m] #?(:clj (json/write-str m) :cljs (js/JSON.stringify (clj->js m))))
+(defn- json-read  [s] #?(:clj (json/read-str s :key-fn keyword)
+                         :cljs (js->clj (js/JSON.parse s) :keywordize-keys true)))
+
+(defn create-agent
+  "Factory for an agent map {:service :http :headers}. `:http` (an IHttp) is
+  required -- it is the transport xrpc drives. `:headers` are per-agent
+  defaults (e.g. atproto-proxy) injected into every call."
+  [{:keys [service http headers] :as opts}]
+  (when (nil? http)
+    (throw (ex-info "[kotoba.lang.atproto-client] create-agent requires :http (an IHttp)" {:opts opts})))
+  {:service service :http http :headers (or headers {})})
+
+;; ─── xrpc orchestration (JVM sync / CLJS async) ──────────────────────────
+
+(defn- build-xrpc-req
+  "Pure: agent+call -> IHttp request map."
+  [agent method nsid body opts]
+  (let [m (normalize-method method)
+        headers (cond-> (merged-headers agent opts) (= m :post) (assoc "Content-Type" "application/json"))
+        url (xrpc-url (:service agent) nsid (when (= m :get) body))]
+    {:method m :url url :headers headers :body (when (= m :post) (some-> body json-write))}))
+
+#?(:clj
+   (defn xrpc
+     "Generic XRPC call via the agent's IHttp. GET -> body as query params;
+     POST -> body as JSON. Returns the parsed JSON response (keyword keys),
+     or nil for an empty body. Throws ex-info on non-2xx."
+     ([agent method nsid] (xrpc agent method nsid nil nil))
+     ([agent method nsid body] (xrpc agent method nsid body nil))
+     ([agent method nsid body opts]
+      (let [req (build-xrpc-req agent method nsid body opts)
+            resp (-request (:http agent) req)
+            status (:status resp)]
+        (if (<= 200 status 299)
+          (when (seq (:body resp)) (json-read (:body resp)))
+          (throw (ex-info (str "[kotoba.lang.atproto-client] xrpc " nsid " failed: " status " " (:body resp))
+                          {:status status :nsid nsid :url (:url req) :body (:body resp)})))))))
+
+#?(:cljs
+   (defn xrpc
+     "CLJS counterpart -- returns js/Promise. See :clj xrpc docstring."
+     ([agent method nsid] (xrpc agent method nsid nil nil))
+     ([agent method nsid body] (xrpc agent method nsid body nil))
+     ([agent method nsid body opts]
+      (let [req (build-xrpc-req agent method nsid body opts)]
+        (-> (-request (:http agent) req)
+            (.then (fn [resp]
+                     (let [status (:status resp)]
+                       (if (<= 200 status 299)
+                         (when (seq (:body resp)) (json-read (:body resp)))
+                         (throw (js/Error. (str "[kotoba.lang.atproto-client] xrpc " nsid " failed: "
+                                                status " " (:body resp)))))))))))))

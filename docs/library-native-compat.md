@@ -33,17 +33,17 @@ reserved names and unhandled error exports. Regression testing also found JSON
 accepting invalid trailing commas, non-string object keys and raw control
 characters; host and native readings now refuse them consistently.
 
-`scripts/test-native-libraries.sh` builds both real source closures using the
-three-generation self-built compiler from `native-toolchain.env`. It links and
-executes them, checks every byte value, JSON/EDN refusals, state transitions,
-Unicode behavior, invalid channel/scope refusals and fuel exhaustion. Source
-digests are read back after execution. CI blocks hosted language executables
-for this job and preserves its logs. This qualifies the declared fixture/API
-subset; it does not migrate the public launcher to the selfhost compiler.
+The former `scripts/test-native-libraries.sh` and `native-toolchain.env` are
+retired because their toolchain required a C loader. Their original bytes
+are preserved in `docs/retired/native-ci-20261024/`; the fixture source closures
+remain. The replacement CI does not yet execute this library corpus. Its
+native port, including every byte value, JSON/EDN refusals, channel/scope
+failures and fuel exhaustion, remains an explicit qualification gap.
 
-The async JVM/KIR/JavaScript/Wasm oracle now runs in the current launcher graph;
-the obsolete isolated historical compiler project is removed. Portable suites
-and public `bin/kotoba --runtime sci` checks exercise the host APIs separately.
+Historical async JVM/KIR/JavaScript/Wasm and public hosted-runtime observations
+are retained as corpus evidence. JVM/Node/hosted-runtime CI jobs are removed;
+do not run those routes or use them as a fallback. Their native equivalents
+remain open as described in `native-cli-migration.md`.
 
 `branch-reviews.json` binds retained original branch snapshots and adapted
 outputs separately. `local-changes.json` records every changed imported file

@@ -1,0 +1,210 @@
+(ns marketplace.returns-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [marketplace.crossborder :as cb]
+            [marketplace.returns :as ret]))
+
+(defn- policy [& {:as over}]
+  (ret/return-policy (merge {:window-days 14 :restocking-fee-bps 1000
+                             :non-returnable #{:perishable :personalised}}
+                            over)))
+
+(defn- r [& {:as over}]
+  (ret/rma (merge {:id "rma-1" :order "ord-1" :seller "merchant.alpha"
+                   :buyer "buyer-1" :reason :not-as-described
+                   :category :beverages
+                   :lines [{:sku "A1" :qty 1}]
+                   :amount-minor 1200 :currency "JPY"
+                   :delivered-at "2026-06-01T10:00:00Z"
+                   :requested-at "2026-06-05T09:00:00Z"}
+                  over)))
+
+(defn- elig [& {:keys [category delivered-at now p]
+                :or {category :beverages delivered-at "2026-06-01T10:00:00Z"
+                     now "2026-06-05T09:00:00Z"}}]
+  (ret/eligibility {:policy (or p (policy)) :category category
+                    :delivered-at delivered-at :now now}))
+
+;; ───────────────── an RMA is not a dispute ─────────────────
+
+(deftest eligibility-is-mechanical-because-nothing-is-contested
+  (testing "the parcel was delivered on the 1st, the window is 14 days, it
+            is now the 5th, the category is returnable — refusing to answer
+            that on the grounds that all decisions need humans would make
+            returns unusable while protecting nobody"
+    (let [e (elig)]
+      (is (true? (:eligible? e)))
+      (is (= 4 (:days-since-delivery e)))
+      (is (empty? (:reasons e))))))
+
+(deftest the-window-counts-from-delivery-not-from-order
+  (testing "a parcel that took three weeks to arrive has not used up the
+            buyer's window while it was in transit"
+    (is (true? (:eligible? (elig :delivered-at "2026-06-20T00:00:00Z"
+                                 :now "2026-06-25T00:00:00Z"))))))
+
+(deftest the-window-boundary-and-beyond
+  (is (true? (:eligible? (elig :now "2026-06-15T00:00:00Z"))) "day 14")
+  (let [e (elig :now "2026-06-16T00:00:00Z")]
+    (is (false? (:eligible? e)) "day 15")
+    (is (= [:outside-window] (:reasons e)))))
+
+(deftest day-counting-is-calendar-correct-across-months
+  (testing "a naive day-of-month subtraction would say -29"
+    (is (= 2 (:days-since-delivery (elig :delivered-at "2026-01-31"
+                                         :now "2026-02-02"))))
+    (is (= 1 (:days-since-delivery (elig :delivered-at "2026-12-31"
+                                         :now "2027-01-01")))))
+  (testing "a delivery at 23:00 and a request at 01:00 next day is one day,
+            not zero — a buyer should not lose a day to a clock time"
+    (is (= 1 (:days-since-delivery (elig :delivered-at "2026-06-01T23:00:00Z"
+                                         :now "2026-06-02T01:00:00Z"))))))
+
+(deftest a-non-returnable-category-is-a-policy-fact
+  (let [e (elig :category :perishable)]
+    (is (false? (:eligible? e)))
+    (is (= [:non-returnable-category] (:reasons e)))))
+
+(deftest an-undelivered-parcel-cannot-be-returned
+  (testing "the buyer wants the dispute path (:not-received) instead"
+    (let [e (elig :delivered-at nil)]
+      (is (false? (:eligible? e)))
+      (is (= [:not-yet-delivered] (:reasons e))))))
+
+;; ───────────────────────── money in the policy ─────────────────────────
+
+(deftest a-seller-may-not-charge-a-restocking-fee-for-their-own-mistake
+  (testing "that is not a jurisdiction question, it is arithmetic about who
+            caused the return"
+    (doseq [reason [:damaged :wrong-item :defective :not-as-described :missing-parts]]
+      (is (= 0 (ret/restocking-fee-minor (policy) reason 1200)) (str reason))))
+  (testing "but a change of mind may be charged the published fee"
+    (is (= 120 (ret/restocking-fee-minor (policy) :changed-mind 1200)))
+    (is (= 0 (ret/restocking-fee-minor (policy :restocking-fee-bps 0)
+                                       :changed-mind 1200)))))
+
+(deftest who-pays-return-shipping-follows-the-published-policy
+  (is (= :seller (ret/who-pays-return-shipping (policy) :damaged)))
+  (is (= :buyer  (ret/who-pays-return-shipping (policy) :changed-mind)))
+  (testing "a seller who chose to offer free returns wins over the default"
+    (is (= :seller (ret/who-pays-return-shipping
+                    (policy :seller-pays-shipping-on #{:changed-mind})
+                    :changed-mind)))))
+
+;; ───────────────────────── lifecycle ─────────────────────────
+
+(deftest an-rma-starts-as-a-request-and-asserts-nothing
+  (let [x (r)]
+    (is (empty? (ret/rma-errors x)))
+    (is (= :requested (:rma/state x)))
+    (is (false? (:rma/adjudicated-by-actor? x)))))
+
+(deftest a-record-claiming-the-actor-adjudicated-is-refused
+  (is (some #(= :actor-adjudicated-return (:returns.error/code %))
+            (ret/rma-errors (assoc (r) :rma/adjudicated-by-actor? true)))))
+
+(deftest an-unknown-return-reason-is-refused
+  (is (some #(= :unknown-return-reason (:returns.error/code %))
+            (ret/rma-errors (r :reason :vibes)))))
+
+(deftest authorize-requires-eligibility
+  (let [x (r)]
+    (is (some? (ret/authorize x (elig) {:authorized-at "t"})))
+    (testing "an ineligible return must go through decline, which records a
+              reason the buyer can act on"
+      (is (nil? (ret/authorize x (elig :category :perishable) {:authorized-at "t"})))
+      (is (nil? (ret/authorize (assoc x :rma/state :authorized) (elig) {}))))))
+
+(deftest a-decline-is-traceable-to-a-published-rule
+  (let [d (ret/decline (r) (elig :now "2026-07-01T00:00:00Z") {:declined-at "t"})]
+    (is (= :declined (:rma/state d)))
+    (is (= [:outside-window] (:reasons (:rma/eligibility d))))))
+
+(deftest resolution-cannot-happen-before-somebody-looked
+  (testing ":inspected -> :resolved is the only way into :resolved"
+    (is (nil? (ret/advance (r) :resolved)))
+    (is (nil? (ret/advance (assoc (r) :rma/state :received) :resolved)))
+    (is (= :resolved (:rma/state (ret/advance (assoc (r) :rma/state :inspected)
+                                              :resolved))))))
+
+(deftest inspection-records-an-observation-not-a-verdict
+  (let [x (assoc (r) :rma/state :received)
+        i (ret/record-inspection x {:condition :used :inspected-by "wh-01"
+                                    :inspected-at "t"})]
+    (is (= :inspected (:rma/state i)))
+    (is (= :used (get-in i [:rma/inspection :inspection/condition])))
+    (is (true? (get-in i [:rma/inspection :inspection/observation-only])))
+    (testing "an unnamed inspector or an unknown condition records nothing"
+      (is (nil? (ret/record-inspection x {:condition :used :inspected-by ""})))
+      (is (nil? (ret/record-inspection x {:condition :vibes :inspected-by "wh-01"}))))))
+
+;; ───────────────────── resolution is a human's ─────────────────────
+
+(deftest resolving-requires-a-named-human
+  (let [x (assoc (r) :rma/state :inspected)]
+    (is (nil? (ret/resolve-return x {:outcome :refund-full :decided-by ""})))
+    (is (nil? (ret/resolve-return x {:outcome :vibes :decided-by "ops-01"})))
+    (is (nil? (ret/resolve-return (r) {:outcome :refund-full :decided-by "ops-01"}))
+        "not inspected yet")
+    (let [res (ret/resolve-return x {:outcome :refund-full :decided-by "ops-01"
+                                     :decided-at "t"})]
+      (is (= :resolved (:rma/state res)))
+      (is (true? (get-in res [:rma/resolution :resolution/human?]))))))
+
+(deftest condition-used-does-not-mechanically-mean-deny
+  (testing "encoding that it does would quietly turn an observation into a
+            verdict — there is deliberately no function that computes an
+            outcome from the inspection"
+    (is (not (contains? (set (map str (keys (ns-publics 'marketplace.returns))))
+                        "outcome-from-inspection")))))
+
+(deftest a-refund-instruction-is-a-record-never-an-execution
+  (let [x (-> (r) (assoc :rma/state :inspected)
+              (ret/resolve-return {:outcome :refund-full :decided-by "ops-01"}))
+        i (ret/refund-instruction x)]
+    (is (= 1200 (:refund/amount-minor i)))
+    (is (= "ops-01" (:refund/authorised-by i)))
+    (is (false? (:refund/executed? i)))))
+
+(deftest a-refund-larger-than-the-order-is-capped
+  (testing "catching it here is cheaper than catching it on a bank statement"
+    (let [x (-> (r) (assoc :rma/state :inspected)
+                (ret/resolve-return {:outcome :refund-partial :refund-minor 99999
+                                     :decided-by "ops-01"}))
+          i (ret/refund-instruction x)]
+      (is (= 1200 (:refund/amount-minor i)))
+      (is (true? (:refund/capped? i))))))
+
+(deftest a-denied-or-unresolved-rma-yields-no-refund-instruction
+  (is (nil? (ret/refund-instruction (r))))
+  (is (nil? (ret/refund-instruction
+             (-> (r) (assoc :rma/state :inspected)
+                 (ret/resolve-return {:outcome :deny :decided-by "ops-01"}))))))
+
+;; ───────────────────── the bridge back to disputes ─────────────────────
+
+(deftest a-declined-return-can-become-a-dispute
+  (testing "a buyer told 'policy says no' who disagrees now has a genuinely
+            contested claim, which is what the dispute path is for"
+    (let [d (ret/decline (r :reason :damaged) (elig :now "2026-07-01") {:declined-at "t"})]
+      (is (true? (ret/escalatable? d)))
+      (is (= :damaged (ret/->dispute-reason d)))
+      (is (contains? cb/dispute-reasons (ret/->dispute-reason d))))))
+
+(deftest changed-mind-has-no-dispute-counterpart
+  (testing "manufacturing one would let the dispute path be used to reopen
+            every policy decision"
+    (let [d (ret/decline (r :reason :changed-mind) (elig :now "2026-07-01")
+                         {:declined-at "t"})]
+      (is (false? (ret/escalatable? d)))
+      (is (nil? (ret/->dispute-reason d))))))
+
+(deftest an-undeclined-rma-is-not-escalatable
+  (is (nil? (ret/->dispute-reason (r))))
+  (is (false? (ret/escalatable? (r)))))
+
+(deftest every-mapped-reason-is-a-real-dispute-reason
+  (doseq [reason ret/return-reasons]
+    (let [d (ret/decline (r :reason reason) (elig :now "2026-07-01") {:declined-at "t"})
+          mapped (ret/->dispute-reason d)]
+      (is (or (nil? mapped) (contains? cb/dispute-reasons mapped))
+          (str reason " -> " mapped)))))

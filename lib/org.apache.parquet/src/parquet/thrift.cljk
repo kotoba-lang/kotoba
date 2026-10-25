@@ -1,0 +1,297 @@
+(ns parquet.thrift
+  "Thrift compact protocol decoder — the format Parquet's metadata is written in.
+
+  Parquet's footer is a Thrift `FileMetaData` struct in the *compact*
+  protocol, so nothing about a Parquet file is readable until this is. It is
+  its own namespace because it has nothing to do with columns: it is a
+  self-contained byte grammar, and keeping it separate is what lets it be
+  tested against byte sequences taken from the protocol spec rather than
+  against this repo's idea of a Parquet file.
+
+  Reads from a vector of unsigned ints. That is a portable representation
+  rather than a fast one — a typed array would avoid the boxing — and the
+  choice is stated here because the profile that reveals it would otherwise
+  arrive as a surprise. Every reader threads an explicit position, so the
+  decoder is pure."
+  (:refer-clojure :exclude [bytes])
+  (:require [kotoba.bytes :as kbytes]))
+
+(defn le-uint
+  "Unsigned little-endian integer of `n` bytes, EXACTLY or not at all.
+
+  The obvious spelling — `(+ acc (* byte (Math/pow 2 (* 8 k))))` — is wrong
+  for int64. 2^56 times a byte exceeds 2^53, so the top two bytes of a 64-bit
+  value land beyond double precision and the answer comes back quietly
+  rounded. It is quiet on the JVM too, because `Math/pow` returns a double
+  and the sum is a double before anything casts it back.
+
+  So: exact integer arithmetic on the JVM, and on ClojureScript — where
+  numbers ARE doubles — a value past `MAX_SAFE_INTEGER` is refused rather
+  than rounded. A reader that returns a plausible wrong number is worse than
+  one that says it cannot represent this value, because nothing downstream
+  can tell."
+  [bs i n]
+  #?(:clj  (loop [k 0 acc 0]
+             (if (= k n)
+               acc
+               (recur (inc k) (bit-or acc (bit-shift-left (long (nth bs (+ i k)))
+                                                          (* 8 k))))))
+     :cljs (let [acc (loop [k 0 acc 0]
+                       (if (= k n)
+                         acc
+                         (recur (inc k) (+ acc (* (nth bs (+ i k))
+                                                  (Math/pow 2 (* 8 k)))))))]
+             (if (> acc js/Number.MAX_SAFE_INTEGER)
+               (throw (ex-info "integer exceeds this runtime's exact range"
+                               {:type :parquet/precision-unavailable
+                                :bytes n :approx acc}))
+               acc))))
+
+;; type ids in a field header's low nibble
+(def ^:private t-stop 0)
+(def types
+  {0 :stop 1 :true 2 :false 3 :byte 4 :i16 5 :i32 6 :i64
+   7 :double 8 :binary 9 :list 10 :set 11 :map 12 :struct})
+
+(defn- u8 [bs i] (nth bs i))
+
+(defn read-varint
+  "ULEB128. -> [value next-index].
+
+  Bounded at 10 bytes: a varint longer than that cannot be a valid i64 and is
+  a corrupt or hostile file trying to make the reader loop."
+  [bs i]
+  (loop [i i shift 0 acc 0 n 0]
+    (when (> n 10)
+      (throw (ex-info "varint too long" {:type :parquet/malformed :at i})))
+    (let [b (u8 bs i)
+          acc (+ acc (* (bit-and b 0x7f) (Math/pow 2 shift)))]
+      (if (zero? (bit-and b 0x80))
+        [acc (inc i)]
+        (recur (inc i) (+ shift 7) acc (inc n))))))
+
+(defn zigzag
+  "Compact protocol encodes signed integers zigzag, so that small negatives
+  are small varints."
+  [n]
+  (let [n (long n)]
+    (if (zero? (bit-and n 1))
+      (quot n 2)
+      (- (- (quot n 2)) 1))))
+
+(defn read-i64 [bs i] (let [[v i'] (read-varint bs i)] [(zigzag v) i']))
+(def read-i32 read-i64)
+
+(defn read-double
+  "8 bytes, little-endian IEEE 754. Goes through the raw bit pattern rather
+  than `le-uint`, because a double's bits routinely exceed the exact integer
+  range that would refuse."
+  [bs i]
+  [#?(:clj (Double/longBitsToDouble
+            (loop [k 0 acc 0]
+              (if (= k 8)
+                acc
+                (recur (inc k) (bit-or acc (bit-shift-left (long (u8 bs (+ i k)))
+                                                           (* 8 k)))))))
+      :cljs (let [a (js/Uint8Array. 8)]
+              (dotimes [k 8] (aset a k (u8 bs (+ i k))))
+              (.getFloat64 (js/DataView. (.-buffer a)) 0 true)))
+   (+ i 8)])
+
+(defn read-binary
+  "varint length, then that many raw bytes. -> [byte-vector next-index]"
+  [bs i]
+  (let [[n i'] (read-varint bs i)
+        n (long n)]
+    [(subvec (vec bs) i' (+ i' n)) (+ i' n)]))
+
+(defn bytes->string
+  "UTF-8 decode. Parquet stores column names and BYTE_ARRAY statistics as raw
+  bytes, and a caller who wants the string has to say so — the same bytes are
+  a string in `path_in_schema` and an opaque value in a FIXED_LEN column."
+  [bv]
+  #?(:clj (kbytes/utf8-string (byte-array (mapv unchecked-byte bv)))
+     :cljs (.decode (js/TextDecoder. "utf-8") (js/Uint8Array. (clj->js (vec bv))))))
+
+(declare read-value skip-value)
+
+(defn- read-collection-header [bs i]
+  (let [b (u8 bs i)
+        size (bit-shift-right b 4)
+        etype (get types (bit-and b 0x0f))]
+    (if (= size 15)
+      (let [[n i'] (read-varint bs (inc i))] [(long n) etype i'])
+      [size etype (inc i)])))
+
+(defn read-list [bs i]
+  (let [[n etype i'] (read-collection-header bs i)]
+    (loop [k 0 i i' acc []]
+      (if (= k n)
+        [acc i]
+        (let [[v i''] (read-value bs i etype)]
+          (recur (inc k) i'' (conj acc v)))))))
+
+(defn read-struct
+  "-> [{field-id value} next-index]. Field ids rather than names: the names
+  live in `parquet.footer`, next to the meaning, so this namespace stays a
+  pure protocol decoder."
+  [bs i]
+  (loop [i i last-id 0 acc {}]
+    (let [b (u8 bs i)
+          tid (bit-and b 0x0f)]
+      (if (= tid t-stop)
+        [acc (inc i)]
+        (let [delta (bit-shift-right b 4)
+              [fid i'] (if (zero? delta)
+                         (let [[z i''] (read-varint bs (inc i))] [(zigzag z) i''])
+                         [(+ last-id delta) (inc i)])
+              ftype (get types tid)
+              [v i''] (read-value bs i' ftype)]
+          (recur i'' fid (assoc acc fid v)))))))
+
+(defn read-value [bs i type]
+  (case type
+    :true   [true i]
+    :false  [false i]
+    :byte   [(u8 bs i) (inc i)]
+    (:i16 :i32 :i64) (read-i64 bs i)
+    :double (read-double bs i)
+    :binary (read-binary bs i)
+    (:list :set) (read-list bs i)
+    :struct (read-struct bs i)
+    :map    (throw (ex-info "thrift map is not used by Parquet metadata"
+                            {:type :parquet/unsupported-thrift :at i}))
+    (throw (ex-info (str "unknown thrift type " (pr-str type))
+                    {:type :parquet/malformed :at i}))))
+
+(defn parse-struct
+  "Decode one compact-protocol struct starting at `i`."
+  [bs i]
+  (first (read-struct bs i)))
+
+(defn parse-struct-with-end [bs i] (read-struct bs i))
+
+;; ── encoding ────────────────────────────────────────────────────────────────
+;;
+;; The same grammar in the other direction. Kept here rather than in a writer
+;; namespace for the reason the reader is here: this is a protocol, not a
+;; Parquet concept, and one home for it means the field-header rules are
+;; written down once.
+;;
+;; Two things the compact protocol does that a naive encoder gets wrong:
+;;
+;; - **A field id is stored as a DELTA from the previous field**, in the high
+;;   nibble, and only when that delta is 1..15. Fields must therefore be
+;;   emitted in ascending id order, and a larger gap falls back to a zigzag
+;;   varint. Emitting them out of order produces a struct that decodes to
+;;   different field ids without failing.
+;; - **A boolean has no value bytes.** Its value lives in the field header's
+;;   type nibble (1 for true, 2 for false), so a bool written as "type 3 plus
+;;   a byte" desynchronises everything after it.
+
+(def ^:private type-ids
+  {:bool-true 1 :bool-false 2 :byte 3 :i16 4 :i32 5 :i64 6
+   :double 7 :binary 8 :list 9 :set 10 :map 11 :struct 12})
+
+(defn write-varint
+  "ULEB128, over an **unsigned** 64-bit value.
+
+  Unsigned matters: zigzag of a value at or above 2^62 sets the top bit, and a
+  loop that tests `(< v 0x80)` on a signed long then sees a negative number,
+  decides it fits in one byte, and emits it as one. The result decodes to
+  something small and plausible. Measured: 2^62+1 came back as 1. So the JVM
+  path shifts with `unsigned-bit-shift-right` and tests the high bits directly.
+
+  ClojureScript has no 64-bit integer, so a magnitude past `MAX_SAFE_INTEGER`
+  is refused rather than written rounded — the rule this repo applies in both
+  directions."
+  [v]
+  #?(:clj (loop [v (long v) acc []]
+            (if (zero? (bit-and v (bit-not 0x7f)))
+              (conj acc (bit-and v 0x7f))
+              (recur (unsigned-bit-shift-right v 7)
+                     (conj acc (bit-or 0x80 (bit-and v 0x7f))))))
+     :cljs (do
+             (when (> v js/Number.MAX_SAFE_INTEGER)
+               (throw (ex-info "integer exceeds this runtime's exact range"
+                               {:type :parquet/precision-unavailable :approx v})))
+             ;; `mod`, not `bit-and`: ClojureScript's bitwise ops coerce to
+             ;; int32, so `(bit-and v 0x7f)` silently truncates above 2^32.
+             (loop [v v acc []]
+               (if (< v 0x80)
+                 (conj acc v)
+                 (recur (js/Math.floor (/ v 128))
+                        (conj acc (bit-or 0x80 (mod v 128)))))))))
+
+(defn zigzag-encode
+  "The inverse of `zigzag`: signed → unsigned, small negatives staying small.
+
+  On the JVM the shift-left deliberately wraps — that IS the unsigned answer,
+  and `write-varint` consumes it as unsigned."
+  [n]
+  #?(:clj (let [n (long n)] (bit-xor (bit-shift-left n 1) (bit-shift-right n 63)))
+     :cljs (let [z (if (neg? n) (- (* 2 (- n)) 1) (* 2 n))]
+             (when (> z js/Number.MAX_SAFE_INTEGER)
+               (throw (ex-info "integer exceeds this runtime's exact range"
+                               {:type :parquet/precision-unavailable :approx n})))
+             z)))
+
+(defn double-bytes
+  "8 bytes, little-endian IEEE 754."
+  [v]
+  #?(:clj (let [b (Double/doubleToLongBits (double v))]
+            (mapv #(bit-and (unsigned-bit-shift-right b (* 8 %)) 0xff) (range 8)))
+     :cljs (let [buf (js/ArrayBuffer. 8)]
+             (.setFloat64 (js/DataView. buf) 0 v true)
+             (vec (js/Array.from (js/Uint8Array. buf))))))
+
+(defn string-bytes [s]
+  #?(:clj (mapv #(bit-and % 0xff) (kbytes/utf8-bytes ^String s))
+     :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s)))))
+
+(defn- value-bytes [type v]
+  (case type
+    (:i16 :i32 :i64) (write-varint (zigzag-encode v))
+    :byte [(bit-and v 0xff)]
+    :double (double-bytes v)
+    :binary (into (write-varint (count v)) v)
+    ;; Already-encoded bytes: a nested struct carries its own stop byte, and a
+    ;; list carries its own element header.
+    (:struct :list) (vec v)))
+
+(defn encode-list
+  "A list field's value: an element header, then the elements' encodings back
+  to back — elements are NOT field-tagged."
+  [elem-type items]
+  (let [n (count items)
+        tid (type-ids elem-type)
+        header (if (< n 15)
+                 [(bit-or (bit-shift-left n 4) tid)]
+                 (into [(bit-or 0xF0 tid)] (write-varint n)))]
+    (into header (mapcat #(value-bytes elem-type %)) items)))
+
+(defn encode-struct
+  "`fields` is an ordered seq of `[field-id type value]`, **ascending by id**.
+
+  A `nil` value omits the field, which is how an optional field is left to its
+  default rather than written explicitly."
+  [fields]
+  (let [fields (remove (fn [[_ _ v]] (nil? v)) fields)]
+    (conj
+     (vec (:out (reduce
+                 (fn [{:keys [last out]} [fid type v]]
+                   (when (<= fid last)
+                     (throw (ex-info "thrift fields must be emitted in ascending id order"
+                                     {:type :parquet/encoder-misuse :field fid :after last})))
+                   (let [tid (case type
+                               :bool (if v (type-ids :bool-true) (type-ids :bool-false))
+                               (type-ids type))
+                         delta (- fid last)
+                         header (if (<= 1 delta 15)
+                                  [(bit-or (bit-shift-left delta 4) tid)]
+                                  (into [tid] (write-varint (zigzag-encode fid))))
+                         body (if (= type :bool) [] (value-bytes type v))]
+                     {:last fid :out (into (into out header) body)}))
+                 {:last 0 :out []}
+                 fields)))
+     0)))                                   ; the struct stop byte

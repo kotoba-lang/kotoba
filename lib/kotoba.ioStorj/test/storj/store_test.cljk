@@ -1,0 +1,145 @@
+(ns storj.store-test
+  "The four functions, over a transport that records what it was asked.
+
+  No network: the point of `IHttp` being a seam is that the whole request can
+  be inspected without one. What is checked is that the S3 shape is translated
+  and not leaked — a 404 becomes nil rather than a status, a response becomes
+  bytes rather than a map, and the key carries its prefix."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [sigv4.crypto :as crypto]
+            [storj.core :as core]
+            [storj.protocols :as p]
+            [storj.store :as store]))
+
+(def ^:private config
+  {:bucket "acme" :access-key "AKIAIOSFODNN7EXAMPLE"
+   :secret-key "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"})
+
+(defn- recording
+  "An `IHttp` that answers with `responses` and remembers every request."
+  [responses]
+  (let [seen (atom [])]
+    {:seen seen
+     :http (reify p/IHttp
+             (-request [_ req]
+               (swap! seen conj req)
+               (let [r (first @responses)]
+                 (swap! responses rest)
+                 r)))}))
+
+(defn- fns-with [responses & [opts]]
+  (let [{:keys [seen http]} (recording (atom responses))
+        client (core/client config {:crypto (crypto/crypto) :http http})]
+    {:seen seen
+     :fns (store/store-fns client (merge {:now (constantly "20260730T000000Z")} opts))}))
+
+;; ── the shape that is translated ────────────────────────────────────────────
+
+(deftest a-get-comes-back-as-bytes
+  (let [{:keys [fns]} (fns-with [{:status 200 :headers {} :body [1 2 3]}])]
+    (is (= [1 2 3] ((:get-object fns) "obj-1")))))
+
+(deftest a-transport-body-is-converted-and-not-merely-passed-along
+  ;; The stub above hands back a vector, so it says nothing about the
+  ;; conversion: removing it entirely left every test here green. What a real
+  ;; transport returns is a host container, and on the JVM that container is
+  ;; signed — 0xC8 arrives as -56 and reaches a consumer as a negative number
+  ;; unless something converts it.
+  (let [body #?(:clj  (byte-array [7 8 -56])
+                :cljs (js/Uint8Array.from #js [7 8 200]))
+        {:keys [fns]} (fns-with [{:status 200 :headers {} :body body}])
+        got ((:get-object fns) "obj-1")]
+    (is (vector? got) "a consumer gets a vector, not the transport's container")
+    (is (= [7 8 200] got) "and the byte above 127 is unsigned")))
+
+(deftest a-missing-object-is-nil-and-not-a-status
+  ;; a consumer deciding whether its own records are wrong needs to tell a
+  ;; missing object from a failed request
+  (let [{:keys [fns]} (fns-with [{:status 404 :headers {} :body nil}])]
+    (is (nil? ((:get-object fns) "gone")))))
+
+(deftest an-empty-object-is-not-a-missing-one
+  ;; pulling :body before the 404 check would make these the same answer
+  (let [{:keys [fns]} (fns-with [{:status 200 :headers {} :body []}])
+        got ((:get-object fns) "empty")]
+    (is (= [] got))
+    (is (not (nil? got)) "which is a different answer from the 404 above")))
+
+(deftest a-failure-is-not-silently-a-miss
+  (let [{:keys [fns]} (fns-with [{:status 500 :headers {} :body nil}])]
+    (is (thrown? #?(:clj Exception :cljs js/Error) ((:get-object fns) "boom")))))
+
+(deftest exists-is-a-head-and-answers-a-boolean
+  (let [{:keys [seen fns]} (fns-with [{:status 200 :headers {} :body nil}
+                                      {:status 404 :headers {} :body nil}])]
+    (is (true? ((:exists? fns) "here")))
+    (is (false? ((:exists? fns) "gone")))
+    (is (= ["HEAD" "HEAD"] (mapv :method @seen)) "and never fetches the body")))
+
+(deftest a-delete-is-idempotent
+  ;; S3 returns 204 whether or not the key existed
+  (let [{:keys [fns]} (fns-with [{:status 204 :headers {} :body nil}
+                                 {:status 204 :headers {} :body nil}])]
+    (is (nil? (:body ((:delete-object fns) "x"))))
+    ((:delete-object fns) "x")))
+
+;; ── keys ────────────────────────────────────────────────────────────────────
+
+(deftest a-prefix-keeps-one-consumer-out-of-another
+  (let [{:keys [seen fns]} (fns-with [{:status 200 :headers {} :body [1]}]
+                                     {:prefix "drive/acme/"})]
+    ((:get-object fns) "obj-1")
+    (is (re-find #"/drive/acme/obj-1" (:url (first @seen))))))
+
+(deftest without-a-prefix-the-reference-is-the-key
+  (let [{:keys [seen fns]} (fns-with [{:status 200 :headers {} :body [1]}])]
+    ((:get-object fns) "obj-1")
+    (is (re-find #"/obj-1" (:url (first @seen))))))
+
+(deftest object-key-refuses-what-is-not-a-string
+  (is (= "p/x" (store/object-key "p/" "x")))
+  (is (= "x" (store/object-key nil "x")))
+  (is (= "x" (store/object-key "" "x")))
+  (doseq [bad [nil 42 :kw ["x"]]]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (store/object-key "p/" bad))
+        (pr-str bad))))
+
+;; ── the clock ───────────────────────────────────────────────────────────────
+
+(deftest a-clock-is-required
+  ;; the signer reads no clock on purpose so it can be tested against AWS's
+  ;; fixed vectors; defaulting to one here would undo that a layer up
+  (let [{:keys [http]} (recording (atom []))
+        client (core/client config {:crypto (crypto/crypto) :http http})]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (store/store-fns client {})))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (store/store-fns client {:now "20260730T000000Z"}))
+        "a string is not a clock — it would sign every request with one instant")))
+
+(deftest the-clock-is-read-per-request
+  (let [ticks (atom ["20260730T000000Z" "20260730T000100Z"])
+        {:keys [seen http]} (recording (atom [{:status 200 :headers {} :body [1]}
+                                              {:status 200 :headers {} :body [2]}]))
+        client (core/client config {:crypto (crypto/crypto) :http http})
+        fns (store/store-fns client {:now #(let [t (first @ticks)]
+                                             (swap! ticks rest) t)})]
+    ((:get-object fns) "a")
+    ((:get-object fns) "b")
+    (is (= 2 (count @seen)))
+    (is (not= (get-in (first @seen) [:headers "authorization"])
+              (get-in (second @seen) [:headers "authorization"]))
+        "two requests a minute apart are not signed identically")))
+
+;; ── content type ────────────────────────────────────────────────────────────
+
+(deftest bytes-by-reference-are-octet-stream
+  ;; a store addressed by reference does not know what the bytes are, and
+  ;; guessing from the key would be a guess
+  (let [{:keys [seen fns]} (fns-with [{:status 200 :headers {} :body nil}])]
+    ((:put-object fns) "obj-1" [1 2 3])
+    (is (= "application/octet-stream" (get-in (first @seen) [:headers "content-type"]))))
+  (testing "and a caller who knows better may say so"
+    (let [{:keys [seen fns]} (fns-with [{:status 200 :headers {} :body nil}]
+                                       {:content-type "image/png"})]
+      ((:put-object fns) "obj-1" [1 2 3])
+      (is (= "image/png" (get-in (first @seen) [:headers "content-type"]))))))

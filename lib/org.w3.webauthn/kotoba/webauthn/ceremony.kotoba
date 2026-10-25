@@ -1,0 +1,204 @@
+;; The WebAuthn relying-party ceremony checks, as a Kotoba application
+;; (ADR-2608261100) -- W3C WebAuthn Level 2, §7.1 steps 7-11, §7.2 steps
+;; 8-12, and §6.1.3.
+;;
+;;   client-data-problem (observed, expected) -> keyword  ; :none when bound
+;;   counter-problem     (stored, presented)  -> keyword
+;;   canonical-b64url?   (string)             -> bool
+;;
+;; ## The relying party's half of a ceremony is a decision
+;;
+;; `webauthn.core` says it plainly: COSE key parsing, CBOR attestation
+;; decoding and signature verification are host-injected, and what stays is
+;; "the relying-party-checkable parts". Those parts are comparisons between
+;; what the RP asked for and what came back. There is no key in any of them.
+;;
+;;   the guest owns   whether the returned clientData is bound to the
+;;                    ceremony this RP started, and whether the signature
+;;                    counter moved the way a genuine authenticator's does
+;;   the host owns    the JSON, the CBOR, the COSE key and the curve
+;;
+;; ## An absent expectation is not a satisfied one
+;;
+;; `verify-client-data` compares `(not= type expected-type)`. Called with an
+;; expectation map that names nothing, every comparison is `nil` against a
+;; value and the result is three mismatches -- which reads as a refusal, so
+;; that direction is safe. Called with clientData that has no `challenge`
+;; key, it THROWS, despite a docstring that says "Never throws": measured,
+;; `NullPointerException` out of `base64url-decode`.
+;;
+;; Here the two are separate answers. A missing field of the response is
+;; `:missing-*`; an expectation the RP did not supply is
+;; `:expectation-missing`, because a check that could not run must not
+;; return what a check that ran and passed returns.
+;;
+;; ## The challenge is compared as a canonical string, not as bytes
+;;
+;; `base64url-decode` reads an unknown character as zero in three of every
+;; four positions and throws in the fourth. Measured: `"A!AA"` and `"AAAA"`
+;; both decode to `[0 0 0]`, `"AA=AA="` decodes to `[0 0 0]` because `=` is
+;; stripped from anywhere rather than from the end, `"!AAA"` throws, and a
+;; trailing extra character yields a phantom zero byte. Several strings
+;; therefore name the same challenge, and one input class fails two
+;; different ways.
+;;
+;; So the challenge is required to be CANONICAL unpadded base64url and then
+;; compared as a string. That is strictly stronger than decoding and
+;; comparing -- it refuses the non-canonical spellings instead of accepting
+;; them as equal -- and it keeps bytes off the value plane entirely
+;; (ADR-2608039970). The RP generated the challenge; it can hold its own
+;; encoding of it.
+;;
+;; ## §7.2 step 9: crossOrigin
+;;
+;; `verify-client-data` does not look at it. Measured: clientData with
+;; `crossOrigin true` and everything else correct returns
+;; `{:valid? true :errors []}`. A ceremony driven from an iframe on another
+;; origin is a different event from one driven by the page the user is
+;; looking at, and an RP that has not said it accepts them should not.
+;;
+;; ## §6.1.3: a counter that goes to zero
+;;
+;; `verify-signature-counter` is `(or (zero? new) (> new previous))`. A
+;; counter of zero means the authenticator does not implement one -- which
+;; is a fact about the AUTHENTICATOR, so it is knowable from the value the
+;; RP stored, not from the value just presented. Reading it from the new
+;; value means a stored counter of 500 followed by a presented 0 passes.
+;; Measured: `(verify-signature-counter 500 0)` is `true`. That is exactly
+;; the cloned-authenticator signal §6.1.3 exists to raise, and the
+;; docstring names it -- "a same-or-lower NONZERO counter signals possible
+;; cloning" -- with the hole inside the sentence.
+;;
+;; `.cljc` stays the oracle for the options builders and the encoder, and
+;; is not required from here (require-graph). It did not grow a second copy
+;; of these checks (ADR-2608261100).
+
+(ns webauthn.ceremony
+  (:export [main client-data-problem counter-problem canonical-b64url?]))
+
+;; --- document accessors -------------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- blank? [s :string] :bool
+  (if (= (string-length s) 0) true false))
+
+(defn- same? [a :string b :string] :bool
+  (if (= (string-length a) (string-length b))
+    (if (string-contains? a b) true false)
+    false))
+
+;; --- canonical unpadded base64url (RFC 4648 §5) ---------------------------------
+
+(defn- b64-char? [c :i64] :bool
+  (if (>= c 65) (if (<= c 90) true                      ; A-Z
+                    (if (>= c 97) (if (<= c 122) true false) false))   ; a-z
+      (if (>= c 48) (if (<= c 57) true false)           ; 0-9
+          (if (= c 45) true                             ; '-'
+              (if (= c 95) true false)))))              ; '_'
+
+(defn- b64-chars? [s :string i :i64] :bool
+  (if (>= i (string-length s)) true
+      (if (b64-char? (string-code-point-at s i)) (b64-chars? s (+ i 1)) false)))
+
+(defn canonical-b64url? [s :string] :bool
+  (let [n (string-length s)]
+    (if (= n 0) false
+        ;; A quad of four characters carries three bytes; one leftover
+        ;; character carries none, so that length names no byte string.
+        ;; `=` is not in the alphabet, so padding is refused with it.
+        (if (= (- n (* 4 (quot n 4))) 1) false
+            (b64-chars? s 0)))))
+
+;; --- clientData (§7.1 steps 7-11, §7.2 steps 8-12) --------------------------------
+
+(defn client-data-problem [observed :document expected :document] :keyword
+  (let [typ (ds observed :type)
+        challenge (ds observed :challenge)
+        origin (ds observed :origin)
+        want-type (ds expected :type)
+        want-challenge (ds expected :challenge)
+        want-origin (ds expected :origin)]
+    (cond
+      ;; What the RP failed to say. Answered first and separately: a
+      ;; relying party that forgot to name its expected origin has a bug in
+      ;; the relying party, and hearing `:origin-mismatch` would send it
+      ;; looking at the authenticator.
+      (blank? want-type) :expectation-missing
+      (blank? want-challenge) :expectation-missing
+      (blank? want-origin) :expectation-missing
+
+      ;; What the response failed to carry. Distinct from a mismatch,
+      ;; because a field that is absent and a field that disagrees are
+      ;; different events -- and because the library throws here.
+      (blank? typ) :missing-type
+      (blank? challenge) :missing-challenge
+      (blank? origin) :missing-origin
+
+      (if (canonical-b64url? challenge) false true) :challenge-not-canonical
+
+      (if (same? typ want-type) false true) :type-mismatch
+      (if (same? challenge want-challenge) false true) :challenge-mismatch
+      (if (same? origin want-origin) false true) :origin-mismatch
+
+      ;; §7.2 step 9. `:accept-cross-origin?` is the RP saying it has
+      ;; thought about it; the default is that it has not.
+      (if (db observed :cross-origin?)
+        (if (db expected :accept-cross-origin?) false true)
+        false)
+      :cross-origin
+
+      :else :none)))
+
+;; --- the signature counter (§6.1.3) -------------------------------------------------
+
+(defn counter-problem [stored :i64 presented :i64] :keyword
+  (cond
+    (< stored 0) :no-stored-counter
+    (< presented 0) :no-presented-counter
+
+    ;; The authenticator does not implement a counter. That is a property of
+    ;; the authenticator, so it is read from what the RP stored -- and it
+    ;; only holds while BOTH are zero. Without this clause a genuine
+    ;; counterless authenticator would be reported as a clone on every
+    ;; assertion, since zero is not greater than zero.
+    (if (= stored 0) (if (= presented 0) true false) false) :none
+
+    ;; Everything else, INCLUDING a presented zero after a nonzero stored
+    ;; value, is a counter that did not advance. An explicit
+    ;; `(= presented 0) :possible-clone` clause stood here until the
+    ;; discrimination pass showed it could be broken without reddening any
+    ;; test: the rule below already covers it, so the clause decided
+    ;; nothing and only looked like it did.
+    (> presented stored) :none
+    :else :possible-clone))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the counter finding and the canonical-encoding refusal back through
+;; the decisions above and answers 0 only when each still decides the way
+;; this object was built to decide, so a COMPILED artifact can be asked
+;; whether it is itself by a host that knows nothing about WebAuthn.
+;;
+;; Three, and short, because `main` is bounded from two sides: a module's
+;; fuel is a private global baked in at compile time (512 by default) and is
+;; spent over the life of an INSTANCE, so these calls share one budget; and
+;; the native backends evaluate `main` as a compile-time oracle with a
+;; budget of their own. The wider check lives in the suite, which has
+;; neither limit.
+
+(defn main [] :i64
+  (cond
+    (if (= (counter-problem 500 0) :possible-clone) false true) 1
+    (if (= (counter-problem 0 0) :none) false true) 2
+    (if (canonical-b64url? "A!AA") true false) 3
+    :else 0))

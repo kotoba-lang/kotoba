@@ -1,0 +1,221 @@
+(ns route-scaling
+  "Does the routing dictionary remove the fan-out term? A/B, same corpus.
+
+    kbb --backend sci --classpath src \\
+      bench/route_scaling.cljk [out.edn]
+
+  `get_scaling.cljs` measured the v1 read path and found the ceiling: growing
+  the shard count 1 -> 32 multiplied GETs per query by 12.2x while per-shard
+  cost stayed flat. Every shard is asked every term, so the client pays a term
+  linear in the shard count, and that is what put the honest reach of the
+  design at 10^9-10^10 pages (ADR-2608071500).
+
+  This runs the SAME corpora and the SAME queries through both read paths on
+  ONE index, so the difference is the read path and nothing else:
+
+  - `query/search`  — v1: descend every shard's dictionary for every term
+  - `route/search`  — descend one routing dictionary once, then open shards
+                      best-first and stop opening when the bound says the rest
+                      cannot matter
+
+  Both are checked against `query/top-k-exhaustive` on every query. A GET
+  reduction that changed an answer is not a reduction, and the point of
+  measuring the oracle here rather than only in the test suite is that the
+  bench runs at sizes the suite does not."
+  (:require [kotobase-shard-index.block :as block]
+            [kotobase-shard-index.build :as build]
+            [kotobase-shard-index.codec :as codec]
+            [kotobase-shard-index.node :as node]
+            [kotobase-shard-index.query :as query]
+            [kotobase-shard-index.route :as route]
+            [kotobase-shard-index.synth :as synth]))
+
+(def sizes [1000 4000 16000 64000])
+(def vocab-size 20000)
+(def k 10)
+
+;; The oracle reads EVERY posting chunk, so at 64,000 documents it costs more
+;; than the rest of this bench combined. Exactness is carried by the test
+;; suite, which checks it on four configurations plus a clustered corpus and
+;; asserts that the bound is actually exercised; here it is a second check at
+;; sizes the suite does not reach. The cut-off is recorded in the receipt
+;; rather than left implicit — a bench that silently stops verifying is worse
+;; than one that never did.
+(def oracle-max-docs 16000)
+
+(defn- mean [xs] (if (empty? xs) 0 (/ (reduce + 0 xs) (count xs))))
+(defn- r2 [x] (/ (js/Math.round (* 100 x)) 100))
+
+(defn- score-vec [r] (mapv :score (:hits r)))
+
+(defn probe
+  "One corpus, both read paths. `docs-fn` and `queries` let the caller supply
+  a topical corpus instead of the uniform one — the two shapes reduce fan-out
+  by different mechanisms and averaging them would hide both."
+  [n shard-count docs queries]
+  (let [store (block/memory-store)
+        {:keys [manifest-cid]} (build/build! store node/sha256-hex docs
+                                             {:shard-count shard-count})
+        [counted tally] (block/counting store)
+        check-oracle? (<= n oracle-max-docs)
+        runs (mapv (fn [q]
+                     (block/reset-tally! tally)
+                     (let [v1 (query/search counted manifest-cid q {:k k})
+                           v1-gets (:gets @tally)]
+                       (block/reset-tally! tally)
+                       (let [rt (route/search counted manifest-cid q {:k k})
+                             rt-gets (:gets @tally)
+                             oracle (when check-oracle?
+                                      (query/top-k-exhaustive store manifest-cid q {:k k}))]
+                         {:q q
+                          :v1-gets v1-gets :route-gets rt-gets
+                          :v1-waves (get-in v1 [:stats :waves])
+                          :route-waves (get-in rt [:stats :waves])
+                          :shards-total (get-in rt [:stats :shards-total])
+                          :shards-considered (get-in rt [:stats :shards-considered])
+                          :shards-opened (get-in rt [:stats :shards-opened])
+                          :shards-pruned (get-in rt [:stats :shards-pruned])
+                          :shards-absent (get-in rt [:stats :shards-absent])
+                          :proof (get-in rt [:stats :proof])
+                          :agrees-v1 (= (score-vec v1) (score-vec rt))
+                          :agrees-oracle (when oracle
+                                           (= (mapv :score (:hits oracle)) (score-vec rt)))})))
+                   queries)]
+    {:docs n
+     :shards shard-count
+     :index-blocks (block/block-count store)
+     :index-bytes (block/total-bytes store)
+     :mean-v1-gets (r2 (mean (map :v1-gets runs)))
+     :mean-route-gets (r2 (mean (map :route-gets runs)))
+     :ratio (r2 (/ (mean (map :route-gets runs)) (max 1 (mean (map :v1-gets runs)))))
+     :max-v1-waves (apply max (map :v1-waves runs))
+     :max-route-waves (apply max (map :route-waves runs))
+     :mean-shards-opened (r2 (mean (map :shards-opened runs)))
+     :mean-shards-pruned (r2 (mean (map :shards-pruned runs)))
+     :mean-shards-absent (r2 (mean (map :shards-absent runs)))
+     :oracle-checked check-oracle?
+     :all-agree-oracle (if check-oracle? (every? :agrees-oracle runs) :not-checked)
+     :all-agree-v1 (every? :agrees-v1 runs)
+     :queries runs}))
+
+(defn uniform [n shard-count]
+  (probe n shard-count
+         (synth/corpus n 12345 vocab-size)
+         (synth/probe-queries vocab-size)))
+
+(defn batch-sweep
+  "The GETs-versus-waves dial, on the corpus where it matters most.
+
+  Opening one shard per wave minimises GETs (each shard is judged against a
+  k-th score that has already risen) and maximises sequential depth. Both are
+  reported because picking either one alone is a sales pitch: GETs are what
+  the object store bills, waves are what the user waits for."
+  [n shard-count]
+  (let [docs (synth/corpus n 12345 vocab-size)
+        queries (synth/probe-queries vocab-size)
+        store (block/memory-store)
+        {:keys [manifest-cid]} (build/build! store node/sha256-hex docs
+                                             {:shard-count shard-count})
+        [counted tally] (block/counting store)]
+    {:docs n :shards shard-count
+     :rows (mapv (fn [sb]
+                   (let [rs (mapv (fn [q]
+                                    (block/reset-tally! tally)
+                                    (let [r (route/search counted manifest-cid q
+                                                          {:k k :shard-batch sb})]
+                                      {:gets (:gets @tally)
+                                       :waves (get-in r [:stats :waves])
+                                       :scores (mapv :score (:hits r))}))
+                                  queries)]
+                     {:shard-batch sb
+                      :mean-gets (r2 (mean (map :gets rs)))
+                      :max-waves (apply max (map :waves rs))
+                      :scores (mapv :scores rs)}))
+                 [1 2 4 8 16 32])}))
+
+(defn clustered
+  "A crawl grouped by host: one topical cluster per shard."
+  [n shard-count]
+  (probe n shard-count
+         (synth/clustered-corpus n 91 shard-count vocab-size 0.3)
+         (synth/cluster-queries shard-count vocab-size 0.3)))
+
+(defn- index-size-ab
+  "What the routing dictionary costs in blocks and bytes, built both ways."
+  [n shard-count]
+  (let [docs (synth/corpus n 12345 vocab-size)
+        with (block/memory-store)
+        without (block/memory-store)]
+    (build/build! with node/sha256-hex docs {:shard-count shard-count})
+    (build/build! without node/sha256-hex docs {:shard-count shard-count :route? false})
+    {:docs n :shards shard-count
+     :blocks-without (block/block-count without)
+     :blocks-with (block/block-count with)
+     :block-growth (r2 (/ (block/block-count with) (block/block-count without)))
+     :bytes-without (block/total-bytes without)
+     :bytes-with (block/total-bytes with)
+     :byte-growth (r2 (/ (block/total-bytes with) (block/total-bytes without)))}))
+
+(defn- row [r]
+  (str "  " (:docs r) "\t" (:shards r) "\t| " (:mean-v1-gets r) "\t  " (:mean-route-gets r)
+       "\t  " (:ratio r)
+       "\t| " (:mean-shards-absent r) "/" (:mean-shards-pruned r) "/" (:mean-shards-opened r)
+       "\t| " (:max-v1-waves r) " -> " (:max-route-waves r)))
+
+(defn -main [& args]
+  (let [out (or (first args)
+                "bench/results/2026-08-08-route-scaling.edn")
+        ;; the regime that exposed the ceiling: shard count grows with corpus
+        scaled (mapv (fn [n] (uniform n (max 1 (quot n 2000)))) sizes)
+        ;; the control: shard count fixed, so there is no fan-out term to remove
+        fixed (mapv (fn [n] (uniform n 8)) [1000 4000 16000])
+        ;; the shape a real crawl has
+        topical (mapv (fn [n] (clustered n (max 2 (quot n 2000)))) [4000 16000 64000])
+        cost (mapv (fn [n] (index-size-ab n (max 1 (quot n 2000)))) [1000 16000])
+        sweep (batch-sweep 64000 32)
+        oracle-ok (fn [rs] (every? #(not= false (:all-agree-oracle %)) rs))
+        result {:generated "2026-08-08"
+                :batch-sweep sweep
+                :batch-sweep-answers-identical
+                (apply = (map :scores (:rows sweep)))
+                :what "A/B of the v1 read path against the routing read path on one index"
+                :vocab vocab-size :k k
+                :oracle-checked-up-to oracle-max-docs
+                :scaled-shards scaled
+                :fixed-shards fixed
+                :clustered topical
+                :index-cost cost
+                :exact (and (oracle-ok scaled) (oracle-ok fixed) (oracle-ok topical))}
+        legend "  docs\tshards\t| v1 GETs  route GETs  ratio\t| absent/pruned/opened\t| waves v1->route"]
+    (println "\n:scaled-shards — uniform corpus, the regime the ceiling was measured in")
+    (println legend)
+    (doseq [r scaled] (println (row r)))
+    (println "\n:fixed-shards — uniform corpus, 8 shards (control: no fan-out term to remove)")
+    (println legend)
+    (doseq [r fixed] (println (row r)))
+    (println "\n:clustered — a crawl grouped by host, one topic per shard")
+    (println legend)
+    (doseq [r topical] (println (row r)))
+    (println (str "\nshard-batch sweep — GETs vs waves, uniform "
+                  (:docs sweep) " docs / " (:shards sweep) " shards"))
+    (println "  batch\tGETs\twaves")
+    (doseq [r (:rows sweep)]
+      (println (str "  " (:shard-batch r) "\t" (:mean-gets r) "\t" (:max-waves r))))
+    (println (str "  answers identical across every batch size: "
+                  (:batch-sweep-answers-identical result)))
+    (println "\nindex cost of the routing dictionary")
+    (doseq [c cost]
+      (println (str "  " (:docs c) "\t" (:shards c) "      | blocks x" (:block-growth c)
+                    "  bytes x" (:byte-growth c))))
+    (println (str "\nexact against the oracle (checked up to " oracle-max-docs
+                  " docs): " (:exact result)))
+    (let [fs (js/require "node:fs")
+          path (js/require "node:path")]
+      (.mkdirSync fs (.dirname path out) #js {:recursive true})
+      (.writeFileSync fs out (codec/encode result) "utf8"))
+    (println "receipt ->" out)
+    (when-not (:exact result)
+      (println "EXACTNESS FAILED")
+      (js/process.exit 1))))
+
+(-main)

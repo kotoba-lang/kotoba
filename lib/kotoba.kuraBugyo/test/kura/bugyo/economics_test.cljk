@@ -1,0 +1,248 @@
+(ns kura.bugyo.economics-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kura.bugyo.collateral :as coll]
+            [kura.bugyo.epoch :as epoch]
+            [kura.bugyo.pricing :as pricing]))
+
+(def rates (pricing/rates {}))
+(def pol (coll/policy {}))
+(def launch pricing/launch-layout)
+(def target pricing/target-layout)
+
+(defn- toy-hash [s] (str "h" (Math/abs (hash (str s)))))
+
+;; --- pricing ---------------------------------------------------------------
+
+(deftest launch-and-target-layouts-are-what-the-adr-resolved
+  (is (= {:k 16 :r 4 :g 12 :l 4 :n 32} (select-keys launch [:k :r :g :l :n])))
+  (is (= 2.0 (pricing/multiplier launch)) "launch is conservative on purpose")
+  (is (= 1.625 (pricing/multiplier target)) "target is the exhaustively verified one"))
+
+(deftest customer-pays-logical-nodes-are-paid-physical
+  (testing "the identity that makes the erasure code a business decision"
+    (let [q (pricing/quote-monthly rates launch {:logical-tb 100})]
+      (is (= 100 (:logical-tb q)))
+      (is (= 200.0 (:physical-tb q)) "2.0x is the coordinator's cost of goods")
+      (let [node-side (* 200.0 1.50)]
+        (is (> (:storage-usd q) node-side) "price covers COGS")
+        (is (< (:storage-usd q) (* 2.0 node-side)) "and is not a 2x markup")))))
+
+(deftest egress-is-not-multiplied-by-the-code
+  (testing "a systematic read reconstructs nothing, so serving one logical TB
+            moves one physical TB — charging egress at the storage multiplier
+            would bill for work the network does not do"
+    (let [a (pricing/quote-monthly rates launch {:logical-tb 0 :egress-tb 10})
+          b (pricing/quote-monthly rates target {:logical-tb 0 :egress-tb 10})]
+      (is (= (:egress-usd a) (:egress-usd b))
+          "egress price is identical under both layouts"))))
+
+(deftest tightening-the-code-is-a-price-cut
+  (let [d (pricing/tightening-dividend rates launch target)]
+    (is (= 2.0 (:from-multiplier d)))
+    (is (= 1.625 (:to-multiplier d)))
+    (is (< 0.18 (:reduction-fraction d) 0.19)
+        (str "19% off, as the multiplier ratio implies: got "
+             (:reduction-fraction d)))
+    (is (pos? (:reduction-usd d)))))
+
+(deftest rates-are-parameters-with-stated-provenance
+  (testing "no rate claims to be OBSERVED on our own network — that is what
+            Phase 0 is for — and anything claiming to be benchmarked cites
+            where it was read from"
+    (is (every? #(contains? #{:modelled :chosen :benchmarked} (:provenance %))
+                (vals pricing/default-rates)))
+    (is (not-any? #(= :observed (:provenance %)) (vals pricing/default-rates))
+        "nothing may claim to be measured on kura until kura has measured it")
+    (is (every? #(seq (:source %))
+                (filter #(= :benchmarked (:provenance %)) (vals pricing/default-rates)))
+        "a benchmarked rate without a source is a guess wearing a better label")
+    (let [r (pricing/rates {:node-storage-usd-tb-month 0.90})]
+      (is (= 0.90 (get-in r [:node-storage-usd-tb-month :value])))
+      (is (= :supplied (get-in r [:node-storage-usd-tb-month :provenance])))
+      (is (< (pricing/storage-price-usd-tb-month r launch)
+             (pricing/storage-price-usd-tb-month rates launch))))))
+
+;; --- collateral ------------------------------------------------------------
+
+(deftest the-storj-comparison-is-honest-about-where-the-difference-comes-from
+  (testing "kura is cheaper at a LOWER margin, because the difference is the
+            storage multiplier — not an undercut of node operators, who are
+            paid the same rate either way"
+    (let [c (pricing/versus-storj rates launch)]
+      (is (= 1.50 (:node-storage-usd-tb-month pricing/storj-reference))
+          "same node storage rate as Storj publishes")
+      (is (= 2.00 (:node-egress-usd-tb pricing/storj-reference))
+          "same node egress rate")
+      (is (< 0.30 (:cheaper-fraction c) 0.40) "~34% cheaper at launch")
+      (is (< (:kura-margin c) (:storj-margin c))
+          "and on a thinner margin, so the saving is not margin-shaving")
+      (is (< (:kura-cogs-usd c) (:storj-cogs-usd c))
+          "the whole difference is cost of goods, i.e. the multiplier"))
+    (let [t (pricing/versus-storj rates target)]
+      (is (< 0.44 (:cheaper-fraction t) 0.48) "~46% cheaper at target"))))
+
+(deftest the-repair-bill-is-the-binding-anchor
+  (testing "a strong audit makes deterrence cheap — a node that deletes
+            everything is caught in about one epoch and gains one epoch of
+            storage cost — but the network still has to rebuild what it held,
+            and that is the larger number"
+    (let [b (coll/bond-required-usd rates pol launch 10.0)]
+      (is (= :repair (:binding-anchor b)))
+      (is (> (:repair-anchor-usd b) (:deterrence-anchor-usd b)))
+      (is (pos? (:bond-usd b))))))
+
+(deftest bond-scales-with-the-mess-a-node-can-make
+  (let [small (coll/bond-required-usd rates pol launch 1.0)
+        big (coll/bond-required-usd rates pol launch 100.0)]
+    (is (< (:bond-usd small) (:bond-usd big)))
+    (is (< (* 50 (:bond-usd-per-tb big)) (* 100 (:bond-usd-per-tb big)))
+        "per-TB is roughly flat above the minimum")
+    (is (= (:minimum-bond-usd pol) (:bond-usd (coll/bond-required-usd rates pol launch 0.01)))
+        "a trivially small node still has something to lose")))
+
+(deftest a-permissionless-network-must-not-price-out-its-operators
+  (testing "the bond is COLLATERAL, returned on clean exit — so what an
+            operator gives up is the return on locked capital, not the
+            capital. Deciding on payback-epochs would have had us cutting the
+            safety factor to fix a problem that is not there."
+    (let [payback (coll/payback-epochs rates pol launch 50.0)
+          cc (coll/capital-cost rates pol launch 50.0)]
+      (is (< 4.0 payback 6.0)
+          (str "payback looks prohibitive at " payback " epochs..."))
+      (is (< (:drag-fraction cc) 0.06)
+          (str "...but the actual drag is " (* 100 (:drag-fraction cc))
+               "% of revenue at 10% APY, which is a rounding error on a
+                hardware business"))
+      (is (pos? (:annual-carry-usd cc))))))
+
+(deftest slashing-is-graduated-and-reports-under-bonding
+  (let [required 300.0]
+    (testing "a missed challenge may be a partition, not a defection"
+      (is (zero? (:deducted-usd (coll/slash {:bond-usd 1000.0 :required-usd required}
+                                            :audit-miss)))))
+    (testing "confirmed data loss takes the lot"
+      (let [r (coll/slash {:bond-usd 1000.0 :required-usd required} :data-loss-confirmed)]
+        (is (= 1000.0 (:deducted-usd r)))
+        (is (= :forfeited (:status r)))))
+    (testing "a bond slashed below requirement is not silently left operating"
+      (let [r (coll/slash {:bond-usd 320.0 :required-usd required} :audit-fail-repeated)]
+        (is (= :under-bonded (:status r)))
+        (is (pos? (:remaining-usd r)))))))
+
+(deftest onboarding-quote-answers-should-i-not-can-i
+  (let [q (coll/onboarding-quote rates pol launch 20.0)]
+    (is (every? q [:bond-usd :epoch-earnings-usd :payback-epochs
+                   :audit-challenges-per-epoch :slash-schedule :tolerated-losses]))
+    (is (= 688 (:audit-challenges-per-epoch q)))
+    (is (= 13 (:tolerated-losses q)) "the Gopalan bound for the launch layout")))
+
+;; --- epoch settlement ------------------------------------------------------
+
+(def nodes
+  [{:node-id "n-a" :physical-tb 10.0 :served-tb 2.0 :bond-usd 500.0}
+   {:node-id "n-b" :physical-tb 5.0 :bond-usd 400.0}
+   {:node-id "n-c" :physical-tb 20.0 :served-tb 1.0 :bond-usd 900.0
+    :findings [:audit-fail]}])
+
+(deftest a-settlement-commits-to-its-own-total
+  (let [s (epoch/close toy-hash rates pol launch "2026-07" nodes)]
+    (is (= 3 (:nodes s)))
+    (is (= (reduce + 0 (map :net-micros (:entries s))) (:total-micros s))
+        "the root's sum IS the total owed")
+    (is (pos? (:total-usd s)))))
+
+(deftest every-node-can-prove-its-share
+  (let [s (epoch/close toy-hash rates pol launch "2026-07" nodes)]
+    (doseq [{:keys [node-id]} (:entries s)]
+      (let [c (epoch/claim s node-id)]
+        (is (some? c))
+        (is (epoch/verify-claim toy-hash c) (str node-id " verifies against the root"))))))
+
+(deftest a-forged-claim-does-not-verify
+  (let [s (epoch/close toy-hash rates pol launch "2026-07" nodes)
+        c (epoch/claim s "n-a")]
+    (is (false? (epoch/verify-claim toy-hash (update c :net-micros + 1000000))))
+    (is (false? (epoch/verify-claim toy-hash (assoc c :node-id "n-z"))))))
+
+(deftest slashing-happens-before-the-tree-not-after
+  (testing "a deduction applied afterwards would make the published root
+            disagree with what was paid, and the root is the only checkable
+            thing there is"
+    (let [s (epoch/close toy-hash rates pol launch "2026-07" nodes)
+          c (first (filter #(= "n-c" (:node-id %)) (:entries s)))]
+      (is (pos? (:withheld-usd c)) "the audit-fail node was docked")
+      (is (< (:net-usd c) (:gross-usd c)))
+      (is (epoch/verify-claim toy-hash (epoch/claim s "n-c"))
+          "and the docked amount is what the root commits to"))))
+
+(deftest a-slashed-epoch-does-not-still-pay-out
+  (testing "deducting from the bond alone would let a node profit from an
+            epoch it was caught cheating in, which is not a penalty"
+    (let [heavy (epoch/close toy-hash rates pol launch "2026-07"
+                             [{:node-id "n-x" :physical-tb 10.0 :bond-usd 1000.0
+                               :findings [:data-loss-confirmed]}])
+          e (first (:entries heavy))]
+      (is (zero? (:net-usd e)) "earnings are withheld up to the deduction")
+      (is (= :forfeited (:bond-status e))))))
+
+(deftest under-bonded-nodes-are-named-in-the-settlement
+  (let [s (epoch/close toy-hash rates pol launch "2026-07"
+                       [{:node-id "n-thin" :physical-tb 50.0 :bond-usd 60.0}])]
+    (is (contains? (:under-bonded s) "n-thin"))))
+
+(deftest reconcile-catches-a-payout-edited-after-commitment
+  (let [s (epoch/close toy-hash rates pol launch "2026-07" nodes)]
+    (is (:consistent? (epoch/reconcile toy-hash s)))
+    (let [tampered (update s :entries
+                           (fn [es] (mapv #(if (= "n-a" (:node-id %))
+                                             (update % :net-micros + 5000000)
+                                             %)
+                                          es)))
+          r (epoch/reconcile toy-hash tampered)]
+      (is (false? (:consistent? r)))
+      (is (contains? (:unverifiable r) "n-a")))))
+
+(deftest treasury-instruction-is-data-not-a-wallet-call
+  (let [s (epoch/close toy-hash rates pol launch "2026-07" nodes)
+        t (epoch/treasury-instruction s)]
+    (is (= :usdc (:currency t)))
+    (is (= :base (:chain t)))
+    (is (= (:total-micros s) (:committed-total-micros t)))
+    (is (= 3 (count (:payees t))))
+    (is (= (get-in s [:root :hash]) (:publish-root t)))))
+
+;; --- declared absence is not slashable -------------------------------------
+
+(deftest a-node-is-not-fined-for-the-absence-it-declared
+  (let [bond {:bond-usd 100.0 :required-usd 50.0}]
+    (testing "an always-on node that vanishes past grace pays — it promised to
+              be there"
+      (let [r (coll/slash (assoc bond :availability :always-on)
+                          :unavailable-beyond-grace)]
+        (is (= 0.10 (:fraction r)))
+        (is (= 10.0 (:deducted-usd r)))
+        (is (false? (:waived-as-declared-absence? r)))))
+    (testing "an intermittent node does not — placement already priced the
+              absence by putting fewer shards there, and charging the bond too
+              counts the same fact twice"
+      (let [r (coll/slash (assoc bond :availability :intermittent)
+                          :unavailable-beyond-grace)]
+        (is (zero? (:fraction r)))
+        (is (zero? (:deducted-usd r)))
+        (is (true? (:waived-as-declared-absence? r)))
+        (is (= :bonded (:status r)) "and it stays in good standing")))
+    (testing "but losing data is slashable at full weight whatever it declared —
+              being asleep and being empty are different claims"
+      (let [r (coll/slash (assoc bond :availability :intermittent)
+                          :data-loss-confirmed)]
+        (is (= 1.0 (:fraction r)))
+        (is (= :forfeited (:status r)))
+        (is (false? (:waived-as-declared-absence? r)))))
+    (testing "and returning wrong bytes is still slashable — a sleeping node
+              cannot excuse a corrupt one"
+      (is (= 0.05 (:fraction (coll/slash (assoc bond :availability :intermittent)
+                                         :audit-fail)))))
+    (testing "the waiver is exactly one finding wide, so it cannot be leaned on"
+      (is (false? (:waived-as-declared-absence?
+                   (coll/slash (assoc bond :availability :intermittent)
+                               :audit-fail-repeated)))))))

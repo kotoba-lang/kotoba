@@ -1,0 +1,510 @@
+(ns ospf.core-test
+  "Round-trip and negative-path tests for the OSPFv2 wire codec.
+
+  Vectors cited to a section/appendix number are RFC 2328 or RFC 1071
+  text, quoted or transcribed verbatim in the namespace docstring next to
+  the code that uses them. Vectors marked `;; constructed, not a
+  published spec vector` are hand-built here — the RFCs describe the
+  fixed-layout header, five packet bodies and the LSA header in prose and
+  ASCII diagrams, not with worked full-packet byte dumps the way the
+  Modbus Application Protocol Specification's §6 does, so most framing
+  vectors in this suite are constructed against the diagrams rather than
+  lifted from a published byte dump. What *is* a published worked
+  example — because RFC 1071 §3 gives one — is the checksum test below,
+  and it is cited exactly."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ospf.bytes :as b]
+            [ospf.checksum :as checksum]
+            [ospf.dd :as dd]
+            [ospf.header :as header]
+            [ospf.hello :as hello]
+            [ospf.lsa :as lsa]
+            [ospf.lsack :as lsack]
+            [ospf.lsr :as lsr]
+            [ospf.lsu :as lsu]
+            [ospf.packet :as packet]))
+
+;; ── ospf.bytes ───────────────────────────────────────────────────────────────
+
+(deftest byte-packing-round-trips
+  (testing "u16"
+    (doseq [n [0 1 255 256 0xABCD 0xFFFF]]
+      (let [[hi lo] (b/u16->bytes n)]
+        (is (= n (b/bytes->u16 hi lo)) n))))
+  (testing "u32, including values whose top byte has the sign bit set —
+            the exact case ospf.bytes's own docstring says bit-shift-left
+            gets wrong on ClojureScript"
+    (doseq [n [0 1 255 65536 0x7FFFFFFF 0x80000000 0xC0000001 0xFFFFFFFF]]
+      (let [[b3 b2 b1 b0] (b/u32->bytes n)]
+        (is (= n (b/bytes->u32 b3 b2 b1 b0)) n))))
+  (testing "i32, the full signed range including OSPF's own named constants"
+    (doseq [n [0 1 -1 2147483647 -2147483648
+               -2147483647   ;; InitialSequenceNumber, 0x80000001 signed — RFC 2328 §12.1.6
+               2147483647]]  ;; MaxSequenceNumber, 0x7fffffff — RFC 2328 §12.1.6 / Appendix B
+      (let [[b3 b2 b1 b0] (b/i32->bytes n)]
+        (is (= n (b/bytes->i32 b3 b2 b1 b0)) n))))
+  (testing "InitialSequenceNumber's wire bytes are exactly 0x80000001 — RFC 2328 §12.1.6"
+    (is (= [0x80 0x00 0x00 0x01] (b/i32->bytes -2147483647))))
+  (testing "MaxSequenceNumber's wire bytes are exactly 0x7fffffff — RFC 2328 Appendix B"
+    (is (= [0x7F 0xFF 0xFF 0xFF] (b/i32->bytes 2147483647)))))
+
+;; ── ospf.checksum — RFC 1071 §2 / §3 / §4.1 ────────────────────────────────
+
+(deftest rfc1071-worked-example
+  ;; RFC 1071 §3, "Numerical Examples", the byte-by-byte / "Normal Order"
+  ;; table for the 8 bytes 00 01 f2 03 f4 f5 f6 f7:
+  ;;   Byte 0/1: 0001   Byte 2/3: f203   Byte 4/5: f4f5   Byte 6/7: f6f7
+  ;;   Sum1: 2ddf0 (carries 2) -> Sum2/Final Swap: ddf2
+  ;; ddf2 is the one's-complement *sum*, i.e. ospf.checksum/ones-complement-sum's
+  ;; return value — the RFC's example stops there and doesn't also print the
+  ;; final complement, so the checksum field value (0xFFFF - 0xddf2 = 0x220d)
+  ;; is derived here, not itself quoted from the text.
+  (let [bs [0x00 0x01 0xf2 0x03 0xf4 0xf5 0xf6 0xf7]]
+    (is (= 0xddf2 (checksum/ones-complement-sum bs)))
+    (is (= 0xddf2 (checksum/ones-complement-sum-fast bs)))
+    (is (= 0x220d (checksum/checksum bs)))
+    (testing "appending the checksum field makes the buffer verify"
+      (is (checksum/valid? (into bs (checksum/checksum-bytes bs)))))))
+
+(deftest rfc1071-odd-length-padding
+  ;; RFC 1071 §2: "If necessary, the last data octet is padded on the
+  ;; right with zeros to form a 16 bit word for checksum purposes." An
+  ;; odd-length buffer must therefore sum identically to the same buffer
+  ;; with one zero byte appended.
+  (doseq [bs [[0x01] [0x01 0x02 0x03] [0xFF 0xFF 0xFF 0xFF 0xFF]]]
+    (is (= (checksum/ones-complement-sum bs)
+           (checksum/ones-complement-sum (conj (vec bs) 0)))
+        bs)))
+
+(defn- rand-bytes [n] (vec (repeatedly n #(rand-int 256))))
+
+;; `rand-int` casts to a 32-bit int on the JVM, so `(rand-int 0x100000000)`
+;; throws ArithmeticException: integer overflow — the exact range every
+;; Router ID / Area ID / Link State ID field in this codec occupies. Draw
+;; those through `rand` (a double, exact for integers well past 2**32) and
+;; cast down instead.
+(defn- rand-u32 [] (long (rand 0x100000000)))
+(defn- rand-i32 [] (- (rand-u32) 0x80000000))
+
+(deftest checksum-definition-and-fast-form-agree
+  (testing "both implementations agree over random buffers of every length 0..64"
+    (is (every? (fn [n]
+                  (every? (fn [_]
+                            (let [bs (rand-bytes n)]
+                              (= (checksum/ones-complement-sum bs)
+                                 (checksum/ones-complement-sum-fast bs))))
+                          (range 8)))
+                (range 0 65))))
+  (testing "and over a packet-sized buffer, several times"
+    (is (every? (fn [_]
+                  (let [bs (rand-bytes 512)]
+                    (= (checksum/ones-complement-sum bs)
+                       (checksum/ones-complement-sum-fast bs))))
+                (range 20)))))
+
+(deftest checksum-generate-then-verify-round-trips
+  (testing "for 300 random EVEN-length buffers, appending the checksum verifies"
+    ;; Even-length only, and that restriction is the point rather than a
+    ;; convenience: see `checksum-append-does-not-verify-at-an-odd-offset`
+    ;; immediately below for the measured reason, and
+    ;; `checksum-verifies-at-an-even-offset-inside-the-buffer` for the
+    ;; shape OSPF actually uses.
+    (is (every? (fn [_]
+                  (let [bs (rand-bytes (* 2 (inc (rand-int 150))))]
+                    (checksum/valid? (into bs (checksum/checksum-bytes bs)))))
+                (range 300))))
+  (testing "and every single-bit corruption of a checksummed buffer is caught"
+    (let [bs (rand-bytes 40)
+          framed (vec (into bs (checksum/checksum-bytes bs)))]
+      (doseq [i (range (count framed)) bit (range 8)]
+        (let [bad (update framed i bit-xor (bit-shift-left 1 bit))]
+          (is (not (checksum/valid? bad)) (str "byte " i " bit " bit)))))))
+
+(deftest checksum-append-does-not-verify-at-an-odd-offset
+  ;; Measured, and correct — not a defect. RFC 1071 §2 pads an odd-length
+  ;; buffer with a zero byte "to form a 16 bit word for checksum
+  ;; purposes". That pad is notional: it exists only while summing. If a
+  ;; caller then *appends* the resulting checksum to the odd-length data,
+  ;; verification re-pairs the bytes from offset 0 and the last data octet
+  ;; now pairs with the checksum's high byte instead of with the pad — a
+  ;; different set of 16-bit words, so the sum is not all-ones.
+  ;;
+  ;; This is asserted rather than avoided because a suite that only ever
+  ;; fed `valid?` even-length buffers would leave a caller free to believe
+  ;; the checksum can be appended anywhere.
+  (doseq [n [1 3 5 41]]
+    (let [bs (rand-bytes n)]
+      (is (not (checksum/valid? (into bs (checksum/checksum-bytes bs))))
+          (str "odd length " n)))))
+
+(deftest checksum-verifies-at-an-even-offset-inside-the-buffer
+  ;; ...and this is the shape OSPF actually uses: RFC 2328 Appendix A.3.1
+  ;; puts the Checksum field at offset 12 of the header, an even offset,
+  ;; with the data continuing after it. Generated with the field zeroed
+  ;; and verified with the field as received (RFC 1071 §2), this holds for
+  ;; a payload of any length, odd included — which is why `ospf.packet`
+  ;; can checksum a packet whose body length is odd.
+  (doseq [n [0 1 3 5 40 41]]
+    (let [payload (rand-bytes n)
+          zeroed (into [0 0] payload)
+          cs (checksum/checksum-bytes zeroed)
+          framed (into (vec cs) payload)]
+      (is (checksum/valid? framed) (str "payload length " n)))))
+
+;; ── ospf.header — RFC 2328 Appendix A.3.1 ──────────────────────────────────
+
+(deftest header-round-trip
+  ;; constructed, not a published spec vector — RFC 2328 has no worked
+  ;; full-header byte dump, only the field diagram this exercises.
+  (let [h {:version 2 :type :hello :packet-length 44 :router-id 0x0A000001
+           :area-id 0 :checksum 0x1234 :autype 0
+           :authentication [0 0 0 0 0 0 0 0]}
+        bs (header/encode h)]
+    (is (= header/length (count bs)))
+    (is (= 2 (first bs)) "Version # is 2 for OSPFv2 — Appendix A.3.1")
+    (is (= 1 (second bs)) "Type 1 is Hello — Appendix A.3.1's type table")
+    (let [[status result] (header/decode bs)]
+      (is (= :ok status))
+      (is (= h (:header result)))
+      (is (empty? (:rest result))))))
+
+(deftest header-round-trip-random-sweep
+  (is (every? (fn [_]
+                (let [h {:version 2
+                         :type (rand-nth [:hello :database-description
+                                           :link-state-request :link-state-update
+                                           :link-state-acknowledgment])
+                         :packet-length (rand-int 65536)
+                         :router-id (rand-u32)
+                         :area-id (rand-u32)
+                         :checksum (rand-int 0x10000)
+                         :autype (rand-int 0x10000)
+                         :authentication (rand-bytes 8)}
+                      [status result] (header/decode (header/encode h))]
+                  (and (= :ok status) (= h (:header result)))))
+              (range 300))))
+
+(deftest header-negative-paths
+  (testing "fewer than 24 bytes"
+    (is (= :ospf/packet-too-short (second (header/decode (repeat 23 0))))))
+  (testing "an empty buffer, the shortest possible input"
+    (is (= :ospf/packet-too-short (second (header/decode [])))))
+  (testing "Type outside 1..5"
+    (let [bs (header/encode {:type :hello :packet-length 24 :router-id 0
+                              :area-id 0 :checksum 0 :autype 0})
+          bad (assoc (vec bs) 1 6)]
+      (is (= :ospf/unknown-packet-type (second (header/decode bad)))))))
+
+;; ── ospf.lsa — RFC 2328 Appendix A.4.1 and §13.1 ───────────────────────────
+
+(def ^:private sample-lsa-header
+  {:ls-age 100 :options 0x02 :ls-type 1 :link-state-id 0x0A000001
+   :advertising-router 0x0A000001 :ls-sequence-number -2147483647
+   :ls-checksum 0xABCD :length 36})
+
+(deftest lsa-header-round-trip
+  (let [bs (lsa/encode sample-lsa-header)]
+    (is (= lsa/header-length (count bs)))
+    (let [[status result] (lsa/decode bs)]
+      (is (= :ok status))
+      (is (= sample-lsa-header (:header result)))
+      (is (empty? (:rest result))))))
+
+(deftest lsa-header-round-trip-random-sweep
+  (is (every? (fn [_]
+                (let [h {:ls-age (rand-int 0x10000)
+                         :options (rand-int 0x100)
+                         :ls-type (inc (rand-int 5))
+                         :link-state-id (rand-u32)
+                         :advertising-router (rand-u32)
+                         :ls-sequence-number (rand-i32)
+                         :ls-checksum (rand-int 0x10000)
+                         :length (rand-int 0x10000)}
+                      [status result] (lsa/decode (lsa/encode h))]
+                  (and (= :ok status) (= h (:header result)))))
+              (range 300))))
+
+(deftest lsa-header-negative-paths
+  (is (= :ospf/lsa-header-too-short (second (lsa/decode (repeat 19 0))))))
+
+;; RFC 2328 §13.1, quoted in full in ospf.lsa's docstring. Every branch of
+;; the rule gets its own case here, each one isolating exactly the field(s)
+;; that branch compares — constructed, not a published spec vector (the
+;; RFC states the rule in prose; it doesn't work a numeric example).
+(deftest lsa-recency-rfc-13-1
+  (let [base sample-lsa-header]
+    (testing "rule 1: higher LS sequence number wins outright"
+      (is (= :a (lsa/compare-instances (assoc base :ls-sequence-number 5)
+                                       (assoc base :ls-sequence-number 4))))
+      (is (= :b (lsa/compare-instances (assoc base :ls-sequence-number 4)
+                                       (assoc base :ls-sequence-number 5)))))
+    (testing "rule 2: equal sequence numbers, higher LS checksum wins"
+      (is (= :a (lsa/compare-instances (assoc base :ls-checksum 0x0002)
+                                       (assoc base :ls-checksum 0x0001)))))
+    (testing "rule 3: equal sequence + checksum, the MaxAge instance wins
+              (it is being flushed, and that is more recent information)"
+      (is (= :a (lsa/compare-instances (assoc base :ls-age lsa/max-age)
+                                       (assoc base :ls-age 100)))))
+    (testing "rule 4: neither is MaxAge; ages differing by more than
+              MaxAgeDiff (900s) — the *smaller* (younger) age wins"
+      (is (= :a (lsa/compare-instances (assoc base :ls-age 100)
+                                       (assoc base :ls-age (+ 100 lsa/max-age-diff 1)))))
+      (testing "and a difference of exactly MaxAgeDiff does NOT trigger this
+                rule — the RFC says 'differ by more than', not 'by at least'"
+        (is (= :same (lsa/compare-instances (assoc base :ls-age 100)
+                                            (assoc base :ls-age (+ 100 lsa/max-age-diff)))))))
+    (testing "rule 5: otherwise, identical"
+      (is (= :same (lsa/compare-instances base base))))))
+
+;; ── ospf.hello — RFC 2328 Appendix A.3.2 ───────────────────────────────────
+
+(def ^:private sample-hello
+  {:network-mask 0xFFFFFF00 :hello-interval 10 :options 0x02 :rtr-pri 1
+   :router-dead-interval 40 :designated-router 0x0A000001
+   :backup-designated-router 0x0A000002
+   :neighbors [0x0A000003 0x0A000004]})
+
+(deftest hello-round-trip
+  (let [bs (hello/encode sample-hello)]
+    (is (= (+ hello/fixed-length 8) (count bs)) "2 neighbors, 4 octets each")
+    (is (= [:ok sample-hello] (hello/decode bs)))))
+
+(deftest hello-round-trip-no-neighbors
+  (is (= [:ok (assoc sample-hello :neighbors [])]
+         (hello/decode (hello/encode (assoc sample-hello :neighbors []))))))
+
+(deftest hello-round-trip-random-sweep
+  (is (every? (fn [_]
+                (let [h {:network-mask (rand-u32)
+                         :hello-interval (rand-int 0x10000)
+                         :options (rand-int 0x100)
+                         :rtr-pri (rand-int 0x100)
+                         :router-dead-interval (rand-u32)
+                         :designated-router (rand-u32)
+                         :backup-designated-router (rand-u32)
+                         :neighbors (vec (repeatedly (rand-int 6)
+                                                      #(rand-u32)))}]
+                  (= [:ok h] (hello/decode (hello/encode h)))))
+              (range 300))))
+
+(deftest hello-negative-paths
+  (is (= :ospf/hello-too-short (second (hello/decode (repeat 19 0)))))
+  (testing "20 fixed octets plus a partial (3-byte) neighbor entry"
+    (is (= :ospf/neighbor-list-misaligned
+           (second (hello/decode (into (vec (repeat 20 0)) [1 2 3])))))))
+
+;; ── ospf.dd — RFC 2328 Appendix A.3.3, flag bit positions ─────────────────
+
+(deftest dd-flags-bit-positions
+  ;; RFC 2328 Appendix A.3.3's diagram draws the flags octet, left (MSB)
+  ;; to right (LSB), as `0 0 0 0 0 I M MS` — so I is bit 2 (0x04), M is
+  ;; bit 1 (0x02), MS is bit 0 (0x01). Verified against the diagram, not
+  ;; assumed from the more common convention of naming the LSB-most flag
+  ;; first, which is the reverse of what the RFC actually draws.
+  (testing "all three flags set encodes to 0x07"
+    (is (= 0x07 (nth (dd/encode {:interface-mtu 0 :options 0
+                                  :init? true :more? true :master? true
+                                  :dd-sequence-number 0}) 3))))
+  (testing "only I set is 0x04, only M is 0x02, only MS is 0x01"
+    (is (= 0x04 (nth (dd/encode {:interface-mtu 0 :options 0
+                                  :init? true :more? false :master? false
+                                  :dd-sequence-number 0}) 3)))
+    (is (= 0x02 (nth (dd/encode {:interface-mtu 0 :options 0
+                                  :init? false :more? true :master? false
+                                  :dd-sequence-number 0}) 3)))
+    (is (= 0x01 (nth (dd/encode {:interface-mtu 0 :options 0
+                                  :init? false :more? false :master? true
+                                  :dd-sequence-number 0}) 3))))
+  (testing "none set is 0x00"
+    (is (= 0x00 (nth (dd/encode {:interface-mtu 0 :options 0
+                                  :init? false :more? false :master? false
+                                  :dd-sequence-number 0}) 3)))))
+
+(def ^:private sample-dd
+  {:interface-mtu 1500 :options 0x02 :init? true :more? false :master? true
+   :dd-sequence-number -2147483647
+   :lsa-headers [sample-lsa-header (assoc sample-lsa-header :ls-type 2)]})
+
+(deftest dd-round-trip
+  (is (= [:ok sample-dd] (dd/decode (dd/encode sample-dd)))))
+
+(deftest dd-round-trip-no-lsas
+  (is (= [:ok (assoc sample-dd :lsa-headers [])]
+         (dd/decode (dd/encode (assoc sample-dd :lsa-headers []))))))
+
+(deftest dd-negative-paths
+  (is (= :ospf/dd-too-short (second (dd/decode (repeat 7 0)))))
+  (testing "a truncated trailing LSA header"
+    (is (= :ospf/lsa-header-too-short
+           (second (dd/decode (into (vec (dd/encode (assoc sample-dd :lsa-headers [])))
+                                     (repeat 5 0))))))))
+
+;; ── ospf.lsr — RFC 2328 Appendix A.3.4 ─────────────────────────────────────
+
+(def ^:private sample-lsr
+  [{:ls-type 1 :link-state-id 0x0A000001 :advertising-router 0x0A000001}
+   {:ls-type 2 :link-state-id 0x0A000002 :advertising-router 0x0A000002}])
+
+(deftest lsr-round-trip
+  (let [bs (lsr/encode sample-lsr)]
+    (is (= (* 2 lsr/entry-length) (count bs)))
+    (is (= [:ok sample-lsr] (lsr/decode bs)))))
+
+(deftest lsr-round-trip-empty
+  (is (= [:ok []] (lsr/decode (lsr/encode [])))))
+
+(deftest lsr-round-trip-random-sweep
+  (is (every? (fn [_]
+                (let [entries (vec (repeatedly (rand-int 8)
+                                                #(hash-map :ls-type (rand-u32)
+                                                           :link-state-id (rand-u32)
+                                                           :advertising-router (rand-u32))))]
+                  (= [:ok entries] (lsr/decode (lsr/encode entries)))))
+              (range 300))))
+
+(deftest lsr-negative-paths
+  (is (= :ospf/lsr-misaligned (second (lsr/decode (repeat 11 0))))))
+
+;; ── ospf.lsack — RFC 2328 Appendix A.3.6 ───────────────────────────────────
+
+(deftest lsack-round-trip
+  (let [headers [sample-lsa-header (assoc sample-lsa-header :ls-type 3)]]
+    (is (= [:ok headers] (lsack/decode (lsack/encode headers))))))
+
+(deftest lsack-round-trip-empty
+  (is (= [:ok []] (lsack/decode (lsack/encode [])))))
+
+(deftest lsack-negative-paths
+  (is (= :ospf/lsa-header-too-short (second (lsack/decode (repeat 5 0))))))
+
+;; ── ospf.lsu — RFC 2328 Appendix A.3.5 ─────────────────────────────────────
+
+(defn- lsu-entry [ls-type body]
+  (let [body (vec body)]
+    {:header (assoc sample-lsa-header :ls-type ls-type
+                     :length (+ lsa/header-length (count body)))
+     :body body}))
+
+(deftest lsu-round-trip
+  (let [entries [(lsu-entry 1 [0xAA 0xBB 0xCC]) (lsu-entry 2 [])]]
+    (is (= [:ok entries] (lsu/decode (lsu/encode entries))))))
+
+(deftest lsu-round-trip-empty
+  (is (= [:ok []] (lsu/decode (lsu/encode [])))))
+
+(deftest lsu-negative-paths
+  (testing "fewer than 4 octets (no room for #LSAs)"
+    (is (= :ospf/lsu-too-short (second (lsu/decode (repeat 3 0))))))
+  (testing "#LSAs claims more entries than the buffer could possibly hold"
+    (is (= :ospf/lsu-too-short
+           (second (lsu/decode (into (b/u32->bytes 100) (repeat 19 0)))))))
+  (testing "an LSA header whose own :length is less than the 20-octet header itself"
+    (let [bad (lsu-entry 1 [])
+          bad (assoc-in bad [:header :length] 5)]
+      (is (= :ospf/lsa-length-too-short (second (lsu/decode (lsu/encode [bad])))))))
+  (testing "an LSA header whose :length claims more bytes than the packet has left"
+    (let [bad (lsu-entry 1 [])
+          bad (assoc-in bad [:header :length] 1000)]
+      (is (= :ospf/lsa-length-exceeds-packet (second (lsu/decode (lsu/encode [bad])))))))
+  (testing "#LSAs undercounts a real list — one entry decodes clean, the rest are unexplained trailing bytes"
+    (let [entries [(lsu-entry 1 [0x01]) (lsu-entry 2 [0x02 0x03])]
+          bs (vec (lsu/encode entries))
+          undercounted (into (b/u32->bytes 1) (subvec bs lsu/count-field-length))]
+      (is (= :ospf/lsu-trailing-bytes (second (lsu/decode undercounted)))))))
+
+;; ── ospf.packet — assembling header + body + RFC 1071 checksum ────────────
+
+(defn- sample-hello-packet []
+  {:type :hello
+   :header {:router-id 0x0A000001 :area-id 0 :autype 0}
+   :body sample-hello})
+
+(defn- sample-lsu-packet []
+  {:type :link-state-update
+   :header {:router-id 0x0A000001 :area-id 0x00000001 :autype 0}
+   :body [(lsu-entry 1 [0x01 0x02 0x03 0x04 0x05])]})
+
+(deftest packet-round-trip-all-five-types
+  (doseq [[type body] [[:hello sample-hello]
+                        [:database-description sample-dd]
+                        [:link-state-request sample-lsr]
+                        [:link-state-update (:body (sample-lsu-packet))]
+                        [:link-state-acknowledgment [sample-lsa-header]]]]
+    (testing type
+      (let [pkt {:type type :header {:router-id 0x0A000001 :area-id 0 :autype 0} :body body}
+            enc (packet/encode pkt)
+            [status result] (packet/decode (:bytes enc))]
+        (is (= :ok status) type)
+        (is (= type (get-in result [:header :type])))
+        (is (= body (:body result)))
+        (is (= (count (:bytes enc)) (get-in result [:header :packet-length]))
+            "the Packet length field must equal the actual encoded size")))))
+
+(deftest packet-checksum-is-computed-not-passed-through
+  ;; The caller's :checksum, if any, is ignored on encode (it's derived),
+  ;; and decode must still see a *correct* checksum despite that.
+  (let [pkt (assoc-in (sample-hello-packet) [:header :checksum] 0xDEAD)
+        enc (packet/encode pkt)
+        [status _] (packet/decode (:bytes enc))]
+    (is (= :ok status))))
+
+(deftest packet-negative-checksum-mismatch
+  (let [enc (packet/encode (sample-hello-packet))
+        bs (vec (:bytes enc))
+        ;; flip a body byte (well past the header) — a real bit error,
+        ;; not a header field that would fail a different, earlier check
+        corrupted (update bs (dec (count bs)) bit-xor 0x01)]
+    (is (= [:error :ospf/checksum-mismatch] (packet/decode corrupted)))))
+
+(deftest packet-negative-length-mismatch
+  (let [enc (packet/encode (sample-hello-packet))
+        bs (vec (:bytes enc))
+        ;; Packet length field (octets 2-3) driven below the 24-octet
+        ;; header minimum, while still supplying >= that many real bytes
+        ;; — this must be caught before the checksum is ever computed.
+        corrupted (into (subvec bs 0 2) (into (b/u16->bytes 10) (subvec bs 4)))]
+    (is (= [:error :ospf/length-mismatch] (packet/decode corrupted)))))
+
+(deftest packet-negative-too-short-for-declared-length
+  (let [enc (packet/encode (sample-hello-packet))
+        bs (vec (:bytes enc))
+        truncated (subvec bs 0 (dec (count bs)))]
+    (is (= [:error :ospf/packet-too-short] (packet/decode truncated)))))
+
+(deftest packet-negative-unsupported-version
+  (let [enc (packet/encode (sample-hello-packet))
+        bs (vec (:bytes enc))
+        corrupted (assoc bs 0 1)]
+    (is (= [:error :ospf/unsupported-version] (packet/decode corrupted)))))
+
+(deftest packet-negative-unknown-type
+  (let [enc (packet/encode (sample-hello-packet))
+        bs (vec (:bytes enc))
+        corrupted (assoc bs 1 9)]
+    (is (= [:error :ospf/unknown-packet-type] (packet/decode corrupted)))))
+
+(deftest packet-negative-body-error-propagates
+  ;; a Hello packet whose body has a misaligned trailing neighbor: the
+  ;; header/checksum are internally consistent (the checksum is computed
+  ;; over these exact, already-misaligned bytes), so this proves body
+  ;; decode errors surface through packet/decode rather than being
+  ;; masked by an earlier, coincidentally-passing check.
+  (let [pkt (assoc (sample-hello-packet) :body
+                    {:network-mask 0 :hello-interval 0 :options 0 :rtr-pri 0
+                     :router-dead-interval 0 :designated-router 0
+                     :backup-designated-router 0 :neighbors []})
+        enc (packet/encode pkt)
+        bs (vec (:bytes enc))
+        with-partial-neighbor (into bs [1 2 3])
+        ;; packet-length and checksum must both be updated to describe
+        ;; this new, longer (and still internally-consistent) packet —
+        ;; otherwise :ospf/length-mismatch or :ospf/checksum-mismatch
+        ;; would fire first and this test would not be isolating the
+        ;; body decoder at all.
+        relen (into (subvec with-partial-neighbor 0 2)
+                    (into (b/u16->bytes (count with-partial-neighbor))
+                          (subvec with-partial-neighbor 4)))
+        prefix (into (subvec relen 0 12) (into (b/u16->bytes 0) (subvec relen 14)))
+        cs (checksum/checksum (into (subvec prefix 0 16) (subvec prefix header/length)))
+        refixed (into (subvec prefix 0 12) (into (b/u16->bytes cs) (subvec prefix 14)))]
+    (is (= [:error :ospf/neighbor-list-misaligned] (packet/decode refixed)))))

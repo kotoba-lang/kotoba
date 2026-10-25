@@ -1,0 +1,204 @@
+;; Not a unit test — an EXECUTABLE end-to-end demo that must genuinely
+;; pass when run, matching the verification style
+;; ADR-2607161817/kotoba-lang/dtn's tcp_demo.cljs established: it spawns
+;; an actual second `nbb` OS process (bin/sftp_node.cljk, found via
+;; $PATH), connects to its real bound TCP port from THIS process (acting
+;; as the SFTP client — see kotobase.sftp.transport.ssh's own docstring
+;; for why that client is demo/test-only, not a general-purpose library),
+;; and proves the full protocol stack for real:
+;;
+;;   version exchange -> SSH_MSG_KEXINIT negotiation -> curve25519-sha256
+;;   ECDH key exchange with an ed25519 host-key signature the client
+;;   actually verifies -> SSH_MSG_NEWKEYS -> aes128-ctr encryption +
+;;   hmac-sha2-256 integrity on every packet from that point on ->
+;;   accept-any 'none' userauth -> one 'session' channel -> 'subsystem
+;;   sftp' -> SSH_FXP_INIT/VERSION -> a real mkdir/write/close/open/
+;;   read/stat/readdir/rename/remove/rmdir sequence against the SECOND
+;;   PROCESS's own in-memory kotobase.local store, with every one of
+;;   those SFTP requests and responses actually traveling as CIPHERTEXT
+;;   (encrypted+MAC'd) over the real socket between the two processes.
+;;
+;; This is proof by protocol response, not proof by log line (unlike
+;; DTN's scenario 1, SFTP has no analogous 'read the child's own stdout'
+;; signal to check — the DATA THAT COMES BACK ACROSS THE ENCRYPTED
+;; CHANNEL, matching exactly what this process asked the OTHER process to
+;; store, IS the proof: if the KEXINIT negotiation, ECDH math, key
+;; derivation, AES-CTR encryption/decryption, or HMAC verification were
+;; wrong in either process, the SFTP responses below would either never
+;; arrive (MAC rejection closes the connection — see
+;; kotobase.sftp.transport.wire's feed! docstring) or would decrypt to
+;; garbage that fails to parse as a valid SFTP packet.
+;;
+;; HONEST SCOPE (restated from kotobase.sftp.transport.ssh's own
+;; docstring, worth repeating here): this proves this repo's OWN
+;; hand-rolled client and server correctly interoperate with EACH OTHER,
+;; across two real OS processes, over a real socket, with a real
+;; encrypted channel. It does NOT prove interop with a real OpenSSH
+;; client or server — no such test exists in this repo, and none is
+;; claimed to.
+;;
+;; Prints PASS/FAIL per check, a final "RESULT: N/M checks passed" line,
+;; and exits 0 iff every check passed (else 1). Run from this repo's
+;; root:
+;;
+;;   kbb --backend sci --classpath "src:test:.deps/kotobase/src" \
+;;     test/kotobase/sftp/transport/ssh_demo.cljk
+
+(ns kotoba.sftp.transport.ssh-demo
+  (:require ["node:child_process" :as cp]
+            ["node:net" :as net]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            [kotobase.sftp.transport.ssh :as ssh]
+            [kotobase.sftp.transport.sftp-subsystem :as sftp]
+            [kotobase.sftp.transport.wire :as w]))
+
+(def classpath "src:test:.deps/kotobase/src")
+(def demo-port 6522)
+
+(defn- sleep-ms [ms] (js/Promise. (fn [resolve _] (js/setTimeout resolve ms))))
+
+(defn- try-connect-once [host port]
+  (js/Promise.
+   (fn [resolve _]
+     (let [sock (net/createConnection #js {:host host :port port})]
+       (.on sock "connect" (fn [] (.destroy sock) (resolve true)))
+       (.on sock "error" (fn [_e] (.destroy sock) (resolve false)))))))
+
+(defn- wait-for-port [host port attempts interval-ms]
+  (p/let [ok? (try-connect-once host port)]
+    (cond
+      ok? true
+      (<= attempts 0) false
+      :else (p/let [_ (sleep-ms interval-ms)] (wait-for-port host port (dec attempts) interval-ms)))))
+
+(defn- req! [state-atom sftp-bytes]
+  (js/Promise. (fn [resolve _] (ssh/send-sftp-request! state-atom sftp-bytes resolve))))
+
+(defn- parsed [resp-buf] (sftp/parse-sftp-packet resp-buf))
+
+(def results (atom []))
+(defn- check! [label ok?]
+  (swap! results conj [label ok?])
+  (println (if ok? "PASS" "FAIL") label))
+
+(defn run-demo []
+  (println "\n--- kotobase.sftp.transport.ssh real cross-process demo ---")
+  (println "  spawning a second `nbb` OS process running bin/sftp_node.cljk listen --port"
+            demo-port "...")
+  (let [out-chunks (atom [])
+        err-chunks (atom [])
+        child (cp/spawn "nbb" #js ["--classpath" classpath "lib/org.ietf.sftp/bin/sftp_node.cljk" "listen"
+                                    "--port" (str demo-port) "--share" "home"]
+                         #js {:cwd (js/process.cwd)})]
+    (.on (.-stdout child) "data" (fn [chunk] (swap! out-chunks conj (str chunk))))
+    (.on (.-stderr child) "data" (fn [chunk] (swap! err-chunks conj (str chunk))))
+    (-> (p/let [up? (wait-for-port "127.0.0.1" demo-port 150 150)] ;; up to ~22s — this
+          ;; machine runs many concurrent Claude Code sessions in parallel
+          ;; (documented environment hazard), so nbb's own cold-start time
+          ;; for the child process is not reliably sub-second under load;
+          ;; a short budget here produces flaky false FAILs, not a real
+          ;; signal about this repo's own code.
+          (if-not up?
+            (do (println "FAIL: child `listen` process never bound port" demo-port)
+                (println "  child stderr:" (str/join "" @err-chunks))
+                (.kill child)
+                false)
+            (p/let [connected (js/Promise.
+                                (fn [resolve _]
+                                  (ssh/connect! {:host "127.0.0.1" :port demo-port :on-ready resolve})))
+                    st connected
+                    _ (println "  encrypted SFTP subsystem channel established with the child process")
+
+                    init-resp (req! st (sftp/build-sftp-packet sftp/fxp-init (w/uint32 3)))
+                    _ (check! "SSH_FXP_INIT -> SSH_FXP_VERSION over the real encrypted channel"
+                              (= sftp/fxp-version (:type (parsed init-resp))))
+
+                    mkdir-resp (req! st (sftp/build-sftp-packet
+                                          sftp/fxp-mkdir
+                                          (js/Buffer.concat #js [(w/uint32 1) (w/ssh-string "alice") (w/uint32 0)])))
+                    _ (check! "MKDIR alice (in the CHILD process's own store) -> OK"
+                              (= sftp/fxp-status (:type (parsed mkdir-resp))))
+
+                    open-w-resp (req! st (sftp/build-sftp-packet
+                                           sftp/fxp-open
+                                           (js/Buffer.concat #js [(w/uint32 2) (w/ssh-string "alice/hello.txt")
+                                                                   (w/uint32 0x0A) (w/uint32 0)])))
+                    _ (check! "OPEN alice/hello.txt for write -> HANDLE"
+                              (= sftp/fxp-handle (:type (parsed open-w-resp))))
+                    wh-buf (first (w/read-ssh-string (:body (parsed open-w-resp)) 4))
+
+                    write-resp (req! st (sftp/build-sftp-packet
+                                          sftp/fxp-write
+                                          (js/Buffer.concat #js [(w/uint32 3) (w/ssh-string wh-buf)
+                                                                  (w/uint32 0) (w/uint32 0)
+                                                                  (w/ssh-string "hello from a real second OS process, over an encrypted SSH channel")])))
+                    _ (check! "WRITE -> OK" (= sftp/fxp-status (:type (parsed write-resp))))
+
+                    close-resp (req! st (sftp/build-sftp-packet
+                                          sftp/fxp-close
+                                          (js/Buffer.concat #js [(w/uint32 4) (w/ssh-string wh-buf)])))
+                    _ (check! "CLOSE write handle -> OK (flushes to the child's fs store)"
+                              (= sftp/fxp-status (:type (parsed close-resp))))
+
+                    open-r-resp (req! st (sftp/build-sftp-packet
+                                           sftp/fxp-open
+                                           (js/Buffer.concat #js [(w/uint32 5) (w/ssh-string "alice/hello.txt")
+                                                                   (w/uint32 0x01) (w/uint32 0)])))
+                    rh-buf (first (w/read-ssh-string (:body (parsed open-r-resp)) 4))
+
+                    read-resp (req! st (sftp/build-sftp-packet
+                                         sftp/fxp-read
+                                         (js/Buffer.concat #js [(w/uint32 6) (w/ssh-string rh-buf)
+                                                                 (w/uint32 0) (w/uint32 0) (w/uint32 4096)])))
+                    read-data (first (w/read-ssh-string (:body (parsed read-resp)) 4))
+                    _ (check! "READ round-trips the exact bytes WRITTEN in the other process, decrypted correctly"
+                              (= "hello from a real second OS process, over an encrypted SSH channel"
+                                 (.toString read-data "utf8")))
+
+                    stat-resp (req! st (sftp/build-sftp-packet
+                                         sftp/fxp-stat
+                                         (js/Buffer.concat #js [(w/uint32 7) (w/ssh-string "alice/hello.txt")])))
+                    _ (check! "STAT -> ATTRS" (= sftp/fxp-attrs (:type (parsed stat-resp))))
+
+                    opendir-resp (req! st (sftp/build-sftp-packet
+                                            sftp/fxp-opendir
+                                            (js/Buffer.concat #js [(w/uint32 8) (w/ssh-string "alice")])))
+                    dh-buf (first (w/read-ssh-string (:body (parsed opendir-resp)) 4))
+                    readdir-resp (req! st (sftp/build-sftp-packet
+                                            sftp/fxp-readdir
+                                            (js/Buffer.concat #js [(w/uint32 9) (w/ssh-string dh-buf)])))
+                    readdir-body (:body (parsed readdir-resp))
+                    _ (check! "READDIR -> NAME listing includes hello.txt"
+                              (and (= sftp/fxp-name (:type (parsed readdir-resp)))
+                                   (str/includes? (.toString readdir-body "utf8") "hello.txt")))
+
+                    rename-resp (req! st (sftp/build-sftp-packet
+                                           sftp/fxp-rename
+                                           (js/Buffer.concat #js [(w/uint32 10) (w/ssh-string "alice/hello.txt")
+                                                                   (w/ssh-string "alice/renamed.txt")])))
+                    _ (check! "RENAME -> OK" (= sftp/fxp-status (:type (parsed rename-resp))))
+
+                    remove-resp (req! st (sftp/build-sftp-packet
+                                           sftp/fxp-remove
+                                           (js/Buffer.concat #js [(w/uint32 11) (w/ssh-string "alice/renamed.txt")])))
+                    _ (check! "REMOVE -> OK" (= sftp/fxp-status (:type (parsed remove-resp))))
+
+                    rmdir-resp (req! st (sftp/build-sftp-packet
+                                          sftp/fxp-rmdir
+                                          (js/Buffer.concat #js [(w/uint32 12) (w/ssh-string "alice")])))
+                    _ (check! "RMDIR now-empty alice -> OK" (= sftp/fxp-status (:type (parsed rmdir-resp))))]
+              (ssh/close-connection! st)
+              (.kill child)
+              (let [failures (filter (fn [[_ ok?]] (not ok?)) @results)]
+                (println "\nRESULT:" (- (count @results) (count failures)) "/" (count @results) "checks passed")
+                (empty? failures)))))
+        (.catch (fn [e]
+                  (println "DEMO CRASHED:" e)
+                  (println "  child stderr so far:" (str/join "" @err-chunks))
+                  (.kill child)
+                  false)))))
+
+(-> (run-demo)
+    (.then (fn [pass?] (js/process.exit (if pass? 0 1))))
+    (.catch (fn [e] (println "DEMO CRASHED (outer):" e) (js/process.exit 1))))

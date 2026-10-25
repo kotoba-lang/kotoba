@@ -1,0 +1,294 @@
+;; ipld.dag-cbor -- a DAG-CBOR encoder over :document values, in pure Kotoba.
+;;
+;; root ADR-2610092310 §3 / step S5. A :document is walked with the operations
+;; the language already has (document-kind / -count / -vector-at /
+;; -map-entry-at and the scalar readers) plus the :bytes and :link kinds of
+;; S1/S2 (document-bytes-value / document-link-value). Every item is written by
+;; ipld.dag-cbor-write; ipld.core/encode (core.cljk) stays the host oracle.
+;;
+;;   (dag-cbor-encode d) -> [:result :bytes :keyword]
+;;
+;; :ok is the DAG-CBOR bytes. :err names why D is not IPLD data:
+;;   :keyword-key     a map key that is a keyword (IPLD keys are strings; the
+;;                    mapping from a keyword to a string is each schema's call)
+;;   :non-string-key  any other map key that is not a string
+;;   :keyword-value   a keyword anywhere a value goes
+;;   :symbol :set :list
+;;                    kinds IPLD has no place for (a list and a vector would
+;;                    both be one CBOR array, so two documents, one CID)
+;;   :f64-non-finite  NaN or an infinity (DAG-CBOR forbids them); a guard: a
+;;                    document already refuses them when it is built
+;;   :too-deep        nesting past the document depth bound (8); unreachable
+;;                    through the document constructors, kept as a guard
+;;   :unknown-kind    a document kind this codec does not know
+;; The first refusal in a depth-first walk (map entries in the document's own
+;; order, a key before its value) is the one answered.
+;;
+;; Writing follows DAG-CBOR: shortest-head integers; f64 always as a CBOR
+;; float64 (fb + 8 bytes); a map re-sorted by DAG-CBOR key order (encoded
+;; length first, then bytewise -- ipld.dag-cbor-write/key-less?), by insertion
+;; sort over the entry indexes (at most 496 comparisons for a 32-entry map); a
+;; link as tag 42 over 00 ++ the binary CID; bytes as major type 2.
+;;
+;; Native (kotoba-native) has no document f64 (lang/surface-status.edn); a
+;; native build of this codec must refuse f64 as :f64-on-native rather than
+;; read it (ADR §3, §6). That is not done here: this module reads f64.
+
+(ns ipld.dag-cbor
+  (:require [ipld.dag-cbor-write :as w]
+            [multiformats.cid :as cid])
+  (:export [dag-cbor-encode refusal encoded link-document float-item
+            main test-scalars test-f64 test-bytes-and-link test-containers test-key-order
+            test-unicode-key-order test-refusals test-refusal-depth-first
+            test-commit-genesis test-commit-next test-commit-link-state test-commit-causal]))
+
+(def max-depth 8)
+
+;; --- reading ----------------------------------------------------------------
+
+(defn- item [d :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at d i) (document-null)))
+
+(defn- entry [d :document i :i64] :document
+  (option-value-of [:option :document] (document-map-entry-at d i) (document-null)))
+
+(defn- entry-key [d :document i :i64] :document (item (entry d i) 0))
+
+(defn- entry-value [d :document i :i64] :document (item (entry d i) 1))
+
+(defn- key-text [d :document i :i64] :string
+  (option-value-of [:option :string] (document-string-value (entry-key d i)) ""))
+
+(defn- f64-bits [d :document] :i64
+  (f64-to-bits (option-value-of [:option :f64] (document-f64-value d) 0.0)))
+
+(defn- finite-bits? [bits :i64] :bool
+  ;; an IEEE 754 binary64 whose exponent is all ones is NaN or an infinity
+  (not (= (bit-and (i64-shift-right bits 52) 2047) 2047)))
+
+;; --- checking ---------------------------------------------------------------
+
+(defn refusal [d :document depth :i64] :keyword
+  ;; :ok, or the reason D (at DEPTH) is not IPLD data
+  (let [k (document-kind d)]
+    (cond
+      (> depth max-depth) :too-deep
+      (or (= k :null) (= k :bool) (= k :i64) (= k :string) (= k :bytes) (= k :link)) :ok
+      (= k :f64) (if (finite-bits? (f64-bits d)) :ok :f64-non-finite)
+      (= k :keyword) :keyword-value
+      (= k :symbol) :symbol
+      (= k :set) :set
+      (= k :list) :list
+      (= k :vector)
+      (let [n (document-count d)]
+        (loop [i 0]
+          (if (>= i n)
+            :ok
+            (let [r (refusal (item d i) (+ depth 1))]
+              (if (= r :ok) (recur (+ i 1)) r)))))
+      (= k :map)
+      (let [n (document-count d)]
+        (loop [i 0]
+          (if (>= i n)
+            :ok
+            (let [kk (document-kind (entry-key d i))]
+              (cond
+                (= kk :keyword) :keyword-key
+                (not (= kk :string)) :non-string-key
+                :else (let [r (refusal (entry-value d i) (+ depth 1))]
+                        (if (= r :ok) (recur (+ i 1)) r)))))))
+      :else :unknown-kind)))
+
+;; --- writing ----------------------------------------------------------------
+
+(defn float-item [x :f64] :vector-i64
+  ;; DAG-CBOR writes every float as a float64: fb, then the 8 big-endian bytes
+  (let [bits (f64-to-bits x)]
+    (loop [i 7 acc (vector-i64 251)]
+      (if (< i 0)
+        acc
+        (recur (- i 1) (vector-conj acc (bit-and (i64-shift-right bits (* 8 i)) 255)))))))
+
+(defn- sorted-entries [d :document] :vector-i64
+  ;; D's entry indexes in DAG-CBOR key order (insertion sort; keys are distinct)
+  (let [n (document-count d)]
+    (loop [i 0 order (vector-i64)]
+      (if (>= i n)
+        order
+        (let [k (key-text d i)
+              p (loop [p (vector-count order)]
+                  (if (and (> p 0) (w/key-less? k (key-text d (vector-at order (- p 1)))))
+                    (recur (- p 1))
+                    p))]
+          (recur (+ i 1)
+                 (w/append (vector-conj (vector-take order p) i) (vector-drop order p))))))))
+
+(defn- write [d :document] :vector-i64
+  ;; D's DAG-CBOR bytes; D has passed refusal
+  (let [k (document-kind d)]
+    (cond
+      (= k :null) (w/null-item)
+      (= k :bool) (w/bool-item (option-value-of [:option :bool] (document-bool-value d) false))
+      (= k :i64) (w/int-item (option-value-of [:option :i64] (document-i64-value d) 0))
+      (= k :f64) (float-item (option-value-of [:option :f64] (document-f64-value d) 0.0))
+      (= k :string) (w/text-item (option-value-of [:option :string] (document-string-value d) ""))
+      (= k :bytes) (w/bytes-item (vector-i64-from-bytes
+                                  (option-value-of [:option :bytes] (document-bytes-value d)
+                                                   (bytes-from-vector-i64 (vector-i64)))))
+      (= k :link) (w/link-bytes-item (vector-i64-from-bytes
+                                      (option-value-of [:option :bytes] (document-link-value d)
+                                                       (bytes-from-vector-i64 (vector-i64)))))
+      (= k :vector)
+      (let [n (document-count d)]
+        (loop [i 0 acc (w/array-head n)]
+          (if (>= i n) acc (recur (+ i 1) (w/append acc (write (item d i)))))))
+      (= k :map)
+      (let [n (document-count d) order (sorted-entries d)]
+        (loop [j 0 acc (w/head 5 n)]
+          (if (>= j n)
+            acc
+            (let [i (vector-at order j)]
+              (recur (+ j 1) (w/append (w/append acc (w/text-item (key-text d i)))
+                                       (write (entry-value d i))))))))
+      :else (vector-i64))))
+
+;; --- entry ------------------------------------------------------------------
+
+(defn dag-cbor-encode [d :document] [:result :bytes :keyword]
+  (let [r (refusal d 0)]
+    (if (= r :ok)
+      (result-ok-of [:result :bytes :keyword] (bytes-from-vector-i64 (write d)))
+      (result-err-of [:result :bytes :keyword] r))))
+
+(defn encoded [d :document] :vector-i64
+  ;; dag-cbor-encode's bytes, or empty when D is refused
+  (vector-i64-from-bytes
+   (result-value-of [:result :bytes :keyword] (dag-cbor-encode d) (bytes-from-vector-i64 (vector-i64)))))
+
+(defn link-document [c :string] :document
+  ;; the :link document of a CID string; null when C is not a valid CIDv1
+  (if (cid/cid-valid? c)
+    (option-value-of [:option :document] (document-link (bytes-from-vector-i64 (cid/cid->bytes c)))
+                     (document-null))
+    (document-null)))
+
+;; --- tests ------------------------------------------------------------------
+;; Expected bytes are ipld.core/encode's (scripts/dag-cbor-oracle-cases.cljk
+;; re-derives the generated ones); the four commits are chain.commit's
+;; test vectors, i.e. Plan A's encode-commit bytes (chain.core/commit!'s).
+
+(defn- same? [a :vector-i64 b :vector-i64] :bool
+  (let [n (vector-count a)]
+    (if (not (= n (vector-count b)))
+      false
+      (loop [i 0] (if (>= i n) true (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false))))))
+
+(defn- s [x :string] :document (document-string x))
+(defn- n [x :i64] :document (document-i64 x))
+
+(defn- refused [d :document] :keyword
+  (result-error-of [:result :bytes :keyword] (dag-cbor-encode d) :ok))
+
+(defn test-scalars [] :bool
+  (and (same? (encoded (document-null)) (vector-i64 246))
+       (same? (encoded (document-bool true)) (vector-i64 245))
+       (same? (encoded (document-bool false)) (vector-i64 244))
+       (same? (encoded (n 0)) (vector-i64 0))
+       (same? (encoded (n 23)) (vector-i64 23))
+       (same? (encoded (n 24)) (vector-i64 24 24))
+       (same? (encoded (n -1)) (vector-i64 32))
+       (same? (encoded (n 4294967296)) (vector-i64 27 0 0 0 1 0 0 0 0))
+       (same? (encoded (n 9223372036854775807)) (vector-i64 27 127 255 255 255 255 255 255 255))
+       (same? (encoded (n -9223372036854775808)) (vector-i64 59 127 255 255 255 255 255 255 255))
+       (same? (encoded (s "")) (vector-i64 96))
+       (same? (encoded (s "日本")) (vector-i64 102 230 151 165 230 156 172))))
+
+(defn test-f64 [] :bool
+  (and (same? (encoded (document-f64 1.5)) (vector-i64 251 63 248 0 0 0 0 0 0))
+       (same? (encoded (document-f64 (f64-from-bits -9223372036854775808))) (vector-i64 251 128 0 0 0 0 0 0 0))
+       ;; a document refuses a non-finite f64 when it is built (osaho
+       ;; value.cljk "invalid document f64"), so :f64-non-finite is a guard
+       ;; no document reaches; the bit test behind it is checked directly
+       (not (finite-bits? 9218868437227405312)) (not (finite-bits? -4503599627370496))
+       (not (finite-bits? 9221120237041090560)) (finite-bits? 9218868437227405311)))
+
+(defn test-bytes-and-link [] :bool
+  (and (same? (encoded (document-bytes (bytes-from-vector-i64 (vector-i64)))) (vector-i64 64))
+       (same? (encoded (document-bytes (bytes-from-vector-i64 (vector-i64 1 2)))) (vector-i64 66 1 2))
+       (same? (encoded (link-document "bafkqaaa")) (vector-i64 216 42 69 0 1 85 0 0))
+       (same? (encoded (link-document "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"))
+              (w/link-item "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"))))
+
+(defn test-containers [] :bool
+  (and (same? (encoded (document-vector)) (vector-i64 128))
+       (same? (encoded (document-vector (n 1) (s "a") (document-null))) (vector-i64 131 1 97 97 246))
+       (same? (encoded (document-map)) (vector-i64 160))
+       (same? (encoded (document-map (s "a") (document-vector (document-map (s "b") (n 1)))))
+              (vector-i64 161 97 97 129 161 97 98 1))))
+
+(defn test-key-order [] :bool
+  ;; the document's own order puts "aaaaaaaaaa" before "b" (canonical bytes);
+  ;; DAG-CBOR puts the shorter key first
+  (and (same? (encoded (document-map (s "b") (n 1) (s "aa") (n 2)))
+              (vector-i64 162 97 98 1 98 97 97 2))
+       (same? (encoded (document-map (s "aaaaaaaaaa") (n 1) (s "b") (n 2)))
+              (vector-i64 162 97 98 2 106 97 97 97 97 97 97 97 97 97 97 1))))
+
+(defn test-unicode-key-order [] :bool
+  ;; equal UTF-8 length: bytewise ("ab" 61 62 < "é" c3 a9)
+  (same? (encoded (document-map (s "é") (n 1) (s "ab") (n 2)))
+         (vector-i64 162 98 97 98 2 98 195 169 1)))
+
+(defn test-refusals [] :bool
+  (and (= (refused (document-map :a (n 1))) :keyword-key)
+       (= (refused (document-map (n 1) (n 1))) :non-string-key)
+       (= (refused (document-keyword :a)) :keyword-value)
+       (= (refused (document-symbol 'a)) :symbol)
+       (= (refused (document-set (n 1))) :set)
+       (= (refused (document-list (n 1))) :list)
+       (= (refused (document-vector (n 1) (document-list))) :list)
+       (= (refused (document-map (s "k") (document-keyword :v))) :keyword-value)
+       (= (refusal (n 1) 9) :too-deep)
+       (= (vector-count (encoded (document-keyword :a))) 0)
+       (= (refused (n 1)) :ok)))
+
+(defn test-refusal-depth-first [] :bool
+  ;; the key is checked before its value; entries in the document's order
+  (and (= (refused (document-map (n 1) (document-keyword :v))) :non-string-key)
+       (= (refused (document-vector (document-set) (document-list))) :set)))
+
+;; --- the four commits of chain.commit's tests, as documents -----------------
+
+(defn- commit [state :document prev :document sq :i64] :document
+  (document-map (s "state") state (s "prev") prev (s "seq") (n sq)))
+
+(defn test-commit-genesis [] :bool
+  (same? (encoded (commit (s "s") (document-null) 0))
+         (cid/hex->bytes "a363736571006470726576f66573746174656173")))
+
+(defn test-commit-next [] :bool
+  (same? (encoded (commit (s "t") (link-document "bafyreifqadrc6zsb42yzhekvsxvaiab7shq4bdeh74elm62s5ntweuip74") 1))
+         (cid/hex->bytes "a363736571016470726576d82a58250001711220b000e22f6641e6b193915595ea04003f91e1c08c87ff08b67b52eb6762510fff6573746174656174")))
+
+(defn test-commit-link-state [] :bool
+  (same? (encoded (commit (link-document "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku") (document-null) 0))
+         (cid/hex->bytes "a363736571006470726576f6657374617465d82a58250001551220e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")))
+
+(defn test-commit-causal [] :bool
+  (same? (encoded (document-map (s "state") (s "u")
+                                (s "prev") (link-document "bafyreiesvnd355et2umrfswrn5wuwcrblyskunzizbdagocrkj3wpotdpa")
+                                (s "seq") (n 2)
+                                (s "causes") (document-vector (link-document "bafyreifqadrc6zsb42yzhekvsxvaiab7shq4bdeh74elm62s5ntweuip74"))
+                                (s "authority") (link-document "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+                                (s "actor") (s "did:key:z6Mk")
+                                (s "lamport") (n 2)))
+         (cid/hex->bytes "a763736571026470726576d82a5825000171122092ab47bef493d51912cad16f6d4b0a215e24aa3728c846033851527767ba6378656163746f726c6469643a6b65793a7a364d6b65737461746561756663617573657381d82a58250001711220b000e22f6641e6b193915595ea04003f91e1c08c87ff08b67b52eb6762510fff676c616d706f72740269617574686f72697479d82a58250001551220e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")))
+
+(defn- one [b :bool] :i64 (if b 1 0))
+
+;; main: the number of test-* that pass (12 when all do).
+(defn main [] :i64
+  (+ (one (test-scalars)) (one (test-f64)) (one (test-bytes-and-link)) (one (test-containers))
+     (one (test-key-order)) (one (test-unicode-key-order)) (one (test-refusals))
+     (one (test-refusal-depth-first)) (one (test-commit-genesis)) (one (test-commit-next))
+     (one (test-commit-link-state)) (one (test-commit-causal))))

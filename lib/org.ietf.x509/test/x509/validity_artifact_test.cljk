@@ -1,0 +1,125 @@
+;; The gate that was missing: does the COMPILED artifact decide the way the
+;; interpreter does?
+;;
+;; `validity_kotoba_test.clj` drives the guest through `kotoba.kir`, which is not what
+;; ships. Until this file existed, nothing here had asserted that
+;; `kotoba -M compile` produces something that answers the same way -- the
+;; shape this workspace keeps warning about, where a check that never ran
+;; looks exactly like a check that passed.
+;;
+;; So: compile with the public CLI, instantiate the `.wasm` on real
+;; `WebAssembly` through amu's own `runtime/browser-host.mjs`, call the
+;; exports, and hold the answers against the interpreter's.
+;;
+;; ## Skipping is not passing
+;;
+;; The gate needs `kotoba`, `nbb` and an amu checkout. Each is measured by
+;; RUNNING it and reading the exit code, never by `which` -- a shim whose
+;; target is gone passes `which` and exits 126, which this migration has
+;; already been bitten by. When a tool is absent the probe exits 3, which is
+;; neither 0 nor 1, and this file reports the absence rather than asserting
+;; nothing.
+
+(ns x509.validity-artifact-test
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private amu-root
+  "The amu checkout that owns the CLI and the browser runtime. Overridable so
+  the gate is not pinned to one machine's layout."
+  (or (System/getenv "AMU_ROOT")
+      (str (System/getProperty "user.home")
+           "/github/com-junkawasaki/orgs/kotoba-lang/amu")))
+
+(defn- runs? [& command]
+  (try (zero? (:exit (apply shell/sh command))) (catch Exception _ false)))
+
+(def ^:private tools
+  (delay
+    {:kotoba (let [bin (str amu-root "/bin/kotoba")]
+               (when (runs? bin "--help") bin))
+     :nbb (when (runs? "nbb" "--version") "nbb")
+     :runtime (io/exists? (io/file amu-root "runtime/browser-host.mjs"))}))
+
+(def ^:private probe
+  (delay
+    (let [{:keys [kotoba nbb runtime]} @tools]
+      (if-not (and kotoba nbb runtime)
+        {:status :unavailable
+         :detail (str "kotoba=" (boolean kotoba) " nbb=" (boolean nbb)
+                      " runtime=" (boolean runtime) " AMU_ROOT=" amu-root)}
+        (let [r (shell/sh nbb "lib/org.ietf.x509/test/x509/artifact_probe.cljk" kotoba amu-root)
+              parsed (try (edn/read-string (str/trim (:out r))) (catch Exception _ nil))]
+          (cond
+            (nil? parsed) {:status :probe-unreadable :detail (str (:out r) (:err r))}
+            (= 3 (:exit r)) (assoc parsed :status (or (:status parsed) :probe-refused))
+            :else parsed))))))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'x509.validity (slurp (io/file (System/getProperty "user.dir") "lib/org.ietf.x509/kotoba/x509/validity.kotoba"))}
+                'x509.validity :wasm32-kotoba-v1))))
+
+(defn- interpreted [f args]
+  (str (ir/execute @kir (symbol f) (vec args) {:fuel 100000})))
+
+(deftest the-compiled-artifact-answers-the-way-the-interpreter-does
+  (let [p @probe]
+    (if (not= :ok (:status p))
+      ;; Not a pass. The suite says out loud that it could not measure.
+      (is false (str "artifact gate could not run: " (:status p) " -- " (:detail p)))
+      (do
+        (is (seq (:results p)) "the probe returned no calls at all")
+        (is (= "0" (:main p))
+            "the artifact's own conformance entry point answered non-zero")
+        (is (re-matches #"[0-9a-f]{64}" (:sha256 p))
+            "and the host measured the module it ran")
+        (testing "every call agrees with the interpreter"
+          (doseq [row (:results p)]
+            (let [f (first row) got (last row) args (butlast (rest row))]
+              (is (= (interpreted f args) got)
+                  (str f "(" (str/join ", " (map pr-str args)) ")")))))))))
+
+(deftest the-gate-would-notice-a-difference
+  ;; The comparison is only worth having if a wrong answer fails it. This
+  ;; asserts the negative directly rather than trusting that it would.
+  (let [p @probe]
+    (when (= :ok (:status p))
+      (let [row (first (:results p))]
+        (is (not= (str (last row) "-not") (interpreted (first row) (butlast (rest row))))
+            "a fabricated answer must not match the interpreter")))))
+
+(deftest the-native-backend-admits-this-guest
+  ;; A guest whose host boundary is strings, integers and booleans compiles
+  ;; to a native code image; one that takes a `:document` does not. Measured
+  ;; on 2026-08-31 across the eleven guests landed that day: six compiled to
+  ;; `aarch64-macos`, and the five that did not were exactly the five whose
+  ;; exports take `:document`, refused with `:kotoba/target-rejected` --
+  ;; "typed values currently require the kotoba-script web target, typed
+  ;; Wasm target, or qualified native string/scalar-record/option-i64/
+  ;; result-i64 features". So the constraint is `:document`, not Wasm.
+  ;;
+  ;; This test keeps THIS guest on the native side of that line: it is the
+  ;; cheapest way to notice if a later change to the exported signatures
+  ;; quietly takes it off.
+  ;;
+  ;; What it does NOT assert is that the native artifact RUNS. `amu run`
+  ;; wants a signed `.kexe` and `amu sign` answers `native export table
+  ;; rejected` for this class of artifact -- measured on `aarch64-macos` and
+  ;; on bare `aarch64`, with a full export table and with `main` alone.
+  ;; Compiled and admitted is measured; executed is not.
+  (if-let [bin (:kotoba @tools)]
+    (let [out (str (System/getProperty "java.io.tmpdir") "/x509-validity-native.kexe")
+          r (shell/sh bin "-M" "compile"
+                      (str (io/file (System/getProperty "user.dir") "lib/org.ietf.x509/kotoba/x509/validity.kotoba"))
+                      "--jvm-free" "--target" "aarch64-macos" "--output" out)]
+      (is (zero? (:exit r))
+          (str "the native backend refused this guest: " (str/trim (str (:out r) (:err r)))))
+      (is (io/exists? (io/file out)) "and produced no code image"))
+    (is false (str "native gate could not run: no kotoba CLI at " amu-root))))
+

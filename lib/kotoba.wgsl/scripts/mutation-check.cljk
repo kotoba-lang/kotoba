@@ -1,0 +1,325 @@
+#!/usr/bin/env kbb
+;; Breaks facts.edn one way at a time and requires verify-facts.cljs to object
+;; FOR THE REASON IT NAMES.
+;;
+;;   kbb --backend sci scripts/mutation-check.cljk              (structural only -- no network)
+;;   kbb --backend sci scripts/mutation-check.cljk --network    (also the fetching branches)
+;;
+;; WHY THE REASON AND NOT THE COLOUR.
+;; A negative test that asserts only "the run went red" counts a run that went
+;; red for an unrelated cause as a discriminating one. Every mutation below
+;; declares the exit code AND the :reason token it must produce, and a run that
+;; goes red the wrong way is a MISMATCH, not a pass.
+;;
+;; STRUCTURAL FIRST, NETWORK OPT-IN AND PACED.
+;; verify-facts.cljs answers everything it can know without the network under
+;; --static, so most of this suite costs milliseconds and puts no load on the
+;; authorities. The network half re-fetches the same few URLs one at a time,
+;; spaced, because a same-URL burst is what trips bot challenges on the kind
+;; of host this pattern was built for.
+;;
+;; NO LAW MUTATIONS. Unlike the sibling ministry registers, kagi's register
+;; cites no e-Gov law, so the law-branch mutations (nonexistent-law,
+;; law-title-drift, law-num-drift) have nothing to act on here and are
+;; dropped. The law branch itself is still exercised by verify-facts.cljs's
+;; own :nonexistent-law self-test, which needs no register entry.
+
+(ns mutation-check
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [promesa.core :as p]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            ["child_process" :as cp]
+            ["process" :as process]))
+
+(def argv (vec (drop 2 (js->clj (.-argv process)))))
+(def network? (boolean (some #{"--network"} argv)))
+(defn- flag [name default]
+  (let [i (.indexOf (into-array argv) name)]
+    (if (and (>= i 0) (< (inc i) (count argv))) (nth argv (inc i)) default)))
+
+(def base-path (flag "--facts" "facts.edn"))
+(def verifier-path (flag "--verifier" "scripts/verify-facts.cljk"))
+(def only (let [v (flag "--only" nil)]
+            (when v (into #{} (str/split v #",")))))
+
+;; Seconds of quiet between network mutations. The default is deliberately
+;; large: the page mutations re-ask the same few URLs, and a same-URL burst is
+;; what trips a bot challenge on ministry-grade hosts.
+(def gap-ms (* 1000 (js/parseInt (flag "--gap" "30"))))
+
+(def base-text (fs/readFileSync base-path "utf8"))
+(def base-data (edn/read-string base-text))
+
+(defn- sleep [ms] (p/create (fn [res _] (js/setTimeout #(res nil) ms))))
+
+(defn- tmpfile [suffix]
+  (path/join (os/tmpdir) (str "wgsl-mutation-" suffix ".edn")))
+
+(defn- run-verifier
+  "Returns {:exit :out}. Written to a file and read back rather than piped:
+  in a shell, $? after a pipe is the LAST command's status, and this suite
+  exists to stop exactly that class of mistake."
+  [facts-file static?]
+  (let [args (cond-> [verifier-path "--facts" facts-file]
+               static? (conj "--static")
+               (not static?) (into ["--pace" "3000"]))
+        r (cp/spawnSync "nbb" (clj->js args)
+                        #js {:encoding "utf8" :timeout 600000})]
+    {:exit (if (nil? (.-status r)) 124 (.-status r))
+     :out (str (.-stdout r) (.-stderr r))}))
+
+;; --- the register, and a minimal one for the network half ----------------
+
+(defn- recount
+  "Rewrite the :coverage entity so a subset register is self-consistent.
+  Without this every subset run would fail on the coverage block instead of on
+  the mutation under test."
+  [data]
+  (let [sourced (filterv :source/url data)
+        by (frequencies (map :source/verify sourced))]
+    (mapv (fn [e]
+            (if (= :coverage (:source/kind e))
+              (assoc e :coverage/entries (count sourced) :coverage/by-verify by)
+              e))
+          data)))
+
+(defn- subset [ids]
+  (recount (filterv #(or (= :coverage (:source/kind %)) (ids (:source/id %))) base-data)))
+
+(def with-pages
+  "Two page-identity entries on two hosts (so the self-test pool is legal),
+  their two host entities, one host entity behind the page-text entry, and
+  one :page-text entry -- the smallest register that still reaches every page
+  branch without bursting any host."
+  (subset #{"host.gpuweb-github-io" "host.github-com"
+            "page.gpuweb-wgsl-spec" "page.gpuweb-repo"
+            "page.gpuweb-wgsl-bikeshed-source"}))
+
+;; --- mutation helpers ----------------------------------------------------
+
+(defn- alter-entity [data id f]
+  (mapv #(if (= id (:source/id %)) (f %) %) data))
+
+(defn- alter-coverage [data f]
+  (mapv #(if (= :coverage (:source/kind %)) (f %) %) data))
+
+;; --- the mutations -------------------------------------------------------
+;; :want-exit and :want-reason are both asserted. :want-reason is matched as a
+;; literal token in the output, so a rename upstream breaks this suite -- which
+;; is the point: pinning the reason is what makes the assertion mean anything.
+
+(def structural
+  [{:id "coverage-entry-count"
+    :why "a source added without updating :coverage/entries"
+    :mutate #(alter-coverage % (fn [c] (update c :coverage/entries inc)))
+    :want-exit 1 :want-reason ":coverage/entries says"}
+
+   {:id "coverage-by-verify"
+    :why "the per-check tally drifting from the file"
+    :mutate #(alter-coverage % (fn [c] (assoc c :coverage/by-verify {:page-identity 1})))
+    :want-exit 1 :want-reason ":coverage/by-verify says"}
+
+   {:id "duplicate-source-id"
+    :why "the join key stops being a key"
+    :mutate #(alter-entity % "page.gpuweb-repo" (fn [e] (assoc e :source/id "page.gpuweb-wgsl-spec")))
+    :want-exit 1 :want-reason "duplicate :source/id"}
+
+   {:id "duplicate-source-url"
+    :why "the same source counted twice under two ids"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-bikeshed-source"
+                           (fn [e] (assoc e :source/url "https://github.com/gpuweb/gpuweb")))
+    :want-exit 1 :want-reason "duplicate :source/url"}
+
+   {:id "unknown-verify-tag"
+    :why "a tag no check knows how to run"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-spec" (fn [e] (assoc e :source/verify :vibes)))
+    :want-exit 2 :want-reason "unknown-verify"}
+
+   {:id "page-text-without-needles"
+    :why "a declared :page-text check with nothing to check"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-bikeshed-source" (fn [e] (dissoc e :page/must-contain)))
+    :want-exit 2 :want-reason "no-needles"}
+
+   {:id "needles-nothing-reads"
+    :why "must-contain on a :page-identity entry, so nothing reads it"
+    :mutate #(alter-entity % "page.gpuweb-repo"
+                           (fn [e] (assoc e :page/must-contain ["never read"])))
+    :want-exit 1 :want-reason "unchecked-needles"}
+
+   {:id "page-on-undeclared-host"
+    :why "a page whose host has no measured :host-behaviour behind it"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-spec"
+                           (fn [e] (assoc e :source/url "https://www.w3.org/TR/WGSL/")))
+    :want-exit 1 :want-reason "no :host-behaviour entity"}
+
+   {:id "all-pages-on-one-host"
+    :why "a self-test pool on one host, which would burst that host"
+    :mutate (fn [data]
+              (mapv (fn [e]
+                      (if (and (= :page-identity (:source/verify e))
+                               (not= "page.gpuweb-wgsl-spec" (:source/id e)))
+                        (assoc e :source/verify :page-text
+                                 :page/must-contain ["x"])
+                        e))
+                    data))
+    :want-exit 2 :want-reason "is on one host"}
+
+   {:id "empty-register"
+    :why "an empty register is not a clean register"
+    :mutate (fn [_] [])
+    :want-exit 2 :want-reason "declares 0 sources"}
+
+   {:id "no-host-behaviour"
+    :why "page checks resting on an assumption nothing measures"
+    :mutate #(filterv (fn [e] (not= :host-behaviour (:source/kind e))) %)
+    :want-exit 2 :want-reason "declares no :host-behaviour"}
+
+   {:id "coverage-entity-removed"
+    :why "a register that never says what it leaves out"
+    :mutate #(filterv (fn [e] (not= :coverage (:source/kind e))) %)
+    :want-exit 1 :want-reason "no :coverage entity"}])
+
+(def structural-text
+  "Mutations that have to be made to the TEXT, because they are about what the
+  reader does with malformed input and cannot be expressed as data."
+  [{:id "entity-appended-after-close"
+    :why "an entity after the closing bracket, which edn/read-string discards silently"
+    :mutate-text #(str % "\n{:source/id \"ghost\" :source/verify :page-identity}\n")
+    :want-exit 2 :want-reason "top-level forms"}
+
+   {:id "broken-edn"
+    :why "a register that does not read at all"
+    :mutate-text #(str/replace-first % "[" "[{:unclosed ")
+    :want-exit 2 :want-reason "cannot read"}])
+
+(def network
+  [{:id "page-title-drift"
+    :why "a real page recorded under a title it does not carry"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-spec" (fn [e] (assoc e :page/title "WebGPU (not the shading language)")))
+    :want-exit 1 :want-reason "title-drift"}
+
+   {:id "missing-text"
+    :why "a string the page does not contain"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-bikeshed-source"
+                           (fn [e] (assoc e :page/must-contain ["WGSL SYNTAX IS WHATEVER THIS SAYS"])))
+    :want-exit 1 :want-reason "missing-text"}
+
+   {:id "charset-drift"
+    :why "a UTF-8 page declared as Shift_JIS -- every Japanese string would be compared against mojibake"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-spec" (fn [e] (assoc e :page/charset "shift_jis")))
+    :want-exit 1 :want-reason "charset-drift"}
+
+   {:id "unexpected-redirect"
+    :why "a URL that lands somewhere other than where it asked"
+    :mutate #(alter-entity % "page.gpuweb-wgsl-bikeshed-source"
+                           (fn [e] (assoc e :source/url "http://github.com/gpuweb/gpuweb")))
+    :want-exit 1 :want-reason "unexpected-redirect"}
+
+   {:id "not-2xx"
+    :why "a cited page that is not there"
+    :mutate #(alter-entity % "page.gpuweb-repo"
+                           (fn [e] (assoc e :source/url "https://github.com/gpuweb/gpuweb-no-such-zzz9")))
+    :want-exit 1 :want-reason "not-2xx"}
+
+   {:id "host-status-drift"
+    :why "a host whose refusal is not the refusal the register measured"
+    :mutate #(alter-entity % "host.gpuweb-github-io"
+                           (fn [e] (assoc e :host/missing-status 403)))
+    :want-exit 1 :want-reason "host-status-drift"}])
+
+;; --- driving -------------------------------------------------------------
+
+(defn- verdict [m {:keys [exit out]}]
+  (let [reason-seen (str/includes? out (:want-reason m))
+        ;; A TOKEN the verifier emits, not prose: "BLOCKED\tchallenge". Prose
+        ;; markers collide with the verifier's own explanations of what trips
+        ;; a challenge (three colliding markers were tried in the sibling
+        ;; register; see the note beside `blocked` in verify-facts.cljs).
+        challenged (str/includes? out "BLOCKED\tchallenge")]
+    (cond
+      ;; A blocked run says nothing about the mutation. Not a pass, not a fail.
+      (and challenged (not (str/includes? (:want-reason m) "challenge")))
+      {:state :inconclusive
+       :note (str "a bot challenge stood in the way (exit " exit
+                  "), so this mutation was not actually tested")}
+
+      (and (= exit (:want-exit m)) reason-seen)
+      {:state :caught :note (str "exit " exit ", reason " (pr-str (:want-reason m)))}
+
+      (= exit 0)
+      {:state :missed :note "the verifier reported OK on a register that is wrong"}
+
+      (not reason-seen)
+      {:state :wrong-reason
+       :note (str "went red (exit " exit ") but never named " (pr-str (:want-reason m))
+                  " -- red for some other cause is not a discriminating run")}
+
+      :else
+      {:state :wrong-exit
+       :note (str "named the reason but exited " exit ", wanted " (:want-exit m))})))
+
+(defn- apply-one [m data static?]
+  (let [f (tmpfile (:id m))]
+    (if-let [mt (:mutate-text m)]
+      (fs/writeFileSync f (mt (if static? (pr-str data) base-text)) "utf8")
+      (fs/writeFileSync f (pr-str ((:mutate m) data)) "utf8"))
+    (let [r (run-verifier f static?)]
+      (fs/unlinkSync f)
+      (assoc (verdict m r) :id (:id m) :why (:why m)))))
+
+(defn- report [rs]
+  (doseq [r rs]
+    (println (str "  " (case (:state r)
+                         :caught "CAUGHT      "
+                         :missed "MISSED      "
+                         :wrong-reason "WRONG-REASON"
+                         :wrong-exit "WRONG-EXIT  "
+                         :inconclusive "INCONCLUSIVE")
+                  "\t" (:id r) "\t" (:note r))))
+  rs)
+
+(defn- wanted [ms] (if only (filterv #(only (:id %)) ms) ms))
+
+(p/let [_ (println (str "── structural mutations (no network) ──────────────────────────"
+                        (when only (str "\n   --only " (pr-str (vec only))))))
+        struct-rs (p/loop [rem (wanted (into structural structural-text)) acc []]
+                    (if (empty? rem)
+                      acc
+                      (let [m (first rem)]
+                        (p/recur (vec (rest rem))
+                                 (conj acc (apply-one m base-data true))))))
+        _ (report struct-rs)
+        net-rs (if-not network?
+                 (do (println "\n── network mutations SKIPPED (pass --network to run them) ─────")
+                     [])
+                 (p/let [_ (println (str "\n── network mutations, paced ("
+                                         (count (wanted network))
+                                         " on a minimal page-bearing register) ──"))
+                         rs (p/loop [rem (wanted network) acc []]
+                              (if (empty? rem)
+                                acc
+                                (p/let [m (first rem)
+                                        r (apply-one m with-pages false)
+                                        _ (report [r])
+                                        _ (when (seq (rest rem)) (sleep gap-ms))]
+                                  (p/recur (vec (rest rem)) (conj acc r)))))]
+                   rs))]
+  (let [all (into struct-rs net-rs)
+        caught (filterv #(= :caught (:state %)) all)
+        incon (filterv #(= :inconclusive (:state %)) all)
+        bad (filterv #(#{:missed :wrong-reason :wrong-exit} (:state %)) all)]
+    (println (str "\ncaught=" (count caught) " inconclusive=" (count incon)
+                  " not-caught=" (count bad) " of " (count all)))
+    (when (seq incon)
+      (println (str "⚠ " (count incon) " mutation(s) were never actually tested. "
+                    "Re-run them; do not read this as a pass.")))
+    (cond
+      (seq bad) (do (println "FAIL\tthe verifier does not discriminate these")
+                    (.exit process 1))
+      (seq incon) (do (println "REFUSED\tsome mutations could not be tested")
+                      (.exit process 2))
+      :else (do (println (str "OK\t" (count caught) " mutation(s), each caught by its own reason"))
+                (.exit process 0)))))

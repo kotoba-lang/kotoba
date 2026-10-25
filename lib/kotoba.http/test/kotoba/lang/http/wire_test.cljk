@@ -1,0 +1,495 @@
+(ns kotoba.lang.http.wire-test
+  "Offline, deterministic proof for the HTTP/1.1 wire layer.
+
+  Two things are asserted throughout. First, that every refusal produces its
+  OWN reason keyword -- a parser that refuses everything with :bad-response
+  tells a caller nothing and cannot be acted on. Second, that the parse does
+  not depend on how the bytes were chunked: `feed-one-byte-at-a-time` re-runs
+  the positive cases a byte at a time and demands the identical value, which
+  is where real parsers break."
+  (:require [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.http :as http]
+            [kotoba.lang.http.wire :as w]))
+
+;; --- evidence floor (root ADR-2608136000) --------------------------------
+;; A suite that ran nothing must not report success.
+
+(def ^:private executed (atom 0))
+(def ^:private test-floor 45)
+
+(use-fixtures :each (fn [f] (swap! executed inc) (f)))
+
+(use-fixtures :once
+  (fn [f]
+    (reset! executed 0)
+    (f)
+    (println (str "EXECUTED\t" @executed "\tFLOOR\t" test-floor))
+    (is (pos? @executed) "zero tests executed: a suite that ran nothing is not a pass")
+    (is (>= @executed test-floor)
+        (str "executed " @executed " tests, floor is " test-floor))))
+
+;; --- helpers --------------------------------------------------------------
+
+(defn- oct [s] (w/->octets s))
+(defn- body-str [resp] (w/latin1-decode (:http/body resp)))
+
+(defn- feed-one-byte-at-a-time
+  "Drive the parser with single-octet feeds, then EOF if still incomplete."
+  ([octets] (feed-one-byte-at-a-time octets nil))
+  ([octets opts]
+   (loop [st (w/recv-init opts) i 0]
+     (if (>= i (count octets))
+       (w/recv-eof st)
+       (let [r (w/recv-feed st [(nth octets i)])]
+         (case (first r)
+           :continue (recur (nth r 1) (inc i))
+           r))))))
+
+(defn- same-either-way?
+  "The all-at-once parse and the byte-at-a-time parse must agree exactly."
+  [s opts]
+  (let [o (oct s)
+        whole (w/parse-response o (assoc opts :eof? true))
+        drip (feed-one-byte-at-a-time o opts)]
+    (= whole drip)))
+
+(defn- scripted-transport
+  "A transport that hands back `reads` (strings) one call at a time, then EOF,
+  and records what was written."
+  [reads]
+  (let [remaining (atom (vec reads))
+        written (atom [])]
+    {:write (fn [os] (swap! written into os) [:ok (count os)])
+     :read (fn [] (if-let [nxt (first @remaining)]
+                    (do (swap! remaining subvec 1) [:ok (oct nxt)])
+                    [:eof]))
+     :written written}))
+
+;; ==========================================================================
+;; octets
+;; ==========================================================================
+
+(deftest utf8-round-trip
+  (doseq [s ["" "hello" "café" "日本語" "🚀 rocket"]]
+    (is (= [:ok s] (w/utf8-decode (w/utf8-encode s))) (str "round trip: " s)))
+  (is (= [104 101 108 108 111] (w/utf8-encode "hello")))
+  (is (= [0xF0 0x9F 0x9A 0x80] (w/utf8-encode "🚀"))))
+
+(deftest utf8-decode-refuses-invalid
+  (is (= :invalid-utf8 (w/reason (w/utf8-decode [0xC3]))))
+  (is (= :invalid-utf8 (w/reason (w/utf8-decode [0x80]))))
+  (is (= :invalid-utf8 (w/reason (w/utf8-decode [0xC0 0x80])))))
+
+(deftest latin1-is-lossless-and-bounded
+  (is (= [:ok [72 105 255]] (w/latin1-encode "Hiÿ")))
+  (is (= :not-latin1 (w/reason (w/latin1-encode "Ā"))))
+  (is (= "Hiÿ" (w/latin1-decode [72 105 255]))))
+
+(deftest hex-encoding
+  (is (= "00ff10" (w/octets->hex [0 255 16])))
+  (is (= "" (w/octets->hex []))))
+
+;; ==========================================================================
+;; request serialisation (RFC 9112 §3)
+;; ==========================================================================
+
+(deftest serialises-a-get-with-host-from-the-url
+  (let [r (w/serialize-request (http/request :get "https://a.b/x?y=1"))]
+    (is (w/ok? r))
+    (is (= "GET /x?y=1 HTTP/1.1\r\nHost: a.b\r\n\r\n" (w/latin1-decode (w/value r))))))
+
+(deftest serialises-default-path-and-explicit-port
+  (is (= "GET / HTTP/1.1\r\nHost: a.b:8443\r\n\r\n"
+         (w/latin1-decode (w/value (w/serialize-request (http/request :get "https://a.b:8443"))))))
+  (is (= "GET / HTTP/1.1\r\nHost: a.b\r\n\r\n"
+         (w/latin1-decode (w/value (w/serialize-request (http/request :get "https://a.b/")))))))
+
+(deftest serialises-a-body-and-supplies-content-length
+  (let [r (w/serialize-request (http/request :post "https://a.b/x" {:body "hi"}))]
+    (is (= "POST /x HTTP/1.1\r\nHost: a.b\r\nContent-Length: 2\r\n\r\nhi"
+           (w/latin1-decode (w/value r))))))
+
+(deftest caller-supplied-host-is-not-duplicated
+  (let [out (w/latin1-decode (w/value (w/serialize-request
+                                       (http/request :get "https://a.b/x" {:headers {"host" "other"}}))))]
+    (is (= 1 (count (re-seq #"host:" (str/lower out)))))
+    (is (str/includes? out "host: other"))))
+
+(deftest refuses-cr-in-a-header-name
+  (is (= :header-name-contains-control
+         (w/reason (w/serialize-request
+                    (http/request :get "https://a.b/" {:headers {"X-A\r\nEvil" "1"}}))))))
+
+(deftest refuses-lf-in-a-header-value
+  (is (= :header-value-contains-control
+         (w/reason (w/serialize-request
+                    (http/request :get "https://a.b/"
+                                  {:headers {"X-A" "1\nContent-Length: 0"}}))))))
+
+(deftest refuses-nul-in-a-header-value
+  (is (= :header-value-contains-control
+         (w/reason (w/serialize-request
+                    (http/request :get "https://a.b/"
+                                  {:headers {"X-A" (str "a" (char 0) "b")}}))))))
+
+(deftest refuses-a-space-inside-a-header-name
+  (is (= :invalid-header-name
+         (w/reason (w/serialize-request
+                    (http/request :get "https://a.b/" {:headers {"X A" "1"}}))))))
+
+(deftest refuses-an-empty-header-name
+  (is (= :empty-header-name
+         (w/reason (w/serialize-request
+                    (http/request :get "https://a.b/" {:headers {"" "1"}}))))))
+
+(deftest refuses-a-non-token-method
+  (is (= :invalid-method
+         (w/reason (w/serialize-request {:http/method "GET POST" :http/url "https://a.b/"})))))
+
+(deftest refuses-a-target-it-cannot-parse
+  (is (= :invalid-request-target
+         (w/reason (w/serialize-request (http/request :get "not a url"))))))
+
+(deftest refuses-a-non-latin1-header-value
+  (is (= :header-value-not-latin1
+         (w/reason (w/serialize-request
+                    (http/request :get "https://a.b/" {:headers {"X-A" "日"}}))))))
+
+(deftest refuses-a-request-body-over-the-caller-ceiling
+  (is (= :body-too-large
+         (w/reason (w/serialize-request (http/request :post "https://a.b/" {:body "0123456789"})
+                                        {:limits {:max-body-bytes 4}})))))
+
+;; ==========================================================================
+;; response parsing -- positive paths
+;; ==========================================================================
+
+(def ^:private cl-response
+  (str "HTTP/1.1 200 OK\r\n"
+       "Content-Type: text/plain\r\n"
+       "Content-Length: 5\r\n"
+       "\r\nhello"))
+
+(def ^:private chunked-response
+  (str "HTTP/1.1 200 OK\r\n"
+       "Transfer-Encoding: chunked\r\n"
+       "\r\n"
+       "5\r\nhello\r\n"
+       "1\r\n \r\n"
+       "6;ext=1\r\nworld!\r\n"
+       "0\r\n"
+       "X-Checksum: abc\r\n"
+       "\r\n"))
+
+(def ^:private close-framed-response
+  "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nstreamed to close")
+
+(deftest parses-a-content-length-body
+  (let [r (w/parse-response (oct cl-response))]
+    (is (w/ok? r))
+    (let [resp (w/value r)]
+      (is (= 200 (:http/status resp)))
+      (is (= "HTTP/1.1" (:http/version resp)))
+      (is (= "OK" (:http/reason-phrase resp)))
+      (is (= "hello" (body-str resp)))
+      (is (= 5 (count (:http/body resp))))
+      (is (= "text/plain" (http/header (:http/headers resp) "Content-Type"))))))
+
+(deftest parses-a-chunked-body-with-multiple-chunks-and-a-trailer
+  (let [r (w/parse-response (oct chunked-response))]
+    (is (w/ok? r))
+    (let [resp (w/value r)]
+      (is (= 200 (:http/status resp)))
+      (is (= "hello world!" (body-str resp)))
+      (is (= {"x-checksum" "abc"} (:http/trailers resp))))))
+
+(deftest parses-a-connection-close-framed-body
+  (let [r (w/parse-response (oct close-framed-response) {:eof? true})]
+    (is (w/ok? r))
+    (is (= "streamed to close" (body-str (w/value r)))))
+  (testing "without EOF it is still incomplete -- close is the frame"
+    (is (= :continue (first (w/parse-response (oct close-framed-response)))))))
+
+(deftest parses-a-zero-length-body
+  (let [r (w/parse-response (oct "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))]
+    (is (w/ok? r))
+    (is (= [] (:http/body (w/value r))))
+    (is (= 0 (count (:http/body (w/value r)))))))
+
+(deftest bodyless-statuses-carry-no-body
+  (doseq [[status raw] [[204 "HTTP/1.1 204 No Content\r\n\r\n"]
+                        [304 "HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n"]]]
+    (let [r (w/parse-response (oct raw))]
+      (is (w/ok? r) (str "status " status))
+      (is (= status (:http/status (w/value r))))
+      (is (= [] (:http/body (w/value r)))))))
+
+(deftest a-head-response-is-bodyless-despite-content-length
+  (let [r (w/parse-response (oct "HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n")
+                            {:method :head})]
+    (is (w/ok? r))
+    (is (= [] (:http/body (w/value r))))
+    (is (= "42" (http/header (:http/headers (w/value r)) "content-length")))))
+
+(deftest interim-responses-are-discarded
+  (let [r (w/parse-response (oct (str "HTTP/1.1 100 Continue\r\n\r\n"
+                                      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")))]
+    (is (w/ok? r))
+    (is (= 200 (:http/status (w/value r))))
+    (is (= "ok" (body-str (w/value r))))))
+
+(deftest repeated-headers-join-but-raw-lines-survive
+  (let [r (w/parse-response (oct "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\n\r\n"))
+        resp (w/value r)]
+    (is (= "a=1, b=2" (get (:http/headers resp) "set-cookie")))
+    (is (= [["Set-Cookie" "a=1"] ["Set-Cookie" "b=2"] ["Content-Length" "0"]]
+           (:http/header-lines resp)))))
+
+(deftest identical-duplicate-content-length-is-accepted-deliberately
+  (testing "RFC 9112 6.3 permits collapsing identical duplicates; only disagreement is a desync"
+    (let [r (w/parse-response (oct "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc"))]
+      (is (w/ok? r))
+      (is (= "abc" (body-str (w/value r)))))
+    (let [r (w/parse-response (oct "HTTP/1.1 200 OK\r\nContent-Length: 3, 3\r\n\r\nabc"))]
+      (is (w/ok? r))
+      (is (= "abc" (body-str (w/value r)))))))
+
+(deftest a-http-1-0-response-parses
+  (let [r (w/parse-response (oct "HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nz"))]
+    (is (w/ok? r))
+    (is (= "HTTP/1.0" (:http/version (w/value r))))))
+
+;; ==========================================================================
+;; byte-boundary independence -- one octet at a time
+;; ==========================================================================
+
+(deftest parse-does-not-depend-on-read-boundaries
+  (doseq [[label raw] [["content-length" cl-response]
+                       ["chunked+trailer" chunked-response]
+                       ["close-framed" close-framed-response]
+                       ["zero-length" "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]
+                       ["interim then real" (str "HTTP/1.1 100 Continue\r\n\r\n"
+                                                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")]]]
+    (is (same-either-way? raw nil) (str "byte-at-a-time differs for " label))))
+
+(deftest refusals-also-survive-byte-at-a-time
+  (doseq [[reason raw] [[:content-length-with-transfer-encoding
+                         "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n"]
+                        [:conflicting-content-length
+                         "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n"]
+                        [:invalid-chunk-size
+                         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"]
+                        [:header-missing-colon
+                         "HTTP/1.1 200 OK\r\nNotAHeader\r\n\r\n"]]]
+    (is (= reason (w/reason (feed-one-byte-at-a-time (oct raw))))
+        (str "expected " reason " when dripped"))))
+
+(deftest chunked-parses-across-every-two-way-split
+  (let [o (oct chunked-response)
+        expected (w/parse-response o)]
+    (doseq [i (range (inc (count o)))]
+      (let [r (w/recv-feed (w/recv-init) (subvec o 0 i))
+            r' (if (= :continue (first r)) (w/recv-feed (nth r 1) (subvec o i)) r)]
+        (is (= expected r') (str "split at " i))))))
+
+;; ==========================================================================
+;; response parsing -- the refusals that matter
+;; ==========================================================================
+
+(defn- refusal [raw & [opts]]
+  (w/reason (w/parse-response (oct raw) (merge {:eof? true} opts))))
+
+(deftest refuses-content-length-with-transfer-encoding
+  (testing "RFC 9112 6.1 -- the classic request-smuggling desync"
+    (is (= :content-length-with-transfer-encoding
+           (refusal "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello")))
+    (testing "refused even on a status that would otherwise be bodyless"
+      (is (= :content-length-with-transfer-encoding
+             (refusal "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"))))))
+
+(deftest refuses-disagreeing-content-lengths
+  (is (= :conflicting-content-length
+         (refusal "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello")))
+  (is (= :conflicting-content-length
+         (refusal "HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello"))))
+
+(deftest refuses-a-malformed-content-length
+  (doseq [v ["abc" "5x" "+5" "-1" "5 5" ""]]
+    (is (= :malformed-content-length
+           (refusal (str "HTTP/1.1 200 OK\r\nContent-Length: " v "\r\n\r\n")))
+        (str "Content-Length: " v))))
+
+(deftest refuses-a-chunk-size-that-is-not-hex
+  (is (= :invalid-chunk-size
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\nhello\r\n0\r\n\r\n")))
+  (testing "and one padded with whitespace, rather than trimming it"
+    (is (= :invalid-chunk-size
+           (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n 5\r\nhello\r\n0\r\n\r\n")))))
+
+(deftest refuses-a-chunk-that-runs-past-what-arrived
+  (testing "declared 5 octets, connection closed after 2"
+    (is (= :truncated-chunk-data
+           (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe")))))
+
+(deftest refuses-a-chunked-body-with-no-final-chunk
+  (is (= :missing-last-chunk
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")))
+  (testing "and one that reached the trailer section but never terminated it"
+    (is (= :missing-last-chunk
+           (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-A: 1\r\n")))))
+
+(deftest refuses-a-chunk-not-followed-by-crlf
+  (is (= :missing-chunk-crlf
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n"))))
+
+(deftest refuses-a-header-line-without-a-colon
+  (is (= :header-missing-colon
+         (refusal "HTTP/1.1 200 OK\r\nContentLength 5\r\n\r\n"))))
+
+(deftest refuses-whitespace-before-the-colon
+  (testing "RFC 9112 5.1 -- an intermediary that trims here desynchronises"
+    (is (= :whitespace-before-colon
+           (refusal "HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\n")))))
+
+(deftest refuses-a-bare-lf-line-terminator
+  (is (= :bare-lf-line-terminator (refusal "HTTP/1.1 200 OK\nContent-Length: 0\r\n\r\n")))
+  (is (= :bare-lf-line-terminator
+         (refusal "HTTP/1.1 200 OK\r\nContent-Length: 0\n\r\n"))))
+
+(deftest refuses-an-obsolete-line-fold
+  (is (= :obs-fold (refusal "HTTP/1.1 200 OK\r\nX-A: 1\r\n  continued\r\n\r\n"))))
+
+(deftest refuses-an-invalid-header-name-in-a-response
+  (is (= :invalid-header-name (refusal "HTTP/1.1 200 OK\r\nX A: 1\r\n\r\n"))))
+
+(deftest refuses-a-response-body-over-the-caller-ceiling
+  (testing "content-length"
+    (is (= :body-too-large
+           (refusal "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" {:limits {:max-body-bytes 10}}))))
+  (testing "chunked"
+    (is (= :body-too-large
+           (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n"
+                    {:limits {:max-body-bytes 10}}))))
+  (testing "connection-close framing is bounded too"
+    (is (= :body-too-large
+           (refusal (str "HTTP/1.1 200 OK\r\n\r\n" (apply str (repeat 50 "x")))
+                    {:limits {:max-body-bytes 10}})))))
+
+(deftest refuses-an-unbounded-line
+  (is (= :line-too-long
+         (refusal (str "HTTP/1.1 200 OK\r\nX-A: " (apply str (repeat 200 "x")) "\r\n\r\n")
+                  {:limits {:max-line-bytes 32}})))
+  (testing "and refuses before the line ever terminates, not after buffering it"
+    (let [r (w/recv-feed (w/recv-init {:limits {:max-line-bytes 16}})
+                         (oct (apply str (repeat 100 "x"))))]
+      (is (= :line-too-long (w/reason r))))))
+
+(deftest refuses-too-many-headers
+  (is (= :too-many-headers
+         (refusal "HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\nC: 3\r\nD: 4\r\n\r\n"
+                  {:limits {:max-headers 2}}))))
+
+(deftest refuses-too-many-chunks
+  (is (= :too-many-chunks
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n"
+                  {:limits {:max-chunks 2}}))))
+
+(deftest refuses-an-endless-run-of-interim-responses
+  (is (= :too-many-informational-responses
+         (refusal (str (apply str (repeat 12 "HTTP/1.1 100 Continue\r\n\r\n"))
+                       "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                  {:limits {:max-informational 3}}))))
+
+(deftest refuses-a-version-it-does-not-speak
+  (testing "HTTP/2 is not silently treated as HTTP/1.1"
+    (is (= :unsupported-http-version (refusal "HTTP/2 200 OK\r\n\r\n")))
+    (is (= :unsupported-http-version (refusal "HTTP/1.2 200 OK\r\nContent-Length: 0\r\n\r\n")))))
+
+(deftest refuses-a-malformed-status-line
+  (is (= :malformed-status-line (refusal "200 OK\r\n\r\n")))
+  (is (= :malformed-status-line (refusal "HTTP/1.1_200 OK\r\n\r\n")))
+  (is (= :malformed-status-code (refusal "HTTP/1.1 2xx OK\r\n\r\n")))
+  (is (= :malformed-status-code (refusal "HTTP/1.1 20 OK\r\n\r\n"))))
+
+(deftest refuses-unsupported-transfer-codings
+  (is (= :unsupported-transfer-encoding
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")))
+  (is (= :chunked-not-final-coding
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n")))
+  (is (= :chunked-repeated
+         (refusal "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n"))))
+
+(deftest names-each-kind-of-truncation-separately
+  (is (= :empty-response (w/reason (w/recv-eof (w/recv-init)))))
+  (is (= :truncated-response-head (refusal "HTTP/1.1 200 OK\r\nContent-Len")))
+  (is (= :truncated-body (refusal "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"))))
+
+;; ==========================================================================
+;; exchange over an injected transport
+;; ==========================================================================
+
+(deftest exchange-writes-the-request-and-parses-the-response
+  (let [t (scripted-transport [cl-response])
+        r (w/exchange t (http/request :get "https://a.b/x"))]
+    (is (w/ok? r))
+    (is (= "hello" (body-str (w/value r))))
+    (is (= "GET /x HTTP/1.1\r\nHost: a.b\r\n\r\n" (w/latin1-decode @(:written t))))))
+
+(deftest exchange-survives-a-transport-that-yields-one-octet-per-read
+  (let [t (scripted-transport (map str (w/latin1-decode (oct chunked-response))))
+        r (w/exchange t (http/request :get "https://a.b/x"))]
+    (is (w/ok? r))
+    (is (= "hello world!" (body-str (w/value r))))
+    (is (= {"x-checksum" "abc"} (:http/trailers (w/value r))))))
+
+(deftest exchange-treats-eof-as-the-frame-when-there-is-no-other
+  (let [t (scripted-transport ["HTTP/1.1 200 OK\r\n\r\n" "abc" "def"])
+        r (w/exchange t (http/request :get "https://a.b/"))]
+    (is (w/ok? r))
+    (is (= "abcdef" (body-str (w/value r))))))
+
+(deftest exchange-propagates-a-transport-write-failure-as-a-value
+  (let [t {:write (fn [_] [:error :tls-closed {:where :write}])
+           :read (fn [] [:eof])}
+        r (w/exchange t (http/request :get "https://a.b/"))]
+    (is (w/error? r))
+    (is (= :tls-closed (w/reason r)))))
+
+(deftest exchange-propagates-a-transport-read-failure-as-a-value
+  (let [t {:write (fn [_] [:ok 0]) :read (fn [] [:error :tls-alert {:code 40}])}]
+    (is (= :tls-alert (w/reason (w/exchange t (http/request :get "https://a.b/")))))))
+
+(deftest exchange-refuses-a-transport-that-never-delivers
+  (let [t {:write (fn [_] [:ok 0]) :read (fn [] [:ok []])}
+        r (w/exchange t (http/request :get "https://a.b/") {:limits {:max-read-calls 10}})]
+    (is (= :transport-stalled (w/reason r)))))
+
+(deftest exchange-refuses-before-writing-a-smuggled-header
+  (let [t (scripted-transport [cl-response])
+        r (w/exchange t (http/request :get "https://a.b/" {:headers {"X" "a\r\nY: b"}}))]
+    (is (= :header-value-contains-control (w/reason r)))
+    (is (= [] @(:written t)) "nothing may reach the wire once the request is refused")))
+
+;; ==========================================================================
+;; IHttp over the transport
+;; ==========================================================================
+
+(deftest ihttp-over-a-transport-returns-a-response-map
+  (let [c (w/transport-http (scripted-transport [cl-response]))
+        resp (http/send c (http/request :get "https://a.b/x"))]
+    (is (= 200 (:http/status resp)))
+    (is (nil? (:http/error resp)))
+    (is (= "text/plain" (http/header (:http/headers resp) "content-type")))))
+
+(deftest ihttp-reports-failure-as-a-response-value-and-never-throws
+  (let [c (w/transport-http {:write (fn [_] [:ok 0]) :read (fn [] [:eof])})
+        resp (http/send c (http/request :get "https://a.b/x"))]
+    (is (= 0 (:http/status resp)))
+    (is (= :empty-response (:http/error resp)))))
+
+(deftest ihttp-decodes-a-json-body-through-the-existing-helpers
+  (let [raw "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"
+        c (w/transport-http (scripted-transport [raw]))
+        resp (http/send c (http/request :get "https://a.b/x"))]
+    (is (= {"ok" true} (http/decode-json-body (update resp :http/body w/latin1-decode))))))

@@ -1,0 +1,230 @@
+(ns kotoba.crdt.doc-kotoba-parity-test
+  "Binds `doc.kotoba` to `doc.cljc` — the same op log, the same document.
+
+  This is where the other three meet: entity membership comes from the OR-Set,
+  field values from the LWW-Register, and both are reached through one op type.
+  Agreeing on `orset` and `register` separately does not imply agreeing here,
+  because `doc` is where each one is wired to the other — `apply-set` merges an
+  incoming register into whatever the entity already had, and `merge-docs`
+  merges field maps entity by entity.
+
+  ## How this is driven
+
+  Ops are data, applied to both implementations by the same interpreter below.
+  Only what a caller can observe is compared: entity membership and field
+  values. Internal state is never decoded.
+
+  A `:remove` op carries the tags it tombstones explicitly rather than reading
+  them out of a replica — `orset/observed-tags` is not exported from `doc`'s
+  root, and a script that says which tags a remove had seen reads better than
+  one that depends on when it ran.
+
+  ## Scope, stated rather than implied
+
+  Entities are `:i64`, fields `:keyword`, values `:string` — the guest's types,
+  a subset of the `.cljc` surface. The `.cljc` helpers that mint ops and drive
+  a clock (`add-entity`, `remove-entity`, `set-field`, `receive`, `snapshot`)
+  have no guest counterpart; `apply-op` and `merge-docs` are the shared surface
+  and are what this covers. `.cljc` has no `contains-entity?`, so membership is
+  asked as `(contains? (doc/entities d) e)`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.crdt.doc :as doc]
+            [kotoba.crdt.kotoba-project :as project]
+            [kotoba.kir :as kir]))
+
+(def ^:private module (delay (project/compile-module 'kotoba.crdt.doc)))
+
+(defn- run [f & args] (kir/execute @module f (vec args)))
+
+;; Spelled as `doc.kotoba` declares them.
+(def ^:private add-payload-type [:vector [:i64 project/stamp-type]])
+(def ^:private remove-payload-type [:vector [project/tag-map-type]])
+(def ^:private set-payload-type
+  [:vector [:i64 :keyword :string project/stamp-type]])
+(def ^:private op-type
+  [:variant :kotoba.crdt/string-document-op-v1
+   [[:add add-payload-type]
+    [:remove remove-payload-type]
+    [:set-field set-payload-type]]])
+
+(def ^:private entities [0 1 -2])
+(def ^:private fields [:title :color])
+
+(def ^:private stamps
+  [{:crdt/counter 1 :crdt/actor 0}
+   {:crdt/counter 2 :crdt/actor 0}
+   {:crdt/counter 1 :crdt/actor 1}
+   {:crdt/counter 3 :crdt/actor 1}])
+
+(defn- ->cljc-op [[kind & args]]
+  (case kind
+    :add (let [[entity stamp] args]
+           {:crdt/op :add :crdt/entity entity :crdt/tag stamp :crdt/stamp stamp})
+    :remove (let [[tags] args]
+              {:crdt/op :remove :crdt/tags (set tags)})
+    :set-field (let [[entity field value stamp] args]
+                 {:crdt/op :set-field :crdt/entity entity :crdt/field field
+                  :crdt/value value :crdt/stamp stamp})))
+
+(defn- ->guest-op [[kind & args]]
+  (case kind
+    :add (let [[entity stamp] args]
+           [op-type :add [add-payload-type entity (project/->stamp stamp)]])
+    :remove (let [[tags] args]
+              [op-type :remove [remove-payload-type (project/->tag-map tags)]])
+    :set-field (let [[entity field value stamp] args]
+                 [op-type :set-field
+                  [set-payload-type entity field value (project/->stamp stamp)]])))
+
+(defn- cljc-step [replicas [target & op]]
+  (if (= :merge target)
+    (let [[into-r from-r] op]
+      (assoc replicas into-r (doc/merge-docs (get replicas into-r)
+                                             (get replicas from-r))))
+    (update replicas target doc/apply-op (->cljc-op op))))
+
+(defn- guest-step [replicas [target & op]]
+  (if (= :merge target)
+    (let [[into-r from-r] op]
+      (assoc replicas into-r (run 'merge-docs (get replicas into-r)
+                                  (get replicas from-r))))
+    (assoc replicas target (run 'apply-op (get replicas target) (->guest-op op)))))
+
+(defn- cljc-view [replicas]
+  (into {} (for [r [:a :b]
+                 e entities]
+             [[r e] {:present? (contains? (doc/entities (get replicas r)) e)
+                     :fields (into {} (for [f fields]
+                                        [f (doc/get-field (get replicas r) e f)]))}])))
+
+(defn- guest-view [replicas]
+  (into {} (for [r [:a :b]
+                 e entities]
+             [[r e] {:present? (run 'contains-entity? (get replicas r) e)
+                     :fields (into {} (for [f fields]
+                                        [f (project/<-option
+                                            (run 'get-field (get replicas r) e f))]))}])))
+
+(def ^:private scripts
+  {"add an entity and set a field"
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "hello" (stamps 1)]]
+
+   "later stamp wins on the same field"
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "first" (stamps 0)]
+    [:a :set-field 0 :title "second" (stamps 3)]]
+
+   "an earlier write arriving late does not win"
+   ;; Op logs are not ordered by the network. Replaying an old op must not undo
+   ;; a newer one, which is the whole reason the register carries a stamp.
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "second" (stamps 3)]
+    [:a :set-field 0 :title "first" (stamps 0)]]
+
+   "different fields of one entity never collide"
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "t" (stamps 1)]
+    [:b :add 0 (stamps 0)]
+    [:b :set-field 0 :color "c" (stamps 2)]
+    [:merge :a :b]
+    [:merge :b :a]]
+
+   "a remove that has seen the add hides the entity but keeps its fields"
+   ;; Fields are deliberately not garbage collected, so a later concurrent add
+   ;; of the same id resurrects the entity with its values intact.
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "kept" (stamps 1)]
+    [:a :remove [(stamps 0)]]
+    [:a :add 0 (stamps 2)]]
+
+   "a remove cannot tombstone a tag it never saw"
+   [[:a :add 0 (stamps 0)]
+    [:b :remove [(stamps 3)]]
+    [:merge :b :a]]
+
+   "replaying the same op twice is the same as once"
+   [[:a :add 0 (stamps 0)]
+    [:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "x" (stamps 1)]
+    [:a :set-field 0 :title "x" (stamps 1)]]
+
+   "two replicas editing different entities converge"
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "a-side" (stamps 1)]
+    [:b :add 1 (stamps 2)]
+    [:b :set-field 1 :title "b-side" (stamps 3)]
+    [:merge :a :b]
+    [:merge :b :a]]
+
+   ;; The two scripts below exist because a mutation survived without them.
+   ;;
+   ;; Changing `merge-fields-from`'s recursion step from `(+ index 1)` to
+   ;; `(+ index 2)` — merge every other entity — passed all 34 test namespaces,
+   ;; this one included. Every merge above happens between replicas that
+   ;; already share most of what they are merging, so skipping an entry lost
+   ;; nothing observable. State-based merge exists precisely for the case they
+   ;; did not cover: a replica that has been away and receives several entities
+   ;; at once, where every entry on the right side is new to the left.
+   "an offline replica catches up on two entities at once"
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "first" (stamps 1)]
+    [:a :add 1 (stamps 2)]
+    [:a :set-field 1 :title "second" (stamps 3)]
+    [:merge :b :a]]
+
+   "an offline replica catches up on two fields at once"
+   [[:a :add 0 (stamps 0)]
+    [:a :set-field 0 :title "t" (stamps 1)]
+    [:a :set-field 0 :color "c" (stamps 2)]
+    [:merge :b :a]]})
+
+(deftest the-document-agrees-after-every-step
+  (doseq [[name script] scripts]
+    (testing name
+      (loop [ops script
+             cljc {:a (doc/init) :b (doc/init)}
+             guest {:a (run 'init) :b (run 'init)}
+             step 0]
+        (is (= (cljc-view cljc) (guest-view guest))
+            (str name " — after step " step))
+        (when-let [op (first ops)]
+          (recur (rest ops)
+                 (cljc-step cljc op)
+                 (guest-step guest op)
+                 (inc step)))))))
+
+(deftest merge-is-commutative-on-the-kotoba-side
+  ;; Asked of the guest directly: two implementations agreeing does not make
+  ;; either one converge.
+  (doseq [[name script] scripts]
+    (testing name
+      (let [{:keys [a b]} (reduce guest-step
+                                  {:a (run 'init) :b (run 'init)}
+                                  script)
+            a<b (run 'merge-docs a b)
+            b<a (run 'merge-docs b a)]
+        (doseq [e entities]
+          (is (= (run 'contains-entity? a<b e)
+                 (run 'contains-entity? b<a e))
+              (str name " — entity " e))
+          (doseq [f fields]
+            (is (= (project/<-option (run 'get-field a<b e f))
+                   (project/<-option (run 'get-field b<a e f)))
+                (str name " — field " e " " f))))))))
+
+(deftest merging-a-document-into-itself-changes-nothing
+  (doseq [[name script] scripts]
+    (testing name
+      (let [{:keys [a]} (reduce guest-step
+                                {:a (run 'init) :b (run 'init)}
+                                script)
+            twice (run 'merge-docs a a)]
+        (doseq [e entities]
+          (is (= (run 'contains-entity? a e)
+                 (run 'contains-entity? twice e))
+              (str name " — entity " e))
+          (doseq [f fields]
+            (is (= (project/<-option (run 'get-field a e f))
+                   (project/<-option (run 'get-field twice e f)))
+                (str name " — field " e " " f))))))))

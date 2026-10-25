@@ -1,0 +1,137 @@
+(ns marketplace.order-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.okaimono :as ok]
+            [marketplace.order :as order]))
+
+(defn- o [& {:keys [id lines currency] :or {id "ord-1" currency "JPY"}}]
+  (order/order {:id id :buyer "buyer-1" :currency currency
+                :lines (or lines
+                           [{:seller "merchant.a" :sku "A1" :name "Cola" :qty 2 :unit-price-minor 600}
+                            {:seller "merchant.b" :sku "B1" :name "Tea" :qty 1 :unit-price-minor 1100}
+                            {:seller "merchant.a" :sku "A2" :name "Water" :qty 3 :unit-price-minor 100}])}))
+
+(deftest lines-group-into-per-seller-sub-orders
+  (let [x (o)]
+    (is (= ["merchant.a" "merchant.b"] (:order/sellers x))
+        "seller-sorted so the same basket always produces the same structure")
+    (is (= 2 (count (:order/sub-orders x))))
+    (testing "a seller's two lines land in ONE sub-order, not two"
+      (is (= 2 (count (:okaimono/lines (order/sub-order x "merchant.a"))))))
+    (testing "each sub-order is a genuine okaimono record the courier already understands"
+      (is (every? #(:okaimono/valid? (ok/validate-order %)) (:order/sub-orders x))))))
+
+(deftest totals-delegate-to-okaimono
+  (let [x (o)]
+    (is (= 1500 (order/seller-subtotal-minor x "merchant.a")) "1200 + 300")
+    (is (= 1100 (order/seller-subtotal-minor x "merchant.b")))
+    (is (= 2600 (order/total-minor x)))))
+
+(deftest basket-lines-are-the-seam-to-settlement
+  (let [bl (order/->basket-lines (o))]
+    (is (= 2 (count bl)))
+    (is (= #{"merchant.a" "merchant.b"} (set (map :line/seller bl))))
+    (is (= 2600 (reduce + 0 (map :line/amount-minor bl))))
+    (testing "one basket line per seller — settlement allocates per seller"
+      (is (= 1500 (:line/amount-minor (first (filter #(= "merchant.a" (:line/seller %)) bl))))))))
+
+(deftest an-unusable-line-refuses-the-whole-order
+  (testing "okaimono/line is the arbiter of line validity, so quantity and
+            price rules live in one place"
+    (is (nil? (o :lines [{:seller "merchant.a" :sku "A1" :name "x" :qty 0 :unit-price-minor 100}])))
+    (is (nil? (o :lines [{:seller "merchant.a" :sku "" :name "x" :qty 1 :unit-price-minor 100}])))
+    (is (nil? (o :lines [{:seller "merchant.a" :sku "A1" :name "x" :qty 1 :unit-price-minor -5}])))))
+
+;; ───────────────────────────── derived status ─────────────────────────────
+
+(defn- advance-all [x to]
+  (reduce (fn [acc s] (order/advance-sub-order acc s to)) x (:order/sellers x)))
+
+(deftest status-is-derived-and-conservative
+  (let [x (o)]
+    (is (= :placed (order/overall-status x)))
+    (testing "the parent can never be ahead of its slowest part"
+      (let [half (order/advance-sub-order x "merchant.a" :confirmed)]
+        (is (= :placed (order/overall-status half))
+            "b is still :placed, so the order is")))
+    (let [both (advance-all x :confirmed)]
+      (is (= :confirmed (order/overall-status both))))))
+
+(deftest partial-delivery-is-its-own-state
+  (let [x (-> (o) (advance-all :confirmed) (advance-all :packed) (advance-all :handed-over))
+        one (order/advance-sub-order x "merchant.a" :delivered)]
+    (is (= :partially-delivered (order/overall-status one)))
+    (testing "and it is NOT fully delivered — releasing every seller's money
+              because one delivered is the multi-seller failure this prevents"
+      (is (false? (order/fully-delivered? one))))
+    (testing "but that one seller IS delivered, for per-seller settlement"
+      (is (true? (order/seller-delivered? one "merchant.a")))
+      (is (false? (order/seller-delivered? one "merchant.b"))))
+    (let [all (order/advance-sub-order one "merchant.b" :delivered)]
+      (is (= :delivered (order/overall-status all)))
+      (is (true? (order/fully-delivered? all))))))
+
+(deftest a-cancelled-sub-order-does-not-cancel-the-order
+  (let [x (order/advance-sub-order (o) "merchant.a" :cancelled)]
+    (is (= :placed (order/overall-status x))
+        "the buyer still has merchant.b coming")
+    (testing "only when every sub-order is cancelled is the order cancelled"
+      (is (= :cancelled (order/overall-status
+                         (order/advance-sub-order x "merchant.b" :cancelled)))))
+    (testing "delivered-among-cancelled reads as partially delivered, not delivered"
+      (let [d (-> x
+                  (order/advance-sub-order "merchant.b" :confirmed)
+                  (order/advance-sub-order "merchant.b" :packed)
+                  (order/advance-sub-order "merchant.b" :handed-over)
+                  (order/advance-sub-order "merchant.b" :delivered))]
+        (is (= :partially-delivered (order/overall-status d)))
+        (is (false? (order/fully-delivered? d)))))))
+
+(deftest there-is-no-status-setter
+  (testing "a stored parent status could disagree with its parts — the
+            contract exposes no way to create that disagreement"
+    (is (nil? (:order/status (o))))
+    (is (not (contains? (set (map str (keys (o)))) ":order/status")))))
+
+;; ───────────────────────────── transitions ─────────────────────────────
+
+(deftest illegal-transitions-are-refused-not-half-applied
+  (let [x (o)]
+    (is (nil? (order/advance-sub-order x "merchant.a" :delivered))
+        "placed -> delivered is not in okaimono's table")
+    (is (nil? (order/advance-sub-order x "merchant.nobody" :confirmed)))
+    (testing "and the original order is untouched"
+      (is (= :placed (order/overall-status x))))))
+
+(deftest dispatchable-sellers-uses-the-couriers-own-question
+  (let [x (-> (o) (advance-all :confirmed) (advance-all :packed))]
+    (is (= ["merchant.a" "merchant.b"] (order/dispatchable-sellers x)))
+    (let [one (order/advance-sub-order x "merchant.a" :handed-over)]
+      (is (= ["merchant.b"] (order/dispatchable-sellers one))
+          "a handed-over parcel is with the courier already"))))
+
+;; ───────────────────────────── validation ─────────────────────────────
+
+(deftest order-validation
+  (is (empty? (order/order-errors (o))))
+  (is (some #(= :missing-buyer (:order.error/code %))
+            (order/order-errors (assoc (o) :order/buyer ""))))
+  (is (some #(= :no-sub-orders (:order.error/code %))
+            (order/order-errors (assoc (o) :order/sub-orders []))))
+  (is (some #(= :invalid-currency (:order.error/code %))
+            (order/order-errors (assoc (o) :order/currency "yen"))))
+  (testing "two sub-orders for one seller would split their money across two
+            settlement allocations"
+    (let [x (o)
+          dup (update x :order/sub-orders conj (first (:order/sub-orders x)))]
+      (is (some #(= :duplicate-seller-sub-order (:order.error/code %))
+                (order/order-errors dup)))))
+  (testing "the parent is not allowed to be sound while a part is not"
+    (let [x (o)
+          broken (assoc-in x [:order/sub-orders 0 :okaimono/id] "")]
+      (is (some #(= :invalid-sub-order (:order.error/code %))
+                (order/order-errors broken)))))
+  (testing "a sub-order in another currency is refused"
+    (let [x (o)
+          mixed (assoc-in x [:order/sub-orders 0 :okaimono/currency] "USD")]
+      (is (some #(= :mixed-currency (:order.error/code %))
+                (order/order-errors mixed))))))

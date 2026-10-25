@@ -1,0 +1,164 @@
+(ns kotoba.property.gleif-universe
+  "Tally the GLEIF LEI2 universe: the denominator of \"how many legal entities
+   are there\", as GLEIF's Golden Copy actually reports it.
+
+   Why this is a separate namespace from `gleif-projection`: a projection is a
+   *slice* chosen for the query plane (`gleif-lei-joined` is 18,930 companies —
+   the LEIs the plane already references), and reading a slice's record count as
+   a universe count is the single mistake this namespace exists to prevent. A
+   tally never selects; it walks every record and reports how many it walked.
+
+   Kept free of I/O so the counting contract is testable without a 500 MB
+   download: `scripts/tally_gleif_universe.cljk` owns the streaming, this owns
+   the arithmetic.
+
+   Three distinctions the shape enforces, because collapsing any of them turns
+   a measurement into a guess:
+
+   1. **A record existing is not a registration being alive.** GLEIF keeps
+      LAPSED, RETIRED, ANNULLED and MERGED rows in the Golden Copy. `:by-status`
+      is reported in full and never summed into one \"companies\" number.
+   2. **Absent is not zero.** The collector drops blank cells, so a record with
+      no jurisdiction has no `:company/jurisdiction` key at all. Those land in
+      an explicit `:absent` counter, never in a bucket and never silently
+      dropped from the denominator.
+   3. **Unreadable is not measured.** `:tally/unreadable` counts lines that
+      could not be parsed. A caller that reports a tally without reading it is
+      reporting a number it did not measure."
+  (:require [kotoba.lang.text :as str]))
+
+(def ^:const absent
+  "Bucket key for a record that carries no value for the attribute being
+   tallied. A keyword, so it can never collide with a GLEIF code (all of which
+   are strings) and can never be read as one."
+  :absent)
+
+(def empty-tally
+  {:tally/scanned 0
+   :tally/unreadable 0
+   :by-jurisdiction {}
+   :by-country {}
+   :by-registration-status {}
+   :by-entity-status {}})
+
+(defn country-of
+  "Jurisdiction code -> ISO 3166-1 country. GLEIF files sub-national
+   jurisdictions as `US-DE`, `CA-ON`; the country is the part before the first
+   hyphen. `subs` rather than `.charAt`/`nth`: those return a char on the JVM
+   and a one-character string in ClojureScript, so an `=` against them answers
+   differently per runtime."
+  [jurisdiction]
+  (when-not (str/blank? jurisdiction)
+    (let [i (str/index-of jurisdiction "-")]
+      (if i (subs jurisdiction 0 i) jurisdiction))))
+
+(defn- bump
+  "Increment `m`'s bucket for `v`, filing a blank/missing value under `absent`
+   rather than under `nil` or `\"\"` — two spellings of the same silence that
+   would otherwise split one fact across two buckets."
+  [m v]
+  (let [k (if (or (nil? v) (and (string? v) (str/blank? v))) absent v)]
+    (update m k (fnil inc 0))))
+
+(defn tally-record
+  "Fold one corpus record into the tally. A record with no `:company/lei` is
+   counted as unreadable rather than as a company: an entity with no identifier
+   cannot be part of a count of identified entities."
+  [t rec]
+  (if (str/blank? (:company/lei rec))
+    (update t :tally/unreadable inc)
+    (let [j (:company/jurisdiction rec)]
+      (-> t
+          (update :tally/scanned inc)
+          (update :by-jurisdiction bump j)
+          (update :by-country bump (country-of j))
+          (update :by-registration-status bump (:company/lei-registration-status rec))
+          (update :by-entity-status bump (:company/entity-status rec))))))
+
+(defn top-n
+  "The `n` largest buckets as a vector of `[key count]`, ties broken by key so
+   the output is byte-stable across runs (a committed aggregate that reorders
+   on every rebuild is unreviewable).
+
+   `sort-by`, not `max-key`: `max-key` compares with `>`, which on the JVM
+   throws on a non-number and in ClojureScript silently coerces. Bucket keys
+   here are strings and one keyword."
+  [m n]
+  (->> m
+       (sort-by (fn [[k v]] [(- v) (str k)]))
+       (take n)
+       (mapv (fn [[k v]] [k v]))))
+
+(defn jurisdiction-count
+  "Distinct jurisdiction codes actually observed. `absent` is not a
+   jurisdiction, so it is excluded from the count and reported separately."
+  [by-jurisdiction]
+  (count (dissoc by-jurisdiction absent)))
+
+(defn country-total
+  "Every record whose jurisdiction resolves to `iso` — `JP` and, where GLEIF
+   files sub-national codes, `US-DE` style children of it. Uses the same
+   prefix rule as `gleif-projection/matcher`, so a filtered projection and this
+   denominator cannot disagree about what \"in this country\" means."
+  [by-country iso]
+  (get by-country iso 0))
+
+(defn summarize
+  "Tally + provenance -> the committed aggregate.
+
+   `:universe/lei-count` is the number of records walked. It is deliberately
+   NOT called a company count: `:universe/by-registration-status` is what says
+   how many of those registrations are alive."
+  [t {:keys [publish content-sha256 observed-at source-archive
+             declared-record-count top-jurisdictions]
+      :or {top-jurisdictions 30}}]
+  (let [{:keys [by-jurisdiction by-country by-registration-status by-entity-status]} t
+        scanned (:tally/scanned t)]
+    (into
+     ;; A sorted map, so a rebuilt aggregate diffs only where the world
+     ;; changed. ClojureScript's hash-map iteration order is not a promise,
+     ;; and a committed file that reshuffles its keys on every publish is one
+     ;; nobody reviews.
+     (sorted-map)
+     (cond->
+       {:aggregate/manifest true
+        :source/dataset "gleif-lei"
+        :source/authority "GLOBAL/GLEIF"
+        :source/licence "CC0 1.0 (GLEIF)"
+        :source/publish publish
+        :source/content-sha256 content-sha256
+        :source/observed-at observed-at
+        :aggregate/kind :universe-denominator
+        :universe/lei-count scanned
+        :tally/scanned scanned
+        :tally/unreadable (:tally/unreadable t)
+        :universe/jurisdiction-count (jurisdiction-count by-jurisdiction)
+        :universe/jurisdiction-absent (get by-jurisdiction absent 0)
+        :universe/country-count (count (dissoc by-country absent))
+        :universe/top-jurisdictions (top-n by-jurisdiction top-jurisdictions)
+        ;; The full breakdowns, not only the top slice. They cost ~15 KB and they
+        ;; are the whole point of a denominator: a reader asking "how many in DE"
+        ;; must not have to re-run a 40-minute ingest to find out, and a question
+        ;; the file cannot answer is one somebody will answer by guessing.
+        :universe/by-jurisdiction (into (sorted-map-by
+                                         (fn [a b] (compare (str a) (str b))))
+                                        by-jurisdiction)
+        :universe/by-country (into (sorted-map-by
+                                    (fn [a b] (compare (str a) (str b))))
+                                   by-country)
+        :universe/by-registration-status (into (sorted-map-by
+                                                (fn [a b] (compare (str a) (str b))))
+                                               by-registration-status)
+        :universe/by-entity-status (into (sorted-map-by
+                                          (fn [a b] (compare (str a) (str b))))
+                                         by-entity-status)
+        :universe/issued-count (get by-registration-status "ISSUED" 0)
+        :universe/jp-count (country-total by-country "JP")}
+        source-archive (assoc :source/archive source-archive)
+        declared-record-count
+        (assoc :source/declared-record-count declared-record-count
+               ;; GLEIF states the row count in its publish API. Recording the
+               ;; difference makes a short read visible instead of plausible: a
+               ;; truncated corpus and a shrinking universe produce the same
+               ;; smaller number, and only this field tells them apart.
+               :tally/declared-delta (- scanned declared-record-count))))))

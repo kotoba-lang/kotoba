@@ -1,0 +1,67 @@
+;; The complete owning source sequence, shared by selection/scheduling and the
+;; future allocator port. Do not filter immediates or omit compare-exchange,
+;; SIMD, phi, indexed-memory or argument operands here.
+(ns kotoba.mir.operands
+  {:kotoba/export [instruction-sources key-of counts count-of]}
+  (:require [kotoba.gmir.node :as node] [kotoba.gmir.identity :as identity]
+            [kotoba.mir.catalog :as catalog] [kotoba.mir.registers :as registers]
+            [kotoba.mir.table :as table]))
+
+(defn- at [value [:ref :gmir.node/value] index :i64] [:ref :gmir.node/value]
+  (option-match [:option [:ref :gmir.node/value]] (node/child value index) (node/nil-value) item item))
+(defn- kw [values [:list :keyword] value :keyword] [:list :keyword] (typed-list-conj [:list :keyword] values value))
+(defn- member? [values [:list :keyword] value [:ref :gmir.node/value]] :bool
+  (arena-scope (loop [index 0]
+    (if (>= index (vector-count values)) false
+      (if (node/same-name? value (node/keyword-literal (typed-list-nth [:list :keyword] values index))) true (recur (+ index 1)))))))
+(defn- append-all [out [:ref :gmir.node/value] values [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (loop [index 0 result out]
+    (if (>= index (node/child-count values)) result (recur (+ index 1) (node/append result (at values index))))))
+(defn- source-key [index :i64] :keyword
+  (case index 0 :mir/src 1 :mir/input 2 :mir/left 3 :mir/right 4 :mir/addend
+    5 :mir/test 6 :mir/value 7 :mir/base 8 :mir/length 9 :mir/expected
+    10 :mir/second-base 11 :mir/second-length 12 :mir/count 13 :mir/stored 14 :mir/offset :mir/size))
+(defn instruction-sources [instruction [:ref :gmir.node/value]] [:ref :gmir.node/value]
+  (let [direct (loop [index 0 out (node/empty-vector)]
+                 (if (>= index 16) out
+                   (let [key (source-key index)]
+                     (recur (+ index 1)
+                       (if (not (node/has-key? instruction key)) out
+                         (let [value (node/key instruction key)]
+                           (if (= (node/kind value) :nil) out (node/append out value))))))))
+        phi (if (not (node/has-key? instruction :mir/incomings)) direct
+              (let [incomings (node/key instruction :mir/incomings)]
+                (if (not= (node/kind incomings) :vector) direct
+                  (loop [index 0 out direct]
+                    (if (>= index (node/child-count incomings)) out
+                      (recur (+ index 1) (node/append out (node/key (at incomings index) :mir/value))))))))
+        op (node/key instruction :mir/op)
+        indexed (arena-scope (or (member? (catalog/kernel-window-operations) op) (member? (catalog/slice-operations) op)
+                    (member? (catalog/kernel-atomic-ops) op)
+                    (node/same-name? op (node/keyword-literal :mir/kernel-try-lock-u32))
+                    (node/same-name? op (node/keyword-literal :mir/kernel-unlock-u32))))
+        memory (if indexed (node/append phi (node/key instruction :mir/index)) phi)]
+    (if (not (node/has-key? instruction :mir/arguments)) memory
+      (let [arguments (node/key instruction :mir/arguments)]
+        (if (= (node/kind arguments) :vector) (append-all memory arguments) memory)))))
+(defn key-of [value [:ref :gmir.node/value]] [:ref :mir.table/key]
+  ;; Callers use admitted GMIR destinations (keyword or nil), or first filter
+  ;; with vreg?/physical-register?. Keep namespace absence distinct from empty.
+  (if (= (node/kind value) :nil) (table/nil-key)
+    (if (= (node/kind value) :symbol) (table/symbol-key (node/namespace-of value) (node/name-of value))
+      (table/keyword-key (node/namespace-of value) (node/name-of value)))))
+(defn count-of [counts [:ref :mir.table/tree] value [:ref :gmir.node/value]] :i64
+  (arena-scope (let [found (table/get counts (key-of value))]
+    (if (option-some?-of [:option [:ref :mir.table/value]] found)
+      (node/number (table/data (option-match [:option [:ref :mir.table/value]] found (table/scalar (node/i64-value 0)) found-value found-value))) 0))))
+(defn counts [target :keyword physical :bool instructions [:ref :gmir.node/value]] [:ref :mir.table/tree]
+  (loop [index 0 out (table/empty)]
+    (if (>= index (node/child-count instructions)) out
+      (let [sources (instruction-sources (at instructions index))
+            updated (loop [source 0 result out]
+                      (if (>= source (node/child-count sources)) result
+                        (let [value (at sources source)]
+                          (recur (+ source 1)
+                            (if (or (identity/vreg? value) (and physical (registers/physical-register? target value)))
+                              (table/put result (key-of value) (table/scalar (node/i64-value (+ (count-of result value) 1)))) result)))))]
+        (recur (+ index 1) updated)))))

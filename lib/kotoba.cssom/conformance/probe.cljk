@@ -1,0 +1,134 @@
+(ns conformance.probe
+  "One-probe-per-page CDP driver.
+
+   Reads an EDN file of `[{:id ... :html \"...\" :js \"...\"} ...]`, writes
+   each probe's HTML to its OWN file, opens each in its OWN browser TAB
+   (`Target.createTarget`, a fresh document with a fresh stylesheet set),
+   evaluates that probe's JS expression, prints `id => value`, closes the
+   tab.
+
+   Why a tab per probe rather than a page per probe: the hazard the
+   conformance README names is one probe's CSS reaching another probe's
+   markup, and that hazard is a SHARED DOCUMENT one. A fresh target is a
+   fresh document. It costs one navigation instead of one browser launch.
+
+   Usage: kbb --backend sci conformance/probe.cljk <probes.edn> [browser]"
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]))
+
+(def ^:private default-browser
+  "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser")
+
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+(defn- devtools-port [profile]
+  (let [f (path/join profile "DevToolsActivePort")]
+    (js/Promise.
+     (fn [resolve reject]
+       (let [deadline (+ (js/Date.now) 30000)]
+         (letfn [(poll []
+                   (cond
+                     (fs/existsSync f)
+                     (resolve (js/parseInt (first (.split (fs/readFileSync f "utf8") "\n")) 10))
+                     (> (js/Date.now) deadline) (reject (js/Error. "no DevToolsActivePort"))
+                     :else (js/setTimeout poll 100)))]
+           (poll)))))))
+
+(defn- ws-session [url]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [ws (js/WebSocket. url)
+           next-id (atom 0)
+           pending (atom {})]
+       (set! (.-onerror ws) (fn [e] (reject (js/Error. (str "cdp socket error: " (.-message e))))))
+       (set! (.-onmessage ws)
+             (fn [ev]
+               (let [msg (js/JSON.parse (.-data ev))]
+                 (when-let [{:keys [res rej]} (get @pending (.-id msg))]
+                   (swap! pending dissoc (.-id msg))
+                   (if-let [err (.-error msg)]
+                     (rej (js/Error. (str "cdp error: " (js/JSON.stringify err))))
+                     (res (.-result msg)))))))
+       (set! (.-onopen ws)
+             (fn [_]
+               (resolve {:send (fn [method params]
+                                 (let [id (swap! next-id inc)]
+                                   (js/Promise.
+                                    (fn [res rej]
+                                      (swap! pending assoc id {:res res :rej rej})
+                                      (.send ws (js/JSON.stringify
+                                                 (clj->js {:id id :method method
+                                                           :params (or params {})})))))))
+                         :close! (fn [] (.close ws))})))))))
+
+(defn- run-probe [port dir idx {:keys [id html js]}]
+  (let [f (path/join dir (str "probe-" idx ".html"))]
+    (fs/writeFileSync f (str "<!doctype html><meta charset=utf-8>" html) "utf8")
+    (-> (js/fetch (str "http://127.0.0.1:" port "/json/new?" (js/encodeURIComponent (str "file://" f)))
+                  #js {:method "PUT"})
+        (.then #(.json %))
+        (.then (fn [t]
+                 (-> (ws-session (.-webSocketDebuggerUrl t))
+                     (.then (fn [{:keys [send close!]}]
+                              ;; Retry until the document has actually parsed.
+                              ;; `/json/new?url=` returns as soon as the tab
+                              ;; exists, not when it has loaded, and a fixed
+                              ;; sleep loses one probe in ten to that race --
+                              ;; measured, twice, and always as a null
+                              ;; `getElementById`, which reads as a wrong
+                              ;; ANSWER rather than as a failure.
+                              (-> ((fn attempt [n]
+                                     (-> (sleep 200)
+                                         (.then #(send "Runtime.evaluate"
+                                                       {:expression
+                                                        (str "(function(){if(document.readyState!=='complete')return null;"
+                                                             "try{return String(" js ")}catch(e){return 'THREW: '+e.message}})()")
+                                                        :returnByValue true
+                                                        :awaitPromise false}))
+                                         (.then (fn [r]
+                                                  (let [v (some-> r .-result .-value)
+                                                        ;; a null `getElementById` is the load race
+                                                        ;; wearing a THREW, not an answer
+                                                        v (when-not (and (string? v)
+                                                                         (re-find #"is not of type 'Element'" v))
+                                                            v)]
+                                                    (if (or (some? v) (zero? n))
+                                                      r
+                                                      (attempt (dec n))))))))
+                                   40)
+                                  (.then (fn [r]
+                                           (close!)
+                                           (println (str id " => " (some-> r .-result .-value)))))
+                                  (.catch (fn [e] (close!) (println (str id " => ERROR " (.-message e)))))
+                                  (.then (fn [_]
+                                           (js/fetch (str "http://127.0.0.1:" port "/json/close/" (.-id t))))))))))))))
+
+(defn- run! [probes browser]
+  (let [profile (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-probe-"))
+        dir (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-probe-pages-"))
+        proc (cp/spawn browser
+                       #js ["--headless=new" "--disable-gpu" "--no-first-run"
+                            "--no-default-browser-check" "--disable-extensions"
+                            "--disable-background-networking" "--disable-sync"
+                            (str "--user-data-dir=" profile)
+                            "--remote-debugging-port=0" "about:blank"]
+                       #js {:stdio "ignore"})
+        cleanup! (fn []
+                   (try (.kill proc "SIGKILL") (catch :default _ nil))
+                   (try (fs/rmSync profile #js {:recursive true :force true}) (catch :default _ nil)))]
+    (-> (devtools-port profile)
+        (.then (fn [port]
+                 (reduce (fn [p [idx probe]]
+                           (.then p (fn [_] (run-probe port dir idx probe))))
+                         (js/Promise.resolve nil)
+                         (map-indexed vector probes))))
+        (.then (fn [_] (cleanup!) (js/process.exit 0)))
+        (.catch (fn [e] (cleanup!)
+                  (binding [*print-fn* *print-err-fn*] (println (.-message e)))
+                  (js/process.exit 1))))))
+
+(let [[file browser] *command-line-args*]
+  (run! (edn/read-string (fs/readFileSync file "utf8")) (or browser default-browser)))

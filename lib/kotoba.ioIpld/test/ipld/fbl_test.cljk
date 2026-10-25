@@ -1,0 +1,171 @@
+(ns ipld.fbl-test
+  "Reading a range out of a chunked byte object, and refusing to return a
+  short one.
+
+  The property that matters is exhaustive rather than illustrative: for a
+  known sequence, EVERY `[start, end)` must equal the same slice of the
+  original. A layout bug is almost never wrong for all ranges -- it is wrong
+  at a chunk boundary, or for a range that starts inside one leaf and ends
+  inside another, and a handful of hand-picked cases miss exactly those."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ipld.core :as ipld]
+            [ipld.fbl :as fbl]
+            [ipld.link :as link]))
+
+(defn- err [f]
+  (try (f) nil
+       (catch #?(:clj Exception :cljs :default) e (:type (ex-data e)))))
+
+(defn- store [blocks]
+  (let [m (into {} (map (juxt :cid :bytes)) blocks)]
+    (fn [cid] (get m cid))))
+
+(def payload (vec (map #(mod (* % 7) 256) (range 100))))
+
+(defn- built [chunk-size] (fbl/build payload chunk-size))
+
+;; ── the exhaustive range property ────────────────────────────────────────────
+
+(deftest every_range_equals_the_same_slice_of_the_original
+  (doseq [chunk-size [1 3 7 16 100 250]]
+    (testing (str "chunk size " chunk-size)
+      (let [{:keys [root blocks length]} (built chunk-size)
+            get-fn (store blocks)]
+        (is (= 100 length))
+        (is (= 100 (fbl/size get-fn root)))
+        (doseq [start (range 0 101 1)
+                end (range start 101 7)]
+          (is (= (subvec payload start end)
+                 (:bytes (fbl/read-range get-fn root start end)))
+              (str "[" start ", " end ") at chunk " chunk-size)))))))
+
+(deftest an_empty_object_has_a_length_and_one_legal_range
+  (let [{:keys [root blocks]} (fbl/build [] 4)
+        get-fn (store blocks)]
+    (is (= 0 (fbl/size get-fn root)))
+    (is (= [] (:bytes (fbl/read-range get-fn root 0 0))))
+    (is (= :ipld/fbl-range-out-of-bounds
+           (err #(fbl/read-range get-fn root 0 1))))))
+
+(deftest read_all_round_trips
+  (doseq [chunk-size [1 8 100]]
+    (let [{:keys [root blocks]} (built chunk-size)]
+      (is (= payload (fbl/read-all (store blocks) root))))))
+
+;; ── only overlapping leaves are fetched ──────────────────────────────────────
+
+(deftest a_range_costs_the_leaves_it_touches_not_the_object
+  ;; The reason the layout exists. 100 bytes in 10-byte leaves: a 5-byte read
+  ;; inside one leaf must not fetch the other nine.
+  (let [{:keys [root blocks]} (built 10)
+        get-fn (store blocks)]
+    (is (= 1 (:leaves-read (fbl/read-range get-fn root 32 37))))
+    (is (= 2 (:leaves-read (fbl/read-range get-fn root 38 42)))
+        "a range crossing one boundary touches exactly two")
+    (is (= 10 (:leaves-read (fbl/read-range get-fn root 0 100))))))
+
+(deftest the_copy_boundary_is_reported_rather_than_claimed
+  (let [{:keys [root blocks]} (built 10)
+        get-fn (store blocks)]
+    (testing "inside one leaf, the bytes could be borrowed"
+      (is (= :borrowed-leaf (:copy-boundary (fbl/read-range get-fn root 30 40))))
+      (is (= :borrowed-leaf (:copy-boundary (fbl/read-range get-fn root 33 35)))))
+    (testing "across a boundary they provably cannot be"
+      (is (= :assembled (:copy-boundary (fbl/read-range get-fn root 39 41))))
+      (is (= :assembled (:copy-boundary (fbl/read-range get-fn root 0 100)))))))
+
+;; ── refusals: a short read must never be returned ────────────────────────────
+
+(deftest a_missing_leaf_refuses_rather_than_returning_fewer_bytes
+  (let [{:keys [root blocks]} (built 10)
+        without-one (remove #(= (:cid (first blocks)) (:cid %)) blocks)
+        get-fn (store without-one)]
+    (is (= :ipld/missing-block (err #(fbl/read-range get-fn root 0 10))))
+    (testing "a range that does not touch the missing leaf still succeeds"
+      (is (= (subvec payload 20 30)
+             (:bytes (fbl/read-range get-fn root 20 30)))))))
+
+(deftest a_missing_root_refuses
+  (let [{:keys [root]} (built 10)]
+    (is (= :ipld/missing-block (err #(fbl/size (constantly nil) root))))
+    (is (= :ipld/missing-block (err #(fbl/read-range (constantly nil) root 0 1))))))
+
+(deftest a_declared_length_that_disagrees_with_the_bytes_is_refused
+  ;; The layout bug that does not announce itself: every offset after the bad
+  ;; leaf shifts, and a reader still returns the width it was asked for.
+  (let [short-leaf (ipld/node->block (fbl/leaf [1 2 3]))
+        lying-root (ipld/node->block
+                    {"parts" [{"length" 10 "part" (link/link (:cid short-leaf))}]})
+        get-fn (store [short-leaf lying-root])]
+    (is (= :ipld/fbl-length-mismatch
+           (err #(fbl/read-range get-fn (:cid lying-root) 0 3))))
+    (is (= 10 (fbl/size get-fn (:cid lying-root)))
+        "size reports the DECLARED length -- checking every leaf would cost the object")))
+
+(deftest a_range_past_the_end_is_refused_not_clamped
+  (let [{:keys [root blocks]} (built 10)
+        get-fn (store blocks)]
+    (is (= :ipld/fbl-range-out-of-bounds (err #(fbl/read-range get-fn root 0 101))))
+    (is (= :ipld/fbl-range-out-of-bounds (err #(fbl/read-range get-fn root 95 200))))
+    (testing "clamping would turn a caller's arithmetic error into a short buffer"
+      (is (= 100 (count (:bytes (fbl/read-range get-fn root 0 100))))))))
+
+(deftest a_malformed_range_is_refused
+  (let [{:keys [root blocks]} (built 10)
+        get-fn (store blocks)]
+    (doseq [[s e] [[-1 5] [5 4] [nil 5]]]
+      (is (= :ipld/invalid-fbl-range (err #(fbl/read-range get-fn root s e)))))))
+
+(deftest a_non_positive_chunk_size_is_refused
+  (doseq [n [0 -1 nil 2.5]]
+    (is (= :ipld/invalid-fbl-chunk-size (err #(fbl/build payload n))))))
+
+;; ── shape does not depend on size ────────────────────────────────────────────
+
+(deftest built_leaves_hold_bytes_not_an_array_of_integers
+  ;; Measured 2026-09-06: `ipld.core` round-trips a native byte container back
+  ;; as one and a vector back as a vector -- so a leaf built from a vector
+  ;; encodes as a CBOR array of integers, decodes fine, and is not Bytes.
+  ;; Both read correctly here; only one of them is the layout's type.
+  (let [{:keys [blocks]} (built 10)
+        leaf-node (ipld/decode (:bytes (first blocks)))
+        b (get leaf-node "bytes")]
+    (is (#?(:clj bytes? :cljs #(instance? js/Uint8Array %)) b)
+        "a leaf must hold a byte string")
+    (is (= 10 (count (seq b))))))
+
+(deftest a_one_chunk_object_has_the_same_shape_as_a_many_chunk_one
+  ;; A reader that special-cased a bare leaf would work until a file grew.
+  (let [small (fbl/build [1 2 3] 100)
+        large (built 10)
+        root-node (fn [{:keys [root blocks]}]
+                    (ipld/decode (get (into {} (map (juxt :cid :bytes)) blocks) root)))]
+    (is (contains? (root-node small) "parts"))
+    (is (contains? (root-node large) "parts"))))
+
+;; ── nesting ──────────────────────────────────────────────────────────────────
+
+(deftest an_inline_part_reads_the_same_as_a_linked_one
+  ;; Parts may be links or inline nodes; a reader must not require one.
+  (let [inline-root (ipld/node->block
+                     {"parts" [{"length" 3 "part" (fbl/leaf [10 11 12])}
+                               {"length" 2 "part" (fbl/leaf [13 14])}]})
+        get-fn (store [inline-root])]
+    (is (= 5 (fbl/size get-fn (:cid inline-root))))
+    (is (= [10 11 12 13 14] (fbl/read-all get-fn (:cid inline-root))))
+    (is (= [12 13] (:bytes (fbl/read-range get-fn (:cid inline-root) 2 4))))))
+
+(deftest a_nested_layout_reads_as_one_flat_sequence
+  (let [a (ipld/node->block (fbl/leaf [1 2 3]))
+        b (ipld/node->block (fbl/leaf [4 5]))
+        inner (ipld/node->block {"parts" [{"length" 3 "part" (link/link (:cid a))}
+                                          {"length" 2 "part" (link/link (:cid b))}]})
+        c (ipld/node->block (fbl/leaf [6 7 8]))
+        outer (ipld/node->block {"parts" [{"length" 5 "part" (link/link (:cid inner))}
+                                          {"length" 3 "part" (link/link (:cid c))}]})
+        get-fn (store [a b inner c outer])]
+    (is (= 8 (fbl/size get-fn (:cid outer))))
+    (is (= [1 2 3 4 5 6 7 8] (fbl/read-all get-fn (:cid outer))))
+    (doseq [start (range 0 9) end (range start 9)]
+      (is (= (subvec [1 2 3 4 5 6 7 8] start end)
+             (:bytes (fbl/read-range get-fn (:cid outer) start end)))))))

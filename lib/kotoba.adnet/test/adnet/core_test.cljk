@@ -1,0 +1,92 @@
+(ns adnet.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [adnet.core :as adnet]
+            [adnet.billing :as billing]))
+
+(deftest usd-conversion
+  (is (= 2000000 (adnet/usd->micros "2.00")))
+  (is (= 2000000 (adnet/usd->micros 2)))
+  (is (= 1500 (adnet/usd->micros "0.0015"))))
+
+(def cpm-adult
+  {:id "cmp-cpm" :advertiser "did:key:zA"
+   :creative {:type :image :image-url "u" :click-url "c"}
+   :bid {:model :cpm :usd "3.00"}
+   :targeting {:tier :adult :formats #{:rectangle} :placements #{"scene-detail"}}
+   :budget {:total-usd "100.00" :spent-micros 0}
+   :status :active})
+
+(def cpc-adult
+  {:id "cmp-cpc" :advertiser "did:key:zB"
+   :creative {:type :image :image-url "u2" :click-url "c2"}
+   :bid {:model :cpc :usd "0.50"}
+   :targeting {:tier :adult}
+   :budget {:total-usd "100.00" :spent-micros 0}
+   :status :active})
+
+(def placement {:slot "scene-detail" :tier :adult :format :rectangle :geo "JP"
+                :now "2026-07-10T12:00:00Z"})
+
+(deftest eligibility
+  (is (adnet/eligible? cpm-adult placement))
+  (testing "tier mismatch"
+    (is (not (adnet/eligible? cpm-adult (assoc placement :tier :general)))))
+  (testing "format not targeted"
+    (is (not (adnet/eligible? cpm-adult (assoc placement :format :vertical)))))
+  (testing "placement not targeted"
+    (is (not (adnet/eligible? cpm-adult (assoc placement :slot "sidebar")))))
+  (testing "paused"
+    (is (not (adnet/eligible? (assoc cpm-adult :status :paused) placement))))
+  (testing "exhausted budget"
+    (is (not (adnet/eligible? (assoc-in cpm-adult [:budget :spent-micros] 100000000) placement))))
+  (testing "out of flight"
+    (is (not (adnet/eligible?
+              (assoc cpm-adult :flight {:start "2027-01-01T00:00:00Z"}) placement)))))
+
+(deftest auction
+  (testing "eCPM ranking: CPM $3 vs CPC $0.50 (×0.2%×1000 = $1 eCPM) → CPM wins"
+    (is (= "cmp-cpm" (:id (adnet/select [cpc-adult cpm-adult] placement)))))
+  (testing "a high CPC can outrank a low CPM"
+    (let [big-cpc (assoc-in cpc-adult [:bid :usd] "2.00")]   ; 2×0.002×1000 = 4 eCPM > $3
+      (is (= "cmp-cpc" (:id (adnet/select [cpm-adult big-cpc] placement))))))
+  (testing "no eligible campaign → nil"
+    (is (nil? (adnet/select [cpm-adult] (assoc placement :tier :general))))))
+
+(deftest serve-decision
+  (testing "paid when a campaign wins"
+    (let [r (adnet/serve [cpm-adult] placement)]
+      (is (= :paid (:kind r)))
+      (is (= "cmp-cpm" (:id (:campaign r))))))
+  (testing "house backfill when none qualify"
+    (let [r (adnet/serve [] placement)]
+      (is (= :house (:kind r)))
+      (is (= "https://x402.nexus/catalog" (:click-url (:creative r)))))))
+
+(deftest pacing
+  (testing "apply-spend advances budget and auto-pauses on exhaustion"
+    (let [c (assoc-in cpm-adult [:budget :total-usd] "0.01")   ; $0.01 budget
+          c' (adnet/apply-spend c 10000)]                       ; spend $0.01
+      (is (= :paused (:status c')))
+      (is (= 10000 (get-in c' [:budget :spent-micros]))))))
+
+(deftest billing-charges
+  (testing "CPM: impression costs bid/1000, click free"
+    (is (= 3000 (billing/charge-micros cpm-adult :impression)))  ; $3/1000 = 3000 micros
+    (is (= 0 (billing/charge-micros cpm-adult :click))))
+  (testing "CPC: click costs full bid, impression free"
+    (is (= 500000 (billing/charge-micros cpc-adult :click)))     ; $0.50
+    (is (= 0 (billing/charge-micros cpc-adult :impression))))
+  (testing "accrue folds charge + advances budget + emits event"
+    (let [{:keys [campaign charge-micros event]}
+          (billing/accrue cpm-adult {:kind :impression :placement "scene-detail"
+                                     :at "2026-07-10T12:00:00Z"})]
+      (is (= 3000 charge-micros))
+      (is (= 3000 (get-in campaign [:budget :spent-micros])))
+      (is (= :impression (:ad/event event)))
+      (is (= "cmp-cpm" (:ad/campaign event))))))
+
+(deftest prepaid-balance
+  (let [acct {:deposited-micros 5000000 :accrued-micros 4900000}]  ; $5 in, $4.90 used
+    (is (= 100000 (billing/balance-micros acct)))                  ; $0.10 left
+    (is (billing/low-balance? acct 200000))                        ; can't cover $0.20 more
+    (is (not (billing/low-balance? acct 50000)))))

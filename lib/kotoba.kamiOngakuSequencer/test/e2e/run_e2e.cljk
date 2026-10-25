@@ -1,0 +1,359 @@
+(ns run-e2e
+  "Real-browser E2E proof for kami-ongaku-sequencer: proves the repo's real,
+   unit-tested MIDI-equivalent event/tick/PPQ data model AND its real
+   Standard MIDI File (SMF) export-smf/import-smf codec correctly drive real
+   audio TIMING and PITCH once combined with kotoba-lang/audio's real
+   oscillator + ADSR DSP via kotoba-lang/org-w3-webaudio's proven
+   AudioWorkletProcessor path (org-w3-webaudio commit
+   e554d853d6403c35b1ffe1c4adb37d2a1d557451).
+
+   kami-ongaku-sequencer has no audio rendering of its own (out of scope per
+   its own README) -- test/e2e/src/kami/ongaku/sequencer/e2e/fixture.cljk bridges its
+   real tick/pitch/velocity event data (AFTER a real export-smf -> import-smf
+   round trip) to the numeric schedule (onset sample position, frequency,
+   gain) real DSP needs (see that namespace's docstring for the exact
+   pattern: 5 notes, quarter-note spacing at PPQ 480 / 120 BPM, distinct
+   pitches 60/64/67/72/76, distinct velocities 40/70/100/110/127).
+
+   This does, in order:
+     0. Requires kami.ongaku.sequencer.e2e.fixture directly (no browser) and checks
+        the REAL SMF round trip (export-smf -> import-smf) preserves every
+        note's tick/pitch/velocity/duration-ticks/channel exactly --
+        the correctness check on top of whatever unit tests already exist.
+     1. Drives a real headless Chromium (Playwright) to compile+run
+        (test/e2e/src/kami/ongaku/sequencer/e2e/{worklet_dsp,main_driver}.cljs,
+        scripts/build-e2e-bundles.sh) kami.ongaku.sequencer.e2e.fixture/render-plan on
+        the POST-round-trip event data inside a real AudioWorkletProcessor,
+        synthesize each of the 5 notes via kotoba-lang/audio's real
+        oscillator + ADSR, place each at its onset-sample offset in ONE
+        continuous output buffer (not 5 separate renders), and capture the
+        actual rendered PCM via OfflineAudioContext.
+     2. Right here (no browser involved), requires kami.ongaku.sequencer.e2e.fixture
+        and audio.synth directly (the SAME .cljc sources the browser bundle
+        was compiled from) and recomputes:
+        a. the render plan from the POST-round-trip data -- cross-verified
+           bit-for-bit against the browser's own computed plan;
+        b. the render plan from the PRE-round-trip data -- cross-verified
+           bit-for-bit against the POST-round-trip plan, proving the SMF
+           round trip changed nothing about the derived schedule;
+        c. the full expected multi-note waveform -- diffed against the
+           captured PCM;
+        d. for each note: the ACTUAL onset sample position in the captured
+           PCM (first sample whose absolute value crosses a small threshold,
+           searched in a window around that note's own onset-sample -- not
+           merely trusting the scheduling was honored) and the ACTUAL
+           frequency (via interpolated positive-going zero-crossing timing
+           over the steady-state envelope window, matching kami-ongaku-
+           sampler's own measurement technique), both compared to the
+           tick-derived expected values.
+
+   Requires: `bash scripts/build-e2e-bundles.sh` run first, `npm install`
+   inside test/e2e/ for the Playwright dependency, and this repo's own src/
+   plus a checkout of kotoba-lang/audio on the nbb classpath:
+
+     kbb --backend sci -cp \"src:test/e2e/src:$AUDIO_SRC_PATH\" test/e2e/run_e2e.cljk"
+  (:require ["playwright" :refer [chromium]]
+            ["http" :as http]
+            ["fs" :as fs]
+            ["path" :as path]
+            [audio.synth :as synth]
+            [kami.ongaku.sequencer.e2e.fixture :as fixture]))
+
+(def site-dir (path/join (js/process.cwd) "test" "e2e" "page"))
+(def port 8942)
+
+(def content-types
+  {".html" "text/html" ".js" "application/javascript"})
+
+(defn start-server []
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [server (http/createServer
+                     (fn [req res]
+                       (let [url (if (= (.-url req) "/") "/index.html" (.-url req))
+                             fpath (path/join site-dir url)
+                             ext (path/extname fpath)
+                             ctype (get content-types ext "application/octet-stream")]
+                         (if (fs/existsSync fpath)
+                           (do (.writeHead res 200 #js {"Content-Type" ctype})
+                               (.end res (fs/readFileSync fpath)))
+                           (do (.writeHead res 404) (.end res "not found"))))))]
+        (.listen server port (fn [] (resolve server)))))))
+
+;; --- step 0: real SMF round-trip correctness check (no browser, no audio) -
+
+(defn print-roundtrip-report []
+  (let [{:keys [pre post match?]} (fixture/round-trip-report)]
+    (println "\n=== step 0: real export-smf -> import-smf round-trip check ===\n")
+    (doseq [[p q] (map vector pre post)]
+      (println "  pre: " p)
+      (println "  post:" q))
+    (println "pre == post (tick/pitch/velocity/duration-ticks/channel), for all 5 notes:" match?)
+    match?))
+
+;; --- offline (nbb) full-waveform reference: SAME fixture.cljc render-plan +
+;;     SAME audio.synth composition worklet_dsp.cljs uses, a different
+;;     runtime (nbb, not browser-compiled cljs) -------------------------------
+
+(defn synthesize-note [freq gain sr local-len gate-off attack decay sustain release]
+  (let [osc (synth/sine-wave freq sr local-len)
+        env (synth/adsr {:attack attack :decay decay :sustain sustain
+                          :release release :gate-off gate-off :sample-rate sr}
+                         local-len)]
+    (mapv #(* % gain) (synth/apply-envelope osc env))))
+
+(defn render-offline
+  "-> {:pcm (vector of doubles, length total-samples) :notes [...]}. The
+   exact same computation as kami.ongaku.sequencer.e2e.worklet-dsp/render-pattern, run
+   here directly on the .cljc source of truth (no browser/worklet at all)."
+  [flat-events]
+  (let [{:keys [notes total-samples]} (fixture/render-plan flat-events)
+        pcm (reduce
+              (fn [acc {:keys [onset-sample gate-off-sample local-length freq gain]}]
+                (let [local-buf (synthesize-note freq gain fixture/sr local-length
+                                                  gate-off-sample fixture/attack-seconds
+                                                  fixture/decay-seconds fixture/sustain-level
+                                                  fixture/release-seconds)]
+                  (reduce
+                    (fn [acc2 i]
+                      (let [gi (+ onset-sample i)]
+                        (if (< gi total-samples)
+                          (update acc2 gi + (nth local-buf i))
+                          acc2)))
+                    acc (range local-length))))
+              (vec (repeat total-samples 0.0))
+              notes)]
+    {:pcm pcm :notes notes :total-samples total-samples}))
+
+(defn max-abs-diff [a b]
+  (reduce max 0.0 (map (fn [x y] (js/Math.abs (- x y))) a b)))
+
+;; --- onset-position measurement: first sample (in a small search window
+;;     around the tick-derived expected onset) whose absolute value crosses
+;;     a small threshold. Not merely asserting the schedule was honored --
+;;     this actually scans the captured/reference PCM. ------------------------
+
+(defn find-onset [samples search-start search-end threshold]
+  (loop [i (max 0 search-start)]
+    (cond
+      (>= i search-end) nil
+      (> (js/Math.abs (nth samples i)) threshold) i
+      :else (recur (inc i)))))
+
+;; --- frequency measurement from captured PCM: interpolated positive-going
+;;     zero-crossing timing over the steady-state (post attack+decay,
+;;     pre-release) window -- same technique kami-ongaku-sampler's own
+;;     run_e2e.cljs uses, reused verbatim, not rediscovered. -----------------
+
+(defn positive-zero-crossings [samples start end]
+  (loop [i (inc start) acc (transient [])]
+    (if (>= i end)
+      (persistent! acc)
+      (let [prev (nth samples (dec i))
+            cur (nth samples i)]
+        (recur (inc i)
+               (if (and (<= prev 0.0) (> cur 0.0))
+                 (conj! acc (+ (dec i) (/ (- 0.0 prev) (- cur prev))))
+                 acc))))))
+
+(defn measure-frequency
+  "-> Hz (double), or nil if fewer than 2 zero-crossings were found."
+  [samples sr start end]
+  (let [crossings (positive-zero-crossings samples start end)]
+    (when (>= (count crossings) 2)
+      (let [n-periods (dec (count crossings))
+            span-samples (- (last crossings) (first crossings))]
+        (/ (* n-periods sr) span-samples)))))
+
+;; --- browser call -----------------------------------------------------------
+
+(defn run-in-page [page]
+  ;; pageFunction is a plain JS source string, not a Function value, and no
+  ;; params need crossing at all (render-pattern takes no arguments -- see
+  ;; worklet_dsp.cljs docstring) -- matching org-w3-webaudio's and
+  ;; kami-ongaku-sampler's own run_e2e.cljs precedent for pageFunction being
+  ;; a source string (Playwright's page.evaluate(pageFunction, arg) silently
+  ;; drops `arg` and resolves undefined when pageFunction is a source
+  ;; string; verified there with plain Node + Playwright, no cljs/nbb
+  ;; involved -- not re-verified here, reusing that finding, though we don't
+  ;; even need `arg` in this harness since there is nothing to pass in).
+  (.evaluate page
+    (str "window.runE2E("
+         (js/JSON.stringify
+           #js {:workletUrl "/worklet-processor.js"
+                :processorName "kami-sequencer-processor"})
+         ")")))
+
+;; --- per-note evaluation -----------------------------------------------------
+
+(def PCM-TOL 1e-6)
+(def ONSET-THRESHOLD 0.005)
+(def ONSET-TOL-SAMPLES 200) ;; ~4.2ms @ 48kHz -- generous vs. attack-ramp/
+                             ;; threshold-detection variance, but tight vs.
+                             ;; the 24000-sample (0.5s) note spacing: a wrong
+                             ;; tick->sample conversion or wrong note order
+                             ;; would miss by thousands of samples, not ~200.
+(def FREQ-REL-TOL 0.005) ;; 0.5%
+
+(defn evaluate-note [pcm-label pcm sr {:keys [tick pitch velocity onset-sample
+                                                gate-off-sample freq gain]}]
+  (let [attack-decay (+ fixture/attack-samples fixture/decay-samples)
+        search-end (min (count pcm) (+ onset-sample attack-decay))
+        detected-onset (find-onset pcm (- onset-sample 5) search-end ONSET-THRESHOLD)
+        onset-diff (when detected-onset (js/Math.abs (- detected-onset onset-sample)))
+        onset-ok (and (some? detected-onset) (<= onset-diff ONSET-TOL-SAMPLES))
+        steady-start (+ onset-sample attack-decay)
+        steady-end (min (count pcm) (+ onset-sample gate-off-sample))
+        measured-freq (measure-frequency pcm sr steady-start steady-end)
+        freq-ok (and (some? measured-freq)
+                     (< (js/Math.abs (/ (- measured-freq freq) freq)) FREQ-REL-TOL))]
+    {:label pcm-label :tick tick :pitch pitch :velocity velocity
+     :expected-onset onset-sample :detected-onset detected-onset :onset-diff onset-diff
+     :onset-ok onset-ok
+     :expected-freq freq :measured-freq measured-freq :freq-ok freq-ok
+     :gain gain}))
+
+(defn fmt [x n] (if (number? x) (.toFixed x n) (str x)))
+
+(defn print-note-row [{:keys [label tick pitch velocity expected-onset detected-onset
+                               onset-diff onset-ok expected-freq measured-freq freq-ok]}]
+  (println (str "  [" label "] tick=" tick " pitch=" pitch " velocity=" velocity))
+  (println (str "    onset: expected=" expected-onset
+                " detected=" detected-onset
+                " diff=" onset-diff " (tol " ONSET-TOL-SAMPLES ") ok=" onset-ok))
+  (println (str "    freq:  expected=" (fmt expected-freq 4) "Hz measured="
+                (some-> measured-freq (fmt 4)) "Hz ok=" freq-ok)))
+
+;; --- decision (plan) cross-check: browser-computed plan vs. offline (nbb)
+;;     computed plan, bit-for-bit -------------------------------------------
+
+(defn browser-plan->clj
+  "plan-js is a plain JS array of JS objects by the time it reaches nbb --
+   it crossed the worklet -> main-thread MessagePort as a clj->js'd value
+   (runtime string-keyed properties, immune to Closure's static
+   property-renaming pass -- see worklet_dsp.cljs/main_driver.cljs
+   docstrings) and then crossed Playwright's page.evaluate() structured-clone
+   boundary into Node as ordinary JSON-shaped data. js->clj with
+   keywordize-keys converts it straight to a vector of keyword-keyed maps;
+   no per-property .- access needed (that pitfall is about compiled cljs
+   reading properties, not this offline nbb reference)."
+  [plan-js]
+  (mapv (fn [{:keys [tick onsetSample freq gain]}]
+          {:tick tick :onset-sample onsetSample :freq freq :gain gain})
+        (js->clj plan-js :keywordize-keys true)))
+
+(defn plans-match? [a b]
+  (and (= (count a) (count b))
+       (every? (fn [[x y]]
+                 (and (= (:tick x) (:tick y))
+                      (= (:onset-sample x) (:onset-sample y))
+                      (< (js/Math.abs (- (:freq x) (:freq y))) 1e-9)
+                      (< (js/Math.abs (- (:gain x) (:gain y))) 1e-9)))
+               (map vector a b))))
+
+(defn report-and-exit [server browser roundtrip-ok result]
+  (let [captured (vec (.-pcm result))
+        sr (.-sampleRate result)
+        browser-plan (browser-plan->clj (.-plan result))
+        post-flat (fixture/post-roundtrip-flat)
+        pre-flat (fixture/pre-roundtrip-flat)
+        offline-post (render-offline (:events post-flat))
+        offline-pre (render-offline (:events pre-flat))
+        offline-plan-post (mapv #(select-keys % [:tick :onset-sample :freq :gain]) (:notes offline-post))
+        offline-plan-pre (mapv #(select-keys % [:tick :onset-sample :freq :gain]) (:notes offline-pre))
+        plan-post-matches-browser (plans-match? offline-plan-post browser-plan)
+        plan-pre-matches-post (plans-match? offline-plan-pre offline-plan-post)
+        reference (:pcm offline-post)
+        n (min (count captured) (count reference))
+        pcm-diff (max-abs-diff (subvec captured 0 n) (subvec (vec reference) 0 n))
+        pcm-ok (and (= (count captured) (count reference)) (< pcm-diff PCM-TOL))
+        rows (mapv (fn [n] (evaluate-note "post-round-trip (browser PCM)" captured sr n))
+                    (:notes offline-post))
+        offline-rows (mapv (fn [n] (evaluate-note "post-round-trip (offline PCM, cross-check)"
+                                                   (:pcm offline-post) fixture/sr n))
+                            (:notes offline-post))
+        pre-rows (mapv (fn [n] (evaluate-note "pre-round-trip (offline PCM, cross-check)"
+                                               (:pcm offline-pre) fixture/sr n))
+                        (:notes offline-pre))]
+    (println "\n=== kami-ongaku-sequencer real-browser AudioWorklet SMF round-trip E2E result ===")
+    (println "\n-- step 1+2c: captured (browser) PCM vs. offline reference PCM --")
+    (println "captured length:" (count captured) "reference length:" (count reference)
+              "sampleRate:" sr)
+    (println "max abs diff:" pcm-diff "tolerance:" PCM-TOL "ok=" pcm-ok)
+
+    (println "\n-- step 2a: browser-computed plan == offline (nbb) plan, post-round-trip data --")
+    (println "browser plan:" browser-plan)
+    (println "offline plan (post-round-trip):" offline-plan-post)
+    (println "match:" plan-post-matches-browser)
+
+    (println "\n-- step 2b: offline plan from PRE-round-trip data == offline plan from POST-round-trip data --")
+    (println "offline plan (pre-round-trip): " offline-plan-pre)
+    (println "offline plan (post-round-trip):" offline-plan-post)
+    (println "match (SMF round trip changed nothing about the derived schedule):" plan-pre-matches-post)
+
+    (println "\n-- step 2d: per-note onset position + frequency, measured from the CAPTURED (browser) PCM --")
+    (doseq [row rows] (print-note-row row))
+
+    (println "\n-- cross-check: same measurement applied to the OFFLINE reference PCM (post-round-trip data) --")
+    (doseq [row offline-rows] (print-note-row row))
+
+    (println "\n-- cross-check: same measurement applied to the OFFLINE reference PCM (PRE-round-trip data) --")
+    (doseq [row pre-rows] (print-note-row row))
+
+    (let [all-onset-ok (every? :onset-ok rows)
+          all-freq-ok (every? :freq-ok rows)
+          all-onset-ok-offline (every? :onset-ok offline-rows)
+          all-freq-ok-offline (every? :freq-ok offline-rows)
+          all-onset-ok-pre (every? :onset-ok pre-rows)
+          all-freq-ok-pre (every? :freq-ok pre-rows)
+          pass (and roundtrip-ok pcm-ok plan-post-matches-browser plan-pre-matches-post
+                    all-onset-ok all-freq-ok
+                    all-onset-ok-offline all-freq-ok-offline
+                    all-onset-ok-pre all-freq-ok-pre)]
+      (println "\n=== summary ===")
+      (println "SMF round-trip data preserved:" roundtrip-ok)
+      (println "captured-PCM vs. offline reference within tolerance:" pcm-ok)
+      (println "browser plan == offline plan (post-round-trip):" plan-post-matches-browser)
+      (println "offline plan pre == offline plan post (round trip is a no-op on the schedule):" plan-pre-matches-post)
+      (println "all onset checks ok (browser PCM):" all-onset-ok)
+      (println "all frequency checks ok (browser PCM):" all-freq-ok)
+      (println "all onset checks ok (offline PCM, post):" all-onset-ok-offline)
+      (println "all frequency checks ok (offline PCM, post):" all-freq-ok-offline)
+      (println "all onset checks ok (offline PCM, pre):" all-onset-ok-pre)
+      (println "all frequency checks ok (offline PCM, pre):" all-freq-ok-pre)
+      (println "PASS:" pass)
+      (.close browser)
+      (.close server)
+      (if pass (js/process.exit 0) (js/process.exit 1)))))
+
+(defn report-error [server browser e]
+  (println "ERROR:" (or (.-stack e) (.-message e) (str e)))
+  (.close browser)
+  (.close server)
+  (js/process.exit 1))
+
+(defn drive-page [server browser page roundtrip-ok]
+  (.on page "console" (fn [msg] (println "[console]" (.text msg))))
+  (.on page "pageerror" (fn [err] (println "[pageerror]" (str err))))
+  (-> (.goto page (str "http://localhost:" port "/"))
+      (.then (fn [_] (run-in-page page)))
+      (.then (fn [result] (report-and-exit server browser roundtrip-ok result)))
+      (.catch (fn [e] (report-error server browser e)))))
+
+(defn -main []
+  (when-not (fs/existsSync (path/join site-dir "worklet-processor.js"))
+    (println "ERROR: test/e2e/page/worklet-processor.js not found.")
+    (println "Run scripts/build-e2e-bundles.sh first.")
+    (js/process.exit 1))
+  (let [roundtrip-ok (print-roundtrip-report)]
+    (-> (start-server)
+        (.then
+          (fn [server]
+            (-> (.launch chromium)
+                (.then
+                  (fn [browser]
+                    (-> (.newPage browser)
+                        (.then (fn [page] (drive-page server browser page roundtrip-ok)))))))))
+        (.catch (fn [e] (println "SETUP ERROR:" (or (.-stack e) (.-message e) (str e))) (js/process.exit 1))))))
+
+(-main)

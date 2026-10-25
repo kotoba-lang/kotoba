@@ -1,0 +1,159 @@
+(ns kotobase.fake-authn
+  "An in-process Authn + data edge behind one `fetch`, for `kotobase.authn-test`.
+
+  Shapes are copied from cloud-kotoba/kotobase-control-plane
+  authn/src/authn/worker.cljk and biscuit.cljk at cloud-kotoba/main c8bc5569
+  (read 2026-09-24), not invented:
+
+    POST /v1/cacao/session   {cacao_b64} -> 200 viewer JSON +
+                             Set-Cookie gftd_session=…; the CACAO is verified
+                             with the same `cacao.edge.verify` the Worker uses,
+                             `aud` must be https://auth.kotoba.cloud, and the
+                             nonce is burned
+    POST /v1/biscuit/token   Bearer kb_sa_… | Cookie gftd_session=… (then
+                             Origin + JSON content type are required —
+                             `safe-browser-mutation?`); a Biscuit presented
+                             here is refused; a non-member is 401;
+                             201 {token authorization tokenType expiresAt
+                             expiresIn tenantDid graph permissions}, the token
+                             a real Biscuit v3 minted by
+                             `biscuit.wire/encode-authority-token` under a
+                             fixed root key, living 15 minutes
+    anything else            the data edge: 200, and the request is recorded
+
+  Every request, to any host, is recorded in `:requests`."
+  (:require ["@noble/curves/ed25519.js" :refer [ed25519]]
+            [biscuit.wire :as wire]
+            [cacao.edge.verify :as cacao-verify]
+            [kotoba.lang.text :as str]))
+
+(def authn-host "auth.kotoba.cloud")
+(def authn-origin "https://auth.kotoba.cloud")
+(def ttl-seconds (* 15 60))
+(def tenant-did "did:web:kotoba.cloud:tenant:t_abcdefabcdef12")
+
+(defn- ->u8 [xs] (js/Uint8Array.from (clj->js (vec xs))))
+(defn- byte-vec [xs] (vec (js/Array.from xs)))
+
+(def root-seed (vec (range 100 132)))
+(def root-public (byte-vec (.getPublicKey ed25519 (->u8 root-seed))))
+
+(defn- b64url [xs]
+  (-> (js/btoa (apply str (map #(js/String.fromCharCode %) xs)))
+      (str/replace "+" "-") (str/replace "/" "_") (str/replace #"=+$" "")))
+
+(defn- respond
+  ([status body] (respond status body {}))
+  ([status body headers]
+   (let [text (if (string? body) body (js/JSON.stringify (clj->js body)))]
+     #js {:ok (<= 200 status 299) :status status
+          :headers #js {:get (fn [k] (get headers (str/lower k)))}
+          :text (fn [] (js/Promise.resolve text))})))
+
+(defn- headers->map [h]
+  (into {} (for [k (js-keys (or h #js {}))] [(str/lower k) (aget h k)])))
+
+(defn- cookie-session [cookie]
+  (when (string? cookie) (second (re-find #"gftd_session=([^;\s]+)" cookie))))
+
+(defn- mint [state holder body]
+  (let [now (:now-ms @state)
+        expiry (.toISOString (js/Date. (+ now (* ttl-seconds 1000))))
+        graph (or (aget body "graph") (some->> (aget body "dbName") (str "db:")))
+        perms (or (some-> (aget body "permissions") array-seq vec) ["data:read" "data:write"])
+        next-secret (byte-vec (js/crypto.getRandomValues (js/Uint8Array. 32)))
+        facts (vec (concat [['scope (str "kotoba://graph/" graph)]
+                            ['scope (str "kotoba://tenant/" tenant-did)]]
+                           (map (fn [p] ['scope (str "kotoba://can/" p)]) perms)
+                           [['before expiry] ['holder holder]
+                            ['tenant_id (aget body "tenantId")]]))
+        token (b64url (wire/encode-authority-token
+                       {:root-key-id 1 :facts facts :root-private-key root-seed
+                        :next-secret next-secret
+                        :next-public-key (byte-vec (.getPublicKey ed25519 (->u8 next-secret)))
+                        :sign-fn (fn [seed payload]
+                                   (byte-vec (.sign ed25519 (->u8 payload) (->u8 seed))))}))]
+    (swap! state update :minted conj token)
+    (respond 201 {:token token :authorization (str "Biscuit " token) :tokenType "Biscuit"
+                  :expiresAt expiry :expiresIn ttl-seconds :tenantDid tenant-did
+                  :graph graph :permissions perms})))
+
+(defn- cacao-session [state body]
+  (let [b64 (aget body "cacao_b64")]
+    (-> (cacao-verify/verify b64 (js/Math.floor (/ (:now-ms @state) 1000)))
+        (.then
+         (fn [r]
+           (let [iss (aget r "iss")
+                 p (aget r "payload")]
+             (cond
+               (not (true? (aget r "valid"))) (respond 401 {:error "invalid CACAO"})
+               (not= authn-origin (aget p "aud")) (respond 401 {:error "invalid CACAO"})
+               (contains? (:burned @state) [iss (aget p "nonce")])
+               (respond 401 {:error "CACAO already used"})
+               :else
+               (let [token (str "s" (count (:sessions @state)) "x" (count (:burned @state)))]
+                 (swap! state #(-> % (update :burned conj [iss (aget p "nonce")])
+                                   (assoc-in [:sessions token] iss)))
+                 (respond 200 {:accountDid (str "did:web:kotoba.cloud:user:" (count (:sessions @state)))
+                               :activeDid iss}
+                          {"set-cookie" (str "gftd_session=" token
+                                             "; Domain=kotoba.cloud; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax")})))))))))
+
+(defn- biscuit-token [state headers body]
+  (let [authorization (get headers "authorization")
+        sa (some->> authorization (re-matches #"(?i)^Bearer (kb_sa_[A-Za-z0-9._~-]{20,2048})$") second)
+        cookie-principal (get-in @state [:sessions (cookie-session (get headers "cookie"))])]
+    (cond
+      (and (string? authorization) (re-find #"(?i)^Biscuit " authorization))
+      (respond 400 {:error "a Biscuit may be attenuated, not refreshed"})
+      (not (re-matches #"^t_[a-z0-9]{12,48}$" (str (aget body "tenantId"))))
+      (respond 400 {:error "valid tenantId required"})
+      sa
+      (if-let [holder (get (:service-accounts @state) sa)]
+        (mint state holder body)
+        (respond 401 {:error "not authorized"}))
+      (not (and (= authn-origin (get headers "origin"))
+                (str/includes? (str (get headers "content-type")) "application/json")))
+      (respond 403 {:error "same-origin application/json request required"})
+      (and cookie-principal (contains? (:members @state) cookie-principal))
+      (mint state cookie-principal body)
+      :else (respond 401 {:error "not authorized"}))))
+
+(defn make
+  "{:fetch f :state atom}. opts: :now-ms, :members #{did}, :service-accounts
+  {\"kb_sa_…\" did}."
+  [{:keys [now-ms members service-accounts]}]
+  (let [state (atom {:now-ms (or now-ms (js/Date.now)) :requests [] :minted []
+                     :sessions {} :burned #{} :members (set members)
+                     :service-accounts (or service-accounts {})})
+        fetch (fn [url opts]
+                (let [u (js/URL. url)
+                      headers (headers->map (some-> opts .-headers))
+                      raw (some-> opts .-body str)
+                      req {:url url :host (.-hostname u) :path (.-pathname u)
+                           :headers headers :body raw}]
+                  (swap! state update :requests conj req)
+                  (if (= authn-host (.-hostname u))
+                    (let [body (or (try (js/JSON.parse raw) (catch :default _ nil)) #js {})]
+                      (case (.-pathname u)
+                        "/v1/cacao/session" (cacao-session state body)
+                        "/v1/biscuit/token" (js/Promise.resolve (biscuit-token state headers body))
+                        (js/Promise.resolve (respond 404 {:error "not found"}))))
+                    (js/Promise.resolve
+                     (if (str/starts-with? (.-pathname u) "/v1/")
+                       (respond 200 "[]")
+                       (respond 200 {:ok true :datoms [] :val nil}))))))]
+    {:fetch fetch :state state}))
+
+(defn advance! [{:keys [state]} ms] (swap! state update :now-ms + ms))
+(defn now [{:keys [state]}] (:now-ms @state))
+(defn revoke-sessions! [{:keys [state]}] (swap! state assoc :sessions {}))
+
+(defn verifies?
+  "The token's key chain checks out from the fake's root key."
+  [token]
+  (let [pad (case (mod (count token) 4) 2 "==" 3 "=" "")
+        bin (js/atob (str (-> token (str/replace "-" "+") (str/replace "_" "/")) pad))
+        bytes (vec (map #(.charCodeAt bin %) (range (count bin))))]
+    (:ok? (wire/verify (wire/decode-token bytes) root-public
+                       (fn [pk payload sig] (.verify ed25519 (->u8 sig) (->u8 payload) (->u8 pk)))))))

@@ -1,0 +1,140 @@
+(ns io.stripe.issuing.state-test
+  "The state mapping, and specifically THE COLLISION, which is the thing this
+  provider's docstring says is the point of the file.
+
+  `core_test` checks that the mapping is complete, that every event is covered, and
+  that the statuses it names are real Stripe statuses. What nothing asserted is the
+  behaviour those declarations exist to protect:
+
+    \"inactive\" means BOTH :issued and :blocked.
+
+  One is a card that has never worked; the other is a card that was working and a
+  human stopped it. A provider that read the state back from Stripe and answered
+  :issued for a blocked card would let a caller \"activate\" a card someone
+  deliberately blocked. `stripe->candidates` returning a SET is what prevents that,
+  and until now no test would have noticed it being changed to return one value.
+
+  Every expectation was measured from the namespace before being written down."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [io.stripe.issuing.state :as state]
+            [kotoba.card.lifecycle :as lifecycle]))
+
+;; ---------------------------------------------------------------------------
+;; the collision
+;; ---------------------------------------------------------------------------
+
+(deftest inactive-means-both-issued-and-blocked
+  (testing "the ambiguity is returned in full rather than resolved by guessing"
+    (is (= #{:issued :blocked} (state/stripe->candidates "inactive")))
+    (is (set? (state/stripe->candidates "inactive"))
+        "a set, so a caller cannot mistake it for a decided answer")
+    (is (< 1 (count (state/stripe->candidates "inactive")))
+        "and it is genuinely ambiguous -- this is what ambiguous-statuses reports")))
+
+(deftest the-two-colliding-states-are-not-the-same-state
+  (testing "they share a Stripe status and remain distinct lifecycle states -- which
+            is precisely why the provider keeps the issuer side as the authority"
+    (is (= (state/->stripe :issued) (state/->stripe :blocked))
+        "same provider-side representation")
+    (is (not= :issued :blocked)
+        "different lifecycle meanings: never worked vs was working and was stopped")
+    (testing "so Stripe alone cannot narrow it, and the mapping is deliberately
+              non-injective"
+      (let [representable (remove nil? (vals state/mapping))]
+        (is (not= (count representable) (count (set representable)))
+            "if this ever became injective, the collision would have been folded away")))))
+
+(deftest the-unambiguous-statuses-are-unambiguous
+  (is (= #{:active} (state/stripe->candidates "active")))
+  (is (= #{:closed} (state/stripe->candidates "canceled")))
+  (testing "and exactly one status is ambiguous, matching what the provider reports"
+    (is (= #{"inactive"} (state/ambiguous-statuses)))))
+
+(deftest a-status-stripe-does-not-have-yields-no-candidates
+  (testing "empty, not a nearest guess -- an unrecognised status must not resolve to
+            a lifecycle state a caller would then act on"
+    (doseq [s ["deleted" "pending" "" "ACTIVE" nil]]
+      (is (= #{} (state/stripe->candidates s)) (pr-str s)))))
+
+;; ---------------------------------------------------------------------------
+;; ->stripe is total; :intake is an absence, not a status
+;; ---------------------------------------------------------------------------
+
+(deftest to-stripe-is-total-over-every-lifecycle-state
+  (testing "total, so no lifecycle state can reach the provider as an unhandled case"
+    (doseq [s lifecycle/states]
+      (is (contains? state/mapping s) (str s " has no entry"))))
+  (is (= (set (keys state/mapping)) lifecycle/states)
+      "and no extra entries either -- a mapping key that is not a lifecycle state
+       would be a state this provider believes in and the library does not"))
+
+(deftest intake-maps-to-nil-because-no-stripe-card-exists-yet
+  (is (nil? (state/->stripe :intake)))
+  (is (false? (state/representable? :intake))
+      "an absence, not a status -- and reported as unrepresentable rather than
+       squeezed into 'inactive', which would claim a card exists")
+  (testing "every other state is representable"
+    (doseq [s (disj lifecycle/states :intake)]
+      (is (true? (state/representable? s)) (str s)))))
+
+(deftest each-mapped-status-is-one-stripe-actually-has
+  (doseq [[s v] state/mapping :when (some? v)]
+    (is (contains? state/statuses v) (str s " -> " (pr-str v)))))
+
+;; ---------------------------------------------------------------------------
+;; events
+;; ---------------------------------------------------------------------------
+
+(deftest a-reissue-carries-no-status-so-it-cannot-be-sent-as-one
+  (testing "Stripe has no replace transition: a replacement is a new card with
+            replacement_for plus a cancel of the original. The absence of
+            :stripe/status is what stops a caller effecting it as a status update."
+    (let [op (state/event->op :reissue)]
+      (is (= :replace (:stripe/op op)))
+      (is (not (contains? op :stripe/status))
+          "no status field at all -- not nil, absent")
+      (is (seq (:stripe/detail op))
+          "and it explains itself, because refusing without a reason is not much
+           better than guessing"))))
+
+(deftest the-three-status-events-name-a-real-status
+  (doseq [e [:activate :block :close]]
+    (let [op (state/event->op e)]
+      (is (= :update-status (:stripe/op op)) (str e))
+      (is (contains? state/statuses (:stripe/status op)) (str e)))))
+
+(deftest activate-and-block-agree-with-the-lifecycle-they-effect
+  (testing "the Stripe status an event sets must be the one the lifecycle's
+            destination state maps to, or the provider and the issuer would disagree
+            about what just happened"
+    (doseq [e [:activate :block :close]]
+      (let [to (get-in lifecycle/events [e :to])]
+        (is (= (state/->stripe to) (:stripe/status (state/event->op e)))
+            (str e " -> " to))))))
+
+(deftest an-unknown-event-has-no-operation
+  (testing "nil, so core's set-card-state! refuses with :event-unknown rather than
+            defaulting to some status"
+    (is (nil? (state/event->op :nope)))
+    (is (nil? (state/event->op nil)))))
+
+(deftest every-lifecycle-event-is-covered-and-no-extras-are-invented
+  (is (state/covers-every-event?))
+  (is (= (set (keys lifecycle/events)) (set (keys state/events)))
+      "a provider event the library does not have would be an operation nobody can
+       ask for; a library event this provider lacks would fail at runtime")
+  (testing "and covers-every-event? is derived, not a hardcoded list -- so adding an
+            event to kotoba.card.lifecycle breaks this rather than passing silently"
+    (is (= (count lifecycle/events) (count state/events)))))
+
+;; ---------------------------------------------------------------------------
+;; the vocabularies themselves
+;; ---------------------------------------------------------------------------
+
+(deftest the-stripe-vocabularies-are-exactly-what-the-spec-says
+  (testing "verified against the live spec 2026-07-30; pinned so a later edit that
+            adds a status Stripe does not have is caught here"
+    (is (= #{"active" "inactive" "canceled"} state/statuses))
+    (is (= #{"virtual" "physical"} state/card-types))
+    (testing "and 'cancelled' with two Ls is not one of them -- Stripe spells it with one"
+      (is (not (contains? state/statuses "cancelled"))))))

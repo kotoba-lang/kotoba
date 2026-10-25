@@ -1,0 +1,625 @@
+(ns datalog.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [datalog.index :as index]
+            [datalog.core :as dl]
+            [datom.source :as ds]))
+
+(defn- assert-quad
+  "`datalog.index/assert-quad` with an explicit `ref?` -- these fixtures use
+  no reverse-reference lookup, so nothing is `:vaet`-indexed. `ref?` is a
+  required argument in this library (see `datalog.index`'s ns docstring):
+  there is no implicit default to inherit."
+  [db quad]
+  (index/assert-quad db quad (constantly false)))
+
+(defn- fixture-db []
+  (-> (index/empty-db)
+      (assert-quad {:s "alice" :p "role" :o "admin"})
+      (assert-quad {:s "alice" :p "name" :o "Alice"})
+      (assert-quad {:s "bob" :p "role" :o "user"})
+      (assert-quad {:s "bob" :p "name" :o "Bob"})
+      (assert-quad {:s "carol" :p "role" :o "admin"})
+      (assert-quad {:s "carol" :p "name" :o "Carol"})))
+
+(def ^:private everything (constantly true))
+
+(deftest single-clause-behaves-like-datalog-query
+  (let [db (fixture-db)]
+    (is (= #{["alice"] ["carol"]}
+           (dl/q db {:find '[?s] :where '[[?s "role" "admin"]]} everything)))))
+
+(deftest two-clause-join-on-shared-variable
+  (let [db (fixture-db)]
+    (testing "?s shared between clauses restricts to admins, then projects their name"
+      (is (= #{["Alice"] ["Carol"]}
+             (dl/q db {:find '[?name]
+                       :where '[[?s "role" "admin"]
+                                [?s "name" ?name]]}
+                   everything))))))
+
+(deftest three-clause-chain-join
+  (let [db (fixture-db)]
+    (is (= #{["alice" "admin" "Alice"] ["carol" "admin" "Carol"]}
+           (dl/q db {:find '[?s ?role ?name]
+                     :where '[[?s "role" ?role]
+                              [?s "role" "admin"]
+                              [?s "name" ?name]]}
+                 everything)))))
+
+(deftest no-shared-variable-is-a-cartesian-product
+  (let [db (fixture-db)]
+    (is (= #{["alice" "Bob"] ["alice" "Carol"] ["alice" "Alice"]
+             ["bob" "Bob"] ["bob" "Carol"] ["bob" "Alice"]
+             ["carol" "Bob"] ["carol" "Carol"] ["carol" "Alice"]}
+           (dl/q db {:find '[?s ?name]
+                     :where '[[?s "role" _]
+                              [_ "name" ?name]]}
+                 everything)))))
+
+(deftest conflicting-binding-yields-empty-result
+  (let [db (fixture-db)]
+    (testing "?x can't be both alice's own subject and match a name it never has"
+      (is (= #{}
+             (dl/q db {:find '[?x]
+                       :where '[[?x "role" "admin"]
+                                [?x "name" "Bob"]]}
+                   everything))))))
+
+(deftest repeated-variable-within-one-clause-self-joins
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s "alice" :p "knows" :o "alice"})
+               (assert-quad {:s "bob" :p "knows" :o "carol"}))]
+    (is (= #{["alice"]}
+           (dl/q db {:find '[?x] :where '[[?x "knows" ?x]]} everything)))))
+
+(deftest visible-is-required
+  (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+               #_:clj-kondo/ignore
+               (dl/q (fixture-db) {:find '[?s] :where '[[?s "role" "admin"]]}))))
+
+(deftest visible-applies-per-clause
+  (let [db (fixture-db)
+        no-bob (fn [{:keys [s]}] (not= "bob" s))]
+    (is (= #{["Alice"] ["Carol"]}
+           (dl/q db {:find '[?name]
+                     :where '[[?s "role" _]
+                              [?s "name" ?name]]}
+                 no-bob)))))
+
+;; ── negation (ADR-2607061200 Stage 2) ───────────────────────────────────────
+
+(deftest not-clause-excludes-matching-bindings
+  (let [db (fixture-db)]
+    (testing "everyone who has a name but is NOT an admin"
+      (is (= #{["bob"]}
+             (dl/q db {:find '[?s]
+                       :where '[[?s "name" _]
+                                (not [?s "role" "admin"])]}
+                   everything))))))
+
+(deftest not-clause-with-wildcard-value-excludes-any-value
+  (let [db (-> (fixture-db)
+               (assert-quad {:s "dave" :p "name" :o "Dave"}))]
+    (testing "dave has a name but no role fact at all -- (not [?s \"role\" _]) keeps him"
+      (is (= #{["dave"]}
+             (dl/q db {:find '[?s]
+                       :where '[[?s "name" _]
+                                (not [?s "role" _])]}
+                   everything))))))
+
+(deftest not-clause-can-reference-multiple-earlier-bound-vars
+  (let [db (fixture-db)]
+    (testing "?s bound by clause 1, ?role bound by clause 2, both usable inside (not ...)"
+      (is (= #{["bob" "user"]}
+             (dl/q db {:find '[?s ?role]
+                       :where '[[?s "name" _]
+                                [?s "role" ?role]
+                                (not [?s "role" "admin"])]}
+                   everything))))))
+
+(deftest unbound-variable-inside-not-clause-throws
+  (let [db (fixture-db)]
+    (testing "?role is never bound by a positive clause before the negation -- unsafe, must throw"
+      (is (thrown-with-msg? js/Error
+                             #"unsafe negation"
+                             (dl/q db {:find '[?s]
+                                       :where '[[?s "name" _]
+                                                (not [?s "role" ?role])]}
+                                   everything))))))
+
+(deftest not-clause-wildcard-inside-is-always-safe
+  (let [db (fixture-db)]
+    (testing "a wildcard inside (not ...) never needs to be bound -- no throw"
+      (is (= #{["alice"] ["carol"]}
+             (dl/q db {:find '[?s]
+                       :where '[[?s "role" "admin"]
+                                (not [?s "banned" _])]}
+                   everything))))))
+
+(deftest not-clause-respects-visible-just-like-a-positive-clause
+  (let [db (fixture-db)
+        ;; carol's admin-role fact is HIDDEN from this caller -- to them it
+        ;; must look exactly as absent as bob's genuinely-missing admin fact.
+        hide-carols-admin-fact (fn [{:keys [s p o]}] (not (and (= s "carol") (= p "role") (= o "admin"))))]
+    (testing "carol really IS an admin, but this caller can't see that fact -- (not [?s \"role\" \"admin\"]) must keep her, exactly like bob (a genuine non-admin)"
+      (is (= #{["bob"] ["carol"]}
+             (dl/q db {:find '[?s]
+                       :where '[[?s "name" _]
+                                (not [?s "role" "admin"])]}
+                   hide-carols-admin-fact))
+          "without redaction only bob would pass (carol really is an admin); the caller's visible? makes carol indistinguishable from a real non-admin"))))
+
+;; ── aggregation (ADR-2607061200 Stage 2) ────────────────────────────────────
+
+(deftest count-aggregate-ungrouped
+  (let [db (fixture-db)]
+    (is (= #{[3]}
+           (dl/q db {:find '[(count ?s)] :where '[[?s "name" _]]} everything)))))
+
+(deftest count-aggregate-grouped-by-role
+  (let [db (fixture-db)]
+    (is (= #{["admin" 2] ["user" 1]}
+           (dl/q db {:find '[?role (count ?s)] :where '[[?s "role" ?role]]} everything)))))
+
+(deftest count-distinct-aggregate
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s "alice" :p "tag" :o "x"})
+               (assert-quad {:s "alice" :p "tag" :o "x"})
+               (assert-quad {:s "alice" :p "tag" :o "y"}))]
+    (is (= #{["alice" 2]}
+           (dl/q db {:find '[?s (count-distinct ?v)] :where '[[?s "tag" ?v]]} everything)))))
+
+(deftest sum-avg-min-max-aggregates
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s "alice" :p "score" :o 10})
+               (assert-quad {:s "alice" :p "score" :o 20})
+               (assert-quad {:s "bob" :p "score" :o 30}))]
+    (is (= #{["alice" 30 15.0 10 20] ["bob" 30 30.0 30 30]}
+           (dl/q db {:find '[?s (sum ?v) (avg ?v) (min ?v) (max ?v)]
+                     :where '[[?s "score" ?v]]}
+                 everything)))))
+
+(deftest ungrouped-aggregate-over-zero-matches-is-one-row-not-empty
+  (let [db (fixture-db)]
+    (is (= #{[0]}
+           (dl/q db {:find '[(count ?s)] :where '[[?s "role" "nonexistent"]]} everything))
+        "Datomic shape: an all-aggregate :find with zero matches is one row of zeros/nils, not an empty set")))
+
+(deftest min-max-of-empty-group-is-nil-not-a-thrown-error
+  (let [db (fixture-db)]
+    (is (= #{[nil nil]}
+           (dl/q db {:find '[(min ?v) (max ?v)] :where '[[?s "score" ?v]]} everything)))))
+
+(deftest aggregate-honors-visible-too
+  (let [db (fixture-db)
+        no-bob (fn [{:keys [s]}] (not= "bob" s))]
+    (is (= #{[2]}
+           (dl/q db {:find '[(count ?s)] :where '[[?s "name" _]]} no-bob)))))
+
+;; ── recursive rules (ADR-2607061200 Stage 3/4) ──────────────────────────────
+
+(defn- chain-db []
+  (-> (index/empty-db)
+      (assert-quad {:s "alice" :p "parent" :o "bob"})
+      (assert-quad {:s "bob" :p "parent" :o "carol"})
+      (assert-quad {:s "carol" :p "parent" :o "dave"})))
+
+(def ^:private ancestor-rules
+  '[[(ancestor ?x ?y) [?x "parent" ?y]]
+    [(ancestor ?x ?y) [?x "parent" ?z] (ancestor ?z ?y)]])
+
+(deftest transitive-closure-via-recursive-rule
+  (let [db (chain-db)]
+    (is (= #{["alice" "bob"] ["alice" "carol"] ["alice" "dave"]
+             ["bob" "carol"] ["bob" "dave"]
+             ["carol" "dave"]}
+           (dl/q db {:find '[?x ?y] :where '[(ancestor ?x ?y)] :rules ancestor-rules} everything)))))
+
+(deftest rule-invocation-can-bind-args-in-either-direction
+  (let [db (chain-db)]
+    (testing "first arg bound (find descendants), second arg bound (find ancestors)"
+      (is (= #{["bob"] ["carol"] ["dave"]}
+             (dl/q db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} everything)))
+      (is (= #{["alice"] ["bob"] ["carol"]}
+             (dl/q db {:find '[?x] :where '[(ancestor ?x "dave")] :rules ancestor-rules} everything))))))
+
+(deftest rule-without-recursion-behaves-like-a-named-join
+  (let [db (chain-db)]
+    (is (= #{["bob"]}
+           (dl/q db {:find '[?y]
+                     :where '[(parent-of "alice" ?y)]
+                     :rules '[[(parent-of ?x ?y) [?x "parent" ?y]]]}
+                 everything)))))
+
+(deftest mutual-recursion-across-two-rules
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s "a" :p "red" :o "b"})
+               (assert-quad {:s "b" :p "blue" :o "c"})
+               (assert-quad {:s "c" :p "red" :o "d"})
+               (assert-quad {:s "d" :p "blue" :o "e"}))
+        rules '[[(reach-red ?x ?y) [?x "red" ?y]]
+                [(reach-red ?x ?y) [?x "red" ?z] (reach-blue ?z ?y)]
+                [(reach-blue ?x ?y) [?x "blue" ?y]]
+                [(reach-blue ?x ?y) [?x "blue" ?z] (reach-red ?z ?y)]]]
+    (is (= #{["b"] ["c"] ["d"] ["e"]}
+           (dl/q db {:find '[?y] :where '[(reach-red "a" ?y)] :rules rules} everything)))))
+
+(deftest recursive-rule-respects-visible-through-the-fixpoint
+  (let [db (chain-db)
+        hide-bob-carol (fn [{:keys [s p o]}] (not (and (= s "bob") (= p "parent") (= o "carol"))))]
+    (testing "without redaction alice reaches carol/dave too; with bob->carol hidden, the fixpoint can't derive past bob"
+      (is (= #{["bob"] ["carol"] ["dave"]}
+             (dl/q db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} everything)))
+      (is (= #{["bob"]}
+             (dl/q db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} hide-bob-carol))
+          "the hidden edge is invisible to every rule-body clause too, not just the top-level :where"))))
+
+(deftest unknown-rule-invocation-throws
+  (let [db (chain-db)]
+    (is (thrown-with-msg? js/Error
+                           #"unknown rule"
+                           (dl/q db {:find '[?y] :where '[(nope "alice" ?y)]} everything)))))
+
+(deftest rule-invoked-with-wrong-arity-throws
+  (let [db (chain-db)]
+    (is (thrown-with-msg? js/Error
+                           #"wrong number of arguments"
+                           (dl/q db {:find '[?y]
+                                     :where '[(anc "alice" ?y "extra")]
+                                     :rules '[[(anc ?x ?y) [?x "parent" ?y]]]}
+                                 everything)))))
+
+(deftest rule-definitions-with-mismatched-arity-throws
+  (let [db (chain-db)]
+    (is (thrown-with-msg? js/Error
+                           #"same arity"
+                           (dl/q db {:find '[?x ?y]
+                                     :where '[(bad ?x ?y)]
+                                     :rules '[[(bad ?x ?y) [?x "parent" ?y]]
+                                              [(bad ?x) [?x "parent" _]]]}
+                                 everything)))))
+
+(deftest negating-a-rule-invocation-throws
+  (let [db (chain-db)]
+    (is (thrown-with-msg? js/Error
+                           #"negation of a rule invocation is not supported"
+                           (dl/q db {:find '[?y]
+                                     :where '[[?y "parent" _] (not (ancestor "alice" ?y))]
+                                     :rules ancestor-rules}
+                                 everything)))))
+
+(deftest unsafe-negation-inside-a-rule-body-throws
+  (let [db (chain-db)]
+    (is (thrown-with-msg? js/Error
+                           #"unsafe negation"
+                           (dl/q db {:find '[?x ?y]
+                                     :where '[(risky ?x ?y)]
+                                     :rules '[[(risky ?x ?y) (not [?x "parent" ?z])]]}
+                                 everything)))))
+
+;; ── query-language extensions: :in, predicate/function clauses, or/or-join ──
+;; (ADR-2607061200 query-language follow-up)
+
+(defn- ages-db []
+  (-> (index/empty-db)
+      (assert-quad {:s "alice" :p "age" :o 30})
+      (assert-quad {:s "bob" :p "age" :o 15})
+      (assert-quad {:s "carol" :p "age" :o 45})))
+
+(deftest in-binds-extra-positional-parameters
+  (let [db (ages-db)]
+    (is (= #{["alice"] ["carol"]}
+           (dl/q db {:find '[?s] :in '[?min-age] :where '[[?s "age" ?age] [(> ?age ?min-age)]]}
+                 everything [18])))))
+
+(deftest in-accepts-a-leading-dollar-as-a-noop-db-placeholder
+  (let [db (ages-db)]
+    (is (= #{["alice"] ["carol"]}
+           (dl/q db {:find '[?s] :in '[$ ?min-age] :where '[[?s "age" ?age] [(> ?age ?min-age)]]}
+                 everything [18])))))
+
+(deftest predicate-clause-filters-without-binding
+  (let [db (ages-db)]
+    (is (= #{["alice"] ["carol"]}
+           (dl/q db {:find '[?s] :where '[[?s "age" ?age] [(> ?age 18)]]} everything)))))
+
+(deftest function-clause-binds-a-computed-result
+  (let [db (ages-db)]
+    (is (= #{["alice" 60] ["bob" 30] ["carol" 90]}
+           (dl/q db {:find '[?s ?doubled] :where '[[?s "age" ?age] [(* ?age 2) ?doubled]]} everything)))))
+
+(deftest unbound-variable-inside-predicate-clause-throws
+  (let [db (ages-db)]
+    (is (thrown-with-msg? js/Error
+                           #"unsafe function/predicate clause"
+                           (dl/q db {:find '[?s] :where '[[(> ?nope 5)]]} everything)))))
+
+(deftest unknown-function-in-clause-throws
+  (let [db (ages-db)]
+    (is (thrown-with-msg? js/Error
+                           #"unknown or disallowed function"
+                           (dl/q db {:find '[?s] :where '[[?s "age" ?age] [(unknown-fn ?age)]]} everything)))))
+
+(deftest or-clause-unions-alternative-branches
+  (let [db (ages-db)]
+    (is (= #{["alice"] ["carol"]}
+           (dl/q db {:find '[?s] :where '[(or [?s "age" 30] [?s "age" 45])]} everything)))))
+
+(deftest or-clause-respects-visible-in-every-branch
+  (let [db (ages-db)
+        hide-carol (fn [{:keys [s]}] (not= "carol" s))]
+    (is (= #{["alice"]}
+           (dl/q db {:find '[?s] :where '[(or [?s "age" 30] [?s "age" 45])]} hide-carol)))))
+
+(deftest or-join-shares-only-declared-variables
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s "alice" :p "friend" :o "bob"})
+               (assert-quad {:s "alice" :p "enemy" :o "carol"})
+               (assert-quad {:s "dave" :p "friend" :o "eve"}))]
+    (testing "?f and ?e are branch-local -- only ?s propagates out"
+      (is (= #{["alice"] ["dave"]}
+             (dl/q db {:find '[?s] :where '[(or-join [?s] [?s "friend" ?f] [?s "enemy" ?e])]} everything))))))
+
+(deftest ground-injects-a-literal-constant
+  (let [db (ages-db)]
+    (is (= #{["alice"]}
+           (dl/q db {:find '[?s] :where '[[?s "age" ?age] [(ground 30) ?age]]} everything)))))
+
+;; --- (and ...) branches inside or / or-join --------------------------------
+
+(deftest and-branch-lets-a-branch-bind-then-constrain
+  (testing "a branch used to be ONE clause, so it could not both bind a
+            variable and constrain it — which is exactly what a comparison
+            inside a disjunction needs, and why every such query had to be
+            refused one layer up"
+    (let [db (-> (index/empty-db)
+                 (assert-quad {:s :a :p :age :o 30})
+                 (assert-quad {:s :a :p :name :o "Alice"})
+                 (assert-quad {:s :b :p :age :o 10})
+                 (assert-quad {:s :b :p :name :o "Bob"})
+                 (assert-quad {:s :c :p :age :o 50})
+                 (assert-quad {:s :c :p :name :o "Carol"}))
+          q (fn [w] (sort (map first (dl/q db {:find '[?n] :where w} (constantly true)))))]
+      (is (= ["Alice" "Carol"]
+             (q '[(or-join [?e] (and [?e :age ?a] [(> ?a 18)]))
+                  [?e :name ?n]]))
+          "bind ?a inside the branch, then constrain it inside the same branch")
+      (is (= ["Alice" "Bob" "Carol"]
+             (q '[(or-join [?e] (and [?e :age ?a] [(> ?a 18)]) [?e :age 10])
+                  [?e :name ?n]]))
+          "an and-branch beside a plain-clause branch"))))
+
+(deftest and-branch-works-in-plain-or-too
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s :a :p :role :o "admin"})
+               (assert-quad {:s :a :p :tier :o 2})
+               (assert-quad {:s :b :p :role :o "admin"})
+               (assert-quad {:s :b :p :tier :o 1}))
+        r (dl/q db '{:find [?e] :where [(or (and [?e :role "admin"] [?e :tier 2])
+                                                 [?e :role "owner"])]}
+                     (constantly true))]
+    (is (= #{[:a]} (set r)) "only the entity satisfying BOTH clauses of the branch")))
+
+(deftest an-unsafe-and-branch-is-still-rejected
+  (testing "the safety check follows the branch's own order — a predicate may
+            rely on a clause earlier in the SAME branch, and on nothing else"
+    (is (thrown? #?(:clj Exception :cljs :default)
+                 (dl/q (index/empty-db)
+                            '{:find [?e] :where [(or-join [?e] (and [(> ?a 18)] [?e :age ?a]))]}
+                            (constantly true))))))
+
+;; --- string predicates -----------------------------------------------------
+
+(deftest string-predicates-are-whitelisted
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s :a :p :name :o "Alice"})
+               (assert-quad {:s :b :p :name :o "Bob"})
+               (assert-quad {:s :c :p :name :o "Alicia"}))
+        q (fn [w] (sort (map first (dl/q db {:find '[?n] :where w} (constantly true)))))]
+    (is (= ["Alice" "Alicia"] (q '[[?e :name ?n] [(starts-with? ?n "Ali")]])))
+    (is (= ["Bob"] (q '[[?e :name ?n] [(ends-with? ?n "ob")]])))
+    (is (= ["Alice" "Alicia"] (q '[[?e :name ?n] [(includes? ?n "lic")]])))))
+
+(deftest an-unknown-function-is-refused-even-with-no-rows
+  (testing "regex is deliberately absent — a caller-supplied pattern is a ReDoS
+            vector, and a query is caller-supplied data here. The refusal is
+            STATIC: eval-fn-call never runs when no binding reaches the clause,
+            so an unknown function used to pass silently whenever the result
+            set was empty, which is the worst place to be lenient — a typo
+            looking exactly like a correct answer of 'nothing matched'"
+    (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"unknown or disallowed"
+                 (dl/q (index/empty-db)
+                            '{:find [?n] :where [[?e :name ?n] [(re-find "x" ?n)]]}
+                            (constantly true))))
+    (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"unknown or disallowed"
+                 (dl/q (index/empty-db)
+                            '{:find [?n] :where [[?e :name ?n] [(eval ?n)]]}
+                            (constantly true))))))
+
+(deftest comparison-predicates-fuse-into-a-value-range
+  (let [db (reduce (fn [d i]
+                     (assert-quad d {:s (str "p" i) :p "age" :o i}))
+                   (index/empty-db)
+                   (range 20))]
+    (is (= #{["p18"] ["p19"]}
+           (dl/q db {:find '[?s]
+                     :where '[[?s "age" ?a]
+                              [(>= ?a 18)]
+                              [(< ?a 20)]]}
+                 everything))
+        "fused [18, 20) agrees with the predicate form")
+    (is (= (dl/q db {:find '[?s]
+                     :where '[[?s "age" ?a]
+                              [(>= ?a 18)]
+                              [(< ?a 20)]]}
+                 everything)
+           (into #{} (map (fn [i] [(str "p" i)])) (range 18 20))))))
+
+(deftest a-range-on-a-bound-entity-is-a-keyed-scan-not-a-domain-walk
+  ;; With ?e already bound by an earlier clause, the fused range is a question
+  ;; about ONE entity's values: it must go through `scan` on `[e a _]`, never
+  ;; through `scan-range` over the attribute's whole value domain (one walk
+  ;; per distinct entity -- measured at 86,932 values per message on LDBC
+  ;; IC09, ayatori iteration 18). With ?e open, one `scan-range` is right.
+  (let [quads (into #{} (for [i (range 20)] {:s (str "p" i) :p "age" :o i}))
+        quads (into quads (for [i (range 20)] {:s "g" :p "member" :o (str "p" i)}))
+        scans (atom []) ranges (atom [])
+        src (reify
+              ds/IPatternSource
+              (-scan [_ [s p o]]
+                (swap! scans conj [s p o])
+                (filter (fn [q] (and (or (nil? s) (= s (:s q)))
+                                     (or (nil? p) (= p (:p q)))
+                                     (or (nil? o) (= o (:o q)))))
+                        quads))
+              ds/IRangeSource
+              (-scan-range [_ attr lo hi opts]
+                (swap! ranges conj [attr lo hi])
+                (filter (fn [q] (and (= attr (:p q)) (ds/in-range? (:o q) lo hi opts))) quads)))
+        bound-first '{:find [?m] :where [["g" "member" ?m] [?m "age" ?a] [(>= ?a 18)] [(< ?a 20)]]}
+        open-first  '{:find [?m] :where [[?m "age" ?a] [(>= ?a 18)] [(< ?a 20)] ["g" "member" ?m]]}]
+    (testing "entity bound by the earlier clause: keyed scans, no domain walk"
+      (reset! scans []) (reset! ranges [])
+      (is (= #{["p18"] ["p19"]} (dl/q src bound-first everything)))
+      (is (= 0 (count @ranges)))
+      (is (= 20 (count (filter (fn [[s p _]] (and (some? s) (= p "age"))) @scans)))
+          "one keyed [e age _] scan per distinct bound entity"))
+    (testing "entity open: exactly one range cut, and the same answer"
+      (reset! scans []) (reset! ranges [])
+      (is (= #{["p18"] ["p19"]} (dl/q src open-first everything)))
+      (is (= 1 (count @ranges)))
+      (is (= [["age" 18 20]] @ranges)))))
+
+(deftest datascript-shaped-db-fns
+  (let [db (-> (index/empty-db)
+               (assert-quad {:s "r1" :p "law.rel/evidence" :o "cite-1"})
+               (assert-quad {:s "e1" :p "law.rel/kind" :o "law.rel/amends"}))]
+    (testing "get-else returns attribute value or default"
+      (is (= "cite-1"
+             (ffirst (dl/q db {:find '[?v]
+                               :where '[[?r "law.rel/evidence" ?v]]}
+                        everything))))
+      (is (= ""
+             (ffirst (dl/q db {:find '[?v]
+                               :where '[[?r "law.rel/kind" _]
+                                        [(get-else $ ?r "law.rel/evidence" "") ?v]]}
+                        everything)))))
+    (testing "missing? detects absent attributes"
+      (is (= #{["e1"]}
+             (dl/q db {:find '[?e]
+                       :where '[[?e "law.rel/kind" _]
+                                [(missing? $ ?e "law.text/sha256")]]}
+                   everything)))
+      (is (empty?
+           (dl/q db {:find '[?e]
+                     :where '[[?e "law.rel/evidence" _]
+                              [(missing? $ ?e "law.rel/evidence")]]}
+                 everything))))
+    (testing "contains? compares keyword set members against string binds"
+      (is (= #{["e1"]}
+             (dl/q db {:find '[?e]
+                       :where '[[?e "law.rel/kind" ?kind]
+                                [(contains? #{:law.rel/amends :law.rel/repeals} ?kind)]]}
+                   everything))))))
+
+
+(deftest the-keyed-fast-path-answers-the-two-index-shapes-and-declines-the-rest
+  ;; ayatori iteration 42: [?e a ?v] with ?e bound and [?e a v] with v
+  ;; bound/ground go straight to :eavt / :avet. Expected sets are written by
+  ;; hand; the controls are shapes the fast path must decline (nil), which
+  ;; the general path then answers.
+  (let [db (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} (constantly false)))
+                   (index/empty-db)
+                   [["a" "knows" "b"] ["a" "knows" "c"] ["b" "knows" "a"] ["a" "name" "A"] ["b" "name" "B"] ["c" "name" "C"]])
+        all (constantly true)
+        hide-c (fn [q] (not= "c" (:o q)))
+        fast #'dl/keyed-fast-path]
+    (testing "entity bound, value free"
+      (is (= #{{'?p "a" '?f "b"} {'?p "a" '?f "c"}} (fast #{{'?p "a"}} '[?p "knows" ?f] db all)))
+      (is (= #{{'?p "a" '?f "b"}} (fast #{{'?p "a"}} '[?p "knows" ?f] db hide-c)) "visible? sees every quad"))
+    (testing "entity bound, value bound: a check, not an extension"
+      (is (= #{{'?p "a" '?f "b"}} (fast #{{'?p "a" '?f "b"} {'?p "a" '?f "zz"}} '[?p "knows" ?f] db all))))
+    (testing "entity bound, value ground / wildcard"
+      (is (= #{{'?p "a"}} (fast #{{'?p "a"} {'?p "c"}} '[?p "knows" "b"] db all)))
+      (is (= #{{'?p "a"} {'?p "b"}} (fast #{{'?p "a"} {'?p "b"} {'?p "c"}} '[?p "knows" _] db all))))
+    (testing "value bound, entity free: the subjects holding it"
+      (is (= #{{'?f "a" '?k "b"}} (fast #{{'?f "a"}} '[?k "knows" ?f] db all)))
+      (is (= #{{'?k "b"}} (fast #{{}} '[?k "name" "B"] db all)) "ground value, free entity"))
+    (testing "controls: shapes the fast path declines"
+      (is (nil? (fast #{{}} '[?k "name" ?n] db all)) "neither side bound")
+      (is (nil? (fast #{{'?p "a"} {'?q "b"}} '[?p "knows" ?f] db all)) "entity not bound in every binding")
+      (is (nil? (fast #{{'?p "a"}} '[?p ?a ?f] db all)) "attribute not ground")
+      (is (nil? (fast #{} '[?p "knows" ?f] db all)) "no bindings"))
+    (testing "through q, the answer is the plain one"
+      (is (= #{["b" "B"] ["c" "C"]}
+             (dl/q db '{:find [?f ?n] :in [?p] :where [[?p "knows" ?f] [?f "name" ?n]]} all ["a"]))))))
+
+(deftest composite-lookups-through-the-group-order-agree-with-the-plain-clauses
+  ;; [?e g ?gv] [?e a ?av] adjacent, ?gv bound, ?e fresh -> one lookup per
+  ;; binding through datalog.index/grouped-values. Expected rows are the
+  ;; same query answered clause by clause (the fusion turned off by breaking
+  ;; adjacency with a predicate that changes nothing).
+  (let [db (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} (constantly false)))
+                   (index/empty-db)
+                   (concat
+                    (for [i (range 40)] [(str "post" i) "creator" (str "p" (mod i 4))])
+                    (for [i (range 40)] [(str "post" i) "forum" (str "f" (mod i 3))])
+                    (for [i (range 40)] [(str "post" i) "date" (str (+ 100 i))])
+                    [["p0" "knows" "p1"] ["p0" "knows" "p2"] ["p1" "knows" "p3"]]))
+        all (constantly true)
+        hide-post7 (fn [q] (not= "post7" (:s q)))
+        fused '[[?p "knows" ?x] [?post "creator" ?x] [?post "forum" ?f]]
+        unfused '[[?p "knows" ?x] [?post "creator" ?x] [(not= ?x "zz")] [?post "forum" ?f]]
+        q (fn [where vis] (dl/q db {:find '[?x ?post ?f] :in '[?p] :where where} vis ["p0"]))]
+    (testing "the pre-pass fuses the adjacent pair and leaves the broken one alone"
+      (is (= 1 (count (filter #'dl/composite-clause? (#'dl/fuse-composites fused {'?p "p0"})))))
+      (is (= 0 (count (filter #'dl/composite-clause? (#'dl/fuse-composites unfused {'?p "p0"})))))
+      (is (= 0 (count (filter #'dl/composite-clause? (#'dl/fuse-composites '[[?post "creator" ?x] [?post "forum" ?f]] {}))))
+          "?x unbound: nothing to look up under"))
+    (testing "point: ?f free, then ?f bound by an earlier clause, then ground"
+      (is (= (q unfused all) (q fused all)))
+      (is (= (q unfused hide-post7) (q fused hide-post7)) "visible? sees both quads")
+      (is (= (dl/q db {:find '[?x ?post] :in '[?p ?f] :where '[[?p "knows" ?x] [?post "creator" ?x] [?post "forum" ?f]]} all ["p0" "f1"])
+             (dl/q db {:find '[?x ?post] :in '[?p ?f] :where '[[?p "knows" ?x] [?post "creator" ?x] [(not= ?x "zz")] [?post "forum" ?f]]} all ["p0" "f1"])))
+      (is (= (dl/q db {:find '[?x ?post] :in '[?p] :where '[[?p "knows" ?x] [?post "creator" ?x] [?post "forum" "f2"]]} all ["p0"])
+             (dl/q db {:find '[?x ?post] :in '[?p] :where '[[?p "knows" ?x] [?post "creator" ?x] [(not= ?x "zz")] [?post "forum" "f2"]]} all ["p0"]))))
+    (testing "range on the second attribute"
+      (let [r (fn [where] (dl/q db {:find '[?x ?post ?d] :in '[?p] :where where} all ["p0"]))]
+        (is (= (r '[[?p "knows" ?x] [?post "creator" ?x] [(not= ?x "zz")] [?post "date" ?d] [(> ?d "120")] [(<= ?d "130")]])
+               (r '[[?p "knows" ?x] [?post "creator" ?x] [?post "date" ?d] [(> ?d "120")] [(<= ?d "130")]])))
+        (is (seq (r '[[?p "knows" ?x] [?post "creator" ?x] [?post "date" ?d] [(> ?d "120")] [(<= ?d "130")]])))))))
+
+(deftest count-pushdown-through-a-composite-agrees-with-counting-the-bindings
+  ;; :find [?f (count ?post)] with the (creator, forum) composite last and ?f
+  ;; bound by an earlier clause (IC05's shape): one weighted binding per
+  ;; (person, forum) instead of one per post. Expected values are a hand
+  ;; count and the same query with the pushdown defeated (adjacency broken);
+  ;; a hidden quad must not be counted; the pushdown must NOT be planned
+  ;; when ?f is free, when ?post is used again, or for another variable.
+  (let [db (reduce (fn [db [s p o]] (index/assert-quad db {:s s :p p :o o} (constantly false)))
+                   (index/empty-db)
+                   (concat
+                    (for [i (range 60)] [(str "post" i) "creator" (str "p" (mod i 4))])
+                    (for [i (range 60)] [(str "post" i) "forum" (str "f" (mod i 3))])
+                    [["p0" "knows" "p1"] ["p0" "knows" "p2"] ["p0" "knows" "p3"]
+                     ["p1" "joined" "f0"] ["p1" "joined" "f1"] ["p2" "joined" "f1"]
+                     ["p3" "joined" "f0"] ["p3" "joined" "f1"] ["p3" "joined" "f2"]]))
+        all (constantly true)
+        hide-some (fn [q] (not (#{"post5" "post9" "post13"} (:s q))))
+        pushed '[[?p "knows" ?x] [?x "joined" ?f] [?post "creator" ?x] [?post "forum" ?f]]
+        plain '[[?p "knows" ?x] [?x "joined" ?f] [?post "creator" ?x] [(not= ?x "zz")] [?post "forum" ?f]]
+        q (fn [where vis] (dl/q db {:find '[?f (count ?post)] :in '[?p] :where where} vis ["p0"]))]
+    ;; each of p1 p2 p3 owns 5 posts in each forum; joined: p1 f0 f1, p2 f1, p3 f0 f1 f2
+    (is (= #{["f0" 10] ["f1" 15] ["f2" 5]} (q plain all)) "hand count")
+    (is (= (q plain all) (q pushed all)))
+    (is (= (q plain hide-some) (q pushed hide-some)) "a hidden quad is not counted")
+    (testing "the pushdown is planned only for the count of the composite's own entity, last, with the value bound"
+      (let [fc (fn [w f] (#'dl/fuse-composites w {'?p "p0"} f))]
+        (is (some :composite/count-into (fc pushed '[?f (count ?post)])))
+        (is (not-any? :composite/count-into (fc '[[?p "knows" ?x] [?post "creator" ?x] [?post "forum" ?f]] '[?f (count ?post)])) "?f free: entries span forums")
+        (is (not-any? :composite/count-into (fc '[[?p "knows" ?x] [?x "joined" ?f] [?post "creator" ?x] [?post "forum" ?f] [?post "creator" ?y]] '[?f (count ?post)])) "?post used again later")
+        (is (not-any? :composite/count-into (fc pushed '[?f (count ?x)])) "count over another variable")
+        (is (not-any? :composite/count-into (fc pushed '[?f ?post (count ?post)])) "the entity is also projected")))
+    (testing "a per-person count still groups per person"
+      (is (= (dl/q db {:find '[?x (count ?post)] :in '[?p] :where plain} all ["p0"])
+             (dl/q db {:find '[?x (count ?post)] :in '[?p] :where pushed} all ["p0"]))))))

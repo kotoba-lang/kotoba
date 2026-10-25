@@ -1,0 +1,529 @@
+(ns prolly-tree.verify-range-test
+  "`verify-range` -- and the one question it exists to settle.
+
+  `verify` proves ONE pair to a party holding only the root. The obvious next
+  ask is `and is that ALL of them, between these two keys?`, and that ask splits
+  into two claims which look alike and are not:
+
+    C1  `this is what scan-range returns for [lo, hi) under this root`
+    C2  `this is every fact in [lo, hi)`
+
+  C1 is expected to be provable from the proof blocks alone, at zero extra
+  bytes, because an internal node carries EVERY child's [max-key, link] inside
+  the bytes its own CID names -- so a verifier can recompute the pruning rule
+  and demand exactly the children it keeps. C2 is expected NOT to be provable,
+  because pruning on a max-key is trusting a claim the prover chose, and no
+  block says the claim is true.
+
+  So this namespace has two controls rather than a happy path and some
+  refusals, and BOTH outcomes are the result:
+
+    the C1 controls MUST be refused -- if a short or substituted proof is
+    accepted, C1 is false as well and there is no range proof here at all;
+
+    the C2 control MUST be accepted -- `an-understated-max-key-hides-a-key-
+    and-the-proof-is-still-accepted` builds a tree `build-tree` cannot produce,
+    where a max-key is understated and the subtree behind it really does hold a
+    key in the window. The prover prunes it, an honest verifier prunes in
+    exactly the same place, and the short answer verifies. That acceptance is
+    the finding, and it is asserted on purpose.
+
+  Every refusal was watched failing rather than assumed, which this repo
+  already insists on for `verify` (`a refusal nobody has watched fail is a
+  refusal nobody has tested`). Measured by mutating `prolly-tree.core`:
+
+    make `verify-range` walk every child instead of calling `range-spans` --
+      a verifier following a different rule from the prover, which is the one
+      thing `descend-cid` says must never happen -- and SIX tests go RED: both
+      C2 tests, the oracle, the cost test, and two of the refusals. The C2
+      acceptances are load-bearing on the verifier pruning where the PROVER
+      pruned, not where it would be safe to.
+
+    make `range-spans` prune the last child on the span's +infinity `upper`
+      instead of on the claimed max-key -- i.e. borrow `diff/span-intersects?`
+      wholesale -- and `the-last-childs-claim-is-trusted-too-and-diff-
+      disagrees` goes RED, alone, on exactly its two assertions.
+      This mutation was RUN FIRST, against the OTHER C2 test, and reddened
+      NOTHING: `upper` and the claimed max-key are the same value for every
+      child except the last, so a fixture understating the FIRST child cannot
+      see the difference. The last-child test exists because of that miss. A
+      mutation that changes no answer has tested no assertion, and the way to
+      find out is to run it rather than to reason about it.
+
+    delete the surplus check and `both-the-honest-leaf-and-the-impostor-is-
+      refused` goes RED -- and only that one, which is the point of adding the
+      impostor rather than swapping it: with a swap, the omission fires first
+      and the surplus check is never reached.
+
+    delete the `in-span?` check and `a-leaf-outside-the-span-its-parent-claims-
+      is-refused` goes RED, alone.
+
+    make `demand` fall back to any block in the archive instead of throwing,
+      and `dropping-any-block-the-rule-keeps-is-refused` and
+      `a-wrong-root-is-refused` go RED -- then the run has to be KILLED, which
+      is the more interesting half. Substituting a block for a missing one
+      re-enters the walk at a node it has already passed, and the walk has no
+      fixed point: it recurses without bound, re-collecting every sibling leaf
+      at every level. The refusal is not only what keeps the answer honest, it
+      is what makes the walk terminate.
+
+  The cost claim is tested separately from the correctness claim, because a
+  verifier that quietly needed a block the scan never read would satisfy every
+  assertion about what it returned. `arrangement`'s suite makes the same
+  argument for counting BYTES and not only blocks: a block count with no byte
+  count is half a claim."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [ipld.core :as ipld]
+            [prolly-tree.core :as pt]
+            [prolly-tree.diff :as d]))
+
+;; ── fixtures ────────────────────────────────────────────────────────────────
+
+(defn- byte-count [bytes]
+  #?(:clj (if (bytes? bytes) (alength ^bytes bytes) (count bytes))
+     :cljs (if (vector? bytes) (count bytes) (.-length bytes))))
+
+(defn- mem-store
+  "A store that records what a read actually touched -- the cid, and the bytes.
+
+  The archive a prover would ship is exactly `@touched` after a scan, so the
+  cost comparison is not a separate measurement that could drift from the
+  thing being verified: it IS the thing being verified."
+  []
+  (let [store (atom {})
+        reads (atom 0)
+        touched (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid]
+               (swap! reads inc)
+               (let [bytes (get @store cid)]
+                 (when bytes (swap! touched assoc cid bytes))
+                 bytes))
+     :store store
+     :reads reads
+     :touched touched
+     :reset! (fn [] (reset! reads 0) (reset! touched {}))}))
+
+(defn- key-str
+  "Zero-padded `key-NNNN`, portable (no `format`, which is :clj-only)."
+  [i]
+  (let [s (str i)]
+    (str "key-" (apply str (repeat (- 4 (count s)) "0")) s)))
+
+(defn- rows [n] (mapv (fn [i] [(key-str i) i]) (range n)))
+
+(defn- lcg
+  "A deterministic pseudo-random sequence, copied from
+  `prolly-tree.range-diff-test` for the reason stated there: `rand-int` is
+  neither portable nor reproducible, and a failing window has to be re-runnable
+  to be worth reporting.
+
+  It is deterministic PER RUNTIME and not ACROSS them. `(* 2147483647
+  1103515245)` is past 2^53, so ClojureScript's doubles drop the low bits that
+  the JVM's longs keep, and the two sequences part company at the FIRST step
+  (measured: 1885017627 on the JVM, 1885017624 under node). So the JVM and cljs
+  runs sample DIFFERENT windows -- more coverage, and two independent samples,
+  but the block and byte totals they print are not the same measurement taken
+  twice and must not be compared to each other. What is comparable, and what
+  the assertions actually check, is that the EXTRA is zero in each."
+  [seed n]
+  (loop [x seed i 0 acc []]
+    (if (= i n) acc
+        (let [x' (mod (+ (* x 1103515245) 12345) 2147483648)]
+          (recur x' (inc i) (conj acc x'))))))
+
+(defn- root-children
+  "The root's `[max-key cid]` children, read from the tree itself.
+
+  Derived rather than hard-coded, for the reason `range-diff-test` gives:
+  chunk boundaries come out of a content hash, so a literal list would stop
+  being a boundary the day anything about encoding changed, and the test would
+  go on passing while testing nothing."
+  [get-fn root]
+  (let [node (ipld/decode (get-fn root))]
+    (when-not (= "leaf" (get node "kind"))
+      (mapv (fn [e] [(first e) (ipld/link-cid (second e))]) (get node "children")))))
+
+(defn- refusal
+  "The `:type` of the refusal `f` throws, or `:accepted` if it returns.
+
+  Named apart rather than asserted as `it threw`, because a control that
+  accepts `something went wrong` counts an unrelated failure as a successful
+  refusal -- and the whole value of these two controls is that they fail
+  differently."
+  [f]
+  (try (f) :accepted
+       (catch #?(:clj Exception :cljs :default) e
+         (or (:type (ex-data e)) :untyped))))
+
+(defn- tampered-bytes
+  [bytes]
+  #?(:clj (let [b (aclone ^bytes bytes)]
+            (aset-byte b 0 (unchecked-byte (inc (aget b 0))))
+            b)
+     :cljs (let [b (js/Uint8Array. bytes)]
+             (aset b 0 (bit-and 0xff (inc (aget b 0))))
+             b)))
+
+(defn- windows
+  "Sixty pseudo-random windows, plus the ones a random draw never finds.
+
+  The boundary-exact windows are the point of the list: `range-spans` keeps a
+  child when its claimed max-key is `>= lo`, and `lo` landing exactly on one of
+  seventeen boundaries is not something 4,200-wide random pairs produce."
+  [boundaries]
+  (concat
+   (->> (lcg 20260906 120)
+        (map #(mod % 4200))
+        (partition 2)
+        (map (fn [[x y]] [(key-str (min x y)) (key-str (max x y))])))
+   (mapcat (fn [m] [[m (str m "0")] [(key-str 0) m] [m nil]]) boundaries)
+   [[(key-str 0) (key-str 1)]
+    [(key-str 1999) (key-str 2000)]
+    [nil (key-str 50)]
+    [(key-str 3950) nil]
+    [nil nil]
+    [(key-str 5000) (key-str 6000)]
+    ["aaa" "bbb"]
+    [(key-str 300) (key-str 300)]
+    [(key-str 700) (key-str 300)]]))
+
+;; ── C1, the positive half: the answer is the scan's answer ──────────────────
+
+(deftest a-range-proof-agrees-with-the-scan-over-many-windows
+  (testing "the oracle: over many windows, verify-range = scan-range.
+
+            This is the assertion that matters, and it is the one `diff` makes
+            for the same reason -- interval arithmetic goes wrong by DROPPING
+            keys, and a dropped key is invisible in the result. Nothing in a
+            smaller answer says it should have been bigger, so only comparing
+            against the function whose answer is being proved can see it."
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          root (pt/build-tree put! (rows 4000))
+          boundaries (mapv first (root-children get-fn root))]
+      (is (< 5 (count boundaries))
+          (str "the fixture needs real internal structure; got " (count boundaries)))
+      (doseq [[lo hi] (windows boundaries)]
+        ((:reset! s))
+        (let [answer (pt/scan-range get-fn root lo hi)
+              proved (pt/verify-range root lo hi (vals @touched))]
+          (is (= answer (:entries proved))
+              (str "mismatch for [" lo ", " hi ")")))))))
+
+(deftest a-nil-root-proves-nothing-and-says-so
+  (testing "the empty tree: `scan-range` gives nil, so `:entries` must be nil
+            too -- a verifier that returned [] there would disagree with the
+            function it is proving"
+    (is (nil? (pt/verify-range nil "a" "z" [])))
+    (is (nil? (:entries (pt/verify-range nil "a" "z" []))))
+    (let [{:keys [put! get-fn]} (mem-store)
+          root (pt/build-tree put! (rows 3))]
+      (is (= :prolly-tree/unexpected-block
+             (refusal #(pt/verify-range nil "a" "z" [(get-fn root)])))
+          "and blocks offered against no root are still blocks nobody asked for"))))
+
+;; ── C1, the cost half: what the proof costs on the wire ─────────────────────
+
+(deftest a-range-proof-needs-exactly-the-blocks-the-scan-read
+  (testing "the `free on the wire` claim, measured rather than argued.
+
+            The prediction under test is that the EXTRA is zero: the verifier
+            needs every block the prover read and not one more, so a server
+            already reading those blocks to answer can ship the proof for the
+            price of the answer. Blocks AND bytes, because two proofs of the
+            same block count are not the same thing on a wire.
+
+            The byte figure is BLOCK bytes. A CARv1 carrying them adds a header
+            and, per block, a varint length and the binary CID -- container
+            overhead that is a property of the container and not of this proof,
+            and saying `zero extra bytes` without saying which bytes were
+            counted would be the half-claim this test exists to avoid."
+    (let [{:keys [put! get-fn touched reads] :as s} (mem-store)
+          root (pt/build-tree put! (rows 4000))
+          boundaries (mapv first (root-children get-fn root))
+          totals (atom {:scan-blocks 0 :scan-bytes 0 :proof-blocks 0 :proof-bytes 0})]
+      (doseq [[lo hi] (windows boundaries)]
+        ((:reset! s))
+        (pt/scan-range get-fn root lo hi)
+        (let [archive @touched
+              scan-blocks (count archive)
+              scan-bytes (reduce + 0 (map byte-count (vals archive)))
+              proved (pt/verify-range root lo hi (vals archive))]
+          (is (= @reads scan-blocks)
+              (str "the scan read each block once, so `blocks touched` is a
+                    fair denominator: [" lo ", " hi ")"))
+          (is (= scan-blocks (:blocks proved))
+              (str "extra blocks for [" lo ", " hi "): "
+                   (- (:blocks proved) scan-blocks)))
+          (is (= scan-bytes (:bytes proved))
+              (str "extra bytes for [" lo ", " hi "): "
+                   (- (:bytes proved) scan-bytes)))
+          (swap! totals #(-> %
+                             (update :scan-blocks + scan-blocks)
+                             (update :scan-bytes + scan-bytes)
+                             (update :proof-blocks + (:blocks proved))
+                             (update :proof-bytes + (:bytes proved))))))
+      (let [{:keys [scan-blocks scan-bytes proof-blocks proof-bytes]} @totals]
+        (is (pos? scan-blocks) "the windows actually read something")
+        (is (= 0 (- proof-blocks scan-blocks))
+            (str "extra blocks over all windows: " (- proof-blocks scan-blocks)))
+        (is (= 0 (- proof-bytes scan-bytes))
+            (str "extra bytes over all windows: " (- proof-bytes scan-bytes)))
+        (println "  [verify-range cost] windows=" (count (windows boundaries))
+                 " scan blocks=" scan-blocks " bytes=" scan-bytes
+                 " | proof blocks=" proof-blocks " bytes=" proof-bytes
+                 " | extra blocks=" (- proof-blocks scan-blocks)
+                 " bytes=" (- proof-bytes scan-bytes))))))
+
+;; ── C1 control (a): a short proof must be refused ───────────────────────────
+
+(deftest dropping-any-block-the-rule-keeps-is-refused
+  (testing "the C1 control. If a proof missing one kept leaf verifies, then
+            `the answer equals what scan-range returns` is false too, and there
+            is nothing here worth shipping."
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          root (pt/build-tree put! (rows 4000))
+          boundaries (mapv first (root-children get-fn root))
+          ;; a window wide enough to keep several leaves, so dropping one still
+          ;; leaves a proof that could plausibly be mistaken for a whole one
+          lo (key-str 100) hi (nth boundaries 3)]
+      ((:reset! s))
+      (let [answer (pt/scan-range get-fn root lo hi)
+            archive @touched]
+        (is (< 3 (count archive))
+            (str "need a multi-block proof for this to mean anything; got "
+                 (count archive)))
+        (is (= answer (:entries (pt/verify-range root lo hi (vals archive))))
+            "control: the honest proof holds")
+        (doseq [cid (keys archive)]
+          (is (= :prolly-tree/block-missing
+                 (refusal #(pt/verify-range root lo hi (vals (dissoc archive cid)))))
+              (str "dropping block " cid " must be refused")))))))
+
+;; ── C1 control (b): a genuine block from elsewhere must be refused ──────────
+
+(deftest a-genuine-leaf-from-elsewhere-in-the-tree-is-refused
+  (testing "substituting a leaf that really is in this tree, at the wrong place
+            -- the range analogue of `a-valid-block-from-elsewhere-in-the-tree-
+            is-refused`.
+
+            It refuses as :prolly-tree/block-missing rather than as a CID
+            mismatch, and that is a property rather than a shortfall: the
+            archive is indexed by re-hashing every block, so a substitution
+            cannot be a lie about which CID a block sits under. It decomposes
+            into an omission (the block the rule demanded) and a surplus (the
+            one nobody asked for), and the omission is hit first."
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          root (pt/build-tree put! (rows 4000))
+          boundaries (mapv first (root-children get-fn root))
+          lo (key-str 100) hi (nth boundaries 3)]
+      ((:reset! s))
+      (pt/scan-range get-fn root lo hi)
+      (let [archive @touched
+            ;; the boundary leaf: the one the window straddles at `lo`, i.e.
+            ;; the leaf holding keys below lo as well as above it. It is fetched
+            ;; WHOLE and filtered, which is what makes it the interesting one.
+            boundary-leaf (first (for [[cid bytes] archive
+                                       :let [node (ipld/decode bytes)]
+                                       :when (and (= "leaf" (get node "kind"))
+                                                  (some (fn [e] (neg? (compare (first e) lo)))
+                                                        (get node "entries")))]
+                                   cid))
+            ;; a leaf from a genuinely different part of the same tree
+            elsewhere (do ((:reset! s))
+                          (pt/scan-range get-fn root (key-str 3900) nil)
+                          (first (for [[cid bytes] @touched
+                                       :when (and (not (contains? archive cid))
+                                                  (= "leaf" (get (ipld/decode bytes) "kind")))]
+                                   [cid bytes])))]
+        (is (some? boundary-leaf) "the window really does straddle a leaf")
+        (is (some? elsewhere) "and there really is another leaf to swap in")
+        (is (= :prolly-tree/block-missing
+               (refusal #(pt/verify-range root lo hi
+                                          (vals (-> archive
+                                                    (dissoc boundary-leaf)
+                                                    (conj elsewhere)))))))))))
+
+(deftest both-the-honest-leaf-and-the-impostor-is-refused
+  (testing "the impostor added rather than swapped, so the omission cannot fire
+            and only the surplus check can. This is the `carries a child the
+            rule would have skipped` refusal, isolated."
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          root (pt/build-tree put! (rows 4000))
+          boundaries (mapv first (root-children get-fn root))
+          lo (key-str 100) hi (nth boundaries 3)]
+      ((:reset! s))
+      (pt/scan-range get-fn root lo hi)
+      (let [archive @touched
+            elsewhere (do ((:reset! s))
+                          (pt/scan-range get-fn root (key-str 3900) nil)
+                          (first (for [[cid bytes] @touched
+                                       :when (not (contains? archive cid))]
+                                   [cid bytes])))]
+        (is (some? elsewhere))
+        (is (= :prolly-tree/unexpected-block
+               (refusal #(pt/verify-range root lo hi (vals (conj archive elsewhere))))))))))
+
+(deftest a-tampered-block-is-refused
+  (testing "every position, not just the root -- and it arrives as a missing
+            block, because a block whose bytes changed hashes somewhere else"
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          root (pt/build-tree put! (rows 4000))
+          boundaries (mapv first (root-children get-fn root))
+          lo (key-str 100) hi (nth boundaries 3)]
+      ((:reset! s))
+      (pt/scan-range get-fn root lo hi)
+      (let [archive @touched]
+        (doseq [[cid bytes] archive]
+          (is (= :prolly-tree/block-missing
+                 (refusal #(pt/verify-range root lo hi
+                                            (vals (assoc archive cid (tampered-bytes bytes))))))
+              (str "tampering with " cid " must be refused")))))))
+
+(deftest a-wrong-root-is-refused
+  (let [{:keys [put! get-fn touched] :as s} (mem-store)
+        root (pt/build-tree put! (rows 4000))
+        other (pt/build-tree put! (rows 30))]
+    (is (not= root other))
+    ((:reset! s))
+    (pt/scan-range get-fn root (key-str 100) (key-str 200))
+    (is (= :prolly-tree/block-missing
+           (refusal #(pt/verify-range other (key-str 100) (key-str 200) (vals @touched)))))))
+
+(deftest a-leaf-outside-the-span-its-parent-claims-is-refused
+  (testing "the one piece of well-formedness a range proof CAN check: a leaf
+            whose keys fall outside the (lower, upper] its own parent claims for
+            it. `build-tree` cannot produce this, so the tree is hand-built."
+    (let [{:keys [put! get-fn]} (mem-store)
+          ;; leaf A is linked under max-key `m` but holds `z9`
+          cid-a (ipld/put-node! put! {"kind" "leaf" "entries" [["a" 1] ["z9" 2]]})
+          cid-b (ipld/put-node! put! {"kind" "leaf" "entries" [["z" 3]]})
+          root (ipld/put-node! put! {"kind" "internal"
+                                     "children" [["m" (ipld/link cid-a)]
+                                                 ["z" (ipld/link cid-b)]]})
+          blocks [(get-fn root) (get-fn cid-a) (get-fn cid-b)]]
+      (is (= :prolly-tree/entry-outside-span
+             (refusal #(pt/verify-range root "a" nil blocks)))))))
+
+;; ── C2 control: the boundary of what this can claim ─────────────────────────
+
+(deftest an-understated-max-key-hides-a-key-and-the-proof-is-still-accepted
+  (testing "THE C2 CONTROL, and it must be ACCEPTED. The acceptance is the
+            finding, not a defect to fix here.
+
+  `build-tree` cannot produce this tree: the first child's max-key is
+  UNDERSTATED, so `range-spans` skips that child for any window starting above
+  the understated claim -- while the subtree behind it really does hold every
+  key in that window. The prover prunes there. An honest verifier, which must
+  prune exactly where the prover pruned or it would refuse honest proofs,
+  prunes there too. So it accepts an answer that is empty when the truth is
+  hundreds of rows.
+
+  This is the whole of the difference between C1 and C2. `verify-range` proves
+  `this is what scan-range returns for this root`, which is true here. It does
+  not prove `this is every fact in the range`, which is false here, and no
+  quantity of blocks from this tree can distinguish the two -- the lie is about
+  a subtree the rule never asks for, so it is not in the proof at all.
+
+  Closing this would take a different commitment (max-keys derived from, or
+  signed by, something the prover does not choose), not a stricter verifier.
+  A verifier strict enough to catch it would have to descend into subtrees the
+  prover pruned, which is the whole scan, which is the thing a range proof
+  exists not to do."
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          honest (pt/build-tree put! (rows 4000))
+          kids (root-children get-fn honest)
+          [m0 _] (first kids)
+          understated (key-str 0)
+          doctored-bytes (ipld/encode
+                          {"kind" "internal"
+                           "children" (into [[understated (ipld/link (second (first kids)))]]
+                                            (mapv (fn [[k c]] [k (ipld/link c)]) (rest kids)))})
+          doctored (ipld/cid doctored-bytes)
+          _ (put! doctored doctored-bytes)
+          lo (key-str 1)
+          hi m0]
+      (is (< 1 (count kids)) "the fixture needs more than one child")
+      (is (neg? (compare understated lo))
+          "the understated claim is below the window, which is what makes it prune")
+
+      (testing "the hidden keys really are in the doctored tree"
+        ((:reset! s))
+        (let [everything (pt/scan-range get-fn doctored nil nil)
+              truth (filterv (fn [[k _]] (and (not (neg? (compare k lo)))
+                                              (neg? (compare k hi))))
+                             everything)]
+          (is (< 50 (count truth))
+              (str "the window hides " (count truth) " rows that an open scan finds"))))
+
+      ((:reset! s))
+      (let [answer (pt/scan-range get-fn doctored lo hi)
+            archive @touched
+            proved (pt/verify-range doctored lo hi (vals archive))]
+        (is (= [] answer)
+            (str "the prover returns nothing, because it pruned the child that
+                  holds everything: " (pr-str (take 3 answer))))
+        (is (= [] (:entries proved))
+            "and the verifier ACCEPTS that empty answer -- this is the C2 result")
+        (is (= answer (:entries proved))
+            "prover and verifier agree exactly; both are wrong about the world")
+        (println "  [C2] doctored root accepted an empty window answer;"
+                 "an open scan of the same root finds"
+                 (count (pt/scan-range get-fn doctored nil nil)) "rows")))))
+
+(deftest the-last-childs-claim-is-trusted-too-and-diff-disagrees
+  (testing "the second C2 shape, and the one place two namespaces in this repo
+            answer the same question differently.
+
+  `core/range-spans` prunes on the CLAIMED max-key. `diff/span-intersects?`
+  prunes on the span, where the last child's upper bound is +infinity, so it
+  keeps a last child whose max-key is understated and `scan-range` does not.
+  Both are defensible. Neither closes C2:
+
+    trusting the claim (what `scan-range` does) hides the keys, and the proof
+    still verifies, because the verifier prunes in the same place;
+
+    distrusting it (what `diff` does) would make the verifier demand a block
+    the prover never read, so every honest proof would be refused.
+
+  So the conservative rule is not a fix for C2 that this repo merely has not
+  adopted yet. It buys nothing a verifier can use, and it is stated here so
+  nobody spends a wire format finding that out."
+    (let [{:keys [put! get-fn touched] :as s} (mem-store)
+          honest (pt/build-tree put! (rows 4000))
+          kids (root-children get-fn honest)
+          [m-prev _] (nth kids (- (count kids) 2))
+          n #?(:clj (Long/parseLong (subs m-prev 4))
+               :cljs (js/parseInt (subs m-prev 4) 10))
+          ;; the first key the LAST child actually holds -- an understatement,
+          ;; because it holds every key from there to key-3999
+          understated (key-str (inc n))
+          lo (key-str (+ n 2))
+          doctored-bytes (ipld/encode
+                          {"kind" "internal"
+                           "children" (conj (mapv (fn [[k c]] [k (ipld/link c)])
+                                                  (pop (vec kids)))
+                                            [understated (ipld/link (second (peek (vec kids))))])})
+          doctored (ipld/cid doctored-bytes)
+          _ (put! doctored doctored-bytes)]
+      (is (< 1 (count kids)))
+      (is (= (key-str 3999) (first (peek (vec kids))))
+          "the honest last child really does claim the tree maximum")
+
+      ((:reset! s))
+      (let [answer (pt/scan-range get-fn doctored lo nil)
+            archive @touched
+            proved (pt/verify-range doctored lo nil (vals archive))
+            conservative (:added (d/range-diff get-fn nil doctored lo nil))]
+        (is (= [] answer)
+            (str "the prover trusts the claim and prunes the last child: "
+                 (pr-str (take 3 answer))))
+        (is (= [] (:entries proved))
+            "and the verifier accepts it -- the second C2 acceptance")
+        (is (< 10 (count conservative))
+            (str "while diff, reading the SAME blocks with the +infinity rule,
+                  finds " (count conservative) " rows in that window"))
+        (println "  [C2/last-child] scan-range+verify-range:" (count answer)
+                 "rows; diff/range-diff on the same root:" (count conservative)
+                 "rows")))))

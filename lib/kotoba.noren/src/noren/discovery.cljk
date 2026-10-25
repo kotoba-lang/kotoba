@@ -1,0 +1,311 @@
+(ns noren.discovery
+  "見込み事業者の**発見**。純 `.cljc`、I/O 無し。
+
+  ## 何を解いているか
+
+  前版はここを空けてあった —— 「ホスト名から業種を推測した瞬間に、この loop は
+  推測を根拠に売り始める」からである。その問題は消えていない。**消したのは
+  推測の方**で、解き方は 2 つの分離:
+
+  1. **業種は OSM のタグから決める。** `amenity=restaurant` は誰かが現地を見て
+     付けた宣言で、こちらの推測ではない。タグ → ISIC は下の `osm-tag->isic` に
+     **表として書いてある**（導出しない）。証拠は OSM の element id で、
+     `https://www.openstreetmap.org/node/123` として第三者が見に行ける。
+  2. **LLM は抽出しかしない。判定しない。** murakumo-main が読むのはページ本文で、
+     返してよいのは**本文にそのまま在る文字列**（店名・メールアドレス・その周辺の
+     一文・受信拒否の文言）だけ。`verify-extraction` が 1 つずつ原文に対して
+     照合し、**verbatim で見つからない主張は落とす**。モデルが上手に作文しても、
+     原文に無い文字列は 1 つも通らない。
+
+  つまり LLM が壊れても・入れ替わっても・幻覚しても、**発見の健全性は
+  モデルの性能に依存しない**。依存しているのは照合であって推論ではない。
+
+  ## この ns が答えない問い
+
+  「その店は良い店か」「連絡すべきか」—— 前者は測らない、後者は
+  `noren.prospect` と `noren.governor`。ここは candidate を prospect の形にする
+  までで、接触の可否はその先で改めて全部かかる。"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]))
+
+;; ── OSM タグ → ISIC（表。導出しない）────────────────────────────────────
+
+(def osm-tag->isic
+  "OSM のタグ → ISIC Rev.5。**`noren.prospect/eligible-isic` の部分集合だけを
+  載せる。** ここに無いタグの POI は candidate にならない（`:isic-not-declared`）。
+
+  `bar`/`pub` を 5630（beverage serving）に分けてあるのは、処方の surface が
+  変わるから —— 持ち帰り主体の店に『営業時間が無い』と言うのと、バーに言うのとでは
+  重みが違う。
+
+  ⚠ **`fast_food` は 5610。** 2026-08-27 まで `5613`（take-away）に写していたが、
+  **5613 は ISIC のどの版にも存在しない** —— `cloud-itonami/org-un-isic` の
+  pin 済み Rev.5（463 class）にも、Rev.4 mirror（428 class）にも無い。
+  両版とも 5610 の題名は「Restaurants and mobile food service activities」で、
+  持ち帰りはそこに含まれる。`cloud-itonami-isic-5613` という repo も存在せず、
+  下の `eligible-isic` が『blueprint actor が実在する業種に限る』と書いている
+  条件を、この 1 行だけが満たしていなかった。"
+  {["amenity" "restaurant"] "5610"
+   ["amenity" "fast_food"]  "5610"
+   ["amenity" "cafe"]       "5610"
+   ["amenity" "bar"]        "5630"
+   ["amenity" "pub"]        "5630"
+   ["amenity" "food_court"] "5629"
+   ["amenity" "ice_cream"]  "5610"})
+
+(defn osm-selectors
+  "`org-openstreetmap-overpass` の `core/ql` に渡す `[[tag value] …]`。"
+  [] (vec (keys osm-tag->isic)))
+
+(defn osm-tags->isic
+  "`element->observation` の `:classify` に渡す分類器。タグ map → ISIC 文字列。
+
+  **どの選択子で引かれたかではなくタグそのものから決める**（上流 repo の
+  `tags->kind` と同じ規律）。複数の選択子が同じ node を返しても分類が揺れない。"
+  [tags]
+  (some (fn [[[k v] isic]] (when (= v (get tags k)) isic)) osm-tag->isic))
+
+(defn chain-outlet?
+  "チェーン店の 1 店舗か。**OSM 自身の宣言で判定する**（`brand:wikidata` /
+  `brand` / `operator:wikidata`）—— 店名を見て推測しない。
+
+  実測 2026-08-11（神楽坂 387 element）: `website` を持つ 50 件の上位が
+  スターバックス・モスバーガー・ドトール・ルノアールで、いずれも `website` が
+  **本部サイト**を指していた。本部サイトを採点して店舗に営業するのは筋が悪く、
+  LLM の `own-site?` でも弾けるが、**その前にタグで弾けるものを LLM に
+  払わない**（1 件 1 回の推論はここでは無料ではない）。"
+  [tags]
+  (boolean (or (get tags "brand:wikidata")
+               (get tags "brand")
+               (get tags "operator:wikidata"))))
+
+(defn observation->candidate
+  "OSM の観測 → candidate。**`website` タグを持たない POI は candidate に
+  ならない** —— 建てる話をする前に、まず今の面を測る必要がある。
+  チェーン店舗も candidate にならない（`chain-outlet?`）。
+
+  `contact:website` も見る（OSM ではどちらの綴りも使われる）。"
+  [{:obs/keys [source-id tags evidence-url isic] :as _obs}]
+  (let [site (or (get tags "website") (get tags "contact:website"))
+        site (when (and site (re-find #"^https?://" site)) site)]
+    (when (and site isic (not (chain-outlet? tags)))
+      {:candidate/id source-id
+       :candidate/osm-name (get tags "name")
+       :candidate/isic isic
+       :candidate/site-url site
+       :candidate/osm-url evidence-url
+       :candidate/osm-tags tags})))
+
+(defn usable-page-text?
+  "その本文を『その店のページ』として扱ってよいか。**HTTP status だけで決める。**
+
+  実測 2026-08-11: OSM の `website` タグは古くなる。神楽坂の 1 件は URL が
+  404 を返しており、本文には `Page not found` が入っていた。status を見ずに
+  本文だけ見ていたので、**404 ページを店のページとして LLM に渡していた**
+  （店名として「Page not」を抽出できてしまう）。
+
+  内容から『これはエラーページらしい』と判定しない —— それは推測で、
+  『404 と書いてある店のトップページ』を誤って捨てる。サーバが 200 と
+  言うなら 200 として扱い、判断は後段の診断に任せる。"
+  [status text]
+  (boolean (and (number? status) (<= 200 status 299) (not (str/blank? text)))))
+
+;; ── LLM 抽出の契約 ───────────────────────────────────────────────────────
+
+(def extraction-system-prompt
+  "モデルへの指示。**日本語で書くが、要求しているのは翻訳でも要約でもなく
+  『原文からの切り出し』**である。作文を頼まない。"
+  (str "あなたは web ページの本文から、そこに**そのまま書かれている文字列だけ**を"
+       "取り出す抽出器です。要約・翻訳・言い換え・推測をしてはいけません。\n"
+       "返答は EDN の map 1 つだけ。前後に説明を書かないでください。\n\n"
+       "キー:\n"
+       "  :business-name   ページに書かれている事業者名（原文のまま）。無ければ nil\n"
+       "  :email           ページに書かれている連絡用メールアドレス。無ければ nil\n"
+       "  :email-context   そのアドレスを含む原文の一文（原文のまま）。無ければ nil\n"
+       "  :opt-out-text    営業・勧誘メールを断る記載があれば、その原文。無ければ nil\n"
+       "  :kind            :organization / :sole-trader / :individual のどれか\n"
+       "  :own-site?       その事業者自身のサイトなら true。まとめサイト・予約\n"
+       "                   ポータル・チェーン本部の一覧ページなら false\n"
+       "  :closed?         閉店・移転済みと**書かれていれば** true\n"
+       "  :confidence      0.0〜1.0\n\n"
+       "**原文に無い文字列を書いてはいけません。** 分からない項目は nil にして"
+       "ください。nil は減点ではありません。"))
+
+(def max-source-chars
+  "モデルに渡す本文の上限。長い本文は先頭を採る（連絡先はたいてい上か下だが、
+  下は footer で定型なので、上を採って足りなければ後述の `tail` を足す）。"
+  6000)
+
+(defn build-prompt
+  "本文 → プロンプト。**先頭と末尾の両方**を渡す（連絡先は footer に居ることが
+  多く、先頭だけだと取りこぼす）。切り出した位置を明示しておくと、モデルが
+  『途中が省略されている』ことを知ったうえで nil を返せる。"
+  [{:keys [text osm-name site-url]}]
+  (let [t (str/trim (or text ""))
+        half (quot max-source-chars 2)
+        body (if (<= (count t) max-source-chars)
+               t
+               (str (subs t 0 half)
+                    "\n…（中略）…\n"
+                    (subs t (- (count t) half))))]
+    (str "OSM に登録されている名称: " (or osm-name "（不明）") "\n"
+         "URL: " site-url "\n\n"
+         "--- ページ本文ここから ---\n" body "\n--- ページ本文ここまで ---")))
+
+(defn parse-extraction
+  "モデルの生返答 → map、または `{:parse-error …}`。
+
+  **生返答は捨てない**（呼び出し側が evidence に残す）—— parser を直したときに
+  過去の判断を引き直せるのは、生返答を持っている場合だけである。"
+  [reply]
+  (let [s (str/trim (or reply ""))
+        ;; ```edn … ``` で包んでくることがある
+        s (-> s (str/replace #"^```(?:edn|clojure)?\s*" "") (str/replace #"```$" ""))
+        start (str/index-of s "{")
+        end (str/last-index-of s "}")]
+    (if (and start end (< start end))
+      (try
+        ;; edn/read-string を使う（`read-string` は *read-eval* を通すので、
+        ;; モデルの出力のような信頼できない文字列に当ててはいけない）。
+        (let [m (edn/read-string (subs s start (inc end)))]
+          (if (map? m) m {:parse-error :not-a-map}))
+        (catch #?(:clj Exception :cljs :default) e
+          {:parse-error (str "read-string: " #?(:clj (.getMessage e) :cljs (.-message e)))}))
+      {:parse-error :no-map-found})))
+
+;; ── 照合 —— ここが健全性の要 ─────────────────────────────────────────────
+
+(defn ^:private code-point-at-0
+  "1 文字の文字列 → コードポイント。`(int (first c))` は cljs で NaN ではなく
+  **0** を返すので使えない（実測 2026-08-11: 全角の正規化が黙って壊れていた）。"
+  [c]
+  #?(:clj (int (.charAt ^String c 0))
+     :cljs (.charCodeAt c 0)))
+
+(defn ^:private normalize
+  "照合用の正規化。空白の潰しと全角英数の半角化だけ。**それ以上は畳まない**
+  —— 畳むほど『原文に在る』の意味が緩む。"
+  [s]
+  (some-> s
+          str/lower
+          (str/replace #"[　\s]+" " ")
+          (str/replace #"[！-～]" (fn [c] (str (char (- (code-point-at-0 c) 0xFEE0)))))
+          str/trim))
+
+(defn ^:private verbatim?
+  [source claim]
+  (let [s (normalize source) c (normalize claim)]
+    (boolean (and s c (seq c) (str/includes? s c)))))
+
+(def verbatim-fields
+  "原文に在ることを要求する項目。ここに無い項目（`:kind` `:own-site?`
+  `:confidence`）は**モデルの判断**であって抽出ではないので、照合ではなく
+  governor の閾値と HARD rule で扱う。"
+  [:business-name :email :email-context :opt-out-text])
+
+(defn verify-extraction
+  "抽出 map を原文に照合する。`{:verified {…} :dropped [{:field :value}] }`。
+
+  **落とした項目は黙って消さない。** 何が落ちたかが見えないと、モデルを
+  替えたときに『抽出が良くなった』のか『照合が緩んだ』のかが分からない。"
+  [extraction source-text]
+  (reduce
+   (fn [acc f]
+     (let [v (get extraction f)]
+       (cond
+         (or (nil? v) (and (string? v) (str/blank? v))) acc
+         (verbatim? source-text v) (assoc-in acc [:verified f] v)
+         :else (update acc :dropped conj {:field f :value v}))))
+   {:verified (select-keys extraction [:kind :own-site? :closed? :confidence])
+    :dropped []}
+   verbatim-fields))
+
+;; ── DiscoveryGovernor ────────────────────────────────────────────────────
+
+(def confidence-floor 0.6)
+
+(defn review-candidate
+  "candidate + 照合済み抽出 → `{:decision :accept|:reject :violations [...]}`。
+
+  `noren.governor` が『出してよいか』を見るのに対し、ここは『名簿に載せてよいか』。
+  分けてあるのは、**名簿に載る条件の方が緩い**から —— 載せてもよいが今日は
+  接触できない相手（履歴・間隔・suppression）が普通に在る。"
+  [{:candidate/keys [isic site-url] :as candidate}
+   {:keys [verified dropped] :as _verification}]
+  (let [{:keys [business-name email email-context opt-out-text
+                kind own-site? closed? confidence]} verified
+        vs (cond-> []
+             (seq dropped)
+             (conj {:rule :unverifiable-extraction
+                    :detail (str "原文に無い主張: "
+                                 (str/join ", " (map #(name (:field %)) dropped)))})
+
+             (not (contains? (set (vals osm-tag->isic)) isic))
+             (conj {:rule :isic-not-declared
+                    :detail (str "OSM タグから宣言された ISIC ではない: " (pr-str isic))})
+
+             (str/blank? site-url)
+             (conj {:rule :no-site :detail "website タグが無い"})
+
+             (not (number? confidence))
+             (conj {:rule :no-confidence :detail "confidence が数値で返っていない"})
+
+             (and (number? confidence) (< confidence confidence-floor))
+             (conj {:rule :low-confidence
+                    :detail (str "confidence " confidence " < " confidence-floor)})
+
+             (not (contains? #{:organization :sole-trader} kind))
+             (conj {:rule :not-a-business
+                    :detail (str "kind が事業者ではない: " (pr-str kind))})
+
+             (not (true? own-site?))
+             (conj {:rule :not-own-site
+                    :detail "事業者自身のサイトではない（まとめ・ポータル・本部一覧）"})
+
+             (true? closed?)
+             (conj {:rule :closed :detail "閉店・移転済みと書かれている"})
+
+             (str/blank? email)
+             (conj {:rule :no-published-email
+                    :detail "公表されたメールアドレスが本文に無い"})
+
+             (str/blank? email-context)
+             (conj {:rule :no-email-context
+                    :detail "アドレスの周辺文が取れていない（公表の文脈を後から検証できない）"})
+
+             (not (str/blank? opt-out-text))
+             (conj {:rule :opt-out-declared
+                    :detail (str "受信拒否の記載: " opt-out-text)})
+
+             (str/blank? business-name)
+             (conj {:rule :no-business-name :detail "事業者名が本文から取れていない"}))]
+    {:decision (if (seq vs) :reject :accept)
+     :violations (vec vs)}))
+
+(defn ->prospect
+  "受理された candidate → `noren.prospect` が食える prospect。
+
+  `:contact/source-url` は**その本文を取ったページの URL**。CDX 経由で取った
+  場合も『どの capture か』を evidence に残すので、後から同じ根拠を引ける。"
+  [{:candidate/keys [id osm-name isic site-url osm-url]}
+   {:keys [verified]} {:keys [now text-source model raw-reply]}]
+  {:prospect/id (str "osm-" (str/replace (str id) #"/" "-"))
+   :prospect/name (or (:business-name verified) osm-name)
+   :prospect/isic isic
+   :prospect/kind (:kind verified)
+   :prospect/source :osm-llm
+   :prospect/site-url site-url
+   :prospect/observed-at now
+   :prospect/opt-out-declared? false
+   :prospect/contact {:contact/email (:email verified)
+                      :contact/source-url site-url
+                      :contact/observed-at now}
+   :prospect/evidence {:evidence/osm-url osm-url
+                       :evidence/osm-name osm-name
+                       :evidence/email-context (:email-context verified)
+                       :evidence/text-source text-source
+                       :evidence/model model
+                       :evidence/confidence (:confidence verified)
+                       ;; 生返答を残す。parser を直したときに引き直せるのは
+                       ;; これを持っている場合だけ。
+                       :evidence/raw-reply raw-reply}})

@@ -1,0 +1,308 @@
+(ns kotoba.ffi-jvm-test
+  "JVM-only: real native calls through kotoba.ffi, each compared with the raw
+  java.lang.foreign answer on the same bytes / the same symbol (the oracle).
+  On kbb the namespace only asserts that it is not the JVM."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.ffi :as ffi])
+  #?(:clj (:import [java.lang.foreign Arena Linker Linker$Option FunctionDescriptor
+                    MemoryLayout MemorySegment ValueLayout]
+                   [java.lang.invoke MethodHandle]
+                   [java.nio.file Files]
+                   [java.nio.file.attribute FileAttribute])))
+
+#?(:cljs
+   (deftest not-the-jvm
+     (is (= :node ffi/host))))
+
+#?(:clj
+   (do
+     (defn- reason [f]
+       (try (f) ::no-throw
+            (catch Throwable e
+              (or (:kotoba.ffi/error (ex-data e)) [::foreign (.getName (class e)) (.getMessage e)]))))
+
+     (defn- raw-class
+       "The JDK exception class raw FFM throws for `f`, or ::no-throw."
+       [f]
+       (try (f) ::no-throw (catch Throwable e (.getName (class e)))))
+
+     (def ^:private linker (Linker/nativeLinker))
+     (def ^:private lookup (.defaultLookup linker))
+
+     (defn- raw-handle ^MethodHandle [name ret args]
+       (.downcallHandle linker (.orElseThrow (.find lookup name))
+                        (FunctionDescriptor/of ret (into-array MemoryLayout args))
+                        (make-array Linker$Option 0)))
+
+     (def ^:private libc
+       (ffi/library {:symbols {"strlen" (ffi/signature :i64 [:ptr])
+                               "getpid" (ffi/signature :i32 [])
+                               "abs" (ffi/signature :i32 [:i32])
+                               "labs" (ffi/signature :i64 [:i64])}}))
+
+     (defn- h [name]
+       (ffi/bind libc (ffi/native-linker) (ffi/default-lookup (ffi/native-linker)) name))
+
+     (deftest layouts-and-descriptors-are-the-ffm-values
+       (is (identical? ValueLayout/JAVA_INT (ffi/layout :i32)))
+       (is (identical? ValueLayout/JAVA_LONG (ffi/layout :i64)))
+       (is (identical? ValueLayout/JAVA_BYTE (ffi/layout :i8)))
+       (is (identical? ValueLayout/JAVA_SHORT (ffi/layout :i16)))
+       (is (identical? ValueLayout/JAVA_FLOAT (ffi/layout :f32)))
+       (is (identical? ValueLayout/JAVA_DOUBLE (ffi/layout :f64)))
+       (is (identical? ValueLayout/ADDRESS (ffi/layout :ptr)))
+       (is (= :unknown-type (reason #(ffi/layout :int))))
+       (is (= :void-has-no-value (reason #(ffi/layout :void))))
+       (testing "type-size agrees with the FFM layout byteSize/byteAlignment"
+         (doseq [t [:i8 :u8 :i16 :u16 :i32 :u32 :i64 :f32 :f64 :ptr]]
+           (is (= [(ffi/type-size t) (ffi/type-align t)]
+                  [(.byteSize (ffi/layout t)) (.byteAlignment (ffi/layout t))]) (str t))))
+       (is (= (FunctionDescriptor/of ValueLayout/JAVA_INT (into-array MemoryLayout [ValueLayout/ADDRESS ValueLayout/JAVA_INT]))
+              (ffi/descriptor (ffi/signature :i32 [:ptr :i32]))))
+       (is (= (FunctionDescriptor/ofVoid (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
+              (ffi/descriptor (ffi/signature-void [:i64])))))
+
+     (deftest symbol-lookup
+       (let [lk (ffi/default-lookup (ffi/native-linker))]
+         (is (ffi/segment? (ffi/find-symbol lk "strlen")))
+         (is (= (.address ^MemorySegment (.orElseThrow (.find lookup "strlen")))
+                (ffi/address (ffi/find-symbol lk "strlen"))))
+         (is (nil? (ffi/find-symbol lk "kotoba_ffi_no_such_symbol")))
+         (is (false? (.isPresent (.find lookup "kotoba_ffi_no_such_symbol"))))
+         (is (= :symbol-not-found (reason #(ffi/find-symbol! lk "kotoba_ffi_no_such_symbol"))))
+         (is (ffi/segment? (ffi/find-symbol! lk "getpid"))))
+       (testing "loader lookup sees nothing that was not System/load-ed"
+         (is (nil? (ffi/find-symbol (ffi/loader-lookup) "kotoba_ffi_no_such_symbol"))))
+       (testing "library loads refuse by name"
+         (is (= :library-load-failed (reason #(ffi/load-library! "/nonexistent/libkotoba-ffi.dylib"))))
+         (is (= :library-load-failed (reason #(ffi/load-library! "relative/lib.so"))))
+         (with-open [a (ffi/confined-arena)]
+           (is (= :library-load-failed (reason #(ffi/library-lookup "/nonexistent/libkotoba-ffi.dylib" a)))))))
+
+     (deftest real-libc-calls-vs-raw-ffm
+       (with-open [a (ffi/confined-arena)]
+         (testing "strlen"
+           (let [s (ffi/c-string a "hello, kotoba")
+                 raw (.invokeWithArguments (raw-handle "strlen" ValueLayout/JAVA_LONG [ValueLayout/ADDRESS])
+                                           ^objects (object-array [s]))]
+             (is (= 13 (ffi/invoke (h "strlen") s)))
+             (is (= raw (ffi/invoke (h "strlen") s)))
+             (is (= 0 (ffi/invoke (h "strlen") (ffi/c-string a ""))))
+             (testing "UTF-8 byte length, not char count"
+               (is (= 9 (ffi/invoke (h "strlen") (ffi/c-string a "日本語")))))))
+         (testing "getpid = ProcessHandle pid = raw FFM"
+           (let [pid (.pid (java.lang.ProcessHandle/current))]
+             (is (= pid (long (ffi/invoke (h "getpid")))))
+             (is (= (.invokeWithArguments (raw-handle "getpid" ValueLayout/JAVA_INT []) ^objects (object-array []))
+                    (ffi/invoke (h "getpid"))))))
+         (testing "abs: a Clojure long is coerced to the int parameter"
+           (is (= 5 (ffi/invoke (h "abs") -5)))
+           (is (= 2147483647 (ffi/invoke (h "abs") -2147483647)))
+           (is (= 2147483647 (ffi/invoke (h "abs") 2147483647)))
+           (is (= (.invokeWithArguments (raw-handle "abs" ValueLayout/JAVA_INT [ValueLayout/JAVA_INT])
+                                        ^objects (object-array [(int -5)]))
+                  (ffi/invoke (h "abs") -5)))
+           (testing "raw FFM refuses the same boxed Long (the coercion is needed)"
+             (is (not= ::no-throw
+                       (raw-class #(.invokeWithArguments (raw-handle "abs" ValueLayout/JAVA_INT [ValueLayout/JAVA_INT])
+                                                         ^objects (object-array [-5])))))))
+         (testing "labs at the i64 edge"
+           (is (= 9223372036854775807 (ffi/invoke (h "labs") -9223372036854775807)))
+           (is (= (.invokeWithArguments (raw-handle "labs" ValueLayout/JAVA_LONG [ValueLayout/JAVA_LONG])
+                                        ^objects (object-array [-42]))
+                  (ffi/invoke-list (h "labs") [-42]))))
+         (testing "downcall also takes a raw FunctionDescriptor"
+           (let [hd (ffi/downcall (ffi/native-linker) (ffi/find-symbol! (ffi/default-lookup (ffi/native-linker)) "abs")
+                                  (FunctionDescriptor/of ValueLayout/JAVA_INT (into-array MemoryLayout [ValueLayout/JAVA_INT])))]
+             (is (= 7 (ffi/invoke hd -7)))
+             (is (instance? MethodHandle (ffi/method-handle hd)))))
+         (testing "invoke refusals by name"
+           (is (= :arity-mismatch (reason #(ffi/invoke (h "abs")))))
+           (is (= :arity-mismatch (reason #(ffi/invoke (h "abs") 1 2))))
+           (is (= :value-out-of-range (reason #(ffi/invoke (h "abs") 2147483648))))
+           (is (= :value-out-of-range (reason #(ffi/invoke (h "abs") -2147483649))))
+           (is (= :not-an-integer (reason #(ffi/invoke (h "abs") 1.5))))
+           (is (= :not-a-segment (reason #(ffi/invoke (h "strlen") "not a pointer"))))
+           (is (= :not-a-handle (reason #(ffi/invoke {:x 1} 1))))
+           (is (= :undeclared-symbol (reason #(h "system")))))))
+
+     (def ^:private samples
+       ;; [type offset value raw-layout raw-value-as-stored]
+       [[:i8 0 -128 ValueLayout/JAVA_BYTE (byte -128)]
+        [:u8 1 255 ValueLayout/JAVA_BYTE (byte -1)]
+        [:i16 2 -32768 ValueLayout/JAVA_SHORT (short -32768)]
+        [:u16 4 65535 ValueLayout/JAVA_SHORT (short -1)]
+        [:i32 8 -2147483648 ValueLayout/JAVA_INT (int -2147483648)]
+        [:u32 12 4294967295 ValueLayout/JAVA_INT (int -1)]
+        [:i64 16 -9223372036854775808 ValueLayout/JAVA_LONG Long/MIN_VALUE]
+        [:f32 24 (float 1.5) ValueLayout/JAVA_FLOAT (float 1.5)]
+        [:f64 32 Math/PI ValueLayout/JAVA_DOUBLE Math/PI]])
+
+     (defn- raw-get [^MemorySegment s l off]
+       (condp identical? l
+         ValueLayout/JAVA_BYTE (.get s ValueLayout/JAVA_BYTE (long off))
+         ValueLayout/JAVA_SHORT (.get s ValueLayout/JAVA_SHORT (long off))
+         ValueLayout/JAVA_INT (.get s ValueLayout/JAVA_INT (long off))
+         ValueLayout/JAVA_LONG (.get s ValueLayout/JAVA_LONG (long off))
+         ValueLayout/JAVA_FLOAT (.get s ValueLayout/JAVA_FLOAT (long off))
+         ValueLayout/JAVA_DOUBLE (.get s ValueLayout/JAVA_DOUBLE (long off))))
+
+     (defn- raw-set [^MemorySegment s l off v]
+       (condp identical? l
+         ValueLayout/JAVA_BYTE (.set s ValueLayout/JAVA_BYTE (long off) (byte v))
+         ValueLayout/JAVA_SHORT (.set s ValueLayout/JAVA_SHORT (long off) (short v))
+         ValueLayout/JAVA_INT (.set s ValueLayout/JAVA_INT (long off) (int v))
+         ValueLayout/JAVA_LONG (.set s ValueLayout/JAVA_LONG (long off) (long v))
+         ValueLayout/JAVA_FLOAT (.set s ValueLayout/JAVA_FLOAT (long off) (float v))
+         ValueLayout/JAVA_DOUBLE (.set s ValueLayout/JAVA_DOUBLE (long off) (double v))))
+
+     (deftest put-fetch-vs-raw-get-set
+       (with-open [a (ffi/confined-arena)]
+         (let [seg (ffi/alloc-bytes a 64 8)]
+           (testing "kotoba.ffi writes, raw FFM reads the same bytes"
+             (doseq [[t off v l stored] samples]
+               (ffi/put! seg t off v)
+               (is (= stored (raw-get seg l off)) (str t))))
+           (testing "raw FFM writes, kotoba.ffi reads"
+             (doseq [[t off v l stored] samples]
+               (.fill ^MemorySegment seg (byte 0))
+               (raw-set seg l off stored)
+               (is (= v (ffi/fetch seg t off)) (str t))))
+           (testing "pointers round-trip as addresses"
+             (let [target (ffi/alloc a :i64)]
+               (ffi/put! target :i64 0 42)
+               (ffi/put! seg :ptr 40 target)
+               (is (= (ffi/address target) (.get ^MemorySegment seg ValueLayout/JAVA_LONG 40)))
+               (let [p (ffi/fetch seg :ptr 40)]
+                 (is (= (ffi/address target) (ffi/address p)))
+                 (is (= 0 (ffi/byte-size p)))
+                 (is (= 42 (ffi/fetch (ffi/reinterpret p 8) :i64 0))))
+               (ffi/put! seg :ptr 48 nil)
+               (is (= 0 (ffi/address (ffi/fetch seg :ptr 48))))
+               (is (= 0 (ffi/address (ffi/null-segment))))
+               (is (identical? MemorySegment/NULL (ffi/null-segment)))))
+           (testing "put! refusals by name"
+             (is (= :value-out-of-range (reason #(ffi/put! seg :u8 0 256))))
+             (is (= :value-out-of-range (reason #(ffi/put! seg :i32 0 2147483648))))
+             (is (= :unknown-type (reason #(ffi/put! seg :long 0 1))))
+             (is (= :void-has-no-value (reason #(ffi/fetch seg :void 0))))
+             (is (= :not-a-segment (reason #(ffi/put! seg :ptr 0 1234))))
+             (is (= :not-a-segment (reason #(ffi/put! (byte-array 8) :i8 0 1))))))))
+
+     (deftest bounds-alignment-and-lifetime
+       (with-open [a (ffi/confined-arena)]
+         (let [seg (ffi/alloc-bytes a 16 8)]
+           (testing "the last in-bounds cell is accepted, one past is refused"
+             (is (nil? (ffi/put! seg :i32 12 7)))
+             (is (= 7 (ffi/fetch seg :i32 12)))
+             (is (= 0 (ffi/fetch seg :u8 15)))
+             (is (= :out-of-bounds (reason #(ffi/fetch seg :u8 16))))
+             (is (= :out-of-bounds (reason #(ffi/fetch seg :i32 16))))
+             (is (= :out-of-bounds (reason #(ffi/put! seg :i64 16 1))))
+             (is (= :out-of-bounds (reason #(ffi/fetch seg :i8 -1))))
+             (is (= "java.lang.IndexOutOfBoundsException"
+                    (raw-class #(.get ^MemorySegment seg ValueLayout/JAVA_BYTE 16)))))
+           (testing "misaligned access is refused (as FFM refuses it)"
+             (is (= :misaligned (reason #(ffi/fetch seg :i32 1))))
+             (is (= "java.lang.IllegalArgumentException"
+                    (raw-class #(.get ^MemorySegment seg ValueLayout/JAVA_INT 1)))))
+           (testing "slices"
+             (is (= 4 (ffi/byte-size (ffi/as-slice seg 12 4))))
+             (is (= 7 (ffi/fetch (ffi/as-slice seg 12 4) :i32 0)))
+             (is (= :out-of-bounds (reason #(ffi/as-slice seg 12 5)))))))
+       (testing "use after close"
+         (let [a (ffi/confined-arena)
+               seg (ffi/alloc a :i32)]
+           (ffi/put! seg :i32 0 1)
+           (.close ^Arena a)
+           (is (= :scope-closed (reason #(ffi/fetch seg :i32 0))))
+           (is (= :scope-closed (reason #(ffi/put! seg :i32 0 2))))
+           (is (= :scope-closed (reason #(ffi/alloc a :i32))))
+           (is (= "java.lang.IllegalStateException"
+                  (raw-class #(.get ^MemorySegment seg ValueLayout/JAVA_INT 0))))))
+       (testing "a confined segment from another thread"
+         (with-open [a (ffi/confined-arena)]
+           (let [seg (ffi/alloc a :i32)]
+             (is (= :wrong-thread @(future (reason #(ffi/fetch seg :i32 0))))))))
+       (testing "a shared segment from another thread is fine"
+         (with-open [a (ffi/shared-arena)]
+           (let [seg (ffi/alloc a :i32)]
+             (ffi/put! seg :i32 0 99)
+             (is (= 99 @(future (ffi/fetch seg :i32 0))))))))
+
+     (deftest allocation
+       (with-open [a (ffi/confined-arena)]
+         (testing "alignment boundaries"
+           (doseq [al [1 2 4 8 16 4096]]
+             (is (zero? (mod (ffi/address (ffi/alloc-bytes a 3 al)) al)) (str al)))
+           (is (= :bad-alignment (reason #(ffi/alloc-bytes a 8 3))))
+           (is (= :bad-alignment (reason #(ffi/alloc-bytes a 8 0))))
+           (is (= :negative-size (reason #(ffi/alloc-bytes a -1))))
+           (is (= 0 (ffi/byte-size (ffi/alloc-bytes a 0))))
+           (is (= 1 (ffi/byte-size (ffi/alloc-bytes a 1)))))
+         (testing "alloc of a type = its layout's size and alignment, zeroed"
+           (doseq [t [:i8 :i16 :i32 :i64 :f32 :f64 :ptr]]
+             (let [s (ffi/alloc a t)]
+               (is (= (ffi/type-size t) (ffi/byte-size s)) (str t))
+               (is (zero? (mod (ffi/address s) (ffi/type-align t))) (str t))))
+           (is (= 0 (ffi/fetch (ffi/alloc a :i64) :i64 0))))
+         (testing "arena kinds"
+           (is (ffi/arena? a))
+           (is (ffi/arena? (ffi/global-arena)))
+           (is (ffi/arena? (ffi/auto-arena)))
+           (is (not (ffi/arena? 1)))
+           (is (not (ffi/segment? a))))))
+
+     (deftest c-strings-vs-raw-allocate-from
+       (with-open [a (ffi/confined-arena)]
+         (doseq [s ["" "a" "hello" "héllo 日本語 🎌"]]
+           (let [ours (ffi/c-string a s)
+                 raw (clojure.lang.Reflector/invokeInstanceMethod a (if (>= ffi/jdk-feature 22) "allocateFrom" "allocateUtf8String") (object-array [s]))]
+             (is (= s (ffi/segment-string ours)))
+             (is (= (clojure.lang.Reflector/invokeInstanceMethod raw (if (>= ffi/jdk-feature 22) "getString" "getUtf8String") (object-array [(long 0)])) (ffi/segment-string ours)))
+             (is (= (inc (count (.getBytes ^String s "UTF-8"))) (ffi/byte-size ours)))
+             (is (= -1 (.mismatch ^MemorySegment ours ^MemorySegment raw)))
+             (is (= 0 (ffi/fetch ours :u8 (dec (ffi/byte-size ours)))))))
+         (is (= :not-a-string (reason #(ffi/c-string a 42))))
+         (testing "no NUL inside the segment"
+           (let [s (ffi/alloc-bytes a 4)]
+             (doseq [i (range 4)] (ffi/put! s :u8 i 65))
+             (is (= :out-of-bounds (reason #(ffi/segment-string s))))))))
+
+     (deftest heap-arrays-and-copies
+       (with-open [a (ffi/confined-arena)]
+         (let [in (float-array [1.0 2.5 -3.0])
+               heap (ffi/of-array in)
+               native (ffi/alloc-bytes a (ffi/byte-size heap) 4)
+               out (float-array 3)]
+           (is (= 12 (ffi/byte-size heap)))
+           (is (identical? native (ffi/copy-from! native heap)))
+           (is (= [1.0 2.5 -3.0] (mapv #(double (ffi/fetch native :f32 (* 4 %))) (range 3))))
+           (ffi/copy-from! (ffi/of-array out) native)
+           (is (= (vec in) (vec out))))
+         (doseq [arr [(byte-array 3) (short-array 3) (char-array 3) (int-array 3)
+                      (long-array 3) (float-array 3) (double-array 3)]]
+           (is (= (.byteSize (MemorySegment/ofArray arr)) (ffi/byte-size (ffi/of-array arr)))
+               (str (class arr))))
+         (is (= :not-a-primitive-array (reason #(ffi/of-array [1 2 3]))))
+         (testing "bytes into a byte array heap segment"
+           (let [b (byte-array 4)]
+             (ffi/put! (ffi/of-array b) :u8 3 200)
+             (is (= -56 (aget b 3)))))))
+
+     (deftest reinterpret-with-arena-and-mapped-files
+       (with-open [a (ffi/confined-arena)]
+         (let [seg (ffi/alloc-bytes a 16 8)
+               zero (ffi/reinterpret (ffi/fetch (doto seg (ffi/put! :ptr 0 seg)) :ptr 0) 16 a)]
+           (is (= 16 (ffi/byte-size zero)))
+           (is (= (ffi/address seg) (ffi/address zero)))
+           (is (= :negative-size (reason #(ffi/reinterpret seg -1))))))
+       (let [f (Files/createTempFile "kotoba-ffi" ".bin" (make-array FileAttribute 0))]
+         (try
+           (Files/write f (byte-array (map unchecked-byte [1 2 3 4 5 6 7 8])) (make-array java.nio.file.OpenOption 0))
+           (with-open [a (ffi/confined-arena)]
+             (let [m (ffi/map-file a (str f) 2 4)]
+               (is (= 4 (ffi/byte-size m)))
+               (is (= [3 4 5 6] (mapv #(ffi/fetch m :u8 %) (range 4))))
+               (is (= :read-only (reason #(ffi/put! m :u8 0 9))))))
+           (finally (Files/deleteIfExists f)))))))

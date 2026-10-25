@@ -1,0 +1,190 @@
+(ns chie.methods.ingest
+  "chie 智慧 — DISCLOSED-source ingest adapter + G7 live-leg gate (ADR-2606171200).
+
+  Grounds the representative graph in PRIMARY DISCLOSURE: each disclosed funding-round
+  record upgrades the matching round stub to :organism/sourcing :authoritative, attaches
+  the disclosed :ai/round-amount-usd, and records :en/disclosed-src provenance on the
+  round's structural edges. This is the offline stand-in for the planet-scale live leg.
+
+  G7 (the gate this implements, previously only declared): `ingest-live` REFUSES unless
+  CHIE_INGEST_LIVE=1 AND an operator DID is supplied — live planet-scale ingest is
+  Council+operator-gated. The offline `ingest-file` does no network I/O and is always safe.
+
+  Honest scope (kanjō/ake pattern): a READ over a disclosed-source fixture + an offline
+  merge. DISCLOSED figures are recorded as facts, never valuation verdicts (N3/G4). Dedup
+  is idempotent: re-ingesting the same fixture is a no-op (id-keyed merge / upgrade-only).
+
+  Pure fns; file I/O only at the #?(:clj) edge; deterministic."
+  (:require [kotoba.lang.text :as str]
+            [chie.methods.analyze :as analyze]
+            #?(:clj [kotoba.io :as io])))
+
+(def live-env "CHIE_INGEST_LIVE")
+
+(defn g7-violation [msg]
+  (ex-info msg {:chie/g7-violation true}))
+
+(defn g7-violation? [e]
+  (boolean (:chie/g7-violation (ex-data e))))
+
+;; NB: analyze/read-edn keeps keywords as ":ns/name" STRINGS (the whole pipeline is
+;; string-keyed), so disclosed records are accessed by string keys too.
+
+(defn round-node
+  "Disclosed round record → an AUTHORITATIVE round node form (with disclosed amount)."
+  [rec]
+  {":organism/id" (get rec ":disclosed/round-id")
+   ":organism/kind" ":ai.invest/round"
+   ":organism/label" (str (get rec ":disclosed/round-id") " (disclosed)")
+   ":organism/sourcing" ":authoritative"
+   ":ai/sector" ":round"
+   ":ai/open?" false
+   ":ai/round-amount-usd" (get rec ":disclosed/amount-usd")})
+
+(defn round-edges
+  "Disclosed round record → structural (:partners, NO axis) edges with provenance.
+  round → lab, and each investor → round; all :authoritative + :en/disclosed-src."
+  [rec]
+  (let [src (get rec ":disclosed/src")
+        rid (get rec ":disclosed/round-id")
+        lab (get rec ":disclosed/lab")]
+    (into [{":en/from" rid ":en/to" lab ":en/kind" ":partners"
+            ":en/grasping-load" 0.10 ":en/sourcing" ":authoritative" ":en/disclosed-src" src}]
+          (map (fn [inv]
+                 {":en/from" inv ":en/to" rid ":en/kind" ":partners"
+                  ":en/grasping-load" 0.10 ":en/sourcing" ":authoritative" ":en/disclosed-src" src}))
+          (get rec ":disclosed/investors"))))
+
+(defn policy-node
+  "Disclosed policy record → an AUTHORITATIVE policy-instrument node upgrade. The node
+  pre-exists in the seed; merge keeps its label/sector and raises sourcing."
+  [rec]
+  {":organism/id" (get rec ":disclosed/policy-id")
+   ":organism/kind" ":ai.policy/instrument"
+   ":organism/sourcing" ":authoritative"})
+
+(defn policy-edges
+  "Disclosed policy record → :governs edges (policy → each governed node) stamped with
+  primary-source provenance. These edges pre-exist in the seed → upgraded in place (so the
+  policy axis concentration is unchanged; only sourcing + :en/disclosed-src are added)."
+  [rec]
+  (let [src (get rec ":disclosed/src")
+        pid (get rec ":disclosed/policy-id")]
+    (mapv (fn [target]
+            {":en/from" pid ":en/to" target ":en/kind" ":governs"
+             ":en/grasping-load" 0.10 ":en/sourcing" ":authoritative" ":en/disclosed-src" src})
+          (get rec ":disclosed/governs"))))
+
+(defn record-node  [rec] (if (contains? rec ":disclosed/round-id") (round-node rec)  (policy-node rec)))
+(defn record-edges [rec] (if (contains? rec ":disclosed/round-id") (round-edges rec) (policy-edges rec)))
+
+(defn parse-disclosed
+  "Parse a disclosed-source fixture EDN (vector of :disclosed/* records — round or policy).
+  Keys are the reader's \":disclosed/…\" strings."
+  [text]
+  (filterv #(and (map? %) (or (contains? % ":disclosed/round-id")
+                              (contains? % ":disclosed/policy-id")))
+           (analyze/read-edn text)))
+
+(defn- edge-id [e] (str (get e ":en/from") "|" (get e ":en/kind") "|" (get e ":en/to")))
+
+(defn- merge-edge
+  "Add a disclosed round edge, or UPGRADE the existing one in place with provenance
+  (:en/disclosed-src + sourcing→:authoritative). Idempotent. Returns [edges added?]."
+  [edges new-e]
+  (let [eid (edge-id new-e)
+        idx (first (keep-indexed (fn [i e] (when (= eid (edge-id e)) i)) edges))]
+    (if idx
+      [(update edges idx merge (select-keys new-e [":en/disclosed-src" ":en/sourcing"])) false]
+      [(conj edges new-e) true])))
+
+(defn merge-graph
+  "Merge disclosed records into a parsed seed graph {:nodes :node-order :edges}.
+  UPGRADE-ONLY + idempotent:
+    - an existing round node is upgraded in place (sourcing→:authoritative, +amount); a new
+      one is appended.
+    - an existing edge is upgraded in place with disclosed provenance; a new one is appended.
+    - re-ingest of the same fixture changes nothing (no node/edge growth).
+  Returns {:graph merged-graph :upgraded n :added-nodes n :added-edges n}."
+  [graph records]
+  (reduce
+   (fn [acc rec]
+     (let [g (:graph acc)
+           rn (record-node rec)
+           rid (get rn ":organism/id")
+           had-node? (contains? (:nodes g) rid)
+           prev (get-in g [:nodes rid])
+           ;; upgrade-only: keep existing label/sector, raise sourcing + add amount
+           merged-node (merge prev rn (when had-node? {":organism/label" (get prev ":organism/label")
+                                                       ":ai/sector" (get prev ":ai/sector")}))
+           g (-> g
+                 (assoc-in [:nodes rid] merged-node)
+                 (update :node-order (fn [v] (if had-node? v (conj v rid)))))
+           [edges added] (reduce (fn [[es n] e]
+                                   (let [[es' a?] (merge-edge es e)]
+                                     [es' (if a? (inc n) n)]))
+                                 [(:edges g) 0]
+                                 (record-edges rec))
+           g (assoc g :edges edges)
+           upgraded? (and had-node? (not= ":authoritative" (get prev ":organism/sourcing")))]
+       (-> acc
+           (assoc :graph g)
+           (update :upgraded + (if upgraded? 1 0))
+           (update :added-nodes + (if had-node? 0 1))
+           (update :added-edges + added))))
+   {:graph graph :upgraded 0 :added-nodes 0 :added-edges 0}
+   records))
+
+#?(:clj
+   (defn ingest-file
+     "Offline ingest: merge a disclosed-source fixture into a seed graph file. No network I/O."
+     [seed-path fixture-path]
+     (let [graph (analyze/load-file* seed-path)
+           records (parse-disclosed (slurp (str fixture-path)))]
+       (merge-graph graph records))))
+
+#?(:clj
+   (defn ingest-files
+     "Offline ingest of SEVERAL disclosed fixtures into one seed, in order. Cumulative result;
+     idempotent (re-running the same fixtures changes nothing). No network I/O."
+     [seed-path fixture-paths]
+     (let [graph0 (analyze/load-file* seed-path)]
+       (reduce
+        (fn [acc fp]
+          (let [records (parse-disclosed (slurp (str fp)))
+                r (merge-graph (:graph acc) records)]
+            {:graph (:graph r)
+             :upgraded (+ (:upgraded acc) (:upgraded r))
+             :added-nodes (+ (:added-nodes acc) (:added-nodes r))
+             :added-edges (+ (:added-edges acc) (:added-edges r))}))
+        {:graph graph0 :upgraded 0 :added-nodes 0 :added-edges 0}
+        fixture-paths))))
+
+#?(:clj
+   (defn ingest-live
+     "G7 gate: live planet-scale ingest is Council+operator-gated. REFUSES unless
+     CHIE_INGEST_LIVE=1 AND a non-blank operator DID is supplied. Never auto-fetches."
+     [{:keys [operator-did]}]
+     (when-not (= "1" (System/getenv live-env))
+       (throw (g7-violation
+               (str "live ingest refused: " live-env " is not set — planet-scale ingest is "
+                    "Council+operator-gated (G7). Use ingest-file for the offline fixture."))))
+     (when (str/blank? (str operator-did))
+       (throw (g7-violation "live ingest refused: no operator DID supplied (G7 / no-server-key).")))
+     (throw (g7-violation "live ingest endpoint not wired in R2 — fixture-only (offline) for now."))))
+
+#?(:clj
+   (defn -main
+     "CLI: offline-ingest the disclosed fixture into the seed and report the upgrade."
+     [& _]
+     (let [here (-> *file* io/file io/parent-file io/parent-file io/parent-file io/parent-file)
+           seed (io/file here "data" "seed.edn")
+           fixtures [(io/file here "data" "ingest" "disclosed-rounds.fixture.edn")
+                     (io/file here "data" "ingest" "disclosed-policy.fixture.edn")]
+           {:keys [graph upgraded added-nodes added-edges]} (ingest-files seed fixtures)
+           auth (count (filter #(= ":authoritative" (get % ":organism/sourcing")) (vals (:nodes graph))))]
+       (println (str "chie ingest (offline, rounds + policy fixtures): " upgraded " node(s) upgraded to "
+                     ":authoritative, " added-nodes " node(s) / " added-edges " 縁 added; merged graph = "
+                     (count (:nodes graph)) " nodes / " (count (:edges graph)) " 縁, "
+                     auth " :authoritative"))
+       0)))

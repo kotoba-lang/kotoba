@@ -1,0 +1,264 @@
+;; `kotoba/ers/path.kotoba` against `ers.core`'s reduced hash tree.
+;;
+;; The oracle builds a real tree and extracts a real reduced path; the guest
+;; is handed that path and must walk it to the same root, naming which two
+;; digests to concatenate and in what order. The host does every digest.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph).
+;;
+;; ## The host loop is the point
+;;
+;; `walk` hands the guest a path and a leaf and then does exactly what it is
+;; told: while `needs-digest?`, digest `hash-first` ‖ `hash-second` and hand
+;; the result back. It never decides an order and never decides when to
+;; promote. If the guest asked for the wrong pair, or in the wrong order,
+;; the root simply comes out different -- which is what makes
+;; `sorting-is-not-optional` a real test rather than an inspection.
+;;
+;; ## The negative controls
+;;
+;; `ers.core`'s docstrings name each of these as the thing that turns
+;; arithmetic into proof:
+;;
+;;   * `a-path-that-does-not-mention-the-document-proves-nothing` — without
+;;     it, any path reaching the right root verifies any document;
+;;   * `sorting-is-not-optional` — §4.2. Skipping it produces an
+;;     implementation that only interoperates with itself, and the test
+;;     catches it by presenting a pair in the order that is NOT sorted;
+;;   * `a-promoted-node-is-not-paired-with-itself` — duplicating would make
+;;     two distinct archives with the same last document produce the same
+;;     root. That is a forgery, not an inefficiency;
+;;   * `mixed-case-hex-is-refused-not-folded` — `'A'` is 0x41 and `'a'` is
+;;     0x61, so folding here would hide that the host handed over something
+;;     whose sort order is not the octets'.
+
+(ns ers.path-kotoba-parity-test
+  (:require [asn1.core :as asn1]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ers.core :as ers]
+            [ers.path-guest-document :refer [->doc]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "ers" "path.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'ers.path (slurp guest-file)}
+                                         'ers.path :wasm32-kotoba-v1))))
+
+;; Digests are 64-character hex and the guest walks them a byte at a time --
+;; checking the case of every one, and comparing two of them to decide the
+;; concatenation order. The budget is measured in both directions by
+;; `fuel-budget-is-measured-in-both-directions` at the bottom of this file,
+;; because in this migration a guessed budget has been wrong three times out
+;; of four.
+(def ^:private test-fuel 5000)
+
+(defn- call
+  ([f args] (call f args test-fuel))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+;; --- the host: the digest function -------------------------------------------
+
+(defn- sha256 [_algorithm octets]
+  (vec (map #(bit-and % 0xff)
+            (seq (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                          (byte-array (map unchecked-byte octets)))))))
+
+(defn- hex [octets] (str/lower (asn1/hex (vec octets))))
+
+(defn- unhex [s]
+  (mapv (fn [[a b]] (Integer/parseInt (str a b) 16))
+        (partition 2 s)))
+
+(defn- digest-of
+  "What the host does when the guest names two values: concatenate exactly
+  those, in exactly that order, and digest."
+  [a b]
+  (hex (sha256 "SHA-256" (into (unhex a) (unhex b)))))
+
+(defn- walk
+  "Drive the guest over `path` for `leaf`, doing every digest it asks for."
+  [path leaf]
+  (let [s0 (call 'offer-path [(call 'init [(->doc {})]) (->doc path)])]
+    (if (= :refused (call 'phase [s0]))
+      {:state s0 :phase :refused :reason (call 'reason [s0]) :root "" :digests 0}
+      (let [s1 (call 'offer-leaf [s0 leaf])]
+        (if (= :refused (call 'phase [s1]))
+          {:state s1 :phase :refused :reason (call 'reason [s1]) :root "" :digests 0}
+          (loop [state s1 n 0]
+            (if (call 'needs-digest? [state])
+              (recur (call 'offer-digest
+                           [state (digest-of (call 'hash-first [state])
+                                             (call 'hash-second [state]))])
+                     (inc n))
+              {:state state
+               :phase (call 'phase [state])
+               :reason (call 'reason [state])
+               :root (call 'root [state])
+               :height (call 'height [state])
+               :digests n})))))))
+
+;; --- fixtures ----------------------------------------------------------------
+
+(defn- leaves [n]
+  (mapv (fn [i] (sha256 "SHA-256" [i])) (range n)))
+
+(defn- tree-of [n] (ers/build-tree sha256 "SHA-256" (leaves n)))
+
+(defn- path-of
+  "The oracle's reduced path for leaf `i`, as lowercase hex groups."
+  [n i]
+  (mapv (fn [group] (mapv hex group)) (ers/reduced-path (tree-of n) i)))
+
+;; --- the tests ----------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest the-guest-walks-to-the-root-the-oracle-built
+  (testing "across shapes: a pair, an odd tree that promotes, a full four,
+            and one deep enough for three levels"
+    (doseq [n [2 3 4 5 8 9]]
+      (let [t (tree-of n)
+            expected (hex (:root t))]
+        (doseq [i (range n)]
+          (let [g (walk (path-of n i) (hex (nth (leaves n) i)))]
+            (is (= :walked (:phase g)) [n i (:reason g)])
+            (is (= expected (:root g)) [n i "root"])
+            (is (true? (call 'covered? [(:state g) expected])) [n i])))))))
+
+(deftest a-path-that-does-not-mention-the-document-proves-nothing
+  (testing "without this check, any path that happens to reach the right
+            root verifies any document at all -- which is the difference
+            between arithmetic working out and the document being in the
+            archive"
+    (let [path (path-of 4 0)
+          other (hex (nth (leaves 4) 3))]
+      (let [g (walk path other)]
+        (is (= :refused (:phase g)))
+        (is (= :ers/leaf-not-in-path (:reason g)))
+        (is (= "" (:root g)) "and no root comes back out"))
+      (testing "while the leaf the path IS about walks fine"
+        (is (= :walked (:phase (walk path (hex (nth (leaves 4) 0))))))))))
+
+(deftest sorting-is-not-optional
+  (testing "§4.2: children are sorted THEN concatenated, which is what makes
+            a partial path verifiable without knowing which side a sibling
+            was on. The guest names the order; this checks it names the
+            sorted one by presenting a group whose stored order is reversed."
+    (let [t (tree-of 2)
+          [a b] (mapv hex (first (ers/reduced-path t 0)))
+          reversed-path [[b a]]
+          leaf a]
+      ;; The same two digests, given in the other order, must produce the
+      ;; same root -- because the guest sorts them.
+      (let [forward (walk [[a b]] leaf)
+            backward (walk reversed-path leaf)]
+        (is (= :walked (:phase forward)))
+        (is (= :walked (:phase backward)))
+        (is (= (:root forward) (:root backward))
+            "a sorted concatenation does not depend on how the group was stored")
+        (is (= (hex (:root t)) (:root forward))
+            "and it is the root the oracle built"))
+      (testing "and the order the guest names IS the sorted one"
+        (let [s (call 'offer-leaf
+                      [(call 'offer-path [(call 'init [(->doc {})])
+                                          (->doc reversed-path)])
+                       leaf])]
+          (is (true? (call 'needs-digest? [s])))
+          (is (= (if (neg? (compare a b)) a b) (call 'hash-first [s])))
+          (is (= (if (neg? (compare a b)) b a) (call 'hash-second [s]))))))))
+
+(deftest a-promoted-node-is-not-paired-with-itself
+  (testing "duplicating an odd node would make two distinct archives with
+            the same last document produce the same root. That is a forgery,
+            not an inefficiency."
+    ;; Three leaves: level 0 pairs 0+1 and promotes 2; level 1 pairs them.
+    (let [t (tree-of 3)
+          path (path-of 3 2)
+          g (walk path (hex (nth (leaves 3) 2)))]
+      (is (= :walked (:phase g)))
+      (is (= (hex (:root t)) (:root g)))
+      (testing "the promoted level asked for no digest"
+        ;; leaf 2 is alone at level 0, so the walk digests once (at level 1),
+        ;; not twice.
+        (is (= 1 (:digests g))
+            "a self-paired promotion would have digested one more time")))
+    (testing "and the promoted group is recorded, so the path spans every level"
+      (is (= (count (path-of 3 2)) (:height (walk (path-of 3 2)
+                                                  (hex (nth (leaves 3) 2)))))))))
+
+(deftest mixed-case-hex-is-refused-not-folded
+  (testing "`'A'` is 0x41 and `'a'` is 0x61, so a mixed-case path sorts by a
+            different order than the octets and produces a root that is
+            wrong without being detectably so. Folding it here would hide
+            that the host handed over something it should not have."
+    (let [path (path-of 4 0)
+          upper (mapv (fn [g] (mapv str/upper g)) path)]
+      (is (= :ers/non-lowercase-hex (:reason (walk upper (hex (nth (leaves 4) 0))))))
+      (is (= :ers/non-lowercase-hex
+             (:reason (walk path (str/upper (hex (nth (leaves 4) 0))))))))))
+
+(deftest a-malformed-path-is-refused
+  (testing "a group is a node and its sibling, or a node alone"
+    (let [a (hex (nth (leaves 4) 0))
+          b (hex (nth (leaves 4) 1))
+          c (hex (nth (leaves 4) 2))]
+      (is (= :ers/malformed-group (:reason (walk [[a b c]] a))))
+      (is (= :ers/malformed-group (:reason (walk [[]] a))))
+      (is (= :ers/empty-path (:reason (walk [] a)))))))
+
+(deftest a-root-is-not-handed-back-mid-walk
+  (testing "a partial computation presented as an answer is worse than no
+            answer"
+    (let [path (path-of 8 0)
+          s (call 'offer-leaf [(call 'offer-path [(call 'init [(->doc {})])
+                                                  (->doc path)])
+                               (hex (nth (leaves 8) 0))])]
+      (is (true? (call 'needs-digest? [s])) "the walk has not finished")
+      (is (= "" (call 'root [s])))
+      (is (false? (call 'covered? [s (hex (:root (tree-of 8)))]))))))
+
+(deftest the-path-spans-every-level
+  (testing "a promoted level is recorded as a group of one rather than
+            omitted, which is how a verifier knows it saw every level"
+    (doseq [n [2 3 5 8 9]]
+      (let [g (walk (path-of n 0) (hex (nth (leaves n) 0)))]
+        (is (= (count (path-of n 0)) (:height g)) n)))))
+
+;; --- the budget --------------------------------------------------------------
+
+(defn- completes-within? [fuel]
+  (try
+    (let [path (path-of 8 0)
+          leaf (hex (nth (leaves 8) 0))
+          s0 (call 'offer-path [(call 'init [(->doc {})] fuel) (->doc path)] fuel)
+          s1 (call 'offer-leaf [s0 leaf] fuel)]
+      (loop [state s1]
+        (if (call 'needs-digest? [state] fuel)
+          (recur (call 'offer-digest
+                       [state (digest-of (call 'hash-first [state] fuel)
+                                         (call 'hash-second [state] fuel))]
+                       fuel))
+          (= :walked (call 'phase [state] fuel)))))
+    (catch clojure.lang.ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest fuel-budget-is-measured-in-both-directions
+  (testing "the default budget is genuinely insufficient -- otherwise
+            `test-fuel` is superstition and should be deleted"
+    (is (false? (completes-within? 512))))
+  (testing "and the chosen budget is sufficient"
+    (is (true? (completes-within? test-fuel))))
+  (testing "the smallest sufficient budget, so the margin is visible"
+    (let [minimum (first (filter completes-within?
+                                 [600 800 1000 1250 1500 1750 2000 3000 5000]))]
+      (is (some? minimum) "no budget in the search range walks an 8-leaf path")
+      (is (<= minimum test-fuel))
+      (println (format "  [fuel] an 8-leaf path walks at %d; test-fuel is %d"
+                       minimum test-fuel)))))

@@ -1,0 +1,257 @@
+(ns kotobase.storage.ipfs-native
+  "A concrete `kotobase.storage.ipfs` client with NO node daemon, NO HTTP
+  RPC surface, and NO npm SDK dependency: a peer-to-peer block store that
+  runs IN this process, over plain TCP sockets to OTHER instances of this
+  same client that the deployer configures explicitly.
+
+  ## Why this exists
+
+  `kotobase.storage.ipfs-kubo` reaches a real, independently operated Kubo
+  (go-ipfs) node -- genuinely outside a single operator's infrastructure,
+  but every deployer has to run and lifecycle-manage a separate Go binary
+  (per-platform download, its own process supervision) alongside the JS/
+  nbb process that actually wants to store a block. This namespace is the
+  kubo-independent alternative: peers ARE this library, running under the
+  same `nbb`/Node runtime as every other kotobase-storage-ipfs client, with
+  zero additional processes and zero third-party (non-workspace) packages.
+  An `npm install helia` in-process alternative was evaluated first and set
+  aside -- see this repo's README for what was actually measured, not
+  assumed, about that path.
+
+  ## What this actually is, precisely
+
+  This is NOT the IPFS/libp2p bitswap wire protocol (`/ipfs/bitswap/1.2.0`)
+  and CANNOT exchange blocks with Kubo, js-ipfs/Helia, or any other IPFS
+  implementation. It is a small point-to-point protocol between explicitly
+  configured peers (this client's own `:peers` list), reusing two pieces
+  this workspace already had, unmodified:
+
+    - `kotoba-lang/wire` (`kotoba.wire.tcp` / `kotoba.wire.framing` /
+      `kotoba.wire.edn`) for the real TCP socket I/O and EDN framing --
+      the same library `kotoba.net.transport.tcp` (`kotoba-lang/io-libp2p`)
+      and `kotoba-lang/dtn` already run real sockets on.
+    - `kotoba.net.bitswap/respond-to-want` (`kotoba-lang/io-libp2p`) for the
+      want/have intersection -- pure, already tested, unmodified.
+
+  What `kotoba.net.bitswap` and `kotoba.net.transport.tcp` do NOT supply --
+  confirmed by reading their source, not assumed -- is actual BLOCK BYTES
+  over the wire: both only ever exchange want-lists / have-lists (CIDs),
+  never payload (`kotoba.net.bitswap`'s own docstring says so explicitly:
+  \"No block transfer over any wire\"). The `:block-get` / `:block-data`
+  request/response pair below is what is NEW here: it actually moves
+  bytes, base64-encoded because `kotoba-lang/wire`'s frame is `pr-str`'d
+  EDN text, not a byte-transparent channel.
+
+  `kotoba-lang/io-libp2p` also ships a real, publicly-interoperable
+  TCP+Noise+Yamux libp2p connection stack (verified 2026-08-04 against
+  live Kubo/go-libp2p peers) -- but its socket driver
+  (`kotoba.net.libp2p.socket`/`dial`/`node`) is JVM-only (`.clj`), and
+  `kotobase-storage-ipfs` is entirely `nbb`/ClojureScript. Reaching for it
+  here would mean either porting that socket layer to Node or making this
+  one client JVM-only inside an otherwise all-cljs library -- both bigger
+  than this task. `kotoba.wire.tcp` (already Node-native) is the one this
+  namespace actually uses.
+
+  ## What this is NOT (be precise, do not oversell)
+
+  - No encryption or authentication of the peer connection (matching
+    `kotoba.net.transport.tcp`'s own documented scope) -- every configured
+    peer is trusted as given. This is an operator-controlled mesh (e.g.
+    fleet nodes under one operator's control), not a hardened
+    open-Internet transport.
+  - No peer discovery / DHT -- `:peers` is configured up front, exactly
+    like `kotoba.net.transport.tcp`.
+  - No verification that fetched bytes hash to the requested CID -- like
+    `ipfs-kubo` and `ipfs-kotobase`, that is the caller's job via
+    `kotobase.storage.verify/async-verifying-block-store` (this repo's
+    top-level README: \"Returned bytes remain untrusted\").
+  - Qualified so far only with real sockets between node handles in one
+    process (`test/ipfs_native_test.cljk`, distinct TCP ports, real
+    `node:net` connections -- not a mock) plus a real 2-OS-process demo
+    (`bin/native_node_demo.cljk`). NOT yet run across independent
+    machines/fleet nodes -- that is a deployment follow-up, not claimed
+    here."
+  (:require ["node:net" :as net]
+            [kotoba.wire.tcp :as wire]
+            [kotoba.wire.framing :as framing]
+            [kotoba.wire.edn :as wedn]
+            [kotoba.net.bitswap :as bitswap]))
+
+;; ---------------------------------------------------------------------------
+;; bytes <-> base64 -- kotoba-lang/wire's frame is pr-str'd EDN text, so a
+;; block's raw bytes travel as an ordinary EDN string, not a byte-transparent
+;; payload.
+;; ---------------------------------------------------------------------------
+
+(defn- bytes->b64 [bytes]
+  (.toString (js/Buffer.from bytes) "base64"))
+
+(defn- b64->bytes [s]
+  (js/Uint8Array.from (js/Buffer.from s "base64")))
+
+;; ---------------------------------------------------------------------------
+;; one-shot request/response over an UNPOOLED TCP connection.
+;;
+;; kotoba.net.transport.tcp pools outbound sockets per peer because it has
+;; several long-lived, high-frequency message kinds in flight concurrently
+;; (gossip fanout, bitswap want, delta-sync) and needs the extra
+;; :reader-attached idempotency bookkeeping that pooling then requires (see
+;; that namespace's docstring for exactly why). This client only ever does
+;; two short request/response round trips per get-block miss, so a fresh
+;; connection per request -- opened, used once, destroyed -- is simpler and
+;; needs none of that: no shared-listener idempotency hazard is possible
+;; because no listener is ever shared.
+;; ---------------------------------------------------------------------------
+
+(defn- read-one-frame!
+  "Attach a 'data' listener to `socket` that decodes exactly the FIRST
+  complete frame to arrive and calls `(on-frame decoded-map)` once. Built
+  from `kotoba.wire.framing/defragment` + `kotoba.wire.edn/decode-frames`
+  -- the same public, pure building blocks `kotoba.net.transport.tcp`'s own
+  `attach-response-reader!` uses for the identical problem (reading a
+  response back over a socket THIS node dialed out itself, which
+  `kotoba.wire.tcp/start-server!`'s auto-decode only covers for the
+  ACCEPTING side of a connection)."
+  [socket on-frame]
+  (let [remainder-atom (atom [])
+        fired (atom false)]
+    (.on socket "data"
+         (fn [chunk]
+           (when-not @fired
+             (let [incoming (vec (js/Array.from chunk))
+                   combined (into @remainder-atom incoming)
+                   {:keys [frames remainder]} (framing/defragment combined)]
+               (reset! remainder-atom remainder)
+               (when (seq frames)
+                 (reset! fired true)
+                 (on-frame (first (wedn/decode-frames [(first frames)]))))))))))
+
+(defn- request!
+  "Open a single, unpooled TCP connection to host:port, send `msg`, wait
+  for exactly one framed response, then close the connection.
+  => Promise<response-map>, or a rejected Promise if the connection itself
+  fails (host unreachable, connection refused, etc.)."
+  [host port msg]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [sock (net/createConnection #js {:host host :port port})]
+       (.on sock "error" reject)
+       (read-one-frame! sock (fn [response] (.destroy sock) (resolve response)))
+       (wire/send-framed! sock msg)))))
+
+;; ---------------------------------------------------------------------------
+;; server-side dispatch
+;; ---------------------------------------------------------------------------
+
+(defn- handle-message!
+  "Answer one inbound request on the accepted `socket`, in place
+  (full-duplex TCP -- no outbound connection needed to reply).
+
+  `:block-want` -> `:block-have` reuses
+  `kotoba.net.bitswap/respond-to-want` UNCHANGED against this node's own
+  local store's key-set as the have-list -- exactly the intersection
+  semantics `kotoba.net.transport.tcp/handle-bitswap-want!` already uses,
+  just against a real local block store instead of a host-injected
+  `:have-set` option.
+
+  `:block-get` -> `:block-data` is the NEW step: base64-encode the actual
+  bytes (or `nil` if this node does not have them after all -- a
+  TOCTOU-safe path even though `:block-want` was just asked, since nothing
+  prevents the store from having changed between the two requests)."
+  [store-atom msg socket]
+  (case (:kind msg)
+    :block-want
+    (let [have (bitswap/respond-to-want (:want-set msg) (set (keys @store-atom)))]
+      (wire/send-framed! socket {:kind :block-have :have have}))
+    :block-get
+    (let [cid (:cid msg)
+          bytes (get @store-atom cid)]
+      (wire/send-framed! socket {:kind :block-data :cid cid
+                                  :bytes-b64 (when (some? bytes) (bytes->b64 bytes))}))
+    ;; :block-have / :block-data are RESPONSE kinds; they never legitimately
+    ;; arrive here (a response is read back over the exact outbound socket
+    ;; that sent the request, via read-one-frame!, not through this
+    ;; server-side dispatch). A stray/malformed peer should not be able to
+    ;; crash this node.
+    nil))
+
+;; ---------------------------------------------------------------------------
+;; per-peer fetch: :block-want then, only if the peer says it has the cid,
+;; :block-get. A peer that is unreachable, or that answers "no", is not an
+;; error -- get-block tries the next configured peer, in order, and only
+;; resolves nil once every peer has been asked.
+;; ---------------------------------------------------------------------------
+
+(defn- fetch-from-peer
+  "=> Promise<bytes-or-nil>. Never rejects: an unreachable peer or a
+  'have: false' answer both resolve to nil so `get-block` can move on to
+  the next configured peer without a `.catch` at every call site."
+  [node-id {:keys [host port]} cid]
+  (-> (request! host port {:kind :block-want :from node-id :want-set #{cid}})
+      (.then (fn [{:keys [have]}]
+               (if (some #{cid} (set have))
+                 (request! host port {:kind :block-get :from node-id :cid cid})
+                 nil)))
+      (.then (fn [response]
+               (when (some? response)
+                 (let [b64 (:bytes-b64 response)]
+                   (when (some? b64) (b64->bytes b64))))))
+      (.catch (fn [_e] nil))))
+
+;; ---------------------------------------------------------------------------
+;; public API
+;; ---------------------------------------------------------------------------
+
+(defn- invalid! [message data]
+  (throw (ex-info message
+                   (assoc data :type :kotobase.storage.ipfs-native/invalid-configuration))))
+
+(defn open
+  "Start a peer-to-peer block-store node listening on `port`.
+
+  `node-id` -- this node's own identifier, sent as `:from` on outbound
+  requests (diagnostic only; not authenticated).
+  `port` -- TCP port to bind for inbound requests from peers.
+  `peers` -- vector of `{:id :host :port}`, in the order `get-block`
+  should try them on a local miss. Optional; a node with no peers is a
+  purely local block store that also SERVES its blocks to anyone who later
+  configures it as a peer.
+
+  Returns the `kotobase.storage.ipfs/open` client shape
+  (`{:put-block! :get-block}`), plus:
+    `:store`  -- the raw local block-store atom (`cid -> bytes`), for a
+                 caller that wants to inspect or seed it directly.
+    `:close!` -- `() -> Promise<true>`, stops the listening TCP server.
+  `put-block!` only ever writes to the LOCAL store; it never pushes bytes
+  to peers. Distribution is pull-based (a peer's own `get-block` miss is
+  what triggers a `:block-want`/`:block-get` round trip against this
+  node), the same shape GraphSync and bitswap both use."
+  [{:keys [node-id port peers]}]
+  (when-not (string? node-id) (invalid! "kotobase.storage.ipfs-native requires :node-id" {:missing :node-id}))
+  (when-not (integer? port) (invalid! "kotobase.storage.ipfs-native requires :port" {:missing :port}))
+  (doseq [{:keys [id host port]} peers]
+    (when-not (and (string? id) (string? host) (integer? port))
+      (invalid! "kotobase.storage.ipfs-native peer entries need :id, :host, :port"
+                {:peer {:id id :host host :port port}})))
+  (let [store (atom {})
+        peers (vec peers)
+        server (wire/start-server! port (fn [msg socket] (handle-message! store msg socket)))]
+    {:store store
+     :close! (fn [] (js/Promise. (fn [resolve _reject] (.close server (fn [_err] (resolve true))))))
+     :put-block!
+     (fn [cid bytes]
+       (swap! store assoc cid bytes)
+       (js/Promise.resolve cid))
+     :get-block
+     (fn [cid]
+       (if-some [bytes (get @store cid)]
+         (js/Promise.resolve bytes)
+         (letfn [(try-peers [remaining]
+                   (if (empty? remaining)
+                     (js/Promise.resolve nil)
+                     (-> (fetch-from-peer node-id (first remaining) cid)
+                         (.then (fn [bytes]
+                                  (if (some? bytes)
+                                    (do (swap! store assoc cid bytes) bytes)
+                                    (try-peers (rest remaining))))))))]
+           (try-peers peers))))}))

@@ -1,0 +1,91 @@
+(ns kura.node.audit-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kura.audit :as kaudit]
+            [kura.node.audit :as na]
+            [kura.node.gf :as gf]
+            [kura.node.memory :as memory]
+            [kura.node.store :as store]))
+
+;; Two hashers, because there are two domains: shard bodies are buffers, and
+;; merkle-sum's internal node preimage is text. Conflating them is the mistake
+;; kura.node.audit's docstring names, and it fails loudly on the JVM.
+(defn- hash-bytes [buf] (str "hb" (Math/abs (hash (gf/->vec buf)))))
+(defn- hash-text [s] (str "hs" (Math/abs (hash (str s)))))
+
+(defn- stocked
+  "A node holding `n` shards of one object."
+  [n]
+  (let [s (memory/open "mem-audit")]
+    (dotimes [i n]
+      (store/-put-shard! s (str "obj-a/0/" i)
+                         (gf/->bytes (mapv #(mod (+ (* i 17) %) 256) (range 64)))))
+    s))
+
+(deftest commitment-is-built-from-the-store-not-a-manifest
+  (testing "a node that commits to what it was supposed to have passes its own
+            audit while missing shards"
+    (let [s (stocked 8)
+          before (na/commit! s hash-bytes hash-text "obj-a/")]
+      (is (= 8 (:leaf-count before)))
+      (is (= (* 8 64) (:claimed-bytes before)))
+      (store/-delete-shard! s "obj-a/0/3")
+      (let [after (na/commit! s hash-bytes hash-text "obj-a/")]
+        (is (= 7 (:leaf-count after)))
+        (is (= (* 7 64) (:claimed-bytes after)))
+        (is (not= (get-in before [:root :hash]) (get-in after [:root :hash]))
+            "the loss changes the root before any challenge is issued")))))
+
+(deftest challenges-are-answered-and-verify
+  (let [s (stocked 32)
+        c (na/commit! s hash-bytes hash-text "obj-a/")
+        challenges (kaudit/challenge-set "seed-1" "mem-audit" 1 12 (:leaf-count c))
+        responses (na/answer-all c challenges)
+        v (kaudit/verdict hash-text (:root c) responses {:f 0.01})]
+    (is (= 12 (count responses)))
+    (is (:pass? v))
+    (is (empty? (:failed v)))))
+
+(deftest an-unanswerable-challenge-is-nil-not-dropped
+  (testing "silently shortening the vector would turn a failure into a shorter
+            clean run"
+    (let [s (stocked 4)
+          c (na/commit! s hash-bytes hash-text "obj-a/")
+          responses (na/answer-all c [0 1 99])]
+      (is (= 3 (count responses)))
+      (is (nil? (nth responses 2)))
+      (let [v (kaudit/verdict hash-text (:root c) responses {:f 0.01})]
+        (is (false? (:pass? v)))
+        (is (= #{2} (set (:failed v))))
+        (is (= 2 (:answered v)))))))
+
+(deftest self-check-finds-rot-before-the-coordinator-does
+  (let [s (stocked 6)
+        c (na/commit! s hash-bytes hash-text "obj-a/")]
+    (is (:ok? (na/self-check s hash-bytes c)))
+    (is (= 6 (:checked (na/self-check s hash-bytes c))))
+
+    (testing "a shard that changed under the commitment"
+      (store/-put-shard! s "obj-a/0/2" (gf/->bytes (vec (repeat 64 9))))
+      (let [r (na/self-check s hash-bytes c)]
+        (is (false? (:ok? r)))
+        (is (= #{"obj-a/0/2"} (set (:damaged r))))))
+
+    (testing "and a shard that vanished"
+      (store/-delete-shard! s "obj-a/0/5")
+      (let [r (na/self-check s hash-bytes c)]
+        (is (false? (:ok? r)))
+        (is (contains? (set (:damaged r)) "obj-a/0/5"))))))
+
+(deftest an-empty-node-commits-to-nothing-coherently
+  (let [c (na/commit! (memory/open "mem-empty") hash-bytes hash-text "obj-a/")]
+    (is (= 0 (:leaf-count c)))
+    (is (= 0 (:claimed-bytes c)))
+    (is (some? (get-in c [:root :hash])))))
+
+(deftest claimed-volume-is-what-payment-reads
+  (testing "the sum tree's point: one number serves audit and invoice, so a
+            node cannot understate to dodge an audit and overstate to bill"
+    (let [s (stocked 10)
+          c (na/commit! s hash-bytes hash-text "obj-a/")]
+      (is (= 640 (:claimed-bytes c)))
+      (is (= 640 (kaudit/claimed-bytes (:tree c)))))))

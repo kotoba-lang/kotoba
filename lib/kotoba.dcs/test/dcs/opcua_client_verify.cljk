@@ -1,0 +1,90 @@
+(ns dcs.opcua-client-verify
+  "Standalone real-client wire-protocol verification for dcs.opcua. NOT
+  part of the `:test` alias (see dcs.opcua's namespace docstring and the
+  README's \"Protocol-simulation layer\" section for why: Eclipse Milo
+  0.6.16's client transport, `sdk-client`, requires
+  `com.digitalpetri.netty:netty-channel-fsm:0.9`; `com.digitalpetri.modbus:
+  modbus-tcp` (dcs.modbus's dependency, needed by the main :test alias)
+  requires `netty-channel-fsm:1.0.0`; putting both on one classpath
+  produces a real, reproduced `AbstractMethodError` at OPC-UA connect
+  time — a genuine tooling conflict between two otherwise-unrelated
+  digitalpetri-authored libraries, not a design choice here).
+
+  Run with:
+
+    kbb -M:opcua-verify -m dcs.opcua-client-verify
+
+  This uses `org.eclipse.milo:sdk-client` — a REAL, independent Eclipse
+  Milo `OpcUaClient` — to connect to a `dcs.opcua` server over a real
+  loopback TCP socket with real UA-TCP binary framing, and read/write
+  registers, printing PASS/FAIL per assertion and exiting non-zero on any
+  failure. `test/dcs/opcua_test.cljk` (part of the main :test alias) covers
+  the same request-dispatch code path in-process, real objects, minus the
+  actual TCP bytes; this file is what proves the TCP bytes."
+  (:require [dcs.ports :as ports]
+            [dcs.opcua :as opcua])
+  (:import
+   (org.eclipse.milo.opcua.sdk.client OpcUaClient)
+   (org.eclipse.milo.opcua.stack.core AttributeId)
+   (org.eclipse.milo.opcua.stack.core.types.structured ReadValueId WriteValue)
+   (org.eclipse.milo.opcua.stack.core.types.enumerated TimestampsToReturn)
+   (org.eclipse.milo.opcua.stack.core.types.builtin NodeId DataValue Variant)))
+
+(defrecord VerifyIO [values]
+  ports/IFieldIO
+  (read-tag [_this tag-id] (get @values tag-id))
+  (write-tag! [_this tag-id value] (swap! values assoc tag-id value)))
+
+(def ^:private port 15040)
+(def ^:private results (atom []))
+
+(defn- check! [label pass?]
+  (swap! results conj [label pass?])
+  (println (if pass? "PASS" "FAIL") "-" label))
+
+(defn -main [& _args]
+  (let [io (->VerifyIO (atom {"COV.PV" 0.032 "FAN.SP" 1500.0}))
+        nm (-> (opcua/node-map)
+               (opcua/add-node (opcua/node-spec "CoV" "COV.PV" :double :read-only))
+               (opcua/add-node (opcua/node-spec "FanSp" "FAN.SP" :double :read-write)))
+        handle (opcua/start-server! io nm {:port port})]
+    (try
+      (let [client (OpcUaClient/create (opcua/endpoint-url handle))
+            connect-result (deref (.connect client) 8000 :TIMEOUT)]
+        (check! "real Milo OpcUaClient connects over real UA-TCP" (not= :TIMEOUT connect-result))
+        (try
+          (let [ns-index (:dcs/ns-index handle)
+                cov-id (NodeId. ns-index "CoV")
+                fansp-id (NodeId. ns-index "FanSp")
+                read-resp (deref (.read client 0.0 TimestampsToReturn/Both
+                                         [(ReadValueId. cov-id (.uid AttributeId/Value) nil nil)
+                                          (ReadValueId. fansp-id (.uid AttributeId/Value) nil nil)])
+                                  8000 :TIMEOUT)
+                [^DataValue cov-dv ^DataValue fansp-dv] (.getResults read-resp)]
+            (check! "real client reads CoV = 0.032 from live IFieldIO"
+                    (= 0.032 (.getValue ^Variant (.getValue cov-dv))))
+            (check! "real client reads FanSp = 1500.0 from live IFieldIO"
+                    (= 1500.0 (.getValue ^Variant (.getValue fansp-dv))))
+            (let [write-resp (deref (.write client [(WriteValue. fansp-id (.uid AttributeId/Value) nil
+                                                                   (DataValue. (Variant. 1800.0)))])
+                                     8000 :TIMEOUT)]
+              (check! "real client write FanSp -> Good status" (.isGood ^org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode
+                                                                          (first (.getResults write-resp))))
+              (check! "write reflected in the SAME IFieldIO the domain logic reads"
+                      (= 1800.0 (ports/read-tag io "FAN.SP"))))
+            (let [bad-resp (deref (.write client [(WriteValue. cov-id (.uid AttributeId/Value) nil
+                                                                 (DataValue. (Variant. 9.9)))])
+                                   8000 :TIMEOUT)]
+              (check! "write to a read-only node is rejected (real Bad_NotWritable)"
+                      (.isBad ^org.eclipse.milo.opcua.stack.core.types.builtin.StatusCode
+                               (first (.getResults bad-resp))))
+              (check! "rejected write left CoV untouched in IFieldIO"
+                      (= 0.032 (ports/read-tag io "COV.PV")))))
+          (finally
+            (deref (.disconnect client) 5000 :TIMEOUT))))
+      (finally
+        (opcua/stop-server! handle)))
+    (let [failures (remove second @results)]
+      (println)
+      (println (count @results) "checks," (count failures) "failures")
+      (System/exit (if (seq failures) 1 0)))))

@@ -1,0 +1,254 @@
+(ns shitsuke.kotoba-oracle
+  "Runs the shipped decision cores.
+
+  `kotoba/*.kotoba` holds the decisions; `resources/shitsuke/oracle/*.kir.edn`
+  is what was compiled from them and what ships. This namespace is the seam,
+  and it is deliberately thin: it resolves a resource, executes an export, and
+  decides nothing.
+
+  ## Why this exists
+
+  The six cores landed with `kotoba-parity-test` /
+  `kotoba-document-parity-test`, which ran both implementations over the same
+  inputs and required the same answers, and on 2026-08-12 with
+  `kotoba-callable-test`, which proved each module exports a surface a host
+  could call. Both were right and both are still here. But an export nobody
+  calls is a door nobody walks through: until now the `.cljc` was what ran and
+  the `.kotoba` was a checked replica. The measure of the port is not how many
+  host lines went away, it is whether the AUTHORITY moved (ADR-2608112100).
+
+  The one that most wanted this is `rawtext-breakout?`. It is a SECURITY
+  predicate — whether a `<script>`/`<style>` payload contains the
+  case-insensitive `</tag` sequence that terminates a RAWTEXT element early and
+  lets markup be injected after it. A security rule that exists twice is a
+  security rule that can be fixed once and stay broken in the copy that runs.
+
+  ## The guest ABI, and the two places the host has to meet it
+
+  `kir/execute` takes a record as `[schema field …]` in DECLARED field order
+  and returns the same shape, so `record` is a positional constructor and
+  nothing more. The declared order is not written down here: `signature` reads
+  it back out of the shipped artifact, which IS the `.kotoba` compiled, so
+  callers get the order from the source of the rule rather than from a host
+  copy of it.
+
+  Strings cross as UTF-8 and the guest refuses one over
+  `string-byte-limit` bytes. `chars-that-always-fit` is that limit expressed in
+  a unit a host can check without encoding anything (see its docstring); a host
+  with a longer string windows it rather than asking a question the guest will
+  not answer.
+
+  ## No fallback around a missing artifact
+
+  A missing or unreadable artifact throws. It does not quietly run something
+  else, because a silent fallback is how a decision stops being the one that
+  shipped — and for `rawtext-breakout?` it is also how an unchecked payload
+  reaches a page.
+
+  ## ClojureScript hosts must register the KIR
+
+  There is no classpath to read a resource from, so `register-kir!` is the only
+  way in and `kir` throws without it. That is a real narrowing of what this
+  library used to do on that runtime, and because shitsuke is a design system
+  that ClojureScript consumers require directly, it is stated here and in the
+  README rather than left to be discovered.
+
+  What it does NOT narrow is namespace loading. Nothing delegated here is
+  evaluated at load time: every delegated call site is inside a function, so
+  `(require '[shitsuke.hig])` on ClojureScript works exactly as before whether
+  or not a KIR was ever registered. `shitsuke.hig/layer-order-css` and
+  `shitsuke.hig/text-style-classes` stay host-side FOR that reason — they are
+  top-level `def`s, and delegating them would make loading the design system
+  depend on a registered artifact."
+  (:require [kotoba.kir :as kir]
+            ;; Both only exist on the branch that has a classpath to read from.
+            #?@(:clj [[kotoba.lang.edn :as edn]
+                      [kotoba.io :as io]])))
+
+(def cores
+  "Oracle id -> the .kotoba it was compiled from, under kotoba/.
+
+  This map is exactly what SHIPS and therefore exactly what RUNS — an artifact
+  in `resources/shitsuke/oracle/` that no host executed would be the same
+  'prepared but not used' state this namespace exists to end, one directory
+  further along. The other five cores stay on their parity gate; the README
+  records which, and the measured reason for each."
+  {:hiccup-core "kotoba/hiccup_core.kotoba"})
+
+(def target
+  "The portable target the shipped KIR is compiled for.
+
+  `hiccup_core` is form-A (data -> bool, no capabilities) and
+  `kotoba-parity-test` already gates it on this target, so naming it once here
+  rather than in the generator and the drift test separately is what keeps
+  regeneration reproducible."
+  :wasm32-kotoba-v1)
+
+(defn resource-path [id]
+  (str "shitsuke/oracle/" (name id) ".kir.edn"))
+
+(def ^:private registered
+  "Pre-parsed KIR, for runtimes with no classpath, and for the test that has to
+  prove the host reads this rather than keeping its own copy."
+  (atom {}))
+
+(defn register-kir!
+  "Install a parsed KIR for `id`, bypassing the resource read."
+  [id kir]
+  (swap! registered assoc id kir)
+  kir)
+
+(defn deregister-kir!
+  "Drop a registration, so `id` reads the shipped artifact again."
+  [id]
+  (swap! registered dissoc id)
+  nil)
+
+(defn- read-artifact [id]
+  #?(:clj
+     (let [path (resource-path id)]
+       (if-let [url (io/resource path)]
+         (edn/read-string (slurp url))
+         (throw (ex-info "shipped decision core is missing — run `kbb -M:test:gen`"
+                         {:oracle id :path path}))))
+     :cljs
+     (throw (ex-info "no classpath on this runtime — register-kir! first"
+                     {:oracle id}))))
+
+(def ^:private cache (atom {}))
+
+(defn kir
+  "The shipped KIR for `id`, read once."
+  [id]
+  ;; A registration wins over the cache: it is an explicit instruction, and a
+  ;; caller that registers after something already read the artifact means the
+  ;; registration, not the read.
+  (or (get @registered id)
+      (get @cache id)
+      (let [loaded (read-artifact id)]
+        (swap! cache assoc id loaded)
+        loaded)))
+
+(defn signature
+  "The shipped declaration of `export`: `:params`, `:param-types`, `:result`.
+
+  This is how a host learns a record's field order without writing it down a
+  second time. Throws if the export is not there, because a host asking for a
+  signature is about to build an argument out of it."
+  [id export]
+  (let [export (symbol (name export))]
+    (or (first (filter #(= export (:name %)) (:functions (kir id))))
+        (throw (ex-info "shipped core does not declare that export"
+                        {:oracle id :export export})))))
+
+(defn resolve-type
+  "Expand a declared type into the one `kir/execute` accepts as a value.
+
+  These modules declare their parameters as `[:ref :hic/rawtext-breakout]` and
+  carry the descriptor in the artifact's `:schemas` table, but a value crossing
+  the boundary must be headed by the EXPANDED `[:record …]` — a `:ref` head is
+  refused. Resolving here is what keeps that asymmetry out of every host: a
+  caller asks for the type of a parameter and gets something it can build.
+
+  Anything that is not a `:ref` is already its own descriptor and is returned
+  unchanged."
+  [id t]
+  (if (and (vector? t) (= :ref (first t)))
+    (let [k (second t)]
+      (or (get (:schemas (kir id)) k)
+          (throw (ex-info "shipped core declares a schema ref it does not define"
+                          {:oracle id :ref k}))))
+    t))
+
+(defn param-types
+  "Declared parameter types of `export`, in order, with schema refs resolved."
+  [id export]
+  (mapv #(resolve-type id %) (:param-types (signature id export))))
+
+(def default-fuel
+  "Fuel for one delegated call.
+
+  Every delegated export is a bounded string composition or a single
+  `string-contains?`; measured 2026-08-12, all of them answer within 1024 fuel
+  at every input size the host can hand them, including a 64 KiB RAWTEXT
+  payload. This is that measurement with four binary orders of magnitude of
+  headroom, not a guess."
+  262144)
+
+(defn call
+  "Execute an export of a shipped core. Args and result are guest ABI values;
+  see `record` for the one conversion that is not the identity."
+  ([id export args] (call id export args default-fuel))
+  ([id export args fuel]
+   (kir/execute (kir id) (symbol (name export)) (vec args) {:fuel fuel})))
+
+;; ── the guest values that are not plain host values ──────────────────
+
+(defn record
+  "Build a guest record argument: the descriptor, then fields in DECLARED
+  order. Declared order, not map order — a record whose fields are permuted is
+  not silently wrong, it simply fails to match the declared type. Pair with
+  `param-types` so the order comes from the artifact."
+  [schema field-values]
+  (into [schema] field-values))
+
+(defn record-fields
+  "`[[field type] …]` of a `[:record name fields]` descriptor, in declared
+  order."
+  [record-type]
+  (nth record-type 2))
+
+(defn record-of
+  "Build a guest record from `{field value}`, ordered by the DECLARED field
+  order in `record-type`.
+
+  This is the constructor hosts should use. Positional `record` requires the
+  caller to know the order, which means writing it down a second time; here the
+  order comes from the shipped artifact and the caller only has to know the
+  field names. A missing field throws rather than sending `nil` across, because
+  `nil` is not a guest value and the failure would otherwise surface as a type
+  mismatch some frames away from the host that caused it."
+  [record-type field-map]
+  (record record-type
+          (mapv (fn [[field _type]]
+                  (if (contains? field-map field)
+                    (get field-map field)
+                    (throw (ex-info "guest record is missing a declared field"
+                                    {:record record-type :field field
+                                     :given (vec (sort (keys field-map)))}))))
+                (record-fields record-type))))
+
+(defn only-param-type
+  "The single declared parameter type of `export`.
+
+  The form-A cores fold multi-argument pure functions into one record (their
+  `T5.2` convention), so most delegated exports take exactly one. Throws on any
+  other arity, so a signature change is a loud failure at the call site rather
+  than a silently mis-shaped argument."
+  [id export]
+  (let [types (param-types id export)]
+    (if (= 1 (count types))
+      (first types)
+      (throw (ex-info "expected a single-parameter export"
+                      {:oracle id :export export :param-types types})))))
+
+;; ── what can cross ───────────────────────────────────────────────────
+
+(def string-byte-limit
+  "The guest refuses a string argument longer than this many UTF-8 bytes
+  (`kotoba.kir.value/string-value-byte-limit`). Measured 2026-08-12 against the
+  pinned pair: 65536 is accepted, 65537 raises `string exceeds UTF-8 byte
+  limit`."
+  65536)
+
+(def chars-that-always-fit
+  "A string of at most this many characters always fits `string-byte-limit`,
+  on either runtime, without encoding it to find out.
+
+  UTF-8 spends at most 3 bytes per UTF-16 code unit — a BMP code point is 1 to
+  3 bytes in one unit, and a supplementary code point is 4 bytes across two
+  units, i.e. 2 bytes per unit. So `3 * char-count` bounds the byte count from
+  above, and dividing gives a length no host needs a `TextEncoder` or a
+  `getBytes` to check. It is conservative by design: the point is a bound that
+  is identical on JVM and ClojureScript, not the largest true one."
+  (quot string-byte-limit 3))

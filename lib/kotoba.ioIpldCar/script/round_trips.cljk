@@ -1,0 +1,162 @@
+;; How many requests does a work tree cost, per block and packed?
+;;
+;;   kbb --backend sci --classpath "src:<unixfs>/src:<io-ipld>/src:<io-multiformats>/src:<dev-protobuf>/src" \
+;;     script/round_trips.cljk <dir>
+;;
+;; The homework in superproject ADR-2608198000 / cloud-itonami-app ADR-0057:
+;; that store issues **one request per block**, and ADR-0057 wrote down what
+;; that costs for a single large upload (a 100 MiB file is 400 leaves plus 3
+;; nodes) while leaving the shape a bot actually writes -- a tree of many small
+;; files -- unmeasured.
+;;
+;; This counts it. Nothing here talks to a network: the request count of a
+;; block-per-object store is a function of the block set, so counting blocks is
+;; exact rather than an estimate. What it is NOT is a latency measurement.
+;; ADR-2608198000 says the indicator is the number of round trips; this reports
+;; that number and no other.
+;;
+;; The tree comes from `git ls-files` when the directory is a repository,
+;; because a work tree is git-managed by definition in the design this
+;; measures, and `.git` and `node_modules` are not part of what a bot commits.
+(ns round-trips
+  (:require [kotoba.lang.text :as str]
+            [ipld.car.bytes :as cb]
+            [ipld.car.v2 :as v2]
+            [unixfs.file :as unixfs]
+            ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:path" :as path]))
+
+(def ^:private nul (js/String.fromCharCode 0))
+
+(defn- git-files [dir]
+  (try
+    (let [out (.execFileSync cp "git" #js ["-C" dir "ls-files" "-z"]
+                             #js {:encoding "utf8" :maxBuffer (* 64 1024 1024)})]
+      (->> (str/split out nul) (remove str/blank?) vec))
+    (catch :default _ nil)))
+
+(defn- walk [dir]
+  (letfn [(step [d acc]
+            (reduce (fn [acc e]
+                      (let [n (.-name e) p (path/join d n)]
+                        (cond
+                          (#{".git" "node_modules"} n) acc
+                          (.isDirectory e) (step p acc)
+                          (.isFile e) (conj acc (path/relative dir p))
+                          :else acc)))
+                    acc
+                    (array-seq (fs/readdirSync d #js {:withFileTypes true}))))]
+    (step dir [])))
+
+(defn- human [n]
+  (cond (> n 1048576) (str (.toFixed (/ n 1048576) 1) " MiB")
+        (> n 1024) (str (.toFixed (/ n 1024) 1) " KiB")
+        :else (str n " B")))
+
+(def ^:const default-max-object-bytes
+  "`cloud.itonami.app.archive/max-object-bytes`, which is
+  `kotobase.archive-put/max-object-bytes`: 4 MiB.
+
+  A pack is an object like any other, so a tree whose blocks exceed this is
+  more than one PUT. The first version of this script reported `1 request` for
+  a 7.7 MiB pack, which is not a number the archive would have accepted."
+  (* 4 1024 1024))
+
+(defn- pack-groups
+  "Greedily group `blocks` so each group packs under `cap`.
+
+  Estimated first (frame + CID + varint, plus the 40 B/block index entry and
+  the fixed header), then every group is actually packed and checked. An
+  estimate that turned out to be wrong must not be reported as a request
+  count — `-main` refuses rather than rounding."
+  [blocks cap]
+  (let [overhead 128
+        cost (fn [b] (+ (cb/bcount (:bytes b)) overhead))]
+    (loop [remaining blocks, current [], size 132, out []]
+      (cond
+        (empty? remaining)
+        (if (seq current) (conj out current) out)
+
+        (and (seq current) (> (+ size (cost (first remaining))) cap))
+        (recur remaining [] 132 (conj out current))
+
+        :else
+        (recur (rest remaining)
+               (conj current (first remaining))
+               (+ size (cost (first remaining)))
+               out)))))
+
+(defn -main [& args]
+  (let [dir (or (first (remove #(str/starts-with? % "--") args)) ".")
+        files (or (git-files dir) (walk dir))]
+    (when (empty? files)
+      (println "no files -- refusing to report a count for an empty tree")
+      (js/process.exit 2))
+    (println (str "\nround trips for " (path/resolve dir) "\n"))
+    (let [state
+          (reduce
+           (fn [acc rel]
+             (let [p (path/join dir rel)
+                   bs (try (vec (js/Uint8Array. (fs/readFileSync p)))
+                           (catch :default _ nil))]
+               (if (nil? bs)
+                 (update acc :unreadable inc)
+                 (let [{:keys [blocks]} (unixfs/build bs)]
+                   (-> acc
+                       (update :files inc)
+                       (update :bytes + (count bs))
+                       (update :blocks into blocks)
+                       (update :per-file conj (count blocks)))))))
+           {:files 0 :bytes 0 :blocks [] :per-file [] :unreadable 0}
+           files)
+          {:keys [files bytes blocks per-file unreadable]} state
+          distinct-cids (set (map :cid blocks))
+          ;; Write-locality packing (ADR-2608160100 is one pack per commit), cut
+          ;; to whatever the object plane will actually accept in one PUT.
+          cap (or (some->> args (filter #(str/starts-with? % "--cap=")) first
+                           (#(js/parseInt (subs % 6) 10)))
+                  default-max-object-bytes)
+          groups (pack-groups (mapv #(select-keys % [:cid :bytes]) blocks) cap)
+          packs (mapv (fn [g] (v2/pack {:roots [] :blocks g})) groups)
+          pack-sizes (mapv #(cb/bcount (:bytes %)) packs)
+          over (filter #(> % cap) pack-sizes)
+          pack-bytes (reduce + 0 pack-sizes)
+          index-bytes (reduce + 0 (map (fn [p size] (- size 51 (:data-size p)))
+                                       packs pack-sizes))
+          multi (count (filter #(> % 1) per-file))]
+      (when (seq over)
+        ;; Refusing to answer beats answering wrongly: the grouping estimate
+        ;; was off and the request count below would be a number the object
+        ;; plane never agreed to.
+        (println (str "  REFUSING — " (count over)
+                      " pack(s) exceed the " (human cap) " object ceiling; "
+                      "the grouping estimate is wrong, not the ceiling"))
+        (js/process.exit 3))
+      ;; A floor, not decoration: a run that read nothing would otherwise print
+      ;; a tidy table of zeros and read as a measurement.
+      (println (str "  SCANNED\t" files " files, " (human bytes)
+                    (when (pos? unreadable) (str " (" unreadable " unreadable)"))))
+      (println)
+      (println (str "  blocks emitted          " (count blocks)))
+      (println (str "  distinct block CIDs     " (count distinct-cids)
+                    "   (" (- (count blocks) (count distinct-cids))
+                    " duplicates across files)"))
+      (println (str "  files needing >1 block  " multi " of " files
+                    "   (max " (apply max (conj per-file 0)) " blocks in one file)"))
+      (println)
+      (println (str "  WRITE  block-per-object   " (count distinct-cids) " requests"))
+      (println (str "  WRITE  packed             " (count packs)
+                    " request" (when (> (count packs) 1) "s")
+                    "      " (human pack-bytes) " total, of which index "
+                    (human index-bytes)
+                    "   (ceiling " (human cap) "/object)"))
+      (println)
+      (println (str "  READ   whole tree         " (count distinct-cids)
+                    " GETs unpacked, " (count packs) " range GET(s) packed"))
+      (println (str "  READ   one file           "
+                    (if (zero? multi) "1 GET either way"
+                        "1 GET per block unpacked, 1 contiguous range GET packed")))
+      (println))))
+
+(apply -main *command-line-args*)

@@ -1,0 +1,330 @@
+(ns kotobase.engine.merge-test
+  "Multi-parent merge commits through the engine (kotobase ADR-2610101200).
+
+  Runs on the Promise facade (`kbb -M:test`), the one every Worker
+  deployment executes."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing async]]
+               :org.babashka/nbb [kotoba.test :refer [deftest is testing async]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is testing async]])
+            [kotobase.engine :as engine]
+            [kotobase.engine.frontier :as frontier]
+            [kotobase.engine.identity :as identity]
+            [kotobase.engine.logical :as logical]
+            [kotobase.engine.merge :as contract]
+            [kotobase.storage.memory :as memory]))
+
+;; Deterministic controls: content addressing (and so merge-CID convergence)
+;; needs deterministic encryption/blinding; production AEAD that is
+;; nondeterministic still converges on the logical root.
+(declare opts)
+
+(defn- open
+  ([store] (open store {:merge opts :trust-scope "merge-test"}))
+  ([store extra]
+   (engine/open (merge {:storage store
+                        :encrypt-fn #(js/Promise.resolve %)
+                        :decrypt-fn #(js/Promise.resolve %)
+                        :blind-fn #(js/Promise.resolve (pr-str %))
+                        :visible? (constantly true)}
+                       extra))))
+
+(def schema
+  {":doc/status" {:db/cardinality :db.cardinality/one}
+   ":doc/title" {:db/cardinality :db.cardinality/one}
+   ":user/email" {:db/cardinality :db.cardinality/one
+                  :db/unique :db.unique/value}})
+
+(def opts {:schema schema :database-id "tenant/db"})
+
+(defn- exchange!
+  "Two offline writers swap immutable blocks (any transport). No ref moves."
+  [a b]
+  (let [blocks (merge (:blocks @(:state a)) (:blocks @(:state b)))]
+    (swap! (:state a) assoc :blocks blocks)
+    (swap! (:state b) assoc :blocks blocks)))
+
+(defn- all-datoms [conn cid]
+  (-> (engine/q (engine/at-cid conn cid) [nil nil nil])
+      (.then (fn [quads] (set (map logical/quad->datom quads))))))
+
+(defn- problem-of
+  "The contract `:problem` of a rejection. SCI (kbb) wraps an error thrown
+  inside a Promise callback in its own `:sci/error`, keeping ours as the
+  cause, so walk the cause chain."
+  [e]
+  (loop [e e]
+    (when e
+      (or (:problem (ex-data e)) (recur (ex-cause e))))))
+
+(defn- problem [promise]
+  (-> promise
+      (.then (fn [_] :no-error))
+      (.catch (fn [e] (or (problem-of e) (ex-message e))))))
+
+(defn- fail! [done]
+  (fn [e]
+    (is false (str "unexpected rejection: " (ex-message e) " " (pr-str (ex-data e))))
+    (done)))
+
+(defn- contract-state [conn cid]
+  (-> (engine/logical-projection conn [cid] opts)
+      (.then (fn [{:keys [graph logical]}]
+               (set (contract/state {:graph graph
+                                     :root (get-in logical [cid :root])
+                                     :schema schema
+                                     :digest logical/digest}))))))
+
+;; ---------------------------------------------------------------------------
+
+(deftest single-parent-commit-bytes-are-unchanged
+  ;; The chain pin that adds `causes` keeps every v1 CID (golden values
+  ;; computed with the previous dependency set).
+  (async done
+    ;; A connection without :merge settings writes exactly the old bytes.
+    (let [conn (open (memory/memory-store) {})]
+      (-> (engine/commit-at! conn nil [["root" "value" "1"]])
+          (.then (fn [g]
+                   (is (= "bafyreiaavacsm5nftemscicen5xwabeasqje7fusxjz2bj2v7fgv4gjaiy" g))
+                   (engine/commit-at! conn g [["left" "value" "2"]])))
+          (.then (fn [c]
+                   (is (= "bafyreidt6672a7tgovbaiyhsyhlurznalscg7yl76qxop672k7xq6f2hby" c))
+                   (js/Promise.all #js [(contract-state conn c) (all-datoms conn c)])))
+          (.then (fn [[logical-state physical]]
+                   (is (= physical logical-state)
+                       "linear history: contract state = engine reads")
+                   (done)))
+          (.catch (fail! done))))))
+
+(defn- diverge
+  "G on writer A, shipped to B; A and B then commit offline on G."
+  []
+  (let [store-a (memory/memory-store)
+        store-b (memory/memory-store)
+        a (open store-a)
+        b (open store-b)]
+    (-> (engine/commit-at! a nil [["doc" ":doc/title" "draft"]
+                                  ["doc" ":doc/status" "open"]
+                                  ["u1" ":user/email" "x@example.com"]])
+        (.then (fn [g]
+                 (exchange! store-a store-b)
+                 (-> (js/Promise.all
+                      #js [(engine/commit-at! a g [[:db/retract "doc" ":doc/status" "open"]
+                                                   ["doc" ":doc/status" "closed"]
+                                                   ["doc" ":doc/tag" "a"]])
+                           (engine/commit-at! b g [[:db/retract "doc" ":doc/status" "open"]
+                                                   ["doc" ":doc/status" "review"]
+                                                   ["doc" ":doc/tag" "b"]
+                                                   [:db/retract "u1" ":user/email" "x@example.com"]
+                                                   ["u2" ":user/email" "x@example.com"]])])
+                     (.then (fn [[a1 b1]]
+                              (exchange! store-a store-b)
+                              {:a a :b b :store-a store-a :store-b store-b
+                               :g g :a1 a1 :b1 b1}))))))))
+
+(deftest offline-writers-converge-on-one-merge-commit
+  (async done
+    (-> (diverge)
+        (.then
+         (fn [{:keys [a b g a1 b1] :as w}]
+           (-> (js/Promise.all #js [(engine/merge-at! a [a1 b1] opts)
+                                    (engine/merge-at! b [b1 a1 b1] opts)])
+               (.then
+                (fn [[ma mb]]
+                  (testing "both writers, either order: one merge"
+                    (is (= :merged (:status ma) (:status mb)))
+                    (is (= (:cid ma) (:cid mb)))
+                    (is (= (:logical-root ma) (:logical-root mb)))
+                    (is (identity/merge-commit? (:logical-commit ma)))
+                    (is (= 2 (:epoch (:logical-commit ma))))
+                    (is (= (set [a1 b1]) (set (:heads ma))))
+                    (is (seq (:conflicts ma))
+                        "the concurrent :doc/status writes were resolved"))
+                  (testing "the mutable ref was never touched"
+                    (is (nil? (get-in @(:state (:store-a w)) [:refs "main"]))))
+                  (-> (js/Promise.all #js [(all-datoms a (:cid ma))
+                                           (contract-state a (:cid ma))
+                                           (engine/verify-at b (:cid mb) opts)])
+                      (.then
+                       (fn [[physical logical-state verified]]
+                         (testing "reads through the merge = contract state"
+                           (is (= physical logical-state))
+                           (is (= physical (set (:datoms verified))))
+                           (is (= (:logical-root ma) (:logical-root verified))))
+                         (testing "set union keeps both tags; card-one keeps one status"
+                           (is (contains? physical {:e "doc" :a ":doc/tag" :v "a"}))
+                           (is (contains? physical {:e "doc" :a ":doc/tag" :v "b"}))
+                           (is (= 1 (count (filter #(= ":doc/status" (:a %)) physical))))
+                           (is (contains? physical {:e "doc" :a ":doc/title" :v "draft"})))
+                         (testing "unique value: the earliest claim is kept"
+                           ;; u1 claimed at epoch 0, but B retracted it; u2's
+                           ;; claim stands because u1 no longer holds it.
+                           (is (= #{"u2"} (set (keep #(when (= ":user/email" (:a %)) (:e %))
+                                                     physical)))))
+                         ;; A v1 commit on top of the merge.
+                         (engine/commit-at! a (:cid ma) [["doc" ":doc/tag" "after"]])))
+                      (.then
+                       (fn [child]
+                         (-> (js/Promise.all #js [(all-datoms a child)
+                                                  (contract-state a child)
+                                                  (engine/verify-at a child opts)
+                                                  (engine/merge-at! a [g a1 (:cid ma) child] opts)])
+                             (.then
+                              (fn [[physical logical-state verified ff]]
+                                (is (= physical logical-state))
+                                (is (contains? physical {:e "doc" :a ":doc/tag" :v "after"}))
+                                (is (= 3 (:epoch verified)))
+                                (testing "merging ancestors is a fast-forward"
+                                  (is (= :fast-forward (:status ff)))
+                                  (is (= child (:cid ff))))
+                                (done))))))))))))
+        (.catch (fail! done)))))
+
+(deftest merge-commits-are-verified-and-sibling-heads-discovered
+  (async done
+    (-> (diverge)
+        (.then
+         (fn [{:keys [a g a1 b1]}]
+           (-> (engine/branch-heads a [g a1 b1 a1 g])
+               (.then
+                (fn [heads]
+                  (is (= (vec (sort [a1 b1])) heads)
+                      "the genesis is contained in both branches")
+                  (engine/merge-at! a heads opts)))
+               (.then
+                (fn [m]
+                  (-> (js/Promise.all
+                       #js [(engine/logical-projection a [(:cid m)] opts)
+                            (problem (engine/verify-at
+                                      a (:cid m)
+                                      (assoc opts :schema
+                                             {":doc/status" {:db/cardinality
+                                                             :db.cardinality/many}})))])
+                      (.then
+                       (fn [[{:keys [graph]} wrong-schema]]
+                         (testing "the contract re-verifies the merge recursively"
+                           (is (= (:logical-root m)
+                                  (:root (contract/verify-merge
+                                          {:graph graph :root (:logical-root m)
+                                           :schema schema :digest logical/digest})))))
+                         (testing "a reader with different settings cannot accept it"
+                           (is (= :physical-mismatch wrong-schema)))
+                         (done)))))))))
+        (.catch (fail! done)))))
+
+(deftest frontier-accepts-the-merge-with-parent-entries
+  (async done
+    (-> (diverge)
+        (.then
+         (fn [{:keys [a a1 b1]}]
+           (-> (engine/merge-at! a [a1 b1] opts)
+               (.then (fn [m]
+                        (-> (engine/logical-projection a [(:cid m)] opts)
+                            (.then (fn [projection] [m projection])))))
+               (.then
+                (fn [[m {:keys [graph logical]}]]
+                  (let [root-a1 (get-in logical [a1 :root])
+                        root-b1 (get-in logical [b1 :root])
+                        entry (fn [root]
+                                (let [commit (get-in graph [root :commit])]
+                                  (cond-> {:root root :commit commit}
+                                    (identity/merge-commit? commit)
+                                    (assoc :parent-entries
+                                           (mapv (fn [p] {:root p
+                                                          :commit (get-in graph [p :commit])})
+                                                 (:parents commit))))))
+                        verified? (fn [{:keys [root commit]}]
+                                    (= root (logical/digest
+                                             (identity/logical-commit-string commit))))
+                        seen (fn [root]
+                               {:format frontier/frontier-format
+                                :database-id "tenant/db"
+                                :logical-commit-root root
+                                :epoch (get-in graph [root :commit :epoch])})
+                        accept (fn [last-root path]
+                                 (try
+                                   (frontier/accept-head
+                                    {:last-seen (seen last-root)
+                                     :candidate-root (first path)
+                                     :path (mapv entry path)
+                                     :verify-entry verified?})
+                                   (catch :default e (:problem (ex-data e)))))]
+                    (testing "a sibling alone is equivocation for a single-writer frontier"
+                      (is (= :equivocation (accept root-a1 [root-b1]))))
+                    (testing "the merge advances an observer of either side"
+                      (doseq [seen-root [root-a1 root-b1]]
+                        (let [result (accept seen-root [(:logical-root m)])]
+                          (is (= :advanced (:status result)))
+                          (is (= (vec (sort [root-a1 root-b1]))
+                                 (:merge-parents result))))))
+                    (testing "without parent entries the proof is rejected"
+                      (is (= :invalid-proof
+                             (try
+                               (frontier/accept-head
+                                {:last-seen (seen root-a1)
+                                 :candidate-root (:logical-root m)
+                                 :path [(dissoc (entry (:logical-root m)) :parent-entries)]
+                                 :verify-entry verified?})
+                               (catch :default e (:problem (ex-data e)))))))
+                    (done)))))))
+        (.catch (fail! done)))))
+
+(deftest merge-advances-the-ref-through-cas
+  (async done
+    (let [store (memory/memory-store)
+          conn (open store)
+          ref-cid #(get-in @(:state store) [:refs "main" :cid])]
+      (-> (engine/transact! conn [["doc" ":doc/title" "v0"]])
+          (.then (fn [h0]
+                   ;; An offline branch from h0 while the ref keeps moving.
+                   (-> (engine/commit-at! conn h0 [["doc" ":doc/tag" "offline"]])
+                       (.then (fn [sibling]
+                                (-> (engine/transact! conn [["doc" ":doc/tag" "online"]])
+                                    ;; A fold commit is a physical checkpoint,
+                                    ;; logically its prev.
+                                    (.then (fn [_] (engine/fold! conn {:threshold 1})))
+                                    (.then (fn [_] (engine/merge! conn [sibling] opts)))
+                                    (.then (fn [result] [sibling result]))))))))
+          (.then
+           (fn [[sibling result]]
+             (is (= :merged (:status result)))
+             (is (true? (:ref-advanced? result)))
+             (is (= (:cid result) (ref-cid)))
+             (-> (engine/q conn [nil ":doc/tag" nil])
+                 (.then
+                  (fn [rows]
+                    (is (= #{"offline" "online"} (set (map :o rows))))
+                    (engine/merge! conn [sibling] opts)))
+                 (.then
+                  (fn [again]
+                    (is (= :fast-forward (:status again)))
+                    (is (false? (:ref-advanced? again)))
+                    (is (= (:cid result) (ref-cid)))
+                    (done))))))
+          (.catch (fail! done))))))
+
+(deftest merge-fails-closed
+  (async done
+    (-> (diverge)
+        (.then
+         (fn [{:keys [a store-a a1 b1]}]
+           (-> (engine/commit-at! a nil [["other" ":doc/title" "unrelated"]])
+               (.then
+                (fn [stranger]
+                  (js/Promise.all
+                   #js [(problem (engine/merge-at! a [a1 b1] (assoc opts :max-closure 2)))
+                        (problem (engine/merge-at! a [a1 b1] (assoc opts :max-work 3)))
+                        (problem (engine/merge-at! a [a1 stranger] opts))
+                        (problem (engine/merge-at! a [a1 b1] (assoc opts :max-work nil)))
+                        (problem (engine/merge-at! a (vec (for [i (range 17)] (str "bafy" i))) opts))
+                        (problem (engine/merge-at! a [a1 "bafymissing"] opts))])))
+               (.then
+                (fn [[closure work unrelated invalid too-many missing]]
+                  (is (= :closure-too-large closure))
+                  (is (= :work-budget-exceeded work))
+                  (is (= :unrelated-histories unrelated))
+                  (is (= :invalid-option invalid))
+                  (is (= :too-many-parents too-many))
+                  (is (= "Kotobase block is missing" missing))
+                  (is (nil? (get-in @(:state store-a) [:refs "main"])))
+                  (done))))))
+        (.catch (fail! done)))))

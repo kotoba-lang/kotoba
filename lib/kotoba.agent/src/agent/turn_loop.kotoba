@@ -1,0 +1,213 @@
+(ns agent.turn-loop
+  (:export [new-loop step running? exit-code api-call-count budget-used
+            run-exit-code run-api-calls run-budget-used run-budget-remaining main])
+  (:schemas
+   {:agent/loop
+    [:record :agent/loop
+     [[:api-call-count :i64]
+      [:max-iterations :i64]
+      [:budget-used :i64]
+      [:budget-max :i64]
+      ;; grace is 0/1 rather than :bool because a bare :bool PARAMETER is a
+      ;; known interpreter gap (compiler ADR 0219 calls it a gap in the
+      ;; interpreter, not in either backend). Record fields are fine; the
+      ;; encoding is here so `step` never has to take one. Remove the encoding
+      ;; when that gap closes -- nothing else depends on it.
+      [:grace :i64]
+      [:status :keyword]
+      [:exit-reason :keyword]
+      ;; The single inert effect this step emits. The host runs it. Building
+      ;; api_messages, calling the provider and executing tools are mechanism
+      ;; (sockets, SDK, credentials) and stay outside.
+      [:effect :keyword]]]}))
+
+;; The hermes turn loop, as a state machine.
+;;
+;; Transcribed from the upstream that runs this fleet:
+;;   NousResearch/hermes-agent  agent/conversation_loop.py:2074..2115
+;;   NousResearch/hermes-agent  agent/iteration_budget.py  (whole file)
+;;
+;;   while (api_call_count < max_iterations and budget.remaining > 0) or grace:
+;;       if interrupt_requested:            -> interrupted_by_user
+;;       if review_input_budget_exhausted:  -> review_input_budget_exhausted
+;;       api_call_count += 1
+;;       if grace: grace = False
+;;       elif not budget.consume():         -> budget_exhausted
+;;   (condition false)                      -> max_iterations_reached
+;;
+;; Two things the transcription made visible that the prose did not:
+;;
+;; 1. `budget_exhausted` is UNREACHABLE single-threaded. The while condition
+;;    tests `remaining > 0` before the body, so `consume()` cannot fail unless
+;;    another thread took the last iteration in between. The branch is kept
+;;    because the upstream is thread-safe and the branch is real there; no
+;;    golden vector reaches it, and that absence is a fact about the schedule,
+;;    not a missing case.
+;; 2. A grace call passes the while condition AND skips `consume()`, so it
+;;    raises api_call_count past max_iterations while leaving budget_used
+;;    untouched. Measured: max=1 budget=9, tick/grace/tick/tick ends at
+;;    api_call_count=2, budget_used=1, max_iterations_reached.
+;;
+;; Terminal states absorb. The upstream `return`s out of the loop, so events
+;; after an exit are never seen; a machine that kept stepping would disagree
+;; with it on every sequence that has anything after the exit.
+
+(def ev-tick 0)
+(def ev-interrupt 1)
+(def ev-review-budget 2)
+(def ev-refund 3)
+(def ev-grace-grant 4)
+
+(defn new-loop [max-iterations :i64 budget-max :i64] [:ref :agent/loop]
+  (record-new [:ref :agent/loop] 0 max-iterations 0 budget-max 0
+              :running :none :none))
+
+(defn running? [st [:ref :agent/loop]] :bool
+  (if (= (record-get [:ref :agent/loop] st :status) :running) true false))
+
+(defn api-call-count [st [:ref :agent/loop]] :i64
+  (record-get [:ref :agent/loop] st :api-call-count))
+
+(defn budget-used [st [:ref :agent/loop]] :i64
+  (record-get [:ref :agent/loop] st :budget-used))
+
+;; 0 running / 1 max-iterations-reached / 2 budget-exhausted
+;; 3 interrupted-by-user / 4 review-input-budget-exhausted
+(defn exit-code [st [:ref :agent/loop]] :i64
+  (let [r (record-get [:ref :agent/loop] st :exit-reason)]
+    (if (= r :max-iterations-reached) 1
+      (if (= r :budget-exhausted) 2
+        (if (= r :interrupted-by-user) 3
+          (if (= r :review-input-budget-exhausted) 4 0))))))
+
+(defn- exit [st [:ref :agent/loop] reason :keyword] [:ref :agent/loop]
+  (record-new
+   [:ref :agent/loop]
+   (record-get [:ref :agent/loop] st :api-call-count)
+   (record-get [:ref :agent/loop] st :max-iterations)
+   (record-get [:ref :agent/loop] st :budget-used)
+   (record-get [:ref :agent/loop] st :budget-max)
+   (record-get [:ref :agent/loop] st :grace)
+   :exited reason :none))
+
+(defn- with-counts [st [:ref :agent/loop] n :i64 used :i64 grace :i64]
+  [:ref :agent/loop]
+  (record-new
+   [:ref :agent/loop] n
+   (record-get [:ref :agent/loop] st :max-iterations)
+   used
+   (record-get [:ref :agent/loop] st :budget-max)
+   grace :running :none :provider-call))
+
+(defn- admitted? [st [:ref :agent/loop]] :bool
+  (let [n (record-get [:ref :agent/loop] st :api-call-count)
+        mx (record-get [:ref :agent/loop] st :max-iterations)
+        used (record-get [:ref :agent/loop] st :budget-used)
+        bmax (record-get [:ref :agent/loop] st :budget-max)
+        grace (record-get [:ref :agent/loop] st :grace)]
+    (if (or (and (< n mx) (> (- bmax used) 0)) (= grace 1)) true false)))
+
+(defn- tick [st [:ref :agent/loop]] [:ref :agent/loop]
+  (if (admitted? st)
+    (let [n (+ (record-get [:ref :agent/loop] st :api-call-count) 1)
+          used (record-get [:ref :agent/loop] st :budget-used)
+          bmax (record-get [:ref :agent/loop] st :budget-max)
+          grace (record-get [:ref :agent/loop] st :grace)]
+      (if (= grace 1)
+        (with-counts st n used 0)
+        ;; consume(): fails only if another thread took the last iteration
+        (if (>= used bmax)
+          (exit (with-counts st n used grace) :budget-exhausted)
+          (with-counts st n (+ used 1) grace))))
+    (exit st :max-iterations-reached)))
+
+(defn step [st [:ref :agent/loop] event :i64] [:ref :agent/loop]
+  (if (running? st)
+    (if (= event ev-interrupt)
+      (exit st :interrupted-by-user)
+      (if (= event ev-review-budget)
+        (exit st :review-input-budget-exhausted)
+        (if (= event ev-refund)
+          (let [used (record-get [:ref :agent/loop] st :budget-used)]
+            (with-counts st
+              (record-get [:ref :agent/loop] st :api-call-count)
+              (if (> used 0) (- used 1) 0)
+              (record-get [:ref :agent/loop] st :grace)))
+          (if (= event ev-grace-grant)
+            (with-counts st
+              (record-get [:ref :agent/loop] st :api-call-count)
+              (record-get [:ref :agent/loop] st :budget-used)
+              1)
+            (tick st)))))
+    st))
+
+;; ── scalar driver ────────────────────────────────────────────────────────
+;; The whole case crosses the export boundary as scalars plus one string, so
+;; the parity harness compares against the upstream's own numbers without
+;; marshalling a record.
+;;
+;; Events are the digits of `evs` ('0'..'4' = tick/interrupt/review/refund/
+;; grace-grant). They are a string and not four parameters because the ABI
+;; caps a function at five (measured: six is `:kotoba.error/max-parameters`,
+;; "function parameters exceed ABI-supported arity"), and the longest case
+;; needs four events plus max-iterations and budget-max. Base-8 packing was
+;; the first attempt and integer `/` has no admitted lowering, so the digits
+;; are read from the string instead -- which also removes the decode entirely.
+
+(defn- drive [st [:ref :agent/loop] evs :string i :i64 n :i64] [:ref :agent/loop]
+  (if (>= i n)
+    st
+    (drive (step st (- (string-code-point-at evs i) 48)) evs (+ i 1) n)))
+
+(defn- run [mx :i64 bmax :i64 evs :string] [:ref :agent/loop]
+  (drive (new-loop mx bmax) evs 0 (string-byte-length evs)))
+
+(defn run-exit-code [mx :i64 bmax :i64 evs :string] :i64
+  (exit-code (run mx bmax evs)))
+
+(defn run-api-calls [mx :i64 bmax :i64 evs :string] :i64
+  (api-call-count (run mx bmax evs)))
+
+(defn run-budget-used [mx :i64 bmax :i64 evs :string] :i64
+  (budget-used (run mx bmax evs)))
+
+(defn run-budget-remaining [mx :i64 bmax :i64 evs :string] :i64
+  (let [remaining (- bmax (run-budget-used mx bmax evs))]
+    (if (> remaining 0) remaining 0)))
+
+(defn main [] :i64
+  ;; plain-3: three ticks under a roomy budget stay running at n=3
+  (if (= 0 (run-exit-code 5 5 "000"))
+    (if (= 3 (run-api-calls 5 5 "000"))
+      ;; hit-max-iterations: max=2, three ticks -> max_iterations_reached at 2
+      (if (= 1 (run-exit-code 2 9 "000"))
+        (if (= 2 (run-api-calls 2 9 "000"))
+          ;; interrupt-mid: tick, interrupt, tick -> absorbed at n=1
+          (if (= 3 (run-exit-code 5 5 "010"))
+            (if (= 1 (run-api-calls 5 5 "010"))
+              ;; grace-past-max: tick, grace, tick, tick -> n=2, used=1
+              (if (= 2 (run-api-calls 1 9 "0400"))
+                (if (= 1 (run-budget-used 1 9 "0400"))
+                  ;; remaining follows consumption, refunds, grace and exits;
+                  ;; an exhausted or negative budget is clamped to zero.
+                  (if (= 2 (run-budget-remaining 5 5 "000"))
+                    (if (= 5 (run-budget-remaining 5 5 ""))
+                      (if (= 0 (run-budget-remaining 9 2 "000"))
+                        (if (= 0 (run-budget-remaining 5 -1 ""))
+                          (if (= 1 (run-budget-remaining 9 2 "003"))
+                            (if (= 8 (run-budget-remaining 1 9 "0400"))
+                              (if (= 4 (run-budget-remaining 5 5 "0130")) 42 14)
+                              13)
+                            12)
+                          11)
+                        10)
+                      9)
+                    8)
+                  7)
+                6)
+              5)
+            4)
+          3)
+        2)
+      1)
+    0))

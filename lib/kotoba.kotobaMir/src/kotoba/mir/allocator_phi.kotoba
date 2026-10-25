@@ -1,0 +1,121 @@
+;; Reference edge phi lowering, deterministic parallel copies and all-or-none
+;; transport coalescing. No allocator policy is selected in this module.
+(ns kotoba.mir.allocator-phi
+  {:kotoba/export [lower program merge-slots merge-destinations parallel-copies instructions used-temp? coalesce]}
+  (:require [kotoba.gmir.node :as node] [kotoba.mir.table :as table]
+            [kotoba.mir.operands :as operands] [kotoba.mir.allocator-data :as data]
+            [kotoba.mir.flat :as flat])
+  (:schemas
+   {:mir.phi/lowered [:record :mir.phi/lowered [[:program [:ref :gmir.node/value]] [:slots :i64] [:destinations [:ref :mir.table/tree]]]]
+    :mir.phi/copies [:record :mir.phi/copies [[:instructions [:ref :gmir.node/value]] [:used-temp :bool]]]}))
+(defn program [lowered [:ref :mir.phi/lowered]] [:ref :gmir.node/value] (record-get [:ref :mir.phi/lowered] lowered :program))
+(defn merge-slots [lowered [:ref :mir.phi/lowered]] :i64 (arena-scope (record-get [:ref :mir.phi/lowered] lowered :slots)))
+(defn merge-destinations [lowered [:ref :mir.phi/lowered]] [:ref :mir.table/tree] (record-get [:ref :mir.phi/lowered] lowered :destinations))
+(defn instructions [copies [:ref :mir.phi/copies]] [:ref :gmir.node/value] (record-get [:ref :mir.phi/copies] copies :instructions))
+(defn used-temp? [copies [:ref :mir.phi/copies]] :bool (arena-scope (record-get [:ref :mir.phi/copies] copies :used-temp)))
+(defn- ins [op :keyword] [:ref :gmir.node/value] (node/put-key (node/empty-map) :mir/op (node/keyword-literal op)))
+(defn- preceding-label [code [:ref :gmir.node/value] index :i64] [:ref :gmir.node/value]
+  (loop [cursor (- index 1)]
+    (if (< cursor 0) (node/nil-value)
+      (let [value (data/at code cursor)]
+        (cond (data/op? value :mir/label) (node/key value :mir/id) (data/op? value :mir/phi) (recur (- cursor 1)) :else (node/nil-value))))))
+(defn lower [program [:ref :gmir.node/value]] [:ref :mir.phi/lowered]
+  (let [code (node/key program :mir/instructions)
+        phis (loop [index 0 out (node/empty-vector)]
+               (if (>= index (node/child-count code)) out
+                 (recur (+ index 1) (if (data/op? (data/at code index) :mir/phi) (node/append out (node/i64-value index)) out))))
+        slots (loop [index 0 out (table/empty)]
+                (if (>= index (node/child-count phis)) out
+                  (recur (+ index 1) (data/put-number out (operands/key-of (node/key (data/at code (node/number (data/at phis index))) :mir/dst)) index))))
+        destinations (loop [index 0 out (table/empty)]
+                       (if (>= index (node/child-count phis)) out
+                         (recur (+ index 1) (data/put-data out (table/index-key index) (node/key (data/at code (node/number (data/at phis index))) :mir/dst)))))
+        edges (loop [index 0 out (table/empty)]
+                (if (>= index (node/child-count phis)) out
+                  (let [position (node/number (data/at phis index)) value (data/at code position)
+                        join (operands/key-of (preceding-label code position))
+                        slot (data/get-number slots (operands/key-of (node/key value :mir/dst)) -1)
+                        incomings (node/key value :mir/incomings)
+                        next (loop [cursor 0 result out]
+                               (if (>= cursor (node/child-count incomings)) result
+                                 (let [incoming (data/at incomings cursor) predecessor (operands/key-of (node/key incoming :mir/predecessor))
+                                       from (data/members result predecessor) old (data/lookup from join)
+                                       list (if (= (node/kind old) :nil) (node/empty-vector) old)
+                                       store (-> (ins :mir/merge-store) (node/put-key :mir/src (node/key incoming :mir/value)) (node/put-key :mir/slot (node/i64-value slot)))]
+                                   (recur (+ cursor 1) (data/put-members result predecessor (data/put-data from join (node/append list store)))))))]
+                    (recur (+ index 1) next))))
+        lowered (loop [index 0 label (node/nil-value) out (node/empty-vector)]
+                  (if (>= index (node/child-count code)) out
+                    (let [value (data/at code index)]
+                      (cond (data/op? value :mir/label) (recur (+ index 1) (node/key value :mir/id) (node/append out value))
+                            (data/op? value :mir/phi) (recur (+ index 1) label (node/append out
+                              (-> (ins :mir/merge-load) (node/put-key :mir/dst (node/key value :mir/dst))
+                                  (node/put-key :mir/slot (node/i64-value (data/get-number slots (operands/key-of (node/key value :mir/dst)) -1))))))
+                            (data/op? value :mir/jump) (recur (+ index 1) label
+                              (node/append (data/append-all out (data/lookup (data/members edges (operands/key-of label))
+                                (operands/key-of (node/key value :mir/target)))) value))
+                            :else (recur (+ index 1) label (node/append out value))))))]
+    (record-new [:ref :mir.phi/lowered] (node/put-key program :mir/instructions lowered) (node/child-count phis) destinations)))
+(defn parallel-copies [copies [:ref :gmir.node/value] temp-slot :i64] [:ref :mir.phi/copies]
+  (let [initial (loop [index 0 out (node/empty-vector)]
+                  (if (>= index (node/child-count copies)) out
+                    (let [value (data/at copies index)] (recur (+ index 1)
+                      (if (node/same-name? (node/key value :mir/dst) (node/key value :mir/src)) out (node/append out value))))))
+        temp (node/keyword-literal :kotoba.mir/parallel-copy-temp)]
+    (loop [pending initial out (node/empty-vector) used-temp false]
+      (if (= (node/child-count pending) 0) (record-new [:ref :mir.phi/copies] out used-temp)
+        (let [sources (loop [index 0 set (table/empty)]
+                        (if (>= index (node/child-count pending)) set
+                          (recur (+ index 1) (data/include set (operands/key-of (node/key (data/at pending index) :mir/src))))))
+              ready (loop [index 0]
+                      (cond (>= index (node/child-count pending)) -1
+                        (not (data/member? sources (operands/key-of (node/key (data/at pending index) :mir/dst)))) index
+                        :else (recur (+ index 1))))]
+          (if (>= ready 0)
+            (let [value (data/at pending ready) src (node/key value :mir/src) dst (node/key value :mir/dst)
+                  instruction (if (node/same-name? src temp)
+                    (-> (ins :mir/spill-load) (node/put-key :mir/dst dst) (node/put-key :mir/slot (node/i64-value temp-slot)))
+                    (-> (ins :mir/move) (node/put-key :mir/dst dst) (node/put-key :mir/src src)))]
+              (recur (data/append-all (data/slice pending 0 ready) (data/slice pending (+ ready 1) (node/child-count pending)))
+                     (node/append out instruction) used-temp))
+            (let [src (node/key (data/at pending 0) :mir/src)
+                  next (loop [index 0 values (node/empty-vector)]
+                         (if (>= index (node/child-count pending)) values
+                           (let [value (data/at pending index)]
+                             (recur (+ index 1) (node/append values (if (node/same-name? src (node/key value :mir/src)) (node/put-key value :mir/src temp) value))))))]
+              (recur next (node/append out (-> (ins :mir/spill-store) (node/put-key :mir/src src) (node/put-key :mir/slot (node/i64-value temp-slot)))) true))))))))
+(defn- merge-store? [value [:ref :gmir.node/value] slots :i64] :bool
+  (arena-scope (and (data/op? value :mir/spill-store) (< (node/number (node/key value :mir/slot)) slots))))
+(defn- matching [code [:ref :gmir.node/value] op :keyword slot :i64] [:ref :gmir.node/value]
+  (loop [index 0 out (node/empty-vector)]
+    (if (>= index (node/child-count code)) out
+      (let [value (data/at code index)] (recur (+ index 1)
+        (if (and (data/op? value op) (= (node/number (node/key value :mir/slot)) slot)) (node/append out value) out))))))
+(defn coalesce [program [:ref :gmir.node/value] merge-slots :i64] [:result [:ref :gmir.node/value] [:ref :mir/refusal]]
+  (let [code (node/key program :mir/instructions) frame-slots (node/number (node/key program :mir/frame-slots))
+        complete (loop [slot 0]
+                   (cond (>= slot merge-slots) true
+                     (and (= (node/child-count (matching code :mir/spill-load slot)) 1)
+                          (>= (node/child-count (matching code :mir/spill-store slot)) 2)) (recur (+ slot 1)) :else false))]
+    (if (or (= merge-slots 0) (not complete)) (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] program)
+      (loop [index 0 out (node/empty-vector) used-temp false]
+        (if (>= index (node/child-count code))
+          (flat/validate! (-> program (node/put-key :mir/frame-slots (node/i64-value (+ (- frame-slots merge-slots) (if used-temp 1 0)))) (node/put-key :mir/instructions out)))
+          (let [value (data/at code index) slot (node/number (node/key value :mir/slot))]
+            (cond (merge-store? value merge-slots)
+              (let [end (loop [cursor index]
+                          (if (and (< cursor (node/child-count code)) (merge-store? (data/at code cursor) merge-slots)) (recur (+ cursor 1)) cursor))]
+                (if (not (data/op? (data/at code end) :mir/jump))
+                  (result-ok-of [:result [:ref :gmir.node/value] [:ref :mir/refusal]] program)
+                  (let [copies (loop [cursor index values (node/empty-vector)]
+                                 (if (>= cursor end) values
+                                   (let [store (data/at code cursor) source-slot (node/number (node/key store :mir/slot))
+                                         load (data/at (matching code :mir/spill-load source-slot) 0)]
+                                     (recur (+ cursor 1) (node/append values (-> (node/empty-map)
+                                       (node/put-key :mir/dst (node/key load :mir/dst)) (node/put-key :mir/src (node/key store :mir/src))))))))
+                        scheduled (parallel-copies copies (- frame-slots merge-slots))]
+                    (recur end (data/append-all out (instructions scheduled)) (or used-temp (used-temp? scheduled))))))
+              (and (data/op? value :mir/spill-load) (< slot merge-slots)) (recur (+ index 1) out used-temp)
+              (node/has-key? value :mir/slot)
+              (recur (+ index 1) (node/append out (node/put-key value :mir/slot (node/i64-value (- slot (if (< slot merge-slots) slot merge-slots))))) used-temp)
+              :else (recur (+ index 1) (node/append out value) used-temp))))))))

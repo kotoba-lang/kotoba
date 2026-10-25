@@ -1,0 +1,143 @@
+(ns mokuroku.catalog-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mokuroku.catalog :as catalog]
+            [mokuroku.command :as command]
+            [mokuroku.item :as item]
+            [mokuroku.selection :as selection]
+            [mokuroku.source :as source]))
+
+(def descriptor
+  (source/descriptor
+   {:id :test/processes
+    :item-kind :process
+    :label "Processes"
+    :capability "process/list"
+    :commands #{:quit :copy-path}
+    :attributes [(source/attribute :cpu "CPU %" :number)
+                 (source/attribute :user "User" :string)]}))
+
+(defn proc [id label cpu user]
+  (item/item id :process label {:cpu cpu :user user}))
+
+(def first-sample
+  [(proc "101" "kernel_task" 12.5 "root")
+   (proc "202" "WindowServer" 8.0 "root")
+   (proc "303" "nbb" 1.5 "jun")])
+
+(def second-sample
+  ;; 202 exited; 404 appeared.
+  [(proc "101" "kernel_task" 30.0 "root")
+   (proc "303" "nbb" 0.5 "jun")
+   (proc "404" "clojure" 44.0 "jun")])
+
+(defn cat-with [items]
+  (catalog/with-items (catalog/catalog (source/memory-source descriptor items)) items))
+
+(deftest selection-survives-a-refresh-by-id
+  (testing "a selected row that still exists stays selected even when the sort moves it"
+    (let [c (-> (cat-with first-sample)
+                (catalog/sort-by-attribute :cpu)
+                (catalog/select "101")
+                (catalog/toggle "303"))]
+      (is (= #{"101" "303"} (:selection/ids (:catalog/selection c))))
+      (let [refreshed (catalog/with-items c second-sample)]
+        (is (= #{"101" "303"} (:selection/ids (:catalog/selection refreshed)))
+            "both survived, despite 101 moving from cheapest to most expensive")
+        (is (empty? (:selection/dropped (:catalog/selection refreshed)))))))
+
+  (testing "a selected row that vanished is dropped and the drop is reported"
+    (let [c (-> (cat-with first-sample)
+                (catalog/select "202")
+                (catalog/toggle "303"))
+          refreshed (catalog/with-items c second-sample)]
+      (is (= #{"303"} (:selection/ids (:catalog/selection refreshed))))
+      (is (= #{"202"} (:selection/dropped (:catalog/selection refreshed)))
+          "the view must be able to say the process exited, not act on a stale row")
+      (is (= #{"202"} (:problems/dropped-selection (:view/problems (catalog/view refreshed))))))))
+
+(deftest range-extension-follows-the-displayed-order
+  (let [c (-> (cat-with first-sample)
+              (catalog/sort-by-attribute :cpu)   ; 303 (1.5), 202 (8.0), 101 (12.5)
+              (catalog/select "303")
+              (catalog/extend-selection "101"))]
+    (is (= #{"303" "202" "101"} (:selection/ids (:catalog/selection c))))
+    (testing "re-sorting then extending uses the new order, not the old one"
+      (let [c2 (-> (cat-with first-sample)
+                   (catalog/sort-by-attribute :cpu)
+                   (catalog/sort-by-attribute :cpu)  ; flip to :desc -> 101, 202, 303
+                   (catalog/select "101")
+                   (catalog/extend-selection "202"))]
+        (is (= #{"101" "202"} (:selection/ids (:catalog/selection c2))))))))
+
+(deftest clicking-a-column-twice-flips-direction
+  (let [c (catalog/sort-by-attribute (cat-with first-sample) :cpu)]
+    (is (= [[:cpu :asc]] (:query/sort (:catalog/query c))))
+    (is (= [[:cpu :desc]] (:query/sort (:catalog/query (catalog/sort-by-attribute c :cpu)))))
+    (is (= [[:user :asc]] (:query/sort (:catalog/query (catalog/sort-by-attribute c :user))))
+        "a different column starts ascending again")))
+
+(deftest commands-are-proposals-bounded-by-the-source
+  (let [c (catalog/select (cat-with first-sample) "202")]
+    (testing "only commands the source declared are offered"
+      (is (= #{:copy-path :quit}
+             (set (map :command/id (:view/commands (catalog/view c)))))))
+
+    (testing "a proposal is a value, and a destructive one demands confirmation"
+      (let [p (catalog/propose c :quit)]
+        (is (= :process/signal (:proposal/effect p)))
+        (is (= ["202"] (:proposal/targets p)))
+        (is (= "process/list" (:proposal/capability p)))
+        (is (true? (:proposal/requires-confirmation? p)))))
+
+    (testing "a command the source never accepted is refused, not silently dropped"
+      (is (= :source-does-not-accept (:proposal/refused (catalog/propose c :trash)))))
+
+    (testing "a single-arity command against a multi-selection is refused"
+      ;; Source acceptance is checked before arity, so this needs a source that
+      ;; does accept :reveal — otherwise the refusal proves the wrong thing.
+      (let [accepts-reveal (assoc descriptor :source/commands #{:reveal})
+            multi (catalog/select-all c)]
+        (is (= :wrong-arity (:proposal/refused
+                             (command/propose accepts-reveal :reveal
+                                              (mapv :item/id (catalog/selected-items multi))))))
+        (is (not (command/refused?
+                  (command/propose accepts-reveal :reveal ["202"])))
+            "one target is fine")))))
+
+(deftest inspector-modes
+  (let [c (cat-with first-sample)]
+    (testing "nothing selected describes the source"
+      (let [i (:view/inspector (catalog/view c))]
+        (is (= :empty (:inspector/mode i)))
+        (is (= "Processes" (:inspector/title i)))))
+
+    (testing "one selected shows its attributes"
+      (let [i (:view/inspector (catalog/view (catalog/select c "303")))]
+        (is (= :single (:inspector/mode i)))
+        (is (= "nbb" (:inspector/title i)))
+        (is (= 1.5 (:field/value (first (filter #(= :cpu (:field/key %))
+                                                (:inspector/fields i))))))))
+
+    (testing "many selected show only what they agree on, plus a total"
+      (let [i (:view/inspector (catalog/view (catalog/select-all c)))
+            fields (into {} (map (juxt :field/key :field/value)) (:inspector/fields i))]
+        (is (= :multi (:inspector/mode i)))
+        (is (= 3 (get fields :count)))
+        (is (= 22.0 (get fields [:sum :cpu])))
+        (is (not (contains? fields :user))
+            "root and jun disagree, so User must not be shown as if it were shared")))))
+
+(deftest a-malformed-source-row-does-not-blank-the-window
+  (let [bad (conj first-sample {:item/id "505" :item/kind "process" :item/label 7})
+        c (catalog/refresh (catalog/catalog (source/memory-source descriptor bad)))
+        v (catalog/view c)]
+    (is (= 4 (count (:result/items (:view/result v)))) "the good rows still render")
+    (is (= #{:item/kind-not-keyword :item/label-not-string}
+           (set (map :item/problem (:problems/items (:view/problems v)))))
+        "and the bad row is reported rather than swallowed")))
+
+(deftest empty-selection-helpers
+  (is (= selection/empty-selection
+         (:catalog/selection (catalog/clear-selection
+                              (catalog/select (cat-with first-sample) "101")))))
+  (is (zero? (selection/count-selected selection/empty-selection))))

@@ -1,0 +1,694 @@
+(ns kotoba.canonical-abi-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
+            [kotoba.wasm.canonical-abi :as canonical]
+            [kotoba.kir.value :as value]))
+
+(deftest scalar-and-bounded-string-layouts-are-closed
+  (is (= {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}
+         (canonical/layout :i64)))
+  (is (= {:descriptor :string :size 8 :alignment 4 :flat [:i32 :i32]
+          :encoding :utf8 :max-bytes 65536
+          :validation [:checked-pointer-range :valid-utf8]}
+         (canonical/layout :string)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no qualified Canonical ABI layout"
+                        (canonical/layout [:vector :i64]))))
+
+(deftest string-export-uses-standard32-indirect-result
+  (is (= {:profile :component-model/standard32-v1
+          :function 'echo
+          :parameters [{:name 'value
+                        :layout {:descriptor :string :size 8 :alignment 4
+                                 :flat [:i32 :i32] :encoding :utf8
+                                 :max-bytes 65536
+                                 :validation [:checked-pointer-range :valid-utf8]}}]
+          :core-params [:i32 :i32]
+          :result-layout {:descriptor :string :size 8 :alignment 4
+                          :flat [:i32 :i32] :encoding :utf8 :max-bytes 65536
+                          :validation [:checked-pointer-range :valid-utf8]}
+          :indirect-result? true
+          :core-results [:i32]
+          :post-return-params [:i32]}
+         (canonical/export-plan
+          {:name 'echo :params ['value] :param-types [:string] :result :string}))))
+
+(deftest bounded-keyword-layout-is-closed
+  (is (= {:descriptor :keyword :size 8 :alignment 4 :flat [:i32 :i32]
+          :encoding :utf8 :max-bytes 512
+          :validation [:checked-pointer-range :valid-utf8]}
+         (canonical/layout :keyword))))
+
+(deftest string-and-keyword-record-fields-flatten-to-pointer-length-leaves
+  (let [descriptor [:ref :demo/state-entry]
+        schemas {:demo/state-entry
+                 [:record :demo/state-entry
+                  [[:key :keyword] [:value :string] [:version :i64]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= 24 (:size value)))
+    (is (= 8 (:alignment value)))
+    (is (= [:i32 :i32 :i32 :i32 :i64] (:flat value)))
+    (is (= [0 8 16] (mapv :offset (:fields value))))
+    (is (= [{:offset 0 :descriptor :keyword :max-bytes 512}
+            {:offset 8 :descriptor :string :max-bytes 65536}
+            {:offset 16 :descriptor :i64}]
+           (canonical/layout-leaves value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))
+    (is (= [:i32 :i32 :i32 :i32 :i64]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest named-scalar-record-layout-preserves-identity-offsets-and-flattening
+  (let [descriptor [:ref :demo/point]
+        schemas {:demo/point
+                 [:record :demo/point [[:x :i64] [:weight :f64] [:visible :bool]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= 24 (:size value)))
+    (is (= 8 (:alignment value)))
+    (is (= [:i64 :f64 :i32] (:flat value)))
+    (is (= [0 8 16] (mapv :offset (:fields value))))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"matching schema identity"
+                          (canonical/layout descriptor
+                                            {:demo/point [:record :demo/other [[:x :i64]]]})))))
+
+(deftest one-level-nested-record-layout-flattens-recursively-with-absolute-offsets
+  (let [descriptor [:ref :demo/outer]
+        schemas {:demo/inner [:record :demo/inner [[:code :i64] [:ratio :f64]]]
+                 :demo/outer [:record :demo/outer
+                              [[:id :i64] [:inner [:ref :demo/inner]] [:active :bool]]]}
+        outer-layout (canonical/layout descriptor schemas)
+        inner-layout (canonical/layout [:ref :demo/inner] schemas)]
+    (is (= 32 (:size outer-layout)))
+    (is (= 8 (:alignment outer-layout)))
+    (is (= [:i64 :i64 :f64 :i32] (:flat outer-layout)))
+    (is (= [0 8 24] (mapv :offset (:fields outer-layout))))
+    (is (= inner-layout (get-in outer-layout [:fields 1 :layout])))
+    (is (= [{:offset 0 :descriptor :i64}
+            {:offset 8 :descriptor :i64}
+            {:offset 16 :descriptor :f64}
+            {:offset 24 :descriptor :bool}]
+           (canonical/layout-leaves outer-layout)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))
+    (is (= [:i64 :i64 :f64 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"recursive schema has no bounded"
+                          (canonical/layout [:ref :demo/self]
+                                            {:demo/self [:record :demo/self
+                                                         [[:child [:ref :demo/self]]]]})))))
+
+(deftest variant-with-record-and-scalar-cases-flattens-with-joined-core-types
+  (let [descriptor [:ref :demo/outcome]
+        schemas {:demo/entry [:record :demo/entry
+                              [[:code :i64] [:ratio :f64] [:present :bool]]]
+                 :demo/short [:record :demo/short [[:code :i64] [:flag :bool]]]
+                 :demo/outcome [:variant :demo/outcome
+                                [[:found [:ref :demo/entry]]
+                                 [:missing :bool]
+                                 [:failed :f32]
+                                 [:short [:ref :demo/short]]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= :variant (:kind value)))
+    (is (= 1 (:discriminant-size value)))
+    (is (= 8 (:payload-offset value)))
+    (is (= 8 (:alignment value)))
+    (is (= 32 (:size value)))
+    (is (= [:found :missing :failed :short] (mapv :tag (:cases value))))
+    ;; Position 0 is dominated by :found's and :short's i64 leading field;
+    ;; position 1, touched only by :found's f64 field until :short's trailing
+    ;; bool field also reaches it, is forced from f64 to i64 by that mixed
+    ;; join; position 2 is touched only by :found's own bool field, so it
+    ;; stays i32 with no other case to force a join at all.
+    (is (= [:i32 :i64 :i64 :i32] (:flat value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))
+    (is (= [:i32 :i64 :i64 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest variant-with-only-bool-and-f32-cases-joins-to-i32
+  (let [descriptor [:ref :demo/flag-or-ratio]
+        schemas {:demo/flag-or-ratio [:variant :demo/flag-or-ratio
+                                      [[:urgent :bool] [:weight :f32]]]}
+        value (canonical/layout descriptor schemas)]
+    ;; Neither case ever touches i64/f64, so the Component Model spec's
+    ;; special-cased i32/f32 join keeps the shared payload position at i32
+    ;; instead of widening to i64 -- the only join outcome besides "both
+    ;; sides already agree" and "widen to i64".
+    (is (= [:i32 :i32] (:flat value)))
+    (is (= 1 (:discriminant-size value)))
+    ;; Payload area is aligned/sized to the wider case (f32, 4 bytes), so
+    ;; the 1-byte discriminant is padded up to offset 4 before it.
+    (is (= 4 (:payload-offset value)))
+    (is (= 8 (:size value)))
+    (is (= 4 (:alignment value)))))
+
+(deftest variant-with-string-keyword-record-case-flattens-payload-fields-generically
+  ;; `layout*`/`variant-layout`/`variant-flatten-payload` needed no code
+  ;; changes for ADR 0054: a case's own `layout*` call already resolves a
+  ;; record-with-string/keyword-fields payload the same way a top-level
+  ;; string-field record already does (ADR 0053), so its own `:flat`
+  ;; already carries the correct `[:i32 :i32]` pointer+length pair per
+  ;; string-like field before this test is even written -- this test exists
+  ;; to make that generic behavior explicit and pinned, not to exercise new
+  ;; canonical-abi.cljc logic. `demo/entry` mirrors `state-v1`'s own `entry`
+  ;; shape exactly (`key: keyword, value: string, version: i64`).
+  (let [descriptor [:ref :demo/state-result]
+        schemas {:demo/entry [:record :demo/entry
+                              [[:key :keyword] [:value :string] [:version :i64]]]
+                 :demo/state-result [:variant :demo/state-result
+                                     [[:found [:ref :demo/entry]] [:missing :bool]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= :variant (:kind value)))
+    (is (= [:found :missing] (mapv :tag (:cases value))))
+    ;; found's own flat is [i32 i32 i32 i32 i64] (key ptr/len, value
+    ;; ptr/len, version); missing's own flat is [i32] and only ever touches
+    ;; position 0, joining i32/i32 -> i32 there and leaving positions 1-4
+    ;; exactly as found's own record layout already produced them. The
+    ;; leading discriminant i32 is prepended on top of this joined sequence.
+    (is (= [:i32 :i32 :i32 :i32 :i32 :i64] (:flat value)))
+    (is (= 1 (:discriminant-size value)))
+    (is (= 8 (:payload-offset value)))
+    (is (= 8 (:alignment value)))
+    (is (= 32 (:size value)))
+    (is (= [{:offset 0 :descriptor :keyword :max-bytes 512}
+            {:offset 8 :descriptor :string :max-bytes 65536}
+            {:offset 16 :descriptor :i64}]
+           (canonical/layout-leaves (:layout (first (:cases value))))))
+    (is (= [:i32 :i32 :i32 :i32 :i32 :i64]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest variant-reference-requires-matching-sealed-schema-identity
+  (is (thrown-with-msg? kerror/ExceptionInfo #"variant reference has no matching schema identity"
+                        (canonical/layout [:ref :demo/outcome]
+                                          {:demo/outcome [:variant :demo/other
+                                                          [[:a :bool]]]}))))
+
+(deftest variant-schema-recursion-through-a-case-payload-is-rejected
+  (is (thrown-with-msg? kerror/ExceptionInfo #"recursive schema has no bounded"
+                        (canonical/layout [:ref :demo/self]
+                                          {:demo/self [:variant :demo/self
+                                                       [[:child [:ref :demo/self]]]]}))))
+
+(deftest list-of-scalar-layout-is-a-bounded-pointer-length-leaf
+  (let [descriptor [:list :i64]
+        value (canonical/layout descriptor)]
+    (is (= descriptor (:descriptor value)))
+    (is (= 8 (:size value)))
+    (is (= 4 (:alignment value)))
+    (is (= [:i32 :i32] (:flat value)))
+    (is (= {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}
+           (:item-layout value)))
+    (is (= value/canonical-list-item-limit (:max-items value)))
+    (is (= value/canonical-list-total-item-limit (:max-total-items value)))
+    (is (= [:checked-pointer-range :bounded-item-count
+            :bounded-total-item-count]
+           (:validation value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))
+    (is (= [:i32 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))))
+
+(deftest empty-list-descriptor-shares-the-same-closed-layout-as-any-other-list
+  ;; The Canonical ABI list layout is a type-level plan (pointer+length pair
+  ;; plus item stride/bound), independent of how many items an actual
+  ;; instance carries at runtime -- an empty list and a full list share
+  ;; exactly the same layout, unlike a sealed record/variant's per-field
+  ;; shape. This test pins that a `:list` layout never varies by instance
+  ;; size, since this namespace has no notion of "instance" at all.
+  (is (= (canonical/layout [:list :bool]) (canonical/layout [:list :bool]))))
+
+(deftest list-of-nested-sealed-record-layout-carries-the-item-record-layout
+  (let [item-descriptor [:ref :demo/point]
+        schemas {:demo/point [:record :demo/point [[:x :i64] [:weight :f64] [:visible :bool]]]}
+        descriptor [:list item-descriptor]
+        value (canonical/layout descriptor schemas)
+        record-value (canonical/layout item-descriptor schemas)]
+    (is (= 8 (:size value)))
+    (is (= 4 (:alignment value)))
+    (is (= [:i32 :i32] (:flat value)))
+    (is (= record-value (:item-layout value)))
+    (is (= value/canonical-list-item-limit (:max-items value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))
+    (is (= [:i32 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest list-field-inside-a-record-is-exposed-as-its-own-pointer-length-leaf
+  (let [descriptor [:ref :demo/basket]
+        schemas {:demo/basket [:record :demo/basket
+                               [[:id :i64] [:items [:list :i64]] [:closed :bool]]]}
+        outer-layout (canonical/layout descriptor schemas)]
+    (is (= 24 (:size outer-layout)))
+    (is (= 8 (:alignment outer-layout)))
+    (is (= [:i64 :i32 :i32 :i32] (:flat outer-layout)))
+    (is (= [0 8 16] (mapv :offset (:fields outer-layout))))
+    (is (= [{:offset 0 :descriptor :i64}
+            {:offset 8 :descriptor [:list :i64]
+             :max-items value/canonical-list-item-limit
+             :max-total-items value/canonical-list-total-item-limit
+             :item-layout {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}}
+            {:offset 16 :descriptor :bool}]
+           (canonical/layout-leaves outer-layout)))))
+
+(deftest list-inside-a-variant-case-joins-with-the-other-cases-flat-core-types
+  (let [descriptor [:ref :demo/entries]
+        schemas {:demo/entries [:variant :demo/entries
+                                [[:present [:list :i64]] [:absent :bool]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= :variant (:kind value)))
+    (is (= [:present :absent] (mapv :tag (:cases value))))
+    ;; :present's own flat is [i32 i32] (list pointer+length); :absent's own
+    ;; flat is [i32] and only touches position 0, joining i32/i32 -> i32
+    ;; there and leaving position 1 exactly as :present's own list layout
+    ;; already produced it. The leading discriminant i32 is prepended.
+    (is (= [:i32 :i32 :i32] (:flat value)))
+    (is (= [:i32 :i32 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest nested-lists-retain-recursive-layout-and-one-total-item-budget
+  (let [layout (canonical/layout [:list [:list :i64]])]
+    (is (= [:list [:list :i64]] (:descriptor layout)))
+    (is (= [:list :i64] (get-in layout [:item-layout :descriptor])))
+    (is (= :i64 (get-in layout [:item-layout :item-layout :descriptor])))
+    (is (= value/canonical-list-item-limit (:max-items layout)))
+    (is (= value/canonical-list-total-item-limit (:max-total-items layout)))
+    (is (= value/canonical-list-total-item-limit
+           (get-in layout [:item-layout :max-total-items])))))
+
+(deftest list-item-type-must-be-a-qualified-canonical-abi-descriptor
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no qualified Canonical ABI layout"
+                        (canonical/layout [:list :not-a-real-descriptor]))))
+
+(deftest list-item-type-recursive-schema-through-the-list-is-still-rejected
+  ;; A list does not itself carry a sealed identity (it is structural, not
+  ;; nominal), so it cannot be self-referential the way a record/variant is
+  ;; -- but a list's item type reaching back to an *enclosing* record's own
+  ;; identity is still a genuinely unbounded recursive schema, and is still
+  ;; caught by `record-layout`'s existing `visited` guard, since `visited`
+  ;; is threaded through `list-layout` unchanged.
+  (is (thrown-with-msg? kerror/ExceptionInfo #"recursive schema has no bounded"
+                        (canonical/layout [:ref :demo/wrapper]
+                                          {:demo/wrapper
+                                           [:record :demo/wrapper
+                                            [[:items [:list [:ref :demo/wrapper]]]]]}))))
+
+(deftest option-of-scalar-layout-is-a-two-case-union-with-a-payload-less-none-case
+  (let [descriptor [:option :i64]
+        value (canonical/layout descriptor)]
+    (is (= descriptor (:descriptor value)))
+    (is (= :option (:kind value)))
+    (is (= {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]} (:item-layout value)))
+    ;; discriminant (1 byte, 2 cases) padded up to the payload's own 8-byte
+    ;; alignment before the payload area starts, exactly the same
+    ;; `align-up`/`discriminant-byte-size` math `variant-layout` already
+    ;; uses for a sealed variant's own union area.
+    (is (= 1 (:discriminant-size value)))
+    (is (= 8 (:payload-offset value)))
+    (is (= 8 (:alignment value)))
+    (is (= 16 (:size value)))
+    ;; none's own flat is [] (unit, no core values) and only ever touches no
+    ;; position at all; some's own flat is [:i64] and is appended past the
+    ;; fold's current (empty) length untouched -- the leading discriminant
+    ;; i32 is prepended on top.
+    (is (= [:i32 :i64] (:flat value)))
+    (is (= [:bounded-discriminant] (:validation value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))
+    (is (= [:i32 :i64]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))))
+
+(deftest option-descriptor-arity-is-checked
+  (is (thrown-with-msg? kerror/ExceptionInfo
+                        #"option descriptor must be exactly \[:option item-descriptor\]"
+                        (canonical/layout [:option]))))
+
+(deftest option-of-nested-sealed-record-layout-carries-the-item-record-layout
+  (let [item-descriptor [:ref :demo/point]
+        schemas {:demo/point [:record :demo/point [[:x :i64] [:weight :f64] [:visible :bool]]]}
+        descriptor [:option item-descriptor]
+        value (canonical/layout descriptor schemas)
+        record-value (canonical/layout item-descriptor schemas)]
+    (is (= record-value (:item-layout value)))
+    (is (= 1 (:discriminant-size value)))
+    (is (= 8 (:payload-offset value)))
+    (is (= 8 (:alignment value)))
+    (is (= 32 (:size value)))
+    (is (= [:i32 :i64 :f64 :i32] (:flat value)))))
+
+(deftest result-of-scalar-and-bool-layout-is-a-two-case-union
+  (let [descriptor [:result :i64 :bool]
+        value (canonical/layout descriptor)]
+    (is (= descriptor (:descriptor value)))
+    (is (= :result (:kind value)))
+    (is (= {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]} (:ok-layout value)))
+    (is (= {:descriptor :bool :size 1 :alignment 1 :flat [:i32] :validation [:canonical-bool]}
+           (:err-layout value)))
+    (is (= 1 (:discriminant-size value)))
+    (is (= 8 (:payload-offset value)))
+    (is (= 8 (:alignment value)))
+    (is (= 16 (:size value)))
+    ;; ok's own flat [:i64] is appended past the fold's empty start; err's
+    ;; own flat [:i32] joins against that first (and only) position, widening
+    ;; i32 against i64 to i64 -- the same `join-core-type` "anything but an
+    ;; i32/f32 mismatch widens to i64" rule `variant-flatten-payload` already
+    ;; applies to any pair of case shapes.
+    (is (= [:i32 :i64] (:flat value)))
+    (is (= [:bounded-discriminant] (:validation value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))))
+
+(deftest result-with-only-bool-and-f32-cases-joins-to-i32
+  ;; Mirrors `variant-with-only-bool-and-f32-cases-joins-to-i32`: neither
+  ;; case ever touches i64/f64, so the Component Model spec's special-cased
+  ;; i32/f32 join keeps the shared payload position at i32 instead of
+  ;; widening to i64.
+  (let [descriptor [:result :bool :f32]
+        value (canonical/layout descriptor)]
+    (is (= [:i32 :i32] (:flat value)))
+    (is (= 1 (:discriminant-size value)))
+    (is (= 4 (:payload-offset value)))
+    (is (= 8 (:size value)))
+    (is (= 4 (:alignment value)))))
+
+(deftest result-descriptor-arity-is-checked
+  (is (thrown-with-msg? kerror/ExceptionInfo
+                        #"result descriptor must be exactly \[:result ok-descriptor err-descriptor\]"
+                        (canonical/layout [:result :i64])))
+  (is (thrown-with-msg? kerror/ExceptionInfo
+                        #"result descriptor must be exactly \[:result ok-descriptor err-descriptor\]"
+                        (canonical/layout [:result :i64 :bool :string]))))
+
+(deftest result-of-nested-sealed-record-and-scalar-carries-both-payload-layouts
+  (let [ok-descriptor [:ref :demo/point]
+        schemas {:demo/point [:record :demo/point [[:x :i64] [:weight :f64] [:visible :bool]]]}
+        descriptor [:result ok-descriptor :bool]
+        value (canonical/layout descriptor schemas)
+        record-value (canonical/layout ok-descriptor schemas)]
+    (is (= record-value (:ok-layout value)))
+    (is (= {:descriptor :bool :size 1 :alignment 1 :flat [:i32] :validation [:canonical-bool]}
+           (:err-layout value)))))
+
+(deftest option-inside-a-variant-case-joins-with-the-other-cases-flat-core-types
+  (let [descriptor [:ref :demo/lookup]
+        schemas {:demo/lookup [:variant :demo/lookup
+                                [[:present [:option :i64]] [:absent :bool]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= :variant (:kind value)))
+    (is (= [:present :absent] (mapv :tag (:cases value))))
+    ;; :present's own flat is [:i32 :i64] (option discriminant, payload);
+    ;; :absent's own flat is [:i32] and only touches position 0, joining
+    ;; i32/i32 -> i32 there and leaving position 1 exactly as :present's own
+    ;; option layout already produced it -- `variant-flatten-payload` needed
+    ;; zero changes for a case whose own payload is `[:option ...]`, exactly
+    ;; as ADR 0065 already showed for `[:list ...]`.
+    (is (= [:i32 :i32 :i64] (:flat value)))
+    (is (= [:i32 :i32 :i64]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest result-inside-a-variant-case-joins-with-the-other-cases-flat-core-types
+  (let [descriptor [:ref :demo/attempt]
+        schemas {:demo/attempt [:variant :demo/attempt
+                                 [[:tried [:result :i64 :bool]] [:skipped :bool]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= :variant (:kind value)))
+    (is (= [:tried :skipped] (mapv :tag (:cases value))))
+    (is (= [:i32 :i32 :i64] (:flat value)))))
+
+(deftest list-of-option-and-option-of-list-both-work
+  ;; Neither `list-layout` nor `option-layout` restricts what the other may
+  ;; nest as an item type -- only list-of-list is explicitly rejected (see
+  ;; `list-item-type-must-not-itself-be-a-list`), because a second
+  ;; independent variable length/stride nested inside the first is a
+  ;; genuinely harder shape. An option (a single fixed-size union payload
+  ;; area) nested inside a list's per-item stride, or a list (a
+  ;; pointer+length pair) nested inside an option's payload area, are both
+  ;; already-admitted recursive shapes with no such problem.
+  (is (= {:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}
+         (get-in (canonical/layout [:list [:option :i64]]) [:item-layout :item-layout])))
+  (is (= [:list :i64] (get-in (canonical/layout [:option [:list :i64]]) [:item-layout :descriptor])))
+  (is (= value/canonical-list-item-limit
+         (get-in (canonical/layout [:option [:list :i64]]) [:item-layout :max-items]))))
+
+(deftest option-of-option-and-result-of-result-are-not-rejected
+  ;; Unlike list-of-list, nesting a union inside another union's payload area
+  ;; is not a genuinely harder shape (both are still a single fixed-size
+  ;; payload area, the same recursive shape a variant case whose own payload
+  ;; is another variant already has) -- so no analogous rejection applies to
+  ;; `option`/`result`.
+  (is (= :option (get-in (canonical/layout [:option [:option :i64]]) [:item-layout :kind])))
+  (is (= :result (get-in (canonical/layout [:result [:result :i64 :bool] :bool]) [:ok-layout :kind]))))
+
+(deftest option-item-type-must-be-a-qualified-canonical-abi-descriptor
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no qualified Canonical ABI layout"
+                        (canonical/layout [:option :not-a-real-descriptor]))))
+
+(deftest result-payload-types-must-be-qualified-canonical-abi-descriptors
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no qualified Canonical ABI layout"
+                        (canonical/layout [:result :not-a-real-descriptor :bool])))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no qualified Canonical ABI layout"
+                        (canonical/layout [:result :bool :not-a-real-descriptor]))))
+
+(deftest option-item-type-recursive-schema-through-the-option-is-still-rejected
+  (is (thrown-with-msg? kerror/ExceptionInfo #"recursive schema has no bounded"
+                        (canonical/layout [:ref :demo/maybe-wrapper]
+                                          {:demo/maybe-wrapper
+                                           [:record :demo/maybe-wrapper
+                                            [[:maybe [:option [:ref :demo/maybe-wrapper]]]]]}))))
+
+(deftest result-payload-type-recursive-schema-through-the-result-is-still-rejected
+  (is (thrown-with-msg? kerror/ExceptionInfo #"recursive schema has no bounded"
+                        (canonical/layout [:ref :demo/attempt-wrapper]
+                                          {:demo/attempt-wrapper
+                                           [:record :demo/attempt-wrapper
+                                            [[:attempt [:result [:ref :demo/attempt-wrapper] :bool]]]]}))))
+
+(deftest tuple-of-one-scalar-layout-is-not-rejected-and-is-a-single-flat-value
+  ;; This slice requires at least one item type (see
+  ;; `tuple-descriptor-must-have-at-least-one-item-type`), but does not
+  ;; require two -- a 1-tuple is a degenerate but legal fixed-length product,
+  ;; the same way a sealed record is allowed exactly one field.
+  (let [descriptor [:tuple :i64]
+        value (canonical/layout descriptor)]
+    (is (= descriptor (:descriptor value)))
+    (is (= :tuple (:kind value)))
+    (is (= 8 (:size value)))
+    (is (= 8 (:alignment value)))
+    (is (= [:i64] (:flat value)))
+    (is (= [{:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}] (:item-layouts value)))
+    (is (= [:i64]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))))
+
+(deftest tuple-of-two-differently-typed-scalars-layout-is-a-fixed-offset-product
+  (let [descriptor [:tuple :i64 :bool]
+        value (canonical/layout descriptor)]
+    (is (= descriptor (:descriptor value)))
+    (is (= :tuple (:kind value)))
+    (is (= [{:descriptor :i64 :size 8 :alignment 8 :flat [:i64]}
+            {:descriptor :bool :size 1 :alignment 1 :flat [:i32]
+             :validation [:canonical-bool]}]
+           (:item-layouts value)))
+    ;; element 0 (:i64, size 8 alignment 8) sits at offset 0; element 1
+    ;; (:bool, size 1 alignment 1) needs no padding after an 8-byte-aligned
+    ;; predecessor, so it sits immediately at offset 8; the whole product is
+    ;; then padded up to its own widest element's alignment (8).
+    (is (= [0 8] (mapv :offset (:fields value))))
+    (is (= 16 (:size value)))
+    (is (= 8 (:alignment value)))
+    (is (= [:i64 :i32] (:flat value)))
+    (is (= [:i32]
+           (:core-results
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))
+    (is (= [:i64 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}))))))
+
+(deftest tuple-descriptor-must-have-at-least-one-item-type
+  (is (thrown-with-msg? kerror/ExceptionInfo
+                        #"tuple descriptor must have at least one item type"
+                        (canonical/layout [:tuple]))))
+
+(deftest tuple-item-count-exceeding-the-bound-is-rejected
+  (let [item-descriptors (repeat (inc value/canonical-tuple-item-limit) :i64)]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"tuple item count exceeds bound"
+                          (canonical/layout (into [:tuple] item-descriptors)))))
+  ;; The bound itself is admitted (not off-by-one rejected).
+  (let [item-descriptors (repeat value/canonical-tuple-item-limit :i64)]
+    (is (= value/canonical-tuple-item-limit
+           (count (:item-layouts (canonical/layout (into [:tuple] item-descriptors))))))))
+
+(deftest tuple-of-nested-sealed-record-and-scalar-carries-both-item-layouts
+  (let [item-descriptor [:ref :demo/point]
+        schemas {:demo/point [:record :demo/point [[:x :i64] [:weight :f64] [:visible :bool]]]}
+        descriptor [:tuple item-descriptor :bool]
+        value (canonical/layout descriptor schemas)
+        record-value (canonical/layout item-descriptor schemas)]
+    (is (= record-value (first (:item-layouts value))))
+    (is (= {:descriptor :bool :size 1 :alignment 1 :flat [:i32] :validation [:canonical-bool]}
+           (second (:item-layouts value))))
+    (is (= [0 24] (mapv :offset (:fields value))))
+    (is (= 32 (:size value)))
+    (is (= 8 (:alignment value)))))
+
+(deftest tuple-field-inside-a-record-is-recursed-into-by-the-shared-fields-clause
+  ;; A tuple's own layout reuses the key name `:fields` precisely so
+  ;; `layout-leaves`'s pre-existing nested-record recursion clause,
+  ;; `(contains? layout :fields)`, recurses into it with zero code changes --
+  ;; this test pins that a tuple-typed record field flattens all the way down
+  ;; to per-element leaves, not a single opaque leaf the way a bounded
+  ;; `list`/`option`/`result` field does.
+  (let [descriptor [:ref :demo/wrapped-tuple]
+        schemas {:demo/wrapped-tuple
+                 [:record :demo/wrapped-tuple
+                  [[:id :i64] [:pair [:tuple :i64 :bool]] [:closed :bool]]]}
+        outer-layout (canonical/layout descriptor schemas)]
+    (is (= 32 (:size outer-layout)))
+    (is (= 8 (:alignment outer-layout)))
+    (is (= [:i64 :i64 :i32 :i32] (:flat outer-layout)))
+    (is (= [0 8 24] (mapv :offset (:fields outer-layout))))
+    (is (= [{:offset 0 :descriptor :i64}
+            {:offset 8 :descriptor :i64}
+            {:offset 16 :descriptor :bool}
+            {:offset 24 :descriptor :bool}]
+           (canonical/layout-leaves outer-layout)))))
+
+(deftest tuple-inside-a-variant-case-joins-with-the-other-cases-flat-core-types
+  (let [descriptor [:ref :demo/pair-or-flag]
+        schemas {:demo/pair-or-flag [:variant :demo/pair-or-flag
+                                      [[:pair [:tuple :i64 :bool]] [:flag :bool]]]}
+        value (canonical/layout descriptor schemas)]
+    (is (= :variant (:kind value)))
+    (is (= [:pair :flag] (mapv :tag (:cases value))))
+    ;; :pair's own flat is [:i64 :i32] (the tuple's own product flat);
+    ;; :flag's own flat is [:i32] and only touches position 0, joining
+    ;; i32/i64 -> i64 there (widening, since neither side is the special-cased
+    ;; i32/f32 pair) and leaving position 1 exactly as :pair's own tuple
+    ;; layout already produced it. The leading discriminant i32 is prepended.
+    (is (= [:i32 :i64 :i32] (:flat value)))
+    (is (= [:i32 :i64 :i32]
+           (:core-params
+            (canonical/export-plan
+             {:name 'echo :params ['value] :param-types [descriptor] :result descriptor}
+             schemas))))))
+
+(deftest tuple-of-tuple-is-not-rejected
+  ;; Contrast ADR 0065's deliberate list-of-list rejection: nesting a tuple
+  ;; inside another tuple's own element position is not a genuinely harder
+  ;; shape (both sides are still a single fixed-size, fixed-offset product
+  ;; with no independent runtime-variable length/stride of its own), so no
+  ;; analogous rejection applies -- the same reasoning ADR 0068 already gave
+  ;; for not rejecting option-of-option/result-of-result.
+  (is (= :tuple (get-in (canonical/layout [:tuple [:tuple :i64 :bool] :f32])
+                        [:item-layouts 0 :kind]))))
+
+(deftest tuple-item-type-must-be-a-qualified-canonical-abi-descriptor
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no qualified Canonical ABI layout"
+                        (canonical/layout [:tuple :not-a-real-descriptor]))))
+
+(deftest tuple-item-type-recursive-schema-through-the-tuple-is-still-rejected
+  ;; A tuple does not itself carry a sealed identity (it is structural, not
+  ;; nominal), so it cannot be self-referential the way a record/variant is
+  ;; -- but an item type reaching back to an *enclosing* record's own
+  ;; identity is still a genuinely unbounded recursive schema, and is still
+  ;; caught by `record-layout`'s existing `visited` guard, since `visited` is
+  ;; threaded through `tuple-layout` unchanged.
+  (is (thrown-with-msg? kerror/ExceptionInfo #"recursive schema has no bounded"
+                        (canonical/layout [:ref :demo/tuple-wrapper]
+                                          {:demo/tuple-wrapper
+                                           [:record :demo/tuple-wrapper
+                                            [[:pair [:tuple [:ref :demo/tuple-wrapper] :bool]]]]}))))
+
+(deftest tuple-composes-freely-with-list-option-and-result
+  ;; Neither `list-layout`/`option-layout`/`result-layout` nor `tuple-layout`
+  ;; restricts what the other may nest as an item/element type -- exactly the
+  ;; same "compose freely in either nesting direction" behavior ADR 0068
+  ;; already showed for list/option, demonstrated here with zero changes
+  ;; needed to `list-layout`, `option-layout`, or `result-layout` for a
+  ;; tuple-typed item, and zero changes to `tuple-layout` for a
+  ;; list/option/result-typed element.
+  (is (= [:i64 :bool]
+         (mapv :descriptor (:item-layouts (get-in (canonical/layout [:list [:tuple :i64 :bool]])
+                                                   [:item-layout])))))
+  (is (= [:list :i64]
+         (get-in (canonical/layout [:tuple [:list :i64] :bool]) [:item-layouts 0 :descriptor])))
+  (is (= :tuple (get-in (canonical/layout [:option [:tuple :i64 :bool]]) [:item-layout :kind])))
+  (is (= :option (get-in (canonical/layout [:tuple [:option :i64] :bool]) [:item-layouts 0 :kind])))
+  (is (= :tuple (get-in (canonical/layout [:result [:tuple :i64 :bool] :bool]) [:ok-layout :kind]))))
+
+(deftest record-field-of-option-or-result-type-still-flattens-the-whole-record-correctly
+  ;; `layout-leaves` does not yet expose a bespoke per-leaf breakdown for an
+  ;; option/result-typed record field (it falls through to the same plain
+  ;; scalar leaf shape a nested *variant* field already does today, since
+  ;; neither has a dedicated leaf-shape branch) -- a documented, out-of-scope
+  ;; gap mirroring `variant`'s own pre-existing one (see this ADR's
+  ;; "Remaining gaps"). This test pins that the record's own top-level
+  ;; `:size`/`:alignment`/`:flat` are still fully and correctly computed
+  ;; regardless, since `record-layout` folds every field's own raw
+  ;; `layout*` result directly and never depends on `layout-leaves` to do so.
+  (let [descriptor [:ref :demo/attempt-record]
+        schemas {:demo/attempt-record
+                 [:record :demo/attempt-record
+                  [[:id :i64] [:outcome [:result :i64 :bool]] [:closed :bool]]]}
+        outer-layout (canonical/layout descriptor schemas)]
+    (is (= [0 8 24] (mapv :offset (:fields outer-layout))))
+    (is (= [:i64 :i32 :i64 :i32] (:flat outer-layout)))
+    (is (= 32 (:size outer-layout)))
+    (is (= 8 (:alignment outer-layout)))))
+
+(deftest set-layout-matches-list-pointer-length-with-set-item-bound
+  (let [schemas {:field [:record :field [[:key :keyword] [:value :string]]]}
+        value (canonical/layout [:set [:ref :field]] schemas)]
+    (is (= [:set [:ref :field]] (:descriptor value)))
+    (is (= 8 (:size value)))
+    (is (= [:i32 :i32] (:flat value)))
+    (is (= 32 (:max-items value)))
+    (is (= 16 (get-in value [:item-layout :size])))))

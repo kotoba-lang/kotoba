@@ -1,0 +1,214 @@
+;; Clojure-shaped twin of session.kotoba (:clj-kotoba / .cljk).
+;;
+;; Same transaction, same four linked modules, same inert `:out` effect.
+;; Type annotations are here because an untyped document walk is not the
+;; guest ABI. `.cljk` is :clj-kotoba, not a JVM target.
+;;
+;; The parity test compiles this alongside the .kotoba and asserts the two
+;; agree on every script; nothing else notices them drifting apart.
+;;
+;; Compile (multi-module, so the pinned form; the CLI's module-lock route
+;; reaches only js-browser today — see session.kotoba's header):
+;;   kotoba -M module-lock /ABS/kotoba/smtp/session.cljk \
+;;     --source-path /ABS/kotoba --blocks /ABS/target/blocks \
+;;     --output /ABS/target/kotoba.modules.edn
+;;   kotoba -M compile --module-lock /ABS/target/kotoba.modules.edn \
+;;     --blocks /ABS/target/blocks --target js-browser --output session.mjs
+
+(ns smtp.session
+  (:require [smtp.message :as message]
+            [smtp.protocol-commands :as cmd]
+            [smtp.protocol-core :as core]
+            [smtp.protocol-response :as resp])
+  (:export [init start step closed
+            phase outgoing error-text
+            accepted-count accepted-at
+            rejected-count rejected-recipient-at rejected-code-at
+            rejected-text-at rejected-status-at]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-str [v :document i :i64] :string
+  (option-value-of [:option :string] (document-string-value (at v i)) ""))
+
+;; --- state constructors ---------------------------------------------------
+
+(defn init [msg :document] :document
+  (document-map :phase (document-keyword :ready)
+                :from (document-string (ds msg :from))
+                :payload (document-string (message/payload msg))
+                :rcpts (message/recipients msg)
+                :i (document-i64 0)
+                :accepted (document-vector)
+                :rejected (document-vector)
+                :acc (document-string "")
+                :out (document-string "")
+                :error (document-string "")))
+
+(defn- quiet [state :document] :document
+  (document-assoc state :out (document-string "")))
+
+(defn- send-line [state :document next-phase :keyword line :string] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword next-phase))
+   :out (document-string line)))
+
+(defn- fail [state :document message :string] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc state :phase (document-keyword :failed))
+    :error (document-string message))
+   :out (document-string "")))
+
+;; --- starting the transaction ---------------------------------------------
+
+(defn start [state :document] :document
+  (cond
+    (not (= (dk state :phase) :ready)) (quiet state)
+    (= (document-count (dg state :rcpts)) 0)
+    (fail state "SMTP send with no recipient")
+    :else (send-line state :mail-from (cmd/mail-from-line (ds state :from)))))
+
+;; --- transitions ----------------------------------------------------------
+
+(defn- rejected-join [v :document i :i64 acc :string] :string
+  (cond
+    (>= i (document-count v)) acc
+    (string=? acc "") (rejected-join v (+ i 1) (ds (at v i) :text))
+    :else (rejected-join v (+ i 1)
+                         (string-concat acc
+                                        (string-concat "; " (ds (at v i) :text))))))
+
+(defn- record-reply [state :document code :i64 text :string] :document
+  (let [who (at-str (dg state :rcpts) (di state :i))]
+    (if (core/positive? code)
+      (document-assoc state :accepted
+                      (document-vector-conj (dg state :accepted)
+                                            (document-string who)))
+      (document-assoc state :rejected
+                      (document-vector-conj
+                       (dg state :rejected)
+                       (document-map :recipient (document-string who)
+                                     :code (document-i64 code)
+                                     :status (document-string
+                                              (resp/enhanced-status text))
+                                     :text (document-string text)))))))
+
+(defn- advance-rcpt [state :document] :document
+  (let [rcpts (dg state :rcpts)
+        i (+ (di state :i) 1)
+        moved (document-assoc state :i (document-i64 i))]
+    (cond
+      (< i (document-count rcpts))
+      (send-line moved :rcpt (cmd/rcpt-to-line (at-str rcpts i)))
+
+      (= (document-count (dg state :accepted)) 0)
+      (fail moved (string-concat "SMTP RCPT TO failed for every recipient: "
+                                 (rejected-join (dg state :rejected) 0 "")))
+
+      :else (send-line moved :data (cmd/data-line)))))
+
+(defn- on-final [state :document code :i64 text :string] :document
+  (let [p (dk state :phase)
+        ok (core/positive? code)]
+    (cond
+      (= p :mail-from)
+      (if ok
+        (send-line (document-assoc state :i (document-i64 0)) :rcpt
+                   (cmd/rcpt-to-line (at-str (dg state :rcpts) 0)))
+        (fail state (string-concat "SMTP MAIL FROM failed: " text)))
+
+      (= p :rcpt) (advance-rcpt (record-reply state code text))
+
+      (= p :data)
+      (if ok
+        (send-line state :payload (ds state :payload))
+        (fail state (string-concat "SMTP DATA failed: " text)))
+
+      (= p :payload)
+      (if ok
+        (send-line state :done "")
+        (fail state (string-concat "SMTP DATA payload failed: " text)))
+
+      :else (quiet state))))
+
+(defn- joined [acc :string text :string] :string
+  (if (string=? acc "")
+    text
+    (string-concat acc (string-concat "\n" text))))
+
+(defn step [state :document line :string] :document
+  (let [p (dk state :phase)]
+    (cond
+      (= p :ready) (quiet state)
+      (= p :done) (quiet state)
+      (= p :failed) (quiet state)
+
+      (not (resp/response-line? line))
+      (fail state "unparseable SMTP response line")
+
+      (resp/response-final? line)
+      (on-final (document-assoc state :acc (document-string ""))
+                (resp/response-code line)
+                (joined (ds state :acc) (resp/response-text line)))
+
+      :else
+      (quiet (document-assoc state :acc
+                             (document-string
+                              (joined (ds state :acc) (resp/response-text line))))))))
+
+;; EOF mid-response. The oracle throws "SMTP connection closed mid-response";
+;; a closed socket is a host fact, so the host reports it and the guest owns
+;; what it means for the transaction.
+(defn closed [state :document] :document
+  (let [p (dk state :phase)]
+    (cond
+      (= p :done) (quiet state)
+      (= p :failed) (quiet state)
+      :else (fail state "SMTP connection closed mid-response"))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn outgoing [state :document] :string (ds state :out))
+
+(defn error-text [state :document] :string (ds state :error))
+
+(defn accepted-count [state :document] :i64
+  (document-count (dg state :accepted)))
+
+(defn accepted-at [state :document i :i64] :string
+  (at-str (dg state :accepted) i))
+
+(defn rejected-count [state :document] :i64
+  (document-count (dg state :rejected)))
+
+(defn rejected-recipient-at [state :document i :i64] :string
+  (ds (at (dg state :rejected) i) :recipient))
+
+(defn rejected-code-at [state :document i :i64] :i64
+  (di (at (dg state :rejected) i) :code))
+
+(defn rejected-text-at [state :document i :i64] :string
+  (ds (at (dg state :rejected) i) :text))
+
+;; RFC 3463. "" where the oracle answers nil: the guest has no nil, and a
+;; server that sends no enhanced code is the ordinary case, not an error.
+(defn rejected-status-at [state :document i :i64] :string
+  (ds (at (dg state :rejected) i) :status))

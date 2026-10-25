@@ -1,0 +1,117 @@
+(ns kotoba.p2p.sync-test
+  "End-to-end protocol tests over the loopback transport, with real data:
+  kotobase-engine transact/commit! on the source node, tag-42 hydrate +
+  verify-chain on the receivers."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.p2p.sync :as sync]
+            [kotoba.p2p.loopback :as lb]
+            [kotobase-engine.core :as eng]
+            [chain.core :as cd]
+            [ipld.core :as ipld]
+            [prolly-tree.core :as pt]))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+(defn- committed-graph
+  "Build a store holding a 2-commit kotobase-engine chain over `n` quads.
+  Returns {:store <ports> :head-cid <chain cid> :seq 1 :datom-count n}."
+  [n]
+  (let [{:keys [put! get-fn] :as store} (mem-store)
+        db1 (eng/transact (eng/empty-db)
+                          (map (fn [i] {:s (str "e" i) :p "n" :o (str i)})
+                               (range (quot n 2))))
+        db2 (eng/transact db1
+                          (map (fn [i] {:s (str "e" i) :p "n" :o (str i)})
+                               (range (quot n 2) n)))
+        c0 (eng/commit! put! get-fn db1 nil)
+        c1 (eng/commit! put! get-fn db2 c0)]
+    {:store store :head-cid c1 :seq 1 :datom-count n}))
+
+(defn- spo-entry-count
+  "Read the synced graph on the RECEIVER's store alone: chain head ->
+  state link -> snapshot block -> spo index root -> prolly scan."
+  [store head-cid]
+  (let [get-fn (:get-fn store)
+        snapshot-cid (ipld/link-cid (:state (cd/head get-fn head-cid)))
+        snapshot (ipld/get-node get-fn snapshot-cid)
+        spo-root (some-> (get-in snapshot ["index-roots" "spo"]) ipld/link-cid)]
+    (count (pt/scan-prefix get-fn spo-root ""))))
+
+(deftest two-nodes-converge
+  (let [{:keys [store head-cid seq datom-count]} (committed-graph 60)
+        a (-> (sync/new-node "a" store)
+              (sync/add-peer "b" #{"g"})
+              (sync/set-head "g" head-cid seq))
+        b (-> (sync/new-node "b" (mem-store))
+              (sync/add-peer "a" #{"g"}))
+        net (lb/announce-and-run (lb/network {"a" a "b" b}) "a" "g")
+        b' (get-in net [:nodes "b"])]
+    (testing "b adopted a's head"
+      (is (= {:head-cid head-cid :seq seq} (sync/head b' "g"))))
+    (testing "the full chain verifies on b's own store"
+      (is (true? (cd/verify-chain (:get-fn (:store b')) head-cid))))
+    (testing "b can read the data locally (chain -> snapshot -> index -> tree)"
+      (is (= datom-count (spo-entry-count (:store b') head-cid))))))
+
+(deftest three-node-line-topology-propagates
+  ;; a -- b -- c : c never peers with a; it can only get the graph through
+  ;; b's post-adoption re-announce.
+  (let [{:keys [store head-cid seq]} (committed-graph 20)
+        a (-> (sync/new-node "a" store)
+              (sync/add-peer "b" #{"g"})
+              (sync/set-head "g" head-cid seq))
+        b (-> (sync/new-node "b" (mem-store))
+              (sync/add-peer "a" #{"g"})
+              (sync/add-peer "c" #{"g"}))
+        c (-> (sync/new-node "c" (mem-store))
+              (sync/add-peer "b" #{"g"}))
+        net (lb/announce-and-run (lb/network {"a" a "b" b "c" c}) "a" "g")]
+    (doseq [pid ["b" "c"]]
+      (let [n (get-in net [:nodes pid])]
+        (is (= head-cid (:head-cid (sync/head n "g"))) (str pid " has the head"))
+        (is (true? (cd/verify-chain (:get-fn (:store n)) head-cid))
+            (str pid " chain verifies locally"))))))
+
+(deftest stale-and-duplicate-announces-are-inert
+  (let [{:keys [store head-cid seq]} (committed-graph 10)
+        a (-> (sync/new-node "a" store)
+              (sync/add-peer "b" #{"g"})
+              (sync/set-head "g" head-cid seq))
+        b (-> (sync/new-node "b" (mem-store))
+              (sync/add-peer "a" #{"g"}))
+        net (lb/announce-and-run (lb/network {"a" a "b" b}) "a" "g")
+        ;; announcing again after convergence must go quiescent with no change
+        net2 (lb/announce-and-run net "a" "g")]
+    (is (= (sync/head (get-in net [:nodes "b"]) "g")
+           (sync/head (get-in net2 [:nodes "b"]) "g")))))
+
+(deftest lying-peer-cannot-corrupt-and-cannot-livelock
+  (let [{:keys [store head-cid seq]} (committed-graph 20)
+        ;; a serves tampered bytes for every block: CID checks all fail on b
+        evil-store {:put! (:put! store)
+                    :get-fn (fn [cid]
+                              (when ((:get-fn store) cid)
+                                #?(:clj (.getBytes "evil" "UTF-8")
+                                   :cljs (.encode (js/TextEncoder.) "evil"))))}
+        ;; ...except the chain walk on a's own side needs real bytes, so give
+        ;; a a real store for its own reads and lie only on the wire by
+        ;; corrupting what handle-want-blocks serves: simplest honest setup
+        ;; is a separate node whose store lies for everything it serves.
+        a (-> (sync/new-node "a" (assoc store :get-fn (:get-fn evil-store)))
+              (sync/add-peer "b" #{"g"})
+              (sync/set-head "g" head-cid seq))
+        b (-> (sync/new-node "b" (mem-store))
+              (sync/add-peer "a" #{"g"}))
+        net (lb/network {"a" a "b" b})]
+    (testing "sync stalls (liveness lost) but terminates and b stays clean (safety kept)"
+      (let [msg {:type :commits :graph "g"
+                 :entries [{:seq 0 :cid "bafyfake"}]
+                 :head-cid head-cid :head-seq seq :origin "a"}
+            net' (lb/run net [{:to "b" :msg msg}])]
+        (is (nil? (sync/head (get-in net' [:nodes "b"]) "g")))
+        (is (empty? @(:store (:store (get-in net' [:nodes "b"])))))))))

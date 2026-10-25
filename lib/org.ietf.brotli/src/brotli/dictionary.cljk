@@ -1,0 +1,124 @@
+(ns brotli.dictionary
+  "The static dictionary and its 121 word transformations (RFC 7932 §8).
+
+   brotli's distances do double duty: a distance larger than what the window and
+   the output so far allow is not an error, it is a reference into a fixed
+   122,784-byte dictionary of words 4-24 bytes long, each of which can appear in
+   121 transformed forms (a prefix, one of 21 elementary transforms, a suffix).
+   A decoder without this table cannot read real streams — almost every one of
+   them uses it — which is why the data lives in `brotli.data`, generated from
+   the RFC and checked against the CRC-32 the RFC publishes for it."
+  (:require [kotoba.bytes :as kbytes] [brotli.data :as data]
+            [kotoba.lang.text :as str]))
+
+;; ---------------------------------------------------------------------------
+;; The dictionary bytes
+;; ---------------------------------------------------------------------------
+
+(def ^:private dict
+  #?(:clj (let [ba (kbytes/base64-decode-bytes ^String data/dictionary-base64)]
+            (mapv #(bit-and (int %) 0xff) ba))
+     :cljs (let [s (js/atob data/dictionary-base64)]
+             (vec (map-indexed (fn [i _] (.charCodeAt s i)) (repeat (.-length s) nil))))))
+
+(def size (count dict))
+
+(def ^:private offsets
+  "DOFFSET[0..24] (§8): cumulative `length * NWORDS[length]`."
+  (vec (reductions + 0 (map-indexed (fn [len bits]
+                                      (if (< len 4) 0 (* len (bit-shift-left 1 bits))))
+                                    data/ndbits))))
+
+(defn words-of-length
+  "NWORDS[length]."
+  [length]
+  (if (< length 4) 0 (bit-shift-left 1 (nth data/ndbits length))))
+
+(defn word
+  "The base word of `length` at `index`."
+  [length index]
+  (let [off (+ (nth offsets length) (* index length))]
+    (when (> (+ off length) size)
+      (throw (ex-info "brotli: dictionary word out of range"
+                      {:reason :bad-dictionary-word :length length :index index})))
+    (subvec dict off (+ off length))))
+
+;; ---------------------------------------------------------------------------
+;; Elementary transforms
+;; ---------------------------------------------------------------------------
+
+(defn- ferment
+  "§8 Ferment: uppercase one UTF-8 character in place, returning its width."
+  [w pos]
+  (let [c (nth w pos)]
+    (cond
+      (< c 192) [(if (<= 97 c 122) (assoc w pos (bit-xor c 32)) w) 1]
+      (< c 224) [(if (< (inc pos) (count w))
+                   (assoc w (inc pos) (bit-xor (nth w (inc pos)) 32))
+                   w)
+                 2]
+      :else     [(if (< (+ pos 2) (count w))
+                   (assoc w (+ pos 2) (bit-xor (nth w (+ pos 2)) 5))
+                   w)
+                 3])))
+
+(defn- ferment-first [w]
+  (if (pos? (count w)) (first (ferment w 0)) w))
+
+(defn- ferment-all [w]
+  (loop [w w i 0]
+    (if (>= i (count w))
+      w
+      (let [[w' n] (ferment w i)]
+        (recur w' (+ i n))))))
+
+(defn- omit-first [w k] (if (< (count w) k) [] (subvec w k)))
+(defn- omit-last [w k] (if (< (count w) k) [] (subvec w 0 (- (count w) k))))
+
+(defn- elementary [w t]
+  (case t
+    :Identity     w
+    :FermentFirst (ferment-first w)
+    :FermentAll   (ferment-all w)
+    (let [n (name t)]
+      (cond
+        (str/starts-with? n "OmitFirst")
+        (omit-first w (#?(:clj Integer/parseInt :cljs js/parseInt) (subs n 9)))
+
+        (str/starts-with? n "OmitLast")
+        (omit-last w (#?(:clj Integer/parseInt :cljs js/parseInt) (subs n 8)))
+
+        :else (throw (ex-info "brotli: unknown elementary transform"
+                              {:reason :bad-transform :transform t}))))))
+
+(def ^:private transform-parts
+  ;; Already byte vectors: `brotli.data` stores the RFC's C string literals
+  ;; decoded, so nothing here has to know about escapes.
+  (vec data/transforms))
+
+(def transform-count (count transform-parts))
+
+(defn transform
+  "Apply transformation `id` (0-120) to a base word."
+  [w id]
+  (when (or (neg? id) (>= id transform-count))
+    (throw (ex-info "brotli: transform id out of range"
+                    {:reason :bad-transform :id id})))
+  (let [[prefix t suffix] (nth transform-parts id)]
+    (into (into (vec prefix) (elementary (vec w) t)) suffix)))
+
+(defn word-for-distance
+  "§8: turn an out-of-window distance into the transformed dictionary word it
+   denotes, or nil when `length` cannot be a dictionary reference."
+  [length distance max-distance]
+  (when-not (<= 4 length 24)
+    (throw (ex-info "brotli: dictionary reference with a length outside 4..24"
+                    {:reason :bad-dictionary-word :length length})))
+  (let [word-id (- distance max-distance 1)
+        nwords  (words-of-length length)
+        index   (mod word-id nwords)
+        tid     (quot word-id nwords)]
+    (when (>= tid transform-count)
+      (throw (ex-info "brotli: dictionary transform id out of range"
+                      {:reason :bad-transform :id tid :length length})))
+    (transform (word length index) tid)))

@@ -1,0 +1,308 @@
+;; The RFC 4998 reduced-hash-tree path decision, as a Kotoba application
+;; (ADR-2608261100) — §4.2 / §4.3.
+;;
+;;   init          (config)        -> state
+;;   offer-path    (state, path)   -> state
+;;   offer-leaf    (state, leaf)   -> state
+;;   offer-digest  (state, digest) -> state   ; the host hashed what we named
+;;
+;; ## What travels, and what decides
+;;
+;; A reduced hash tree lets one document's evidence be extracted from an
+;; archive of a million without revealing — or needing — the other 999,999.
+;; The path from a document's digest to the root is all that travels, and
+;; everything that makes it *proof* rather than arithmetic is a decision:
+;;
+;;   the guest owns   whether the path mentions the document at all, whether
+;;                    it covers every level, which two digests to concatenate
+;;                    and IN WHAT ORDER, and when a node is promoted rather
+;;                    than paired
+;;   the host owns    the digest function, and the bytes it runs on
+;;
+;; `hash-first` / `hash-second` name the two values in the order they must
+;; be concatenated; the host digests exactly that and hands the result back.
+;; The guest never computes a hash and never sees a document.
+;;
+;; ## Four rules, each of which turns arithmetic into proof
+;;
+;; `ers.core`'s own docstrings name every one:
+;;
+;;   1. **the first group must contain the leaf.** *"A path that does not
+;;      mention the document it is supposed to be about proves nothing, and
+;;      this is the check that turns 'the arithmetic worked out' into 'this
+;;      document is in this archive'."* Without it any path that happens to
+;;      reach the right root verifies any document;
+;;   2. **children are SORTED, then concatenated** (§4.2). *"Sorting is what
+;;      makes a partial path verifiable without knowing which side a sibling
+;;      was on"* — skipping it produces an implementation that only
+;;      interoperates with itself;
+;;   3. **an odd node is promoted unchanged, not paired with a copy of
+;;      itself.** *"Duplicating it would make two distinct archives with the
+;;      same last document produce the same root"* — which is the Merkle
+;;      duplication flaw, and it is a forgery, not an inefficiency;
+;;   4. **the path's length equals the tree's height.** A promoted level is
+;;      recorded as a group of one rather than omitted, *"which is how a
+;;      verifier knows it saw every level"*. A short path is a path with
+;;      levels missing, and it must not be mistaken for a small tree.
+;;
+;; ## Digests arrive as lowercase hex, and that is checked
+;;
+;; Sorting must be by OCTET value (§4.2). Lowercase fixed-width hex sorts
+;; identically to the octets it encodes, so the guest can compare the text
+;; it was given — but only if it really is lowercase: `'A'` is 0x41 and
+;; `'a'` is 0x61, so a mixed-case path would sort by a different order than
+;; the octets and produce a root that is wrong without being detectably so.
+;; Uppercase is therefore REFUSED rather than folded, because folding it
+;; here would hide that the host handed over something it should not have.
+;;
+;; ## Out of scope, named rather than skipped
+;;
+;; `:oldest` (the claim is the EARLIEST verified timestamp, not the latest)
+;; and `:trusted` (`:unknown` unless every TSA was vouched for) are the
+;; other two decisions in `ers.core/verify`. They are about the timestamp
+;; chain rather than the tree and belong in a slice of their own; this one
+;; does not touch them and does not pretend to.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/ers/path.kotoba \
+;;     --target wasm32-browser --output path.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6531-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns ers.path
+  (:export [init offer-path offer-leaf offer-digest
+            phase reason
+            needs-digest? hash-first hash-second
+            height level root covered?]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- dv [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-vector)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-str [v :document i :i64] :string
+  (option-value-of [:option :string] (document-string-value (at v i)) ""))
+
+;; --- hex --------------------------------------------------------------------
+;; Lowercase fixed-width hex sorts identically to the octets it encodes. That
+;; is only true if it IS lowercase, so this is checked rather than assumed.
+
+(defn- at-byte [s :string i :i64] :i64
+  (if (< i (string-byte-length s)) (string-code-point-at s i) -1))
+
+(defn- lower-hex-char? [c :i64] :bool
+  (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102))))
+
+(defn- lower-hex? [s :string i :i64] :bool
+  (let [c (at-byte s i)]
+    (cond (= c -1) (> i 0)
+          (not (lower-hex-char? c)) false
+          :else (lower-hex? s (+ i 1)))))
+
+;; Octet order, read off the text. Shorter sorts first when it is a prefix,
+;; which is the same answer octet comparison gives for digests of unequal
+;; length -- and unequal lengths within one tree are themselves a defect the
+;; host should not have produced.
+(defn- text<? [a :string b :string i :i64] :bool
+  (let [x (at-byte a i)
+        y (at-byte b i)]
+    (cond
+      (and (= x -1) (= y -1)) false
+      (= x -1) true
+      (= y -1) false
+      (< x y) true
+      (> x y) false
+      :else (text<? a b (+ i 1)))))
+
+;; --- state ------------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+(defn init [_config :document] :document
+  (document-map :phase (document-keyword :want-path)
+                :reason (document-keyword :none)
+                :path (document-vector)
+                :height (document-i64 -1)
+                :level (document-i64 0)
+                :current (document-string "")
+                :a (document-string "")
+                :b (document-string "")
+                :pending (document-bool false)))
+
+;; --- the path ---------------------------------------------------------------
+;; `path` is a vector of groups, each a vector of lowercase hex digests. A
+;; group of one is a promoted node; a group of two is a pair.
+
+(defn- groups-well-formed? [path :document i :i64] :bool
+  (cond
+    (>= i (document-count path)) true
+    (let [g (at path i)
+          n (document-count g)]
+      (or (< n 1) (> n 2)))
+    false
+    :else (groups-well-formed? path (+ i 1))))
+
+(defn- all-lower-hex? [path :document i :i64 j :i64] :bool
+  (cond
+    (>= i (document-count path)) true
+    (>= j (document-count (at path i))) (all-lower-hex? path (+ i 1) 0)
+    (not (lower-hex? (at-str (at path i) j) 0)) false
+    :else (all-lower-hex? path i (+ j 1))))
+
+(defn offer-path [state :document path :document] :document
+  (if (not (= (dk state :phase) :want-path))
+    state
+    (cond
+      (= (document-count path) 0) (refuse state :ers/empty-path)
+
+      ;; A group is a node and its sibling, or a node alone. Anything else is
+      ;; not a reduced path.
+      (not (groups-well-formed? path 0)) (refuse state :ers/malformed-group)
+
+      ;; Folding uppercase here would hide that the host handed over
+      ;; something whose sort order is not the octets'.
+      (not (all-lower-hex? path 0 0)) (refuse state :ers/non-lowercase-hex)
+
+      :else
+      (document-assoc
+       (document-assoc
+        (document-assoc state :phase (document-keyword :want-leaf))
+        :path path)
+       :height (document-i64 (document-count path))))))
+
+;; --- the leaf ---------------------------------------------------------------
+
+(defn- in-group? [g :document leaf :string i :i64] :bool
+  (cond
+    (>= i (document-count g)) false
+    (string=? (at-str g i) leaf) true
+    :else (in-group? g leaf (+ i 1))))
+
+;; --- the walk ---------------------------------------------------------------
+;; At each level: a group of one promotes the current value unchanged, and a
+;; group of two names the pair to hash, sorted.
+
+;; Every group is folded, the first included: a group of two is hashed, a
+;; group of one carries the running value up unchanged. `:level` is the next
+;; group to fold.
+(defn- advance [state :document] :document
+  (let [path (dv state :path)
+        level (di state :level)]
+    (if (>= level (document-count path))
+      (document-assoc (document-assoc state :phase (document-keyword :walked))
+                      :pending (document-bool false))
+      (let [g (at path level)]
+        (if (= (document-count g) 1)
+          ;; Promoted: carried up unchanged. NOT paired with a copy of
+          ;; itself -- duplicating would make two distinct archives with the
+          ;; same last document produce the same root.
+          (advance (document-assoc state :level (document-i64 (+ level 1))))
+          (let [x (at-str g 0)
+                y (at-str g 1)]
+            (document-assoc
+             (document-assoc
+              (document-assoc state
+                              ;; Sorted, then concatenated (§4.2). This is
+                              ;; what makes a partial path verifiable
+                              ;; without knowing which side the sibling was
+                              ;; on.
+                              :a (document-string (if (text<? x y 0) x y)))
+              :b (document-string (if (text<? x y 0) y x)))
+             :pending (document-bool true))))))))
+
+
+;; The check that turns "the arithmetic worked out" into "this document is in
+;; this archive". Without it, any path that happens to reach the right root
+;; verifies any document at all.
+(defn offer-leaf [state :document leaf :string] :document
+  (if (not (= (dk state :phase) :want-leaf))
+    state
+    (cond
+      (not (lower-hex? leaf 0)) (refuse state :ers/non-lowercase-hex)
+
+      (not (in-group? (at (dv state :path) 0) leaf 0))
+      (refuse state :ers/leaf-not-in-path)
+
+      :else
+      (advance
+       (document-assoc
+        (document-assoc state :current (document-string leaf))
+        :phase (document-keyword :walking))))))
+
+;; The host digested the concatenation of `hash-first` and `hash-second` and
+;; hands the result back as lowercase hex.
+(defn offer-digest [state :document digest :string] :document
+  (cond
+    (not (= (dk state :phase) :walking)) state
+    (not (db state :pending)) state
+    (not (lower-hex? digest 0)) (refuse state :ers/non-lowercase-hex)
+    :else (advance (document-assoc
+                    (document-assoc
+                     (document-assoc state :current (document-string digest))
+                     :level (document-i64 (+ (di state :level) 1)))
+                    :pending (document-bool false)))))
+
+;; --- projections ------------------------------------------------------------
+
+(defn phase [state :document] :keyword
+  (let [p (dk state :phase)]
+    (if (= p :walking)
+      (if (db state :pending) :want-digest :walking)
+      p)))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; True when the host must digest `hash-first` ‖ `hash-second`.
+(defn needs-digest? [state :document] :bool
+  (and (= (dk state :phase) :walking) (db state :pending)))
+
+(defn hash-first [state :document] :string (ds state :a))
+
+(defn hash-second [state :document] :string (ds state :b))
+
+;; The number of levels the path claims, which must be the tree's height. A
+;; promoted level is recorded as a group of one rather than omitted, which is
+;; how a verifier knows it saw every level.
+(defn height [state :document] :i64 (di state :height))
+
+(defn level [state :document] :i64 (di state :level))
+
+;; Only once the walk finished. A root handed back mid-walk would be a
+;; partial computation presented as an answer.
+(defn root [state :document] :string
+  (if (= (dk state :phase) :walked) (ds state :current) ""))
+
+;; Whether the leaf is covered by an archive whose root is `expected`.
+(defn covered? [state :document expected :string] :bool
+  (and (= (dk state :phase) :walked)
+       (string=? (ds state :current) expected)))

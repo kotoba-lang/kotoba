@@ -1,0 +1,137 @@
+#!/usr/bin/env kbb
+;; verify-kotoba-core.cljs — run `kotoba/toml_scan_core.kotoba` and check what
+;; it actually answers.
+;;
+;; The module compiles to a `kotoba-js-artifact/v1` ESM. Compiling needs the
+;; Kotoba compiler (`kotoba-lang/amu`, which needs a JVM); RUNNING the result
+;; needs only node, which is why this runner is nbb and takes the artifact path
+;; rather than building it.
+;;
+;;   kotoba -M compile kotoba/toml_scan_core.kotoba --target js --output core.mjs
+;;   kbb --backend sci scripts/verify-kotoba-core.cljk core.mjs
+;;
+;; ## One instance per case, deliberately
+;;
+;; A Kotoba module carries 512 function-entry charges for the WHOLE LIFE of an
+;; instance and never replenishes them (kotoba-lang/compiler,
+;; backend/cljs.clj: "permanently exhausted after 512 total function calls
+;; across its whole lifetime -- not 512 per top-level call"; WASM has the same
+;; module-global counter). Measured 2026-08-11: one instance sustained seven
+;; `line-kind` calls on an 8-byte line before trapping `fuel-exhausted`.
+;;
+;; So each case gets a fresh instance. That is not a test trick — it is the
+;; reason this core does not yet drive `check-metadata`, whose real input has a
+;; ~500-character line that exceeds the budget inside a single call. The cases
+;; below are sized to fit; the limit is recorded in the README.
+(ns verify-kotoba-core
+  (:require ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def artifact
+  (let [a (first *command-line-args*)]
+    (when-not a
+      (println "usage: kbb --backend sci scripts/verify-kotoba-core.cljk <compiled-artifact.mjs>")
+      (js/process.exit 2))
+    (if (str/starts-with? a "/") a (path/join (js/process.cwd) a))))
+
+;; [label fn-name args expected]
+(def cases
+  [["blank line"            "line-kind" ["   "] "blank"]
+   ["comment"               "line-kind" ["  # hi"] "comment"]
+   ["comment in Japanese"   "line-kind" ["# 日本語のコメント"] "comment"]
+   ["table header"          "line-kind" ["[knowledge]"] "table"]
+   ["array-of-tables"       "line-kind" ["[[bin]]"] "array-table"]
+   ["key/value"             "line-kind" ["name = \"x\""] "pair"]
+   ["neither"               "line-kind" ["garbage"] "unknown"]
+
+   ["trim ascii"            "trim" ["  a b  "] "a b"]
+   ["trim multi-byte"       "trim" ["  日本  "] "日本"]
+
+   ["table path"            "table-path" ["[knowledge.auth]"] [true "knowledge.auth"]]
+   ["table path multi-byte" "table-path" ["[日本]"] [true "日本"]]
+   ["table unclosed"        "table-path" ["[oops"] [false "table header is not closed"]]
+   ["array table path"      "array-table-path" ["[[bin]]"] [true "bin"]]
+
+   ["key"                   "pair-key" ["layer = 6"] [true "layer"]]
+   ["key multi-byte"        "pair-key" ["名前 = 1"] [true "名前"]]
+   ["quoted key refused"    "pair-key" ["\"a\" = 1"] [false "quoted keys are outside this subset"]]
+   ["value"                 "pair-value" ["layer = 6"] [true "6"]]
+
+   ["bare key ok"           "bare-key-ok?" ["depends_on"] true]
+   ["dotted key refused"    "bare-key-ok?" ["a.b"] false]
+   ;; A non-ASCII key must ANSWER, not trap: the scan walks codepoints, so it
+   ;; reaches the membership test instead of cutting a byte out of 日.
+   ["multi-byte key refused" "bare-key-ok?" ["日本"] false]
+
+   ["scalar integer"        "scalar-kind" ["6"] "integer"]
+   ["scalar string"         "scalar-kind" ["\"x\""] "string"]
+   ["scalar boolean"        "scalar-kind" ["true"] "boolean"]
+   ["scalar array open"     "scalar-kind" ["["] "array-open"]
+   ["scalar multiline open" "scalar-kind" ["\"\"\""] "multiline-string-open"]
+   ["scalar unsupported"    "scalar-kind" ["1979-05-27"] "integer"]
+
+   ["string plain"          "basic-string-value" ["\"abc\""] [true "abc"]]
+   ["string escape"         "basic-string-value" ["\"a\\nb\""] [true "a\nb"]]
+   ["string multi-byte"     "basic-string-value" ["\"日本語です\""] [true "日本語です"]]
+   ["string emoji"          "basic-string-value" ["\"営み🌾OS\""] [true "営み🌾OS"]]
+   ["string multi-byte + escape" "basic-string-value" ["\"日\\n語\""] [true "日\n語"]]
+   ["string unterminated"   "basic-string-value" ["\"abc"] [false "string is not closed"]]
+   ;; \uXXXX is refused rather than approximated — there is no codepoint encoder
+   ;; in this profile, and wrong bytes would be worse than a refusal.
+   ["unicode escape refused" "basic-string-value" ["\"a\\u0041\""] [false "escape outside this subset"]]
+
+   ["integer"               "integer-value" ["42"] [true 42]]
+   ["integer separators"    "integer-value" ["1_000"] [true 1000]]
+   ["integer negative"      "integer-value" ["-42"] [true -42]]
+   ["integer plus"          "integer-value" ["+7"] [true 7]]
+   ;; The one that matters most: a float must NOT come back as its truncation.
+   ["float refused"         "integer-value" ["1.0"] [false "not an integer"]]
+   ["not a number"          "integer-value" ["abc"] [false "not an integer"]]
+
+   ;; ── boundary regressions ────────────────────────────────────────────────
+   ;; Three separate places cut at a FIXED offset, which reads as a cheap test
+   ;; and is a trap the moment the value contains multi-byte text. All three
+   ;; were found by running this core over a real config (net-kotobase's
+   ;; deps.toml, 2026-08-11); each answers now instead of trapping.
+   ["prefix test vs multi-byte"  "scalar-kind" ["\"金融/医療/政府 向け\""] "string"]
+   ["suffix test vs multi-byte"  "basic-string-value" ["\"unterminated 日本語"]
+    [false "string is not closed"]]
+   ["bracket test vs multi-byte" "table-path" ["- B1 反 equivocation: 未実装"]
+    [false "table header is not closed"]]
+   ["multiline opener still seen" "scalar-kind" ["\"\"\"日本語"] "multiline-string-open"]])
+
+(defn- normalise [v]
+  (cond
+    (= (type v) js/BigInt) (js/Number v)
+    (array? v) (mapv normalise (array-seq v))
+    :else v))
+
+(defn -main []
+  (-> (js/import artifact)
+      (.then
+       (fn [m]
+         (let [failures (atom [])]
+           (doseq [[label fname args expected] cases]
+             (let [got (try
+                         ;; fresh instance per case — see the fuel note above
+                         (let [inst (.instantiateKotoba m #js {})
+                               f (aget inst fname)]
+                           (normalise (apply f args)))
+                         (catch :default e {:trap (or (.-message e) (str e))}))]
+               (if (= got expected)
+                 (println (str "  ok   " label))
+                 (do (swap! failures conj label)
+                     (println (str "  FAIL " label
+                                   "\n         expected " (pr-str expected)
+                                   "\n         got      " (pr-str got)))))))
+           (println)
+           (if (seq @failures)
+             (do (println (str (count @failures) " of " (count cases) " cases failed"))
+                 (js/process.exit 1))
+             (println (str "OK — " (count cases) " cases, all as specified"))))))
+      (.catch (fn [e]
+                (println (str "could not load " artifact ": " (.-message e)))
+                (println "build it first: kotoba -M compile kotoba/toml_scan_core.kotoba --target js --output <path>")
+                (js/process.exit 2)))))
+
+(-main)

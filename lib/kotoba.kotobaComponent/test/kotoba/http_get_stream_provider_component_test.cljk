@@ -1,0 +1,175 @@
+(ns kotoba.http-get-stream-provider-component-test
+  "W5 deepen ADR 0131: synthetic http get-stream wasm packaging
+  (url+headers → i64 byte-count intermediate) + multi-step Wasmtime."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.component.composition :as composition]
+            [kotoba.component.core :as component-core]
+            [kotoba.wasm.tools :as wasm-tools])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(def ^:private wasmtime-binary
+  (let [pinned (io/file ".tools" "wasmtime" "wasmtime")]
+    (if (io/can-execute? pinned) (io/path pinned) "wasmtime")))
+
+(defn- wat-data
+  [bytes]
+  (apply str (map #(format "\\%02x" (bit-and (int %) 0xff)) bytes)))
+
+(defn- http-get-stream-descriptors
+  []
+  (let [header-name :kotoba.http/header
+        req-name :kotoba.http/get-stream-request
+        header [:record header-name
+                [[:name :keyword] [:value :string]]]
+        req [:record req-name
+             [[:url :string]
+              [:headers [:set [:ref header-name]]]]]]
+    {:req [:ref req-name]
+     :res :i64
+     :schemas {header-name header
+               req-name req}}))
+
+(deftest http-get-stream-provider-rejects-wrong-shape
+  (let [d (http-get-stream-descriptors)
+        bad-schemas (assoc (:schemas d)
+                           :kotoba.http/get-stream-request
+                           [:record :kotoba.http/get-stream-request
+                            [[:url :string]]])]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"url\+headers"
+         (composition/package-http-get-stream-provider
+          (:req d) (:res d) bad-schemas)))))
+
+(deftest http-get-stream-provider-packages-and-validates
+  (let [d (http-get-stream-descriptors)
+        provider (composition/package-http-get-stream-provider
+                  (:req d) (:res d) (:schemas d))
+        path (Files/createTempFile "kotoba-http-get-stream-validate-" ".wasm"
+                                   (make-array FileAttribute 0))]
+    (try
+      (is (= :wasm-component-provider/v1 (:format provider)))
+      (is (= :http/get-stream (:capability provider)))
+      (is (= [:http/get-stream] (:capabilities provider)))
+      (is (pos? (alength ^bytes (:bytes provider))))
+      (Files/write path ^bytes (:bytes provider)
+                   (make-array java.nio.file.OpenOption 0))
+      (is (string? (wasm-tools/run-command! ["wasm-tools" "validate" (str path)])))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(deftest http-get-stream-provider-wat-returns-fixed-body-length
+  (let [d (http-get-stream-descriptors)
+        entry {:name :http/get-stream :interface "http-stream" :function "get"}
+        wat (component-core/http-get-stream-provider-wat
+             entry (:req d) (:res d) (:schemas d))]
+    (is (str/includes? wat "http-stream"))
+    (is (str/includes? wat "i64.const 2"))
+    (is (str/includes? wat "cm32p2_memory"))))
+
+(defn- get-stream-sequence-driver-wit
+  []
+  (str
+   "package kotoba:application@1.0.0;\n\n"
+   "interface types {\n"
+   "  record kotoba-http-header {\n"
+   "    name: string,\n"
+   "    value: string,\n"
+   "  }\n"
+   "  record kotoba-http-get-stream-request {\n"
+   "    url: string,\n"
+   "    headers: list<kotoba-http-header>,\n"
+   "  }\n"
+   "}\n\n"
+   "interface http-stream {\n"
+   "  use types.{kotoba-http-get-stream-request};\n"
+   "  get: func(request: kotoba-http-get-stream-request) -> s64;\n"
+   "}\n\n"
+   "world driver {\n"
+   "  import http-stream;\n"
+   "  export run: func() -> s64;\n"
+   "}\n"))
+
+(defn- get-stream-sequence-driver-wat
+  "Two get calls with empty headers; sum of fixed body lengths (2+2=4)."
+  []
+  (let [url1 (kbytes/utf8-bytes "https://api.example.test/a")
+        url2 (kbytes/utf8-bytes "https://api.example.test/b")
+        u1-ptr 256
+        u2-ptr 384]
+    (str
+     "(module\n"
+     "  (import \"cm32p2|kotoba:application/http-stream@1\" \"get\"\n"
+     "    (func $get (param i32 i32 i32 i32) (result i64)))\n"
+     "  (memory (export \"cm32p2_memory\") 1 1)\n"
+     "  (func (export \"cm32p2_realloc\")\n"
+     "    (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32)\n"
+     "    (result i32)\n"
+     "    local.get $old i32.eqz\n"
+     "    if (result i32) i32.const 512 else local.get $old end)\n"
+     "  (func (export \"cm32p2||run\") (result i64)\n"
+     "    (local $a i64) (local $b i64)\n"
+     "    i32.const " u1-ptr " i32.const " (alength url1)
+     " i32.const 0 i32.const 0"
+     " call $get local.set $a\n"
+     "    i32.const " u2-ptr " i32.const " (alength url2)
+     " i32.const 0 i32.const 0"
+     " call $get local.set $b\n"
+     "    local.get $a local.get $b i64.add)\n"
+     "  (func (export \"cm32p2||run_post\") (param i64))\n"
+     "  (func (export \"cm32p2_initialize\"))\n"
+     "  (data (i32.const " u1-ptr ") \"" (wat-data url1) "\")\n"
+     "  (data (i32.const " u2-ptr ") \"" (wat-data url2) "\")\n"
+     ")\n")))
+
+(defn- package-get-stream-sequence-driver
+  []
+  (let [dir (Files/createTempDirectory "kotoba-http-get-stream-seq-driver-"
+                                       (make-array FileAttribute 0))
+        world (.resolve dir "driver.wit")
+        core (.resolve dir "driver.wasm")
+        embedded (.resolve dir "embedded.wasm")
+        component (.resolve dir "driver.component.wasm")]
+    (try
+      (Files/writeString world (get-stream-sequence-driver-wit)
+                         (make-array java.nio.file.OpenOption 0))
+      (Files/write core (wasm-tools/parse-wat (get-stream-sequence-driver-wat))
+                   (make-array java.nio.file.OpenOption 0))
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "embed" (str world) (str core)
+        "--encoding" "utf8" "-o" (str embedded)])
+      (wasm-tools/run-command!
+       ["wasm-tools" "component" "new" (str embedded)
+        "--reject-legacy-names" "-o" (str component)])
+      {:format :wasm-component/v1
+       :imports [:http/get-stream]
+       :bytes (Files/readAllBytes component)}
+      (finally
+        (doseq [path [component embedded core world]]
+          (Files/deleteIfExists path))
+        (Files/deleteIfExists dir)))))
+
+(deftest http-get-stream-sequence-driver-closes-and-wasmtime-returns-length-sum
+  "Multi-step deepen (ADR 0131): compose get-stream provider with a driver
+   that performs two gets; Wasmtime returns 2+2=4."
+  (let [d (http-get-stream-descriptors)
+        provider (composition/package-http-get-stream-provider
+                  (:req d) (:res d) (:schemas d))
+        driver (package-get-stream-sequence-driver)
+        closed (composition/compose-closed driver [provider])
+        path (Files/createTempFile "kotoba-http-get-stream-sequence-" ".wasm"
+                                   (make-array FileAttribute 0))]
+    (try
+      (is (= :wasm-component-closed/v1 (:format closed)))
+      (is (= [:http/get-stream] (:application-imports closed)))
+      (Files/write path ^bytes (:bytes closed)
+                   (make-array java.nio.file.OpenOption 0))
+      (is (string? (wasm-tools/run-command! ["wasm-tools" "validate" (str path)])))
+      (let [run (shell/sh wasmtime-binary "run" "--invoke" "run()" (str path))]
+        (is (zero? (:exit run)) (str "wasmtime err: " (:err run)))
+        (is (= "4" (str/trim (:out run)))))
+      (finally
+        (Files/deleteIfExists path)))))

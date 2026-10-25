@@ -1,0 +1,177 @@
+(ns transit.core-test
+  (:require [kotoba.test :refer [deftest is]]
+            [transit.core :as transit]))
+
+(deftest media-types
+  (is (transit/json-content-type? "application/json; charset=utf-8"))
+  (is (transit/accepts-json? "text/plain, application/json"))
+  (is (not (transit/json-content-type? "application/transit+json"))))
+
+(deftest datomic-values-write-as-plain-json
+  (let [value {:db/id 1
+               :user/name "Ada"
+               :user/roles #{:role/admin :role/editor}
+               :query (list '?e :user/name "Ada")}]
+    (is (= {"db/id" 1
+            "user/name" "Ada"
+            "user/roles" ["role/admin" "role/editor"]
+            "query" ["?e" "user/name" "Ada"]}
+           (transit/write-json value)))))
+
+(deftest datomic-envelope-defaults-to-plain-json
+  (is (= {:content-type "application/json"
+          :accept "application/json"
+          :body {"graph" "people"
+                 "query_edn" "[:find ?e :where [?e :user/name \"Ada\"]]"}}
+         (transit/datomic-envelope
+          {:graph "people"
+           :query-edn "[:find ?e :where [?e :user/name \"Ada\"]]"}))))
+
+(deftest datomic-envelope-can-opt-into-gzip
+  (is (= "gzip"
+         (:content-encoding
+          (transit/datomic-envelope {:graph "people"} {:gzip? true})))))
+
+(deftest office-envelope-round-trips-known-fields
+  (let [payload {:slides/id "deck"
+                 :slides/slides [{:slides/id "s1"}]}
+        envelope (transit/office-envelope :slides/deck payload
+                                           {:request-id "req-1"
+                                            :cid "bafydeck"
+                                            :operation :patch})
+        decoded (transit/read-office-envelope-body (:body envelope))]
+    (is (= "application/json" (:content-type envelope)))
+    (is (nil? (:content-encoding envelope)))
+    (is (= :kotoba.protocol/office (:kotoba.protocol/family decoded)))
+    (is (= 1 (:kotoba.protocol/version decoded)))
+    (is (= :slides/deck (:kotoba.resource/kind decoded)))
+    (is (= {"slides/id" "deck" "slides/slides" [{"slides/id" "s1"}]}
+           (:kotoba.resource/payload decoded)))
+    (is (= "req-1" (:kotoba.request/id decoded)))
+    (is (= "bafydeck" (:kotoba.resource/cid decoded)))
+    (is (= :patch (:kotoba.operation/kind decoded)))))
+
+(deftest office-envelope-can-opt-into-gzip
+  (is (= "gzip"
+         (:content-encoding
+          (transit/office-envelope :slides/deck {} {:gzip? true})))))
+
+(deftest office-envelope-carries-a-form
+  (let [envelope (transit/office-envelope :forms/form {:forms/id "contact"})
+        decoded (transit/read-office-envelope-body (:body envelope))]
+    (is (= :forms/form (:kotoba.resource/kind decoded)))
+    (is (= {"forms/id" "contact"} (:kotoba.resource/payload decoded)))))
+
+(deftest office-envelope-rejects-unknown-resource-kind
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo
+                  :cljs cljs.core.ExceptionInfo)
+               (transit/office-envelope :unknown/resource {}))))
+
+;; ---------------------------------------------------------------------------
+;; The invariants below had no test before 2026-09-09. Each one is a regression
+;; that the suite above stayed green through; every mutation registered in
+;; scripts/maturity-loop/mutations.edn for this repo was seen to bite here.
+
+(deftest a-foreign-envelope-is-not-read-as-an-office-envelope
+  ;; The family check is the only thing that distinguishes an office envelope
+  ;; from any other JSON object with the right-looking keys. Without it,
+  ;; read-office-envelope-body happily returns a map for a body it has no
+  ;; business reading, and the caller keys on a resource kind nobody sent.
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo
+                  :cljs cljs.core.ExceptionInfo)
+               (transit/read-office-envelope-body
+                {"kotoba.protocol/family" "kotoba.protocol/mail"
+                 "kotoba.resource/kind" "slides/deck"})))
+  ;; A body with no family at all is the same rejection, not a nil-punning pass.
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo
+                  :cljs cljs.core.ExceptionInfo)
+               (transit/read-office-envelope-body {"kotoba.resource/kind" "slides/deck"})))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo
+                  :cljs cljs.core.ExceptionInfo)
+               (transit/read-office-envelope-body {}))))
+
+(deftest every-declared-office-resource-kind-can-be-carried
+  ;; office-resource-kinds is a closed set and the docstring names
+  ;; kotoba-lang/forms as the repo that paid for a kind being left out of it.
+  ;; Exercising two kinds by hand did not notice a third going missing, so
+  ;; drive the set itself: whatever is declared must survive a round trip.
+  (doseq [kind transit/office-resource-kinds]
+    (let [decoded (transit/read-office-envelope-body
+                   (:body (transit/office-envelope kind {:probe "x"})))]
+      (is (= kind (:kotoba.resource/kind decoded))
+          (str "resource kind did not round trip: " kind))))
+  ;; and the set is the seven kinds the readers key on, so dropping one is a
+  ;; change to this contract rather than an implementation detail.
+  (is (= #{:slides/deck :sheets/workbook :docs/document :forms/form
+           :office/update :office/selection :office/presence}
+         transit/office-resource-kinds)))
+
+(deftest media-type-matching-ignores-case-and-parameters
+  ;; Content-Type is case-insensitive per RFC 9110; a peer that upcases the
+  ;; media type is sending valid JSON, and dropping the case fold turns that
+  ;; into a rejected request.
+  (is (transit/json-content-type? "APPLICATION/JSON"))
+  (is (transit/json-content-type? "Application/Json; charset=UTF-8"))
+  (is (transit/json-content-type? "  application/json  "))
+  (is (transit/accepts-json? "APPLICATION/JSON"))
+  ;; Accept carries q-values; the parameter has to be split off before compare.
+  (is (transit/accepts-json? "application/json;q=0.9"))
+  (is (transit/accepts-json? "text/html, application/json;q=0.9, */*;q=0.1")))
+
+(deftest non-json-media-types-are-refused
+  ;; The negative direction: these predicates are used to decide whether a
+  ;; request is ours, so answering true for everything is the dangerous
+  ;; failure, and it is the one a missing test cannot see.
+  (is (not (transit/json-content-type? "text/plain")))
+  (is (not (transit/json-content-type? "application/json-seq")))
+  (is (not (transit/json-content-type? nil)))
+  (is (not (transit/accepts-json? "text/plain")))
+  (is (not (transit/accepts-json? "application/xml, text/html")))
+  (is (not (transit/accepts-json? nil)))
+  (is (not (transit/accepts-json? ""))))
+
+(deftest sets-serialize-in-a-deterministic-order
+  ;; write-json sorts sets before emitting an array. Set iteration order is not
+  ;; part of the value, so without the sort the same EDN produces two different
+  ;; JSON bodies — which breaks byte-for-byte comparison, caching, and any CID
+  ;; taken over the wire body. The two-element set in the test above is too
+  ;; small to notice; this one is ordered differently unsorted.
+  (let [s #{:g :b :j :a :e :c :i :d :h :f}
+        once (transit/write-json s)]
+    (is (= ["a" "b" "c" "d" "e" "f" "g" "h" "i" "j"] once))
+    ;; same value, built in a different order, must give the same wire form
+    (is (= once (transit/write-json (into #{} (reverse [:g :b :j :a :e :c :i :d :h :f])))))
+    ;; nested inside a map, too — that is where envelopes actually carry them
+    (is (= {"roles" ["a" "b" "c" "d" "e" "f" "g" "h" "i" "j"]}
+           (transit/write-json {:roles s})))))
+
+(deftest envelopes-carry-no-content-encoding-unless-asked
+  ;; with-gzip is opt-in: announcing gzip on an uncompressed body makes the
+  ;; host's output undecodable. Absence is the invariant, and absence is what
+  ;; a test suite forgets to assert.
+  (is (nil? (:content-encoding (transit/datomic-envelope {:graph "people"}))))
+  (is (nil? (:content-encoding (transit/datomic-envelope {:graph "people"} {}))))
+  (is (nil? (:content-encoding (transit/datomic-envelope {:graph "people"} {:gzip? false}))))
+  (is (nil? (:content-encoding (transit/office-envelope :slides/deck {}))))
+  (is (nil? (:content-encoding (transit/office-envelope :slides/deck {} {:gzip? false})))))
+
+(deftest optional-envelope-fields-are-absent-rather-than-nil
+  ;; The reader uses cond-> so that a field nobody sent does not appear as an
+  ;; explicit nil. `(contains? m k)` and `(get m k)` disagree about a nil
+  ;; value, so a caller checking presence would read a request id that was
+  ;; never sent.
+  (let [decoded (transit/read-office-envelope-body
+                 (:body (transit/office-envelope :docs/document {:docs/id "d1"})))]
+    (is (not (contains? decoded :kotoba.request/id)))
+    (is (not (contains? decoded :kotoba.resource/cid)))
+    (is (not (contains? decoded :kotoba.operation/kind)))
+    (is (= :docs/document (:kotoba.resource/kind decoded)))))
+
+(deftest map-keys-that-are-not-keywords-still-write
+  ;; write-key has a branch per key type; only the keyword branch was covered,
+  ;; so a symbol or numeric key could start emitting a tagged or mangled name
+  ;; without anything noticing.
+  (is (= {"sym" 1} (transit/write-json {'sym 1})))
+  (is (= {"my.ns/sym" 1} (transit/write-json {'my.ns/sym 1})))
+  (is (= {"already" 1} (transit/write-json {"already" 1})))
+  (is (= {"7" 1} (transit/write-json {7 1}))))

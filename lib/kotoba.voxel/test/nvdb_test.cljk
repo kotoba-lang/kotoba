@@ -1,0 +1,113 @@
+(ns nvdb-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [voxel.nvdb :as nvdb]))
+
+(defn- u [n width] (mapv (fn [i] (mod (long (/ n (Math/pow 256 i))) 256)) (range width)))
+(defn- s->b [s] (mapv #?(:clj int :cljs #(.charCodeAt % 0)) s))
+
+(deftest a-segment-round-trips
+  (let [grid (vec (range 100))
+        seg (nvdb/segment {:name "density" :grid grid
+                           :metadata {:voxel-count 4242
+                                      :index-bbox [-8 -8 -8 7 7 7]
+                                      :voxel-size [0.1 0.1 0.1]
+                                      :world-bbox [-0.8 -0.8 -0.8 0.7 0.7 0.7]
+                                      :node-count [12 3 1 1]}})
+        [status segs] (nvdb/read-segments seg)]
+    (is (= :ok status))
+    (testing "the sizes add up to the layout the format defines"
+      (is (= (+ 16 176 (count "density") (count grid)) (count seg))))
+    (is (= 1 (count segs)))
+    (let [d (first (nvdb/describe segs))]
+      (is (= "density" (:grid/name d)))
+      (is (= 4242 (:grid/voxels d)))
+      (is (= [-8 -8 -8 7 7 7] (:grid/index-bbox d)) "negative index bounds survive")
+      (is (every? #(< (Math/abs (- % 0.1)) 1e-12) (:grid/voxel-size d)) "doubles survive")
+      (is (= :none (:grid/codec d)))
+      (is (= {:major 32 :minor 6 :patch 0} (:grid/version d))))
+    (is (= grid (:grid (first segs))) "the grid buffer comes back byte for byte")))
+
+(deftest it-reads-a-segment-assembled-by-hand
+  ;; Byte offsets written out from the FileMetaData declaration rather than
+  ;; produced by `write-metadata`, so this checks the LAYOUT and not just that
+  ;; the writer and reader agree with each other.
+  (let [meta (vec (concat (u 512 8)          ; 0   gridSize
+                          (u 512 8)          ; 8   fileSize
+                          (u 7 8)            ; 16  nameKey
+                          (u 999 8)          ; 24  voxelCount
+                          (u 1 4)            ; 32  gridType
+                          (u 2 4)            ; 36  gridClass
+                          (repeat 48 0)      ; 40  worldBBox, 6 doubles
+                          (mapcat #(u % 4) [0 0 0 15 15 15]) ; 88 indexBBox
+                          (repeat 24 0)      ; 112 voxelSize, 3 doubles
+                          (u 3 4)            ; 136 nameSize
+                          (mapcat #(u % 4) [5 2 1 1])        ; 140 nodeCount
+                          (mapcat #(u % 4) [0 0 0])          ; 156 tileCount
+                          (u 0 2)            ; 168 codec
+                          (u 0 2)            ; 170 blindDataCount
+                          (u (nvdb/version 32 7 0) 4)))      ; 172 version
+        bytes (vec (concat (s->b "NanoVDB2") (u (nvdb/version 32 7 0) 4) (u 1 2) (u 0 2)
+                           meta (s->b "vel") (repeat 512 0xcd)))
+        [status segs] (nvdb/read-segments bytes)]
+    (is (= :ok status))
+    (is (= 176 (count meta)) "FileMetaData is 176 bytes")
+    (let [{:keys [metadata name grid]} (first segs)]
+      (is (= "vel" name))
+      (is (= 999 (:voxel-count metadata)))
+      (is (= [0 0 0 15 15 15] (:index-bbox metadata)))
+      (is (= [5 2 1 1] (:node-count metadata)))
+      (is (= 512 (count grid)))
+      (is (= {:major 32 :minor 7 :patch 0} (nvdb/version-parts (:version metadata)))))))
+
+(deftest the-magic-is-eight-bytes-not-a-number
+  ;; 0x324244566f6e614e is about 3.6e18, past 2^53, so reconstructing it as a
+  ;; double gives a value that is CLOSE to the constant and not equal to it.
+  ;; The first version of this namespace compared numbers and rejected its own
+  ;; output.
+  (let [seg (nvdb/segment {:name "g" :grid [1 2 3]})]
+    (is (= "NanoVDB2" (apply str (map #?(:clj char :cljs js/String.fromCharCode)
+                                      (subvec seg 0 8)))))
+    (is (= :ok (first (nvdb/read-segments seg))))))
+
+(deftest version-packs-eleven-eleven-ten
+  (doseq [[maj min patch] [[32 6 0] [32 7 1] [2047 2047 1023] [0 0 0]]]
+    (is (= {:major maj :minor min :patch patch}
+           (nvdb/version-parts (nvdb/version maj min patch))))))
+
+(deftest it-refuses-what-it-cannot-read
+  (testing "bytes that are not NanoVDB"
+    (let [[status msg] (nvdb/read-segments (vec (concat (s->b "NotAVDB!") (repeat 20 0))))]
+      (is (= :error status))
+      (is (string/includes? msg "not a NanoVDB magic number"))))
+
+  (testing "too short for a header"
+    (is (= :error (first (nvdb/read-segments [1 2 3])))))
+
+  (testing "a compressed segment is refused, not mis-read"
+    ;; ZIP and BLOSC change what follows the metadata. Reading on would return
+    ;; a buffer of compressed bytes labelled as a grid — which downstream is a
+    ;; grid full of noise, not an error.
+    (doseq [[codec label] [[1 "ZIP"] [2 "BLOSC"]]]
+      (let [seg (nvdb/segment {:name "g" :grid [1 2 3]})
+            compressed (assoc seg 14 codec)
+            [status msg] (nvdb/read-segments compressed)]
+        (is (= :error status))
+        (is (string/includes? msg label))
+        (is (string/includes? msg "labelled as a grid")))))
+
+  (testing "and a codec number that is not a codec"
+    (let [seg (assoc (nvdb/segment {:name "g" :grid [1]}) 14 9)
+          [status msg] (nvdb/read-segments seg)]
+      (is (= :error status))
+      (is (string/includes? msg "not one this knows")))))
+
+(deftest it-does-not-claim-to-decode-the-grid
+  ;; This reads the container. `voxel.vdb` is the tree. Nothing connects them,
+  ;; and the returned map says `:grid` is bytes.
+  (is (nil? (resolve 'voxel.nvdb/grid->tree)))
+  (is (nil? (resolve 'voxel.nvdb/read-tree)))
+  (let [[_ segs] (nvdb/read-segments (nvdb/segment {:name "g" :grid [7 7 7]}))]
+    (is (= [7 7 7] (:grid (first segs))))
+    (is (every? integer? (:grid (first segs)))
+        "bytes, not a decoded tree")))

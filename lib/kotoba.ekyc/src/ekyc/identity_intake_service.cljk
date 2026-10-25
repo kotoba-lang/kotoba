@@ -1,0 +1,43 @@
+(ns ekyc.identity-intake-service
+  "Private service-binding HTTP adapter. Mount only in a Worker with workers_dev
+  disabled and no routes. x-kotoba-principal is trusted only over this binding."
+  (:require [ekyc.identity-intake-host :as host] [ekyc.identity-intake :as intake]
+            [ekyc.identity-vault :as vault] [ekyc.passport :as p]))
+(defn bounded! [request limit]
+  (if-not (.-body request) (js/Promise.reject (ex-info "body-required" {:status 400}))
+    (let [reader (.getReader (.-body request)) chunks (array)]
+      (letfn [(step [size]
+                (-> (.read reader)
+                    (.then (fn [part]
+                             (if (.-done part)
+                               (-> (.arrayBuffer (js/Blob. chunks)) (.then #(js/Uint8Array. %)))
+                               (let [n (+ size (.-byteLength (.-value part)))]
+                                 (if (> n limit)
+                                   (-> (.cancel reader) (.then #(throw (ex-info "body-too-large" {:status 413}))))
+                                   (do (.push chunks (.-value part)) (step n)))))))))]
+        (step 0)))))
+(defn json-response [body status]
+  (js/Response. (js/JSON.stringify (clj->js body))
+                #js {:status status :headers #js {"content-type" "application/json" "cache-control" "no-store, private"}}))
+(defn handler [ports now!]
+  (vault/validate-ports! ports)
+  (fn [request]
+    (let [url (js/URL. (.-url request)) op (subs (.-pathname url) 1)
+          principal (.get (.-headers request) "x-kotoba-principal")]
+      (if-not (and (= "https://identity.internal" (.-origin url)) (= "POST" (.-method request)) (intake/text? principal))
+        (js/Promise.resolve (json-response {:error "private-binding-required"} 403))
+        (-> (bounded! request (if (= op "upload") 6291456 32768))
+            (.then (fn [bytes]
+                     (let [body (if (= op "upload")
+                                  {:id (.get (.-headers request) "x-kotoba-case") :slot (.get (.-headers request) "x-kotoba-slot")
+                                   :mediaType (.get (.-headers request) "content-type") :bytes bytes}
+                                  (js->clj (js/JSON.parse (.decode (js/TextDecoder.) bytes)) :keywordize-keys true))]
+                       (host/dispatch! ports op principal body (now!)))))
+            (.then (fn [result]
+                     (if (= op "evidence")
+                       (js/Response. (:bytes result) #js {:status 200 :headers (clj->js {"content-type" (:media-type result)
+                                                                                      "cache-control" "no-store, private"})})
+                       (json-response (cond-> result (:receipt-ref result) (assoc :receiptId (:receipt-ref result))) 200))))
+            (.catch (fn [error]
+                      ;; Never echo upstream exceptions, document values, keys or signatures.
+                      (json-response {:error "intake-not-accepted"} (or (:status (ex-data error)) 503)))))))))

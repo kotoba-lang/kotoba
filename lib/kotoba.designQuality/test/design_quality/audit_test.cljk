@@ -1,0 +1,210 @@
+(ns design-quality.audit-test
+  "Behavior both upstream forks rely on: axis completeness, weight sanity,
+   findings for a broken sample, a perfect sample scoring 100, the
+   override/skip/extra-axes mechanics, aggregate math — plus a JVM CLI smoke."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [design-quality.audit :as audit]
+            #?(:clj [design-quality.cli :as cli])
+            #?(:clj [clojure.java.io :as io])))
+
+;; --- samples -------------------------------------------------------------------
+
+(def perfect-src
+  "Satisfies every core axis AND both extra axes (16px+ inputs, solid colours)."
+  (str "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+       "<meta name=\"theme-color\" content=\"#111\">"
+       "<style>"
+       ":root{color-scheme:light dark}"
+       "html,body{overflow-x:hidden}"
+       "body{min-height:100dvh;background:#ffffff;color:#111111;"
+       "padding:env(safe-area-inset-top) env(safe-area-inset-bottom)}"
+       "button{min-height:44px;transition:opacity 100ms}"
+       "input{font-size:16px}"
+       ":focus-visible{outline:2px solid blue}"
+       "@media (prefers-reduced-motion: reduce){*{transition:none}}"
+       "@media (max-width:600px){main{padding:8px}}"
+       "</style></head><body><button>go</button><input></body></html>"))
+
+(def broken-src
+  (str "<html><head><style>"
+       "body{height:100vh;background:#ffffff;color:rgba(0,0,0,0.4)}"
+       ".card{transition:transform 200ms}"
+       "input{font-size:12px}"
+       "</style></head><body><button>x</button><input></body></html>"))
+
+;; --- axis completeness -----------------------------------------------------------
+
+(deftest default-axes-completeness
+  (testing "the 10-axis core both forks share, ids distinct, shape as data"
+    (is (= [:viewport :safe-area :dynamic-viewport :tap-targets :focus-visible
+            :reduced-motion :overflow-guard :color-scheme :responsive :semantics]
+           (mapv :id audit/default-axes)))
+    (is (apply distinct? (map :id audit/default-axes)))
+    (doseq [{:keys [id title weight check]} audit/default-axes]
+      (is (keyword? id))
+      (is (string? title))
+      (is (number? weight))
+      (is (fn? check)))))
+
+(deftest extra-axes-completeness
+  (testing "the isekai-only axes ship as data"
+    (is (= [:input-zoom :contrast] (mapv :id audit/extra-axes)))
+    (is (= 12 (count (audit/resolve-axes {:extra-axes audit/extra-axes}))))))
+
+;; --- weight sanity ----------------------------------------------------------------
+
+(deftest weight-sanity
+  (testing "weights are positive, bounded, and the normalizer covers them"
+    (doseq [{:keys [id weight]} (concat audit/default-axes audit/extra-axes)]
+      (is (< 0.0 weight 1.0) (str id)))
+    ;; both forks normalize by Σweight rather than requiring Σ = 1 —
+    ;; core sums to 0.89, the full isekai rubric to 1.08 (upstream values kept).
+    (let [core-sum (reduce + (map :weight audit/default-axes))
+          full-sum (reduce + (map :weight (concat audit/default-axes audit/extra-axes)))]
+      (is (< 0.85 core-sum 0.95))
+      (is (< 1.0 full-sum 1.15)))))
+
+;; --- scoring ---------------------------------------------------------------------
+
+(deftest perfect-sample-scores-100
+  (let [{:keys [overall axes]} (audit/score-page perfect-src)]
+    (is (= 100.0 (double overall)))
+    (is (every? #(= 1.0 (:score %)) axes))
+    (is (every? #(nil? (:finding %)) axes)))
+  (testing "still 100 with the extra isekai axes"
+    (is (= 100.0 (double (:overall (audit/score-page perfect-src {:extra-axes audit/extra-axes})))))))
+
+(deftest broken-sample-emits-findings
+  (let [{:keys [overall axes]} (audit/score-page broken-src {:extra-axes audit/extra-axes})
+        findings (into {} (keep (fn [a] (when (:finding a) [(:id a) (:finding a)])) axes))]
+    (is (< overall 50.0))
+    (doseq [ax [:viewport :safe-area :dynamic-viewport :tap-targets :focus-visible
+                :reduced-motion :overflow-guard :color-scheme :responsive :semantics
+                :input-zoom :contrast]]
+      (is (contains? findings ax) (str "expected a finding for " ax)))
+    (is (str/includes? (findings :input-zoom) "12"))
+    (is (str/includes? (findings :contrast) "4.5:1"))))
+
+(deftest score-is-weight-normalized
+  (testing "overall = 100 * Σ(score*w) / Σw (the isekai iteration-02 fix)"
+    (let [{:keys [overall axes]} (audit/score-page broken-src)
+          total (reduce + (map :weight axes))
+          weighted (reduce + (map #(* (:score %) (:weight %)) axes))]
+      (is (< (Math/abs (- overall (* 100.0 (/ weighted total)))) 1e-9)))))
+
+;; --- override / skip / weights mechanics --------------------------------------------
+
+(deftest skip-mechanics
+  (let [axes (audit/resolve-axes {:skip #{:contrast :semantics} :extra-axes audit/extra-axes})]
+    (is (not-any? #(#{:contrast :semantics} (:id %)) axes))
+    (is (= 10 (count axes))))
+  (testing "skipping every failing axis yields a perfect score"
+    ;; a partially-broken page: passes most axes, fails viewport/safe-area/color-scheme
+    (let [partial-src (str "<html lang=\"en\"><head><meta charset=\"utf-8\"><style>"
+                           "html{overflow-x:hidden}:focus-visible{outline:1px solid}"
+                           "@media (max-width:600px){main{padding:4px}}"
+                           "</style></head><body><p>text only</p></body></html>")
+          all-ids (into #{} (map :id) audit/default-axes)
+          failing (into #{} (keep #(when (:finding %) (:id %)))
+                        (:axes (audit/score-page partial-src)))]
+      (is (= #{:viewport :safe-area :color-scheme} failing))
+      (is (= 100.0 (double (:overall (audit/score-page partial-src {:skip failing})))))
+      (is (= (- (count all-ids) (count failing))
+             (count (:axes (audit/score-page partial-src {:skip failing}))))))))
+
+(deftest weights-override-mechanics
+  (testing "a re-weighted axis moves the aggregate (weights as data)"
+    (let [base (:overall (audit/score-page broken-src))
+          ;; :responsive scores 0 on broken-src; giving it huge weight drags overall down
+          heavy (:overall (audit/score-page broken-src {:weights {:responsive 10.0}}))]
+      (is (< heavy base)))
+    (let [axes (audit/resolve-axes {:weights {:viewport 0.42}})]
+      (is (= 0.42 (:weight (first (filter #(= :viewport (:id %)) axes))))))))
+
+(deftest axes-replacement-mechanics
+  (testing "consumers can replace the base set wholesale (custom finding text etc.)"
+    (let [custom [{:id :always-bad :title "always bad" :weight 1.0
+                   :check (fn [_] {:score 0.0 :finding "custom"})}]
+          {:keys [overall axes]} (audit/score-page perfect-src {:axes custom})]
+      (is (= 0.0 (double overall)))
+      (is (= [:always-bad] (mapv :id axes)))
+      (is (= "custom" (:finding (first axes)))))))
+
+;; --- aggregate math ---------------------------------------------------------------
+
+(deftest aggregate-math
+  (let [{:keys [overall pages findings]} (audit/audit {"good" perfect-src "bad" broken-src})]
+    (is (= 2 (count pages)))
+    (is (< (Math/abs (- overall
+                        (/ (+ (get-in pages ["good" :overall])
+                              (get-in pages ["bad" :overall]))
+                           2.0)))
+           1e-9))
+    (testing "findings aggregate across pages, heaviest headroom first, bad-page only"
+      (is (seq findings))
+      (is (= (sort-by :headroom > findings) findings))
+      (is (every? #(= ["bad"] (:pages %)) findings))
+      (doseq [{:keys [axis weight pages worst-score headroom]} findings]
+        (is (keyword? axis))
+        (is (number? weight))
+        (is (vector? pages))
+        (is (<= 0.0 worst-score 1.0))
+        (is (pos? headroom)))))
+  (testing "empty page set"
+    (is (= 0.0 (:overall (audit/audit {}))))))
+
+;; --- WCAG contrast machinery ---------------------------------------------------------
+
+(deftest contrast-calculator
+  (is (= [255 255 255 1.0] (audit/parse-color "#fff")))
+  (is (= [0 0 0 1.0] (audit/parse-color "#000000")))
+  (is (= [0.0 0.0 0.0 0.4] (audit/parse-color "rgba(0,0,0,0.4)")))
+  (is (nil? (audit/parse-color "inherit")))
+  (testing "black on white is 21:1, white on white is 1:1"
+    (is (< 20.9 (audit/contrast-ratio [0 0 0] [255 255 255]) 21.1))
+    (is (< 0.99 (audit/contrast-ratio [255 255 255] [255 255 255]) 1.01))))
+
+;; --- CLI (JVM smoke; the nbb/bb paths are exercised in CI shell steps) ---------------
+
+#?(:clj
+   (defn- run-cli
+     "Run cli/run capturing stdout → {:exit .. :result .. :out str}."
+     [args]
+     (let [res (atom nil)
+           out (with-out-str (reset! res (cli/run args)))]
+       (assoc @res :out out))))
+
+#?(:clj
+   (deftest cli-smoke
+     (let [dir (doto (io/file (System/getProperty "java.io.tmpdir")
+                              (str "dq-cli-" (System/nanoTime)))
+                 (.mkdirs))
+           good (io/file dir "good.html")
+           bad (io/file dir "bad.html")]
+       (try
+         (spit good perfect-src)
+         (spit bad broken-src)
+         (testing "score a directory, human report"
+           (let [{:keys [exit result out]} (run-cli ["score" (.getPath dir)])]
+             (is (= 0 exit))
+             (is (= 2 (count (:pages result))))
+             (is (str/includes? out "aggregate:"))
+             (is (str/includes? out "findings (headroom-first):"))))
+         (testing "gate passes: perfect file with --min 99"
+           (is (= 0 (:exit (run-cli ["score" (.getPath good) "--min" "99"])))))
+         (testing "gate fails: broken file with --min 99 → exit 1"
+           (is (= 1 (:exit (run-cli ["score" (.getPath bad) "--min" "99"])))))
+         (testing "--skip and --edn"
+           (let [skip-all (str/join "," (map (comp name :id) audit/default-axes))
+                 {:keys [exit result out]} (run-cli ["score" (.getPath bad) "--edn" "--skip" skip-all])]
+             (is (= 0 exit))
+             (is (= 0 (count (:axes (get (:pages result) (.getPath bad))))))
+             (is (str/starts-with? out "{"))))
+         (testing "bad args"
+           (is (= 1 (:exit (run-cli ["score"]))))
+           (is (= 1 (:exit (run-cli ["nope"])))))
+         (finally
+           (doseq [f [good bad]] (.delete ^java.io.File f))
+           (.delete ^java.io.File (io/file dir)))))))

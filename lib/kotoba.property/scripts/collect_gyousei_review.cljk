@@ -1,0 +1,179 @@
+(ns collect-gyousei-review
+  "行政事業レビューシートのデータベース（xlsx）から支出先を取り出す。
+
+   ## 外部ツールに頼る箇所を 1 つに絞る
+
+   xlsx は zip + SpreadsheetML。**展開だけ `unzip -p` に任せ**、解析はここで行う
+   （`pdftotext` に頼る官報収集器と同じ形）。無ければ空ファイルを書かずに止まる。
+
+   実測 2026-08-19（`database240918.xlsx`）: sharedStrings 46 MB /
+   sheet1 67 MB / 5,442 行 / 14,298 列。
+
+   ## ⚠ 既定の curl UA は 404 になる
+
+   `gyoukaku.go.jp` は User-Agent を見ており、curl の既定 UA には**全経路で 404**を
+   返す（サイズまで同一の 404 ページ）。**ブラウザを騙らない** —— 素性を名乗る UA
+   （下記）で 200 が返る。robots.txt は存在しない（404 ページが返る）。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_gyousei_review.cljk --xlsx <file> --out <o>
+       [--dropped-out <f>]   組織だと言えず落とした名前（規則の点検用）
+       [--numbers <f>]       面が持つ法人番号だけに絞る
+       [--fold]              会社 × 府省に畳む（面に置く形。明細は corpus に残る）
+     kbb --backend sci -cp src scripts/collect_gyousei_review.cljk --download --out <o>"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.gyousei-review :as gr]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- flag? [n] (boolean (some #(= n %) argv)))
+
+(def user-agent "kotoba-property/1.0 (+https://github.com/kotoba-lang/property)")
+(def source-page "https://www.gyoukaku.go.jp/review/database/")
+
+(defn- unzip? []
+  (try (.execFileSync cp "unzip" #js ["-v"] #js {:stdio "ignore"}) true
+       (catch :default _ false)))
+
+(defn- part [xlsx name]
+  (.toString (.execFileSync cp "unzip" #js ["-p" xlsx name]
+                            #js {:maxBuffer (* 512 1024 1024)})))
+
+(defn shared-strings
+  "`<si>` を順に平文へ。`<t>` が複数ある（書式が割れた）セルは連結する ——
+   連結しないと『株式会社』と『日立製作所』が別の文字列になり、名前が壊れる。"
+  [xml]
+  (->> (re-seq #"(?s)<si>(.*?)</si>" xml)
+       (mapv (fn [[_ body]]
+               (->> (re-seq #"(?s)<t[^>]*>(.*?)</t>" body)
+                    (map second)
+                    (str/join "")
+                    (#(-> % (str/replace "&amp;" "&") (str/replace "&lt;" "<")
+                          (str/replace "&gt;" ">") (str/replace "&quot;" "\"")
+                          (str/replace "&#10;" "\n"))))))))
+
+(defn row-cells
+  "1 行の XML -> `{列文字 値}`。共有文字列は解決する。"
+  [row strs]
+  (into {}
+        (keep (fn [[_ ref t v]]
+                (when v
+                  (let [col (str/replace ref #"\d+$" "")
+                        val (if (= t "s")
+                              (get strs (js/parseInt v 10))
+                              v)]
+                    (when val [col val]))))
+              (re-seq #"<c r=\"([A-Z]+\d+)\"(?:[^>]*?t=\"(\w+)\")?[^>]*>(?:<v>([^<]*)</v>)?" row))))
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        ;; **版そのものを識別子にする。** 年は名乗れない（シートが前年度の入札を
+        ;; 含むと注記しており、さらに 240502 と 240918 はどちらも 2024 年公表）。
+        xlsx (arg "--xlsx" nil)]
+    (when-not (and out xlsx)
+      (println "usage: collect_gyousei_review.cljs --xlsx <file> --out <o> [--year 2024]")
+      (js/process.exit 2))
+    (when-not (unzip?)
+      (println "unzip is required and was not found — refusing to write an empty file")
+      (js/process.exit 2))
+    (let [wanted (when-let [nf (arg "--numbers" nil)]
+                   ;; **全件を commit しない。** 80,319 行の支出先をそのまま面に置くと
+                   ;; クエリのたびに 39 MB を load する。面が持つ番号に絞り、
+                   ;; 絞る前の分母は manifest に残す（gbizinfo / closures と同じ規律）。
+                   (when (.existsSync fs nf)
+                     (into #{} (filter #(re-matches #"[0-9]{13}" %))
+                           (map str/trim (str/split (.readFileSync fs nf "utf8") #"\n")))))
+          strs (shared-strings (part xlsx "xl/sharedStrings.xml"))
+          sheet (part xlsx "xl/worksheets/sheet1.xml")
+          rows (map second (re-seq #"(?s)<row [^>]*>(.*?)</row>" sheet))
+          header (row-cells (first rows) strs)
+          ;; 列文字ではなくヘッダ名で引く（年度版で列が動く）。
+          col->program (into {} (keep (fn [[col name*]]
+                                        (when-let [attr (get gr/program-columns name*)]
+                                          [col attr]))
+                                      header))
+          col->recipient (into {} (keep (fn [[col name*]]
+                                          (when-let [r (gr/recipient-column name*)]
+                                            [col r]))
+                                        header))
+          state (atom {:programs 0 :seen 0 :dropped 0 :records [] :dropped-names [] :kept-all 0 :placeholder 0})]
+      (when (empty? col->recipient)
+        (js/console.error "collect-gyousei-review: no 支出先 columns in the header — the workbook layout changed")
+        (js/process.exit 2))
+      (doseq [row (rest rows)]
+        (let [cells (row-cells row strs)
+              program (into {} (keep (fn [[col attr]]
+                                       (when-let [v (get cells col)] [attr v]))
+                                     col->program))
+              ;; ⚠ `seq` を束縛名にしない —— `clojure.core/seq` を隠して
+              ;; `(seq ...)` が「数値を呼ぶ」になる（実測 2026-08-19、
+              ;; `za.call is not a function` で落ちた）。
+              groups (reduce (fn [acc [col {:keys [block rank field]}]]
+                               (if-let [v (get cells col)]
+                                 (assoc-in acc [[block rank] field] v)
+                                 acc))
+                             {}
+                             col->recipient)]
+          (swap! state update :programs inc)
+          (doseq [[[block rank] fields] groups
+                  :when (not (str/blank? (str (:name fields))))]
+            (swap! state update :seen inc)
+            ;; 相手が書かれていない欄は**別に数える** —— 個人を守って落とした数と
+            ;; 混ぜると、規則の厳しさも記入漏れの多さも分からなくなる。
+            (when (gr/placeholder? (:name fields))
+              (swap! state update :placeholder inc))
+            (if-let [rec (and (not (gr/placeholder? (:name fields)))
+                              (gr/recipient-record {:program program :block block :rank rank
+                                                    :fields fields :publish (.basename path xlsx)}))]
+              (do (swap! state update :kept-all inc)
+                  (when (or (nil? wanted)
+                            (contains? wanted (:company/houjin-bangou rec)))
+                    (swap! state update :records conj rec)))
+              ;; **落としたものは数えるだけでなく見られるようにする。**
+              ;; 「組織だと言えなかった」は規則の判断であって事実ではないので、
+              ;; 判断を後から点検できないと規則を直せない。
+              (when-not (gr/placeholder? (:name fields))
+                (swap! state (fn [st]
+                               (-> st
+                                   (update :dropped inc)
+                                   (update :dropped-names conj (str (:name fields)))))))))))
+      (when-let [df (arg "--dropped-out" nil)]
+        (let [names (sort (distinct (:dropped-names @state)))]
+          (.writeFileSync fs df (str/join "\n" names) "utf8")
+          (println (str "  wrote " (count names) " distinct dropped name(s) -> " df))))
+      (let [{:keys [programs seen dropped records kept-all placeholder]} @state
+            ;; `--fold` で会社 × 府省に畳む（面に置くのはこちら。明細は corpus）。
+            records (if (flag? "--fold") (gr/fold-recipients records) records)
+            with-hb (count (filter :company/houjin-bangou records))
+            manifest (gr/corpus-manifest {:observed-at (.toISOString (js/Date.))
+                                          :record-count (count records)
+                                          :programs programs
+                                          :recipients-seen seen
+                                          :organisations-seen kept-all
+                                          :placeholder-rows placeholder
+                                          :queried (count (or wanted #{}))
+                                          :dropped-individuals dropped
+                                          :with-houjin-bangou with-hb
+                                          :folded-from (when (flag? "--fold")
+                                                         (count (:records @state)))
+                                          :publish (.basename path xlsx)
+                                          :source-url source-page})]
+        (when (zero? (count records))
+          (js/console.error "collect-gyousei-review: parsed the workbook and kept no recipient — that is a failure here, not an empty year")
+          (js/process.exit 2))
+        (.mkdirSync fs (.dirname path out) #js {:recursive true})
+        (.writeFileSync fs out
+                        (str (pr-str manifest) "\n"
+                             (str/join "\n" (map pr-str records)) "\n")
+                        "utf8")
+        (println (pr-str {:out out :programs programs :recipients-seen seen
+                          :organisations kept-all
+                          :kept (count records) :with-houjin-bangou with-hb
+                          :dropped-not-organisation dropped
+                          :placeholder-rows placeholder
+                          :bytes (.-size (.statSync fs out))}))))))
+
+(-main)

@@ -1,0 +1,154 @@
+(ns dnssec.nsec3-test
+  (:require [kotoba.lang.text] [kotoba.test :refer [deftest is testing]]
+            [dnssec.canonical :as c]
+            [dnssec.nsec3 :as n3]
+            [dnssec.provider :as p]))
+
+(defn- a-rr [nm addr]
+  {:zone/name nm :zone/ttl 300 :zone/class "IN" :zone/type "A"
+   :zone/rdata {:zone/address addr}})
+
+(def zone
+  [(a-rr "example.com." "192.0.2.1")
+   (a-rr "www.example.com." "192.0.2.2")
+   (a-rr "mail.example.com." "192.0.2.3")
+   (a-rr "secret-internal-host.example.com." "192.0.2.4")])
+
+(def opts {:apex "example.com." :salt [] :iterations 0})
+
+;; ── base32hex ─────────────────────────────────────────────────────────────
+
+(deftest base32hex-is-the-extended-hex-alphabet-not-standard-base32
+  (testing "RFC 4648 base32hex test vectors"
+    (is (= "CO" (n3/base32hex (mapv int "f"))))
+    (is (= "CPNG" (n3/base32hex (mapv int "fo"))))
+    (is (= "CPNMU" (n3/base32hex (mapv int "foo"))))
+    (is (= "CPNMUOG" (n3/base32hex (mapv int "foob"))))
+    (is (= "CPNMUOJ1" (n3/base32hex (mapv int "fooba"))))
+    (is (= "CPNMUOJ1E8" (n3/base32hex (mapv int "foobar")))))
+  (testing "standard base32 would spell the same bytes differently"
+    ;; standard base32 of "foobar" is MZXW6YTBOI — no digits, different letters
+    (is (not= "MZXW6YTBOI" (n3/base32hex (mapv int "foobar"))))
+    (is (re-matches #"[0-9A-V]+" (n3/base32hex (mapv int "foobar")))
+        "0-9A-V, not A-Z2-7 — they differ in every symbol"))
+  (testing "unpadded, because an NSEC3 owner name carries no ="
+    (is (not (kotoba.lang.text/includes? (n3/base32hex [1]) "=")))))
+
+;; ── hashing ───────────────────────────────────────────────────────────────
+
+(deftest the-hash-is-over-the-canonical-wire-name-not-the-text
+  (let [h (n3/hash-name p/sha1-fn "www.example.com." opts)]
+    (is (= 20 (count h)) "SHA-1 is 20 octets")
+    (testing "case does not change it — the wire form is lowercased"
+      (is (= h (n3/hash-name p/sha1-fn "WWW.Example.COM." opts))))
+    (testing "and it is not the hash of the text"
+      (is (not= h (p/->octets (p/sha1-fn (mapv int "www.example.com."))))
+          "hashing the text gives a chain no validator can reproduce"))
+    (testing "it IS the hash of the encoded name"
+      (is (= h (p/->octets (p/sha1-fn (c/encode-name "www.example.com."))))))))
+
+(deftest the-salt-is-applied-at-every-iteration
+  (let [no-salt (n3/hash-name p/sha1-fn "a.example.com." {:salt [] :iterations 2})
+        salted (n3/hash-name p/sha1-fn "a.example.com." {:salt [0xAA 0xBB] :iterations 2})]
+    (is (not= no-salt salted))
+    (testing "and applying it only on the first round gives a different answer"
+      ;; first round only: H(name||salt), then H(digest) with no salt
+      (let [once (loop [d (p/->octets (p/sha1-fn (into (vec (c/encode-name "a.example.com."))
+                                                       [0xAA 0xBB])))
+                        k 0]
+                   (if (>= k 2) d (recur (p/->octets (p/sha1-fn d)) (inc k))))]
+        (is (not= salted once)
+            "the common implementation error, and it produces a chain nobody else computes")))))
+
+(deftest iterations-above-the-bound-are-refused
+  (is (thrown? js/Error
+               (n3/hash-name p/sha1-fn "a.example.com." {:iterations 150})))
+  (testing "RFC 9276 recommends zero, and that is the default"
+    (is (zero? n3/default-iterations))
+    (is (= [] n3/default-salt))
+    (is (= (n3/hash-name p/sha1-fn "a.example.com." {})
+           (n3/hash-name p/sha1-fn "a.example.com." {:iterations 0 :salt []})))))
+
+;; ── the chain ─────────────────────────────────────────────────────────────
+
+(deftest the-chain-is-ordered-by-hash-not-by-name
+  (let [ch (n3/chain p/sha1-fn zone opts)
+        hashes (mapv :nsec3/hash ch)]
+    (is (= 4 (count ch)))
+    (is (= hashes (vec (sort c/compare-bytes hashes))) "sorted by hash")
+    (testing "which is the point — the order reveals nothing about the names"
+      (let [name-order (mapv #(c/canonical-name (:zone/name %))
+                             (sort-by #(c/canonical-name (:zone/name %)) zone))
+            hash-order (mapv :nsec3/hash ch)]
+        (is (not= (mapv #(n3/hash-name p/sha1-fn % opts) name-order) hash-order)
+            "if the hash order matched the name order the reordering bought nothing")))))
+
+(deftest the-chain-wraps
+  (let [ch (n3/chain p/sha1-fn zone opts)]
+    (is (= (:nsec3/hash (first ch)) (:nsec3/next (last ch)))
+        "without the wrap, every name hashing past the largest hash is unprovable")))
+
+(deftest owner-names-are-base32hex-under-the-apex
+  (let [ch (n3/chain p/sha1-fn zone opts)]
+    (doseq [r ch]
+      (is (re-matches #"[0-9A-V]{32}\.example\.com\." (:zone/name r))
+          (str "unexpected owner name " (:zone/name r))))))
+
+(deftest a-zone-name-is-not-readable-from-the-chain
+  (let [ch (n3/chain p/sha1-fn zone opts)
+        text (pr-str ch)]
+    (is (not (kotoba.lang.text/includes? text "secret-internal-host"))
+        "this is the entire reason NSEC3 exists")
+    (is (not (kotoba.lang.text/includes? text "www.example.com")))))
+
+;; ── coverage, including the wrap ──────────────────────────────────────────
+
+(deftest covers-handles-the-ordinary-interval
+  (let [r {:nsec3/hash [0x10] :nsec3/next [0x20]}]
+    (is (n3/covers? r [0x18]))
+    (is (not (n3/covers? r [0x08])))
+    (is (not (n3/covers? r [0x28])))
+    (testing "the endpoints are excluded — a hash equal to an endpoint EXISTS"
+      (is (not (n3/covers? r [0x10])))
+      (is (not (n3/covers? r [0x20]))))))
+
+(deftest covers-handles-the-wrap-at-the-end-of-the-chain
+  ;; The last record's next is SMALLER than its own hash. Written as a plain
+  ;; `lo < x < hi` range this interval is never covered — and it is exactly the
+  ;; one an attacker would aim at.
+  (let [r {:nsec3/hash [0xF0] :nsec3/next [0x10]}]
+    (is (n3/covers? r [0xFF]) "above the last hash")
+    (is (n3/covers? r [0x05]) "below the first hash")
+    (is (not (n3/covers? r [0x80])) "inside the rest of the chain")
+    (testing "a naive range check would cover nothing here"
+      (is (not (and (pos? (c/compare-bytes [0xFF] [0xF0]))
+                    (neg? (c/compare-bytes [0xFF] [0x10]))))))))
+
+(deftest every-name-in-the-zone-is-covered-by-exactly-one-record
+  (let [ch (n3/chain p/sha1-fn zone opts)]
+    (doseq [probe ["nope.example.com." "also-missing.example.com." "zzz.example.com."]]
+      (let [h (n3/hash-name p/sha1-fn probe opts)
+            covering (filter #(n3/covers? % h) ch)]
+        (is (= 1 (count covering))
+            (str probe " should fall in exactly one interval, found " (count covering)))))))
+
+;; ── the params record ─────────────────────────────────────────────────────
+
+(deftest nsec3param-carries-what-a-validator-needs-to-recompute-the-hash
+  (let [p' (n3/nsec3param (assoc opts :salt [0xDE 0xAD]))
+        raw (get-in p' [:zone/rdata :zone/raw])]
+    (is (= "NSEC3PARAM" (:zone/type p')))
+    (is (= "example.com." (:zone/name p')))
+    (is (= 1 (nth raw 0)) "hash algorithm SHA-1")
+    (is (= 0 (nth raw 1)) "flags")
+    (is (= [0 0] (subvec raw 2 4)) "iterations, big-endian u16")
+    (is (= 2 (nth raw 4)) "salt length")
+    (is (= [0xDE 0xAD] (subvec raw 5 7)))
+    (testing "without it a validator cannot compute the hash to look for, so a fully signed zone still proves nothing"
+      (is (some? p')))))
+
+(deftest opt-out-is-not-produced
+  (let [ch (n3/chain p/sha1-fn zone opts)]
+    (doseq [r ch]
+      (is (zero? (nth (get-in r [:zone/rdata :zone/raw]) 1))
+          "flags must be 0; opt-out is a different security model, not a parameter"))))

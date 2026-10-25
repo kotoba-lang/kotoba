@@ -1,0 +1,130 @@
+#!/usr/bin/env kbb
+;; etzhayyim-project-common-crawl — Phase 5 DID/domain injection (clj/cljc port of
+;; scripts/phase5_inject_did.py; ADR-2606280030).
+;;
+;; Faithful port of the domain-loading + DID/slug derivation + PDS XRPC record
+;; building. The RisingWave gap-domain loader (load_domains_from_risingwave) is NOT
+;; ported as a psycopg call — it becomes the injectable `common-crawl.store` seam
+;; (RisingWave is forbidden canonical state). PDS writes use babashka.http-client.
+(ns common-crawl.inject
+  "Phase 5 — load CC domains, derive DIDs, build the PDS identity.create + createRecord
+   payloads (pure helpers + a clj XRPC caller)."
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [cheshire.core :as json])
+            #?(:clj [babashka.http-client :as http])))
+
+(def site-app-did "did:web:site.etzhayyim.com")
+
+;; ── derivation ────────────────────────────────────────────────────────────────
+
+(defn domain-slug
+  "slug for a domain record: explicit :slug, else domain with `.`/`_` → `-`."
+  [d]
+  (or (get d "slug")
+      (-> (get d "domain") (str/replace "." "-") (str/replace "_" "-"))))
+
+(defn domain-did
+  "DID for a domain record: explicit :did, else did:web:site.etzhayyim.com:{slug}."
+  [d]
+  (or (get d "did") (str site-app-did ":" (domain-slug d))))
+
+;; ── loaders (pure) ────────────────────────────────────────────────────────────
+
+(defn load-domains-from-jsonl-lines
+  "Parse JSONL lines into domain maps, drop those under `min-pages`, cap at `limit`
+   (0 = all), then sort by pageCount descending — verbatim port of
+   load_domains_from_jsonl (the limit is applied BEFORE the sort, as in Python)."
+  [lines {:keys [min-pages limit] :or {min-pages 0 limit 0}}]
+  #?(:clj
+     (->> lines
+          (remove str/blank?)
+          (map #(json/parse-string %))
+          (filter #(or (<= min-pages 0) (>= (get % "pageCount" 0) min-pages)))
+          ((fn [xs] (if (pos? limit) (take limit xs) xs)))
+          (sort-by #(get % "pageCount" 0) >)
+          vec)
+     :cljs (throw (ex-info "load-domains-from-jsonl-lines: cljs JSON not wired" {}))))
+
+(def ^:private cypher-domain-re
+  #"MERGE \(d:CcDomain \{name: \"([^\"]+)\"\}\).*d\.did = \"([^\"]+)\".*d\.slug = \"([^\"]+)\"")
+(def ^:private cypher-topics-re #"d\.topics = (\[.*?\])")
+
+(defn parse-cypher-domain-line
+  "Extract {name did slug topics} from one CcDomain MERGE line, or nil."
+  [line]
+  #?(:clj
+     (when-let [m (re-find cypher-domain-re line)]
+       (let [topics (when-let [tm (re-find cypher-topics-re line)]
+                      (try (json/parse-string (second tm)) (catch Exception _ nil)))]
+         {"domain" (nth m 1) "did" (nth m 2) "slug" (nth m 3)
+          "topics" (or topics []) "pageCount" 1}))
+     :cljs (throw (ex-info "parse-cypher-domain-line: cljs JSON not wired" {}))))
+
+(defn load-domains-from-cypher-lines
+  "Fold CcDomain MERGE lines into unique domains, incrementing pageCount on repeat,
+   then sort by pageCount descending (port of load_domains_from_cypher)."
+  [lines {:keys [limit] :or {limit 0}}]
+  (let [by-name (reduce
+                 (fn [acc line]
+                   (if-let [d (parse-cypher-domain-line line)]
+                     (let [nm (get d "domain")]
+                       (if (contains? acc nm)
+                         (update-in acc [nm "pageCount"] (fnil inc 0))
+                         (assoc acc nm d)))
+                     acc))
+                 {} lines)
+        sorted (sort-by #(get % "pageCount" 0) > (vals by-name))]
+    (vec (if (pos? limit) (take limit sorted) sorted))))
+
+;; ── PDS record builders (pure) ────────────────────────────────────────────────
+
+(defn identity-create-doc
+  "documentJson payload for com.atproto.identity.create."
+  [d]
+  (let [domain (get d "domain")
+        sample (get d "sampleTitles")
+        desc   (cond-> (str "[AI Agent — unofficial] Internet domain: " domain)
+                 (seq sample) (str " | Sample: "
+                                   (let [t (str (first sample))]
+                                     (if (> (count t) 100) (subs t 0 100) t))))]
+    {:displayName domain
+     :description desc
+     :domain domain
+     :pageCount (get d "pageCount" 0)
+     :topics (get d "topics" [])}))
+
+(defn domain-record
+  "com.etzhayyim.apps.site.domain record body."
+  [d]
+  {:domain (get d "domain")
+   :slug (domain-slug d)
+   :did (domain-did d)
+   :pageCount (get d "pageCount" 0)
+   :topics (get d "topics" [])
+   :source "common-crawl"
+   :crawl "CC-MAIN-2026-12"})
+
+;; ── XRPC (clj only) ───────────────────────────────────────────────────────────
+
+#?(:clj
+   (defn pds-config
+     "PDS endpoint config from env."
+     [getenv]
+     {:url   (or (getenv "PDS_URL") "https://atproto.etzhayyim.com")
+      :token (or (getenv "etzhayyim_TOKEN") "")}))
+
+#?(:clj
+   (defn xrpc-call
+     "POST to a PDS XRPC endpoint with the internal-auth + active-DID headers
+      (mirror of phase5 xrpc_call). Returns the parsed body map or {:error …}."
+     [{:keys [url]} nsid body _token]
+     (let [resp (http/post (str url "/xrpc/" nsid)
+                           {:headers {"Content-Type" "application/json"
+                                      "x-kotodama-verified" "true"
+                                      "X-Active-DID" site-app-did}
+                            :body (json/generate-string body)
+                            :timeout 120000
+                            :throw false})]
+       (if (>= (:status resp) 400)
+         {:error (subs (str (:body resp)) 0 (min 200 (count (str (:body resp)))))}
+         (try (json/parse-string (:body resp)) (catch Exception _ {:ok true}))))))

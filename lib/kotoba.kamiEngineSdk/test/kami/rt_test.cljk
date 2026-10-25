@@ -1,0 +1,109 @@
+(ns kami.rt-test
+  "GPU-free contract tests for kami.rt: recipe validation, IR normalization,
+  WGSL ray-query emission, per-backend lowering (emit vs delegate vs nda), and a
+  CPU reference intersector that pins the trace *semantics* without a GPU."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotoba.lang.text :as str]
+            [kami.rt :as rt]))
+
+(deftest validation
+  (testing "minimal recipe (just a name) validates"
+    (is (true? (rt/valid? {:rt/name "gi"}))))
+  (testing "non-string name rejected"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (rt/valid? {:rt/name :gi}))))
+  (testing "unknown accel/integrator/format rejected"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (rt/valid? {:rt/name "x" :rt/accel {:kind :bogus}})))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (rt/valid? {:rt/name "x" :rt/integrator {:kind :bogus}})))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (rt/valid? {:rt/name "x" :rt/output {:format :rgba12 :denoise :none}}))))
+  (testing "negative bounces / zero spp rejected"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (rt/valid? {:rt/name "x" :rt/integrator {:kind :path :max-bounces -1}})))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (rt/valid? {:rt/name "x" :rt/integrator {:kind :path :spp 0}})))))
+
+(deftest pipeline-fills-defaults
+  (let [ir (rt/pipeline {:rt/name "gi"})]
+    (testing "defaults merged"
+      (is (= :bvh  (-> ir :rt/accel :kind)))
+      (is (= :path (-> ir :rt/integrator :kind)))
+      (is (= 4     (-> ir :rt/integrator :max-bounces)))
+      (is (= :sobol (-> ir :rt/sampler :kind))))
+    (testing "author overrides win"
+      (is (= 8 (-> (rt/pipeline {:rt/name "x" :rt/integrator {:max-bounces 8}})
+                   :rt/integrator :max-bounces))))))
+
+(deftest pipeline-derives-passes
+  (testing "denoise present → primary/trace/denoise/present"
+    (is (= [:primary :trace :denoise :present]
+           (map :pass/id (:rt/passes (rt/pipeline {:rt/name "gi"}))))))
+  (testing "denoise :none → no denoise pass"
+    (is (= [:primary :trace :present]
+           (map :pass/id (:rt/passes (rt/pipeline {:rt/name "gi" :rt/output {:format :rgba16f :denoise :none}})))))))
+
+(deftest pipeline-is-pure-serializable
+  (testing "same recipe → identical IR (record/replay surface)"
+    (let [r {:rt/name "gi" :rt/integrator {:spp 16}}]
+      (is (= (rt/pipeline r) (rt/pipeline r))))))
+
+(deftest emit-wgsl-bakes-integrator
+  (let [ir  (rt/pipeline {:rt/name "gi" :rt/integrator {:max-bounces 6 :spp 16 :clamp 8.0}
+                          :rt/sampler {:kind :halton :seed 7}})
+        out (rt/emit :wgsl ir)
+        src (:wgsl out)]
+    (testing "descriptor shape"
+      (is (= :wgsl (:backend out)))
+      (is (= "trace" (:entry out)))
+      (is (= [8 8 1] (:workgroup out))))
+    (testing "integrator params baked as override constants"
+      (is (str/includes? src "RT_MAX_BOUNCES: u32 = 6u"))
+      (is (str/includes? src "RT_SPP: u32 = 16u"))
+      (is (str/includes? src "RT_CLAMP: f32 = 8.0"))
+      (is (str/includes? src "RT_SEED: u32 = 7u")))
+    (testing "uses WebGPU ray-query"
+      (is (str/includes? src "ray_query"))
+      (is (str/includes? src "rayQueryInitialize"))
+      (is (str/includes? src "struct RtGlobals")))))
+
+(deftest emit-delegate-and-nda-backends
+  (let [ir (rt/pipeline {:rt/name "gi"})]
+    (testing "metal/vulkan → delegate plan (no shader emitted here)"
+      (let [m (rt/emit :metal ir)]
+        (is (= :delegate (:status m)))
+        (is (true? (:delegate m)))
+        (is (= :metal-rt (:api m)))
+        (is (nil? (:wgsl m)))))
+    (testing "ps5/switch → nda plan"
+      (is (= :nda (:status (rt/emit :ps5 ir))))
+      (is (= :nda (:status (rt/emit :switch ir)))))
+    (testing "every plan carries the derived passes"
+      (is (= (:rt/passes ir) (:passes (rt/emit :unreal ir)))))
+    (testing "unknown backend throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error) (rt/emit :n64 ir))))))
+
+(deftest targets-matrix-covers-requested-platforms
+  (is (every? (set (keys rt/targets))
+              [:wgsl :metal :vulkan :dx12 :ps5 :switch :unity :unreal]))
+  (is (= :emit (-> rt/targets :wgsl :status))))
+
+;; --- CPU reference intersector (semantics oracle) ---------------------------
+
+(deftest cpu-intersect-sphere
+  (let [ray {:o [0.0 0.0 0.0] :d [0.0 0.0 -1.0]}]
+    (testing "hits a sphere straight ahead at the near surface"
+      (is (= 4.0 (rt/intersect-sphere ray {:c [0.0 0.0 -5.0] :r 1.0}))))
+    (testing "misses a sphere off-axis"
+      (is (nil? (rt/intersect-sphere ray {:c [10.0 0.0 -5.0] :r 1.0}))))
+    (testing "no hit behind the ray origin"
+      (is (nil? (rt/intersect-sphere ray {:c [0.0 0.0 5.0] :r 1.0}))))))
+
+(deftest cpu-trace-picks-nearest
+  (let [ray {:o [0.0 0.0 0.0] :d [0.0 0.0 -1.0]}
+        hit (rt/cpu-trace ray [{:c [0.0 0.0 -10.0] :r 1.0 :id :far}
+                               {:c [0.0 0.0 -5.0]  :r 1.0 :id :near}
+                               {:c [9.0 0.0 -5.0]  :r 1.0 :id :miss}])]
+    (is (= :near (:id hit)))
+    (is (= 4.0 (:t hit)))
+    (is (= [0.0 0.0 -4.0] (:point hit)))))

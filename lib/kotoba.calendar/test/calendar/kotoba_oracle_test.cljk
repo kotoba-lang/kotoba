@@ -1,0 +1,320 @@
+(ns calendar.kotoba-oracle-test
+  "What keeps the shipped artifacts honest, now that they are what runs.
+
+  `overlaps-parity-test` compiles `src/calendar/model.kotoba` fresh and
+  compares it to `model.cljc`. That was the whole check while the host had its
+  own copy of the rule. It is not the whole check any more, because the host
+  no longer computes anything — it reads
+  `resources/calendar/oracle/*.kir.edn`, and a fresh compile is not those
+  files. Three things have to hold that did not have to before:
+
+    1. the shipped artifacts ARE the current sources, compiled — all of them
+    2. the hosts actually read them, rather than having quietly kept a copy
+    3. what is not delegated is not delegated on purpose, and says why
+
+  The second is the one that is easy to lose and impossible to see: a
+  delegation that fell back to a host implementation would pass every parity
+  test ever written, because a host copy is exactly what those tests compare
+  against.
+
+  The first is easy to lose in a different way — by being narrower than it
+  looks. `kotoba-lang/com-cloudflare` shipped nine artifacts and drift-checked
+  one; a mutation of a production artifact passed its whole suite of 94 tests.
+  So both gates here take their subject list from data in the seam
+  (`oracle/cores`, `oracle/delegated`) rather than from names typed here, and
+  a third gate requires that data to cover what is on disk."
+  (:require [kotoba.lang.error :as kerror] [calendar.kotoba-oracle :as oracle]
+            [calendar.kotoba-oracle-gen :as gen]
+            [calendar.model :as model]
+            [calendar.validate :as validate]
+            [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.coll :as walk]
+            [kotoba.compiler.core :as compiler]))
+
+;; ── drift ────────────────────────────────────────────────────────────
+
+(defn- renumber-gensyms
+  "Canonicalize compiler-generated names by first appearance.
+
+  Lowering introduces names of the form `or-tmp__11099`, and the number comes
+  from a counter that is per-process, not per-source. So the shipped artifact
+  — written by `kbb -M:test:gen` in one JVM — and a fresh compile in this
+  JVM can be the same program under different numbers, and a raw `=` between
+  them would fail for a reason that is not drift. Renumbering by first
+  appearance removes exactly that difference and no other: two programs that
+  differ in structure still differ afterwards, which the mutation checks in
+  this namespace's evidence exercise in both directions.
+
+  Neither core uses `and` or `or` today, so nothing here is renumbered yet.
+  It is here because the first core that does would otherwise turn this gate
+  red for a reason nobody would read as drift — and a gate that cries wolf is
+  a gate that gets deleted."
+  [kir]
+  (let [seen (volatile! {})]
+    (walk/postwalk
+     (fn [x]
+       (if (and (symbol? x) (re-find #"__\d+$" (name x)))
+         (let [n (or (get @seen x)
+                     (let [n (count @seen)] (vswap! seen assoc x n) n))]
+           (symbol (str (str/replace (name x) #"__\d+$" "") "__" n)))
+         x))
+     kir)))
+
+(deftest the-shipped-artifacts-are-the-current-sources-compiled
+  ;; Over `oracle/cores`, not over a name written here: a core that ships
+  ;; without being checked is the hole this gate exists to not have.
+  (doseq [[id source] (sort-by key oracle/cores)]
+    (testing (str id " <- " source)
+      (let [shipped (edn/read-string (slurp (io/resource (oracle/resource-path id))))
+            fresh (:kir (compiler/compile-source (slurp (io/file "src" source))
+                                                 gen/target {}))]
+        (is (= (renumber-gensyms fresh) (renumber-gensyms shipped))
+            (str "shipped KIR for " id " is stale — run `kbb -M:test:gen`"))))))
+
+(deftest every-declared-core-actually-ships
+  (doseq [id (keys oracle/cores)]
+    (is (some? (io/resource (oracle/resource-path id)))
+        (str "no artifact for " id))
+    (is (some? (oracle/kir id)))))
+
+(deftest every-core-in-src-is-declared
+  ;; The other half of the drift gate, and the one that cannot be written as a
+  ;; loop over `cores`: a `.kotoba` added to `src/` and never shipped is a
+  ;; decision core that no gate in this repository looks at. `validate.kotoba`
+  ;; sat in `src/` in exactly that state until this commit.
+  (let [on-disk (->> (file-seq (io/file "src"))
+                     (filter #(str/ends-with? (.getName ^java.io.File %) ".kotoba"))
+                     (map #(str/replace (.getPath ^java.io.File %) #"^src/" ""))
+                     set)]
+    (is (seq on-disk) "found no .kotoba under src/ — run this from the repo root")
+    (is (= on-disk (set (vals oracle/cores)))
+        "every .kotoba under src/ must be declared in `oracle/cores`")))
+
+(deftest every-export-is-either-delegated-or-explained
+  ;; Shipping an export and calling it are different things, and the gap
+  ;; between them is where a rule goes to be believed without being run. Each
+  ;; export is in exactly one of the two maps, and `host-answered` carries the
+  ;; reason rather than a commit message somebody would have to find.
+  (doseq [id (keys oracle/cores)]
+    (testing (str id)
+      (let [called (get oracle/delegated id #{})
+            explained (get oracle/host-answered id {})]
+        (is (= (oracle/exports id) (into called (keys explained)))
+            "every shipped export is either delegated or recorded as host-answered")
+        (is (empty? (set/intersection called (set (keys explained))))
+            "an export cannot be both")
+        (doseq [[export reason] explained]
+          (is (and (string? reason) (< 20 (count reason)))
+              (str id "/" export " needs a reason, not a placeholder")))))))
+
+(deftest a-missing-artifact-throws-rather-than-deciding-anything
+  ;; The seam's one refusal. If it fell back instead, the first thing anyone
+  ;; would notice is that a decision quietly stopped being the shipped one.
+  (is (thrown-with-msg? kerror/ExceptionInfo #"shipped decision core is missing"
+                        (oracle/kir :not-a-core)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"does not declare that export"
+                        (oracle/param-types :model 'not-an-export))))
+
+;; ── the record both cores speak ──────────────────────────────────────
+
+(deftest both-cores-declare-the-same-event-record
+  ;; `oracle/event-type` is one literal used by two hosts, and each host hands
+  ;; it to a different core. If the two `.kotoba` files disagreed about
+  ;; `:calendar/event` — a field renamed in one, a field reordered — the
+  ;; calls would start failing to match, and the failure would say nothing
+  ;; about why. It says so here. The relevant precedent is this repository's
+  ;; own: the `.kotoba` and the `.cljc` drifted into different data models
+  ;; once already (ADR-2608120200, case 4), and nothing noticed.
+  (is (= [:record :calendar/event [[:id :keyword] [:start :i64] [:end :i64]]]
+         oracle/event-type)
+      "the literal, so a change to it is a change somebody made on purpose")
+  (is (= [oracle/event-type oracle/event-type] (oracle/param-types :model 'overlaps?)))
+  (is (= [oracle/event-type] (oracle/param-types :validate 'event-valid?)))
+  (is (= :bool (:result (oracle/signature :model 'overlaps?))))
+  (is (= :bool (:result (oracle/signature :validate 'event-valid?)))))
+
+;; ── delegation ───────────────────────────────────────────────────────
+
+(def ^:private event-record
+  "Spelled out as text, because a substituted core has to DECLARE the same
+  type for the swap to be a swap and not a different module."
+  "[:record :calendar/event [[:id :keyword] [:start :i64] [:end :i64]]]")
+
+(def ^:private inverted-model
+  "`overlaps?`, negated — same signature, same record type, opposite answer on
+  every input. Compiled here rather than hand-written as KIR so that it is a
+  real core and not a shape that happens to satisfy the interpreter."
+  (str "(ns calendar.model (:export [overlaps?]))"
+       "(def event-type " event-record ")"
+       "(defn overlaps?"
+       "  [left [:alias event-type] right [:alias event-type]] :bool"
+       "  (let [a-start (record-get event-type left :start)"
+       "        a-end (record-get event-type left :end)"
+       "        b-start (record-get event-type right :start)"
+       "        b-end (record-get event-type right :end)]"
+       "    (if (< a-start a-end)"
+       "      (if (< b-start b-end)"
+       "        (if (< a-start b-end)"
+       "          (if (< b-start a-end) false true)"
+       "          true)"
+       "        true)"
+       "      true)))"))
+
+(def ^:private inverted-validate
+  "`event-valid?`, negated: an event occupies time exactly when it does not."
+  (str "(ns calendar.validate (:export [event-valid?]))"
+       "(def event-type " event-record ")"
+       "(defn event-valid? [event [:alias event-type]] :bool"
+       "  (if (< (record-get event-type event :start)"
+       "         (record-get event-type event :end)) false true))"))
+
+(defn- with-core
+  "Run `f` against a substituted core, then put the shipped one back."
+  [id source f]
+  (let [kir (:kir (compiler/compile-source source gen/target {}))]
+    (try
+      (oracle/register-kir! id kir)
+      (f)
+      (finally (oracle/deregister-kir! id)))))
+
+(defn- ev [id start end]
+  {:calendar/id id :calendar/start start :calendar/end end})
+
+(deftest every-delegated-export-has-a-substitute-that-the-host-follows
+  ;; The subject list is `oracle/delegated`, so this fails when a call is
+  ;; added there without a case below — the gate cannot fall behind the map
+  ;; quietly.
+  (is (= {:model '#{overlaps?} :validate '#{event-valid?}} oracle/delegated)
+      "a delegated export was added or removed without a case in this namespace"))
+
+(deftest the-model-host-reads-the-artifact-rather-than-keeping-a-copy
+  ;; Swap in a core that answers the OPPOSITE, and require the host to follow.
+  ;; A `model.cljc/overlaps?` that had kept its own conjunction of `compare`s
+  ;; would not, and nothing else in this repository would say so.
+  (let [overlapping [(ev :a 0 10) (ev :b 5 15)]
+        disjoint [(ev :a 0 10) (ev :b 20 30)]]
+    (is (true? (apply model/overlaps? overlapping)) "the shipped answer")
+    (is (false? (apply model/overlaps? disjoint)) "the shipped answer")
+    (with-core
+      :model inverted-model
+      (fn []
+        (is (false? (apply model/overlaps? overlapping))
+            "the host followed the artifact")
+        (is (true? (apply model/overlaps? disjoint))
+            "and followed it in both directions")
+        (testing "everything built on the rule follows too, not just the entry point"
+          ;; `conflicts` calls `overlaps?` straight through, so if delegation
+          ;; were partial -- entry point delegating, callers still on a private
+          ;; copy -- this is where it would show.
+          (let [cal (-> (model/calendar "cal")
+                        (model/add-event (model/event "standup" {:calendar/start 0
+                                                                 :calendar/end 10}))
+                        (model/add-attendee "standup" "person:jun"))
+                candidate (model/event "review" {:calendar/start 5 :calendar/end 15})]
+            (is (= [] (model/conflicts cal "person:jun" candidate))
+                "under the inverted core, overlapping events do not conflict")))))
+    (is (true? (apply model/overlaps? overlapping)) "restored")
+    (is (false? (apply model/overlaps? disjoint)) "restored")))
+
+(deftest the-validate-host-reads-the-artifact-rather-than-keeping-a-copy
+  (let [positive (ev "a" 0 10)
+        empty-span (ev "b" 10 10)
+        inverted-span (ev "c" 10 5)
+        codes #(mapv :calendar/code (validate/event-problems %))]
+    (testing "the shipped answers"
+      (is (= [] (codes positive)))
+      (is (= [:event/non-positive-duration] (codes empty-span)))
+      (is (= [:event/non-positive-duration] (codes inverted-span)))
+      (is (true? (validate/occupies-time? positive)))
+      (is (false? (validate/occupies-time? empty-span))))
+    (with-core
+      :validate inverted-validate
+      (fn []
+        ;; A `validate.cljc` that had kept `(not (neg? (compare start end)))`
+        ;; would answer exactly as it did above.
+        (is (false? (validate/occupies-time? positive))
+            "occupies-time? followed the substituted core")
+        (is (true? (validate/occupies-time? empty-span))
+            "and followed it in both directions")
+        (testing "everything built on the rule follows with it"
+          ;; `event-problems`, `problems` and `valid?` are phrased in terms of
+          ;; the rule, so the substituted answer has to reach all three. That
+          ;; is what a port is supposed to look like: the rule moved, the
+          ;; things phrased in terms of it did not have to.
+          (is (= [:event/non-positive-duration] (codes positive)))
+          (is (= [] (codes empty-span)))
+          (let [cal (-> (model/calendar "cal")
+                        (model/add-event (model/event "ok" {:calendar/start 0
+                                                            :calendar/end 10})))]
+            (is (false? (validate/valid? cal))
+                "a calendar of well-formed events is invalid under the inverted core")))
+        (testing "absence is still refused before the core is consulted"
+          ;; The missing-instant problem is not the core's to answer — `:i64`
+          ;; has no `nil` — so it must NOT move with the substitution.
+          (is (= [:event/missing-time]
+                 (codes {:calendar/id "d" :calendar/start nil :calendar/end nil}))))))
+    (testing "restored"
+      (is (= [] (codes positive)))
+      (is (= [:event/non-positive-duration] (codes empty-span))))))
+
+(deftest the-two-hosts-apply-the-same-rule-to-an-event
+  ;; `model.kotoba/overlaps?` requires each event to occupy time before it
+  ;; compares anything, and `validate.kotoba/event-valid?` is that requirement
+  ;; on its own. Two cores, one rule — so an event this library calls
+  ;; `:event/non-positive-duration` must also be an event that overlaps
+  ;; nothing, including itself. That equivalence is the thing 7b98dbc fixed,
+  ;; and it is asserted rather than assumed because it is now spread across
+  ;; two artifacts that can drift apart.
+  (doseq [[s e] [[0 10] [10 10] [10 5] [0 1] [5 5]]
+          :let [event (ev "x" s e)]]
+    (is (= (validate/occupies-time? event)
+           (model/overlaps? event event))
+        (str "[" s "," e ")"))))
+
+;; ── what the host keeps, and why ─────────────────────────────────────
+
+(deftest the-host-marshals-instants-it-cannot-hand-over-literally
+  ;; `:i64` holds neither `nil` nor an ISO-8601 string, and this model stores
+  ;; both. What is left on the host side is exactly those two halves, so they
+  ;; are asserted here rather than being an implementation detail nobody named.
+  (testing "absence is refused before the core is consulted"
+    (is (false? (model/overlaps? {:calendar/id :a} (ev :b 0 100))))
+    (is (false? (model/overlaps? (ev :a 0 100) {:calendar/id :b})))
+    (is (= [:event/missing-time]
+           (mapv :calendar/code (validate/event-problems {:calendar/id "a"})))))
+  (testing "string instants reach the core with their order intact"
+    (is (true? (model/overlaps? (ev :a "2026-01-01T00:00:00Z" "2026-01-01T01:00:00Z")
+                                (ev :b "2026-01-01T00:30:00Z" "2026-01-01T02:00:00Z"))))
+    (is (false? (model/overlaps? (ev :a "2026-01-01T00:00:00Z" "2026-01-01T01:00:00Z")
+                                 (ev :b "2026-01-01T01:00:00Z" "2026-01-01T02:00:00Z")))
+        "half-open, on strings as on integers")
+    (is (false? (model/overlaps? (ev :a "2026-01-01T01:00:00Z" "2026-01-01T01:00:00Z")
+                                 (ev :b "2026-01-01T00:00:00Z" "2026-01-01T02:00:00Z")))
+        "an empty interval occupies no instant, whatever the instants are")
+    (is (true? (validate/occupies-time?
+                (ev "a" "2026-01-01T00:00:00Z" "2026-01-01T01:00:00Z"))))
+    (is (false? (validate/occupies-time?
+                 (ev "a" "2026-01-01T01:00:00Z" "2026-01-01T01:00:00Z"))))))
+
+(deftest the-interpreter-that-runs-is-the-one-the-compiler-declares
+  ;; The artifact is emitted by the pinned compiler and executed by the pinned
+  ;; interpreter, and those two are a matched pair — KIR is a versioned
+  ;; document. Measured on a sibling repository the same day: advancing the
+  ;; interpreter alone, to fix a real ClojureScript bug, produced 1 failure
+  ;; and 32 errors against an artifact the older emitter had written. The pin
+  ;; agreement is asserted here rather than described in a `deps.edn` comment,
+  ;; because a comment cannot fail.
+  (let [ours (-> (edn/read-string (slurp "deps.edn"))
+                 (get-in [:deps 'io.github.kotoba-lang/osaho :git/sha]))
+        compiler-root (-> (io/resource "kotoba/compiler/core.clj")
+                          .getPath (str/replace #"/src/kotoba/compiler/core\.clj$" ""))
+        theirs (-> (io/file compiler-root "deps.edn") slurp edn/read-string
+                   (get-in [:deps 'io.github.kotoba-lang/osaho :git/sha]))]
+    (is (string? ours))
+    (is (string? theirs) (str "no kotoba-kir pin found under " compiler-root))
+    (is (= theirs ours)
+        "the runtime interpreter must be the one the test-only compiler declares")))

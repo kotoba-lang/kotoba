@@ -1,0 +1,247 @@
+;; Clojure-shaped twin of state.kotoba (:clj-kotoba / .cljk).
+;;
+;; `.cljk` is :clj-kotoba, not a JVM target.
+;;
+;; The signatures carry no type annotations WHERE INFERENCE SUFFICES. Which ones
+;; those are was measured (2026-09-09), not guessed, by stripping and rebuilding:
+;;
+;;   * The five private helpers keep theirs. Strip them and an unconstrained
+;;     parameter falls back to `:i64`, reported at the CALL SITE rather than at the
+;;     helper -- measured here as `expected i64, got bool` pointing into
+;;     `ambiguous-from`'s accumulator. This independently reproduces what
+;;     `kotoba.card.lifecycle`'s twin already records.
+;;
+;;   * `->stripe` and `event-op-kind` keep theirs, and this is the rule the sibling
+;;     did not state: inference reaches a parameter through an ANNOTATED CALLEE,
+;;     not through `=` against a literal. Those two functions are pure `cond`
+;;     dispatch -- their parameter meets nothing but keyword literals -- so they
+;;     infer `:i64` and refuse with `expected keyword, got i64`. `representable?`
+;;     and `event->op` take the same keyword and CAN be stripped, because their
+;;     parameter flows into `lc/state?` / `event-op-kind`, which are annotated.
+;;
+;;   * Everything else strips: `status?` / `card-type?` (the parameter reaches
+;;     `string=?`), `status-at` / `card-type-at` (`:i64` is the fallback and also
+;;     the right answer), `stripe->candidates`, `ambiguous-statuses`,
+;;     `covers-every-event?` and all seven `test-*`.
+;;
+;; ⚠ A span reported against a `.cljk` pointed at line 9, which is a COMMENT --
+;; so do not chase the line number, bisect the signatures. That is why the reason
+;; each annotation survives is written down here instead of being rediscovered.
+;;
+;; Compared, not read: `state_kotoba_parity_test` builds BOTH through the same
+;; two-module graph and asserts the emitted artifacts carry the SAME `kirDigest`.
+;; That is the only check that catches inference picking a different TYPE for the
+;; same code -- and it holds: the two artifacts differ in exactly one line, the
+;; provenance header, and only in the source digests. `kirDigest` is identical.
+;;
+
+(ns io.stripe.issuing.state
+  (:require [kotoba.card.lifecycle :as lc])
+  (:export [status? card-type? status-count status-at
+            card-type-count card-type-at
+            ->stripe representable? stripe->candidates ambiguous-statuses
+            event->op event-op-kind covers-every-event?
+            test-statuses test-mapping test-collision test-ambiguous
+            test-events test-coverage test-card-types]))
+
+;; --- Stripe's own vocabulary ----------------------------------------------
+;;
+;; Verified against the live API spec 2026-07-30 (2026-06-24.preview): a card's
+;; status is one of active / inactive / canceled and its type is
+;; virtual / physical. Enumerated as well as tested, because `ambiguous-statuses`
+;; has to walk them.
+
+(defn status? [s]
+  (or (string=? s "active")
+      (or (string=? s "inactive") (string=? s "canceled"))))
+
+(defn status-count [] 3)
+
+;; Sorted, matching how the oracle's test reads the set.
+(defn status-at [i]
+  (cond
+    (= i 0) "active"
+    (= i 1) "canceled"
+    (= i 2) "inactive"
+    :else ""))
+
+(defn card-type? [t]
+  (or (string=? t "virtual") (string=? t "physical")))
+
+(defn card-type-count [] 2)
+
+(defn card-type-at [i]
+  (cond
+    (= i 0) "physical"
+    (= i 1) "virtual"
+    :else ""))
+
+;; --- the mapping ----------------------------------------------------------
+;;
+;; Every lifecycle state appears, which is what
+;; `kotoba.card.actuation/state-mapping-complete?` checks. :intake maps to nothing
+;; because a cardholder in intake has no Stripe card -- an absence, not a status.
+;;
+;; :issued and :blocked BOTH map to "inactive". That is not a mistake to be tidied
+;; away; it is the impedance mismatch this component exists to publish.
+
+(defn ->stripe [state :keyword] :string
+  (cond
+    (= state :intake) ""
+    (= state :issued) "inactive"
+    (= state :active) "active"
+    (= state :blocked) "inactive"
+    (= state :closed) "canceled"
+    :else ""))
+
+(defn representable? [state]
+  (and (lc/state? state) (not (string=? (->stripe state) ""))))
+
+;; --- the collision, returned in full --------------------------------------
+;;
+;; Every lifecycle state whose Stripe status is `status`, in the lifecycle
+;; enumeration's order. Deliberately all of them: a provider that guessed one
+;; would tell a caller that a deliberately-blocked card is merely un-activated,
+;; and the caller would then "activate" it.
+;;
+;; This walks `lc/state-count` rather than a local list, so a fifth lifecycle
+;; state would appear here without this file being edited -- which is the whole
+;; reason this is a multi-module guest.
+
+(defn- candidates-from [status :string i :i64 acc :document] :document
+  (if (>= i (lc/state-count))
+    acc
+    (let [s (lc/state-at i)]
+      (candidates-from status (+ i 1)
+                       (if (and (not (string=? (->stripe s) ""))
+                                (string=? (->stripe s) status))
+                         (document-vector-conj acc (document-keyword s))
+                         acc)))))
+
+(defn stripe->candidates [status]
+  (candidates-from status 0 (document-vector)))
+
+;; The statuses that map back to more than one lifecycle state. Reported, not
+;; hidden -- a caller needs to know which reads it cannot trust.
+(defn- ambiguous-from [i :i64 acc :document] :document
+  (if (>= i (status-count))
+    acc
+    (let [s (status-at i)]
+      (ambiguous-from (+ i 1)
+                      (if (> (document-count (stripe->candidates s)) 1)
+                        (document-vector-conj acc (document-string s))
+                        acc)))))
+
+(defn ambiguous-statuses []
+  (ambiguous-from 0 (document-vector)))
+
+;; --- how an event is effected ---------------------------------------------
+;;
+;; :reissue is the interesting one. Stripe has no "replace" transition: a
+;; replacement is a NEW card object created with replacement_for pointing at the
+;; old one, which Stripe then cancels. So a reissue is TWO provider calls, and
+;; this table says so rather than pretending it is a status change -- matching
+;; kotoba.card.lifecycle, which already reports mints-successor? true for it.
+
+(defn event-op-kind [event :keyword] :keyword
+  (cond
+    (= event :activate) :update-status
+    (= event :block) :update-status
+    (= event :close) :update-status
+    (= event :reissue) :replace
+    :else :none))
+
+(defn- op-status [event :keyword] :string
+  (cond
+    (= event :activate) "active"
+    (= event :block) "inactive"
+    (= event :close) "canceled"
+    :else ""))
+
+(defn event->op [event]
+  (cond
+    (= (event-op-kind event) :none) (document-null)
+
+    (= (event-op-kind event) :replace)
+    (document-map :stripe/op (document-keyword :replace)
+                  :stripe/detail
+                  (document-string
+                    (string-concat "creates a new card with replacement_for and "
+                                   "cancels the original -- two calls, not a status change")))
+
+    :else
+    (document-map :stripe/op (document-keyword :update-status)
+                  :stripe/status (document-string (op-status event)))))
+
+;; Every lifecycle event has a provider operation. Walks the lifecycle guest's
+;; enumeration, so a fifth lifecycle event makes this FALSE instead of being
+;; silently uncovered -- the oracle compares two key sets for the same reason.
+(defn- covers-from [i :i64] :bool
+  (if (>= i (lc/event-count))
+    true
+    (if (= (event-op-kind (lc/event-at i)) :none)
+      false
+      (covers-from (+ i 1)))))
+
+(defn covers-every-event? []
+  (covers-from 0))
+
+;; --- tests ----------------------------------------------------------------
+;;
+;; `test-*` returns i64 1 on pass. These run through the module graph, so they
+;; also prove the cross-repository require resolves at runtime and not just at
+;; check time.
+;;
+;; `truth` wraps a returned bool for the reason measured in org-w3-webcodecs: a
+;; keyword or bool comparison placed directly inside an `and` fails on jvm-kir
+;; with `value is not a boolean` while js and wasm accept it.
+
+(defn- truth [b :bool] :bool (if b true false))
+
+(defn test-statuses []
+  (if (and (truth (status? "active"))
+           (and (truth (status? "canceled"))
+                (and (not (status? "expired")) (not (status? "")))))
+    1 0))
+
+(defn test-card-types []
+  (if (and (truth (card-type? "virtual"))
+           (and (truth (card-type? "physical"))
+                (and (not (card-type? "prepaid")) (= (card-type-count) 2))))
+    1 0))
+
+(defn test-mapping []
+  (if (and (string=? (->stripe :active) "active")
+           (and (string=? (->stripe :closed) "canceled")
+                (and (string=? (->stripe :intake) "")
+                     (and (not (representable? :intake))
+                          (truth (representable? :issued))))))
+    1 0))
+
+;; The collision: "inactive" must come back as BOTH, never one.
+(defn test-collision []
+  (let [c (stripe->candidates "inactive")]
+    (if (and (= (document-count c) 2)
+             (= (document-count (stripe->candidates "active")) 1))
+      1 0)))
+
+(defn test-ambiguous []
+  (let [a (ambiguous-statuses)]
+    (if (and (= (document-count a) 1)
+             (= (document-count (stripe->candidates "canceled")) 1))
+      1 0)))
+
+(defn test-events []
+  (if (and (= (event-op-kind :activate) :update-status)
+           (and (= (event-op-kind :reissue) :replace)
+                (and (= (event-op-kind :frobnicate) :none)
+                     (and (= (document-count (event->op :activate)) 2)
+                          (= (document-kind (event->op :frobnicate)) :null)))))
+    1 0))
+
+;; The cross-module check itself: every lifecycle event, read from the lifecycle
+;; guest, has an operation here.
+(defn test-coverage []
+  (if (and (truth (covers-every-event?))
+           (and (= (lc/event-count) 4) (= (lc/state-count) 5)))
+    1 0))

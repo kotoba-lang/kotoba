@@ -1,0 +1,152 @@
+(ns sigv4.core-test
+  "The pure SigV4 layer, pinned to AWS's own published reference vectors.
+
+  These are not self-generated goldens. The expected canonical-request hash,
+  string-to-sign and signature below are the values AWS documents for its
+  worked S3 examples, so a regression here means we diverged from the spec, not
+  merely from yesterday's output."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [sigv4.core :as v4]))
+
+;; AWS worked example credentials (public, from the SigV4 documentation).
+(def secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+(def key-id "AKIAIOSFODNN7EXAMPLE")
+
+(deftest uri-encode-follows-s3-rules
+  (testing "unreserved characters survive"
+    (is (= "abcXYZ019-_.~" (v4/uri-encode "abcXYZ019-_.~"))))
+  (testing "space, slash and plus are encoded, hex is uppercase"
+    (is (= "a%20b" (v4/uri-encode "a b")))
+    (is (= "a%2Fb" (v4/uri-encode "a/b")))
+    (is (= "a%2Bb" (v4/uri-encode "a+b"))))
+  (testing "the characters encodeURIComponent exempts are NOT exempt here —
+            this is the classic source of signature mismatches"
+    (is (= "%21%27%28%29%2A" (v4/uri-encode "!'()*"))))
+  (testing "non-ASCII is encoded as UTF-8 bytes"
+    (is (= "%E6%97%A5" (v4/uri-encode "日")))
+    (is (= "%F0%9F%97%84" (v4/uri-encode "🗄")))))
+
+(deftest object-path-is-path-style-and-per-segment
+  (is (= "/bucket/a/b/c.txt" (v4/object-path "bucket" "a/b/c.txt")))
+  (is (= "/bucket/a%20b/c%2Bd" (v4/object-path "bucket" "a b/c+d")))
+  (testing "a colon inside a segment is encoded, the slashes are not
+            (shoko keys DID documents as pins/did:key/…)"
+    (is (= "/my-bucket/pins/did%3Akey/abc.json"
+           (v4/object-path "my-bucket" "pins/did:key/abc.json"))))
+  (testing "a trailing slash is a real empty final segment, not something to drop
+            — kotobase-peer's copy split without a limit and silently lost it"
+    (is (= "/bucket/dir/" (v4/object-path "bucket" "dir/"))))
+  (testing "a blank key degrades to the bucket path (used by ListObjectsV2)"
+    (is (= "/bucket" (v4/object-path "bucket" nil)))
+    (is (= "/bucket" (v4/object-path "bucket" "")))))
+
+(deftest canonical-query-sorts-by-encoded-key
+  (is (= "" (v4/canonical-query nil)))
+  (is (= "" (v4/canonical-query {})))
+  (testing "keyword keys work too — shoko passes {:prefix … :list-type …}"
+    (is (= "list-type=2&prefix=a%2Fb"
+           (v4/canonical-query {:prefix "a/b" :list-type "2"}))))
+  (is (= "a=1&b=2" (v4/canonical-query {"b" "2" "a" "1"})))
+  (is (= "list-type=2&prefix=a%2Fb" (v4/canonical-query {"prefix" "a/b" "list-type" "2"}))))
+
+(deftest amz-dates-strips-separators-and-fraction
+  (is (= {:long "20130524T000000Z" :short "20130524"}
+         (v4/amz-dates "2013-05-24T00:00:00.000Z")))
+  (testing "an instant without a fractional part works too"
+    (is (= {:long "20130524T000000Z" :short "20130524"}
+           (v4/amz-dates "2013-05-24T00:00:00Z")))))
+
+;; ── AWS reference vector 1: GET Object with a Range header ───────────────────
+;; https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+
+(def get-object-canonical
+  (str "GET\n"
+       "/test.txt\n"
+       "\n"
+       "host:examplebucket.s3.amazonaws.com\n"
+       "range:bytes=0-9\n"
+       "x-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+       "x-amz-date:20130524T000000Z\n"
+       "\n"
+       "host;range;x-amz-content-sha256;x-amz-date\n"
+       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"))
+
+(deftest aws-get-object-canonical-request
+  (let [{:keys [canonical-request signed-headers]}
+        (v4/canonical-request
+         {:method       :get
+          :path         "/test.txt"
+          :query        ""
+          ;; deliberately out of order and mixed-case, to exercise the
+          ;; lowercase+sort that the spec requires
+          :headers      {"X-Amz-Date"           "20130524T000000Z"
+                         "Range"                "bytes=0-9"
+                         "Host"                 "examplebucket.s3.amazonaws.com"
+                         "x-amz-content-sha256" v4/empty-payload-sha256}
+          :payload-hash v4/empty-payload-sha256})]
+    (is (= get-object-canonical canonical-request)
+        "byte-identical to the canonical request AWS documents")
+    (is (= "host;range;x-amz-content-sha256;x-amz-date" signed-headers))))
+
+(deftest aws-get-object-string-to-sign
+  (is (= (str "AWS4-HMAC-SHA256\n"
+              "20130524T000000Z\n"
+              "20130524/us-east-1/s3/aws4_request\n"
+              ;; SHA-256 of get-object-canonical, per the AWS docs
+              "7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972")
+         (v4/string-to-sign
+          "20130524T000000Z"
+          (v4/credential-scope "20130524" "us-east-1")
+          "7344ae5b7ee6c3e7e6b0fe0640412a37625d1fbfff95c48bbb2dc43964946972"))))
+
+(deftest empty-payload-hash-constant-is-right
+  ;; Cross-checked against the value AWS embeds in the same worked example.
+  (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+         v4/empty-payload-sha256)))
+
+;; ── AWS reference vector 2: presigned URL (query-string auth) ────────────────
+;; https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
+
+(deftest aws-presigned-canonical-request
+  (let [scope  (v4/credential-scope "20130524" "us-east-1")
+        params (v4/presign-params {:key-id          key-id
+                                   :scope           scope
+                                   :long-date       "20130524T000000Z"
+                                   :expires-seconds 86400
+                                   :signed-headers  "host"})
+        qs     (v4/canonical-query params)]
+    (is (= (str "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request"
+                "&X-Amz-Date=20130524T000000Z"
+                "&X-Amz-Expires=86400"
+                "&X-Amz-SignedHeaders=host")
+           qs)
+        "the credential scope's slashes must be percent-encoded in the query")
+    (is (= (str "GET\n"
+                "/test.txt\n"
+                qs "\n"
+                "host:examplebucket.s3.amazonaws.com\n"
+                "\n"
+                "host\n"
+                "UNSIGNED-PAYLOAD")
+           (:canonical-request
+            (v4/canonical-request {:method       :get
+                                   :path         "/test.txt"
+                                   :query        qs
+                                   :headers      {"host" "examplebucket.s3.amazonaws.com"}
+                                   :payload-hash v4/unsigned-payload}))))))
+
+(deftest signing-key-chain-shape
+  (let [{:keys [seed steps]} (v4/signing-key-chain secret "20130524" "us-east-1")]
+    (is (= "AWS4wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" seed)
+        "the ladder seeds from the prefixed secret, never the bare one")
+    (is (= ["20130524" "us-east-1" "s3" "aws4_request"] steps))))
+
+(deftest authorization-header-format
+  (is (= (str "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, "
+              "SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, "
+              "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+         (v4/authorization-header key-id
+                                  (v4/credential-scope "20130524" "us-east-1")
+                                  "host;range;x-amz-content-sha256;x-amz-date"
+                                  "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"))))

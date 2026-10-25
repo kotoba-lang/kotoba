@@ -1,0 +1,168 @@
+(ns rtp.header-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [rtp.header :as h]))
+
+(defn- rand-u32
+  "`(rand-int 0x100000000)` overflows — `rand-int` casts through a JVM
+  `int`, and 2^32 doesn't fit in one. `rand` takes a `double` bound
+  instead, so there's no int truncation to overflow on the way in."
+  []
+  (long (rand 4294967296)))
+
+;; ---------------------------------------------------------------------
+;; A hand-built RFC 3550 §5.1 frame, worked out byte-by-byte and checked
+;; against the field values below (not copied from an external capture —
+;; labelled per the honesty rule as constructed, not a published vector,
+;; since RFC 3550 §5.1 shows the *bit layout* but does not publish a worked
+;; numeric example frame the way §24 examples work for SIP).
+;;
+;; V=2 P=0 X=0 CC=0            -> 1000 0000 = 0x80
+;; M=0 PT=8 (PCMA)              -> 0000 1000 = 0x08
+;; sequence number = 0x1234
+;; timestamp       = 0x9ABCDEF0
+;; SSRC            = 0x11223344
+;; payload         = [0xAA 0xBB]
+;; ---------------------------------------------------------------------
+(def constructed-frame
+  ;; constructed, not a published spec vector
+  [0x80 0x08 0x12 0x34 0x9A 0xBC 0xDE 0xF0 0x11 0x22 0x33 0x44 0xAA 0xBB])
+
+(deftest decode-constructed-frame
+  (let [pkt (h/decode constructed-frame)]
+    (is (= 2 (:version pkt)))
+    (is (false? (:marker? pkt)))
+    (is (= 8 (:payload-type pkt)))
+    (is (= 0x1234 (:sequence-number pkt)))
+    (is (= 0x9ABCDEF0 (:timestamp pkt)))
+    (is (= 0x11223344 (:ssrc pkt)))
+    (is (= [0xAA 0xBB] (:payload pkt)))
+    (is (= [] (:csrc pkt)))
+    (is (false? (:extension? pkt)))
+    (is (false? (:padding? pkt)))))
+
+(deftest round-trip-basic
+  (testing "decode(encode(x)) == x for a plain packet, byte-exact"
+    (let [pkt {:marker? true :payload-type 96 :sequence-number 65535
+               :timestamp 4294967295 :ssrc 0xCAFEBABE :payload [1 2 3 4 5]}
+          bs (h/encode pkt)
+          dec (h/decode bs)]
+      (is (= true (:marker? dec)))
+      (is (= 96 (:payload-type dec)))
+      (is (= 65535 (:sequence-number dec)))
+      (is (= 4294967295 (:timestamp dec)))
+      (is (= 0xCAFEBABE (:ssrc dec)))
+      (is (= [1 2 3 4 5] (:payload dec))))))
+
+(deftest round-trip-property
+  (testing "decode(encode(x)) reproduces every semantic field, for 200 generated packets"
+    (dotimes [i 200]
+      (let [csrc (vec (repeatedly (rand-int 6) #(rand-u32)))
+            pkt {:marker? (odd? i)
+                 :payload-type (rand-int 128)
+                 :sequence-number (rand-int 65536)
+                 :timestamp (rand-u32)
+                 :ssrc (rand-u32)
+                 :csrc csrc
+                 :payload (vec (repeatedly (rand-int 20) #(rand-int 256)))}
+            dec (h/decode (h/encode pkt))]
+        (is (not (and (vector? dec) (= :error (first dec))))
+            (str "unexpected decode failure for " pkt " -> " dec))
+        (is (= (:marker? pkt) (:marker? dec)))
+        (is (= (:payload-type pkt) (:payload-type dec)))
+        (is (= (:sequence-number pkt) (:sequence-number dec)))
+        (is (= (:timestamp pkt) (:timestamp dec)))
+        (is (= (:ssrc pkt) (:ssrc dec)))
+        (is (= csrc (:csrc dec)))
+        (is (= (:payload pkt) (:payload dec)))))))
+
+(deftest round-trip-with-csrc-and-extension
+  (let [pkt {:payload-type 0 :sequence-number 1 :timestamp 1 :ssrc 1
+             :csrc [0x1 0x2 0x3]
+             :extension {:profile 0xBEDE :data [1 2 3 4 5 6 7 8]}
+             :payload [9 9 9]}
+        dec (h/decode (h/encode pkt))]
+    (is (= [0x1 0x2 0x3] (:csrc dec)))
+    (is (true? (:extension? dec)))
+    (is (= {:profile 0xBEDE :data [1 2 3 4 5 6 7 8]} (:extension dec)))
+    (is (= [9 9 9] (:payload dec)))))
+
+(deftest round-trip-with-padding
+  (let [pkt {:payload-type 0 :sequence-number 1 :timestamp 1 :ssrc 1
+             :payload [1 2 3] :padding 3}
+        bs (h/encode pkt)
+        decoded (h/decode bs)]
+    ;; 12-byte fixed header + 3 payload bytes + 3 padding bytes
+    (is (= 18 (count bs)))
+    (is (true? (:padding? decoded)))
+    (is (= 3 (:padding decoded)))
+    (is (= [1 2 3] (:payload decoded)))
+    (is (= 3 (last bs)) "the trailing padding-count octet includes itself")))
+
+;; ---------------------------------------------------------------------
+;; negative tests — every one must assert the SPECIFIC reason keyword
+;; ---------------------------------------------------------------------
+
+(deftest error-short-header
+  (is (= [:error :rtp/short-header] (h/decode [0x80 0x00 0x00])))
+  (is (= [:error :rtp/short-header] (h/decode [])))
+  (is (= [:error :rtp/short-header]
+         (h/decode (vec (repeat 11 0))))))
+
+(deftest error-bad-version
+  ;; V=1 P=0 X=0 CC=0 -> 0100 0000 = 0x40
+  (is (= [:error :rtp/bad-version]
+         (h/decode (into [0x40 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+                           0x00 0x00 0x00 0x00])))))
+
+(deftest error-short-csrc
+  ;; CC=2 claims 8 bytes of CSRC but only 4 are present after the fixed header
+  (let [b0 (bit-or (bit-shift-left 2 6) 2)]
+    (is (= [:error :rtp/short-csrc]
+           (h/decode (into [b0 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+                             0x00 0x00 0x00 0x00 0x01 0x02 0x03 0x04]))))))
+
+(deftest error-short-extension
+  ;; X=1 but no room for the 4-byte extension header at all
+  (let [b0 (bit-or (bit-shift-left 2 6) 0x10)]
+    (is (= [:error :rtp/short-extension]
+           (h/decode [b0 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+                      0x00 0x00 0x00 0x00])))))
+
+(deftest error-short-extension-truncated-data
+  ;; X=1, extension declares 2 words (8 bytes) of data but only 4 follow
+  (let [b0 (bit-or (bit-shift-left 2 6) 0x10)]
+    (is (= [:error :rtp/short-extension]
+           (h/decode (into [b0 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+                             0x00 0x00 0x00 0x00 0xBE 0xDE 0x00 0x02]
+                            [1 2 3 4]))))))
+
+(deftest error-bad-padding-zero-count
+  ;; P=1 but the trailing octet is 0 — never legal, RFC 3550 §5.1
+  (let [b0 (bit-or (bit-shift-left 2 6) 0x20)]
+    (is (= [:error :rtp/bad-padding]
+           (h/decode (into [b0 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+                             0x00 0x00 0x00 0x00 0x01 0x00]))))))
+
+(deftest error-bad-padding-too-large
+  ;; P=1, trailing octet claims 200 bytes of padding but body is much shorter
+  (let [b0 (bit-or (bit-shift-left 2 6) 0x20)]
+    (is (= [:error :rtp/bad-padding]
+           (h/decode (into [b0 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+                             0x00 0x00 0x00 0x00 0x01 200]))))))
+
+;; ---------------------------------------------------------------------
+;; discrimination proof — break the decoder, see the SPECIFIC error
+;; change, not just "any error". See README for what was broken and
+;; restored to produce this evidence during development.
+;; ---------------------------------------------------------------------
+
+(deftest discriminates-specific-reasons
+  (testing "short-header and bad-version are genuinely different codepaths"
+    (is (not= (h/decode [])
+              (h/decode (into [0x40] (repeat 11 0))))))
+  (testing "short-csrc and short-extension are genuinely different codepaths"
+    (let [cc2-header (into [(bit-or (bit-shift-left 2 6) 2)] (repeat 11 0))
+          x1-header (into [(bit-or (bit-shift-left 2 6) 0x10)] (repeat 11 0))]
+      (is (= [:error :rtp/short-csrc] (h/decode cc2-header)))
+      (is (= [:error :rtp/short-extension] (h/decode x1-header)))
+      (is (not= (h/decode cc2-header) (h/decode x1-header))))))

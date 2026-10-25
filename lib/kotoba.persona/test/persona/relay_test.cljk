@@ -1,0 +1,146 @@
+(ns persona.relay-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [persona.core :as persona]
+            [persona.relay :as relay]
+            [word-id.english :as english]))
+
+(def root "did:key:z6MkExampleRootIdentifierThatMustNeverLeak")
+(def other-root "did:key:z6MkSomebodyElse")
+(def destination "jun@example.invalid")
+(def domain "relay.itonami.cloud")
+(def now "2026-08-06T00:00:00Z")
+
+(defn- entropy [n] (mapv #(mod (* (inc n) (inc %) 97) 256) (range 24)))
+
+(defn- fixture
+  "example.com のための persona を 1 本持つ directory と、そのアドレス。"
+  []
+  (let [r (persona/issue (persona/directory)
+                         {:root root :party "example.com" :domain domain
+                          :entropy (entropy 3) :vocabulary english/vocabulary
+                          :now now})]
+    [(:persona/directory r) (:persona/address (:persona/persona r))]))
+
+;; ---------------------------------------------------------------------------
+;; 受信
+;; ---------------------------------------------------------------------------
+
+(deftest forwards-mail-from-the-expected-party
+  (let [[dir address] (fixture)
+        d (relay/inbound dir {:address address
+                              :sender "noreply@example.com"
+                              :destination destination})]
+    (is (= :forward (:persona.relay/decision d)))
+    (is (= destination (:persona.relay/deliver-to d)))
+    (is (= [] (:persona.relay/signals d)))
+    (testing "転送の決定に本体の識別子は出てこない"
+      (is (= {:persona/address address} (:persona.relay/persona d))))))
+
+(deftest subdomains-of-the-party-are-expected
+  (let [[dir address] (fixture)]
+    (doseq [sender ["billing@mail.example.com" "x@a.b.example.com"]]
+      (is (= [] (:persona.relay/signals
+                 (relay/inbound dir {:address address :sender sender
+                                     :destination destination})))
+          sender))))
+
+(deftest a-sender-that-is-not-the-party-is-signalled-but-still-delivered
+  (let [[dir address] (fixture)
+        d (relay/inbound dir {:address address
+                              :sender "offers@datamarket.example"
+                              :destination destination})]
+    (is (= :forward (:persona.relay/decision d))
+        "遮断はしない —— 正当な転送もある")
+    (is (= [:persona.relay/unexpected-sender]
+           (map :persona.relay/signal (:persona.relay/signals d)))
+        "しかし黙らない —— このアドレスが漏れたか売られた証拠になりうる")))
+
+(deftest disabled-and-burned-addresses-refuse
+  (let [[dir address] (fixture)]
+    (is (= :persona.relay/address-disabled
+           (:persona.relay/reason
+            (relay/inbound (:persona/directory (persona/disable dir address now))
+                           {:address address :sender "x@example.com"
+                            :destination destination}))))
+    (is (= :persona.relay/address-burned
+           (:persona.relay/reason
+            (relay/inbound (:persona/directory (persona/burn dir address now))
+                           {:address address :sender "x@example.com"
+                            :destination destination}))))))
+
+(deftest unknown-addresses-refuse
+  (is (= :persona.relay/unknown-address
+         (:persona.relay/reason
+          (relay/inbound (persona/directory)
+                         {:address "nobody@relay.itonami.cloud"
+                          :sender "x@example.com" :destination destination})))))
+
+(deftest a-missing-destination-refuses-rather-than-dropping
+  (let [[dir address] (fixture)]
+    (is (= :persona.relay/no-destination
+           (:persona.relay/reason
+            (relay/inbound dir {:address address :sender "x@example.com"
+                                :destination nil}))))))
+
+(deftest observed-senders-accumulate-separately-from-the-decision
+  (let [[dir address] (fixture)
+        dir' (-> dir
+                 (relay/note-sender address "a@example.com")
+                 (relay/note-sender address "b@mail.example.com")
+                 (relay/note-sender address "c@datamarket.example"))]
+    (is (= #{"example.com" "mail.example.com" "datamarket.example"}
+           (:persona/observed-senders (persona/persona-at dir' address))))
+    (testing "知らないアドレスは無視する（directory は変わらない）"
+      (is (= dir' (relay/note-sender dir' "nobody@relay.itonami.cloud" "x@y.z"))))))
+
+;; ---------------------------------------------------------------------------
+;; 送信 —— ここが一番よく壊れる
+;; ---------------------------------------------------------------------------
+
+(deftest outbound-always-states-the-from-address
+  (let [[dir address] (fixture)
+        d (relay/outbound dir {:root root :address address
+                               :recipient "support@example.com"})]
+    (is (= :allow (:persona.relay/decision d)))
+    (is (= address (:persona.relay/from d))
+        "呼び出し側に From を組み立てさせない —— 1 通本体から返せば全部無効になる")
+    (is (= [] (:persona.relay/signals d)))))
+
+(deftest sending-to-a-different-party-is-allowed-but-signalled
+  (let [[dir address] (fixture)
+        d (relay/outbound dir {:root root :address address
+                               :recipient "hello@another.example"})]
+    (is (= :allow (:persona.relay/decision d)))
+    (is (= [:persona.relay/cross-party]
+           (map :persona.relay/signal (:persona.relay/signals d)))
+        "両者が同じアドレスを見ると結びつく")))
+
+(deftest you-cannot-send-as-somebody-elses-persona
+  (let [[dir address] (fixture)
+        d (relay/outbound dir {:root other-root :address address
+                               :recipient "support@example.com"})]
+    (is (= :refuse (:persona.relay/decision d)))
+    (is (= :persona.relay/not-yours (:persona.relay/reason d)))
+    (is (nil? (:persona.relay/from d)))))
+
+(deftest you-cannot-send-from-a-stopped-persona
+  (let [[dir address] (fixture)]
+    (doseq [[state dir'] [[:persona.relay/address-disabled
+                           (:persona/directory (persona/disable dir address now))]
+                          [:persona.relay/address-burned
+                           (:persona/directory (persona/burn dir address now))]]]
+      (let [d (relay/outbound dir' {:root root :address address
+                                    :recipient "support@example.com"})]
+        (is (= :refuse (:persona.relay/decision d)))
+        (is (= state (:persona.relay/reason d)))
+        (is (nil? (:persona.relay/from d)))))))
+
+(deftest within-is-a-suffix-test-and-says-so
+  (is (relay/within? "example.com" "example.com"))
+  (is (relay/within? "mail.example.com" "example.com"))
+  (is (not (relay/within? "notexample.com" "example.com"))
+      "接尾辞は必ずドット境界で切る")
+  (is (not (relay/within? "example.com" "mail.example.com")))
+  (testing "登録可能ドメインの判定はしていない —— PSL は持たない"
+    (is (relay/within? "victim.co.uk" "co.uk")
+        "誤警報の側に倒れる（信号であって遮断ではないため許容する）")))

@@ -1,0 +1,338 @@
+;; capability-admission-core — the analyzer's remaining decisions: effect
+;; algebra, minimal policy, policy check, admission.
+;;
+;; WHAT THIS COVERS, AND WHAT IT DOES NOT
+;; --------------------------------------
+;; The analyzer removed with the Rust crates covered effect inference,
+;; minimal-policy, policy-check and admission-check. The decisions are here,
+;; including inference's — see `infer-step`.
+;;
+;; What is NOT here is the iteration. That is not the same thing, and an
+;; earlier version of this header got it wrong: it said the fold "stays host
+;; until the native admission gate takes collections", which misattributed the
+;; boundary twice. Measured 2026-08-11:
+;;
+;;   - native already has bounded homogeneous vectors and a string index; they
+;;     are deliberately PRIVATE handles that may not cross a kexe export, since
+;;     an external caller cannot construct, validate, inspect or release one.
+;;     That is a safety property, not a missing feature.
+;;   - no backend has a sequence PARAMETER type at all, so this was never a
+;;     native-specific limit.
+;;   - and none of it matters for the fold, because a fold's decision content
+;;     is its transition, not its loop.
+;;
+;; So the transition is here and word-typed, the loop is the host's, and the
+;; boundary is `state + event -> next-state` rather than a collection crossing
+;; an export. Nothing needs to be widened for inference to be a Kotoba
+;; decision.
+;;
+;; WHY BITMASKS
+;; ------------
+;; :effect-ops has 6 entries, so an effect SET is six bits of an :i64 and the
+;; whole algebra is integer ops: union is bit-or, "declared covers inferred" is
+;; a masked compare, minimal policy is the inferred mask itself. That keeps
+;; every decision word-typed, which is what the native gate
+;; (`only-native-word-typed-features?` in kotoba-kir) accepts today. It is not
+;; a trick to dodge the gate: an effect set genuinely is a subset of a fixed
+;; six-element universe, and a bitmask is its exact representation.
+;;
+;; Complement is `(bit-xor m (known-effect-mask))`, never `bit-not`: complement
+;; is meant relative to the KNOWN effect universe, not to 64 bits of machine
+;; word. (`bit-not` is also unsupported on the :js backend, which is how the
+;; wrong version announced itself.)
+;;
+;; EFFECT IS NOT AUTHORITY
+;; -----------------------
+;; The two halves below must not be collapsed. `effect-*` answers what a
+;; program NEEDS — inferred statically, granting nothing. `admission-code`
+;; answers whether it MAY, and requires a grant, a policy, and an unexpired
+;; window to intersect to something non-empty. A program whose effects are
+;; fully inferred and fully declared still gets code 2 with no grant. That is
+;; the whole point of the distinction and it is executable here rather than
+;; only stated in prose (ADR-2607279200 §3, lang/capability-semantics.edn).
+;;
+;; DENY LADDER
+;; -----------
+;; Order follows capability-semantics.edn :rules. It is observable — the codes
+;; are distinct and the tests pin each one — because a receipt has to name why
+;; (:receipt/outcome, and T3.1: every reject carries a code).
+;;
+;;   1 unknown-kind        requested names a bit outside the known universe
+;;   2 missing-grant       nothing was delegated at all
+;;   3 expired-grant       now is past the grant window
+;;   4 empty-intersection  requested ∩ delegated ∩ policy is empty
+;;   0 admit
+;;
+;; A later rule never rescues an earlier one, so an expired grant reports
+;; expiry rather than whatever the intersection would have said.
+;;
+;; AUTHORITY SPLIT (same as safe_analyzer_core)
+;; -------------------------------------------
+;;   safe_analyzer_facts.edn  owns which ops carry an effect
+;;   this file               owns what an effect set means and when it admits
+;;   the authority test      binds them, including the bit ORDER
+;;
+;; Bit i is index i in :effect-ops. Reordering that vector reorders these bits,
+;; which is a wire change and not a formatting change; the test fails on it.
+;;
+;; Effects: none. Capabilities: none. This is `kotoba/pure` — the module that
+;; decides about capabilities holds none itself.
+
+(ns capability-admission-core
+  (:export [facts-schema
+            known-effect-mask effect-bit effect-union infer-step effect-member?
+            effect-complement
+            undeclared-effects declaration-satisfied?
+            unused-grants minimal-policy
+            effective-scope authority-shortfall authority-sufficient?
+            attenuation-violation? production-policy-ok?
+            admission-code admits?
+            code-admit code-unknown-kind code-missing-grant
+            code-expired-grant code-empty-intersection
+            test-facts-schema test-effect-bits test-effect-algebra
+            test-declaration-check test-unused-grants
+            test-effective-scope test-attenuation test-production-policy
+            test-deny-ladder test-effect-is-not-authority
+            test-partial-authority-admits test-infer-step]))
+
+(defn facts-schema [] :string
+  "kotoba.selfhost.safe-analyzer-facts.v0")
+
+;; ── effect algebra ───────────────────────────────────────────────────
+
+(defn known-effect-mask [] :i64
+  ;; 6 effect ops in :effect-ops => bits 0..5
+  63)
+
+(defn effect-bit [op :string] :i64
+  ;; bit i = index i in :effect-ops. Reordering that vector reorders
+  ;; these bits, which is a wire change, not a formatting change.
+  (if (string=? op "kgraph-assert!") 1
+    (if (string=? op "kgraph-retract!") 2
+    (if (string=? op "kgraph-get-objects") 4
+    (if (string=? op "kgraph-query") 8
+    (if (string=? op "llm-infer") 16
+    (if (string=? op "has-capability?") 32
+      0)))))))
+
+(defn effect-union [a :i64 b :i64] :i64
+  ;; TEMPORARY SHAPE — this is `bit-or`, spelled with the inclusion-exclusion
+  ;; identity because `bit-or` is not supported by the restricted-ESM (:js)
+  ;; backend today; `bit-and` and `bit-xor` are. `bit-not` is missing the same
+  ;; way, which is why complement above is a `bit-xor` against the universe.
+  ;; For bitmasks a+b-(a&b) is exactly a|b, so this is not an approximation —
+  ;; but it is a backend gap, not a style, and this should become `(bit-or a b)`
+  ;; when :js grows the op. Measured 2026-08-11 against amu 76d4d90.
+  (- (+ a b) (bit-and a b)))
+
+(defn infer-step [acc :i64 op :string] :i64
+  ;; The whole decision content of effect inference: given what has been
+  ;; inferred so far and one more op, what is inferred now.
+  ;;
+  ;; A host `reduce` over this is a loop with nothing left to get wrong — it
+  ;; cannot mis-classify an op, assign the wrong bit, or union incorrectly,
+  ;; because it does none of those. Contrast the shape this replaces, where the
+  ;; host called `effect-bit` and `effect-union` itself and the ORDER of those
+  ;; calls was host-authored.
+  ;;
+  ;; Word-typed on purpose, and it costs nothing: i64 and string are both
+  ;; native-admissible, so inference qualifies on native ISA the same as the
+  ;; rest of this file. A vector parameter would have forfeited that.
+  (effect-union acc (effect-bit op)))
+
+(defn effect-member? [mask :i64 bit :i64] :bool
+  (if (= bit (bit-and mask bit)) true false))
+
+(defn effect-complement [mask :i64] :i64
+  ;; complement within the known universe, never within the machine word
+  (bit-xor (bit-and mask (known-effect-mask)) (known-effect-mask)))
+
+;; ── declaration check + minimal policy ───────────────────────────────
+
+(defn undeclared-effects [inferred :i64 declared :i64] :i64
+  ;; what the program does that its declaration does not admit
+  (bit-and inferred (effect-complement declared)))
+
+(defn declaration-satisfied? [inferred :i64 declared :i64] :bool
+  ;; declaration may be WIDER than inference; it may never be narrower
+  (if (= 0 (undeclared-effects inferred declared)) true false))
+
+(defn unused-grants [inferred :i64 declared :i64] :i64
+  ;; the unused-grant lint: declared and never reached
+  (bit-and declared (effect-complement inferred)))
+
+(defn minimal-policy [inferred :i64] :i64
+  ;; the smallest policy that still admits: exactly what was inferred
+  (bit-and inferred (known-effect-mask)))
+
+;; ── scope + admission ────────────────────────────────────────────────
+
+(defn effective-scope [requested :i64 delegated :i64 policy :i64] :i64
+  ;; :effective-scope = requested ∩ delegated ∩ local-policy.
+  ;; Naming a resource is not holding it (:plain-resource-is-not-authority):
+  ;; a bit in `requested` alone never survives this.
+  (bit-and requested (bit-and delegated policy)))
+
+(defn authority-shortfall [inferred :i64 delegated :i64 policy :i64] :i64
+  ;; What the program needs and will NOT get. Admission and sufficiency are
+  ;; different questions and the deny ladder only answers the first:
+  ;; :empty-intersection denies an EMPTY intersection, so a partial one is
+  ;; admitted and the handler receives the narrowed capability
+  ;; (:handler-receives :concrete-post-intersection-capability). A caller that
+  ;; treats code 0 as "has what it needs" is wrong; this is how it asks.
+  (bit-and inferred
+           (effect-complement (effective-scope inferred delegated policy))))
+
+(defn authority-sufficient? [inferred :i64 delegated :i64 policy :i64] :bool
+  (if (= 0 (authority-shortfall inferred delegated policy)) true false))
+
+(defn attenuation-violation? [parent :i64 child :i64] :bool
+  ;; :scope-attenuation-only — delegation may narrow, never widen
+  (if (= 0 (bit-and child (effect-complement parent))) false true))
+
+(defn production-policy-ok? [policy :i64] :bool
+  ;; :production-effective-wildcard :forbidden — a production local policy must
+  ;; set :policy/forbid-wildcard, so a policy of "everything" is malformed for
+  ;; production. This is a check on the POLICY, not on the request: :any is
+  ;; allowed to exist in fixtures to exercise intersection algebra, and is
+  ;; refused here at the point where it would become effective authority.
+  (if (= (known-effect-mask) (bit-and policy (known-effect-mask))) false true))
+
+(defn code-admit [] :i64 0)
+(defn code-unknown-kind [] :i64 1)
+(defn code-missing-grant [] :i64 2)
+(defn code-expired-grant [] :i64 3)
+(defn code-empty-intersection [] :i64 4)
+
+(defn admission-code [requested :i64 delegated :i64 policy :i64
+                      now :i64 expires :i64] :i64
+  ;; "outside the universe" is asked as "does masking change it", not as a
+  ;; complement against -1: the universe is 6 bits, and a machine-word
+  ;; complement would make the question about the word instead.
+  (if (not (= requested (bit-and requested (known-effect-mask))))
+    (code-unknown-kind)
+    (if (= 0 delegated)
+      (code-missing-grant)
+      (if (> now expires)
+        (code-expired-grant)
+        (if (= 0 (effective-scope requested delegated policy))
+          (code-empty-intersection)
+          (code-admit))))))
+
+(defn admits? [requested :i64 delegated :i64 policy :i64
+               now :i64 expires :i64] :bool
+  (if (= (code-admit) (admission-code requested delegated policy now expires))
+    true false))
+
+;; ── tests ────────────────────────────────────────────────────────────
+;; Cross-target evidence (:jvm-kir, :js, :wasm). Agreement with the EDN — the
+;; bit ORDER above all — is the CLJ authority test's job.
+
+(defn test-facts-schema [] :i64
+  (if (string=? (facts-schema) "kotoba.selfhost.safe-analyzer-facts.v0") 1 0))
+
+(defn test-effect-bits [] :i64
+  (if (and (= 1 (effect-bit "kgraph-assert!"))
+           (= 32 (effect-bit "has-capability?"))
+           (= 0 (effect-bit "+"))
+           (= 0 (effect-bit "ns"))
+           (= 63 (known-effect-mask)))
+    1 0))
+
+(defn test-infer-step [] :i64
+  ;; folding by hand here is the point: the host's reduce does exactly this
+  (let [a (infer-step 0 "llm-infer")]
+    (let [b (infer-step a "+")]
+      (let [c (infer-step b "kgraph-query")]
+        (if (and (= 16 a)
+                 (= 16 b)                        ; a non-effect op changes nothing
+                 (= 24 c)
+                 (= c (infer-step c "llm-infer")) ; idempotent
+                 (= 0 (infer-step 0 "ns")))
+          1 0)))))
+
+(defn test-effect-algebra [] :i64
+  (if (and (= 3 (effect-union 1 2))
+           (= 1 (effect-union 1 1))
+           (effect-member? 3 1)
+           (not (effect-member? 3 4))
+           ;; complement is within the universe, so it never sets bit 6+
+           (= 62 (effect-complement 1))
+           (= 0 (effect-complement 63)))
+    1 0))
+
+(defn test-declaration-check [] :i64
+  (if (and (declaration-satisfied? 3 3)
+           ;; wider declaration is fine
+           (declaration-satisfied? 1 3)
+           ;; narrower is not
+           (not (declaration-satisfied? 3 1))
+           (= 2 (undeclared-effects 3 1))
+           (= 3 (minimal-policy 3))
+           (= 3 (minimal-policy 67)))
+    1 0))
+
+(defn test-unused-grants [] :i64
+  (if (and (= 2 (unused-grants 1 3))
+           (= 0 (unused-grants 3 3))
+           (= 0 (unused-grants 3 1)))
+    1 0))
+
+(defn test-effective-scope [] :i64
+  (if (and (= 1 (effective-scope 3 1 63))
+           (= 0 (effective-scope 3 4 63))
+           ;; requesting alone grants nothing
+           (= 0 (effective-scope 63 0 63))
+           (= 0 (effective-scope 63 63 0)))
+    1 0))
+
+(defn test-attenuation [] :i64
+  (if (and (not (attenuation-violation? 3 1))
+           (not (attenuation-violation? 3 3))
+           (attenuation-violation? 1 3))
+    1 0))
+
+(defn test-production-policy [] :i64
+  (if (and (production-policy-ok? 3)
+           (not (production-policy-ok? 63)))
+    1 0))
+
+(defn test-deny-ladder [] :i64
+  (if (and (= (code-unknown-kind) (admission-code 64 1 1 0 9))
+           (= (code-missing-grant) (admission-code 1 0 1 0 9))
+           (= (code-expired-grant) (admission-code 1 1 1 10 9))
+           (= (code-empty-intersection) (admission-code 1 2 3 0 9))
+           (= (code-admit) (admission-code 3 3 1 0 9))
+           ;; an earlier rule is never rescued by a later one: this request
+           ;; would also intersect emptily, and still reports expiry
+           (= (code-expired-grant) (admission-code 1 2 3 10 9))
+           (admits? 3 3 1 0 9)
+           (not (admits? 1 0 1 0 9)))
+    1 0))
+
+(defn test-partial-authority-admits [] :i64
+  ;; The property the authority test found by disagreeing with an earlier
+  ;; version of this file: a policy that covers only part of what a program
+  ;; needs still ADMITS it, with a narrowed scope. Pinned here so it stays a
+  ;; decision rather than a side effect of the deny ladder.
+  (let [needs 3]
+    (if (and (admits? needs needs 1 0 9)
+             (= 1 (effective-scope needs needs 1))
+             (not (authority-sufficient? needs needs 1))
+             (= 2 (authority-shortfall needs needs 1))
+             (authority-sufficient? needs needs (minimal-policy needs))
+             (= 0 (authority-shortfall needs needs (minimal-policy needs))))
+      1 0)))
+
+(defn test-effect-is-not-authority [] :i64
+  ;; A program whose effects are fully inferred AND fully declared still does
+  ;; not get to run: inference grants nothing.
+  (let [inferred (effect-union (effect-bit "llm-infer")
+                               (effect-bit "kgraph-query"))]
+    (if (and (declaration-satisfied? inferred inferred)
+             (= 0 (undeclared-effects inferred inferred))
+             (= (code-missing-grant)
+                (admission-code inferred 0 (known-effect-mask) 0 9))
+             ;; and with a grant, the same program admits
+             (admits? inferred inferred (known-effect-mask) 0 9))
+      1 0)))

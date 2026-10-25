@@ -1,0 +1,126 @@
+(ns kotoba.lang.pqh.pq-test
+  "Port of pq.test.ts's KEM + ML-DSA sections, plus cross-language
+   known-answer vectors (kotoba.lang.pqh.vectors) proving:
+     - X25519 key agreement matches @noble/curves/ed25519's x25519
+     - ML-KEM-768 encapsulate/decapsulate matches @noble/post-quantum/ml-kem
+     - ML-DSA-65 keygen-from-seed + cross-verification matches
+       @noble/post-quantum/ml-dsa
+     - HKDF-SHA256 (the KEM combiner) matches @noble/hashes/hkdf
+   See kotoba.lang.pqh.pq's namespace docstring for the one documented,
+   deliberate divergence from the TS API (ML-DSA-65 secret-key
+   representation).
+
+   Stays .clj (not .cljc): binds pq/*pq* to the JVM-only BouncyCastle
+   fixture kotoba.lang.pqh.pq-bc AND directly imports org.bouncycastle.*
+   itself for independent cross-vector verification (x25519/hkdf/mlkem/
+   mldsa-matches-noble below) -- there is no cljs equivalent to cross-check
+   against without a real @noble/* host impl. No cljs test runner exists in
+   this repo either way (see crypto-test's docstring)."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing use-fixtures]]
+            [kotoba.lang.pqh.pq :as pq]
+            [kotoba.lang.pqh.pq-bc :as pq-bc]
+            [kotoba.lang.pqh.util :as u]
+            [kotoba.lang.pqh.vectors :as v])
+  (:import (org.bouncycastle.crypto.params X25519PrivateKeyParameters X25519PublicKeyParameters
+                                            HKDFParameters)
+           (org.bouncycastle.crypto.generators HKDFBytesGenerator)
+           (org.bouncycastle.crypto.digests SHA256Digest)
+           (org.bouncycastle.pqc.crypto.mlkem MLKEMParameters MLKEMPrivateKeyParameters
+                                               MLKEMExtractor)
+           (org.bouncycastle.pqc.crypto.mldsa MLDSAParameters MLDSAPrivateKeyParameters)))
+
+(use-fixtures :each (fn [f] (binding [pq/*pq* (pq-bc/bc-pq)] (f))))
+
+;; ── cross-language known-answer vectors ──────────────────────────────────
+
+(deftest x25519-matches-noble
+  (let [vec (:x25519 v/vectors)
+        priv (X25519PrivateKeyParameters. (v/hb (:aSecret vec)))
+        pub (X25519PublicKeyParameters. (v/hb (:bPublic vec)))
+        out (byte-array 32)
+        _ (.generateSecret priv pub out 0)]
+    (is (= (:sharedSecretAB vec) (u/bytes->hex out)))
+    (is (= (:aPublic vec) (u/bytes->hex (.getEncoded (.generatePublicKey priv)))))))
+
+(deftest hkdf-sha256-matches-noble
+  (let [vec (:hkdf_sha256 v/vectors)
+        ikm (v/hb (:ikm vec)) salt (v/hb (:salt vec)) info (v/hb (:info vec))
+        gen (doto (HKDFBytesGenerator. (SHA256Digest.)) (.init (HKDFParameters. ikm salt info)))
+        out (byte-array 32)]
+    (.generateBytes gen out 0 32)
+    (is (= (:okm vec) (u/bytes->hex out)))))
+
+(deftest mlkem768-decapsulate-matches-noble
+  (let [vec (:mlkem768 v/vectors)
+        noble-sec (v/hb (:secretKey vec))
+        noble-ct (v/hb (:cipherText vec))
+        priv (MLKEMPrivateKeyParameters. MLKEMParameters/ml_kem_768 noble-sec)
+        extractor (MLKEMExtractor. priv)
+        secret (.extractSecret extractor noble-ct)]
+    (is (= (:sharedSecret vec) (u/bytes->hex secret)))
+    (is (= (:secretKey vec) (u/bytes->hex (.getEncoded priv))))))
+
+(deftest mldsa65-keygen-and-verify-match-noble
+  (let [vec (:mldsa65 v/vectors)
+        seed (v/hb (:seed vec))
+        noble-pub (v/hb (:publicKey vec))
+        noble-sig (v/hb (:sig vec))
+        msg (v/hb (:msg vec))
+        priv (MLDSAPrivateKeyParameters. MLDSAParameters/ml_dsa_65 seed)]
+    (is (= (:publicKey vec) (u/bytes->hex (.getEncoded (.getPublicKeyParameters priv)))))
+    (is (= (:secretKey vec) (u/bytes->hex (.getEncoded priv))))
+    (is (pq/ml-dsa-verify noble-pub msg noble-sig))))
+
+;; ── port of "pq hybrid KEM (pqh-v1)" ──────────────────────────────────────
+
+(defn- utf8 ^bytes [^String s] (kbytes/utf8-bytes s))
+
+(deftest hybrid-kem
+  (testing "encapsulate/decapsulate derive the same 32-byte shared secret"
+    (let [{:keys [public-bundle secret-bundle]} (pq/generate-hybrid-kem-key-pair)]
+      (is (= pq/MLKEM768-PUBLIC-BYTES (alength ^bytes (:mlkem-public-key public-bundle))))
+      (let [info (utf8 "did:example:a|did:example:b")
+            {:keys [shared-secret handshake]} (pq/hybrid-encapsulate public-bundle info)]
+        (is (= pq/HYBRID-SHARED-SECRET-BYTES (alength shared-secret)))
+        (is (= pq/PQ-SUITE (:suite handshake)))
+        (is (= pq/MLKEM768-CIPHERTEXT-BYTES (alength ^bytes (:mlkem-ciphertext handshake))))
+        (let [derived (pq/hybrid-decapsulate handshake secret-bundle public-bundle info)]
+          (is (= (u/bytes->hex derived) (u/bytes->hex shared-secret)))))))
+
+  (testing "different info (DID pair) derives a different key"
+    (let [{:keys [public-bundle secret-bundle]} (pq/generate-hybrid-kem-key-pair)
+          {:keys [shared-secret handshake]} (pq/hybrid-encapsulate public-bundle (utf8 "did:a|did:b"))
+          other (pq/hybrid-decapsulate handshake secret-bundle public-bundle (utf8 "did:a|did:MALLORY"))]
+      (is (not= (u/bytes->hex other) (u/bytes->hex shared-secret)))))
+
+  (testing "tampered ML-KEM ciphertext yields a different secret (implicit rejection)"
+    (let [{:keys [public-bundle secret-bundle]} (pq/generate-hybrid-kem-key-pair)
+          {:keys [shared-secret handshake]} (pq/hybrid-encapsulate public-bundle)
+          ct (aclone ^bytes (:mlkem-ciphertext handshake))
+          _ (aset-byte ct 0 (unchecked-byte (bit-xor (aget ct 0) (unchecked-byte 0x01))))
+          tampered (assoc handshake :mlkem-ciphertext ct)
+          derived (pq/hybrid-decapsulate tampered secret-bundle public-bundle)]
+      (is (not= (u/bytes->hex derived) (u/bytes->hex shared-secret)))))
+
+  (testing "rejects an unknown suite"
+    (let [{:keys [public-bundle]} (pq/generate-hybrid-kem-key-pair)]
+      (is (thrown-with-msg? kerror/ExceptionInfo #"unsupported suite"
+                            (pq/hybrid-encapsulate (assoc public-bundle :suite "rsa-2048")))))))
+
+;; ── port of "pq ML-DSA-65" ─────────────────────────────────────────────────
+
+(deftest ml-dsa-65
+  (testing "sign/verify roundtrip; rejects wrong key and tampered message"
+    (let [kp (pq/generate-ml-dsa-key-pair)
+          msg (utf8 "canonical body bytes")
+          sig (pq/ml-dsa-sign (:secret-key kp) msg)]
+      (is (true? (pq/ml-dsa-verify (:public-key kp) msg sig)))
+      (is (false? (pq/ml-dsa-verify (:public-key kp) (utf8 "tampered") sig)))
+      (let [other (pq/generate-ml-dsa-key-pair)]
+        (is (false? (pq/ml-dsa-verify (:public-key other) msg sig))))))
+
+  (testing "is deterministic from a 32-byte seed"
+    (let [seed (u/random-bytes 32)
+          a (pq/generate-ml-dsa-key-pair seed)
+          b (pq/generate-ml-dsa-key-pair seed)]
+      (is (= (u/bytes->hex (:public-key a)) (u/bytes->hex (:public-key b)))))))

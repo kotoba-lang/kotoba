@@ -1,0 +1,60 @@
+(ns kotobase.storage.graphsync-replica-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ed25519.core :as ed]
+            [ipld.core :as ipld]
+            [kotoba.p2p.graphsync-replication :as replication]
+            [kotobase.storage.graphsync-replica :as replica]
+            [kotobase.storage.object-memory :as omem]
+            [kotobase.storage.pack :as pack]))
+
+(defn- seed [n]
+  (byte-array (map unchecked-byte (repeat 32 n))))
+
+(defn- fixture [replica-id n]
+  (let [objects (omem/memory-object-store)
+        catalog (pack/memory-catalog)
+        seed (seed n)
+        store (pack/pack-block-store objects catalog)]
+    {:objects objects :catalog catalog :store store
+     :public-key (ed/pubkey-from-seed seed)
+     :replicate (replica/replicate-fn
+                 {:store store :catalog catalog :replica-id replica-id
+                  :sign-fn #(ed/sign seed %)})}))
+
+(deftest two-independent-carv2-stores-produce-qualifying-signed-receipts
+  (let [{:keys [cid bytes]} (ipld/node->block {"checkpoint" 1})
+        a (fixture "replica-a" 51)
+        b (fixture "replica-b" 52)
+        replicas {"replica-a" a "replica-b" b}
+        enrolled-keys (into {} (map (fn [[id r]] [id (:public-key r)]) replicas))
+        verify (replica/verifier enrolled-keys
+                                 (fn [public-key message signature]
+                                   (ed/verify public-key message signature)))
+        planned (replication/plan-replication
+                 (replication/new-tracker
+                  {:replication-factor 2 :max-replicas 3 :receipt-ttl-ms 60000})
+                 cid (clojure.core/keys replicas) "owner" (constantly true))
+        executed (replication/execute-effects
+                  (:tracker planned) cid bytes (:effects planned) 1000
+                  (fn [replica-id cid bytes now-ms]
+                    ((get-in replicas [replica-id :replicate])
+                     replica-id cid bytes now-ms))
+                  verify)]
+    (is (true? (get-in executed [:qualification :qualified?])))
+    (is (= #{"replica-a" "replica-b"}
+           (set (map :replica-id (:receipts executed)))))
+    (doseq [[_ {:keys [objects catalog]}] replicas]
+      (is (= 1 (count (omem/snapshot objects)))
+          "each replica owns a separate CARv2 object")
+      (is (= cid (:cid (first (vals ((:snapshot catalog))))))))))
+
+(deftest receipt-signature-covers-pack-location
+  (let [{:keys [cid bytes]} (ipld/node->block {"checkpoint" 2})
+        r (fixture "replica-a" 61)
+        receipt ((:replicate r) "replica-a" cid bytes 2000)
+        verify (replica/verifier {"replica-a" (:public-key r)}
+                                 (fn [public-key message signature]
+                                   (ed/verify public-key message signature)))]
+    (is (true? (verify receipt)))
+    (testing "a valid block receipt cannot be moved to another pack"
+      (is (false? (verify (assoc receipt :pack-cid "bafk-forged")))))))

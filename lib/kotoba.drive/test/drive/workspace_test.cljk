@@ -1,0 +1,172 @@
+(ns drive.workspace-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [drive.workspace :as workspace]))
+
+(deftest drive-hierarchy-acl-versions-trash-and-quota
+  (let [ws (-> (workspace/workspace "acme/ops" "alice" 10)
+               (workspace/create-folder "projects" "root" "Projects" "alice")
+               (workspace/create-file "plan" "projects" {:drive/title "Plan"} "alice")
+               (workspace/grant "plan" "bob" :viewer)
+               (workspace/add-version "plan" {:drive.version/id "v1"
+                                                :drive.version/object-ref "r2:acme/plan/v1"
+                                                :drive.version/size-bytes 6}))]
+    (is (workspace/can-read? ws "plan" "bob"))
+    (is (not (workspace/can-write? ws "plan" "bob")))
+    (is (= "r2:acme/plan/v1" (:drive/object-ref (workspace/item ws "plan"))))
+    (is (= 6 (:drive.workspace/used-bytes ws)))
+    (is (empty? (workspace/visible-items (workspace/trash ws "plan") "bob")))
+    (testing "every version consumes quota"
+      ;; `Exception` is JVM-only, so this branch could not run under cljs
+      ;; and clj-kondo failed the repo's own lint gate on it.
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (workspace/add-version ws "plan" {:drive.version/id "v2"
+                                                       :drive.version/object-ref "r2:v2"
+                                                       :drive.version/size-bytes 5}))))))
+
+(deftest inherited-permissions-search-and-share-links
+  (let [ws (-> (workspace/workspace "w" "owner" 100)
+               (workspace/create-folder "team" "root" "Team" "owner")
+               (workspace/create-file "plan" "team" {:drive/title "Launch Plan"} "owner")
+               (workspace/grant "team" "alice" :viewer)
+               (workspace/create-share-link "secret" "plan" :viewer 2000))]
+    (is (workspace/can-read? ws "plan" "alice"))
+    (is (= ["plan" "team"] (mapv :drive/id (workspace/search ws "alice" ""))))
+    (is (= "plan" (:drive.share/item-id (workspace/resolve-share-link ws "secret" 1000))))
+    (is (nil? (workspace/resolve-share-link ws "secret" 2000)))
+    (is (nil? (workspace/resolve-share-link (workspace/revoke-share-link ws "secret")
+                                            "secret" 1000)))))
+
+;; ── folders ─────────────────────────────────────────────────────────────────
+
+(defn- tree
+  "root ─ work ─ q1 ─ memo
+              └ notes
+       └ loose"
+  []
+  (-> (workspace/workspace "w" "alice" 1000000)
+      (workspace/create-folder "work" "root" "仕事" "alice")
+      (workspace/create-folder "q1" "work" "Q1" "alice")
+      (workspace/create-file "memo" "q1" {:drive/title "議事録"} "alice")
+      (workspace/create-file "notes" "work" {:drive/title "メモ"} "alice")
+      (workspace/create-file "loose" "root" {:drive/title "単独"} "alice")))
+
+(deftest a-breadcrumb-reads-from-the-root-down
+  (is (= ["root" "work" "q1" "memo"] (mapv :drive/id (workspace/path (tree) "memo"))))
+  (is (= ["My Drive" "仕事" "Q1" "議事録"] (mapv :drive/title (workspace/path (tree) "memo"))))
+  (is (= ["root"] (mapv :drive/id (workspace/path (tree) "root"))))
+  (is (nil? (workspace/path (tree) "nope"))))
+
+(deftest descendants-walk-the-subtree-and-nothing-else
+  (is (= #{"q1" "memo" "notes"} (set (workspace/descendants (tree) "work"))))
+  (is (= #{"memo"} (set (workspace/descendants (tree) "q1"))))
+  (is (= [] (workspace/descendants (tree) "memo")))
+  (is (= #{"work" "q1" "memo" "notes" "loose"} (set (workspace/descendants (tree) "root")))))
+
+(deftest trashing-a-folder-hides-what-is-inside-it
+  ;; The bug this replaces: `visible-items` checked the item's own flag, so a
+  ;; file whose folder was in the trash stayed in the listing — an orphan
+  ;; nobody could explain and nobody could get rid of.
+  (let [ws (workspace/trash (tree) "work")]
+    (is (workspace/trashed? ws "work"))
+    (is (workspace/trashed? ws "memo") "two levels down")
+    (is (workspace/trashed? ws "notes"))
+    (is (not (workspace/trashed? ws "loose")))
+    (is (= #{"root" "loose"} (set (map :drive/id (workspace/visible-items ws "alice")))))))
+
+(deftest restoring-a-folder-reveals-exactly-what-was-visible-before
+  ;; And this is why the flag is not cascaded. `memo` was already in the
+  ;; trash before its folder went there; restoring the folder must not take
+  ;; it out. A cascade would have overwritten memo's own flag and had nothing
+  ;; left to restore it from.
+  (let [ws (-> (tree) (workspace/trash "memo") (workspace/trash "work"))
+        back (workspace/restore ws "work")]
+    (is (workspace/trashed? back "memo") "still where its owner put it")
+    (is (not (workspace/trashed? back "notes")) "and its sibling is back")
+    (is (not (workspace/trashed? back "work")))
+    (is (= #{"root" "work" "q1" "notes" "loose"}
+           (set (map :drive/id (workspace/visible-items back "alice")))))))
+
+(deftest the-root-cannot-be-trashed-or-moved
+  ;; Trashing it would hide the entire Drive by the rule above, with no way
+  ;; back through any listing — every item, including the root, would be
+  ;; invisible.
+  (is (thrown? js/Error
+               (workspace/trash (tree) "root")))
+  (is (thrown? js/Error
+               (workspace/move (tree) "root" "work"))))
+
+(deftest moving-changes-one-parent-and-two-listings
+  (let [ws (workspace/move (tree) "memo" "root")]
+    (is (= "root" (:drive/parent-id (workspace/item ws "memo"))))
+    (is (= ["root" "memo"] (mapv :drive/id (workspace/path ws "memo"))))
+    ;; Left the old folder as well as joined the new one. Only adding would
+    ;; leave the file in two listings at once.
+    (is (= [] (mapv :drive/id (workspace/children ws "q1" "alice"))))
+    (is (= #{"work" "loose" "memo"} (set (mapv :drive/id (workspace/children ws "root" "alice")))))))
+
+(deftest a-folder-cannot-contain-itself
+  ;; A drag lands where it lands, so this is an ordinary thing for an
+  ;; interface to ask. The result would be a subtree detached from the root:
+  ;; invisible to a listing that walks down, unreachable by a breadcrumb that
+  ;; walks up, and marked wrong nowhere.
+  (is (thrown? js/Error
+               (workspace/move (tree) "work" "work")))
+  (is (thrown? js/Error
+               (workspace/move (tree) "work" "q1")) "into its own child")
+  (is (thrown? js/Error
+               (workspace/move (tree) "work" "memo")) "into a grandchild")
+  ;; A file may go anywhere, because a file has no descendants.
+  (is (some? (workspace/move (tree) "memo" "root"))))
+
+(deftest a-cycle-that-arrived-anyway-does-not-hang
+  ;; `move` refuses to make one, but a workspace is data and can come from a
+  ;; store, a wire, or a fixture. A loop walked without a guard hangs the
+  ;; process, which is a worse answer than a short list.
+  (let [broken (-> (tree)
+                   (assoc-in [:drive.workspace/items "work" :drive/parent-id] "q1"))]
+    (is (vector? (workspace/ancestors broken "memo")))
+    (is (boolean? (workspace/trashed? broken "memo")))))
+
+(deftest permission-is-inherited-down-the-tree
+  ;; Already true — `effective-role` walked parents from the start — but
+  ;; nothing exercised it through a folder anyone had actually shared, and
+  ;; sharing a folder is the reason folders are worth having.
+  (let [ws (workspace/grant (tree) "work" "bob" :editor)]
+    (is (= :editor (workspace/effective-role ws "memo" "bob")) "two levels down")
+    (is (workspace/can-write? ws "memo" "bob"))
+    (is (nil? (workspace/effective-role ws "loose" "bob")) "and not outside it")
+    ;; A narrower grant deeper down wins, because it is found first.
+    (let [ws (workspace/grant ws "memo" "bob" :viewer)]
+      (is (= :viewer (workspace/effective-role ws "memo" "bob")))
+      (is (not (workspace/can-write? ws "memo" "bob"))))))
+
+(deftest a-moved-item-takes-its-new-folder-s-permissions
+  ;; The consequence of inheritance that is easy to miss: moving a file into
+  ;; a shared folder shares it, and moving it out unshares it. Worth a test
+  ;; because it is a permission change nobody performed.
+  (let [ws (workspace/grant (tree) "work" "bob" :editor)]
+    (is (nil? (workspace/effective-role ws "loose" "bob")))
+    (let [ws (workspace/move ws "loose" "q1")]
+      (is (= :editor (workspace/effective-role ws "loose" "bob"))))
+    (let [ws (workspace/move ws "memo" "root")]
+      (is (nil? (workspace/effective-role ws "memo" "bob"))))))
+
+(deftest children-are-what-is-in-the-folder-now
+  (let [ws (tree)]
+    (is (= ["q1" "notes"] (mapv :drive/id (workspace/children ws "work" "alice"))))
+    (is (= [] (workspace/children ws "memo" "alice")) "a file has none")
+    ;; Trash is excluded, and so is anything this principal cannot read.
+    (is (= ["notes"] (mapv :drive/id (workspace/children (workspace/trash ws "q1") "work" "alice"))))
+    (is (= [] (workspace/children ws "work" "bob")))))
+
+(deftest search-does-not-find-what-is-in-the-trash
+  ;; Search reads `visible-items`, so it inherits the ancestry rule: a file
+  ;; whose folder was trashed stops being findable, rather than being found
+  ;; and then leading nowhere.
+  (let [before (tree)
+        after (workspace/trash before "work")]
+    (is (= ["議事録"] (mapv :drive/title (workspace/search before "alice" "議事録"))))
+    (is (empty? (workspace/search after "alice" "議事録")))
+    (is (empty? (workspace/search after "alice" "Q1")) "the folder itself too")
+    (is (= ["単独"] (mapv :drive/title (workspace/search after "alice" "単独")))
+        "and what is not under it is still there")))

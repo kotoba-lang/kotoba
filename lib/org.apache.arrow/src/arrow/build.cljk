@@ -1,0 +1,209 @@
+(ns arrow.build
+  "A FlatBuffers **builder**. The inverse of `arrow.flatbuffers`, and much the
+  harder direction.
+
+  ## Why the buffer is built backwards
+
+  A FlatBuffers table stores its fields at positive offsets from itself and
+  points at its vtable with a *negative* one, and a vector stores its length
+  before its elements. Both mean a writer must know how big a thing is before
+  it can write the thing that refers to it. The format resolves this by
+  building from the **end of the buffer toward the front**: every object is
+  complete before anything referring to it is written, so a reference is
+  always backwards into finished bytes.
+
+  So the working representation here is a vector accumulated in **reverse** —
+  index 0 is the final byte of the finished buffer — and `offset` is the
+  distance from the end rather than a position. `finish!` reverses it once.
+  Two consequences worth stating, because both are silent when wrong:
+
+  - a little-endian value is pushed **most-significant byte first**, since the
+    accumulation is reversed
+  - patching a value already written at offset `o` touches reverse-indices
+    `o-1, o-2, …`, which is what `place-at!` exists to get right in one place
+
+  ## Alignment is not decoration
+
+  `prep!` pads so a value of `size` bytes lands on a `size` boundary *counting
+  from the end*, including the bytes about to be written after it
+  (`additional`). Getting this wrong produces a buffer that this repo's own
+  reader still reads — the offsets are all self-consistent — and that a real
+  Arrow implementation rejects or misreads. That asymmetry is why the tests
+  hand the output to pyarrow rather than only round-tripping it.
+
+  Scope: exactly what Arrow's metadata uses — tables, scalars, strings,
+  vectors of offsets, vectors of inline structs, and unions (which are just a
+  type byte plus an offset). No nested vectors of vectors, no shared strings."
+  (:refer-clojure :exclude [bytes])
+  (:require [kotoba.bytes :as kbytes]))
+
+(defn builder []
+  (atom {:bytes []          ; reversed: index 0 is the LAST byte of the result
+         :vtable nil        ; field offsets of the table under construction
+         :object-end 0
+         :min-align 1}))
+
+(defn offset
+  "Bytes written so far — equivalently, the distance from the end of the
+  finished buffer, which is the coordinate every FlatBuffers offset uses."
+  [b]
+  (count (:bytes @b)))
+
+(defn- pad! [b n]
+  (when (pos? n) (swap! b update :bytes into (repeat n 0))))
+
+(defn prep!
+  "Align so that a `size`-byte value, followed by `additional` more bytes,
+  lands on a `size` boundary."
+  [b size additional]
+  (swap! b update :min-align max size)
+  (pad! b (bit-and (- (+ (offset b) additional)) (dec size))))
+
+(defn- byte-seq
+  "`n` little-endian bytes of `v`, least-significant first."
+  [v n]
+  (case n
+    1 [(bit-and v 0xff)]
+    (2 4) (mapv #(bit-and (unsigned-bit-shift-right (bit-and v 0xffffffff) (* 8 %)) 0xff)
+                (range n))
+    8 #?(:clj (mapv #(bit-and (unsigned-bit-shift-right (long v) (* 8 %)) 0xff) (range 8))
+         ;; Split into 32-bit halves so no intermediate needs more precision
+         ;; than a double has. A magnitude past 2^53 is refused rather than
+         ;; written rounded -- the same rule `arrow.flatbuffers/i64` applies
+         ;; when reading, and for the same reason.
+         :cljs (let [m (js/Math.abs v)]
+                 (when (> m js/Number.MAX_SAFE_INTEGER)
+                   (throw (ex-info "integer exceeds this runtime's exact range"
+                                   {:type :arrow/precision-unavailable :approx v})))
+                 (let [lo0 (mod m 4294967296)
+                       hi0 (js/Math.floor (/ m 4294967296))
+                       [lo hi] (if (neg? v)
+                                 (if (zero? lo0)
+                                   [0 (mod (- 4294967296 hi0) 4294967296)]
+                                   [(- 4294967296 lo0) (- 4294967295 hi0)])
+                                 [lo0 hi0])]
+                   (into (mapv #(bit-and (unsigned-bit-shift-right lo (* 8 %)) 0xff) (range 4))
+                         (mapv #(bit-and (unsigned-bit-shift-right hi (* 8 %)) 0xff) (range 4))))))))
+
+(defn place!
+  "Write `v` as `n` little-endian bytes.
+
+  Pushed most-significant-first because the accumulator is reversed."
+  [b v n]
+  (swap! b update :bytes into (reverse (byte-seq v n))))
+
+(defn place-bytes!
+  "Write raw `bs` so they appear in this order in the finished buffer."
+  [b bs]
+  (swap! b update :bytes into (reverse bs)))
+
+(defn place-at!
+  "Overwrite the `n`-byte value that sits at `o`.
+
+  An item whose offset is `o` starts at absolute position `len - o`, which is
+  reverse-index `o - 1`, and its later bytes are at *decreasing* indices."
+  [b o v n]
+  (let [bs (byte-seq v n)]
+    (swap! b update :bytes
+           (fn [acc] (reduce (fn [a k] (assoc a (- o 1 k) (nth bs k)))
+                             acc (range n))))))
+
+(defn prepend-uoffset!
+  "A reference to the object at `off`, relative to its own position."
+  [b off]
+  (prep! b 4 0)
+  (place! b (+ (- (offset b) off) 4) 4))
+
+;; ── vectors ─────────────────────────────────────────────────────────────────
+
+(defn start-vector! [b elem-size n align]
+  (prep! b 4 (* elem-size n))
+  (prep! b align (* elem-size n)))
+
+(defn end-vector! [b n]
+  (place! b n 4)
+  (offset b))
+
+(defn create-string!
+  "A UTF-8 string, null-terminated as the format requires."
+  [b s]
+  (let [bs #?(:clj (mapv #(bit-and % 0xff) (kbytes/utf8-bytes ^String s))
+              :cljs (vec (js/Array.from (.encode (js/TextEncoder.) s))))]
+    (prep! b 4 (inc (count bs)))
+    (place! b 0 1)
+    (place-bytes! b bs)
+    (end-vector! b (count bs))))
+
+(defn create-offset-vector!
+  "A vector of references to already-built objects."
+  [b offs]
+  (start-vector! b 4 (count offs) 4)
+  ;; Reversed: the accumulator grows backwards, so the last element is
+  ;; prepended first.
+  (doseq [o (reverse offs)] (prepend-uoffset! b o))
+  (end-vector! b (count offs)))
+
+(defn create-struct-vector!
+  "A vector of inline structs. `emit` writes ONE struct's fields, and must
+  write them in reverse field order — a struct is inline, so its own bytes are
+  laid down back-to-front like everything else."
+  [b items struct-size align emit]
+  (start-vector! b struct-size (count items) align)
+  (doseq [x (reverse items)]
+    (prep! b align 0)
+    (emit b x))
+  (end-vector! b (count items)))
+
+;; ── tables ──────────────────────────────────────────────────────────────────
+
+(defn start-object! [b nfields]
+  (swap! b assoc :vtable (vec (repeat nfields 0)) :object-end (offset b)))
+
+(defn- slot! [b i]
+  (swap! b assoc-in [:vtable i] (offset b)))
+
+(defn add-scalar!
+  "Field `i` = `v`, omitted entirely when it equals `default`.
+
+  Omission is not an optimisation: it is how the format spells \"this field
+  has its default value\", and writing the default explicitly is merely
+  larger, not wrong."
+  [b i v n default]
+  (when-not (= v default)
+    (prep! b n 0)
+    (place! b v n)
+    (slot! b i)))
+
+(defn add-offset!
+  "Field `i` = a reference to the object at `off`. nil/0 omits the field."
+  [b i off]
+  (when (and off (pos? off))
+    (prepend-uoffset! b off)
+    (slot! b i)))
+
+(defn end-object!
+  "Close the table and emit its vtable. Returns the table's offset."
+  [b]
+  (let [vt (:vtable @b)]
+    ;; Placeholder for the soffset; patched once the vtable's position is known.
+    (prep! b 4 0)
+    (place! b 0 4)
+    (let [object-offset (offset b)
+          ;; Trailing absent fields need no slots at all -- a reader treats a
+          ;; vtable too short to hold an id as "absent", which is the same
+          ;; answer a zero slot gives.
+          trimmed (loop [v vt] (if (and (seq v) (zero? (peek v))) (recur (pop v)) v))]
+      (doseq [o (reverse trimmed)]
+        (place! b (if (zero? o) 0 (- object-offset o)) 2))
+      (place! b (- object-offset (:object-end @b)) 2)   ; table length
+      (place! b (* 2 (+ 2 (count trimmed))) 2)          ; vtable length
+      (place-at! b object-offset (- (offset b) object-offset) 4)
+      (swap! b assoc :vtable nil)
+      object-offset)))
+
+(defn finish!
+  "Write the root reference and return the finished buffer, forwards."
+  [b root]
+  (prep! b (:min-align @b) 4)
+  (prepend-uoffset! b root)
+  (vec (reverse (:bytes @b))))

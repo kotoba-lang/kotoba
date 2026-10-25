@@ -1,0 +1,250 @@
+(ns optimal-transport.sinkhorn
+  "Entropic-regularized optimal transport (Sinkhorn's algorithm), in the
+  LOG-DOMAIN STABILIZED form (dual potentials `f`/`g` updated via
+  log-sum-exp, never a raw `exp(-C/epsilon)` Gibbs kernel matrix) so that
+  small `epsilon` -- the regime morph-target correspondences actually need,
+  since large `epsilon` blurs the transport plan into a diffuse near-uniform
+  coupling instead of a sharp near-permutation match -- doesn't overflow/
+  underflow in double-precision float arithmetic. Naive multiplicative
+  Sinkhorn (`sinkhorn-naive`, also provided here) computes `K = exp(-C/eps)`
+  directly and repeatedly rescales `K` by `mu`/`nu`-derived row/column
+  factors `u`/`v` -- mathematically identical at the fixed point, but `K`'s
+  entries underflow to exact `0.0` once `C/epsilon` gets large, silently
+  corrupting the row/column scaling. The two are cross-checked against each
+  other in `sinkhorn_test.cljc` at a moderate `epsilon` where naive Sinkhorn
+  is still numerically safe.
+
+  Inspired by the optimal-transport / Monge-Kantorovich regularity line of
+  work (Figalli et al.'s Monge-Ampere regularity theory studies the SMOOTH,
+  PDE-constrained limit of optimal transport; entropic OT is the discrete,
+  computationally tractable relaxation actually used here) -- this
+  namespace is NOT a Monge-Ampere PDE solver and makes no regularity-theory
+  claims. It is a practical, iterative numerical method: Cuturi's 2013
+  \"Sinkhorn Distances\" plus the log-domain stabilization standard in
+  modern OT solvers (see e.g. Peyre & Cuturi, \"Computational Optimal
+  Transport\", Remark 4.10 / Section 4.4, for the same f/g update this
+  namespace implements).
+
+  Complexity: O(n*m) per iteration (`n` source points, `m` target points --
+  every f/g dual-potential update visits every cost-matrix entry once),
+  O(n*m*iterations) total, O(n*m) memory for the cost matrix and returned
+  plan. This is intended for OFFLINE / AUTHOR-TIME morph-target
+  PRECOMPUTATION (run once per mesh pair, result baked into a static delta
+  array), NOT per-frame runtime use -- `kami.webgpu.mesh`'s `draw!` consumes
+  the precomputed `:morph-target-deltas` via a scalar `morph-weights` blend
+  at draw time (`orgs/kotoba-lang/webgpu/src/kami/webgpu/mesh.cljs`), it
+  never re-solves a transport problem per frame.
+
+  First-class runtime is ClojureScript (browser/Node) per this org's
+  runtime-priority policy (`kotoba wasm` > `clojurewasm` > ClojureScript >
+  `nbb`, JVM/`bb` demoted to compat-only, com-junkawasaki/root AGENTS.md
+  2026-07-10) -- the `#?(:clj ... :cljs ...)` reader conditionals below
+  select `Math/exp`/`Math/log`/`Math/abs` on the JVM and
+  `js/Math.exp`/`js/Math.log`/`js/Math.abs` in ClojureScript, the same
+  convention as `character.math`
+  (`orgs/kotoba-lang/character/src/character/math.cljc`). Tests run via
+  `kbb -M:test` for CI convenience -- every sibling `.cljc` repo in this
+  org does the same (pragmatic JVM test harness, not a runtime-priority
+  statement).")
+
+;; -- platform math (JVM `Math/` vs JS `js/Math`), same convention as
+;; character.math. This repo is intentionally dependency-free (see
+;; README) -- a handful of scalar helpers isn't worth a cross-repo
+;; dependency for a library this small. --
+
+(defn- exp [x] #?(:clj (Math/exp x) :cljs (js/Math.exp x)))
+(defn- log [x] #?(:clj (Math/log x) :cljs (js/Math.log x)))
+(defn- abs-val [x] #?(:clj (Math/abs (double x)) :cljs (js/Math.abs x)))
+
+(defn- sum [xs] (reduce + 0.0 xs))
+
+(defn- normalize-mass
+  "Rescale `xs` to sum to `1.0`. `sinkhorn`/`sinkhorn-naive` apply this to
+  both `mu` and `nu` independently before solving, so the 'both must sum to
+  the same total mass' contract always holds regardless of the caller's raw
+  scale (e.g. `mu` in an arbitrary per-point weight unit and `nu` in a
+  different one both just work) -- see `sinkhorn`'s docstring Contract
+  section."
+  [xs]
+  (let [s (sum xs)]
+    (when-not (pos? s)
+      (throw (ex-info "mass vector must have positive total mass" {:sum s :xs xs})))
+    (mapv #(/ % s) xs)))
+
+(defn- validate-dims!
+  "Checks `cost-matrix` is non-empty/rectangular-enough and `mu`/`nu`
+  lengths match its row/column counts. Returns `[n m]`."
+  [cost-matrix mu nu]
+  (let [n (count cost-matrix)
+        m (count (first cost-matrix))]
+    (when (zero? n)
+      (throw (ex-info "cost-matrix must have at least one row" {})))
+    (when (not= n (count mu))
+      (throw (ex-info "mu length must match cost-matrix row count"
+                       {:expected n :actual (count mu)})))
+    (when (not= m (count nu))
+      (throw (ex-info "nu length must match cost-matrix column count"
+                       {:expected m :actual (count nu)})))
+    [n m]))
+
+(defn- log-sum-exp
+  "`log(sum(exp(xs)))`, computed with the max-subtraction trick
+  (`m + log(sum(exp(xs - m)))`, `m = max(xs)`) so no term overflows -- the
+  single stabilization primitive the whole log-domain algorithm rests on."
+  [xs]
+  (let [m (reduce max xs)]
+    (+ m (log (sum (map (fn [x] (exp (- x m))) xs))))))
+
+(defn row-sums [plan] (mapv sum plan))
+
+(defn col-sums [plan]
+  (let [m (count (first plan))]
+    (mapv (fn [j] (sum (map #(nth % j) plan))) (range m))))
+
+(defn transport-cost
+  "`sum_ij plan[i][j] * cost-matrix[i][j]` -- the total entropic-OT
+  transport cost of `plan` under `cost-matrix` (excludes the entropy
+  regularization term itself). Useful for comparing plans / sanity-checking
+  convergence; not needed by the Sinkhorn iteration itself."
+  [plan cost-matrix]
+  (sum (mapcat (fn [prow crow] (map * prow crow)) plan cost-matrix)))
+
+(defn converged? [plan] (:sinkhorn/converged? (meta plan)))
+(defn iterations [plan] (:sinkhorn/iterations (meta plan)))
+(defn marginal-violation [plan] (:sinkhorn/marginal-violation (meta plan)))
+
+;; -- log-domain stabilized Sinkhorn ---------------------------------------
+
+(defn- f-update
+  "One dual-potential update `f_i <- eps*log(mu_i) - eps*LSE_j[(g_j-C_ij)/eps]`
+  for every row `i` -- the closed-form choice of `f` that makes `plan`'s row
+  sums exactly equal `mu` GIVEN the current `g` (Sinkhorn is block-
+  coordinate ascent on the entropic-OT dual: alternately solve for `f`
+  exactly, then `g` exactly, repeat)."
+  [cost-matrix g log-mu epsilon]
+  (mapv (fn [row log-mu-i]
+          (- (* epsilon log-mu-i)
+             (* epsilon (log-sum-exp (mapv (fn [cij gj] (/ (- gj cij) epsilon)) row g)))))
+        cost-matrix log-mu))
+
+(defn- g-update
+  "Same as `f-update` for columns: `g_j <- eps*log(nu_j) -
+  eps*LSE_i[(f_i-C_ij)/eps]`, using the just-updated `f`."
+  [cost-matrix f log-nu epsilon]
+  (let [m (count log-nu)]
+    (mapv (fn [j log-nu-j]
+            (- (* epsilon log-nu-j)
+               (* epsilon (log-sum-exp (mapv (fn [row fi] (/ (- fi (nth row j)) epsilon))
+                                              cost-matrix f)))))
+          (range m) log-nu)))
+
+(defn- plan-from-potentials [cost-matrix f g epsilon]
+  (mapv (fn [row fi]
+          (mapv (fn [cij gj] (exp (/ (- (+ fi gj) cij) epsilon))) row g))
+        cost-matrix f))
+
+(defn sinkhorn
+  "Entropic-regularized optimal transport via log-domain stabilized
+  Sinkhorn iteration. Returns the `n x m` transport plan (a vector of `n`
+  row-vectors of length `m`, each entry `>= 0.0`) as plain nested vectors --
+  a seqable-of-seqables the caller can `nth`/`get-in` into directly.
+  Convergence diagnostics (`:sinkhorn/converged?` `:sinkhorn/iterations`
+  `:sinkhorn/marginal-violation`) are attached as metadata on the returned
+  plan (see the `converged?`/`iterations`/`marginal-violation` accessors,
+  above) -- the return value is still just a plan, not a wrapper map.
+
+  Contract: `cost-matrix` is `n x m` (`n` source points `i`, `m` target
+  points `j` -- rows/columns must be rectangular, every row the same
+  length). `mu` (length `n`) and `nu` (length `m`) are non-negative mass
+  vectors; both are independently rescaled to sum to `1.0` before solving,
+  so the classical OT requirement 'total source mass = total target mass'
+  is automatically satisfied regardless of the caller's raw scale -- if
+  exact literal (non-rescaled) mass conservation matters for your use case,
+  ensure `mu`/`nu` already both sum to `1.0` before calling.
+
+  Options (`{:keys [epsilon max-iters tol]}`):
+  - `epsilon` (default `0.05`) -- entropic regularization strength. Smaller
+    -> sharper, closer to an exact (Monge) point-to-point assignment;
+    larger -> more diffuse/blurred coupling. Morph-target correspondences
+    want small `epsilon` (sharp matches), which is exactly the regime naive
+    Sinkhorn is numerically unsafe in and this log-domain form is not.
+    CONVERGENCE TRADEOFF: smaller `epsilon` needs proportionally more
+    iterations for the same marginal tolerance (Sinkhorn's contraction rate
+    depends on `epsilon` relative to the cost matrix's spread -- a
+    well-separated point cloud converges fast even at small `epsilon`; a
+    cost matrix with many near-tied entries relative to `epsilon` converges
+    slowly and may need a larger `max-iters`). `converged?`/`iterations` on
+    the returned plan tell you whether `max-iters` was actually enough.
+  - `max-iters` (default `200`) -- hard iteration cap.
+  - `tol` (default `1e-6`) -- convergence check is on MARGINAL VIOLATION
+    (`max_i |row-sum(plan)_i - mu_i|`), not iteration count alone: the loop
+    stops as soon as the transport plan's row marginals match `mu` within
+    `tol`, or `max-iters` is hit, whichever comes first.
+
+  Complexity: O(n*m) per iteration, O(n*m) memory. Intended for
+  OFFLINE/PRECOMPUTED use (author-time morph-target generation), not
+  per-frame runtime -- see the namespace docstring."
+  ([cost-matrix mu nu] (sinkhorn cost-matrix mu nu {}))
+  ([cost-matrix mu nu {:keys [epsilon max-iters tol]
+                        :or {epsilon 0.05 max-iters 200 tol 1e-6}}]
+   (let [[_ m] (validate-dims! cost-matrix mu nu)
+         mu (normalize-mass mu)
+         nu (normalize-mass nu)
+         log-mu (mapv #(log (max % 1e-300)) mu)
+         log-nu (mapv #(log (max % 1e-300)) nu)]
+     ;; `f` is deliberately NOT carried as loop state: `f-update` recomputes
+     ;; it from scratch each round using only `g`/`mu` (block-coordinate
+     ;; ascent solves for `f` exactly given `g`, never incrementally), so
+     ;; the previous `f` is never read -- only `g` needs to persist across
+     ;; iterations.
+     (loop [iter 0 g (vec (repeat m 0.0))]
+       (let [f' (f-update cost-matrix g log-mu epsilon)
+             g' (g-update cost-matrix f' log-nu epsilon)
+             plan (plan-from-potentials cost-matrix f' g' epsilon)
+             violation (apply max 0.0 (map (fn [a b] (abs-val (- a b))) (row-sums plan) mu))
+             iters (inc iter)]
+         (if (or (< violation tol) (>= iters max-iters))
+           (with-meta plan {:sinkhorn/converged? (< violation tol)
+                             :sinkhorn/iterations iters
+                             :sinkhorn/marginal-violation violation})
+           (recur iters g')))))))
+
+;; -- naive (non-log-domain) Sinkhorn, for testing/comparison only --------
+
+(defn sinkhorn-naive
+  "Textbook multiplicative Sinkhorn: `K = exp(-cost-matrix/epsilon)`, then
+  alternately rescale row-scaling `u` / column-scaling `v` so `diag(u) K
+  diag(v)`'s marginals match `mu`/`nu`. Mathematically the same fixed point
+  as `sinkhorn` above, but computes `K` directly -- safe only when
+  `cost-matrix/epsilon` stays small enough that `exp(-cost-matrix/epsilon)`
+  doesn't underflow to `0.0` (which silently breaks the `u`/`v` rescaling,
+  since dividing by a zero-valued `K` row/column sum produces
+  `Infinity`/`NaN`). Provided for testing/cross-checking `sinkhorn` at a
+  moderate `epsilon`, NOT the recommended entry point -- `mesh-morph`
+  always calls the log-domain `sinkhorn`, and small-`epsilon` morph-target
+  use cases should too. Same options/contract/complexity as `sinkhorn`."
+  ([cost-matrix mu nu] (sinkhorn-naive cost-matrix mu nu {}))
+  ([cost-matrix mu nu {:keys [epsilon max-iters tol]
+                        :or {epsilon 0.05 max-iters 200 tol 1e-6}}]
+   (let [[_ m] (validate-dims! cost-matrix mu nu)
+         mu (normalize-mass mu)
+         nu (normalize-mass nu)
+         K (mapv (fn [row] (mapv (fn [cij] (exp (- (/ cij epsilon)))) row)) cost-matrix)]
+     ;; `u` is deliberately NOT carried as loop state, same reasoning as
+     ;; `f` in `sinkhorn` above: `u'` is recomputed from scratch each round
+     ;; from `v`/`mu`/`K`, so the previous `u` is never read -- only `v`
+     ;; needs to persist across iterations.
+     (loop [iter 0 v (vec (repeat m 1.0))]
+       (let [Kv (mapv (fn [row] (sum (map * row v))) K)
+             u' (mapv (fn [mu-i kv-i] (/ mu-i (max kv-i 1e-300))) mu Kv)
+             KTu (mapv (fn [j] (sum (map-indexed (fn [i row] (* (nth row j) (nth u' i))) K)))
+                       (range m))
+             v' (mapv (fn [nu-j ktu-j] (/ nu-j (max ktu-j 1e-300))) nu KTu)
+             plan (mapv (fn [u-i row] (mapv (fn [kij v-j] (* u-i kij v-j)) row v')) u' K)
+             violation (apply max 0.0 (map (fn [a b] (abs-val (- a b))) (row-sums plan) mu))
+             iters (inc iter)]
+         (if (or (< violation tol) (>= iters max-iters))
+           (with-meta plan {:sinkhorn/converged? (< violation tol)
+                             :sinkhorn/iterations iters
+                             :sinkhorn/marginal-violation violation})
+           (recur iters v')))))))

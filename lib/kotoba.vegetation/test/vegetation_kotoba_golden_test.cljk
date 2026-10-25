@@ -1,0 +1,119 @@
+(ns vegetation-kotoba-golden-test
+  (:require [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.compiler.ir :as ir]
+            [vegetation.cull :as cull]
+            [vegetation.instance :as instance]
+            [vegetation.lod :as lod]
+            [vegetation.placement :as placement]))
+
+(defn- lod-code [tier]
+  (double ({:detail 0 :billboard 1 :culled 2} tier)))
+
+(defn- invoke-js [artifact calls]
+  (let [source64 (kbytes/base64-encode
+                                  (kbytes/utf8-bytes ^String (:source artifact)))
+        calls-json (json/write-str calls)
+        script (str "const calls=" calls-json ";"
+                    "import('data:text/javascript;base64," source64 "').then(m=>{"
+                    "const k=m.instantiateKotoba({});"
+                    "console.log(JSON.stringify(calls.map(([n,a])=>k[n](...a))));"
+                    "}).catch(e=>{console.error(e);process.exit(99)})")
+        result (shell/sh "node" "--input-type=module" "-e" script)]
+    (is (zero? (:exit result)) (:err result))
+    (mapv double (read-string (:out result)))))
+
+(defn- invoke-wasm [artifact calls]
+  (let [wasm64 (kbytes/base64-encode (:bytes artifact))
+        compiler-source (java.io.File. (.toURI (io/resource "kotoba/compiler/core.clj")))
+        compiler-root (nth (iterate #(.getParentFile ^java.io.File %) compiler-source) 4)
+        runtime-uri (str (.toURI (java.io.File. compiler-root "runtime/browser-host.mjs")))
+        calls-json (json/write-str calls)
+        script (str "const calls=" calls-json ";"
+                    "import('" runtime-uri "').then(async m=>{"
+                    "const h=await m.instantiateKotoba(Buffer.from('" wasm64 "','base64'));"
+                    "console.log(JSON.stringify(calls.map(([n,a])=>h.instance.exports[n](...a))));"
+                    "}).catch(e=>{console.error(e);process.exit(99)})")
+        result (shell/sh "node" "--input-type=module" "-e" script)]
+    (is (zero? (:exit result)) (:err result))
+    (mapv double (read-string (:out result)))))
+
+(deftest vegetation-spatial-goldens-agree-across-targets
+  (let [source (slurp "lib/kotoba.vegetation/src/vegetation_golden.kotoba")
+        calls [["grass-lod-code" [10.0]] ["grass-lod-code" [25.0]]
+               ["grass-lod-code" [60.0]] ["palm-lod-code" [100.0]]
+               ["palm-lod-code" [400.0]] ["palm-lod-code" [600.0]]
+               ["xz-distance" [13.0 -2.0 1.0 3.0]]
+               ["patch-in-range-code" [16.0 16.0 40.0 32.0]]
+               ["patch-in-range-code" [160.0 160.0 40.0 32.0]]
+               ["placement-eligible-code" [20.0 0.1 0.8]]
+               ["placement-eligible-code" [120.0 0.1 0.8]]
+               ["placement-eligible-code" [20.0 0.6 0.8]]
+               ["placement-eligible-code" [20.0 0.1 0.1]]]
+        expected [(lod-code (lod/classify-lod 10.0 :grass))
+                  (lod-code (lod/classify-lod 25.0 :grass))
+                  (lod-code (lod/classify-lod 60.0 :grass))
+                  (lod-code (lod/classify-lod 100.0 :palm-tree))
+                  (lod-code (lod/classify-lod 400.0 :palm-tree))
+                  (lod-code (lod/classify-lod 600.0 :palm-tree))
+                  13.0 1.0 0.0 1.0 0.0 0.0 0.0]
+        js-artifact (compiler/compile-source source :js-kotoba-v1)
+        wasm-artifact (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        reference (mapv (fn [[name args]]
+                          (ir/execute (:kir js-artifact) (symbol name) args))
+                        calls)
+        js-values (invoke-js js-artifact calls)
+        wasm-values (invoke-wasm wasm-artifact calls)]
+    ;; The public CLJC culler independently exercises the same 5-12-13 XZ
+    ;; distance and confirms that the canonical grass instance is visible.
+    (is (= [0] (cull/cull-by-distance
+                [(instance/make-instance {:position [13.0 0.0 -2.0]
+                                          :scale 1.0 :rotation 0.0 :species 0.0
+                                          :wind-phase 0.0 :color-tint 0.0})]
+                1.0 3.0 1)))
+    (is (= expected reference))
+    (is (= expected js-values))
+    (is (= expected wasm-values))
+    (is (= js-values wasm-values))
+    (is (= :kotoba.floating-point/ieee-754-f32-f64-v7
+           (:floating-point-policy js-artifact)))
+    (is (= #{} (set (:effects (:kir js-artifact)))))))
+
+(deftest deterministic-xorshift-agrees-with-cljc-across-targets
+  (let [source (slurp "lib/kotoba.vegetation/src/vegetation_golden.kotoba")
+        seeds [0 1 -1 2147483648 4294967295 4294967296
+               -9223372036854775808 9223372036854775807]
+        expected-new (mapv placement/rng-new seeds)
+        expected-next (mapv (fn [seed] (first (placement/rng-next-u32 seed))) expected-new)
+        expected-f64 (mapv (fn [seed] (first (placement/rng-next-f32 seed))) expected-new)
+        js-artifact (compiler/compile-source source :js-kotoba-v1)
+        wasm-artifact (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        kir (:kir js-artifact)
+        reference-new (mapv #(ir/execute kir 'rng-new [%]) seeds)
+        reference-next (mapv #(ir/execute kir 'rng-next-u32 [%]) expected-new)
+        reference-f64 (mapv #(ir/execute kir 'rng-next-f64 [%]) expected-new)
+        js64 (kbytes/base64-encode
+                              (kbytes/utf8-bytes ^String (:source js-artifact)))
+        wasm64 (kbytes/base64-encode (:bytes wasm-artifact))
+        seeds-js (str "[" (str/join "," (map #(str % "n") seeds)) "]")
+        next-js (str "[" (str/join "," (map #(str % "n") expected-next)) "]")
+        f64-js (str "[" (str/join "," (map #(Double/toString (double %)) expected-f64)) "]")
+        compiler-source (java.io.File. (.toURI (io/resource "kotoba/compiler/core.clj")))
+        compiler-root (nth (iterate #(.getParentFile ^java.io.File %) compiler-source) 4)
+        runtime-uri (str (.toURI (java.io.File. compiler-root "runtime/browser-host.mjs")))
+        script (str "const seeds=" seeds-js ",next=" next-js ",floats=" f64-js ";"
+                    "Promise.all([import('data:text/javascript;base64," js64 "'),import('" runtime-uri "')])"
+                    ".then(async ([j,host])=>{const a=j.instantiateKotoba({}),h=await host.instantiateKotoba(Buffer.from('" wasm64 "','base64')),b=h.instance.exports;"
+                    "for(let i=0;i<seeds.length;i++){const s=a['rng-new'](seeds[i]),w=b['rng-new'](seeds[i]);"
+                    "if(s!==w||a['rng-next-u32'](s)!==next[i]||b['rng-next-u32'](w)!==next[i])process.exit(2);"
+                    "const af=a['rng-next-f64'](s),bf=b['rng-next-f64'](w);if(!Object.is(af,bf)||Math.abs(af-floats[i])>1e-15)process.exit(3)}})"
+                    ".catch(e=>{console.error(e);process.exit(99)})")
+        result (shell/sh "node" "--input-type=module" "-e" script)]
+    (is (= expected-new reference-new))
+    (is (= expected-next reference-next))
+    (is (= expected-f64 reference-f64))
+    (is (zero? (:exit result)) (:err result))))

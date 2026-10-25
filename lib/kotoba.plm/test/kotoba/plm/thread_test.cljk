@@ -1,0 +1,100 @@
+(ns kotoba.plm.thread-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotoba.plm.db :as db]
+            #?(:clj [kotoba.plm.db-host :as db-host])
+            [kotoba.plm.item :as plm]
+            [kotoba.plm.cost :as cost]
+            [kotoba.plm.erp :as erp]
+            [kotoba.plm.thread :as thread]))
+
+(defn- fresh [prefix]
+  #?(:clj (db-host/fresh-conn (str prefix (System/nanoTime)))
+     :cljs (throw (ex-info "Datomic Local test oracle is JVM-only" {}))))
+
+(defn- world []
+  (let [conn (fresh "t-")]
+    (db/tx! conn erp/chart)
+    (db/tx! conn
+      [(plm/item {:part-no "PN-2000" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "PN-2001" :make-buy :buy :std-unit-cost 50})
+       (plm/item {:part-no "PN-1000" :make-buy :make})])
+    (db/tx! conn
+      [(plm/bom-edge {:parent "PN-1000@A" :child "PN-2000@A" :qty 4 :find-no 1})
+       (plm/bom-edge {:parent "PN-1000@A" :child "PN-2001@A" :qty 2 :find-no 2})])
+    conn))
+
+(deftest rolled-cost-walks-mbom
+  (let [conn (world)]
+    (is (= 500M (cost/rolled-cost (db/db conn) "PN-1000@A"))
+        "4×100 + 2×50 = 500")))
+
+(deftest released-gating
+  (let [conn (world)]
+    (testing "unknown item is a no-op, not an exception"
+      (is (false? (:ok (thread/release-item! conn "PN-XXXX@A")))))
+    (testing "draft item has no inventory until released"
+      (is (nil? (db/attr (db/db conn) :erp.inventory/std-cost [:erp.inventory/id "INV-PN-1000@A"]))))
+    (thread/release-item! conn "PN-2000@A")
+    (thread/release-item! conn "PN-2001@A")
+    (let [r (thread/release-item! conn "PN-1000@A")]
+      (is (:ok r))
+      (is (= 500M (:rolled-cost r)))
+      (is (= :released (plm/lifecycle (db/db conn) "PN-1000@A"))))
+    (testing "re-release is a reported no-op"
+      (is (= :already-released (:reason (thread/release-item! conn "PN-1000@A")))))))
+
+(deftest receipt-and-eco-revaluation
+  (let [conn (world)]
+    (doseq [iid ["PN-2000@A" "PN-2001@A" "PN-1000@A"]] (thread/release-item! conn iid))
+    (thread/receive-goods! conn "PN-1000@A" 10)
+    (testing "perpetual inventory valued at standard"
+      (is (= 5000M (erp/inventory-value (db/db conn))) "10 × 500"))
+    ;; design change: PN-2000 standard 100 → 130
+    (db/tx! conn [(plm/change-order {:id "ECO-1" :affected ["PN-2000@A"] :new-unit-cost 130})])
+    (let [res (thread/release-eco! conn "ECO-1")]
+      (is (:ok res))
+      (is (= 620M (:new-std (first (:parents res)))) "4×130 + 2×50 = 620")
+      (is (= 1200M (:revaluation (first (:parents res)))) "(620-500) × 10"))
+    (testing "inventory revalued to the new standard"
+      (is (= 6200M (erp/inventory-value (db/db conn))) "10 × 620"))
+    (testing "GL stays balanced (Σdebit = Σcredit)"
+      (let [tb (erp/trial-balance (db/db conn))
+            dr (reduce + 0M (map (comp :debit val) tb))
+            cr (reduce + 0M (map (comp :credit val) tb))]
+        (is (= dr cr))
+        ;; cost ↑ → inventory asset ↑ (Dr 1400) with a credit revaluation variance
+        ;; (favorable), so 5900 carries a -1200 credit balance — the P/L impact.
+        (is (= -1200M (get-in tb ["5900" :balance])) "revaluation variance hits P/L")))))
+
+(defn- three-level-world
+  "Buy item B → Make item S (consumes 1×B) → Make item T (consumes 1×S).
+   A grandparent-of-B BOM, so an ECO on B must revalue T too, not just S."
+  []
+  (let [conn (fresh "t-")]
+    (db/tx! conn erp/chart)
+    (db/tx! conn
+      [(plm/item {:part-no "B" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "S" :make-buy :make})
+       (plm/item {:part-no "T" :make-buy :make})])
+    (db/tx! conn
+      [(plm/bom-edge {:parent "S@A" :child "B@A" :qty 1 :find-no 1})
+       (plm/bom-edge {:parent "T@A" :child "S@A" :qty 1 :find-no 1})])
+    conn))
+
+(deftest eco-revalues-transitive-ancestors-not-just-direct-parents
+  (let [conn (three-level-world)]
+    (doseq [iid ["B@A" "S@A" "T@A"]] (thread/release-item! conn iid))
+    (thread/receive-goods! conn "T@A" 5)
+    (is (= 500M (erp/inventory-value (db/db conn))) "5 × 100 before ECO")
+    (db/tx! conn [(plm/change-order {:id "ECO-2" :affected ["B@A"] :new-unit-cost 130})])
+    (let [res (thread/release-eco! conn "ECO-2")]
+      (is (:ok res))
+      (is (= #{"B@A" "S@A" "T@A"} (set (map :parent (:parents res))))
+          "the affected buy item, its direct parent S, and the grandparent T are all re-rolled")
+      (is (= 130M (:new-std (some #(when (= "S@A" (:parent %)) %) (:parents res)))))
+      (is (= 130M (:new-std (some #(when (= "T@A" (:parent %)) %) (:parents res))))
+          "T's rolled cost (via S) is 130, same as B's new cost"))
+    (testing "T's own inventory record is re-rolled, not left stale"
+      (is (= 130M (db/attr (db/db conn) :erp.inventory/std-cost [:erp.inventory/id "INV-T@A"]))))
+    (testing "inventory value reflects the grandparent's revaluation too"
+      (is (= 650M (erp/inventory-value (db/db conn))) "5 × 130"))))

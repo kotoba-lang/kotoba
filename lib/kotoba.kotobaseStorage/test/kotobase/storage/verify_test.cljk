@@ -1,0 +1,205 @@
+(ns kotobase.storage.verify-test
+  "The claim under test is that a caller reading through this decorator cannot
+  be handed bytes that are not the bytes -- and, just as importantly, that a
+  tampered block is not quietly turned into a missing one, because a tree walk
+  cannot tell a missing node from a subtree that does not exist."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.memory :as memory]
+            [kotobase.storage.verify :as verify]
+            #?(:clj [multiformats.core :as mf])))
+
+;; A toy content-addressing function: portable, and honest about the only
+;; property the decorator relies on -- that the same bytes always name
+;; themselves the same way, and different bytes do not.
+(defn- cid-of [bytes] (str "cid:" (vec bytes)))
+
+(defn- bytes-of [& values] (vec values))
+
+;; ── a hostile store ─────────────────────────────────────────────────────────
+;;
+;; Not a mock of a broken provider: this IS what an untrusted host is
+;; permitted to be. `core.cljc` puts blocks on "untrusted, erasure-coded,
+;; content-addressed networks", so serving different bytes under a CID is
+;; inside the threat model, not outside it.
+
+(defrecord Liar [blocks caps]
+  storage/IBlockStore
+  (-put-blocks! [_ bs] (mapv :cid bs))
+  (-get-blocks [_ cids] (select-keys blocks cids))
+  storage/IBackendCapabilities
+  (-capabilities [_] caps))
+
+(defn- liar
+  ([blocks] (liar blocks storage/block-capabilities))
+  ([blocks caps] (->Liar blocks caps)))
+
+;; ── the happy path is genuinely a pass-through ──────────────────────────────
+
+(deftest matching-blocks-pass-through-unchanged
+  (let [a (bytes-of 1 2 3)
+        b (bytes-of 4 5)
+        inner (liar {(cid-of a) a (cid-of b) b})
+        store (verify/verifying-block-store inner cid-of)]
+    (is (= {(cid-of a) a (cid-of b) b}
+           (storage/-get-blocks store [(cid-of a) (cid-of b)])))
+    (testing "and the single-block convenience reader too"
+      (is (= a (storage/get-block store (cid-of a)))))))
+
+;; ── the policy: throw, do not omit ──────────────────────────────────────────
+
+(deftest a-tampered-block-throws-rather-than-vanishing
+  (testing "omitting it would make a corrupt store look like a shorter answer:
+            rows quietly missing from a query, indistinguishable from a cache
+            miss, with nothing in the result saying the host lied"
+    (let [honest (bytes-of 1 2 3)
+          swapped (bytes-of 9 9 9)
+          cid (cid-of honest)
+          store (verify/verifying-block-store (liar {cid swapped}) cid-of)]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (storage/-get-blocks store [cid])))
+      (let [data (try (storage/-get-blocks store [cid])
+                      (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+        (is (= verify/mismatch-type (:type data)))
+        (is (= cid (:cid data)) "the CID that was asked for")
+        (is (= (cid-of swapped) (:actual-cid data))
+            "and the CID the bytes actually hash to -- the evidence")))))
+
+(deftest one-bad-block-fails-the-whole-batch
+  (testing "returning the good half would hand the caller a partial result it
+            has no way to know is partial"
+    (let [good (bytes-of 1 2 3)
+          cid-bad "cid:tampered"
+          store (verify/verifying-block-store
+                 (liar {(cid-of good) good cid-bad (bytes-of 7)}) cid-of)]
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (storage/-get-blocks store [(cid-of good) cid-bad]))))))
+
+;; ── missing stays missing ───────────────────────────────────────────────────
+
+(deftest a-missing-cid-is-omitted-not-nil-and-not-an-error
+  (let [a (bytes-of 1 2 3)
+        store (verify/verifying-block-store (liar {(cid-of a) a}) cid-of)
+        found (storage/-get-blocks store [(cid-of a) "cid:absent"])]
+    (is (= #{(cid-of a)} (set (keys found))) "the contract omits, it does not nil")
+    (is (nil? (storage/get-block store "cid:absent")))
+    (testing "an empty request is an empty map, not a throw"
+      (is (= {} (storage/-get-blocks store []))))))
+
+(deftest a-provider-that-spells-missing-as-nil-is-normalised-not-accused
+  (testing "nil is not wrong bytes; it is a provider saying 'missing' the way
+            the contract says not to, and the contract's answer for missing is
+            omission"
+    (let [store (verify/verifying-block-store (liar {"cid:x" nil}) cid-of)]
+      (is (= {} (storage/-get-blocks store ["cid:x"]))))))
+
+;; ── capabilities ────────────────────────────────────────────────────────────
+
+(deftest capabilities-delegate-and-declare-the-guarantee
+  (let [inner (liar {} #{:immutable-blocks :cid-addressed-read :batch-get})
+        store (verify/verifying-block-store inner cid-of)]
+    (is (every? (storage/-capabilities store) (storage/-capabilities inner))
+        "nothing the wrapped store declared is lost")
+    (is (contains? (storage/-capabilities store) verify/verified-capability)
+        "and verification is discoverable rather than an assembly accident")
+    (testing "so a wrapped block-only store still validates as one"
+      (is (identical? store (storage/validate-block-store! store))))))
+
+(deftest a-wrapped-backend-keeps-its-ref-profile
+  (let [store (verify/verifying-block-store (memory/memory-store) cid-of)]
+    (is (= :linearizable-ref (storage/ref-profile store)))
+    (is (true? (storage/linearizable? store)))))
+
+;; ── the ref plane is delegated, and only when it exists ─────────────────────
+
+(deftest wrapping-a-full-backend-keeps-it-a-full-backend
+  (testing "silently dropping IRefStore would break the refs of any backend
+            wrapped here"
+    (let [store (verify/verifying-block-store (memory/memory-store) cid-of)]
+      (is (storage/ref-store? store))
+      (is (storage/backend? store))
+      (is (identical? store (storage/validate-backend! store)))
+      (is (nil? (storage/-read-ref store "main")))
+      (is (:published? (storage/-compare-and-set-ref! store "main" nil "cid-a")))
+      (is (= "cid-a" (:cid (storage/-read-ref store "main"))))
+      (is (false? (:published? (storage/-compare-and-set-ref!
+                                store "main" nil "cid-b")))))))
+
+(deftest wrapping-a-block-only-store-does-not-invent-a-ref-plane
+  (testing "always implementing IRefStore would make backend? answer true for
+            a store that has no refs -- a worse lie than the one it avoids"
+    (let [store (verify/verifying-block-store (liar {}) cid-of)]
+      (is (false? (storage/ref-store? store)))
+      (is (false? (storage/backend? store)))
+      (is (true? (storage/block-backend? store)))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (storage/validate-backend! store))))))
+
+;; ── puts are pass-through, and a mis-keyed put surfaces on read ─────────────
+
+(deftest puts-are-delegated-and-a-mis-keyed-put-is-caught-when-read
+  (let [inner (memory/memory-store)
+        store (verify/verifying-block-store inner cid-of)
+        a (bytes-of 1 2 3)]
+    (is (= [(cid-of a)] (storage/-put-blocks! store [{:cid (cid-of a) :bytes a}])))
+    (is (= a (storage/get-block store (cid-of a))))
+    (testing "a caller that computes its own CIDs wrongly builds a store that
+              fails its OWN reads, loudly -- the same defect at the same seam,
+              without hashing every write twice"
+      (storage/put-block! store "cid:wrong" a)
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (storage/get-block store "cid:wrong"))))))
+
+;; ── configuration fails closed ──────────────────────────────────────────────
+
+(deftest construction-refuses-a-store-or-a-hash-it-cannot-use
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (verify/verifying-block-store (liar {}) nil))
+      "no cid-of means no verification, which is the thing being asked for")
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (verify/verifying-block-store {:not "a store"} cid-of))))
+
+(deftest an-async-store-in-the-sync-decorator-says-which-one-to-use
+  (testing "without this the Promise object itself is hashed and every block in
+            the batch reports as tampered -- an alarming, entirely wrong
+            diagnosis of a wiring mistake"
+    (let [async-ish (reify
+                      storage/IBlockStore
+                      (-put-blocks! [_ bs] (mapv :cid bs))
+                      (-get-blocks [_ _] :a-promise-shaped-thing)
+                      storage/IBackendCapabilities
+                      (-capabilities [_] storage/block-capabilities))
+          store (verify/verifying-block-store async-ish cid-of)
+          data (try (storage/-get-blocks store ["cid:x"])
+                    (catch #?(:clj Exception :cljs :default) e (ex-data e)))]
+      (is (= :kotobase.storage/async-store-in-sync-decorator (:type data))))))
+
+;; ── the scrub survey, which exists so the read path need not be lenient ─────
+
+(deftest classify-surveys-damage-without-stopping
+  (let [good (bytes-of 1 2 3)
+        result (verify/classify cid-of {(cid-of good) good
+                                        "cid:bad" (bytes-of 7 7)
+                                        "cid:nil" nil})]
+    (is (= {(cid-of good) good} (:verified result)))
+    (is (= {"cid:bad" (cid-of (bytes-of 7 7))} (:mismatched result)))
+    (testing "and it does not accuse a nil of being tampering either"
+      (is (not (contains? (:mismatched result) "cid:nil"))))))
+
+;; ── against a real CID implementation, not just a toy one ───────────────────
+
+#?(:clj
+   (deftest works-with-genuine-content-addressing
+     (testing "the decorator's only assumption is that cid-of names bytes; the
+               injected function can be the real one, and io-multiformats is
+               byte-identical to `ipfs add --cid-version=1 --raw-leaves`"
+       (let [real-cid-of (fn [^bytes bs] (mf/cidv1-raw bs))
+             payload (kbytes/utf8-bytes "the quick brown fox")
+             cid (real-cid-of payload)
+             honest (verify/verifying-block-store (liar {cid payload}) real-cid-of)
+             lying (verify/verifying-block-store
+                    (liar {cid (kbytes/utf8-bytes "the quick brown cat")})
+                    real-cid-of)]
+         (is (= {cid payload} (storage/-get-blocks honest [cid])))
+         (is (thrown? clojure.lang.ExceptionInfo
+                      (storage/-get-blocks lying [cid])))))))

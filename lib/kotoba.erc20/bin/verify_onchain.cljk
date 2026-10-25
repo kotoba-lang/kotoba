@@ -1,0 +1,159 @@
+;; REAL Sepolia transactions, signed by eth-crypto and executed on-chain. This is
+;; the end of the verification ladder: unit vectors -> viem cross-checks -> live
+;; read-only calls -> money actually moving on a public chain.
+;;
+;; NOT in CI: it spends testnet funds and depends on a public RPC. Run it when the
+;; signing or calldata path changes.
+;;
+;;   SEPOLIA_KEY=$(kagi get SWAP_SEPOLIA_TESTNET_KEY) \
+;;   kbb --backend sci --classpath "$(kbb -Spath -M:test | tr ':' '\n' \
+;;        | grep -E 'kotoba-lang|^src$' | tr '\n' ':')" bin/verify_onchain.cljk
+;;
+;; Result 2026-07-26 (12/12), signer 0xAd785580D9af6AC6e43D19eC5F5F666b6b016EA9:
+;;   0xa3e0d7115a5b91c9b124f93066b3467e00bf1ffdd508a8c11f237a2f14aeb6e4  block 11354631
+;;   0x9a48363f1a5123fdbfb27faae2d61b3db4344c11f2a12e2d9e760f7b3b6c87f0  block 11354632
+;;
+;; Two transactions, chosen so they prove more than a plain transfer would:
+;;   1. deposit() on WETH with value  -> exercises EIP-1559 signing, a typed
+;;      envelope with BOTH calldata and value, and a contract call
+;;   2. erc20/transfer calldata       -> exercises erc20's calldata generation
+;;      against a real deployed token, with a balance change we then read back
+;;      through erc20's own decoder
+;;
+;; Before each broadcast the signature is checked LOCALLY (ecrecover must return
+;; our own address) and afterwards the node's returned tx hash is compared to
+;; eth-crypto's locally computed raw-tx-hash — which is the only way to verify
+;; that function against an independent authority.
+(ns send-sepolia
+  (:require [kotoba.lang.text :as str]
+            [erc20.core :as erc20]
+            [eth-crypto.core :as eth]
+            [promesa.core :as p]))
+
+(def RPC "https://ethereum-sepolia-rpc.publicnode.com")
+(def WETH "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14")   ; verified: symbol()=WETH, decimals()=18
+(def RECIPIENT "0x0000000000000000000000000000000000000001")
+
+(def privkey
+  (eth/hex->bytes (or (some-> js/process.env.SEPOLIA_KEY str/trim)
+                      (throw (ex-info "SEPOLIA_KEY not set" {})))))
+
+(def ok (atom 0)) (def bad (atom 0))
+(defn check [label pass? & [detail]]
+  (if pass? (swap! ok inc) (swap! bad inc))
+  (println (str (if pass? "  PASS  " "  FAIL  ") label
+                (when detail (str "\n           " detail)))))
+
+(defn rpc [method params]
+  (p/let [r (js/fetch RPC #js {:method "POST"
+                              :headers #js {"content-type" "application/json"}
+                              :body (js/JSON.stringify
+                                     (clj->js {:jsonrpc "2.0" :id 1 :method method :params params}))})
+          b (.json r)]
+    (if-let [e (aget b "error")] {:error (aget e "message")} {:result (aget b "result")})))
+
+(defn hex->int [h] (js/parseInt (str/replace (str h) "0x" "") 16))
+
+(defn wait-receipt [txh]
+  (p/loop [n 0]
+    (p/let [{:keys [result]} (rpc "eth_getTransactionReceipt" [txh])]
+      (cond
+        result result
+        (> n 40) nil
+        :else (p/let [_ (p/delay 3000)] (p/recur (inc n)))))))
+
+(defn send-tx!
+  "Sign locally, self-check, broadcast, confirm. Returns the receipt."
+  [label {:keys [to data value gas]} nonce chain-id fees]
+  (println (str "\n── " label " ──"))
+  (let [tx (cond-> {:chain-id chain-id :nonce nonce
+                    :max-priority-fee-per-gas (:priority fees)
+                    :max-fee-per-gas (:max fees)
+                    :gas gas :to to :data (or data "0x") :value (or value 0)}
+             true identity)
+        digest (eth/eip1559-digest tx)
+        sig (eth/secp256k1-sign privkey digest)
+        raw (eth/eip1559-raw tx sig)
+        local-hash (eth/raw-tx-hash raw)
+        signer (eth/address-of-privkey privkey)]
+    ;; local gate: never broadcast a signature that does not recover to us
+    (check "signature recovers our own address BEFORE broadcasting"
+           (= signer (eth/ecrecover-checksum digest (eth/signature->bytes sig)))
+           (str "signer " signer))
+    (println (str "           local raw-tx-hash " local-hash))
+    (p/let [{:keys [result error]} (rpc "eth_sendRawTransaction" [raw])]
+      (if error
+        (do (check (str label " broadcast accepted") false error) nil)
+        (p/let [_ (check "node ACCEPTED the transaction" true (str "tx " result))
+                _ (check "node's tx hash == eth-crypto's locally computed raw-tx-hash"
+                         (= (str/lower local-hash) (str/lower result))
+                         (str "node  " result))
+                receipt (wait-receipt result)]
+          (check (str label ": mined with status success")
+                 (= "0x1" (some-> receipt (aget "status")))
+                 (str "block " (some-> receipt (aget "blockNumber") hex->int)
+                      "  gasUsed " (some-> receipt (aget "gasUsed") hex->int)
+                      "  status " (some-> receipt (aget "status"))))
+          receipt)))))
+
+(defn weth-balance [addr]
+  (p/let [{:keys [result]} (rpc "eth_call" [{:to WETH :data (erc20/balance-of addr)} "latest"])]
+    (erc20/decode-uint result)))
+
+(p/let [signer (eth/address-of-privkey privkey)
+        _ (println (str "REAL SEPOLIA TRANSACTIONS — signer " signer))
+        {cid :result} (rpc "eth_chainId" [])
+        chain-id (hex->int cid)
+        {n :result} (rpc "eth_getTransactionCount" [signer "pending"])
+        nonce (hex->int n)
+        {bal :result} (rpc "eth_getBalance" [signer "latest"])
+        {blk :result} (rpc "eth_getBlockByNumber" ["latest" false])
+        base-fee (hex->int (aget blk "baseFeePerGas"))
+        priority 1500000000                             ; 1.5 gwei
+        max-fee (+ (* 2 base-fee) priority)
+        fees {:priority priority :max max-fee}
+        _ (check "Sepolia reachable, chain id 11155111" (= 11155111 chain-id))
+        _ (println (str "           nonce " nonce
+                        "  balance " (erc20/->display (str (hex->int bal)) 18) " SepETH"
+                        "  baseFee " base-fee " wei"))
+
+        ;; ── tx 1: wrap 0.01 ETH via deposit() ──
+        wrap-amount (erc20/->units "0.01" 18)
+        {gas1 :result} (rpc "eth_estimateGas"
+                            [{:from signer :to WETH :data "0xd0e30db0"
+                              :value (str "0x" (.toString (js/BigInt wrap-amount) 16))}])
+        r1 (send-tx! "tx 1: WETH deposit() with 0.01 ETH"
+                     {:to WETH :data "0xd0e30db0" :value wrap-amount
+                      :gas (+ 20000 (hex->int gas1))}
+                     nonce chain-id fees)
+        bal-after-wrap (weth-balance signer)
+        _ (check "our WETH balance == the 0.01 we wrapped, read via erc20's decoder"
+                 (= wrap-amount bal-after-wrap)
+                 (str "balanceOf(us) = " bal-after-wrap " = "
+                      (erc20/->display bal-after-wrap 18) " WETH"))
+
+        ;; ── tx 2: ERC-20 transfer, using erc20's own calldata ──
+        send-amount (erc20/->units "0.004" 18)
+        before-recipient (weth-balance RECIPIENT)
+        calldata (erc20/transfer RECIPIENT send-amount)
+        _ (println (str "\n           erc20/transfer calldata " (subs calldata 0 10)
+                        "… (" (count calldata) " chars)"))
+        {gas2 :result} (rpc "eth_estimateGas"
+                            [{:from signer :to WETH :data calldata}])
+        r2 (send-tx! "tx 2: ERC-20 transfer of 0.004 WETH"
+                     {:to WETH :data calldata :value 0
+                      :gas (+ 20000 (hex->int gas2))}
+                     (inc nonce) chain-id fees)
+        after-us (weth-balance signer)
+        after-recipient (weth-balance RECIPIENT)]
+  (check "our WETH balance decreased by exactly the transferred amount"
+         (= after-us (erc20/->units "0.006" 18))
+         (str "balanceOf(us) = " (erc20/->display after-us 18) " WETH"))
+  (check "the recipient's WETH balance increased by exactly the transferred amount"
+         (= (- (js/BigInt after-recipient) (js/BigInt before-recipient))
+            (js/BigInt send-amount))
+         (str "balanceOf(recipient) " (erc20/->display before-recipient 18)
+              " -> " (erc20/->display after-recipient 18) " WETH"))
+  (println (str "\n═══ TOTAL: " @ok " passed, " @bad " failed ═══"))
+  (println (str "explorer: https://sepolia.etherscan.io/address/" signer))
+  (when (pos? @bad) (js/process.exit 1)))

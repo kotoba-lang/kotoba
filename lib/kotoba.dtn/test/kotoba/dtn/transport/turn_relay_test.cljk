@@ -1,0 +1,209 @@
+(ns kotoba.dtn.transport.turn-relay-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.bytes :as b]
+            [kotoba.turn.stun :as stun]
+            [kotoba.turn.credential :as cred]
+            [kotoba.dtn.transport.turn-relay :as tr]))
+
+(def ^:private txid (vec (range 12)))
+(def ^:private shared-secret "test-shared-secret")
+
+(deftest ip-conversion-round-trip-test
+  (testing "dotted-quad <-> byte-vector round-trips"
+    (is (= [127 0 0 1] (tr/ip-str->vec "127.0.0.1")))
+    (is (= "127.0.0.1" (tr/ip-vec->str [127 0 0 1])))
+    (is (= [10 20 30 40] (tr/ip-str->vec (tr/ip-vec->str [10 20 30 40]))))))
+
+(deftest build-allocate-request-test
+  (let [{:keys [username credential]} (cred/mint-credential shared-secret "alice" 600 1700000000)
+        req (tr/build-allocate-request username credential txid)
+        {:keys [header attrs]} (tr/parse-stun-message req)]
+    (testing "header type + txid"
+      (is (= stun/allocate-request (:typ header)))
+      (is (= txid (:txid header))))
+    (testing "USERNAME attribute round-trips (byte-vector equality — portable, no platform string interop)"
+      (is (= (b/utf8-encode username) (vec (tr/find-attr attrs stun/attr-username)))))
+    (testing "REQUESTED-TRANSPORT present (UDP = protocol 17)"
+      (is (= 0x11 (first (tr/find-attr attrs stun/attr-requested-transport)))))
+    (testing "MESSAGE-INTEGRITY verifies under the credential just used to sign"
+      (is (true? (stun/verify-message-integrity req (b/utf8-encode credential)))))
+    (testing "MESSAGE-INTEGRITY does NOT verify under a different credential"
+      (is (false? (stun/verify-message-integrity req (b/utf8-encode "wrong-credential")))))
+    (testing "FINGERPRINT verifies"
+      (is (true? (stun/verify-fingerprint req))))))
+
+(deftest build-create-permission-request-test
+  (let [{:keys [username credential]} (cred/mint-credential shared-secret "bob" 600 1700000000)
+        peer-ip [8 8 8 8] peer-port 4242
+        req (tr/build-create-permission-request username credential peer-ip peer-port txid)
+        {:keys [header attrs]} (tr/parse-stun-message req)]
+    (testing "header type + txid"
+      (is (= stun/create-permission-request (:typ header)))
+      (is (= txid (:txid header))))
+    (testing "XOR-PEER-ADDRESS round-trips to the exact peer ip/port given"
+      (let [decoded (stun/decode-xor-mapped-v4 (tr/find-attr attrs stun/attr-xor-peer-address))]
+        (is (= peer-ip (:ip decoded)))
+        (is (= peer-port (:port decoded)))))
+    (testing "MESSAGE-INTEGRITY verifies"
+      (is (true? (stun/verify-message-integrity req (b/utf8-encode credential)))))
+    (testing "FINGERPRINT verifies"
+      (is (true? (stun/verify-fingerprint req))))))
+
+(deftest build-refresh-request-test
+  (let [{:keys [username credential]} (cred/mint-credential shared-secret "erin" 600 1700000000)]
+    (testing "no lifetime-s given (2-arg): no LIFETIME attribute at all"
+      (let [req (tr/build-refresh-request username credential txid)
+            {:keys [header attrs]} (tr/parse-stun-message req)]
+        (is (= stun/refresh-request (:typ header)))
+        (is (= txid (:txid header)))
+        (is (= (b/utf8-encode username) (vec (tr/find-attr attrs stun/attr-username))))
+        (is (nil? (tr/find-attr attrs stun/attr-lifetime)))
+        (is (true? (stun/verify-message-integrity req (b/utf8-encode credential))))
+        (is (true? (stun/verify-fingerprint req)))))
+    (testing "explicit nil lifetime-s (3-arg form): same as omitting it"
+      (let [req (tr/build-refresh-request username credential txid nil)
+            {:keys [attrs]} (tr/parse-stun-message req)]
+        (is (nil? (tr/find-attr attrs stun/attr-lifetime)))))
+    (testing "lifetime-s given: LIFETIME attribute present and round-trips via response-lifetime"
+      (let [req (tr/build-refresh-request username credential txid 4)
+            {:keys [attrs]} (tr/parse-stun-message req)]
+        (is (= 4 (tr/response-lifetime attrs)))
+        (is (true? (stun/verify-message-integrity req (b/utf8-encode credential))))
+        (is (true? (stun/verify-fingerprint req)))))
+    (testing "lifetime-s of 0 is a valid, distinct-from-absent request (RFC 8656 §7.3 delete-allocation signal)"
+      (let [req (tr/build-refresh-request username credential txid 0)
+            {:keys [attrs]} (tr/parse-stun-message req)]
+        (is (= 0 (tr/response-lifetime attrs)))))))
+
+(deftest response-lifetime-test
+  (testing "decodes a real Allocate-success-shaped LIFETIME attribute"
+    (let [resp (-> (stun/encode-header {:typ stun/allocate-response :length 0 :txid txid})
+                    (stun/push-attr stun/attr-lifetime (stun/encode-u32-attr 600))
+                    stun/set-attr-length
+                    stun/append-fingerprint)
+          {:keys [attrs]} (tr/parse-stun-message resp)]
+      (is (= 600 (tr/response-lifetime attrs)))))
+  (testing "decodes a real Refresh-success-shaped LIFETIME attribute with a different value"
+    (let [resp (-> (stun/encode-header {:typ stun/refresh-response :length 0 :txid txid})
+                    (stun/push-attr stun/attr-lifetime (stun/encode-u32-attr 4))
+                    stun/set-attr-length
+                    stun/append-fingerprint)
+          {:keys [attrs]} (tr/parse-stun-message resp)]
+      (is (= 4 (tr/response-lifetime attrs)))))
+  (testing "nil when LIFETIME is absent (e.g. an error response)"
+    (let [err-resp (-> (stun/encode-header {:typ stun/allocate-error :length 0 :txid txid})
+                        (stun/push-attr stun/attr-error-code (stun/encode-error-code 437 "Allocation Mismatch"))
+                        stun/set-attr-length
+                        stun/append-fingerprint)
+          {:keys [attrs]} (tr/parse-stun-message err-resp)]
+      (is (nil? (tr/response-lifetime attrs))))))
+
+(deftest build-send-indication-test
+  (let [peer-ip [127 0 0 1] peer-port 9999
+        payload (b/utf8-encode "#:dtn{:dtn/version 7}")
+        ind (tr/build-send-indication peer-ip peer-port payload txid)
+        {:keys [header attrs]} (tr/parse-stun-message ind)]
+    (testing "header type + txid"
+      (is (= stun/send-indication (:typ header)))
+      (is (= txid (:txid header))))
+    (testing "XOR-PEER-ADDRESS round-trips"
+      (let [decoded (stun/decode-xor-mapped-v4 (tr/find-attr attrs stun/attr-xor-peer-address))]
+        (is (= peer-ip (:ip decoded)))
+        (is (= peer-port (:port decoded)))))
+    (testing "DATA carries the exact payload bytes given"
+      (is (= payload (vec (tr/find-attr attrs stun/attr-data)))))
+    (testing "no MESSAGE-INTEGRITY (indications are never signed)"
+      (is (nil? (tr/find-attr attrs stun/attr-message-integrity))))
+    (testing "FINGERPRINT still verifies"
+      (is (true? (stun/verify-fingerprint ind))))))
+
+(deftest parse-stun-message-test
+  (testing "a real, well-formed message parses"
+    (let [{:keys [username credential]} (cred/mint-credential shared-secret "carol" 600 1700000000)
+          req (tr/build-allocate-request username credential txid)]
+      (is (some? (tr/parse-stun-message req)))))
+  (testing "too-short input returns nil, not a throw"
+    (is (nil? (tr/parse-stun-message [1 2 3]))))
+  (testing "20+ bytes but a bad magic cookie returns nil, not a throw"
+    (is (nil? (tr/parse-stun-message (vec (repeat 24 0)))))))
+
+;; ---------------------------------------------------------------------------
+;; allocate-response-relayed-address / data-indication-payload /
+;; data-indication-peer — built the same way kotoba.turn.listener itself
+;; constructs these response/indication shapes server-side (mirrors
+;; handle-allocate!'s success response and handle-relay-inbound!'s Data
+;; indication in org-ietf-turn's own listener.cljs), so this namespace's
+;; client-side PARSING is checked against a realistic server-side ENCODING,
+;; not just its own encoder round-tripping with itself.
+;; ---------------------------------------------------------------------------
+
+(deftest allocate-response-relayed-address-test
+  (let [relayed-ip [203 0 113 5] relayed-port 55555
+        resp (-> (stun/encode-header {:typ stun/allocate-response :length 0 :txid txid})
+                  (stun/push-attr stun/attr-xor-relayed-address
+                                   (stun/encode-xor-mapped-v4 relayed-ip relayed-port))
+                  stun/set-attr-length
+                  stun/append-fingerprint)
+        {:keys [attrs]} (tr/parse-stun-message resp)]
+    (testing "decodes the relayed address"
+      (is (= {:ip relayed-ip :port relayed-port} (tr/allocate-response-relayed-address attrs))))
+    (testing "nil when the attribute is absent (e.g. an error response)"
+      (let [err-resp (-> (stun/encode-header {:typ stun/allocate-error :length 0 :txid txid})
+                          (stun/push-attr stun/attr-error-code (stun/encode-error-code 401 "Unauthorized"))
+                          stun/set-attr-length
+                          stun/append-fingerprint)
+            {:keys [attrs]} (tr/parse-stun-message err-resp)]
+        (is (nil? (tr/allocate-response-relayed-address attrs)))))))
+
+(deftest data-indication-parsing-test
+  (let [peer-ip [198 51 100 7] peer-port 33333
+        payload (b/utf8-encode "hello-from-peer")
+        ind (-> (stun/encode-header {:typ stun/data-indication :length 0 :txid txid})
+                (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 peer-ip peer-port))
+                (stun/push-attr stun/attr-data payload)
+                stun/set-attr-length
+                stun/append-fingerprint)
+        {:keys [attrs]} (tr/parse-stun-message ind)]
+    (testing "data-indication-payload recovers the exact bytes"
+      (is (= payload (vec (tr/data-indication-payload attrs)))))
+    (testing "data-indication-peer recovers the exact peer address"
+      (is (= {:ip peer-ip :port peer-port} (tr/data-indication-peer attrs))))))
+
+;; ---------------------------------------------------------------------------
+;; classify-inbound-datagram — the "is this a relayed Data indication or a
+;; raw bundle datagram" decision.
+;; ---------------------------------------------------------------------------
+
+(deftest classify-inbound-datagram-test
+  (testing "a real Data indication classifies as :data-indication"
+    (let [ind (-> (stun/encode-header {:typ stun/data-indication :length 0 :txid txid})
+                  (stun/push-attr stun/attr-xor-peer-address (stun/encode-xor-mapped-v4 [1 2 3 4] 1))
+                  (stun/push-attr stun/attr-data (b/utf8-encode "x"))
+                  stun/set-attr-length
+                  stun/append-fingerprint)]
+      (is (= :data-indication (tr/classify-inbound-datagram ind)))))
+
+  (testing "a real STUN message of a DIFFERENT type classifies as :other-stun"
+    (let [{:keys [username credential]} (cred/mint-credential shared-secret "dan" 600 1700000000)
+          req (tr/build-allocate-request username credential txid)]
+      (is (= :other-stun (tr/classify-inbound-datagram req)))))
+
+  (testing "a real pr-str'd EDN bundle (namespaced-map #: shorthand) classifies as :raw-bundle,
+            not :other-stun -- this is the leading-bits collision case (both '#' and STUN's
+            00-leading-bits share the same top-2-bits pattern) the classifier must resolve
+            correctly via the magic-cookie check, not just the leading-bits heuristic"
+    (let [bundle-str "#:dtn{:dtn/version 7, :dtn/source \"dtn:+819012345678\", :dtn/destination \"dtn:+12125550199\"}"
+          raw (b/utf8-encode bundle-str)]
+      (is (= \# (first bundle-str)) "sanity: this bundle string really does start with '#'")
+      (is (= :raw-bundle (tr/classify-inbound-datagram raw)))))
+
+  (testing "a real ChannelData-shaped datagram (never sent by this repo's client, but a
+            real inbound possibility) classifies as :raw-bundle, not crashing"
+    (let [framed [0x40 0x01 0 3 65 66 67]] ;; channel 0x4001, length 3, payload "ABC"
+      (is (= :raw-bundle (tr/classify-inbound-datagram framed)))))
+
+  (testing "garbage too short to be anything recognizable classifies as :raw-bundle"
+    (is (= :raw-bundle (tr/classify-inbound-datagram [1 2]))))
+
+  (testing "never throws on empty input"
+    (is (= :raw-bundle (tr/classify-inbound-datagram [])))))

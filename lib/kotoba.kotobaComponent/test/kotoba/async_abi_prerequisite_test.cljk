@@ -1,0 +1,265 @@
+(ns kotoba.async-abi-prerequisite-test
+  "What the pinned toolchain actually does with WIT `async func`.
+
+   These are not tests of this repository. They pin the three component-model
+   facts the bounded-async plan rests on, measured against the pinned
+   `wasm-tools` and `.tools/wasmtime`, so that:
+
+   - a later contributor does not spend a day rediscovering why the
+     write-the-WAT-by-hand approach cannot work, and
+   - a toolchain bump that changes any of these rules fails here, loudly,
+     instead of silently changing what the plan is worth.
+
+   The facts, in the order they were measured:
+
+   1. An `async func` import CAN be lowered synchronously -- a plain core
+      import, no task/waitable/callback machinery -- but only if the calling
+      export is itself `async func`. A synchronous task that blocks traps.
+   2. `future<T>` and `stream<T>` are handles in a per-instance table. A
+      guest cannot fabricate one; a fabricated index traps.
+   3. Fact 2 fails at RUN time, not at build time. The artifact builds and
+      validates. That is the dangerous shape: an artifact that looks
+      finished.
+
+   What fact 2 does NOT say: that a core module can never create one.
+   `wit-component` accepts `[future-new-N]<func>` and the rest of the
+   `[future-*]`/`[stream-*]` family as core imports
+   (`crates/wit-component/src/validation.rs`, v1.243.0, lines 918-940 for the
+   signatures and 2236-2323 for the names). A guest that imports those can
+   create futures. What is measured here is only that a guest which does NOT
+   import them cannot invent a handle -- which is the mistake worth catching,
+   because it is the one that still builds."
+  (:require [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.wasm.tools :as wasm-tools])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(def ^:private wasmtime-binary
+  (let [pinned (io/file ".tools" "wasmtime" "wasmtime")]
+    (if (io/can-execute? pinned) (io/path pinned) "wasmtime")))
+
+(defn- wasmtime-available? []
+  (let [{:keys [exit out]} (shell/sh wasmtime-binary "--version")]
+    (and (zero? exit)
+         (some-> (re-find #"wasmtime (\d+)\." out) second parse-long (>= 43)))))
+
+(defn- build-component!
+  "Write `wit` and `wat` into `dir` and produce a component."
+  [dir name wit wat world]
+  (let [world-file (.resolve dir (str name ".wit"))
+        core (.resolve dir (str name ".core.wasm"))
+        embedded (.resolve dir (str name ".embedded.wasm"))
+        component (.resolve dir (str name ".component.wasm"))]
+    (Files/writeString world-file wit (make-array java.nio.file.OpenOption 0))
+    (Files/write core (wasm-tools/parse-wat wat) (make-array java.nio.file.OpenOption 0))
+    (wasm-tools/run-command! ["wasm-tools" "component" "embed" (str world-file) (str core)
+                              "--world" world "--encoding" "utf8" "-o" (str embedded)])
+    (wasm-tools/run-command! ["wasm-tools" "component" "new" (str embedded)
+                              "--reject-legacy-names" "-o" (str component)])
+    component))
+
+(defn- with-temp-dir [f]
+  (let [dir (Files/createTempDirectory "kotoba-async-abi-" (make-array FileAttribute 0))]
+    (try (f dir)
+         (finally
+           (->> (iterator-seq (.iterator (Files/walk dir (make-array java.nio.file.FileVisitOption 0))))
+                (sort-by #(- (count (str %))))
+                (run! #(Files/deleteIfExists ^java.nio.file.Path %)))))))
+
+;; ---------------------------------------------------------------------------
+;; Fixtures. `tick` is the smallest possible async func: scalar in, scalar out.
+
+(defn- caller-wit [export-async?]
+  (str "package kotoba:asyncprobe@1.0.0;\n\n"
+       "interface slow {\n  tick: async func(n: u64) -> u64;\n}\n\n"
+       "world caller {\n  import slow;\n"
+       "  export run: " (when export-async? "async ") "func() -> u64;\n}\n"))
+
+(def ^:private caller-wat
+  ;; A PLAIN core import for an async func -- this is the whole point.
+  (str "(module\n"
+       "  (import \"cm32p2|kotoba:asyncprobe/slow@1\" \"tick\""
+       " (func $tick (param i64) (result i64)))\n"
+       "  (memory (export \"cm32p2_memory\") 1 1)\n"
+       "  (func (export \"cm32p2||run\") (result i64) (i64.const 1) (call $tick))\n"
+       ")\n"))
+
+(def ^:private provider-wit
+  (str "package kotoba:asyncprobe@1.0.0;\n\n"
+       "interface slow {\n  tick: async func(n: u64) -> u64;\n}\n\n"
+       "world slow-provider {\n  export slow;\n}\n"))
+
+(def ^:private provider-wat
+  ;; A PLAIN core function lifted as an async export.
+  (str "(module\n"
+       "  (memory (export \"cm32p2_memory\") 1 1)\n"
+       "  (func (export \"cm32p2|kotoba:asyncprobe/slow@1|tick\")"
+       " (param $n i64) (result i64)\n"
+       "    local.get $n i64.const 41 i64.add)\n"
+       ")\n"))
+
+(defn- compose! [dir caller provider]
+  (let [out (.resolve dir "closed.wasm")]
+    (wasm-tools/run-command! ["wac" "plug" (str caller) "--plug" (str provider)
+                              "-o" (str out)])
+    out))
+
+(defn- run-closed [path]
+  (shell/sh wasmtime-binary "run" "--invoke" "run()" (str path)))
+
+;; ---------------------------------------------------------------------------
+
+(deftest async-import-lowers-synchronously-when-the-caller-is-async
+  (when (wasmtime-available?)
+    (with-temp-dir
+      (fn [dir]
+        (let [caller (build-component! dir "caller" (caller-wit true) caller-wat "caller")
+              provider (build-component! dir "provider" provider-wit provider-wat
+                                         "slow-provider")
+              closed (compose! dir caller provider)
+              {:keys [exit out]} (run-closed closed)]
+          ;; No task, no waitable set, no callback: a plain core import and a
+          ;; plain core function, across an `async func` boundary.
+          (is (zero? exit))
+          (is (= 42 (parse-long (str/trim out)))))))))
+
+(deftest a-synchronous-caller-cannot-block-on-an-async-import
+  (when (wasmtime-available?)
+    (with-temp-dir
+      (fn [dir]
+        (let [caller (build-component! dir "caller" (caller-wit false) caller-wat "caller")
+              provider (build-component! dir "provider" provider-wit provider-wat
+                                         "slow-provider")
+              closed (compose! dir caller provider)
+              {:keys [exit err]} (run-closed closed)]
+          ;; Same bytes on the provider side; the only change is that `run` is
+          ;; no longer async. This is the constraint that decides the shape of
+          ;; every capability interface that wants to reach an async import:
+          ;; the Kotoba-side export has to be async too.
+          (is (not (zero? exit)))
+          (is (str/includes? err "cannot block a synchronous task")
+              (str "unexpected failure: " err)))))))
+
+(deftest the-async-composition-needs-the-async-validation-feature
+  (when (wasmtime-available?)
+    (with-temp-dir
+      (fn [dir]
+        (let [caller (build-component! dir "caller" (caller-wit true) caller-wat "caller")
+              provider (build-component! dir "provider" provider-wit provider-wat
+                                         "slow-provider")
+              closed (compose! dir caller provider)
+              default (shell/sh "wasm-tools" "validate" (str closed))
+              enabled (shell/sh "wasm-tools" "validate" "--features" "all" (str closed))]
+          ;; `wasm-tools validate` with default features REJECTS this artifact.
+          ;; Anything that validates composed output has to opt in, or it will
+          ;; report a working async component as invalid.
+          (is (not (zero? (:exit default))))
+          (is (str/includes? (:err default) "async"))
+          (is (zero? (:exit enabled))))))))
+
+(deftest a-guest-cannot-fabricate-a-future-handle
+  (when (wasmtime-available?)
+    (with-temp-dir
+      (fn [dir]
+        (let [wit (str "package kotoba:asyncprobe@1.0.0;\n\n"
+                       "world maker {\n  export make: async func() -> future<u64>;\n}\n")
+              wat (str "(module\n"
+                       "  (memory (export \"cm32p2_memory\") 1 1)\n"
+                       "  (func (export \"cm32p2||make\") (result i32) i32.const 0)\n"
+                       ")\n")
+              component (build-component! dir "maker" wit wat "maker")
+              validate (shell/sh "wasm-tools" "validate" "--features" "all" (str component))
+              {:keys [exit err]} (shell/sh wasmtime-binary "run" "--invoke" "make()"
+                                           (str component))]
+          ;; It BUILDS and it VALIDATES. That is the trap: an artifact that
+          ;; looks finished.
+          (is (zero? (:exit validate)))
+          ;; And it cannot run, because `future<T>` is an index into a
+          ;; per-instance handle table that only the canonical built-ins can
+          ;; populate. This module imports none of them, so it has no handle
+          ;; to return -- see the namespace docstring for the intrinsics a
+          ;; module that wanted one would have to import.
+          (is (not (zero? exit)))
+          (is (str/includes? err "unknown handle index")
+              (str "unexpected failure: " err)))))))
+
+;; ---------------------------------------------------------------------------
+;; The blocker: standard32 has no intrinsic surface
+
+(def ^:private intrinsic-wit
+  (str "package kotoba:probe9;\n\n"
+       "interface bar {\n  foo: func(x: future<u32>) -> u32;\n}\n\n"
+       "world module {\n  import bar;\n}\n"))
+
+(defn- intrinsic-module-wat
+  "A core module importing `foo`, optionally also its `future.new` intrinsic.
+
+   `mangling` is the module-name style: standard32 prefixes `cm32p2|`, legacy
+   does not. The intrinsic is the ONLY variable between the two builds a test
+   compares -- everything else is held identical so a rejection cannot be
+   blamed on the surrounding module."
+  [mangling intrinsic?]
+  (let [prefix (if (= :standard32 mangling) "cm32p2|" "")
+        mem (if (= :standard32 mangling) "cm32p2_memory" "memory")
+        realloc (if (= :standard32 mangling) "cm32p2_realloc" "cabi_realloc")]
+    (str "(module\n"
+         "  (func (import \"" prefix "kotoba:probe9/bar\" \"foo\")"
+         " (param i32) (result i32))\n"
+         (when intrinsic?
+           (str "  (func (import \"" prefix "kotoba:probe9/bar\""
+                " \"[future-new-0]foo\") (result i64))\n"))
+         "  (memory (export \"" mem "\") 1)\n"
+         "  (func (export \"" realloc "\")"
+         " (param i32 i32 i32 i32) (result i32) i32.const 0)\n"
+         ")\n")))
+
+(defn- try-build
+  "Returns `[ok? stderr]` for embed+new of one module under one name style."
+  [dir label wat reject-legacy?]
+  (let [world-file (.resolve dir (str label ".wit"))
+        core (.resolve dir (str label ".core.wasm"))
+        embedded (.resolve dir (str label ".embedded.wasm"))
+        component (.resolve dir (str label ".component.wasm"))]
+    (Files/writeString world-file intrinsic-wit (make-array java.nio.file.OpenOption 0))
+    (Files/write core (wasm-tools/parse-wat wat) (make-array java.nio.file.OpenOption 0))
+    (let [embed (shell/sh "wasm-tools" "component" "embed" (str world-file) (str core)
+                          "--world" "module" "--encoding" "utf8" "-o" (str embedded))]
+      (if-not (zero? (:exit embed))
+        [false (:err embed)]
+        (let [new- (apply shell/sh
+                          (cond-> ["wasm-tools" "component" "new" (str embedded)]
+                            reject-legacy? (conj "--reject-legacy-names")
+                            :always (conj "-o" (str component))))]
+          [(zero? (:exit new-)) (:err new-)])))))
+
+(deftest standard32-has-no-future-stream-intrinsic-surface
+  "The reason bounded async is blocked, reduced to one variable.
+
+   `wit-component` implements the `[future-*]`/`[stream-*]` intrinsics for
+   the LEGACY name mangling only: `impl NameMangling for Standard` returns
+   `None` for every one of them (validation.rs, v1.243.0). So this is not a
+   spelling that has to be guessed -- under `--reject-legacy-names`, which
+   every component this repo builds uses, there is no way for a guest to
+   create a future or a stream.
+
+   When this test starts failing, upstream has added the surface and the
+   blocker has lifted. That is the point of pinning it."
+  (with-temp-dir
+    (fn [dir]
+      ;; Identical module, minus the intrinsic: standard32 is fine with it.
+      (let [[ok? err] (try-build dir "std-plain"
+                                 (intrinsic-module-wat :standard32 false) true)]
+        (is ok? (str "standard32 rejected a module with no intrinsic: " err)))
+      ;; Add only the intrinsic: standard32 now rejects, and says which one.
+      (let [[ok? err] (try-build dir "std-intrinsic"
+                                 (intrinsic-module-wat :standard32 true) true)]
+        (is (not ok?) "standard32 accepted a future intrinsic -- upstream may have added the surface")
+        (is (str/includes? err "[future-new-0]foo") (str "unexpected rejection: " err)))
+      ;; The same intrinsic, under legacy names, builds. So the artifact is
+      ;; well-formed; it is the mangling that lacks the surface.
+      (let [[ok? err] (try-build dir "legacy-intrinsic"
+                                 (intrinsic-module-wat :legacy true) false)]
+        (is ok? (str "legacy rejected the intrinsic too: " err))))))

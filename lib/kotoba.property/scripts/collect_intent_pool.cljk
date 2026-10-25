@@ -1,0 +1,204 @@
+(ns collect-intent-pool
+  "gBizINFO の**一括ファイル 3 本**から、intent を点数にしたリードプールを作る。
+
+   届出認定（誰がどの計画認定を、いつ取ったか）を母集団にし、調達（受注歴）と
+   財務（決算月）を**加点だけ**に使う。点数の意味と重みは
+   `kotoba.property.intent-score` の docstring が正本 —— ここは I/O だけ。
+
+   ## 被覆率が桁で違うので、2 列に分けて出す
+
+   実測 2026-08-25（節税プール 16,947 社）: 認定 100% / 調達 3.9% / 決算月 2.2%。
+   足して 1 列にすると、**測れなかった 97.8% が『シグナルの無い会社』として沈む。**
+   `base`（全社比較可能）と `boost`（加点のみ）を分けたまま出し、どちらが測れたかも
+   列に残す。
+
+   ## 認定は intent の代理であって、税制の適用可否ではない
+
+   ⚠ 税務助言をしない。記録するのは『いつ・どの認定が公表されたか』だけ。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_intent_pool.cljk --out pool.tsv \\
+       [--since 2025-01-01] [--limit 2000] [--as-of 2026-08-25] [--cache /tmp/gbiz-bulk]
+       [--refresh]   キャッシュを無視して落とし直す
+
+   Requires GBIZINFO_TOKEN（env か Keychain `gbizinfo-api-token`）。無ければ exit 3。"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.bulk-csv :as csv]
+            [kotoba.property.intent-score :as sc]
+            [kotoba.property.gbizinfo :as gb]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- flag? [n] (boolean (some #{n} argv)))
+(defn- int-arg [n d] (let [v (arg n nil)] (if v (js/parseInt v 10) d)))
+
+(defn- die! [code msg]
+  ;; ⚠ `exitCode` を立ててから throw しない。**この throw は `-main` の同期部分から
+  ;; 外へ抜けるので nbb の既定 exit 1 になり、契約した 2/3 が一度も出なかった**
+  ;; （実測 2026-08-26）。`.exit` で即座に落とす。ここまでで stdout には何も
+  ;; 書いていないので、切り捨てられる出力は無い。
+  (js/console.error msg)
+  (.exit js/process code))
+
+(defn- sh [args]
+  (let [r (.spawnSync cp (first args) (clj->js (vec (rest args))) #js {:encoding "utf8"})]
+    {:exit (or (.-status r) 1) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+(defn- token []
+  (or (not-empty (.. js/process -env -GBIZINFO_TOKEN))
+      (let [r (sh ["security" "find-generic-password" "-s" "gbizinfo-api-token" "-w"])]
+        (when (zero? (:exit r)) (not-empty (str/trim (:out r)))))))
+
+(def download-page "https://info.gbiz.go.jp/hojin/DownloadTop")
+(def download-endpoint "https://info.gbiz.go.jp/hojin/Download")
+
+(defn- fetch-section!
+  "1 section を落として展開し、CSV のパスを返す。既に在れば落とし直さない。"
+  [tok cache downfile refresh?]
+  (.mkdirSync fs cache #js {:recursive true})
+  (let [dir (.join path cache (str downfile ".d"))
+        existing (when (and (not refresh?) (.existsSync fs dir))
+                   (first (filter #(str/ends-with? % ".csv") (js->clj (.readdirSync fs dir)))))]
+    (if existing
+      (do (js/console.error (str "  cached: " downfile)) (.join path dir existing))
+      (let [zip (.join path cache (str downfile ".zip"))
+            cookie (.join path cache "session.txt")
+            page (.join path cache "page.html")
+            hdr (.join path cache (str downfile ".hdr"))]
+        ;; セッションはダウンロードごとに取り直す。使い回すと 2 本目以降が静かに
+        ;; HTML を返す（既存 zenken 収集器が実測した罠）。
+        (sh ["curl" "-s" "-c" cookie "-o" page "-A" "Mozilla/5.0" download-page])
+        (let [sid (second (re-find #"jsessionid=([A-F0-9]+)" (str (.readFileSync fs page "utf8"))))]
+          (sh ["curl" "-s" "-b" cookie "-o" zip "-D" hdr "-A" "Mozilla/5.0" "-X" "POST"
+               (str download-endpoint ";jsessionid=" sid)
+               "--data-urlencode" (str "downfile=" downfile)
+               "--data-urlencode" "meta=" "--data-urlencode" "downenc=UTF-8"
+               "--data-urlencode" (str "apiToken=" tok)
+               "--data-urlencode" "downtype=zip" "--data-urlencode" "isZip=on"])
+          ;; **status を見ない。** token 無しの POST は 200 と HTML を返すので、
+          ;; 添付ファイル名と ZIP magic だけが、落ちてきたものが何かを言う。
+          (let [headers (if (.existsSync fs hdr) (str (.readFileSync fs hdr "utf8")) "")
+                fname (second (re-find #"filename=\"([^\"]+)\"" headers))]
+            (when-not fname
+              (die! 3 (str "no attachment for " downfile " — the server answered a page, "
+                           "which is what it does when the token is missing or rejected.")))
+            (let [head (.readFileSync fs zip)]
+              (when-not (and (> (.-length head) 1) (= 0x50 (aget head 0)) (= 0x4b (aget head 1)))
+                (die! 1 (str "not a zip: " fname))))
+            (sh ["unzip" "-o" "-q" zip "-d" dir])
+            (let [csvs (filter #(str/ends-with? % ".csv") (js->clj (.readdirSync fs dir)))]
+              (when (empty? csvs) (die! 1 (str "zip had no csv: " fname)))
+              (js/console.error (str "  downloaded: " fname))
+              (.join path dir (first csvs)))))))))
+
+(defn- read-section!
+  "CSV -> `{:rows [...] :get (fn [row col])}`。要求した列が無ければ止まる。"
+  [csv-path required]
+  (let [rows (csv/parse (str (.readFileSync fs csv-path "utf8")))
+        header (first rows)
+        g (csv/getter header)]
+    (doseq [c required]
+      (when-not (some #{c} header)
+        (die! 1 (str "column missing from " csv-path ": " c
+                     " (have: " (str/join ", " (take 12 header)) ")"))))
+    {:rows (rest rows) :get g}))
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        cache (arg "--cache" "/tmp/gbiz-bulk")
+        since (arg "--since" "2025-01-01")
+        as-of (arg "--as-of" (subs (.toISOString (js/Date.)) 0 10))
+        limit (int-arg "--limit" 2000)
+        refresh? (flag? "--refresh")
+        tok (token)]
+    (when-not out (die! 3 "--out is required"))
+    (when-not tok (die! 3 "GBIZINFO_TOKEN not in env and not in Keychain (gbizinfo-api-token)"))
+
+    (js/console.error "sections:")
+    (let [nintei (read-section! (fetch-section! tok cache "TodokedeNinteijoho" refresh?)
+                                ["法人番号" "商号または名称" "登記住所" "証明日" "名称" "部門"])
+          chotatsu (read-section! (fetch-section! tok cache "Chotatsujoho" refresh?)
+                                  ["法人番号" "受注日"])
+          zaimu (read-section! (fetch-section! tok cache "Zaimujoho" refresh?)
+                               ["法人番号" "事業年度"])
+          gn (:get nintei) gc (:get chotatsu) gz (:get zaimu)
+
+          ;; 調達: 法人番号 -> 受注歴あり。**この集合に居ないことは「受注が無い」
+          ;; ではなく「このファイルに載っていない」**なので、居ない社は nil にする。
+          procured (into #{} (map #(gc % "法人番号")) (:rows chotatsu))
+
+          ;; 財務: 法人番号 -> 決算月。載っていない社は nil（0 ではない）。
+          fiscal (reduce (fn [m row]
+                           (if-let [mo (gb/fiscal-year-end-month (gz row "事業年度"))]
+                             (assoc m (gz row "法人番号") mo)
+                             m))
+                         {} (:rows zaimu))
+
+          scored-kinds (set (keys sc/certification-weights))
+          matching (->> (:rows nintei)
+                        (filter #(contains? scored-kinds (gn % "名称")))
+                        (filter #(>= 0 (compare since (gn % "証明日")))))
+          by-company (group-by #(gn % "法人番号") matching)
+
+          scored (->> by-company
+                      (map (fn [[num rs]]
+                             (let [certs (mapv (fn [r] {:kind (gn r "名称") :date (gn r "証明日")}) rs)
+                                   latest (last (sort-by #(gn % "証明日") rs))
+                                   s (sc/score {:certs certs
+                                                :procurement? (when (seq procured) (contains? procured num))
+                                                :fiscal-end-month (get fiscal num)}
+                                               as-of)]
+                               (merge s
+                                      {:num num
+                                       :name (gn latest "商号または名称")
+                                       :address (gn latest "登記住所")
+                                       :bumon (gn latest "部門")
+                                       :latest (gn latest "証明日")
+                                       :kinds (vec (distinct (map :kind certs)))}))))
+                      sc/rank
+                      (take limit)
+                      vec)]
+      (when (zero? (count scored))
+        (die! 2 (str "Refusing to report a pass: 0 companies matched "
+                     (pr-str scored-kinds) " since " since)))
+      (let [n-proc (count (filter #(some #{"procurement"} (:intent/measured %)) scored))
+            n-fisc (count (filter #(some #{"fiscal-year-end"} (:intent/measured %)) scored))]
+        (fs/writeFileSync
+         out
+         (str "# gBizINFO 一括 3 本から作った intent プール。生成物。手で編集しない。\n"
+              "# as-of=" as-of "  since=" since "  scored-kinds=" (str/join "," (sort scored-kinds)) "\n"
+              "# 列: 法人番号 <TAB> シグナル <TAB> 商号 <TAB> 登記住所 <TAB> 部門"
+              " <TAB> base <TAB> boost <TAB> measured <TAB> unmeasured\n"
+              "# ⚠ base と boost を足さないこと。boost は被覆率の低いシグナル"
+              "（調達 / 決算月）由来で、足すと『測れた少数』が『測れなかった多数』の上に\n"
+              "#   シグナルの強さではなく被覆の差で乗る。並べるのは base。\n"
+              "# ⚠ シグナルは『いつ・どの認定が公表されたか』の記録であって、その企業が\n"
+              "#   いま特定の税制を使えるという主張ではない。税務助言をしない。\n"
+              "# 出典：gBizINFO（経済産業省）https://info.gbiz.go.jp/ を加工して作成\n"
+              (str/join
+               "\n"
+               (map (fn [r]
+                      (str/join "\t"
+                                [(:num r)
+                                 (str (str/join "|" (:kinds r))
+                                      " (" (:latest r) ", 種類" (count (:kinds r)) ")"
+                                      " intent=" (:intent/base r)
+                                      (when (pos? (:intent/boost r)) (str "+" (:intent/boost r))))
+                                 (:name r) (:address r) (:bumon r)
+                                 (:intent/base r) (:intent/boost r)
+                                 (str/join "," (:intent/measured r))
+                                 (str/join "," (:intent/unmeasured r))]))
+                    scored))
+              "\n"))
+        (println (str "MATCHED-ROWS\t" (count matching)))
+        (println (str "COMPANIES\t" (count by-company)))
+        (println (str "WRITTEN\t" (count scored)))
+        (println (str "BASE-RANGE\t" (:intent/base (first scored)) " .. " (:intent/base (last scored))))
+        (println (str "MEASURED-PROCUREMENT\t" n-proc "/" (count scored)))
+        (println (str "MEASURED-FISCAL-YEAR\t" n-fisc "/" (count scored)))
+        (println (str "OUT\t" out))))))
+
+(-main)

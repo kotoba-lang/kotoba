@@ -1,0 +1,2374 @@
+(ns conformance.run
+  "Differential conformance: cssom vs a real Blink browser, on three axes.
+
+   For every case in cases.edn this renders the SAME markup twice -- once
+   through the real pipeline this repo is part of (htmldom parse ->
+   cssom.core cascade -> cssom.layout draw-ops) and once in a real headless
+   Brave/Chrome -- and compares:
+
+   1. LINE STRUCTURE -- the ordered list of lines, each line being the
+      whitespace-normalized text that landed on it, left to right.
+   2. GEOMETRY -- every element's own box, matched by tag + nearest and
+      compared within 2px on x/y/w/h.
+   3. COMPUTED STYLE -- what cssom.core's CASCADE resolved for each
+      element, against the browser's own getComputedStyle, over a chosen
+      set of properties. See that axis's own header comment further down
+      for what is comparable at that layer and what is explicitly not.
+
+   Why line structure and not pixels: this engine has no glyph shaping
+   (see cssom.layout's ns docstring -- widths come from a
+   `(long (* 0.6 font-size))` per-character approximation unless a host
+   supplies :measure-text), so its absolute coordinates CANNOT match a
+   real font's and comparing them would measure the approximation, not
+   the layout. What text shares a line, in what order, and how many lines
+   there are is the part both engines genuinely agree on when the layout
+   is right -- and it is exactly the part this engine got wrong for
+   everything inline until 2026-08-03.
+
+   The browser side is read with `--headless --dump-dom`: an inline script
+   measures every text node with Range.getClientRects(), base64s the
+   result into a <pre>, and dump-dom hands us back the DOM containing it.
+   No CDP client, no Playwright, no extra dependency -- the same reason
+   this repo's own smoke checks avoid a driver.
+
+   Usage:
+     kbb --backend sci --classpath \"src:<dom-gpu>/src:<htmldom>/src\" conformance/run.cljk \\
+       [--browser <path to Brave/Chrome binary>] [--width 800] \\
+       [--only <id substring>] [--debug-geometry] [--debug-style] \\
+       [--debug-paint] [--ledger <path to append a result entry to>]"
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [cssom.core :as css]
+            [cssom.layout :as layout]
+            [htmldom.core :as html]
+            [kotoba.wasm.dom :as dom]))
+
+(def browser-candidates
+  ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+   "/Applications/Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta"
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+   "/Applications/Chromium.app/Contents/MacOS/Chromium"])
+
+(defn- parse-args [argv]
+  (loop [args (vec argv) out {:width 800}]
+    (if-let [a (first args)]
+      (case a
+        "--browser" (recur (drop 2 args) (assoc out :browser (second args)))
+        "--width" (recur (drop 2 args) (assoc out :width (js/parseInt (second args) 10)))
+        "--ledger" (recur (drop 2 args) (assoc out :ledger (second args)))
+        "--only" (recur (drop 2 args) (assoc out :only (second args)))
+        "--debug-geometry" (recur (rest args) (assoc out :debug-geometry true))
+        "--debug-style" (recur (rest args) (assoc out :debug-style true))
+        "--debug-paint" (recur (rest args) (assoc out :debug-paint true))
+        "--dump-ops" (recur (drop 2 args) (assoc out :dump-ops (second args)))
+        "--dump-style" (recur (drop 2 args) (assoc out :dump-style (second args)))
+        (recur (rest args) out))
+      out)))
+
+(defn- find-browsers
+  "The ordered list of oracle candidates to try. Brave is first — it is the
+   named comparison target — but every candidate here is the SAME layout
+   engine (Blink): Brave is Chromium plus network/privacy shields, and
+   shields do not change layout. So when Brave's headless mode refuses to
+   produce a dump in this environment (measured: it writes zero bytes and
+   never exits, while Chrome writes its dump and then hangs, which the
+   SIGKILL timeout handles), falling through to Chrome/Chromium measures
+   the identical engine rather than a different one. The oracle that
+   actually produced the numbers is printed and recorded in the ledger, so
+   a fallback is never silent."
+  [explicit]
+  (if explicit
+    (if (fs/existsSync explicit)
+      [explicit]
+      (throw (ex-info "browser not found at --browser path" {:path explicit})))
+    (let [found (filterv fs/existsSync browser-candidates)]
+      (when (empty? found)
+        (throw (ex-info "no Blink browser found; pass --browser <path>"
+                        {:looked-at browser-candidates})))
+      found)))
+
+;; ---- the browser (oracle) side ----
+
+(def measure-script
+  "Runs INSIDE the real browser, once, over EVERY case container on the
+   page. Each text node is measured with a Range so that a wrapped node
+   reports one rect per line, which is how the harness detects wrapping
+   (and then declines to score that case on text equality). Output is
+   base64 so arbitrary case text can never break the <pre> we read it back
+   out of.
+
+   All cases share one page — and therefore one browser launch — because a
+   launch costs seconds and the corpus is meant to grow into the hundreds."
+  "
+  (function () {
+    var out = {};
+    // The property set the computed-style axis compares. Names on the left
+    // are CSS property names (what the engine's own :style/* attrs are
+    // keyed by); on the right, the camelCase getComputedStyle key.
+    var STYLE_PROPS = [
+      ['color', 'color'], ['font-size', 'fontSize'], ['font-weight', 'fontWeight'],
+      ['font-style', 'fontStyle'], ['display', 'display'], ['text-align', 'textAlign'],
+      ['margin-top', 'marginTop'], ['margin-right', 'marginRight'],
+      ['margin-bottom', 'marginBottom'], ['margin-left', 'marginLeft'],
+      ['padding-top', 'paddingTop'], ['padding-right', 'paddingRight'],
+      ['padding-bottom', 'paddingBottom'], ['padding-left', 'paddingLeft']
+    ];
+    function readStyle(el) {
+      var cs = getComputedStyle(el), o = {};
+      for (var p = 0; p < STYLE_PROPS.length; p++) o[STYLE_PROPS[p][0]] = cs[STYLE_PROPS[p][1]];
+      return o;
+    }
+    // The key an element is looked up by in the UA baseline below. Tag
+    // alone is not enough for <input>: this browser's UA sheet gives a
+    // checkbox `margin: 3px 3px 3px 4px` and a bare 13x13 box that a text
+    // input does not get, so probing every <input> as a text one would
+    // charge those differences to the cascade.
+    function probeKey(el) {
+      var tag = el.tagName.toLowerCase();
+      return tag === 'input' ? tag + ':' + ((el.getAttribute('type') || 'text').toLowerCase()) : tag;
+    }
+    var roots = document.querySelectorAll('.kotoba-case');
+    for (var i = 0; i < roots.length; i++) {
+      var root = roots[i];
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+      var words = [];
+      var node;
+      while ((node = walker.nextNode())) {
+        var text = node.nodeValue;
+        if (!text.trim()) continue;
+        // Text INSIDE an atomic inline (a button's label, a select's
+        // options) belongs to that control's own formatting context, not
+        // to the line box being compared. Skipped on both sides -- see
+        // engine-lines' matching containment filter -- so the comparison
+        // measures one inline formatting context rather than two.
+        // An ATOMIC inline's contents are its own formatting context --
+        // form controls and replaced elements by tag, and anything the
+        // author made `display: inline-block`, which is the same concept
+        // spelled in CSS. Excluded on both sides (see engine-lines' own
+        // filter) so the comparison measures ONE inline formatting context.
+        var inAtomic = false;
+        for (var a = node.parentElement; a && a !== root; a = a.parentElement) {
+          if (a.matches('img,input,button,select,textarea') ||
+              getComputedStyle(a).display === 'inline-block') { inAtomic = true; break; }
+        }
+        if (inAtomic) continue;
+        var re = /\\S+/g, m;
+        while ((m = re.exec(text))) {
+          var range = document.createRange();
+          range.setStart(node, m.index);
+          range.setEnd(node, m.index + m[0].length);
+          var r = range.getBoundingClientRect();
+          if (!r.width && !r.height) continue;
+          // A word that is BROKEN ACROSS LINES (overflow-wrap: break-word,
+          // word-break: break-all, or a word longer than its line) has one
+          // client rect per line fragment, and its bounding rect spans all
+          // of them. Reporting the bounding rect made every intra-word
+          // break invisible: the whole word clustered onto one line, and a
+          // correct engine that broke it exactly where the browser did was
+          // scored as WRONG for producing more lines than the oracle could
+          // see (`:text/overflow-wrap-anywhere`, `:text/word-break-break-all`).
+          //
+          // Measured in Brave: `short aaaaaaaaaaaaaaaaaaaa` in a 90px box
+          // reports three rects at 20px steps, so the browser breaks the
+          // a-run in two -- exactly as the engine does. The disagreement
+          // was entirely in the measurement.
+          //
+          // Which characters land on which line cannot be read off the
+          // rects, so for a multi-rect word (only) each character is
+          // measured on its own and grouped by top. That is the browser's
+          // own answer to what-is-on-this-line, at the only granularity
+          // that can answer it.
+          var rects = range.getClientRects();
+          if (rects.length <= 1) {
+            words.push({ text: m[0], top: r.top, bottom: r.bottom, left: r.left });
+          } else {
+            var frags = [];
+            for (var ci = 0; ci < m[0].length; ci++) {
+              var cr = document.createRange();
+              cr.setStart(node, m.index + ci);
+              cr.setEnd(node, m.index + ci + 1);
+              var q = cr.getBoundingClientRect();
+              if (!q.width && !q.height) continue;
+              var last = frags[frags.length - 1];
+              if (last && Math.abs(last.top - q.top) < 1) {
+                last.text += m[0][ci];
+                last.bottom = Math.max(last.bottom, q.bottom);
+              } else {
+                frags.push({ text: m[0][ci], top: q.top, bottom: q.bottom, left: q.left });
+              }
+            }
+            for (var fi = 0; fi < frags.length; fi++) words.push(frags[fi]);
+          }
+        }
+      }
+      // The GEOMETRY axis: every element's own box, relative to the case
+      // root. The line axis answers 'what ended up on which line'; this
+      // answers 'how big is each box and where does it sit' -- the
+      // question that hid colspan (a spanning cell is alone on its row
+      // either way) and a button label's vertical centering.
+      var boxes = [];
+      var els = root.querySelectorAll('*');
+      var rootRect = root.getBoundingClientRect();
+      for (var j = 0; j < els.length; j++) {
+        var el = els[j];
+        var r = el.getBoundingClientRect();
+        // Whether this element GENERATES A BOX at all, asked of the DOM
+        // rather than inferred from the numbers: getClientRects() is
+        // empty exactly when there is no box to report. Measured across
+        // nine shapes in Brave 151 (2026-08-05), it is empty for
+        // `display: none` and `display: contents` and for nothing else --
+        // an empty inline, an empty block, a `width: 0; height: 0` block,
+        // a `<br>` and a `visibility: hidden` inline all report one rect.
+        // getBoundingClientRect() still hands back 0,0,0,0 for the
+        // boxless ones, and that origin is the VIEWPORT's, so subtracting
+        // the case root below turns it into whatever negative offset the
+        // case happens to sit at down the page. See geometry-agreement
+        // for what is done with the flag.
+        boxes.push({ tag: el.tagName.toLowerCase(),
+                     boxless: el.getClientRects().length === 0,
+                     x: r.left - rootRect.left, y: r.top - rootRect.top,
+                     w: r.width, h: r.height });
+      }
+      // The COMPUTED-STYLE axis: what the CASCADE decided for each
+      // element, in the browser's own normal form. Read in the same
+      // document order as `boxes` above and matched on the other side by
+      // tag + occurrence -- deliberately NOT by the geometry axis's
+      // nearest-box pairing, so a layout failure can never be re-scored
+      // as a cascade failure.
+      var styles = [];
+      for (var k = 0; k < els.length; k++) {
+        var e2 = els[k], cs2 = getComputedStyle(e2);
+        // Three pieces of context travel with each element, used ONLY to
+        // attribute a mismatch, never to decide one:
+        //  - the PARENT's whole computed style, so a value the browser
+        //    plainly INHERITED can be charged to the ancestor it came
+        //    from rather than counted again at every descendant;
+        //  - float/position, because real CSS BLOCKIFIES a float and an
+        //    absolutely positioned box at computed-value time, exactly as
+        //    it does a flex/grid item.
+        styles.push({ tag: e2.tagName.toLowerCase(),
+                      key: probeKey(e2),
+                      parentDisplay: getComputedStyle(e2.parentElement).display,
+                      parent: readStyle(e2.parentElement),
+                      cssFloat: cs2.cssFloat, position: cs2.position,
+                      style: readStyle(e2) });
+      }
+      // The PAINT-ORDER axis: at a grid of sample points, which element
+      // does the browser say is on top? This is the only axis that
+      // observes STACKING rather than size -- z-index, later-sibling
+      // overlap, negative z-index behind its parent, pointer-events -- and
+      // nothing measured it before, so a paint-order regression was
+      // invisible to all three existing axes.
+      //
+      // elementFromPoint works in VIEWPORT coordinates and returns null
+      // outside the viewport, so each case is scrolled into view first and
+      // any point still off-screen is counted as skipped rather than
+      // silently scored.
+      var hits = [];
+      var skipped = 0;
+      window.scrollTo(0, Math.max(0, root.getBoundingClientRect().top + window.scrollY - 8));
+      var vr = root.getBoundingClientRect();
+      for (var gy = 0; gy < 5; gy++) {
+        for (var gx = 0; gx < 5; gx++) {
+          // interior points only: an edge point lands on whichever box
+          // rounds in its favour and measures the rounding, not the order.
+          var fx = (gx + 0.5) / 5, fy = (gy + 0.5) / 5;
+          var px = vr.left + vr.width * fx, py = vr.top + vr.height * fy;
+          if (py < 0 || py > window.innerHeight || px < 0 || px > window.innerWidth) { skipped++; continue; }
+          var hit = document.elementFromPoint(px, py);
+          if (!hit) { skipped++; continue; }
+          // Only the case's own subtree is comparable; a point that lands
+          // on the page chrome around it says nothing about the engine.
+          if (hit !== root && !root.contains(hit)) { skipped++; continue; }
+          // The tag alone cannot tell two overlapping boxes apart, and
+          // stacking is mostly a question about two <div>s. The author's
+          // own `class` is the one identity BOTH sides can read off the
+          // same markup -- the engine puts `:class (attr node :class)` on
+          // every `:node` op already -- so it travels with the tag and is
+          // compared beside it. `className` is an SVGAnimatedString on an
+          // <svg>, hence the typeof guard.
+          hits.push({ x: vr.width * fx, y: vr.height * fy,
+                      tag: hit === root ? null : hit.tagName.toLowerCase(),
+                      cls: (hit === root || typeof hit.className !== 'string' ||
+                            !hit.className) ? null : hit.className });
+        }
+      }
+      out[root.id] = { words: words, boxes: boxes, styles: styles,
+                       hits: hits, hitsSkipped: skipped };
+    }
+    // The UA baseline, MEASURED rather than assumed: what this browser's
+    // own user-agent stylesheet alone gives each tag the corpus uses, with
+    // no author CSS anywhere near it. Without it every `<b>` that is bold
+    // and every `<div>` that is `block` looks like a cascade error; with
+    // it, a mismatch whose oracle value EQUALS this probe is attributable
+    // to the UA sheet (which this engine keeps in cssom.layout, where the
+    // cascade's own output cannot see it) rather than to the cascade
+    // computing a wrong value.
+    //
+    // Some tags only get their real UA style inside a particular parent (a
+    // <td> outside a table is not a table-cell, an <li> outside a list is
+    // not a list-item), so each one is probed inside the minimal legal
+    // ancestor chain it needs.
+    var PROBE_PARENT = {
+      td: 'table>tbody>tr', th: 'table>tbody>tr', tr: 'table>tbody',
+      tbody: 'table', thead: 'table', tfoot: 'table', caption: 'table',
+      col: 'table>colgroup', colgroup: 'table',
+      li: 'ul', dt: 'dl', dd: 'dl', option: 'select', optgroup: 'select',
+      legend: 'fieldset', figcaption: 'figure', summary: 'details',
+      rt: 'ruby', rp: 'ruby', source: 'video', track: 'video'
+    };
+    var probeHost = document.createElement('div');
+    probeHost.className = 'kotoba-case';
+    probeHost.style.cssText = 'position:absolute;left:-9999px;top:0';
+    document.body.appendChild(probeHost);
+    var ua = {};
+    var seenKeys = {};
+    var allEls = document.querySelectorAll('.kotoba-case *');
+    for (var t = 0; t < allEls.length; t++) seenKeys[probeKey(allEls[t])] = true;
+    Object.keys(seenKeys).forEach(function (key) {
+      var parts = key.split(':'), tag = parts[0];
+      var holder = document.createElement('div');
+      probeHost.appendChild(holder);
+      var cur = holder;
+      (PROBE_PARENT[tag] || '').split('>').filter(Boolean).forEach(function (p) {
+        var e = document.createElement(p); cur.appendChild(e); cur = e;
+      });
+      var el = document.createElement(tag);
+      // Some UA rules key off an ATTRIBUTE, not just the tag: an <a> is
+      // only styled as a link (`rgb(0, 0, 238)`) when it HAS an href, and
+      // an <input>'s box depends entirely on its type. Without these the
+      // probe reports plain black for <a> and a text field's box for a
+      // checkbox, and every such divergence gets misattributed to the
+      // cascade.
+      if (tag === 'a') el.setAttribute('href', '#');
+      if (parts[1]) el.setAttribute('type', parts[1]);
+      cur.appendChild(el);
+      ua[key] = readStyle(el);
+      holder.remove();
+    });
+    probeHost.remove();
+    out['__ua__'] = ua;
+    // The oracle's OWN character width, measured rather than guessed: the
+    // page is monospace, so one Range over a known-length string gives the
+    // exact per-character advance this browser uses. Handing that back lets
+    // the engine side wrap against the same metrics (see engine-lines'
+    // :measure-text), which is what makes WRAPPING cases comparable at all
+    // -- otherwise every wrap point differs by the ratio between this
+    // engine's 0.6-em approximation and the real font, and the corpus can
+    // only ever contain text short enough never to wrap.
+    // A per-character advance TABLE, measured in the oracle, for normal
+    // and bold. Not a single average: measured here, this system's
+    // `monospace` face is fixed-pitch at 7.00px in regular but its BOLD
+    // variant is proportional -- a 40-char run of 'M' reports 11.05px per
+    // character while the real bold word `manual` reports 7.94. A single
+    // probe character is therefore a 40%-wrong proxy for bold text, which
+    // is what made every <b> box disagree (b 0/11) and looked like an
+    // engine bug until it was measured directly.
+    var probe = document.createElement('span');
+    probe.style.cssText = 'font-family:monospace;font-size:14px;white-space:pre';
+    document.body.appendChild(probe);
+    // normal / bold / italic each get their own table: measured here, this
+    // system's `monospace` is fixed-pitch at 7.00px in regular but BOTH its
+    // bold and its italic faces are proportional, so one table cannot
+    // stand in for the others (an <em> measured 7.0/char here against the
+    // browser's 10.28).
+    // ASCII, Latin-1, and the typographic codepoints real page furniture
+    // uses. Measuring only ASCII left `©`, `·`, `›`, `—` and friends on the
+    // fallback advance, which put the first link of a footer 1.4px off and
+    // the second 6.4px off -- small, but a mismatch the engine was blamed
+    // for and never made.
+    var CHARS = [];
+    for (var c1 = 32; c1 <= 126; c1++) CHARS.push(c1);
+    for (var c2 = 160; c2 <= 255; c2++) CHARS.push(c2);
+    // 0x2010 is HYPHEN, and it is here because the ENGINE now emits it:
+    // it is the glyph Chromium inserts at the end of a line it broke at a
+    // soft hyphen (see cssom.layout's `inserted-hyphen`). Measured here
+    // rather than assumed to be the same as `-`, because it is not -- this
+    // system's monospace face has no U+2010 and the fallback reports 14px
+    // at 14px where `-` reports 7.
+    [0x2010,
+     0x2013,0x2014,0x2018,0x2019,0x201C,0x201D,0x2022,0x2026,0x2030,0x2039,
+     0x203A,0x2044,0x2122,0x2190,0x2191,0x2192,0x2193,0x2194,0x2212,0x2260,
+     0x2264,0x2265,0x221E,0x2248,0x2217,0x25CA,0x2660,0x2663,0x2665,0x2666,
+     0x2020,0x2021,0x203E,0x2032,0x2033].forEach(function (c) { CHARS.push(c); });
+    var advances = { normal: {}, bold: {}, italic: {},
+                     control: {}, 'control-bold': {}, 'control-italic': {} };
+    [['normal', 'normal', 'normal'],
+     ['bold', 'bold', 'normal'],
+     ['italic', 'normal', 'italic']].forEach(function (spec) {
+      probe.style.fontWeight = spec[1];
+      probe.style.fontStyle = spec[2];
+      CHARS.forEach(function (code) {
+        var ch = String.fromCharCode(code);
+        probe.textContent = new Array(21).join(ch);
+        advances[spec[0]][code] = probe.getBoundingClientRect().width / 20;
+      });
+    });
+    // The CONTROL face. Form controls do not inherit the page font: this
+    // browser computes `Arial 13.3333px` for an <input> inside a monospace
+    // container, so a control's intrinsic width can only be computed
+    // against metrics measured in that font -- which the engine now asks
+    // for by naming the family in its own UA defaults.
+    //
+    // Three of them, for the same reason the page font has three: a
+    // control's label can be BOLD or ITALIC, and the control face is a
+    // different font from the page's, so neither the page's bold table nor
+    // the control's regular one stands in for it. Measured here, `now` is
+    // 24.45px in regular Arial 13.3333 and 26.65 in its bold -- a 9%
+    // difference, which is what made `<button>save <b>now</b></button>`
+    // come back 3.5px narrow than Brave's and its <b> 2.8px narrow.
+    // Until 2026-08-05 the face lookup below tested the FAMILY first and
+    // returned regular control metrics for a bold control query, so the
+    // engine asked the right question and was answered with the wrong
+    // face.
+    probe.style.cssText = 'white-space:pre;' + getComputedStyle(document.createElement('input')).font;
+    [['control', '400', 'normal'],
+     ['control-bold', '700', 'normal'],
+     ['control-italic', '400', 'italic']].forEach(function (spec) {
+      probe.style.font = spec[2] + ' ' + spec[1] + ' 13.3333px Arial';
+      CHARS.forEach(function (code) {
+        var ch = String.fromCharCode(code);
+        probe.textContent = new Array(21).join(ch);
+        advances[spec[0]][code] = probe.getBoundingClientRect().width / 20;
+      });
+    });
+    probe.remove();
+    out['__advances__'] = advances;
+    // The vertical half: a font's real ASCENT and DESCENT, which is what a
+    // line box is actually built from. Measured with canvas TextMetrics --
+    // 14px monospace is 12/3 here (a 15px content area, not the 16.8 a
+    // 1.2em approximation assumes), its bold face 14/4, and 24px 21/5.
+    //
+    // `xHeight` rides along because it is the same object: the INK top of a
+    // lowercase `x`, which is the metric `vertical-align: middle` centres a
+    // box on (`baseline - x-height/2`) and the one thing font-metrics used
+    // to have no answer for. Measured here, 14px monospace is 6.34375 --
+    // and independently, reading the same number back off a real
+    // `vertical-align: middle` box in this browser gives 6.34375 too, so
+    // the ink extent IS the metric Blink aligns against, not a proxy for
+    // it. (Checked at 14/20/26.6666/40px across four families; the two
+    // readings agree to within 0.0125px, which is LayoutUnit's own 1/64.)
+    var ctx = document.createElement('canvas').getContext('2d');
+    function fm(font) {
+      ctx.font = font;
+      var t = ctx.measureText('Hxg');
+      return { ascent: t.fontBoundingBoxAscent, descent: t.fontBoundingBoxDescent,
+               xHeight: ctx.measureText('x').actualBoundingBoxAscent };
+    }
+    out['__metrics__'] = {
+      normal: fm('14px monospace'), bold: fm('bold 14px monospace'),
+      italic: fm('italic 14px monospace'), control: fm('13.3333px Arial'),
+      'control-bold': fm('bold 13.3333px Arial'),
+      'control-italic': fm('italic 13.3333px Arial')
+    };
+    // The DECODED SIZE of every image resource on the page, keyed by src.
+    //
+    // Same bargain as the advance tables above, and the same reason: a
+    // resource's own dimensions are a fact about bytes, which a pure
+    // layout engine cannot see and which the engine's `:image-size` theme
+    // hook exists for a host to answer. Handing them over removes the one
+    // difference this comparison cannot legitimately judge (whether the
+    // harness has a decoder) and leaves the actual question -- what BOX
+    // the engine builds from a size, a ratio and the declarations -- fully
+    // on the engine.
+    //
+    // Read off the oracle's own decoder rather than decoded here, and that
+    // is the deliberate half. An independent decoder in the harness would
+    // score a DECODER disagreement as a layout disagreement, and this
+    // corpus contains the case that proves it: `R0lGODlhAQABAAAAACw=`, the
+    // 1x1 GIF ten cases use, has a well-formed header saying 1x1 and no
+    // image data at all. A header-sniffing decoder reports 1x1; Brave
+    // rejects it, reports naturalWidth 0, and paints a 16x16 broken-image
+    // icon. Feeding the engine 1x1 for it would make a `width: 200px`
+    // image 200x200 here against Brave's 16x16 -- an argument between two
+    // decoders, dressed as a layout bug.
+    //
+    // `naturalWidth` is the resource's size, NOT the answer: the engine
+    // still has to combine it with `width`/`height`/`max-width`/the
+    // attributes to reach a box, which is what the `:replaced/img-*` cases
+    // compare. The one case where the two coincide is a bare <img>, whose
+    // box IS its intrinsic size, and that case is a tautology under this
+    // arrangement -- it asserts the size is consulted at all, nothing
+    // more, and it says so in the corpus.
+    //
+    // `complete` is reported alongside so a run where an image had not
+    // loaded when this script ran cannot look like a size of zero. The
+    // engine side prints a warning rather than silently laying out 0x0.
+    //
+    // Emitted as an ARRAY of [src, w, h, complete] rather than as an
+    // object keyed by src, because the reader keywordizes JSON keys and a
+    // keyword whose name contains `/` cannot be turned back into its
+    // string: `(name :data:image/svg+xml;base64,...)` is `data:image` alone.
+    var imgs = [];
+    var els = document.querySelectorAll('img[src]');
+    for (var ii = 0; ii < els.length; ii++) {
+      var im = els[ii];
+      imgs.push([im.getAttribute('src'), im.naturalWidth, im.naturalHeight, im.complete]);
+    }
+    out['__images__'] = imgs;
+    // The viewport `@media` is evaluated against, measured rather than
+    // assumed. The corpus's cases are 800px wide but the headless window
+    // is not: `innerWidth` reads 756 in Brave 151 headless on this
+    // machine, while `cssom.core/default-viewport-width` is 800. Every
+    // `@media` threshold between those two numbers would have diverged
+    // for a reason that is a property of the harness rather than of the
+    // cascade. See `*oracle-viewport-width*`.
+    out['__viewport__'] = [window.innerWidth, window.innerHeight];
+    // ...and the colour scheme `prefers-color-scheme` is evaluated
+    // against, for the same reason. Measured rather than assumed because
+    // the assumption was wrong: `cssom.core/default-color-scheme` is
+    // \"light\" and headless Brave 151 on this machine reports DARK.
+    out['__scheme__'] = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    var pre = document.createElement('pre');
+    pre.id = 'kotoba-conformance-out';
+    pre.textContent = btoa(unescape(encodeURIComponent(JSON.stringify(out))));
+    document.body.appendChild(pre);
+  })();
+  ")
+
+(def ^:private conditional-group-at-rules
+  "At-rules whose body holds RULES, not declarations, and which are
+   therefore transparent to scoping: the selectors inside them still have
+   to be prefixed, and the at-rule's own prelude must not be.
+
+   Everything else that opens a block -- `@font-face`, `@property`,
+   `@keyframes`, `@page`, `@counter-style` -- holds DECLARATIONS, and
+   prefixing anything inside one would corrupt it. Those are emitted
+   verbatim, which also means they are document-global on the shared page:
+   a case registering `@property --x` registers it for every case, so a
+   case using one must pick a name nothing else uses."
+  #{"media" "supports" "layer" "container" "scope" "document"})
+
+(defn- matching-brace
+  "Index of the `}` closing the `{` at `open`, or nil if it is unbalanced.
+   The corpus is hand-written CSS with no braces inside strings, and an
+   unbalanced block is caught by the corpus-wide balance check rather than
+   guessed at here."
+  [s open]
+  (loop [i (inc open) depth 1]
+    (cond
+      (>= i (count s)) nil
+      (= \{ (nth s i)) (recur (inc i) (inc depth))
+      (= \} (nth s i)) (if (= 1 depth) i (recur (inc i) (dec depth)))
+      :else (recur (inc i) depth))))
+
+(defn- split-selector-list
+  "Splits a selector PRELUDE on its top-level commas -- the ones that
+   separate one selector from the next -- and on no others.
+
+   A plain `split` on `,` is wrong, and the way it is wrong is silent:
+   `div:has(b, i)` came out as two selectors, so `scope-css` prefixed the
+   SECOND ARGUMENT of the `:has()` and produced
+   `#case-N div:has(b, #case-N i)`. That is still valid CSS and still
+   matches something, so nothing anywhere reported an error -- it simply
+   answered a different question. Measured in Brave 151 on 2026-08-06 on
+   `<div><i>i</i></div><div><b>b</b></div><div><u>u</u></div>`: the correct
+   rule paints the first two divs red, and the mis-scoped one paints only
+   the second, because `:scope #case-N i` needs a `#case-N` INSIDE the div.
+   Every functional pseudo-class that takes a list is affected --
+   `:is()`, `:where()`, `:not()`, `:has()`, `:lang()`, `:nth-child(... of
+   a, b)`.
+
+   The corpus contained exactly one such prelude before this round
+   (`p:not(.x, .y)`), and it survived by luck: `#case-N .y` still matches
+   the same element, so the answer happened to be the same. Measured both
+   ways, both red -- which is why this went unnoticed rather than why it is
+   harmless.
+
+   Parenthesis depth is enough here; a comma inside an attribute selector's
+   quoted value would need string tracking, and no case has one. Brackets
+   are tracked anyway because they are one line of code and `[a=\"x,y\"]`
+   is a shape a future case could plausibly want."
+  [prelude]
+  (let [s (str prelude)
+        n (count s)]
+    (loop [i 0 start 0 depth 0 out []]
+      (if (>= i n)
+        (conj out (subs s start))
+        (let [c (nth s i)]
+          (cond
+            (or (= \( c) (= \[ c)) (recur (inc i) start (inc depth) out)
+            (or (= \) c) (= \] c)) (recur (inc i) start (max 0 (dec depth)) out)
+            (and (= \, c) (zero? depth)) (recur (inc i) (inc i) depth (conj out (subs s start i)))
+            :else (recur (inc i) start depth out)))))))
+
+(defn- rooted-scope-prelude?
+  "Whether `prelude` is an `@scope` that names a scope ROOT -- the form
+   whose rules are already confined to that root's subtree, and which
+   therefore must not have its body prefixed with the case container's id.
+   See `scope-css` for the three browser measurements behind that."
+  [prelude]
+  (boolean (re-find #"(?i)^@scope\s*\(" (str/trim (str prelude)))))
+
+(defn- scope-css
+  "Prefixes every STYLE RULE selector in a case's CSS with that case's
+   container id, so all cases can share one page without one case's
+   `li::before` reaching into another's markup.
+
+   Brace-balanced rather than `split` on `}`, because a cascade corpus is
+   made of at-rules and the naive version corrupted every one of them.
+   Measured on the shape this round needed first:
+   `@media (min-width: 600px) { p { color: red } }` came out as
+   `#case-0 @media (min-width: 600px) { p { color: red }` -- the at-rule's
+   PRELUDE prefixed with an id (so the whole block is invalid and the
+   browser drops it), the inner `p` left UNSCOPED (so had it parsed it
+   would have reached every other case on the page), and the closing brace
+   lost. `@layer a, b;` became `#case-0 @layer a, #case-0 b;`, because the
+   comma-split for a selector list was applied to a layer-name list.
+   No case in the corpus contained an `@` rule before this round, so none
+   of that had ever run.
+
+   Three shapes, and the rule for each:
+   - an at-rule STATEMENT (`@layer a, b;`) is emitted verbatim -- it names
+     layers, not elements, and there is nothing in it to scope;
+   - a conditional group at-rule (see `conditional-group-at-rules`) keeps
+     its prelude and has its BODY scoped recursively, so
+     `@media (...) { @layer x { p { ... } } }` reaches `#case-0 p`;
+   - a style rule has its selector list scoped and its body emitted
+     verbatim. The body is verbatim on purpose: a NESTED rule
+     (`p { & span { ... } }`) is relative to its parent and already
+     scoped by it -- prefixing it again would make it `#case-0 & span`,
+     which matches nothing.
+
+   A ROOTED `@scope` is the fourth shape, and it is the same trap the
+   nested rule above is: a scoped selector carries an implicit `:scope `
+   descendant prefix, so prefixing it with the case container's id makes it
+   `:scope #case-0 .x` -- and `#case-0` is an ANCESTOR of the scope root,
+   not a descendant, so it matches nothing. Measured in Brave 151 over CDP
+   on 2026-08-06, one probe page per probe:
+
+   | CSS | Brave |
+   |---|---|
+   | `@scope (#sc) { #cN .x { red } }`, `#cN > #sc > .x` plus a `.x` beside it | BOTH black -- the rule reaches nothing |
+   | `@scope (#sc) { #cN :scope .x { red } }` | inside red, outside black -- an explicit `:scope` survives the prefix |
+   | `@scope (#sc) { .x { red } }`, no prefix at all | inside red, outside black, and a `.x` in ANOTHER container black |
+
+   The third row is why the body is left unprefixed rather than rewritten:
+   a rooted `@scope` prelude ALREADY confines its rules to that root's
+   subtree, so the id prefix buys nothing and costs the whole feature. It
+   does mean the scope root's own selector has to be unique on the shared
+   page -- which is the discipline `cases.edn` already states for `@scope`
+   roots, layer names and `@property` names alike.
+
+   A PRELUDE-LESS `@scope { ... }` is NOT given this treatment: it scopes
+   to the owning `<style>` element's parent, which on the corpus page is
+   the shared `<body>`, so its rules would reach every case. It keeps the
+   prefix, and stays confined.
+
+   What this costs, named here because nothing else would notice it: the
+   two sides of the harness now differ in one respect. `cascaded-document`
+   gives the ENGINE the case's raw `:css`; the browser gets this function's
+   output. An unscoped selector therefore carries one more id in the
+   browser than in the engine -- which was always true and always harmless,
+   because before the `:scope` group every competing selector in a case was
+   unscoped and they all gained the same id. A rooted `@scope` body now
+   gains nothing, so a case where a SCOPED rule competes with an UNSCOPED
+   one at close specificity is comparing different numbers on the two
+   sides. `cases.edn` names the one measurement that makes inexpressible.
+
+   The selector list is split by `split-selector-list`, which respects
+   parentheses -- see its docstring for the mis-scoping a plain `split`
+   on `,` produced inside a `:has()`/`:is()`/`:lang()` argument."
+  [css scope]
+  (when-not (str/blank? (str css))
+    (let [s (str css)
+          n (count s)]
+      (loop [i 0 out []]
+        (let [i (loop [i i] (if (and (< i n) (re-matches #"\s" (str (nth s i)))) (recur (inc i)) i))]
+          (if (>= i n)
+            (let [out (remove str/blank? out)]
+              (when (seq out) (str/join "\n" out)))
+            (let [brace (str/index-of s "{" i)
+                  semi (str/index-of s ";" i)]
+              (cond
+                ;; an at-rule statement: `@layer a, b;`, `@import ...;`
+                (and semi (or (nil? brace) (< semi brace)))
+                (recur (inc semi) (conj out (str/trim (subs s i (inc semi)))))
+
+                (nil? brace)
+                (let [out (remove str/blank? out)]
+                  (when (seq out) (str/join "\n" out)))
+
+                :else
+                (if-let [close (matching-brace s brace)]
+                  (let [prelude (str/trim (subs s i brace))
+                        body (subs s (inc brace) close)
+                        at-name (second (re-find #"^@([A-Za-z-]+)" prelude))]
+                    (recur (inc close)
+                           (conj out
+                                 (cond
+                                   (and at-name (contains? conditional-group-at-rules
+                                                           (str/lower at-name)))
+                                   (str prelude " {"
+                                        (or (scope-css body
+                                                       (if (rooted-scope-prelude? prelude) nil scope))
+                                            "")
+                                        "}")
+
+                                   at-name (str prelude " {" body "}")
+
+                                   :else
+                                   (str (->> (split-selector-list prelude)
+                                             (map str/trim)
+                                             (remove str/blank?)
+                                             (map #(if (str/blank? (str scope)) % (str scope " " %)))
+                                             (str/join ", "))
+                                        " {" body "}")))))
+                  ;; unbalanced: emit the remainder untouched rather than
+                  ;; silently dropping it, so it is visible as a broken rule
+                  (let [out (conj out (subs s i))]
+                    (str/join "\n" (remove str/blank? out))))))))))))
+
+(defn- corpus-page [cases width]
+  (str "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
+       "html,body{margin:0;padding:0}"
+       ".kotoba-case{width:" width "px;font-family:monospace;font-size:14px;line-height:20px}"
+       (->> cases
+            (map-indexed (fn [i c] (scope-css (:css c) (str "#case-" i))))
+            (remove nil?)
+            (str/join "\n"))
+       "</style></head><body>"
+       (->> cases
+            (map-indexed (fn [i c]
+                           (str "<div class=\"kotoba-case\" id=\"case-" i "\">" (:html c) "</div>")))
+            (str/join "\n"))
+       "<script>" measure-script "</script></body></html>"))
+
+(defn- run-cdp!
+  "Reads the measurement block by driving the browser over the DevTools
+   protocol (see conformance/cdp_dump.cljk for why, and for what Brave 151
+   does to `--dump-dom`). Run as a child nbb process on purpose: CDP is
+   inherently async and this script is synchronous end to end, so the
+   alternative was making the whole harness promise-shaped to accommodate
+   one I/O detail.
+
+   This is the PRIMARY transport, not a fallback, on two measurements:
+   Brave 151 produces nothing at all from `--dump-dom` while answering CDP
+   normally, and CDP is ~10x faster (3-6s vs 60s) because it does not
+   depend on a headless Chromium ever exiting -- which it does not, so the
+   `--dump-dom` path always burns its full SIGKILL timeout. Brave and
+   Chrome over CDP were verified byte-identical on the 200-case corpus
+   (202/202 blocks), as they should be: same engine."
+  [browser file]
+  (let [out-file (path/join (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-cdp-out-")) "block.html")
+        res (cp/spawnSync "nbb" #js ["conformance/cdp_dump.cljk" browser file out-file]
+                          #js {:encoding "utf8" :timeout 240000})
+        out (if (fs/existsSync out-file) (fs/readFileSync out-file "utf8") "")]
+    (when-not (str/includes? out "kotoba-conformance-out")
+      (throw (ex-info "browser produced no measurement block over CDP"
+                      {:status (.-status res)
+                       :stderr (str/trim (or (.-stderr res) ""))})))
+    out))
+
+(defn- run-cdp-with-retry!
+  "`run-cdp!`, retried once.
+
+   A CDP launch fails TRANSIENTLY when several harness runs overlap, which
+   is now routine -- agents run this concurrently. Measured 2026-08-04: a
+   run reported `browser produced no measurement block over CDP` with eight
+   leftover Brave processes on the machine, and the identical command
+   succeeded seconds later. Without a retry the run silently falls through
+   to the next candidate browser, so a transient failure quietly changes
+   WHICH browser produced the numbers -- and Brave is the named comparison
+   target. One retry, with a short pause, converts the common case back
+   into a Brave measurement; a genuine failure still falls through and is
+   still printed."
+  [browser file]
+  (try
+    (run-cdp! browser file)
+    (catch :default first-err
+      (println (str "  oracle retry: " (last (str/split browser #"/"))
+                    " did not answer CDP (" (ex-message first-err) ") -- retrying once"))
+      ;; A brief pause: the observed failure mode is contention with other
+      ;; browser instances still shutting down, which resolves in seconds.
+      ;;
+      ;; Atomics.wait, not a busy loop on Date.now: this harness is
+      ;; deliberately synchronous end to end (see run-cdp!), and the machine
+      ;; running it is typically running other agents' browsers at the same
+      ;; time -- spinning a core for three seconds to wait for THOSE to
+      ;; finish would make the thing it is waiting for slower.
+      (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 3000)
+      (run-cdp! browser file))))
+
+(defn- run-dump-dom!
+  "Runs the corpus page in a real Blink browser and returns its measurement
+   block.
+
+   Two hard-won details, both measured on Brave 151.1.93.129 rather than
+   assumed:
+
+   1. `--headless=old`. `--headless=new --dump-dom` prints NOTHING at all
+      (exit 0, empty stdout) and bare `--headless` never returns. Old
+      headless is deprecated upstream, so when a future Brave drops it this
+      is the first thing to re-measure -- the harness then fails loudly (no
+      measurement block) instead of silently scoring zero.
+
+   2. Output goes to a FILE, through `sh -c ... > file`, never through a
+      pipe. Chromium's child processes inherit stdout and keep it open
+      after the parent is killed, so a pipe never reaches EOF and the
+      reader hangs forever -- `spawnSync`'s own `:timeout` does not help,
+      because it kills the parent and then still waits on the pipe.
+      Redirecting to a file removes the EOF dependency entirely, and
+      `timeout` bounds the run. (`--virtual-time-budget` is also omitted on
+      purpose: with old headless it kept the browser alive indefinitely on
+      a page that had already finished rendering.)"
+  [browser file]
+  (let [profile (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-conf-"))
+        out-file (path/join profile "dump.html")
+        ;; `timeout -s KILL`, not plain `timeout`: measured here, headless
+        ;; Chromium WRITES its --dump-dom output and then never exits, and
+        ;; it ignores SIGTERM, so a plain `timeout` hangs forever. SIGKILL
+        ;; after the dump is written costs nothing -- the exit status is
+        ;; deliberately ignored below and only the file content is trusted.
+        cmd (str "timeout -s KILL 30 '" browser "' --headless=old --disable-gpu"
+                 " --no-first-run --no-default-browser-check --disable-extensions"
+                 " --user-data-dir='" profile "'"
+                 " --dump-dom 'file://" file "' > '" out-file "' 2>/dev/null")
+        res (cp/spawnSync "/bin/sh" #js ["-c" cmd] #js {:encoding "utf8" :timeout 90000})
+        stdout (if (fs/existsSync out-file) (fs/readFileSync out-file "utf8") "")]
+    (when-not (str/includes? stdout "kotoba-conformance-out")
+      (fs/rmSync profile #js {:recursive true :force true})
+      (throw (ex-info "browser produced no measurement block"
+                      {:status (.-status res) :bytes (count stdout)})))
+    (fs/rmSync profile #js {:recursive true :force true})
+    stdout))
+
+(defn- parse-block
+  "Both transports hand back the same `<pre id=\"kotoba-conformance-out\">`
+   shape, so there is exactly one parser for exactly one format."
+  [raw]
+  (let [start (str/index-of raw "kotoba-conformance-out\">")
+        from (+ start (count "kotoba-conformance-out\">"))
+        end (str/index-of raw "</pre>" from)]
+    (-> (js/Buffer.from (subs raw from end) "base64")
+        (.toString "utf8")
+        js/JSON.parse
+        (js->clj :keywordize-keys true))))
+
+(defn- run-browser!
+  "CDP first, `--dump-dom` second. Both are tried before a candidate
+   browser is declared unusable, because the two fail independently: Brave
+   151 answers CDP and produces nothing from --dump-dom, and a future
+   browser that locks down the debugging port would do the reverse. Which
+   transport actually produced the numbers is returned alongside them and
+   printed, because 'the oracle was Brave' and 'the oracle was Brave, over
+   CDP, because its --dump-dom is dead' are different facts about the
+   measurement."
+  [browser file]
+  (try
+    {:transport :cdp :data (parse-block (run-cdp-with-retry! browser file))}
+    (catch :default cdp-err
+      (try
+        {:transport :dump-dom :data (parse-block (run-dump-dom! browser file))}
+        (catch :default dump-err
+          (throw (ex-info (str "no measurement block: CDP -- " (ex-message cdp-err)
+                               "; --dump-dom -- " (ex-message dump-err))
+                          {:cdp (ex-data cdp-err) :dump-dom (ex-data dump-err)})))))))
+
+(defn- normalize [s]
+  ;; Case-folded on purpose: `text-transform: uppercase` genuinely rewrites
+  ;; what cssom.layout emits (it must -- wrapping has to measure the
+  ;; transformed text) while a real browser leaves the DOM text alone and
+  ;; upper-cases at paint time. Both are correct, and comparing them
+  ;; case-sensitively would score a correct engine as wrong.
+  (-> (str s) (str/replace #"\s+" " ") str/trim str/lower))
+
+(defn- cluster-lines
+  "Groups measured WORDS into line boxes by vertical overlap, then reads
+   each line left to right.
+
+   Overlap, not an exact `top` match: a `<b>` and the plain text beside it
+   sit on the same line but their boxes differ by a pixel or two because
+   the fonts differ, and Blink's own per-run boxes are not top-aligned
+   either. Clustering on whether a word's vertical MIDPOINT falls inside
+   the line's current vertical span is what both engines agree on when the
+   layout is right.
+
+   The same function is applied to BOTH sides -- the browser's word rects
+   and cssom.layout's own draw-ops -- so neither side gets a grouping rule
+   the other doesn't. Word-level measurement (rather than per text NODE)
+   is what makes wrapped text comparable at all: a wrapped node has one
+   rect per line, and only its individual words can be attributed to the
+   line they actually landed on."
+  [words]
+  (->> words
+       (sort-by (fn [w] [(:top w) (:left w)]))
+       (reduce (fn [lines w]
+                 (let [mid (/ (+ (:top w) (:bottom w)) 2)
+                       line (peek lines)]
+                   (if (and line (< (:top line) mid (:bottom line)))
+                     (conj (pop lines)
+                           (-> line
+                               (update :words conj w)
+                               (assoc :top (min (:top line) (:top w))
+                                      :bottom (max (:bottom line) (:bottom w)))))
+                     (conj lines {:top (:top w) :bottom (:bottom w) :words [w]}))))
+               [])
+       (mapv (fn [line]
+               (->> (:words line)
+                    ;; The tie-break is part of the rule, and it is the
+                    ;; same rule on both sides. Two words at the SAME
+                    ;; `left` on the same line have no left-to-right order
+                    ;; to read -- they are stacked on top of each other --
+                    ;; so `sort-by :left` alone falls through to whatever
+                    ;; order the words arrived in, and the two sides do
+                    ;; not arrive in the same one: the browser walks text
+                    ;; nodes in DOCUMENT order while cssom.layout emits
+                    ;; draw-ops in PAINT order. Six corpus cases are built
+                    ;; on exactly that shape (an overlapping pair pulled
+                    ;; together by `margin-top: -60px`, so `a` and `b` are
+                    ;; both at x=0), and the stacking round made the
+                    ;; engine's paint order correct -- which flipped the
+                    ;; pair and read as `want ["a b"] got ["b a"]` on an
+                    ;; axis that is not about paint order at all. Sorting
+                    ;; coincident words by their own text is deterministic,
+                    ;; symmetric, and gives up nothing: it can only reorder
+                    ;; words whose positions are identical, and identical
+                    ;; positions carry no order to preserve.
+                    (sort-by (juxt :left #(normalize (:text %))))
+                    (map :text)
+                    (map normalize)
+                    (remove str/blank?)
+                    (str/join " "))))
+       (filterv (complement str/blank?))))
+
+;; ---- the cssom side ----
+
+(defn- text-face
+  "Which of the six measured faces a run of text is drawn in.
+
+   Six, not four: a form control's face is a different FONT from the page's
+   (Arial 13.3333 against monospace 14, see the measurement script's
+   control-face probe), so it needs its own bold and italic exactly as the
+   page font does. This used to test the family FIRST and stop -- a bold
+   control label was answered with regular control metrics, which is a
+   9%-narrow answer to a question the engine asked correctly.
+
+   The family test is `Arial` because that is the family this engine names
+   in its own UA control defaults (cssom.layout's ua-control-font); it is
+   how a control's text identifies itself on the way out."
+  [family weight style]
+  (let [control? (= "Arial" family)]
+    (cond (= "bold" weight) (if control? :control-bold :bold)
+          (= "italic" style) (if control? :control-italic :italic)
+          control? :control
+          :else :normal)))
+
+(defn- face-ref-size
+  "The size the face's advance/metric table was measured at, which is what
+   the engine's own font-size is scaled against."
+  [face]
+  (if (contains? #{:control :control-bold :control-italic} face) 13.3333 14))
+
+(def ^:dynamic *oracle-viewport-width*
+  "The width `@media` is evaluated against on the ENGINE side, read out of
+   the oracle's own `window.innerWidth` (see the measurement script's
+   `__viewport__` probe) rather than left at `cssom.core`'s 800px default.
+
+   Not a thumb on the scale, and the same class of correction as the
+   wrapper carrying the page's `line-height`: the browser answers
+   `@media (min-width: 780px)` against 756 and the engine answered it
+   against 800, so every threshold in that band was a disagreement about
+   WHICH VIEWPORT, not about the cascade. What is being compared is
+   whether the two sides evaluate the same condition the same way; the
+   number the condition is evaluated against has to be the same one.
+
+   nil means 'the oracle did not report one' -- the engine's own default
+   then stands, which is what happened for every run before this round."
+  nil)
+
+(def ^:dynamic *oracle-color-scheme*
+  "The colour scheme `prefers-color-scheme` is evaluated against on the
+   ENGINE side, read out of the oracle's own `matchMedia` (see the
+   measurement script's `__scheme__` probe). Same correction as
+   `*oracle-viewport-width*`, and it had to be measured to be believed:
+   `cssom.core/default-color-scheme` is \"light\", and headless Brave 151
+   on this machine answers `(prefers-color-scheme: dark)` with **true**."
+  nil)
+
+(defn- cascaded-document
+  "One parse + cascade pass: htmldom parse -> cssom.core/apply-cascade,
+   stopping BEFORE layout. This is the document the computed-style axis
+   reads (`:style/*` attrs are exactly what apply-cascade writes and what
+   `cssom.core/computed-style` returns), and the same document the layout
+   axes then feed to cssom.layout.
+
+   The wrapper carries the SAME declarations the browser page sets on
+   `.kotoba-case`. Without them the engine never saw the container's
+   `line-height: 20px` and fell back to its own `normal` (1.2em) rule, so
+   an <h1> got a 33px line box where the browser -- which inherits the
+   explicit 20px -- reports 20. That was a harness asymmetry being scored
+   as an engine error.
+
+   apply-cascade runs even with no author CSS: it is also what folds a
+   `style=\"...\"` attribute's :style-inline into the :style/* attrs
+   cssom.layout actually reads, so skipping it would silently drop every
+   inline style in the corpus.
+
+   The CSS is scoped by the wrapper's own id, for the same reason the
+   browser page scopes it by `#case-N`, and this is the change that makes
+   the two sides ask the SAME QUESTION. The browser scopes because 808
+   cases share one document; this side does not need to, because each case
+   is its own document -- but the wrapper is an ELEMENT either way, and an
+   unscoped selector can match it on this side while the `#case-N ` prefix
+   holds the browser's wrapper out of reach. Measured on
+   `:selector/has-takes-a-selector-list`: the browser evaluates
+   `#case-N div:has(b, i)`, which cannot match its own container, while
+   this side evaluated a bare `div:has(b, i)`, which matched
+   `<div id=\"root\">` -- and the red it declared there INHERITED into the
+   one div the rule is supposed to miss. Four such cases were written
+   before this was noticed, and all four looked like engine bugs.
+
+   It also removes a specificity asymmetry that has been latent since the
+   wrapper existed: the browser has been scoring `#case-N p` at (1,0,1)
+   while this side scored `p` at (0,0,1). No corpus case turned on it,
+   because every case compares rules against each other and both sides
+   added the id to all of them or to none -- but the two sides were not
+   evaluating the same selector."
+  [{:keys [html css]}]
+  (-> (html/parse-into-document
+       (str "<div id=\"root\" style=\"font-size: 14px; line-height: 20px\">" html "</div>"))
+      (css/apply-cascade (css/parse-rules (or (scope-css css "#root") ""))
+                         (cond-> {}
+                           *oracle-viewport-width*
+                           (assoc :viewport-width *oracle-viewport-width*)
+                           *oracle-color-scheme*
+                           (assoc :color-scheme *oracle-color-scheme*)))))
+
+(defn- engine-ops
+  "One layout pass through the real pipeline: htmldom parse -> cssom.core
+   cascade -> cssom.layout draw-ops, at the harness width.
+
+   Two theme settings, both of which remove something the comparison
+   cannot legitimately judge rather than helping the engine:
+
+   - `:measure-text` is fed the ORACLE's own measured per-character
+     advance (see the measurement script's `__char_width__` probe) through
+     the engine's existing host hook. Without it every wrap point differs
+     by the constant ratio between this engine's 0.6-em approximation and
+     the real font, and the corpus could only hold text short enough never
+     to wrap. Where to BREAK is still entirely the engine's decision.
+   - `:padding`/`:gap` are this engine's own theme (every box gets a 4px
+     inset, every row a 4px gap) -- a host styling choice, not CSS. Left
+     at their defaults they narrow the content width by 16px per nested
+     box, scoring the theme instead of the layout."
+  [{:keys [html css]} width host]
+  (let [[_ doc] (dom/consume-ops (cascaded-document {:html html :css css}))]
+    (layout/draw-ops (dom/tree doc)
+                     {:width width
+                      :theme {:padding 0
+                              :gap 0
+                              ;; the vertical counterpart of :measure-text,
+                              ;; scaled LINEARLY from the measured 14px
+                              ;; faces (13.3333px for the control face).
+                              ;;
+                              ;; The oracle's own values are INTEGERS at
+                              ;; every size -- measured 2026-08-04 across
+                              ;; ten faces/sizes, `fontBoundingBoxAscent`/
+                              ;; `Descent` came back 9/2, 12/3, 14/3, 17/4,
+                              ;; 21/5 for monospace at 10/14/16/20/24 and
+                              ;; 12/3, 22/5 for Arial at 13.3333/24, i.e.
+                              ;; round(size x em-ratio) every time. This
+                              ;; hook does NOT round, so it hands the engine
+                              ;; fractional metrics no real font has (20.57
+                              ;; where the browser says 21), which is where
+                              ;; the residual +-1px on every large-font line
+                              ;; box comes from.
+                              ;;
+                              ;; Rounding it was measured rather than
+                              ;; argued, and is deliberately NOT applied:
+                              ;; it moved the geometry axis 1150 -> 1150
+                              ;; boxes (clean cases 283 -> 284, line
+                              ;; structure 297 -> 298, paint order
+                              ;; 7600 -> 7599) and pushed
+                              ;; :form/textarea-with-rows OUT of tolerance,
+                              ;; because rounding a control's ascent+descent
+                              ;; UP to 15 compounds over three rows against
+                              ;; a real textarea whose face is 13.3333px
+                              ;; MONOSPACE (14 per row), not the 13px Arial
+                              ;; ua-control-font charges. That is one half
+                              ;; of a pair of cancelling errors (see
+                              ;; ua-control-font in cssom.layout); fixing it
+                              ;; alone makes the result worse, so it waits
+                              ;; for the other half.
+                              ;;
+                              ;; 2026-08-05: the other half landed (see
+                              ;; :avg-advance below), and the control face is
+                              ;; no longer part of this argument -- the
+                              ;; engine now asks at exactly 13.3333, which is
+                              ;; the size the control tables were measured
+                              ;; at, so `k` is 1 and the control's metrics
+                              ;; come back as the browser's own integers with
+                              ;; no rounding to do. What is left of the note
+                              ;; above is about the PAGE faces at 20/24/40px,
+                              ;; and re-measuring it is its own change.
+                              :font-metrics (fn [font-size weight style family]
+                                              (let [face (text-face family weight style)
+                                                    base (get (:metrics host) face)
+                                                    ref (face-ref-size face)
+                                                    k (/ (or font-size ref) ref)]
+                                                {:ascent (* k (:ascent base))
+                                                 :descent (* k (:descent base))
+                                                 :x-height (* k (:xHeight base))}))
+                              ;; The two metrics a FORM CONTROL is sized
+                              ;; from, which no string measurement produces.
+                              ;;
+                              ;; Both are derived from data this probe
+                              ;; ALREADY collects -- the `x` entry of the
+                              ;; per-character advance table and the face's
+                              ;; ascent -- and not from measuring a control.
+                              ;; That distinction is the whole point: a
+                              ;; harness that recovered these by inverting
+                              ;; `<textarea cols=n>` would be handing the
+                              ;; engine the answer to the question the
+                              ;; corpus asks. These are font facts, read the
+                              ;; way a host with a canvas reads them, and
+                              ;; the engine still owns every formula they
+                              ;; feed.
+                              ;;
+                              ;; The two laws, measured in Brave 151 on
+                              ;; 2026-08-05 over 10 families x 11 sizes x 14
+                              ;; column counts and exact on all 3,080
+                              ;; observations (see cssom.layout's avg-advance
+                              ;; and max-advance):
+                              ;;
+                              ;;   avg = max(w, round(w)), w = `x` advance
+                              ;;   max = round(the font's ascent)
+                              ;;
+                              ;; Both round at the ASKED size, not at the
+                              ;; reference one -- that is the whole content
+                              ;; of the first law, and scaling a rounded
+                              ;; 13.3333px value linearly would reproduce
+                              ;; exactly the 5.4%-at-40px error the previous
+                              ;; attempt found and correctly refused to ship.
+                              ;;
+                              ;; Blink distrusts a handful of families'
+                              ;; summary metrics (`Courier`, `Helvetica`,
+                              ;; `Times`, `Monaco`, `Geneva`, `Lucida
+                              ;; Grande`) and falls back to the `0` advance
+                              ;; with no max slack for those. Not implemented
+                              ;; here because this corpus has six faces and
+                              ;; none of them is one: it would be dead code
+                              ;; asserting a measurement nothing runs.
+                              :avg-advance (fn [font-size weight style family]
+                                             (let [face (text-face family weight style)
+                                                   ref (face-ref-size face)
+                                                   w (* (/ (or font-size ref) ref)
+                                                        ((get host face) \x))]
+                                               (max w (js/Math.round w))))
+                              :max-advance (fn [font-size weight style family]
+                                             (let [face (text-face family weight style)
+                                                   base (get (:metrics host) face)
+                                                   ref (face-ref-size face)]
+                                               (js/Math.round
+                                                (* (/ (or font-size ref) ref)
+                                                   (:ascent base)))))
+                              :measure-text (fn [text font-size weight style family]
+                                              (let [face (text-face family weight style)
+                                                    advance (get host face)
+                                                    ref (face-ref-size face)]
+                                                (* (/ (or font-size ref) ref)
+                                                   (reduce + 0 (map advance (str text))))))
+                              ;; The resource half, measured in the oracle
+                              ;; the same way (see the measurement script's
+                              ;; `__images__` probe for why it is read off
+                              ;; the browser's decoder rather than decoded
+                              ;; here). A src the oracle could not decode
+                              ;; comes back 0x0, which this hands over
+                              ;; unchanged -- `replaced-intrinsic-size`
+                              ;; treats a non-positive size as no answer,
+                              ;; which is the same "unresolved resource"
+                              ;; state a host with no decoder is in.
+                              :image-size (fn [src] (get (:images host) src))}})))
+
+(defn- engine-lines
+  "cssom.layout's own answer, in the same shape the oracle's is read into.
+
+   `host` is the ORACLE's own measured per-character advance (see the
+   measurement script's `__char_width__` probe), threaded in through the
+   engine's existing `:measure-text` theme hook -- the same hook a real
+   host uses to make wrap decisions agree with how it will actually paint.
+   Supplying it here is not a thumb on the scale: it removes the one
+   difference the comparison cannot legitimately judge (this engine has no
+   glyph shaping, so its 0.6-em approximation disagrees with any real font
+   by a constant factor) and leaves the actual question -- WHERE the engine
+   decides to break -- fully on the engine.
+
+   Each `:text` draw-op is split back into words positioned by this
+   engine's own width model, because that is the granularity the browser
+   side is measured at; the op's vertical span is `[y, y + font-size]`,
+   which is exactly the em box the real hosts paint into (dom-gpu draws at
+   `y + font-size`, the baseline). Splitting per word also means a wrapped
+   line compares correctly rather than as one blob."
+  [{:keys [html css]} width host]
+  (let [ops (engine-ops {:html html :css css} width host)
+        ;; Mirror of the oracle script's own `closest(...)` skip: a form
+        ;; control's or replaced box's INNER text is its own formatting
+        ;; context. Done geometrically here because draw-ops carry no
+        ;; parentage -- a text op inside an atomic box's rect is that box's
+        ;; content.
+        atomic-boxes (filterv #(and (= :node (:draw/op %))
+                                    (or (contains? #{:img :input :button :select :textarea} (:tag %))
+                                        (= "inline-block" (:display %))))
+                              ops)
+        ;; Left/top edges INCLUSIVE, right/bottom edges EXCLUSIVE. A point
+        ;; on a box's right edge is ADJACENT to it, not inside it -- and
+        ;; the difference is not academic here, because a float is the one
+        ;; construct that reliably puts text at exactly the right edge of a
+        ;; replaced box. Measured on :page/hero-with-floated-image (an 80px
+        ;; `float: left` <img> with the headline flowing beside it): the
+        ;; engine correctly put all three lines at x=80, the closed test
+        ;; called x=80 "inside" the img's 0..80 span, and every line was
+        ;; discarded -- the case reported `got []`, an EMPTY line structure
+        ;; for a page that had rendered correctly. The oracle side has no
+        ;; such problem: it uses `closest(...)`, i.e. real parentage, which
+        ;; this geometric predicate only approximates because draw-ops
+        ;; carry no parent pointer.
+        inside-atomic? (fn [op]
+                         (some (fn [b]
+                                 (and (>= (:x op) (:x b)) (< (:x op) (+ (:x b) (:w b)))
+                                      (>= (:y op) (:y b)) (< (:y op) (+ (:y b) (:h b)))))
+                               atomic-boxes))
+        text-ops (->> ops
+                      (filter #(= :text (:draw/op %)))
+                      (remove inside-atomic?))
+        word-w (fn [text fs weight style]
+                 (let [advance (cond (= "bold" weight) (:bold host)
+                                     (= "italic" style) (:italic host)
+                                     :else (:normal host))]
+                   (* (/ (or fs 14) 14) (reduce + 0 (map advance (str text))))))]
+    (->> text-ops
+         (mapcat (fn [op]
+                   (let [fs (:font-size op 14)]
+                     (loop [words (str/split (str (:text op)) #"(?=\s)|(?<=\s)")
+                            x (:x op)
+                            out []]
+                       (if-let [w (first words)]
+                         (recur (rest words) (+ x (word-w w fs (:font-weight op) (:font-style op)))
+                                (if (str/blank? w)
+                                  out
+                                  ;; The engine reports a text op in EM-BOX
+                                  ;; coordinates (its `:y` is one font-size
+                                  ;; above the baseline, where dom-gpu's
+                                  ;; hosts paint). The oracle reports the
+                                  ;; font's CONTENT AREA. Converting here
+                                  ;; compares the same box in the same
+                                  ;; coordinates rather than penalising a
+                                  ;; convention difference.
+                                  (let [face (text-face (:font-family op) (:font-weight op)
+                                                        (:font-style op))
+                                        base (get (:metrics host) face)
+                                        ref (face-ref-size face)
+                                        k (/ fs ref)
+                                        asc (* k (:ascent base))
+                                        desc (* k (:descent base))
+                                        baseline (+ (:y op) fs)]
+                                    (conj out {:text w :left x
+                                               :top (- baseline asc)
+                                               :bottom (+ baseline desc)}))))
+                         out)))))
+         cluster-lines)))
+
+
+;; ---- comparison ----
+
+(def ^:private geometry-tolerance-px
+  "How far a box may differ before the geometry axis calls it a mismatch.
+   Not zero: both sides now wrap against the SAME measured character
+   advance, so text-derived widths land within a pixel, but sub-pixel
+   rounding is real on the browser side (fractional device pixels) and this
+   engine works in whole pixels throughout."
+  2)
+
+(defn- geometry-agreement
+  "Matches each element box between the two sides by tag and occurrence
+   order -- both sides walk the same document, so the Nth `<td>` on one
+   side is the Nth `<td>` on the other -- and reports how many agree
+   within geometry-tolerance-px on all four of x/y/w/h.
+
+   Matching by tag+occurrence rather than by injected ids keeps the corpus
+   readable (cases stay plain HTML a person can eyeball) at the cost of
+   being wrong if one side drops an element entirely; that shows up as a
+   count mismatch, which is reported rather than silently zipped away.
+
+   AN ELEMENT THAT GENERATES NO BOX IS NOT A BOX, and is excluded here --
+   counted and printed under EXCLUDED, never dropped silently. `display:
+   none` and `display: contents` are the two cases (see the `boxless`
+   flag the page script sets, and the nine shapes measured to establish
+   that they are the only two). The browser still answers
+   getBoundingClientRect() for them, with a 0,0,0,0 rect in VIEWPORT
+   coordinates, so the case root's offset comes off it and leaves a
+   position that says only where on the page the case happened to land:
+   `:display/contents-is-transparent`'s wrapper read y=-28.03 in a full
+   run and y=0 when the same case ran alone. There is nothing for an
+   engine to agree or disagree with there. This engine emits a 0x0 box for
+   a `display: contents` element (deliberately -- splice-display-contents
+   says why) and nothing at all for a `display: none` one, so the same
+   number of ZERO-AREA engine boxes of that tag come out with them; a
+   zero-area engine box is the only thing that can be standing in for an
+   element that generates no box, and dropping a positioned box would be
+   hiding a real disagreement.
+
+   What this does NOT excuse: whether the element's children were promoted
+   into the right formatting context, at the right sizes, is scored in
+   full -- three of this case's four boxes carry that signal, and they are
+   the reason the case is in the corpus."
+  [oracle-boxes engine-boxes]
+  (let [by-tag (fn [boxes] (group-by :tag boxes))
+        zero-area? (fn [b] (and (zero? (or (:w b) 0)) (zero? (or (:h b) 0))))
+        drop-n (fn [n pred coll]
+                 (:out (reduce (fn [acc b]
+                                 (if (and (pos? (:left acc)) (pred b))
+                                   (update acc :left dec)
+                                   (update acc :out conj b)))
+                               {:left n :out []} coll)))
+        o (by-tag (remove :boxless oracle-boxes))
+        boxless (->> oracle-boxes (filter :boxless) (map :tag) frequencies)
+        e (reduce-kv (fn [m tag n] (update m tag #(drop-n n zero-area? (vec %))))
+                     (by-tag engine-boxes) boxless)
+        tags (distinct (concat (keys o) (keys e)))
+        close? (fn [a b] (<= (abs (- (or a 0) (or b 0))) geometry-tolerance-px))
+        dist (fn [a b] (reduce + (map (fn [k] (abs (- (or (get a k) 0) (or (get b k) 0))))
+                                      [:x :y :w :h])))
+        ;; Greedy NEAREST matching within a tag, not index-by-index: the
+        ;; browser lists elements in document order while this engine emits
+        ;; draw-ops in PAINT order, so an absolutely positioned box (painted
+        ;; last, above its siblings) lined up against the wrong sibling and
+        ;; reported two mismatches where the boxes were in fact identical.
+        pair-up (fn [os es]
+                  (loop [os os es (vec es) pairs []]
+                    (if-let [ob (first os)]
+                      (if (seq es)
+                        (let [best (apply min-key #(dist ob (nth es %)) (range (count es)))]
+                          (recur (rest os)
+                                 (vec (concat (subvec es 0 best) (subvec es (inc best))))
+                                 (conj pairs [ob (nth es best)])))
+                        (recur (rest os) es pairs))
+                      pairs)))]
+    (reduce (fn [acc tag]
+              (let [os (get o tag []) es (get e tag [])
+                    pairs (pair-up os es)
+                    agree (count (filter (fn [[ob eb]]
+                                           (and (close? (:x ob) (:x eb))
+                                                (close? (:y ob) (:y eb))
+                                                (close? (:w ob) (:w eb))
+                                                (close? (:h ob) (:h eb))))
+                                         pairs))
+                    ;; WHICH dimension disagrees, and by how much: a tail of
+                    ;; mismatches is far easier to attribute from "always h,
+                    ;; always +4" than from a list of failing cases.
+                    deltas (for [[ob eb] pairs
+                                 dim [:x :y :w :h]
+                                 :when (not (close? (get ob dim) (get eb dim)))]
+                             {:tag tag :dim dim
+                              :delta (- (or (get eb dim) 0) (or (get ob dim) 0))})]
+                (-> acc
+                    (update :total + (max (count os) (count es)))
+                    (update :agree + agree)
+                    (update :deltas into deltas)
+                    (update :by-tag update tag (fnil (fn [[a t]] [(+ a agree) (+ t (max (count os) (count es)))]) [0 0]))
+                    (cond-> (not= (count os) (count es))
+                      (update :missing conj tag)))))
+            {:total 0 :agree 0 :missing [] :by-tag {} :deltas []
+             :excluded (mapv (fn [[tag n]] {:reason :element-generates-no-box
+                                            :tag tag :n n})
+                             boxless)}
+            tags)))
+
+(defn- wrapper-op-ids
+  "The `:node/id`s of the two boxes that are the HARNESS's own, not the
+   case's: the document node and the `<div id=\"root\">` `cascaded-document`
+   wraps every case in. Read off the document tree, by identity.
+
+   This used to be read off the op vector by POSITION -- `engine-boxes`
+   took the first `:div` node op as the root, and `engine-topmost-at` took
+   the first two node ops as the wrappers. Both are true only while the
+   engine emits ops in document order, and the stacking round ended that:
+   a `z-index: -1` box whose nearest stacking context is the ROOT is
+   painted in Appendix E's step 2, i.e. before every other box in the
+   document, so it is now the first `:div` op and the second op overall.
+   Positionally, the harness read that box as its own wrapper and
+   subtracted its origin from every box in the case --
+   `:stacking/negative-z-index`, whose geometry is exact on both sides,
+   came out with all four boxes shifted by -120px. The reordering is
+   correct (Brave paints that box under everything and reports its box at
+   x=120 all the same); the harness's assumption about where it would
+   appear was not."
+  [c]
+  (let [tree (dom/tree (cascaded-document c))]
+    (into #{(:node/id tree)}
+          (->> (tree-seq map? #(filter map? (:children %)) tree)
+               (filter #(= "root" (get-in % [:attrs :id])))
+               (map :node/id)))))
+
+(defn- engine-boxes
+  "Element boxes from the engine's own `:node` draw-ops, relative to the
+   root box, in the same shape the oracle reports."
+  [ops wrapper-ids]
+  (let [nodes (filterv #(= :node (:draw/op %)) ops)
+        root (first (filter #(and (= :div (:tag %)) (contains? wrapper-ids (:id %))) nodes))
+        rx (:x root 0) ry (:y root 0)]
+    (->> nodes
+         (remove #(contains? wrapper-ids (:id %)))
+         (remove #(= :document (:tag %)))
+         (mapv (fn [op] {:tag (name (:tag op))
+                         :x (- (:x op) rx) :y (- (:y op) ry)
+                         :w (:w op) :h (:h op)})))))
+
+;; ---- the computed-style (cascade) axis ----
+;;
+;; Neither layout axis ever looks at the CASCADE. `cssom.core/apply-cascade`
+;; resolves selectors, specificity, layers, `!important`, custom properties
+;; and shorthand expansion into `:style/*` attrs -- and until this axis
+;; existed nothing compared a single one of those values against the
+;; browser's own `getComputedStyle`. A whole subsystem was unmeasured: a
+;; specificity bug that dropped a declaration entirely would still lay out
+;; SOMETHING, and both layout axes would happily score the something.
+;;
+;; What makes this comparable at all, and what does NOT:
+;;
+;; `getComputedStyle` returns the browser's *computed* value -- cascade,
+;; then inheritance, then defaulting from the UA stylesheet, all collapsed
+;; into one absolute normal form (`rgb(255, 0, 0)`, `"14px"`, `"700"`).
+;; This engine's `:style/*` attrs hold only the FIRST of those three
+;; stages, in author-ish form (`"red"`, `14`, `"bold"`). So each side is
+;; normalised into one canonical form per property kind (colours parsed to
+;; [r g b a], lengths to bare pixels, `bold`/`normal` to 700/400), and the
+;; two later stages are supplied on the engine's behalf, explicitly and
+;; labelled:
+;;
+;;   :direct    -- the cascade wrote a value for this element. The only
+;;                 source this axis genuinely MEASURES.
+;;   :inherited -- no value here, but an ancestor had one and the property
+;;                 is inherited in CSS. Supplied by this harness walking
+;;                 up the engine's own document, which is exactly the
+;;                 `(or (:prop st) (:prop inherited))` fallback
+;;                 cssom.layout applies at paint time.
+;;   :initial   -- nobody in the ancestor chain declared it, so CSS's own
+;;                 INITIAL value stands. This used to mean something much
+;;                 weaker than it sounds: the UA stylesheet lived in
+;;                 cssom.layout and was invisible to anything reading the
+;;                 cascade, so 2,123 of these were the engine not SAYING
+;;                 what it drew. Both halves of that sheet are now a real
+;;                 cascade origin (ADR-2800003100), and what is left in
+;;                 this bucket is genuinely undeclared.
+;;
+;; The classification below outlived the divergence it was built for, so a
+;; mismatch is CLASSIFIED rather than just counted, against a UA baseline
+;; measured in the oracle itself (see the measurement script's `__ua__`
+;; probe):
+;;
+;;   :ua-default  -- the engine has no cascaded value and the browser's
+;;                   value is exactly what its UA sheet gives that tag
+;;                   bare. One architectural divergence, N thousand times.
+;;   :blockified  -- a `display` mismatch on a FLEX or GRID item, where
+;;                   real CSS blockifies at computed-value time and the
+;;                   browser therefore reports `block` with nobody having
+;;                   declared anything. Also measured (the oracle sends
+;;                   each element's parent display) rather than guessed.
+;;   :cascade     -- everything else: the two sides disagree about a value
+;;                   the cascade is genuinely responsible for. THIS is the
+;;                   bucket worth reading.
+
+(def computed-style-properties
+  "The properties this axis compares, and what each side's value means.
+
+   Deliberately small and deliberately boring: every one of these has a
+   normal form both sides can be reduced to without guessing. `:kind`
+   selects the normaliser; `:inherited?` is real CSS's own inheritance
+   flag (which decides whether an absent value looks up the ancestor
+   chain); `:initial` is the CSS initial value, used when nothing in the
+   chain declared the property."
+  [{:prop :color :inherited? true :kind :color
+    ;; CSS's initial `color` is the system colour `canvastext`, which
+    ;; Chrome resolves to opaque black in a light colour scheme.
+    :initial "#000000"}
+   {:prop :font-size :inherited? true :kind :length :initial 16}
+   {:prop :font-weight :inherited? true :kind :weight :initial 400}
+   {:prop :font-style :inherited? true :kind :keyword :initial "normal"}
+   {:prop :display :inherited? false :kind :keyword :initial "inline"}
+   {:prop :text-align :inherited? true :kind :keyword :initial "start"}
+   {:prop :margin-top :inherited? false :kind :length :initial 0}
+   {:prop :margin-right :inherited? false :kind :length :initial 0}
+   {:prop :margin-bottom :inherited? false :kind :length :initial 0}
+   {:prop :margin-left :inherited? false :kind :length :initial 0}
+   {:prop :padding-top :inherited? false :kind :length :initial 0}
+   {:prop :padding-right :inherited? false :kind :length :initial 0}
+   {:prop :padding-bottom :inherited? false :kind :length :initial 0}
+   {:prop :padding-left :inherited? false :kind :length :initial 0}])
+
+(def ^:private named-colors
+  "The CSS named colours this harness can canonicalise. Anything outside
+   this table is EXCLUDED with `:unparseable-color` and printed, never
+   silently treated as a mismatch -- the point of the axis is to be able to
+   say which side is wrong, and a colour neither side parsed says nothing."
+  {"black" [0 0 0] "silver" [192 192 192] "gray" [128 128 128] "grey" [128 128 128]
+   "white" [255 255 255] "maroon" [128 0 0] "red" [255 0 0] "purple" [128 0 128]
+   "fuchsia" [255 0 255] "magenta" [255 0 255] "green" [0 128 0] "lime" [0 255 0]
+   "olive" [128 128 0] "yellow" [255 255 0] "navy" [0 0 128] "blue" [0 0 255]
+   "teal" [0 128 128] "aqua" [0 255 255] "cyan" [0 255 255] "orange" [255 165 0]
+   "pink" [255 192 203] "brown" [165 42 42] "gold" [255 215 0]
+   "darkgray" [169 169 169] "darkgrey" [169 169 169]
+   "lightgray" [211 211 211] "lightgrey" [211 211 211]
+   "transparent" [0 0 0 0]
+   ;; the system colours Chrome reports for the initial `color` value
+   "canvastext" [0 0 0] "windowtext" [0 0 0]})
+
+(defn- parse-color
+  "`#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa`, `rgb()`/`rgba()` in either the
+   comma or the slash-alpha form, and the named colours above, all reduced
+   to `[r g b a]`. nil when this harness cannot parse it -- the caller
+   turns that into an explicit exclusion rather than a mismatch."
+  [v]
+  (let [s (str/lower (str/trim (str v)))
+        hex1 (fn [h i] (let [d (js/parseInt (subs h i (inc i)) 16)] (+ d (* 16 d))))
+        hex2 (fn [h i] (js/parseInt (subs h i (+ i 2)) 16))]
+    (cond
+      (str/blank? s) nil
+      (contains? named-colors s)
+      (let [c (named-colors s)] (if (= 4 (count c)) c (conj c 1)))
+
+      (str/starts-with? s "#")
+      (let [h (subs s 1)]
+        (cond
+          (re-matches #"[0-9a-f]{3}" h) [(hex1 h 0) (hex1 h 1) (hex1 h 2) 1]
+          (re-matches #"[0-9a-f]{4}" h) [(hex1 h 0) (hex1 h 1) (hex1 h 2) (/ (hex1 h 3) 255)]
+          (re-matches #"[0-9a-f]{6}" h) [(hex2 h 0) (hex2 h 2) (hex2 h 4) 1]
+          (re-matches #"[0-9a-f]{8}" h) [(hex2 h 0) (hex2 h 2) (hex2 h 4) (/ (hex2 h 6) 255)]
+          :else nil))
+
+      (re-find #"^rgba?\(" s)
+      (let [nums (mapv js/parseFloat (re-seq #"-?[0-9.]+" (subs s (inc (str/index-of s "(")))))]
+        (when (>= (count nums) 3)
+          [(nth nums 0) (nth nums 1) (nth nums 2) (if (> (count nums) 3) (nth nums 3) 1)]))
+
+      :else nil)))
+
+(def ^:private length-tolerance-px
+  "Lengths agree within this. Not zero because the browser reports
+   fractional device pixels (`13.3333px`) while this engine's cascade
+   coerces `<n>px` to a whole number -- but far tighter than the geometry
+   axis's 2px, because these are DECLARED values rather than accumulated
+   positions."
+  0.5)
+
+(defn- normalize-style-value
+  "Reduces one side's raw value for one property to a comparable canonical
+   form. Returns `{:v <canonical>}`, or `{:excluded <reason>}` when the
+   value is real but not comparable AT THIS LAYER -- which is a different
+   statement from `the two sides disagree` and is reported separately."
+  [kind v]
+  (let [s (str/trim (str v))]
+    (cond
+      (str/blank? s) {:excluded :absent}
+
+      (= :color kind)
+      (if-let [c (parse-color s)] {:v (mapv #(js/Math.round (* 1000 %)) c)} {:excluded :unparseable-color})
+
+      (= :length kind)
+      (cond
+        (number? v) {:v v}
+        (re-matches #"-?[0-9.]+" s) {:v (js/parseFloat s)}
+        (re-matches #"-?[0-9.]+px" s) {:v (js/parseFloat s)}
+        ;; `1em`, `50%`, `auto`, `calc(100% - 8px)`: the cascade legitimately
+        ;; holds the SPECIFIED value for these and resolves them only at
+        ;; paint time (against a font size / containing block it does not
+        ;; have here), while getComputedStyle reports the already-resolved
+        ;; used value. Comparing them would compare two different STAGES,
+        ;; not two answers to the same question.
+        :else {:excluded :non-absolute-length})
+
+      (= :weight kind)
+      (cond
+        (number? v) {:v v}
+        (re-matches #"[0-9]+" s) {:v (js/parseFloat s)}
+        (= "normal" (str/lower s)) {:v 400}
+        (= "bold" (str/lower s)) {:v 700}
+        ;; `lighter`/`bolder` are relative to the PARENT's computed weight,
+        ;; which is a resolution step the cascade does not perform.
+        :else {:excluded :relative-font-weight})
+
+      :else {:v (str/lower s)})))
+
+(defn- resolve-cascaded-style
+  "The engine's answer for one element: for every compared property, the
+   value plus WHERE it came from (:direct / :inherited / :initial -- see
+   this section's header comment). `inherited` is the map the parent hands
+   down."
+  [attrs inherited]
+  (into {}
+        (map (fn [{:keys [prop inherited? initial]}]
+               (let [k (keyword "style" (name prop))]
+                 [prop (cond
+                         (contains? attrs k) {:value (get attrs k) :source :direct}
+                         (and inherited? (contains? inherited prop)) (get inherited prop)
+                         :else {:value initial :source :initial})])))
+        computed-style-properties))
+
+(defn- inheritable-style
+  "What an element hands down to its children: its own resolved value for
+   every INHERITED property, with a `:direct` source demoted to
+   `:inherited` so a descendant's report names where the value really
+   originated rather than claiming the descendant declared it."
+  [resolved]
+  (into {}
+        (keep (fn [{:keys [prop inherited?]}]
+                (when inherited?
+                  (let [r (get resolved prop)]
+                    [prop (cond-> r (= :direct (:source r)) (assoc :source :inherited))]))))
+        computed-style-properties))
+
+(defn- engine-styles
+  "Every element under the case root, in DOCUMENT order, with its
+   cascade-resolved style.
+
+   Reads the cascaded document directly and never touches cssom.layout, so
+   this axis shares no machinery with the geometry axis: a layout bug
+   cannot show up here as a cascade bug, and vice versa. That independence
+   is also why elements are matched by tag + occurrence rather than by the
+   geometry axis's nearest-box pairing."
+  [c]
+  (let [tree (dom/tree (cascaded-document c))
+        root (->> (tree-seq map? #(filter map? (:children %)) tree)
+                  (filter #(= "root" (get-in % [:attrs :id])))
+                  first)]
+    (when root
+      (letfn [(walk [node inherited acc]
+                (reduce (fn [acc child]
+                          (if-not (and (map? child) (:tag child))
+                            acc
+                            (let [resolved (resolve-cascaded-style (:attrs child) inherited)
+                                  tag (name (:tag child))]
+                              (walk child
+                                    (inheritable-style resolved)
+                                    (conj acc {:tag tag
+                                               ;; mirror of the oracle's own probeKey()
+                                               :key (if (= "input" tag)
+                                                      (str "input:" (str/lower
+                                                                     (str (get-in child [:attrs :type] "text"))))
+                                                      tag)
+                                               :style resolved})))))
+                        acc
+                        (:children node)))]
+        (walk root (inheritable-style (resolve-cascaded-style (:attrs root) {})) [])))))
+
+(defn- computed-style-agreement
+  "Compares one case's cascade-resolved styles against the browser's
+   `getComputedStyle`, element by element and property by property.
+
+   Elements are paired by tag + occurrence order: both sides walk the same
+   document, so the Nth `<td>` on one side is the Nth `<td>` on the other.
+   Where the two sides disagree about HOW MANY elements of a tag exist
+   (htmldom and Blink both synthesise `<tbody>`, but a parser divergence
+   would show up here), the surplus is excluded as
+   `:element-count-mismatch` rather than zipped against the wrong element.
+
+   `ua` is the oracle's own measured UA baseline, used only to attribute a
+   mismatch (`:ua-default` vs `:cascade`), never to decide one."
+  [oracle-styles engine-styles ua]
+  (let [o (group-by :tag oracle-styles)
+        e (group-by :tag engine-styles)
+        tags (distinct (concat (keys o) (keys e)))
+        same? (fn [kind a b]
+                (if (= :length kind)
+                  (<= (abs (- a b)) length-tolerance-px)
+                  (= a b)))]
+    (reduce
+     (fn [acc tag]
+       (let [os (get o tag []) es (get e tag [])
+             n (min (count os) (count es))
+             surplus (- (max (count os) (count es)) n)
+             acc (cond-> acc
+                   (pos? surplus)
+                   (update :excluded conj {:reason :element-count-mismatch :tag tag
+                                           :n (* surplus (count computed-style-properties))}))]
+         (reduce
+          (fn [acc i]
+            (let [ob (nth os i) eb (nth es i)]
+              (reduce
+               (fn [acc {:keys [prop kind inherited?]}]
+                 (let [raw-o (get-in ob [:style prop])
+                       {:keys [value source]} (get-in eb [:style prop])
+                       no (normalize-style-value kind raw-o)
+                       ne (normalize-style-value kind value)]
+                   (cond
+                     (:excluded no)
+                     (update acc :excluded conj {:reason (keyword "oracle" (name (:excluded no)))
+                                                 :tag tag :prop prop :n 1 :raw raw-o})
+                     (:excluded ne)
+                     (update acc :excluded conj {:reason (keyword "engine" (name (:excluded ne)))
+                                                 :tag tag :prop prop :n 1 :raw value})
+                     (same? kind (:v no) (:v ne))
+                     (-> acc (update :agree inc) (update :total inc)
+                         (update-in [:sources source] (fnil inc 0))
+                         (update-in [:by-prop prop] (fnil (fn [[a t]] [(inc a) (inc t)]) [0 0])))
+                     :else
+                     (let [nua (normalize-style-value kind (get-in ua [(keyword (:key ob)) prop]))
+                           npa (normalize-style-value kind (get-in ob [:parent prop]))
+                           ;; A value the cascade wrote for THIS element is
+                           ;; the cascade's own answer; nothing downstream
+                           ;; can excuse it. Every other source means the
+                           ;; engine had no declaration here, which is when
+                           ;; a UA rule or a blockification could explain
+                           ;; the browser's value instead.
+                           undeclared? (not= :direct source)
+                           cause (cond
+                                   ;; The oracle's value is EXACTLY what
+                                   ;; this browser gives the bare tag, and
+                                   ;; the engine's cascade declared nothing
+                                   ;; here -- so the UA sheet explains it.
+                                   ;; This cannot tell that apart from a
+                                   ;; cascade that DROPPED a declaration
+                                   ;; which happened to restate the UA
+                                   ;; value; that is recorded in the README
+                                   ;; rather than papered over.
+                                   (and undeclared? (:v nua)
+                                        (same? kind (:v no) (:v nua)))
+                                   :ua-default
+
+                                   (and (= :display prop)
+                                        (or (contains? #{"flex" "grid" "inline-flex" "inline-grid"}
+                                                       (str/lower (str (:parentDisplay ob))))
+                                            (not (contains? #{"none" ""} (str/lower (str (:cssFloat ob)))))
+                                            (contains? #{"absolute" "fixed"}
+                                                       (str/lower (str (:position ob)))))
+                                        (contains? #{"block" "flex" "grid" "table"} (:v no)))
+                                   :blockified
+
+                                   ;; The browser's value here is simply its
+                                   ;; PARENT's -- it inherited it. Whatever
+                                   ;; produced the divergence happened at an
+                                   ;; ancestor and is already scored there;
+                                   ;; charging it again at every descendant
+                                   ;; would multiply one cause by the depth
+                                   ;; of the tree.
+                                   (and inherited? undeclared? (:v npa)
+                                        (same? kind (:v no) (:v npa)))
+                                   :ua-inherited
+
+                                   :else :cascade)]
+                       (-> acc (update :total inc)
+                           (update-in [:sources source] (fnil inc 0))
+                           (update-in [:by-prop prop] (fnil (fn [[a t]] [a (inc t)]) [0 0]))
+                           (update :diffs conj {:prop prop :tag tag :cause cause :source source
+                                                :engine (str value) :oracle (str raw-o)}))))))
+               acc
+               computed-style-properties)))
+          acc
+          (range n))))
+     {:total 0 :agree 0 :by-prop {} :sources {} :diffs [] :excluded []}
+     tags)))
+
+(defn- engine-topmost-at
+  "Which element the ENGINE says is on top at a point, by the same rule it
+   paints with: later ops cover earlier ones, so the last `:node` op whose
+   box contains the point wins.
+
+   This deliberately reads the ops in emitted order rather than re-deriving
+   a stacking context. The draw-op vector IS the engine's paint order --
+   layout-absolute-children already sorts its own children by z-index into
+   the `below`/`above` bands before emitting -- so reading it back is the
+   honest question: `given what this engine told a host to paint, what
+   would a user click?` A separate re-implementation of stacking here would
+   test my model of the engine rather than the engine.
+
+   `:hit` is read for the same reason: the engine, not the harness,
+   decides where an element answers a click. An op with `:hit` is hit at a
+   point in one of ITS rects rather than in the border box, `[]` meaning
+   `not a hit-test candidate at all` -- see cssom.layout's ns docstring
+   for the three measured cases where the two differ. Deriving that here
+   instead would, again, test my model of the engine.
+
+   `:clip` push/pop ops are tracked for the SAME reason, and not tracking
+   them was this axis's own defect. A box with a non-`visible` `overflow`
+   emits `{:draw/op :clip :clip/op :push ...}` around its content and a
+   matching `:pop` after it, and cssom.layout's own comment at the
+   emission site says in as many words that this is how the engine
+   expresses `a line that overflows a box which CLIPS is not hit outside
+   it` -- and that its `:hit` rects are deliberately left UNCLIPPED
+   because the clip is a separate op stream every real hit-tester already
+   tracks (`browser.session/hit-nodes` does). This harness did not, so it
+   read one half of the engine's answer and charged the engine for the
+   other: measured in Brave 151 on 2026-08-06, a 300px `inline-block`
+   inside a `width: 200px; overflow: auto` box is NOT hit at x=240, and
+   the same box at `overflow: visible` IS. `hidden`, `scroll`, `clip` and
+   `overflow-x: auto` all clip; only `visible` does not.
+
+   `:pointer-events` and `:visibility` are read for the SAME reason, and
+   not reading them was this axis's own defect for its whole life. The
+   engine puts both keys on every `:node` op precisely so that a
+   hit-tester can skip the op (`style-passthrough`'s docstring says so),
+   and BOTH of the engine's real hit-testers already do:
+   `browser.session/node-at` and dom-gpu's `retained` host each drop an op
+   whose `:pointer-events` is `none` or whose `:visibility` is
+   `hidden`/`collapse` before taking the topmost. This harness did not, so
+   it was asking a question no consumer of the engine asks, and it charged
+   the engine for two behaviours the engine has right: measured on
+   `:stacking/pointer-events-none-falls-through` and
+   `:stacking/visibility-hidden-is-not-hit`, 40 sample points where Brave
+   answers the box UNDERNEATH the transparent one and the engine's own
+   hosts would too. Reading the two keys is not re-deriving stacking here
+   -- it is reading one more field of the answer the engine already
+   emitted, exactly like `:hit`."
+  [ops wrapper-ids x y]
+  (let [;; Half-open on the far edges, like every other rectangle test
+        ;; here -- see the note in the filter below, which is where that
+        ;; was measured.
+        inside? (fn [r] (and (<= (:x r) x) (< x (+ (:x r) (:w r)))
+                             (<= (:y r) y) (< y (+ (:y r) (:h r)))))
+        ;; Both sides wrap the case, and neither wrapper is an answer: the
+        ;; browser page puts the markup in a `.kotoba-case` div and the
+        ;; oracle reports null when a point lands on it, while
+        ;; `cascaded-document` wraps the same markup in `<div id="root">`
+        ;; to carry the container's declarations. Scoring one against the
+        ;; other made every point that lands on bare text -- text nodes are
+        ;; not elements, so the browser returns the containing element,
+        ;; which for a case's own top-level text IS the wrapper -- read as
+        ;; `none -> div`. That single asymmetry was 2246 of 2523
+        ;; disagreements on the first run.
+        ;;
+        ;; `wrapper-ids` arrives from wrapper-op-ids rather than being
+        ;; taken as the first two node ops here -- see there for the
+        ;; measured reordering that broke the positional version.
+        ]
+    ;; A fold rather than a filter, because the clip state is ORDER-
+    ;; dependent: a `:node` op is a candidate only while every clip pushed
+    ;; before it and not yet popped still contains the point. The rest of
+    ;; the test is unchanged -- the `last` candidate still wins, which is
+    ;; the paint order read backwards.
+    ;;
+    ;; Half-open, like every other rectangle test here: a box spanning
+    ;; [0,400) does not contain x=400. With the far edges inclusive, every
+    ;; sample point that landed exactly on a box's right or bottom edge
+    ;; was scored as a disagreement -- the browser reports the case
+    ;; wrapper there (i.e. `none`) and the engine claimed the box.
+    ;; Measured on :page/header-nav-main, whose own div is 400px wide
+    ;; inside the 800px case container: all five of that case's mismatches
+    ;; were the x=400 column, and its geometry is 10/10.
+    ;;
+    ;; The same inclusive-edge mistake was found and fixed in
+    ;; `engine-lines`' replaced-box test earlier the same day; this is the
+    ;; paint-order axis's copy of it.
+    (->> ops
+         (reduce
+          (fn [{:keys [clips] :as acc} op]
+            (case (:draw/op op)
+              ;; an unmatched `:pop` cannot arise from layout-node, which
+              ;; emits the pair together -- guarded anyway so a reordering
+              ;; pass upstream can never make this throw
+              :clip (if (= :push (:clip/op op))
+                      (update acc :clips conj op)
+                      (cond-> acc (seq clips) (update :clips pop)))
+              :node (if (and (not= "none" (:pointer-events op))
+                             (not (contains? #{"hidden" "collapse"} (:visibility op)))
+                             (if-let [hit (:hit op)]
+                               (some inside? hit)
+                               (inside? op))
+                             (not= :document (:tag op))
+                             (not (contains? wrapper-ids (:id op)))
+                             (every? inside? clips))
+                      (assoc acc :best op)
+                      acc)
+              acc))
+          {:clips [] :best nil})
+         :best
+         (#(when % [(:tag %) (let [c (:class %)] (when (seq c) c))])))))
+
+(defn- hit-label
+  "How a hit prints and compares: the tag, plus the author's `class` when
+   there is one. `[:div \"a\"]` reads as `div.a`."
+  [[tag cls]]
+  (if cls (str (name tag) "." cls) (name tag)))
+
+(defn- paint-order-agreement
+  [oracle-hits ops wrapper-ids]
+  (reduce (fn [acc {:keys [x y tag cls]}]
+            (let [mine (engine-topmost-at ops wrapper-ids x y)
+                  want (when tag [(keyword tag) cls])]
+              (if (= want mine)
+                (update acc :agree inc)
+                (-> acc
+                    (update :diffs conj {:x (long x) :y (long y)
+                                         :oracle (if want (hit-label want) "none")
+                                         :engine (if mine (hit-label mine) "none")})))))
+          {:agree 0 :total (count oracle-hits) :diffs []}
+          oracle-hits))
+
+(defn- engine-render
+  "All three axes from one case: the line structure and the element boxes
+   (both from cssom.layout), and the cascade-resolved style of every
+   element (from cssom.core alone)."
+  [c width host]
+  (let [ops (engine-ops c width host)
+        wrapper-ids (wrapper-op-ids c)]
+    {:lines (engine-lines c width host)
+     :boxes (engine-boxes ops wrapper-ids)
+     ;; the harness's own two boxes, by identity -- see wrapper-op-ids
+     :wrapper-ids wrapper-ids
+     ;; the raw op vector, kept for the paint-order axis: `engine-boxes`
+     ;; distils ops into rects and loses the ORDER, which is the whole
+     ;; subject here.
+     :boxes-ops ops
+     :styles (engine-styles c)}))
+
+(defn- compare-case [oracle-data ua width host c]
+  (let [oracle-words (:words oracle-data)
+        lines (cluster-lines oracle-words)
+        rendered (try (engine-render c width host)
+                      (catch :default e {:error (ex-message e)}))
+        mine (if (:error rendered) rendered (:lines rendered))
+        geo (when-not (:error rendered)
+              (geometry-agreement (:boxes oracle-data) (:boxes rendered)))
+        paint (when-not (:error rendered)
+                (paint-order-agreement (:hits oracle-data) (:boxes-ops rendered)
+                                       (:wrapper-ids rendered)))
+        sty (when-not (:error rendered)
+              (-> (computed-style-agreement (:styles oracle-data) (:styles rendered) ua)
+                  (update :diffs (fn [ds] (mapv #(assoc % :id (:id c)) ds)))
+                  (update :excluded (fn [xs] (mapv #(assoc % :id (:id c)) xs)))))]
+    (cond
+      (map? mine)
+      {:id (:id c) :group (:group c) :status :error :detail (:error mine)}
+
+      ;; Generated content (::before/::after, list markers) is NOT in the
+      ;; DOM text the oracle walks -- a real browser paints it from the box
+      ;; tree, and no Range can reach it. cssom.layout synthesizes it as
+      ;; real text, so the two sides are structurally incomparable here
+      ;; through no fault of either. Marked in the corpus, excluded from
+      ;; the score, and printed, rather than silently counted as a failure.
+      (:oracle/blind c)
+      {:id (:id c) :group (:group c) :status :unscorable :geo geo :sty sty :paint paint
+       :oracle-boxes (:boxes oracle-data) :engine-boxes (:boxes rendered)
+       :engine-ops (:boxes-ops rendered) :oracle-hits (:hits oracle-data)
+       :detail "oracle cannot see generated content" :expected lines :actual mine}
+
+      (= lines mine)
+      {:id (:id c) :group (:group c) :status :pass :geo geo :sty sty :paint paint
+       :oracle-boxes (:boxes oracle-data) :engine-boxes (:boxes rendered)
+       :engine-ops (:boxes-ops rendered) :oracle-hits (:hits oracle-data)}
+
+      ;; The boxes travel with EVERY outcome, not just :pass. They used to
+      ;; be attached only on :pass, which meant `--debug-geometry` printed
+      ;; nothing for exactly the cases anyone would run it on -- a failing
+      ;; case and a blind case both came back with no boxes to look at.
+      :else
+      {:id (:id c) :group (:group c) :status :fail :geo geo :sty sty :paint paint
+       :oracle-boxes (:boxes oracle-data) :engine-boxes (:boxes rendered)
+       :engine-ops (:boxes-ops rendered) :oracle-hits (:hits oracle-data)
+       :expected lines :actual mine})))
+
+;; ---- report ----
+
+(defn- pct [n d] (if (zero? d) 0 (js/Math.round (* 100 (/ n d)))))
+
+;; nbb/ClojureScript has no clojure.core/format.
+(defn- pad-right [s n] (let [s (str s)] (str s (apply str (repeat (max 0 (- n (count s))) " ")))))
+(defn- pad-left [s n] (let [s (str s)] (str (apply str (repeat (max 0 (- n (count s))) " ")) s)))
+
+(let [{:keys [browser width ledger only] :as opts} (parse-args *command-line-args*)
+      candidates (find-browsers browser)
+      cases (cond->> (edn/read-string (fs/readFileSync "conformance/cases.edn" "utf8"))
+              only (filter #(str/includes? (str (:id %)) only)))
+      ;; A per-run directory, not a fixed name in tmpdir. Two runs of this
+      ;; harness overlap routinely now that agents run them in parallel, and
+      ;; a shared path means run B overwrites the page run A is about to
+      ;; measure -- so A reads B's corpus through A's case indices and
+      ;; scores near-zero on everything. Observed exactly that on
+      ;; 2026-08-04: 3/190 lines and 0/750 boxes, the box count coming from
+      ;; a corpus that run had never seen. A harness whose numbers depend on
+      ;; who else is running is not measuring anything.
+      page (path/join (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-conf-page-"))
+                      "corpus.html")
+      _ (fs/writeFileSync page (corpus-page cases width))
+      [browser transport oracle]
+      (loop [[b & more] candidates failures []]
+        (if (nil? b)
+          (throw (ex-info "no candidate browser produced a measurement block"
+                          {:tried failures}))
+          (let [r (try (let [{:keys [transport data]} (run-browser! b page)]
+                         [b transport data])
+                       (catch :default e (println (str "oracle unusable: " b " -- " (ex-message e))) nil))]
+            (or r (recur more (conj failures b))))))
+      _ (println (str "\noracle:  " browser " (" (name transport) ")"
+                      "\nwidth:   " width "px\ncases:   " (count cases) "\n"))
+      advances (:__advances__ oracle)
+      advance-for (fn [face]
+                    (fn [ch] (get-in advances [face (keyword (str (.charCodeAt ch 0)))] 8.4)))
+      ;; Everything this harness plays the part of a HOST for travels
+      ;; together: the per-character advances, the per-face ascent/descent,
+      ;; and the decoded size of each image resource -- three facts about
+      ;; fonts and bytes that a pure layout engine cannot derive and asks
+      ;; for through `:measure-text`/`:font-metrics`/`:image-size`.
+      images (into {} (map (fn [[src w h complete]]
+                             [src {:w w :h h :complete complete}])
+                           (:__images__ oracle)))
+      _ (let [pending (remove :complete (vals images))]
+          (when (seq pending)
+            (println (str "WARNING: " (count pending) " image(s) had not finished loading when"
+                          " the oracle measured; their size reads as 0 and every <img> using"
+                          " them will lay out as an unresolved resource on BOTH sides."))))
+      host {:normal (advance-for :normal)
+              :bold (advance-for :bold)
+              :italic (advance-for :italic)
+              :control (advance-for :control)
+              :control-bold (advance-for :control-bold)
+              :control-italic (advance-for :control-italic)
+              :metrics (:__metrics__ oracle)
+              :images images}
+      ;; ---- cases that cannot share a page with the others --------------
+      ;;
+      ;; A `position: fixed` box is positioned against the VIEWPORT, so on a
+      ;; page holding every case its box in case-relative coordinates is
+      ;; just "how far down the page this case happens to sit" -- measured
+      ;; -47.84 for `:position/fixed-leaves-flow`, 0 if that case were
+      ;; first, and a different number the moment a case is inserted above
+      ;; it. Two rounds recorded that as a limit of this harness.
+      ;;
+      ;; It is not a limit, it is a page-layout choice: a case marked
+      ;; `:oracle/isolated true` gets its OWN page, where the case IS at the
+      ;; viewport origin and the browser's answer is stable and meaningful.
+      ;; One extra browser run per isolated case (~3-6s over CDP), so this
+      ;; is for cases that genuinely need it, not a default.
+      isolated-oracle
+      (reduce (fn [acc [i c]]
+                (if (:oracle/isolated c)
+                  (let [f (path/join (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-conf-iso-"))
+                                     "case.html")]
+                    (fs/writeFileSync f (corpus-page [c] width))
+                    (println (str "isolated: " (:id c) " measured on its own page"))
+                    ;; the case is index 0 of its own page; re-key it to the
+                    ;; index it has in the real corpus
+                    (assoc acc (keyword (str "case-" i))
+                           (get (:data (run-browser! browser f)) :case-0)))
+                  acc))
+              {}
+              (map-indexed vector cases))
+      oracle (merge oracle isolated-oracle)
+      _ (println (str "metrics: per-character advance table measured in the oracle ("
+                      (count (:normal advances)) " chars x normal/bold/italic)\n"))
+      ua (:__ua__ oracle)
+      _ (println (str "UA base: user-agent baseline probed in the oracle for "
+                      (count ua) " tags (bare element, no author CSS)\n"))
+      viewport (:__viewport__ oracle)
+      scheme (:__scheme__ oracle)
+      _ (println (str "viewport: " (if viewport
+                                     (str (first viewport) "x" (second viewport)
+                                          "px, " (or scheme "?") " scheme -- measured in the"
+                                          " oracle and used for @media on BOTH sides")
+                                     "not reported; the engine's own default stands")
+                      "\n"))
+      results (binding [*oracle-viewport-width* (first viewport)
+                        *oracle-color-scheme* scheme]
+                (vec (map-indexed (fn [i c]
+                                    (compare-case (get oracle (keyword (str "case-" i)) []) ua width host c))
+                                  cases)))
+      scorable (remove #(= :unscorable (:status %)) results)
+      passed (filter #(= :pass (:status %)) scorable)
+      by-group (->> scorable
+                    (group-by :group)
+                    (sort-by key)
+                    (mapv (fn [[g rs]]
+                            [g (count (filter #(= :pass (:status %)) rs)) (count rs)])))]
+  ;; `--dump-ops <file>` writes EVERY case's `:node` ops, in emitted order,
+  ;; as one line per op under its case id -- a plain-text file made to be
+  ;; `diff`ed between two commits.
+  ;;
+  ;; The scoreboard cannot answer "did this change break anything": it is
+  ;; four sums over 501 cases, and a sum hides an exchange. This corpus has
+  ;; already been bitten by one -- a 5/5 -> 0/5 regression on the table
+  ;; group went unnoticed in a round where three other cases improved by as
+  ;; much. Per-case ops are the granularity at which an exchange is
+  ;; visible, and the ORDER is part of it (that order IS the paint order,
+  ;; and read backwards the hit-test order), which is why this prints ops
+  ;; rather than the sorted box list the geometry axis compares.
+  ;;
+  ;; Unscorable and blind cases are dumped too: they still lay out, and a
+  ;; change that moves their boxes is still a change.
+  (when-let [f (:dump-ops (parse-args *command-line-args*))]
+    (fs/writeFileSync
+     f
+     (str/join
+      "\n"
+      (for [r results
+            line (cons (str "CASE " (:id r))
+                       (if (:engine-ops r)
+                         (for [op (filter #(= :node (:draw/op %)) (:engine-ops r))]
+                           (str "  " (pad-right (name (:tag op)) 10)
+                                (pad-left (:x op) 9) (pad-left (:y op) 9)
+                                (pad-left (:w op) 9) (pad-left (:h op) 9)
+                                (when-let [hit (:hit op)]
+                                  (str "  hit=" (pr-str (mapv (juxt :x :y :w :h) hit))))))
+                         [(str "  <no ops: " (name (:status r))
+                               (some->> (:detail r) (str " -- ")) ">")]))]
+        line))
+     "utf8")
+    (println (str "ops dumped: " f "\n")))
+  ;; `--dump-style <file>` is `--dump-ops` for the CASCADE, and it exists
+  ;; because the ops dump is blind to exactly the changes a cascade round
+  ;; makes. Round forty-nine's own note: six nesting cases changed and
+  ;; "their divergence is a colour, which the ops dump cannot see". A
+  ;; sort-tuple change is on the path of every declaration of every case,
+  ;; and the four sums it is scored by hide an exchange as readily as the
+  ;; geometry sums did the 5/5 -> 0/5 table regression that motivated
+  ;; `--dump-ops`.
+  ;;
+  ;; One line per compared value that DISAGREES, under its case id, in the
+  ;; axis's own order -- so a case that stops or starts diverging on any
+  ;; property shows up as an added or removed line, in both directions.
+  ;; Cases with no disagreement are listed with a count, so a case that
+  ;; goes from "scored 40 values" to "scored none" is visible too.
+  (when-let [f (:dump-style (parse-args *command-line-args*))]
+    (fs/writeFileSync
+     f
+     (str/join
+      "\n"
+      (for [r results
+            line (cons (str "CASE " (:id r)
+                            (if-let [s (:sty r)]
+                              (str "  " (:agree s) "/" (:total s))
+                              "  <no styles>"))
+                       (for [d (:diffs (:sty r))]
+                         (str "  " (pad-right (name (:prop d)) 18)
+                              (pad-right (str (:tag d)) 10)
+                              (pad-right (name (:cause d)) 14)
+                              (:engine d) " -> " (:oracle d))))]
+        line))
+     "utf8")
+    (println (str "style dumped: " f "\n")))
+  (when (:debug-geometry (parse-args *command-line-args*))
+    (doseq [r results :when (seq (:oracle-boxes r))]
+      (println "GEO" (:id r))
+      ;; `boxless` prints in place of the coordinates rather than beside
+      ;; them: the numbers there are a viewport-origin 0,0,0,0 with the
+      ;; case root's offset taken off it, and showing them invites the
+      ;; reader to chase a delta that is not one -- see
+      ;; geometry-agreement.
+      (println "  oracle:" (pr-str (mapv #(if (:boxless %)
+                                            [(:tag %) :boxless]
+                                            ((juxt :tag :x :y :w :h) %))
+                                         (:oracle-boxes r))))
+      (println "  engine:" (pr-str (mapv (juxt :tag :x :y :w :h) (:engine-boxes r))))))
+  ;; `--debug-paint` prints, for every case with a paint-order
+  ;; disagreement, the two things that produce one: the engine's `:node`
+  ;; ops IN EMITTED ORDER (which is the paint order, and therefore the
+  ;; hit-test order read backwards) and every sampled point with what each
+  ;; side said. Without the ORDER a paint-order residual is unreadable --
+  ;; the boxes it is made of usually all agree, which is the axis's whole
+  ;; point.
+  (when (:debug-paint (parse-args *command-line-args*))
+    (doseq [r results :when (seq (:diffs (:paint r)))]
+      (println "PAINT" (:id r))
+      (println "  ops:" (pr-str (mapv (juxt :tag :x :y :w :h)
+                                      (filter #(= :node (:draw/op %)) (:engine-ops r)))))
+      (doseq [{:keys [x y oracle engine]} (:diffs (:paint r))]
+        (println (str "  (" x "," y ") oracle " oracle " engine " engine)))))
+  (doseq [r results]
+    (println (str (pad-right (name (:status r)) 16)
+                  (pad-right (str (:id r)) 48)
+                  (if (= :pass (:status r))
+                    ""
+                    (str "want " (pr-str (:expected r)) " got " (pr-str (:actual r))
+                         (when (:detail r) (str " error: " (:detail r))))))))
+  (println)
+  (doseq [[g p t] by-group]
+    (println (str "  " (pad-right (name g) 20) (pad-left p 2) "/" (pad-left t 2)
+                  (pad-left (pct p t) 5) "%")))
+  (println)
+  (let [geos (keep :geo results)
+        boxes-total (reduce + 0 (map :total geos))
+        boxes-agree (reduce + 0 (map :agree geos))
+        clean (count (filter #(and (:geo %) (pos? (:total (:geo %)))
+                                   (= (:total (:geo %)) (:agree (:geo %))))
+                             results))
+        with-boxes (count (filter #(pos? (:total (:geo % {:total 0}))) results))]
+    (println (str "GEOMETRY  " boxes-agree "/" boxes-total " element boxes agree within "
+                  geometry-tolerance-px "px  (" (pct boxes-agree boxes-total) "%)"))
+    (println (str "          " clean "/" with-boxes " cases with every box in agreement"))
+    (let [per-tag (reduce (fn [acc g]
+                            (reduce (fn [acc [tag [a t]]]
+                                      (update acc tag (fnil (fn [[a0 t0]] [(+ a0 a) (+ t0 t)]) [0 0])))
+                                    acc (:by-tag g)))
+                          {} geos)]
+      (let [all-deltas (mapcat :deltas geos)
+            by-dim (->> all-deltas
+                        (group-by (juxt :tag :dim))
+                        (map (fn [[[tag dim] ds]]
+                               [tag dim (count ds)
+                                (let [sorted (sort (map :delta ds))]
+                                  (nth sorted (quot (count sorted) 2)))]))
+                        (sort-by (fn [[_ _ n _]] (- n))))]
+        (println "          worst (tag, dimension, count, median delta engine-oracle):")
+        (doseq [[tag dim n med] (take 12 by-dim)]
+          (let [cases (->> results
+                           (filter (fn [r] (some #(and (= tag (:tag %)) (= dim (:dim %)))
+                                                 (:deltas (:geo r)))))
+                           (map :id)
+                           (take 3))]
+            (println (str "            " (pad-right tag 8) (pad-right (name dim) 3)
+                          (pad-left n 4) "  " (pad-left (if (pos? med) (str "+" med) med) 8)
+                          "   " (str/join ", " (map str cases)))))))
+      (println "          worst tags (agreeing/total):")
+      (doseq [[tag [a t]] (->> per-tag (sort-by (fn [[_ [a t]]] (- a t))) (take 10))
+              :when (< a t)]
+        (println (str "            " (pad-right tag 12) a "/" t))))
+    ;; The same discipline the computed-style axis already keeps: what was
+    ;; taken out of the denominator, why, and where -- so an exclusion can
+    ;; never quietly flatter the number above it.
+    (let [ex (->> results
+                  (mapcat (fn [r] (map #(assoc % :id (:id r)) (:excluded (:geo r)))))
+                  (group-by :reason))]
+      (when (seq ex)
+        (println (str "          EXCLUDED from comparison ("
+                      (reduce + 0 (map :n (mapcat val ex))) " boxes), never silently:"))
+        (doseq [[reason xs] ex]
+          (println (str "            " (pad-right (name reason) 36)
+                        (pad-left (reduce + 0 (map :n xs)) 3) "  "
+                        (str/join " " (map #(str (:tag %) "(" (:n %) ")") (take 4 xs)))
+                        "   " (str/join ", " (map str (distinct (take 2 (map :id xs)))))))))
+    (println)))
+
+  ;; ---- the paint-order axis ----
+  (let [paints (keep :paint results)
+        total (reduce + 0 (map :total paints))
+        agree (reduce + 0 (map :agree paints))
+        diffs (mapcat (fn [r] (map #(assoc % :id (:id r)) (:diffs (:paint r)))) results)
+        by-pair (->> diffs
+                     (map (juxt :oracle :engine))
+                     frequencies
+                     (sort-by (comp - val)))]
+    (println (str "PAINT ORDER  " agree "/" total " sample points hit the same element  ("
+                  (pct agree total) "%)"))
+    (println (str "             " (count (filter #(and (:paint %) (pos? (:total (:paint %)))
+                                                       (= (:total (:paint %)) (:agree (:paint %))))
+                                                 results))
+                  "/" (count (filter #(pos? (:total (:paint % {:total 0}))) results))
+                  " cases where every sampled point agrees"))
+    (when (seq by-pair)
+      (println "             worst (oracle sees -> engine sees, count, cases):")
+      (doseq [[[o e] n] (take 8 by-pair)]
+        (println (str "               " (pad-right (str (name o) " -> " (name e)) 28)
+                      (pad-left n 4) "   "
+                      (str/join ", " (map str (distinct (take 3 (map :id (filter #(and (= o (:oracle %)) (= e (:engine %))) diffs))))))))))
+    (println))
+
+  ;; ---- the computed-style (cascade) axis ----
+  (let [stys (keep :sty results)
+        total (reduce + 0 (map :total stys))
+        agree (reduce + 0 (map :agree stys))
+        clean (count (filter #(and (:sty %) (pos? (:total (:sty %)))
+                                   (= (:total (:sty %)) (:agree (:sty %))))
+                             results))
+        with-styles (count (filter #(pos? (:total (:sty % {:total 0}))) results))
+        diffs (mapcat :diffs stys)
+        excluded (mapcat :excluded stys)
+        sources (apply merge-with + {} (map :sources stys))
+        by-prop (reduce (fn [acc s]
+                          (reduce (fn [acc [p [a t]]]
+                                    (update acc p (fnil (fn [[a0 t0]] [(+ a0 a) (+ t0 t)]) [0 0])))
+                                  acc (:by-prop s)))
+                        {} stys)
+        by-cause (frequencies (map :cause diffs))]
+    (println (str "COMPUTED STYLE  " agree "/" total " cascade-resolved values agree  ("
+                  (pct agree total) "%)"))
+    (println (str "                " clean "/" with-styles " cases with every compared value in agreement"))
+    ;; The actionable count: how many cases have no mismatch this axis can
+    ;; attribute to the CASCADE itself. The headline number above is
+    ;; dominated by the UA stylesheet living one namespace downstream, which
+    ;; is one architectural fact repeated thousands of times rather than
+    ;; thousands of bugs -- and burying that would make the axis unreadable.
+    (println (str "                "
+                  (count (filter (fn [r] (and (:sty r) (pos? (:total (:sty r)))
+                                              (not-any? #(= :cascade (:cause %)) (:diffs (:sty r)))))
+                                 results))
+                  "/" with-styles " cases with no CASCADE-attributed mismatch"))
+    (println (str "                mismatch cause: "
+                  (str/join ", " (map (fn [[c n]] (str (name c) " " n))
+                                      (sort-by (fn [[_ n]] (- n)) by-cause)))))
+    (println (str "                engine-side source: "
+                  (str/join ", " (map (fn [[s n]] (str (name s) " " n))
+                                      (sort-by (fn [[_ n]] (- n)) sources)))))
+    (println "                per property (agreeing/compared):")
+    (doseq [{:keys [prop]} computed-style-properties
+            :let [[a t] (get by-prop prop [0 0])]]
+      (println (str "                  " (pad-right (name prop) 16) (pad-left a 5) "/" (pad-left t 5)
+                    (pad-left (pct a t) 5) "%")))
+    (let [row (fn [[[prop tag engine oracle cause] ds]]
+                (println (str "                  " (pad-right (name prop) 15) (pad-right tag 8)
+                              (pad-left (count ds) 4) "  "
+                              (pad-right (str engine " -> " oracle) 34)
+                              (pad-right (name cause) 12)
+                              (str/join ", " (map (comp str :id) (take 2 ds))))))
+          grouped (fn [ds] (->> ds
+                                (group-by (juxt :prop :tag :engine :oracle :cause))
+                                (sort-by (fn [[_ g]] (- (count g))))))]
+      (println "                worst (property, tag, count, engine -> oracle, cause):")
+      (doseq [g (take 14 (grouped diffs))] (row g))
+      ;; The residual that names BUGS rather than the known architectural
+      ;; split, listed separately because it is otherwise invisible under
+      ;; the UA traffic.
+      (let [cs (filter #(= :cascade (:cause %)) diffs)]
+        (println (str "                cascade-attributed residual (" (count cs) " values):"))
+        (doseq [g (take (if (:debug-style opts) 200 12) (grouped cs))] (row g))))
+    (println (str "                EXCLUDED from comparison (" (reduce + 0 (map :n excluded))
+                  " values), never silently:"))
+    (doseq [[reason xs] (->> excluded
+                             (group-by :reason)
+                             (sort-by (fn [[_ xs]] (- (reduce + 0 (map :n xs))))))]
+      (println (str "                  " (pad-right (name reason) 34)
+                    (pad-left (reduce + 0 (map :n xs)) 5) "  "
+                    (str/join " " (->> xs
+                                       (map #(str (some-> (:prop %) name)
+                                                  (when (:tag %) (str "/" (:tag %)))))
+                                       frequencies
+                                       (sort-by (fn [[_ n]] (- n)))
+                                       (take 4)
+                                       (map (fn [[k n]] (str k "(" n ")")))))
+                    "   " (str/join ", " (map str (distinct (take 3 (map :id xs))))))))
+    (println))
+  (println (str "TOTAL " (count passed) "/" (count scorable) " = " (pct (count passed) (count scorable)) "%"
+                (let [u (count (filter #(= :unscorable (:status %)) results))]
+                  (when (pos? u) (str "   (" u " unscorable, excluded)")))))
+
+  ;; An axis that compared NOTHING is not an axis that scored zero, and the
+  ;; harness used to report it as `0/0 ... (0%)` in the same shape as a real
+  ;; measurement. Measured 2026-08-04: two runs of the same checkout minutes
+  ;; apart printed `COMPUTED STYLE 0/0 (0%)` and `8501/9982 (85%)` -- the
+  ;; oracle had returned no styles once, and only the implausibility of the
+  ;; number gave it away. A silent zero is worse than a crash: it goes into
+  ;; the ledger as a data point and reads as a regression forever after.
+  (let [unmeasured (cond-> []
+                     (zero? (reduce + 0 (map :total (keep :geo results))))
+                     (conj "GEOMETRY")
+                     (zero? (reduce + 0 (map :total (keep :sty results))))
+                     (conj "COMPUTED STYLE")
+                     (zero? (count scorable))
+                     (conj "LINE STRUCTURE"))]
+    (when (seq unmeasured)
+      (println (str "\nUNMEASURED: " (str/join ", " unmeasured)
+                    " compared zero values across " (count cases) " cases."
+                    (if (zero? (count cases))
+                      "\n  No case matched the filter -- widen --only."
+                      (str "\n  This is NOT a score of 0% -- the oracle returned nothing for that axis."
+                           "\n  Oracle: " browser " (" (name transport) ")."))
+                    "\n  Nothing was appended to the ledger; re-run before trusting any number above."))
+      (js/process.exit 3)))
+  (when ledger
+    (let [entry {:conformance/oracle (last (str/split browser #"/"))
+                 :conformance/width width
+                 :conformance/total (count scorable)
+                 :conformance/passed (count passed)
+                 :conformance/pct (pct (count passed) (count scorable))
+                 :conformance/unscorable (vec (sort (map :id (filter #(= :unscorable (:status %)) results))))
+                 :conformance/by-group (into {} (map (fn [[g p t]] [g [p t]]) by-group))
+                 :conformance/failing (vec (sort (map :id (remove #(= :pass (:status %)) scorable))))
+                 :conformance/geometry-boxes-agree (reduce + 0 (map :agree (keep :geo results)))
+                 :conformance/geometry-boxes-total (reduce + 0 (map :total (keep :geo results)))
+                 :conformance/computed-style-agree (reduce + 0 (map :agree (keep :sty results)))
+                 :conformance/computed-style-total (reduce + 0 (map :total (keep :sty results)))
+                 :conformance/computed-style-excluded (reduce + 0 (map :n (mapcat :excluded (keep :sty results))))}]
+      (fs/appendFileSync ledger (str (pr-str entry) "\n"))
+      (println (str "\nappended to " ledger)))))

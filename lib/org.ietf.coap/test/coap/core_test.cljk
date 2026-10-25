@@ -1,0 +1,236 @@
+(ns coap.core-test
+  "Where a value is drawn directly from the RFC 7252/7959 text — the Code
+  byte arithmetic (§12.1), the Option nibble-extension boundaries (§3.1),
+  the Block SZX-to-byte-count table (RFC 7959 §2.2) — the test comment
+  cites the section. RFC 7252 does not print a byte-for-byte worked
+  message example in its own text the way MQTT-3.1.1 prints a size table
+  for its Variable Byte Integer, so full message byte dumps here are
+  constructed from those same field rules rather than lifted from the
+  spec, and are marked `constructed, not a published spec vector` at the
+  point they're used, per this workspace's honesty requirement for test
+  data."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [coap.code :as code]
+            [coap.options :as opt]
+            [coap.message :as msg]
+            [coap.block :as block]))
+
+;; ── Code (RFC 7252 §12.1) ────────────────────────────────────────────────
+
+(deftest code-table-round-trip
+  ;; Every class.detail this table names, both directions, matching the
+  ;; published arithmetic (class << 5) | detail.
+  (doseq [[[c d] nm] code/code-names]
+    (is (= (bit-or (bit-shift-left c 5) d) (:byte (code/encode nm))) nm)
+    (is (= nm (:name (code/decode (:byte (code/encode nm))))) nm)))
+
+(deftest code-published-values
+  ;; RFC 7252 §12.1 Table 1/2: the specific byte values as usually quoted.
+  (is (= 0x01 (:byte (code/encode :get))))
+  (is (= 0x02 (:byte (code/encode :post))))
+  (is (= 0x03 (:byte (code/encode :put))))
+  (is (= 0x04 (:byte (code/encode :delete))))
+  (is (= 0x41 (:byte (code/encode :created))))
+  (is (= 0x45 (:byte (code/encode :content))))
+  (is (= 0x84 (:byte (code/encode :not-found))))
+  (is (= 0xA0 (:byte (code/encode :internal-server-error))))
+  (is (= 0x00 (:byte (code/encode :empty)))))
+
+(deftest code-unknown-name
+  (is (= :unknown-code-name (:reason (code/encode :not-a-real-code)))))
+
+(deftest code-unknown-byte-decodes-to-nil-name
+  ;; RFC 7252 §5.9 reserves unassigned class.detail values for future
+  ;; codes rather than treating them as ill-formed; class/detail must
+  ;; still come back correctly.
+  (let [d (code/decode 0x1F)] ; 0.31, unassigned
+    (is (= :ok (:status d)))
+    (is (nil? (:name d)))
+    (is (= [0 31] [(:class d) (:detail d)]))))
+
+;; ── option nibble/extension arithmetic (RFC 7252 §3.1) ──────────────────
+
+(deftest nibble-boundaries
+  ;; The exact boundaries the spec's arithmetic produces.
+  (doseq [[n nib ext] [[0 0 []] [12 12 []]
+                       [13 13 [0]] [268 13 [255]]
+                       [269 14 [0 0]] [65804 14 [255 255]]]]
+    (let [e (opt/nibble-encode n)]
+      (is (= nib (:nibble e)) n)
+      (is (= ext (:ext e)) n))))
+
+(deftest nibble-round-trip
+  (doseq [n (concat (range 0 300) [268 269 65803 65804])]
+    (let [e (opt/nibble-encode n)
+          bs (:ext e)
+          d (opt/nibble-decode (:nibble e) bs 0)]
+      (is (= n (:value d)) n))))
+
+(deftest nibble-value-too-large
+  (is (= :value-too-large (:reason (opt/nibble-encode 65805)))))
+
+;; ── options section ──────────────────────────────────────────────────────
+
+(deftest options-encode-sorts-and-deltas
+  ;; constructed, not a published spec vector: content-format (12, value
+  ;; [0]) then two uri-path segments (11, repeated — delta 0 the second
+  ;; time), given here out of order to prove encode-options sorts them.
+  (let [e (msg/encode-options [[:content-format [0]]
+                               [:uri-path (msg/ascii->bytes "a")]
+                               [:uri-path (msg/ascii->bytes "b")]])]
+    (is (= :ok (:status e)))
+    ;; first option after sort: uri-path "a" (number 11, delta 11 from 0)
+    ;; -> byte 0xB1 ('B' = delta 11 length 1), then "a" (0x61)
+    (is (= [0xB1 0x61] (subvec (:bytes e) 0 2)))))
+
+(deftest options-round-trip
+  (let [opts [[:uri-path (msg/ascii->bytes "sensors")]
+             [:uri-path (msg/ascii->bytes "temperature")]
+             [:content-format [0]]
+             [:etag [1 2 3 4]]]
+        e (msg/encode-options opts)
+        d (msg/decode-options (:bytes e) 0)]
+    (is (= :ok (:status d)))
+    ;; sorted by number: etag(4), uri-path(11)x2, content-format(12)
+    (is (= [4 11 11 12] (mapv first (:options d))))
+    (is (= (msg/ascii->bytes "sensors") (second (nth (:options d) 1))))
+    (is (= (msg/ascii->bytes "temperature") (second (nth (:options d) 2))))))
+
+(deftest options-unknown-name
+  (is (= :unknown-option-name (:reason (msg/encode-options [[:not-a-real-option []]])))))
+
+(deftest options-reserved-nibble
+  ;; A byte with the delta nibble = 15 but not the payload marker (0xF0,
+  ;; not 0xFF) is reserved (RFC 7252 §3.1).
+  (is (= :reserved-option-nibble (:reason (msg/decode-options [0xF0] 0)))))
+
+(deftest options-payload-marker-with-no-payload
+  ;; RFC 7252 §3.1: "the presence of a marker followed by a zero-length
+  ;; payload MUST be processed as a message format error."
+  (is (= :payload-marker-with-no-payload (:reason (msg/decode-options [0xFF] 0)))))
+
+;; ── whole message ──────────────────────────────────────────────────────
+
+(deftest empty-message-round-trip
+  ;; RFC 7252 §4.2/§4.3: an Empty CON is used as a CoAP ping. Code 0x00,
+  ;; Token Length 0, no options, no payload.
+  (let [e (msg/encode {:type :con :code :empty :message-id 0x1234})]
+    (is (= :ok (:status e)))
+    (is (= [0x40 0x00 0x12 0x34] (:bytes e))
+        "Ver=1 T=CON(0) TKL=0 -> 0x40; constructed from the header layout, not a published vector")
+    (let [d (msg/decode (:bytes e))]
+      (is (= :ok (:status d)))
+      (is (= :con (get-in d [:message :type])))
+      (is (= :empty (get-in d [:message :code])))
+      (is (= 0x1234 (get-in d [:message :message-id]))))))
+
+(deftest get-request-round-trip
+  ;; constructed, not a published spec vector: CON GET /sensors/temperature
+  ;; with an Accept option and a 4-byte token.
+  (let [e (msg/encode {:type :con :code :get :message-id 0xABCD :token [1 2 3 4]
+                       :options [[:uri-path (msg/ascii->bytes "sensors")]
+                                 [:uri-path (msg/ascii->bytes "temperature")]
+                                 [:accept [0]]]})]
+    (is (= :ok (:status e)))
+    (let [d (msg/decode (:bytes e))]
+      (is (= :ok (:status d)))
+      (is (= :con (get-in d [:message :type])))
+      (is (= :get (get-in d [:message :code])))
+      (is (= 0xABCD (get-in d [:message :message-id])))
+      (is (= [1 2 3 4] (get-in d [:message :token])))
+      (is (= [11 11 17] (mapv first (get-in d [:message :options])))))))
+
+(deftest content-response-with-payload-round-trip
+  (let [e (msg/encode {:type :ack :code :content :message-id 0xABCD :token [1 2 3 4]
+                       :options [[:content-format [0]]]
+                       :payload (msg/ascii->bytes "22.5 C")})
+        d (msg/decode (:bytes e))]
+    (is (= :ok (:status d)))
+    (is (= :ack (get-in d [:message :type])))
+    (is (= :content (get-in d [:message :code])))
+    (is (= "22.5 C" (msg/bytes->ascii (get-in d [:message :payload]))))))
+
+(deftest rst-round-trip
+  (let [e (msg/encode {:type :rst :code :empty :message-id 42})
+        d (msg/decode (:bytes e))]
+    (is (= :rst (get-in d [:message :type])))))
+
+(deftest unsupported-version
+  ;; RFC 7252 §3: Ver MUST be 1 (01 binary); byte 0 here has Ver=2 (10),
+  ;; T=CON, TKL=0.
+  (is (= :unsupported-version (:reason (msg/decode [0x80 0x01 0x00 0x00])))))
+
+(deftest reserved-token-length
+  ;; TKL=9 is reserved (RFC 7252 §3: lengths 9-15 MUST NOT be sent).
+  (is (= :reserved-token-length
+         (:reason (msg/decode [0x49 0x01 0x00 0x00 1 2 3 4 5 6 7 8 9])))))
+
+(deftest empty-message-with-token-is-malformed
+  ;; RFC 7252 §3: an Empty message (Code 0.00) MUST have TKL = 0.
+  (is (= :non-empty-empty-message
+         (:reason (msg/decode [0x41 0x00 0x00 0x00 0xFF])))))
+
+(deftest token-too-long-refused-at-encode
+  (is (= :token-too-long (:reason (msg/encode {:type :con :code :get :message-id 1
+                                               :token (vec (range 9))})))))
+
+(deftest incomplete-header
+  (is (= :incomplete (:status (msg/decode [0x40 0x01 0x00])))))
+
+(deftest incomplete-token
+  ;; TKL says 4 but only 2 bytes of token are present.
+  (is (= :incomplete (:status (msg/decode [0x44 0x01 0x00 0x00 1 2])))))
+
+;; ── block-wise transfer (RFC 7959 §2.1/§2.2) ─────────────────────────────
+
+(deftest block-size-table
+  ;; RFC 7959 §2.2: block size = 2^(SZX+4).
+  (is (= {0 16 1 32 2 64 3 128 4 256 5 512 6 1024} block/size-exponents)))
+
+(deftest block-round-trip
+  (doseq [num [0 1 15 16 4095 1048575] more? [true false] szx (range 7)]
+    (let [e (block/encode {:num num :more? more? :szx szx})]
+      (is (= :ok (:status e)) [num more? szx])
+      (let [d (block/decode (:bytes e))]
+        (is (= num (:num d)) [num more? szx])
+        (is (= more? (:more? d)))
+        (is (= szx (:szx d)))))))
+
+(deftest block-zero-is-zero-bytes
+  ;; NUM=0 M=false SZX=0 packs to the all-zero field, which is the empty
+  ;; option value — not a 1-byte 0x00. Getting this backwards (always
+  ;; emitting at least 1 byte) would desync a decoder reading Length from
+  ;; the option header.
+  (is (= [] (:bytes (block/encode {:num 0 :more? false :szx 0})))))
+
+(deftest block-first-block-of-a-multi-block-transfer
+  ;; constructed, not a published spec vector, but a canonical shape:
+  ;; block 0 of a transfer using 64-byte blocks (SZX=2) with more to come.
+  (let [e (block/encode {:num 0 :more? true :szx 2})]
+    (is (= [0x0A] (:bytes e))) ; NUM=0 M=1 SZX=2 -> 0000 1 010 = 0x0A
+    (let [d (block/decode (:bytes e))]
+      (is (= 0 (:num d)))
+      (is (true? (:more? d)))
+      (is (= 64 (:size d))))))
+
+(deftest block-reserved-szx
+  (is (= :reserved-szx (:reason (block/encode {:num 0 :more? false :szx 7}))))
+  (is (= :reserved-szx (:reason (block/decode [0x07])))))
+
+(deftest block-value-too-long
+  (is (= :block-value-too-long (:reason (block/decode [1 2 3 4])))))
+
+(deftest block-option-embedded-in-a-real-message
+  ;; constructed, not a published spec vector: GET with a Block2 option
+  ;; (23) asking for block 3, 64-byte blocks, no more requested (M is
+  ;; meaningless in a Block2 request and conventionally 0).
+  (let [bv (:bytes (block/encode {:num 3 :more? false :szx 2}))
+        e (msg/encode {:type :con :code :get :message-id 7
+                       :options [[23 bv] [:uri-path (msg/ascii->bytes "big")]]})
+        d (msg/decode (:bytes e))]
+    (is (= :ok (:status d)))
+    (let [[[num23 v23]] (filter #(= 23 (first %)) (get-in d [:message :options]))]
+      (is (= 23 num23))
+      (let [b (block/decode v23)]
+        (is (= 3 (:num b)))
+        (is (= 64 (:size b)))))))

@@ -1,0 +1,274 @@
+(ns jiten.core
+  "Build a corpus value from entries, and ask it questions.
+
+   `corpus` is fail-closed: it refuses to build if `jiten.schema` or
+   `jiten.link` reports an `:error`. `corpus*` keeps going and carries the
+   problems along, which is what an ingest pass needs -- a harvester that dies
+   on the first bad record cannot tell you how bad the batch was.
+
+   The queries here are the ones an encyclopedia can answer and a pile of pages
+   cannot: which claims rest on one source, which subjects the record covers,
+   what a citation is load-bearing for. They exist because the body is
+   structured. `sources` over Wikipedia would be a scraping project."
+  (:require [kotoba.lang.text :as str]
+            [jiten.link :as link]
+            [jiten.schema :as schema]))
+
+(defn- problem [code msg data]
+  (merge {:jiten/severity :error :jiten/code code :jiten/message msg} data))
+
+(defn- dupes [xs]
+  (->> xs (frequencies) (keep (fn [[k n]] (when (> n 1) k))) (sort-by str) vec))
+
+(defn duplicate-problems
+  "Identity collisions, which neither `jiten.schema` nor `jiten.link` can see
+   because both work below the corpus.
+
+   These have to be errors rather than a last-write-wins merge: every id here is
+   `:db.unique/identity` in `jiten.tx`, so two statements sharing an id do not
+   collide at transact time -- they UPSERT, and one claim silently overwrites the
+   other's text and citation. The collision has to be caught before it reaches
+   the database, where it stops looking like a collision at all."
+  [entries]
+  (-> []
+      (into (for [id (dupes (map :jiten.entry/id entries))]
+              (problem :corpus/duplicate-entry-id
+                       (str "two entries share :jiten.entry/id " (pr-str id))
+                       {:jiten.entry/id id})))
+      (into (for [id (dupes (for [e entries
+                                  sec (filter map? (:jiten.entry/body e))
+                                  s (:jiten.section/statements sec)]
+                              (:jiten.statement/id s)))]
+              (problem :corpus/duplicate-statement-id
+                       (str "two statements share :jiten.statement/id " (pr-str id)
+                            "; on transact the second would upsert over the first")
+                       {:jiten.statement/id id})))
+      (into (for [e entries
+                  id (dupes (map :jiten.section/id (filter map? (:jiten.entry/body e))))]
+              (problem :corpus/duplicate-section-id
+                       (str "entry " (pr-str (:jiten.entry/id e))
+                            " has two sections with :jiten.section/id " (pr-str id))
+                       {:jiten.entry/id (:jiten.entry/id e) :jiten.section/id id})))
+      vec))
+
+(defn corpus*
+  "Build a corpus, keeping problems rather than throwing.
+
+   `{:entries [] :by-id {} :index {...} :problems []}`"
+  [entries]
+  (let [entries (vec entries)]
+    {:entries  entries
+     :by-id    (into {} (map (juxt :jiten.entry/id identity)) entries)
+     :index    (link/index entries)
+     :problems (-> (schema/problems entries)
+                   (into (link/problems entries))
+                   (into (duplicate-problems entries))
+                   vec)}))
+
+(defn corpus
+  "Build a corpus, refusing on any `:error`.
+
+   The refusal is the point. An encyclopedia that accepts an unsourced claim
+   'for now' has, from that moment, no way to tell a reader which of its claims
+   are sourced."
+  [entries]
+  (let [c (corpus* entries)
+        errs (filterv #(= :error (:jiten/severity %)) (:problems c))]
+    (when (seq errs)
+      (throw (ex-info (str "jiten: corpus has " (count errs) " admissibility error(s); "
+                           "use corpus* to build anyway and inspect :problems")
+                      {:jiten/errors errs})))
+    c))
+
+(defn entries [c] (:entries c))
+(defn entry [c id] (get (:by-id c) id))
+
+(defn problems-of
+  "Every problem the corpus carries, both severities. Named `problems-of` rather
+   than `problems` because `jiten.schema/problems` and `jiten.link/problems` take
+   entries while this takes a built corpus, and one of those three being subtly
+   different from the others is how a caller ends up validating nothing."
+  [c]
+  (:problems c))
+
+(defn warnings [c]
+  (filterv #(= :warn (:jiten/severity %)) (:problems c)))
+
+(defn errors [c]
+  (filterv #(= :error (:jiten/severity %)) (:problems c)))
+
+;; ---------------------------------------------------------------------------
+;; statements and sources
+;; ---------------------------------------------------------------------------
+
+(defn statements
+  "Every statement in the corpus, each stamped with the entry and section it
+   came from, so a result set is traceable without a second lookup."
+  [c]
+  (vec (for [e (:entries c)
+             sec (filter map? (:jiten.entry/body e))
+             s (:jiten.section/statements sec)]
+         (assoc s
+                :jiten/entry (:jiten.entry/id e)
+                :jiten/section (:jiten.section/id sec)))))
+
+(defn sources
+  "`{source-citation [statement-ids]}` -- what each citation is holding up.
+
+   The useful direction is the reverse of how an encyclopedia is normally read.
+   Given a source that turns out to be wrong, retracted, or a mirror of another
+   source, this says exactly which claims have to be revisited."
+  [c]
+  (->> (statements c)
+       (group-by :jiten.statement/source)
+       (into (sorted-map))
+       (reduce-kv (fn [m src ss]
+                    (assoc m src (vec (sort-by str (map :jiten.statement/id ss)))))
+                  {})))
+
+(defn single-source-entries
+  "Entries whose every statement cites the same one source.
+
+   Not an error -- a registry-based entry legitimately rests on its registry --
+   but it is the shape a fabricated entry has, and the shape a summarised press
+   release has, so it is worth being able to list."
+  [c]
+  (vec (sort-by str
+                (for [e (:entries c)
+                      :let [srcs (set (for [sec (filter map? (:jiten.entry/body e))
+                                            s (:jiten.section/statements sec)]
+                                        (:jiten.statement/source s)))]
+                      :when (= 1 (count srcs))]
+                  (:jiten.entry/id e)))))
+
+(defn by-confidence
+  "`{confidence count}` over every statement. A corpus drifting toward
+   `:estimate` is drifting toward being written rather than recorded."
+  [c]
+  (frequencies (map :jiten.statement/confidence (statements c))))
+
+(defn contested
+  "Statements whose sources disagree, with the recorded dissent. This is content
+   in its own right -- 'the sources disagree, and here is how' is often the most
+   accurate thing an encyclopedia can say."
+  [c]
+  (vec (for [s (statements c)
+             :when (= :contested (:jiten.statement/confidence s))]
+         (select-keys s [:jiten.statement/id :jiten/entry :jiten.statement/text
+                         :jiten.statement/source :jiten.statement/dissent]))))
+
+;; ---------------------------------------------------------------------------
+;; subjects and coverage
+;; ---------------------------------------------------------------------------
+
+(defn entries-about
+  "Every entry whose `:jiten.entry/subject` is `subject`, in any language.
+
+   The multilingual case is the reason `:jiten.entry/subject` exists. Wikipedia
+   has a separate encyclopedia per language and reconciles them through
+   Wikidata after the fact; here the subject is the join key from the start, so
+   two languages disagreeing about a subject is a query result rather than an
+   undiscovered fork."
+  [c subject]
+  (vec (sort-by (comp str :jiten.entry/id)
+                (filter #(= subject (:jiten.entry/subject %)) (:entries c)))))
+
+(defn subjects
+  "Distinct subjects the corpus has entries for."
+  [c]
+  (into (sorted-set) (keep :jiten.entry/subject (:entries c))))
+
+(defn coverage
+  "Given the subject ids of some other record -- `:innen.node/id` values, repo
+   paths, LEI-bearing entities -- say which have an entry and which do not.
+
+   `{:covered [] :uncovered [] :ratio 0.0}`. The uncovered list is the useful
+   half: it is what this corpus does not yet say about a world some other corpus
+   already enumerates."
+  [c subject-ids]
+  (let [have (subjects c)
+        want (vec (distinct subject-ids))
+        covered (filterv have want)
+        uncovered (vec (remove have want))]
+    {:covered   (vec (sort-by str covered))
+     :uncovered (vec (sort-by str uncovered))
+     :ratio     (if (seq want) (/ (double (count covered)) (count want)) 0.0)}))
+
+(defn frontier
+  "What to write next, ranked. Combines the two signals the corpus already has:
+   how many entries point at a missing target, and -- for targets that are also
+   subjects of some external id set -- that the world outside believes they
+   exist.
+
+   Same idea as `innen.algo/frontier`: the record proposes its own next ingest
+   rather than a human guessing at coverage."
+  ([c] (frontier c nil))
+  ([c external-subjects]
+   (let [ext (set external-subjects)]
+     (vec (for [m (link/missing-targets (:index c))]
+            (assoc m :jiten/in-external-record (contains? ext (:jiten.link/to m))))))))
+
+;; ---------------------------------------------------------------------------
+;; shape
+;; ---------------------------------------------------------------------------
+
+(defn stats
+  "A corpus at a glance. Every number here is countable from the record itself;
+   none of it is a quality judgement."
+  [c]
+  (let [ss (statements c)
+        idx (:index c)]
+    {:entries        (count (:entries c))
+     :statements     (count ss)
+     :sections       (reduce + 0 (map (comp count #(filter map? %) :jiten.entry/body) (:entries c)))
+     :subjects       (count (subjects c))
+     :languages      (into (sorted-set) (keep :jiten.entry/lang (:entries c)))
+     :forms          (frequencies (map :jiten.entry/form (:entries c)))
+     :topic-kinds    (frequencies (map :jiten.entry/topic-kind (:entries c)))
+     :confidence     (by-confidence c)
+     :distinct-sources (count (distinct (map :jiten.statement/source ss)))
+     :links          (count (:links idx))
+     :red-links      (count (link/red-links idx))
+     :orphans        (count (link/orphans idx))
+     :problems       (frequencies (map :jiten/severity (:problems c)))}))
+
+(defn explain
+  "Everything the corpus can say about one entry, with citations attached at
+   each claim. The output is meant to be read by a person checking the record,
+   which is why it carries sources rather than rendered prose."
+  [c id]
+  (when-let [e (entry c id)]
+    {:jiten.entry/id       id
+     :jiten.entry/title    (:jiten.entry/title e)
+     :jiten.entry/lang     (:jiten.entry/lang e)
+     :jiten.entry/subject  (:jiten.entry/subject e)
+     :jiten.entry/notability (:jiten.entry/notability e)
+     :jiten/claims (vec (for [sec (filter map? (:jiten.entry/body e))
+                              s (:jiten.section/statements sec)]
+                          {:jiten/section (:jiten.section/heading sec)
+                           :jiten.statement/text (:jiten.statement/text s)
+                           :jiten.statement/source (:jiten.statement/source s)
+                           :jiten.statement/confidence (:jiten.statement/confidence s)
+                           :jiten.statement/dissent (:jiten.statement/dissent s)}))
+     :jiten/backlinks (link/backlinks (:index c) id)
+     :jiten/points-at (vec (sort-by str (distinct (map :jiten.link/to
+                                                       (get (:out (:index c)) id)))))}))
+
+(defn titles
+  "`{lang {title entry-id}}`. Two entries sharing a title in one language is
+   what `:disambiguation` is for; this is how you find the pairs that need one."
+  [c]
+  (reduce (fn [m e]
+            (update-in m [(:jiten.entry/lang e) (str/lower (or (:jiten.entry/title e) ""))]
+                       (fnil conj []) (:jiten.entry/id e)))
+          {} (:entries c)))
+
+(defn title-collisions
+  "Titles claimed by more than one entry in the same language, with no
+   `:disambiguation` entry covering them."
+  [c]
+  (vec (for [[lang by-title] (sort-by str (titles c))
+             [title ids] (sort-by key by-title)
+             :when (> (count ids) 1)
+             :when (not-any? #(= :disambiguation (:jiten.entry/form (entry c %))) ids)]
+         {:jiten.entry/lang lang :jiten.entry/title title :jiten/entries (vec (sort-by str ids))})))

@@ -1,0 +1,169 @@
+(ns unixfs.file-test
+  "Every expected CID here came out of kubo 0.41:
+
+      ipfs add -Q --cid-version=1 --raw-leaves --chunker=size-N <file>
+
+  on a file this namespace regenerates. `pattern-bytes` is an xorshift32
+  stream so no two chunks repeat — a constant fill would still exercise the
+  tree shape but could not catch links emitted in the wrong order.
+
+  The `chunker=size-1024` vectors are not a different feature. Tree shape
+  depends on the 174-link ceiling and not on chunk size, so a smaller chunk
+  reaches the same boundaries — 174 links, 175, three levels — in kilobytes
+  instead of tens of megabytes."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ipld.dag-pb :as dag-pb]
+            [multiformats.core :as mf]
+            [unixfs.file :as unixfs]))
+
+(defn pattern-bytes
+  "xorshift32 from a fixed seed. The same function generated the files that
+  were fed to `ipfs add`; if it drifts, the single-chunk vector below fails
+  first and unambiguously, because that CID is nothing but the sha2-256 of
+  these bytes."
+  [n]
+  #?(:clj
+     (let [out (byte-array n)]
+       (loop [i 0 s 0x12345678]
+         (if (= i n)
+           out
+           (let [s (bit-and 0xffffffff (bit-xor s (bit-shift-left s 13)))
+                 s (bit-xor s (unsigned-bit-shift-right s 17))
+                 s (bit-and 0xffffffff (bit-xor s (bit-shift-left s 5)))]
+             (aset-byte out i (unchecked-byte (bit-and s 0xff)))
+             (recur (inc i) s)))))
+     :cljs
+     (let [out (js/Uint8Array. n)]
+       (loop [i 0 s 0x12345678]
+         (if (= i n)
+           out
+           (let [s (bit-and 0xffffffff (bit-xor s (bit-shift-left s 13)))
+                 s (bit-xor s (unsigned-bit-shift-right s 17))
+                 s (bit-and 0xffffffff (bit-xor s (bit-shift-left s 5)))]
+             (aset out i (bit-and s 0xff))
+             (recur (inc i) s)))))))
+
+;; ── conformance ───────────────────────────────────────────────────────────
+
+(def default-chunk-vectors
+  "`--chunker=size-262144`, the `ipfs add` default."
+  [{:label "empty" :size 0
+    :cid "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku"}
+   {:label "one byte" :size 1
+    :cid "bafkreidjelut4obhmqwojoedy5llggv7qabwmsotmff7l7ftvxnehohkgi"}
+   {:label "exactly one chunk" :size 262144
+    :cid "bafkreifwidxy2bxbc5r2pmjmjp6gd6t35h3m2ee5rhfx2g4rjehr3mdbgm"}
+   {:label "one chunk plus one byte" :size 262145
+    :cid "bafybeibehmsugjvfzrrnrs3katfdixzvvyelnptwbacjw7typ4kht3dmoa"}
+   {:label "four chunks" :size 1048576
+    :cid "bafybeihekfxcwcsuwj3drmrk7qz75d4cxfjgf656kkx4ut244wxj4wukoi"}])
+
+(def small-chunk-vectors
+  "`--chunker=size-1024`, reaching the link-count boundaries cheaply."
+  [{:label "two chunks" :size 2048
+    :cid "bafybeidtwpjv3zp6cf5o4gx4b3uudjyjleatu6xdad2sp3jmygfd6bfrli"}
+   {:label "a full 174-link node" :size 178176
+    :cid "bafybeibmyupfn2lrok54te5jjpiyktli7n3cfwhjuceukpmxlr6jpc643u"}
+   {:label "175 chunks — one level deeper" :size 179200
+    :cid "bafybeigdrouqor7w6g7ejjelcupocitq46usreuwmdo6ez2eap6grlvpom"}
+   {:label "175 chunks and a remainder" :size 179300
+    :cid "bafybeic6gcjkrjcfgbvw35dcxeanv55gkv2l6hwvyvnfei6z7cbyx4a6ge"}
+   {:label "30,277 chunks — three levels above the leaves" :size 31003648
+    :cid "bafybeia34nvpqbib2whh4qdgdnccamhyvxw2etpshi4fjpp74ct3wwzfzu"}])
+
+(deftest matches-ipfs-add-at-the-default-chunk-size
+  (doseq [{:keys [label size cid]} default-chunk-vectors]
+    (testing label
+      (is (= cid (unixfs/cid (pattern-bytes size)))))))
+
+(deftest matches-ipfs-add-across-the-link-boundaries
+  (doseq [{:keys [label size cid]} small-chunk-vectors]
+    (testing label
+      (is (= cid (unixfs/cid (pattern-bytes size) {:chunk-size 1024}))))))
+
+(deftest a-single-chunk-file-is-a-bare-raw-block
+  (testing "no dag-pb wrapper below the chunk size — the special case
+            everything else in the format is built on top of"
+    (doseq [size [0 1 1000 262144]]
+      (let [{:keys [cid blocks]} (unixfs/build (pattern-bytes size))]
+        (is (= 1 (count blocks)))
+        (is (= cid (mf/cidv1-raw (pattern-bytes size))))
+        (is (str/starts-with? cid "bafkrei"))))))
+
+(deftest a-second-chunk-introduces-a-root
+  (let [{:keys [cid blocks]} (unixfs/build (pattern-bytes 262145))]
+    (is (= 3 (count blocks)) "two leaves and a root")
+    (is (str/starts-with? cid "bafybei"))
+    (is (= cid (:cid (last blocks))) "the root is published last")))
+
+;; ── the properties a writer depends on ────────────────────────────────────
+
+(deftest children-are-published-before-their-parents
+  (testing "a store that follows :blocks in order never advertises a root
+            whose children are not there yet"
+    (let [{:keys [blocks]} (unixfs/build (pattern-bytes 179200) {:chunk-size 1024})
+          position (into {} (map-indexed (fn [i b] [(:cid b) i])) blocks)]
+      (is (= (count blocks) (count position)) "no duplicate cids in this dag")
+      (doseq [{:keys [cid bytes]} blocks
+              :when (str/starts-with? cid "bafybei")]
+        (doseq [link (:links (dag-pb/decode bytes))]
+          (is (< (position (:cid link)) (position cid))
+              (str "child " (:cid link) " must precede " cid)))))))
+
+(deftest every-block-hashes-to-its-cid
+  (let [{:keys [blocks]} (unixfs/build (pattern-bytes 179300) {:chunk-size 1024})]
+    (doseq [{:keys [cid bytes]} blocks]
+      (is (= cid (if (str/starts-with? cid "bafkrei")
+                   (mf/cidv1-raw bytes)
+                   (dag-pb/cid bytes)))))))
+
+;; ── reading ───────────────────────────────────────────────────────────────
+
+(defn- store-of [blocks]
+  (into {} (map (juxt :cid :bytes)) blocks))
+
+(deftest round-trips-through-a-store
+  (doseq [size [0 1 2048 179300]]
+    (let [source (pattern-bytes size)
+          {:keys [cid blocks]} (unixfs/build source {:chunk-size 1024})
+          store (store-of blocks)
+          out (unixfs/read-file store cid)]
+      (is (= (vec (seq source)) (vec (seq out))) (str "size " size)))))
+
+(deftest a-missing-block-is-not-a-short-read
+  (let [{:keys [cid blocks]} (unixfs/build (pattern-bytes 2048) {:chunk-size 1024})
+        holed (dissoc (store-of blocks) (:cid (first blocks)))]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (unixfs/read-file holed cid)))))
+
+(deftest bytes-that-do-not-hash-to-their-cid-are-refused
+  (let [{:keys [cid blocks]} (unixfs/build (pattern-bytes 2048) {:chunk-size 1024})
+        leaf (first blocks)
+        ;; Not `(pattern-bytes 1024)` — that IS the first leaf, and a tamper
+        ;; test that substitutes the original bytes proves nothing.
+        tampered (assoc (store-of blocks) (:cid leaf)
+                        #?(:clj (byte-array 1024) :cljs (js/Uint8Array. 1024)))]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (unixfs/read-file tampered cid)))))
+
+(deftest the-block-budget-is-enforced
+  (let [{:keys [cid blocks]} (unixfs/build (pattern-bytes 179200) {:chunk-size 1024})]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (unixfs/read-file (store-of blocks) cid {:max-blocks 10})))))
+
+(deftest failures-are-distinguishable-by-type
+  (testing "a caller has to tell absence from corruption — one is a store
+            that does not have it, the other is a store that must not be
+            trusted, and `:ok? false` for both would hide the second"
+    (let [{:keys [cid blocks]} (unixfs/build (pattern-bytes 2048) {:chunk-size 1024})
+          leaf (first blocks)
+          type-of (fn [store]
+                    (try (unixfs/read-file store cid) nil
+                         (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) e
+                           (:type (ex-data e)))))]
+      (is (= :unixfs/missing-block
+             (type-of (dissoc (store-of blocks) (:cid leaf)))))
+      (is (= :unixfs/cid-mismatch
+             (type-of (assoc (store-of blocks) (:cid leaf)
+                             #?(:clj (byte-array 1024) :cljs (js/Uint8Array. 1024)))))))))

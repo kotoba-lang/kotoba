@@ -1,0 +1,274 @@
+(ns sha3.core
+  "SHA-3 and SHAKE (NIST FIPS 202) over Keccak-f[1600], in portable `.cljk` with
+   no dependencies.
+
+   ```clojure
+   (require '[sha3.core :as sha3])
+
+   (sha3/sha3-256 bytes)          ; => 32 unsigned bytes
+   (sha3/sha3-256-hex bytes)      ; => lowercase hex string
+   (sha3/shake128 bytes 64)       ; => 64 bytes of SHAKE128 output
+   (sha3/shake256-hex bytes 32)
+
+   ;; incremental XOF, for callers that squeeze in pieces (ML-KEM, ML-DSA)
+   (let [x (-> (sha3/xof :shake128) (sha3/xof-absorb seed) (sha3/xof-absorb more))
+         [x a] (sha3/xof-squeeze x 168)
+         [x b] (sha3/xof-squeeze x 168)]
+     ...)
+   ```
+
+   Why this exists: FIPS 203 (ML-KEM) and FIPS 204 (ML-DSA) are built on SHAKE and
+   SHA-3, and the workspace had no portable Keccak. Without it the post-quantum
+   boundary cannot leave the JVM.
+
+   A `bytes` argument is any seqable of integers. Signed JVM bytes are accepted
+   (each is masked with 0xFF). Results are vectors of unsigned integers 0-255.
+
+   Representation: the 1600-bit state is 25 lanes of 64 bits, held as a vector of
+   50 unsigned 32-bit halves (lane i is `[2i]` low and `[2i+1]` high). ClojureScript
+   bitwise operators are int32 and the JVM's are int64, so everything stays in the
+   unsigned 32-bit domain and is normalised through `u32` after every operation
+   that can leave it.
+
+   The tables are computed, not typed. The 24 round constants come from the LFSR
+   of FIPS 202 Algorithm 5 and the 25 rotation offsets from Algorithm 2, so no
+   constant can have a transcription error. The suite pins them anyway, against
+   NIST's published vectors and the CAVP files (see test/cavp/PROVENANCE.md).")
+
+
+;; ---------------------------------------------------------------------------
+;; 32-bit helpers
+;; ---------------------------------------------------------------------------
+
+(defn u32
+  "Normalise an integer to the unsigned 32-bit range."
+  [x]
+  #?(:clj  (bit-and x 0xFFFFFFFF)
+     :cljs (unsigned-bit-shift-right x 0)))
+
+(defn- shl [x n] (u32 (bit-shift-left x n)))
+(defn- shr [x n] (unsigned-bit-shift-right x n))
+
+(defn- rotl64
+  "Rotate the 64-bit lane (lo, hi) left by n, 0 <= n < 64. Returns [lo hi]."
+  [lo hi n]
+  (let [[lo hi n] (if (>= n 32) [hi lo (- n 32)] [lo hi n])]
+    (if (zero? n)
+      [lo hi]
+      [(u32 (bit-or (shl lo n) (shr hi (- 32 n))))
+       (u32 (bit-or (shl hi n) (shr lo (- 32 n))))])))
+
+;; ---------------------------------------------------------------------------
+;; Tables, computed from FIPS 202
+;; ---------------------------------------------------------------------------
+
+(def ^:private rc-bits
+  "rc(t) of Algorithm 5, for t = 0 .. 7*24-1."
+  (vec
+   (for [t (range (* 7 24))]
+     (if (zero? (mod t 255))
+       1
+       ;; R is held as 8 bits, R[0] leftmost. Each step is 0||R, then the four
+       ;; taps are xored with the bit that was shifted out, then truncate to 8.
+       (loop [i 1 r [1 0 0 0 0 0 0 0]]
+         (if (> i (mod t 255))
+           (first r)
+           (let [r9 (into [0] r)
+                 b8 (nth r9 8)
+                 r9 (-> r9
+                        (update-in [0] #(bit-xor % b8))
+                        (update-in [4] #(bit-xor % b8))
+                        (update-in [5] #(bit-xor % b8))
+                        (update-in [6] #(bit-xor % b8)))]
+             (recur (inc i) (subvec r9 0 8)))))))))
+
+(def ^:private round-constants
+  "24 constants as [lo hi]. Bit 2^j - 1 of RC[ir] is rc(j + 7*ir), j = 0..6."
+  (vec
+   (for [ir (range 24)]
+     (reduce (fn [[lo hi] j]
+               (if (= 1 (nth rc-bits (+ j (* 7 ir))))
+                 (let [z (dec (bit-shift-left 1 j))]
+                   (if (< z 32)
+                     [(u32 (bit-or lo (shl 1 z))) hi]
+                     [lo (u32 (bit-or hi (shl 1 (- z 32))))]))
+                 [lo hi]))
+             [0 0]
+             (range 7)))))
+
+(def ^:private rho-offsets
+  "Rotation offset of lane (x, y) at index x + 5y, Algorithm 2."
+  (loop [t 0 x 1 y 0 acc (vec (repeat 25 0))]
+    (if (= t 24)
+      acc
+      (recur (inc t) y (mod (+ (* 2 x) (* 3 y)) 5)
+             (assoc acc (+ x (* 5 y)) (mod (quot (* (inc t) (+ t 2)) 2) 64))))))
+
+(def ^:private pi-source
+  "pi: the new lane (x, y) is the old lane ((x + 3y) mod 5, x), Algorithm 3.
+   Indexed by the new lane x + 5y; the value is the old lane's index."
+  (vec (for [y (range 5) x (range 5)]
+         (+ (mod (+ x (* 3 y)) 5) (* 5 x)))))
+
+;; ---------------------------------------------------------------------------
+;; Keccak-f[1600]
+;; ---------------------------------------------------------------------------
+
+(defn- round
+  "One round of Keccak-f[1600] on the 50-element state, with round constant rc."
+  [a [rc-lo rc-hi]]
+  (let [lane (fn [v i] [(nth v (* 2 i)) (nth v (inc (* 2 i)))])
+        ;; theta
+        c (vec (for [x (range 5)]
+                 (reduce (fn [[l h] y]
+                           (let [[l2 h2] (lane a (+ x (* 5 y)))]
+                             [(bit-xor l l2) (bit-xor h h2)]))
+                         [0 0] (range 5))))
+        d (vec (for [x (range 5)]
+                 (let [[l1 h1] (nth c (mod (+ x 4) 5))
+                       [l2 h2] (rotl64 (first (nth c (mod (+ x 1) 5)))
+                                       (second (nth c (mod (+ x 1) 5))) 1)]
+                   [(u32 (bit-xor l1 l2)) (u32 (bit-xor h1 h2))])))
+        t (vec (for [i (range 25)]
+                 (let [[l h] (lane a i)
+                       [dl dh] (nth d (mod i 5))]
+                   [(u32 (bit-xor l dl)) (u32 (bit-xor h dh))])))
+        ;; rho and pi
+        b (vec (for [i (range 25)]
+                 (let [src (nth pi-source i)
+                       [l h] (nth t src)]
+                   (rotl64 l h (nth rho-offsets src)))))
+        ;; chi
+        chi (vec (for [i (range 25)]
+                   (let [x (mod i 5)
+                         row (- i x)
+                         [l0 h0] (nth b i)
+                         [l1 h1] (nth b (+ row (mod (+ x 1) 5)))
+                         [l2 h2] (nth b (+ row (mod (+ x 2) 5)))]
+                     [(u32 (bit-xor l0 (bit-and (u32 (bit-not l1)) l2)))
+                      (u32 (bit-xor h0 (bit-and (u32 (bit-not h1)) h2)))])))
+        ;; iota
+        [l00 h00] (nth chi 0)
+        chi (assoc chi 0 [(u32 (bit-xor l00 rc-lo)) (u32 (bit-xor h00 rc-hi))])]
+    (vec (mapcat identity chi))))
+
+(defn keccak-f1600
+  "The permutation. `state` is a vector of 50 unsigned 32-bit halves."
+  [state]
+  (reduce round state round-constants))
+
+;; ---------------------------------------------------------------------------
+;; Sponge
+;; ---------------------------------------------------------------------------
+
+(defn- ->byte [b] (bit-and b 0xFF))
+
+(defn- xor-block
+  "XOR `block` (a vector of rate bytes, rate a multiple of 8) into the state."
+  [state block]
+  (let [n (quot (count block) 8)]
+    (loop [i 0 s state]
+      (if (= i n)
+        s
+        (let [o (* 8 i)
+              by (fn [k] (nth block (+ o k)))
+              lo (u32 (bit-or (by 0) (shl (by 1) 8) (shl (by 2) 16) (shl (by 3) 24)))
+              hi (u32 (bit-or (by 4) (shl (by 5) 8) (shl (by 6) 16) (shl (by 7) 24)))]
+          (recur (inc i)
+                 (-> s
+                     (assoc (* 2 i) (u32 (bit-xor (nth s (* 2 i)) lo)))
+                     (assoc (inc (* 2 i)) (u32 (bit-xor (nth s (inc (* 2 i))) hi))))))))))
+
+(defn- state-byte [state p]
+  (let [half (nth state (+ (* 2 (quot p 8)) (if (< (mod p 8) 4) 0 1)))
+        k (mod p 4)]
+    (bit-and (shr half (* 8 k)) 0xFF)))
+
+(def ^:private params
+  "rate in bytes and the domain-separation suffix byte of each function."
+  {:sha3-224 {:rate 144 :suffix 0x06}
+   :sha3-256 {:rate 136 :suffix 0x06}
+   :sha3-384 {:rate 104 :suffix 0x06}
+   :sha3-512 {:rate 72  :suffix 0x06}
+   :shake128 {:rate 168 :suffix 0x1F}
+   :shake256 {:rate 136 :suffix 0x1F}})
+
+(def ^:private zero-state (vec (repeat 50 0)))
+
+(defn xof
+  "A fresh sponge for `kind` (:shake128, :shake256, or a :sha3-* kind). Returns
+   an immutable value; the other xof functions return updated values."
+  [kind]
+  (let [{:keys [rate suffix]} (or (get params kind)
+                                  (throw (ex-info "unknown sponge kind" {:kind kind})))]
+    {:rate rate :suffix suffix :state zero-state :buf [] :phase :absorb :off 0}))
+
+(defn- absorb-full-blocks
+  [{:keys [rate] :as x} bytes]
+  (loop [state (:state x) buf (into (:buf x) bytes)]
+    (if (< (count buf) rate)
+      (assoc x :state state :buf buf)
+      (recur (keccak-f1600 (xor-block state (subvec buf 0 rate)))
+             (subvec buf rate)))))
+
+(defn xof-absorb
+  "Absorb more input. Throws once squeezing has started."
+  [x bytes]
+  (when (not= :absorb (:phase x))
+    (throw (ex-info "cannot absorb after squeeze" {})))
+  (absorb-full-blocks x (map ->byte bytes)))
+
+(defn- finalize
+  "Pad (suffix, zeros, final 0x80) and absorb the last block; start squeezing."
+  [{:keys [rate suffix buf state] :as x}]
+  (let [n (count buf)
+        pad (-> (vec (repeat (- rate n) 0))
+                (assoc 0 suffix)
+                (update (dec (- rate n)) #(bit-or % 0x80)))
+        state (keccak-f1600 (xor-block state (into buf pad)))]
+    (assoc x :state state :buf [] :phase :squeeze :off 0)))
+
+(defn xof-squeeze
+  "Return `[x' out]` with `n` more output bytes. Finalises the input on the first
+   call. Output continues exactly where the previous call stopped, so squeezing
+   10 then 20 bytes equals squeezing 30."
+  [x n]
+  (let [x (if (= :absorb (:phase x)) (finalize x) x)
+        rate (:rate x)]
+    (loop [state (:state x) off (:off x) out (transient []) k n]
+      (if (zero? k)
+        [(assoc x :state state :off off) (persistent! out)]
+        (if (= off rate)
+          (recur (keccak-f1600 state) 0 out k)
+          (recur state (inc off) (conj! out (state-byte state off)) (dec k)))))))
+
+(defn- digest [kind bytes n]
+  (second (xof-squeeze (xof-absorb (xof kind) bytes) n)))
+
+;; ---------------------------------------------------------------------------
+;; Public API
+;; ---------------------------------------------------------------------------
+
+(defn sha3-224 [bytes] (digest :sha3-224 bytes 28))
+(defn sha3-256 [bytes] (digest :sha3-256 bytes 32))
+(defn sha3-384 [bytes] (digest :sha3-384 bytes 48))
+(defn sha3-512 [bytes] (digest :sha3-512 bytes 64))
+
+(defn shake128 [bytes out-len] (digest :shake128 bytes out-len))
+(defn shake256 [bytes out-len] (digest :shake256 bytes out-len))
+
+(defn hex
+  "Lowercase hex of a byte sequence."
+  [bytes]
+  (apply str (map (fn [b]
+                    (let [b (bit-and b 0xFF)]
+                      (str (nth "0123456789abcdef" (bit-shift-right b 4))
+                           (nth "0123456789abcdef" (bit-and b 15)))))
+                  bytes)))
+
+(defn sha3-224-hex [bytes] (hex (sha3-224 bytes)))
+(defn sha3-256-hex [bytes] (hex (sha3-256 bytes)))
+(defn sha3-384-hex [bytes] (hex (sha3-384 bytes)))
+(defn sha3-512-hex [bytes] (hex (sha3-512 bytes)))
+(defn shake128-hex [bytes out-len] (hex (shake128 bytes out-len)))
+(defn shake256-hex [bytes out-len] (hex (shake256 bytes out-len)))

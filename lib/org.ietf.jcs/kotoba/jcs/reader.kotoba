@@ -1,0 +1,439 @@
+;; jcs.reader -- strict JSON (RFC 8259) over bytes, in the Amu selfhost seed
+;; subset, so a loaderless static image can read a document it is about to
+;; trust (Linear JUN-349; kotoba-lang/amu#1469). Bytes are :vector-i64 of
+;; 0..255; positions are byte offsets.
+;;
+;;   json-valid?        the whole input is exactly one JSON value, with
+;;                      whitespace around it allowed
+;;   json-end           where the value starting at i ends, or a negative
+;;                      reason: -1 syntax, -2 deeper than 64, -3 a bad
+;;                      string (control byte, bad escape, bad UTF-8),
+;;                      -4 a bad number, -5 a duplicate key, -6 an escaped key
+;;   json-kind          1 object, 2 array, 3 string, 4 number, 5 true,
+;;                      6 false, 7 null (0 otherwise)
+;;   json-member        the value of an object's member, by key; -1 if absent
+;;   json-element       the n-th element of an array; -1 if absent
+;;   json-count         members of an object, elements of an array
+;;   json-string-bytes  a string's decoded bytes (escapes and \u pairs
+;;                      resolved); json-string the same as a :string
+;;   json-int-ok?       an integer, no fraction or exponent, |n| <= 2^53-1;
+;;                      json-int its value
+;;   json-canonical?    the document is in canonical form under both RFC 8785
+;;                      (JCS, this repo) and JSON.stringify of sorted-key data
+;;                      (murakumo's replicated_topology `encoded`): no
+;;                      whitespace, ASCII keys in strictly increasing byte
+;;                      order (= UTF-16 order), no all-digit keys (JavaScript
+;;                      objects enumerate those first, JCS does not), only
+;;                      the escapes both write, and integers within
+;;                      +-(2^53-1) (both print those as plain digits)
+;;   json-canonical-bytes  the value at i in that canonical form: members
+;;                      sorted, whitespace dropped, strings re-escaped, integers
+;;                      re-printed; no bytes when it has none (the same domain)
+;;
+;; Strict profile, beyond RFC 8259, so that two readers cannot see two
+;; different documents in the same bytes: duplicate keys are refused, keys
+;; may not contain escapes (so "a" and "\u0061" cannot both appear), a \u
+;; surrogate must be a pair, UTF-8 must be well formed (no overlong forms,
+;; no surrogates, nothing above U+10FFFF), and a byte order mark is not
+;; whitespace. Navigation and decoding assume a document json-valid?
+;; accepted.
+;;
+;; The seed has no forward references, so validation is one loop with an
+;; explicit stack (depth 64) instead of mutually recursive functions.
+;; Written in the Amu selfhost seed subset; README "Reading in a static
+;; image" has the gate.
+(ns jcs.reader
+  (:export [json-valid? json-end json-kind json-member json-element json-count
+            json-string-bytes json-string json-int-ok? json-int json-canonical?
+            json-canonical-bytes]))
+
+;; ---------------------------------------------------------------------------
+;; Bytes
+
+(defn- jr-at [b :vector-i64 i :i64] :i64 (if (and (>= i 0) (< i (vector-count b))) (vector-at b i) -1))
+(defn- jr-ws? [c :i64] :bool (or (= c 32) (= c 9) (= c 10) (= c 13)))
+(defn- jr-skip [b :vector-i64 i :i64] :i64 (loop [j i] (if (jr-ws? (jr-at b j)) (recur (+ j 1)) j)))
+(defn- jr-digit? [c :i64] :bool (and (>= c 48) (<= c 57)))
+(defn- jr-cont? [c :i64] :bool (and (>= c 128) (<= c 191)))
+(defn- jr-digits [b :vector-i64 j :i64] :i64 (loop [k j] (if (jr-digit? (jr-at b k)) (recur (+ k 1)) k)))
+(defn- jr-bytes [s :string] :vector-i64 (vector-i64-from-bytes (string-to-utf8 s)))
+
+(defn- jr-hex [c :i64] :i64
+  (cond (jr-digit? c) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        (and (>= c 65) (<= c 70)) (- c 55)
+        :else -1))
+
+(defn- jr-hex4 [b :vector-i64 k :i64] :i64
+  (let [a (jr-hex (jr-at b k)) c (jr-hex (jr-at b (+ k 1))) d (jr-hex (jr-at b (+ k 2))) e (jr-hex (jr-at b (+ k 3)))]
+    (if (or (< a 0) (< c 0) (< d 0) (< e 0)) -1 (+ (* a 4096) (+ (* c 256) (+ (* d 16) e))))))
+
+;; the width of the UTF-8 sequence at j (lead byte 0x80 or above), or -1
+(defn- jr-utf8 [b :vector-i64 j :i64] :i64
+  (let [c (jr-at b j) c1 (jr-at b (+ j 1)) c2 (jr-at b (+ j 2)) c3 (jr-at b (+ j 3))]
+    (cond (and (>= c 194) (<= c 223)) (if (jr-cont? c1) 2 -1)
+          (= c 224) (if (and (>= c1 160) (<= c1 191) (jr-cont? c2)) 3 -1)
+          (or (and (>= c 225) (<= c 236)) (= c 238) (= c 239)) (if (and (jr-cont? c1) (jr-cont? c2)) 3 -1)
+          (= c 237) (if (and (>= c1 128) (<= c1 159) (jr-cont? c2)) 3 -1)
+          (= c 240) (if (and (>= c1 144) (<= c1 191) (jr-cont? c2) (jr-cont? c3)) 4 -1)
+          (and (>= c 241) (<= c 243)) (if (and (jr-cont? c1) (jr-cont? c2) (jr-cont? c3)) 4 -1)
+          (= c 244) (if (and (>= c1 128) (<= c1 143) (jr-cont? c2) (jr-cont? c3)) 4 -1)
+          :else -1)))
+
+;; ---------------------------------------------------------------------------
+;; Tokens
+
+;; the escape at j (b[j] is the backslash): the index after it, or -1
+(defn- jr-escape [b :vector-i64 j :i64] :i64
+  (let [c (jr-at b (+ j 1))]
+    (cond (or (= c 34) (= c 92) (= c 47) (= c 98) (= c 102) (= c 110) (= c 114) (= c 116)) (+ j 2)
+          (= c 117)
+          (let [u (jr-hex4 b (+ j 2))]
+            (cond (< u 0) -1
+                  (and (>= u 55296) (<= u 56319))
+                  (if (and (= (jr-at b (+ j 6)) 92) (= (jr-at b (+ j 7)) 117))
+                    (let [v (jr-hex4 b (+ j 8))] (if (and (>= v 56320) (<= v 57343)) (+ j 12) -1))
+                    -1)
+                  (and (>= u 56320) (<= u 57343)) -1
+                  :else (+ j 6)))
+          :else -1)))
+
+;; the string at i (b[i] is the quote): the index after its closing quote,
+;; -3 when it is malformed, -6 when keys? and it holds an escape
+(defn- jr-str [b :vector-i64 i :i64 keys? :bool] :i64
+  (loop [j (+ i 1)]
+    (let [c (jr-at b j)]
+      (cond (< c 0) -3
+            (= c 34) (+ j 1)
+            (< c 32) -3
+            (= c 92) (if keys? -6 (let [e (jr-escape b j)] (if (< e 0) -3 (recur e))))
+            (< c 128) (recur (+ j 1))
+            :else (let [w (jr-utf8 b j)] (if (< w 0) -3 (recur (+ j w))))))))
+
+(defn- jr-number [b :vector-i64 i :i64] :i64
+  (let [j0 (if (= (jr-at b i) 45) (+ i 1) i)
+        c (jr-at b j0)
+        j1 (cond (= c 48) (+ j0 1) (and (>= c 49) (<= c 57)) (jr-digits b (+ j0 1)) :else -1)]
+    (if (< j1 0) -4
+      (let [j2 (if (= (jr-at b j1) 46) (if (jr-digit? (jr-at b (+ j1 1))) (jr-digits b (+ j1 2)) -1) j1)]
+        (if (< j2 0) -4
+          (let [e (jr-at b j2)]
+            (if (or (= e 101) (= e 69))
+              (let [k (if (or (= (jr-at b (+ j2 1)) 43) (= (jr-at b (+ j2 1)) 45)) (+ j2 2) (+ j2 1))]
+                (if (jr-digit? (jr-at b k)) (jr-digits b (+ k 1)) -4))
+              j2)))))))
+
+(defn- jr-lit [b :vector-i64 i :i64 lit :string] :i64
+  (let [l (jr-bytes lit)]
+    (loop [k 0] (if (= k (vector-count l)) (+ i k) (if (= (jr-at b (+ i k)) (vector-at l k)) (recur (+ k 1)) -1)))))
+
+;; the scalar or string token at i: its end, or a negative reason
+(defn- jr-scalar [b :vector-i64 i :i64] :i64
+  (let [c (jr-at b i)]
+    (cond (= c 34) (jr-str b i false)
+          (or (= c 45) (jr-digit? c)) (jr-number b i)
+          (= c 116) (jr-lit b i "true")
+          (= c 102) (jr-lit b i "false")
+          (= c 110) (jr-lit b i "null")
+          :else -1)))
+
+;; ---------------------------------------------------------------------------
+;; Skipping over text already validated
+
+(defn- jr-skip-string [b :vector-i64 i :i64] :i64
+  (loop [j (+ i 1)] (let [c (vector-at b j)] (cond (= c 34) (+ j 1) (= c 92) (recur (+ j 2)) :else (recur (+ j 1))))))
+
+(defn- jr-skip-value [b :vector-i64 i :i64] :i64
+  (let [c (vector-at b i)]
+    (cond (= c 34) (jr-skip-string b i)
+          (or (= c 123) (= c 91))
+          (loop [j (+ i 1) d 1]
+            (let [x (vector-at b j)]
+              (cond (= x 34) (recur (jr-skip-string b j) d)
+                    (or (= x 123) (= x 91)) (recur (+ j 1) (+ d 1))
+                    (or (= x 125) (= x 93)) (if (= d 1) (+ j 1) (recur (+ j 1) (- d 1)))
+                    :else (recur (+ j 1) d))))
+          :else (loop [j i] (let [x (jr-at b j)] (if (or (< x 0) (= x 44) (= x 125) (= x 93) (jr-ws? x)) j (recur (+ j 1))))))))
+
+;; do the bytes between the quotes of the strings at [a, ae) and [c, ce) agree?
+(defn- jr-span=? [b :vector-i64 a :i64 ae :i64 c :i64 ce :i64] :bool
+  (if (not (= (- ae a) (- ce c))) false
+    (loop [k 0] (if (= k (- ae a)) true (if (= (vector-at b (+ a k)) (vector-at b (+ c k))) (recur (+ k 1)) false)))))
+
+;; does the object at obj already have, before ks, a key equal to [ks, ke)?
+(defn- jr-dup? [b :vector-i64 obj :i64 ks :i64 ke :i64] :bool
+  (loop [j (jr-skip b (+ obj 1))]
+    (if (>= j ks) false
+      (let [e (jr-skip-string b j)]
+        (if (jr-span=? b j e ks ke) true
+          (let [v (jr-skip b (+ (jr-skip b e) 1)) n (jr-skip b (jr-skip-value b v))]
+            (recur (jr-skip b (+ n 1)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Validation: one loop, an explicit stack of container kinds (1 object,
+;; 2 array) and object starts. Modes: 0 a value, 1 after a value, 2 a key,
+;; 3 a key or }, 4 a value or ].
+
+(defn json-end [b :vector-i64 start :i64] :i64
+  (let [kinds (vector-alloc 65) objs (vector-alloc 65)]
+    (loop [i start sp 0 mode 0]
+      (cond
+        (= mode 0)
+        (let [c (jr-at b i)]
+          (cond (or (= c 123) (= c 91))
+                (if (>= sp 64) -2
+                  (let [z (vector-assoc! kinds sp (if (= c 123) 1 2)) y (vector-assoc! objs sp i)]
+                    (recur (jr-skip b (+ i 1)) (+ sp 1) (if (= c 123) 3 4))))
+                :else (let [e (jr-scalar b i)] (if (< e 0) e (recur e sp 1)))))
+        (= mode 1)
+        (if (= sp 0) i
+          (let [j (jr-skip b i) c (jr-at b j) k (vector-at kinds (- sp 1))]
+            (cond (= c 44) (recur (jr-skip b (+ j 1)) sp (if (= k 1) 2 0))
+                  (and (= c 125) (= k 1)) (recur (+ j 1) (- sp 1) 1)
+                  (and (= c 93) (= k 2)) (recur (+ j 1) (- sp 1) 1)
+                  :else -1)))
+        (or (= mode 2) (= mode 3))
+        (let [c (jr-at b i)]
+          (cond (and (= mode 3) (= c 125)) (recur (+ i 1) (- sp 1) 1)
+                (= c 34)
+                (let [e (jr-str b i true)]
+                  (cond (< e 0) e
+                        (jr-dup? b (vector-at objs (- sp 1)) i e) -5
+                        :else (let [j (jr-skip b e)] (if (= (jr-at b j) 58) (recur (jr-skip b (+ j 1)) sp 0) -1))))
+                :else -1))
+        :else (if (= (jr-at b i) 93) (recur (+ i 1) (- sp 1) 1) (recur i sp 0))))))
+
+(defn json-valid? [b :vector-i64] :bool
+  (let [s (jr-skip b 0) e (json-end b s)]
+    (and (>= e 0) (= (jr-skip b e) (vector-count b)))))
+
+;; ---------------------------------------------------------------------------
+;; Navigation (over a document json-valid? accepted)
+
+(defn json-kind [b :vector-i64 i :i64] :i64
+  (let [c (jr-at b i)]
+    (cond (= c 123) 1 (= c 91) 2 (= c 34) 3 (or (= c 45) (jr-digit? c)) 4
+          (= c 116) 5 (= c 102) 6 (= c 110) 7 :else 0)))
+
+(defn json-member [b :vector-i64 obj :i64 key :string] :i64
+  (if (not (= (jr-at b obj) 123)) -1
+    (let [k (jr-bytes key)]
+      (loop [j (jr-skip b (+ obj 1))]
+        (if (not (= (jr-at b j) 34)) -1
+          (let [e (jr-skip-string b j)
+                v (jr-skip b (+ (jr-skip b e) 1))
+                same (and (= (- (- e j) 2) (vector-count k))
+                          (loop [m 0] (if (= m (vector-count k)) true (if (= (vector-at b (+ (+ j 1) m)) (vector-at k m)) (recur (+ m 1)) false))))]
+            (if same v
+              (let [n (jr-skip b (jr-skip-value b v))]
+                (if (= (jr-at b n) 44) (recur (jr-skip b (+ n 1))) -1)))))))))
+
+(defn json-element [b :vector-i64 arr :i64 n :i64] :i64
+  (if (or (not (= (jr-at b arr) 91)) (< n 0)) -1
+    (loop [j (jr-skip b (+ arr 1)) k 0]
+      (if (= (jr-at b j) 93) -1
+        (if (= k n) j
+          (let [m (jr-skip b (jr-skip-value b j))]
+            (if (= (jr-at b m) 44) (recur (jr-skip b (+ m 1)) (+ k 1)) -1)))))))
+
+(defn json-count [b :vector-i64 i :i64] :i64
+  (let [c (jr-at b i)]
+    (if (not (or (= c 123) (= c 91))) 0
+      (let [j0 (jr-skip b (+ i 1))]
+        (if (or (= (jr-at b j0) 125) (= (jr-at b j0) 93)) 0
+          (loop [j j0 n 1]
+            (let [v (if (= c 123) (jr-skip b (+ (jr-skip b (jr-skip-string b j)) 1)) j)
+                  m (jr-skip b (jr-skip-value b v))]
+              (if (= (jr-at b m) 44) (recur (jr-skip b (+ m 1)) (+ n 1)) n))))))))
+
+;; ---------------------------------------------------------------------------
+;; Decoding
+
+(defn- jr-unescape [d :i64] :i64
+  (cond (= d 98) 8 (= d 102) 12 (= d 110) 10 (= d 114) 13 (= d 116) 9 :else d))
+
+(defn- jr-put-utf8 [out :vector-i64 n :i64 cp :i64] :i64
+  (cond (< cp 128) (let [z (vector-assoc! out n cp)] (+ n 1))
+        (< cp 2048) (let [z (vector-assoc! out n (+ 192 (quot cp 64))) y (vector-assoc! out (+ n 1) (+ 128 (rem cp 64)))] (+ n 2))
+        (< cp 65536) (let [z (vector-assoc! out n (+ 224 (quot cp 4096))) y (vector-assoc! out (+ n 1) (+ 128 (rem (quot cp 64) 64)))
+                           x (vector-assoc! out (+ n 2) (+ 128 (rem cp 64)))] (+ n 3))
+        :else (let [z (vector-assoc! out n (+ 240 (quot cp 262144))) y (vector-assoc! out (+ n 1) (+ 128 (rem (quot cp 4096) 64)))
+                    x (vector-assoc! out (+ n 2) (+ 128 (rem (quot cp 64) 64))) w (vector-assoc! out (+ n 3) (+ 128 (rem cp 64)))] (+ n 4))))
+
+(defn json-string-bytes [b :vector-i64 i :i64] :vector-i64
+  (let [e (jr-skip-string b i) out (vector-alloc (- e i))
+        n (loop [j (+ i 1) n 0]
+            (if (>= j (- e 1)) n
+              (let [c (vector-at b j)]
+                (if (= c 92)
+                  (let [d (vector-at b (+ j 1))]
+                    (if (= d 117)
+                      (let [u (jr-hex4 b (+ j 2))
+                            pair (and (>= u 55296) (<= u 56319))
+                            cp (if pair (+ 65536 (+ (* (- u 55296) 1024) (- (jr-hex4 b (+ j 8)) 56320))) u)]
+                        (recur (+ j (if pair 12 6)) (jr-put-utf8 out n cp)))
+                      (let [z (vector-assoc! out n (jr-unescape d))] (recur (+ j 2) (+ n 1)))))
+                  (let [z (vector-assoc! out n c)] (recur (+ j 1) (+ n 1)))))))]
+    (loop [k 0 r (vector-alloc n)] (if (= k n) r (recur (+ k 1) (vector-assoc! r k (vector-at out k)))))))
+
+(defn json-string [b :vector-i64 i :i64] :string (string-from-utf8 (bytes-from-vector-i64 (json-string-bytes b i))))
+
+(defn json-int-ok? [b :vector-i64 i :i64] :bool
+  (let [j0 (if (= (jr-at b i) 45) (+ i 1) i) e (jr-digits b j0) x (jr-at b e)]
+    (and (jr-digit? (jr-at b j0)) (not (= x 46)) (not (= x 101)) (not (= x 69)) (<= (- e j0) 16)
+         (<= (loop [k j0 v 0] (if (= k e) v (recur (+ k 1) (+ (* v 10) (- (vector-at b k) 48))))) 9007199254740991))))
+
+(defn json-int [b :vector-i64 i :i64] :i64
+  (let [neg (= (jr-at b i) 45) j0 (if neg (+ i 1) i) e (jr-digits b j0)
+        v (loop [k j0 v 0] (if (= k e) v (recur (+ k 1) (+ (* v 10) (- (vector-at b k) 48)))))]
+    (if neg (- 0 v) v)))
+
+;; ---------------------------------------------------------------------------
+;; Canonical form
+
+;; the escapes JSON.stringify writes: \" \\ \b \f \n \r \t, and \u00xx in
+;; lowercase for the other control bytes; nothing else
+(defn- jr-canon-string? [b :vector-i64 i :i64 e :i64] :bool
+  (loop [j (+ i 1)]
+    (if (>= j (- e 1)) true
+      (if (= (vector-at b j) 92)
+        (let [d (vector-at b (+ j 1))]
+          (cond (or (= d 34) (= d 92) (= d 98) (= d 102) (= d 110) (= d 114) (= d 116)) (recur (+ j 2))
+                (= d 117)
+                (let [u (jr-hex4 b (+ j 2))
+                      lower (loop [k 2] (if (= k 6) true (let [h (vector-at b (+ j k))] (if (and (>= h 65) (<= h 70)) false (recur (+ k 1))))))]
+                  (if (and lower (< u 32) (not (= u 8)) (not (= u 9)) (not (= u 10)) (not (= u 12)) (not (= u 13)))
+                    (recur (+ j 6)) false))
+                :else false))
+        (recur (+ j 1))))))
+
+;; a key for the canonical form: ASCII, not all digits
+(defn- jr-canon-key? [b :vector-i64 i :i64 e :i64] :bool
+  (loop [j (+ i 1) digits true]
+    (if (>= j (- e 1)) (not digits)
+      (let [c (vector-at b j)] (if (>= c 128) false (recur (+ j 1) (and digits (jr-digit? c))))))))
+
+;; is the key [c, ce) after the key [a, ae), byte by byte?
+(defn- jr-after? [b :vector-i64 a :i64 ae :i64 c :i64 ce :i64] :bool
+  (loop [k 1]
+    (let [x (if (< (+ a k) (- ae 1)) (vector-at b (+ a k)) -1) y (if (< (+ c k) (- ce 1)) (vector-at b (+ c k)) -1)]
+      (cond (and (< x 0) (< y 0)) false
+            (= x y) (recur (+ k 1))
+            :else (> y x)))))
+
+(defn- jr-canon-number? [b :vector-i64 i :i64 e :i64] :bool
+  (and (json-int-ok? b i) (= (jr-digits b (if (= (vector-at b i) 45) (+ i 1) i)) e)
+       (not (and (= (vector-at b i) 45) (= (vector-at b (+ i 1)) 48)))))
+
+;; one pass over a valid document. The stack holds, per open container, its
+;; kind, whether the next string is a key, and the previous key's span.
+(defn json-canonical? [b :vector-i64] :bool
+  (let [kinds (vector-alloc 65) want (vector-alloc 65) pa (vector-alloc 65) pe (vector-alloc 65)]
+    (loop [j 0 sp 0]
+      (if (= j (vector-count b)) true
+        (let [c (vector-at b j)]
+          (cond (jr-ws? c) false
+                (or (= c 123) (= c 91))
+                (let [z (vector-assoc! kinds sp (if (= c 123) 1 2)) y (vector-assoc! want sp (if (= c 123) 1 0)) x (vector-assoc! pa sp -1)]
+                  (recur (+ j 1) (+ sp 1)))
+                (or (= c 125) (= c 93)) (recur (+ j 1) (- sp 1))
+                (= c 44) (let [z (if (and (> sp 0) (= (vector-at kinds (- sp 1)) 1)) (vector-assoc! want (- sp 1) 1) want)] (recur (+ j 1) sp))
+                (= c 58) (recur (+ j 1) sp)
+                (= c 34)
+                (let [e (jr-skip-string b j)]
+                  (if (not (jr-canon-string? b j e)) false
+                    (if (and (> sp 0) (= (vector-at want (- sp 1)) 1))
+                      (let [d (- sp 1)]
+                        (if (and (jr-canon-key? b j e) (or (< (vector-at pa d) 0) (jr-after? b (vector-at pa d) (vector-at pe d) j e)))
+                          (let [z (vector-assoc! pa d j) y (vector-assoc! pe d e) x (vector-assoc! want d 0)] (recur e sp))
+                          false))
+                      (recur e sp))))
+                (or (= c 45) (jr-digit? c))
+                (let [e (jr-number b j)] (if (jr-canon-number? b j e) (recur e sp) false))
+                :else (recur (jr-skip-value b j) sp)))))))
+
+;; ---------------------------------------------------------------------------
+;; Canonical bytes: the RFC 8785 form of a value in a valid document, the
+;; bytes murakumo signs, emitted from the parse (members sorted, whitespace
+;; dropped, strings re-escaped, integers re-printed). The same domain as
+;; json-canonical?: a fraction or exponent, an integer beyond +-(2^53-1),
+;; or a non-ASCII or all-digit key has no canonical form here, and the
+;; answer is then no bytes. Canonical output is never longer than its input.
+
+(defn- jr-put [out :vector-i64 n :i64 c :i64] :i64 (let [z (vector-assoc! out n c)] (+ n 1)))
+
+(defn- jr-put-text [out :vector-i64 n :i64 s :string] :i64
+  (let [t (jr-bytes s)] (loop [k 0 m n] (if (= k (vector-count t)) m (recur (+ k 1) (jr-put out m (vector-at t k)))))))
+
+(defn- jr-hexd [v :i64] :i64 (if (< v 10) (+ v 48) (+ v 87)))
+
+;; decoded bytes, escaped the way RFC 8785 and JSON.stringify write them
+(defn- jr-put-string [out :vector-i64 n :i64 s :vector-i64] :i64
+  (let [m0 (jr-put out n 34)
+        m1 (loop [k 0 m m0]
+             (if (= k (vector-count s)) m
+               (let [c (vector-at s k)]
+                 (recur (+ k 1)
+                        (cond (= c 34) (jr-put out (jr-put out m 92) 34)
+                              (= c 92) (jr-put out (jr-put out m 92) 92)
+                              (= c 8) (jr-put out (jr-put out m 92) 98)
+                              (= c 12) (jr-put out (jr-put out m 92) 102)
+                              (= c 10) (jr-put out (jr-put out m 92) 110)
+                              (= c 13) (jr-put out (jr-put out m 92) 114)
+                              (= c 9) (jr-put out (jr-put out m 92) 116)
+                              (< c 32) (jr-put out (jr-put out (jr-put out (jr-put out (jr-put out (jr-put out m 92) 117) 48) 48)
+                                                                (jr-hexd (quot c 16))) (jr-hexd (rem c 16)))
+                              :else (jr-put out m c))))))]
+    (jr-put out m1 34)))
+
+;; members of an object, key starts in ks and value starts in vs, sorted by key
+(defn- jr-sort-members [b :vector-i64 ks :vector-i64 vs :vector-i64 m :i64] :i64
+  (loop [x 0]
+    (if (>= x m) 0
+      (let [best (loop [y (+ x 1) bi x]
+                   (if (= y m) bi
+                     (let [ky (vector-at ks y) kb (vector-at ks bi)]
+                       (recur (+ y 1) (if (jr-after? b ky (jr-skip-string b ky) kb (jr-skip-string b kb)) y bi)))))
+            k1 (vector-at ks x) v1 (vector-at vs x) k2 (vector-at ks best) v2 (vector-at vs best)
+            a (vector-assoc! ks x k2) c (vector-assoc! vs x v2) d (vector-assoc! ks best k1) e (vector-assoc! vs best v1)]
+        (recur (+ x 1))))))
+
+(defn- jr-emit [b :vector-i64 i :i64 out :vector-i64 n :i64] :i64
+  (let [k (json-kind b i)]
+    (cond (< n 0) n
+          (= k 1)
+          (let [m (json-count b i) ks (vector-alloc m) vs (vector-alloc m)
+                f (loop [j (jr-skip b (+ i 1)) x 0]
+                    (if (= x m) 0
+                      (let [e (jr-skip-string b j) v (jr-skip b (+ (jr-skip b e) 1))
+                            z (vector-assoc! ks x j) y (vector-assoc! vs x v)
+                            nx (jr-skip b (jr-skip-value b v))]
+                        (recur (if (= (jr-at b nx) 44) (jr-skip b (+ nx 1)) nx) (+ x 1)))))
+                ok (loop [x 0] (if (= x m) true (if (jr-canon-key? b (vector-at ks x) (jr-skip-string b (vector-at ks x))) (recur (+ x 1)) false)))]
+            (if (not ok) -1
+              (let [s (jr-sort-members b ks vs m)
+                    m2 (loop [x 0 p (jr-put out n 123)]
+                         (if (or (= x m) (< p 0)) p
+                           (let [p1 (if (> x 0) (jr-put out p 44) p)
+                                 k0 (vector-at ks x) ke (jr-skip-string b k0)
+                                 p2 (loop [q k0 r p1] (if (= q ke) r (recur (+ q 1) (jr-put out r (vector-at b q)))))]
+                             (recur (+ x 1) (jr-emit b (vector-at vs x) out (jr-put out p2 58))))))]
+                (if (< m2 0) -1 (jr-put out m2 125)))))
+          (= k 2)
+          (let [m2 (loop [j (jr-skip b (+ i 1)) x 0 p (jr-put out n 91)]
+                     (if (or (= (jr-at b j) 93) (< p 0)) p
+                       (let [p1 (jr-emit b j out (if (> x 0) (jr-put out p 44) p))
+                             nx (jr-skip b (jr-skip-value b j))]
+                         (recur (if (= (jr-at b nx) 44) (jr-skip b (+ nx 1)) nx) (+ x 1) p1))))]
+            (if (< m2 0) -1 (jr-put out m2 93)))
+          (= k 3) (jr-put-string out n (json-string-bytes b i))
+          (= k 4) (if (json-int-ok? b i) (jr-put-text out n (string-from-i64 (json-int b i))) -1)
+          (= k 5) (jr-put-text out n "true")
+          (= k 6) (jr-put-text out n "false")
+          (= k 7) (jr-put-text out n "null")
+          :else -1)))
+
+(defn json-canonical-bytes [b :vector-i64 i :i64] :vector-i64
+  (let [out (vector-alloc (vector-count b)) n (jr-emit b i out 0)]
+    (if (< n 0) (vector-alloc 0)
+      (loop [k 0 r (vector-alloc n)] (if (= k n) r (recur (+ k 1) (vector-assoc! r k (vector-at out k))))))))

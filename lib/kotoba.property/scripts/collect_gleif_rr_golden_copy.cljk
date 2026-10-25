@@ -1,0 +1,128 @@
+(ns collect-gleif-rr-golden-copy
+  "Bulk ingest of the GLEIF RR (Level 2) Golden Copy into the portable EDN
+   corpus this workspace queries with Datalog.
+
+   Level 1 answers 'who is this legal entity'. This file answers 'who owns it',
+   which is the question a Level 1 projection cannot reach at any size, because
+   an entity record carries no edge. 483,263 relationships in the 20260803-0000
+   publish — two orders of magnitude smaller than the 3.4M entity file, so the
+   whole thing is tractable where the entity universe is not.
+
+   Same shape as `collect_gleif_golden_copy.cljs`: `unzip -p` streams the
+   member so the CSV never materialises on disk, the archive is hashed so a
+   corpus traces to its publish, and line 1 of the output is a provenance
+   manifest. The corpus is a cache artifact, not a git artifact — commit the
+   *projections* built by `scripts/project_gleif_rr_corpus.cljk`.
+
+   Usage:
+     kbb --backend sci -cp src scripts/collect_gleif_rr_golden_copy.cljk --zip <rr-golden-copy.csv.zip>
+     kbb --backend sci -cp src scripts/collect_gleif_rr_golden_copy.cljk --zip <path> --out <corpus.edn> --limit 1000"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.gleif-golden-copy :as l1]
+            [kotoba.property.gleif-rr-golden-copy :as rr]
+            ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["readline" :as readline]))
+
+(def ^:private default-out
+  (.join path (or (.-HOME js/process.env) ".") ".cache" "gleif" "gleif-rr-corpus.edn"))
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- sha256-file [p]
+  (-> (.createHash crypto "sha256")
+      (.update (.readFileSync fs p))
+      (.digest "hex")))
+
+(defn- zip-entry-name [zip]
+  (let [out (.toString (.execFileSync cp "unzip" #js ["-Z1" zip]))]
+    (first (remove empty? (map str/trim (str/split-lines out))))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        zip (arg-value args "--zip" nil)
+        out (arg-value args "--out" default-out)
+        limit (when-let [l (arg-value args "--limit" nil)] (js/parseInt l 10))
+        quiet? (flag? args "--quiet")]
+    (when-not zip
+      (println "usage: collect_gleif_rr_golden_copy.cljs --zip <rr-golden-copy.csv.zip> [--out <corpus.edn>] [--limit N]")
+      (.exit js/process 2))
+    (coverage/assert-collectable! rr/source-id)
+    (let [entry (zip-entry-name zip)
+          content-sha256 (sha256-file zip)
+          observed-at (.toISOString (js/Date.))
+          publish (rr/publish-id entry)
+          _ (.mkdirSync fs (.dirname path out) #js {:recursive true})
+          tmp (str out ".partial")
+          sink (.createWriteStream fs tmp)
+          proc (.spawn cp "unzip" #js ["-p" zip entry]
+                       #js {:stdio #js ["ignore" "pipe" "inherit"]})
+          rl (.createInterface readline #js {:input (.-stdout proc) :crlfDelay ##Inf})
+          state (atom {:header nil :rows 0 :written 0 :skipped 0 :pending nil})]
+      (.write sink (str (pr-str (rr/corpus-manifest {:publish publish
+                                                     :content-sha256 content-sha256
+                                                     :observed-at observed-at
+                                                     :source-archive zip}))
+                        "\n"))
+      (let [emit!
+            (fn [line]
+              (let [{:keys [header rows]} @state]
+                (if-not header
+                  (swap! state assoc :header
+                         (rr/selection (l1/header-index (l1/parse-csv-line line))))
+                  (if (and limit (>= rows limit))
+                    (.close rl)
+                    (let [rec (rr/row->record line header)]
+                      (swap! state update :rows inc)
+                      (if rec
+                        (do (.write sink (str (pr-str rec) "\n"))
+                            (swap! state update :written inc))
+                        (swap! state update :skipped inc))
+                      (when (and (not quiet?) (zero? (mod (:rows @state) 100000)))
+                        (println "  ..." (:rows @state) "rows")))))))]
+        (.on rl "line"
+             (fn [line]
+               ;; A quoted field may contain a newline, so a record is complete
+               ;; only once the *next* record starts.
+               (let [pending (:pending @state)]
+                 (cond
+                   (l1/record-start? line)
+                   (do (when pending (emit! pending))
+                       (swap! state assoc :pending line))
+
+                   pending
+                   (swap! state assoc :pending (str pending "\n" line))
+
+                   ;; The header row does not look like a record start.
+                   :else (emit! line)))))
+        (.on rl "close"
+             (fn []
+               (when-let [pending (:pending @state)]
+                 (swap! state assoc :pending nil)
+                 (emit! pending))
+               ;; `--limit` closes the reader early; without killing the
+               ;; producer the process sits until `unzip` has streamed the file.
+               (try (.kill proc) (catch :default _ nil))
+               (.end sink
+                     (fn []
+                       (.renameSync fs tmp out)
+                       (let [{:keys [rows written skipped]} @state]
+                         (println (pr-str {:corpus out
+                                           :source-archive zip
+                                           :zip-entry entry
+                                           :publish publish
+                                           :content-sha256 content-sha256
+                                           :observed-at observed-at
+                                           :rows rows
+                                           :written written
+                                           :skipped skipped
+                                           :bytes (.-size (.statSync fs out))}))))))))
+      nil)))
+
+(-main)

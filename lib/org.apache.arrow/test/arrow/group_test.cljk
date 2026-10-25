@@ -1,0 +1,116 @@
+(ns arrow.group-test
+  "GROUP BY over a real Arrow file.
+
+  `columnar.group` has its own suite against a source built from literal
+  chunks, and that suite is the one that can hand the engine absent or
+  over-wide statistics on demand. What it cannot do is show the fold crossing
+  boundaries that a **format** decided: record batches whose row counts came
+  out of message headers, columns whose buffers were fetched at their own
+  offsets, and null counts that came from field nodes rather than from a map
+  literal.
+
+  This is also the first place grouping meets a source that records **no
+  min/max**, which is the interesting case: a grouped query over Arrow prunes
+  nothing on bounds, and the chunk counts say so."
+  (:require [arrow.source :as asrc]
+            [arrow.write :as w]
+            [clojure.test :refer [deftest is testing]]
+            [columnar.group :as group]
+            [columnar.source :as csrc]
+            [columnar.vector :as cvec]
+            #?(:clj [clojure.java.io :as io])))
+
+(defn read-fixture [name]
+  #?(:clj (with-open [in (io/input-stream (io/file "lib/org.apache.arrow/test/fixtures" name))]
+            (let [out (java.io.ByteArrayOutputStream.)]
+              (io/copy in out)
+              (mapv #(bit-and % 0xff) (.toByteArray out))))
+     :cljs (vec (js/Array.from (.readFileSync (js/require "fs")
+                                              (str "lib/org.apache.arrow/test/fixtures/" name))))))
+
+(def plain (delay (read-fixture "plain.arrow")))
+
+(deftest a-group-folds-across-real-record-batches
+  ;; plain.arrow is three batches of three rows; region alternates across the
+  ;; batch boundaries, so a fold that reset per batch would give six groups.
+  (let [{:keys [rows chunks-read chunks-skipped]}
+        (group/group (asrc/open @plain)
+                     {:group-by ["region"]
+                      :aggs [{:as "n" :agg :count}
+                             {:as "total" :agg :sum :column "price"}
+                             {:as "lo" :agg :min :column "price"}
+                             {:as "hi" :agg :max :column "price"}]})]
+    (is (= 3 chunks-read))
+    (is (= 0 chunks-skipped))
+    ;; east: 10 20 120 130 210   west: 30 110 220 230
+    (is (= [{"region" "east" "n" 5 "total" 490 "lo" 10 "hi" 210}
+            {"region" "west" "n" 4 "total" 590 "lo" 30 "hi" 230}]
+           rows))))
+
+(deftest nulls-from-field-nodes-are-counted-not-summed
+  ;; `note` is null in 7 of 9 rows, and those nulls came out of the record
+  ;; batch's FieldNode rather than from a literal.
+  (let [{:keys [rows]}
+        (group/group (asrc/open @plain)
+                     {:group-by ["region"]
+                      :aggs [{:as "rows" :agg :count}
+                             {:as "notes" :agg :count-non-null :column "note"}]})]
+    (is (= [{"region" "east" "rows" 5 "notes" 2}
+            {"region" "west" "rows" 4 "notes" 0}] rows)
+        "count is rows in the group; count-non-null is how many had a value")))
+
+(deftest grouping-by-a-nullable-column-keeps-the-null-group
+  (let [{:keys [rows]}
+        (group/group (asrc/open @plain)
+                     {:group-by ["note"] :aggs [{:as "n" :agg :count}]})]
+    (is (= #{nil "clearance" "sale"} (set (map #(get % "note") rows))))
+    (is (= 7 (some #(when (nil? (get % "note")) (get % "n")) rows))
+        "the seven rows with no note are a group, not seven dropped rows")))
+
+(deftest a-grouped-query-over-arrow-prunes-nothing-on-bounds
+  ;; The format records no min/max, so `columnar.stats` refuses to prune and
+  ;; every chunk is read -- the same honest cost the scan path pays, and the
+  ;; reason a grouped query over Parquet can be cheaper for the same data.
+  (let [{:keys [rows chunks-read chunks-skipped]}
+        (group/group (asrc/open @plain)
+                     {:group-by ["region"]
+                      :aggs [{:as "n" :agg :count}]
+                      :predicates [[:> "price" 200]]})]
+    (is (= 3 chunks-read))
+    (is (= 0 chunks-skipped))
+    (testing "and the answer is still exactly right -- pruning decides what to
+              read, never what matches"
+      (is (= [{"region" "east" "n" 1} {"region" "west" "n" 2}] rows)))))
+
+(deftest an-all-null-chunk-is-still-skipped-under-a-group-by
+  ;; The one proof Arrow's metadata does supply: null_count == length. It
+  ;; works under grouping because `columnar.stats` derives it from :rows and
+  ;; :nulls rather than from bounds.
+  (let [bs (w/file {:fields [{:name "k" :type :utf8}
+                             {:name "v" :type :int64}]
+                    :batches [[(cvec/column :utf8 ["a" "b"])
+                               (cvec/column :int64 [nil nil])]
+                              [(cvec/column :utf8 ["a" "b"])
+                               (cvec/column :int64 [1 2])]]})
+        {:keys [rows chunks-read chunks-skipped]}
+        (group/group (asrc/open bs)
+                     {:group-by ["k"]
+                      :aggs [{:as "s" :agg :sum :column "v"}]
+                      :predicates [[:not-null "v"]]})]
+    (is (= 1 chunks-read))
+    (is (= 1 chunks-skipped) "the batch whose v is entirely null")
+    (is (= [{"k" "a" "s" 1} {"k" "b" "s" 2}] rows))))
+
+;; ── the capability, end to end ──────────────────────────────────────────────
+
+(deftest a-grouped-result-can-be-written-back-as-a-table
+  ;; GROUP BY plus the writer: an aggregate becomes an object other systems
+  ;; open. This is the pair of P2 items that are done, meeting.
+  (let [{:keys [rows]} (group/group (asrc/open @plain)
+                                    {:group-by ["region"]
+                                     :aggs [{:as "total" :agg :sum :column "price"}]})
+        bs (w/of-columns (w/columns-of-rows [["region" :utf8] ["total" :int64]] rows))
+        back (asrc/open bs)]
+    (is (= ["region" "total"] (csrc/-schema back)))
+    (let [col (csrc/-read-column back 0 "total")]
+      (is (= [490 590] (mapv #(cvec/value-at col %) (range (cvec/count col))))))))

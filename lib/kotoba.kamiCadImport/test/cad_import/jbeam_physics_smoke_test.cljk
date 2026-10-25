@@ -1,0 +1,116 @@
+(ns cad-import.jbeam-physics-smoke-test
+  "Physics smoke test -- load each demo vehicle through the full
+   emit -> load chain, place it on a flat ground, and step the
+   simulator for ~1 second. We don't tune anything for performance
+   here; we only confirm that:
+
+   1. `vehicle.vehicle/step` doesn't throw
+   2. No node position becomes NaN / infinite
+   3. The centre of mass doesn't fly off into space
+   4. Beam breakage during settling is bounded (a few hardpoints
+      failing is fine; a cascade would mean the spring constants are
+      catastrophically wrong)
+
+   Ported 1:1 from the original crate's `tests/jbeam_physics_smoke.rs`
+   (kami-cad-import, kotoba-lang/kami-engine, deleted PR #82),
+   ADR-2607010930. Uses `vehicle.*` (kotoba-lang/kami-vehicle, also
+   restored to CLJC under the same ADR) for the actual physics step."
+  (:require [kotoba.test :refer [deftest is]]
+            [cad-import.demos :as demos]
+            [cad-import.jbeam-emit :as je]
+            [vehicle.jbeam :as vjbeam]
+            [vehicle.vehicle :as veh]
+            [vehicle.vec3 :as v3]
+            [vehicle.ground :as ground]))
+
+(defn- finite? [n]
+  #?(:clj (Double/isFinite n) :cljs (js/Number.isFinite n)))
+
+(defn- finite-node-positions [v]
+  (every? (fn [n]
+            (let [{:keys [x y z]} (:position n)]
+              (and (finite? x) (finite? y) (finite? z))))
+          (:nodes v)))
+
+(defn- step-for [v grnd frames dt]
+  (reduce (fn [v _] (veh/step v dt grnd)) v (range frames)))
+
+(defn- load-demo [demo-fn]
+  (let [asm (demo-fn)
+        [_ jbeam] (je/emit asm)
+        [status v] (vjbeam/load-edn jbeam)]
+    (is (= status :ok))
+    v))
+
+(deftest synth-sedan-settles-for-one-second
+  (let [v (load-demo demos/synth-sedan)
+        grnd (ground/flat-ground -0.1)
+        initial-beams (count (:beams v))
+        v (step-for v grnd 60 (/ 1.0 60.0))]
+    (is (finite-node-positions v) "finite positions after 1s")
+    (let [com (veh/center-of-mass v)]
+      (is (< (v3/length com) 50.0)
+          (str "centre of mass flew off: " com " (length " (v3/length com) ")")))
+    (let [broken (count (filter :broken (:beams v)))
+          broken-pct (* (/ (double broken) initial-beams) 100.0)]
+      (is (< broken-pct 25.0)
+          (str broken "/" initial-beams " beams broke during settle (" broken-pct "% -- Phase 2.5 spring tuning needed)")))))
+
+(deftest roadster-settles-for-one-second
+  (let [v (load-demo demos/roadster-na)
+        grnd (ground/flat-ground -0.1)
+        initial-beams (count (:beams v))
+        v (step-for v grnd 60 (/ 1.0 60.0))]
+    (is (finite-node-positions v) "finite positions after 1s")
+    (let [com (veh/center-of-mass v)]
+      (is (< (v3/length com) 50.0)
+          (str "centre of mass flew off: " com " (length " (v3/length com) ")")))
+    ;; roadster has 32 hardpoint joints and many auto-emitted beams; a
+    ;; tighter bound surfaces material-table regressions early.
+    (let [broken (count (filter :broken (:beams v)))
+          broken-pct (* (/ (double broken) initial-beams) 100.0)]
+      (is (< broken-pct 30.0)
+          (str broken "/" initial-beams " beams broke during settle (" broken-pct "% -- Phase 2.5)")))))
+
+(deftest roadster-ring-deforms-under-load
+  ;; Phase 2.6 evidence: tire ring nodes nearest the ground should sit
+  ;; at or just above the ground plane (the ring spring is unilateral so
+  ;; ring nodes never penetrate appreciably). At the same time, ring
+  ;; nodes near the top of the wheel should remain near their ideal
+  ;; radius -- proof that the ring is deforming, not rigid.
+  (let [v (load-demo demos/roadster-na)
+        grnd (ground/flat-ground -0.1)
+        v (step-for v grnd 60 (/ 1.0 60.0))
+        tire-ys (map #(:y (:position %)) (filter #(= (:group %) :wheel-tire) (:nodes v)))
+        tire-y-min (apply min tire-ys)
+        tire-y-max (apply max tire-ys)]
+    ;; Tire nodes never penetrate the ground (allow a 5mm tolerance for
+    ;; XPBD residual at 30 iterations).
+    (is (> tire-y-min -0.105) (str "lowest tire node " tire-y-min " below ground -0.105m tolerance"))
+    ;; Tread band has at least 30cm spread top-to-bottom -- a rigid disc
+    ;; would have ~60cm so we just assert the ring isn't collapsed.
+    (let [spread (- tire-y-max tire-y-min)]
+      (is (> spread 0.30) (str "tire ring spread " spread " m -- ring collapsed?")))))
+
+(deftest roadster-throttle-accelerates-forward
+  ;; After settling, 2 seconds of full throttle should move the centre
+  ;; of mass forward by at least 0.30m. This proves the entire chain --
+  ;; engine torque -> clutch -> gearbox -> diff -> wheel omega ->
+  ;; Pacejka slip -> fx -> contact-patch ring force -> chassis -- is
+  ;; actually transmitting load.
+  (let [v (load-demo demos/roadster-na)
+        grnd (ground/flat-ground -0.1)
+        v (step-for v grnd 30 (/ 1.0 60.0))
+        com-settled (veh/center-of-mass v)
+        v (-> v
+              (assoc-in [:controls :throttle] 1.0)
+              (assoc-in [:powertrain :gearbox :current-gear] 1)
+              (assoc-in [:powertrain :gearbox :shift-progress] 1.0))
+        v (step-for v grnd 120 (/ 1.0 60.0))]
+    (is (finite-node-positions v) "finite positions after throttle")
+    (let [com (veh/center-of-mass v)
+          forward (- (:z com) (:z com-settled))]
+      (is (< (v3/length com) 100.0) (str "com flew off: " com))
+      (is (> (Math/abs forward) 0.30)
+          (str "after 2s of full throttle the chassis should have moved at least 0.30m forward; got "
+               forward "m (Phase 2.8 clutch tuning needed)")))))

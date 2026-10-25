@@ -1,0 +1,75 @@
+(ns roundtrip
+  "End-to-end round-trip against a REAL datalevin store (no GPU):
+   connect → transact schema+scene → snapshot → as-of undo →
+   ecs/load → render/frame → ipc/pack.
+  Run: kbb -Sdeps '{:paths [\"src\" \"dev\"] :deps {datalevin/datalevin {:mvn/version \"0.9.22\"}}}' -M -m roundtrip"
+  (:require [kami.db     :as db]
+            [kami.scene  :as scene]
+            [kami.ecs    :as ecs]
+            [kami.render :as render]
+            [kami.ipc    :as ipc]))
+
+(defn -main [& _]
+  (let [dir   (str "/tmp/kami-datalevin-" (System/currentTimeMillis))
+        conn  (db/connect dir)
+        cam   (random-uuid)
+        t1    (random-uuid)
+        t2    (random-uuid)]
+    (println "== datalevin store:" dir)
+
+    ;; assets + scene as tx-data
+    (db/transact! conn [{:asset/id "mesh/conifer" :asset/kind :mesh     :asset/uri "b2://m/conifer"}
+                        {:asset/id "mat/bark"     :asset/kind :material :asset/uri "b2://m/bark"}])
+    (db/transact! conn [{:kami/eid cam :kami/name "cam" :camera/active? true
+                         :camera/fov 60.0 :camera/near 0.1 :camera/far 100.0
+                         :transform/translation [0.0 0.0 5.0]}])
+    (db/transact! conn (into [] (mapcat scene/add-entity)
+                             [{:kami/eid t1 :kami/name "tree-a"
+                               :transform/translation [-2.0 0.0 0.0]
+                               :mesh/asset [:asset/id "mesh/conifer"]
+                               :material/asset [:asset/id "mat/bark"]}
+                              {:kami/eid t2 :kami/name "tree-b"
+                               :transform/translation [2.0 0.0 0.0]
+                               :mesh/asset [:asset/id "mesh/conifer"]
+                               :material/asset [:asset/id "mat/bark"]}]))
+
+    ;; --- snapshot from the real db ---
+    (let [snap (db/snapshot (db/db conn) {:scene "forest" :env {:clear render/nintendo-cream}})]
+      (println "== snapshot entities:" (count (:snapshot/entities snap))
+               "assets:" (count (:snapshot/assets snap)) "t:" (:snapshot/t snap))
+      (assert (= 3 (count (:snapshot/entities snap))) "3 entities (cam + 2 trees)")
+      (assert (= 2 (count (:snapshot/assets snap))) "2 assets")
+      (assert (true? (scene/valid? snap)) "snapshot validates")
+
+      ;; ref attrs came back as lookup maps, not :db/id ints
+      (let [tree (first (filter :mesh/asset (:snapshot/entities snap)))]
+        (println "== tree mesh ref:" (:mesh/asset tree))
+        (assert (= "mesh/conifer" (:asset/id (:mesh/asset tree))) "mesh ref resolved to :asset/id"))
+
+      ;; --- project to ECS and build a render-IR frame ---
+      (let [world (ecs/load-snapshot snap)
+            frame (render/frame world {:n 1 :aspect 1.0})
+            draws (-> frame :frame/passes first :pass/draws)
+            packed (ipc/pack frame)]
+        (println "== draws:" (count draws)
+                 "instances:" (-> draws first :draw/instances :count))
+        (assert (= 1 (count draws)) "2 trees merge into 1 instanced draw")
+        (assert (= 2 (-> draws first :draw/instances :count)) "2 instances")
+        (println "== packed:" (:len packed) "bytes," (:ncols packed) "columns, magic"
+                 (subvec (:buffer packed) 0 4))
+        (assert (= [0x4B 0x41 0x4D 0x49] (subvec (:buffer packed) 0 4)) "KAMI magic")
+        (assert (zero? (mod (:len packed) 16)) "16-byte aligned")
+
+        ;; --- edit + commit + undo via as-of ---
+        (let [w2 (ecs/set-component world t1 :transform/translation [99.0 0.0 0.0])
+              tx (ecs/->tx w2)]
+          (println "== ecs/->tx after moving tree-a:" tx)
+          (assert (= 1 (count tx)) "only tree-a dirty")
+          (db/transact! conn tx)
+          (let [snap2 (db/snapshot (db/db conn))
+                moved (first (filter #(= t1 (:kami/eid %)) (:snapshot/entities snap2)))]
+            (println "== after commit, tree-a pos:" (:transform/translation moved))
+            (assert (= [99.0 0.0 0.0] (:transform/translation moved)) "commit persisted")))
+
+        (println "\n✅ datalevin round-trip OK (connect → tx → snapshot → ecs → render-IR → pack → commit)")
+        (System/exit 0)))))

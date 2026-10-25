@@ -1,0 +1,240 @@
+(ns prolly-tree.insert-test
+  "History independence is the whole contract.
+
+  A prolly tree earns its place by producing the same CIDs for the same logical
+  content no matter how that content was assembled. If an incremental insert
+  can produce a tree a rebuild would not, then two replicas holding identical
+  data can disagree about their root hash, and every equality check above this
+  layer -- CAS, dedup, replication -- is quietly wrong. So the property is
+  asserted directly, over randomized key sets and insertion orders, rather than
+  spot-checked on a hand-picked example."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
+            [prolly-tree.core :as pt]))
+
+(defn- store []
+  (let [blocks (atom {})]
+    {:put! (fn [cid bytes] (swap! blocks assoc cid bytes) cid)
+     :get-fn (fn [cid] (get @blocks cid))
+     :blocks blocks}))
+
+(defn- key-str
+  "Fixed-width so string order matches numeric order. `format` is Clojure-only
+  and this file is .cljc."
+  [n]
+  (let [d (str (Math/abs (long n)))
+        pad (subs "000000" 0 (max 0 (- 6 (count d))))]
+    (str "k" (when (neg? n) "-") pad d)))
+
+(defn- build [put! pairs]
+  (pt/build-tree put! (vec (sort-by first pairs))))
+
+(defn- rebuild-root
+  "Root CID of a full rebuild of `pairs`, in a throwaway store."
+  [pairs]
+  (let [{:keys [put!]} (store)]
+    (build put! pairs)))
+
+(defn- insert-root
+  "Root CID after building `base` and then inserting `additions` one at a time."
+  [base additions]
+  (let [{:keys [put! get-fn]} (store)]
+    (reduce (fn [root [k v]] (pt/insert put! get-fn root k v))
+            (build put! base)
+            additions)))
+
+;; ── the property ────────────────────────────────────────────────────────────
+
+(deftest insert-matches-rebuild-single
+  (testing "one insert into trees of many sizes, at many positions"
+    (doseq [size [1 2 5 50 300 1200]
+            position [:front :middle :back]]
+      (let [base (mapv (fn [n] [(key-str (* 2 n)) (str "v" n)]) (range size))
+            k (case position
+                :front (key-str -1)
+                :middle (key-str (inc (* 2 (quot size 2))))
+                :back (key-str (* 2 (inc size))))
+            addition [k "new"]]
+        (is (= (rebuild-root (conj base addition))
+               (insert-root base [addition]))
+            (str "size=" size " position=" position))))))
+
+(deftest insert-matches-rebuild-many
+  (testing "a run of inserts, in an order unrelated to key order"
+    (doseq [[size adds] [[100 25] [600 60] [2000 40]]]
+      (let [base (mapv (fn [n] [(key-str (* 3 n)) (str "v" n)]) (range size))
+            additions (mapv (fn [n] [(key-str (inc (* 3 n))) (str "a" n)])
+                            (take adds (iterate #(mod (+ % 37) size) 7)))
+            expected (rebuild-root (concat base additions))]
+        (is (= expected (insert-root base additions))
+            (str "size=" size " adds=" (count additions)))))))
+
+(deftest insert-replaces-existing-key
+  (testing "an insert on an existing key replaces it, and still matches a rebuild"
+    (let [base (mapv (fn [n] [(key-str n) (str "v" n)]) (range 200))
+          k (key-str 137)
+          expected (rebuild-root (assoc base 137 [k "replaced"]))]
+      (is (= expected (insert-root base [[k "replaced"]]))))))
+
+(deftest insert-into-empty
+  (let [{:keys [put! get-fn]} (store)]
+    (is (= (rebuild-root [["only" "v"]])
+           (pt/insert put! get-fn nil "only" "v")))))
+
+;; ── the point: bounded work ─────────────────────────────────────────────────
+
+(deftest insert-writes-far-fewer-blocks-than-a-rebuild
+  (testing "an insert touches the path, not the tree — this is the difference
+            between a fold that fits in a Worker budget and one that does not"
+    ;; A ratio against one tree's block count is not the property -- with a
+    ;; ~1/256 boundary rate even 3,000 entries is only a handful of blocks, and
+    ;; the ratio says more about the fan-out than about the algorithm. The
+    ;; property is that insert cost does NOT grow with the tree.
+    (let [written-for (fn [size]
+                        (let [base (mapv (fn [n] [(key-str n) (str "v" n)])
+                                         (range size))
+                              {:keys [put! get-fn blocks]} (store)
+                              root (build put! base)
+                              before (count @blocks)]
+                          (pt/insert put! get-fn root (key-str 999999) "new")
+                          (- (count @blocks) before)))
+          small (written-for 2000)
+          large (written-for 40000)]
+      (is (pos? small))
+      (is (<= large (+ small 2))
+          (str "insert wrote " small " blocks into a 2,000-entry tree and "
+               large " into a 40,000-entry one; the cost must not scale with"
+               " the tree")))))
+
+(deftest lookup-sees-inserted-values
+  (let [{:keys [put! get-fn]} (store)
+        base (mapv (fn [n] [(key-str n) (str "v" n)]) (range 500))
+        root (reduce (fn [r [k v]] (pt/insert put! get-fn r k v))
+                     (build put! base)
+                     [["zzz-new" "tail"] ["a-new" "head"]])]
+    (is (= "tail" (pt/lookup get-fn root "zzz-new")))
+    (is (= "head" (pt/lookup get-fn root "a-new")))
+    (is (= "v250" (pt/lookup get-fn root (key-str 250))))
+    (is (nil? (pt/lookup get-fn root "absent")))))
+
+;; ── batch insert ────────────────────────────────────────────────────────────
+
+(deftest insert-many-matches-rebuild
+  (testing "a batch lands the same tree a rebuild of the same content would"
+    (doseq [[size adds] [[0 5] [50 10] [600 60] [2000 150]]]
+      (let [base (mapv (fn [n] [(key-str (* 3 n)) (str "v" n)]) (range size))
+            additions (mapv (fn [n] [(key-str (inc (* 3 n))) (str "a" n)])
+                            (range adds))
+            {:keys [put! get-fn]} (store)
+            root (if (zero? size) nil (build put! base))]
+        (is (= (rebuild-root (concat base additions))
+               (pt/insert-many put! get-fn root additions))
+            (str "size=" size " adds=" adds))))))
+
+(deftest insert-many-matches-a-loop-of-single-inserts
+  (testing "batching is an optimisation, not a different algorithm"
+    (let [base (mapv (fn [n] [(key-str (* 2 n)) (str "v" n)]) (range 400))
+          additions (mapv (fn [n] [(key-str (inc (* 2 n))) (str "a" n)]) (range 40))
+          {:keys [put! get-fn]} (store)]
+      (is (= (insert-root base additions)
+             (pt/insert-many put! get-fn (build put! base) additions))))))
+
+(deftest insert-many-last-write-wins-on-a-repeated-key
+  (let [{:keys [put! get-fn]} (store)
+        base (mapv (fn [n] [(key-str n) (str "v" n)]) (range 100))
+        root (pt/insert-many put! get-fn (build put! base)
+                             [["dup" "first"] ["dup" "second"]])]
+    (is (= "second" (pt/lookup get-fn root "dup")))))
+
+(deftest insert-many-rechunks-the-internal-levels-once
+  (testing "the reason this exists: a loop of single inserts rewrites the
+            internal levels once per entry, which for a fold's novelty costs
+            more than the rebuild it replaces"
+    (let [base (mapv (fn [n] [(key-str n) (str "v" n)]) (range 3000))
+          additions (mapv (fn [n] [(str "zz" n) (str "a" n)]) (range 100))
+          loop-blocks (let [{:keys [put! get-fn blocks]} (store)
+                            root (build put! base)
+                            before (count @blocks)]
+                        (reduce (fn [r [k v]] (pt/insert put! get-fn r k v))
+                                root additions)
+                        (- (count @blocks) before))
+          batch-blocks (let [{:keys [put! get-fn blocks]} (store)
+                             root (build put! base)
+                             before (count @blocks)]
+                         (pt/insert-many put! get-fn root additions)
+                         (- (count @blocks) before))]
+      (is (< batch-blocks loop-blocks)
+          (str "batch wrote " batch-blocks " blocks, loop wrote " loop-blocks)))))
+
+;; ── the async write path ────────────────────────────────────────────────────
+;;
+;; `insert-many-async` is the synchronous function with the I/O peeled off both
+;; ends, so the interesting assertions are the two things that could still
+;; differ: does it produce the same tree, and does it actually wait for the
+;; writes it made.
+
+#?(:cljs
+   (defn- async-store
+     "A store whose reads and writes land SEVERAL TURNS LATER.
+
+     One turn is not enough to test anything: a single `.then` still resolves
+     before the caller's next read even when its promise is dropped, so a
+     one-turn store cannot tell an awaited write from an ignored one --
+     measured on `kotobase-storage`'s signed head, where removing the await
+     left the suite green. Eight turns can, and a network round trip is many
+     more than eight."
+     []
+     (let [blocks (atom {})
+           later (fn [f]
+                   (-> (reduce (fn [p _] (.then p identity))
+                               (js/Promise.resolve nil)
+                               (range 8))
+                       (.then (fn [_] (f)))))]
+       {:put! (fn [cid bytes] (later #(do (swap! blocks assoc cid bytes) cid)))
+        :get-fn (fn [cid] (later #(get @blocks cid)))
+        :blocks blocks})))
+
+#?(:cljs
+   (deftest async-insert-many-matches-the-synchronous-tree
+     (testing "same input, same root -- history independence does not get a
+               different answer because the store is remote"
+       (async done
+         (let [sync-s (store)
+               entries (mapv (fn [i] [(key-str i) i]) (range 400))
+               base (pt/build-tree (:put! sync-s) (sort-by first entries))
+               additions (mapv (fn [i] [(key-str i) i]) (range 400 460))
+               expected (pt/insert-many (:put! sync-s) (:get-fn sync-s) base additions)
+               async-s (async-store)]
+           ;; seed the async store with the same base tree
+           (reset! (:blocks async-s) @(:blocks sync-s))
+           (-> (pt/insert-many-async (:put! async-s) (:get-fn async-s) base additions)
+               (.then (fn [root]
+                        (is (= expected root)
+                            "async root is byte-identical to the sync root")
+                        (done)))
+               (.catch (fn [e] (is false (str "threw: " e)) (done)))))))))
+
+#?(:cljs
+   (deftest async-insert-many-awaits-its-writes
+     (testing "the reason this exists: the caller gets a root only once the
+               blocks that root names have actually landed"
+       (async done
+         (let [{:keys [put! get-fn blocks]} (async-store)
+               entries (mapv (fn [i] [(key-str i) i]) (range 300))]
+           (-> (pt/insert-many-async put! get-fn nil entries)
+               (.then (fn [root]
+                        ;; Checked the instant the promise resolves, with no
+                        ;; further turns. If the writes were fired and not
+                        ;; awaited, this root names bytes that are still in
+                        ;; flight -- which is exactly how a published head ends
+                        ;; up pointing at blocks a reader cannot fetch.
+                        (is (some? (get @blocks root))
+                            "the root's own block is in the store")
+                        (is (= (count entries)
+                               (count (filter some?
+                                              (map #(pt/lookup (fn [c] (get @blocks c))
+                                                               root (first %))
+                                                   entries))))
+                            "and every entry is readable from it")
+                        (done)))
+               (.catch (fn [e] (is false (str "threw: " e)) (done)))))))))

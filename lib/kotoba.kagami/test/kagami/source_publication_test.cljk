@@ -1,0 +1,261 @@
+(ns kagami.source-publication-test
+  (:require ["node:fs" :as fs] ["node:path" :as path] ["node:crypto" :as crypto]
+            [kotoba.test :refer [deftest is testing]] [kotoba.lang.text :as str]
+            [kagami.source :as s] [kagami.source-test :as st]
+            [kagami.source-io :as io] [kagami.source-io-test :as fixtures]
+            [kagami.source-publication :as pub] [kagami.source-publication-io :as pio]
+            [kagami.ci :as ci] [kagami.pin :as pin] [kagami.west :as west]))
+
+(defn keypair []
+  (let [pair (crypto/generateKeyPairSync "ed25519")
+        pem (.export (.-privateKey pair) #js {:type "pkcs8" :format "pem"})]
+    {:pem pem :did (pio/signer pem)}))
+(defn write! [file value]
+  (fs/mkdirSync (path/dirname file) #js {:recursive true})
+  (fs/writeFileSync file (str (pr-str value) "\n")))
+
+(defn proofs [f revision candidate suffix]
+  (let [policy (:policy f) runner (:runner f) reviewer (:reviewer f)
+        receipt (ci/make-receipt {:subject (pub/subject candidate revision policy)
+                                  :checks [{:name "contracts" :outcome :pass} {:name "integration" :outcome :pass}]
+                                  :required (set (:policy/required policy)) :policy (s/value-cid policy)
+                                  :at "fixture-time" :parent nil})
+        evidence (pub/evidence candidate revision policy
+                   (ci/sign-receipt pio/sha256 #(pio/sign (:pem runner) %) (:did runner) receipt))
+        reviews [(pub/review candidate revision policy
+                             (mapv :repo/id (get-in revision [:source/value :revision/changes]))
+                             (:did reviewer) #(pio/sign (:pem reviewer) %))]
+        files (into {} (map (fn [[kind value]]
+                              (let [file (path/join (:base f) (str (name kind) "-" suffix ".edn"))]
+                                (write! file value) [kind file])))
+                    {:revision revision :snapshot candidate :lock (st/lock-value candidate) :evidence evidence :reviews reviews})]
+    files))
+
+(defn fixture []
+  (let [f (fixtures/fixture) publisher (keypair) runner (keypair) reviewer (keypair)
+        manifest (fixtures/init-repo! (path/join (:root f) "com-junkawasaki/west-manifest"))
+        sources (into {} (map (fn [r]
+                               (let [dest (path/join (:base f) (str (get-in r [:repo :repo/name]) ".git"))]
+                                 (io/run ["git" "clone" "--bare" (:owner r) dest] (:base f))
+                                 [(get-in r [:repo :repo/id]) {:provider :git :url (str "file://" dest) :ref "refs/heads/main"}]))) (:repos f))
+        policy {:policy/version 1 :policy/channel "stable" :policy/ref "refs/heads/main"
+                :policy/required ["contracts" "integration"] :policy/publishers [(:did publisher)]
+                :policy/runners [(:did runner)]
+                :policy/reviewers {"acme/app" [(:did reviewer)] "acme/lib" [(:did reviewer)]}
+                :policy/inputs {:inputs/toolchain st/digest :inputs/environment st/digest
+                                :inputs/checks st/digest :inputs/target "fixture-native"}
+                :policy/sources sources}
+        lock {:lock/version 1 :lock/resolver st/digest :lock/complete? true
+              :lock/dependencies {"acme/app" ["acme/lib"] "acme/lib" []}
+              :lock/revisions (into {} (map (fn [r] [(get-in r [:repo :repo/id]) (:old r)])) (:repos f))}
+        west-text (west/emit
+                    {:fleet/header "manifest:\n  version: \"1.0\"\n  remotes:\n    - name: acme\n      url-base: https://github.com/acme\n  projects:"
+                     :fleet/footer "\n  self:\n    path: com-junkawasaki/west-manifest\n"
+                     :fleet/repos (mapv (fn [r] {:repo/name (get-in r [:repo :repo/name]) :repo/remote "acme"
+                                                 :repo/path (get-in r [:repo :repo/path]) :repo/revision (:old r) :repo/groups []}) (:repos f))})
+        db-text (pr-str (west/parse west-text))
+        head-record (pin/make-record {:repo "fleet-db" :value (pio/sha256 db-text) :sequence 1 :parent nil})
+        head {:record head-record :signer (:did publisher) :signature (pio/sign (:pem publisher) (pin/canonical-str head-record))}
+        files {"manifest/west.yml" west-text "manifest/repos.edn" "[]"
+               "manifest/fleet-db.edn" db-text "manifest/fleet-db.ledger.edn" ""
+               "manifest/fleet-head.edn" (pr-str head)
+               pub/policy-path (pr-str policy) pub/lock-path (pr-str lock)}]
+    (doseq [[file text] files]
+      (fs/mkdirSync (path/dirname (path/join manifest file)) #js {:recursive true})
+      (fs/writeFileSync (path/join manifest file) text))
+    (fixtures/git manifest "add" ".") (fixtures/git manifest "commit" "-qm" "initial authoritative state")
+    (let [expected (fixtures/git manifest "rev-parse" "HEAD") remote (path/join (:base f) "manifest.git")
+          _ (io/run ["git" "clone" "--bare" manifest remote] (:base f))
+          _ (fixtures/git manifest "remote" "add" "origin" (str "file://" remote))
+          base (s/from-west west-text "[]" expected (pr-str lock) lock)
+          base-file (path/join (:base f) "base.edn")
+          changes (mapv (fn [r] {:repo/id (get-in r [:repo :repo/id])
+                                 :revision/old {:algorithm :sha1 :hex (:old r)}
+                                 :revision/new {:algorithm :sha1 :hex (:new r)}}) (:repos f))
+          revision (s/make-revision st/change base (assoc st/revision-value :revision/base (:source/cid base) :revision/changes changes))
+          candidate (st/candidate base revision) key-file (path/join (:base f) "publisher.pem")
+          out (path/join (:root f) "workspaces/publish/prepared.edn")
+          f (assoc f :policy policy :publisher publisher :runner runner :reviewer reviewer
+                   :manifest manifest :expected expected :remote remote :base-record base
+                   :revision-record revision :candidate candidate :base-file base-file)]
+      (write! base-file base) (fs/writeFileSync key-file (:pem publisher) #js {:mode 384})
+      (assoc f :opts (merge {:manifest manifest :expected expected :base base-file :key key-file :root (:root f) :out out}
+                           (proofs f revision candidate "initial"))))))
+
+(defn apply-options [f]
+  {:manifest (:manifest f) :prepared (get-in f [:opts :out]) :root (:root f)
+   :out (path/join (:root f) "workspaces/publish/receipt.edn")})
+
+(deftest optional-authority-record-absence-needs-a-successful-tree-read
+  (is (= :fixture-read-failed
+         (with-redefs [io/git (fn [& _] (throw (ex-info "unavailable" {:reason :fixture-read-failed})))]
+           (st/reason #(pio/optional-at "repo" st/old pub/snapshot-path)))))
+  (is (nil? (with-redefs [io/git (fn [& _] "")]
+              (pio/optional-at "repo" st/old pub/snapshot-path))))
+  (is (= "" (with-redefs [io/git (fn [_ command & _] (if (= command "ls-tree") "100644 blob fixture" ""))]
+              (pio/optional-at "repo" st/old pub/snapshot-path)))))
+
+(deftest a-valid-signature-for-another-head-subject-is-not-a-fleet-head
+  (let [f (fixture) repo (:manifest f) expected (:expected f) real-at pio/at
+        record (assoc (:record (pio/read-at repo expected "manifest/fleet-head.edn")) :pin/name "another-subject")
+        head {:record record :signer (get-in f [:publisher :did])
+              :signature (pio/sign (get-in f [:publisher :pem]) (pin/canonical-str record))}
+        wrong-head (fn [r oid file]
+                     (if (= file "manifest/fleet-head.edn") (pr-str head) (real-at r oid file)))
+        lock-text (io/read-text (get-in f [:opts :lock]))]
+    (is (= :base-head-invalid-or-untrusted
+           (with-redefs [pio/at wrong-head]
+             (st/reason #(pio/basis! repo expected (:base-record f) (:candidate f) (:revision-record f)
+                                    (:policy f) {:text lock-text :value (s/read-edn! lock-text)})))))
+    (is (= expected (pio/remote-head repo "origin" "refs/heads/main")))))
+
+(deftest grouped-publication-is-one-complete-commit-and-retry-is-idempotent
+  (let [f (fixture) before (io/owner-state (:manifest f)) prepared (pio/prepare! (:opts f))
+        repo (:manifest f) commit (:prepared/commit prepared)]
+    (is (= (:expected f) (pio/remote-head repo "origin" "refs/heads/main")))
+    (is (= before (io/owner-state repo)))
+    (is (= (:candidate f) (:candidate (pio/validate-prepared! repo prepared))))
+    (is (= 2 (count (pio/ledger (pio/at repo commit "manifest/fleet-db.ledger.edn")))))
+    (is (= :published (:publication/state (pio/publish! (apply-options f)))))
+    (is (= commit (pio/remote-head repo "origin" "refs/heads/main")))
+    (is (= before (io/owner-state repo)))
+    (is (true? (:publication/already-published (pio/publish! (apply-options f)))))))
+
+(deftest missing-review-and-self-reduced-required-checks-cannot-publish
+  (let [f (fixture) opts (:opts f)]
+    (write! (:reviews opts) [])
+    (is (= :owner-approval-missing (st/reason #(pio/prepare! opts))))
+    (is (= (:expected f) (pio/remote-head (:manifest f) "origin" "refs/heads/main"))))
+  (let [f (fixture) opts (:opts f) policy (:policy f) runner (:runner f)
+        receipt (ci/make-receipt {:subject (pub/subject (:candidate f) (:revision-record f) policy)
+                                  :checks [] :required #{} :policy (s/value-cid policy) :at "fixture" :parent nil})
+        e (pub/evidence (:candidate f) (:revision-record f) policy
+            (ci/sign-receipt pio/sha256 #(pio/sign (:pem runner) %) (:did runner) receipt))]
+    (write! (:evidence opts) e)
+    (is (= :evidence-invalid-or-untrusted (st/reason #(pio/prepare! opts))))
+    (is (= (:expected f) (pio/remote-head (:manifest f) "origin" "refs/heads/main")))))
+
+(deftest one-unpublished-source-member-refuses-the-entire-group
+  (let [f (fixture) r (first (:repos f)) unpublished (fixtures/commit! (:owner r) "not published")
+        revision (s/make-revision st/change (:base-record f)
+                    (assoc-in (get-in f [:revision-record :source/value]) [:revision/changes 0 :revision/new :hex] unpublished))
+        candidate (st/candidate (:base-record f) revision)
+        opts (merge (:opts f) (proofs f revision candidate "unpublished"))]
+    (is (= :command-failed (st/reason #(pio/prepare! opts))))
+    (is (= (:expected f) (pio/remote-head (:manifest f) "origin" "refs/heads/main")))))
+
+(deftest stale-parent-leaves-accepted-state-intact
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) repo (:manifest f)]
+    (fixtures/commit! repo "concurrent unrelated change")
+    (fixtures/git repo "push" "origin" "main")
+    (let [current (pio/remote-head repo "origin" "refs/heads/main")]
+      (is (= :stale-manifest-parent (st/reason #(pio/publish! (apply-options f)))))
+      (is (= current (pio/remote-head repo "origin" "refs/heads/main"))))))
+
+(deftest an-untrusted-prepared-file-cannot-redirect-the-signed-publication-target
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) repo (:manifest f)
+        fork (path/join (:base f) "redirect.git")
+        _ (io/run ["git" "clone" "--bare" (:remote f) fork] (:base f))
+        _ (fixtures/git repo "remote" "add" "redirect" (str "file://" fork))
+        bad (assoc prepared :prepared/remote "redirect")
+        bad (assoc bad :prepared/cid (s/value-cid (dissoc bad :prepared/cid)))]
+    (write! (get-in f [:opts :out]) bad)
+    (is (= :publication-remote-mismatch (st/reason #(pio/publish! (apply-options f)))))
+    (is (= (:expected f) (pio/remote-head repo "origin" "refs/heads/main")))
+    (is (= (:expected f) (pio/remote-head repo "redirect" "refs/heads/main")))))
+
+(deftest pushurl-and-follow-tags-cannot-extend-the-signed-publication-target
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) repo (:manifest f)
+        fork (path/join (:base f) "pushurl.git")
+        _ (io/run ["git" "clone" "--bare" (:remote f) fork] (:base f))
+        _ (fixtures/git repo "config" "remote.origin.pushurl" (str "file://" fork))
+        _ (fixtures/git repo "config" "push.followTags" "true")
+        _ (fixtures/git repo "tag" "-a" "unrequested-tag" "-m" "fixture tag" (:prepared/commit prepared))]
+    (is (= :published (:publication/state (pio/publish! (apply-options f)))))
+    (is (= (:prepared/commit prepared) (pio/remote-head repo "origin" "refs/heads/main")))
+    (is (= (:expected f) (pio/head-at-url repo (str "file://" fork) "refs/heads/main")))
+    (is (str/blank? (io/git repo "ls-remote" "--tags" (str "file://" (:remote f)))))))
+
+(deftest modified-prepared-artifact-cannot-smuggle-an-unrelated-file
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) repo (:manifest f)
+        files (into {} (map (fn [[file _]] [file (pio/at repo (:prepared/commit prepared) file)])) (:prepared/files prepared))
+        files (assoc files "AGENTS.md" "unreviewed injected policy")
+        scratch (fs/mkdtempSync (path/join (:base f) "inject-"))
+        commit (pio/git-commit! repo (:expected f) files scratch "injected")
+        bad (assoc prepared :prepared/commit commit :prepared/files
+                   (into {} (map (fn [[file text]] [file (s/content-cid text)])) files))
+        bad (assoc bad :prepared/cid (s/value-cid (dissoc bad :prepared/cid)))]
+    (write! (get-in f [:opts :out]) bad)
+    (is (= :unexpected-publication-file (st/reason #(pio/publish! (apply-options f)))))
+    (is (= (:expected f) (pio/remote-head repo "origin" "refs/heads/main")))))
+
+(deftest concurrent-publication-is-refused-by-the-real-nonforced-update
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) repo (:manifest f)
+        raced (fixtures/commit! repo "concurrent after validation") real-git io/git
+        race-git (fn [p & args]
+                   (when (= "push" (first args))
+                     (real-git repo "push" "origin" "main"))
+                   (apply real-git p args))]
+    (is (= :command-failed (with-redefs [io/git race-git] (st/reason #(pio/publish! (apply-options f))))))
+    (is (= raced (pio/remote-head repo "origin" "refs/heads/main")))
+    (is (= (pio/at repo (:expected f) "manifest/west.yml") (pio/at repo raced "manifest/west.yml")))))
+
+(deftest lost-push-acknowledgement-is-recovered-by-readback
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) real-git io/git
+        lose-ack (fn [p & args]
+                   (let [result (apply real-git p args)]
+                     (when (= "push" (first args)) (throw (ex-info "lost ack" {:reason :fixture-lost-ack})))
+                     result))]
+    (is (= :published (:publication/state
+                        (with-redefs [io/git lose-ack] (pio/publish! (apply-options f))))))
+    (is (= (:prepared/commit prepared) (pio/remote-head (:manifest f) "origin" "refs/heads/main")))))
+
+(deftest a-second-publication-extends-the-snapshot-and-signed-pin-chains
+  (let [f (fixture) first-prepared (pio/prepare! (:opts f)) _ (pio/publish! (apply-options f))
+        app (first (:repos f)) next-oid (fixtures/commit! (:owner app) "next accepted source")
+        _ (fixtures/git (:owner app) "push" (get-in f [:policy :policy/sources "acme/app" :url]) "main")
+        base (:candidate f)
+        revision (s/make-revision st/change base
+                    (assoc st/revision-value :revision/base (:source/cid base)
+                           :revision/changes [{:repo/id "acme/app" :revision/old {:algorithm :sha1 :hex (:new app)}
+                                               :revision/new {:algorithm :sha1 :hex next-oid}}]))
+        candidate (st/candidate base revision) base-file (path/join (:base f) "base-next.edn")
+        _ (write! base-file base)
+        opts (merge (:opts f) (proofs f revision candidate "next")
+                    {:base base-file :expected (:prepared/commit first-prepared)
+                     :out (path/join (:root f) "workspaces/publish/next-prepared.edn")})
+        prepared (pio/prepare! opts) validated (pio/validate-prepared! (:manifest f) prepared)]
+    (is (= candidate (:candidate validated)))
+    (is (= (:prepared/publication first-prepared) (get-in validated [:publication :publication/parent])))
+    (is (= :published (:publication/state (pio/publish! {:manifest (:manifest f) :prepared (:out opts) :root (:root f)}))))))
+
+(deftest real-cli-prepares-and-publishes-the-same-guarded-transaction
+  (let [f (fixture) argv (reduce (fn [a [k v]] (into a [(str "--" (name k)) v]))
+                                ["kbb" "--backend" "sci" "--classpath" "src" "lib/kotoba.kagami/bin/source.cljk" "publish-prepare"] (:opts f))
+        output (io/run argv (js/process.cwd))]
+    (is (str/includes? output ":prepared"))
+    (is (= (:expected f) (pio/remote-head (:manifest f) "origin" "refs/heads/main")))
+    (let [output (io/run ["kbb" "--backend" "sci" "--classpath" "src" "lib/kotoba.kagami/bin/source.cljk" "publish-apply"
+                          "--manifest" (:manifest f) "--prepared" (get-in f [:opts :out]) "--root" (:root f)] (js/process.cwd))]
+      (is (str/includes? output ":published")))))
+
+(deftest a-byte-identical-executable-projection-is-still-a-substitution
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) repo (:manifest f)
+        scratch (fs/mkdtempSync (path/join (:base f) "mode-"))
+        env {"GIT_INDEX_FILE" (path/join scratch "index")}
+        g (fn [args] (str/trim (io/run-with (into ["git" "-C" repo] args) repo {:env env})))
+        _ (g ["read-tree" (:prepared/commit prepared)])
+        _ (g ["update-index" "--chmod=+x" "manifest/fleet-head.edn"])
+        tree (g ["write-tree"]) commit (g ["commit-tree" tree "-p" (:expected f) "-m" "mode substitution"])
+        bad (assoc prepared :prepared/commit commit)
+        bad (assoc bad :prepared/cid (s/value-cid (dissoc bad :prepared/cid)))]
+    (write! (get-in f [:opts :out]) bad)
+    (is (= :unexpected-publication-file-mode (st/reason #(pio/publish! (apply-options f)))))
+    (is (= (:expected f) (pio/remote-head repo "origin" "refs/heads/main")))))
+
+(deftest an-acknowledged-publication-can-recreate-a-missing-local-receipt
+  (let [f (fixture) prepared (pio/prepare! (:opts f)) opts (apply-options f)]
+    (pio/publish! (dissoc opts :out))
+    (is (not (fs/existsSync (:out opts))))
+    (is (true? (:publication/already-published (pio/publish! opts))))
+    (is (= (:prepared/commit prepared) (:manifest/commit (io/read-edn (:out opts)))))))

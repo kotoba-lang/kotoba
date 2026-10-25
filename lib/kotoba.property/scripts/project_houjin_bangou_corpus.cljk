@@ -1,0 +1,182 @@
+(ns project-houjin-bangou-corpus
+  "法人番号 corpus (cache, ~5.8M rows) -> committed projection for the query plane.
+
+   Usage:
+     kbb --backend sci -cp src scripts/project_houjin_bangou_corpus.cljk \\
+       --corpus ~/.cache/houjin-bangou/houjin-bangou-corpus.edn \\
+       --name-file /tmp/plane-jp-names.txt \\
+       --report /tmp/name-resolution.edn \\
+       --out data/houjin-bangou-joined.datoms.edn
+
+     kbb --backend sci -cp src scripts/project_houjin_bangou_corpus.cljk --corpus <c> \\
+       --prefecture JP-13 --kind 301 --latest-only --active-only \\
+       --out data/houjin-bangou-tokyo.datoms.edn
+
+   Streams the corpus line by line: it is larger than this process's heap.
+
+   Name resolution runs in a second phase, after the scan, because deciding
+   whether a name is ambiguous needs to have seen every candidate. Only names
+   that resolve to exactly one entity are written; the rest are reported by
+   name in `--report` and are NOT in the projection."
+  (:require [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kotoba.property.houjin-bangou-projection :as hp]
+            [kotoba.property.houjin-bangou-zenken :as hb]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["readline" :as readline]))
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- comma-list [s]
+  (when-not (str/blank? s)
+    (vec (remove str/blank? (map str/trim (str/split s #","))))))
+
+(defn- read-lines [f]
+  (when f
+    (->> (str/split-lines (.readFileSync fs f "utf8"))
+         (map str/trim)
+         (remove str/blank?)
+         ;; A `#` line is a comment: the name lists are hand-maintained and a
+         ;; list you cannot annotate gets annotated in a second file that then
+         ;; drifts.
+         (remove #(str/starts-with? % "#"))
+         vec)))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        corpus (arg-value args "--corpus" nil)
+        out (arg-value args "--out" nil)
+        report-file (arg-value args "--report" nil)
+        numbers (read-lines (arg-value args "--number-file" nil))
+        ;; 1 行 1 名。TAB があれば 名前<TAB>住所 として読み、同名で割れたときの
+        ;; 絞り込みに使う（住所を渡さなければ従来どおり名前だけの照合）。
+        queries (mapv (fn [l]
+                        (let [[nm addr] (str/split l #"\t" 2)]
+                          (if (str/blank? (str addr))
+                            (str/trim nm)
+                            {:name (str/trim nm) :address (str/trim addr)})))
+                      (or (read-lines (arg-value args "--name-file" nil)) []))
+        names (mapv (fn [q] (if (map? q) (:name q) q)) queries)
+        name-keys (into #{} (comp (mapcat (juxt hb/normalize-name hb/name-core))
+                                  (remove nil?))
+                        names)
+        spec {:numbers numbers
+              :name-keys name-keys
+              :prefectures (comma-list (arg-value args "--prefecture" nil))
+              :kinds (comma-list (arg-value args "--kind" nil))
+              :latest-only? (flag? args "--latest-only")
+              :active-only? (flag? args "--active-only")}]
+    (when-not (and corpus out)
+      (println "usage: project_houjin_bangou_corpus.cljs --corpus <corpus.edn> --out <projection.edn> [--number-file f] [--name-file f] [--report f] [--prefecture JP-13] [--kind 301] [--latest-only] [--active-only]")
+      (.exit js/process 2))
+    (when-not (.existsSync fs corpus)
+      (println (str "no corpus at " corpus " — run scripts/collect_houjin_bangou_zenken.cljk first"))
+      (.exit js/process 2))
+    (let [match? (hp/matcher spec)
+          number-set (set numbers)
+          tmp (str out ".partial")
+          _ (.mkdirSync fs (.dirname path out) #js {:recursive true})
+          sink (.createWriteStream fs tmp)
+          state (atom {:manifest nil :scanned 0 :kept 0 :unreadable 0
+                       :written #{} :candidates {}})
+          write! (fn [rec]
+                   (let [n (:company/houjin-bangou rec)]
+                     (when-not (contains? (:written @state) n)
+                       (.write sink (str (pr-str rec) "\n"))
+                       (swap! state #(-> % (update :written conj n) (update :kept inc))))))
+          write-report!
+          (fn [manifest resolution]
+            (.writeFileSync
+             fs report-file
+             (str (pr-str
+                   {:report/corpus corpus
+                    :report/publish (:source/publish manifest)
+                    :report/queried (count names)
+                    :report/resolved
+                    (into (sorted-map)
+                          (map (fn [[q rec]]
+                                 [q {:houjin-bangou (:company/houjin-bangou rec)
+                                     :legal-name (:company/legal-name rec)
+                                     :match (:company/name-match rec)
+                                     :region (:company/region rec)
+                                     :city (:company/city rec)}]))
+                          (:resolved resolution))
+                    ;; Both of these are the point of the report: a name the
+                    ;; registry could not decide, and a name it has never heard
+                    ;; of, are different problems with different fixes.
+                    :report/ambiguous (into (sorted-map) (:ambiguous resolution))
+                    :report/unmatched (vec (sort (:unmatched resolution)))})
+                  "\n")
+             "utf8"))
+          finish!
+          (fn [resolution]
+            (let [{:keys [manifest scanned kept unreadable]} @state
+                  header (hp/projection-manifest (or manifest {}) spec kept)
+                  body (.readFileSync fs tmp "utf8")]
+              (.writeFileSync fs out (str (pr-str header) "\n" body) "utf8")
+              (.unlinkSync fs tmp)
+              (when (and (pos? scanned) (zero? kept))
+                (js/console.error
+                 (str "project-houjin-bangou-corpus: WARNING scanned " scanned
+                      " record(s) and kept 0 — an empty projection and a corpus"
+                      " that did not load look the same in the file")))
+              (when (pos? unreadable)
+                (js/console.error
+                 (str "project-houjin-bangou-corpus: WARNING " unreadable
+                      " corpus line(s) could not be read and are NOT in the projection")))
+              (when (and report-file resolution) (write-report! manifest resolution))
+              (println
+               (pr-str (cond-> {:out out
+                                :corpus corpus
+                                :scanned scanned
+                                :kept kept
+                                :unreadable unreadable
+                                :bytes (.-size (.statSync fs out))}
+                         resolution
+                         (assoc :names (count names)
+                                :resolved (count (:resolved resolution))
+                                :ambiguous (count (:ambiguous resolution))
+                                :unmatched (count (:unmatched resolution))))))))
+          rl (.createInterface readline
+                               #js {:input (.createReadStream fs corpus) :crlfDelay ##Inf})]
+      (.on rl "line"
+           (fn [line]
+             (when-not (str/blank? line)
+               (if-let [rec (try (reader/read-string line) (catch :default _ nil))]
+                 (if (:corpus/manifest rec)
+                   (swap! state assoc :manifest rec)
+                   (do (swap! state update :scanned inc)
+                       (when (match? rec)
+                         (cond
+                           (contains? number-set (:company/houjin-bangou rec))
+                           (write! rec)
+
+                           ;; Name hits are held, not written: whether this row
+                           ;; answers the query depends on how many others do.
+                           (seq names)
+                           (swap! state update :candidates hp/collect-candidate rec)
+
+                           ;; No name query at all — this is a filter-only
+                           ;; projection (`--kind`, `--prefecture`), and every
+                           ;; match is an answer. Routing these into the
+                           ;; candidate map instead wrote an empty projection
+                           ;; over 5.8M scanned rows, which the summary reported
+                           ;; honestly (`:kept 0`) and nothing else would have.
+                           :else (write! rec)))))
+                 ;; A line we cannot read is reported, never silently dropped:
+                 ;; a projection that quietly lost records looks identical to
+                 ;; one whose filter was simply narrow.
+                 (swap! state update :unreadable inc)))))
+      (.on rl "close"
+           (fn []
+             (let [{:keys [candidates]} @state
+                   resolution (when (seq queries) (hp/resolve-names queries candidates))]
+               (doseq [rec (vals (:resolved resolution))] (write! rec))
+               (.end sink (fn [] (finish! resolution))))))
+      nil)))
+
+(-main)

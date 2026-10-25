@@ -1,0 +1,104 @@
+(ns filecoin.node.block-test
+  (:require [cbor.core :as cbor]
+            [kotoba.test :refer [deftest is testing]]
+            [filecoin.node.block :as block]
+            [filecoin.node.block-vectors :as v]
+            [filecoin.node.rpc :as nrpc]))
+
+;; ── against mainnet ──────────────────────────────────────────────────────────
+;; The only assertions here that are not this library talking to itself.
+
+(deftest header-cids-match-mainnet
+  ;; Every header in a real tipset, re-encoded from Lotus's JSON and hashed.
+  ;; A wrong tag, a dropped 0x00 link prefix, a truncated sign-magnitude
+  ;; weight, a signature encoded as a pair instead of a byte string, or the
+  ;; 16 fields in any other order all produce a different CID.
+  (is (seq v/headers))
+  (doseq [{:keys [cid json]} v/headers]
+    (testing cid
+      (is (= cid (block/cid (nrpc/json->block-header json)))))))
+
+(deftest header-json-round-trips
+  (doseq [{:keys [json]} v/headers]
+    (testing (get json "Miner")
+      (is (= json (nrpc/block-header->json (nrpc/json->block-header json)))))))
+
+(deftest headers-cover-both-states-of-the-optional-fields
+  ;; Worth asserting rather than assuming: a snapshot in which every header
+  ;; happened to carry a ticket and a signature would test the null path not
+  ;; at all, and the null path is where a 16-element array quietly becomes a
+  ;; 12-element one.
+  (let [hs (map (comp nrpc/json->block-header :json) v/headers)]
+    (is (every? :ticket hs) "mainnet headers always carry a ticket")
+    (is (every? :block-sig hs))
+    (is (some :bls-aggregate hs))
+    (is (some #(seq (:win-post-proof %)) hs))
+    (is (some #(seq (:beacon-entries %)) hs))))
+
+;; ── the encoding itself ──────────────────────────────────────────────────────
+
+(deftest a-header-is-a-sixteen-element-array
+  (let [h (nrpc/json->block-header (:json (first v/headers)))
+        bs (mapv #(bit-and (int %) 0xff) (block/encode h))]
+    (testing "CBOR major type 4, length 16 — 0x90"
+      (is (= 0x90 (first bs))))
+    (testing "and it decodes back to the same header"
+      (is (= h (block/decode (block/encode h)))))))
+
+(deftest a-fifteen-element-array-is-not-a-header
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (block/decode (cbor/encode (vec (repeat 15 0))))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (block/decode (cbor/encode (vec (repeat 17 0)))))))
+
+(deftest a-nullable-field-is-a-null-in-the-array-not-a-missing-one
+  ;; The array is 16 long whether or not there is an election proof. Dropping
+  ;; the slot shifts every following field by one, and the header then
+  ;; decodes as something else entirely rather than failing.
+  (let [h (nrpc/json->block-header (:json (first v/headers)))
+        without (assoc h :election-proof nil :bls-aggregate nil)
+        decoded (cbor/decode (block/encode without))]
+    (is (= 16 (count decoded)))
+    (is (nil? (nth decoded 2)))
+    (is (nil? (nth decoded 11)))
+    (is (not= (block/cid h) (block/cid without)))))
+
+(deftest signing-bytes-are-the-cbor-not-the-cid
+  ;; The rule that differs from messages. `filecoin.message/signing-bytes`
+  ;; returns a 38-byte CID; this returns the whole header.
+  (let [h (nrpc/json->block-header (:json (first v/headers)))
+        sb (block/signing-bytes h)]
+    (is (= (vec (map #(bit-and (int %) 0xff) sb))
+           (vec (map #(bit-and (int %) 0xff)
+                     (block/encode (assoc h :block-sig nil))))))
+    (is (> (count (vec (seq sb))) 100) "a CID would be 38 bytes")
+    (testing "and it is not the serialisation of the signed header"
+      (is (not= (vec (map #(bit-and (int %) 0xff) sb))
+                (vec (map #(bit-and (int %) 0xff) (block/encode h))))))))
+
+(deftest a-link-carries-its-multibase-prefix
+  (let [c (first v/tipset-cids)
+        l (block/link c)]
+    (is (cbor/tagged? l))
+    (is (= block/cid-tag (cbor/tag-number l)))
+    (is (= 0x00 (bit-and (int (first (seq (cbor/tag-value l)))) 0xff)))
+    (is (= c (block/unlink l)))
+    (testing "and a link without it is refused rather than silently shifted"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (block/unlink (cbor/tagged block/cid-tag
+                                              #?(:clj (byte-array [1 2 3])
+                                                 :cljs (js/Uint8Array. #js [1 2 3])))))))
+    (testing "and a bare byte string is not a link at all"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (block/unlink #?(:clj (byte-array [0 1 2])
+                                    :cljs (js/Uint8Array. #js [0 1 2]))))))))
+
+(deftest msg-meta-is-two-links
+  (let [[a b] v/tipset-cids
+        mm (block/msg-meta a b)
+        bs (block/encode-msg-meta mm)]
+    (is (= 0x82 (bit-and (int (first (seq bs))) 0xff)))
+    (is (= mm (block/decode-msg-meta bs)))
+    (is (string? (block/msg-meta-cid mm)))
+    (testing "and the two roots are not interchangeable"
+      (is (not= (block/msg-meta-cid mm) (block/msg-meta-cid (block/msg-meta b a)))))))

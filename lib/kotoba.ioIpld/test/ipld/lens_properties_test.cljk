@@ -1,0 +1,92 @@
+(ns ipld.lens-properties-test
+  "P1-3 of ADR-2608170400: DMT/lens round-trip, union ambiguity, and the
+  recursive depth/node budgets.
+
+  The round-trip property is the one that matters for a lens: decoding a
+  representation to its logical form and encoding it back must return the
+  representation you started from. A lens that loses information passes any
+  single-direction test and still corrupts data."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [ipld.schema :as schema]
+            [ipld.schema-dsl :as dsl]))
+
+(def ^:private limits {:max-depth 16 :max-nodes 128})
+
+(defn- compiled [src] (schema/compile-schema (dsl/parse src)))
+
+(defn- round-trip [src type-name representation]
+  (let [c (compiled src)
+        logical (:logical-value (schema/representation->logical! c type-name representation limits))]
+    (:value (schema/logical->representation! c type-name logical limits))))
+
+(def ^:private lenses
+  ;; [label source type representation]
+  [["struct map"        "type A struct { x Int y Int }" "A" {"x" 1 "y" 2}]
+   ["struct tuple"      "type A struct { x Int y Int } representation tuple" "A" [1 2]]
+   ["struct stringjoin" "type A struct { x String } representation stringjoin {join \":\"}" "A" "v"]
+   ["struct stringpairs" "type A struct { x String } representation stringpairs {innerDelim \":\" entryDelim \",\"}" "A" "x:v"]
+   ["struct listpairs"  "type A struct { x String } representation listpairs" "A" [["x" "v"]]]
+   ["map listpairs"     "type A {String:Int} representation listpairs" "A" [["a" 1]]]
+   ["map stringpairs"   "type A {String:String} representation stringpairs {innerDelim \":\" entryDelim \",\"}" "A" "a:b"]
+   ["union keyed"       "type B struct {}\ntype A union {| B \"b\"} representation keyed" "A" {"b" {}}]
+   ["union envelope"    "type B struct {}\ntype A union {| B \"b\"} representation envelope {discriminantKey \"t\" contentKey \"c\"}" "A" {"t" "b" "c" {}}]
+   ["union stringprefix" "type B string\ntype A union {| B \"b:\"} representation stringprefix" "A" "b:x"]
+   ["enum string"       "type A enum { | X }" "A" "X"]
+   ["enum int"          "type A enum { | X (\"0\") } representation int" "A" 0]
+   ["field rename"      "type A struct { x Int (rename \"y\") }" "A" {"y" 1}]])
+
+(deftest a-lens-round-trips-its-representation
+  (doseq [[label src type-name representation] lenses]
+    (testing label
+      (is (= representation (round-trip src type-name representation))))))
+
+(deftest an-ambiguous-union-is-refused-at-compile-time
+  ;; Ambiguity has to fail when the schema is compiled, not when a value
+  ;; happens to hit the overlap: the second is a value-dependent bug that
+  ;; survives every test whose fixture picks the other member.
+  (testing "kinded union with two members of the same kind"
+    (is (= :invalid-union-table
+           (try (compiled "type B struct {}\ntype C struct {}\ntype A union {| B map | C map} representation kinded")
+                nil
+                (catch kerror/ExceptionInfo e (:problem (ex-data e)))))))
+  (testing "keyed union with a duplicated discriminant"
+    (is (= :invalid-union-table
+           (try (compiled "type B struct {}\ntype C struct {}\ntype A union {| B \"k\" | C \"k\"} representation keyed")
+                nil
+                (catch kerror/ExceptionInfo e (:problem (ex-data e))))))))
+
+(defn- nested [n] (reduce (fn [acc _] {"n" acc}) {"n" nil} (range n)))
+
+(defn- problem [f]
+  (try (do (f) nil) (catch kerror/ExceptionInfo e (:problem (ex-data e)))))
+
+(deftest recursion-budgets-bind-typed-structures
+  (let [c (compiled "type A struct { n nullable A }")]
+    (testing "depth"
+      (is (= :max-depth-exceeded
+             (problem #(schema/representation->logical! c "A" (nested 6)
+                                                        {:max-depth 4 :max-nodes 256}))))
+      (is (nil? (problem #(schema/representation->logical! c "A" (nested 6)
+                                                           {:max-depth 16 :max-nodes 256})))))
+    (testing "nodes"
+      (is (= :max-nodes-exceeded
+             (problem #(schema/representation->logical! c "A" (nested 6)
+                                                        {:max-depth 16 :max-nodes 4})))))))
+
+(deftest recursion-budgets-also-bind-any
+  ;; `any` admits an arbitrary Data Model node. Before this was fixed the
+  ;; branch returned without walking the value, so the node itself was charged
+  ;; and nothing beneath it was: a caller could ask for :max-depth 8 and
+  ;; receive something nested a hundred thousand deep, with no way to tell that
+  ;; the limit had not applied. A budget that cannot be distinguished from one
+  ;; that held is the failure, not the depth.
+  (let [c (compiled "type A any")]
+    (is (= :max-depth-exceeded
+           (problem #(schema/representation->logical! c "A" (nested 6)
+                                                      {:max-depth 2 :max-nodes 1024}))))
+    (is (= :max-nodes-exceeded
+           (problem #(schema/representation->logical! c "A" (nested 20)
+                                                      {:max-depth 64 :max-nodes 8}))))
+    (is (nil? (problem #(schema/representation->logical! c "A" (nested 3)
+                                                         {:max-depth 32 :max-nodes 256})))
+        "a value inside the budget still passes")))

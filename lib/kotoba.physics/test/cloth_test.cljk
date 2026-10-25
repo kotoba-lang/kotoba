@@ -1,0 +1,187 @@
+(ns cloth-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [kotoba.physics.cloth :as cloth]))
+
+(defn- sqrt [x] (#?(:clj Math/sqrt :cljs js/Math.sqrt) x))
+(defn- abs* [x] (#?(:clj Math/abs :cljs js/Math.abs) (double x)))
+(def ^:private pi #?(:clj Math/PI :cljs js/Math.PI))
+
+(deftest projection-reduces-the-residual-monotonically
+  ;; The residual is the largest amount by which any constraint is violated.
+  ;; More projection has to mean less of it, always — a solver with a sign
+  ;; wrong still produces a picture that drapes, and fails this.
+  (let [g (cloth/grid {:rows 8 :cols 8 :spacing 0.1 :pins #{[0 0] [0 7]}})
+        residuals (mapv (fn [it]
+                          (let [[_ c] (cloth/simulate g {:dt 0.016 :iterations it} 40)]
+                            (cloth/residual c)))
+                        [1 4 16 64])]
+    (is (apply > residuals) (str "residuals were " (pr-str residuals)))
+    (is (< (last residuals) 2.0e-3))
+    (testing "and a fresh grid starts satisfied"
+      (is (< (cloth/residual g) 1.0e-12)))))
+
+(defn- pull-one
+  "Displace a single particle so the constraints are actually violated.
+
+  Without this the test below measures nothing: a fresh grid starts with every
+  constraint satisfied, and with gravity off nothing ever violates one, so the
+  projection loop computes a correction of zero and the centre of mass cannot
+  move whatever the weighting is. Measured 2026-08-24 — replacing the
+  mass weight with a constant left this test GREEN, and only the residual test
+  noticed. A test that passes because nothing happened is the failure this
+  whole file is written against.
+
+  Both `:particle/position` AND `:particle/previous` move, because this is a
+  Verlet integrator and velocity is implicit in the difference between them.
+  Displacing only the position gives that particle a velocity of 0.05 per
+  step, and then the whole cloth has net linear momentum — so its centre of
+  mass moves at a constant rate, CORRECTLY, and the assertion below fails on a
+  correct implementation. Measured 2026-08-24: 0.2514 -> 0.3208. The invariant
+  is that PROJECTION does not shift the centre of mass, not that a system
+  carrying momentum stays where it is."
+  [c]
+  (-> c
+      (update-in [:cloth/particles 0 :particle/position] (fn [[x y z]] [(+ x 0.05) y z]))
+      (update-in [:cloth/particles 0 :particle/previous] (fn [[x y z]] [(+ x 0.05) y z]))))
+
+(deftest a-free-cloth-does-not-move-its-own-centre-of-mass
+  ;; Each constraint moves its two particles by mass-weighted OPPOSITE amounts,
+  ;; so projection cannot shift the centre of mass — however hard it is working.
+  (let [free (pull-one (cloth/grid {:rows 6 :cols 6 :spacing 0.1}))
+        before (cloth/centre-of-mass free)
+        [_ after] (cloth/simulate free {:dt 0.01 :iterations 20 :gravity [0.0 0.0 0.0]} 50)]
+    (testing "and the projection really did have work to do"
+      (is (> (cloth/residual free) 0.01) "the fixture starts violated")
+      (is (< (cloth/residual after) (* 0.5 (cloth/residual free))) "and relaxes"))
+    (is (every? true? (map #(< (abs* (- %1 %2)) 1.0e-12) (cloth/centre-of-mass after) before))
+        (str before " -> " (cloth/centre-of-mass after))))
+
+  (testing "with a non-uniform mass distribution, which is where equal weighting shows"
+    (let [g (pull-one (cloth/grid {:rows 4 :cols 4 :spacing 0.1}))
+          heavy (update g :cloth/particles
+                        (fn [ps] (-> ps
+                                     (assoc-in [0 :particle/inverse-mass] 0.1)
+                                     (assoc-in [5 :particle/inverse-mass] 4.0))))
+          before (cloth/centre-of-mass heavy)
+          [_ after] (cloth/simulate heavy {:dt 0.01 :iterations 20 :gravity [0.0 0.0 0.0]} 40)]
+      (is (every? true? (map #(< (abs* (- %1 %2)) 1.0e-12) (cloth/centre-of-mass after) before))))))
+
+(deftest the-solver-is-frame-indifferent
+  ;; A distance constraint does not know where the origin is or which way is
+  ;; north, so neither may the solver.
+  (let [g (cloth/grid {:rows 5 :cols 5 :spacing 0.1 :pins #{[0 0]}})
+        move (fn [c f] (update c :cloth/particles
+                               (fn [ps] (mapv #(-> % (update :particle/position f)
+                                                     (update :particle/previous f)) ps))))
+        theta (/ pi 5.0)
+        rot (fn [[x y z]] [(- (* x (#?(:clj Math/cos :cljs js/Math.cos) theta))
+                              (* z (#?(:clj Math/sin :cljs js/Math.sin) theta)))
+                           y
+                           (+ (* x (#?(:clj Math/sin :cljs js/Math.sin) theta))
+                              (* z (#?(:clj Math/cos :cljs js/Math.cos) theta)))])
+        opts {:dt 0.01 :iterations 10 :gravity [0.0 0.0 0.0]}
+        [_ base] (cloth/simulate g opts 20)
+        [_ shifted] (cloth/simulate (move g #(mapv + % [100.0 0.0 -37.5])) opts 20)
+        [_ rotated] (cloth/simulate (move g rot) opts 20)]
+    (is (< (abs* (- (cloth/residual base) (cloth/residual shifted))) 1.0e-12))
+    (is (< (abs* (- (cloth/residual base) (cloth/residual rotated))) 1.0e-12))))
+
+(deftest a-pendulum-swings-at-the-analytic-period
+  ;; One pinned particle, one free, one constraint: the small-angle pendulum,
+  ;; whose period is 2 pi sqrt(L/g) and owes nothing to this implementation.
+  (let [l 1.0
+        a (* pi (/ 10.0 180.0))
+        pend {:cloth/particles [(cloth/particle [0.0 0.0 0.0] 0.0)
+                                (cloth/particle [(* l (#?(:clj Math/sin :cljs js/Math.sin) a))
+                                                 (- (* l (#?(:clj Math/cos :cljs js/Math.cos) a)))
+                                                 0.0])]
+              :cloth/constraints [(cloth/constraint 0 1 l)]}
+        dt 0.0005
+        xs (loop [c pend i 0 out []]
+             (if (= i 12000)
+               out
+               (let [[_ n] (cloth/step c {:dt dt :iterations 20})]
+                 (recur n (inc i) (conj out (get-in n [:cloth/particles 1 :particle/position 0]))))))
+        crossings (vec (keep-indexed (fn [i [p q]] (when (and (neg? p) (pos? q)) (* dt i)))
+                                     (map vector xs (rest xs))))
+        period (- (nth crossings 1) (nth crossings 0))
+        analytic (* 2.0 pi (sqrt (/ l 9.81)))]
+    (is (>= (count crossings) 2))
+    (is (< (abs* (/ (- period analytic) analytic)) 0.01)
+        (str "period " period " vs analytic " analytic))
+    (testing "and the bob never leaves its circle"
+      (is (< (cloth/residual {:cloth/particles (:cloth/particles pend)
+                              :cloth/constraints (:cloth/constraints pend)})
+             1.0e-12)))))
+
+(deftest a-strand-keeps-its-length
+  (let [s (cloth/strand {:count 20 :spacing 0.05})
+        [status draped] (cloth/simulate s {:dt 0.008 :iterations 40} 200)
+        len (fn [c] (reduce + (map (fn [a b]
+                                     (sqrt (reduce + (map #(* (- %1 %2) (- %1 %2))
+                                                          (:particle/position a)
+                                                          (:particle/position b)))))
+                                   (:cloth/particles c) (rest (:cloth/particles c)))))]
+    (is (= :ok status))
+    (is (< (abs* (- (len draped) (len s))) 5.0e-3)
+        (str "strand length " (len draped) " vs " (len s)))
+    (testing "and it hangs below where it started"
+      (is (< (get-in draped [:cloth/particles 19 :particle/position 1])
+             (get-in s [:cloth/particles 19 :particle/position 1]))))))
+
+(deftest nothing-ends-up-inside-a-collider
+  (let [g (cloth/grid {:rows 9 :cols 9 :spacing 0.1 :y 1.0})
+        sphere {:collider/kind :sphere :collider/centre [0.4 0.5 0.4] :collider/radius 0.3}
+        floor {:collider/kind :plane :collider/point [0.0 0.0 0.0] :collider/normal [0.0 1.0 0.0]}
+        [_ c] (cloth/simulate g {:dt 0.008 :iterations 12 :colliders [sphere floor]} 120)
+        d (fn [p] (sqrt (reduce + (map #(* (- %1 %2) (- %1 %2)) (:particle/position p) [0.4 0.5 0.4]))))]
+    (is (zero? (count (filter #(< (d %) 0.2999) (:cloth/particles c))))
+        "particles inside the sphere")
+    (is (zero? (count (filter #(< (get-in % [:particle/position 1]) -1.0e-9) (:cloth/particles c))))
+        "particles below the floor")
+    (testing "and the cloth actually fell onto them rather than staying put"
+      (is (< (nth (cloth/centre-of-mass c) 1) 1.0)))))
+
+(deftest it-refuses-what-it-cannot-integrate
+  (let [g (cloth/grid {:rows 3 :cols 3})]
+    (testing "zero iterations is free fall wearing the shape of a cloth"
+      (let [[status msg] (cloth/step g {:dt 0.01 :iterations 0})]
+        (is (= :error status))
+        (is (string/includes? msg "free fall"))))
+    (is (= :error (first (cloth/step g {:dt 0.0 :iterations 10}))))
+    (is (= :error (first (cloth/step g {:dt -0.01 :iterations 10}))))
+    (testing "a constraint pointing at a particle that is not there"
+      (let [[status msg] (cloth/step (assoc g :cloth/constraints [(cloth/constraint 0 99 0.1)])
+                                     {:dt 0.01 :iterations 5})]
+        (is (= :error status))
+        (is (string/includes? msg "does not exist"))))
+    (testing "a constraint joining a particle to itself"
+      (is (= :error (first (cloth/step (assoc g :cloth/constraints [(cloth/constraint 2 2 0.1)])
+                                       {:dt 0.01 :iterations 5})))))))
+
+(deftest compliance-softens-without-depending-on-the-iteration-count
+  ;; This is the whole point of XPBD over PBD: with a stiffness parameter that
+  ;; is not compliance, the same cloth gets stiffer as you add iterations, so
+  ;; the material a scene describes changes when you change a solver setting.
+  (let [make (fn [c] (cloth/grid {:rows 6 :cols 6 :spacing 0.1 :pins #{[0 0] [0 5]}
+                                  :compliance c :shear-compliance c :bend-compliance c}))
+        drop-of (fn [c its]
+                  (let [[_ done] (cloth/simulate c {:dt 0.01 :iterations its} 60)]
+                    (nth (cloth/centre-of-mass done) 1)))
+        soft-20 (drop-of (make 1.0e-3) 20)
+        soft-80 (drop-of (make 1.0e-3) 80)
+        stiff-20 (drop-of (make 0.0) 20)]
+    (is (< soft-20 stiff-20) "a compliant cloth sags further than a rigid one")
+    (is (< (abs* (- soft-20 soft-80)) 1.0e-9)
+        (str "sag moved from " soft-20 " to " soft-80 " when only the iteration"
+             " count changed — the material a scene describes must not change"
+             " when a solver setting does (rigid, for scale, is " stiff-20 ")"))
+    (testing "which is a property of accumulating the multiplier, not of the formula"
+      ;; Written as a bound rather than an equality on purpose: this asserted
+      ;; only "within 25% of the way to rigid" at first, and the FIRST
+      ;; implementation here failed even that — it recomputed lambda from the
+      ;; current violation each pass, so 20 vs 80 iterations moved the sag
+      ;; three quarters of the way to the rigid cloth. The docstring claimed
+      ;; iteration-independence while the code did not have it.
+      (is (< (abs* (- soft-20 stiff-20)) 1.0) "and the two are still different cloths"))))

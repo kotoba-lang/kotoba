@@ -1,0 +1,647 @@
+(ns pattern-compile
+  ;; The regex-subset compiler, in Kotoba. The other half of `pattern-core`,
+  ;; and the half that used to be `src/pattern/compile.cljk`.
+  ;;
+  ;; With this the library is KOTOBA ONLY: a pattern goes in as text and a
+  ;; program comes out as a `:document`, without a Clojure host anywhere in the
+  ;; path. The `.cljc` stays as the parity oracle (both are run against each
+  ;; other over the 200 literals scraped from the browser stack), not as the
+  ;; implementation.
+  ;;
+  ;; Style: the pure S-expression core. Calls are `(app (ref f) x)`, control is
+  ;; `if` and `let`, and the sugar (`cond`, `and`, `or`, threading) is not used
+  ;; -- ADR-544's `.kotoba` surface. Measured against the grammar's own claim:
+  ;; `(app (ref f) n)` and `(f n)` produce the same HIR, the same KIR and the
+  ;; same bytes, so this is a surface convention and not a semantic one. What
+  ;; it buys is one spelling per meaning, which is what DefCID is computed over.
+  ;;
+  ;; ## Everything is a document, including a failure
+  ;;
+  ;; A parse answers `{:node .. :i ..}` and a refusal answers `{:error :why
+  ;; :i ..}`; `compile-pattern` answers a program or `{:error ..}`. Kotoba has
+  ;; no nil and an aborting function cannot be exported, so the refusal is a
+  ;; value the caller must look at -- which is what the `.cljc` used an
+  ;; exception for.
+  ;;
+  ;; ## The subset
+  ;;
+  ;; Literals, `.`, classes with ranges and negation, `\d \D \s \S \w \W`,
+  ;; groups (`( )` and `(?: )` compile alike -- there are no captures yet),
+  ;; alternation, the greedy quantifiers `* + ? {n} {n,m}`, `^`, `$`, and a
+  ;; leading `(?i)`. Refused by name: lookahead, back references, non-greedy
+  ;; quantifiers, and inline flags other than a leading `(?i)`.
+  (:export [main
+            compile-pattern compile-text
+            parse-alt parse-cat parse-repeat parse-atom parse-class
+            emit ast-lit ast-any ast-class
+            error? error-of
+            test-lit test-class test-quantifier test-alternation
+            test-anchor test-escape test-refusals test-program])
+  (:schemas {:pat/cursor [:record :pat/cursor [[:s :string] [:i :i64] [:n :i64]]]
+             :pat/class [:record :pat/class
+                         [[:s :string] [:i :i64] [:n :i64]
+                          [:ranges :document] [:first :bool]]]
+             :pat/emit [:record :pat/emit
+                        [[:node :document] [:base :i64] [:classes :document]]]
+             :pat/seq [:record :pat/seq
+                       [[:xs :document] [:i :i64] [:base :i64]
+                        [:code :document] [:classes :document]]]
+             :pat/rep [:record :pat/rep
+                       [[:node :document] [:lo :i64] [:hi :i64]
+                        [:base :i64] [:classes :document]]]}))
+
+;; --- document helpers -----------------------------------------------------
+
+(defn dget [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn dat [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (app (ref dget) d k)) 0))
+
+(defn dkw [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (app (ref dget) d k)) :none))
+
+(defn iv [n :i64] :document
+  (document-i64 n))
+
+;; --- errors ---------------------------------------------------------------
+
+(defn vec-concat-from [a :document b :document i :i64] :document
+  (if (>= i (document-count b))
+    a
+    (app (ref vec-concat-from) (document-vector-conj a (dat b i)) b (+ i 1))))
+
+;; `document-merge` is for MAPS: handed two vectors it fails the lowering with
+;; `document-map-required` (measured 2026-09-09, at the :ir phase, after both
+;; `check` and the subset pass had accepted the module). There is no vector
+;; concatenation head, so this is it.
+(defn vec-concat [a :document b :document] :document
+  (app (ref vec-concat-from) a b 0))
+
+(defn error-of [why :keyword at :i64] :document
+  (document-map :error (document-keyword why) :i (app (ref iv) at)))
+
+(defn error? [d :document] :bool
+  (document-contains d :error))
+
+;; --- code points ----------------------------------------------------------
+
+(defn cp-width [cp :i64] :i64
+  (if (< cp 128) 1 (if (< cp 2048) 2 (if (< cp 65536) 3 4))))
+
+(defn cp-at [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1 (string-code-point-at s i)))
+
+(defn step-i [s :string i :i64] :i64
+  (+ i (app (ref cp-width) (app (ref cp-at) s i))))
+
+(defn digit? [cp :i64] :bool
+  (if (< cp 48) false (<= cp 57)))
+
+;; --- the AST --------------------------------------------------------------
+;;
+;; {:t :lit :cp n} {:t :any} {:t :bol} {:t :eol}
+;; {:t :class :ranges [lo hi ...] :neg 0|1}
+;; {:t :cat :xs [..]} {:t :alt :xs [..]} {:t :rep :x .. :lo n :hi n}   hi -1 = unbounded
+
+(defn ast-lit [cp :i64] :document
+  (document-map :t (document-keyword :lit) :cp (app (ref iv) cp)))
+
+(defn ast-any [] :document
+  (document-map :t (document-keyword :any)))
+
+(defn ast-class [ranges :document neg :i64] :document
+  (document-map :t (document-keyword :class) :ranges ranges :neg (app (ref iv) neg)))
+
+(defn ast-rep [x :document lo :i64 hi :i64] :document
+  (let [l (app (ref iv) lo)
+        h (app (ref iv) hi)]
+    (document-map :t (document-keyword :rep) :x x :lo l :hi h)))
+
+(defn parsed [node :document i :i64] :document
+  (let [pos (app (ref iv) i)]
+    (document-map :node node :i pos)))
+
+;; --- escapes --------------------------------------------------------------
+
+(defn digit-ranges [] :document
+  (document-vector (app (ref iv) 48) (app (ref iv) 57)))
+
+(defn space-ranges [] :document
+  (document-vector (app (ref iv) 9) (app (ref iv) 10) (app (ref iv) 11)
+                   (app (ref iv) 13) (app (ref iv) 32) (app (ref iv) 32)))
+
+(defn word-ranges [] :document
+  (document-vector (app (ref iv) 48) (app (ref iv) 57) (app (ref iv) 65) (app (ref iv) 90)
+                   (app (ref iv) 95) (app (ref iv) 95) (app (ref iv) 97) (app (ref iv) 122)))
+
+;; The escape's ranges, or an empty vector when the escape is a literal.
+(defn escape-ranges [cp :i64] :document
+  (if (= cp 100) (app (ref digit-ranges))
+      (if (= cp 68) (app (ref digit-ranges))
+          (if (= cp 115) (app (ref space-ranges))
+              (if (= cp 83) (app (ref space-ranges))
+                  (if (= cp 119) (app (ref word-ranges))
+                      (if (= cp 87) (app (ref word-ranges))
+                          (document-vector))))))))
+
+(defn escape-negated? [cp :i64] :bool
+  (if (= cp 68) true (if (= cp 83) true (= cp 87))))
+
+(defn escape-literal [cp :i64] :i64
+  (if (= cp 110) 10
+      (if (= cp 114) 13
+          (if (= cp 116) 9
+              (if (= cp 102) 12 cp)))))
+
+;; --- character classes ----------------------------------------------------
+
+(defn class-scan [x [:ref :pat/class]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        n (record-get x :n)
+        ranges (record-get x :ranges)
+        first? (record-get x :first)
+        cp (app (ref cp-at) s i)]
+    (if (< cp 0)
+      (app (ref error-of) :class/unterminated i)
+      (if (if (= cp 93) (not first?) false)
+        (app (ref parsed) ranges (+ i 1))
+        (if (= cp 92)
+          (let [e (app (ref cp-at) s (+ i 1))
+                esc (app (ref escape-ranges) e)]
+            (if (< e 0)
+              (app (ref error-of) :class/trailing-backslash i)
+              (if (> (document-count esc) 0)
+                (if (app (ref escape-negated?) e)
+                  (app (ref error-of) :class/negated-escape i)
+                  (app (ref class-scan)
+                       (record-new [:ref :pat/class] s (+ i 2) n
+                                   (app (ref vec-concat) ranges esc) false)))
+                (let [lit (app (ref escape-literal) e)]
+                  (app (ref class-scan)
+                       (record-new [:ref :pat/class] s (+ i 2) n
+                                   (document-vector-conj
+                                    (document-vector-conj ranges (app (ref iv) lit))
+                                    (app (ref iv) lit))
+                                   false))))))
+          (let [j (app (ref step-i) s i)
+                dash (app (ref cp-at) s j)
+                after (if (< dash 0) -1 (app (ref cp-at) s (+ j 1)))]
+            (if (if (= dash 45) (if (< after 0) false (not (= after 93))) false)
+              (app (ref class-scan)
+                   (record-new [:ref :pat/class] s (app (ref step-i) s (+ j 1)) n
+                               (document-vector-conj
+                                (document-vector-conj ranges (app (ref iv) cp))
+                                (app (ref iv) after))
+                               false))
+              (app (ref class-scan)
+                   (record-new [:ref :pat/class] s j n
+                               (document-vector-conj
+                                (document-vector-conj ranges (app (ref iv) cp))
+                                (app (ref iv) cp))
+                               false)))))))))
+
+(defn parse-class [s :string i :i64] :document
+  ;; `i` is just past the `[`
+  (let [neg? (= 94 (app (ref cp-at) s i))
+        start (if neg? (+ i 1) i)
+        scanned (app (ref class-scan)
+                     (record-new [:ref :pat/class] s start (string-length s)
+                                 (document-vector) true))]
+    (if (app (ref error?) scanned)
+      scanned
+      (app (ref parsed)
+           (app (ref ast-class) (app (ref dget) scanned :node) (if neg? 1 0))
+           (app (ref di) scanned :i)))))
+
+;; --- atoms ----------------------------------------------------------------
+
+(defn parse-atom [s :string i :i64] :document
+  (let [cp (app (ref cp-at) s i)]
+    (if (< cp 0)
+      (app (ref error-of) :atom/end i)
+      (if (= cp 40)
+        (let [q (app (ref cp-at) s (+ i 1))
+              colon (app (ref cp-at) s (+ i 2))
+              group? (if (= q 63) (= colon 58) false)]
+          (if (if (= q 63) (not group?) false)
+            (app (ref error-of) :group/inline-flags i)
+            (let [inner (app (ref parse-alt) s (if group? (+ i 3) (+ i 1)))]
+              (if (app (ref error?) inner)
+                inner
+                (if (= 41 (app (ref cp-at) s (app (ref di) inner :i)))
+                  (app (ref parsed) (app (ref dget) inner :node) (+ (app (ref di) inner :i) 1))
+                  (app (ref error-of) :group/unterminated i))))))
+        (if (= cp 91)
+          (app (ref parse-class) s (+ i 1))
+          (if (= cp 46)
+            (app (ref parsed) (app (ref ast-any)) (+ i 1))
+            (if (= cp 94)
+              (app (ref parsed) (document-map :t (document-keyword :bol)) (+ i 1))
+              (if (= cp 36)
+                (app (ref parsed) (document-map :t (document-keyword :eol)) (+ i 1))
+                (if (= cp 92)
+                  (let [e (app (ref cp-at) s (+ i 1))
+                        esc (app (ref escape-ranges) e)]
+                    (if (< e 0)
+                      (app (ref error-of) :escape/trailing-backslash i)
+                      (if (app (ref digit?) e)
+                        (app (ref error-of) :escape/back-reference i)
+                        (if (> (document-count esc) 0)
+                          (app (ref parsed)
+                               (app (ref ast-class) esc (if (app (ref escape-negated?) e) 1 0))
+                               (+ i 2))
+                          (app (ref parsed)
+                               (app (ref ast-lit) (app (ref escape-literal) e))
+                               (+ i 2))))))
+                  (app (ref parsed) (app (ref ast-lit) cp) (app (ref step-i) s i)))))))))))
+
+;; --- {n,m} ----------------------------------------------------------------
+
+(defn digits-value [x [:ref :pat/cursor]] :document
+  (let [s (record-get x :s)
+        i (record-get x :i)
+        n (record-get x :n)
+        cp (app (ref cp-at) s i)]
+    (if (app (ref digit?) cp)
+      (app (ref digits-value)
+           (record-new [:ref :pat/cursor] s (+ i 1) (+ (* n 10) (- cp 48))))
+      (app (ref parsed) (app (ref iv) n) i))))
+
+(defn parse-count [s :string i :i64] :document
+  ;; `i` is just past the `{`. Answers {:lo :hi :i} with hi -1 for {n,}
+  (let [lo (app (ref digits-value) (record-new [:ref :pat/cursor] s i 0))
+        j (app (ref di) lo :i)
+        c (app (ref cp-at) s j)]
+    (if (= c 125)
+      (document-map :lo (app (ref dget) lo :node) :hi (app (ref dget) lo :node)
+                    :i (app (ref iv) (+ j 1)))
+      (if (= c 44)
+        (let [hi (app (ref digits-value) (record-new [:ref :pat/cursor] s (+ j 1) 0))
+              k (app (ref di) hi :i)
+              open? (= (+ j 1) k)]
+          (if (= 125 (app (ref cp-at) s k))
+            (let [hv (if open? (app (ref iv) -1) (app (ref dget) hi :node))]
+              (document-map :lo (app (ref dget) lo :node) :hi hv :i (app (ref iv) (+ k 1))))
+            (app (ref error-of) :count/unterminated j)))
+        (app (ref error-of) :count/unterminated j)))))
+
+;; --- quantifiers ----------------------------------------------------------
+
+(defn quantify [s :string node :document i :i64] :document
+  (let [cp (app (ref cp-at) s i)
+        next (app (ref cp-at) s (+ i 1))
+        lazy? (= next 63)]
+    (if (= cp 42)
+      (if lazy?
+        (app (ref error-of) :quantifier/non-greedy i)
+        (app (ref quantify) s (app (ref ast-rep) node 0 -1) (+ i 1)))
+      (if (= cp 43)
+        (if lazy?
+          (app (ref error-of) :quantifier/non-greedy i)
+          (app (ref quantify) s (app (ref ast-rep) node 1 -1) (+ i 1)))
+        (if (= cp 63)
+          (if lazy?
+            (app (ref error-of) :quantifier/non-greedy i)
+            (app (ref quantify) s (app (ref ast-rep) node 0 1) (+ i 1)))
+          (if (= cp 123)
+            (let [c (app (ref parse-count) s (+ i 1))]
+              (if (app (ref error?) c)
+                c
+                (app (ref quantify) s
+                     (app (ref ast-rep) node (app (ref di) c :lo) (app (ref di) c :hi))
+                     (app (ref di) c :i))))
+            (app (ref parsed) node i)))))))
+
+(defn parse-repeat [s :string i :i64] :document
+  (let [a (app (ref parse-atom) s i)]
+    (if (app (ref error?) a)
+      a
+      (app (ref quantify) s (app (ref dget) a :node) (app (ref di) a :i)))))
+
+;; --- concatenation and alternation ----------------------------------------
+
+(defn cat-from [s :string i :i64 xs :document] :document
+  (let [cp (app (ref cp-at) s i)]
+    (if (if (< cp 0) true (if (= cp 124) true (= cp 41)))
+      (app (ref parsed)
+           (if (= 1 (document-count xs))
+             (dat xs 0)
+             (document-map :t (document-keyword :cat) :xs xs))
+           i)
+      (let [r (app (ref parse-repeat) s i)]
+        (if (app (ref error?) r)
+          r
+          (app (ref cat-from) s (app (ref di) r :i)
+               (document-vector-conj xs (app (ref dget) r :node))))))))
+
+(defn parse-cat [s :string i :i64] :document
+  (app (ref cat-from) s i (document-vector)))
+
+(defn alt-from [s :string i :i64 branches :document] :document
+  (let [c (app (ref parse-cat) s i)]
+    (if (app (ref error?) c)
+      c
+      (let [j (app (ref di) c :i)
+            bs (document-vector-conj branches (app (ref dget) c :node))]
+        (if (= 124 (app (ref cp-at) s j))
+          (app (ref alt-from) s (+ j 1) bs)
+          (app (ref parsed)
+               (if (= 1 (document-count bs))
+                 (dat bs 0)
+                 (document-map :t (document-keyword :alt) :xs bs))
+               j))))))
+
+(defn parse-alt [s :string i :i64] :document
+  (app (ref alt-from) s i (document-vector)))
+
+;; --- emitting -------------------------------------------------------------
+;;
+;; Thompson construction with absolute program counters: `emit` is given the
+;; base it will be placed at, so nothing is patched afterwards.
+
+(defn ins2 [op :i64 a :i64] :document
+  (document-vector (app (ref iv) op) (app (ref iv) a)))
+
+(defn ins3 [op :i64 a :i64 b :i64] :document
+  (document-vector (app (ref iv) op) (app (ref iv) a) (app (ref iv) b)))
+
+(defn emitted [code :document classes :document] :document
+  (document-map :code code :classes classes))
+
+(defn class-index [classes :document ranges :document] :i64
+  ;; classes is a vector of flat range vectors; equal ranges share an index
+  (let [n (document-count classes)]
+    (app (ref class-index-from) classes ranges 0 n)))
+
+(defn class-index-from [classes :document ranges :document i :i64 n :i64] :i64
+  (if (>= i n)
+    -1
+    (if (document-equal? (dat classes i) ranges)
+      i
+      (app (ref class-index-from) classes ranges (+ i 1) n))))
+
+(defn emit-seq [x [:ref :pat/seq]] :document
+  (let [xs (record-get x :xs)
+        i (record-get x :i)
+        base (record-get x :base)
+        code (record-get x :code)
+        classes (record-get x :classes)]
+    (if (>= i (document-count xs))
+      (app (ref emitted) code classes)
+      (let [one (app (ref emit) (record-new [:ref :pat/emit] (dat xs i)
+                                            (+ base (document-count code)) classes))]
+        (app (ref emit-seq)
+             (record-new [:ref :pat/seq] xs (+ i 1) base
+                         (app (ref vec-concat) code (app (ref dget) one :code))
+                         (app (ref dget) one :classes)))))))
+
+(defn repeat-nodes [node :document k :i64 acc :document] :document
+  (if (<= k 0)
+    acc
+    (app (ref repeat-nodes) node (- k 1) (document-vector-conj acc node))))
+
+(defn optional-nodes [node :document k :i64 acc :document] :document
+  (if (<= k 0)
+    acc
+    (app (ref optional-nodes) node (- k 1)
+         (document-vector-conj acc (app (ref ast-rep) node 0 1)))))
+
+(defn emit-rep [x [:ref :pat/rep]] :document
+  (let [node (record-get x :node)
+        lo (record-get x :lo)
+        hi (record-get x :hi)
+        base (record-get x :base)
+        classes (record-get x :classes)]
+    (if (if (= lo 0) (= hi -1) false)
+      ;; x* : split(base+1, out) x jmp(base)
+      (let [body (app (ref emit) (record-new [:ref :pat/emit] node (+ base 1) classes))
+            bc (app (ref dget) body :code)
+            out (+ (+ base 2) (document-count bc))]
+        (app (ref emitted)
+             (document-vector-conj
+              (app (ref vec-concat) (document-vector (app (ref ins3) 3 (+ base 1) out)) bc)
+              (app (ref ins2) 4 base))
+             (app (ref dget) body :classes)))
+      (if (if (= lo 1) (= hi -1) false)
+        ;; x+ : x split(base, here+1)
+        (let [body (app (ref emit) (record-new [:ref :pat/emit] node base classes))
+              bc (app (ref dget) body :code)
+              split-pc (+ base (document-count bc))]
+          (app (ref emitted)
+               (document-vector-conj bc (app (ref ins3) 3 base (+ split-pc 1)))
+               (app (ref dget) body :classes)))
+        (if (if (= lo 0) (= hi 1) false)
+          ;; x? : split(base+1, out) x
+          (let [body (app (ref emit) (record-new [:ref :pat/emit] node (+ base 1) classes))
+                bc (app (ref dget) body :code)
+                out (+ (+ base 1) (document-count bc))]
+            (app (ref emitted)
+                 (app (ref vec-concat) (document-vector (app (ref ins3) 3 (+ base 1) out)) bc)
+                 (app (ref dget) body :classes)))
+          (if (= hi -1)
+            ;; x{n,} : n copies then x*
+            (app (ref emit)
+                 (record-new [:ref :pat/emit]
+                             (document-map :t (document-keyword :cat)
+                                           :xs (document-vector-conj
+                                                (app (ref repeat-nodes) node lo (document-vector))
+                                                (app (ref ast-rep) node 0 -1)))
+                             base classes))
+            ;; x{n,m} : n copies then (m-n) optional copies
+            (if (< hi lo)
+              (app (ref error-of) :count/backwards base)
+              (app (ref emit)
+                   (record-new [:ref :pat/emit]
+                               (document-map :t (document-keyword :cat)
+                                             :xs (app (ref optional-nodes) node (- hi lo)
+                                                      (app (ref repeat-nodes) node lo (document-vector))))
+                               base classes)))))))))
+
+(defn emit-alt [xs :document base :i64 classes :document] :document
+  (if (= 1 (document-count xs))
+    (app (ref emit) (record-new [:ref :pat/emit] (dat xs 0) base classes))
+    (let [head (app (ref emit) (record-new [:ref :pat/emit] (dat xs 0) (+ base 1) classes))
+          hc (app (ref dget) head :code)
+          after (+ (+ base 2) (document-count hc))
+          rest (app (ref emit-alt) (document-vector-remove xs 0) after
+                    (app (ref dget) head :classes))
+          rc (app (ref dget) rest :code)
+          end (+ after (document-count rc))]
+      (app (ref emitted)
+           (app (ref vec-concat)
+                (document-vector-conj
+                 (app (ref vec-concat) (document-vector (app (ref ins3) 3 (+ base 1) after)) hc)
+                 (app (ref ins2) 4 end))
+                rc)
+           (app (ref dget) rest :classes)))))
+
+(defn emit [x [:ref :pat/emit]] :document
+  (let [node (record-get x :node)
+        base (record-get x :base)
+        classes (record-get x :classes)
+        t (app (ref dkw) node :t)]
+    (if (= t :lit)
+      (app (ref emitted) (document-vector (app (ref ins2) 0 (app (ref di) node :cp))) classes)
+      (if (= t :any)
+        (app (ref emitted) (document-vector (app (ref ins2) 2 0)) classes)
+        (if (= t :bol)
+          (app (ref emitted) (document-vector (app (ref ins2) 7 0)) classes)
+          (if (= t :eol)
+            (app (ref emitted) (document-vector (app (ref ins2) 8 0)) classes)
+            (if (= t :class)
+              (let [ranges (app (ref dget) node :ranges)
+                    found (app (ref class-index) classes ranges)
+                    idx (if (< found 0) (document-count classes) found)
+                    cs (if (< found 0) (document-vector-conj classes ranges) classes)]
+                (app (ref emitted)
+                     (document-vector (app (ref ins3) 1 idx (app (ref di) node :neg)))
+                     cs))
+              (if (= t :cat)
+                (app (ref emit-seq)
+                     (record-new [:ref :pat/seq] (app (ref dget) node :xs) 0 base
+                                 (document-vector) classes))
+                (if (= t :alt)
+                  (app (ref emit-alt) (app (ref dget) node :xs) base classes)
+                  (if (= t :rep)
+                    (app (ref emit-rep)
+                         (record-new [:ref :pat/rep] (app (ref dget) node :x)
+                                     (app (ref di) node :lo) (app (ref di) node :hi)
+                                     base classes))
+                    (app (ref error-of) :emit/unknown-node base)))))))))))
+
+;; --- the public surface ---------------------------------------------------
+
+(defn starts-with-fold? [re :string] :bool
+  (if (< (string-length re) 4)
+    false
+    (string=? "(?i)" (string-substring re 0 4))))
+
+(defn compile-pattern [re :string] :document
+  (let [fold? (app (ref starts-with-fold?) re)
+        body (if fold? (string-substring re 4 (string-length re)) re)]
+    (if (string-contains? body "(?=")
+      (app (ref error-of) :refused/lookahead 0)
+      (if (string-contains? body "(?!")
+        (app (ref error-of) :refused/lookahead 0)
+        (if (string-contains? body "(?<")
+          (app (ref error-of) :refused/lookbehind 0)
+          (let [parsed-ast (app (ref parse-alt) body 0)]
+            (if (app (ref error?) parsed-ast)
+              parsed-ast
+              (if (not (= (string-length body) (app (ref di) parsed-ast :i)))
+                (app (ref error-of) :refused/unparsed (app (ref di) parsed-ast :i))
+                (let [out (app (ref emit)
+                               (record-new [:ref :pat/emit] (app (ref dget) parsed-ast :node)
+                                           0 (document-vector)))]
+                  (if (app (ref error?) out)
+                    out
+                    (document-map
+                     :code (document-vector-conj (app (ref dget) out :code)
+                                                 (app (ref ins2) 6 0))
+                     :classes (app (ref dget) out :classes)
+                     :fold (document-bool fold?))))))))))))
+
+(defn compile-text [re :string] :string
+  (document-edn-print (app (ref compile-pattern) re)))
+
+;; --- tests ----------------------------------------------------------------
+
+(defn code-of [p :document] :document
+  (app (ref dget) p :code))
+
+(defn op-at [p :document i :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (dat (dat (app (ref code-of) p) i) 0)) -1))
+
+(defn arg-at [p :document i :i64 k :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (dat (dat (app (ref code-of) p) i) k)) -1))
+
+(defn test-lit [] :bool
+  (let [p (app (ref compile-pattern) "ab")]
+    (if (app (ref error?) p)
+      false
+      (if (= 3 (document-count (app (ref code-of) p)))
+        (if (= 97 (app (ref arg-at) p 0 1))
+          (if (= 98 (app (ref arg-at) p 1 1))
+            (= 6 (app (ref op-at) p 2))
+            false)
+          false)
+        false))))
+
+(defn test-class [] :bool
+  (let [p (app (ref compile-pattern) "[0-9]")
+        ranges (dat (app (ref dget) p :classes) 0)]
+    (if (= 1 (app (ref op-at) p 0))
+      (if (= 2 (document-count ranges))
+        (if (= 48 (option-value-of [:option :i64] (document-i64-value (dat ranges 0)) -1))
+          (= 57 (option-value-of [:option :i64] (document-i64-value (dat ranges 1)) -1))
+          false)
+        false)
+      false)))
+
+(defn test-quantifier [] :bool
+  (let [p (app (ref compile-pattern) "[0-9]+")]
+    ;; class, split(0,2), match
+    (if (= 3 (document-count (app (ref code-of) p)))
+      (if (= 3 (app (ref op-at) p 1))
+        (if (= 0 (app (ref arg-at) p 1 1))
+          (= 2 (app (ref arg-at) p 1 2))
+          false)
+        false)
+      false)))
+
+(defn test-alternation [] :bool
+  (let [p (app (ref compile-pattern) "a|b")]
+    ;; split(1,3) a jmp(4) b match
+    (if (= 5 (document-count (app (ref code-of) p)))
+      (if (= 3 (app (ref op-at) p 0))
+        (if (= 1 (app (ref arg-at) p 0 1))
+          (if (= 3 (app (ref arg-at) p 0 2))
+            (if (= 4 (app (ref op-at) p 2))
+              (= 4 (app (ref arg-at) p 2 1))
+              false)
+            false)
+          false)
+        false)
+      false)))
+
+(defn test-anchor [] :bool
+  (let [p (app (ref compile-pattern) "^a$")]
+    (if (= 4 (document-count (app (ref code-of) p)))
+      (if (= 7 (app (ref op-at) p 0))
+        (= 8 (app (ref op-at) p 2))
+        false)
+      false)))
+
+(defn test-escape [] :bool
+  (let [p (app (ref compile-pattern) "\\d{3}-\\d{4}")]
+    ;; three classes, a literal dash, four classes, match
+    (if (= 9 (document-count (app (ref code-of) p)))
+      (if (= 0 (app (ref op-at) p 3))
+        (if (= 45 (app (ref arg-at) p 3 1))
+          (= 1 (app (ref op-at) p 4))
+          false)
+        false)
+      false)))
+
+(defn test-refusals [] :bool
+  (if (= :refused/lookahead (app (ref dkw) (app (ref compile-pattern) "(?=a)") :error))
+    (if (= :escape/back-reference (app (ref dkw) (app (ref compile-pattern) "(a)\\1") :error))
+      (if (= :quantifier/non-greedy (app (ref dkw) (app (ref compile-pattern) "a*?") :error))
+        (= :group/inline-flags (app (ref dkw) (app (ref compile-pattern) "(?m)^a") :error))
+        false)
+      false)
+    false))
+
+(defn test-program [] :bool
+  (let [p (app (ref compile-pattern) "(?i)!important")]
+    (if (option-value-of [:option :bool] (document-bool-value (app (ref dget) p :fold)) false)
+      (= 11 (document-count (app (ref code-of) p)))
+      false)))
+
+(defn main []
+  (document-count (app (ref code-of) (app (ref compile-pattern) "ab"))))

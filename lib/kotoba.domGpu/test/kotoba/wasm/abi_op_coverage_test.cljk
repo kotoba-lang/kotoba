@@ -1,0 +1,162 @@
+(ns kotoba.wasm.abi-op-coverage-test
+  "Every kotoba:dom op must be known to ALL THREE layers that see it:
+   `abi/op->record` (encode), `abi/validate-batch` (admit), and
+   `kotoba.wasm.host.retained/apply-op` (apply).
+
+   This test exists because they drifted, twice, and both drifts were
+   invisible until a real page hit them:
+
+   - `:append-content` (CSS generated content, ::before/::after) and
+     `:create-comment` were encoded and applied but NOT admitted, so
+     `validate-batch` threw \"Invalid ABI op kind\" and took down the
+     WHOLE commit batch -- every unrelated mutation queued alongside it
+     too. Measured 2026-08-29 through `kotoba-lang/browser`'s two real
+     `browser.demo` smoke tests, which had been failing with
+     `{:op :append-content}`.
+   - Before that, `:remove-event-listener` plus four more ops were
+     encoded but not applied, and `apply-op`'s default branch returns
+     `state` UNCHANGED -- a silent no-op, so the retained tree simply
+     stopped mirroring the guest's DOM with no error anywhere.
+
+   The second shape is why this test pins the no-op set explicitly
+   rather than only checking that nothing throws: an op that falls
+   through `apply-op`'s default looks exactly like an op that correctly
+   has no retained effect."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as io]
+            [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.wasm.abi :as abi]
+            [kotoba.wasm.host.retained :as retained]))
+
+(def abi-source-path "lib/kotoba.domGpu/src/kotoba/wasm/abi.cljk")
+
+(def sample-ops
+  "One minimal, VALID raw op per kind `op->record` accepts. Keys must equal
+   the kinds found in the source (asserted below), so a newly added op with
+   no sample here fails instead of going unexercised."
+  {:dom/create-element        [:dom/create-element 1 :main]
+   :dom/create-text           [:dom/create-text 5 "hello"]
+   :dom/create-comment        [:dom/create-comment 3 " a comment "]
+   :dom/create-fragment       [:dom/create-fragment 4]
+   :dom/set-root              [:dom/set-root 1]
+   :dom/set-attr              [:dom/set-attr 1 :style/width 480]
+   :dom/remove-attr           [:dom/remove-attr 1 :style/width]
+   :dom/append-child          [:dom/append-child 1 2]
+   :dom/append-content        [:dom/append-content 1 2]
+   :dom/insert-before         [:dom/insert-before 1 2 nil]
+   :dom/remove-child          [:dom/remove-child 1 2]
+   :dom/remove-children       [:dom/remove-children 1]
+   :dom/set-text              [:dom/set-text 2 "changed"]
+   :dom/add-event-listener    [:dom/add-event-listener 1 :click "handler-2"]
+   :dom/remove-event-listener [:dom/remove-event-listener 1 :click "handler-1"]
+   :dom/dispatch-event        [:dom/dispatch-event "handler-1" {:event/type :click}]
+   :dom/focus                 [:dom/focus 2]
+   :dom/blur                  [:dom/blur 1]})
+
+(def retained-no-op-kinds
+  "Ops with NO effect on the retained tree, and the reason each is legitimate.
+
+   `apply-op`'s default branch returns `state` unchanged, so an op that is
+   merely UNHANDLED is indistinguishable from one that correctly does
+   nothing. Anything that lands here without a reason is the second drift
+   described in this namespace's docstring."
+  #{:dispatch-event})
+
+(def abi-ops-without-a-wit-function
+  "Ops `op->record` emits that `wit/kotoba-dom.wit` declares no host
+   function for -- i.e. ops that cannot cross the WIT boundary to a native
+   or WASM renderer at all today.
+
+   `wit-contract-test/wit-renderer-functions-cover-abi-ops` reads as though
+   it proves coverage, but it only ever encodes NINE hand-listed sample ops,
+   so it has never asked about any of these. Measured 2026-08-29: half the
+   ABI has no WIT surface. Recorded here so that adding a WIT function
+   fails this test and forces the record to be updated, rather than the gap
+   staying invisible in a test that looks exhaustive."
+  #{:create-comment :append-content :remove-attr :remove-event-listener
+    :dispatch-event :set-text :create-fragment :focus :blur})
+
+(defn- source-op-kinds
+  "The `:dom/...` case keys `op->record` actually dispatches on."
+  []
+  (let [f (io/file abi-source-path)]
+    (is (io/exists? f)
+        (str "cannot read " abi-source-path " from " (System/getProperty "user.dir")
+             " -- this test cannot answer without the source, and must not pass by default"))
+    (when (io/exists? f)
+      (->> (re-seq #":dom/([a-z][a-z0-9-]*)" (slurp f))
+           (map (comp keyword (partial str "dom/") second))
+           set))))
+
+(deftest every-abi-op-kind-has-a-sample
+  (let [kinds (source-op-kinds)]
+    (testing "evidence floor: the scan found a plausible number of ops"
+      (is (>= (count kinds) 10)
+          (str "only " (count kinds) " op kinds scanned out of " abi-source-path
+               " -- a scan that finds nothing must not read as a pass")))
+    (testing "the sample set and the source agree, in both directions"
+      (is (= #{} (set/difference kinds (set (keys sample-ops))))
+          "an op kind exists in abi.cljc with no sample op in this test")
+      (is (= #{} (set/difference (set (keys sample-ops)) kinds))
+          "this test samples an op kind abi.cljc no longer has"))))
+
+(deftest encode-admit-apply-agree-on-every-op-kind
+  (doseq [[kind op] (sort-by key sample-ops)]
+    (testing (str kind " survives encode -> validate -> apply")
+      (let [batch (abi/encode-batch [op])]
+        (is (= 1 (count (:ops batch))))
+        (is (= batch (abi/validate-batch batch))
+            (str kind " was encoded but not admitted by validate-batch"))
+        (let [record (first (:ops batch))
+              ;; A state where EVERY sample op has something to change: node 1
+              ;; already carries the attribute :dom/remove-attr removes, node 1
+              ;; already has the listener :dom/remove-event-listener removes, and
+              ;; focus is on node 1 so :dom/focus (node 2) and :dom/blur (node 1)
+              ;; both move it. Without that, a genuinely-unhandled op and a
+              ;; correctly-applied-but-idempotent one look identical.
+              before (assoc retained/base-state
+                            :nodes {1 {:node/id 1 :node/type :element :tag :main
+                                       :attrs {:style/width "320"} :children [2]}
+                                    2 {:node/id 2 :node/type :text :text "hello"}}
+                            :listeners {1 {:click ["handler-1"]}}
+                            :focus 1)
+              after (retained/apply-op before record)]
+          (is (map? after))
+          (if (contains? retained-no-op-kinds (:op record))
+            (is (= before after)
+                (str kind " is recorded as having no retained effect but changed the state"))
+            (is (not= before after)
+                (str kind " left the retained tree UNCHANGED -- either it fell through "
+                     "apply-op's silent default branch, or it belongs in "
+                     "retained-no-op-kinds with a reason"))))))))
+
+(deftest the-gate-discriminates
+  (testing "an unknown op kind is refused by encode, not silently dropped"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"Unknown kotoba DOM op"
+                          (abi/encode-batch [[:dom/no-such-op 1]]))))
+  (testing "a malformed but KNOWN op is refused by validate, per kind"
+    (doseq [[kind bad] {:dom/append-content [:dom/append-content nil 2]
+                        :dom/create-comment [:dom/create-comment nil "x"]
+                        :dom/append-child   [:dom/append-child nil 2]
+                        :dom/set-attr       [:dom/set-attr nil :style/width 1]}]
+      (is (thrown? kerror/ExceptionInfo
+                   (abi/validate-batch (abi/encode-batch [bad])))
+          (str kind " with a nil id was admitted"))))
+  (testing "an unsupported ABI version is refused"
+    (is (thrown-with-msg? kerror/ExceptionInfo #"Unsupported kotoba DOM ABI version"
+                          (abi/validate-batch {:abi/version 999 :ops []})))))
+
+(deftest wit-coverage-gap-is-recorded-not-hidden
+  (let [wit (slurp (io/file "lib/kotoba.domGpu/wit/kotoba-dom.wit"))
+        declared (->> (re-seq #"(?m)^\s*([a-z][a-z0-9-]*):\s*func\b" wit)
+                      (map second) set)
+        abi-kinds (->> (vals sample-ops) (map (comp :op abi/op->record)) set)
+        covered (->> abi-kinds (filter #(contains? declared (name %))) set)
+        gap (set/difference abi-kinds covered)]
+    (is (seq declared) "wit/kotoba-dom.wit declared no functions -- refusing to report coverage")
+    (is (= abi-ops-without-a-wit-function gap)
+        (str "the set of ABI ops with no WIT host function changed. If a WIT "
+             "function was added, remove that op from "
+             "`abi-ops-without-a-wit-function`. Currently missing: "
+             (pr-str (sort gap))))))

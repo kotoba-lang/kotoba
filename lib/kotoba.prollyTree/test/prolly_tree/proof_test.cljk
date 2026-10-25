@@ -1,0 +1,188 @@
+(ns prolly-tree.proof-test
+  "Inclusion proofs, and the forgeries they have to refuse.
+
+  A proof API is only worth having if the negative cases are the ones under
+  test. A `verify` that returns truthy for an honest proof and was never shown
+  a dishonest one has demonstrated nothing -- so the honest round-trip here is
+  three deftests and the refusals are ten.
+
+  Both halves of `verify` were checked by mutation rather than assumed: with
+  the CID check removed `a-well-formed-block-that-lies-about-the-value` goes
+  red, and with the descent check weakened to `accept any genuine child`
+  `a-shadow-path-to-a-second-copy-of-the-key` goes red. A refusal nobody has
+  watched fail is a refusal nobody has tested."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [prolly-tree.core :as pt]
+            [ipld.core :as ipld]))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+(defn- key-str
+  "Zero-padded \"key-NNNN\", portable (no `format`, which is :clj-only)."
+  [i]
+  (let [s (str i)]
+    (str "key-" (apply str (repeat (- 4 (count s)) "0")) s)))
+
+(defn- tampered-bytes
+  "A copy of `bytes` with one byte changed -- a block that is no longer the
+  block its CID names."
+  [bytes]
+  #?(:clj (let [b (aclone ^bytes bytes)]
+            (aset-byte b 0 (unchecked-byte (inc (aget b 0))))
+            b)
+     :cljs (let [b (js/Uint8Array. bytes)]
+             (aset b 0 (bit-and 0xff (inc (aget b 0))))
+             b)))
+
+;; ── the honest path ─────────────────────────────────────────────────────────
+
+(deftest proof-round-trips-small-tree
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first [["a" 1] ["b" 2] ["c" 3]])
+        root (pt/build-tree put! entries)]
+    (doseq [[k v] entries]
+      (let [proof (pt/inclusion-proof get-fn root k)]
+        (is (some? proof) (str "a proof exists for " k))
+        (is (= {:value v} (pt/verify root k proof)))))))
+
+(deftest proof-round-trips-multi-level-tree
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        sampled (take-nth 137 entries)]
+    (testing "every sampled key proves, and the value matches lookup"
+      (doseq [[k v] sampled]
+        (let [proof (pt/inclusion-proof get-fn root k)]
+          (is (= {:value v} (pt/verify root k proof)))
+          (is (= v (pt/lookup get-fn root k))))))
+    (testing "the tree really is multi-level, so internal descent is exercised"
+      (is (some #(> (count (pt/inclusion-proof get-fn root (first %))) 1)
+                sampled)))))
+
+(deftest proof-carries-a-nil-value-without-becoming-a-refusal
+  (testing "{:value nil} is a proof that held; nil is a proof that did not"
+    (let [{:keys [put! get-fn]} (mem-store)
+          root (pt/build-tree put! [["k" nil]])]
+      (is (= {:value nil} (pt/verify root "k" (pt/inclusion-proof get-fn root "k")))))))
+
+;; ── the refusals ────────────────────────────────────────────────────────────
+
+(deftest no-proof-for-an-absent-key
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! (sort-by first [["a" 1] ["b" 2] ["c" 3]]))]
+    (is (nil? (pt/inclusion-proof get-fn root "zzz-missing")))))
+
+(deftest nil-root-proves-and-verifies-nothing
+  (let [{:keys [get-fn]} (mem-store)]
+    (is (nil? (pt/inclusion-proof get-fn nil "anything")))
+    (is (nil? (pt/verify nil "anything" [])))))
+
+(deftest empty-proof-is-refused
+  (let [{:keys [put! _]} (mem-store)
+        root (pt/build-tree put! [["a" 1]])]
+    (is (nil? (pt/verify root "a" [])))
+    (is (nil? (pt/verify root "a" nil)))))
+
+(deftest tampered-block-is-refused
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        k (key-str 1234)
+        proof (pt/inclusion-proof get-fn root k)]
+    (is (= {:value 1234} (pt/verify root k proof)) "control: the honest proof holds")
+    (testing "every position in the path is CID-checked, not just the root"
+      (doseq [i (range (count proof))]
+        (is (nil? (pt/verify root k (assoc (vec proof) i (tampered-bytes (nth proof i)))))
+            (str "tampering block " i " must be refused"))))))
+
+(deftest a-well-formed-block-that-lies-about-the-value-is-refused
+  (testing "the attack the CID check exists for: not garbage, a different truth"
+    (let [{:keys [put! get-fn]} (mem-store)
+          entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+          root (pt/build-tree put! entries)
+          k (key-str 1234)
+          proof (pt/inclusion-proof get-fn root k)
+          leaf (ipld/decode (last proof))
+          lying (assoc leaf "entries"
+                       (mapv (fn [e] (if (= (first e) k) [k 999999] (vec e)))
+                             (get leaf "entries")))
+          lying-bytes (ipld/encode lying)]
+      (is (not= (ipld/cid lying-bytes) (ipld/cid (last proof)))
+          "the forged leaf is a different block")
+      (is (= {:value 1234} (pt/verify root k proof)) "control")
+      (is (nil? (pt/verify root k (conj (vec (butlast proof)) lying-bytes)))))))
+
+(deftest a-valid-block-from-elsewhere-in-the-tree-is-refused
+  (testing "substituting a leaf that is genuinely in this tree, at the wrong place"
+    (let [{:keys [put! get-fn]} (mem-store)
+          entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+          root (pt/build-tree put! entries)
+          k1 (key-str 100)
+          k2 (key-str 1900)
+          p1 (pt/inclusion-proof get-fn root k1)
+          p2 (pt/inclusion-proof get-fn root k2)]
+      (is (not= (last p1) (last p2)) "the two keys really live in different leaves")
+      (is (nil? (pt/verify root k1 (conj (vec (butlast p1)) (last p2))))))))
+
+(deftest a-proof-for-another-key-is-refused
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        k1 (key-str 100)
+        k2 (key-str 1900)
+        p1 (pt/inclusion-proof get-fn root k1)]
+    (is (not= (last p1) (last (pt/inclusion-proof get-fn root k2)))
+        "different leaves, so the path genuinely differs")
+    (is (nil? (pt/verify root k2 p1)))))
+
+(deftest a-wrong-root-is-refused
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        other-root (pt/build-tree put! (sort-by first [["a" 1] ["b" 2]]))
+        k (key-str 1234)
+        proof (pt/inclusion-proof get-fn root k)]
+    (is (not= root other-root))
+    (is (nil? (pt/verify other-root k proof)))))
+
+(deftest a-truncated-or-padded-path-is-refused
+  (let [{:keys [put! get-fn]} (mem-store)
+        entries (sort-by first (map (fn [i] [(key-str i) i]) (range 2000)))
+        root (pt/build-tree put! entries)
+        k (key-str 1234)
+        proof (vec (pt/inclusion-proof get-fn root k))]
+    (is (> (count proof) 1) "need a multi-block path for this to mean anything")
+    (testing "stopping at an internal node proves nothing"
+      (is (nil? (pt/verify root k (subvec proof 0 (dec (count proof)))))))
+    (testing "blocks after the leaf are not ignored"
+      (is (nil? (pt/verify root k (conj proof (first proof))))))))
+
+(deftest a-shadow-path-to-a-second-copy-of-the-key-is-refused
+  (testing "what the descent check buys, isolated
+
+  `build-tree` cannot produce this tree -- it is hand-built to hold `m` in TWO
+  leaves with different values, which a well-formed prolly tree never does.
+  That is the point: if a prover controls the tree, `chains to the root` and
+  `the leaf contains k` are together NOT enough. Both paths below are real
+  blocks that really chain to this root. Only the one the descent rule selects
+  is what the tree SAYS for `m`, and only that one may verify -- otherwise a
+  proof means `this pair is somewhere in the tree`, which is a strictly weaker
+  claim than a caller settling a withdrawal against it would assume."
+    (let [{:keys [put! get-fn]} (mem-store)
+          cid-a (ipld/put-node! put! {"kind" "leaf" "entries" [["m" 1]]})
+          cid-b (ipld/put-node! put! {"kind" "leaf" "entries" [["m" 2] ["z" 3]]})
+          root (ipld/put-node! put! {"kind" "internal"
+                                     "children" [["m" (ipld/link cid-a)]
+                                                 ["z" (ipld/link cid-b)]]})
+          root-bytes (get-fn root)]
+      (testing "the read path picks leaf A, so that is the only truth about m"
+        (is (= 1 (pt/lookup get-fn root "m"))))
+      (testing "the honest proof verifies"
+        (is (= {:value 1} (pt/verify root "m" [root-bytes (get-fn cid-a)]))))
+      (testing "the shadow path is real, chains to the root, and is still refused"
+        (is (nil? (pt/verify root "m" [root-bytes (get-fn cid-b)])))))))

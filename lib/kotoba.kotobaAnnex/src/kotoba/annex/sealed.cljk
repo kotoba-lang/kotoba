@@ -1,0 +1,146 @@
+(ns kotoba.annex.sealed
+  "**封緘した annex object** —— identity は平文の CID、location は暗号文の CID
+   （ADR-2608301039 D2）。内側の store（`archive` / `grant` / `directory`）を包む。
+
+   ## なぜ git-annex 自身の暗号化を使わないか
+
+   `encryption=shared` を使うと remote 側の key が `GPGHMACSHA256--…` になり、
+   **内容ハッシュでなくなるので CID へ機械変換できない**（`kotoba.annex.cid` の
+   docstring が実測している）。annex 層を `encryption=none` のままにして封緘を
+   この seam の中で行えば、annex key は `SHA256E-s<n>--<sha256>` のまま、つまり
+   **平文の CID = identity** として保たれる。
+
+     identity   annex key から導く CIDv1(raw,sha2-256)。平文を指す。
+                **object store には出さない。** private git（annex branch）に留まる。
+     location   暗号文の sha256 から作る CIDv1。**object store が鍵にするのはこちら。**
+
+   両者は必ず異なる。同じなら平文のまま出たか、暗号文が平文から導かれた
+   （convergent、ADR-2608070400 D5 で禁止）ことを意味する。
+
+   ## 対応表は annex branch に置く
+
+   location は identity から計算できない（content key が毎回新しいので暗号文が
+   毎回違う —— それが convergent 禁止の意味）。したがって identity→location の
+   対応表が要る。置き場は **git-annex の per-key state**（`SETSTATE`/`GETSTATE`）で、
+   annex branch に載って repo と一緒に複製され、remote ごとに分かれる。
+   本 ns はその state を注入された port として受け取る（bin 側が実プロトコルを話す）。
+
+   **state が無い key は `:no` を返す。** ここを `:unknown` や `:yes` にすると、
+   対応表を失った時に「在ることになっている bytes」が生まれ、git-annex は
+   numcopies 充足と信じて最後のローカルコピーを落とす。
+
+   ## 受信者
+
+   content key はオブジェクトごとに新しく、受信者ごとに X25519 で wrap される
+   （`kotoba-lang/envelope`）。**共有は鍵を wrap し直すだけで、オブジェクトを
+   暗号化し直さない。** 現状の受信者は operator 鍵 1 本 —— WebAuthn PRF から
+   X25519 を導く経路（ADR-2608301039 D7 段3）が入るまで、受信者が他に存在しない。
+   増えたときに壊れないよう、recipients は最初から集合で受ける。"
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.annex.cid :as cid]
+            [envelope.seal :as seal]))
+
+(defn- sha256-hex [b]
+  (-> (js/require "crypto") (.createHash "sha256") (.update b) (.digest "hex")))
+
+(defn- require-identity-cid [key]
+  (or (cid/key->cid key)
+      (throw (js/Error.
+              (str "key から identity CID を導出できない: " key
+                   " — annex 層は encryption=none / chunk 無しで使うこと"
+                   "（封緘はこの seam が行う）")))))
+
+(defn location-key
+  "暗号文そのものの annex key 形。`kotoba.annex.cid/key->cid` がそのまま
+   location CID を返すので、内側の store を一切変更せずに使える。"
+  [ciphertext]
+  (str "SHA256E-s" (.-length ciphertext) "--" (sha256-hex ciphertext)))
+
+(defn- to-buffer [x]
+  (if (js/Buffer.isBuffer x) x (js/Buffer.from x)))
+
+(defn sealed-store
+  "opts:
+     :inner      包む store（`kotoba.annex.store` 契約）
+     :recipients [{:id <did> :pub <x25519 public bytes>} …]
+     :reader     {:id <did> :priv <x25519 private bytes>} —— この process が
+                 開ける受信者。nil なら retrieve は常に nil（書き専用）。
+     :state      {:get (fn [key]) -> string|nil, :set! (fn [key value]) -> truthy}
+
+   戻り値は `kotoba.annex.store` 契約と同形（関数は Promise を返す）。"
+  [{:keys [inner recipients reader state]}]
+  (let [put-state! (:set! state)
+        get-state (:get state)
+        ;; ⚠ **JSON にしない。** `clj->js` は namespace 付きキーワードの namespace を
+        ;; 落とすので、`:envelope/recipients` が `:recipients` になって帰ってくる。
+        ;; envelope の全キーが namespaced なので、往復した封筒は `entry-for` から
+        ;; 見えなくなり、**封緘は成功したまま二度と開けない**（実測 2026-08-30、
+        ;; その形で roundtrip テストだけが落ちた）。EDN は namespace を保つ。
+        ;; annex の state 値は 1 行でなければならないが、`pr-str` は改行を出さない。
+        read-state (fn [key]
+                     (when-let [v (get-state key)]
+                       (try (edn/read-string v) (catch :default _ nil))))]
+    {:inner inner
+     :store!
+     (fn [key bytes]
+       (let [identity-cid (require-identity-cid key)
+             plain (to-buffer bytes)]
+         ;; 防御: key の hash と実バイト列が食い違うなら封緘もしない。
+         (when (not= (sha256-hex plain) (:hash (cid/parse-key key)))
+           (throw (js/Error. (str "key の hash と実バイト列の sha256 が不一致: " key))))
+         (when (empty? recipients)
+           (throw (js/Error. "recipients が空 —— 誰にも開けない object は封緘ではなく紛失")))
+         (-> (seal/seal-object identity-cid [plain] recipients)
+             (.then
+              (fn [{:keys [envelope chunks]}]
+                (let [ct (to-buffer (first chunks))
+                      lk (location-key ct)]
+                  ;; identity と location が一致したら封緘されていない。送らない。
+                  (when (= lk key)
+                    (throw (js/Error. "location key が identity key と同一 —— 封緘されていない")))
+                  (-> (js/Promise.resolve ((:store! inner) lk ct))
+                      (.then (fn [ok]
+                               (when ok
+                                 ;; 対応表は bytes が着いてから書く。逆順にすると
+                                 ;; 「在ることになっている」項目が先に生まれる。
+                                 (put-state! key (pr-str {:location lk
+                                                          :envelope envelope}))
+                                 true)))
+                      (.then (fn [ok] (boolean ok))))))))))
+     :present?
+     (fn [key]
+       (if-let [{:keys [location]} (read-state key)]
+         (js/Promise.resolve ((:present? inner) location))
+         ;; 対応表に無い = この remote は場所を知らない。:unknown にしない。
+         (js/Promise.resolve :no)))
+     :retrieve
+     (fn [key]
+       (let [{:keys [location envelope]} (read-state key)]
+         (if (or (nil? location) (nil? reader))
+           (js/Promise.resolve nil)
+           (-> (js/Promise.resolve ((:retrieve inner) location))
+               (.then (fn [ct]
+                        (when ct
+                          (when-let [entry (seal/entry-for envelope (:id reader))]
+                            (seal/open-object envelope entry (:priv reader)
+                                              [(to-buffer ct)])))))
+               (.then (fn [chunks]
+                        (when (seq chunks)
+                          (let [plain (to-buffer (first chunks))]
+                            ;; fail-closed: 復号できても平文が key と合わなければ nil。
+                            (when (= (sha256-hex plain) (:hash (cid/parse-key key)))
+                              plain)))))
+               (.catch (fn [_] nil))))))
+     :remove!
+     (fn [key]
+       (if-let [{:keys [location]} (read-state key)]
+         (js/Promise.resolve ((:remove! inner) location))
+         (js/Promise.resolve false)))
+     :init! (fn [] ((:init! inner)))
+     :prepare!
+     (fn [config]
+       (when (empty? recipients)
+         (throw (js/Error. "recipients が空 —— 封緘先が無い状態で走り出さない")))
+       (when (or (nil? get-state) (nil? put-state!))
+         (throw (js/Error. "state port が無い —— identity→location の対応表を置けない")))
+       ((:prepare! inner) config))}))

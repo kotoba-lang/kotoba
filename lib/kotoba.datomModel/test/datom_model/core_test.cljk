@@ -1,0 +1,725 @@
+(ns datom-model.core-test
+  "Ported from `kotoba-lang/kotobase-peer`'s `kotobase-peer.core-test`
+  (@ ea4a8e8b0f757a5f15a28cc3a0ac42406b65ffde) -- every test there that
+  exercises the MODEL half (transact / schema / :db/ident / datoms / q /
+  query / pull / entity). The persistence-half tests (commit!, fold!,
+  hydrate-*, cold-datoms, as-of/since/history, verify-chain, and the whole
+  AES-GCM/HMAC test-crypto preamble they need) are deliberately not ported --
+  none of that code is in this repo.
+
+  Two mechanical changes run through every ported test, and they are the
+  point of the extraction:
+
+  1. `ref?` is a required argument, so calls gain an explicit predicate where
+     the source relied on `ipld.core/link?` by default.
+  2. `datoms` takes a required `render-value`, so calls gain `->wire` where
+     the source hardcoded `#(pr-str (arrangement.core/link->edn %))`.
+
+  `Ref` below stands in for `ipld.core/Link`. It is deliberately a local
+  record and not the real thing: if these tests needed io-ipld to pass, the
+  extraction would not have worked. `->wire` reproduces
+  `arrangement.core/link->edn`'s exact `[\"ipld/link\" cid]` output, so the
+  `:v_edn` assertions here are byte-identical to the source repo's."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [datalog.index :as index]
+            [datom-model.core :as m]))
+
+(defrecord Ref [cid])
+
+(defn- ref?
+  "Stand-in for `ipld.core/link?`: the caller's answer to \"is this value a
+  reference\", which is exactly what this library refuses to guess."
+  [x]
+  (instance? Ref x))
+
+(defn- ->wire
+  "Stand-in for `#(pr-str (arrangement.core/link->edn %))`: a reference
+  renders as `[\"ipld/link\" cid]`, anything else `pr-str`s directly."
+  [v]
+  (pr-str (if (ref? v) ["ipld/link" (:cid v)] v)))
+
+(def ^:private everything (constantly true))
+(def ^:private no-refs (constantly false))
+
+;; ── the extraction's own contract: both injections are required ─────────────
+
+(deftest ref-is-required-no-implicit-default
+  (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+               #_:clj-kondo/ignore (m/transact (m/empty-db) [["a" "b" "c"]]))
+      "transact will not guess what a reference is -- datalog.index's own rule")
+  (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+               #_:clj-kondo/ignore (m/install-schema (m/empty-db) {"a" {:db/valueType :string}}))))
+
+(deftest render-value-is-required-no-implicit-default
+  (let [db (m/transact (m/empty-db) [["alice" "role" "admin"]] ref?)]
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 #_:clj-kondo/ignore (m/datoms db everything))
+        "datoms will not guess a wire encoding -- pr-str of a reference is silent garbage")))
+
+(deftest wire-encoding-matches-kotobase-peers-byte-for-byte
+  ;; The exact string kotobase-peer.core-test asserts for a Link-valued datom.
+  (let [bob (->Ref "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")
+        db (m/transact (m/empty-db)
+                       [{:s "alice" :p "knows" :o bob}
+                        {:s "alice" :p "name" :o "Alice"}]
+                       ref?)]
+    (is (= #{["knows" "[\"ipld/link\" \"bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m\"]"]
+             ["name" "\"Alice\""]}
+           (set (map (juxt :a :v_edn) (m/datoms db ->wire everything)))))))
+
+;; ── transact / datoms ───────────────────────────────────────────────────────
+
+(deftest transact-and-datoms-roundtrip
+  (testing "quad maps, [:db/add e a v], and bare [e a v] triples all normalize the same way"
+    (let [db (m/transact (m/empty-db)
+                         [{:s "alice" :p "role" :o "admin"}
+                          [:db/add "alice" "name" "Alice"]
+                          ["bob" "role" "user"]]
+                         ref?)
+          rows (m/datoms db ->wire everything)]
+      (is (= 3 (count rows)))
+      (is (every? #(and (:e %) (:a %) (:v_edn %) (:added %)) rows))
+      (is (= #{"\"admin\"" "\"Alice\"" "\"user\""} (set (map :v_edn rows)))))))
+
+(deftest datoms-visible-filters-rows
+  (let [db (m/transact (m/empty-db)
+                       [["alice" "role" "admin"] ["bob" "role" "user"]]
+                       ref?)
+        alice-only (fn [{:keys [e]}] (= "alice" e))]
+    (is (= [{:e "alice" :a "role" :v_edn "\"admin\"" :added true}]
+           (m/datoms db ->wire alice-only))
+        "visible? actually excludes rows, not just threaded through")))
+
+(deftest datoms-honors-index-components-limit
+  (let [db (m/transact (m/empty-db)
+                       [["keybackup/did:key:zAlice" ":aozora.keyBackup/did" "did:key:zAlice"]
+                        ["keybackup/did:key:zAlice" ":aozora.keyBackup/blob" "{blobA}"]
+                        ["keybackup/did:key:zBob"   ":aozora.keyBackup/did" "did:key:zBob"]
+                        ["keybackup/did:key:zBob"   ":aozora.keyBackup/blob" "{blobB}"]
+                        ["acct/alice" ":atproto.account/handle" "alice.aozora.app"]]
+                       ref?)]
+    (testing "no opts → whole-db scan"
+      (is (= 5 (count (m/datoms db ->wire everything))))
+      (is (= 5 (count (m/datoms db nil ->wire everything)))))
+    (testing ":eavt + [e] returns ONLY that entity's datoms"
+      (let [rows (m/datoms db {:index :eavt :components ["keybackup/did:key:zAlice"]} ->wire everything)]
+        (is (= 2 (count rows)))
+        (is (every? #(= "keybackup/did:key:zAlice" (:e %)) rows))
+        (is (= #{":aozora.keyBackup/did" ":aozora.keyBackup/blob"} (set (map :a rows))))))
+    (testing ":eavt + [e a] narrows to one attribute"
+      (is (= [{:e "keybackup/did:key:zAlice" :a ":aozora.keyBackup/blob"
+               :v_edn "\"{blobA}\"" :added true}]
+             (m/datoms db {:index :eavt
+                           :components ["keybackup/did:key:zAlice" ":aozora.keyBackup/blob"]}
+                       ->wire everything))))
+    (testing ":avet + [attr value] point-looks-up the subject(s)"
+      (is (= [{:e "keybackup/did:key:zBob" :a ":aozora.keyBackup/did"
+               :v_edn "\"did:key:zBob\"" :added true}]
+             (m/datoms db {:index :avet
+                           :components [":aozora.keyBackup/did" "did:key:zBob"]}
+                       ->wire everything))))
+    (testing ":avet + [attr] returns all datoms for that attribute"
+      (is (= 2 (count (m/datoms db {:index :avet :components [":aozora.keyBackup/did"]} ->wire everything)))))
+    (testing ":aevt + [attr] scans one attribute"
+      (is (= 2 (count (m/datoms db {:index :aevt :components [":aozora.keyBackup/blob"]} ->wire everything)))))
+    (testing ":limit caps rows"
+      (is (= 1 (count (m/datoms db {:index :avet :components [":aozora.keyBackup/did"] :limit 1} ->wire everything)))))
+    (testing "missing entity/attr → empty, not a full scan"
+      (is (= [] (m/datoms db {:index :eavt :components ["keybackup/nope"]} ->wire everything)))
+      (is (= [] (m/datoms db {:index :avet :components [":aozora.keyBackup/did" "did:key:zNope"]} ->wire everything))))))
+
+(deftest transact-is-immutable
+  (let [db0 (m/empty-db)
+        db1 (m/transact db0 [{:s "alice" :p "role" :o "admin"}] ref?)]
+    (is (= 0 (count (m/datoms db0 ->wire everything))))
+    (is (= 1 (count (m/datoms db1 ->wire everything))))))
+
+;; ── q / query / query plan ──────────────────────────────────────────────────
+
+(deftest q-routes-through-datalog-query
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "role" :o "admin"}
+                        {:s "bob" :p "role" :o "user"}]
+                       ref?)]
+    (is (= #{{:s "alice" :p "role" :o "admin"}} (m/q db ["alice" nil nil] everything)))
+    (is (= #{{:s "alice" :p "role" :o "admin"}} (m/q db [nil "role" "admin"] everything)))
+    (is (= 2 (count (m/q db [nil nil nil] everything))))))
+
+(deftest q-visible-is-required
+  ;; a non-empty db: an omitted visible? must actually be invoked as a
+  ;; predicate (and fail) for this to be a meaningful cross-platform check --
+  ;; on an empty db, cljs's `filter` never calls the missing predicate at all,
+  ;; so the arity mismatch would silently NOT surface.
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "role" :o "admin"}] ref?)]
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 #_:clj-kondo/ignore (m/q db [nil nil nil]))
+        "q cascades datalog.query's required visibility decision -- no permissive default")))
+
+(deftest query-joins-across-clauses
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "role" :o "admin"}
+                        {:s "alice" :p "name" :o "Alice"}
+                        {:s "bob" :p "role" :o "user"}
+                        {:s "bob" :p "name" :o "Bob"}]
+                       ref?)]
+    (is (= #{["Alice"]}
+           (m/query db {:find '[?name]
+                        :where '[[?s "role" "admin"]
+                                 [?s "name" ?name]]}
+                    everything)))))
+
+(deftest query-plans-selective-connected-triples-before-broad-clauses
+  (let [db (m/transact
+            (m/empty-db)
+            (concat [{:s "alice" :p "role" :o "admin"}
+                     {:s "alice" :p "name" :o "Alice"}]
+                    (mapcat (fn [i]
+                              [{:s (str "user-" i) :p "role" :o "user"}
+                               {:s (str "user-" i) :p "name" :o (str "User " i)}])
+                            (range 100)))
+            ref?)
+        query {:find '[?name]
+               :where '[[?s "name" ?name]
+                        [?s "role" "admin"]]}
+        plan (m/datalog-query-plan db query everything)]
+    (is (:optimized? plan))
+    (is (= '[[?s "role" "admin"] [?s "name" ?name]]
+           (get-in plan [:query :where])))
+    (is (= [1 0] (mapv :id (:plan plan))))
+    (is (= #{["Alice"]} (m/query db query everything)))))
+
+(deftest query-plan-preserves-order-for-binding-sensitive-forms
+  (let [db (m/empty-db)
+        query {:find '[?s]
+               :where '[[?s "age" ?age] [(> ?age 18)]]}
+        plan (m/datalog-query-plan db query everything)]
+    (is (false? (:optimized? plan)))
+    (is (= (:where query) (get-in plan [:query :where])))))
+
+(deftest query-plan-consumes-scoped-materialized-statistics-without-scanning
+  (let [visibility-calls (atom 0)
+        visible? (fn [_] (swap! visibility-calls inc) true)
+        query {:find '[?name]
+               :where '[[?s "name" ?name] [?s "role" "admin"]]
+               :statistics-scope "tenant-a/public-v1"
+               :query-epoch 7
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "epoch" 7
+                                  "clauses" [{"pattern" [nil "name" nil] "rows" 101}
+                                             {"pattern" [nil "role" "admin"] "rows" 1}]}}
+        plan (m/datalog-query-plan (m/empty-db) query visible?)]
+    (is (= [1 0] (mapv :id (:plan plan))))
+    (is (= [:materialized-statistics :materialized-statistics]
+           (mapv :estimate-source (:plan plan))))
+    (is (zero? @visibility-calls))))
+
+(deftest query-plan-rejects-statistics-from-another-visibility-scope
+  (let [query {:find '[?s]
+               :where '[[?s "role" "admin"]]
+               :statistics-scope "tenant-b/private-v1"
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "clauses" [{"pattern" [nil "role" "admin"] "rows" 1}]}}
+        plan (m/datalog-query-plan (m/empty-db) query everything)]
+    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+
+(deftest query-plan-falls-back-when-materialized-statistics-are-stale
+  (let [query {:find '[?s] :where '[[?s "role" "admin"]]
+               :statistics-scope "tenant-a/public-v1"
+               :query-epoch 9 :max-statistics-age 1
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "epoch" 7
+                                  "clauses" [{"pattern" [nil "role" "admin"]
+                                              "rows" 1}]}}
+        plan (m/datalog-query-plan (m/empty-db) query everything)]
+    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+
+(deftest query-visible-is-required
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "role" :o "admin"}] ref?)]
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 #_:clj-kondo/ignore (m/query db {:find '[?s] :where '[[?s "role" "admin"]]})))))
+
+(deftest query-negation-end-to-end
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "role" :o "admin"}
+                        {:s "alice" :p "name" :o "Alice"}
+                        {:s "bob" :p "role" :o "user"}
+                        {:s "bob" :p "name" :o "Bob"}]
+                       ref?)]
+    (is (= #{["bob"]}
+           (m/query db {:find '[?s]
+                        :where '[[?s "name" _]
+                                 (not [?s "role" "admin"])]}
+                    everything)))))
+
+(deftest query-negation-still-respects-visible-through-the-model-layer
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "role" :o "admin"}
+                        {:s "alice" :p "name" :o "Alice"}
+                        {:s "bob" :p "role" :o "user"}
+                        {:s "bob" :p "name" :o "Bob"}
+                        {:s "carol" :p "role" :o "admin"}
+                        {:s "carol" :p "name" :o "Carol"}]
+                       ref?)
+        hide-carols-admin-fact (fn [{:keys [s p o]}] (not (and (= s "carol") (= p "role") (= o "admin"))))]
+    (is (= #{["bob"] ["carol"]}
+           (m/query db {:find '[?s]
+                        :where '[[?s "name" _]
+                                 (not [?s "role" "admin"])]}
+                    hide-carols-admin-fact))
+        "carol's admin fact is hidden from this caller -- indistinguishable from bob's genuine non-admin status")))
+
+(deftest query-aggregation-end-to-end
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "role" :o "admin"}
+                        {:s "bob" :p "role" :o "user"}
+                        {:s "carol" :p "role" :o "admin"}]
+                       ref?)]
+    (is (= #{["admin" 2] ["user" 1]}
+           (m/query db {:find '[?role (count ?s)] :where '[[?s "role" ?role]]} everything)))))
+
+(deftest query-recursive-rule-end-to-end
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "parent" :o "bob"}
+                        {:s "bob" :p "parent" :o "carol"}
+                        {:s "carol" :p "parent" :o "dave"}]
+                       ref?)
+        ancestor-rules '[[(ancestor ?x ?y) [?x "parent" ?y]]
+                         [(ancestor ?x ?y) [?x "parent" ?z] (ancestor ?z ?y)]]]
+    (is (= #{["bob"] ["carol"] ["dave"]}
+           (m/query db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} everything)))))
+
+(deftest query-recursive-rule-still-respects-visible-through-the-model-layer
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "parent" :o "bob"}
+                        {:s "bob" :p "parent" :o "carol"}
+                        {:s "carol" :p "parent" :o "dave"}]
+                       ref?)
+        hide-bob-carol (fn [{:keys [s p o]}] (not (and (= s "bob") (= p "parent") (= o "carol"))))
+        ancestor-rules '[[(ancestor ?x ?y) [?x "parent" ?y]]
+                         [(ancestor ?x ?y) [?x "parent" ?z] (ancestor ?z ?y)]]]
+    (is (= #{["bob"]}
+           (m/query db {:find '[?y] :where '[(ancestor "alice" ?y)] :rules ancestor-rules} hide-bob-carol))
+        "bob->carol is hidden from this caller -- the recursive fixpoint can't derive past bob")))
+
+(deftest query-language-extensions-end-to-end
+  ;; Built via datalog.index/assert-quad directly (not m/transact) to keep
+  ;; :age a real number -- ->quad-value stringifies every non-ref value (a
+  ;; separate, pre-existing, orthogonal limitation this test isn't about).
+  (let [db (-> (m/empty-db)
+               (index/assert-quad {:s "alice" :p "age" :o 30} ref?)
+               (index/assert-quad {:s "bob" :p "age" :o 15} ref?)
+               (index/assert-quad {:s "carol" :p "age" :o 45} ref?))]
+    (is (= #{["alice"] ["carol"]}
+           (m/query db {:find '[?s] :in '[?min-age] :where '[[?s "age" ?age] [(> ?age ?min-age)]]}
+                    everything [18])))
+    (is (= #{["alice"] ["carol"]}
+           (m/query db {:find '[?s] :where '[(or [?s "age" 30] [?s "age" 45])]} everything)))))
+
+;; ── pull ────────────────────────────────────────────────────────────────────
+
+(deftest pull-returns-entity-attrs
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "role" :o "admin"}
+                                     {:s "alice" :p "name" :o "Alice"}]
+                       ref?)]
+    (is (= {"role" #{"admin"} "name" #{"Alice"}} (m/pull db "alice")))))
+
+(deftest pull-pattern-plain-attrs
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "role" :o "admin"}
+                                     {:s "alice" :p "name" :o "Alice"}
+                                     {:s "alice" :p "age" :o "30"}]
+                       ref?)]
+    (is (= {"role" #{"admin"} "name" #{"Alice"}}
+           (m/pull db "alice" ["role" "name"])))))
+
+(deftest pull-pattern-wildcard-matches-2-arg-form
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "role" :o "admin"}
+                                     {:s "alice" :p "name" :o "Alice"}]
+                       ref?)]
+    (is (= (m/pull db "alice") (m/pull db "alice" '[*])))))
+
+(deftest pull-pattern-nested-ref-forward
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "name" :o "Alice"}
+                                     {:s "bob" :p "manager" :o "alice"}
+                                     {:s "bob" :p "name" :o "Bob"}]
+                       ref?)]
+    (is (= {"manager" #{{"name" #{"Alice"}}}}
+           (m/pull db "bob" [{"manager" ["name"]}])))))
+
+(deftest pull-pattern-reverse-ref-needs-ref-valued-refs
+  ;; refs-to (VAET-style) only tracks values the caller's own `ref?` accepted
+  ;; -- same convention `refs` documents.
+  (let [alice (->Ref "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")
+        db (m/transact (m/empty-db) [{:s "alice" :p "name" :o "Alice"}
+                                     {:s "bob" :p "manager" :o alice}
+                                     {:s "bob" :p "name" :o "Bob"}
+                                     {:s "carol" :p "manager" :o alice}
+                                     {:s "carol" :p "name" :o "Carol"}]
+                       ref?)]
+    (testing "flat reverse ref"
+      (is (= #{"bob" "carol"} (get (m/pull db alice ["_manager"]) "_manager"))))
+    (testing "nested reverse ref"
+      (is (= #{{"name" #{"Bob"}} {"name" #{"Carol"}}}
+             (get (m/pull db alice [{"_manager" ["name"]}]) "_manager"))))))
+
+(deftest pull-pattern-recursion-depth-limit
+  (let [db (m/transact (m/empty-db)
+                       [{:s "a" :p "name" :o "A"} {:s "a" :p "friend" :o "b"}
+                        {:s "b" :p "name" :o "B"} {:s "b" :p "friend" :o "c"}
+                        {:s "c" :p "name" :o "C"} {:s "c" :p "friend" :o "a"}]
+                       no-refs)]
+    (is (= {"friend" #{{"name" #{"B"} "friend" #{{"name" #{"C"} "friend" #{"a"}}}}}}
+           (m/pull db "a" [{"friend" 2}]))
+        "depth 2: expands friend twice (a->b->c), then leaves c's own friend value bare (a, unexpanded)")))
+
+(deftest pull-pattern-unlimited-recursion-is-cycle-safe
+  (let [db (m/transact (m/empty-db)
+                       [{:s "a" :p "friend" :o "b"}
+                        {:s "b" :p "friend" :o "c"}
+                        {:s "c" :p "friend" :o "a"}]
+                       no-refs)]
+    (testing "a->b->c->a is a cycle -- '... must terminate, not hang, and treat the closed loop as {}"
+      (is (= {"friend" #{{"friend" #{{"friend" #{{}}}}}}}
+             (m/pull db "a" [{"friend" '...}]))))))
+
+;; ── schema: Datomic-style "schema is just datoms too" ───────────────────────
+
+(deftest schema-is-derived-from-installed-datoms
+  (let [db (m/install-schema (m/empty-db)
+                             {"role" {:db/valueType :string :db/cardinality :one}
+                              "age"  {:db/valueType :long}
+                              "email" {:db/valueType :string :db/unique :identity}}
+                             ref?)]
+    (is (= {"role" {:value-type "string" :cardinality "one" :unique nil :tuple-types nil}
+            "age" {:value-type "long" :cardinality "many" :unique nil :tuple-types nil}
+            "email" {:value-type "string" :cardinality "many" :unique "identity" :tuple-types nil}}
+           (m/schema-of db)))))
+
+(deftest plain-transact-is-unaffected-by-schema-no-migration-needed
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "totally-unknown-attr" :o "anything"}] ref?)]
+    (is (= #{"anything"} (get (m/pull db "alice") "totally-unknown-attr")))))
+
+(deftest transact-with-schema-rejects-unknown-attribute
+  (let [db (m/install-schema (m/empty-db) {"role" {:db/valueType :string}} ref?)]
+    (is (thrown-with-msg? js/Error
+                          #"unknown attribute"
+                          (m/transact-with-schema db [{:s "alice" :p "nickname" :o "Al"}] ref? {})))))
+
+(deftest transact-with-schema-can-declare-new-attributes-inline
+  (let [db (m/transact-with-schema (m/empty-db)
+                                   [{:s "alice" :p "role" :o "admin"}]
+                                   ref?
+                                   {"role" {:db/valueType :string}})]
+    (is (= #{"admin"} (get (m/pull db "alice") "role")))))
+
+(deftest transact-with-schema-rejects-value-type-mismatch
+  (let [db (m/install-schema (m/empty-db) {"age" {:db/valueType :long}} ref?)]
+    (is (thrown-with-msg? js/Error
+                          #"schema violation"
+                          (m/transact-with-schema db [{:s "bob" :p "age" :o "not-a-number"}] ref? {})))
+    (testing "a real long passes validation (storage still stringifies -- schema validates the ORIGINAL value's type, it doesn't change the stored representation)"
+      (is (= #{"42"} (get (m/pull (m/transact-with-schema db [{:s "bob" :p "age" :o 42}] ref? {}) "bob") "age"))))))
+
+(deftest transact-with-schema-cardinality-one-replaces-not-accumulates
+  (let [db0 (m/install-schema (m/empty-db) {"role" {:db/valueType :string :db/cardinality :one}} ref?)
+        db1 (m/transact-with-schema db0 [{:s "alice" :p "role" :o "admin"}] ref? {})
+        db2 (m/transact-with-schema db1 [{:s "alice" :p "role" :o "superadmin"}] ref? {})]
+    (is (= #{"admin"} (get (m/pull db1 "alice") "role")))
+    (is (= #{"superadmin"} (get (m/pull db2 "alice") "role"))
+        "cardinality :one retracts the prior value instead of accumulating -- unlike the index layer's native cardinality-many default")))
+
+(deftest transact-with-schema-cardinality-many-still-accumulates
+  (let [db0 (m/install-schema (m/empty-db) {"tag" {:db/valueType :string}} ref?)
+        db1 (m/transact-with-schema db0 [{:s "alice" :p "tag" :o "a"}] ref? {})
+        db2 (m/transact-with-schema db1 [{:s "alice" :p "tag" :o "b"}] ref? {})]
+    (is (= #{"a" "b"} (get (m/pull db2 "alice") "tag")))))
+
+(deftest transact-with-schema-unique-identity-rejects-cross-entity-collision
+  (let [db0 (m/install-schema (m/empty-db) {"email" {:db/valueType :string :db/unique :identity}} ref?)
+        db1 (m/transact-with-schema db0 [{:s "alice" :p "email" :o "a@x.com"}] ref? {})]
+    (is (thrown-with-msg? js/Error
+                          #"unique attribute violation"
+                          (m/transact-with-schema db1 [{:s "bob" :p "email" :o "a@x.com"}] ref? {})))
+    (testing "the SAME entity re-asserting its own unique value is not a violation"
+      (is (= #{"a@x.com"}
+             (get (m/pull (m/transact-with-schema db1 [{:s "alice" :p "email" :o "a@x.com"}] ref? {}) "alice") "email"))))))
+
+(deftest inline-schema-declaration-actually-validates-not-a-silent-noop
+  ;; regression test for a real bug: passing {:db/valueType ...} directly to
+  ;; transact-with-schema (never pre-installed via install-schema) used to
+  ;; silently skip value-type validation entirely.
+  (is (thrown-with-msg? js/Error
+                        #"schema violation"
+                        (m/transact-with-schema (m/empty-db)
+                                                [{:s "bob" :p "age" :o "not-a-number"}]
+                                                ref?
+                                                {"age" {:db/valueType :long}}))))
+
+(deftest uuid-value-type
+  (let [db0 (m/install-schema (m/empty-db) {"id" {:db/valueType :uuid}} ref?)
+        the-id #uuid "0f1e86a9-aa89-414e-8368-d4e95e9fcd4c"]
+    (testing "validates against the ORIGINAL value's type; storage still stringifies"
+      (is (= #{(str the-id)} (get (m/pull (m/transact-with-schema db0 [{:s "a" :p "id" :o the-id}] ref? {}) "a") "id"))))
+    (is (thrown-with-msg? js/Error
+                          #"schema violation"
+                          (m/transact-with-schema db0 [{:s "a" :p "id" :o "not-a-uuid"}] ref? {})))))
+
+(deftest instant-value-type
+  (let [db0 (m/install-schema (m/empty-db) {"born" {:db/valueType :instant}} ref?)]
+    (is (thrown-with-msg? js/Error
+                          #"schema violation"
+                          (m/transact-with-schema db0 [{:s "a" :p "born" :o "not-a-date"}] ref? {})))))
+
+(deftest keyword-and-symbol-value-types
+  (let [db0 (m/install-schema (m/empty-db) {"status" {:db/valueType :keyword} "op" {:db/valueType :symbol}} ref?)
+        db1 (m/transact-with-schema db0 [{:s "a" :p "status" :o :active} {:s "a" :p "op" :o 'foo}] ref? {})]
+    (is (= #{(str :active)} (get (m/pull db1 "a") "status")))
+    (is (= #{(str 'foo)} (get (m/pull db1 "a") "op")))
+    (is (thrown-with-msg? js/Error
+                          #"schema violation"
+                          (m/transact-with-schema db0 [{:s "a" :p "status" :o "active"}] ref? {})))))
+
+(deftest tuple-value-type
+  (let [db0 (m/install-schema (m/empty-db)
+                              {"coords" {:db/valueType :tuple :db/tupleTypes [:double :double]}}
+                              ref?)]
+    (is (= #{(str [1.0 2.0])} (get (m/pull (m/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 2.0]}] ref? {}) "a") "coords")))
+    (is (thrown-with-msg? js/Error
+                          #"tuple arity mismatch"
+                          (m/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 2.0 3.0]}] ref? {})))
+    (is (thrown-with-msg? js/Error
+                          #"schema violation"
+                          (m/transact-with-schema db0 [{:s "a" :p "coords" :o [1.0 "not-a-double"]}] ref? {})))))
+
+(deftest ref-value-type-uses-the-callers-own-ref-predicate
+  ;; New coverage: kotobase-peer checked "ref" with a hardcoded ipld/link?,
+  ;; independent of the ref? the same call used for indexing. Here the two
+  ;; cannot drift apart.
+  (let [db0 (m/install-schema (m/empty-db) {"knows" {:db/valueType :ref}} ref?)
+        bob (->Ref "bafyknows")]
+    (is (= #{"alice"}
+           (get (m/refs (m/transact-with-schema db0 [{:s "alice" :p "knows" :o bob}] ref? {}) bob)
+                "knows")))
+    (is (thrown-with-msg? js/Error
+                          #"schema violation"
+                          (m/transact-with-schema db0 [{:s "alice" :p "knows" :o "bob"}] ref? {})))))
+
+(deftest transact-with-schema-does-not-accept-retraction-forms
+  ;; Known gap #2 in the README, pinned so it cannot be mistaken for a
+  ;; guarantee: schema enforcement routes through `raw-triple`, which knows
+  ;; only {:s :p :o} / [:db/add e a v] / [e a v]. Plain `transact` handles
+  ;; both retraction forms; `transact-with-schema` throws on them.
+  (let [db (m/install-schema (m/empty-db) {"role" {:db/valueType :string}} ref?)]
+    (is (thrown-with-msg? js/Error
+                          #"unrecognized tx-data item"
+                          (m/transact-with-schema db [[:db/retract "alice" "role" "admin"]] ref? {})))
+    (is (thrown-with-msg? js/Error
+                          #"unrecognized tx-data item"
+                          (m/transact-with-schema db [[:db/retractEntity "alice"]] ref? {})))))
+
+;; ── entity ──────────────────────────────────────────────────────────────────
+
+(deftest entity-is-pulls-flat-2-arg-form
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p "role" :o "admin"} {:s "alice" :p "name" :o "Alice"}] ref?)]
+    (is (= (m/pull db "alice") (m/entity db "alice")))))
+
+(deftest entity-attr-navigates-into-a-ref-values-own-entity
+  (let [db (m/transact (m/empty-db)
+                       [{:s "alice" :p "name" :o "Alice"}
+                        {:s "bob" :p "manager" :o "alice"}
+                        {:s "bob" :p "name" :o "Bob"}]
+                       ref?)]
+    (is (= #{{"name" #{"Alice"}}} (m/entity-attr db (m/entity db "bob") "manager")))))
+
+(deftest entity-attr-on-a-value-that-was-never-a-subject-is-empty
+  (let [db (m/transact (m/empty-db) [{:s "bob" :p "hobby" :o "chess"}] ref?)]
+    (is (= #{{}} (m/entity-attr db (m/entity db "bob") "hobby")))))
+
+;; ── refs / VAET ─────────────────────────────────────────────────────────────
+
+(deftest transact-auto-indexes-ref-values-as-refs
+  (let [bob (->Ref "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")
+        db (m/transact (m/empty-db)
+                       [{:s "alice" :p "knows" :o bob}
+                        {:s "alice" :p "name" :o "Alice"}]
+                       ref?)]
+    (testing "a ref?-accepted object is reverse-indexed"
+      (is (= {"knows" #{"alice"}} (m/refs db bob))))
+    (testing "a plain string is never mistaken for a ref"
+      (is (= {} (m/refs db "Alice"))))))
+
+(deftest datoms-vaet-index-reverse-reference-lookup
+  (let [bob (->Ref "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")
+        db (m/transact (m/empty-db)
+                       [{:s "alice" :p "knows" :o bob}
+                        {:s "carol" :p "knows" :o bob}
+                        {:s "alice" :p "name" :o "Alice"}]
+                       ref?)]
+    (testing "no components -> full VAET scan, only ref-valued quads show up"
+      (let [rows (m/datoms db {:index :vaet} ->wire everything)]
+        (is (= 2 (count rows)))
+        (is (every? #(= "knows" (:a %)) rows))
+        (is (= #{"alice" "carol"} (set (map :e rows))))))
+    (testing "[value] narrows to that value's reverse refs"
+      (is (= 2 (count (m/datoms db {:index :vaet :components [bob]} ->wire everything)))))
+    (testing "[value attr] point-looks-up the exact entities"
+      (let [rows (m/datoms db {:index :vaet :components [bob "knows"]} ->wire everything)]
+        (is (= #{"alice" "carol"} (set (map :e rows))))
+        (is (every? #(= "knows" (:a %)) rows))))
+    (testing "a value never asserted as a ref has no VAET entries"
+      (is (= [] (m/datoms db {:index :vaet :components ["Alice"]} ->wire everything))))))
+
+;; ── entid / ident ───────────────────────────────────────────────────────────
+
+(deftest entid-passes-through-a-plain-non-keyword-id
+  (is (= "alice" (m/entid (m/empty-db) "alice"))))
+
+(deftest entid-resolves-a-keyword-ident-via-a-real-transact-shaped-attr
+  ;; ":db/ident" (colon-prefixed) matches what entities->datoms actually
+  ;; produces for a real {:db/id "e" :db/ident :my/thing} tx item -- see
+  ;; ->quad's (str a) coercion.
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p ":db/ident" :o ":person/alice"}
+                                     {:s "alice" :p ":name" :o "Alice"}]
+                       ref?)]
+    (is (= "alice" (m/entid db :person/alice)))))
+
+(deftest entid-returns-nil-for-an-ident-nothing-asserts
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p ":name" :o "Alice"}] ref?)]
+    (is (nil? (m/entid db :person/nobody)))))
+
+(deftest ident-is-the-inverse-of-entid
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p ":db/ident" :o ":person/alice"}] ref?)]
+    (is (= :person/alice (m/ident db "alice")))))
+
+(deftest ident-is-nil-when-no-db-ident-is-asserted
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p ":name" :o "Alice"}] ref?)]
+    (is (nil? (m/ident db "alice")))))
+
+(deftest ident-is-nil-when-db-ident-value-is-not-keyword-shaped
+  (let [db (m/transact (m/empty-db) [{:s "alice" :p ":db/ident" :o "not-a-keyword"}] ref?)]
+    (is (nil? (m/ident db "alice")))))
+
+;; ── tx-report / with ────────────────────────────────────────────────────────
+
+(deftest transact-with-report-shape
+  (let [db0 (m/empty-db)
+        report (m/transact-with-report db0 [{:s "alice" :p "role" :o "admin"}] ref?)]
+    (is (= #{:db-before :db-after :tx-data} (set (keys report))))
+    (is (= db0 (:db-before report)))
+    (is (= #{"admin"} (get (m/pull (:db-after report) "alice") "role")))
+    (is (= [{:s "alice" :p "role" :o "admin"}] (:tx-data report)))))
+
+(deftest with-is-transact-with-report-under-datomics-own-name
+  (let [db0 (m/empty-db)
+        tx-data [{:s "alice" :p "role" :o "admin"}]]
+    (is (= (m/transact-with-report db0 tx-data ref?) (m/with db0 tx-data ref?)))))
+
+(deftest with-never-touches-the-original-db-value
+  (let [db0 (m/empty-db)
+        {:keys [db-after]} (m/with db0 [{:s "alice" :p "role" :o "admin"}] ref?)]
+    (is (= 0 (count (m/datoms db0 ->wire everything))) "db0 itself is untouched -- with is purely speculative")
+    (is (= 1 (count (m/datoms db-after ->wire everything))))))
+
+;; ── canonical datom model ───────────────────────────────────────────────────
+
+(deftest tx-map->datoms-single-entity-contract
+  (testing "one entity tx-map -> its own [e a v] datoms, :db/id -> e"
+    (is (= [["e1" :ns/a "v1"] ["e1" :ns/b "v2"]]
+           (m/tx-map->datoms {:db/id "e1" :ns/a "v1" :ns/b "v2"}))))
+  (testing "an entity with only :db/id (no other attrs) -> no datoms"
+    (is (= [] (m/tx-map->datoms {:db/id "e1"}))))
+  (testing "entities->datoms on a single-element seq == tx-map->datoms on that one entity"
+    (let [ent {:db/id "e1" :ns/a "v1" :ns/b "v2"}]
+      (is (= (m/tx-map->datoms ent) (m/entities->datoms [ent]))))))
+
+(deftest datafy-via-canonical-datom-model
+  (testing "entities->datoms uses datom.core/eavt: :db/id → e, other pairs → [e a v]"
+    (is (= [["e1" :ns/a "v1"] ["e1" :ns/b "v2"]]
+           (m/entities->datoms [{:db/id "e1" :ns/a "v1" :ns/b "v2"}]))))
+  (testing "transact-tx (entity tx-maps) ≡ transact (equivalent [e a v] triples)"
+    (let [ents [{:db/id "alice" :atproto.account/did "alice" :atproto.account/handle "a.app"}
+                {:db/id "keybackup/alice" :aozora.keyBackup/did "alice"}]
+          via-tx  (m/transact-tx (m/empty-db) ents ref?)
+          via-raw (m/transact (m/empty-db)
+                              [["alice" :atproto.account/did "alice"]
+                               ["alice" :atproto.account/handle "a.app"]
+                               ["keybackup/alice" :aozora.keyBackup/did "alice"]]
+                              ref?)]
+      (is (= (set (m/datoms via-raw ->wire everything)) (set (m/datoms via-tx ->wire everything)))
+          "the model's entity datafication == kotoba's shared [e a v] model"))))
+
+;; ── retraction / effective deltas ───────────────────────────────────────────
+
+(deftest transact-applies-retraction-forms
+  (let [db (m/transact (m/empty-db)
+                       [["e1" ":a/x" "v1"] ["e1" ":a/y" "v2"] ["e2" ":a/x" "v3"]]
+                       ref?)]
+    (testing "[:db/retract e a v] removes exactly one datom"
+      (let [db' (m/transact db [[:db/retract "e1" ":a/x" "v1"]] ref?)]
+        (is (= 2 (count (m/datoms db' {:index :eavt} ->wire everything))))
+        (is (= [] (m/datoms db' {:index :eavt :components ["e1" ":a/x"]} ->wire everything)))))
+    (testing "[:db/retractEntity e] removes the whole entity"
+      (let [db' (m/transact db [[:db/retractEntity "e1"]] ref?)]
+        (is (= [] (m/datoms db' {:index :eavt :components ["e1"]} ->wire everything)))
+        (is (= 1 (count (m/datoms db' {:index :eavt} ->wire everything))))))
+    (testing "retract then re-assert wins in order"
+      (let [db' (m/transact db [[:db/retractEntity "e1"] ["e1" ":a/x" "v9"]] ref?)]
+        (is (= [{:e "e1" :a ":a/x" :v_edn "\"v9\"" :added true}]
+               (m/datoms db' {:index :eavt :components ["e1"]} ->wire everything)))))))
+
+(deftest transact-effective-emits-only-state-transitions
+  (let [db (m/transact (m/empty-db)
+                       [["e1" "role" "admin"] ["e1" "name" "Alice"]]
+                       ref?)
+        result (m/transact-effective
+                db
+                [[:db/add "e1" "role" "admin"]
+                 [:db/retract "missing" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/add "e1" "role" "user"]]
+                ref?)]
+    (is (= [{:e "e1" :a "role" :v "admin" :op :retract}
+            {:e "e1" :a "role" :v "user" :op :assert}]
+           (:effective-deltas result)))
+    (is (= #{"user"} (get (index/entity-attrs (:db-after result) "e1") "role")))))
+
+(deftest transact-effective-expands-entity-retraction-deterministically
+  (let [db (m/transact (m/empty-db)
+                       [["e1" "role" "admin"] ["e1" "name" "Alice"]]
+                       ref?)
+        result (m/transact-effective db [[:db/retractEntity "e1"]] ref?)]
+    (is (= [{:e "e1" :a "name" :v "Alice" :op :retract}
+            {:e "e1" :a "role" :v "admin" :op :retract}]
+           (:effective-deltas result)))
+    (is (empty? (index/entity-attrs (:db-after result) "e1")))))
+
+(deftest apply-quad-applies-one-op-tagged-quad
+  ;; Private in kotobase-peer.core (all its call sites were persistence-side);
+  ;; public here, so it needs its own direct coverage.
+  (let [db (m/transact (m/empty-db) [["e1" "role" "admin"] ["e1" "name" "Alice"]] ref?)]
+    (testing "missing :op means :assert"
+      (is (= #{"admin" "user"}
+             (get (m/entity (m/apply-quad db {:s "e1" :p "role" :o "user"} ref?) "e1") "role"))))
+    (testing ":retract removes exactly that quad"
+      (is (= #{} (get (m/entity (m/apply-quad db {:s "e1" :p "role" :o "admin" :op :retract} ref?) "e1")
+                      "role" #{}))))
+    (testing ":retract-entity removes every quad of the subject"
+      (is (= {} (m/entity (m/apply-quad db {:s "e1" :op :retract-entity} ref?) "e1"))))))
+
+(deftest transact-with-statistics-refreshes-from-effective-deltas
+  (let [db (m/transact (m/empty-db) [["e1" "role" "admin"]] ref?)
+        statistics {:visibility-scope "tenant-a/public-v1" :epoch 4
+                    :clauses [{:pattern [nil "role" nil] :rows 1}
+                              {:pattern [nil "role" "admin"] :rows 1}]}
+        result (m/transact-with-statistics
+                db
+                [[:db/add "e1" "role" "admin"]
+                 [:db/retract "missing" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/add "e2" "role" "user"]]
+                ref?
+                statistics 5)]
+    (is (= 5 (get-in result [:query-statistics :epoch])))
+    (is (= [1 0] (mapv :rows (get-in result [:query-statistics :clauses]))))
+    (is (= 2 (count (:effective-deltas result))))))

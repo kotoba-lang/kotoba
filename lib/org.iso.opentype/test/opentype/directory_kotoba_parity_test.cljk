@@ -1,0 +1,209 @@
+;; `kotoba/opentype/directory.kotoba` against `opentype.core/parse`.
+;;
+;; Parity covers what the library reads and reads correctly: the sfnt
+;; version, the table count, and which of head/maxp/name/cmap the directory
+;; names. The fixture is the repo's own `noto-lycian.ttf`, so agreement is
+;; against something neither side made up.
+;;
+;; Three places are where they part, and the test shows each rather than
+;; describing it:
+;;
+;;   * `a-file-that-is-not-a-font-is-refused` -- `parse` reads a version of
+;;     0xDEADBEEF and still answers `:magic-ok? true`, because it never
+;;     looks at the version it just read;
+;;   * `a-table-offset-past-the-end-is-refused` -- `:table-offsets` exists,
+;;     in the library's own words, "so a caller can reach `opentype.cmap`
+;;     without re-parsing the directory". An offset of 0xFFFFFFFF is handed
+;;     to that caller with nothing said;
+;;   * `an-oversized-table-count-is-refused-rather-than-thrown` -- a
+;;     numTables of 0x7FFF produces an IndexOutOfBoundsException. A refusal
+;;     and a raw exception are different answers, and only one of them a
+;;     caller can act on.
+;;
+;; `.cljc` stays the oracle for the fields it extracts and is not required
+;; from the guest (require-graph). It did not grow a second copy of these
+;; refusals (ADR-2608261100).
+
+(ns opentype.directory-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [opentype.core :as ot]
+            [opentype.directory-guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "opentype" "directory.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'opentype.directory (slurp guest-file)}
+                                         'opentype.directory :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(defn- fixture []
+  (with-open [in (io/input-stream (io/resource "opentype/fixtures/noto-lycian.ttf"))]
+    (mapv #(bit-and % 0xff) (seq (.readAllBytes in)))))
+
+;; --- the host: the bytes -------------------------------------------------------
+
+(defn- walk
+  "What a font loader does: hand over the first twelve bytes, then whatever
+  range the guest names, until it stops asking. Entries are handed over one
+  at a time and never collected -- a `:document` vector holds 32 and a font
+  has no such ceiling."
+  ([bytes] (walk bytes 200))
+  ([bytes max-steps]
+   (let [s0 (call 'offer-header
+                  [(call 'init [(->doc {:file-length (count bytes)})])
+                   (->doc (vec (take 12 bytes)))])]
+     (loop [state s0 steps 0]
+       (let [at (call 'needs-at [state])
+             n (call 'needs-count [state])]
+         (if (or (neg? at) (>= steps max-steps))
+           {:phase (call 'phase [state])
+            :reason (call 'reason [state])
+            :version (call 'sfnt-version [state])
+            :tables (call 'table-count [state])
+            :seen (call 'entries-seen [state])
+            :head? (call 'saw-head? [state])
+            :maxp? (call 'saw-maxp? [state])
+            :name? (call 'saw-name? [state])
+            :cmap? (call 'saw-cmap? [state])
+            :steps steps}
+           (do
+             ;; A host cannot decline: if the guest names a range the file
+             ;; does not carry, that is the guest's bug and the test must
+             ;; see it rather than shrug.
+             (when (> (+ at n) (count bytes))
+               (throw (ex-info "guest asked past the end of the file"
+                               {:at at :count n :file-length (count bytes)})))
+             (recur (call 'offer-entry
+                          [state (->doc (subvec bytes at (+ at n)))])
+                    (inc steps)))))))))
+
+;; --- mutations, each one legal-looking except in the one place -----------------
+
+(defn- put32 [bytes o v]
+  (-> bytes
+      (assoc o (bit-and (bit-shift-right v 24) 0xff))
+      (assoc (+ o 1) (bit-and (bit-shift-right v 16) 0xff))
+      (assoc (+ o 2) (bit-and (bit-shift-right v 8) 0xff))
+      (assoc (+ o 3) (bit-and v 0xff))))
+
+(defn- put16 [bytes o v]
+  (-> bytes
+      (assoc o (bit-and (bit-shift-right v 8) 0xff))
+      (assoc (+ o 1) (bit-and v 0xff))))
+
+(defn- entry-at [bytes i] (subvec bytes (+ 12 (* i 16)) (+ 12 (* i 16) 16)))
+
+(defn- swap-entries
+  "Splice entries `i` and `j` (i < j), leaving every other byte alone. The
+  file is still 4556 bytes of the same font; only the directory's order
+  changed."
+  [bytes i j]
+  (let [ei (entry-at bytes i) ej (entry-at bytes j)]
+    (vec (concat (subvec bytes 0 (+ 12 (* i 16))) ej
+                 (subvec bytes (+ 12 (* i 16) 16) (+ 12 (* j 16))) ei
+                 (subvec bytes (+ 12 (* j 16) 16))))))
+
+;; --- the tests ------------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest the-directory-agrees-with-the-oracle
+  (let [bytes (fixture)
+        g (walk bytes)
+        o (ot/parse bytes)]
+    (is (= :done (:phase g)) (:reason g))
+    (is (= (:sfnt-version o) (:version g)))
+    (is (= (:num-tables o) (:tables g)))
+    (is (= (:num-tables o) (:seen g))
+        "every entry the header promised was actually offered")
+    (testing "and the tables the oracle returns nil for when absent"
+      (is (= (contains? (:tables o) "head") (:head? g)))
+      (is (= (contains? (:tables o) "maxp") (:maxp? g)))
+      (is (= (contains? (:tables o) "name") (:name? g)))
+      (is (= (contains? (:tables o) "cmap") (:cmap? g))))))
+
+(deftest a-file-that-is-not-a-font-is-refused
+  (let [bytes (put32 (fixture) 0 0xDEADBEEF)
+        o (ot/parse bytes)]
+    (testing "the oracle reads the version and does not look at it"
+      (is (= 0xDEADBEEF (:sfnt-version o)))
+      (is (true? (:magic-ok? o))
+          "a file whose first four bytes say it is not a font is still `magic-ok?`"))
+    (let [g (walk bytes)]
+      (is (= :refused (:phase g)))
+      (is (= :opentype/bad-sfnt-version (:reason g))))))
+
+(deftest a-collection-is-not-a-malformed-font
+  (let [bytes (put32 (fixture) 0 0x74746366)   ; 'ttcf'
+        g (walk bytes)]
+    (is (= :refused (:phase g)))
+    (is (= :opentype/is-a-collection (:reason g))
+        "a collection has a different layout after the tag; telling a caller
+         their font is broken sends them to the wrong repair")))
+
+(deftest a-table-offset-past-the-end-is-refused
+  ;; Entry 0 of this fixture is 'OS/2' (measured), so moving its offset does
+  ;; not disturb the head/maxp/name reads the oracle makes -- which is the
+  ;; point: the oracle parses cleanly and hands the offset out.
+  (let [bytes (put32 (fixture) (+ 12 8) 0xFFFFFFFF)
+        o (ot/parse bytes)]
+    (testing "the oracle hands the caller a pointer past the end of the file"
+      (is (= 0xFFFFFFFF (get (:table-offsets o) "OS/2")))
+      (is (true? (:magic-ok? o)) "and reports the font as sound"))
+    (let [g (walk bytes)]
+      (is (= :refused (:phase g)))
+      (is (= :opentype/table-out-of-range (:reason g))))))
+
+(deftest an-oversized-table-count-is-refused-rather-than-thrown
+  (let [bytes (put16 (fixture) 4 0x7FFF)]
+    (testing "the oracle reads past the end of the vector"
+      (is (thrown? IndexOutOfBoundsException (ot/parse bytes))))
+    (let [g (walk bytes)]
+      (is (= :refused (:phase g)))
+      (is (= :opentype/table-count-out-of-range (:reason g))
+          "12 + numTables*16 does not fit in 4556 bytes, and that is checked
+           before anything is indexed"))))
+
+(deftest entries-out-of-order-are-refused
+  ;; The same 4556 bytes with two directory records exchanged. Every offset
+  ;; still points at its own table, so nothing is corrupt in the sense the
+  ;; other tests mean -- only the order, which ISO/IEC 14496-22 §4.2
+  ;; requires and which a reader that ignores it cannot distinguish from a
+  ;; second directory spliced onto the first.
+  (let [bytes (swap-entries (fixture) 0 1)
+        o (ot/parse bytes)]
+    (is (= 10 (:num-tables o)) "the oracle parses it as a ten-table font")
+    (is (= (:tables (ot/parse (fixture))) (:tables o))
+        "and finds exactly the same tables")
+    (let [g (walk bytes)]
+      (is (= :refused (:phase g)))
+      (is (= :opentype/tags-out-of-order (:reason g))))))
+
+(deftest a-truncated-file-is-refused-before-the-read
+  (let [bytes (fixture)
+        g (walk (vec (take 8 bytes)))]
+    (is (= :refused (:phase g)))
+    (is (= :opentype/truncated (:reason g)))))
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed: the walk completes at
+  ;; the interpreter default, so no `test-fuel` is warranted. Four of the
+  ;; five budgets guessed in this migration were superstition; this form is
+  ;; what caught them.
+  (let [bytes (fixture)]
+    (is (= :done (:phase (walk bytes)))
+        "the default fuel carries a ten-entry directory")
+    (is (thrown? Exception
+                 (call 'offer-header
+                       [(call 'init [(->doc {:file-length (count bytes)})] 4)
+                        (->doc (vec (take 12 bytes)))]))
+        "and a budget of four is not enough, so the assertion above is not
+         vacuous")))

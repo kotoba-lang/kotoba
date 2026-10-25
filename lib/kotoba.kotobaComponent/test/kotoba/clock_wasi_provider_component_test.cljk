@@ -1,0 +1,328 @@
+(ns kotoba.clock-wasi-provider-component-test
+  "W6 first slice: a clock provider whose time comes from WASI 0.3.
+
+   Everything before this ran a provider that made its own numbers up. This
+   one imports `wasi:clocks/system-clock@0.3.0` and
+   `wasi:clocks/monotonic-clock@0.3.0`, so the assertions here are about
+   agreement with the host clock rather than about a synthetic sequence, and
+   about what the composed world is allowed to import."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.component.composition :as composition]
+            [kotoba.component.core :as component-core]
+            [kotoba.component.wit-text :as wit-text]
+            [kotoba.wasm.tools :as wasm-tools])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(def ^:private wasmtime-binary
+  (let [pinned (io/file ".tools" "wasmtime" "wasmtime")]
+    (if (io/can-execute? pinned) (io/path pinned) "wasmtime")))
+
+(def ^:private minimum-wasmtime-major
+  "Read from the pinned contract rather than restated, so the test cannot
+   drift below the number the contract claims."
+  (-> (io/resource "kotoba/lang/component-model-v1.edn")
+      slurp edn/read-string
+      (get-in [:spec-baseline :wasi :minimum-wasmtime-major])))
+
+(defn- wasmtime-major []
+  (let [{:keys [exit out]} (shell/sh wasmtime-binary "--version")]
+    (when (zero? exit)
+      (some-> (re-find #"wasmtime (\d+)\." out) second parse-long))))
+
+(defn- require-qualifying-wasmtime!
+  "Fail, do not skip.
+
+   A qualification test that quietly passes on an engine older than the one
+   the contract pins is worse than no test: the gap it exists to close stays
+   open while the suite reports green. `:minimum-wasmtime-43` is on the
+   backend gap list precisely because WASI 0.3 is not present before 43."
+  []
+  (let [major (wasmtime-major)]
+    (is (some? major)
+        (str "wasmtime not runnable as " wasmtime-binary))
+    (is (and major (>= major minimum-wasmtime-major))
+        (str "WASI 0.3 qualification needs wasmtime >= " minimum-wasmtime-major
+             ", found " major
+             ". Provision a pinned engine at .tools/wasmtime/wasmtime."))
+    (and major (>= major minimum-wasmtime-major))))
+
+(defn- ref-ify [variant-descriptor]
+  (let [[_ variant-name cases] variant-descriptor
+        schemas (atom {})
+        ref-cases (mapv (fn [[tag payload]]
+                          (if (and (vector? payload) (= :record (first payload)))
+                            (let [[_ record-name _fields] payload]
+                              (swap! schemas assoc record-name payload)
+                              [tag [:ref record-name]])
+                            [tag payload]))
+                        cases)]
+    (swap! schemas assoc variant-name [:variant variant-name ref-cases])
+    {:descriptor [:ref variant-name] :schemas @schemas}))
+
+(defn- clock-v1-descriptors
+  "clock-v1's own shape. The kit resource lives in the compiler repo, so the
+   literal below is the fallback this repo's own clock tests already use."
+  []
+  (let [res (io/resource "kotoba/lang/capability-kits/clock-v1.edn")
+        kit (if res
+              (edn/read-string (slurp res))
+              {:request
+               [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]]
+               :result
+               [:variant :kotoba.clock/result
+                [[:wall [:record :kotoba.clock/wall
+                         [[:unix-millis :i64] [:observation-sequence :i64]]]]
+                 [:monotonic [:record :kotoba.clock/monotonic
+                              [[:nanos :i64] [:observation-sequence :i64]]]]
+                 [:error [:record :kotoba.clock/error
+                          [[:code :keyword] [:message :string]]]]]]})
+        request (ref-ify (:request kit))
+        result (ref-ify (:result kit))]
+    {:descriptor (:descriptor request)
+     :result-descriptor (:descriptor result)
+     :schemas (merge (:schemas request) (:schemas result))}))
+
+(defn- entry [] {:interface "clock" :function "now"})
+
+;; ---------------------------------------------------------------------------
+;; The artifact itself
+
+(deftest wasi-clock-provider-wat-imports-only-the-declared-clocks
+  (let [{:keys [descriptor result-descriptor schemas]} (clock-v1-descriptors)
+        wat (component-core/clock-wasi-provider-wat
+             (entry) descriptor result-descriptor schemas)]
+    (is (str/includes? wat component-core/wasi-system-clock-import-module))
+    (is (str/includes? wat component-core/wasi-monotonic-clock-import-module))
+    ;; The synthetic provider's tell: a fixed epoch base compiled into the
+    ;; module. Its absence is what makes this a host-time claim.
+    (is (not (str/includes? wat "1700000000000")))
+    (is (not (re-find #"global \$wall" wat)))
+    (is (not (re-find #"global \$mono" wat)))
+    ;; The observation sequence stays provider-local on purpose.
+    (is (re-find #"global \$obs" wat))
+    ;; No other import may appear.
+    (is (= 2 (count (re-seq #"\(import " wat))))))
+
+(deftest wasi-clock-provider-rejects-non-clock-shape
+  (let [schemas {:demo/wall [:record :demo/wall
+                             [[:unix-millis :i64] [:observation-sequence :bool]]]
+                 :demo/mono [:record :demo/mono
+                             [[:nanos :i64] [:observation-sequence :i64]]]
+                 :demo/err [:record :demo/err
+                            [[:code :keyword] [:message :string]]]
+                 :demo/clock-request
+                 [:variant :demo/clock-request [[:wall :bool] [:monotonic :bool]]]
+                 :demo/clock-result
+                 [:variant :demo/clock-result
+                  [[:wall [:ref :demo/wall]]
+                   [:monotonic [:ref :demo/mono]]
+                   [:error [:ref :demo/err]]]]}]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"clock-v1's own literal request/result shape"
+         (composition/package-clock-wasi-provider
+          :clock/now [:ref :demo/clock-request] [:ref :demo/clock-result] schemas)))))
+
+(deftest wasi-clock-provider-packages-and-declares-its-imports
+  (let [{:keys [descriptor result-descriptor schemas]} (clock-v1-descriptors)
+        provider (composition/package-clock-wasi-provider
+                  :clock/now descriptor result-descriptor schemas)
+        dir (Files/createTempDirectory "clock-wasi-validate-"
+                                       (make-array FileAttribute 0))
+        path (.resolve dir "provider.component.wasm")]
+    (try
+      (is (= :wasm-component-provider/v1 (:format provider)))
+      (is (= composition/clock-wasi-imports (:wasi-imports provider)))
+      (Files/write path ^bytes (:bytes provider) (make-array java.nio.file.OpenOption 0))
+      (is (string? (wasm-tools/run-command! ["wasm-tools" "validate" (str path)])))
+      (let [wit (wasm-tools/run-command! ["wasm-tools" "component" "wit" (str path)])]
+        (doseq [declared composition/clock-wasi-imports]
+          (is (str/includes? wit declared)
+              (str "provider world does not import " declared)))
+        ;; The capability is still exported under its own name: the
+        ;; application side cannot tell this provider from the synthetic one.
+        (is (str/includes? wit "export kotoba:application/clock@1.0.0")))
+      (finally
+        (Files/deleteIfExists path)
+        (Files/deleteIfExists dir)))))
+
+;; ---------------------------------------------------------------------------
+;; Composition: the application must stay WASI-free
+
+(defn- driver-wit
+  "An application that imports clock and exports one scalar reading.
+
+   Identical in shape to the synthetic provider's driver: the application
+   side of the boundary does not change when the time source does."
+  []
+  (str
+   "package kotoba:application@1.0.0;\n\n"
+   "interface types {\n"
+   "  record kotoba-clock-wall {\n    unix-millis: s64,\n    observation-sequence: s64,\n  }\n"
+   "  record kotoba-clock-monotonic {\n    nanos: s64,\n    observation-sequence: s64,\n  }\n"
+   "  record kotoba-clock-error {\n    code: string,\n    message: string,\n  }\n"
+   "  variant kotoba-clock-request {\n    wall(bool),\n    monotonic(bool),\n  }\n"
+   "  variant kotoba-clock-result {\n"
+   "    wall(kotoba-clock-wall),\n    monotonic(kotoba-clock-monotonic),\n"
+   "    error(kotoba-clock-error),\n  }\n"
+   "}\n\n"
+   "interface clock {\n"
+   "  use types.{kotoba-clock-request, kotoba-clock-result};\n"
+   "  now: func(request: kotoba-clock-request) -> kotoba-clock-result;\n"
+   "}\n\n"
+   "world driver {\n  import clock;\n  export run: func() -> s64;\n}\n"))
+
+(defn- driver-wat
+  "Reads the wall case and returns `unix-millis` (payload at retptr+8).
+
+   Deliberately NOT the observation sequence the synthetic driver returns:
+   the sequence is provider-local and would be identical either way, so it
+   cannot distinguish a real clock from a made-up one."
+  []
+  (let [mod "cm32p2|kotoba:application/clock@1"
+        ret-base 64]
+    (str
+     "(module\n"
+     "  (import \"" mod "\" \"now\" (func $now (param i32 i32 i32)))\n"
+     "  (memory (export \"cm32p2_memory\") 1 1)\n"
+     "  (func (export \"cm32p2_realloc\")\n"
+     "    (param $old i32) (param $old-size i32) (param $align i32) (param $new-size i32)\n"
+     "    (result i32)\n"
+     "    local.get $old i32.eqz if (result i32) i32.const 256 else local.get $old end)\n"
+     "  (func (export \"cm32p2||run\") (result i64)\n"
+     "    i32.const 0 i32.const 0 i32.const " ret-base " call $now\n"
+     "    i32.const " ret-base " i64.load offset=8)\n"
+     "  (func (export \"cm32p2||run_post\") (param i64))\n"
+     "  (func (export \"cm32p2_initialize\"))\n"
+     ")\n")))
+
+(defn- package-driver []
+  (let [dir (Files/createTempDirectory "kotoba-wasi-clock-driver-"
+                                       (make-array FileAttribute 0))
+        world (.resolve dir "driver.wit")
+        core (.resolve dir "driver.wasm")
+        embedded (.resolve dir "embedded.wasm")
+        component (.resolve dir "driver.component.wasm")]
+    (try
+      (Files/writeString world (driver-wit) (make-array java.nio.file.OpenOption 0))
+      (Files/write core (wasm-tools/parse-wat (driver-wat))
+                   (make-array java.nio.file.OpenOption 0))
+      (wasm-tools/run-command! ["wasm-tools" "component" "embed" (str world) (str core)
+                                "--encoding" "utf8" "-o" (str embedded)])
+      (wasm-tools/run-command! ["wasm-tools" "component" "new" (str embedded)
+                                "--reject-legacy-names" "-o" (str component)])
+      {:format :wasm-component/v1 :imports [:clock/now]
+       :bytes (Files/readAllBytes component)}
+      (finally
+        (doseq [p [component embedded core world]] (Files/deleteIfExists p))
+        (Files/deleteIfExists dir)))))
+
+(deftest composed-world-imports-exactly-the-declared-wasi
+  (let [{:keys [descriptor result-descriptor schemas]} (clock-v1-descriptors)
+        provider (composition/package-clock-wasi-provider
+                  :clock/now descriptor result-descriptor schemas)
+        wit (composition/composed-world-wit (:bytes provider))
+        imports (wit-text/world-imports wit)]
+    ;; Checked on the provider artifact directly: it is the only participant
+    ;; that is supposed to hold WASI authority at all.
+    (is (= (set composition/clock-wasi-imports)
+           (set (filter #(str/starts-with? % "wasi:") imports)))
+        (str "provider imports were " (pr-str imports)))
+    ;; WIT hoists the shared `use`d types interface into the world's imports.
+    ;; It carries no functions, so it grants nothing -- and that is what the
+    ;; allowlist is asked to notice, rather than the name.
+    (is (contains? (set imports) "kotoba:application/types@1.0.0"))
+    (is (false? (get (wit-text/interface-functions wit)
+                     "kotoba:application/types@1.0.0")))
+    (is (true? (get (wit-text/interface-functions wit)
+                    "wasi:clocks/system-clock@0.3.0")))
+    (is (= (vec (sort composition/clock-wasi-imports))
+           (composition/assert-declared-wasi-imports!
+            (:bytes provider) composition/clock-wasi-imports)))))
+
+(deftest undeclared-import-is-rejected
+  (let [{:keys [descriptor result-descriptor schemas]} (clock-v1-descriptors)
+        provider (composition/package-clock-wasi-provider
+                  :clock/now descriptor result-descriptor schemas)]
+    ;; Narrowing the declared set must make the SAME artifact fail: this is
+    ;; the check that the allowlist is load-bearing rather than decorative.
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"undeclared import"
+         (composition/assert-declared-wasi-imports!
+          (:bytes provider) ["wasi:clocks/monotonic-clock@0.3.0"])))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"missing a declared import"
+         (composition/assert-declared-wasi-imports!
+          (:bytes provider) (conj composition/clock-wasi-imports
+                                  "wasi:filesystem/types@0.3.0"))))))
+
+;; ---------------------------------------------------------------------------
+;; Execution under a qualifying engine
+
+(defn- composed-artifact []
+  (let [{:keys [descriptor result-descriptor schemas]} (clock-v1-descriptors)
+        provider (composition/package-clock-wasi-provider
+                  :clock/now descriptor result-descriptor schemas)]
+    (composition/compose-with-declared-wasi
+     (package-driver) [provider] composition/clock-wasi-imports)))
+
+(defn- run-composed [path flags]
+  (apply shell/sh (concat [wasmtime-binary "run"] flags
+                          ["--invoke" "run()" (str path)])))
+
+(deftest composition-closes-the-capability-and-keeps-only-wasi
+  (let [composed (composed-artifact)]
+    (is (= :wasm-component-wasi-composed/v1 (:format composed)))
+    (is (= (vec (sort composition/clock-wasi-imports)) (:wasi-imports composed)))
+    ;; The application's own CAPABILITY import is gone: `wac plug` satisfied
+    ;; it. The shared types interface is still imported and is meant to be --
+    ;; it declares no function, which `assert-declared-wasi-imports!` has
+    ;; already checked by the time this artifact exists.
+    (let [imports (set (composition/composed-world-imports (:bytes composed)))]
+      (is (not (contains? imports "kotoba:application/clock@1.0.0")))
+      (is (contains? imports "kotoba:application/types@1.0.0")))))
+
+(deftest wasmtime-wasi-clock-returns-real-host-time
+  (when (require-qualifying-wasmtime!)
+    (let [composed (composed-artifact)
+          path (Files/createTempFile "kotoba-clock-wasi-" ".wasm"
+                                     (make-array FileAttribute 0))]
+      (try
+        (Files/write path ^bytes (:bytes composed) (make-array java.nio.file.OpenOption 0))
+        (let [before (System/currentTimeMillis)
+              granted (run-composed path ["-S" "p3"])
+              after (System/currentTimeMillis)]
+          (is (zero? (:exit granted)) (str "wasmtime err: " (:err granted)))
+          (let [millis (parse-long (str/trim (:out granted)))]
+            (is (some? millis) (str "no reading in: " (pr-str (:out granted))))
+            ;; The synthetic provider answers 1700000000001 here. Agreeing with
+            ;; the host clock to within the wall time of the call is the claim.
+            (is (and millis (<= (- before 1000) millis (+ after 1000)))
+                (str "component time " millis " outside host window ["
+                     before ", " after "]"))))
+        (finally
+          (Files/deleteIfExists path))))))
+
+(deftest wasmtime-denies-the-clock-when-authority-is-withheld
+  (when (require-qualifying-wasmtime!)
+    (let [composed (composed-artifact)
+          path (Files/createTempFile "kotoba-clock-wasi-deny-" ".wasm"
+                                     (make-array FileAttribute 0))]
+      (try
+        (Files/write path ^bytes (:bytes composed) (make-array java.nio.file.OpenOption 0))
+        (let [denied (run-composed path ["-S" "cli=n" "-S" "p3=n"])]
+          (is (not (zero? (:exit denied)))
+              "withholding the clocks must not still produce a time")
+          ;; Denial happens in the linker, before instantiation -- the guest
+          ;; never runs, so it never observes a fallback value it could treat
+          ;; as a time.
+          (is (str/includes? (:err denied) "wasi:clocks/")
+              (str "unexpected denial message: " (:err denied)))
+          (is (str/includes? (:err denied) "not found in the linker")
+              (str "unexpected denial message: " (:err denied))))
+        (finally
+          (Files/deleteIfExists path))))))

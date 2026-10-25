@@ -1,0 +1,223 @@
+(ns netconf.framing-test
+  "RFC 6242 §4.2 chunked framing. The single most important test file in
+  this repo (see README): chunking is defined to be split-boundary
+  agnostic, and the boundary-sweep tests below are what actually prove
+  this decoder honors that, rather than just proving encode/decode agree
+  with themselves.
+
+  ASCII bytes are written as hex literals (0x23 for '#', etc.) or built
+  via `netconf.bytes/utf8-encode`, deliberately never via `(int \\c)` or
+  `(map int \"str\")` — on ClojureScript a character literal like `\\#`
+  and a string element from `(seq \"str\")` are both one-character
+  STRINGS, and `int` of one does not give its code point (it silently
+  coerces through `ToInt32` on the string via NaN, i.e. 0). This
+  workspace's own org-modbus/org-ietf-websocket/org-ietf-argon2 READMEs
+  each record hitting exactly this idiom in one day; `netconf.bytes`
+  exists specifically so this file doesn't repeat it a fourth time."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [netconf.bytes :as b]
+            [netconf.framing :as f]))
+
+(def LF 0x0A)
+(def HASH 0x23)
+
+;; ── RFC 6242 §4.2's own worked example ───────────────────────────────
+;;
+;; The RFC frames this message:
+;;
+;;   <rpc message-id="102"
+;;        xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+;;     <close-session/>
+;;   </rpc>
+;;
+;; as (§4.2, using '\n' for LineFeed as the RFC text itself does):
+;;
+;;   C:  \n#4\n
+;;   C:  <rpc
+;;   C:  \n#18\n
+;;   C:   message-id="102"\n
+;;   C:  \n#79\n
+;;   C:       xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">\n
+;;   C:    <close-session/>\n
+;;   C:  </rpc>
+;;   C:  \n##\n
+;;
+;; "there is no LineFeed character after the <rpc> end tag in this
+;; message" (§4.2) — the chunk boundaries fall mid-XML-attribute and
+;; mid-namespace-declaration, which is the point: chunking has nothing
+;; to do with XML tokens.
+
+(def rfc-6242-example-message
+  "<rpc message-id=\"102\"\n     xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">\n  <close-session/>\n</rpc>")
+
+(def rfc-6242-example-wire
+  ;; §4.2's own chunk sizes: 4, 18, 79.
+  (vec (concat [LF HASH] (b/utf8-encode "4") [LF]
+               (b/utf8-encode "<rpc")
+               [LF HASH] (b/utf8-encode "18") [LF]
+               (b/utf8-encode " message-id=\"102\"\n")
+               [LF HASH] (b/utf8-encode "79") [LF]
+               (b/utf8-encode "     xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">\n  <close-session/>\n</rpc>")
+               [LF HASH HASH LF])))
+
+(deftest rfc-6242-section-4-2-worked-example
+  (testing "the wire bytes we build match the RFC's own example byte-for-byte"
+    (is (= 119 (count rfc-6242-example-wire)))
+    (is (= "\n#4\n<rpc\n#18\n message-id=\"102\"\n\n#79\n     xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\">\n  <close-session/>\n</rpc>\n##\n"
+           (second (b/utf8-decode rfc-6242-example-wire)))))
+  (testing "our encoder, given the RFC's own chunk sizes, produces those same bytes"
+    (is (= rfc-6242-example-wire
+           (f/encode-chunks (b/utf8-encode rfc-6242-example-message)
+                             [:sizes [4 18 79]]))))
+  (testing "our decoder reassembles the RFC's own wire bytes back to the RFC's own message"
+    (is (= [:ok (b/utf8-encode rfc-6242-example-message)]
+           (f/decode-chunks rfc-6242-example-wire)))))
+
+;; ── the point of this repo: split-boundary agnosticism ───────────────
+
+(deftest boundary-sweep-every-single-split-point
+  ;; RFC 6242 §4.2: chunking is pure byte-stream segmentation. A decoder
+  ;; MUST reassemble a message correctly no matter where the sender
+  ;; happened to split it across two `feed` calls — including a split
+  ;; that lands inside the chunk-size ASCII digits, inside chunk-data
+  ;; (mid-XML-attribute, as here), or inside the `\n##\n` end marker.
+  ;; This exhaustively tries EVERY one of the wire message's 118 internal
+  ;; split points, not a sample of them.
+  (let [wire rfc-6242-example-wire
+        n (count wire)]
+    (doseq [split (range 1 n)]
+      (let [d0 (f/feed (f/decoder) (subvec wire 0 split))
+            d1 (f/feed d0 (subvec wire split n))]
+        (is (= :done (:status d1)) (str "split at " split " left status " (:status d1) " reason " (:reason d1)))
+        (is (= (b/utf8-encode rfc-6242-example-message) (:payload d1)) (str "split at " split))))))
+
+(deftest boundary-sweep-one-byte-at-a-time
+  ;; The extreme case of the above: feed the decoder a single byte per
+  ;; `feed` call. If per-call state weren't fully carried (e.g. if
+  ;; anything were re-derived from "the whole chunk arrived at once"),
+  ;; this is where it would show.
+  (let [wire rfc-6242-example-wire
+        d (reduce (fn [d byte] (f/feed d [byte])) (f/decoder) wire)]
+    (is (= :done (:status d)))
+    (is (= (b/utf8-encode rfc-6242-example-message) (:payload d)))))
+
+(deftest chunk-data-containing-bytes-that-look-like-chunk-headers
+  ;; The decoder must count declared chunk-data length, never scan
+  ;; chunk-data for '\n'/'#' — chunk-data is 1*OCTET (%x00-FF), so it can
+  ;; legally contain a byte sequence that looks exactly like a chunk
+  ;; header. If `feed` were (incorrectly) scanning for the next "\n#"
+  ;; instead of counting down `:remaining`, this payload would truncate
+  ;; the chunk early.
+  (let [payload (b/utf8-encode "before \n#99\n embedded-fake-header after")
+        wire (f/encode-chunks payload :single)]
+    (is (= [:ok payload] (f/decode-chunks wire)))))
+
+;; ── multi-chunk round trips under each chunk-size policy ─────────────
+
+(deftest single-chunk-policy
+  (let [payload (b/utf8-encode "<get/>")]
+    (is (= [:ok payload] (f/decode-chunks (f/encode-chunks payload))))
+    (is (= [:ok payload] (f/decode-chunks (f/encode-chunks payload :single))))))
+
+(deftest fixed-size-policy
+  (let [payload (b/utf8-encode "0123456789ABCDEFGHIJ")] ; 20 bytes
+    ;; 20 bytes / 7 => three chunks (7,7,6), not one — confirm the
+    ;; encoder actually split it, not just that decode agrees with
+    ;; whatever it produced.
+    (let [wire (f/encode-chunks payload [:fixed 7])]
+      (is (= [:ok payload] (f/decode-chunks wire)))
+      (is (> (count wire) (+ 4 (count payload)) )
+          "more than one chunk header worth of framing overhead was added"))))
+
+(deftest explicit-sizes-policy-mismatch-is-an-encode-error
+  (is (= :chunked-framing-sizes-mismatch
+         (:netconf/error (ex-data (try (f/encode-chunks (b/utf8-encode "abc") [:sizes [1 1]])
+                                        (catch #?(:clj Exception :cljs :default) e e)))))))
+
+(deftest empty-payload-is-an-encode-error
+  (is (= :chunked-framing-empty-payload
+         (:netconf/error (ex-data (try (f/encode-chunks [])
+                                        (catch #?(:clj Exception :cljs :default) e e)))))))
+
+;; ── negative decode paths: specific, named reasons ────────────────────
+
+(deftest malformed-header-missing-leading-lf
+  ;; chunk = LF HASH chunk-size LF chunk-data — starting with '#' instead
+  ;; of '\n' is missing the mandatory leading LF.
+  (is (= [:error :chunked-framing-malformed-header]
+         (f/decode-chunks (vec (concat [HASH] (b/utf8-encode "4") [LF] (b/utf8-encode "abcd") [LF HASH HASH LF]))))))
+
+(deftest malformed-header-missing-hash
+  (is (= [:error :chunked-framing-malformed-header]
+         (f/decode-chunks (vec (concat [LF] (b/utf8-encode "4") [LF] (b/utf8-encode "abcd") [LF HASH HASH LF]))))))
+
+(deftest malformed-size-leading-zero
+  ;; "Leading zeros are prohibited" (§4.2) — chunk-size is
+  ;; 1*DIGIT1 0*DIGIT, so the first digit must be 1-9.
+  (is (= [:error :chunked-framing-malformed-size]
+         (f/decode-chunks (vec (concat [LF HASH] (b/utf8-encode "04") [LF] (b/utf8-encode "abcd") [LF HASH HASH LF]))))))
+
+(deftest malformed-size-non-digit
+  (is (= [:error :chunked-framing-malformed-size]
+         (f/decode-chunks (vec (concat [LF HASH] (b/utf8-encode "x") (b/utf8-encode "abcd") [LF HASH HASH LF]))))))
+
+(deftest size-too-large
+  ;; "the maximum allowed chunk-size value is 4294967295" (§4.2) —
+  ;; 4294967296 (one more) must be rejected.
+  (is (= [:error :chunked-framing-size-too-large]
+         (f/decode-chunks (vec (concat [LF HASH] (b/utf8-encode "4294967296") [LF]))))))
+
+(deftest max-chunk-size-boundary-is-not-itself-an-error
+  ;; The *value* 4294967295 is legal (only *above* it is an error); we
+  ;; just can't actually supply that many data bytes in a test, so check
+  ;; the size-parsing sub-state alone doesn't fail at exactly the limit —
+  ;; feed only the header, and confirm we're cleanly waiting on data.
+  (let [d (f/feed (f/decoder) (vec (concat [LF HASH] (b/utf8-encode "4294967295") [LF])))]
+    (is (= :reading (:status d)))
+    (is (= :reading-data (:sub d)))
+    (is (= 4294967295 (:remaining d)))))
+
+(deftest malformed-end-marker
+  ;; end-of-chunks = LF HASH HASH LF — a non-LF after "##" is malformed.
+  (is (= [:error :chunked-framing-malformed-end-marker]
+         (f/decode-chunks (vec (concat [LF HASH] (b/utf8-encode "4") [LF] (b/utf8-encode "abcd") [LF HASH HASH] (b/utf8-encode "x")))))))
+
+(deftest trailing-garbage-after-end-of-chunks
+  (is (= [:error :chunked-framing-trailing-garbage]
+         (f/decode-chunks (vec (concat (f/encode-chunks (b/utf8-encode "abcd")) [0x00]))))))
+
+(deftest truncated-message
+  (is (= [:error :chunked-framing-truncated]
+         ;; declared chunk-size 10, only 4 data bytes actually supplied
+         (f/decode-chunks (vec (concat [LF HASH] (b/utf8-encode "10") [LF] (b/utf8-encode "abcd"))))))
+  (is (= [:error :chunked-framing-truncated]
+         (f/decode-chunks []))))
+
+;; ── the incremental reader also supports a second message on the same
+;;    stream via `leftover` ────────────────────────────────────────────
+
+(deftest leftover-carries-the-start-of-the-next-message
+  (let [msg-a (b/utf8-encode "<get/>")
+        msg-b (b/utf8-encode "<get-config/>")
+        wire (vec (concat (f/encode-chunks msg-a) (f/encode-chunks msg-b)))
+        d1 (f/feed (f/decoder) wire)]
+    (is (= :done (:status d1)))
+    (is (= msg-a (:payload d1)))
+    (let [d2 (f/feed (f/decoder) (:leftover d1))]
+      (is (= :done (:status d2)))
+      (is (= msg-b (:payload d2)))
+      (is (empty? (:leftover d2))))))
+
+;; ── utf8 bridge codec: round-trips including multi-byte code points ──
+
+(deftest utf8-round-trip
+  (doseq [s ["" "ascii only" "café" "€uro" "𝄞 clef" "mixed é € 𝄞 done"]]
+    (is (= [:ok s] (b/utf8-decode (b/utf8-encode s))) s)))
+
+(deftest utf8-known-byte-sequences
+  ;; well-known UTF-8 encodings (Unicode standard), not RFC 6241/6242
+  ;; vectors — cross-checking our hand-rolled codec against values
+  ;; independent of our own encoder.
+  (is (= [0xC3 0xA9] (b/utf8-encode "é")))          ; é
+  (is (= [0xE2 0x82 0xAC] (b/utf8-encode "€")))      ; €
+  (is (= [0xF0 0x9D 0x84 0x9E] (b/utf8-encode "𝄞")))) ; 𝄞 (surrogate pair)

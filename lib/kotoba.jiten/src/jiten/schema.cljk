@@ -1,0 +1,305 @@
+(ns jiten.schema
+  "事典 (jiten) -- the admissibility contract for an encyclopedia entry.
+
+   An encyclopedia is only worth querying if every claim in it can be traced to
+   something a human can check. Wikipedia's unit is a page of prose to which
+   citations are attached by convention; the convention is enforced by other
+   humans, after the fact, and unevenly. Here the unit is an entry whose body is
+   a vector of STATEMENTS, and a statement without `:jiten.statement/source` is
+   not a warning -- it is an `:error`, and `jiten.core/corpus` refuses to build a
+   corpus containing one. Unsourced prose is unrepresentable rather than merely
+   discouraged. This is the same move `innen.schema` makes for dependency edges,
+   for the same reason: a plausible-sounding claim is exactly what a language
+   model produces from nothing.
+
+   Two consequences fall out of that choice and are worth stating up front.
+
+   There is no `:jiten.entry/abstract`. A lead paragraph is the place an
+   encyclopedia most reliably accumulates claims nobody sourced, because it reads
+   as summary rather than assertion. The lead is a section like any other and its
+   statements carry sources like any others.
+
+   There is no attribute for a rating, rank, score, quality grade, or verdict on
+   an entry's SUBJECT. A record that ranks the entities it describes has stopped
+   being a record and become an adjudicator. Following the workspace convention
+   (kawaraban `schema/news.edn`), the gate is expressed by the attribute not
+   existing: an unknown attribute is refused by Datomic and unresolvable in
+   DataScript, so this is 'cannot be written', not 'written as false'.
+
+   `confidences` is copied verbatim from `innen.schema` on purpose. The two
+   records describe the same world and a reader should not have to learn two
+   vocabularies for how well-established a claim is."
+  (:require [kotoba.lang.text :as str]))
+
+(def entry-forms
+  "What KIND OF ENTRY this is -- its form, not its topic. The distinction
+   matters because navigational entries make no claims and so cannot be held to
+   a notability standard: a disambiguation page exists because a title is
+   ambiguous, which is a fact about the corpus rather than about the world."
+  {:article        {:doc "A substantive entry about one subject. Requires notability and at least one sourced statement."
+                    :requires-notability? true}
+   :disambiguation {:doc "Navigational: the readings a title could refer to. Carries links, not claims. Exempt from notability."
+                    :requires-notability? false}
+   :index          {:doc "Navigational: an enumerated list of entries sharing a property. Exempt from notability."
+                    :requires-notability? false}
+   :glossary       {:doc "A term definition. Requires notability, but a single sourced statement is a complete glossary entry."
+                    :requires-notability? true}})
+
+(def topic-kinds
+  "What the entry is ABOUT. The first ten are `innen.schema/node-kinds`
+   verbatim, so an entry's topic-kind and its subject node's kind are the same
+   vocabulary and can be compared without translation. The remainder are kinds
+   an encyclopedia needs that a dependency record does not."
+  {:organization {:doc "A firm, company, cooperative, guild, church body, NGO, union, association, or other organised body."}
+   :polity       {:doc "A state, empire, province, municipality, or other governing jurisdiction."}
+   :person       {:doc "A natural person. Admissible ONLY as a documented public actor; see person-problems."}
+   :contract     {:doc "A treaty, charter, concession, licence, lease, loan agreement, or other instrument."}
+   :event        {:doc "A dated occurrence: a founding, a war, an election, a market crash, a launch."}
+   :incident     {:doc "A failure or harm event: an outage, a spill, a collapse, a breach, a disaster."}
+   :artifact     {:doc "A built thing: a canal, a cable, a fab, a pipeline, a codebase, a satellite constellation."}
+   :standard     {:doc "A specification, protocol, code system, or unit of account."}
+   :resource     {:doc "A material or natural input: a mineral, a fuel, a watershed, a seed line."}
+   :document     {:doc "A record that testifies to other subjects: an archive holding, a filing, a chronicle."}
+   :place        {:doc "A geographic feature or settled location considered as a place rather than as a polity."}
+   :work         {:doc "An authored work: a book, film, recording, painting, piece of software."}
+   :term         {:doc "A word or phrase whose meaning is the subject. The usual topic of a :glossary entry."}
+   :concept      {:doc "An abstraction, method, or theory."}
+   :taxon        {:doc "A biological taxon."}})
+
+(def confidences
+  "How well-established a statement is. Never inferred -- the writer must state
+   it, because 'how sure are we' is a property of the source, not something a
+   later reader can reconstruct.
+
+   Identical to `innen.schema/confidences`. Do not diverge these."
+  {:documented {:doc "A primary or authoritative source states it directly."}
+   :attested   {:doc "A secondary source states it; primary not consulted."}
+   :contested  {:doc "Sources disagree. Requires :jiten.statement/dissent saying what the other sources hold."}
+   :estimate   {:doc "Derived or inferred rather than stated. Requires :jiten.statement/method saying how."}})
+
+(def notability-bases
+  "Why this subject gets an entry at all.
+
+   Wikipedia settles this by argument on a talk page, which means the answer is
+   not available to a query and not stable over time. Here the basis is declared
+   as data and each basis has a condition a machine can check."
+  {:independent-sources {:doc "At least two sources that are not each other and not the subject."
+                         :min-sources 2}
+   :registry            {:doc "The subject carries a registry identifier (LEI, QID, patent number, repo path), so its existence is not in question. One source suffices, and it must be the registry."
+                         :min-sources 1}
+   :workspace           {:doc "An entity of this workspace (a repo, an actor, a manifest project). Its existence is established by the workspace record itself."
+                         :min-sources 1}})
+
+(def ^:private lang-re #"[a-z]{2,3}(-[A-Za-z0-9]{2,8})*")
+
+(defn- problem [severity code msg data]
+  (merge {:jiten/severity severity :jiten/code code :jiten/message msg} data))
+
+(defn- blank? [s] (or (nil? s) (and (string? s) (str/blank? s))))
+
+(defn- err [code msg data] (problem :error code msg data))
+(defn- warn [code msg data] (problem :warn code msg data))
+
+;; ---------------------------------------------------------------------------
+;; statements
+;; ---------------------------------------------------------------------------
+
+(defn statement-problems
+  "Admissibility problems for one statement. Fail-closed on sourcing.
+
+   `:contested` and `:estimate` each carry an extra obligation, and both exist
+   for the same reason: those two values are the ones a writer reaches for when
+   the evidence is weak, so each has to say what the weakness is. Recording
+   'sources disagree' without recording the disagreement loses the only part of
+   that fact a reader could act on."
+  [{:jiten.statement/keys [id text source confidence dissent method] :as s}]
+  (cond-> []
+    (not (keyword? id))
+    (conj (err :statement/id-not-keyword "statement :jiten.statement/id must be a keyword" {:jiten/statement s}))
+
+    (blank? text)
+    (conj (err :statement/no-text "statement needs :jiten.statement/text" {:jiten/statement s}))
+
+    (blank? source)
+    (conj (err :statement/no-source
+               "statement needs :jiten.statement/source (citation, with retrieval date for online sources)"
+               {:jiten/statement s}))
+
+    (not (contains? confidences confidence))
+    (conj (err :statement/unknown-confidence
+               (str "statement must declare :jiten.statement/confidence, one of "
+                    (pr-str (set (keys confidences))))
+               {:jiten/statement s}))
+
+    (and (= :contested confidence) (blank? dissent))
+    (conj (err :statement/contested-without-dissent
+               "a :contested statement must record what the disagreeing sources hold in :jiten.statement/dissent"
+               {:jiten/statement s}))
+
+    (and (= :estimate confidence) (blank? method))
+    (conj (err :statement/estimate-without-method
+               "an :estimate statement must say how it was derived in :jiten.statement/method"
+               {:jiten/statement s}))
+
+    (and (seq (:jiten.statement/links s))
+         (not (every? keyword? (:jiten.statement/links s))))
+    (conj (err :statement/bad-links
+               ":jiten.statement/links must be entry-id keywords"
+               {:jiten/statement s}))))
+
+;; ---------------------------------------------------------------------------
+;; sections
+;; ---------------------------------------------------------------------------
+
+(defn section-problems
+  "Admissibility problems for one section, including its statements."
+  [{:jiten.section/keys [id heading statements] :as sec}]
+  (into (cond-> []
+          (not (keyword? id))
+          (conj (err :section/id-not-keyword "section :jiten.section/id must be a keyword" {:jiten/section sec}))
+
+          (blank? heading)
+          (conj (err :section/no-heading "section needs :jiten.section/heading" {:jiten/section sec}))
+
+          (not (sequential? statements))
+          (conj (err :section/statements-not-sequential
+                     "section :jiten.section/statements must be a vector"
+                     {:jiten/section sec}))
+
+          (and (sequential? statements) (empty? statements))
+          (conj (warn :section/empty
+                      "section has no statements; an empty heading tells a reader a topic was considered and then not written"
+                      {:jiten/section sec})))
+        (when (sequential? statements)
+          (mapcat statement-problems statements))))
+
+;; ---------------------------------------------------------------------------
+;; notability
+;; ---------------------------------------------------------------------------
+
+(defn notability-problems
+  "Whether the stated reason for having this entry actually holds."
+  [{:jiten.notability/keys [basis sources note] :as n}]
+  (let [spec (get notability-bases basis)]
+    (cond-> []
+      (nil? spec)
+      (conj (err :notability/unknown-basis
+                 (str "notability :jiten.notability/basis must be one of " (pr-str (set (keys notability-bases))))
+                 {:jiten/notability n}))
+
+      (and spec (not (sequential? sources)))
+      (conj (err :notability/sources-not-sequential
+                 "notability :jiten.notability/sources must be a vector of citations"
+                 {:jiten/notability n}))
+
+      (and spec (sequential? sources) (< (count (remove blank? sources)) (:min-sources spec)))
+      (conj (err :notability/too-few-sources
+                 (str "basis " (pr-str basis) " requires at least " (:min-sources spec)
+                      " non-blank source(s); got " (count (remove blank? sources)))
+                 {:jiten/notability n}))
+
+      (and (= :independent-sources basis)
+           (sequential? sources)
+           (not= (count (set sources)) (count sources)))
+      (conj (err :notability/duplicate-sources
+                 "the same citation listed twice is one source, not two -- :independent-sources means independent"
+                 {:jiten/notability n}))
+
+      (and (= :workspace basis) (blank? note))
+      (conj (err :notability/workspace-without-note
+                 "basis :workspace must name the workspace record establishing the entity in :jiten.notability/note"
+                 {:jiten/notability n})))))
+
+;; ---------------------------------------------------------------------------
+;; entries
+;; ---------------------------------------------------------------------------
+
+(defn- person-problems
+  "A :person topic carries the same restriction as `innen.schema`: the subject
+   must be a documented public actor. An encyclopedia of private individuals is
+   a dossier."
+  [{:jiten.entry/keys [topic-kind public-role?] :as e}]
+  (cond-> []
+    (and (= :person topic-kind) (not public-role?))
+    (conj (err :entry/person-not-marked-public
+               "a :person entry must set :jiten.entry/public-role? true and cite the public record establishing the role; private individuals are not admissible"
+               {:jiten/entry e}))))
+
+(defn entry-problems
+  "Admissibility problems for one entry, including every section and statement.
+
+   Note what is NOT checked here: whether links resolve. That needs the whole
+   corpus, so it lives in `jiten.link`. A red link is a legitimate state for an
+   encyclopedia to be in -- it is how a reader learns what is missing -- and
+   making it an error at the entry level would force writers to either stub
+   every mention or stop cross-referencing."
+  [{:jiten.entry/keys [id title lang form topic-kind subject body notability] :as e}]
+  (let [spec (get entry-forms form)
+        stmt-count (reduce + 0 (map (comp count :jiten.section/statements) (filter map? body)))]
+    (-> (cond-> []
+          (not (keyword? id))
+          (conj (err :entry/id-not-keyword "entry :jiten.entry/id must be a keyword" {:jiten/entry e}))
+
+          (blank? title)
+          (conj (err :entry/no-title "entry needs :jiten.entry/title" {:jiten/entry e}))
+
+          (blank? lang)
+          (conj (err :entry/no-lang
+                     "entry needs :jiten.entry/lang (BCP-47); an encyclopedia that leaves language implicit forks per-language and cannot tell translations from disagreements"
+                     {:jiten/entry e}))
+
+          (and (string? lang) (not (str/blank? lang)) (not (re-matches lang-re lang)))
+          (conj (err :entry/bad-lang (str "entry :jiten.entry/lang is not a BCP-47 shape: " (pr-str lang)) {:jiten/entry e}))
+
+          (nil? spec)
+          (conj (err :entry/unknown-form
+                     (str "entry :jiten.entry/form must be one of " (pr-str (set (keys entry-forms))))
+                     {:jiten/entry e}))
+
+          (not (contains? topic-kinds topic-kind))
+          (conj (err :entry/unknown-topic-kind
+                     (str "entry :jiten.entry/topic-kind must be one of " (pr-str (set (keys topic-kinds))))
+                     {:jiten/entry e}))
+
+          (and (some? subject) (not (keyword? subject)))
+          (conj (err :entry/subject-not-keyword
+                     "entry :jiten.entry/subject must be an :innen.node/id keyword, so the entry joins to the dependency record by value"
+                     {:jiten/entry e}))
+
+          (not (sequential? body))
+          (conj (err :entry/body-not-sequential "entry :jiten.entry/body must be a vector of sections" {:jiten/entry e}))
+
+          (and spec (:requires-notability? spec) (nil? notability))
+          (conj (err :entry/no-notability
+                     (str "an entry of form " (pr-str form) " must declare :jiten.entry/notability")
+                     {:jiten/entry e}))
+
+          (and spec (not (:requires-notability? spec)) (pos? stmt-count))
+          (conj (err :entry/navigational-with-claims
+                     (str "an entry of form " (pr-str form) " is navigational and must not carry statements; move the claims to the entry they are about")
+                     {:jiten/entry e}))
+
+          (and spec (:requires-notability? spec) (sequential? body) (zero? stmt-count))
+          (conj (err :entry/no-statements
+                     "an entry that requires notability must carry at least one sourced statement; a title with no claims is a red link with extra steps"
+                     {:jiten/entry e})))
+        (into (person-problems e))
+        (into (when notability (notability-problems notability)))
+        (into (when (sequential? body) (mapcat section-problems (filter map? body))))
+        (into (when (and (sequential? body) (some (complement map?) body))
+                [(err :entry/section-not-map "every element of :jiten.entry/body must be a section map" {:jiten/entry e})])))))
+
+(defn problems
+  "All admissibility problems across a collection of entries."
+  [entries]
+  (vec (mapcat entry-problems entries)))
+
+(defn errors
+  "Only the fatal ones."
+  [entries]
+  (vec (filter #(= :error (:jiten/severity %)) (problems entries))))
+
+(defn admissible?
+  "True when nothing in `entries` is an `:error`."
+  [entries]
+  (empty? (errors entries)))

@@ -1,0 +1,115 @@
+(ns ekyc.identity-intake-host
+  "Intake application host. Principal is supplied by authenticated service binding;
+  never take it from public JSON. KMS and Kotobase ports require prior qualification."
+  (:require [ekyc.identity-vault :as vault] [ekyc.identity-intake :as intake]
+            [ekyc.identity-crypto :as crypto] [ekyc.passport :as p] [ekyc.researcher-profile :as profile]))
+(defn holder-key! [jwk]
+  (p/require! (and (= #{:kty :crv :x} (set (keys jwk))) (= "OKP" (:kty jwk)) (= "Ed25519" (:crv jwk))) :invalid-holder-key)
+  (.importKey (.-subtle js/crypto) "jwk" (clj->js jwk) "Ed25519" false #js ["verify"]))
+(defn proof! [jwk signed principal now]
+  (-> (holder-key! jwk)
+      (.then #(crypto/verify % "holder" "kotoba-intake+jwt" signed))
+      (.then (fn [claims]
+               (p/require! (and (= principal (:principal claims)) (= "https://kotoba.cloud" (:aud claims))
+                                (crypto/fresh-claims? claims now) (<= (- (:exp claims) (:iat claims)) 120)) :invalid-intake-proof)
+               claims))))
+(defn begin! [ports principal jwk signed now]
+  (vault/validate-ports! ports)
+  (p/require! (and (true? (:intake-enabled? ports)) (true? (:notice-approved? ports))) :intake-not-enabled)
+  (p/require! (fn? (:create-key! ports)) :private-key-service-unavailable)
+  (-> (proof! jwk signed principal now)
+      (.then (fn [claims]
+               (p/require! (and (= "start" (:action claims)) (= intake/version (:notice-version claims))
+                                (true? (:consent claims)) (intake/text? (:purpose claims)) (intake/text? (:scope claims))
+                                (profile/valid? (:researcher-profile claims))) :invalid-intake-consent)
+               (let [id (str (random-uuid)) nonce (str (random-uuid))]
+                 (-> (crypto/holder-key-id jwk)
+                     (.then (fn [holder-id]
+                              (-> ((:create-key! ports) id)
+                                  (.then (fn [key-ref]
+                                           (-> (vault/commit! ports {:op :intake-start :id id :principal principal :authenticated true
+                                                                    :nonce nonce :holder-key-id holder-id :holder-jwk jwk :holder-proof-verified true
+                                                                    :consent true :notice-version intake/version :purpose (:purpose claims) :scope (:scope claims)
+                                                                    :researcher-profile (:researcher-profile claims)
+                                                                    :key-ref key-ref :expires-at (+ now 604800000)} now)
+                                               (.then (fn [receipt] {:id id :nonce nonce :expiresAt (+ now 900000) :receiptId (:receipt-ref receipt)}))
+                                               ;; A failed/unknown CAS may have committed: never destroy a key on ambiguous failure.
+                                               ;; Orphan keys require reconciliation against canonical cases before deletion.
+                                               ))))))))))))
+(defn submit! [ports principal id signed now]
+  (-> ((:read! ports))
+      (.then (fn [{:keys [state]}]
+               (let [r (get-in state [:intake id])]
+                 (p/require! (intake/owner? r principal) :case-not-found)
+                 (-> (proof! (:holder-jwk r) signed principal now)
+                     (.then (fn [claims]
+                              (p/require! (and (= "submit" (:action claims)) (= id (:id claims)) (= (:nonce r) (:nonce claims))
+                                               (= (get-in r [:evidence :document :digest]) (:document-digest claims))
+                                               (= (get-in r [:evidence :live-video :digest]) (:video-digest claims))) :evidence-proof-mismatch)
+                              (vault/commit! ports {:op :intake-submit :id id :principal principal :authenticated true
+                                                    :nonce (:nonce r) :holder-proof-verified true} now)))))))))
+(defn review! [ports principal id signed now]
+  (-> ((:read! ports))
+      (.then (fn [{:keys [state]}]
+               (let [registry (get-in state [:reviewer-keys principal]) jwk (:public-jwk registry)]
+                 (p/require! (intake/reviewer? state principal) :reviewer-not-registered)
+                 (-> (holder-key! jwk)
+                     (.then #(crypto/verify % (:key-id registry) "kotoba-intake-review+jwt" signed))
+                     (.then (fn [claims]
+                              (p/require! (and (= id (:id claims)) (= principal (:actor claims))
+                                               (= "https://kotoba.cloud" (:aud claims)) (crypto/fresh-claims? claims now)
+                                               (<= (- (:exp claims) (:iat claims)) 120)) :invalid-review-proof)
+                              (-> (crypto/holder-key-id jwk)
+                                  (.then (fn [thumb]
+                                           (p/require! (= thumb (:key-thumbprint registry)) :reviewer-key-mismatch)
+                                           (vault/commit! ports
+                                                          (-> claims
+                                                              (assoc :op ({"approve" :intake-approve "reject" :intake-reject} (:action claims))
+                                                                     :id id :principal principal :authenticated true :operator-signature-verified true
+                                                                     :reviewer-key-id (:key-id registry) :reviewer-key-thumbprint thumb
+                                                                     :holder-method (when (= "supervised-live-video-document-comparison" (:holder-method claims)) :supervised-live-video-document-comparison)
+                                                                     :reason ({"document-unreadable" :document-unreadable "holder-check-required" :holder-check-required
+                                                                               "screening-review" :screening-review "scope-review" :scope-review
+                                                                               "affiliation-review" :affiliation-review "qualification-review" :qualification-review} (:reason claims)))
+                                                              (update :screening #(assoc % :status (when (= "clear" (:status %)) :clear)
+                                                                                          :coverage (mapv {"sanctions" :sanctions "pep" :pep "adverse-media" :adverse-media} (:coverage %))))
+                                                              (update :scope #(assoc % :status (when (= "approved" (:status %)) :approved)))) now))))))))))))
+
+(defn status! [ports principal now]
+  (vault/validate-ports! ports)
+  (-> ((:read! ports))
+      (.then (fn [{:keys [state]}]
+               {:policyVersion intake/version :profilePolicyVersion profile/version :principalId principal :intakeEnabled (and (true? (:intake-enabled? ports)) (true? (:notice-approved? ports)))
+                :cases (mapv #(intake/public-record % now) (filter #(= principal (:principal %)) (vals (:intake state))))
+                :reviewer (intake/reviewer? state principal)
+                :queue (if (intake/reviewer? state principal)
+                         (mapv #(intake/public-record % now) (take 50 (filter #(and (not= principal (:principal %))
+                                                                                        (or (= :pending-review (:status %))
+                                                                                            (= principal (:reviewer %)))) (vals (:intake state))))) [])}))))
+
+(defn dispatch!
+  "Private host entry. Body is already bounded, principal comes from the existing
+  auth viewer. Public routes must never expose ports or accept principal overrides."
+  [ports operation principal body now]
+  (vault/validate-ports! ports)
+  (p/require! (intake/text? principal) :authentication-required)
+  (let [id (:id body)]
+    (case operation
+      "status" (status! ports principal now)
+      "profile" (-> (vault/commit! ports {:op :intake-profile-read :id id :principal principal
+                                          :authenticated true :audit-id (str (random-uuid))} now)
+                    (.then #((:read! ports)))
+                    (.then (fn [{:keys [state]}]
+                             (let [r (get-in state [:intake id])]
+                               (p/require! (intake/access? state id principal now) :profile-access-denied)
+                               {:id id :revision (:revision r) :researcherProfile (:researcher-profile r)
+                                :profileSummary (profile/summary (:researcher-profile r) (:profile-review r) now)}))))
+      "start" (begin! ports principal (:holderJwk body) (:proof body) now)
+      "submit" (submit! ports principal id (:proof body) now)
+      "claim" (vault/commit! ports {:op :intake-claim :id id :principal principal :authenticated true} now)
+      "decision" (review! ports principal id (:proof body) now)
+      "delete" (vault/delete-case! ports id principal now)
+      "upload" (vault/store-evidence! ports id principal ({"document" :document "live-video" :live-video} (:slot body))
+                                      (:mediaType body) (:bytes body) now)
+      "evidence" (vault/read-evidence! ports id principal ({"document" :document "live-video" :live-video} (:slot body)) now)
+      (p/reject! :unsupported-intake-operation))))

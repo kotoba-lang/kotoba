@@ -1,0 +1,106 @@
+(ns daichou.signature-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [daichou.signature :as sig]
+            [daichou.hash]
+            [daichou.canonical]
+            [daichou.receipt :as receipt]
+            [daichou.chain :as chain]))
+
+;; RFC 8032 の公開テストベクタ1。**実鍵ではない** — 仕様との一致を見るためだけに置く。
+(def rfc-seed "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+(def rfc-pub  "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+(def rfc-sig  "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+
+(deftest matches-the-specification-not-just-itself
+  (testing "自己整合ではなく **RFC 8032 のテストベクタ**と一致することを見る。
+            自分の実装と自分の検証器が噛み合うだけの test は、両方が同じように
+            間違っていても緑になる。"
+    (is (= rfc-sig (sig/sign rfc-seed "")))
+    (is (true? (sig/verify rfc-pub "" rfc-sig)))
+    #?(:cljs (is (= rfc-pub (sig/public-key rfc-seed))))))
+
+(deftest a-wrong-key-or-a-changed-message-fails
+  (is (false? (sig/verify rfc-pub "tampered" rfc-sig)))
+  (let [other-pub (apply str (repeat 64 "0"))]
+    (is (false? (sig/verify other-pub "" rfc-sig)))))
+
+(deftest malformed-material-is-refused-not-guessed
+  (testing "長さの違う鍵や署名を黙って受け取ると、検証が通ったのか通っていないのかが
+            分からなくなる。"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (sig/sign "abcd" "x")))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (sig/verify rfc-pub "" "beef")))))
+
+(def approval
+  {:approval/by "gftd-governor"
+   :approval/decision :allow
+   :approval/policy-version "fleet-policy@2026-07-31"})
+
+(defn- signer [msg] (sig/sign rfc-seed msg))
+(defn- verifier [pk msg s] (sig/verify pk msg s))
+
+(deftest signing-binds-the-receipt-to-its-place-in-the-chain
+  (let [r (-> (receipt/make {:action {:action/agent "claude-code" :action/type "git:push"}
+                             :approval approval
+                             :at "2026-07-31T00:00:01Z"})
+              (receipt/sign {:signer signer :by "fleet-writer" :public-key rfc-pub}))]
+    (is (= :ed25519 (get-in r [:receipt/signature :signature/alg])))
+    (testing "署名した主体と承認した主体は別物として残る — fleet が書き、governor が承認する"
+      (is (= "fleet-writer" (get-in r [:receipt/signature :signature/by])))
+      (is (= "gftd-governor" (get-in r [:receipt/approval :approval/by]))))
+    (is (true? (receipt/signature-valid? r verifier)))
+    (testing "**2つの検査は担当が違い、どちらも単独では足りない。**署名は
+              `:receipt/hash` に対するものなので:"
+      (testing "(a) 本文だけ書き換えた場合 — ハッシュが合わなくなるので intact? が
+                捕まえる。署名はまだ古いハッシュに当たるので**通ってしまう**"
+        (let [t (assoc-in r [:receipt/action :action/type] "git:force-push")]
+          (is (false? (receipt/intact? t)))
+          (is (true? (receipt/signature-valid? t verifier))
+              "署名だけを見て『無事』と判断すると、この改ざんを見逃す")))
+      (testing "(b) 本文・action-ref・ハッシュを**すべて**作り直した場合 —
+                内部は完全に整合するので intact? は通る。ここで唯一残る歯止めが
+                署名で、鍵を持たない限り新しいハッシュに当たる署名は作れない"
+        (let [t   (assoc-in r [:receipt/action :action/type] "git:force-push")
+              t1  (assoc t :receipt/action-ref
+                         (daichou.hash/sha256
+                          (daichou.canonical/write (:receipt/action t))))
+              t2  (assoc t1 :receipt/hash (receipt/recompute-hash t1))]
+          (is (true? (receipt/intact? t2))
+              "内部整合だけを見る検査はここを通してしまう")
+          (is (false? (receipt/signature-valid? t2 verifier))
+              "署名だけがこの改ざんを止める")))
+      (testing "逆に、action-ref を直さずハッシュだけ作り直しても intact? が落ちる
+                — action-ref が行為を独立に縛っているため"
+        (let [t  (assoc-in r [:receipt/action :action/type] "git:force-push")
+              t2 (assoc t :receipt/hash (receipt/recompute-hash t))]
+          (is (false? (receipt/intact? t2)))))
+      (testing "だから chain/verify は両方を順に見る"
+        (is (:ok? (chain/verify [r] {:verifier verifier})))))))
+
+(deftest the-chain-says-whether-it-looked-at-signatures
+  (let [signed (fn [c a at] (conj (vec c)
+                                  (-> (receipt/make {:action a :approval approval :at at
+                                                     :previous-hash (:receipt/hash (last c))})
+                                      (receipt/sign {:signer signer :by "fleet-writer"
+                                                     :public-key rfc-pub}))))
+        c (-> [] (signed {:action/n 1} "t1") (signed {:action/n 2} "t2"))]
+    (testing "verifier を渡さなければ署名は見ない。**見ていないものを『通った』と報告しない**"
+      (let [v (chain/verify c)]
+        (is (:ok? v))
+        (is (false? (:signatures-checked? v)))))
+    (testing "渡せば見る"
+      (let [v (chain/verify c {:verifier verifier})]
+        (is (:ok? v))
+        (is (true? (:signatures-checked? v)))))
+    (testing "署名を検証すると決めた台帳に無署名の行があるのは、検証していないのと同じ"
+      (let [mixed (conj (vec c) (receipt/make {:action {:action/n 3} :approval approval :at "t3"
+                                               :previous-hash (:receipt/hash (last c))}))
+            v (chain/verify mixed {:verifier verifier})]
+        (is (false? (:ok? v)))
+        (is (= 2 (:broken-at v)))
+        (is (= :unsigned (:reason v)))))
+    (testing "署名だけ他所から持ってきても落ちる"
+      (let [forged (assoc-in (vec c) [1 :receipt/signature :signature/value] rfc-sig)
+            v (chain/verify forged {:verifier verifier})]
+        (is (false? (:ok? v)))
+        (is (= 1 (:broken-at v)))
+        (is (= :signature-invalid (:reason v)))))))

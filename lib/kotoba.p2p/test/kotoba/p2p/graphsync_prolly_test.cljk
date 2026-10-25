@@ -1,0 +1,88 @@
+(ns kotoba.p2p.graphsync-prolly-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [ipld.link :as link]
+            [kotoba.p2p.graphsync :as gs]
+            [kotoba.p2p.graphsync-prolly :as delta]
+            [prolly-tree.core :as pt]))
+
+(def wire-limits
+  {:max-message-bytes 1048576 :max-requests 4 :max-responses 4 :max-blocks 256})
+(def sync-limits {:max-blocks 256 :max-bytes 1000000 :max-reads 512})
+
+(defn- request-id []
+  #?(:clj (byte-array (map unchecked-byte (range 16)))
+     :cljs (js/Uint8Array.from (clj->js (range 16)))))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+(defn- key-str [i]
+  (let [s (str i)]
+    (str "k/" (apply str (repeat (- 5 (count s)) "0")) s)))
+
+(deftest delta-extension-round-trips-and-reconstructs-target
+  (let [sender (mem-store)
+        receiver (mem-store)
+        put-base! (fn [cid bytes]
+                    ((:put! sender) cid bytes)
+                    ((:put! receiver) cid bytes))
+        base-data (mapv (fn [i] [(key-str i) (str "v" i)]) (range 3000))
+        base (pt/build-tree put-base! base-data)
+        target-data (mapv (fn [[k v]]
+                            (if (#{(key-str 9) (key-str 1500) (key-str 2990)} k)
+                              [k (str v "-new")] [k v]))
+                          base-data)
+        target (pt/build-tree (:put! sender) target-data)
+        request (delta/with-base-root
+                 {:id (request-id) :type :new :root target
+                  :selector {:selector :matcher}}
+                 base)
+        decoded-request (-> {:requests [request]}
+                            (gs/encode-frame wire-limits)
+                            (gs/decode-frame wire-limits)
+                            :requests first)
+        fulfilled (delta/fulfill-request (:get-fn sender) decoded-request sync-limits)
+        decoded-response (-> fulfilled :message
+                             (gs/encode-frame wire-limits)
+                             (gs/decode-frame wire-limits))]
+    (is (= base (delta/base-root decoded-request)))
+    (is (= target (get-in decoded-response [:blocks 0 :cid])))
+    (is (pos? (get-in fulfilled [:stats :blocks])))
+    (delta/land-delta! (:put! receiver) target decoded-response)
+    (is (= target-data (pt/scan-range (:get-fn receiver) target nil nil)))))
+
+(deftest extension-and-responder-budgets-fail-closed
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! (mapv (fn [i] [(key-str i) i]) (range 1000)))
+        bare {:id (request-id) :type :new :root root
+              :selector {:selector :matcher}}]
+    (testing "missing or non-Link base roots are rejected"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (delta/base-root bare)))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (delta/base-root
+                    (assoc bare :extensions
+                           {delta/extension-name {"base" root}})))))
+    (testing "requester cannot avoid responder limits"
+      (let [request (assoc-in (delta/with-base-root bare root)
+                              [:extensions delta/extension-name "extra"]
+                              (link/link root))]
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                     (delta/fulfill-request get-fn request sync-limits))))
+      (let [request (delta/with-base-root bare
+                                         (pt/build-tree put! [["other" 1]]))]
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                     (delta/fulfill-request get-fn request
+                                            (assoc sync-limits :max-blocks 1))))))
+    (testing "receiver requires a target-bound response proof"
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (delta/land-delta!
+                    put! root
+                    {:responses [{:id (request-id)
+                                  :status (:completed-full gs/status)
+                                  :metadata []}]
+                     :blocks []}))))))

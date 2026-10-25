@@ -1,0 +1,938 @@
+(ns kotoba.lang.kami-nv-compat.warp.examples-test
+  "Coverage for warp.examples waves 1-3 (damping-kernel, pendulum-step-kernel,
+  cartpole-step-kernel, two-link-arm-step-kernel, franka-fk-inline,
+  franka-fk-kernel). Each kernel is exercised via warp.warp/launch, matching
+  how a real caller would dispatch the sync/CPU-fallback path."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.kami-nv-compat.warp.examples :as ex]
+            [kotoba.lang.kami-nv-compat.warp.warp :as wp]))
+
+(defn- close? [a b tol] (< (Math/abs (- a b)) tol))
+
+(deftest damping-kernel-scales-each-element
+  (let [arr (wp/wp-array [10.0 20.0 30.0])]
+    (wp/launch {:kernel-fn (:fn ex/damping-kernel) :dim 3 :inputs [arr 0.5]})
+    (is (= [5.0 10.0 15.0] @arr))))
+
+(deftest damping-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback true}
+          {:binding 1 :kind :uniform :input-index 1 :writeback false}]
+         (:bindings ex/damping-kernel)))
+  (is (= 64 (:workgroup-size ex/damping-kernel))))
+
+(deftest pendulum-step-equilibrium-has-no-drift
+  (testing "theta=0, omega=0, tau=0 -> stays at rest"
+    (let [theta (wp/wp-array [0.0]) omega (wp/wp-array [0.0]) tau (wp/wp-array [0.0])]
+      (wp/launch {:kernel-fn (:fn ex/pendulum-step-kernel) :dim 1
+                  :inputs [theta omega tau 0.01 9.81 1.0 1.0]})
+      (is (= [0.0] @theta))
+      (is (= [0.0] @omega)))))
+
+(deftest pendulum-step-at-90-degrees-matches-hand-derived-alpha
+  (testing "theta=pi/2, omega=0, tau=0, m=L=1 -> alpha = -g/L ~= -9.81,
+            so omega after one dt step ~= -9.81*dt (matches the source's
+            own worked example comment)"
+    (let [dt 0.001
+          theta (wp/wp-array [(/ Math/PI 2)])
+          omega (wp/wp-array [0.0])
+          tau   (wp/wp-array [0.0])]
+      (wp/launch {:kernel-fn (:fn ex/pendulum-step-kernel) :dim 1
+                  :inputs [theta omega tau dt 9.81 1.0 1.0]})
+      (is (close? (first @omega) (* -9.81 dt) 1e-9)))))
+
+(deftest pendulum-step-batches-independent-envs
+  (testing "dim=N runs N independent envs (tid indexes each array)"
+    (let [n 4
+          theta (wp/wp-array (repeat n 0.0))
+          omega (wp/wp-array (vec (range n)))          ; distinct initial omegas
+          tau   (wp/wp-array (repeat n 0.0))]
+      (wp/launch {:kernel-fn (:fn ex/pendulum-step-kernel) :dim n
+                  :inputs [theta omega tau 0.01 9.81 1.0 1.0]})
+      ;; at theta=0 the gravity torque term is 0, so each env's new theta is
+      ;; just its own initial omega * dt (no cross-env interference)
+      (is (= [0.0 0.01 0.02 0.03] @theta)))))
+
+(deftest cartpole-step-at-rest-stays-at-rest
+  (let [x (wp/wp-array [0.0]) x-dot (wp/wp-array [0.0])
+        theta (wp/wp-array [0.0]) theta-dot (wp/wp-array [0.0])
+        force (wp/wp-array [0.0])]
+    (wp/launch {:kernel-fn (:fn ex/cartpole-step-kernel) :dim 1
+                :inputs [x x-dot theta theta-dot force 0.02 9.8 1.0 0.1 0.5]})
+    (is (= [0.0] @x))
+    (is (= [0.0] @theta))))
+
+(deftest cartpole-step-tilted-pole-accelerates-away-from-vertical
+  (testing "a small positive tilt with no force -> theta-dot moves further
+            positive (unstable inverted-pendulum equilibrium)"
+    (let [x (wp/wp-array [0.0]) x-dot (wp/wp-array [0.0])
+          theta (wp/wp-array [0.05]) theta-dot (wp/wp-array [0.0])
+          force (wp/wp-array [0.0])]
+      (wp/launch {:kernel-fn (:fn ex/cartpole-step-kernel) :dim 1
+                  :inputs [x x-dot theta theta-dot force 0.02 9.8 1.0 0.1 0.5]})
+      (is (pos? (first @theta-dot))))))
+
+(deftest cartpole-step-symmetric-under-sign-flip
+  (testing "flipping the initial tilt's sign flips theta-dot's sign (odd symmetry)"
+    (let [run (fn [t0]
+                (let [x (wp/wp-array [0.0]) x-dot (wp/wp-array [0.0])
+                      theta (wp/wp-array [t0]) theta-dot (wp/wp-array [0.0])
+                      force (wp/wp-array [0.0])]
+                  (wp/launch {:kernel-fn (:fn ex/cartpole-step-kernel) :dim 1
+                              :inputs [x x-dot theta theta-dot force 0.02 9.8 1.0 0.1 0.5]})
+                  (first @theta-dot)))]
+      (is (close? (run 0.05) (- (run -0.05)) 1e-12)))))
+
+;; ── two-link-arm-step-kernel ──────────────────────────────────────────────
+
+(def two-link-arm-params
+  "m1 L1 r1 I1 m2 L2 r2 I2 — a concrete, non-degenerate parameter set (both
+  links contribute mass/inertia so det(M) is never zero)."
+  [1.0 1.0 0.5 0.1 1.0 1.0 0.5 0.1])
+
+(defn- run-two-link-arm [q1 q2 dq1 dq2 t1 t2 dt]
+  (let [theta1 (wp/wp-array [q1]) theta1-dot (wp/wp-array [dq1])
+        theta2 (wp/wp-array [q2]) theta2-dot (wp/wp-array [dq2])
+        tau1   (wp/wp-array [t1]) tau2       (wp/wp-array [t2])]
+    (wp/launch {:kernel-fn (:fn ex/two-link-arm-step-kernel) :dim 1
+                :inputs (into [theta1 theta1-dot theta2 theta2-dot tau1 tau2 dt 9.8]
+                               two-link-arm-params)})
+    {:theta1 (first @theta1) :theta1-dot (first @theta1-dot)
+     :theta2 (first @theta2) :theta2-dot (first @theta2-dot)}))
+
+(deftest two-link-arm-step-rest-at-zero-is-equilibrium
+  (testing "q1=q2=0, zero velocity, zero torque -> both gravity terms vanish
+            (sin(0)=0), stays at rest exactly"
+    (let [r (run-two-link-arm 0.0 0.0 0.0 0.0 0.0 0.0 0.001)]
+      (is (= 0.0 (:theta1 r)))
+      (is (= 0.0 (:theta1-dot r)))
+      (is (= 0.0 (:theta2 r)))
+      (is (= 0.0 (:theta2-dot r))))))
+
+(deftest two-link-arm-step-matches-independent-hand-derivation
+  (testing "q1=0.1, q2=0, at rest, no torque: cross-checked against a raw
+            (non-kernel) re-derivation of the same closed-form 2x2 solve"
+    (let [m1 1.0 L1 1.0 r1 0.5 I1 0.1
+          m2 1.0 r2 0.5 I2 0.1
+          g 9.8 q1 0.1 q2 0.0 dt 0.001
+          a (+ (* m1 r1 r1) I1 (* m2 L1 L1))
+          b (+ (* m2 r2 r2) I2)
+          c (* m2 L1 r2)
+          cos-t2 (Math/cos q2)
+          m11 (+ a b (* 2 c cos-t2)) m12 (+ b (* c cos-t2)) m22 b
+          h1 (+ (* m1 g r1 (Math/sin q1)) (* m2 g (+ (* L1 (Math/sin q1)) (* r2 (Math/sin (+ q1 q2))))))
+          h2 (* m2 g r2 (Math/sin (+ q1 q2)))
+          det (- (* m11 m22) (* m12 m12))
+          ddq1 (/ (- (* m22 (- h1)) (* m12 (- h2))) det)
+          ddq2 (/ (- (* m11 (- h2)) (* m12 (- h1))) det)
+          r (run-two-link-arm q1 q2 0.0 0.0 0.0 0.0 dt)]
+      (is (close? (:theta1-dot r) (* dt ddq1) 1e-12))
+      (is (close? (:theta2-dot r) (* dt ddq2) 1e-12)))))
+
+(deftest two-link-arm-step-registers-correct-bindings
+  (is (= 10 (count (:bindings ex/two-link-arm-step-kernel))))
+  (is (every? false? (map :writeback (filter #(= (:kind %) :storage)
+                                              (drop 4 (take 6 (:bindings ex/two-link-arm-step-kernel)))))))
+  (is (= 64 (:workgroup-size ex/two-link-arm-step-kernel))))
+
+;; ── franka-fk-inline / franka-fk-kernel ────────────────────────────────────
+
+(defn- close3? [[ax ay az] [bx by bz] tol]
+  (and (close? ax bx tol) (close? ay by tol) (close? az bz tol)))
+
+(deftest franka-fk-inline-home-pose-matches-hand-derivation
+  (testing "q=[0 0 0 0 0 0 0]: with every R_q = identity, the chain reduces
+            to composing 7 fixed x-axis rotations by the URDF rpy angles —
+            hand-traced through all 7 steps to [0.088, 0, 1.033], which also
+            matches the commonly-cited Franka Panda home-pose EE height"
+    (is (close3? [0.088 0.0 1.033] (ex/franka-fk-inline (repeat 7 0.0)) 1e-9))))
+
+(deftest franka-fk-kernel-matches-franka-fk-inline
+  (testing "dispatched through warp.warp/launch + WpArray plumbing, the
+            kernel's :js path gives the identical result to calling
+            franka-fk-inline directly"
+    (let [q-in   (wp/wp-array (vec (repeat 7 0.0)))
+          ee-out (wp/wp-array (vec (repeat 3 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/franka-fk-kernel) :dim 1 :inputs [q-in ee-out]})
+      (is (close3? (ex/franka-fk-inline (repeat 7 0.0)) @ee-out 1e-12)))))
+
+(deftest franka-fk-kernel-batches-independent-envs
+  (testing "dim=N runs N independent envs (env*7 / env*3 offsets don't
+            collide across envs)"
+    (let [envs   [[0.0 0.0 0.0 0.0 0.0 0.0 0.0]
+                  [0.5 -0.3 0.2 -1.5 0.1 1.8 0.7]]
+          q-in   (wp/wp-array (vec (apply concat envs)))
+          ee-out (wp/wp-array (vec (repeat 6 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/franka-fk-kernel) :dim 2 :inputs [q-in ee-out]})
+      (is (close3? (ex/franka-fk-inline (first envs)) (subvec @ee-out 0 3) 1e-12))
+      (is (close3? (ex/franka-fk-inline (second envs)) (subvec @ee-out 3 6) 1e-12)))))
+
+(deftest franka-fk-inline-finite-for-arbitrary-pose
+  (is (every? #(#?(:clj Double/isFinite :cljs js/isFinite) %)
+              (ex/franka-fk-inline [0.5 -0.3 0.2 -1.5 0.1 1.8 0.7]))))
+
+(deftest franka-fk-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback true}]
+         (:bindings ex/franka-fk-kernel)))
+  (is (= 64 (:workgroup-size ex/franka-fk-kernel))))
+
+;; ── pd-joint-controller-kernel / pd-joint-controller-inline ───────────────
+;;
+;; tau[i] = Kp[i % n] * (q*[i] - q[i]) - Kd[i % n] * qdot[i]
+
+(deftest pd-joint-controller-kernel-matches-hand-derived-torque
+  (testing "2 joints (n=2), 2 envs' worth of joint state packed flat: hand
+            derived tau0 = 10*(2-1) - 2*0.5 = 9.0, tau1 = 5*(3-3) - 1*(-0.5) = 0.5"
+    (let [q-actual  (wp/wp-array [1.0 3.0])
+          qd-actual (wp/wp-array [0.5 -0.5])
+          q-target  (wp/wp-array [2.0 3.0])
+          kp        (wp/wp-array [10.0 5.0])
+          kd        (wp/wp-array [2.0 1.0])
+          tau-out   (wp/wp-array [0.0 0.0])]
+      (wp/launch {:kernel-fn (:fn ex/pd-joint-controller-kernel) :dim 2
+                  :inputs [q-actual qd-actual q-target kp kd tau-out 2]})
+      (is (close? (first @tau-out) 9.0 1e-12))
+      (is (close? (second @tau-out) 0.5 1e-12)))))
+
+(deftest pd-joint-controller-kernel-matches-pd-joint-controller-inline
+  (let [q-actual  [1.0 3.0] qd-actual [0.5 -0.5] q-target [2.0 3.0]
+        kp [10.0 5.0] kd [2.0 1.0]
+        tau-out (wp/wp-array [0.0 0.0])]
+    (wp/launch {:kernel-fn (:fn ex/pd-joint-controller-kernel) :dim 2
+                :inputs [(wp/wp-array q-actual) (wp/wp-array qd-actual) (wp/wp-array q-target)
+                         (wp/wp-array kp) (wp/wp-array kd) tau-out 2]})
+    (is (= @tau-out (ex/pd-joint-controller-inline q-actual qd-actual q-target kp kd 2)))))
+
+(deftest pd-joint-controller-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback false}
+          {:binding 3 :kind :storage :input-index 3 :writeback false}
+          {:binding 4 :kind :storage :input-index 4 :writeback false}
+          {:binding 5 :kind :storage :input-index 5 :writeback true}
+          {:binding 6 :kind :uniform :input-index 6 :writeback false}]
+         (:bindings ex/pd-joint-controller-kernel)))
+  (is (= 64 (:workgroup-size ex/pd-joint-controller-kernel))))
+
+;; ── action-scale-clamp-kernel / action-scale-clamp-inline ─────────────────
+
+(deftest action-scale-clamp-kernel-clamps-at-both-bounds-and-passes-through
+  (testing "raw = scale*action + offset; raw0=1.1 clamps to hi=1.0,
+            raw1=0.3 passes through unclamped, raw2=-1.7 clamps to lo=-1.0"
+    (let [action (wp/wp-array [0.5 0.1 -0.9])
+          scale  (wp/wp-array [2.0]) offset (wp/wp-array [0.1])
+          lo     (wp/wp-array [-1.0]) hi (wp/wp-array [1.0])
+          out    (wp/wp-array [0.0 0.0 0.0])]
+      (wp/launch {:kernel-fn (:fn ex/action-scale-clamp-kernel) :dim 3
+                  :inputs [action scale offset lo hi out 1]})
+      (is (close? (nth @out 0) 1.0 1e-12))
+      (is (close? (nth @out 1) 0.3 1e-9))
+      (is (close? (nth @out 2) -1.0 1e-12)))))
+
+(deftest action-scale-clamp-kernel-matches-action-scale-clamp-inline
+  (let [action [0.5 0.1 -0.9] scale [2.0] offset [0.1] lo [-1.0] hi [1.0]
+        out (wp/wp-array [0.0 0.0 0.0])]
+    (wp/launch {:kernel-fn (:fn ex/action-scale-clamp-kernel) :dim 3
+                :inputs [(wp/wp-array action) (wp/wp-array scale) (wp/wp-array offset)
+                         (wp/wp-array lo) (wp/wp-array hi) out 1]})
+    (is (= @out (ex/action-scale-clamp-inline action scale offset lo hi 1)))))
+
+(deftest action-scale-clamp-kernel-registers-correct-bindings
+  (is (= 7 (count (:bindings ex/action-scale-clamp-kernel))))
+  (is (every? false? (map :writeback (take 5 (:bindings ex/action-scale-clamp-kernel)))))
+  (is (true? (:writeback (nth (:bindings ex/action-scale-clamp-kernel) 5))))
+  (is (= 64 (:workgroup-size ex/action-scale-clamp-kernel))))
+
+;; ── effort-limit-kernel / effort-limit-inline ──────────────────────────────
+
+(deftest effort-limit-kernel-clamps-symmetrically-with-inclusive-boundary
+  (testing "tau=15 -> 10 (over), tau=-15 -> -10 (under), tau=5 -> 5 (inside),
+            tau=10 (exactly at limit) -> 10 (unchanged, inclusive boundary)"
+    (let [tau (wp/wp-array [15.0 -15.0 5.0 10.0])
+          lim (wp/wp-array [10.0])]
+      (wp/launch {:kernel-fn (:fn ex/effort-limit-kernel) :dim 4 :inputs [tau lim 1]})
+      (is (= [10.0 -10.0 5.0 10.0] @tau)))))
+
+(deftest effort-limit-kernel-matches-effort-limit-inline
+  (let [tau [15.0 -15.0 5.0 10.0] lim [10.0]
+        tau-arr (wp/wp-array tau)]
+    (wp/launch {:kernel-fn (:fn ex/effort-limit-kernel) :dim 4
+                :inputs [tau-arr (wp/wp-array lim) 1]})
+    (is (= @tau-arr (ex/effort-limit-inline tau lim 1)))))
+
+(deftest effort-limit-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback true}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :uniform :input-index 2 :writeback false}]
+         (:bindings ex/effort-limit-kernel)))
+  (is (= 64 (:workgroup-size ex/effort-limit-kernel))))
+
+;; ── observation-normalize-kernel / observation-normalize-inline ───────────
+
+(deftest observation-normalize-kernel-normalizes-clamps-and-floors-sigma
+  (testing "feature 0: (5-2)/1.5 + 0 = 2.0, within [-10,10] -> 2.0 unchanged;
+            feature 1: (100-0)/1.0 + 0 = 100, clamps to hi=1.0;
+            feature 2: std=0 floors to sigma=1e-8, (1-0)/1e-8 = 1e8, within
+            [-1e10,1e10] -> passes through unclamped"
+    (let [obs   (wp/wp-array [5.0 100.0 1.0])
+          mean  (wp/wp-array [2.0 0.0 0.0])
+          std   (wp/wp-array [1.5 1.0 0.0])
+          noise (wp/wp-array [0.0 0.0 0.0])
+          clo   (wp/wp-array [-10.0 -1.0 -1.0e10])
+          chi   (wp/wp-array [10.0 1.0 1.0e10])]
+      (wp/launch {:kernel-fn (:fn ex/observation-normalize-kernel) :dim 3
+                  :inputs [obs mean std noise clo chi 3]})
+      (is (close? (nth @obs 0) 2.0 1e-12))
+      (is (close? (nth @obs 1) 1.0 1e-12))
+      (is (close? (nth @obs 2) 1.0e8 1.0)))))
+
+(deftest observation-normalize-kernel-matches-observation-normalize-inline
+  (let [obs [5.0 100.0 1.0] mean [2.0 0.0 0.0] std [1.5 1.0 0.0]
+        noise [0.0 0.0 0.0] clo [-10.0 -1.0 -1.0e10] chi [10.0 1.0 1.0e10]
+        obs-arr (wp/wp-array obs)]
+    (wp/launch {:kernel-fn (:fn ex/observation-normalize-kernel) :dim 3
+                :inputs [obs-arr (wp/wp-array mean) (wp/wp-array std) (wp/wp-array noise)
+                         (wp/wp-array clo) (wp/wp-array chi) 3]})
+    (is (= @obs-arr (ex/observation-normalize-inline obs mean std noise clo chi 3)))))
+
+(deftest observation-normalize-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback true}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback false}
+          {:binding 3 :kind :storage :input-index 3 :writeback false}
+          {:binding 4 :kind :storage :input-index 4 :writeback false}
+          {:binding 5 :kind :storage :input-index 5 :writeback false}
+          {:binding 6 :kind :uniform :input-index 6 :writeback false}]
+         (:bindings ex/observation-normalize-kernel)))
+  (is (= 64 (:workgroup-size ex/observation-normalize-kernel))))
+
+;; ── anymal-fk-inline / anymal-fk-kernel ─────────────────────────────────────
+
+(deftest anymal-fk-inline-zero-q-matches-hand-derivation
+  (testing "q=zeros for all 4 legs: every rot-axis(axis, 0) is the identity
+            matrix, so each foot is simply the sum of that leg's
+            haa-base + hfe-local + kfe-local + foot-local offsets — hand
+            summed here independently of the R_world composition code path"
+    (let [feet (ex/anymal-fk-inline (vec (repeat 12 0.0)))]
+      (is (close3? [0.277 0.2205 -0.634] (feet 0) 1e-12))          ; LF
+      (is (close3? [-0.277 0.2205 -0.634] (feet 1) 1e-12))         ; LH
+      (is (close3? [0.277 -0.0115 -0.634] (feet 2) 1e-12))         ; RF
+      (is (close3? [-0.277 -0.0115 -0.634] (feet 3) 1e-12)))))     ; RH
+
+(deftest anymal-fk-kernel-matches-anymal-fk-inline
+  (testing "dispatched through warp.warp/launch + WpArray plumbing, the
+            kernel's :js path gives the identical result to calling
+            anymal-fk-inline directly"
+    (let [q-in     (wp/wp-array (vec (repeat 12 0.0)))
+          feet-out (wp/wp-array (vec (repeat 12 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/anymal-fk-kernel) :dim 1 :inputs [q-in feet-out]})
+      (is (= (vec (apply concat (ex/anymal-fk-inline (vec (repeat 12 0.0)))))
+             @feet-out)))))
+
+(deftest anymal-fk-kernel-batches-independent-envs
+  (testing "dim=N runs N independent envs (env*12 offsets don't collide
+            across envs)"
+    (let [env0     (vec (repeat 12 0.0))
+          env1     [0.1 -0.2 0.3 0.05 -0.1 0.15 -0.05 0.2 -0.15 0.1 0.1 0.1]
+          q-in     (wp/wp-array (vec (concat env0 env1)))
+          feet-out (wp/wp-array (vec (repeat 24 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/anymal-fk-kernel) :dim 2 :inputs [q-in feet-out]})
+      (is (= (vec (apply concat (ex/anymal-fk-inline env0))) (subvec @feet-out 0 12)))
+      (is (= (vec (apply concat (ex/anymal-fk-inline env1))) (subvec @feet-out 12 24))))))
+
+(deftest anymal-fk-inline-finite-for-arbitrary-pose
+  (is (every? #(#?(:clj Double/isFinite :cljs js/isFinite) %)
+              (apply concat (ex/anymal-fk-inline [0.1 -0.2 0.3 0.05 -0.1 0.15
+                                                   -0.05 0.2 -0.15 0.1 0.1 0.1])))))
+
+(deftest anymal-fk-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback true}]
+         (:bindings ex/anymal-fk-kernel)))
+  (is (= 64 (:workgroup-size ex/anymal-fk-kernel))))
+
+;; ── generic-serial-fk-inline / generic-serial-fk-kernel ─────────────────────
+;;
+;; Franka's own xyz/rpy/axis data (rpy = (r,0,0), axis = z for every joint)
+;; is a genuine independent cross-check: generic-serial-fk-inline's
+;; rot-rpy-full(r,0,0) reduces algebraically to wave 47's rot-rpy(r), and its
+;; rot-axis([0,0,1], angle) reduces to wave 47's rot-z(angle) — both already
+;; verified in franka-fk-*'s own tests — so feeding the generic kernel
+;; Franka's config must reproduce franka-fk-inline's output exactly.
+
+(def ^:private generic-fk-half-pi (/ Math/PI 2))
+
+(def ^:private generic-fk-franka-xyz
+  [[0 0 0.333] [0 0 0] [0 -0.316 0] [0.0825 0 0]
+   [-0.0825 0.384 0] [0 0 0] [0.088 0 0]])
+
+(def ^:private generic-fk-franka-rpy
+  [[0 0 0] [(- generic-fk-half-pi) 0 0] [generic-fk-half-pi 0 0]
+   [generic-fk-half-pi 0 0] [(- generic-fk-half-pi) 0 0]
+   [generic-fk-half-pi 0 0] [generic-fk-half-pi 0 0]])
+
+(def ^:private generic-fk-franka-axis (vec (repeat 7 [0 0 1])))
+
+(deftest generic-serial-fk-inline-matches-franka-fk-inline-for-franka-config
+  (testing "feeding generic-serial-fk-inline Franka's own joint xyz/rpy/axis
+            data reproduces franka-fk-inline's output exactly, at both the
+            home pose and an arbitrary pose"
+    (is (close3? (ex/franka-fk-inline (repeat 7 0.0))
+                 (ex/generic-serial-fk-inline (repeat 7 0.0) generic-fk-franka-xyz
+                                               generic-fk-franka-rpy generic-fk-franka-axis)
+                 1e-12))
+    (let [q [0.5 -0.3 0.2 -1.5 0.1 1.8 0.7]]
+      (is (close3? (ex/franka-fk-inline q)
+                   (ex/generic-serial-fk-inline q generic-fk-franka-xyz
+                                                 generic-fk-franka-rpy generic-fk-franka-axis)
+                   1e-12)))))
+
+(deftest generic-serial-fk-kernel-matches-generic-serial-fk-inline
+  (testing "dispatched through warp.warp/launch + WpArray plumbing (including
+            the plain-number n uniform), the kernel's :js path gives the
+            identical result to calling generic-serial-fk-inline directly"
+    (let [q          [0.5 -0.3 0.2 -1.5 0.1 1.8 0.7]
+          q-in       (wp/wp-array (vec q))
+          joint-xyz  (wp/wp-array (vec (apply concat generic-fk-franka-xyz)))
+          joint-rpy  (wp/wp-array (vec (apply concat generic-fk-franka-rpy)))
+          joint-axis (wp/wp-array (vec (apply concat generic-fk-franka-axis)))
+          ee-out     (wp/wp-array (vec (repeat 3 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/generic-serial-fk-kernel) :dim 1
+                  :inputs [q-in joint-xyz joint-rpy joint-axis ee-out 7]})
+      (is (close3? (ex/generic-serial-fk-inline q generic-fk-franka-xyz
+                                                 generic-fk-franka-rpy generic-fk-franka-axis)
+                   @ee-out 1e-12)))))
+
+(deftest generic-serial-fk-kernel-batches-independent-envs
+  (testing "dim=N runs N independent envs (env*n offsets don't collide
+            across envs)"
+    (let [envs       [[0.0 0.0 0.0 0.0 0.0 0.0 0.0]
+                       [0.5 -0.3 0.2 -1.5 0.1 1.8 0.7]]
+          q-in       (wp/wp-array (vec (apply concat envs)))
+          joint-xyz  (wp/wp-array (vec (apply concat generic-fk-franka-xyz)))
+          joint-rpy  (wp/wp-array (vec (apply concat generic-fk-franka-rpy)))
+          joint-axis (wp/wp-array (vec (apply concat generic-fk-franka-axis)))
+          ee-out     (wp/wp-array (vec (repeat 6 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/generic-serial-fk-kernel) :dim 2
+                  :inputs [q-in joint-xyz joint-rpy joint-axis ee-out 7]})
+      (is (close3? (ex/franka-fk-inline (first envs)) (subvec @ee-out 0 3) 1e-12))
+      (is (close3? (ex/franka-fk-inline (second envs)) (subvec @ee-out 3 6) 1e-12)))))
+
+(deftest generic-serial-fk-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback false}
+          {:binding 3 :kind :storage :input-index 3 :writeback false}
+          {:binding 4 :kind :storage :input-index 4 :writeback true}
+          {:binding 5 :kind :uniform :input-index 5 :writeback false}]
+         (:bindings ex/generic-serial-fk-kernel)))
+  (is (= 64 (:workgroup-size ex/generic-serial-fk-kernel))))
+
+;; ── mulberry32 / gaussian-marsaglia ────────────────────────────────────────
+;;
+;; Expected values below were independently re-derived by running the TS
+;; source's mulberry32/gaussianMarsaglia algorithm verbatim under node
+;; (not via this Clojure port), confirming the CLJC port is bit-identical
+;; to the JS reference across several seeds, including seeds >= 2^31 (where
+;; a naive signed-int32 port would diverge from the unsigned-residue
+;; semantics `>>> 0` implies).
+
+(deftest mulberry32-is-deterministic-for-a-fixed-seed
+  (testing "two freshly-seeded instances with the same seed produce an
+            identical sequence"
+    (let [a (ex/mulberry32 99) b (ex/mulberry32 99)]
+      (is (= [(a) (a) (a)] [(b) (b) (b)])))))
+
+(deftest mulberry32-different-seeds-diverge
+  (let [a (ex/mulberry32 1) b (ex/mulberry32 2)]
+    (is (not= (a) (b)))))
+
+(deftest mulberry32-matches-independent-node-oracle
+  (testing "cross-checked against `node` running the TS algorithm verbatim
+            (not this port) for several seeds, including seeds spanning the
+            2^31 signed/unsigned boundary"
+    (doseq [[seed expected]
+            [[0 [0.26642920868471265 3.297457005828619E-4 0.2232720274478197
+                 0.1462021479383111 0.46732782293111086 0.5450490827206522]]
+             [1 [0.6270739405881613 0.002735721180215478 0.5274470399599522
+                 0.9810509674716741 0.9683778982143849 0.281103502959013]]
+             [42 [0.6011037519201636 0.44829055899754167 0.8524657934904099
+                  0.6697340414393693 0.17481389874592423 0.5265925421845168]]
+             [12345 [0.9797282677609473 0.3067522644996643 0.484205421525985
+                     0.817934412509203 0.5094283693470061 0.34747186047025025]]
+             [4294967295 [0.8964226141106337 0.189478256739676 0.7156526781618595
+                          0.9440599093213677 0.8452364315744489 0.5391399988438934]]
+             [2147483648 [0.8205775609239936 0.4481089550536126 0.7836112855002284
+                          0.5120457962621003 0.8388098266441375 0.4205148529727012]]]]
+      (let [rng (ex/mulberry32 seed)]
+        (is (= expected (vec (repeatedly 6 rng))) (str "seed=" seed))))))
+
+(deftest gaussian-marsaglia-matches-independent-node-oracle
+  (testing "cross-checked against node's Math.random-free mulberry32-driven
+            Marsaglia polar sampler, run independently of this port"
+    (is (= [0.5671395738744712 -2.4985646366811625 -0.2068583132564943
+            -1.5932138444925312 0.3917699810786397 1.6884458710701966]
+           (ex/gaussian-marsaglia (ex/mulberry32 7) 6)))))
+
+(deftest gaussian-marsaglia-honors-odd-counts
+  (testing "requesting an odd count still returns exactly that many samples
+            (drops the second sample of the last accepted pair)"
+    (is (= 5 (count (ex/gaussian-marsaglia (ex/mulberry32 3) 5))))))
+
+;; ── l2-norm-squared-kernel / l2-norm-squared-inline ────────────────────────
+
+(deftest l2-norm-squared-inline-matches-hand-derivation
+  (testing "[3, 4] -> 3^2 + 4^2 = 25 (classic 3-4-5 triangle)"
+    (is (= [25.0] (ex/l2-norm-squared-inline [3.0 4.0] 2)))))
+
+(deftest l2-norm-squared-inline-batches-independent-envs
+  (is (= [25.0 1.0] (ex/l2-norm-squared-inline [3.0 4.0 1.0 0.0] 2))))
+
+(deftest l2-norm-squared-kernel-matches-inline
+  (let [x   (wp/wp-array [3.0 4.0 1.0 0.0])
+        out (wp/wp-array [0.0 0.0])]
+    (wp/launch {:kernel-fn (:fn ex/l2-norm-squared-kernel) :dim 2 :inputs [x out 2]})
+    (is (= (ex/l2-norm-squared-inline [3.0 4.0 1.0 0.0] 2) @out))))
+
+(deftest l2-norm-squared-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback true}
+          {:binding 2 :kind :uniform :input-index 2 :writeback false}]
+         (:bindings ex/l2-norm-squared-kernel)))
+  (is (= 64 (:workgroup-size ex/l2-norm-squared-kernel))))
+
+;; ── track-vel-exp-inline ────────────────────────────────────────────────────
+
+(deftest track-vel-exp-inline-matches-hand-derivation
+  (testing "vTarget=[1,0], vActual=[0,0], sigma=1 -> ||diff||^2=1,
+            reward = exp(-1) = 0.36787944117144233"
+    (is (close? 0.36787944117144233
+                (first (ex/track-vel-exp-inline [1.0 0.0] [0.0 0.0] 1.0 2))
+                1e-15))))
+
+(deftest track-vel-exp-inline-perfect-tracking-gives-reward-one
+  (is (= [1.0] (ex/track-vel-exp-inline [2.0 -1.0] [2.0 -1.0] 0.5 2))))
+
+;; ── combine-weighted-rewards ─────────────────────────────────────────────────
+
+(deftest combine-weighted-rewards-matches-hand-derivation
+  (testing "term1=[1,2] w=2, term2=[10,20] w=0.5
+            -> [1*2+10*0.5, 2*2+20*0.5] = [7, 14]"
+    (is (= [7.0 14.0] (ex/combine-weighted-rewards [[1.0 2.0] [10.0 20.0]] [2.0 0.5])))))
+
+;; ── terminations-kernel / terminations-inline ──────────────────────────────
+
+(deftest terminations-inline-matches-hand-derivation
+  (testing "env0: q in [0,1] bounds, base_z above floor, step under budget
+            -> alive. env1: q exceeds q_upper AND step over budget -> both
+            terminated and truncated"
+    (is (= {:terminated [0 1] :truncated [0 1]}
+           (ex/terminations-inline [0.1 0.2, 2.0 0.2] [0.0 0.0] [1.0 1.0]
+                                    [1.0 1.0] [5.0 15.0] 2 0.5 10.0)))))
+
+(deftest terminations-inline-base-fall-terminates-even-with-valid-joints
+  (testing "base_z below min_base_z terminates even when joints are within
+            limits and step count is low"
+    (is (= {:terminated [1] :truncated [0]}
+           (ex/terminations-inline [0.1 0.2] [0.0 0.0] [1.0 1.0] [0.1] [1.0] 2 0.5 10.0)))))
+
+(deftest terminations-kernel-matches-terminations-inline
+  (let [q          (wp/wp-array [0.1 0.2 2.0 0.2])
+        q-lower    (wp/wp-array [0.0 0.0])
+        q-upper    (wp/wp-array [1.0 1.0])
+        base-z     (wp/wp-array [1.0 1.0])
+        step       (wp/wp-array [5.0 15.0])
+        terminated (wp/wp-array [0.0 0.0])
+        truncated  (wp/wp-array [0.0 0.0])]
+    (wp/launch {:kernel-fn (:fn ex/terminations-kernel) :dim 2
+                :inputs [q q-lower q-upper base-z step terminated truncated 2 0.5 10.0]})
+    (is (= (ex/terminations-inline [0.1 0.2 2.0 0.2] [0.0 0.0] [1.0 1.0] [1.0 1.0] [5.0 15.0] 2 0.5 10.0)
+           {:terminated (mapv long @terminated) :truncated (mapv long @truncated)}))))
+
+(deftest terminations-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback false}
+          {:binding 3 :kind :storage :input-index 3 :writeback false}
+          {:binding 4 :kind :storage :input-index 4 :writeback false}
+          {:binding 5 :kind :storage :input-index 5 :writeback true}
+          {:binding 6 :kind :storage :input-index 6 :writeback true}
+          {:binding 7 :kind :uniform :input-index 7 :writeback false}]
+         (:bindings ex/terminations-kernel)))
+  (is (= 64 (:workgroup-size ex/terminations-kernel))))
+
+;; ── mlp-policy-forward-inline / mlp-policy-forward-kernel ─────────────────
+
+(deftest mlp-policy-forward-inline-single-neuron-matches-hand-derived-tanh
+  (testing "1 obs, 1 hidden, 1 action: obs=2, W1=3, b1=-1 -> hidden pre-act
+            = 3*2-1 = 5, ReLU(5)=5; W2=0.5, b2=0.1 -> out pre-act =
+            0.5*5+0.1 = 2.6 -> tanh(2.6), computed independently via the
+            raw exp-based tanh identity (e^2x-1)/(e^2x+1), not by calling
+            back into any tanh helper"
+    (let [result (ex/mlp-policy-forward-inline [2.0] [3.0] [-1.0] [0.5] [0.1] 1 1 1)
+          e (Math/exp (* 2 2.6))
+          hand-tanh (/ (- e 1) (+ e 1))]
+      (is (close? (first result) hand-tanh 1e-12)))))
+
+(deftest mlp-policy-forward-inline-relu-clamps-negative-hidden-pre-activation
+  (testing "W1=-3, obs=2, b1=-1 -> hidden pre-act = -7 -> ReLU clamps to 0,
+            so the output only depends on b2: tanh(0.5*0+0.2) = tanh(0.2)"
+    (let [result (ex/mlp-policy-forward-inline [2.0] [-3.0] [-1.0] [0.5] [0.2] 1 1 1)]
+      (is (close? (first result) (Math/tanh 0.2) 1e-12)))))
+
+(deftest mlp-policy-forward-inline-batches-independent-envs
+  (testing "2 envs, obs-dim=1, hidden-dim=2, action-dim=2 -- each env's
+            hidden/action values hand-derived independently of the
+            function under test"
+    (let [obs [1.0 2.0] W1 [1.0 2.0] b1 [0.0 0.0]
+          W2 [1.0 1.0 0.5 0.5] b2 [0.0 0.0]
+          result (ex/mlp-policy-forward-inline obs W1 b1 W2 b2 1 2 2)
+          ;; env0: hidden=[ReLU(1*1)=1, ReLU(2*1)=2]; a0=tanh(1+2)=tanh(3); a1=tanh(0.5+1)=tanh(1.5)
+          ;; env1: hidden=[ReLU(1*2)=2, ReLU(2*2)=4]; a0=tanh(2+4)=tanh(6); a1=tanh(1+2)=tanh(3)
+          expected [(Math/tanh 3) (Math/tanh 1.5) (Math/tanh 6) (Math/tanh 3)]]
+      (is (= (count expected) (count result)))
+      (is (every? true? (map #(close? %1 %2 1e-12) result expected))))))
+
+(deftest mlp-policy-forward-kernel-matches-mlp-policy-forward-inline
+  (testing "dispatched through warp.warp/launch + WpArray plumbing, the
+            kernel's :js path gives the identical result to calling
+            mlp-policy-forward-inline directly"
+    (let [obs [1.0 2.0] W1 [1.0 2.0] b1 [0.0 0.0]
+          W2 [1.0 1.0 0.5 0.5] b2 [0.0 0.0]
+          obs-a (wp/wp-array obs) W1-a (wp/wp-array W1) b1-a (wp/wp-array b1)
+          W2-a (wp/wp-array W2) b2-a (wp/wp-array b2)
+          action-out (wp/wp-array (vec (repeat 4 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/mlp-policy-forward-kernel) :dim 2
+                  :inputs [obs-a W1-a b1-a W2-a b2-a action-out 1 2 2]})
+      (is (= (ex/mlp-policy-forward-inline obs W1 b1 W2 b2 1 2 2) @action-out)))))
+
+(deftest mlp-policy-forward-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback false}
+          {:binding 3 :kind :storage :input-index 3 :writeback false}
+          {:binding 4 :kind :storage :input-index 4 :writeback false}
+          {:binding 5 :kind :storage :input-index 5 :writeback true}
+          {:binding 6 :kind :uniform :input-index 6 :writeback false}]
+         (:bindings ex/mlp-policy-forward-kernel)))
+  (is (= 64 (:workgroup-size ex/mlp-policy-forward-kernel))))
+
+;; ── conditional-reset-inline / conditional-reset-kernel ───────────────────
+
+(deftest conditional-reset-inline-copies-only-done-envs
+  (testing "d=2 (2 floats/env), 2 envs: env0 done -> its 2 slots get
+            reset-state; env1 not-done -> its 2 slots keep state"
+    (let [result (ex/conditional-reset-inline
+                   [10.0 11.0 20.0 21.0] [100.0 101.0 200.0 201.0] [1.0 0.0] 2)]
+      (is (= [100.0 101.0 20.0 21.0] result)))))
+
+(deftest conditional-reset-boundary-at-exactly-half-resets
+  (testing "done == 0.5 exactly is >= 0.5, so it resets (boundary inclusive)"
+    (is (= [9.0] (ex/conditional-reset-inline [1.0] [9.0] [0.5] 1)))))
+
+(deftest conditional-reset-boundary-just-below-half-does-not-reset
+  (testing "done just under 0.5 does not reset (boundary exclusive below)"
+    (is (= [1.0] (ex/conditional-reset-inline [1.0] [9.0] [0.4999999] 1)))))
+
+(deftest conditional-reset-kernel-matches-conditional-reset-inline
+  (testing "dispatched through warp.warp/launch + WpArray plumbing, the
+            kernel's :js path (in-place mutation of the state WpArray)
+            gives the identical result to conditional-reset-inline's pure
+            return value"
+    (let [state [10.0 11.0 20.0 21.0] reset-state [100.0 101.0 200.0 201.0] done [1.0 0.0]
+          state-a (wp/wp-array state) reset-a (wp/wp-array reset-state) done-a (wp/wp-array done)]
+      (wp/launch {:kernel-fn (:fn ex/conditional-reset-kernel) :dim 4
+                  :inputs [state-a reset-a done-a 2]})
+      (is (= (ex/conditional-reset-inline state reset-state done 2) @state-a)))))
+
+(deftest conditional-reset-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback true}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback false}
+          {:binding 3 :kind :uniform :input-index 3 :writeback false}]
+         (:bindings ex/conditional-reset-kernel)))
+  (is (= 64 (:workgroup-size ex/conditional-reset-kernel))))
+
+;; ── ground-contact-inline / ground-contact-kernel ─────────────────────────
+
+(deftest ground-contact-inline-matches-hand-derived-forces
+  (testing "4 feet, ground_z=0, Kp=100, Kd=10:
+            foot0 pz=0.0 (penetration=0, not >0) -> fz=0
+            foot1 pz=-0.01, vz=0 -> raw=100*0.01-10*0=1.0 -> fz=1.0
+            foot2 pz=-0.01, vz=5.0 -> raw=1.0-50.0=-49.0 -> clamped to 0
+            foot3 pz=0.02 (above ground, penetration<0) -> fz=0"
+    (let [p-world [0 0 0.0,  0 0 -0.01,  0 0 -0.01,  0 0 0.02]
+          v-world [0 0 0.0,  0 0 0.0,    0 0 5.0,    0 0 0.0]
+          result (ex/ground-contact-inline p-world v-world 0.0 100.0 10.0)]
+      (is (= [0 0 0  0 0 1.0  0 0 0  0 0 0] result)))))
+
+(deftest ground-contact-boundary-zero-penetration-yields-no-force
+  (testing "pz == ground_z exactly (penetration=0) must NOT enter the >0
+            branch, even with a huge downward velocity that would
+            otherwise dominate the damping term"
+    (is (= [0 0 0] (ex/ground-contact-inline [0 0 5.0] [0 0 -100.0] 5.0 100.0 10.0)))))
+
+(deftest ground-contact-just-above-threshold-yields-tiny-positive-force
+  (testing "penetration = 1e-9 (just above the >0 threshold) with vz=0 ->
+            fz = Kp*1e-9 = 100*1e-9 = 1e-7"
+    (let [[_ _ fz] (ex/ground-contact-inline [0 0 (- 5.0 1e-9)] [0 0 0.0] 5.0 100.0 10.0)]
+      (is (close? fz 1e-7 1e-12)))))
+
+(deftest ground-contact-kernel-matches-ground-contact-inline
+  (testing "dispatched through warp.warp/launch + WpArray plumbing, the
+            kernel's :js path gives the identical result to calling
+            ground-contact-inline directly"
+    (let [p-world [0 0 0.0,  0 0 -0.01,  0 0 -0.01,  0 0 0.02]
+          v-world [0 0 0.0,  0 0 0.0,    0 0 5.0,    0 0 0.0]
+          p-a (wp/wp-array p-world) v-a (wp/wp-array v-world)
+          f-out (wp/wp-array (vec (repeat 12 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/ground-contact-kernel) :dim 4
+                  :inputs [p-a v-a f-out 0.0 100.0 10.0]})
+      (is (= (ex/ground-contact-inline p-world v-world 0.0 100.0 10.0) @f-out)))))
+
+(deftest ground-contact-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :storage :input-index 2 :writeback true}
+          {:binding 3 :kind :uniform :input-index 3 :writeback false}]
+         (:bindings ex/ground-contact-kernel)))
+  (is (= 64 (:workgroup-size ex/ground-contact-kernel))))
+
+;; ── franka-fk-jacobian-inline / franka-fk-jacobian-kernel ──────────────────
+
+(defn- closev? [a b tol] (every? true? (map #(close? %1 %2 tol) a b)))
+
+(deftest franka-fk-jacobian-inline-ee-matches-franka-fk-inline
+  (testing "the FK half of franka-fk-jacobian-inline reproduces the already-
+            verified franka-fk-inline's EE position exactly (same chain,
+            re-derived independently as part of the Jacobian computation)"
+    (let [q [0.2 -0.4 0.3 -1.8 0.15 1.0 0.5]]
+      (is (close3? (ex/franka-fk-inline q) (:ee (ex/franka-fk-jacobian-inline q)) 1e-12)))))
+
+(deftest franka-fk-jacobian-inline-matches-finite-difference
+  (testing "cross-checked against a finite-difference estimate of the same
+            Jacobian, built from franka-fk-inline (already independently
+            verified against the hand-derived home pose) perturbing each
+            q_i by 1e-6 -- NOT by calling franka-fk-jacobian-inline itself.
+            Analytic and finite-diff columns should agree to a few
+            significant figures (O(eps) truncation error)."
+    (let [q0  (vec (repeat 7 0.0))
+          eps 1e-6
+          ee0 (ex/franka-fk-inline q0)
+          fd-cols (for [i (range 7)]
+                    (let [eep (ex/franka-fk-inline (assoc q0 i eps))]
+                      (mapv #(/ (- %1 %2) eps) eep ee0)))
+          fd-J [(mapv #(nth % 0) fd-cols) (mapv #(nth % 1) fd-cols) (mapv #(nth % 2) fd-cols)]
+          analytic (:J (ex/franka-fk-jacobian-inline q0))]
+      (dotimes [r 3]
+        (is (closev? (nth fd-J r) (nth analytic r) 1e-6))))))
+
+(deftest franka-fk-jacobian-kernel-matches-franka-fk-jacobian-inline
+  (testing "dispatched through warp.warp/launch across 2 envs, the kernel's
+            :js path (ee + 3x7 J packed into a 24-float-per-env out-buf)
+            matches franka-fk-jacobian-inline called directly per env"
+    (let [envs    [[0.0 0.0 0.0 0.0 0.0 0.0 0.0] [0.2 -0.4 0.3 -1.8 0.15 1.0 0.5]]
+          q-in    (wp/wp-array (vec (apply concat envs)))
+          out-buf (wp/wp-array (vec (repeat 48 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/franka-fk-jacobian-kernel) :dim 2 :inputs [q-in out-buf]})
+      (doseq [e (range 2)]
+        (let [{:keys [ee J]} (ex/franka-fk-jacobian-inline (envs e))
+              base   (* e 24)
+              ee-out (subvec @out-buf base (+ base 3))
+              J-out  (vec (for [r (range 3)] (vec (for [c (range 7)] (nth @out-buf (+ base 3 (* r 7) c))))))]
+          (is (close3? ee ee-out 1e-12))
+          (dotimes [r 3] (is (closev? (nth J r) (nth J-out r) 1e-12))))))))
+
+(deftest franka-fk-jacobian-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback true}]
+         (:bindings ex/franka-fk-jacobian-kernel)))
+  (is (= 64 (:workgroup-size ex/franka-fk-jacobian-kernel))))
+
+;; ── franka-reach-step-inline / franka-reach-kernel ──────────────────────────
+
+(defn- solve3
+  "Fresh Gaussian elimination w/ partial pivoting for a 3x3 linear system --
+  deliberately independent of franka-reach-step-inline's closed-form
+  cofactor inverse, used only to cross-check it in
+  franka-reach-step-inline-matches-gaussian-elimination."
+  [A b]
+  (let [n   3
+        aug (mapv (fn [row bi] (conj (vec row) bi)) A b)
+        aug (reduce
+             (fn [aug col]
+               (let [piv  (apply max-key #(Math/abs (double (get-in aug [% col]))) (range col n))
+                     aug  (assoc aug col (aug piv) piv (aug col))
+                     pval (get-in aug [col col])
+                     aug  (assoc aug col (mapv #(/ % pval) (aug col)))]
+                 (reduce (fn [aug r]
+                           (if (= r col)
+                             aug
+                             (let [f (get-in aug [r col])]
+                               (assoc aug r (mapv - (aug r) (map #(* f %) (aug col)))))))
+                         aug (remove #{col} (range n)))))
+             aug (range n))]
+    (mapv #(get-in aug [% n]) (range n))))
+
+(deftest franka-reach-step-inline-matches-gaussian-elimination
+  (testing "cross-checked against a raw (non-cofactor) 3x3 Gaussian-
+            elimination solve of A*y = err, built directly from
+            franka-fk-jacobian-inline's (already independently verified)
+            ee/J -- exercises the DLS solve end to end without reusing
+            franka-reach-step-inline's own cofactor-inverse code"
+    (let [q      [0.1 -0.3 0.2 -1.5 0.1 0.8 0.3]
+          target [0.4 0.15 0.5]
+          lambda 0.05
+          alpha  0.2
+          {:keys [ee J]} (ex/franka-fk-jacobian-inline q)
+          [j0 j1 j2] J
+          dot  (fn [a b] (reduce + (map * a b)))
+          err  [(- (target 0) (ee 0)) (- (target 1) (ee 1)) (- (target 2) (ee 2))]
+          lam2 (* lambda lambda)
+          A    [[(+ lam2 (dot j0 j0)) (dot j0 j1) (dot j0 j2)]
+                [(dot j1 j0) (+ lam2 (dot j1 j1)) (dot j1 j2)]
+                [(dot j2 j0) (dot j2 j1) (+ lam2 (dot j2 j2))]]
+          y    (solve3 A err)
+          dq   (mapv (fn [i] (+ (* (j0 i) (y 0)) (* (j1 i) (y 1)) (* (j2 i) (y 2)))) (range 7))
+          expected (mapv (fn [qi dqi] (+ qi (* alpha dqi))) q dq)
+          actual   (ex/franka-reach-step-inline q target lambda alpha)]
+      (is (closev? expected actual 1e-9)))))
+
+(deftest franka-reach-step-inline-fixed-point-when-target-already-reached
+  (testing "err=0 (target == current EE) -> y=0 -> dq=0 -> q_new == q,
+            regardless of lambda/alpha"
+    (let [q  [0.1 0.2 0.3 0.4 0.5 0.6 0.7]
+          ee (:ee (ex/franka-fk-jacobian-inline q))]
+      (is (= (vec q) (ex/franka-reach-step-inline q ee 0.05 0.5))))))
+
+(deftest franka-reach-step-inline-moves-toward-target
+  (testing "one small DLS step strictly reduces the Euclidean EE-to-target
+            distance (basic IK sanity: it doesn't overshoot or diverge for
+            a small, well-damped step)"
+    (let [q       (vec (repeat 7 0.0))
+          ee0     (:ee (ex/franka-fk-jacobian-inline q))
+          target  (mapv + ee0 [0.02 0.01 -0.01])
+          dist    (fn [a b] (Math/sqrt (reduce + (map #(* % %) (map - a b)))))
+          d0      (dist ee0 target)
+          q-new   (ex/franka-reach-step-inline q target 0.05 0.3)
+          ee1     (:ee (ex/franka-fk-jacobian-inline q-new))
+          d1      (dist ee1 target)]
+      (is (< d1 d0)))))
+
+(deftest franka-reach-kernel-matches-franka-reach-step-inline
+  (testing "dispatched through warp.warp/launch, the kernel's :js path
+            (q-inout overwritten in place) matches franka-reach-step-inline
+            called directly"
+    (let [q         [0.1 -0.3 0.2 -1.5 0.1 0.8 0.3]
+          target    [0.4 0.15 0.5]
+          lambda    0.05
+          alpha     0.2
+          q-inout   (wp/wp-array (vec q))
+          target-in (wp/wp-array (vec target))]
+      (wp/launch {:kernel-fn (:fn ex/franka-reach-kernel) :dim 1
+                  :inputs [q-inout target-in lambda alpha]})
+      (is (= (ex/franka-reach-step-inline q target lambda alpha) @q-inout)))))
+
+(deftest franka-reach-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback true}
+          {:binding 1 :kind :storage :input-index 1 :writeback false}
+          {:binding 2 :kind :uniform :input-index 2 :writeback false}
+          {:binding 3 :kind :uniform :input-index 3 :writeback false}]
+         (:bindings ex/franka-reach-kernel)))
+  (is (= 64 (:workgroup-size ex/franka-reach-kernel))))
+
+;; ── franka-grav-comp-inline / franka-grav-comp-kernel ───────────────────────
+;;
+;; The cross-check below is a from-scratch FK+COM chain built directly on
+;; Math/cos+Math/sin (NOT reusing examples.cljc's private rot-rpy/rot-z/
+;; mat3-mul-small/matvec3-small helpers, and NOT calling back into
+;; franka-grav-comp-inline), used to independently verify the Lagrangian
+;; identity g(q) = dU/dq: the static gravity-compensation torque equals the
+;; gradient of gravitational potential energy U(q) = sum_k m_k*g_mag*height_k
+;; w.r.t. q, evaluated via central finite differences.
+
+(def ^:private raw-half-pi (/ Math/PI 2))
+(def ^:private raw-xyz
+  [[0 0 0.333] [0 0 0] [0 -0.316 0] [0.0825 0 0] [-0.0825 0.384 0] [0 0 0] [0.088 0 0]])
+(def ^:private raw-rpy-r
+  [0 (- raw-half-pi) raw-half-pi raw-half-pi (- raw-half-pi) raw-half-pi raw-half-pi])
+(def ^:private raw-masses [2.74 2.74 2.38 2.38 2.74 1.55 0.54])
+(def ^:private raw-com-local
+  [[0.003875 0.002081 -0.04762] [-0.003141 -0.02872 0.003495]
+   [0.02785 0.03094 -0.0961] [-0.05317 0.1046 0.02711]
+   [-0.01121 0.04123 -0.03825] [0.065 -0.016 -0.020] [0.010 0.010 0.045]])
+
+(defn- raw-mm3 [a b]
+  (vec (for [i (range 3)] (vec (for [j (range 3)] (reduce + (for [k (range 3)] (* (get-in a [i k]) (get-in b [k j])))))))))
+(defn- raw-mv3 [m v] (vec (for [i (range 3)] (reduce + (for [j (range 3)] (* (get-in m [i j]) (v j)))))))
+(defn- raw-rx [r] (let [c (Math/cos r) s (Math/sin r)] [[1 0 0] [0 c (- s)] [0 s c]]))
+(defn- raw-rz [a] (let [c (Math/cos a) s (Math/sin a)] [[c (- s) 0] [s c 0] [0 0 1]]))
+
+(defn- raw-com-world-all [q]
+  (loop [i 0 R [[1 0 0] [0 1 0] [0 0 1]] p [0.0 0.0 0.0] coms []]
+    (if (>= i 7)
+      coms
+      (let [Ro (raw-rx (raw-rpy-r i)) Rq (raw-rz (nth q i)) R-i-in-p (raw-mm3 Ro Rq)
+            rotated (raw-mv3 R (raw-xyz i)) p' (mapv + p rotated) R' (raw-mm3 R R-i-in-p)
+            c-rot (raw-mv3 R' (raw-com-local i)) com-w (mapv + p' c-rot)]
+        (recur (inc i) R' p' (conj coms com-w))))))
+
+(defn- raw-U-std
+  "Standard-sign potential energy: U = sum_k m_k * g_mag * height_k, i.e.
+  U = sum_k -m_k*(gravity . com_k) for a downward gravity vector. Standard
+  manipulator dynamics has g(q) = dU/dq equal to the static gravity-
+  compensation torque."
+  [q gravity]
+  (let [coms (raw-com-world-all q)]
+    (reduce + (for [k (range 7)] (* -1.0 (raw-masses k) (reduce + (map * gravity (coms k))))))))
+
+(deftest franka-grav-comp-inline-matches-potential-energy-finite-difference
+  (testing "tau_g[i] ~= dU/dq_i (central finite diff, eps=1e-6) against a
+            from-scratch FK+COM chain and standard-sign potential energy --
+            an independent physics identity, not a re-derivation of the
+            kernel's own cross-product bookkeeping"
+    (let [q       [0.2 -0.4 0.3 -1.8 0.15 1.0 0.5]
+          gravity [0.0 0.0 -9.81]
+          eps     1e-6
+          fd-tau  (vec (for [i (range 7)]
+                         (/ (- (raw-U-std (update q i + eps) gravity)
+                               (raw-U-std (update q i - eps) gravity))
+                            (* 2 eps))))
+          actual  (ex/franka-grav-comp-inline q gravity)]
+      (is (closev? fd-tau actual 1e-5)))))
+
+(deftest franka-grav-comp-inline-default-gravity-matches-explicit
+  (testing "the 1-arity default gravity (0,0,-9.81) matches passing it explicitly"
+    (let [q [0.2 -0.4 0.3 -1.8 0.15 1.0 0.5]]
+      (is (= (ex/franka-grav-comp-inline q) (ex/franka-grav-comp-inline q [0.0 0.0 -9.81]))))))
+
+(deftest franka-grav-comp-kernel-matches-franka-grav-comp-inline
+  (testing "dispatched through warp.warp/launch, the kernel's :js path
+            (gx/gy/gz taken as 3 separate positional args, per the TS
+            source's documented single-vec4-uniform limitation) matches
+            franka-grav-comp-inline called directly"
+    (let [q       [0.2 -0.4 0.3 -1.8 0.15 1.0 0.5]
+          gravity [0.0 0.0 -9.81]
+          q-in    (wp/wp-array (vec q))
+          tau-out (wp/wp-array (vec (repeat 7 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/franka-grav-comp-kernel) :dim 1
+                  :inputs (into [q-in tau-out] gravity)})
+      (is (= (ex/franka-grav-comp-inline q gravity) @tau-out)))))
+
+(deftest franka-grav-comp-kernel-batches-independent-envs
+  (testing "dim=N runs N independent envs (env*7 offsets don't collide)"
+    (let [envs    [[0.0 0.0 0.0 0.0 0.0 0.0 0.0] [0.2 -0.4 0.3 -1.8 0.15 1.0 0.5]]
+          gravity [0.0 0.0 -9.81]
+          q-in    (wp/wp-array (vec (apply concat envs)))
+          tau-out (wp/wp-array (vec (repeat 14 0.0)))]
+      (wp/launch {:kernel-fn (:fn ex/franka-grav-comp-kernel) :dim 2
+                  :inputs (into [q-in tau-out] gravity)})
+      (is (closev? (ex/franka-grav-comp-inline (first envs) gravity) (subvec @tau-out 0 7) 1e-12))
+      (is (closev? (ex/franka-grav-comp-inline (second envs) gravity) (subvec @tau-out 7 14) 1e-12)))))
+
+(deftest franka-grav-comp-kernel-registers-correct-bindings
+  (is (= [{:binding 0 :kind :storage :input-index 0 :writeback false}
+          {:binding 1 :kind :storage :input-index 1 :writeback true}
+          {:binding 2 :kind :uniform :input-index 2 :writeback false}]
+         (:bindings ex/franka-grav-comp-kernel)))
+  (is (= 64 (:workgroup-size ex/franka-grav-comp-kernel))))

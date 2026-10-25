@@ -1,0 +1,2269 @@
+(ns kotoba.script-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is run-tests testing]]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.script :as script])
+  (:gen-class))
+
+(def ambient-access-pattern
+  "Ambient/DOM reach-out in emitted restricted ESM.
+
+  Matches an *access form* — `globalThis`, a property read off `window` /
+  `document`, a call to `eval` / `fetch`, a `new DOMParser` / `new
+  XMLHttpRequest` — not the bare name. The previous version grepped the bare
+  substrings, so the emitter's own error codes (`'document-read-string'`,
+  `'document-read-hex-odd'`, … 19 of them from the W4 document validators)
+  matched it and both guards were permanently red. A guard that always fails
+  protects nothing: a genuine leak looked exactly like the benign string."
+  #"\bglobalThis\b|\bwindow\s*[.\[]|\bdocument\s*[.\[]|(?<![\w$.-])eval\s*\(|new\s+DOMParser|(?<![\w$.-])fetch\s*\(|new\s+XMLHttpRequest")
+
+
+(defn- run-node
+  "`clojure.java.shell/sh`, except that a `node --input-type=module -e <src>`
+  invocation runs the source from a temp `.mjs` file instead of from argv.
+
+  Linux caps a *single* argv entry at MAX_ARG_STRLEN = 128 KiB, well below the
+  macOS limit, so a test whose emitted module is large enough fails there with
+  `Cannot run program \"node\": error=7, Argument list too long` — a process
+  error, not an assertion failure, which is why it read as a CI-only break
+  rather than a real one. The base64 `data:` import these tests use inflates
+  the module by 4/3 before it ever reaches argv, so the ceiling arrives sooner
+  than the module size suggests.
+
+  Same return shape as `shell/sh` (`{:exit :out :err}`), so call sites are
+  unchanged."
+  [& args]
+  (if (= (take 3 args) '("node" "--input-type=module" "-e"))
+    (let [file (java.io.File/createTempFile "kotoba-script-test-" ".mjs")]
+      (try
+        (spit file (nth args 3))
+        (apply shell/sh "node" (.getPath file) (drop 4 args))
+        (finally (.delete file))))
+    (apply shell/sh args)))
+
+(def kir
+  {:format :kotoba.kir/v3 :entry 'main :effects #{}
+   :functions [{:name 'add1 :params ['x] :body '(+ x 1)}
+               {:name 'main :params [] :body '(add1 41)}]})
+
+(deftest fuel-metadata-must-fit-the-exact-js-counter
+  (doseq [fuel [nil false 0 -1 1/2 1.5 Double/NaN Double/POSITIVE_INFINITY
+               9007199254740992N "Infinity" "1;throw new Error('injected')"]]
+    (let [data (try (script/emit kir {:fuel fuel}) nil
+                    (catch kerror/ExceptionInfo e (ex-data e)))]
+      (is (= :fuel-outside-admitted-range (:reason data)) (pr-str fuel))))
+  (doseq [fuel [1 512 4294967296 9007199254740991N]]
+    (is (str/includes? (script/emit kir {:fuel fuel}) (str "let fuel=" fuel ";")))))
+
+(deftest emits-and-executes-restricted-esm
+  (let [source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.main()!==42n)process.exit(2);console.log('42')})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (= "42\n" (:out result)))
+    (is (str/includes? source "let fuel=512;"))
+    (is (not (re-find ambient-access-pattern source)))))
+
+;; Every public var below whose value is a KIR map is exported by
+;; `scripts/gen-parity-golden.cljk` as a JVM golden for `test/nbb/parity.cljk`
+;; (emit bytes must match on nbb). Fixtures whose emit is EXPECTED to throw
+;; stay `let`-bound inside their deftest so the generator never sees them.
+;; `^{:emit-opts …}` on a var carries the options the golden was emitted with.
+
+(def do-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['value 'traps] :effects #{}
+   :functions
+   [{:name 'value :params [] :param-types [] :result :string :effects #{}
+     :body '(do 1 (+ 1 1) "done")}
+    {:name 'traps :params [] :param-types [] :result :i64 :effects #{}
+     :body '(do (quot 1 0) 5)}]})
+
+(deftest do-emits-in-order-and-returns-its-last-value
+  (let [source (script/emit do-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.value()!=='done')process.exit(2);"
+                "try{x.traps();process.exit(3)}catch(e){"
+                "if(e.message!=='division-by-zero')process.exit(4)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "void (quot(1n,0n));return 5n;"))
+    (is (= source (script/emit do-kir)))))
+
+(def closure-dispatcher-kir
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :effects #{}
+   :functions
+   [{:name 'main :params [] :param-types [] :result :string :effects #{}
+     :body '(let [f (pair 1 0)]
+              (do 0 (__kotoba_invoke_string$arity1 f 123)))}
+    {:name '__kotoba_lambda_1_arity1 :params ['x] :param-types [:i64]
+     :result :string :effects #{} :body "done"}
+    {:name '__kotoba_invoke_string$arity1
+     :params ['__kotoba_closure_string_1 '__kotoba_invoke_arg_0]
+     :param-types [:i64 :i64] :result :string :effects #{}
+     :body '(if (= (pair-first __kotoba_closure_string_1) 1)
+              (__kotoba_lambda_1_arity1 __kotoba_invoke_arg_0)
+              (if (= (quot 1 0) 0) "" ""))}]})
+
+(deftest compiler-closure-dispatchers-guard-the-physical-pair-handle
+  (let [closure-kir closure-dispatcher-kir
+        source (script/emit closure-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.main()!=='done')process.exit(2)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source
+                       "k$__kotoba_closure_string_1$1=assertClosure(k$__kotoba_closure_string_1$1);"))
+    (is (not (str/includes? source
+                            "k$__kotoba_closure_string_1$1=assertI64(k$__kotoba_closure_string_1$1);")))
+    (is (= source (script/emit closure-kir)))))
+
+(def closure-refinement-kir
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main 'consume] :effects #{}
+   :functions
+   [{:name 'main :params [] :param-types [] :result :i64 :effects #{}
+     :body '(consume (make))}
+    {:name 'make :params [] :param-types [] :closure-result? true
+     :result :i64 :effects #{} :body '(pair 7 0)}
+    {:name 'consume :params ['f] :param-types [:i64]
+     :closure-param-indexes [0]
+     :result :i64 :effects #{} :body '(pair-first f)}]})
+
+(deftest closure-parameter-refinements-guard-nondispatcher-functions
+  (let [closure-kir closure-refinement-kir
+        source (script/emit closure-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.main()!==7n)process.exit(2);"
+                "try{x.consume(Object.freeze([7n,9n]));process.exit(3)}catch(e){"
+                "if(e.message!=='invalid-closure-capture-chain')process.exit(4)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "return assertClosure(Object.freeze([7n,0n]));"))
+    (is (str/includes? source "k$f$1=assertClosure(k$f$1);"))
+    (is (not (str/includes? source "k$f$1=assertI64(k$f$1);")))))
+
+(deftest malformed-closure-parameter-refinements-are-rejected
+  (let [base {:format :kotoba.kir/v4 :entry 'main :exports ['main] :effects #{}
+              :functions [{:name 'main :params ['value] :param-types [:i64]
+                           :closure-param-indexes [0]
+                           :result :i64 :effects #{} :body 'value}]}]
+    (doseq [indexes [[1] [0 0] [0 -1] ["0"]]]
+      (testing (pr-str indexes)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"KIR function type signature is invalid"
+             (script/emit (assoc-in base [:functions 0 :closure-param-indexes]
+                                    indexes))))))
+    (testing "metadata is typed-KIR-only"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"KIR function type signature is invalid"
+           (script/emit (assoc base :format :kotoba.kir/v3)))))))
+
+(deftest malformed-closure-result-refinements-are-rejected
+  (let [base {:format :kotoba.kir/v4 :entry 'main :exports ['main] :effects #{}
+              :functions [{:name 'main :params [] :param-types []
+                           :closure-result? true
+                           :result :i64 :effects #{} :body '(pair 1 0)}]}]
+    (doseq [value [false 1 :yes]]
+      (testing (pr-str value)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"KIR function type signature is invalid"
+             (script/emit (assoc-in base [:functions 0 :closure-result?]
+                                    value))))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"KIR function type signature is invalid"
+         (script/emit (assoc-in base [:functions 0 :result] :string))))))
+
+(def pair-chain-kir
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main 'first-arg] :effects #{}
+   :functions
+   [{:name 'main :params [] :param-types [] :result :i64 :effects #{}
+     :body '(first-arg (pair 7 (pair 8 0)))}
+    {:name 'first-arg :params ['args] :param-types [:i64]
+     :i64-pair-chain-param-indexes [0]
+     :result :i64 :effects #{} :body '(pair-first args)}]})
+
+(deftest i64-pair-chain-parameter-refinements-are-checked
+  (let [program pair-chain-kir
+        source (script/emit program)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.main()!==7n)process.exit(2);"
+                "try{x['first-arg'](7n);process.exit(3)}catch(e){"
+                "if(e.message!=='invalid-i64-pair-chain')process.exit(4)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "k$args$1=assertI64PairChain(k$args$1);"))))
+
+(deftest malformed-i64-pair-chain-parameter-refinements-are-rejected
+  (let [base {:format :kotoba.kir/v4 :entry 'main :exports ['main] :effects #{}
+              :functions [{:name 'main :params ['value] :param-types [:i64]
+                           :i64-pair-chain-param-indexes [0]
+                           :result :i64 :effects #{} :body 'value}]}]
+    (doseq [indexes [[1] [0 0] [0 -1] ["0"]]]
+      (testing (pr-str indexes)
+        (is (thrown-with-msg?
+             kerror/ExceptionInfo #"KIR function type signature is invalid"
+             (script/emit (assoc-in base [:functions 0 :i64-pair-chain-param-indexes]
+                                    indexes))))))
+    (testing "pair-chain and closure refinements cannot overlap"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"KIR function type signature is invalid"
+           (script/emit (assoc-in base [:functions 0 :closure-param-indexes] [0])))))
+    (testing "metadata is typed-KIR-only"
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"KIR function type signature is invalid"
+           (script/emit (assoc base :format :kotoba.kir/v3)))))))
+
+(deftest ambient-access-guard-catches-real-reach-out
+  (testing "the guard fires on each ambient access form"
+    (doseq [leak ["const g=globalThis;" "const d=window.location;"
+                  "document.querySelector('x')" "const v=eval('1+1');"
+                  "new DOMParser().parseFromString(s)" "await fetch('http://x')"
+                  "new XMLHttpRequest()" "const w=window['location'];"]]
+      (is (re-find ambient-access-pattern leak) (str "missed: " leak))))
+  (testing "and not on the emitter's own error codes or ordinary identifiers"
+    (doseq [benign ["throw new Error('document-read-string')"
+                    "throw new Error('document-read-hex-odd')"
+                    "const documentBytes=0;" "const evaluated=1;"
+                    "obj.fetchCount=2;" "let prefetch=3;"]]
+      (is (not (re-find ambient-access-pattern benign)) (str "false positive: " benign)))))
+
+(def shadow-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['shadow 'sequential 'nested]
+   :effects #{}
+   :functions
+   [{:name 'shadow :params ['y] :param-types [:i64] :result :i64 :effects #{}
+     :body '(let [y (if (< y 0) (- y) y)] y)}
+    {:name 'sequential :params ['x] :param-types [:i64] :result :i64 :effects #{}
+     :body '(let [x (+ x 1) y (+ x 1) x (+ y 1)] x)}
+    {:name 'nested :params ['x] :param-types [:i64] :result :i64 :effects #{}
+     :body '(let [x (+ x 1)] (let [x (+ x 1)] x))}]})
+
+(deftest lexical-bindings-have-unique-js-names
+  (let [source (script/emit shadow-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.shadow(-5n)!==5n)process.exit(2);"
+                "if(x.sequential(1n)!==4n)process.exit(3);"
+                "if(x.nested(1n)!==3n)process.exit(4)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "function k$shadow(k$y$1)"))
+    (is (str/includes? source "const k$y$2="))
+    (is (= source (script/emit shadow-kir)))))
+
+(def i32-profile-kir
+  (let [functions
+        (mapv (fn [[name params body]]
+                {:name name :params params :param-types (vec (repeat (count params) :i64))
+                 :result :i64 :effects #{} :body body})
+              [['signed ['x] '(i32-wrap x)]
+               ['unsigned ['x] '(u32-wrap x)]
+               ['add ['x 'y] '(i32-wrapping-add x y)]
+               ['mul ['x 'y] '(i32-wrapping-mul x y)]
+               ['xor ['x 'y] '(i32-xor x y)]
+               ['shl ['x] '(i32-shift-left x 31)]
+               ['shr ['x] '(i32-shift-right x 31)]
+               ['ushr ['x] '(u32-shift-right x 1)]
+               ['next ['x] '(xorshift32 x)]])]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports (mapv :name functions) :effects #{}
+     :functions functions}))
+
+(deftest i32-wrapping-shift-and-xorshift-profile-is-explicit
+  (let [source (script/emit i32-profile-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.signed(4294967295n)!==-1n||x.unsigned(-1n)!==4294967295n)process.exit(2);"
+                "if(x.add(2147483647n,1n)!==-2147483648n||x.mul(2147483647n,2n)!==-2n)process.exit(3);"
+                "if(x.xor(-1n,2147483647n)!==-2147483648n||x.shl(1n)!==-2147483648n)process.exit(4);"
+                "if(x.shr(-2147483648n)!==-1n||x.ushr(-1n)!==2147483647n)process.exit(5);"
+                "if(x.next(1n)!==270369n||x.next(270369n)!==67634689n||x.next(67634689n)!==2647435461n)process.exit(6);"
+                "})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const xorshift32="))
+    (is (str/includes? source "BigInt.asIntN(32")))
+  (doseq [count [-1 32]]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"integer literal"
+                          (script/emit
+                           {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                            :functions [{:name 'bad :params ['x] :param-types [:i64]
+                                         :result :i64 :effects #{}
+                                         :body (list 'i32-shift-left 'x count)}]})))))
+
+(def f64-bits-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['bits 'from-bits 'negative-zero 'infinity 'nan-bits]
+   :effects #{}
+   :functions
+   [{:name 'bits :params ['value] :param-types [:f64]
+     :result :i64 :effects #{} :body '(f64-to-bits value)}
+    {:name 'from-bits :params ['value] :param-types [:i64]
+     :result :f64 :effects #{} :body '(f64-from-bits value)}
+    {:name 'negative-zero :params [] :param-types []
+     :result :f64 :effects #{} :body -0.0}
+    {:name 'infinity :params [] :param-types []
+     :result :f64 :effects #{} :body Double/POSITIVE_INFINITY}
+    {:name 'nan-bits :params [] :param-types []
+     :result :i64 :effects #{} :body '(f64-to-bits ##NaN)}]})
+
+(deftest floating-point-f64-bit-profile-is-explicit-and-sealed
+  (let [source (script/emit f64-bits-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.bits(1.5)!==4609434218613702656n)process.exit(2);"
+                "if(x.bits(-0)!==-9223372036854775808n)process.exit(3);"
+                "if(!Object.is(x['negative-zero'](),-0))process.exit(4);"
+                "if(x.infinity()!==Infinity)process.exit(5);"
+                "if(x['nan-bits']()!==9221120237041090560n)process.exit(6);"
+                "if(!Number.isNaN(x['from-bits'](9221120237041090560n)))process.exit(7);"
+                "try{x.bits(1n);process.exit(8)}catch(e){}console.log('f64-ok')})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (= "ieee-754-f32-f64-v7" script/floating-point-policy))
+    (is (str/includes? source "floatingPointPolicy:'ieee-754-f32-f64-v7'"))
+    (is (zero? (:exit result)) (:err result))
+    (is (= "f64-ok\n" (:out result)))
+    (is (str/includes? source "f64ToBits")))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"type mismatch"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params ['x] :param-types [:f64]
+                                       :result :i64 :effects #{} :body 'x}]}))))
+
+(def f64-arithmetic-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['add 'divide 'neg 'absolute 'equal 'less 'unordered 'nan-bits]
+   :effects #{}
+   :functions
+   [{:name 'add :params ['x 'y] :param-types [:f64 :f64]
+     :result :f64 :effects #{} :body '(f64-add x y)}
+    {:name 'divide :params ['x 'y] :param-types [:f64 :f64]
+     :result :f64 :effects #{} :body '(f64-div x y)}
+    {:name 'neg :params ['x] :param-types [:f64]
+     :result :f64 :effects #{} :body '(f64-neg x)}
+    {:name 'absolute :params ['x] :param-types [:f64]
+     :result :f64 :effects #{} :body '(f64-abs x)}
+    {:name 'equal :params ['x 'y] :param-types [:f64 :f64]
+     :result :bool :effects #{} :body '(f64-eq x y)}
+    {:name 'less :params ['x 'y] :param-types [:f64 :f64]
+     :result :bool :effects #{} :body '(f64-lt x y)}
+    {:name 'unordered :params ['x 'y] :param-types [:f64 :f64]
+     :result :bool :effects #{} :body '(f64-unordered x y)}
+    {:name 'nan-bits :params [] :param-types []
+     :result :i64 :effects #{}
+     :body '(f64-to-bits (f64-div (f64-from-bits 0) (f64-from-bits 0)))}]})
+
+(deftest f64-arithmetic-has-explicit-ieee-special-value-semantics
+  (let [source (script/emit f64-arithmetic-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "if(x.add(0.1,0.2)!==0.30000000000000004)process.exit(2);"
+                     "if(x.divide(1,0)!==Infinity||!Number.isNaN(x.divide(0,0)))process.exit(3);"
+                     "if(!Object.is(x.neg(0),-0)||!Object.is(x.absolute(-0),0))process.exit(4);"
+                     "if(!x.equal(0,-0)||x.equal(NaN,NaN)||!x.less(-1,0))process.exit(5);"
+                     "if(!x.unordered(NaN,1)||x.unordered(1,2))process.exit(6);"
+                     "if(x['nan-bits']()!==9221120237041090560n)process.exit(7)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(deftest direct-floating-ordered-collections-fail-closed
+  (doseq [type [[:set :f64] [:map :keyword :f64] [:map :f32 :i64]]]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"direct floating"
+         (script/emit
+          {:format :kotoba.kir/v4 :entry nil :exports [] :effects #{}
+           :functions [{:name 'value :params [] :param-types [] :result type
+                        :effects #{} :body 0}]})))))
+
+(def f64-i64-conversion-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['to-f64 'rounded 'to-i64 'truncating]
+   :effects #{}
+   :functions
+   [{:name 'to-f64 :params ['x] :param-types [:i64]
+     :result :f64 :effects #{} :body '(i64-to-f64-checked x)}
+    {:name 'rounded :params ['x] :param-types [:i64]
+     :result :f64 :effects #{} :body '(i64-to-f64-rounded x)}
+    {:name 'to-i64 :params ['x] :param-types [:f64]
+     :result :i64 :effects #{} :body '(f64-to-i64-checked x)}
+    {:name 'truncating :params ['x] :param-types [:f64]
+     :result :i64 :effects #{} :body '(f64-to-i64-truncating x)}]})
+
+(deftest f64-i64-conversions-distinguish-exact-rounded-and-truncating
+  (let [source (script/emit f64-i64-conversion-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "if(x['to-f64'](9007199254740992n)!==9007199254740992)process.exit(2);"
+                     "try{x['to-f64'](9007199254740993n);process.exit(3)}catch(e){}"
+                     "if(x.rounded(9007199254740993n)!==9007199254740992)process.exit(4);"
+                     "if(x['to-i64'](-0)!==0n||x['to-i64'](42)!==42n)process.exit(5);"
+                     "for(const v of [1.5,NaN,Infinity,9223372036854775808])"
+                     "{try{x['to-i64'](v);process.exit(6)}catch(e){}}"
+                     "if(x.truncating(1.9)!==1n||x.truncating(-1.9)!==-1n)process.exit(7);"
+                     "for(const v of [NaN,Infinity,-Infinity,9223372036854775808])"
+                     "{try{x.truncating(v);process.exit(8)}catch(e){}}})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def f32-profile-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['from-bits 'bits 'rounded 'widen 'add 'divide 'unordered
+             'to-f32 'rounded-i64 'to-i64 'truncating]
+   :effects #{}
+   :functions
+   [{:name 'from-bits :params ['x] :param-types [:i64]
+     :result :f32 :effects #{} :body '(f32-from-bits x)}
+    {:name 'bits :params ['x] :param-types [:f32]
+     :result :i64 :effects #{} :body '(f32-to-bits x)}
+    {:name 'rounded :params ['x] :param-types [:f64]
+     :result :f32 :effects #{} :body '(f64-to-f32-rounded x)}
+    {:name 'widen :params ['x] :param-types [:f32]
+     :result :f64 :effects #{} :body '(f32-to-f64-exact x)}
+    {:name 'add :params ['x 'y] :param-types [:f32 :f32]
+     :result :f32 :effects #{} :body '(f32-add x y)}
+    {:name 'divide :params ['x 'y] :param-types [:f32 :f32]
+     :result :f32 :effects #{} :body '(f32-div x y)}
+    {:name 'unordered :params ['x 'y] :param-types [:f32 :f32]
+     :result :bool :effects #{} :body '(f32-unordered x y)}
+    {:name 'to-f32 :params ['x] :param-types [:i64]
+     :result :f32 :effects #{} :body '(i64-to-f32-checked x)}
+    {:name 'rounded-i64 :params ['x] :param-types [:i64]
+     :result :f32 :effects #{} :body '(i64-to-f32-rounded x)}
+    {:name 'to-i64 :params ['x] :param-types [:f32]
+     :result :i64 :effects #{} :body '(f32-to-i64-checked x)}
+    {:name 'truncating :params ['x] :param-types [:f32]
+     :result :i64 :effects #{} :body '(f32-to-i64-truncating x)}]})
+
+(deftest f32-is-an-explicitly-rounded-scalar-profile
+  (let [source (script/emit f32-profile-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({}),one=x['from-bits'](1065353216n),"
+                     "negz=x['from-bits'](-2147483648n),nan=x['from-bits'](2143289344n);"
+                     "if(one!==1||!Object.is(negz,-0)||x.bits(nan)!==2143289344n)process.exit(2);"
+                     "const tenth=x.rounded(0.1);if(x.bits(tenth)!==1036831949n)process.exit(3);"
+                     "if(x.widen(tenth)!==0.10000000149011612)process.exit(4);"
+                     "if(x.bits(x.add(one,tenth))!==1066192077n)process.exit(5);"
+                     "if(x.divide(one,x['from-bits'](0n))!==Infinity||!x.unordered(nan,one))process.exit(6);"
+                     "if(x['to-f32'](16777216n)!==16777216)process.exit(7);"
+                     "try{x['to-f32'](16777217n);process.exit(8)}catch(e){}"
+                     "if(x['rounded-i64'](16777217n)!==16777216)process.exit(9);"
+                     "if(x['to-i64'](one)!==1n||x.truncating(x.rounded(1.9))!==1n)process.exit(10);"
+                     "try{x['to-i64'](tenth);process.exit(11)}catch(e){}})"
+                     ".catch(e=>{console.error(e.message);process.exit(99)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def float-sqrt-min-max-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['f32-s 'f32-lo 'f32-hi 'f64-s 'f64-lo 'f64-hi]
+   :effects #{}
+   :functions
+   [{:name 'f32-s :params ['x] :param-types [:f32] :result :f32
+     :effects #{} :body '(f32-sqrt x)}
+    {:name 'f32-lo :params ['x 'y] :param-types [:f32 :f32] :result :f32
+     :effects #{} :body '(f32-min x y)}
+    {:name 'f32-hi :params ['x 'y] :param-types [:f32 :f32] :result :f32
+     :effects #{} :body '(f32-max x y)}
+    {:name 'f64-s :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-sqrt x)}
+    {:name 'f64-lo :params ['x 'y] :param-types [:f64 :f64] :result :f64
+     :effects #{} :body '(f64-min x y)}
+    {:name 'f64-hi :params ['x 'y] :param-types [:f64 :f64] :result :f64
+     :effects #{} :body '(f64-max x y)}]})
+
+(deftest floating-sqrt-min-max-have-sealed-special-value-semantics
+  (let [source (script/emit float-sqrt-min-max-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({}),p=Math.fround(0),n=Math.fround(-0);"
+                     "if(x['f32-s'](Math.fround(4))!==2||!Number.isNaN(x['f32-s'](Math.fround(-1))))process.exit(2);"
+                     "if(!Object.is(x['f32-lo'](p,n),-0)||!Object.is(x['f32-hi'](p,n),0))process.exit(3);"
+                     "if(!Number.isNaN(x['f32-lo'](NaN,p))||!Number.isNaN(x['f32-hi'](p,NaN)))process.exit(4);"
+                     "if(x['f64-s'](4)!==2||!Number.isNaN(x['f64-s'](-1)))process.exit(5);"
+                     "if(!Object.is(x['f64-lo'](0,-0),-0)||!Object.is(x['f64-hi'](0,-0),0))process.exit(6);"
+                     "if(!Number.isNaN(x['f64-lo'](NaN,0))||!Number.isNaN(x['f64-hi'](0,NaN)))process.exit(7)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def quarter-turn-trig-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['sin 'cos] :effects #{}
+   :functions
+   [{:name 'sin :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-sin-quarter-turn x)}
+    {:name 'cos :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-cos-quarter-turn x)}]})
+
+(deftest bounded-trigonometry-has-a-deterministic-error-contract
+  (let [source (script/emit quarter-turn-trig-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({}),q=Math.PI/4;"
+                     "if(x.sin(q)!==0.7071067811865475||x.cos(q)!==0.7071067811865476)process.exit(2);"
+                     "if(!Object.is(x.sin(-0),-0)||x.cos(-0)!==1)process.exit(3);"
+                     "for(let i=0;i<=128;i++){const v=-q+2*q*i/128;"
+                     "if(Math.abs(x.sin(v)-Math.sin(v))>4e-15||Math.abs(x.cos(v)-Math.cos(v))>4e-15)process.exit(4);}"
+                     "for(const v of [NaN,Infinity,-Infinity,q+Number.EPSILON,-q-Number.EPSILON])"
+                     "{for(const f of [x.sin,x.cos]){try{f(v);process.exit(5)}catch(e){"
+                     "if(e.message!=='f64-quarter-turn-domain')process.exit(6)}}}})"
+                     ".catch(e=>{console.error(e.message);process.exit(99)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def bounded-trig-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['sin 'cos] :effects #{}
+   :functions
+   [{:name 'sin :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-sin-bounded x)}
+    {:name 'cos :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-cos-bounded x)}]})
+
+(deftest bounded-wide-angle-trigonometry-has-explicit-range-reduction
+  (let [source (script/emit bounded-trig-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({}),limit=8192*Math.PI;"
+                     "for(const v of [0,-0,Math.PI/2,-Math.PI/2,Math.PI,-Math.PI,limit,-limit]){"
+                     "if(Math.abs(x.sin(v)-Math.sin(v))>5e-12||Math.abs(x.cos(v)-Math.cos(v))>5e-12)process.exit(2);}"
+                     "for(let i=0;i<=128;i++){const v=-limit+2*limit*i/128;"
+                     "if(Math.abs(x.sin(v)-Math.sin(v))>5e-12||Math.abs(x.cos(v)-Math.cos(v))>5e-12)process.exit(3);}"
+                     "if(!Object.is(x.sin(-0),-0)||x.cos(-0)!==1)process.exit(4);"
+                     "for(const v of [NaN,Infinity,-Infinity,limit+Number.EPSILON*limit,-limit-Number.EPSILON*limit])"
+                     "{for(const f of [x.sin,x.cos]){try{f(v);process.exit(5)}catch(e){"
+                     "if(e.message!=='f64-bounded-angle-domain')process.exit(6)}}}})"
+                     ".catch(e=>{console.error(e.message);process.exit(99)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def near-zero-exp-log-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['exp 'log] :effects #{}
+   :functions
+   [{:name 'exp :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-exp-near-zero x)}
+    {:name 'log :params ['x] :param-types [:f64] :result :f64
+     :effects #{} :body '(f64-log-near-one x)}]})
+
+(deftest bounded-exp-and-log-have-fixed-polynomial-contracts
+  (let [source (script/emit near-zero-exp-log-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "for(let i=0;i<=128;i++){const v=-0.5+i/128;"
+                     "if(Math.abs(x.exp(v)-Math.exp(v))>4e-15)process.exit(2);}"
+                     "for(let i=0;i<=128;i++){const v=0.75+0.75*i/128;"
+                     "if(Math.abs(x.log(v)-Math.log(v))>4e-15)process.exit(3);}"
+                     "if(x.exp(0)!==1||!Object.is(x.log(1),0))process.exit(4);"
+                     "for(const [f,values,message] of [[x.exp,[NaN,Infinity,-Infinity,0.5000000000000001],"
+                     "'f64-exp-near-zero-domain'],[x.log,[NaN,Infinity,-Infinity,0,0.7499999999999999,1.5000000000000002],"
+                     "'f64-log-near-one-domain']]){for(const v of values){try{f(v);process.exit(5)}catch(e){"
+                     "if(e.message!==message)process.exit(6)}}}})"
+                     ".catch(e=>{console.error(e.message);process.exit(99)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def atan2-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['atan2] :effects #{}
+   :functions [{:name 'atan2 :params ['y 'x] :param-types [:f64 :f64]
+                :result :f64 :effects #{} :body '(f64-atan2-bounded y x)}]})
+
+(deftest bounded-atan2-has-a-fixed-finite-domain-contract
+  (let [source (script/emit atan2-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const f=m.instantiateKotoba({}).atan2;"
+                     "for(const y of [-1e300,-7,-1,-0,0,1,7,1e300])for(const x of [-1e300,-9,-1,-0,0,1,9,1e300]){"
+                     "if(Math.abs(f(y,x)-Math.atan2(y,x))>2e-15)process.exit(2);}"
+                     "if(!Object.is(f(-0,1),-0)||f(0,-1)!==Math.PI||f(-0,-1)!==-Math.PI)process.exit(3);"
+                     "for(const p of [[NaN,1],[1,NaN],[Infinity,1],[1,-Infinity]])try{f(...p);process.exit(4)}"
+                     "catch(e){if(e.message!=='f64-atan2-bounded-domain')process.exit(5)}})"
+                     ".catch(e=>{console.error(e.message);process.exit(99)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def wide-exp-log-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['exp 'log] :effects #{}
+   :functions [{:name 'exp :params ['x] :param-types [:f64] :result :f64
+                :effects #{} :body '(f64-exp-bounded x)}
+               {:name 'log :params ['x] :param-types [:f64] :result :f64
+                :effects #{} :body '(f64-log-bounded x)}]})
+
+(deftest wide-exp-and-log-use-fixed-binary-scaling
+  (let [source (script/emit wide-exp-log-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({}),limit=512*Math.LN2;"
+                     "for(let i=0;i<=128;i++){const v=-limit+2*limit*i/128,a=x.exp(v),b=Math.exp(v);"
+                     "if(Math.abs(a-b)/b>1e-13)process.exit(2);}"
+                     "for(let i=-512;i<=512;i+=8){const v=2**i;"
+                     "if(Math.abs(x.log(v)-Math.log(v))>1e-13)process.exit(3);}"
+                     "if(x.exp(0)!==1||!Object.is(x.log(1),0))process.exit(4);"
+                     "for(const [f,vals,msg] of [[x.exp,[NaN,Infinity,-Infinity,limit+Number.EPSILON*limit],"
+                     "'f64-exp-bounded-domain'],[x.log,[NaN,Infinity,-Infinity,0,2**-513,2**513],"
+                     "'f64-log-bounded-domain']])for(const v of vals)try{f(v);process.exit(5)}catch(e){"
+                     "if(e.message!==msg)process.exit(6)}})"
+                     ".catch(e=>{console.error(e.message);process.exit(99)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def cap-call-v3-kir
+  {:format :kotoba.kir/v3 :entry 'main
+   :effects #{[:cap/call 7]}
+   :functions [{:name 'main :params [] :body '(cap-call 7 4)}]})
+
+(deftest capabilities-fail-closed
+  (let [source (script/emit cap-call-v3-kir)]
+    (is (re-find #"requiredCapabilities:Object.freeze\(\[7\]\)" source))
+    (is (re-find #"capability-denied" source))))
+
+(def typed-cap-call-i64-kir
+  {:format :kotoba.kir/v4 :entry 'main :effects #{[:cap/call 7]}
+   :functions [{:name 'main :params [] :param-types [] :result :i64
+                :body '(typed-cap-call 7 :i64 :i64 0)}]})
+
+(deftest typed-cap-call-i64-hosts-as-call-capability
+  (let [source (script/emit typed-cap-call-i64-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({7:(_v)=>99});"
+                "if(x.main()!==99n)process.exit(2)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (str/includes? source "callCapability(7,"))
+    (is (zero? (:exit result)) (:err result))))
+
+(def typed-cap-call-variant-kir
+  (let [request [:variant :kotoba.dataspace/request [[:facet-enter :bool] [:facet-leave :i64]]]
+        result [:variant :kotoba.dataspace/result
+                [[:facet [:record :kotoba.dataspace/facet [[:id :i64]]]]
+                 [:error [:record :kotoba.dataspace/error
+                          [[:code :keyword] [:message :string]]]]]]]
+    {:format :kotoba.kir/v4 :entry 'main :effects #{[:cap/call 24]}
+     :functions [{:name 'main :params [] :param-types [] :result :i64
+                  :body (list 'let ['answer
+                                    (list 'typed-cap-call 24 request result
+                                          (list 'variant-new request :facet-enter false))]
+                              (list 'variant-match result 'answer
+                                    [[:facet 'f (list 'record-get
+                                                      [:record :kotoba.dataspace/facet [[:id :i64]]]
+                                                      'f :id)]
+                                     [:error 'e 0]]))}]}))
+
+(def typed-cap-call-string-kir
+  {:format :kotoba.kir/v4 :entry 'main :effects #{[:cap/call 4]}
+   :functions [{:name 'main :params [] :param-types [] :result :string
+                :body '(typed-cap-call 4 :string :string "x")}]})
+
+(deftest typed-cap-call-interns-host-document-and-variant-results
+  (let [source (script/emit typed-cap-call-variant-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({24:(req,contract)=>{"
+                "if(req[1]!==':facet-enter')process.exit(3);"
+                "const rec=contract.result[2].find(([n])=>n===':facet')[1];"
+                "return [contract.result,':facet',[rec,1n]];}});"
+                "if(x.main()!==1n)process.exit(2)})")
+        probe (run-node "node" "--input-type=module" "-e" js)]
+    (is (str/includes? source "callTypedCapability(24,"))
+    (is (zero? (:exit probe)) (:err probe)))
+  (let [source (script/emit typed-cap-call-string-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({4:(v)=>v+'!'});"
+                "if(x.main()!=='x!')process.exit(2)})")
+        probe (run-node "node" "--input-type=module" "-e" js)]
+    (is (str/includes? source "callTypedCapability(4,"))
+    (is (zero? (:exit probe)) (:err probe))))
+
+(def ^{:emit-opts {:module-graph-digest (apply str (repeat 64 "a"))
+                   :module-source-digests {'example.text (apply str (repeat 64 "b"))
+                                           'example.app (apply str (repeat 64 "c"))}}}
+  module-graph-kir
+  "`kir` emitted with module-graph identity options (see the var metadata)."
+  kir)
+
+(deftest module-graph-identity-is-frozen-into-the-esm-artifact
+  (let [a (apply str (repeat 64 "a"))
+        b (apply str (repeat 64 "b"))
+        c (apply str (repeat 64 "c"))
+        source (script/emit module-graph-kir (:emit-opts (meta #'module-graph-kir)))]
+    (is (str/includes? source (str "moduleGraphDigest:\"" a "\"")))
+    (is (re-find #"moduleSourceDigests:Object.freeze\(\{\"example.app\":" source))
+    (is (< (.indexOf source "\"example.app\"") (.indexOf source "\"example.text\"")))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"supplied together"
+                          (script/emit kir {:module-graph-digest a})))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"canonical SHA-256"
+                          (script/emit kir {:module-graph-digest "bad"
+                                            :module-source-digests {'example.app c}})))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"source digests are invalid"
+                          (script/emit kir {:module-graph-digest a
+                                            :module-source-digests {"example.app" c}})))))
+
+(def ^{:emit-opts {:package-lock-digest (apply str (repeat 64 "a"))
+                   :trust-policy-digest (apply str (repeat 64 "b"))
+                   :package-receipt-digest (apply str (repeat 64 "c"))}}
+  supply-chain-kir
+  "`kir` emitted with supply-chain identity options (see the var metadata)."
+  kir)
+
+(deftest supply-chain-identity-is-frozen-into-the-esm-artifact
+  (let [a (apply str (repeat 64 "a"))
+        b (apply str (repeat 64 "b"))
+        c (apply str (repeat 64 "c"))
+        source (script/emit supply-chain-kir (:emit-opts (meta #'supply-chain-kir)))]
+    (is (str/includes? source (str "packageLockDigest:\"" a "\"")))
+    (is (str/includes? source (str "trustPolicyDigest:\"" b "\"")))
+    (is (str/includes? source (str "packageReceiptDigest:\"" c "\"")))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"must be supplied together"
+                          (script/emit kir {:package-lock-digest a})))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"canonical SHA-256"
+                          (script/emit kir {:package-lock-digest a
+                                            :trust-policy-digest "bad"
+                                            :package-receipt-digest c})))))
+
+(def equality-v3-kir
+  {:format :kotoba.kir/v3 :entry 'main :effects #{}
+   :functions [{:name 'main :params [] :body '(= 1 2)}]})
+
+(def pair-equality-v3-kir
+  {:format :kotoba.kir/v3 :entry 'main :effects #{}
+   :functions [{:name 'main :params []
+                :body '(if (= (pair 1 0) 0) 1 2)}]})
+
+(def explicit-exports-kir (assoc kir :exports ['main]))
+
+(def library-kir
+  {:format :kotoba.kir/v3 :entry nil :exports ['add1]
+   :effects #{}
+   :functions [{:name 'add1 :params ['x] :body '(+ x 1)}]})
+
+(deftest equality-is-comparison-and-grants-are-exact
+  (let [source (script/emit equality-v3-kir)]
+    (is (re-find #"valueEqual\(1n,2n\)" source))
+    (is (not (re-find #"1n = 2n" source)))
+    (is (re-find #"capability-grant-mismatch" source))))
+
+(deftest equality-between-pair-values-and-scalars-is-false
+  (let [source (script/emit pair-equality-v3-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{if(m.instantiateKotoba({}).main()!==2n)process.exit(2)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))))
+
+(deftest explicit-exports-hide-internal-functions
+  (let [source (script/emit explicit-exports-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.main()!==42n||Object.hasOwn(x,'add1'))process.exit(2)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (not (re-find #"'add1':k\$add1" source))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"exports are invalid"
+                        (script/emit (assoc kir :exports ['missing])))))
+
+(deftest library-module-needs-exports-but-not-an-entry
+  (let [source (script/emit library-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(m.kotobaArtifact.entry!==null||x.add1(41n)!==42n)process.exit(2)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (re-find #"entry:null" source)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"exports are invalid"
+                        (script/emit {:format :kotoba.kir/v3 :entry nil
+                                      :effects #{} :functions []}))))
+
+(def bounded-strings-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['greet 'byte-length]
+   :effects #{}
+   :functions [{:name 'greet :params ['name] :param-types [:string]
+                :result :string :effects #{}
+                :body '(string-concat "こんにちは、" name)}
+               {:name 'byte-length :params ['value] :param-types [:string]
+                :result :i64 :effects #{}
+                :body '(string-byte-length value)}]})
+
+(deftest typed-bounded-strings-preserve-values-through-the-frozen-api
+  (let [source (script/emit bounded-strings-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.greet('言葉')!=='こんにちは、言葉')process.exit(2);"
+                "if(x['byte-length']('言葉')!==6n)process.exit(3);"
+                "try{x.greet(1n);process.exit(4)}catch(e){if(e.message!=='invalid-string')process.exit(5)}"
+                "try{x.greet('x'.repeat(65536));process.exit(6)}catch(e){if(e.message!=='string-too-large')process.exit(7)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (re-find #"kirFormat:'v4'" source))
+    (is (re-find #"valueProfile:'typed-v1'" source))
+    (is (re-find #"stringLimits:Object.freeze\(\{literalBytes:65536,moduleLiteralBytes:65536,valueBytes:65536\}\)"
+                 source))
+    (is (re-find #"invalid-utf16" source)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"type mismatch"
+                        (script/emit {:format :kotoba.kir/v4 :entry nil :exports ['bad]
+                                      :effects #{}
+                                      :functions [{:name 'bad :params [] :param-types []
+                                                   :result :string :effects #{} :body 1}]})))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"exceeds? byte limit"
+                        (script/emit {:format :kotoba.kir/v4 :entry nil :exports ['large]
+                                      :effects #{}
+                                      :functions [{:name 'large :params [] :param-types []
+                                                   :result :string :effects #{}
+                                                   :body (apply str (repeat 65537 "x"))}]})))
+  (let [unpaired (String. (char-array [(char 0xd800)]))]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"unpaired high surrogate"
+                          (script/emit {:format :kotoba.kir/v4 :entry nil :exports ['bad]
+                                        :effects #{}
+                                        :functions [{:name 'bad :params [] :param-types []
+                                                     :result :string :effects #{} :body unpaired}]})))))
+
+(def string-replace-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['replace]
+   :effects #{}
+   :functions [{:name 'replace :params ['value 'needle 'replacement]
+                :param-types [:string :string :string]
+                :result :string :effects #{}
+                :body '(string-replace-all value needle replacement)}]})
+
+(deftest bounded-string-replacement-is-literal-and-fails-closed
+  (let [source (script/emit string-replace-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.replace('a.$a.$','.','$')!=='a$$a$$')process.exit(2);"
+                "try{x.replace('abc','','x');process.exit(3)}"
+                "catch(e){if(e.message!=='empty-string-replacement-needle')process.exit(4)}"
+                "try{x.replace('x'.repeat(40000),'x','xx');process.exit(5)}"
+                "catch(e){if(e.message!=='string-too-large')process.exit(6)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "stringReplaceAll")))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"type mismatch"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params ['value]
+                                       :param-types [:string] :result :string :effects #{}
+                                       :body '(string-replace-all value 1 "x")}]}))))
+
+(def string-contains-fold-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['contains 'fold 'contains-fold]
+   :effects #{}
+   :functions [{:name 'contains :params ['haystack 'needle]
+                :param-types [:string :string] :result :bool :effects #{}
+                :body '(string-contains? haystack needle)}
+               {:name 'fold :params ['value] :param-types [:string]
+                :result :string :effects #{}
+                :body '(string-fold-case value)}
+               {:name 'contains-fold :params ['haystack 'needle]
+                :param-types [:string :string] :result :bool :effects #{}
+                :body '(string-contains? (string-fold-case haystack)
+                                         (string-fold-case needle))}]})
+
+(deftest bounded-string-contains-and-case-fold-compose-for-case-insensitive-search
+  (let [source (script/emit string-contains-fold-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.contains('final decision made','decision')!==true)process.exit(2);"
+                "if(x.contains('final decision made','banana')!==false)process.exit(3);"
+                "try{x.contains('abc','');process.exit(4)}"
+                "catch(e){if(e.message!=='empty-string-search-needle')process.exit(5)}"
+                "try{x.contains('','');process.exit(6)}"
+                "catch(e){if(e.message!=='empty-string-search-needle')process.exit(7)}"
+                "if(x.fold('FINAL DECISION')!=='final decision')process.exit(8);"
+                "if(x.fold('CAFÉ')!=='café')process.exit(9);"
+                "if(x.contains('x'.repeat(40000),'y'.repeat(30000))!==false)process.exit(10);"
+                "if(x.contains('This Is The FINAL Decision','final decision')!==false)process.exit(11);"
+                "if(x['contains-fold']('This Is The FINAL Decision','final decision')!==true)process.exit(12);"
+                "if(x['contains-fold']('CAFÉ menu','café')!==true)process.exit(13)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "stringContains"))
+    (is (str/includes? source "stringFoldCase")))
+
+(def string-code-point-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['cp]
+   :effects #{}
+   :functions [{:name 'cp :params ['s 'off]
+                :param-types [:string :i64] :result :i64 :effects #{}
+                :body '(string-code-point-at s off)}]})
+
+(deftest string-code-point-at-decodes-utf8-at-byte-offset
+  (let [source (script/emit string-code-point-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                ;; "aあ𝟘0": a@0=0x61, あ@1=0x3042(3B), 𝟘@4=0x1d7d8(4B), 0@8=0x30
+                "if(x.cp('a\u3042\ud835\udfd80',0n)!==97n)process.exit(2);"
+                "if(x.cp('a\u3042\ud835\udfd80',1n)!==12354n)process.exit(3);"
+                "if(x.cp('a\u3042\ud835\udfd80',4n)!==120792n)process.exit(4);"
+                "if(x.cp('a\u3042\ud835\udfd80',8n)!==48n)process.exit(5);"
+                ;; offset 2 is mid-code-point (continuation byte) -> trap
+                "try{x.cp('a\u3042\ud835\udfd80',2n);process.exit(6)}"
+                "catch(e){if(e.message!=='string-code-point-boundary')process.exit(7)}"
+                ;; offset 9 == byte length -> out of bounds
+                "try{x.cp('a\u3042\ud835\udfd80',9n);process.exit(8)}"
+                "catch(e){if(e.message!=='string-code-point-offset-bounds')process.exit(9)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "stringCodePointAt"))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"type mismatch"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params ['value]
+                                       :param-types [:string] :result :i64 :effects #{}
+                                       :body '(string-contains? value 1)}]})))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"type mismatch"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params ['value]
+                                       :param-types [:i64] :result :string :effects #{}
+                                       :body '(string-fold-case value)}]}))))
+
+(def keywords-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['identity 'same?]
+   :effects #{}
+   :functions [{:name 'identity :params ['value] :param-types [:keyword]
+                :result :keyword :effects #{} :body 'value}
+               {:name 'same? :params ['left 'right]
+                :param-types [:keyword :keyword]
+                ;; profile 5: `=` is :bool
+                :result :bool :effects #{} :body '(= left right)}]})
+
+(deftest typed-keywords-preserve-canonical-text-without-hashing
+  (let [source (script/emit keywords-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.identity(':安全/確認')!==':安全/確認')process.exit(2);"
+                "if(x['same?'](':a',':a')!==true||x['same?'](':a',':b')!==false)process.exit(3);"
+                "try{x.identity('not-a-keyword');process.exit(4)}"
+                "catch(e){if(e.message!=='invalid-keyword')process.exit(5)}"
+                "try{x.identity(1n);process.exit(6)}"
+                "catch(e){if(e.message!=='invalid-keyword')process.exit(7)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "assertKeyword"))
+    (is (str/includes? source "keywordLimits:Object.freeze({valueBytes:512})")))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"different types"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params [] :param-types []
+                                       :result :bool :effects #{} :body '(= :a 1)}]}))))
+
+(def bounded-maps-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['lookup 'update]
+   :effects #{}
+   :functions [{:name 'lookup :params ['value] :param-types [:map]
+                :result :i64 :effects #{} :body '(map-get value :a 0)}
+               {:name 'update :params ['value] :param-types [:map]
+                :result :map :effects #{}
+                :body '(map-assoc value :b 2 :a 3)}]})
+
+(deftest typed-bounded-maps-use-canonical-persistent-keyword-entries
+  (let [source (script/emit bounded-maps-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "const before=[[':a',1n]];const after=x.update(before);"
+                "if(x.lookup(before)!==1n||x.lookup(after)!==3n)process.exit(2);"
+                "if(before[0][1]!==1n||after.length!==2||after[0][0]!==':a'||after[1][0]!==':b')process.exit(3);"
+                "try{x.lookup([[':a',1n],[':a',2n]]);process.exit(4)}"
+                "catch(e){if(e.message!=='duplicate-map-key')process.exit(5)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "mapLimits:Object.freeze({entries:128})"))
+    (is (str/includes? source "const makeMap="))))
+
+(def bool-option-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['negate 'present? 'with-default 'same-option?]
+   :effects #{}
+   :functions
+   [{:name 'negate :params ['value] :param-types [:bool]
+     :result :bool :effects #{} :body '(bool-not value)}
+    {:name 'present? :params ['value] :param-types [:option-i64]
+     :result :bool :effects #{} :body '(option-some? value)}
+    {:name 'with-default :params ['value] :param-types [:option-i64]
+     :result :i64 :effects #{} :body '(option-value value 9)}
+    {:name 'same-option? :params ['left 'right]
+     :param-types [:option-i64 :option-i64]
+     ;; profile 5: `=` is :bool
+     :result :bool :effects #{} :body '(= left right)}]})
+
+(deftest typed-booleans-and-options-never-use-js-truthiness-or-null-sentinels
+  (let [source (script/emit bool-option-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "const none=Object.freeze([false]);const some=Object.freeze([true,7n]);"
+                "if(x.negate(true)!==false||x['present?'](none)!==false||x['present?'](some)!==true)process.exit(2);"
+                "if(x['with-default'](none)!==9n||x['with-default'](some)!==7n)process.exit(3);"
+                "if(x['same-option?'](none,[false])!==true||x['same-option?'](some,[true,7n])!==true)process.exit(4);"
+                "for(const bad of [null,undefined,0n,[false,1n],[true]]){try{x['present?'](bad);process.exit(5)}"
+                "catch(e){if(e.message!=='invalid-option-i64')process.exit(6)}}"
+                "try{x.negate(0n);process.exit(7)}catch(e){if(e.message!=='invalid-bool')process.exit(8)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const optionNone=Object.freeze([false])"))
+    (is (str/includes? source "booleanProfile:'strict-v1'"))
+    (is (str/includes? source "optionProfile:'tagged-i64-v1'"))
+    (is (not (str/includes? source "undefined?"))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"different types"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params [] :param-types []
+                                       :result :i64 :effects #{}
+                                       :body '(= (option-none) false)}]}))))
+
+(def result-i64-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['ok? 'value 'error 'same?]
+   :effects #{}
+   :functions
+   [{:name 'ok? :params ['result] :param-types [:result-i64]
+     :result :bool :effects #{} :body '(result-ok? result)}
+    {:name 'value :params ['result 'fallback] :param-types [:result-i64 :i64]
+     :result :i64 :effects #{} :body '(result-value result fallback)}
+    {:name 'error :params ['result 'fallback] :param-types [:result-i64 :i64]
+     :result :i64 :effects #{} :body '(result-error result fallback)}
+    {:name 'same? :params ['left 'right] :param-types [:result-i64 :result-i64]
+     ;; profile 5: `=` is :bool
+     :result :bool :effects #{} :body '(= left right)}]})
+
+(deftest bounded-result-i64-has-closed-tags-payloads-and-lazy-fallbacks
+  (let [source (script/emit result-i64-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});const ok=[true,7n],err=[false,12n];"
+                "if(x['ok?'](ok)!==true||x['ok?'](err)!==false)process.exit(2);"
+                "if(x.value(ok,99n)!==7n||x.value(err,99n)!==99n)process.exit(3);"
+                "if(x.error(err,99n)!==12n||x.error(ok,99n)!==99n)process.exit(4);"
+                "if(x['same?'](ok,[true,7n])!==true||x['same?'](err,[false,13n])!==false)process.exit(5);"
+                "for(const bad of [null,undefined,[true],[false],['ok',1n],[true,1]]){try{x['ok?'](bad);process.exit(6)}"
+                "catch(e){if(e.message!=='invalid-result-i64')process.exit(7)}}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "resultProfile:'tagged-i64-i64-v1'"))
+    (is (str/includes? source "const assertResultI64="))))
+
+(def parametric-result-kir
+  (let [text-result [:result :string :i64]
+        nested-result [:result :string [:result :i64 :bool]]]
+    {:format :kotoba.kir/v4 :entry nil :exports ['text 'nested 'nested-error?]
+     :effects #{}
+     :functions
+     [{:name 'text :params ['r] :param-types [text-result]
+       :result :string :effects #{}
+       :body (list 'result-value-of text-result 'r "fallback")}
+      {:name 'nested :params [] :param-types [] :result nested-result :effects #{}
+       :body (list 'result-err-of nested-result
+                   (list 'result-ok-of [:result :i64 :bool] 7))}
+      {:name 'nested-error? :params ['r] :param-types [nested-result]
+       :result :bool :effects #{}
+       :body (list 'result-ok?-of [:result :i64 :bool]
+                   (list 'result-error-of nested-result 'r
+                         (list 'result-err-of [:result :i64 :bool] false)))}]}))
+
+(deftest parametric-result-validates-nested-payload-types-and-budgets
+  (let [source (script/emit parametric-result-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.text([true,'安全'])!=='安全'||x.text([false,9n])!=='fallback')process.exit(2);"
+                "const n=x.nested();if(n[0]!==false||n[1][0]!==true||n[1][1]!==7n||!Object.isFrozen(n[1]))process.exit(3);"
+                "if(x['nested-error?'](n)!==true)process.exit(4);"
+                "for(const bad of [[true,9n],[false,[true,'wrong']],[false,[true,7]]]){try{x['nested-error?'](bad);process.exit(5)}"
+                "catch(e){if(!['invalid-string','invalid-i64'].includes(e.message))process.exit(6)}}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "parametricAdtLimits:Object.freeze({depth:12,nodes:64,variantCases:32})")))
+  (let [too-deep (nth (iterate (fn [t] [:result :i64 t]) :bool) 13)]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"depth limit"
+                          (script/emit
+                           {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                            :functions [{:name 'bad :params ['x] :param-types [too-deep]
+                                         :result :bool :effects #{} :body true}]})))))
+
+(def ^:private result-match-type [:result :string :i64])
+
+(def result-match-kir
+  ;; i64-returning match: the executable half of `result-match-is-exhaustive-typed-and-lazy`.
+  {:format :kotoba.kir/v4 :entry nil :exports ['describe] :effects #{}
+   :functions
+   [{:name 'describe :params ['r] :param-types [result-match-type]
+     :result :i64 :effects #{}
+     :body (list 'result-match-of result-match-type 'r 'text
+                 '(string-byte-length text) 'code 'code)}]})
+
+(deftest result-match-is-exhaustive-typed-and-lazy
+  (let [type result-match-type
+        ;; The string-bodied form is EXPECTED to throw (binder typing), so it
+        ;; stays let-bound and out of the golden set.
+        kir (assoc-in result-match-kir [:functions 0]
+                      {:name 'describe :params ['r] :param-types [type]
+                       :result :string :effects #{}
+                       :body (list 'result-match-of type 'r 'text 'text 'code 'code)})
+        executable result-match-kir
+        source (script/emit executable)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "if(x.describe([true,'安全'])!==6n||x.describe([false,17n])!==17n)process.exit(2)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const parametricResultMatch="))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"different types"
+                          (script/emit kir)))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"binders"
+                          (script/emit
+                           (assoc-in executable [:functions 0 :body]
+                                     (list 'result-match-of type 'r :bad 1 'code 'code)))))))
+
+(def ^:private variant-status-type [:variant :demo/status [[:ready :i64] [:failed :string]]])
+(def ^:private variant-status-branches
+  [[:ready 'n '(+ n 1)] [:failed 'message '(string-byte-length message)]])
+
+(def variant-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['ready 'describe] :effects #{}
+   :functions
+   [{:name 'ready :params [] :param-types [] :result variant-status-type :effects #{}
+     :body (list 'variant-new variant-status-type :ready 7)}
+    {:name 'describe :params ['value] :param-types [variant-status-type] :result :i64 :effects #{}
+     :body (list 'variant-match variant-status-type 'value variant-status-branches)}]})
+
+(deftest closed-variants-own-identity-payloads-and-exhaustive-matches
+  (let [type variant-status-type
+        branches variant-status-branches
+        kir variant-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "const t=Object.freeze(['variant',':demo/status',Object.freeze([Object.freeze([':ready','i64']),Object.freeze([':failed','string'])])]);"
+                "const r=x.ready();if(r[1]!==':ready'||r[2]!==7n||!Object.isFrozen(r))process.exit(2);"
+                "if(x.describe([t,':ready',9n])!==10n||x.describe([t,':failed','安全'])!==6n)process.exit(3);"
+                "try{x.describe([t,':unknown',1n]);process.exit(4)}catch(e){if(e.message!=='unknown-variant-case')process.exit(5)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "variantCases:32"))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"exactly cover"
+                          (script/emit (assoc-in kir [:functions 1 :body]
+                                                 (list 'variant-match type 'value (vec (reverse branches)))))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"expression type mismatch"
+                          (script/emit (assoc-in kir [:functions 0 :body]
+                                                 (list 'variant-new type :ready "wrong"))))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"qualified keyword"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params [] :param-types []
+                                       :result [:variant :status [[:ready :i64]]]
+                                       :effects #{} :body 0}]}))))
+
+(def generic-option-kir
+  (let [type [:option :string]]
+    {:format :kotoba.kir/v4 :entry nil :exports ['some 'none 'describe] :effects #{}
+     :functions
+     [{:name 'some :params [] :param-types [] :result type :effects #{}
+       :body (list 'option-some-of type "安全")}
+      {:name 'none :params [] :param-types [] :result type :effects #{}
+       :body (list 'option-none-of type)}
+      {:name 'describe :params ['value] :param-types [type] :result :i64 :effects #{}
+       :body (list 'option-match type 'value 7 'text '(string-byte-length text))}]}))
+
+(deftest generic-options-preserve-none-type-identity-and-exhaustive-matching
+  (let [type [:option :string]
+        kir generic-option-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),t=Object.freeze(['option','string']);"
+                "const s=x.some(),n=x.none();if(s[1]!==true||s[2]!=='安全'||n[1]!==false)process.exit(2);"
+                "if(x.describe([t,true,'安全'])!==6n||x.describe([t,false])!==7n)process.exit(3);"
+                "try{x.describe([Object.freeze(['option','i64']),false]);process.exit(4)}"
+                "catch(e){if(e.message!=='invalid-generic-option')process.exit(5)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "genericOptionProfile:'typed-tagged-v1'"))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"different types"
+                          (script/emit
+                          (assoc-in kir [:functions 2 :body]
+                                     (list 'option-match type 'value 7 'text 'text)))))))
+
+(def hetero-vector-kir
+  (let [type [:vector [:i64 :string :bool]]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports ['make 'name 'rename 'count-items 'same?] :effects #{}
+     :functions
+     [{:name 'make :params [] :param-types [] :result type :effects #{}
+       :body (list 'hetero-vector-new type 7 "安全" true)}
+      {:name 'name :params ['value] :param-types [type] :result :string :effects #{}
+       :body (list 'hetero-vector-at type 'value 1)}
+      {:name 'rename :params ['value] :param-types [type] :result type :effects #{}
+       :body (list 'hetero-vector-assoc type 'value 1 "確認")}
+      {:name 'count-items :params ['value] :param-types [type] :result :i64 :effects #{}
+       :body (list 'hetero-vector-count type 'value)}
+      {:name 'same? :params ['left 'right] :param-types [type type]
+       :result :i64 :effects #{}
+       :body (list 'hetero-vector-equal type 'left 'right)}]}))
+
+(def structured-f64-kir
+  (let [vector-type [:vector [:f64 :f64]]
+        record-type [:record :geometry/point [[:x :f64] [:y :f64]]]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports ['make-vector 'vector-x 'make-point 'point-y 'move-x]
+     :effects #{}
+     :functions
+     [{:name 'make-vector :params [] :param-types [] :result vector-type :effects #{}
+       :body (list 'hetero-vector-new vector-type -0.0 ##NaN)}
+      {:name 'vector-x :params ['value] :param-types [vector-type]
+       :result :f64 :effects #{}
+       :body (list 'hetero-vector-at vector-type 'value 0)}
+      {:name 'make-point :params [] :param-types [] :result record-type :effects #{}
+       :body (list 'record-new record-type 1.25 -0.0)}
+      {:name 'point-y :params ['value] :param-types [record-type]
+       :result :f64 :effects #{}
+       :body (list 'record-get record-type 'value :y)}
+      {:name 'move-x :params ['value 'x] :param-types [record-type :f64]
+       :result record-type :effects #{}
+       :body (list 'record-assoc record-type 'value :x 'x)}]}))
+
+(deftest heterogeneous-vectors-seal-position-types-and-exact-length
+  (let [type [:vector [:i64 :string :bool]]
+        kir hetero-vector-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "const t=Object.freeze(['vector',Object.freeze(['i64','string','bool'])]);"
+                "const before=x.make(),after=x.rename(before);"
+                "if(before[1]!==7n||before[2]!=='安全'||before[3]!==true||x.name(before)!=='安全')process.exit(2);"
+                "if(after[2]!=='確認'||before[2]!=='安全'||x['count-items'](before)!==3n||!Object.isFrozen(after))process.exit(3);"
+                "if(x['same?'](before,[t,7n,'安全',true])!==1n||x['same?'](before,after)!==0n)process.exit(8);"
+                "try{x.name([Object.freeze(['vector',Object.freeze(['string','string','bool'])]),7n,'安全',true]);process.exit(4)}"
+                "catch(e){if(e.message!=='invalid-heterogeneous-vector')process.exit(5)}"
+                "try{x.name([t,7n,'安全']);process.exit(6)}catch(e){if(e.message!=='invalid-heterogeneous-vector')process.exit(7)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "heterogeneousVectorLimits:Object.freeze({items:32})"))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"exactly match"
+                          (script/emit (assoc-in kir [:functions 0 :body]
+                                                 (list 'hetero-vector-new type 7 "安全")))))
+
+(deftest structured-f64-values-preserve-nan-and-signed-zero
+  (let [source (script/emit structured-f64-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded "').then(m=>{"
+                     "const x=m.instantiateKotoba({}),v=x['make-vector'](),p=x['make-point']();"
+                     "if(!Object.is(x['vector-x'](v),-0)||!Number.isNaN(v[2]))process.exit(2);"
+                     "if(!Object.is(x['point-y'](p),-0)||x['move-x'](p,2.5)[1]!==2.5)process.exit(3);"
+                     "try{x['point-y']([p[0],1.0,'bad']);process.exit(4)}"
+                     "catch(e){if(e.message!=='invalid-f64')process.exit(5)}})"))]
+    (is (zero? (:exit result)) (:err result))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"in-range integer literal"
+                          (script/emit (assoc-in kir [:functions 1 :body]
+                                                 (list 'hetero-vector-at type 'value 3))))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"bounded vector"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['bad] :effects #{}
+                          :functions [{:name 'bad :params [] :param-types []
+                                       :result [:vector (vec (repeat 33 :i64))]
+                                       :effects #{} :body 0}]}))))
+
+(def typed-set-kir
+  (let [type [:set :i64]
+        option-type [:option :string]
+        nested-type [:set [:option :string]]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports ['make 'nested 'duplicate 'contains? 'add 'remove 'same?] :effects #{}
+     :functions
+     [{:name 'make :params [] :param-types [] :result type :effects #{}
+       :body (list 'typed-set-new type 3 1 2)}
+      {:name 'nested :params [] :param-types [] :result nested-type :effects #{}
+       :body (list 'typed-set-new nested-type
+                   (list 'option-some-of option-type "b")
+                   (list 'option-none-of option-type)
+                   (list 'option-some-of option-type "a"))}
+      {:name 'duplicate :params [] :param-types [] :result type :effects #{}
+       :body (list 'typed-set-new type 1 1)}
+      {:name 'contains? :params ['value 'item] :param-types [type :i64]
+       :result :bool :effects #{}
+       :body (list 'typed-set-contains type 'value 'item)}
+      {:name 'add :params ['value 'item] :param-types [type :i64]
+       :result type :effects #{}
+       :body (list 'typed-set-conj type 'value 'item)}
+      {:name 'remove :params ['value 'item] :param-types [type :i64]
+       :result type :effects #{}
+       :body (list 'typed-set-disj type 'value 'item)}
+      {:name 'same? :params ['left 'right] :param-types [type type]
+       :result :i64 :effects #{}
+       :body (list 'typed-set-equal type 'left 'right)}]}))
+
+(deftest typed-sets-have-canonical-order-unique-items-and-persistent-updates
+  (let [type [:set :i64]
+        kir typed-set-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),t=Object.freeze(['set','i64']);"
+                "const a=x.make(),b=x.add(a,4n),c=x.remove(b,2n);"
+                "if(a[1].join(',')!=='1,2,3'||!x['contains?'](a,2n)||x['contains?'](a,9n))process.exit(2);"
+                "if(a[1].length!==3||b[1].join(',')!=='1,2,3,4'||c[1].join(',')!=='1,3,4'||!Object.isFrozen(c[1]))process.exit(3);"
+                "if(x['same?'](a,[t,[3n,2n,1n]])!==1n||x['same?'](a,b)!==0n)process.exit(4);"
+                "const n=x.nested();if(n[1].length!==3||n[1][0][1]!==false||n[1][1][2]!=='a'||n[1][2][2]!=='b')process.exit(9);"
+                "try{x.duplicate();process.exit(5)}catch(e){if(e.message!=='duplicate-set-item')process.exit(6)}"
+                "try{x['contains?']([Object.freeze(['set','string']),['1']],1n);process.exit(7)}"
+                "catch(e){if(e.message!=='invalid-typed-set')process.exit(8)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "typedSetLimits:Object.freeze({items:32})"))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"item limit"
+                          (script/emit
+                           (assoc-in kir [:functions 0 :body]
+                                     (list* 'typed-set-new type (range 33))))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"expression type mismatch"
+                          (script/emit
+                           (assoc-in kir [:functions 0 :body]
+                                     (list 'typed-set-new type "wrong")))))))
+
+(def typed-list-kir
+  (let [type [:list :i64]]
+    {:format :kotoba.kir/v4 :entry nil :exports ['make 'count-items] :effects #{}
+     :functions
+     [{:name 'make :params [] :param-types [] :result type :effects #{}
+       :body (list 'typed-list-new type 4 5 6)}
+      {:name 'count-items :params ['value] :param-types [type]
+       :result :i64 :effects #{} :body '(vector-count value)}]}))
+
+(deftest canonical-lists-construct-count-and-validate-items
+  (let [type [:list :i64]
+        kir typed-list-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),v=x.make();"
+                "if(x['count-items'](v)!==3n||v[1].join(',')!=='4,5,6'||!Object.isFrozen(v[1]))process.exit(2);"
+                "try{x['count-items']([Object.freeze(['list','i64']),[1n,'bad']]);process.exit(3)}"
+                "catch(e){if(e.message!=='invalid-i64')process.exit(4)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"expression type mismatch"
+                          (script/emit
+                          (assoc-in kir [:functions 0 :body]
+                                     (list 'typed-list-new type "wrong")))))))
+
+
+;; ---------------------------------------------------------------------------
+;; typed-list-nth -- the ACCESSOR. Added 2026-09-08.
+;;
+;; Until then this backend had `typed-list-new` (above) and `vector-count`
+;; through `vectorOrListCount`, and nothing that read an element back:
+;; `typed-list-nth` reached `emit-expr` as an unrecognised head and was refused
+;; `unsupported KIR node`. kotoba-sema has typed it since 2026-09-03 and
+;; rewrites `nth` on a `[:list T]` to it, so the head arrives from ordinary
+;; guest source; the KIR reference interpreter already executed it. Only the
+;; two backends were missing, which meant a `[:list T]` -- including every
+;; `typed-map-keys` / `typed-map-vals` projection -- could be built and counted
+;; and never read.
+(def typed-list-nth-kir
+  (let [i64-type [:list :i64]
+        string-type [:list :string]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports ['at-i64 'at-string 'make-strings] :effects #{}
+     :functions
+     [{:name 'make-strings :params [] :param-types [] :result string-type
+       :effects #{} :body (list 'typed-list-new string-type "a" "bb" "ccc")}
+      {:name 'at-i64 :params ['index] :param-types [:i64] :result :i64 :effects #{}
+       :body (list 'typed-list-nth i64-type
+                   (list 'typed-list-new i64-type 4 5 6) 'index)}
+      {:name 'at-string :params ['value 'index] :param-types [string-type :i64]
+       :result :string :effects #{}
+       :body (list 'typed-list-nth string-type 'value 'index)}]}))
+
+(deftest canonical-lists-read-an-element-back-and-trap-out-of-range
+  (let [kir typed-list-nth-kir
+        string-type [:list :string]
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),v=x['make-strings']();"
+                ;; the read itself, at both ends and in the middle
+                "if(x['at-i64'](0n)!==4n||x['at-i64'](2n)!==6n)process.exit(2);"
+                "if(x['at-string'](v,0n)!=='a'||x['at-string'](v,1n)!=='bb'"
+                "||x['at-string'](v,2n)!=='ccc')process.exit(3);"
+                ;; and both ends of the range, which TRAP rather than answering
+                "try{x['at-string'](v,3n);process.exit(4)}"
+                "catch(e){if(e.message!=='list-index-out-of-range')process.exit(5)}"
+                "try{x['at-string'](v,-1n);process.exit(6)}"
+                "catch(e){if(e.message!=='list-index-out-of-range')process.exit(7)}"
+                ;; and the carrier is still validated on the way in
+                "try{x['at-string']([Object.freeze(['list','string']),[1n]],0n);process.exit(8)}"
+                "catch(e){if(e.message!=='invalid-string')process.exit(9)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (testing "the index is an i64, not a string, and the type descriptor is a list"
+      (is (thrown-with-msg? kerror/ExceptionInfo #"expression type mismatch"
+                            (script/emit
+                             (assoc-in kir [:functions 2 :body]
+                                       (list 'typed-list-nth string-type 'value "0")))))
+      (is (thrown-with-msg? kerror/ExceptionInfo #"typed list nth requires"
+                            (script/emit
+                             (assoc-in kir [:functions 2 :body]
+                                       (list 'typed-list-nth [:set :string] 'value 'index)))))
+      (is (thrown-with-msg? kerror/ExceptionInfo #"arity"
+                            (script/emit
+                             (assoc-in kir [:functions 2 :body]
+                                       (list 'typed-list-nth string-type 'value))))))))
+
+(def bytes-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['make 'identity] :effects #{}
+   :functions
+   [{:name 'make :params [] :param-types [] :result :bytes :effects #{}
+     :body '(bytes-empty)}
+    {:name 'identity :params ['value] :param-types [:bytes]
+     :result :bytes :effects #{} :body 'value}]})
+
+(deftest canonical-empty-bytes-cross-restricted-esm-boundaries
+  (let [source (script/emit bytes-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),empty=x.make(),value=new Uint8Array([1,2,3]);"
+                "if(!(empty instanceof Uint8Array)||empty.byteLength!==0||x.identity(value)!==value)process.exit(2);"
+                "try{x.identity('not-bytes');process.exit(3)}catch(e){if(e.message!=='invalid-bytes')process.exit(4)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "bytesLimits:Object.freeze({valueBytes:65536})"))))
+
+(def ^:private record-person-type
+  [:record :demo/person [[:name :string] [:age :i64] [:nickname [:option :string]]]])
+
+(def record-kir
+  (let [type record-person-type
+        option-type [:option :string]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports ['make 'name-of 'birthday 'same?] :effects #{}
+     :functions
+     [{:name 'make :params [] :param-types [] :result type :effects #{}
+       :body (list 'record-new type "Kotoba" 7
+                   (list 'option-none-of option-type))}
+      {:name 'name-of :params ['value] :param-types [type]
+       :result :string :effects #{}
+       :body (list 'record-get type 'value :name)}
+      {:name 'birthday :params ['value 'age] :param-types [type :i64]
+       :result type :effects #{}
+       :body (list 'record-assoc type 'value :age 'age)}
+      {:name 'same? :params ['left 'right] :param-types [type type]
+       :result :i64 :effects #{}
+       :body (list 'record-equal type 'left 'right)}]}))
+
+(deftest bounded-records-seal-schema-field-order-and-persistent-updates
+  (let [type record-person-type
+        other-type [:record :demo/account [[:name :string] [:age :i64]
+                                            [:nickname [:option :string]]]]
+        option-type [:option :string]
+        kir record-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),v=x.make(),u=x.birthday(v,8n);"
+                "if(x['name-of'](v)!=='Kotoba'||v[2]!==7n||u[2]!==8n||v[2]!==7n)process.exit(2);"
+                "if(!Object.isFrozen(v)||!Object.isFrozen(v[0])||x['same?'](v,u)!==0n||x['same?'](v,v)!==1n)process.exit(3);"
+                "const ot=Object.freeze(['record',':demo/account',Object.freeze([Object.freeze([':name','string']),Object.freeze([':age','i64']),Object.freeze([':nickname',Object.freeze(['option','string'])])])]);"
+                "try{x['name-of']([ot,'Kotoba',7n,[Object.freeze(['option','string']),false]]);process.exit(4)}"
+                "catch(e){if(e.message!=='invalid-record')process.exit(5)}"
+                "try{x['name-of']([v[0],'Kotoba']);process.exit(6)}catch(e){if(e.message!=='invalid-record')process.exit(7)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "recordLimits:Object.freeze({fields:32})"))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"declared keyword literal"
+                          (script/emit
+                           (assoc-in kir [:functions 1 :body]
+                                     (list 'record-get type 'value :missing)))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"expression type mismatch"
+                          (script/emit
+                           (assoc-in kir [:functions 0 :body]
+                                     (list 'record-new type 7 7
+                                           (list 'option-none-of option-type))))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"unique bounded vector"
+                          (script/emit
+                           (assoc-in kir [:functions 0 :result]
+                                     [:record :demo/bad [[:x :i64] [:x :string]]]))))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"unique bounded vector"
+                          (script/emit
+                           (assoc-in kir [:functions 0 :result]
+                                     [:record :demo/large
+                                      (mapv (fn [i] [(keyword (str "f" i)) :i64])
+                                            (range 33))]))))
+    (is (not= type other-type))))
+
+(def vector-i64-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['count-items 'lookup 'require-item 'drop-items 'update 'append 'same?]
+   :effects #{}
+   :functions
+   [{:name 'count-items :params ['value] :param-types [:vector-i64]
+     :result :i64 :effects #{} :body '(vector-count value)}
+    {:name 'lookup :params ['value 'index] :param-types [:vector-i64 :i64]
+     :result :i64 :effects #{} :body '(vector-get value index 99)}
+    {:name 'require-item :params ['value 'index] :param-types [:vector-i64 :i64]
+     :result :i64 :effects #{} :body '(vector-at value index)}
+    {:name 'drop-items :params ['value 'count] :param-types [:vector-i64 :i64]
+     :result :vector-i64 :effects #{} :body '(vector-drop value count)}
+    {:name 'update :params ['value 'index 'item]
+     :param-types [:vector-i64 :i64 :i64] :result :vector-i64 :effects #{}
+     :body '(vector-assoc value index item)}
+    {:name 'append :params ['value 'item] :param-types [:vector-i64 :i64]
+     :result :vector-i64 :effects #{} :body '(vector-conj value item)}
+    {:name 'same? :params ['left 'right] :param-types [:vector-i64 :vector-i64]
+     ;; profile 5: `=` is :bool
+     :result :bool :effects #{} :body '(= left right)}]})
+
+(def vector-at-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['at] :effects #{}
+   :functions [{:name 'at :params ['v] :param-types [:vector-i64]
+                :result :i64 :effects #{} :body '(vector-at v 2)}]})
+
+(deftest bounded-vector-i64-is-frozen-indexed-and-persistent
+  (let [source (script/emit vector-i64-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});const before=[1n,2n];"
+                "const fixture=Array.from({length:12171},(_,i)=>BigInt(i&255));"
+                "if(x['count-items'](fixture)!==12171n||x['require-item'](fixture,12170n)!==138n)process.exit(10);"
+                "const after=x.update(before,0n,7n);const appended=x.append(after,8n);"
+                "if(x['count-items'](before)!==2n||x.lookup(before,9n)!==99n||x.lookup(before,-1n)!==99n||x.lookup(before,9223372036854775807n)!==99n)process.exit(2);"
+                "if(x['require-item'](before,1n)!==2n||x['drop-items']([1n,2n,3n],1n).join(',')!=='2,3')process.exit(9);"
+                "if(before[0]!==1n||after[0]!==7n||appended.length!==3||!Object.isFrozen(appended))process.exit(3);"
+                "if(x['same?']([1n,2n],[1n,2n])!==true||x['same?']([1n],[2n])!==false)process.exit(8);"
+                "for(const bad of [null,[1],[1n,'x']]){try{x['count-items'](bad);process.exit(4)}"
+                "catch(e){if(e.message!=='invalid-vector-i64'&&e.message!=='invalid-i64')process.exit(5)}}"
+                "try{x['count-items'](Array.from({length:16385},()=>0n));process.exit(11)}"
+                "catch(e){if(e.message!=='vector-too-large')process.exit(12)}"
+                "try{x.update(before,2n,3n);process.exit(6)}catch(e){if(e.message!=='vector-index-out-of-range')process.exit(7)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "vectorLimits:Object.freeze({items:16384})"))
+    (is (str/includes? source "const makeVector=")))
+  (let [source (script/emit vector-at-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node "node" "--input-type=module" "-e"
+                         (str "import('data:text/javascript;base64," encoded
+                              "').then(m=>{try{m.instantiateKotoba({}).at([1n]);process.exit(2)}"
+                              "catch(e){if(e.message!=='vector-index-out-of-range')process.exit(3)}})"))]
+    (is (zero? (:exit result)) (:err result)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"item limit"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['too-large] :effects #{}
+                          :functions [{:name 'too-large :params [] :param-types []
+                                       :result :vector-i64 :effects #{}
+                                       :body (apply list 'vector-new (range 16385))}]}))))
+
+(def vector-f64-kir
+  {:format :kotoba.kir/v4 :entry nil
+   :exports ['make 'count-items 'lookup 'require-item 'drop-items 'update 'append]
+   :effects #{}
+   :functions
+   [{:name 'make :params [] :param-types [] :result :vector-f64 :effects #{}
+     :body '(vector-f64-new -0.0 ##NaN 1.5)}
+    {:name 'count-items :params ['value] :param-types [:vector-f64]
+     :result :i64 :effects #{} :body '(vector-f64-count value)}
+    {:name 'lookup :params ['value 'index 'fallback]
+     :param-types [:vector-f64 :i64 :f64] :result :f64 :effects #{}
+     :body '(vector-f64-get value index fallback)}
+    {:name 'require-item :params ['value 'index] :param-types [:vector-f64 :i64]
+     :result :f64 :effects #{} :body '(vector-f64-at value index)}
+    {:name 'drop-items :params ['value 'count] :param-types [:vector-f64 :i64]
+     :result :vector-f64 :effects #{} :body '(vector-f64-drop value count)}
+    {:name 'update :params ['value 'index 'item]
+     :param-types [:vector-f64 :i64 :f64] :result :vector-f64 :effects #{}
+     :body '(vector-f64-assoc value index item)}
+    {:name 'append :params ['value 'item] :param-types [:vector-f64 :f64]
+     :result :vector-f64 :effects #{} :body '(vector-f64-conj value item)}]})
+
+(deftest bounded-vector-f64-preserves-ieee-values-and-persistence
+  (let [source (script/emit vector-f64-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),v=x.make();"
+                "if(x['count-items'](v)!==3n||!Object.is(v[0],-0)||!Number.isNaN(v[1])||v[2]!==1.5)process.exit(2);"
+                "const changed=x.update(v,2n,-0),appended=x.append(changed,Infinity),dropped=x['drop-items'](appended,1n);"
+                "if(v[2]!==1.5||!Object.is(changed[2],-0)||appended[3]!==Infinity||!Object.isFrozen(dropped))process.exit(3);"
+                "if(!Number.isNaN(x.lookup(v,1n,7))||x.lookup(v,99n,-2.5)!==-2.5)process.exit(4);"
+                "try{x['require-item'](v,-1n);process.exit(5)}catch(e){if(e.message!=='vector-f64-index-out-of-range')process.exit(6)}"
+                "for(const bad of [null,[1n],[undefined]]){try{x['count-items'](bad);process.exit(7)}catch(e){}}"
+                "try{x['count-items'](Array.from({length:16385},()=>0));process.exit(8)}"
+                "catch(e){if(e.message!=='vector-f64-too-large')process.exit(9)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const makeVectorF64="))
+    (is (str/includes? source "vectorF64Get(")))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"item limit"
+                        (script/emit
+                         {:format :kotoba.kir/v4 :entry nil :exports ['too-large] :effects #{}
+                          :functions [{:name 'too-large :params [] :param-types []
+                                       :result :vector-f64 :effects #{}
+                                       :body (apply list 'vector-f64-new
+                                                    (repeat 16385 0.0))}]}))))
+
+(def string-index-disjoint-set-kir
+  (let [functions
+        [{:name 'index :params [] :param-types [] :result :string-index :effects #{}
+          :body '(string-index-assoc (string-index-assoc (string-index-new) "b" 2) "a" 1)}
+         {:name 'lookup :params [] :param-types [] :result :i64 :effects #{}
+          :body '(option-value-of [:option :i64] (string-index-get (index) "b") 99)}
+         {:name 'joined :params [] :param-types [] :result :disjoint-set-i64 :effects #{}
+          :body '(option-value-of [:option :disjoint-set-i64]
+                   (disjoint-set-i64-union (disjoint-set-i64-new 3) 0 2)
+                   (disjoint-set-i64-new 0))}
+         {:name 'cycle :params [] :param-types [] :result :bool :effects #{}
+          :body '(option-some?-of [:option :disjoint-set-i64]
+                   (disjoint-set-i64-union (joined) 2 0))}]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports (mapv :name functions) :effects #{} :functions functions}))
+
+(deftest compact-string-index-and-disjoint-set-are-bounded-and-persistent
+  (let [source (script/emit string-index-disjoint-set-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node "node" "--input-type=module" "-e"
+                         (str "import('data:text/javascript;base64," encoded
+                              "').then(m=>{const x=m.instantiateKotoba({}),i=x.index(),d=x.joined();"
+                              "if(x.lookup()!==2n||i.length!==2||i[0][0]!=='a'||d[0].length!==3||x.cycle()!==false)process.exit(2);"
+                              "if(!Object.isFrozen(i)||!Object.isFrozen(i[0])||!Object.isFrozen(d[0]))process.exit(3);"
+                              "for(const f of [()=>x.index(Array(129).fill(['x',0n])),()=>x.joined(129n)]){try{f();}catch(e){}}})"))]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const assertStringIndex="))
+    (is (str/includes? source "const disjointSetI64Union="))))
+
+(def document-kir
+  (let [functions
+        [{:name 'doc :params [] :param-types [] :result :document :effects #{}
+          :body '(document-map :type (document-string "Annotation")
+                               :target (document-string "urn:test")
+                               :enabled (document-bool true))}
+         {:name 'type-name :params [] :param-types [] :result :string :effects #{}
+          :body '(option-value-of [:option :string]
+                   (document-string-value
+                    (option-value-of [:option :document]
+                      (document-get (doc) :type) (document-null)))
+                   "missing")}
+         {:name 'updated-count :params [] :param-types [] :result :i64 :effects #{}
+          :body '(document-count
+                   (document-dissoc
+                    (document-merge (doc)
+                      (document-map :creator (document-string "alice")))
+                    :enabled))}
+         {:name 'external-count :params ['value] :param-types [:document]
+          :result :i64 :effects #{} :body '(document-count value)}
+         {:name 'kind :params ['value] :param-types [:document]
+          :result :keyword :effects #{} :body '(document-kind value)}
+         {:name 'same :params ['left 'right] :param-types [:document :document]
+          :result :bool :effects #{} :body '(document-equal? left right)}
+         {:name 'repeated-nulls :params [] :param-types [] :result :document :effects #{}
+          :body '(document-map :a (document-null) :b (document-null))}
+         {:name 'repeated-value :params [] :param-types [] :result :document :effects #{}
+          :body '(let [item (document-map :name (document-string "same"))]
+                   (document-vector item item))}]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports (mapv :name functions) :effects #{} :functions functions}))
+
+(deftest bounded-canonical-documents-are-persistent-and-reject-host-objects
+  (let [source (script/emit document-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result
+        (run-node
+         "node" "--input-type=module" "-e"
+         (str "import('data:text/javascript;base64," encoded
+              "').then(m=>{const x=m.instantiateKotoba({}),d=x.doc();"
+              "if(x['type-name']()!=='Annotation'||x['updated-count']()!==3n||x.kind(d)!==':map')process.exit(2);"
+              "const same=['map',[[':items',['vector',[['i64',1n],['string','x']]]]]],different=['map',[[':items',['vector',[['i64',2n],['string','x']]]]]];if(x.same(same,same)!==true||x.same(same,different)!==false||x.same(['f64',-0],['f64',0])!==true)process.exit(7);"
+              "const nulls=x['repeated-nulls'](),repeated=x['repeated-value']();if(nulls[1].length!==2||nulls[1][0][1][0]!=='null'||repeated[1].length!==2||repeated[1][0][1][0][1][1]!=='same'||repeated[1][0]===repeated[1][1])process.exit(8);"
+              "for(const [v,k] of [[['null'],':null'],[['bool',true],':bool'],[['i64',1n],':i64'],[['f64',1],':f64'],[['string','x'],':string'],[['keyword',':x'],':keyword'],[['vector',[]],':vector']])if(x.kind(v)!==k)process.exit(6);"
+              "if(!Object.isFrozen(d)||!Object.isFrozen(d[1])||!Object.isFrozen(d[1][0]))process.exit(3);"
+              "for(const bad of [{type:'Annotation'},['map',[[':b',['null']],[':a',['null']]]],['f64',Infinity]]){let rejected=false;"
+              "try{x['external-count'](bad)}catch(e){rejected=true}if(!rejected)process.exit(4);}"
+              "const cycle=['vector',[]];cycle[1].push(cycle);let rejected=false;"
+              "try{x['external-count'](cycle)}catch(e){rejected=true}if(!rejected)process.exit(5);"
+              "const child=['string','shared'],shared=['vector',[child,child]];rejected=false;try{x['external-count'](shared)}catch(e){rejected=true}if(!rejected)process.exit(9);"
+              "const sharedNull=['null'];rejected=false;try{x['external-count'](['vector',[sharedNull,sharedNull]])}catch(e){rejected=true}if(!rejected)process.exit(10);})"))]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const assertDoc="))
+    (is (str/includes? source "const docMerge="))
+    (is (str/includes? source "const docKind="))
+    (is (str/includes? source "const docEqual="))))
+
+(def validate-once-kir
+  ;; kotoba-lang/kotoba-script#103: a value is checked where it ENTERS the
+  ;; guest, not again on every operation. These pin both halves: the checks
+  ;; that must stay (the boundary, the limits, no shared nodes in an output)
+  ;; and the one that must go (re-copying a document the guest produced).
+  (let [functions
+        [{:name 'id :params ['d] :param-types [:document] :result :document :effects #{} :body 'd}
+         {:name 'count-of :params ['d] :param-types [:document] :result :i64 :effects #{}
+          :body '(document-count d)}
+         {:name 'make :params [] :param-types [] :result :document :effects #{}
+          :body '(document-vector (document-string "a") (document-string "b"))}
+         {:name 'twice :params ['d] :param-types [:document] :result :document :effects #{}
+          :body '(document-vector d d)}
+         {:name 'echo :params ['s] :param-types [:string] :result :string :effects #{} :body 's}
+         ;; substring / code-point-at remember the UTF-8 bytes of the LAST string:
+         ;; alternate two strings of different widths so a stale memo would show
+         {:name 'alternate :params ['a 'b] :param-types [:string :string] :result :string :effects #{}
+          :body '(string-concat (string-substring a 0 3)
+                   (string-concat (string-substring b 0 1) (string-substring a 3 6)))}
+         {:name 'alternate-cp :params ['a 'b] :param-types [:string :string] :result :i64 :effects #{}
+          :body '(+ (string-byte-length (string-substring a 0 3)) (string-code-point-at b 1))}
+         ;; the length, not the string: nothing crosses the boundary as a string, so
+         ;; only the INTERNAL size check can stop an over-limit build
+         {:name 'build-length :params ['n] :param-types [:i64] :result :i64 :effects #{}
+          :body '(string-byte-length (build-from 0 n ""))}
+         {:name 'build-from :params ['i 'n 'acc] :param-types [:i64 :i64 :string] :result :string
+          :effects #{} :body '(if (>= i n) acc (build-from (+ i 1) n (string-concat acc "0123456789")))}]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports '[id count-of make twice echo alternate alternate-cp build-length] :effects #{} :functions functions}))
+
+(deftest values-are-checked-where-they-enter-not-on-every-operation
+  (let [source (script/emit validate-once-kir {:fuel 100000})
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result
+        (run-node
+         "node" "--input-type=module" "-e"
+         (str "import('data:text/javascript;base64," encoded "').then(m=>{"
+              "const x=m.instantiateKotoba({});const throws=(f,msg)=>{try{f()}catch(e){return e.message===msg}return false;};"
+              ;; a document the guest produced is answered as it is -- not re-walked, not re-copied
+              "const d=x.make();if(x.id(d)!==d||x.count_of===undefined&&x['count-of'](d)!==2n)process.exit(11);"
+              ;; a host array is still checked and copied, and the copy is then trusted
+              "const raw=['vector',[['string','a']]];const r=x.id(raw);if(r===raw||!Object.isFrozen(r)||x.id(r)!==r)process.exit(12);"
+              ;; the shared/cyclic check still refuses a HOST array that shares a node
+              "const c=['string','c'];if(!throws(()=>x.id(['vector',[c,c]]),'doc-shared-or-cyclic'))process.exit(13);"
+              ;; a checked node may repeat; the output copies it apart (no shared node leaves the guest)
+              "const two=x.twice(d);if(two[1].length!==2||two[1][0]===two[1][1])process.exit(14);"
+              "const hv=x.id(['vector',[d,d]]);if(hv[1][0]===hv[1][1])process.exit(15);"
+              ;; the boundary still checks strings in full; an internal loop still enforces the size limit
+              "if(!throws(()=>x.echo('\\uD800'),'invalid-utf16'))process.exit(16);"
+              "if(x.alternate('日本語','xé')!=='日x本'||x['alternate-cp']('日本語','xé')!==236n)process.exit(19);"
+              "if(x['build-length'](6553n)!==65530n)process.exit(17);"
+              "if(!throws(()=>x['build-length'](6554n),'string-too-large'))process.exit(18);"
+              "})"))]
+    (is (zero? (:exit result)) (str (:exit result) " " (:err result)))))
+
+(def document-sha256-kir
+  (let [functions
+        [{:name 'null-digest :params [] :param-types [] :result :string :effects #{}
+          :body '(document-sha256 (document-null))}
+         {:name 'hello-digest :params [] :param-types [] :result :string :effects #{}
+          :body '(document-sha256
+                   (document-map :tag (document-string "div")
+                                 :text (document-string "Hello")))}
+         {:name 'world-digest :params [] :param-types [] :result :string :effects #{}
+          :body '(document-sha256
+                   (document-map :tag (document-string "div")
+                                 :text (document-string "World")))}
+         {:name 'digest :params ['value] :param-types [:document]
+          :result :string :effects #{} :body '(document-sha256 value)}]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports (mapv :name functions) :effects #{} :functions functions}))
+
+(deftest document-sha256-is-stable-and-content-sensitive
+  (let [source (script/emit document-sha256-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        ;; golden for single-byte encoding of document-null ("n")
+        null-hex "1b16b1df538ba12dc3f97edbb85caa7050d46c148134290feba80f8236c83db9"
+        result
+        (run-node
+         "node" "--input-type=module" "-e"
+         (str "import('data:text/javascript;base64," encoded
+              "').then(m=>{const x=m.instantiateKotoba({});"
+              "const n=x['null-digest']();if(n!=='" null-hex "'){console.error('null',n);process.exit(2);}"
+              "const h=x['hello-digest'](),w=x['world-digest']();"
+              "if(!/^[0-9a-f]{64}$/.test(h)||h===w||h!==x.digest(['map',[[':tag',['string','div']],[':text',['string','Hello']]]]))process.exit(3);"
+              "if(x.digest(['f64',-0])!==x.digest(['f64',0]))process.exit(4);"
+              "})"))]
+    (is (zero? (:exit result)) (str (:err result) (:out result)))
+    (is (str/includes? source "const docSha256="))
+    (is (str/includes? source "const docCanonicalBytes="))))
+
+(def document-edn-kir
+  (let [functions
+        [{:name 'value :params [] :param-types [] :result :document :effects #{}
+          :body '(document-map
+                   :goal (document-string "言葉")
+                   :attempt (document-i64 -7)
+                   :ready (document-bool true)
+                   :steps (document-vector (document-null) (document-keyword :actor/run)))}
+         {:name 'printed :params [] :param-types [] :result :string :effects #{}
+          :body '(document-edn-print (value))}
+         {:name 'same :params [] :param-types [] :result :bool :effects #{}
+          :body '(document-equal? (value) (document-edn-read (document-edn-print (value))))}
+         {:name 'commented :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "; policy\n{:b false, :a 1}")}
+         {:name 'symbol-value :params [] :param-types [] :result :document :effects #{}
+          :body '(document-symbol (symbol "actor/run"))}
+         {:name 'symbol-text :params [] :param-types [] :result :string :effects #{}
+          :body '(document-edn-print (symbol-value))}
+         {:name 'parsed-symbol :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "actor/run")}
+         {:name 'list-value :params [] :param-types [] :result :document :effects #{}
+          :body '(document-list (document-symbol (symbol "actor/run")) (document-i64 7))}
+         {:name 'list-text :params [] :param-types [] :result :string :effects #{}
+          :body '(document-edn-print (list-value))}
+         {:name 'parsed-list :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "(actor/run 7)")}
+         {:name 'set-value :params [] :param-types [] :result :document :effects #{}
+          :body '(document-set (document-string "one") (document-keyword :ready) (document-i64 1))}
+         {:name 'set-text :params [] :param-types [] :result :string :effects #{}
+          :body '(document-edn-print (set-value))}
+         {:name 'parsed-set :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "#{\"one\" 1 :ready}")}
+         {:name 'set-has-ready :params [] :param-types [] :result :bool :effects #{}
+          :body '(document-set-contains? (parsed-set) (document-keyword :ready))}
+         {:name 'general-map :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "{[1 2] :pair, \"name\" 7, :ready true}")}
+         {:name 'general-text :params [] :param-types [] :result :string :effects #{}
+          :body '(document-edn-print (general-map))}
+         {:name 'general-name :params [] :param-types [] :result :i64 :effects #{}
+          :body '(option-value-of [:option :i64]
+                   (document-i64-value
+                    (option-value-of [:option :document]
+                      (document-get (general-map) (document-string "name")) (document-null))) -1)}
+         {:name 'bad-set-duplicate :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "#{:ready :ready}")}
+         {:name 'bad-symbol :params [] :param-types [] :result :string :effects #{}
+          :body '(document-edn-print (document-symbol (symbol "nil")))}
+         {:name 'bad :params [] :param-types [] :result :document :effects #{}
+          :body '(document-edn-read "#inst \"2026-08-03\"")}]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports (mapv :name functions) :effects #{} :functions functions}))
+
+(deftest bounded-document-textual-edn-roundtrips-and-rejects-reader-authority
+  (let [source (script/emit document-edn-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "if(x.printed()!=='{:attempt -7 :goal \"言葉\" :ready true :steps [nil :actor/run]}')process.exit(2);"
+                     "if(x.same()!==true)process.exit(3);"
+                     "const c=x.commented();if(c[0]!=='map'||c[1][0][0][1]!==':a'||c[1][1][0][1]!==':b')process.exit(4);"
+                     "if(x['symbol-text']()!=='actor/run'||x['parsed-symbol']()[0]!=='symbol')process.exit(5);"
+                     "if(x['list-text']()!=='(actor/run 7)'||x['parsed-list']()[0]!=='list')process.exit(6);"
+                     "if(x['set-text']()!=='#{1 :ready \"one\"}'||x['parsed-set']()[0]!=='set'||x['set-has-ready']()!==true)process.exit(7);"
+                     "if(x['general-text']()!=='{:ready true \"name\" 7 [1 2] :pair}'||x['general-name']()!==7n)process.exit(9);"
+                     "for(const name of ['bad','bad-symbol','bad-set-duplicate']){let denied=false;try{x[name]()}catch(e){denied=true}if(!denied)process.exit(8);}"
+                     "}).catch(e=>{console.error(e);process.exit(70)})"))]
+    (is (zero? (:exit result)) (str (:err result) (:out result)))
+    (is (str/includes? source "const docEdnPrint="))
+    (is (str/includes? source "const docEdnRead="))))
+
+(def document-vector-kir
+  (let [functions
+        [{:name 'items :params [] :param-types [] :result :document :effects #{}
+          :body '(document-vector (document-i64 1) (document-i64 2))}
+         {:name 'first-item :params [] :param-types [] :result :i64 :effects #{}
+          :body '(option-value-of [:option :i64]
+                   (document-i64-value
+                    (option-value-of [:option :document]
+                      (document-vector-at (items) 0) (document-null))) -1)}
+         {:name 'changed :params [] :param-types [] :result :document :effects #{}
+          :body '(document-vector-conj
+                   (document-vector-assoc (items) 1 (document-i64 7))
+                   (document-i64 9))}
+         {:name 'kind :params [] :param-types [] :result :keyword :effects #{}
+          :body '(option-value-of [:option :keyword]
+                   (document-keyword-value (document-keyword :fixed)) :missing)}
+         {:name 'tail :params [] :param-types [] :result :document :effects #{}
+          :body '(document-vector-drop (changed) 1)}
+         {:name 'removed :params [] :param-types [] :result :document :effects #{}
+          :body '(document-vector-remove (changed) 1)}
+         {:name 'entry :params [] :param-types [] :result :document :effects #{}
+          :body '(option-value-of [:option :document]
+                   (document-map-entry-at
+                     (document-map :z (document-i64 9) :a (document-string "first")) 0)
+                   (document-null))}
+         {:name 'key-name :params [] :param-types [] :result :string :effects #{}
+          :body '(keyword-name :rdf/type)}
+         {:name 'bad-assoc :params [] :param-types [] :result :document :effects #{}
+          :body '(document-vector-assoc (items) -1 (document-null))}]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports (mapv :name functions) :effects #{} :functions functions}))
+
+(deftest bounded-document-vectors-have-safe-persistent-operations
+  (let [source (script/emit document-vector-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({}),v=x.changed(),t=x.tail();"
+                     "const r=x.removed(),e=x.entry();if(x['first-item']()!==1n||x.kind()!==':fixed'||x['key-name']()!=='type'||v[1].length!==3||v[1][1][1]!==7n||t[1].length!==2||r[1].length!==2||r[1][1][1]!==9n)process.exit(2);"
+                     "if(e[0]!=='vector'||e[1][0][1]!==':a'||e[1][1][1]!=='first')process.exit(6);"
+                     "if(!Object.isFrozen(v)||!Object.isFrozen(v[1])||!Object.isFrozen(t))process.exit(3);"
+                     "try{x['bad-assoc']();process.exit(4)}catch(e){if(e.message!=='doc-vector-index-out-of-range')process.exit(5)}"
+                     "})"))]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const docVectorAt="))
+    (is (str/includes? source "const docVectorConj="))))
+
+(def keyword-from-string-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['context-key]
+   :effects #{}
+   :functions [{:name 'context-key :params [] :param-types []
+                :result :keyword :effects #{}
+                :body '(keyword-from-string "@context")}]})
+
+(deftest bounded-keywords-can-be-created-from-safe-runtime-text
+  (let [source (script/emit keyword-from-string-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node "node" "--input-type=module" "-e"
+                         (str "import('data:text/javascript;base64," encoded
+                              "').then(m=>{if(m.instantiateKotoba({})['context-key']()!==':@context')process.exit(2)})"))]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "const keywordFromString="))))
+
+(deftest rejects-unchecked-or-unknown-ir
+  (is (thrown? kerror/ExceptionInfo (script/emit {:format :unknown})))
+  (is (thrown? kerror/ExceptionInfo
+               (script/emit {:format :kotoba.kir/v3 :entry 'main :effects #{}
+                             :functions [{:name 'main :params [] :body '(fetch 1)}]}))))
+
+(deftest ast-verifier-rejects-obfuscated-ambient-authority
+  ;; Parsing normalizes the escaped spelling to the forbidden `globalThis`
+  ;; identifier before the authority check.
+  (is (thrown-with-msg? kerror/ExceptionInfo
+                        #"AST violates restricted subset"
+                        (script/verify-output!
+                         "export const x=global\\u0054his.fetch;")))
+  (is (thrown? kerror/ExceptionInfo
+               (script/verify-output! "export const x=({}).constructor;")))
+  (is (thrown? kerror/ExceptionInfo
+               (script/verify-output! "export const x=import('x');"))))
+
+(def generated-identifier-kir
+  {:format :kotoba.kir/v3 :entry nil :exports ['within-window]
+   :effects #{}
+   :functions
+   [{:name 'within-window
+     :params ['window-ms 'document-count 'process-id]
+     :param-types [:i64 :i64 :i64]
+     :result :i64
+     :effects #{}
+     :body '(if (<= document-count window-ms) process-id 0)}]})
+
+(deftest verifier-distinguishes-generated-identifiers-from-ambient-authority
+  (let [source (script/emit generated-identifier-kir)]
+    (is (string? source))
+    (is (str/includes? source "k$window$002dms"))
+    (is (str/includes? source "k$document$002dcount"))
+    (is (str/includes? source "k$process$002did")))
+  (is (= "export const x='window document process globalThis';"
+         (script/verify-output!
+          "export const x='window document process globalThis';")))
+  (doseq [source ["export const x=window;"
+                  "export const x=document;"
+                  "export const x=process;"
+                  "export const x={'__proto__':1};"]]
+    (is (thrown? kerror/ExceptionInfo
+                 (script/verify-output! source)))))
+
+(def typed-map-kir
+  (let [type [:map :keyword :i64]
+        option-type [:option :i64]
+        entry-type [:option [:vector [:keyword :i64]]]]
+    {:format :kotoba.kir/v4 :entry nil :exports ['present 'missing 'updated 'entry]
+     :effects #{}
+     :functions
+     [{:name 'present :params [] :param-types [] :result option-type :effects #{}
+       :body (list 'typed-map-get type
+                   (list 'typed-map-new type :b 2 :a 1) :b)}
+      {:name 'missing :params [] :param-types [] :result option-type :effects #{}
+       :body (list 'typed-map-get type (list 'typed-map-new type) :x)}
+      {:name 'updated :params [] :param-types [] :result :i64 :effects #{}
+       :body (list 'typed-map-count type
+                   (list 'typed-map-dissoc type
+                         (list 'typed-map-assoc type
+                               (list 'typed-map-new type :a 1) :b 2)
+                         :a))}
+      {:name 'entry :params [] :param-types [] :result entry-type :effects #{}
+       :body (list 'typed-map-entry-at type
+                   (list 'typed-map-new type :b 2 :a 1) 0)}]}))
+
+(deftest bounded-typed-maps-execute-with-canonical-keys-and-typed-absence
+  (let [source (script/emit typed-map-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "const p=x.present(),n=x.missing(),e=x.entry();"
+                     "if(p[1]!==true||p[2]!==2n||n[1]!==false||x.updated()!==1n||"
+                     "e[1]!==true||e[2][1]!==':a'||e[2][2]!==1n)process.exit(2)})"))]
+    (is (zero? (:exit result)) (:err result))
+    (is (str/includes? source "typedMapLimits:Object.freeze({entries:31})"))))
+
+(def typed-map-keys-vals-kir
+  (let [type [:map :keyword :i64]
+        keys-type [:list :keyword]
+        vals-type [:list :i64]]
+    {:format :kotoba.kir/v4 :entry nil :exports ['keys-count 'first-key 'first-val]
+     :effects #{}
+     :functions
+     [{:name 'keys-count :params [] :param-types [] :result :i64 :effects #{}
+       :body (list 'vector-count (list 'typed-map-keys type
+                                       (list 'typed-map-new type :b 2 :a 1)))}
+      {:name 'first-key :params [] :param-types [] :result keys-type :effects #{}
+       :body (list 'typed-map-keys type (list 'typed-map-new type :b 2 :a 1))}
+      {:name 'first-val :params [] :param-types [] :result vals-type :effects #{}
+       :body (list 'typed-map-vals type (list 'typed-map-new type :b 2 :a 1))}]}))
+
+(deftest typed-map-keys-and-vals-project-in-entry-order
+  (let [source (script/emit typed-map-keys-vals-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "const k=x['first-key'](),v=x['first-val']();"
+                     "if(x['keys-count']()!==2n||k[1][0]!==':a'||k[1][1]!==':b'||"
+                     "v[1][0]!==1n||v[1][1]!==2n)process.exit(2)})"))]
+    (is (zero? (:exit result)) (:err result))))
+
+(def xml-subset-kir
+  (let [option-string [:option :string]]
+    {:format :kotoba.kir/v4 :entry nil
+     :exports ['count-path 'count-name 'name-text 'text 'attr]
+     :effects #{}
+     :functions
+     [{:name 'count-path :params ['xml 'path] :param-types [:string :string]
+       :result :i64 :effects #{} :body '(xml-path-count xml path)}
+      {:name 'count-name :params ['xml 'name] :param-types [:string :string]
+       :result :i64 :effects #{} :body '(xml-name-count xml name)}
+      {:name 'name-text :params ['xml 'name 'index]
+       :param-types [:string :string :i64]
+       :result option-string :effects #{}
+       :body '(xml-name-text xml name index)}
+      {:name 'text :params ['xml 'path 'index]
+       :param-types [:string :string :i64]
+       :result option-string :effects #{}
+       :body '(xml-path-text xml path index)}
+      {:name 'attr :params ['xml 'path 'index 'attribute]
+       :param-types [:string :string :i64 :string]
+       :result option-string :effects #{}
+       :body '(xml-path-attr xml path index attribute)}]}))
+
+(deftest bounded-xml-subset-has-exact-path-text-and-typed-absence-semantics
+  (let [source (script/emit xml-subset-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        xml "<?xml version=\"1.0\" encoding=\"utf-8\"?><!-- bounded --><!DOCTYPE html><html><robot name=\"cart\"><link name=\"base\"> Hello <span>bounded</span> XML </link><link name='tip'/><joint name=\"slide\" type=\"prismatic\"><parent link=\"base\"/><child link=\"tip\"/></joint></robot></html>"
+        xml64 (kbytes/base64-encode (kbytes/utf8-bytes xml))
+        invalid ["<!DOCTYPE robot><robot/>"
+                 "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\"><html/>"
+                 "<!DOCTYPE html SYSTEM \"about:legacy-compat\"><html/>"
+                 "<!DOCTYPE html [<!ENTITY x \"unsafe\">]><html/>"
+                 "<!DOCTYPE html><!DOCTYPE html><html/>"
+                 "<robot><link name=\"a&amp;b\"/></robot>"
+                 "<robot a=\"1\" a=\"2\"/>"
+                 "<robot><link/></wrong>"
+                 "<?unsafe x?><robot/>"
+                 "<robot><![CDATA[x]]></robot>"
+                 "<robot/>trailing"
+                 (str (apply str (repeat 33 "<n>"))
+                      (apply str (repeat 33 "</n>")))
+                 (str "<robot "
+                      (str/join " " (map #(str "a" % "=\"x\"") (range 33)))
+                      "/>")
+                 (str "<robot>" (apply str (repeat 2048 "<n/>")) "</robot>")]
+        invalid64 (mapv #(kbytes/base64-encode
+                                         (kbytes/utf8-bytes ^String %)) invalid)
+        invalid-js (str "[" (str/join "," (map pr-str invalid64)) "]")
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),xml=Buffer.from('" xml64 "','base64').toString();"
+                "if(x['count-path'](xml,'html/robot/link')!==2n)process.exit(2);"
+                "if(x['count-path'](xml,'html/robot/link/span')!==1n)process.exit(3);"
+                "if(x['count-name'](xml,'link')!==2n||x['count-name'](xml,'span')!==1n)process.exit(7);"
+                "const tip=x.attr(xml,'html/robot/link',1n,'name'),missing=x.attr(xml,'html/robot/link',0n,'missing');"
+                "const text=x.text(xml,'html/robot/link',0n),nested=x.text(xml,'html/robot/link/span',0n),absent=x.text(xml,'html/robot/link',2n);"
+                "const named=x['name-text'](xml,'link',0n),namedAbsent=x['name-text'](xml,'link',2n);"
+                "if(!tip[1]||tip[2]!=='tip'||missing[1]||!text[1]||text[2]!=='Hello bounded XML'||!nested[1]||nested[2]!=='bounded'||absent[1]||!named[1]||named[2]!=='Hello bounded XML'||namedAbsent[1])process.exit(4);"
+                "for(const b of " invalid-js "){let trapped=false;try{x['count-path'](Buffer.from(b,'base64').toString(),'robot')}catch(e){trapped=true}if(!trapped)process.exit(5)}"
+                "for(const f of [()=>x['count-path'](xml,'robot//link'),"
+                "()=>x['count-path'](xml,'" (str/join "/" (repeat 33 "n")) "'),"
+                "()=>x['count-path']('<r a=\"" (apply str (repeat 65536 "x")) "\"/>','r'),"
+                "()=>x.attr(xml,'html/robot/link',-1n,'name'),"
+                "()=>x.text(xml,'html/robot/link',-1n),"
+                "()=>x['name-text'](xml,'link',-1n),"
+                "()=>x['count-name'](xml,'bad/name')]){let trapped=false;try{f()}catch(e){trapped=true}if(!trapped)process.exit(6)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (str (:err result) "\n" (:out result)))
+    (is (str/includes? source "xmlSubsetLimits:Object.freeze({nodes:2048,depth:32,attributesPerNode:32,pathSegments:32})"))
+    (is (not (re-find ambient-access-pattern source)))))
+
+(def decimal-f64-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['parse]
+   :effects #{}
+   :functions [{:name 'parse :params ['value] :param-types [:string]
+                :result [:option :f64] :effects #{}
+                :body '(decimal-f64-parse value)}]})
+
+(deftest bounded-decimal-f64-parser-is-finite-typed-and-preserves-negative-zero
+  (let [source (script/emit decimal-f64-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        valid ["0" "-0" "+1.5" "-2.4" ".5" "1." "6.022e23"
+               "1e-324" "5e-324" "1.7976931348623157e308"]
+        invalid ["" " " "NaN" "Infinity" "-Infinity" "0x10" "1_000"
+                 "1e0000" "1e309" (apply str (repeat 65 "1"))]
+        valid-js (str "[" (str/join "," (map pr-str valid)) "]")
+        invalid-js (str "[" (str/join "," (map pr-str invalid)) "]")
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "for(const s of " valid-js "){const v=x.parse(s);if(!v[1]||!Number.isFinite(v[2]))process.exit(2)}"
+                "if(!Object.is(x.parse('-0')[2],-0)||x.parse('1e-324')[2]!==0||x.parse('5e-324')[2]!==Number.MIN_VALUE)process.exit(3);"
+                "for(const s of " invalid-js "){const v=x.parse(s);if(v[1])process.exit(4)}})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (str (:err result) "\n" (:out result)))
+    (is (str/includes? source
+                       "decimalF64Limits:Object.freeze({bytes:64,vector3Bytes:194,finiteOnly:true,rounding:'nearest-ties-even'})"))
+    (is (not (re-find #"parseFloat|eval|Function" source)))))
+
+(def decimal-f64x3-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['parse]
+   :effects #{}
+   :functions [{:name 'parse :params ['value] :param-types [:string]
+                :result [:option [:vector [:f64 :f64 :f64]]] :effects #{}
+                :body '(decimal-f64x3-parse value)}]})
+
+(deftest bounded-decimal-f64x3-parser-is-fixed-width-and-atomic
+  (let [source (script/emit decimal-f64x3-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({}),ok=x.parse(' -0  1.5\\t5e-324 ');"
+                "if(!ok[1]||!Object.is(ok[2][1],-0)||ok[2][2]!==1.5||ok[2][3]!==Number.MIN_VALUE)process.exit(2);"
+                "for(const s of ['', '1 2', '1 2 3 4', '1,2,3', '1 NaN 3', '1 1e309 3', '1　2　3', ' '.repeat(195)])"
+                "if(x.parse(s)[1])process.exit(3)})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (str (:err result) "\n" (:out result)))
+    (is (str/includes? source "vector3Bytes:194"))
+    (is (not (re-find #"parseFloat|eval|Function" source)))))
+
+(def symbol-kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['make]
+   :effects #{}
+   :functions [{:name 'make :params ['value] :param-types [:string]
+                :result :symbol :effects #{}
+                :body '(symbol value)}]})
+
+(deftest typed-symbol-construction-is-validated
+  (let [source (script/emit symbol-kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        result (run-node
+                "node" "--input-type=module" "-e"
+                (str "import('data:text/javascript;base64," encoded
+                     "').then(m=>{const x=m.instantiateKotoba({});"
+                     "if(x.make('alpha/beta')!=='alpha/beta')process.exit(2);"
+                     "try{x.make('bad value');process.exit(3)}catch(e){}})"))]
+    (is (zero? (:exit result)) (str (:err result) "\n" (:out result)))
+    (is (str/includes? source "symbolFromString"))))
+
+(def string-index-of-kir
+  {:format :kotoba.kir/v4 :entry nil :exports '[byte-offset absent segments]
+   :effects #{}
+   :functions [{:name 'byte-offset :params [] :param-types [] :result :i64
+                :body '(+ (string-index-of "héllo wörld" "wö") 1)}
+               {:name 'absent :params [] :param-types [] :result :i64
+                :body '(string-index-of "abc" "zz")}
+               {:name 'segments :params [] :param-types [] :result :i64
+                :body '(string-split-count "a\nb\nc" "\n")}]})
+
+(defn -main [& _]
+  (let [{:keys [fail error]} (run-tests 'kotoba.script-test)]
+    (System/exit (if (pos? (+ fail error)) 1 0))))
+
+(deftest string-index-of-is-an-i64-byte-offset-and-split-count-counts-segments
+  ;; Guest-grammar contract: string-index-of -> i64 first UTF-8 BYTE offset,
+  ;; -1 when absent; string-split-count -> i64 segment count, non-empty sep.
+  ;; Before 2026-09-06 stringIndexOf returned a JS Number of code points, so a
+  ;; guest doing `(+ i 1)` threw "Cannot mix BigInt and other types", and
+  ;; string-split-count was not emitted at all ("unsupported KIR operation").
+  (let [kir string-index-of-kir
+        source (script/emit kir)
+        encoded (kbytes/base64-encode (kbytes/utf8-bytes source))
+        js (str "import('data:text/javascript;base64," encoded
+                "').then(m=>{const x=m.instantiateKotoba({});"
+                "console.log(String(x['byte-offset']())+' '+String(x.absent())+' '+String(x.segments()))})")
+        result (run-node "node" "--input-type=module" "-e" js)]
+    (is (zero? (:exit result)) (:err result))
+    ;; "héllo " is 7 bytes (é = 2), so "wö" starts at byte 7; +1 -> 8.
+    (is (= "8 -1 3\n" (:out result)))
+    (is (= source (script/emit kir)))))
+
+;; A code-point boundary violation must be DECIDED, not inferred from a throw.
+;;
+;; stringSubstring used to run the decode inside `try{...}catch(_){throw new
+;; Error('string-substring-code-point-boundary')}`. That catch is bare, so it
+;; renamed every failure raised inside it -- including the RangeError a deep
+;; guest recursion raises when the JS stack runs out. Measured 2026-09-08 in
+;; the workspace: a kbb guest scanning a 4 KB document with NO multi-byte
+;; character anywhere failed as `string-substring-code-point-boundary`, and the
+;; same guest with the substring taken out failed honestly as `Maximum call
+;; stack size exceeded`. The rename turned a missing tail-call optimisation
+;; into a false report about the UTF-8 surface.
+;;
+;; "aこb" is 5 UTF-8 bytes: a | e3 81 93 | b. (0,1) and (1,4) are boundaries;
+;; (1,2) cuts inside こ.
+;; The behaviour tests over these three fixtures live in test/nbb/parity.cljk,
+;; not here: they need a JS engine, not a JVM, and this namespace is one of the
+;; `kbb -M:test` sites the workspace is retiring (ADR-2609070200). The
+;; fixtures stay because scripts/gen-parity-golden.cljk lifts them into goldens,
+;; and the nbb suite reads the same fixture files -- one definition, not two.
+(def substring-boundary-kir
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main 'cut] :effects #{}
+   :functions
+   [{:name 'cut :params ['start 'end] :param-types [:i64 :i64]
+     :result :string :effects #{}
+     :body '(string-substring "aこb" start end)}
+    {:name 'main :params [] :param-types [] :result :string :effects #{}
+     :body '(cut 1 4)}]})
+
+(def deep-self-recursion-kir
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :effects #{}
+   :functions
+   [{:name 'countdown :params ['n 'acc] :param-types [:i64 :i64]
+     :result :i64 :effects #{}
+     :body '(if (= n 0) acc (countdown (- n 1) (+ acc 1)))}
+    {:name 'main :params [] :param-types [] :result :i64 :effects #{}
+     :body '(countdown 200000 0)}]})
+
+(def self-tail-call-argument-order-kir
+  {:format :kotoba.kir/v4 :entry 'main :exports ['main] :effects #{}
+   :functions
+   [{:name 'swap :params ['n 'a 'b] :param-types [:i64 :i64 :i64]
+     :result :i64 :effects #{}
+     :body '(if (= n 0) b (swap (- n 1) b a))}
+    {:name 'main :params [] :param-types [] :result :i64 :effects #{}
+     :body '(swap 1 1 2)}]})
+
