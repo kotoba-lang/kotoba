@@ -149,6 +149,7 @@ The bundled standard libraries live in this repository:
 | `org.si2.def` | `org.si2.def/src` | `def-format.component`, `def-format.design`, `def-format.net`, `def-format.parser` (an external specification, publisher si2.org) |
 | `org.etsi.pades` | `org.etsi.pades/src` | `pades.core` (an external specification, publisher etsi.org) |
 | `org.ros.urdf` | `org.ros.urdf/src` | `articulated_scene` (an external specification, publisher ros.org) |
+| `org.materialx.core` | `org.materialx.core/src` | `kotoba.materialx`, `materialx.core` (an external specification, publisher materialx.org) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
