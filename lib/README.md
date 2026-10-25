@@ -183,6 +183,7 @@ The bundled standard libraries live in this repository:
 | `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
 | `org.khronos.gltf` | `org.khronos.gltf/src` | `gltf`, `kotoba.gltf.retarget` (an external specification, publisher khronos.org) |
 | `org.accellera.uvm` | `org.accellera.uvm/src` | `uvm.component`, `uvm.factory`, `uvm.phase`, `uvm.rtl-driver` (an external specification, publisher accellera.org) |
+| `kotoba.physics2d` | `kotoba.physics2d/src` | `physics-2d`, `physics-2d.backend`, `physics-2d.stairs` (Kotoba project library) |
 | `kotoba.machineProbe` | `kotoba.machineProbe/src` | `machine.bench`, `machine.bench-cli`, `machine.calibrate-cli`, `machine.curve-cli` (Kotoba project library) |
 | `kotoba.kotobaSema` | `kotoba.kotobaSema/src` | `kotoba.compiler.affine`, `kotoba.compiler.frontend`, `kotoba.compiler.frontend.absence-resolution`, `kotoba.compiler.frontend.analyze` (Kotoba project library) |
 | `kotoba.engi` | `kotoba.engi/src` | `engi.chain`, `engi.core`, `engi.crypto`, `engi.metrics` (Kotoba project library) |
