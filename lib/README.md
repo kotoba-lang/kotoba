@@ -111,6 +111,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.rdap` | `org.ietf.rdap/src` | `rdap.jcard`, `rdap.response`, `rdap.service`, `rdap.status` (an external specification, publisher ietf.org) |
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
 | `kotoba.nostr` | `kotoba.nostr/src` | `nostr.blossom`, `nostr.crypto`, `nostr.event`, `nostr.http` (Kotoba project library) |
 | `kotoba.mokurokuUi` | `kotoba.mokurokuUi/src` | `mokuroku-ui.core` (Kotoba project library) |
 | `kotoba.traversal` | `kotoba.traversal/src` | `traversal.core` (Kotoba project library) |
