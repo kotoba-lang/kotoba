@@ -1,0 +1,447 @@
+(ns kotoba.image.jvm-oracle-test
+  "JVM ORACLE: kotoba.image against the JDK classes it replaces
+  (java.awt.image.BufferedImage, javax.imageio.ImageIO), pixel by pixel.
+  The body is #?(:clj ...): kbb skips it, scripts/jvm_test.cljk runs it on a
+  real JDK. Each deftest prints one `ORACLE <case> cases=.. pixels=..
+  mismatches=..` line; the README quotes them."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.image :as img]
+            [kotoba.image.gray :as gray]
+            [kotoba.image.pngs :as pngs]
+            [deflate.zlib :as zlib]))
+
+#?(:clj
+(do
+(import '[java.awt.image BufferedImage]
+        '[javax.imageio ImageIO]
+        '[java.io ByteArrayInputStream ByteArrayOutputStream File]
+        '[java.awt.color ColorSpace ICC_Profile])
+
+(defn- ->ba ^bytes [v] (byte-array (map unchecked-byte v)))
+(defn- ->v [^bytes b] (mapv #(bit-and (long %) 0xff) b))
+
+(defn- jdk-read ^BufferedImage [bytes]
+  (ImageIO/read (ByteArrayInputStream. (->ba bytes))))
+
+(defn- jdk-write-png [^BufferedImage bi]
+  (let [out (ByteArrayOutputStream.)]
+    (when-not (ImageIO/write bi "png" out) (throw (ex-info "no png writer" {})))
+    (->v (.toByteArray out))))
+
+(defn- jdk-claims?
+  "Would any ImageIO reader claim these bytes (read from a stream)?"
+  [bytes]
+  (let [iis (ImageIO/createImageInputStream (ByteArrayInputStream. (->ba bytes)))]
+    (.hasNext (ImageIO/getImageReaders iis))))
+
+(defn- report [label cases pixels mismatches & extra]
+  (println (apply str "ORACLE " label " cases=" cases " pixels=" pixels
+                  " mismatches=" mismatches (map #(str " " %) extra))))
+
+(defn- compare-read
+  "kotoba read-image vs ImageIO.read getRGB on every pixel of png bytes.
+  -> {:pixels n :mismatches m :type-ok? bool :first-mismatch ..}"
+  [bytes]
+  (let [bi (jdk-read bytes)
+        k (img/read-image bytes)
+        w (.getWidth bi) h (.getHeight bi)
+        bad (for [y (range h) x (range w)
+                  :let [j (.getRGB bi x y) o (img/get-rgb k x y)]
+                  :when (not= j o)]
+              {:x x :y y :jdk (format "%08x" j) :kotoba (format "%08x" o)})]
+    {:pixels (* w h)
+     :mismatches (count bad)
+     :first-mismatch (first bad)
+     :size-ok? (and (= w (img/width k)) (= h (img/height k)))}))
+
+(def ^:private rng (java.util.Random. 20260925))
+(defn- reseed!
+  "Each deftest draws from its own seed, so its counts do not depend on the
+  order clojure.test runs the vars in."
+  [label] (.setSeed ^java.util.Random rng (long (+ 20260925 (count label) (* 31 (reduce + (map int label)))))))
+(defn- rand-int* [n] (.nextInt ^java.util.Random rng (int n)))
+
+;; ── (a) ImageIO-written PNGs of every BufferedImage type ─────────────────────
+
+(def jdk-types
+  {"TYPE_INT_RGB" BufferedImage/TYPE_INT_RGB
+   "TYPE_INT_ARGB" BufferedImage/TYPE_INT_ARGB
+   "TYPE_INT_ARGB_PRE" BufferedImage/TYPE_INT_ARGB_PRE
+   "TYPE_BYTE_GRAY" BufferedImage/TYPE_BYTE_GRAY
+   "TYPE_USHORT_GRAY" BufferedImage/TYPE_USHORT_GRAY
+   "TYPE_BYTE_INDEXED" BufferedImage/TYPE_BYTE_INDEXED
+   "TYPE_BYTE_BINARY" BufferedImage/TYPE_BYTE_BINARY
+   "TYPE_4BYTE_ABGR" BufferedImage/TYPE_4BYTE_ABGR
+   "TYPE_3BYTE_BGR" BufferedImage/TYPE_3BYTE_BGR
+   "TYPE_USHORT_565_RGB" BufferedImage/TYPE_USHORT_565_RGB})
+
+(defn- random-bi ^BufferedImage [t w h]
+  (let [bi (BufferedImage. (int w) (int h) (int t))
+        r (.getRaster bi)
+        bands (.getNumBands r)
+        sizes (.getSampleSize (.getSampleModel r))]
+    (doseq [y (range h) x (range w) b (range bands)]
+      (.setSample r (int x) (int y) (int b)
+                  (int (rand-int* (bit-shift-left 1 (aget sizes b))))))
+    bi))
+
+(deftest a1-imageio-written-pngs
+  (reseed! "a1-imageio-written-pngs")
+  (let [totals (atom {:cases 0 :pixels 0 :mismatches 0})]
+    (doseq [[label t] (sort jdk-types)]
+      (let [per (atom {:cases 0 :pixels 0 :mismatches 0})]
+        (dotimes [_ 12]
+          (let [w (inc (rand-int* 40)) h (inc (rand-int* 40))
+                bytes (jdk-write-png (random-bi t w h))
+                r (compare-read bytes)]
+            (is (zero? (:mismatches r)) (str label " " w "x" h " " (:first-mismatch r)))
+            (is (:size-ok? r))
+            (swap! per #(-> % (update :cases inc) (update :pixels + (:pixels r))
+                            (update :mismatches + (:mismatches r))))))
+        (report (str "imageio-writer/" label) (:cases @per) (:pixels @per) (:mismatches @per))
+        (swap! totals #(merge-with + % @per))))
+    (report "imageio-writer/ALL" (:cases @totals) (:pixels @totals) (:mismatches @totals))))
+
+;; ── (a) hand-built PNGs: every colour type x bit depth x tRNS ────────────────
+
+(defn- random-rows [w h ch bits]
+  (vec (for [_ (range h)]
+         (vec (for [_ (range (* w ch))] (rand-int* (bit-shift-left 1 bits)))))))
+
+(def kinds
+  [[:gray 1] [:gray 2] [:gray 4] [:gray 8] [:gray 16]
+   [:rgb 8] [:rgb 16]
+   [:indexed 1] [:indexed 2] [:indexed 4] [:indexed 8]
+   [:gray-alpha 8] [:gray-alpha 16]
+   [:rgba 8] [:rgba 16]])
+
+(defn- case-png
+  "One random PNG of `color`/`bits`; `variant` in #{:plain :trns :trns-raw}."
+  [color bits variant]
+  (let [w (inc (rand-int* 24)) h (inc (rand-int* 24))
+        ch (pngs/channels color)
+        rows (random-rows w h ch bits)
+        some-px (fn [] (let [row (nth rows (rand-int* h)) x (rand-int* w)]
+                         (subvec row (* x ch) (* (inc x) ch))))
+        before
+        (case color
+          :indexed
+          (let [n (inc (rand-int* (bit-shift-left 1 bits)))
+                plte (vec (repeatedly (* 3 n) #(rand-int* 256)))]
+            (cond-> [["PLTE" plte]]
+              (not= variant :plain)
+              (conj ["tRNS" (vec (repeatedly (rand-int* (+ n 3)) #(rand-int* 256)))])))
+          :gray
+          (case variant
+            :plain []
+            ;; the raw sample of a pixel that exists
+            :trns-raw [["tRNS" (pngs/u16be (first (some-px)))]]
+            ;; for sub-byte depths: the SCALED value of a pixel that exists
+            :trns (let [s (first (some-px)) mx (dec (bit-shift-left 1 bits))]
+                    [["tRNS" (pngs/u16be (if (< bits 8) (quot (+ (* s 255) (quot mx 2)) mx) s))]]))
+          :rgb
+          (if (= variant :plain) []
+              [["tRNS" (vec (mapcat pngs/u16be (some-px)))]])
+          [])]
+    {:bytes (pngs/png-bytes {:width w :height h :color color :bits bits :rows rows :before before})
+     :trns? (boolean (some #(= "tRNS" (first %)) before))}))
+
+(deftest a2-every-png-kind
+  (reseed! "a2-every-png-kind")
+  (let [totals (atom {:cases 0 :pixels 0 :mismatches 0 :type-rule 0})]
+    (doseq [[color bits] kinds
+            variant (if (#{:gray :rgb :indexed} color) [:plain :trns :trns-raw] [:plain])]
+      (let [per (atom {:cases 0 :pixels 0 :mismatches 0 :type-rule 0})]
+        (dotimes [_ 10]
+          (let [{:keys [bytes trns?]} (case-png color bits variant)
+                r (compare-read bytes)
+                k (img/read-image bytes)
+                want-type (if (or (#{:rgba :gray-alpha} color) trns?) :argb :rgb)]
+            (is (zero? (:mismatches r)) (str color bits variant " " (:first-mismatch r)))
+            (is (= want-type (img/image-type k)) "contract: :argb iff colour type 4/6 or tRNS")
+            (swap! per #(-> % (update :cases inc) (update :pixels + (:pixels r))
+                            (update :mismatches + (:mismatches r))
+                            (update :type-rule + (if (= want-type (img/image-type k)) 0 1))))))
+        (report (str "hand-built/" (name color) "-" bits "/" (name variant))
+                (:cases @per) (:pixels @per) (:mismatches @per))
+        (swap! totals #(merge-with + % @per))))
+    (report "hand-built/ALL" (:cases @totals) (:pixels @totals) (:mismatches @totals)
+            (str "type-rule-violations=" (:type-rule @totals)))))
+
+;; ── (a) boundary palettes: every PLTE length around the rounding points ──────
+
+(deftest a3-palette-rounding
+  (reseed! "a3-palette-rounding")
+  (let [per (atom {:cases 0 :pixels 0 :mismatches 0})]
+    (doseq [bits [1 2 4 8]
+            n [1 2 3 4 5 15 16 17 255 256 257]
+            trns-len [nil 0 1 (dec n) n (inc n) 300]
+            :when (<= n 257)]
+      (let [cap (bit-shift-left 1 bits)
+            w cap h 1
+            ;; every index the bit depth allows, so the padding is read
+            rows [(vec (range cap))]
+            plte (vec (for [i (range n) c (range 3)] (mod (+ (* 37 i) (* 91 c) 11) 256)))
+            before (cond-> [["PLTE" plte]]
+                     trns-len (conj ["tRNS" (vec (for [i (range trns-len)] (mod (* 53 i) 256)))]))
+            bytes (pngs/png-bytes {:width w :height h :color :indexed :bits bits :rows rows :before before})
+            r (compare-read bytes)]
+        (is (zero? (:mismatches r)) (str "bits " bits " n " n " trns " trns-len " " (:first-mismatch r)))
+        (swap! per #(-> % (update :cases inc) (update :pixels + (:pixels r))
+                        (update :mismatches + (:mismatches r))))))
+    (report "palette-rounding" (:cases @per) (:pixels @per) (:mismatches @per))))
+
+;; ── (a) exhaustive 16-bit and 8-bit conversions ──────────────────────────────
+
+(deftest a4-exhaustive-sample-conversions
+  (reseed! "a4-exhaustive-sample-conversions")
+  (testing "every 16-bit sample in every 16-bit colour type"
+    (let [all (vec (range 65536))
+          rows (fn [f] (vec (for [y (range 256)] (vec (mapcat #(f (+ (* y 256) %)) (range 256))))))
+          cases {"rgb-16" {:color :rgb :rows (rows (fn [v] [v (- 65535 v) (bit-and (* v 7) 0xffff)]))}
+                 "rgba-16" {:color :rgba :rows (rows (fn [v] [(bit-and (* v 3) 0xffff) v (- 65535 v) v]))}
+                 "gray-16" {:color :gray :rows (rows (fn [v] [v]))}
+                 "gray-alpha-16" {:color :gray-alpha :rows (rows (fn [v] [(- 65535 v) v]))}}]
+      (doseq [[label {:keys [color rows]}] (sort cases)]
+        (let [r (compare-read (pngs/png-bytes {:width 256 :height 256 :color color :bits 16 :rows rows}))]
+          (is (zero? (:mismatches r)) (str label " " (:first-mismatch r)))
+          (report (str "exhaustive/" label) 1 (:pixels r) (:mismatches r))))))
+  (testing "the gray LUTs, entry by entry, against BufferedImage"
+    (let [g8 (BufferedImage. 256 1 BufferedImage/TYPE_BYTE_GRAY)
+          g16 (BufferedImage. 65536 1 BufferedImage/TYPE_USHORT_GRAY)]
+      (dotimes [i 256] (.setSample (.getRaster g8) i 0 0 i))
+      (dotimes [i 65536] (.setSample (.getRaster g16) i 0 0 i))
+      (let [bad8 (count (remove #(= (.getRGB g8 % 0)
+                                    (unchecked-int (bit-or 0xff000000 (* 0x010101 (gray/srgb8 8 %)))))
+                                (range 256)))
+            bad16 (count (remove #(= (.getRGB g16 % 0)
+                                     (unchecked-int (bit-or 0xff000000 (* 0x010101 (gray/srgb8 16 %)))))
+                                 (range 65536)))]
+        (is (zero? bad8)) (is (zero? bad16))
+        (report "gray-lut/8" 256 256 bad8)
+        (report "gray-lut/16" 65536 65536 bad16)))))
+
+;; ── (a) ancillary chunks ImageIO does not apply ──────────────────────────────
+
+(defn- iccp-chunk []
+  (let [profile (->v (.getData (ICC_Profile/getInstance ColorSpace/CS_LINEAR_RGB)))]
+    ["iCCP" (vec (concat (map int "linear") [0 0] (zlib/wrap profile)))]))
+
+(deftest a5-colour-management-chunks-are-not-applied
+  (reseed! "a5-colour-management-chunks-are-not-applied")
+  (let [per (atom {:cases 0 :pixels 0 :mismatches 0})
+        extras {"gAMA" [["gAMA" [0 0 0xaf 0xc8]]]              ; 1/2.2 -> 0.45
+                "gAMA-1.0" [["gAMA" [0 1 0x86 0xa0]]]
+                "sRGB" [["sRGB" [0]]]
+                "cHRM" [["cHRM" (vec (repeat 32 1))]]
+                "iCCP" [(iccp-chunk)]
+                "all" [["gAMA" [0 0 0xaf 0xc8]] (iccp-chunk) ["cHRM" (vec (repeat 32 1))]]}]
+    (doseq [[label chunks] (sort extras)
+            [color bits] [[:rgb 8] [:gray 8] [:rgba 16] [:indexed 8]]]
+      (let [w 9 h 7 ch (pngs/channels color)
+            before (if (= :indexed color)
+                     (into chunks [["PLTE" (vec (repeatedly (* 3 256) #(rand-int* 256)))]])
+                     chunks)
+            bytes (pngs/png-bytes {:width w :height h :color color :bits bits
+                                   :rows (random-rows w h ch bits) :before before})
+            plain (pngs/png-bytes {:width 1 :height 1 :color :rgb :bits 8 :rows [[1 2 3]]})
+            r (compare-read bytes)]
+        (is (zero? (:mismatches r)) (str label " " color bits " " (:first-mismatch r)))
+        (is (some? plain))
+        (swap! per #(-> % (update :cases inc) (update :pixels + (:pixels r))
+                        (update :mismatches + (:mismatches r))))))
+    (report "gAMA-iCCP-sRGB-cHRM" (:cases @per) (:pixels @per) (:mismatches @per))))
+
+;; ── (a) chunk placement ImageIO.read looks at (ignoreMetadata) ───────────────
+
+(deftest a6-trns-placement
+  (reseed! "a6-trns-placement")
+  (let [cases [;; gray tRNS after the IDAT: ImageIO.read ignores it
+               {:color :gray :bits 8 :rows [[5 6]] :after [["tRNS" [0 5]]]}
+               ;; wrong-length tRNS for rgb: ignored
+               {:color :rgb :bits 8 :rows [[1 2 3 4 5 6]] :before [["tRNS" [0 1 0 2]]]}
+               ;; two gray tRNS: the last valid one wins
+               {:color :gray :bits 8 :rows [[5 6]] :before [["tRNS" [0 5]] ["tRNS" [0 6]]]}
+               ;; palette tRNS AFTER the IDAT still counts (full metadata parse)
+               {:color :indexed :bits 8 :rows [[0 1]] :before [["PLTE" [1 2 3 4 5 6]]]
+                :after [["tRNS" [7]]]}
+               ;; palette: an empty tRNS before the PLTE is skipped cleanly
+               {:color :indexed :bits 8 :rows [[0 1]] :before [["tRNS" []] ["PLTE" [1 2 3 4 5 6]]]}
+               ;; palette: well-formed ancillary chunks of every parsed kind
+               {:color :indexed :bits 2 :rows [[0 1 2 3]]
+                :before [["gAMA" [0 0 0xaf 0xc8]] ["sRGB" [1]] ["cHRM" (vec (repeat 32 2))]
+                         ["pHYs" (vec (repeat 9 3))] ["sBIT" [8 8 8]] ["tIME" [7 0xe0 9 25 1 2 3]]
+                         ["tEXt" (vec (concat (map int "Title") [0] (map int "x")))]
+                         ["sPLT" (vec (concat (map int "p") [0 8] (repeat 12 5)))]
+                         ["PLTE" [1 2 3 4 5 6 7 8 9]] ["bKGD" [1]] ["hIST" [0 1 0 2 0 3]]
+                         ["zTXt" [1 2 3]] ["iTXt" [4 5 6]] ["abCd" [9 9]]]}
+               ;; an empty IDAT after a tEXt after the image data: ImageIO stops at
+               ;; the tEXt, png.core concatenates -- both see the same pixels
+               {:color :rgb :bits 8 :rows [[1 2 3 4 5 6]] :after [["tEXt" [65 0]] ["IDAT" []]]}
+               ;; 16-bit rgb with tRNS
+               {:color :rgb :bits 16 :rows [[1 2 3 4 5 6]] :before [["tRNS" [0 1 0 2 0 3]]]}
+               ;; gray 8 tRNS value above 255: never matches
+               {:color :gray :bits 8 :rows [[0 1]] :before [["tRNS" [1 0]]]}]
+        mism (reduce + (for [c cases]
+                         (let [bytes (pngs/png-bytes (merge {:width (quot (count (first (:rows c)))
+                                                                          (pngs/channels (:color c)))
+                                                             :height 1} c))
+                               r (compare-read bytes)]
+                           (is (zero? (:mismatches r)) (str c " " (:first-mismatch r)))
+                           (:mismatches r))))]
+    (report "trns-placement" (count cases) "-" mism)))
+
+(deftest a6b-where-imageio-throws-we-refuse
+  (reseed! "a6b-where-imageio-throws-we-refuse")
+  (let [pal {:width 2 :height 1 :color :indexed :bits 8 :rows [[0 1]]}
+        plte ["PLTE" [1 2 3 4 5 6]]
+        cases {"palette tRNS before PLTE" (assoc pal :before [["tRNS" [7]] plte])
+               "palette second PLTE" (assoc pal :before [plte plte])
+               "palette gAMA length 3" (assoc pal :before [plte ["gAMA" [0 0 1]]])
+               "palette sRGB length 2" (assoc pal :before [plte ["sRGB" [0 0]]])
+               "palette hIST before PLTE" (assoc pal :before [["hIST" [0 1]] plte])
+               "palette hIST odd length" (assoc pal :before [plte ["hIST" [0 1 2]]])
+               "palette tEXt no terminator" (assoc pal :before [plte ["tEXt" (vec (map int "abc"))]])
+               "palette iCCP empty profile" (assoc pal :before [plte ["iCCP" [65 0 0]]])
+               "palette sPLT depth 4" (assoc pal :before [plte ["sPLT" [65 0 4 1 2 3 4 5 6]]])
+               "palette sPLT ragged" (assoc pal :before [plte ["sPLT" [65 0 8 1 2 3 4 5 6 7]]])
+               "rgba tRNS" {:width 1 :height 1 :color :rgba :bits 8 :rows [[1 2 3 4]]
+                            :before [["tRNS" [0 1]]]}}
+        run (fn [label c]
+              (let [bytes (pngs/png-bytes c)]
+                (when bytes
+                  (let [jdk (try (jdk-read bytes) :decoded (catch Exception _ :threw))
+                        ours (try (img/read-image bytes) :decoded
+                                  (catch Exception e (:reason (ex-data e))))]
+                    (is (= :threw jdk) (str label ": ImageIO throws"))
+                    (is (= :malformed ours) (str label ": we refuse :malformed, got " ours))
+                    (and (= :threw jdk) (= :malformed ours))))))
+        results (keep (fn [[l c]] (run l c)) cases)]
+    (report "imageio-throws->refused" (count results) "-" (count (remove true? results)))))
+
+;; ── sniffing: does some ImageIO reader claim the bytes iff we do? ────────────
+
+(defn- our-claim [bytes]
+  (try (if (nil? (img/read-image bytes)) :none :png)
+       (catch Exception e
+         (let [d (ex-data e)]
+           (case (:kotoba.image/error d)
+             :unsupported-format (:format d)
+             :unsupported-png :png
+             (throw e))))))
+
+(deftest a7-sniffing-agrees-with-imageio
+  (reseed! "a7-sniffing-agrees-with-imageio")
+  (let [crafted [[] [0] [0 0] [0 0 1] [0 0 1 1] [0 0 1 1 0] [0 0 0x87 0x7f 1 1]
+                 [0 0 0x88 0x00 1 1] [0 0 1 0x85 0x7f] [0 0 1 0x86 0x00] [0 1 1 1 0]
+                 [1 0 1 1 0] [0 0 0x80 1 1] [0 0 0xff 0xff 0xff 0xff 0x7f 1]
+                 [0xff 0xd8] [0xff 0xd9] [0xff] (mapv int "GIF89a") (mapv int "GIF87a")
+                 (mapv int "GIF88a") (mapv int "GIF8") [0x42 0x4d] [0x42] [0x42 0x4e]
+                 [0x49 0x49 0x2a 0] [0x4d 0x4d 0 0x2a] [0x49 0x49 0 0x2a]
+                 [137 80 78 71 13 10 26] (mapv int "hello")]
+        randoms (repeatedly 2000 (fn [] (vec (repeatedly (rand-int* 12) #(rand-int* 256)))))
+        results (for [b (concat crafted randoms)]
+                  (let [jdk (jdk-claims? b) ours (our-claim b)]
+                    {:b b :ok (= jdk (not= :none ours))}))
+        bad (remove :ok results)]
+    (is (empty? bad) (str (take 5 bad)))
+    (report "sniff" (count results) "-" (count bad)
+            (str "claimed-by-imageio=" (count (filter #(jdk-claims? (:b %)) results))))))
+
+(deftest a8-refusals-are-honest
+  (reseed! "a8-refusals-are-honest")
+  (testing "every :unsupported-png case is one ImageIO either decodes or throws on -- never null"
+    (let [bi (random-bi BufferedImage/TYPE_INT_RGB 9 7)
+          interlaced (let [w (.next (ImageIO/getImageWritersByFormatName "png"))
+                           p (doto (.getDefaultWriteParam w)
+                               (.setProgressiveMode javax.imageio.ImageWriteParam/MODE_DEFAULT))
+                           out (ByteArrayOutputStream.)
+                           ios (ImageIO/createImageOutputStream out)]
+                       (.setOutput w ios)
+                       (.write w nil (javax.imageio.IIOImage. bi nil nil) p)
+                       (.close ios)
+                       (->v (.toByteArray out)))]
+      (is (= 1 (nth interlaced 28)) "the IHDR interlace byte ImageIO wrote is Adam7")
+      (is (= :interlaced (:reason (try (img/read-image interlaced) nil (catch Exception e (ex-data e))))))
+      (is (some? (jdk-read interlaced)) "ImageIO decodes Adam7 -- so we refuse, not nil")
+      (let [no-plte (pngs/png-bytes {:width 1 :height 1 :color :indexed :bits 8 :rows [[0]]})]
+        (is (thrown? javax.imageio.IIOException (jdk-read no-plte)))))))
+
+;; ── (b) kotoba write-png -> ImageIO.read ─────────────────────────────────────
+
+(deftest b-written-pngs-read-back-in-imageio
+  (reseed! "b-written-pngs-read-back-in-imageio")
+  (let [per (atom {:cases 0 :pixels 0 :mismatches 0})]
+    (doseq [type [:rgb :argb] _ (range 25)]
+      (let [w (inc (rand-int* 50)) h (inc (rand-int* 50))
+            m (img/create w h type)]
+        (doseq [y (range h) x (range w)]
+          (img/set-rgb! m x y (.nextInt ^java.util.Random rng)))
+        (let [bi (jdk-read (->v (img/write-png m)))
+              bad (count (for [y (range h) x (range w)
+                               :when (not= (.getRGB bi x y) (img/get-rgb m x y))] 1))]
+          (is (zero? bad))
+          (is (= (if (= type :argb) BufferedImage/TYPE_4BYTE_ABGR BufferedImage/TYPE_3BYTE_BGR)
+                 (.getType bi)))
+          (swap! per #(-> % (update :cases inc) (update :pixels + (* w h))
+                          (update :mismatches + bad))))))
+    (report "write-png->ImageIO.read" (:cases @per) (:pixels @per) (:mismatches @per))))
+
+(deftest b2-files
+  (reseed! "b2-files")
+  (let [f (File/createTempFile "kotoba-image-oracle" ".png")
+        m (img/create 5 4 :argb)]
+    (doseq [y (range 4) x (range 5)] (img/set-rgb! m x y (.nextInt ^java.util.Random rng)))
+    (is (true? (img/write-png-file! m (.toPath f))))
+    (let [bi (ImageIO/read f)]
+      (is (= (img/pixels m) (vec (for [y (range 4) x (range 5)] (.getRGB bi x y))))))
+    (is (= (img/pixels m) (img/pixels (img/read-file f))) "java.io.File")
+    (is (= (img/pixels m) (img/pixels (img/read-file (.getPath f)))) "String")
+    (testing "WBMP sniff on a File knows the length (FileImageInputStream)"
+      (java.nio.file.Files/write (.toPath f) (->ba [0 0 1 1 0x80]) (make-array java.nio.file.OpenOption 0))
+      (is (some? (ImageIO/read f)) "ImageIO decodes a 1x1 WBMP file")
+      (is (= :wbmp (:format (try (img/read-file f) (catch Exception e (ex-data e))))))
+      (java.nio.file.Files/write (.toPath f) (->ba [0 0 1 1]) (make-array java.nio.file.OpenOption 0))
+      (is (nil? (ImageIO/read f)) "no raster byte: no reader claims the file")
+      (is (nil? (img/read-file f))))
+    (.delete f)
+    (is (thrown-with-msg? javax.imageio.IIOException #"Can't read input file!" (ImageIO/read f)))
+    (is (= :cannot-read (:kotoba.image/error (try (img/read-file f) (catch Exception e (ex-data e))))))))
+
+;; ── (c) BufferedImage.getRGB/setRGB vs get-rgb/set-rgb! ──────────────────────
+
+(deftest c-set-get-against-buffered-image
+  (reseed! "c-set-get-against-buffered-image")
+  (let [per (atom {:writes 0 :pixels 0 :mismatches 0 :bounds 0 :bounds-mismatch 0})
+        specials [0 -1 0x7fffffff (unchecked-int 0x80000000) (unchecked-int 0xff0080ff)
+                  0x00ffffff 0x01000000 (unchecked-int 0xfe000001)]]
+    (doseq [[type jt] [[:rgb BufferedImage/TYPE_INT_RGB] [:argb BufferedImage/TYPE_INT_ARGB]]
+            _ (range 20)]
+      (let [w (inc (rand-int* 30)) h (inc (rand-int* 30))
+            bi (BufferedImage. (int w) (int h) (int jt))
+            m (img/create w h type)]
+        (dotimes [_ (* 3 w h)]
+          (let [x (rand-int* w) y (rand-int* h)
+                v (if (zero? (rand-int* 5))
+                    (nth specials (rand-int* (count specials)))
+                    (.nextInt ^java.util.Random rng))
+                ;; the kotoba side gets the same bits as a long sometimes
+                kv (if (zero? (rand-int* 2)) v (bit-and (long v) 0xffffffff))]
+            (.setRGB bi x y (int v))
+            (img/set-rgb! m x y kv)
+            (swap! per update :writes inc)))
+        (let [bad (count (for [y (range h) x (range w)
+                               :when (not= (.getRGB bi x y) (img/get-rgb m x y))] 1))]
+          (is (zero? bad) (str type " " w "x" h))
+          (swap! per #(-> % (update :pixels + (* w h)) (update :mismatches + bad))))
+        (doseq [x [-1 0 (dec w) w] y [-1 0 (dec h) h]]
+          (let [jdk (try (.getRGB bi (int x) (int y)) :ok
+                         (catch ArrayIndexOutOfBoundsException _ :oob))
+                ours (try (img/get-rgb m x y) :ok
+                          (catch Exception e (if (= :out-of-bounds (:kotoba.image/error (ex-data e))) :oob e)))]
+            (is (= jdk ours) (str "bounds " x "," y " in " w "x" h))
+            (swap! per #(-> % (update :bounds inc)
+                            (update :bounds-mismatch + (if (= jdk ours) 0 1))))))))
+    (report "setRGB-getRGB" (:writes @per) (:pixels @per) (:mismatches @per)
+            (str "bounds-probes=" (:bounds @per) " bounds-mismatches=" (:bounds-mismatch @per)))))
+))
