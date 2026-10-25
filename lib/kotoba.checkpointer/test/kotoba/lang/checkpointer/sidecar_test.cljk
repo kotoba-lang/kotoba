@@ -1,0 +1,98 @@
+(ns kotoba.lang.checkpointer.sidecar-test
+  "True end-to-end test: starts a REAL Unix-domain-socket server
+  (kotoba.lang.checkpointer.sidecar/start!, backed by a real temp-dir state
+  dir), connects a REAL client SocketChannel, sends a framed msgpack `put`
+  request exactly like the wire protocol defines (4-byte big-endian length
+  prefix + msgpack), and verifies the response's mst_root_cid matches what
+  kotoba.lang.checkpointer.commit/commit-mst computes directly for the same
+  input (which is itself cross-checked against real @atproto/repo output in
+  commit_test.clj) -- i.e. this test proves the socket/framing/dispatch
+  plumbing doesn't corrupt anything between the wire and the pure core.
+
+  `.clj`, genuinely JVM-only (not a compliance gap): drives a real
+  `java.net.UnixDomainSocketAddress` server + client -- sidecar.clj itself
+  is `.clj`-only, see its namespace docstring."
+  (:require [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.checkpointer.sidecar :as sidecar]
+            [kotoba.lang.checkpointer.msgpack :as msgpack]
+            [kotoba.lang.checkpointer.commit :as commit])
+  (:import (java.net UnixDomainSocketAddress)
+           (java.nio.channels SocketChannel)))
+
+(defn- temp-dir []
+  (str (kio/temp-dir "checkpointer-sidecar-test")))
+
+(defn- short-socket-path
+  "A Unix-domain-socket path is bound by `sun_path` (~104 bytes on macOS,
+  ~108 on Linux) -- `java.io.tmpdir`-derived temp DIRECTORIES (used for
+  state-dir, which has no such length constraint) can be long enough
+  (`/var/folders/.../T/...` on macOS) that appending a socket filename risks
+  overflowing that limit. Build the actual socket path directly under
+  `/tmp` (short, guaranteed-present on every POSIX host this JVM runs on)
+  instead, independent of state-dir's path length."
+  []
+  (str "/tmp/ckpt-e2e-" (System/nanoTime) ".sock"))
+
+(defn- client-send-frame! [^SocketChannel ch req]
+  (sidecar/write-frame! ch (msgpack/encode req)))
+
+(defn- client-read-frame [^SocketChannel ch]
+  (msgpack/decode (sidecar/read-frame ch)))
+
+(deftest end-to-end-put-over-real-socket-test
+  (let [state-dir (temp-dir)
+        socket-path (short-socket-path)
+        cfg {:socket-path socket-path :state-dir state-dir :allowed-dids #{"did:key:zE2E"}}
+        sc (sidecar/start! cfg)]
+    (try
+      (with-open [ch (SocketChannel/open (UnixDomainSocketAddress/of socket-path))]
+        (testing "health check over the real socket"
+          (client-send-frame! ch {"v" 1 "op" "health" "cell_did" "did:key:zE2E"
+                                   "thread_id" nil "checkpoint_ns" nil "checkpoint_id" nil
+                                   "payload" nil "meta" {}})
+          (let [res (client-read-frame ch)]
+            (is (get res "ok"))
+            (is (= {"status" "ok"} (msgpack/decode (get res "data"))))))
+
+        (testing "put over the real socket -- root CID matches the pure commit-mst pipeline directly"
+          (let [payload-value {"messages" ["hello from a real unix socket"] "step" 7}
+                req {"v" 1 "op" "put" "cell_did" "did:key:zE2E" "thread_id" "thread-e2e"
+                     "checkpoint_ns" "" "checkpoint_id" "cp-e2e-1"
+                     "payload" (msgpack/encode payload-value) "meta" {}}
+                expected (commit/commit-mst {:cell-did "did:key:zE2E" :thread-id "thread-e2e"
+                                              :checkpoint-ns "" :checkpoint-id "cp-e2e-1"
+                                              :payload payload-value})]
+            (client-send-frame! ch req)
+            (let [res (client-read-frame ch)]
+              (is (get res "ok"))
+              (is (= (:root-cid expected) (get res "mst_root_cid"))))))
+
+        (testing "get_tuple over the real socket returns the original payload bytes back"
+          (client-send-frame! ch {"v" 1 "op" "get_tuple" "cell_did" "did:key:zE2E" "thread_id" "thread-e2e"
+                                   "checkpoint_ns" "" "checkpoint_id" "cp-e2e-1"
+                                   "payload" nil "meta" {}})
+          (let [res (client-read-frame ch)]
+            (is (get res "ok"))
+            (is (= {"messages" ["hello from a real unix socket"] "step" 7} (msgpack/decode (get res "data"))))))
+
+        (testing "an unprovisioned cell_did is rejected over the real socket"
+          (client-send-frame! ch {"v" 1 "op" "put" "cell_did" "did:key:zNope" "thread_id" "t"
+                                   "checkpoint_ns" "" "checkpoint_id" "x" "payload" (msgpack/encode {}) "meta" {}})
+          (let [res (client-read-frame ch)]
+            (is (false? (get res "ok")))
+            (is (re-find #"not provisioned" (get res "error"))))))
+      (finally (sidecar/stop! sc)))))
+
+(deftest multiple-sequential-requests-on-one-connection-test
+  (let [state-dir (temp-dir)
+        socket-path (short-socket-path)
+        sc (sidecar/start! {:socket-path socket-path :state-dir state-dir :allowed-dids #{"did:key:zMulti"}})]
+    (try
+      (with-open [ch (SocketChannel/open (UnixDomainSocketAddress/of socket-path))]
+        (dotimes [i 5]
+          (client-send-frame! ch {"v" 1 "op" "put" "cell_did" "did:key:zMulti" "thread_id" "t"
+                                   "checkpoint_ns" "" "checkpoint_id" (str "cp-" i)
+                                   "payload" (msgpack/encode {"i" i}) "meta" {}})
+          (let [res (client-read-frame ch)]
+            (is (get res "ok") (str "request " i " failed: " (get res "error"))))))
+      (finally (sidecar/stop! sc)))))
