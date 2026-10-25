@@ -1,0 +1,111 @@
+#!/usr/bin/env kbb
+;; Acceptance for `shitsuke.kotoba.guest`: drive the REAL compiled artifact.
+;;
+;; The bridge is small enough that a test with a hand-written `call` function
+;; would pass on a day when the guest answered nothing -- a stub would agree
+;; with a stub. So this builds `kotoba/example_counter.kotoba` with amu and
+;; calls the emitted restricted ESM, which is the same artifact a Cloudflare
+;; Worker and a browser bundle load.
+;;
+;; nbb rather than the JVM suite: this repo's `kbb -M:test` needs a JVM,
+;; and the runtime order here puts nbb above it. The seam's :clj branch (the
+;; mini runtime + install-guest!) is covered by test/shitsuke/kotoba_guest_test.cljk.
+;;
+;; Exit codes: 0 passed, 1 failed, 2 REFUSED (the tools to answer are absent,
+;; which is not a pass).
+;;
+;;   kbb --backend sci --classpath src test/kotoba/guest_acceptance.cljk
+
+(ns kotoba.guest-acceptance
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [shitsuke.kotoba.guest :as kg]))
+
+(def script (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+                "lib/kotoba.shitsuke/test/kotoba/guest_acceptance.cljk"))
+(def root (path/resolve (path/dirname (path/resolve script)) ".." ".."))
+
+(defn sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check! [label expected actual]
+  (swap! checks inc)
+  (when-not (= expected actual)
+    (swap! failures inc)
+    (println "  FAIL" label "\n    expected:" (pr-str expected) "\n    actual:  " (pr-str actual))))
+
+(defn build! [dir]
+  (let [entry (path/join root "kotoba" "example_counter.kotoba")
+        src (path/join root "kotoba")
+        blocks (path/join dir "blocks")
+        lock (path/join dir "counter.lock.edn")
+        out (path/join dir "counter.mjs")]
+    (let [l (sh "kotoba" ["-M" "module-lock" entry "--source-path" src
+                          "--blocks" blocks "--output" lock])]
+      (when-not (zero? (:exit l))
+        (println "module-lock failed:" (:err l)) (js/process.exit 1)))
+    (let [c (sh "kotoba" ["-M" "compile" "--module-lock" lock "--blocks" blocks
+                          "--target" "js" "--output" out])]
+      (when-not (zero? (:exit c))
+        (println "compile failed:" (:err c)) (js/process.exit 1)))
+    out))
+
+(defn run [artifact]
+  (-> (js/import artifact)
+      (.then
+       (fn [mod]
+         ;; One instance per call: instantiateKotoba opens a fuel budget that
+         ;; is spent and never replenished, and the guest is pure, so nothing
+         ;; is carried between calls except the db value itself.
+         (let [g (kg/guest (fn [export & args]
+                             (let [inst (.instantiateKotoba mod)]
+                               (.apply (aget inst export) inst (clj->js args)))))
+               db (kg/init g)]
+           (check! "init is ordinary Clojure data" {:count 0 :label "clicks"} db)
+           (check! "step applies an event" 5 (:count (kg/step g db [:counter/set 5])))
+           (check! "an unknown event leaves the db alone" db (kg/step g db [:nothing/here]))
+           (let [answer (kg/handle g {:count 5 :label "clicks"} [:counter/reset])]
+             (check! "handle returns the next db" {:count 0 :label "clicks"} (:db answer))
+             (check! "handle returns ordered inert effects"
+                     [[:dispatch [:ui/focus]]] (:fx answer))
+             (check! "a db-only handler asks for nothing"
+                     [] (kg/effects g db [:counter/inc])))
+           (check! "query answers a subscription" 5 (kg/query g {:count 5} [:counter/count]))
+           (check! "query reads a string" "clicks" (kg/query g db [:counter/label]))
+           ;; the boundary, on both sides of it: a comparison with only one
+           ;; side tested is not a tested comparison
+           (check! "positive? at 1" true (kg/query g {:count 1} [:counter/positive?]))
+           (check! "positive? at 0" false (kg/query g {:count 0} [:counter/positive?]))
+           (check! "positive? at -1" false (kg/query g {:count -1} [:counter/positive?]))
+           (let [doc (kg/view g db)
+                 hic (kg/document->hiccup doc)]
+             (check! "view is a document" "div" (:tag doc))
+             (check! "the document becomes the hiccup both renderers already take"
+                     [:div {:class "shitsuke__counter"}
+                      [:h1 {} "clicks"]
+                      [:button {:class "dec" :data-k "counter/dec"} "-"]
+                      [:button {:class "inc" :data-k "counter/inc"} "+"]]
+                     hic))
+           (check! "non-document values pass through document->hiccup"
+                   "plain" (kg/document->hiccup "plain"))
+           (println (str "SCANNED\t" @checks))
+           (println (if (zero? @failures)
+                      (str "kotoba guest acceptance: " @checks "/" @checks " passed against the emitted ESM")
+                      (str "kotoba guest acceptance: " (- @checks @failures) "/" @checks " FAILED")))
+           (js/process.exit (if (zero? @failures) 0 1)))))
+      (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1)))))
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (println "REFUSED: the kotoba CLI is not runnable here (measured by running it, not by `which`)")
+    (js/process.exit 2))
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "shitsuke-guest-"))]
+    (run (build! dir))))
+
+(main)
