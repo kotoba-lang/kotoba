@@ -1,0 +1,87 @@
+(ns langchain.edn-persist-test
+  ;; JVM-only: the filesystem host (temp directories, a real lock, concurrent
+  ;; JVM threads) is a JVM fact. On the kbb engine (`kbb -M:test`, SCI on
+  ;; Node) this namespace loads and defines no tests; what is left when the
+  ;; host is taken away runs everywhere in `langchain.edn-persist-portable-test`.
+  (:require [kotoba.io :as kio] #?@(:clj [[kotoba.lang.edn :as edn]
+                      [clojure.java.io :as io]])
+            [kotoba.test :refer [deftest is testing]]
+            [langchain.db :as db]
+            [langchain.edn-persist :as ep]
+            [langchain.persist :as persist]))
+
+#?(:clj (do
+
+(def schema {:person/id {:db/unique :db.unique/identity}})
+
+(defn- temp-state-file []
+  (io/file (kio/temp-dir
+                     "langchain-edn-persist-")
+           "state.edn"))
+
+(deftest editable-edn-persists-and-replays
+  (let [file (temp-state-file)
+        p (persist/scoped (ep/host file) "actor/person")
+        conn (db/create-conn schema p)]
+    (db/transact! conn [{:db/id -1 :person/id "alice" :person/name "Alice"}])
+    (testing "a new process-shaped connection replays the local journal"
+      (is (= "Alice"
+             (db/q '[:find ?n . :where
+                     [?e :person/id "alice"]
+                     [?e :person/name ?n]]
+                   (db/db (db/create-conn schema
+                                          (persist/scoped (ep/host file)
+                                                          "actor/person")))))))
+    (testing "direct agent edits outside the journal survive the next append"
+      (spit file (pr-str (assoc (edn/read-string (slurp file))
+                                :agent/note "keep me")))
+      (db/transact! conn [{:db/id -1 :person/id "bob" :person/name "Bob"}])
+      (is (= "keep me" (:agent/note (edn/read-string (slurp file))))))))
+
+(deftest streams-and-cursors-are-isolated
+  (let [file (temp-state-file)
+        host (ep/host file)]
+    ((:append host) "a" {:value 1})
+    ((:append host) "b" {:value 2})
+    ((:append host) "a" {:value 3})
+    (is (= [1 3] (mapv :value ((:read host) "a" 0))))
+    (is (= [3] (mapv :value ((:read host) "a" 1))))
+    (is (= [2] (mapv :value ((:read host) "b" 0))))))
+
+(deftest unsafe-edn-and-invalid-events-fail-closed
+  (let [file (temp-state-file)
+        host (ep/host file)]
+    (spit file "#unsafe/tag {:secret true}")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"EDN dispatch forms are forbidden"
+                          ((:read host) "actor" 0)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"event must be a map"
+                          ((:append (ep/host (temp-state-file))) "actor" [])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"invalid repository persistence stream"
+                          ((:read (ep/host (temp-state-file))) "" 0)))))
+
+(deftest deployment-environment-contract-is-shared-and-required
+  (let [file (temp-state-file)
+        persist (ep/configured-persist
+                 {"KOTOBA_REPOSITORY_STATE_FILE" (.getPath file)
+                  "KOTOBA_REPOSITORY_STREAM" "tenant/actor"}
+                 "ignored")]
+    ((:append persist) {:tx 1 :tx-data []})
+    (is (= 1 (:tx (first ((:read persist) 0)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"KOTOBA_REPOSITORY_STATE_FILE is required"
+                          (ep/configured-persist {} "tenant/actor")))))
+
+(deftest concurrent-jvm-appends-are-serialized-before-the-file-lock
+  (let [file (temp-state-file)
+        host (ep/host file)
+        writers (doall (for [n (range 40)]
+                         (future ((:append host) "concurrent" {:n n}))))]
+    (doseq [writer writers] @writer)
+    (let [events ((:read host) "concurrent" 0)]
+      (is (= 40 (count events)))
+      (is (= (vec (range 1 41)) (mapv :seq events)))
+      (is (= (set (range 40)) (set (map :n events)))))))
+))

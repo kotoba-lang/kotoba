@@ -1,0 +1,128 @@
+(ns live-murakumo
+  "The same LCEL chain as `chain`, but against a real model, to prove the
+  injected-I/O seam end to end:
+
+     kbb -Sdeps '{:paths [\"src\" \"examples\"]}' \\
+             -M -e \"(require 'live-murakumo) (live-murakumo/-main)\"
+
+  langchain does no I/O of its own (ADR-0001). Everything host-shaped is
+  injected here and nowhere in the library:
+
+    :http-fn      java.net.http, ~20 lines below — no http-kit, no dep
+    :json-write   langchain.json/encode
+    :json-read    langchain.json/decode + keywordize (decode returns STRING
+                  keys; model/parse-openai-response reads :choices/:message,
+                  so the keywordize step is required, not cosmetic)
+
+  The model id is resolved from the `murakumo-main` KV alias at run time and
+  is deliberately not hardcoded: AGENTS.md forbids baking a concrete model id
+  into anything, because fleet main gets swapped by rewriting that one entry.
+  Resolution order is env override -> alias -> endpoint-only fallback."
+  (:require [langchain.runnable :as r]
+            [langchain.prompt :as prompt]
+            [langchain.parser :as parser]
+            [langchain.model :as model]
+            [langchain.json :as json])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.time Duration]))
+
+;; --- injected host capability 1/2: HTTP ------------------------------------
+
+(def ^:private client
+  (delay (-> (HttpClient/newBuilder)
+             (.connectTimeout (Duration/ofSeconds 10))
+             (.build))))
+
+(defn jvm-http
+  "The :http-fn shape a langchain model adapter expects:
+  {:url :method :headers :body} -> {:status :body}."
+  [{:keys [url headers body]}]
+  (let [b (reduce-kv (fn [acc k v] (.header acc k v))
+                     (-> (HttpRequest/newBuilder (URI/create url))
+                         (.timeout (Duration/ofSeconds 120)))
+                     (or headers {}))
+        resp (.send @client
+                    (.build (.POST b (HttpRequest$BodyPublishers/ofString (or body ""))))
+                    (HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp) :body (.body resp)}))
+
+(defn- http-get [url]
+  (let [resp (.send @client
+                    (-> (HttpRequest/newBuilder (URI/create url))
+                        (.timeout (Duration/ofSeconds 20))
+                        (.GET) (.build))
+                    (HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp) :body (.body resp)}))
+
+;; --- injected host capability 2/2: JSON ------------------------------------
+
+(defn- keywordize [x]
+  (cond
+    (map? x) (reduce-kv (fn [m k v] (assoc m (keyword k) (keywordize v))) {} x)
+    (sequential? x) (mapv keywordize x)
+    :else x))
+
+(def json-read (comp keywordize json/decode))
+(def json-write json/encode)
+
+;; --- alias resolution ------------------------------------------------------
+
+(def ^:private alias-url
+  "https://api.murakumo.cloud/infer/models/murakumo-main")
+
+(def ^:private fallback-endpoint
+  ;; Endpoint only. Never a model id: whatever that endpoint is serving is by
+  ;; definition current, whereas a hardcoded id goes stale the next time main
+  ;; is swapped.
+  "https://infer.murakumo.cloud/v1/chat/completions")
+
+(defn resolve-main
+  "-> {:url :model :alias-for :source}. Env override wins, then the KV alias,
+  then endpoint-only."
+  []
+  (let [env-url (System/getenv "MURAKUMO_URL")
+        env-model (System/getenv "MURAKUMO_MODEL")]
+    (if (and env-url env-model)
+      {:url env-url :model env-model :source :env}
+      (let [{:keys [status body]} (try (http-get alias-url)
+                                       (catch Exception e {:status 0 :body (str e)}))]
+        (if (= 200 status)
+          (let [m (json-read body)]
+            {:url (or env-url (:endpoint m) fallback-endpoint)
+             :model (or env-model (:id m) "murakumo-main")
+             :alias-for (:alias-for m)
+             :source :alias})
+          {:url (or env-url fallback-endpoint)
+           :model (or env-model "murakumo-main")
+           :source :fallback})))))
+
+(defn -main [& _]
+  (let [{:keys [url model alias-for source]} (resolve-main)
+        _ (println (format "resolved via %s: model=%s alias-for=%s"
+                           (name source) model (or alias-for "?")))
+        llm (model/openai-model
+             {:url url
+              :model model
+              ;; A reasoning model spends tokens on reasoning_content before it
+              ;; emits any content. Too small a budget returns finish_reason
+              ;; "length" with content "" -- an empty string, not an error.
+              :max-tokens 512
+              :http-fn jvm-http
+              :json-write json-write
+              :json-read json-read})
+        chain (r/pipe (prompt/chat-template
+                       [:system "You translate to {lang}. Reply with the translation only."]
+                       [:user "{text}"])
+                      (model/as-runnable llm)
+                      (parser/str-parser))
+        answer (r/invoke chain {:lang "French" :text "good morning"})]
+    (println "reply:" (pr-str answer))
+    (when (= "" answer)
+      (println)
+      (println "Empty content. The model spent the whole :max-tokens budget in")
+      (println "reasoning_content, which this OpenAI-shaped adapter does not read.")
+      (println "Raise :max-tokens and run again.")
+      (System/exit 1))
+    (println "OK")))

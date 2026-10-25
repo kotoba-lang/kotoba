@@ -1,0 +1,308 @@
+(ns langchain.edn-persist
+  "The repository-first persistence contract, as policy plus an injected store.
+
+  Transactions remain editable, local EDN while an agent is running. The cloud
+  host may later encrypt and publish the whole state file through Kagi, DataLad
+  and a Kotobase head. Every append re-reads the state while holding a lock, so
+  unrelated keys written directly by an agent are preserved instead of being
+  replaced by a stale in-memory snapshot.
+
+  ## Why this is `.cljc` now
+
+  It was `langchain.edn-persist`, a JVM host, and it was the last `.clj` in this
+  library's runtime surface. That mattered beyond tidiness: measured 2026-08-27,
+  it is what stopped `cloud.itonami.app.store` — the namespace the largest group
+  of otherwise-portable namespaces waits on — from being portable at all. One
+  `.clj` in a dependency is enough to hold a whole graph on the JVM.
+
+  The split follows `kotoba.lang.fs`, which solved the same problem for the
+  filesystem: the decisions are pure and live here, the effects go behind a
+  protocol a host implements and injects, and an in-memory implementation ships
+  with it so the policy can be exercised with no host at all.
+
+  ## The three layers
+
+  - **Policy** (pure, this namespace): what a valid stream name is, how EDN is
+    read, what the next state is after an append, which events answer a cursor.
+  - **`IStateStore`** (protocol): read the text, write the text, hold the lock.
+    Three operations, because that is all the policy needs to be durable.
+  - **Hosts**: `memory-store` here; the filesystem-backed one below, whose
+    read/write/lock are the only reader-conditional code in the file.
+
+  A host that is not a filesystem — a Worker with a KV binding, a browser with
+  IndexedDB — implements the same three operations and reuses every line of the
+  policy."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str])
+  #?(:clj (:import [java.nio.channels FileChannel]
+                   [java.nio.file AtomicMoveNotSupportedException CopyOption Files
+                    OpenOption StandardCopyOption StandardOpenOption])))
+
+(def ^:private streams-key :kotoba.agent/streams)
+(def ^:private sequence-key :kotoba.agent/sequence)
+
+;; ---------- policy (pure) ----------
+
+(defn valid-stream? [stream]
+  (and (string? stream) (seq stream) (<= (count stream) 1024)))
+
+(defn parse-state
+  "The EDN rules for a repository state document.
+
+  UNKNOWN tagged literals are refused rather than read: this text is editable by
+  an agent, and a reader tag is a call into whatever the host happens to have
+  registered.
+
+  `#inst` and `#uuid` are the exception, and they are not refused — they are
+  built into `clojure.edn` itself, so `:default` is never consulted for them.
+  Measured 2026-08-27 on both runtimes, which agree: both read, `#evil/tag`
+  refuses. Said explicitly because the JVM-only version of this docstring
+  claimed tagged literals were refused full stop, and that claim survived as
+  long as one runtime was the only one anybody ran. The two built-ins construct
+  a Date and a UUID from a literal and reach no host code, which is why they are
+  admitted rather than blocked.
+
+  `#js` is built in on ClojureScript ONLY, and is refused by name below so the
+  two runtimes agree. Without that, a document written by a Node host could be
+  read there and rejected on the JVM — the format would depend on who opened
+  it, which is the one thing a shared state file cannot afford.
+
+  `nil` text — no document yet — is an empty map, which is what makes the first
+  append the same code path as every later one."
+  [text]
+  (if (str/blank? (str text))
+    {}
+    (let [value (edn/read-string
+                 ;; kotoba.lang.edn's bounded reader refuses EVERY `#`-prefixed
+                 ;; dispatch form (#:ns{}, #tag, #inst, #uuid, #{}) uniformly on
+                 ;; all runtimes, so the host-dependence this opts-map used to
+                 ;; guard against is structurally inherited from the library.
+                 ;; The refusal is kotoba.lang.edn/reject!'s own `EDN dispatch
+                 ;; forms are forbidden`, always, on JVM and Node alike.
+                 text)]
+      (when-not (map? value)
+        (throw (ex-info "repository EDN root must be a map"
+                        {:type :langchain.edn-persist/invalid-root})))
+      value)))
+
+(defn render-state
+  "The bytes-to-be, as text. A trailing newline because this file is edited by
+  people and by `git`."
+  [value]
+  ;; Bind *print-namespace-maps* false so namespaced keywords (:agent/notes)
+  ;; serialize as `{:agent/notes ...}` rather than the `#:agent{...}` dispatch
+  ;; shorthand. kotoba.lang.edn's bounded reader refuses every `#`-prefixed
+  ;; form, and the round-trip must stay dispatch-free.
+  (str (binding [*print-namespace-maps* false] (pr-str value)) "\n"))
+
+(defn append-to-state
+  "`[next-state stamped-event]` for one append.
+
+  The sequence is per-DOCUMENT, not per-stream, so a cursor taken in one stream
+  orders against events in another. That is what makes the whole state file one
+  log rather than several that happen to share a file."
+  [state stream event]
+  (let [sequence (inc (long (or (get state sequence-key) 0)))
+        stamped (assoc event :seq sequence)]
+    [(-> state
+         (assoc sequence-key sequence)
+         (update-in [streams-key stream] (fnil conj []) stamped))
+     stamped]))
+
+(defn events-since
+  "The events in STREAM after cursor SINCE, in sequence order."
+  [state stream since]
+  (let [since (long (or since 0))]
+    (->> (get-in state [streams-key stream] [])
+         (filter #(> (long (:seq %)) since))
+         (sort-by :seq)
+         vec)))
+
+(defn- assert-stream! [stream]
+  (when-not (valid-stream? stream)
+    (throw (ex-info "invalid repository persistence stream"
+                    {:type :langchain.edn-persist/invalid-stream
+                     :stream stream}))))
+
+;; ---------- the injected store ----------
+
+(defprotocol IStateStore
+  "Durable text under a lock. Three operations, deliberately.
+
+  `read-text` answers nil when nothing has been written. `write-text!` must
+  replace the whole document atomically — a reader must never observe a partial
+  one. `with-lock` must exclude other writers of the same document, including
+  ones in other processes where the host can manage that; `append` is a
+  read-modify-write and is only correct while it holds."
+  (read-text [store])
+  (write-text! [store text])
+  (with-lock [store f]))
+
+(defn memory-store
+  "An in-memory store, for tests and for a standalone run with no host.
+
+  The lock is a plain call: one atom in one process is already serialized by
+  `swap!`, and pretending to hold a cross-process lock that does not exist
+  would be the more misleading answer."
+  ([] (memory-store nil))
+  ([initial-text]
+   (let [text (atom initial-text)]
+     (reify IStateStore
+       (read-text [_] @text)
+       (write-text! [_ value] (reset! text value) nil)
+       (with-lock [_ f] (f))))))
+
+;; ---------- the host operation map ----------
+
+(defn store-host
+  "A `langchain.persist/scoped`-compatible `{:append :read}` over STORE.
+
+  Both operations take the lock, and `append` re-reads inside it. That re-read
+  is the point of the whole namespace: an agent may have edited unrelated keys
+  in the document since this process last looked, and writing a remembered
+  snapshot would silently drop them."
+  [store]
+  {:append
+   (fn [stream event]
+     (assert-stream! stream)
+     (when-not (map? event)
+       (throw (ex-info "repository persistence event must be a map"
+                       {:type :langchain.edn-persist/invalid-event})))
+     (with-lock store
+       (fn []
+         (let [[next-state stamped] (append-to-state (parse-state (read-text store))
+                                                     stream event)]
+           (write-text! store (render-state next-state))
+           stamped))))
+   :read
+   (fn [stream since]
+     (assert-stream! stream)
+     (with-lock store
+       (fn [] (events-since (parse-state (read-text store)) stream since))))})
+
+;; ---------- the filesystem host ----------
+;;
+;; The only reader-conditional code in the file, and it implements exactly the
+;; three protocol operations. A host that is not a filesystem replaces this
+;; section and reuses everything above it.
+
+#?(:clj
+   (defn- lock-file-for [^java.io.File file]
+     (let [parent (or (.getParentFile file) (java.io.File. "."))]
+       (.mkdirs parent)
+       (java.io.File. parent (str "." (.getName file) ".lock")))))
+
+#?(:clj (defonce ^:private local-locks (atom {})))
+
+#?(:clj
+   (defn- atomic-write! [^java.io.File file text]
+     (let [parent (or (.getParentFile file) (java.io.File. "."))
+           _ (.mkdirs parent)
+           tmp (.toFile (Files/createTempFile
+                         (.toPath parent) ".state-" ".edn"
+                         (make-array java.nio.file.attribute.FileAttribute 0)))
+           bytes (kbytes/utf8-bytes ^String text)]
+       (try
+         (Files/write (.toPath tmp) bytes
+                      (into-array OpenOption [StandardOpenOption/WRITE
+                                              StandardOpenOption/TRUNCATE_EXISTING]))
+         (try
+           (Files/move (.toPath tmp) (.toPath file)
+                       (into-array CopyOption [StandardCopyOption/ATOMIC_MOVE
+                                               StandardCopyOption/REPLACE_EXISTING]))
+           (catch AtomicMoveNotSupportedException _
+             (Files/move (.toPath tmp) (.toPath file)
+                         (into-array CopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+         (finally
+           (Files/deleteIfExists (.toPath tmp)))))))
+
+#?(:clj
+   (defn file-store
+     "An `IStateStore` over one editable state file.
+
+     The lock is taken twice on purpose. `FileChannel.lock` coordinates
+     PROCESSES but throws `OverlappingFileLockException` for competing threads
+     inside one JVM, so a JVM-local monitor serializes those first. Dropping
+     either one leaves a real concurrency hole, and the two are not
+     interchangeable."
+     [path]
+     (let [file (if (instance? java.io.File path) path (java.io.File. (str path)))]
+       (reify IStateStore
+         (read-text [_] (when (.isFile file) (slurp file)))
+         (write-text! [_ text] (atomic-write! file text) nil)
+         (with-lock [_ f]
+           (let [lock-file (lock-file-for file)
+                 key (.getCanonicalPath lock-file)
+                 monitor (get (swap! local-locks
+                                     #(if (contains? % key) % (assoc % key (Object.))))
+                              key)]
+             (locking monitor
+               (with-open [channel (FileChannel/open
+                                    (.toPath lock-file)
+                                    (into-array OpenOption [StandardOpenOption/CREATE
+                                                            StandardOpenOption/WRITE]))
+                           _lock (.lock channel)]
+                 (f)))))))))
+
+(defn default-store
+  "The store this host uses when a caller names a path and nothing else.
+
+  On ClojureScript there is no answer that is right for every host — Node has a
+  filesystem, a Worker has a KV binding, a browser has neither — so this
+  refuses instead of guessing. `langchain.edn-persist-node` supplies one for
+  Node; anything else injects its own."
+  [path]
+  #?(:clj (file-store path)
+     :cljs (throw (ex-info "no default state store on this host; inject one"
+                           {:type :langchain.edn-persist/no-default-store
+                            :path path}))))
+
+;; ---------- compatibility with the JVM-only version ----------
+
+(defn host
+  "The `{:append :read}` map for a state FILE.
+
+  Kept at this name and arity because four repositories call it. It is now
+  `store-host` over `default-store`; the behaviour it had is the behaviour the
+  filesystem store implements."
+  [file]
+  (store-host (default-store file)))
+
+(defn with-state-lock
+  "Run F while holding FILE's lock, for hosts that edit the document directly.
+
+  `cloud.itonami.app.store` uses this to put its own whole-state write inside
+  the same boundary an append takes, so an actor append cannot overwrite a
+  cooperating edit."
+  [file f]
+  (with-lock (default-store file) f))
+
+(defn configured-persist
+  "The connection persistence map from an environment-shaped map.
+
+  `KOTOBA_REPOSITORY_STATE_FILE` is required; `KOTOBA_REPOSITORY_STREAM`
+  overrides DEFAULT-STREAM. Keeping this contract here prevents every actor
+  deployment from inventing a different repository coordinate convention.
+
+  Takes the environment as a MAP rather than reading it, which is what lets this
+  be tested and what lets a host that has no environment supply one."
+  ([environment default-stream]
+   (configured-persist environment default-stream nil))
+  ([environment default-stream store-for-path]
+   (let [path (not-empty (get environment "KOTOBA_REPOSITORY_STATE_FILE"))
+         stream (or (not-empty (get environment "KOTOBA_REPOSITORY_STREAM"))
+                    default-stream)]
+     (when-not path
+       (throw (ex-info "KOTOBA_REPOSITORY_STATE_FILE is required"
+                       {:type :langchain.edn-persist/state-file-required})))
+     (assert-stream! stream)
+     (let [make (or store-for-path default-store)
+           {:keys [append read]} (store-host (make path))]
+       {:append (fn [event] (append stream event))
+        :read (fn [since] (read stream since))}))))
+
+#?(:clj
+   (defn required-persist-from-env
+     "Production entrypoint adapter for `langchain.db/create-conn`."
+     [default-stream]
+     (configured-persist (System/getenv) default-stream)))

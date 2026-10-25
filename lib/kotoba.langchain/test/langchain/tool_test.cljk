@@ -1,0 +1,92 @@
+(ns langchain.tool-test
+  "Invariants of tool definition and tool-call execution.
+
+  `langchain.tool` is the point where model output becomes an actual call
+  into caller code, and where a thrown exception has to become a message
+  the model can read instead of a crash that ends the loop. Two other test
+  namespaces used it to build fixtures; none pinned that contract."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langchain.tool :as tool]))
+
+(def ^:private echo
+  (tool/tool {:name "echo" :fn (fn [{:keys [v]}] (str "got:" v))}))
+
+(deftest tool-fills-defaults-without-overwriting
+  (is (= "" (:description echo)))
+  (is (= {:type "object" :properties {}} (:schema echo)))
+  (testing "a supplied description/schema wins over the default"
+    (let [t (tool/tool {:name "x" :fn identity
+                        :description "D"
+                        :schema {:type "object" :properties {:a {}}}})]
+      (is (= "D" (:description t)))
+      (is (= {:type "object" :properties {:a {}}} (:schema t))))))
+
+(deftest tool-rejects-a-malformed-definition
+  ;; the :pre guards fail at definition time rather than at the first
+  ;; model tool-call, when the failure would be far from its cause
+  (is (thrown? #?(:clj AssertionError :cljs js/Error)
+               (tool/tool {:name 1 :fn identity})))
+  (is (thrown? #?(:clj AssertionError :cljs js/Error)
+               (tool/tool {:name "x" :fn 5}))))
+
+(deftest execute-returns-a-tool-message-carrying-the-call-id
+  ;; the id is how the model pairs a result with the call it made; losing
+  ;; it turns a correct answer into an unattributable one
+  (is (= {:role :tool :tool-call-id "c1" :content "got:7"}
+         (tool/execute [echo] {:id "c1" :name "echo" :input {:v 7}}))))
+
+(deftest execute-passes-content-blocks-through-untouched
+  ;; a tool may return Anthropic content blocks (an image from a
+  ;; screenshot tool, say). Stringifying those would destroy them, so
+  ;; vectors bypass the `str` that everything non-string goes through.
+  (let [blocks (tool/tool {:name "blocks"
+                           :fn (fn [_] [{:type "image" :source "s"}])})]
+    (is (= [{:type "image" :source "s"}]
+           (:content (tool/execute [blocks] {:id "c2" :name "blocks" :input {}})))))
+  (testing "a non-string, non-vector result is stringified"
+    (let [m (tool/tool {:name "m" :fn (fn [_] {:a 1})})]
+      (is (= "{:a 1}"
+             (:content (tool/execute [m] {:id "c3" :name "m" :input {}})))))))
+
+(deftest execute-turns-a-thrown-exception-into-an-error-result
+  ;; the model has to be able to react to a tool failure, so a throw
+  ;; becomes an is_error tool_result rather than unwinding the agent loop
+  (let [boom (tool/tool {:name "boom" :fn (fn [_] (throw (ex-info "kaboom" {})))})
+        r (tool/execute [boom] {:id "c4" :name "boom" :input {}})]
+    (is (= :tool (:role r)))
+    (is (= "c4" (:tool-call-id r)))
+    (is (true? (:error? r)))
+    (is (= "Error: kaboom" (:content r)))))
+
+(deftest execute-reports-an-unknown-tool-as-an-error-result
+  ;; same contract as a throw: a hallucinated tool name is something the
+  ;; model can recover from, not a crash
+  (let [r (tool/execute [echo] {:id "c5" :name "nope" :input {}})]
+    (is (true? (:error? r)))
+    (is (= "c5" (:tool-call-id r)))
+    (is (= "Error: unknown tool nope" (:content r)))))
+
+(deftest execute-all-preserves-call-order
+  ;; results are matched by position as well as by id downstream, so the
+  ;; order of the assistant's calls has to survive
+  (let [m (tool/tool {:name "m" :fn (fn [_] "M")})]
+    (is (= [{:role :tool :tool-call-id "a" :content "M"}
+            {:role :tool :tool-call-id "b" :content "got:1"}]
+           (tool/execute-all [echo m]
+                             {:role :assistant
+                              :tool-calls [{:id "a" :name "m" :input {}}
+                                           {:id "b" :name "echo" :input {:v 1}}]}))))
+  (testing "an assistant message with no tool calls yields no results"
+    (is (= [] (tool/execute-all [echo] {:role :assistant})))
+    (is (= [] (tool/execute-all [echo] {:role :assistant :tool-calls nil})))))
+
+(deftest wire-formats-put-the-schema-where-each-vendor-expects-it
+  ;; the two providers disagree on both nesting and the key name; this is
+  ;; the whole reason both functions exist
+  (is (= {:name "echo" :description ""
+          :input_schema {:type "object" :properties {}}}
+         (tool/->anthropic echo)))
+  (is (= {:type "function"
+          :function {:name "echo" :description ""
+                     :parameters {:type "object" :properties {}}}}
+         (tool/->openai echo))))
