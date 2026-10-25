@@ -1,0 +1,261 @@
+(ns publish-catalog
+  "Give a fleet of addressed appviews one mutable name.
+
+    kbb -M:catalog <manifest-path>... [--out catalog.edn] [--dry-run]
+
+  A content address never changes, which is the point and also the problem:
+  something has to say which address is *current*. IPNS is that something —
+  a name derived from an Ed25519 key, where holding the seed IS authority
+  over the name.
+
+  ## Why one name and not four hundred
+
+  Per-app names would be the obvious shape, and this deliberately does not do
+  it. Four hundred names means four hundred private keys to hold, rotate, and
+  lose; the workspace's safety floor is explicit that credentials are taken
+  one at a time by known identifier, and a key set that large is managed by
+  enumeration whether anyone admits it or not. One key names a catalog: a
+  document listing every app and the address it currently has. Following one
+  app costs one fetch and a lookup instead of a resolve.
+
+  Per-app names stay possible — `:kotoba.app/latest` is a per-app field and
+  is left empty rather than filled with something that resolves elsewhere.
+  What is claimed here is exactly what exists: the fleet has a naming plane.
+
+  ## What it does, in order
+
+    read manifests → build the catalog → address it → PUT to kotobase →
+    GET it back and compare bytes → sign an IPNS record for /ipfs/{cid} →
+    PUT to the delegated routers → resolve the name back and require it to
+    be this CID → write the catalog file
+
+  Every step is fail-closed. A router accepting a record is not evidence the
+  name resolves to it.
+
+  Seed: `CONTENT_ADDRESS_CATALOG_IPNS_SEED`, 64 hex characters. Custody is
+  kagi item `cloud-itonami-appviews-catalog` (compartment `personal`)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [content-address.archive :as archive]
+            [content-address.core :as ca]
+            [content-address.digest :as digest]
+            [ed25519.core :as ed]
+            [ipns.core :as ipns]
+            [ipns.record :as rec]
+            [kad.routing :as routing]
+            [protobuf.wire :as pb])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.time Duration Instant ZoneOffset]
+           [java.time.temporal ChronoUnit]))
+
+(def seed-env "CONTENT_ADDRESS_CATALOG_IPNS_SEED")
+(def kagi-item "cloud-itonami-appviews-catalog")
+(def validity-days 365)
+(def record-ttl-ns (* 5 60 1000000000))
+(def resolve-attempts 8)
+(def resolve-wait-ms 2000)
+
+(defn- ->octets [b] (digest/->octets b))
+(defn- ->bytes [o] (digest/->bytes o))
+
+;; ------------------------------------------------------------ the catalog
+
+(defn entry
+  "One line of the catalog: who the app is and what it currently addresses.
+
+  Location is not in here. A catalog of addresses that also pinned hosts
+  would make the hosts part of what the name says, and they are not."
+  [path]
+  (let [parsed (edn/read-string (slurp path))
+        m (first (filter ca/addressed? (ca/entities parsed)))
+        addr (ca/file-address-of parsed)]
+    (when addr
+      {:kotoba.app/id (or (:kotoba.app/id m) (:kotoba.app/name m) path)
+       :kotoba.app/bundle-cid (:bundle-cid addr)
+       :kotoba.app/embed-url (or (:embed-url addr) (ca/embed-url (:bundle-cid addr)))})))
+
+(defn catalog
+  "Sorted by app id so the same fleet always produces the same bytes."
+  [paths at]
+  (let [entries (->> paths (keep entry) (sort-by :kotoba.app/id) vec)]
+    {:kotoba.catalog/at at
+     :kotoba.catalog/count (count entries)
+     :kotoba.catalog/apps entries}))
+
+(defn catalog-bytes [c]
+  (digest/->octets (str (pr-str c) "\n")))
+
+;; ---------------------------------------------------------------- naming
+
+(defn parse-seed [s]
+  (let [hex (str/replace (str s) #"\s" "")]
+    (when-not (re-matches #"[0-9a-fA-F]{64}" hex)
+      (throw (ex-info "IPNS seed must be 64 hex chars" {:env seed-env :kagi kagi-item})))
+    (ed/unhex hex)))
+
+(defn load-seed []
+  (parse-seed (or (System/getenv seed-env)
+                  (throw (ex-info "IPNS seed missing" {:env seed-env :kagi kagi-item})))))
+
+(defn name-from-seed [seed]
+  (ipns/pubkey->name (->octets (ed/pubkey-from-seed seed))))
+
+(defn- sign-fn [seed] (fn [octets] (->octets (ed/sign seed (->bytes octets)))))
+
+(defn- verify-fn [pub msg sig] (ed/verify (->bytes pub) (->bytes msg) (->bytes sig)))
+
+(defn- validity-at [^Instant instant]
+  (let [utc (.atOffset instant ZoneOffset/UTC)]
+    (rec/rfc3339-nanos {:year (.getYear utc) :month (.getMonthValue utc)
+                        :day (.getDayOfMonth utc) :hour (.getHour utc)
+                        :minute (.getMinute utc) :second (.getSecond utc)
+                        :nanos (.getNano utc)})))
+
+(defn signed-record [{:keys [seed cid sequence now] :or {now (Instant/now) sequence 1}}]
+  (let [value (str "/ipfs/" cid)
+        record (rec/create {:value value
+                            :validity (validity-at (.plus now validity-days ChronoUnit/DAYS))
+                            :sequence sequence
+                            :ttl record-ttl-ns
+                            :sign-fn (sign-fn seed)})
+        nm (name-from-seed seed)
+        ok (rec/validate record nm {:verify-fn verify-fn :now-ms (.toEpochMilli now)})]
+    (when-not (:valid? ok)
+      (throw (ex-info "signed record does not validate" {:reason (:reason ok)})))
+    {:name nm :cid cid :value value :sequence sequence :octets (rec/serialize record)}))
+
+;; ------------------------------------------------------------- DHT plumbing
+
+(defonce ^:private client
+  (delay (-> (HttpClient/newBuilder) (.connectTimeout (Duration/ofSeconds 30)) .build)))
+
+(defn- cache-busted [url nonce]
+  (str url (if (str/includes? url "?") "&" "?") "fresh=" nonce))
+
+(defn kad-http
+  "Synchronous http-fn for `kad.routing`. A delegated router may CDN-cache
+  GET past the record TTL, so reads carry a transport-only nonce: a publish
+  has to verify the record it just wrote, not a still-valid predecessor."
+  [{:keys [method url headers body]}]
+  (let [url (if (= method :get) (cache-busted url (System/nanoTime)) url)
+        bldr (reduce-kv (fn [b k v] (.header b (name k) (str v)))
+                        (-> (HttpRequest/newBuilder (URI/create url))
+                            (.timeout (Duration/ofSeconds 45)))
+                        (or headers {}))
+        req (case method
+              :get (.build (.GET bldr))
+              :put (.build (.PUT bldr (HttpRequest$BodyPublishers/ofByteArray
+                                       (if (bytes? body) body (->bytes body)))))
+              (throw (ex-info "unsupported kad method" {:method method})))
+        resp (.send ^HttpClient @client req (HttpResponse$BodyHandlers/ofByteArray))
+        raw (.body resp)]
+    {:status (.statusCode resp)
+     :body (when (pos? (alength ^bytes raw)) (->octets raw))}))
+
+(defn- validate-octets [nm octets]
+  (try
+    (let [parsed (rec/parse octets)]
+      (when (:valid? (rec/validate parsed nm {:verify-fn verify-fn
+                                              :now-ms (System/currentTimeMillis)}))
+        parsed))
+    (catch Exception _ nil)))
+
+(defn resolve-value
+  "Resolve until the routers agree this name carries this sequence."
+  [http-fn nm {:keys [sequence]}]
+  (loop [attempt 1]
+    ;; validate-fn takes the octets alone; the name is closed over. Passing
+    ;; the two-argument form is an arity error at the far end of a publish
+    ;; that has already succeeded — after the PUT, with the record live.
+    (let [got (routing/resolve http-fn nm {:validate-fn #(validate-octets nm %)})]
+      (cond
+        (and (:ok? got) (= sequence (:sequence (:record got)))) got
+        (>= attempt resolve-attempts) (assoc got :ok? false :reason :sequence-not-visible)
+        :else (do (Thread/sleep resolve-wait-ms) (recur (inc attempt)))))))
+
+;; -------------------------------------------------------------------- main
+
+(defn -main [& args]
+  (let [out (or (second (drop-while #(not= "--out" %) args)) "catalog.edn")
+        ;; A flag's VALUE is not a manifest path. Dropping only the flags
+        ;; themselves made `--out catalog.edn` try to read catalog.edn as an
+        ;; input, which is the same class of bug as a gate reading `--min 10`
+        ;; as a directory named 10.
+        flag-values (set (remove nil? [out (second (drop-while #(not= "--sequence" %) args))]))
+        paths (remove (fn [a] (or (str/starts-with? a "--") (flag-values a))) args)
+        dry? (some #{"--dry-run"} args)
+        ;; IPNS sequence. Republishing means a new catalog CID under the same
+        ;; name, and a record that does not advance the sequence is not an
+        ;; update — routers are entitled to keep the one they have.
+        sequence (or (some-> (second (drop-while #(not= "--sequence" %) args))
+                             Long/parseLong)
+                     (some-> (let [ptr (str/replace out #"\.edn$" ".pointer.edn")]
+                               (when (io/exists? (io/file ptr)) (edn/read-string (slurp ptr))))
+                             :kotoba.catalog/sequence
+                             inc)
+                     1)
+        token (or (System/getenv "KOTOBASE_ARCHIVE_TOKEN") "")
+        c (catalog paths (str (Instant/now)))
+        octets (catalog-bytes c)
+        cid (ca/cid-string :raw (digest/sha256 octets))
+        size (count octets)]
+    (println "apps" (:kotoba.catalog/count c))
+    (println "sequence" sequence)
+    (println "catalog-cid" cid)
+    (println "size" size)
+    (when (zero? (:kotoba.catalog/count c))
+      (println "UNANSWERED — no addressed manifest in the input")
+      (System/exit 2))
+    (if dry?
+      (println "dry-run — nothing sent")
+      (let [refusals (archive/refusals {:cid cid :size size :token token})]
+        (when (seq refusals)
+          (println "REFUSED" (pr-str refusals))
+          (System/exit 1))
+        (let [put (archive/put! {:cid cid :octets octets :token token
+                                 :content-type "application/edn"})]
+          (println "put" (:status put))
+          (when-not (#{200 201} (:status put))
+            (println "ARCHIVE REFUSED" (:body put))
+            (System/exit 1))
+          (let [v (archive/verify {:cid cid})]
+            (println "get" (:status v) "verified" (:verified? v))
+            (when-not (:verified? v) (System/exit 1))
+            (let [seed (load-seed)
+                  signed (signed-record {:seed seed :cid cid :sequence sequence})
+                  nm (:name signed)
+                  pub (routing/publish kad-http nm (:octets signed) {})]
+              (println "ipns-name" nm)
+              (println "routers-accepted" (count (:accepted pub)))
+              (when-not (:ok? pub)
+                (println "IPNS PUBLISH REFUSED" (pr-str (:rejected pub)))
+                (System/exit 1))
+              (let [got (resolve-value kad-http nm {:sequence sequence})
+                    value (when (:ok? got) (pb/utf8-string (:value (:record got))))]
+                (when-not (= (str "/ipfs/" cid) value)
+                  (println "RESOLVED VALUE IS NOT THIS CID" {:want (str "/ipfs/" cid)
+                                                             :got value})
+                  (System/exit 1))
+                ;; Two files on purpose. `out` holds the catalog EXACTLY as
+                ;; archived, so anyone can re-hash it and get the CID back —
+                ;; a committed copy that had the pointer folded into it would
+                ;; be a document that cannot verify itself. The pointer is a
+                ;; sibling.
+                (spit out (kbytes/utf8-string (byte-array (map unchecked-byte octets))))
+                (spit (str/replace out #"\.edn$" ".pointer.edn")
+                      (str (pr-str {:kotoba.catalog/cid cid
+                                    :kotoba.catalog/name nm
+                                    :kotoba.catalog/sequence sequence
+                                    :kotoba.catalog/count (:kotoba.catalog/count c)
+                                    :kotoba.catalog/at (:kotoba.catalog/at c)
+                                    :kotoba.catalog/ipns-url (str "ipns://" nm)
+                                    :kotoba.catalog/embed-url (ca/embed-url cid)
+                                    :kotoba.catalog/archive (ca/archive-url
+                                                             archive/default-origin cid)})
+                           "\n"))
+                (println "resolved" value)
+                (println "wrote" out)))))))
+    (shutdown-agents)))
