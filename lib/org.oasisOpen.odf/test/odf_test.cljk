@@ -1,0 +1,92 @@
+(ns odf-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.compiler.ir :as ir])
+  (:import [java.util.zip ZipInputStream]))
+
+(def source (slurp "lib/org.oasisOpen.odf/src/odf.kotoba"))
+(defn call [kir function & args] (ir/execute kir function (vec args)))
+(defn di64 [value] ["i64" value])
+(defn dkw [value] ["keyword" value])
+(defn dget [document key]
+  (some (fn [[candidate value]] (when (= candidate key) value)) (second document)))
+
+(defn unzip-resource [path]
+  (with-open [zis (ZipInputStream. (io/input-stream (io/resource path)))]
+    (loop [entries {}]
+      (if-let [entry (.getNextEntry zis)]
+        (let [output (java.io.ByteArrayOutputStream.)]
+          (io/copy zis output)
+          (recur (assoc entries (.getName entry) (.toByteArray output))))
+        entries))))
+
+(defn utf8 [bytes] (kbytes/utf8-string ^bytes bytes))
+
+(deftest reference-preserves-odf-contract
+  (let [kir (:kir (compiler/compile-source source :js-kotoba-v1))
+        xml "<?xml version=\"1.0\" encoding=\"utf-8\"?><office:document-content><office:body><office:text><text:p>Hello <text:span>ODF</text:span></text:p><text:list><text:list-item><text:p>Nested paragraph</text:p></text:list-item></text:list></office:text></office:body></office:document-content>"
+        mime "application/vnd.oasis.opendocument.text"
+        result (call kir 'summary mime xml 2)]
+    (is (= :odt (call kir 'kind mime)))
+    (is (= :ods (call kir 'kind "application/vnd.oasis.opendocument.spreadsheet")))
+    (is (= :odp (call kir 'kind "application/vnd.oasis.opendocument.presentation")))
+    (is (= :odf (call kir 'kind "application/octet-stream")))
+    (is (= 2 (call kir 'paragraph-count xml)))
+    (is (= [[:option :string] true "Hello ODF"]
+           (call kir 'paragraph-text xml 0)))
+    (is (= [[:option :string] true "Nested paragraph"]
+           (call kir 'paragraph-text xml 1)))
+    (is (= [[:option :string] false] (call kir 'paragraph-text xml 2)))
+    (is (= (dkw :odt) (dget result :kind)))
+    (is (= (di64 2) (dget result :entry-count)))
+    (is (= (di64 2) (dget result :paragraph-count)))
+    (is (= #{} (set (:effects kir))))
+    (testing "malformed XML and invalid indexes fail closed"
+      (is (thrown? kerror/ExceptionInfo
+                   (call kir 'paragraph-count "<office:text><text:p>broken</office:text>")))
+      (is (thrown? kerror/ExceptionInfo (call kir 'paragraph-text xml -1))))))
+
+(deftest real-pandoc-odt-preserves-observable-content
+  (let [entries (unzip-resource "odf/fixtures/pandoc_book.odt")
+        mime (utf8 (get entries "mimetype"))
+        content (utf8 (get entries "content.xml"))
+        kir (:kir (compiler/compile-source source :js-kotoba-v1))]
+    (is (= :odt (call kir 'kind mime)))
+    (is (= 6 (count entries)))
+    (is (= 4 (call kir 'paragraph-count content)))
+    (is (= ["My Real Book" "Real Author"
+            "Hello epub world from a real pandoc export."
+            "Second chapter content here."]
+           (mapv #(nth (call kir 'paragraph-text content %) 2) (range 4))))))
+
+(defn compiler-root []
+  (nth (iterate #(.getParent ^java.nio.file.Path %)
+                (java.nio.file.Path/of (.toURI (io/resource "kotoba/compiler/core.clj")))) 4))
+(defn base64 [value] (kbytes/base64-encode value))
+
+(deftest restricted-javascript-and-typed-wasm-conform-semantically
+  (let [javascript (compiler/compile-source source :js-kotoba-v1)
+        wasm (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        js64 (base64 (kbytes/utf8-bytes ^String (:source javascript)))
+        wasm64 (base64 ^bytes (:bytes wasm))
+        probe
+        (shell/sh
+          "node" "--input-type=module" "-e"
+          (str "import(process.argv[1]).then(async host=>{"
+               "const j=await import('data:text/javascript;base64," js64 "');"
+               "const w=await host.instantiateKotoba(Buffer.from(process.argv[2],'base64'));"
+               "const run=x=>{const xml='<?xml version=\"1.0\"?><office:document-content><office:body><office:text><text:p>Hello <text:span>ODF</text:span></text:p><text:list><text:list-item><text:p>Nested</text:p></text:list-item></text:list></office:text></office:body></office:document-content>';"
+               "if(x.kind('application/vnd.oasis.opendocument.text')!==':odt'||x['paragraph-count'](xml)!==2n)throw Error('summary');"
+               "const a=x['paragraph-text'](xml,0n),b=x['paragraph-text'](xml,1n),none=x['paragraph-text'](xml,2n);"
+               "if(!a[1]||a[2]!=='Hello ODF'||!b[1]||b[2]!=='Nested'||none[1])throw Error('text');"
+               "let malformed=false;try{x['paragraph-count']('<x><text:p>broken</x>')}catch(e){malformed=true}if(!malformed)throw Error('reject');};"
+               "run(j.instantiateKotoba({}));run(w.instance.exports);"
+               "}).catch(e=>{console.error(e);process.exit(99)})")
+          (.toString (.toUri (.resolve (compiler-root) "runtime/browser-host.mjs"))) wasm64)]
+    (is (zero? (:exit probe)) (str (:out probe) (:err probe)))))
+
+(deftest production-source-authority
+  (is (= ["lib/org.oasisOpen.odf/src/odf.kotoba"]
+         (->> (file-seq (io/file "src")) (filter #(.isFile %)) (map str) sort vec))))

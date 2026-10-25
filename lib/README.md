@@ -120,6 +120,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.du` | `org.ieee.du/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.find` | `org.ieee.find/src` | `` (an external specification, publisher ieee.org) |
 | `org.jsonrpc.core` | `org.jsonrpc.core/src` | `` (an external specification, publisher jsonrpc.org) |
+| `org.oasisOpen.odf` | `org.oasisOpen.odf/src` | `` (an external specification, publisher oasisOpen.org) |
 | `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
 | `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
 | `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |
