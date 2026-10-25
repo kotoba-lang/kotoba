@@ -163,6 +163,7 @@ The bundled standard libraries live in this repository:
 | `org.farama.gymnasium` | `org.farama.gymnasium/src` | `cartpole-wasm` (an external specification, publisher farama.org) |
 | `org.ethercat.core` | `org.ethercat.core/src` | `ethercat.datagram`, `ethercat.ethernet`, `ethercat.frame`, `ethercat.wkc` (an external specification, publisher ethercat.org) |
 | `org.oasisOpen.amqp` | `org.oasisOpen.amqp/src` | `amqp.frame`, `amqp.performative`, `amqp.types` (an external specification, publisher oasisOpen.org) |
+| `org.ibis.core` | `org.ibis.core/src` | `ibis.component`, `ibis.model`, `ibis.parser` (an external specification, publisher ibis.org) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
