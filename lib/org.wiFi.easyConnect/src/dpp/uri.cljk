@@ -1,0 +1,298 @@
+(ns dpp.uri
+  "The Wi-Fi Easy Connect (DPP) bootstrapping URI -- the payload of the QR code a
+  headless enrollee displays so a phone acting as configurator can hand it a
+  network credential over the air.
+
+  Pure and portable: no I/O, no host interop, byte vectors of 0..255 ints. The
+  DPP protocol itself (authentication and configuration exchanges over 802.11
+  action frames) is NOT here; this is only the bootstrapping information, the
+  way `org-ietf-ssh` holds the SSH transport core and not the sockets.
+
+  Mechanism and decision are split on purpose:
+
+    parse   structure only -- splits the URI and reports what it found,
+            including tags it does not know. It judges nothing.
+    admit   the decision -- is this a bootstrapping URI this deployment will
+            act on? Fail-closed: anything it cannot positively admit, it
+            refuses with a named reason.
+
+  The split exists because `parse` returning a map is not evidence the URI is
+  usable, and a single function that did both would have no way to say so."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── bytes ─────────────────────────────────────────────────────────────────
+
+(def ^:private b64-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(def ^:private b64-index
+  (into {} (map-indexed (fn [i c] [c i]) b64-alphabet)))
+
+(defn base64-decode
+  "Standard base64 (RFC 4648 §4, padded) -> vector of bytes, or nil when the
+  input is not well-formed. DPP uses the standard alphabet, not base64url:
+  a `-` or `_` here is a malformed key, not an alternate spelling."
+  [s]
+  (when (and (string? s) (zero? (mod (count s) 4)) (pos? (count s)))
+    (let [chars (vec s)
+          pad (count (take-while #(= % \=) (reverse chars)))]
+      (when (<= pad 2)
+        (let [body (subvec chars 0 (- (count chars) pad))]
+          (when (every? b64-index body)
+            (let [bits (mapcat (fn [c]
+                                 (let [v (b64-index c)]
+                                   (map #(bit-and 1 (bit-shift-right v %)) [5 4 3 2 1 0])))
+                               body)
+                  n-bytes (quot (- (* 3 (quot (count chars) 4)) pad) 1)
+                  octets (->> bits
+                              (partition 8)
+                              (map (fn [bs] (reduce (fn [a b] (+ (* 2 a) b)) 0 bs)))
+                              vec)]
+              (when (>= (count octets) n-bytes)
+                (subvec octets 0 n-bytes)))))))))
+
+;; ── a very small DER reader ───────────────────────────────────────────────
+;; Only what an EC SubjectPublicKeyInfo needs: definite-length tag/length/value.
+
+(defn- der-read
+  "Read one TLV at `i`. Returns [tag content-start content-len next-i] or nil.
+  Refuses indefinite length and any length that runs past the end -- a
+  truncated key must not read as a short one."
+  [bs i]
+  (when (< (inc i) (count bs))
+    (let [tag (nth bs i)
+          l0 (nth bs (inc i))]
+      (cond
+        (< l0 0x80) (let [start (+ i 2)] (when (<= (+ start l0) (count bs)) [tag start l0 (+ start l0)]))
+        (= l0 0x80) nil                                   ; indefinite: not DER
+        :else (let [n (- l0 0x80)
+                    start (+ i 2 n)]
+                (when (and (<= n 4) (<= start (count bs)))
+                  (let [len (reduce (fn [a k] (+ (* 256 a) (nth bs k))) 0 (range (+ i 2) start))]
+                    (when (<= (+ start len) (count bs)) [tag start len (+ start len)]))))))))
+
+(def ^:private oid-ec-public-key [0x2A 0x86 0x48 0xCE 0x3D 0x02 0x01])
+
+(def ^:private curves
+  "Named curves DPP bootstrapping keys are admitted on, with the byte length of
+  a point in each form. A point of the wrong length for its curve is refused --
+  the length is the only thing distinguishing P-256 from a truncated P-384."
+  {[0x2A 0x86 0x48 0xCE 0x3D 0x03 0x01 0x07] {:curve :p-256 :compressed 33 :uncompressed 65}
+   [0x2B 0x81 0x04 0x00 0x22]                {:curve :p-384 :compressed 49 :uncompressed 97}
+   [0x2B 0x81 0x04 0x00 0x23]                {:curve :p-521 :compressed 67 :uncompressed 133}})
+
+(defn ec-public-key
+  "Admit `bs` as a DER SubjectPublicKeyInfo holding an EC public key on one of
+  the named curves. Returns {:curve :p-256 :form :compressed :point [...]} or
+  {:error <reason>}. Every refusal is named: `nil` would make a malformed key
+  and an unsupported curve the same answer."
+  [bs]
+  (if-not (vector? bs)
+    {:error :not-bytes}
+    (let [[tag spki-start spki-len] (der-read bs 0)]
+      (cond
+        (nil? tag) {:error :not-der}
+        (not= tag 0x30) {:error :spki-not-sequence}
+        (not= (+ spki-start spki-len) (count bs)) {:error :trailing-bytes-after-spki}
+        :else
+        (let [[alg-tag alg-start alg-len alg-end] (or (der-read bs spki-start) [nil nil nil nil])]
+          (cond
+            (nil? alg-tag) {:error :no-algorithm-identifier}
+            (not= alg-tag 0x30) {:error :algorithm-not-sequence}
+            :else
+            (let [[o1-tag o1-start o1-len o1-end] (or (der-read bs alg-start) [nil nil nil nil])]
+              (cond
+                (not= o1-tag 0x06) {:error :no-algorithm-oid}
+                (not= (vec (subvec bs o1-start (+ o1-start o1-len))) oid-ec-public-key)
+                {:error :not-ec-public-key}
+                :else
+                (let [[o2-tag o2-start o2-len] (or (der-read bs o1-end) [nil nil nil])]
+                  (cond
+                    (not= o2-tag 0x06) {:error :no-curve-oid}
+                    (not= (+ o2-start o2-len) alg-end) {:error :algorithm-identifier-trailing-bytes}
+                    :else
+                    (let [curve (curves (vec (subvec bs o2-start (+ o2-start o2-len))))]
+                      (if-not curve
+                        {:error :unsupported-curve}
+                        (let [[bt-tag bt-start bt-len] (or (der-read bs alg-end) [nil nil nil])]
+                          (cond
+                            (not= bt-tag 0x03) {:error :no-bit-string}
+                            (not= (+ bt-start bt-len) (count bs)) {:error :trailing-bytes-after-key}
+                            (zero? bt-len) {:error :empty-bit-string}
+                            (not (zero? (nth bs bt-start))) {:error :bit-string-unused-bits}
+                            :else
+                            (let [point (vec (subvec bs (inc bt-start) (+ bt-start bt-len)))
+                                  head (first point)
+                                  form (cond (contains? #{0x02 0x03} head) :compressed
+                                             (= head 0x04) :uncompressed
+                                             :else nil)]
+                              (cond
+                                (nil? form) {:error :unknown-point-form}
+                                (not= (count point) (get curve form)) {:error :point-length-mismatch}
+                                :else {:curve (:curve curve) :form form :point point}))))))))))))))))
+
+;; ── the URI ───────────────────────────────────────────────────────────────
+
+(def scheme "DPP:")
+
+(def known-tags
+  "Tag -> what it carries. `K` is the bootstrapping public key and is the only
+  required field; the spec places it last."
+  {"V" :version "M" :mac "C" :channels "I" :information "H" :host "K" :public-key})
+
+(def ^:private tag-order ["V" "M" "C" "I" "H" "K"])
+
+(defn- parse-channels [s]
+  (let [parts (str/split s #"," -1)]
+    (when (and (seq parts) (every? seq parts))
+      (reduce (fn [acc p]
+                (if-not acc
+                  nil
+                  (let [[c ch & more] (str/split p #"/" -1)]
+                    (if (or (seq more)
+                            (not (re-matches #"\d{1,3}" (or c "")))
+                            (not (re-matches #"\d{1,3}" (or ch ""))))
+                      nil
+                      (conj acc {:operating-class #?(:clj (Long/parseLong c) :cljs (js/parseInt c 10))
+                                 :channel #?(:clj (Long/parseLong ch) :cljs (js/parseInt ch 10))})))))
+              [] parts))))
+
+(defn parse
+  "Split a DPP bootstrapping URI into its fields. Structure only -- this
+  reports what is there, including tags it does not know, and judges nothing.
+  Returns {:fields {...} :unknown-tags [...] :order [...]} or {:error ...}.
+
+  A field value may not contain `;` (the separator) or `:` before the first
+  one (the tag delimiter). The URI is a sequence of `T:value;` and therefore
+  ends with `;` -- a canonical one ends `;;` because the last value's `;`
+  is followed by the terminator."
+  [s]
+  (cond
+    (not (string? s)) {:error :not-a-string}
+    (not (str/starts-with? s scheme)) {:error :not-a-dpp-uri}
+    (not (str/ends-with? s ";")) {:error :unterminated}
+    :else
+    ;; The URI is `DPP:` + zero or more `T:V;` + a terminating `;`. So drop the
+    ;; terminator, and what remains must itself end with the last field's `;`.
+    ;; Splitting before dropping that one leaves a phantom empty field, which
+    ;; would make every well-formed URI look malformed.
+    (let [body (subs s (count scheme) (dec (count s)))
+          chunks (cond
+                   (str/blank? body) []
+                   (not (str/ends-with? body ";")) ::unterminated-field
+                   :else (str/split (subs body 0 (dec (count body))) #";" -1))]
+      (cond
+        (= chunks ::unterminated-field) {:error :field-not-terminated}
+        (some str/blank? chunks) {:error :empty-field}
+        :else
+        (reduce
+         (fn [acc chunk]
+           (if (:error acc)
+             acc
+             (let [i (str/index-of chunk ":")]
+               (if (or (nil? i) (zero? i))
+                 {:error :field-without-tag}
+                 (let [tag (subs chunk 0 i)
+                       value (subs chunk (inc i))
+                       k (known-tags tag)]
+                   (cond
+                     (contains? (set (:order acc)) tag) {:error :duplicate-tag}
+                     (nil? k) (-> acc
+                                  (update :unknown-tags conj tag)
+                                  (update :order conj tag))
+                     :else (-> acc
+                               (assoc-in [:fields k] value)
+                               (update :order conj tag))))))))
+         {:fields {} :unknown-tags [] :order []}
+         chunks)))))
+
+(defn admit
+  "The decision. Given a URI string, may this deployment act on it?
+
+  Returns {:ok? true :key {...} :mac ... :channels [...] ...} or
+  {:ok? false :reason <keyword>}. Fail-closed in both directions that matter:
+  an unknown tag is refused unless the caller opts in (a tag we do not
+  understand may be the one that changes what the URI means), and a public key
+  that is not an EC SPKI on an admitted curve is refused rather than passed
+  through for someone else to worry about.
+
+  opts:
+    :allow-unknown-tags?  default false
+    :require-key-last?    default true  (the spec places K last)"
+  ([s] (admit s {}))
+  ([s {:keys [allow-unknown-tags? require-key-last?]
+       :or {allow-unknown-tags? false require-key-last? true}}]
+   (let [p (parse s)]
+     (if (:error p)
+       {:ok? false :reason (:error p)}
+       (let [{:keys [fields unknown-tags order]} p]
+         (cond
+           (and (seq unknown-tags) (not allow-unknown-tags?))
+           {:ok? false :reason :unknown-tag :tags unknown-tags}
+
+           (nil? (:public-key fields)) {:ok? false :reason :missing-public-key}
+
+           (and require-key-last? (not= "K" (last order)))
+           {:ok? false :reason :public-key-not-last}
+
+           :else
+           (let [bs (base64-decode (:public-key fields))]
+             (if-not bs
+               {:ok? false :reason :public-key-not-base64}
+               (let [key (ec-public-key bs)]
+                 (cond
+                   (:error key) {:ok? false :reason (:error key)}
+
+                   (and (:mac fields) (not (re-matches #"[0-9a-f]{12}" (:mac fields))))
+                   {:ok? false :reason :malformed-mac}
+
+                   (and (:channels fields) (nil? (parse-channels (:channels fields))))
+                   {:ok? false :reason :malformed-channel-list}
+
+                   (and (:version fields) (not (re-matches #"\d{1,3}" (:version fields))))
+                   {:ok? false :reason :malformed-version}
+
+                   (and (:information fields)
+                        (not (every? #(let [c #?(:clj (int %) :cljs (.charCodeAt % 0))]
+                                        (and (>= c 0x20) (< c 0x7f)))
+                                     (:information fields))))
+                   {:ok? false :reason :non-printable-information}
+
+                   :else
+                   (cond-> {:ok? true :key key}
+                     (:mac fields) (assoc :mac (:mac fields))
+                     (:channels fields) (assoc :channels (parse-channels (:channels fields)))
+                     (:version fields) (assoc :version #?(:clj (Long/parseLong (:version fields))
+                                                          :cljs (js/parseInt (:version fields) 10)))
+                     (:information fields) (assoc :information (:information fields))
+                     (:host fields) (assoc :host (:host fields))
+                     (seq unknown-tags) (assoc :unknown-tags unknown-tags))))))))))))
+
+(defn generate
+  "Build a canonical bootstrapping URI. `m` takes :public-key (base64 string,
+  required), and optionally :version, :mac, :channels (a vector of
+  {:operating-class n :channel n}), :information, :host.
+
+  Emits fields in spec order with K last, then the terminator. Returns the
+  string, or {:error <reason>} -- generating a URI that `admit` would refuse
+  is a bug here, so this refuses first."
+  [m]
+  (let [chan-str (when-let [cs (seq (:channels m))]
+                   (str/join "," (map #(str (:operating-class %) "/" (:channel %)) cs)))
+        values {"V" (when-let [v (:version m)] (str v))
+                "M" (:mac m)
+                "C" chan-str
+                "I" (:information m)
+                "H" (:host m)
+                "K" (:public-key m)}
+        present (keep (fn [t] (when-let [v (get values t)] [t v])) tag-order)]
+    (cond
+      (nil? (:public-key m)) {:error :missing-public-key}
+      (some (fn [[_ v]] (str/includes? (str v) ";")) present) {:error :semicolon-in-value}
+      :else
+      (let [uri (str scheme (str/join (map (fn [[t v]] (str t ":" v ";")) present)) ";")]
+        ;; The generator is held to the admitter: if what we just built would
+        ;; not be accepted, say so here rather than shipping it to a phone.
+        (if (:ok? (admit uri))
+          uri
+          {:error :generated-uri-not-admissible :admit (admit uri)})))))
