@@ -1,0 +1,160 @@
+(ns av1.bool-encoder-test
+  "Verifies av1.bool-encoder against av1.bool-decoder: encode a known
+   sequence of (symbol, cdf) pairs, `done`-flush to bytes, then decode
+   those same bytes with av1.bool-decoder/read-symbol using the SAME
+   initial cdfs (both sides adapting identically via the shared
+   av1.bool-decoder/adapt-cdf) and confirm the decoded symbol sequence
+   matches exactly. This is the strongest available check (there is no
+   independent 'known good' AV1 symbol-encoder test vector to check
+   against, since the spec itself never defines an encode side -- see
+   av1.bool-encoder's own namespace docstring) -- structurally the same
+   validation strategy av1.bitwriter-test uses against av1.bitreader."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [av1.bool-encoder :as be]
+            [av1.bool-decoder :as bd]
+            [av1.bitreader :as br]))
+
+(defn- roundtrip
+  "`pairs`: seq of [sym cdf-template]. Encodes every symbol (against its
+   own persisted, per-cdf-template adapting copy -- mirrors how a real
+   tile's many cdf tables each adapt independently across many symbol
+   reads/writes), flushes, decodes the same way, and returns
+   {:bytes :decoded :expected}."
+  [pairs]
+  (let [enc0 (be/init)
+        [enc-final _cdfs]
+        (reduce (fn [[enc cdfs] [sym cdf]]
+                  (let [live (get cdfs cdf cdf)
+                        [cdf' enc'] (be/encode-symbol enc live sym true)]
+                    [enc' (assoc cdfs cdf cdf')]))
+                [enc0 {}] pairs)
+        bytes (be/done enc-final)
+        bd0 (bd/init-symbol (br/make-reader bytes) (count bytes))
+        [decoded _cdfs _bd]
+        (reduce (fn [[acc cdfs bdstate] [_sym cdf]]
+                  (let [live (get cdfs cdf cdf)
+                        [dsym cdf' bdstate'] (bd/read-symbol bdstate live true)]
+                    [(conj acc dsym) (assoc cdfs cdf cdf') bdstate']))
+                [[] {} bd0] pairs)]
+    {:bytes bytes :decoded decoded :expected (mapv first pairs)}))
+
+(deftest single-symbol-roundtrip-test
+  (testing "a single symbol against a binary cdf round-trips for both values"
+    (let [cdf [16384 32768 0]]
+      (doseq [sym [0 1]]
+        (is (= [sym] (:decoded (roundtrip [[sym cdf]]))))))))
+
+(deftest skewed-cdf-roundtrip-test
+  (testing "a heavily skewed binary cdf (like av1.tables/Default-Skip-Cdf's
+            low-probability-of-1 shape) round-trips for both values"
+    (let [cdf [30000 32768 0]]
+      (doseq [sym [0 1]]
+        (is (= [sym] (:decoded (roundtrip [[sym cdf]]))))))))
+
+(deftest multi-symbol-cdf-adaptation-roundtrip-test
+  (testing "repeated symbols against a 5-way cdf round-trip, exercising
+            real CDF adaptation across many reads/writes of the SAME cdf
+            (not just a single write) -- 50 symbols is enough to grow
+            `cnt`/`low` well past 64 bits, exercising av1.bool-encoder's
+            bigint-safe accumulator (see its namespace docstring)"
+    (let [cdf [4000 8000 16000 24000 32768 0]
+          syms (vec (take 50 (cycle [0 2 4 1 3])))
+          pairs (mapv (fn [s] [s cdf]) syms)
+          result (roundtrip pairs)]
+      (is (= syms (:decoded result))))))
+
+(deftest mixed-cdfs-roundtrip-test
+  (testing "a sequence mixing several different cdfs (mirroring a real
+            decode_block()'s mix of skip/y-mode/coeff cdfs in one tile)"
+    (let [cdf1 [16384 32768 0]
+          cdf2 [30000 32768 0]
+          cdf3 [4000 8000 16000 24000 32768 0]
+          pairs [[0 cdf1] [1 cdf2] [2 cdf3] [0 cdf3] [1 cdf1] [4 cdf3] [0 cdf2]]]
+      (is (= (mapv first pairs) (:decoded (roundtrip pairs)))))))
+
+(deftest stress-many-symbols-various-nsyms-test
+  (testing "5000 symbols across cdfs with nsyms 2..13 (the full range this
+            repo's real coefficient/mode cdfs use) round-trip exactly"
+    (let [mk-cdf (fn [nsyms seed]
+                   (let [rng (java.util.Random. (long seed))
+                         raw (sort (repeatedly (dec nsyms) #(inc (.nextInt rng 32767))))
+                         bounds (vec (concat (distinct raw) [32768]))
+                         bounds (if (< (count bounds) nsyms)
+                                  (vec (concat bounds (repeat (- nsyms (count bounds)) 32768)))
+                                  bounds)]
+                     (conj (vec (take nsyms bounds)) 0)))
+          cdf-pool (mapv (fn [i] (mk-cdf (+ 2 (mod i 12)) (+ i 1000))) (range 20))
+          rng (java.util.Random. 123)
+          pairs (vec (repeatedly 5000 (fn []
+                                         (let [cdf (rand-nth cdf-pool)
+                                               n (dec (count cdf))]
+                                           [(.nextInt rng n) cdf]))))
+          result (roundtrip pairs)]
+      (is (= (:expected result) (:decoded result))))))
+
+(deftest boundary-symbol-roundtrip-test
+  (testing "the first (sym=0) and last (sym=nsyms-1) symbol of a cdf --
+            the two edge cases of av1.bool-encoder/encode-symbol's
+            fl==32768 special case and its v==0 case -- both round-trip,
+            for nsyms 2..13"
+    (doseq [nsyms (range 2 14)]
+      (let [step (quot 32768 nsyms)
+            cdf (conj (vec (concat (map #(* (inc %) step) (range (dec nsyms))) [32768])) 0)]
+        (is (= [0] (:decoded (roundtrip [[0 cdf]]))))
+        (is (= [(dec nsyms)] (:decoded (roundtrip [[(dec nsyms) cdf]]))))))))
+
+(deftest disable-cdf-update-roundtrip-test
+  (testing "adapt?=false (disable_cdf_update semantics): both sides skip
+            adaptation and still round-trip, using the SAME (unmodified)
+            cdf for every write/read"
+    (let [enc0 (be/init)
+          cdf [3000 32768 0]
+          [_ enc1] (be/encode-symbol enc0 cdf 1 false)
+          [_ enc2] (be/encode-symbol enc1 cdf 0 false)
+          bytes (be/done enc2)
+          bd0 (bd/init-symbol (br/make-reader bytes) (count bytes))
+          [s1 _ bd1] (bd/read-symbol bd0 cdf false)
+          [s2 _ _bd2] (bd/read-symbol bd1 cdf false)]
+      (is (= [1 0] [s1 s2])))))
+
+(deftest encode-literal-roundtrip-test
+  (testing "encode-literal round-trips against av1.bool-decoder/read-literal
+            for various bit widths and values"
+    (doseq [[n v] [[8 173] [1 0] [1 1] [5 0] [5 31] [16 54321]]]
+      (let [enc0 (be/init)
+            enc1 (be/encode-literal enc0 n v)
+            bytes (be/done enc1)
+            bd0 (bd/init-symbol (br/make-reader bytes) (count bytes))
+            [got _] (bd/read-literal bd0 n)]
+        (is (= v got) (str "encode-literal(" n "," v ") roundtrip failed"))))))
+
+(deftest encode-bool-roundtrip-test
+  (testing "encode-bool round-trips against av1.bool-decoder/read-bool"
+    (let [enc0 (be/init)
+          enc1 (be/encode-bool enc0 1)
+          enc2 (be/encode-bool enc1 0)
+          enc3 (be/encode-bool enc2 1)
+          bytes (be/done enc3)
+          bd0 (bd/init-symbol (br/make-reader bytes) (count bytes))
+          [b1 bd1] (bd/read-bool bd0)
+          [b2 bd2] (bd/read-bool bd1)
+          [b3 _bd3] (bd/read-bool bd2)]
+      (is (= [1 0 1] [b1 b2 b3])))))
+
+(deftest mixed-symbols-and-literals-roundtrip-test
+  (testing "interleaving cdf-symbol writes and raw-literal writes (like a
+            real coeffs() pass, which mixes cdf-coded levels with raw sign
+            bits) round-trips"
+    (let [cdf [16384 32768 0]
+          enc0 (be/init)
+          [_ enc1] (be/encode-symbol enc0 cdf 1 true)
+          enc2 (be/encode-literal enc1 1 0)
+          [_ enc3] (be/encode-symbol enc2 cdf 0 true)
+          enc4 (be/encode-literal enc3 1 1)
+          bytes (be/done enc4)
+          bd0 (bd/init-symbol (br/make-reader bytes) (count bytes))
+          [s1 cdf' bd1] (bd/read-symbol bd0 cdf true)
+          [l1 bd2] (bd/read-literal bd1 1)
+          [s2 _cdf'' bd3] (bd/read-symbol bd2 cdf' true)
+          [l2 _bd4] (bd/read-literal bd3 1)]
+      (is (= [1 0 0 1] [s1 l1 s2 l2])))))

@@ -1,0 +1,532 @@
+(ns av1.transform
+  "AV1 dequantization + inverse DCT + 2D inverse transform + reconstruction,
+   transcribed field-for-field from AV1 Bitstream & Decoding Process
+   Specification section 7.12 (\"Reconstruction and dequantization\") /
+   7.13 (\"Inverse transform process\") -- AOMediaCodec/av1-spec master,
+   08.decoding.process.md #Reconstruct process / #1D transforms /
+   #2D inverse transform process, 04.conventions.md #Round2 (fetched
+   2026-07-13).
+
+   SCOPE (Phase 1 continuation, ADR-2607122000 Migration step 9 -- see
+   av1.decode-block namespace docstring for the full scope statement):
+   DCT_DCT only (no ADST/FLIPADST/IDTX -- av1.decode-block throws before
+   calling this namespace for any other PlaneTxType), 8-bit only (no
+   high-bitdepth). The inverse-DCT process below (`inverse-dct!`) is
+   transcribed in full generality for n = 2..6 (TX_4X4 .. TX_64X64) per
+   the spec's own unified algorithm -- this is no harder to transcribe
+   completely than partially, since the spec gives one flat, self-similar
+   step list gated by `n` conditions -- but av1.decode-block only ever
+   calls it with n=5 (TX_32X32, this phase's only supported transform
+   size; see av1.tables namespace docstring for why), so only that path is
+   validated against real data.
+
+   Implementation note: the spec's 1D transform processes are described as
+   in-place mutation of an array T. This namespace mirrors that with a
+   Clojure transient vector (assoc!/nth), the same mutation-via-transient
+   style av1.bool-decoder already uses for CDF adaptation -- portable to
+   both `:clj` and `:cljs` (no Java-array/JS-typed-array dependency)."
+  (:require [av1.tables :as tables]))
+
+(defn round2
+  "04.conventions.md Round2(x,n): (x + (1<<(n-1))) >> n, or x when n==0.
+   Works for negative x via bit-shift-right's arithmetic (sign-extending)
+   right shift, matching the spec's floor-division definition."
+  [x n]
+  (if (zero? n) x (bit-shift-right (+ x (bit-shift-left 1 (dec n))) n)))
+
+(defn brev
+  "08.decoding.process.md #Butterfly functions: brev(numBits, x) = bit-reversal
+   of the low numBits bits of x."
+  [num-bits x]
+  (loop [i 0, t 0]
+    (if (>= i num-bits)
+      t
+      (let [bit (bit-and (bit-shift-right x i) 1)]
+        (recur (inc i) (+ t (bit-shift-left bit (- num-bits 1 i))))))))
+
+(defn cos128
+  "cos128(angle): Cos128_Lookup-based piecewise definition, spec #Butterfly
+   functions."
+  [angle]
+  (let [angle2 (bit-and angle 255)]
+    (cond
+      (<= 0 angle2 64) (nth tables/Cos128-Lookup angle2)
+      (<= 65 angle2 128) (- (nth tables/Cos128-Lookup (- 128 angle2)))
+      (<= 129 angle2 192) (- (nth tables/Cos128-Lookup (- angle2 128)))
+      :else (nth tables/Cos128-Lookup (- 256 angle2)))))
+
+(defn sin128 [angle] (cos128 (- angle 64)))
+
+(defn- t-get [t i] (nth t i))
+(defn- t-set [t i v] (assoc! t i v))
+
+;; ---------------------------------------------------------------------
+;; Inverse ADST process (spec 7.13.2.6, "Inverse ADST4 process" -- ADR-
+;; 2607122000 Migration step 9 ADST extension). Only size 4 (n=2) is
+;; implemented -- this repo's ADST extension supports exactly one new
+;; transform size, TX_4X4 (see av1.decode-block namespace docstring's ADST
+;; section); ADST8/ADST16 (n=3/4, needed for TX_8X8/TX_16X16 ADST) are out
+;; of scope and av1.decode-block never calls this with n!=2.
+;;
+;; SINPI_1_9..SINPI_4_9 (08.decoding.process.md #Inverse ADST4 process)
+;; cross-checked against libaom's av1_iadst4 (av1/common/av1_inv_txfm1d.c,
+;; AOMediaCodec/aom master, fetched 2026-07-13): aom's sinpi_arr(12) uses
+;; the identical 4 constants and the same algebraic structure (s0..s6/a7/b7/
+;; x0..x3 stage-for-stage), confirming this transcription against a second,
+;; independent implementation of the same process (not just re-reading the
+;; same spec paragraph twice).
+(def SINPI_1_9 1321)
+(def SINPI_2_9 2482)
+(def SINPI_3_9 3344)
+(def SINPI_4_9 3803)
+
+(defn inverse-adst4!
+  "spec #Inverse ADST4 process: in-place inverse ADST of the transient
+   vector `t` (length 4). `r` (intermediate clamping range) is accepted
+   only for signature parity with inverse-dct!/B/H -- like B's `_r`, the
+   spec documents it as a bitstream-conformance precision requirement on
+   the s/x intermediates, not a value this process's own arithmetic reads
+   or clips against (ADST4 has no B/H butterfly calls, so there is no
+   clip3 to apply here)."
+  [t _r]
+  (let [T0 (t-get t 0) T1 (t-get t 1) T2 (t-get t 2) T3 (t-get t 3)
+        s0 (* SINPI_1_9 T0)
+        s1 (* SINPI_2_9 T0)
+        s2 (* SINPI_3_9 T1)
+        s3 (* SINPI_4_9 T2)
+        s4 (* SINPI_1_9 T2)
+        s5 (* SINPI_2_9 T3)
+        s6 (* SINPI_4_9 T3)
+        a7 (- T0 T2)
+        b7 (+ a7 T3)
+        s0 (+ s0 s3)
+        s1 (- s1 s4)
+        s3 s2
+        s2 (* SINPI_3_9 b7)
+        s0 (+ s0 s5)
+        s1 (- s1 s6)
+        x0 (+ s0 s3)
+        x1 (+ s1 s3)
+        x2 s2
+        x3 (+ s0 s1)
+        x3 (- x3 s3)]
+    (-> t
+        (t-set 0 (round2 x0 12))
+        (t-set 1 (round2 x1 12))
+        (t-set 2 (round2 x2 12))
+        (t-set 3 (round2 x3 12)))))
+
+(defn inverse-adst!
+  "spec #Inverse ADST process (7.13.2.9): dispatches on n (2<=n<=4). Only
+   n=2 (ADST4, TX_4X4) is implemented -- see namespace docstring."
+  [t n r]
+  (when (not= n 2)
+    (throw (ex-info "av1.transform: internal: inverse-adst! only supports n=2 (ADST4/TX_4X4)"
+                     {:reason :unsupported-adst-size :n n})))
+  (inverse-adst4! t r))
+
+;; Inverse identity transform 4 process (spec 7.13.2.11) -- included for
+;; completeness alongside inverse-adst4! since IDTX is a structurally
+;; reachable TX_SET_INTRA_1/2 symbol value even though av1.decode-block
+;; currently restricts the DECODED TxType away from IDTX (throws rather
+;; than calling this). Kept unused (not wired into inverse-transform-2d)
+;; until a future extension actually needs it.
+(defn inverse-identity-4! [t]
+  (reduce (fn [t i] (t-set t i (round2 (* (t-get t i) 5793) 12))) t (range 4)))
+
+(defn B
+  "spec #Butterfly functions: B(a,b,angle,flip,r) -- butterfly rotation
+   (+ index swap when flip==1). Returns the updated transient T. `r` is
+   accepted (not used computationally) only to keep this fn's signature a
+   1:1 match with the spec's B(a,b,angle,flip,r) -- the spec's `r` is a
+   *bitstream conformance requirement* on the values B produces (\"it is a
+   requirement of bitstream conformance that the values saved into T are
+   representable by r bits\"), not an input B's own pseudocode reads from."
+  [t a b angle flip _r]
+  (let [ta (t-get t a) tb (t-get t b)
+        x (- (* ta (cos128 angle)) (* tb (sin128 angle)))
+        y (+ (* ta (sin128 angle)) (* tb (cos128 angle)))
+        va (round2 x 12) vb (round2 y 12)]
+    (if (zero? flip)
+      (-> t (t-set a va) (t-set b vb))
+      (-> t (t-set a vb) (t-set b va)))))
+
+(defn H
+  "spec #Butterfly functions: H(a,b,flip,r) -- Hadamard rotation with
+   intermediate clamping to r bits, (+ index swap when flip==1)."
+  [t a b flip r]
+  (let [[a b] (if (zero? flip) [a b] [b a])
+        x (t-get t a) y (t-get t b)
+        lo (- (bit-shift-left 1 (dec r))) hi (dec (bit-shift-left 1 (dec r)))
+        clip3 (fn [v] (cond (< v lo) lo (> v hi) hi :else v))]
+    (-> t (t-set a (clip3 (+ x y))) (t-set b (clip3 (- x y))))))
+
+(defn inverse-dct-permute
+  "spec #Inverse DCT array permutation process: in-place bit-reversal
+   permutation of T (length 2^n)."
+  [t n]
+  (let [n0 (bit-shift-left 1 n)
+        copy (mapv #(t-get t %) (range n0))]
+    (reduce (fn [t i] (t-set t i (nth copy (brev n i)))) t (range n0))))
+
+(defn inverse-dct!
+  "spec #Inverse DCT process (7.13.2.3): in-place inverse DCT of permuted
+   array T (length 2^n, 2<=n<=6). `r` is the intermediate clamping range.
+   Transcribed step-for-step (all 31 steps, each gated by the same `n`
+   condition as the spec) -- see namespace docstring for why the full
+   n=2..6 range is transcribed even though av1.decode-block only exercises
+   n=5 (TX_32X32)."
+  [t n r]
+  (let [t (inverse-dct-permute t n)
+        ge (fn [k] (>= n k))
+        t (if (= n 6) (reduce (fn [t i] (B t (+ 32 i) (- 63 i) (- 63 (* 4 (brev 4 i))) 0 r)) t (range 16)) t)
+        t (if (ge 5) (reduce (fn [t i] (B t (+ 16 i) (- 31 i) (+ 6 (bit-shift-left (brev 3 (- 7 i)) 3)) 0 r)) t (range 8)) t)
+        t (if (= n 6) (reduce (fn [t i] (H t (+ 32 (* i 2)) (+ 33 (* i 2)) (bit-and i 1) r)) t (range 16)) t)
+        t (if (ge 4) (reduce (fn [t i] (B t (+ 8 i) (- 15 i) (+ 12 (bit-shift-left (brev 2 (- 3 i)) 4)) 0 r)) t (range 4)) t)
+        t (if (ge 5) (reduce (fn [t i] (H t (+ 16 (* 2 i)) (+ 17 (* 2 i)) (bit-and i 1) r)) t (range 8)) t)
+        t (if (= n 6)
+            (reduce (fn [t [i j]] (B t (- 62 (* i 4) j) (+ 33 (* i 4) j) (+ 60 (- (* 16 (brev 2 i))) (* 64 j)) 1 r))
+                    t (for [i (range 4) j (range 2)] [i j]))
+            t)
+        t (if (ge 3) (reduce (fn [t i] (B t (+ 4 i) (- 7 i) (- 56 (* 32 i)) 0 r)) t (range 2)) t)
+        t (if (ge 4) (reduce (fn [t i] (H t (+ 8 (* 2 i)) (+ 9 (* 2 i)) (bit-and i 1) r)) t (range 4)) t)
+        t (if (ge 5)
+            (reduce (fn [t [i j]] (B t (- 30 (* 4 i) j) (+ 17 (* 4 i) j) (+ 24 (bit-shift-left j 6) (bit-shift-left (- 1 i) 5)) 1 r))
+                    t (for [i (range 2) j (range 2)] [i j]))
+            t)
+        t (if (= n 6) (reduce (fn [t [i j]] (H t (+ 32 (* i 4) j) (- (+ 35 (* i 4)) j) (bit-and i 1) r)) t (for [i (range 8) j (range 2)] [i j])) t)
+        t (reduce (fn [t i] (B t (* 2 i) (inc (* 2 i)) (+ 32 (* 16 i)) (- 1 i) r)) t (range 2))
+        t (if (ge 3) (reduce (fn [t i] (H t (+ 4 (* 2 i)) (+ 5 (* 2 i)) i r)) t (range 2)) t)
+        t (if (ge 4) (reduce (fn [t i] (B t (- 14 i) (+ 9 i) (+ 48 (* 64 i)) 1 r)) t (range 2)) t)
+        t (if (ge 5) (reduce (fn [t [i j]] (H t (+ 16 (* 4 i) j) (- (+ 19 (* 4 i)) j) (bit-and i 1) r)) t (for [i (range 4) j (range 2)] [i j])) t)
+        t (if (= n 6) (reduce (fn [t [i j]] (B t (- 61 (* i 8) j) (+ 34 (* i 8) j) (+ 56 (- (* i 32)) (* (bit-shift-right j 1) 64)) 1 r)) t (for [i (range 2) j (range 4)] [i j])) t)
+        t (reduce (fn [t i] (H t i (- 3 i) 0 r)) t (range 2))
+        t (if (ge 3) (B t 6 5 32 1 r) t)
+        t (if (ge 4) (reduce (fn [t [i j]] (H t (+ 8 (* 4 i) j) (- (+ 11 (* 4 i)) j) i r)) t (for [i (range 2) j (range 2)] [i j])) t)
+        t (if (ge 5) (reduce (fn [t i] (B t (- 29 i) (+ 18 i) (+ 48 (* (bit-shift-right i 1) 64)) 1 r)) t (range 4)) t)
+        t (if (= n 6) (reduce (fn [t [i j]] (H t (+ 32 (* 8 i) j) (- (+ 39 (* 8 i)) j) (bit-and i 1) r)) t (for [i (range 4) j (range 4)] [i j])) t)
+        t (if (ge 3) (reduce (fn [t i] (H t i (- 7 i) 0 r)) t (range 4)) t)
+        t (if (ge 4) (reduce (fn [t i] (B t (- 13 i) (+ 10 i) 32 1 r)) t (range 2)) t)
+        t (if (ge 5) (reduce (fn [t [i j]] (H t (+ 16 (* i 8) j) (- (+ 23 (* i 8)) j) i r)) t (for [i (range 2) j (range 4)] [i j])) t)
+        t (if (= n 6) (reduce (fn [t i] (B t (- 59 i) (+ 36 i) (if (< i 4) 48 112) 1 r)) t (range 8)) t)
+        t (if (ge 4) (reduce (fn [t i] (H t i (- 15 i) 0 r)) t (range 8)) t)
+        t (if (ge 5) (reduce (fn [t i] (B t (- 27 i) (+ 20 i) 32 1 r)) t (range 4)) t)
+        t (if (= n 6) (reduce (fn [t i] (-> t (H (+ 32 i) (- 47 i) 0 r) (H (+ 48 i) (- 63 i) 1 r))) t (range 8)) t)
+        t (if (ge 5) (reduce (fn [t i] (H t i (- 31 i) 0 r)) t (range 16)) t)
+        t (if (= n 6) (reduce (fn [t i] (B t (- 55 i) (+ 40 i) 32 1 r)) t (range 8)) t)
+        t (if (= n 6) (reduce (fn [t i] (H t i (- 63 i) 0 r)) t (range 32)) t)]
+    t))
+
+(defn- clip3 [lo hi v] (cond (< v lo) lo (> v hi) hi :else v))
+
+(defn dequantize
+  "spec #Reconstruct process, step 1 (dequantization only -- the inverse
+   transform is `inverse-transform-2d` below). `quant` is a flat vector of
+   length tw*th (row-major, Quant[i*tw+j]) already de-scanned into raster
+   order by the caller. Returns Dequant as a flat row-major vector of the
+   same length.
+
+   SCOPE: `using-qmatrix` must be 0 (quantizer matrices not implemented --
+   av1.decode-block throws before calling this fn otherwise); DC/AC
+   quantizer values (`dc-quant`/`ac-quant`, already looked up by the caller
+   via av1.tables/Dc-Qlookup-8bit / Ac-Qlookup-8bit) are plain scalars, no
+   q2/Quantizer_Matrix scaling term."
+  [quant tw th dq-denom dc-quant ac-quant bit-depth]
+  (let [clip-lo (- (bit-shift-left 1 (+ 7 bit-depth)))
+        clip-hi (dec (bit-shift-left 1 (+ 7 bit-depth)))]
+    (mapv (fn [idx]
+            (let [q (if (zero? idx) dc-quant ac-quant)
+                  dq (* (nth quant idx) q)
+                  sign (if (neg? dq) -1 1)
+                  dq2 (quot (* sign (bit-and (abs dq) 0xFFFFFF)) dq-denom)]
+              (clip3 clip-lo clip-hi dq2)))
+          (range (* tw th)))))
+
+(defn- make-row
+  "Row `row-idx` of the w-wide row-transform input T[j], spec step 1: `T[j]
+   = Dequant[i][j]` if i<32 and j<32 (both bounded by `th`/`tw` = Min(32,h)/
+   Min(32,w)), else 0. `dequant-2d` (from `dequantize`) only has `tw*th`
+   elements, so `row-idx >= th` (only reachable for the h>32 rectangular
+   sizes this phase doesn't support, see av1.decode-block) must short-
+   circuit to an all-zero row rather than index out of bounds."
+  [dequant-2d w row-idx tw th]
+  (if (>= row-idx th)
+    (vec (repeat w 0))
+    (mapv (fn [j] (if (< j tw) (nth dequant-2d (+ (* row-idx tw) j)) 0)) (range w))))
+
+;; PlaneTxType -> {row,col} 1D-transform-kind dispatch (spec #2D inverse
+;; transform process's two "if PlaneTxType is equal to one of ..." lists).
+;; Only the 4 TxTypes this repo's ADST extension can ever produce are
+;; covered (:DCT_DCT already existed; :ADST_DCT/:DCT_ADST/:ADST_ADST added
+;; for the ADST extension, see av1.decode-block namespace docstring) --
+;; every other spec TxType (FLIPADST_*/V_*/H_*/IDTX) either needs the
+;; identity transform or the flipUD/flipLR reconstruction step, neither of
+;; which av1.decode-block ever reaches (it throws before producing any
+;; TxType outside this set of 4), so `row-transform-kind`/`col-transform-
+;; kind` throw for internal-consistency rather than silently defaulting.
+(defn- row-transform-kind [tx-type]
+  (case tx-type
+    :DCT_DCT :dct
+    :ADST_DCT :dct
+    :DCT_ADST :adst
+    :ADST_ADST :adst
+    (throw (ex-info "av1.transform: internal: unsupported PlaneTxType for row transform"
+                     {:reason :unsupported-tx-type :tx-type tx-type}))))
+
+(defn- col-transform-kind [tx-type]
+  (case tx-type
+    :DCT_DCT :dct
+    :ADST_DCT :adst
+    :DCT_ADST :dct
+    :ADST_ADST :adst
+    (throw (ex-info "av1.transform: internal: unsupported PlaneTxType for column transform"
+                     {:reason :unsupported-tx-type :tx-type tx-type}))))
+
+(defn- apply-1d! [t n r kind]
+  (case kind
+    :dct (inverse-dct! t n r)
+    :adst (inverse-adst! t n r)))
+
+(defn inverse-transform-2d
+  "spec #2D inverse transform process (7.13.3). `tx-type` (default
+   :DCT_DCT, for pre-existing callers) selects which 1D transform runs on
+   each axis via row-transform-kind/col-transform-kind above -- for
+   :DCT_DCT this is byte-for-byte the same computation as before the ADST
+   extension (both axes still invoke inverse-dct!). `dequant` is the flat
+   row-major tw*th Dequant array from `dequantize` (tw = th = Min(32,w) --
+   for this phase's supported sizes, TX_32X32/TX_4X4, tw==th==w==h always,
+   so no zero-padding is actually exercised, but the general w>32/h>32
+   zero-padding step is still implemented for fidelity). Returns Residual
+   as a flat row-major w*h vector.
+
+   log2W/log2H equal (square transform only, matches this phase's
+   TX_32X32/TX_4X4 scope) so the `Abs(log2W-log2H)==1` rectangular-
+   transform rescale step is never exercised and is omitted (av1.decode-
+   block only calls this fn for square transforms)."
+  ([dequant log2W log2H bit-depth] (inverse-transform-2d dequant log2W log2H bit-depth :DCT_DCT))
+  ([dequant log2W log2H bit-depth tx-type]
+   (let [w (bit-shift-left 1 log2W) h (bit-shift-left 1 log2H)
+         tw (min 32 w) th (min 32 h)
+         row-shift (case log2W 2 0 3 1 4 2 5 2 6 2)
+         col-shift 4
+         row-clamp (+ bit-depth 8)
+         col-clamp (max (+ bit-depth 6) 16)
+         row-kind (row-transform-kind tx-type)
+         col-kind (col-transform-kind tx-type)
+         ;; row transforms
+         row-residual
+         (mapv (fn [i]
+                 (let [row (make-row dequant w i tw th)
+                       t0 (transient row)
+                       t1 (apply-1d! t0 log2W row-clamp row-kind)
+                       out (persistent! t1)]
+                   (mapv #(round2 % row-shift) out)))
+               (range h))
+         ;; clip between row and column transforms
+         clipped (mapv (fn [row] (mapv #(clip3 (- (bit-shift-left 1 (dec col-clamp))) (dec (bit-shift-left 1 (dec col-clamp))) %) row)) row-residual)
+         ;; column transforms
+         cols (mapv (fn [j]
+                      (let [col (mapv #(nth (nth clipped %) j) (range h))
+                            t0 (transient col)
+                            t1 (apply-1d! t0 log2H col-clamp col-kind)
+                            out (persistent! t1)]
+                        (mapv #(round2 % col-shift) out)))
+                    (range w))]
+     ;; transpose cols (w vectors of length h) back to row-major h x w
+     (vec (for [i (range h) j (range w)] (nth (nth cols j) i))))))
+
+(defn dq-denom
+  "spec #Reconstruct process: dqDenom by txSz -- TX_32X32/TX_16X32/TX_32X16/
+   TX_16X64/TX_64X16 -> 2, TX_64X64/TX_32X64/TX_64X32 -> 4, else 1. This
+   repo supports TX_32X32 (dqDenom==2) and, per the ADST extension,
+   TX_4X4 (dqDenom==1, the `:else` branch); the full rule is transcribed
+   for fidelity since it's a cheap `cond`."
+  [tx-sz]
+  (cond
+    (contains? #{tables/TX_32X32 tables/TX_16X32 tables/TX_32X16 tables/TX_16X64 tables/TX_64X16} tx-sz) 2
+    (contains? #{tables/TX_64X64 tables/TX_32X64 tables/TX_64X32} tx-sz) 4
+    :else 1))
+
+;; =======================================================================
+;; ENCODE side: forward transform + quantize -- av1.decode-block's decode
+;; ->encode inversion (2026-07 AV1 encode task, ADR-2607122000 Migration
+;; step 9 continuation), mirroring org-iso-h264's own decode->encode
+;; derivation method: since the AV1 spec (like H.264's) only ever defines
+;; the DECODE side, the forward transform paired with the inverse above was
+;; derived by NUMERICALLY PROBING `inverse-transform-2d`/`dequantize`
+;; themselves (not re-derived from an external forward-transform spec/
+;; source), then confirming the derived closed-form formula reproduces
+;; those probed outputs exactly. This is a stronger validation stance than
+;; \"looks like a textbook DCT-II\": it's fit directly against THIS
+;; namespace's own inverse, so `forward-transform-2d` composed with
+;; `inverse-transform-2d` is -- by construction, not assumption -- close to
+;; an identity map (up to integer/quantization rounding, which is expected
+;; and normal for any DCT-based codec, not a bug).
+;;
+;; DERIVATION (n=5/TX_32X32, this task's ORIGINAL encode scope): probing
+;; `inverse-transform-2d` with a single nonzero Dequant[k][l]=X (all others
+;; 0) and reading back the resulting (should-be-constant/single-basis-
+;; shaped) residual showed EXACTLY (not approximately):
+;;   residual[i][j] = round( X * G * alpha(k) * alpha(l)
+;;                           * cos(pi/32*(i+0.5)*k) * cos(pi/32*(j+0.5)*l) )
+;; with alpha(0) = sqrt(1/32), alpha(k>0) = sqrt(2/32) (the standard
+;; orthonormal DCT-II/III basis normalization), and G = 1/4 EXACTLY (probed
+;; at k=l=0 with X=128*n for n=1..128: residual == n every time, i.e.
+;; residual = round(X/128) = round(X * (1/32) * (1/4)); and at k=0,l=1
+;; with X=4096/8192: residual[0][j] matched
+;; round(X * sqrt(2/32)*sqrt(1/32) * cos(...) * (1/4)) to within 1 of
+;; rounding, confirming G=1/4 rather than 1/2 or 1 -- see the AV1 encode
+;; task's research notes for the full probe transcript). Since this is an
+;; ORTHONORMAL basis (forward and inverse share the same normalization,
+;; unlike the textbook \"1/N, 2/N\" DCT-II/III pair), the exact forward
+;; inverse of `inverse-transform-2d`'s `residual = G * IDCT2D(Dequant)` is
+;; `Dequant = (1/G) * DCT2D(residual)` -- i.e. the SAME basis functions,
+;; analysis instead of synthesis, times 1/G instead of G.
+;;
+;; SIZE GENERALIZATION (chroma encode extension, ADR-2607122000 Migration
+;; step 9 continuation -- a real bug this extension's OWN validation
+;; caught, not assumed away): the n=32-only derivation above was WRONG to
+;; generalize as a size-INDEPENDENT final scale of 4.0 -- re-probing
+;; `inverse-transform-2d` the SAME way (single nonzero Dequant[k][l]=8192,
+;; all else 0) at every square size this repo's transform sizes span
+;; (log2 = 2/3/4/5/6, i.e. TX_4X4/TX_8X8/TX_16X16/TX_32X32/TX_64X64) showed
+;; the DC-only (k=l=0) response is NOT size-independent: residual ==
+;; 256/128/64/64/64 for log2=2/3/4/5/6 respectively (this extension's own
+;; real encode/decode round-trip test for TX_16X16 chroma FAILED with a
+;; factor-of-2 error before this fix was found -- flat 16x16 content at
+;; value 20 round-tripped to 10, exactly half, and a genuine AC/gradient
+;; chroma round-trip showed a large SSD, not a subtle off-by-one). The
+;; pattern matches `inverse-transform-2d`'s OWN `row-shift` case table
+;; exactly (`case log2W 2 0 3 1 4 2 5 2 6 2` -- row-shift SATURATES at 2
+;; once log2>=4; `col-shift` is a separate FIXED 4 regardless of size):
+;; solving for the exact final multiplier `forward-transform-2d` must
+;; apply (on top of the alpha-normalized two-axis DCT sum, which already
+;; contributes a factor of `n` = 2^log2 for the flat/DC case) against
+;; every probed value gives the closed form
+;;   scale(log2) = 2 ^ (7 - max(log2, 4))
+;; -- confirmed to reproduce every probed DC value exactly (8/8/8/4/2 for
+;; log2=2/3/4/5/6), AND independently confirmed for a genuine AC (non-DC)
+;; frequency too (k=0,l=1 probe at log2=4/TX_16X16, `Dequant[0][1]=8192`:
+;; scale=8 reproduced `inverse-transform-2d`'s real per-pixel output
+;; exactly across the whole probed row, where the OLD hardcoded 4.0 was
+;; off by exactly 2x on every sample) -- so this is confirmed for both DC
+;; and AC contributions, not merely the flat-DC case that would have been
+;; the smallest possible probe. `forward-scale` below implements this
+;; closed form; for log2=5/TX_32X32 (this task's original scope) it
+;; reduces to `2^(7-5) = 4` EXACTLY, the pre-existing hardcoded constant --
+;; so every pre-existing TX_32X32 caller's output is byte-for-byte
+;; unchanged by this fix.
+;;
+;; This was verified point-by-point against `inverse-transform-2d`'s real
+;; (non-probed) output for several multi-coefficient combinations
+;; (including negative coefficients) before being relied on for real
+;; encode/decode round-trips -- see test/av1/transform_encode_test.cljk.
+
+(defn- alpha
+  "Orthonormal 1D DCT-II/III basis normalization: alpha(0) = sqrt(1/n),
+   alpha(k>0) = sqrt(2/n), n = 2^log2n (see derivation above)."
+  [k n]
+  (if (zero? k)
+    (Math/sqrt (/ 1.0 n))
+    (Math/sqrt (/ 2.0 n))))
+
+(defn- forward-scale
+  "The final multiplier `forward-transform-2d` applies (on top of the
+   alpha-normalized two-axis forward DCT sum) to exactly invert
+   `inverse-transform-2d` for square transform size `2^log2` -- see the
+   SIZE GENERALIZATION note above for the derivation and probe values.
+   `2^(7 - max(log2,4))`: 8 for log2 in {2,3,4} (TX_4X4/TX_8X8/TX_16X16),
+   4 for log2=5 (TX_32X32, this task's original scope -- matches the
+   pre-existing hardcoded constant exactly), 2 for log2=6 (TX_64X64) --
+   log2=2..6 all directly probed against the real `inverse-transform-2d`
+   (see the SIZE GENERALIZATION note above), though this repo's encode
+   scope only ever calls this fn with log2=4 (chroma) or log2=5 (luma)."
+  [log2]
+  (Math/pow 2.0 (- 7 (max log2 4))))
+
+(defn- round-half-up
+  "Math/round (Java) rounds half-up for both signs (round-toward-positive-
+   infinity at the .5 boundary) -- matches this repo's other Round2-based
+   rounding closely enough for encode-side coefficient selection (there is
+   no spec-mandated forward-transform rounding rule to match exactly,
+   unlike Round2 on the decode side, since the spec never defines a
+   forward transform at all -- see namespace docstring)."
+  [x]
+  #?(:clj (long (Math/round (double x)))
+     :cljs (Math/round x)))
+
+(defn forward-dct-1d
+  "Orthonormal 1D forward DCT-II of length-n vector `x` (n = 2^log2n):
+   `X[k] = sum_i x[i] * alpha(k,n) * cos(pi/n*(i+0.5)*k)`, floating point,
+   NOT rounded to integer here (rounding happens once, in
+   `forward-transform-2d`, after both axes and the overall x4 scale are
+   applied -- rounding after each 1D pass separately would compound
+   quantization-like error the spec's own inverse never introduces on its
+   side, since `inverse-transform-2d`'s Round2 calls are calibrated against
+   its OWN per-stage fixed-point scale, not this floating-point forward
+   pass's)."
+  [x n]
+  (mapv (fn [k]
+          (let [a (alpha k n)]
+            (reduce + 0.0
+                    (map-indexed (fn [i xi] (* xi a (Math/cos (* Math/PI (/ (+ i 0.5) n) k)))) x))))
+        (range n)))
+
+(defn forward-transform-2d
+  "Exact forward inverse of `inverse-transform-2d` for `:DCT_DCT` (the only
+   PlaneTxType this repo's encode scope produces -- TX_32X32/TX_16X16, both
+   forced DCT_DCT by `get_tx_set()`, see av1.decode-block's docstring).
+   `residual` is a flat row-major w*h vector (w=h=2^log2W, square
+   transforms only, matching this repo's encode scope); returns Coeff as a
+   flat row-major w*h vector of INTEGER (rounded) coefficients, in the same
+   raster-position convention `dequantize`/`quantize` (below) expect (NOT
+   scan order -- the caller de-scans/re-scans, matching how
+   av1.decode-block's `read-coeffs` already threads `quant` by raster
+   position, see its docstring).
+
+   Separable: 1D forward DCT-II along columns (row-major, i.e. transforming
+   each ROW's samples into that row's column-frequency coefficients, the
+   direct structural mirror of `inverse-transform-2d`'s row-transform
+   pass), then along rows (mirroring its column-transform pass), then the
+   size-dependent final scale (`forward-scale`, see namespace docstring's
+   SIZE GENERALIZATION note -- 4.0 for log2W=5/TX_32X32, matching this
+   fn's original hardcoded constant exactly; 8.0 for log2W=4/TX_16X16, the
+   chroma encode extension's new size) + round-to-integer."
+  [residual log2W log2H]
+  (let [w (bit-shift-left 1 log2W) h (bit-shift-left 1 log2H)
+        rows (mapv (fn [i] (forward-dct-1d (mapv (fn [j] (nth residual (+ (* i w) j))) (range w)) w))
+                    (range h))
+        ;; rows[i][l] is now column-frequency l for spatial row i; forward-
+        ;; transform the column axis (spatial row i -> row-frequency k)
+        ;; for each fixed column-frequency l.
+        cols (mapv (fn [l]
+                     (forward-dct-1d (mapv (fn [i] (nth (nth rows i) l)) (range h)) h))
+                   (range w))
+        scale (forward-scale log2W)]
+    ;; cols[l][k] = Coeff2D[k][l] (pre-scale); assemble row-major [k][l],
+    ;; apply the size-dependent final scale, and round to integer.
+    (vec (for [k (range h), l (range w)]
+           (round-half-up (* scale (nth (nth cols l) k)))))))
+
+(defn quantize
+  "Exact forward inverse of `dequantize` (up to the expected, normal
+   rounding loss of any lossy transform-coding quantizer -- there is no
+   spec text to match here either, since dequantize's own `dq-denom`/
+   masking-to-24-bits mechanics are round-trip-lossy by design once real
+   compression is in play). `coeff` is `forward-transform-2d`'s flat
+   row-major output; `q` is `dc-quant` (index 0) or `ac-quant` (every other
+   index), `dq-denom` from `dq-denom` above. Returns Quant, the flat
+   row-major vector of signed integers `read-coeffs`' encode-side inverse
+   (av1.encode-block/write-coeffs) needs.
+
+   `dequantize`'s own formula is `dq = quant*q`, `dq2 = sign(dq) *
+   (|dq| & 0xFFFFFF) / dq-denom` (dropping the 24-bit mask here, which only
+   matters for implausibly large coefficients this repo's encode scope
+   never produces); inverting `dq2 = quant*q/dq-denom` for `quant` given a
+   target `dq2` is `quant = round(dq2 * dq-denom / q)`."
+  [coeff tw th dq-denom dc-quant ac-quant]
+  (mapv (fn [idx]
+          (let [q (if (zero? idx) dc-quant ac-quant)
+                target (nth coeff idx)]
+            (round-half-up (/ (* target dq-denom) (double q)))))
+        (range (* tw th))))

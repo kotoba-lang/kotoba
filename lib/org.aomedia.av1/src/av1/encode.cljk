@@ -1,0 +1,353 @@
+(ns av1.encode
+  "Top-level AV1 ENCODE orchestration (2026-07 AV1 encode task,
+   ADR-2607122000 Migration step 9 continuation -- \"AV1 encode side\",
+   mirroring kotoba-lang/org-iso-h264's own decode->encode task strategy:
+   start from the simplest real, independently-decodable case). Ties
+   together every encode-side namespace this task added
+   (av1.bitwriter/av1.bool-encoder/av1.transform's forward-transform-
+   2d+quantize/av1.encode-block/av1.sequence-header's `write`/
+   av1.frame-header's `write`/av1.obu's `write-obu`) into ONE function,
+   `encode-keyframe`, that turns a 32x32 8-bit luma plane into a complete,
+   legal, standalone AV1 OBU stream (the same 'low overhead bitstream
+   format' av1.obu/parse-all consumes, and the same format `ffmpeg -f obu`/
+   `dav1d`/`aomdec` read).
+
+   SCOPE (see av1.encode-block's namespace docstring for the full
+   boundary): a single monochrome 32x32 KEY_FRAME, ONE BLOCK_32X32/
+   PARTITION_NONE leaf covering the whole frame, DC_PRED, TX_32X32/
+   DCT_DCT. This is exactly the mirror image of av1.decode-block's very
+   FIRST pixel-reconstruction milestone (`keyframe-32x32-gradient.obu`'s
+   scope, before that namespace's V_PRED/PAETH/SMOOTH/chroma/ADST/inter
+   extensions) -- deliberately, since that's this org's own established
+   practice for a first encode pass (narrowest real, validated slice
+   first, extend later).
+
+   SEQUENCE HEADER CHOICE: `reduced_still_picture_header=1` (see
+   av1.sequence-header/write's docstring for why this is the simplest
+   legal AV1 profile, not a shortcut outside the spec -- AVIF still images
+   commonly use exactly this profile, and dav1d/aomdec fully support it).
+
+   CHROMA (Cb/Cr) ENCODE EXTENSION (ADR-2607122000 Migration step 9
+   continuation, deriving the encode side by inverting av1.decode-block's
+   already-validated chroma-decode extension the same way this task's
+   original luma pass inverted its luma-only decode milestone): adds
+   optional 4:2:0 color support to `encode-keyframe` -- pass `:cb`/`:cr`
+   (each a flat row-major 16x16 8-bit vector, the 4:2:0 subsample of this
+   fn's 32x32 luma frame) to encode a `mono_chrome=0`/`num_planes=3` color
+   keyframe instead of the original monochrome-only shape. Scoped to
+   EXACTLY the same single-whole-frame-leaf shape as luma: one
+   BLOCK_32X32 leaf (subsamples 4:2:0 to exactly one BLOCK_16X16 chroma
+   block, per av1.decode-block namespace docstring's chroma section),
+   UV_DC_PRED (chroma DC prediction with no available neighbors, same
+   `128` constant as luma's DC_PRED-no-neighbors case, av1.intra-pred/
+   dc-predict being plane-agnostic), TX_16X16/DCT_DCT (chroma's TxType is
+   DCT_DCT with a structural zero-bit guarantee for UV_DC_PRED, exactly
+   mirroring luma's TX_32X32 guarantee -- see av1.decode-block namespace
+   docstring's chroma section -- so `write-coeffs` needed zero changes,
+   see av1.encode-block namespace docstring), zero chroma quantizer delta
+   (`delta_q_u_dc=delta_q_u_ac=0`, so chroma shares luma's `base-q-idx`
+   directly -- the simplest legal choice, not a scope restriction: a wider
+   `encode-keyframe` could accept separate chroma deltas as additional
+   args). `av1.transform/forward-transform-2d`/`quantize` needed ZERO
+   changes either (already fully generic over `log2W`/`log2H`, see that
+   namespace's docstring -- TX_16X16 chroma is exercised there for the
+   FIRST time by real encode/decode round-trips in this extension's own
+   validation, previously only TX_32X32/luma was). `uv_mode` IS a real
+   symbol write (`av1.encode-block/write-uv-mode`, the encode-side inverse
+   of av1.decode-block/read-uv-mode) -- not zero-bit, since `uv_mode`'s
+   cdf read/write is real for every color frame regardless of the decoded/
+   encoded value.
+
+   Validated the same way this task's every prior extension was: this
+   repo's OWN decoder round-trips a real Cb/Cr target (see
+   test/av1/encode_test.cljk's chroma round-trip tests), AND checked-in
+   `encode-keyframe-32x32-color-*.obu` fixtures (this repo's own encoder
+   output) decode successfully via REAL `dav1d`/`aomdec` -- the strongest
+   available check, since dav1d/aomdec accepting and correctly decoding a
+   `mono_chrome=0` bitstream this repo itself produced confirms the
+   sequence-header/frame-header/uv_mode/chroma-coeffs bit layout is
+   genuinely spec-conformant, not merely self-consistent with this repo's
+   own decode side (see test/av1/fixtures.cljk's docstrings for the exact
+   `dav1d`/`aomdec` invocations)."
+  (:require [av1.bitwriter :as bw]
+            [av1.bool-encoder :as be]
+            [av1.transform :as xform]
+            [av1.tables :as tables]
+            [av1.tile-group :as tg]
+            [av1.encode-block :as eb]
+            [av1.decode-block :as db]
+            [av1.sequence-header :as sh]
+            [av1.frame-header :as fh]
+            [av1.obu :as obu]))
+
+(def FRAME-SIZE 32)
+(def MI-SIZE 8) ;; FRAME-SIZE / 4
+(def CHROMA-SIZE 16) ;; FRAME-SIZE >> subsampling_x/y (4:2:0)
+(def CHROMA-MI-SIZE 4) ;; MI-SIZE >> subsampling_x/y
+
+;; ---------------------------------------------------------------------
+;; Partition tree -- this repo's encode scope only ever produces the exact
+;; shape av1.tile-group/decode-partition documents for an 8x8-mi (32x32px)
+;; frame under a 64x64 superblock: top-level BLOCK_64X64 call has
+;; hasRows=hasCols=false (mi-rows=mi-cols=8, half4x4=8, `0+8 < 8` is false)
+;; -> PARTITION_SPLIT with ZERO bits (spec's own structural forcing, see
+;; av1.tile-group's `decode-partition` `:else` branch); of its 4
+;; BLOCK_32X32 children, only the top-left (0,0) is in-bounds (the other 3
+;; start at row/col 8, `>= mi-rows/mi-cols`, spec's `return 0` with ZERO
+;; reads); the one real child has hasRows=hasCols=true (half4x4=4 for
+;; BLOCK_32X32, `0+4 < 8` true) -> a REAL `partition` symbol read against
+;; `Default_Partition_W32_Cdf[ctx=0]` (avail-u?/avail-l? both false at the
+;; frame origin) -- this fn writes exactly that one real symbol
+;; (PARTITION_NONE) and nothing else, matching the zero real reads
+;; everywhere else in this tree.
+
+(defn write-partition-none
+  "Writes the ONE real `partition` symbol this frame's fixed partition-tree
+   shape needs (see above) -- PARTITION_NONE at BLOCK_32X32, ctx=0."
+  [state]
+  (let [cdf (nth tg/Default_Partition_W32_Cdf 0)
+        adapt? (:cdf-adapt? state true)
+        [_cdf' enc'] (be/encode-symbol (:enc state) cdf tg/PARTITION_NONE adapt?)]
+    (assoc state :enc enc')))
+
+;; ---------------------------------------------------------------------
+;; Prediction -- DC_PRED with NO available neighbors (this frame's only
+;; leaf covers the whole frame, so avail-u?/avail-l? are both false, spec
+;; 7.11.2.4's \"neither available\" case): predicted value is the fixed
+;; `1 << (BitDepth-1)` == 128 constant, matching av1.intra-pred/dc-predict
+;; exactly for this shape (not re-derived here -- see luma-spec-32's
+;; :plane-key / av1.decode-block/decode-transform-block for the real
+;; decode-side computation this mirrors).
+
+(def DC-PRED-NO-NEIGHBORS 128)
+
+;; ---------------------------------------------------------------------
+;; luma-spec-32 -- the SAME map shape av1.decode-block's own
+;; `luma-spec-base` uses (deliberately duplicated rather than requiring
+;; av1.decode-block's private var: `luma-spec-base` isn't public, and this
+;; is a small, static, well-documented literal -- see av1.decode-block's
+;; own docstring for what each key means).
+
+(def luma-spec-32
+  {:plane 0 :bwl 5 :w 32 :seg-eob 1024 :scan tables/Default-Scan-32x32
+   :subx 0 :suby 0 :tx-sz tables/TX_32X32
+   :txb-skip-cdf-key :txb-skip-cdfs :txb-skip-table tables/Default-Txb-Skip-Cdf-32x32
+   :eob-pt-cdf-key :eob-pt-1024-cdf :eob-pt-table tables/Default-Eob-Pt-1024-Cdf-Luma
+   :eob-extra-cdf-key :eob-extra-cdfs :eob-extra-table tables/Default-Eob-Extra-Cdf-32x32-Luma
+   :coeff-base-eob-cdf-key :coeff-base-eob-cdfs :coeff-base-eob-table tables/Default-Coeff-Base-Eob-Cdf-32x32-Luma
+   :coeff-base-cdf-key :coeff-base-cdfs :coeff-base-table tables/Default-Coeff-Base-Cdf-32x32-Luma
+   :coeff-br-cdf-key :coeff-br-cdfs :coeff-br-table tables/Default-Coeff-Br-Cdf-32x32-Luma
+   :dc-sign-cdf-key :dc-sign-cdfs :dc-sign-table tables/Default-Dc-Sign-Cdf-Luma})
+
+;; chroma-spec-32 -- the SAME map shape av1.decode-block's own
+;; `chroma-spec-base`/`u-spec`/`v-spec` use (deliberately duplicated here
+;; the same way `luma-spec-32` above duplicates `luma-spec-base` -- those
+;; are private in av1.decode-block, and this is a small, static,
+;; well-documented literal). `av1.encode-block/write-coeffs` only ever
+;; consults `:plane`/`:bwl`/`:w`/`:scan`/the seven `:*-cdf-key`/`:*-table`
+;; pairs (NOT `:subx`/`:suby`/`:plane-key`/`:tx-sz`, which are only needed
+;; by av1.decode-block's own `decode-transform-block` orchestration, not
+;; by `write-coeffs` itself) -- see av1.encode-block namespace docstring.
+;; U (plane 1) and V (plane 2) intentionally share every `:*-cdf-key` (the
+;; spec's `ptype` dimension is "luma vs chroma", not "Y vs U vs V" -- see
+;; av1.decode-block namespace docstring's cross-block-context section),
+;; only `:plane` differs.
+
+(def chroma-spec-32
+  {:bwl 4 :w 16 :scan tables/Default-Scan-16x16
+   :txb-skip-cdf-key :txb-skip-cdfs-chroma :txb-skip-table tables/Default-Txb-Skip-Cdf-16x16-Chroma
+   :eob-pt-cdf-key :eob-pt-256-cdf-chroma :eob-pt-table tables/Default-Eob-Pt-256-Cdf-Chroma
+   :eob-extra-cdf-key :eob-extra-cdfs-chroma :eob-extra-table tables/Default-Eob-Extra-Cdf-16x16-Chroma
+   :coeff-base-eob-cdf-key :coeff-base-eob-cdfs-chroma :coeff-base-eob-table tables/Default-Coeff-Base-Eob-Cdf-16x16-Chroma
+   :coeff-base-cdf-key :coeff-base-cdfs-chroma :coeff-base-table tables/Default-Coeff-Base-Cdf-16x16-Chroma
+   :coeff-br-cdf-key :coeff-br-cdfs-chroma :coeff-br-table tables/Default-Coeff-Br-Cdf-16x16-Chroma
+   :dc-sign-cdf-key :dc-sign-cdfs-chroma :dc-sign-table tables/Default-Dc-Sign-Cdf-Chroma})
+
+(def u-spec-32 (assoc chroma-spec-32 :plane 1))
+(def v-spec-32 (assoc chroma-spec-32 :plane 2))
+
+;; ---------------------------------------------------------------------
+;; encode-tile-payload -- the tile_group_obu()'s worth of bits: partition
+;; tree (write-partition-none, plus the zero-bit SPLIT/out-of-bounds
+;; structure, which needs no explicit writes at all) + decode_block()
+;; (read_skip/read_cdef/intra_frame_y_mode/intra_angle_info_y/
+;; read_block_tx_size/coeffs(), all mirrored via av1.encode-block, except
+;; the several that are zero-bit-forced for this scope and so need no
+;; write call at all -- read_cdef (enable_cdef=0), intra_angle_info_y
+;; (DC_PRED isn't directional), read_block_tx_size (TX_MODE_LARGEST forces
+;; TxSize directly)).
+
+(defn encode-tile-payload
+  "Returns a flat byte vector: the fully bool-encoded, byte-aligned tile
+   data for this frame's ONE tile (`init_symbol`/writes/`exit_symbol`,
+   mirroring av1.tile-group/parse-tile-group-obu's own per-tile
+   init_symbol/decode-partition-over-superblocks/exit_symbol loop, but
+   for exactly the one real leaf this frame's fixed shape has -- see
+   `write-partition-none`'s docstring). `luma-quant` is the target luma
+   TX_32X32 coefficient array (already-quantized, raster position, from
+   av1.transform/forward-transform-2d + quantize) -- pass an all-zero
+   vector for a `skip=1` (zero-residual) block. `chroma-quants` is `nil`
+   for a monochrome frame, or `{:u <TX_16X16 quant> :v <TX_16X16 quant>}`
+   for a color frame (chroma encode extension, see namespace docstring) --
+   `skip` is 1 only when EVERY plane's quant array is all-zero (matching
+   the spec's single per-block skip flag covering every plane, not a
+   luma-only concept).
+
+   `q-idx` is `av1.tables/q-ctx-idx`'s mapping of base_q_idx to this
+   repo's CDF-table q-context index (matching how av1.decode-block's
+   `make-decode-block-fn` computes it once per frame -- SHARED between
+   luma and chroma here since this fn's chroma quantizer delta is always
+   0, see namespace docstring)."
+  ([q-idx luma-quant cdf-adapt?] (encode-tile-payload q-idx luma-quant nil cdf-adapt?))
+  ([q-idx luma-quant chroma-quants cdf-adapt?]
+   (let [color? (some? chroma-quants)
+         skip (if (and (every? zero? luma-quant)
+                       (or (not color?)
+                           (and (every? zero? (:u chroma-quants)) (every? zero? (:v chroma-quants)))))
+                1 0)
+         state0 {:enc (be/init) :cdf-adapt? cdf-adapt? :skips {} :y-modes {}}
+         state1 (write-partition-none state0)
+         state2 (eb/write-skip state1 0 0 false false skip)
+         ;; read_cdef(): zero-bit no-op for this scope (enable_cdef=0 from
+         ;; the sequence header, see av1.decode-block/read-cdef's own
+         ;; `(not enable-cdef?)` short-circuit) -- no write needed.
+         state3 (eb/write-y-mode state2 0 0 false false db/DC_PRED)
+         ;; intra_angle_info_y(): zero-bit no-op (DC_PRED isn't
+         ;; is_directional_mode) -- no write needed.
+         state4 (-> state3
+                    (update :skips assoc [0 0] skip)
+                    (update :y-modes assoc [0 0] db/DC_PRED))
+         ;; uv_mode (chroma encode extension): a REAL symbol write for
+         ;; every color frame, regardless of skip -- per spec, uv_mode is
+         ;; read right after intra_angle_info_y() and BEFORE
+         ;; read_block_tx_size()/residual(), unconditionally on skip (see
+         ;; av1.decode-block/make-decode-block-fn's intra branch, which
+         ;; calls read-uv-mode before checking `(pos? skip)`).
+         state4b (if color?
+                   (eb/write-uv-mode state4 db/DC_PRED db/UV_DC_PRED)
+                   state4)
+         ;; read_block_tx_size(): zero-bit no-op (TX_MODE_LARGEST forces
+         ;; TxSize=Max_Tx_Size_Rect[BLOCK_32X32]=TX_32X32 directly) -- no
+         ;; write needed. residual(): only when skip=0 (mirrors
+         ;; av1.decode-block's own skip-branch, which skips coeffs()
+         ;; entirely and only predicts, for EVERY plane).
+         state5 (if (zero? skip)
+                  (let [[_luma-eob stateL] (eb/write-coeffs state4b q-idx 0 0 MI-SIZE MI-SIZE 0 luma-spec-32 luma-quant)]
+                    (if color?
+                      ;; chroma's txb_skip ctx (plane>0 branch, `get_txb_skip_ctx`)
+                      ;; is a real map lookup (av1.decode-block/
+                      ;; get-txb-skip-ctx-chroma, made public for exactly this
+                      ;; reuse) -- for this fn's only supported shape (single
+                      ;; whole-frame leaf, no neighbors), the above/left maps
+                      ;; are always empty, so this always evaluates to exactly
+                      ;; 7 (matching av1.decode-block's own documented
+                      ;; invariant for the same single-leaf case), computed
+                      ;; via the real fn rather than hardcoded for clarity/
+                      ;; future-proofing (mirrors how luma's ctx=0 is still
+                      ;; passed explicitly below rather than omitted).
+                      (let [txb-ctx-u (db/get-txb-skip-ctx-chroma stateL 1 0 0 CHROMA-MI-SIZE CHROMA-MI-SIZE
+                                                                   CHROMA-SIZE CHROMA-SIZE CHROMA-SIZE CHROMA-SIZE
+                                                                   CHROMA-MI-SIZE CHROMA-MI-SIZE)
+                            [_u-eob stateU] (eb/write-coeffs stateL q-idx 0 0 CHROMA-MI-SIZE CHROMA-MI-SIZE
+                                                              txb-ctx-u u-spec-32 (:u chroma-quants))
+                            txb-ctx-v (db/get-txb-skip-ctx-chroma stateU 2 0 0 CHROMA-MI-SIZE CHROMA-MI-SIZE
+                                                                   CHROMA-SIZE CHROMA-SIZE CHROMA-SIZE CHROMA-SIZE
+                                                                   CHROMA-MI-SIZE CHROMA-MI-SIZE)
+                            [_v-eob stateV] (eb/write-coeffs stateU q-idx 0 0 CHROMA-MI-SIZE CHROMA-MI-SIZE
+                                                              txb-ctx-v v-spec-32 (:v chroma-quants))]
+                        stateV)
+                      stateL))
+                  state4b)]
+     (be/done (:enc state5)))))
+
+;; ---------------------------------------------------------------------
+;; Top-level: pixels -> forward transform/quantize -> tile payload ->
+;; frame_header+tile_group (one OBU_FRAME) -> full OBU stream (temporal
+;; delimiter + sequence header + frame).
+
+(defn- quantize-plane
+  "Shared forward-transform+quantize helper for luma (`log2`=5, size 32) and
+   chroma (`log2`=4, size 16) -- both planes share the SAME `dc-quant`/
+   `ac-quant` in this fn's scope (chroma's quantizer delta is always 0, see
+   namespace docstring), only the transform size differs. Returns an
+   all-zero vector for `skip?`, matching the spec's single per-block skip
+   flag applying to every plane at once (av1.decode-block's `reset_block_
+   context()`, no `coeffs()` call for any plane when skip=1)."
+  [pixels size log2 tx-sz dc-quant ac-quant skip?]
+  (if skip?
+    (vec (repeat (* size size) 0))
+    (let [pred (vec (repeat (* size size) DC-PRED-NO-NEIGHBORS))
+          residual (mapv - pixels pred)
+          coeff (xform/forward-transform-2d residual log2 log2)]
+      (xform/quantize coeff size size (xform/dq-denom tx-sz) dc-quant ac-quant))))
+
+(defn encode-keyframe
+  "`pixels`: flat row-major 32x32 vector of 8-bit luma samples (the target
+   reconstructed image -- what THIS repo's own decode-block, and a real
+   independent decoder like dav1d, should reconstruct when decoding this
+   fn's output, up to the expected lossy-transform-coding error for
+   non-flat content, see av1.transform's forward-transform-2d/quantize
+   docstrings). `base-q-idx` (1..255) is this frame's quantizer.
+
+   Chroma (Cb/Cr) encode extension (ADR-2607122000 Migration step 9
+   continuation, see namespace docstring): pass `:cb`/`:cr` (each a flat
+   row-major 16x16 vector, the 4:2:0 subsample of `pixels`) to encode a
+   `mono_chrome=0`/4:2:0 color keyframe instead of the original monochrome-
+   only shape -- both or neither must be supplied. `:skip?` (when true)
+   requires EVERY plane (luma AND, if supplied, Cb/Cr) to already equal
+   its DC_PRED/UV_DC_PRED no-neighbors predicted value (128), matching the
+   spec's single per-block skip flag covering every plane at once (not a
+   luma-only concept) -- callers passing `:skip? true` with non-flat-128
+   chroma would silently desync the decode side, so this is the caller's
+   responsibility to guarantee (mirrors the pre-existing luma-only
+   `:skip?` contract, unchanged).
+
+   Returns a flat byte vector: OBU_TEMPORAL_DELIMITER (empty) ++
+   OBU_SEQUENCE_HEADER ++ OBU_FRAME (frame_header_obu() + tile_group_obu()
+   combined, spec #Frame OBU syntax) -- the same 'low overhead bitstream
+   format' av1.obu/parse-all / av1.tile-group/parse-frame-obu / real
+   `dav1d`/`aomdec`/`ffmpeg -f obu` all consume."
+  ([pixels base-q-idx] (encode-keyframe pixels base-q-idx {}))
+  ([pixels base-q-idx {:keys [cdf-adapt? skip? cb cr] :or {cdf-adapt? true skip? false cb nil cr nil}}]
+   (when (not= (count pixels) (* FRAME-SIZE FRAME-SIZE))
+     (throw (ex-info "av1.encode/encode-keyframe: pixels must be a flat 32x32 vector"
+                      {:count (count pixels)})))
+   (when (not= (some? cb) (some? cr))
+     (throw (ex-info "av1.encode/encode-keyframe: :cb and :cr must both be supplied (color) or both omitted (monochrome)"
+                      {:cb? (some? cb) :cr? (some? cr)})))
+   (let [color? (some? cb)]
+     (when (and color? (not= (count cb) (* CHROMA-SIZE CHROMA-SIZE)))
+       (throw (ex-info "av1.encode/encode-keyframe: :cb must be a flat 16x16 vector"
+                        {:count (count cb)})))
+     (when (and color? (not= (count cr) (* CHROMA-SIZE CHROMA-SIZE)))
+       (throw (ex-info "av1.encode/encode-keyframe: :cr must be a flat 16x16 vector"
+                        {:count (count cr)})))
+     (let [q-idx (tables/q-ctx-idx base-q-idx)
+           dc-quant (nth tables/Dc-Qlookup-8bit base-q-idx) ;; delta_q_y_dc=0 -> dc-q-index==base-q-idx
+           ac-quant (nth tables/Ac-Qlookup-8bit base-q-idx)
+           quant (quantize-plane pixels FRAME-SIZE 5 tables/TX_32X32 dc-quant ac-quant skip?)
+           ;; chroma's delta_q_u_dc/delta_q_u_ac are both written as 0 (see
+           ;; av1.frame-header/write's :color? branch), so chroma shares
+           ;; luma's dc-quant/ac-quant directly.
+           chroma-quants (when color?
+                           {:u (quantize-plane cb CHROMA-SIZE 4 tables/TX_16X16 dc-quant ac-quant skip?)
+                            :v (quantize-plane cr CHROMA-SIZE 4 tables/TX_16X16 dc-quant ac-quant skip?)})
+           tile-bytes (encode-tile-payload q-idx quant chroma-quants cdf-adapt?)
+           ;; -- OBU_SEQUENCE_HEADER -- needs spec 5.3.4 trailing_bits()
+           ;; padding (a '1' bit then zero-pad), NOT plain zero-padding --
+           ;; see av1.bitwriter/trailing-bits's docstring: real decoders
+           ;; (ffmpeg/dav1d) reject an OBU_SEQUENCE_HEADER (or standalone
+           ;; OBU_FRAME_HEADER/OBU_METADATA) payload padded with plain
+           ;; zeros instead.
+           seq-payload (bw/to-bytes (bw/trailing-bits (sh/write (bw/make-writer) {:max-frame-width FRAME-SIZE :max-frame-height FRAME-SIZE :mono-chrome? (not color?)})))
+           seq-obu (bw/to-bytes (obu/write-obu (bw/make-writer) 1 seq-payload))
+           ;; -- OBU_FRAME: frame_header_obu() + byte_alignment() + tile_group_obu() --
+           frame-payload-writer (-> (bw/make-writer)
+                                     (fh/write {:base-q-idx base-q-idx :color? color?})
+                                     (bw/byte-alignment))
+           frame-payload-writer2 (reduce (fn [w byte] (bw/f w 8 byte)) frame-payload-writer tile-bytes)
+           frame-payload (bw/to-bytes frame-payload-writer2)
+           frame-obu (bw/to-bytes (obu/write-obu (bw/make-writer) 6 frame-payload))
+           ;; -- OBU_TEMPORAL_DELIMITER (empty payload) --
+           td-obu (bw/to-bytes (obu/write-obu (bw/make-writer) 2 []))]
+       (vec (concat td-obu seq-obu frame-obu))))))

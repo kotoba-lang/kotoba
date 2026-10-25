@@ -1,0 +1,264 @@
+(ns av1.bool-encoder
+  "AV1 'Symbol encoder' -- the structural inverse of av1.bool-decoder's
+   Symbol decoder (spec 8.2, \"Parsing process for symbol decoder\"). The
+   AV1 spec is decoder-only (like every codec spec this org has encoded
+   for -- see kotoba-lang/org-iso-h264's own decode->encode note); there is
+   no 'Symbol encoding process' section to transcribe. Instead this
+   namespace ports the REAL, independently-implemented range encoder that
+   actually produces AV1 bitstreams real encoders (aomenc/SVT-AV1) and
+   real decoders (this repo, dav1d) agree on: libaom's `od_ec_enc_*`
+   family (`aom_dsp/entenc.c`/`entenc.h`, AOMediaCodec/aom master, fetched
+   2026-07-13) -- the encode-side counterpart of the same daala-derived
+   range coder av1.bool-decoder implements the decode side of. This is
+   analogous to how av1.transform's ADST work cross-checked against
+   libaom's `av1_iadst4` as a second independent source -- here the
+   'second source' IS the primary source, since there's no spec text on
+   the encode side to transcribe from at all.
+
+   CORRECTNESS ARGUMENT (not just 'looks similar to the decoder'): every
+   per-symbol boundary computation below (`encode-symbol`'s u/v) was
+   derived by algebraic inversion of av1.bool-decoder/read-symbol's own
+   per-candidate boundary formula (`cur` in its search loop) -- assigning
+   av1.bool-decoder's loop-local `n` (nsyms, `(dec (count cdf))`) the
+   relationship `n == N+1` to libaom's `N = nsyms-1`, the boundary
+   functions become IDENTICAL: decoder's `cur` at prospective symbol index
+   `s` equals encoder's `v` (fh boundary) at that same `s`, and decoder's
+   `prev` (`cur` from the s-1 iteration) equals encoder's `u` (fl
+   boundary) -- see this namespace's `encode-symbol` docstring for the
+   full derivation. This was verified computationally, not just by
+   inspection, before this namespace was written: a real encoded AV1
+   bitstream's `read_symbol` boundary values were probed at several
+   (cdf, symbol) pairs and matched byte-for-byte against libaom's
+   `od_ec_encode_q15`'s `u`/`v` at the same inputs.
+
+   IMPLEMENTATION SIMPLIFICATION (bounded low, no periodic flush): the
+   real libaom encoder keeps `enc->low` inside a 64-bit machine word by
+   periodically flushing its top bits into the output buffer (with
+   backward carry-propagation into already-flushed bytes) once `cnt`
+   would exceed ~40 -- a performance/memory optimization for encoding
+   megabyte-scale real video, not a correctness requirement. This repo's
+   encode scope only ever produces a handful of bytes (a single 32x32
+   keyframe's tile data), so `low`/`cnt` here are simply never flushed
+   mid-stream -- `low` grows as a single persistent accumulator across
+   every `encode-symbol`/`encode-bool` call, and od_ec_enc_done's real
+   byte-extraction algorithm (`done`, below) runs exactly once at the very
+   end. This produces IDENTICAL output to a real periodically-flushing
+   encoder (the periodic flush only serializes already-committed high bits
+   early; it doesn't change what those bits mathematically are), while
+   avoiding the fragile carry-propagate-backward-into-the-output-buffer
+   bookkeeping the real implementation needs purely to stay within 64 bits
+   -- verified by exact byte-for-byte comparison against dav1d's
+   independent decode of this repo's own encoded output (see
+   test/av1/bool_encoder_test.cljk and the round-trip tests in
+   test/av1/encode_test.cljk).
+
+   PORTABILITY (JVM Clojure ONLY -- a deliberate, documented exception to
+   this repo's usual `.cljc` convention, not an oversight): because
+   `low`/`cnt` are never flushed, `low` grows into a true arbitrary-
+   precision integer over the course of an encode (tens to low hundreds of
+   bits for this repo's single-keyframe scope) -- `low` is threaded as a
+   Clojure `bigint`, and every arithmetic op on it uses the auto-promoting
+   `+'`/`*'`/`quot`/`rem` (never `bit-and`/`bit-shift-left`/etc., which
+   Clojure does not support on `clojure.lang.BigInt` -- confirmed
+   empirically, not assumed: `(bit-shift-left (bigint 1) 100)` throws
+   `IllegalArgumentException`). `pow2`/`shift-right'`/`low-bits'` below
+   reimplement exactly the shift/mask operations this fn needs via
+   multiplication/`quot`/`rem`, which stay correct for both fixnums and
+   bigints.
+
+   This file is `.clj`, not `.cljc`, because `bigint`/`+'`/`*'` do not
+   exist in ClojureScript's numeric tower at all (cljs numbers are plain
+   JS doubles, with no arbitrary-precision integer type built into
+   `cljs.core` -- confirmed via `clj-kondo`'s cljs analysis, which flags
+   all three as unresolved symbols for a `.cljc` file, not merely a style
+   nitpick). Per this repo's runtime-priority policy (kotoba wasm >
+   clojurewasm > cljs > nbb > (jvm/bb), see `com-junkawasaki/root`
+   AGENTS.md), JVM is the last-resort choice for NEW app code -- this is
+   that documented exception: a cljs-portable version would need to use
+   `js/BigInt` (which DOES support correct arbitrary-precision bitwise ops
+   natively in modern JS) instead of Clojure's `bigint`/`+'`/`*'`, a
+   genuinely different implementation, out of scope for this repo's first
+   AV1 encode pass -- flagged here for a future revisit rather than
+   silently assumed portable or silently left as a `.cljc` file that
+   would only ever compile correctly under `:clj`."
+  (:require [av1.bool-decoder :as bd]))
+
+(def EC_PROB_SHIFT 6)
+(def EC_MIN_PROB 4)
+
+(defn init
+  "od_ec_enc_reset(): fresh encoder state. `low`/`cnt` per libaom's own
+   initial values (`cnt` starts at -9 \"so that it crosses zero after
+   we've accumulated one byte + one carry bit\", per entenc.c). `low` is a
+   `bigint` from the start (not a plain `0`) so every subsequent `+'`/`*'`
+   on it stays in arbitrary-precision arithmetic (see namespace docstring)."
+  []
+  {:buf [] :low (bigint 0) :rng 0x8000 :cnt -9})
+
+(defn- pow2
+  "2^n as a plain integer that auto-promotes to bigint once it exceeds
+   fixnum range (`n` is typically small -- <=16 -- when computing a
+   `normalize` shift amount, but can grow into the hundreds inside `done`'s
+   final byte-extraction loop, hence the bigint-safe `*'` here rather than
+   `bit-shift-left`, which doesn't support bigint args -- see namespace
+   docstring)."
+  [n]
+  (loop [acc 1, i 0]
+    (if (>= i n) acc (recur (*' acc 2) (inc i)))))
+
+(defn- ilog-nz
+  "OD_ILOG_NZ(x): number of bits needed to represent x>=1 (position of the
+   highest set bit, 1-based) -- entcode.h's `OD_ILOG_NZ`. Only ever called
+   on `rng` (always a plain 16-bit-range fixnum here), so plain
+   `bit-shift-right` is safe."
+  [x]
+  (loop [x x, n 0]
+    (if (zero? x) n (recur (bit-shift-right x 1) (inc n)))))
+
+(defn- propagate-carry-bwd
+  "entenc.h propagate_carry_bwd(): add 1 to buf[offs], cascading the carry
+   into buf[offs-1] etc. for as long as a byte overflows from 0xff to
+   0x00. `offs` must be a valid existing index (asserted by the caller,
+   matching libaom's own `assert(offs > 0)`)."
+  [buf offs]
+  (loop [buf buf, i offs]
+    (let [v (inc (nth buf i))]
+      (if (> v 0xff)
+        (recur (assoc buf i 0) (dec i))
+        (assoc buf i v)))))
+
+(defn- normalize
+  "entenc.c od_ec_enc_normalize(), simplified per this namespace's docstring
+   (no periodic flush -- `low`/`cnt` grow unboundedly across the whole
+   encode instead of being flushed every ~40 bits). `low`/`rng` are the
+   locally-updated values from encode-symbol/encode-bool's caller (mirrors
+   the C fn's own `low`/`rng` parameters, distinct from `enc->low`/
+   `enc->rng` until this fn stores them back). `d` is always small (0..15,
+   `rng` is always in 1..65535), so `rng`'s own shift stays a plain fixnum
+   shift; `low`'s shift uses the bigint-safe `*'`/`pow2` (see namespace
+   docstring)."
+  [enc low rng]
+  (let [d (- 16 (ilog-nz rng))]
+    (assoc enc :low (*' low (pow2 d)) :rng (bit-shift-left rng d) :cnt (+ (:cnt enc) d))))
+
+(defn encode-symbol
+  "entenc.c od_ec_encode_cdf_q15()/od_ec_encode_q15(), adapted to this
+   repo's `cdf` convention (av1.bool-decoder's: cdf[i] is the CUMULATIVE
+   probability up to and including symbol i, cdf[nsyms-1] == 1<<15,
+   cdf[nsyms] is the adaptation counter -- i.e. this repo's `cdf` IS the
+   spec's `cdf`, not libaom's `icdf` (`32768 - cdf`); `fl`/`fh` below
+   convert to icdf terms inline instead of requiring a second, pre-negated
+   table).
+
+   DERIVATION (see namespace docstring): let `n = (dec (count cdf))`
+   (nsyms, matching av1.bool-decoder/read-symbol's own local `n`) and
+   `N = n - 1` (libaom's own `nsyms - 1`). av1.bool-decoder's read-symbol
+   searches for the smallest `symbol` where `symbol-value < cur(symbol)`,
+   with `cur(symbol) = ((symbol-range>>8) * (icdf(symbol)>>6) >> 1) +
+   EC_MIN_PROB*(n-symbol-1)` -- literally libaom's `v` boundary
+   (`EC_MIN_PROB*(N-sym)` with `sym=symbol`, and `n-symbol-1 == N-symbol`
+   since `n=N+1`) evaluated at that same candidate index. The PREVIOUS
+   iteration's `cur` (== decoder's `prev`, the boundary just before the
+   found `symbol`) is therefore libaom's `u` boundary evaluated at
+   `sym-1`. So: `u = cur(sym-1)`, `v = cur(sym)` -- both computed by the
+   exact same formula, just at adjacent indices -- confirming `fl`/`fh`
+   below (which are exactly `icdf(sym-1)`/`icdf(sym)`, i.e. `32768 -
+   cdf[sym-1]`/`32768 - cdf[sym]`) reconstruct precisely the boundaries
+   read-symbol's search loop would have found for this `sym`, with no
+   search needed (the encoder already knows which symbol it's producing).
+
+   Returns [cdf' enc'] -- `cdf'` is the (possibly) adapted cdf, matching
+   av1.bool-decoder/read-symbol's own [sym cdf' state'] shape (minus
+   `sym`, which the caller already knows -- it's choosing it)."
+  ([enc cdf sym] (encode-symbol enc cdf sym true))
+  ([enc cdf sym adapt?]
+   (let [n (dec (count cdf))
+         r (:rng enc)
+         low (:low enc)
+         fl (if (pos? sym) (- 32768 (nth cdf (dec sym))) 32768)
+         fh (- 32768 (nth cdf sym))
+         [low' rng']
+         (if (< fl 32768)
+           (let [u (+ (bit-shift-right (* (bit-shift-right r 8) (bit-shift-right fl EC_PROB_SHIFT)) 1)
+                      (* EC_MIN_PROB (- n sym)))
+                 v (+ (bit-shift-right (* (bit-shift-right r 8) (bit-shift-right fh EC_PROB_SHIFT)) 1)
+                      (* EC_MIN_PROB (- n sym 1)))]
+             [(+' low (- r u)) (- u v)])
+           (let [v (+ (bit-shift-right (* (bit-shift-right r 8) (bit-shift-right fh EC_PROB_SHIFT)) 1)
+                      (* EC_MIN_PROB (- n sym 1)))]
+             [low (- r v)]))
+         enc' (normalize enc low' rng')
+         cdf' (if adapt? (bd/adapt-cdf cdf sym n) cdf)]
+     [cdf' enc'])))
+
+(defn encode-bool
+  "entenc.c od_ec_encode_bool_q15(): encode a raw equiprobable bit via the
+   same throwaway cdf av1.bool-decoder/read-bool uses (`[1<<14 1<<15 0]`,
+   adapt?=false -- the modified cdf is never reused, matching the
+   decoder's own discard)."
+  [enc bit]
+  (let [cdf [(bit-shift-left 1 14) (bit-shift-left 1 15) 0]
+        [_ enc'] (encode-symbol enc cdf bit false)]
+    enc'))
+
+(defn encode-literal
+  "Inverse of av1.bool-decoder/read-literal: `n` independent encode-bool
+   calls, MSB first (matching read-literal's `x = 2*x + bit` accumulation
+   -- the i-th call here must carry bit `(n-1-i)` of `value`)."
+  [enc n value]
+  (loop [e enc, i 0]
+    (if (>= i n)
+      e
+      (recur (encode-bool e (bit-and (bit-shift-right value (- n 1 i)) 1)) (inc i)))))
+
+(defn- shift-right'
+  "Bigint-safe `x >> n` for nonnegative `x` (this namespace's `low`/`e`
+   accumulators are always nonnegative -- see namespace docstring)."
+  [x n]
+  (quot x (pow2 n)))
+
+(defn- low-bits'
+  "Bigint-safe `x & ((1<<n)-1)` (low n bits) for nonnegative `x`."
+  [x n]
+  (rem x (pow2 n)))
+
+(defn done
+  "entenc.c od_ec_enc_done(): flush all remaining committed bits to the
+   output buffer (the minimum number of bits that ensure this encoder's
+   symbols decode correctly regardless of what follows) and return the
+   final byte vector. Call this exactly once, after every symbol/bool for
+   this tile has been encoded (mirrors av1.bool-decoder/exit-symbol being
+   the decode side's matching one-time finalization).
+
+   `l`/`e` can be true bigints by this point (see namespace docstring), so
+   this reimplements the C fn's `e = ((l+m) & ~m) | (m+1)` (m=0x3FFF) via
+   quot/rem instead of bitwise ops -- `(l+m) & ~m` rounds `l` UP to the
+   nearest multiple of `m+1` (2^14); `q = quot(l+m, m+1)` is that
+   multiple's index, and OR-ing in bit 14 (`m+1`) is a no-op exactly when
+   `q` is already odd (bit 14 of `q*(m+1)` is `q`'s own low bit) --
+   `shift-right'`/`low-bits'` above handle the main extraction loop's
+   `>>`/`&` the same bigint-safe way."
+  [enc]
+  (let [l (:low enc) c (:cnt enc)
+        m 0x3FFF
+        mp1 (inc m)
+        q (quot (+' l m) mp1)
+        rounded (*' q mp1)
+        e (if (odd? q) rounded (+' rounded mp1))
+        s0 (+ 10 c)]
+    (if (<= s0 0)
+      (:buf enc)
+      (loop [buf (:buf enc), e e, s s0, c c]
+        (let [val (low-bits' (shift-right' e (+ c 16)) 16)
+              low-byte (int (low-bits' val 8))
+              carry? (pos? (low-bits' (shift-right' val 8) 1))
+              buf' (if carry?
+                     (do (when (zero? (count buf))
+                           (throw (ex-info "av1.bool-encoder: internal: done() carry with empty buffer" {})))
+                         (propagate-carry-bwd (conj buf low-byte) (dec (count buf))))
+                     (conj buf low-byte))
+              e' (low-bits' e (+ c 16))
+              s' (- s 8) c' (- c 8)]
+          (if (> s' 0)
+            (recur buf' e' s' c')
+            buf'))))))
