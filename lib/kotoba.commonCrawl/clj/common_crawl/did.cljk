@@ -1,0 +1,100 @@
+#!/usr/bin/env kbb
+;; etzhayyim-project-common-crawl — per-page DID derivation (clj/cljc port of the
+;; Python mirror in scripts/phase3h_transform_parquet.py; ADR-2606280030).
+;;
+;; SSoT INVARIANT (repo AGENTS.md "Per-page DID Actor"):
+;;   `page-did-from-url` here, `page_did_from_url()` in scripts/phase3h_transform_parquet.py,
+;;   and `page_did_from_url` in rust/cc-phase3/src/main.rs MUST produce identical output.
+;;   Change one, change all (and add a test).
+;;
+;; URL → DID is path-isomorphic (`/` ↔ `:`); root `/` uses the sentinel `:_root`;
+;; query/fragment stripped; DIDs longer than 2048 chars fall back to a `:_h:{16hex}`
+;; SHA-256 slug. Pure functions only — the parquet I/O around it stays in the .py
+;; (pyarrow is a hard dep; this ns ports the per-row logic faithfully).
+(ns common-crawl.did
+  "Per-page DID derivation — pure, JVM/cljs/bb-portable, byte-exact mirror of the
+   Rust + Python SSoT."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str])
+  #?(:clj (:import [java.security MessageDigest])))
+
+(def did-prefix "did:web:site.etzhayyim.com:")
+(def page-did-max-len 2048)
+
+(def ^:private safe-chars
+  (set "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._"))
+
+(defn- utf8-bytes ^bytes [^String s]
+  #?(:clj (kbytes/utf8-bytes s)
+     :cljs (js/Array.from (.encode (js/TextEncoder.) s))))
+
+(defn encode-segment
+  "Percent-encode a single path segment, matching the Rust/Python `encode_segment`.
+   Bytes whose char is in [A-Za-z0-9-._] pass through; every other UTF-8 byte
+   becomes `%XX` (uppercase hex)."
+  [s]
+  (let [bs (utf8-bytes s)]
+    (apply str
+           (for [b bs]
+             (let [ub (bit-and (int b) 0xFF)
+                   c  (char ub)]
+               (if (contains? safe-chars c)
+                 c
+                 (str "%" (str/upper (cond-> (Integer/toHexString ub)
+                                            (< ub 16) (->> (str "0")))))))))))
+
+(defn domain-to-slug
+  "domain → slug: `.` and `_` → `-` (matches Python `domain_to_slug`)."
+  [domain]
+  (-> domain (str/replace "." "-") (str/replace "_" "-")))
+
+(defn url-path
+  "Return the path component of `url`, mirroring `urllib.parse.urlparse(url).path`:
+   strip fragment, then query, then scheme + netloc. Lenient (never throws) so it
+   matches urlparse's permissive behaviour on real Common Crawl URLs."
+  [url]
+  (let [no-frag (first (str/split url #"#" 2))
+        no-q    (first (str/split no-frag #"\?" 2))
+        ;; strip a leading `scheme:`
+        m       (re-find #"^[a-zA-Z][a-zA-Z0-9+.\-]*:(.*)$" no-q)
+        rest1   (if m (second m) no-q)]
+    (if (str/starts-with? rest1 "//")
+      ;; authority present — path begins at the first `/` after `//`
+      (let [after (subs rest1 2)
+            slash (str/index-of after "/")]
+        (if slash (subs after slash) ""))
+      rest1)))
+
+(defn- sha256-hex16
+  "First 16 hex chars of SHA-256(url)."
+  [^String url]
+  #?(:clj (let [md  (MessageDigest/getInstance "SHA-256")
+                dig (.digest md (kbytes/utf8-bytes url))]
+            (subs (apply str (map #(format "%02x" (bit-and (int %) 0xFF)) dig)) 0 16))
+     :cljs (throw (ex-info "sha256-hex16 not implemented for cljs" {:url url}))))
+
+(defn page-did-from-url
+  "Return `[rkey did]` for a page URL under `domain`, or nil when either is blank.
+   Byte-exact mirror of Rust/Python `page_did_from_url`."
+  [url domain]
+  (when (and (seq url) (seq domain))
+    (let [domain-slug (domain-to-slug domain)
+          path        (url-path url)
+          segments    (->> (str/split path #"/")
+                           (remove str/blank?)
+                           (map encode-segment))
+          rkey        (if (empty? segments)
+                        (str domain-slug ":_root")
+                        (str domain-slug ":" (str/join ":" segments)))
+          did         (str did-prefix rkey)]
+      (if (> (count did) page-did-max-len)
+        (let [rkey* (str domain-slug ":_h:" (sha256-hex16 url))]
+          [rkey* (str did-prefix rkey*)])
+        [rkey did]))))
+
+(defn transform-page-row
+  "Given a page row map with :url and :domain, return it with :rkey, :vertex_id and
+   :owner_did replaced by the derived page DID, or nil if the URL can't be parsed
+   (mirrors the in-place column rewrite + null-rkey drop in phase3h transform_one)."
+  [{:keys [url domain] :as row}]
+  (when-let [[rkey did] (page-did-from-url (or url "") (or domain ""))]
+    (assoc row :rkey rkey :vertex_id rkey :owner_did did)))

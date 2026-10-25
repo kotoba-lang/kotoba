@@ -1,0 +1,118 @@
+(ns youtube.portable-test
+  "The cljs half of this library's contract.
+
+  Everything here also runs on the JVM (test/youtube/*_test.clj). What these
+  add is proof that the *same* namespaces work under ClojureScript — before
+  2026-08-11 every effectful fn was wrapped in #?(:clj ...), so a `.cljc`
+  library that advertised portability actually only existed on one runtime,
+  and nbb operators had to shell out to a separate Python client to publish.
+
+  Run: kbb --backend sci --classpath src:test-cljs test-cljs/youtube/portable_test.cljs"
+  (:require [cljs.test :refer [deftest is testing run-tests]]
+            [youtube.client :as client]
+            [youtube.videos :as videos]
+            [youtube.captions :as captions]
+            [youtube.channels :as channels]))
+
+(defn stub
+  "A synchronous transport that replays canned responses and records requests."
+  [responses recorder]
+  (fn [req]
+    (swap! recorder conj req)
+    (let [r (first @responses)] (swap! responses rest) r)))
+
+(deftest url-encode-matches-jvm-urlencoder
+  (testing "form encoding is byte-identical to java.net.URLEncoder"
+    ;; measured against the JVM on the same inputs, 2026-08-11 — space is +,
+    ;; * is left alone, everything else percent-escaped
+    (is (= ["id+a" "s%2Bc" "a%7Eb" "x%28y%29" "q%21*" "z%251"]
+           (mapv client/url-encode ["id a" "s+c" "a~b" "x(y)" "q!*" "z%1"])))))
+
+(deftest json-round-trips
+  (is (= {:a 1 :b "x"} (client/read-json (client/write-json {:a 1 :b "x"}))))
+  (is (= "VID-9" (:id (client/read-json (js/JSON.stringify #js {:id "VID-9"}))))))
+
+(deftest refresh-access-token-on-cljs
+  (let [calls (atom [])
+        rs (atom [{:status 200 :body (client/write-json {:access_token "AT-123"})}])
+        tok (client/refresh-access-token! {:client-id "id a" :client-secret "s+c" :refresh-token "rt"}
+                                          {:http-fn (stub rs calls)})]
+    (is (= "AT-123" tok))
+    (is (= "client_id=id+a&client_secret=s%2Bc&refresh_token=rt&grant_type=refresh_token"
+           (:body (first @calls))))
+    (is (= "application/x-www-form-urlencoded" (get-in (first @calls) [:headers "Content-Type"])))))
+
+(deftest refresh-access-token-failures
+  (testing "non-2xx and missing access_token both raise, not return nil"
+    (is (thrown? js/Error
+                 (client/refresh-access-token! {} {:http-fn (stub (atom [{:status 400 :body "{}"}]) (atom []))})))
+    (is (thrown? js/Error
+                 (client/refresh-access-token! {} {:http-fn (stub (atom [{:status 200 :body "{}"}]) (atom []))})))))
+
+(deftest insert-video-resumable-flow
+  (let [calls (atom [])
+        rs (atom [{:status 200 :response-headers {"location" "https://upload.example/x"}}
+                  {:status 200 :body (client/write-json {:id "VID-9"})}])
+        bytes (js/Uint8Array. 5)
+        id (videos/insert-video! "AT" bytes
+                                 (videos/video-metadata {:title "t" :description "d"})
+                                 {:http-fn (stub rs calls)})]
+    (is (= "VID-9" id))
+    (testing "Uint8Array length reaches the init header"
+      (is (= "5" (get-in (first @calls) [:headers "X-Upload-Content-Length"]))))
+    (testing "the PUT goes to the Location the init returned"
+      (is (= "https://upload.example/x" (:url (second @calls)))))))
+
+(deftest insert-video-missing-location
+  (is (thrown? js/Error
+               (videos/insert-video! "AT" (js/Uint8Array. 1) {}
+                                     {:http-fn (stub (atom [{:status 200 :response-headers {}}]) (atom []))}))))
+
+(deftest multipart-caption-body-preserves-bytes
+  (let [srt (client/utf8-bytes "1\n00:00:01,000 --> 00:00:02,000\nhi\n")
+        body (captions/multipart-body
+              (captions/caption-snippet {:youtube-video-id "V" :lang "en" :name "en"}) srt "BND")
+        text (.decode (js/TextDecoder.) body)]
+    (is (= 220 (client/byte-count body)))
+    (is (re-find #"--BND\r\n" text))
+    (is (re-find #"00:00:01,000" text) "the SRT part survives byte-for-byte")
+    (is (re-find #"--BND--\r\n$" text))))
+
+(deftest no-silent-default-transport
+  (testing "constructing the default is free; calling it fails loudly"
+    (let [f (client/default-http-fn)]
+      (is (fn? f))
+      (is (thrown-with-msg? js/Error #"no default transport" (f {}))))))
+
+;; ---- the shared surface extracted from shiropico's four tool copies -------
+
+(deftest assert-channel-guard-on-cljs
+  (let [ok (fn [body] (fn [_] {:status 200 :body body :response-headers {}}))]
+    (is (= {:id "UC-x" :title "Yukkuri"}
+           (channels/assert-channel! "tok" "UC-x"
+             {:http-fn (ok (client/write-json {:items [{:id "UC-x" :snippet {:title "Yukkuri"}}]}))})))
+    (testing "a different channel is refused — this is the check that cannot be undone by deleting"
+      (is (thrown-with-msg? js/Error #"channel mismatch"
+            (channels/assert-channel! "tok" "UC-x"
+              {:http-fn (ok (client/write-json {:items [{:id "UC-other" :snippet {:title "B"}}]}))}))))
+    (testing "two channels on one token is ambiguity, not success"
+      (is (thrown? js/Error
+            (channels/assert-channel! "tok" "UC-x"
+              {:http-fn (ok (client/write-json {:items [{:id "UC-x" :snippet {:title "A"}}
+                                                        {:id "UC-b" :snippet {:title "B"}}]}))}))))))
+
+(deftest privacy-body-on-cljs
+  (let [b (videos/privacy-body "vid1" {:license "creativeCommon" :embeddable false
+                                       :publicStatsViewable false :madeForKids true} "public")]
+    (is (= "public" (get-in b [:status :privacyStatus])))
+    (is (= "creativeCommon" (get-in b [:status :license])))
+    (is (true? (get-in b [:status :selfDeclaredMadeForKids])))
+    (is (nil? (get-in b [:status :madeForKids])))))
+
+(deftest list-status-on-cljs
+  (let [stub (fn [_] {:status 200 :response-headers {}
+                      :body (client/write-json {:items [{:id "a" :status {:privacyStatus "unlisted"}}]})})]
+    (is (= {"a" {:privacyStatus "unlisted"}} (videos/list-status! "tok" ["a" "b"] {:http-fn stub})))))
+
+(let [{:keys [fail error]} (run-tests)]
+  (when (pos? (+ (or fail 0) (or error 0))) (js/process.exit 1)))

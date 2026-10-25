@@ -116,6 +116,36 @@ The bundled standard libraries live in this repository:
 | `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
 | `org.threadgroup.thread` | `org.threadgroup.thread/src` | `thread.dispatch`, `thread.frag`, `thread.iphc`, `thread.mesh` (an external specification, publisher threadgroup.org) |
 | `org.threejs.core` | `org.threejs.core/src` | `org-threejs.core`, `org-threejs.gltf`, `org-threejs.interop`, `org-threejs.vrm` (an external specification, publisher threejs.org) |
+| `kotoba.kotobaSecurity` | `kotoba.kotobaSecurity/src` | `` (Kotoba project library) |
+| `kotoba.kotobaRegistry` | `kotoba.kotobaRegistry/src` | `` (Kotoba project library) |
+| `kotoba.kotobaLangOrg` | `kotoba.kotobaLangOrg/src` | `` (Kotoba project library) |
+| `kotoba.kotobaIo` | `kotoba.kotobaIo/src` | `` (Kotoba project library) |
+| `kotoba.hub` | `kotoba.hub/src` | `` (Kotoba project library) |
+| `kotoba.hash` | `kotoba.hash/src` | `` (Kotoba project library) |
+| `kotoba.gmail` | `kotoba.gmail/src` | `` (Kotoba project library) |
+| `kotoba.find` | `kotoba.find/src` | `` (Kotoba project library) |
+| `kotoba.fax` | `kotoba.fax/src` | `` (Kotoba project library) |
+| `kotoba.deps` | `kotoba.deps/src` | `` (Kotoba project library) |
+| `kotoba.curpus2skill` | `kotoba.curpus2skill/src` | `` (Kotoba project library) |
+| `kotoba.commonCrawl` | `kotoba.commonCrawl/src` | `` (Kotoba project library) |
+| `kotoba.comYoutube` | `kotoba.comYoutube/src` | `` (Kotoba project library) |
+| `kotoba.comX` | `kotoba.comX/src` | `` (Kotoba project library) |
+| `kotoba.comWhisper` | `kotoba.comWhisper/src` | `` (Kotoba project library) |
+| `kotoba.comVultr` | `kotoba.comVultr/src` | `` (Kotoba project library) |
+| `kotoba.comVimeoUpload` | `kotoba.comVimeoUpload/src` | `` (Kotoba project library) |
+| `kotoba.comViberBot` | `kotoba.comViberBot/src` | `` (Kotoba project library) |
+| `kotoba.comTiktok` | `kotoba.comTiktok/src` | `` (Kotoba project library) |
+| `kotoba.comIntelXeDriver` | `kotoba.comIntelXeDriver/src` | `` (Kotoba project library) |
+| `kotoba.comFeishu` | `kotoba.comFeishu/src` | `` (Kotoba project library) |
+| `kotoba.comFacebookGraph` | `kotoba.comFacebookGraph/src` | `` (Kotoba project library) |
+| `kotoba.comFabbersStl` | `kotoba.comFabbersStl/src` | `` (Kotoba project library) |
+| `kotoba.comDiscordBot` | `kotoba.comDiscordBot/src` | `` (Kotoba project library) |
+| `kotoba.comCloudflareWorkers` | `kotoba.comCloudflareWorkers/src` | `` (Kotoba project library) |
+| `kotoba.comChatwork` | `kotoba.comChatwork/src` | `` (Kotoba project library) |
+| `kotoba.cloudflareBrowserRender` | `kotoba.cloudflareBrowserRender/src` | `` (Kotoba project library) |
+| `kotoba.bluesky` | `kotoba.bluesky/src` | `` (Kotoba project library) |
+| `kotoba.bencode` | `kotoba.bencode/src` | `` (Kotoba project library) |
+| `kotoba.aima` | `kotoba.aima/src` | `` (Kotoba project library) |
 | `kotoba.wgsl` | `kotoba.wgsl/src` | `kami.wgsl`, `kotoba.wgsl` (Kotoba project library) |
 | `kotoba.webgpuRs` | `kotoba.webgpuRs/src` | `kotoba.webgpu-rs`, `kotoba.webgpu-rs.config`, `kotoba.webgpu-rs.demo`, `kotoba.webgpu-rs.edn` (Kotoba project library) |
 | `kotoba.toml` | `kotoba.toml/src` | `kotoba.toml`, `toml.core` (Kotoba project library) |

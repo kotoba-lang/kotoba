@@ -1,0 +1,163 @@
+;; find/core.kotoba -- recursive search of a granted directory TREE, as a
+;; Kotoba guest that runs on the kbb hosts (native KEXE and js) with
+;; :fs/browse (wire 34) and :fs/app-data (wire 35).
+;;
+;; ## Why this no longer needs :fs/browse-dir
+;;
+;; This repository was started on the premise that ":fs/browse answers entry
+;; NAMES only with no way to ask whether an entry is a directory", so a
+;; recursive walk needed a second capability -- :fs/browse-dir, compiler wire
+;; 36 / runtime id 261 -- and STATUS.md recorded two blockers for it: the
+;; 36-vs-261 wire reconciliation, and a murakumo KIR-drift gate coupled to the
+;; sema pin advance that would be required.
+;;
+;; That premise was true when it was written and is not true now. Wire 34
+;; answers "NAME<TAB>D" -- D is "1" for a directory -- since amu a681d3f2;
+;; kbb.browse/subdirs and entry-dir? read exactly that flag. Measured
+;; 2026-09-09 on aarch64-macos, EXECUTED through tools/kexe_loader.c with
+;; only wire 34 granted: subdirs of a 3-entry directory answered 2, and the
+;; walk below answered what `find <root> -type f` answers across five
+;; mutations of the tree (a file added at depth 4, one added at the root, one
+;; removed at depth 2, and an empty directory, which must not change the
+;; count).
+;;
+;; What actually blocked this repository was neither of the recorded
+;; blockers: `string-index-of` had no native lowering, so no listing could be
+;; split into lines at all. That landed 2026-09-09 (kotoba-native ADR 0081,
+;; kotoba-verifier ADR 0051, osaho ADR 0271).
+;;
+;; ## Language discipline
+;;
+;; No loop/recur: iteration is fuel-bounded SELF-recursion, and the queue of
+;; directories still to visit is carried as one "\n"-joined string so that no
+;; function here needs to call one declared after it. Every browse and read is
+;; inside the capability guard, so a walk cannot leave the granted tree.
+;;
+;; ## The bound, measured -- it is bytes ever allocated, not bytes alive
+;;
+;; A native guest's strings live in one 65,536-byte arena in the loader
+;; (`kexe_loader.c`, KEXE_STRING_POOL_BYTES). `string_pool_used` only ever
+;; grows -- there is no reclamation for the life of the instance -- so a walk
+;; that BUILDS strings is bounded by everything it has ever concatenated, not
+;; by what it is holding. `append-line` rebuilds the accumulator each line, so
+;; assembling one directory's worth of prefixed paths is quadratic in that
+;; directory's fan-out.
+;;
+;; Measured 2026-09-09, aarch64-macos, fuel 50,000,000 so that fuel is not
+;; the binding constraint, one file per subdirectory:
+;;
+;;   root path 17 bytes  -- 16 subdirectories ran, 24 trapped SIGILL
+;;   root path 123 bytes -- 12 subdirectories ran, 16 trapped SIGILL
+;;
+;; The ceiling MOVES with the path length, which is what says the limit is
+;; bytes and not a count. A 57-directory real repository checkout (4,790
+;; bytes of directory paths, well under the arena) also traps, for the same
+;; reason: the arena is spent on intermediates.
+;;
+;; So this guest is honest about its size: it answers for a tree of a few
+;; dozen directories, not for `orgs/` with its thousands. The fix is not a
+;; bigger arena -- it is to stop accumulating. When :io/write lands, each
+;; result is written as it is found and the walk stops holding anything,
+;; which is why stdout is a correctness capability here and not a convenience.
+
+;; ## What main answers
+;;
+;; The root comes from the environment (:env/read, wire 33) rather than a
+;; literal, because a guest has no argv today -- there is no :cli/args
+;; capability in the catalog. FIND_ROOT must be an ABSOLUTE path: the native
+;; loader refuses a relative request outright.
+;;
+;; The answer is the number of *.clj / *.cljc / *.cljs files under the root.
+;; It is a COUNT and not a listing because a guest has no stdout either; the
+;; loader prints the return value. When :io/write lands this becomes a printed
+;; listing without changing the walk.
+
+(ns find.core
+  (:require [kbb.browse :as browse]
+            [kbb.env :as env])
+  (:export [main]))
+
+;; --- name predicates -----------------------------------------------------
+
+(defn has-suffix? [name :string suf :string] :bool
+  (let [n (string-byte-length name)
+        m (string-byte-length suf)]
+    (if (>= n m)
+      (string=? (string-substring name (- n m) n) suf)
+      false)))
+
+;; 1 when NAME ends in one of the three Clojure extensions, else 0. Answered
+;; as an i64 because it is summed; `.cljc` and `.cljs` both end in `.clj`
+;; plus one byte, so the three tests are independent and at most one holds.
+(defn target? [name :string] :i64
+  (if (has-suffix? name ".clj") 1
+    (if (has-suffix? name ".cljc") 1
+      (if (has-suffix? name ".cljs") 1 0))))
+
+;; --- listing arithmetic --------------------------------------------------
+
+(defn append-line [acc :string x :string] :string
+  (if (= (string-byte-length acc) 0)
+    x
+    (string-concat (string-concat acc "\n") x)))
+
+;; Each line of NAMES, prefixed with DIR and a separator.
+(defn prefix-lines [dir :string names :string acc :string] :string
+  (let [i (string-index-of names "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length names) 0)
+        acc
+        (append-line acc (string-concat (string-concat dir "/") names)))
+      (prefix-lines dir
+                    (string-substring names (+ i 1) (string-byte-length names))
+                    (append-line acc (string-concat (string-concat dir "/")
+                                                    (string-substring names 0 i)))))))
+
+;; --- one directory's own entries ----------------------------------------
+
+;; Sum of `target?` over the lines of a "\n"-joined listing of plain NAMES.
+(defn score-names [names :string acc :i64] :i64
+  (let [i (string-index-of names "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length names) 0)
+        acc
+        (+ acc (target? names)))
+      (score-names (string-substring names (+ i 1) (string-byte-length names))
+                   (+ acc (target? (string-substring names 0 i)))))))
+
+;; The score of one directory's FILES, without needing the flagged wire.
+;;
+;; `kbb.browse` exports `entries` (every entry's name, flags stripped) and
+;; `subdirs` (the names of the directory entries). Both are derived from the
+;; SAME listing and names within one directory are unique, so scoring the
+;; first and subtracting the second leaves exactly the files -- including the
+;; case that makes a cheaper test wrong, a DIRECTORY whose name ends in
+;; `.clj`, which is counted once and subtracted once.
+(defn score-files [dir :string] :i64
+  (- (score-names (browse/entries dir) 0)
+     (score-names (browse/subdirs dir) 0)))
+
+;; --- the walk ------------------------------------------------------------
+
+;; Pop one directory off QUEUE, score its files, push its subdirectories.
+;; QUEUE is "\n"-joined absolute paths; it is empty exactly when the tree has
+;; been visited, so this terminates on any finite tree within fuel.
+(defn scan [queue :string acc :i64] :i64
+  (if (= (string-byte-length queue) 0)
+    acc
+    (let [i (string-index-of queue "\n")
+          dir (if (< i 0) queue (string-substring queue 0 i))
+          rest (if (< i 0) "" (string-substring queue (+ i 1) (string-byte-length queue)))
+          subs (browse/subdirs dir)]
+      (scan (if (= (string-byte-length subs) 0)
+              rest
+              (append-line rest (prefix-lines dir subs "")))
+            (+ acc (score-files dir))))))
+
+;; Files under a granted tree, by extension. Recursion depth is the queue
+;; walk, not the tree depth: `scan` is self-recursive in tail position.
+(defn count-targets [root :string] :i64
+  (scan root 0))
+
+(defn main [] :i64
+  (count-targets (env/read "FIND_ROOT")))
