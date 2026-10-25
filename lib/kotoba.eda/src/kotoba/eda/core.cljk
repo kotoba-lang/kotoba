@@ -1,0 +1,308 @@
+(ns kotoba.eda.core
+  "Pure CLJC EDN-driven EDA kernels.
+
+  These kernels are intentionally small, deterministic, and inspectable. They
+  implement useful calculations for CI/browser validation and produce signoff
+  evidence compatible with the kotoba EDA workbench."
+  #?(:clj (:require [kotoba.lang.coll :as set])
+     :cljs (:require [kotoba.lang.coll :as set])))
+
+(def signoff-types
+  {:sw/opensta :signoff/timing-pvt
+   :sw/openroad :signoff/route
+   :sw/klayout :signoff/drc
+   :sw/netgen :signoff/lvs
+   :sw/ngspice :signoff/spice-corner
+   :sw/ate-adapter :signoff/ate-pattern})
+
+(defn stable-cid [x]
+  (let [s (pr-str x)
+        h (reduce (fn [h ch]
+                    (mod (* 16777619 (bit-xor h (int ch))) 4294967296))
+                  2166136261
+                  s)]
+    (str "bafyeda" #?(:clj (Long/toString h 36)
+                      :cljs (.toString h 36)))))
+
+(defn- evidence
+  [job status metrics]
+  (let [tool (:eda.job/tool job)
+        op (:eda.job/operation job)
+        row {:eda.signoff/type (signoff-types tool :signoff/native)
+             :eda.signoff/tool tool
+             :eda.signoff/operation op
+             :eda.signoff/status status
+             :eda.signoff/metrics metrics}]
+    (assoc row :eda.signoff/evidence-cid (stable-cid row))))
+
+(defn analyze-timing
+  "Computes max arrival time on a combinational timing graph.
+
+  Input:
+  {:eda.timing/clock-period-ns 10
+   :eda.timing/corners [{:corner/id :tt :corner/scale 1.0}]
+   :eda.timing/nodes [:in :u1 :out]
+   :eda.timing/edges [{:from :in :to :u1 :delay-ns 1.2} ...]
+   :eda.timing/endpoints [:out]}"
+  [job]
+  (let [nodes (:eda.timing/nodes job)
+        edges (:eda.timing/edges job)
+        endpoints (set (:eda.timing/endpoints job))
+        period (double (:eda.timing/clock-period-ns job 0))
+        incoming (group-by :to edges)
+        arrivals (fn [scale]
+                   (reduce (fn [acc n]
+                             (let [arr (if-let [ins (seq (incoming n))]
+                                         (reduce max (map #(+ (double (get acc (:from %) 0.0))
+                                                              (* scale (double (:delay-ns % 0.0))))
+                                                          ins))
+                                         0.0)]
+                               (assoc acc n arr)))
+                           {}
+                           nodes))
+        corner-results
+        (mapv (fn [corner]
+                (let [scale (double (:corner/scale corner 1.0))
+                      arr (arrivals scale)
+                      worst (reduce max 0.0 (map #(double (get arr % 0.0)) endpoints))
+                      slack (- period worst)]
+                  (assoc corner
+                         :arrival-ns worst
+                         :slack-ns slack
+                         :status (if (neg? slack) :failed :passed))))
+              (:eda.timing/corners job))
+        worst-slack (reduce min #?(:clj Double/POSITIVE_INFINITY :cljs js/Infinity) (map :slack-ns corner-results))
+        status (if (and (seq corner-results) (not (neg? worst-slack))) :passed :failed)]
+    (evidence job status {:corners (count corner-results)
+                          :worst-slack-ns worst-slack
+                          :corner-results corner-results})))
+
+(defn- neighbors [[x y] [w h]]
+  (filter (fn [[a b]] (and (<= 0 a) (< a w) (<= 0 b) (< b h)))
+          [[(inc x) y] [(dec x) y] [x (inc y)] [x (dec y)]]))
+
+(defn- route-one [grid blocked source sink]
+  (loop [q [source]
+         parent {source nil}]
+    (if-let [p (first q)]
+      (if (= p sink)
+        (loop [cur p path []]
+          (if cur
+            (recur (parent cur) (conj path cur))
+            (vec (reverse path))))
+        (let [nexts (remove #(or (blocked %) (contains? parent %)) (neighbors p grid))]
+          (recur (into (subvec (vec q) 1) nexts)
+                 (reduce #(assoc %1 %2 p) parent nexts))))
+      nil)))
+
+(defn route
+  "Routes two-pin nets on a grid using BFS and reports unrouted overflow."
+  [job]
+  (let [grid (:eda.route/grid job)
+        blocked0 (set (:eda.route/blockages job))
+        routed
+        (reduce (fn [acc net]
+                  (let [path (route-one grid (:blocked acc) (:source net) (:sink net))]
+                    (if path
+                      (-> acc
+                          (update :paths assoc (:net/id net) path)
+                          (update :blocked into path))
+                      (update acc :overflow inc))))
+                {:blocked blocked0 :paths {} :overflow 0}
+                (:eda.route/nets job))
+        status (if (zero? (:overflow routed)) :passed :failed)]
+    (evidence job status {:overflow (:overflow routed)
+                          :routed (count (:paths routed))
+                          :paths (:paths routed)})))
+
+(defn- rect-width [[x1 y1 x2 y2]]
+  (min (Math/abs (- (double x2) (double x1)))
+       (Math/abs (- (double y2) (double y1)))))
+
+(defn- gap-1d [a1 a2 b1 b2]
+  (cond (< a2 b1) (- b1 a2)
+        (< b2 a1) (- a1 b2)
+        :else 0.0))
+
+(defn- rect-spacing [[ax1 ay1 ax2 ay2] [bx1 by1 bx2 by2]]
+  (max (gap-1d ax1 ax2 bx1 bx2)
+       (gap-1d ay1 ay2 by1 by2)))
+
+(defn drc
+  "Checks minimum width and same-layer spacing for axis-aligned rectangles."
+  [job]
+  (let [rules (:eda.drc/rules job)
+        shapes (:eda.drc/shapes job)
+        width-violations
+        (for [s shapes
+              :let [minw (get-in rules [(:layer s) :min-width] 0)]
+              :when (< (rect-width (:rect s)) minw)]
+          {:rule :min-width :shape (:shape/id s) :layer (:layer s)
+           :actual (rect-width (:rect s)) :required minw})
+        spacing-violations
+        (for [[a & more] (take-while seq (iterate rest shapes))
+              b more
+              :when (= (:layer a) (:layer b))
+              :let [mins (get-in rules [(:layer a) :min-spacing] 0)
+                    actual (rect-spacing (:rect a) (:rect b))]
+              :when (< actual mins)]
+          {:rule :min-spacing :a (:shape/id a) :b (:shape/id b)
+           :layer (:layer a) :actual actual :required mins})
+        violations (vec (concat width-violations spacing-violations))]
+    (evidence job (if (empty? violations) :passed :failed)
+              {:violations (count violations) :findings violations})))
+
+(defn- net-signature [netlist]
+  (->> (:eda.netlist/devices netlist)
+       (map (fn [d]
+              [(:type d)
+               (sort (map (fn [[pin net]] [pin net]) (:pins d)))
+               (select-keys d [:value :model])]))
+       sort
+       vec))
+
+(defn lvs [job]
+  (let [layout (net-signature (:eda.lvs/layout-netlist job))
+        source (net-signature (:eda.lvs/source-netlist job))
+        missing (vec (remove (set layout) source))
+        extra (vec (remove (set source) layout))
+        mismatches (+ (count missing) (count extra))]
+    (evidence job (if (zero? mismatches) :passed :failed)
+              {:mismatches mismatches :missing missing :extra extra})))
+
+(defn- stamp-resistor [g nodes n1 n2 conductance]
+  (let [idx (zipmap nodes (range))]
+    (reduce (fn [m [i j v]] (update-in m [i j] (fnil + 0.0) v))
+            g
+            (remove (fn [[i j _]] (or (nil? i) (nil? j)))
+                    [[(idx n1) (idx n1) conductance]
+                     [(idx n2) (idx n2) conductance]
+                     [(idx n1) (idx n2) (- conductance)]
+                     [(idx n2) (idx n1) (- conductance)]]))))
+
+(defn- solve-linear [a b]
+  (let [n (count b)]
+    (loop [i 0 a (mapv vec a) b (vec b)]
+      (if (= i n)
+        b
+        (let [pivot (double (get-in a [i i]))
+              a (assoc a i (mapv #(/ (double %) pivot) (a i)))
+              b (assoc b i (/ (double (b i)) pivot))
+              rows (remove #{i} (range n))
+              [a b] (reduce (fn [[aa bb] r]
+                              (let [f (double (get-in aa [r i]))]
+                                [(assoc aa r (mapv - (aa r) (mapv #(* f %) (aa i))))
+                                 (assoc bb r (- (double (kbb -M:r)) (* f (double (kbb -M:i)))))]))
+                            [a b]
+                            rows)]
+          (recur (inc i) a b))))))
+
+(defn spice-dc
+  "Linear DC nodal solve for resistors and current sources to ground.
+
+  Voltage sources are represented as fixed nodes in :eda.spice/fixed."
+  [job]
+  (let [fixed (:eda.spice/fixed job)
+        ground (:eda.spice/ground job :gnd)
+        nodes (->> (:eda.spice/elements job)
+                   (mapcat (fn [e] [(:n1 e) (:n2 e)]))
+                   (remove #(or (= % ground) (contains? fixed %)))
+                   distinct
+                   vec)
+        idx (zipmap nodes (range))
+        n (count nodes)
+        g0 (vec (repeat n (vec (repeat n 0.0))))
+        i0 (vec (repeat n 0.0))
+        fixed* (assoc fixed ground 0.0)
+        stamped
+        (reduce (fn [{:keys [g i]} e]
+                  (case (:type e)
+                    :resistor
+                    (let [r (double (:ohms e))
+                          c (/ 1.0 r)
+                          n1 (:n1 e)
+                          n2 (:n2 e)
+                          g (stamp-resistor g nodes n1 n2 c)
+                          i (reduce (fn [ii [node fixed-node sign]]
+                                      (if (and (idx node) (contains? fixed* fixed-node))
+                                        (update ii (idx node) + (* sign c (double (fixed* fixed-node))))
+                                        ii))
+                                    i
+                                    [[n1 n2 1.0] [n2 n1 1.0]])]
+                      {:g g :i i})
+                    :current-source
+                    {:g g
+                     :i (if-let [row (idx (:to e))]
+                          (update i row + (double (:amps e)))
+                          i)}
+                    {:g g :i i}))
+                {:g g0 :i i0}
+                (:eda.spice/elements job))
+        solution (if (seq nodes) (solve-linear (:g stamped) (:i stamped)) [])
+        voltages (merge fixed (zipmap nodes solution) {ground 0.0})
+        failed? (some #(let [v (double %)]
+                         #?(:clj (or (Double/isNaN v) (Double/isInfinite v))
+                            :cljs (or (js/isNaN v) (not (js/isFinite v)))))
+                      solution)]
+    (evidence job (if failed? :failed :passed)
+              {:voltages voltages :nodes (count nodes)})))
+
+(defn- eval-gate [gate values]
+  (let [in #(get values % 0)]
+    (case (:type gate)
+      :buf (in (first (:inputs gate)))
+      :not (if (zero? (in (first (:inputs gate)))) 1 0)
+      :and (if (every? #(= 1 (in %)) (:inputs gate)) 1 0)
+      :or (if (some #(= 1 (in %)) (:inputs gate)) 1 0)
+      :xor (mod (reduce + (map in (:inputs gate))) 2)
+      0)))
+
+(defn- simulate-logic [circuit vector faults]
+  (reduce (fn [values gate]
+            (let [out (:output gate)
+                  v (if-let [forced (get faults out)]
+                      forced
+                      (eval-gate gate values))]
+              (assoc values out v)))
+          (merge vector faults)
+          (:eda.ate/gates circuit)))
+
+(defn ate-coverage [job]
+  (let [circuit (:eda.ate/circuit job)
+        outputs (:eda.ate/outputs circuit)
+        nets (vec (set (concat (:eda.ate/inputs circuit)
+                               outputs
+                               (map :output (:eda.ate/gates circuit)))))
+        faults (for [n nets stuck [0 1]] [n stuck])
+        detects?
+        (fn [fault]
+          (some (fn [v]
+                  (let [good (select-keys (simulate-logic circuit v {}) outputs)
+                        bad (select-keys (simulate-logic circuit v {(first fault) (second fault)}) outputs)]
+                    (not= good bad)))
+                (:eda.ate/vectors job)))
+        detected (count (filter detects? faults))
+        total (count faults)
+        cov (if (pos? total) (* 100.0 (/ detected total)) 0.0)]
+    (evidence job (if (>= cov 95.0) :passed :failed)
+              {:faults total :detected detected :vector-coverage cov})))
+
+(defn run-job [job]
+  (case [(:eda.job/tool job) (:eda.job/operation job)]
+    [:sw/opensta :op/analyze-timing] (analyze-timing job)
+    [:sw/openroad :op/route] (route job)
+    [:sw/klayout :op/drc] (drc job)
+    [:sw/netgen :op/lvs] (lvs job)
+    [:sw/ngspice :op/simulate] (spice-dc job)
+    [:sw/ate-adapter :op/ate] (ate-coverage job)
+    (evidence job :failed {:error :unsupported-job})))
+
+(defn run-flow [flow]
+  (let [results (mapv run-job (:eda.flow/jobs flow))
+        passed (count (filter #(= :passed (:eda.signoff/status %)) results))]
+    {:eda.flow/id (:eda.flow/id flow)
+     :eda.flow/results results
+     :eda.flow/pass-count passed
+     :eda.flow/total (count results)
+     :eda.flow/status (if (= passed (count results)) :passed :failed)
+     :eda.flow/evidence-cid (stable-cid results)}))
