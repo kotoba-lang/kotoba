@@ -1,0 +1,98 @@
+(ns oidc.adapters.jwt-rsa
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [oidc.adapters.jwks :as jwks]
+            ;; The claim/JWK decisions live in a portable namespace shared with
+            ;; oidc.adapters.jwt-edge (WebCrypto). Two copies of `claim-error`
+            ;; is not duplication, it is a security bug waiting for its first
+            ;; divergence — see that namespace's docstring.
+            [oidc.adapters.jwt-claims :as jc])
+  (:import [java.math BigInteger]
+           [java.security KeyFactory KeyPairGenerator Signature]
+           [java.security.interfaces RSAPrivateKey RSAPublicKey]
+           [java.security.spec RSAPublicKeySpec]))
+
+(defn b64url-encode [bytes]
+  (kbytes/base64url-encode bytes {:pad? false}))
+
+(defn- b64url-decode-bytes [s]
+  (kbytes/base64url-decode-bytes s))
+
+(defn- b64url-decode-string [s]
+  (kbytes/utf8-string (b64url-decode-bytes s)))
+
+(defn- unsigned-bigint [b64]
+  (BigInteger. 1 (b64url-decode-bytes b64)))
+
+(defn- decode-part [decode-json part]
+  (decode-json (b64url-decode-string part)))
+
+(defn- now-seconds []
+  (quot (System/currentTimeMillis) 1000))
+
+(defn- jwk-key [jwk]
+  (let [spec (RSAPublicKeySpec. (unsigned-bigint (:n jwk))
+                                (unsigned-bigint (:e jwk)))]
+    (.generatePublic (KeyFactory/getInstance "RSA") spec)))
+
+(defn- verify-signature? [public-key signing-input signature-bytes]
+  (let [sig (doto (Signature/getInstance "SHA256withRSA")
+              (.initVerify public-key)
+              (.update (kbytes/utf8-bytes signing-input)))]
+    (.verify sig signature-bytes)))
+
+(defn rs256-verifier [jwks opts]
+  (let [decode-json (or (:decode-json opts) edn/read-string)]
+    (reify jwks/IJwksVerifier
+      (verify-jwt! [_ token-ref call-opts]
+        (try
+          (let [parts (jc/split-jwt token-ref)
+                _ (when-not parts
+                    (throw (ex-info "invalid JWT compact serialization" {})))
+                [header-seg claims-seg sig-seg] parts
+                signing-input (str header-seg "." claims-seg)
+                header (decode-part decode-json header-seg)
+                claims (decode-part decode-json claims-seg)
+                jwk (jc/matching-jwk (or (:jwks call-opts) jwks) header)
+                err (jc/claim-error claims (assoc call-opts
+                                                  :now (or (:now call-opts) (now-seconds))))]
+            (cond
+              (jc/header-error header)
+              {:error (jc/header-error header) :alg (:alg header)}
+              (nil? jwk)
+              {:error :missing-jwk :kid (:kid header)}
+              (not (verify-signature? (jwk-key jwk) signing-input (b64url-decode-bytes sig-seg)))
+              {:error :invalid-signature}
+              err
+              (assoc claims :error err)
+              :else
+              (assoc claims :jwt-ref token-ref)))
+          (catch Exception e
+            {:error :invalid-jwt
+             :message (ex-message e)}))))))
+
+(defn generate-rsa-keypair []
+  (.generateKeyPair (doto (KeyPairGenerator/getInstance "RSA")
+                      (.initialize 2048))))
+
+(defn jwk-from-public-key
+  ([public-key] (jwk-from-public-key public-key {}))
+  ([^RSAPublicKey public-key opts]
+   {:kty "RSA"
+    :kid (:kid opts)
+    :alg "RS256"
+    :use "sig"
+    :n (b64url-encode (.toByteArray (.getModulus public-key)))
+    :e (b64url-encode (.toByteArray (.getPublicExponent public-key)))}))
+
+(defn- sign-rsa [^RSAPrivateKey private-key signing-input]
+  (let [sig (doto (Signature/getInstance "SHA256withRSA")
+              (.initSign private-key)
+              (.update (kbytes/utf8-bytes signing-input)))]
+    (.sign sig)))
+
+(defn sign-rs256 [private-key header claims]
+  (let [header-seg (b64url-encode (kbytes/utf8-bytes (pr-str header)))
+        claims-seg (b64url-encode (kbytes/utf8-bytes (pr-str claims)))
+        signing-input (str header-seg "." claims-seg)]
+    (str signing-input "." (b64url-encode (sign-rsa private-key signing-input)))))

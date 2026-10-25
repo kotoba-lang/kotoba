@@ -1,0 +1,110 @@
+(ns oidc.adapters.discovery-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is]]
+            [oidc.adapters.discovery :as discovery])
+  (:import [com.sun.net.httpserver HttpHandler HttpServer]
+           [java.net InetSocketAddress]))
+
+(defn- respond! [exchange status body]
+  (let [bytes (kbytes/utf8-bytes body)]
+    (.sendResponseHeaders exchange status (alength bytes))
+    (with-open [out (.getResponseBody exchange)]
+      (.write out bytes))))
+
+(defn- server [requests]
+  (let [s (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)]
+    (.createContext
+     s "/"
+     (reify HttpHandler
+       (handle [_ exchange]
+         (let [path (.getPath (.getRequestURI exchange))]
+           (swap! requests conj path)
+           (case path
+             "/.well-known/openid-configuration"
+             (respond! exchange 200
+                       (pr-str {:issuer "issuer"
+                                :authorization_endpoint "https://idp.example/auth"
+                                :token_endpoint "https://idp.example/token"
+                                :userinfo_endpoint "https://idp.example/userinfo"
+                                :jwks_uri (str "http://127.0.0.1:"
+                                               (.getPort (.getAddress s))
+                                               "/jwks")}))
+             "/jwks"
+             (respond! exchange 200 (pr-str {:keys [{:kid "k1"}]}))
+             (respond! exchange 404 (pr-str {:error :not-found})))))))
+    (.start s)
+    s))
+
+(defn- base-url [^HttpServer s]
+  (str "http://127.0.0.1:" (.getPort (.getAddress s))))
+
+(deftest fetches-and-caches-discovery-and-jwks
+  (let [requests (atom [])
+        s (server requests)]
+    (try
+      (let [client (discovery/discovery-client)
+            cfg1 (discovery/resolve-config! client (base-url s))
+            cfg2 (discovery/resolve-config! client (base-url s))]
+        (is (= "https://idp.example/token" (:token-endpoint cfg1)))
+        (is (= [{:kid "k1"}] (get-in cfg2 [:jwks :keys])))
+        (is (= ["/.well-known/openid-configuration" "/jwks"] @requests)))
+      (finally
+        (.stop s 0)))))
+
+(deftest refreshes-jwks-after-ttl
+  (let [now (atom 0)
+        calls (atom 0)
+        client (discovery/discovery-client
+                {:ttl-ms 100
+                 :now-ms (fn [] @now)
+                 :client (proxy [java.net.http.HttpClient] []
+                           (send [req handler]
+                             (let [n (swap! calls inc)
+                                   body (if (= n 1)
+                                          (pr-str {:keys [{:kid "old"}]})
+                                          (pr-str {:keys [{:kid "new"}]}))]
+                               (proxy [java.net.http.HttpResponse] []
+                                 (statusCode [] 200)
+                                 (body [] body)))))})]
+    (is (= [{:kid "old"}] (:keys ((:fetch-jwks! client) "https://idp.example/jwks"))))
+    (reset! now 101)
+    (is (= [{:kid "new"}] (:keys ((:fetch-jwks! client) "https://idp.example/jwks"))))
+    (is (= 2 @calls))))
+
+(deftest forced-refresh-bypasses-fresh-cache
+  (let [now (atom 0)
+        calls (atom 0)
+        client (discovery/discovery-client
+                {:ttl-ms 1000
+                 :now-ms (fn [] @now)
+                 :client (proxy [java.net.http.HttpClient] []
+                           (send [req handler]
+                             (let [n (swap! calls inc)]
+                               (proxy [java.net.http.HttpResponse] []
+                                 (statusCode [] 200)
+                                 (body [] (pr-str {:keys [{:kid (str "k" n)}]}))))))})]
+    ((:fetch-jwks! client) "https://idp.example/jwks")
+    (is (= [{:kid "k2"}]
+           (:keys ((:fetch-jwks! client) "https://idp.example/jwks" {:refresh? true}))))
+    (is (= 2 @calls))))
+
+(deftest uses-stale-jwks-when-refresh-fails-and-policy-allows
+  (let [now (atom 0)
+        calls (atom 0)
+        client (discovery/discovery-client
+                {:ttl-ms 10
+                 :allow-stale-on-error? true
+                 :now-ms (fn [] @now)
+                 :client (proxy [java.net.http.HttpClient] []
+                           (send [req handler]
+                             (let [n (swap! calls inc)]
+                               (proxy [java.net.http.HttpResponse] []
+                                 (statusCode [] (if (= n 1) 200 503))
+                                 (body [] (if (= n 1)
+                                            (pr-str {:keys [{:kid "cached"}]})
+                                            (pr-str {:error :unavailable})))))))})]
+    ((:fetch-jwks! client) "https://idp.example/jwks")
+    (reset! now 11)
+    (let [out ((:fetch-jwks! client) "https://idp.example/jwks")]
+      (is (= [{:kid "cached"}] (:keys out)))
+      (is (true? (:stale? out)))
+      (is (= 503 (get-in out [:refresh-error :status]))))))
