@@ -1,0 +1,189 @@
+(ns kotobase.storage.sqlite
+  "SQLite implementation of immutable blocks and linearizable local refs."
+  (:require [kotoba.sql.conn :as conn] [kotoba.lang.text :as str]
+            [kotobase.storage.core :as storage]))
+
+(def schema-statements
+  ["CREATE TABLE IF NOT EXISTS kotobase_blocks (
+      cid TEXT PRIMARY KEY,
+      bytes BLOB NOT NULL,
+      byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    ) WITHOUT ROWID"
+   "CREATE TABLE IF NOT EXISTS kotobase_refs (
+      name TEXT PRIMARY KEY,
+      cid TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+    ) WITHOUT ROWID"])
+
+(defn datasource
+  "Create an unpooled SQLite DataSource from a file path or jdbc:sqlite: URL."
+  [path-or-url]
+  (let [value (str path-or-url)
+        url (if (str/starts-with? value "jdbc:sqlite:")
+              value
+              (str "jdbc:sqlite:" value))]
+    (conn/sqlite-datasource url)))
+
+(defn- execute-statement! [connection sql]
+  (with-open [statement (conn/create-statement connection)]
+    (conn/execute! statement sql)))
+
+(defn- configure-connection!
+  [connection busy-timeout-ms]
+  (execute-statement! connection "PRAGMA foreign_keys = ON")
+  (execute-statement!
+   connection
+   (str "PRAGMA busy_timeout = " (long busy-timeout-ms)))
+  connection)
+
+(defn- bind! [statement params]
+  (doseq [[index value] (map-indexed vector params)]
+    (if (conn/blob? value)
+      (conn/set-bytes! statement (inc index) value)
+      (conn/set-object! statement (inc index) value)))
+  statement)
+
+(defn- execute! [connection sql params]
+  (with-open [statement (bind! (conn/prepare connection sql) params)]
+    (conn/execute-update! statement)))
+
+(defn- rows [connection sql params row-fn]
+  (with-open [statement (bind! (conn/prepare connection sql) params)
+              result (conn/execute-query statement)]
+    (loop [out []]
+      (if (conn/next! result)
+        (recur (conj out (row-fn result)))
+        out))))
+
+(defn initialize!
+  ([datasource] (initialize! datasource 5000))
+  ([datasource busy-timeout-ms]
+   (with-open [connection (conn/connection datasource)]
+     (configure-connection! connection busy-timeout-ms)
+     ;; WAL is persistent database state and must be selected outside a
+     ;; transaction. It allows readers to proceed while a writer commits.
+     (execute-statement! connection "PRAGMA journal_mode = WAL")
+     (doseq [statement schema-statements]
+       (execute-statement! connection statement)))
+   datasource))
+
+(defn- open-connection
+  [datasource busy-timeout-ms]
+  (doto (conn/connection datasource)
+    (configure-connection! busy-timeout-ms)))
+
+(defrecord SQLiteStorage [datasource busy-timeout-ms]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks]
+    (with-open [connection (open-connection datasource busy-timeout-ms)]
+      (let [auto-commit? (conn/auto-commit? connection)]
+        (try
+          (conn/set-auto-commit! connection false)
+          (doseq [{:keys [cid bytes]} blocks]
+            (when-not (and (string? cid) (conn/blob? bytes))
+              (throw
+               (ex-info "SQLite blocks require a string CID and byte array"
+                        {:type :kotobase.storage/invalid-block :cid cid})))
+            (execute!
+             connection
+             "INSERT INTO kotobase_blocks(cid, bytes, byte_length)
+              VALUES (?, ?, ?) ON CONFLICT(cid) DO NOTHING"
+             [cid bytes (alength ^bytes bytes)]))
+          (doseq [{:keys [cid bytes]} blocks
+                  :let [stored
+                        (first
+                         (rows connection
+                               "SELECT bytes FROM kotobase_blocks WHERE cid = ?"
+                               [cid]
+                               #(conn/get-bytes % 1)))]
+                  :when (not (conn/bytes-equal? ^bytes bytes ^bytes stored))]
+            (throw
+             (ex-info "CID already has different bytes"
+                      {:type :kotobase.storage/cid-collision :cid cid})))
+          (conn/commit! connection)
+          (mapv :cid blocks)
+          (catch Throwable error
+            (conn/rollback! connection)
+            (throw error))
+          (finally
+            (conn/set-auto-commit! connection auto-commit?))))))
+  (-get-blocks [_ cids]
+    (if (empty? cids)
+      {}
+      (with-open [connection (open-connection datasource busy-timeout-ms)]
+        (let [placeholders (str/join "," (repeat (count cids) "?"))]
+          (into {}
+                (rows connection
+                      (str "SELECT cid, bytes FROM kotobase_blocks WHERE cid IN ("
+                           placeholders ")")
+                      cids
+                      (fn [result]
+                        [(conn/get-string result 1) (conn/get-bytes result 2)])))))))
+
+  storage/IRefStore
+  (-read-ref [_ name]
+    (with-open [connection (open-connection datasource busy-timeout-ms)]
+      (first
+       (rows connection
+             "SELECT cid, revision FROM kotobase_refs WHERE name = ?"
+             [name]
+             (fn [result]
+               {:cid (conn/get-string result 1)
+                :version (conn/get-long result 2)})))))
+  (-compare-and-set-ref! [this name expected next]
+    (with-open [connection (open-connection datasource busy-timeout-ms)]
+      (let [published
+            (first
+             (rows
+              connection
+              (if (nil? expected)
+                "INSERT INTO kotobase_refs(name, cid) VALUES (?, ?)
+                 ON CONFLICT(name) DO NOTHING RETURNING cid, revision"
+                "UPDATE kotobase_refs
+                 SET cid = ?, revision = revision + 1,
+                     updated_at = unixepoch()
+                 WHERE name = ? AND cid = ? RETURNING cid, revision")
+              (if (nil? expected)
+                [name next]
+                [next name expected])
+              (fn [result]
+                {:published? true
+                 :current (conn/get-string result 1)
+                 :version (conn/get-long result 2)})))]
+        (or published
+            (let [current (storage/-read-ref this name)]
+              {:published? false
+               :current (:cid current)
+               :version (:version current)})))))
+
+  storage/IBackendCapabilities
+  (-capabilities [_]
+    #{:immutable-blocks :cid-addressed-read :conditional-ref
+      :linearizable-ref :batch-get :batch-put :local-file
+      :sqlite-transaction}))
+
+(defn open
+  "Open a SQLite backend.
+
+  Supply either `:datasource` or `:path`. Schema initialization defaults to
+  true. `:busy-timeout-ms` controls how long competing writers wait."
+  [{:keys [datasource path initialize? busy-timeout-ms]
+    :or {initialize? true busy-timeout-ms 5000}}]
+  (when-not (and (integer? busy-timeout-ms) (<= 0 busy-timeout-ms))
+    (throw
+     (ex-info "SQLite busy timeout must be a non-negative integer"
+              {:type :kotobase.storage/invalid-configuration
+               :backend :sqlite})))
+  (let [datasource (or datasource (when path (kotobase.storage.sqlite/datasource
+                                               path)))]
+    (when-not (conn/datasource? datasource)
+      (throw
+       (ex-info "SQLite storage requires :path or javax.sql.DataSource"
+                {:type :kotobase.storage/invalid-configuration
+                 :backend :sqlite})))
+    (when initialize?
+      (initialize! datasource busy-timeout-ms))
+    (->SQLiteStorage datasource busy-timeout-ms)))
+

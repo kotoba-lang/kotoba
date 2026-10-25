@@ -1,0 +1,110 @@
+(ns filecoin.message-test
+  (:require [cbor.core :as cbor]
+            [kotoba.test :refer [deftest is testing]]
+            [filecoin.address :as addr]
+            [filecoin.bigint :as bigint]
+            [filecoin.chain-vectors :as cv]
+            [filecoin.cid :as fcid]
+            [filecoin.message :as msg]
+            [filecoin.rpc :as rpc]
+            [filecoin.signature :as sig]))
+
+;; ── against mainnet ──────────────────────────────────────────────────────────
+;; The only assertions here that are not this library talking to itself.
+;; Each message below was recorded off Filecoin mainnet together with the CID
+;; the network gave it. Re-deriving that CID exercises the entire path —
+;; address bytes, sign-magnitude amounts, field order, definite-length CBOR,
+;; BLAKE2b-256, the multihash prefix, base32 — and a mistake anywhere in it
+;; produces a different CID.
+
+(deftest bls-message-cids-match-mainnet
+  (doseq [{:keys [message cid]} cv/bls-messages]
+    (testing cid
+      (is (= cid (msg/cid (rpc/json->message message)))))))
+
+(deftest secp256k1-message-cids-match-mainnet
+  (doseq [{:keys [message signature message-cid signed-cid]} cv/secp256k1-messages]
+    (let [m (rpc/json->message message)
+          s (sig/signature (:type signature) (rpc/base64-decode (:data signature)))
+          sm (sig/signed-message m s)]
+      (testing "the message's own CID"
+        (is (= message-cid (msg/cid m))))
+      (testing "and the signed wrapper's, which is what the chain calls it"
+        (is (= signed-cid (sig/cid sm)))
+        (is (not= message-cid signed-cid))))))
+
+(deftest bls-signed-messages-keep-the-message-cid
+  ;; The rule that has no visible effect until a lookup fails: a BLS signed
+  ;; message is named by the message CID, not the wrapper's.
+  (let [m (rpc/json->message (:message (first cv/bls-messages)))
+        sm (sig/signed-message m (sig/signature sig/bls (vec (repeat 96 0))))]
+    (is (= (msg/cid m) (sig/cid sm)))))
+
+;; ── the encoding itself ──────────────────────────────────────────────────────
+
+(deftest a-message-is-a-ten-element-array
+  (let [m (rpc/json->message (:message (first cv/bls-messages)))
+        bs (mapv #(bit-and (int %) 0xff) (msg/encode m))]
+    (testing "CBOR major type 4, length 10 — 0x8a"
+      (is (= 0x8a (first bs))))
+    (testing "and it decodes back to the same message"
+      (is (= (dissoc m :params) (dissoc (msg/decode (msg/encode m)) :params)))
+      (is (= (:params m) (:params (msg/decode (msg/encode m))))))))
+
+(deftest a-nine-element-array-is-not-a-message
+  ;; Guessing which of the ten fields is missing is how a decoder invents a
+  ;; message — and the invented one would still have a valid CID.
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (msg/decode (cbor/encode (vec (repeat 9 0))))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (msg/decode (cbor/encode (vec (repeat 11 0)))))))
+
+(deftest signing-bytes-are-the-binary-cid
+  (let [m (rpc/json->message (:message (first cv/bls-messages)))]
+    (testing "not the CBOR, and not the CID string"
+      (is (= (vec (msg/signing-bytes m)) (vec (fcid/to-bytes (msg/encode m)))))
+      (is (= (msg/cid m) (fcid/bytes->string (msg/signing-bytes m)))))
+    (testing "and an ECDSA signer hashes them once more"
+      (is (= 32 (count (msg/digest-for-secp256k1 m)))))))
+
+;; ── amounts ──────────────────────────────────────────────────────────────────
+
+(deftest attofil-survives-javascript
+  ;; 29409837650000000000 is a real transfer from the vectors below. It is
+  ;; past 2^53, so a JavaScript Number cannot hold it — the value has to
+  ;; travel as a string and be encoded through BigInt.
+  (testing "zero is the empty byte string, not a zero byte"
+    (is (= [] (bigint/->wire "0")))
+    (is (= "0" (bigint/<-wire []))))
+  (testing "a positive amount is 0x00 ++ big-endian magnitude"
+    (is (= [0 1] (bigint/->wire "1")))
+    (is (= [0 1 0] (bigint/->wire "256"))))
+  (testing "and a negative one is 0x01 ++ the same magnitude — sign-magnitude,
+            not two's complement"
+    (is (= [1 1] (bigint/->wire "-1")))
+    (is (= "-1" (bigint/<-wire [1 1]))))
+  (testing "past 2^53"
+    (let [v "29409837650000000000"]
+      (is (= v (bigint/<-wire (bigint/->wire v))))))
+  (testing "and past 2^64, which is where a u64 would have given up"
+    (let [v "2000000000000000000000000000"]        ; the total supply, in atto
+      (is (= v (bigint/<-wire (bigint/->wire v))))))
+  (testing "FIL → attoFIL is decimal, never floating point"
+    (is (= "500000000000000000" (bigint/fil->atto "0.5")))
+    (is (= "1000000000000000000" (bigint/fil->atto "1")))
+    (is (= "1" (bigint/fil->atto "0.000000000000000001")))
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (bigint/fil->atto "0.0000000000000000001")))))
+
+(deftest message-accepts-addresses-as-strings-or-maps
+  (let [a "f1xpbyy4tkdx5si2bgo37dubc2xwv6fum5tk57mia"
+        m1 (msg/message {:to a :from a :value "1"})
+        m2 (msg/message {:to (addr/from-string a) :from (addr/from-string a) :value "1"})]
+    (is (= (msg/cid m1) (msg/cid m2)))
+    (testing "and encoding a raw map is the same as normalising it first"
+      ;; `encode` used to skip normalisation when `:to` was already present,
+      ;; which is true of exactly the raw map a caller writes by hand — and
+      ;; then handed a string to the address encoder.
+      (is (= (msg/cid m1) (msg/cid {:to a :from a :value "1"}))))
+    (testing "and normalising twice changes nothing"
+      (is (= m1 (msg/message m1))))))

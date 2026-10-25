@@ -1,0 +1,154 @@
+(ns chain.observer.core-test
+  (:require [chain.observer.contract :as contract]
+            [chain.observer.cosmos :as cosmos]
+            [chain.observer.evm :as evm]
+            [chain.observer.lightning :as lightning]
+            [chain.observer.protocol :as observer]
+            [chain.observer.solana :as solana]
+            [chain.observer.substrate :as substrate]
+            [kotoba.test :refer [deftest is]]))
+
+(defn- fixture-observer [adapter fixtures calls]
+  (observer/observer
+   adapter
+   (fn [{:keys [method params]}]
+     (swap! calls conj [method params])
+     (get fixtures [method params] (get fixtures method)))))
+
+(deftest evm-preserves-latest-safe-and-finalized-semantics
+  (let [calls (atom [])
+        fixtures
+        {"eth_chainId" "0x1"
+         "eth_syncing" false
+         ["eth_getBlockByNumber" ["0x0" false]]
+         {:number "0x0" :hash "0xgenesis"}
+         ["eth_getBlockByNumber" ["latest" false]]
+         {:number "0x64" :hash "0xlatest"}
+         ["eth_getBlockByNumber" ["safe" false]]
+         {:number "0x62" :hash "0xsafe"}
+         ["eth_getBlockByNumber" ["finalized" false]]
+         {:number "0x60" :hash "0xfinal"}
+         "net_peerCount" "0x8"}
+        result
+        (observer/snapshot
+         (fixture-observer
+          (evm/adapter {:expected-chain-id 1
+                        :expected-genesis-hash "0xgenesis"})
+          fixtures calls))]
+    (is (= "eip155:1" (:chain-id result)))
+    (is (= 100 (get-in result [:tip :height])))
+    (is (= :safe (get-in result [:safe-tip :finality])))
+    (is (= 96 (get-in result [:finalized-tip :height])))
+    (is (contract/ready? result))
+    (is (= 7 (count @calls)))))
+
+(deftest evm-rejects-a-chain-id-mismatch
+  (let [fixtures
+        {"eth_chainId" "0x1" "eth_syncing" false
+         ["eth_getBlockByNumber" ["0x0" false]]
+         {:number "0x0" :hash "g"}
+         ["eth_getBlockByNumber" ["latest" false]]
+         {:number "0x1" :hash "l"}
+         ["eth_getBlockByNumber" ["safe" false]] nil
+         ["eth_getBlockByNumber" ["finalized" false]] nil
+         "net_peerCount" "0x0"}]
+    (is (= :chain.observer/network-mismatch
+           (:type
+            (ex-data
+             (try
+               (observer/snapshot
+                (fixture-observer
+                 (evm/adapter {:expected-chain-id 8453})
+                 fixtures (atom [])))
+               (catch clojure.lang.ExceptionInfo exception
+                 exception))))))))
+
+(deftest solana-keeps-confirmed-and-finalized-slots-separate
+  (let [result
+        (observer/snapshot
+         (fixture-observer
+          (solana/adapter {:expected-genesis-hash "Genesis"
+                           :cluster "mainnet"})
+          {"getGenesisHash" "Genesis" "getHealth" "ok"
+           "getVersion" {:solana-core "2.0"}
+           ["getSlot" [{:commitment "confirmed"}]] 1000
+           ["getSlot" [{:commitment "finalized"}]] 990}
+          (atom [])))]
+    (is (= "solana:mainnet" (:chain-id result)))
+    (is (= :confirmed (get-in result [:tip :finality])))
+    (is (= :finalized (get-in result [:finalized-tip :finality])))
+    (is (false? (get-in result [:sync :syncing?])))))
+
+(deftest cosmos-committed-block-is-the-finalized-observation
+  (let [result
+        (observer/snapshot
+         (fixture-observer
+          (cosmos/adapter {:expected-chain-id "cosmoshub-4"})
+          {"status" {:node_info {:id "node" :network "cosmoshub-4"}
+                     :sync_info {:catching_up false}}
+           "health" {}
+           "block" {:block_id {:hash "ABC"}
+                    :block {:header {:chain_id "cosmoshub-4"
+                                     :height "42"}}}}
+          (atom [])))]
+    (is (= "cosmos:cosmoshub-4" (:chain-id result)))
+    (is (= (:tip result) (:finalized-tip result)))
+    (is (contract/ready? result))))
+
+(deftest substrate-resolves-the-finalized-hash-before-header-request
+  (let [calls (atom [])
+        result
+        (observer/snapshot
+         (fixture-observer
+          (substrate/adapter
+           {:expected-chain-name "Polkadot"
+            :expected-genesis-hash "0xgenesis"})
+          {"system_chain" "Polkadot"
+           "system_health" {:isSyncing false :peers 4
+                            :shouldHavePeers true}
+           ["chain_getBlockHash" [0]] "0xgenesis"
+           ["chain_getHeader" []] {:number "0x64" :hash "0xbest"}
+           "chain_getFinalizedHead" "0xfinal"
+           ["chain_getHeader" ["0xfinal"]]
+           {:number "0x60" :hash "0xfinal"}}
+          calls))]
+    (is (= "polkadot:0xgenesis" (:chain-id result)))
+    (is (= 96 (get-in result [:finalized-tip :height])))
+    (is (some #(= ["chain_getHeader" ["0xfinal"]] %) @calls))))
+
+(deftest lightning-requires-both-chain-and-graph-sync
+  (let [result
+        (observer/snapshot
+         (fixture-observer
+          (lightning/adapter {:expected-network "mainnet"})
+          {"lnrpc.Lightning/GetInfo"
+           {:chains [{:network "mainnet"}]
+            :identity_pubkey "02abc" :alias "node"
+            :synced_to_chain true :synced_to_graph false
+            :block_height 900000 :block_hash "block"
+            :num_peers 5 :num_active_channels 2}}
+          (atom [])))]
+    (is (= "lightning:mainnet" (:chain-id result)))
+    (is (true? (get-in result [:sync :syncing?])))
+    (is (nil? (:finalized-tip result)))
+    (is (= :readonly-macaroon (get-in result [:trust :credential])))))
+
+(deftest observation-detects-same-height-reorganizations
+  (let [before {:tip {:height 10 :hash "a"}}
+        after {:tip {:height 10 :hash "b"}}]
+    (is (contract/reorg? before after))
+    (is (not (contract/same-tip? before after)))))
+
+(deftest invalid-capabilities-fail-closed
+  (is (= :chain.observer/invalid-snapshot
+         (:type
+          (ex-data
+           (try
+             (contract/validate-snapshot
+              {:schema contract/schema :family :evm
+               :chain-id "eip155:1" :identity {} :health {} :sync {}
+               :tip {:height 1 :finality :latest}
+               :finalized-tip nil :capabilities #{:transaction/broadcast}
+               :trust {:level :remote-rpc}})
+             (catch clojure.lang.ExceptionInfo exception
+               exception)))))))

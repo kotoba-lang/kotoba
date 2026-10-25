@@ -1,0 +1,583 @@
+(ns kotobase.storage.kura.async
+  "Promise-based kotobase blocks packed into CARv2 objects on a Kura shard
+  fleet.
+
+  A CARv2 pack is one Kura object containing several verified CID blocks. A
+  durable CAS catalog maps each CID to the pack CID and frame range. The
+  catalog is the restart-safe lookup path; Kura's deterministic placement
+  keeps the shard list out of per-block metadata. Reads fetch just the frame's
+  data-shard ranges and verify the block CID. If a range is absent or
+  unreachable, the complete Kura object is reconstructed and its pack digest
+  is checked before the frame is returned.
+
+  `:catalog` must implement both kotobase IBlockStore and IRefStore and declare
+  `:linearizable-ref`. The ref stores immutable, content-addressed manifest
+  blocks; its CAS publishes the CID -> manifest binding once. This keeps
+  Kura's shard plane free of a process-local index and prevents two writers
+  from silently selecting different packs for one CID.
+
+  `:verify-block` is injected because a Yataverse CID may use a codec this CAR
+  helper does not hash itself (for example dag-pb). It must throw or return
+  false for a mismatch. CAR framing carries the CID bytes without changing
+  them."
+  (:require [erasure.lrc :as lrc]
+            [ipld.car :as car]
+            [ipld.car.bytes :as car-bytes]
+            [ipld.car.v2 :as car-v2]
+            [kotobase.storage.core :as storage]
+            [kura.manifest :as manifest]
+            [kura.node.async :as shard-async]
+            [kura.node.gf :as gf]
+            [kura.node.object :as kura-object]
+            [kura.node.store :as node-store]
+            [multiformats.core :as mf]))
+
+(def default-max-pack-bytes (* 4 1024 1024))
+(def default-stripe-bytes (* 4 1024 1024))
+(def default-max-catalog-cas-inflight 8)
+(def catalog-prefix "kura/carv2/v1/")
+
+(defn- promise [value]
+  (js/Promise.resolve value))
+
+(defn- all [values]
+  (js/Promise.all (clj->js (vec values))))
+
+(defn- catalog-key [cid]
+  (str catalog-prefix cid))
+
+(defn- raw-cid [bytes]
+  (mf/cidv1-raw bytes))
+
+(defn- json-bytes [value]
+  (.encode (js/TextEncoder.) (js/JSON.stringify (clj->js value))))
+
+(defn- parse-json [bytes]
+  (js->clj (.parse js/JSON (.decode (js/TextDecoder.) bytes))
+           :keywordize-keys true))
+
+(defn- verify-block! [verify-block cid bytes]
+  (when (false? (verify-block cid bytes))
+    (throw (ex-info "block verifier rejected CID bytes"
+                    {:type :kotobase.storage.kura/invalid-block
+                     :cid cid})))
+  bytes)
+
+(defn- estimate-block-bytes
+  "A safe grouping estimate: payload + CID frame + index record + per-pack
+  framing allowance. The exact archive is checked after packing as well."
+  [{:keys [cid bytes]}]
+  (let [cid-bytes (car/cid->bytes cid)
+        {:keys [digest]} (car/read-cid cid-bytes 0)]
+    (+ (car-bytes/bcount bytes)
+       (car-bytes/bcount cid-bytes)
+       (car-bytes/bcount digest)
+       64)))
+
+(defn- estimated-groups [blocks max-pack-bytes]
+  (loop [remaining (seq blocks) current [] used 64 out []]
+    (if-let [block (first remaining)]
+      (let [cost (estimate-block-bytes block)]
+        (when (> (+ cost 64) max-pack-bytes)
+          (throw (ex-info "one CID block exceeds the configured CARv2 pack limit"
+                          {:type :kotobase.storage.kura/block-too-large
+                           :cid (:cid block)
+                           :bytes (car-bytes/bcount (:bytes block))
+                           :max-pack-bytes max-pack-bytes})))
+        (if (and (seq current) (> (+ used cost) max-pack-bytes))
+          (recur remaining [] 64 (conj out current))
+          (recur (next remaining) (conj current block) (+ used cost) out)))
+      (cond-> out (seq current) (conj current)))))
+
+(defn- bounded-packs
+  "Pack deterministically and split any group whose real CAR index/framing
+  exceeds the hard size ceiling."
+  [blocks max-pack-bytes]
+  (letfn [(fit [group]
+            (let [packed (car-v2/pack {:roots [] :blocks group})
+                  size (car-bytes/bcount (:bytes packed))]
+              (if (<= size max-pack-bytes)
+                [{:blocks group :packed packed}]
+                (if (= 1 (count group))
+                  (throw (ex-info "one CARv2 frame exceeds the configured pack limit"
+                                  {:type :kotobase.storage.kura/block-too-large
+                                   :cid (:cid (first group))
+                                   :archive-bytes size
+                                   :max-pack-bytes max-pack-bytes}))
+                  (let [middle (quot (count group) 2)]
+                    (into (fit (subvec group 0 middle))
+                          (fit (subvec group middle))))))))]
+    (vec (mapcat fit (estimated-groups blocks max-pack-bytes)))))
+
+(defn- placement-for [ctx object-id]
+  (let [{:keys [plan-placement placement-context fleet layout]} ctx
+        result (plan-placement object-id layout placement-context)
+        placements (mapv #(get (:shards result) %) (range (:n layout)))]
+    (when-not (:complete? result)
+      (throw (ex-info "Kura placement cannot satisfy the configured failure-domain caps"
+                      {:type :kotobase.storage.kura/placement-shortfall
+                       :object-id object-id
+                       :shortfall (:shortfall result)})))
+    (when-not (and (= (:n layout) (count placements))
+                   (= (:n layout) (count (distinct placements)))
+                   (every? #(and (string? %) (contains? fleet %)) placements))
+      (throw (ex-info "Kura placement plan must map every shard to a distinct fleet node"
+                      {:type :kotobase.storage.kura/invalid-placement
+                       :object-id object-id
+                       :placements placements
+                       :expected-shards (:n layout)})))
+    placements))
+
+(defn- stores-for [ctx placement-ids]
+  (fn [_stripe shard-index]
+    (or (get (:fleet ctx) (nth placement-ids shard-index nil))
+        (throw (ex-info "Kura placement refers to a node absent from this fleet"
+                        {:type :kotobase.storage.kura/missing-node
+                         :node-id (nth placement-ids shard-index nil)})))))
+
+(defn- geometry [ctx object-id archive-size placement-ids]
+  (let [k (:k (:layout ctx))
+        rounded-size (* k (max 1 (quot (+ archive-size k -1) k)))
+        stripe-bytes (min (:max-stripe-bytes ctx) rounded-size)
+        plan (manifest/plan {:object-id object-id
+                             :size archive-size
+                             :stripe-bytes stripe-bytes}
+                            (:layout ctx))]
+    {:plan plan
+     :layout-config (:layout-config ctx)
+     :stripe-bytes stripe-bytes
+     :placements placement-ids}))
+
+(defn- manifest-block [metadata]
+  (let [bytes (json-bytes metadata)]
+    {:cid (raw-cid bytes) :bytes bytes}))
+
+(defn- decode-manifest-block [manifest-cid found]
+  (let [bytes (get found manifest-cid)]
+    (when (nil? bytes)
+      (throw (ex-info "catalog ref points to a missing manifest block"
+                      {:type :kotobase.storage.kura/missing-manifest
+                       :cid manifest-cid})))
+    (when-not (= manifest-cid (raw-cid bytes))
+      (throw (ex-info "catalog returned bytes under a different CID"
+                      {:type :kotobase.storage.kura/catalog-cid-mismatch
+                       :cid manifest-cid})))
+    (let [metadata (parse-json bytes)]
+      (when-not (and (= 1 (:version metadata))
+                     (string? (:pack-cid metadata))
+                     (string? (:pack-object-id metadata))
+                     (string? (:pack-digest metadata))
+                     (integer? (:archive-size metadata))
+                     (pos? (:archive-size metadata))
+                     (integer? (:stripe-bytes metadata))
+                     (pos? (:stripe-bytes metadata))
+                     (map? (:layout metadata))
+                     (vector? (:placements metadata))
+                     (vector? (:entries metadata)))
+        (throw (ex-info "Kura pack manifest has an unsupported shape"
+                        {:type :kotobase.storage.kura/invalid-manifest
+                         :cid manifest-cid})))
+      metadata)))
+
+(defn- read-manifests> [backend cids]
+  (let [catalog (:catalog backend)
+        cids (vec (distinct cids))]
+    (-> (all (map (fn [cid]
+                    (promise (storage/-read-ref catalog (catalog-key cid))))
+                  cids))
+        (.then (fn [heads]
+                 (let [refs (vec (keep (fn [[cid head]]
+                                         (when head [cid (:cid head)]))
+                                       (map vector cids (array-seq heads))))
+                       manifest-cids (vec (distinct (map second refs)))]
+                   (if (empty? manifest-cids)
+                     {}
+                     (-> (all (map (fn [manifest-cid]
+                                     (promise (storage/-get-blocks catalog [manifest-cid])))
+                                   manifest-cids))
+                         (.then (fn [blocks]
+                                  (let [decoded (into {}
+                                                      (map (fn [manifest-cid found]
+                                                             [manifest-cid
+                                                              (decode-manifest-block manifest-cid found)])
+                                                           manifest-cids
+                                                           (array-seq blocks)))]
+                                    (into {}
+                                          (map (fn [[cid manifest-cid]]
+                                                 (let [metadata (get decoded manifest-cid)
+                                                       entry (some #(when (= cid (:cid %)) %)
+                                                                   (:entries metadata))]
+                                                   (when-not entry
+                                                     (throw (ex-info "catalog CID is absent from its pack manifest"
+                                                                     {:type :kotobase.storage.kura/manifest-entry-missing
+                                                                      :cid cid
+                                                                      :manifest-cid manifest-cid})))
+                                                   [cid (merge (dissoc metadata :entries) entry)])))
+                                          refs))))))))))))
+
+(defn- read-manifest> [backend cid]
+  (-> (read-manifests> backend [cid])
+      (.then #(get % cid))))
+
+(defn- publish-manifest> [backend cid manifest-cid]
+  (let [catalog (:catalog backend)]
+    (-> (promise (storage/-compare-and-set-ref!
+                  catalog (catalog-key cid) nil manifest-cid))
+        (.then (fn [result]
+                 (boolean (:published? result)))))))
+
+(defn- pack-plan [ctx pack-object-id archive-size placement-ids]
+  (geometry ctx pack-object-id archive-size placement-ids))
+
+(defn- publish-pack-manifests> [backend blocks manifest-cid]
+  (reduce (fn [state-promise batch]
+            (-> state-promise
+                (.then (fn [state]
+                         (-> (all (map (fn [{:keys [cid]}]
+                                         (publish-manifest> backend cid manifest-cid))
+                                       batch))
+                             (.then (fn [outcomes]
+                                      (let [published (count (filter true?
+                                                                     (array-seq outcomes)))]
+                                        (-> state
+                                            (update :published + published)
+                                            (update :contended + (- (count batch)
+                                                                    published)))))))))))
+          (js/Promise.resolve {:published 0 :contended 0})
+          (partition-all default-max-catalog-cas-inflight blocks)))
+
+(defn- persist-pack-manifest> [backend blocks catalog-block receipt]
+  ;; Catalog writes can fail ambiguously after the manifest was stored. A
+  ;; concurrent writer may already have published refs to this shared,
+  ;; content-addressed pack, so leave it for catalog-aware garbage collection
+  ;; instead of deleting data that may now be reachable.
+  (-> (promise (storage/-put-blocks! (:catalog backend) [catalog-block]))
+      (.then (fn [_]
+               (-> (publish-pack-manifests> backend blocks (:cid catalog-block))
+                   (.then (fn [state] (assoc state :receipt receipt))))))))
+
+(defn- store-pack> [backend {:keys [blocks packed]}]
+  (let [ctx (:ctx backend)
+        archive (:bytes packed)
+        pack-cid (raw-cid archive)
+        object-id (str "carv2-" pack-cid)
+        placement-ids (placement-for ctx object-id)
+        {:keys [plan stripe-bytes layout-config placements]}
+        (pack-plan ctx object-id (car-bytes/bcount archive) placement-ids)
+        digest raw-cid
+        entries (into {} (map (juxt :cid identity)) (:entries packed))
+        catalog-block (manifest-block
+                       {:version 1
+                        :pack-cid pack-cid
+                        :pack-object-id object-id
+                        :pack-digest pack-cid
+                        :archive-size (car-bytes/bcount archive)
+                        :stripe-bytes stripe-bytes
+                        :layout layout-config
+                        :placements placements
+                        :entries (mapv (fn [{:keys [cid]}]
+                                         (let [entry (get entries cid)]
+                                           {:cid cid
+                                            :file-offset (:file-offset entry)
+                                            :frame-length (:frame-length entry)}))
+                                       blocks)})]
+    (-> (kura-object/put-object!>
+         {:plan plan
+          :store-for (stores-for ctx placement-ids)
+          :digest digest
+          :bytes archive})
+        (.then (fn [receipt]
+                 (persist-pack-manifest> backend blocks catalog-block receipt)))
+        (.then (fn [state]
+                 (assoc state
+                        :pack-cid pack-cid
+                        :archive-bytes (car-bytes/bcount archive)
+                        :physical-bytes (get-in state [:receipt :physical-bytes])))))))
+
+(defn- read-frame [verify-block expected-cid frame]
+  (let [frame (car-bytes/as-bytes frame)
+        {frame-size :value varint-length :length} (car-bytes/read-varint frame 0)
+        frame-end (+ varint-length frame-size)]
+    (when (> frame-end (car-bytes/bcount frame))
+      (throw (ex-info "CAR range ends before its declared frame"
+                      {:type :kotobase.storage.kura/truncated-frame
+                       :cid expected-cid})))
+    (when-not (= frame-end (car-bytes/bcount frame))
+      (throw (ex-info "CAR range contains bytes outside its declared frame"
+                      {:type :kotobase.storage.kura/frame-length-mismatch
+                       :cid expected-cid
+                       :declared frame-end
+                       :actual (car-bytes/bcount frame)})))
+    (let [{actual-cid :cid cid-length :length}
+          (car/read-cid frame varint-length)
+          start (+ varint-length cid-length)
+          block (car-bytes/slice frame start frame-end)]
+      (when-not (= expected-cid actual-cid)
+        (throw (ex-info "CAR range index points at another CID"
+                        {:type :kotobase.storage.kura/frame-cid-mismatch
+                         :expected expected-cid
+                         :actual actual-cid})))
+      (verify-block! verify-block expected-cid block))))
+
+(defn- metadata-plan [_ctx metadata]
+  (let [layout (lrc/layout (:layout metadata))
+        plan (manifest/plan {:object-id (:pack-object-id metadata)
+                             :size (:archive-size metadata)
+                             :stripe-bytes (:stripe-bytes metadata)}
+                            layout)]
+    {:plan plan :layout layout}))
+
+(defn- reconstruct-pack-range> [ctx metadata offset length]
+  (let [{:keys [plan]} (metadata-plan ctx metadata)
+        placement-ids (:placements metadata)
+        store-for (stores-for ctx placement-ids)]
+    (-> (kura-object/get-object>
+         {:plan plan
+          :store-for store-for
+          :digest raw-cid
+          :expect-digest (:pack-digest metadata)})
+        (.then (fn [result]
+                 (car-bytes/slice (:bytes result) offset (+ offset length)))))))
+
+(defn- checked-shard-range [bytes expected-length]
+  (let [bytes (when bytes (car-bytes/as-bytes bytes))]
+    (when-not (and bytes (= expected-length (car-bytes/bcount bytes)))
+      (throw (js/Error. "Kura returned an incomplete shard range")))
+    bytes))
+
+(defn- shard-range> [store-for plan stripe index shard-offset length]
+  (let [shard-id (manifest/shard-id (:object-id plan) stripe index)]
+    ;; Defer the protocol call so both a synchronous throw from a faulty
+    ;; adapter and an asynchronous rejection flow through the same fallback.
+    (-> (promise nil)
+        (.then (fn [_]
+                 (shard-async/-get-range>
+                  (store-for stripe index) shard-id shard-offset length)))
+        (.then #(checked-shard-range % length)))))
+
+(defn- reconstruct-local-range> [store-for plan layout read]
+  (let [{:keys [stripe index shard-offset length]} read
+        recovery (lrc/recovery-plan layout #{index})
+        step (first (:steps recovery))]
+    (when-not (and (:recoverable? recovery)
+                   (= :local (:op step))
+                   (= index (:target step)))
+      (throw (ex-info "Kura data range has no local parity recovery plan"
+                      {:type :kotobase.storage.kura/local-range-unrecoverable
+                       :stripe stripe :index index})))
+    (-> (all (map (fn [read-index]
+                    (shard-range> store-for plan stripe read-index
+                                  shard-offset length))
+                  (:reads step)))
+        (.then (fn [ranges]
+                 ;; Local parity is XOR over equal offsets, so only the exact
+                 ;; requested byte range is transferred from the peer shards.
+                 (gf/xor-shards (map car-bytes/as-bytes (array-seq ranges))
+                                length))))))
+
+(defn- ranged-pack-bytes> [ctx metadata offset length]
+  (let [{:keys [plan]} (metadata-plan ctx metadata)
+        placement-ids (:placements metadata)
+        store-for (stores-for ctx placement-ids)
+        reads (manifest/range-reads plan offset length)]
+    (when (empty? reads)
+      (throw (ex-info "CAR frame range is outside the Kura object"
+                      {:type :kotobase.storage.kura/range-out-of-bounds
+                       :offset offset :length length})))
+    (-> (all (map (fn [read]
+                    (let [{:keys [stripe index shard-offset length]} read]
+                      (-> (shard-range> store-for plan stripe index
+                                        shard-offset length)
+                          (.catch (fn [_]
+                                    (reconstruct-local-range>
+                                     store-for plan (:layout plan) read))))))
+                  reads))
+        (.then
+         (fn [values]
+           (let [segments (mapv (fn [read bytes]
+                                  (assoc read
+                                         :object-offset (+ (* (:stripe read) (:stripe-bytes plan))
+                                                           (* (:index read) (:shard-bytes plan))
+                                                           (:shard-offset read))
+                                         :body (car-bytes/as-bytes bytes)))
+                                reads (array-seq values))
+                 ordered (sort-by :object-offset segments)]
+             (loop [remaining (seq ordered) cursor offset parts []]
+               (if-let [segment (first remaining)]
+                 (if (= cursor (:object-offset segment))
+                   (recur (next remaining)
+                          (+ cursor (:length segment))
+                          (conj parts (:body segment)))
+                   (throw (js/Error. "Kura CAR range segments are not contiguous")))
+                 (if (= cursor (+ offset length))
+                   (car-bytes/concat parts)
+                   (throw (js/Error. "Kura CAR range is incomplete"))))))))
+        (.catch (fn [_]
+                  ;; Direct data and local-parity ranges are the fast paths.
+                  ;; If local reconstruction also fails, Kura's full-object
+                  ;; path checks the pack digest before returning any bytes.
+                  (reconstruct-pack-range> ctx metadata offset length))))))
+
+(defn- read-entry> [backend cid metadata]
+  (let [ctx (:ctx backend)]
+    (-> (ranged-pack-bytes> ctx metadata
+                            (:file-offset metadata)
+                            (:frame-length metadata))
+        (.then #(read-frame (:verify-block ctx) cid %)))))
+
+(defn repair-block!>
+  "Verify and repair the Kura pack containing `cid`.
+
+  Returns a receipt candidate with the verified pack CID, bytes rewritten and
+  recorded placement. A coordinator must bind this result to its signed order,
+  provider identity and deadline before it is eligible for a YATA
+  `delivery-repair` score; this local result is not a payout claim."
+  [backend cid]
+  (let [ctx (:ctx backend)]
+    (-> (read-manifest> backend cid)
+        (.then (fn [metadata]
+                 (when-not metadata
+                   (throw (ex-info "cannot repair a CID absent from the Kura catalog"
+                                   {:type :kotobase.storage.kura/missing-cid
+                                    :cid cid})))
+                 (let [{:keys [plan]} (metadata-plan ctx metadata)
+                       placement-ids (:placements metadata)]
+                   (-> (kura-object/repair-object!>
+                        {:plan plan
+                         :store-for (stores-for ctx placement-ids)
+                         :digest raw-cid
+                         :expect-digest (:pack-digest metadata)})
+                       (.then (fn [receipt]
+                                (assoc receipt
+                                       :cid cid
+                                       :pack-cid (:pack-cid metadata)
+                                       :archive-size (:archive-size metadata)
+                                       :bytes-rewritten (* (:rewritten receipt)
+                                                           (:shard-bytes plan))
+                                       :placements placement-ids
+                                       :evidence-kind :kura/verified-repair-v1))))))))))
+
+(defrecord KuraCarBackend [ctx catalog]
+  storage/IBlockStore
+  (-put-blocks! [this blocks]
+    (let [verify-block (:verify-block ctx)
+          unique (->> blocks
+                      (map (fn [{:keys [cid bytes]}]
+                             {:cid cid
+                              :bytes (verify-block! verify-block cid
+                                                    (car-bytes/as-bytes bytes))}))
+                      (reduce (fn [by-cid block]
+                                (assoc by-cid (:cid block) block))
+                              (sorted-map))
+                      vals
+                      vec)]
+      (-> (read-manifests> this (map :cid unique))
+          (.then (fn [existing]
+                   (let [fresh (filterv #(not (contains? existing (:cid %))) unique)]
+                     (reduce (fn [p group]
+                               (.then p (fn [results]
+                                          (-> (store-pack> this group)
+                                              (.then #(conj results %))))))
+                             (js/Promise.resolve [])
+                             (bounded-packs fresh (:max-pack-bytes ctx)))))))))
+
+  (-get-blocks [this cids]
+    (-> (read-manifests> this cids)
+        (.then (fn [metadata]
+                 (let [present (filterv #(contains? metadata %) cids)]
+                   (-> (all (map (fn [cid]
+                                   (read-entry> this cid (get metadata cid)))
+                                 present))
+                       (.then (fn [blocks]
+                                (into {} (map vector present (array-seq blocks)))))))))))
+
+  storage/IRefStore
+  (-read-ref [_ ref-name] (storage/-read-ref catalog ref-name))
+  (-compare-and-set-ref! [_ ref-name expected next-cid]
+    (storage/-compare-and-set-ref! catalog ref-name expected next-cid))
+
+  storage/IBackendCapabilities
+  (-capabilities [_]
+    (conj #{:immutable-blocks :cid-addressed-read :conditional-ref
+            :verified-blocks :packed-blocks :range-read}
+          (storage/ref-profile catalog))))
+
+(defn open
+  "Open an async Yataverse block store over Kura.
+
+  Required options:
+
+  * `:fleet` maps every Kura placement node id to its async shard store.
+  * `:plan-placement` is the coordinator's deterministic Kura placement function.
+    It receives `(object-id layout placement-context)` and returns
+    `{:complete? bool :shortfall n :shards {index node-id}}`. Its result must
+    assign every shard to a distinct id in `:fleet` and satisfy the signed
+    placement policy. Injecting it keeps the node data plane from pinning a
+    second, incompatible copy of Kura's coordinator placement module.
+  * `:placement-context` carries the coordinator's current node inventory,
+    group policy and committed regional-demand generation.
+  * `:catalog` is a durable kotobase backend with linearizable CAS refs; it
+    stores the small CID -> CAR-frame manifests and user refs.
+  * `:verify-block` verifies arbitrary supported Yataverse CID codecs and
+    throws or returns false on a mismatch.
+
+  CAR packs are bounded by `:max-pack-bytes` (4 MiB by default). Kura stripes
+  default to the same ceiling and are rounded to the code's data-shard count
+  for small packs, avoiding a full-size padding penalty. Every fleet node must
+  advertise `:range-read`; otherwise this backend refuses to claim
+  `:packed-blocks`.
+
+  This is a Worker/Node.js adapter. It returns Promises from the kotobase
+  protocols, as required by `kotobase.storage/async-contract`."
+  [{:keys [fleet plan-placement placement-context catalog verify-block max-pack-bytes
+           max-stripe-bytes layout]
+    :or {max-pack-bytes default-max-pack-bytes
+         max-stripe-bytes default-stripe-bytes}}]
+  (assert (and (map? fleet) (seq fleet)) "fleet must map node ids to async stores")
+  (assert (every? shard-async/async-store? (vals fleet))
+          "every Kura fleet member must implement the async shard-store protocol")
+  (assert (ifn? plan-placement)
+          "plan-placement must be the coordinator's deterministic Kura placement function")
+  (assert (and (map? placement-context) (seq (:nodes placement-context)))
+          "placement-context must include the coordinator's current Kura node inventory")
+  (assert (ifn? verify-block)
+          ":verify-block must verify supported Yataverse CID codecs")
+  (assert (and (integer? max-pack-bytes) (>= max-pack-bytes 512))
+          ":max-pack-bytes must be at least 512")
+  (assert (and (integer? max-stripe-bytes) (pos? max-stripe-bytes))
+          ":max-stripe-bytes must be positive")
+  (let [layout-config (or layout {:k 16 :r 4 :g 6})
+        layout (lrc/layout layout-config)
+        nodes (:nodes placement-context)
+        node-ids (set (map :id nodes))
+        fleet-ids (set (keys fleet))]
+    (assert (= node-ids fleet-ids)
+            "placement node ids and async fleet ids must match exactly")
+    (assert (every? #(contains? (:capabilities (node-store/-descriptor %))
+                                :range-read)
+                    (vals fleet))
+            "every Kura node must advertise true range reads for CAR packs")
+    (assert (zero? (mod max-stripe-bytes (:k layout)))
+            ":max-stripe-bytes must be divisible by the data-shard count")
+    (storage/validate-block-store! catalog)
+    (assert (storage/ref-store? catalog)
+            "catalog must implement IRefStore for persistent CID indexing")
+    (assert (= :linearizable-ref (storage/ref-profile catalog))
+            "CAR catalog requires linearizable CAS for multi-writer correctness")
+    (->KuraCarBackend
+     {:fleet fleet
+      :plan-placement plan-placement
+      :placement-context placement-context
+      :layout layout
+      :layout-config layout-config
+      :verify-block verify-block
+      :max-pack-bytes max-pack-bytes
+      :max-stripe-bytes max-stripe-bytes}
+     catalog)))
+
+(defn durability-report
+  "Report Kura's actual node failure domains against this backend's LRC code."
+  [backend]
+  (let [{:keys [fleet layout]} (:ctx backend)]
+    (node-store/audit (mapv node-store/-descriptor (vals fleet))
+                      (lrc/max-tolerated-erasures layout))))

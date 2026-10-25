@@ -1,0 +1,166 @@
+(ns kotobase.storage.ordered-map-test
+  "Two substrates disagreeing about one row, and what it takes to notice.
+
+  The two `scan` implementations below are not invented for the test. Their
+  bound predicates are lifted verbatim from the two range APIs in this
+  workspace, measured 2026-09-06:
+
+      prolly-tree.core/scan-range       (neg? (compare k hi))
+      kotobase.projection/decode-range  (not (pos? (compare k upper)))
+
+  They differ on exactly one key -- the one equal to the upper bound -- which
+  is why a facade that took either as `range` would return a different row set
+  depending on which substrate answered, with nothing in the result saying so."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.storage.ordered-map :as om]))
+
+(defn- err [f]
+  (try (f) nil
+       (catch #?(:clj Exception :cljs :default) e (:type (ex-data e)))))
+
+(def rows
+  (into (sorted-map) {"a" 1 "b" 2 "c" 3 "d" 4 "e" 5}))
+
+(def base-profile
+  {:comparator :lexicographic-utf8
+   :snapshot :root-cid
+   :duplicates :unique-key
+   :tombstones :absent})
+
+;; verbatim: prolly-tree.core/in-key-range?
+(defn- prolly-scan [lower upper]
+  (vec (filter (fn [[k _]]
+                 (and (or (nil? lower) (not (neg? (compare k lower))))
+                      (or (nil? upper) (neg? (compare k upper)))))
+               rows)))
+
+;; verbatim: kotobase.projection/decode-range's key predicate
+(defn- inclusive-scan [lower upper]
+  (vec (filter (fn [[k _]]
+                 (and (or (nil? lower) (not (neg? (compare k lower))))
+                      (or (nil? upper) (not (pos? (compare k upper))))))
+               rows)))
+
+(def half-open-adapter
+  {:profile (assoc base-profile :bounds :half-open) :scan prolly-scan})
+
+(def inclusive-adapter
+  {:profile (assoc base-profile :bounds :inclusive-upper) :scan inclusive-scan})
+
+;; ── the disagreement, and the adaptation ─────────────────────────────────────
+
+(deftest the_two_substrates_really_do_disagree_on_the_boundary_row
+  (testing "raw, before any adaptation -- this is the hazard, not a strawman"
+    (is (= ["a" "b" "c"] (mapv first (prolly-scan "a" "d"))))
+    (is (= ["a" "b" "c" "d"] (mapv first (inclusive-scan "a" "d")))
+        "the inclusive API returns the upper-bound row and the half-open one does not")))
+
+(deftest scan_makes_both_answer_the_same_half_open_question
+  (let [rng (om/range "a" "d")]
+    (is (= ["a" "b" "c"] (mapv first (om/scan half-open-adapter rng))))
+    (is (= ["a" "b" "c"] (mapv first (om/scan inclusive-adapter rng)))
+        "adapted by filtering, because no string successor exists to rewrite the bound"))
+  (testing "unbounded upper needs no adaptation and loses nothing"
+    (let [rng (om/range "c" nil)]
+      (is (= ["c" "d" "e"] (mapv first (om/scan half-open-adapter rng))))
+      (is (= ["c" "d" "e"] (mapv first (om/scan inclusive-adapter rng)))))))
+
+(deftest the_oracle_agrees_only_after_adaptation
+  (let [rng (om/range "a" "d")
+        r (om/range-oracle half-open-adapter inclusive-adapter rng)]
+    (is (:agree? r))
+    (is (= 3 (:compared r)))
+    (is (false? (:vacuous? r)))
+    (is (= [] (:only-in-a r)))
+    (is (= [] (:only-in-b r)))))
+
+(deftest the_oracle_reports_a_real_difference_rather_than_hiding_it
+  ;; An adapter that MISDECLARES its bounds: inclusive substrate claiming to be
+  ;; half-open. Nothing adapts it, so the boundary row survives.
+  (let [misdeclared {:profile (assoc base-profile :bounds :half-open)
+                     :scan inclusive-scan}
+        r (om/range-oracle half-open-adapter misdeclared (om/range "a" "d"))]
+    (is (false? (:agree? r)))
+    (is (= ["d"] (:only-in-b r))
+        "the one row the two APIs were always going to disagree about")
+    (is (= 4 (:compared r)))))
+
+;; ── agreement on nothing is not evidence ─────────────────────────────────────
+
+(deftest agreement_on_no_rows_is_reported_as_vacuous
+  (let [rng (om/range "x" "z")
+        r (om/range-oracle half-open-adapter inclusive-adapter rng)]
+    (is (:agree? r) "they do agree -- on nothing")
+    (is (zero? (:compared r)))
+    (is (:vacuous? r)
+        "a caller asserting only on :agree? cannot tell this from a real pass"))
+  (testing "two substrates that both return nothing at all also agree"
+    (let [empty-adapter {:profile (assoc base-profile :bounds :half-open)
+                         :scan (fn [_ _] [])}
+          r (om/range-oracle empty-adapter empty-adapter (om/range "a" "z"))]
+      (is (:agree? r))
+      (is (:vacuous? r)))))
+
+;; ── declarations: undeclared is not a default ────────────────────────────────
+
+(deftest every_dimension_must_be_declared
+  (doseq [dimension [:comparator :bounds :snapshot :duplicates :tombstones]]
+    (testing (str "missing " dimension)
+      (is (= :kotobase.storage/undeclared-ordered-map
+             (err #(om/validate-profile!
+                    (dissoc (assoc base-profile :bounds :half-open) dimension)))))))
+  (testing "a complete profile passes"
+    (is (map? (om/validate-profile! (assoc base-profile :bounds :half-open))))))
+
+(deftest an_unrecognised_declaration_is_not_the_same_as_a_missing_one
+  ;; Apart on purpose: one says the substrate has not been asked, the other
+  ;; says it answered something this contract cannot interpret.
+  (is (= :kotobase.storage/unknown-ordered-map-declaration
+         (err #(om/validate-profile!
+                (assoc base-profile :bounds :inclusive-lower)))))
+  (is (= :kotobase.storage/undeclared-ordered-map
+         (err #(om/validate-profile! (dissoc base-profile :comparator))))))
+
+;; ── refusals ─────────────────────────────────────────────────────────────────
+
+(deftest a_range_over_unordered_keys_is_refused_not_answered
+  ;; HMAC-blinded keys are the case in this workspace: the encoding does not
+  ;; preserve order, so lexical order of it is not the database's order.
+  (let [blinded {:profile (assoc base-profile :bounds :half-open
+                                 :comparator :opaque-unordered)
+                 :scan prolly-scan}]
+    (is (= :kotobase.storage/unordered-range-refused
+           (err #(om/scan blinded (om/range "a" "d")))))))
+
+(deftest substrates_declaring_different_semantics_are_not_compared
+  (doseq [[dimension other] [[:comparator :opaque-unordered]
+                             [:duplicates :newest-epoch-wins]
+                             [:tombstones :suppress-key]]]
+    (testing (str "differing " dimension)
+      (let [other-adapter {:profile (assoc base-profile :bounds :half-open
+                                           dimension other)
+                           :scan prolly-scan}]
+        (is (= :kotobase.storage/incomparable-substrates
+               (err #(om/range-oracle half-open-adapter other-adapter
+                                      (om/range "a" "d"))))
+            "an agreement here would only say the difference did not show"))))
+  (testing "differing bounds is the case the oracle exists for, and is allowed"
+    (is (map? (om/range-oracle half-open-adapter inclusive-adapter
+                               (om/range "a" "d"))))))
+
+(deftest a_range_that_cannot_contain_anything_is_refused
+  (is (= :kotobase.storage/empty-ordered-map-range (err #(om/range "c" "c"))))
+  (is (= :kotobase.storage/empty-ordered-map-range (err #(om/range "d" "b"))))
+  (testing "open bounds stay legal"
+    (is (= {:lower nil :upper nil} (om/range nil nil)))
+    (is (= {:lower "a" :upper nil} (om/range "a" nil)))))
+
+(deftest snapshot_and_bounds_may_differ_because_this_contract_adapts_them
+  ;; Two substrates pinning versions differently still compare: what they
+  ;; return is rows, and the snapshot is how each got them.
+  (let [epoch-adapter {:profile (assoc base-profile :bounds :inclusive-upper
+                                       :snapshot :query-epoch)
+                       :scan inclusive-scan}
+        r (om/range-oracle half-open-adapter epoch-adapter (om/range "a" "d"))]
+    (is (:agree? r))
+    (is (= 3 (:compared r)))))

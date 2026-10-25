@@ -1,0 +1,188 @@
+(ns kotobase.storage.signed-head-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.storage.contract :as contract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.memory :as memory]
+            [kotobase.storage.signed-head :as sh]))
+
+;; A deliberately dumb pointer: unconditional overwrite, exactly what B2 or an
+;; IPNS publish gives. If the design needs more than this, it has failed.
+(defn- pointer []
+  (let [state (atom {})]
+    {:read-head! (fn [n] (get @state n))
+     :write-head! (fn [n head] (swap! state assoc n head))
+     :state state}))
+
+(defn- signer [key]
+  {:sign-fn (fn [record] [key (hash record)])
+   :verify-fn (fn [record sig issuer]
+                (and (= sig [key (hash record)]) (= issuer key)))})
+
+(defn- store [key]
+  (let [p (pointer)
+        s (signer key)]
+    (assoc (merge p s)
+           :store (sh/open (assoc (select-keys p [:read-head! :write-head!])
+                                  :sign-fn (:sign-fn s)
+                                  :verify-fn (:verify-fn s)
+                                  :issuer key)))))
+
+(deftest publishes-and-reads-back
+  (let [{:keys [store]} (store "alice")]
+    (is (nil? (storage/-read-ref store "main")) "absent ref is nil")
+    (is (:published? (storage/-compare-and-set-ref! store "main" nil "cid-a")))
+    (is (= "cid-a" (:cid (storage/-read-ref store "main"))))
+    (is (:published? (storage/-compare-and-set-ref! store "main" "cid-a" "cid-b")))
+    (is (= "cid-b" (:cid (storage/-read-ref store "main"))))))
+
+(deftest a-stale-publish-loses-and-sees-the-winner
+  (let [{:keys [store]} (store "alice")]
+    (storage/-compare-and-set-ref! store "main" nil "cid-a")
+    (let [lost (storage/-compare-and-set-ref! store "main" nil "cid-b")]
+      (is (false? (:published? lost)))
+      (is (= "cid-a" (:current lost))))))
+
+(deftest the-sequence-advances-by-one
+  (let [{:keys [store]} (store "alice")]
+    (storage/-compare-and-set-ref! store "main" nil "cid-a")
+    (is (= 0 (:version (storage/-read-ref store "main"))))
+    (storage/-compare-and-set-ref! store "main" "cid-a" "cid-b")
+    (is (= 1 (:version (storage/-read-ref store "main"))))))
+
+(deftest an-unverifiable-head-reads-as-absent
+  (testing "an untrusted host can serve rubbish; the reader's job is not to
+            believe it, and a forged head must not read as a valid ref"
+    (let [{:keys [store state]} (store "alice")]
+      (storage/-compare-and-set-ref! store "main" nil "cid-a")
+      (swap! state update "main" assoc "cid" "cid-forged")
+      (is (nil? (storage/-read-ref store "main"))))))
+
+(deftest a-head-from-another-issuer-reads-as-absent
+  ;; `mallory` is built FIRST: destructuring :store shadows the `store` fn, so
+  ;; building it after would call a record as a function.
+  (let [mallory (store "mallory")
+        {:keys [store state]} (store "alice")]
+    (storage/-compare-and-set-ref! (:store mallory) "main" nil "cid-m")
+    (reset! state {"main" (get @(:state mallory) "main")})
+    (is (nil? (storage/-read-ref store "main")))))
+
+(deftest a-fork-is-visible
+  (testing "the property a plain overwritten pointer cannot provide: two heads
+            at one sequence are detectable rather than a silent lost update"
+    (let [a (store "alice")
+          b (store "alice")]
+      (storage/-compare-and-set-ref! (:store a) "main" nil "cid-a")
+      (storage/-compare-and-set-ref! (:store b) "main" nil "cid-b")
+      (let [ha (get @(:state a) "main")
+            hb (get @(:state b) "main")]
+        (is (sh/forked? ha hb))
+        (is (not (sh/forked? ha ha)))))))
+
+(deftest the-profile-is-single-writer-not-linearizable
+  (testing "a signature proves authorship, not exclusivity — claiming
+            linearizable here would be the silent-success failure ref-profiles
+            exists to prevent"
+    (let [{:keys [store]} (store "alice")]
+      (is (= :single-writer-ref (storage/ref-profile store)))
+      (is (not (storage/linearizable? store))))))
+
+(deftest composes-with-a-block-only-store
+  (testing "the point of the exercise: blocks on a host with no conditional
+            write, refs on this"
+    (let [blocks (reify
+                   storage/IBlockStore
+                   (-put-blocks! [_ bs] (mapv :cid bs))
+                   (-get-blocks [_ _] {})
+                   storage/IBackendCapabilities
+                   (-capabilities [_] storage/block-capabilities))
+          backend (storage/compose {:blocks blocks :refs (:store (store "alice"))})]
+      (is (= backend (storage/validate-backend! backend)))
+      (is (= :single-writer-ref (storage/ref-profile backend))))))
+
+;; ── the shared conformance suite ────────────────────────────────────────────
+;;
+;; Everything above tests this ref store against assertions written for it.
+;; That is the weaker half of the job: the README says "Provider
+;; implementations must run `kotobase.storage.contract/verify`", and until now
+;; the newest ref plane in the repo was the one implementation not doing it.
+;; A store can satisfy every bespoke test in its own file and still disagree
+;; with the contract every other provider is held to -- the suite exists
+;; because that disagreement is what breaks callers.
+;;
+;; Composed against the real memory block store rather than the stub above, so
+;; the block half of the contract is exercised too. `compose` deliberately
+;; strips ref profiles off the block side, so the `:linearizable-ref` that
+;; `memory-store` declares cannot lend itself to this composition -- the
+;; profile below has to come from the signed head, and it does.
+(deftest signed-head-satisfies-the-shared-contract
+  (let [backend (storage/compose {:blocks (memory/memory-store)
+                                  :refs (:store (store "alice"))})
+        result (contract/verify backend (fn [ok? label] (is ok? label)))]
+    (testing "and the race half is reported as not-claimed rather than passed"
+      ;; `:single-writer-ref` must NOT report `:concurrency :verified`. A
+      ;; passing run that looked identical to a linearizable one would be the
+      ;; suite lending this store a guarantee it explicitly refuses to make.
+      (is (= {:profile :single-writer-ref :concurrency :not-claimed} result)))))
+
+;; ── what an untrusted host can actually do (ADR-2608047000) ────────────────
+;;
+;; Every head below is GENUINELY SIGNED. Nothing here forges a signature,
+;; because forging one was never the attack: the attack is that a valid
+;; signature was being read as authority over a ref it says nothing about.
+;;
+;; `open-verifier` is the natural implementation of `verify-fn` — "this
+;; signature is valid for the key it names" — as opposed to the one the tests
+;; above happen to use, which also pins the issuer. The library must not
+;; depend on every caller having independently thought of that.
+
+(defn- open-verifier []
+  {:sign-fn (fn [record] ["sig" (hash record)])
+   :verify-fn (fn [record sig _issuer] (= sig ["sig" (hash record)]))})
+
+(defn- open-store [issuer & [opts]]
+  (let [p (pointer)
+        s (open-verifier)]
+    (assoc (merge p s)
+           :store (sh/open (merge (select-keys p [:read-head! :write-head!])
+                                  {:sign-fn (:sign-fn s)
+                                   :verify-fn (:verify-fn s)
+                                   :issuer issuer}
+                                  opts)))))
+
+(deftest a-head-for-another-ref-is-not-this-refs-head
+  (let [{:keys [store state]} (open-store "alice")]
+    (storage/-compare-and-set-ref! store "main" nil "cid-a")
+    (let [head (get @state "main")]
+      (testing "the host answers a read for `other` with `main`'s real head"
+        (swap! state assoc "other" head)
+        (is (nil? (storage/-read-ref store "other"))
+            "a genuinely signed head addressed to a different ref is not this ref's head"))
+      (testing "and `main` itself is unaffected"
+        (is (= "cid-a" (:cid (storage/-read-ref store "main"))))))))
+
+(deftest a-head-from-an-unaccepted-issuer-is-refused
+  (let [{:keys [store state sign-fn]} (open-store "alice")]
+    (storage/-compare-and-set-ref! store "main" nil "cid-a")
+    (testing "a head signed by someone else's key, for this exact ref, at a higher seq"
+      (let [record (sh/head-record {:ref-name "main" :seq 99 :cid "cid-mallory"
+                                    :prev "cid-a" :issuer "mallory"})]
+        (swap! state assoc "main" (assoc record "sig" (sign-fn record)))
+        (is (nil? (storage/-read-ref store "main"))
+            "a valid signature by an unaccepted issuer is not authority over this ref")))))
+
+(deftest accept-issuer?-is-the-stated-way-to-widen-it
+  ;; Rotation and deliberate hand-off are real; they are a decision the
+  ;; deployment states, not the absence of a check.
+  (let [{:keys [store state sign-fn]}
+        (open-store "alice" {:accept-issuer? #{"alice" "alice-2026"}})]
+    (storage/-compare-and-set-ref! store "main" nil "cid-a")
+    (let [record (sh/head-record {:ref-name "main" :seq 7 :cid "cid-rotated"
+                                  :prev "cid-a" :issuer "alice-2026"})]
+      (swap! state assoc "main" (assoc record "sig" (sign-fn record)))
+      (is (= "cid-rotated" (:cid (storage/-read-ref store "main"))))
+      (is (= 7 (:version (storage/-read-ref store "main")))))
+    (testing "and an issuer outside the set is still refused"
+      (let [record (sh/head-record {:ref-name "main" :seq 8 :cid "cid-mallory"
+                                    :prev "cid-rotated" :issuer "mallory"})]
+        (swap! state assoc "main" (assoc record "sig" (sign-fn record)))
+        (is (nil? (storage/-read-ref store "main")))))))

@@ -1,0 +1,100 @@
+(ns kotobase.storage.s3-sigv4
+  "Minimal AWS SigV4 signer for S3-compatible object requests."
+  (:require [kotoba.lang.text :as str]))
+
+(def encoder (js/TextEncoder.))
+
+(defn- hex [buffer]
+  (let [bytes (js/Uint8Array. buffer) out (array)]
+    (dotimes [index (.-length bytes)]
+      (.push out (.padStart (.toString (aget bytes index) 16) 2 "0")))
+    (.join out "")))
+
+(defn- digest [data]
+  (-> (js/crypto.subtle.digest
+       "SHA-256" (if (string? data) (.encode encoder data) data))
+      (.then hex)))
+
+(defn- hmac [key data]
+  (let [raw (if (string? key) (.encode encoder key) key)]
+    (-> (js/crypto.subtle.importKey
+         "raw" raw #js {:name "HMAC" :hash "SHA-256"} false #js ["sign"])
+        (.then #(js/crypto.subtle.sign
+                 "HMAC" % (.encode encoder data))))))
+
+(defn- signing-key [secret date region]
+  (-> (hmac (str "AWS4" secret) date)
+      (.then #(hmac % region))
+      (.then #(hmac % "s3"))
+      (.then #(hmac % "aws4_request"))))
+
+(defn- encode-part [value]
+  (-> (js/encodeURIComponent value)
+      (.replace
+       (js/RegExp. "[!'()*]" "g")
+       #(str "%" (.toUpperCase (.toString (.charCodeAt % 0) 16))))))
+
+(defn- object-path [bucket key]
+  (str "/" (encode-part bucket) "/"
+       (str/join "/" (map encode-part (str/split key #"/")))))
+
+(defn signed-request
+  "Sign an S3 request. `:key` is the object key.
+
+  It is bound as `object-key` rather than `key` because `key` is
+  `clojure.core/key`, which this function needs three lines later to sort and
+  name the canonical headers. Destructured as `key`, the object key — a
+  string — became the sort function, and every call through here threw
+  `a.call is not a function` before a single byte left the process. Nothing
+  caught it: the suites exercise the R2 binding client and an in-repo mock,
+  and this is the other client."
+  [{:keys [endpoint bucket region access-key secret-key
+           method body headers]
+    object-key :key}]
+  (let [endpoint (str/replace endpoint #"/+$" "")
+        path (object-path bucket object-key)
+        host (.-host (js/URL. endpoint))
+        iso (.toISOString (js/Date.))
+        date (.replace iso (js/RegExp. "[:-]|\\.\\d{3}" "g") "")
+        short (.slice date 0 8)]
+    (-> (digest (or body ""))
+        (.then
+         (fn [payload-hash]
+           (let [extra (into {}
+                             (map (fn [[name value]]
+                                    [(str/lower (clojure.core/name name))
+                                     (str value)]))
+                             headers)
+                 signed (merge extra
+                               {"host" host
+                                "x-amz-content-sha256" payload-hash
+                                "x-amz-date" date})
+                 ordered (sort-by key signed)
+                 names (str/join ";" (map key ordered))
+                 canonical-headers
+                 (apply str
+                        (map (fn [[name value]]
+                               (str name ":" (str/trim value) "\n"))
+                             ordered))
+                 canonical (str method "\n" path "\n\n"
+                                canonical-headers "\n" names "\n"
+                                payload-hash)
+                 scope (str short "/" region "/s3/aws4_request")]
+             (-> (digest canonical)
+                 (.then #(str "AWS4-HMAC-SHA256\n" date "\n"
+                              scope "\n" %))
+                 (.then
+                  (fn [to-sign]
+                    (-> (signing-key secret-key short region)
+                        (.then #(hmac % to-sign)))))
+                 (.then
+                  (fn [signature]
+                    {:url (str endpoint path)
+                     :headers
+                     (js/Object.assign
+                      (clj->js signed)
+                      #js {"authorization"
+                           (str "AWS4-HMAC-SHA256 Credential="
+                                access-key "/" scope
+                                ", SignedHeaders=" names
+                                ", Signature=" (hex signature))})})))))))))

@@ -1,0 +1,248 @@
+(ns kotobase.storage.object-s3
+  "The large-object plane for S3-compatible endpoints and R2.
+
+  This is what removes a 4 MiB ceiling that was never the storage's: the
+  live `PUT /ipfs/:cid` path caps there because the Worker buffers the body,
+  and a Worker has a memory budget while B2 does not care how large the
+  object is (ADR-2608012600, Context 2). A GB object must not travel through
+  the process that asked for it, so the fix is not a bigger buffer -- it is
+  to stop being in the path.
+
+  ## Which profile a store gets is decided by the client, not by this file
+
+  `signed-client` holds SigV4 credentials, so it can hand a caller a URL and
+  step out of the way: `:presigned-transfer`.
+
+  An `r2-client` holds a Workers **binding**. A binding has no credentials to
+  sign with -- it is an object with `get`/`put` methods, usable only from
+  inside the Worker -- so a store built on one cannot redirect anybody
+  anywhere, and declares `:proxied-transfer`. That is not this adapter being
+  conservative; it is the only true statement available, and the profile
+  exists so the caller learns it at open time rather than on the first
+  large upload.
+
+  Same discipline as the ref profile next door, and for the same reason: the
+  failure mode of guessing is silent.
+
+  ## A PUT grant without a size is refused
+
+  `-presign-put` requires `:size-bytes` and rejects without it. `content-length`
+  is signed, so the grant only accepts a body of exactly that length --
+  otherwise whoever holds the URL may store any number of bytes under a CID
+  whose digest they never had to know.
+
+  Refusing the sizeless call is the half that matters. Binding the size only
+  when one is offered still leaves the blank cheque available to every caller
+  that omits it, which is the caller streaming an object of unknown length --
+  i.e. exactly the large ones this plane is for."
+  (:require [kotoba.lang.text :as str]
+            [kotobase.storage.object :as object]
+            [sigv4.crypto :as crypto]
+            [sigv4.request :as sigv4]))
+
+(defn- object-key [prefix cid] (str prefix "objects/" cid))
+
+(defn- signed-header-list
+  "SigV4's `:signed-headers` is the canonical `\"content-length;host\"` STRING
+  -- that is the form `X-Amz-SignedHeaders` takes on the wire.
+
+  `object/bound-put-grant?` asks `(contains? (set signed-headers) ...)`, and
+  a set built from that string is a set of CHARACTERS: it contains \"c\" and
+  \"-\" and never \"content-length\". Passing the string straight through
+  therefore reports every grant as unbound -- which is the safe direction to
+  be wrong in, but it is still wrong, and the opposite mistake (reporting a
+  header we listed but did not sign) is the one that costs money. The
+  contract caught this on the first run."
+  [signed-headers]
+  (cond
+    (string? signed-headers) (vec (remove str/blank? (str/split signed-headers #";")))
+    (sequential? signed-headers) (vec signed-headers)
+    :else []))
+
+(defn- expires-at
+  "Absolute expiry for a grant. The contract wants a moment, SigV4 signs a
+  duration; a caller holding `{:expires-in 3600}` cannot tell whether the
+  clock started when the grant was minted or when it was received."
+  [now seconds]
+  (.toISOString (js/Date. (+ (.getTime now) (* 1000 seconds)))))
+
+(def ^:private default-expires-seconds 900)
+
+;; ── presigned ───────────────────────────────────────────────────────────────
+
+(defrecord PresignedObjects [client prefix delete?]
+  object/IObjectStore
+  (-stat-object [_ cid]
+    (object/assert-object-cid! cid)
+    ((:head-object client) {:key (object-key prefix cid)}))
+  (-delete-object! [_ cid]
+    (object/assert-object-cid! cid)
+    (if delete?
+      ((:delete-object! client) {:key (object-key prefix cid)})
+      ;; The bytes are still readable, and `git annex drop --from` decides
+      ;; from this answer. A tombstone that reports success turns drop into
+      ;; a lie about custody.
+      (js/Promise.resolve {:deleted? false :reason :not-supported})))
+
+  object/IPresignedTransfer
+  (-presign-put [_ cid {:keys [size-bytes expires-seconds]}]
+    (object/assert-object-cid! cid)
+    (if-not (and (number? size-bytes) (>= size-bytes 0))
+      (js/Promise.reject
+       (ex-info "a large-object PUT grant requires :size-bytes"
+                {:type :kotobase.storage/unbounded-put-grant :cid cid}))
+      (let [seconds (or expires-seconds default-expires-seconds)
+            now (js/Date.)]
+        (-> ((:presign client)
+             {:method :put
+              :key (object-key prefix cid)
+              :headers {"content-length" (str size-bytes)}
+              :expires-seconds seconds})
+            (.then (fn [{:keys [url headers signed-headers]}]
+                     (object/grant {:href url
+                                    :method :put
+                                    :headers headers
+                                    :signed-headers (signed-header-list signed-headers)
+                                    :expires-at (expires-at now seconds)})))))))
+  (-presign-get [_ cid {:keys [expires-seconds]}]
+    (object/assert-object-cid! cid)
+    (let [seconds (or expires-seconds default-expires-seconds)
+          now (js/Date.)]
+      (-> ((:presign client)
+           {:method :get :key (object-key prefix cid) :expires-seconds seconds})
+          (.then (fn [{:keys [url headers signed-headers]}]
+                   (object/grant {:href url
+                                  :method :get
+                                  :headers headers
+                                  :signed-headers (signed-header-list signed-headers)
+                                  :expires-at (expires-at now seconds)}))))))
+
+
+  object/IRangeRead
+  (-get-object-range [_ cid start end]
+    (object/assert-object-cid! cid)
+    (if-not (:get-object-range client)
+      ;; A client that cannot range is not a store that ranges. Saying so
+      ;; here keeps `-object-capabilities` honest below.
+      (js/Promise.reject
+       (ex-info "this S3 client has no :get-object-range"
+                {:type :kotobase.storage/range-read-unavailable}))
+      (-> ((:get-object-range client) {:key (object-key prefix cid)
+                                       :start start :end end})
+          (.then (fn [stored] (:body stored))))))
+
+  object/IObjectCapabilities
+  (-object-capabilities [_]
+    ;; `:range-grant` is the claim this store could always make: the URL it
+    ;; hands out honours `Range`, and the caller fetches it directly. It used
+    ;; to be spelled `:range-read`, which since 2026-08-16 means something
+    ;; narrower and checkable -- that this store returns the bytes itself.
+    ;; Both are true here when the client can range, and only the second has
+    ;; a protocol behind it.
+    (cond-> #{:large-objects :presigned-transfer :range-grant}
+      (:get-object-range client) (conj :range-read)
+      delete? (conj :object-delete))))
+
+;; ── proxied ─────────────────────────────────────────────────────────────────
+
+(defrecord ProxiedObjects [client prefix delete?]
+  object/IObjectStore
+  (-stat-object [_ cid]
+    (object/assert-object-cid! cid)
+    ((:head-object client) {:key (object-key prefix cid)}))
+  (-delete-object! [_ cid]
+    (object/assert-object-cid! cid)
+    (if delete?
+      ((:delete-object! client) {:key (object-key prefix cid)})
+      (js/Promise.resolve {:deleted? false :reason :not-supported})))
+
+  object/IProxiedTransfer
+  (-put-object! [_ cid bytes]
+    (object/assert-object-cid! cid)
+    (-> ((:put-object! client) {:key (object-key prefix cid) :body bytes})
+        (.then (fn [_] {:size-bytes (.-length bytes)}))))
+  (-get-object [_ cid]
+    (object/assert-object-cid! cid)
+    (-> ((:get-object client) {:key (object-key prefix cid)})
+        (.then (fn [stored] (:body stored)))))
+
+
+  object/IRangeRead
+  (-get-object-range [_ cid start end]
+    (object/assert-object-cid! cid)
+    (if-not (:get-object-range client)
+      ;; A client that cannot range is not a store that ranges. Saying so
+      ;; here keeps `-object-capabilities` honest below.
+      (js/Promise.reject
+       (ex-info "this S3 client has no :get-object-range"
+                {:type :kotobase.storage/range-read-unavailable}))
+      (-> ((:get-object-range client) {:key (object-key prefix cid)
+                                       :start start :end end})
+          (.then (fn [stored] (:body stored))))))
+
+  object/IObjectCapabilities
+  (-object-capabilities [_]
+    ;; No credentials, so no grant to make a claim about -- but an R2
+    ;; binding ranges natively, which is the claim a packed block store
+    ;; needs. This is the deployment the pack plane was designed for: the
+    ;; Worker holds the binding and reads KiB out of a pack.
+    (cond-> #{:large-objects :proxied-transfer}
+      (:get-object-range client) (conj :range-read)
+      delete? (conj :object-delete))))
+
+;; ── open ────────────────────────────────────────────────────────────────────
+
+(defn- clean-prefix [prefix]
+  (let [value (or prefix "kotobase")]
+    (str (.replace value #"^/+|/+$" "") "/")))
+
+(defn open-objects
+  "Build the large-object store for `client`.
+
+  The profile follows the client: one that can `:presign` gets
+  `:presigned-transfer`, one that cannot gets `:proxied-transfer`. Pass
+  `:require-presigned? true` where proxying is not acceptable -- on a path
+  that must carry GB objects, silently degrading to a proxied store means
+  discovering the Worker's memory limit in production instead of at open.
+
+  `:delete? false` for an endpoint or a bucket policy that does not permit
+  DELETE; the store then reports `:not-supported` rather than a tombstone."
+  [{:keys [client prefix delete? require-presigned?]
+    :or {delete? true}}]
+  (let [prefix (clean-prefix prefix)
+        presigns? (fn? (:presign client))]
+    (when (and require-presigned? (not presigns?))
+      (throw (ex-info
+              (str "large-object store requires presigned transfer, but this "
+                   "client cannot sign URLs -- an R2 binding has no "
+                   "credentials, so bytes would travel through this process")
+              {:type :kotobase.storage/presigned-transfer-unavailable})))
+    (object/validate-object-store!
+     (if presigns?
+       (->PresignedObjects client prefix delete?)
+       (->ProxiedObjects client prefix delete?)))))
+
+;; ── the presign half of a signed client ─────────────────────────────────────
+
+(defn presigner
+  "A `:presign` function for `kotobase.storage.s3/signed-client`'s config.
+
+  Separate from `signed-client` so the credentials travel exactly as far as
+  they already do, and so a deployment can decline to add it -- a client
+  without `:presign` yields a proxied store, which is a smaller capability
+  rather than a broken one.
+
+  `sigv4.request/presigned-request` rather than this repo's own
+  `s3-sigv4/signed-request`: it already signs arbitrary headers, and the
+  content-length binding this plane depends on IS that feature. A second
+  presigner here would be a second place to get the canonical request
+  wrong, and the symptom of getting it wrong is a 403 with no local
+  reproduction."
+  [{:keys [endpoint bucket region access-key secret-key]}]
+  (let [c (crypto/crypto)]
+    (fn [{:keys [method key headers expires-seconds]}]
+      (sigv4/presigned-request
+       c {:endpoint endpoint :bucket bucket :region region
+          :access-key access-key :secret-key secret-key
+          :method method :key key :headers headers
+          :expires-seconds expires-seconds}))))

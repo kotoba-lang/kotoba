@@ -1,0 +1,249 @@
+(ns kotobase.storage.pack-recovery-test
+  "The recovery drill: what this plane does when the object store is wrong.
+
+  Everything else in the suite measures a store that works. This namespace
+  breaks it in the four ways superproject ADR-2608170400 P4-2 names — a pack
+  that is gone, an index that will not parse, an object that ends early, and
+  a range response that is not the range asked for — and pins what the store
+  says about each.
+
+  Measured on 2026-08-17 before any of it existed, all four were quiet or
+  misdirected:
+
+  | broken thing | what it did |
+  |---|---|
+  | middle pack deleted | returned the tip pack's 3 entries — same value as a healthy 1-pack store |
+  | tip pack deleted | returned `[]` — same value as a zero budget, and as an empty store |
+  | index corrupted | threw, discarding every pack already recovered, naming none of them |
+  | object truncated | omitted the frames it could not reach, with every counter healthy |
+  | store ignores Range | threw `car: unsupported CID version {:version 13217}` — blaming the pack for the store's bug |
+
+  The first two are the shape this whole plane keeps finding: a thing that
+  could not be measured returning the value of a thing that measured fine."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [ipld.car.bytes :as b]
+            [ipld.car.v2 :as v2]
+            [ipld.core :as ipld]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.object :as object]
+            [kotobase.storage.object-memory :as omem]
+            [kotobase.storage.pack :as pack]
+            [kotobase.storage.pack-plan :as plan]))
+
+(defn- leaf [i] (ipld/node->block {"kind" "leaf" "v" i}))
+
+(defn- packed-store
+  "A store holding `commits` commits of `per` blocks each, one pack per
+  commit, plus the pieces a drill needs to break it."
+  [commits per]
+  (let [objects (omem/memory-object-store)
+        catalog (pack/memory-catalog)
+        store (pack/pack-block-store objects catalog)
+        blocks (mapv (fn [c] (mapv #(leaf (+ (* c 100) %)) (range per)))
+                     (range commits))]
+    (doseq [bs blocks] (storage/-put-blocks! store bs))
+    {:objects objects :catalog catalog :store store :commits blocks
+     :tip (pack/tip-pack store)}))
+
+(defn- pack-order
+  "Pack CIDs newest first, which is the order the chain walks."
+  [objects tip]
+  (vec (distinct (map :pack-cid (:entries (pack/bootstrap-report objects tip))))))
+
+(defn- clobber-tail
+  "The last `n` bytes replaced with 0x7f.
+
+  Written with slice/concat rather than `byte-array` + `aset-byte` because
+  this drill runs on nbb as well as the JVM, and a recovery path that is
+  only exercised on one of them is half a drill."
+  [bs n]
+  (let [len (b/bcount bs)]
+    (b/concat [(b/slice bs 0 (- len n)) (b/->bytes (repeat n 0x7f))])))
+
+;; ── a pack that is gone ─────────────────────────────────────────────────────
+
+(deftest a-hole-in-the-chain-is-not-a-catalog
+  (let [{:keys [objects tip]} (packed-store 3 3)
+        [_ middle _] (pack-order objects tip)]
+    (is (true? (:complete? (pack/bootstrap-report objects tip))))
+    (object/-delete-object! objects middle)
+    (let [report (pack/bootstrap-report objects tip)]
+      (testing "the walk says where it stopped instead of stopping quietly"
+        (is (= :missing-pack (:terminated report)))
+        (is (false? (:complete? report)))
+        (is (= middle (:stopped-at report)))
+        (is (= 1 (:packs report)))
+        (is (= 3 (count (:entries report)))
+            "the tip pack's entries — which is exactly what a healthy
+             one-pack store returns, and why :terminated has to exist"))
+      (testing "and the entries-only form refuses to pass it off as a catalog"
+        (is (thrown? #?(:clj Exception :cljs js/Error)
+                     (pack/bootstrap-catalog! objects tip)))
+        (let [data (try (pack/bootstrap-catalog! objects tip)
+                        (catch #?(:clj Throwable :cljs :default) t (ex-data t)))]
+          (is (= :kotobase.storage.pack/incomplete-chain (:type data)))
+          (is (= 3 (count (:entries data)))
+              "nothing is thrown away by refusing to return it"))))))
+
+(deftest three-empty-answers-that-used-to-be-one
+  (testing "`[]` was the value for a missing tip, a spent budget and an empty
+            store alike; the reason is what tells them apart"
+    (let [{:keys [objects tip]} (packed-store 2 2)]
+      (is (= :budget-exhausted (:terminated (pack/bootstrap-report objects tip 0))))
+      (is (= [] (:entries (pack/bootstrap-report objects tip 0))))
+      (is (= [] (pack/bootstrap-catalog! objects tip 0))
+          "a budget the caller set is the one incomplete walk that still
+           returns entries — only the caller knows if it meant to stop")
+      (object/-delete-object! objects tip)
+      (let [gone (pack/bootstrap-report objects tip)]
+        (is (= :missing-pack (:terminated gone)))
+        (is (= [] (:entries gone)))
+        (is (thrown? #?(:clj Exception :cljs js/Error)
+                     (pack/bootstrap-catalog! objects tip)))))
+    (let [empty-store (omem/memory-object-store)]
+      (is (= :chain-start (:terminated (pack/bootstrap-report empty-store nil)))
+          "no tip at all is a complete walk of an empty chain, not a failure")
+      (is (true? (:complete? (pack/bootstrap-report empty-store nil)))))))
+
+;; ── an index that will not parse ────────────────────────────────────────────
+
+(deftest an-unreadable-pack-keeps-what-was-already-recovered
+  (let [{:keys [objects tip commits]} (packed-store 3 3)
+        [_ _ oldest] (pack-order objects tip)
+        bytes (object/-get-object objects oldest)]
+    ;; the index sits at the tail; make it garbage
+    (object/-put-object! objects oldest (clobber-tail bytes 12))
+    (let [report (pack/bootstrap-report objects tip)]
+      (is (= :unreadable-pack (:terminated report)))
+      (is (= oldest (:stopped-at report)))
+      (is (= oldest (get-in report [:problem :pack-cid]))
+          "the operator is told which pack, which the bare throw never said")
+      (is (some? (get-in report [:problem :error])))
+      (is (= 6 (count (:entries report)))
+          "two readable packs survive the third being corrupt — the throw
+           this replaced discarded them")
+      (testing "and what survived is a catalog that actually serves blocks"
+        (let [fresh (pack/memory-catalog)
+              _ ((:record! fresh) (:entries report))
+              reader (pack/pack-block-store objects fresh)
+              wanted (mapv :cid (concat (nth commits 1) (nth commits 2)))
+              got (storage/-get-blocks reader wanted)]
+          (is (= 6 (count got)))
+          (is (= :served (:evidence (pack/stats reader)))))))))
+
+;; ── an object that ends early ───────────────────────────────────────────────
+
+(deftest a-truncated-pack-degrades-the-read-instead-of-passing-it
+  (let [{:keys [objects tip commits]} (packed-store 1 4)
+        entries (pack/bootstrap-catalog! objects tip)
+        bytes (object/-get-object objects tip)
+        ;; cut inside the data region, so located frames really are gone
+        keep-bytes (:file-offset (nth (sort-by :file-offset entries) 2))
+        truncated (omem/memory-object-store)]
+    (object/-put-object! truncated tip (b/slice bytes 0 keep-bytes))
+    (let [cat (pack/memory-catalog)
+          _ ((:record! cat) entries)
+          reader (pack/pack-block-store truncated cat)
+          got (storage/-get-blocks reader (mapv :cid (first commits)))
+          s (pack/stats reader)]
+      (is (= 2 (count got)) "the frames that survived the cut, and only those")
+      (is (= 2 (:frames-short s)) "the two that did not, counted")
+      (is (= :degraded (:evidence s))
+          "a read that returned half the blocks is not a half-success — the
+           request count is not a measurement of anything")
+      (is (= 2 (:blocks-served s))
+          "and the served count is still honest, which is why :evidence is
+           a separate reading rather than a smaller number"))))
+
+(deftest a-pack-the-store-does-not-have-is-counted-on-the-read-path
+  (let [{:keys [objects tip commits]} (packed-store 1 3)
+        entries (pack/bootstrap-catalog! objects tip)
+        empty-store (omem/memory-object-store)
+        cat (pack/memory-catalog)
+        _ ((:record! cat) entries)
+        reader (pack/pack-block-store empty-store cat)
+        got (storage/-get-blocks reader (mapv :cid (first commits)))
+        s (pack/stats reader)]
+    (is (= {} got))
+    (is (= 1 (:packs-missing s)))
+    (is (= :degraded (:evidence s))
+        "a catalog pointing at a pack nobody has used to read exactly like a
+         catalog that knew nothing: {:requests 1 :blocks-served 0}")))
+
+;; ── a range response that is not the range asked for ────────────────────────
+
+(defrecord IgnoresRange [inner]
+  object/IObjectStore
+  (-stat-object [_ cid] (object/-stat-object inner cid))
+  (-delete-object! [_ cid] (object/-delete-object! inner cid))
+  object/IProxiedTransfer
+  (-put-object! [_ cid bytes] (object/-put-object! inner cid bytes))
+  (-get-object [_ cid] (object/-get-object inner cid))
+  object/IRangeRead
+  ;; HTTP 200 where 206 was asked for: the whole object, every time. A real
+  ;; provider bug, and the one this plane is least able to survive silently.
+  (-get-object-range [_ cid _ _] (object/-get-object inner cid))
+  object/IObjectCapabilities
+  (-object-capabilities [_] (object/-object-capabilities inner)))
+
+(deftest a-store-that-ignores-range-is-named-as-the-store
+  (let [{:keys [objects tip]} (packed-store 1 4)
+        entries (pack/bootstrap-catalog! objects tip)
+        cat (pack/memory-catalog)
+        _ ((:record! cat) entries)
+        reader (pack/pack-block-store (->IgnoresRange objects) cat)
+        wanted (mapv :cid (sort-by :file-offset entries))
+        data (try (storage/-get-blocks reader [(last wanted)])
+                  (catch #?(:clj Throwable :cljs :default) t (ex-data t)))]
+    (is (= :kotobase.storage.pack/range-mismatch (:type data)))
+    (is (= :range-ignored (:mismatch data))
+        "the bytes are perfectly good; they are not the bytes asked for.
+         Before this check the failure surfaced as `car: unsupported CID
+         version {:version 13217}` — the pack blamed for the store's bug")
+    (testing "and it catches every frame, not most of them"
+      ;; Written first as "the first block still reads, because its run
+      ;; starts at 0" -- which the drill immediately falsified. A CARv2 data
+      ;; region begins at byte 51, after pragma and header, so NO frame ever
+      ;; sits at offset 0 and `start` is positive on every read of a pack.
+      ;; The detector is total here rather than probabilistic.
+      (doseq [cid wanted]
+        (is (thrown? #?(:clj Exception :cljs js/Error)
+                     (do (pack/drop-cache! reader)
+                         (storage/-get-blocks reader [cid]))))))))
+
+(deftest the-mismatch-check-answers-only-when-it-is-certain
+  (testing "a short response is not a mismatch — IRangeRead says a store
+            returns the overlap when the object ends first, and the
+            read-ahead window asks past the end of every pack"
+    (is (nil? (plan/window-mismatch 0 1048576 (b/->bytes (repeat 40 1)))))
+    (is (nil? (plan/window-mismatch 51 1000 (b/->bytes (repeat 40 1))))))
+  (testing "more bytes than the range is wide is arithmetic, not a guess"
+    (is (= :over-fetch (plan/window-mismatch 0 10 (b/->bytes (repeat 40 1))))))
+  (testing "and a pragma at a non-zero start is the object from byte 0"
+    (is (= :range-ignored
+           (plan/window-mismatch 51 100000 (b/concat [v2/pragma
+                                                      (b/->bytes (repeat 40 1))]))))
+    (is (nil? (plan/window-mismatch 0 100000 (b/concat [v2/pragma
+                                                        (b/->bytes (repeat 40 1))])))
+        "at start 0 it is simply the object, correctly")))
+
+;; ── the catalog disagreeing with the pack ───────────────────────────────────
+
+(deftest a-catalog-that-points-at-the-wrong-frame-fails-closed
+  (testing "the pack is fine and the catalog is wrong — which used to be
+            served as a missing block with every counter healthy"
+    (let [{:keys [objects tip]} (packed-store 1 4)
+          entries (vec (sort-by :file-offset (pack/bootstrap-catalog! objects tip)))
+          [a bee] [(first entries) (second entries)]
+          ;; a's CID, bee's location
+          wrong (assoc a :file-offset (:file-offset bee)
+                       :frame-length (:frame-length bee))
+          cat (pack/memory-catalog)
+          _ ((:record! cat) [wrong])
+          reader (pack/pack-block-store objects cat)
+          data (try (storage/-get-blocks reader [(:cid a)])
+                    (catch #?(:clj Throwable :cljs :default) t (ex-data t)))]
+      (is (= :kotobase.storage.pack/frame-misplaced (:type data)))
+      (is (= (:cid a) (:located data)))
+      (is (= (:cid bee) (:found data))))))

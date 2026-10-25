@@ -1,0 +1,137 @@
+(ns ipfs-kotobase-test
+  "Qualification for `kotobase.storage.ipfs-kotobase` -- the identity/location
+  split it exists for (root ADR-2608148200). Runs a real, ephemeral,
+  loopback-only HTTP double of the archive contract (raw-CID-keyed PUT/GET)
+  rather than stubbing `js/fetch`: nbb/SCI does not reliably let a script
+  reassign the global `fetch` binding an already-loaded namespace resolved
+  at load time, so a stub silently keeps calling the REAL network -- this
+  double avoids that class of false-green entirely, at the cost of a real
+  (loopback) socket.
+
+  The larger, full-pipeline check (`unixfs.file/build` -> this client ->
+  `unixfs.file/read-file`, byte-for-byte, over the same kind of double) is
+  `bin/large_put.cljk` pointed at `bin/mock_archive_server.cljk` (README).
+  This suite stays smaller and faster: it proves the client's OWN
+  identity/location bookkeeping, not the whole UnixFS round trip."
+  (:require [kotoba.lang.text :as str]
+            [kotobase.storage.ipfs-kotobase :as k]
+            [multiformats.core :as mf]
+            ["node:http" :as http]))
+
+(def ^:private failures (atom 0))
+
+(defn- expect [ok? message]
+  (if ok?
+    (println (str "ok  - " message))
+    (do (js/console.error (str "FAIL: " message)) (swap! failures inc))))
+
+(defn- start-double!
+  "A real HTTP server on loopback implementing the same raw-CID-keyed
+  PUT/GET shape the archive uses (no auth check -- this suite tests the
+  CLIENT, not the gate). Returns a Promise of {:base-url :calls :close!}."
+  []
+  (let [store (atom {})
+        calls (atom [])
+        server (http/createServer
+                (fn [req res]
+                  (let [cid (second (re-find #"^/ipfs/([^/?]+)" (.-url req)))
+                        method (.-method req)]
+                    (swap! calls conj {:url (.-url req) :method method})
+                    (cond
+                      (= method "PUT")
+                      (let [chunks (atom [])]
+                        (.on req "data" (fn [c] (swap! chunks conj c)))
+                        (.on req "end"
+                             (fn []
+                               (swap! store assoc cid (js/Buffer.concat (clj->js @chunks)))
+                               (.writeHead res 201) (.end res))))
+
+                      (contains? @store cid)
+                      (do (.writeHead res 200) (.end res (get @store cid)))
+
+                      :else
+                      (do (.writeHead res 404) (.end res))))))]
+    (js/Promise.
+     (fn [resolve _]
+       (.listen server 0
+                (fn []
+                  (let [port (.-port (.address server))]
+                    (resolve {:base-url (str "http://127.0.0.1:" port)
+                              :calls calls
+                              :close! (fn [] (.close server))}))))))))
+
+(defn- test-raw-block-put-uses-its-own-cid-as-location [{:keys [base-url calls close!]}]
+  (let [client (k/open {:base-url base-url :token "t"})
+        bytes (js/Uint8Array.from #js [1 2 3])
+        cid (mf/cidv1-raw bytes)]
+    (-> ((:put-block! client) cid bytes)
+        (.then (fn [stored]
+                 (expect (= cid stored) "a raw block's put-block! resolves to the SAME cid it was given")
+                 (expect (some #(str/ends-with? (:url %) cid) @calls)
+                         "a raw block is PUT directly under its own identity cid (no location translation)")
+                 (expect (empty? @(:location-index client))
+                         "a raw leaf adds nothing to the location index"))))))
+
+(defn- test-non-raw-block-put-translates-to-a-raw-location [{:keys [base-url calls]}]
+  (let [client (k/open {:base-url base-url :token "t"})
+        bytes (js/Uint8Array.from #js [9 9 9 9])
+        ;; A synthetic non-raw identity cid: what a dag-pb node's `:cid`
+        ;; looks like from `unixfs.file/build` -- NOT the raw cid of these
+        ;; bytes, which is the point of this test.
+        fake-dag-pb-cid "bafybeifakefakefakefakefakefakefakefakefakefakefakefake"
+        expected-location (mf/cidv1-raw bytes)]
+    (-> ((:put-block! client) fake-dag-pb-cid bytes)
+        (.then (fn [stored]
+                 (expect (= fake-dag-pb-cid stored)
+                         "a non-raw block's put-block! STILL resolves to the identity cid it was given -- the split is invisible to the caller")
+                 (expect (some #(str/ends-with? (:url %) expected-location) @calls)
+                         "a non-raw block is PUT under the RAW cid of its own bytes (the archive Location), not its identity cid")
+                 (expect (= expected-location (get @(:location-index client) fake-dag-pb-cid))
+                         "the identity->location mapping is recorded for a non-raw block")
+                 (expect (= expected-location ((:location-of client) fake-dag-pb-cid))
+                         "location-of resolves the identity cid to its recorded location"))))))
+
+(defn- test-get-block-resolves-through-the-location-index [{:keys [base-url]}]
+  (let [client (k/open {:base-url base-url :token "t"})
+        bytes (js/Uint8Array.from #js [7 7 7])
+        fake-dag-pb-cid "bafybeianotherfakefakefakefakefakefakefakefakefakefakefake"]
+    (-> ((:put-block! client) fake-dag-pb-cid bytes)
+        (.then (fn [_] ((:get-block client) fake-dag-pb-cid)))
+        (.then (fn [got]
+                 (expect (some? got)
+                         "get-block, asked for the identity cid, finds the block stored under its location cid")
+                 (expect (= (vec bytes) (vec got))
+                         "the fetched bytes are byte-identical to what was put"))))))
+
+(defn- test-a-cid-that-was-never-put-resolves-to-nil [{:keys [base-url]}]
+  (let [client (k/open {:base-url base-url :token "t"})]
+    (-> ((:get-block client) "bafkreineverput")
+        (.then (fn [got] (expect (nil? got) "get-block on an unknown cid returns nil, not an error"))))))
+
+(defn- test-location-of-defaults-to-identity []
+  (let [client (k/open {:base-url "http://127.0.0.1:1" :token "t"})]
+    (expect (= "bafkreisomecid" ((:location-of client) "bafkreisomecid"))
+            "location-of, given a cid never seen by put-block!, returns it unchanged (identity == location for raw)")))
+
+(defn -main [& _]
+  (-> (start-double!)
+      (.then
+       (fn [double]
+         (-> (js/Promise.all
+              #js [(test-raw-block-put-uses-its-own-cid-as-location double)
+                   (test-non-raw-block-put-translates-to-a-raw-location double)
+                   (test-get-block-resolves-through-the-location-index double)
+                   (test-a-cid-that-was-never-put-resolves-to-nil double)])
+             (.then (fn [_] ((:close! double)))))))
+      (.then
+       (fn [_]
+         (test-location-of-defaults-to-identity)
+         (if (zero? @failures)
+           (println "ipfs-kotobase-test: all green")
+           (println (str "ipfs-kotobase-test: " @failures " FAILURE(S) above")))
+         (.exit js/process (if (zero? @failures) 0 1))))
+      (.catch (fn [e]
+                (js/console.error (str "FAIL (uncaught): " (or (.-message e) (str e))))
+                (.exit js/process 1)))))
+
+(-main)

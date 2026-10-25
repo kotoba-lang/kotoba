@@ -1,0 +1,603 @@
+(ns num.autograd-test
+  "The correctness bar for autograd is NOT 'runs without error' — it's
+  'matches numerical (finite-difference) gradients', the standard technique
+  for catching sign errors / wrong Jacobians / off-by-one-axis bugs that a
+  merely-doesn't-throw test would miss entirely. Every weight/bias array of a
+  linear/relu/linear/softmax/mse-loss network (torch-clj's own README
+  architecture, plus a loss) gets its analytic gradient (num.autograd)
+  checked element-by-element against a central-difference numerical estimate."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [num.array :as arr]
+            [num.autograd :as ag]
+            [num.cpu :as cpu]))
+
+(def backend (cpu/cpu-backend))
+
+(defn- approx-vec-tol?
+  "Like num.contract/approx-vec?, but with a caller-given tolerance — finite-
+  difference gradients carry their own O(eps^2) truncation error, a looser
+  and different-in-KIND tolerance than num.contract's fixed 1e-5 (which
+  assumes exact-arithmetic backend-vs-backend agreement, not a numerical
+  derivative estimate)."
+  [u v tol]
+  (and (= (count u) (count v))
+       (every? true? (map (fn [a b] (< (Math/abs (- (double a) (double b))) tol)) u v))))
+
+(defn- forward-loss
+  "Pure forward pass through the SAME ops num.autograd's ops wrap (so a
+  discrepancy this test finds is about the BACKWARD formulas, not a
+  forward-computation mismatch), returning the scalar loss."
+  [xd w1d b1d w2d b2d targetd]
+  (let [[result _tape]
+        (ag/with-tape
+          (let [x (ag/value xd) w1 (ag/value w1d) b1 (ag/value b1d)
+                w2 (ag/value w2d) b2 (ag/value b2d)
+                h (ag/relu* (ag/add-bias* (ag/matmul* x w1) b1))
+                o (ag/softmax* (ag/add-bias* (ag/matmul* h w2) b2))]
+            (ag/mse-loss* o targetd)))]
+    (arr/->scalar (:data result))))
+
+(defn- numerical-grad
+  "Central-difference numerical gradient of `f` (a fn from one NDArray to a
+  scalar loss, with every other input closed over) w.r.t. `arrd`, element by
+  element. Independent of num.autograd's backward machinery entirely."
+  [f arrd eps]
+  (let [xs (vec (arr/->vec arrd)) shape (:shape arrd) be (:backend arrd) n (count xs)]
+    (arr/from-vec
+     be
+     (mapv (fn [i]
+             (let [plus (arr/from-vec be (assoc xs i (+ (nth xs i) eps)) shape)
+                   minus (arr/from-vec be (assoc xs i (- (nth xs i) eps)) shape)]
+               (/ (- (f plus) (f minus)) (* 2.0 eps))))
+           (range n))
+     shape)))
+
+(deftest sigmoid-and-tanh-gradients-match-finite-differences
+  (testing "smooth activation gradients match independent central differences"
+    (let [xd (arr/from-vec backend [-2.0 -0.4 0.0 0.7 2.0] [5])
+          target (arr/from-vec backend [0.1 -0.2 0.3 0.4 -0.1] [5])]
+      (doseq [[label activation]
+              [["sigmoid" ag/sigmoid*] ["tanh" ag/tanh*] ["gelu" ag/gelu*]]]
+        (let [loss-of (fn [input]
+                        (let [[loss _]
+                              (ag/with-tape
+                                (ag/mse-loss* (activation (ag/value input)) target))]
+                          (arr/->scalar (:data loss))))
+              [result tape]
+              (ag/with-tape
+                (let [x (ag/value xd)
+                      loss (ag/mse-loss* (activation x) target)]
+                  {:x x :loss loss}))
+              _ (ag/backward! (:loss result)
+                              (arr/from-vec backend [1.0] []) tape)
+              numeric (numerical-grad loss-of xd 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (:x result)))
+                               (arr/->vec numeric) 1.0e-4)
+              label))))))
+
+(deftest linear-relu-linear-softmax-mse-gradients-match-finite-differences
+  (testing "every weight/bias array's analytic gradient matches a central-
+            difference numerical estimate to ~1e-3 (finite-difference's own
+            truncation error, not a correctness bug, sets this tolerance —
+            tighter than num.contract's usual 1e-5 which assumes exact
+            arithmetic, not a numerical derivative estimate)"
+    (let [in 3 hidden 4 out 2 batch 2
+          xd  (arr/from-vec backend (mapv #(* 0.1 (inc %)) (range (* batch in))) [batch in])
+          w1d (arr/from-vec backend (mapv #(- (* 0.05 %) 0.3) (range (* in hidden))) [in hidden])
+          b1d (arr/from-vec backend (mapv #(- (* 0.02 %) 0.05) (range hidden)) [hidden])
+          w2d (arr/from-vec backend (mapv #(- (* 0.03 %) 0.15) (range (* hidden out))) [hidden out])
+          b2d (arr/from-vec backend [0.1 -0.1] [out])
+          targetd (arr/from-vec backend [1 0 0 1] [batch out])
+
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) w1 (ag/value w1d) b1 (ag/value b1d)
+                  w2 (ag/value w2d) b2 (ag/value b2d)
+                  h (ag/relu* (ag/add-bias* (ag/matmul* x w1) b1))
+                  o (ag/softmax* (ag/add-bias* (ag/matmul* h w2) b2))
+                  loss (ag/mse-loss* o targetd)]
+              {:loss loss :w1 w1 :b1 b1 :w2 w2 :b2 b2}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+
+      (doseq [[label key data]
+              [["w1" :w1 w1d] ["b1" :b1 b1d] ["w2" :w2 w2d] ["b2" :b2 b2d]]]
+        (testing (str label " gradient")
+          (let [analytic (arr/->vec @(:grad (get result key)))
+                numeric (arr/->vec
+                         (numerical-grad
+                          (fn [perturbed]
+                            (forward-loss xd
+                                          (if (= key :w1) perturbed w1d)
+                                          (if (= key :b1) perturbed b1d)
+                                          (if (= key :w2) perturbed w2d)
+                                          (if (= key :b2) perturbed b2d)
+                                          targetd))
+                          data 1.0e-4))]
+            (is (approx-vec-tol? analytic numeric 1.0e-3)
+                (str label " analytic=" analytic " numeric=" numeric))))))))
+
+(deftest gradient-descent-actually-reduces-loss
+  (testing "not just 'gradients are individually correct' but 'training
+            works': ten plain SGD steps (w -= lr*grad) on the same network,
+            re-deriving fresh gradients each step, must not increase the
+            loss overall — the real, practical proof this is usable for
+            training, not only a formula-correctness check"
+    (let [in 3 hidden 4 out 2 batch 2 lr 0.5
+          targetd (arr/from-vec backend [1 0 0 1] [batch out])
+          xd (arr/from-vec backend (mapv #(* 0.1 (inc %)) (range (* batch in))) [batch in])
+          step (fn [w1d b1d w2d b2d]
+                 (let [[result tape]
+                       (ag/with-tape
+                         (let [x (ag/value xd) w1 (ag/value w1d) b1 (ag/value b1d)
+                               w2 (ag/value w2d) b2 (ag/value b2d)
+                               h (ag/relu* (ag/add-bias* (ag/matmul* x w1) b1))
+                               o (ag/softmax* (ag/add-bias* (ag/matmul* h w2) b2))
+                               loss (ag/mse-loss* o targetd)]
+                           {:loss loss :w1 w1 :b1 b1 :w2 w2 :b2 b2}))]
+                   (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+                   (let [descend (fn [param-data grad-value]
+                                    (arr/from-vec backend
+                                                  (map (fn [p g] (- p (* lr g)))
+                                                       (arr/->vec param-data)
+                                                       (arr/->vec @(:grad grad-value)))
+                                                  (:shape param-data)))]
+                     {:loss (arr/->scalar (:data (:loss result)))
+                      :w1 (descend w1d (:w1 result)) :b1 (descend b1d (:b1 result))
+                      :w2 (descend w2d (:w2 result)) :b2 (descend b2d (:b2 result))})))]
+      (loop [n 10
+             w1d (arr/from-vec backend (mapv #(- (* 0.05 %) 0.3) (range (* in hidden))) [in hidden])
+             b1d (arr/from-vec backend (mapv #(- (* 0.02 %) 0.05) (range hidden)) [hidden])
+             w2d (arr/from-vec backend (mapv #(- (* 0.03 %) 0.15) (range (* hidden out))) [hidden out])
+             b2d (arr/from-vec backend [0.1 -0.1] [out])
+             losses []]
+        (if (zero? n)
+          (do
+            (is (> (count losses) 1))
+            (is (< (last losses) (first losses))
+                (str "losses: " losses)))
+          (let [{:keys [loss w1 b1 w2 b2]} (step w1d b1d w2d b2d)]
+            (recur (dec n) w1 b1 w2 b2 (conj losses loss))))))))
+
+(deftest conv2d-gradients-match-finite-differences
+  (testing "conv2d*'s im2col*/col2im backward (the one genuinely new formula
+            — matmul*/reshape* are already verified elsewhere), checked
+            against finite differences for BOTH the kernel and the INPUT.
+            Checking dL/dx specifically exercises col2im's overlapping-
+            window scatter-add (kh=kw=2 on a 4x4 input means every interior
+            input pixel contributes to more than one output position) —
+            a bug there would not show up if only dL/dkernel were checked.
+            All values kept strictly positive (x, kernel, and therefore the
+            conv output) to stay clear of relu's non-differentiable kink at
+            0, which would make the numerical estimate unstable/misleading,
+            not the analytic gradient wrong."
+    (let [H 4 W 4 kh 2 kw 2
+          xd (arr/from-vec backend (mapv #(* 0.1 (inc %)) (range (* H W))) [H W])
+          kd (arr/from-vec backend [0.1 0.2 0.3 0.4] [kh kw])
+          targetd (arr/from-vec backend (repeat 9 0.3) [3 3]) ; oh=ow=3 for 4x4 in, 2x2 kernel
+
+          loss-of (fn [xd' kd']
+                    (let [[result _tape]
+                          (ag/with-tape
+                            (let [x (ag/value xd') k (ag/value kd')]
+                              (ag/mse-loss* (ag/relu* (ag/conv2d* x k)) targetd)))]
+                      (arr/->scalar (:data result))))
+
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) k (ag/value kd)
+                  loss (ag/mse-loss* (ag/relu* (ag/conv2d* x k)) targetd)]
+              {:loss loss :x x :k k}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+
+      (doseq [[label key data] [["kernel" :k kd] ["input" :x xd]]]
+        (testing (str label " gradient")
+          (let [analytic (arr/->vec @(:grad (get result key)))
+                numeric (arr/->vec
+                         (numerical-grad
+                          (fn [perturbed]
+                            (if (= key :k) (loss-of xd perturbed) (loss-of perturbed kd)))
+                          data 1.0e-4))]
+            (is (approx-vec-tol? analytic numeric 1.0e-3)
+                (str label " analytic=" analytic " numeric=" numeric))))))))
+
+(deftest attention-self-attention-gradient-matches-finite-differences
+  (testing "attention*'s transpose*/scale* backward (matmul*/softmax* are
+            already verified elsewhere), checked in the SELF-attention
+            configuration torch.num-backend's :attention layer actually
+            uses — Q=K=V=the SAME Value. This specifically exercises that
+            with-tape/backward!'s gradient accumulation correctly SUMS the
+            three separate contributions (from x's role as Q, as K via
+            transpose*, and as V) into one shared :grad atom, not just that
+            each formula is right in isolation."
+    (let [seq 3 d 2
+          xd (arr/from-vec backend [0.2 -0.1 0.3 0.4 -0.2 0.1] [seq d])
+          targetd (arr/from-vec backend (repeat (* seq d) 0.0) [seq d])
+
+          loss-of (fn [xd']
+                    (let [[result _tape]
+                          (ag/with-tape
+                            (let [x (ag/value xd')]
+                              (ag/mse-loss* (ag/attention* x x x) targetd)))]
+                      (arr/->scalar (:data result))))
+
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd)
+                  loss (ag/mse-loss* (ag/attention* x x x) targetd)]
+              {:loss loss :x x}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [analytic (arr/->vec @(:grad (:x result)))
+            numeric (arr/->vec (numerical-grad loss-of xd 1.0e-4))]
+        (is (approx-vec-tol? analytic numeric 1.0e-3)
+            (str "x analytic=" analytic " numeric=" numeric))))))
+
+(deftest multi-head-attention-gradient-matches-finite-differences
+  (testing "two-head self-attention differentiates through rank-3 batched
+            matmul and inverse axis permutations"
+    (let [xd (arr/from-vec backend
+                           [0.2 -0.1 0.3 0.4
+                            -0.2 0.1 0.5 -0.3
+                            0.6 0.2 -0.4 0.1]
+                           [3 4])
+          target (arr/from-vec backend (repeat 12 0.0) [3 4])
+          loss-of (fn [xd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (let [x (ag/value xd')]
+                              (ag/mse-loss*
+                               (ag/multi-head-attention* x x x 2) target)))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd)
+                  prediction (ag/multi-head-attention* x x x 2)
+                  loss (ag/mse-loss* prediction target)]
+              {:loss loss :prediction prediction :x x}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [analytic @(:grad (:x result))
+            numeric (numerical-grad loss-of xd 1.0e-5)]
+        (is (= [3 4] (:shape (:data (:prediction result)))))
+        (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+            (str "analytic=" (arr/->vec analytic)
+                 " numeric=" (arr/->vec numeric)))))))
+
+(deftest grouped-query-attention-gradients-match-finite-differences
+  (let [qd (arr/from-vec backend [0.2 -0.1 0.3 0.4,
+                                  -0.2 0.1 0.5 -0.3] [2 4])
+        kd (arr/from-vec backend [0.3 -0.4, 0.2 0.6] [2 2])
+        vd (arr/from-vec backend [0.7 -0.2, -0.1 0.5] [2 2])
+        target (arr/from-vec backend (repeat 8 0.0) [2 4])
+        opts {:kv-heads 1}
+        loss-of (fn [q k v]
+                  (let [[loss _]
+                        (ag/with-tape
+                          (ag/mse-loss*
+                           (ag/multi-head-attention* (ag/value q) (ag/value k)
+                                                     (ag/value v) 2 opts)
+                           target))]
+                    (arr/->scalar (:data loss))))
+        [result tape]
+        (ag/with-tape
+          (let [q (ag/value qd) k (ag/value kd) v (ag/value vd)
+                prediction (ag/multi-head-attention* q k v 2 opts)
+                loss (ag/mse-loss* prediction target)]
+            {:q q :k k :v v :loss loss}))]
+    (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+    (doseq [[label value numeric]
+            [[:query (:q result) (numerical-grad #(loss-of % kd vd) qd 1.0e-5)]
+             [:key (:k result) (numerical-grad #(loss-of qd % vd) kd 1.0e-5)]
+             [:value (:v result) (numerical-grad #(loss-of qd kd %) vd 1.0e-5)]]]
+      (is (approx-vec-tol? (arr/->vec @(:grad value)) (arr/->vec numeric) 2.0e-4)
+          (str label " analytic=" (arr/->vec @(:grad value))
+               " numeric=" (arr/->vec numeric))))))
+
+(deftest batched-masked-attention-gradient-matches-finite-differences
+  (let [xd (arr/from-vec backend
+                         [0.2 -0.1, 0.3 0.4,
+                          -0.2 0.1, 0.5 -0.3] [2 2 2])
+        target (arr/from-vec backend (repeat 8 0.0) [2 2 2])
+        padding (arr/from-vec backend [0 1, 0 0] [2 2])
+        opts {:causal? true :key-padding-mask padding}
+        loss-of (fn [xd']
+                  (let [[loss _]
+                        (ag/with-tape
+                          (let [x (ag/value xd')]
+                            (ag/mse-loss*
+                             (ag/multi-head-attention* x x x 1 opts) target)))]
+                    (arr/->scalar (:data loss))))
+        [result tape]
+        (ag/with-tape
+          (let [x (ag/value xd)
+                prediction (ag/multi-head-attention* x x x 1 opts)
+                loss (ag/mse-loss* prediction target)]
+            {:loss loss :prediction prediction :x x}))]
+    (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+    (let [analytic @(:grad (:x result))
+          numeric (numerical-grad loss-of xd 1.0e-5)]
+      (is (= [2 2 2] (:shape (:data (:prediction result)))))
+      (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 2.0e-4)
+          (str "analytic=" (arr/->vec analytic)
+               " numeric=" (arr/->vec numeric))))))
+
+(deftest conv2d-nchw-gradients-match-finite-differences
+  (testing "batched/channel-aware convolution differentiates input, grouped
+            weights, and bias under padding+stride, not only valid 2-D toys"
+    (let [xd (arr/from-vec backend (mapv #(* 0.07 (inc %)) (range 18)) [1 2 3 3])
+          wd (arr/from-vec backend [0.2 -0.1 0.3 0.4 -0.2 0.5 0.1 -0.3]
+                           [2 1 2 2])
+          bd (arr/from-vec backend [0.05 -0.08] [2])
+          target (arr/from-vec backend [0.2 0.1 -0.1 0.3 0.4 -0.2 0.15 0.05]
+                               [1 2 2 2])
+          opts {:padding 1 :stride 2 :groups 2}
+          loss-of
+          (fn [xd' wd' bd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (ag/mse-loss*
+                     (ag/conv2d-nchw* (ag/value xd') (ag/value wd') (ag/value bd') opts)
+                     target))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) weight (ag/value wd) bias (ag/value bd)
+                  loss (ag/mse-loss* (ag/conv2d-nchw* x weight bias opts) target)]
+              {:loss loss :x x :weight weight :bias bias}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd] ["bias" :bias bd]]]
+        (let [numeric
+              (numerical-grad
+               (fn [perturbed]
+                 (loss-of (if (= key :x) perturbed xd)
+                          (if (= key :weight) perturbed wd)
+                          (if (= key :bias) perturbed bd)))
+               data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))
+
+(deftest differentiable-cast-restores-input-gradient-dtype
+  (let [input-data (arr/from-vec backend [0.25 -0.5 1.0] [3] :f16)
+        [result tape]
+        (ag/with-tape
+          (let [input (ag/value input-data)
+                output (ag/cast* input :f32)]
+            {:input input :output output}))
+        seed (arr/from-vec backend [1.0 2.0 3.0] [3])]
+    (ag/backward! (:output result) seed tape)
+    (is (= :f32 (:dtype (:data (:output result)))))
+    (is (= :f16 (:dtype @(:grad (:input result)))))
+    (is (= [1.0 2.0 3.0] (arr/->vec @(:grad (:input result)))))))
+
+(deftest groupnorm-silu-gradients-match-finite-differences
+  (testing "UNet normalization+activation differentiates NCHW input and both
+            affine parameters, including GroupNorm's coupled group reduction"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1 -0.3 0.8 1.4 -0.9]
+                           [1 4 2 1])
+          wd (arr/from-vec backend [0.8 1.1 -0.7 1.3] [4])
+          bd (arr/from-vec backend [0.1 -0.2 0.05 0.3] [4])
+          target (arr/from-vec backend [0.0 0.2 -0.1 0.5 0.4 -0.3 0.8 0.1]
+                               [1 4 2 1])
+          loss-of
+          (fn [xd' wd' bd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (ag/mse-loss*
+                     (ag/silu*
+                      (ag/group-norm-nchw* (ag/value xd') 2
+                                           (ag/value wd') (ag/value bd') 1.0e-5))
+                     target))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) weight (ag/value wd) bias (ag/value bd)
+                  normalized (ag/group-norm-nchw* x 2 weight bias 1.0e-5)
+                  loss (ag/mse-loss* (ag/silu* normalized) target)]
+              {:loss loss :x x :weight weight :bias bias}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd] ["bias" :bias bd]]]
+        (let [numeric
+              (numerical-grad
+               (fn [perturbed]
+                 (loss-of (if (= key :x) perturbed xd)
+                          (if (= key :weight) perturbed wd)
+                          (if (= key :bias) perturbed bd)))
+               data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))
+
+(deftest layernorm-gradients-match-finite-differences
+  (testing "rank-3 final-axis LayerNorm differentiates input, gamma, and beta"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7, 1.1 -0.3 0.8,
+                                    1.4 -0.9 0.1, 0.5 -0.2 0.6] [2 2 3])
+          wd (arr/from-vec backend [0.8 1.1 -0.7] [3])
+          bd (arr/from-vec backend [0.1 -0.2 0.05] [3])
+          target (arr/from-vec backend (repeat 12 0.15) [2 2 3])
+          loss-of (fn [xd' wd' bd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss*
+                             (ag/layer-norm-last* (ag/value xd')
+                                                  (ag/value wd') (ag/value bd') 1.0e-5)
+                             target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) w (ag/value wd) b (ag/value bd)
+                  loss (ag/mse-loss* (ag/layer-norm-last* x w b 1.0e-5) target)]
+              {:loss loss :x x :weight w :bias b}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd] ["bias" :bias bd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :weight) perturbed wd)
+                                  (if (= key :bias) perturbed bd)))
+                       data 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (get result key)))
+                               (arr/->vec numeric) 1.0e-4)
+              label))))))
+
+(deftest embedding-weight-gradient-matches-finite-differences
+  (testing "embedding scatter-add accumulates repeated token rows"
+    (let [indices (arr/from-vec backend [2 0 2 1] [4])
+          wd (arr/from-vec backend
+                           [0.1 0.2 0.3, -0.2 0.4 0.5,
+                            0.7 -0.1 0.6, 0.0 0.2 -0.3] [4 3])
+          target (arr/from-vec backend (repeat 12 0.15) [4 3])
+          loss-of (fn [weight]
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss* (ag/embedding* indices (ag/value weight))
+                                          target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [weight (ag/value wd)
+                  loss (ag/mse-loss* (ag/embedding* indices weight) target)]
+              {:loss loss :weight weight}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [numeric (numerical-grad loss-of wd 1.0e-5)]
+        (is (approx-vec-tol? (arr/->vec @(:grad (:weight result)))
+                             (arr/->vec numeric) 1.0e-4))))))
+
+(deftest rmsnorm-gradients-match-finite-differences
+  (testing "RMSNorm differentiates rank-3 inputs and its scale vector"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1, -0.3 0.8 1.4 -0.9]
+                           [1 2 4])
+          wd (arr/from-vec backend [0.8 1.1 -0.7 1.3] [4])
+          target (arr/from-vec backend (repeat 8 0.15) [1 2 4])
+          loss-of (fn [xd' wd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss*
+                             (ag/rms-norm-last* (ag/value xd') (ag/value wd') 1.0e-5)
+                             target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) w (ag/value wd)
+                  loss (ag/mse-loss* (ag/rms-norm-last* x w 1.0e-5) target)]
+              {:loss loss :x x :weight w}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["weight" :weight wd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :weight) perturbed wd)))
+                       data 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (get result key)))
+                               (arr/->vec numeric) 1.0e-4)
+              label))))))
+
+(deftest rotary-embedding-gradient-matches-finite-differences
+  (testing "batched two-head RoPE VJP is the inverse orthogonal rotation"
+    (let [xd (arr/from-vec backend
+                           [0.2 -0.4 0.7 1.1, -0.3 0.8 1.4 -0.9,
+                            0.1 0.5 -0.2 0.6, 0.9 -0.7 0.3 -0.1]
+                           [2 2 4])
+          target (arr/from-vec backend (repeat 16 0.15) [2 2 4])
+          opts {:theta 10000.0 :position-offset 3}
+          loss-of (fn [input]
+                    (let [[loss _]
+                          (ag/with-tape
+                            (ag/mse-loss*
+                             (ag/rotary-embedding* (ag/value input) 2 opts) target))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd)
+                  loss (ag/mse-loss* (ag/rotary-embedding* x 2 opts) target)]
+              {:loss loss :x x}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (let [numeric (numerical-grad loss-of xd 1.0e-5)]
+        (is (approx-vec-tol? (arr/->vec @(:grad (:x result)))
+                             (arr/->vec numeric) 1.0e-4))))))
+
+(deftest branched-residual-product-gradients-match-finite-differences
+  (testing "a value reused by residual and gated-product branches accumulates both VJPs"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1] [2 2])
+          yd (arr/from-vec backend [0.8 1.1 -0.7 1.3] [2 2])
+          target (arr/from-vec backend [0.1 -0.2 0.3 0.4] [2 2])
+          loss-of (fn [xd' yd']
+                    (let [[loss _]
+                          (ag/with-tape
+                            (let [x (ag/value xd') y (ag/value yd')]
+                              (ag/mse-loss* (ag/add* x (ag/mul* x y)) target)))]
+                      (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) y (ag/value yd)
+                  loss (ag/mse-loss* (ag/add* x (ag/mul* x y)) target)]
+              {:loss loss :x x :y y}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[key data other]
+              [[:x xd yd] [:y yd xd]]]
+        (let [numeric (numerical-grad
+                       #(if (= key :x) (loss-of % other) (loss-of other %))
+                       data 1.0e-5)]
+          (is (approx-vec-tol? (arr/->vec @(:grad (get result key)))
+                               (arr/->vec numeric) 1.0e-4)))))))
+
+(deftest upsample-cat-skip-gradients-match-finite-differences
+  (testing "a branched UNet-style upsample + channel skip concatenation graph
+            propagates gradients into both source tensors"
+    (let [xd (arr/from-vec backend [0.2 -0.4 0.7 1.1] [1 1 2 2])
+          skipd (arr/from-vec backend [-0.3 0.8 1.4 -0.9 0.1 0.5 -0.2 0.6]
+                              [1 2 2 2])
+          target (arr/from-vec backend (repeat 48 0.15) [1 3 4 4])
+          loss-of
+          (fn [xd' skipd']
+            (let [[loss _]
+                  (ag/with-tape
+                    (let [x (ag/value xd') skip (ag/value skipd')]
+                      (ag/mse-loss*
+                       (ag/silu*
+                        (ag/cat* [(ag/upsample-nearest2d* x 2)
+                                  (ag/upsample-nearest2d* skip 2)] 1))
+                       target)))]
+              (arr/->scalar (:data loss))))
+          [result tape]
+          (ag/with-tape
+            (let [x (ag/value xd) skip (ag/value skipd)
+                  merged (ag/cat* [(ag/upsample-nearest2d* x 2)
+                                   (ag/upsample-nearest2d* skip 2)] 1)
+                  loss (ag/mse-loss* (ag/silu* merged) target)]
+              {:loss loss :x x :skip skip}))]
+      (ag/backward! (:loss result) (arr/from-vec backend [1.0] []) tape)
+      (doseq [[label key data]
+              [["input" :x xd] ["skip" :skip skipd]]]
+        (let [numeric (numerical-grad
+                       (fn [perturbed]
+                         (loss-of (if (= key :x) perturbed xd)
+                                  (if (= key :skip) perturbed skipd)))
+                       data 1.0e-5)
+              analytic @(:grad (get result key))]
+          (is (approx-vec-tol? (arr/->vec analytic) (arr/->vec numeric) 1.0e-4)
+              (str label " analytic=" (arr/->vec analytic)
+                   " numeric=" (arr/->vec numeric))))))))
+
+(deftest stable-cross-entropy-supports-ignore-index-and-loss-scaling
+  (let [logit-data (arr/from-vec backend [1.0 2.0 3.0, 1.0 0.0 -1.0] [2 3])
+        labels (arr/from-vec backend [2 -100] [2])
+        [result tape]
+        (ag/with-tape
+          (let [logits (ag/value logit-data)
+                loss (ag/cross-entropy-loss* logits labels)]
+            {:logits logits :loss loss}))]
+    (ag/backward! (:loss result) (arr/from-vec backend [2.0] []) tape)
+    (let [denominator (+ (Math/exp -2.0) (Math/exp -1.0) 1.0)
+          expected-gradient [(/ (* 2.0 (Math/exp -2.0)) denominator)
+                             (/ (* 2.0 (Math/exp -1.0)) denominator)
+                             (* 2.0 (- (/ 1.0 denominator) 1.0))
+                             0.0 0.0 0.0]]
+      (is (< (Math/abs (- (arr/->scalar (:data (:loss result)))
+                          (Math/log denominator))) 1.0e-9))
+      (is (approx-vec-tol? expected-gradient
+                           (arr/->vec @(:grad (:logits result))) 1.0e-9)))))

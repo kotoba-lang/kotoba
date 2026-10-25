@@ -1,0 +1,162 @@
+(ns kotoba.clj-host.frame-test
+  "Cross-language contract test: decodes the exact bytes emitted by
+  `kami.ipc/pack` for the deterministic fixture scene (kami-engine-sdk-clj
+  `dev/gen_fixture.clj`) — a camera at z=+5 and two trees at x=+-2. These
+  are the same `.bin` fixtures the retired Rust crate's `#[cfg(test)]`
+  module asserted against (`frame.rs`), carried over byte-for-byte so this
+  namespace is proven byte-exact with the original decoder."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.clj-host.frame :as frame]
+            #?(:clj [clojure.java.io :as io])))
+
+#?(:clj
+   (defn- slurp-bytes ^bytes [resource-path]
+     (with-open [in (io/input-stream (io/resource resource-path))]
+       (let [out (java.io.ByteArrayOutputStream.)]
+         (io/copy in out)
+         (.toByteArray out)))))
+
+#?(:clj (def ^:private fixture (slurp-bytes "fixtures/frame.bin")))
+#?(:clj (def ^:private fixture-v2 (slurp-bytes "fixtures/frame_v2.bin")))
+
+#?(:clj
+   (defn- take-bytes ^bytes [^bytes bs n]
+     (java.util.Arrays/copyOfRange bs 0 (int n))))
+
+#?(:clj
+   (defn- with-byte ^bytes [^bytes bs idx v]
+     (let [copy (aclone bs)]
+       (aset-byte copy (int idx) (unchecked-byte v))
+       copy)))
+
+#?(:clj
+   (deftest decodes-clj-emitted-fixture
+     (let [{:keys [ok? value]} (frame/decode fixture)]
+       (is ok? "fixture decodes")
+       (is (= 42 (:frame-n value)) "frame_n round-trips from clj")
+       (is (= 2 (count (:columns value))) "camera column + 1 instanced draw column")
+
+       (testing "camera column = 2 mat4 (view, proj)"
+         (let [cam (first (:columns value))]
+           (is (= frame/dtype-mat4 (:dtype cam)))
+           (is (= 2 (:len cam)))
+           (let [[view proj] (frame/camera fixture value)]
+             ;; camera world translation is +5 on z -> view (its inverse) is -5 on z.
+             (is (== -5.0 (nth view 14)) "view matrix z-translation")
+             ;; perspective proj is right-handed wgpu (m[11] == -1, m[10] < 0).
+             (is (== -1.0 (nth proj 11)) "perspective w-row")
+             (is (< (nth proj 10) 0.0) "perspective z-scale negative (RH, depth 0..1)"))))
+
+       (testing "instance column = 2 mat4 (two trees), x-translations are +-2 (order-free)"
+         (let [inst (first (frame/draw-instances value))]
+           (is (= frame/dtype-mat4 (:dtype inst)))
+           (is (= 2 (:len inst)))
+           (let [mats (frame/mat4s fixture inst)
+                 xs   (sort (map #(nth % 12) mats))]
+             (is (= [-2.0 2.0] xs) "two tree instances at x = +-2")
+             (doseq [m mats]
+               (is (== 1.0 (nth m 0)))
+               (is (== 1.0 (nth m 15))))))))))
+
+#?(:clj
+   (deftest decodes-v2-tint-fixture
+     (let [{:keys [ok? value]} (frame/decode fixture-v2)]
+       (is ok? "v2 fixture decodes")
+       (is (= frame/version-tint (:version value)) "v2 layout version")
+       (is (= 42 (:frame-n value)))
+       (is (= 3 (count (:columns value))) "camera + (model + tint)")
+
+       (let [ds (frame/draws value)]
+         (is (= 1 (count ds)) "one draw block")
+         (let [[model tint] (first ds)]
+           (is (= frame/dtype-mat4 (:dtype model)))
+           (is (= 2 (:len model)) "two tree instances")
+           (is (some? tint) "v2 draw carries a tint column")
+           (is (= frame/dtype-f16 (:dtype tint)))
+           (is (= 2 (:len tint)) "one RGBA tint per instance")
+           (let [rgbas (frame/f16x4s fixture-v2 tint)]
+             (is (= 2 (count rgbas)))
+             (doseq [c rgbas ch c]
+               (is (< (Math/abs (- ch 1.0)) 1e-3) "default tint is opaque white"))))))))
+
+#?(:clj
+   (deftest v1-fixture-has-no-tint-block
+     (let [{:keys [value]} (frame/decode fixture)]
+       (is (= frame/version (:version value)))
+       (let [ds (frame/draws value)]
+         (is (= 1 (count ds)))
+         (is (nil? (second (first ds))) "v1 draws carry no tint column")))))
+
+#?(:clj
+   (deftest rejects-bad-magic
+     (let [b (with-byte fixture 0 0)
+           {:keys [ok? error]} (frame/decode b)]
+       (is (not ok?))
+       (is (= :bad-magic error)))))
+
+#?(:clj
+   (deftest rejects-unknown-dtype
+     ;; corrupt column 0's dtype byte (header at offset 16) to an unknown tag.
+     (let [b (with-byte fixture 16 9)
+           {:keys [ok? error data]} (frame/decode b)]
+       (is (not ok?))
+       (is (= :unknown-dtype error))
+       (is (= 0 (:index data)))
+       (is (= 9 (:dtype data))))))
+
+#?(:clj
+   (deftest rejects-truncated
+     (let [{:keys [ok? error]} (frame/decode (take-bytes fixture 8))]
+       (is (not ok?))
+       (is (= :too-short error)))))
+
+#?(:clj
+   (deftest rejects-bad-version
+     (let [b (-> fixture (with-byte 4 0xFF) (with-byte 5 0xFF))
+           {:keys [ok? error]} (frame/decode b)]
+       (is (not ok?))
+       (is (= :bad-version error)))))
+
+#?(:clj
+   (deftest rejects-truncated-mid-column-header
+     ;; 16-byte frame header present, but cut inside the 2 x 16-byte column
+     ;; headers (ncols=2 needs 48 bytes) -> the per-column bounds check fires.
+     (let [{:keys [ok? error]} (frame/decode (take-bytes fixture 24))]
+       (is (not ok?))
+       (is (= :too-short error)))))
+
+#?(:clj
+   (deftest rejects-column-payload-out-of-bounds
+     ;; headers intact (48 bytes) but the payload they point at is gone -> the
+     ;; bounds guard fires instead of an out-of-bounds read on untrusted bytes.
+     (let [{:keys [ok? error]} (frame/decode (take-bytes fixture 48))]
+       (is (not ok?))
+       (is (= :column-out-of-bounds error)))))
+
+#?(:clj
+   (deftest every-payload-offset-is-16-byte-aligned
+     ;; mirror of the clj-side invariant: columns DMA into GPU buffers without
+     ;; realignment, so each payload offset must be 16-aligned.
+     (let [{:keys [value]} (frame/decode fixture)]
+       (doseq [c (:columns value)]
+         (is (zero? (mod (:offset c) 16)) "column payload offset 16-aligned")))))
+
+;; ---------------------------------------------------------------------------
+;; f16 <-> f32 (portable, no fixture IO — exercised on both platforms)
+;; ---------------------------------------------------------------------------
+
+(defn- fabs [x]
+  #?(:clj (Math/abs (double x))
+     :cljs (.abs js/Math x)))
+
+(deftest f16-decodes-opaque-white
+  ;; 0x3C00 is the f16 bit pattern for 1.0.
+  (is (< (fabs (- (frame/f16->f32 0x3C00) 1.0)) 1e-6)))
+
+(deftest f16-decodes-zero
+  (is (== 0.0 (frame/f16->f32 0x0000))))
+
+(deftest element-size-known-and-unknown
+  (is (= 64 (frame/element-size frame/dtype-mat4)))
+  (is (= 4 (frame/element-size frame/dtype-f32)))
+  (is (= 0 (frame/element-size 42))))

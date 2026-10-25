@@ -1,0 +1,231 @@
+(ns afdx.core-test
+  "Every worked frame/value in this file that is not an exhaustive sweep
+  is marked `;; constructed, not a published spec vector` per this
+  library's README — see the individual namespace docstrings for exactly
+  what public-source provenance each claim rests on, and which is least
+  confident (the destination-MAC VL convention in `afdx.vl`)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [afdx.bytes :as b]
+            [afdx.ethernet :as eth]
+            [afdx.vl :as vl]
+            [afdx.ipv4 :as ipv4]
+            [afdx.udp :as udp]
+            [afdx.frame :as frame]
+            [afdx.sequence :as sn]
+            [afdx.bag :as bag]
+            [afdx.redundancy :as red]))
+
+;; ── bytes ────────────────────────────────────────────────────────────────────
+
+(deftest u16-round-trip-all-values
+  (is (every? (fn [n] (= n (b/rd-u16be (b/u16be n) 0))) (range 0 0x10000 97))))
+
+(deftest u32-round-trip-including-high-bit-set
+  ;; The same category of value that goes negative under ClojureScript's
+  ;; signed bitwise coercion in `com-aviation-ia-arinc-429` — a 32-bit
+  ;; value with the top bit set — exercised here even though nothing in
+  ;; this library's frame pipeline currently constructs one, because
+  ;; `rd-u32be` is shared infrastructure and an untested corner is
+  ;; exactly how that bug hides.
+  (is (= 0x80000000 (b/rd-u32be (b/u32be 0x80000000) 0)))
+  (is (>= (b/rd-u32be (b/u32be 0xFFFFFFFF) 0) 0))
+  (is (every? (fn [n] (= n (b/rd-u32be (b/u32be n) 0)))
+              (range 0 0x100000000 104729))))
+
+(deftest checksum16-rfc1071-worked-example
+  ;; RFC 1071 section 3, "Example". Words: 0x0001 0xf203 0xf4f5 0xf6f7.
+  ;; The RFC's own worked checksum for these four words is 0x220D.
+  (is (= 0x220D (b/checksum16 [0x00 0x01 0xf2 0x03 0xf4 0xf5 0xf6 0xf7]))))
+
+(deftest checksum16-verifies-to-zero
+  (testing "appending the checksum makes the buffer verify to 0, over many random-ish buffers"
+    (doseq [seed (range 50)]
+      (let [bs (vec (take 40 (iterate (fn [x] (mod (+ (* x 1103515245) 12345 seed) 256)) seed)))
+            c (b/checksum16 (into bs [0 0]))
+            framed (into bs (b/u16be c))]
+        (is (zero? (b/checksum16 framed)))))))
+
+;; ── ethernet ─────────────────────────────────────────────────────────────────
+
+(deftest ethernet-round-trip
+  (let [[es bytes] (eth/encode {:dst-mac [1 2 3 4 5 6] :src-mac [10 20 30 40 50 60]
+                                :ethertype eth/ethertype-ipv4 :payload [0xAA 0xBB 0xCC]})]
+    (is (= :ok es))
+    (let [[ds fields] (eth/decode bytes)]
+      (is (= :ok ds))
+      (is (= [1 2 3 4 5 6] (:dst-mac fields)))
+      (is (= [10 20 30 40 50 60] (:src-mac fields)))
+      (is (= eth/ethertype-ipv4 (:ethertype fields)))
+      (is (= [0xAA 0xBB 0xCC] (:payload fields))))))
+
+(deftest ethernet-bad-mac-length
+  (is (= [:error :afdx/bad-mac {:which :dst :length 5}]
+         (eth/encode {:dst-mac [1 2 3 4 5] :src-mac [1 2 3 4 5 6] :ethertype 0 :payload []}))))
+
+(deftest ethernet-frame-too-short
+  (is (= [:error :afdx/frame-too-short {:length 3 :minimum 14}]
+         (eth/decode [1 2 3]))))
+
+;; ── vl ───────────────────────────────────────────────────────────────────────
+
+(deftest vl-id-round-trips-over-full-16-bit-space
+  (testing "every one of the 65,536 possible Virtual Link IDs"
+    (doseq [id (range 0x10000)]
+      (let [[es mac] (vl/vl-id->dst-mac id)
+            [ds back] (vl/dst-mac->vl-id mac)]
+        (is (= :ok es))
+        (is (= :ok ds))
+        (is (= id back))))))
+
+(deftest vl-id-out-of-range
+  (is (= [:error :afdx/vl-id-out-of-range 0x10000] (vl/vl-id->dst-mac 0x10000)))
+  (is (= [:error :afdx/vl-id-out-of-range -1] (vl/vl-id->dst-mac -1))))
+
+(deftest not-a-vl-mac
+  (is (= [:error :afdx/not-a-vl-mac [1 2 3 4 5 6]] (vl/dst-mac->vl-id [1 2 3 4 5 6]))))
+
+(deftest vl-id-known-worked-example
+  ;; constructed, not a published spec vector.
+  (is (= [:ok [0x03 0x00 0x00 0x00 0x01 0x00]] (vl/vl-id->dst-mac 0x100))))
+
+;; ── ipv4 ─────────────────────────────────────────────────────────────────────
+
+(deftest ipv4-round-trip
+  (doseq [payload [[] [1] (vec (range 200))]
+          ttl [1 64 255]]
+    (let [[es bytes] (ipv4/encode {:ttl ttl :src-ip [172 16 0 1] :dst-ip [172 16 0 2] :payload payload})]
+      (is (= :ok es))
+      (let [[ds fields] (ipv4/decode bytes)]
+        (is (= :ok ds))
+        (is (= ttl (:ttl fields)))
+        (is (= [172 16 0 1] (:src-ip fields)))
+        (is (= [172 16 0 2] (:dst-ip fields)))
+        (is (= payload (:payload fields)))))))
+
+(deftest ipv4-checksum-mismatch-is-the-specific-reason
+  (let [[_ bytes] (ipv4/encode {:ttl 10 :src-ip [1 1 1 1] :dst-ip [2 2 2 2] :payload [9 9]})
+        corrupted (update (vec bytes) 12 bit-xor 0xFF)]
+    (is (= :afdx/ipv4-checksum-mismatch (first (rest (ipv4/decode corrupted)))))
+    (is (= :error (first (ipv4/decode corrupted))))))
+
+(deftest ipv4-not-ipv4-version
+  (let [[_ bytes] (ipv4/encode {:ttl 1 :src-ip [1 1 1 1] :dst-ip [2 2 2 2] :payload []})
+        wrong-version (assoc (vec bytes) 0 0x55)] ;; version nibble 5
+    (is (= [:error :afdx/not-ipv4 5] (ipv4/decode wrong-version)))))
+
+;; ── udp ──────────────────────────────────────────────────────────────────────
+
+(deftest udp-round-trip-with-checksum
+  (doseq [payload [[] [7] (vec (range 100))]]
+    (let [[es bytes] (udp/encode {:src-port 1234 :dst-port 4321 :payload payload
+                                  :src-ip [10 1 1 1] :dst-ip [10 1 1 2]})]
+      (is (= :ok es))
+      (let [[ds fields] (udp/decode bytes [10 1 1 1] [10 1 1 2])]
+        (is (= :ok ds))
+        (is (= 1234 (:src-port fields)))
+        (is (= 4321 (:dst-port fields)))
+        (is (= payload (:payload fields)))))))
+
+(deftest udp-checksum-catches-wrong-dst-ip
+  (let [[_ bytes] (udp/encode {:src-port 1 :dst-port 2 :payload [1 2 3]
+                               :src-ip [1 1 1 1] :dst-ip [2 2 2 2]})]
+    (is (= :ok (first (udp/decode bytes [1 1 1 1] [2 2 2 2]))))
+    (is (= :afdx/udp-checksum-mismatch
+           (second (udp/decode bytes [1 1 1 1] [9 9 9 9]))))))
+
+(deftest udp-checksum-disabled
+  (let [[_ bytes] (udp/encode {:src-port 1 :dst-port 2 :payload [1] :checksum? false})
+        [ds fields] (udp/decode bytes [0 0 0 0] [0 0 0 0])]
+    (is (= :ok ds))
+    (is (= 0 (:checksum fields)))))
+
+;; ── full frame ───────────────────────────────────────────────────────────────
+
+(deftest frame-round-trip
+  (doseq [sn [1 128 255]
+          application-data [[] [0x41 0x42] (vec (range 50))]]
+    (let [[es bytes] (frame/encode {:vl-id 0x0200 :src-mac [2 0 0 0 0 9]
+                                    :src-ip [10 0 0 1] :dst-ip [239 1 2 3]
+                                    :src-port 1000 :dst-port 2000
+                                    :application-data application-data :sn sn})]
+      (is (= :ok es))
+      (let [[ds fields] (frame/decode bytes)]
+        (is (= :ok ds))
+        (is (= 0x0200 (:vl-id fields)))
+        (is (= sn (:sn fields)))
+        (is (= application-data (:application-data fields)))))))
+
+(deftest frame-sn-out-of-range-on-encode
+  (is (= [:error :afdx/sn-out-of-range 256]
+         (frame/encode {:vl-id 1 :src-mac [0 0 0 0 0 1] :src-ip [1 1 1 1] :dst-ip [2 2 2 2]
+                        :src-port 1 :dst-port 2 :application-data [] :sn 256}))))
+
+;; ── sequence numbers ─────────────────────────────────────────────────────────
+
+(deftest sn-wraps-255-to-1-skipping-0
+  (is (= 1 (sn/next-sn 255)))
+  (is (not= 0 (sn/next-sn 255)))
+  (is (= 1 (sn/next-sn 0))))
+
+(deftest sn-next-sn-over-full-range
+  (doseq [n (range 256)]
+    (let [nxt (sn/next-sn n)]
+      (is (= nxt (if (= n 255) 1 (inc n)))))))
+
+(deftest sn-valid-over-full-byte-range
+  (is (every? sn/valid-sn? (range 256)))
+  (is (not (sn/valid-sn? 256)))
+  (is (not (sn/valid-sn? -1))))
+
+(deftest sn-steps-forward-exhaustive
+  (testing "all 255 x 255 (from, to) pairs in the live 1..255 cycle"
+    (doseq [from (range 1 256) to (range 1 256)]
+      (let [[status steps] (sn/steps-forward from to)]
+        (is (= :ok status))
+        (is (= to (nth (iterate sn/next-sn from) steps)))))))
+
+(deftest sn-steps-forward-rejects-the-sentinel
+  (is (= [:error :afdx/sn-out-of-range 0] (sn/steps-forward 0 5)))
+  (is (= [:error :afdx/sn-out-of-range 0] (sn/steps-forward 5 0))))
+
+;; ── BAG ──────────────────────────────────────────────────────────────────────
+
+(deftest bag-allowed-values
+  (is (every? bag/valid-bag-ms? bag/allowed-ms))
+  (is (not (bag/valid-bag-ms? 3)))
+  (is (not (bag/valid-bag-ms? 256))))
+
+(deftest bag-frames-per-second
+  (is (= 1000.0 (bag/bag->frames-per-second 1)))
+  (is (= 7.8125 (bag/bag->frames-per-second 128))))
+
+(deftest bag-conformance
+  (is (bag/conforms-to-bag? [0 1.0 2.0 3.0] 1 0.0))
+  (is (not (bag/conforms-to-bag? [0 0.5 2.0] 1 0.0)))
+  (is (bag/conforms-to-bag? [0 0.6 1.7] 1 0.5))) ;; within jitter tolerance
+
+(deftest bag-first-violation-names-the-offending-pair
+  (is (= {:index 1 :gap 0.5 :minimum-allowed 1.0}
+         (bag/first-violation [0 1.0 1.5 3.0] 1 0.0))))
+
+;; ── redundancy management ────────────────────────────────────────────────────
+
+(deftest redundancy-first-valid-wins
+  (let [[s1 a1] (red/receive red/initial-state {:network :a :sn 1 :received-at-ms 0})]
+    (is (= :deliver a1))
+    (testing "the redundant B-network copy of the SAME sn is a discarded duplicate"
+      (is (= :discard-duplicate (second (red/receive s1 {:network :b :sn 1 :received-at-ms 3})))))
+    (testing "the next sn on either network delivers"
+      (is (= :deliver (second (red/receive s1 {:network :b :sn 2 :received-at-ms 4})))))))
+
+(deftest redundancy-accepts-a-gap-within-window
+  (let [[s1 _] (red/receive red/initial-state {:network :a :sn 1 :received-at-ms 0})]
+    (is (= :accept-with-gap (second (red/receive s1 {:network :a :sn 5 :received-at-ms 10} 8))))))
+
+(deftest redundancy-discards-stale-beyond-window
+  (let [[s1 _] (red/receive red/initial-state {:network :a :sn 1 :received-at-ms 0})]
+    (is (= :discard-stale (second (red/receive s1 {:network :a :sn 200 :received-at-ms 10} 8))))))
+
+(deftest redundancy-sn-out-of-range
+  (is (= [:error :afdx/sn-out-of-range 300]
+         (red/receive red/initial-state {:network :a :sn 300 :received-at-ms 0}))))

@@ -1,0 +1,186 @@
+(ns prolific.core-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [prolific.core :as core]))
+
+;; A filter list shaped like a real GET /filters/ response: opaque numeric
+;; choice ids, a decoy "first language" filter, and two Chinese variants.
+(def filters-fixture
+  [{:filter_id "handedness" :title "Handedness" :type "select"
+    :choices {:0 "Left" :1 "Right"}}
+   {:filter_id "first-language" :title "First language"
+    :question "What is your first language?" :type "select"
+    :choices {:0 "English" :1 "Japanese"}}
+   {:filter_id "fluent-languages" :title "Fluent languages"
+    :question "Which of the following languages are you fluent in?" :type "select"
+    :choices {:1 "English" :2 "Spanish" :3 "Arabic" :4 "Hindi"
+              :5 "Chinese (Mandarin)" :6 "Chinese (Cantonese)"
+              :7 "Japanese" :8 "Portuguese"}}
+   {:filter_id "age" :title "Age" :type "range" :min 18 :max 100}])
+
+(deftest reward-never-underpays
+  (testing "rounds up to the next 5c so the hourly rate never dips below target"
+    (is (= 200 (core/reward-cents 10)))   ; 10min @ $12/hr = $2.00
+    (is (= 240 (core/reward-cents 12)))   ; $2.40
+    (is (= 160 (core/reward-cents 8)))    ; $1.60
+    (is (= 20 (core/reward-cents 1))))    ; $0.20 exactly, not $0.19
+  (testing "no float drift: these are the values BOTH hosts must produce.
+            An earlier float-based version returned 205 for 10 minutes on the
+            JVM and 200 under nbb — the same study paying two different
+            amounts depending on which runtime built the payload."
+    (is (= 140 (core/reward-cents 7)))
+    (is (= 100 (core/reward-cents 5)))
+    (is (= 400 (core/reward-cents 20)))
+    (is (= 1200 (core/reward-cents 60))))
+  (testing "a fractional hourly rate still never underpays"
+    (is (>= (core/reward-cents 10 12.34) 205))
+    (is (zero? (mod (core/reward-cents 10 12.34) 5)))))
+
+(deftest cost-is-reward-plus-fee
+  (let [{:keys [total-cents participant-total-cents platform-fee-cents]}
+        (core/cost-breakdown 30 10)]
+    (is (= 6000 participant-total-cents))
+    (is (= 2568 platform-fee-cents))
+    (is (= 8568 total-cents))
+    (is (= "$85.68" (core/usd total-cents)))))
+
+(deftest usd-formats-cents-not-floats
+  (is (= "$0.05" (core/usd 5)))
+  (is (= "$1.00" (core/usd 100)))
+  (is (= "$17.14" (core/usd 1714)))
+  (is (= "$100.00" (core/usd 10000))))
+
+(deftest prefers-fluency-over-first-language
+  (testing "reading the screen is what matters, not what you grew up speaking"
+    (is (= "fluent-languages" (:filter_id (core/language-filter filters-fixture)))))
+  (testing "range filters and non-language selects are ignored"
+    (is (not= "age" (:filter_id (core/language-filter filters-fixture))))
+    (is (not= "handedness" (:filter_id (core/language-filter filters-fixture))))))
+
+;; ---------------------------------------------------------------------------
+;; The live account has 491 filters and the fixture has four, which is why the
+;; old text heuristic passed here and failed there. These pin the real shapes.
+;; ---------------------------------------------------------------------------
+
+(def monolingual-decoy
+  "Verbatim from the live API. Its question contains both \"language\" and
+  \"fluent\", so the heuristic that scanned text picked it over
+  fluent-languages — which sits 85 entries later in the response."
+  {:filter_id "english-speaking-monolingual"
+   :title "English speaking Monolingual"
+   :question "Are you an English-speaking monolingual, that is, are you fluent only in English? Or are you also fluent in another language?"
+   :type "select"
+   :choices {:0 "I only know English"
+             :1 "I know one other language in addition to English"
+             :2 "I know 2 or more languages in addition to English"
+             :3 "N/A or Rather not say"}})
+
+(deftest a-filter-that-only-mentions-languages-is-not-a-language-filter
+  (testing "its options are monolingualism categories, not languages"
+    (is (false? (core/language-choices? monolingual-decoy)))
+    (is (true? (core/language-choices?
+                (first (filter #(= "fluent-languages" (:filter_id %))
+                               filters-fixture)))))))
+
+(deftest the-decoy-does-not-win-even-when-it-comes-first
+  (testing "measured against the live account: the decoy is at index 303 and
+            fluent-languages at 388, so ordering decided the outcome"
+    (let [live-ish (into [monolingual-decoy] filters-fixture)]
+      (is (= "fluent-languages" (:filter_id (core/language-filter live-ish)))))))
+
+(deftest the-five-languages-this-fleet-recruits-resolve
+  (testing "English, Hindi, Chinese, Spanish and Arabic — the requested pool.
+            Against the live API these return ids 19/31/13/60/4 on fluent-languages."
+    (let [r (core/resolve-languages (into [monolingual-decoy] filters-fixture)
+                                    ["English" "Hindi" "Chinese" "Spanish" "Arabic"])]
+      (is (nil? (:error r)))
+      (is (= "fluent-languages" (:filter_id r)))
+      (testing "every requested language is represented — asserting a label
+                COUNT of 5 was wrong here, because the fixture splits Chinese
+                into Mandarin and Cantonese and correctly recruits both. The
+                live filter has a single Chinese choice, so the count differs
+                between the two and only coverage is the invariant."
+        (doseq [want ["English" "Hindi" "Chinese" "Spanish" "Arabic"]]
+          (is (some #(str/includes? % want) (:labels r)) want))))))
+
+(deftest selection-is-by-exact-id-not-by-position
+  (testing "shuffling the list must not change which filter is chosen"
+    (let [fs (into [monolingual-decoy] filters-fixture)]
+      (is (= "fluent-languages"
+             (:filter_id (core/language-filter (reverse fs)))
+             (:filter_id (core/language-filter fs)))))))
+
+(deftest one-request-can-match-several-choices
+  (let [r (core/resolve-languages filters-fixture ["English" "Chinese"])]
+    (is (nil? (:error r)))
+    (testing "Chinese picks up BOTH Mandarin and Cantonese"
+      (is (= #{"1" "5" "6"} (set (:selected_values r)))))))
+
+(deftest the-requested-audience-is-exactly-what-is-recruited
+  (let [r (core/resolve-languages filters-fixture
+                                  ["English" "Hindi" "Chinese" "Spanish" "Arabic"])]
+    (is (= #{"1" "4" "5" "6" "2" "3"} (set (:selected_values r))))
+    (testing "Japanese and Portuguese are NOT recruited"
+      (is (not (contains? (set (:selected_values r)) "7")))
+      (is (not (contains? (set (:selected_values r)) "8"))))))
+
+(deftest an-unmatched-language-is-an-error-not-a-silent-drop
+  (testing "dropping one would recruit a population nobody asked for"
+    (let [r (core/resolve-languages filters-fixture ["English" "Klingon"])]
+      (is (= :unmatched (:error r)))
+      (is (= ["Klingon"] (:missing r)))
+      (is (some? (:choices r)) "reports the real choices so the caller can correct"))))
+
+(deftest missing-language-filter-is-reported
+  (is (= :no-language-filter
+         (:error (core/resolve-languages [{:filter_id "age" :type "range"}] ["English"])))))
+
+(deftest pool-reads-detects-the-language-barrier
+  (let [{:keys [labels]} (core/resolve-languages filters-fixture ["English" "Chinese"])]
+    (is (core/pool-reads? labels "english"))
+    (is (core/pool-reads? labels "Chinese"))
+    (is (not (core/pool-reads? labels "Japanese")))))
+
+(deftest study-payload-carries-the-filter-and-the-code
+  (let [lang (core/resolve-languages filters-fixture ["English"])
+        p (core/study-payload
+           {:name "T" :description "D" :minutes 10 :internal-name "x/y"}
+           {:places 5 :completion-code "CODE1"
+            :external-url "https://example.test/study/?pid={{%PROLIFIC_PID%}}"
+            :language-filter lang})]
+    (is (= 5 (:total_available_places p)))
+    (is (= 200 (:reward p)))
+    (is (= [{:filter_id "fluent-languages" :selected_values ["1"]}] (:filters p)))
+    (is (= "url_parameters" (:prolific_id_option p)))
+    (testing "the completion code auto-approves whoever reaches the debrief"
+      (is (= [{:action "AUTOMATICALLY_APPROVE"}]
+             (-> p :completion_codes first :actions))))))
+
+(deftest study-payload-without-a-filter-recruits-everyone
+  (let [p (core/study-payload {:name "T" :description "D" :minutes 5}
+                              {:places 1 :completion-code "C" :external-url "u"})]
+    (is (= [] (:filters p)) "empty filters = whole pool, not a broken filter")))
+
+(def submissions-fixture
+  [{:id "s1" :participant_id "p1" :status "APPROVED" :study_code "CODE1"}
+   {:id "s2" :participant_id "p2" :status "AWAITING REVIEW" :study_code nil}
+   {:id "s3" :participant_id "p3" :status "AWAITING REVIEW" :study_code "CODE1"}
+   {:id "s4" :participant_id "p4" :status "ACTIVE" :study_code nil}
+   {:id "s5" :participant_id "p5" :status "AWAITING REVIEW" :study_code ""}])
+
+(deftest triage-separates-the-people-auto-approval-cannot-pay
+  (let [t (core/triage submissions-fixture)]
+    (is (= 5 (:total t)))
+    (is (= 3 (count (:pending t))))
+    (testing "abandoners have no completion code — nothing auto-pays them"
+      (is (= #{"s2" "s5"} (set (map :id (:pending-abandoned t)))))
+      (is (= #{"s3"} (set (map :id (:pending-with-code t)))))))
+  (testing "an empty-string code counts as abandoned, not as completed"
+    (is (not (core/reached-debrief? {:study_code ""})))
+    (is (not (core/reached-debrief? {:study_code nil})))
+    (is (core/reached-debrief? {:study_code "CODE1"}))))
+
+(deftest triage-of-nothing-is-not-an-error
+  (let [t (core/triage [])]
+    (is (= 0 (:total t)))
+    (is (empty? (:pending t)))))

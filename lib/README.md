@@ -99,6 +99,42 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.productParty` | `kotoba.productParty/src` | `kotoba.product-party` (Kotoba project library) |
+| `kotoba.pay` | `kotoba.pay/src` | `pay.core`, `pay.eip3009`, `pay.facilitator`, `pay.rail.base-l2` (Kotoba project library) |
+| `kotoba.num` | `kotoba.num/src` | `num.array`, `num.autograd`, `num.core`, `num.cpu` (Kotoba project library) |
+| `kotoba.ioFilecoin` | `kotoba.ioFilecoin/src` | `filecoin.address`, `filecoin.bigint`, `filecoin.cid`, `filecoin.message` (Kotoba project library) |
+| `kotoba.hil` | `kotoba.hil/src` | `hil.core` (Kotoba project library) |
+| `kotoba.cron` | `kotoba.cron/src` | `cron.execute`, `cron.model`, `cron.validate` (Kotoba project library) |
+| `kotoba.crm` | `kotoba.crm/src` | `kotoba.crm.funnel`, `kotoba.crm.leadscore`, `kotoba.crm.pipeline`, `kotoba.crm.revrec` (Kotoba project library) |
+| `kotoba.crdt` | `kotoba.crdt/src` | `kotoba.crdt.clock`, `kotoba.crdt.doc`, `kotoba.crdt.kotoba-oracle`, `kotoba.crdt.orset` (Kotoba project library) |
+| `kotoba.contacts` | `kotoba.contacts/src` | `contacts.model`, `contacts.validate` (Kotoba project library) |
+| `kotoba.consumability` | `kotoba.consumability/src` | `consumability.core` (Kotoba project library) |
+| `kotoba.composer` | `kotoba.composer/src` | `kotoba.composer`, `kotoba.composer.generation`, `kotoba.composer.pipeline`, `kotoba.composer.stem` (Kotoba project library) |
+| `kotoba.comTeamsBot` | `kotoba.comTeamsBot/src` | `teams.client`, `teams.events`, `teams.jwt`, `teams.jwt-verify` (Kotoba project library) |
+| `kotoba.comProlificApp` | `kotoba.comProlificApp/src` | `prolific.browser`, `prolific.channel`, `prolific.client`, `prolific.core` (Kotoba project library) |
+| `kotoba.comProfibusProfinet` | `kotoba.comProfibusProfinet/src` | `profinet.dcp`, `profinet.ethernet`, `profinet.rt` (Kotoba project library) |
+| `kotoba.comNvidiaIsaacSim` | `kotoba.comNvidiaIsaacSim/src` | `genesis`, `genesis.articulation3d`, `genesis.batched`, `genesis.cartpole` (Kotoba project library) |
+| `kotoba.comMetaWebhook` | `kotoba.comMetaWebhook/src` | `meta-webhook.async-signature`, `meta-webhook.handshake`, `meta-webhook.instagram-client`, `meta-webhook.instagram-events` (Kotoba project library) |
+| `kotoba.comMattermost` | `kotoba.comMattermost/src` | `mattermost.client` (Kotoba project library) |
+| `kotoba.comMatrix` | `kotoba.comMatrix/src` | `matrix.client` (Kotoba project library) |
+| `kotoba.comMapillaryGraphApi` | `kotoba.comMapillaryGraphApi/src` | `com-mapillary-graph-api.core`, `com-mapillary-graph-api.fetch` (Kotoba project library) |
+| `kotoba.comLinkedin` | `kotoba.comLinkedin/src` | `linkedin.client` (Kotoba project library) |
+| `kotoba.comLineMessaging` | `kotoba.comLineMessaging/src` | `line-messaging.async-signature`, `line-messaging.client`, `line-messaging.events`, `line-messaging.signature` (Kotoba project library) |
+| `kotoba.comInstagram` | `kotoba.comInstagram/src` | `instagram.client` (Kotoba project library) |
+| `kotoba.comAviationIaArinc664` | `kotoba.comAviationIaArinc664/src` | `afdx.bag`, `afdx.bytes`, `afdx.ethernet`, `afdx.frame` (Kotoba project library) |
+| `kotoba.comAviationIaArinc429` | `kotoba.comAviationIaArinc429/src` | `arinc429.bcd`, `arinc429.bits`, `arinc429.bnr`, `arinc429.label` (Kotoba project library) |
+| `kotoba.comAppleTouchid` | `kotoba.comAppleTouchid/src` | `touchid.biometric` (Kotoba project library) |
+| `kotoba.comAppleFileprovider` | `kotoba.comAppleFileprovider/src` | `fileprovider.model` (Kotoba project library) |
+| `kotoba.comAppleFaceid` | `kotoba.comAppleFaceid/src` | `faceid.biometric` (Kotoba project library) |
+| `kotoba.comAdobeCmap` | `kotoba.comAdobeCmap/src` | `adobe.cmap.core` (Kotoba project library) |
+| `kotoba.cncToolpath` | `kotoba.cncToolpath/src` | `cnc-toolpath`, `cnc-toolpath.gcode`, `cnc-toolpath.stock`, `cnc-toolpath.tool` (Kotoba project library) |
+| `kotoba.cloudMurakumoGeneration` | `kotoba.cloudMurakumoGeneration/src` | `murakumo.generation`, `murakumo.generation.client`, `murakumo.generation.digest`, `murakumo.generation.image` (Kotoba project library) |
+| `kotoba.cljHost` | `kotoba.cljHost/src` | `kotoba.clj-host`, `kotoba.clj-host.frame` (Kotoba project library) |
+| `kotoba.ci` | `kotoba.ci/src` | `ci.execute`, `ci.model`, `ci.run`, `ci.validate` (Kotoba project library) |
+| `kotoba.chainObserver` | `kotoba.chainObserver/src` | `chain.observer`, `chain.observer.contract`, `chain.observer.cosmos`, `chain.observer.evm` (Kotoba project library) |
+| `kotoba.chain` | `kotoba.chain/src` | `chain.authorized`, `chain.core` (Kotoba project library) |
+| `kotoba.chIec608705104` | `kotoba.chIec608705104/src` | `iec60870.apci`, `iec60870.asdu`, `iec60870.float32`, `iec60870.frame` (Kotoba project library) |
+| `kotoba.kotobaseStorage` | `kotoba.kotobaseStorage/src` | `kotobase.storage.async-contract`, `kotobase.storage.contract`, `kotobase.storage.core`, `kotobase.storage.memory` (Kotoba project library) |
 | `kotoba.cofog` | `kotoba.cofog/src` | `kotoba.cofog`, `kotoba.cofog.embedded` (Kotoba project library) |
 | `kotoba.technology` | `kotoba.technology/src` | `kotoba.technology`, `kotoba.technology.embedded` (Kotoba project library) |
 | `kotoba.torrentApp` | `kotoba.torrentApp/src` | `kotoba.torrent-app`, `kotoba.torrent-app.download` (Kotoba project library) |

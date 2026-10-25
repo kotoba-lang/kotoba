@@ -1,0 +1,210 @@
+(ns chain.authorized-test
+  "The cross-cutting test superproject ADR-2608170400 P5-1 asks for: causal DAG
+  merge, actor authority, revocation, and the receipt parent chain, checked
+  together rather than each in its own repo.
+
+  They were each fine alone, which is why nothing caught the join: `chain`
+  records `authority` and `actor` and says in a comment that it does not check
+  them, and the grant shape with `revoked?`/`expires-at` lives in a different
+  organisation's repository. A commit could name an authority that was revoked
+  before it was written and every check in the stack passed."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [ipld.core :as ipld]
+            [chain.core :as chain]
+            [chain.authorized :as auth]))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))}))
+
+(def ^:private cap
+  "Grant CIDs, genuinely content-addressed.
+
+  `chain.core` stores `authority` as an IPLD link and refuses anything that is
+  not a base32 CID -- which a first draft of this test found out by handing it
+  the string \"cap-alice\". That is the library being right twice in one
+  file: it also refuses to cite a parent that does not exist. Both refusals
+  are the reason the verification here is about corruption that arrives AFTER
+  a write, not about writes that were never possible."
+  (into {} (map (fn [k] [k (ipld/cid (ipld/encode {"grant" (name k)}))]))
+        [:alice :bob :revoked :expired :future :unknown]))
+
+(def ^:private grants
+  {(cap :alice)   {:subject "alice"}
+   (cap :bob)     {:subject "bob"}
+   (cap :revoked) {:subject "mallory" :revoked-at "2026-08-10T00:00:00Z"}
+   (cap :expired) {:subject "carol" :expires-at "2026-08-01T00:00:00Z"}
+   (cap :future)  {:subject "dave" :not-before "2027-01-01T00:00:00Z"}})
+
+(def ^:private now "2026-08-18T00:00:00Z")
+
+(defn- opts
+  ([] (opts :prospective))
+  ([policy] {:resolve-grant grants :as-of now :revocation policy}))
+
+;; ── the two declarations a caller cannot skip ───────────────────────────────
+
+(deftest the-caller-must-say-when-and-must-say-what-revocation-means
+  (let [{:keys [put! get-fn]} (mem-store)
+        c (chain/commit! put! get-fn "s0" nil {:actor "alice" :authority (cap :alice)})]
+    (testing ":as-of is required — a Lamport clock cannot judge an expiry"
+      (let [d (try (auth/verify-authorized get-fn c (dissoc (opts) :as-of))
+                   (catch #?(:clj Throwable :cljs :default) t (ex-data t)))]
+        (is (= :chain.authorized/no-as-of (:type d)))))
+    (testing ":revocation is required, because neither answer is the right one"
+      (let [d (try (auth/verify-authorized get-fn c (dissoc (opts) :revocation))
+                   (catch #?(:clj Throwable :cljs :default) t (ex-data t)))]
+        (is (= :chain.authorized/no-revocation-policy (:type d))))
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (auth/verify-authorized get-fn c (opts :whatever)))))
+    (testing "and a resolver is required, because this namespace owns no grants"
+      (let [d (try (auth/verify-authorized get-fn c (dissoc (opts) :resolve-grant))
+                   (catch #?(:clj Throwable :cljs :default) t (ex-data t)))]
+        (is (= :chain.authorized/no-resolver (:type d)))))
+    (testing "the verdict repeats back what it was computed under"
+      (let [r (auth/verify-authorized get-fn c (opts))]
+        (is (= now (:as-of r)))
+        (is (= :prospective (:revocation r)))))))
+
+;; ── a single principal's line ───────────────────────────────────────────────
+
+(deftest a-permitted-history-passes-and-says-how-much-it-read
+  (let [{:keys [put! get-fn]} (mem-store)
+        a (chain/commit! put! get-fn "s0" nil {:actor "alice" :authority (cap :alice)})
+        b (chain/commit! put! get-fn "s1" a {:actor "alice" :authority (cap :alice)})
+        r (auth/verify-authorized get-fn b (opts))]
+    (is (true? (:ok? r)))
+    (is (= [] (:findings r)))
+    (is (= 2 (:visited r))
+        "the evidence floor: a pass over zero commits is not a pass")
+    (is (true? (:ok? (:causal r))) "and the causal report travels with it")))
+
+(deftest a-commit-with-no-authority-is-not-authorized
+  ;; The field is optional in `chain.core` on purpose -- commits predating it
+  ;; keep their CIDs -- so "absent" has to be a finding here rather than a
+  ;; silent pass. This is where the old behaviour and the new one differ most.
+  (let [{:keys [put! get-fn]} (mem-store)
+        a (chain/commit! put! get-fn "s0" nil)
+        r (auth/verify-authorized get-fn a (opts))]
+    (is (false? (:ok? r)))
+    (is (= :no-authority (:reason (first (:findings r)))))))
+
+(deftest an-authority-nobody-can-resolve-is-a-finding-not-a-pass
+  (let [{:keys [put! get-fn]} (mem-store)
+        a (chain/commit! put! get-fn "s0" nil {:actor "alice" :authority (cap :unknown)})
+        r (auth/verify-authorized get-fn a (opts))]
+    (is (false? (:ok? r)))
+    (is (= :unknown-authority (:reason (first (:findings r))))
+        "a CID that resolves to nothing reads as provenance while being none")))
+
+(deftest a-grant-for-someone-else-does-not-permit-this-actor
+  (let [{:keys [put! get-fn]} (mem-store)
+        a (chain/commit! put! get-fn "s0" nil {:actor "alice" :authority (cap :bob)})
+        r (auth/verify-authorized get-fn a (opts))]
+    (is (false? (:ok? r)))
+    (is (= :actor-not-the-subject (:reason (first (:findings r)))))))
+
+(deftest expiry-and-not-yet-valid-are-different-findings
+  (let [{:keys [put! get-fn]} (mem-store)
+        e (chain/commit! put! get-fn "s0" nil {:actor "carol" :authority (cap :expired)})
+        f (chain/commit! put! get-fn "s0" nil {:actor "dave" :authority (cap :future)})]
+    (is (= :expired (:reason (first (:findings (auth/verify-authorized get-fn e (opts)))))))
+    (is (= :not-yet-valid
+           (:reason (first (:findings (auth/verify-authorized get-fn f (opts)))))))))
+
+;; ── revocation, which is a policy and not a fact ────────────────────────────
+
+(deftest the-same-history-passes-or-fails-on-the-declared-policy
+  ;; The item this test exists for. A commit written BEFORE its grant was
+  ;; revoked is permitted under one reading of revocation and forbidden under
+  ;; the other, and both readings are defensible -- so the answer must depend
+  ;; on what the caller declared, visibly.
+  (let [{:keys [put! get-fn]} (mem-store)
+        c (chain/commit! put! get-fn "s0" nil {:actor "mallory" :authority (cap :revoked)})]
+    (testing "retroactive: the grant was never trustworthy, so nor is the commit"
+      (let [r (auth/verify-authorized get-fn c (opts :retroactive))]
+        (is (false? (:ok? r)))
+        (is (= :revoked (:reason (first (:findings r)))))))
+    (testing "prospective, judged after the revocation: still revoked"
+      (is (false? (:ok? (auth/verify-authorized get-fn c (opts :prospective))))))
+    (testing "prospective, judged BEFORE the revocation: permitted"
+      ;; the same bytes, the same grant, a different :as-of
+      (let [r (auth/verify-authorized
+               get-fn c (assoc (opts :prospective) :as-of "2026-08-01T00:00:00Z"))]
+        (is (true? (:ok? r))
+            "which is why the instant is part of the verdict rather than
+             ambient")))))
+
+;; ── merges ──────────────────────────────────────────────────────────────────
+
+(deftest a-merge-does-not-launder-an-unauthorized-branch
+  ;; The intersection the item names: merge semantics, authority and
+  ;; revocation at once. Two principals, one of them unauthorized, merged by a
+  ;; third who is perfectly authorized to merge.
+  (let [{:keys [put! get-fn]} (mem-store)
+        good (chain/commit! put! get-fn "a0" nil {:actor "alice" :authority (cap :alice)})
+        bad (chain/commit! put! get-fn "b0" nil {:actor "mallory"
+                                                 :authority (cap :revoked)})
+        merged (chain/commit! put! get-fn "m" good {:actor "bob" :authority (cap :bob)
+                                                  :causes [bad]})]
+    (testing "the merge commit itself is impeccable"
+      (let [r (auth/verify-authorized get-fn merged (opts :retroactive))]
+        (is (nil? (some #(= merged (:cid %)) (:findings r)))
+            "bob's own authority covers bob's own commit")))
+    (testing "and the history it created is still not authorized"
+      (let [r (auth/verify-authorized get-fn merged (opts :retroactive))]
+        (is (false? (:ok? r)))
+        (is (= 1 (count (:findings r))))
+        (is (= bad (:cid (first (:findings r)))))
+        (is (= 3 (:visited r)) "all three commits were actually read")))
+    (testing "the opposite rule would make merging a way to bless anything"
+      ;; stated as a test rather than a comment: the good branch alone is fine,
+      ;; so the failure above comes from what the merge pulled in and nothing
+      ;; else.
+      (is (true? (:ok? (auth/verify-authorized get-fn good (opts :retroactive))))))))
+
+(deftest every-failure-is-reported-not-just-the-first
+  ;; An audit that stops at one finding is an audit you have to run again to
+  ;; learn what is wrong.
+  (let [{:keys [put! get-fn]} (mem-store)
+        one (chain/commit! put! get-fn "x" nil {:actor "carol" :authority (cap :expired)})
+        two (chain/commit! put! get-fn "y" nil {:actor "dave" :authority (cap :future)})
+        three (chain/commit! put! get-fn "z" one {:actor "alice" :authority (cap :alice)
+                                                 :causes [two]})
+        r (auth/verify-authorized get-fn three (opts))]
+    (is (false? (:ok? r)))
+    (is (= #{:expired :not-yet-valid} (set (map :reason (:findings r)))))
+    (is (= 3 (:visited r)))))
+
+;; ── the causal report is not optional ───────────────────────────────────────
+
+(deftest an-unsound-history-fails-before-authorization-is-considered
+  ;; Authorization over a history whose CIDs do not re-derive would be a
+  ;; statement about bytes nobody verified.
+  ;;
+  ;; The orphan has to be made by DELETING a parent after the fact, because
+  ;; `chain.core/commit!` fetches and CID-verifies every parent it is asked to
+  ;; cite -- "an edge to nothing is worse than no edge, because it reads as
+  ;; provenance". A first draft of this test tried to cite a parent that was
+  ;; never stored and got an exception at write time instead, which is the
+  ;; library being right rather than the test being clever.
+  (let [store (atom {})
+        put! (fn [cid bytes] (swap! store assoc cid bytes))
+        get-fn (fn [cid] (get @store cid))
+        a (chain/commit! put! get-fn "s0" nil {:actor "alice" :authority (cap :alice)})
+        b (chain/commit! put! get-fn "s1" a {:actor "alice" :authority (cap :alice)})
+        _ (swap! store dissoc a)
+        r (auth/verify-authorized get-fn b (opts))]
+    (is (false? (:ok? r)))
+    (is (= :missing-parent (:reason r))
+        "the causal reason surfaces rather than being replaced by an
+         authorization verdict computed over an unverified walk")
+    (is (false? (:ok? (:causal r))))))
+
+(deftest a-report-over-nothing-is-not-a-pass
+  (let [{:keys [get-fn]} (mem-store)
+        r (auth/verify-authorized get-fn nil (opts))]
+    (is (false? (:ok? r)))
+    (is (zero? (:visited r)))))
