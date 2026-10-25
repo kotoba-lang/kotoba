@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.comAppleFileprovider` | `kotoba.comAppleFileprovider/src` | `fileprovider.model` (Kotoba project library) |
 | `kotoba.comAppleFaceid` | `kotoba.comAppleFaceid/src` | `faceid.biometric` (Kotoba project library) |
 | `kotoba.comAdobeCmap` | `kotoba.comAdobeCmap/src` | `adobe.cmap.core` (Kotoba project library) |
 | `kotoba.cncToolpath` | `kotoba.cncToolpath/src` | `cnc-toolpath`, `cnc-toolpath.gcode`, `cnc-toolpath.stock`, `cnc-toolpath.tool` (Kotoba project library) |
