@@ -222,6 +222,7 @@ The bundled standard libraries live in this repository:
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
+| `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
 | `kotoba.map` | `kotoba.map/src` | `kotoba.map`, `kotoba.map.color`, `kotoba.map.constants`, `kotoba.map.data` (Kotoba project library) |
 | `kotoba.kotobaseClientQuery` | `kotoba.kotobaseClientQuery/src` | `kotobase-client-query.acceptance` (Kotoba project library) |
 | `kotoba.bim` | `kotoba.bim/src` | `bim`, `bim.cloud`, `bim.cloud.http`, `bim.drawing` (Kotoba project library) |
