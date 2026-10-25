@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.langgraphStore` | `kotoba.langgraphStore/src` | `langgraph-store.blob`, `langgraph-store.checkpoint` (Kotoba project library) |
 | `kotoba.kisekae` | `kotoba.kisekae/src` | `kisekae.build`, `kisekae.capability`, `kisekae.compositor`, `kisekae.edit` (Kotoba project library) |
 | `kotoba.kasane` | `kotoba.kasane/src` | `kasane.bytes`, `kasane.codec`, `kasane.decode`, `kasane.gltf` (Kotoba project library) |
 | `kotoba.ioStorjNode` | `kotoba.ioStorjNode/src` | `storj.node.bytes`, `storj.node.certificate`, `storj.node.contact`, `storj.node.der` (Kotoba project library) |
