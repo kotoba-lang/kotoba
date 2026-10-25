@@ -1,0 +1,142 @@
+(ns num.quantized-test
+  (:require [kotoba.test :refer [deftest is]]
+            [num.array :as arr]
+            [num.contract :as contract]
+            [num.core :as nm]
+            [num.cpu :as cpu]
+            [num.dtype :as dtype]
+            [num.quantized :as q]))
+
+(defn- half-bytes [value]
+  (let [bits (bit-and 0xffff (dtype/f32->f16-bits value))]
+    [(bit-and bits 0xff) (bit-and (bit-shift-right bits 8) 0xff)]))
+
+(def scales [1 2 3 4 49 34 19 60])
+(def mins [9 10 11 12 45 30 51 20])
+(def packed-scales [193 130 67 196, 137 74 203 76, 209 226 51 76])
+
+(defn- block [d dmin]
+  (vec (concat (half-bytes d) (half-bytes dmin) packed-scales
+               (repeat 128 0x21))))
+
+(defn- dense-row [d dmin]
+  (vec (mapcat (fn [index]
+                 (let [quant (if (even? index) 1 2)]
+                   (repeat 32 (- (* d (nth scales index) quant)
+                                 (* dmin (nth mins index))))))
+               (range 8))))
+
+(defn- q6-block [d]
+  (vec (concat (repeat (+ 128 64) 0)
+               (map #(bit-and % 0xff) (range -8 8))
+               (half-bytes d))))
+
+(defn- q6-dense-row [d]
+  (vec (mapcat #(repeat 16 (* d % -32.0)) (range -8 8))))
+
+(defn- q8-block [d]
+  (vec (concat (half-bytes d) (map #(bit-and % 0xff) (range -16 16)))))
+
+(defn- q5-block [d]
+  ;; High bits set at positions 0 and 31; low nibble 0 for the first half and
+  ;; 15 for the second half.
+  (vec (concat (half-bytes d) [1 0 0 128] (repeat 16 0xf0))))
+
+(defn- q5-dense-row [d]
+  (vec (concat [0.0] (repeat 15 (* d -16.0))
+               (repeat 15 (* d -1.0)) [(* d 15.0)])))
+
+(deftest q5-zero-matmul-stays-packed
+  (let [backend (cpu/cpu-backend)
+        bytes (vec (concat (q5-block 0.5) (q5-block -0.25)))
+        weight (q/matrix backend bytes [2 32] :q5-0)
+        input (arr/from-vec backend (repeat 32 1.0) [1 32])]
+    (is (= 44 (:byte-count weight)))
+    (is (= 32 (:block-size weight)))
+    (is (contract/approx-vec?
+         [(reduce + (q5-dense-row 0.5))
+          (reduce + (q5-dense-row -0.25))]
+         (arr/->vec (q/matmul input weight))))))
+
+(deftest q5-zero-blocks-can-span-logical-rows
+  (let [backend (cpu/cpu-backend)
+        bytes (q5-block 0.5)
+        table (q/table backend bytes [2 16] :q5-0)
+        matrix (q/matrix backend bytes [2 16] :q5-0)
+        indices (arr/from-vec backend [1 0] [2])
+        input (arr/from-vec backend (repeat 16 1.0) [1 16])
+        dense (q5-dense-row 0.5)]
+    (is (contract/approx-vec?
+         (vec (concat (subvec dense 16) (subvec dense 0 16)))
+         (arr/->vec (q/embedding indices table))))
+    (is (contract/approx-vec?
+         [(reduce + (subvec dense 0 16)) (reduce + (subvec dense 16))]
+         (arr/->vec (q/matmul input matrix))))))
+
+(deftest q4-k-matmul-matches-dense-oracle-without-expanding-weight
+  (let [backend (cpu/cpu-backend)
+        bytes (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
+        weight (q/matrix backend bytes [2 256] :q4-k)
+        input-values (vec (concat (repeat 256 1.0)
+                                  (map #(if (even? %) 0.5 -0.25) (range 256))))
+        input (arr/from-vec backend input-values [2 256])
+        dense-values (vec (mapcat (fn [inner]
+                                    [(nth (dense-row 0.5 0.25) inner)
+                                     (nth (dense-row -0.125 0.5) inner)])
+                                  (range 256)))
+        dense (arr/from-vec backend dense-values [256 2])]
+    (is (= [256 2] (:shape weight)))
+    (is (= 288 (:byte-count weight)))
+    (is (< (:byte-count weight) (* 4 (arr/nelems (:shape weight)))))
+    (is (contract/approx-vec? (arr/->vec (nm/matmul input dense))
+                              (arr/->vec (q/matmul input weight))))))
+
+(deftest q8-0-matmul-keeps-original-block-layout
+  (let [backend (cpu/cpu-backend)
+        weight (q/matrix backend
+                         (vec (concat (q8-block 0.25) (q8-block -0.5)))
+                         [2 32] :q8-0)
+        input (arr/from-vec backend (repeat 32 1.0) [1 32])
+        expected [(reduce + (map #(* 0.25 %) (range -16 16)))
+                  (reduce + (map #(* -0.5 %) (range -16 16)))]]
+    (is (= 68 (:byte-count weight)))
+    (is (= 32 (:block-size weight)))
+    (is (contract/approx-vec? expected (arr/->vec (q/matmul input weight))))))
+
+(deftest packed-embedding-gathers-rows-and-shares-tied-matrix-buffer
+  (let [backend (cpu/cpu-backend)
+        indices (arr/from-vec backend [1 0 1] [3])
+        fixtures
+        [[:q5-0 (vec (concat (q5-block 0.5) (q5-block -0.25)))
+          [(q5-dense-row 0.5) (q5-dense-row -0.25)]]
+         [:q4-k (vec (concat (block 0.5 0.25) (block -0.125 0.5)))
+          [(dense-row 0.5 0.25) (dense-row -0.125 0.5)]]
+         [:q6-k (vec (concat (q6-block 0.25) (q6-block -0.125)))
+          [(q6-dense-row 0.25) (q6-dense-row -0.125)]]
+         [:q8-0 (vec (concat (q8-block 0.25) (q8-block -0.5)))
+          [(mapv #(* 0.25 %) (range -16 16))
+           (mapv #(* -0.5 %) (range -16 16))]]]]
+    (doseq [[quant-type bytes rows] fixtures]
+      (let [table (q/table backend bytes [2 (count (first rows))] quant-type)
+            tied (q/as-matrix table)
+            expected (vec (mapcat #(nth rows %) [1 0 1]))]
+        (is (identical? (:handle table) (:handle tied)))
+        (is (= [(count (first rows)) 2] (:shape tied)))
+        (is (contract/approx-vec? expected
+                                  (arr/->vec (q/embedding indices table))))))))
+
+(deftest q6-k-matmul-matches-dense-oracle-without-expanding-weight
+  (let [backend (cpu/cpu-backend)
+        bytes (vec (concat (q6-block 0.25) (q6-block -0.125)))
+        weight (q/matrix backend bytes [2 256] :q6-k)
+        input (arr/from-vec backend (repeat 256 1.0) [1 256])
+        dense (arr/from-vec
+               backend
+               (vec (mapcat (fn [inner]
+                              [(nth (q6-dense-row 0.25) inner)
+                               (nth (q6-dense-row -0.125) inner)])
+                            (range 256))) [256 2])]
+    (is (= 420 (:byte-count weight)))
+    (is (< (:byte-count weight) (* 4 (arr/nelems (:shape weight)))))
+    (is (contract/approx-vec? (arr/->vec (nm/matmul input dense))
+                              (arr/->vec (q/matmul input weight))))))

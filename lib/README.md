@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.num` | `kotoba.num/src` | `num.array`, `num.autograd`, `num.core`, `num.cpu` (Kotoba project library) |
 | `kotoba.ioFilecoin` | `kotoba.ioFilecoin/src` | `filecoin.address`, `filecoin.bigint`, `filecoin.cid`, `filecoin.message` (Kotoba project library) |
 | `kotoba.hil` | `kotoba.hil/src` | `hil.core` (Kotoba project library) |
 | `kotoba.cron` | `kotoba.cron/src` | `cron.execute`, `cron.model`, `cron.validate` (Kotoba project library) |

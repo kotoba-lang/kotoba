@@ -1,0 +1,1485 @@
+(ns num.deno-gpu
+  "The Deno WebGPU→Metal `IGpuDevice` HOST (ADR-2607051400 §Phase 2) — promotes
+  `verify/metal_contract.js`'s already-proven-on-real-Apple-M4-Metal raw JS harness
+  into a REAL, reusable `num.wgsl/IGpuDevice` implementation, so `num.core`'s ops
+  (`axpy!`/`scal!`/`add`/`sub`/`mul`/`div`/`sum`/`amax`/`amin`/`matvec`/`matmul`/`spmv`)
+  dispatch through the SAME shaders on real GPU hardware, from real Clojure code,
+  instead of only being exercised by a standalone verification script.
+
+  CLJS-only (needs `navigator.gpu`, a Deno/browser global — the JVM side is an
+  informative stub). Requires `deno run --allow-all` (`navigator.gpu` is native in
+  Deno ≥ 2, no `--unstable-webgpu` flag needed — confirmed against the Deno binary
+  this ADR pass was built and tested with).
+
+  ## Sync vs. async — the one real design tension, resolved
+
+  WebGPU's device negotiation (`requestAdapter`/`requestDevice`) and buffer readback
+  (`mapAsync`) are Promise-based; everything else (`createBuffer`/`writeBuffer`/
+  `createComputePipeline`/`dispatchWorkgroups`/`queue.submit`) is SYNCHRONOUS — a
+  single GPU queue processes submitted command buffers strictly in submission
+  order, so kernel dispatch never needs to wait on anything. Concretely, for every
+  `num.protocol/IBackend` method:
+    - `-alloc -free -copy-from-host -axpy -scal -ewise -gemv -gemm -spmv` are ALL
+      fully synchronous end-to-end on this device (they only ever create/write/
+      dispatch, never read back) — dispatching `axpy!`/`scal!`/`add`/`sub`/`mul`/
+      `div`/`matvec`/`matmul`/`spmv` through `WgslBackendAsync` behaves EXACTLY
+      like the fully-synchronous `num.wgsl-backend/WgslBackend`.
+    - `-copy-to-host -reduce -dot -nrm2` are the only ops that ever call
+      `-read-buffer`, and `-read-buffer` is unavoidably async on this host (it
+      awaits `GPUBuffer.mapAsync`). `WgslBackendAsync` does NOT pretend otherwise:
+      these four methods return a JS `Promise` instead of an immediate value — a
+      deliberate, documented deviation from `IBackend`'s normal 'reductions/dot
+      return host scalars' contract, exactly the tension `num.wgsl-backend`'s own
+      docstring already flagged as unresolved. Callers on Deno must `.then` (or
+      `await` at the top-level script boundary, which Deno supports) these four;
+      see `test/num/deno_gpu_verify.cljk` for the pattern.
+
+  We tried the ClojureScript-native `^:async`/`js-await` special forms first —
+  confirmed NOT supported by this repo's plain `kbb -M -m cljs.main` compiler
+  pipeline (ClojureScript 1.11.132, no shadow-cljs): they compile to calls on an
+  undeclared var, not real `async`/`await` JS. Plain JS Promise `.then` interop
+  (the pattern `kotoba-lang/host`'s `kami.backend.browser` already uses for its own
+  browser GPU host bring-up, mixed with `cljs.core.async`'s `go` there) is the
+  established, working idiom in this org for this exact kind of host-boundary
+  async bridging, so `WgslBackendAsync` uses the same interop style, without
+  pulling in `core.async` (not needed here — no complex internal control flow, just
+  a couple of `.then` chains)."
+  (:require [num.protocol :as p]
+            [num.array :as arr]
+            [num.dtype :as dtype]
+            [num.wgsl :as w]
+            [num.wgsl-backend :as wb]))
+
+#?(:cljs
+   (do
+     ;; --- IGpuDevice: navigator.gpu, mirroring verify/metal_contract.js exactly ---
+
+     (def ^:private storage-usage
+       (bit-or js/GPUBufferUsage.STORAGE js/GPUBufferUsage.COPY_SRC js/GPUBufferUsage.COPY_DST))
+     (def ^:private uniform-usage
+       (bit-or js/GPUBufferUsage.UNIFORM js/GPUBufferUsage.COPY_DST))
+     (def ^:private readback-usage
+       (bit-or js/GPUBufferUsage.COPY_DST js/GPUBufferUsage.MAP_READ))
+
+     (defn- usage->flags [usage]
+       (case usage
+         :uniform uniform-usage
+         (:storage :read) storage-usage))
+
+     (defn- linear-workgroups
+       "Map a 64-wide linear invocation range across WebGPU's x/y dispatch
+       dimensions without exceeding the per-dimension 65,535 limit. Shaders
+       using this layout flatten gid.xy with the reported num_workgroups.x."
+       [invocations]
+       (let [groups (wb/ceil-div invocations 64)
+             y (wb/ceil-div groups 65535)
+             x (wb/ceil-div groups y)]
+         [x y 1]))
+
+     (defn- next-power-of-two [n]
+       (loop [value 1]
+         (if (>= value n) value (recur (* 2 value)))))
+
+     (defn- apply-repetition-penalty-row!
+       [dev pipes logits-h row cols previous-tokens repetition-penalty]
+       (let [previous-tokens (vec (distinct previous-tokens))]
+         (when (and (not= 1.0 repetition-penalty) (seq previous-tokens))
+           (let [tokens (w/-create-buffer dev (count previous-tokens) :storage)]
+             (w/-write-buffer dev tokens (wb/u32-tag previous-tokens))
+             (w/-dispatch dev (wb/get-pipeline dev pipes :repetition-penalty-row)
+                          [logits-h tokens
+                           (wb/uni dev (wb/u32-tag
+                                        [row cols (count previous-tokens) 0]))
+                           (wb/uni dev [(double repetition-penalty)])]
+                          [(wb/ceil-div (count previous-tokens) 64) 1 1])
+             (w/-destroy-buffer dev tokens)))))
+
+     (defn- top-k-row-buffer!
+       [dev pipes logits-h row cols k]
+       (let [candidates (w/-create-buffer dev (* 2 k) :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev pipes :top-k-row)
+                      [logits-h candidates
+                       (wb/uni dev (wb/u32-tag [row cols k 0]))]
+                      [1 1 1])
+         candidates))
+
+     (defn- record-allocation! [stats buffer]
+       (let [bytes (.-size buffer)]
+         (swap! stats
+                (fn [state]
+                  (let [live-buffers (inc (:live-buffers state))
+                        live-bytes (+ (:live-bytes state) bytes)]
+                    (-> state
+                        (assoc :live-buffers live-buffers :live-bytes live-bytes)
+                        (update-in [:live-buffers-by-size bytes] (fnil inc 0))
+                        (update :created-buffers inc)
+                        (update :created-bytes + bytes)
+                        (update :peak-live-buffers max live-buffers)
+                        (update :peak-live-bytes max live-bytes))))))
+       buffer)
+
+     (defn- record-destroy! [stats buffer]
+       (let [bytes (.-size buffer)]
+         (swap! stats
+                (fn [state]
+                  (let [remaining (dec (get-in state
+                                               [:live-buffers-by-size bytes] 0))]
+                    (cond-> (-> state
+                                (update :live-buffers dec)
+                                (update :live-bytes - bytes)
+                                (update :destroyed-buffers inc)
+                                (update :destroyed-bytes + bytes))
+                      (pos? remaining)
+                      (assoc-in [:live-buffers-by-size bytes] remaining)
+                      (not (pos? remaining))
+                      (update :live-buffers-by-size dissoc bytes)))))
+         (.destroy buffer)))
+
+     (defn- record-transfer! [stats kind nbytes]
+       (swap! stats
+              (fn [state]
+                (-> state
+                    (update (keyword (str (name kind) "s")) (fnil inc 0))
+                    (update (keyword (str (name kind) "-bytes"))
+                            (fnil + 0) nbytes)))))
+
+     (deftype DenoGpuDevice [dev stats]
+       w/IGpuDevice
+       (-create-buffer [_ n usage]
+         (let [nbytes (* 4 (long n))
+               floor (if (= usage :uniform) 16 4)]
+           (record-allocation!
+            stats (.createBuffer dev #js {:size (max nbytes floor)
+                                          :usage (usage->flags usage)}))))
+
+       (-write-buffer [_ buf xs]
+         ;; Dtype comes from `num.wgsl-backend/u32-tag` metadata, NOT from
+         ;; inspecting the numbers themselves: ClojureScript numbers have no
+         ;; Long-vs-Double distinction (unlike the JVM) — `(integer? 2.0)` is
+         ;; TRUE in cljs, so a value-based guess would misclassify every whole-
+         ;; number f32 payload (e.g. `[1 2 3 4]`) as u32. Untagged xs defaults to
+         ;; f32 (every payload-data buffer is f32; only CSR row-ptr/col-idx and
+         ;; the ewise/reduce/gemv/gemm uniform dims/op-selector are u32, and
+         ;; num.wgsl-backend explicitly tags exactly those call sites).
+         (let [u32? (= :u32 (:num.wgsl/dtype (meta xs)))
+               arr (if u32?
+                     (js/Uint32Array. (into-array xs))
+                     (js/Float32Array. (into-array (map double xs))))]
+           (.writeBuffer (.-queue dev) buf 0 arr)))
+
+       (-read-buffer [_ buf n]
+         ;; ASYNC — see namespace docstring. Every real -read-buffer call site in
+         ;; this repo (-copy-to-host, -reduce's partials) only ever reads f32 data
+         ;; (every num.wgsl shader's OUTPUT buffers are `array<f32>`), so this can
+         ;; always interpret the readback as Float32Array.
+         (let [nbytes (max (* 4 (long n)) 4)
+               staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
+               encoder (.createCommandEncoder dev)]
+           (record-transfer! stats :readback nbytes)
+           (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [out (vec (js/Array.from (js/Float32Array. (.slice (.getMappedRange staging) 0))))]
+                          (.unmap staging)
+                          (.destroy staging)
+                          out))))))
+
+       (-compile [_ wgsl-src entry]
+         (let [module (.createShaderModule dev #js {:code wgsl-src})]
+           (.createComputePipeline dev #js {:layout "auto"
+                                             :compute #js {:module module :entryPoint entry}})))
+
+       (-dispatch [_ pipeline buffers workgroups]
+         (let [bind-group (.createBindGroup
+                            dev #js {:layout (.getBindGroupLayout pipeline 0)
+                                     :entries (into-array
+                                               (map-indexed
+                                                (fn [i b] #js {:binding i :resource #js {:buffer b}})
+                                                buffers))})
+               encoder (.createCommandEncoder dev)
+               pass (.beginComputePass encoder)
+               [wx wy wz] workgroups]
+           (.setPipeline pass pipeline)
+           (.setBindGroup pass 0 bind-group)
+           (.dispatchWorkgroups pass wx wy wz)
+           (.end pass)
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           ;; Every uniform in this backend is a one-dispatch parameter buffer
+           ;; created by `wb/uni`. WebGPU guarantees already-submitted work may
+           ;; finish after destroy, so retire it immediately instead of leaking
+           ;; thousands of tiny GPUBuffer objects across diffusion steps.
+           (doseq [buffer buffers]
+             (when (not (zero? (bit-and (.-usage buffer) js/GPUBufferUsage.UNIFORM)))
+               (record-destroy! stats buffer)))))
+
+       w/IGpuDeviceLifecycle
+       (-destroy-buffer [_ buffer]
+         (record-destroy! stats buffer))
+
+       w/IGpuDeviceDType
+       (-create-buffer-dtype [_ n usage dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "WebGPU typed storage currently supports f16 only"
+                           {:dtype dtype*})))
+         (record-allocation!
+          stats (.createBuffer dev #js {:size (max (* 4 (quot (+ (long n) 1) 2)) 4)
+                                        :usage (usage->flags usage)})))
+       (-write-buffer-dtype [_ buf xs dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
+         (let [values (mapv #(bit-and (dtype/f32->f16-bits %) 0xffff) xs)
+               encoded (js/Uint16Array.
+                        (into-array (cond-> values (odd? (count values)) (conj 0))))]
+           (.writeBuffer (.-queue dev) buf 0 encoded)))
+       (-read-buffer-dtype [_ buf n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "unsupported WebGPU dtype" {:dtype dtype*})))
+         (let [nbytes (max (* 4 (quot (+ (long n) 1) 2)) 4)
+               staging (.createBuffer dev #js {:size nbytes :usage readback-usage})
+               encoder (.createCommandEncoder dev)]
+           (record-transfer! stats :readback nbytes)
+           (.copyBufferToBuffer encoder buf 0 staging 0 nbytes)
+           (.submit (.-queue dev) #js [(.finish encoder)])
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [raw (js/Uint16Array. (.slice (.getMappedRange staging) 0))
+                              out (mapv dtype/f16-bits->f32
+                                        (take n (js/Array.from raw)))]
+                          (.unmap staging)
+                          (.destroy staging)
+                          out)))))))
+
+     ;; --- device negotiation (the ONLY inherently-async step) ------------------
+
+     (defn request-device
+       "Negotiate `navigator.gpu.requestAdapter() → requestDevice()` (exactly
+       `metal_contract.js`'s bring-up). Returns a JS Promise<#js{:adapter :device}>."
+       []
+       (-> (.requestAdapter js/navigator.gpu)
+           (.then (fn [adapter]
+                    (-> (.requestDevice adapter)
+                        (.then (fn [dev]
+                                 (set! (.-onuncapturederror dev)
+                                       (fn [event] (js/console.error (.-error event))))
+                                 #js {:adapter adapter :device dev})))))))
+
+     (defn adapter-description
+       "Best-effort adapter description string for logging (mirrors
+       `adapter.info?.description` in the JS verify harness). `r` is the
+       `#js{:adapter :device}` `request-device` resolves to."
+       [r]
+       (some-> r .-adapter .-info .-description))
+
+     ;; --- WgslBackendAsync: num.wgsl-backend/WgslBackend's dispatch logic, over
+     ;;     an async device ------------------------------------------------------
+
+     (deftype WgslBackendAsync [dev pipes]
+       p/IBackend
+       (-backend-name [_] :wgsl-deno)
+       (-alloc [_ n] (w/-create-buffer dev n :storage))
+       (-free [_ h]
+         (w/-destroy-buffer dev h)
+         nil)
+       (-copy-from-host [_ xs]
+         (let [b (w/-create-buffer dev (count xs) :storage)] (w/-write-buffer dev b (map double xs)) b))
+       (-copy-to-host [_ h n] (w/-read-buffer dev h n))          ; => Promise<vector> — see ns docstring
+
+       (-axpy [_ alpha xh yh n]
+         (w/-dispatch dev (wb/get-pipeline dev pipes :axpy) [xh yh (wb/uni dev [(double alpha)])]
+                      [(wb/ceil-div n 64) 1 1])
+         yh)
+
+       (-scal [_ alpha xh n]
+         (w/-dispatch dev (wb/get-pipeline dev pipes :scal) [xh (wb/uni dev [(double alpha)])]
+                      [(wb/ceil-div n 64) 1 1])
+         xh)
+
+       (-ewise [_ op xh yh n]
+         (let [z (w/-create-buffer dev n :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise)
+                        [xh yh z (wb/uni dev (wb/u32-tag [({:add 0 :sub 1 :mul 2 :div 3} op)]))]
+                        [(wb/ceil-div n 64) 1 1])
+           z))
+
+       (-ewise1 [_ op xh n]
+         (let [z (w/-create-buffer dev n :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1)
+                        [xh z (wb/uni
+                               dev (wb/u32-tag
+                                    [({:exp 0 :relu 1 :neg 2 :silu 3
+                                       :sigmoid 4 :tanh 5
+                                       :sigmoid-gradient 6 :tanh-gradient 7
+                                       :gelu 8 :gelu-gradient 9} op)]))]
+                        [(wb/ceil-div n 64) 1 1])
+           z))
+
+       (-reduce [_ op xh n]
+         (let [nwg (wb/ceil-div n 256)
+               parts (w/-create-buffer dev nwg :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :reduce)
+                        [xh parts (wb/uni dev (wb/u32-tag [({:sum 0 :max 1 :min 2} op)]))] [nwg 1 1])
+           (.then (w/-read-buffer dev parts nwg)                 ; => Promise<number>
+                  (fn [xs]
+                    (w/-destroy-buffer dev parts)
+                    (reduce (case op :sum + :max max :min min) xs)))))
+
+       (-dot [this xh yh n]
+         (let [product (p/-ewise this :mul xh yh n)
+               result (p/-reduce this :sum product n)]
+           (w/-destroy-buffer dev product)
+           result))
+       (-nrm2 [this xh n] (.then (p/-dot this xh xh n) (fn [d] (Math/sqrt d))))   ; => Promise<number>
+
+       (-gemv [this alpha Ah m n xh beta yh]
+         (w/-dispatch dev (wb/get-pipeline dev pipes :gemv) [Ah xh yh (wb/uni dev (wb/u32-tag [m n]))]
+                      [(wb/ceil-div m 64) 1 1])
+         (when (or (not= 1.0 alpha) (not= 0.0 beta)) (p/-scal this alpha yh m))
+         yh)
+
+       (-gemm [this alpha Ah m k Bh n beta Ch]
+         (w/-dispatch dev (wb/get-pipeline dev pipes :gemm) [Ah Bh Ch (wb/uni dev (wb/u32-tag [m k n 0]))]
+                      [(wb/ceil-div n 16) (wb/ceil-div m 16) 1])
+         (when (not= 1.0 alpha) (p/-scal this alpha Ch (* m n)))
+         Ch)
+
+       (-spmv [_ csr xh]
+         (let [m (:n-rows csr)
+               rp (w/-create-buffer dev (inc m) :storage)
+               ci (w/-create-buffer dev (:nnz csr) :storage)
+               v  (w/-create-buffer dev (:nnz csr) :storage)
+               y  (w/-create-buffer dev m :storage)]
+           (w/-write-buffer dev rp (wb/u32-tag (seq (:row-ptr csr))))
+           (w/-write-buffer dev ci (wb/u32-tag (seq (:col-idx csr))))
+           (w/-write-buffer dev v (seq (:vals csr)))
+           (w/-dispatch dev (wb/get-pipeline dev pipes :spmv) [rp ci v xh y] [(wb/ceil-div m 64) 1 1])
+           (doseq [temporary [rp ci v]] (w/-destroy-buffer dev temporary))
+           y))
+
+       p/IDeviceSelection
+       (-argmax-rows [_ logits-h rows cols]
+         (let [indices (w/-create-buffer dev rows :storage)
+               raw-device (.-dev dev)
+               nbytes (* 4 rows)
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :argmax-rows)
+                        [logits-h indices
+                         (wb/uni dev (wb/u32-tag [rows cols 0 0]))]
+                        [rows 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder indices 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [out (vec (js/Array.from
+                                        (js/Uint32Array.
+                                         (.slice (.getMappedRange staging) 0))))]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev indices)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          out)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev indices)
+                         (throw error))))))
+
+       (-top-k-row [_ logits-h _rows cols row k previous-tokens repetition-penalty]
+         (let [_ (apply-repetition-penalty-row!
+                  dev pipes logits-h row cols previous-tokens repetition-penalty)]
+           (let [candidate-count (* 2 k)
+                 candidates (top-k-row-buffer! dev pipes logits-h row cols k)
+                 raw-device (.-dev dev)
+                 nbytes (* 4 candidate-count)
+                 staging (.createBuffer raw-device
+                                        #js {:size nbytes :usage readback-usage})]
+             (let [encoder (.createCommandEncoder raw-device)]
+               (.copyBufferToBuffer encoder candidates 0 staging 0 nbytes)
+               (.submit (.-queue raw-device) #js [(.finish encoder)]))
+             (-> (.mapAsync staging js/GPUMapMode.READ)
+                 (.then (fn [_]
+                          (let [flat (vec (js/Array.from
+                                          (js/Float32Array.
+                                           (.slice (.getMappedRange staging) 0))))
+                                out (mapv (fn [[token logit]]
+                                            [(long token) logit])
+                                          (partition 2 flat))]
+                            (.unmap staging)
+                            (.destroy staging)
+                            (w/-destroy-buffer dev candidates)
+                            (swap! (.-stats dev)
+                                   (fn [state]
+                                     (-> state
+                                         (update :selection-readbacks (fnil inc 0))
+                                         (update :selection-readback-bytes
+                                                 (fnil + 0) nbytes))))
+                            out)))
+                 (.catch (fn [error]
+                           (.destroy staging)
+                           (w/-destroy-buffer dev candidates)
+                           (throw error)))))))
+
+       (-sample-top-k-row
+         [_ logits-h _rows cols row k previous-tokens repetition-penalty
+          temperature top-p random-value]
+         (apply-repetition-penalty-row!
+          dev pipes logits-h row cols previous-tokens repetition-penalty)
+         (let [candidates (top-k-row-buffer! dev pipes logits-h row cols k)
+               selected (w/-create-buffer dev 1 :storage)
+               raw-device (.-dev dev)
+               nbytes 4
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sample-candidates)
+                        [candidates selected (wb/uni dev (wb/u32-tag [k]))
+                         (wb/uni dev [(double temperature) (double top-p)
+                                      (double random-value) 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder selected 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [token (aget (js/Uint32Array.
+                                           (.slice (.getMappedRange staging) 0)) 0)]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev candidates)
+                          (w/-destroy-buffer dev selected)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          token)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev candidates)
+                         (w/-destroy-buffer dev selected)
+                         (throw error))))))
+
+       (-sample-softmax-row
+         [_ logits-h _rows cols row previous-tokens repetition-penalty
+          temperature random-value]
+         (apply-repetition-penalty-row!
+          dev pipes logits-h row cols previous-tokens repetition-penalty)
+         (let [selected (w/-create-buffer dev 1 :storage)
+               raw-device (.-dev dev)
+               nbytes 4
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sample-softmax-row)
+                        [logits-h selected
+                         (wb/uni dev (wb/u32-tag [row cols 0 0]))
+                         (wb/uni dev [(double temperature)
+                                      (double random-value) 0.0 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder selected 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [token (aget (js/Uint32Array.
+                                           (.slice (.getMappedRange staging) 0)) 0)]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev selected)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          token)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev selected)
+                         (throw error))))))
+
+       (-sample-nucleus-row
+         [_ logits-h _rows cols row previous-tokens repetition-penalty
+          temperature top-p random-value]
+         (apply-repetition-penalty-row!
+          dev pipes logits-h row cols previous-tokens repetition-penalty)
+         (let [padded (next-power-of-two cols)
+               values (w/-create-buffer dev padded :storage)
+               tokens (w/-create-buffer dev padded :storage)
+               selected (w/-create-buffer dev 1 :storage)
+               raw-device (.-dev dev)
+               nbytes 4
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})
+               groups [(wb/ceil-div padded 256) 1 1]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nucleus-sort-init)
+                        [logits-h values tokens
+                         (wb/uni dev (wb/u32-tag [row cols padded 0]))]
+                        groups)
+           (loop [span 2]
+             (when (<= span padded)
+               (loop [stride (/ span 2)]
+                 (when (>= stride 1)
+                   (w/-dispatch dev
+                                (wb/get-pipeline dev pipes :nucleus-bitonic-step)
+                                [values tokens
+                                 (wb/uni dev (wb/u32-tag
+                                              [padded span stride 0]))]
+                                groups)
+                   (recur (/ stride 2))))
+               (recur (* span 2))))
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sample-ranked-nucleus)
+                        [values tokens selected
+                         (wb/uni dev (wb/u32-tag [cols padded 0 0]))
+                         (wb/uni dev [(double temperature) (double top-p)
+                                      (double random-value) 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder selected 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [token (aget (js/Uint32Array.
+                                           (.slice (.getMappedRange staging) 0)) 0)]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev values)
+                          (w/-destroy-buffer dev tokens)
+                          (w/-destroy-buffer dev selected)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          token)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev values)
+                         (w/-destroy-buffer dev tokens)
+                         (w/-destroy-buffer dev selected)
+                         (throw error))))))
+
+       (-speculative-rejection-row
+         [_ target-h draft-h _rows cols row draft-token temperature
+          acceptance-random residual-random]
+         (let [result (w/-create-buffer dev 2 :storage)
+               raw-device (.-dev dev)
+               nbytes 8
+               staging (.createBuffer raw-device
+                                      #js {:size nbytes :usage readback-usage})]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :speculative-rejection-row)
+                        [target-h draft-h result
+                         (wb/uni dev (wb/u32-tag [row cols draft-token 0]))
+                         (wb/uni dev [(double temperature)
+                                      (double acceptance-random)
+                                      (double residual-random) 0.0])]
+                        [1 1 1])
+           (let [encoder (.createCommandEncoder raw-device)]
+             (.copyBufferToBuffer encoder result 0 staging 0 nbytes)
+             (.submit (.-queue raw-device) #js [(.finish encoder)]))
+           (-> (.mapAsync staging js/GPUMapMode.READ)
+               (.then (fn [_]
+                        (let [values (js/Uint32Array.
+                                      (.slice (.getMappedRange staging) 0))
+                              out {:accepted? (= 1 (aget values 0))
+                                   :token (aget values 1)}]
+                          (.unmap staging)
+                          (.destroy staging)
+                          (w/-destroy-buffer dev result)
+                          (swap! (.-stats dev)
+                                 (fn [state]
+                                   (-> state
+                                       (update :selection-readbacks (fnil inc 0))
+                                       (update :selection-readback-bytes
+                                               (fnil + 0) nbytes))))
+                          out)))
+               (.catch (fn [error]
+                         (.destroy staging)
+                         (w/-destroy-buffer dev result)
+                         (throw error))))))
+
+       p/IQuantizedOps
+       (-quantized-from-host [_ bytes _params]
+         (let [words (wb/pack-bytes-u32 bytes)
+               buffer (w/-create-buffer dev (count words) :storage)]
+           (w/-write-buffer dev buffer words)
+           buffer))
+       (-quantized-matmul [_ input-h weight-h
+                           {:keys [quant-type m k n blocks-per-row]}]
+         (when-not (#{:q5-0 :q4-k :q6-k :q8-0} quant-type)
+           (throw (ex-info "unsupported WebGPU quantized matmul"
+                           {:quant-type quant-type})))
+         (let [output (w/-create-buffer dev (* m n) :storage)]
+           (w/-dispatch dev (wb/get-pipeline
+                             dev pipes ({:q5-0 :q5-0-matmul
+                                        :q4-k :q4-k-matmul
+                                        :q6-k :q6-k-matmul
+                                        :q8-0 :q8-0-matmul} quant-type))
+                        [input-h weight-h output
+                         (wb/uni dev (wb/u32-tag [m k n blocks-per-row]))]
+                        [(* (wb/ceil-div m 4) n) 1 1])
+           output))
+       (-quantized-embedding [_ indices-h table-h
+                              {:keys [quant-type rows dim count blocks-per-row total]}]
+         (let [pipeline ({:q5-0 :q5-0-embedding
+                          :q4-k :q4-k-embedding :q6-k :q6-k-embedding
+                          :q8-0 :q8-0-embedding} quant-type)]
+           (when-not pipeline
+             (throw (ex-info "unsupported WebGPU quantized embedding"
+                             {:quant-type quant-type})))
+           (let [output (w/-create-buffer dev total :storage)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes pipeline)
+                          [indices-h table-h output
+                           (wb/uni dev (wb/u32-tag
+                                        [rows dim count blocks-per-row total 0 0 0]))]
+                          [(wb/ceil-div total 64) 1 1])
+             output)))
+
+       p/IMutableBufferOps
+       (-copy-into! [_ destination source offset n dtype*]
+         (case dtype*
+           :f32
+           (w/-dispatch dev (wb/get-pipeline dev pipes :copy-into)
+                        [destination source
+                         (wb/uni dev (wb/u32-tag [offset n 0 0]))]
+                        [(wb/ceil-div n 64) 1 1])
+           :f16
+           (do
+             (when-not (and (even? offset) (even? n))
+               (throw (ex-info "f16 copy-into requires even offset and count"
+                               {:offset offset :count n})))
+             (w/-dispatch dev (wb/get-pipeline dev pipes :copy-into-f16)
+                          [destination source
+                           (wb/uni dev (wb/u32-tag
+                                        [(quot offset 2) (quot n 2) 0 0]))]
+                          [(wb/ceil-div (quot n 2) 64) 1 1]))
+           (throw (ex-info "GPU copy-into supports f32/f16" {:dtype dtype*})))
+         destination)
+
+       p/IDTypeStorage
+       (-alloc-dtype [_ n dtype*]
+         (w/-create-buffer-dtype dev n :storage dtype*))
+       (-copy-from-host-dtype [_ xs dtype*]
+         (let [buffer (w/-create-buffer-dtype dev (count xs) :storage dtype*)]
+           (w/-write-buffer-dtype dev buffer xs dtype*)
+           buffer))
+       (-copy-to-host-dtype [_ h n dtype*]
+         (w/-read-buffer-dtype dev h n dtype*))
+
+       p/ICastOps
+       (-cast-dtype [_ input n source-dtype target-dtype]
+         (case [source-dtype target-dtype]
+           [:f16 :f32]
+           (let [output (w/-create-buffer dev n :storage)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :f16-to-f32)
+                          [input output (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                          [(wb/ceil-div n 64) 1 1])
+             output)
+           [:f32 :f16]
+           (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :f32-to-f16)
+                          [input output (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                          [(wb/ceil-div (wb/ceil-div n 2) 64) 1 1])
+             output)
+           (throw (ex-info "unsupported GPU dtype cast"
+                           {:source source-dtype :target target-dtype}))))
+
+       p/IDTypeOps
+       (-ewise-dtype [_ op xh yh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise-f16)
+                        [xh yh output
+                         (wb/uni dev (wb/u32-tag [({:add 0 :sub 1 :mul 2 :div 3} op)
+                                                  n 0 0]))]
+                        (linear-workgroups (wb/ceil-div n 2)))
+           output))
+       (-ewise1-dtype [_ op xh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :ewise1-f16)
+                        [xh output
+                         (wb/uni dev (wb/u32-tag [({:exp 0 :relu 1 :neg 2 :silu 3
+                                                   :sigmoid 4 :tanh 5
+                                                   :sigmoid-gradient 6 :tanh-gradient 7
+                                                   :gelu 8 :gelu-gradient 9} op)
+                                                  n 0 0]))]
+                        (linear-workgroups (wb/ceil-div n 2)))
+           output))
+       (-scale-dtype [_ alpha xh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU scale supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev n :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :scale-f16)
+                        [xh output
+                         (wb/uni dev (wb/u32-tag [n 0 0 0]))
+                         (wb/uni dev [(double alpha)])]
+                        (linear-workgroups (wb/ceil-div n 2)))
+           output))
+       (-gemm-dtype [_ Ah m k Bh n dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU operations support f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev (* m n) :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :gemm-f16)
+                        [Ah Bh output (wb/uni dev (wb/u32-tag [m k n 0]))]
+                        [(wb/ceil-div (wb/ceil-div (* m n) 2) 64) 1 1])
+           output))
+
+       p/IDTypeTensorOps
+       (-conv2d-nchw-dtype [_ input-h weight-h bias-h
+                            {:keys [n cout oh ow] :as params} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU convolution supports f16 only" {:dtype dtype*})))
+         (let [total (* n cout oh ow)
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               bias (or bias-h (w/-create-buffer-dtype dev cout :storage :f16))
+               spatial (* oh ow)
+               oc4? (and (= 1 (:groups params))
+                         (zero? (mod cout 4)) (zero? (mod spatial 2)))
+               invocations (if oc4? (* n (quot cout 4) (quot spatial 2))
+                               (wb/ceil-div total 2))
+               values ((juxt :n :cin :h :width :cout :cin-group :kh :kw
+                             :oh :ow :sh :sw :ph :pw :dh :dw :groups)
+                       params)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes
+                                             (if oc4? :conv2d-nchw-f16-oc4
+                                                 :conv2d-nchw-f16))
+                        [input-h weight-h bias output
+                         (wb/uni dev (wb/u32-tag (into (vec values) [0 0 0])))]
+                        [(wb/ceil-div invocations 64) 1 1])
+           (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-group-norm-nchw-dtype [_ input-h weight-h bias-h
+                                {:keys [n c h width groups channels-group
+                                        group-size eps silu?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU GroupNorm supports f16 only" {:dtype dtype*})))
+         (let [total (* n c h width)
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               weight (or weight-h
+                          (let [buffer (w/-create-buffer-dtype dev c :storage :f16)]
+                            (w/-write-buffer-dtype dev buffer (repeat c 1.0) :f16)
+                            buffer))
+               bias (or bias-h (w/-create-buffer-dtype dev c :storage :f16))]
+           (w/-dispatch dev (wb/get-pipeline
+                             dev pipes (if (even? group-size)
+                                         :group-norm-nchw-f16
+                                         :group-norm-nchw-f16-reference))
+                        [input-h weight bias output
+                         (wb/uni dev (wb/u32-tag
+                                      [n c h width groups channels-group
+                                       group-size (* h width) (if silu? 1 0)]))
+                         (wb/uni dev [(double eps)])]
+                        (if (even? group-size)
+                          [(* n groups) 1 1]
+                          [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1]))
+           (when-not weight-h (w/-destroy-buffer dev weight))
+           (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-upsample-nearest2d-dtype [_ input-h
+                                    {:keys [n c h width oh ow scale-h scale-w]}
+                                    dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU upsample supports f16 only" {:dtype dtype*})))
+         (let [total (* n c oh ow)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :upsample-nearest2d-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [n c h width oh ow scale-h scale-w total]))]
+                        (linear-workgroups (wb/ceil-div total 2)))
+           output))
+       (-slice-axis-dtype [_ input-h
+                           {:keys [total input-block output-block input-offset]}
+                           dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU slice supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :slice-axis-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [total input-block output-block input-offset]))]
+                        (linear-workgroups (wb/ceil-div total 2)))
+           output))
+       (-nchw-to-rgb-image-dtype [_ input-h {:keys [height width total]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RGB conversion supports f16 only"
+                           {:dtype dtype*})))
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        (linear-workgroups total))
+           output))
+       (-transpose-dtype [_ input-h
+                          {:keys [rank total input-shape output-shape perm]}
+                          dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU transpose supports f16 only" {:dtype dtype*})))
+         (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+               output (w/-create-buffer-dtype dev total :storage :f16)
+               params (concat [rank total 0 0] (pad4 input-shape)
+                              (pad4 output-shape) (pad4 perm))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd-f16)
+                        [input-h output (wb/uni dev (wb/u32-tag params))]
+                        (linear-workgroups (wb/ceil-div total 2)))
+           output))
+       (-multi-head-attention-dtype
+         [_ query-h key-h value-h
+          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
+                  causal?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU attention supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-f16)
+                        [query-h key-h value-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0) 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-multi-head-attention-backward-dtype
+         [_ query-h key-h value-h grad-output-h
+          {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
+                  causal?]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU attention backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total-q (* batch seq-q d-model)
+               total-k (* batch seq-k kv-d-model)
+               total (max total-q total-k)
+               expand (fn [input n]
+                        (let [output (w/-create-buffer dev n :storage)]
+                          (w/-dispatch dev (wb/get-pipeline dev pipes :f16-to-f32)
+                                       [input output
+                                        (wb/uni dev (wb/u32-tag [n 0 0 0]))]
+                                       [(wb/ceil-div n 64) 1 1])
+                          output))
+               query (expand query-h total-q)
+               key (expand key-h total-k)
+               value (expand value-h total-k)
+               grad-output (expand grad-output-h total-q)
+               mask (w/-create-buffer dev (* batch seq-k) :storage)
+               grad-query (w/-create-buffer dev total-q :storage)
+               grad-key (w/-create-buffer dev total-k :storage)
+               grad-value (w/-create-buffer dev total-k :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-backward)
+                        [query key value mask grad-output grad-query grad-key grad-value
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0) 0 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (doseq [temporary [query key value grad-output mask]]
+             (w/-destroy-buffer dev temporary))
+           {:query grad-query :key grad-key :value grad-value}))
+       (-add-last-axis-bias-dtype [_ input-h bias-h {:keys [total width]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU bias add supports f16 only" {:dtype dtype*})))
+         (let [output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias-f16)
+                        [input-h bias-h output
+                         (wb/uni dev (wb/u32-tag [total width 0 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-embedding-dtype [_ indices-h weight-h {:keys [tokens rows dim]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU embedding supports f16 only" {:dtype dtype*})))
+         (let [total (* tokens dim)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding-f16)
+                        [indices-h weight-h output
+                         (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+       (-embedding-backward-dtype
+         [_ indices-h grad-output-h {:keys [tokens rows dim]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU embedding backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows dim)
+               grad-weight (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding-backward-f16)
+                        [indices-h grad-output-h grad-weight
+                         (wb/uni dev (wb/u32-tag [tokens rows dim total]))]
+                        [(wb/ceil-div total 64) 1 1])
+           grad-weight))
+       (-rms-norm-dtype [_ input-h weight-h {:keys [rows dim eps]} dtype*]
+         (when-not (and (= dtype* :f16) (even? dim))
+           (throw (ex-info "typed GPU RMSNorm requires f16 and even features"
+                           {:dtype dtype* :dim dim})))
+         (let [output (w/-create-buffer-dtype dev (* rows dim) :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm-f16)
+                        [input-h weight-h output
+                         (wb/uni dev (wb/u32-tag [rows dim 0 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           output))
+       (-rms-norm-backward-dtype
+         [_ input-h weight-h grad-output-h {:keys [rows dim eps]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RMSNorm backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows dim)
+               stats (w/-create-buffer dev (* rows 2) :storage)
+               grad-input (w/-create-buffer-dtype dev total :storage :f16)
+               grad-weight (w/-create-buffer dev dim :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes :rms-norm-backward-stats-f16)
+                        [input-h weight-h grad-output-h stats
+                         (wb/uni dev (wb/u32-tag [rows dim total 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm-backward-f16)
+                        [input-h weight-h grad-output-h stats grad-input grad-weight
+                         (wb/uni dev (wb/u32-tag [rows dim total 0]))]
+                        [(wb/ceil-div (max (wb/ceil-div total 2) dim) 64) 1 1])
+           (w/-destroy-buffer dev stats)
+           {:input grad-input :weight grad-weight}))
+       (-cross-entropy-forward-dtype
+         [_ logits-h labels-h {:keys [rows classes ignore-index]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU cross entropy supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows classes)
+               stats (w/-create-buffer dev (* rows 2) :storage)
+               scalar (w/-create-buffer dev 2 :storage)
+               params (wb/uni dev (wb/u32-tag
+                                   [rows classes total ignore-index]))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :cross-entropy-stats-f16)
+                        [logits-h stats params] [rows 1 1])
+           (w/-dispatch dev (wb/get-pipeline dev pipes :cross-entropy-loss-f16)
+                        [logits-h labels-h stats scalar
+                         (wb/uni dev (wb/u32-tag
+                                      [rows classes total ignore-index]))]
+                        [1 1 1])
+           {:loss scalar :stats stats}))
+       (-cross-entropy-backward-dtype
+         [_ logits-h labels-h stats-h upstream-h
+          {:keys [rows classes ignore-index loss-h]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU cross entropy backward supports f16 only"
+                           {:dtype dtype*})))
+         (let [total (* rows classes)
+               grad-logits (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes :cross-entropy-gradient-f16)
+                        [logits-h labels-h stats-h loss-h upstream-h grad-logits
+                         (wb/uni dev (wb/u32-tag
+                                      [rows classes total ignore-index]))]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           (w/-destroy-buffer dev stats-h)
+           grad-logits))
+       (-rotary-embedding-dtype
+         [_ input-h {:keys [batch sequence embed heads head-dim position-offset
+                            theta direction]} dtype*]
+         (when-not (= dtype* :f16)
+           (throw (ex-info "typed GPU RoPE supports f16 only" {:dtype dtype*})))
+         (let [total (* batch sequence embed)
+               output (w/-create-buffer-dtype dev total :storage :f16)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rotary-embedding-f16)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                         (wb/uni dev [(double theta)])
+                         (wb/uni dev [(double direction)])]
+                        [(wb/ceil-div (wb/ceil-div total 2) 64) 1 1])
+           output))
+
+       p/ITensorBackend
+       (-conv2d-nchw [_ input-h weight-h bias-h
+                      {:keys [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw groups]}]
+         (let [total (* n cout oh ow)
+               output (w/-create-buffer dev total :storage)
+               bias (or bias-h (w/-create-buffer dev cout :storage))
+               params [n cin h width cout cin-group kh kw oh ow sh sw ph pw dh dw
+                       groups 0 0 0]]
+           (let [oc4? (and (= groups 1) (zero? (mod cout 4)))
+                 invocations (if oc4? (quot total 4) total)]
+             (w/-dispatch
+              dev (wb/get-pipeline
+                   dev pipes (if oc4? :conv2d-nchw-oc4 :conv2d-nchw))
+              [input-h weight-h bias output (wb/uni dev (wb/u32-tag params))]
+              [(wb/ceil-div invocations 64) 1 1]))
+           (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-group-norm-nchw [_ input-h weight-h bias-h
+                          {:keys [n c h width groups channels-group group-size eps]
+                           :as params}]
+         (let [total (* n c h width)
+               output (w/-create-buffer dev total :storage)
+               weight (or weight-h
+                          (let [buffer (w/-create-buffer dev c :storage)]
+                            (w/-write-buffer dev buffer (repeat c 1.0)) buffer))
+               bias (or bias-h (w/-create-buffer dev c :storage))
+               dims [n c h width groups channels-group group-size (* h width)]]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev pipes
+                                         (if (:silu? params)
+                                           :group-norm-silu-nchw
+                                           :group-norm-nchw))
+                        [input-h weight bias output (wb/uni dev (wb/u32-tag dims))
+                         (wb/uni dev [(double eps)])]
+                        [(* n groups) 1 1])
+           (when-not weight-h (w/-destroy-buffer dev weight))
+           (when-not bias-h (w/-destroy-buffer dev bias))
+           output))
+       (-embedding [_ indices-h weight-h {:keys [tokens rows dim]}]
+         (let [total (* tokens dim)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :embedding)
+                        [indices-h weight-h output
+                         (wb/uni dev (wb/u32-tag [tokens rows dim 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-rms-norm [_ input-h weight-h {:keys [rows dim eps]}]
+         (let [output (w/-create-buffer dev (* rows dim) :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rms-norm)
+                        [input-h weight-h output
+                         (wb/uni dev (wb/u32-tag [rows dim 0 0]))
+                         (wb/uni dev [(double eps)])]
+                        [rows 1 1])
+           output))
+       (-rotary-embedding
+         [_ input-h {:keys [batch sequence embed heads head-dim position-offset
+                            theta direction]}]
+         (let [total (* batch sequence embed)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rotary-embedding)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch sequence embed heads head-dim
+                                       position-offset 0 0]))
+                         (wb/uni dev [(double theta)])
+                         (wb/uni dev [(double direction)])]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-rgb-image-to-nchw [_ input-h {:keys [height width total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :rgb-image-to-nchw)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-nchw-to-rgb-image [_ input-h {:keys [height width total]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :nchw-to-rgb-image)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [height width total 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-upsample-nearest2d [_ input-h
+                             {:keys [n c h width oh ow scale-h scale-w]}]
+         (let [total (* n c oh ow)
+               output (w/-create-buffer dev total :storage)
+               dims [n c h width oh ow scale-h scale-w]]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :upsample-nearest2d)
+                        [input-h output (wb/uni dev (wb/u32-tag dims))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-cat [_ input-handles {:keys [total-output output-block inputs]}]
+         (let [output (w/-create-buffer dev total-output :storage)]
+           (doseq [[input-h {:keys [total block axis-offset]}]
+                   (map vector input-handles inputs)]
+             (w/-dispatch dev (wb/get-pipeline dev pipes :cat-copy)
+                          [input-h output
+                           (wb/uni dev (wb/u32-tag [total block output-block axis-offset]))]
+                          [(wb/ceil-div total 64) 1 1]))
+           output))
+       (-slice-axis [_ input-h {:keys [total input-block output-block input-offset]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :slice-axis)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag
+                                      [total input-block output-block input-offset]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-pad-right-bottom-nchw [_ input-h {:keys [total h width output-width]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :pad-right-bottom-nchw)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [total h width output-width]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-add-last-axis-bias [_ input-h bias-h {:keys [total width]}]
+         (let [output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :add-last-axis-bias)
+                        [input-h bias-h output
+                         (wb/uni dev (wb/u32-tag [total width 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-transpose-2d [_ input-h {:keys [rows cols]}]
+         (let [output (w/-create-buffer dev (* rows cols) :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-2d)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [rows cols]))]
+                        [(wb/ceil-div cols 16) (wb/ceil-div rows 16) 1])
+           output))
+       (-transpose-nd [_ input-h {:keys [rank total input-shape output-shape perm]}]
+         (let [pad4 #(vec (take 4 (concat % (repeat 0))))
+               params (concat [rank total 0 0] (pad4 input-shape)
+                              (pad4 output-shape) (pad4 perm))
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :transpose-nd)
+                        [input-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-batched-matmul [_ a-h b-h
+                         {:keys [batch-shape batch-a batch-b batch-rank
+                                 batches m k n total]}]
+         (let [align (fn [shape]
+                       (vec (concat (repeat (- batch-rank (count shape)) 1) shape
+                                    (repeat (- 4 batch-rank) 1))))
+               out-shape (vec (concat batch-shape (repeat (- 4 batch-rank) 1)))
+               params (concat [batch-rank batches m n] [k total 0 0]
+                              out-shape (align batch-a) (align batch-b))
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :batched-matmul)
+                        [a-h b-h output (wb/uni dev (wb/u32-tag params))]
+                        [(wb/ceil-div total 64) 1 1])
+           output))
+       (-sum-rows [_ input-h {:keys [rows cols]}]
+         (let [output (w/-create-buffer dev cols :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :bias-gradient)
+                        [input-h output
+                         (wb/uni dev (wb/u32-tag [rows cols]))]
+                        [(wb/ceil-div cols 64) 1 1])
+           output))
+       (-mse-loss [_ prediction-h target-h {:keys [count]}]
+         (let [loss (w/-create-buffer dev 1 :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :mse-loss)
+                        [prediction-h target-h loss
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [1 1 1])
+           loss))
+       (-mse-gradient [_ prediction-h target-h upstream-h {:keys [count]}]
+         (let [gradient (w/-create-buffer dev count :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :mse-gradient)
+                        [prediction-h target-h upstream-h gradient
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           gradient))
+       (-sgd-step [_ parameter-h gradient-h {:keys [count learning-rate]}]
+         (let [output (w/-create-buffer dev count :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :sgd-step)
+                        [parameter-h gradient-h output
+                         (wb/uni dev [(double learning-rate)])
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           output))
+       (-adamw-step [_ parameter-h gradient-h moment-h variance-h
+                     {:keys [count learning-rate beta1 beta2 eps weight-decay
+                             correction1 correction2]}]
+         (let [moment (or moment-h (w/-create-buffer dev count :storage))
+               variance (or variance-h (w/-create-buffer dev count :storage))
+               next-parameter (w/-create-buffer dev count :storage)
+               next-moment (w/-create-buffer dev count :storage)
+               next-variance (w/-create-buffer dev count :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :adamw-step)
+                        [parameter-h gradient-h moment variance
+                         next-parameter next-moment next-variance
+                         (wb/uni dev (mapv double
+                                           [learning-rate beta1 beta2 eps
+                                            weight-decay correction1 correction2 0.0]))
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           {:parameter next-parameter :moment next-moment
+            :variance next-variance}))
+       (-unscale-gradient [_ gradient-h {:keys [count inverse-scale]}]
+         (let [output (w/-create-buffer dev count :storage)
+               found-inf (w/-create-buffer dev 1 :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :unscale-gradient)
+                        [gradient-h output found-inf
+                         (wb/uni dev [(double inverse-scale)])
+                         (wb/uni dev (wb/u32-tag [count]))]
+                        [(wb/ceil-div count 64) 1 1])
+           {:gradient output :found-inf found-inf}))
+       (-multi-head-attention [_ query-h key-h value-h key-padding-mask-h
+                               {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim total
+                                       causal? has-key-padding-mask?]}]
+         (let [output (w/-create-buffer dev total :storage)
+               mask (or key-padding-mask-h
+                        (w/-create-buffer dev (* batch seq-k) :storage))]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention)
+                        [query-h key-h value-h mask output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (when-not key-padding-mask-h (w/-destroy-buffer dev mask))
+           output))
+       (-multi-head-attention-backward [_ query-h key-h value-h key-padding-mask-h
+                                        grad-output-h
+                                        {:keys [batch seq-q seq-k d-model kv-d-model heads kv-heads head-dim
+                                                causal? has-key-padding-mask?]}]
+         (let [total-q (* batch seq-q d-model)
+               total-k (* batch seq-k kv-d-model)
+               total (max total-q total-k)
+               mask (or key-padding-mask-h
+                        (w/-create-buffer dev (* batch seq-k) :storage))
+               grad-query (w/-create-buffer dev total-q :storage)
+               grad-key (w/-create-buffer dev total-k :storage)
+               grad-value (w/-create-buffer dev total-k :storage)]
+           (w/-dispatch dev (wb/get-pipeline dev pipes :multi-head-attention-backward)
+                        [query-h key-h value-h mask grad-output-h
+                         grad-query grad-key grad-value
+                         (wb/uni dev (wb/u32-tag
+                                      [batch seq-q seq-k d-model kv-d-model
+                                       heads kv-heads head-dim total-q total-k total
+                                       (if causal? 1 0)
+                                       (if has-key-padding-mask? 1 0) 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (when-not key-padding-mask-h (w/-destroy-buffer dev mask))
+           {:query grad-query :key grad-key :value grad-value})))
+
+     (defn backend
+       "Wrap an already-negotiated `r` (`request-device`'s resolved value) as a
+       WgslBackendAsync — the num.protocol/IBackend GPU dispatch entry point for
+       Deno hosts. Pipelines compile lazily on first use, exactly like
+       num.wgsl-backend/wgsl-backend."
+       [r]
+       (->WgslBackendAsync
+        (->DenoGpuDevice
+         (.-device r)
+         (atom {:live-buffers 0 :live-bytes 0
+                :peak-live-buffers 0 :peak-live-bytes 0
+                :created-buffers 0 :created-bytes 0
+                :destroyed-buffers 0 :destroyed-bytes 0
+                :live-buffers-by-size {}}))
+        (atom {})))
+
+     (defn backend-stats
+       "Snapshot tracked storage/uniform GPUBuffer lifetime counters. Readback
+       staging buffers are intentionally excluded because they are scoped to a
+       Promise and destroyed immediately after unmap."
+       [backend]
+       @(.-stats (.-dev backend)))
+
+     (defn upload-byte-view
+       "Upload an already encoded little-endian f32/f16 ArrayBufferView without
+       expanding it into a JavaScript number sequence. The queue copies the
+       supplied bytes before returning; the source view may therefore alias a
+       mapped checkpoint file."
+       [backend bytes shape dtype*]
+       (dtype/check dtype*)
+       (when-not (or (= dtype* :f32) (= dtype* :f16))
+         (throw (ex-info "raw WebGPU upload supports f32/f16"
+                         {:dtype dtype*})))
+       (let [elements (arr/nelems shape)
+             expected (* elements (dtype/element-bytes dtype*))
+             actual (.-byteLength bytes)]
+         (when-not (= expected actual)
+           (throw (ex-info "raw byte length does not match shape/dtype"
+                           {:expected expected :actual actual :shape shape
+                            :dtype dtype*})))
+         (let [device (.-dev (.-dev backend))
+               buffer (if (= dtype* :f32)
+                        (w/-create-buffer (.-dev backend) elements :storage)
+                        (w/-create-buffer-dtype (.-dev backend) elements :storage :f16))
+               source (if (zero? (mod actual 4))
+                        bytes
+                        (let [padded (js/Uint8Array. (* 4 (Math/ceil (/ actual 4))))]
+                          (.set padded bytes)
+                          padded))]
+           (record-transfer! (.-stats (.-dev backend)) :raw-upload actual)
+           (when (not= actual (.-byteLength source))
+             (swap! (.-stats (.-dev backend))
+                    update :raw-upload-padding-bytes (fnil + 0)
+                    (- (.-byteLength source) actual)))
+           (.writeBuffer (.-queue device) buffer 0 source)
+           (assoc (arr/->NDArray backend buffer (vec shape)) :dtype dtype*))))
+
+     (defn cast-f16-to-f32
+       "Expand a physical f16 NDArray into a device-resident f32 NDArray."
+       [input]
+       (when-not (= :f16 (:dtype input))
+         (throw (ex-info "cast-f16-to-f32 requires f16 input"
+                         {:dtype (:dtype input)})))
+       (let [backend (:backend input)
+             count (arr/nelems (:shape input))
+             dev (.-dev backend)
+             output (w/-create-buffer dev count :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :f16-to-f32)
+                      [(:handle input) output
+                       (wb/uni dev (wb/u32-tag [count 0 0 0]))]
+                      [(wb/ceil-div count 64) 1 1])
+         (assoc (arr/->NDArray backend output (:shape input)) :dtype :f32)))
+
+     (defn upload-f16-as-f32-byte-view
+       "Upload encoded f16 bytes and expand them to f32 entirely on the GPU."
+       [backend bytes shape]
+       (let [packed (upload-byte-view backend bytes shape :f16)
+             output (cast-f16-to-f32 packed)]
+         (arr/release! packed)
+         output))
+
+     (defn upload-bf16-as-f32-byte-view
+       "Upload encoded bf16 bytes and expand them to f32 entirely on the GPU."
+       [backend bytes shape]
+       ;; Raw bf16 and f16 have the same packed-u16 physical storage. The
+       ;; dedicated shader, rather than the temporary's logical tag, determines
+       ;; how those words are decoded.
+       (let [packed (upload-byte-view backend bytes shape :f16)
+             count (arr/nelems shape)
+             dev (.-dev backend)
+             output (w/-create-buffer dev count :storage)]
+         (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :bf16-to-f32)
+                      [(:handle packed) output
+                       (wb/uni dev (wb/u32-tag [count 0 0 0]))]
+                      [(wb/ceil-div count 64) 1 1])
+         (arr/release! packed)
+         (assoc (arr/->NDArray backend output (vec shape)) :dtype :f32)))
+
+     (defn paged-kv-write!
+       "Write one K/V token into `[physical-block,offset]` without host readback."
+       [key-pool value-pool key value block offset]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             backend (:backend key-pool)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (= kv-width (arr/nelems (:shape key)))
+                        (= kv-width (arr/nelems (:shape value)))
+                        (<= 0 block) (< block blocks)
+                        (<= 0 offset) (< offset block-size))
+           (throw (ex-info "invalid paged KV write shapes or address"
+                           {:pool (:shape key-pool) :key (:shape key)
+                            :value (:shape value) :block block :offset offset})))
+         (let [dev (.-dev backend)]
+           (w/-dispatch dev (wb/get-pipeline dev (.-pipes backend) :paged-kv-write)
+                        [(:handle key) (:handle value)
+                         (:handle key-pool) (:handle value-pool)
+                         (wb/uni dev (wb/u32-tag
+                                      [block offset block-size kv-width]))]
+                        [(wb/ceil-div kv-width 64) 1 1]))
+         nil))
+
+     (defn paged-kv-copy-block!
+       "Copy `tokens` used positions from one physical block to another."
+       [key-pool value-pool source destination tokens]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             backend (:backend key-pool)
+             total (* tokens kv-width)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (<= 0 source) (< source blocks)
+                        (<= 0 destination) (< destination blocks)
+                        (not= source destination)
+                        (pos? tokens) (<= tokens block-size))
+           (throw (ex-info "invalid paged KV block copy"
+                           {:pool (:shape key-pool) :source source
+                            :destination destination :tokens tokens})))
+         (let [dev (.-dev backend)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-kv-copy-block)
+                        [(:handle key-pool) (:handle value-pool)
+                         (wb/uni dev (wb/u32-tag
+                                      [source destination tokens block-size
+                                       kv-width total 0 0]))]
+                        [(wb/ceil-div total 64) 1 1]))
+         nil))
+
+     (defn paged-gqa-attention
+       "One-token GQA decode over physical K/V pools and a logical block table."
+       [query key-pool value-pool block-table length heads kv-heads]
+       (let [[blocks block-size kv-width] (:shape key-pool)
+             model (arr/nelems (:shape query))
+             head-dim (quot model heads)
+             required-blocks (quot (+ length block-size -1) block-size)
+             backend (:backend query)]
+         (when-not (and (= (:shape key-pool) (:shape value-pool))
+                        (pos? length) (<= length (* blocks block-size))
+                        (pos? heads) (pos? kv-heads)
+                        (zero? (mod heads kv-heads))
+                        (zero? (mod model heads))
+                        (= kv-width (* kv-heads head-dim))
+                        (<= required-blocks (arr/nelems (:shape block-table))))
+           (throw (ex-info "invalid paged GQA attention shapes"
+                           {:query (:shape query) :pool (:shape key-pool)
+                            :block-table (:shape block-table) :length length
+                            :heads heads :kv-heads kv-heads})))
+         (let [dev (.-dev backend)
+               output (w/-create-buffer dev model :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-gqa-attention)
+                        [(:handle query) (:handle key-pool) (:handle value-pool)
+                         (:handle block-table) output
+                         (wb/uni dev (wb/u32-tag
+                                      [length block-size kv-width heads kv-heads
+                                       head-dim model 0]))]
+                        [(wb/ceil-div model 64) 1 1])
+           (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
+
+     (defn paged-gqa-attention-batch
+       "Batched one-token GQA over shared physical pools. Each query row uses
+       its own block-table row and sequence length."
+       [query key-pool value-pool block-tables lengths heads kv-heads]
+       (let [[batch model] (:shape query)
+             [table-batch max-blocks] (:shape block-tables)
+             [_blocks block-size kv-width] (:shape key-pool)
+             head-dim (quot model heads)
+             backend (:backend query)
+             total (* batch model)]
+         (when-not (and (= 2 (count (:shape query)))
+                        (= (:shape key-pool) (:shape value-pool))
+                        (= batch table-batch)
+                        (= [batch] (:shape lengths))
+                        (pos? batch) (pos? max-blocks)
+                        (pos? heads) (pos? kv-heads)
+                        (zero? (mod heads kv-heads))
+                        (zero? (mod model heads))
+                        (= kv-width (* kv-heads head-dim)))
+           (throw (ex-info "invalid batched paged GQA attention shapes"
+                           {:query (:shape query) :pool (:shape key-pool)
+                            :block-tables (:shape block-tables)
+                            :lengths (:shape lengths) :heads heads
+                            :kv-heads kv-heads})))
+         (let [dev (.-dev backend)
+               output (w/-create-buffer dev total :storage)]
+           (w/-dispatch dev
+                        (wb/get-pipeline dev (.-pipes backend)
+                                         :paged-gqa-attention-batch)
+                        [(:handle query) (:handle key-pool) (:handle value-pool)
+                         (:handle block-tables) (:handle lengths) output
+                         (wb/uni dev (wb/u32-tag
+                                      [batch max-blocks block-size kv-width
+                                       heads kv-heads head-dim model total 0 0 0]))]
+                        [(wb/ceil-div total 64) 1 1])
+           (assoc (arr/->NDArray backend output (:shape query)) :dtype :f32))))
+
+     (defn gpu-backend
+       "Negotiate a live device AND wrap it as a WgslBackendAsync in one step.
+       Mirrors num.cpu/cpu-backend's explicit-construction pattern (num has no
+       dynamic `*backend*` var — every call site is passed a backend value, or an
+       NDArray carries one in `:backend`); the only difference from `cpu-backend`
+       is that THIS constructor is necessarily async (device negotiation is
+       Promise-based), so it returns a JS Promise<WgslBackendAsync> rather than an
+       immediate value."
+       []
+       (.then (request-device) backend)))
+
+   :clj
+   (do
+     (defn request-device [] (throw (ex-info "num.deno-gpu/request-device requires ClojureScript compiled for a Deno/WebGPU host — see README 'Live GPU backend (Deno)'." {})))
+     (defn adapter-description [_] (throw (ex-info "num.deno-gpu/adapter-description requires a cljs/Deno host." {})))
+     (defn backend [_] (throw (ex-info "num.deno-gpu/backend requires a cljs/Deno host." {})))
+     (defn upload-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-byte-view requires a cljs/Deno host." {})))
+     (defn cast-f16-to-f32 [& _] (throw (ex-info "num.deno-gpu/cast-f16-to-f32 requires a cljs/Deno host." {})))
+     (defn upload-f16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-f16-as-f32-byte-view requires a cljs/Deno host." {})))
+     (defn upload-bf16-as-f32-byte-view [& _] (throw (ex-info "num.deno-gpu/upload-bf16-as-f32-byte-view requires a cljs/Deno host." {})))
+     (defn paged-kv-write! [& _] (throw (ex-info "num.deno-gpu/paged-kv-write! requires a cljs/Deno host." {})))
+     (defn paged-kv-copy-block! [& _] (throw (ex-info "num.deno-gpu/paged-kv-copy-block! requires a cljs/Deno host." {})))
+     (defn paged-gqa-attention [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention requires a cljs/Deno host." {})))
+     (defn paged-gqa-attention-batch [& _] (throw (ex-info "num.deno-gpu/paged-gqa-attention-batch requires a cljs/Deno host." {})))
+     (defn gpu-backend [] (throw (ex-info "num.deno-gpu/gpu-backend requires a cljs/Deno host." {})))))
