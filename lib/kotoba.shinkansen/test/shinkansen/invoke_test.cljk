@@ -1,0 +1,169 @@
+(ns shinkansen.invoke-test
+  "The invocation envelope and the authority seam: one shape for every
+  transport, refused by name at every step, and NEVER allowed because
+  nobody said no. Each refusal pins its reason literal — a negative test
+  that only asserts (not (:ok r)) counts a run that failed for another
+  reason (AGENTS.md 8 問 #6)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [shinkansen.invoke :as invoke]
+            [shinkansen.routes :as routes]))
+
+(def ^:private cid "bafkreia2cc444k5yrw57uhszfrvbri7wee3ljbpb5wfcorykk72kgxhjaq")
+(def ^:private alice "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK")
+
+(def ^:private decl
+  {:events {:cart/add {:validate (fn [[_ {:keys [id]}]] (string? id))}
+            :cart/clear {}}})
+
+(defn- action [event]
+  {:artifact cid :principal alice :grant "<biscuit bytes>"
+   :input {:kind :action :event event}})
+
+(defn- opts
+  "actions/dispatch opts plus a call counter on the guest step, so a test
+  can assert the chain was NOT touched — the absence of an entry in the
+  result is not evidence the step never ran."
+  [calls & [authorize-fn]]
+  (cond-> {:db {}
+           :state-fn (fn [db event] (swap! calls inc)
+                       (update db :events (fnil conj []) event))
+           :cid-fn (fn [text] (str "cid-" (hash text)))
+           :prev-cid nil :height 1}
+    authorize-fn (assoc :authorize-fn authorize-fn)))
+
+(def ^:private allow (fn [_] {:ok true :reason :granted}))
+
+(deftest no-authorizer-is-a-refusal-not-a-pass
+  (let [calls (atom 0)
+        r (invoke/dispatch decl (action [:cart/add {:id "x"}]) (opts calls))]
+    (is (not (:ok r)))
+    (is (= :no-authorizer (:reason r)))
+    (is (= 0 @calls) "the guest step must not run for an undecided invocation")))
+
+(deftest an-answer-that-is-not-a-decision-is-a-refusal
+  (testing "nil never puns to allow"
+    (let [calls (atom 0)
+          r (invoke/dispatch decl (action [:cart/add {:id "x"}]) (opts calls (fn [_] nil)))]
+      (is (= :authorizer-answer-not-a-decision (:reason r)))
+      (is (= 0 @calls))))
+  (testing "a map without :ok is not a decision either"
+    (let [r (invoke/dispatch decl (action [:cart/add {:id "x"}]) (opts (atom 0) (fn [_] {:reason :granted})))]
+      (is (= :authorizer-answer-not-a-decision (:reason r))))))
+
+(deftest denied-names-the-authorizer-reason-and-appends-nothing
+  (let [calls (atom 0)
+        r (invoke/dispatch decl (action [:cart/add {:id "x"}])
+                           (opts calls (fn [_] {:ok false :reason :wrong-holder})))]
+    (is (= :denied (:reason r)))
+    (is (= :wrong-holder (:authorizer r)))
+    (is (= :chain/append (get-in r [:effect :effect])))
+    (is (= 0 @calls))))
+
+(defn- keys-anywhere [v]
+  (cond (map? v) (into (set (keys v)) (mapcat keys-anywhere (vals v)))
+        (sequential? v) (into #{} (mapcat keys-anywhere v))
+        :else #{}))
+
+(deftest allowed-appends-and-records-who-and-on-whose-decision-never-the-grant
+  (let [calls (atom 0)
+        r (invoke/dispatch decl (action [:cart/add {:id "x"}]) (opts calls allow))]
+    (is (:ok r))
+    (is (= 1 @calls))
+    (is (= alice (get-in r [:entry :principal])))
+    (is (= {:ok true :reason :granted} (get-in r [:entry :receipt])))
+    (is (string? (get-in r [:entry :db-cid])))
+    (is (not (contains? (keys-anywhere r) :grant))
+        "the presented grant is a bearer — it must not be in the chain or the answer")))
+
+(deftest the-authorizer-sees-the-effect-and-nothing-about-where-the-call-came-from
+  (let [seen (atom nil)
+        r (invoke/dispatch decl (action [:cart/add {:id "x"}])
+                           (opts (atom 0) (fn [q] (reset! seen q) {:ok true})))]
+    (is (:ok r))
+    (is (= #{:principal :artifact :grant :effect} (set (keys @seen))))
+    (is (= alice (:principal @seen)))
+    (is (= cid (:artifact @seen)))
+    (is (= {:effect :chain/append
+            :resource (str "kotoba://app/" cid "/chain")
+            :event [:cart/add {:id "x"}]}
+           (:effect @seen)))))
+
+(deftest declaration-still-gates-after-authorization
+  ;; authority and declaration are two gates, in that order: an allowed
+  ;; principal dispatching an undeclared event is refused by the declaration.
+  (let [calls (atom 0)
+        r (invoke/dispatch decl (action [:nope {}]) (opts calls allow))]
+    (is (= :undeclared-event (:reason r)))
+    (is (= 0 @calls))))
+
+(deftest envelope-defects-are-named-before-the-authorizer-is-asked
+  (let [asked (atom 0)
+        auth (fn [_] (swap! asked inc) {:ok true})
+        try* (fn [env] (invoke/authorize env {:authorize-fn auth}))]
+    (is (= :artifact-required (:reason (try* {:input {:kind :query}}))))
+    (is (= :cidv0-refused (:reason (try* {:artifact "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+                                          :input {:kind :query}}))))
+    (is (= :artifact-not-a-cid (:reason (try* {:artifact "not-a-cid" :input {:kind :query}}))))
+    (is (= :input-required (:reason (try* {:artifact cid}))))
+    (is (= :unknown-kind (:reason (try* {:artifact cid :input {:kind :mutation}}))))
+    (is (= :action-needs-event (:reason (try* {:artifact cid :input {:kind :action :event "cart/add"}}))))
+    (is (= :query-needs-params (:reason (try* {:artifact cid :input {:kind :query :params [1]}}))))
+    (is (= :event-needs-source (:reason (try* {:artifact cid :input {:kind :event :frame {}}}))))
+    (is (= :principal-not-a-did (:reason (try* {:artifact cid :principal "alice"
+                                                :input {:kind :query}}))))
+    (is (= 0 @asked) "no defective envelope reached the authorizer")
+    (testing "and the boundary: a well-formed envelope of each kind does reach it"
+      (is (:ok (try* {:artifact cid :input {:kind :query}})))
+      (is (:ok (try* {:artifact cid :input {:kind :action :event [:cart/clear]}})))
+      (is (:ok (try* {:artifact cid :input {:kind :event :source "stripe" :frame {}}})))
+      (is (= 3 @asked)))))
+
+(deftest each-kind-asks-for-its-own-effect-on-its-own-resource
+  (is (= {:effect :app/query :resource (str "kotoba://app/" cid) :params {:id 1}}
+         (invoke/effect-request {:artifact cid :input {:kind :query :params {:id 1}}})))
+  (is (= {:effect :app/assert :resource (str "kotoba://app/" cid "/events/stripe") :source "stripe"}
+         (invoke/effect-request {:artifact cid :input {:kind :event :source "stripe"}}))))
+
+(deftest a-query-goes-through-the-same-seam-and-answers-a-station
+  (let [env {:artifact cid :principal alice :input {:kind :query :params {:id "abc"}}}
+        base {:load-fn (fn [p] {:for (:id p)}) :cid-fn (fn [t] (str "cid-" (hash t)))}]
+    (is (= :no-authorizer (:reason (invoke/query env base))))
+    (let [r (invoke/query env (assoc base :authorize-fn allow))]
+      (is (:ok r))
+      (is (= {:for "abc"} (:data r)))
+      (is (string? (:data-cid r)))
+      (is (= alice (:principal r))))))
+
+(deftest kinds-do-not-cross-their-verbs
+  (is (= :not-an-action
+         (:reason (invoke/dispatch decl {:artifact cid :input {:kind :query}} (opts (atom 0) allow)))))
+  (is (= :not-a-query
+         (:reason (invoke/query (action [:cart/clear]) {:authorize-fn allow :load-fn identity :cid-fn str})))))
+
+(deftest mcp-identity-comes-from-the-session-not-the-arguments
+  (let [env (invoke/from-mcp {:artifact cid :event ["cart/add" "milk"]
+                              :principal "did:key:zMallory" :grant "forged"}
+                             {:principal alice :grant "session-grant"})]
+    (is (= alice (:principal env)))
+    (is (= "session-grant" (:grant env)))
+    (is (= {:kind :action :event [:cart/add "milk"]} (:input env)))
+    (is (:ok (invoke/check-envelope env)))))
+
+(deftest a-resolved-route-is-a-query-envelope-not-an-execution
+  (let [tree {:path "/" :children [{:path "apps" :children [{:path ":id" :document cid}]}]}
+        r (routes/resolve-path tree "/apps/abc123")
+        env (invoke/from-route r {:principal alice})]
+    (is (:ok r))
+    (is (= {:artifact cid :input {:kind :query :params {:id "abc123"}}} (:invocation r)))
+    (is (= cid (:artifact env)))
+    (is (= {:id "abc123"} (get-in env [:input :params])))
+    (is (:ok (invoke/check-envelope env)))
+    (is (not (contains? (keys-anywhere env) :path)) "the name does not travel with the invocation")))
+
+(deftest mcp-string-event-ids-meet-the-keyword-declaration
+  ;; over the stdio JSON wire the event head is "todo/add"; the declaration
+  ;; says :todo/add — from-mcp speaks the interaction vocabulary so they meet
+  (let [env (invoke/from-mcp {:artifact cid :event ["cart/add" {:id "x"}]} {:principal alice})]
+    (is (= :cart/add (get-in env [:input :event 0])))
+    (is (:ok (invoke/dispatch decl (assoc env :grant "g") (opts (atom 0) allow))))))
+

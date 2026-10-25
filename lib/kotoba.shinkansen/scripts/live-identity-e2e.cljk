@@ -1,0 +1,136 @@
+(ns live-identity-e2e
+  "The content-identity contract on a LIVE name host, end to end, with no
+  session: for each host, GET the receipts, pick documents, fetch each and
+  check that the bytes served hash to the CID the ETag names (raw CIDv1,
+  sha2-256 — content-address), that Link rel=canonical names ipfs://<cid>,
+  that Cache-Control revalidates, that If-None-Match with the CID answers
+  304, and that an asset claims no identity. Then POST /v1/invoke without a
+  grant and confirm the seam refuses by name.
+
+  Prints `CASE<TAB>host<TAB>name<TAB>OK|FAIL<TAB>detail` and
+  `SCANNED<TAB>n<TAB>FAILED<TAB>m`. Exit 0 only when n > 0 and m = 0; 1 on a
+  FAIL; 2 when a host could not be reached (never a pass).
+
+  Run: kbb --backend sci --classpath src:../content-address/src:../text/src scripts/live-identity-e2e.cljk [host …]
+  Default hosts: kotoba.cloud docs.kotoba.cloud"
+  (:require [clojure.string :as str]
+            [content-address.core :as ca]
+            [content-address.digest :as d]))
+
+(def results (atom []))
+(def unreachable (atom 0))
+
+(defn- case! [host name ok? detail]
+  (swap! results conj {:host host :name name :ok? (boolean ok?)})
+  (println (str "CASE\t" host "\t" name "\t" (if ok? "OK" "FAIL") "\t" detail)))
+
+(defn- get* [url & [headers]]
+  (-> (js/fetch url (clj->js {:headers (merge {"accept-language" "en"} headers) :redirect "manual"}))
+      (.then (fn [r] (-> (.text r)
+                         (.then (fn [t] {:status (.-status r)
+                                         :etag (.get (.-headers r) "etag")
+                                         :link (.get (.-headers r) "link")
+                                         :cache (.get (.-headers r) "cache-control")
+                                         :marker (.get (.-headers r) "x-content-identity")
+                                         :text t})))))
+      (.catch (fn [e] {:error (str e)}))))
+
+(defn- cid-of [text] (ca/cid-string (d/sha256 (d/->octets text))))
+
+(defn- check-host [host]
+  (let [base (str "https://" host)]
+    ;; ONE receipt set for every host of the site, served from the apex (a
+    ;; remapped host such as docs. maps its paths under /docs/ — measured
+    ;; 2026-09-17: /.well-known/… on docs.kotoba.cloud is 404, by design)
+    (-> (get* (str "https://kotoba.cloud" "/.well-known/shinkansen/receipts.json"))
+        (.then (fn [{:keys [status text error]}]
+                 (if (or error (not= 200 status))
+                   (do (swap! unreachable inc)
+                       (println (str "UNREACHABLE\t" host "\treceipts " (or error status)))
+                       nil)
+                   (let [receipts (js->clj (js/JSON.parse text) :keywordize-keys true)
+                         docs (:documents receipts)
+                         by-path (into {} (map (juxt :path :cid)) docs)
+                         home (get by-path "/")
+                         ;; on docs.kotoba.cloud the host root is the /docs/ emit
+                         host-root (or (when (= host "kotoba.cloud") home)
+                                       (get by-path (str "/" (first (str/split host #"\.")) "/"))
+                                       home)]
+                     (case! host "receipts: documents > 0 with an artifact" (and (pos? (count docs)) (string? (:artifact receipts)))
+                            (str (count docs) " documents"))
+                     (-> (get* (str base "/"))
+                         (.then (fn [{:keys [status etag link cache text]}]
+                                  (let [served (cid-of text)
+                                        strong (str/replace (str etag) #"^W/" "")]
+                                    ;; a CDN that compresses weakens the tag (W/"cid"); the CID inside is what counts
+                                    (case! host "GET / is 200 with ETag = the raw CIDv1 of the bytes served (weak form allowed)"
+                                           (and (= 200 status) (= strong (str "\"" served "\"")))
+                                           (str status " etag=" etag " served=" served))
+                                    (case! host "Link rel=canonical names ipfs://<cid>"
+                                           (= link (str "<ipfs://" served ">; rel=\"canonical\"")) (str link))
+                                    (case! host "Cache-Control revalidates (a name is mutable)" (= "no-cache" cache) (str cache))
+                                    (case! host "the receipt names the same CID for the host root"
+                                           (= host-root served) (str "receipt=" host-root))
+                                    (get* (str base "/") {"if-none-match" (str "\"" served "\"")}))))
+                         (.then (fn [{:keys [status etag]}]
+                                  (case! host "If-None-Match with the CID is 304" (= 304 status) (str status " " etag))
+                                  (get* (str base "/") {"if-none-match" (str "W/" etag)})))
+                         (.then (fn [{:keys [status etag]}]
+                                  (case! host "If-None-Match with the WEAK tag a browser sends back is 304" (= 304 status) (str status " " etag))
+                                  (get* (str base "/css/site.css"))))
+                         (.then (fn [{:keys [status etag link marker]}]
+                                  (case! host "an asset claims no identity (no ipfs Link, no marker)"
+                                         (and (= 200 status) (nil? link) (nil? marker)
+                                              (not (str/starts-with? (str etag) "\"bafk")))
+                                         (str status " etag=" etag))
+                                  ;; the identity the canonical names must be RETRIEVABLE somewhere:
+                                  ;; the bytes plane (yataverse.com since 2026-09-14) serving the same
+                                  ;; bytes. Measured 2026-09-17: 404 — no write path exists (SPEC §1.1)
+                                  (get* (str "https://" host-root ".ipfs.yataverse.com/"))))
+                         (.then (fn [{:keys [status text]}]
+                                  (case! host "canonical resolves: the bytes plane serves the CID's bytes"
+                                         (and (= 200 status) (= host-root (cid-of text)))
+                                         (str status (when (= 200 status) (str " served=" (cid-of text)))))
+                                  ;; the API is not on every document host (docs. is documents-only,
+                                  ;; measured 2026-09-17: /v1/invoke there is 404 by design) — the seam
+                                  ;; is measured once, on the API host (check-invoke)
+                                  (:artifact receipts))))))))
+        (.catch (fn [e] (swap! unreachable inc) (println (str "UNREACHABLE\t" host "\t" e)) nil)))))
+
+(defn- check-invoke
+  "The authority seam on the API host: without a grant, 403 by name; with a
+   grant that is not a token, 403 by name. (The allow path needs a Biscuit
+   from auth.kotoba.cloud, i.e. a passkey session — measured by hand from
+   the owner's browser, SPEC §3.3.)"
+  [artifact]
+  (let [host "api.kotoba.cloud"
+        post (fn [headers]
+               (-> (js/fetch (str "https://" host "/v1/invoke")
+                             (clj->js {:method "POST" :headers (merge {"content-type" "application/json"} headers)
+                                       :body (js/JSON.stringify (clj->js {:artifact artifact :input {:kind "query" :params {}}}))}))
+                   (.then (fn [r] (-> (.text r) (.then (fn [t] [(.-status r) t])))))))]
+    (if-not artifact
+      (do (swap! unreachable inc) (println (str "UNREACHABLE\t" host "\tno artifact to invoke")) nil)
+      (-> (post {})
+          (.then (fn [[status t]]
+                   (case! host "POST /v1/invoke without a grant is 403 no-grant-presented"
+                          (and (= 403 status) (str/includes? t "no-grant-presented")) (str status))
+                   (post {"authorization" "Biscuit not*a*token"})))
+          (.then (fn [[status t]]
+                   (case! host "POST /v1/invoke with an unreadable grant is 403 grant-unreadable"
+                          (and (= 403 status) (str/includes? t "grant-unreadable")) (str status))))
+          (.catch (fn [e] (swap! unreachable inc) (println (str "UNREACHABLE\t" host "\t" e)) nil))))))
+
+(defn -main []
+  (let [argv (vec (js/Array.from js/process.argv))
+        ;; kbb's own arguments precede the script; hosts are what follows it
+        after (rest (drop-while #(not (str/ends-with? (str %) "live-identity-e2e.cljk")) argv))
+        hosts (if (seq after) (vec after) ["kotoba.cloud" "docs.kotoba.cloud"])]
+    (-> (reduce (fn [p h] (.then p (fn [_] (check-host h)))) (js/Promise.resolve nil) hosts)
+        (.then (fn [artifact] (check-invoke artifact)))
+        (.then (fn [_]
+                 (let [rs @results failed (count (remove :ok? rs))]
+                   (println (str "SCANNED\t" (count rs) "\tFAILED\t" failed "\tUNREACHABLE\t" @unreachable))
+                   (js/process.exit (cond (pos? @unreachable) 2 (empty? rs) 2 (pos? failed) 1 :else 0))))))))
+
+(-main)
