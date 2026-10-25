@@ -1,0 +1,239 @@
+(ns kotobase.protocols.sparql-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.store :as st]
+            [kotobase.protocols.sparql :as h]))
+
+;; Mirrors kotobase-query's own bridge_test.cljc fixture (ADR-2607172300
+;; names kotobase-query as this repo's shared prerequisite bridge) --
+;; users/departments, a multi-valued attr, a user with no dept-key, and
+;; two roles worth of BGP+filter / UNION / OPTIONAL coverage.
+(defn- fixture-store []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :dept-key "d1"
+                              :tags ["eng" "lead"]})
+    (st/-put s "users" "u2" {:name "Bob" :role "user" :dept-key "d2"})
+    (st/-put s "users" "u3" {:name "Carol" :role "admin" :dept-key "d1"})
+    (st/-put s "users" "u4" {:name "Dave" :role "user"}) ; no dept-key
+    (st/-put s "departments" "d1" {:name "Engineering" :budget 900000})
+    (st/-put s "departments" "d2" {:name "Sales" :budget 400000})
+    s))
+
+(defn- ctx
+  ([] (ctx (constantly true)))
+  ([visible?] {:store (fixture-store) :coll-keys ["users" "departments"] :visible? visible?}))
+
+;; ---------------------------------------------------------- test-only JSON decode
+;; This repo's own `json.cljc` (src/) deliberately implements ENCODE only
+;; (see its ns docstring -- nothing in the SPARQL protocol request path is
+;; JSON to parse). Tests still want structural assertions on the encoded
+;; response body rather than fragile string matching, so this tiny decoder
+;; lives here, test-only, never required by src/.
+(declare decode-value)
+
+(defn- skip-ws [s i]
+  (loop [i i] (if (and (< i (count s)) (#{\space \tab \newline \return} (.charAt s i))) (recur (inc i)) i)))
+
+(defn- decode-string [s i]
+  (loop [i (inc i) acc (transient [])]
+    (let [c (.charAt s i)]
+      (cond
+        (= c \") [(apply str (persistent! acc)) (inc i)]
+        (= c \\) (let [e (.charAt s (inc i))]
+                   (recur (+ i 2) (conj! acc (case e \n \newline \t \tab \r \return e))))
+        :else (recur (inc i) (conj! acc c))))))
+
+(defn- decode-number [s i]
+  (let [m (re-find #"^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?" (subs s i))]
+    [#?(:clj (if (re-find #"[.eE]" m) (Double/parseDouble m) (Long/parseLong m))
+        :cljs (js/parseFloat m))
+     (+ i (count m))]))
+
+(defn- decode-array [s i]
+  (loop [i (skip-ws s (inc i)) acc []]
+    (if (= \] (.charAt s i))
+      [acc (inc i)]
+      (let [[v i] (decode-value s i)
+            i (skip-ws s i)]
+        (if (= \, (.charAt s i))
+          (recur (skip-ws s (inc i)) (conj acc v))
+          [(conj acc v) (inc i)])))))
+
+(defn- decode-object [s i]
+  (loop [i (skip-ws s (inc i)) acc {}]
+    (if (= \} (.charAt s i))
+      [acc (inc i)]
+      (let [[k i] (decode-string s i)
+            i (skip-ws s i)
+            [v i] (decode-value s (skip-ws s (inc i)))
+            i (skip-ws s i)]
+        (if (= \, (.charAt s i))
+          (recur (skip-ws s (inc i)) (assoc acc k v))
+          [(assoc acc k v) (inc i)])))))
+
+(defn- decode-value [s i]
+  (let [i (skip-ws s i) c (.charAt s i)]
+    (cond
+      (= c \") (decode-string s i)
+      (= c \{) (decode-object s i)
+      (= c \[) (decode-array s i)
+      (= (subs s i (+ i 4)) "true") [true (+ i 4)]
+      (= (subs s i (+ i 5)) "false") [false (+ i 5)]
+      (= (subs s i (+ i 4)) "null") [nil (+ i 4)]
+      :else (decode-number s i))))
+
+(defn- decode [s] (first (decode-value s 0)))
+
+;; -------------------------------------------------------------- GET + BGP/FILTER
+
+(deftest get-bgp-and-filter
+  (let [resp (h/handle (ctx)
+                        {:method :get
+                         :query {"query" "SELECT ?uname WHERE { ?u <urn:kotobase:role> \"admin\" . ?u <urn:kotobase:name> ?uname . FILTER(?uname != \"Carol\") }"}
+                         :headers {"accept" "application/sparql-results+json"}})]
+    (is (= 200 (:status resp)))
+    (is (= "application/sparql-results+json" (get-in resp [:headers "content-type"])))
+    (let [body (decode (:body resp))]
+      (is (= ["uname"] (get-in body ["head" "vars"])))
+      (is (= [{"uname" {"type" "literal" "value" "Alice"}}]
+             (get-in body ["results" "bindings"]))
+          "only Alice: admin AND name != Carol -- Carol is admin too but filtered out"))))
+
+;; -------------------------------------------------------------- cross-collection join
+
+(deftest post-sparql-query-cross-collection-join
+  (let [resp (h/handle (ctx)
+                        {:method :post
+                         :headers {"content-type" "application/sparql-query"}
+                         :body (str "SELECT ?uname ?dname WHERE { "
+                                    "?u <urn:kotobase:name> ?uname . "
+                                    "?u <urn:kotobase:dept-key> ?dk . "
+                                    "?d <urn:kotobase:kotobase/coll> \"departments\" . "
+                                    "?d <urn:kotobase:kotobase/key> ?dk . "
+                                    "?d <urn:kotobase:name> ?dname . }")})]
+    (is (= 200 (:status resp)))
+    (let [bindings (get-in (decode (:body resp)) ["results" "bindings"])
+          rows (into #{} (map (fn [b] [(get-in b ["uname" "value"]) (get-in b ["dname" "value"])])) bindings)]
+      (is (= #{["Alice" "Engineering"] ["Bob" "Sales"] ["Carol" "Engineering"]} rows)
+          "Dave (no dept-key) correctly drops out of the join"))))
+
+;; -------------------------------------------------------------- UNION
+
+(deftest post-form-urlencoded-union
+  ;; Percent-encoded (portably, not via a JS-only encodeURIComponent call)
+  ;; form of: SELECT ?s WHERE { { ?s <urn:kotobase:role> "admin" } UNION
+  ;; { ?s <urn:kotobase:role> "user" } } -- exercises `percent-decode` (src)
+  ;; on a real multi-clause query, and `extra=ignored` exercises multi-field
+  ;; form bodies.
+  (let [encoded (str "query=SELECT%20%3Fs%20WHERE%20%7B%20%7B%20%3Fs%20%3Curn%3Akotobase%3Arole%3E"
+                      "%20%22admin%22%20%7D%20UNION%20%7B%20%3Fs%20%3Curn%3Akotobase%3Arole%3E"
+                      "%20%22user%22%20%7D%20%7D&extra=ignored")
+        resp (h/handle (ctx)
+                        {:method :post
+                         :headers {"content-type" "application/x-www-form-urlencoded"}
+                         :body encoded})]
+    (is (= 200 (:status resp)))
+    (is (= 4 (count (get-in (decode (:body resp)) ["results" "bindings"]))))))
+
+;; -------------------------------------------------------------- OPTIONAL
+
+(deftest optional-keeps-unmatched-left-rows
+  (let [query (str "SELECT ?s ?friend WHERE { ?s <urn:kotobase:kotobase/coll> \"users\" . "
+                    "?s <urn:kotobase:name> ?n . "
+                    "OPTIONAL { ?s <urn:kotobase:knows> ?friend } }")
+        resp (h/handle (ctx) {:method :get :query {"query" query}})
+        bindings (get-in (decode (:body resp)) ["results" "bindings"])]
+    (is (= 200 (:status resp)))
+    (is (= 4 (count bindings)) "all 4 users come back even though none :knows anyone")
+    (is (every? #(not (contains? % "friend")) bindings))))
+
+;; -------------------------------------------------------------- ASK
+
+(deftest ask-true-and-false
+  (is (= {"head" {} "boolean" true}
+         (decode (:body (h/handle (ctx) {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"admin\" }"}})))))
+  (is (= {"head" {} "boolean" false}
+         (decode (:body (h/handle (ctx) {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"superadmin\" }"}}))))))
+
+;; -------------------------------------------------------------- content negotiation
+
+(deftest accept-json-explicit-and-default
+  (is (= 200 (:status (h/handle (ctx) {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"admin\" }"}
+                                        :headers {"accept" "application/sparql-results+json"}}))))
+  (is (= 200 (:status (h/handle (ctx) {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"admin\" }"}})))
+      "no Accept header defaults to JSON")
+  (is (= 200 (:status (h/handle (ctx) {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"admin\" }"}
+                                        :headers {"accept" "*/*"}})))))
+
+(deftest accept-unsupported-format-406
+  (let [resp (h/handle (ctx) {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"admin\" }"}
+                               :headers {"accept" "application/sparql-results+xml"}})]
+    (is (= 406 (:status resp)))))
+
+;; -------------------------------------------------------------- error paths
+
+(deftest missing-query-400
+  (is (= 400 (:status (h/handle (ctx) {:method :get :query {}})))))
+
+(deftest malformed-query-400
+  (let [resp (h/handle (ctx) {:method :get :query {"query" "SELECT ?s WHERE { ?s"}})]
+    (is (= 400 (:status resp)))
+    (is (str/includes? (:body resp) "parse error"))))
+
+(deftest unsupported-method-405
+  (is (= 405 (:status (h/handle (ctx) {:method :delete :query {}})))))
+
+(deftest visible-required-500-not-thrown-to-caller
+  (is (= 500 (:status (h/handle {:store (fixture-store) :coll-keys ["users"] :visible? nil}
+                                 {:method :get :query {"query" "ASK WHERE { ?u <urn:kotobase:role> \"admin\" }"}})))))
+
+;; -------------------------------------------------------------- redaction
+
+(deftest visible-predicate-redacts-entities-end-to-end
+  (let [no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+        resp (h/handle (ctx no-bob?) {:method :get :query {"query" "SELECT ?n WHERE { ?u <urn:kotobase:kotobase/coll> \"users\" . ?u <urn:kotobase:name> ?n }"}})
+        names (into #{} (map #(get-in % ["n" "value"])) (get-in (decode (:body resp)) ["results" "bindings"]))]
+    (is (= #{"Alice" "Carol" "Dave"} names))))
+
+;; --- CONSTRUCT / DESCRIBE over HTTP ----------------------------------------
+
+(defn- nt-req [q accept]
+  {:method :post :path "/sparql"
+   :headers (cond-> {"content-type" "application/sparql-query"}
+              accept (assoc "accept" accept))
+   :body q})
+
+(deftest construct-answers-n-triples
+  (let [r (h/handle (ctx) (nt-req "CONSTRUCT { ?u <urn:kotobase:isNamed> ?n } WHERE { ?u <urn:kotobase:name> ?n }"
+                                       "application/n-triples"))]
+    (is (= 200 (:status r)))
+    (is (re-find #"application/n-triples" (get (:headers r) "content-type")))
+    (is (re-find #"<urn:kotobase:isNamed>" (:body r)))
+    (is (every? #(re-find #" \.$" %) (remove str/blank? (str/split-lines (:body r))))
+        "every line is a terminated triple")))
+
+(deftest describe-answers-the-subject-triples
+  (let [r (h/handle (ctx) (nt-req "DESCRIBE ?u WHERE { ?u <urn:kotobase:role> \"admin\" }"
+                                       "application/n-triples"))]
+    (is (= 200 (:status r)))
+    (is (seq (:body r)))))
+
+(deftest a-graph-form-is-not-offered-as-a-results-table
+  (testing "content negotiation depends on the FORM, not just the header:
+            application/sparql-results+json has no way to say 'these are
+            triples', so asking for it with CONSTRUCT is a 406 rather than a
+            graph mislabelled as a solution table"
+    (let [r (h/handle (ctx) (nt-req "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"
+                                         "application/sparql-results+json"))]
+      (is (= 406 (:status r)))
+      (is (re-find #"RDF graph" (:body r))))))
+
+(deftest a-solution-table-is-still-json-only
+  (let [r (h/handle (ctx) (nt-req "SELECT ?s WHERE { ?s ?p ?o }" "application/n-triples"))]
+    (is (= 406 (:status r)))))
+
+(deftest no-accept-header-gets-the-one-format-there-is
+  (doseq [q ["CONSTRUCT { ?s <urn:p> ?o } WHERE { ?s <urn:kotobase:name> ?o }"
+             "SELECT ?s WHERE { ?s ?p ?o }"]]
+    (is (= 200 (:status (h/handle (ctx) (nt-req q nil)))) q)))

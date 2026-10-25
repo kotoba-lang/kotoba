@@ -218,6 +218,7 @@ The bundled standard libraries live in this repository:
 | `org.opencypher.cypher` | `org.opencypher.cypher/src` | `kotobase.protocols.cypher`, `kotobase.protocols.cypher.http`, `kotobase.protocols.cypher.json` (an external specification, publisher opencypher.org) |
 | `org.apache.tinkerpopGremlin` | `org.apache.tinkerpopGremlin/src` | `kotobase.gremlin.envelope`, `kotobase.gremlin.json`, `kotobase.gremlin.traversal`, `kotobase.gremlin.wire` (an external specification, publisher apache.org) |
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
+| `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `kotoba.kototamaNative` | `kotoba.kototamaNative/src` | `kototama.native.executor`, `kototama.native.lease-transport` (Kotoba project library) |
 | `kotoba.kotobaVerifier` | `kotoba.kotobaVerifier/src` | `kotoba.verifier`, `kotoba.verifier.conformance`, `kotoba.verifier.linux-static`, `kotoba.verifier.signing` (Kotoba project library) |
 | `kotoba.kotobaNative` | `kotoba.kotobaNative/src` | `kotoba.native.aarch64`, `kotoba.native.affine`, `kotoba.native.aggregate-abi`, `kotoba.native.document` (Kotoba project library) |
