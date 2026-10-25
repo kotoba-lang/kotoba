@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.cue` | `kotoba.cue/src` | `cue.core`, `kotoba.cue` (Kotoba project library) |
 | `kotoba.chie` | `kotoba.chie/src` | `chie.cell`, `chie.cells.social-post.state-machine`, `chie.methods.analyze`, `chie.methods.autorun` (Kotoba project library) |
 | `kotoba.capnp` | `kotoba.capnp/src` | `capnp.core`, `kotoba.capnp` (Kotoba project library) |
 | `kotoba.bitcoinConsensus` | `kotoba.bitcoinConsensus/src` | `bitcoin.consensus.assumeutxo`, `bitcoin.consensus.block`, `bitcoin.consensus.chainstate`, `bitcoin.consensus.codec` (Kotoba project library) |
