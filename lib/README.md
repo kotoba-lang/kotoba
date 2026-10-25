@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.sdkPy` | `kotoba.sdkPy/src` | `etzhayyim-sdk.config`, `etzhayyim-sdk.errors`, `etzhayyim-sdk.llm`, `etzhayyim-sdk.metrics` (Kotoba project library) |
 | `kotoba.kotobaDelta` | `kotoba.kotobaDelta/src` | `delta.anchor`, `delta.op`, `delta.store` (Kotoba project library) |
 | `kotoba.svgraph` | `kotoba.svgraph/src` | `` (Kotoba project library) |
 | `kotoba.lab` | `kotoba.lab/src` | `kotoba.lab.verification`, `kotoba.lab.verification-check` (Kotoba project library) |

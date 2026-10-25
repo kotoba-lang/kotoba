@@ -1,0 +1,114 @@
+;; test_llm.cljc — which host the LLM client contacts, and what it carries there.
+;;
+;; `etzhayyim-sdk.llm` is the one module in this SDK that transmits a credential: when
+;; ETZHAYYIM_LLM_KEY is set, `auth-headers` attaches `Authorization: Bearer <key>` to every
+;; POST. So the host it resolves must always be one somebody chose — never a name the SDK
+;; invented for itself.
+;;
+;; The regression these cover: `llm-url` used to fall back to a literal
+;; "http://levi.local:4000". `.local` is the mDNS/Bonjour namespace (RFC 6762), so that name
+;; is claimable by any host on the same link, and `levi` is a private murakumo fleet node
+;; that only exists on the operator's own network. With ETZHAYYIM_LLM_URL unset on a shared
+;; network, `chat`/`translate` would hand the bearer token to whoever answered first.
+;;
+;; No real network calls: HTTP goes through the dynamic `llm/*request*` stub, exactly as
+;; test_mst_projector.cljc stubs `mp/*request*`.
+(ns etzhayyim-sdk.test-llm
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [cheshire.core :as json]
+            [etzhayyim-sdk.errors :as err]
+            [etzhayyim-sdk.llm :as llm]))
+
+(defn- env-url [] #?(:clj (System/getenv "ETZHAYYIM_LLM_URL") :cljs nil))
+
+(defn- attempt
+  "Run *f*, returning {:value v} or {:error e} — so a test can report the leaked value
+  instead of only that an expected throw was missing."
+  [f]
+  (try {:value (f)} (catch #?(:clj Exception :cljs :default) e {:error e})))
+
+(defn- ok-handler
+  "Stub that records {:url :headers} into *seen* and answers with a well-formed completion."
+  [seen]
+  (fn [url headers _body-str]
+    (swap! seen conj {:url url :headers headers})
+    {:status 200
+     :body (json/generate-string {:choices [{:message {:content "ok"}}]})}))
+
+;; ─── The host llm-url resolves ───────────────────────────────────────
+
+(deftest llm-url-never-invents-an-mdns-host
+  (let [configured (some-> (env-url) str/trim not-empty)
+        outcome (attempt llm/llm-url)]
+    (if configured
+      (testing "an explicitly configured ETZHAYYIM_LLM_URL is honoured"
+        (is (= (str/replace configured #"/+$" "") (:value outcome))))
+      (testing "with ETZHAYYIM_LLM_URL unset, llm-url refuses rather than picking a host"
+        (is (contains? outcome :error)
+            (str "llm-url must not resolve a host nobody chose; it returned "
+                 (pr-str (:value outcome))))
+        (when-let [e (:error outcome)]
+          (is (err/sdk-error? e ::err/llm-error)
+              "the refusal should be a classifiable SDK llm error"))))
+
+    ;; The specific regression, asserted whatever the environment.
+    (is (not (str/includes? (str (:value outcome)) ".local"))
+        "llm-url must never return a .local (mDNS) host")))
+
+;; ─── What actually leaves the process ────────────────────────────────
+
+(deftest no-credential-is-sent-to-an-unchosen-host
+  (when (str/blank? (str (env-url)))
+    (let [seen (atom [])]
+      (binding [llm/*request* (ok-handler seen)]
+        (attempt #(llm/chat "hello")))
+      (testing "an unconfigured client sends nothing at all"
+        (is (empty? @seen)
+            (str "chat contacted a host the SDK chose for itself: "
+                 (pr-str (mapv :url @seen)))))
+      (testing "and in particular reaches no mDNS host"
+        (is (not-any? #(str/includes? (str (:url %)) ".local") @seen)
+            "an Authorization header would have gone to an mDNS-squattable host")))))
+
+;; ─── POSITIVE CONTROL ────────────────────────────────────────────────
+;; Passes both before and after the fix. An explicitly supplied URL was always honoured and
+;; still is, credential included. If this ever fails, the breakage is in request building or
+;; header assembly — not in the default-host change above.
+
+(deftest explicitly-configured-host-is-used-and-carries-the-credential
+  (let [seen (atom [])]
+    (with-redefs [llm/llm-url (constantly "https://proxy.example")
+                  llm/llm-key (constantly "tok")]
+      (binding [llm/*request* (ok-handler seen)]
+        (is (= "ok" (llm/chat "hello")))))
+    (is (= ["https://proxy.example/v1/chat/completions"] (mapv :url @seen)))
+    (is (= "Bearer tok" (get-in (first @seen) [:headers "authorization"])))))
+
+;; ─── Normalization of a value that IS supplied ───────────────────────
+;;
+;; `chat-completions` builds `(str (llm-url) "/v1/chat/completions")`, so a value that does
+;; not name a host must be refused rather than concatenated: "  " used to yield the non-URL
+;; "  /v1/chat/completions" and a trailing slash a doubled "//". These exercise the pure
+;; resolver, so they need no environment.
+
+(deftest resolve-llm-url-normalizes-and-refuses
+  (testing "a chosen host is returned as given"
+    (is (= "https://proxy.example" (llm/resolve-llm-url "https://proxy.example"))))
+
+  (testing "trailing slashes are stripped, so the built path has no doubled //"
+    (is (= "https://proxy.example" (llm/resolve-llm-url "https://proxy.example/")))
+    (is (= "https://proxy.example" (llm/resolve-llm-url "https://proxy.example///"))))
+
+  (testing "surrounding whitespace is trimmed"
+    (is (= "https://proxy.example" (llm/resolve-llm-url "  https://proxy.example  "))))
+
+  (testing "values naming no host are refused, never passed through"
+    (doseq [raw [nil "" "   " "\t\n" "/" "///"]]
+      (let [outcome (attempt #(llm/resolve-llm-url raw))]
+        (is (contains? outcome :error)
+            (str "expected a refusal for " (pr-str raw)
+                 ", got " (pr-str (:value outcome))))
+        (when-let [e (:error outcome)]
+          (is (err/sdk-error? e ::err/llm-config-error)
+              (str "refusal for " (pr-str raw) " should be a config error")))))))
