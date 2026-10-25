@@ -1,0 +1,200 @@
+(ns gijiroku.bot-join
+  "Bot-join MeetingPlatform — a headless browser joins the meeting as a guest
+  participant (just the join URL, no OAuth app / admin consent) and captures
+  its own recording + transcript, instead of pulling a platform-hosted cloud
+  recording (`gijiroku.zoom` / `gijiroku.google-meet` / `gijiroku.teams`).
+  This is the 'bot participates live' option ADR-2607031100 named and
+  deliberately did NOT choose as the default:
+
+    - it needs a real OS-level Xvfb + PulseAudio + ffmpeg capture rig (a
+      deployment concern, not just a JVM dep — see docs/DESIGN.md
+      \"bot-join host setup\"),
+    - the join-flow selectors below are UI heuristics against each
+      platform's web client and WILL break when that UI changes,
+    - Zoom/Meet/Teams each restrict unattended automated participants under
+      their ToS to varying degrees — evaluate before enabling in a given org.
+
+  Its upside is exactly the one that motivated adding it: **no Zoom
+  Marketplace app, no Google Workspace admin, no Entra ID registration —
+  only the meeting URL.** `MeetingPlatform` stayed a protocol precisely so
+  this could be added without touching `gijiroku.operation` at all; it's a
+  second, opt-in implementation, not a replacement.
+
+  Requires the `:bot-join` alias (`io.github.kotoba-lang/playwright-clj`) —
+  intentionally NOT a core gijiroku dependency, so the OAuth-API path stays
+  lightweight for consumers (cloud-itonami/cloud-manimani) that don't need
+  it. Audio capture is injected as host-caps (:audio-start-fn
+  :audio-stop-fn), mirroring gijiroku's I/O-injection discipline elsewhere:
+  the default shells out to ffmpeg against a PulseAudio monitor device, but
+  the join-flow logic never hard-codes that choice.
+
+  Live join + capture is unverified here (no test meeting, no
+  Xvfb/PulseAudio/ffmpeg host in this environment) — the same 'contract
+  proven offline, live pending a real rig' status as gijiroku.zoom/teams and
+  kekkai's kotobase.net wiring. What IS verified offline: join-URL
+  construction per platform and the host-caps injection contract
+  (test/gijiroku/bot_join_test.cljk)."
+  (:require [gijiroku.model :as m]
+            [gijiroku.platform :as p]
+            [gijiroku.transcriber :as t]))
+
+(defn- pw
+  "Lazily resolve+call playwright-clj.core/f-name — keeps playwright-clj off
+  this namespace's load-time classpath requirement (see docstring: it's the
+  `:bot-join` alias's opt-in dep, not a core gijiroku dep), while still
+  failing with a clear \"namespace not found\" if join!/meeting-ended? are
+  actually called without the alias active."
+  [f-name & args]
+  (apply (requiring-resolve (symbol "playwright-clj.core" (name f-name))) args))
+
+;; ───────────────────────── join URLs (no app registration) ─────────────────────────
+
+(defmulti join-url
+  "meeting: gijiroku.model/meeting plus platform-specific fields
+  (:password for Zoom). Every one of these is the same URL a human clicks
+  from a calendar invite — nothing platform-API-shaped."
+  (fn [meeting] (:platform meeting)))
+
+(defmethod join-url :zoom [{:keys [external-id password]}]
+  (cond-> (str "https://zoom.us/wc/join/" external-id)
+    password (str "?pwd=" password)))
+
+(defmethod join-url :google-meet [{:keys [external-id]}]
+  (str "https://meet.google.com/" external-id))
+
+(defmethod join-url :teams [{:keys [external-id]}]
+  (str "https://teams.microsoft.com/v2/?meetingjoin=true#/l/meetup-join/" external-id))
+
+;; ───────────────────────── per-platform web-client selectors ─────────────────────────
+;; Heuristic and fragile by nature (see namespace docstring) — each platform's
+;; web client changes its DOM without notice; treat these as a starting point
+;; to re-verify against the live client, not a stable contract.
+
+(def selectors
+  {:zoom        {:name-input "input#input-for-name" :join-btn "button#joinBtn"
+                 :in-meeting "#wc-container .footer__btns-container"}
+   :google-meet {:name-input "input[type=text][aria-label='Your name']"
+                 :join-btn "//span[text()='Ask to join' or text()='Join now']/.."
+                 :in-meeting "div[aria-label='Leave call']"}
+   :teams       {:name-input "input#prejoin-display-name-input"
+                 :join-btn "button#prejoin-join-button"
+                 :in-meeting "#hangup-button"}})
+
+(def default-browser-args
+  ;; Auto-grant the mic/cam permission prompts a real join flow triggers,
+  ;; and hand Chromium a synthetic device instead of a real one — this is
+  ;; the standard flag pair for unattended media testing, NOT a way to
+  ;; fabricate audio content (real audio comes from the PulseAudio capture
+  ;; below, routed from the browser's actual output).
+  ["--use-fake-ui-for-media-stream" "--use-fake-device-for-media-stream"])
+
+;; ───────────────────────── audio capture (injected host-caps) ─────────────────────────
+
+(defn default-audio-start!
+  "ffmpeg captures the PulseAudio *monitor* of a null-sink the operator has
+  already routed the browser's output into (docs/DESIGN.md \"bot-join host
+  setup\" — this process does not create that routing itself). Returns a
+  handle audio-stop-fn can terminate."
+  [session-id]
+  (let [path (str "/tmp/gijiroku-" session-id ".wav")]
+    {:process (.start (ProcessBuilder. ^java.util.List
+                        ["ffmpeg" "-y" "-f" "pulse" "-i" "gijiroku.monitor" path]))
+     :path path}))
+
+(defn default-audio-stop!
+  [{:keys [^Process process]}]
+  (.destroy process)
+  (.waitFor process 10 java.util.concurrent.TimeUnit/SECONDS))
+
+;; ───────────────────────── join! ─────────────────────────
+
+(defn- meeting-ended?
+  "True once the in-meeting selector goes hidden (call ended / bot removed)."
+  [page sel poll-ms]
+  (try (pw :wait-for page (:in-meeting sel) :hidden {:timeout poll-ms}) true
+       (catch Exception _ false)))
+
+(defn join!
+  "Join `meeting` as a bot participant, capture audio for up to
+  `max-duration-s`, then leave. BLOCKING — this drives a real browser through
+  a live join flow for the duration of the call, so call it from a
+  scheduler/worker, never from inside the actor's StateGraph (a StateGraph
+  node must stay fast/pure). Returns {:audio-path :duration-s}.
+
+  opts:
+    :display-name     (default \"gijiroku\")
+    :max-duration-s    (default 3600)
+    :poll-interval-s   (default 15) — how often meeting-ended? is checked
+    :audio-start-fn/:audio-stop-fn  host-caps (default ffmpeg+PulseAudio)
+    :browser-args      Chromium launch args (default default-browser-args)"
+  [meeting {:keys [display-name max-duration-s poll-interval-s
+                   audio-start-fn audio-stop-fn browser-args]
+            :or   {display-name "gijiroku" max-duration-s 3600 poll-interval-s 15
+                   audio-start-fn default-audio-start! audio-stop-fn default-audio-stop!
+                   browser-args default-browser-args}}]
+  (let [sel (get selectors (:platform meeting))
+        url (join-url meeting)
+        session-id (str (:external-id meeting) "-" (System/nanoTime))
+        b (pw :launch {:headless true :args browser-args})
+        page (pw :new-page b)
+        start-ms (System/currentTimeMillis)]
+    (try
+      (pw :goto page url)
+      (pw :fill page (:name-input sel) display-name)
+      (pw :click page (:join-btn sel))
+      (pw :wait-for page (:in-meeting sel) :visible {:timeout 60000})
+      (let [audio (audio-start-fn session-id)
+            deadline (+ start-ms (* 1000 max-duration-s))]
+        (loop []
+          (when (and (< (System/currentTimeMillis) deadline)
+                     (not (meeting-ended? page sel (* 1000 poll-interval-s))))
+            (recur)))
+        (audio-stop-fn audio)
+        {:audio-path (:path audio) :duration-s (quot (- (System/currentTimeMillis) start-ms) 1000)})
+      (finally (pw :close b)))))
+
+;; ───────────────────────── MeetingPlatform ─────────────────────────
+
+(defrecord BotJoinPlatform [tenant transcriber join-opts meetings sessions]
+  p/MeetingPlatform
+  (meeting-meta [_ external-id]
+    ;; Unlike the cloud APIs, bot-join has no endpoint to discover meeting
+    ;; metadata — an unregistered external-id gets a bare stub (enough to
+    ;; attempt join-url construction, nothing else). Register real meetings
+    ;; via `register-meeting!` (the caller already has this from wherever it
+    ;; sourced the join link, e.g. a calendar invite parser).
+    (or (get @meetings external-id)
+        {:id external-id :platform :bot-join :external-id external-id
+         :title nil :host nil :tenant tenant :participants [] :status :scheduled
+         :scheduled-start nil}))
+  (fetch-recording [this external-id]
+    (let [{:keys [audio-path duration-s]}
+          (or (get @sessions external-id)
+              (let [meeting (p/meeting-meta this external-id)
+                    r (join! meeting join-opts)]
+                (swap! sessions assoc external-id r)
+                r))]
+      {:id (str "r-" external-id) :meeting-id external-id :platform :bot-join
+       :asset-ref audio-path :duration-s duration-s :format "wav"}))
+  (fetch-transcript [this external-id]
+    (let [rec (p/fetch-recording this external-id)]
+      (t/with-meeting-id (t/-transcribe transcriber (:asset-ref rec)) external-id)))
+  (list-participants [this external-id] (m/participant-ids (p/meeting-meta this external-id)))
+  (verify-webhook [_ _headers _raw-body] false)) ; bot-join has no webhook; ingest is scheduler-driven
+
+(defn register-meeting!
+  "Bot-join has no API to discover meeting metadata (unlike the cloud APIs) —
+  register the join details (:external-id, :password for Zoom, :tenant,
+  :participants if known) before fetch-recording/fetch-transcript can join."
+  [platform meeting]
+  (swap! (:meetings platform) assoc (:external-id meeting) meeting))
+
+(defn bot-join-platform
+  "tenant: the consuming org, e.g. \"cloud-manimani\" (used as the default
+  meeting :tenant for stub/unregistered meetings). transcriber: default
+  gijiroku.transcriber/mock-transcriber (swap in
+  gijiroku.whisper/whisper-transcriber for real STT). join-opts: passed
+  through to `join!` (display-name/max-duration-s/audio-*-fn/browser-args)."
+  [{:keys [tenant transcriber join-opts]
+    :or {transcriber (t/mock-transcriber) join-opts {}}}]
+  (->BotJoinPlatform tenant transcriber join-opts (atom {}) (atom {})))
