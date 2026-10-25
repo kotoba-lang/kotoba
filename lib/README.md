@@ -118,6 +118,7 @@ The bundled standard libraries live in this repository:
 | `org.threejs.core` | `org.threejs.core/src` | `org-threejs.core`, `org-threejs.gltf`, `org-threejs.interop`, `org-threejs.vrm` (an external specification, publisher threejs.org) |
 | `org.ecmaInternational.ecma262` | `org.ecmaInternational.ecma262/src` | `` (an external specification, publisher ecmaInternational.org) |
 | `org.ieee.du` | `org.ieee.du/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.find` | `org.ieee.find/src` | `` (an external specification, publisher ieee.org) |
 | `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
 | `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
 | `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |
