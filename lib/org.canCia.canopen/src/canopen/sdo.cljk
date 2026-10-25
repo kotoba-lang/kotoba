@@ -1,0 +1,384 @@
+(ns canopen.sdo
+  "SDO (Service Data Object) expedited and segmented transfer, CiA 301
+  §7.2.4. SDO reads and writes a single Object Dictionary entry
+  (index:subindex) between a client (usually the NMT master, or any
+  configuring tool) and a server (the addressed node), over a fixed pair
+  of 8-byte CAN frames: client->server on `0x600+node` and server->client
+  on `0x580+node` (see `canopen.cob-id`).
+
+  Every SDO frame's byte 0 is a **command-specifier byte**, and this is the
+  packed-bitfield-next-to-a-flag case the AGENTS.md conformance floor
+  calls out: it is not one 8-bit enum, it is up to four fields sharing a
+  byte, and which fields are meaningful depends on *which* SDO service the
+  byte belongs to.
+
+  **Initiate Download/Upload** (the first frame of a transfer — the one
+  that carries the index:subindex, and, if the value is small enough,
+  the whole value in one frame: 'expedited'):
+
+    bit 7..5  ccs/scs   command specifier (which service — see below)
+    bit 4     (reserved on download-request; unused elsewhere)
+    bit 3..2  n         bytes 4..7 NOT holding data — valid only if e=1 AND
+                         s=1. Data occupies the low `4-n` bytes of
+                         bytes 4..7, *not* the high ones.
+    bit 1     e          1 = expedited (data rides in this same frame,
+                         <=4 bytes) / 0 = segmented (a size follow, then
+                         separate segment frames carry the data)
+    bit 0     s          1 = size is indicated (either the expedited byte
+                         count via `n`, or for a non-expedited initiate,
+                         the total transfer size as a u32 in bytes 4..7)
+
+  **Segment** frames (the follow-up frames of a non-expedited transfer):
+
+    bit 7..5  ccs/scs   command specifier (0 = download segment request /
+                         upload segment response; 3 = upload segment
+                         request / 1 = download segment response — see
+                         the `command-specifiers` table, the two
+                         directions do NOT share a code)
+    bit 4     t         toggle bit — 0 for the first segment, flips (0/1/
+                         0/1...) each following segment. A segment whose
+                         toggle does not match the expected value is a
+                         protocol violation, not new data — see
+                         `check-toggle`.
+    bit 3..1  n         bytes 1..7 NOT holding data (0..7): a segment
+                         carries at most 7 payload bytes, so unlike the
+                         initiate frame's `n` this one needs 3 bits.
+    bit 0     c         'continue' — actually named the other way in the
+                         standard's own mnemonic (`c` = 'no more
+                         segments'): 1 on the LAST segment of the
+                         transfer, 0 on every one before it.
+
+  This asymmetry — `e`/`s` on initiate frames, `t`/`c` on segment frames,
+  both pairs squeezed into the low 2 bits next to a 2-or-3-bit `n` whose
+  own width changes between the two frame kinds — is exactly the kind of
+  thing that is easy to get subtly wrong copying from memory, so every
+  encode/decode pair here is exercised by both a spec-shaped worked
+  example and a round-trip sweep.
+
+  **Abort** (either direction, at any point in a transfer): byte0 = 0x80
+  (ccs/scs = 4, `100` in the top 3 bits, nothing else set), bytes 1..2
+  index, byte 3 subindex, bytes 4..7 the abort code (u32, **little-endian**
+  — see the endianness note below).
+
+  ## Endianness
+
+  **Little-endian, throughout.** CANopen inherits CiA 301's byte order for
+  every multi-byte field in an SDO frame: the object dictionary index
+  (bytes 1..2), the expedited/segmented-initiate size (bytes 4..7), and
+  the abort code (bytes 4..7) are all least-significant-byte-first. This
+  is the same direction as EtherCAT's wire order (see `org-ethercat`) and
+  the *opposite* of PROFINET's (see `com-profibus-profinet`) — three
+  fieldbuses built on the same idea (a short frame carrying a few packed
+  integers) that do not agree on byte order, which is precisely the kind
+  of thing that is invisible until two implementations are put on the
+  same wire. Verified against CANopenNode's `301/CO_SDOserver.h` struct
+  layouts and python-canopen's `canopen/sdo/base.py` `struct.pack('<...')`
+  format strings, both of which are unambiguous about byte order in a way
+  a written description can silently get backwards.
+
+  Sources for the protocol shape overall: CiA 301 §7.2.4 is a paywalled
+  CAN in Automation document; the command-specifier values and field
+  layout here are cross-checked against CANopenNode's `301/CO_SDOserver.c`
+  state machine, python-canopen's `canopen/sdo/client.py`, and
+  Wireshark's `packet-canopen.c` SDO dissector.")
+
+;; ── little-endian helpers ────────────────────────────────────────────────
+
+(defn- u16le [n] [(bit-and n 0xFF) (bit-and (unsigned-bit-shift-right n 8) 0xFF)])
+(defn- rd-u16le [bs off] (bit-or (bit-and (nth bs off) 0xFF)
+                                  (bit-shift-left (bit-and (nth bs (inc off)) 0xFF) 8)))
+(defn- u32le [n] [(bit-and n 0xFF)
+                   (bit-and (unsigned-bit-shift-right n 8) 0xFF)
+                   (bit-and (unsigned-bit-shift-right n 16) 0xFF)
+                   (bit-and (unsigned-bit-shift-right n 24) 0xFF)])
+(defn- rd-u32le [bs off]
+  ;; `unsigned-bit-shift-right ... 0` at the end, not just at each step:
+  ;; ClojureScript's `bit-shift-left`/`bit-or` are 32-bit SIGNED (JS
+  ;; semantics) — shifting a top byte with its high bit set (>=0x80) left
+  ;; by 24 produces a NEGATIVE host number even though the underlying bit
+  ;; pattern is correct, and every abort code / size field whose top byte
+  ;; is >=0x80 would come back as a negative number instead of the
+  ;; intended 0..4294967295 unsigned value. This has no effect on the
+  ;; JVM, where the same expression already produces a nonnegative Long.
+  (unsigned-bit-shift-right
+   (bit-or (bit-and (nth bs off) 0xFF)
+           (bit-shift-left (bit-and (nth bs (+ off 1)) 0xFF) 8)
+           (bit-shift-left (bit-and (nth bs (+ off 2)) 0xFF) 16)
+           (bit-shift-left (bit-and (nth bs (+ off 3)) 0xFF) 24))
+   0))
+
+;; ── command specifiers, top 3 bits of byte 0 ────────────────────────────
+
+(def command-specifiers
+  "Named per direction; download-request and upload-response DO NOT share
+  a code with their own response/request despite both being 'the frame
+  with the index:subindex in it' — see the docstring above."
+  {:download-segment-request 0
+   :download-initiate-response 3
+   :upload-initiate-request 2
+   :upload-segment-response 0
+   :abort 4
+   :download-initiate-request 1
+   :download-segment-response 1
+   :upload-segment-request 3
+   :upload-initiate-response 2})
+
+(defn- ccs-of [b] (bit-and (unsigned-bit-shift-right b 5) 0x7))
+
+;; ── expedited initiate download (write), client -> server ──────────────
+
+(defn encode-download-request
+  "`{:index :subindex :data (1..4 bytes)}` -> `[:ok bytes]` (8), an
+  expedited-transfer Initiate SDO Download request. `n` (bytes 4..7 not
+  holding data) is derived from `(count data)`, never taken separately,
+  so it cannot disagree with what was actually written."
+  [{:keys [index subindex data]}]
+  (let [data (vec data)]
+    (cond
+      (not (<= 0 index 0xFFFF)) [:error :canopen/index-out-of-range index]
+      (not (<= 0 subindex 0xFF)) [:error :canopen/subindex-out-of-range subindex]
+      (not (<= 1 (count data) 4)) [:error :canopen/expedited-data-too-long (count data)]
+      :else
+      (let [n (- 4 (count data))
+            cs (bit-or (bit-shift-left 1 5)     ; ccs = 1
+                       (bit-shift-left (bit-and n 0x3) 2)
+                       (bit-shift-left 1 1)      ; e = 1
+                       1)                        ; s = 1
+            padded (into data (repeat n 0))]
+        [:ok (into [cs] (concat (u16le index) [subindex] padded))]))))
+
+(defn decode-download-request
+  "8 bytes -> `[:ok {:index :subindex :data :expedited? :size}]`.
+  Non-expedited (segmented) initiate: `:data` is `[]`, `:size` is the
+  announced total transfer size (present only if `s`=1)."
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 1 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else
+      (let [cs (first bs)
+            e? (pos? (bit-and cs 0x02))
+            s? (pos? (bit-and cs 0x01))
+            n (bit-and (unsigned-bit-shift-right cs 2) 0x3)
+            index (rd-u16le bs 1)
+            subindex (nth bs 3)]
+        [:ok (merge {:index index :subindex subindex :expedited? e?}
+                    (if e?
+                      {:data (subvec bs 4 (+ 4 (- 4 n)))}
+                      {:data []
+                       :size (when s? (rd-u32le bs 4))}))]))))
+
+(defn encode-download-response
+  "`{:index :subindex}` -> `[:ok bytes]` (8), the server's Initiate SDO
+  Download response (scs=3). No data — this just acknowledges the write."
+  [{:keys [index subindex]}]
+  (cond
+    (not (<= 0 index 0xFFFF)) [:error :canopen/index-out-of-range index]
+    (not (<= 0 subindex 0xFF)) [:error :canopen/subindex-out-of-range subindex]
+    :else [:ok (into [(bit-shift-left 3 5)] (concat (u16le index) [subindex 0 0 0 0]))]))
+
+(defn decode-download-response
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 3 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else [:ok {:index (rd-u16le bs 1) :subindex (nth bs 3)}])))
+
+;; ── expedited initiate upload (read) ─────────────────────────────────────
+
+(defn encode-upload-request
+  "`{:index :subindex}` -> `[:ok bytes]` (8), Initiate SDO Upload request
+  (ccs=2). No data — this asks the server to send the value."
+  [{:keys [index subindex]}]
+  (cond
+    (not (<= 0 index 0xFFFF)) [:error :canopen/index-out-of-range index]
+    (not (<= 0 subindex 0xFF)) [:error :canopen/subindex-out-of-range subindex]
+    :else [:ok (into [(bit-shift-left 2 5)] (concat (u16le index) [subindex 0 0 0 0]))]))
+
+(defn decode-upload-request
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 2 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else [:ok {:index (rd-u16le bs 1) :subindex (nth bs 3)}])))
+
+(defn encode-upload-response
+  "`{:index :subindex :data (1..4 bytes)}` -> `[:ok bytes]` (8), an
+  expedited-transfer Initiate SDO Upload response (scs=2)."
+  [{:keys [index subindex data]}]
+  (let [data (vec data)]
+    (cond
+      (not (<= 0 index 0xFFFF)) [:error :canopen/index-out-of-range index]
+      (not (<= 0 subindex 0xFF)) [:error :canopen/subindex-out-of-range subindex]
+      (not (<= 1 (count data) 4)) [:error :canopen/expedited-data-too-long (count data)]
+      :else
+      (let [n (- 4 (count data))
+            cs (bit-or (bit-shift-left 2 5)
+                       (bit-shift-left (bit-and n 0x3) 2)
+                       (bit-shift-left 1 1)
+                       1)
+            padded (into data (repeat n 0))]
+        [:ok (into [cs] (concat (u16le index) [subindex] padded))]))))
+
+(defn decode-upload-response
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 2 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else
+      (let [cs (first bs)
+            e? (pos? (bit-and cs 0x02))
+            s? (pos? (bit-and cs 0x01))
+            n (bit-and (unsigned-bit-shift-right cs 2) 0x3)
+            index (rd-u16le bs 1)
+            subindex (nth bs 3)]
+        [:ok (merge {:index index :subindex subindex :expedited? e?}
+                    (if e?
+                      {:data (subvec bs 4 (+ 4 (- 4 n)))}
+                      {:data []
+                       :size (when s? (rd-u32le bs 4))}))]))))
+
+;; ── segmented transfer ───────────────────────────────────────────────────
+
+(defn encode-download-segment
+  "`{:toggle 0|1 :data (0..7 bytes) :last?}` -> `[:ok bytes]` (8) — a
+  Download Segment request (ccs=0), client -> server."
+  [{:keys [toggle data last?]}]
+  (let [data (vec data)]
+    (cond
+      (not (#{0 1} toggle)) [:error :canopen/sdo-toggle-not-a-bit toggle]
+      (not (<= 0 (count data) 7)) [:error :canopen/sdo-segment-too-long (count data)]
+      :else
+      (let [n (- 7 (count data))
+            cs (bit-or (bit-shift-left toggle 4)
+                       (bit-shift-left (bit-and n 0x7) 1)
+                       (if last? 1 0))
+            padded (into data (repeat n 0))]
+        [:ok (into [cs] padded)]))))
+
+(defn decode-download-segment
+  "8 bytes -> `[:ok {:toggle :data :last?}]`. Does not itself validate the
+  toggle sequence — that requires session state (the toggle of the
+  *previous* segment), which is a protocol-handler concern, not a codec
+  one. Use `check-toggle` with the expected value."
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 0 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else
+      (let [cs (first bs)
+            toggle (bit-and (unsigned-bit-shift-right cs 4) 0x1)
+            n (bit-and (unsigned-bit-shift-right cs 1) 0x7)
+            last? (pos? (bit-and cs 0x1))]
+        [:ok {:toggle toggle :data (subvec bs 1 (+ 1 (- 7 n))) :last? last?}]))))
+
+(defn encode-upload-segment
+  "`{:toggle 0|1 :data (0..7 bytes) :last?}` -> `[:ok bytes]` (8) — an
+  Upload Segment response (scs=0), server -> client. Same field layout as
+  `encode-download-segment`; the two are distinguished only by which
+  command-specifier value belongs on which COB-ID (see `canopen.cob-id`),
+  not by anything visible in this byte alone."
+  [{:keys [toggle data last?]}]
+  (encode-download-segment {:toggle toggle :data data :last? last?}))
+
+(defn decode-upload-segment
+  "Structurally identical to `decode-download-segment` (scs=0 == ccs=0);
+  kept as a separate name because the two travel on different COB-IDs and
+  mean opposite things (a server handing data to the client, not the
+  client handing data to the server)."
+  [bytes] (decode-download-segment bytes))
+
+(defn encode-upload-segment-request
+  "`{:toggle 0|1}` -> `[:ok bytes]` (8) — an Upload Segment request
+  (ccs=3), client -> server: 'send me the next segment'. No data."
+  [{:keys [toggle]}]
+  (if-not (#{0 1} toggle)
+    [:error :canopen/sdo-toggle-not-a-bit toggle]
+    [:ok (into [(bit-or (bit-shift-left 3 5) (bit-shift-left toggle 4))] (repeat 7 0))]))
+
+(defn decode-upload-segment-request
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 3 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else [:ok {:toggle (bit-and (unsigned-bit-shift-right (first bs) 4) 0x1)}])))
+
+(defn encode-download-segment-response
+  "`{:toggle 0|1}` -> `[:ok bytes]` (8) — a Download Segment response
+  (scs=1), server -> client: 'got it, send the next one'."
+  [{:keys [toggle]}]
+  (if-not (#{0 1} toggle)
+    [:error :canopen/sdo-toggle-not-a-bit toggle]
+    [:ok (into [(bit-or (bit-shift-left 1 5) (bit-shift-left toggle 4))] (repeat 7 0))]))
+
+(defn decode-download-segment-response
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 1 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else [:ok {:toggle (bit-and (unsigned-bit-shift-right (first bs) 4) 0x1)}])))
+
+(defn check-toggle
+  "`expected` (the toggle bit the next segment must carry, starting at 0
+  for the first segment) vs. a decoded segment's `:toggle` -> `[:ok
+  next-expected]` (the flipped bit) or `[:error :canopen/sdo-toggle-mismatch
+  {:expected :got}]`. This is the toggle-sequence check `decode-*-segment`
+  deliberately does not do itself (it has no session state to check
+  against) — a protocol handler calls this once per segment received."
+  [expected {:keys [toggle]}]
+  (if (= expected toggle)
+    [:ok (bit-xor expected 1)]
+    [:error :canopen/sdo-toggle-mismatch {:expected expected :got toggle}]))
+
+;; ── abort ────────────────────────────────────────────────────────────────
+
+(def abort-codes
+  "A handful of the CiA 301 Table 23 abort codes actually exercised by the
+  test suite. Not exhaustive — abort codes are a large enumeration and the
+  point here is the frame shape, not reproducing the whole table."
+  {0x05040001 :command-specifier-not-valid-or-unknown
+   0x05040005 :out-of-memory
+   0x06010001 :attempt-to-read-a-write-only-object
+   0x06010002 :attempt-to-write-a-read-only-object
+   0x06020000 :object-does-not-exist
+   0x06090011 :subindex-does-not-exist
+   0x08000000 :general-error})
+
+(defn encode-abort
+  "`{:index :subindex :abort-code (u32, keyword from `abort-codes` or a raw
+  int)}` -> `[:ok bytes]` (8). Works in either direction."
+  [{:keys [index subindex abort-code]}]
+  (let [code (if (keyword? abort-code)
+               (some (fn [[k v]] (when (= v abort-code) k)) abort-codes)
+               abort-code)]
+    (cond
+      (not (<= 0 index 0xFFFF)) [:error :canopen/index-out-of-range index]
+      (not (<= 0 subindex 0xFF)) [:error :canopen/subindex-out-of-range subindex]
+      (nil? code) [:error :canopen/unknown-abort-code abort-code]
+      :else [:ok (into [0x80] (concat (u16le index) [subindex] (u32le code)))])))
+
+(defn decode-abort
+  [bytes]
+  (let [bs (vec bytes)]
+    (cond
+      (not= 8 (count bs)) [:error :canopen/sdo-frame-wrong-length (count bs)]
+      (not= 4 (ccs-of (first bs)))
+      [:error :canopen/unexpected-command-specifier (ccs-of (first bs))]
+      :else
+      (let [code (rd-u32le bs 4)]
+        [:ok {:index (rd-u16le bs 1) :subindex (nth bs 3) :abort-code code
+              :abort-code-name (get abort-codes code)}]))))

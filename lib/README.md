@@ -137,6 +137,7 @@ The bundled standard libraries live in this repository:
 | `org.iso.std6983` | `org.iso.std6983/src` | `kotoba.cam`, `kotoba.cam.gcode`, `kotoba.cam.stock`, `kotoba.cam.tool` (an external specification, publisher iso.org) |
 | `org.ietf.dns` | `org.ietf.dns/src` | `nameserver.amano`, `nameserver.custom-tld`, `nameserver.delegate`, `nameserver.domain-verification` (an external specification, publisher ietf.org) |
 | `org.chainagnostic.cacao` | `org.chainagnostic.cacao/src` | `cacao.cli`, `cacao.conformance`, `cacao.core`, `cacao.edge.base58` (an external specification, publisher chainagnostic.org) |
+| `org.canCia.canopen` | `org.canCia.canopen/src` | `canopen.cob-id`, `canopen.emcy`, `canopen.nmt`, `canopen.pdo` (an external specification, publisher canCia.org) |
 | `com.microsoft.riff` | `com.microsoft.riff/src` | `riff.bytes`, `riff.core` (Kotoba project library) |
 | `com.pkware.zip` | `com.pkware.zip/src` | `zip.bytes`, `zip.core`, `zip.write` (Kotoba project library) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
