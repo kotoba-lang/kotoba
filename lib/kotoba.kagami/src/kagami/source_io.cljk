@@ -1,0 +1,269 @@
+(ns kagami.source-io
+  "Git/filesystem adapter for source records. Operational kbb/CLJS mechanism;
+   source contracts and planning live in kagami.source. argv only, no shell."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            [kotoba.lang.text :as str]
+            [multiformats.core :as mf]
+            [kagami.source :as source]
+            [kagami.source-workspace :as sw]
+            [kagami.west :as west]))
+
+;; Existing multiformats provider seam checks this host mechanism against its
+;; portable vectors before installation. All record identities stay unchanged.
+(defonce sha256-provider
+  (mf/install-sha256! (fn [bytes]
+                       (js/Uint8Array. (.digest (.update (crypto/createHash "sha256") (js/Buffer.from bytes)))))))
+
+(defn run-with [argv cwd {:keys [input env]}]
+  (let [r (cp/spawnSync (first argv) (clj->js (rest argv))
+                        #js {:cwd cwd :input input :encoding "utf8" :timeout 120000
+                             :maxBuffer 67108864
+                             :env (js/Object.assign #js {} js/process.env #js {"GIT_TERMINAL_PROMPT" "0" "GIT_NO_REPLACE_OBJECTS" "1"} (clj->js env))})]
+    (source/require! (and (nil? (.-error r)) (= 0 (.-status r)))
+                     :command-failed {:command (first argv)
+                                      :detail (subs (str (.-stderr r)) 0 (min 1500 (count (str (.-stderr r)))))})
+    (.-stdout r)))
+(defn run [argv cwd] (run-with argv cwd {}))
+
+(defn git [repo & args] (run (into ["git" "--no-replace-objects" "-c" "core.fsmonitor=false" "-C" repo] args) repo))
+(defn read-text [file] (fs/readFileSync file "utf8"))
+(defn read-edn [file] (source/read-edn! (read-text file)))
+(defn read-record [file] (source/verify! (read-edn file)))
+
+(defn write-new!
+  "Create only. An identical immutable object can be retried; never replace
+   another file. fsync before acknowledging local durability."
+  [file text]
+  (let [file (path/resolve file)]
+    (fs/mkdirSync (path/dirname file) #js {:recursive true})
+    (if (fs/existsSync file)
+      (source/require! (= text (read-text file)) :destination-occupied {:path file})
+      (let [fd (fs/openSync file "wx" 384)]
+        (try (fs/writeFileSync fd text) (fs/fsyncSync fd)
+             (finally (fs/closeSync fd))))) file))
+
+(defn write-record! [file r]
+  (source/verify! r) (write-new! file (str (pr-str r) "\n")) r)
+
+(defn options [argv allowed]
+  (loop [args argv out {}]
+    (if (empty? args) out
+        (let [[k v & more] args key (when (str/starts-with? k "--") (keyword (subs k 2)))]
+          (source/require! (and (allowed key) (not (contains? out key))
+                               (string? v) (not (str/starts-with? v "--")))
+                           :invalid-option {:option k})
+          (recur more (assoc out key v))))))
+
+(defn needed! [opts keys]
+  (doseq [k keys] (source/require! (string? (get opts k)) :missing-option {:option k})) opts)
+
+(defn inside? [p root] (or (= p root) (str/starts-with? p (str root path/sep))))
+(defn lexists? [p] (try (fs/lstatSync p) true (catch :default _ false)))
+
+(defn safe-child! [root target]
+  (let [root (fs/realpathSync root) target (path/resolve target)
+        ancestor (loop [p target] (if (lexists? p) p (recur (path/dirname p))))]
+    (source/require! (and (inside? target root) (inside? (fs/realpathSync ancestor) root)
+                         (not (and (lexists? target) (.isSymbolicLink (fs/lstatSync target)))))
+                     :path-escapes-scope {:path target}) target))
+
+(defn atomic-edn! [file value]
+  (let [temp (str file "." (.-pid js/process) "." (random-uuid) ".tmp")]
+    (write-new! temp (str (pr-str value) "\n"))
+    (fs/renameSync temp file)))
+
+(defn with-workspace-lock! [file thunk]
+  (let [fd (try (fs/openSync file "wx" 384)
+                (catch :default e
+                  (if (= "EEXIST" (.-code e))
+                    (throw (ex-info "workspace is locked; inspect the recorded process before recovery"
+                                    {:reason :workspace-locked :path file})) (throw e))))]
+    (try
+      (fs/writeFileSync fd (pr-str {:pid (.-pid js/process) :at (.toISOString (js/Date.))}))
+      (fs/fsyncSync fd)
+      (thunk)
+      (finally (fs/closeSync fd) (fs/unlinkSync file)))))
+
+(defn owner-state [owner]
+  {:head (str/trim (git owner "rev-parse" "HEAD"))
+   :status (git owner "status" "--porcelain=v1" "-z" "--untracked-files=normal")
+   :stashes (git owner "stash" "list" "--format=%H")})
+
+(defn worktree-clean! [dest oid]
+  (source/require! (and (= oid (str/trim (git dest "rev-parse" "HEAD")))
+                       (str/blank? (git dest "status" "--porcelain=v1" "--untracked-files=normal")))
+                   :workspace-diverged {:path dest}))
+
+(defn remote-identity [url]
+  ;; GitHub's HTTPS and SSH transports name the same repository. Other hosts
+  ;; keep their exact identity; credentials and arbitrary URL rewrites do not
+  ;; participate in this equivalence.
+  (let [url (str/replace url #"\.git$" "")]
+    (if-let [[_ id] (re-matches #"(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)" url)]
+      (str "github:" (.toLowerCase id)) url)))
+
+(defn owner! [root repo]
+  (let [owner (safe-child! root (path/join root (:repo/path repo)))
+        _ (source/require! (fs/existsSync owner) :owner-checkout-missing {:repo (:repo/id repo)})
+        owner (fs/realpathSync owner)
+        _ (source/require! (= owner (str/trim (git owner "rev-parse" "--show-toplevel")))
+                           :wrong-owner-checkout {:repo (:repo/id repo)})
+        _ (source/require! (= "false" (str/trim (git owner "rev-parse" "--is-shallow-repository")))
+                           :shallow-owner {:repo (:repo/id repo)})
+        remotes (str/split-lines (str/trim (git owner "remote")))
+        matching (filterv #(= (remote-identity (:repo/url repo))
+                              (remote-identity (str/trim (git owner "config" "--get" (str "remote." % ".url"))))) remotes)]
+    (source/require! (= 1 (count matching)) :owner-remote-mismatch {:repo (:repo/id repo)})
+    {:owner owner :remote (first matching) :before (owner-state owner)}))
+
+(defn projection [repos]
+  (let [entries
+        (mapv (fn [i r]
+                (let [url (:repo/url r) slash (.lastIndexOf url "/")
+                      remote (str "snapshot-" i)]
+                  {:remote remote :base (subs url 0 slash)
+                   :entity {:repo/name (:repo/name r) :repo/remote remote
+                            :repo/repo-path (subs url (inc slash))
+                            :repo/path (:repo/path r) :repo/revision (get-in r [:repo/oid :hex])
+                            :repo/groups []}})) (range) repos)
+        header (str "manifest:\n  version: \"1.0\"\n  remotes:\n"
+                    (str/join "\n" (map #(str "    - name: " (:remote %) "\n      url-base: " (:base %)) entries))
+                    "\n  projects:")]
+    (west/emit {:fleet/header header :fleet/footer "\n  self:\n    path: snapshot-manifest\n"
+                :fleet/repos (mapv :entity entries)})))
+
+(def workspace-config "[manifest]\npath = snapshot-manifest\nfile = west.yml\n")
+
+(defn workspace-controls! [root dest]
+  ;; A resumed task is an occupied workspace. Check every control destination,
+  ;; including directories, before following paths or writing generated files.
+  (doseq [relative [".west" ".west/config" ".source-workspace.edn" ".source-workspace.lock"
+                    "snapshot-manifest" "snapshot-manifest/west.yml" "snapshot-manifest/snapshot.edn"]]
+    (safe-child! root (path/join dest relative))))
+
+(defn workspace-config! [dest journal]
+  (let [file (path/join dest ".west/config")
+        digest (when (fs/existsSync file) (source/content-cid (read-text file)))]
+    (source/require! (and digest (or (= digest (:workspace/config-initial journal))
+                                     (= digest (source/content-cid workspace-config))))
+                     :workspace-control-diverged {:path file})))
+
+(defn workspace!
+  [{:keys [snapshot roots root agent task out apply resume forest-command]}]
+  (let [record (read-record snapshot) root (fs/realpathSync (path/resolve root))
+        _ (source/require! (fs/existsSync (path/join root ".west/config")) :forest-config-missing {})
+        plan (sw/plan record (str/split roots #",") {:root root :agent agent :task task})
+        dest (safe-child! root (path/join root "workspaces/west" task))
+        _ (workspace-controls! root dest)
+        journal-file (path/join dest ".source-workspace.edn")
+        existing (when (and (= "true" resume) (fs/existsSync journal-file)) (read-edn journal-file))
+        _ (source/require! (or (not (fs/existsSync dest))
+                               (and existing (= plan (:workspace/plan existing))))
+                           :destination-occupied {:path dest})
+        _ (when existing (workspace-config! dest existing))
+        owners (into {} (map (fn [r] [(:repo/id r) (owner! root r)])) (:workspace/repos plan))
+        _ (doseq [r (:workspace/repos plan)]
+            (let [target (safe-child! root (path/join dest (:repo/path r)))]
+              (when (fs/existsSync target)
+                (source/require! (some #{target} (:workspace/created existing)) :destination-occupied {:path target})
+                (worktree-clean! target (get-in r [:repo/oid :hex])))))
+        receipt-file (safe-child! root (or out (path/join dest ".source-workspace-receipt.edn")))
+        _ (source/require! (inside? receipt-file (path/join root "workspaces")) :report-outside-workspaces {})]
+    (if-not (= "true" apply)
+      (assoc plan :workspace/state :planned :workspace/path dest)
+      (let [journal (atom (or existing {:workspace/plan plan :workspace/created [] :workspace/state :creating}))]
+        (when-not existing
+          (let [factory (or forest-command (path/join root "com-junkawasaki/west-manifest/bin/forest-maintenance"))]
+            (run [factory "workspace" "--root" root "--kind" "west" "--agent" agent "--task" task] root))
+          (workspace-controls! root dest)
+          (swap! journal assoc :workspace/config-initial
+                 (source/content-cid (read-text (path/join dest ".west/config"))))
+          (atomic-edn! journal-file @journal))
+        (with-workspace-lock! (path/join dest ".source-workspace.lock")
+         (fn []
+          (try
+          (workspace-controls! root dest)
+          (workspace-config! dest @journal)
+          (doseq [r (:workspace/repos plan)]
+            (let [{:keys [owner remote]} (owners (:repo/id r))
+                  oid (get-in r [:repo/oid :hex]) target (path/join dest (:repo/path r))]
+              (when-not (fs/existsSync target)
+                (let [present (cp/spawnSync "git" #js ["-C" owner "cat-file" "-e" (str oid "^{commit}")]
+                                             #js {:encoding "utf8"})]
+                  (when-not (= 0 (.-status present))
+                    (git owner "fetch" "--no-tags" "--no-recurse-submodules" "--no-write-fetch-head" remote oid)))
+                (source/require! (= oid (str/trim (git owner "rev-parse" (str oid "^{commit}")))) :object-unverified {})
+                (fs/mkdirSync (path/dirname target) #js {:recursive true})
+                ;; Record intended ownership before Git mutates its worktree registry.
+                (swap! journal update :workspace/created #(vec (distinct (conj % target))))
+                (atomic-edn! journal-file @journal)
+                (git owner "worktree" "add" "--detach" target oid))
+              (worktree-clean! target oid)))
+          (doseq [[_ {:keys [owner before]}] owners]
+            (source/require! (= before (owner-state owner)) :owner-changed-during-materialization {:owner owner}))
+          (let [manifest (path/join dest "snapshot-manifest")
+                _ (fs/mkdirSync manifest #js {:recursive true})
+                _ (write-new! (path/join manifest "west.yml") (projection (:workspace/repos plan)))
+                _ (write-record! (path/join manifest "snapshot.edn") record)
+                ;; The factory created this new, task-owned config; pin it to the projection.
+                _ (fs/writeFileSync (path/join dest ".west/config") workspace-config)
+                receipt {:workspace/version 1 :workspace/snapshot (:source/cid record)
+                         :workspace/path dest :workspace/roots (:workspace/roots plan)
+                         :workspace/repos (mapv #(select-keys % [:repo/id :repo/oid]) (:workspace/repos plan))
+                         :workspace/state :complete}
+                receipt (assoc receipt :workspace/cid (source/value-cid receipt))]
+            (write-new! receipt-file (str (pr-str receipt) "\n"))
+            (swap! journal assoc :workspace/state :complete :workspace/receipt receipt-file)
+            (atomic-edn! journal-file @journal) receipt)
+          (catch :default e
+            (swap! journal assoc :workspace/state :incomplete :workspace/error (ex-message e))
+            (atomic-edn! journal-file @journal)
+            (throw (ex-info "workspace incomplete; preserved for explicit resume"
+                            {:reason :workspace-incomplete :journal journal-file :cause (ex-data e)}))))))))))
+
+(defn main [argv]
+  (let [[command & args] argv]
+    (case command
+      "change"
+      (let [o (needed! (options args #{:id :actor :title :repos :out}) [:id :actor :title :repos :out])]
+        (write-record! (:out o) (source/record :change
+          {:change/id (:id o) :change/actor (:actor o) :change/title (:title o)
+           :change/repos (str/split (:repos o) #",")})))
+      "snapshot"
+      (let [o (needed! (options args #{:manifest :at :lock :out}) [:manifest :at :lock :out])
+            at (:at o) repo (path/resolve (:manifest o)) lock-text (read-text (:lock o))]
+        (source/require! (source/oid? at) :invalid-manifest-basis {})
+        (source/require! (= at (str/trim (git repo "rev-parse" (str at "^{commit}")))) :invalid-manifest-basis {})
+        (write-record! (:out o)
+          (source/from-west (git repo "show" (str at ":manifest/west.yml"))
+                            (git repo "show" (str at ":manifest/repos.edn"))
+                            at lock-text (source/read-edn! lock-text))))
+      "revision"
+      (let [o (needed! (options args #{:change :base :changes :actor :parent :out})
+                       [:change :base :changes :actor :out])
+            change (read-record (:change o)) base (read-record (:base o))
+            parent (when (:parent o) (read-record (:parent o)))
+            _ (when parent
+                (source/kind! parent :revision)
+                (source/require! (= (get-in parent [:source/value :revision/change])
+                                    (get-in change [:source/value :change/id])) :revision-parent-change-mismatch {}))]
+        (write-record! (:out o)
+          (source/make-revision change base
+            {:revision/change (get-in change [:source/value :change/id])
+             :revision/base (:source/cid base) :revision/parent (:source/cid parent)
+             :revision/actor (:actor o) :revision/changes (read-edn (:changes o)) :revision/op-heads []})))
+      "candidate"
+      (let [o (needed! (options args #{:base :revision :lock :out}) [:base :revision :lock :out])
+            text (read-text (:lock o))]
+        (write-record! (:out o) (source/candidate (read-record (:base o)) (read-record (:revision o))
+                                                {:text text :value (source/read-edn! text)})))
+      "workspace"
+      (workspace! (needed! (options args #{:snapshot :roots :root :agent :task :out :apply :resume :forest-command})
+                            [:snapshot :roots :root :agent :task]))
+      "verify"
+      (let [o (needed! (options args #{:record}) [:record])]
+        (read-record (:record o)))
+      (throw (ex-info "source: change|snapshot|revision|candidate|workspace|verify" {:reason :unknown-command})))))

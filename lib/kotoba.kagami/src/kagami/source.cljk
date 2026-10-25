@@ -1,0 +1,208 @@
+(ns kagami.source
+  "Versioned source records (ADR-2610151430). Pure data validation, identity
+   and closure planning; existing CLJK operational runtime, not Q9 qualification.
+   The owner resolver supplies the lock/graph. No package resolution happens here."
+  (:require [kotoba.bytes :as bytes]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [multiformats.core :as mf]
+            [kagami.west :as west]))
+
+(defn require! [ok reason data]
+  (when-not ok (throw (ex-info (name reason) (assoc data :reason reason)))))
+
+(defn fields! [m required optional]
+  (require! (and (map? m) (every? #(contains? m %) required)
+                 (every? (into (set required) optional) (keys m)))
+            :invalid-fields {:required required :actual (when (map? m) (set (keys m)))})
+  m)
+
+(defn segment? [s]
+  (boolean (and (string? s) (re-matches #"[A-Za-z0-9][A-Za-z0-9._-]*" s)
+                (not (#{"." ".."} s)))))
+
+(defn repo-id? [s]
+  (boolean (and (string? s) (= 2 (count (str/split s #"/")))
+                (every? segment? (str/split s #"/")))))
+
+(defn oid? [s] (boolean (and (string? s) (re-matches #"[0-9a-f]{40}" s))))
+
+(defn cid? [s]
+  (try
+    (let [{:keys [version codec multihash]} (when (string? s) (mf/cid->parts s))
+          h (vec multihash)]
+      (boolean (and (= 1 version) (= mf/codec-raw codec)
+                    (= 34 (count h)) (= [18 32] (subvec h 0 2))
+                    (= s (mf/cidv1 codec multihash)))))
+    (catch #?(:clj Exception :cljs :default) _ false)))
+
+(defn text! [s]
+  (require! (and (string? s) (not (str/blank? s)) (<= (count s) 8192))
+            :invalid-text {}) s)
+
+(defn read-edn! [text]
+  (let [values (edn/read-string (str "[" text "\n]"))]
+    (require! (= 1 (count values)) :one-edn-value-required {}) (first values)))
+
+(defn unique-vector! [v pred]
+  (require! (and (vector? v) (= (count v) (count (set v))) (every? pred v))
+            :invalid-or-duplicate-items {}) v)
+
+(defn- canonical [x]
+  (cond
+    (map? x) [:map (mapv (fn [[k v]] [(canonical k) (canonical v)])
+                         (sort-by (comp pr-str key) x))]
+    (vector? x) [:vector (mapv canonical x)]
+    (set? x) [:set (vec (sort-by pr-str (map canonical x)))]
+    (or (nil? x) (boolean? x) (string? x) (keyword? x)) x
+    (and (integer? x) (<= -9007199254740991 x 9007199254740991)) x
+    :else (throw (ex-info "unsupported canonical value" {:reason :unsupported-value}))))
+
+(defn canonical-str [value] (pr-str ["kotoba-source/v1" (canonical value)]))
+(defn content-cid [text] (mf/cidv1-raw (bytes/utf8-bytes text)))
+(defn value-cid [value] (content-cid (canonical-str value)))
+
+(defn git-oid! [oid]
+  (fields! oid #{:algorithm :hex} #{})
+  (require! (and (= :sha1 (:algorithm oid)) (oid? (:hex oid))) :unsupported-git-oid {})
+  oid)
+
+(defn remote-url? [url]
+  (boolean
+   (and (string? url)
+        (re-matches #"(?:https://[A-Za-z0-9.-]+/|ssh://git@[A-Za-z0-9.-]+/|git@[A-Za-z0-9.-]+:|kotoba://[A-Za-z0-9.-]+/)[A-Za-z0-9._/-]+" url)
+        (not (re-find #"(?:^|/)\.\.?(?:/|$)" url)))))
+
+(defn repo! [r]
+  (fields! r #{:repo/id :repo/name :repo/path :repo/url :repo/oid :repo/materialization} #{})
+  (require! (and (repo-id? (:repo/id r)) (segment? (:repo/name r))
+                 (= (:repo/id r) (:repo/path r)) (remote-url? (:repo/url r))
+                 (#{:git :submodules :datalad} (:repo/materialization r)))
+            :invalid-repository {:repo (:repo/id r)})
+  (git-oid! (:repo/oid r)) r)
+
+(defn change! [v]
+  (fields! v #{:change/id :change/actor :change/title :change/repos} #{})
+  (require! (segment? (:change/id v)) :invalid-change-id {})
+  (text! (:change/actor v)) (text! (:change/title v))
+  (unique-vector! (:change/repos v) repo-id?)
+  (require! (seq (:change/repos v)) :empty-change {}) v)
+
+(defn snapshot! [v]
+  (fields! v #{:snapshot/parent :snapshot/basis :snapshot/registry :snapshot/lock
+               :snapshot/graph :snapshot/repos} #{})
+  (require! (or (nil? (:snapshot/parent v)) (cid? (:snapshot/parent v))) :invalid-parent {})
+  (require! (oid? (:snapshot/basis v)) :invalid-manifest-basis {})
+  (require! (and (cid? (:snapshot/registry v)) (cid? (:snapshot/lock v))) :invalid-lock {})
+  (let [repos (:snapshot/repos v) graph (:snapshot/graph v)]
+    (require! (and (vector? repos) (seq repos)) :empty-snapshot {})
+    (doseq [r repos] (repo! r))
+    (doseq [k [:repo/id :repo/name :repo/path]]
+      (require! (= (count repos) (count (set (map k repos)))) :duplicate-repository {:field k}))
+    (let [ids (set (map :repo/id repos))]
+      (require! (and (map? graph) (= ids (set (keys graph)))) :incomplete-dependency-graph {})
+      (doseq [[_ deps] graph] (unique-vector! deps ids)))) v)
+
+(defn revision! [v]
+  (fields! v #{:revision/change :revision/base :revision/parent :revision/actor
+               :revision/changes :revision/op-heads} #{})
+  (require! (segment? (:revision/change v)) :invalid-change-id {})
+  (text! (:revision/actor v))
+  (require! (and (cid? (:revision/base v))
+                 (or (nil? (:revision/parent v)) (cid? (:revision/parent v)))) :invalid-parent {})
+  (unique-vector! (:revision/op-heads v) cid?)
+  (let [changes (:revision/changes v)]
+    (require! (and (vector? changes) (seq changes)
+                   (= (count changes) (count (set (map :repo/id changes))))) :invalid-changes {})
+    (doseq [r changes]
+      (fields! r #{:repo/id :revision/old :revision/new} #{})
+      (require! (repo-id? (:repo/id r)) :invalid-repository {})
+      (git-oid! (:revision/old r)) (git-oid! (:revision/new r))
+      (require! (not= (:revision/old r) (:revision/new r)) :unchanged-revision {}))) v)
+
+(defn validate! [kind value]
+  (case kind :change (change! value) :revision (revision! value) :snapshot (snapshot! value)
+        (throw (ex-info "unsupported record type" {:reason :unsupported-record-type}))))
+
+(defn record [kind value]
+  (validate! kind value)
+  (let [body {:source/version 1 :source/kind kind :source/value value}]
+    (assoc body :source/cid (value-cid body))))
+
+(defn verify! [r]
+  (fields! r #{:source/version :source/kind :source/value :source/cid} #{})
+  (require! (= 1 (:source/version r)) :unsupported-record-version {})
+  (validate! (:source/kind r) (:source/value r))
+  (require! (= (:source/cid r) (value-cid (dissoc r :source/cid))) :cid-mismatch {}) r)
+
+(defn kind! [r kind]
+  (verify! r) (require! (= kind (:source/kind r)) :wrong-record-kind {}) (:source/value r))
+
+(defn make-revision [change base value]
+  (let [c (kind! change :change) b (kind! base :snapshot)
+        r (record :revision value)
+        by-id (into {} (map (juxt :repo/id identity)) (:snapshot/repos b))]
+    (require! (and (= (:change/id c) (:revision/change value))
+                   (= (:source/cid base) (:revision/base value))) :revision-base-mismatch {})
+    (doseq [item (:revision/changes value)]
+      (require! (and ((set (:change/repos c)) (:repo/id item))
+                     (= (:revision/old item) (:repo/oid (by-id (:repo/id item)))))
+                :revision-scope-or-old-mismatch {:repo (:repo/id item)})) r))
+
+(defn lock! [repos lock-text lock]
+  (fields! lock #{:lock/version :lock/resolver :lock/complete? :lock/dependencies :lock/revisions} #{})
+  (require! (and (= lock (read-edn! lock-text)) (= 1 (:lock/version lock))
+                 (true? (:lock/complete? lock)) (cid? (:lock/resolver lock))) :unverified-resolver-lock {})
+  (require! (= (:lock/revisions lock) (into {} (map (fn [r] [(:repo/id r) (get-in r [:repo/oid :hex])])) repos))
+            :resolver-input-revisions-mismatch {})
+  (let [ids (set (map :repo/id repos)) graph (:lock/dependencies lock)]
+    (require! (and (map? graph) (= ids (set (keys graph)))) :incomplete-dependency-graph {})
+    (doseq [[_ deps] graph] (unique-vector! deps ids))) lock)
+
+(defn candidate [base revision {:keys [text value]}]
+  (let [b (kind! base :snapshot) r (kind! revision :revision)
+        changes (into {} (map (juxt :repo/id identity)) (:revision/changes r))
+        by-id (into {} (map (juxt :repo/id identity)) (:snapshot/repos b))
+        repos (mapv #(if-let [c (changes (:repo/id %))] (assoc % :repo/oid (:revision/new c)) %) (:snapshot/repos b))]
+    (require! (= (:source/cid base) (:revision/base r)) :revision-base-mismatch {})
+    (doseq [[id c] changes]
+      (require! (= (:revision/old c) (:repo/oid (by-id id))) :revision-old-mismatch {:repo id}))
+    (lock! repos text value)
+    (record :snapshot
+            (assoc b :snapshot/parent (:source/cid base)
+                   :snapshot/lock (content-cid text) :snapshot/graph (:lock/dependencies value)
+                   :snapshot/repos repos))))
+
+(defn closure [snapshot roots]
+  (let [s (kind! snapshot :snapshot) graph (:snapshot/graph s)]
+    (unique-vector! roots #(contains? graph %))
+    (require! (seq roots) :empty-working-set {})
+    (loop [todo roots seen #{}]
+      (if-let [id (first todo)]
+        (if (seen id) (recur (subvec todo 1) seen)
+            (recur (into (subvec todo 1) (graph id)) (conj seen id)))
+        (vec (sort seen))))))
+
+(defn from-west
+  "Capture exact west bytes plus an owner resolver lock. The lock is a boundary
+   format: {:lock/version 1 :lock/resolver <CID> :lock/complete? true
+            :lock/dependencies {canonical-repo-id [dependency-id ...]}
+            :lock/revisions {canonical-repo-id full-git-oid}}."
+  [west-text registry-text basis lock-text lock]
+  (let [db (west/parse west-text)]
+    (require! (= west-text (west/emit db)) :projection-not-byte-exact {})
+    (let [value {:snapshot/parent nil :snapshot/basis basis
+             :snapshot/registry (content-cid registry-text) :snapshot/lock (content-cid lock-text)
+             :snapshot/graph (:lock/dependencies lock)
+             :snapshot/repos
+             (mapv (fn [e]
+                     (let [id (str (:repo/remote e) "/" (or (:repo/repo-path e) (:repo/name e)))]
+                       {:repo/id id :repo/name (:repo/name e) :repo/path id
+                        :repo/url (west/remote-url db e)
+                        :repo/oid {:algorithm :sha1 :hex (:repo/revision e)}
+                        :repo/materialization
+                        (cond (get-in e [:repo/userdata :datalad]) :datalad
+                              (or (:repo/submodules? e) (seq (:repo/submodule-paths e))) :submodules
+                              :else :git)})) (:fleet/repos db))}]
+      (lock! (:snapshot/repos value) lock-text lock)
+      (record :snapshot value))))

@@ -1,0 +1,266 @@
+(ns kagami.pin-kotoba-parity-test
+  "`kagami.pin` (the running cljc) vs `src/kagami/pin_core.kotoba` (the
+  decision core), compiled at test time and executed through the pinned KIR
+  interpreter.
+
+  This is step 1 of the dual-source pattern (kotoba-lang handoff §2): the
+  `.kotoba` is parity-bound, not yet authoritative — see the header of
+  `pin_core.kotoba` for why the authority move is a separate slice.
+
+  The facts adapter in this namespace is the seam a future host adapter would
+  be: it does the walking and the crypto calls (host mechanism) and hands the
+  guest only scalars. It deliberately does NOT pre-decide anything the guest
+  can judge from a scalar: the signer string crosses raw, so 'is this signer
+  well-formed' is decided exactly once, in the guest.
+
+  Reason literals are pinned (`reason-literals-are-pinned`): if `pin.cljc`
+  renames a reason, this suite fails on the rename itself, not only on
+  disagreement — an assertion that would stay green under a rename on both
+  sides at once is not discriminating the thing it names."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kagami.pin :as pin]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private kir
+  (delay
+    (let [result (compiler/compile-source (slurp "lib/kotoba.kagami/src/kagami/pin_core.kotoba")
+                                          :wasm32-kotoba-v1 {})]
+      (or (:kir result)
+          (throw (ex-info "compile-source returned no :kir"
+                          {:keys (keys result)}))))))
+
+;; Field order is the DECLARED order in pin_core.kotoba's schema. Spelled out
+;; here rather than read back from the source: if the schema changes shape,
+;; this stops matching and the call fails loudly instead of silently
+;; following the change (same stance as cloud-itonami-app's policy seam).
+(def ^:private facts-ty
+  [:record :pin/admission-facts
+   [[:signer :string]
+    [:authorized :bool]
+    [:signature-valid :bool]
+    [:has-current :bool]
+    [:sequence :i64]
+    [:current-sequence :i64]
+    [:parent [:option :string]]
+    [:expected-parent :string]
+    [:reachable :string]
+    [:value-advance :string]]])
+
+(def ^:private string-option [:option :string])
+
+(defn- opt [s]
+  (if (nil? s) [string-option false] [string-option true (str s)]))
+
+(defn- guest-covers? [grant path]
+  (ir/execute @kir 'covers? [(str grant) (str path)]))
+
+(defn- tri
+  "cljc tri-state (true | false | :unknown | nil) -> guest token.
+  Anything that is neither `false` nor `:unknown` is not flagged by the cljc,
+  so it crosses as \"ok\" — the mapping is total on purpose."
+  [v]
+  (cond (false? v) "fail" (= :unknown v) "unknown" :else "ok"))
+
+(defn- facts
+  "proposal + ctx -> the guest facts record, doing only host-mechanism work:
+  keyring walk (per-grant judgement delegated to guest `covers?`), the two
+  injected crypto fns, and map reads."
+  [{:keys [record signature signer]}
+   {:keys [repo-path current keyring verify-fn hash-fn reachable? value-advance?]
+    :or {value-advance? true}}]
+  (let [pubkey (when (and signer (str/starts-with? signer "ed25519:"))
+                 (subs signer (count "ed25519:")))
+        cur-rec (:record current)
+        authorized (boolean (some #(guest-covers? % repo-path)
+                                  (get-in keyring [:keys signer :grants])))
+        signature-valid (boolean (when pubkey
+                                   (verify-fn pubkey (pin/canonical-str record)
+                                              signature)))
+        expected-parent (if cur-rec
+                          (pin/record-hash hash-fn cur-rec (:signature current))
+                          "")]
+    (into [facts-ty]
+          [(str signer)
+           authorized
+           signature-valid
+           (some? cur-rec)
+           (long (:pin/sequence record))
+           (long (or (:pin/sequence cur-rec) 0))
+           (opt (:pin/parent record))
+           (str expected-parent)
+           (tri reachable?)
+           (tri value-advance?)])))
+
+(defn- guest-admit [proposal ctx]
+  (let [out (ir/execute @kir 'admit-verdict [(facts proposal ctx)])
+        [verdict & reasons] (str/split out #" ")]
+    {:verdict (keyword verdict) :reasons (mapv keyword reasons)}))
+
+;; ---------------------------------------------------------------------------
+;; deterministic corpus — no real crypto; both sides get the same injected fns
+
+(def ^:private good-sig "sig-good")
+
+(defn- verify-fn [_pubkey _payload sig] (= good-sig sig))
+(defn- hash-fn [s] (str "h" (Math/abs (long (hash s)))))
+
+(def ^:private keyring
+  {:keys {"ed25519:aa11" {:grants #{"orgs/kotoba-lang/*"}}
+          "ed25519:bb22" {:grants #{"orgs/kotoba-lang/kagami"}}
+          "rsa:cc33" {:grants #{"orgs/kotoba-lang/*"}}}})
+
+(def ^:private repo "orgs/kotoba-lang/kagami")
+
+(defn- rec [m]
+  (pin/make-record (merge {:repo repo :value "cafe1234" :parent nil
+                           :valid-until nil} m)))
+
+(def ^:private genesis
+  {:record (rec {:sequence 1}) :signature good-sig :signer "ed25519:aa11"})
+
+(def ^:private current
+  ;; An accepted head to advance from: sequence 5.
+  {:record (rec {:sequence 5 :value "beef5555"}) :signature good-sig})
+
+(def ^:private current-parent-hash
+  (pin/record-hash hash-fn (:record current) (:signature current)))
+
+(defn- ctx [m]
+  (merge {:repo-path repo :current nil :keyring keyring
+          :verify-fn verify-fn :hash-fn hash-fn :reachable? true}
+         m))
+
+(def ^:private corpus
+  [["genesis accept"
+    genesis (ctx {})]
+   ["genesis sequence not 1"
+    {:record (rec {:sequence 2}) :signature good-sig :signer "ed25519:aa11"}
+    (ctx {})]
+   ["genesis has parent"
+    {:record (rec {:sequence 1 :parent "h999"}) :signature good-sig
+     :signer "ed25519:aa11"}
+    (ctx {})]
+   ["malformed signer, but that signer holds a covering grant"
+    ;; Only :malformed-signer: authorization is looked up by the FULL signer
+    ;; id, and this keyring grants rsa:cc33 — the malformedness is the one
+    ;; thing wrong, which is exactly what makes it discriminating.
+    {:record (rec {:sequence 1}) :signature good-sig :signer "rsa:cc33"}
+    (ctx {})]
+   ["nil signer"
+    {:record (rec {:sequence 1}) :signature good-sig :signer nil}
+    (ctx {})]
+   ["unauthorized signer (exact grant does not cover a different repo)"
+    {:record (pin/make-record {:repo "orgs/kotoba-lang/other" :value "cafe1234"
+                               :sequence 1 :parent nil :valid-until nil})
+     :signature good-sig :signer "ed25519:bb22"}
+    (ctx {:repo-path "orgs/kotoba-lang/other"})]
+   ["bad signature"
+    {:record (rec {:sequence 1}) :signature "sig-forged" :signer "ed25519:aa11"}
+    (ctx {})]
+   ["advance accept"
+    {:record (rec {:sequence 6 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current :value-advance? true})]
+   ["sequence rollback (equal)"
+    {:record (rec {:sequence 5 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current})]
+   ["sequence rollback (behind)"
+    {:record (rec {:sequence 4 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current})]
+   ["parent mismatch (wrong hash)"
+    {:record (rec {:sequence 6 :parent "h000"})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current})]
+   ["parent mismatch (absent parent with a current head)"
+    {:record (rec {:sequence 6})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current})]
+   ["unreachable from upstream default branch"
+    {:record (rec {:sequence 6 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current :reachable? false})]
+   ["value regression"
+    {:record (rec {:sequence 6 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current :value-advance? false})]
+   ["value-advance false without a current head is not a regression"
+    {:record (rec {:sequence 1}) :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:value-advance? false})]
+   ["warn-accept: reachability unverifiable"
+    {:record (rec {:sequence 6 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current :reachable? :unknown})]
+   ["warn-accept: value-advance unverifiable"
+    {:record (rec {:sequence 6 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current :value-advance? :unknown})]
+   ["warn-accept: both unverifiable"
+    {:record (rec {:sequence 6 :parent current-parent-hash})
+     :signature good-sig :signer "ed25519:aa11"}
+    (ctx {:current current :reachable? :unknown :value-advance? :unknown})]
+   ["reasons accumulate in declaration order"
+    ;; forged signature + rollback + wrong parent + unreachable, all at once
+    {:record (rec {:sequence 3 :parent "h000"})
+     :signature "sig-forged" :signer "ed25519:aa11"}
+    (ctx {:current current :reachable? false :value-advance? false})]])
+
+;; ---------------------------------------------------------------------------
+
+(deftest admit-parity-over-the-corpus
+  (doseq [[label proposal c] corpus]
+    (testing label
+      (is (= (pin/admit proposal c) (guest-admit proposal c))))))
+
+(deftest reason-literals-are-pinned
+  ;; Not parity: the exact spelling both implementations must produce. A
+  ;; rename that lands on both sides at once still fails here, which is the
+  ;; point — the reason tokens are protocol, consumed by ledger events and
+  ;; operators, not an internal detail two implementations may drift together.
+  (let [reasons (fn [proposal c] (:reasons (pin/admit proposal c)))]
+    (is (= {:verdict :accept :reasons []} (pin/admit genesis (ctx {}))))
+    (is (= [:genesis-sequence-not-1]
+           (reasons {:record (rec {:sequence 2}) :signature good-sig
+                     :signer "ed25519:aa11"}
+                    (ctx {}))))
+    (is (= [:unreachable-from-upstream-default-branch]
+           (reasons {:record (rec {:sequence 6 :parent current-parent-hash})
+                     :signature good-sig :signer "ed25519:aa11"}
+                    (ctx {:current current :reachable? false}))))
+    (is (= [:bad-signature :sequence-rollback :parent-mismatch
+            :unreachable-from-upstream-default-branch :value-regression]
+           (reasons {:record (rec {:sequence 3 :parent "h000"})
+                     :signature "sig-forged" :signer "ed25519:aa11"}
+                    (ctx {:current current :reachable? false
+                          :value-advance? false}))))
+    (is (= {:verdict :warn-accept
+            :reasons [:reachability-unverifiable-fail-open
+                      :value-advance-unverifiable-fail-open]}
+           (pin/admit {:record (rec {:sequence 6 :parent current-parent-hash})
+                       :signature good-sig :signer "ed25519:aa11"}
+                      (ctx {:current current :reachable? :unknown
+                            :value-advance? :unknown}))))))
+
+(deftest covers-parity-and-boundaries
+  (let [cases [["orgs/kotoba-lang/kagami" "orgs/kotoba-lang/kagami"]
+               ["orgs/kotoba-lang/kagami" "orgs/kotoba-lang/kagami2"]
+               ["orgs/kotoba-lang/*" "orgs/kotoba-lang/kagami"]
+               ["orgs/kotoba-lang/*" "orgs/kotoba-lang/"]
+               ["orgs/kotoba-lang/*" "orgs/kotoba-lang"]
+               ["orgs/kotoba-lang/*" "orgs/other/kagami"]
+               ["*" "anything/at/all"]
+               ["*" ""]
+               ["" ""]
+               ["" "orgs/x"]
+               ["orgs/longer-than-path/*" "orgs/x"]]]
+    (doseq [[grant path] cases]
+      (testing (pr-str [grant path])
+        (is (= (pin/covers? grant path) (guest-covers? grant path))))))
+  (testing "pinned expectations, not just agreement"
+    (is (true? (guest-covers? "orgs/kotoba-lang/*" "orgs/kotoba-lang/kagami")))
+    (is (false? (guest-covers? "orgs/kotoba-lang/*" "orgs/kotoba-lang")))
+    (is (true? (guest-covers? "*" "orgs/anything")))
+    (is (false? (guest-covers? "orgs/kotoba-lang/kagami" "orgs/kotoba-lang/kagami2")))))
