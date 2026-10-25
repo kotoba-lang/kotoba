@@ -1,0 +1,271 @@
+(ns mail-archive.ingest
+  "Bulk backfill + incremental sync of a Gmail mailbox into the content-addressed
+  blob store + the `Store` index.
+
+  Backfill: paginate `gmail.threads/list-threads` (loop on `:nextPageToken`,
+  Gmail search syntax in `:q`), fetch each thread with `gmail.threads/get-thread`
+  (Gmail's default 'full' format — headers, labelIds, base64url body parts),
+  decode the body, normalize the address envelope through `mail.inbound/from-parts`
+  / `mail.message/normalize-address` (never hand-rolled), reconstruct a canonical
+  RFC822-ish source, content-address it via the `BlobStore` (cid = sha256 hex),
+  and transact the `:email/*` + `:person/*` + `:blob/*` entity through the `Store`.
+
+  Incremental: `users.history.list` from a persisted historyId cursor. com-gmail
+  has no `history`/`messages` namespace yet, so those two endpoints are called
+  through the shared `gmail.client/request!` boundary directly (documented
+  deviation — same auth/transport seam, still fully stubbable). A 404 from the
+  history endpoint means the cursor is older than Gmail's retention window; the
+  caller should fall back to a full backfill.
+
+  JVM-only: `com-gmail` is JVM-only today (every fn is `#?(:clj ...)`), and body
+  decoding + hashing use `java.util.Base64` / `java.time`, so every fn here is
+  `#?(:clj ...)`. Address normalization (`mail.message`) is the portable part.
+
+  Date encoding: `:email/date` is stored as a `YYYYMMDD` **integer** (derived from
+  Gmail's `internalDate`), not an ISO string, so date-range queries use numeric
+  `<`/`<=` — the only comparators `langchain.db` and DataScript share (both treat
+  `<`/`<=` as numeric; string comparison is unsupported on either side). This is
+  what makes the date-range query answer identically across both backends.
+
+  Content id: `:email/cid` = sha256 hex of the reconstructed source bytes (the
+  bytes the BlobStore actually stores), so the cid is reproducible from content."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [mail.inbound :as inbound]
+            [mail-archive.blob-store :as blob-store]
+            [mail-archive.store :as store]
+            #?(:clj [gmail.client :as client])
+            #?(:clj [gmail.threads :as threads])))
+
+;; ───────────────────────── header / address parsing ─────────────────────────
+
+#?(:clj
+   (defn header-value
+     "Case-insensitive lookup of a Gmail payload header (`[{:name :value} ...]`)."
+     [headers name]
+     (let [want (str/lower name)]
+       (some (fn [h] (when (= want (str/lower (str (:name h)))) (:value h))) headers))))
+
+#?(:clj
+   (defn split-addresses
+     "Split a comma-separated address header into trimmed, non-blank fragments.
+     (Display names containing commas are a known edge; the common case is safe.)"
+     [s]
+     (when s (->> (str/split s #",") (map str/trim) (remove str/blank?)))))
+
+#?(:clj
+   (defn parse-address
+     "Split `\"Display Name <addr@host>\"` into `{:name :email}`. Bare addresses
+     and nil are handled; only the display name / `<addr>` split lives here — the
+     email itself is normalized (lowercase/trim) by `mail.message`, not here."
+     [s]
+     (if (str/blank? (str s))
+       {:name nil :email nil}
+       (let [m (re-find #"^(.*?)<([^>]+)>\s*$" (str/trim s))]
+         (if m
+           {:name (let [n (-> (nth m 1) str/trim (str/replace #"^\"|\"$" ""))]
+                    (when (seq n) n))
+            :email (str/trim (nth m 2))}
+           {:name nil :email (str/trim s)})))))
+
+#?(:clj
+   (defn- ->person
+     "A `:person/*` entity from an already-normalized email + optional display name."
+     [email name]
+     (when-not (str/blank? (str email))
+       (cond-> {:person/id email :person/emails [email]}
+         (and name (not (str/blank? name))) (assoc :person/name name)))))
+
+;; ───────────────────────── body decode / reconstruct ─────────────────────────
+
+#?(:clj
+   (defn- decode-part-bytes ^bytes [^String data]
+     (when data (kbytes/base64url-decode-bytes data))))
+
+#?(:clj
+   (defn- decode-part-text [data]
+     (when-let [^bytes b (decode-part-bytes data)] (kbytes/utf8-string b))))
+
+#?(:clj
+   (defn text-body
+     "Depth-first first `text/plain` part's decoded text (Gmail nests parts
+     arbitrarily under multipart/*), falling back to the top-level body data."
+     [payload]
+     (letfn [(walk [p]
+               (let [data (get-in p [:body :data])]
+                 (cond
+                   (and (= (:mimeType p) "text/plain") data) (decode-part-text data)
+                   (:parts p) (some walk (:parts p))
+                   :else nil)))]
+       (or (walk payload)
+           (decode-part-text (get-in payload [:body :data]))))))
+
+#?(:clj
+   (defn reconstruct-source
+     "A stable RFC822-ish serialization used as the content-addressed blob: the raw
+     header lines Gmail returns, a blank line, then the decoded text body. Gmail's
+     threads.get 'full' format does not include the raw RFC822 bytes, so we
+     reconstruct a canonical form; its sha256 is the email's cid."
+     ^String [message]
+     (let [headers (get-in message [:payload :headers])
+           header-lines (map (fn [{:keys [name value]}] (str name ": " value)) headers)
+           body (or (text-body (:payload message)) "")]
+       (str (str/join "\r\n" header-lines) "\r\n\r\n" body))))
+
+#?(:clj
+   (defn- internal-date->yyyymmdd
+     "Gmail `internalDate` (epoch millis, string or long) -> a `YYYYMMDD` integer (UTC)."
+     [internal-date]
+     (when internal-date
+       (let [ms (if (string? internal-date) (Long/parseLong internal-date) (long internal-date))
+             d (.atZone (java.time.Instant/ofEpochMilli ms) java.time.ZoneOffset/UTC)]
+         (+ (* 10000 (.getYear d)) (* 100 (.getMonthValue d)) (.getDayOfMonth d))))))
+
+;; ───────────────────────── projection ─────────────────────────
+
+#?(:clj
+   (defn message->email-entity
+     "Project one Gmail message (threads.get 'full' shape) into an `:email/*` entity
+     map with nested `:person/*` (and, when `blob` is supplied, `:blob/*`) refs.
+     `blob` is `{:cid <sha256> :entity <blob-entity-map>}`; pass nil to project
+     without a blob (used by tests to assert the transformed shape). Pure — no I/O.
+     Address normalization goes through `mail.inbound/from-parts` (which delegates
+     to `mail.message/normalize-address`), so it is never hand-rolled here."
+     [message blob]
+     (let [payload (:payload message)
+           headers (:headers payload)
+           h (fn [n] (header-value headers n))
+           parsed-from (parse-address (h "From"))
+           parsed-tos (mapv parse-address (split-addresses (h "To")))
+           parsed-ccs (mapv parse-address (split-addresses (h "Cc")))
+           envelope (inbound/from-parts
+                     {:provider :gmail
+                      :provider-message-id (or (:id message) "")
+                      :from (:email parsed-from)
+                      :to (mapv :email parsed-tos)
+                      :cc (mapv :email parsed-ccs)
+                      :subject (h "Subject")
+                      :text (text-body payload)})
+           msg (:mail.inbound/message envelope)
+           from-person (->person (get-in msg [:mail/from :mail.address/email])
+                                 (:name parsed-from))
+           to-persons (into [] (keep identity)
+                            (map (fn [a p] (->person a (:name p)))
+                                 (map :mail.address/email (:mail/to msg))
+                                 parsed-tos))
+           cc-persons (into [] (keep identity)
+                            (map (fn [a p] (->person a (:name p)))
+                                 (map :mail.address/email (:mail/cc msg))
+                                 parsed-ccs))
+           date (internal-date->yyyymmdd (:internalDate message))]
+       (cond-> {:email/message-id (or (h "Message-ID") (:id message))
+                :email/thread-id (:threadId message)}
+         (:cid blob)               (assoc :email/cid (:cid blob))
+         (:entity blob)            (assoc :email/blob (:entity blob))
+         (h "Subject")             (assoc :email/subject (h "Subject"))
+         date                      (assoc :email/date date)
+         (seq (:labelIds message)) (assoc :email/labels (vec (:labelIds message)))
+         from-person               (assoc :email/from from-person)
+         (seq to-persons)          (assoc :email/to to-persons)
+         (seq cc-persons)          (assoc :email/cc cc-persons)))))
+
+#?(:clj
+   (defn- blob-entity [cid ^bytes source-bytes path]
+     {:blob/cid cid
+      :blob/sha256 cid
+      :blob/size (alength source-bytes)
+      :blob/mime "message/rfc822"
+      :blob/path path}))
+
+;; ───────────────────────── ingest (side-effecting) ─────────────────────────
+
+#?(:clj
+   (defn ingest-message!
+     "Content-address one Gmail message's reconstructed source into the BlobStore,
+     project it, and transact the `:email/*` entity via the Store. Returns the
+     transacted entity map."
+     [store blob-store message]
+     (let [source (reconstruct-source message)
+           bytes (kbytes/utf8-bytes source)
+           cid (blob-store/put! blob-store bytes)
+           entity (message->email-entity message {:cid cid :entity (blob-entity cid bytes cid)})]
+       (store/transact! store [entity])
+       entity)))
+
+#?(:clj
+   (defn ingest-thread!
+     "Fetch a thread ('full' format) and ingest every message in it. Returns the
+     ingested entity maps."
+     [store blob-store thread-id http-opts]
+     (let [thread (threads/get-thread thread-id http-opts)]
+       (mapv #(ingest-message! store blob-store %) (:messages thread)))))
+
+#?(:clj
+   (defn backfill!
+     "Paginate threads matching `:q` (Gmail search syntax; nil = whole mailbox)
+     via `list-threads`' `:nextPageToken`, ingesting each thread. `http-opts`
+     carries `:http-fn`/`:token` and optional `:q`/`:max-results`. Returns the
+     number of messages ingested."
+     [store blob-store http-opts]
+     (let [thread-http (dissoc http-opts :q :max-results :page-token)]
+       (loop [page-token nil, n 0]
+         (let [resp (threads/list-threads (cond-> http-opts
+                                            page-token (assoc :page-token page-token)))
+               threads (:threads resp)
+               next-token (:nextPageToken resp)
+               ingested (mapcat #(ingest-thread! store blob-store (:id %) thread-http) threads)
+               n' (+ n (count ingested))]
+           (if (and next-token (seq threads))
+             (recur next-token n')
+             n'))))))
+
+;; ───────────────────────── incremental sync ─────────────────────────
+
+#?(:clj
+   (defn list-history
+     "users.history.list from a cursor, via the shared gmail.client boundary (see
+     ns docstring). Returns the parsed body; throws ex-info (`:status` in ex-data)
+     on non-2xx — a 404 means the cursor expired."
+     [start-history-id {:keys [page-token] :as http-opts}]
+     (client/request! "/history"
+                      (assoc (dissoc http-opts :page-token)
+                             :query (cond-> {:startHistoryId start-history-id}
+                                      page-token (assoc :pageToken page-token))))))
+
+#?(:clj
+   (defn get-message
+     "users.messages.get ('full' format), via the shared gmail.client boundary."
+     [message-id http-opts]
+     (client/request! (str "/messages/" message-id) http-opts)))
+
+#?(:clj
+   (defn incremental-sync!
+     "Advance from a persisted historyId cursor: read it via `(cursor-get)`, fetch
+     history, ingest every added message (`messagesAdded`), page through
+     `:nextPageToken`, then persist the new historyId via `(cursor-set! id)`.
+     Returns `{:ingested N :history-id id}`, or `{:cursor-expired true}` when Gmail
+     404s the cursor (caller should full-backfill). `cursor-get`/`cursor-set!` are
+     injected so the caller owns cursor persistence — no schema change needed."
+     [store blob-store {:keys [cursor-get cursor-set!]} http-opts]
+     (let [start (cursor-get)]
+       (try
+         (loop [page-token nil, ingested 0, latest start]
+           (let [resp (list-history start (cond-> http-opts
+                                            page-token (assoc :page-token page-token)))
+                 latest' (or (:historyId resp) latest)
+                 added-ids (->> (:history resp)
+                                (mapcat :messagesAdded)
+                                (keep (comp :id :message))
+                                distinct)
+                 n (reduce (fn [acc mid]
+                             (ingest-message! store blob-store (get-message mid http-opts))
+                             (inc acc))
+                           ingested
+                           added-ids)]
+             (if-let [nt (:nextPageToken resp)]
+               (recur nt n latest')
+               (do (when (and cursor-set! latest') (cursor-set! latest'))
+                   {:ingested n :history-id latest'}))))
+         (catch clojure.lang.ExceptionInfo e
+           (if (= 404 (:status (ex-data e)))
+             {:cursor-expired true}
+             (throw e)))))))
