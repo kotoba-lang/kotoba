@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS kotobase_blocks (
+  cid TEXT PRIMARY KEY,
+  bytes BYTEA NOT NULL,
+  byte_length BIGINT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS kotobase_refs (
+  name TEXT PRIMARY KEY,
+  cid TEXT NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 1,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

@@ -1,0 +1,125 @@
+(ns kotobase.storage.pack-catalog-test
+  "The catalog on a real datom plane rather than an atom.
+
+  `memory-catalog` is a map, and a map will agree with anything. The
+  argument in ADR-2608160100 for putting the catalog on the datom plane is
+  that it has to JOIN — with the pack that holds the block, and beyond this
+  repository with the commit and the tenant. A test that never runs a query
+  cannot tell whether that argument was implemented or just written down.
+
+  `kotoba-lang/datalog` is the engine here and it is a TEST-ONLY dependency:
+  the library ships the vocabulary, the quads and the queries, and composes
+  over whichever datom store the caller already has."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [datalog.core :as d]
+            [datalog.index :as index]
+            [ipld.car.bytes :as b]
+            [ipld.core :as ipld]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.object-memory :as omem]
+            [kotobase.storage.pack :as pack]
+            [kotobase.storage.pack-catalog :as cat]))
+
+(defn- datalog-catalog
+  "Wire `datom-catalog` to an in-memory four-index db."
+  []
+  (let [db (atom (index/empty-db))]
+    [db (cat/datom-catalog
+         {:transact! (fn [quads]
+                       (swap! db (fn [d]
+                                   (reduce #(index/assert-quad %1 %2 cat/cid-ref?)
+                                           d quads))))
+          :q (fn [query inputs] (d/q @db query (constantly true) inputs))})]))
+
+(defn- leaf [i] (ipld/node->block {"kind" "leaf" "v" i}))
+
+(defn- fixture []
+  (let [objects (omem/memory-object-store)
+        [db catalog] (datalog-catalog)]
+    {:objects objects :db db :catalog catalog
+     :store (pack/pack-block-store objects catalog)}))
+
+(deftest blocks-round-trip-through-a-queried-catalog
+  (testing "the same read path, with every location coming out of a Datalog
+            query instead of a map lookup"
+    (let [{:keys [store]} (fixture)
+          blocks (mapv leaf (range 5))]
+      (storage/-put-blocks! store blocks)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (let [got (storage/-get-blocks store (mapv :cid blocks))]
+        (is (= (set (map :cid blocks)) (set (keys got))))
+        (doseq [{:keys [cid bytes]} blocks]
+          (is (b/equal? bytes (get got cid))))
+        (is (= 5 (:blocks-served (pack/stats store))))
+        (is (= 1 (:requests (pack/stats store)))
+            "and it is still one request — the catalog changed, not the plan")))))
+
+(deftest a-cid-the-catalog-never-saw-is-omitted
+  (let [{:keys [store]} (fixture)]
+    (storage/-put-blocks! store (mapv leaf (range 3)))
+    (let [got (storage/-get-blocks store [(:cid (leaf 42))])]
+      (is (= {} got))
+      (is (= :nothing-served (:evidence (pack/stats store)))))))
+
+(deftest the-subject-is-the-content-address
+  (testing "there is no :block/cid attribute — the entity IS the CID, which
+            is the same choice bonsai makes for git objects"
+    (let [{:keys [store db]} (fixture)
+          blocks (mapv leaf (range 3))]
+      (storage/-put-blocks! store blocks)
+      (doseq [{:keys [cid]} blocks]
+        (is (seq (index/entity-attrs @db cid))
+            "the block CID is an entity in its own right")))))
+
+(deftest the-join-the-datom-plane-exists-for
+  (testing "a block's location alongside facts about the pack that holds it,
+            in ONE query. This is what a catalog in its own store cannot do,
+            and the reason ADR-2608160100 puts it here"
+    (let [{:keys [store db]} (fixture)
+          blocks (mapv leaf (range 7))]
+      (storage/-put-blocks! store blocks)
+      (let [target (:cid (first blocks))
+            rows (d/q @db cat/pack-summary-query (constantly true) [target])
+            [pack off pack-size block-count] (first rows)]
+        (is (= 1 (count rows)) "one row, and it took one query")
+        (is (string? pack))
+        (is (pos? off))
+        (is (pos? pack-size) "the pack's own size came from :pack/size-bytes")
+        (is (= 7 block-count)
+            "and its block count -- facts recorded by record-pack!, joined to
+             a block located by :block/pack")))))
+
+(deftest sealing-nothing-records-nothing
+  (let [{:keys [store db]} (fixture)]
+    (is (= [] (storage/-put-blocks! store [])) "no blocks, no pack")
+    (is (empty? (index/by-predicate @db :block/pack)))
+    (is (empty? (index/by-predicate @db :pack/size-bytes)))))
+
+(deftest the-reverse-direction-answers-what-is-in-a-pack
+  (testing "which compaction and a catalog rebuild both need, and which is
+            why :block/pack is indexed as a reference"
+    (let [{:keys [store db]} (fixture)
+          blocks (mapv leaf (range 6))]
+      (storage/-put-blocks! store blocks)
+      (let [[[pack]] (seq (d/q @db '{:find [?pack] :in [?cid]
+                                     :where [[?cid :block/pack ?pack]]}
+                               (constantly true) [(:cid (first blocks))]))
+            rows (d/q @db cat/pack-contents-query (constantly true) [pack])]
+        (is (= 6 (count rows)) "every block in the pack, from the pack alone")
+        (is (= (set (map :cid blocks)) (set (map first rows))))
+        (is (= (set (map :cid blocks))
+               (get (index/refs-to @db pack) :block/pack))
+            "and the reverse index answers it directly, which is what
+             indexing :block/pack as a reference buys")))))
+
+(deftest recording-a-pack-is-optional
+  (testing "a catalog that only tracks blocks is still a catalog — adding a
+            required port would have broken every one that already exists"
+    (let [objects (omem/memory-object-store)
+          catalog (pack/memory-catalog)
+          store (pack/pack-block-store objects catalog)]
+      (is (nil? (:record-pack! catalog)))
+      (storage/-put-blocks! store (mapv leaf (range 3)))
+      (is (= 3 (count ((:snapshot catalog))))))))

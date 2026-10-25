@@ -1,0 +1,122 @@
+(ns kotobase.storage.object-id-test
+  "The claim under test is that git-lfs, git-annex and kotobase name the same
+  bytes with the same digest, so no registry is needed — AND that the two
+  configurations where that stops being true fail closed instead of resolving
+  to some other object."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotobase.storage.object-id :as oid]
+            #?(:clj [multiformats.core :as mf])))
+
+;; sha2-256 of the 3 bytes [1 2 3]
+(def hex-a "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81")
+(def cid-a "bafkreiadsbmmn4waznesyuz3bjgrj33xzqhxrk6mz3ksq7meugrachh3qe")
+
+(deftest cid-round-trips
+  (is (= cid-a (oid/digest-hex->cid hex-a)))
+  (is (= hex-a (oid/cid->digest-hex cid-a)))
+  (testing "every digest, not just this one"
+    (doseq [hex [(apply str (repeat 64 "0"))
+                 (apply str (repeat 64 "f"))
+                 (apply str (repeat 32 "5a"))
+                 (str (apply str (repeat 63 "0")) "1")]]
+      (is (= hex (oid/cid->digest-hex (oid/digest-hex->cid hex)))))))
+
+#?(:clj
+   (deftest cid-agrees-with-multiformats
+     (testing "the zero-dependency base32/multihash arithmetic here matches
+               io-multiformats, which is byte-identical to
+               `ipfs add --cid-version=1 --raw-leaves`"
+       (doseq [payload ["" "hello\n" "the quick brown fox"]]
+         (let [bytes (kbytes/utf8-bytes ^String payload)
+               hex (mf/hexify (mf/sha256 bytes))]
+           (is (= (mf/cidv1-raw bytes) (oid/digest-hex->cid hex))
+               (str "CID assembly for " (pr-str payload)))
+           (is (= hex (oid/cid->digest-hex (mf/cidv1-raw bytes)))
+               (str "CID decode for " (pr-str payload))))))))
+
+(deftest cid-rejects-what-is-not-a-raw-sha256-cid
+  (testing "a wrong codec, a wrong length, a wrong multibase and a wrong
+            alphabet are all nil rather than a truncated digest"
+    (is (nil? (oid/cid->digest-hex "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"))
+        "dag-pb is a directory, not a large object")
+    (is (nil? (oid/cid->digest-hex "Qmc5gCcjYypU7y28oCALwfSvxCBskLuPKWpK4qpterKC7z"))
+        "CIDv0 base58")
+    (is (nil? (oid/cid->digest-hex "b!!!")))
+    (is (nil? (oid/cid->digest-hex "bafkrei")))
+    (is (nil? (oid/cid->digest-hex nil)))
+    (is (nil? (oid/digest-hex->cid "abc")) "not 32 bytes")
+    (is (nil? (oid/digest-hex->cid (str/upper hex-a)))
+        "uppercase hex is a second spelling of the same digest; accepting it
+         would let one object have two CIDs")))
+
+(defn- upper [s] (str/upper s))
+
+(deftest lfs-oid-forms
+  (is (= {:digest-hex hex-a} (oid/parse-lfs-oid hex-a)) "batch API form")
+  (is (= {:digest-hex hex-a} (oid/parse-lfs-oid (str "sha256:" hex-a)))
+      "pointer-file form")
+  (is (= cid-a (oid/wire-id->cid :lfs hex-a)))
+  (is (= hex-a (oid/cid->lfs-oid cid-a)))
+  (testing "any other oid type needs an explicit binding"
+    (is (nil? (oid/parse-lfs-oid (str "sha512:" hex-a))))
+    (is (nil? (oid/wire-id->cid :lfs (upper hex-a)))
+        "uppercase hex is not the wire form; accepting it would produce a
+         second oid for the same object")))
+
+(deftest annex-plain-key-derives
+  (let [k (str "SHA256E-s100000--" hex-a ".wav")
+        parsed (oid/parse-annex-key k)]
+    (is (= "SHA256E" (:backend parsed)))
+    (is (= 100000 (:size parsed)))
+    (is (= ".wav" (:extension parsed)))
+    (is (= hex-a (:digest-hex parsed)))
+    (is (true? (:derivable? parsed)))
+    (is (= cid-a (oid/wire-id->cid :annex k)))
+    (is (= k (oid/cid->annex-key cid-a 100000 ".wav"))
+        "and back, which is what an import path needs"))
+  (testing "SHA256 (no extension) derives too"
+    (is (= cid-a (oid/wire-id->cid :annex (str "SHA256-s3--" hex-a))))))
+
+(deftest annex-chunked-key-is-not-derivable
+  (testing "every chunk of a chunked file carries the WHOLE file's digest, so
+            deriving a CID from it would store one object's bytes under
+            another object's name"
+    (let [k (str "SHA256E-s100000-S32768-C1--" hex-a ".wav")
+          parsed (oid/parse-annex-key k)]
+      (is (true? (:chunked? parsed)))
+      (is (false? (:derivable? parsed)))
+      (is (nil? (oid/wire-id->cid :annex k)))
+      (is (thrown? #?(:clj Exception :cljs js/Error) (oid/require-cid :annex k)))
+      (is (= :chunked
+             (try (oid/require-cid :annex k)
+                  (catch #?(:clj Exception :cljs :default) e
+                    (:reason (ex-data e)))))
+          "and says which of the two non-derivable cases it is"))))
+
+(deftest annex-encrypted-key-is-not-derivable
+  (testing "GPGHMACSHA1 is an HMAC over the filename, not a hash of the bytes,
+            and the stored bytes are ciphertext"
+    (let [k "GPGHMACSHA1--c51589c9e6b4c58a1ba2ba1b0b6b6ac0f47e3f4e"]
+      (is (false? (:derivable? (oid/parse-annex-key k))))
+      (is (nil? (oid/wire-id->cid :annex k)))
+      (is (= :non-sha256-backend
+             (try (oid/require-cid :annex k)
+                  (catch #?(:clj Exception :cljs :default) e
+                    (:reason (ex-data e))))))))
+  (testing "MD5E and WORM likewise"
+    (is (nil? (oid/wire-id->cid :annex "MD5E-s3--900150983cd24fb0d6963f7d28e17f72.txt")))
+    (is (nil? (oid/wire-id->cid :annex "WORM-s3-m1234--file.txt")))))
+
+(deftest garbage-is-not-a-key
+  (is (nil? (oid/parse-annex-key "")))
+  (is (nil? (oid/parse-annex-key "--abc")) "no backend")
+  (is (nil? (oid/parse-annex-key "SHA256E-s3")) "no separator")
+  (is (nil? (oid/parse-annex-key nil)))
+  (is (nil? (oid/wire-id->cid :git "whatever")) "unknown protocol"))
+
+(deftest cid-to-annex-key-needs-a-size
+  (is (nil? (oid/cid->annex-key cid-a nil)))
+  (is (nil? (oid/cid->annex-key cid-a -1)))
+  (is (= (str "SHA256E-s0--" hex-a) (oid/cid->annex-key cid-a 0))
+      "an empty file is a real object"))

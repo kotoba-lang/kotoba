@@ -1,0 +1,337 @@
+(ns kotobase.storage.pack-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [ipld.car.bytes :as b]
+            [ipld.core :as ipld]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.object :as object]
+            [kotobase.storage.object-memory :as omem]
+            [kotobase.storage.pack :as pack]))
+
+(defn- fixture
+  ([] (fixture {}))
+  ([opts]
+   (let [objects (omem/memory-object-store)
+         catalog (pack/memory-catalog)]
+     {:objects objects
+      :catalog catalog
+      :store (pack/pack-block-store objects catalog opts)})))
+
+(defn- leaf [i] (ipld/node->block {"kind" "leaf" "v" i}))
+
+;; A cons chain: each node names the next, so the reader cannot know the
+;; second CID until it has decoded the first. This is the shape that made the
+;; measurement worth taking — 97 % of hydration's sequential term
+;; (root ADR-2608021000).
+(defn- cons-chain [n]
+  (loop [i (dec n) next-cid nil acc ()]
+    (if (neg? i)
+      (vec acc)
+      (let [blk (ipld/node->block
+                 (cond-> {"e" i}
+                   next-cid (assoc "rest" (ipld/link next-cid))))]
+        (recur (dec i) (:cid blk) (conj acc blk))))))
+
+(defn- walk-chain!
+  "Follow the chain the way a hydrate loop must: one `-get-blocks` per link,
+  because the next CID does not exist until this block is decoded."
+  [store head-cid]
+  (loop [cid head-cid seen []]
+    (if-not cid
+      seen
+      (let [bytes (get (storage/-get-blocks store [cid]) cid)
+            node (ipld/decode bytes)]
+        (recur (some-> (get node "rest") ipld/link-cid) (conj seen (get node "e")))))))
+
+;; ── the contract it claims to implement ─────────────────────────────────────
+
+(deftest it-is-a-block-store-with-the-packed-profile
+  (let [{:keys [store]} (fixture)]
+    (is (storage/block-backend? store))
+    (is (= store (storage/validate-block-store! store)))
+    (is (= :packed-blocks (storage/block-profile store)))
+    (is (true? (storage/packed? store)))
+    (is (= store (storage/validate-block-profile! store))
+        "it answers the question rather than leaving it open")))
+
+(deftest an-object-store-without-range-read-is-refused
+  (testing "the only implementation left would fetch a whole pack per block"
+    (let [no-range (reify
+                     object/IObjectStore
+                     (-stat-object [_ _] nil)
+                     (-delete-object! [_ _] {:deleted? false :reason :not-supported})
+                     object/IProxiedTransfer
+                     (-put-object! [_ _ _] {:size-bytes 0})
+                     (-get-object [_ _] nil)
+                     object/IObjectCapabilities
+                     (-object-capabilities [_] #{:large-objects :proxied-transfer}))]
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (pack/pack-block-store no-range (pack/memory-catalog)))))))
+
+(deftest blocks-round-trip-through-a-pack
+  (let [{:keys [store objects]} (fixture)
+        blocks (mapv leaf (range 5))]
+    (storage/-put-blocks! store blocks)
+    (is (= 1 (count (omem/snapshot objects)))
+        "one call sealed exactly one pack")
+    (let [got (storage/-get-blocks store (mapv :cid blocks))]
+      (is (= (set (map :cid blocks)) (set (keys got))))
+      (doseq [{:keys [cid bytes]} blocks]
+        (is (b/equal? bytes (get got cid)))))))
+
+(deftest a-cid-nobody-packed-is-omitted-not-invented
+  (let [{:keys [store]} (fixture)
+        blocks (mapv leaf (range 3))]
+    (storage/-put-blocks! store blocks)
+    (let [absent (:cid (leaf 99))
+          got (storage/-get-blocks store [(:cid (first blocks)) absent])]
+      (is (= 1 (count got)))
+      (is (nil? (get got absent))))))
+
+(deftest a-tampered-pack-fails-closed
+  (testing "the bytes came from an object store the engine does not trust"
+    (let [{:keys [store objects catalog]} (fixture)
+          blocks (mapv leaf (range 3))
+          _ (storage/-put-blocks! store blocks)
+          [pack-cid packed] (first (omem/snapshot objects))
+          target-cid (:cid (first blocks))
+          {:keys [file-offset frame-length]} (get ((:lookup catalog) [target-cid])
+                                                  target-cid)]
+      (is (some? file-offset) "the catalog located the frame")
+      (is (pos? frame-length))
+      ;; flip the last byte of that frame: still a well-formed frame, just
+      ;; different bytes, so only the CID check can catch it
+      (let [target (dec (+ file-offset frame-length))
+            v (b/as-bytes packed)
+            flipped (b/concat [(b/slice v 0 target)
+                               (b/->bytes [(bit-xor 0xff (b/bget v target))])
+                               (b/slice v (inc target) (b/bcount v))])]
+        (object/-put-object! objects pack-cid flipped)
+        (pack/drop-cache! store)
+        (is (thrown? #?(:clj Exception :cljs js/Error)
+                     (storage/-get-blocks store [target-cid])))))))
+
+;; ── the measurement the design rests on ─────────────────────────────────────
+
+(deftest one-request-serves-a-whole-cons-chain
+  (testing "the chain is still sequential; the network is not"
+    (let [chain (cons-chain 100)
+          {:keys [store]} (fixture)]
+      (storage/-put-blocks! store chain)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (let [seen (walk-chain! store (:cid (first chain)))
+            {:keys [requests cache-hits bytes-fetched]} (pack/stats store)]
+        (is (= (range 100) seen) "every link was actually followed")
+        (is (= 1 requests)
+            "100 links, 1 range request — the window held the rest")
+        (is (= 99 cache-hits))
+        (is (pos? bytes-fetched))))))
+
+(deftest without-a-window-the-chain-costs-one-request-per-link
+  (testing "the negative control: packing alone does not buy this, the
+            read-ahead does. Without it a pack store pays exactly what a
+            block-per-object store pays"
+    (let [chain (cons-chain 100)
+          {:keys [store]} (fixture {:window-bytes 0 :cache-bytes 0})]
+      (storage/-put-blocks! store chain)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (walk-chain! store (:cid (first chain)))
+      (is (= 100 (:requests (pack/stats store)))))))
+
+(deftest the-window-is-a-trade-and-both-halves-are-reported
+  (let [chain (cons-chain 100)
+        windowed (fixture)
+        narrow (fixture {:window-bytes 0 :cache-bytes 0})]
+    (doseq [{:keys [store]} [windowed narrow]]
+      (storage/-put-blocks! store chain)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (walk-chain! store (:cid (first chain))))
+    (let [w (pack/stats (:store windowed))
+          n (pack/stats (:store narrow))]
+      (is (< (:requests w) (:requests n)) "fewer round trips")
+      (is (>= (:bytes-fetched w) (:bytes-fetched n))
+          "and not fewer bytes — a window pays for requests with transfer")
+      (println "  cons-chain(100):"
+               "windowed" (pr-str w) " narrow" (pr-str n)))))
+
+(deftest a-batch-read-coalesces-into-one-request
+  (let [{:keys [store]} (fixture {:window-bytes 0 :cache-bytes 0})
+        blocks (mapv leaf (range 20))]
+    (storage/-put-blocks! store blocks)
+    (pack/drop-cache! store)
+    (pack/reset-stats! store)
+    (let [got (storage/-get-blocks store (mapv :cid blocks))]
+      (is (= 20 (count got)))
+      (is (= 1 (:requests (pack/stats store)))
+          "adjacent frames coalesce even with read-ahead switched off"))))
+
+(deftest separate-packs-cost-separate-requests
+  (testing "the honest limit: packing helps only where the policy put the
+            blocks together"
+    (let [{:keys [store]} (fixture {:window-bytes 0 :cache-bytes 0})
+          a (mapv leaf (range 0 5))
+          b (mapv leaf (range 100 105))]
+      (storage/-put-blocks! store a)
+      (storage/-put-blocks! store b)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (storage/-get-blocks store (mapv :cid (concat a b)))
+      (is (= 2 (:requests (pack/stats store)))
+          "two packs, two requests, however the caller batched"))))
+
+(deftest a-gap-wider-than-the-ceiling-is-not-coalesced
+  (let [{:keys [store]} (fixture {:window-bytes 0 :cache-bytes 0 :max-gap-bytes 8})
+        blocks (mapv leaf (range 12))]
+    (storage/-put-blocks! store blocks)
+    (pack/drop-cache! store)
+    (pack/reset-stats! store)
+    (storage/-get-blocks store [(:cid (first blocks)) (:cid (last blocks))])
+    (is (= 2 (:requests (pack/stats store)))
+        "the frames between them are not worth dragging along")))
+
+(deftest zero-requests-is-not-evidence-of-anything
+  (testing "the counter that had to exist: {:requests 0} is what a perfectly
+            efficient read and a read that never happened both look like, and
+            the second is what a catalog lookup returning nothing produces"
+    (let [{:keys [store]} (fixture)
+          blocks (mapv leaf (range 3))]
+      (storage/-put-blocks! store blocks)
+      (pack/reset-stats! store)
+      ;; nobody asked for anything this store knows about
+      (is (= {} (storage/-get-blocks store [(:cid (leaf 999))])))
+      (let [s (pack/stats store)]
+        (is (zero? (:requests s)))
+        (is (zero? (:blocks-served s)))
+        (is (= :nothing-served (:evidence s))
+            "and it says so rather than reading as a flawless result")
+        (is (nil? (:requests-per-block s))
+            "no denominator, so no ratio -- not a ratio of zero")))
+    (let [{:keys [store]} (fixture)
+          blocks (mapv leaf (range 3))]
+      (storage/-put-blocks! store blocks)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (storage/-get-blocks store (mapv :cid blocks))
+      (let [s (pack/stats store)]
+        (is (= 3 (:blocks-served s)))
+        (is (= :served (:evidence s)))
+        (is (= 1/3 (:requests-per-block s))
+            "one request for three blocks is the figure of merit, and it is
+             only meaningful because the denominator is real")))))
+
+;; ── the pack chain, and the catalog with the catalog taken away ─────────────
+
+(deftest three-commits-are-reachable-from-the-tip-alone
+  (testing "every block of every pack, recovered by walking the chain"
+    (let [{:keys [objects store]} (fixture)
+          commits (mapv (fn [c] (mapv #(leaf (+ (* c 10) %)) (range 4))) (range 3))]
+      (doseq [blocks commits] (storage/-put-blocks! store blocks))
+      (let [tip (pack/tip-pack store)
+            recovered (pack/bootstrap-catalog! objects tip)
+            wanted (set (map :cid (apply concat commits)))]
+        (is (some? tip) "the store remembered the pack it sealed last")
+        (testing "three commits sealed three packs, all of them reached"
+          (is (= 3 (count (distinct (map :pack-cid recovered))))))
+        (is (= wanted (set (map :cid recovered)))
+            "and every block is located, with no catalog consulted")))))
+
+(deftest a-bootstrapped-catalog-can-actually-serve-the-blocks
+  ;; Locations that cannot be read are not a recovered catalog.
+  (let [{:keys [objects store]} (fixture)
+        blocks (mapv leaf (range 6))]
+    (storage/-put-blocks! store blocks)
+    (let [recovered (pack/bootstrap-catalog! objects (pack/tip-pack store))
+          fresh (pack/memory-catalog)
+          _ ((:record! fresh) recovered)
+          reader (pack/pack-block-store objects fresh)
+          got (storage/-get-blocks reader (mapv :cid blocks))]
+      (doseq [{:keys [cid bytes]} blocks]
+        (is (b/equal? bytes (get got cid))))
+      (is (= 6 (:blocks-served (pack/stats reader)))))))
+
+(deftest a-multi-pack-bootstrap-serves-every-block-it-located
+  ;; The two halves of the claim, in one test. `three-commits-...` shows the
+  ;; chain reaches every pack but compares CIDs, not bytes;
+  ;; `a-bootstrapped-catalog-can-actually-serve-...` reads real bytes but
+  ;; writes ONE commit, so it cannot tell a chained store from an unchained
+  ;; one. Measured: with chaining removed, the first fails and the second
+  ;; passes. Neither on its own says "the locations recovered by walking the
+  ;; chain are locations blocks can be read from".
+  (let [{:keys [objects store]} (fixture)
+        commits (mapv (fn [c] (mapv #(leaf (+ (* c 100) %)) (range 5))) (range 4))
+        all (apply concat commits)]
+    (doseq [blocks commits] (storage/-put-blocks! store blocks))
+    (let [recovered (pack/bootstrap-catalog! objects (pack/tip-pack store))
+          fresh (pack/memory-catalog)
+          _ ((:record! fresh) recovered)
+          reader (pack/pack-block-store objects fresh)
+          got (storage/-get-blocks reader (mapv :cid all))]
+      (is (= 4 (count (distinct (map :pack-cid recovered)))))
+      (doseq [{:keys [cid bytes]} all]
+        (is (b/equal? bytes (get got cid))
+            (str "block " cid " was located by the walk but could not be read")))
+      (is (= 20 (:blocks-served (pack/stats reader)))
+          "all twenty, across four packs, out of a catalog nobody kept"))))
+
+(deftest the-walk-is-bounded
+  ;; A pack cannot link to ITSELF -- its CID is the hash of its own bytes, so
+  ;; a self-root is not constructible. A cycle would take two packs written by
+  ;; something other than this store, which is exactly the case `seen` is for.
+  ;; What is testable here is the budget, and it is the half that bounds a
+  ;; chain that is merely very long.
+  (let [{:keys [objects store]} (fixture)]
+    (doseq [c (range 3)] (storage/-put-blocks! store (mapv #(leaf (+ (* c 10) %)) (range 2))))
+    (let [tip (pack/tip-pack store)]
+      (is (= [] (pack/bootstrap-catalog! objects tip 0))
+          "a zero budget reads nothing rather than everything")
+      (is (= 2 (count (pack/bootstrap-catalog! objects tip 1)))
+          "a budget of one reads the tip pack and stops")
+      (is (= 6 (count (pack/bootstrap-catalog! objects tip 3)))
+          "and the full budget reaches all three"))))
+
+
+(deftest a-chain-built-one-commit-at-a-time-is-not-co-located
+  (testing "the honest counterpart to one-request-serves-a-whole-cons-chain.
+
+            Production novelty is a cons chain where each transaction appends
+            ONE cell pointing at the previous. Under write-locality -- one
+            commit, one pack -- each cell lands in its own pack, so walking
+            the chain crosses N packs and the window cannot help: it extends
+            forward inside one object, and the predecessor is a different
+            object entirely.
+
+            The optimistic measurement above puts the whole chain in one
+            -put-blocks! call. That is co-location, and co-location is what
+            packing buys. It is not what a chain built one commit at a time
+            looks like."
+    (let [chain (cons-chain 100)
+          {:keys [store objects]} (fixture)]
+      ;; one commit per link, which is what a transaction actually does
+      (doseq [blk chain] (storage/-put-blocks! store [blk]))
+      (is (= 100 (count (omem/snapshot objects))) "100 commits, 100 packs")
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (let [seen (walk-chain! store (:cid (first chain)))
+            {:keys [requests cache-hits blocks-served]} (pack/stats store)]
+        (is (= (range 100) seen))
+        (is (= 100 requests)
+            "one request per link -- the same as block-per-object. Packing
+             per commit does NOT flatten a cross-commit pointer chase")
+        (is (zero? cache-hits) "and no window can span two objects")
+        (is (= 100 blocks-served))))))
+
+(deftest what-packing-actually-buys-is-commit-local-reads
+  (testing "a single commit writing several blocks -- a transaction block, the
+            prolly-tree pages it updated, its novelty cell -- is one pack and
+            therefore one request. That is the claim that survives"
+    (let [{:keys [store]} (fixture {:window-bytes 0 :cache-bytes 0})
+          one-commit (mapv leaf (range 12))]
+      (storage/-put-blocks! store one-commit)
+      (pack/drop-cache! store)
+      (pack/reset-stats! store)
+      (storage/-get-blocks store (mapv :cid one-commit))
+      (is (= 1 (:requests (pack/stats store)))
+          "12 blocks from one commit, one request, without any read-ahead"))))

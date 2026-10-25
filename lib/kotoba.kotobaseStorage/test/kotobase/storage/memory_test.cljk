@@ -1,0 +1,92 @@
+(ns kotobase.storage.memory-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.storage.contract :as contract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.memory :as memory]))
+
+(deftest reference-backend-satisfies-contract
+  (let [result (contract/verify (memory/memory-store)
+                                (fn [ok? label] (is ok? label)))]
+    (testing "and the race actually ran, rather than being skipped silently"
+      (is (= {:profile :linearizable-ref :concurrency :verified} result)))))
+
+;; ── the suite must be able to fail ───────────────────────────────────────────
+;;
+;; A conformance check that has never rejected anything is a check whose
+;; sensitivity is unmeasured. The store below is the production hazard in
+;; miniature -- an S3-compatible endpoint that accepts a PUT and ignores
+;; the `If-Match` header -- and the point of these tests is that the suite
+;; catches it, and catches it on the strength claim rather than on the API
+;; shape, which it satisfies perfectly.
+
+(defrecord IgnoresExpected [state profile]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks]
+    (swap! state update :blocks into (map (juxt :cid :bytes)) blocks)
+    (mapv :cid blocks))
+  (-get-blocks [_ cids] (select-keys (:blocks @state) cids))
+
+  storage/IRefStore
+  (-read-ref [_ name] (get-in @state [:refs name]))
+  (-compare-and-set-ref! [_ name _expected next]
+    ;; Unconditional. Every writer is told it won.
+    (swap! state assoc-in [:refs name] {:cid next :version next})
+    {:published? true :current next :version next})
+
+  storage/IBackendCapabilities
+  (-capabilities [_]
+    (conj storage/required-capabilities profile)))
+
+(defn- ignoring-store [profile]
+  (->IgnoresExpected (atom {:blocks {} :refs {}}) profile))
+
+(deftest a-backend-that-ignores-the-precondition-is-rejected
+  (let [failures (atom [])
+        record (fn [ok? label] (when-not ok? (swap! failures conj label)))]
+    (contract/verify (ignoring-store :linearizable-ref) record)
+    (testing "the sequential half already catches the simplest case"
+      (is (some #(re-find #"stale CAS loses" %) @failures)))
+    (testing "and the race catches what a single writer cannot see"
+      (is (some #(re-find #"exactly one of 4" %) @failures)
+          "4 concurrent writers all published and the suite let it pass"))))
+
+(deftest the-same-store-is-not-asked-to-pass-what-it-does-not-claim
+  ;; Declaring :single-writer-ref is not a loophole -- the sequential
+  ;; checks still apply and this store still fails them. What changes is
+  ;; that it is no longer asked about concurrent writers, because it never
+  ;; claimed to survive them.
+  (let [failures (atom [])
+        record (fn [ok? label] (when-not ok? (swap! failures conj label)))
+        result (contract/verify (ignoring-store :single-writer-ref) record)]
+    (is (= {:profile :single-writer-ref :concurrency :not-claimed} result))
+    (is (not-any? #(re-find #"concurrent" %) @failures))))
+
+;; ── the profile declaration is mandatory ─────────────────────────────────────
+
+(defrecord NoProfile [caps]
+  storage/IBlockStore
+  (-put-blocks! [_ blocks] (mapv :cid blocks))
+  (-get-blocks [_ _] {})
+  storage/IRefStore
+  (-read-ref [_ _] nil)
+  (-compare-and-set-ref! [_ _ _ next] {:published? true :current next})
+  storage/IBackendCapabilities
+  (-capabilities [_] caps))
+
+(deftest a-backend-must-declare-exactly-one-ref-profile
+  (testing "none -- the old default, in which :conditional-ref implied nothing"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (storage/validate-backend!
+                  (->NoProfile storage/required-capabilities)))))
+  (testing "both -- claiming linearizable and single-writer at once says
+            neither, and is likelier a merge artefact than a design"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (storage/validate-backend!
+                  (->NoProfile (into storage/required-capabilities
+                                     storage/ref-profiles))))))
+  (testing "exactly one is accepted, and readable back"
+    (let [backend (->NoProfile (conj storage/required-capabilities
+                                     :single-writer-ref))]
+      (is (= :single-writer-ref (storage/ref-profile backend)))
+      (is (false? (storage/linearizable? backend)))
+      (is (identical? backend (storage/validate-backend! backend))))))

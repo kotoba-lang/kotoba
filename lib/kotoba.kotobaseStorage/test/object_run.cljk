@@ -1,0 +1,169 @@
+(ns object-run
+  "The async large-object contract, verified against its own oracles.
+
+  Same discipline as `test/run.cljk`: running the suite against a correct
+  store proves nothing about the suite. So this file also runs it against
+  stores it MUST reject, and requires the rejection to come from the right
+  check -- otherwise a suite that accepted everything would look identical
+  to a suite that works.
+
+  The oracles here are all one hazard, approached from three sides: a grant
+  that constrains nothing. That is the hazard the presigned profile exists
+  to manage, and the sync `object-contract` cannot reach any of them,
+  because it cannot run against a store that actually signs."
+  (:require [kotobase.storage.object :as object]
+            [kotobase.storage.object-async-contract :as contract]
+            [kotobase.storage.object-memory :as memory]))
+
+(def ^:private failures (atom 0))
+
+(defn- expect [ok? message]
+  (if ok?
+    (println (str "ok  - " message))
+    (do (js/console.error (str "FAIL: " message)) (swap! failures inc))))
+
+(defn- expect-rejection
+  "Run the suite and require it to reject, mentioning `fragment`."
+  [store label fragment]
+  (-> (contract/verify store)
+      (.then (fn [result]
+               (js/console.error
+                (str "FAIL: " label " -- the suite ACCEPTED a store it must "
+                     "reject: " (pr-str result)))
+               (swap! failures inc))
+            (fn [error]
+              (let [message (or (.-message error) (str error))]
+                (if (re-find (re-pattern fragment) message)
+                  (println (str "ok  - " label))
+                  (do (js/console.error
+                       (str "FAIL: " label " -- rejected for the WRONG reason: "
+                            message))
+                      (swap! failures inc))))))))
+
+;; ── oracles ─────────────────────────────────────────────────────────────────
+
+(def ^:private expiry "2026-01-01T00:00:00Z")
+
+(defrecord UnboundGrantStore [refuse-sizeless?]
+  object/IObjectStore
+  (-stat-object [_ cid] (object/assert-object-cid! cid) nil)
+  (-delete-object! [_ cid] (object/assert-object-cid! cid)
+    {:deleted? false :reason :not-supported})
+
+  object/IPresignedTransfer
+  ;; Signs `host` only. The header is LISTED but not signed -- which is
+  ;; precisely the mistake the contract exists to catch, because the request
+  ;; looks correct on the wire and the signature accepts any body length.
+  (-presign-put [_ cid {:keys [size-bytes]}]
+    (object/assert-object-cid! cid)
+    (if (and refuse-sizeless? (nil? size-bytes))
+      (js/Promise.reject (ex-info "size required" {}))
+      (js/Promise.resolve
+       (object/grant {:href (str "https://example.invalid/put/" cid)
+                      :method :put
+                      :headers {"content-length" (str size-bytes)}
+                      :signed-headers ["host"]
+                      :expires-at expiry}))))
+  (-presign-get [_ cid _]
+    (object/assert-object-cid! cid)
+    (js/Promise.resolve
+     (object/grant {:href (str "https://example.invalid/get/" cid)
+                    :method :get :signed-headers ["host"]
+                    :expires-at expiry})))
+
+  object/IObjectCapabilities
+  (-object-capabilities [_] #{:large-objects :presigned-transfer}))
+
+(defrecord BlankChequeOnOmissionStore []
+  object/IObjectStore
+  (-stat-object [_ cid] (object/assert-object-cid! cid) nil)
+  (-delete-object! [_ cid] (object/assert-object-cid! cid)
+    {:deleted? false :reason :not-supported})
+
+  object/IPresignedTransfer
+  ;; Binds the size when it is GIVEN one -- so it passes `bound-put-grant?`
+  ;; -- and issues an unbound grant to every caller that omits it. This is
+  ;; the oracle that justifies the second presigned check existing at all.
+  (-presign-put [_ cid {:keys [size-bytes]}]
+    (object/assert-object-cid! cid)
+    (js/Promise.resolve
+     (object/grant {:href (str "https://example.invalid/put/" cid)
+                    :method :put
+                    :headers (if size-bytes {"content-length" (str size-bytes)} {})
+                    :signed-headers (if size-bytes ["host" "content-length"] ["host"])
+                    :expires-at expiry})))
+  (-presign-get [_ cid _]
+    (object/assert-object-cid! cid)
+    (js/Promise.resolve
+     (object/grant {:href (str "https://example.invalid/get/" cid)
+                    :method :get :signed-headers ["host"] :expires-at expiry})))
+
+  object/IObjectCapabilities
+  (-object-capabilities [_] #{:large-objects :presigned-transfer}))
+
+(defrecord PassThroughIdStore []
+  object/IObjectStore
+  ;; No `assert-object-cid!`. An LFS oid or annex key becomes a storage key
+  ;; nobody can resolve back to content.
+  (-stat-object [_ _] nil)
+  (-delete-object! [_ _] {:deleted? false :reason :not-supported})
+  object/IProxiedTransfer
+  (-put-object! [_ _ bytes] {:size-bytes (count (vec bytes))})
+  (-get-object [_ _] nil)
+  object/IObjectCapabilities
+  (-object-capabilities [_] #{:large-objects :proxied-transfer}))
+
+(defrecord ProfileLiarStore []
+  object/IObjectStore
+  (-stat-object [_ cid] (object/assert-object-cid! cid) nil)
+  (-delete-object! [_ cid] (object/assert-object-cid! cid) {:deleted? false})
+  ;; Declares presigned, implements proxied.
+  object/IProxiedTransfer
+  (-put-object! [_ _ _] nil)
+  (-get-object [_ _] nil)
+  object/IObjectCapabilities
+  (-object-capabilities [_] #{:large-objects :presigned-transfer}))
+
+;; ── run ─────────────────────────────────────────────────────────────────────
+
+(defn -main [& _]
+  (-> (contract/verify (memory/memory-object-store))
+      (.then (fn [result]
+               (expect (= :proxied-transfer (:profile result))
+                       (str "memory object store conforms: " (pr-str result)))))
+      (.then (fn [_]
+               (contract/verify (memory/memory-object-store {:delete? false}))))
+      (.then (fn [result]
+               (expect (false? (:deletes result))
+                       (str "a store without :object-delete conforms by saying so: "
+                            (pr-str result)))))
+
+      ;; The four the sync suite cannot express.
+      (.then (fn [_]
+               (expect-rejection (->UnboundGrantStore true)
+                                 "a grant that signs only host is rejected"
+                                 "SIGNATURE")))
+      (.then (fn [_]
+               (expect-rejection (->BlankChequeOnOmissionStore)
+                                 "a grant issued unbound when size is omitted is rejected"
+                                 "REFUSED")))
+      (.then (fn [_]
+               (expect-rejection (->PassThroughIdStore)
+                                 "a store that passes a non-CID id through is rejected"
+                                 "CIDv1")))
+      (.then (fn [_]
+               (expect-rejection (->ProfileLiarStore)
+                                 "a store declaring a profile it does not implement is rejected"
+                                 "transfer profile")))
+      (.then (fn [_]
+               (if (zero? @failures)
+                 (println "object contract oracles: all green")
+                 (do (println (str "object contract oracles: " @failures
+                                   " FAILURE(S) above"))
+                     (set! (.-exitCode js/process) 1)
+                     (js/process.exit 1)))))
+      (.catch (fn [error]
+                (js/console.error (str "object contract runner threw: " error))
+                (js/process.exit 1)))))
+
+(-main)

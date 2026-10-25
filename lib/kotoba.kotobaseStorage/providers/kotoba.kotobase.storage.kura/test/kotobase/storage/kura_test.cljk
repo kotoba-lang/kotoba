@@ -1,0 +1,155 @@
+(ns kotobase.storage.kura-test
+  (:require #?(:org.babashka/nbb [kotoba.test :refer [deftest is testing]]
+               :clj [kotoba.test :refer [deftest is testing]]
+               :cljs [kotoba.test.cljs :refer-macros [deftest is testing]])
+            [erasure.lrc :as lrc]
+            [kotobase.storage.contract :as kcontract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.kura :as sut]
+            [kotobase.storage.memory :as kmemory]
+            [kura.node.gf :as gf]
+            [kura.node.memory :as node-memory]
+            [kura.node.store :as node-store]
+            [kura.placement :as placement]))
+
+;; --- a fleet ---------------------------------------------------------------
+
+(defn- fleet
+  "`n` node-backends, one per rack so the placement caps can be satisfied."
+  [n]
+  (into {} (map (fn [i] [(str "n-" i) (node-memory/open (str "n-" i))])) (range n)))
+
+(defn- placement-cfg [ids]
+  {:group-count 256
+   :nodes (mapv #(placement/node {:id % :domains {:rack %}
+                                  :availability :always-on}) ids)
+   :pol (placement/policy {:caps {:rack 1}})})
+
+(defn- backend
+  ([] (backend {}))
+  ([pol-opts]
+   (let [f (fleet 32)]
+     {:fleet f
+      :backend (sut/open {:fleet f
+                          :placement-cfg (placement-cfg (keys f))
+                          :ref-store (kmemory/memory-store)
+                          :policy pol-opts})})))
+
+(defn- bytes-of [n seed]
+  (gf/->bytes (mapv #(mod (+ (* seed 41) (* % 13)) 256) (range n))))
+
+;; --- the contract ----------------------------------------------------------
+
+(deftest passes-the-kotobase-storage-contract
+  (let [{:keys [backend]} (backend)]
+    (kcontract/verify backend (fn [ok? label] (is ok? label)))))
+
+(deftest declares-the-delegate-s-ref-profile-not-its-own
+  (testing "kura has no CAS; reporting the delegate's profile is the only
+            honest answer, and validate-backend! requires exactly one"
+    (let [{:keys [backend]} (backend)
+          ref-only (kmemory/memory-store)]
+      (is (= (storage/ref-profile ref-only) (storage/ref-profile backend)))
+      (is (some? (storage/ref-profile backend)))
+      (is (= backend (storage/validate-backend! backend))))))
+
+(deftest a-ref-store-delegate-is-required
+  (testing "a backend that faked a CAS would return success on an ignored
+            precondition — the failure mode kotobase.storage warns about"
+    (let [f (fleet 32)]
+      (is (thrown? #?(:clj Throwable :cljs js/Error)
+                   (sut/open {:fleet f :placement-cfg (placement-cfg (keys f))})))
+      (is (thrown? #?(:clj Throwable :cljs js/Error)
+                   (sut/open {:fleet {} :placement-cfg (placement-cfg [])
+                              :ref-store (kmemory/memory-store)}))))))
+
+;; --- the strategy split ----------------------------------------------------
+
+(deftest small-blocks-replicate-and-large-blocks-code
+  (let [pol (sut/policy {})]
+    (is (= :replication (sut/strategy-for pol 16384)) "16 KiB — a kotobase block")
+    (is (= :replication (sut/strategy-for pol 131072)) "128 KiB — the upper end")
+    (is (= :erasure (sut/strategy-for pol (* 1024 1024))) "1 MiB is the threshold")
+    (is (= :erasure (sut/strategy-for pol (* 64 1024 1024))) "kura's design point")))
+
+(deftest the-quoted-multiplier-depends-on-the-workload
+  (testing "1.625 is not the answer for kotobase-shaped blocks, and quoting it
+            would misstate what a consumer is buying by nearly a factor of two"
+    (let [pol (sut/policy {})
+          kotobase-shaped (repeat 100 (* 64 1024))
+          kura-shaped (repeat 100 (* 64 1024 1024))
+          mixed (concat (repeat 90 (* 64 1024)) (repeat 10 (* 64 1024 1024)))]
+      (is (= 3.0 (:multiplier (sut/effective-multiplier pol kotobase-shaped)))
+          "all-small is replication's 3x")
+      (is (= 1.625 (:multiplier (sut/effective-multiplier pol kura-shaped)))
+          "all-large is the code's 1.625x")
+      (let [m (sut/effective-multiplier pol mixed)]
+        (is (< 1.625 (:multiplier m) 3.0) "a real mixture is neither")
+        (is (= 90 (:replicated m)))
+        (is (= 10 (:erasure-coded m)))))))
+
+(deftest threshold-is-policy-not-a-constant
+  (let [tiny (sut/policy {:erasure-threshold-bytes 1})]
+    (is (= :erasure (sut/strategy-for tiny 16)))
+    (is (= 1.625 (:multiplier (sut/effective-multiplier tiny [16 32 64]))))))
+
+;; --- round trips -----------------------------------------------------------
+
+(deftest replicated-blocks-round-trip
+  (let [{:keys [backend]} (backend)
+        body (bytes-of 4096 1)]
+    (storage/put-block! backend "cidsmall1" body)
+    (is (= (gf/->vec body) (gf/->vec (storage/get-block backend "cidsmall1"))))))
+
+(deftest erasure-coded-blocks-round-trip
+  (let [{:keys [backend]} (backend {:erasure-threshold-bytes 1024})
+        body (bytes-of 40000 7)]
+    (storage/put-block! backend "cidbig1" body)
+    (is (= (gf/->vec body) (gf/->vec (storage/get-block backend "cidbig1")))
+        "padding to a shard boundary must not change the block")))
+
+(deftest odd-lengths-survive-padding
+  (testing "the logical length is what the index exists to remember"
+    (let [{:keys [backend]} (backend {:erasure-threshold-bytes 1})]
+      (doseq [n [1 15 16 17 255 1000 4097]]
+        (let [cid (str "cidodd" n)
+              body (bytes-of n n)]
+          (storage/put-block! backend cid body)
+          (is (= (gf/->vec body) (gf/->vec (storage/get-block backend cid)))
+              (str n " bytes")))))))
+
+(deftest batch-put-and-get
+  (let [{:keys [backend]} (backend {:erasure-threshold-bytes 2048})
+        blocks (mapv (fn [i] {:cid (str "cidb" i) :bytes (bytes-of (* 100 (inc i)) i)})
+                     (range 6))]
+    (storage/-put-blocks! backend blocks)
+    (let [got (storage/-get-blocks backend (mapv :cid blocks))]
+      (is (= 6 (count got)))
+      (doseq [{:keys [cid bytes]} blocks]
+        (is (= (gf/->vec bytes) (gf/->vec (get got cid))))))
+    (testing "misses are omitted, not nil-valued"
+      (is (= #{"cidb0"} (set (keys (storage/-get-blocks backend ["cidb0" "absent"]))))))))
+
+(deftest a-clean-read-touches-only-data-shards
+  (testing "systematic direct read — no reconstruction on the happy path"
+    (let [{:keys [fleet backend]} (backend {:erasure-threshold-bytes 1})
+          body (bytes-of 3200 3)
+          lay (lrc/layout {:k 16 :r 4 :g 6})]
+      (storage/put-block! backend "cidsys" body)
+      (let [held (into #{} (mapcat (fn [[_ s]] (node-store/-list-shards s "cidsys/"))) fleet)]
+        (is (= 26 (count held)) "all n shards were written"))
+      (is (= (gf/->vec body) (gf/->vec (storage/get-block backend "cidsys"))))
+      (is (= 26 (:n lay))))))
+
+;; --- durability ------------------------------------------------------------
+
+(deftest durability-report-tells-the-truth-about-the-fleet
+  (testing "the question a kotobase consumer asks is how durable their data is,
+            and the answer is how many real failure domains the fleet has —
+            not what the code's parameters say"
+    (let [{:keys [backend]} (backend)
+          r (sut/durability-report backend)]
+      (is (= 32 (:backends r)))
+      (is (= 1 (:effective-domains r))
+          "32 in-memory nodes in one process are one domain, and it says so")
+      (is (false? (:survivable? r))))))

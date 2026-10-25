@@ -1,0 +1,146 @@
+#!/usr/bin/env kbb
+;; Upload a file LARGER THAN kotobase.net's PUT /ipfs/:cid single-object
+;; ceiling (`kotobase.archive-put/max-object-bytes`, 4 MiB) by never asking
+;; the archive to accept one object that big.
+;;
+;; The archive endpoint itself is unchanged (and stays fail-closed: it still
+;; buffers a body ≤4 MiB and hashes it in one shot, still refuses anything
+;; larger). What changes is what gets PUT: the file is chunked into a
+;; UnixFS balanced DAG (`unixfs.file/build`, byte-identical to
+;; `ipfs add --cid-version=1 --raw-leaves`) whose blocks are all
+;; individually far under the ceiling (256 KiB leaves, small dag-pb
+;; parents), and EACH block goes through the existing, unmodified endpoint.
+;;
+;; A CARv2 pack of all blocks (`ipld.car.v2/pack`, kotoba-lang/io-ipld-car)
+;; is uploaded too WHEN it still fits under the same 4 MiB ceiling — one
+;; extra object that turns a whole-file GET into one round trip instead of
+;; one per block (root ADR-2608160100). When the pack itself would exceed
+;; 4 MiB, it is skipped and reported, never silently dropped: per-block
+;; retrieval alone is still complete.
+;;
+;; This script both writes AND verifies: every block is re-fetched from
+;; kotobase.net over the network (not read back from local memory) and the
+;; file is reassembled from those fetched bytes via `unixfs.file/read-file`,
+;; which itself re-hashes every block against the CID it was asked for.
+;; A byte-identical reassembly is the only thing this script calls success.
+;;
+;; Run:
+;;   KOTOBASE_ARCHIVE_TOKEN_FILE=/path/to/token-file \
+;;     kbb --backend sci --classpath "<see README>" bin/large_put.cljk <file>
+;;
+;; The token is read from a FILE path (never a CLI arg — argv is visible to
+;; every process on the machine via `ps`) named by
+;; KOTOBASE_ARCHIVE_TOKEN_FILE, falling back to KOTOBASE_ARCHIVE_TOKEN in
+;; the environment for callers who already handle that themselves.
+
+(ns large-put
+  (:require [kotoba.lang.text :as str]
+            [ipld.car.v2 :as carv2]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.ipfs :as ipfs]
+            [kotobase.storage.ipfs-kotobase :as ipfs-kotobase]
+            [multiformats.core :as mf]
+            [unixfs.file :as unixfs]
+            ["node:fs" :as fs]))
+
+(def max-object-bytes
+  "Mirrors `kotobase.archive-put/max-object-bytes` in
+  net-kotobase/control-plane/kotobase-api-gateway-cljs — not importable
+  across the repo boundary, so pinned here with its source named. If that
+  constant changes, this one is stale until updated by hand; a pack sized
+  right at the old ceiling would then fail a live PUT with a clear 413,
+  not silently succeed against a wrong assumption."
+  (* 4 1024 1024))
+
+(defn- read-token []
+  (if-let [f (aget js/process.env "KOTOBASE_ARCHIVE_TOKEN_FILE")]
+    (str/trim (.toString (fs/readFileSync f)))
+    (or (aget js/process.env "KOTOBASE_ARCHIVE_TOKEN")
+        (throw (ex-info "no token: set KOTOBASE_ARCHIVE_TOKEN_FILE or KOTOBASE_ARCHIVE_TOKEN" {})))))
+
+(defn- base-url []
+  (or (aget js/process.env "KOTOBASE_BASE_URL") "https://kotobase.net"))
+
+(defn- bytes= [a b]
+  (and (= (.-length a) (.-length b))
+       (loop [i 0]
+         (cond
+           (= i (.-length a)) true
+           (not= (aget a i) (aget b i)) false
+           :else (recur (inc i))))))
+
+(defn -main [& args]
+  (let [path (first args)]
+    (when-not path
+      (println "usage: large_put.cljs <file>")
+      (.exit js/process 2))
+    (let [token (read-token)
+          origin (base-url)
+          file-bytes (js/Uint8Array. (fs/readFileSync path))
+          _ (println (str "file " path " (" (.-length file-bytes) " bytes)"))
+          {:keys [cid blocks size]} (unixfs/build file-bytes)
+          leaves (count (filter #(= (:cid %) (mf/cidv1-raw (:bytes %))) blocks))
+          client (ipfs-kotobase/open {:base-url origin :token token})
+          adapter (ipfs/open {:client client})]
+      (println (str "unixfs root " cid " (" (count blocks) " block(s), "
+                    leaves " raw leaf, " (- (count blocks) leaves)
+                    " dag-pb, logical size " size ")"))
+
+      (-> (storage/-put-blocks! adapter blocks)
+          (.then
+           (fn [stored]
+             (println (str "put-blocks! stored " (count stored) "/" (count blocks)
+                           " block(s), all identity CIDs echoed back"))
+             (let [packed (carv2/pack {:roots [cid] :blocks blocks})
+                   pack-bytes (:bytes packed)
+                   pack-len (.-length pack-bytes)]
+               (println (str "carv2 pack: " pack-len " bytes ("
+                             (count (:entries packed)) " entries)"))
+               (if (> pack-len max-object-bytes)
+                 (js/Promise.resolve
+                  {:pack-uploaded? false
+                   :pack-reason (str "pack " pack-len
+                                     "B exceeds max-object-bytes " max-object-bytes
+                                     "B -- skipped, per-block retrieval is still complete")})
+                 (-> ((:put-block! client) (mf/cidv1-raw pack-bytes) pack-bytes)
+                     (.then (fn [pack-cid]
+                              {:pack-uploaded? true :pack-cid pack-cid :pack-bytes pack-len})))))))
+          (.then
+           (fn [pack-result]
+             (println (if (:pack-uploaded? pack-result)
+                        (str "carv2 pack uploaded: " (:pack-cid pack-result))
+                        (str "carv2 pack NOT uploaded: " (:pack-reason pack-result))))
+             (-> (storage/-get-blocks adapter (mapv :cid blocks))
+                 (.then (fn [fetched] [pack-result fetched])))))
+          (.then
+           (fn [[pack-result fetched]]
+             (println (str "get-blocks fetched " (count fetched) "/" (count blocks)
+                           " block(s) back over the network"))
+             (when (not= (count fetched) (count blocks))
+               (throw (ex-info "not every block round-tripped" {:expected (count blocks)
+                                                                 :fetched (count fetched)})))
+             (let [get-block (fn [c] (get fetched c))
+                   rebuilt (unixfs/read-file get-block cid)]
+               (if (bytes= rebuilt file-bytes)
+                 (println (str "VERIFIED: reassembled " (.-length rebuilt)
+                              " bytes match the original file exactly"))
+                 (throw (ex-info "reassembled bytes do not match the original file"
+                                 {:expected (.-length file-bytes) :actual (.-length rebuilt)}))))
+             (println (str "root cid: " cid))
+             pack-result))
+          (.then (fn [_] (.exit js/process 0)))
+          (.catch (fn [e]
+                    (println (str "FAIL " (or (.-message e) (str e))))
+                    (when-let [d (ex-data e)] (println (str "  " (pr-str d))))
+                    (.exit js/process 1)))))))
+
+;; process.argv under `kbb --backend sci --classpath <cp> bin/large_put.cljk <file>` is
+;; [node kbb --backend sci --classpath <cp> bin/large_put.cljk <file> ...] -- `--classpath`
+;; shifts the fixed slice(2) offset, so drop everything up to and including
+;; this script's own path instead of assuming a position (AGENTS.md's
+;; documented `kbb --backend sci --classpath` argv-shift trap).
+(let [argv (js->clj js/process.argv)
+      self-idx (or (some #(when (str/ends-with? (second %) "large_put.cljk") (first %))
+                         (map-indexed vector argv))
+                   1)]
+  (apply -main (vec (drop (inc self-idx) argv))))

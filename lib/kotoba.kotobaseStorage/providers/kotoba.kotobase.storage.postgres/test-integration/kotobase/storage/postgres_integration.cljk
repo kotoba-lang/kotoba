@@ -1,0 +1,93 @@
+(ns kotobase.storage.postgres-integration
+  "The shared contract against a real PostgreSQL server.
+
+  The unit suite in `test/` can only check that `open` rejects a missing
+  datasource. Everything this backend actually claims -- and it claims
+  `:linearizable-ref` -- lives in the SQL, so it can only be checked
+  against a server.
+
+  Both halves run here. The concurrent half races four JVM threads at the
+  same expected head, which is what distinguishes a guard evaluated inside
+  the statement from one evaluated in Clojure around it. Reading the code
+  says it is the former (`UPDATE ... WHERE name = ? AND cid = ? RETURNING`,
+  with `INSERT ... ON CONFLICT DO NOTHING RETURNING` for genesis), and the
+  Worker sibling states as much in a comment. This is that reading,
+  measured.
+
+  Run:
+    docker run -d --rm --name kotobase-pg-test -e POSTGRES_PASSWORD=... \\
+      -p 55432:5432 postgres:16-alpine
+    kbb -M:test:integration"
+  (:require [kotobase.storage.contract :as contract]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.postgres :as postgres])
+  (:import [org.postgresql.ds PGSimpleDataSource]))
+
+(defn- datasource []
+  (doto (PGSimpleDataSource.)
+    (.setURL (or (System/getenv "KOTOBASE_POSTGRES_URL")
+                 "jdbc:postgresql://127.0.0.1:55432/kotobase"))
+    (.setUser (or (System/getenv "KOTOBASE_POSTGRES_USER") "kotobase"))
+    (.setPassword (or (System/getenv "KOTOBASE_POSTGRES_PASSWORD") "kotobase"))))
+
+(defn- truncate! [ds]
+  (with-open [connection (.getConnection ds)
+              statement (.createStatement connection)]
+    (.execute statement "TRUNCATE kotobase_refs, kotobase_blocks")))
+
+(defrecord Toctou [inner]
+  ;; The same real server underneath, with the CAS split into a read, a
+  ;; comparison and a later write -- what this backend would be if the
+  ;; `WHERE ... AND cid = ?` guard were lifted out of the statement into
+  ;; Clojure. It satisfies every sequential check. If the race cannot
+  ;; catch it here, a green run above is not evidence of anything.
+  storage/IBlockStore
+  (-put-blocks! [_ blocks] (storage/-put-blocks! inner blocks))
+  (-get-blocks [_ cids] (storage/-get-blocks inner cids))
+
+  storage/IRefStore
+  (-read-ref [_ name] (storage/-read-ref inner name))
+  (-compare-and-set-ref! [_ name expected next]
+    (let [current (storage/-read-ref inner name)]
+      (if (not= expected (:cid current))
+        {:published? false :current (:cid current) :version (:version current)}
+        (do
+          ;; Decided. Widen the window the way a network round trip does,
+          ;; then write with no guard at all.
+          (Thread/sleep 5)
+          (storage/-compare-and-set-ref! inner name (:cid current) next)
+          {:published? true :current next}))))
+
+  storage/IBackendCapabilities
+  (-capabilities [_] (storage/-capabilities inner)))
+
+(defn -main [& _]
+  (let [ds (datasource)
+        backend (postgres/open {:datasource ds :initialize? true})
+        failures (atom [])]
+    (truncate! ds)
+    (let [result (contract/verify backend
+                                  (fn [ok? label]
+                                    (when-not ok? (swap! failures conj label))))]
+      (println (str "PostgreSQL contract: " (pr-str result)))
+      (when-not (= {:profile :linearizable-ref :concurrency :verified} result)
+        (swap! failures conj (str "expected a raced linearizable run, got " result))))
+
+    ;; The oracle. Its own truncate, because the contract's ref names are
+    ;; shared state and a second run over the same tables would trip on the
+    ;; first run's refs before ever reaching the race.
+    (truncate! ds)
+    (let [oracle-failures (atom [])]
+      (contract/verify (->Toctou backend)
+                       (fn [ok? label]
+                         (when-not ok? (swap! oracle-failures conj label))))
+      (if (some #(re-find #"exactly one of 4" %) @oracle-failures)
+        (println "ok  - a read-then-write CAS over the same server is rejected by the race")
+        (swap! failures conj
+               "a read-then-write CAS was ACCEPTED -- the race has no teeth here")))
+
+    (if (seq @failures)
+      (do (println (str "postgres integration: " (count @failures) " FAILURE(S)"))
+          (doseq [f @failures] (println (str "  - " f)))
+          (System/exit 1))
+      (println "kotobase-storage-postgres: all green"))))

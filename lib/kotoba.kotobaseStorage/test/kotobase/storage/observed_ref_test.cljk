@@ -1,0 +1,78 @@
+(ns kotobase.storage.observed-ref-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.storage.core :as storage]
+            [kotobase.storage.observed-ref :as observed]))
+
+(defrecord RefOracle [head]
+  storage/IRefStore
+  (-read-ref [_ _] @head)
+  (-compare-and-set-ref! [_ _ expected next]
+    (let [current @head]
+      (if (= expected (:cid current))
+        (let [candidate {:cid next :version (inc (or (:version current) -1))}]
+          (reset! head candidate)
+          {:published? true :current next :version (:version candidate)})
+        {:published? false :current (:cid current) :version (:version current)})))
+  storage/IBackendCapabilities
+  (-capabilities [_] #{:conditional-ref :single-writer-ref}))
+
+(defn- problem-of [thunk]
+  (try
+    (thunk)
+    nil
+    (catch #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) error
+      (:problem (ex-data error)))))
+
+(deftest durable-observation-rejects-replay-and-equivocation
+  (let [remote (atom {:cid "cid-7" :version 7})
+        observations (observed/memory-observation-store)
+        guarded (observed/open {:inner (->RefOracle remote)
+                                :observations observations})]
+    (is (= {:cid "cid-7" :version 7} (storage/-read-ref guarded "main")))
+    (testing "a correctly shaped but older remote head cannot roll back state"
+      (reset! remote {:cid "cid-3" :version 3})
+      (is (= :rollback
+             (problem-of #(storage/-read-ref guarded "main")))))
+    (testing "a second CID at the observed sequence is equivocation"
+      (reset! remote {:cid "cid-fork" :version 7})
+      (is (= :equivocation
+             (problem-of #(storage/-read-ref guarded "main")))))
+    (testing "a verified higher sequence advances the durable observation"
+      (reset! remote {:cid "cid-8" :version 8})
+      (is (= {:cid "cid-8" :version 8}
+             (storage/-read-ref guarded "main"))))
+    (testing "disappearance after observation is not confused with empty DB"
+      (reset! remote nil)
+      (is (= :rollback
+             (problem-of #(storage/-read-ref guarded "main")))))))
+
+(deftest publish-results-also-advance-observation
+  (let [remote (atom nil)
+        observations (observed/memory-observation-store)
+        guarded (observed/open {:inner (->RefOracle remote)
+                                :observations observations})]
+    (is (:published? (storage/-compare-and-set-ref! guarded "main" nil "cid-0")))
+    (reset! remote nil)
+    (is (= :rollback (problem-of #(storage/-read-ref guarded "main"))))))
+
+(deftest rollback-is-rejected-before-a-write-can-mutate-the-remote
+  (let [remote (atom {:cid "cid-7" :version 7})
+        guarded (observed/open
+                 {:inner (->RefOracle remote)
+                  :observations (observed/memory-observation-store)})]
+    (storage/-read-ref guarded "main")
+    ;; Same expected CID, replayed at an older sequence. A CID-only precondition
+    ;; would accept this and publish onto the rollback fork.
+    (reset! remote {:cid "cid-7" :version 2})
+    (is (= :rollback
+           (problem-of
+            #(storage/-compare-and-set-ref! guarded "main" "cid-7" "cid-8"))))
+    (is (= {:cid "cid-7" :version 2} @remote)
+        "the rejected write has no remote side effect")))
+
+(deftest ref-capabilities-are-delegated-not-invented
+  (let [guarded (observed/open
+                 {:inner (->RefOracle (atom nil))
+                  :observations (observed/memory-observation-store)})]
+    (is (= :single-writer-ref (storage/ref-profile guarded)))
+    (is (not (storage/linearizable? guarded)))))
