@@ -1,0 +1,99 @@
+(ns kotoba.selfhost.native-build
+  "Build the shipped decisions for this host's ISA.
+
+      kbb -M:native-build [directory]     ;; defaults to target/native
+
+  Same compile path as `oracle-gen`, different target: that one emits the KIR
+  the interpreter reads, this one emits machine code for the host and signs it.
+  Both start from `kotoba/*.kotoba`, and neither transforms what it produced —
+  if these two disagreed about how to compile, the parity gate would be
+  comparing two things that were never the same source.
+
+  The keypair is generated per build and trusted only by the `trust.edn`
+  written beside it. That is right for a build directory and wrong for a
+  release: a real deployment signs with a real key and ships a trust file that
+  predates the artifact."
+  (:require [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.artifact.runtime-identity :as runtime-identity]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.selfhost.oracle :as oracle]
+            [kotoba.verifier.signing :as signing])
+  (:gen-class))
+
+(defn host-target
+  "The native target for the ISA this process is on."
+  []
+  (if (contains? #{"aarch64" "arm64"} (str/lower (System/getProperty "os.arch")))
+    :aarch64-kotoba-v1
+    :x86_64-kotoba-v1))
+
+(defn- write-edn! [file value]
+  (io/make-parents file)
+  (spit file (pr-str value)))
+
+(defn loader-source-dir
+  "Where the reviewed `kexe_loader.c` is on this machine.
+
+  The compiler repository owns that file and does not put it on a classpath —
+  it is C, compiled by the native host rather than loaded by a JVM. So it is
+  found the only way a git dependency's non-classpath files can be found: take
+  a file the compiler DOES put on the classpath, and walk up from it to the
+  checkout root.
+
+  This is only for a build. A release stages the measured loader once and ships
+  its bytes and digest; nothing at runtime looks for C source."
+  []
+  (let [anchor (or (io/resource "kotoba/compiler/core.clj")
+                   (throw (ex-info "the compiler is not on this classpath" {})))
+        _ (when-not (= "file" (.getProtocol anchor))
+            (throw (ex-info "the compiler must be a source checkout, not a jar"
+                            {:anchor (str anchor)})))
+        start (io/file (.toURI anchor))]
+    (or (->> (iterate #(.getParentFile ^java.io.File %) start)
+             (take-while some?)
+             (take 8)
+             (map #(io/file % "tools"))
+             (filter #(.isFile (io/file % "kexe_loader.c")))
+             first
+             (#(some-> ^java.io.File % .getPath)))
+        (throw (ex-info "no tools/kexe_loader.c above the compiler on this classpath"
+                        {:from (.getPath start)})))))
+
+(defn build!
+  "Compile, sign and stage every oracle into `directory`. Returns its path."
+  [directory]
+  (let [dir (io/file directory)
+        _ (.mkdirs dir)
+        measure (requiring-resolve 'kototama.native.executor/measure-runtime)
+        {:keys [runtime loader-bytes]} (measure {:loader-source-dir (loader-source-dir)})
+        loader (io/file dir "kotoba-loader")
+        signing-key (signing/generate-keypair)
+        now (quot (System/currentTimeMillis) 1000)
+        target (host-target)]
+    (with-open [out (io/output-stream loader)]
+      (.write out ^bytes loader-bytes))
+    (when-not (.setExecutable loader true true)
+      (throw (ex-info "cannot make the measured loader executable"
+                      {:path (.getPath loader)})))
+    (write-edn! (io/file dir "runtime.edn")
+                {:format :kotoba.runtime-measurement/v1 :runtime runtime})
+    (write-edn! (io/file dir "trust.edn")
+                {:format :kotoba.trust/v1
+                 :trusted-signers #{(:signer signing-key)}
+                 :revoked-signers #{}
+                 :revoked-artifacts #{}
+                 :trusted-runtime-sha256 #{(runtime-identity/identity-sha256 runtime)}})
+    (doseq [[id source] (sort-by key oracle/oracles)]
+      (let [result (compiler/compile-source (slurp source) target {:allow #{}})
+            artifact (or (:artifact result)
+                         (throw (ex-info "compile-source returned no :artifact"
+                                         {:oracle id :source source :target target})))]
+        (write-edn! (io/file dir (str (name id) ".signed.kexe"))
+                    (signing/sign artifact signing-key {:not-before (- now 60)
+                                                :expires (+ now 86400)}))))
+    (.getPath dir)))
+
+(defn -main [& args]
+  (println (build! (or (first args) "target/native")))
+  (shutdown-agents))

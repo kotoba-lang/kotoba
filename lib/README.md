@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kotobaSelfhostContracts` | `kotoba.kotobaSelfhostContracts/src` | `kotoba.selfhost.analyzer`, `kotoba.selfhost.contracts`, `kotoba.selfhost.oracle` (Kotoba project library) |
 | `kotoba.kotobaComponent` | `kotoba.kotobaComponent/src` | `kotoba.component.admission`, `kotoba.component.artifact`, `kotoba.component.composition`, `kotoba.component.core` (Kotoba project library) |
 | `kotoba.kotobaWasm` | `kotoba.kotobaWasm/src` | `kotoba.wasm.canonical-abi`, `kotoba.wasm.core`, `kotoba.wasm.tools`, `kotoba.wasm.typed` (Kotoba project library) |
 | `kotoba.kotobaAnnex` | `kotoba.kotobaAnnex/src` | `kotoba.annex.archive`, `kotoba.annex.cid`, `kotoba.annex.directory`, `kotoba.annex.grant` (Kotoba project library) |
