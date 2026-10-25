@@ -1,0 +1,263 @@
+(ns ieee802154.mac
+  "The IEEE 802.15.4 MAC frame — Frame Control Field, sequence number, and
+  the addressing fields whose presence and width depend on bits parsed out
+  of the FCF earlier in the same frame. This is the frame format Zigbee
+  actually puts on the air (2003/2006-era, not the 2015 multipurpose/frame-
+  version-2 shapes IEEE 802.15.4e later added) — Thread's 6LoWPAN layer
+  (`kotoba-lang/org-threadgroup-thread`) sits on top of the same MAC frame
+  and depends on this namespace rather than re-deriving it.
+
+  ## Provenance
+
+  IEEE 802.15.4 text itself is an IEEE standard, not freely republishable.
+  The FCF bit layout below (frame type at bits 0-2, addressing-mode values
+  0=none/2=short/3=extended, frame-version values 0/1/2, PAN ID compression
+  at bit 6) is reproduced from the shape that is publicly, redundantly
+  documented in open-source dissectors and stacks — Wireshark's
+  `epan/dissectors/packet-ieee802154.c` (`ieee802154_fcf_*` fields),
+  Zephyr's `subsys/net/l2/ieee802154/ieee802154_frame.c`, and Contiki-NG's
+  `os/net/mac/framer/frame802154.c` — three independent open-source
+  implementations that agree with each other and with TI/NXP application
+  notes. None of that is the IEEE text quoted from memory; every concrete
+  frame in this library's tests is marked `;; constructed, not a published
+  spec vector`.
+
+  ## The addressing-fields trap
+
+  This is the file the task that produced this repo called out by name:
+  whether Destination PAN ID / Destination Address / Source PAN ID / Source
+  Address are present **at all**, and whether each address is 2 or 8
+  bytes, is not fixed by the frame type — it is computed from four FCF
+  bits (`dest-addr-mode`, `src-addr-mode`, `pan-id-compression?`, and
+  implicitly whether the *other* address is present) that a decoder must
+  have already parsed before it can find the byte offset of anything after
+  them. A decoder that assumes a fixed header shape (as a beacon/ack-only
+  implementation might) silently misreads every data frame with extended
+  addressing. `decode` here always parses the FCF first and uses it to walk
+  the rest of the frame — there is no fixed-offset path.
+
+  **PAN ID compression** (2006-era rule, the one Zigbee and Thread actually
+  rely on — 802.15.4e's later revision replaced this with a 9-row table
+  this library does not implement, noted in the README): when both a
+  source and a destination address are present and the PAN ID Compression
+  bit is set, the Source PAN ID is omitted from the wire and is understood
+  to equal the Destination PAN ID. If either address is absent, the bit
+  has no effect on the source PAN ID's presence in this implementation.")
+
+;; ── little-endian helpers — 802.15.4 is little-endian throughout, like
+;;    Zigbee/LoRaWAN/BLE and unlike Modbus ───────────────────────────────
+
+(defn- u16le [n]
+  [(bit-and n 0xFF) (bit-and (unsigned-bit-shift-right n 8) 0xFF)])
+
+(defn- rd-u16le [bs off]
+  (bit-or (bit-and (nth bs off) 0xFF)
+          (bit-shift-left (bit-and (nth bs (inc off)) 0xFF) 8)))
+
+(defn- u64le [n]
+  ;; quot/mod, not bit-shift: an extended (EUI-64) address with its top bit
+  ;; set is a value the JVM reader promotes to BigInt, and BigInt rejects
+  ;; bit-shift-left/unsigned-bit-shift-right outright (`Numbers.bitOpsCast`
+  ;; throws). quot/mod promote across long/BigInt with no special-casing —
+  ;; `org-lora-alliance-lorawan`'s `lorawan.bytes/le-n` hit this first.
+  (loop [x n i 0 acc []]
+    (if (= i 8) acc (recur (quot x 256) (inc i) (conj acc (int (mod x 256)))))))
+
+(defn- rd-u64le [bs off]
+  ;; ClojureScript has no arbitrary-precision integer: every number is a
+  ;; double, exact only to 2^53. `+`/`*` on :cljs stay silently within that
+  ;; boundary (the honest, bounded gap this library documents rather than
+  ;; hides); `+'`/`*'` on :clj promote to BigInt so a full EUI-64 with its
+  ;; top bit set round-trips exactly on the JVM.
+  (reduce (fn [acc b] #?(:clj (+' (*' acc 256) b) :cljs (+ (* acc 256) b)))
+          0
+          (reverse (subvec (vec bs) off (+ off 8)))))
+
+;; ── vocabulary ────────────────────────────────────────────────────────────
+
+(def frame-types
+  "keyword -> 3-bit Frame Type code. 4-7 are reserved (not in this map)."
+  {:beacon 0 :data 1 :ack 2 :mac-command 3})
+
+(def frame-type-by-code (into {} (map (fn [[k v]] [v k]) frame-types)))
+
+(def addr-modes
+  "keyword -> 2-bit Addressing Mode code. 1 is reserved (not in this map)."
+  {:none 0 :short 2 :extended 3})
+
+(def addr-mode-by-code (into {} (map (fn [[k v]] [v k]) addr-modes)))
+
+(def addr-widths {:none 0 :short 2 :extended 8})
+
+(def frame-versions
+  "keyword -> 2-bit Frame Version code. 3 is reserved (not in this map)."
+  {:v2003 0 :v2006 1 :v2015 2})
+
+(def frame-version-by-code (into {} (map (fn [[k v]] [v k]) frame-versions)))
+
+;; ── Frame Control Field (16 bits, transmitted little-endian) ──────────────
+
+(defn build-fcf
+  "`{:frame-type :security-enabled? :frame-pending? :ack-request?
+     :pan-id-compression? :dest-addr-mode :src-addr-mode :frame-version}`
+  -> `[:ok u16]` or `[:error reason ...]`.
+
+  Bit layout (bit 0 = LSB of the first octet on the wire):
+
+    0-2   Frame Type
+    3     Security Enabled
+    4     Frame Pending
+    5     Ack Request
+    6     PAN ID Compression
+    7-9   Reserved (always 0 here)
+    10-11 Destination Addressing Mode
+    12-13 Frame Version
+    14-15 Source Addressing Mode"
+  [{:keys [frame-type security-enabled? frame-pending? ack-request?
+           pan-id-compression? dest-addr-mode src-addr-mode frame-version]
+    :or {dest-addr-mode :none src-addr-mode :none frame-version :v2006}}]
+  (cond
+    (not (contains? frame-types frame-type))
+    [:error :ieee802154/reserved-frame-type frame-type]
+
+    (not (contains? addr-modes dest-addr-mode))
+    [:error :ieee802154/reserved-addressing-mode dest-addr-mode]
+
+    (not (contains? addr-modes src-addr-mode))
+    [:error :ieee802154/reserved-addressing-mode src-addr-mode]
+
+    (not (contains? frame-versions frame-version))
+    [:error :ieee802154/reserved-frame-version frame-version]
+
+    :else
+    [:ok (bit-or (bit-and (frame-types frame-type) 0x07)
+                 (bit-shift-left (if security-enabled? 1 0) 3)
+                 (bit-shift-left (if frame-pending? 1 0) 4)
+                 (bit-shift-left (if ack-request? 1 0) 5)
+                 (bit-shift-left (if pan-id-compression? 1 0) 6)
+                 (bit-shift-left (bit-and (addr-modes dest-addr-mode) 0x03) 10)
+                 (bit-shift-left (bit-and (frame-versions frame-version) 0x03) 12)
+                 (bit-shift-left (bit-and (addr-modes src-addr-mode) 0x03) 14))]))
+
+(defn parse-fcf
+  "u16 (already assembled from the two little-endian wire bytes) -> `[:ok
+  fcf-map]` or `[:error reason code]` if any subfield lands on a reserved
+  value. A permissive decoder that keeps going on a reserved subfield would
+  make silent misinterpretation of an unsupported frame indistinguishable
+  from a correctly parsed one."
+  [u16]
+  (let [ft-code (bit-and u16 0x07)
+        dam-code (bit-and (unsigned-bit-shift-right u16 10) 0x03)
+        sam-code (bit-and (unsigned-bit-shift-right u16 14) 0x03)
+        fv-code (bit-and (unsigned-bit-shift-right u16 12) 0x03)]
+    (cond
+      (not (contains? frame-type-by-code ft-code))
+      [:error :ieee802154/reserved-frame-type ft-code]
+
+      (not (contains? addr-mode-by-code dam-code))
+      [:error :ieee802154/reserved-addressing-mode dam-code]
+
+      (not (contains? addr-mode-by-code sam-code))
+      [:error :ieee802154/reserved-addressing-mode sam-code]
+
+      (not (contains? frame-version-by-code fv-code))
+      [:error :ieee802154/reserved-frame-version fv-code]
+
+      :else
+      [:ok {:frame-type (frame-type-by-code ft-code)
+            :security-enabled? (bit-test u16 3)
+            :frame-pending? (bit-test u16 4)
+            :ack-request? (bit-test u16 5)
+            :pan-id-compression? (bit-test u16 6)
+            :dest-addr-mode (addr-mode-by-code dam-code)
+            :frame-version (frame-version-by-code fv-code)
+            :src-addr-mode (addr-mode-by-code sam-code)}])))
+
+;; ── addressing-field presence (the field this file exists to document) ────
+
+(defn addressing-shape
+  "The FCF map -> `{:dest-pan-id? :dest-addr-width :src-pan-id? :src-addr-
+  width}`, the exact set of addressing bytes a MAC header carries for this
+  FCF, computed once and reused by both `encode` and `decode` so the two
+  can never disagree about frame layout."
+  [{:keys [dest-addr-mode src-addr-mode pan-id-compression?]}]
+  (let [dest-present? (not= dest-addr-mode :none)
+        src-present? (not= src-addr-mode :none)]
+    {:dest-pan-id? dest-present?
+     :dest-addr-width (addr-widths dest-addr-mode)
+     :src-pan-id? (and src-present? (not (and pan-id-compression? dest-present?)))
+     :src-addr-width (addr-widths src-addr-mode)}))
+
+;; ── full frame ──────────────────────────────────────────────────────────
+
+(defn encode
+  "`{:frame-type ... :seq-num u8 :dest-pan-id :dest-addr :src-pan-id
+  :src-addr :payload}` -> `[:ok bytes]` or `[:error reason ...]`. `payload`
+  is an already-encoded byte sequence (the MAC payload — Zigbee NWK frame,
+  a MAC command, etc.); this namespace does not know what is inside it.
+  No FCS/MFR trailer — see README 'Not here'."
+  [{:keys [seq-num dest-pan-id dest-addr src-pan-id src-addr payload]
+    :or {payload []} :as m}]
+  (let [[st fcf-or-reason & extra] (build-fcf m)]
+    (if (= st :error)
+      (into [st fcf-or-reason] extra)
+      (let [fcf fcf-or-reason
+            [pst pfcf] (parse-fcf fcf) ;; re-derive so shape can't drift from build-fcf
+            _ (assert (= pst :ok))
+            {:keys [dest-pan-id? dest-addr-width src-pan-id? src-addr-width]}
+            (addressing-shape pfcf)]
+        (cond
+          (not (<= 0 seq-num 0xFF))
+          [:error :ieee802154/sequence-number-out-of-range seq-num]
+
+          (and dest-pan-id? (not (<= 0 dest-pan-id 0xFFFF)))
+          [:error :ieee802154/pan-id-out-of-range dest-pan-id]
+
+          (and src-pan-id? (not (<= 0 src-pan-id 0xFFFF)))
+          [:error :ieee802154/pan-id-out-of-range src-pan-id]
+
+          :else
+          [:ok (vec (concat (u16le fcf)
+                             [(bit-and seq-num 0xFF)]
+                             (when dest-pan-id? (u16le dest-pan-id))
+                             (when (pos? dest-addr-width)
+                               (if (= dest-addr-width 2) (u16le dest-addr) (u64le dest-addr)))
+                             (when src-pan-id? (u16le src-pan-id))
+                             (when (pos? src-addr-width)
+                               (if (= src-addr-width 2) (u16le src-addr) (u64le src-addr)))
+                             payload))])))))
+
+(defn decode
+  "bytes -> `[:ok frame-map]` or `[:error reason ...]`. `frame-map`
+  includes `:fcf` (the raw parsed FCF map) merged with the addressing
+  fields actually present, plus `:payload` (whatever bytes remain — this
+  namespace hands them back undecoded; `zigbee.nwk`/`zigbee.aps` decode
+  the ones a Zigbee frame carries)."
+  [bs]
+  (let [bs (vec bs)
+        n (count bs)]
+    (if (< n 3)
+      [:error :ieee802154/frame-too-short n]
+      (let [[st fcf :as parsed] (parse-fcf (rd-u16le bs 0))]
+        (if (= st :error)
+          (vec parsed)
+          (let [{:keys [dest-pan-id? dest-addr-width src-pan-id? src-addr-width]}
+                (addressing-shape fcf)
+                header-len (+ 3 (if dest-pan-id? 2 0) dest-addr-width
+                               (if src-pan-id? 2 0) src-addr-width)]
+            (if (< n header-len)
+              [:error :ieee802154/frame-too-short n]
+              (let [seq-num (nth bs 2)
+                    off (atom 3)
+                    take-u16! (fn [] (let [v (rd-u16le bs @off)] (swap! off + 2) v))
+                    take-addr! (fn [w] (let [v (if (= w 2) (rd-u16le bs @off) (rd-u64le bs @off))]
+                                          (swap! off + w) v))
+                    dest-pan-id (when dest-pan-id? (take-u16!))
+                    dest-addr (when (pos? dest-addr-width) (take-addr! dest-addr-width))
+                    src-pan-id (when src-pan-id? (take-u16!))
+                    src-addr (when (pos? src-addr-width) (take-addr! src-addr-width))]
+                [:ok (cond-> {:fcf fcf :seq-num seq-num :payload (subvec bs @off n)}
+                       dest-pan-id? (assoc :dest-pan-id dest-pan-id)
+                       (pos? dest-addr-width) (assoc :dest-addr dest-addr)
+                       src-pan-id? (assoc :src-pan-id src-pan-id)
+                       (pos? src-addr-width) (assoc :src-addr src-addr))]))))))))

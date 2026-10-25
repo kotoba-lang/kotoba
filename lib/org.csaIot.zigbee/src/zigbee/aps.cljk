@@ -1,0 +1,167 @@
+(ns zigbee.aps
+  "The Zigbee APS (Application Support Sub-layer) header — the frame
+  carried inside a `zigbee.nwk` frame's payload, which addresses a
+  specific endpoint/cluster/profile rather than just a network node.
+
+  ## Provenance
+
+  Same caveat as `zigbee.nwk`: the Zigbee Specification is a CSA member
+  document. This shape is reconstructed from Wireshark's open-source
+  `epan/dissectors/packet-zbee-aps.c` (`zbee_aps_fc_*` field table and its
+  `disc_dsts`/`profile`/`cluster` field-presence logic keyed off frame
+  type and delivery mode) and `zigpy`'s `zigpy/zigbee/apsde.py` APS frame
+  model.
+
+  ## APS Frame Control (1 byte):
+
+    0-1  Frame Type       00 Data, 01 Command, 10 Ack, 11 reserved
+    2-3  Delivery Mode     00 Unicast, 01 reserved, 10 Broadcast, 11 Group
+    4    Ack Format
+    5    Security
+    6    Ack Request
+    7    Extended Header Present (not decoded — see README 'Not here')
+
+  ## Field presence (this library's scope: Data and Ack frame types;
+  Command frames carry only the APS Counter and a command payload)
+
+  Data / Ack, delivery mode Group: Group Address (2B) · Cluster ID (2B) ·
+  Profile ID (2B) · Source Endpoint (1B) · APS Counter (1B).
+
+  Data / Ack, delivery mode Unicast/Broadcast: Destination Endpoint (1B) ·
+  Cluster ID (2B) · Profile ID (2B) · Source Endpoint (1B) · APS Counter
+  (1B).
+
+  Command: APS Counter (1B) only — no endpoint/cluster/profile fields; the
+  command payload carries its own command identifier.
+
+  **Least confident item in this repo**: whether an Ack frame in the wild
+  always carries the full Cluster/Profile/endpoint set this library
+  assumes for it (treated identically to Data here) — several public
+  captures show a shortened Ack that omits them. This library encodes/
+  decodes Ack the same as Data; a shortened Ack is out of scope, not
+  silently mishandled (`decode` will report `:frame-too-short` on one
+  rather than guess).")
+
+(defn- u16le [n] [(bit-and n 0xFF) (bit-and (unsigned-bit-shift-right n 8) 0xFF)])
+(defn- rd-u16le [bs off] (bit-or (bit-and (nth bs off) 0xFF)
+                                  (bit-shift-left (bit-and (nth bs (inc off)) 0xFF) 8)))
+
+(def frame-types {:data 0 :command 1 :ack 2})
+(def frame-type-by-code (into {} (map (fn [[k v]] [v k]) frame-types)))
+
+(def delivery-modes {:unicast 0 :broadcast 2 :group 3})
+(def delivery-mode-by-code (into {} (map (fn [[k v]] [v k]) delivery-modes)))
+
+(defn build-fcf
+  "`{:frame-type :delivery-mode :ack-format? :security? :ack-request?}`
+  -> `[:ok u8]` | `[:error reason ...]`."
+  [{:keys [frame-type delivery-mode ack-format? security? ack-request?]
+    :or {delivery-mode :unicast}}]
+  (cond
+    (not (contains? frame-types frame-type))
+    [:error :zigbee.aps/reserved-frame-type frame-type]
+
+    (not (contains? delivery-modes delivery-mode))
+    [:error :zigbee.aps/reserved-delivery-mode delivery-mode]
+
+    :else
+    [:ok (bit-or (bit-and (frame-types frame-type) 0x03)
+                 (bit-shift-left (bit-and (delivery-modes delivery-mode) 0x03) 2)
+                 (bit-shift-left (if ack-format? 1 0) 4)
+                 (bit-shift-left (if security? 1 0) 5)
+                 (bit-shift-left (if ack-request? 1 0) 6))]))
+
+(defn parse-fcf
+  [b]
+  (let [ft-code (bit-and b 0x03)
+        dm-code (bit-and (unsigned-bit-shift-right b 2) 0x03)]
+    (cond
+      (not (contains? frame-type-by-code ft-code))
+      [:error :zigbee.aps/reserved-frame-type ft-code]
+
+      (not (contains? delivery-mode-by-code dm-code))
+      [:error :zigbee.aps/reserved-delivery-mode dm-code]
+
+      :else
+      [:ok {:frame-type (frame-type-by-code ft-code)
+            :delivery-mode (delivery-mode-by-code dm-code)
+            :ack-format? (bit-test b 4)
+            :security? (bit-test b 5)
+            :ack-request? (bit-test b 6)
+            :extended-header? (bit-test b 7)}])))
+
+(defn encode
+  "`{:frame-type :delivery-mode :dest-endpoint :group-address :cluster-id
+  :profile-id :src-endpoint :aps-counter :payload}` -> `[:ok bytes]` |
+  `[:error reason ...]`. Which of `:dest-endpoint`/`:group-address` is
+  required depends on `:delivery-mode`; for `:frame-type :command` none of
+  the endpoint/cluster/profile fields are used at all."
+  [{:keys [dest-endpoint group-address cluster-id profile-id src-endpoint
+           aps-counter payload]
+    :or {payload []} :as m}]
+  (let [[st fcf-or-reason & extra] (build-fcf m)]
+    (if (= st :error)
+      (into [st fcf-or-reason] extra)
+      (let [fcf fcf-or-reason
+            [_ pfcf] (parse-fcf fcf)
+            {:keys [frame-type delivery-mode]} pfcf
+            group? (= delivery-mode :group)
+            has-fields? (not= frame-type :command)]
+        (cond
+          (not (<= 0 aps-counter 0xFF))
+          [:error :zigbee.aps/counter-out-of-range aps-counter]
+
+          (and has-fields? group? (not (<= 0 group-address 0xFFFF)))
+          [:error :zigbee.aps/address-out-of-range group-address]
+
+          (and has-fields? (not group?) (not (<= 0 dest-endpoint 0xFF)))
+          [:error :zigbee.aps/endpoint-out-of-range dest-endpoint]
+
+          (and has-fields? (not (<= 0 cluster-id 0xFFFF)))
+          [:error :zigbee.aps/cluster-out-of-range cluster-id]
+
+          (and has-fields? (not (<= 0 profile-id 0xFFFF)))
+          [:error :zigbee.aps/profile-out-of-range profile-id]
+
+          (and has-fields? (not (<= 0 src-endpoint 0xFF)))
+          [:error :zigbee.aps/endpoint-out-of-range src-endpoint]
+
+          :else
+          [:ok (vec (concat [fcf]
+                             (when has-fields?
+                               (concat (if group? (u16le group-address) [(bit-and dest-endpoint 0xFF)])
+                                       (u16le cluster-id)
+                                       (u16le profile-id)
+                                       [(bit-and src-endpoint 0xFF)]))
+                             [(bit-and aps-counter 0xFF)]
+                             payload))])))))
+
+(defn decode
+  [bs]
+  (let [bs (vec bs) n (count bs)]
+    (if (< n 2)
+      [:error :zigbee.aps/frame-too-short n]
+      (let [[st fcf :as parsed] (parse-fcf (nth bs 0))]
+        (if (= st :error)
+          (vec parsed)
+          (let [{:keys [frame-type delivery-mode]} fcf
+                has-fields? (not= frame-type :command)
+                group? (= delivery-mode :group)
+                header-len (+ 1 (if has-fields? (+ 1 2 2 1) 0) 1)]
+            (if (< n header-len)
+              [:error :zigbee.aps/frame-too-short n]
+              (let [off (atom 1)
+                    dest-or-group (when has-fields?
+                                    (let [v (if group? (rd-u16le bs @off) (nth bs @off))]
+                                      (swap! off + (if group? 2 1))
+                                      v))
+                    cluster-id (when has-fields? (let [v (rd-u16le bs @off)] (swap! off + 2) v))
+                    profile-id (when has-fields? (let [v (rd-u16le bs @off)] (swap! off + 2) v))
+                    src-endpoint (when has-fields? (let [v (nth bs @off)] (swap! off inc) v))
+                    aps-counter (nth bs @off)
+                    _ (swap! off inc)]
+                [:ok (cond-> {:fcf fcf :aps-counter aps-counter :payload (subvec bs @off n)}
+                       (and has-fields? group?) (assoc :group-address dest-or-group)
+                       (and has-fields? (not group?)) (assoc :dest-endpoint dest-or-group)
+                       has-fields? (assoc :cluster-id cluster-id :profile-id profile-id
+                                          :src-endpoint src-endpoint))]))))))))
