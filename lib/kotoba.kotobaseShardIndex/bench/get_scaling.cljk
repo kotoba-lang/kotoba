@@ -1,0 +1,150 @@
+(ns get-scaling
+  "How many object-store GETs does one query cost, as the corpus grows?
+
+    kbb --backend sci --classpath src \\
+      bench/get_scaling.cljk [out.edn]
+
+  This is the number the design rests on. A client with no server pays one
+  round trip per GET, so GETs-per-query IS the cost model.
+
+  ## Two regimes, because sharding is not free
+
+  The per-shard cost is logarithmic: descend a dictionary tree, read the top
+  chunks of impact-ordered postings, stop when the bound separates. But EVERY
+  shard is asked EVERY query, so the client pays a fan-out term linear in the
+  shard count. Those pull in opposite directions and reporting only one of
+  them would be a sales pitch.
+
+  - `:fixed-shards`  — shard count constant while the corpus grows 64x. This
+                       isolates the per-shard cost, which is the design claim.
+  - `:scaled-shards` — shard count grows with the corpus (n/2000). This is the
+                       fan-out term, which is the design's real ceiling.
+
+  We count GETs, not milliseconds, deliberately — the discipline
+  `kotobase-peer`'s dag-shape bench established (ADR-2608021000): wall clock on
+  a machine running many agent sessions measures the machine.
+
+  `waves` is the second number and the one latency tracks: the depth of the
+  sequential dependency chain. GETs within a wave are independent and a real
+  client issues them concurrently.
+
+  What this does NOT measure: real network latency, object-store tail
+  behaviour, concurrency, or CDN hit rates. The store is in-memory. Multiply
+  waves by a measured per-GET RTT for a latency estimate — do not read one off
+  this file."
+  (:require [kotobase-shard-index.block :as block]
+            [kotobase-shard-index.build :as build]
+            [kotobase-shard-index.codec :as codec]
+            [kotobase-shard-index.node :as node]
+            [kotobase-shard-index.query :as query]
+            [kotobase-shard-index.synth :as synth]))
+
+(def sizes [1000 4000 16000 64000])
+(def vocab-size 20000)
+(def k 10)
+(def fixed-shards 8)
+
+(defn- mean [xs] (if (empty? xs) 0 (/ (reduce + 0 xs) (count xs))))
+
+(defn probe [n shard-count]
+  (let [queries (synth/probe-queries vocab-size)
+        store (block/memory-store)
+        {:keys [manifest-cid stats]} (build/build! store node/sha256-hex
+                                                   (synth/corpus n 12345 vocab-size)
+                                                   {:shard-count shard-count})
+        [counted tally] (block/counting store)
+        runs (mapv (fn [q]
+                     (block/reset-tally! tally)
+                     (let [r (query/search counted manifest-cid q {:k k})
+                           gets (:gets @tally)
+                           bytes (:bytes @tally)]
+                       (block/reset-tally! tally)
+                       (query/top-k-exhaustive counted manifest-cid q {:k k})
+                       {:q q :gets gets :bytes bytes
+                        :waves (get-in r [:stats :waves])
+                        :chunk-reads (get-in r [:stats :chunk-reads])
+                        :proof (get-in r [:stats :proof])
+                        :hits (count (:hits r))
+                        :full-scan-gets (:gets @tally)}))
+                   queries)]
+    {:docs n
+     :shards shard-count
+     :terms (:term-count stats)
+     :index-blocks (block/block-count store)
+     :index-bytes (block/total-bytes store)
+     :dict-height (:dict-height (first (:shards (block/get-block store manifest-cid))))
+     :queries runs
+     :mean-gets (mean (map :gets runs))
+     :max-gets (apply max (map :gets runs))
+     :mean-full-scan-gets (mean (map :full-scan-gets runs))
+     :max-waves (apply max (map :waves runs))}))
+
+(defn- regime [label shard-fn]
+  (println (str "\n== " label " =="))
+  (mapv (fn [n]
+          (let [sc (shard-fn n)
+                _ (println (str "  building " n " docs / " sc " shards ..."))
+                r (probe n sc)]
+            (println (str "    blocks=" (:index-blocks r)
+                          " mean-gets=" (:mean-gets r)
+                          " full-scan=" (:mean-full-scan-gets r)
+                          " max-waves=" (:max-waves r)))
+            r))
+        sizes))
+
+(defn- growth [rs kf] (/ (double (kf (last rs))) (kf (first rs))))
+
+(defn -main [& args]
+  (let [fixed (regime :fixed-shards (constantly fixed-shards))
+        scaled (regime :scaled-shards (fn [n] (max 1 (quot n 2000))))
+        receipt
+        {:receipt :kotobase-shard-index/get-scaling
+         :date "2026-08-07"
+         :runtime "nbb (Node 22), in-memory block store"
+         :method "GET counts and waves, not wall clock -- see ns docstring"
+         :k k
+         :vocab-size vocab-size
+         :sizes sizes
+         :fixed-shard-count fixed-shards
+         :regimes {:fixed-shards fixed :scaled-shards scaled}
+         :summary
+         {:corpus-growth (/ (double (last sizes)) (first sizes))
+          :fixed-shards
+          {:index-block-growth (growth fixed :index-blocks)
+           :query-get-growth (growth fixed :mean-gets)
+           :waves-first (:max-waves (first fixed))
+           :waves-last (:max-waves (last fixed))
+           :gets-as-fraction-of-index (/ (double (:mean-gets (last fixed)))
+                                         (:index-blocks (last fixed)))}
+          :scaled-shards
+          {:shard-growth (/ (double (:shards (last scaled))) (:shards (first scaled)))
+           :index-block-growth (growth scaled :index-blocks)
+           :query-get-growth (growth scaled :mean-gets)
+           :waves-first (:max-waves (first scaled))
+           :waves-last (:max-waves (last scaled))
+           :gets-as-fraction-of-index (/ (double (:mean-gets (last scaled)))
+                                         (:index-blocks (last scaled)))}}
+         :caveats
+         ["In-memory store: this measures GET COUNT and WAVES, never latency."
+          "Synthetic Zipf corpus over a 20,000-term vocabulary. Real text has a much
+           longer tail, which lengthens dictionaries (more descent levels --
+           logarithmic) and makes mid-frequency terms more selective, not less."
+          "Single process: no concurrency, no CDN, no tail latency."
+          "full-scan-gets reads every posting chunk of the SAME index -- the O(matching
+           postings) baseline. It is NOT the deployed hydrate path, which reads the whole
+           database and is bounded below by index-blocks. On small corpora the full scan
+           can be CHEAPER than the bounded scan, because prefetch reads 8 chunks per wave
+           and a short posting list has fewer than 8 chunks in total."
+          "The two regimes bracket the design. Real deployments choose shard count from
+           write parallelism and object size, not from corpus size -- but the fan-out term
+           is what decides how far this can go, so it is measured rather than argued."]}
+        out (or (first args) "bench/results/2026-08-07-get-scaling.edn")]
+    (println "\n== summary ==")
+    (println (pr-str (:summary receipt)))
+    (let [fs (js/require "node:fs")
+          path (js/require "node:path")]
+      (.mkdirSync fs (.dirname path out) #js {:recursive true})
+      (.writeFileSync fs out (codec/encode receipt) "utf8"))
+    (println "receipt ->" out)))
+
+(-main)
