@@ -1,0 +1,144 @@
+#!/usr/bin/env kbb
+;; Aggregate denial receipts / continuous-monitoring alerts into summary EDN.
+;;
+;; Scans evidence/*/alerts (or --dir) for *.edn alert files, writes a summary,
+;; and optionally emits a host-denial-spike monitoring alert when thresholds
+;; are crossed.
+;;
+;; Usage (repo root):
+;;   kbb --backend sci --classpath src scripts/aggregate-host-denial.cljk
+;;   kbb --backend sci --classpath src scripts/aggregate-host-denial.cljk --dir evidence/2026-07-18
+;;   kbb --backend sci --classpath src scripts/aggregate-host-denial.cljk --dir test/fixtures/alerts \\
+;;       --spike-threshold 1 --denial-sum-threshold 50 --emit-alert
+;;
+;; Evidence: evidence/<date>/host-denial-summary.edn (+ optional spike alert)
+(ns kotoba.security.scripts.aggregate-host-denial
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [kotoba.security.host-denial-telemetry :as hdt]
+            [kotoba.security.alert-delivery :as ad]))
+
+(def script-file (or *file* (first (.-argv js/process))))
+(def script-dir (path/dirname (path/resolve script-file)))
+(def root (path/resolve script-dir ".."))
+
+(def cli-args
+  (try
+    (vec *command-line-args*)
+    (catch :default _
+      (vec (drop 2 (js->clj (.-argv js/process)))))))
+
+(defn- flag? [name] (boolean (some #{name} cli-args)))
+(defn- flag-val [name]
+  (let [i (.indexOf cli-args name)]
+    (when (and (>= i 0) (< (inc i) (count cli-args)))
+      (nth cli-args (inc i)))))
+
+(defn- parse-int [s default]
+  (if (nil? s)
+    default
+    (let [n (js/parseInt s 10)]
+      (if (js/isNaN n) default n))))
+
+(def date (or (flag-val "--date") (.slice (.toISOString (js/Date.)) 0 10)))
+(def observed-at (or (flag-val "--observed-at") (.toISOString (js/Date.))))
+(def run-id (or (flag-val "--run-id") (str "host-denial-aggregate-" date)))
+(def emit-alert? (flag? "--emit-alert"))
+(def deliver? (flag? "--deliver"))
+(def stdout? (flag? "--stdout"))
+(def spike-thr (parse-int (flag-val "--spike-threshold") 1))
+(def denial-thr (parse-int (flag-val "--denial-sum-threshold") 50))
+
+(defn- list-edn-files
+  "Collect *.edn under dir (non-recursive) excluding *summary*."
+  [dir]
+  (if-not (fs/existsSync dir)
+    []
+    (->> (js->clj (fs/readdirSync dir))
+         (filter #(and (str/ends-with? % ".edn")
+                       (not (str/includes? % "summary"))
+                       (not (str/includes? % "ndjson"))))
+         (map #(path/join dir %))
+         vec)))
+
+(defn- discover-dirs
+  "Default: --dir if set; else evidence/<date>/alerts and evidence/<date>;
+   plus evidence/2026-07-17 and evidence/2026-07-18 roots for samples."
+  []
+  (if-let [d (flag-val "--dir")]
+    [(if (path/isAbsolute d) d (path/resolve root d))]
+    (let [base (path/join root "evidence")
+          candidates [(path/join base date "alerts")
+                      (path/join base date)
+                      (path/join base "2026-07-18" "alerts")
+                      (path/join base "2026-07-18")
+                      (path/join base "2026-07-17" "alerts")
+                      (path/join base "2026-07-17")]]
+      (filterv fs/existsSync candidates))))
+
+(defn- load-alerts [dirs]
+  (let [files (mapcat list-edn-files dirs)
+        seen (atom #{})
+        out (atom [])]
+    (doseq [f files]
+      (when-not (contains? @seen f)
+        (swap! seen conj f)
+        (when-let [a (hdt/parse-alert-edn (fs/readFileSync f "utf8"))]
+          (swap! out conj a))))
+    @out))
+
+(def dirs (discover-dirs))
+(def alerts (load-alerts dirs))
+(def summary
+  (hdt/aggregate alerts
+                 {:threshold {:spike-alert-count spike-thr
+                              :denial-count-sum denial-thr}
+                  :source-dir (str/join "," dirs)
+                  :observed-at observed-at
+                  :run-id run-id
+                  :evidence-id "EV-0018"}))
+
+(def out-dir (path/join root "evidence" date))
+(when-not (fs/existsSync out-dir)
+  (fs/mkdirSync out-dir #js {:recursive true}))
+(def summary-path (path/join out-dir "host-denial-summary.edn"))
+(fs/writeFileSync summary-path (pr-str summary))
+(println "ok wrote" summary-path)
+(println "  alerts" (:summary/alert-count summary)
+         "host-denial" (:summary/host-denial-alert-count summary)
+         "spikes" (:summary/host-denial-spike-count summary)
+         "denial-sum" (:summary/denial-count-sum summary)
+         "exceeded?" (:summary/threshold-exceeded? summary))
+
+(defn finish! [spike delivery]
+  (when spike
+    (let [p (path/join out-dir "alert-host-denial-spike-aggregated.edn")]
+      (fs/writeFileSync p (pr-str spike))
+      (println "ok wrote" p)))
+  (when delivery
+    (doseq [r (:results delivery)]
+      (println "sink" (pr-str r))))
+  (when (:summary/threshold-exceeded? summary)
+    (println "THRESHOLD EXCEEDED — host-denial monitoring signal"))
+  (.exit js/process 0))
+
+(if-not (or emit-alert? deliver?)
+  (finish! nil nil)
+  (let [spike (hdt/spike-monitoring-alert summary)]
+    (if-not spike
+      (do (println "no spike alert (threshold not exceeded)")
+          (finish! nil nil))
+      (if-not deliver?
+        (finish! spike nil)
+        (let [file-dir (or (flag-val "--file-dir")
+                           (ad/default-file-dir root date))]
+          (-> (ad/deliver-all! spike {:file-dir file-dir :stdout? stdout?})
+              (.then (fn [d]
+                       (if (:ok? d)
+                         (finish! spike d)
+                         (do (println "FAIL delivery" (pr-str d))
+                             (.exit js/process 1)))))
+              (.catch (fn [e]
+                        (println "FAIL" (str e))
+                        (.exit js/process 1)))))))))

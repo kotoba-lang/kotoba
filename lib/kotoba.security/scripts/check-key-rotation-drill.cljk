@@ -1,0 +1,160 @@
+#!/usr/bin/env kbb
+;; Pure package-signing rotation drill (R-002 residual).
+;;
+;; Sequence: old active + new pre-active → rotate-signing-key →
+;; new active, old retired (verify-until), blocked contains old, active
+;; contains new; --require-active semantics still hold.
+;;
+;; Synthetic register only — never mutates registers/key-register.edn.
+;; Exit 0 on pass, 1 on fail. No private keys involved.
+;;
+;; Usage (repo root):
+;;   kbb --backend sci --classpath src scripts/check-key-rotation-drill.cljk
+;;   kbb --backend sci --classpath src scripts/check-key-rotation-drill.cljk --write [evidence/YYYY-MM-DD]
+(ns kotoba.security.scripts.check-key-rotation-drill
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]
+            [kotoba.security.key-status :as key-status]
+            [kotoba.security.key-lifecycle :as kl]))
+
+(def script-file (or *file* (first (.-argv js/process))))
+(def script-dir (path/dirname (path/resolve script-file)))
+(def root (path/resolve script-dir ".."))
+
+(def cli-args
+  (try
+    (vec *command-line-args*)
+    (catch :default _
+      (vec (drop 2 (js->clj (.-argv js/process)))))))
+
+(def write? (boolean (some #{"--write"} cli-args)))
+(def date "2026-07-18")
+(def now date)
+(def verify-until "2033-07-18")
+(def out-dir
+  (let [rest-args (vec (remove #{"--write"} cli-args))]
+    (if (first rest-args)
+      (path/resolve (first rest-args))
+      (path/resolve root "evidence" date))))
+
+(defn- synthetic-package-key
+  [id status]
+  (cond-> {:key/id id
+           :key/class :package-signing
+           :key/algorithm :ed25519
+           :key/status status
+           :key/owner :package-owner
+           :key/created-at date
+           :key/public (str "ed25519:ROTATION-DRILL-FAKE-PUBLIC-" id)
+           :key/storage :test-local-synthetic
+           :key/pq-status :classical-only
+           :key/intent :research-demo
+           :key/notes "test-local synthetic key for rotation drill; not production; no private material."}
+    (= status :active) (assoc :key/active-from date
+                              :key/active-until "2027-07-18")
+    (= status :pre-active) (assoc :key/active-from nil
+                                  :key/active-until nil)))
+
+(defn- mini-register [keys]
+  {:register/type :kotoba.security/key-register
+   :register/version 1
+   :keys (vec keys)})
+
+(defn- fail! [msg data]
+  (println "FAIL" msg (pr-str data))
+  (.exit js/process 1))
+
+(defn- assert! [cond msg data]
+  (when-not cond
+    (fail! msg data)))
+
+(println "key-lifecycle-rotation-drill starting (pure/synthetic; live register untouched)")
+
+;; Step 1: old active + new pre-active
+(def old-key (synthetic-package-key "drill-pkg-old-2026-07-18" :active))
+(def new-key (synthetic-package-key "drill-pkg-new-2026-07-18-rot" :pre-active))
+(def reg0 (mini-register [old-key new-key]))
+(assert! (true? (key-status/status-transition-ok? :pre-active :active))
+         "pre-active -> active must be legal" {})
+(assert! (true? (key-status/status-transition-ok? :active :retired))
+         "active -> retired must be legal" {})
+(assert! (= #{"drill-pkg-old-2026-07-18"} (key-status/active-signer-ids reg0))
+         "only old starts active" (key-status/active-signer-ids reg0))
+(assert! (contains? (key-status/blocked-signer-ids reg0) "drill-pkg-new-2026-07-18-rot")
+         "pre-active new key is blocked for new artifacts"
+         (key-status/blocked-signer-ids reg0))
+(assert! (true? (:kotoba.key/ok? (key-status/evaluate-key-register reg0)))
+         "initial register ok?" (key-status/evaluate-key-register reg0))
+(println "step1 ok: old active + new pre-active")
+
+;; Step 2: rotate-signing-key
+(def rot (key-status/rotate-signing-key old-key new-key now verify-until))
+(assert! (true? (:ok? rot)) "rotation must ok?" rot)
+(assert! (= :active (get-in rot [:new :key/status])) "new becomes active" (:new rot))
+(assert! (= :retired (get-in rot [:old :key/status])) "old becomes retired" (:old rot))
+(assert! (= verify-until (get-in rot [:old :key/verify-until]))
+         "verify-until set on retired old" (:old rot))
+(assert! (nil? (get-in rot [:new :key/transition-error])) "no promote error" (:new rot))
+(assert! (nil? (get-in rot [:old :key/transition-error])) "no retire error" (:old rot))
+(println "step2 ok: rotate-signing-key promote+retire")
+
+;; Step 3: post-rotation register evaluation
+(def reg1 (mini-register [(:old rot) (:new rot)]))
+(def eval1 (key-status/evaluate-key-register reg1))
+(def blocked (key-status/blocked-signer-ids reg1))
+(def active (key-status/active-signer-ids reg1))
+(assert! (contains? blocked "drill-pkg-old-2026-07-18")
+         "retired old is blocked for new artifacts" blocked)
+(assert! (= #{"drill-pkg-new-2026-07-18-rot"} active)
+         "only new is active" active)
+(assert! (true? (:kotoba.key/ok? eval1))
+         "evaluate still ok? after rotation" eval1)
+(assert! (= {:valid? true}
+            (kl/check-signer-for-new-artifact reg1 "drill-pkg-new-2026-07-18-rot"))
+         "new key trusted for new artifacts" nil)
+(assert! (false? (:valid? (kl/check-signer-for-new-artifact reg1 "drill-pkg-old-2026-07-18")))
+         "old key not trusted for new artifacts"
+         (kl/check-signer-for-new-artifact reg1 "drill-pkg-old-2026-07-18"))
+(println "step3 ok: active={new}; blocked contains old; signer trust correct")
+
+;; Step 4: package-admission trust fold
+(def trust {:revoked-signers #{}})
+(def folded (update trust :revoked-signers into blocked))
+(assert! (contains? (:revoked-signers folded) "drill-pkg-old-2026-07-18")
+         "folded trust includes retired old" folded)
+(assert! (not (contains? (:revoked-signers folded) "drill-pkg-new-2026-07-18-rot"))
+         "active new must not enter blocked set" folded)
+(println "step4 ok: blocked-signer-ids fold for package admission")
+
+(def evidence
+  {:simulation/id "sim-package-signing-rotation-2026-07-18"
+   :simulation/kind :package-signing-rotation
+   :simulation/observed-at (str now "T12:00:00Z")
+   :simulation/result :rotated-as-expected
+   :simulation/now now
+   :simulation/verify-until verify-until
+   :simulation/old-key-id "drill-pkg-old-2026-07-18"
+   :simulation/new-key-id "drill-pkg-new-2026-07-18-rot"
+   :simulation/rotation {:ok? (:ok? rot)
+                         :new-status (get-in rot [:new :key/status])
+                         :old-status (get-in rot [:old :key/status])
+                         :verify-until (get-in rot [:old :key/verify-until])}
+   :simulation/post-eval eval1
+   :simulation/active (vec active)
+   :simulation/blocked (vec blocked)
+   :simulation/notes "Pure synthetic rotation drill. Production register not mutated. Private material never present."
+   :simulation/evidence-id "EV-0014"})
+
+(println "PASS key-lifecycle-rotation-drill"
+         "new=" (first active)
+         "retired=" "drill-pkg-old-2026-07-18")
+
+(when write?
+  (when-not (fs/existsSync out-dir)
+    (fs/mkdirSync out-dir #js {:recursive true}))
+  (let [edn-path (path/join out-dir "key-lifecycle-rotation-drill.edn")]
+    (fs/writeFileSync edn-path (pr-str evidence))
+    (println "wrote" edn-path)))
+
+(.exit js/process 0)

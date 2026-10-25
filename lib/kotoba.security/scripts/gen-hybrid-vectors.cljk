@@ -1,0 +1,170 @@
+;; Hybrid X25519 + ML-KEM-768 test-vector generator (kotoba-lang/kotoba#264).
+;;
+;; Usage (from the repo root; Bouncy Castle only lives in the :vectors alias):
+;;   kbb -M:vectors scripts/gen-hybrid-vectors.cljk
+;;
+;; Writes conformance/crypto/vectors/hybrid-x25519-mlkem768.edn. Generation is
+;; fully deterministic: all randomness (X25519 keys, ML-KEM keygen d/z, ML-KEM
+;; encapsulation randomness) is drawn from a seeded HMAC-SHA256 counter DRBG —
+;; never from SecureRandom defaults — so re-running this script reproduces the
+;; vector file byte-for-byte.
+;;
+;; Scheme (documented in docs/hybrid-envelope-vectors.md):
+;;   recipient: X25519 keypair + ML-KEM-768 keypair
+;;   encapsulate: X25519 ephemeral keypair -> ss1 = X25519(eph-secret, recipient-pub)
+;;                ML-KEM-768 encapsulation  -> (ciphertext, ss2)
+;;   KEK = HKDF-SHA256(ikm = ss1 || ss2,
+;;                     salt = ASCII "kotoba.hybrid.v1",
+;;                     info = 4-byte big-endian epoch) -> 32 bytes
+(ns gen-hybrid-vectors
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as io]
+            [kotoba.lang.text :as str])
+  (:import [java.security MessageDigest SecureRandom]
+           [java.nio ByteBuffer]
+           [javax.crypto Mac]
+           [javax.crypto.spec SecretKeySpec]
+           [org.bouncycastle.crypto.params X25519PrivateKeyParameters X25519PublicKeyParameters]
+           [org.bouncycastle.pqc.crypto.mlkem
+            MLKEMParameters MLKEMKeyGenerationParameters MLKEMKeyPairGenerator
+            MLKEMGenerator MLKEMExtractor MLKEMPublicKeyParameters MLKEMPrivateKeyParameters]))
+
+;; ---------- bytes / hex ----------
+
+(defn hex ^String [^bytes b]
+  (str/join (map #(format "%02x" %) b)))
+
+(defn concat-bytes ^bytes [& arrays]
+  (byte-array (mapcat vec arrays)))
+
+(defn sha256 ^bytes [^bytes b]
+  (.digest (MessageDigest/getInstance "SHA-256") b))
+
+(defn hmac-sha256 ^bytes [^bytes key ^bytes data]
+  (let [mac (Mac/getInstance "HmacSHA256")]
+    (.init mac (SecretKeySpec. key "HmacSHA256"))
+    (.doFinal mac data)))
+
+(defn epoch-bytes
+  "4-byte big-endian unsigned encoding of the epoch (the HKDF info)."
+  ^bytes [epoch]
+  (.array (.putInt (ByteBuffer/allocate 4) (int epoch))))
+
+(defn hkdf-sha256
+  "RFC 5869 HKDF-SHA256: extract with `salt`, expand `info` to `length` bytes."
+  ^bytes [^bytes ikm ^bytes salt ^bytes info length]
+  (let [prk (hmac-sha256 salt ikm)
+        n (long (Math/ceil (/ length 32.0)))
+        blocks (loop [i 1 t (byte-array 0) out []]
+                 (if (> i n)
+                   out
+                   (let [t' (hmac-sha256 prk (concat-bytes t info (byte-array [(byte i)])))]
+                     (recur (inc i) t' (conj out t')))))]
+    (byte-array (take length (apply concat (map vec blocks))))))
+
+;; ---------- seeded DRBG (HMAC-SHA256 counter construction) ----------
+
+(defn drbg
+  "Deterministic SecureRandom over an HMAC-SHA256 counter stream:
+  block_i = HMAC-SHA256(seed, ASCII(label + \".\" + i)), i = 1,2,...
+  The stream is consumed sequentially by nextBytes. Never mixes in entropy."
+  ^SecureRandom [^bytes seed ^String label]
+  (let [counter (atom 0)
+        buf (atom (byte-array 0))
+        pos (atom 0)]
+    (proxy [SecureRandom] []
+      (nextBytes [^bytes out]
+        (dotimes [i (alength out)]
+          (when (>= ^long @pos (alength ^bytes @buf))
+            (let [c (swap! counter inc)]
+              (reset! buf (hmac-sha256 seed (kbytes/utf8-bytes (str label "." c))))
+              (reset! pos 0)))
+          (aset out i (aget ^bytes @buf @pos))
+          (swap! pos inc))))))
+
+(defn drbg-bytes ^bytes [^bytes seed ^String label n]
+  (let [out (byte-array n)]
+    (.nextBytes (drbg seed label) out)
+    out))
+
+;; ---------- hybrid X25519 + ML-KEM-768 ----------
+
+(def kek-salt (kbytes/utf8-bytes "kotoba.hybrid.v1"))
+
+(defn gen-vector
+  "Generates one deterministic hybrid-wrapping vector from `seed-label`."
+  [id epoch ^String seed-label]
+  (let [seed (sha256 (kbytes/utf8-bytes seed-label))
+        ;; recipient X25519 keypair (secret drawn from the DRBG)
+        rx-secret (drbg-bytes seed "x25519.recipient" 32)
+        rx-priv (X25519PrivateKeyParameters. rx-secret 0)
+        rx-pub (.generatePublicKey rx-priv)
+        ;; recipient ML-KEM-768 keypair (keygen randomness from the DRBG)
+        kpg (doto (MLKEMKeyPairGenerator.)
+              (.init (MLKEMKeyGenerationParameters.
+                      (drbg seed "mlkem.keygen") MLKEMParameters/ml_kem_768)))
+        kp (.generateKeyPair kpg)
+        mk-pub ^MLKEMPublicKeyParameters (.getPublic kp)
+        mk-priv ^MLKEMPrivateKeyParameters (.getPrivate kp)
+        ;; encapsulation: X25519 ephemeral + ML-KEM encapsulation
+        eph-secret (drbg-bytes seed "x25519.ephemeral" 32)
+        eph-priv (X25519PrivateKeyParameters. eph-secret 0)
+        eph-pub (.generatePublicKey eph-priv)
+        ss1 (let [out (byte-array 32)]
+              (.generateSecret eph-priv rx-pub out 0)
+              out)
+        swe (.generateEncapsulated
+             (MLKEMGenerator. (drbg seed "mlkem.encaps")) mk-pub)
+        ct (.getEncapsulation swe)
+        ss2 (.getSecret swe)
+        ;; combined KEK
+        kek (hkdf-sha256 (concat-bytes ss1 ss2) kek-salt (epoch-bytes epoch) 32)
+        ;; sanity: decapsulation path reproduces both shared secrets
+        ss1' (let [out (byte-array 32)]
+               (.generateSecret rx-priv (X25519PublicKeyParameters. (.getEncoded eph-pub) 0) out 0)
+               out)
+        ss2' (.extractSecret (MLKEMExtractor. mk-priv) ct)]
+    (assert (= (vec ss1) (vec ss1')) "x25519 decapsulation mismatch")
+    (assert (= (vec ss2) (vec ss2')) "ml-kem decapsulation mismatch")
+    {:vector/id id
+     :vector/epoch epoch
+     :vector/kem [:x25519 :ml-kem-768]
+     :vector/seed (hex seed)
+     :vector/seed-label seed-label
+     :vector/inputs {:x25519/recipient-public (hex (.getEncoded rx-pub))
+                     :x25519/recipient-secret (hex rx-secret)
+                     :x25519/ephemeral-public (hex (.getEncoded eph-pub))
+                     :x25519/ephemeral-secret (hex eph-secret)
+                     :ml-kem/encapsulation-key (hex (.getEncoded mk-pub))
+                     :ml-kem/decapsulation-key (hex (.getEncoded mk-priv))
+                     :ml-kem/ciphertext (hex ct)}
+     :vector/expected {:x25519/shared-secret (hex ss1)
+                       :ml-kem/shared-secret (hex ss2)
+                       :kek (hex kek)
+                       :envelope {:envelope/algorithms [:x25519 :ml-kem-768 :aes-256-gcm]
+                                  :envelope/provider {:provider/id :bc-hybrid-x25519-mlkem768
+                                                      :provider/fips-validated false}
+                                  :envelope/epoch epoch
+                                  :envelope/kem? true
+                                  :envelope/hybrid? true}}}))
+
+(def vector-specs
+  [["hybrid-x25519-mlkem768-0001" 1 "kotoba.hybrid.v1/vector/0001"]
+   ["hybrid-x25519-mlkem768-0002" 2 "kotoba.hybrid.v1/vector/0002"]
+   ["hybrid-x25519-mlkem768-0003" 3 "kotoba.hybrid.v1/vector/0003"]])
+
+(defn -main [& _]
+  (let [vectors (mapv #(apply gen-vector %) vector-specs)
+        out-file (io/file "conformance/crypto/vectors/hybrid-x25519-mlkem768.edn")]
+    (io/make-parents out-file)
+    (with-open [w (io/writer out-file)]
+      (binding [*out* w *print-length* nil *print-level* nil]
+        (println ";; Deterministic hybrid X25519 + ML-KEM-768 wrapping vectors.")
+        (println ";; Generated by scripts/gen-hybrid-vectors.cljk (kbb -M:vectors scripts/gen-hybrid-vectors.cljk)")
+        (println ";; Do not hand-edit; see docs/hybrid-envelope-vectors.md.")
+        (prn vectors)))
+    (doseq [v vectors]
+      (println "wrote" (:vector/id v) "epoch" (:vector/epoch v)
+               "kek" (subs (get-in v [:vector/expected :kek]) 0 16)))
+    (println "ok" (count vectors) "vectors ->" (str out-file))))
+
+(-main)
