@@ -1,0 +1,188 @@
+(ns kotoba.image-test
+  "Portable: runs under kbb (ClojureScript on Node) and on the JVM. The
+  literals below were measured against javax.imageio / BufferedImage (see
+  kotoba.image.jvm-oracle-test, which re-measures them on every JVM run)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.image :as img]
+            [kotoba.image.pngs :as pngs]
+            [kotoba.lang.io.file :as file]))
+
+(defn- refusal
+  "The :kotoba.image/error keyword f throws, or ::no-throw."
+  [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (or (:kotoba.image/error (ex-data e)) [::foreign (ex-message e)]))))
+
+(defn- refusal-data [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e (ex-data e))))
+
+(defn- unchecked-int* [n] #?(:clj (unchecked-int n) :cljs (bit-or n 0)))
+(defn- int* [c] #?(:clj (int c) :cljs (.charCodeAt c 0)))
+
+(defn- ->u [bs] (mapv #(bit-and % 0xff) #?(:clj (seq bs) :cljs (js/Array.from bs))))
+
+;; ── create / get / set ───────────────────────────────────────────────────────
+
+(deftest create-and-shape
+  (let [a (img/create 3 2 :argb)]
+    (is (img/image? a))
+    (is (not (img/image? {:type :argb})))
+    (is (= [3 2 :argb] [(img/width a) (img/height a) (img/image-type a)]))
+    (is (= (repeat 6 0) (img/pixels a)) "fresh :argb pixels are 0"))
+  (is (= (repeat 6 -16777216) (img/pixels (img/create 3 2 :rgb)))
+      "fresh :rgb pixels read 0xFF000000 (alpha forced)")
+  (testing "boundary: 1x1 is the smallest"
+    (is (= 1 (img/width (img/create 1 1 :rgb)))))
+  (testing "refusals, by name"
+    (is (= :invalid-dimensions (refusal #(img/create 0 1 :rgb))))
+    (is (= :invalid-dimensions (refusal #(img/create 1 0 :rgb))))
+    (is (= :invalid-dimensions (refusal #(img/create -1 5 :argb))))
+    (is (= :invalid-dimensions (refusal #(img/create 1.5 2 :argb))))
+    (is (= :invalid-dimensions (refusal #(img/create 65536 65536 :argb))) "more pixels than an int array holds")
+    (is (= :invalid-type (refusal #(img/create 2 2 :gray))))
+    (is (= :invalid-type (refusal #(img/create 2 2 nil))))))
+
+(deftest set-then-get
+  (let [a (img/create 2 2 :argb) r (img/create 2 2 :rgb)]
+    (is (nil? (img/set-rgb! a 1 1 0x12345678)))
+    (is (= 0x12345678 (img/get-rgb a 1 1)))
+    (testing "low 32 bits, signed"
+      (img/set-rgb! a 0 0 0xff0080ff)
+      (is (= -16744193 (img/get-rgb a 0 0)) "0xff0080ff as a long -> signed int")
+      (img/set-rgb! a 0 0 -1)
+      (is (= -1 (img/get-rgb a 0 0)))
+      (img/set-rgb! a 0 0 0x1ffffffff)
+      (is (= -1 (img/get-rgb a 0 0)) "bit 32 is dropped")
+      (img/set-rgb! a 0 0 0x100000000)
+      (is (= 0 (img/get-rgb a 0 0)) "exactly 2^32 wraps to 0")
+      (img/set-rgb! a 0 0 0x7fffffff)
+      (is (= 2147483647 (img/get-rgb a 0 0)))
+      (img/set-rgb! a 0 0 0x80000000)
+      (is (= -2147483648 (img/get-rgb a 0 0))))
+    (testing ":rgb keeps 24 bits and reads alpha 0xFF"
+      (img/set-rgb! r 1 0 0x00123456)
+      (is (= (unchecked-int* 0xff123456) (img/get-rgb r 1 0)))
+      (img/set-rgb! r 1 0 0x7f123456)
+      (is (= (unchecked-int* 0xff123456) (img/get-rgb r 1 0)) "alpha written is ignored")
+      (img/set-rgb! r 0 1 -1)
+      (is (= -1 (img/get-rgb r 0 1))))
+    (testing "bounds, by name"
+      (is (= :out-of-bounds (refusal #(img/get-rgb a 2 0))) "x = width")
+      (is (= :out-of-bounds (refusal #(img/get-rgb a 0 2))) "y = height")
+      (is (= :out-of-bounds (refusal #(img/get-rgb a -1 0))))
+      (is (= :out-of-bounds (refusal #(img/set-rgb! a 2 1 0))))
+      (is (= :out-of-bounds (refusal #(img/set-rgb! r 0 -1 0))))
+      (is (= 0x12345678 (img/get-rgb a 1 1)) "x = width-1, y = height-1 is inside"))
+    (is (= :invalid-argb (refusal #(img/set-rgb! a 0 0 1.5))))
+    (is (= :invalid-image (refusal #(img/get-rgb {:type :rgb :width 1 :height 1} 0 0))))))
+
+;; ── PNG round trip ───────────────────────────────────────────────────────────
+
+(defn- filled [w h type f]
+  (let [m (img/create w h type)]
+    (doseq [y (range h) x (range w)] (img/set-rgb! m x y (f x y)))
+    m))
+
+(deftest write-then-read
+  (doseq [type [:rgb :argb]]
+    (testing (name type)
+      (let [m (filled 7 5 type (fn [x y] (+ (* x 0x010203) (* y 0x3a0b0c0d) 0x80402010)))
+            bytes (img/write-png m)
+            u (->u bytes)
+            back (img/read-image bytes)]
+        (is #?(:clj (bytes? bytes) :cljs (instance? js/Int8Array bytes))
+            "byte[] on the JVM, Int8Array under kbb")
+        (is (= [137 80 78 71 13 10 26 10] (subvec u 0 8)))
+        (is (= (if (= type :rgb) 2 6) (nth u 25)) "IHDR colour type byte")
+        (is (= type (img/image-type back)))
+        (is (= (img/pixels m) (img/pixels back)) "every pixel")
+        (is (= (img/pixels m) (img/pixels (img/read-image u))) "a vector of bytes reads the same")))))
+
+(deftest files
+  (let [f (str (file/temp-file "kotoba-image" ".png"))
+        m (filled 4 3 :argb (fn [x y] (+ (* 40 x) (* 0x01000000 (* 60 y)))))]
+    (is (true? (img/write-png-file! m f)))
+    (is (= (img/pixels m) (img/pixels (img/read-file f))))
+    (file/delete-if-exists f)
+    (is (= :cannot-read (refusal #(img/read-file f))) "missing file")
+    (is (= f (:path (refusal-data #(img/read-file f)))))
+    (is (= :cannot-read (refusal #(img/read-file (str (file/temp-dir "kotoba-image")))))
+        "a directory")
+    (is (= :cannot-write (refusal #(img/write-png-file! m "/nonexistent-dir-kotoba-image/x.png"))))
+    (is (= :invalid-path (refusal #(img/read-file nil))))))
+
+;; ── what is not a PNG ────────────────────────────────────────────────────────
+
+(deftest not-an-image-is-nil
+  (is (nil? (img/read-image [])))
+  (is (nil? (img/read-image [104 101 108 108 111])))
+  (is (nil? (img/read-image [137 80 78 71 13 10 26])) "7 of the 8 signature bytes")
+  (is (nil? (img/read-image [0 0])) "WBMP header, no dimensions")
+  (is (nil? (img/read-image [0 0 0x88 0x00 1 1])) "WBMP width 1024: ImageIO's reader declines it"))
+
+(deftest other-formats-refuse-by-name
+  (is (= :unsupported-format (refusal #(img/read-image [0xFF 0xD8 0xFF 0xE0 0 0x10]))))
+  (is (= :jpeg (:format (refusal-data #(img/read-image [0xFF 0xD8])))))
+  (is (= :gif (:format (refusal-data #(img/read-image (mapv int* "GIF89a..."))))))
+  (is (= :gif (:format (refusal-data #(img/read-image (mapv int* "GIF87a"))))))
+  (is (nil? (img/read-image (mapv int* "GIF88a"))))
+  (is (= :bmp (:format (refusal-data #(img/read-image [0x42 0x4d 0 0])))))
+  (is (= :tiff (:format (refusal-data #(img/read-image [0x49 0x49 0x2a 0x00])))))
+  (is (= :tiff (:format (refusal-data #(img/read-image [0x4d 0x4d 0x00 0x2a])))))
+  (is (= :wbmp (:format (refusal-data #(img/read-image [0 0 0x87 0x7f 1 1]))))
+      "WBMP width 1023 is inside ImageIO's stream limit"))
+
+;; ── PNG kinds: literals measured against ImageIO ─────────────────────────────
+
+(deftest gray-goes-through-the-srgb-curve
+  (let [m (img/read-image (pngs/png-bytes {:width 3 :height 1 :color :gray :bits 8
+                                           :rows [[0 128 255]]}))]
+    (is (= :rgb (img/image-type m)))
+    (is (= [-16777216 (unchecked-int* 0xffbcbcbc) -1] (img/pixels m))
+        "128 reads back 0xBC, not 0x80")))
+
+(deftest sub-byte-gray-does-not
+  (let [m (img/read-image (pngs/png-bytes {:width 4 :height 1 :color :gray :bits 2
+                                           :rows [[0 1 2 3]]}))]
+    (is (= [-16777216 (unchecked-int* 0xff555555) (unchecked-int* 0xffaaaaaa) -1]
+           (img/pixels m)))))
+
+(deftest palette-with-trns
+  (let [m (img/read-image (pngs/png-bytes {:width 3 :height 1 :color :indexed :bits 8
+                                           :rows [[0 1 2]]
+                                           :before [["PLTE" [255 0 0, 0 255 0, 0 0 255]]
+                                                    ["tRNS" [128]]]}))]
+    (is (= :argb (img/image-type m)))
+    (is (= [(unchecked-int* 0x80ff0000) (unchecked-int* 0xff00ff00) (unchecked-int* 0xff0000ff)]
+           (img/pixels m)))))
+
+(deftest rgb16-rounds
+  (let [m (img/read-image (pngs/png-bytes {:width 3 :height 1 :color :rgb :bits 16
+                                           :rows [[0 128 65535, 32896 32895 257, 65534 1 32767]]}))]
+    (is (= :rgb (img/image-type m)))
+    (is (= [(unchecked-int* 0xff0000ff) (unchecked-int* 0xff808001) (unchecked-int* 0xffff007f)]
+           (img/pixels m)))))
+
+(deftest gray-trns-becomes-argb
+  (let [m (img/read-image (pngs/png-bytes {:width 2 :height 1 :color :gray :bits 8
+                                           :rows [[7 8]] :before [["tRNS" [0 7]]]}))]
+    (is (= :argb (img/image-type m)))
+    (is (= [(unchecked-int* 0x002e2e2e) (unchecked-int* 0xff323232)] (img/pixels m)))))
+
+(deftest pngs-that-refuse-by-name
+  (let [base {:width 2 :height 1 :color :rgb :bits 8 :rows [[1 2 3 4 5 6]]}]
+    (is (= :interlaced (:reason (refusal-data #(img/read-image (pngs/png-bytes (assoc base :interlace 1)))))))
+    (is (= :malformed (:reason (refusal-data #(img/read-image (pngs/png-bytes (assoc base :interlace 2)))))))
+    (is (= :invalid-bit-depth (:reason (refusal-data #(img/read-image (pngs/png-bytes (assoc base :bits 4 :rows [[1 2 3 4 5 6]])))))))
+    (is (= :missing-plte (:reason (refusal-data #(img/read-image (pngs/png-bytes {:width 1 :height 1 :color :indexed :bits 8 :rows [[0]]}))))))
+    (is (= :missing-plte (:reason (refusal-data #(img/read-image (pngs/png-bytes {:width 1 :height 1 :color :indexed :bits 8 :rows [[0]]
+                                                                                 :after [["PLTE" [1 2 3]]]})))))
+        "a PLTE after the first IDAT does not count")
+    (is (= :malformed (:reason (refusal-data #(img/read-image (subvec (pngs/png-bytes base) 0 40)))))
+        "truncated")
+    (is (= :unsupported-png (refusal #(img/read-image (pngs/png-bytes (assoc base :interlace 1))))))
+    (testing "the control: the same PNG, interlace 0, decodes"
+      (is (= [(unchecked-int* 0xff010203) (unchecked-int* 0xff040506)]
+             (img/pixels (img/read-image (pngs/png-bytes base))))))))
