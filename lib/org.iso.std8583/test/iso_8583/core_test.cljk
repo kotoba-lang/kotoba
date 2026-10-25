@@ -1,0 +1,271 @@
+(ns iso-8583.core-test
+  "Test vectors marked with a spec citation are structural facts of ISO
+  8583 transcribed from widely published field/MTI reference tables
+  (bit numbering, BCD nibble packing, the MTI digit breakdown, the
+  LL/LLL length disciplines) -- textbook material, not verbatim standard
+  text quoted from memory. Full message byte sequences are `constructed,
+  not a published spec vector` per this workspace's honesty rule: this
+  suite does not have confident, verifiable recall of an exact published
+  ISO 8583 wire dump, so it builds its own messages and proves them
+  correct by round trip and by hand-checked bit/nibble arithmetic rather
+  than by claiming to match a specification example it cannot cite."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [iso-8583.bcd :as bcd]
+            [iso-8583.bitmap :as bitmap]
+            [iso-8583.charcode :as cc]
+            [iso-8583.mti :as mti]
+            [iso-8583.fields :as fields]
+            [iso-8583.codec :as codec]))
+
+;; ---------------------------------------------------------------------
+;; BCD
+
+(deftest bcd-pack-unpack
+  (testing "even digit count -- two digits per byte, MSB nibble first"
+    (is (= [0x12 0x34] (bcd/pack-digits "1234")))
+    (is (= "1234" (bcd/unpack-digits [0x12 0x34] 4))))
+  (testing "odd digit count -- leading zero nibble pad (this codec's committed convention)"
+    (is (= [0x01 0x23] (bcd/pack-digits "123")))
+    (is (= "123" (bcd/unpack-digits [0x01 0x23] 3))))
+  (testing "single digit"
+    (is (= [0x05] (bcd/pack-digits "5")))
+    (is (= "5" (bcd/unpack-digits [0x05] 1))))
+  (testing "byte-count"
+    (is (= 1 (bcd/byte-count 1)))
+    (is (= 1 (bcd/byte-count 2)))
+    (is (= 2 (bcd/byte-count 3)))
+    (is (= 2 (bcd/byte-count 4))))
+  (testing "non-digit input is rejected, not silently mis-packed"
+    (is (nil? (bcd/pack-digits "12A4")))
+    (is (nil? (bcd/pack-digits ""))))
+  (testing "round trip over a corpus of digit strings -- constructed, not a published spec vector"
+    (doseq [digits ["0" "9" "00" "42" "123" "0000" "99999999999999999999"
+                     "1000000000000000" "007"]]
+      (is (= digits (bcd/unpack-digits (bcd/pack-digits digits) (count digits)))))))
+
+(deftest track2-pack-unpack
+  (testing "ISO/IEC 7813 track 2 nibble mapping -- constructed convention, see bcd.cljc docstring"
+    ;; "4012345=1220", 12 characters (even, no pad), nibble-paired:
+    ;; (4,0)(1,2)(3,4)(5,D)(1,2)(2,0) = 0x40 0x12 0x34 0x5D 0x12 0x20
+    (is (= [0x40 0x12 0x34 0x5D 0x12 0x20]
+           (bcd/pack-track2 "4012345=1220"))
+        "12 characters: 6 bytes, digits map to their own nibble, = maps to 0xD")
+    (is (= "4012345=1220" (bcd/unpack-track2 [0x40 0x12 0x34 0x5D 0x12 0x20] 12))))
+  (testing "round trip"
+    (doseq [t2 ["4111111111111111=29011010000012345"
+                "5" "12=34" "0000000000000000"]]
+      (is (= t2 (bcd/unpack-track2 (bcd/pack-track2 t2) (count t2))))))
+  (testing "invalid character rejected"
+    (is (nil? (bcd/pack-track2 "12X34")))))
+
+;; ---------------------------------------------------------------------
+;; Bitmap
+
+(deftest bitmap-bit-numbering
+  (testing "bit 1 is the MSB of byte 0 (ISO 8583 bitmap convention)"
+    (is (= [0x80 0 0 0 0 0 0 0] (bitmap/relative-fields->bytes #{1})))
+    (is (= #{1} (bitmap/bytes->relative-fields [0x80 0 0 0 0 0 0 0]))))
+  (testing "bit 64 is the LSB of byte 7"
+    (is (= [0 0 0 0 0 0 0 1] (bitmap/relative-fields->bytes #{64})))
+    (is (= #{64} (bitmap/bytes->relative-fields [0 0 0 0 0 0 0 1]))))
+  (testing "field 2 (PAN) and field 3 (processing code) present -- a common real bitmap pattern"
+    (is (= [0x60 0 0 0 0 0 0 0] (bitmap/relative-fields->bytes #{2 3}))))
+  (testing "round trip over random-ish field sets"
+    (doseq [fs [#{1} #{64} #{1 64} #{2 3 4 7 11 12 13} (set (range 1 65))]]
+      (is (= fs (bitmap/bytes->relative-fields (bitmap/relative-fields->bytes fs)))))))
+
+(deftest bitmap-hex-form
+  (let [bs (bitmap/relative-fields->bytes #{2 3 4 7 11 12 13 32 39 41 42 43 49})]
+    (is (= 16 (count (bitmap/bytes->hex bs))))
+    (is (= bs (bitmap/hex->bytes (bitmap/bytes->hex bs))))
+    (testing "lower-case hex accepted"
+      (is (= bs (bitmap/hex->bytes (str/lower (bitmap/bytes->hex bs))))))
+    (testing "wrong length or non-hex is rejected"
+      (is (nil? (bitmap/hex->bytes "ABC")))
+      (is (nil? (bitmap/hex->bytes "GGGGGGGGGGGGGGGG"))))))
+
+;; ---------------------------------------------------------------------
+;; MTI
+
+(deftest mti-decompose-recompose
+  (testing "0200: 1987, financial, request, acquirer -- a canonical ISO 8583 example"
+    (is (= {:version :1987 :class :financial :function :request :origin :acquirer}
+           (mti/decompose "0200"))))
+  (testing "0210: financial request *response*"
+    (is (= :request-response (:function (mti/decompose "0210")))))
+  (testing "0800/0810: network management request/response"
+    (is (= :network-management (:class (mti/decompose "0800"))))
+    (is (= :request-response (:function (mti/decompose "0810")))))
+  (testing "round trip over every assigned digit combination"
+    (doseq [v ["0" "1" "2" "8" "9"] c (map str (range 1 9)) f (map str (range 0 5)) o (map str (range 0 6))]
+      (let [code (str v c f o)]
+        (is (= code (mti/recompose (mti/decompose code)))))))
+  (testing "named errors"
+    (is (= [:error :iso8583/invalid-mti] (mti/decompose "02A0")))
+    (is (= [:error :iso8583/invalid-mti] (mti/decompose "020")))
+    (is (= [:error :iso8583/unknown-mti-component]
+           (mti/recompose {:version :not-a-real-version :class :financial
+                            :function :request :origin :acquirer})))))
+
+;; ---------------------------------------------------------------------
+;; Whole-message encode/decode
+
+(def sample-message
+  {:mti "0200"
+   :fields {2 "4111111111111111"
+            3 "000000"
+            4 "000000012345"
+            7 "0829120000"
+            11 "000001"
+            12 "120000"
+            13 "0829"
+            22 "051"
+            25 "00"
+            32 "12345"
+            35 "4111111111111111=29011010000012345"
+            37 "000000000001"
+            41 "TERM0001"
+            49 "840"}})
+
+(deftest message-round-trip-ascii-mti-hex-bitmap
+  (let [encoded (codec/encode-message sample-message fields/default-1987-fields)]
+    (is (vector? encoded) (str "encode failed: " (pr-str encoded)))
+    (is (= "0200" (apply str (map char (take 4 encoded)))) "MTI is ASCII")
+    (let [decoded (codec/decode-message encoded fields/default-1987-fields)]
+      (is (= sample-message decoded)))))
+
+(deftest message-round-trip-bcd-mti-binary-bitmap
+  (let [opts {:mti-encoding :bcd :bitmap-encoding :binary}
+        encoded (codec/encode-message sample-message fields/default-1987-fields opts)]
+    (is (vector? encoded))
+    (is (= [0x02 0x00] (take 2 encoded)) "MTI 0200 packed BCD")
+    (let [decoded (codec/decode-message encoded fields/default-1987-fields opts)]
+      (is (= sample-message decoded)))))
+
+(deftest message-with-secondary-bitmap
+  ;; field 102 (>64) forces the secondary bitmap; it's already in
+  ;; default-1987-fields, so no table modification needed for this test.
+  (let [msg {:mti "0800" :fields {3 "000000" 11 "000042" 102 "ACCT1"}}
+        encoded (codec/encode-message msg fields/default-1987-fields)]
+    (is (vector? encoded))
+    (testing "primary bit 1 is set (secondary bitmap present)"
+      (let [primary-hex (apply str (map char (subvec encoded 4 20)))
+            primary-bytes (bitmap/hex->bytes primary-hex)]
+        (is (contains? (bitmap/bytes->relative-fields primary-bytes) 1))))
+    (let [decoded (codec/decode-message encoded fields/default-1987-fields)]
+      (is (= msg decoded)))))
+
+(deftest message-with-tertiary-bitmap
+  (let [msg {:mti "0800" :fields {3 "000000" 11 "000042" 70 "301" 150 "AB"}}
+        table (assoc fields/default-1987-fields
+                      70 {:content-type :n :length-type :fixed :length 3 :encoding :bcd}
+                      150 {:content-type :an :length-type :fixed :length 2})
+        encoded (codec/encode-message msg table)]
+    (is (vector? encoded))
+    (let [decoded (codec/decode-message encoded table)]
+      (is (= msg decoded)))))
+
+;; ---------------------------------------------------------------------
+;; Randomised sweep over bitmap field-presence combinations
+
+(defn- rand-value
+  [{:keys [content-type length-type length]}]
+  (let [n (case length-type :fixed length (:llvar) (inc (rand-int 20)) (:lllvar) (inc (rand-int 30)))]
+    (case content-type
+      :n (apply str (repeatedly n #(rand-int 10)))
+      :z (apply str (repeatedly n #(rand-nth "0123456789")))
+      :b (vec (repeatedly n #(rand-int 256)))
+      (apply str (repeatedly n #(rand-nth "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "))))))
+
+(def sweepable-fields
+  ;; A fixed pool to sample subsets from -- every entry in
+  ;; `default-1987-fields` whose value this test can synthesize cheaply.
+  (vec (keys fields/default-1987-fields)))
+
+(deftest bitmap-presence-sweep
+  (testing "decode(encode(x)) == x over 200 random field-presence combinations"
+    (dotimes [trial 200]
+      (let [k (inc (rand-int (count sweepable-fields)))
+            chosen (take k (shuffle sweepable-fields))
+            field-map (into {} (map (fn [fnum]
+                                       [fnum (rand-value (get fields/default-1987-fields fnum))])
+                                     chosen))
+            msg {:mti (str (rand-nth "012") (rand-nth "12345678")
+                            (rand-nth "01234") (rand-nth "012345"))
+                 :fields field-map}
+            encoded (codec/encode-message msg fields/default-1987-fields)]
+        (is (vector? encoded)
+            (str "trial " trial " encode failed for fields " (pr-str chosen) ": " (pr-str encoded)))
+        (when (vector? encoded)
+          (let [decoded (codec/decode-message encoded fields/default-1987-fields)]
+            (is (= msg decoded)
+                (str "trial " trial " round trip mismatch for fields " (pr-str chosen)))))))))
+
+;; ---------------------------------------------------------------------
+;; Negative tests -- named errors, asserted by specific reason keyword
+
+(deftest negative-tests-named-errors
+  (testing "LLVAR content longer than 99 characters overflows the two-digit length prefix"
+    (let [table {2 {:content-type :n :length-type :llvar :encoding :ascii :len-encoding :ascii}}
+          too-long (apply str (repeat 100 "1"))]
+      (is (= [:error :iso8583/llvar-length-overflow]
+             (codec/encode-message {:mti "0200" :fields {2 too-long}} table)))))
+  (testing "LLLVAR content longer than 999 characters overflows the three-digit length prefix"
+    (let [table {2 {:content-type :an :length-type :lllvar :len-encoding :ascii}}
+          too-long (apply str (repeat 1000 "A"))]
+      (is (= [:error :iso8583/lllvar-length-overflow]
+             (codec/encode-message {:mti "0200" :fields {2 too-long}} table)))))
+  (testing "message truncated mid-field"
+    (let [table {3 {:content-type :n :length-type :fixed :length 6 :encoding :bcd}}
+          full (codec/encode-message {:mti "0200" :fields {3 "123456"}} table)
+          truncated (vec (butlast full))]
+      (is (= [:error :iso8583/message-too-short] (codec/decode-message truncated table)))))
+  (testing "message truncated inside the primary bitmap"
+    (let [table {}
+          bad (vec (concat (map cc/char-code "0200") (map cc/char-code "ABCDEF")))]
+      (is (= [:error :iso8583/bitmap-too-short] (codec/decode-message bad table)))))
+  (testing "invalid MTI on encode"
+    (is (= [:error :iso8583/invalid-mti]
+           (codec/encode-message {:mti "02A0" :fields {}} {}))))
+  (testing "invalid MTI on decode (not four ASCII digits)"
+    (is (= [:error :iso8583/invalid-mti]
+           (codec/decode-message (vec (concat (map cc/char-code "02A0") (map cc/char-code "0000000000000000")))
+                                  {}))))
+  (testing "unknown field present in bitmap but absent from the table"
+    (let [encoded (codec/encode-message {:mti "0200" :fields {}} {})
+          ;; hand-set bit 2 in the primary bitmap the encoder just produced,
+          ;; without giving field 2 a spec, so decode discovers a field the
+          ;; table cannot explain
+          hex "60000000000000" ;; will be overwritten below, kept for clarity
+          bitmap-bytes (bitmap/relative-fields->bytes #{2})
+          bitmap-hex (mapv cc/char-code (bitmap/bytes->hex bitmap-bytes))
+          bad (vec (concat (map cc/char-code "0200") bitmap-hex))]
+      (is (= [:error :iso8583/unknown-field] (codec/decode-message bad {})))))
+  (testing "fixed-length field value of the wrong length is rejected on encode"
+    (let [table {3 {:content-type :n :length-type :fixed :length 6 :encoding :bcd}}]
+      (is (= [:error :iso8583/fixed-length-mismatch]
+             (codec/encode-message {:mti "0200" :fields {3 "123"}} table)))))
+  (testing "reserved field numbers 1/65/129 cannot be supplied as data"
+    (is (= [:error :iso8583/reserved-field-number]
+           (codec/encode-message {:mti "0200" :fields {1 "x"}} {}))))
+  (testing "field number out of range 2..192"
+    (is (= [:error :iso8583/field-number-out-of-range]
+           (codec/encode-message {:mti "0200" :fields {999 "x"}} {}))))
+  (testing "invalid length digits (non-numeric LLVAR prefix)"
+    (let [table {2 {:content-type :an :length-type :llvar :len-encoding :ascii}}
+          bad (vec (concat (map cc/char-code "0200")
+                            (map cc/char-code (bitmap/bytes->hex (bitmap/relative-fields->bytes #{2})))
+                            (map cc/char-code "XY") (map cc/char-code "ab")))]
+      (is (= [:error :iso8583/invalid-length-digits] (codec/decode-message bad table))))))
+
+;; ---------------------------------------------------------------------
+;; Field spec validation
+
+(deftest field-spec-validation
+  (is (true? (fields/valid-spec? {:content-type :n :length-type :fixed :length 6 :encoding :bcd})))
+  (is (true? (fields/valid-spec? {:content-type :n :length-type :llvar :encoding :bcd :len-encoding :bcd})))
+  (is (false? (fields/valid-spec? {:content-type :zzz :length-type :fixed :length 6})))
+  (is (false? (fields/valid-spec? {:content-type :n :length-type :fixed})))
+  (is (false? (fields/valid-spec? {:content-type :n :length-type :llvar}))
+      "llvar/lllvar requires a valid :len-encoding"))

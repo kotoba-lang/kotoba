@@ -1,0 +1,342 @@
+(ns iso-8583.codec
+  "Whole-message ISO 8583 encode/decode: MTI, primary bitmap, optional
+  secondary and tertiary bitmaps, then every present data element in
+  ascending field-number order, each one self-delimiting via its own
+  length discipline (`iso-8583.fields`). There is no message-level length
+  prefix in front of any of this in the base standard -- a caller with a
+  length-prefixed transport (2-byte, 4-byte, ASCII, whatever the acquirer
+  uses) frames that separately, the way `iso-8583.mllp`-shaped concerns
+  belong outside a wire codec (see `hl7-v2.mllp` for the same separation
+  of concerns in this workspace's other v2 codec).
+
+  `field-table` is a required parameter to every function here, not a
+  built-in default silently applied -- see `iso-8583.fields`'s docstring
+  for why. There is no MLLP-equivalent module in this library: unlike HL7
+  v2 (see this workspace's `org-hl7-v2`), ISO 8583 has no single de facto
+  TCP framing -- acquirers use 2-byte, 4-byte or ASCII length prefixes
+  more or less interchangeably -- so that framing decision is left to the
+  caller rather than guessed at here."
+  (:require [kotoba.lang.coll :as set]
+            [iso-8583.bcd :as bcd]
+            [iso-8583.bitmap :as bitmap]
+            [iso-8583.charcode :as cc]
+            [iso-8583.mti :as mti]))
+
+(def default-options
+  {:mti-encoding :ascii
+   ;; :hex -- 16 ASCII hex characters per bitmap level (text-oriented
+   ;; carriers). :binary -- 8 raw bytes per level.
+   :bitmap-encoding :hex})
+
+(defn error?
+  [x]
+  (and (vector? x) (= 2 (count x)) (= :error (first x))))
+
+(defn- bind
+  "`result` is either `[:error reason]` or an n-tuple of successfully
+  decoded values (most often `[value next-pos]`). Propagates the error
+  unchanged, or applies `f` to the tuple's contents."
+  [result f]
+  (if (error? result) result (apply f result)))
+
+(defn- take-bytes
+  "`n` bytes of `bs` starting at `pos`, and the position after them, or
+  `nil` if fewer than `n` bytes remain."
+  [bs pos n]
+  (if (< (count bs) (+ pos n))
+    nil
+    [(subvec bs pos (+ pos n)) (+ pos n)]))
+
+(defn- format-len
+  "`n` as a zero-padded decimal string of exactly `width` digits."
+  [n width]
+  (let [s (str n)]
+    (str (apply str (repeat (max 0 (- width (count s))) "0")) s)))
+
+(defn- parse-int-str
+  [s]
+  #?(:clj (Integer/parseInt s)
+     :cljs (js/parseInt s 10)))
+
+;; ---------------------------------------------------------------------
+;; MTI
+
+(defn- encode-mti
+  "Returns `[mti-bytes]` (a 1-tuple, so `bind`'s `apply` hands the plain
+  byte vector to a single-argument continuation) or `[:error reason]`."
+  [mti-str encoding]
+  (if-not (mti/valid? mti-str)
+    [:error :iso8583/invalid-mti]
+    [(case encoding
+       :ascii (mapv cc/char-code mti-str)
+       :bcd (bcd/pack-digits mti-str))]))
+
+(defn- decode-mti
+  [bs pos encoding]
+  (let [n (case encoding :ascii 4 :bcd 2)]
+    (if-let [[chunk npos] (take-bytes bs pos n)]
+      (let [mti-str (case encoding
+                      :ascii (apply str (map char chunk))
+                      :bcd (bcd/unpack-digits chunk 4))]
+        (if (mti/valid? mti-str)
+          [mti-str npos]
+          [:error :iso8583/invalid-mti]))
+      [:error :iso8583/message-too-short])))
+
+;; ---------------------------------------------------------------------
+;; Bitmap levels
+
+(defn- encode-bitmap-level
+  [relative-field-set encoding]
+  (let [bs (bitmap/relative-fields->bytes relative-field-set)]
+    (case encoding
+      :binary bs
+      :hex (mapv cc/char-code (bitmap/bytes->hex bs)))))
+
+(defn- decode-bitmap-level
+  [bs pos encoding]
+  (let [n (case encoding :binary 8 :hex 16)]
+    (if-let [[chunk npos] (take-bytes bs pos n)]
+      (let [level-bytes (case encoding
+                           :binary chunk
+                           :hex (bitmap/hex->bytes (apply str (map char chunk))))]
+        (if (nil? level-bytes)
+          [:error :iso8583/invalid-bitmap-hex]
+          [(bitmap/bytes->relative-fields level-bytes) npos]))
+      [:error :iso8583/bitmap-too-short])))
+
+;; ---------------------------------------------------------------------
+;; Field content: content-type x encoding -> bytes, and back
+
+(defn- content-byte-length
+  [content-type n encoding]
+  (case content-type
+    :b n
+    :z (bcd/byte-count n)
+    :n (if (= encoding :bcd) (bcd/byte-count n) n)
+    n))
+
+(defn- encode-content
+  [content-type value encoding]
+  (case content-type
+    :b (when (and (sequential? value) (every? #(<= 0 % 255) value)) (vec value))
+    :z (bcd/pack-track2 value)
+    :n (case encoding
+         :bcd (bcd/pack-digits value)
+         :ascii (when (bcd/valid-digits? value) (mapv cc/char-code value))
+         nil)
+    (when (string? value) (mapv cc/char-code value))))
+
+(defn- decode-content
+  [content-type chunk n encoding]
+  (case content-type
+    :b (vec chunk)
+    :z (bcd/unpack-track2 chunk n)
+    :n (case encoding
+         :bcd (bcd/unpack-digits chunk n)
+         (apply str (map char chunk)))
+    (apply str (map char chunk))))
+
+;; ---------------------------------------------------------------------
+;; One field
+
+(defn- encode-field
+  "Returns `[content-bytes]` (a 1-tuple; see `encode-mti`) or
+  `[:error reason]`."
+  [spec value]
+  (let [{:keys [content-type length-type length encoding len-encoding]} spec]
+    (if (nil? value)
+      [:error :iso8583/missing-field-value]
+      (case length-type
+        :fixed
+        (let [content (encode-content content-type value encoding)]
+          (cond
+            (nil? content) [:error :iso8583/invalid-field-content]
+            (not= (count value) length) [:error :iso8583/fixed-length-mismatch]
+            :else [content]))
+
+        (:llvar :lllvar)
+        (let [n (count value)
+              max-n (if (= length-type :llvar) 99 999)
+              content (encode-content content-type value encoding)]
+          (cond
+            (nil? content) [:error :iso8583/invalid-field-content]
+            (> n max-n)
+            [:error (if (= length-type :llvar)
+                      :iso8583/llvar-length-overflow
+                      :iso8583/lllvar-length-overflow)]
+            :else
+            (let [width (if (= length-type :llvar) 2 3)
+                  len-digits (format-len n width)
+                  len-bytes (case len-encoding
+                              :ascii (mapv cc/char-code len-digits)
+                              :bcd (bcd/pack-digits len-digits))]
+              [(vec (concat len-bytes content))])))))))
+
+(defn- decode-field
+  [bs pos spec]
+  (let [{:keys [content-type length-type length encoding len-encoding]} spec]
+    (case length-type
+      :fixed
+      (let [byte-n (content-byte-length content-type length encoding)]
+        (if-let [[chunk npos] (take-bytes bs pos byte-n)]
+          [(decode-content content-type chunk length encoding) npos]
+          [:error :iso8583/message-too-short]))
+
+      (:llvar :lllvar)
+      (let [width (if (= length-type :llvar) 2 3)
+            prefix-bytes (case len-encoding
+                           :ascii width
+                           :bcd (bcd/byte-count width))]
+        (if-let [[pchunk ppos] (take-bytes bs pos prefix-bytes)]
+          (let [len-digits (case len-encoding
+                              :ascii (apply str (map char pchunk))
+                              :bcd (bcd/unpack-digits pchunk width))]
+            (if-not (bcd/valid-digits? len-digits)
+              [:error :iso8583/invalid-length-digits]
+              (let [n (parse-int-str len-digits)
+                    byte-n (content-byte-length content-type n encoding)]
+                (if-let [[chunk npos] (take-bytes bs ppos byte-n)]
+                  [(decode-content content-type chunk n encoding) npos]
+                  [:error :iso8583/message-too-short]))))
+          [:error :iso8583/message-too-short])))))
+
+;; ---------------------------------------------------------------------
+;; Whole message
+
+(def ^:private bitmap-indicator-fields #{1 65 129})
+
+(defn- validate-field-numbers
+  [present]
+  (cond
+    (seq (set/intersection present bitmap-indicator-fields))
+    [:error :iso8583/reserved-field-number]
+    (seq (remove #(<= 2 % 192) present))
+    [:error :iso8583/field-number-out-of-range]
+    :else nil))
+
+(defn encode-message
+  "`{:mti \"0200\" :fields {2 \"4111111111111111\" 3 \"000000\" ...}}` ->
+  a byte vector (ints 0..255), or `[:error <reason>]`. `field-table` is
+  required (see `iso-8583.fields`). `options` merges over
+  `default-options` (`:mti-encoding` `:ascii`/`:bcd`, `:bitmap-encoding`
+  `:hex`/`:binary`)."
+  ([message field-table] (encode-message message field-table {}))
+  ([{:keys [mti fields]} field-table options]
+   (let [{:keys [mti-encoding bitmap-encoding]} (merge default-options options)
+         fields (or fields {})
+         present (set (keys fields))]
+     (if-let [err (validate-field-numbers present)]
+       err
+       (bind (encode-mti mti mti-encoding)
+             (fn [mti-bytes]
+               (let [primary-data (set (filter #(<= 2 % 64) present))
+                     secondary-data (set (filter #(<= 65 % 128) present))
+                     tertiary-data (set (filter #(<= 129 % 192) present))
+                     has-tertiary? (seq tertiary-data)
+                     has-secondary? (or (seq secondary-data) has-tertiary?)
+                     primary-rel (cond-> (set primary-data) has-secondary? (conj 1))
+                     secondary-rel (when has-secondary?
+                                      (cond-> (set (map #(- % 64) secondary-data))
+                                        has-tertiary? (conj 1)))
+                     tertiary-rel (when has-tertiary? (set (map #(- % 128) tertiary-data)))
+                     primary-bm (encode-bitmap-level primary-rel bitmap-encoding)
+                     secondary-bm (when has-secondary? (encode-bitmap-level secondary-rel bitmap-encoding))
+                     tertiary-bm (when has-tertiary? (encode-bitmap-level tertiary-rel bitmap-encoding))
+                     header (vec (concat mti-bytes primary-bm
+                                          (or secondary-bm []) (or tertiary-bm [])))]
+                 ;; A plain loop/recur, not `bind` -- `recur` cannot cross
+                 ;; the closure boundary of a callback passed to a helper
+                 ;; function, only the lexically enclosing `loop`/`fn`.
+                 (loop [remaining (sort present) acc header]
+                   (if (empty? remaining)
+                     acc
+                     (let [fnum (first remaining)
+                           spec (get field-table fnum)]
+                       (if (nil? spec)
+                         [:error :iso8583/unknown-field]
+                         (let [result (encode-field spec (get fields fnum))]
+                           (if (error? result)
+                             result
+                             (let [[content] result]
+                               (recur (rest remaining) (vec (concat acc content)))))))))))))))))
+
+(defn- finish-decode
+  [mti-str primary-rel secondary-rel tertiary-rel bs pos field-table]
+  (let [primary-fields (disj primary-rel 1)
+        secondary-fields (when secondary-rel (set (map #(+ 64 %) (disj secondary-rel 1))))
+        tertiary-fields (when tertiary-rel (set (map #(+ 128 %) tertiary-rel)))
+        all-fields (sort (set/union primary-fields
+                                     (or secondary-fields #{})
+                                     (or tertiary-fields #{})))]
+    (loop [remaining all-fields pos pos acc {}]
+      (if (empty? remaining)
+        {:mti mti-str :fields acc}
+        (let [fnum (first remaining)
+              spec (get field-table fnum)]
+          (if (nil? spec)
+            [:error :iso8583/unknown-field]
+            (let [result (decode-field bs pos spec)]
+              (if (error? result)
+                result
+                (let [[value npos] result]
+                  (recur (rest remaining) npos (assoc acc fnum value)))))))))))
+
+(defn decode-message
+  "Inverse of `encode-message`: a byte vector -> `{:mti :fields}`, or
+  `[:error <reason>]`: `:iso8583/message-too-short`,
+  `:iso8583/bitmap-too-short`, `:iso8583/invalid-bitmap-hex`,
+  `:iso8583/invalid-mti`, `:iso8583/unknown-field`,
+  `:iso8583/invalid-length-digits`.
+
+  Reads the MTI, then the primary bitmap, then (only if primary bit 1 is
+  set) the secondary bitmap, then (only if secondary bit 1 is set) the
+  tertiary bitmap -- each level is decoded with its own error check
+  before the next is attempted, since a truncated or corrupt bitmap
+  makes every subsequent byte offset meaningless."
+  ([bs field-table] (decode-message bs field-table {}))
+  ([bs field-table options]
+   (let [{:keys [mti-encoding bitmap-encoding]} (merge default-options options)
+         bs (vec bs)
+         mti-result (decode-mti bs 0 mti-encoding)]
+     (if (error? mti-result)
+       mti-result
+       (let [[mti-str pos] mti-result
+             primary-result (decode-bitmap-level bs pos bitmap-encoding)]
+         (if (error? primary-result)
+           primary-result
+           (let [[primary-rel pos] primary-result]
+             (if-not (contains? primary-rel 1)
+               (finish-decode mti-str primary-rel nil nil bs pos field-table)
+               (let [secondary-result (decode-bitmap-level bs pos bitmap-encoding)]
+                 (if (error? secondary-result)
+                   secondary-result
+                   (let [[secondary-rel pos] secondary-result]
+                     (if-not (contains? secondary-rel 1)
+                       (finish-decode mti-str primary-rel secondary-rel nil bs pos field-table)
+                       (let [tertiary-result (decode-bitmap-level bs pos bitmap-encoding)]
+                         (if (error? tertiary-result)
+                           tertiary-result
+                           (let [[tertiary-rel pos] tertiary-result]
+                             (finish-decode mti-str primary-rel secondary-rel tertiary-rel
+                                            bs pos field-table))))))))))))))))
+
+;; ---------------------------------------------------------------------
+;; Human-readable hex round trip, for logs and test vectors
+
+(def ^:private hex-digits "0123456789ABCDEF")
+
+(defn bytes->hex
+  [bs]
+  (apply str (mapcat (fn [b]
+                        [(nth hex-digits (bit-and (unsigned-bit-shift-right b 4) 0xF))
+                         (nth hex-digits (bit-and b 0xF))])
+                      bs)))
+
+(defn hex->bytes
+  [s]
+  (when (and (string? s) (even? (count s)))
+    (vec (map (fn [[hi lo]]
+                #?(:clj (Integer/parseInt (str hi lo) 16)
+                   :cljs (js/parseInt (str hi lo) 16)))
+              (partition 2 s)))))
