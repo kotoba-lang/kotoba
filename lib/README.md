@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.comGoogleChat` | `kotoba.comGoogleChat/src` | `google-chat.client`, `google-chat.connector` (Kotoba project library) |
 | `kotoba.comGoogleCalendar` | `kotoba.comGoogleCalendar/src` | `google-calendar.connector` (Kotoba project library) |
 | `kotoba.bonsai` | `kotoba.bonsai/src` | `bonsai.b2-git`, `bonsai.delta`, `bonsai.git-codec`, `bonsai.git-object` (Kotoba project library) |
 | `kotoba.torihikiTerminal` | `kotoba.torihikiTerminal/src` | `torihiki-terminal.client`, `torihiki-terminal.config`, `torihiki-terminal.deploy`, `torihiki-terminal.keys` (Kotoba project library) |
