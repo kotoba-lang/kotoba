@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.comAviationIaArinc664` | `kotoba.comAviationIaArinc664/src` | `afdx.bag`, `afdx.bytes`, `afdx.ethernet`, `afdx.frame` (Kotoba project library) |
 | `kotoba.comAviationIaArinc429` | `kotoba.comAviationIaArinc429/src` | `arinc429.bcd`, `arinc429.bits`, `arinc429.bnr`, `arinc429.label` (Kotoba project library) |
 | `kotoba.comAppleTouchid` | `kotoba.comAppleTouchid/src` | `touchid.biometric` (Kotoba project library) |
 | `kotoba.comAppleFileprovider` | `kotoba.comAppleFileprovider/src` | `fileprovider.model` (Kotoba project library) |
