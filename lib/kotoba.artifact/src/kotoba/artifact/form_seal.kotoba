@@ -1,0 +1,177 @@
+;; Typed compiler metadata sealing. Canonical bytes and comparison rules are
+;; the owning core implementation below, with Form storage instead of guest
+;; documents. No seal or verifier predicate is replaced by successful data.
+(ns kotoba.artifact.form-seal
+  {:kotoba/export [canonical-bytes edn-safe seal sha256 valid-seal?]}
+  (:require [kotoba.artifact.data :as meta])
+  (:capabilities #{:hash/sha256}))
+
+;; This is the owning core's canonicalization: ordered map keys, comma-space
+;; map entries, shared-namespace lifting and list/set normalization are kept.
+;; Metadata uses typed Form storage; the original core API remains unchanged.
+;; String leaves currently retain its 64 KiB document scalar representation;
+;; native code belongs in bytes nodes, not a large string or one node per byte.
+(defn- item-at [v [:ref :form/r] i :i64] [:ref :form/r]
+     (option-value-of [:option [:ref :form/r]] (meta/value-vector-at v i) (meta/value-null)))
+
+(defn- list-item-at [l [:ref :form/r] i :i64] [:ref :form/r]
+     (option-value-of [:option [:ref :form/r]] (meta/value-list-at l i) (meta/value-null)))
+
+(defn- entry-at [m [:ref :form/r] i :i64] [:ref :form/r]
+     (option-value-of [:option [:ref :form/r]] (meta/value-map-entry-at m i) (meta/value-null)))
+
+(defn- string-of [d [:ref :form/r]] :string
+     (option-value-of [:option :string] (meta/value-string-value d) ""))
+
+;; A set's members as a vector, through its EDN text: `#{a b}` -> `[a b]`
+;; (the admitted document operations read a set only by membership; the same
+;; print/read pair lang/compat clojure.walk uses).
+(defn- set-items [s [:ref :form/r]] [:ref :form/r] (meta/value-as-vector s))
+
+;; The text item `i` of `v` sorts by: `v` is a vector of texts, or (`pair?`)
+;; of [sort-text key-text value-text] map entries.
+(defn- text-at [v [:ref :form/r] i :i64 pair? :bool] :string
+     (if pair?
+       (string-of (item-at (item-at v i) 0))
+       (string-of (item-at v i))))
+
+(defn- min-index [v [:ref :form/r] pair? :bool] :i64
+     (loop [i 1 best 0]
+       (if (< i (meta/value-count v))
+         (recur (+ i 1) (if (< (string-compare (text-at v i pair?) (text-at v best pair?)) 0) i best))
+         best)))
+
+;; Selection sort by text, stable (the first of equal texts is taken first),
+;; as `sort-by pr-str` and `sorted-map-by compare-on-pr-str` order them.
+(defn- sort-by-text [v [:ref :form/r] pair? :bool] [:ref :form/r]
+     (loop [rest-v v acc (meta/value-vector)]
+       (if (< 0 (meta/value-count rest-v))
+         (let [m (min-index rest-v pair?)]
+           (recur (meta/value-vector-remove rest-v m) (meta/value-vector-conj acc (item-at rest-v m))))
+         acc)))
+
+;; `sep`-joined texts of a vector of texts (`pair?`: "key-text value-text").
+(defn- join-texts [v [:ref :form/r] sep :string pair? :bool] :string
+     (loop [i 0 acc ""]
+       (if (< i (meta/value-count v))
+         (let [t (if pair?
+                   (string-concat (string-of (item-at (item-at v i) 1))
+                                  (string-concat " " (string-of (item-at (item-at v i) 2))))
+                   (text-at v i false))]
+           (recur (+ i 1) (if (= i 0) t (string-concat acc (string-concat sep t)))))
+         acc)))
+
+(defn- scalar-text [d [:ref :form/r]] :string
+     (let [kind (meta/value-kind d)]
+       (if (= :null kind)
+         "nil"
+         (if (= :i64 kind)
+           (string-from-i64 (option-value-of [:option :i64] (meta/value-i64-value d) 0))
+           (meta/value-edn-print d)))))
+
+;; The recursive group: canonical-text and the three container texts.
+(defn- items-text [d [:ref :form/r] kind :keyword] :string
+     (loop [i 0 acc (meta/value-vector)]
+       (if (< i (meta/value-count d))
+         (recur (+ i 1) (meta/value-vector-conj acc (meta/value-string
+                                                   (canonical-text (if (= :list kind) (list-item-at d i) (item-at d i))))))
+         (string-concat "[" (string-concat (join-texts (if (= :set kind) (sort-by-text acc false) acc) " " false) "]")))))
+
+;; A keyword or symbol key's namespace, from its printed text: `:a/b` and
+;; `a/b` -> "a"; "" for any other key or a key with no namespace.
+(defn- key-ns [kind :keyword text :string] :string
+     (let [start (if (= :keyword kind) 1 0)
+           slash (string-index-of text "/")]
+       (if (and (or (= :keyword kind) (= :symbol kind)) (< start slash))
+         (string-substring text start slash)
+         "")))
+
+;; The key's text with its namespace taken off (`:a/b` -> `:b`, `a/b` -> `b`).
+(defn- key-strip [kind :keyword text :string] :string
+     (let [rest-text (string-substring text (+ (string-index-of text "/") 1) (string-length text))]
+       (if (= :keyword kind) (string-concat ":" rest-text) rest-text)))
+
+;; The namespace every key shares, or "" when they do not all share one.
+;; ClojureScript's printer (nbb prints with *print-namespace-maps* true, the
+;; runtime the compiler's digests are taken on) then writes `#:ns{..}` with
+;; the keys stripped -- `lift-ns` in cljs.core -- in the order of the
+;; UNSTRIPPED keys (measured: `{:a/b 1 a/*x* 2}` prints `#:a{:b 1, *x* 2}`).
+;; The JVM prints `{:ns/k ..}`: the two hosts differ on such a map, and this
+;; follows nbb.
+(defn- shared-ns [d [:ref :form/r]] :string
+     (loop [i 0 ns ""]
+       (if (< i (meta/value-count d))
+         (let [k (item-at (entry-at d i) 0)
+               kind (meta/value-kind k)
+               this (key-ns kind (if (or (= :keyword kind) (= :symbol kind)) (meta/value-edn-print k) ""))]
+           (if (= 0 (string-length this))
+             ""
+             (if (or (= i 0) (= 0 (string-compare ns this)))
+               (recur (+ i 1) this)
+               "")))
+         ns)))
+(defn- map-text [d [:ref :form/r]] :string
+     (let [ns (shared-ns d)
+           lift? (< 0 (string-length ns))]
+       (loop [i 0 acc (meta/value-vector)]
+         (if (< i (meta/value-count d))
+           (let [e (entry-at d i)
+                 k (item-at e 0)
+                 kt (canonical-text k)]
+             (recur (+ i 1) (meta/value-vector-conj acc (-> (meta/value-vector)
+      (meta/value-vector-conj (meta/value-string kt))
+      (meta/value-vector-conj (meta/value-string (if lift? (key-strip (meta/value-kind k) kt) kt)))
+      (meta/value-vector-conj (meta/value-string (canonical-text (item-at e 1))))))))
+           (string-concat (if lift? (string-concat "#:" ns) "")
+                          (string-concat "{" (string-concat (join-texts (sort-by-text acc true) ", " true) "}")))))))
+
+(defn edn-safe [x [:ref :form/r]] [:ref :form/r] x)
+
+(defn- canonical-text
+     "`(pr-str (canonical x))` of the host reading, over a document."
+     [d [:ref :form/r]] :string
+     (let [kind (meta/value-kind d)]
+       (if (= :map kind)
+         (map-text d)
+         (if (= :set kind)
+           (items-text (set-items d) :set)
+           (if (= :vector kind)
+             (items-text d :vector)
+             (if (= :list kind)
+               (items-text d :list)
+               (scalar-text d)))))))
+
+(defn sha256 [value [:ref :form/r]] :string
+     (typed-cap-call :hash/sha256 :string :string (canonical-text value)))
+
+(defn canonical-bytes [value [:ref :form/r]] :bytes
+     (string-to-utf8 (canonical-text value)))
+
+(defn seal [artifact [:ref :form/r]] [:ref :form/r]
+     (let [payload (meta/value-dissoc artifact (meta/value-keyword :sha256))]
+       (meta/value-assoc payload (meta/value-keyword :sha256) (meta/value-string (sha256 payload)))))
+
+;; Constant-time hex-digest comparison -- `MessageDigest/isEqual` on the
+;; JVM, `node:crypto`'s `timingSafeEqual` on Node (both fixed-length
+;; 64-char sha256 hex, so the length precondition `timingSafeEqual`
+;; requires always holds for two genuine digests; a length mismatch means
+;; `(:sha256 artifact)` was never a real digest to begin with, so failing
+;; that check the same way a mismatch would is the correct outcome, not a
+;; bypass).
+(defn- digest-equal?
+     "Constant-time equality of two digest texts over their UTF-8 bytes: every
+     byte is read whatever the first difference, as timingSafeEqual does."
+     [a :string b :string] :bool
+     (let [x (string-to-utf8 a) y (string-to-utf8 b)]
+       (if (= (bytes-count x) (bytes-count y))
+         (loop [i 0 diff 0]
+           (if (< i (bytes-count x))
+             (recur (+ i 1) (bit-or diff (bit-xor (bytes-at x i) (bytes-at y i))))
+             (= diff 0)))
+         false)))
+
+(defn valid-seal? [artifact [:ref :form/r]] :bool
+     (let [claimed (option-value-of [:option [:ref :form/r]] (meta/value-get artifact (meta/value-keyword :sha256)) (meta/value-null))]
+       (if (= :string (meta/value-kind claimed))
+         (digest-equal? (string-of claimed) (sha256 (meta/value-dissoc artifact (meta/value-keyword :sha256))))
+         false)))

@@ -1,0 +1,193 @@
+;; Canonical whole ELF64 record encoder boundary. Pure source candidate.
+;; Integers retain their full signed/unsigned width domain via explicit u64 limbs.
+(ns kotoba.object.elf64
+  {:kotoba/export [encode-header encode-program-header encode-rela encode-section-header encode-symbol little-endian pad-to]}
+  (:schemas
+   {:kotoba.object.elf64/number
+    [:record :kotoba.object.elf64/number [[:kind :keyword] [:low :i64] [:high :i64]]]
+    :kotoba.object.elf64/result
+    [:record :kotoba.object.elf64/result [[:bytes :vector-i64] [:error :keyword] [:field :keyword]]]}))
+
+(defn- ok [bytes :vector-i64] [:ref :kotoba.object.elf64/result]
+  (record-new [:ref :kotoba.object.elf64/result] bytes :ok :none))
+(defn- fail [error :keyword field :keyword] [:ref :kotoba.object.elf64/result]
+  (record-new [:ref :kotoba.object.elf64/result] (vector-alloc 0) error field))
+(defn- good? [result [:ref :kotoba.object.elf64/result]] :bool
+  (= (record-get [:ref :kotoba.object.elf64/result] result :error) :ok))
+(defn- lookup [m :document key :keyword] :document
+  (if (not= (document-kind m) :map) (document-null)
+    (loop [index 0]
+      (if (>= index (document-count m)) (document-null)
+        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))
+              k (option-value-of [:option :document] (document-vector-at pair 0) (document-null))]
+          (if (document-equal? k (document-keyword key))
+            (option-value-of [:option :document] (document-vector-at pair 1) (document-null)) (recur (+ index 1))))))))
+(defn- has? [m :document key :keyword] :bool
+  (if (not= (document-kind m) :map) false
+    (loop [index 0]
+      (if (>= index (document-count m)) false
+        (let [pair (option-value-of [:option :document] (document-map-entry-at m index) (document-null))]
+          (if (document-equal? (option-value-of [:option :document] (document-vector-at pair 0) (document-null))
+                              (document-keyword key)) true (recur (+ index 1))))))))
+(defn- field [m :document key :keyword fallback :document] :document
+  (if (has? m key) (lookup m key) fallback))
+(defn- item [v :document index :i64] :document
+  (option-value-of [:option :document] (document-vector-at v index) (document-null)))
+(defn- i64-of [d :document] :i64 (option-value-of [:option :i64] (document-i64-value d) -1))
+(defn- key-of [d :document] :keyword (option-value-of [:option :keyword] (document-keyword-value d) :none))
+(defn- options [d :document] :document (if (= (document-kind d) :null) (document-map) d))
+(defn- truthy? [d :document] :bool
+  (and (not= (document-kind d) :null) (not (document-equal? d (document-bool false)))))
+
+;; Ordinary documents cover every i64. {:elf64/u64 [low32 high32]} covers
+;; the entire unsigned 64-bit range without promotion or floating point.
+(defn- number [d :document] [:ref :kotoba.object.elf64/number]
+  (if (= (document-kind d) :i64) (record-new [:ref :kotoba.object.elf64/number] :signed (i64-of d) 0)
+    (let [limbs (lookup d :elf64/u64) low (item limbs 0) high (item limbs 1)]
+      (if (and (= (document-kind d) :map) (= (document-count d) 1)
+               (= (document-kind limbs) :vector) (= (document-count limbs) 2)
+               (= (document-kind low) :i64) (= (document-kind high) :i64)
+               (>= (i64-of low) 0) (<= (i64-of low) 4294967295)
+               (>= (i64-of high) 0) (<= (i64-of high) 4294967295))
+        (record-new [:ref :kotoba.object.elf64/number] :unsigned (i64-of low) (i64-of high))
+        (record-new [:ref :kotoba.object.elf64/number] :invalid 0 0)))))
+(defn- fits? [n [:ref :kotoba.object.elf64/number] width :i64] :bool
+  (let [kind (record-get [:ref :kotoba.object.elf64/number] n :kind)
+        low (record-get [:ref :kotoba.object.elf64/number] n :low)
+        high (record-get [:ref :kotoba.object.elf64/number] n :high)
+        minimum (case width 1 -128 2 -32768 4 -2147483648 0)
+        maximum (case width 1 255 2 65535 4 4294967295 0)]
+    (cond
+      (= kind :signed) (or (= width 8) (and (>= low minimum) (<= low maximum)))
+      (= kind :unsigned) (or (= width 8) (and (= high 0) (<= low maximum)))
+      :else false)))
+(defn- number-byte [n [:ref :kotoba.object.elf64/number] index :i64] :i64
+  (let [unsigned? (= (record-get [:ref :kotoba.object.elf64/number] n :kind) :unsigned)
+        value (if (and unsigned? (>= index 4))
+                (record-get [:ref :kotoba.object.elf64/number] n :high)
+                (record-get [:ref :kotoba.object.elf64/number] n :low))
+        shift (* 8 (if (and unsigned? (>= index 4)) (- index 4) index))]
+    (bit-and (u64-shift-right value shift) 255)))
+
+(defn little-endian [value :document width :i64] [:ref :kotoba.object.elf64/result]
+  (let [n (number value)]
+    (cond
+      (not (or (= width 1) (= width 2) (= width 4) (= width 8))) (fail :integer-width :width)
+      (= (record-get [:ref :kotoba.object.elf64/number] n :kind) :invalid) (fail :integer-shape :value)
+      (not (fits? n width)) (fail :integer-range :value)
+      :else (loop [index 0 bytes (vector-alloc 0)]
+              (if (= index width) (ok bytes)
+                (recur (+ index 1) (vector-conj bytes (number-byte n index))))))))
+(defn pad-to [bytes :vector-i64 size :i64] [:ref :kotoba.object.elf64/result]
+  (cond
+    (< size 0) (fail :padding-size :size)
+    (> (vector-count bytes) size) (fail :padding-too-small :size)
+    :else
+    (let [valid? (loop [index 0]
+                   (if (>= index (vector-count bytes)) true
+                     (let [byte (vector-at bytes index)]
+                       (if (and (>= byte 0) (<= byte 255)) (recur (+ index 1)) false))))]
+      (if (not valid?) (fail :invalid-byte :bytes)
+        (loop [index (vector-count bytes) out bytes]
+          (if (= index size) (ok out) (recur (+ index 1) (vector-conj out 0))))))))
+
+(defn- join [a :vector-i64 b :vector-i64] :vector-i64
+  (loop [index 0 out a]
+    (if (>= index (vector-count b)) out (recur (+ index 1) (vector-conj out (vector-at b index))))))
+(defn- append-field [out [:ref :kotoba.object.elf64/result] value :document width :i64 key :keyword]
+  [:ref :kotoba.object.elf64/result]
+  (if (not (good? out)) out
+    (let [encoded (little-endian value width)]
+      (if (not (good? encoded)) (fail (record-get [:ref :kotoba.object.elf64/result] encoded :error) key)
+        (ok (join (record-get [:ref :kotoba.object.elf64/result] out :bytes)
+                  (record-get [:ref :kotoba.object.elf64/result] encoded :bytes)))))))
+(defn- enum-id [kind :keyword value :keyword] :i64
+  (case kind
+    :object (case value :relocatable 1 :executable 2 :shared 3 :core 4 -1)
+    :machine (case value :x86-64 62 :aarch64 183 -1)
+    :program (case value :null 0 :load 1 :dynamic 2 :interpreter 3 :note 4 :program-header 6 :tls 7 -1)
+    :section (case value :null 0 :progbits 1 :symtab 2 :strtab 3 :rela 4 :nobits 8 -1) -1))
+(defn- nonnegative? [n [:ref :kotoba.object.elf64/number]] :bool
+  (or (= (record-get [:ref :kotoba.object.elf64/number] n :kind) :unsigned)
+      (and (= (record-get [:ref :kotoba.object.elf64/number] n :kind) :signed)
+           (>= (record-get [:ref :kotoba.object.elf64/number] n :low) 0))))
+(defn- enum-field [out [:ref :kotoba.object.elf64/result] value :document kind :keyword width :i64 key :keyword]
+  [:ref :kotoba.object.elf64/result]
+  (if (not (good? out)) out
+    (if (= (document-kind value) :keyword)
+      (let [id (enum-id kind (key-of value))]
+        (if (< id 0) (fail :unknown-enum key) (append-field out (document-i64 id) width key)))
+      (if (nonnegative? (number value)) (append-field out value width key) (fail :unknown-enum key)))))
+(defn- zero-number? [d :document] :bool
+  (let [n (number d)]
+    (and (not= (record-get [:ref :kotoba.object.elf64/number] n :kind) :invalid)
+         (= (record-get [:ref :kotoba.object.elf64/number] n :low) 0)
+         (= (record-get [:ref :kotoba.object.elf64/number] n :high) 0))))
+(defn- ident [] :vector-i64
+  (loop [index 0 out (vector-alloc 0)]
+    (if (= index 16) out
+      (recur (+ index 1) (vector-conj out (case index 0 127 1 69 2 76 3 70 4 2 5 1 6 1 0))))))
+
+(defn encode-header [input :document] [:ref :kotoba.object.elf64/result]
+  (let [opts (options input) zero (document-i64 0)]
+    (if (not= (document-kind opts) :map) (fail :options-shape :options)
+      (let [count (field opts :program-header-count zero)]
+        (-> (ok (ident))
+            (enum-field (field opts :type (document-null)) :object 2 :type)
+            (enum-field (field opts :machine (document-null)) :machine 2 :machine)
+            (append-field (document-i64 1) 4 :version)
+            (append-field (field opts :entry zero) 8 :entry)
+            (append-field (field opts :program-header-offset zero) 8 :program-header-offset)
+            (append-field (field opts :section-header-offset zero) 8 :section-header-offset)
+            (append-field zero 4 :flags) (append-field (document-i64 64) 2 :header-size)
+            (append-field (document-i64 (if (zero-number? count) 0 56)) 2 :program-header-entry-size)
+            (append-field count 2 :program-header-count)
+            (append-field (document-i64 64) 2 :section-header-entry-size)
+            (append-field (field opts :section-header-count zero) 2 :section-header-count)
+            (append-field (field opts :section-name-index zero) 2 :section-name-index))))))
+(defn encode-program-header [input :document] [:ref :kotoba.object.elf64/result]
+  (let [opts (options input) zero (document-i64 0)]
+    (if (not= (document-kind opts) :map) (fail :options-shape :options)
+      (let [virtual (field opts :virtual-address zero) physical (field opts :physical-address (document-null))]
+        (-> (ok (vector-alloc 0)) (enum-field (field opts :type (document-keyword :load)) :program 4 :type)
+            (append-field (field opts :flags zero) 4 :flags)
+            (append-field (field opts :offset zero) 8 :offset)
+            (append-field virtual 8 :virtual-address)
+            (append-field (if (truthy? physical) physical virtual) 8 :physical-address)
+            (append-field (field opts :file-size zero) 8 :file-size)
+            (append-field (field opts :memory-size zero) 8 :memory-size)
+            (append-field (field opts :alignment zero) 8 :alignment))))))
+(defn encode-section-header [input :document] [:ref :kotoba.object.elf64/result]
+  (let [opts (options input) zero (document-i64 0)]
+    (if (not= (document-kind opts) :map) (fail :options-shape :options)
+      (-> (ok (vector-alloc 0)) (append-field (field opts :name-offset zero) 4 :name-offset)
+          (enum-field (field opts :type (document-keyword :null)) :section 4 :type)
+          (append-field (field opts :flags zero) 8 :flags)
+          (append-field (field opts :address zero) 8 :address)
+          (append-field (field opts :offset zero) 8 :offset)
+          (append-field (field opts :size zero) 8 :size)
+          (append-field (field opts :link zero) 4 :link)
+          (append-field (field opts :info zero) 4 :info)
+          (append-field (field opts :alignment zero) 8 :alignment)
+          (append-field (field opts :entry-size zero) 8 :entry-size)))))
+(defn- relocation-type? [d :document] :bool
+  (let [n (number d)] (and (nonnegative? n) (fits? n 4))))
+(defn encode-rela [input :document] [:ref :kotoba.object.elf64/result]
+  (let [opts (options input) zero (document-i64 0) type (field opts :type (document-null))]
+    (cond
+      (not= (document-kind opts) :map) (fail :options-shape :options)
+      (not (relocation-type? type)) (fail :relocation-type :type)
+      :else
+      ;; r_info is emitted as low type32 then high symbol32, never a wide product.
+      (-> (ok (vector-alloc 0)) (append-field (field opts :offset zero) 8 :offset)
+          (append-field type 4 :type) (append-field (field opts :symbol-index zero) 4 :symbol-index)
+          (append-field (field opts :addend zero) 8 :addend)))))
+(defn encode-symbol [input :document] [:ref :kotoba.object.elf64/result]
+  (let [opts (options input) zero (document-i64 0)]
+    (if (not= (document-kind opts) :map) (fail :options-shape :options)
+      (-> (ok (vector-alloc 0)) (append-field (field opts :name-offset zero) 4 :name-offset)
+          (append-field (field opts :info zero) 1 :info)
+          (append-field (field opts :other zero) 1 :other)
+          (append-field (field opts :section-index zero) 2 :section-index)
+          (append-field (field opts :value zero) 8 :value)
+          (append-field (field opts :size zero) 8 :size)))))

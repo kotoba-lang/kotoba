@@ -12,19 +12,16 @@ encoder, `kotoba.object.pe32plus`, a validated PE32+ record/image encoder, and
 Backends supply target decisions as data and use the returned byte vectors when
 assembling a complete image.
 
-```clojure
-(require '[kotoba.object.elf64 :as elf64])
-
-(elf64/encode-header
- {:type :executable
-  :machine :x86-64
-  :entry 0x401000
-  :program-header-offset 64
-  :program-header-count 2
-  :section-header-offset 0x3000
-  :section-header-count 4
-  :section-name-index 3})
-```
+The canonical ELF64 source candidate is `src/kotoba/object/elf64.kotoba`.
+Its seven public functions return explicit bytes/error/field records. Read
+[the complete API and migration record](docs/elf64-kotoba-port.md) before
+connecting a native consumer; native admission and byte/refusal qualification
+remain open.
+The complete PE32+ candidate is `src/kotoba/object/pe32plus.kotoba`, with
+shared natural-number arithmetic in `unsigned.kotoba`;
+see [the PE32+ API and source record](docs/pe32plus-kotoba-port.md).
+The complete Mach-O candidate is `src/kotoba/object/macho64.kotoba`;
+see [the Mach-O API and source record](docs/macho64-kotoba-port.md).
 
 ## Boundary
 
@@ -40,14 +37,24 @@ assembling a complete image.
 The Mach-O contract emits compact ARM64 and x86-64 `MH_OBJECT` files with typed
 sections, symbols, external relocations, and platform build-version metadata.
 
-## Development
+## Canonical native migration
 
+Tracking is [JUN-201](https://linear.app/kotobalabs/issue/JUN-201) and
+[JUN-200](https://linear.app/kotobalabs/issue/JUN-200) in Kotoba Labs.
 Canonical source, build and CDCI are migrating to Kotoba / Amu selfhost.
-The old Clojure/JVM workflow and its CLJK compatibility-loader prerequisite
-are retired. Complete object encoders and their positive/refusal/resource
-corpus still need canonical integration and native qualification; no native
-gate is activated or declared successful here. The old hosted sources and
-drivers remain migration inventory, not a required final oracle.
+The target build/execution/CI closure is Kotoba / Amu selfhost only.
+The obsolete JVM/Clojure compatibility-loader workflow is removed from this
+candidate; its remote state was already disabled manually, and its CLJK
+compatibility-loader prerequisite is retired. No replacement
+native gate is claimed until the complete compiler/consumer closure exists;
+no native gate is activated or declared successful here.
+
+ELF64 includes every public record encoder, integer range and bounded padding.
+The PE32+ and Mach-O candidates cover their complete image/object boundaries.
+Whole-component native admission, Definition CIDs,
+byte/refusal behavior, consumer API integration and reviewed pins remain open.
+Existing hosted sources and drivers remain migration inventory, not a
+required final oracle.
 
 See [native CDCI retirement](docs/native-cdci-retirement.md) for the exact
 source/blob provenance, unchanged corpus and open acceptance. Historical
