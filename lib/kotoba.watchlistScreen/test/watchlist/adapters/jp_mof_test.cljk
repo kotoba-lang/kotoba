@@ -1,0 +1,111 @@
+(ns watchlist.adapters.jp-mof-test
+  (:require [watchlist.test-fixtures :as fixtures]
+            [clojure.edn :as edn]
+            [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is]]
+            [csv.core :as csv]
+            [watchlist.adapters.jp-mof :as mof]
+            [watchlist.model :as model]))
+
+;; test/fixtures/jp_mof_sample.csv carries the REAL header row of the live
+;; MOF file (that row is schema, and drift in it is the thing this suite has
+;; to catch) with fabricated names in every data row -- never real
+;; designated-person data. It keeps the live file's BOM and CRLF endings.
+(def fixture (fixtures/slurp-text "lib/kotoba.watchlistScreen/test/fixtures/jp_mof_sample.csv"))
+
+(defn- entity-by-id [parsed id]
+  (first (filter #(= id (:entity/id %)) (:entities parsed))))
+
+(deftest fixture-header-still-matches-the-columns-the-adapter-names
+  ;; The adapter addresses columns by their Japanese header string. If MOF
+  ;; renames or reorders one, every `field` lookup returns "" and the parse
+  ;; silently yields entities with no aliases, no DOB and no nationality --
+  ;; a smaller, quieter list, not an error. This is the assertion that turns
+  ;; that into a failure. Its limit is honest and worth stating: it compares
+  ;; the adapter against the FIXTURE, so it catches drift only once someone
+  ;; refreshes the fixture from the live file.
+  (let [header (-> fixture (str/replace #"^﻿" "") csv/read-csv first)]
+    (is (= mof/header header))
+    (is (= 32 (count header)))))
+
+(deftest parse-counts-rows-entities-and-skips-separately
+  (let [r (mof/parse fixture {:source-published-at "2026-08-20"})]
+    (is (= 5 (:row-count r)))
+    (is (= 3 (:entity-count r)))
+    (is (= 2 (:skipped-rows r)))
+    (is (= "2026-08-20" (:source-published-at r)))
+    (is (every? model/valid-entity? (:entities r)))
+    (is (every? #(= :jp-mof (:entity/source %)) (:entities r)))))
+
+(deftest parse-without-a-published-at-yields-nil-not-today
+  ;; A fetch date is not a publication date. The CSV has no generation
+  ;; timestamp, so absent an explicit one this must report that it does not
+  ;; know -- never substitute the clock, which would make every snapshot
+  ;; look freshly published by the source.
+  (is (nil? (:source-published-at (mof/parse fixture)))))
+
+(deftest entity-row-splits-aliases-across-both-scripts
+  (let [e (entity-by-id (mof/parse fixture) "jp-mof:002-900001")]
+    (is (= :entity (:entity/type e)))
+    (is (= "EXAMPLE HOLDINGS" (:entity/primary-name e)))
+    (is (= ["レイジツ・ホールディングス" "レイジツHD" "例示商会"
+            "EXAMPLE HD" "Example Trading Co" "FORMER EXAMPLE LTD"]
+           (:entity/aliases e)))
+    (is (= ["MOF-KUBUN-2"] (:entity/programs e)))
+    (is (= "2001.10.12 2012.3.27改訂" (:entity/source-updated-at e)))))
+
+(deftest a-quoted-field-containing-the-separator-does-not-shift-later-columns
+  ;; Row 2's 出生地（英語） is "Sample City, Republic of Example" -- one field
+  ;; holding one comma. A split-on-comma reader turns it into two, every
+  ;; column after it shifts left by one, and 国籍（英語） comes back holding
+  ;; the birthplace's tail instead. Asserting on nationality rather than on
+  ;; birthplace is deliberate: birthplace is not carried into the entity, so
+  ;; only a LATER column can show the shift.
+  (let [e (entity-by-id (mof/parse fixture) "jp-mof:029-900002")]
+    (is (= ["Republic of Example"] (:entity/nationality e)))
+    (is (= "1970/1/2" (:entity/dob e)))))
+
+(deftest a-row-with-no-english-name-uses-the-japanese-one-as-primary
+  (let [e (entity-by-id (mof/parse fixture) "jp-mof:005-900003")]
+    (is (= "ヤマダ・ジロウ" (:entity/primary-name e)))
+    ;; and it is not also repeated as its own alias
+    (is (= [] (:entity/aliases e)))))
+
+(deftest an-unrecognised-person-or-entity-value-is-skipped-not-defaulted
+  ;; Fixture row 4 carries 個人・団体 = 法人格なき社団, a value MOF does not
+  ;; currently use. Mapping an unknown value onto :entity "because most rows
+  ;; are" would file it under a type nobody assigned it.
+  (let [r (mof/parse fixture)]
+    (is (nil? (entity-by-id r "jp-mof:005-900004")))
+    (is (nil? (get mof/entity-type-labels "法人格なき社団")))))
+
+(deftest a-row-with-no-number-is-skipped
+  (let [ids (set (map :entity/id (:entities (mof/parse fixture))))]
+    (is (not (contains? ids "jp-mof:")))
+    (is (= 3 (count ids)))))
+
+(deftest latest-csv-link-picks-the-newest-and-refuses-to-guess
+  (let [html (str "<a href=\"./shisantouketsu20250110.csv\">old</a>"
+                  "<a href=\"./shisantouketsu20260820.csv\">new</a>"
+                  "<a href=\"./shisantouketsu20260415.csv\">mid</a>")]
+    (is (= {:url (str "https://www.mof.go.jp/policy/international_policy/gaitame_kawase/"
+                      "gaitame/economic_sanctions/shisantouketsu20260820.csv")
+            :published-at "2026-08-20"}
+           (mof/latest-csv-link html))))
+  ;; nil, not a remembered URL: a page that stopped carrying the link must
+  ;; fail the refresh loudly rather than re-fetch one frozen snapshot forever.
+  (is (nil? (mof/latest-csv-link "<a href=\"./something-else.pdf\">x</a>")))
+  (is (nil? (mof/latest-csv-link ""))))
+
+(deftest the-committed-snapshot-is-real-and-internally-consistent
+  ;; Against the actual data this repo ships, not the fixture. An evidence
+  ;; floor rather than a shape check: a snapshot that failed to write, or
+  ;; wrote an empty vector, must not pass as "no problems found".
+  (let [entities (edn/read-string (fixtures/slurp-text "lib/kotoba.watchlistScreen/resources/watchlist/lists/jp-mof.entities.edn"))
+        manifest (edn/read-string (fixtures/slurp-text "lib/kotoba.watchlistScreen/resources/watchlist/lists/jp-mof.manifest.edn"))]
+    (is (< 2000 (count entities)) "the MOF list has thousands of entries; a small count means a broken write")
+    (is (= (count entities) (:manifest/entity-count manifest)))
+    (is (= :jp-mof (:manifest/source manifest)))
+    (is (every? model/valid-entity? entities))
+    (is (= (count entities) (count (distinct (map :entity/id entities)))))
+    (is (re-matches #"\d{4}-\d{2}-\d{2}" (:manifest/source-published-at manifest)))))

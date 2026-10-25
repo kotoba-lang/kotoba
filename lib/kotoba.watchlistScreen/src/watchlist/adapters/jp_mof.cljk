@@ -1,0 +1,164 @@
+(ns watchlist.adapters.jp-mof
+  "Japan Ministry of Finance 資産凍結等対象者一覧 (consolidated asset-freeze
+   target list) CSV -> watchlist.model entities.
+
+   Schema verified against the actual live file fetched during this ns's
+   development -- https://www.mof.go.jp/policy/international_policy/
+   gaitame_kawase/gaitame/economic_sanctions/shisantouketsu20260820.csv,
+   UTF-8 with a BOM, 32 columns, 2,866 rows -- not reconstructed from
+   memory. See test/fixtures/jp_mof_sample.csv for a schema-faithful
+   fixture (real header row, fabricated names).
+
+   WHY THIS SOURCE. The MOF list is the only one of the three this repo
+   ingests that is published under Japanese law (外為法 / the Foreign
+   Exchange and Foreign Trade Act) and the only one that carries Japanese
+   orthography for its subjects. It is NOT a 反社会的勢力 (organised-crime)
+   database: no such list is published in machine-readable form by any
+   Japanese authority, and this repository must not be described as
+   screening for one. It is an asset-freeze / economic-sanctions list, the
+   same subject as OFAC SDN and the UN Consolidated List.
+
+   THE URL MOVES. MOF encodes the publication date in the filename
+   (shisantouketsu<YYYYMMDD>.csv) and does not keep a stable alias, so a
+   hardcoded URL either 404s or -- worse -- keeps serving one frozen
+   snapshot forever while every refresh reports success. `latest-csv-link`
+   reads the index page and finds the newest one; it is pure so it can be
+   tested, and the fetching stays in scripts/refresh_lists.cljk."
+  (:require [kotoba.lang.text :as str]
+            [csv.core :as csv]
+            [watchlist.model :as model]))
+
+(def index-url
+  "https://www.mof.go.jp/policy/international_policy/gaitame_kawase/gaitame/economic_sanctions/list.html")
+
+(def ^:private base-url
+  "https://www.mof.go.jp/policy/international_policy/gaitame_kawase/gaitame/economic_sanctions/")
+
+(defn latest-csv-link
+  "Find the newest shisantouketsu<YYYYMMDD>.csv link in the MOF index page's
+   HTML. -> {:url absolute-url :published-at \"YYYY-MM-DD\"} or nil.
+
+   Returns nil rather than a guessed URL when the page carries no such link
+   at all: a refresh that cannot find today's file must fail loudly, not
+   fall back to a stale one it happens to remember."
+  ([html] (latest-csv-link html base-url))
+  ([html base]
+   (let [dates (->> (re-seq #"shisantouketsu(\d{8})\.csv" (str html))
+                    (map second)
+                    distinct
+                    sort)]
+     (when-let [d (last dates)]
+       {:url (str base "shisantouketsu" d ".csv")
+        :published-at (str (subs d 0 4) "-" (subs d 4 6) "-" (subs d 6 8))}))))
+
+;; --- column names, exactly as the live file's header row spells them -----
+;; Held as vars rather than inlined so a header-drift test can assert the
+;; whole set against the fixture in one place (see jp_mof_test).
+
+(def header
+  ["区分" "番号" "告示日付" "告示番号" "個人・団体"
+   "氏名（日本語）" "氏名（英語）"
+   "別名・別称（日本語）" "別名・別称（英語）"
+   "旧称（日本語）" "旧称（英語）"
+   "確定に十分でない別名（日本語）" "確定に十分でない別名（英語）"
+   "称号（日本語）" "称号（英語）" "役職（日本語）" "役職（英語）"
+   "生年月日" "出生地（日本語）" "出生地（英語）"
+   "国籍（日本語）" "国籍（英語）"
+   "旅券番号" "身分証番号"
+   "住所・所在地（国）（日本語）" "住所・所在地（都市その他の情報）（日本語）"
+   "住所・所在地（国）（英語）" "住所・所在地（都市その他の情報）（英語）"
+   "国連参照番号" "リスト掲載日" "その他の情報" "外務省告示情報"])
+
+(def ^:private alias-columns
+  ["氏名（日本語）"
+   "別名・別称（日本語）" "別名・別称（英語）"
+   "旧称（日本語）" "旧称（英語）"
+   "確定に十分でない別名（日本語）" "確定に十分でない別名（英語）"])
+
+(def entity-type-labels
+  "The 個人・団体 column's two values. An unrecognised value is NOT mapped to
+   a default -- see `parse`'s :skipped-rows."
+  {"個人" :individual "団体" :entity})
+
+(defn- strip-bom
+  "Drop a leading U+FEFF. The MOF file has one, and csv/read-maps would
+   otherwise key its first column as BOM+区分 -- a header name that
+   compares unequal to 区分 everywhere, silently, forever."
+  [s]
+  (if (and (seq s) (= \uFEFF (first s))) (subs s 1) s))
+
+(defn- field [row col] (str/trim (str (get row col ""))))
+
+(defn- split-aliases
+  "MOF separates multiple aliases inside one cell with '；'/';'. Splitting on
+   the separator is the whole job -- the parenthesised (a)(b)(c) enumeration
+   MOF uses in the prose 外務省告示情報 column does NOT appear in these
+   columns (checked against the live file), so there is nothing else to peel."
+  [s]
+  (->> (str/split (str s) #"[;；]")
+       (map str/trim)
+       (remove str/blank?)))
+
+(defn row->entity
+  "One CSV row map -> a watchlist.model entity, or nil if the row carries no
+   usable identity (blank 番号, blank on both name columns, or an
+   unrecognised 個人・団体 value).
+
+   `:entity/primary-name` is the ENGLISH name. Measured on the live file, 0
+   of 2,866 rows lack one, so this is not a lossy preference in practice --
+   and it keeps every MOF entity reachable through the same Latin path OFAC
+   and UN entities use. The Japanese name is carried as the first alias, so
+   a Japanese-script query still matches it directly (see
+   watchlist.match/normalize's script fold, which exists for this)."
+  [row]
+  (let [id (field row "番号")
+        en (field row "氏名（英語）")
+        ja (field row "氏名（日本語）")
+        type-label (field row "個人・団体")
+        etype (get entity-type-labels type-label)
+        primary (if (seq en) en ja)]
+    (when (and (seq id) (seq primary) etype)
+      (model/entity (str "jp-mof:" id) :jp-mof
+                    {:type etype
+                     :primary-name primary
+                     :aliases (into [] (comp (mapcat #(split-aliases (field row %)))
+                                             (remove #(= % primary))
+                                             (distinct))
+                                    alias-columns)
+                     :dob (not-empty (field row "生年月日"))
+                     :nationality (or (seq (split-aliases (field row "国籍（英語）")))
+                                      (seq (split-aliases (field row "国籍（日本語）")))
+                                      [])
+                     ;; 区分 groups rows by which 外務省告示 they were listed
+                     ;; under. MOF publishes no legend for these codes in the
+                     ;; machine-readable file, so the code is carried opaque
+                     ;; rather than given an invented label -- a caller can
+                     ;; group by it, and nobody can mistake it for a program
+                     ;; name it was never given.
+                     :programs (remove str/blank? [(when-let [k (not-empty (field row "区分"))]
+                                                     (str "MOF-KUBUN-" k))])
+                     :source-updated-at (not-empty (field row "告示日付"))}))))
+
+(defn parse
+  "MOF consolidated CSV string -> {:entities [...] :source-published-at str
+   :entity-count int :row-count int :skipped-rows int}.
+
+   `:source-published-at` is NOT derivable from the file -- the CSV has no
+   generation timestamp column -- so it is passed in from the filename the
+   link discovery resolved (`latest-csv-link`). Omitting it yields nil
+   rather than today's date: a fetch date is not a publication date and
+   this must not quietly conflate them.
+
+   `:row-count` and `:skipped-rows` are reported separately from
+   `:entity-count` so a row this adapter could not read is visible as a
+   skip instead of arriving as a silently smaller list."
+  ([csv-str] (parse csv-str {}))
+  ([csv-str {:keys [source-published-at]}]
+   (let [rows (csv/read-maps (strip-bom (str csv-str)))
+         rows (remove (fn [r] (every? str/blank? (vals r))) rows)
+         entities (into [] (keep row->entity) rows)]
+     {:entities entities
+      :source-published-at source-published-at
+      :entity-count (count entities)
+      :row-count (count rows)
+      :skipped-rows (- (count rows) (count entities))})))
