@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.connector` | `kotoba.connector/src` | `connector.auth`, `connector.consent`, `connector.declare`, `connector.invoke` (Kotoba project library) |
 | `kotoba.comBackblazeSecure` | `kotoba.comBackblazeSecure/src` | `com-backblaze-secure.audit`, `com-backblaze-secure.b2-cli`, `com-backblaze-secure.config`, `com-backblaze-secure.credentials` (Kotoba project library) |
 | `kotoba.cloudMurakumoStudio` | `kotoba.cloudMurakumoStudio/src` | `murakumo-studio.client`, `murakumo-studio.desktop`, `murakumo-studio.engine`, `murakumo-studio.fleet` (Kotoba project library) |
 | `kotoba.cloudFilecoin` | `kotoba.cloudFilecoin/src` | `filecoin.cloud.chain`, `filecoin.cloud.evm`, `filecoin.cloud.pay`, `filecoin.cloud.pdp` (Kotoba project library) |
