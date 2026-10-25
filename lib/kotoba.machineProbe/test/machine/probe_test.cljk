@@ -1,0 +1,116 @@
+(ns machine.probe-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [machine.core :as m]
+            [machine.probe :as p]))
+
+(def m1max
+  "Captured from the machine this library was written on:
+  `sysctl -a | rg '^(hw\\.|machdep\\.cpu\\.brand_string)'`."
+  (slurp (io/resource "sysctl-m1max.txt")))
+
+(def probed (p/from-darwin-sysctl m1max))
+
+;; ── parsing ──────────────────────────────────────────────────────────────
+
+(deftest sysctl-lines-without-a-separator-are-dropped-not-guessed
+  (let [s (p/parse-sysctl "hw.pagesize: 16384\nnot a pair\nhw.ncpu: 10\n: leading\n")]
+    (is (= {"hw.pagesize" "16384" "hw.ncpu" "10"} s))))
+
+;; ── the real machine ─────────────────────────────────────────────────────
+
+(deftest the-descriptor-validates
+  (is (m/valid? probed) (pr-str (m/validation-errors probed)))
+  (is (= :measured (:machine/provenance probed)))
+  (is (= "sysctl -a (Darwin)" (:machine/source probed))))
+
+(deftest two-numbers-that-break-the-portable-floor
+  (testing "128-byte lines, not 64 — every padding and tiling answer changes"
+    (is (= 128 (m/line-bytes probed)))
+    (is (= 64 (m/line-bytes m/portable-64))))
+  (testing "16 KiB pages, not 4 — a page cache sized in 4 KiB units is wrong here"
+    (is (= 16384 (m/page-bytes probed)))
+    (is (= 4096 (m/page-bytes m/portable-64)))))
+
+(deftest the-machine-is-heterogeneous-and-says-so
+  (is (m/heterogeneous? probed))
+  (is (= [:performance :efficiency] (mapv :id (m/clusters probed))))
+  (testing "asking for a capacity without naming a cluster is an error, because
+            there is no single answer"
+    (is (thrown? js/Error
+                 (m/private-cache-bytes probed 2 :unified)))))
+
+(deftest each-cluster-answers-differently-which-is-the-whole-point
+  (let [pc (m/for-cluster probed :performance)
+        ec (m/for-cluster probed :efficiency)]
+    (testing "performance: 8 cores, 128 KiB L1d, 12 MiB L2 shared by four"
+      (is (= 8 (get-in pc [:cpu :cores])))
+      (is (= 131072 (m/cache-bytes pc 1 :data)))
+      (is (= 12582912 (m/cache-bytes pc 2 :unified)))
+      (is (= 3145728 (m/private-cache-bytes pc 2 :unified))))
+    (testing "efficiency: 2 cores, 64 KiB L1d, 4 MiB L2 shared by two"
+      (is (= 2 (get-in ec [:cpu :cores])))
+      (is (= 65536 (m/cache-bytes ec 1 :data)))
+      (is (= 2097152 (m/private-cache-bytes ec 2 :unified))))
+    (testing "a tile sized for one cluster is 1.5x the other — planning for
+              'the machine' would have been wrong for half of it"
+      (is (= 3 (quot (* 2 (m/private-cache-bytes pc 2 :unified))
+                     (m/private-cache-bytes ec 2 :unified)))))
+    (testing "and each view is an ordinary flat descriptor every planner takes"
+      (is (m/valid? pc))
+      (is (not (m/heterogeneous? pc))))))
+
+(deftest ways-are-absent-because-macos-does-not-report-them
+  (testing "not filled with the 8 that most caches happen to use"
+    (is (every? #(nil? (:ways %)) (m/caches probed))))
+  (testing "and the descriptor is still valid — the contract bent to the
+            machine rather than the reading bending to the contract"
+    (is (m/valid? probed))))
+
+(deftest neon-is-detected-not-assumed
+  (is (= {:name :neon :width-bits 128} (get-in probed [:cpu :simd])))
+  (testing "four f32 lanes, two f64"
+    (is (= 4 (m/simd-lanes probed 4)))
+    (is (= 2 (m/simd-lanes probed 8)))))
+
+(deftest a-single-perflevel-machine-gets-a-flat-cache-not-clusters
+  (let [flat (p/from-darwin-sysctl
+              (str "machdep.cpu.brand_string: Fake CPU\n"
+                   "hw.ncpu: 4\nhw.cachelinesize: 64\nhw.pagesize: 4096\n"
+                   "hw.nperflevels: 1\nhw.optional.arm64: 0\n"
+                   "hw.perflevel0.l1dcachesize: 32768\n"
+                   "hw.perflevel0.l2cachesize: 262144\n"
+                   "hw.perflevel0.cpusperl2: 1\n"))]
+    (is (m/valid? flat))
+    (is (not (m/heterogeneous? flat)))
+    (is (= 262144 (m/private-cache-bytes flat 2 :unified)))))
+
+(deftest an-unreadable-machine-fails-here-not-three-layers-down
+  (is (thrown? js/Error
+               (p/probe {:platform :windows :run (fn [& _] "")})))
+  (testing "a probe that misreads is caught by validation before it escapes"
+    (is (thrown? js/Error
+                 (p/probe {:platform :darwin
+                           :run (fn [& _] "hw.cachelinesize: 100\nhw.nperflevels: 1\nhw.perflevel0.l1dcachesize: 1\nhw.perflevel0.cpusperl2: 1\n")})))))
+
+;; ── linux ────────────────────────────────────────────────────────────────
+
+(deftest linux-keeps-the-ways-it-can-actually-read
+  (let [files {"cpu0/cache/index0/size" "32K"
+               "cpu0/cache/index0/level" "1"
+               "cpu0/cache/index0/type" "Data"
+               "cpu0/cache/index0/coherency_line_size" "64"
+               "cpu0/cache/index0/ways_of_associativity" "8"
+               "cpu0/cache/index0/shared_cpu_list" "0"
+               "cpu0/cache/index1/size" "1M"
+               "cpu0/cache/index1/level" "2"
+               "cpu0/cache/index1/type" "Unified"
+               "cpu0/cache/index1/coherency_line_size" "64"
+               "cpu0/cache/index1/ways_of_associativity" "16"
+               "cpu0/cache/index1/shared_cpu_list" "0,1"}
+        d (p/from-linux-sysfs files {:cores 8 :page-bytes 4096})]
+    (is (m/valid? d) (pr-str (m/validation-errors d)))
+    (is (= 8 (:ways (m/cache-at d 1 :data))))
+    (is (= 1048576 (m/cache-bytes d 2 :unified)))
+    (testing "two cores share that L2, so a private share is half"
+      (is (= 524288 (m/private-cache-bytes d 2 :unified))))))

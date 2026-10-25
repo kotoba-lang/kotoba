@@ -1,0 +1,104 @@
+(ns machine.calibrate-cli
+  "`kbb -M:calibrate` — measure the roofline's constants, then test it.
+
+  `layout/achievable-ratio` was reported as agreeing with measurement twice on
+  2026-08-03. Neither agreement meant anything: the loop floor came from the
+  candidate arm and the bandwidth from the baseline arm, so the formula
+  returned their ratio by construction. This is the test that was owed.
+
+  Three steps, in an order that matters:
+
+  1. measure the loop floor on an L1-resident array, where memory is free;
+  2. measure the bandwidth on a line-strided scan of a 45 MiB array, where the
+     loop is amortised over a whole cache line per touch;
+  3. **predict a configuration neither measurement touched**, then run it.
+
+  Step 3 is the only part that can fail. Steps 1 and 2 use array sizes, strides
+  and element widths that step 3 does not, so the constants cannot encode the
+  answer.
+
+  It did fail, first time, by 65% — and the failure was step 2's fault, not the
+  model's. Bandwidth was measured with a contiguous f64 sum, whose iteration
+  touches 8 bytes and costs 0.77 ns, capping it at 10.4 GB/s: the loop floor
+  wearing different units. The strided scan puts the memory system back in
+  charge and reports 30.1 GB/s, and the prediction then lands within 19%.
+
+  A prediction that misses is the useful outcome either way — it is either the
+  model that is wrong or the calibration, and both are worth knowing."
+  (:require [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [layout.core :as l]
+            [machine.bench :as b]
+            [machine.core :as m]
+            [machine.probe :as p]))
+
+(defn- platform []
+  (let [os (str/lower (System/getProperty "os.name" ""))]
+    (cond (str/includes? os "mac") :darwin
+          (str/includes? os "linux") :linux
+          :else :unknown)))
+
+(defn- mean [xs] (/ (reduce + 0.0 xs) (count xs)))
+
+(defn -main [& args]
+  (let [reps (or (some-> (first args) parse-long) 25)
+        probed (p/probe {:platform (platform)
+                         :run (fn [cmd cmd-args] (:out (apply shell/sh cmd cmd-args)))})
+        mach (if (m/heterogeneous? probed) (m/for-cluster probed :performance) probed)
+        floor (b/loop-floor-ns {:warmup 5 :reps (max 5 (quot reps 3))})
+        bw (b/bandwidth-bytes-per-ns mach {:warmup 10 :reps reps})
+        loop-ns (:ns-per-element floor)
+        bps (:bytes-per-ns bw)]
+    (println (:machine/id mach) "· line" (m/line-bytes mach) "B")
+    (println)
+    (println "constants, measured independently of anything predicted below:")
+    (println (format "  loop floor    %.3f ns/element  (%d elements = %d B, L1-resident)"
+                     loop-ns (:elements floor) (:working-set-bytes floor)))
+    (println (format "  bandwidth     %.1f GB/s          (%d elements = %d MiB, line-strided)"
+                     bps (:elements bw) (quot (:working-set-bytes bw) 1048576)))
+    (println)
+    ;; The held-out configuration: eight doubles per element, four million of
+    ;; them. Neither constant was measured at this width or this size.
+    (let [n 4000000
+          width 8
+          fields (b/fields-of width)
+          access {:access/fields #{:f0} :access/stride 1}
+          roof (l/achievable-ratio mach {:baseline (l/aos mach fields)
+                                         :candidate (l/soa mach fields)
+                                         :n n :access access
+                                         :loop-ns-per-element loop-ns
+                                         :bandwidth-bytes-per-ns bps})
+          pred-aos (get-in roof [:baseline :time-ns])
+          pred-soa (get-in roof [:candidate :time-ns])
+          _ (println (format "PREDICTION for %d elements x %d doubles (never measured):" n width))
+          _ (println (format "  AoS %8.3f ms   SoA %8.3f ms   ratio %5.2fx   both-memory-bound? %s"
+                             (/ pred-aos 1e6) (/ pred-soa 1e6)
+                             (:achievable-ratio roof) (:both-memory-bound? roof)))
+          _ (println)
+          r (b/run-unrolled mach {:n n :width width :warmup 15 :reps reps})
+          act-aos (mean (get-in r [:unrolled :aos]))
+          act-soa (mean (get-in r [:unrolled :soa]))
+          err (fn [p a] (* 100.0 (- (/ a p) 1.0)))]
+      (println "MEASURED:")
+      (println (format "  AoS %8.3f ms   SoA %8.3f ms   ratio %5.2fx"
+                       (/ act-aos 1e6) (/ act-soa 1e6) (/ act-aos act-soa)))
+      (println)
+      (println (format "  AoS error %+6.1f%%   SoA error %+6.1f%%   ratio error %+6.1f%%"
+                       (err pred-aos act-aos) (err pred-soa act-soa)
+                       (err (:achievable-ratio roof) (/ act-aos act-soa))))
+      (println)
+      (let [worst (apply max (map #(Math/abs ^double %)
+                                  [(err pred-aos act-aos) (err pred-soa act-soa)]))]
+        (println
+         (cond
+           (< worst 25.0)
+           (str "=> the model predicted a configuration it had never seen, within "
+                (Math/round worst) "%. That is a test it could have failed.")
+           (< worst 60.0)
+           (str "=> right order of magnitude, " (Math/round worst)
+                "% out. Usable as a ceiling, not as an estimate.")
+           :else
+           (str "=> off by " (Math/round worst)
+                "%. The model does not predict this machine; treat :cost/lines"
+                " as a bytes count and nothing more.")))))
+    (flush)))

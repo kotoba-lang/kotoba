@@ -1,0 +1,103 @@
+(ns machine.tiling-cli
+  "`kbb -M:tiling` — is `traversal/tile-plan`'s tile the fast one?
+
+  The plan picks a tile that *fits* a named cache level. Fitting and being
+  fastest are different claims, and after the roofline result the default
+  assumption has to be that a model may be arithmetically right about bytes
+  while answering a question the machine does not ask.
+
+  So this sweeps tile widths with loop order and everything else held fixed,
+  marks where the plan pointed, and puts the best tile against the unblocked
+  arm through `perfgate`. The verdict is gated on the points, not read off the
+  means — the mistake the scaling CLI made first time round."
+  (:require [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [machine.bench :as b]
+            [machine.core :as m]
+            [machine.probe :as p]
+            [perfgate.core :as g]
+            [traversal.core :as t]))
+
+(defn- platform []
+  (let [os (str/lower (System/getProperty "os.name" ""))]
+    (cond (str/includes? os "mac") :darwin
+          (str/includes? os "linux") :linux
+          :else :unknown)))
+
+(defn- mean [xs] (/ (reduce + 0.0 xs) (count xs)))
+(defn- ms [ns] (/ (Math/round (/ (double ns) 1000.0)) 1000.0))
+
+(defn -main [& args]
+  (let [n (or (some-> (first args) parse-long) 768)
+        reps (or (some-> (second args) parse-long) 5)
+        probed (p/probe {:platform (platform)
+                         :run (fn [cmd cmd-args] (:out (apply shell/sh cmd cmd-args)))})
+        mach (if (m/heterogeneous? probed) (m/for-cluster probed :performance) probed)
+        plan-of (fn [lvl kind]
+                  (t/tile-plan mach {:extents [n n] :element-bytes 8 :arrays 3
+                                     :level lvl :kind kind}))
+        l1 (plan-of 1 :data)
+        l2 (plan-of 2 :unified)
+        predicted #{(:tile/size l1) (:tile/size l2)}
+        ;; Pilot first. A sweep whose best effect is under the noise floor
+        ;; cannot produce a qualifying result however long it runs, and
+        ;; learning that after twenty minutes of matmul is the expensive way.
+        pilot (b/run-tiling {:n (max 128 (quot n 4)) :warmup 1 :reps 5
+                             :tiles [(:tile/size l2) (max 128 (quot n 4))]})
+        pilot-obs (fn [id pt] (g/observation
+                               {:id id :plan-id :blocked-matmul :machine mach
+                                :metric :wall-ns :unit :ns :samples (:samples pt)
+                                :source "machine.bench/run-tiling pilot"}))
+        power (g/detectable? (pilot-obs :blocked (first (:points pilot)))
+                             (pilot-obs :unblocked (second (:points pilot)))
+                             0.10)
+        r (b/run-tiling {:n n :warmup 2 :reps reps})
+        flops (:flops r)
+        points (:points r)
+        best (apply min-key #(mean (:samples %)) points)
+        unblocked (last points)]
+    (println (:machine/id mach) "· line" (m/line-bytes mach) "B ·"
+             "L1d" (m/cache-bytes mach 1 :data) "B · L2 private"
+             (m/private-cache-bytes mach 2 :unified) "B")
+    (println "blocked ikj matmul, n =" n "· 3 operands ·"
+             (Math/round (/ (* 8.0 n n) 1048576.0)) "MiB per matrix")
+    (println "traversal/tile-plan says: L1d ->" (:tile/size l1)
+             "· L2 ->" (:tile/size l2))
+    (println (format "pilot: minimum detectable improvement here is %.0f%% — a 10%% effect is %s"
+                     (* 100.0 (:minimum-detectable power))
+                     (if (:detectable? power) "detectable" "NOT detectable")))
+    (when-not (:detectable? power)
+      (println "       " (:remedy power)))
+    (println)
+    (println (format "%-8s %10s %10s %8s  %s" "tile" "ms" "GFLOP/s" "vs best" "note"))
+    (doseq [{:keys [tile samples]} points]
+      (let [mu (mean samples)]
+        (println (format "%-8s %10s %10.2f %7.2fx  %s"
+                         (if (>= tile n) (str tile " (none)") (str tile))
+                         (ms mu)
+                         (/ flops mu)
+                         (/ mu (mean (:samples best)))
+                         (str (when (predicted tile) "<- tile-plan ")
+                              (when (= tile (:tile best)) "<- fastest"))))))
+    (println)
+    (let [o (fn [id s] (g/observation {:id id :plan-id :blocked-matmul :machine mach
+                                       :metric :wall-ns :unit :ns :samples s
+                                       :source (str "machine.bench/run-tiling n=" n)}))
+          v (g/qualify (o :blocked (:samples best)) (o :unblocked (:samples unblocked)))]
+      (doseq [line (g/explain v)] (println line))
+      (println)
+      (let [best-tile (:tile best)
+            hit? (predicted best-tile)
+            near? (some #(<= 0.5 (/ (double best-tile) %) 2.0) predicted)]
+        (println
+         (cond
+           (not (:qualified? v))
+           (str "=> INCONCLUSIVE: the blocked-vs-unblocked comparison did not qualify,"
+                " so the sweep's shape has no standing either.")
+           hit? (str "=> tile-plan's tile IS the fastest (" best-tile ").")
+           near? (str "=> tile-plan pointed at " (str/join "/" (sort predicted))
+                      ", fastest measured " best-tile " — within 2x, same regime.")
+           :else (str "=> tile-plan pointed at " (str/join "/" (sort predicted))
+                      ", fastest measured " best-tile " — MORE than 2x off."
+                      " The capacity rule is not selecting for speed here.")))))
+    (flush)))
