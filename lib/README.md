@@ -182,6 +182,7 @@ The bundled standard libraries live in this repository:
 | `org.dnp.dnp3` | `org.dnp.dnp3/src` | `dnp3.app`, `dnp3.crc`, `dnp3.dl`, `dnp3.objects` (an external specification, publisher dnp.org) |
 | `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
 | `org.khronos.gltf` | `org.khronos.gltf/src` | `gltf`, `kotoba.gltf.retarget` (an external specification, publisher khronos.org) |
+| `org.accellera.uvm` | `org.accellera.uvm/src` | `uvm.component`, `uvm.factory`, `uvm.phase`, `uvm.rtl-driver` (an external specification, publisher accellera.org) |
 | `kotoba.rtl` | `kotoba.rtl/src` | `rtl`, `rtl.eda-adapter`, `rtl.hdl`, `rtl.simulator` (Kotoba project library) |
 | `kotoba.eda` | `kotoba.eda/src` | `kotoba.eda.cli`, `kotoba.eda.core`, `kotoba.eda.oss-report`, `kotoba.eda.sdc-adapter` (Kotoba project library) |
 | `kotoba.cloudMurakumoLangchain` | `kotoba.cloudMurakumoLangchain/src` | `murakumo.fleet`, `murakumo.host`, `murakumo.model` (Kotoba project library) |
