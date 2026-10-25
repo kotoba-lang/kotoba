@@ -1,0 +1,145 @@
+(ns arrangement.lego-test
+  "The bricks have to actually swap.
+
+  Every assertion here runs the SAME question through different compositions
+  and requires the same answer. A seam that is only exercised by one
+  implementation is a layer of indirection, not a seam."
+  (:require [kotoba.test :refer [deftest is testing #?(:cljs async)]]
+            [datom.source :as ds]
+            [datom.source.conformance :as conf]
+            [arrangement.core :as arr]
+            [arrangement.datalog :as dl]
+            [arrangement.partitioned :as part]
+            [arrangement.source :as as]
+            [arrangement.core-test :refer [test-blind-fn test-encrypt-fn test-decrypt-fn]]))
+
+(defn- mem-store []
+  (let [store (atom {}) reads (atom 0)]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (swap! reads inc) (get @store cid))
+     :reads reads}))
+
+(defn- db-of [quads] (reduce arr/assert-quad (arr/empty-db) quads))
+(defn- commit! [put! quads]
+  (arr/commit! put! (db-of quads) nil arr/current-schema-version
+               test-blind-fn test-encrypt-fn))
+
+(def yes (constantly true))
+
+;; ── the Datalog engine now runs on any source ────────────────────────
+
+(def social
+  [{:s "alice" :p "knows" :o "bob"}
+   {:s "bob"   :p "knows" :o "carol"}
+   {:s "alice" :p "city"  :o "tokyo"}
+   {:s "bob"   :p "city"  :o "tokyo"}
+   {:s "carol" :p "city"  :o "osaka"}])
+
+(def two-clause-join
+  '{:find [?a ?b] :where [[?a "knows" ?b] [?b "city" "tokyo"]]})
+
+#?(:cljs
+   (deftest datalog-joins-over-the-worker-native-cursor
+     (async done
+       (let [blocks (atom {})
+             put! (fn [cid bytes]
+                    (swap! blocks assoc cid bytes)
+                    (js/Promise.resolve cid))
+             get! #(js/Promise.resolve (get @blocks %))]
+         (-> (arr/commit! put! (db-of social) nil arr/current-schema-version
+                          #(js/Promise.resolve (test-blind-fn %))
+                          #(js/Promise.resolve (test-encrypt-fn %)))
+             (.then #(as/cursor-async
+                      get! %
+                      (fn [x] (js/Promise.resolve (test-blind-fn x)))
+                      (fn [x] (js/Promise.resolve (test-decrypt-fn x)))))
+             (.then #(dl/q-async % two-clause-join yes))
+             (.then (fn [answer]
+                      (is (= #{["alice" "bob"]} answer))
+                      (done)))
+             (.catch (fn [e]
+                       (is false (str "async Datalog threw: " e))
+                       (done))))))))
+
+#?(:clj
+   (deftest datalog-answers-the-same-over-db-source-and-cursor
+     (let [{:keys [put! get-fn]} (mem-store)
+           cid (commit! put! social)
+           db (db-of social)
+           expected #{["alice" "bob"]}]
+       (testing "a materialized db -- the historical argument -- still works"
+         (is (= expected (dl/q db two-clause-join yes))))
+       (testing "the same db behind the seam"
+         (is (= expected (dl/q (as/materialized db) two-clause-join yes))))
+       (testing "and a CURSOR over the persisted snapshot, nothing materialized"
+         (is (= expected (dl/q (as/cursor get-fn cid test-blind-fn test-decrypt-fn)
+                               two-clause-join yes))))
+       (testing "negation resolves through the same path"
+         (let [nq '{:find [?a] :where [[?a "city" "tokyo"] (not [?a "knows" "bob"])]}]
+           (is (= (dl/q db nq yes)
+                  (dl/q (as/cursor get-fn cid test-blind-fn test-decrypt-fn) nq yes))))))))
+
+#?(:clj
+   (deftest a-cursor-backed-datalog-join-reads-fewer-blocks-than-hydrating
+     (let [{:keys [put! get-fn reads]} (mem-store)
+           quads (concat social
+                         (for [i (range 20000)]
+                           {:s (str "n" i) :p "noise" :o (str "v" i)}))
+           cid (commit! put! quads)]
+       (reset! reads 0)
+       (let [_ (dl/q (as/materialized (arr/restore get-fn cid test-decrypt-fn))
+                     two-clause-join yes)
+             hydrate-reads @reads]
+         (reset! reads 0)
+         (let [answer (dl/q (as/cursor get-fn cid test-blind-fn test-decrypt-fn)
+                            two-clause-join yes)
+               cursor-reads @reads]
+           (is (= #{["alice" "bob"]} answer))
+           (println (format "  [datalog join] cursor %d blocks vs hydrate %d (%.1fx)"
+                            cursor-reads hydrate-reads
+                            (double (/ hydrate-reads (max 1 cursor-reads)))))
+           (testing "the join itself is now index-driven"
+             (is (< (* 5 cursor-reads) hydrate-reads))))))))
+
+;; ── brick 2: compaction is transparent to the reader ─────────────────
+
+#?(:clj
+   (deftest compaction-preserves-answers-and-collapses-the-read
+     (let [{:keys [put! get-fn reads]} (mem-store)
+           k 50
+           quads (for [i (range 2000)]
+                   {:s (str "s" i) :p (if (zero? (mod i 400)) "rare" "common")
+                    :o (str "v" i)})
+           parts (into {} (map (fn [p]
+                                 [(str "p" p)
+                                  (commit! put! (take 40 (drop (* p 40) quads)))]))
+                       (range k))
+           root (part/put-root! put! parts nil)
+           merged (ds/merged (map #(as/cursor get-fn % test-blind-fn test-decrypt-fn)
+                                  (vals parts)))]
+       (reset! reads 0)
+       (let [via-merge (ds/scan-set merged [nil "rare" nil])
+             merge-reads @reads
+             compacted (as/compacted-cursor put! get-fn root test-blind-fn
+                                            test-encrypt-fn test-decrypt-fn)]
+         (reset! reads 0)
+         (let [via-compacted (ds/scan-set compacted [nil "rare" nil])
+               compacted-reads @reads]
+           (testing "same facts -- compaction is a read optimisation, not a filter"
+             (is (= via-merge via-compacted))
+             (is (= 5 (count via-compacted))))
+           (println (format "  [k=%d] merged %d blocks/scan vs compacted %d (%.1fx)"
+                            k merge-reads compacted-reads
+                            (double (/ merge-reads (max 1 compacted-reads)))))
+           (testing "and the compacted read is a fraction of the k-way one"
+             (is (< (* 5 compacted-reads) merge-reads)))))
+       (testing "a compacted snapshot is an ORDINARY snapshot -- the reader
+                needs no special case, which is what makes it a brick"
+         (is (empty? (conf/check
+                      (fn [qs]
+                        (let [{:keys [put! get-fn]} (mem-store)
+                              ps {"a" (commit! put! (take 3 qs))
+                                  "b" (commit! put! (drop 3 qs))}
+                              r (part/put-root! put! ps nil)]
+                          (as/compacted-cursor put! get-fn r test-blind-fn
+                                               test-encrypt-fn test-decrypt-fn))))))))))

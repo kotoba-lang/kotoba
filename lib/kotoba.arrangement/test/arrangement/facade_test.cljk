@@ -1,0 +1,189 @@
+(ns arrangement.facade-test
+  "The compatibility shims are the whole risk of moving the query layer out.
+  `arrangement.core`'s index functions, `arrangement.query` and
+  `arrangement.datalog` are a public surface with live consumers
+  (`kotobase-peer`, `kotobase-query`, `kotoba-git`/`bonsai`,
+  `kotoba-rad`/`nekko`, `loop-system-dynamics`, `net-kotobase`), and none of
+  them changed a line when the code moved to `kotoba-lang/datalog`. That
+  claim is asserted here rather than hoped for.
+
+  These are NOT query-semantics tests. Those live in `datalog`, once, which
+  is the point of the move -- re-testing them here would recreate exactly the
+  duplication being removed. What is tested here is only what the shim itself
+  can break:
+
+    1. EXHAUSTIVENESS -- every public var of `datalog.index`/`datalog.query`/
+       `datalog.core` is re-exported, so a var added upstream cannot go
+       missing here in silence;
+    2. DELEGATION -- each wrapper returns what the underlying function
+       returns, so a wrapper cannot quietly become a second implementation;
+    3. the arity `datalog.index` deliberately dropped -- `ref?` defaulted to
+       `ipld.core/link?` -- still exists here, since supplying it is now
+       arrangement's job;
+    4. the arglists and docstrings a caller sees are still there. This one is
+       not decorative: it is how the `def`-alias form of these shims was
+       caught reporting `()` as its signature on ClojureScript, while
+       reporting the right thing on the JVM;
+    5. one end-to-end call through each shim, so \"it compiles\" is not
+       mistaken for \"it runs\"."
+  (:require #?(:clj [kotoba.test :refer [deftest testing is]]
+               :cljs [cljs.test :refer-macros [deftest testing is]])
+            [arrangement.core :as arr]
+            [arrangement.query :as q]
+            [arrangement.datalog :as dl]
+            [datalog.index :as index]
+            [datalog.query :as dq]
+            [datalog.core :as dc]
+            [ipld.core :as ipld]))
+
+(def ^:private everything (constantly true))
+(def ^:private no-refs (constantly false))
+
+(defn- db-of [triples]
+  (reduce (fn [db [s p o]] (arr/assert-quad db {:s s :p p :o o})) (arr/empty-db) triples))
+
+(def ^:private sample
+  (db-of [["alice" "role" "admin"]
+          ["alice" "name" "Alice"]
+          ["bob" "role" "user"]
+          ["bob" "name" "Bob"]
+          ["bob" "manager" "alice"]]))
+
+;; ── 1. exhaustiveness ───────────────────────────────────────────────────────
+;; The shim is only a compatibility guarantee if it covers ALL of what it
+;; shims. Rather than trusting a hand-written list to stay complete, ask the
+;; upstream namespaces what they publish and check every name is re-exported.
+;; `ns-publics` needs a runtime namespace object, so this is JVM-only; the
+;; cljs job still runs everything below it.
+
+#?(:clj
+   (deftest every-public-var-upstream-is-re-exported
+     (doseq [[home shim] [['datalog.index 'arrangement.core]
+                          ['datalog.query 'arrangement.query]
+                          ['datalog.core 'arrangement.datalog]]]
+       (require home shim)
+       (let [expected (set (keys (ns-publics home)))
+             present (set (keys (ns-publics shim)))
+             missing (remove present expected)]
+         (is (seq expected) (str home " publishes something"))
+         (is (empty? missing)
+             (str shim " is missing " (pr-str (vec missing)) " from " home))))))
+
+;; ── 2. delegation: the wrappers wrap, they do not re-implement ──────────────
+;; If any of these ever stops holding, a second implementation has grown here
+;; -- which is the exact failure the move exists to make impossible.
+
+(deftest index-wrappers-delegate-to-datalog-index
+  (is (= (index/empty-db) (arr/empty-db)))
+  (is (= (index/entity-attrs sample "alice") (arr/entity-attrs sample "alice")))
+  (is (= (index/by-predicate sample "role") (arr/by-predicate sample "role")))
+  (is (= (index/by-predicate-value sample "role" "admin")
+         (arr/by-predicate-value sample "role" "admin")))
+  (is (= (index/by-predicate-range sample "role" "a" "z")
+         (arr/by-predicate-range sample "role" "a" "z")))
+  (is (= (index/refs-to sample "alice") (arr/refs-to sample "alice")))
+  (testing "assert/retract add only the ref? default -- at arity 3 they must
+            be indistinguishable from the underlying ones"
+    (is (= (index/assert-quad (index/empty-db) {:s "a" :p "b" :o "c"} no-refs)
+           (arr/assert-quad (arr/empty-db) {:s "a" :p "b" :o "c"} no-refs)))
+    (is (= (index/retract-quad sample {:s "bob" :p "role" :o "user"} no-refs)
+           (arr/retract-quad sample {:s "bob" :p "role" :o "user"} no-refs)))))
+
+;; ── 3. the arity datalog.index dropped ──────────────────────────────────────
+
+(deftest arity-2-defaults-ref?-to-ipld-link?
+  (testing "a plain value is not a ref, so :vaet stays empty"
+    (let [db (arr/assert-quad (arr/empty-db) {:s "a" :p "knows" :o "b"})]
+      (is (= {} (:vaet db)))
+      (is (= {} (arr/refs-to db "b")))))
+  (testing "an ipld Link IS a ref, without the caller saying so"
+    (let [link (ipld/link "bafytest")
+          db (arr/assert-quad (arr/empty-db) {:s "a" :p "knows" :o link})]
+      (is (= {"knows" #{"a"}} (arr/refs-to db link)))
+      (is (= db (arr/assert-quad (arr/empty-db) {:s "a" :p "knows" :o link} ipld/link?))
+          "the default is ipld/link?, not something else that happens to agree here")))
+  (testing "retract-quad's arity-2 default matches assert-quad's, so a Link
+            asserted and retracted through the defaults leaves nothing behind"
+    (let [link (ipld/link "bafytest")
+          q {:s "a" :p "knows" :o link}]
+      (is (= (arr/empty-db)
+             (-> (arr/empty-db) (arr/assert-quad q) (arr/retract-quad q)))))))
+
+;; ── 4. what a caller SEES: arglists and docstrings ──────────────────────────
+;; Runs on BOTH runtimes deliberately. The first draft of these shims used
+;; `(def entity-attrs index/entity-attrs)`, which is correct on the JVM and
+;; reports `()` as the signature on ClojureScript -- the analyzer derives
+;; `:arglists` for a `def` from its init expression and overwrites a declared
+;; one. A JVM-only version of this test would have passed and shipped it.
+
+(deftest re-exported-vars-keep-their-arglists-and-docs
+  (doseq [[nm v] [["empty-db" #'arr/empty-db]
+                  ["assert-quad" #'arr/assert-quad]
+                  ["retract-quad" #'arr/retract-quad]
+                  ["entity-attrs" #'arr/entity-attrs]
+                  ["by-predicate" #'arr/by-predicate]
+                  ["by-predicate-value" #'arr/by-predicate-value]
+                  ["by-predicate-range" #'arr/by-predicate-range]
+                  ["refs-to" #'arr/refs-to]
+                  ["query" #'q/query]
+                  ["query-range" #'q/query-range]
+                  ["cardinality" #'q/cardinality]
+                  ["q" #'dl/q]]]
+    (let [m (meta v)]
+      (is (seq (:arglists m)) (str nm " has arglists"))
+      (is (seq (:doc m)) (str nm " has a docstring")))))
+
+(deftest assert-quad-still-declares-both-arities
+  (is (= '([db q] [db q ref?]) (:arglists (meta #'arr/assert-quad))))
+  (is (= '([db q] [db q ref?]) (:arglists (meta #'arr/retract-quad)))))
+
+;; ── 5. end to end through each shim ─────────────────────────────────────────
+
+(deftest index-accessors-work-through-the-shim
+  (is (= {"role" #{"admin"} "name" #{"Alice"}} (arr/entity-attrs sample "alice")))
+  (is (= {"alice" #{"admin"} "bob" #{"user"}} (arr/by-predicate sample "role")))
+  (is (= #{"alice"} (arr/by-predicate-value sample "role" "admin")))
+  (is (= #{} (arr/by-predicate-value sample "role" "nobody"))))
+
+(deftest arrangement-query-works-through-the-shim
+  (is (= #{{:s "alice" :p "role" :o "admin"}}
+         (q/query sample ["alice" "role" nil] everything)))
+  (is (= 2 (q/cardinality sample [nil "role" nil] everything)))
+  (testing "visible? is still threaded through, not dropped by the alias"
+    (is (= 1 (q/cardinality sample [nil "role" nil]
+                            (fn [{:keys [o]}] (= o "admin")))))))
+
+(deftest arrangement-datalog-works-through-the-shim
+  (testing "a multi-clause join -- the thing arrangement.query alone cannot do"
+    (is (= #{["Alice"]}
+           (dl/q sample '{:find [?name]
+                          :where [[?s "role" "admin"] [?s "name" ?name]]}
+                 everything))))
+  (testing ":in, negation and aggregates all still reach the engine"
+    (is (= #{["Bob"]}
+           (dl/q sample '{:find [?name] :in [?role]
+                          :where [[?s "role" ?role]
+                                  [?s "name" ?name]
+                                  (not [?s "role" "admin"])]}
+                 everything ["user"])))
+    (is (= #{[2]} (dl/q sample '{:find [(count ?s)] :where [[?s "role" _]]}
+                        everything))))
+  (testing ":order-by/:limit still returns a VECTOR, not a set"
+    (let [r (dl/q sample '{:find [?name]
+                           :where [[?s "name" ?name]]
+                           :order-by [[?name :desc]] :limit 1}
+                  everything)]
+      (is (vector? r))
+      (is (= [["Bob"]] r))))
+  (testing "arity 4 (with :in inputs) is reachable through the alias"
+    (is (= #{["alice"]}
+           (dl/q sample '{:find [?m] :in [?s] :where [[?s "manager" ?m]]}
+                 everything ["bob"])))))
+
+(deftest the-shims-and-the-home-agree-on-the-same-query
+  ;; Not a semantics test -- a "did the wrapper land on the right var" test.
+  ;; Same db, same query, one through each path.
+  (let [query '{:find [?s ?name] :where [[?s "role" "admin"] [?s "name" ?name]]}]
+    (is (= (dc/q sample query everything) (dl/q sample query everything)))
+    (is (= (dq/query sample [nil "role" nil] everything)
+           (q/query sample [nil "role" nil] everything)))))
