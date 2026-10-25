@@ -104,6 +104,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `kotoba.game` | `kotoba.game/src` | `game`, `game.addons`, `game.analytics`, `game.animation` (Kotoba project library) |
 | `kotoba.drive` | `kotoba.drive/src` | `drive.model`, `drive.object`, `drive.store.fs`, `drive.store.memory` (Kotoba project library) |
 | `kotoba.srs` | `kotoba.srs/src` | `srs.core`, `srs.host`, `srs.lifecycle`, `srs.status` (Kotoba project library) |
 | `kotoba.okaimono` | `kotoba.okaimono/src` | `kotoba.okaimono`, `kotoba.okaimono.export`, `kotoba.okaimono.ui` (Kotoba project library) |

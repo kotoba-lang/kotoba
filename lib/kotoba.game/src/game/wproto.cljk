@@ -1,0 +1,448 @@
+(ns game.wproto
+  "W Protocol CQRS integration for KAMI games. Restored from the legacy
+  kami-engine/kami-game Rust crate's `src/wproto.rs` (637 lines), deleted
+  in kotoba-lang/kami-engine PR #82 \"Remove Rust workspace from
+  kami-engine\", as part of the clj-wgsl migration (ADR-2607010930,
+  com-junkawasaki/root), restoration cluster G (quality/wire-protocol) of
+  the 7-cluster `kotoba-lang/game` restoration.
+
+  Write path: Game events -> WRecord() -> AT Record -> MDAG -> yata sync
+  Read path:  G() (Sql) -> game state queries
+
+  This replaces direct DO SQLite for cross-island analytics while keeping
+  DO SQLite for operational per-island state.
+
+  Wire-format note: the original Rust structs derive `serde::{Serialize,
+  Deserialize}` for JSON wire transport; the original crate's own tests
+  only assert on JSON *substring* containment (never structural JSON
+  parsing) except for `EmoteLoadoutRecord`, which round-trips. Following
+  the same zero-dep portable-serialization pattern used by the sibling
+  `kotoba-lang/actor-ipc` restoration's `actor-ipc.ipc` namespace (and
+  documented there per ADR-2607010930), `record->wire` / `wire->record`
+  below use an EDN round-trip (`pr-str` / `clojure.edn/read-string`)
+  rather than depending on an external JSON library; EDN's printed form
+  still contains the same field-value substrings the original tests check
+  for (e.g. numbers, unquoted strings' characters), so the ported tests
+  assert the equivalent EDN containment."
+  (:require #?(:clj [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])))
+
+;; --- kinds ------------------------------------------------------------
+;; Rust: `pub mod kinds { pub const ISLAND_DEF: &str = "kami.islandDef"; ... }`
+;; W Protocol record kinds for KAMI.
+;;
+;; AT Lexicon mapping (dot notation -> app.etzhayyim.apps.kami.*):
+;;   "kami.islandDef"     -> app.etzhayyim.apps.kami.islandDef
+;;   "kami.character"     -> app.etzhayyim.apps.kami.character
+;;   "kami.matchSummary"  -> app.etzhayyim.apps.kami.matchSummary
+;;   etc.
+(def kinds
+  "W Protocol record kind constants. Mirrors Rust `pub mod kinds { pub
+  const X: &str = ...; }`; each `kinds::X` becomes `(:x kinds)`."
+  {;; -- gftd:kami/island --
+   :island-def "kami.islandDef"
+   :portal "kami.portal"
+
+   ;; -- gftd:kami/scene --
+   :scene-version "kami.sceneVersion"
+
+   ;; -- gftd:kami/character --
+   :character "kami.character"
+
+   ;; -- gftd:kami/publish --
+   :build-result "kami.buildResult"
+   :publish-result "kami.publishResult"
+
+   ;; -- gftd:kami-battle-royale/match-lifecycle --
+   :match-summary "kami.matchSummary"
+   :player-result "kami.playerResult"
+
+   ;; -- gftd:kami-battle-royale/ranked-queue --
+   :ranked-profile "kami.rankedProfile"
+   :season-info "kami.seasonInfo"
+
+   ;; -- gftd:kami-battle-royale/match-state --
+   :kill-event "kami.killEvent"
+
+   ;; -- gftd:kami/catalog --
+   :listing "kami.listing"
+   :collection "kami.collection"
+
+   ;; -- gftd:kami/player --
+   :player-profile "kami.playerProfile"
+   :achievement-def "kami.achievement"
+   :achievement-unlock "kami.achievementUnlock"
+   :play-session "kami.playSession"
+
+   ;; -- gftd:kami/ranking --
+   :leaderboard "kami.leaderboard"
+   :leaderboard-entry "kami.leaderboardEntry"
+   :season-pass "kami.seasonPass"
+
+   ;; -- gftd:kami/economy --
+   :item-def "kami.itemDef"
+   :trade "kami.trade"
+
+   ;; -- gftd:kami/emote --
+   :emote-def "kami.emoteDef"
+   :emote-grant "kami.emoteGrant"
+   :emote-loadout "kami.emoteLoadout"
+   :emote-play "kami.game.emotePlay"
+
+   ;; -- gftd:kami/physics --
+   :collision-event "kami.game.collision"
+
+   ;; -- gftd:kami/trigger --
+   :trigger-zone "kami.triggerZone"
+   :trigger-event "kami.game.triggerEvent"
+
+   ;; -- gftd:kami/npc --
+   :npc-def "kami.npcDef"
+   :npc-interaction "kami.game.npcInteraction"
+   :quest-def "kami.questDef"
+   :quest-progress "kami.questProgress"
+
+   ;; -- gftd:kami/inventory --
+   :inventory-event "kami.game.inventoryEvent"
+
+   ;; -- gftd:kami/terrain --
+   :terrain-config "kami.terrainConfig"
+   :terrain-edit "kami.game.terrainEdit"
+
+   ;; -- gftd:kami/pokoa --
+   :pokoa-trainer "kami.pokoaTrainer"
+   :pokoa-battle "kami.game.pokoaBattle"
+   :pokoa-capture "kami.game.pokoaCapture"
+   :pokoa-evolve "kami.game.pokoaEvolve"
+
+   ;; -- gftd:kami/gacha --
+   :gacha-banner "kami.gachaBanner"
+   :gacha-roll-result "kami.game.gachaRoll"
+
+   ;; -- Game telemetry events --
+   :score-submit "kami.game.score"
+   :item-pickup "kami.game.itemPickup"
+   :item-equip "kami.game.itemEquip"
+   :economy-tx "kami.game.transaction"
+   :gacha-roll "kami.game.gacha"
+   :achievement "kami.game.achievement"
+   :session-start "kami.game.sessionStart"
+   :session-end "kami.game.sessionEnd"
+   :portal-traverse "kami.game.portalTraverse"
+   :player-kill "kami.game.kill"
+   :npc-dialogue "kami.game.dialogue"})
+
+;; --- record constructors --------------------------------------------------
+;; Each `pub struct XRecord { ... }` becomes a plain CLJC map constructor
+;; below, keyed by kebab-case keyword equivalents of the Rust field names.
+;; W Protocol record payload for score submission.
+(defn score-record
+  "Mirrors Rust `struct ScoreRecord { island_id, user_id, score, game_slug,
+  metadata }`."
+  [{:keys [island-id user-id score game-slug metadata]}]
+  {:island-id island-id :user-id user-id :score score
+   :game-slug game-slug :metadata metadata})
+
+;; W Protocol record for economy transaction.
+(defn transaction-record
+  "Mirrors Rust `struct TransactionRecord { user_id, amount, currency,
+  reason, island_id }`."
+  [{:keys [user-id amount currency reason island-id]}]
+  {:user-id user-id :amount amount :currency currency
+   :reason reason :island-id island-id})
+
+;; W Protocol record for session tracking.
+(defn session-record
+  "Mirrors Rust `struct SessionRecord { user_id, island_id, duration_secs,
+  score, items_collected, kills }`."
+  [{:keys [user-id island-id duration-secs score items-collected kills]}]
+  {:user-id user-id :island-id island-id :duration-secs duration-secs
+   :score score :items-collected items-collected :kills kills})
+
+;; W Protocol record for portal traversal (cross-island analytics).
+(defn portal-record
+  "Mirrors Rust `struct PortalRecord { user_id, from_island, to_island }`."
+  [{:keys [user-id from-island to-island]}]
+  {:user-id user-id :from-island from-island :to-island to-island})
+
+;; W Protocol record for emote definition (catalog).
+(defn emote-def-record
+  "Mirrors Rust `struct EmoteDefRecord { slug, name, description,
+  animation, duration_ms, looping, particle, sound_ref, color_tint,
+  rarity, game_id, tradeable, preview_cid }`. `animation` is an
+  animation-preset enum value; `particle` a particle-effect enum value;
+  `rarity` an item-rarity enum value (all represented as strings here, as
+  in the original wire format)."
+  [{:keys [slug name description animation duration-ms looping particle
+            sound-ref color-tint rarity game-id tradeable preview-cid]}]
+  {:slug slug :name name :description description :animation animation
+   :duration-ms duration-ms :looping looping :particle particle
+   :sound-ref sound-ref :color-tint color-tint :rarity rarity
+   :game-id game-id :tradeable tradeable :preview-cid preview-cid})
+
+;; W Protocol record for emote grant (player inventory).
+(defn emote-grant-record
+  "Mirrors Rust `struct EmoteGrantRecord { user_id, emote_slug, source }`.
+  `source`: \"purchase\", \"reward\", \"achievement\", \"trade\", \"default\"."
+  [{:keys [user-id emote-slug source]}]
+  {:user-id user-id :emote-slug emote-slug :source source})
+
+;; W Protocol record for emote loadout (quick-select wheel).
+(defn emote-loadout-record
+  "Mirrors Rust `struct EmoteLoadoutRecord { user_id, slots, active_index
+  }`. `slots` is a vector of `Option<String>`, represented as a CLJC
+  vector of strings/nil."
+  [{:keys [user-id slots active-index]}]
+  {:user-id user-id :slots (vec slots) :active-index active-index})
+
+;; W Protocol record for emote play event (telemetry).
+(defn emote-play-record
+  "Mirrors Rust `struct EmotePlayRecord { user_id, emote_slug, trigger,
+  island_id, position }`. `trigger` is an emote-trigger enum value;
+  `position` is `[f32; 3]`."
+  [{:keys [user-id emote-slug trigger island-id position]}]
+  {:user-id user-id :emote-slug emote-slug :trigger trigger
+   :island-id island-id :position position})
+
+;; W Protocol record for collision audit event.
+(defn collision-record
+  "Mirrors Rust `struct CollisionRecord { entity_a, entity_b, kind,
+  impulse, island_id, position }`."
+  [{:keys [entity-a entity-b kind impulse island-id position]}]
+  {:entity-a entity-a :entity-b entity-b :kind kind :impulse impulse
+   :island-id island-id :position position})
+
+;; W Protocol record for trigger zone event.
+(defn trigger-event-record
+  "Mirrors Rust `struct TriggerEventRecord { zone_id, player_did, kind,
+  data_json, island_id }`."
+  [{:keys [zone-id player-did kind data-json island-id]}]
+  {:zone-id zone-id :player-did player-did :kind kind
+   :data-json data-json :island-id island-id})
+
+;; W Protocol record for NPC interaction.
+(defn npc-interaction-record
+  "Mirrors Rust `struct NpcInteractionRecord { npc_id, player_did,
+  interaction_type, dialogue_node_id, choice_id, island_id }`."
+  [{:keys [npc-id player-did interaction-type dialogue-node-id choice-id island-id]}]
+  {:npc-id npc-id :player-did player-did :interaction-type interaction-type
+   :dialogue-node-id dialogue-node-id :choice-id choice-id :island-id island-id})
+
+;; W Protocol record for quest progress update.
+(defn quest-progress-record
+  "Mirrors Rust `struct QuestProgressRecord { quest_id, player_did, status,
+  objectives_progress_json }`."
+  [{:keys [quest-id player-did status objectives-progress-json]}]
+  {:quest-id quest-id :player-did player-did :status status
+   :objectives-progress-json objectives-progress-json})
+
+;; W Protocol record for inventory change event.
+(defn inventory-event-record
+  "Mirrors Rust `struct InventoryEventRecord { player_did, item_slug,
+  action, quantity, island_id, position }`. `position` is `Option<[f32; 3]>`."
+  [{:keys [player-did item-slug action quantity island-id position]}]
+  {:player-did player-did :item-slug item-slug :action action
+   :quantity quantity :island-id island-id :position position})
+
+;; W Protocol record for terrain edit event.
+(defn terrain-edit-record
+  "Mirrors Rust `struct TerrainEditRecord { island_id, position,
+  block_type, player_did }`. `position` is `[i32; 3]`."
+  [{:keys [island-id position block-type player-did]}]
+  {:island-id island-id :position position :block-type block-type
+   :player-did player-did})
+
+;; W Protocol record for Pokoa battle result.
+(defn pokoa-battle-record
+  "Mirrors Rust `struct PokoaBattleRecord { battle_id, battle_type,
+  player_did, outcome, turns, player_species, opponent_species,
+  island_id }`."
+  [{:keys [battle-id battle-type player-did outcome turns
+            player-species opponent-species island-id]}]
+  {:battle-id battle-id :battle-type battle-type :player-did player-did
+   :outcome outcome :turns turns :player-species player-species
+   :opponent-species opponent-species :island-id island-id})
+
+;; W Protocol record for Pokoa capture event.
+(defn pokoa-capture-record
+  "Mirrors Rust `struct PokoaCaptureRecord { player_did, species_id,
+  species_name, level, ball_type, island_id }`."
+  [{:keys [player-did species-id species-name level ball-type island-id]}]
+  {:player-did player-did :species-id species-id :species-name species-name
+   :level level :ball-type ball-type :island-id island-id})
+
+;; W Protocol record for gacha roll result.
+(defn gacha-roll-record
+  "Mirrors Rust `struct GachaRollRecord { banner_id, player_did,
+  result_slug, rarity, pity_count, is_rate_up }`."
+  [{:keys [banner-id player-did result-slug rarity pity-count is-rate-up]}]
+  {:banner-id banner-id :player-did player-did :result-slug result-slug
+   :rarity rarity :pity-count pity-count :is-rate-up is-rate-up})
+
+;; --- wire (de)serialization ------------------------------------------------
+;; Rust: `serde_json::to_string(&r)` / `serde_json::from_str(&json)`.
+;; Adapted to an EDN round-trip (see namespace docstring) instead of
+;; depending on an external JSON library.
+(defn record->wire
+  "Serialize a record map to wire text. Mirrors Rust
+  `serde_json::to_string(&r)`."
+  [record]
+  (pr-str record))
+
+(defn wire->record
+  "Deserialize a record map from wire text. Mirrors Rust
+  `serde_json::from_str::<T>(&json)`."
+  [wire]
+  (edn/read-string wire))
+
+;; --- queries ----------------------------------------------------------
+;; Rust: `pub mod queries { pub const X: &str = "MATCH ..."; }`
+;; Sql graph queries for cross-island analytics (read path).
+(def queries
+  "Sql graph query constants. Mirrors Rust `pub mod queries { pub const X:
+  &str = ...; }`; each `queries::X` becomes `(:x queries)`."
+  {;; Top scores across all islands.
+   :global-leaderboard
+   "MATCH (s:Score) RETURN s.user_id, s.score, s.island_id ORDER BY s.score DESC LIMIT $limit"
+
+   ;; Player's cross-island stats.
+   :player-stats
+   "MATCH (p:Player {user_id: $user_id})-[:PLAYED]->(i:Island) RETURN i.name, p.total_score, p.sessions, p.play_time_secs"
+
+   ;; Most popular islands by session count.
+   :popular-islands
+   "MATCH (s:Session)-[:ON]->(i:Island) RETURN i.island_id, i.name, COUNT(s) as sessions ORDER BY sessions DESC LIMIT $limit"
+
+   ;; Island-to-island portal flow (which portals are most used).
+   :portal-flow
+   "MATCH (p:Portal)-[:FROM]->(a:Island), (p)-[:TO]->(b:Island) RETURN a.name, b.name, COUNT(p) as traversals ORDER BY traversals DESC LIMIT $limit"
+
+   ;; Player gem balance across all games.
+   :player-gems
+   "MATCH (w:Wallet {user_id: $user_id, currency: 'gems'}) RETURN w.balance"
+
+   ;; Most used emotes across all islands.
+   :popular-emotes
+   "MATCH (e:EmotePlay) RETURN e.emote_slug, COUNT(e) as plays ORDER BY plays DESC LIMIT $limit"
+
+   ;; Player's emote inventory.
+   :player-emotes
+   "MATCH (g:EmoteGrant {user_id: $user_id}) RETURN g.emote_slug, g.source"
+
+   ;; Emote usage by trigger type (analytics).
+   :emote-trigger-stats
+   "MATCH (e:EmotePlay {emote_slug: $emote_slug}) RETURN e.trigger, COUNT(e) as count ORDER BY count DESC"
+
+   ;; Emote usage heatmap by island.
+   :emote-island-heatmap
+   "MATCH (e:EmotePlay) RETURN e.island_id, e.emote_slug, COUNT(e) as plays ORDER BY plays DESC LIMIT $limit"
+
+   ;; NPC interaction frequency.
+   :npc-interaction-stats
+   "MATCH (n:NpcInteraction) RETURN n.npc_id, n.interaction_type, COUNT(n) as count ORDER BY count DESC LIMIT $limit"
+
+   ;; Quest completion rates.
+   :quest-completion-rate
+   "MATCH (q:QuestProgress {status: 'completed'}) RETURN q.quest_id, COUNT(q) as completions ORDER BY completions DESC LIMIT $limit"
+
+   ;; Pokoa species popularity (captures).
+   :pokoa-capture-stats
+   "MATCH (c:PokoaCapture) RETURN c.species_name, COUNT(c) as captures ORDER BY captures DESC LIMIT $limit"
+
+   ;; Pokoa battle win rates by species.
+   :pokoa-win-rates
+   "MATCH (b:PokoaBattle {outcome: 'player_win'}) RETURN b.player_species, COUNT(b) as wins ORDER BY wins DESC LIMIT $limit"
+
+   ;; Gacha roll rarity distribution.
+   :gacha-rarity-dist
+   "MATCH (g:GachaRoll {banner_id: $banner_id}) RETURN g.rarity, COUNT(g) as count ORDER BY count DESC"
+
+   ;; Terrain edit hotspots (building activity).
+   :terrain-edit-hotspots
+   "MATCH (t:TerrainEdit) RETURN t.island_id, COUNT(t) as edits ORDER BY edits DESC LIMIT $limit"
+
+   ;; Trigger zone fire frequency.
+   :trigger-fire-stats
+   "MATCH (t:TriggerEvent) RETURN t.kind, t.island_id, COUNT(t) as fires ORDER BY fires DESC LIMIT $limit"
+
+   ;; Inventory item popularity (pickups).
+   :inventory-popular-items
+   "MATCH (i:InventoryEvent {action: 'pickup'}) RETURN i.item_slug, COUNT(i) as pickups ORDER BY pickups DESC LIMIT $limit"})
+
+;; --- cqrs-command-template ------------------------------------------------
+;; Rust: `pub fn cqrs_command_template(game_slug: &str) -> String`
+;; Generate the magatama-go command patterns for W Protocol CQRS. This is
+;; the TinyGo code template that each KAMI game island uses.
+(defn cqrs-command-template
+  "Generate the magatama-go command patterns for W Protocol CQRS. Mirrors
+  Rust `cqrs_command_template(game_slug: &str) -> String`."
+  [game-slug]
+  (str
+   "\n"
+   "// W Protocol CQRS commands for " game-slug "\n"
+   "// Write path: WRecord() -> AT Record -> MDAG -> yata auto sync\n"
+   "// Read path: Q() (DO SQLite operational) + G() (Sql analytics)\n"
+   "\n"
+   "// -- Write: Score submission (WRecord) --\n"
+   "func cmdSubmitScore(ctx *magatama.AppContext, body []byte) ([]byte, error) {\n"
+   "    var args struct {\n"
+   "        Score    int64  `json:\"score\"`\n"
+   "        Metadata string `json:\"metadata\"`\n"
+   "    }\n"
+   "    json.Unmarshal(body, &args)\n"
+   "\n"
+   "    // Operational write: DO SQLite (per-island leaderboard)\n"
+   "    magatama.Q(\"scores\").Insert(magatama.Row{\n"
+   "        \"game_id\": \"" game-slug "\", \"user_id\": ctx.UserID, \"org_id\": ctx.OrgID,\n"
+   "        \"actor_id\": ctx.ActorID, \"score\": args.Score, \"metadata\": args.Metadata,\n"
+   "        \"created_at\": nowISO(),\n"
+   "    })\n"
+   "\n"
+   "    // Analytics write: WRecord -> AT Record -> MDAG -> yata Sql sync\n"
+   "    payload, _ := json.Marshal(map[string]any{\n"
+   "        \"island_id\": \"" game-slug "\", \"user_id\": ctx.UserID,\n"
+   "        \"score\": args.Score, \"game_slug\": \"" game-slug "\", \"metadata\": args.Metadata,\n"
+   "    })\n"
+   "    magatama.WRecord(\"kami.game.score\", payload)\n"
+   "\n"
+   "    return json.Marshal(map[string]any{\"ok\": true, \"score\": args.Score})\n"
+   "}\n"
+   "\n"
+   "// -- Read: Leaderboard (Q for local, G for global) --\n"
+   "func cmdGetRankings(ctx *magatama.AppContext, body []byte) ([]byte, error) {\n"
+   "    // Local (this island): DO SQLite\n"
+   "    local, _ := magatama.Q(\"scores\").\n"
+   "        Where(magatama.Eq{\"game_id\": \"" game-slug "\", \"org_id\": ctx.OrgID}).\n"
+   "        OrderBy(\"score DESC\").Limit(50).Query()\n"
+   "\n"
+   "    // Global (all islands): Sql graph\n"
+   "    global, _ := magatama.G(\"Score\").\n"
+   "        Match(magatama.Eq{\"game_slug\": \"" game-slug "\"}).\n"
+   "        Return(\"user_id\", \"score\", \"island_id\").\n"
+   "        OrderBy(\"score DESC\").Limit(50).Query()\n"
+   "\n"
+   "    return json.Marshal(map[string]any{\"local\": json.RawMessage(local), \"global\": global})\n"
+   "}\n"
+   "\n"
+   "// -- Write: Economy transaction (WRecord) --\n"
+   "func cmdPurchase(ctx *magatama.AppContext, body []byte) ([]byte, error) {\n"
+   "    var args struct {\n"
+   "        Amount int64  `json:\"amount\"`\n"
+   "        Reason string `json:\"reason\"`\n"
+   "    }\n"
+   "    json.Unmarshal(body, &args)\n"
+   "\n"
+   "    // DO SQLite: debit wallet\n"
+   "    magatama.Q(\"wallets\").\n"
+   "        Where(magatama.Eq{\"user_id\": ctx.UserID, \"org_id\": ctx.OrgID, \"currency\": \"gems\"}).\n"
+   "        Update(magatama.Row{\"balance\": magatama.Raw(\"balance - ?\", args.Amount)})\n"
+   "\n"
+   "    // WRecord: analytics\n"
+   "    payload, _ := json.Marshal(map[string]any{\n"
+   "        \"user_id\": ctx.UserID, \"amount\": -args.Amount,\n"
+   "        \"currency\": \"gems\", \"reason\": args.Reason, \"island_id\": \"" game-slug "\",\n"
+   "    })\n"
+   "    magatama.WRecord(\"kami.game.transaction\", payload)\n"
+   "\n"
+   "    return json.Marshal(map[string]any{\"ok\": true})\n"
+   "}\n"))

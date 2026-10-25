@@ -1,0 +1,139 @@
+(ns game.ranked-test
+  "Tests ported 1:1 from kami-game's `ranked.rs` `#[cfg(test)] mod tests`
+  (kotoba-lang/kami-engine, deleted PR #82; ADR-2607010930)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [game.ranked :as ranked]))
+
+(deftest rank-tiers
+  (testing "rank-tier-from-mmr thresholds"
+    (is (= :bronze (ranked/rank-tier-from-mmr 0)))
+    (is (= :silver (ranked/rank-tier-from-mmr 500)))
+    (is (= :gold (ranked/rank-tier-from-mmr 1000)))
+    (is (= :platinum (ranked/rank-tier-from-mmr 1500)))
+    (is (= :diamond (ranked/rank-tier-from-mmr 2000)))
+    (is (= :champion (ranked/rank-tier-from-mmr 3000)))
+    (is (= :unreal (ranked/rank-tier-from-mmr 5000)))))
+
+(deftest rank-division-display
+  (testing "rank-division-display formatting"
+    (is (= "Bronze III" (ranked/rank-division-display (ranked/rank-division-from-mmr 100))))
+    (is (= "Bronze II" (ranked/rank-division-display (ranked/rank-division-from-mmr 250))))
+    (is (= "Bronze I" (ranked/rank-division-display (ranked/rank-division-from-mmr 400))))
+    (is (= "Champion" (ranked/rank-division-display (ranked/rank-division-from-mmr 3500))))
+    (is (= "Unreal" (ranked/rank-division-display (ranked/rank-division-from-mmr 5500))))))
+
+(deftest placement-scoring
+  (testing "placement-points"
+    (is (= 120 (ranked/placement-points 1 100)))
+    (is (= 85 (ranked/placement-points 2 100)))
+    (is (= 40 (ranked/placement-points 10 100)))
+    (is (= 10 (ranked/placement-points 25 100)))
+    (is (neg? (ranked/placement-points 75 100)))))
+
+(deftest mmr-calculation-victory
+  (testing "calculate-mmr-change for a strong win"
+    (let [profile (ranked/new-ranked-profile "did:test:1" "Player1" 1)
+          result {:placement 1 :total-players 100 :kills 8 :assists 3
+                   :damage-dealt 1500 :builds-placed 50 :survival-time-seconds 1200.0}
+          change (ranked/calculate-mmr-change profile result)]
+      (is (= 120 (:placement-points change)))
+      (is (pos? (:kill-points change)))
+      (is (= 0 (:bus-fee change))) ; Bronze has no bus fee
+      (is (> (:total change) 200)))))
+
+(deftest mmr-progression-bronze-to-silver
+  (testing "5 wins with kills promotes Bronze -> Silver"
+    (let [profile0 (ranked/new-ranked-profile "did:test:1" "Player1" 1)]
+      (is (= :bronze (:tier (:rank profile0))))
+      (let [result {:placement 1 :total-players 100 :kills 5 :assists 2
+                     :damage-dealt 800 :builds-placed 30 :survival-time-seconds 900.0}
+            profile (reduce (fn [p _] (first (ranked/apply-match-result p result)))
+                             profile0 (range 5))]
+        (is (>= (:mmr profile) 500) (str "MMR should be >= 500, got " (:mmr profile)))
+        (is (not (ranked/tier< (:tier (:rank profile)) :silver)))
+        (is (= 5 (:wins profile)))
+        (is (= 100.0 (:win-rate profile)))))))
+
+(deftest demotion-shield
+  (testing "shield prevents dropping below the tier floor"
+    (let [profile0 (-> (ranked/new-ranked-profile "did:test:1" "Player1" 1)
+                        (assoc :mmr 500 :demotion-shield true)
+                        ranked/update-rank)
+          result {:placement 90 :total-players 100 :kills 0 :assists 0
+                   :damage-dealt 50 :builds-placed 0 :survival-time-seconds 30.0}
+          [profile change] (ranked/apply-match-result profile0 result)]
+      (is (>= (:mmr profile) 480) (str "Shield should prevent demotion, got MMR=" (:mmr profile)))
+      (is (false? (:demotion-shield profile))) ; consumed
+      (is (some? change)))))
+
+(deftest high-rank-bus-fee
+  (testing "Champion tier pays a -60 bus fee"
+    (let [profile (-> (ranked/new-ranked-profile "did:test:1" "Player1" 1)
+                       (assoc :mmr 3500)
+                       ranked/update-rank)]
+      (is (= :champion (:tier (:rank profile))))
+      (let [result {:placement 50 :total-players 100 :kills 2 :assists 1
+                     :damage-dealt 400 :builds-placed 10 :survival-time-seconds 600.0}
+            change (ranked/calculate-mmr-change profile result)]
+        (is (= -60 (:bus-fee change)))))))
+
+(deftest matchmaking-groups
+  (testing "matchmake groups a 200-player queue into lobbies at least half full,
+            with every lobby honoring max-mmr-spread. NOTE: max-mmr-spread here
+            is 2000, not the original 500 -- with a 25-per-player MMR step and
+            200 players, 500 can hold at most 21 in-spread players per lobby
+            (500/25 + 1), so a 500-spread queue can NEVER satisfy the >=50
+            floor while honoring spread; the original test's params were only
+            jointly satisfiable because of the bug this now regression-tests
+            against (matchmake used to force spread-violating players into a
+            lobby purely to hit the size floor)"
+    (let [queue (mapv (fn [i] {:player-did (str "did:test:" i)
+                                :mmr (* i 25)
+                                :rank (ranked/rank-tier-from-mmr (* i 25))
+                                :queue-time 5.0})
+                       (range 200))
+          lobbies (ranked/matchmake queue 100 2000)]
+      (is (seq lobbies))
+      (doseq [lobby lobbies]
+        (is (>= (count lobby) 50))
+        (let [mmrs (mapv #(:mmr (nth queue %)) lobby)]
+          (is (<= (- (apply max mmrs) (apply min mmrs)) 2000)))))))
+
+(deftest matchmaking-never-violates-max-mmr-spread-to-hit-the-size-floor
+  (testing "an under-sized lobby (below target-size/2) that hits a large MMR
+            gap must NOT force-absorb an out-of-spread player just to reach
+            the size floor -- it must close as an under-sized-but-in-spread
+            lobby instead. Regression: 4 MMR-0 players + 11 MMR-5000 players,
+            target-size 10 (floor 5), max-mmr-spread 100 used to produce a
+            first lobby mixing MMR 0 and MMR 5000 (a spread of 5000, 50x the
+            configured tolerance) because the lobby only had 4 members when
+            the 5000-point jump was encountered"
+    (let [queue (vec (concat (repeat 4 {:mmr 0 :queue-time 5.0})
+                             (repeat 11 {:mmr 5000 :queue-time 5.0})))
+          lobbies (ranked/matchmake queue 10 100)]
+      (doseq [lobby lobbies]
+        (let [mmrs (mapv #(:mmr (nth queue %)) lobby)]
+          (is (<= (- (apply max mmrs) (apply min mmrs)) 100)
+              (str "lobby " lobby " with mmrs " mmrs " violates max-mmr-spread")))))))
+
+(deftest season-soft-reset
+  (testing "soft-reset-mmr applies the season ratio"
+    (let [season {:season-number 2 :name "KAMI Season 2"
+                   :start-date "2026-04-01" :end-date "2026-06-30"
+                   :active true :soft-reset-ratio 0.5}]
+      (is (= 1500 (ranked/soft-reset-mmr season 3000)))
+      (is (= 0 (ranked/soft-reset-mmr season 0))))))
+
+(deftest kd-ratio-calculation
+  (testing "3 wins + 2 losses yields the expected K/D ratio"
+    (let [profile0 (ranked/new-ranked-profile "did:test:1" "Player1" 1)
+          win {:placement 1 :total-players 100 :kills 5 :assists 0
+               :damage-dealt 500 :builds-placed 0 :survival-time-seconds 900.0}
+          loss {:placement 50 :total-players 100 :kills 2 :assists 0
+                :damage-dealt 200 :builds-placed 0 :survival-time-seconds 300.0}
+          profile (as-> profile0 p
+                    (reduce (fn [p _] (first (ranked/apply-match-result p win))) p (range 3))
+                    (reduce (fn [p _] (first (ranked/apply-match-result p loss))) p (range 2)))]
+      ;; 15+4=19 kills, 2 deaths (5 games - 3 wins)
+      (is (= 19 (:total-kills profile)))
+      (is (> (:kd-ratio profile) 9.0))))) ; 19/2 = 9.5
