@@ -143,6 +143,7 @@ The bundled standard libraries live in this repository:
 | `org.iso.std10303` | `org.iso.std10303/src` | `brep`, `brep.assembly`, `brep.config`, `brep.config-loader` (an external specification, publisher iso.org) |
 | `org.csaIot.matter` | `org.csaIot.matter/src` | `matter.message`, `matter.protocol`, `matter.tlv` (an external specification, publisher csaIot.org) |
 | `org.bitcoin.p2p` | `org.bitcoin.p2p/src` | `kotobase.bitcoin.protocol`, `kotobase.bitcoin.transport` (an external specification, publisher bitcoin.org) |
+| `org.dicomstandard.dicom` | `org.dicomstandard.dicom/src` | `dicom.bytes`, `dicom.dataset`, `dicom.dictionary`, `dicom.element` (an external specification, publisher dicomstandard.org) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
 | `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |
 | `com.adobe.tiff` | `com.adobe.tiff/src` | `tiff.bytes`, `tiff.codec`, `tiff.core` (Kotoba project library) |
