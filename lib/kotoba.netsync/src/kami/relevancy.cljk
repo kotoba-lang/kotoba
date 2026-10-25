@@ -1,0 +1,187 @@
+(ns kami.relevancy
+  "Who receives which entity — area-of-interest filtering, as EDN.
+
+   `kami.netsync` answers *what crosses the wire* for an entity (which fields,
+   which authority, how to interpolate). It does not answer *whether that entity
+   crosses the wire to you at all*, and without that answer every observer
+   receives every entity: bandwidth grows as observers x entities, so doubling
+   the players quadruples the traffic. That is the ceiling this namespace exists
+   to remove.
+
+   ## Three things, not one
+
+   1. **A relevant set.** Which entity ids an observer should be receiving now.
+   2. **Hysteresis.** An entity hovering on the boundary must not enter and leave
+      every tick. Flicker is worse than either state: each crossing costs a spawn
+      and a despawn, so a single jittering entity can cost more bandwidth than
+      simply always sending it. Enter and exit use different radii.
+   3. **A delta.** The wire wants `:entered` / `:left`, not the whole set — the
+      set is what you keep, the delta is what you send.
+
+   ## Why a grid
+
+   The obvious implementation compares every observer against every entity. It is
+   also the thing being replaced, so it stays here as [[brute-force-relevant]]
+   and the tests assert the grid agrees with it exactly. Bucketing entities into
+   cells of the interest radius means an observer examines a fixed neighbourhood
+   (at most 3x3x3 cells in 3D) instead of the whole world, which is what turns
+   observers x entities into observers x local-density.
+
+   The cell size is the *exit* radius, never smaller: a cell smaller than the
+   query radius would need a wider neighbourhood sweep, and the 3x3x3 bound
+   silently stops being a bound.
+
+   Pure and cross-platform. No transport, no clock, no mutation: an observer's
+   previous set is passed in and the next one is returned, so a caller can keep
+   it wherever it keeps state."
+  (:require [kotoba.lang.coll :as set]))
+
+(def default-policy
+  "`:enter` is the radius at which an entity becomes relevant, `:exit` the larger
+   radius at which it stops being. `:exit` must exceed `:enter` or there is no
+   hysteresis band and boundary flicker returns."
+  {:enter 60.0
+   :exit 75.0})
+
+(defn valid-policy?
+  [{:keys [enter exit]}]
+  (boolean (and (number? enter) (number? exit) (pos? enter) (> exit enter))))
+
+(defn- dist2 [[ax ay az] [bx by bz]]
+  (let [dx (- ax bx) dy (- ay by) dz (- az bz)]
+    (+ (* dx dx) (* dy dy) (* dz dz))))
+
+;; --- the reference implementation -------------------------------------------
+
+(defn brute-force-relevant
+  "Every observer against every entity. Kept deliberately: it is the definition
+   the grid is checked against, and the thing whose cost the grid removes.
+
+   `entities` is `{id position}`. `previous` is the observer's current relevant
+   set, which decides whether an entity is judged by `:enter` or `:exit` — an
+   entity already relevant is held until it passes the outer radius."
+  [{:keys [enter exit]} observer-pos entities previous]
+  (let [e2 (* enter enter)
+        x2 (* exit exit)
+        prev (or previous #{})]
+    (persistent!
+     (reduce-kv (fn [acc id pos]
+                  (let [d2 (dist2 observer-pos pos)]
+                    (if (if (contains? prev id) (<= d2 x2) (<= d2 e2))
+                      (conj! acc id)
+                      acc)))
+                (transient #{})
+                entities))))
+
+;; --- the grid ---------------------------------------------------------------
+
+(defn- cell-of [size [x y z]]
+  [(long (Math/floor (/ x size)))
+   (long (Math/floor (/ y size)))
+   (long (Math/floor (/ z size)))])
+
+(defn build-index
+  "Bucket `entities` ({id position}) into cells of the policy's `:exit` radius.
+
+   Returns `{:cell-size s :cells {[i j k] {id position}}}`. Building is O(n) and
+   is meant to happen once per tick, then be queried by every observer — an index
+   rebuilt per observer would cost more than the brute force it replaces."
+  [{:keys [exit] :as policy} entities]
+  (when-not (valid-policy? policy)
+    (throw (ex-info "relevancy policy needs 0 < :enter < :exit"
+                    {:reason :relevancy/bad-policy :policy policy})))
+  {:cell-size exit
+   :cells (persistent!
+           (reduce-kv (fn [acc id pos]
+                        (let [c (cell-of exit pos)]
+                          (assoc! acc c (assoc (get acc c {}) id pos))))
+                      (transient {})
+                      entities))})
+
+(defn- neighbourhood
+  "The 27 cells around `pos`. Correct only while the cell size is at least the
+   exit radius — with a smaller cell an entity within the radius could sit two
+   cells away and be missed."
+  [size pos]
+  (let [[ci cj ck] (cell-of size pos)]
+    (for [di [-1 0 1] dj [-1 0 1] dk [-1 0 1]]
+      [(+ ci di) (+ cj dj) (+ ck dk)])))
+
+(defn relevant
+  "The observer's next relevant set, using the index.
+
+   Two passes, and each does exactly one job:
+
+   - the neighbourhood sweep admits entities newly inside `:enter`
+   - the retention pass keeps entities already in `previous` that are still
+     inside `:exit`
+
+   Hysteresis lives entirely in the second pass. An earlier version also chose
+   the radius per entity *inside* the sweep, which produced the same answers —
+   a mutation test showed that inline condition could be deleted without any gate
+   noticing, because retention re-admitted everything it had excluded. Two
+   mechanisms for one rule, and only one of them load-bearing.
+
+   Retention also has to exist for a reason the sweep cannot cover: it is what
+   *drops* an entity. The sweep can only add, so an entity that moved far away
+   would stay relevant forever if retention did not re-measure it."
+  [{:keys [enter exit] :as _policy} {:keys [cell-size cells]} observer-pos entities previous]
+  (let [e2 (* enter enter)
+        x2 (* exit exit)
+        prev (or previous #{})
+        near (persistent!
+              (reduce (fn [acc c]
+                        (reduce-kv (fn [a id pos]
+                                     (if (<= (dist2 observer-pos pos) e2)
+                                       (conj! a id)
+                                       a))
+                                   acc
+                                   (get cells c)))
+                      (transient #{})
+                      (neighbourhood cell-size observer-pos)))]
+    (reduce (fn [acc id]
+              (if (contains? acc id)
+                acc
+                (let [pos (get entities id)]
+                  (if (and pos (<= (dist2 observer-pos pos) x2))
+                    (conj acc id)
+                    acc))))
+            near
+            prev)))
+
+;; --- what actually goes on the wire ----------------------------------------
+
+(defn delta
+  "`{:relevant next :entered … :left …}` — the set to keep and the change to send."
+  [previous next]
+  (let [prev (or previous #{})]
+    {:relevant next
+     :entered (set/difference next prev)
+     :left (set/difference prev next)}))
+
+(defn tick
+  "One tick for many observers against one entity set.
+
+   `observers` is `{observer-id {:pos [x y z] :relevant #{…}}}`. Returns the same
+   map with `:relevant` advanced and `:entered` / `:left` attached. The index is
+   built once and shared, which is the whole economy of the thing."
+  ([observers entities] (tick default-policy observers entities))
+  ([policy observers entities]
+   (let [index (build-index policy entities)]
+     (persistent!
+      (reduce-kv (fn [acc oid {:keys [pos relevant] :as o}]
+                   (assoc! acc oid
+                           (merge o (delta relevant
+                                           (kami.relevancy/relevant policy index pos
+                                                                    entities relevant)))))
+                 (transient {})
+                 observers)))))
+
+(defn examined-count
+  "How many entities the grid actually distance-checks for one observer.
+
+   Exposed because 'the grid is cheaper' is the claim this namespace is making,
+   and a claim about cost needs something to measure. Compare against
+   `(count entities)`, which is what the brute force examines."
+  [{:keys [cell-size cells]} observer-pos]
+  (reduce + 0 (map #(count (get cells % {})) (neighbourhood cell-size observer-pos))))
