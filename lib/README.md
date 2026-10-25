@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.perfgate` | `kotoba.perfgate/src` | `perfgate.core` (Kotoba project library) |
 | `kotoba.loopGameAutoplay` | `kotoba.loopGameAutoplay/src` | `loop-game-autoplay.env`, `loop-game-autoplay.policy`, `loop-game-autoplay.qualify`, `loop-game-autoplay.server` (Kotoba project library) |
 | `kotoba.layout` | `kotoba.layout/src` | `layout.core` (Kotoba project library) |
 | `kotoba.kuraNode` | `kotoba.kuraNode/src` | `kura.node.accounting`, `kura.node.async`, `kura.node.audit`, `kura.node.contract` (Kotoba project library) |
