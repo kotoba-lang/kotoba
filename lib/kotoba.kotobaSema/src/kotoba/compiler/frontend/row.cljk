@@ -1,0 +1,2139 @@
+(ns kotoba.compiler.frontend.row
+  "Module `row` of kotoba.compiler.frontend, cut from the original namespace by amu refactor split (19 forms, 499 lines). Depends on: base, kernel-region, closure-types, infer, record-projection."
+  ;; the Kotoba-route interface: the names the other frontend modules, kotoba.sema and the native guests use
+  ;; (the linked project export bound is 1024 clauses, ADR 0363 port)
+  #?(:kotoba {:kotoba/export [row-argument-text row-field-reads row-generics row-if-branches row-joins row-name-part row-operated? row-pass-through row-rebinds? row-record-fields row-symbols-in row-text specialize-row-parameters type-literal type-literals]})
+  (:require #?@(:kotoba [[kotoba.form :as form]])
+            [kotoba.lang.text :as str]
+            [kotoba.compiler.frontend-tables :as tables]
+            [kotoba.compiler.frontend.base :refer [reject! #?@(:kotoba [code-point-width fdrop fget fkw fl-add fl-has? fl-nth fl-slice fmeta-from fname fnamespace form-text fput ftruthy? pr-form simple-symbol-form?] :default [first-truthy])]]
+            [kotoba.compiler.frontend.kernel-region :refer [#?@(:kotoba [] :default [map-literal-key-order map-literal-record-namespace]) map-literal-record-type]]
+            [kotoba.compiler.frontend.closure-types :refer [#?@(:kotoba [] :default [*schemas*]) max-record-fields record-type?]]
+            [kotoba.compiler.frontend.infer :refer [infer-expression-type use-site-text #?@(:kotoba [zip-locals ctx-schemas] :default [infer-absent-parameter-types row-aliases *module-list-fields* list-field-read-key])]]
+            #?@(:kotoba [[kotoba.compiler.frontend.infer-passes :refer [abort-signatures infer-type-or-nil]]])
+            #?@(:kotoba [] :default [[kotoba.compiler.frontend.namespace-defs :refer [reserved-binding-name?]]
+                                     [kotoba.compiler.frontend.expand :refer [max-symbol-chars]]])
+            [kotoba.compiler.frontend.record-projection :refer [rewrite-record-projection #?@(:kotoba [rewrite-record-projection-or] :default [match-has-marker])]])
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                          [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                                 :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
+                                 ;; a refusal: the Kotoba-route `reject!` throws one (ADR 0007)
+                                 :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                                 ;; the desugar env and its results (docs/selfhost-frontend-typemodel-design.md 1.2)
+                                 :fe/env [:record :fe/env [[:counter :i64] [:result [:ref :form/r]] [:none :bool] [:arities [:ref :form/r]] [:lexical [:ref :form/r]] [:types [:ref :form/r]] [:docfns [:ref :form/r]] [:loop-counter :i64] [:tbl [:ref :form/r]] [:schemas [:ref :form/r]] [:lazy :bool] [:abort-ctx :string] [:used-caps [:ref :form/r]] [:options [:ref :form/r]] [:helpers [:ref :form/r]] [:shapes [:ref :form/r]] [:lambda-counter :i64] [:lambdas [:ref :form/r]] [:loop-result [:ref :form/r]] [:loop-known [:ref :form/r]] [:dispatchers [:ref :form/r]] [:uses-apply :bool] [:uses-lazy :bool] [:contracts [:ref :form/r]]]]
+                                 :fe/dr [:record :fe/dr [[:env [:ref :fe/env]] [:form [:ref :form/r]]]]
+                                 :fe/drs [:record :fe/drs [[:env [:ref :fe/env]] [:forms [:list [:ref :form/r]]]]]
+                                 ;; the inference context: the host's dynamic vars of infer.cljk, threaded by value
+                                 :ie/ctx [:record :ie/ctx [[:schemas [:ref :form/r]] [:row-schemas [:ref :form/r]] [:handlers [:ref :form/r]] [:final :bool] [:tail :bool] [:names [:ref :form/r]] [:recording :bool] [:recorded [:ref :form/r]] [:collect :bool] [:throws [:list [:ref :form/r]]] [:known [:ref :form/r]] [:tbl [:ref :form/r]] [:rec-limit :i64] [:rec-count :i64]]]
+                                 :ie/r [:record :ie/r [[:type [:ref :form/r]] [:ctx [:ref :ie/ctx]]]]
+                                 ;; abort elaboration: the walk results (form + synthetic-name counter) and its context
+                                 :ae/r [:record :ae/r [[:form [:ref :form/r]] [:n :i64]]]
+                                 :ae/rs [:record :ae/rs [[:forms [:list [:ref :form/r]]] [:n :i64]]]
+                                 :ae/c [:record :ae/c [[:ctx [:ref :ie/ctx]] [:sigs [:ref :form/r]] [:aet [:ref :form/r]]]]
+                                 :ana/r [:record :ana/r [[:form [:ref :form/r]] [:aux [:ref :form/r]] [:n :i64]]]
+                                 :ana/rl [:record :ana/rl [[:forms [:list [:ref :form/r]]] [:aux [:ref :form/r]] [:n :i64]]]
+                                 :ana/g [:record :ana/g [[:ctx [:ref :ie/ctx]] [:a [:ref :form/r]] [:b [:ref :form/r]] [:c [:ref :form/r]] [:d [:ref :form/r]]]]
+                                 :ana/ir [:record :ana/ir [[:ok :bool] [:val [:ref :form/r]] [:err [:ref :fe/err]]]]})))
+
+
+;; --- row-polymorphic parameters (ADR 0353 point 3, floor :row-records) -----
+;;
+;; `(defn- f [m] (:a m))` used to be refused: an unannotated parameter was a
+;; provisional `:i64`, and `(record-get m :a)` without a descriptor needs a
+;; record. The parameter's type is now read from its uses as a ROW: every
+;; field read off it, `{:a T | r}`. There is still no dynamically shaped
+;; record boundary (ADR 0214) and no value carries its type at run time: f
+;; exists only as its specializations, one per record type a call passes it
+;; (`f__row_0_b_s`), each checked at that record like any annotated function
+;; (monomorphization). A call whose argument is not a record, or is a record
+;; without a field the row reads, is refused by name at the call.
+;;
+;; What makes a parameter a row: an unannotated parameter the body reads a
+;; field off (`(:k m)`, desugared to a 2-arity `record-get`), or passes on
+;; unchanged to another function's row parameter (a fixed point over the
+;; call graph). A parameter the body rebinds is left as it was.
+;;
+;; A parameter a row operation uses -- assoc / dissoc / select-keys on it, or
+;; merge of it -- is a row too (floor :row-operations, `row-operated?`); the
+;; fields dissoc / select-keys name are fields it reads.
+;;
+;; Floor :row-unification: a loop helper (and so a fn literal a reduce / map
+;; lowers to one) is generic with its function; two parameters that are the
+;; branches of one `if` are one row (`row-joins`), and a call passing them two
+;; record types is refused by name; a keyword map literal WRITTEN as a row
+;; argument is that row's record (`row-map-literal-record`); a slot's reads
+;; include what the rows it is passed on to read, so a missing field is
+;; refused at the outermost call. A literal bound by `let` before it is passed
+;; is still the keyword->i64 map, and a vector literal of records is still
+;; typed from its source alone (floor :literal-typing). A specialization's
+;; definition CID is its own KIR's, which already seals the record it was
+;; specialized at (floor :specialization-identity derives it from the
+;; generic's).
+
+#?(:kotoba nil :default (def row-binding-heads tables/row-binding-heads))
+
+#?(:kotoba
+(defn rw-sym-is? [f [:ref :form/r] name :string] :bool
+  (and (form/is-symbol? f) (string=? (form/symbol-value f) name)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-set-has? [s [:ref :form/r] x [:ref :form/r]] :bool
+  (fl-has? (form/kids-of s) x 0))
+   :default nil)
+
+#?(:kotoba
+(defn rw-set-add [s [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (if (fl-has? (form/kids-of s) x 0)
+    s
+    (form/form-set (form/append-form (form/kids-of s) x))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-empty-set [] [:ref :form/r]
+  (form/form-set (form/no-forms)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-empty-map [] [:ref :form/r]
+  (form/form-map (form/no-forms)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-error [msg :string code :string form [:ref :form/r]] [:ref :fe/err]
+  (record-new [:ref :fe/err] msg code form "subset" (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-error-data [msg :string code :string form [:ref :form/r] data [:ref :form/r]] [:ref :fe/err]
+  (record-new [:ref :fe/err] msg code form "subset" data))
+   :default nil)
+
+#?(:kotoba
+(defn rw-fail [bad? :bool msg :string code :string form [:ref :form/r]] :i64
+  (if bad? (throw (rw-error msg code form)) 0))
+   :default nil)
+
+;; the data map of a refusal: {:kotoba.error/function f :kotoba.error/parameter p ...}
+#?(:kotoba
+(defn rw-data2 [k1 :string v1 [:ref :form/r] k2 :string v2 [:ref :form/r]] [:ref :form/r]
+  (form/assoc-form (form/assoc-form (rw-empty-map) (fkw k1) v1) (fkw k2) v2))
+   :default nil)
+
+#?(:kotoba
+(defn rw-data-put [data [:ref :form/r] k :string v [:ref :form/r]] [:ref :form/r]
+  (form/assoc-form data (fkw k) v))
+   :default nil)
+
+#?(:kotoba
+(defn rw-vec-set [xs [:ref :form/r] i :i64 x [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (fl-append-at (form/kids-of xs) i x 0 (form/no-forms))))
+   :default nil)
+
+#?(:kotoba
+(defn fl-append-at [xs [:list [:ref :form/r]] at :i64 x [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count xs))
+    acc
+    (fl-append-at xs at x (+ i 1) (form/append-form acc (if (= i at) x (fl-nth xs i))))))
+   :default nil)
+
+;; a text of UTF-16 code units' worth of "_" or the kept character: a-z and 0-9 stay, everything else is "_"
+#?(:kotoba
+(defn rw-name-chars [s :string i :i64 acc :string] :string
+  (if (>= i (string-length s))
+    acc
+    (let [c (string-code-point-at s i)
+          keep (or (and (>= c 97) (<= c 122)) (and (>= c 48) (<= c 57)))
+          w (code-point-width c)
+          piece (if keep (string-substring s i (+ i 1)) (if (>= c 65536) "__" "_"))]
+      (rw-name-chars s (+ i w) (string-concat acc piece)))))
+   :default nil)
+
+;; Clojure's `compare` of two keywords: the namespace first (none sorts first), then the name
+#?(:kotoba
+(defn rw-kw-compare [a [:ref :form/r] b [:ref :form/r]] :i64
+  (let [na (fnamespace a)
+        nb (fnamespace b)]
+    (cond
+      (and (string=? na "") (not (string=? nb ""))) -1
+      (and (not (string=? na "")) (string=? nb "")) 1
+      (not (string=? na nb)) (string-compare na nb)
+      :else (string-compare (fname a) (fname b)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-insert-kw [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] [:list [:ref :form/r]]
+  (if (or (>= i (vector-count xs)) (> (rw-kw-compare (fl-nth xs i) x) 0))
+    (fl-slice xs i (vector-count xs) (form/append-form (fl-slice xs 0 i (form/no-forms)) x))
+    (rw-insert-kw xs x (+ i 1))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-sort-kws [xs [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of xs))
+    acc
+    (rw-sort-kws xs (+ i 1) (rw-insert-kw acc (form/nth-of xs i) 0))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-syms-kids [kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count kids))
+    acc
+    (rw-syms-kids kids (+ i 1) (rw-syms (fl-nth kids i) acc))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-syms [form [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (rw-syms-kids (form/kids-of form) 0 (if (simple-symbol-form? form) (fl-add acc form) acc)))
+   :default nil)
+
+#?(:kotoba
+;; every simple symbol in the tree, as a set
+(defn row-symbols-in [form [:ref :form/r]] [:ref :form/r]
+  (form/form-set (rw-syms form (form/no-forms))))
+   :default
+(defn row-symbols-in [form]
+  (into #{} (filter simple-symbol?) (tree-seq coll? seq form))))
+
+;; is PARAM among the binders at even positions of the vector BV from I
+#?(:kotoba
+(defn rw-binder? [param [:ref :form/r] bv [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of bv))
+    false
+    (or (form/eq param (form/nth-of bv i)) (rw-binder? param bv (+ i 2)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rebinds-node? [param [:ref :form/r] x [:ref :form/r] heads [:ref :form/r]] :bool
+  (and (form/is-seq? x) (> (form/count-of x) 0)
+       (let [head (form/nth-of x 0)]
+         (or (and (rw-sym-is? head "let") (form/is-vec? (form/nth-of x 1)) (rw-binder? param (form/nth-of x 1) 0))
+             (and (rw-set-has? heads head)
+                  (rw-set-has? (row-symbols-in (form/form-vec (fdrop x 3))) param))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rebinds-kids? [param [:ref :form/r] kids [:list [:ref :form/r]] i :i64 heads [:ref :form/r]] :bool
+  (if (>= i (vector-count kids))
+    false
+    (or (rw-rebinds? param (fl-nth kids i) heads) (rw-rebinds-kids? param kids (+ i 1) heads))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rebinds? [param [:ref :form/r] form [:ref :form/r] heads [:ref :form/r]] :bool
+  (or (rw-rebinds-node? param form heads) (rw-rebinds-kids? param (form/kids-of form) 0 heads)))
+   :default nil)
+
+#?(:kotoba
+;; Does FORM bind PARAM anywhere (a let binder, or a name a match binds)?
+(defn row-rebinds? [param [:ref :form/r] form [:ref :form/r]] :bool
+  (rw-rebinds? param form (tables/row-binding-heads)))
+   :default
+(defn row-rebinds?
+  "Does FORM bind PARAM anywhere (a let binder, or a name a match binds)?"
+  [param form]
+  (boolean
+   (first-truthy
+    (fn [x]
+      (and (seq? x)
+           (or (and (= 'let (first x)) (vector? (second x))
+                    (some #(= param %) (take-nth 2 (second x))))
+               (and (contains? row-binding-heads (first x))
+                    (contains? (row-symbols-in (drop 3 x)) param)))))
+    (tree-seq coll? seq form)))))
+
+#?(:kotoba
+(defn rw-if-branches [form [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (cond
+    (simple-symbol-form? form) (fl-add acc form)
+    (and (form/is-seq? form) (> (form/count-of form) 0) (rw-sym-is? (form/nth-of form 0) "if") (= 4 (form/count-of form)))
+    (rw-if-branches (form/nth-of form 3) (rw-if-branches (form/nth-of form 2) acc))
+    :else acc))
+   :default nil)
+
+#?(:kotoba
+;; The bare symbols FORM may evaluate to through `if` branches
+(defn row-if-branches [form [:ref :form/r]] [:ref :form/r]
+  (form/form-set (rw-if-branches form (form/no-forms))))
+   :default
+(defn row-if-branches
+  "The bare symbols FORM may evaluate to through `if` branches: `(if c m (if d
+  n o))` is #{m n o}. Anything else is itself when a symbol."
+  [form]
+  (cond
+    (simple-symbol? form) #{form}
+    (and (seq? form) (= 'if (first form)) (= 4 (count form)))
+    (into (row-if-branches (nth form 2)) (row-if-branches (nth form 3)))
+    :else #{})))
+
+;; the symbols of PARAMS (other than PARAM) among the branches of an `if` that also has PARAM as a branch
+#?(:kotoba
+(defn rw-joins-node [param [:ref :form/r] params [:ref :form/r] x [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (and (form/is-seq? x) (> (form/count-of x) 0) (rw-sym-is? (form/nth-of x 0) "if") (= 4 (form/count-of x)))
+    (let [branches (rw-if-branches x (form/no-forms))]
+      (if (fl-has? branches param 0)
+        (rw-joins-pick param params branches 0 acc)
+        acc))
+    acc))
+   :default nil)
+
+#?(:kotoba
+(defn rw-joins-pick [param [:ref :form/r] params [:ref :form/r] branches [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count branches))
+    acc
+    (let [b (fl-nth branches i)]
+      (rw-joins-pick param params branches (+ i 1)
+                     (if (and (not (form/eq b param)) (fl-has? (form/kids-of params) b 0)) (fl-add acc b) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-joins-kids [param [:ref :form/r] params [:ref :form/r] kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count kids))
+    acc
+    (rw-joins-kids param params kids (+ i 1) (rw-joins param params (fl-nth kids i) acc))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-joins [param [:ref :form/r] params [:ref :form/r] form [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (rw-joins-kids param params (form/kids-of form) 0 (rw-joins-node param params form acc)))
+   :default nil)
+
+#?(:kotoba
+;; The parameters PARAM is joined with in FORM: another parameter among PARAMS that is a branch of the same `if`
+(defn row-joins [param [:ref :form/r] params [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+  (form/form-set (rw-joins param params form (form/no-forms))))
+   :default
+(defn row-joins
+  "The parameters PARAM is joined with in FORM: another parameter among
+  PARAMS that is a branch of the same `if` (`(if c m n)` joins m and n --
+  both branches have one type, so a parameter returned beside a row is that
+  row, floor :row-unification)."
+  [param params form]
+  (let [params (set params)]
+    (into #{}
+          (mapcat (fn [x]
+                    (when (and (seq? x) (= 'if (first x)) (= 4 (count x)))
+                      (let [branches (row-if-branches x)]
+                        (when (contains? branches param)
+                          (filter params (disj branches param)))))))
+          (tree-seq coll? seq form)))))
+
+;; the keywords from index I of X, added to ACC
+#?(:kotoba
+(defn rw-kws-from [x [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of x))
+    acc
+    (rw-kws-from x (+ i 1) (if (form/is-keyword? (form/nth-of x i)) (fl-add acc (form/nth-of x i)) acc))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-reads-node [param [:ref :form/r] x [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (and (form/is-seq? x) (> (form/count-of x) 0))
+    (let [head (form/nth-of x 0)]
+      (cond
+        (and (rw-sym-is? head "record-get") (= 3 (form/count-of x)) (form/is-keyword? (form/nth-of x 2))
+             (or (form/eq param (form/nth-of x 1))
+                 (fl-has? (rw-if-branches (form/nth-of x 1) (form/no-forms)) param 0)))
+        (fl-add acc (form/nth-of x 2))
+        (and (or (rw-sym-is? head "dissoc") (rw-sym-is? head "select-keys")) (form/eq param (form/nth-of x 1)))
+        (rw-kws-from x 2 acc)
+        :else acc))
+    acc))
+   :default nil)
+
+#?(:kotoba
+(defn rw-reads-kids [param [:ref :form/r] kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count kids))
+    acc
+    (rw-reads-kids param kids (+ i 1) (rw-reads param (fl-nth kids i) acc))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-reads [param [:ref :form/r] form [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (rw-reads-kids param (form/kids-of form) 0 (rw-reads-node param form acc)))
+   :default nil)
+
+;; the row-scope cluster (preserved verbatim at the end of this file) is
+;; declared here so the host twins below can wire its mono a7ef280 call sites
+;; (row-aliases now comes from infer: infer-absent-parameter-types needs it and
+;; infer <- row would be a require cycle; type-literals is defined below this
+;; cluster's specialize-row-parameters)
+#?(:kotoba nil :default (declare row-scope row-get-receiver? row-updates row-list-item? row-list-item-slot? row-param-text type-literals))
+
+#?(:kotoba
+;; The fields FORM reads off PARAM, as a set: a descriptor-less `(record-get PARAM :k)`, and the fields
+;; `(dissoc PARAM :k ..)` / `(select-keys PARAM :k ..)` name
+(defn row-field-reads [param [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+  (form/form-set (rw-reads param form (form/no-forms))))
+   :default
+(defn row-field-reads
+  "The fields FORM reads off PARAM: a descriptor-less `(record-get PARAM :k)`
+  or `(get PARAM :k)`, and the fields `(dissoc PARAM :k ..)` /
+  `(select-keys PARAM :k ..)` name (floor :row-operations: a row shrinks only
+  by fields it has). `(get PARAM :k d)` does not require :k -- a record
+  without it answers d -- and neither does a match pattern's projection: an
+  arm naming a key the record lacks does not match (floor
+  :row-get-and-match). A field read off a name bound to an update of PARAM
+  that the update did not write is read off PARAM (`row-updates`)."
+  [param form]
+  (let [aliases (row-aliases param form)
+        updates (row-updates param form)
+        updated (fn [receiver k]
+                  (when-let [written (get updates receiver)]
+                    (not (contains? written k))))]
+    (into (sorted-set)
+          (mapcat (fn [x]
+                    (cond
+                      (and (seq? x) (= 'record-get (first x)) (= 3 (count x))
+                           (keyword? (nth x 2))
+                           (or (contains? aliases (second x))
+                               (updated (second x) (nth x 2))
+                               ;; `(:k (if c m n))` reads :k off both branches
+                               ;; (floor :row-unification).
+                               (contains? (row-if-branches (second x)) param)))
+                      [(nth x 2)]
+                      (and (row-get-receiver? aliases x) (= 'get (first x)) (= 3 (count x))
+                           (keyword? (nth x 2)) (not (:kotoba.compiler.frontend/match-projection (meta x))))
+                      [(nth x 2)]
+                      (and (seq? x) (= 'get (first x)) (= 3 (count x)) (keyword? (nth x 2))
+                           (not (:kotoba.compiler.frontend/match-projection (meta x)))
+                           (updated (second x) (nth x 2)))
+                      [(nth x 2)]
+                      (and (seq? x) (contains? '#{dissoc select-keys} (first x))
+                           (= param (second x)))
+                      (filter keyword? (drop 2 x))
+                      :else nil)))
+          (tree-seq coll? seq form)))))
+
+#?(:kotoba
+(defn rw-any-eq? [param [:ref :form/r] xs [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of xs))
+    false
+    (or (form/eq param (form/nth-of xs i)) (rw-any-eq? param xs (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-operated-node? [param [:ref :form/r] x [:ref :form/r]] :bool
+  (and (form/is-seq? x) (> (form/count-of x) 0)
+       (let [head (form/nth-of x 0)]
+         (or (and (or (rw-sym-is? head "map-assoc") (rw-sym-is? head "dissoc") (rw-sym-is? head "select-keys") (rw-sym-is? head "merge"))
+                  (form/eq param (form/nth-of x 1)))
+             (and (rw-sym-is? head "merge") (rw-any-eq? param x 1))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-operated-kids? [param [:ref :form/r] kids [:list [:ref :form/r]] i :i64] :bool
+  (if (>= i (vector-count kids))
+    false
+    (or (row-operated? param (fl-nth kids i)) (rw-operated-kids? param kids (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+;; Is PARAM the receiver of a row operation in FORM, or merged by one?
+(defn row-operated? [param [:ref :form/r] form [:ref :form/r]] :bool
+  (or (rw-operated-node? param form) (rw-operated-kids? param (form/kids-of form) 0)))
+   :default
+(defn row-operated?
+  "Is PARAM the receiver of a row operation in FORM, or merged by one (ADR
+  0353 floor :row-operations)? Either makes it a row even when no field is
+  read off it: `(defn- f [m] (assoc m :d 1))`."
+  [param form]
+  (let [aliases (row-aliases param form)]
+    (boolean
+     (first-truthy
+      (fn [x]
+        (and (seq? x)
+             (or (and (contains? '#{map-assoc dissoc select-keys merge} (first x))
+                      (= param (second x)))
+                 (and (= 'merge (first x)) (first-truthy #{param} (rest x)))
+                 ;; floor :row-get-and-match: any `get` off it, a computed
+                 ;; key's included -- the specialization refuses that by
+                 ;; name -- and a match map pattern over it.
+                 (row-get-receiver? aliases x))))
+      (tree-seq coll? seq form))))))
+
+#?(:kotoba
+(defn rw-pass-args [param [:ref :form/r] x [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of x))
+    acc
+    (rw-pass-args param x (+ i 1)
+                  (if (form/eq param (form/nth-of x i))
+                    (form/append-form acc (form/vec2 (form/nth-of x 0) (form/int-form (- i 1))))
+                    acc))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-pass-kids [param [:ref :form/r] kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (vector-count kids))
+    acc
+    (rw-pass-kids param kids (+ i 1) (rw-pass param (fl-nth kids i) acc))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-pass [param [:ref :form/r] form [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (rw-pass-kids param (form/kids-of form) 0
+                (if (and (form/is-seq? form) (> (form/count-of form) 0) (form/is-symbol? (form/nth-of form 0)))
+                  (rw-pass-args param form 1 acc)
+                  acc)))
+   :default nil)
+
+#?(:kotoba
+;; `[[callee index] ...]` for every call in FORM that passes PARAM itself as an argument
+(defn row-pass-through [param [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+  (form/form-vec (rw-pass param form (form/no-forms))))
+   :default
+(defn row-pass-through
+  "`[[callee index] ...]` for every call in FORM that passes PARAM itself as an
+  argument."
+  [param form]
+  (into []
+        (mapcat (fn [x]
+                  (when (and (seq? x) (symbol? (first x)))
+                    (keep-indexed (fn [i arg] (when (= param arg) [(first x) i]))
+                                  (rest x)))))
+        (tree-seq coll? seq form))))
+
+#?(:kotoba
+(defn rw-field-names [fields [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of fields))
+    acc
+    (rw-field-names fields (+ i 1) (fl-add acc (form/nth-of (form/nth-of fields i) 0)))))
+   :default nil)
+
+#?(:kotoba
+;; The field keys of record type T (a `[:ref :ns/name]` naming a :record schema, or an anonymous record), as a set; nil
+;; when T is not a record. SCHEMAS is the schema table (the host's `*schemas*`).
+(defn row-record-fields [schemas [:ref :form/r] t [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (form/is-vec? t) (> (form/count-of t) 1) (form/eq (form/nth-of t 0) (form/keyword-form :ref)) (form/is-keyword? (form/nth-of t 1)))
+    (let [schema (form/form-get schemas (form/nth-of t 1))]
+      (if (and (form/is-vec? schema) (> (form/count-of schema) 2) (form/eq (form/nth-of schema 0) (form/keyword-form :record)))
+        (form/form-set (rw-field-names (form/nth-of schema 2) 0 (form/no-forms)))
+        (form/nil-form)))
+    (record-type? t) (form/form-set (rw-field-names (form/nth-of t 2) 0 (form/no-forms)))
+    :else (form/nil-form)))
+   :default
+(defn row-record-fields
+  "The field keys of record type T (`[:ref :ns/name]` naming a :record schema),
+  or nil when T is not a record."
+  [t]
+  (cond
+    (and (vector? t) (= :ref (first t)) (keyword? (second t)))
+    (let [schema (get *schemas* (second t))]
+      (when (and (vector? schema) (= :record (first schema)))
+        (into #{} (map first) (nth schema 2))))
+    ;; An anonymous record -- a record literal, or the result of a row
+    ;; operation (floor :row-operations) -- satisfies a row the same way.
+    (record-type? t) (into #{} (map first) (nth t 2))
+    :else nil)))
+
+#?(:kotoba
+(defn rw-join-kw-texts [xs [:list [:ref :form/r]] i :i64 acc :string] :string
+  (if (>= i (vector-count xs))
+    acc
+    (rw-join-kw-texts xs (+ i 1) (string-concat (if (> i 0) (string-concat acc " ") acc) (string-concat (form-text (fl-nth xs i)) " T")))))
+   :default nil)
+
+#?(:kotoba
+;; the row `{:a T :b T | r}` of FIELDS (any collection of keywords), in keyword order
+(defn row-text [fields [:ref :form/r]] :string
+  (if (= 0 (form/count-of fields))
+    "{| r}"
+    (string-concat "{" (string-concat (rw-join-kw-texts (rw-sort-kws fields 0 (form/no-forms)) 0 "") " | r}"))))
+   :default
+(defn row-text [fields]
+  (if (empty? fields)
+    "{| r}"
+    (str "{" (str/join " " (map #(str % " T") fields)) " | r}"))))
+
+#?(:kotoba
+;; a record type's name as an identifier part: a-z and 0-9 stay, everything else is "_"
+(defn row-name-part [t [:ref :form/r]] :string
+  (let [k (form/nth-of t 1)]
+    (rw-name-chars (string-concat (fnamespace k) (string-concat "_" (fname k))) 0 "")))
+   :default
+(defn row-name-part [t]
+  (apply str (map (fn [c] (let [s (str c)]
+                            (if (contains? #{"a" "b" "c" "d" "e" "f" "g" "h" "i" "j" "k" "l" "m"
+                                             "n" "o" "p" "q" "r" "s" "t" "u" "v" "w" "x" "y" "z"
+                                             "0" "1" "2" "3" "4" "5" "6" "7" "8" "9"} s)
+                              s "_")))
+                  (str (namespace (second t)) "_" (name (second t)))))))
+
+;; does a call in PASSES hand the parameter to a parameter DECLARED as a record (already typed, so not a row)
+#?(:kotoba
+(defn rw-annotated-record-use? [schemas [:ref :form/r] by-name [:ref :form/r] passes [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of passes))
+    false
+    (let [pass (form/nth-of passes i)
+          callee (form/form-get by-name (form/nth-of pass 0))
+          j (form/int-value (form/nth-of pass 1))
+          ptypes (fget callee :param-types)
+          inferred (fget callee :param-types-inferred)]
+      (or (and (< j (form/count-of ptypes))
+               (not (rw-any-eq? (form/int-form j) inferred 0))
+               (ftruthy? (row-record-fields schemas (form/nth-of ptypes j))))
+          (rw-annotated-record-use? schemas by-name passes (+ i 1))))))
+   :default nil)
+
+;; the index of each joined symbol among PARAMS (a later duplicate wins, as `zipmap`)
+#?(:kotoba
+(defn rw-index-of [params [:ref :form/r] x [:ref :form/r] i :i64 best :i64] :i64
+  (if (>= i (form/count-of params))
+    best
+    (rw-index-of params x (+ i 1) (if (form/eq x (form/nth-of params i)) i best))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-join-indexes [params [:ref :form/r] joined [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of joined))
+    acc
+    (let [ix (rw-index-of params (form/nth-of joined i) 0 -1)]
+      (rw-join-indexes params joined (+ i 1) (if (< ix 0) acc (rw-set-add acc (form/int-form ix)))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-slot [schemas [:ref :form/r] by-name [:ref :form/r] f [:ref :form/r] i :i64 heads [:ref :form/r]] [:ref :form/r]
+  (let [params (fget f :params)
+        p (form/nth-of params i)
+        body (fget f :body)
+        passes (row-pass-through p body)]
+    (if (and (form/eq (form/nth-of (fget f :param-types) i) (form/keyword-form :i64))
+             (simple-symbol-form? p)
+             (not (rw-rebinds? p body heads))
+             (not (rw-annotated-record-use? schemas by-name passes 0)))
+      (fput (fput (fput (fput (rw-empty-map) :reads (row-field-reads p body))
+                          :operated? (form/bool-form (row-operated? p body)))
+                  :passes passes)
+            :joins (rw-join-indexes params (form/form-vec (form/kids-of (row-joins p params body))) 0 (rw-empty-set)))
+      (form/nil-form))))
+   :default nil)
+
+;; the candidate slot indexes of F: every parameter of a loop helper, else the inferred ones ascending
+#?(:kotoba
+(defn rw-candidate-indexes [f [:ref :form/r]] [:ref :form/r]
+  (if (ftruthy? (fget f :loop-helper?))
+    (rw-range (form/count-of (fget f :params)) 0 (form/no-forms))
+    (rw-sort-ints (fget f :param-types-inferred) 0 (form/no-forms))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-range [n :i64 i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i n)
+    (form/form-vec acc)
+    (rw-range n (+ i 1) (form/append-form acc (form/int-form i)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-insert-int [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] [:list [:ref :form/r]]
+  (if (or (>= i (vector-count xs)) (> (form/int-value (fl-nth xs i)) (form/int-value x)))
+    (fl-slice xs i (vector-count xs) (form/append-form (fl-slice xs 0 i (form/no-forms)) x))
+    (rw-insert-int xs x (+ i 1))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-sort-ints [xs [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of xs))
+    (form/form-vec acc)
+    (rw-sort-ints xs (+ i 1) (rw-insert-int acc (form/nth-of xs i) 0))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-slots [schemas [:ref :form/r] by-name [:ref :form/r] f [:ref :form/r] idxs [:ref :form/r] j :i64 heads [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (if (>= j (form/count-of idxs))
+    acc
+    (let [i (form/int-value (form/nth-of idxs j))
+          slot (rw-slot schemas by-name f i heads)]
+      (rw-slots schemas by-name f idxs (+ j 1) heads (if (form/is-nil? slot) acc (form/assoc-form acc (form/int-form i) slot))))))
+   :default nil)
+
+;; name -> slots, for every function that can have a row parameter
+#?(:kotoba
+(defn rw-candidates [schemas [:ref :form/r] functions [:ref :form/r] by-name [:ref :form/r] i :i64 heads [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)
+          eligible (or (ftruthy? (fget f :loop-helper?))
+                       (and (ftruthy? (fget f :source-name)) (> (form/count-of (fget f :param-types-inferred)) 0)))]
+      (rw-candidates schemas functions by-name (+ i 1) heads
+                     (if eligible
+                       (form/assoc-form acc (fget f :name) (rw-slots schemas by-name f (rw-candidate-indexes f) 0 heads (rw-empty-map)))
+                       acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-known-has? [known [:ref :form/r] fname [:ref :form/r] i :i64] :bool
+  (let [rows (form/form-get known fname)]
+    (and (not (form/is-nil? rows)) (form/form-has? rows (form/int-form i)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-passes-known? [known [:ref :form/r] passes [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of passes))
+    false
+    (let [pass (form/nth-of passes i)]
+      (or (rw-known-has? known (form/nth-of pass 0) (form/int-value (form/nth-of pass 1)))
+          (rw-passes-known? known passes (+ i 1))))))
+   :default nil)
+
+;; is slot I of FNAME a row: it reads a field, is operated on, was known to be one, or is passed to one
+#?(:kotoba
+(defn rw-row? [slots [:ref :form/r] known [:ref :form/r] fname [:ref :form/r] i :i64] :bool
+  (let [slot (form/form-get slots (form/int-form i))]
+    (or (> (form/count-of (fget slot :reads)) 0)
+        (ftruthy? (fget slot :operated?))
+        (rw-known-has? known fname i)
+        (rw-passes-known? known (fget slot :passes) 0))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-any-row? [slots [:ref :form/r] known [:ref :form/r] fname [:ref :form/r] joined [:ref :form/r] k :i64] :bool
+  (if (>= k (form/count-of joined))
+    false
+    (or (rw-row? slots known fname (form/int-value (form/nth-of joined k)))
+        (rw-any-row? slots known fname joined (+ k 1)))))
+   :default nil)
+
+;; the joined indexes of a slot that are slots themselves
+#?(:kotoba
+(defn rw-joined-slots [slots [:ref :form/r] joins [:ref :form/r] k :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= k (form/count-of joins))
+    (form/form-vec acc)
+    (let [ix (form/nth-of joins k)]
+      (rw-joined-slots slots joins (+ k 1) (if (form/form-has? slots ix) (form/append-form acc ix) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-union-reads [acc [:ref :form/r] more [:ref :form/r] k :i64] [:ref :form/r]
+  (if (>= k (form/count-of more))
+    acc
+    (rw-union-reads (rw-set-add acc (form/nth-of more k)) more (+ k 1))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-reads-of-joined [slots [:ref :form/r] joined [:ref :form/r] k :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= k (form/count-of joined))
+    acc
+    (rw-reads-of-joined slots joined (+ k 1)
+                        (rw-union-reads acc (fget (form/form-get slots (form/nth-of joined k)) :reads) 0))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-reads-of-passes [known [:ref :form/r] passes [:ref :form/r] k :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= k (form/count-of passes))
+    acc
+    (let [pass (form/nth-of passes k)
+          rows (form/form-get known (form/nth-of pass 0))
+          reads (if (form/is-nil? rows) (form/nil-form) (form/form-get rows (form/nth-of pass 1)))]
+      (rw-reads-of-passes known passes (+ k 1) (if (form/is-nil? reads) acc (rw-union-reads acc reads 0))))))
+   :default nil)
+
+;; the rows of one function: slot index -> fields, for the slots that are rows (ascending)
+#?(:kotoba
+(defn rw-rows [slots [:ref :form/r] known [:ref :form/r] fname [:ref :form/r] idxs [:ref :form/r] j :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= j (form/count-of idxs))
+    acc
+    (let [ix (form/nth-of idxs j)
+          slot (form/form-get slots ix)
+          joined (rw-joined-slots slots (fget slot :joins) 0 (form/no-forms))
+          is-row (or (rw-row? slots known fname (form/int-value ix))
+                     (rw-any-row? slots known fname joined 0))
+          reads (rw-reads-of-passes known (fget slot :passes) 0
+                                    (rw-reads-of-joined slots joined 0 (fget slot :reads)))]
+      (rw-rows slots known fname idxs (+ j 1) (if is-row (form/assoc-form acc ix reads) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-map-keys-sorted-ints [m [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of m))
+    (rw-sort-ints (form/form-vec acc) 0 (form/no-forms))
+    (rw-map-keys-sorted-ints m (+ i 2) (form/append-form acc (form/nth-of m i)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-next-known [candidates [:ref :form/r] known [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of candidates))
+    acc
+    (let [fname (form/nth-of candidates i)
+          slots (form/nth-of candidates (+ i 1))
+          rows (rw-rows slots known fname (rw-map-keys-sorted-ints slots 0 (form/no-forms)) 0 (rw-empty-map))]
+      (rw-next-known candidates known (+ i 2) (if (> (form/count-of rows) 0) (form/assoc-form acc fname rows) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-fixed-point [candidates [:ref :form/r] known [:ref :form/r]] [:ref :form/r]
+  (let [next (rw-next-known candidates known 0 (rw-empty-map))]
+    (if (form/eq next known) known (rw-fixed-point candidates next))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-by-name [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (rw-by-name functions (+ i 1) (form/assoc-form acc (fget (form/nth-of functions i) :name) (form/nth-of functions i)))))
+   :default nil)
+
+#?(:kotoba
+;; name -> {index fields} for every function with a row parameter, to a fixed point over pass-through
+(defn row-generics [ctx [:ref :ie/ctx] functions [:ref :form/r]] [:ref :form/r]
+  (let [schemas (ctx-schemas ctx)
+        by-name (rw-by-name functions 0 (rw-empty-map))
+        candidates (rw-candidates schemas functions by-name 0 (tables/row-binding-heads) (rw-empty-map))]
+    (rw-fixed-point candidates (rw-empty-map))))
+   :default
+(defn row-generics
+  "name -> {index fields} for every function with a row parameter, to a fixed
+  point over pass-through."
+  [functions]
+  (let [by-name (into {} (map (juxt :name identity)) functions)
+        ;; A parameter also passed to a parameter DECLARED as a record already
+        ;; has a type: `infer-absent-parameter-types` refines it to that record,
+        ;; as it did before rows existed, so it is not a row.
+        annotated-record-use?
+        (fn [passes]
+          (some (fn [[callee j]]
+                  (let [{:keys [param-types param-types-inferred]} (get by-name callee)]
+                    (and (< j (count param-types))
+                         (not (contains? (set param-types-inferred) j))
+                         (row-record-fields (nth param-types j)))))
+                passes))
+        candidates
+        (into {}
+              (keep (fn [{:keys [name params param-types param-types-inferred body
+                                 source-name loop-helper?]}]
+                      ;; A loop helper has no written parameters at all: each
+                      ;; parameter's type was read off its one call site, so a
+                      ;; captured row parameter arrives as the provisional :i64
+                      ;; its enclosing function still has here (floor
+                      ;; :row-unification: a loop over a row parameter is
+                      ;; specialized with its function).
+                      (when (or loop-helper? (and source-name (seq param-types-inferred)))
+                        [name (into {}
+                                    (keep (fn [i]
+                                            (let [p (nth params i)
+                                                  body (if (simple-symbol? p) (row-scope p body) body)]
+                                              (when (and (= :i64 (nth param-types i))
+                                                         (simple-symbol? p)
+                                                         (not (row-rebinds? p body))
+                                                         (not (annotated-record-use?
+                                                               (row-pass-through p body))))
+                                                [i {:reads (row-field-reads p body)
+                                                    :operated? (row-operated? p body)
+                                                    :list-item? (row-list-item? p body)
+                                                    :passes (row-pass-through p body)
+                                                    :joins (into #{}
+                                                                 (map (zipmap params (range)))
+                                                                 (row-joins p params body))}]))))
+                                    (if loop-helper?
+                                      (range (count params))
+                                      (sort param-types-inferred)))])))
+              functions)]
+    (loop [known {}]
+      (let [next-known
+            (into {}
+                  (keep (fn [[fname slots]]
+                          (let [row? (fn [i]
+                                       (let [{:keys [reads operated? passes]} (get slots i)]
+                                         (or (seq reads) operated?
+                                             (contains? (get known fname) i)
+                                             (some (fn [[callee j]]
+                                                     (contains? (get known callee) j))
+                                                   passes))))
+                                rows (into (sorted-map)
+                                           (keep (fn [[i {:keys [reads joins]}]]
+                                                   ;; A slot joined with a row is that row, and
+                                                   ;; reads what it reads: both are one type.
+                                                   (let [joined (filter #(contains? slots %) joins)]
+                                                     (when (or (row? i) (some row? joined))
+                                                       ;; ... and what the rows it is passed on to
+                                                       ;; read, so a missing field is refused at the
+                                                       ;; outermost call, not inside a specialization.
+                                                       [i (-> reads
+                                                              (into (mapcat #(:reads (get slots %))) joined)
+                                                              (into (mapcat (fn [[callee j]]
+                                                                              (get-in known [callee j])))
+                                                                    (:passes (get slots i))))]))))
+                                           slots)]
+                            (when (seq rows) [fname rows]))))
+                  candidates)]
+        (if (= next-known known)
+          ;; floor :list-item-from-expression: a parameter of a row function
+          ;; that is only conj'd onto an open `[]` field rides along with the
+          ;; row -- specialized at the record a call passes it, left as it is
+          ;; for anything else. Added after the fixed point, so passing it on
+          ;; makes nothing else a row.
+          (into {}
+                (map (fn [[fname rows]]
+                       [fname (reduce-kv (fn [rows i {:keys [list-item?]}]
+                                           (if (and list-item? (not (contains? rows i)))
+                                             (assoc rows i (with-meta (sorted-set) {::list-item true}))
+                                             rows))
+                                         rows (get candidates fname))]))
+                known)
+          (recur next-known)))))))
+
+#?(:kotoba
+(defn rw-texts [xs [:ref :form/r] i :i64 acc :string] :string
+  (if (>= i (form/count-of xs))
+    acc
+    (rw-texts xs (+ i 1) (string-concat (if (> i 1) (string-concat acc " ") acc) (use-site-text (form/nth-of xs i))))))
+   :default nil)
+
+;; the fields of record type T paired with the values of the record-new from index 2 of ARG, as `k v k v`
+#?(:kotoba
+(defn rw-record-pairs [fields [:ref :form/r] arg [:ref :form/r] i :i64 acc :string] :string
+  (if (or (>= i (form/count-of fields)) (>= (+ i 2) (form/count-of arg)))
+    acc
+    (rw-record-pairs fields arg (+ i 1)
+                     (string-concat (if (> i 0) (string-concat acc " ") acc)
+                                    (string-concat (use-site-text (form/nth-of (form/nth-of fields i) 0))
+                                                   (string-concat " " (use-site-text (form/nth-of arg (+ i 2)))))))))
+   :default nil)
+
+#?(:kotoba
+;; ARG as written: a map literal the row typed is shown as the literal, not as the record-new it became
+(defn row-argument-text [arg [:ref :form/r]] :string
+  (if (and (form/is-seq? arg) (> (form/count-of arg) 0) (or (rw-sym-is? (form/nth-of arg 0) "record-new") (rw-sym-is? (form/nth-of arg 0) "map-new")))
+    (let [literal? (rw-sym-is? (form/nth-of arg 0) "map-new")
+          t (form/nth-of arg 1)]
+      (if (or literal?
+              (and (record-type? t) (string=? (fnamespace (form/nth-of t 1)) "kotoba.map-literal")))
+        (string-concat "{"
+                       (string-concat (if literal? (rw-texts arg 1 "") (rw-record-pairs (form/nth-of t 2) arg 0 ""))
+                                      "}"))
+        (use-site-text arg)))
+    (use-site-text arg)))
+   :default
+(defn row-argument-text
+  "ARG as written: a map literal the row typed (`row-map-literal-record`) is
+  shown as the literal, not as the record-new it became."
+  [arg]
+  (if (and (seq? arg) (contains? '#{record-new map-new} (first arg)))
+    (let [literal? (= 'map-new (first arg))
+          t (second arg)]
+      (if (or literal?
+              (and (record-type? t)
+                   (= map-literal-record-namespace (namespace (second t)))))
+        (str "{" (str/join " " (if literal?
+                                 (map use-site-text (rest arg))
+                                 (mapcat (fn [[k _] v] [(use-site-text k) (use-site-text v)])
+                                         (nth t 2) (drop 2 arg))))
+             "}")
+        (use-site-text arg)))
+    (use-site-text arg))))
+
+#?(:kotoba
+(defn rw-type-shown [arg-type [:ref :form/r]] :string
+  (if (form/is-keyword? arg-type) (fname arg-type) (pr-form arg-type)))
+   :default nil)
+
+;; the first of READS (in keyword order) that FIELDS lacks
+#?(:kotoba
+(defn rw-first-missing [reads [:list [:ref :form/r]] fields [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (vector-count reads))
+    (form/nil-form)
+    (if (rw-set-has? fields (fl-nth reads i))
+      (rw-first-missing reads fields (+ i 1))
+      (fl-nth reads i))))
+   :default nil)
+
+#?(:kotoba
+(defn row-generic-call-refusal! [schemas [:ref :form/r] generic [:ref :form/r] index [:ref :form/r] param [:ref :form/r] reads [:ref :form/r]
+                                 arg [:ref :form/r] arg-type [:ref :form/r]] :i64
+  (let [row (row-text reads)
+        gtext (form-text generic)
+        ptext (form-text param)
+        fields (row-record-fields schemas arg-type)]
+    (cond
+      (form/is-nil? arg-type)
+      (throw (rw-error-data (str "argument " (row-argument-text arg) " to " gtext " has no type known here, and parameter "
+                                 ptext " of " gtext " is the row " row
+                                 ": only a record satisfies a row; bind the argument to a record first")
+                            "kotoba.error/row-argument-not-record" arg
+                            (rw-data2 "kotoba.error/function" generic "kotoba.error/parameter" param)))
+      (form/is-nil? fields)
+      (throw (rw-error-data (str "argument " (row-argument-text arg) " to " gtext " is "
+                                 (rw-type-shown arg-type) ", and parameter " ptext " of " gtext " is the row " row
+                                 ": only a record satisfies a row")
+                            "kotoba.error/row-argument-not-record" arg
+                            (rw-data-put (rw-data2 "kotoba.error/function" generic "kotoba.error/parameter" param)
+                                         "kotoba.error/actual" arg-type)))
+      :else
+      (let [missing (rw-first-missing (rw-sort-kws reads 0 (form/no-forms)) fields 0)]
+        (throw (rw-error-data (str "argument " (row-argument-text arg) " to " gtext " is record "
+                                   (form-text (form/nth-of arg-type 1)) ", which has no field " (form-text missing)
+                                   " that the row " row " of parameter " ptext " reads")
+                              "kotoba.error/row-field-missing" arg
+                              (rw-data-put (rw-data-put (rw-data2 "kotoba.error/function" generic "kotoba.error/parameter" param)
+                                                        "kotoba.error/field" missing)
+                                           "kotoba.error/actual" arg-type)))))))
+   :default
+(defn row-generic-call-refusal!
+  [generic index param reads arg arg-type]
+  (let [row (row-text reads)]
+    (cond
+      (nil? arg-type)
+      (reject! (str "argument " (row-argument-text arg) " to " generic " has no type known here, and parameter "
+                    param " of " generic " is the row " row
+                    ": only a record satisfies a row; bind the argument to a record first")
+               arg :kotoba.error/row-argument-not-record
+               {:kotoba.error/function generic :kotoba.error/parameter param})
+      (nil? (row-record-fields arg-type))
+      (reject! (str "argument " (row-argument-text arg) " to " generic " is "
+                    (if (keyword? arg-type) (name arg-type) (pr-str arg-type))
+                    ", and parameter " param " of " generic " is the row " row
+                    ": only a record satisfies a row")
+               arg :kotoba.error/row-argument-not-record
+               {:kotoba.error/function generic :kotoba.error/parameter param
+                :kotoba.error/actual arg-type})
+      :else
+      (let [missing (first (remove (row-record-fields arg-type) reads))]
+        (reject! (str "argument " (row-argument-text arg) " to " generic " is record "
+                      (second arg-type) ", which has no field " missing
+                      " that the row " row " of parameter " param " reads")
+                 arg :kotoba.error/row-field-missing
+                 {:kotoba.error/function generic :kotoba.error/parameter param
+                  :kotoba.error/field missing :kotoba.error/actual arg-type}))))))
+
+#?(:kotoba
+(defn rw-all-keywords-at-even? [args [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of args))
+    true
+    (and (form/is-keyword? (form/nth-of args i)) (rw-all-keywords-at-even? args (+ i 2)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-literal-types [ctx [:ref :ie/ctx] form [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of form))
+    (form/form-vec acc)
+    (rw-literal-types ctx form (+ i 2) locals table
+                      (form/append-form acc (infer-type-or-nil ctx (form/nth-of form (+ i 1)) locals table)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-all-some? [types [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of types))
+    true
+    (and (not (form/is-nil? (form/nth-of types i))) (rw-all-some? types (+ i 1)))))
+   :default nil)
+
+;; the record-new of a keyword map literal: fields [[k T] ...] from the keys at positions 1,3,.. and TYPES
+#?(:kotoba
+(defn rw-record-fields-of [form [:ref :form/r] types [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= j (form/count-of types))
+    (form/form-vec acc)
+    (rw-record-fields-of form types (+ j 1) (form/append-form acc (form/vec2 (form/nth-of form (+ 1 (* 2 j))) (form/nth-of types j))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-record-values [form [:ref :form/r] types [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= j (form/count-of types))
+    acc
+    (rw-record-values form types (+ j 1) (form/append-form acc (form/nth-of form (+ 2 (* 2 j)))))))
+   :default nil)
+
+#?(:kotoba
+;; A keyword-keyed map literal passed to a row is that row's record, not the keyword->i64 pair map: `(map-new :a 1 :b x)` in a row
+;; argument is `(record-new [:record :kotoba.map-literal/a+b [[:a :i64] [:b T]]] 1 x)`, T read off x. Anything else, or a literal a
+;; value of which has no type known here, is returned unchanged.
+(defn row-map-literal-record [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (if (and (form/is-seq? form) (> (form/count-of form) 1) (rw-sym-is? (form/nth-of form 0) "map-new")
+           (= 0 (rem (- (form/count-of form) 1) 2))
+           (rw-all-keywords-at-even? form 1))
+    (let [types (rw-literal-types ctx form 1 locals table (form/no-forms))]
+      (if (rw-all-some? types 0)
+        (form/form-seq (form/cons-onto (sa-sym-record-new)
+                                        (form/cons-onto (map-literal-record-type (rw-record-fields-of form types 0 (form/no-forms)))
+                                                        (rw-record-values form types 0 (form/no-forms)))))
+        form))
+    form))
+   :default
+(defn row-map-literal-record
+  "A keyword-keyed map literal passed to a row is that row's record, not the
+  keyword->i64 pair map (floor :row-unification): `(map-new :a 1 :b x)` in a
+  row argument is `(record-new [:record :kotoba.map-literal/a+b [[:a :i64] [:b
+  T]]] 1 x)`, T read off x. Anything else, or a literal a value of which has
+  no type known here, is returned unchanged (and refused as a map)."
+  [form type-of]
+  (if (and (seq? form) (= 'map-new (first form)) (seq (rest form))
+           (even? (count (rest form)))
+           (every? keyword? (take-nth 2 (rest form))))
+    (let [entries (partition 2 (rest form))
+          types (mapv #(type-of (second %)) entries)]
+      (if (every? some? types)
+        (list* 'record-new
+               (map-literal-record-type (mapv (fn [[k _] t] [k t]) entries types))
+               (map second entries))
+        form))
+    form)))
+
+#?(:kotoba
+(defn sa-sym-record-new [] [:ref :form/r]
+  (form/symbol-form "record-new"))
+   :default nil)
+
+#?(:kotoba
+(defn rw-r [form [:ref :form/r] rs [:ref :form/r]] [:ref :ana/r]
+  (record-new [:ref :ana/r] form rs 0))
+   :default nil)
+
+#?(:kotoba
+(defn rw-r-form [r [:ref :ana/r]] [:ref :form/r] (record-get [:ref :ana/r] r :form))
+   :default nil)
+
+#?(:kotoba
+(defn rw-r-rs [r [:ref :ana/r]] [:ref :form/r] (record-get [:ref :ana/r] r :aux))
+   :default nil)
+
+#?(:kotoba
+(defn rw-g [ctx [:ref :ie/ctx] generics [:ref :form/r] by-name [:ref :form/r]] [:ref :ana/g]
+  (record-new [:ref :ana/g] ctx generics by-name (form/nil-form) (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-g-ctx [g [:ref :ana/g]] [:ref :ie/ctx] (record-get [:ref :ana/g] g :ctx))
+   :default nil)
+
+#?(:kotoba
+(defn rw-g-generics [g [:ref :ana/g]] [:ref :form/r] (record-get [:ref :ana/g] g :a))
+   :default nil)
+
+#?(:kotoba
+(defn rw-g-by-name [g [:ref :ana/g]] [:ref :form/r] (record-get [:ref :ana/g] g :b))
+   :default nil)
+
+#?(:kotoba
+(defn rw-arg-type [g [:ref :ana/g] arg [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (infer-type-or-nil (rw-g-ctx g) arg locals table))
+   :default nil)
+
+#?(:kotoba
+(defn rw-label [by-name [:ref :form/r] g [:ref :form/r]] [:ref :form/r]
+  (let [f (form/form-get by-name g)
+        sn (fget f :source-name)]
+    (if (ftruthy? sn) sn g)))
+   :default nil)
+
+;; the spec name for (G, TYPES): "g__row_0_<part>_1_<part>", then _2, _3 ... until nobody has taken it
+#?(:kotoba
+(defn rw-types-text [types [:ref :form/r] i :i64 acc :string] :string
+  (if (>= (+ i 1) (form/count-of types))
+    acc
+    (rw-types-text types (+ i 2)
+                   (string-concat (if (> i 0) (string-concat acc "_") acc)
+                                  (string-concat (string-from-i64 (form/int-value (form/nth-of types i)))
+                                                 (string-concat "_" (row-name-part (form/nth-of types (+ i 1)))))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-fresh-spec-name [base :string k :i64 taken [:ref :form/r]] [:ref :form/r]
+  (let [n (form/symbol-form (if (= 1 k) base (string-concat base (string-concat "_" (string-from-i64 k)))))]
+    (if (rw-set-has? taken n) (rw-fresh-spec-name base (+ k 1) taken) n)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-set-types [pt [:ref :form/r] types [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of types))
+    pt
+    (rw-set-types (rw-vec-set pt (form/int-value (form/nth-of types i)) (form/nth-of types (+ i 1))) types (+ i 2))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-without-indexes [inferred [:ref :form/r] types [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of inferred))
+    (form/form-set acc)
+    (let [x (form/nth-of inferred i)]
+      (rw-without-indexes inferred types (+ i 1) (if (form/form-has? types x) acc (form/append-form acc x))))))
+   :default nil)
+
+;; the specialization of generic G at TYPES (a Form map index -> record type): its name, created on first use
+#?(:kotoba
+(defn rw-instantiate [g [:ref :ana/g] op [:ref :form/r] types [:ref :form/r] rs [:ref :form/r]] [:ref :ana/r]
+  (let [key (form/vec2 op types)
+        specs (fget rs :specs)]
+    (if (form/form-has? specs key)
+      (rw-r (form/form-get specs key) rs)
+      (let [f (form/form-get (rw-g-by-name g) op)
+            base (str (form-text op) "__row_" (rw-types-text types 0 ""))
+            sname (rw-fresh-spec-name base 1 (fget rs :taken))
+            inferred (rw-without-indexes (fget f :param-types-inferred) types 0 (form/no-forms))
+            named (fput (fput f :name sname) :param-types (rw-set-types (fget f :param-types) types 0))
+            spec (if (> (form/count-of inferred) 0)
+                   (fput named :param-types-inferred inferred)
+                   (form/dissoc-form named (form/keyword-form :param-types-inferred)))
+            rs2 (fput (fput (fput rs :taken (rw-set-add (fget rs :taken) sname))
+                            :specs (form/assoc-form specs key sname))
+                      :fns (form/form-vec (form/append-form (form/kids-of (fget rs :fns)) spec)))]
+        (rw-r sname rs2)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-dissoc-all [locals [:ref :form/r] syms [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of syms))
+    locals
+    (rw-dissoc-all (form/dissoc-form locals (form/nth-of syms i)) syms (+ i 1))))
+   :default nil)
+
+;; the rewritten kids of FORM from I on, appended (as a list) to ACC
+#?(:kotoba
+(defn rw-kids [g [:ref :ana/g] form [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] final? :bool
+               acc [:list [:ref :form/r]] rs [:ref :form/r]] [:ref :ana/rl]
+  (if (>= i (form/count-of form))
+    (record-new [:ref :ana/rl] acc rs 0)
+    (let [r (rw-rewrite g (form/nth-of form i) locals table final? rs)]
+      (rw-kids g form (+ i 1) locals table final? (form/append-form acc (rw-r-form r)) (rw-r-rs r)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rl-forms [r [:ref :ana/rl]] [:list [:ref :form/r]] (record-get [:ref :ana/rl] r :forms))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rl-rs [r [:ref :ana/rl]] [:ref :form/r] (record-get [:ref :ana/rl] r :aux))
+   :default nil)
+
+;; (let [b v ...] body ...): each value rewritten, then typed, in the locals of the bindings before it
+#?(:kotoba
+(defn rw-let-pairs [g [:ref :ana/g] bindings [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] final? :bool
+                    out [:list [:ref :form/r]] rs [:ref :form/r]] [:ref :ana/rl]
+  (if (>= (+ i 1) (form/count-of bindings))
+    (record-new [:ref :ana/rl] (form/append-form (form/no-forms) (fput (fput (rw-empty-map) :out (form/form-vec out)) :locals locals)) rs 0)
+    (let [b (form/nth-of bindings i)
+          r (rw-rewrite g (form/nth-of bindings (+ i 1)) locals table final? rs)
+          v (rw-r-form r)
+          t (rw-arg-type g v locals table)
+          locals2 (if (and (not (form/is-nil? t)) (simple-symbol-form? b))
+                    (form/assoc-form locals b t)
+                    (form/dissoc-form locals b))]
+      (rw-let-pairs g bindings (+ i 2) locals2 table final? (form/append-form (form/append-form out b) v) (rw-r-rs r)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rewrite-let [g [:ref :ana/g] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r] final? :bool rs [:ref :form/r]] [:ref :ana/r]
+  (let [pr (rw-let-pairs g (form/nth-of form 1) 0 locals table final? (form/no-forms) rs)
+        st (fl-nth (rw-rl-forms pr) 0)
+        bodies (rw-kids g form 2 (fget st :locals) table final? (form/no-forms) (rw-rl-rs pr))]
+    (rw-r (form/form-seq (form/cons-onto (form/symbol-form "let") (form/cons-onto (fget st :out) (rw-rl-forms bodies))))
+          (rw-rl-rs bodies))))
+   :default nil)
+
+;; the arguments of a call to a generic: rewritten, and a row argument that is a keyword map literal becomes its record
+#?(:kotoba
+(defn rw-generic-args [g [:ref :ana/g] form [:ref :form/r] i :i64 rows [:ref :form/r] locals [:ref :form/r] table [:ref :form/r] final? :bool
+                       acc [:list [:ref :form/r]] rs [:ref :form/r]] [:ref :ana/rl]
+  (if (>= i (form/count-of form))
+    (record-new [:ref :ana/rl] acc rs 0)
+    (let [r (rw-rewrite g (form/nth-of form i) locals table final? rs)
+          a (rw-r-form r)
+          a2 (if (form/form-has? rows (form/int-form (- i 1)))
+               (row-map-literal-record (rw-g-ctx g) a locals table)
+               a)]
+      (rw-generic-args g form (+ i 1) rows locals table final? (form/append-form acc a2) (rw-r-rs r)))))
+   :default nil)
+
+;; index -> type of the arguments at the row positions, ascending
+#?(:kotoba
+(defn rw-arg-types [g [:ref :ana/g] args [:list [:ref :form/r]] rows [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of rows))
+    acc
+    (let [ix (form/nth-of rows i)]
+      (rw-arg-types g args rows (+ i 2) locals table
+                    (form/assoc-form acc ix (rw-arg-type g (fl-nth args (form/int-value ix)) locals table))))))
+   :default nil)
+
+;; the first row position whose argument is not a record with every field the row reads, else -1
+#?(:kotoba
+(defn rw-bad-index [schemas [:ref :form/r] types [:ref :form/r] rows [:ref :form/r] i :i64] :i64
+  (if (>= (+ i 1) (form/count-of types))
+    -1
+    (let [ix (form/nth-of types i)
+          fields (row-record-fields schemas (form/nth-of types (+ i 1)))
+          reads (form/form-get rows ix)]
+      (if (and (ftruthy? fields) (rw-subset? reads fields 0))
+        (rw-bad-index schemas types rows (+ i 2))
+        (form/int-value ix)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-subset? [reads [:ref :form/r] fields [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of reads))
+    true
+    (and (rw-set-has? fields (form/nth-of reads i)) (rw-subset? reads fields (+ i 1)))))
+   :default nil)
+
+;; the first (i, j) with i < j where parameter j is joined to parameter i's `if` but was passed another type; [-1 -1] when none
+#?(:kotoba
+(defn rw-split-j [types [:ref :form/r] ti [:ref :form/r] i :i64 js [:ref :form/r] k :i64] :i64
+  (if (>= k (form/count-of js))
+    -1
+    (let [j (form/int-value (form/nth-of js k))
+          tj (form/form-get types (form/int-form j))]
+      (if (and (< i j) (not (form/is-nil? tj)) (not (form/eq ti tj)))
+        j
+        (rw-split-j types ti i js (+ k 1))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-split-from [types [:ref :form/r] params [:ref :form/r] body [:ref :form/r] p :i64] [:ref :form/r]
+  (if (>= (+ p 1) (form/count-of types))
+    (form/nil-form)
+    (let [i (form/int-value (form/nth-of types p))
+          ti (form/nth-of types (+ p 1))
+          joined (rw-sort-ints (form/form-vec (form/kids-of (rw-join-indexes params (form/form-vec (form/kids-of (row-joins (form/nth-of params i) params body))) 0 (rw-empty-set)))) 0 (form/no-forms))
+          j (rw-split-j types ti i joined 0)]
+      (if (>= j 0)
+        (form/vec2 (form/int-form i) (form/int-form j))
+        (rw-split-from types params body (+ p 2))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-join-mismatch [label [:ref :form/r] args [:ref :form/r] types [:ref :form/r] params [:ref :form/r] i :i64 j :i64] :i64
+  (throw (rw-error-data (str "arguments " (row-argument-text (form/nth-of args i)) " and " (row-argument-text (form/nth-of args j)) " to " (form-text label)
+                             " are " (pr-form (form/form-get types (form/int-form i))) " and " (pr-form (form/form-get types (form/int-form j)))
+                             ", and parameters " (form-text (form/nth-of params i)) " and " (form-text (form/nth-of params j))
+                             " of " (form-text label) " are branches of one if, so one row:"
+                             " a row is one record type at each call")
+                        "kotoba.error/row-join-mismatch" (form/nth-of args j)
+                        (rw-data2 "kotoba.error/function" label "kotoba.error/parameter" (form/nth-of params j)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-call-seq [head [:ref :form/r] args [:ref :form/r]] [:ref :form/r]
+  (form/form-seq (form/cons-onto head (form/kids-of args))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rewrite-generic [g [:ref :ana/g] form [:ref :form/r] op [:ref :form/r] locals [:ref :form/r] table [:ref :form/r] final? :bool
+                          rs [:ref :form/r]] [:ref :ana/r]
+  (let [rows (form/form-get (rw-g-generics g) op)
+        ra (rw-generic-args g form 1 rows locals table final? (form/no-forms) rs)
+        args (form/form-vec (rw-rl-forms ra))
+        rs1 (rw-rl-rs ra)
+        types (rw-arg-types g (rw-rl-forms ra) rows 0 locals table (rw-empty-map))
+        schemas (ctx-schemas (rw-g-ctx g))
+        bad (rw-bad-index schemas types rows 0)
+        f (form/form-get (rw-g-by-name g) op)
+        params (fget f :params)
+        split (if (< bad 0) (rw-split-from types params (fget f :body) 0) (form/nil-form))
+        label (rw-label (rw-g-by-name g) op)]
+    (rw-generic-decision g op args rs1 types rows bad split final? params label)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-generic-decision [g [:ref :ana/g] op [:ref :form/r] args [:ref :form/r] rs [:ref :form/r] types [:ref :form/r] rows [:ref :form/r]
+                           bad :i64 split [:ref :form/r] final? :bool params [:ref :form/r] label [:ref :form/r]] [:ref :ana/r]
+  (cond
+    (and (not (form/is-nil? split)) final?)
+    (let [_ (rw-join-mismatch label args types params (form/int-value (form/nth-of split 0)) (form/int-value (form/nth-of split 1)))]
+      (rw-r (form/nil-form) rs))
+    (not (form/is-nil? split)) (rw-r (rw-call-seq op args) rs)
+    (< bad 0)
+    (let [ri (rw-instantiate g op types rs)]
+      (rw-r (rw-call-seq (rw-r-form ri) args) (rw-r-rs ri)))
+    final?
+    (let [bi (form/int-form bad)
+          _ (row-generic-call-refusal! (ctx-schemas (rw-g-ctx g)) label bi (form/nth-of params bad) (form/form-get rows bi)
+                                       (form/nth-of args bad) (form/form-get types bi))]
+      (rw-r (form/nil-form) rs))
+    :else (rw-r (rw-call-seq op args) rs)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-rewrite [g [:ref :ana/g] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r] final? :bool rs [:ref :form/r]] [:ref :ana/r]
+  (cond
+    (and (form/is-seq? form) (> (form/count-of form) 0))
+    (let [op (form/nth-of form 0)]
+      (cond
+        (rw-sym-is? op "quote") (rw-r form rs)
+        (and (rw-sym-is? op "let") (form/is-vec? (form/nth-of form 1))) (rw-rewrite-let g form locals table final? rs)
+        (tables/row-binding-heads-has? op)
+        (let [inner (rw-dissoc-all locals (form/form-vec (form/kids-of (row-symbols-in (form/form-vec (fdrop form 3))))) 0)
+              r (rw-kids g form 1 inner table final? (form/no-forms) rs)]
+          (rw-r (form/form-seq (form/cons-onto op (rw-rl-forms r))) (rw-rl-rs r)))
+        (form/form-has? (rw-g-generics g) op) (rw-rewrite-generic g form op locals table final? rs)
+        :else
+        (let [r (rw-kids g form 1 locals table final? (form/no-forms) rs)]
+          (rw-r (form/form-seq (form/cons-onto op (rw-rl-forms r))) (rw-rl-rs r)))))
+    (form/is-vec? form)
+    (let [r (rw-kids g form 0 locals table final? (form/no-forms) rs)]
+      (rw-r (form/form-vec (rw-rl-forms r)) (rw-rl-rs r)))
+    :else (rw-r form rs)))
+   :default nil)
+
+;; every function whose result was inferred gets the type of its (record-projected) body
+#?(:kotoba
+(defn rw-infer-results [g [:ref :ana/g] fs [:ref :form/r] i :i64 table [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of fs))
+    (form/form-vec acc)
+    (let [f (form/nth-of fs i)
+          locals (zip-locals (fget f :params) (fget f :param-types))
+          t (if (ftruthy? (fget f :result-inferred?))
+              (rw-arg-type g (rewrite-record-projection-or (rw-g-ctx g) (fget f :body) locals table) locals table)
+              (form/nil-form))]
+      (rw-infer-results g fs (+ i 1) table (form/append-form acc (if (form/is-nil? t) f (fput f :result t)))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-infer-twice [g [:ref :ana/g] fs [:ref :form/r]] [:ref :form/r]
+  (let [once (rw-infer-results g fs 0 (abort-signatures fs) (form/no-forms))]
+    (rw-infer-results g once 0 (abort-signatures once) (form/no-forms))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-round-bodies [g [:ref :ana/g] fs [:ref :form/r] i :i64 table [:ref :form/r] final? :bool acc [:list [:ref :form/r]] rs [:ref :form/r]] [:ref :ana/rl]
+  (if (>= i (form/count-of fs))
+    (record-new [:ref :ana/rl] acc rs 0)
+    (let [f (form/nth-of fs i)
+          r (rw-rewrite g (fget f :body) (zip-locals (fget f :params) (fget f :param-types)) table final? rs)]
+      (rw-round-bodies g fs (+ i 1) table final? (form/append-form acc (fput f :body (rw-r-form r))) (rw-r-rs r)))))
+   :default nil)
+
+;; one round: result inference twice, then every body rewritten against the new signatures
+#?(:kotoba
+(defn rw-round [g [:ref :ana/g] fs [:ref :form/r] final? :bool rs [:ref :form/r]] [:ref :ana/r]
+  (let [inferred (rw-infer-twice g fs)
+        rl (rw-round-bodies g inferred 0 (abort-signatures inferred) final? (form/no-forms) rs)]
+    (rw-r (form/form-vec (rw-rl-forms rl)) (rw-rl-rs rl))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-fns-from [rs [:ref :form/r] from :i64] [:list [:ref :form/r]]
+  (fl-slice (form/kids-of (fget rs :fns)) from (form/count-of (fget rs :fns)) (form/no-forms)))
+   :default nil)
+
+;; the fixed point: rounds until nothing new is specialized and nothing changes (or the budget runs out), then the final round
+#?(:kotoba
+(defn rw-loop [g [:ref :ana/g] fs [:ref :form/r] budget :i64 rs [:ref :form/r]] [:ref :form/r]
+  (let [before (form/count-of (fget rs :fns))
+        r (rw-round g fs false rs)
+        rs1 (rw-r-rs r)
+        fs2 (form/form-vec (form/append-many (form/kids-of (rw-r-form r)) (rw-fns-from rs1 before)))]
+    (if (or (= 0 budget)
+            (and (= before (form/count-of (fget rs1 :fns))) (form/eq fs2 fs)))
+      (let [n (form/count-of (fget rs1 :fns))
+            fin (rw-round g fs2 true rs1)]
+        (form/form-vec (form/append-many (form/kids-of (rw-r-form fin)) (rw-fns-from (rw-r-rs fin) n))))
+      (rw-loop g fs2 (- budget 1) rs1))))
+   :default nil)
+
+;; 1. an export has one ABI: a generic there is refused
+#?(:kotoba
+(defn rw-check-exports [generics [:ref :form/r] i :i64 by-name [:ref :form/r] exported [:ref :form/r]] :i64
+  (if (>= (+ i 1) (form/count-of generics))
+    0
+    (let [name (form/nth-of generics i)
+          rows (form/nth-of generics (+ i 1))
+          f (form/form-get by-name name)
+          hit (and (not (ftruthy? (fget f :loop-helper?)))
+                   (or (form/is-nil? exported) (rw-set-has? exported (fget f :source-name))))
+          ix (form/nth-of rows 0)
+          p (form/nth-of (fget f :params) (form/int-value ix))
+          label (rw-label by-name name)
+          _ (rw-export-fail hit label p (form/form-get rows ix) (fget f :source-name))]
+      (rw-check-exports generics (+ i 2) by-name exported))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-export-fail [hit :bool label [:ref :form/r] p [:ref :form/r] reads [:ref :form/r] source-name [:ref :form/r]] :i64
+  (if hit
+    (throw (rw-error-data (str "exported function " (form-text label) " has the row-polymorphic parameter " (form-text p)
+                               " " (row-text reads)
+                               ", and an export has one ABI: annotate " (form-text p)
+                               " with a record type, or make " (form-text label) " private with defn-")
+                          "kotoba.error/row-generic-export" source-name
+                          (rw-data2 "kotoba.error/function" label "kotoba.error/parameter" p)))
+    0))
+   :default nil)
+
+;; 2. a generic used as a value: the first of the items of a non-quote collection node that names one
+#?(:kotoba
+(defn rw-first-generic-in [x [:ref :form/r] i :i64 generics [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of x))
+    (form/nil-form)
+    (if (form/form-has? generics (form/nth-of x i))
+      (form/nth-of x i)
+      (rw-first-generic-in x (+ i 1) generics))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-first-generic-value-kids [kids [:list [:ref :form/r]] i :i64 generics [:ref :form/r]] [:ref :form/r]
+  (if (>= i (vector-count kids))
+    (form/nil-form)
+    (let [r (rw-first-generic-value (fl-nth kids i) generics)]
+      (if (form/is-nil? r) (rw-first-generic-value-kids kids (+ i 1) generics) r))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-first-generic-value [x [:ref :form/r] generics [:ref :form/r]] [:ref :form/r]
+  (let [own (if (and (> (form/count-of x) 0) (not (form/is-map? x))
+                     (not (and (form/is-seq? x) (rw-sym-is? (form/nth-of x 0) "quote"))))
+              (rw-first-generic-in x (if (form/is-seq? x) 1 0) generics)
+              (form/nil-form))]
+    (if (form/is-nil? own) (rw-first-generic-value-kids (form/kids-of x) 0 generics) own)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-value-fail [arg [:ref :form/r] by-name [:ref :form/r]] :i64
+  (if (form/is-nil? arg)
+    0
+    (throw (rw-error-data (str "row-polymorphic function " (form-text (rw-label by-name arg))
+                               " cannot be used as a value: it exists only as its specializations, "
+                               "one per record type a call passes it")
+                          "kotoba.error/row-generic-value" arg
+                          (form/assoc-form (rw-empty-map) (fkw "kotoba.error/function") (rw-label by-name arg))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-check-values [functions [:ref :form/r] i :i64 generics [:ref :form/r] by-name [:ref :form/r]] :i64
+  (if (>= i (form/count-of functions))
+    0
+    (let [arg (rw-first-generic-value (fget (form/nth-of functions i) :body) generics)
+          _ (rw-value-fail arg by-name)]
+      (rw-check-values functions (+ i 1) generics by-name))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-ordinary [functions [:ref :form/r] generics [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    (form/form-vec acc)
+    (let [f (form/nth-of functions i)]
+      (rw-ordinary functions generics (+ i 1) (if (form/form-has? generics (fget f :name)) acc (form/append-form acc f))))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-specialize [ctx [:ref :ie/ctx] functions [:ref :form/r] exported [:ref :form/r] generics [:ref :form/r]] [:ref :form/r]
+  (let [by-name (rw-by-name functions 0 (rw-empty-map))
+        _ (rw-check-exports generics 0 by-name exported)
+        _ (rw-check-values functions 0 generics by-name)
+        g (rw-g ctx generics by-name)
+        rs (fput (fput (fput (rw-empty-map) :specs (rw-empty-map)) :fns (form/form-vec (form/no-forms)))
+                 :taken (rw-names-set functions 0 (rw-empty-set)))]
+    (rw-loop g (rw-ordinary functions generics 0 (form/no-forms)) 64 rs)))
+   :default nil)
+
+#?(:kotoba
+(defn rw-names-set [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (rw-names-set functions (+ i 1) (rw-set-add acc (fget (form/nth-of functions i) :name)))))
+   :default nil)
+
+#?(:kotoba
+;; Monomorphize every row-polymorphic function at the record types its calls pass, and drop the generic. EXPORTED is the set of
+;; exported source names (nil: every function); a generic there has no single ABI and is refused.
+(defn specialize-row-parameters [ctx [:ref :ie/ctx] functions [:ref :form/r] exported [:ref :form/r]] [:ref :form/r]
+  (let [generics (row-generics ctx functions)]
+    (if (= 0 (form/count-of generics))
+      functions
+      (rw-specialize ctx functions exported generics))))
+   :default
+(defn specialize-row-parameters
+  "Monomorphize every row-polymorphic function at the record types its calls
+  pass, and drop the generic. EXPORTED is the set of exported source names
+  (nil: every function); a generic there has no single ABI and is refused."
+  [functions exported]
+  (let [generics (row-generics functions)]
+    (if (empty? generics)
+      functions
+      (let [by-name (into {} (map (juxt :name identity)) functions)
+            label (fn [g] (or (:source-name (get by-name g)) g))]
+        (doseq [[g rows] generics
+                :let [f (get by-name g)]
+                :when (and (not (:loop-helper? f))
+                           (or (nil? exported) (contains? exported (:source-name f))))]
+          (let [i (ffirst rows)
+                p (nth (:params f) i)]
+            (reject! (str "exported function " (label g) " has the row-polymorphic parameter " p
+                          " " (row-text (get rows i))
+                          ", and an export has one ABI: annotate " p
+                          " with a record type, or make " (label g) " private with defn-")
+                     (:source-name f) :kotoba.error/row-generic-export
+                     {:kotoba.error/function (label g) :kotoba.error/parameter p})))
+        (doseq [f functions
+                x (tree-seq coll? seq (:body f))
+                :when (and (coll? x) (seq x) (not (and (seq? x) (= 'quote (first x)))))
+                arg (if (seq? x) (rest x) (seq x))
+                ;; symbol? first: past eight generics this is a hash map, and
+                ;; an integer literal is a ClojureScript BigInt, which has no
+                ;; hash (floor :cljs-literal-hash).
+                :when (and (symbol? arg) (contains? generics arg))]
+          (reject! (str "row-polymorphic function " (label arg)
+                        " cannot be used as a value: it exists only as its specializations, "
+                        "one per record type a call passes it")
+                   arg :kotoba.error/row-generic-value
+                   {:kotoba.error/function (label arg)}))
+        (let [specs (volatile! {})
+              spec-functions (volatile! [])
+              taken (volatile! (into #{} (map :name) functions))
+              instantiate!
+              (fn [g types]
+                (or (get @specs [g types])
+                    (let [f (get by-name g)
+                          base (str g "__row_"
+                                    (str/join "_" (map (fn [[i t]] (str i "_" (row-name-part t)))
+                                                       types)))
+                          ;; A name is at most `max-symbol-chars` (the verifier
+                          ;; refuses a longer one, "runtime KIR function shape
+                          ;; rejected"): two record parameters spell past it
+                          ;; (floor :list-item-from-expression). Cut with room for
+                          ;; the `_k` that keeps a cut name distinct below.
+                          base (if (< (- max-symbol-chars 4) (count base))
+                                 (subs base 0 (- max-symbol-chars 4))
+                                 base)
+                          sname (loop [k 1]
+                                  (let [n (symbol (if (= 1 k) base (str base "_" k)))]
+                                    (if (contains? @taken n) (recur (inc k)) n)))
+                          spec (-> f
+                                   (assoc :name sname
+                                          :param-types (reduce (fn [pt [i t]] (assoc pt i t))
+                                                               (:param-types f) types))
+                                   (update :param-types-inferred
+                                           #(not-empty (reduce disj (set %) (keys types)))))
+                          spec (if (:param-types-inferred spec) spec (dissoc spec :param-types-inferred))]
+                      (vswap! taken conj sname)
+                      (vswap! specs assoc [g types] sname)
+                      (vswap! spec-functions conj spec)
+                      sname)))
+              arg-type (fn [arg locals table]
+                         (try (infer-expression-type arg locals table)
+                              (catch #?(:clj Exception :cljs :default) _ nil)))
+              ;; A rebuilt form keeps its metadata: a match pattern's
+              ;; projection is marked (floor :row-get-and-match), and the
+              ;; specialization is where its arm is folded away.
+              keep-meta (fn [form rebuilt] (if (= form rebuilt) form (with-meta rebuilt (meta form))))
+              rewrite
+              (fn rw [form locals table final?]
+                (cond
+                  (and (seq? form) (seq form))
+                  (let [[op & args] form]
+                    (cond
+                      (= op 'quote) form
+                      (and (= op 'let) (vector? (first args)))
+                      (let [[bindings locals]
+                            (reduce (fn [[out locals] [b v]]
+                                      (let [v (rw v locals table final?)
+                                            t (arg-type v locals table)]
+                                        [(conj out b v)
+                                         (if (and t (simple-symbol? b)) (assoc locals b t) (dissoc locals b))]))
+                                    [[] locals] (partition 2 (first args)))]
+                        (apply list 'let bindings (map #(rw % locals table final?) (rest args))))
+                      (contains? row-binding-heads op)
+                      (let [inner (apply dissoc locals (row-symbols-in (drop 3 form)))]
+                        (apply list op (map #(rw % inner table final?) args)))
+                      (contains? generics op)
+                      (let [rows (get generics op)
+                            args (vec (map-indexed
+                                       (fn [i a]
+                                         (let [a (rw a locals table final?)]
+                                           (if (contains? rows i)
+                                             (row-map-literal-record a #(arg-type % locals table))
+                                             a)))
+                                       args))
+                            types (into (sorted-map)
+                                        (keep (fn [[i reads]]
+                                                (let [t (arg-type (nth args i) locals table)]
+                                                  ;; A list-item slot takes a record's type, and
+                                                  ;; nothing else's.
+                                                  (when (or (not (row-list-item-slot? reads))
+                                                            (row-record-fields t))
+                                                    [i t]))))
+                                        rows)
+                            bad (first (keep (fn [[i t]]
+                                               (let [fields (row-record-fields t)
+                                                     reads (get rows i)]
+                                                 (when-not (and fields (every? fields reads)) i)))
+                                             types))
+                            params (:params (get by-name op))
+                            split (when-not bad
+                                    (first (for [[i ti] types
+                                                 j (sort (map (zipmap params (range))
+                                                              (row-joins (nth params i) params
+                                                                         (:body (get by-name op)))))
+                                                 :let [tj (get types j)]
+                                                 :when (and (< i j) tj (not= ti tj))]
+                                             [i j])))]
+                        (cond
+                          (and split final?)
+                          (let [[i j] split]
+                            (reject! (str "arguments " (row-argument-text (nth args i)) " and "
+                                          (row-argument-text (nth args j)) " to " (label op)
+                                          " are " (pr-str (get types i)) " and " (pr-str (get types j))
+                                          ", and parameters " (nth params i) " and " (nth params j)
+                                          " of " (label op) " are branches of one if, so one row:"
+                                          " a row is one record type at each call")
+                                     (nth args j) :kotoba.error/row-join-mismatch
+                                     {:kotoba.error/function (label op)
+                                      :kotoba.error/parameter (nth params j)}))
+                          split (apply list op args)
+                          (nil? bad) (apply list (instantiate! op types) args)
+                          final? (row-generic-call-refusal!
+                                  (label op) bad
+                                  (row-param-text (nth (:params (get by-name op)) bad)
+                                                  (:body (get by-name op)))
+                                  (get rows bad) (nth args bad) (get types bad))
+                          :else (apply list op args)))
+                      :else (keep-meta form (apply list op (map #(rw % locals table final?) args)))))
+                  (vector? form) (mapv #(rw % locals table final?) form)
+                  :else form))
+              signatures (fn [fs]
+                           (into {} (map (fn [{:keys [name params param-types result]}]
+                                           [name {:params params :param-types param-types
+                                                  :result result}]))
+                                 fs))
+              infer-results (fn [fs]
+                              (let [table (signatures fs)]
+                                (mapv (fn [{:keys [params param-types body result-inferred?] :as f}]
+                                        ;; The body's descriptor-less record-gets are
+                                        ;; resolved first: a specialization returning
+                                        ;; its row (`(if (> (:a m) 6) m n)`) has a
+                                        ;; record result only once `(:a m)` is typed.
+                                        (if-let [t (and result-inferred?
+                                                        (let [locals (zipmap params param-types)]
+                                                          (arg-type (try (rewrite-record-projection
+                                                                          body locals table *schemas*)
+                                                                         (catch #?(:clj Exception :cljs :default) _ body))
+                                                                    locals table)))]
+                                          (assoc f :result t)
+                                          f))
+                                      fs)))
+              round (fn [fs final?]
+                      ;; Parameters first (ADR 0353 floor :rebound-row-argument):
+                      ;; this pass runs before the module-wide parameter
+                      ;; inference, so a helper's unannotated string parameter
+                      ;; is still the provisional :i64 here. A specialization
+                      ;; calling it -- normalize-selection's (code-unit-count
+                      ;; value) -- had no inferable result, kept :i64, and a
+                      ;; caller's (let [state (normalize-selection state)] ..)
+                      ;; passed that :i64 on to the next row.
+                      ;;
+                      ;; Literals next (ADR 0353 floor
+                      ;; :merge-literal-reads-its-row): a literal whose item is
+                      ;; a field read off a row -- open-window's (merge
+                      ;; {:window/title title ..} (dissoc window ..)) -- has
+                      ;; no type in the generic, where that field is not known,
+                      ;; so `type-literals` left it untyped there. In a
+                      ;; specialization the field is its record's: typed here,
+                      ;; the literal is the record its result is, and a caller
+                      ;; passing that result on to the next row passes a record.
+                      (let [fs (infer-results (infer-results (type-literals (infer-absent-parameter-types fs))))
+                            table (signatures fs)]
+                        (mapv (fn [{:keys [params param-types] :as f}]
+                                (update f :body rewrite (zipmap params param-types) table final?))
+                              fs)))
+              ordinary (vec (remove #(contains? generics (:name %)) functions))]
+          (loop [fs ordinary budget 64]
+            (let [before (count @spec-functions)
+                  fs' (round fs false)
+                  fs' (into fs' (subvec @spec-functions before))]
+              (if (or (zero? budget)
+                      (and (= before (count @spec-functions)) (= fs' fs)))
+                (let [n (count @spec-functions)
+                      final (round fs' true)]
+                  (into final (subvec @spec-functions n)))
+                (recur fs' (dec budget)))))))))))
+
+#?(:kotoba
+;; The inferred type of one literal item, or nil when nothing here knows it.
+(defn literal-item-type [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (infer-type-or-nil ctx form locals table))
+   :default
+(defn literal-item-type
+  "The inferred type of one literal item, or nil when nothing here knows it."
+  [form locals table]
+  (try (infer-expression-type form locals table)
+       (catch #?(:clj Exception :cljs :default) _ nil))))
+
+#?(:kotoba
+(defn rw-record-too-big [form [:ref :form/r] n :i64] :i64
+  (if (> n (max-record-fields))
+    (throw (rw-error (str "map literal with keyword keys lowers to a closed record and "
+                          "exceeds the record field limit: " (string-from-i64 n)
+                          " entries, at most " (string-from-i64 (max-record-fields)))
+                     "kotoba.error/map-literal-value" form))
+    0))
+   :default nil)
+
+#?(:kotoba
+(defn rw-all-i64? [types [:ref :form/r] i :i64] :bool
+  (if (>= i (form/count-of types))
+    true
+    (and (form/eq (form/nth-of types i) (form/keyword-form :i64)) (rw-all-i64? types (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-all-eq? [types [:ref :form/r] i :i64] :bool
+  (if (>= (+ i 1) (form/count-of types))
+    true
+    (and (form/eq (form/nth-of types i) (form/nth-of types (+ i 1))) (rw-all-eq? types (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+(defn rw-item-types [ctx [:ref :ie/ctx] args [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of args))
+    (form/form-vec acc)
+    (rw-item-types ctx args (+ i 1) locals table (form/append-form acc (literal-item-type ctx (form/nth-of args i) locals table)))))
+   :default nil)
+
+;; the result of typing a literal, or nil when it stays as it was (the host returns the form itself)
+#?(:kotoba
+(defn rw-type-literal [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (let [op (form/nth-of form 0)
+        argc (- (form/count-of form) 1)]
+    (cond
+      (and (rw-sym-is? op "map-new") (> argc 0) (= 0 (rem argc 2)) (rw-all-keywords-at-even? form 1))
+      (let [types (rw-literal-types ctx form 1 locals table (form/no-forms))]
+        ;; M17: the vector arm's rule applied to the map arm -- all `:i64`
+        ;; (or not all known) keeps the legacy pair map byte for byte.
+        (if (and (rw-all-some? types 0) (not (rw-all-i64? types 0)))
+          (let [_ (rw-record-too-big form (form/count-of types))]
+            (form/form-seq (form/cons-onto (sa-sym-record-new)
+                                            (form/cons-onto (map-literal-record-type (rw-record-fields-of form types 0 (form/no-forms)))
+                                                            (rw-record-values form types 0 (form/no-forms))))))
+          (form/nil-form)))
+      (and (rw-sym-is? op "vector-new") (> argc 0))
+      (let [types (rw-item-types ctx form 1 locals table (form/no-forms))]
+        (cond
+          (or (not (rw-all-some? types 0)) (rw-all-i64? types 0)) (form/nil-form)
+          (rw-all-eq? types 0)
+          (form/form-seq (form/cons-onto (form/symbol-form "typed-list-new")
+                                          (form/cons-onto (form/vec2 (form/keyword-form :list) (form/nth-of types 0)) (fdrop form 1))))
+          :else
+          (form/form-seq (form/cons-onto (form/symbol-form "hetero-vector-new")
+                                          (form/cons-onto (form/vec2 (form/keyword-form :vector) types) (fdrop form 1))))))
+      :else (form/nil-form))))
+   :default nil)
+
+#?(:kotoba
+;; ADR 0353 floor :literal-typing. One literal whose items were lowered before any type was inferred, typed now that its items'
+;; types are known (the form itself when nothing changes).
+(defn type-literal [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (let [r (rw-type-literal ctx form locals table)]
+    (if (form/is-nil? r) form r)))
+   :default
+(defn type-literal
+  "ADR 0353 floor :literal-typing. One literal whose items were lowered
+  before any type was inferred, typed now that its items' types are known.
+
+  A keyword-keyed pair map `(map-new :a x :b y)` is the anonymous closed
+  record of its fields, each typed by its value -- the record a literal with
+  a spelled non-i64 value already lowered to (`keyword-map-literal-record-
+  fields`) -- only when a field's known type is NOT `:i64`. A literal whose
+  fields are all `:i64` (or not all known here) is the legacy pair map it
+  always was, byte for byte (ADR 0012 decision 1; the CID-stability control
+  in `keyword-map-record-literal-test`), and its missing keys answer get's
+  default. This is the same rule the `vector-new` arm below applies.
+
+  A vector literal `(vector-new a b)` whose items are not all `:i64` is a
+  typed vector: `[:list T]` when every item is one type T (so `nth` with any
+  index answers a T and `count` counts it), the heterogeneous `[:vector
+  [T ...]]` a closed literal of mixed item types already is otherwise.
+
+  A literal an item of which has no type known here is returned unchanged
+  (and refused downstream as it was)."
+  [form locals table]
+  (let [[op & args] form]
+    (cond
+      (and (= 'map-new op) (seq args) (even? (count args))
+           (every? keyword? (take-nth 2 args)))
+      (let [entries (partition 2 args)
+            types (mapv #(literal-item-type (second %) locals table) entries)]
+        ;; M17: the vector arm's rule applied to the map arm -- a literal
+        ;; whose items are all `:i64` (or not all known here) is the legacy
+        ;; pair map it always was, byte for byte (ADR 0012 decision 1, and
+        ;; the CID-stability control in keyword-map-record-literal-test).
+        ;; Only a known non-:i64 item makes the anonymous closed record.
+        (if (and (every? some? types) (not (every? #{:i64} types)))
+          (do (when (> (count entries) max-record-fields)
+                (reject! (str "map literal with keyword keys lowers to a closed record and "
+                              "exceeds the record field limit: " (count entries)
+                              " entries, at most " max-record-fields)
+                         form :kotoba.error/map-literal-value))
+              (list* 'record-new
+                     (map-literal-record-type (mapv (fn [[k _] t] [k t]) entries types))
+                     (map second entries)))
+          form))
+
+      ;; ADR 0353 floor :empty-map-literal. `{}` has no row of its own, so
+      ;; `(assoc {} :a x :b y)` is the literal `{:a x :b y}` -- the record of
+      ;; the keys it assoc's, fields in a map literal's key order, a repeated
+      ;; key's last value winning as `assoc`'s does -- and never the
+      ;; keyword->i64 pair map `(map-new)` used to be. An integer or string
+      ;; first key is the typed map `rewrite-record-projection` retypes
+      ;; (monolith a7ef280 15518-15543).
+      (and (= 'map-assoc op) (= '(map-new) (first args)) (seq (rest args))
+           (even? (count (rest args)))
+           (every? keyword? (take-nth 2 (rest args))))
+      (let [entries (reduce (fn [m [k v]] (assoc m k v)) {} (partition 2 (rest args)))
+            entries (sort-by key (map-literal-key-order :keyword) entries)
+            types (mapv #(literal-item-type (second %) locals table) entries)]
+        (if (every? some? types)
+          (do (when (> (count entries) max-record-fields)
+                (reject! (str "map literal with keyword keys lowers to a closed record and "
+                              "exceeds the record field limit: " (count entries)
+                              " entries, at most " max-record-fields)
+                         form :kotoba.error/map-literal-value))
+              (list* 'record-new
+                     (map-literal-record-type (mapv (fn [[k _] t] [k t]) entries types))
+                     (map second entries)))
+          form))
+
+      (and (= 'vector-new op) (seq args))
+      (let [types (mapv #(literal-item-type % locals table) args)]
+        (cond
+          (or (not (every? some? types)) (every? #{:i64} types)) form
+          (apply = types) (list* 'typed-list-new [:list (first types)] args)
+          :else (list* 'hetero-vector-new [:vector types] args)))
+
+      :else form))))
+
+;; the rewritten kids of FORM from I on, as a list
+#?(:kotoba
+(defn tl-kids [ctx [:ref :ie/ctx] form [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of form))
+    acc
+    (let [r (tl-rewrite ctx (form/nth-of form i) locals table)]
+      (tl-kids ctx form (+ i 1) locals table (form/append-form acc r)))))
+   :default nil)
+
+;; `(if (= form rebuilt) form (with-meta rebuilt (meta form)))`
+#?(:kotoba
+(defn tl-keep-meta [form [:ref :form/r] rebuilt [:ref :form/r]] [:ref :form/r]
+  (if (form/eq form rebuilt) form (fmeta-from form rebuilt)))
+   :default nil)
+
+#?(:kotoba
+(defn tl-let-pairs [ctx [:ref :ie/ctx] bindings [:ref :form/r] i :i64 locals [:ref :form/r] table [:ref :form/r] out [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= (+ i 1) (form/count-of bindings))
+    (fput (fput (rw-empty-map) :out (form/form-vec out)) :locals locals)
+    (let [b (form/nth-of bindings i)
+          v (tl-rewrite ctx (form/nth-of bindings (+ i 1)) locals table)
+          t (literal-item-type ctx v locals table)
+          locals2 (if (and (not (form/is-nil? t)) (simple-symbol-form? b))
+                    (form/assoc-form locals b t)
+                    (form/dissoc-form locals b))]
+      (tl-let-pairs ctx bindings (+ i 2) locals2 table (form/append-form (form/append-form out b) v)))))
+   :default nil)
+
+#?(:kotoba
+(defn tl-rewrite-let [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (let [bv (form/nth-of form 1)
+        st (tl-let-pairs ctx bv 0 locals table (form/no-forms))
+        bodies (tl-kids ctx form 2 (fget st :locals) table (form/no-forms))
+        bindings (fmeta-from bv (fget st :out))
+        rebuilt (form/form-seq (form/cons-onto (form/symbol-form "let") (form/cons-onto bindings bodies)))]
+    (tl-keep-meta form rebuilt)))
+   :default nil)
+
+#?(:kotoba
+(defn tl-rewrite [ctx [:ref :ie/ctx] form [:ref :form/r] locals [:ref :form/r] table [:ref :form/r]] [:ref :form/r]
+  (cond
+    (and (form/is-seq? form) (> (form/count-of form) 0))
+    (let [op (form/nth-of form 0)]
+      (cond
+        (rw-sym-is? op "quote") form
+        (and (rw-sym-is? op "let") (form/is-vec? (form/nth-of form 1))) (tl-rewrite-let ctx form locals table)
+        (tables/row-binding-heads-has? op)
+        (let [inner (rw-dissoc-all locals (form/form-vec (form/kids-of (row-symbols-in (form/form-vec (fdrop form 3))))) 0)
+              kids (tl-kids ctx form 1 inner table (form/no-forms))]
+          (tl-keep-meta form (form/form-seq (form/cons-onto op kids))))
+        :else
+        (let [kids (tl-kids ctx form 1 locals table (form/no-forms))
+              rebuilt (tl-keep-meta form (form/form-seq (form/cons-onto op kids)))
+              typed (rw-type-literal ctx rebuilt locals table)]
+          (if (form/is-nil? typed) rebuilt (fmeta-from form typed)))))
+    (form/is-vec? form)
+    (let [kids (tl-kids ctx form 0 locals table (form/no-forms))]
+      (tl-keep-meta form (form/form-vec kids)))
+    :else form))
+   :default nil)
+
+#?(:kotoba
+(defn tl-round [ctx [:ref :ie/ctx] fs [:ref :form/r] i :i64 table [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of fs))
+    (form/form-vec acc)
+    (let [f (form/nth-of fs i)
+          body (tl-rewrite ctx (fget f :body) (zip-locals (fget f :params) (fget f :param-types)) table)]
+      (tl-round ctx fs (+ i 1) table (form/append-form acc (fput f :body body))))))
+   :default nil)
+
+#?(:kotoba
+(defn tl-loop [ctx [:ref :ie/ctx] fs [:ref :form/r] budget :i64] [:ref :form/r]
+  (let [next (tl-round ctx fs 0 (abort-signatures fs) (form/no-forms))]
+    (if (or (= 0 budget) (form/eq next fs))
+      next
+      (tl-loop ctx next (- budget 1)))))
+   :default nil)
+
+#?(:kotoba
+;; Run `type-literal` over every function body, innermost literal first, with the locals a `let` binds typed as they are bound.
+;; Rounds to a fixed point, because a function whose result was a literal changes type with it.
+(defn type-literals [ctx [:ref :ie/ctx] functions [:ref :form/r]] [:ref :form/r]
+  (tl-loop ctx functions 8))
+   :default
+(defn type-literals
+  "Run `type-literal` over every function body, innermost literal first, with
+  the locals a `let` binds typed as they are bound. Rounds to a fixed point,
+  because a function whose result was a literal changes type with it."
+  [functions]
+  (let [signatures (fn [fs]
+                     (into {} (map (fn [{:keys [name params param-types result]}]
+                                     [name {:params params :param-types param-types
+                                            :result result}]))
+                           fs))
+        ;; A rebuilt form keeps the metadata later passes read (spans, and
+        ;; the markers absence and predicate elaboration leave on forms).
+        keep-meta (fn [form rebuilt] (if (= form rebuilt) form (with-meta rebuilt (meta form))))
+        rewrite
+        (fn rw [form locals table]
+          (cond
+            (and (seq? form) (seq form))
+            (let [[op & args] form]
+              (cond
+                (= op 'quote) form
+                (and (= op 'let) (vector? (first args)))
+                (let [[bindings locals]
+                      (reduce (fn [[out locals] [b v]]
+                                (let [v (rw v locals table)
+                                      t (literal-item-type v locals table)]
+                                  [(conj out b v)
+                                   (if (and t (simple-symbol? b)) (assoc locals b t) (dissoc locals b))]))
+                              [[] locals] (partition 2 (first args)))]
+                  (keep-meta form (apply list 'let (with-meta bindings (meta (first args)))
+                                         (map #(rw % locals table) (rest args)))))
+                (contains? row-binding-heads op)
+                (let [inner (apply dissoc locals (row-symbols-in (drop 3 form)))]
+                  (keep-meta form (apply list op (map #(rw % inner table) args))))
+                :else
+                (let [rebuilt (keep-meta form (apply list op (map #(rw % locals table) args)))
+                      typed (type-literal rebuilt locals table)]
+                  (if (identical? typed rebuilt) rebuilt (with-meta typed (meta form))))))
+            (vector? form) (keep-meta form (mapv #(rw % locals table) form))
+            :else form))]
+    (loop [fs functions budget 8]
+      (let [table (signatures fs)
+            fs' (mapv (fn [{:keys [params param-types] :as f}]
+                        (update f :body rewrite (zipmap params param-types) table))
+                      fs)]
+        (if (or (zero? budget) (= fs' fs))
+          fs'
+          (recur fs' (dec budget))))))))
+
+
+;; --- main-only preservation forms (a7ef280 monolith), host twins only ---
+;; row-scope cluster: preserved verbatim (typed twins and wiring are follow-ups).
+
+#?(:kotoba nil :default (defn- row-scope
+  "FORM with every reference to PARAM that a `let` has shadowed renamed out of
+  the way, so what row inference reads off PARAM is what the parameter is
+  read for: in `(let [m (norm m)] (:a m))` the first m is the parameter and
+  the second is norm's result. A `let` binder equal to PARAM is renamed too,
+  and so is each later reference in that `let` -- its following binding
+  values and its body. browser.text-edit rebinds its state parameter this way
+  in every function (ADR 0353 floor :browser-text-edit); before, a rebinding
+  anywhere left the parameter the provisional :i64."
+  [param form]
+  (let [shadowed (symbol (str "__kotoba_row_shadowed_" (name param)))
+        rename (fn rename [x]
+                 (cond (= param x) shadowed
+                       (seq? x) (with-meta (apply list (map rename x)) (meta x))
+                       (map-entry? x) x
+                       (vector? x) (with-meta (mapv rename x) (meta x))
+                       :else x))]
+    (letfn [(scope [x]
+              (cond
+                (and (seq? x) (= 'let (first x)) (vector? (second x))
+                     (even? (count (second x))))
+                (loop [pairs (partition 2 (second x)) out []]
+                  (if-let [[b v] (first pairs)]
+                    (if (= param b)
+                      (apply list 'let
+                             (into (conj out shadowed (scope v))
+                                   (mapcat (fn [[b2 v2]] [(if (= param b2) shadowed b2) (rename v2)]))
+                                   (next pairs))
+                             (map rename (drop 2 x)))
+                      (recur (next pairs) (conj out b (scope v))))
+                    (apply list 'let out (map scope (drop 2 x)))))
+                (seq? x) (with-meta (apply list (map scope x)) (meta x))
+                (map-entry? x) x
+                (vector? x) (with-meta (mapv scope x) (meta x))
+                :else x))]
+      (scope form)))))
+
+#?(:kotoba nil :default (defn- row-get-receiver?
+  "Is X a `get` (or a match's presence test) whose receiver is one of
+  ALIASES? A `get` reads a row as `(:k m)` does (floor :row-get-and-match)."
+  [aliases x]
+  (and (seq? x)
+       (or (and (= 'get (first x)) (<= 3 (count x) 4))
+           (= match-has-marker (first x))
+           ;; floor :options-map-argument: `{:keys [extend?]}` over a
+           ;; parameter. It reads a row as `(get m :k)` with an absent key
+           ;; does -- not requiring the key.
+           (= '__kotoba_destructure_get (first x)))
+       (contains? aliases (second x)))))
+
+#?(:kotoba nil :default (defn- row-updates
+  "binder -> the keys written since PARAM, for each name a `let` in FORM binds
+  to an assoc of PARAM -- or of a name already here -- with keyword keys:
+  `(let [s (update s :n inc)] (update s :m inc))`, its rebinding renamed out
+  of the way by `row-scope`, binds the shadowed name to `(map-assoc PARAM :n
+  ..)`. That name is PARAM's row with :n written, so a field read off it that
+  it did not write is a field read off PARAM (ADR 0353 floor
+  :native-rebound-row-update). A name bound more than once is left out: which
+  binding a read sees is a question of scope this walk does not answer."
+  [param form]
+  (let [lets (filter (fn [x] (and (seq? x) (= 'let (first x)) (vector? (second x))
+                                  (even? (count (second x)))))
+                     (tree-seq coll? seq form))
+        pairs (mapcat #(partition 2 (second %)) lets)
+        once (into #{} (keep (fn [[b n]] (when (= 1 n) b)))
+                   (frequencies (map first pairs)))]
+    (reduce (fn [known [b v]]
+              (if (and (simple-symbol? b) (contains? once b) (not= param b)
+                       (seq? v) (= 'map-assoc (first v)) (<= 4 (count v)) (even? (count v))
+                       (or (= param (second v)) (contains? known (second v)))
+                       (every? keyword? (take-nth 2 (drop 2 v))))
+                (assoc known b (into (get known (second v) #{}) (take-nth 2 (drop 2 v))))
+                known))
+            {} pairs))))
+
+#?(:kotoba nil :default (defn- row-list-item?
+  "Is PARAM an item `(conj (record-get m k) .. PARAM ..)` conj's onto an open
+  `[]` key k of the module (floor :list-item-from-expression), or onto a key a
+  vector literal of records is written at (floor :record-list-field-literal:
+  browser.surface's {.. :surface/windows [{:window/id \"w1\" ..}]} beside
+  open-window's conj of its window)? The item is then checked against the
+  list's R by `typed-list-conj`."
+  [param form]
+  (boolean
+   (first-truthy
+    (fn [x]
+      (and (seq? x) (= 'conj (first x))
+           (let [k (list-field-read-key (second x))]
+             (or (contains? (:open *module-list-fields*) k)
+                 (contains? (:record-lists *module-list-fields*) k)))
+           (first-truthy #{param} (drop 2 x))))
+    (tree-seq coll? seq form)))))
+
+#?(:kotoba nil :default (defn- row-list-item-slot?
+  "Is the row slot READS (`row-generics`) a parameter only conj'd onto an open
+  `[]` field (floor :list-item-from-expression)?"
+  [reads]
+  (boolean (::list-item (meta reads)))))
+
+#?(:kotoba nil :default (defn- row-param-text
+  "PARAM as the author wrote it: a destructured parameter is a synthetic name
+  (`param-name+wrap`), so it is shown as the `{:keys [..]}` its body reads
+  off it (floor :options-map-argument)."
+  [param body]
+  (if (and (reserved-binding-name? param)
+           (str/starts-with? (name param) "__kotoba_param-destr"))
+    (let [aliases (row-aliases param body)
+          ks (into [] (comp (filter #(and (seq? %) (= '__kotoba_destructure_get (first %))
+                                          (contains? aliases (second %))
+                                          (keyword? (nth % 2 nil))))
+                            (map #(symbol (name (nth % 2))))
+                            (distinct))
+                   (tree-seq coll? seq body))]
+      (str "{:keys " (pr-str ks) "}"))
+    param)))

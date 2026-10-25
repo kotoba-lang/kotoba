@@ -1,0 +1,150 @@
+(ns kotoba.compiler.interrupt-entry-test
+  "Two rules an interrupt entry has to obey before any byte is emitted.
+
+  ONE: `kernel-isr-entry-address` is admitted at arity 1 and nothing else.
+  Arity is the WHOLE of what this frontend verifies for a privileged
+  operation, and the number is stated independently in three repositories --
+  here, in kotoba-gmir's `x86-privileged-action-arities`, and in
+  kotoba-native's emitter -- with nothing keeping them equal but review.
+
+  TWO: a function whose NAME claims an interrupt vector must have the
+  signature the toolchain-generated entry calls. That entry is a fixed byte
+  sequence: it loads four registers out of the frame the CPU built and calls.
+  It cannot ask the body what it wanted, so a body of a different arity is
+  handed four registers and reads whichever of them it happened to name -- a
+  wrong answer with no diagnostic anywhere, which is why the refusal is here
+  and not in the packager.
+
+  What this namespace cannot check: whether the packager actually laid an
+  entry down at that vector. That is kotoba-native's, and the two halves are
+  deliberately separate -- this one is about the SOURCE naming a vector, that
+  one about an IMAGE having one."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.compiler.frontend :as frontend]))
+
+(defn- unit
+  "`analyze` admits a compilation unit, not a lone `defn`."
+  [source]
+  (str source "\n(defn main [] :i64 0)"))
+
+(defn- analyzes? [source]
+  (try (do (sema/analyze (unit source)) true)
+       (catch #?(:clj Throwable :cljs :default) _ false)))
+
+(defn- rejection-of [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+(defn- rejection-code [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         (:kotoba.error/code (ex-data e)))))
+
+(def ^:private body
+  "A well-formed entry body, reused so the negative cases below differ from it
+  in exactly one thing."
+  (str "(defn aiueos-isr-3 [vector :i64 error-code :i64 rip :i64 rsp :i64] :i64"
+       "  (kernel-out-u8 233 73))"))
+
+(deftest isr-entry-address-is-admitted-at-arity-one
+  (is (analyzes? "(defn f [] :i64 (kernel-isr-entry-address 3))")
+      "the vector is the one input")
+  (is (analyzes? "(defn f [vector] :i64 (kernel-isr-entry-address vector))")
+      "and it need not be a literal here -- the backend bounds it at run time")
+  ;; The shape a real IDT build has: the address is one term of the gate
+  ;; descriptor arithmetic, not a statement on its own.
+  (is (analyzes?
+       (str "(defn gate-low [vector :i64] :i64"
+            "  (bit-or (bit-and (kernel-isr-entry-address vector) 65535)"
+            "          524288))"))
+      "the descriptor arithmetic this operator exists for must analyze"))
+
+(deftest isr-entry-address-refuses-every-other-arity
+  ;; The reason literal is pinned, not merely that something was refused: a
+  ;; call with the wrong argument count that fell through to the function-call
+  ;; arm would ALSO be rejected, with "operation has no admitted lowering",
+  ;; and would look identical from outside.
+  (doseq [[label source got]
+          [["no arguments" "(defn f [] :i64 (kernel-isr-entry-address))" 0]
+           ["two arguments" "(defn f [] :i64 (kernel-isr-entry-address 3 3))" 2]]]
+    (testing label
+      (is (= (str "kernel privileged operation arity mismatch: kernel-isr-entry-address takes 1 argument; got " got)
+             (rejection-of source))))))
+
+(deftest the-arity-map-is-the-single-statement-of-it
+  (is (= 1 (get frontend/kernel-privileged-operations 'kernel-isr-entry-address)))
+  ;; Pinned beside it: the four canned handler-address operations stay
+  ;; zero-arity. Each names exactly ONE byte sequence; this one names any
+  ;; member of a table, which is the whole reason it takes an operand.
+  (doseq [op '[kernel-page-fault-handler-address
+               kernel-page-fault-recovery-handler-address
+               kernel-double-fault-handler-address
+               kernel-undefined-opcode-handler-address]]
+    (is (= 0 (get frontend/kernel-privileged-operations op)) (str op)))
+  ;; A privileged operation is a reserved function name, so a guest cannot
+  ;; shadow it with a `defn` of its own and get past the arity check that way.
+  (is (contains? frontend/reserved-function-names 'kernel-isr-entry-address)))
+
+(deftest an-entry-name-is-its-vector
+  (is (= 3 (frontend/interrupt-entry-vector 'aiueos-isr-3)))
+  (is (= 0 (frontend/interrupt-entry-vector 'aiueos-isr-0)))
+  (is (= 63 (frontend/interrupt-entry-vector 'aiueos-isr-63)))
+  (testing "a mnemonic is not a vector"
+    (is (nil? (frontend/interrupt-entry-vector 'aiueos-isr-bp))))
+  (testing "the table stops at the reservation the image packager makes"
+    (is (= 64 frontend/interrupt-entry-vector-limit))
+    (is (nil? (frontend/interrupt-entry-vector 'aiueos-isr-64)))
+    (is (nil? (frontend/interrupt-entry-vector 'aiueos-isr-255))))
+  (testing "leading zeroes are not a second spelling of the same vector"
+    (is (nil? (frontend/interrupt-entry-vector 'aiueos-isr-03))))
+  (testing "a name that is not an entry name at all"
+    (is (nil? (frontend/interrupt-entry-vector 'main)))
+    (is (nil? (frontend/interrupt-entry-vector 'aiueos-sha256)))))
+
+(deftest a-well-formed-entry-analyzes
+  (is (nil? (rejection-of body))
+      "SCANNED: the admitted entry really does analyze"))
+
+(deftest an-entry-with-the-wrong-arity-is-refused
+  ;; The generated entry loads rdi/rsi/rdx/rcx from the interrupt frame and
+  ;; calls. A two-parameter body reads rdi and rsi and leaves the other two
+  ;; registers holding the rip and rsp it never asked for -- no diagnostic
+  ;; anywhere, which is why this is refused in the frontend.
+  (doseq [[label params]
+          [["two parameters" "[vector :i64 error-code :i64]"]
+           ["five parameters"
+            "[vector :i64 error-code :i64 rip :i64 rsp :i64 extra :i64]"]
+           ["no parameters" "[]"]]]
+    (testing label
+      (let [source (str "(defn aiueos-isr-3 " params " :i64 0)")]
+        (is (= "interrupt entry must take the vector, error code, rip and rsp"
+               (rejection-of source)))
+        (is (= :kotoba.error/interrupt-entry-signature
+               (rejection-code source)))))))
+
+(deftest an-entry-with-a-non-i64-parameter-is-refused
+  ;; Every one of the four is a machine word lifted straight out of the frame
+  ;; the CPU built. A `:string` parameter would have the entry hand a raw
+  ;; frame word to code expecting a validated pair handle.
+  (let [source (str "(defn aiueos-isr-3 "
+                    "[vector :i64 error-code :string rip :i64 rsp :i64] :i64 0)")]
+    (is (= "interrupt entry parameters are machine words from the frame"
+           (rejection-of source)))
+    (is (= :kotoba.error/interrupt-entry-signature (rejection-code source)))))
+
+(deftest an-entry-name-that-is-not-a-vector-is-refused
+  ;; Refused rather than ignored. `aiueos-isr-bp` reads as an entry, and the
+  ;; packager has no entry to point at for it, so admitting it would produce a
+  ;; function that looks installed and is not.
+  (doseq [[label name] [["a mnemonic" "aiueos-isr-bp"]
+                        ["above the table" "aiueos-isr-64"]
+                        ["a leading zero" "aiueos-isr-03"]]]
+    (testing label
+      (let [source (str "(defn " name
+                        " [vector :i64 error-code :i64 rip :i64 rsp :i64] :i64 0)")]
+        (is (= (str "interrupt entry name must be aiueos-isr-<vector> "
+                    "with a vector below 64")
+               (rejection-of source)))
+        (is (= :kotoba.error/interrupt-entry-name (rejection-code source)))))))

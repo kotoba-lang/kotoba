@@ -1,0 +1,366 @@
+(ns kotoba.compiler.kotoba-reader-test
+  "JVM-free reader tests for the `#()` fn shorthand (lang-cosientist
+  iteration 3). Runs on the nbb route like the rest of run-tests.cljk.
+
+  Integer literals read as JS bigint, so expected forms are built with
+  `(js/BigInt \"2\")` rather than quoted literals -- a quoted `2` in CLJS
+  is a double and `=` fails against the reader's bigint."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :as t :refer [deftest is]]
+            [kotoba.compiler.kotoba-reader :as r]))
+
+#?(:clj  (def ^:private two 2)
+   :cljs (def ^:private two (js/BigInt "2")))
+#?(:clj  (def ^:private one 1)
+   :cljs (def ^:private one (js/BigInt "1")))
+
+(deftest public-facade-has-one-native-import-per-namespace
+  ;; A separate #?@(:default ...) also selects on :kotoba. The facade must
+  ;; exclude its host-only imports before the native project reader admits
+  ;; this graph; importing namespace-defs under two aliases is refused.
+  (let [source #?(:clj (slurp "lib/kotoba.kotobaSema/src/kotoba/sema.cljk")
+                  :cljs (.readFileSync (js/require "node:fs")
+                                      "lib/kotoba.kotobaSema/src/kotoba/sema.cljk" "utf8"))
+        header (first (r/read-forms source))
+        requires (rest (first (filter #(and (seq? %) (= :require (first %)))
+                                      (drop 2 header))))
+        namespaces (mapv first requires)]
+    (is (= (count namespaces) (count (distinct namespaces))))
+    (is (= #{'kotoba.compiler.frontend 'kotoba.compiler.schema 'kotoba.form
+             'kotoba.compiler.frontend.namespace-defs
+             'kotoba.compiler.frontend-tables}
+           (set namespaces)))))
+
+(deftest native-analyzer-excludes-host-collection-helpers
+  (let [path "lib/kotoba.kotobaSema/src/kotoba/compiler/frontend/analyze.cljk"
+        source #?(:clj (slurp path)
+                  :cljs (.readFileSync (js/require "node:fs") path "utf8"))
+        definitions (->> (r/read-forms source)
+                         (filter #(and (seq? %) (#{'defn 'defn-} (first %))))
+                         (map second)
+                         set)]
+    (is (contains? definitions 'an-part-gate))
+    (is (not (contains? definitions 'host-only-body?)))
+    (is (not (contains? definitions 'host-only-body)))))
+
+(deftest fn-shorthand-reads-as-fn-form
+  ;; #() is ONE call form: #(* % 2) == (fn [p1] (* p1 2)).
+  (is (= (list 'fn ['p1] (list '* 'p1 two))
+         (first (r/read-forms "#(* % 2)")))))
+
+(deftest fn-shorthand-two-args
+  (is (= '(fn [p1 p2] (+ p1 p2))
+         (first (r/read-forms "#(+ %1 %2)")))))
+
+(deftest fn-shorthand-nested-body
+  ;; Inner collections are preserved; only the top-level args are the call.
+  (is (= (list 'fn ['p1] (list 'f (list '+ 'p1 one)))
+         (first (r/read-forms "#(f (+ % 1))")))))
+
+(deftest fn-shorthand-empty-body-rejects
+  (is (thrown? #?(:clj Throwable :cljs :default) (r/read-forms "#()"))))
+
+(deftest fn-shorthand-rest-arg-rejects
+  (is (thrown? #?(:clj Throwable :cljs :default) (r/read-forms "#(+ %& 1)"))))
+
+(deftest fn-shorthand-gap-arg-rejects
+  ;; %2 with no %1 in a 1-source map is a shape the map lowering refuses;
+  ;; the reader itself must NOT invent a %1 binding for it.
+  (is (= (list 'fn ['p1 'p2] (list '+ 'p2 one))
+         (first (r/read-forms "#(+ %2 1)")))))
+
+;; ── source-location, after the line index (build-scaling co-scientist it. 2) ──
+;;
+;; `source-location` used to re-derive line/column at every located node by
+;; `subs`-ing the whole prefix and splitting it on newlines, which is O(offset)
+;; per node and quadratic in source size. It is now a binary search over one
+;; line-start index. These pin the three positions a binary search gets wrong
+;; when its boundary condition is off: the very first form, a form that starts
+;; exactly ON a line start, and a form on the last line.
+
+(deftest locations-on-the-first-line
+  (let [[a b] (r/read-forms "(a) (b)")]
+    (is (= {:line 1 :column 1} (select-keys (meta a) [:line :column])))
+    (is (= {:line 1 :column 5} (select-keys (meta b) [:line :column])))))
+
+(deftest location-at-a-line-start
+  ;; `(b)` begins at offset 4, which is itself a line start.
+  (let [[_ b] (r/read-forms "(a)\n(b)")]
+    (is (= {:line 2 :column 1 :offset 4}
+           (select-keys (meta b) [:line :column :offset])))))
+
+(deftest location-on-a-late-line-is-indented-from-that-line-not-the-file
+  (let [source (str (apply str (repeat 200 "(a)\n")) "  (z)")
+        forms (r/read-forms source)]
+    (is (= {:line 201 :column 3} (select-keys (meta (last forms)) [:line :column])))))
+
+(deftest locations-agree-with-counting-newlines-at-every-form
+  ;; The property the fast path has to preserve, checked against the slow
+  ;; definition rather than against remembered numbers.
+  (let [source "(a)\n  (b (c))\n\n(d)\n     (e)\n"
+        expected (fn [offset]
+                   (let [prefix (subs source 0 offset)
+                         nl (count (filter #(= \newline %) prefix))]
+                     {:line (inc nl)
+                      :column (inc (- offset (inc (or (str/last-index-of prefix "\n") -1))))}))]
+    (doseq [form (r/read-forms source)]
+      (is (= (expected (:offset (meta form)))
+             (select-keys (meta form) [:line :column]))
+          (str "form " (pr-str form)))))) 
+
+;; ── set literals of exact integers ────────────────────────────────────────
+;;
+;; An exact Kotoba i64 literal reads as a JavaScript BigInt, `cljs.core/set`
+;; switches to a hashed representation above eight elements, and nbb cannot
+;; hash a BigInt. Nine integers in a set therefore threw a raw TypeError about
+;; `closure_uid_...`, which reached the caller as `source reader rejected
+;; input` with no reason attached to it at all.
+;;
+;; The limit is NOT lifted here -- reading the set without hashing gets past
+;; the reader and hits the same barrier inside elaboration, which turns a
+;; refusal into an internal compiler error. It is named instead.
+
+(deftest eight-exact-integers-in-a-set-read
+  (is (= 8 (count (first (r/read-forms "#{1 2 3 4 5 6 7 8}"))))))
+
+(deftest nine-exact-integers-in-a-set-read-as-a-tagged-form-on-this-host
+  ;; ONE host, and the asymmetry is the point. A Clojure set hashes a BigInt
+  ;; without complaint, so on the JVM nine exact integers read like any other
+  ;; nine values; where `cljs.core/set` cannot hash a BigInt the reader hands
+  ;; over `(kotoba.reader/set [..])` instead (2026-09-11). It used to REFUSE
+  ;; here, which meant a :clj branch holding an ABI table refused the whole
+  ;; file. The tagged form is refused BY NAME in admission (see
+  ;; pure_head_slice_test), not as an internal compiler error -- that was the
+  ;; reason the reader refused rather than read, and it no longer holds.
+  (let [f (first (r/read-forms "#{1 2 3 4 5 6 7 8 9}"))]
+    #?(:clj (is (and (set? f) (= 9 (count f))) "the JVM reads a real set")
+       :cljs (do (is (= 'kotoba.reader/set (first f)))
+                 (is (= 9 (count (second f))))))))
+
+(deftest nine-keywords-in-a-set-still-read
+  ;; The barrier is the BigInt, not the count -- keywords hash fine.
+  (is (= 9 (count (first (r/read-forms "#{:a :b :c :d :e :f :g :h :i}"))))))
+
+;; ---------------------------------------------------------------------------
+;; 2026-09-08: the two things that were wrong here, found only by making this
+;; reader the reader for BOTH hosts. Neither was findable while the JVM read
+;; source with `clojure.tools.reader` and only ClojureScript came through here.
+;; ---------------------------------------------------------------------------
+
+(deftest an-integer-in-range-is-a-long-on-the-jvm
+  ;; `parse-int-token` called `(bigint token)` unconditionally, so on the JVM
+  ;; `5` came back `clojure.lang.BigInt` where `clojure.tools.reader` returns
+  ;; `java.lang.Long`. `(= 5 (bigint 5))` is true, so no program ever computed
+  ;; a wrong VALUE from it -- what broke was every assertion comparing a
+  ;; printed AST or a sha256 of one, because `5` and `5N` are different text.
+  ;; 18 assertions across the corpus, all golden-hash or `pr-str` mismatches.
+  ;;
+  ;; This asserts the TYPE, not the value, because value equality is exactly
+  ;; what hid the defect. `(is (= 5 ...))` passes either way.
+  #?(:clj (is (instance? Long (first (r/read-forms "5")))
+              "an integer that fits in an i64 is a Long, as tools.reader gives")
+     :cljs (is (identical? js/BigInt (.-constructor (first (r/read-forms "5"))))
+               "ClojureScript has no Long; a JS Number loses precision above 2^53")))
+
+(deftest an-integer-past-the-i64-boundary-promotes
+  ;; The other direction, so the fix cannot be "always Long" either. The
+  ;; boundary itself stays exact; one past it must not silently wrap.
+  #?(:clj (do (is (instance? Long (first (r/read-forms "9223372036854775807")))
+                  "i64 max is still a Long")
+              (is (instance? clojure.lang.BigInt
+                             (first (r/read-forms "9223372036854775808")))
+                  "one past i64 max promotes rather than throwing or wrapping"))
+     :cljs (is (= "9223372036854775808"
+                  (str (first (r/read-forms "9223372036854775808"))))
+               "bigint carries it exactly")))
+
+(deftest deref-reads-as-a-deref-form
+  ;; `read-form`'s dispatch had no case for `@`, and `@` is not a delimiter,
+  ;; so `@a` fell through to `read-symbol-or-number` and became the single
+  ;; SYMBOL `@a`. The frontend then refused it as an unbound variable -- a
+  ;; true statement about a wrong input, which sends the author looking for a
+  ;; missing binding that was never the problem. 17 assertions in
+  ;; `local_state_test`.
+  (is (= (list 'deref 'a) (first (r/read-forms "@a"))))
+  (is (= (list 'swap! 'a '+ one)
+         (first (r/read-forms "(swap! a + 1)")))
+      "the surrounding local-state forms are untouched")
+  (is (= (list 'f (list 'deref 'a))
+         (first (r/read-forms "(f @a)")))
+      "and it composes inside a call"))
+
+(deftest the-other-reader-macros-are-still-absent
+  ;; Stated as a test so it cannot quietly stop being true. syntax-quote,
+  ;; unquote and var-quote have no case in this reader. Nothing in the
+  ;; `.kotoba` corpus exercises them, so their absence is UNMEASURED rather
+  ;; than known-good. `quote` LEFT this list on 2026-09-11 (deliberately: the
+  ;; compiler's own sources quote sets of symbols, and `'a` had been reading
+  ;; as the symbol `'a`); `^meta` left it the same day. If another one starts
+  ;; reading as a form instead of a symbol, someone added it and this test
+  ;; should be updated deliberately rather than deleted.
+  (is (symbol? (first (r/read-forms "`a")))
+      "syntax-quote is read as a symbol today, not as a form")
+  (is (= (list 'quote 'a) (first (r/read-forms "'a")))
+      "quote reads as (quote a) since 2026-09-11"))
+
+(deftest hex-literals-read
+  ;; 79 `.kotoba` files in this workspace use `0x...`, and none of them could
+  ;; be read here until 2026-09-08: the token matched no number pattern, fell
+  ;; through to `symbol`, and was refused downstream as `unbound or dynamic
+  ;; symbol is forbidden: 0xF000` -- which sends the author looking for a
+  ;; missing binding rather than a missing literal.
+  ;;
+  ;; Invisible while the JVM used `clojure.tools.reader`, which handles hex for
+  ;; free. Making this the reader for both hosts is what surfaced it, via
+  ;; amu's `(bit-or 0xF000 0x00F0)`.
+  (is (= "61440" (str (first (r/read-forms "0xF000")))))
+  (is (= "255"   (str (first (r/read-forms "0xFF")))))
+  (is (= "255"   (str (first (r/read-forms "0xff"))))  "case-insensitive")
+  (is (= "-255"  (str (first (r/read-forms "-0xFF")))) "signed")
+  (is (= "1"     (str (first (r/read-forms "0x1"))))))
+
+(deftest a-leading-zero-is-refused-rather-than-guessed
+  ;; `clojure.tools.reader` reads `0377` as OCTAL 255; this reader read it as
+  ;; decimal 377. Same source, two hosts, two different numbers, an error on
+  ;; neither. Refusing is the fix, not implementing octal: every leading-zero
+  ;; match in the checked-in corpus is an ADR number in a comment, so nothing
+  ;; pays for the refusal, and silently picking one host's answer is how the
+  ;; divergence survived.
+  (let [e (try (r/read-forms "0377") nil (catch #?(:clj Exception :cljs :default) e e))]
+    (is (some? e) "0377 is refused")
+    (is (str/includes? (ex-message e) "leading zero")
+        (str "the refusal names its reason, got: " (some-> e ex-message))))
+  (is (= "0" (str (first (r/read-forms "0")))) "a bare zero is still a zero"))
+
+(deftest a-numeric-looking-token-is-not-a-variable-name
+  ;; The durable half. Anything starting like a number that parses as no
+  ;; number is a malformed LITERAL, and saying so is the difference between
+  ;; `unsupported numeric literal: 2r1010` and a hunt for an unbound variable.
+  (doseq [token ["2r1010" "16rFF" "1e5x"]]
+    (let [e (try (r/read-forms token) nil (catch #?(:clj Exception :cljs :default) e e))]
+      (is (some? e) (str token " is refused rather than read as a symbol"))))
+  ;; and the other direction: an ordinary name that merely contains digits
+  ;; must still be a symbol
+  (is (symbol? (first (r/read-forms "vec3"))))
+  (is (symbol? (first (r/read-forms "x1")))))
+
+(deftest an-f64-constant-is-admitted-in-both-reader-shapes
+  ;; `(def k 1.5)` compiled on the JVM and was refused on nbb with
+  ;; `constant value must be closed bounded integer/string/...` -- a complaint
+  ;; about closedness for a value that was already closed. `constant-literal?`
+  ;; asked `value/f64-value?`, a HOST double, which an f64 literal only ever is
+  ;; on the JVM; under this reader it arrives as `(f64-from-bits <i64>)`.
+  ;;
+  ;; Third site in `frontend.cljc` with that shape mismatch, after the f32
+  ;; branch and the map-key/document shims. Found by kotoba-lang/amu's
+  ;; `f64-constants-are-closed-and-use-canonical-bit-lowering` once the JVM
+  ;; started reading through here too.
+  ;;
+  ;; This lives in the reader's test file on purpose: the defect is about what
+  ;; the READER produces, and the assertion is what the reader hands the
+  ;; frontend for `1.5`.
+  (let [form (first (r/read-forms "1.5"))]
+    (is (seq? form) "a decimal literal is a form, not a host double")
+    (is (= 'f64-from-bits (first form)))
+    (is (= 2 (count form)))
+    (is (true? (:kotoba.reader/f64-literal (meta form)))
+        "and it carries the marker the frontend's shims match on")))
+
+;; ---------------------------------------------------------------------------
+;; Reader widenings measured against the compiler's own sources (2026-09-11,
+;; adr-2609111900 iteration 2): `#_`, `#?@`, `#:ns{}`, `\uXXXX`. Each has a
+;; positive and a refusing case; a refusal is asserted on its message so a
+;; different failure cannot pass as the intended one (AGENTS.md 8 問 ⑥).
+
+(defn- refusal [src]
+  (try (r/read-forms src) nil (catch :default e (.-message e))))
+
+(deftest discard-drops-exactly-one-form
+  (is (= (list 'def 'v two) (first (r/read-forms "(def v #_ 1 2)"))))
+  ;; nested discard: the discarded form is read in full, so balance holds
+  (is (= (list 'def 'v two) (first (r/read-forms "(def v #_ (a #_ b c) 2)")))))
+
+(deftest discard-refuses-unbalanced-form
+  (is (= "unterminated collection" (refusal "(def v #_ (a b 2)"))))
+
+(deftest splicing-conditional-splices-kotoba-branch
+  (is (= [one two (js/BigInt "3")]
+         (first (r/read-forms "[1 #?@(:clj [9 9] :kotoba [2 3])]")))))
+
+(deftest splicing-conditional-default-branch-and-no-match
+  (is (= [one (js/BigInt "4")] (first (r/read-forms "[1 #?@(:clj [9] :default [4])]"))))
+  (is (= [one] (first (r/read-forms "[1 #?@(:clj [9])]")))))
+
+(deftest splicing-conditional-refuses-non-collection-and-top-level
+  (is (= "`#?@` branch must be a sequential collection" (refusal "[#?@(:kotoba 1)]")))
+  (is (= "`#?@` is not admitted at top level" (refusal "#?@(:kotoba [1])")))
+  (is (= "expected `(` after `#?@`" (refusal "[#?@ x]"))))
+
+(deftest namespaced-map-qualifies-bare-keys-only
+  (is (= {:a/b one :c/d two :e one}
+         (first (r/read-forms "#:a{:b 1 :c/d 2 :_/e 1}")))))
+
+(deftest namespaced-map-refuses-bad-shape
+  (is (= "expected `{` after `#:ns`" (refusal "#:a[1]")))
+  (is (= "map literal must contain an even number of forms" (refusal "#:a{:b}"))))
+
+(deftest unicode-escape-reads-one-code-unit
+  (is (= (list 'def 's "é") (first (r/read-forms "(def s \"\\u00e9\")"))))
+  (is (= (list 'def 's "A\tB") (first (r/read-forms "(def s \"\\u0041\\tB\")")))))
+
+(deftest unicode-escape-refuses-short-hex
+  (is (= "unsupported string escape" (refusal "(def s \"\\u00e\")")))
+  (is (= "unsupported string escape" (refusal "(def s \"\\x41\")"))))
+
+(deftest backspace-and-form-feed-escapes-read-as-clojure-reads-them
+  ;; osaho's kir/value.cljk spells a JSON escape table with `\\b` / `\\f`;
+  ;; before 2026-09-12 that one literal refused the whole file.
+  (is (= (list 'def 's (str (char 8) "|" (char 12))) (first (r/read-forms "(def s \"\\b|\\f\")"))))
+  ;; The letter next to them is still not an escape.
+  (is (= "unsupported string escape" (refusal "(def s \"\\g\")"))))
+
+(deftest regex-literal-is-read-as-a-tagged-pattern
+  (is (= (list 'kotoba.reader/regex "a\\d+\"b")
+         (first (r/read-forms "#\"a\\d+\\\"b\"")))))
+
+(deftest regex-literal-inside-a-discarded-branch-no-longer-refuses-the-file
+  (is (= [one] (first (r/read-forms "[1 #?(:clj #\"x+\")]")))))
+
+(deftest regex-literal-refuses-unterminated
+  (is (= "unterminated regex literal" (refusal "#\"abc"))))
+
+(deftest js-literal-is-read-as-a-tagged-form
+  (is (= (list 'kotoba.reader/js {:a one}) (first (r/read-forms "#js {:a 1}"))))
+  (is (= [one] (first (r/read-forms "[1 #?(:cljs #js [1 2])]")))))
+
+(deftest quote-reads-as-a-quote-form
+  (is (= (list 'quote 'sym) (first (r/read-forms "'sym"))))
+  (is (= (list 'quote #{'a 'b}) (first (r/read-forms "'#{a b}"))))
+  (is (= (list 'def 'x (list 'quote #{'a})) (first (r/read-forms "(def x '#{a})")))))
+
+(deftest quote-refuses-nothing-to-quote
+  (is (= "quote must precede a form" (refusal "'#_ x"))))
+
+(deftest char-literal-reads-as-a-tagged-form
+  (is (= (list 'kotoba.reader/char "\\") (first (r/read-forms "\\\\"))))
+  (is (= (list 'kotoba.reader/char "\"") (first (r/read-forms "\\\""))))
+  (is (= (list '= 'ch (list 'kotoba.reader/char "(")) (first (r/read-forms "(= ch \\()"))))
+  (is (= (list 'kotoba.reader/char "\n") (first (r/read-forms "\\newline"))))
+  (is (= (list 'kotoba.reader/char "é") (first (r/read-forms "\\u00e9"))))
+  (is (= [one] (first (r/read-forms "[1 #?(:clj \\a)]")))))
+
+(deftest char-literal-refuses-unknown-names
+  (is (= "unsupported character literal" (refusal "\\bogus")))
+  (is (= "unexpected end of input after `\\`" (refusal "\\"))))
+
+(deftest host-precision-literals-read-as-tagged-forms
+  (is (= (list 'kotoba.reader/bigint "0") (first (r/read-forms "0N"))))
+  (is (= (list 'kotoba.reader/bigdec "1.5") (first (r/read-forms "1.5M"))))
+  (is (= [one] (first (r/read-forms "[1 #?(:clj 0N)]")))))
+
+
+(deftest reader-evaluation-is-refused-as-a-dispatch-not-as-two-characters
+  (is (= "reader evaluation is forbidden" (refusal "(def x #=(+ 1 2))")))
+  ;; the two characters inside a string or a regex literal are just text
+  (is (= (list 'def 'x "#=") (first (r/read-forms "(def x \"#=\")"))))
+  (is (= (list 'kotoba.reader/regex "#=") (first (r/read-forms "#\"#=\"")))))

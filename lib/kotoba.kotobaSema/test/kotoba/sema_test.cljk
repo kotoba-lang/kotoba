@@ -1,0 +1,802 @@
+(ns kotoba.sema-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.frontend]
+            [kotoba.hir :as hir]
+            [kotoba.sema :as sema]))
+
+(deftest source-to-checked-hir
+  (testing "untyped source produces the compatibility HIR profile"
+    (let [result (sema/analyze "(defn main [] 42)")]
+      (is (= :kotoba.hir/v2 (:format result)))
+      (is (= 'main (:entry result)))
+      (is (= :i64 (:result result)))
+      (is (hir/valid? result))))
+  (testing "typed source produces typed HIR"
+    (let [result (sema/analyze "(defn main [] :string \"ok\")")]
+      (is (= :kotoba.hir/v3 (:format result)))
+      (is (= :string (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "a bare bool parameter is a typed host boundary"
+    (let [result (sema/analyze
+                  "(ns example.predicates (:export [negate]))
+                   (defn negate [value :bool witness :i64] :bool
+                     (if value false true))")]
+      (is (= :kotoba.hir/v3 (:format result)))
+      (is (= [:bool :i64] (get-in result [:functions 0 :param-types])))
+      (is (= :bool (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "a bool expression without a typed parameter stays compatibility HIR"
+    (let [result (sema/analyze "(defn main [] (= 1 1))")]
+      (is (= :kotoba.hir/v2 (:format result)))
+      (is (= :bool (get-in result [:functions 0 :result])))
+      (is (hir/valid? result)))))
+
+(deftest bytes-count-is-a-typed-pure-bytes-operation
+  (let [result (sema/analyze
+                "(ns example.bytes (:export [size]))
+                 (defn size [value :bytes] :i64 (bytes-count value))")]
+    (is (= '(bytes-count value) (get-in result [:functions 0 :body])))
+    (is (= :i64 (get-in result [:functions 0 :result])))
+    (is (empty? (get-in result [:functions 0 :effects])))
+    (is (hir/valid? result)))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"expected bytes, got i64"
+       (sema/analyze
+        "(ns example.bytes (:export [size]))
+         (defn size [value :i64] :i64 (bytes-count value))"))))
+
+(deftest bytes-at-is-a-typed-pure-unsigned-byte-read
+  (testing "an indexed byte read is pure and yields i64"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [head]))
+                   (defn head [value :bytes] :i64 (bytes-at value 0))")]
+      (is (= '(bytes-at value 0) (get-in result [:functions 0 :body])))
+      (is (= :i64 (get-in result [:functions 0 :result])))
+      (is (empty? (get-in result [:functions 0 :effects])))
+      (is (hir/valid? result))))
+  (testing "the index is an ordinary i64 expression, not only a literal"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [at]))
+                   (defn at [value :bytes index :i64] :i64 (bytes-at value index))")]
+      (is (= '(bytes-at value index) (get-in result [:functions 0 :body])))
+      (is (= :i64 (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "the sequence operand must be bytes"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected bytes, got i64"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :i64] :i64 (bytes-at value 0))"))))
+  (testing "the index operand must be i64"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected i64, got bytes"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :i64 (bytes-at value value))"))))
+  (testing "arity is fixed at two operands"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"bytes-at requires a bytes operand and an index"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :i64 (bytes-at value))")))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"bytes-at requires a bytes operand and an index"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :i64 (bytes-at value 0 1))")))))
+
+(deftest bytes-slice-is-a-typed-pure-half-open-subrange
+  (testing "a subrange of bytes is itself bytes, and is pure"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [head]))
+                   (defn head [value :bytes] :bytes (bytes-slice value 0 2))")]
+      (is (= '(bytes-slice value 0 2) (get-in result [:functions 0 :body])))
+      (is (= :bytes (get-in result [:functions 0 :result])))
+      (is (empty? (get-in result [:functions 0 :effects])))
+      (is (hir/valid? result))))
+  (testing "the offsets are ordinary i64 expressions"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [part]))
+                   (defn part [value :bytes start :i64 end :i64] :bytes
+                     (bytes-slice value start end))")]
+      (is (= '(bytes-slice value start end) (get-in result [:functions 0 :body])))
+      (is (= :bytes (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "it composes with the other bytes operations"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [tail]))
+                   (defn tail [value :bytes] :bytes
+                     (bytes-slice value 1 (bytes-count value)))")]
+      (is (= :bytes (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "the sequence operand must be bytes"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected bytes, got i64"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :i64] :bytes (bytes-slice value 0 2))"))))
+  (testing "both offsets must be i64"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected i64, got bytes"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :bytes (bytes-slice value value 2))")))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected i64, got bytes"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :bytes (bytes-slice value 0 value))"))))
+  (testing "arity is fixed at three operands"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"bytes-slice requires a bytes operand and two offsets"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :bytes (bytes-slice value 0))")))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"bytes-slice requires a bytes operand and two offsets"
+         (sema/analyze
+          "(ns example.bytes (:export [head]))
+           (defn head [value :bytes] :bytes (bytes-slice value 0 1 2))")))))
+
+(deftest bytes-concat-is-a-typed-pure-join
+  (testing "joining two byte sequences yields bytes and stays pure"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [twice]))
+                   (defn twice [value :bytes] :bytes (bytes-concat value value))")]
+      (is (= '(bytes-concat value value) (get-in result [:functions 0 :body])))
+      (is (= :bytes (get-in result [:functions 0 :result])))
+      (is (empty? (get-in result [:functions 0 :effects])))
+      (is (hir/valid? result))))
+  (testing "it composes with the other bytes operations"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [rotate]))
+                   (defn rotate [value :bytes] :bytes
+                     (bytes-concat (bytes-slice value 1 3) (bytes-slice value 0 1)))")]
+      (is (= :bytes (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "the empty sequence is a lawful operand"
+    (let [result (sema/analyze
+                  "(ns example.bytes (:export [same]))
+                   (defn same [value :bytes] :bytes (bytes-concat (bytes) value))")]
+      (is (= :bytes (get-in result [:functions 0 :result])))
+      (is (hir/valid? result))))
+  (testing "both operands must be bytes"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected bytes, got i64"
+         (sema/analyze
+          "(ns example.bytes (:export [j]))
+           (defn j [value :bytes] :bytes (bytes-concat value (bytes-count value)))")))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"expected bytes, got i64"
+         (sema/analyze
+          "(ns example.bytes (:export [j]))
+           (defn j [value :i64] :bytes (bytes-concat value value))"))))
+  (testing "arity is fixed at two operands"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"bytes-concat requires two bytes operands"
+         (sema/analyze
+          "(ns example.bytes (:export [j]))
+           (defn j [value :bytes] :bytes (bytes-concat value))")))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"bytes-concat requires two bytes operands"
+         (sema/analyze
+          "(ns example.bytes (:export [j]))
+           (defn j [value :bytes] :bytes (bytes-concat value value value))")))))
+
+(deftest reader-and-schema-contracts
+  (is (= 'defn (ffirst (sema/read-forms "(defn main [] 42)"))))
+  (let [table {:app/item
+               [:record :app/item
+                [[:value :i64]
+                 [:next [:option [:ref :app/item]]]]]}]
+    (is (= table (sema/validate-schema-table! table)))
+    (is (re-matches #"[0-9a-f]{64}"
+                    (get (sema/schema-identities table) :app/item)))))
+
+(deftest semantic-catalogs-are-on-the-classpath
+  (is (some? (io/resource "kotoba/lang/capability-catalog.edn")))
+  (is (some? (io/resource "kotoba/lang/guest-grammar.edn")))
+  (is (seq sema/capability-registry))
+  (is (seq sema/source-operation-registry)))
+
+(deftest dataspace-transact-is-catalog-wire-id-24
+  "ADR-2608154100: named dataspace/transact is wire id 24, contiguous with 1–23."
+  (let [catalog (edn/read-string
+                 (slurp (io/resource "kotoba/lang/capability-catalog.edn")))
+        from-catalog (into {} (map (fn [[k e]] [k (:compiler-wire-id e)])
+                                   (:capabilities catalog)))]
+    (is (= 24 (get from-catalog :dataspace/transact)))
+    (is (= 24 (get sema/capability-registry :dataspace/transact)))
+    (is (= :dataspace/transact
+           (get sema/source-operation-registry 'dataspace/transact)))
+    (is (= (set (keys sema/capability-registry))
+           (set (vals sema/source-operation-registry))))
+    ;; The assertion is contiguity, not a fixed ceiling -- it moves when the
+    ;; registry legitimately grows and fails when a gap is left.
+    ;;
+    ;; It said that and did not do it. `(range 1 31)` IS a fixed ceiling: the
+    ;; catalog grew to 32 wire ids and this went red for the one reason the
+    ;; comment promised it would not -- legitimate growth. Measured 2026-09-03.
+    ;; Written against the registry's own size, it now moves with growth and
+    ;; still fails on a gap, a duplicate, or an id that does not start at 1.
+    ;; The floor is what keeps an emptied registry from passing vacuously.
+    (let [ids (sort (vals sema/capability-registry))]
+      ;; The floor said "the ids this suite names by hand" and was 24, while
+      ;; `typed-eval-is-catalogued-and-contextually-typed` below names 30. The
+      ;; message was therefore stronger than the number: a registry that lost
+      ;; :code/eval would clear this floor and be caught only by that other
+      ;; test. Raised to 30 on 2026-09-03 so the number says what the message
+      ;; does. It is a floor, not a ceiling -- the registry is at 32 since
+      ;; :screen/observe and :screen/act were promoted into the authority
+      ;; (ADR-2609031100), and growth is what the contiguity check below is
+      ;; written against.
+      (is (<= 30 (count ids))
+          "the registry must not shrink below the ids this suite names by hand")
+      (is (= (range 1 (inc (count ids))) ids)
+          "wire ids stay contiguous from 1; a gap means named source will reject"))))
+
+(deftest typed-eval-is-catalogued-and-contextually-typed
+  (is (= 30 (get sema/capability-registry :code/eval)))
+  (is (= :code/eval (get sema/source-operation-registry 'code/eval)))
+  (let [hir (sema/analyze
+             "(ns app (:capabilities #{:code/eval}))
+              (defn run [request :document] :i64 (eval request))
+              (defn main [] 0)")
+        run (->> (:functions hir) (filter #(= 'run (:name %))) first)]
+    (is (= #{[:cap/call 30]} (:effects hir)))
+    (is (= '(typed-cap-call 30 :document :i64 request) (:body run))))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"typed eval requires exactly one"
+       (sema/analyze
+        "(ns app (:capabilities #{:code/eval}))
+         (defn run [] :i64 (eval))
+         (defn main [] 0)")))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"forbidden"
+       (sema/analyze "(defn main [] (load-string \"(+ 1 2)\"))"))))
+
+(deftest stream-ingress-is-catalog-wire-ids-25-and-26
+  "root ADR-2608150900: a bidirectional frame stream, where http-ingress is one
+  request paired to one reply. Frames in and frames out are separate wire ids
+  because they are separate authorities."
+  (let [catalog (edn/read-string
+                 (slurp (io/resource "kotoba/lang/capability-catalog.edn")))
+        from-catalog (into {} (map (fn [[k e]] [k (:compiler-wire-id e)])
+                                   (:capabilities catalog)))]
+    (is (= 25 (get from-catalog :stream/accept)))
+    (is (= 26 (get from-catalog :stream/send)))
+    (is (= 25 (get sema/capability-registry :stream/accept)))
+    (is (= 26 (get sema/capability-registry :stream/send)))
+    (is (= :stream/accept (get sema/source-operation-registry 'stream/accept)))
+    (is (= :stream/send (get sema/source-operation-registry 'stream/send)))))
+
+(deftest hearing-a-stream-is-not-permission-to-speak-into-it
+  (testing "a guest that declares only accept gets only accept's effect"
+    (let [hir (sema/analyze
+               "(ns app (:capabilities #{:stream/accept}))
+                (defn listen [s] (cap-call :stream/accept s))
+                (defn main [] 0)")]
+      (is (= #{[:cap/call 25]} (:effects hir)))))
+  (testing "and declaring both yields both, separately"
+    (let [hir (sema/analyze
+               "(ns app (:capabilities #{:stream/accept :stream/send}))
+                (defn listen [s] (cap-call :stream/accept s))
+                (defn speak [f] (cap-call :stream/send f))
+                (defn main [] 0)")]
+      (is (= #{[:cap/call 25] [:cap/call 26]} (:effects hir))))))
+
+(deftest named-dataspace-cap-call-resolves-to-wire-id-24
+  (let [hir (sema/analyze
+             "(ns app (:capabilities #{:dataspace/transact}))
+              (defn publish [x] (cap-call :dataspace/transact x))
+              (defn main [] 0)")]
+    (is (= #{[:cap/call 24]} (:effects hir)))
+    (is (= '(cap-call 24 x)
+           (->> (:functions hir) (filter #(= 'publish (:name %))) first :body)))))
+
+(deftest dataspace-source-forms-lower-to-one-typed-effect-kernel
+  (let [hir (sema/analyze
+             "(ns app (:capabilities #{:dataspace/transact}))
+              (defn publish [x :document] (assert! x))
+              (defn retract [x :document f :i64] (retract! x f))
+              (defn subscribe [p :document] (observe! p))
+              (defn enter [] (facet-enter!))
+              (defn leave [f :i64] (facet-leave! f))
+              (defn main [] 0)")
+        bodies (into {} (map (juxt :name :body)) (:functions hir))]
+    (is (= #{[:cap/call 24]} (:effects hir)))
+    (is (= #{:dataspace/transact} (:named-operations hir)))
+    (doseq [name '[publish retract subscribe enter leave]]
+      (is (= 'typed-cap-call (first (get bodies name))))
+      (is (= 24 (second (get bodies name)))))
+    (is (= :assert (-> bodies (get 'publish) (nth 4) (nth 2))))
+    (is (= 0 (-> bodies (get 'publish) (nth 4) (nth 3) last))
+        "one-argument assertion is rooted in facet zero")
+    (is (= :observe (-> bodies (get 'subscribe) (nth 4) (nth 2))))
+    (is (= :facet-enter (-> bodies (get 'enter) (nth 4) (nth 2))))
+    (is (= :facet-leave (-> bodies (get 'leave) (nth 4) (nth 2))))
+    (let [result-type (nth (get bodies 'subscribe) 3)
+          matches-case (some #(when (= :matches (first %)) %)
+                             (nth result-type 2))]
+      (is (= [[:bindings :document] [:notices :document]]
+             (nth (second matches-case) 2))
+          "observe! result carries delivered notices, not only a snapshot"))))
+
+(deftest dataspace-source-forms-fail-closed
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"not declared in namespace :capabilities"
+       (sema/analyze
+        "(ns app (:capabilities #{:entropy/draw}))
+         (defn publish [x :document] (assert! x))
+         (defn main [] 0)")))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"assert! requires an assertion document"
+       (sema/analyze
+        "(ns app (:capabilities #{:dataspace/transact}))
+         (defn publish [] (assert!))")))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"type mismatch"
+       (sema/analyze
+        "(ns app (:capabilities #{:dataspace/transact}))
+         (defn publish [] (assert! (quot 1 0)))
+         (defn main [] 0)")))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"outside pure-product profile"
+       (sema/analyze
+        "(defn publish [x :document] (assert! x))"
+        {:language-profile :pure-product}))))
+
+(deftest cljs-fallback-is-kept-in-lockstep-with-catalog
+  "CLJS cannot read the classpath resource, so the fallback map IS the catalog
+   on that backend -- and on amu's JDK-free nbb route, which is the one most
+   guests are compiled through. Forgetting it drops a capability there while
+   every JVM test stays green.
+
+   This grepped the source text for the single line `:dataspace/transact 24`.
+   A test that names one entry cannot see the others, and on 2026-09-03 that
+   showed: kotoba-sema c823461 moved the fallback and the vendored catalog
+   together to wire ids 31 and 32 while the AUTHORITY named neither, and the
+   only check standing over the pair asked about 24. It compares the whole map
+   to the resource now, in both directions, so a name or an id added to one
+   and not the other is a failure rather than a grep that still passes."
+  (let [fallback @(resolve 'kotoba.compiler.frontend/capability-registry-cljs-fallback)
+        catalog (edn/read-string
+                 (slurp (io/resource "kotoba/lang/capability-catalog.edn")))
+        from-catalog (into {} (map (fn [[k e]] [k (:compiler-wire-id e)]))
+                           (:capabilities catalog))]
+    (is (pos? (count fallback)) "the fallback map must not be empty")
+    (is (= (set (keys from-catalog)) (set (keys fallback)))
+        "every catalogued capability is in the CLJS fallback, and no others")
+    (is (= from-catalog fallback)
+        "the CLJS fallback and the catalog resource agree on every wire id")
+    (is (= 24 (get fallback :dataspace/transact))
+        "capability-registry-cljs-fallback must include wire id 24")))
+
+(deftest undeclared-dataspace-capability-is-rejected
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"not declared in namespace :capabilities"
+       (sema/analyze
+        "(ns app (:capabilities #{:entropy/draw}))
+         (defn publish [x] (cap-call :dataspace/transact x))
+         (defn main [] 0)"))))
+
+(deftest page-fault-evidence-operations-are-a-closed-kernel-surface
+  (let [result (sema/analyze
+                "(defn main []
+                   (let [handler (kernel-page-fault-handler-address)
+                         selector (kernel-read-cs)]
+                     (kernel-load-idt handler 10)))")]
+    (is (= :i64 (:result result)))
+    (is (hir/valid? result))))
+
+(deftest recoverable-page-fault-operations-have-sealed-arities
+  (let [result (sema/analyze
+                "(defn main []
+                   (let [handler (kernel-page-fault-recovery-handler-address)
+                         configured (kernel-configure-page-fault-recovery 4096 12272)
+                         probe (kernel-probe-recoverable-guard-write)]
+                     (+ handler configured probe)))")]
+    (is (= :i64 (:result result)))
+    (is (hir/valid? result))))
+
+(deftest rt-timer-handler-is-a-sealed-zero-arity-kernel-operation
+  (let [result (sema/analyze
+                "(defn main [] (kernel-rt-timer-handler-address))")]
+    (is (= :i64 (:result result)))
+    (is (hir/valid? result)))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"kernel privileged operation arity mismatch"
+       (sema/analyze
+        "(defn main [] (kernel-rt-timer-handler-address 1))"))))
+
+(deftest undefined-opcode-handler-is-a-sealed-zero-arity-kernel-operation
+  ;; amu-h7: mirrors `kernel-double-fault-handler-address` -- zero-arity and
+  ;; an address. Inert in an image until kotoba-gmir, kotoba-kir, the grammar
+  ;; authority and kotoba-native admit it too; this table is one of the five.
+  (let [result (sema/analyze
+                "(defn main [] (kernel-undefined-opcode-handler-address))")]
+    (is (= :i64 (:result result)))
+    (is (hir/valid? result)))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo
+       #"kernel privileged operation arity mismatch"
+       (sema/analyze
+        "(defn main [] (kernel-undefined-opcode-handler-address 6))"))))
+
+(deftest double-fault-ist-operations-have-sealed-arities
+  (let [result (sema/analyze
+                "(defn main []
+                   (let [handler (kernel-double-fault-handler-address)
+                         configured (kernel-configure-double-fault-ist 4096 12288)
+                         loaded (kernel-load-gdt-tss 8192 10)
+                         probe (kernel-probe-double-fault)]
+                     (+ handler configured loaded probe)))")]
+    (is (= :i64 (:result result)))
+    (is (hir/valid? result))))
+
+(deftest public-sema-facade-owns-consumer-entry-points
+  (is (not (contains? sema/forbidden-heads 'eval)))
+  (is (contains? sema/forbidden-heads 'load-string))
+  (is (every? pos? [sema/max-functions sema/max-expression-nodes
+                    sema/max-lowered-nodes sema/max-bindings
+                    sema/max-list-items sema/max-namespace-capabilities
+                    sema/max-namespace-docstring-chars
+                    sema/max-function-docstring-chars]))
+  (is (map? (sema/kernel-region-report
+             (sema/analyze "(defn main [] 42)"))))
+  (with-redefs [sema/max-functions 1]
+    (is (thrown-with-msg? kerror/ExceptionInfo #"function count"
+                          (sema/analyze
+                           "(defn helper [] 1) (defn main [] 42)")))))
+
+(defn- result-of
+  "The declared result type of `p` in SRC. `main` must be zero-arity, so the
+  function under test is a helper beside it."
+  [src]
+  (let [r (sema/analyze (str src "\n(defn main [] 0)"))]
+    (->> (:functions r) (filter #(= 'p (:name %))) first :result)))
+
+(deftest string-predicates-are-bool-like-every-other-predicate
+  ;; Profile 5 (compiler ADR 0191) typed comparisons and predicates as `:bool`
+  ;; so `and`/`or`/`not` compose. It carried the arithmetic and generic
+  ;; predicates and left `string=?` and `string-contains?` at `:i64`, in the
+  ;; same frontend where the later `string-index-contains` returns `:bool`.
+  (testing "a :bool-declared function may return one"
+    (is (= :bool (result-of "(defn p [a :string b :string] :bool (string=? a b))")))
+    (is (= :bool (result-of "(defn p [a :string] :bool (string-contains? a \"x\"))"))))
+  (testing "and they compose, which is the whole reason profile 5 exists"
+    (is (= :bool (result-of
+                  "(defn p [a :string] :bool (and (string=? a \"x\") (string-contains? a \"y\")))"))))
+  (testing "not, over a string predicate"
+    (is (= :bool (result-of "(defn p [a :string b :string] :bool (not (string=? a b)))"))))
+  (testing "an i64-declared function may no longer return one — this is the break"
+    (is (thrown? kerror/ExceptionInfo
+                 (result-of "(defn p [a :string b :string] :i64 (string=? a b))"))))
+  (testing "the migration ADR 0191 names is available: (if p 1 0)"
+    (is (= :i64 (result-of
+                 "(defn p [a :string b :string] :i64 (if (string=? a b) 1 0))")))))
+
+(defn- function-named
+  [result name]
+  (->> (:functions result) (filter #(= name (:name %))) first))
+
+(defn- form-tree [form]
+  (tree-seq coll? seq form))
+
+(deftest pure-map-reduce-fusion-elides-intermediate-vectors
+  (let [ops (fn [body]
+              (let [{:keys [functions]}
+                    (sema/analyze
+                     (str "(ns t (:export [f]))\n"
+                          "(defn f [v :vector-i64] :i64 " body ")"))]
+                (into #{} (comp (map :body)
+                                (mapcat form-tree)
+                                (filter seq?)
+                                (map first))
+                      functions)))]
+    (is (not (contains? (ops "(reduce + 0 (map inc v))") 'vector-conj)))
+    (is (not (contains? (ops "(reduce + 0 (map dec (map inc v)))") 'vector-conj)))
+    (is (contains? (ops "(reduce + 0 (map (fn [x] (+ x 1)) v))") 'vector-conj)
+        "unproven callbacks retain eager materialization")))
+
+(defn- body-heads [form]
+  (into [] (comp (filter seq?) (map first)) (form-tree form)))
+
+(deftest option-some?-widens-from-option-i64-to-option-T
+  ;; Bare `option-some?` (and the `some?` / `nil?` desugars that become it) is
+  ;; typed `:option-i64`. Decision cores that store `[:option :string]` on a
+  ;; record therefore have to write `option-some?-of` at every site — the same
+  ;; tax `option-or` already pays by rewriting to `option-value-of`. This pass
+  ;; is that rewrite: HIR still carries the typed `-of` form native admits.
+  (testing "option-some? on [:option :string] is :bool and lowers to -of"
+    (let [result (sema/analyze
+                  (str "(defn p [v [:option :string]] :bool (option-some? v))\n"
+                       "(defn main [] 0)"))
+          p (function-named result 'p)]
+      (is (hir/valid? result))
+      (is (= :bool (:result p)))
+      (is (some #{'option-some?-of} (body-heads (:body p))))
+      (is (not-any? #{'option-some?} (body-heads (:body p))))))
+  (testing "option-value on [:option :string] lowers to option-value-of"
+    (let [p (function-named
+             (sema/analyze
+              (str "(defn p [v [:option :string]] :string (option-value v \"none\"))\n"
+                   "(defn main [] 0)"))
+             'p)]
+      (is (= :string (:result p)))
+      (is (some #{'option-value-of} (body-heads (:body p))))
+      (is (not-any? #{'option-value} (body-heads (:body p))))))
+  (testing "some? and nil? follow, because they desugar to option-some?"
+    (let [some-p (function-named
+                  (sema/analyze
+                   (str "(defn p [v [:option :string]] :bool (some? v))\n"
+                        "(defn main [] 0)"))
+                  'p)
+          nil-p (function-named
+                 (sema/analyze
+                  (str "(defn p [v [:option :string]] :bool (nil? v))\n"
+                       "(defn main [] 0)"))
+                 'p)]
+      (is (= :bool (:result some-p)))
+      (is (some #{'option-some?-of} (body-heads (:body some-p))))
+      (is (= :bool (:result nil-p)))
+      (is (some #{'option-some?-of} (body-heads (:body nil-p))))))
+  (testing "and of two record option-string fields is :bool, without (if … true false)"
+    (let [p (function-named
+             (sema/analyze
+              "(ns example.actor
+                 (:schemas {:example/actor
+                            [:record :example/actor
+                             [[:endpoint [:option :string]]
+                              [:region [:option :string]]]]})
+                 (:export [p]))
+               (defn p [a [:ref :example/actor]] :bool
+                 (and (option-some? (record-get a :endpoint))
+                      (option-some? (record-get a :region))))")
+             'p)]
+      (is (= :bool (:result p)))
+      (is (some #{'option-some?-of} (body-heads (:body p))))
+      (is (not-any? #{'option-some?} (body-heads (:body p))))
+      (is (not-any? true? (form-tree (:body p)))
+          "the (if pred true false) wrap is the stale self-restriction this removes")))
+  (testing "legacy :option-i64 keeps the bare form — KIR execute still uses it"
+    (let [p (function-named
+             (sema/analyze
+              (str "(defn p [v :option-i64] :bool (option-some? v))\n"
+                   "(defn main [] 0)"))
+             'p)]
+      (is (= :bool (:result p)))
+      (is (some #{'option-some?} (body-heads (:body p))))
+      (is (not-any? #{'option-some?-of} (body-heads (:body p))))))
+  (testing "rewrite leak still fails closed: option-some? remains option-i64-only"
+    (is (thrown-with-msg? kerror/ExceptionInfo
+                          #"expected option-i64"
+                          (sema/analyze
+                           "(defn p [v :i64] :bool (option-some? v))\n(defn main [] 0)")))))
+
+(deftest fused-read-modify-write-is-admitted-end-to-end
+  ;; `lvl-qty[k] += qty` (superproject ADR-2609010500; `torihiki.book`'s
+  ;; `slab/add!`, two call sites) has no expression in Kotoba except
+  ;; `(vector-assoc! v k (+ (vector-at v k) delta))` -- read then write, at
+  ;; the same index, in one compound expression. `kotoba.compiler.affine`
+  ;; counted that as two uses of `v` and `check-affine-writes!` (the frontend
+  ;; gate `defn-parts` calls on every function) refused it, unconditionally,
+  ;; because two calls means two uses regardless of what either call does.
+  ;;
+  ;; This is `sema/analyze` -- the same public entry point every other test
+  ;; in this namespace goes through -- not the isolated predicate, so it
+  ;; exercises the actual decision `defn-parts` makes, not a stand-in for it.
+  (testing "admitted: read and write fused at the same index, one call site"
+    (let [result (sema/analyze
+                  "(defn add! [v :vector-i64 k :i64 delta :i64] :vector-i64
+                     (vector-assoc! v k (+ (vector-at v k) delta)))
+                   (defn main [] 0)")
+          add! (function-named result 'add!)]
+      (is (hir/valid? result))
+      (is (= :vector-i64 (:result add!)))
+      (is (= '(vector-assoc! v k (+ (vector-at v k) delta)) (:body add!)))))
+  (testing "admitted: the same fusion threaded through tail recursion"
+    (let [result (sema/analyze
+                  "(defn go [v :vector-i64 i :i64 n :i64 delta :i64] :i64
+                     (if (>= i n)
+                       (vector-at v 0)
+                       (go (vector-assoc! v i (+ (vector-at v i) delta)) (+ i 1) n delta)))
+                   (defn main [] 0)")]
+      (is (hir/valid? result))))
+  (testing "admitted: a read at k2 inside the write at k1 runs before the write
+            (the gate decides in evaluation order since 2026-09-23)"
+    (is (hir/valid?
+         (sema/analyze
+          "(defn add! [v :vector-i64 k1 :i64 k2 :i64 delta :i64] :vector-i64
+             (vector-assoc! v k1 (+ (vector-at v k2) delta)))
+           (defn main [] 0)"))))
+  (testing "refused: a read after the write, inside when -- once admitted"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"requires a linear handle"
+         (sema/analyze
+          "(defn peek0 [v :vector-i64 c :i64] :i64
+             (when (= c 1) (vector-assoc! v 0 5) (vector-at v 0)))
+           (defn main [] 0)"))))
+  (testing "still refused: the handle read again after the fused write consumed it"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"requires a linear handle"
+         (sema/analyze
+          "(defn add-then-read! [v :vector-i64 k :i64 delta :i64] :i64
+             (do (vector-assoc! v k (+ (vector-at v k) delta))
+                 (vector-at v 0)))
+           (defn main [] 0)"))))
+  (testing "still refused: two fused writes to the same handle on one path"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"requires a linear handle"
+         (sema/analyze
+          "(defn add-twice! [v :vector-i64 k1 :i64 k2 :i64 d1 :i64 d2 :i64] :i64
+             (do (vector-assoc! v k1 (+ (vector-at v k1) d1))
+                 (vector-assoc! v k2 (+ (vector-at v k2) d2))
+                 0))
+           (defn main [] 0)"))))
+  (testing "unaffected regression: the plain bang-form still admits, no fusion involved"
+    (let [result (sema/analyze
+                  "(defn go [v :vector-i64 i :i64 n :i64] :i64
+                     (if (>= i n)
+                       (vector-at v 0)
+                       (go (vector-assoc! v 0 i) (+ i 1) n)))
+                   (defn main [] 0)")]
+      (is (hir/valid? result)))))
+
+;; ---------------------------------------------------------------------------
+;; sysops: the general atomics and the x86 system operations.
+;; ---------------------------------------------------------------------------
+
+(def ^:private sysops-atomic-calls
+  ;; source form -> declared arity
+  {"(kernel-atomic-add-u32 base 4096 0 1)" 4
+   "(kernel-atomic-add-u64 base 4096 0 1)" 4
+   "(kernel-xchg-u32 base 4096 0 1)" 4
+   "(kernel-xchg-u64 base 4096 0 1)" 4
+   "(kernel-cmpxchg-u32 base 4096 0 1 2)" 5
+   "(kernel-cmpxchg-u64 base 4096 0 1 2)" 5})
+
+(defn- sysops-module
+  "`main` must take zero arguments, so a base parameter lives on a helper."
+  [body]
+  (str "(defn go [base] " body ") (defn main [] (go 4096))"))
+
+(deftest general-atomics-are-admitted-with-sealed-arities
+  (doseq [[call _] sysops-atomic-calls]
+    (testing call
+      (let [result (sema/analyze (sysops-module call))]
+        (is (= :i64 (:result result)))
+        (is (hir/valid? result)))))
+  (testing "a wrong arity is refused by name"
+    (doseq [[call arity] sysops-atomic-calls
+            :let [head (subs call 1 (.indexOf call " "))]
+            wrong [(str "(" head " base 4096 0)")
+                   (str "(" head " base 4096 0 1 2 3)")]
+            :when (not= arity (dec (count (re-seq #"\S+" wrong))))]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"kernel memory operation arity mismatch"
+           (sema/analyze (sysops-module wrong)))
+          wrong))))
+
+(deftest general-atomics-carry-the-region-provenance-rule
+  ;; They take a base, so the base must NAME a region rather than compute one.
+  ;; Nothing here is specific to the atomics -- it falls out of listing them in
+  ;; `kernel-memory-operations` -- which is exactly why it is asserted: putting
+  ;; them anywhere else would have exempted them from it silently.
+  (doseq [[call _] sysops-atomic-calls
+          ;; the same call with its base replaced by a value nothing rooted
+          :let [head (subs call 1 (.indexOf call " "))
+                after-base (subs call (inc (.indexOf call " " (inc (.indexOf call " ")))))
+                unrooted (str "(" head " (kernel-load-u8 buf 512 0) " after-base)]]
+    (testing unrooted
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"kernel memory base must name a region, not compute one"
+           (sema/analyze
+            (str "(defn go [buf] " unrooted ") (defn main [] (go 4096))")))
+          unrooted)))
+  (testing "and a parameter base is admitted, as it is for every other one"
+    (is (hir/valid?
+         (sema/analyze
+          (sysops-module "(kernel-cmpxchg-u32 base 4096 0 1 2)"))))))
+
+(deftest system-operations-are-sealed-zero-arity-privileged-operations
+  (doseq [head ["kernel-fence-load" "kernel-fence-store" "kernel-fence-full"
+                "kernel-rdtsc" "kernel-rdtscp" "kernel-swapgs"]]
+    (testing head
+      (let [result (sema/analyze (str "(defn main [] (" head "))"))]
+        (is (= :i64 (:result result)))
+        (is (hir/valid? result)))
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"kernel privileged operation arity mismatch"
+           (sema/analyze (str "(defn main [] (" head " 1))")))))))
+
+(deftest the-new-operation-names-are-reserved
+  ;; A module that defines its own `kernel-rdtsc` would otherwise shadow the
+  ;; operation and compile into a call to itself.
+  (doseq [head '[kernel-atomic-add-u32 kernel-atomic-add-u64
+                 kernel-xchg-u32 kernel-xchg-u64
+                 kernel-cmpxchg-u32 kernel-cmpxchg-u64
+                 kernel-fence-load kernel-fence-store kernel-fence-full
+                 kernel-rdtsc kernel-rdtscp kernel-swapgs]]
+    (is (contains? @#'kotoba.compiler.frontend/reserved-function-names head)
+        head)))
+
+(deftest an-accumulator-threaded-through-helpers-earns-the-bang
+  ;; The shape `x25519.field/mul` has and could not write: an inner loop and
+  ;; an outer loop that each take the accumulator, update it, and RETURN it.
+  ;; A returned handle is an escape as far as one body can tell, so every one
+  ;; of these updates copied -- measured 2026-09-08 on aarch64, the same
+  ;; 3000-iteration loop costs 3001 vector handles and 48,016 arena items
+  ;; copying and 1 handle and 16 items in place.
+  ;;
+  ;; Admitted now because the decision is made over the MODULE: the callee
+  ;; lets the handle escape nowhere but its return, and every caller gives it
+  ;; up at the call. Neither half is sound alone, so both are asserted.
+  (testing "admitted: the accumulator is returned and every caller drops it"
+    (is (hir/valid?
+         (sema/analyze
+          "(defn- inner [x :vector-i64 y :vector-i64 i :i64 j :i64 t :vector-i64] :vector-i64
+             (if (>= j 16)
+               t
+               (inner x y i (+ j 1)
+                      (vector-assoc! t (+ i j) (+ (vector-at t (+ i j))
+                                                  (* (vector-at x i) (vector-at y j)))))))
+           (defn- outer [x :vector-i64 y :vector-i64 i :i64 t :vector-i64] :vector-i64
+             (if (>= i 16) t (outer x y (+ i 1) (inner x y i 0 t))))
+           (defn main [] :i64
+             (let [t (vector-alloc 31)
+                   u (outer (vector-alloc 16) (vector-alloc 16) 0 t)]
+               (vector-at u 0)))"))))
+  (testing "refused: the callee keeps the handle somewhere this cannot follow"
+    (is (thrown-with-msg?
+         Exception #"requires a linear handle"
+         (sema/analyze
+          "(defn- keep-it [i :i64 t :vector-i64] :vector-i64
+             (if (>= i 16)
+               (vector-assoc! t 0 (vector-at t 1))
+               (keep-it (+ i 1) (vector-assoc t i (+ (vector-at t i) 1)))))
+           (defn main [] :i64
+             (let [t (vector-alloc 16)
+                   u (keep-it 0 t)
+                   w (keep-it 0 t)]
+               (+ (vector-at u 0) (vector-at w 0))))")))))
+
+(deftest a-caller-that-reads-after-handing-over-is-still-admitted
+  ;; A KNOWN HOLE, asserted so that closing it is visible rather than silent.
+  ;;
+  ;; A function whose vector parameter is linear in its OWN body earns the
+  ;; bang whatever its callers do, and has since the gate existed. The
+  ;; consequence is observable rather than theoretical: measured 2026-09-08,
+  ;; this program compiled to aarch64-macos and executed under kexe_loader
+  ;; answers 2, and it should answer 1 -- `main` reads its own `t` after
+  ;; handing it over, and sees a store it never asked for. `main` writes no
+  ;; bang, so the gate never looks at it.
+  ;;
+  ;; `module-linear-returning` is the machinery that would close it, and
+  ;; requiring it refuses two shapes that work today: a public helper whose
+  ;; callers are in another module (`torihiki.book`'s `slab/add!`, which
+  ;; superproject ADR-2609010500 exists for), and any function this module
+  ;; does not see called. That is a decision about the language rather than a
+  ;; patch, so the widening landed and this stayed.
+  ;;
+  ;; WHEN IT IS CLOSED, invert this assertion. It is written as an admission
+  ;; on purpose: a suite that simply omitted the case would go green through
+  ;; the fix and through a regression alike.
+  (is (hir/valid?
+       (sema/analyze
+        "(defn- bump [t :vector-i64] :vector-i64
+           (vector-assoc! t 0 (+ (vector-at t 0) 1)))
+         (defn main [] :i64
+           (let [t (vector-alloc 4)
+                 u (bump t)]
+             (+ (vector-at u 0) (vector-at t 0))))"))
+      "still admitted -- see the comment: this is the hole, not the contract"))

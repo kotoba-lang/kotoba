@@ -1,0 +1,295 @@
+(ns kotoba.compiler.local-state-test
+  "Local state, slice 1 (kotoba-lang `lang/local-state.edn`).
+
+  `lang/surface-status.edn` `:no-ambient-mutation` bans `atom`/`swap!`/`reset!`
+  under the invariant that state must not be AMBIENT -- not that mutation is
+  forbidden. The `:state` capability kit is the admitted model for state that
+  ESCAPES or PERSISTS. It is the wrong model for
+
+      (let [a (atom 0)] (swap! a + 1) @a)
+
+  which needs no host, no grant and no runtime cell. This is that second
+  widening, in the smallest complete shape:
+
+  - `(atom init)` is admitted ONLY as a let binding's init. The name it binds
+    is a CELL, not a value: it may appear only as the first argument of
+    `swap!` / `reset!` / `deref` (`@a`), in the same function body.
+  - The elaboration is state passing. The cell becomes an ordinary let-bound
+    value, rebound after every write; `deref` reads the current binding;
+    `swap!`/`reset!` evaluate to the new value, as Clojure's do.
+  - A branching form whose arms write is emitted once per mutated cell plus
+    once for its own value, so the join is a rebinding rather than a merge.
+  - Nothing reaches the effect row. `:named-operations` gains `:local-state`.
+
+  Everything the slice does not do is refused with a message that says so, and
+  each refusal is pinned here by its exact text. The control at the end is an
+  atom-free program whose HIR and KIR hashes were taken on the commit before
+  this pass existed (kotoba-sema 411d4cab): a change to how any atom-free
+  program lowers would move them."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.sema :as sema]))
+
+(defn- run [source function arguments]
+  (long (kir/execute (kir/lower (sema/analyze source)) function arguments)))
+
+(defn- rejection-of
+  ([source] (rejection-of source nil))
+  ([source opts]
+   (try (do (sema/analyze source opts) nil)
+        (catch Throwable e (ex-message e)))))
+
+(defn- rejection-code-of [source]
+  (try (do (sema/analyze source) nil)
+       (catch Throwable e (:kotoba.error/code (ex-data e)))))
+
+(defn- function-named [hir name]
+  (first (filter #(= name (:name %)) (:functions hir))))
+
+(def ^:private atom-heads '#{atom swap! reset! deref clojure.core/deref})
+
+(defn- mentions-an-atom-head? [form]
+  (boolean (some #(and (seq? %) (seq %) (contains? atom-heads (first %)))
+                 (tree-seq coll? seq form))))
+
+;; ---------------------------------------------------------------------------
+;; Positive: a counter in a let
+
+(def ^:private counter
+  "(defn main [] :i64 (let [a (atom 0)] (swap! a + 1) (swap! a + 41) @a))")
+
+(deftest a-counter-in-a-let
+  (testing "the reads see the writes"
+    (is (= 42 (run counter 'main []))))
+  (testing "nothing reaches the effect row -- there is no cell at runtime"
+    (let [hir (sema/analyze counter)]
+      (is (= #{} (:effects hir)))
+      (is (= #{} (:effects (function-named hir 'main))))))
+  (testing "but the elaboration is visible in :named-operations"
+    (is (contains? (:named-operations (sema/analyze counter)) :local-state)))
+  (testing "no atom operation survives into HIR or KIR"
+    (let [hir (sema/analyze counter)]
+      (is (not (mentions-an-atom-head? (mapv :body (:functions hir)))))
+      (is (not (mentions-an-atom-head? (kir/lower hir))))))
+  (testing "the lowering is ordinary let bindings, one per write"
+    (let [body (:body (function-named (sema/analyze counter) 'main))]
+      (is (= 'let (first body)))
+      ;; (atom 0) plus two writes: three bindings, and the body reads the last.
+      (is (= 3 (quot (count (second body)) 2)))
+      (is (= (nth (second body) 4) (nth body 2))))))
+
+;; ---------------------------------------------------------------------------
+;; Positive: a write in each arm of an if
+
+(def ^:private through-an-if
+  "(defn- classify [n :i64] :i64
+     (let [a (atom 0)]
+       (if (> n 0) (swap! a + 10) (reset! a 5))
+       (+ @a n)))
+   (defn main [] :i64 (+ (classify 1) (classify -1)))")
+
+(deftest an-atom-through-an-if
+  (testing "the post-branch value of the cell is the join of the arms"
+    (is (= 15 (run through-an-if 'main []))))
+  (testing "an arm that does not write still contributes the cell's value"
+    (is (= 7 (run "(defn main [] :i64
+                     (let [a (atom 7)] (if (> 0 1) (reset! a 1) 0) @a))"
+                  'main []))))
+  (testing "a nested let inside the scope writes the outer cell"
+    (is (= 10 (run "(defn main [] :i64
+                      (let [a (atom 0)] (let [x 5] (swap! a + x)) (* @a 2)))"
+                   'main []))))
+  (testing "cond, case and when reach the same join"
+    (is (= 7 (run "(defn main [] :i64
+                     (let [a (atom 0)] (cond (> 1 2) (reset! a 1) :else (reset! a 7)) @a))"
+                  'main [])))
+    (is (= 20 (run "(defn main [] :i64
+                      (let [a (atom 0)] (case 2 1 (reset! a 10) 2 (reset! a 20) (reset! a 30)) @a))"
+                   'main [])))
+    (is (= 12 (run "(defn main [] :i64
+                      (let [a (atom 3)] (when (> 1 0) (swap! a * 4)) @a))"
+                   'main []))))
+  (testing "two cells written in one branch are joined independently"
+    (is (= 33 (run "(defn main [] :i64
+                      (let [a (atom 1) b (atom 2)]
+                        (if (> 1 0) (do (swap! a + 10) (swap! b + 20)) 0)
+                        (+ @a @b)))"
+                   'main []))))
+  (testing "a cell is not restricted to i64"
+    (is (= 4 (run "(defn main [] :i64
+                     (let [s (atom \"ab\")] (reset! s \"abcd\") (string-length @s)))"
+                  'main [])))))
+
+;; ---------------------------------------------------------------------------
+;; Positive: swap! with extra arguments, and Clojure's own answer for a write
+
+(deftest swap-takes-extra-arguments-and-returns-the-new-value
+  (testing "(swap! a f x y) is (f a x y)"
+    (is (= 42 (run "(defn main [] :i64
+                      (let [a (atom 1)] (swap! a + 2 3) (swap! a * 7) (+ @a 0)))"
+                   'main []))))
+  (testing "a write evaluates to the NEW value, as Clojure's swap! does"
+    (is (= 12 (run "(defn main [] :i64 (let [a (atom 5)] (+ (swap! a + 1) @a)))"
+                   'main []))))
+  (testing "a read inside a write's arguments sees the value before that write"
+    (is (= 8 (run "(defn main [] :i64 (let [a (atom 4)] (swap! a + @a) @a))"
+                  'main []))))
+  (testing "@a and (deref a) are the same read"
+    (is (= 42 (run "(defn main [] :i64 (let [a (atom 40)] (swap! a + 2) @a))" 'main [])))
+    (is (= 42 (run "(defn main [] :i64 (let [a (atom 40)] (swap! a + 2) (deref a)))"
+                   'main [])))))
+
+;; ---------------------------------------------------------------------------
+;; Negative: the escape rule. This is the load-bearing one -- it is what keeps
+;; the state non-ambient, so each shape it must catch is pinned separately.
+
+(def ^:private escape-message
+  (str "atom `a` escapes its let scope (atom slice 1 admits swap!/reset!/deref "
+       "in straight-line code of the binding function only)"))
+
+(deftest a-cell-is-not-a-value
+  (testing "passed as an argument"
+    (is (= escape-message
+           (rejection-of "(defn- takes [x :i64] :i64 x)
+                          (defn main [] :i64 (let [a (atom 0)] (takes a)))"))))
+  (testing "returned"
+    (is (= escape-message
+           (rejection-of "(defn main [] :i64 (let [a (atom 0)] a))"))))
+  (testing "stored in a collection"
+    (is (= escape-message
+           (rejection-of "(defn main [] :i64 (let [a (atom 0)] (vector-at [a 1] 0)))"))))
+  (testing "captured by a fn literal, even only to read it"
+    (is (= escape-message
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)]
+                              (vector-at (map (fn [x] (+ x @a)) [1 2 3]) 0)))"))))
+  (testing "read inside a loop, where a rebinding chain cannot express it"
+    (is (= escape-message
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)]
+                              (loop [i 0] (if (= i 3) @a (recur (+ i 1))))))"))))
+  (testing "read inside a dotimes body"
+    (is (= escape-message
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)] (dotimes [i 2] @a) 1))"))))
+  (testing "shadowed by an ordinary let binding of the same name"
+    (is (= escape-message
+           (rejection-of "(defn main [] :i64 (let [a (atom 0)] (let [a 1] a)))")))))
+
+;; ---------------------------------------------------------------------------
+;; Negative: everything else the slice refuses
+
+(deftest the-refusals-say-what-the-slice-does-not-do
+  (testing "an atom anywhere but a let binding's init"
+    (is (= (str "atom must be the init expression of a let binding (atom slice 1 "
+                "admits swap!/reset!/deref in straight-line code of the binding "
+                "function only)")
+           (rejection-of "(defn main [] :i64 (+ 1 (atom 0)))"))))
+  (testing "swap! on something that is not a cell"
+    (is (= "swap! expects a let-bound atom cell as its first argument; got `x` (atom slice 1)"
+           (rejection-of "(defn- f [x :i64] :i64 (swap! x + 1))
+                          (defn main [] :i64 (f 1))"))))
+  (testing "reset! on something that is not a cell"
+    (is (= "reset! expects a let-bound atom cell as its first argument; got `x` (atom slice 1)"
+           (rejection-of "(defn- f [x :i64] :i64 (reset! x 1))
+                          (defn main [] :i64 (f 1))"))))
+  (testing "deref of something that is not a cell"
+    (is (= "deref expects a let-bound atom cell as its first argument; got `x` (atom slice 1)"
+           (rejection-of "(defn- f [x :i64] :i64 (deref x))
+                          (defn main [] :i64 (f 5))"))))
+  (testing "a write inside a head whose operands are not all evaluated"
+    (is (= (str "swap!/reset! is not admitted inside `and` (atom slice 1 admits "
+                "them in let, do, if, when, cond and case only)")
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)]
+                              (if (and (> 1 0) (> (swap! a + 1) 0)) 1 2)))"))))
+  (testing "a write whose new value is a different type than the cell"
+    (is (= "atom `a` is i64; this rebinding is string (atom slice 1 requires one type per cell)"
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)] (swap! a string-from-i64) 1))"))))
+  (testing "a branch that both writes a cell and calls a capability"
+    ;; The elaboration copies the branch once per cell; copying a capability
+    ;; call would duplicate the effect, so the branch is refused instead.
+    (is (= (str "a branch that writes an atom must not contain a capability call "
+                "(atom slice 1 elaborates the branch once per cell)")
+           (rejection-of "(ns n (:capabilities #{:clock/now}) (:export [main]))
+                          (defn main [] :i64
+                            (let [a (atom 0)]
+                              (if (> 1 0) (do (swap! a + 1) (clock/now)) 0)
+                              @a))"))))
+  (testing "a cond that writes but has no :else, so one arm is implicit"
+    (is (= (str "a cond that writes an atom must end with :else (atom slice 1 admits "
+                "swap!/reset!/deref in straight-line code of the binding function only)")
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)] (cond (> 1 2) (reset! a 1)) @a))"))))
+  (testing "a cell shadowing another cell of the same name"
+    (is (= (str "atom `a` shadows an atom of the same name (atom slice 1 admits "
+                "swap!/reset!/deref in straight-line code of the binding function only)")
+           (rejection-of "(defn main [] :i64
+                            (let [a (atom 0)] (let [a (atom 1)] @a)))")))))
+
+(deftest every-local-state-refusal-carries-a-stable-code
+  (is (= :kotoba.error/local-state-escape
+         (rejection-code-of "(defn main [] :i64 (let [a (atom 0)] a))")))
+  (is (= :kotoba.error/local-state-not-a-cell
+         (rejection-code-of "(defn- f [x :i64] :i64 (deref x)) (defn main [] :i64 (f 5))")))
+  (is (= :kotoba.error/local-state-position
+         (rejection-code-of "(defn main [] :i64
+                               (let [a (atom 0)]
+                                 (if (and (> 1 0) (> (swap! a + 1) 0)) 1 2)))")))
+  (is (= :kotoba.error/local-state-atom-position
+         (rejection-code-of "(defn main [] :i64 (+ 1 (atom 0)))")))
+  (is (= :kotoba.error/local-state-cell-type
+         (rejection-code-of "(defn main [] :i64
+                               (let [a (atom 0)] (swap! a string-from-i64) 1))"))))
+
+(deftest the-heads-cannot-be-redefined-now-that-they-are-admitted
+  ;; They left `forbidden-heads`, so nothing else would stop a program from
+  ;; defining one and shadowing the head silently.
+  (doseq [head ["atom" "swap!" "reset!" "deref"]]
+    (is (= "reserved function name"
+           (rejection-of (str "(defn " head " [x :i64] :i64 x) (defn main [] :i64 0)")))
+        head)))
+
+(deftest the-pure-product-profile-refuses-the-heads
+  ;; They were refused there through `forbidden-heads`; naming them in
+  ;; `pure-product-disallowed-heads` keeps that surface exactly what it was.
+  (is (= "form outside pure-product profile: atom"
+         (rejection-of "(defn main [] :i64 (let [a (atom 0)] @a))"
+                       {:language-profile :pure-product}))))
+
+;; ---------------------------------------------------------------------------
+;; Control: an atom-free program lowers exactly as it did before the pass
+
+(def ^:private control
+  "Exercises what the pass walks -- let chains, do, if, cond, case, when, a
+  constant, and a helper call -- with no atom, swap!, reset! or deref."
+  "(ns local.control (:export [main]))
+   (def limit 6)
+   (defn- clampish [x :i64 lo :i64 hi :i64] :i64 (if (< x lo) lo (if (> x hi) hi x)))
+   (defn- accumulate [n :i64] :i64
+     (let [base (* n 2) bump (+ base 1)]
+       (do (+ base 0)
+           (cond (> bump 100) 100 (> bump 10) bump :else (+ bump 1)))))
+   (defn main [] :i64
+     (let [a (clampish 9 0 limit) b (accumulate 3)]
+       (+ a b (case b 8 1 9 2 3) (when (> a 0) a))))")
+
+(defn- sha256-hex [^String text]
+  (let [digest (java.security.MessageDigest/getInstance "SHA-256")]
+    (apply str (map #(format "%02x" %) (.digest digest (kbytes/utf8-bytes text))))))
+
+(deftest an-atom-free-program-lowers-byte-for-byte-as-before
+  ;; Both hashes were taken on kotoba-sema 411d4cab, the main tip before this
+  ;; pass landed, from `(pr-str hir)` and `(pr-str (dissoc kir :oracle-value))`
+  ;; of exactly this source. `elaborate-local-state` returns a body that
+  ;; mentions none of the four heads UNCHANGED, and these pin that.
+  (let [hir (sema/analyze control)
+        kir (kir/lower hir)]
+    (is (= "2406d55205a300f53034a10d34ddc4d0e09b7e7e6fd05824b743442c6b2052dc"
+           (sha256-hex (pr-str hir))))
+    (is (= "f3e89188ef1d1a966589ba51f476af876c48f5c3292131d514960dad242bcafc"
+           (sha256-hex (pr-str (dissoc kir :oracle-value)))))
+    (is (= 21 (long (kir/execute kir 'main []))))
+    (is (= #{} (:named-operations hir))
+        ":local-state is added only when a cell is actually elaborated")))

@@ -1,0 +1,1108 @@
+(ns kotoba.compiler.validate-expr
+  "The frontend's `validate-expr` (admission of one desugared expression),
+  as a Kotoba-route module over `kotoba.form`. Selfhost core rewrite S3,
+  slice 2 (docs/selfhost-core-rewrite-plan-20260930.md).
+
+  Why this pass first. `validate-expr` has one input shape (a form, the
+  locals in scope, the module's function arities), one output (the form
+  or a refusal) and no dependency on the inference passes: its only
+  ambient state is the `budget` volatile, the `locals` set and the
+  `functions` map, all of which arrive as arguments. So the port needs no
+  dynamic var; the three become the explicit `:vx/env` record and a
+  `nodes` counter threaded through `:vx/r` results.
+
+  Data that used to be host values.
+    * Operation tables are `kotoba.compiler.frontend-tables` Forms, parsed
+      ONCE per batch into `:tabs` (index -> table, listed at `build-tabs`).
+    * `forbidden-heads` and `grammar-declared-heads` are derived from a
+      classpath resource by the host (`load-catalog-forbidden`); the caller
+      hands them in as Form sets.
+    * A refusal is a value: `:vx/r` {ok code msg nodes}. Kotoba cannot catch,
+      and the host's `reject!` throws, so the differential compares the
+      thrown `ex-message` and `:kotoba.error/code` to these two fields.
+
+  What is in this slice. Literals, symbols, `let`, `if`, `do`, `cap-call`,
+  arithmetic / float division / comparisons, every arity-table family
+  (i64, i32, heap, kgraph, string, xml, region, decimal, f64, f32, typed
+  safe value, typed vector, typed f64 vector, compact graph, document,
+  kernel memory / privileged, `kernel-uefi-alloc-region`, image symbol),
+  the bytes heads, `map-new`/`map-get`/`map-assoc`, `vector-new`,
+  document sequences, module function calls, and the unbound-symbol /
+  unknown-operation refusals with their nearest-name advice.
+
+  Type-descriptor heads (`typed-list-*`, `typed-set-*`, `typed-map-*`,
+  `record-*`, `hetero-vector-*`, `option-*`, `variant-*`, `result-match-of`,
+  the parametric result family, `typed-cap-call`) validate their descriptor
+  with `kotoba.compiler.value-type` (the port of `validate-value-type!`), in
+  the host's order: shape, descriptor, descriptor kind, operands.
+
+  The rodata literals (`ucs2`, `guid`, `bytes-literal`, `bytes-literal-length`)
+  check their source text as the host's `rodata-literal-content?` does
+  (vx-rodata; until 2026-10-04 they answered `vx/unsupported`)."
+  {:kotoba/export [run-batch check-form make-ctx check-form-in]}
+  (:require [kotoba.form :as form]
+            [kotoba.compiler.frontend-tables :as tables]
+            [kotoba.compiler.value-type :as vt])
+  (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                       [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+             :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
+             :vx/env [:record :vx/env [[:locals [:ref :form/r]] [:functions [:ref :form/r]]
+                                       [:tabs [:ref :form/r]] [:index [:ref :form/r]] [:forbidden [:ref :form/r]]
+                                       [:declared [:ref :form/r]] [:depth :i64]]]
+             :vx/r [:record :vx/r [[:ok :bool] [:code :string] [:msg :string] [:nodes :i64]]]}))
+
+;; ---- results -------------------------------------------------------------
+
+(defn- pass [nodes :i64] [:ref :vx/r]
+  (record-new [:ref :vx/r] true "" "" nodes))
+
+(defn- refuse [code :string msg :string nodes :i64] [:ref :vx/r]
+  (record-new [:ref :vx/r] false code msg nodes))
+
+(defn- reject [msg :string nodes :i64] [:ref :vx/r]
+  (refuse "kotoba.error/subset-reject" msg nodes))
+
+(defn- unsupported [what :string nodes :i64] [:ref :vx/r]
+  (refuse "vx/unsupported" what nodes))
+
+(defn- r-ok? [r [:ref :vx/r]] :bool (record-get [:ref :vx/r] r :ok))
+(defn- r-nodes [r [:ref :vx/r]] :i64 (record-get [:ref :vx/r] r :nodes))
+
+;; ---- env -----------------------------------------------------------------
+
+(defn- env-locals [e [:ref :vx/env]] [:ref :form/r] (record-get [:ref :vx/env] e :locals))
+(defn- env-functions [e [:ref :vx/env]] [:ref :form/r] (record-get [:ref :vx/env] e :functions))
+(defn- env-tabs [e [:ref :vx/env]] [:ref :form/r] (record-get [:ref :vx/env] e :tabs))
+(defn- env-index [e [:ref :vx/env]] [:ref :form/r] (record-get [:ref :vx/env] e :index))
+(defn- env-forbidden [e [:ref :vx/env]] [:ref :form/r] (record-get [:ref :vx/env] e :forbidden))
+(defn- env-declared [e [:ref :vx/env]] [:ref :form/r] (record-get [:ref :vx/env] e :declared))
+(defn- env-depth [e [:ref :vx/env]] :i64 (record-get [:ref :vx/env] e :depth))
+
+(defn- deeper [e [:ref :vx/env]] [:ref :vx/env]
+  (record-new [:ref :vx/env] (env-locals e) (env-functions e) (env-tabs e) (env-index e)
+              (env-forbidden e) (env-declared e) (+ 1 (env-depth e))))
+
+(defn- with-locals [e [:ref :vx/env] locals [:ref :form/r]] [:ref :vx/env]
+  (record-new [:ref :vx/env] locals (env-functions e) (env-tabs e) (env-index e)
+              (env-forbidden e) (env-declared e) (env-depth e)))
+
+;; ---- name index ------------------------------------------------------------
+;;
+;; A table is a Form and a lookup in it is a scan; the walk asks about every
+;; operator, so the tables are folded ONCE per batch into 64 buckets keyed by the
+;; first byte of the name. A bucket is a vec of entries [name family arity];
+;; entries keep the order of insertion, so the first table that names an operator
+;; wins (as the host's `cond` does). Sets (forbidden / declared heads) use family 0.
+
+(defn- bucket-of [name :string] :i64 (rem (string-code-point-at name 0) 64))
+
+(defn- empty-index [] [:ref :form/r]
+  (loop [i 0 acc (form/no-forms)]
+    (if (>= i 64)
+      (form/form-vec acc)
+      (recur (+ i 1) (form/append-form acc (form/form-vec (form/no-forms)))))))
+
+(defn- replace-nth [v [:ref :form/r] i :i64 x [:ref :form/r]] [:ref :form/r]
+  (let [n (form/count-of v)]
+    (form/form-vec
+     (loop [j 0 acc (form/no-forms)]
+       (if (>= j n)
+         acc
+         (recur (+ j 1) (form/append-form acc (if (= j i) x (form/nth-of v j)))))))))
+
+(defn- idx-add [idx [:ref :form/r] name :string fam :i64 ar :i64] [:ref :form/r]
+  (let [b (bucket-of name)
+        old (form/nth-of idx b)]
+    (replace-nth idx b
+                 (form/form-vec
+                  (form/append-form (form/kids-of old)
+                                    (form/vec3 (form/string-form name) (form/int-form fam) (form/int-form ar)))))))
+
+;; the entry [name family arity] for NAME, or nil
+(defn- idx-find [idx [:ref :form/r] name :string] [:ref :form/r]
+  (let [bucket (form/nth-of idx (bucket-of name))
+        n (form/count-of bucket)]
+    (loop [i 0]
+      (if (>= i n)
+        (form/nil-form)
+        (let [entry (form/nth-of bucket i)]
+          (if (string=? (form/string-value (form/nth-of entry 0)) name)
+            entry
+            (recur (+ i 1))))))))
+
+;; fold table T (a map: name -> arity, or a set) into IDX as family FAM
+(defn- idx-add-table [idx [:ref :form/r] t [:ref :form/r] fam :i64] [:ref :form/r]
+  (let [n (form/count-of t)
+        map? (form/is-map? t)
+        step (if map? 2 1)]
+    (loop [i 0 acc idx]
+      (if (>= i n)
+        acc
+        (recur (+ i step)
+               (idx-add acc (form/symbol-value (form/nth-of t i)) fam
+                        (if map? (form/int-value (form/nth-of t (+ i 1))) 0)))))))
+
+(defn- build-index [tabs [:ref :form/r]] [:ref :form/r]
+  (loop [i 0 acc (empty-index)]
+    (if (>= i 24)
+      acc
+      (recur (+ i 1) (idx-add-table acc (form/nth-of tabs i) i)))))
+
+(defn- build-set-index [t [:ref :form/r]] [:ref :form/r]
+  (idx-add-table (empty-index) t 0))
+
+(defn- op-fam [e [:ref :vx/env] op :string] :i64
+  (let [entry (idx-find (env-index e) op)]
+    (if (form/is-nil? entry) -1 (form/int-value (form/nth-of entry 1)))))
+
+(defn- op-arity [e [:ref :vx/env] op :string] :i64
+  (let [entry (idx-find (env-index e) op)]
+    (if (form/is-nil? entry) -1 (form/int-value (form/nth-of entry 2)))))
+
+;; ---- small predicates over forms -----------------------------------------
+
+;; `simple-symbol?`: a symbol with no namespace ("/" alone is the division symbol).
+(defn- simple-sym? [f [:ref :form/r]] :bool
+  (and (form/is-symbol? f)
+       (or (< (string-find-byte (form/symbol-value f) 47 0) 0)
+           (string=? (form/symbol-value f) "/"))))
+
+(defn- sym-in-list? [xs [:ref :form/r] name :string] :bool
+  (let [n (form/count-of xs)]
+    (loop [i 0]
+      (if (>= i n)
+        false
+        (if (string=? (form/symbol-value (form/nth-of xs i)) name)
+          true
+          (recur (+ i 1)))))))
+
+(defn- set-has-name? [idx [:ref :form/r] name :string] :bool
+  (not (form/is-nil? (idx-find idx name))))
+
+(defn- has-dot? [name :string] :bool (>= (string-find-byte name 46 0) 0))
+
+;; ---- nearest names (edit distance, ordering) -----------------------------
+
+(defn- abs-diff [a :i64 b :i64] :i64 (if (< a b) (- b a) (- a b)))
+
+(defn- min3 [a :i64 b :i64 c :i64] :i64
+  (min a (min b c)))
+
+(defn- row-step [a :string b :string i :i64 lb :i64 previous [:list :i64]] [:list :i64]
+  (let [ca (string-code-point-at a (- i 1))]
+    (loop [j 1 row (typed-list-conj [:list :i64] (typed-list-new [:list :i64]) i)]
+      (if (> j lb)
+        row
+        (recur (+ j 1)
+               (typed-list-conj [:list :i64] row
+                                (min3 (+ 1 (typed-list-nth [:list :i64] previous j))
+                                      (+ 1 (typed-list-nth [:list :i64] row (- j 1)))
+                                      (+ (typed-list-nth [:list :i64] previous (- j 1))
+                                         (if (= ca (string-code-point-at b (- j 1))) 0 1)))))))))
+
+(defn- iota-row [lb :i64] [:list :i64]
+  (loop [j 0 row (typed-list-new [:list :i64])]
+    (if (> j lb) row (recur (+ j 1) (typed-list-conj [:list :i64] row j)))))
+
+(defn- edit-distance [a :string b :string limit :i64] :i64
+  (let [la (string-byte-length a)
+        lb (string-byte-length b)]
+    (if (> (abs-diff la lb) limit)
+      (+ limit 1)
+      (loop [i 1 previous (iota-row lb)]
+        (if (> i la)
+          (min (+ limit 1) (typed-list-nth [:list :i64] previous lb))
+          (recur (+ i 1) (row-step a b i lb previous)))))))
+
+(defn- list-has-string? [xs [:list :string] s :string] :bool
+  (let [n (vector-count xs)]
+    (loop [i 0]
+      (if (>= i n) false
+        (if (string=? (typed-list-nth [:list :string] xs i) s) true (recur (+ i 1)))))))
+
+;; the sort key of a candidate: its distance digit then its name, so byte order
+;; on keys is (distance, name) order
+(defn- near-key [text :string limit :i64 prefix :string candidate :string] :string
+  (if (or (string=? candidate text) (>= (string-index-of candidate "__") 0))
+    ""
+    (let [d (edit-distance text candidate limit)
+          prefix-hit (and (> (string-byte-length prefix) 0)
+                          (>= (string-byte-length candidate) 5)
+                          (string=? prefix (string-substring candidate 0 5)))]
+      (if (or (<= d limit) prefix-hit)
+        (string-concat (string-from-i64 d) candidate)
+        ""))))
+
+(defn- near-keys [text :string candidates [:list :string]] [:list :string]
+  (let [limit (if (>= (string-byte-length text) 8) 3 2)
+        prefix (if (>= (string-byte-length text) 5) (string-substring text 0 5) "")
+        n (vector-count candidates)]
+    (loop [i 0 acc (typed-list-new [:list :string])]
+      (if (>= i n)
+        acc
+        (let [k (near-key text limit prefix (typed-list-nth [:list :string] candidates i))]
+          (recur (+ i 1)
+                 (if (or (string=? k "") (list-has-string? acc k))
+                   acc
+                   (typed-list-conj [:list :string] acc k))))))))
+
+(defn- min-key-index [keys [:list :string] taken [:list :string]] :i64
+  (let [n (vector-count keys)]
+    (loop [i 0 best -1]
+      (if (>= i n)
+        best
+        (let [k (typed-list-nth [:list :string] keys i)]
+          (recur (+ i 1)
+                 (if (list-has-string? taken k)
+                   best
+                   (if (< best 0)
+                     i
+                     (if (< (string-compare k (typed-list-nth [:list :string] keys best)) 0) i best)))))))))
+
+;; up to three nearest names, as the keys (distance digit first) in order
+(defn- nearest-keys [text :string candidates [:list :string]] [:list :string]
+  (let [keys (near-keys text candidates)]
+    (loop [taken (typed-list-new [:list :string]) rounds 0]
+      (if (>= rounds 3)
+        taken
+        (let [i (min-key-index keys taken)]
+          (if (< i 0)
+            taken
+            (recur (typed-list-conj [:list :string] taken (typed-list-nth [:list :string] keys i))
+                   (+ rounds 1))))))))
+
+;; "; nearest defined: a (kind), b (kind)" or "" when nothing is near
+(defn- nearest-advice [keys [:list :string] kind-of-local :bool locals [:ref :form/r] functions [:ref :form/r]
+                       unbound? :bool] :string
+  (let [n (vector-count keys)]
+    (if (= n 0)
+      ""
+      (loop [i 0 out "; nearest defined: "]
+        (if (>= i n)
+          out
+          (let [k (typed-list-nth [:list :string] keys i)
+                name (string-substring k 1 (string-byte-length k))
+                kind (if unbound?
+                       (if (sym-in-list? locals name) "local" "function")
+                       (if (tables/table-has? functions (form/symbol-form name)) "function" "builtin"))]
+            (recur (+ i 1)
+                   (str out (if (= i 0) "" ", ") name " (" kind ")"))))))))
+
+(defn- push-name [xs [:list :string] name :string] [:list :string]
+  (typed-list-conj [:list :string] xs name))
+
+(defn- names-of-symbols [xs [:ref :form/r] acc [:list :string]] [:list :string]
+  (let [n (form/count-of xs)]
+    (loop [i 0 acc acc]
+      (if (>= i n) acc (recur (+ i 1) (push-name acc (form/symbol-value (form/nth-of xs i))))))))
+
+(defn- names-of-map-keys [m [:ref :form/r] acc [:list :string]] [:list :string]
+  (let [n (form/count-of m)]
+    (loop [i 0 acc acc]
+      (if (>= i n) acc (recur (+ i 2) (push-name acc (form/symbol-value (form/nth-of m i))))))))
+
+(defn- unbound-symbol [f [:ref :form/r] e [:ref :vx/env] n :i64] [:ref :vx/r]
+  (let [text (form/symbol-value f)
+        locals (env-locals e)
+        functions (env-functions e)
+        cands (names-of-symbols locals (names-of-map-keys functions (typed-list-new [:list :string])))
+        keys (nearest-keys text cands)]
+    (refuse "kotoba.error/unbound-symbol"
+            (str "unbound or dynamic symbol is forbidden: " text
+                 " is not a parameter, a let binding, or a function of this module"
+                 (nearest-advice keys true locals functions true))
+            n)))
+
+;; ---- tables --------------------------------------------------------------
+
+;; Index -> table. The order is fixed here and only here.
+;;  0 arithmetic  1 float-division-heads  2 i64  3 i32  4 comparisons  5 heap
+;;  6 kgraph  7 string  8 xml  9 region  10 decimal  11 f64  12 f32
+;;  13 typed-map-operations  14 typed-safe-value  15 parametric-result
+;;  16 typed-vector  17 typed-f64-vector  18 compact-graph  19 document-fixed
+;;  20 kernel-memory  21 kernel-privileged  22 rodata-literal  23 image-symbol
+(defn- build-tabs [] [:ref :form/r]
+  (form/form-vec
+   (form/append-form
+    (form/append-form
+     (form/append-form
+      (form/append-form
+       (form/append-form
+        (form/append-form
+         (form/append-form
+          (form/append-form
+           (form/append-form
+            (form/append-form
+             (form/append-form
+              (form/append-form
+               (form/append-form
+                (form/append-form
+                 (form/append-form
+                  (form/append-form
+                   (form/append-form
+                    (form/append-form
+                     (form/append-form
+                      (form/append-form
+                       (form/append-form
+                        (form/append-form
+                         (form/append-form
+                          (form/one-form (tables/arithmetic))
+                          (tables/float-division-heads))
+                         (tables/i64-operations))
+                        (tables/i32-operations))
+                       (tables/comparisons))
+                      (tables/heap-operations))
+                     (tables/kgraph-operations))
+                    (tables/string-operations))
+                   (tables/xml-operations))
+                  (tables/region-operations))
+                 (tables/decimal-operations))
+                (tables/f64-operations))
+               (tables/f32-operations))
+              (tables/typed-map-operations))
+             (tables/typed-safe-value-operations))
+            (tables/parametric-result-operations))
+           (tables/typed-vector-operations))
+          (tables/typed-f64-vector-operations))
+         (tables/compact-graph-operations))
+        (tables/document-fixed-operations))
+       (tables/kernel-memory-operations))
+      (tables/kernel-privileged-operations))
+     (tables/rodata-literal-operations))
+    (tables/image-symbol-operations))))
+
+(defn- tab [e [:ref :vx/env] i :i64] [:ref :form/r] (form/nth-of (env-tabs e) i))
+
+(defn- in-functions? [e [:ref :vx/env] op :string] :bool
+  (tables/table-has? (env-functions e) (form/symbol-form op)))
+
+;; ---- the walk ------------------------------------------------------------
+
+(defn- arity-word [n :i64] :string (if (= n 1) " argument" " arguments"))
+
+(defn- reject-operation-arity [family :string op :string expected :i64 supplied :i64 n :i64] [:ref :vx/r]
+  (refuse "kotoba.error/call-arity"
+          (str family " arity mismatch: " op " takes " expected (arity-word expected) "; got " supplied)
+          n))
+
+(defn- reject-call-arity [op :string expected :i64 supplied :i64 n :i64] [:ref :vx/r]
+  (refuse "kotoba.error/call-arity"
+          (str "function call arity mismatch: " op " takes " expected (arity-word expected) "; got " supplied)
+          n))
+
+(defn- integer-in? [f [:ref :form/r] lo :i64 hi :i64] :bool
+  (and (form/is-int? f) (>= (form/int-value f) lo) (<= (form/int-value f) hi)))
+
+;; the reader-tag refusals; "" when OP is not one
+(defn- reader-tag-msg [op :string] :string
+  (cond
+    (string=? op "kotoba.reader/regex")
+    "host regex literal #\"...\" is not admitted; pass the pattern as a string to kotoba.lang.bounded-regex"
+    (string=? op "kotoba.reader/js")
+    "#js literal is host interop; keep it inside a :cljs reader-conditional branch"
+    (or (string=? op "kotoba.reader/set") (string=? op "kotoba.reader/bigint") (string=? op "kotoba.reader/bigdec"))
+    (str "host literal " (string-substring op 14 (string-byte-length op)) " is not admitted (Kotoba admits keyword-set data and i64 / f64 literals); keep it inside a :clj / :cljs reader-conditional branch")
+    (string=? op "kotoba.reader/char")
+    "character literal \\c is host data; Kotoba text is UTF-8 bytes -- spell the byte as an integer (byte-at / string-byte-at) or use a one-character string"
+    :else ""))
+
+(defn- reader-tag-code [op :string] :string
+  (cond
+    (string=? op "kotoba.reader/regex") "kotoba.error/host-regex-literal"
+    (string=? op "kotoba.reader/js") "kotoba.error/host-js-literal"
+    (string=? op "kotoba.reader/char") "kotoba.error/host-char-literal"
+    :else "kotoba.error/host-literal"))
+
+;; Validate kids I.. of F at depth+1, in order, stopping at the first refusal.
+(defn- vx-from [f [:ref :form/r] e [:ref :vx/env] nodes :i64 i :i64] [:ref :vx/r]
+  (let [ce (deeper e)
+        n (form/count-of f)]
+    (loop [j i nodes nodes]
+      (if (>= j n)
+        (pass nodes)
+        (let [r (vx (form/nth-of f j) ce nodes)]
+          (if (r-ok? r) (recur (+ j 1) (r-nodes r)) r))))))
+
+;; A family whose table fixes the arity: check it, then walk every argument.
+(defn- vx-family [label :string f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)]
+    (if (not= expected argc)
+      (reject-operation-arity label op expected argc n)
+      (vx-from f e n 1))))
+
+;; ---- let -----------------------------------------------------------------
+
+(defn- distinct-names? [bindings [:ref :form/r]] :bool
+  (let [n (form/count-of bindings)]
+    (loop [i 0]
+      (if (>= i n)
+        true
+        (if (loop [j (+ i 2)]
+              (if (>= j n)
+                false
+                (if (form/eq (form/nth-of bindings i) (form/nth-of bindings j)) true (recur (+ j 2)))))
+          false
+          (recur (+ i 2)))))))
+
+(defn- valid-name? [nm [:ref :form/r] e [:ref :vx/env]] :bool
+  (and (simple-sym? nm)
+       (<= (string-byte-length (form/symbol-value nm)) 128)
+       (not (set-has-name? (env-forbidden e) (form/symbol-value nm)))))
+
+;; Walk the binding pairs from index I; at the end validate the body.
+(defn- vx-bind [f [:ref :form/r] bindings [:ref :form/r] e [:ref :vx/env] locals [:ref :form/r]
+                i :i64 n :i64] [:ref :vx/r]
+  (if (>= i (form/count-of bindings))
+    (vx (form/nth-of f 2) (with-locals (deeper e) locals) n)
+    (let [nm (form/nth-of bindings i)]
+      (if (not (valid-name? nm e))
+        (reject "invalid local binding" n)
+        (let [r (vx (form/nth-of bindings (+ i 1)) (with-locals (deeper e) locals) n)]
+          (if (r-ok? r)
+            (vx-bind f bindings e (form/form-vec (form/append-form (form/kids-of locals) nm)) (+ i 2) (r-nodes r))
+            r))))))
+
+(defn- vx-let [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (let [body-count (if (> argc 0) (- argc 1) 0)
+        bindings (form/nth-of f 1)]
+    (cond
+      (not= body-count 1)
+      (refuse "kotoba.error/let-body-multiple-forms"
+              (str "let requires one result expression; got " (string-from-i64 body-count) " (sequence with `do`)")
+              n)
+      (not (and (form/is-vec? bindings) (= 0 (rem (form/count-of bindings) 2))))
+      (reject "let requires an even binding vector" n)
+      (not (distinct-names? bindings))
+      (reject "duplicate let binding" n)
+      (> (quot (form/count-of bindings) 2) 4096)
+      (reject "let binding count exceeds admission limit" n)
+      :else (vx-bind f bindings e (env-locals e) 0 n))))
+
+;; ---- heads ---------------------------------------------------------------
+
+(defn- vx-if [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (not= argc 3)
+    (refuse "kotoba.error/if-arity" (str "if requires test, then, else; got " argc " arguments") n)
+    (vx-from f e n 1)))
+
+(defn- vx-do [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (= argc 0)
+    (refuse "kotoba.error/do-empty" "do requires at least one expression" n)
+    (vx-from f e n 1)))
+
+(defn- vx-cap-call [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (not (and (= argc 2) (integer-in? (form/nth-of f 1) 0 255)))
+    (reject "cap-call requires a literal capability id in [0,255] and one value" n)
+    (vx (form/nth-of f 2) (deeper e) n)))
+
+;; i64/i32 shift counts. i64: a literal count is range-checked, any other count is
+;; validated as an expression (and then, as in the host, the whole argument list
+;; walks it a second time). i32: the count must be a literal in [0,31].
+(defn- vx-i64 [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)]
+    (cond
+      (not= expected argc) (reject-operation-arity "i64 operation" op expected argc n)
+      (or (string=? op "i64-shift-left") (string=? op "i64-shift-right") (string=? op "u64-shift-right"))
+      (let [c (form/nth-of f 2)]
+        (if (form/is-int? c)
+          (if (integer-in? c 0 63)
+            (vx-from f e n 1)
+            (reject "i64 shift count literal must be in [0,63]" n))
+          (let [r (vx c (deeper e) n)]
+            (if (r-ok? r) (vx-from f e (r-nodes r) 1) r))))
+      :else (vx-from f e n 1))))
+
+(defn- vx-i32 [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)]
+    (cond
+      (not= expected argc) (reject-operation-arity "i32 operation" op expected argc n)
+      (and (or (string=? op "i32-shift-left") (string=? op "i32-shift-right") (string=? op "u32-shift-right"))
+           (not (integer-in? (form/nth-of f 2) 0 31)))
+      (reject "i32 shift count must be an integer literal in [0,31]" n)
+      :else (vx-from f e n 1))))
+
+(defn- vx-map-op [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (cond
+    (and (string=? op "map-new") (= 1 (rem argc 2))) (reject "map-new requires keyword/value pairs" n)
+    (and (string=? op "map-get") (not= argc 3)) (reject "map-get requires map, keyword, and default" n)
+    (and (string=? op "map-assoc") (not (and (>= argc 3) (= 1 (rem argc 2)))))
+    (reject "map-assoc requires map and keyword/value pairs" n)
+    :else (vx-from f e n 1)))
+
+;; bytes heads: fixed argument counts, walk the operands
+(defn- vx-bytes [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (cond
+    (string=? op "bytes-empty")
+    (if (= argc 0) (pass n) (reject "bytes-empty does not accept operands" n))
+    (string=? op "bytes-count")
+    (if (= argc 1) (vx-from f e n 1) (reject "bytes-count requires one bytes operand" n))
+    (string=? op "bytes-at")
+    (if (= argc 2) (vx-from f e n 1) (reject "bytes-at requires a bytes operand and an index" n))
+    (string=? op "bytes-slice")
+    (if (= argc 3) (vx-from f e n 1) (reject "bytes-slice requires a bytes operand and two offsets" n))
+    (string=? op "bytes-concat")
+    (if (= argc 2) (vx-from f e n 1) (reject "bytes-concat requires two bytes operands" n))
+    :else
+    (if (= argc 1) (vx (form/nth-of f 1) (deeper e) n) (reject (str op " requires one operand; got " argc) n))))
+
+(defn- bytes-head? [op :string] :bool
+  (or (string=? op "bytes-empty") (string=? op "bytes-count") (string=? op "bytes-at")
+      (string=? op "bytes-slice") (string=? op "bytes-concat")
+      (string=? op "bytes-from-vector-i64") (string=? op "vector-i64-from-bytes")
+      (string=? op "string-from-utf8")))
+
+;; heads whose first operand is a type descriptor (validate-value-type!), plus rodata
+(defn- descriptor-head? [op :string] :bool
+  (or (string=? op "typed-cap-call")
+      (string=? op "typed-list-new") (string=? op "typed-list-conj") (string=? op "typed-list-nth")
+      (string=? op "typed-set-new") (string=? op "typed-set-count") (string=? op "typed-set-contains")
+      (string=? op "typed-set-conj") (string=? op "typed-set-disj") (string=? op "typed-set-equal")
+      (string=? op "typed-set-nth")
+      (string=? op "typed-map-new") (string=? op "typed-map-count") (string=? op "typed-map-contains")
+      (string=? op "typed-map-get") (string=? op "typed-map-dissoc") (string=? op "typed-map-entry-at")
+      (string=? op "typed-map-keys") (string=? op "typed-map-vals") (string=? op "typed-map-assoc")
+      (string=? op "typed-map-equal")
+      (string=? op "record-new") (string=? op "record-get") (string=? op "record-assoc")
+      (string=? op "record-equal")
+      (string=? op "hetero-vector-new") (string=? op "hetero-vector-count") (string=? op "hetero-vector-at")
+      (string=? op "hetero-vector-assoc") (string=? op "hetero-vector-equal")
+      (string=? op "option-none-of") (string=? op "option-some-of") (string=? op "option-some?-of")
+      (string=? op "option-value-of") (string=? op "option-match")
+      (string=? op "variant-new") (string=? op "variant-match") (string=? op "result-match-of")))
+
+(defn- vx-alloc-region [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)
+        pages (form/nth-of f 5)]
+    (cond
+      (not= expected argc) (reject-operation-arity "kernel privileged operation" op expected argc n)
+      (not (form/is-int? pages))
+      (refuse "kotoba.error/kernel-alloc-region-pages" "kernel-uefi-alloc-region page count must be a literal" n)
+      (not (and (<= 1 (form/int-value pages)) (<= (form/int-value pages) 1099511627776)))
+      (refuse "kotoba.error/kernel-alloc-region-pages"
+              "kernel-uefi-alloc-region page count must be between 1 and 1099511627776" n)
+      :else (vx-from f e n 1))))
+
+;; ---- rodata literals (boot-lit): the argument is source, not an expression ----------
+;; The host's `rodata-literal-content?` (frontend/validate.cljk, its Kotoba arm): UCS-2 text without a
+;; surrogate, an 8-4-4-4-12 hex GUID, an even-length hex byte string. Agent F64, 2026-10-04 (was vx/unsupported).
+(defn- rl-hex-code? [c :i64] :bool
+  (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+
+(defn- rl-hex-range? [s :string i :i64 end :i64] :bool
+  (loop [j i]
+    (cond (>= j end) true
+          (rl-hex-code? (string-code-point-at s j)) (recur (+ j 1))
+          :else false)))
+
+(defn- rl-width [c :i64] :i64 (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- rl-surrogate-free? [s :string] :bool
+  (loop [i 0]
+    (if (>= i (string-length s))
+      true
+      (let [c (string-code-point-at s i)]
+        (if (and (>= c 55296) (<= c 57343)) false (recur (+ i (rl-width c))))))))
+
+(defn- rl-guid? [t :string] :bool
+  (and (= 36 (string-length t))
+       (= 45 (string-code-point-at t 8)) (= 45 (string-code-point-at t 13))
+       (= 45 (string-code-point-at t 18)) (= 45 (string-code-point-at t 23))
+       (rl-hex-range? t 0 8) (rl-hex-range? t 9 13) (rl-hex-range? t 14 18)
+       (rl-hex-range? t 19 23) (rl-hex-range? t 24 36)))
+
+(defn- rl-content? [op :string t :string] :bool
+  (cond (string=? op "ucs2") (rl-surrogate-free? t)
+        (string=? op "guid") (rl-guid? t)
+        (or (string=? op "bytes-literal") (string=? op "bytes-literal-length"))
+        (and (= 0 (rem (string-length t) 2)) (rl-hex-range? t 0 (string-length t)))
+        :else false))
+
+(defn- vx-rodata [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)]
+    (cond
+      (not= expected argc) (reject-operation-arity "rodata literal" op expected argc n)
+      (not (form/is-string? (form/nth-of f 1))) (reject "rodata literal requires a string literal" n)
+      (not (rl-content? op (form/string-value (form/nth-of f 1)))) (reject "rodata literal is malformed for its encoding" n)
+      :else (pass n))))
+
+(defn- vx-image-symbol [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)
+        a (form/nth-of f 1)]
+    (cond
+      (not= expected argc) (reject-operation-arity "image symbol operation" op expected argc n)
+      (not (form/is-symbol? a)) (reject "kernel-function-address requires a function name" n)
+      (sym-in-list? (env-locals e) (form/symbol-value a))
+      (reject "kernel-function-address names a function, not a local" n)
+      (not (in-functions? e (form/symbol-value a)))
+      (reject "kernel-function-address names no function in this module" n)
+      :else (pass n))))
+
+;; ---- type-descriptor heads -------------------------------------------------------
+;;
+;; The host validates the descriptor with `validate-value-type!` (a fresh node
+;; counter each time), so a descriptor refusal keeps its own code and message and is
+;; reported at the expression's node count.
+
+(defn- check-type [type [:ref :form/r] n :i64] [:ref :vx/r]
+  (let [r (vt/validate-type type 0 0)]
+    (if (r-ok? r)
+      (pass n)
+      (refuse (record-get [:ref :vx/r] r :code) (record-get [:ref :vx/r] r :msg) n))))
+
+;; kinds of descriptor: 1 list 2 set 3 map 4 record 5 heterogeneous vector 6 option 7 variant
+(defn- kind-ok? [kind :i64 type [:ref :form/r]] :bool
+  (cond
+    (= kind 1) (vt/list-type? type)
+    (= kind 2) (vt/set-type? type)
+    (= kind 3) (vt/map-type? type)
+    (= kind 4) (vt/record-type? type)
+    (= kind 5) (vt/hetero-type? type)
+    (= kind 6) (vt/option-type? type)
+    (= kind 7) (vt/variant-type? type)
+    :else true))
+
+;; Walk the single operand at index I.
+(defn- vx-at [f [:ref :form/r] e [:ref :vx/env] n :i64 i :i64] [:ref :vx/r]
+  (vx (form/nth-of f i) (deeper e) n))
+
+;; Walk the operands at I then J, in that order.
+(defn- vx-at2 [f [:ref :form/r] e [:ref :vx/env] n :i64 i :i64 j :i64] [:ref :vx/r]
+  (let [r (vx-at f e n i)]
+    (if (r-ok? r) (vx-at f e (r-nodes r) j) r)))
+
+;; the common shape: exactly WANT operands, descriptor first (validated, then of kind KIND),
+;; then every operand from START on
+(defn- vx-typed [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64 want :i64 shape-msg :string
+                 kind :i64 kind-msg :string start :i64] [:ref :vx/r]
+  (if (not= argc want)
+    (reject shape-msg n)
+    (let [tr (check-type (form/nth-of f 1) n)]
+      (cond
+        (not (r-ok? tr)) tr
+        (not (kind-ok? kind (form/nth-of f 1))) (reject kind-msg n)
+        :else (vx-from f e n start)))))
+
+(defn- item-count [argc :i64] :i64 (if (> argc 0) (- argc 1) 0))
+
+;; a constructor: descriptor of KIND, at most LIMIT items, then walk the items
+(defn- vx-ctor [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64 kind :i64 kind-msg :string
+                limit :i64 limit-msg :string] [:ref :vx/r]
+  (let [tr (check-type (form/nth-of f 1) n)]
+    (cond
+      (not (r-ok? tr)) tr
+      (not (kind-ok? kind (form/nth-of f 1))) (reject kind-msg n)
+      (> (item-count argc) limit) (reject limit-msg n)
+      :else (vx-from f e n 2))))
+
+(defn- vx-typed-map-new [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (let [tr (check-type (form/nth-of f 1) n)
+        items (item-count argc)]
+    (cond
+      (not (r-ok? tr)) tr
+      (not (and (vt/map-type? (form/nth-of f 1)) (= 0 (rem items 2)) (<= (quot items 2) 31)))
+      (reject "typed map constructor shape or entry limit is invalid" n)
+      :else (vx-from f e n 2))))
+
+(defn- vx-record-new [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (let [type (form/nth-of f 1)
+        tr (check-type type n)]
+    (cond
+      (not (r-ok? tr)) tr
+      (not (and (vt/record-type? type) (= (vt/record-field-count type) (item-count argc))))
+      (reject "record constructor must exactly match its descriptor" n)
+      :else (vx-from f e n 2))))
+
+(defn- vx-hetero-new [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (let [type (form/nth-of f 1)
+        tr (check-type type n)]
+    (cond
+      (not (r-ok? tr)) tr
+      (not (and (vt/hetero-type? type) (= (vt/hetero-item-count type) (item-count argc))))
+      (reject "heterogeneous vector constructor must exactly match its descriptor" n)
+      :else (vx-from f e n 2))))
+
+;; record-get / record-assoc: shape, descriptor, a declared field, then the operands
+(defn- vx-record-field [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64 want :i64 shape-msg :string] [:ref :vx/r]
+  (if (not= argc want)
+    (reject shape-msg n)
+    (let [type (form/nth-of f 1)
+          tr (check-type type n)]
+      (cond
+        (not (r-ok? tr)) tr
+        (not (and (vt/record-type? type) (vt/record-declares-field? type (form/nth-of f 3))))
+        (reject "record field must be a declared keyword literal" n)
+        (= want 3) (vx-at f e n 2)
+        :else (vx-at2 f e n 2 4)))))
+
+(defn- vx-hetero-indexed [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [want (if (string=? op "hetero-vector-at") 3 4)]
+    (if (not= argc want)
+      (reject "heterogeneous vector indexed operation shape is invalid" n)
+      (let [type (form/nth-of f 1)
+            index (form/nth-of f 3)
+            tr (check-type type n)]
+        (cond
+          (not (r-ok? tr)) tr
+          (not (vt/hetero-type? type)) (reject "heterogeneous vector operation requires a vector descriptor" n)
+          (not (form/is-int? index))
+          (refuse "kotoba.error/hetero-vector-index" "heterogeneous vector index must be an integer literal" n)
+          (not (and (<= 0 (form/int-value index)) (< (form/int-value index) (vt/hetero-item-count type))))
+          (refuse "kotoba.error/hetero-vector-index-range" "heterogeneous vector index must be in range" n)
+          (= want 3) (vx-at f e n 2)
+          :else (vx-at2 f e n 2 4))))))
+
+;; a binder: a symbol with no namespace
+(defn- binder? [b [:ref :form/r]] :bool (simple-sym? b))
+
+(defn- vx-with-binder [f [:ref :form/r] e [:ref :vx/env] n :i64 body-index :i64 binder [:ref :form/r]] [:ref :vx/r]
+  (vx (form/nth-of f body-index)
+      (with-locals (deeper e) (form/form-vec (form/append-form (form/kids-of (env-locals e)) binder)))
+      n))
+
+(defn- vx-option-match [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (not= argc 5)
+    (reject "option-match shape is invalid" n)
+    (let [type (form/nth-of f 1)
+          tr (check-type type n)]
+      (cond
+        (not (r-ok? tr)) tr
+        (not (and (vt/option-type? type) (binder? (form/nth-of f 4))))
+        (reject "option-match requires option type and unqualified some binder" n)
+        :else
+        (let [r1 (vx-at2 f e n 2 3)]
+          (if (r-ok? r1)
+            (vx-with-binder f e (r-nodes r1) 5 (form/nth-of f 4))
+            r1))))))
+
+(defn- vx-variant-new [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (not= argc 3)
+    (reject "variant-new shape is invalid" n)
+    (let [type (form/nth-of f 1)
+          tr (check-type type n)]
+      (cond
+        (not (r-ok? tr)) tr
+        (not (and (vt/variant-type? type) (form/is-keyword? (form/nth-of f 2))))
+        (reject "variant-new requires variant descriptor and keyword tag" n)
+        :else (vx-at f e n 3)))))
+
+;; the branches of a variant-match: [tag binder body] triples, tags equal to the declared cases in order
+(defn- branches-cover? [cases [:ref :form/r] branches [:ref :form/r]] :bool
+  (let [n (form/count-of cases)]
+    (and (form/is-vec? branches)
+         (= n (form/count-of branches))
+         (loop [i 0]
+           (if (>= i n)
+             true
+             (let [b (form/nth-of branches i)]
+               (if (and (form/eq (form/nth-of (form/nth-of cases i) 0) (form/nth-of b 0))
+                        (form/is-vec? b) (= (form/count-of b) 3) (binder? (form/nth-of b 1)))
+                 (recur (+ i 1))
+                 false)))))))
+
+(defn- vx-variant-branches [branches [:ref :form/r] i :i64 f [:ref :form/r] e [:ref :vx/env] n :i64] [:ref :vx/r]
+  (if (>= i (form/count-of branches))
+    (pass n)
+    (let [b (form/nth-of branches i)
+          r (vx (form/nth-of b 2)
+                (with-locals (deeper e) (form/form-vec (form/append-form (form/kids-of (env-locals e)) (form/nth-of b 1))))
+                n)]
+      (if (r-ok? r) (vx-variant-branches branches (+ i 1) f e (r-nodes r)) r))))
+
+(defn- vx-variant-match [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (not= argc 3)
+    (reject "variant-match shape is invalid" n)
+    (let [type (form/nth-of f 1)
+          branches (form/nth-of f 3)
+          tr (check-type type n)]
+      (cond
+        (not (r-ok? tr)) tr
+        (not (and (vt/variant-type? type) (branches-cover? (form/nth-of type 2) branches)))
+        (reject "variant match must exactly cover declared cases in order" n)
+        :else
+        (let [r (vx-at f e n 2)]
+          (if (r-ok? r) (vx-variant-branches branches 0 f e (r-nodes r)) r))))))
+
+(defn- vx-result-match [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (let [type (form/nth-of f 1)]
+    (cond
+      (not= argc 6) (reject "result-match-of shape is invalid" n)
+      (not (vt/result-type? type)) (reject "result match requires [:result ok-type err-type]" n)
+      :else
+      (let [tr (check-type type n)]
+        (cond
+          (not (r-ok? tr)) tr
+          (not (and (binder? (form/nth-of f 3)) (binder? (form/nth-of f 5))))
+          (reject "result match binders must be unqualified symbols" n)
+          :else
+          (let [r1 (vx-at f e n 2)]
+            (if (r-ok? r1)
+              (let [r2 (vx-with-binder f e (r-nodes r1) 4 (form/nth-of f 3))]
+                (if (r-ok? r2)
+                  (vx-with-binder f e (r-nodes r2) 6 (form/nth-of f 5))
+                  r2))
+              r1)))))))
+
+(defn- vx-parametric [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [expected (op-arity e op)
+        type (form/nth-of f 1)]
+    (cond
+      (not= expected argc) (reject-operation-arity "parametric result operation" op expected argc n)
+      (not (vt/result-type? type)) (reject "parametric result operation requires [:result ok-type err-type]" n)
+      :else
+      (let [tr (check-type type n)]
+        (if (r-ok? tr) (vx-from f e n 2) tr)))))
+
+(defn- vx-typed-cap-call [f [:ref :form/r] e [:ref :vx/env] n :i64 argc :i64] [:ref :vx/r]
+  (if (not (and (= argc 4) (integer-in? (form/nth-of f 1) 0 255)))
+    (reject "typed-cap-call requires a literal capability id in [0,255], request type, result type, and one request" n)
+    (let [r1 (check-type (form/nth-of f 2) n)]
+      (if (not (r-ok? r1))
+        r1
+        (let [r2 (check-type (form/nth-of f 3) n)]
+          (if (r-ok? r2) (vx-at f e n 4) r2))))))
+
+(defn- vx-descriptor [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (cond
+    (string=? op "typed-list-new")
+    (vx-ctor f e n argc 1 "typed list constructor requires [:list item-type]" 128 "typed list constructor exceeds item limit")
+    (string=? op "typed-list-conj")
+    (vx-typed f e n argc 3 "typed list conj shape is invalid" 1 "typed list conj requires [:list item-type]" 2)
+    (string=? op "typed-list-nth")
+    (vx-typed f e n argc 3 "typed list nth shape is invalid" 1 "typed list nth requires [:list item-type]" 2)
+    (string=? op "typed-set-new")
+    (vx-ctor f e n argc 2 "typed set constructor requires [:set item-type]" 32 "typed set constructor exceeds item limit")
+    (string=? op "typed-set-count")
+    (vx-typed f e n argc 2 "typed set count shape is invalid" 2 "typed set count requires [:set item-type]" 2)
+    (or (string=? op "typed-set-contains") (string=? op "typed-set-conj") (string=? op "typed-set-disj"))
+    (vx-typed f e n argc 3 "typed set operation shape is invalid" 2 "typed set operation requires [:set item-type]" 2)
+    (string=? op "typed-set-equal")
+    (vx-typed f e n argc 3 "typed set equality shape is invalid" 2 "typed set equality requires [:set item-type]" 2)
+    (string=? op "typed-set-nth")
+    (vx-typed f e n argc 3 "typed set nth shape is invalid" 2 "typed set nth requires [:set item-type]" 2)
+    (string=? op "typed-map-new") (vx-typed-map-new f e n argc)
+    (string=? op "typed-map-count")
+    (vx-typed f e n argc 2 "typed map count shape is invalid" 3 "typed map count requires [:map key-type value-type]" 2)
+    (or (string=? op "typed-map-contains") (string=? op "typed-map-get") (string=? op "typed-map-dissoc"))
+    (vx-typed f e n argc 3 "typed map operation shape is invalid" 3 "typed map operation requires [:map key-type value-type]" 2)
+    (string=? op "typed-map-entry-at")
+    (vx-typed f e n argc 3 "typed map entry projection shape is invalid" 3 "typed map entry projection requires [:map key-type value-type]" 2)
+    (or (string=? op "typed-map-keys") (string=? op "typed-map-vals"))
+    (vx-typed f e n argc 2 "typed map projection shape is invalid" 3 "typed map projection requires [:map key-type value-type]" 2)
+    (string=? op "typed-map-assoc")
+    (vx-typed f e n argc 4 "typed map assoc shape is invalid" 3 "typed map assoc requires [:map key-type value-type]" 2)
+    (string=? op "typed-map-equal")
+    (vx-typed f e n argc 3 "typed map equality shape is invalid" 3 "typed map equality requires [:map key-type value-type]" 2)
+    (string=? op "record-new") (vx-record-new f e n argc)
+    (string=? op "record-get") (vx-record-field f e n argc 3 "record projection shape is invalid")
+    (string=? op "record-assoc") (vx-record-field f e n argc 4 "record replacement shape is invalid")
+    (string=? op "record-equal")
+    (vx-typed f e n argc 3 "record equality shape is invalid" 4 "record equality requires a record descriptor" 2)
+    (string=? op "hetero-vector-new") (vx-hetero-new f e n argc)
+    (string=? op "hetero-vector-count")
+    (vx-typed f e n argc 2 "heterogeneous vector count shape is invalid" 5 "heterogeneous vector count requires a vector descriptor" 2)
+    (or (string=? op "hetero-vector-at") (string=? op "hetero-vector-assoc"))
+    (vx-hetero-indexed f e n op argc)
+    (string=? op "hetero-vector-equal")
+    (vx-typed f e n argc 3 "heterogeneous vector equality shape is invalid" 5 "heterogeneous vector equality requires a vector descriptor" 2)
+    (string=? op "option-none-of")
+    (vx-typed f e n argc 1 "option-none-of shape is invalid" 6 "option-none-of requires [:option payload-type]" 2)
+    (or (string=? op "option-some-of") (string=? op "option-some?-of"))
+    (vx-typed f e n argc 2 "generic option operation shape is invalid" 6 "generic option operation requires [:option payload-type]" 2)
+    (string=? op "option-value-of")
+    (vx-typed f e n argc 3 "option-value-of shape is invalid" 6 "option-value-of requires [:option payload-type]" 2)
+    (string=? op "option-match") (vx-option-match f e n argc)
+    (string=? op "variant-new") (vx-variant-new f e n argc)
+    (string=? op "variant-match") (vx-variant-match f e n argc)
+    :else (vx-result-match f e n argc)))
+
+;; ---- unknown operation ----------------------------------------------------
+
+(defn- builtin-names [e [:ref :vx/env]] [:list :string]
+  (loop [i 0 acc (typed-list-new [:list :string])]
+    (if (>= i 24)
+      acc
+      (let [t (tab e i)]
+        (recur (+ i 1)
+               (if (form/is-map? t)
+                 (names-of-map-keys t acc)
+                 (names-of-symbols t acc)))))))
+
+(defn- unknown-operation [op :string e [:ref :vx/env] n :i64] [:ref :vx/r]
+  (if (set-has-name? (env-declared e) op)
+    (refuse "kotoba.error/unimplemented-grammar-head"
+            (str op " is named by the language grammar (lang/guest-grammar.edn) "
+                 "but this analyser has no lowering for it -- not implemented on "
+                 "this compile path")
+            n)
+    (let [cands (names-of-map-keys (env-functions e) (builtin-names e))
+          keys (nearest-keys op cands)]
+      (refuse "kotoba.error/unknown-operation"
+              (str "unknown operation: " op " is not a builtin, a sugar head, or a "
+                   "function of this module"
+                   (nearest-advice keys false (env-locals e) (env-functions e) false))
+              n))))
+
+;; ---- the head dispatch, in the host's cond order -----------------------------
+
+(defn- vx-head [f [:ref :form/r] e [:ref :vx/env] n :i64 op :string argc :i64] [:ref :vx/r]
+  (let [fam (op-fam e op)]
+  (cond
+    (string=? op "let") (vx-let f e n argc)
+    (string=? op "if") (vx-if f e n argc)
+    (string=? op "do") (vx-do f e n argc)
+    (string=? op "cap-call") (vx-cap-call f e n argc)
+    (string=? op "typed-cap-call") (vx-typed-cap-call f e n argc)
+    (= fam 0)
+    (if (or (= argc 0)
+            (and (or (string=? op "quot") (string=? op "bit-xor") (string=? op "bit-and") (string=? op "bit-or"))
+                 (not= argc 2)))
+      (reject "invalid arithmetic arity" n)
+      (vx-from f e n 1))
+    (= fam 1) (if (not= argc 2) (reject "/ requires two operands" n) (vx-from f e n 1))
+    (= fam 2) (vx-i64 f e n op argc)
+    (= fam 3) (vx-i32 f e n op argc)
+    (= fam 4) (if (not= argc 2) (reject "comparison requires two operands" n) (vx-from f e n 1))
+    (= fam 5) (vx-family "heap operation" f e n op argc)
+    (= fam 6) (vx-family "kgraph operation" f e n op argc)
+    (= fam 7) (vx-family "string operation" f e n op argc)
+    (= fam 8) (vx-family "XML operation" f e n op argc)
+    (= fam 9) (vx-family "region operation" f e n op argc)
+    (= fam 10) (vx-family "decimal operation" f e n op argc)
+    (= fam 11) (vx-family "f64 operation" f e n op argc)
+    (= fam 12) (vx-family "f32 operation" f e n op argc)
+    (= fam 13) (vx-map-op f e n op argc)
+    (= fam 14) (vx-family "typed safe-value operation" f e n op argc)
+    (descriptor-head? op) (vx-descriptor f e n op argc)
+    (bytes-head? op) (vx-bytes f e n op argc)
+    (= fam 15) (vx-parametric f e n op argc)
+    (string=? op "vector-new")
+    (if (> argc 128) (reject "vector-new exceeds item limit" n) (vx-from f e n 1))
+    (string=? op "vector-f64-new")
+    (if (> argc 128) (reject "vector-f64-new exceeds item limit" n) (vx-from f e n 1))
+    (= fam 16) (vx-family "typed vector operation" f e n op argc)
+    (= fam 17) (vx-family "typed f64 vector operation" f e n op argc)
+    (= fam 18) (vx-family "compact graph operation" f e n op argc)
+    (= fam 19) (vx-family "document operation" f e n op argc)
+    (or (string=? op "document-vector") (string=? op "document-list") (string=? op "document-set"))
+    (if (> argc 32) (reject "document sequence exceeds item limit" n) (vx-from f e n 1))
+    (string=? op "document-map")
+    (cond (= 1 (rem argc 2)) (reject "document-map requires key/value pairs" n)
+          (> (quot argc 2) 32) (reject "document-map exceeds entry limit" n)
+          :else (vx-from f e n 1))
+    (= fam 20) (vx-family "kernel memory operation" f e n op argc)
+    (string=? op "kernel-uefi-alloc-region") (vx-alloc-region f e n op argc)
+    (= fam 21) (vx-family "kernel privileged operation" f e n op argc)
+    (= fam 22) (vx-rodata f e n op argc)
+    (= fam 23) (vx-image-symbol f e n op argc)
+    (in-functions? e op)
+    (let [expected (form/int-value (tables/table-get (env-functions e) (form/symbol-form op)))]
+      (if (not= expected argc) (reject-call-arity op expected argc n) (vx-from f e n 1)))
+    :else (unknown-operation op e n))))
+
+(defn- vx-call [f [:ref :form/r] e [:ref :vx/env] n :i64] [:ref :vx/r]
+  (let [opf (form/first-of f)
+        op (if (form/is-symbol? opf) (form/symbol-value opf) "")
+        argc (- (form/count-of f) 1)
+        rmsg (reader-tag-msg op)]
+    (cond
+      (not (string=? rmsg "")) (refuse (reader-tag-code op) rmsg n)
+      (not (simple-sym? opf)) (reject "computed or namespaced calls are forbidden" n)
+      (or (set-has-name? (env-forbidden e) op) (has-dot? op))
+      (refuse "kotoba.error/ambient-forbidden"
+              "dynamic loading, interop, mutation, and metaprogramming are forbidden" n)
+      :else (vx-head f e n op argc))))
+
+(defn vx [f [:ref :form/r] e [:ref :vx/env] nodes :i64] [:ref :vx/r]
+  (let [n (+ nodes 1)]
+    (cond
+      (> n 4194304) (reject "program expression budget exhausted" n)
+      (> (env-depth e) 256) (reject "expression nesting exceeds admission limit" n)
+      (form/is-int? f) (pass n)
+      (form/is-string? f)
+      (if (> (string-byte-length (form/string-value f)) 65536)
+        (reject "string exceeds UTF-8 byte limit" n)
+        (pass n))
+      (form/is-keyword? f)
+      (if (> (+ 1 (string-byte-length (keyword-name (form/keyword-value f)))) 512)
+        (reject "keyword exceeds UTF-8 byte limit" n)
+        (pass n))
+      (form/is-bool? f) (pass n)
+      (form/is-symbol? f)
+      (if (sym-in-list? (env-locals e) (form/symbol-value f))
+        (pass n)
+        (unbound-symbol f e n))
+      (form/is-seq? f) (vx-call f e n)
+      :else (reject "value type is outside the safe profile" n))))
+
+;; ---- single-form entry ----------------------------------------------------
+;; One expression against LOCALS (a Form list of symbols), FUNCTIONS (a Form map name -> arity) and
+;; the FORBIDDEN / DECLARED head sets, with NODES already charged to the program. Answers the Form
+;; vector [ok? code message nodes], so the frontend's `validate-expr` (a module of its own) can
+;; raise the refusal in its own error type. The tables are folded for every call; a caller that
+;; checks many bodies should batch them (`run-batch`).
+(defn check-form [f [:ref :form/r] locals [:ref :form/r] functions [:ref :form/r]
+                  forbidden [:ref :form/r] declared [:ref :form/r] nodes :i64] [:ref :form/r]
+  (let [tabs (build-tabs)
+        index (build-index tabs)
+        e (record-new [:ref :vx/env] locals functions tabs index
+                      (build-set-index forbidden) (build-set-index declared) 0)
+        r (vx f e nodes)]
+    (form/vec4 (form/bool-form (r-ok? r))
+               (form/string-form (record-get [:ref :vx/r] r :code))
+               (form/string-form (record-get [:ref :vx/r] r :msg))
+               (form/int-form (r-nodes r)))))
+
+;; ---- shared context (agent ARENA, 2026-10-04) -----------------------------
+;; check-form folds the 24 operation tables, the operator index and the two head-set indexes on every
+;; call; the frontend calls it once per function body, so a program of N functions rebuilt them N times
+;; (measured: the majority of the native analyze's vector handles and pairs, docs/selfhost-analyze-memory-
+;; 20261003.md). make-ctx folds them once into the Form vector [tabs index forbidden-index declared-index];
+;; check-form-in answers exactly what check-form answers for the same FORBIDDEN / DECLARED.
+(defn make-ctx [forbidden [:ref :form/r] declared [:ref :form/r]] [:ref :form/r]
+  (let [tabs (build-tabs)]
+    (form/vec4 tabs (build-index tabs) (build-set-index forbidden) (build-set-index declared))))
+
+(defn check-form-in [ctx [:ref :form/r] f [:ref :form/r] locals [:ref :form/r] functions [:ref :form/r]
+                     nodes :i64] [:ref :form/r]
+  (let [e (record-new [:ref :vx/env] locals functions (form/nth-of ctx 0) (form/nth-of ctx 1)
+                      (form/nth-of ctx 2) (form/nth-of ctx 3) 0)
+        r (vx f e nodes)]
+    (form/vec4 (form/bool-form (r-ok? r))
+               (form/string-form (record-get [:ref :vx/r] r :code))
+               (form/string-form (record-get [:ref :vx/r] r :msg))
+               (form/int-form (r-nodes r)))))
+
+;; ---- batch entry ---------------------------------------------------------
+
+(defn- clip [s :string] :string
+  (if (> (string-byte-length s) 200) (string-substring s 0 200) s))
+
+(defn- line-of [r [:ref :vx/r]] :string
+  (if (r-ok? r)
+    (string-concat "OK " (string-from-i64 (r-nodes r)))
+    (clip (string-concat (record-get [:ref :vx/r] r :code) (string-concat " " (record-get [:ref :vx/r] r :msg))))))
+
+;; A batch is text of lines: line 0 is [forbidden-set declared-set]; every later
+;; line is one case [form locals functions depth]. Each line is read as EDN on its
+;; own. The answer is one line per case: "OK <nodes>" or "<code> <message>" (clipped to 200 bytes, so a batch's answer stays under the 64 KiB string limit).
+(defn- next-newline [text :string i :i64] :i64
+  (string-find-byte text 10 i))
+
+(defn run-batch [text :string] :string
+  (let [n (string-byte-length text)
+        e0 (next-newline text 0)
+        head (form/edn-form (string-substring text 0 e0))
+        tabs (build-tabs)
+        index (build-index tabs)
+        forbidden (build-set-index (form/nth-of head 0))
+        declared (build-set-index (form/nth-of head 1))]
+    (loop [i (+ e0 1) out ""]
+      (if (>= i n)
+        out
+        (let [j (next-newline text i)
+              end (if (< j 0) n j)
+              c (form/edn-form (string-substring text i end))
+              e (record-new [:ref :vx/env] (form/nth-of c 1) (form/nth-of c 2) tabs index forbidden declared
+                            (form/int-value (form/nth-of c 3)))
+              r (vx (form/nth-of c 0) e 0)]
+          (recur (+ end 1) (string-concat out (string-concat (line-of r) "\n"))))))))

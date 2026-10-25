@@ -1,0 +1,3528 @@
+(ns kotoba.compiler.frontend.base
+  "Module `base` of kotoba.compiler.frontend, cut from the original namespace by amu refactor split (93 forms, 1312 lines). Depends on: nothing in this split."
+  ;; the Kotoba-route interface: the names the other frontend modules, kotoba.sema and the native guests use
+  ;; (the linked project export bound is 1024 clauses, ADR 0363 port)
+  #?(:kotoba {:kotoba/export [a-normalize-aborts abort-escapes? abort-form-mentions? ascii-digit-code? capability-id->name capability-registry capability-wire-id check-abort-facet-unwind! code-point-width dr effect-capability-id elaborate-local-state env-counter expand-intrinsic-helper-forms fdistinct? fdrop fe-read-error fe-reject fe-reject-data fget fhas? fhead fhead-is? fkw fl-add fl-distinct? fl-drop fl-has? fl-nth fl-slice fmeta-from fname fnamespace form->document form-span form-text fprivate-symbol? fput frebuild-seq fsource-head fsym fsymbols-into ftruthy? fwith-source-head if-parts let-body pr-form read-forms read-forms-result refuse-reader-tagged-host-literal! reject! reject-call-arity! reject-operation-arity! simple-symbol-form? source-operation-registry synthetic try-clause-parts validate-interrupt-entries!]})
+  (:require [kotoba.lang.text :as str]
+            [kotoba.compiler.frontend-tables :as tables]
+            [kotoba.compiler.kotoba-reader :as kr]
+            #?@(:kotoba [[kotoba.form :as form]])
+            #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]]))
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                          [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                                 :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
+                                 ;; a refusal: the Kotoba-route `reject!` throws one (ADR 0007)
+                                 :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                                 :kotoba.reader/out [:record :kotoba.reader/out [[:forms [:list [:ref :form/r]]] [:err :string] [:at :i64]]]
+                                 ;; the desugar env and its results (docs/selfhost-frontend-typemodel-design.md 1.2)
+                                 :fe/env [:record :fe/env [[:counter :i64] [:result [:ref :form/r]] [:none :bool] [:arities [:ref :form/r]] [:lexical [:ref :form/r]] [:types [:ref :form/r]] [:docfns [:ref :form/r]] [:loop-counter :i64] [:tbl [:ref :form/r]] [:schemas [:ref :form/r]] [:lazy :bool] [:abort-ctx :string] [:used-caps [:ref :form/r]] [:options [:ref :form/r]] [:helpers [:ref :form/r]] [:shapes [:ref :form/r]] [:lambda-counter :i64] [:lambdas [:ref :form/r]] [:loop-result [:ref :form/r]] [:loop-known [:ref :form/r]] [:dispatchers [:ref :form/r]] [:uses-apply :bool] [:uses-lazy :bool] [:contracts [:ref :form/r]]]]
+                                 :fe/dr [:record :fe/dr [[:env [:ref :fe/env]] [:form [:ref :form/r]]]]
+                                 :fe/drs [:record :fe/drs [[:env [:ref :fe/env]] [:forms [:list [:ref :form/r]]]]]
+                                 ;; the local-state elaboration state and step result (see "Local state" below)
+                                 :anf/r [:record :anf/r [[:binds [:list [:ref :form/r]]] [:form [:ref :form/r]] [:dead :bool] [:n :i64]]]
+                                 :ls/s [:record :ls/s [[:env [:ref :fe/env]] [:ids :i64] [:used :bool]]]
+                                 :ls/r [:record :ls/r [[:bindings [:list [:ref :form/r]]] [:value [:ref :form/r]] [:cells [:ref :form/r]] [:st [:ref :ls/s]] [:aux [:ref :form/r]]]]})))
+
+;; forward references inside this module (the cut keeps the original form order)
+#?(:kotoba nil :default (declare local-state-tx local-state-tx-let-tail))
+
+
+;; clojure.core/some, spelled as the loop it is. In Kotoba `some` is the
+;; option constructor and a two-argument `(some pred coll)` is refused as a
+;; name collision (kotoba-sema frontend); this is the same definition as
+;; clojure.core/some -- the first logical-true (pred x), in order, stopping
+;; there -- so the host answer is unchanged on nbb and the JVM.
+#?(:kotoba nil :default
+(defn first-truthy [pred coll]
+  (loop [s (seq coll)]
+    (when s
+      (or (pred (first s)) (recur (next s)))))))
+
+#?(:kotoba nil :default (def capability-registry-cljs-fallback tables/capability-registry-cljs-fallback))
+
+#?(:kotoba nil :default
+(defn load-capability-catalog []
+  #?(:clj
+     (try
+       (let [c (clojure.java.io/resource "kotoba/lang/capability-catalog.edn")]
+         (if c
+           (with-open [r (clojure.java.io/reader c)]
+             (clojure.edn/read (java.io.PushbackReader. r)))
+           {:capabilities
+            (into {} (map (fn [[name id]]
+                            [name {:source-operation (symbol (namespace name) (clojure.core/name name))
+                                   :effect name :compiler-wire-id id}]))
+                  capability-registry-cljs-fallback)}))
+       (catch Exception _
+         {:capabilities
+          (into {} (map (fn [[name id]]
+                          [name {:source-operation (symbol (namespace name) (clojure.core/name name))
+                                 :effect name :compiler-wire-id id}]))
+                capability-registry-cljs-fallback)}))
+     :cljs
+     {:capabilities
+      (into {} (map (fn [[name id]]
+                      [name {:source-operation (symbol (namespace name) (clojure.core/name name))
+                             :effect name :compiler-wire-id id}]))
+            capability-registry-cljs-fallback)})))
+
+;; Kotoba: no classpath to read the catalog resource from, so the closed
+;; fallback (the same one ClojureScript uses) is the catalog; `frontend-tables`
+;; holds the three derived tables written out, and its test compares them.
+#?(:kotoba
+   (defn capability-catalog [] [:ref :form/r]
+     (tables/capability-catalog-fallback))
+   :default
+   (def capability-catalog (load-capability-catalog)))
+
+#?(:kotoba
+   (defn capability-registry [] [:ref :form/r]
+     (tables/capability-registry-cljs-fallback))
+   :default
+   (def capability-registry
+     "Semantic capability name -> stable compiler wire ID."
+     (into {} (map (fn [[name entry]] [name (:compiler-wire-id entry)]))
+           (:capabilities capability-catalog))))
+
+#?(:kotoba
+   (defn source-operation-registry [] [:ref :form/r]
+     (tables/source-operation-registry-fallback))
+   :default
+   (def source-operation-registry
+     "Friendly qualified source operation -> semantic capability name."
+     (into {} (map (fn [[name entry]] [(:source-operation entry) name]))
+           (:capabilities capability-catalog))))
+
+#?(:kotoba
+   (defn capability-id->name [] [:ref :form/r]
+     (tables/capability-id->name-fallback))
+   :default
+(def capability-id->name
+  "Inverse of capability-registry for diagnostics and effect ceilings. Two names
+  may share a wire id when they are payload variants of one capability
+  (`:fs/app-data` and `:fs/app-data-bytes`, wire 35); the inverse names the
+  primary one, which sorts after its variants and so is written last."
+  (into {} (map (fn [[k v]] [v k]) (sort-by (comp str key) #(compare %2 %1) capability-registry)))))
+
+;; isr: an interrupt entry is a function whose NAME is its vector.
+;;
+;; `aiueos-isr-3` is the entry for vector 3. The name carries the number
+;; because the toolchain-generated entry has to know its own vector -- it
+;; passes it to the body -- and a mnemonic table (`bp`, `pf`, ...) would be a
+;; second place to keep the mapping, kept equal by review across three
+;; repositories. A decimal suffix is derivable in both directions with no
+;; table at all.
+(def interrupt-entry-prefix "aiueos-isr-")
+
+;; isr: vectors 0..63. The exceptions are 0..31 and the rest is room for the
+;; remapped legacy PIC (32..47) and a handful of message-signalled lines,
+;; which is what a NIC driver needs. It is a RESERVATION in the image's text
+;; segment -- the packager lays down one fixed-size entry per vector -- so
+;; widening it costs bytes in every kernel image that has any entry at all,
+;; and is a decision with an ADR rather than a constant to nudge.
+(def interrupt-entry-vector-limit 64)
+
+;; a reader-phase refusal (the host's `(ex-info msg {:phase :read})`)
+#?(:kotoba
+   (defn fe-read-error [msg :string] [:ref :fe/err]
+     (record-new [:ref :fe/err] msg "" (form/nil-form) "read" (form/nil-form)))
+   :default nil)
+
+;; a refusal with a stable code (the host `reject!`'s :kotoba.error/code, spelled as its text)
+#?(:kotoba
+   (defn fe-reject [msg :string code :string form [:ref :form/r]] [:ref :fe/err]
+     (record-new [:ref :fe/err] msg code form "subset" (form/nil-form)))
+   :default nil)
+
+;; a refusal that carries data (the host `reject!` 4-arity: `:kotoba.error/expected`, `:actual`, `:use-site`,
+;; ...): DATA is a Form map keyed by the host's keywords. infer-absent-parameter-types reads it back.
+#?(:kotoba
+   (defn fe-reject-data [msg :string code :string form [:ref :form/r] data [:ref :form/r]] [:ref :fe/err]
+     (record-new [:ref :fe/err] msg code form "subset" data))
+   :default nil)
+
+#?(:kotoba
+   (defn reject-data! [message :string code :string form [:ref :form/r] data [:ref :form/r]] :i64
+     (throw (fe-reject-data message code form data)))
+   :default nil)
+
+;; `(when-not ok (reject! msg form code))` as an aborting function: bind it in a `let`
+#?(:kotoba
+   (defn require-k [ok :bool msg :string code :string form [:ref :form/r]] :i64
+     (if ok 0 (throw (fe-reject msg code form))))
+   :default nil)
+
+#?(:kotoba
+   (defn require-read [ok :bool msg :string] :i64
+     (if ok 0 (throw (fe-read-error msg))))
+   :default nil)
+
+#?(:kotoba
+   (defn env-counter [env [:ref :fe/env]] :i64 (record-get [:ref :fe/env] env :counter))
+   :default nil)
+
+#?(:kotoba
+   (defn dr [env [:ref :fe/env] f [:ref :form/r]] [:ref :fe/dr]
+     (record-new [:ref :fe/dr] env f))
+   :default nil)
+
+;; ---- Kotoba-route string readings (host regexes, spelled as scans) --------
+;; The host keeps its regexes byte for byte; on the Kotoba route a name is a Form
+;; symbol and a pattern is a scan over its text (docs/selfhost-frontend-typemodel-design.md).
+#?(:kotoba
+   (defn form-text [f [:ref :form/r]] :string
+     ;; `(str f)` for the atoms a name can be.
+     (if (or (form/is-symbol? f) (form/is-string? f))
+       (form/string-value f)
+       (if (form/is-keyword? f)
+         (document-edn-print (document-keyword (form/keyword-value f)))
+         "")))
+   :default nil)
+
+#?(:kotoba
+   (defn ascii-digit-code? [c :i64] :bool
+     (and (>= c 48) (<= c 57)))
+   :default nil)
+
+;; every byte of S from I to the end is an ASCII digit
+#?(:kotoba
+   (defn digits-from? [s :string i :i64] :bool
+     (if (>= i (string-length s))
+       true
+       (if (ascii-digit-code? (string-code-point-at s i))
+         (digits-from? s (+ i 1))
+         false)))
+   :default nil)
+
+#?(:kotoba
+   (defn decimal-value-from [s :string i :i64 acc :i64] :i64
+     (if (>= i (string-length s))
+       acc
+       (decimal-value-from s (+ i 1) (+ (* acc 10) (- (string-code-point-at s i) 48)))))
+   :default nil)
+
+;; The vector a name declares, or -1. Deep nested `if`s cost the admission pass
+;; time (measured: one 7-deep body took 90 s), so each decision is its own function.
+#?(:kotoba
+   (defn decimal-vector-text? [digits :string] :bool
+     ;; (0|[1-9][0-9]*), the whole remainder
+     (and (> (string-length digits) 0)
+          (digits-from? digits 0)
+          (or (= (string-length digits) 1)
+              (not (= 48 (string-code-point-at digits 0))))))
+   :default nil)
+
+#?(:kotoba
+   (defn decimal-vector-value [digits :string] :i64
+     (if (decimal-vector-text? digits)
+       (if (<= (string-length digits) 18) (decimal-value-from digits 0 0) -1)
+       -1))
+   :default nil)
+
+#?(:kotoba
+   (defn interrupt-vector-value [text :string] :i64
+     (if (= 0 (string-index-of text "aiueos-isr-"))
+       (let [v (decimal-vector-value (string-substring text 11 (string-length text)))]
+         (if (< v 64) v -1))
+       -1))
+   :default nil)
+
+#?(:kotoba
+   (defn interrupt-entry-vector [entry-name [:ref :form/r]] [:ref :form/r]
+     (let [v (interrupt-vector-value (form-text entry-name))]
+       (if (< v 0) (form/nil-form) (form/int-form v))))
+   :default
+(defn interrupt-entry-vector
+  "The vector `name` declares, or nil when it is not an interrupt entry name.
+
+  Nil for a name that merely starts with the prefix and does not continue as a
+  decimal vector (`aiueos-isr-bp`), and nil for one outside the table -- both
+  of which are refusals rather than admissions, because the packager has no
+  entry to point at either way."
+  [name]
+  (let [text (str name)]
+    (when (and (str/starts-with? text interrupt-entry-prefix)
+               (re-matches #"(0|[1-9][0-9]*)"
+                           (subs text (count interrupt-entry-prefix))))
+      (let [vector (#?(:clj Long/parseLong :cljs js/parseInt)
+                    (subs text (count interrupt-entry-prefix)))]
+        (when (< vector interrupt-entry-vector-limit) vector))))))
+
+;; UTF-8 strings: an index is a BYTE offset and `string-code-point-at` refuses an
+;; interior byte, so every full scan steps by the width of the code point it read.
+#?(:kotoba
+   (defn code-point-width [c :i64] :i64
+     (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+   :default nil)
+
+(def max-reader-depth
+  "`:max-reader-depth` from lang/guest-grammar.edn's `:admission-limits`.
+
+   It bounds the SOURCE. Desugaring creates nesting the source does not have —
+   a flat 64-arm `case` reads at depth 2 and becomes a 64-deep chain of `if` —
+   so this is not a bound on the tree the compiler walks. `analyze` says so
+   where that difference bites."
+  512)
+
+#?(:kotoba
+   ;; The host's scan, as a self-call that answers instead of throwing. UTF-8:
+   ;; an index is a byte offset, so it steps by the width of what it read.
+   ;; MODE: 0 code, 1 inside a string, 2 after a backslash in a string, 3 comment.
+   (defn reader-depth-scan [source :string n :i64 index :i64 depth :i64 mode :i64] :bool
+     (if (>= index n)
+       false
+       (let [ch (string-code-point-at source index)
+             next-index (+ index (code-point-width ch))]
+         (if (= mode 3)
+           (reader-depth-scan source n next-index depth (if (= ch 10) 0 3))
+           (if (= mode 2)
+             (reader-depth-scan source n next-index depth 1)
+             (if (= mode 1)
+               (reader-depth-scan source n next-index depth
+                                  (if (= ch 92) 2 (if (= ch 34) 0 1)))
+               (if (= ch 59)
+                 (reader-depth-scan source n next-index depth 3)
+                 (if (= ch 34)
+                   (reader-depth-scan source n next-index depth 1)
+                   (if (or (= ch 40) (= ch 91) (= ch 123))
+                     (if (> (+ depth 1) max-reader-depth)
+                       true
+                       (reader-depth-scan source n next-index (+ depth 1) 0))
+                     (if (or (= ch 41) (= ch 93) (= ch 125))
+                       (reader-depth-scan source n next-index (if (> depth 0) (- depth 1) 0) 0)
+                       (reader-depth-scan source n next-index depth 0)))))))))))
+   :default nil)
+
+#?(:kotoba
+   (defn reader-depth-exceeded? [source :string] :bool
+     (reader-depth-scan source (string-length source) 0 0 0))
+   :default nil)
+
+#?(:kotoba
+   (defn check-reader-depth! [source :string] :i64
+     (if (reader-depth-exceeded? source)
+       (throw (fe-read-error "reader nesting exceeds admission limit"))
+       0))
+   :default
+(defn check-reader-depth! [source]
+  (loop [index 0 depth 0 in-string? false escaped? false in-comment? false]
+    (when (< index (count source))
+      (let [ch (.charAt ^String source index)]
+        (cond
+          in-comment? (recur (inc index) depth false false (not= ch \newline))
+          (and in-string? escaped?) (recur (inc index) depth true false false)
+          (and in-string? (= ch \\)) (recur (inc index) depth true true false)
+          (= ch \newline) (recur (inc index) depth in-string? false false)
+          (= ch \;) (recur (inc index) depth in-string? false (not in-string?))
+          (= ch \") (recur (inc index) depth (not in-string?) false false)
+          in-string? (recur (inc index) depth true false false)
+          (#{\( \[ \{} ch)
+          (let [next-depth (inc depth)]
+            (when (> next-depth max-reader-depth)
+              (throw (ex-info "reader nesting exceeds admission limit" {:phase :read})))
+            (recur (inc index) next-depth false false false))
+          (#{\) \] \}} ch) (recur (inc index) (max 0 (dec depth)) false false false)
+          :else (recur (inc index) depth false false false)))))))
+
+(def max-source-bytes
+  "`:max-source-bytes` from lang/guest-grammar.edn's `:admission-limits`.
+   1 MiB until 2026-09-29 (amu ADR 0356); 8 MiB now, the same bound the project
+   linker puts on a linked closure."
+  8388608)
+
+(def max-definition-source-bytes
+  "Maximum canonical UTF-8 bytes in one top-level source form. This is the
+   former whole-source ceiling, applied to the unit the compiler identifies,
+   caches, and compiles independently."
+  (* 1024 1024))
+
+#?(:kotoba
+   (defn read-forms-result [source :string] [:ref :kotoba.reader/out]
+     (if (> (string-byte-length source) max-source-bytes)
+       (record-new [:ref :kotoba.reader/out] (form/no-forms)
+                   "source exceeds 8 MiB admission limit" 0)
+       (let [parsed (kr/read-forms-bounded source 512 1048576)
+             error (record-get [:ref :kotoba.reader/out] parsed :err)
+             forms (record-get [:ref :kotoba.reader/out] parsed :forms)]
+         (if (and (= (string-byte-length error) 0)
+                  (> (vector-count forms) 10000))
+           (record-new [:ref :kotoba.reader/out] forms
+                       "too many top-level forms" 0)
+           parsed))))
+   :default nil)
+
+#?(:kotoba
+   (defn read-forms [source :string] [:ref :form/r]
+     ;; The Kotoba route reads with kotoba-reader's guest twin (lang/compat/kotoba/
+     ;; compiler/kotoba_reader.kotoba): the whole .kotoba grammar (reader conditionals,
+     ;; #() literals, character and regex tokens, ^meta, ::kw, large integers), every node
+     ;; carrying its line * 2^32 + column span. The host arm below reads the same grammar
+     ;; with the .cljk reader; scripts/reader-twin-diff in kotoba-lang is their differential.
+     (let [_ (require-read (<= (string-byte-length source) 8388608) "source exceeds 8 MiB admission limit")
+           _ (check-reader-depth! source)
+           rd (kr/read-forms source)
+           err (record-get [:ref :kotoba.reader/out] rd :err)
+           _ (require-read (= (string-byte-length err) 0) "source reader rejected input")
+           out (record-get [:ref :kotoba.reader/out] rd :forms)
+           _ (require-read (<= (vector-count out) 10000) "too many top-level forms")]
+       (form/form-vec out)))
+   :default
+(defn read-forms [source]
+  (when-not (string? source)
+    (throw (ex-info "source must be a string" {:phase :read})))
+  (when (> (count source) max-source-bytes)
+    (throw (ex-info "source exceeds 8 MiB admission limit" {:phase :read})))
+  ;; `#=` (reader evaluation) is refused by the READER's dispatch arm, not by a
+  ;; textual scan: the scan matched the two characters anywhere -- inside a
+  ;; string, a comment, or the very regex that spelled it -- and so refused
+  ;; this file's own source once the self-host route linked it (measured
+  ;; 2026-09-11, adr-2609111900: 5 amu modules refused with "reader
+  ;; evaluation is forbidden" for a `#=` that was never a reader macro).
+  (check-reader-depth! source)
+  ;; This forked until 2026-09-08: `clojure.tools.reader` on the JVM,
+  ;; `kotoba-reader` on ClojureScript. Two readers for one grammar is two
+  ;; answers to every question about that grammar, with only one of them
+  ;; exercised by whichever suite happened to run -- and this repository has
+  ;; now paid for that twice in one day. Once when f32 decimal literals
+  ;; compiled on the JVM and were refused on nbb, because the frontend
+  ;; branch was written for the shape only the JVM reader produces. Once
+  ;; when collapsing the fork revealed that `kotoba-reader` had no `@`
+  ;; (deref) case at all and boxed every JVM integer as `BigInt`. Neither
+  ;; was findable while each host had its own reader.
+  ;;
+  ;; It parses the whole source in one pass rather than one form at a time,
+  ;; so the >10000 admission check runs post-hoc here instead of
+  ;; per-iteration -- equivalent outcome, and the same 1 MiB source cap
+  ;; already bounds how large that one pass can be.
+  (let [out (try
+              (kr/read-forms source)
+              ;; The reader's own reason is IN the message, not only in the
+              ;; cause: callers that report `ex-message` -- amu's
+              ;; `test --manifest` :compiler-admit row among them -- printed
+              ;; "source reader rejected input" and nothing else, so a
+              ;; negative case could not name the refusal it exists for
+              ;; (kotoba-lang negative/malformed_reader_conditional.cljk).
+              (catch #?(:clj Exception :cljs :default) error
+                (throw (ex-info (if-let [reason (ex-message error)]
+                                  (str "source reader rejected input: " reason)
+                                  "source reader rejected input")
+                                {:phase :read} error))))]
+    (when (> (count out) 10000)
+      (throw (ex-info "too many top-level forms" {:phase :read})))
+    out)))
+
+#?(:kotoba
+   ;; The span of a Form is its :span field, line * 2^32 + column (0 when unknown).
+   (defn form-span [form [:ref :form/r]] :i64
+     (form/span-of form))
+   :default
+(defn form-span [form]
+  (let [{:keys [line column end-line end-column offset end-offset]} (meta form)]
+    (when (and (integer? line) (integer? column))
+      (cond-> {:line line :column column}
+        (integer? end-line) (assoc :end-line end-line)
+        (integer? end-column) (assoc :end-column end-column)
+        (integer? offset) (assoc :offset offset)
+        (integer? end-offset) (assoc :end-offset end-offset))))))
+
+#?(:kotoba
+   (defn reject! [message :string code :string form [:ref :form/r]] :i64
+     (throw (fe-reject message code form)))
+   :default
+(defn reject!
+  "Reject a source form. Always attaches `:phase :subset`, a source `:span`
+  when available, and a stable `:kotoba.error/code` (T3.1).
+
+  Prefer an explicit specific code via the 3-arity. The 2-arity defaults to
+  `:kotoba.error/subset-reject` so no reject site is code-less."
+  ([message form]
+   (reject! message form :kotoba.error/subset-reject nil))
+  ([message form code]
+   (reject! message form code nil))
+  ([message form code data]
+   (let [m (meta form)
+         span (or (when (map? form) (:span form))
+                  (get m :span)
+                  (form-span form))
+         operation (or (get m :source-operation)
+                       (when (and (seq? form) (symbol? (first form)) (namespace (first form)))
+                         (keyword (namespace (first form)) (name (first form)))))
+         code (or code :kotoba.error/subset-reject)]
+     (throw (ex-info message
+                     (cond-> {:phase :subset :form form :kotoba.error/code code}
+                       span (assoc :span span)
+                       operation (assoc :operation operation)
+                       (map? data) (merge data))))))))
+
+
+#?(:kotoba
+   (defn refuse-reader-tagged-host-literal! [form [:ref :form/r] op [:ref :form/r]] :i64
+     (let [o (form-text op)
+           slash (string-find-byte o 47 0)
+           short-name (if (< slash 0) o (string-substring o (+ slash 1) (string-length o)))
+           _ (require-k (not (string=? o "kotoba.reader/regex"))
+                        "host regex literal #\"...\" is not admitted; pass the pattern as a string to kotoba.lang.bounded-regex"
+                        "kotoba.error/host-regex-literal" form)
+           _ (require-k (not (string=? o "kotoba.reader/js"))
+                        "#js literal is host interop; keep it inside a :cljs reader-conditional branch"
+                        "kotoba.error/host-js-literal" form)
+           _ (require-k (not (or (string=? o "kotoba.reader/set") (string=? o "kotoba.reader/bigint") (string=? o "kotoba.reader/bigdec")))
+                        (string-concat "host literal " (string-concat short-name " is not admitted (Kotoba admits keyword-set data and i64 / f64 literals); keep it inside a :clj / :cljs reader-conditional branch"))
+                        "kotoba.error/host-literal" form)
+           _ (require-k (not (string=? o "kotoba.reader/char"))
+                        "character literal \\c is host data; Kotoba text is UTF-8 bytes -- spell the byte as an integer (byte-at / string-byte-at) or use a one-character string"
+                        "kotoba.error/host-char-literal" form)]
+       0))
+   :default
+(defn refuse-reader-tagged-host-literal!
+  "Reader-tagged host literals. `kotoba.compiler.kotoba-reader` reads `#\"...\"`
+  as `(kotoba.reader/regex \"pat\")` and `#js X` as `(kotoba.reader/js X)` so
+  that a discarded :clj / :cljs reader-conditional branch can contain them
+  (measured 2026-09-11: 35 of the compiler's own 178 sources were refused at
+  the reader for a regex literal, most inside branches never selected). If
+  one is SELECTED and reaches admission it is refused here by NAME, with the
+  admitted alternative in the message."
+  [form op]
+  (when (= op 'kotoba.reader/regex)
+    (reject! "host regex literal #\"...\" is not admitted; pass the pattern as a string to kotoba.lang.bounded-regex"
+             form :kotoba.error/host-regex-literal))
+  (when (= op 'kotoba.reader/js)
+    (reject! "#js literal is host interop; keep it inside a :cljs reader-conditional branch"
+             form :kotoba.error/host-js-literal))
+  (when (contains? #{'kotoba.reader/set 'kotoba.reader/bigint 'kotoba.reader/bigdec} op)
+    (reject! (str "host literal " (name op) " is not admitted (Kotoba admits keyword-set data and i64 / f64 literals); keep it inside a :clj / :cljs reader-conditional branch")
+             form :kotoba.error/host-literal))
+  (when (= op 'kotoba.reader/char)
+    (reject! "character literal \\c is host data; Kotoba text is UTF-8 bytes -- spell the byte as an integer (byte-at / string-byte-at) or use a one-character string"
+             form :kotoba.error/host-char-literal))))
+
+#?(:kotoba
+   (defn reject-call-arity! [op :string expected :i64 supplied :i64 form [:ref :form/r]] :i64
+     (throw (fe-reject (string-concat "function call arity mismatch: "
+                                      (string-concat op
+                                                     (string-concat " takes "
+                                                                    (string-concat (string-from-i64 expected)
+                                                                                   (string-concat (if (= 1 expected) " argument" " arguments")
+                                                                                                  (string-concat "; got " (string-from-i64 supplied)))))))
+                       "kotoba.error/call-arity" form)))
+   :default
+(defn reject-call-arity!
+  "One sentence for a wrong argument count at a call to a module function, in
+  BOTH directions.
+
+  Two sites raise it and they must agree: `elaborate-named-ability`, which is
+  where the surplus used to be dropped, and `validate-expr`, which sees calls
+  that elaboration does not walk (a call nested inside a vector literal, for
+  one). A caller reading one message must not have to know which pass produced
+  it, so the count is named rather than merely asserted -- `arity mismatch`
+  alone does not say which way it points, and the direction is the whole
+  content of the report when the surplus argument was previously answered."
+  [op expected supplied form]
+  (reject! (str "function call arity mismatch: " op " takes " expected
+                (if (= 1 expected) " argument" " arguments")
+                "; got " supplied)
+           form :kotoba.error/call-arity
+           {:function op :expected expected :supplied supplied})))
+
+#?(:kotoba
+   (defn reject-operation-arity! [family :string op :string expected :i64 supplied :i64 form [:ref :form/r]] :i64
+     (throw (fe-reject (string-concat family
+                                      (string-concat " arity mismatch: "
+                                                     (string-concat op
+                                                                    (string-concat " takes "
+                                                                                   (string-concat (string-from-i64 expected)
+                                                                                                  (string-concat (if (= 1 expected) " argument" " arguments")
+                                                                                                                 (string-concat "; got " (string-from-i64 supplied))))))))
+                       "kotoba.error/call-arity" form)))
+   :default
+(defn reject-operation-arity!
+  "The builtin-family form of `reject-call-arity!`: FAMILY is the table's
+  label (`\"string operation\"`), OP the head, EXPECTED the table's arity and
+  SUPPLIED what the call wrote.
+
+  Every family used to say only `<family> arity mismatch` -- neither the head
+  nor the count it wanted, so a two-argument `string-substring` read the same
+  as any other slip in a family of a dozen heads. The sentence, the code and
+  the ex-data now match the user-function form: one class of defect, one
+  shape of report, whichever table caught it."
+  [family op expected supplied form]
+  (reject! (str family " arity mismatch: " op " takes " expected
+                (if (= 1 expected) " argument" " arguments")
+                "; got " supplied)
+           form :kotoba.error/call-arity
+           {:function op :expected expected :supplied supplied})))
+
+#?(:kotoba
+   ;; -> the Form vector [error-type binder handler], error-type nil when left to inference
+   (defn try-clause-parts [clause [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+     (let [_ (require-k (and (form/is-seq? clause)
+                             (form/is-symbol? (form/nth-of clause 0))
+                             (string=? (form/symbol-value (form/nth-of clause 0)) "catch"))
+                        "try requires a (catch [error-type] binder handler) clause"
+                        "kotoba.error/abort-shape" form)
+           parts (- (form/count-of clause) 1)
+           _ (require-k (or (= parts 2) (= parts 3))
+                        "catch requires an optional error type, one binder, and one handler expression"
+                        "kotoba.error/abort-shape" form)
+           error-type (if (= parts 3) (form/nth-of clause 1) (form/nil-form))
+           binder (form/nth-of clause (- (form/count-of clause) 2))
+           handler (form/nth-of clause (- (form/count-of clause) 1))
+           _ (require-k (and (form/is-symbol? binder)
+                             (< (string-find-byte (form/symbol-value binder) 47 0) 0))
+                        "catch binder must be an unqualified symbol"
+                        "kotoba.error/abort-shape" form)]
+       ;; `(catch :default e ...)` is the dual-runtime spelling of "any error"
+       (form/vec3 (if (form/eq error-type (form/keyword-form :default)) (form/nil-form) error-type)
+                  binder handler)))
+   :default
+(defn try-clause-parts
+  "`(catch binder handler)` or `(catch error-type binder handler)` ->
+  `[error-type binder handler]`, error-type nil when the author left it to
+  inference. Shared by desugaring, inference and elaboration so the clause
+  has one shape."
+  [clause form]
+  (when-not (and (seq? clause) (= 'catch (first clause)))
+    (reject! "try requires a (catch [error-type] binder handler) clause"
+             form :kotoba.error/abort-shape))
+  (let [parts (rest clause)
+        [error-type binder handler]
+        (case (count parts)
+          2 (cons nil parts)
+          3 parts
+          (reject! "catch requires an optional error type, one binder, and one handler expression"
+                   form :kotoba.error/abort-shape))]
+    (when-not (and (symbol? binder) (nil? (namespace binder)))
+      (reject! "catch binder must be an unqualified symbol" form :kotoba.error/abort-shape))
+    ;; `(catch :default e ...)` is the dual-runtime spelling of "any error"
+    ;; (ClojureScript's catch-all); Kotoba's spelling is no error type, which
+    ;; leaves the binder's type to inference.
+    [(when-not (= :default error-type) error-type) binder handler])))
+
+#?(:kotoba
+   (defn let-body [args [:list [:ref :form/r]] form [:ref :form/r]] [:ref :form/r]
+     (let [n (vector-count args)
+           bodies (if (> n 0) (- n 1) 0)
+           _ (require-k (= bodies 1)
+                        (string-concat "let requires one result expression; got "
+                                       (string-concat (string-from-i64 bodies) " (sequence with `do`)"))
+                        "kotoba.error/let-body-multiple-forms" form)]
+       (typed-list-nth [:list [:ref :form/r]] args 1)))
+   :default
+(defn let-body
+  "The ONE body expression of a core `let`, refusing anything else.
+
+  `let` is a core special form that takes a binding vector and a single body
+  expression; sequencing is `do`'s job. Source `let` bodies with several forms
+  are collapsed into a `do` by `sequenced-body` during desugaring, so by the
+  time any later pass reads a `let` there is exactly one body form.
+
+  This exists because a single body form used to be an assumption rather
+  than a check. Six passes in this file destructured `(let [[bindings body] args] ...)`
+  and two of them REBUILT the form from `body` alone -- so a `let` that reached
+  them with several body forms came out with one, silently, and
+  `validate-expr`'s own one-result-expression check then measured the
+  truncated form and passed it. Every path that produces a `let` now goes
+  through `sequenced-body`; every path that consumes one goes through here, so
+  a future path that forgets gets a refusal instead of a shorter program."
+  [args form]
+  (let [body (rest args)]
+    (when-not (= 1 (count body))
+      (reject! (str "let requires one result expression; got " (count body)
+                    " (sequence with `do`)")
+               form :kotoba.error/let-body-multiple-forms))
+    (first body))))
+
+#?(:kotoba
+   (defn if-parts [args [:list [:ref :form/r]] form [:ref :form/r]] [:list [:ref :form/r]]
+     (let [_ (require-k (= 3 (vector-count args))
+                        (string-concat "if requires test, then, else; got "
+                                       (string-concat (string-from-i64 (vector-count args)) " arguments"))
+                        "kotoba.error/if-arity" form)]
+       args))
+   :default
+(defn if-parts
+  "The THREE parts of a core `if`, refusing any other arity.
+
+  Found alongside the `let` body truncation and it is the same shape: `if`
+  survived desugaring with whatever arity the source wrote, a later pass
+  destructured `[test then else]` and REBUILT the form from those three, and
+  `validate-expr`'s own `if requires test, then, else` then measured the
+  rebuilt three-argument form and passed it. Measured 2026-09-02:
+
+      (defn run [n :i64] :i64 (if (> n 0) (+ n 10) (+ n 100) (+ n 1000)))
+
+  compiled to wasm32 with :ok true and answered 15, having dropped the fourth
+  argument without a word. In Clojure that source is an arity error."
+  [args form]
+  (when-not (= 3 (count args))
+    (reject! (str "if requires test, then, else; got " (count args) " arguments")
+             form :kotoba.error/if-arity))
+  args))
+
+#?(:kotoba
+   (defn capability-wire-id [capability [:ref :form/r] form [:ref :form/r]] :i64
+     (let [id (form/form-get (capability-registry) capability)
+           _ (require-k (not (form/is-nil? id))
+                        (string-concat "cap-call names an unregistered capability: " (form-text capability))
+                        "kotoba.error/subset-reject" form)]
+       (form/int-value id)))
+   :default
+(defn capability-wire-id [capability form]
+  (if-let [id (get capability-registry capability)]
+    id
+    (reject! (str "cap-call names an unregistered capability: " capability)
+             form))))
+
+#?(:kotoba
+   (defn effect-capability-id [id :i64] :i64 id)
+   :default
+(defn effect-capability-id [id]
+  ;; `.kotoba` policy literals are bigint under nbb while typed Wasm metadata
+  ;; indices must remain host integers for ULEB encoding.
+  #?(:kotoba id :clj id :cljs (i64/->bigint id))))
+
+;; Every other synthesized `let` temporary. Bound ONCE per `analyze` call, the
+;; same lifetime and for the same reason as `*loop-counter*` above: the same
+;; source encounters the same desugars in the same left-to-right order, so it
+;; always gets the same names.
+;;
+;; These were `gensym`, whose counter is process-global, so the emitted KIR
+;; differed on every compile. `and`/`or`/comparison chains were made
+;; deterministic first (they could be named by position); these could not,
+;; because a temp such as `doseq`'s cursor is still live after the body runs,
+;; so a nested `doseq` naming its cursor the same thing would capture it. A
+;; per-compilation counter keeps uniqueness exactly as gensym did while making
+;; the sequence a function of the source.
+;;
+;; The consumer-side cost this removes is real: kotoba-lang/murakumo carries a
+;; `normalize-kir-gensyms` that rewrites `or-tmp__N` / `binding-some__N` so its
+;; drift gate can compare structure instead of counter values.
+;;
+;; Falls back to `gensym` when unbound, so a desugar helper called outside
+;; `analyze` still produces correct (if unstable) names rather than colliding.
+#?(:kotoba nil :default
+(def ^:dynamic *synthetic-counter* nil))
+
+#?(:kotoba
+   (defn synthetic [env [:ref :fe/env] prefix :string] [:ref :fe/dr]
+     (let [n (+ (env-counter env) 1)]
+       (dr (record-assoc [:ref :fe/env] env :counter n)
+           (form/symbol-form (string-concat "__kotoba_" (string-concat prefix (string-concat "_" (string-from-i64 n))))))))
+   :default
+(defn synthetic [prefix]
+  (if *synthetic-counter*
+    (symbol (str "__kotoba_" prefix "_" (vswap! *synthetic-counter* inc)))
+    (gensym (str prefix "__")))))
+
+;; ---------------------------------------------------------------------------
+;; Library heads: surface names whose meaning is a Kotoba function this
+;; frontend supplies (superproject adr-2609242330, the selfhost builtin gaps,
+;; 2026-09-25). kotoba-lang `lang/guest-grammar.edn` `:library-heads` is the
+;; contract; this is its implementation.
+;;
+;; WHY A FUNCTION AND NOT A SLOT. Each of these is expressible over operations
+;; every backend already runs (`string-code-point-at`, `vector-alloc`,
+;; `vector-assoc!`, `bytes-from-vector-i64`, the parametric result/option
+;; constructors), so writing it once in Kotoba gives one meaning on the
+;; reference, ESM, Wasm and both native ISAs by construction -- no new KIR
+;; operation, no loader slot, no verifier widening. A slot would be a second
+;; implementation per backend of a decision (what is a digit, when does a
+;; decimal overflow) that has to agree everywhere.
+;;
+;; HOW. When a module's source calls one of these heads and does NOT define a
+;; function of that name itself, the call head is renamed to the helper below
+;; and the helper's definitions are appended to the module as private `defn-`s
+;; under the reserved `__kotoba_intrinsic_` prefix -- after
+;; `reject-reserved-source-symbols!`, so source cannot name or shadow them. A
+;; module that mentions none of the heads is returned UNCHANGED (identical
+;; forms), so no existing definition CID can move. The helpers are excluded
+;; from the implicit export set (see `intrinsic-helper-name?`).
+;;
+;; The helper source is TEXT read by `read-forms`, the reader user source goes
+;; through: an i64 literal past 2^53 read by a ClojureScript host as a quoted
+;; form would arrive as a rounded double.
+;;
+;;   (string-to-utf8 s)    -> :bytes, the UTF-8 encoding of S. Total: every
+;;                            string is canonical UTF-8, and a string is at
+;;                            most 65536 bytes, which is also the bytes limit.
+;;                            One `string-code-point-at` per code point into a
+;;                            `vector-alloc` of the byte length, then one copy.
+;;                            Byte access on a string is `(bytes-at
+;;                            (string-to-utf8 s) i)` with the conversion
+;;                            hoisted -- O(n) once, O(1) per byte.
+;;   (string-parse-i64 s)  -> [:result :i64 :keyword]: an optional `+` or `-`,
+;;                            then one or more ASCII digits 0-9, nothing else
+;;                            (no whitespace, no `_`, no other script's
+;;                            digits). err :parse/malformed for any other
+;;                            text, err :parse/out-of-range for a well-formed
+;;                            decimal outside [-2^63, 2^63-1]. Malformed wins:
+;;                            the whole text is scanned before a range verdict.
+;;                            Never wraps: the magnitude accumulates NEGATIVE
+;;                            so -2^63 is representable, with the overflow test
+;;                            BEFORE each multiply.
+;;   (parse-long s)        -> [:option :i64]: `string-parse-i64`'s ok value,
+;;                            or none for either error -- Clojure's
+;;                            `parse-long` (nil for malformed and out of range)
+;;                            on ASCII input. Where they differ: the JVM's
+;;                            Long/valueOf also accepts non-ASCII decimal
+;;                            digits (Character/digit), this refuses them; and
+;;                            ClojureScript's parse-long answers nil past 2^53,
+;;                            this answers the exact i64.
+(def intrinsic-helper-source
+  "(defn- __kotoba_intrinsic_subvec [v :vector-i64 start :i64 end :i64] :vector-i64
+     (let [tail (vector-drop v start)
+           n (- end start)]
+       (do (vector-drop tail (- (vector-count tail) n))
+           (loop [i 0 out (vector-alloc n)]
+             (if (= i n)
+               (vector-drop out 0)
+               (recur (+ i 1) (vector-assoc! out i (vector-at tail i))))))))
+   (defn- __kotoba_intrinsic_subvec_from [v :vector-i64 start :i64] :vector-i64
+     (vector-drop v start))
+   (defn- __kotoba_intrinsic_string_to_utf8 [s :string] :bytes
+     (let [n (string-byte-length s)]
+       (loop [i 0 v (vector-alloc n)]
+         (if (>= i n)
+           (bytes-from-vector-i64 v)
+           (let [c (string-code-point-at s i)]
+             (if (< c 128)
+               (recur (+ i 1) (vector-assoc! v i c))
+               (if (< c 2048)
+                 (recur (+ i 2)
+                        (vector-assoc! (vector-assoc! v i (+ 192 (quot c 64)))
+                                       (+ i 1) (+ 128 (bit-and c 63))))
+                 (if (< c 65536)
+                   (recur (+ i 3)
+                          (vector-assoc! (vector-assoc! (vector-assoc! v i (+ 224 (quot c 4096)))
+                                                        (+ i 1) (+ 128 (bit-and (quot c 64) 63)))
+                                         (+ i 2) (+ 128 (bit-and c 63))))
+                   (recur (+ i 4)
+                          (vector-assoc! (vector-assoc! (vector-assoc! (vector-assoc! v i (+ 240 (quot c 262144)))
+                                                                       (+ i 1) (+ 128 (bit-and (quot c 4096) 63)))
+                                                        (+ i 2) (+ 128 (bit-and (quot c 64) 63)))
+                                         (+ i 3) (+ 128 (bit-and c 63))))))))))))
+   (defn- __kotoba_intrinsic_code_unit_count [s :string] :i64
+     (let [n (string-byte-length s)]
+       (loop [i 0 k 0]
+         (if (>= i n)
+           k
+           (let [c (string-code-point-at s i)]
+             (if (< c 128)
+               (recur (+ i 1) (+ k 1))
+               (if (< c 2048)
+                 (recur (+ i 2) (+ k 1))
+                 (if (< c 65536)
+                   (recur (+ i 3) (+ k 1))
+                   (recur (+ i 4) (+ k 2))))))))))
+   (defn- __kotoba_intrinsic_code_unit_at [s :string u :i64] :i64
+     (let [n (string-byte-length s)]
+       (if (< u 0)
+         (string-code-point-at s n)
+         (loop [i 0 k 0]
+           (if (>= i n)
+             (string-code-point-at s n)
+             (let [c (string-code-point-at s i)]
+               (if (< c 65536)
+                 (if (= k u)
+                   c
+                   (recur (+ i (if (< c 128) 1 (if (< c 2048) 2 3))) (+ k 1)))
+                 (if (= k u)
+                   (+ 55296 (quot (- c 65536) 1024))
+                   (if (= (+ k 1) u)
+                     (+ 56320 (bit-and (- c 65536) 1023))
+                     (recur (+ i 4) (+ k 2)))))))))))
+   (defn- __kotoba_intrinsic_code_unit_offset [s :string u :i64] :i64
+     (let [n (string-byte-length s)]
+       (if (< u 0)
+         (+ n 1)
+         (loop [i 0 k 0]
+           (if (= k u)
+             i
+             (if (>= i n)
+               (+ n 1)
+               (let [c (string-code-point-at s i)]
+                 (if (< c 65536)
+                   (recur (+ i (if (< c 128) 1 (if (< c 2048) 2 3))) (+ k 1))
+                   (if (= (+ k 1) u)
+                     (+ i 1)
+                     (recur (+ i 4) (+ k 2)))))))))))
+   (defn- __kotoba_intrinsic_subs [s :string start :i64 end :i64] :string
+     (string-substring s (__kotoba_intrinsic_code_unit_offset s start)
+                       (__kotoba_intrinsic_code_unit_offset s end)))
+   (defn- __kotoba_intrinsic_subs_from [s :string start :i64] :string
+     (string-substring s (__kotoba_intrinsic_code_unit_offset s start) (string-byte-length s)))
+   (defn- __kotoba_intrinsic_ex_info [msg :string data :document] :document
+     (document-map (document-keyword :message) (document-string msg)
+                   (document-keyword :data) data))
+   (defn- __kotoba_intrinsic_ex_message [e :document] :string
+     (option-or (document-string-value
+                 (option-or (document-get e (document-keyword :message)) (document-null)))
+                \"\"))
+   (defn- __kotoba_intrinsic_ex_data [e :document] :document
+     (option-or (document-get e (document-keyword :data)) (document-null)))
+   (defn- __kotoba_intrinsic_parse_i64 [s :string] [:result :i64 :keyword]
+     (let [n (string-byte-length s)
+           c0 (if (> n 0) (string-code-point-at s 0) -1)
+           negative (= c0 45)
+           start (if (or (= c0 45) (= c0 43)) 1 0)]
+       (if (>= start n)
+         (result-err-of [:result :i64 :keyword] :parse/malformed)
+         (loop [i start acc 0 over false]
+           (if (>= i n)
+             (if over
+               (result-err-of [:result :i64 :keyword] :parse/out-of-range)
+               (if negative
+                 (result-ok-of [:result :i64 :keyword] acc)
+                 (if (= acc -9223372036854775808)
+                   (result-err-of [:result :i64 :keyword] :parse/out-of-range)
+                   (result-ok-of [:result :i64 :keyword] (- 0 acc)))))
+             (let [c (string-code-point-at s i)]
+               (if (or (< c 48) (> c 57))
+                 (result-err-of [:result :i64 :keyword] :parse/malformed)
+                 (let [d (- c 48)]
+                   (if (or over
+                           (< acc -922337203685477580)
+                           (and (= acc -922337203685477580) (> d 8)))
+                     (recur (+ i 1) acc true)
+                     (recur (+ i 1) (- (* acc 10) d) false))))))))))
+   (defn- __kotoba_intrinsic_parse_long [s :string] [:option :i64]
+     (let [r (__kotoba_intrinsic_parse_i64 s)]
+       (if (result-ok?-of [:result :i64 :keyword] r)
+         (option-some-of [:option :i64] (result-value-of [:result :i64 :keyword] r 0))
+         (option-none-of [:option :i64]))))")
+
+#?(:kotoba nil :default (def intrinsic-helper-heads tables/intrinsic-helper-heads))
+
+#?(:kotoba nil :default (def intrinsic-helper-order tables/intrinsic-helper-order))
+
+#?(:kotoba
+   (defn intrinsic-helper-forms-from [kids [:list [:ref :form/r]] i :i64
+                                       acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (let [f (typed-list-nth [:list [:ref :form/r]] kids i)]
+         (intrinsic-helper-forms-from
+          kids (+ i 1)
+          (typed-list-conj [:list [:ref :form/r]]
+                           (typed-list-conj [:list [:ref :form/r]] acc (form/nth-of f 1))
+                           f)))))
+   :default nil)
+
+;; Kotoba: the name -> defn form map, built from the same source text (every
+;; helper is EDN-shaped, so the Form reader reads them wrapped in a vector).
+#?(:kotoba
+   (defn intrinsic-helper-forms [] [:ref :form/r]
+     (form/form-map
+      (intrinsic-helper-forms-from
+       (form/kids-of (form/edn-form (str "[" intrinsic-helper-source "]")))
+       0 (form/no-forms)))))
+#?(:kotoba nil :default
+(def intrinsic-helper-forms
+  (delay (into {} (map (fn [form] [(second form) form]))
+               (read-forms intrinsic-helper-source)))))
+
+;; ex-info data maps on the Kotoba route: the entries of a Form map ordered by
+;; key text (`(sort-by (comp str key) m)`), as the document-map arguments.
+#?(:kotoba
+   (defn- ex-slice [xs [:list [:ref :form/r]] from :i64 to :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= from to)
+       acc
+       (ex-slice xs (+ from 1) to (form/append-form acc (typed-list-nth [:list [:ref :form/r]] xs from)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ex-first-greater [xs [:list [:ref :form/r]] key :string i :i64] :i64
+     (if (>= i (vector-count xs))
+       i
+       (if (> (string-compare (form-text (form/nth-of (typed-list-nth [:list [:ref :form/r]] xs i) 0)) key) 0)
+         i
+         (ex-first-greater xs key (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ex-insert [xs [:list [:ref :form/r]] pair [:ref :form/r]] [:list [:ref :form/r]]
+     (let [p (ex-first-greater xs (form-text (form/nth-of pair 0)) 0)]
+       (ex-slice xs p (vector-count xs) (form/append-form (ex-slice xs 0 p (form/no-forms)) pair))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ex-sorted-pairs [m [:ref :form/r] form [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ j 1) (form/count-of m))
+       acc
+       (let [k (form/nth-of m j)
+             _ (require-k (form/is-keyword? k) "ex-info data map keys must be keywords" "kotoba.error/library-head-shape" form)]
+         (ex-sorted-pairs m form (+ j 2) (ex-insert acc (form/vec2 k (form/nth-of m (+ j 1))))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ex-entry-forms [pairs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count pairs))
+       acc
+       (let [pair (typed-list-nth [:list [:ref :form/r]] pairs i)]
+         (ex-entry-forms pairs (+ i 1)
+                         (form/append-form
+                          (form/append-form acc (form/call1 "document-keyword" (form/nth-of pair 0)))
+                          (form/call1 "__kotoba_document_of" (form/nth-of pair 1)))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ex-document-map [m [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+     (form/form-seq
+      (form/cons-onto (form/symbol-form "document-map")
+                      (ex-entry-forms (ex-sorted-pairs m form 0 (form/no-forms)) 0 (form/no-forms)))))
+   :default nil)
+
+;; The cause arity is refused here exactly as the host twin below and the
+;; monolith (a7ef280 4229-4253) refuse it: `ex-info` takes a message and a
+;; data document, nothing else. This arm had drifted onto the OLDER
+;; cause-preserving rewrite (a `:cause` entry in the document); a cause is
+;; another Throwable, and there is none here to be one.
+#?(:kotoba
+   (defn- ex-info-data-argument [args [:list [:ref :form/r]] form [:ref :form/r]] [:list [:ref :form/r]]
+     (let [n (vector-count args)
+           _ (require-k (= n 2) "ex-info takes a message and a data document; the cause arity has no Throwable to name" "kotoba.error/library-head-shape" form)
+           msg (typed-list-nth [:list [:ref :form/r]] args 0)
+           data (typed-list-nth [:list [:ref :form/r]] args 1)]
+       (if (form/is-map? data)
+         (form/two-forms msg (ex-document-map data form))
+         (form/two-forms msg data))))
+   :default
+(defn ex-info-data-argument
+  "`(ex-info msg data)`'s arguments with a MAP LITERAL `data` written as the
+  `:document` it is: `{:phase :read :path p}` -> `(document-map
+  (document-keyword :phase) (__kotoba_document_of :read) ...)`. A map literal
+  is otherwise a constant document, and a local inside one does not compile
+  (lang/conformance/abort/ex_info_round_trip.kotoba). Keys must be keywords;
+  each value is typed later by `__kotoba_document_of`. Any other `data` is
+  passed through and must already be a `:document`. The one- and
+  three-argument arities are refused: a cause is another Throwable, and there
+  is none here to be one (monolith a7ef280 4229-4253)."
+  [args form]
+  (when-not (= 2 (count args))
+    (reject! "ex-info takes a message and a data document; the cause arity has no Throwable to name"
+             form :kotoba.error/library-head-shape))
+  (let [[msg data] args
+        entries (fn [m]
+                  (when-not (every? keyword? (keys m))
+                    (reject! "ex-info data map keys must be keywords" form :kotoba.error/library-head-shape))
+                  (mapcat (fn [[k v]] [(list 'document-keyword k) (list '__kotoba_document_of v)])
+                          (sort-by (comp str key) m)))]
+    [msg (if (map? data)
+           (apply list 'document-map (entries data))
+           data)])))
+
+;; expand-intrinsic-helper-forms on the Kotoba route: the same renaming over
+;; Form records. The host's `volatile!` of used heads is a second pure pass
+;; (`ih-needed-*`) that visits the same forms (not entering `quote`). The host
+;; keeps `:kotoba.diag/source-head` as metadata on the renamed head; a Form has
+;; no metadata, so that diagnostic spelling is not carried on this route.
+#?(:kotoba
+   (defn- ih-has? [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] :bool
+     (if (>= i (vector-count xs))
+       false
+       (if (form/eq (typed-list-nth [:list [:ref :form/r]] xs i) x)
+         true
+         (ih-has? xs x (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-defined [forms [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count forms))
+       acc
+       (let [f (typed-list-nth [:list [:ref :form/r]] forms i)
+             h (form/nth-of f 0)
+             named (and (form/is-seq? f)
+                        (form/is-symbol? h)
+                        (or (string=? (form/symbol-value h) "defn") (string=? (form/symbol-value h) "defn-"))
+                        (not (form/is-nil? (form/nth-of f 1))))]
+         (ih-defined forms (+ i 1) (if named (form/append-form acc (form/nth-of f 1)) acc)))))
+   :default nil)
+
+;; the table entry [helper [needs...]] of a head, nil for a head the module defines itself
+#?(:kotoba
+   (defn- ih-entry [heads [:ref :form/r] defined [:list [:ref :form/r]] sym [:ref :form/r]] [:ref :form/r]
+     (if (ih-has? defined sym 0) (form/nil-form) (form/form-get heads sym)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-any-head? [heads [:ref :form/r] defined [:list [:ref :form/r]] j :i64] :bool
+     (if (>= (+ j 1) (form/count-of heads))
+       false
+       (if (ih-has? defined (form/nth-of heads j) 0)
+         (ih-any-head? heads defined (+ j 2))
+         true)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-quote? [f [:ref :form/r]] :bool
+     (and (form/is-seq? f)
+          (form/is-symbol? (form/nth-of f 0))
+          (string=? (form/symbol-value (form/nth-of f 0)) "quote")))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-mentions? [heads [:ref :form/r] defined [:list [:ref :form/r]] f [:ref :form/r]] :bool
+     (if (and (form/is-seq? f) (not (form/is-nil? (ih-entry heads defined (form/nth-of f 0)))))
+       true
+       (ih-any-mention? heads defined (form/kids-of f) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-any-mention? [heads [:ref :form/r] defined [:list [:ref :form/r]] kids [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count kids))
+       false
+       (if (ih-mentions? heads defined (typed-list-nth [:list [:ref :form/r]] kids i))
+         true
+         (ih-any-mention? heads defined kids (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-add-all [acc [:list [:ref :form/r]] more [:ref :form/r] i :i64] [:list [:ref :form/r]]
+     (if (>= i (form/count-of more))
+       acc
+       (ih-add-all (if (ih-has? acc (form/nth-of more i) 0) acc (form/append-form acc (form/nth-of more i)))
+                   more (+ i 1))))
+   :default nil)
+
+;; the helpers a call needs: `subvec` with two arguments is `subvec-from`
+#?(:kotoba
+   (defn- ih-note [heads [:ref :form/r] defined [:list [:ref :form/r]] f [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [entry (ih-entry heads defined (form/nth-of f 0))]
+       (if (form/is-nil? entry)
+         acc
+         (let [named (form/symbol-value (form/nth-of entry 0))
+               subvec2 (and (string=? named "__kotoba_intrinsic_subvec")
+                            (= 2 (- (form/count-of f) 1)))
+               subs2 (and (string=? named "__kotoba_intrinsic_subs")
+                          (= 2 (- (form/count-of f) 1)))
+               key (cond
+                     subvec2 (ih-entry heads defined (form/symbol-form "subvec-from"))
+                     subs2 (ih-entry heads defined (form/symbol-form "subs-from"))
+                     :else entry)]
+           (if (form/is-nil? key) acc (ih-add-all acc (form/nth-of key 1) 0))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-needed [heads [:ref :form/r] defined [:list [:ref :form/r]] f [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (ih-quote? f)
+       acc
+       (ih-needed-kids heads defined (form/kids-of f) 0
+                       (if (form/is-seq? f) (ih-note heads defined f acc) acc))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-needed-kids [heads [:ref :form/r] defined [:list [:ref :form/r]] kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (ih-needed-kids heads defined kids (+ i 1)
+                       (ih-needed heads defined (typed-list-nth [:list [:ref :form/r]] kids i) acc))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-rename-call [heads [:ref :form/r] defined [:list [:ref :form/r]] f [:ref :form/r]] [:ref :form/r]
+     (if (= 0 (form/count-of f))
+       f
+       (let [op (form/nth-of f 0)
+             entry (ih-entry heads defined op)
+             named (if (form/is-nil? entry) "" (form/symbol-value (form/nth-of entry 0)))
+             ;; `(subvec v start)` and `(subs s start)` are the arities that
+             ;; name a different helper.
+             helper (cond
+                      (and (string=? named "__kotoba_intrinsic_subvec") (= 2 (- (form/count-of f) 1)))
+                      "__kotoba_intrinsic_subvec_from"
+                      (and (string=? named "__kotoba_intrinsic_subs") (= 2 (- (form/count-of f) 1)))
+                      "__kotoba_intrinsic_subs_from"
+                      :else named)
+             args0 (form/rest-list f)
+             args (if (string=? helper "__kotoba_intrinsic_ex_info") (ex-info-data-argument args0 f) args0)
+             head (if (string=? helper "") (ih-rename heads defined op) (form/symbol-form helper))]
+         (record-assoc [:ref :form/r] f :kids
+                       (form/cons-onto head (ih-rename-kids heads defined args 0 (form/no-forms)))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-rename [heads [:ref :form/r] defined [:list [:ref :form/r]] f [:ref :form/r]] [:ref :form/r]
+     (cond
+       (ih-quote? f) f
+       (form/is-seq? f) (ih-rename-call heads defined f)
+       (or (form/is-vec? f) (form/is-map? f) (form/is-set? f))
+       (record-assoc [:ref :form/r] f :kids (ih-rename-kids heads defined (form/kids-of f) 0 (form/no-forms)))
+       :else f))
+   :default nil)
+
+#?(:kotoba
+   (defn- ih-rename-kids [heads [:ref :form/r] defined [:list [:ref :form/r]] kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (ih-rename-kids heads defined kids (+ i 1)
+                       (form/append-form acc (ih-rename heads defined (typed-list-nth [:list [:ref :form/r]] kids i))))))
+   :default nil)
+
+;; the helper definitions in source order, those `needed`
+#?(:kotoba
+   (defn- ih-append-helpers [order [:ref :form/r] helper-forms [:ref :form/r] needed [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (form/count-of order))
+       acc
+       (let [name (form/nth-of order i)]
+         (ih-append-helpers order helper-forms needed (+ i 1)
+                            (if (ih-has? needed name 0)
+                              (form/append-form acc (form/form-get helper-forms name))
+                              acc)))))
+   :default nil)
+
+#?(:kotoba
+   (defn expand-intrinsic-helper-forms [forms [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [heads (tables/intrinsic-helper-heads)
+           defined (ih-defined forms 0 (form/no-forms))]
+       (if (and (ih-any-head? heads defined 0) (ih-any-mention? heads defined forms 0))
+         (ih-append-helpers (tables/intrinsic-helper-order) (intrinsic-helper-forms)
+                            (ih-needed-kids heads defined forms 0 (form/no-forms)) 0
+                            (ih-rename-kids heads defined forms 0 (form/no-forms)))
+         forms)))
+   :default
+(defn expand-intrinsic-helper-forms
+  "Rename every call to a library head the module does not define itself, and
+  append the helpers those calls need. FORMS unchanged when there are none."
+  [forms]
+  (let [defined (into #{} (keep (fn [f] (when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                                          (second f))))
+                      forms)
+        heads (apply dissoc intrinsic-helper-heads defined)
+        used (volatile! #{})
+        rename (fn rename [form]
+                 (cond
+                   (and (seq? form) (= 'quote (first form))) form
+                   (seq? form)
+                   (let [[op & args] form
+                         helper (when (symbol? op) (first (get heads op)))
+                         ;; `(subvec v start)` and `(subs s start)` are the
+                         ;; arities that name a different helper.
+                         helper (cond
+                                  (and (= helper '__kotoba_intrinsic_subvec) (= 2 (count args)))
+                                  '__kotoba_intrinsic_subvec_from
+                                  (and (= helper '__kotoba_intrinsic_subs) (= 2 (count args)))
+                                  '__kotoba_intrinsic_subs_from
+                                  :else helper)]
+                     (when helper (vswap! used conj (case helper
+                                                      __kotoba_intrinsic_subvec_from 'subvec-from
+                                                      __kotoba_intrinsic_subs_from 'subs-from
+                                                      op)))
+                     (with-meta (apply list (if helper
+                                              (with-meta helper {:kotoba.diag/source-head op})
+                                              (rename op))
+                                       (map rename (if (= helper '__kotoba_intrinsic_ex_info)
+                                                     (ex-info-data-argument args form)
+                                                     args)))
+                       (meta form)))
+                   (vector? form) (with-meta (mapv rename form) (meta form))
+                   (map? form) (with-meta (into {} (map (fn [[k v]] [(rename k) (rename v)])) form)
+                                 (meta form))
+                   (set? form) (with-meta (into #{} (map rename) form) (meta form))
+                   :else form))
+        mentions? (fn [form] (first-truthy #(and (seq? %) (symbol? (first %)) (contains? heads (first %)))
+                                            (tree-seq coll? seq form)))]
+    (if-not (and (seq heads) (first-truthy mentions? forms))
+      forms
+      (let [renamed (mapv rename forms)
+            needed (into #{} (mapcat #(second (get heads %))) @used)]
+        (into renamed
+              (keep (fn [helper] (when (contains? needed helper)
+                                   (get @intrinsic-helper-forms helper))))
+              intrinsic-helper-order))))))
+
+;; ---------------------------------------------------------------------------
+;; Local state -- the atom slice 1 elaboration (kotoba-lang `lang/local-state.edn`).
+;;
+;; `lang/surface-status.edn` `:no-ambient-mutation` bans `atom`/`swap!`/
+;; `reset!` under the invariant that state must not be AMBIENT -- not that
+;; mutation is forbidden. The `:state` capability kit is the admitted model for
+;; state that ESCAPES or PERSISTS. It is the wrong model for
+;;
+;;     (let [a (atom 0)] (swap! a + 1) @a)
+;;
+;; which needs no host, no grant and no runtime cell: the atom is born and dies
+;; inside one function body, so the compiler can see every write. This slice
+;; admits exactly that shape and compiles it away.
+;;
+;; A cell is NOT a value. The binding name introduced by `(atom init)` may
+;; appear only as the first argument of `swap!` / `reset!` / `deref` (`@a`
+;; reads as `(clojure.core/deref a)` on the JVM reader, which is normalised
+;; here). Every other mention -- passed as an argument, returned, stored,
+;; captured by `fn`, read inside `loop`/`doseq`/`dotimes` -- is refused by the
+;; escape rule below, which is what keeps the state non-ambient: nothing can
+;; observe it except the straight-line code that owns it.
+;;
+;; The elaboration is state passing. The cell becomes an ordinary let-bound
+;; value, REBOUND after every write; `deref` reads the current binding;
+;; `swap!`/`reset!` evaluate to the new value (Clojure's own answer). Where a
+;; branch writes, the branching form is emitted ONCE PER MUTATED CELL plus once
+;; for its own value, and the enclosing scope rebinds each cell from its copy:
+;;
+;;     (let [a (atom 0)] (if c (swap! a + 10) (reset! a 5)) (+ @a 1))
+;;
+;;     (let [__kotoba_cell_1_2_a 0
+;;           __kotoba_cell_1_5_a (if c (let [__kotoba_cell_1_3_a (+ __kotoba_cell_1_2_a 10)]
+;;                                       __kotoba_cell_1_3_a)
+;;                                     (let [__kotoba_cell_1_4_a 5] __kotoba_cell_1_4_a))
+;;           ...]
+;;       (+ __kotoba_cell_1_5_a 1))
+;;
+;; Copying a branch is sound because Kotoba branches are pure -- the copies
+;; compute the same values and differ only in which one they project. The one
+;; observable exception is a capability call, so a branch that both writes a
+;; cell and calls a capability is refused rather than duplicated.
+;;
+;; Nothing is added to the effect row: the cell does not exist at runtime and
+;; there is no authority to declare. `:named-operations` gains `:local-state`
+;; so the elaboration is still visible in `check` output and provenance.
+;;
+;; A program with no `atom` / `swap!` / `reset!` / `deref` skips this pass
+;; entirely (`local-state-source?`), so its lowering is byte-for-byte what it
+;; was -- pinned by a golden in `test/kotoba/compiler/local_state_test.cljk`.
+
+#?(:kotoba nil :default
+(def ^:dynamic *local-state-used*
+  "Set once per analyze when an atom cell is elaborated, so `:named-operations`
+  can carry `:local-state`. Created outside the desugaring `binding` in
+  `analyze*` for the same reason `used-capabilities` is."
+  nil))
+
+#?(:kotoba nil :default
+(def ^:dynamic *local-state-ids*
+  "Per-function counter behind cell binding names. Deterministic (a function of
+  the source), never `gensym`, for the reason `*synthetic-counter*` gives."
+  nil))
+
+(def local-state-note
+  "atom slice 1 admits swap!/reset!/deref in straight-line code of the binding function only")
+
+#?(:kotoba nil :default (def local-state-write-heads tables/local-state-write-heads))
+
+#?(:kotoba nil :default (def local-state-scope-heads tables/local-state-scope-heads))
+
+#?(:kotoba nil :default (def local-state-conditional-heads tables/local-state-conditional-heads))
+
+#?(:kotoba nil :default (def local-state-effect-heads tables/local-state-effect-heads))
+
+;; ---------------------------------------------------------------------------
+;; Local state (atom slice 1) on the Kotoba route.
+;;
+;; The same elaboration as the host functions below, over Form records. The
+;; host reads three dynamic vars (`*local-state-ids*` the per-function id
+;; counter, `*local-state-used*` the "an atom was elaborated" flag,
+;; `*synthetic-counter*` behind `synthetic`); here they are the record :ls/s
+;; threaded through every step, with the desugar env (its :counter is the
+;; synthetic counter) inside. A step answers :ls/r: the bindings the enclosing
+;; scope must emit first, the value, the cells afterwards and the state. CELLS is a
+;; Form map: cell symbol -> [id current-symbol]. AUX carries what a step
+;; also reports (the arm that produced a branch; the cells a join changed).
+;; A refusal is a `throw` of :fe/err bound in a `let`, never a statement before a loop.
+;; ---------------------------------------------------------------------------
+#?(:kotoba
+   (defn fl-nth [xs [:list [:ref :form/r]] i :i64] [:ref :form/r] (typed-list-nth [:list [:ref :form/r]] xs i))
+   :default nil)
+
+#?(:kotoba
+   (defn- fd-vec [f [:ref :form/r] i :i64 acc :document] :document
+     (if (>= i (form/count-of f))
+       acc
+       (fd-vec f (+ i 1) (document-vector-conj acc (form->document (form/nth-of f i))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- fd-map [f [:ref :form/r] i :i64 acc :document] :document
+     (if (>= (+ i 1) (form/count-of f))
+       acc
+       (fd-map f (+ i 2) (document-assoc acc (form->document (form/nth-of f i)) (form->document (form/nth-of f (+ i 1)))))))
+   :default nil)
+
+;; the items of a set Form sorted by their printed text (`canonical-text` sorts a set that way)
+#?(:kotoba
+   (defn- fd-first-greater [xs [:list [:ref :form/r]] text :string i :i64] :i64
+     (if (>= i (vector-count xs))
+       i
+       (if (> (string-compare (pr-form (fl-nth xs i)) text) 0) i (fd-first-greater xs text (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- fd-sorted [f [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (form/count-of f))
+       acc
+       (let [x (form/nth-of f i)
+             p (fd-first-greater acc (pr-form x) 0)]
+         (fd-sorted f (+ i 1) (fl-slice acc p (vector-count acc) (form/append-form (fl-slice acc 0 p (form/no-forms)) x))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- fd-vec-of [xs [:list [:ref :form/r]] i :i64 acc :document] :document
+     (if (>= i (vector-count xs))
+       acc
+       (fd-vec-of xs (+ i 1) (document-vector-conj acc (form->document (fl-nth xs i))))))
+   :default nil)
+
+;; a Form as the :document the artifact digest is taken over (a list reads as a vector, a
+;; set as a vector sorted by its items' text, f64 and bytes forms as nil)
+#?(:kotoba
+   (defn form->document [f [:ref :form/r]] :document
+     (cond
+       (form/is-nil? f) (document-null)
+       (form/is-bool? f) (document-bool (form/bool-value f))
+       (form/is-int? f) (document-i64 (form/int-value f))
+       (form/is-string? f) (document-string (form/string-value f))
+       (form/is-keyword? f) (document-keyword (form/keyword-value f))
+       (form/is-symbol? f) (document-symbol (symbol (form/symbol-value f)))
+       (form/is-map? f) (fd-map f 0 (document-map))
+       (form/is-set? f) (fd-vec-of (fd-sorted f 0 (form/no-forms)) 0 (document-vector))
+       (or (form/is-seq? f) (form/is-vec? f)) (fd-vec f 0 (document-vector))
+       :else (document-null)))
+   :default nil)
+
+#?(:kotoba
+   (defn fl-add [xs [:list [:ref :form/r]] x [:ref :form/r]] [:list [:ref :form/r]]
+     (if (fl-has? xs x 0) xs (form/append-form xs x)))
+   :default nil)
+
+;; ---- generic Form helpers shared by the pass modules (Kotoba route) ----
+;; The host keeps dynamic data in Clojure maps/lists/symbol metadata; here it is a Form tree.
+;; Metadata has two in-band slots: a seq Form's :s carries the head the author wrote when a
+;; pure-head rewrite replaced it (host: meta :kotoba/pure-source-head), and a symbol Form's :n
+;; is 1 when the author wrote it ^:private (host: meta :private).
+
+;; fget / fhas? read a keyword key without minting its Form (agent ARENA 2026-10-04: the minted key was ~20% of the
+;; native analyze's pairs); the same answers as form-get / form-has? on (keyword-form key): the first even-index kid
+;; that is a keyword equal to KEY.
+#?(:kotoba
+   (defn fkw-index [kids [:list [:ref :form/r]] key :keyword] :i64
+     (let [n (vector-count kids)]
+       (loop [j 0]
+         (if (>= (+ j 1) n)
+           -1
+           (let [x (typed-list-nth [:list [:ref :form/r]] kids j)]
+             (if (and (form/is-keyword? x) (= (form/keyword-value x) key))
+               j
+               (recur (+ j 2))))))))
+   :default nil)
+
+;; the value of a keyword key in a Form map (nil when absent)
+#?(:kotoba
+   (defn fget [m [:ref :form/r] key :keyword] [:ref :form/r]
+     (let [kids (form/kids-of m) j (fkw-index kids key)]
+       (if (< j 0) (form/nil-form) (typed-list-nth [:list [:ref :form/r]] kids (+ j 1)))))
+   :default nil)
+
+;; M with KEY bound to V
+#?(:kotoba
+   (defn fput [m [:ref :form/r] key :keyword v [:ref :form/r]] [:ref :form/r]
+     (form/assoc-form m (form/keyword-form key) v))
+   :default nil)
+
+#?(:kotoba
+   (defn fhas? [m [:ref :form/r] key :keyword] :bool
+     (>= (fkw-index (form/kids-of m) key) 0))
+   :default nil)
+
+;; Clojure truthiness of a Form: neither nil nor false
+#?(:kotoba
+   (defn ftruthy? [f [:ref :form/r]] :bool
+     (and (not (form/is-nil? f)) (not (and (form/is-bool? f) (not (form/bool-value f))))))
+   :default nil)
+
+;; the kids of F from index N, as a list
+#?(:kotoba
+   (defn fdrop [f [:ref :form/r] n :i64] [:list [:ref :form/r]]
+     (fl-slice (form/kids-of f) n (form/count-of f) (form/no-forms)))
+   :default nil)
+
+;; the same slice of a list
+#?(:kotoba
+   (defn fl-drop [xs [:list [:ref :form/r]] n :i64] [:list [:ref :form/r]]
+     (fl-slice xs n (vector-count xs) (form/no-forms)))
+   :default nil)
+
+#?(:kotoba
+   (defn fkw [text :string] [:ref :form/r]
+     (form/keyword-form (keyword-from-string text)))
+   :default nil)
+
+#?(:kotoba
+   (defn fsym [text :string] [:ref :form/r]
+     (form/symbol-form text))
+   :default nil)
+
+;; `(name x)`: the part of a symbol or keyword after its namespace
+#?(:kotoba
+   (defn fname [f [:ref :form/r]] :string
+     (let [t (if (form/is-keyword? f) (form-text f) (form/symbol-value f))
+           body (if (form/is-keyword? f) (string-substring t 1 (string-length t)) t)
+           slash (string-find-byte body 47 0)]
+       (if (or (< slash 0) (= (string-length body) 1))
+         body
+         (string-substring body (+ slash 1) (string-length body)))))
+   :default nil)
+
+;; `(namespace x)`: the part before the slash, "" when there is none
+#?(:kotoba
+   (defn fnamespace [f [:ref :form/r]] :string
+     (let [t (if (form/is-keyword? f) (form-text f) (form/symbol-value f))
+           body (if (form/is-keyword? f) (string-substring t 1 (string-length t)) t)
+           slash (string-find-byte body 47 0)]
+       (if (or (< slash 1) (= (string-length body) 1))
+         ""
+         (string-substring body 0 slash))))
+   :default nil)
+
+;; the head symbol's text of a seq Form, "" when it has none
+#?(:kotoba
+   (defn fhead [f [:ref :form/r]] :string
+     (if (and (form/is-seq? f) (> (form/count-of f) 0) (form/is-symbol? (form/nth-of f 0)))
+       (form/symbol-value (form/nth-of f 0))
+       ""))
+   :default nil)
+
+;; a list form headed by the symbol NAME
+#?(:kotoba
+   (defn fhead-is? [f [:ref :form/r] name :string] :bool
+     (string=? (fhead f) name))
+   :default nil)
+
+;; the metadata the host copies from SOURCE onto RESULT: the span, and for two seq forms the
+;; source head slot
+#?(:kotoba
+   (defn fmeta-from [source [:ref :form/r] result [:ref :form/r]] [:ref :form/r]
+     (let [r1 (if (= 0 (form/span-of source)) result (record-assoc [:ref :form/r] result :span (form/span-of source)))]
+       (if (and (form/is-seq? source) (form/is-seq? result) (not (string=? (record-get [:ref :form/r] source :s) "")))
+         (record-assoc [:ref :form/r] r1 :s (record-get [:ref :form/r] source :s))
+         r1)))
+   :default nil)
+
+;; a seq Form of ITEMS carrying SOURCE's metadata
+#?(:kotoba
+   (defn frebuild-seq [source [:ref :form/r] items [:list [:ref :form/r]]] [:ref :form/r]
+     (fmeta-from source (form/form-seq items)))
+   :default nil)
+
+;; the head the author wrote when a pure-head rewrite replaced a form ("" when it did not)
+#?(:kotoba
+   (defn fsource-head [f [:ref :form/r]] :string
+     (if (form/is-seq? f) (record-get [:ref :form/r] f :s) ""))
+   :default nil)
+
+#?(:kotoba
+   (defn fwith-source-head [f [:ref :form/r] head :string] [:ref :form/r]
+     (record-assoc [:ref :form/r] f :s head))
+   :default nil)
+
+#?(:kotoba
+   (defn fprivate-symbol? [f [:ref :form/r]] :bool
+     (and (form/is-symbol? f) (= 1 (form/int-value f))))
+   :default nil)
+
+;; the symbols of PATTERN other than `&` (`binding-symbols`), distinct
+#?(:kotoba
+   (defn fsymbols-into [f [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (form/is-symbol? f)
+       (if (string=? (form/symbol-value f) "&") acc (fl-add acc f))
+       (fsymbols-kids (form/kids-of f) 0 acc)))
+   :default nil)
+
+#?(:kotoba
+   (defn- fsymbols-kids [kids [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (fsymbols-kids kids (+ i 1) (fsymbols-into (fl-nth kids i) acc))))
+   :default nil)
+
+;; every element of the Form collection F is distinct from the others
+#?(:kotoba
+   (defn fdistinct? [f [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of f))
+       true
+       (and (not (fl-has? (form/kids-of f) (form/nth-of f i) (+ i 1)))
+            (fdistinct? f (+ i 1)))))
+   :default nil)
+
+;; the elements of the list XS from I: the same element does not occur before I
+#?(:kotoba
+   (defn fl-distinct? [xs [:list [:ref :form/r]]] :bool
+     (fdistinct? (form/form-vec xs) 0))
+   :default nil)
+
+;; a count as text
+#?(:kotoba
+   (defn fcount-text [f [:ref :form/r]] :string
+     (string-from-i64 (form/count-of f)))
+   :default nil)
+
+
+
+#?(:kotoba
+   (defn- pr-kids [f [:ref :form/r] i :i64 sep :string acc :string] :string
+     (if (>= i (form/count-of f))
+       acc
+       (pr-kids f (+ i 1) sep (string-concat (if (> i 0) (string-concat acc sep) acc) (pr-form (form/nth-of f i))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- pr-map-entries [f [:ref :form/r] i :i64 acc :string] :string
+     (if (>= (+ i 1) (form/count-of f))
+       acc
+       (pr-map-entries f (+ i 2)
+                       (string-concat (if (> i 0) (string-concat acc ", ") acc)
+                                      (string-concat (pr-form (form/nth-of f i)) (string-concat " " (pr-form (form/nth-of f (+ i 1)))))))))
+   :default nil)
+
+;; a printer for the few forms a refusal message quotes (`pr-str`)
+#?(:kotoba
+   (defn pr-form [f [:ref :form/r]] :string
+     (cond
+       (form/is-nil? f) "nil"
+       (form/is-bool? f) (if (form/bool-value f) "true" "false")
+       (form/is-int? f) (string-from-i64 (form/int-value f))
+       (form/is-string? f) (string-concat "\"" (string-concat (form/string-value f) "\""))
+       (form/is-keyword? f) (form-text f)
+       (form/is-symbol? f) (form/symbol-value f)
+       (form/is-seq? f) (string-concat "(" (string-concat (pr-kids f 0 " " "") ")"))
+       (form/is-vec? f) (string-concat "[" (string-concat (pr-kids f 0 " " "") "]"))
+       (form/is-set? f) (string-concat "#{" (string-concat (pr-kids f 0 " " "") "}"))
+       (form/is-map? f) (string-concat "{" (string-concat (pr-map-entries f 0 "") "}"))
+       :else "?"))
+   :default nil)
+
+#?(:kotoba
+   (defn simple-symbol-form? [f [:ref :form/r]] :bool
+     (and (form/is-symbol? f)
+          (or (< (string-find-byte (form/symbol-value f) 47 0) 0)
+              (string=? (form/symbol-value f) "/"))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-s [env [:ref :fe/env] ids :i64 used :bool] [:ref :ls/s] (record-new [:ref :ls/s] env ids used))
+   :default nil)
+#?(:kotoba
+   (defn- ls-st-env [s [:ref :ls/s]] [:ref :fe/env] (record-get [:ref :ls/s] s :env))
+   :default nil)
+#?(:kotoba
+   (defn- ls-st-ids [s [:ref :ls/s]] :i64 (record-get [:ref :ls/s] s :ids))
+   :default nil)
+#?(:kotoba
+   (defn- ls-st-used [s [:ref :ls/s]] :bool (record-get [:ref :ls/s] s :used))
+   :default nil)
+#?(:kotoba
+   (defn- ls-r [bindings [:list [:ref :form/r]] value [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s] aux [:ref :form/r]] [:ref :ls/r]
+     (record-new [:ref :ls/r] bindings value cells st aux))
+   :default nil)
+#?(:kotoba
+   (defn- ls-bindings [r [:ref :ls/r]] [:list [:ref :form/r]] (record-get [:ref :ls/r] r :bindings))
+   :default nil)
+#?(:kotoba
+   (defn- ls-value [r [:ref :ls/r]] [:ref :form/r] (record-get [:ref :ls/r] r :value))
+   :default nil)
+#?(:kotoba
+   (defn- ls-cells [r [:ref :ls/r]] [:ref :form/r] (record-get [:ref :ls/r] r :cells))
+   :default nil)
+#?(:kotoba
+   (defn- ls-st [r [:ref :ls/r]] [:ref :ls/s] (record-get [:ref :ls/r] r :st))
+   :default nil)
+#?(:kotoba
+   (defn- ls-aux [r [:ref :ls/r]] [:ref :form/r] (record-get [:ref :ls/r] r :aux))
+   :default nil)
+#?(:kotoba
+   (defn- ls-no-cells [] [:ref :form/r] (form/form-map (form/no-forms)))
+   :default nil)
+
+;; ---- the node tests ----
+#?(:kotoba
+   (defn- ls-head [f [:ref :form/r]] [:ref :form/r]
+     (if (and (form/is-seq? f) (> (form/count-of f) 0)) (form/nth-of f 0) (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-deref-head? [head [:ref :form/r]] :bool
+     (and (form/is-symbol? head)
+          (or (string=? (form/symbol-value head) "deref") (string=? (form/symbol-value head) "clojure.core/deref"))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-sym? [f [:ref :form/r] text :string] :bool
+     (and (form/is-symbol? f) (string=? (form/symbol-value f) text)))
+   :default nil)
+
+;; KIND 0 the slice is mentioned, 1 a cell is written, 2 a cell is read, 3 a capability may run
+#?(:kotoba
+   (defn- ls-node? [kind :i64 node [:ref :form/r]] :bool
+     (let [head (ls-head node)]
+       (if (form/is-nil? head)
+         false
+         (cond
+           (= kind 0) (or (tables/local-state-write-heads-has? head) (ls-deref-head? head))
+           (= kind 1) (tables/local-state-write-heads-has? head)
+           (= kind 2) (ls-deref-head? head)
+           :else (or (tables/local-state-effect-heads-has? head)
+                     (tables/table-has? (source-operation-registry) head))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-scan? [kind :i64 f [:ref :form/r]] :bool
+     (if (ls-node? kind f) true (ls-scan-kids? kind (form/kids-of f) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-scan-kids? [kind :i64 kids [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count kids))
+       false
+       (if (ls-scan? kind (fl-nth kids i)) true (ls-scan-kids? kind kids (+ i 1)))))
+   :default nil)
+
+;; the first node that is a symbol naming a cell, in the order `tree-seq` visits (nil when none)
+#?(:kotoba
+   (defn- ls-mention [f [:ref :form/r] cells [:ref :form/r]] [:ref :form/r]
+     (if (and (form/is-symbol? f) (not (form/is-nil? (form/form-get cells f))))
+       f
+       (ls-mention-kids (form/kids-of f) 0 cells)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-mention-kids [kids [:list [:ref :form/r]] i :i64 cells [:ref :form/r]] [:ref :form/r]
+     (if (>= i (vector-count kids))
+       (form/nil-form)
+       (let [m (ls-mention (fl-nth kids i) cells)]
+         (if (form/is-nil? m) (ls-mention-kids kids (+ i 1) cells) m))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-source? [f [:ref :form/r]] :bool (ls-scan? 0 f))
+   :default nil)
+#?(:kotoba
+   (defn- ls-writes? [f [:ref :form/r]] :bool (ls-scan? 1 f))
+   :default nil)
+#?(:kotoba
+   (defn- ls-reads? [f [:ref :form/r]] :bool (ls-scan? 2 f))
+   :default nil)
+#?(:kotoba
+   (defn- ls-effectful? [f [:ref :form/r]] :bool (ls-scan? 3 f))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-touches? [f [:ref :form/r] cells [:ref :form/r]] :bool
+     (or (ls-writes? f) (ls-reads? f) (not (form/is-nil? (ls-mention f cells)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-escape [name [:ref :form/r] form [:ref :form/r]] :i64
+     (throw (fe-reject (str "atom `" (form-text name) "` escapes its let scope (" local-state-note ")")
+                       "kotoba.error/local-state-escape" form)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-position [head [:ref :form/r] form [:ref :form/r]] :i64
+     (throw (fe-reject (str "swap!/reset! is not admitted inside `" (form-text head)
+                            "` (atom slice 1 admits them in let, do, if, when, cond and case only)")
+                       "kotoba.error/local-state-position" form)))
+   :default nil)
+
+;; the symbol currently holding CELL's value
+#?(:kotoba
+   (defn- ls-cell-ref [op :string target [:ref :form/r] cells [:ref :form/r] form [:ref :form/r]] [:ref :form/r]
+     (let [_ (require-k (and (simple-symbol-form? target) (not (form/is-nil? (form/form-get cells target))))
+                        (str op " expects a let-bound atom cell as its first argument; got `" (pr-form target) "` (atom slice 1)")
+                        "kotoba.error/local-state-not-a-cell" form)]
+       (form/nth-of (form/form-get cells target) 1)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-wrap [bindings [:list [:ref :form/r]] value [:ref :form/r]] [:ref :form/r]
+     (if (> (vector-count bindings) 0)
+       (form/call2 "let" (form/form-vec bindings) value)
+       value))
+   :default nil)
+
+;; a new binding symbol for CELL; the id is stable across rebindings
+#?(:kotoba
+   (defn- ls-fresh [cells [:ref :form/r] name [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [old (form/form-get cells name)
+           has (not (form/is-nil? old))
+           ids0 (ls-st-ids st)
+           id (if has (form/int-value (form/nth-of old 0)) (+ ids0 1))
+           ids1 (if has ids0 (+ ids0 1))
+           n (+ ids1 1)
+           sym (form/symbol-form (str "__kotoba_cell_" (string-from-i64 id) "_" (string-from-i64 n) "_" (form-text name)))]
+       (ls-r (form/no-forms) sym (form/assoc-form cells name (form/vec2 (form/int-form id) sym))
+             (ls-s (ls-st-env st) n (ls-st-used st)) (form/nil-form))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-synth [st [:ref :ls/s] prefix :string] [:ref :ls/r]
+     (let [d (synthetic (ls-st-env st) prefix)]
+       (ls-r (form/no-forms) (record-get [:ref :fe/dr] d :form) (ls-no-cells)
+             (ls-s (record-get [:ref :fe/dr] d :env) (ls-st-ids st) (ls-st-used st)) (form/nil-form))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-with-st [r [:ref :ls/r] st [:ref :ls/s]] [:ref :ls/r]
+     (ls-r (ls-bindings r) (ls-value r) (ls-cells r) st (ls-aux r)))
+   :default nil)
+
+;; ---- changed cells, ordered by id ----
+#?(:kotoba
+   (defn- ls-id-of [cells [:ref :form/r] name [:ref :form/r]] :i64
+     (form/int-value (form/nth-of (form/form-get cells name) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn fl-has? [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] :bool
+     (if (>= i (vector-count xs))
+       false
+       (if (form/eq (fl-nth xs i) x) true (fl-has? xs x (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-first-after [xs [:list [:ref :form/r]] cells [:ref :form/r] id :i64 i :i64] :i64
+     (if (>= i (vector-count xs))
+       i
+       (if (> (ls-id-of cells (fl-nth xs i)) id) i (ls-first-after xs cells id (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn fl-slice [xs [:list [:ref :form/r]] from :i64 to :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= from to)
+       acc
+       (fl-slice xs (+ from 1) to (form/append-form acc (fl-nth xs from)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-insert-by-id [xs [:list [:ref :form/r]] cells [:ref :form/r] x [:ref :form/r]] [:list [:ref :form/r]]
+     (if (fl-has? xs x 0)
+       xs
+       (let [p (ls-first-after xs cells (ls-id-of cells x) 0)]
+         (fl-slice xs p (vector-count xs) (form/append-form (fl-slice xs 0 p (form/no-forms)) x)))))
+   :default nil)
+
+;; the cells of BEFORE whose binding AFTER moved, added to ACC (ordered by cell id)
+#?(:kotoba
+   (defn- ls-changed-into [before [:ref :form/r] after [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ j 1) (form/count-of before))
+       acc
+       (let [name (form/nth-of before j)
+             b (form/nth-of (form/form-get before name) 1)
+             a-entry (form/form-get after name)
+             a (if (form/is-nil? a-entry) (form/nil-form) (form/nth-of a-entry 1))]
+         (ls-changed-into before after (+ j 2)
+                          (if (form/eq b a) acc (ls-insert-by-id acc before name))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-changed [before [:ref :form/r] after [:ref :form/r]] [:list [:ref :form/r]]
+     (ls-changed-into before after 0 (form/no-forms)))
+   :default nil)
+
+;; ---- substitution inside a subtree that does not write ----
+#?(:kotoba
+   (defn- ls-subst [form [:ref :form/r] cells [:ref :form/r]] [:ref :form/r]
+     (cond
+       (form/is-seq? form)
+       (let [head (ls-head form)]
+         (cond
+           (ls-deref-head? head)
+           (let [_ (require-k (= 2 (form/count-of form)) "deref takes exactly one argument (atom slice 1)"
+                              "kotoba.error/local-state-arity" form)]
+             (ls-cell-ref "deref" (form/nth-of form 1) cells form))
+
+           (tables/local-state-scope-heads-has? head)
+           (let [m (ls-mention form cells)
+                 _ (require-k (form/is-nil? m)
+                              (str "atom `" (form-text m) "` escapes its let scope (" local-state-note ")")
+                              "kotoba.error/local-state-escape" form)]
+             form)
+
+           :else
+           (record-assoc [:ref :form/r] form :kids (ls-subst-kids (form/kids-of form) 0 cells (form/no-forms)))))
+
+       (or (form/is-vec? form) (form/is-set? form) (form/is-map? form))
+       (record-assoc [:ref :form/r] form :kids (ls-subst-kids (form/kids-of form) 0 cells (form/no-forms)))
+
+       (form/is-symbol? form)
+       (let [_ (require-k (form/is-nil? (form/form-get cells form))
+                          (str "atom `" (form-text form) "` escapes its let scope (" local-state-note ")")
+                          "kotoba.error/local-state-escape" form)]
+         form)
+
+       :else form))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-subst-kids [kids [:list [:ref :form/r]] i :i64 cells [:ref :form/r] acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count kids))
+       acc
+       (ls-subst-kids kids (+ i 1) cells (form/append-form acc (ls-subst (fl-nth kids i) cells)))))
+   :default nil)
+
+;; ---- the transformation ----
+;; the items in order, threading the cells; value is the Form vector of the item values
+#?(:kotoba
+   (defn- ls-tx-items [items [:list [:ref :form/r]] i :i64 bindings [:list [:ref :form/r]] values [:list [:ref :form/r]] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (if (>= i (vector-count items))
+       (ls-r bindings (form/form-vec values) cells st (form/nil-form))
+       (let [res (ls-tx (fl-nth items i) cells st)]
+         (ls-tx-items items (+ i 1) (form/append-many bindings (ls-bindings res))
+                      (form/append-form values (ls-value res)) (ls-cells res) (ls-st res)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-swap [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [_ (require-k (>= (form/count-of form) 3)
+                        "swap! takes a cell, a function, and that function's extra arguments (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           target (form/nth-of form 1)
+           current (ls-cell-ref "swap!" target cells form)
+           fargs (fl-slice (form/kids-of form) 2 (form/count-of form) (form/no-forms))
+           _ (require-k (not (ls-scan-kids? 1 fargs 0))
+                        (str "a swap! argument must not write another atom (" local-state-note ")")
+                        "kotoba.error/local-state-position" form)
+           applied (ls-tx-items fargs 0 (form/no-forms) (form/no-forms) cells st)
+           items (form/kids-of (ls-value applied))
+           fresh (ls-fresh (ls-cells applied) target (ls-st applied))
+           sym (ls-value fresh)
+           call (form/form-seq (form/cons-onto (fl-nth items 0) (form/cons-onto current (form/rest-list (ls-value applied)))))]
+       (ls-r (form/append-form (form/append-form (ls-bindings applied) sym) call)
+             sym (ls-cells fresh) (ls-st fresh) (form/nil-form))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-reset [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [_ (require-k (= 3 (form/count-of form)) "reset! takes a cell and one value (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           target (form/nth-of form 1)
+           value (form/nth-of form 2)
+           _ (ls-cell-ref "reset!" target cells form)
+           _ (require-k (not (ls-writes? value))
+                        (str "a reset! value must not write another atom (" local-state-note ")")
+                        "kotoba.error/local-state-position" form)
+           res (ls-tx value cells st)
+           fresh (ls-fresh (ls-cells res) target (ls-st res))
+           sym (ls-value fresh)]
+       (ls-r (form/append-form (form/append-form (ls-bindings res) sym) (ls-value res))
+             sym (ls-cells fresh) (ls-st fresh) (form/nil-form))))
+   :default nil)
+
+
+;; one branching form from the tail of each arm. KIND 0 `if`, 1 `case` (TESTS the
+;; constants, DEFAULT? whether the last tail is the default).
+#?(:kotoba
+   (defn- ls-case-clauses [tests [:list [:ref :form/r]] tails [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count tests))
+       acc
+       (ls-case-clauses tests tails (+ i 1)
+                        (form/append-form (form/append-form acc (fl-nth tests i)) (fl-nth tails i)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-assemble [kind :i64 scrutinee [:ref :form/r] tails [:list [:ref :form/r]] tests [:list [:ref :form/r]] default? :bool] [:ref :form/r]
+     (if (= kind 0)
+       (form/call3 "if" scrutinee (fl-nth tails 0) (fl-nth tails 1))
+       (let [clauses (ls-case-clauses tests tails 0 (form/no-forms))
+             all (if default? (form/append-form clauses (fl-nth tails (- (vector-count tails) 1))) clauses)]
+         (form/form-seq (form/cons-onto (form/symbol-form "case") (form/cons-onto scrutinee all))))))
+   :default nil)
+
+;; the arms' tails: each arm's bindings wrapped around its value
+#?(:kotoba
+   (defn- ls-tails [branches [:list [:ref :ls/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count branches))
+       acc
+       (let [b (typed-list-nth [:list [:ref :ls/r]] branches i)]
+         (ls-tails branches (+ i 1) (form/append-form acc (ls-wrap (ls-bindings b) (ls-value b)))))))
+   :default nil)
+
+;; the tails projecting CELL
+#?(:kotoba
+   (defn- ls-cell-tails [branches [:list [:ref :ls/r]] cell [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count branches))
+       acc
+       (let [b (typed-list-nth [:list [:ref :ls/r]] branches i)]
+         (ls-cell-tails branches cell (+ i 1)
+                        (form/append-form acc (ls-wrap (ls-bindings b) (form/nth-of (form/form-get (ls-cells b) cell) 1)))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-union-by-id [acc [:list [:ref :form/r]] cells [:ref :form/r] more [:list [:ref :form/r]] i :i64] [:list [:ref :form/r]]
+     (if (>= i (vector-count more))
+       acc
+       (ls-union-by-id (ls-insert-by-id acc cells (fl-nth more i)) cells more (+ i 1))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-changed-of-branches [cells-in [:ref :form/r] branches [:list [:ref :ls/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count branches))
+       acc
+       (ls-changed-of-branches cells-in branches (+ i 1)
+                               (ls-union-by-id acc cells-in (ls-changed cells-in (ls-cells (typed-list-nth [:list [:ref :ls/r]] branches i))) 0))))
+   :default nil)
+
+;; the projections: one copy of the branching form per mutated cell
+#?(:kotoba
+   (defn- ls-projections [changed [:list [:ref :form/r]] i :i64 branches [:list [:ref :ls/r]] kind :i64 scrutinee [:ref :form/r] tests [:list [:ref :form/r]] default? :bool cs [:ref :form/r] st [:ref :ls/s] acc [:list [:ref :form/r]]] [:ref :ls/r]
+     (if (>= i (vector-count changed))
+       (ls-r acc (form/nil-form) cs st (form/nil-form))
+       (let [cell (fl-nth changed i)
+             fresh (ls-fresh cs cell st)
+             sym (ls-value fresh)
+             tails (ls-cell-tails branches cell 0 (form/no-forms))]
+         (ls-projections changed (+ i 1) branches kind scrutinee tests default? (ls-cells fresh) (ls-st fresh)
+                         (form/append-form (form/append-form acc sym)
+                                           (ls-assemble kind scrutinee tails tests default?))))))
+   :default nil)
+
+;; the shared tail of every branching join
+#?(:kotoba
+   (defn- ls-branch-copies [cells-in [:ref :form/r] branches [:list [:ref :ls/r]] kind :i64 scrutinee [:ref :form/r] tests [:list [:ref :form/r]] default? :bool st [:ref :ls/s]] [:ref :ls/r]
+     (let [changed (ls-changed-of-branches cells-in branches 0 (form/no-forms))]
+       (if (= 0 (vector-count changed))
+         (ls-r (form/no-forms)
+               (ls-assemble kind scrutinee (ls-tails branches 0 (form/no-forms)) tests default?)
+               cells-in st (form/form-vec changed))
+         (let [proj (ls-projections changed 0 branches kind scrutinee tests default? cells-in st (form/no-forms))
+               value-sym (ls-synth (ls-st proj) "cellvalue")]
+           (ls-r (form/append-form (form/append-form (ls-bindings proj) (ls-value value-sym))
+                                   (ls-assemble kind scrutinee (ls-tails branches 0 (form/no-forms)) tests default?))
+                 (ls-value value-sym) (ls-cells proj) (ls-st value-sym) (form/form-vec changed))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-guard-branch [branch [:ref :ls/r] cells-in [:ref :form/r] form [:ref :form/r]] :i64
+     (require-k (not (and (> (vector-count (ls-changed cells-in (ls-cells branch))) 0)
+                          (ls-effectful? (ls-aux branch))))
+                (str "a branch that writes an atom must not contain a capability call"
+                     " (atom slice 1 elaborates the branch once per cell)")
+                "kotoba.error/local-state-effectful-branch" form))
+   :default nil)
+
+;; transform each arm against the post-scrutinee cells, threading the state
+#?(:kotoba
+   (defn- ls-tx-arms [arms [:list [:ref :form/r]] i :i64 cells [:ref :form/r] form [:ref :form/r] st [:ref :ls/s] acc [:list [:ref :ls/r]]] [:list [:ref :ls/r]]
+     (if (>= i (vector-count arms))
+       acc
+       (let [arm (fl-nth arms i)
+             res (ls-tx arm cells st)
+             branch (ls-r (ls-bindings res) (ls-value res) (ls-cells res) (ls-st res) arm)
+             _ (ls-guard-branch branch cells form)]
+         (ls-tx-arms arms (+ i 1) cells form (ls-st res) (typed-list-conj [:list [:ref :ls/r]] acc branch)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-last-st [branches [:list [:ref :ls/r]] st [:ref :ls/s]] [:ref :ls/s]
+     (if (= 0 (vector-count branches))
+       st
+       (ls-st (typed-list-nth [:list [:ref :ls/r]] branches (- (vector-count branches) 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-coll? [f [:ref :form/r]] :bool
+     (or (form/is-seq? f) (form/is-vec? f) (form/is-set? f) (form/is-map? f)))
+   :default nil)
+
+;; shared driver for `if` and `case`
+#?(:kotoba
+   (defn- ls-tx-branching [scrutinee [:ref :form/r] arms [:list [:ref :form/r]] kind :i64 tests [:list [:ref :form/r]] default? :bool cells [:ref :form/r] form [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [head (ls-tx scrutinee cells st)
+           cells1 (ls-cells head)
+           branches (ls-tx-arms arms 0 cells1 form (ls-st head) (typed-list-new [:list [:ref :ls/r]]))
+           st1 (ls-last-st branches (ls-st head))
+           scrutinee-value (ls-value head)
+           simple? (not (ls-coll? scrutinee-value))
+           synth (ls-synth st1 "cellscrutinee")
+           scrutinee-sym (if simple? scrutinee-value (ls-value synth))
+           st2 (if simple? st1 (ls-st synth))
+           joined (ls-branch-copies cells1 branches kind scrutinee-sym tests default? st2)]
+       (if (= 0 (form/count-of (ls-aux joined)))
+         (ls-r (ls-bindings head)
+               (ls-assemble kind scrutinee-value (ls-tails branches 0 (form/no-forms)) tests default?)
+               cells1 (ls-st joined) (form/nil-form))
+         (ls-r (form/append-many (form/append-many (ls-bindings head)
+                                                   (if simple? (form/no-forms) (form/two-forms scrutinee-sym scrutinee-value)))
+                                 (ls-bindings joined))
+               (ls-value joined) (ls-cells joined) (ls-st joined) (form/nil-form)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-if [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [_ (require-k (= 4 (form/count-of form))
+                        (str "if requires test, then, else where it writes an atom (" local-state-note ")")
+                        "kotoba.error/local-state-arity" form)]
+       (ls-tx-branching (form/nth-of form 1) (form/two-forms (form/nth-of form 2) (form/nth-of form 3))
+                        0 (form/no-forms) false cells form st)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-when [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [_ (require-k (> (form/count-of form) 2) "when requires at least one body expression (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           bodies (fl-slice (form/kids-of form) 2 (form/count-of form) (form/no-forms))
+           body (if (= 1 (vector-count bodies))
+                  (fl-nth bodies 0)
+                  (form/form-seq (form/cons-onto (form/symbol-form "do") bodies)))]
+       (ls-tx (form/call3 "if" (form/nth-of form 1) body (form/int-form 0)) cells st)))
+   :default nil)
+
+;; (if test expression else) folded from the last pair back to the first
+#?(:kotoba
+   (defn- ls-cond-fold [clauses [:list [:ref :form/r]] i :i64 acc [:ref :form/r]] [:ref :form/r]
+     (if (< i 0)
+       acc
+       (ls-cond-fold clauses (- i 2) (form/call3 "if" (fl-nth clauses i) (fl-nth clauses (+ i 1)) acc))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-cond [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [clauses (form/rest-list form)
+           n (vector-count clauses)
+           _ (require-k (and (> n 0) (= 0 (rem n 2))) "cond requires an even number of clauses (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           _ (require-k (form/eq (fl-nth clauses (- n 2)) (form/keyword-form :else))
+                        (str "a cond that writes an atom must end with :else (" local-state-note ")")
+                        "kotoba.error/local-state-position" form)]
+       (ls-tx (ls-cond-fold clauses (- n 4) (fl-nth clauses (- n 1))) cells st)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-case-tests [clauses [:list [:ref :form/r]] i :i64 n :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ i 1) n)
+       acc
+       (ls-case-tests clauses (+ i 2) n (form/append-form acc (fl-nth clauses i)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-case-arms [clauses [:list [:ref :form/r]] i :i64 n :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ i 1) n)
+       acc
+       (ls-case-arms clauses (+ i 2) n (form/append-form acc (fl-nth clauses (+ i 1))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-case [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [_ (require-k (> (form/count-of form) 2) "case requires at least one clause (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           clauses (fl-slice (form/kids-of form) 2 (form/count-of form) (form/no-forms))
+           n (vector-count clauses)
+           default? (= 1 (rem n 2))
+           paired (if default? (- n 1) n)
+           tests (ls-case-tests clauses 0 paired (form/no-forms))
+           arms0 (ls-case-arms clauses 0 paired (form/no-forms))
+           arms (if default? (form/append-form arms0 (fl-nth clauses (- n 1))) arms0)]
+       (ls-tx-branching (form/nth-of form 1) arms 1 tests default? cells form st)))
+   :default nil)
+
+;; (do e1 ... en): a non-final expression is bound rather than dropped, so a kernel
+;; store or a cap-call in non-final position survives
+#?(:kotoba
+   (defn- ls-do-from [forms [:list [:ref :form/r]] i :i64 bindings [:list [:ref :form/r]] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [res (ls-tx (fl-nth forms i) cells st)
+           bindings1 (form/append-many bindings (ls-bindings res))]
+       (if (< (+ i 1) (vector-count forms))
+         (let [value (ls-value res)]
+           (if (ls-coll? value)
+             (let [step (ls-synth (ls-st res) "cellstep")]
+               (ls-do-from forms (+ i 1)
+                           (form/append-form (form/append-form bindings1 (ls-value step)) value)
+                           (ls-cells res) (ls-st step)))
+             (ls-do-from forms (+ i 1) bindings1 (ls-cells res) (ls-st res))))
+         (ls-r bindings1 (ls-value res) (ls-cells res) (ls-st res) (form/nil-form)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-do [forms [:list [:ref :form/r]] cells [:ref :form/r] form [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [_ (require-k (> (vector-count forms) 0) "do requires at least one body expression (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)]
+       (ls-do-from forms 0 (form/no-forms) cells st)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-let [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [bindings (form/nth-of form 1)
+           _ (require-k (form/is-vec? bindings) "let requires a binding vector (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           _ (require-k (= 0 (rem (form/count-of bindings) 2)) "let requires an even binding vector (atom slice 1)"
+                        "kotoba.error/local-state-arity" form)
+           bodies (fl-slice (form/kids-of form) 2 (form/count-of form) (form/no-forms))]
+       (ls-tx-let-tail bindings 0 bodies cells form st)))
+   :default nil)
+
+;; the let-scope around the rest, entered once per mutated cell and once for the value
+#?(:kotoba
+   (defn- ls-scope [name [:ref :form/r] bound-value [:ref :form/r] tail [:ref :ls/r] tail-form [:ref :form/r]] [:ref :form/r]
+     (form/call2 "let" (form/vec2 name bound-value) (ls-wrap (ls-bindings tail) tail-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-let-projections [changed [:list [:ref :form/r]] i :i64 name [:ref :form/r] bound-value [:ref :form/r] tail [:ref :ls/r] cs [:ref :form/r] st [:ref :ls/s] acc [:list [:ref :form/r]]] [:ref :ls/r]
+     (if (>= i (vector-count changed))
+       (ls-r acc (form/nil-form) cs st (form/nil-form))
+       (let [cell (fl-nth changed i)
+             fresh (ls-fresh cs cell st)
+             sym (ls-value fresh)
+             inner (form/nth-of (form/form-get (ls-cells tail) cell) 1)]
+         (ls-let-projections changed (+ i 1) name bound-value tail (ls-cells fresh) (ls-st fresh)
+                             (form/append-form (form/append-form acc sym) (ls-scope name bound-value tail inner))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-let-atom [bvec [:ref :form/r] j :i64 bodies [:list [:ref :form/r]] cells [:ref :form/r] form [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [name (form/nth-of bvec j)
+           value (form/nth-of bvec (+ j 1))
+           _ (require-k (= 2 (form/count-of value)) "atom takes exactly one initial value (atom slice 1)"
+                        "kotoba.error/local-state-arity" value)
+           _ (require-k (simple-symbol-form? name) (str "an atom must be bound to a plain name (" local-state-note ")")
+                        "kotoba.error/local-state-atom-position" form)
+           _ (require-k (form/is-nil? (form/form-get cells name))
+                        (str "atom `" (form-text name) "` shadows an atom of the same name (" local-state-note ")")
+                        "kotoba.error/local-state-shadow" form)
+           _ (require-k (not (ls-writes? (form/nth-of value 1)))
+                        (str "an atom's initial value must not write another atom (" local-state-note ")")
+                        "kotoba.error/local-state-position" value)
+           init (ls-tx (form/nth-of value 1) cells st)
+           fresh (ls-fresh (ls-cells init) name (ls-st init))
+           sym (ls-value fresh)
+           st1 (ls-s (ls-st-env (ls-st fresh)) (ls-st-ids (ls-st fresh)) true)
+           tail (ls-tx-let-tail bvec (+ j 2) bodies (ls-cells fresh) form st1)]
+       ;; The cell dies with its `let`; only the outer cells survive.
+       (ls-r (form/append-many (form/append-form (form/append-form (ls-bindings init) sym) (ls-value init)) (ls-bindings tail))
+             (ls-value tail) (form/dissoc-form (ls-cells tail) name) (ls-st tail) (form/nil-form))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-let-plain [bvec [:ref :form/r] j :i64 bodies [:list [:ref :form/r]] cells [:ref :form/r] form [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [name (form/nth-of bvec j)
+           value (form/nth-of bvec (+ j 1))
+           m (ls-mention name cells)
+           _ (require-k (form/is-nil? m)
+                        (str "atom `" (form-text m) "` escapes its let scope (" local-state-note ")")
+                        "kotoba.error/local-state-escape" form)
+           bound (ls-tx value cells st)
+           cells1 (ls-cells bound)
+           tail (ls-tx-let-tail bvec (+ j 2) bodies cells1 form (ls-st bound))
+           changed (ls-changed cells1 (ls-cells tail))]
+       (if (= 0 (vector-count changed))
+         (ls-r (ls-bindings bound) (ls-scope name (ls-value bound) tail (ls-value tail)) cells1 (ls-st tail) (form/nil-form))
+         (let [proj (ls-let-projections changed 0 name (ls-value bound) tail cells1 (ls-st tail) (form/no-forms))
+               value-sym (ls-synth (ls-st proj) "cellvalue")]
+           (ls-r (form/append-form (form/append-form (form/append-many (ls-bindings bound) (ls-bindings proj))
+                                                     (ls-value value-sym))
+                                   (ls-scope name (ls-value bound) tail (ls-value tail)))
+                 (ls-value value-sym) (ls-cells proj) (ls-st value-sym) (form/nil-form))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-let-tail [bvec [:ref :form/r] j :i64 bodies [:list [:ref :form/r]] cells [:ref :form/r] form [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (if (>= j (form/count-of bvec))
+       (ls-tx-do bodies cells form st)
+       (if (ls-sym? (ls-head (form/nth-of bvec (+ j 1))) "atom")
+         (ls-tx-let-atom bvec j bodies cells form st)
+         (ls-tx-let-plain bvec j bodies cells form st))))
+   :default nil)
+
+#?(:kotoba
+   (defn- ls-tx-seq [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (let [head (ls-head form)
+           hs (if (form/is-symbol? head) (form/symbol-value head) "")]
+       (cond
+         (string=? hs "atom")
+         (let [_ (require-k false (str "atom must be the init expression of a let binding (" local-state-note ")")
+                            "kotoba.error/local-state-atom-position" form)]
+           (ls-r (form/no-forms) form cells st (form/nil-form)))
+         (string=? hs "swap!") (ls-tx-swap form cells st)
+         (string=? hs "reset!") (ls-tx-reset form cells st)
+         (string=? hs "let") (ls-tx-let form cells st)
+         (string=? hs "do") (ls-tx-do (form/rest-list form) cells form st)
+         (string=? hs "if") (ls-tx-if form cells st)
+         (string=? hs "when") (ls-tx-when form cells st)
+         (string=? hs "cond") (ls-tx-cond form cells st)
+         (string=? hs "case") (ls-tx-case form cells st)
+         (or (tables/local-state-scope-heads-has? head)
+             (tables/local-state-conditional-heads-has? head))
+         (let [_ (ls-position head form)]
+           (ls-r (form/no-forms) form cells st (form/nil-form)))
+         :else
+         (let [applied (ls-tx-items (form/kids-of form) 0 (form/no-forms) (form/no-forms) cells st)]
+           (ls-r (ls-bindings applied)
+                 (record-assoc [:ref :form/r] form :kids (form/kids-of (ls-value applied)))
+                 (ls-cells applied) (ls-st applied) (form/nil-form))))))
+   :default nil)
+
+;; FORM under CELLS: the bindings the enclosing sequenced scope must emit first, the
+;; expression's value, and the cells afterwards
+#?(:kotoba
+   (defn- ls-tx [form [:ref :form/r] cells [:ref :form/r] st [:ref :ls/s]] [:ref :ls/r]
+     (cond
+       (not (ls-touches? form cells))
+       (ls-r (form/no-forms) form cells st (form/nil-form))
+
+       (not (ls-writes? form))
+       (ls-r (form/no-forms) (ls-subst form cells) cells st (form/nil-form))
+
+       (form/is-seq? form) (ls-tx-seq form cells st)
+
+       (form/is-vec? form)
+       (let [applied (ls-tx-items (form/kids-of form) 0 (form/no-forms) (form/no-forms) cells st)]
+         (ls-r (ls-bindings applied)
+               (record-assoc [:ref :form/r] form :kids (form/kids-of (ls-value applied)))
+               (ls-cells applied) (ls-st applied) (form/nil-form)))
+
+       :else
+       (let [_ (require-k false (str "swap!/reset! is not admitted inside a collection literal (" local-state-note ")")
+                          "kotoba.error/local-state-position" form)]
+         (ls-r (form/no-forms) form cells st (form/nil-form)))))
+   :default nil)
+
+;; Elaborate function-local atoms away, or answer BODY untouched when the function
+;; does not mention the slice. The result's state carries the env (its counter
+;; advanced) and :used, the host's `*local-state-used*`.
+#?(:kotoba
+   (defn elaborate-local-state [body [:ref :form/r] env [:ref :fe/env]] [:ref :ls/r]
+     (if (ls-source? body)
+       (let [res (ls-tx body (ls-no-cells) (ls-s env 0 false))]
+         (ls-r (form/no-forms) (ls-wrap (ls-bindings res) (ls-value res)) (ls-no-cells) (ls-st res) (form/nil-form)))
+       (ls-r (form/no-forms) body (ls-no-cells) (ls-s env 0 false) (form/nil-form))))
+   :default nil)
+
+#?(:kotoba nil :default
+(defn local-state-deref-head? [head]
+  (or (= head 'deref) (= head 'clojure.core/deref))))
+
+#?(:kotoba nil :default
+(defn local-state-head [form]
+  (when (and (seq? form) (seq form)) (first form))))
+
+#?(:kotoba nil :default
+(defn local-state-nodes [form] (tree-seq coll? seq form)))
+
+#?(:kotoba nil :default
+(defn local-state-source?
+  "Whether this body mentions the slice at all. A `false` here is what makes
+  the pass a no-op -- and therefore byte-identical -- for every other program."
+  [form]
+  (boolean (first-truthy (fn [node]
+                   (when-let [head (local-state-head node)]
+                     (or (contains? local-state-write-heads head)
+                         (local-state-deref-head? head))))
+                 (local-state-nodes form)))))
+
+#?(:kotoba nil :default
+(defn local-state-writes? [form]
+  (boolean (first-truthy (fn [node]
+                   (when-let [head (local-state-head node)]
+                     (contains? local-state-write-heads head)))
+                 (local-state-nodes form)))))
+
+#?(:kotoba nil :default
+(defn local-state-reads? [form]
+  (boolean (first-truthy (fn [node]
+                   (when-let [head (local-state-head node)]
+                     (local-state-deref-head? head)))
+                 (local-state-nodes form)))))
+
+#?(:kotoba nil :default
+(defn local-state-mentions-cell? [form cells]
+  (boolean (first-truthy #(and (symbol? %) (contains? cells %)) (local-state-nodes form)))))
+
+#?(:kotoba nil :default
+(defn local-state-touches? [form cells]
+  (or (local-state-writes? form)
+      (local-state-reads? form)
+      (local-state-mentions-cell? form cells))))
+
+#?(:kotoba nil :default
+(defn local-state-effectful? [form]
+  (boolean (first-truthy (fn [node]
+                   (when-let [head (local-state-head node)]
+                     (or (contains? local-state-effect-heads head)
+                         (contains? source-operation-registry head))))
+                 (local-state-nodes form)))))
+
+#?(:kotoba nil :default
+(defn local-state-escape! [name form]
+  (reject! (str "atom `" name "` escapes its let scope (" local-state-note ")")
+           form :kotoba.error/local-state-escape)))
+
+#?(:kotoba nil :default
+(defn local-state-position! [head form]
+  (reject! (str "swap!/reset! is not admitted inside `" head
+                "` (atom slice 1 admits them in let, do, if, when, cond and case only)")
+           form :kotoba.error/local-state-position)))
+
+#?(:kotoba nil :default
+(defn local-state-cell-ref!
+  "The symbol currently holding CELL's value; refuses a first argument that is
+  not a cell bound by `(atom ...)` in this function body."
+  [op target cells form]
+  (if (and (simple-symbol? target) (contains? cells target))
+    (:sym (get cells target))
+    (reject! (str op " expects a let-bound atom cell as its first argument; got `"
+                  (pr-str target) "` (atom slice 1)")
+             form :kotoba.error/local-state-not-a-cell))))
+
+#?(:kotoba nil :default
+(defn local-state-wrap [bindings value]
+  (if (seq bindings) (list 'let (vec bindings) value) value)))
+
+#?(:kotoba nil :default
+(defn local-state-fresh
+  "A new binding symbol for CELL. The cell's id is stable across rebindings so
+  the type check can tie them together; the second number is drawn from one
+  per-function counter so no two bindings anywhere in the function collide."
+  [cells name]
+  (let [id (or (:id (get cells name)) (vswap! *local-state-ids* inc))
+        n (vswap! *local-state-ids* inc)
+        sym (symbol (str "__kotoba_cell_" id "_" n "_" name))]
+    [(assoc cells name {:id id :sym sym}) sym])))
+
+#?(:kotoba nil :default
+(defn local-state-changed
+  "The cells of BEFORE whose binding AFTER moved, ordered by cell id so the
+  emitted bindings are a function of the source."
+  [before after]
+  (vec (sort-by #(:id (get before %))
+                (filter #(not= (:sym (get before %)) (:sym (get after %)))
+                        (keys before))))))
+
+#?(:kotoba nil :default
+(defn local-state-subst
+  "Rewrite `(deref c)` to the symbol holding c's value inside a subtree that
+  does NOT write. Every other mention of a cell is an escape."
+  [form cells]
+  (cond
+    (seq? form)
+    (let [head (first form)]
+      (cond
+        (local-state-deref-head? head)
+        (do (when-not (= 2 (count form))
+              (reject! "deref takes exactly one argument (atom slice 1)"
+                       form :kotoba.error/local-state-arity))
+            (local-state-cell-ref! "deref" (second form) cells form))
+
+        (contains? local-state-scope-heads head)
+        (do (when-let [cell (first (filter #(and (symbol? %) (contains? cells %))
+                                           (local-state-nodes form)))]
+              (local-state-escape! cell form))
+            form)
+
+        :else
+        (let [parts (mapv #(local-state-subst % cells) form)]
+          (if (= (seq parts) (seq form))
+            form
+            (with-meta (apply list parts) (meta form))))))
+
+    (vector? form)
+    (let [parts (mapv #(local-state-subst % cells) form)]
+      (if (= parts form) form (with-meta parts (meta form))))
+
+    (set? form) (into #{} (map #(local-state-subst % cells)) form)
+    (map? form) (into {} (map (fn [[k v]] [(local-state-subst k cells)
+                                           (local-state-subst v cells)]))
+                      form)
+    (symbol? form) (if (contains? cells form) (local-state-escape! form form) form)
+    :else form)))
+
+#?(:kotoba nil :default
+(defn local-state-tx-items [items cells]
+  (reduce (fn [acc item]
+            (let [res (local-state-tx item (:cells acc))]
+              (-> acc
+                  (update :bindings into (:bindings res))
+                  (update :items conj (:value res))
+                  (assoc :cells (:cells res)))))
+          {:bindings [] :items [] :cells cells}
+          items)))
+
+#?(:kotoba nil :default
+(defn local-state-tx-swap [form cells]
+  (when (< (count form) 3)
+    (reject! "swap! takes a cell, a function, and that function's extra arguments (atom slice 1)"
+             form :kotoba.error/local-state-arity))
+  (let [[_ target f & extra] form
+        current (local-state-cell-ref! "swap!" target cells form)]
+    (when (local-state-writes? (cons f extra))
+      (reject! (str "a swap! argument must not write another atom (" local-state-note ")")
+               form :kotoba.error/local-state-position))
+    (let [applied (local-state-tx-items (cons f extra) cells)
+          [cells' sym] (local-state-fresh (:cells applied) target)]
+      {:bindings (conj (vec (:bindings applied)) sym
+                       (apply list (first (:items applied)) current (rest (:items applied))))
+       :value sym
+       :cells cells'}))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-reset [form cells]
+  (when-not (= 3 (count form))
+    (reject! "reset! takes a cell and one value (atom slice 1)"
+             form :kotoba.error/local-state-arity))
+  (let [[_ target value] form
+        _ (local-state-cell-ref! "reset!" target cells form)]
+    (when (local-state-writes? value)
+      (reject! (str "a reset! value must not write another atom (" local-state-note ")")
+               form :kotoba.error/local-state-position))
+    (let [res (local-state-tx value cells)
+          [cells' sym] (local-state-fresh (:cells res) target)]
+      {:bindings (conj (vec (:bindings res)) sym (:value res))
+       :value sym
+       :cells cells'}))))
+
+#?(:kotoba nil :default
+(defn local-state-branch-copies
+  "The shared tail of every branching join: one copy of the branching form per
+  mutated cell, then one for the form's own value. BRANCHES are the transformed
+  arms; ASSEMBLE rebuilds the branching form from one tail expression per arm."
+  [cells-in branches assemble form]
+  (let [changed (vec (sort-by #(:id (get cells-in %))
+                              (distinct (mapcat #(local-state-changed cells-in (:cells %))
+                                                branches))))]
+    (if (empty? changed)
+      {:changed [] :bindings []
+       :value (assemble (mapv #(local-state-wrap (:bindings %) (:value %)) branches))
+       :cells cells-in}
+      (let [[cells' projections]
+            (reduce (fn [[cs acc] cell]
+                      (let [[cs' sym] (local-state-fresh cs cell)]
+                        [cs' (conj acc sym
+                                   (assemble
+                                    (mapv #(local-state-wrap
+                                            (:bindings %)
+                                            (:sym (get (:cells %) cell)))
+                                          branches)))]))
+                    [cells-in []] changed)
+            value-sym (synthetic "cellvalue")]
+        {:changed changed
+         :bindings (conj (vec projections) value-sym
+                         (assemble (mapv #(local-state-wrap (:bindings %) (:value %))
+                                         branches)))
+         :value value-sym
+         :cells cells'
+         :form form})))))
+
+#?(:kotoba nil :default
+(defn local-state-guard-branch! [branch cells-in form]
+  (when (and (seq (local-state-changed cells-in (:cells branch)))
+             (local-state-effectful? (:source branch)))
+    (reject! (str "a branch that writes an atom must not contain a capability call"
+                  " (atom slice 1 elaborates the branch once per cell)")
+             form :kotoba.error/local-state-effectful-branch))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-branching
+  "Shared driver for `if` and `case`: transform the scrutinee, transform each
+  arm against the post-scrutinee cells, then join."
+  [scrutinee arms assemble-with-scrutinee cells form]
+  (let [head (local-state-tx scrutinee cells)
+        cells1 (:cells head)
+        branches (mapv (fn [arm] (assoc (local-state-tx arm cells1) :source arm)) arms)
+        _ (doseq [branch branches] (local-state-guard-branch! branch cells1 form))
+        scrutinee-value (:value head)
+        simple? (or (symbol? scrutinee-value) (not (coll? scrutinee-value)))
+        scrutinee-sym (if simple? scrutinee-value (synthetic "cellscrutinee"))
+        joined (local-state-branch-copies
+                cells1 branches
+                (fn [tails] (assemble-with-scrutinee scrutinee-sym tails))
+                form)]
+    (if (empty? (:changed joined))
+      {:bindings (vec (:bindings head))
+       :value (assemble-with-scrutinee scrutinee-value
+                                       (mapv #(local-state-wrap (:bindings %) (:value %))
+                                             branches))
+       :cells cells1}
+      {:bindings (vec (concat (:bindings head)
+                              (when-not simple? [scrutinee-sym scrutinee-value])
+                              (:bindings joined)))
+       :value (:value joined)
+       :cells (:cells joined)}))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-if [form cells]
+  (let [args (rest form)]
+    (when-not (= 3 (count args))
+      (reject! (str "if requires test, then, else where it writes an atom ("
+                    local-state-note ")")
+               form :kotoba.error/local-state-arity))
+    (local-state-tx-branching
+     (first args) (vec (rest args))
+     (fn [test tails] (list 'if test (first tails) (second tails)))
+     cells form))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-when [form cells]
+  (let [[_ test & bodies] form]
+    (when (empty? bodies)
+      (reject! "when requires at least one body expression (atom slice 1)"
+               form :kotoba.error/local-state-arity))
+    (local-state-tx (list 'if test
+                          (if (= 1 (count bodies)) (first bodies) (cons 'do bodies))
+                          0)
+                    cells))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-cond [form cells]
+  (let [clauses (rest form)]
+    (when (or (empty? clauses) (odd? (count clauses)))
+      (reject! "cond requires an even number of clauses (atom slice 1)"
+               form :kotoba.error/local-state-arity))
+    (let [pairs (vec (partition 2 clauses))]
+      (when-not (= :else (first (peek pairs)))
+        (reject! (str "a cond that writes an atom must end with :else ("
+                      local-state-note ")")
+                 form :kotoba.error/local-state-position))
+      (local-state-tx (reduce (fn [else [test expression]] (list 'if test expression else))
+                              (second (peek pairs))
+                              (reverse (pop pairs)))
+                      cells)))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-case [form cells]
+  (let [[_ scrutinee & clauses] form]
+    (when (empty? clauses)
+      (reject! "case requires at least one clause (atom slice 1)"
+               form :kotoba.error/local-state-arity))
+    (let [default? (odd? (count clauses))
+          pairs (vec (partition 2 (if default? (butlast clauses) clauses)))
+          tests (mapv first pairs)
+          arms (cond-> (mapv second pairs) default? (conj (last clauses)))]
+      (local-state-tx-branching
+       scrutinee arms
+       (fn [value tails]
+         (list* 'case value
+                (concat (mapcat vector tests (take (count tests) tails))
+                        (when default? [(last tails)]))))
+       cells form)))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-do [forms cells form]
+  (when (empty? forms)
+    (reject! "do requires at least one body expression (atom slice 1)"
+             form :kotoba.error/local-state-arity))
+  (loop [remaining (seq forms) bindings [] cells cells]
+    (let [res (local-state-tx (first remaining) cells)
+          bindings (into (vec bindings) (:bindings res))]
+      (if (next remaining)
+        ;; A non-final expression is bound rather than dropped: `sequenced-body`
+        ;; keeps `do` first-class precisely so a kernel store or a cap-call in
+        ;; non-final position survives, and the same has to hold here.
+        (recur (next remaining)
+               (let [value (:value res)]
+                 (if (or (symbol? value) (not (coll? value)))
+                   bindings
+                   (conj bindings (synthetic "cellstep") value)))
+               (:cells res))
+        {:bindings bindings :value (:value res) :cells (:cells res)})))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-let [form cells]
+  (let [bindings (second form)
+        bodies (drop 2 form)]
+    (when-not (vector? bindings)
+      (reject! "let requires a binding vector (atom slice 1)"
+               form :kotoba.error/local-state-arity))
+    (when (odd? (count bindings))
+      (reject! "let requires an even binding vector (atom slice 1)"
+               form :kotoba.error/local-state-arity))
+    (local-state-tx-let-tail (partition 2 bindings) bodies cells form))))
+
+#?(:kotoba nil :default
+(defn local-state-tx-let-tail [pairs bodies cells form]
+  (if (empty? pairs)
+    (local-state-tx-do bodies cells form)
+    (let [[name value] (first pairs)
+          remaining (next pairs)]
+      (if (= 'atom (local-state-head value))
+        (do
+          (when-not (= 2 (count value))
+            (reject! "atom takes exactly one initial value (atom slice 1)"
+                     value :kotoba.error/local-state-arity))
+          (when-not (simple-symbol? name)
+            (reject! (str "an atom must be bound to a plain name (" local-state-note ")")
+                     form :kotoba.error/local-state-atom-position))
+          (when (contains? cells name)
+            (reject! (str "atom `" name "` shadows an atom of the same name ("
+                          local-state-note ")")
+                     form :kotoba.error/local-state-shadow))
+          (when (local-state-writes? (second value))
+            (reject! (str "an atom's initial value must not write another atom ("
+                          local-state-note ")")
+                     value :kotoba.error/local-state-position))
+          (let [init (local-state-tx (second value) cells)
+                [cells' sym] (local-state-fresh (:cells init) name)
+                _ (when *local-state-used* (vreset! *local-state-used* true))
+                tail (local-state-tx-let-tail remaining bodies cells' form)]
+            {:bindings (vec (concat (:bindings init) [sym (:value init)] (:bindings tail)))
+             :value (:value tail)
+             ;; The cell dies with its `let`; only the outer cells survive.
+             :cells (dissoc (:cells tail) name)}))
+        (do
+          (when (local-state-mentions-cell? name cells)
+            (local-state-escape! (first (filter #(and (symbol? %) (contains? cells %))
+                                                (local-state-nodes name)))
+                                 form))
+          (let [bound (local-state-tx value cells)
+                cells1 (:cells bound)
+                tail (local-state-tx-let-tail remaining bodies cells1 form)
+                changed (local-state-changed cells1 (:cells tail))
+                scope (fn [tail-form]
+                        (list 'let [name (:value bound)]
+                              (local-state-wrap (:bindings tail) tail-form)))]
+            (if (empty? changed)
+              {:bindings (vec (:bindings bound))
+               :value (scope (:value tail))
+               :cells cells1}
+              ;; The rest of the `let` writes cells that live OUTSIDE this
+              ;; binding's scope, so the scope is entered once per mutated cell
+              ;; and once for the value -- the same copy rule branches follow.
+              (let [[cells' projections]
+                    (reduce (fn [[cs acc] cell]
+                              (let [[cs' sym] (local-state-fresh cs cell)]
+                                [cs' (conj acc sym (scope (:sym (get (:cells tail) cell))))]))
+                            [cells1 []] changed)
+                    value-sym (synthetic "cellvalue")]
+                {:bindings (vec (concat (:bindings bound) projections
+                                        [value-sym (scope (:value tail))]))
+                 :value value-sym
+                 :cells cells'})))))))))
+
+#?(:kotoba nil :default
+(defn local-state-tx
+  "Transform FORM under CELLS, returning the bindings the enclosing sequenced
+  scope must emit first, the expression's value, and the cells afterwards."
+  [form cells]
+  (cond
+    (not (local-state-touches? form cells))
+    {:bindings [] :value form :cells cells}
+
+    (not (local-state-writes? form))
+    {:bindings [] :value (local-state-subst form cells) :cells cells}
+
+    (seq? form)
+    (let [head (first form)]
+      (cond
+        (= head 'atom)
+        (reject! (str "atom must be the init expression of a let binding ("
+                      local-state-note ")")
+                 form :kotoba.error/local-state-atom-position)
+        (= head 'swap!) (local-state-tx-swap form cells)
+        (= head 'reset!) (local-state-tx-reset form cells)
+        (= head 'let) (local-state-tx-let form cells)
+        (= head 'do) (local-state-tx-do (rest form) cells form)
+        (= head 'if) (local-state-tx-if form cells)
+        (= head 'when) (local-state-tx-when form cells)
+        (= head 'cond) (local-state-tx-cond form cells)
+        (= head 'case) (local-state-tx-case form cells)
+        (contains? local-state-scope-heads head) (local-state-position! head form)
+        (contains? local-state-conditional-heads head) (local-state-position! head form)
+        :else
+        (let [applied (local-state-tx-items (seq form) cells)]
+          {:bindings (:bindings applied)
+           :value (with-meta (apply list (:items applied)) (meta form))
+           :cells (:cells applied)})))
+
+    (vector? form)
+    (let [applied (local-state-tx-items form cells)]
+      {:bindings (:bindings applied)
+       :value (with-meta (vec (:items applied)) (meta form))
+       :cells (:cells applied)})
+
+    :else
+    (reject! (str "swap!/reset! is not admitted inside a collection literal ("
+                  local-state-note ")")
+             form :kotoba.error/local-state-position))))
+
+#?(:kotoba nil :default
+(defn elaborate-local-state
+  "Elaborate function-local atoms away, or return BODY untouched when the
+  function does not mention the slice."
+  [body]
+  (if-not (local-state-source? body)
+    body
+    (binding [*local-state-ids* (volatile! 0)]
+      (let [{:keys [bindings value]} (local-state-tx body {})]
+        (local-state-wrap bindings value))))))
+
+#?(:kotoba
+   (defn interrupt-entry-signature [] [:ref :form/r]
+     (form/edn-form "{:arity 4 :param-type :i64 :result :i64}"))
+   :default
+(def interrupt-entry-signature
+  "isr: the signature every interrupt entry body has, and the reason it is
+  fixed rather than declared.
+
+  The toolchain-generated entry is a fixed byte sequence: it saves the general
+  registers, replenishes this object's fuel, loads four registers from the
+  frame the CPU built, and calls. Those four registers are the SysV first four
+  arguments, in order -- the vector, the error code (zero for the vectors that
+  push none), the interrupted RIP and the interrupted RSP. The entry cannot
+  ask the body what it wanted, so a body with a different arity would be
+  handed four registers and read whichever of them it happened to name.
+
+  Every one of them is a machine word out of the interrupt frame, so every
+  parameter is `:i64` and so is the result. A `:string` or record parameter
+  would make the entry hand a raw frame word to code expecting a validated
+  handle."
+  {:arity 4 :param-type :i64 :result :i64}))
+
+#?(:kotoba nil :default
+(defn validate-interrupt-entries!
+  "isr: refuse a function whose NAME claims an interrupt vector but whose
+  signature is not the one the generated entry calls.
+
+  Names are checked in two directions. `aiueos-isr-3` must have the fixed
+  signature; `aiueos-isr-bp` and `aiueos-isr-64` are refused outright, because
+  they read as entries and the packager has no entry to point at for either --
+  admitting them would produce a function that looks installed and is not."
+  [functions]
+  (doseq [{:keys [name param-types result]} functions
+          :let [text (str name)]
+          :when (str/starts-with? text interrupt-entry-prefix)]
+    (when-not (interrupt-entry-vector name)
+      (reject! (str "interrupt entry name must be " interrupt-entry-prefix
+                    "<vector> with a vector below "
+                    interrupt-entry-vector-limit)
+               name :kotoba.error/interrupt-entry-name))
+    (when-not (= (:arity interrupt-entry-signature) (count param-types))
+      (reject! "interrupt entry must take the vector, error code, rip and rsp"
+               name :kotoba.error/interrupt-entry-signature))
+    (when-not (every? #(= (:param-type interrupt-entry-signature) %) param-types)
+      (reject! "interrupt entry parameters are machine words from the frame"
+               name :kotoba.error/interrupt-entry-signature))
+    (when-not (= (:result interrupt-entry-signature) result)
+      (reject! "interrupt entry result must be i64"
+               name :kotoba.error/interrupt-entry-signature)))
+  functions))
+
+
+;; ── Abort ability, slice 1 ──────────────────────────────────────────────────
+;;
+;; Contract: kotoba-lang `lang/abort-ability.edn`. The permanent invariant is
+;; that no control effect is UNTRACKED. `throw`/`try` are admitted because the
+;; abort they express is tracked twice over: `:abort` appears in the inferred
+;; effect row of every function that can leave its caller this way, and the
+;; function's interface is lowered to `[:result T E]` before any backend sees
+;; it. Post-elaboration there is no `throw`, no `try`, no unwinding -- only the
+;; result values and matches this frontend already lowers.
+;;
+;; What slice 1 does NOT do, each refused with a message that says so:
+;; a throw inside a loop/doseq/dotimes body, a lazy thunk or a fn literal
+;; (precondition :checked-lexical-facet-unwind); an aborting function at an
+;; export boundary; a throw or aborting call anywhere but tail position or a
+;; let binding value; a call to an aborting function from a scope that neither
+;; catches it nor aborts with the same error type.
+
+#?(:kotoba nil :default
+(defn abort-form-mentions?
+  "Does FORM contain a `throw` or a `try` anywhere? The cheap syntactic test
+  every abort pass makes first, so a module without either takes exactly the
+  path it took before the ability existed."
+  [form]
+  (boolean (first-truthy #(and (seq? %) (contains? '#{throw try} (first %)))
+                 (tree-seq coll? seq form)))))
+
+#?(:kotoba nil :default
+(defn abort-escapes?
+  "Does FORM abort past its own boundary -- a `throw`, or a call to a function
+  in ABORT-ERROR-TYPES, with no try body in between? A try's handler counts:
+  what it throws leaves the try. Pass `{}` to ask about own throws only."
+  [form abort-error-types]
+  (cond
+    (seq? form)
+    (let [[op & args] form]
+      (cond
+        (= op 'throw) true
+        (= op 'try) (abort-escapes? (last (second args)) abort-error-types)
+        (contains? abort-error-types op) true
+        :else (boolean (first-truthy #(abort-escapes? % abort-error-types) args))))
+    (coll? form) (boolean (first-truthy #(abort-escapes? % abort-error-types) form))
+    :else false)))
+
+#?(:kotoba nil :default
+(defn abort-anf-trivial?
+  "Can FORM be evaluated AFTER a hoisted binding without changing what the
+  program does?
+
+  Only if evaluating it is unobservable and cannot depend on the computation
+  that was moved in front of it. A literal and a symbol qualify: there is no
+  ambient mutation in this language, so a local's value cannot have been
+  changed by the hoisted form. A form containing a CALL does not -- the call
+  may exercise a capability, and reordering two observable effects is the one
+  thing the A-normalization must not do.
+
+  CONTAINMENT, not shape, is the test, because a vector literal can hold a
+  call: `(vector-at [(g 1) 2] 0)` is admitted (measured 2026-09-02). A type,
+  `[:result :i64 :string]`, contains no seq and is therefore trivial -- which
+  is what keeps a type out of a `let` binding, where it would not be a value."
+  [form]
+  (not (first-truthy seq? (tree-seq coll? seq form)))))
+
+#?(:kotoba nil :default
+(defn a-normalize-aborts
+  "A-normalize every aborting form into a position the elaboration admits:
+  tail position, or a `let` binding value.
+
+  Slice 1 refused an aborting form in an operand or a test. This is the
+  conversion that lifts that restriction, and the whole of its difficulty is
+  EVALUATION ORDER. `(op a b)` evaluates a then b; if b aborts and is hoisted,
+  `(let [t b] (op a t))` would evaluate b BEFORE a. So once any argument is
+  hoisted, every argument to its LEFT that is not `abort-anf-trivial?` is
+  hoisted too, in order. Arguments to the right stay where they are: they are
+  evaluated after, and still are.
+
+  What is produced is source, not lowered code: a `let` whose binding value is
+  the aborting form. `elaborate-aborts` then does exactly what it already did
+  for a `let` binding value the author wrote -- one `result-match-of` with a
+  re-raising err arm. The lowering is not duplicated here.
+
+  A `throw` reached in an operand position makes the ENCLOSING expression
+  dead: `(+ (g 1) (throw \"s\"))` evaluates `(g 1)` and then leaves, so it
+  becomes `(let [t (g 1)] (throw \"s\"))` -- the `+` is gone because it never
+  runs. Deadness propagates outward through operand positions and stops at a
+  scope, where a `throw` is the ordinary tail form.
+
+  Runs TWICE, because the two things it hoists are known at different times.
+  Own `throw`s are syntax, so the first run has ABORT-ERROR-TYPES `{}` and
+  must precede `infer-abort-error-types` -- a bottom-typed operand is refused
+  by `require-expression-type!` during inference, before the fixed point could
+  report anything. Aborting CALLS are only known after that fixed point, so
+  the second run follows it. PREFIX keeps the two runs' synthesized names
+  disjoint; without that a name from the first run could be shadowed by one
+  from the second inside the same function.
+
+  A function whose body mentions neither `throw` nor `try` nor an aborting
+  call is returned untouched, so a program without the ability lowers to the
+  same bytes it did before the ability existed."
+  [functions abort-error-types prefix]
+  (binding [*synthetic-counter* (volatile! 0)]
+   (letfn
+   [(escapes? [form] (abort-escapes? form abort-error-types))
+    (hoist [form] (let [t (synthetic prefix)] [[[t form]] t]))
+    (wrap [binds form]
+      (if (seq binds) (list 'let (vec (mapcat identity binds)) form) form))
+    (scope [form]
+      ;; A position where an aborting form is already admitted: a function
+      ;; body, an `if` branch, a `try` body or handler, a match arm.
+      (let [{:keys [binds form]} (anf form true)] (wrap binds form)))
+    (siblings [items tail-last? rebuild tail?]
+      ;; ITEMS are evaluated left to right and REBUILD puts the results back
+      ;; into the form they came from. The last one is in tail position when
+      ;; TAIL-LAST? -- that is how a `do`'s value, and only its value, keeps
+      ;; the tail treatment.
+      (let [last-hoisted (last (keep-indexed (fn [i x] (when (escapes? x) i)) items))
+            n (count items)]
+        (loop [i 0 remaining (seq items) binds [] out []]
+          (if (nil? remaining)
+            (let [rebuilt (rebuild out)]
+              (if (or tail? (not (escapes? rebuilt)))
+                {:binds binds :form rebuilt}
+                (let [[b t] (hoist rebuilt)] {:binds (into binds b) :form t})))
+            (let [last? (= i (dec n))
+                  {b :binds f :form dead? :dead?} (anf (first remaining) (and last? tail-last?))]
+              (cond
+                ;; A dead LAST element in tail position is the ordinary
+                ;; `(do ... (throw e))`: the throw is the value, and the
+                ;; deadness travels outward rather than truncating here.
+                (and dead? last? tail-last?)
+                {:binds (into binds b) :form (rebuild (conj out f)) :dead? true}
+                dead?
+                {:binds (into binds b) :form f :dead? true}
+                :else
+                (let [binds (into binds b)]
+                  (if (and (some? last-hoisted) (<= i last-hoisted)
+                           (not (abort-anf-trivial? f)))
+                    (let [[hb t] (hoist f)]
+                      (recur (inc i) (next remaining) (into binds hb) (conj out t)))
+                    (recur (inc i) (next remaining) binds (conj out f))))))))))
+    (bind-unless-tail [rebuilt tail?]
+      (if (or tail? (not (escapes? rebuilt)))
+        {:binds [] :form rebuilt}
+        (let [[b t] (hoist rebuilt)] {:binds b :form t})))
+    (anf [form tail?]
+      (cond
+        (and (vector? form) (escapes? form))
+        (siblings form false vec tail?)
+
+        (not (seq? form))
+        {:binds [] :form form}
+
+        (not (or (abort-form-mentions? form) (escapes? form)))
+        {:binds [] :form form}
+
+        :else
+        (let [[op & args] form]
+          (case op
+            throw
+            (let [{b :binds v :form dead? :dead?} (anf (first args) false)]
+              (if dead?
+                {:binds b :form v :dead? true}
+                {:binds b :form (list 'throw v) :dead? true}))
+
+            try
+            (let [[body clause] args
+                  [explicit binder handler] (try-clause-parts clause form)
+                  rebuilt (list 'try (scope body)
+                                (if (some? explicit)
+                                  (list 'catch explicit binder (scope handler))
+                                  (list 'catch binder (scope handler))))]
+              (bind-unless-tail rebuilt tail?))
+
+            if
+            (let [[test then else] (if-parts args form)
+                  {b :binds t :form dead? :dead?} (anf test false)]
+              (if dead?
+                {:binds b :form t :dead? true}
+                (let [{binds :binds form :form}
+                      (bind-unless-tail (list 'if t (scope then) (scope else)) tail?)]
+                  {:binds (into b binds) :form form})))
+
+            do (siblings (vec args) true #(apply list 'do %) tail?)
+
+            let
+            (let [bindings (first args) body (let-body args form)
+                  [binds pairs]
+                  (reduce (fn [[binds pairs] [name value]]
+                            ;; A binding value is already an admitted position
+                            ;; for an aborting form, so it is normalized as a
+                            ;; tail and stays where it is.
+                            (let [{b :binds v :form} (anf value true)]
+                              [(into binds b) (conj pairs [name v])]))
+                          [[] []] (partition 2 bindings))
+                  {body-binds :binds body* :form dead? :dead?} (anf body true)
+                  rebuilt (list 'let (vec (mapcat identity (concat binds pairs body-binds)))
+                                body*)]
+              (if (or tail? (not (escapes? rebuilt)))
+                {:binds [] :form rebuilt :dead? dead?}
+                (let [[b t] (hoist rebuilt)] {:binds b :form t})))
+
+            result-match-of
+            (let [[type value ok-name ok-body err-name err-body] args
+                  {b :binds v :form dead? :dead?} (anf value false)]
+              (if dead?
+                {:binds b :form v :dead? true}
+                (let [{binds :binds form :form}
+                      (bind-unless-tail (list 'result-match-of type v
+                                              ok-name (scope ok-body)
+                                              err-name (scope err-body))
+                                        tail?)]
+                  {:binds (into b binds) :form form})))
+
+            option-match
+            (let [[type value none-body some-name some-body] args
+                  {b :binds v :form dead? :dead?} (anf value false)]
+              (if dead?
+                {:binds b :form v :dead? true}
+                (let [{binds :binds form :form}
+                      (bind-unless-tail (list 'option-match type v (scope none-body)
+                                              some-name (scope some-body))
+                                        tail?)]
+                  {:binds (into b binds) :form form})))
+
+            variant-match
+            (let [[type value branches] args
+                  {b :binds v :form dead? :dead?} (anf value false)]
+              (if dead?
+                {:binds b :form v :dead? true}
+                (let [lowered (mapv (fn [[tag binder body :as branch]]
+                                      (let [body* (scope body)]
+                                        (if (vector? branch) [tag binder body*] (list tag binder body*))))
+                                    branches)
+                      {binds :binds form :form}
+                      (bind-unless-tail (list 'variant-match type v
+                                              (if (vector? branches) (vec lowered) (apply list lowered)))
+                                        tail?)]
+                  {:binds (into b binds) :form form})))
+
+            ;; A `fn` literal's body belongs to the lambda it becomes, not to
+            ;; the function it sits in; hoisting out of it would move the
+            ;; computation to a different call count. Left alone.
+            fn {:binds [] :form form}
+
+            (siblings (vec args) false #(cons op %) tail?)))))]
+    (mapv (fn [{:keys [body] :as function}]
+            (if (or (abort-form-mentions? body) (escapes? body))
+              (assoc function :body (scope body))
+              function))
+          functions)))))
+
+#?(:kotoba
+   ;; The one `:dataspace/*` wire id in the capability catalog
+   ;; (`:dataspace/transact` 24); frontend-tables-test compares it with the
+   ;; set the host derives from the registry.
+   (defn dataspace-capability-ids [] [:ref :form/r]
+     (form/edn-form "#{24}"))
+   :default
+   (def dataspace-capability-ids
+     "The wire IDs of every `:dataspace/*` capability -- the facet operations
+  whose unwind the abort ability has no checked form for yet."
+     (into #{} (keep (fn [[name id]] (when (= "dataspace" (namespace name)) id)))
+           capability-registry)))
+
+#?(:kotoba
+   (defn- ie-all-i64? [ptypes [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of ptypes))
+       true
+       (and (form/eq (form/nth-of ptypes i) (form/keyword-form :i64)) (ie-all-i64? ptypes (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- validate-interrupt-entry [fn-map [:ref :form/r]] :i64
+     (let [name (form/form-get fn-map (form/keyword-form :name))
+           text (form-text name)
+           ptypes (form/form-get fn-map (form/keyword-form :param-types))
+           result (form/form-get fn-map (form/keyword-form :result))]
+       (if (= 0 (string-index-of text "aiueos-isr-"))
+         (let [_ (require-k (>= (interrupt-vector-value text) 0)
+                            "interrupt entry name must be aiueos-isr-<vector> with a vector below 64"
+                            "kotoba.error/interrupt-entry-name" name)
+               _ (require-k (= 4 (form/count-of ptypes))
+                            "interrupt entry must take the vector, error code, rip and rsp"
+                            "kotoba.error/interrupt-entry-signature" name)
+               _ (require-k (ie-all-i64? ptypes 0)
+                            "interrupt entry parameters are machine words from the frame"
+                            "kotoba.error/interrupt-entry-signature" name)
+               _ (require-k (form/eq result (form/keyword-form :i64))
+                            "interrupt entry result must be i64"
+                            "kotoba.error/interrupt-entry-signature" name)]
+           0)
+         0)))
+   :default nil)
+
+
+
+#?(:kotoba
+   (defn- validate-interrupt-entries-from [functions [:list [:ref :form/r]] i :i64] :i64
+     (if (>= i (vector-count functions))
+       0
+       (let [_ (validate-interrupt-entry (fl-nth functions i))]
+         (validate-interrupt-entries-from functions (+ i 1)))))
+   :default nil)
+
+;; refuse a function whose NAME claims an interrupt vector but whose signature is not
+;; the one the generated entry calls; answers FUNCTIONS
+#?(:kotoba
+   (defn validate-interrupt-entries! [functions [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (let [_ (validate-interrupt-entries-from functions 0)]
+       functions))
+   :default nil)
+
+;; Does FORM contain a `throw` or a `try` anywhere?
+#?(:kotoba
+   (defn abort-form-mentions? [form [:ref :form/r]] :bool
+     (if (and (form/is-seq? form)
+              (form/is-symbol? (form/nth-of form 0))
+              (or (string=? (form/symbol-value (form/nth-of form 0)) "throw")
+                  (string=? (form/symbol-value (form/nth-of form 0)) "try")))
+       true
+       (abort-mentions-kids? (form/kids-of form) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- abort-mentions-kids? [kids [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count kids))
+       false
+       (if (abort-form-mentions? (fl-nth kids i)) true (abort-mentions-kids? kids (+ i 1)))))
+   :default nil)
+
+;; Does FORM abort past its own boundary -- a `throw`, or a call to a function in
+;; ABORT-ERROR-TYPES (a Form map or set keyed by function name), with no try body in
+;; between? A try's handler counts: what it throws leaves the try.
+#?(:kotoba
+   (defn abort-escapes? [form [:ref :form/r] abort-error-types [:ref :form/r]] :bool
+     (cond
+       (form/is-seq? form)
+       (let [op (form/nth-of form 0)
+             opn (if (form/is-symbol? op) (form/symbol-value op) "")]
+         (cond
+           (string=? opn "throw") true
+           (string=? opn "try")
+           (abort-escapes? (form/last-of (form/nth-of form 2)) abort-error-types)
+           (tables/table-has? abort-error-types op) true
+           :else (abort-escapes-kids? (form/kids-of form) 1 abort-error-types)))
+       (or (form/is-vec? form) (form/is-set? form) (form/is-map? form))
+       (abort-escapes-kids? (form/kids-of form) 0 abort-error-types)
+       :else false))
+   :default nil)
+
+#?(:kotoba
+   (defn- abort-escapes-kids? [kids [:list [:ref :form/r]] i :i64 abort-error-types [:ref :form/r]] :bool
+     (if (>= i (vector-count kids))
+       false
+       (if (abort-escapes? (fl-nth kids i) abort-error-types)
+         true
+         (abort-escapes-kids? kids (+ i 1) abort-error-types))))
+   :default nil)
+
+;; Can FORM be evaluated AFTER a hoisted binding without changing what the program
+;; does? Containment, not shape: a form containing a seq (a call) is not trivial.
+#?(:kotoba
+   (defn abort-anf-trivial? [form [:ref :form/r]] :bool
+     (if (form/is-seq? form) false (abort-trivial-kids? (form/kids-of form) 0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- abort-trivial-kids? [kids [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count kids))
+       true
+       (if (abort-anf-trivial? (fl-nth kids i)) (abort-trivial-kids? kids (+ i 1)) false)))
+   :default nil)
+
+;; ---- a-normalize-aborts ----
+;; An A-normalization step answers :anf/r: the hoisted bindings (flat name/value), the
+;; form, whether it is dead (a throw was reached in operand position), and the
+;; synthetic counter (the host's `*synthetic-counter*` volatile, bound once per call).
+#?(:kotoba
+   (defn- an-res [binds [:list [:ref :form/r]] form [:ref :form/r] dead :bool n :i64] [:ref :anf/r]
+     (record-new [:ref :anf/r] binds form dead n))
+   :default nil)
+#?(:kotoba
+   (defn- an-binds [r [:ref :anf/r]] [:list [:ref :form/r]] (record-get [:ref :anf/r] r :binds))
+   :default nil)
+#?(:kotoba
+   (defn- an-form [r [:ref :anf/r]] [:ref :form/r] (record-get [:ref :anf/r] r :form))
+   :default nil)
+#?(:kotoba
+   (defn- an-dead [r [:ref :anf/r]] :bool (record-get [:ref :anf/r] r :dead))
+   :default nil)
+#?(:kotoba
+   (defn- an-n [r [:ref :anf/r]] :i64 (record-get [:ref :anf/r] r :n))
+   :default nil)
+
+;; bind FORM to a fresh name
+#?(:kotoba
+   (defn- an-hoist [prefix :string n :i64 form [:ref :form/r]] [:ref :anf/r]
+     (let [t (form/symbol-form (str "__kotoba_" prefix "_" (string-from-i64 (+ n 1))))]
+       (an-res (form/two-forms t form) t false (+ n 1))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-wrap [binds [:list [:ref :form/r]] form [:ref :form/r]] [:ref :form/r]
+     (if (> (vector-count binds) 0)
+       (form/call2 "let" (form/form-vec binds) form)
+       form))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-bind-unless-tail [aet [:ref :form/r] prefix :string n :i64 rebuilt [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (if (or tail? (not (abort-escapes? rebuilt aet)))
+       (an-res (form/no-forms) rebuilt false n)
+       (an-hoist prefix n rebuilt)))
+   :default nil)
+
+;; the binds of A then of B
+#?(:kotoba
+   (defn- an-merge [a [:ref :anf/r] b [:ref :anf/r] form [:ref :form/r] dead :bool] [:ref :anf/r]
+     (an-res (form/append-many (an-binds a) (an-binds b)) form dead (an-n b)))
+   :default nil)
+
+;; a position where an aborting form is already admitted
+#?(:kotoba
+   (defn- an-scope [aet [:ref :form/r] prefix :string n :i64 form [:ref :form/r]] [:ref :anf/r]
+     (let [r (an-anf aet prefix n form true)]
+       (an-res (form/no-forms) (an-wrap (an-binds r) (an-form r)) false (an-n r))))
+   :default nil)
+
+;; the index of the last item that escapes, or -1
+#?(:kotoba
+   (defn- an-last-hoisted [aet [:ref :form/r] items [:list [:ref :form/r]] i :i64 best :i64] :i64
+     (if (>= i (vector-count items))
+       best
+       (an-last-hoisted aet items (+ i 1) (if (abort-escapes? (fl-nth items i) aet) i best))))
+   :default nil)
+
+;; rebuild a sibling form: KIND 0 a vector, 1 `(do ...)`, 2 `(OP ...)`
+#?(:kotoba
+   (defn- an-build [kind :i64 op [:ref :form/r] out [:list [:ref :form/r]]] [:ref :form/r]
+     (cond
+       (= kind 0) (form/form-vec out)
+       (= kind 1) (form/form-seq (form/cons-onto (form/symbol-form "do") out))
+       :else (form/form-seq (form/cons-onto op out))))
+   :default nil)
+
+;; ITEMS are evaluated left to right and rebuilt into the form they came from. The
+;; last one is in tail position when TAIL-LAST?.
+#?(:kotoba
+   (defn- an-sib [aet [:ref :form/r] prefix :string items [:list [:ref :form/r]] i :i64 binds [:list [:ref :form/r]] out [:list [:ref :form/r]] lh :i64 tail-last? :bool kind :i64 op [:ref :form/r] tail? :bool n :i64] [:ref :anf/r]
+     (if (>= i (vector-count items))
+       (let [rebuilt (an-build kind op out)]
+         (if (or tail? (not (abort-escapes? rebuilt aet)))
+           (an-res binds rebuilt false n)
+           (let [h (an-hoist prefix n rebuilt)]
+             (an-res (form/append-many binds (an-binds h)) (an-form h) false (an-n h)))))
+       (let [last? (= i (- (vector-count items) 1))
+             r (an-anf aet prefix n (fl-nth items i) (and last? tail-last?))
+             dead? (an-dead r)
+             f (an-form r)
+             n1 (an-n r)
+             binds1 (form/append-many binds (an-binds r))]
+         (cond
+           (and dead? last? tail-last?)
+           (an-res binds1 (an-build kind op (form/append-form out f)) true n1)
+           dead?
+           (an-res binds1 f true n1)
+           (and (>= lh 0) (<= i lh) (not (abort-anf-trivial? f)))
+           (let [h (an-hoist prefix n1 f)]
+             (an-sib aet prefix items (+ i 1) (form/append-many binds1 (an-binds h)) (form/append-form out (an-form h))
+                     lh tail-last? kind op tail? (an-n h)))
+           :else
+           (an-sib aet prefix items (+ i 1) binds1 (form/append-form out f) lh tail-last? kind op tail? n1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-siblings [aet [:ref :form/r] prefix :string n :i64 items [:list [:ref :form/r]] tail-last? :bool kind :i64 op [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (an-sib aet prefix items 0 (form/no-forms) (form/no-forms) (an-last-hoisted aet items 0 -1)
+             tail-last? kind op tail? n))
+   :default nil)
+
+;; the argument at I of ARGS, nil when absent
+#?(:kotoba
+   (defn- an-arg [args [:list [:ref :form/r]] i :i64] [:ref :form/r]
+     (if (< i (vector-count args)) (fl-nth args i) (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-throw [aet [:ref :form/r] prefix :string n :i64 args [:list [:ref :form/r]]] [:ref :anf/r]
+     (let [r (an-anf aet prefix n (an-arg args 0) false)]
+       (if (an-dead r)
+         (an-res (an-binds r) (an-form r) true (an-n r))
+         (an-res (an-binds r) (form/call1 "throw" (an-form r)) true (an-n r)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-try [aet [:ref :form/r] prefix :string n :i64 args [:list [:ref :form/r]] form [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (let [body (an-arg args 0)
+           parts (try-clause-parts (an-arg args 1) form)
+           explicit (form/nth-of parts 0)
+           binder (form/nth-of parts 1)
+           handler (form/nth-of parts 2)
+           sb (an-scope aet prefix n body)
+           sh (an-scope aet prefix (an-n sb) handler)
+           rebuilt (form/call2 "try" (an-form sb)
+                               (if (form/is-nil? explicit)
+                                 (form/call2 "catch" binder (an-form sh))
+                                 (form/call3 "catch" explicit binder (an-form sh))))]
+       (an-bind-unless-tail aet prefix (an-n sh) rebuilt tail?)))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-if [aet [:ref :form/r] prefix :string n :i64 args [:list [:ref :form/r]] form [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (let [parts (if-parts args form)
+           r (an-anf aet prefix n (fl-nth parts 0) false)]
+       (if (an-dead r)
+         (an-res (an-binds r) (an-form r) true (an-n r))
+         (let [st (an-scope aet prefix (an-n r) (fl-nth parts 1))
+               se (an-scope aet prefix (an-n st) (fl-nth parts 2))
+               bt (an-bind-unless-tail aet prefix (an-n se) (form/call3 "if" (an-form r) (an-form st) (an-form se)) tail?)]
+           (an-res (form/append-many (an-binds r) (an-binds bt)) (an-form bt) false (an-n bt))))))
+   :default nil)
+
+;; the let pairs: values normalized as tails (an admitted position) and kept in place.
+;; answers :anf/r with BINDS the hoisted bindings, FORM the vector of name/value pairs flat
+#?(:kotoba
+   (defn- an-let-pairs [aet [:ref :form/r] prefix :string bvec [:ref :form/r] j :i64 n :i64 binds [:list [:ref :form/r]] pairs [:list [:ref :form/r]]] [:ref :anf/r]
+     (if (>= (+ j 1) (form/count-of bvec))
+       (an-res binds (form/form-vec pairs) false n)
+       (let [r (an-anf aet prefix n (form/nth-of bvec (+ j 1)) true)]
+         (an-let-pairs aet prefix bvec (+ j 2) (an-n r) (form/append-many binds (an-binds r))
+                       (form/append-form (form/append-form pairs (form/nth-of bvec j)) (an-form r))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-let [aet [:ref :form/r] prefix :string n :i64 args [:list [:ref :form/r]] form [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (let [bvec (an-arg args 0)
+           body (let-body args form)
+           lp (an-let-pairs aet prefix bvec 0 n (form/no-forms) (form/no-forms))
+           rb (an-anf aet prefix (an-n lp) body true)
+           rebuilt (form/call2 "let"
+                               (form/form-vec (form/append-many (form/append-many (an-binds lp) (form/kids-of (an-form lp))) (an-binds rb)))
+                               (an-form rb))]
+       (if (or tail? (not (abort-escapes? rebuilt aet)))
+         (an-res (form/no-forms) rebuilt (an-dead rb) (an-n rb))
+         (an-hoist prefix (an-n rb) rebuilt))))
+   :default nil)
+
+;; result-match-of / option-match / variant-match: the scrutinee is normalized, each
+;; arm is a scope. KIND 0 result-match-of, 1 option-match, 2 variant-match.
+#?(:kotoba
+   (defn- an-variant-branches [aet [:ref :form/r] prefix :string branches [:ref :form/r] i :i64 n :i64 acc [:list [:ref :form/r]]] [:ref :anf/r]
+     (if (>= i (form/count-of branches))
+       (an-res acc (form/nil-form) false n)
+       (let [branch (form/nth-of branches i)
+             s (an-scope aet prefix n (form/nth-of branch 2))
+             lowered (if (form/is-vec? branch)
+                       (form/vec3 (form/nth-of branch 0) (form/nth-of branch 1) (an-form s))
+                       (form/form-seq (form/three-forms (form/nth-of branch 0) (form/nth-of branch 1) (an-form s))))]
+         (an-variant-branches aet prefix branches (+ i 1) (an-n s) (form/append-form acc lowered)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-match [aet [:ref :form/r] prefix :string n :i64 args [:list [:ref :form/r]] kind :i64 tail? :bool] [:ref :anf/r]
+     (let [type (an-arg args 0)
+           r (an-anf aet prefix n (an-arg args 1) false)]
+       (if (an-dead r)
+         (an-res (an-binds r) (an-form r) true (an-n r))
+         (let [v (an-form r)
+               rebuilt-r
+               (cond
+                 (= kind 0)
+                 (let [ok (an-scope aet prefix (an-n r) (an-arg args 3))
+                       er (an-scope aet prefix (an-n ok) (an-arg args 5))]
+                   (an-res (form/no-forms)
+                           (form/call6 "result-match-of" type v (an-arg args 2) (an-form ok) (an-arg args 4) (an-form er))
+                           false (an-n er)))
+                 (= kind 1)
+                 (let [none (an-scope aet prefix (an-n r) (an-arg args 2))
+                       some (an-scope aet prefix (an-n none) (an-arg args 4))]
+                   (an-res (form/no-forms)
+                           (form/call5 "option-match" type v (an-form none) (an-arg args 3) (an-form some))
+                           false (an-n some)))
+                 :else
+                 (let [branches (an-arg args 2)
+                       lowered (an-variant-branches aet prefix branches 0 (an-n r) (form/no-forms))
+                       container (if (form/is-vec? branches)
+                                   (form/form-vec (an-binds lowered))
+                                   (form/form-seq (an-binds lowered)))]
+                   (an-res (form/no-forms) (form/call3 "variant-match" type v container) false (an-n lowered))))
+               bt (an-bind-unless-tail aet prefix (an-n rebuilt-r) (an-form rebuilt-r) tail?)]
+           (an-res (form/append-many (an-binds r) (an-binds bt)) (an-form bt) false (an-n bt))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-seq [aet [:ref :form/r] prefix :string n :i64 form [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (let [op (form/nth-of form 0)
+           opn (if (form/is-symbol? op) (form/symbol-value op) "")
+           args (form/rest-list form)]
+       (cond
+         (string=? opn "throw") (an-throw aet prefix n args)
+         (string=? opn "try") (an-try aet prefix n args form tail?)
+         (string=? opn "if") (an-if aet prefix n args form tail?)
+         (string=? opn "do") (an-siblings aet prefix n args true 1 op tail?)
+         (string=? opn "let") (an-let aet prefix n args form tail?)
+         (string=? opn "result-match-of") (an-match aet prefix n args 0 tail?)
+         (string=? opn "option-match") (an-match aet prefix n args 1 tail?)
+         (string=? opn "variant-match") (an-match aet prefix n args 2 tail?)
+         ;; A `fn` literal's body belongs to the lambda it becomes: left alone.
+         (string=? opn "fn") (an-res (form/no-forms) form false n)
+         :else (an-siblings aet prefix n args false 2 op tail?))))
+   :default nil)
+
+#?(:kotoba
+   (defn- an-anf [aet [:ref :form/r] prefix :string n :i64 form [:ref :form/r] tail? :bool] [:ref :anf/r]
+     (cond
+       (and (form/is-vec? form) (abort-escapes? form aet))
+       (an-siblings aet prefix n (form/kids-of form) false 0 (form/nil-form) tail?)
+       (not (form/is-seq? form)) (an-res (form/no-forms) form false n)
+       (not (or (abort-form-mentions? form) (abort-escapes? form aet))) (an-res (form/no-forms) form false n)
+       :else (an-seq aet prefix n form tail?)))
+   :default nil)
+
+;; A-normalize every function's body (FUNCTIONS: a Form list of function maps); the
+;; counter runs across the whole call and starts at 0, as the host's volatile does
+#?(:kotoba
+   (defn- an-functions [aet [:ref :form/r] prefix :string functions [:list [:ref :form/r]] i :i64 n :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count functions))
+       acc
+       (let [function (fl-nth functions i)
+             key (form/keyword-form :body)
+             body (form/form-get function key)]
+         (if (or (abort-form-mentions? body) (abort-escapes? body aet))
+           (let [s (an-scope aet prefix n body)]
+             (an-functions aet prefix functions (+ i 1) (an-n s)
+                           (form/append-form acc (form/assoc-form function key (an-form s)))))
+           (an-functions aet prefix functions (+ i 1) n (form/append-form acc function))))))
+   :default nil)
+
+#?(:kotoba
+   (defn a-normalize-aborts [functions [:list [:ref :form/r]] abort-error-types [:ref :form/r] prefix :string] [:list [:ref :form/r]]
+     (an-functions abort-error-types prefix functions 0 0 (form/no-forms)))
+   :default nil)
+
+;; ---- check-abort-facet-unwind! ----
+#?(:kotoba
+   (defn- af-truthy? [f [:ref :form/r]] :bool
+     (and (not (form/is-nil? f)) (not (and (form/is-bool? f) (not (form/bool-value f))))))
+   :default nil)
+
+;; the facet operations of ROW (a Form collection of [kind wire-id] vectors), in order
+#?(:kotoba
+   (defn- af-facets [row [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (form/count-of row))
+       acc
+       (let [e (form/nth-of row i)]
+         (af-facets row (+ i 1)
+                    (if (and (form/is-vec? e) (tables/table-has? (dataspace-capability-ids) (form/nth-of e 1)))
+                      (form/append-form acc e)
+                      acc)))))
+   :default nil)
+
+;; `(pr-str (into #{} (map name-of-id) facets))` as the set's elements, distinct, in order
+#?(:kotoba
+   (defn- af-names [facets [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count facets))
+       acc
+       (let [nm (form/form-get (capability-id->name) (form/nth-of (fl-nth facets i) 1))]
+         (af-names facets (+ i 1) (if (fl-has? acc nm 0) acc (form/append-form acc nm))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- check-abort-facet-unwind-one! [function [:ref :form/r] function-effects [:ref :form/r]] :i64
+     (let [name (form/form-get function (form/keyword-form :name))
+           row0 (form/form-get function-effects name)
+           row (if (form/is-nil? row0) (form/form-set (form/no-forms)) row0)
+           aborting (or (af-truthy? (form/form-get function (form/keyword-form :abort-error-type)))
+                        (af-truthy? (form/form-get function (form/keyword-form :abort-catches?))))
+           facets (if aborting (af-facets row 0 (form/no-forms)) (form/no-forms))]
+       (if (> (vector-count facets) 0)
+         (let [source-name (form/form-get function (form/keyword-form :source-name))
+               shown (if (af-truthy? source-name) source-name name)
+               kind (if (af-truthy? (form/form-get function (form/keyword-form :abort-own-throw?)))
+                      "throw"
+                      (if (af-truthy? (form/form-get function (form/keyword-form :abort-error-type))) "abort" "try"))]
+           (throw (fe-reject (str kind " in function " (form-text shown)
+                                  " whose effect row has a dataspace facet operation "
+                                  (pr-form (form/form-set (af-names facets 0 (form/no-forms))))
+                                  " is not admitted in abort slice 1: precondition "
+                                  ":checked-lexical-facet-unwind is not met")
+                             "kotoba.error/abort-precondition" name)))
+         0)))
+   :default nil)
+
+#?(:kotoba
+   (defn- check-abort-facet-unwind-from [functions [:list [:ref :form/r]] function-effects [:ref :form/r] i :i64] :i64
+     (if (>= i (vector-count functions))
+       0
+       (let [_ (check-abort-facet-unwind-one! (fl-nth functions i) function-effects)]
+         (check-abort-facet-unwind-from functions function-effects (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn check-abort-facet-unwind! [functions [:list [:ref :form/r]] function-effects [:ref :form/r]] [:list [:ref :form/r]]
+     (let [_ (check-abort-facet-unwind-from functions function-effects 0)]
+       functions))
+   :default nil)
+
+#?(:kotoba nil :default
+(defn check-abort-facet-unwind!
+  "Precondition :checked-lexical-facet-unwind, refused where it would be
+  needed: a function that throws, or catches, while its inferred effect row
+  carries a dataspace facet operation. An abort leaving such a scope would
+  skip the `facet-leave!` obligation, and slice 1 has no unwind that runs it.
+  The row is the interprocedural one, so a facet operation in a callee counts."
+  [functions function-effects]
+  (doseq [{:keys [name source-name abort-error-type abort-own-throw? abort-catches?]} functions
+          :when (or abort-error-type abort-catches?)]
+    (let [row (get function-effects name #{})
+          ;; A row's wire id is a BigInt on ClojureScript and the registry's
+          ;; a Number, and `contains?` compares them unequal -- so until
+          ;; 2026-09-25 this guard never fired on the nbb route: a throw in a
+          ;; facet scope was ADMITTED there and refused only on the JVM
+          ;; (measured on lang/conformance/abort/negative/throw_in_facet_scope
+          ;; through `kotoba.sema/analyze` under nbb). Compare as numbers.
+          wire-id (fn [id] #?(:clj id :cljs (js/Number id)))
+          facet-effects (filter #(and (vector? %) (contains? dataspace-capability-ids (wire-id (second %)))) row)]
+      (when (seq facet-effects)
+        (reject! (str (cond abort-own-throw? "throw"
+                            abort-error-type "abort"
+                            :else "try")
+                      " in function " (or source-name name)
+                      " whose effect row has a dataspace facet operation "
+                      (pr-str (into #{} (map #(get capability-id->name (wire-id (second %)))) facet-effects))
+                      " is not admitted in abort slice 1: precondition "
+                      ":checked-lexical-facet-unwind is not met")
+                 name :kotoba.error/abort-precondition))))))

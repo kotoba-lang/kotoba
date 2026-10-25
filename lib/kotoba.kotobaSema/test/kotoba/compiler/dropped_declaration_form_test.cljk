@@ -1,0 +1,438 @@
+(ns kotoba.compiler.dropped-declaration-form-test
+  "The dual of the crash sweep: a declaration form that COMPILES and is then
+  silently dropped.
+
+  `malformed-definition-form-test` closed the case where a malformed
+  declaration reached a host error. This file closes the other end of the same
+  layer -- the shapes that were ADMITTED, emitted nothing, and left the caller
+  with a program that compiled without the thing they wrote.
+
+  Measured 2026-09-03 through `amu check --jvm-free` (amu 57ba0ee0) and
+  directly against this repository at 5917518b:
+
+      (extend-type)      exit 0   admitted, declaration dropped
+      (extend-type nil)  exit 0   admitted, declaration dropped
+      (extend-type 42)   exit 0   admitted, declaration dropped
+      (defprotocol)      exit 65  refused
+      (defrecord)        exit 65  refused
+      (extend-protocol)  exit 65  refused
+      (definterface)     exit 65  refused -- IN defprotocol's NAME
+
+  Two defects, and one line that had to be drawn before either could be fixed.
+
+  1. `extend-type` was the only sibling in its family that admitted. The arm
+     read `(let [[_ record-name & extra] form] ...)` and fed `extra` to
+     `protocol-extension-groups`, whose loop returns `[]` on an empty
+     remainder; `mapcat` over no groups called nothing, and NOTHING ELSE in
+     the arm looked at `record-name`. The whole-source pass then removed the
+     form along with the well-formed declarations. `extend-protocol` states
+     the same requirement up front and refuses; `extend-type` now says the
+     mirror of that sentence.
+
+  2. `definterface` shares `protocol-form->info` with `defprotocol` and
+     inherited its name, so a caller who wrote `definterface` was told about
+     `defprotocol` -- a message that sends them to a form they did not write.
+     The head is now spelled from the form. That is safe for the same reason
+     `definition-heads` is a closed vocabulary: a form reaches this function
+     only because the caller MATCHED its head against one of two literals.
+
+  3. THE LINE. `dropped` is not `emitted nothing here`. An unreferenced `def`
+     constant and an uncalled `defdesugar` template also leave the HIR
+     unchanged, and both are correct: reference one and the HIR moves. The
+     defect is a shape that is inert in EVERY program -- and measuring that
+     is what stopped this change from being much larger.
+
+     A blanket `a template body may not contain a declaration` would have
+     been wrong. Measured the same day: `def`, `defrecord`, `defprotocol`,
+     `definterface`, `extend-type`, `extend-protocol`, `defdesugar`,
+     `defmulti` and `defmethod` are NOT in `reserved-function-names`, so
+     `(defn defrecord [x] (+ x 1))` is an admitted program and
+     `(defdesugar t [y] (defrecord y))` is an admitted CALL to it that
+     computes. Refusing those would have broken working source to close a
+     hole they were not in.
+
+     What is left is the intersection of the two vocabularies this layer
+     already has: `definition-heads` INTERSECT `reserved-function-names` =
+     `#{ns defn defn-}`. A template body holding one of those three can never
+     be a call, because the name may not be defined, and can never be a
+     declaration, because a template body is substituted into an expression
+     position. Inert in every program, so refused. The nine that may be calls
+     are asserted to STILL COMPUTE, in the same file."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.lang.coll :as set]
+            [kotoba.sema :as sema]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.kir :as kir]
+            [kotoba.artifact.core :as artifact]))
+
+(defn- outcome
+  "`nil` when the source is admitted, else the parts of the refusal a caller
+  can act on, with the exit code amu's CLI would return. Same shape as
+  `malformed-definition-form-test/outcome`, and deliberately so: the two files
+  measure the two halves of one layer and must report them the same way."
+  [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         (let [data (ex-data e)
+               phase (or (:phase data) :internal)]
+           {:message (ex-message e)
+            :phase phase
+            :code (:kotoba.error/code data)
+            :span (select-keys (or (:span data) {}) [:line :column])
+            :exit (case phase
+                    :usage 64
+                    (:decode :read :subset :admission :verify
+                     :project-link :module-lock) 65
+                    :definition-identity 66
+                    (:signature :trust) 77
+                    :output 74
+                    70)}))))
+
+(def ^:private main "(defn main [] 0)\n")
+(defn- unit [declaration] (str "(ns probe.p)\n" declaration "\n" main))
+
+(defn- digest
+  "`nil` when the source is refused, else a digest of its HIR. Two sources with
+  the same digest produced the same program."
+  [source]
+  (try (artifact/sha256 (pr-str (sema/analyze source)))
+       (catch #?(:clj Throwable :cljs :default) _ nil)))
+
+(defn- inert?
+  "True when `declaration` compiles to exactly the program that does not
+  contain it -- the operational meaning of `the declaration was dropped`.
+
+  This is the proof the report asked for, and it is stronger than exit 0: it
+  says the emitted HIR carries nothing the form put there, rather than that
+  nobody complained."
+  [declaration]
+  (let [with (unit declaration)
+        without (str "(ns probe.p)\n" main)
+        a (digest with)]
+    (and (some? a) (= a (digest without)))))
+
+;; --- 1. extend-type: the sibling that admitted ----------------------------
+
+(def ^:private extend-type-without-sections
+  "Every spelling of `extend-type` that carried no protocol section. The name
+  position is swept too, because the arm read it and then never looked at it:
+  `(extend-type 42)` and `(extend-type Undeclared)` were admitted on exactly
+  the same path as `(extend-type)`."
+  ["(extend-type)" "(extend-type nil)" "(extend-type 42)" "(extend-type 1.5)"
+   "(extend-type true)" "(extend-type \"s\")" "(extend-type :k)"
+   "(extend-type [v])" "(extend-type {})" "(extend-type #{})"
+   "(extend-type (l))" "(extend-type R)"])
+
+(deftest extend-type-without-a-protocol-section-is-refused
+  ;; One sentence, and it is the mirror of the sibling that already stated
+  ;; this fact: `extend-protocol requires one declared protocol and bounded
+  ;; type sections`. The two nouns swap and nothing else does, because the
+  ;; two forms differ only in which side is named first.
+  (doseq [declaration extend-type-without-sections]
+    (let [r (outcome (unit declaration))]
+      (is (= 65 (:exit r)) declaration)
+      (is (= "extend-type requires one declared record and bounded protocol sections"
+             (:message r)) declaration)
+      (is (= :kotoba.error/protocol-extension (:code r)) declaration)
+      (is (= {:line 2 :column 1} (:span r)) declaration)))
+  (testing "including in a program where the record and protocol both exist"
+    ;; The shape the report is really about. `(extend-type R)` next to a
+    ;; declared `R` and a declared `Q` reads like an extension and was one
+    ;; character away from being one; it emitted nothing and said nothing.
+    (let [source (str "(ns probe.p)\n"
+                      "(defprotocol Q (m [this]))\n"
+                      "(defrecord R [x])\n"
+                      "(extend-protocol Q R (m [this] (:x this)))\n"
+                      "(extend-type R)\n"
+                      "(defn main [] :i64 (m (->R 9)))\n")
+          r (outcome source)]
+      (is (= 65 (:exit r)))
+      (is (= "extend-type requires one declared record and bounded protocol sections"
+             (:message r)))
+      (is (= :kotoba.error/protocol-extension (:code r))))))
+
+(deftest a-well-formed-extend-type-is-still-admitted-and-still-computes
+  ;; The control. `no longer exit 0` would pass for an arm that had learned to
+  ;; refuse every `extend-type`, so the value is asserted, not just the exit.
+  (let [source (str "(ns probe.p)\n"
+                    "(defprotocol Q (m [this]))\n"
+                    "(defrecord R [x])\n"
+                    "(extend-type R Q (m [this] (:x this)))\n"
+                    "(defn main [] :i64 (m (->R 9)))\n")]
+    (is (nil? (outcome source)))
+    (is (= 9 #?(:clj (kir/execute (kir/lower (sema/analyze source)) 'main [] {})
+                :cljs (js/Number (kir/execute (kir/lower (sema/analyze source))
+                                              'main [] {})))))
+    (testing "two protocol sections in one form"
+      (let [two (str "(ns probe.p)\n"
+                     "(defprotocol Q (m [this]))\n"
+                     "(defprotocol P (n [this]))\n"
+                     "(defrecord R [x])\n"
+                     "(extend-type R Q (m [this] (:x this)) P (n [this] (:x this)))\n"
+                     "(defn main [] :i64 (+ (m (->R 4)) (n (->R 5))))\n")]
+        (is (nil? (outcome two)))))))
+
+(deftest extend-type-refusals-that-already-existed-still-refuse
+  ;; The guard runs before `protocol-extension-groups`, so the sections-level
+  ;; refusals it used to reach are now reported by the form-level sentence.
+  ;; Measured before the change, so the move is deliberate and visible rather
+  ;; than discovered later as a message that quietly changed.
+  (doseq [declaration ["(extend-type R nil)" "(extend-type R 42)"
+                       "(extend-type R [])" "(extend-type R ())"]]
+    (let [r (outcome (str "(ns probe.p)\n(defrecord R [x])\n" declaration "\n" main))]
+      (is (= 65 (:exit r)) declaration)
+      (is (= :kotoba.error/protocol-extension (:code r)) declaration)
+      (is (= "protocol extension section requires a protocol name and methods"
+             (:message r)) declaration)))
+  (testing "an undeclared record now answers in extend-type's own name"
+    (let [r (outcome (unit "(extend-type Undeclared Q (m [this] 0))"))]
+      (is (= 65 (:exit r)))
+      (is (= "extend-type requires one declared record and bounded protocol sections"
+             (:message r)))
+      (is (= :kotoba.error/protocol-extension (:code r))))))
+
+;; --- 2. the misattributed message -----------------------------------------
+
+(deftest definterface-refuses-in-its-own-name
+  ;; `(definterface)` reported `defprotocol requires ...`, sending a caller to
+  ;; a form they did not write. Both heads share `protocol-form->info`; the
+  ;; head is now read from the form, which is closed because the caller
+  ;; matched it against `protocol-declaration-heads`.
+  (doseq [spelling ["" " nil" " 42" " [v]" " {}" " I" " I nil" " I (m [])"
+                    " I (m [this]) (m [this])"]]
+    (testing (str "(definterface" spelling ")")
+      (let [r (outcome (unit (str "(definterface" spelling ")")))]
+        (is (= 65 (:exit r)) spelling)
+        (is (= "definterface requires unique bounded (method [this ...]) signatures"
+               (:message r)) spelling)
+        (is (= :kotoba.error/protocol-declaration (:code r)) spelling)
+        (is (= {:line 2 :column 1} (:span r)) spelling)))
+    (testing (str "(defprotocol" spelling ") keeps the sentence it always had")
+      (let [r (outcome (unit (str "(defprotocol" spelling ")")))]
+        (is (= 65 (:exit r)) spelling)
+        (is (= "defprotocol requires unique bounded (method [this ...]) signatures"
+               (:message r)) spelling)
+        (is (= :kotoba.error/protocol-declaration (:code r)) spelling))))
+  (testing "the two heads are the closed vocabulary the message is spelled from"
+    (is (= '#{defprotocol definterface} frontend/protocol-declaration-heads))
+    (is (set/subset? frontend/protocol-declaration-heads frontend/definition-heads)))
+  (testing "a well-formed definterface is still admitted and still computes"
+    (let [source (str "(ns probe.p)\n"
+                      "(definterface I (label [this]))\n"
+                      "(defrecord R [x])\n"
+                      "(extend-type R I (label [this] (:x this)))\n"
+                      "(defn main [] :i64 (label (->R 6)))\n")]
+      (is (nil? (outcome source)))
+      (is (= 6 #?(:clj (kir/execute (kir/lower (sema/analyze source)) 'main [] {})
+                  :cljs (js/Number (kir/execute (kir/lower (sema/analyze source))
+                                                'main [] {}))))))))
+
+;; --- 3. the desugar template body -----------------------------------------
+
+(def ^:private unspellable-heads
+  "The heads a template body may hold that can be nothing at all.
+
+  Derived, not chosen: a head in `definition-heads` is not a declaration in an
+  expression position, and a head in `reserved-function-names` may not be
+  defined as a function, so a head in BOTH can be neither. The other nine
+  definition heads may be function names and are asserted to still work."
+  '#{ns defn defn-})
+
+(deftest the-unspellable-heads-are-exactly-the-two-vocabularies-overlap
+  ;; If either vocabulary moves, this is the assertion that notices. Widening
+  ;; the check by hand instead would have refused `(defdesugar t [y]
+  ;; (defrecord y))`, which is a call to a function a program may define.
+  (is (= unspellable-heads
+         (set/intersection frontend/definition-heads
+                           frontend/reserved-function-names))))
+
+(deftest a-template-body-holding-an-unspellable-head-is-refused
+  (doseq [[declaration label]
+          [["(defdesugar t [] (defn g [] 0))"        "defn"]
+           ["(defdesugar t [] (defn- g [] 0))"       "defn-"]
+           ["(defdesugar t [] (ns other.n))"         "ns"]
+           ["(defdesugar t [x] (+ x (defn g [] 0)))" "nested below the root"]
+           ["(defdesugar t [x] (let [a x] (defn g [] 0)))" "inside a let"]]]
+    (testing label
+      (let [r (outcome (unit declaration))]
+        (is (= 65 (:exit r)) declaration)
+        (is (= "desugar template body may not contain a reserved head form"
+               (:message r)) declaration)
+        (is (= :kotoba.error/subset-reject (:code r)) declaration)
+        (is (= {:line 2 :column 1} (:span r)) declaration))))
+  (testing "and it is refused whether or not the template is ever called"
+    ;; Uncalled it was dropped; called it reached `operation has no admitted
+    ;; lowering`, which named neither the template nor the declaration in it.
+    (let [r (outcome (str "(ns probe.p)\n(defdesugar t [] (defn g [] 0))\n"
+                          "(defn main [] (t))\n"))]
+      (is (= 65 (:exit r)))
+      (is (= "desugar template body may not contain a reserved head form"
+             (:message r))))))
+
+(deftest the-nine-spellable-heads-in-a-template-body-still-compute
+  ;; The control that keeps the refusal above from being a blanket ban. Each
+  ;; of these is a function a program may define, called from a template body,
+  ;; and each must still produce its value.
+  (let [spellable (sort (set/difference frontend/definition-heads unspellable-heads))]
+    (is (= 9 (count spellable)))
+    (doseq [head spellable]
+      (let [source (str "(ns probe.p)\n"
+                        "(defn " head " [x] :i64 (+ x 1))\n"
+                        "(defdesugar t [y] (" head " y))\n"
+                        "(defn main [] :i64 (t 6))\n")]
+        (is (nil? (outcome source)) (str head))
+        (is (= 7 #?(:clj (kir/execute (kir/lower (sema/analyze source)) 'main [] {})
+                    :cljs (js/Number (kir/execute (kir/lower (sema/analyze source))
+                                                  'main [] {}))))
+            (str head))))))
+
+;; --- 4. byte identity: only the wrong programs changed --------------------
+
+(def ^:private extension-source
+  "Every arm the change touches, in one program that must not move: two
+  protocol declarations under BOTH heads, two records, two `extend-type`
+  forms (one of them with two sections), and an `extend-protocol`."
+  (str "(ns golden.c)\n"
+       "(defprotocol Area (area [this]))\n"
+       "(definterface Named (label [this]))\n"
+       "(defrecord Box [w h])\n"
+       "(defrecord Tag [n])\n"
+       "(extend-type Box Area (area [this] (* (:w this) (:h this))))\n"
+       "(extend-type Tag Area (area [this] (:n this)) Named (label [this] (:n this)))\n"
+       "(extend-protocol Named Box (label [this] (:w this)))\n"
+       "(defn main [] :i64 (+ (area (->Box 3 4)) (label (->Box 5 6)) (area (->Tag 7)) (label (->Tag 8))))\n"))
+
+(def ^:private template-source
+  "The other arm: three templates whose bodies hold `if`, `let`, `do` and a
+  call. Those four heads are in `structural-heads` beside `defn` and `ns`, and
+  the body check must not have swept them up with the three it refuses."
+  (str "(ns golden.d)\n"
+       "(defdesugar clamp [x lo hi] (if (< x lo) lo (if (> x hi) hi x)))\n"
+       "(defdesugar twice [x] (let [a x] (do (+ a a))))\n"
+       "(defdesugar unused [x] (fn-free x))\n"
+       "(defn fn-free [x] :i64 x)\n"
+       "(defn main [] :i64 (+ (clamp 9 0 6) (twice 5)))\n"))
+
+(def ^:private goldens
+  "Digests of `(pr-str hir)` and `(pr-str (kir/lower hir))` for the two
+  programs above, taken at 5917518b BEFORE the guards existed.
+
+  Per runtime, because the digest is over a RENDERING: a `.kotoba` integer
+  literal is a bigint, which `pr-str` writes as `42` on the JVM and `42n`
+  under nbb. Both pairs were measured pre-fix and both are asserted, so
+  neither runtime's half is a place where nothing is checked."
+  #?(:clj  {:extension-hir "b4dbfab2faef858675c8258888a7c1411342efd7188cb132bbe7e95a0016adde"
+            :extension-kir "af8564f7611b960ce10489b3c7143da870ed5ce3c33e404978e7b06b792b4f03"
+            :template-hir  "fcd71f03de62d83c6409603b580a6590d58d79232293849068aa4a19eb4851fb"
+            :template-kir  "7113554879b84353aa276b36ec2e2e69107cb5db606f83de365888c9a2672417"}
+     :cljs {:extension-hir "1e6453a08b16739e7258b44dd893be615fe7a66c87eda3cb73637c5122dea91a"
+            :extension-kir "c70e21b9bc5caf4b699f9b6e24bfe422dafda9b8569ecbc5f107e3b3e02963fb"
+            :template-hir  "15765d560a80996c3a91fde0f86d612111e31fd4b9424995274aac1c8baa2d9b"
+            :template-kir  "d6d308b0f4bcf75523c2ac6ceb316b543defff82ce23d9984a40045524310cc6"}))
+
+(defn- w [value] #?(:clj value :cljs (js/Number value)))
+
+(deftest a-correct-declaration-emits-the-same-bytes-as-before-the-fix
+  (testing "records, both protocol heads, extend-type and extend-protocol"
+    (let [hir (sema/analyze extension-source)]
+      (is (= (:extension-hir goldens) (artifact/sha256 (pr-str hir))))
+      (is (= (:extension-kir goldens) (artifact/sha256 (pr-str (kir/lower hir)))))
+      (is (= 32 (w (kir/execute (kir/lower hir) 'main [] {}))))))
+  (testing "desugar templates whose bodies hold if, let, do and a call"
+    (let [hir (sema/analyze template-source)]
+      (is (= (:template-hir goldens) (artifact/sha256 (pr-str hir))))
+      (is (= (:template-kir goldens) (artifact/sha256 (pr-str (kir/lower hir)))))
+      (is (= 16 (w (kir/execute (kir/lower hir) 'main [] {})))))))
+
+;; --- 5. the sweep, with a floor -------------------------------------------
+
+(def ^:private shapes
+  "What goes after the head. Zero arguments, a non-symbol name of every
+  literal kind, and then the shapes that carry a name and something after it."
+  ["" " nil" " 42" " 1.5" " true" " \"s\"" " :k" " [v]" " {}" " #{}" " (l)"
+   " f" " f nil" " f 42" " f []" " f [x]" " f ()" " f {}"
+   " f P" " f P ()" " f P nil" " f P 42" " f [] 0" " f [x] x"])
+
+(def ^:private conditionally-effective
+  "The declarations that compile to the program without them and are RIGHT to:
+  an unreferenced constant and an uncalled template. Each is proved effective
+  by a witness below, which is what separates this list from the defect.
+
+  A shape reaching `inert` that is not here fails the sweep. That is the
+  assertion the report is about: the next silently dropped declaration has to
+  land in this set to go unnoticed, and putting it there means writing a
+  witness that shows it computing."
+  #{"(def f nil)" "(def f 42)" "(def f [])" "(def f {})"
+    "(defdesugar f [] 0)" "(defdesugar f [x] x)"})
+
+(deftest every-conditionally-effective-shape-has-a-witness
+  ;; Without this, `conditionally-effective` would be a place to hide a defect.
+  (testing "a constant moves the HIR when it is referenced"
+    (let [without (digest "(ns probe.p)\n(def f 42)\n(defn main [] 0)\n")
+          with (digest "(ns probe.p)\n(def f 42)\n(defn main [] :i64 f)\n")]
+      (is (some? with))
+      (is (not= without with))
+      (is (= 42 (w (kir/execute (kir/lower (sema/analyze
+                                            "(ns probe.p)\n(def f 42)\n(defn main [] :i64 f)\n"))
+                                'main [] {}))))))
+  (testing "a template moves the HIR when it is called"
+    (let [without (digest "(ns probe.p)\n(defdesugar f [x] x)\n(defn main [] 0)\n")
+          with (digest "(ns probe.p)\n(defdesugar f [x] x)\n(defn main [] :i64 (f 5))\n")]
+      (is (some? with))
+      (is (not= without with))
+      (is (= 5 (w (kir/execute (kir/lower (sema/analyze
+                                           "(ns probe.p)\n(defdesugar f [x] x)\n(defn main [] :i64 (f 5))\n"))
+                               'main [] {})))))))
+
+(deftest no-declaration-is-admitted-and-dropped
+  ;; The evidence floor. Before this change the same sweep found twelve
+  ;; `extend-type` spellings whose HIR was byte-identical to the program with
+  ;; the line deleted -- admitted, and gone.
+  ;;
+  ;; `scanned` and `refused` must both clear a floor: a sweep that measured
+  ;; nothing, and a sweep whose every probe was accidentally admitted, would
+  ;; otherwise report the same clean answer as a sweep that measured
+  ;; everything. `inert` is asserted as a SET rather than a count, because a
+  ;; new dropped shape appearing while an old one starts refusing would keep
+  ;; any count the same.
+  (let [scanned (atom 0)
+        refused (atom 0)
+        admitted (atom 0)
+        inert (atom #{})]
+    (doseq [head (sort frontend/definition-heads)
+            shape shapes]
+      (swap! scanned inc)
+      (let [declaration (str "(" head shape ")")
+            source (if (= 'ns head)
+                     (str declaration "\n" main)
+                     (unit declaration))]
+        (if (nil? (outcome source))
+          (do (swap! admitted inc)
+              (when (and (not= 'ns head) (inert? declaration))
+                (swap! inert conj declaration)))
+          (swap! refused inc))))
+    (is (<= 250 @scanned) (str "scanned=" @scanned))
+    (is (<= 200 @refused) (str "refused=" @refused))
+    (is (<= 1 @admitted) (str "admitted=" @admitted))
+    (is (= conditionally-effective @inert)
+        (str "silently dropped: " (pr-str (sort (set/difference @inert conditionally-effective)))))))
+
+(deftest no-template-body-is-admitted-and-dropped
+  ;; The same question for the arm the top-level sweep cannot reach: a
+  ;; declaration head written INSIDE a template body. Three must refuse; the
+  ;; other nine must be admitted, because they may be calls.
+  (let [scanned (atom 0) refused (atom 0) spellable (atom 0)]
+    (doseq [head (sort frontend/definition-heads)]
+      (swap! scanned inc)
+      (let [r (outcome (unit (str "(defdesugar t [x] (" head " x))")))]
+        (if (contains? unspellable-heads head)
+          (do (swap! refused inc)
+              (is (= 65 (:exit r)) (str head))
+              (is (= "desugar template body may not contain a reserved head form"
+                     (:message r)) (str head)))
+          (do (swap! spellable inc)
+              (is (nil? r) (str head))))))
+    (is (= 12 @scanned) (str "scanned=" @scanned))
+    (is (= 3 @refused) (str "refused=" @refused))
+    (is (= 9 @spellable) (str "spellable=" @spellable))))

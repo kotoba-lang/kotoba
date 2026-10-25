@@ -1,0 +1,174 @@
+(ns kotoba.compiler.defn-body-sequences-test
+  "A `defn` / `defn-` / `fn` body of several forms is one `do` (2026-09-12,
+  adr-2609111900, the selfhost ceiling loop).
+
+  CLASSIFICATION: IMPLEMENTATION STATE, not a property. `lang/guest-grammar.edn`
+  `:implicit-body-forms` had `defn defn- fn` in `:refuses` (\"exactly one body
+  expression\") while `let when when-not when-let` were in `:sequences`
+  (\"collapse to `do`\"), and `do` is a first-class head on every backend --
+  sequential drop, last value. So `(defn f [..] a b)` is `(defn f [..] (do a
+  b))` by the grammar's own `do` entry, and admitting the spelling adds no
+  semantics. The authority moved the three heads to `:sequences` first
+  (kotoba-lang, same day); this suite is the frontend honouring it.
+
+  The wall: `lang/selfhost-distance.edn` measurement 14 (amu 75f2c37) refused
+  14 of the compiler's own 225 modules with `function must contain one result
+  expression`, and a reader survey of the same files found 272 `defn` /
+  `defn-` forms with more than one body expression -- 177 of them opening
+  with `when-not` and 41 with `when`, i.e. a validation guard `(when-not ok
+  (throw (ex-info ...)))` followed by the result.
+
+  Measured at d17a490 BEFORE the change (the same probes, the unmodified
+  frontend on the classpath):
+
+      (defn f [x :i64] :i64 (+ x 1) (* x 2))      function must contain one result expression
+      (fn [x] (+ x 1) (* x 2))  as a let value     single-arity fn value requires exactly one body
+      (fn ([x] a b) ([x y] c))                     multi-arity fn requires ([params] body) clauses
+      (map (fn [x] a b) xs)                        map fn must contain one result expression; explicit (do ...) is the spelling
+      (map-indexed (fn [i x] a b) xs)              map-indexed fn must contain one result expression; explicit (do ...) is the spelling
+      (reduce (fn [acc x] a b) 0 xs)               reduce fn must be (fn [acc x] single-expr)
+      (filter (fn [x] a b) xs)                     filter pred must be (fn [x] single-expr)
+
+  Each positive below RUNS to the value of its LAST form, so a collapse that
+  kept the first form (the `let` defect of 2026-09-02) cannot pass. The CID
+  control analyses the implicit and the explicit spelling to the SAME
+  analysis -- one function, one body, so one definition CID.
+
+  What stays refused, by its own sentence, pinned here in the negative
+  direction: an EMPTY defn body; `loop` (`:refuses`, its helper lowering);
+  `try` (`lang/abort-ability.edn` `:try :body-forms 1`); a protocol method
+  (its own diagnostic, not this profile's); an empty map callback."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- module [defs body]
+  (str "(ns m.probe)\n" defs "\n(defn main [] :i64 " body ")\n"))
+
+(defn- answer
+  "Analyse, lower and RUN `main`; the value, not the admission."
+  [defs body]
+  (let [v (kir/execute (kir/lower (sema/analyze (module defs body))) 'main [] {})]
+    #?(:clj (long v) :cljs (js/Number v))))
+
+(defn- refusal [defs body]
+  (try (do (sema/analyze (module defs body)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+(defn- function-named [hir name]
+  (first (filter #(= name (:name %)) (:functions hir))))
+
+;; ----------------------------------------------------------------- defn
+
+(deftest a-two-form-defn-body-answers-its-last-form
+  ;; 21 -> (+ x 1) is dropped, (* x 2) is the value: 42. A collapse that
+  ;; kept the FIRST form would answer 22 and fail here.
+  (is (= 42 (answer "(defn f [x :i64] :i64 (+ x 1) (* x 2))" "(f 21)")))
+  (testing "three forms; the middle one is neither the value nor a crash"
+    (is (= 42 (answer "(defn f [x :i64] :i64 (+ x 1) (+ x 2) (* x 2))" "(f 21)"))))
+  (testing "defn- is the same profile"
+    (is (= 42 (answer "(defn- f [x :i64] :i64 (+ x 1) (* x 2))" "(f 21)")))))
+
+(deftest the-implicit-and-the-explicit-do-are-one-definition
+  ;; The CID control. `sema/analyze` of the two spellings is EQUAL -- every
+  ;; function, every body, so every definition CID amu mints from it.
+  (let [implicit (sema/analyze (module "(defn f [x :i64] :i64 (+ x 1) (* x 2))" "(f 21)"))
+        explicit (sema/analyze (module "(defn f [x :i64] :i64 (do (+ x 1) (* x 2)))" "(f 21)"))]
+    (is (= explicit implicit) "one analysis for the two spellings")
+    (is (= (:functions explicit) (:functions implicit)))
+    (testing "and the body IS a do -- the non-final form survives to HIR"
+      (let [body (:body (function-named implicit 'f))]
+        (is (seq? body))
+        (is (= 'do (first body)))
+        (is (= 3 (count body)) "(do (+ x 1) (* x 2)): both forms kept")))))
+
+(deftest a-validation-guard-before-the-result
+  ;; The shape 177 of the compiler's own defns have: a `when-not` guard that
+  ;; throws, then the result. The thrower is `defn-` and `main` catches,
+  ;; because an aborting EXPORT is refused at the boundary
+  ;; (`lang/abort-ability.edn`: `unhandled abort at export boundary`) --
+  ;; measured, and that refusal is not this wave's. The declared result is
+  ;; the source type `:i64`; abort lowering makes it `[:result :i64 :keyword]`.
+  (let [defs "(defn- g [x :i64] :i64 (when-not (< 0 x) (throw :neg)) (+ x 1))"]
+    (is (= 42 (answer defs "(try (g 41) (catch e 0))")) "the guard passes: the result")
+    (is (= 7 (answer defs "(try (g -1) (catch e 7))")) "the guard fires: the handler")
+    (let [g (function-named (sema/analyze (module defs "(try (g 41) (catch e 0))")) 'g)]
+      (is (= #{:abort} (:effects g)))
+      (is (= [:result :i64 :keyword] (:result g))))))
+
+(deftest multi-arity-and-variadic-clauses-sequence-too
+  (testing "a multi-arity clause"
+    (is (= 42 (answer "(defn f ([x] (+ x 1) (* x 2)) ([x y] (+ x y)))" "(f 21)"))))
+  (testing "a variadic clause, at two used arities"
+    ;; (f 1) -> 2, (f 10 20) -> 20: 22
+    (is (= 22 (answer "(defn- f [a & r] (+ a 1) (* a 2))" "(+ (f 1) (f 10 20))")))))
+
+;; ------------------------------------------------------------------- fn
+
+(deftest an-fn-value-with-two-body-forms
+  (is (= 42 (answer "" "(let [f (fn [x] (+ x 1) (* x 2))] (f 21))")))
+  (testing "a multi-arity fn clause"
+    (is (= 42 (answer "" "(let [f (fn ([x] (+ x 1) (* x 2)) ([x y] (+ x y)))] (f 21))")))))
+
+(deftest a-callback-with-two-body-forms-answers-its-last-form
+  (testing "map"
+    (is (= 8 (answer "(defn f [xs] (map (fn [x] (+ x 1) (* x 2)) xs))" "(vector-at (f [3 4]) 1)"))))
+  (testing "map-indexed"
+    (is (= 8 (answer "(defn f [xs] (map-indexed (fn [i x] (+ x 1) (* x 2)) xs))" "(vector-at (f [3 4]) 1)"))))
+  (testing "reduce"
+    (is (= 7 (answer "(defn f [xs] (reduce (fn [acc x] (+ acc 0) (+ acc x)) 0 xs))" "(f [3 4])"))))
+  (testing "filter"
+    (is (= 4 (answer "(defn f [xs] (filter (fn [x] (+ x 0) (> x 3)) xs))" "(vector-at (f [3 4]) 0)")))))
+
+;; ------------------------------------------------ still refused, by name
+
+(deftest an-empty-body-is-still-refused-by-its-sentence
+  ;; 2026-10-20 (issue #785, option (a)): the erased-body case below no longer
+  ;; refuses at load. The reader's no-reading marker tells it apart from a body
+  ;; the author left empty, and a HOST-ONLY function is admitted with a body
+  ;; that refuses by name when called -- the module loads, the refusal lands at
+  ;; the call site. Measured before the change: load refusal, sentence below;
+  ;; after: `unhandled abort at export boundary` at the call.
+  (testing "defn whose only body form is a #?(:clj ...) -- a HOST-ONLY function traps at the call"
+    (is (= "unhandled abort at export boundary; catch it with try: main"
+           (:message (refusal "(defn f [x :i64] :i64 #?(:clj (inc x) :cljs (inc x)))" "(f 21)")))))
+  (testing "defn"
+    (is (= "function body is empty; a function must contain one result expression (a body that is only a `#?(:clj ...)` with no :kotoba or :default clause reads as nothing)"
+           (:message (refusal "(defn f [x :i64] :i64)" "(f 21)")))))
+  (testing "fn value"
+    (is (= "fn value requires unique arities with zero to four unique parameters"
+           (:message (refusal "" "(let [f (fn [x])] (f 21))")))))
+  (testing "multi-arity fn clause"
+    (is (= "multi-arity fn requires ([params] body) clauses"
+           (:message (refusal "" "(let [f (fn ([x]) ([x y] (+ x y)))] (f 21))")))))
+  (testing "map callback"
+    (is (= "map fn requires a body expression"
+           (:message (refusal "(defn f [xs] (map (fn [x]) xs))" "(vector-at (f [3 4]) 1)")))))
+  (testing "map-indexed callback"
+    (is (= "map-indexed fn requires a body expression"
+           (:message (refusal "(defn f [xs] (map-indexed (fn [i x]) xs))" "(vector-at (f [3 4]) 1)")))))
+  (testing "reduce callback"
+    (is (= "reduce fn must be (fn [acc x] single-expr)"
+           (:message (refusal "(defn f [xs] (reduce (fn [acc x]) 0 xs))" "(f [3 4])")))))
+  (testing "filter predicate"
+    (is (= "filter pred must be (fn [x] single-expr)"
+           (:message (refusal "(defn f [xs] (filter (fn [x]) xs))" "(vector-at (f [3 4]) 0)"))))))
+
+(deftest the-heads-that-stay-in-refuses-still-refuse
+  ;; `:implicit-body-forms :refuses #{loop try catch}` after the move.
+  ;; Sentences measured at d17a490 and unchanged by this wave.
+  (testing "loop"
+    (is (= "loop requires exactly one body expression (this profile has no `do`)"
+           (:message (refusal "" "(loop [i 0] (+ i 1) i)")))))
+  (testing "try"
+    (is (= "try requires exactly one body expression and one catch clause"
+           (:message (refusal "(defn- g [x :i64] :i64 (if (< x 0) (throw :neg) x))"
+                              "(try (g 1) (g 2) (catch e 0))")))))
+  (testing "a protocol method has its own diagnostic and is not this profile's"
+    (is (= "protocol method must contain one result expression"
+           (:message (refusal (str "(defprotocol P (m [this x]))\n"
+                                   "(defrecord R [v :i64])\n"
+                                   "(extend-type R P (m [this x] (+ x 1) (* x 2)))")
+                              "(m (->R 1) 21)"))))))

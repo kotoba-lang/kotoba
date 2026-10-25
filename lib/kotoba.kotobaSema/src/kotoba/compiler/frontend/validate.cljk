@@ -1,0 +1,1445 @@
+(ns kotoba.compiler.frontend.validate
+  "Module `validate` of kotoba.compiler.frontend, cut from the original namespace by amu refactor split (26 forms, 982 lines). Depends on: base, kernel-region, closure-types, expand, namespace-defs."
+  ;; the Kotoba-route interface: the names the other frontend modules, kotoba.sema and the native guests use
+  ;; (the linked project export bound is 1024 clauses, ADR 0363 port)
+  #?(:kotoba {:kotoba/export [def-parts holds-symbol? max-bindings max-expression-nodes max-list-items max-typed-set-items quote-form? validate-ctx validate-expr validate-expr-in]})
+  (:require [kotoba.lang.text :as str]
+            [kotoba.kir.value :as value]
+            #?@(:kotoba [[kotoba.form :as form] [kotoba.compiler.validate-expr :as vx]])
+            #?@(:cljs [[kotoba.kir.cljs-i64 :as i64]])
+            [kotoba.compiler.frontend.base :refer [#?@(:kotoba [code-point-width fdrop fget fhead-is? fkw fl-add fl-drop fl-nth fl-slice fput pr-form] :default [if-parts let-body refuse-reader-tagged-host-literal! reject! reject-call-arity! reject-operation-arity! first-truthy])]]
+            [kotoba.compiler.frontend.kernel-region :refer [integer-literal? #?@(:kotoba [] :default [kernel-memory-operations]) #?@(:kotoba [sym-is?])]]
+            [kotoba.compiler.frontend.closure-types :refer [canonical-list-type? canonical-typed-map-type? generic-option-type? heterogeneous-vector-type? parametric-result-type? record-type? type-alias-form? typed-set-type? validate-value-type! variant-type?]]
+            [kotoba.compiler.frontend.expand :refer [kotoba-integer? max-function-docstring-chars valid-name?]]
+            [kotoba.compiler.frontend.namespace-defs :refer [forbidden-heads heterogeneous-vector-index! internal-failure! unbound-symbol! unknown-operation! #?@(:kotoba [grammar-declared-heads] :default [arithmetic compact-graph-operations comparisons decimal-operations document-fixed-operations f32-operations f64-operations float-division-heads heap-operations i32-operations i64-operations image-symbol-operations kernel-privileged-operations kgraph-operations parametric-result-operations region-operations rodata-literal-operations string-operations typed-f64-vector-operations typed-map-operations typed-safe-value-operations typed-vector-operations xml-operations])]])
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                          [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                                 :form/rd [:record :form/rd [[:form [:ref :form/r]] [:pos :i64]]]
+                                 ;; a refusal: the Kotoba-route `reject!` throws one (ADR 0007)
+                                 :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                                 ;; the desugar env and its results (docs/selfhost-frontend-typemodel-design.md 1.2)
+                                 :fe/env [:record :fe/env [[:counter :i64] [:result [:ref :form/r]] [:none :bool] [:arities [:ref :form/r]] [:lexical [:ref :form/r]] [:types [:ref :form/r]] [:docfns [:ref :form/r]] [:loop-counter :i64] [:tbl [:ref :form/r]] [:schemas [:ref :form/r]] [:lazy :bool] [:abort-ctx :string] [:used-caps [:ref :form/r]] [:options [:ref :form/r]] [:helpers [:ref :form/r]] [:shapes [:ref :form/r]] [:lambda-counter :i64] [:lambdas [:ref :form/r]] [:loop-result [:ref :form/r]] [:loop-known [:ref :form/r]] [:dispatchers [:ref :form/r]] [:uses-apply :bool] [:uses-lazy :bool] [:contracts [:ref :form/r]]]]
+                                 :fe/dr [:record :fe/dr [[:env [:ref :fe/env]] [:form [:ref :form/r]]]]
+                                 :fe/drs [:record :fe/drs [[:env [:ref :fe/env]] [:forms [:list [:ref :form/r]]]]]})))
+
+;; forward references inside this module (the cut keeps the original form order)
+#?(:kotoba nil :default (declare holds-symbol? validate-expr validate-expr-impl))
+
+
+;; ---- quoted data: a symbol, a vector of symbols, or an atom that holds none (maps and sets print in pr-str order: unported) ----
+#?(:kotoba
+   (defn holds-symbol-from? [kids [:list [:ref :form/r]] i :i64] :bool
+     (if (>= i (vector-count kids))
+       false
+       (or (holds-symbol? (typed-list-nth [:list [:ref :form/r]] kids i)) (holds-symbol-from? kids (+ i 1)))))
+   :default nil)
+
+;; fwstore: the ceiling on `kernel-uefi-alloc-region`'s page count.
+;;
+;; 2^40 pages is 2^52 bytes, so `page-count * 4096` stays an exact i64 on both
+;; runtimes and the comparison against a declared window cannot wrap. It is
+;; NOT a policy about how much memory a boot path may ask for -- that belongs
+;; to the firmware, which answers `EFI_OUT_OF_RESOURCES` -- and it is not a
+;; second window ceiling either.
+;;
+;; The ceiling that BITES is the derived one, and only for small allocations:
+;; every checked window is already bounded by its tier, and the widest tier is
+;; 65536 bytes, so `page-count * 4096` is the tighter of the two exactly when
+;; `page-count` is below 16. What this refuses, concretely, is a 64 KiB window
+;; declared over a one-page allocation.
+#?(:kotoba
+   (defn alloc-region-maximum-pages [] :i64 1099511627776)
+   :default
+(def alloc-region-maximum-pages 1099511627776))
+
+#?(:kotoba
+   (defn hex-code? [c :i64] :bool
+     (or (and (>= c 48) (<= c 57)) (and (>= c 97) (<= c 102)) (and (>= c 65) (<= c 70))))
+   :default nil)
+
+;; every code of S in [I, END) is a hex digit
+#?(:kotoba
+   (defn hex-range? [s :string i :i64 end :i64] :bool
+     (if (>= i end)
+       true
+       (if (hex-code? (string-code-point-at s i))
+         (hex-range? s (+ i 1) end)
+         false)))
+   :default nil)
+
+#?(:kotoba
+   (defn hex-text? [text :string] :bool
+     (and (= 0 (rem (string-length text) 2))
+          (hex-range? text 0 (string-length text))))
+   :default
+(defn hex-text? [text]
+  (and (even? (count text))
+       (every? (fn [character]
+                 (let [code #?(:clj (int character)
+                               :cljs (.charCodeAt character 0))]
+                   (or (<= 48 code 57) (<= 97 code 102) (<= 65 code 70))))
+               text))))
+
+;; the string holds no UTF-16 surrogate code point (UTF-8 cannot spell one, so
+;; the scan only proves it reads cleanly to the end)
+#?(:kotoba
+   (defn surrogate-free? [s :string i :i64] :bool
+     (if (>= i (string-length s))
+       true
+       (let [c (string-code-point-at s i)]
+         (if (and (>= c 55296) (<= c 57343))
+           false
+           (surrogate-free? s (+ i (code-point-width c)))))))
+   :default nil)
+
+;; 8-4-4-4-12: dashes at 8, 13, 18, 23, hex everywhere else
+#?(:kotoba
+   (defn guid-text? [text :string] :bool
+     (and (= 36 (string-length text))
+          (= 45 (string-code-point-at text 8))
+          (= 45 (string-code-point-at text 13))
+          (= 45 (string-code-point-at text 18))
+          (= 45 (string-code-point-at text 23))
+          (hex-range? text 0 8)
+          (hex-range? text 9 13)
+          (hex-range? text 14 18)
+          (hex-range? text 19 23)
+          (hex-range? text 24 36)))
+   :default nil)
+
+#?(:kotoba
+   (defn rodata-literal-content? [op [:ref :form/r] text [:ref :form/r]] :bool
+     (and (form/is-string? text)
+          (if (sym-is? op "ucs2")
+            (surrogate-free? (form/string-value text) 0)
+            (if (sym-is? op "guid")
+              (guid-text? (form/string-value text))
+              (if (or (sym-is? op "bytes-literal") (sym-is? op "bytes-literal-length"))
+                (hex-text? (form/string-value text))
+                false)))))
+   :default
+(defn rodata-literal-content?
+  "True when TEXT is a well-formed literal for OP.
+
+  This duplicates `kotoba.gmir/rodata-content?` on purpose and is not allowed
+  to disagree with it -- the suite compares the two on the same corpus. It
+  exists because the refusals differ in KIND: this one names a source form and
+  a line, and the one in kotoba-gmir names an instruction. A malformed GUID has
+  no failure mode downstream (sixteen bytes get placed either way and the
+  firmware answers EFI_UNSUPPORTED, which is what a machine without that
+  protocol answers), so the shape has to be refused, and it should be refused
+  where the author can see what they wrote."
+  [op text]
+  (and (string? text)
+       (case op
+         ;; UCS-2, so a surrogate is refused rather than encoded: emitting the
+         ;; pair renders as two replacement glyphs, a wrong answer that looks
+         ;; like a working one.
+         ucs2 (not-any? (fn [character]
+                          (let [code #?(:clj (int character)
+                                        :cljs (.charCodeAt character 0))]
+                            (<= 0xd800 code 0xdfff)))
+                        text)
+         guid (let [fields (reduce (fn [out character]
+                                     (if (= \- character)
+                                       (conj out "")
+                                       (conj (pop out) (str (peek out) character))))
+                                   [""]
+                                   text)]
+                (and (= 5 (count fields))
+                     (= [8 4 4 4 12] (mapv count fields))
+                     (every? hex-text? fields)))
+         (bytes-literal bytes-literal-length) (hex-text? text)
+         false))))
+#?(:kotoba
+   (defn max-expression-nodes [] :i64 4194304)
+   :default
+(def max-expression-nodes 4194304))
+#?(:kotoba
+   (defn max-bindings [] :i64 4096)
+   :default
+(def max-bindings 4096))
+#?(:kotoba
+   (defn max-list-items [] :i64 128)
+   :default
+(def max-list-items 128))
+#?(:kotoba
+   (defn max-typed-set-items [] :i64 32)
+   :default
+(def max-typed-set-items 32))
+#?(:kotoba
+   (defn max-typed-map-entries [] :i64 31)
+   :default
+(def max-typed-map-entries 31))
+
+;; A refusal is an abort (ADR 0007); `require-k` is module-local on purpose (an imported aborting
+;; function is typed [:result T E] here and does not propagate through a plain call).
+#?(:kotoba
+   (defn fe-reject [msg :string code :string form [:ref :form/r]] [:ref :fe/err]
+     (record-new [:ref :fe/err] msg code form "subset" (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn require-k [ok :bool msg :string code :string form [:ref :form/r]] :i64
+     (if ok 0 (throw (fe-reject msg code form))))
+   :default nil)
+
+;; The host's `reader-tagged f64` shape `(f64-from-bits <i64>)`; a Form reads an f64 literal as an
+;; f64 Form, so both spellings are the closed literal here (the reader's metadata flag has no
+;; Form equivalent, so any `(f64-from-bits n)` with an integer is accepted).
+#?(:kotoba
+   (defn document-reader-f64-form? [form [:ref :form/r]] :bool
+     (or (form/is-f64? form)
+         (and (fhead-is? form "f64-from-bits") (= 2 (form/count-of form)) (kotoba-integer? (form/nth-of form 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn quote-form? [form [:ref :form/r]] :bool
+     (and (fhead-is? form "quote") (= 2 (form/count-of form))))
+   :default nil)
+
+;; The value type of a scalar inside a quoted symbol-key map, nil otherwise
+#?(:kotoba
+   (defn quoted-scalar-type [v [:ref :form/r]] [:ref :form/r]
+     (cond
+       (kotoba-integer? v) (form/keyword-form :i64)
+       (form/is-string? v) (form/keyword-form :string)
+       (form/is-keyword? v) (form/keyword-form :keyword)
+       (form/is-bool? v) (form/keyword-form :bool)
+       :else (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-all-symbols? [xs [:ref :form/r] i :i64 step :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (and (form/is-symbol? (form/nth-of xs i)) (qd-all-symbols? xs (+ i step) step))))
+   :default nil)
+
+;; the distinct scalar types of the values of the map M (odd positions)
+#?(:kotoba
+   (defn- qd-value-types [m [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= j (form/count-of m))
+       acc
+       (qd-value-types m (+ j 2) (fl-add acc (quoted-scalar-type (form/nth-of m j))))))
+   :default nil)
+
+
+
+;; The literal kind of DATUM, the payload of `(quote datum)`, when it is admitted symbol data:
+;; a Form map {:kind :symbol|:symbol-set|:symbol-key-map|:symbol-vector [:value-type T]}; nil otherwise
+#?(:kotoba
+   (defn quoted-symbol-datum-kind [datum [:ref :form/r]] [:ref :form/r]
+     (cond
+       (form/is-symbol? datum) (fput (form/form-map (form/no-forms)) :kind (form/keyword-form :symbol))
+       (and (form/is-set? datum) (> (form/count-of datum) 0) (<= (form/count-of datum) (max-typed-set-items))
+            (qd-all-symbols? datum 0 1))
+       (fput (form/form-map (form/no-forms)) :kind (form/keyword-form :symbol-set))
+       (and (form/is-map? datum) (> (form/count-of datum) 0) (<= (quot (form/count-of datum) 2) (max-typed-map-entries))
+            (qd-all-symbols? datum 0 2))
+       (let [types (qd-value-types datum 1 (form/no-forms))]
+         (if (and (= 1 (vector-count types)) (not (form/is-nil? (fl-nth types 0))))
+           (fput (fput (form/form-map (form/no-forms)) :kind (form/keyword-form :symbol-key-map)) :value-type (fl-nth types 0))
+           (form/nil-form)))
+       (and (form/is-vec? datum) (> (form/count-of datum) 0) (<= (form/count-of datum) (value/vector-literal-item-limit))
+            (qd-all-symbols? datum 0 1))
+       (fput (form/form-map (form/no-forms)) :kind (form/keyword-form :symbol-vector))
+       :else (form/nil-form)))
+   :default nil)
+
+;; FORM as the author wrote it, for a refusal: set members and map entries in `pr-str` order
+#?(:kotoba
+   (defn- qd-sorted-by-text [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count xs))
+       acc
+       (qd-sorted-by-text xs (+ i 1) (qd-insert-text acc (fl-nth xs i) 0))))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-insert-text [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] [:list [:ref :form/r]]
+     (if (or (>= i (vector-count xs)) (< (string-compare (pr-form x) (pr-form (fl-nth xs i))) 0))
+       (fl-slice xs i (vector-count xs) (form/append-form (fl-slice xs 0 i (form/no-forms)) x))
+       (qd-insert-text xs x (+ i 1))))
+   :default nil)
+
+;; map entries as [k v] vectors, sorted by the key's printed text
+#?(:kotoba
+   (defn- qd-entries [m [:ref :form/r] j :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= (+ j 1) (form/count-of m))
+       acc
+       (qd-entries m (+ j 2) (form/append-form acc (form/vec2 (form/nth-of m j) (form/nth-of m (+ j 1)))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-insert-entry [xs [:list [:ref :form/r]] x [:ref :form/r] i :i64] [:list [:ref :form/r]]
+     (if (or (>= i (vector-count xs)) (< (string-compare (pr-form (form/nth-of x 0)) (pr-form (form/nth-of (fl-nth xs i) 0))) 0))
+       (fl-slice xs i (vector-count xs) (form/append-form (fl-slice xs 0 i (form/no-forms)) x))
+       (qd-insert-entry xs x (+ i 1))))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-sorted-entries [xs [:list [:ref :form/r]] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+     (if (>= i (vector-count xs))
+       acc
+       (qd-sorted-entries xs (+ i 1) (qd-insert-entry acc (fl-nth xs i) 0))))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-join-text [xs [:list [:ref :form/r]] i :i64 sep :string acc :string] :string
+     (if (>= i (vector-count xs))
+       acc
+       (qd-join-text xs (+ i 1) sep (string-concat (if (> i 0) (string-concat acc sep) acc) (qd-text (fl-nth xs i))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-entries-text [entries [:list [:ref :form/r]] i :i64 acc :string] :string
+     (if (>= i (vector-count entries))
+       acc
+       (let [e (fl-nth entries i)]
+         (qd-entries-text entries (+ i 1)
+                          (string-concat (if (> i 0) (string-concat acc ", ") acc)
+                                         (string-concat (qd-text (form/nth-of e 0)) (string-concat " " (qd-text (form/nth-of e 1)))))))))
+   :default nil)
+
+#?(:kotoba
+   (defn- qd-text [f [:ref :form/r]] :string
+     (cond
+       (form/is-seq? f) (string-concat "(" (string-concat (qd-join-text (form/kids-of f) 0 " " "") ")"))
+       (form/is-vec? f) (string-concat "[" (string-concat (qd-join-text (form/kids-of f) 0 " " "") "]"))
+       (form/is-set? f) (string-concat "#{" (string-concat (qd-join-text (qd-sorted-by-text (form/kids-of f) 0 (form/no-forms)) 0 " " "") "}"))
+       (form/is-map? f) (string-concat "{" (string-concat (qd-entries-text (qd-sorted-entries (qd-entries f 0 (form/no-forms)) 0 (form/no-forms)) 0 "") "}"))
+       :else (pr-form f)))
+   :default nil)
+
+#?(:kotoba
+   (defn quoted-datum-text [form [:ref :form/r]] :string
+     (let [t (qd-text form)]
+       (if (> (string-length t) 80) (string-concat (string-substring t 0 77) "...") t)))
+   :default nil)
+
+;; The by-name refusal for a `(quote datum)` that holds symbols but is not one of the four admitted kinds
+#?(:kotoba
+   (defn reject-quoted-symbol-datum! [form [:ref :form/r]] :i64
+     (let [datum (form/nth-of form 1)
+           spelled (quoted-datum-text form)]
+       (cond
+         (and (form/is-set? datum) (> (form/count-of datum) (max-typed-set-items)) (qd-all-symbols? datum 0 1))
+         (throw (fe-reject (str "quoted set has too many entries: " spelled
+                                " -- a symbol set ([:set :symbol]) holds at most 32 entries; split it into several smaller sets (each of 32 entries or fewer)")
+                           "kotoba.error/subset-reject" form))
+         (form/is-set? datum)
+         (throw (fe-reject (str "quoted set mixes symbols with other kinds: " spelled
+                                " -- a symbol set ([:set :symbol]) holds symbols only; spell every entry as a symbol, or every entry as a keyword")
+                           "kotoba.error/subset-reject" form))
+         (form/is-vec? datum)
+         (throw (fe-reject (str "quoted vector mixes symbols with other kinds: " spelled
+                                " -- a symbol vector ([:vector [:symbol ...]]) holds symbols only; spell every item as a symbol")
+                           "kotoba.error/subset-reject" form))
+         (and (form/is-map? datum) (not (qd-all-symbols? datum 0 2)))
+         (throw (fe-reject (str "quoted map mixes symbol keys with other key kinds: " spelled
+                                " -- a symbol-key map ([:map :symbol V]) holds symbol keys only; spell every key as a symbol, or every key as a keyword")
+                           "kotoba.error/subset-reject" form))
+         (form/is-map? datum)
+         (throw (fe-reject (str "quoted symbol-key map values are not one scalar kind: " spelled
+                                " -- a symbol-key map is [:map :symbol V] for one V of integer / string / keyword / boolean; a symbol or a collection is not a value it holds")
+                           "kotoba.error/subset-reject" form))
+         (form/is-seq? datum)
+         (throw (fe-reject (str "quoted list has no literal spelling: " spelled
+                                " -- quote admits a symbol, a symbol set, a symbol-key map or a symbol vector; a list is a heap value built with list")
+                           "kotoba.error/subset-reject" form))
+         :else
+         (throw (fe-reject (str "quoted data is outside the admitted symbol kinds: " spelled
+                                " -- quote admits a symbol, a symbol set, a symbol-key map or a symbol vector")
+                           "kotoba.error/subset-reject" form)))))
+   :default nil)
+
+;; Admission of one desugared expression (the Kotoba reading is `kotoba.compiler.validate-expr`,
+;; the port of `validate-expr-impl`): answers the node count after FORM, or refuses. NODES is the
+;; count already charged to the program; the rodata literals are checked there too (vx-rodata, agent F64
+;; 2026-10-04; they answered "vx/unsupported" before).
+#?(:kotoba
+   (defn validate-expr [form [:ref :form/r] locals [:ref :form/r] functions [:ref :form/r] nodes :i64] :i64
+     ;; `vx/check-form` is the 7-argument entry kotoba.compiler.validate-expr defines; the
+     ;; `vx/check-context` this arm called (2ffad04's overlay) is defined nowhere in this
+     ;; repository, so the module had no Kotoba reading. Same answers as `validate-expr-in`
+     ;; against `(validate-ctx)`, which analyze uses (once-per-run context).
+     (let [r (vx/check-form form locals functions (forbidden-heads) (grammar-declared-heads) nodes)
+           ok (form/bool-value (form/nth-of r 0))
+           ck (require-k ok (form/string-value (form/nth-of r 2)) (form/string-value (form/nth-of r 1)) form)]
+       (form/int-value (form/nth-of r 3))))
+   :default nil)
+
+;; The same admission against a context folded once per analyze run (`validate-ctx`, agent ARENA
+;; 2026-10-04): the operation tables and head-set indexes are built once, not once per function body.
+#?(:kotoba
+   (defn validate-ctx [] [:ref :form/r]
+     (vx/make-ctx (forbidden-heads) (grammar-declared-heads)))
+   :default nil)
+
+#?(:kotoba
+   (defn validate-expr-in [ctx [:ref :form/r] form [:ref :form/r] locals [:ref :form/r] functions [:ref :form/r] nodes :i64] :i64
+     (let [r (vx/check-form-in ctx form locals functions nodes)
+           ok (form/bool-value (form/nth-of r 0))
+           ck (require-k ok (form/string-value (form/nth-of r 2)) (form/string-value (form/nth-of r 1)) form)]
+       (form/int-value (form/nth-of r 3))))
+   :default nil)
+
+;; ---- constants ----
+#?(:kotoba
+   (defn- cl-all? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (and (constant-literal? (form/nth-of xs i)) (cl-all? xs (+ i 1)))))
+   :default nil)
+
+#?(:kotoba
+   (defn- cl-all-keywords? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (and (form/is-keyword? (form/nth-of xs i)) (cl-all-keywords? xs (+ i 1)))))
+   :default nil)
+
+;; Closed compile-time data admitted for top-level `def`
+#?(:kotoba
+   (defn constant-literal? [value [:ref :form/r]] :bool
+     (cond
+       (kotoba-integer? value) true
+       (form/is-f64? value) true
+       (document-reader-f64-form? value) true
+       (form/is-string? value) (<= (string-byte-length (form/string-value value)) (value/string-literal-byte-limit))
+       (form/is-keyword? value) true
+       (form/is-bool? value) true
+       (form/is-nil? value) true
+       (form/is-symbol? value) true
+       (form/is-vec? value) (or (type-alias-form? value)
+                                (and (<= (form/count-of value) (max-list-items)) (cl-all? value 0)))
+       (form/is-set? value) (and (> (form/count-of value) 0) (<= (form/count-of value) (max-typed-set-items))
+                                 (cl-all-keywords? value 0))
+       (form/is-map? value) (and (<= (quot (form/count-of value) 2) (max-list-items)) (cl-all? value 0))
+       (quote-form? value) (and (holds-symbol? (form/nth-of value 1))
+                                (not (form/is-nil? (quoted-symbol-datum-kind (form/nth-of value 1)))))
+       (form/is-seq? value) (and (or (fhead-is? value "typed-set-new") (fhead-is? value "typed-map-new"))
+                                 (form/is-vec? (form/nth-of value 1))
+                                 (<= (form/count-of value) (+ 2 (max-list-items)))
+                                 (cl-all-from? value 2))
+       :else false))
+   :default nil)
+
+#?(:kotoba
+   (defn- cl-all-from? [xs [:ref :form/r] i :i64] :bool
+     (if (>= i (form/count-of xs))
+       true
+       (and (constant-literal? (form/nth-of xs i)) (cl-all-from? xs (+ i 1)))))
+   :default nil)
+
+;; `{:name :value}` for a literal `def`, `{:name :fold-form}` for a computed one
+#?(:kotoba
+   (defn- dp-closed-refusal [value [:ref :form/r]] :i64
+     (throw (fe-reject "constant value must be closed bounded integer/string/keyword/boolean/nil/vector/map or non-empty keyword-set data"
+                       "kotoba.error/subset-reject" value)))
+   :default nil)
+
+#?(:kotoba
+   (defn def-parts [form [:ref :form/r]] [:ref :form/r]
+     (let [name (form/nth-of form 1)
+           declaration0 (fdrop form 2)
+           has-doc (and (= 2 (vector-count declaration0)) (form/is-string? (fl-nth declaration0 0)))
+           docstring (if has-doc (fl-nth declaration0 0) (form/nil-form))
+           declaration (if has-doc (fl-drop declaration0 1) declaration0)
+           ok1 (require-k (or (not has-doc) (<= (string-length (form/string-value docstring)) (max-function-docstring-chars)))
+                          "constant docstring exceeds admission limit" "kotoba.error/subset-reject" docstring)
+           ok2 (require-k (= 1 (vector-count declaration)) "constant must contain exactly one literal value"
+                          "kotoba.error/subset-reject" form)
+           value-form (fl-nth declaration 0)
+           keyword-literal (and (fhead-is? value-form "keyword") (= 2 (form/count-of value-form))
+                                (form/is-string? (form/nth-of value-form 1)))
+           quoted (and (fhead-is? value-form "quote") (= 2 (form/count-of value-form)))
+           value (cond
+                   keyword-literal (fkw (form/string-value (form/nth-of value-form 1)))
+                   quoted (form/nth-of value-form 1)
+                   :else value-form)
+           changed (or keyword-literal quoted)]
+       (cond
+         ;; quoted data holding a symbol: the compiler's own operation tables, and a quoted symbol
+         ;; (NOT an alias)
+         (and changed (holds-symbol? value))
+         (cond
+           (not (form/is-nil? (quoted-symbol-datum-kind value)))
+           (fput (fput (form/form-map (form/no-forms)) :name name) :value value-form)
+           (form/is-seq? value) (let [c (dp-closed-refusal value)] (form/nil-form))
+           :else (let [c (reject-quoted-symbol-datum! value-form)] (form/nil-form)))
+         (constant-literal? value) (fput (fput (form/form-map (form/no-forms)) :name name) :value value)
+         (form/is-string? value)
+         (let [c (require-k false (str "constant string exceeds the portable string byte limit: "
+                                       (string-from-i64 (string-byte-length (form/string-value value))) " bytes, at most "
+                                       (string-from-i64 (value/string-literal-byte-limit))
+                                       " -- a longer string is a value a function builds, or a file a capability reads")
+                            "kotoba.error/subset-reject" value)]
+           (form/nil-form))
+         changed (let [c (dp-closed-refusal value)] (form/nil-form))
+         (or (and (form/is-seq? value) (form/is-symbol? (form/nth-of value 0)))
+             (form/is-vec? value) (form/is-map? value) (form/is-set? value))
+         (fput (fput (form/form-map (form/no-forms)) :name name) :fold-form value)
+         :else (let [c (dp-closed-refusal value)] (form/nil-form)))))
+   :default nil)
+
+#?(:kotoba nil :default
+(defn document-reader-f64-form?
+  "The JVM reader represents an f64 literal as a Double. The JVM-free reader
+  preserves its exact bits as `(f64-from-bits <i64>)`; recognize that closed
+  reader shape here so contextual document literals elaborate identically."
+  [form]
+  (and (seq? form)
+       (true? (:kotoba.reader/f64-literal (meta form)))
+       (= 'f64-from-bits (first form))
+       (= 2 (count form))
+       (kotoba-integer? (second form)))))
+
+;; ── quoted symbol data: `'sym` `'#{a b}` `'{a 1}` `'[a b]` ──────────────────
+;;
+;; The reader hands `'datum` over as `(quote datum)` (2026-09-11). Until
+;; 2026-09-12 no pass gave the form a meaning: in a function body it was
+;; `unknown operation: quote`, and at a `def` the payload was refused
+;; `constant value is quoted data holding symbols ... spell the entries as
+;; keywords`. Measured on the selfhost distance (lang/selfhost-distance.edn
+;; measurement 18, amu cdebca89, 225 compiler sources): 12 modules refused
+;; at exactly that sentence -- 8 with a quoted SET of symbols, 4 with a quoted
+;; MAP whose keys are symbols -- every one an operation table of the
+;; compiler's own (`(def arithmetic '#{+ - * quot bit-xor bit-and bit-or})`,
+;; `(def heap-operations '{pair 2 pair-first 1 pair-second 1})`, `(def
+;; find-name 'kotoba$string-index-find)`). "Spell the entries as keywords"
+;; is not available to those authors: the members ARE symbols, operation
+;; heads compared against read source.
+;;
+;; CLASSIFICATION (AGENTS.md, "is it a property or implementation state"),
+;; written before the change: IMPLEMENTATION STATE. `:symbol` is already a
+;; value type of this frontend (`value-types`), `(symbol "a")` builds one
+;; from a `:string`, `(typed-set-new [:set :symbol] ...)` and `(typed-map-new
+;; [:map :symbol V] ...)` check and run. What was missing was the LITERAL
+;; spelling. So `(quote sym)` elaborates to exactly `(symbol "sym")` -- the
+;; same KIR, one definition CID for the two spellings -- and the quoted
+;; collections elaborate to the constructors the keyword literals already
+;; lower to, with `:symbol` in the descriptor. A namespaced `'ns/x` is the
+;; symbol `(symbol "ns/x")` gives (measured 2026-09-12: that call is admitted
+;; and executes to `ns/x`; mirrored, not refused).
+;;
+;; At a `def`, the quoted datum IS the constant's literal representation --
+;; `(quote #{a b})` is held as written, the way a keyword set `#{:a :b}` is
+;; held as written -- because a bare symbol at a def is an ALIAS of another
+;; constant, and a raw set of symbols would be substituted and then read as
+;; variable references. `substitute-constants` and every rewriting pass
+;; already leave `quote` subtrees alone. A folded `:symbol` / `[:set
+;; :symbol]` / scalar-valued `[:map :symbol V]` result is spelled back as
+;; the same quoted datum (`spell-folded-value`), so `(def s 'a)` and `(def s
+;; (symbol "a"))` are one constant.
+;;
+;; NOT widened here, recorded: `=` on two `:symbol`s is refused `equality
+;; type is outside the safe value profile` (measured 2026-09-12); membership
+;; is `typed-set-contains [:set :symbol]`, lookup is `get` on the typed map.
+;;
+;; Refused BY NAME (one sentence each, the same at a def and in a body): a
+;; set / vector mixing symbols with other kinds, a map mixing symbol keys
+;; with other key kinds, a symbol-key map whose values are not one scalar
+;; kind (integer / string / keyword / boolean), and a quoted list.
+
+#?(:kotoba nil :default
+(defn quote-form? [form]
+  (and (seq? form) (= 'quote (first form)) (= 2 (count form)))))
+
+#?(:kotoba
+   (defn holds-symbol? [datum [:ref :form/r]] :bool
+     (if (form/is-symbol? datum)
+       true
+       (if (or (form/is-seq? datum) (form/is-vec? datum) (form/is-set? datum) (form/is-map? datum))
+         (holds-symbol-from? (form/kids-of datum) 0)
+         false)))
+   :default
+(defn holds-symbol? [datum]
+  (first-truthy symbol? (tree-seq coll? seq datum))))
+
+#?(:kotoba nil :default
+(defn quoted-scalar-type
+  "The value type of a scalar inside a quoted symbol-key map, or nil."
+  [v]
+  (cond
+    (kotoba-integer? v) :i64
+    (string? v) :string
+    (keyword? v) :keyword
+    (boolean? v) :bool
+    :else nil)))
+
+#?(:kotoba nil :default
+(defn quoted-symbol-datum-kind
+  "The literal kind of DATUM, the payload of `(quote datum)`, when it is
+  admitted symbol data: `:symbol`, `:symbol-set`, `:symbol-key-map` (with
+  `:value-type`), `:symbol-vector`; nil for anything else."
+  [datum]
+  (cond
+    (symbol? datum) {:kind :symbol}
+    (and (set? datum) (seq datum) (<= (count datum) max-typed-set-items)
+         (every? symbol? datum))
+    {:kind :symbol-set}
+    (and (map? datum) (seq datum) (<= (count datum) max-typed-map-entries)
+         (every? symbol? (keys datum)))
+    (let [value-types (distinct (map quoted-scalar-type (vals datum)))]
+      (when (and (= 1 (count value-types)) (some? (first value-types)))
+        {:kind :symbol-key-map :value-type (first value-types)}))
+    (and (vector? datum) (seq datum) (<= (count datum) value/vector-literal-item-limit)
+         (every? symbol? datum))
+    {:kind :symbol-vector}
+    :else nil)))
+
+#?(:kotoba nil :default
+(defn quoted-datum-text
+  "FORM as the author wrote it, for a refusal: integers as digits on both
+  runtimes (a ClojureScript BigInt would otherwise print as
+  `#object[BigInt 1]`), set members and map entries in `pr-str` order so
+  the sentence does not depend on hash order, bounded."
+  [form]
+  (letfn [(text [f]
+            (cond
+              (seq? f) (str "(" (str/join " " (map text f)) ")")
+              (vector? f) (str "[" (str/join " " (map text f)) "]")
+              (set? f) (str "#{" (str/join " " (map text (sort-by pr-str f))) "}")
+              (map? f) (str "{" (str/join ", " (map (fn [[k v]] (str (text k) " " (text v)))
+                                                     (sort-by (comp pr-str key) f))) "}")
+              (kotoba-integer? f) (str f)
+              (symbol? f) (str f)
+              :else (pr-str f)))]
+    (let [t (text form)]
+      (if (> (count t) 80) (str (subs t 0 77) "...") t)))))
+
+#?(:kotoba nil :default
+(defn reject-quoted-symbol-datum!
+  "The by-name refusal for a `(quote datum)` that holds symbols but is not
+  one of the four admitted kinds. Text pinned by
+  quoted_symbol_constants_test."
+  [form]
+  (let [datum (second form)
+        spelled (quoted-datum-text form)]
+    (cond
+      (and (set? datum) (> (count datum) max-typed-set-items) (every? symbol? datum))
+      (reject! (str "quoted set has too many entries: " spelled
+                    " -- a symbol set ([:set :symbol]) holds at most 32 entries; split it into several smaller sets (each of 32 entries or fewer)")
+               form :kotoba.error/subset-reject)
+      (set? datum)
+      (reject! (str "quoted set mixes symbols with other kinds: " spelled
+                    " -- a symbol set ([:set :symbol]) holds symbols only; spell every entry as a symbol, or every entry as a keyword")
+               form :kotoba.error/subset-reject)
+      (vector? datum)
+      (reject! (str "quoted vector mixes symbols with other kinds: " spelled
+                    " -- a symbol vector ([:vector [:symbol ...]]) holds symbols only; spell every item as a symbol")
+               form :kotoba.error/subset-reject)
+      (and (map? datum) (not (every? symbol? (keys datum))))
+      (reject! (str "quoted map mixes symbol keys with other key kinds: " spelled
+                    " -- a symbol-key map ([:map :symbol V]) holds symbol keys only; spell every key as a symbol, or every key as a keyword")
+               form :kotoba.error/subset-reject)
+      (map? datum)
+      (reject! (str "quoted symbol-key map values are not one scalar kind: " spelled
+                    " -- a symbol-key map is [:map :symbol V] for one V of integer / string / keyword / boolean; a symbol or a collection is not a value it holds")
+               form :kotoba.error/subset-reject)
+      (seq? datum)
+      (reject! (str "quoted list has no literal spelling: " spelled
+                    " -- quote admits a symbol, a symbol set, a symbol-key map or a symbol vector; a list is a heap value built with list")
+               form :kotoba.error/subset-reject)
+      :else
+      (reject! (str "quoted data is outside the admitted symbol kinds: " spelled
+                    " -- quote admits a symbol, a symbol set, a symbol-key map or a symbol vector")
+               form :kotoba.error/subset-reject)))))
+
+#?(:kotoba nil :default
+(defn charge-node! [budget form]
+  (when (> (vswap! budget inc) max-expression-nodes)
+    (reject! "program expression budget exhausted" form))))
+
+#?(:kotoba nil :default
+(defn validate-bindings [bindings locals functions depth budget]
+  (when-not (and (vector? bindings) (even? (count bindings)))
+    (reject! "let requires an even binding vector" bindings))
+  (when-not (= (count (take-nth 2 bindings)) (count (distinct (take-nth 2 bindings))))
+    (reject! "duplicate let binding" bindings))
+  (when (> (quot (count bindings) 2) max-bindings)
+    (reject! "let binding count exceeds admission limit" bindings))
+  (loop [pairs (partition 2 bindings) env locals]
+    (if-let [[name value] (first pairs)]
+      (do
+        (when-not (and (valid-name? name) (not (contains? forbidden-heads name)))
+          (reject! "invalid local binding" name))
+        (validate-expr value env functions (inc depth) budget)
+        (recur (next pairs) (conj env name)))
+      env))))
+
+;; The three per-expression passes -- lowering, admission and inference --
+;; each get the same wrapper, for the same reason (`internal-failure!`).
+;; Admission and inference destructure a declared type after checking its
+;; shape in most branches and not in all of them, so a host error can escape
+;; here too; the innermost frame names the operation it escaped from.
+#?(:kotoba nil :default
+(defn validate-expr [form locals functions depth budget]
+  (try (validate-expr-impl form locals functions depth budget)
+       (catch #?(:clj Throwable :cljs :default) error (internal-failure! error form)))))
+
+#?(:kotoba nil :default
+(defn validate-expr-impl [form locals functions depth budget]
+  (charge-node! budget form)
+  (when (> depth 256)
+    (reject! "expression nesting exceeds admission limit" form))
+  (cond
+    (kotoba-integer? form)
+    #?(:clj (if (<= Long/MIN_VALUE form Long/MAX_VALUE) form
+                (reject! "integer literal is outside i64" form))
+       :cljs (if (i64/in-i64-range? form) form
+                 (reject! "integer literal is outside i64" form)))
+    (string? form)
+    (try
+      (value/bounded-string! form value/string-literal-byte-limit)
+      form
+      (catch #?(:clj Exception :cljs :default) error
+        (reject! (ex-message error) form)))
+    (keyword? form)
+    (try
+      (value/bounded-keyword! form value/keyword-value-byte-limit)
+      form
+      (catch #?(:clj Exception :cljs :default) error
+        (reject! (ex-message error) form)))
+    (boolean? form) form
+    (symbol? form) (if (contains? locals form) form
+                       (unbound-symbol! "unbound or dynamic symbol is forbidden"
+                                        form locals functions))
+    (seq? form)
+    (let [[op & args] form]
+      (refuse-reader-tagged-host-literal! form op)
+      (when-not (simple-symbol? op) (reject! "computed or namespaced calls are forbidden" form))
+      (when (or (contains? forbidden-heads op) (re-find #"[.]" (name op)))
+        (reject! "dynamic loading, interop, mutation, and metaprogramming are forbidden"
+                 form :kotoba.error/ambient-forbidden))
+      (cond
+        (= op 'let)
+        ;; One body form, one message. This used to carry its own copy of the
+        ;; rule and its own wording, and it was the copy nothing could reach:
+        ;; the rewrite passes truncated the body before validation measured it.
+        (validate-expr (let-body args form)
+                       (validate-bindings (first args) locals functions depth budget)
+                       functions (inc depth) budget)
+
+        (= op 'if)
+        (doseq [arg (if-parts args form)]
+          (validate-expr arg locals functions (inc depth) budget))
+
+        (= op 'do)
+        (do (when (empty? args) (reject! "do requires at least one expression" form :kotoba.error/do-empty))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (= op 'cap-call)
+        (let [[cap-id value :as call-args] args]
+          (when-not (and (= 2 (count call-args)) (kotoba-integer? cap-id) (<= 0 cap-id 255))
+            (reject! "cap-call requires a literal capability id in [0,255] and one value" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (= op 'typed-cap-call)
+        (let [[cap-id request-type result-type request :as call-args] args]
+          (when-not (and (= 4 (count call-args)) (kotoba-integer? cap-id) (<= 0 cap-id 255))
+            (reject! "typed-cap-call requires a literal capability id in [0,255], request type, result type, and one request" form))
+          (validate-value-type! request-type)
+          (validate-value-type! result-type)
+          (validate-expr request locals functions (inc depth) budget))
+
+        (contains? arithmetic op)
+            (do (when (or (empty? args) (and (contains? '#{quot bit-xor bit-and bit-or} op) (not= 2 (count args))))
+              (reject! "invalid arithmetic arity" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? float-division-heads op)
+        (do (when-not (= 2 (count args)) (reject! "/ requires two operands" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? i64-operations op)
+        (do (when-not (= (get i64-operations op) (count args))
+              (reject-operation-arity! "i64 operation" op (get i64-operations op) (count args) form))
+            ;; The count was admitted only as a literal in [0,63] until
+            ;; 2026-09-10. The reason recorded in kotoba-native was that a
+            ;; literal "lets a backend lower a shift onto CL without a mask" --
+            ;; an implementation convenience, not a property of the operation,
+            ;; and it made variable-count shift and rotate inexpressible, which
+            ;; is most of what a cipher is.
+            ;;
+            ;; Measured before changing it: the x86-64 emitter ALREADY emits the
+            ;; variable-count group (`shl rax,cl` / `sar rax,cl` / `shr rax,cl`)
+            ;; and already routes the count through `emit-rhs-window`, which
+            ;; evaluates an arbitrary expression into rcx. Nothing about the
+            ;; lowering needed to change; only this admission did.
+            ;;
+            ;; A literal still takes the checked path here, so an out-of-range
+            ;; CONSTANT is still a compile-time reject rather than a runtime
+            ;; trap -- the diagnostic a caller can act on. A non-literal count
+            ;; is validated as an ordinary expression and the backend emits a
+            ;; range guard, because `kotoba.kir` traps on a count outside
+            ;; [0,63] and x86 CL is taken mod 64: without the guard the native
+            ;; artifact and its own sealed oracle would disagree for exactly
+            ;; the inputs nobody tests.
+            (when (contains? '#{i64-shift-left i64-shift-right u64-shift-right} op)
+              (if (kotoba-integer? (second args))
+                (when-not (<= 0 (second args) 63)
+                  (reject! "i64 shift count literal must be in [0,63]" form))
+                (validate-expr (second args) locals functions (inc depth) budget)))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? i32-operations op)
+        (do (when-not (= (get i32-operations op) (count args))
+              (reject-operation-arity! "i32 operation" op (get i32-operations op) (count args) form))
+            (when (contains? '#{i32-shift-left i32-shift-right u32-shift-right} op)
+              (when-not (and (kotoba-integer? (second args)) (<= 0 (second args) 31))
+                (reject! "i32 shift count must be an integer literal in [0,31]" form)))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? comparisons op)
+        (do (when-not (= 2 (count args)) (reject! "comparison requires two operands" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? heap-operations op)
+        (do (when-not (= (get heap-operations op) (count args))
+              (reject-operation-arity! "heap operation" op (get heap-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? kgraph-operations op)
+        (do (when-not (= (get kgraph-operations op) (count args))
+              (reject-operation-arity! "kgraph operation" op (get kgraph-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? string-operations op)
+        (do (when-not (= (get string-operations op) (count args))
+              (reject-operation-arity! "string operation" op (get string-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? xml-operations op)
+        (do (when-not (= (get xml-operations op) (count args))
+              (reject-operation-arity! "XML operation" op (get xml-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? region-operations op)
+        (do (when-not (= (get region-operations op) (count args))
+              (reject-operation-arity! "region operation" op (get region-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? decimal-operations op)
+        (do (when-not (= (get decimal-operations op) (count args))
+              (reject-operation-arity! "decimal operation" op (get decimal-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? f64-operations op)
+        (do (when-not (= (get f64-operations op) (count args))
+              (reject-operation-arity! "f64 operation" op (get f64-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? f32-operations op)
+        (do (when-not (= (get f32-operations op) (count args))
+              (reject-operation-arity! "f32 operation" op (get f32-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? typed-map-operations op)
+        (do (case op
+              map-new (when (odd? (count args))
+                        (reject! "map-new requires keyword/value pairs" form))
+              map-get (when-not (= 3 (count args))
+                        (reject! "map-get requires map, keyword, and default" form))
+              map-assoc (when-not (and (>= (count args) 3) (odd? (count args)))
+                          (reject! "map-assoc requires map and keyword/value pairs" form)))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? typed-safe-value-operations op)
+        (do (when-not (= (get typed-safe-value-operations op) (count args))
+              (reject-operation-arity! "typed safe-value operation" op (get typed-safe-value-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (= op 'typed-list-new)
+        (let [[type & items] args]
+          (validate-value-type! type)
+          (when-not (canonical-list-type? type)
+            (reject! "typed list constructor requires [:list item-type]" form))
+          (when (> (count items) max-list-items)
+            (reject! "typed list constructor exceeds item limit" form))
+          (doseq [item items]
+            (validate-expr item locals functions (inc depth) budget)))
+
+        (= op 'typed-list-conj)
+        (let [[type value item] args]
+          (when-not (= 3 (count args)) (reject! "typed list conj shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-list-type? type)
+            (reject! "typed list conj requires [:list item-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr item locals functions (inc depth) budget))
+
+        (= op 'typed-list-nth)
+        (let [[type value index] args]
+          (when-not (= 3 (count args)) (reject! "typed list nth shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-list-type? type)
+            (reject! "typed list nth requires [:list item-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr index locals functions (inc depth) budget))
+
+        (= op 'bytes-empty)
+        (when-not (empty? args)
+          (reject! "bytes-empty does not accept operands" form))
+
+        (= op 'bytes-count)
+        (let [[value] args]
+          (when-not (= 1 (count args))
+            (reject! "bytes-count requires one bytes operand" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (= op 'bytes-at)
+        (let [[value index] args]
+          (when-not (= 2 (count args))
+            (reject! "bytes-at requires a bytes operand and an index" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr index locals functions (inc depth) budget))
+
+        (= op 'bytes-slice)
+        (let [[value start end] args]
+          (when-not (= 3 (count args))
+            (reject! "bytes-slice requires a bytes operand and two offsets" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr start locals functions (inc depth) budget)
+          (validate-expr end locals functions (inc depth) budget))
+
+        (= op 'bytes-concat)
+        (let [[left right] args]
+          (when-not (= 2 (count args))
+            (reject! "bytes-concat requires two bytes operands" form))
+          (validate-expr left locals functions (inc depth) budget)
+          (validate-expr right locals functions (inc depth) budget))
+
+        (contains? '#{bytes-from-vector-i64 vector-i64-from-bytes string-from-utf8} op)
+        (do (when-not (= 1 (count args))
+              (reject! (str op " requires one operand; got " (count args)) form))
+            (validate-expr (first args) locals functions (inc depth) budget))
+
+        (= op 'typed-set-new)
+        (let [[type & items] args]
+          (validate-value-type! type)
+          (when-not (typed-set-type? type)
+            (reject! "typed set constructor requires [:set item-type]" form))
+          (when (> (count items) max-typed-set-items)
+            (reject! "typed set constructor exceeds item limit" form))
+          (doseq [item items]
+            (validate-expr item locals functions (inc depth) budget)))
+
+        (= op 'typed-set-count)
+        (let [[type value] args]
+          (when-not (= 2 (count args)) (reject! "typed set count shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (typed-set-type? type)
+            (reject! "typed set count requires [:set item-type]" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (contains? '#{typed-set-contains typed-set-conj typed-set-disj} op)
+        (let [[type value item] args]
+          (when-not (= 3 (count args)) (reject! "typed set operation shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (typed-set-type? type)
+            (reject! "typed set operation requires [:set item-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr item locals functions (inc depth) budget))
+
+        (= op 'typed-set-equal)
+        (let [[type left right] args]
+          (when-not (= 3 (count args)) (reject! "typed set equality shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (typed-set-type? type)
+            (reject! "typed set equality requires [:set item-type]" form))
+          (validate-expr left locals functions (inc depth) budget)
+          (validate-expr right locals functions (inc depth) budget))
+
+        (= op 'typed-set-nth)
+        (let [[type value index] args]
+          (when-not (= 3 (count args)) (reject! "typed set nth shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (typed-set-type? type)
+            (reject! "typed set nth requires [:set item-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr index locals functions (inc depth) budget))
+
+        (= op 'typed-map-new)
+        (let [[type & entries] args]
+          (validate-value-type! type)
+          (when-not (and (canonical-typed-map-type? type)
+                         (even? (count entries))
+                         (<= (/ (count entries) 2) max-typed-map-entries))
+            (reject! "typed map constructor shape or entry limit is invalid" form))
+          (doseq [entry entries]
+            (validate-expr entry locals functions (inc depth) budget)))
+
+        (= op 'typed-map-count)
+        (let [[type value] args]
+          (when-not (= 2 (count args)) (reject! "typed map count shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-typed-map-type? type)
+            (reject! "typed map count requires [:map key-type value-type]" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (contains? '#{typed-map-contains typed-map-get typed-map-dissoc} op)
+        (let [[type value key] args]
+          (when-not (= 3 (count args)) (reject! "typed map operation shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-typed-map-type? type)
+            (reject! "typed map operation requires [:map key-type value-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr key locals functions (inc depth) budget))
+
+        (= op 'typed-map-entry-at)
+        (let [[type value index] args]
+          (when-not (= 3 (count args)) (reject! "typed map entry projection shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-typed-map-type? type)
+            (reject! "typed map entry projection requires [:map key-type value-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr index locals functions (inc depth) budget))
+
+        (contains? '#{typed-map-keys typed-map-vals} op)
+        (let [[type value] args]
+          (when-not (= 2 (count args))
+            (reject! "typed map projection shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-typed-map-type? type)
+            (reject! "typed map projection requires [:map key-type value-type]" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (= op 'typed-map-assoc)
+        (let [[type map-value key item] args]
+          (when-not (= 4 (count args)) (reject! "typed map assoc shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-typed-map-type? type)
+            (reject! "typed map assoc requires [:map key-type value-type]" form))
+          (doseq [item-form [map-value key item]]
+            (validate-expr item-form locals functions (inc depth) budget)))
+
+        (= op 'typed-map-equal)
+        (let [[type left right] args]
+          (when-not (= 3 (count args)) (reject! "typed map equality shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (canonical-typed-map-type? type)
+            (reject! "typed map equality requires [:map key-type value-type]" form))
+          (validate-expr left locals functions (inc depth) budget)
+          (validate-expr right locals functions (inc depth) budget))
+
+        (= op 'record-new)
+        (let [[type & values] args
+              fields (when (record-type? type) (nth type 2))]
+          (validate-value-type! type)
+          (when-not (and (record-type? type) (= (count fields) (count values)))
+            (reject! "record constructor must exactly match its descriptor" form))
+          (doseq [item values]
+            (validate-expr item locals functions (inc depth) budget)))
+
+        (= op 'record-get)
+        (let [[type value field] args
+              fields (when (record-type? type) (nth type 2))]
+          (when-not (= 3 (count args)) (reject! "record projection shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (and (record-type? type) (keyword? field) (first-truthy #{field} (map first fields)))
+            (reject! "record field must be a declared keyword literal" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (= op 'record-assoc)
+        (let [[type value field replacement] args
+              fields (when (record-type? type) (nth type 2))]
+          (when-not (= 4 (count args)) (reject! "record replacement shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (and (record-type? type) (keyword? field) (first-truthy #{field} (map first fields)))
+            (reject! "record field must be a declared keyword literal" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr replacement locals functions (inc depth) budget))
+
+        (= op 'record-equal)
+        (let [[type left right] args]
+          (when-not (= 3 (count args)) (reject! "record equality shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (record-type? type)
+            (reject! "record equality requires a record descriptor" form))
+          (validate-expr left locals functions (inc depth) budget)
+          (validate-expr right locals functions (inc depth) budget))
+
+        (= op 'hetero-vector-new)
+        (let [[type & items] args
+              item-types (when (heterogeneous-vector-type? type) (second type))]
+          (validate-value-type! type)
+          (when-not (and (heterogeneous-vector-type? type)
+                         (= (count item-types) (count items)))
+            (reject! "heterogeneous vector constructor must exactly match its descriptor" form))
+          (doseq [item items]
+            (validate-expr item locals functions (inc depth) budget)))
+
+        (= op 'hetero-vector-count)
+        (let [[type value] args]
+          (when-not (= 2 (count args))
+            (reject! "heterogeneous vector count shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (heterogeneous-vector-type? type)
+            (reject! "heterogeneous vector count requires a vector descriptor" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (contains? '#{hetero-vector-at hetero-vector-assoc} op)
+        (let [[type value index item] args
+              expected (if (= op 'hetero-vector-at) 3 4)
+              item-types (when (heterogeneous-vector-type? type) (second type))]
+          (when-not (= expected (count args))
+            (reject! "heterogeneous vector indexed operation shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (heterogeneous-vector-type? type)
+            (reject! "heterogeneous vector operation requires a vector descriptor" form))
+          (heterogeneous-vector-index! index item-types form)
+          (validate-expr value locals functions (inc depth) budget)
+          (when (= op 'hetero-vector-assoc)
+            (validate-expr item locals functions (inc depth) budget)))
+
+        (= op 'hetero-vector-equal)
+        (let [[type left right] args]
+          (when-not (= 3 (count args))
+            (reject! "heterogeneous vector equality shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (heterogeneous-vector-type? type)
+            (reject! "heterogeneous vector equality requires a vector descriptor" form))
+          (validate-expr left locals functions (inc depth) budget)
+          (validate-expr right locals functions (inc depth) budget))
+
+        (= op 'option-none-of)
+        (do (when-not (= 1 (count args)) (reject! "option-none-of shape is invalid" form))
+            (validate-value-type! (first args))
+            (when-not (generic-option-type? (first args))
+              (reject! "option-none-of requires [:option payload-type]" form)))
+
+        (contains? '#{option-some-of option-some?-of} op)
+        (let [[type value] args]
+          (when-not (= 2 (count args)) (reject! "generic option operation shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (generic-option-type? type)
+            (reject! "generic option operation requires [:option payload-type]" form))
+          (validate-expr value locals functions (inc depth) budget))
+
+        (= op 'option-value-of)
+        (let [[type value fallback] args]
+          (when-not (= 3 (count args)) (reject! "option-value-of shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (generic-option-type? type)
+            (reject! "option-value-of requires [:option payload-type]" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr fallback locals functions (inc depth) budget))
+
+        (= op 'option-match)
+        (let [[type value none-body some-name some-body] args]
+          (when-not (= 5 (count args)) (reject! "option-match shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (and (generic-option-type? type) (symbol? some-name)
+                         (nil? (namespace some-name)))
+            (reject! "option-match requires option type and unqualified some binder" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (validate-expr none-body locals functions (inc depth) budget)
+          (validate-expr some-body (conj locals some-name) functions (inc depth) budget))
+
+        (= op 'variant-new)
+        (let [[type tag payload] args]
+          (when-not (= 3 (count args)) (reject! "variant-new shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (and (variant-type? type) (keyword? tag))
+            (reject! "variant-new requires variant descriptor and keyword tag" form))
+          (validate-expr payload locals functions (inc depth) budget))
+
+        (= op 'variant-match)
+        (let [[type value branches] args
+              cases (when (variant-type? type) (nth type 2))]
+          (when-not (= 3 (count args)) (reject! "variant-match shape is invalid" form))
+          (validate-value-type! type)
+          (when-not (and (variant-type? type) (vector? branches)
+                         (= (mapv first cases) (mapv first branches))
+                         (every? #(and (vector? %) (= 3 (count %))
+                                       (symbol? (second %)) (nil? (namespace (second %)))) branches))
+            (reject! "variant match must exactly cover declared cases in order" form))
+          (validate-expr value locals functions (inc depth) budget)
+          (doseq [[_ binder body] branches]
+            (validate-expr body (conj locals binder) functions (inc depth) budget)))
+
+        (= op 'result-match-of)
+        (let [[type result ok-name ok-body err-name err-body] args]
+          (when-not (= 6 (count args))
+            (reject! "result-match-of shape is invalid" form))
+          (when-not (parametric-result-type? type)
+            (reject! "result match requires [:result ok-type err-type]" form))
+          (validate-value-type! type)
+          (when-not (and (symbol? ok-name) (nil? (namespace ok-name))
+                         (symbol? err-name) (nil? (namespace err-name)))
+            (reject! "result match binders must be unqualified symbols" form))
+          (validate-expr result locals functions (inc depth) budget)
+          (validate-expr ok-body (conj locals ok-name) functions (inc depth) budget)
+          (validate-expr err-body (conj locals err-name) functions (inc depth) budget))
+
+        (contains? parametric-result-operations op)
+        (do (when-not (= (get parametric-result-operations op) (count args))
+              (reject-operation-arity! "parametric result operation" op (get parametric-result-operations op) (count args) form))
+            (when-not (parametric-result-type? (first args))
+              (reject! "parametric result operation requires [:result ok-type err-type]" form))
+            (validate-value-type! (first args))
+            (doseq [arg (rest args)]
+              (validate-expr arg locals functions (inc depth) budget)))
+
+        (= op 'vector-new)
+        (do (when (> (count args) value/vector-literal-item-limit)
+              (reject! "vector-new exceeds item limit" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (= op 'vector-f64-new)
+        (do (when (> (count args) value/vector-literal-item-limit)
+              (reject! "vector-f64-new exceeds item limit" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? typed-vector-operations op)
+        (do (when-not (= (get typed-vector-operations op) (count args))
+              (reject-operation-arity! "typed vector operation" op (get typed-vector-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? typed-f64-vector-operations op)
+        (do (when-not (= (get typed-f64-vector-operations op) (count args))
+              (reject-operation-arity! "typed f64 vector operation" op (get typed-f64-vector-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? compact-graph-operations op)
+        (do (when-not (= (get compact-graph-operations op) (count args))
+              (reject-operation-arity! "compact graph operation" op (get compact-graph-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? document-fixed-operations op)
+        (do (when-not (= (get document-fixed-operations op) (count args))
+              (reject-operation-arity! "document operation" op (get document-fixed-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? '#{document-vector document-list document-set} op)
+        (do (when (> (count args) value/document-container-item-limit)
+              (reject! "document sequence exceeds item limit" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (= op 'document-map)
+        (do (when (odd? (count args))
+              (reject! "document-map requires key/value pairs" form))
+            (when (> (quot (count args) 2) value/document-container-item-limit)
+              (reject! "document-map exceeds entry limit" form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? kernel-memory-operations op)
+        (do (when-not (= (get kernel-memory-operations op) (count args))
+              (reject-operation-arity! "kernel memory operation" op (get kernel-memory-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        ;; fwstore: the allocation that answers with an address is the one
+        ;; privileged head with a constraint on an OPERAND, and it has to be
+        ;; here rather than beside the window check below: the window check
+        ;; only runs when the region reaches a base position, and a page count
+        ;; that is not a literal is wrong whether or not the program ever
+        ;; writes to what it allocated. The region-provenance rule's promise
+        ;; is that this pass knows the length -- a promise it cannot keep for
+        ;; an expression.
+        (= op 'kernel-uefi-alloc-region)
+        (do (when-not (= (get kernel-privileged-operations op) (count args))
+              (reject-operation-arity! "kernel privileged operation" op (get kernel-privileged-operations op) (count args) form))
+            (let [pages (nth args 4 ::missing)]
+              (when-not (integer-literal? pages)
+                (reject! "kernel-uefi-alloc-region page count must be a literal"
+                         form :kotoba.error/kernel-alloc-region-pages))
+              (when-not (and (<= 1 pages) (<= pages alloc-region-maximum-pages))
+                (reject! (str "kernel-uefi-alloc-region page count must be "
+                              "between 1 and " alloc-region-maximum-pages)
+                         form :kotoba.error/kernel-alloc-region-pages)))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        (contains? kernel-privileged-operations op)
+        (do (when-not (= (get kernel-privileged-operations op) (count args))
+              (reject-operation-arity! "kernel privileged operation" op (get kernel-privileged-operations op) (count args) form))
+            (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        ;; boot-lit: the argument is a piece of the SOURCE, not an expression,
+        ;; and the args are deliberately not walked. `(ucs2 s)` for a
+        ;; parameter `s` has no answer -- there is no runtime here that could
+        ;; place bytes for a string that does not exist until the program
+        ;; runs -- so it is refused at the source rather than lowered into
+        ;; something the backend has to refuse with a shape error.
+        (contains? rodata-literal-operations op)
+        (do (when-not (= (get rodata-literal-operations op) (count args))
+              (reject-operation-arity! "rodata literal" op (get rodata-literal-operations op) (count args) form))
+            (when-not (string? (first args))
+              (reject! "rodata literal requires a string literal" form))
+            (when-not (rodata-literal-content? op (first args))
+              (reject! "rodata literal is malformed for its encoding" form)))
+
+        ;; boot-scratch: the argument is a NAME and is deliberately not
+        ;; validated as an expression. A bare symbol in argument position is
+        ;; a local reference everywhere else in this grammar, so the check
+        ;; that it names a FUNCTION has to happen here or the report will be
+        ;; about an unbound local.
+        (contains? image-symbol-operations op)
+        (do (when-not (= (get image-symbol-operations op) (count args))
+              (reject-operation-arity! "image symbol operation" op (get image-symbol-operations op) (count args) form))
+            (when-not (symbol? (first args))
+              (reject! "kernel-function-address requires a function name" form))
+            (when (contains? locals (first args))
+              (reject! "kernel-function-address names a function, not a local"
+                       form))
+            (when-not (contains? functions (first args))
+              (reject! "kernel-function-address names no function in this module"
+                       form)))
+
+        (contains? functions op)
+        (let [expected (count (get functions op))]
+          (when-not (= expected (count args))
+            (reject-call-arity! op expected (count args) form))
+          (doseq [arg args] (validate-expr arg locals functions (inc depth) budget)))
+
+        :else (unknown-operation! op form functions))
+      form)
+    :else (reject! "value type is outside the safe profile" form))))
+
+#?(:kotoba nil :default
+(defn constant-literal?
+  "Closed compile-time data admitted for top-level `def`. Constants are
+  substituted before desugaring, so they cannot allocate ambient mutable
+  state or execute code during compilation."
+  [value]
+  (cond
+    (kotoba-integer? value) true
+    ;; Function-body f64 literals already lower through canonical IEEE-754
+    ;; bits. A top-level constant is only lexically substituted into that same
+    ;; path, so admitting a closed Double here adds no evaluation authority.
+    (value/f64-value? value) true
+    ;; The same literal as the line above, in the shape the JVM-free reader
+    ;; hands it over: `(f64-from-bits <i64>)`. `value/f64-value?` asks about a
+    ;; HOST double, which an f64 literal only ever is on the JVM, so
+    ;; `(def k 1.5)` compiled there and was refused on nbb with
+    ;; `constant value must be closed bounded integer/string/...` -- a message
+    ;; about closedness for a value that was already closed.
+    ;;
+    ;; This is the THIRD site in this file where a branch was written for the
+    ;; JVM reader's shape and not the reader's: `desugar-expr*`'s f32 branch
+    ;; (fixed 2026-09-08), `f64-literal-key?` and `document-reader-f64-form?`
+    ;; (which already carry the shim), and this one. All three were invisible
+    ;; while the JVM read source with `clojure.tools.reader`; unifying the
+    ;; readers surfaced them one at a time, this one via kotoba-lang/amu's
+    ;; `f64-constants-are-closed-and-use-canonical-bit-lowering`.
+    ;;
+    ;; Admitting it adds no authority: it is the identical IEEE-754 bit form a
+    ;; function-body f64 literal already lowers to, and a constant is only
+    ;; lexically substituted into that same path.
+    (document-reader-f64-form? value) true
+    (string? value) (try
+                      (value/bounded-string! value value/string-literal-byte-limit)
+                      true
+                      (catch #?(:clj Exception :cljs :default) _ false))
+    (keyword? value) true
+    (boolean? value) true
+    (nil? value) true
+    ;; Symbols are inert references at this stage. Resolution below admits
+    ;; only names declared by another top-level constant and rejects unknown
+    ;; names and cycles before any function is desugared.
+    (symbol? value) true
+    (vector? value) (or (type-alias-form? value)
+                        (and (<= (count value) max-list-items)
+                             (every? constant-literal? value)))
+    ;; Keep inferred source sets deliberately narrow. Other item types use
+    ;; `typed-set` with an explicit descriptor in function code.
+    (set? value) (and (seq value)
+                      (<= (count value) max-typed-set-items)
+                      (every? keyword? value))
+    (map? value) (and (<= (count value) max-list-items)
+                      (every? constant-literal? (mapcat identity value)))
+    ;; The canonical constructor a folded set or typed map is spelled back
+    ;; as (2026-09-11, `spell-folded-value`): a closed type descriptor and
+    ;; constant items. It is data the same way the literals above are --
+    ;; `typed-set-new` / `typed-map-new` construct and nothing else -- and it
+    ;; is what an i64 or string set literal would lower to if the language
+    ;; spelled one. Admitting it here is what lets a folded constant take the
+    ;; literal path (`resolve-constant-aliases!`, `substitute-constants`)
+    ;; without a second evaluation.
+    ;; Quoted symbol data (2026-09-12, see the section comment above
+    ;; `quote-form?`): `'sym`, `'#{a b}`, `'{a 1 b 2}`, `'[a b]` are held AS
+    ;; WRITTEN, quote and all -- the quote is what keeps a symbol from being
+    ;; read as a constant alias, and `substitute-constants` never enters a
+    ;; quote. Each lowers, where it is used, to the same form `(symbol
+    ;; "...")` and the typed constructors already lower to.
+    (quote-form? value) (and (holds-symbol? (second value))
+                             (some? (quoted-symbol-datum-kind (second value))))
+    (seq? value) (and (contains? '#{typed-set-new typed-map-new} (first value))
+                      (vector? (second value))
+                      (<= (count value) (+ 2 max-list-items))
+                      (every? constant-literal? (nnext value)))
+    :else false)))
+
+#?(:kotoba nil :default
+(defn def-parts
+  "`{:name :value}` for a literal `def`, `{:name :fold-form}` for a computed
+  one -- the second is folded by `fold-def-value!` once the constants above
+  it are known (see `analyze-forms*`)."
+  [form]
+  (let [[_ name & declaration] form
+        [docstring declaration] (if (and (= 2 (count declaration))
+                                         (string? (first declaration)))
+                                  [(first declaration) (rest declaration)]
+                                  [nil declaration])]
+    (when (and docstring (> (count docstring) max-function-docstring-chars))
+      (reject! "constant docstring exceeds admission limit" docstring))
+    (when-not (= 1 (count declaration))
+      (reject! "constant must contain exactly one literal value" form))
+    (let [value-form (first declaration)
+          value (cond
+                  (and (seq? value-form)
+                       (= 'keyword (first value-form))
+                       (= 2 (count value-form))
+                       (string? (second value-form)))
+                  (keyword (second value-form))
+                  ;; `'datum` is DATA the author wrote, never a computation:
+                  ;; the quote comes off and the datum is held to the literal
+                  ;; rule. (The reader hands `'x` over as `(quote x)` since
+                  ;; 2026-09-11.)
+                  (and (seq? value-form)
+                       (= 'quote (first value-form))
+                       (= 2 (count value-form)))
+                  (second value-form)
+                  :else value-form)]
+      (cond
+        ;; quoted data holding a symbol: `'#{if let}` (the compiler's own
+        ;; operation tables) and `'name` (a quoted symbol, which is NOT an
+        ;; alias -- the author quoted it to keep it a symbol). Classified
+        ;; BEFORE the literal rule can read the bare symbol as an alias
+        ;; (measured 2026-09-11 on kotoba-native/string_index.cljk, whose
+        ;; `(def find-name 'kotoba$string-index-find)` got the alias
+        ;; sentence). Until 2026-09-12 this arm refused every such datum
+        ;; (`... spell the entries as keywords`; measurement 18: 12 of 225
+        ;; compiler sources). Now the four symbol kinds are held AS WRITTEN,
+        ;; quote and all -- see the section comment above `quote-form?` --
+        ;; and the rest are refused by their own name; a quoted list keeps
+        ;; the closedness sentence below, as `'(1 2)` does.
+        (and (not= value-form value) (holds-symbol? value))
+        (cond
+          (quoted-symbol-datum-kind value) {:name name :value value-form}
+          (seq? value)
+          (reject! "constant value must be closed bounded integer/string/keyword/boolean/nil/vector/map or non-empty keyword-set data" value)
+          :else (reject-quoted-symbol-datum! value-form))
+        (constant-literal? value) {:name name :value value}
+        ;; a string past the constant's portable byte bound: say the bound
+        ;; and the size, not "must be closed" about a value that is
+        ;; (measured 2026-09-11 on kotoba/abi/wit_data.cljk, a .wit file
+        ;; held in a def)
+        (string? value)
+        (reject! (str "constant string exceeds the portable string byte limit: "
+                      (value/utf8-byte-count! value) " bytes, at most " value/string-literal-byte-limit
+                      " -- a longer string is a value a function builds, or a file a capability reads")
+                 value :kotoba.error/subset-reject)
+        ;; quoted data that is not a literal (a quoted list is not a call)
+        (not= value-form value)
+        (reject! "constant value must be closed bounded integer/string/keyword/boolean/nil/vector/map or non-empty keyword-set data" value)
+        ;; a call form, or a collection literal holding one: computed at
+        ;; analysis time, on the reference interpreter, once (see the
+        ;; section comment above). A bare symbol never reaches here -- it is
+        ;; a constant alias, and `constant-literal?` admits it.
+        (or (and (seq? value) (symbol? (first value)))
+            (vector? value) (map? value) (set? value))
+        {:name name :fold-form value}
+        :else
+        (reject! "constant value must be closed bounded integer/string/keyword/boolean/nil/vector/map or non-empty keyword-set data" value))))))

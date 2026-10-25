@@ -1,0 +1,396 @@
+(ns kotoba.compiler.abort-ability-test
+  "The typed abort ability, slices 1 and 2 (kotoba-lang `lang/abort-ability.edn`).
+
+  `lang/surface-status.edn` `:explicit-errors` bans the AMBIENT `throw`/`try`/
+  `catch` under the invariant that no control effect is untracked, and names
+  the widening: a typed abort whose effect appears in the inferred row. This
+  is that widening, in the smallest complete shape:
+
+  - `(throw e)` types as bottom, puts `:abort` on the enclosing function's
+    inferred row, and the function's error type E is the type of `e`.
+  - `(try body (catch [E] e handler))` catches every abort the body can reach
+    and REMOVES `:abort` from what the body contributed.
+  - Slice 2: a CALL to an aborting function makes the caller aborting too, so
+    `:abort` and E are interprocedural facts; and an aborting form in an
+    operand or a test is A-normalized into a `let` binding rather than
+    refused, LEFT TO RIGHT, so hoisting cannot reorder two observable effects.
+  - Elaboration lowers an aborting function to return `[:result T E]`, a
+    throw to `result-err-of`, a try to one `result-match-of`. Nothing unwinds;
+    no backend sees either head.
+
+  Everything the slice does not do is refused with a message that says so,
+  and each refusal is pinned here by its exact text. The control at the end
+  is a throw-free program whose HIR and KIR hashes were taken on the commit
+  before this ability existed (kotoba-sema c14ca39e): a change to how any
+  throw-free program lowers would move them."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.sema :as sema]))
+
+(defn- run [source function arguments]
+  (long (kir/execute (kir/lower (sema/analyze source)) function arguments)))
+
+(defn- rejection-of
+  ([source] (rejection-of source nil))
+  ([source opts]
+   (try (do (sema/analyze source opts) nil)
+        (catch Throwable e (ex-message e)))))
+
+(defn- rejection-code-of [source]
+  (try (do (sema/analyze source) nil)
+       (catch Throwable e (:kotoba.error/code (ex-data e)))))
+
+(defn- function-named [hir name]
+  (first (filter #(= name (:name %)) (:functions hir))))
+
+;; ---------------------------------------------------------------------------
+;; Positive: throw and try in one function
+
+(def ^:private one-function
+  "(ns abort.one (:export [main]))
+   (defn main [] :i64 (try (if (> 1 0) (throw \"boom\") 5) (catch e 7)))")
+
+(deftest throw-and-try-in-one-function
+  (testing "the handler runs and the try has the branches' value type"
+    (is (= 7 (run one-function 'main []))))
+  (testing "try removes :abort from the row, so main is exportable"
+    (let [hir (sema/analyze one-function)
+          main (function-named hir 'main)]
+      (is (= #{} (:effects main)))
+      (is (= #{} (:effects hir)))
+      (is (= :i64 (:result main)))))
+  (testing "the lowering is one result-match-of over the body's [:result T E] value"
+    (let [body (:body (function-named (sema/analyze one-function) 'main))]
+      (is (= 'result-match-of (first body)))
+      (is (= [:result :i64 :string] (second body)))
+      (is (= '(if (> 1 0)
+                (result-err-of [:result :i64 :string] "boom")
+                (result-ok-of [:result :i64 :string] 5))
+             (nth body 2)))
+      ;; no `throw`, no `try`, anywhere in HIR
+      (is (not-any? #(and (seq? %) (contains? '#{throw try catch} (first %)))
+                    (tree-seq coll? seq body))))))
+
+;; ---------------------------------------------------------------------------
+;; Positive: an abort crossing a callee, and propagating through one
+
+(def ^:private across-callee
+  "(ns abort.callee (:export [main]))
+   (defn- safe-div [a :i64 b :i64] :i64
+     (if (= b 0) (throw \"division by zero\") (quot a b)))
+   (defn main [] :i64 (try (safe-div 10 0) (catch e (string-length e))))")
+
+(deftest an-abort-crosses-a-callee
+  (testing "the caller's try catches what the callee threw; the binder is E"
+    (is (= 16 (run across-callee 'main []))))
+  (testing "the callee carries :abort and is lowered to [:result T E]"
+    (let [hir (sema/analyze across-callee)
+          callee (function-named hir 'safe-div)]
+      (is (= #{:abort} (:effects callee)))
+      (is (= [:result :i64 :string] (:result callee)))
+      (is (= '(if (= b 0)
+                (result-err-of [:result :i64 :string] "division by zero")
+                (result-ok-of [:result :i64 :string] (quot a b)))
+             (:body callee)))))
+  (testing "the caller catches, so its row and the module row carry no :abort"
+    (let [hir (sema/analyze across-callee)]
+      (is (= #{} (:effects (function-named hir 'main))))
+      (is (= #{:abort} (:effects hir))
+          "the module row is the union of function rows, and one function aborts"))))
+
+(def ^:private propagating
+  "(ns abort.propagate (:export [main]))
+   (defn- parse [s :string] :i64
+     (if (string=? s \"\") (throw \"empty\") (string-length s)))
+   (defn- twice [s :string] :i64
+     (if (string=? s \"x\") (throw \"reserved\") (let [v (parse s)] (* 2 v))))
+   (defn main [] :i64
+     (+ (try (twice \"\") (catch :string e 100))
+        (try (twice \"ab\") (catch e 0))))")
+
+(deftest an-abort-propagates-through-a-function-that-aborts-with-the-same-type
+  (testing "twice re-raises parse's abort, and the explicit (catch :string e ...) pins E"
+    (is (= 104 (run propagating 'main []))))
+  (testing "the let binding value that aborts is bound through result-match-of with a re-raising err arm"
+    (let [twice (function-named (sema/analyze propagating) 'twice)]
+      (is (= #{:abort} (:effects twice)))
+      (is (= '(if (string=? s "x")
+                (result-err-of [:result :i64 :string] "reserved")
+                (result-match-of [:result :i64 :string] (parse s)
+                                 v (result-ok-of [:result :i64 :string] (* 2 v))
+                                 __kotoba_abort_err_1 (result-err-of [:result :i64 :string] __kotoba_abort_err_1)))
+             (:body twice))))))
+
+(deftest a-throw-in-a-handler-leaves-the-try
+  (testing "nested try; the inner handler's throw of a different type is the outer catch's"
+    (is (= 42 (run "(ns abort.nested (:export [main]))
+                    (defn- g [x :i64] :i64
+                      (try (if (= x 0) (throw \"z\") x) (catch e (throw 1))))
+                    (defn main [] :i64 (try (g 0) (catch e (+ e 41))))"
+                   'main [])))))
+
+(deftest error-and-result-types-are-inferred-when-absent
+  (testing "E from a parameter's inferred type, T from the body"
+    (is (= 3 (run "(ns abort.inferred (:export [main]))
+                   (defn- chk [s] (if (string=? s \"\") (throw s) (string-length s)))
+                   (defn main [] (try (chk \"abc\") (catch e (string-length e))))"
+                  'main [])))
+    (is (= [:result :i64 :string]
+           (:result (function-named (sema/analyze "(ns abort.inferred (:export [main]))
+                                                   (defn- chk [s] (if (string=? s \"\") (throw s) (string-length s)))
+                                                   (defn main [] (try (chk \"abc\") (catch e (string-length e))))")
+                                    'chk))))))
+
+;; ---------------------------------------------------------------------------
+;; Negative: each refusal pinned by its exact message
+
+(deftest two-error-types-in-one-function-are-refused
+  (is (= "function f throws two different error types: string and i64"
+         (rejection-of "(ns a (:export [main]))
+                        (defn- f [x :i64] :i64 (if (= x 0) (throw \"s\") (throw 1)))
+                        (defn main [] :i64 (try (f 1) (catch e 0)))"))))
+
+(deftest a-call-to-an-aborting-function-makes-the-caller-abort
+  (testing "SLICE 2. The caller neither throws nor catches, so slice 1 refused
+            the call outright. Now it propagates, and the refusal that is left
+            is the export boundary -- reached THROUGH the propagation, which is
+            what says the propagation happened"
+    (is (= "unhandled abort at export boundary; catch it with try: main"
+           (rejection-of "(ns a (:export [main]))
+                          (defn- f [x :i64] :i64 (if (= x 0) (throw \"s\") x))
+                          (defn main [] :i64 (f 1))"))))
+  (testing "the two error types must agree, and the refusal names both
+            functions and both types"
+    (is (= "function g throws i64 but calls aborting function `f`, which aborts with string"
+           (rejection-of "(ns a (:export [main]))
+                          (defn- f [x :i64] :i64 (if (= x 0) (throw \"s\") x))
+                          (defn- g [x :i64] :i64 (if (= x 1) (throw 9) (f x)))
+                          (defn main [] :i64 (try (g 1) (catch e 0)))"))))
+  (testing "two callees that disagree, in a function that throws nothing itself"
+    (is (= "function g calls aborting functions with two different error types: string (`f`) and i64 (`h`)"
+           (rejection-of "(ns a (:export [main]))
+                          (defn- f [x :i64] :i64 (if (= x 0) (throw \"s\") x))
+                          (defn- h [x :i64] :i64 (if (= x 0) (throw 9) x))
+                          (defn- g [x :i64] :i64 (+ (f x) (h x)))
+                          (defn main [] :i64 (try (g 1) (catch e 0)))")))))
+
+(def ^:private propagated
+  "`read` writes no throw and no try; it is aborting because `parse` is."
+  "(ns abort.slice2 (:export [main]))
+   (defn- parse [s :string] :i64 (if (string=? s \"\") (throw \"empty\") (string-length s)))
+   (defn- read2 [s :string] :i64 (+ 1 (parse s)))
+   (defn main [] :i64 (try (read2 \"\") (catch e (string-length e))))")
+
+(deftest an-abort-propagates-to-a-caller-that-does-not-throw
+  (testing "the abort crosses two calls and the outermost try catches it"
+    (is (= 5 (run propagated 'main []))))
+  (testing "the caller's interface is lowered to [:result T E] and its row carries :abort"
+    (let [hir (sema/analyze propagated)
+          caller (function-named hir 'read2)]
+      (is (= #{:abort} (:effects caller)))
+      (is (= [:result :i64 :string] (:result caller)))))
+  (testing "the call site propagates the err arm: ok continues, err re-raises"
+    (is (= '(result-match-of [:result :i64 :string] (parse s)
+                             __kotoba_abort_operand_1
+                             (result-ok-of [:result :i64 :string] (+ 1 __kotoba_abort_operand_1))
+                             __kotoba_abort_err_1
+                             (result-err-of [:result :i64 :string] __kotoba_abort_err_1))
+           (:body (function-named (sema/analyze propagated) 'read2)))))
+  (testing "the catching function is still clean, and the module row is not"
+    (let [hir (sema/analyze propagated)]
+      (is (= #{} (:effects (function-named hir 'main))))
+      (is (= #{:abort} (:effects hir))))))
+
+(deftest an-unhandled-abort-at-an-export-boundary-is-refused
+  (is (= "unhandled abort at export boundary; catch it with try: main"
+         (rejection-of "(defn main [] :i64 (if (= 1 1) (throw \"s\") 1))")))
+  (testing "every function is exported when nothing narrows the export list, so a bare aborting helper is refused too"
+    (is (= "unhandled abort at export boundary; catch it with try: f"
+           (rejection-of "(defn f [x :i64] :i64 (if (= x 0) (throw \"s\") x))
+                          (defn main [] :i64 (try (f 1) (catch e 0)))")))))
+
+(deftest a-throw-inside-a-loop-body-is-refused-citing-the-precondition
+  (let [message "throw inside a loop/doseq/dotimes body is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"]
+    (is (= message (rejection-of "(ns a (:export [main]))
+                                  (defn main [] :i64
+                                    (try (loop [i 0] (if (= i 3) (throw \"s\") (recur (+ i 1))))
+                                         (catch e 0)))")))
+    (is (= message (rejection-of "(ns a (:export [main]))
+                                  (defn main [] :i64 (try (doseq [x [1 2]] (throw \"s\")) (catch e 0)))")))
+    (is (= message (rejection-of "(ns a (:export [main]))
+                                  (defn main [] :i64 (try (dotimes [x 2] (throw \"s\")) (catch e 0)))")))))
+
+(deftest a-throw-inside-a-lazy-thunk-or-fn-literal-is-refused
+  (is (= "throw inside a lazy thunk is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+         (rejection-of "(ns a (:export [main]))
+                        (defn main [] :i64
+                          (try (lazy-first (lazy-cons (throw \"s\") (lazy-cons 1 0))) (catch e 0)))")))
+  (is (= "throw inside a fn literal is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+         (rejection-of "(ns a (:export [main]))
+                        (defn main [] :i64 (try (let [g (fn [x] (throw \"s\"))] (g 1)) (catch e 0)))"))))
+
+(deftest a-throw-in-a-facet-scope-is-refused-citing-the-precondition
+  (is (= "throw in function f whose effect row has a dataspace facet operation #{:dataspace/transact} is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+         (rejection-of "(ns a (:capabilities #{:dataspace/transact}) (:export [main]))
+                        (defn- f [] :i64 (do (facet-leave! 0) (throw \"s\")))
+                        (defn main [] :i64 (try (f) (catch e 0)))")))
+  (testing "the row is interprocedural: a facet operation in a callee counts"
+    (is (= "throw in function f whose effect row has a dataspace facet operation #{:dataspace/transact} is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+           (rejection-of "(ns a (:capabilities #{:dataspace/transact}) (:export [main]))
+                          (defn- leave [] :i64 (do (facet-leave! 0) 0))
+                          (defn- f [] :i64 (do (leave) (throw \"s\")))
+                          (defn main [] :i64 (try (f) (catch e 0)))"))))
+  (testing "and a try in such a scope, which would skip the leave in its body"
+    (is (= "try in function main whose effect row has a dataspace facet operation #{:dataspace/transact} is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+           (rejection-of "(ns a (:capabilities #{:dataspace/transact}) (:export [main]))
+                          (defn- f [x :i64] :i64 (if (= x 0) (throw \"s\") x))
+                          (defn main [] :i64 (try (do (facet-enter!) (f 0)) (catch e 0)))")))))
+
+(def ^:private aborting-source
+  "(ns a (:export [main]))
+   (defn- f [x :i64] :i64 (if (= x 0) (throw \"boom\") x))
+   (defn- h [x :i64] :i64 (+ x 1))
+   (defn- g [a :i64 b :i64] :i64 (- a b))
+   (defn main [] :i64 (try ")
+
+(defn- in-main [expression handler]
+  (str aborting-source expression " (catch e " handler ")))"))
+
+(deftest an-aborting-form-in-operand-or-test-position-is-a-normalized
+  (testing "SLICE 2. Each of these was the slice-1 position refusal; each now
+            runs, on both the ok and the err path"
+    (is (= 8 (run (in-main "(+ 1 (f 7))" "0") 'main [])))
+    (is (= 4 (run (in-main "(+ 1 (f 0))" "(string-length e)") 'main [])))
+    (is (= 100 (run (in-main "(if (> (f 5) 3) 100 200)" "0") 'main [])))
+    (is (= 5 (run (in-main "(g (f 9) 4)" "0") 'main []))))
+  (testing "a throw in operand position makes the enclosing expression dead:
+            the operands to its LEFT still run, the expression itself does not"
+    (is (= 1 (run "(ns a (:export [main]))
+                   (defn main [] :i64 (try (+ 1 (throw \"s\")) (catch e (string-length e))))"
+                  'main [])))
+    (is (= '(result-match-of [:result :i64 :string]
+                             (let [__kotoba_abort_thrown_1 (h 1)]
+                               (result-err-of [:result :i64 :string] "s"))
+                             __kotoba_abort_ok_1 __kotoba_abort_ok_1
+                             e (string-byte-length e))
+           (:body (function-named (sema/analyze (in-main "(+ (h 1) (throw \"s\"))" "(string-length e)"))
+                                  'main)))
+        "`(h 1)` is still evaluated; the `+` is gone because it never runs")))
+
+(deftest a-normalization-preserves-left-to-right-evaluation
+  ;; The hazard the ANF exists to avoid: hoisting `(f 2)` out of `(g (h 1)
+  ;; (f 2))` without also hoisting `(h 1)` would evaluate `(f 2)` FIRST. `h`
+  ;; is pure here, so no test could catch that by its VALUE -- the order is
+  ;; only visible in the shape, so the shape is what is pinned.
+  (is (= '(let [__kotoba_abort_operand_1 (h 1)]
+            (result-match-of [:result :i64 :string] (f 2)
+                             __kotoba_abort_operand_2
+                             (result-ok-of [:result :i64 :string]
+                                           (g __kotoba_abort_operand_1 __kotoba_abort_operand_2))
+                             __kotoba_abort_err_1
+                             (result-err-of [:result :i64 :string] __kotoba_abort_err_1)))
+         (nth (:body (function-named (sema/analyze (in-main "(g (h 1) (f 2))" "0")) 'main)) 2))))
+
+(deftest an-aborting-call-in-a-guarded-lexical-context-is-refused
+  ;; Slice 2's propagation would otherwise admit exactly what slice 1's
+  ;; precondition guard was written to stop: `throw` is refused inside these
+  ;; while it is still syntax, but a CALL is not visible then -- which
+  ;; functions abort is not known until the fixed point. Same precondition,
+  ;; same words.
+  (is (= "call to aborting function `f` inside a loop/doseq/dotimes body is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+         (rejection-of (in-main "(loop [i 1 acc 0] (if (= i 3) acc (recur (+ i 1) (+ acc (f i)))))" "0"))))
+  (is (= "call to aborting function `f` inside a fn literal is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+         (rejection-of (in-main "(let [q (fn [x] (f x))] (invoke q 1))" "0"))))
+  (is (= "call to aborting function `f` inside a lazy thunk is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+         (rejection-of (in-main "(lazy-first (lazy-cons (f 1) (lazy-cons 2 0)))" "0"))))
+  (testing "a throw in a fn literal is still refused where it always was, even
+            though the fn literal is now in an operand position"
+    (is (= "throw inside a fn literal is not admitted in abort slice 1: precondition :checked-lexical-facet-unwind is not met"
+           (rejection-of "(ns a (:export [main]))
+                          (defn main [] :i64
+                            (try (+ 1 (let [q (fn [x] (throw \"s\"))] (invoke q 1))) (catch e 0)))")))))
+
+(deftest a-try-that-catches-nothing-is-refused
+  (is (= "try body cannot abort; there is nothing to catch"
+         (rejection-of "(ns a (:export [main])) (defn main [] :i64 (try 1 (catch e 0)))"))))
+
+(deftest an-explicit-catch-type-must-be-what-the-body-throws
+  (is (= "try catches string but its body aborts with i64"
+         (rejection-of "(ns a (:export [main]))
+                        (defn main [] :i64 (try (if (> 1 0) (throw 1) 5) (catch :string e 7)))"))))
+
+(deftest a-throw-outside-any-function-is-refused
+  (is (= "only ns, def, defn, and defn- are allowed at top level"
+         (rejection-of "(throw 1) (defn main [] :i64 1)"))))
+
+(deftest the-clause-shape-is-closed
+  (is (= "try requires exactly one body expression and one catch clause"
+         (rejection-of "(ns a (:export [main])) (defn main [] :i64 (try (throw 1) 2 (catch e 0)))")))
+  (is (= "catch is admitted only as the clause of a try"
+         (rejection-of "(ns a (:export [main])) (defn main [] :i64 (catch e 0))")))
+  (is (= "throw requires exactly one error value"
+         (rejection-of "(ns a (:export [main])) (defn main [] :i64 (try (throw 1 2) (catch e 0)))"))))
+
+(deftest abort-is-an-effect-a-ceiling-can-refuse
+  (is (= "inferred effects exceed declared effect ceiling for f: #{:abort}"
+         (rejection-of "(ns a (:export [main]))
+                        (defn- f [x :i64] {:effects #{:clock/now}} (if (= x 0) (throw \"s\") x))
+                        (defn main [] :i64 (try (f 1) (catch e 0)))"))))
+
+(deftest the-pure-product-profile-refuses-the-heads
+  (is (= "form outside pure-product profile: try"
+         (rejection-of one-function {:language-profile :pure-product}))))
+
+(deftest every-abort-refusal-carries-a-stable-code
+  (is (= :kotoba.error/abort-error-type
+         (rejection-code-of "(ns a (:export [main]))
+                             (defn- f [x :i64] :i64 (if (= x 0) (throw \"s\") (throw 1)))
+                             (defn main [] :i64 (try (f 1) (catch e 0)))")))
+  (is (= :kotoba.error/abort-unhandled-export
+         (rejection-code-of "(defn main [] :i64 (if (= 1 1) (throw \"s\") 1))")))
+  (is (= :kotoba.error/abort-precondition
+         (rejection-code-of "(ns a (:export [main]))
+                             (defn main [] :i64 (try (dotimes [x 2] (throw \"s\")) (catch e 0)))"))))
+
+;; ---------------------------------------------------------------------------
+;; Control: a throw-free program lowers exactly as it did before the ability
+
+(def ^:private control
+  "A program that exercises the passes the ability touches -- if joins, let
+  bindings, loop helpers, a lambda through `map`, `match`, `defdesugar`, a
+  constant, `doseq`, `cond`, and hand-written result values -- and no throw
+  or try."
+  "(ns control.program (:export [main entry-point]))
+   (def limit 6)
+   (defdesugar clamp [x lo hi] (if (< x lo) lo (if (> x hi) hi x)))
+   (defn- total [a :i64 b :i64] :i64 (+ a b))
+   (defn- sum-to [n :i64] :i64 (loop [i n acc 0] (if (= i 0) acc (recur (- i 1) (+ acc i)))))
+   (defn- label [s :string] :i64 (match s \"a\" 1 \"b\" 2 :else (string-length s)))
+   (defn- twice-all [v :vector-i64] :vector-i64 (map (fn [x] (* 2 x)) v))
+   (defn- safe-quot [a :i64 b :i64] [:result :i64 :string]
+     (if (= b 0) (result-err-of [:result :i64 :string] \"zero\") (result-ok-of [:result :i64 :string] (quot a b))))
+   (defn entry-point [k :i64] :i64
+     (let [r (safe-quot 10 k)]
+       (result-match-of [:result :i64 :string] r v v e (string-length e))))
+   (defn main [] :i64
+     (+ (sum-to 5) (clamp 9 0 limit) (label \"zz\") (total 1 2)
+        (vector-at (twice-all [1 2 3]) 2) (entry-point 0) (entry-point 2)
+        (doseq [x [1 2]] x) (cond (> 1 2) 0 :else 1)))")
+
+(defn- sha256-hex [^String text]
+  (let [digest (java.security.MessageDigest/getInstance "SHA-256")]
+    (apply str (map #(format "%02x" %) (.digest digest (kbytes/utf8-bytes text))))))
+
+(deftest a-throw-free-program-lowers-byte-for-byte-as-before
+  ;; Both hashes were taken on kotoba-sema c14ca39e, the main tip before this
+  ;; ability landed, from `(pr-str hir)` and `(pr-str (dissoc kir :oracle-value))`
+  ;; of exactly this source. They pin that no pass this change touched --
+  ;; if-typing, let lowering, effect inference, the export check -- moved a
+  ;; program that has no throw and no try.
+  (let [hir (sema/analyze control)
+        kir (kir/lower hir)]
+    (is (= "420b44ecc31e04d926c7bc3fdaf778ed380e3c624a19b8510c32a30ae01d9d90"
+           (sha256-hex (pr-str hir))))
+    (is (= "a26ad601fcbd36b546d04fcd2f8d0bc04157febd07f0eafca9a7c349e73440e6"
+           (sha256-hex (pr-str (dissoc kir :oracle-value)))))
+    (is (= 42 (long (kir/execute kir 'main []))))))

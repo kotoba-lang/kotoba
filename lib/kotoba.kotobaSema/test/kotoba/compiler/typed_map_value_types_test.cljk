@@ -1,0 +1,355 @@
+(ns kotoba.compiler.typed-map-value-types-test
+  "`[:map K V]` was generic in V everywhere except where a program could reach
+  it -- the same defect the key half had, one layer over.
+
+  Measured 2026-09-03 against sema df383ba0 / amu 57ba0ee0, at BOTH layers:
+
+                    bare literal {1 <v>}      typed-map-new / get / assoc /
+                                              dissoc / contains? / entry-at
+    :i64            OK                        OK
+    :string         type mismatch: expected   OK
+                      i64, got string
+    :bool           ... got bool              OK
+    :keyword        ... got keyword           OK
+    record          ... got [:record ...]     OK
+    [:map :i64 :i64] ... got [:map :i64 :i64] OK
+    [:vector [...]] ... got [:vector [...]]   OK
+    [:set :i64]     ... got [:set :i64]       OK
+    :f64            outside the structured    outside the structured scalar
+                      scalar ABI                ABI
+
+  Every column but the first was already generic. What refused an ordinary
+  program was the LITERAL, which fixed its value type at `:i64` -- so
+
+    (let [m {1 \"a\"}] (typed-map-count [:map :i64 :string] m))
+
+  exited 65 with `expression type mismatch: expected i64, got string`: a
+  GENERIC type error on a program that reads correct, and the same shape of
+  defect the key work fixed the day before.
+
+  The runtime never had the restriction. `kotoba.kir.value/bounded-typed-value!`
+  validates a `[:map K V]` by validating each key against K and each value
+  against V, then sorting the entries with `compare-typed-values` on the KEY
+  ALONE, and detecting duplicates on the KEY ALONE. Measured:
+
+    (bounded-typed-value! [:map :i64 :string]
+                          [[:map :i64 :string] [[9 \"a\"] [2 \"z\"] [5 \"m\"]]])
+    => [[2 \"z\"] [5 \"m\"] [9 \"a\"]]     ; ordered by key; the values rode along
+    [[1 10] [1 99]]  => throws \"typed map contains a duplicate key\"
+
+  so a VALUE needs neither a total order nor a decidable identity. That is why
+  the float refusals are two different facts and are said as two messages: a
+  floating KEY has no identity to be a key by, and a floating VALUE is refused
+  by the structured scalar ABI alone (`validate-value-type!` throws \"direct
+  floating map keys or values are outside the structured scalar ABI\" for
+  `[:map :i64 :f64]`). The value-side obstacle is REAL -- it is not the key
+  argument inherited -- and it is owned by `kotoba-kir`, not by this
+  frontend.
+
+  Four things are pinned here:
+
+  1. positives per admitted value type, run to a VALUE on the KIR interpreter
+     (not merely \"not refused\");
+  2. the refusals, each by its exact message and code, so a program that is
+     refused for a DIFFERENT reason cannot be counted as this case passing;
+  3. the interaction with the keyword-keyed literal: until 2026-09-11 it
+     stayed the legacy untagged pair map and a non-i64 value was refused by
+     name; it now lowers to a closed record (adr-2609111900, see
+     `keyword_map_record_literal_test.cljk`), and the all-i64 one is
+     unchanged;
+  4. a BYTE-IDENTITY control on i64-valued, keyword-keyed and
+     all-unknown-value programs, whose HIR and KIR must be unchanged character
+     for character. Captured on sema df383ba0 on BOTH runtimes before the
+     change; `norm` exists because `pr-str` writes a `.kotoba` integer as `42`
+     on the JVM and `42n` under nbb."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]
+            [kotoba.kir.value :as value]
+            #?(:cljs [kotoba.kir.cljs-i64 :as i64])))
+
+(defn- unit [body] (str "(ns m.probe)\n(defn main [] :i64 " body ")\n"))
+
+(defn- run [body]
+  (let [v (kir/execute (kir/lower (sema/analyze (unit body))) 'main [] {})]
+    #?(:clj v :cljs (js/Number v))))
+
+(defn- refusal [body]
+  (try (do (sema/analyze (unit body)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+;; --- 1. the reported defect ------------------------------------------------
+
+(deftest a-string-valued-literal-is-a-typed-map
+  ;; `amu check --jvm-free` on exactly this program exited 65 with
+  ;; "expression type mismatch: expected i64, got string".
+  (is (= 1 (run "(let [m {1 \"a\"}] (typed-map-count [:map :i64 :string] m))")))
+  (is (= 5 (run (str "(string-length (option-value-of [:option :string]"
+                     " (typed-map-get [:map :i64 :string] {1 \"hello\"} 1)"
+                     " \"\"))"))))
+  (testing "through the friendly `get`, whose default says the value type too"
+    (is (= 4 (run "(string-length (get {1 \"abcd\"} 1 \"\"))")))
+    (is (= 0 (run "(string-length (get {1 \"abcd\"} 9 \"\"))")))))
+
+;; --- 2. positives, per admitted value type ---------------------------------
+
+(deftest a-bool-valued-literal-runs-to-a-value
+  (is (= 7 (run (str "(if (option-value-of [:option :bool]"
+                     " (typed-map-get [:map :i64 :bool] {1 true 2 false} 1)"
+                     " false) 7 8)"))))
+  (is (= 8 (run (str "(if (option-value-of [:option :bool]"
+                     " (typed-map-get [:map :i64 :bool] {1 true 2 false} 2)"
+                     " true) 7 8)")))))
+
+(deftest a-keyword-valued-literal-runs-to-a-value
+  (is (= 7 (run (str "(if (= (option-value-of [:option :keyword]"
+                     " (typed-map-get [:map :i64 :keyword] {1 :a 2 :b} 2)"
+                     " :z) :b) 7 8)")))))
+
+(deftest a-record-valued-literal-runs-to-a-value
+  ;; A record has no literal spelling, but `record-new` DECLARES the type it
+  ;; builds as its first argument, and that argument is in the source. The
+  ;; four canonical constructors that do this are read the same way.
+  (is (= 42 (run (str "(record-get [:record :m/r [[:x :i64]]]"
+                      " (option-value-of [:option [:record :m/r [[:x :i64]]]]"
+                      " (typed-map-get [:map :i64 [:record :m/r [[:x :i64]]]]"
+                      " {1 (record-new [:record :m/r [[:x :i64]]] 42)} 1)"
+                      " (record-new [:record :m/r [[:x :i64]]] 0)) :x)")))))
+
+(deftest a-map-valued-literal-runs-to-a-value
+  (is (= 2 (run (str "(typed-map-count [:map :i64 :i64]"
+                     " (option-value-of [:option [:map :i64 :i64]]"
+                     " (typed-map-get [:map :i64 [:map :i64 :i64]]"
+                     " {1 (typed-map-new [:map :i64 :i64] 5 50 6 60)} 1)"
+                     " (typed-map-new [:map :i64 :i64])))")))))
+
+(deftest a-vector-valued-and-a-set-valued-literal-run-to-a-value
+  (is (= 4 (run (str "(hetero-vector-at [:vector [:i64 :i64]]"
+                     " (option-value-of [:option [:vector [:i64 :i64]]]"
+                     " (typed-map-get [:map :i64 [:vector [:i64 :i64]]]"
+                     " {1 (hetero-vector-new [:vector [:i64 :i64]] 4 5)} 1)"
+                     " (hetero-vector-new [:vector [:i64 :i64]] 0 0)) 0)"))))
+  (is (= 1 (run (str "(typed-set-count [:set :i64]"
+                     " (option-value-of [:option [:set :i64]]"
+                     " (typed-map-get [:map :i64 [:set :i64]]"
+                     " {1 (typed-set-new [:set :i64] 9)} 1)"
+                     " (typed-set-new [:set :i64])))")))))
+
+(deftest a-string-keyed-literal-carries-the-widened-value-types-too
+  ;; The key and value halves are read independently: neither restricts the
+  ;; other.
+  (is (= 5 (run (str "(string-length (option-value-of [:option :string]"
+                     " (typed-map-get [:map :string :string] {\"k\" \"hello\"}"
+                     " \"k\") \"\"))"))))
+  (is (= 7 (run (str "(if (option-value-of [:option :bool]"
+                     " (typed-map-get [:map :string :bool] {\"k\" true} \"k\")"
+                     " false) 7 8)")))))
+
+(deftest the-write-half-carries-the-widened-value-types
+  (is (= 2 (run (str "(typed-map-count [:map :i64 :string]"
+                     " (assoc {1 \"a\"} 2 \"b\"))"))))
+  (is (= 1 (run (str "(typed-map-count [:map :i64 :string]"
+                     " (dissoc {1 \"a\" 2 \"b\"} 1))"))))
+  (is (= 7 (run "(if (contains? {1 \"a\"} 1) 7 8)")))
+  (is (= 3 (run (str "(string-length (option-value-of [:option :string]"
+                     " (typed-map-get [:map :i64 :string]"
+                     " (assoc {1 \"a\"} 1 \"xyz\") 1) \"\"))")))))
+
+(deftest an-empty-literal-takes-its-VALUE-type-from-the-first-assoc-too
+  ;; `{}` desugars to `(map-new)` and is retyped by `assoc` from its first
+  ;; key. That site ran AFTER desugaring and still hard-coded `:i64` for the
+  ;; value; it asks inference now, exactly as it already asked for the key.
+  (is (= 1 (run (str "(string-length (option-value-of [:option :string]"
+                     " (typed-map-get [:map :i64 :string] (assoc {} 1 \"a\")"
+                     " 1) \"\"))"))))
+  (is (= 7 (run (str "(if (option-value-of [:option :bool]"
+                     " (typed-map-get [:map :string :bool] (assoc {} \"k\" true)"
+                     " \"k\") false) 7 8)"))))
+  (testing "an i64 value still gets the descriptor it always got"
+    (is (= 10 (run "(get (assoc {} 1 10) 1 0)")))))
+
+;; --- 3. what an unknown value expression does ------------------------------
+
+(deftest a-value-expression-inference-owns-contributes-nothing-here
+  ;; Desugaring runs before inference, so only a value the SOURCE spells out
+  ;; can be read here. An arbitrary expression keeps the `:i64` this site has
+  ;; always defaulted to and is checked downstream, as it was before.
+  (is (= 1 (run "(typed-map-count [:map :i64 :i64] {1 (+ 1 1)})")))
+  (testing "one typed value is enough to type the whole literal"
+    (is (= 2 (run (str "(string-length (option-value-of [:option :string]"
+                       " (typed-map-get [:map :i64 :string]"
+                       " {1 \"a\" 2 (string-concat \"b\" \"c\")} 2) \"\"))"))))))
+
+;; --- 4. every refusal, pinned by its exact message and code ----------------
+
+(deftest a-floating-literal-VALUE-is-refused-on-the-ABI-not-on-key-identity
+  ;; The key refusal and the value refusal are two different facts. This one
+  ;; says so in its own words rather than borrowing the key's.
+  (is (= {:message (str "map literal value at key 1 is a floating point "
+                        "literal: map value type :f64 is outside the "
+                        "structured scalar ABI. This is the ABI's refusal and "
+                        "not the floating-key one -- a value needs neither a "
+                        "total order nor a decidable identity, and is refused "
+                        "because the typed map's value slot has no floating "
+                        "encoding")
+          :code :kotoba.error/floating-map-kv}
+         (refusal "(typed-map-count [:map :i64 :i64] {1 1.5})"))))
+
+(deftest disagreeing-value-types-are-refused-naming-BOTH-and-WHERE
+  (is (= {:message (str "map literal values must all be one type; the value "
+                        "at key 1 is :i64 and the value at key 2 is :string")
+          :code :kotoba.error/map-literal-value}
+         (refusal "(typed-map-count [:map :i64 :i64] {1 10 2 \"a\"})")))
+  (testing "the entries are named in the literal's canonical key order, so the message does not depend on the host's map iteration order"
+    (is (= (str "map literal values must all be one type; the value at key "
+                "\"a\" is :bool and the value at key \"b\" is :i64")
+           (:message (refusal (str "(typed-map-count [:map :string :bool]"
+                                   " {\"a\" true \"b\" 1})")))))
+    (is (= (str "map literal values must all be one type; the value at key "
+                "\"a\" is :bool and the value at key \"b\" is :i64")
+           (:message (refusal (str "(typed-map-count [:map :string :bool]"
+                                   " {\"b\" 1 \"a\" true})")))))))
+
+(deftest a-keyword-keyed-literal-with-a-non-i64-value-is-a-closed-record
+  ;; Until 2026-09-11 this pinned the OPPOSITE: the literal was refused by
+  ;; name and pointed at `typed-map-new`, because "a keyword-keyed literal
+  ;; stays the legacy untagged pair map". That was the pair map's state, not a
+  ;; property (`lang/surface-status.edn` carried it as `:implemented-partial`),
+  ;; and `typed-map-new [:map :keyword :string]` could not have held a MIXED
+  ;; literal anyway. The literal now lowers to a closed record whose fields
+  ;; are read off the values, the way a `defrecord` constructor lowers; see
+  ;; `keyword_map_record_literal_test.cljk` for the descriptor, the nested
+  ;; cases and the refusals. The all-i64 keyword literal is unchanged (the
+  ;; byte-identity control at the end of this file).
+  (is (= 1 (run "(string-length (:a {:a \"x\"}))")))
+  (is (= 7 (run "(if (:a {:a true}) 7 8)")))
+  (testing "the typed-map spelling with keyword keys still works beside it"
+    (is (= 7 (run (str "(if (option-value-of [:option :bool]"
+                       " (typed-map-get [:map :keyword :bool]"
+                       " (typed-map-new [:map :keyword :bool] :a true) :a)"
+                       " false) 7 8)"))))))
+
+(deftest the-key-side-refusals-are-unchanged
+  ;; A floating KEY still gets the identity argument, not the ABI one. If the
+  ;; two messages ever collapsed into one, this and the case above would both
+  ;; still pass on the collapsed text unless one of them pinned the other's.
+  (is (= (str "map literal keys must be keywords, integers or strings; this "
+              "literal has a floating point key, which has no portable key "
+              "identity -- NaN compares unequal to itself, and +0.0 and -0.0 "
+              "are equal while differing in bits, so neither the entry order "
+              "nor duplicate-key detection is decidable")
+         (:message (refusal "(get {1.5 2} 1.5 0)"))))
+  (is (= "map value type :f64 is outside the structured scalar ABI"
+         (:message (refusal (str "(typed-map-count [:map :i64 :f64]"
+                                 " (typed-map-new [:map :i64 :f64]))"))))))
+
+;; --- 5. the value half takes no part in order or identity ------------------
+
+(defn- i64-key
+  "An `:i64` the runtime validator will accept on both hosts: a plain integer
+  on the JVM, a JS bigint under nbb (where a plain number is refused with
+  `value is not a signed i64`)."
+  [n]
+  #?(:clj n :cljs (i64/->bigint n)))
+
+(defn- rendered-entries
+  "Entry keys rendered with `str` so the two hosts' integer representations
+  compare: `(= (js/BigInt 2) 2)` is false in ClojureScript."
+  [validated]
+  (mapv (fn [[k v]] [(str k) v]) (second validated)))
+
+(deftest the-entry-chain-is-ordered-by-the-KEY-and-the-value-rides-along
+  ;; Measured directly on the runtime validator, because this is the fact that
+  ;; makes the float refusals two facts rather than one.
+  (is (= [["2" "z"] ["5" "m"] ["9" "a"]]
+         (rendered-entries
+          (value/bounded-typed-value!
+           [:map :i64 :string]
+           [[:map :i64 :string] [[(i64-key 9) "a"] [(i64-key 2) "z"]
+                                 [(i64-key 5) "m"]]]))))
+  (testing "duplicate detection is on the key alone: two DIFFERENT values under one key are still a duplicate"
+    (is (thrown? #?(:clj Throwable :cljs :default)
+                 (value/bounded-typed-value!
+                  [:map :i64 :i64]
+                  [[:map :i64 :i64] [[(i64-key 1) (i64-key 10)]
+                                     [(i64-key 1) (i64-key 99)]]]))))
+  (testing "a string-valued literal walks in KEY order, not value order"
+    ;; Values "z" "m" "a" descend while keys 2 5 9 ascend, so a comparator
+    ;; that reached the value would order these differently.
+    (is (= 1 (run (str "(string-length (option-value-of [:option :string]"
+                       " (typed-map-get [:map :i64 :string]"
+                       " {9 \"a\" 2 \"zzz\" 5 \"mm\"} 9) \"\"))"))))
+    (is (= 3 (run (str "(string-length (option-value-of [:option :string]"
+                       " (typed-map-get [:map :i64 :string]"
+                       " {9 \"a\" 2 \"zzz\" 5 \"mm\"} 2) \"\"))"))))))
+
+;; --- 6. the byte-identity control ------------------------------------------
+
+(defn- norm
+  "A host-independent rendering. `pr-str` writes a `.kotoba` integer as `42`
+  on the JVM and `42n` under nbb, so a literal golden could not be shared
+  between the runtimes without this."
+  [form]
+  (cond
+    (map? form) (str "{" (apply str (map (fn [[k v]] (str (norm k) " " (norm v) " "))
+                                         (sort-by (comp pr-str key) form))) "}")
+    (vector? form) (str "[" (apply str (interpose " " (map norm form))) "]")
+    (set? form) (str "#{" (apply str (interpose " " (sort (map norm form)))) "}")
+    (seq? form) (str "(" (apply str (interpose " " (map norm form))) ")")
+    (string? form) (pr-str form)
+    (keyword? form) (str form)
+    (symbol? form) (str form)
+    (nil? form) "nil"
+    (boolean? form) (str form)
+    #?(:clj (integer? form) :cljs (or (number? form) (i64/bigint-value? form)))
+    (str form)
+    :else (pr-str form)))
+
+(def ^:private i64-valued-source
+  (str "(ns g.c)\n(defn main [] :i64 (typed-map-count [:map :i64 :i64]"
+       " (assoc {3 30 1 10} 2 20)))\n"))
+
+(def ^:private unknown-valued-source
+  (str "(ns g.f)\n(defn main [] :i64 (typed-map-count [:map :i64 :i64]"
+       " {1 (+ 1 1) 2 (* 2 3)}))\n"))
+
+(def ^:private keyword-valued-source
+  (str "(ns g.a)\n(defn main [] :i64 (let [m (assoc {:b 2 :a 1} :c 3)]"
+       " (+ (get m :a 0) (get m :c 0))))\n"))
+
+(deftest an-i64-valued-literal-lowers-to-exactly-what-it-lowered-to-before
+  (is (= (str "[(typed-map-count [:map :i64 :i64] (typed-map-assoc "
+              "[:map :i64 :i64] (typed-map-new [:map :i64 :i64] 1 10 3 30) "
+              "2 20))]")
+         (norm (mapv :body (:functions (sema/analyze i64-valued-source))))))
+  (is (= (str "{:blocks [{:id 0 :instructions [[:const.i64 3] [:return]] }] "
+              ":effects #{} :entry main :exports [main] :format :kotoba.kir/v4 "
+              ":functions [{:body (typed-map-count [:map :i64 :i64] "
+              "(typed-map-assoc [:map :i64 :i64] (typed-map-new "
+              "[:map :i64 :i64] 1 10 3 30) 2 20)) :effects #{} :name main "
+              ":param-types [] :params [] :result :i64 }] :oracle-value 3 "
+              ":schema-identities nil :schemas nil "
+              ":signature {:params [] :result :i64 } }")
+         (norm (kir/lower (sema/analyze i64-valued-source))))))
+
+(deftest an-all-unknown-valued-literal-still-lowers-to-the-i64-descriptor
+  ;; The fallback, pinned. If this ever started inferring, a literal whose
+  ;; values are only known to inference would change descriptor silently.
+  (is (= (str "[(typed-map-count [:map :i64 :i64] (typed-map-new "
+              "[:map :i64 :i64] 1 (+ 1 1) 2 (* 2 3)))]")
+         (norm (mapv :body (:functions (sema/analyze unknown-valued-source)))))))
+
+(deftest a-keyword-keyed-literal-lowers-to-exactly-what-it-lowered-to-before
+  (is (= (str "[(let [m (map-assoc (map-new :a 1 :b 2) :c 3)] "
+              "(+ (map-get m :a 0) (map-get m :c 0)))]")
+         (norm (mapv :body (:functions (sema/analyze keyword-valued-source))))))
+  (is (= (str "{:blocks [{:id 0 :instructions [[:const.i64 4] [:return]] }] "
+              ":effects #{} :entry main :exports [main] :format :kotoba.kir/v4 "
+              ":functions [{:body (let [m (map-assoc (map-new :a 1 :b 2) :c 3)] "
+              "(+ (map-get m :a 0) (map-get m :c 0))) :effects #{} :name main "
+              ":param-types [] :params [] :result :i64 }] :oracle-value 4 "
+              ":schema-identities nil :schemas nil "
+              ":signature {:params [] :result :i64 } }")
+         (norm (kir/lower (sema/analyze keyword-valued-source))))))

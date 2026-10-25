@@ -1,0 +1,190 @@
+(ns kotoba.compiler.firmware-store-test
+  "fwstore: writing to pages the firmware allocated.
+
+  A UEFI image could allocate a page and could not write it. The page is at an
+  address the firmware chose, so it reaches the program through a load, and
+  the region-provenance rule refuses a base that came from one -- in the
+  caller as well as the callee.
+
+  What this suite decides is that the rule is EXTENDED and not deleted.
+  `(kernel-uefi-alloc-region ...)` is a third root beside `kernel-boot-info`
+  and `kernel-scratch-region`; a loaded word is still refused, and so is an
+  address the program computed. The page count is a literal, so this pass
+  holds the region's length and refuses a window wider than it."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.lang.text :as str]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.sema :as sema]))
+
+(defn- unit [source] (str source "\n(defn main [] :i64 0)"))
+
+(defn- analyzes? [source]
+  (try (do (sema/analyze (unit source)) true)
+       (catch #?(:clj Throwable :cljs :default) _ false)))
+
+(defn- rejection-of [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+(defn- rejection-code [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch :default e
+         (:kotoba.error/code (ex-data e)))))
+
+;; One page, AllocateAnyPages, EfiLoaderData, at boot services +0x28.
+(def ^:private one-page
+  "(kernel-uefi-alloc-region bs 40 0 2 1 0)")
+
+(defn- with-bs [body] (str "(defn f [bs] :i64 " body ")"))
+
+;; ── the head ───────────────────────────────────────────────────────────────
+
+(deftest the-allocation-is-a-six-argument-privileged-head
+  (is (= 6 (get frontend/kernel-privileged-operations 'kernel-uefi-alloc-region)))
+  (is (analyzes? (with-bs one-page)))
+  (testing "five arguments is refused"
+    (is (some? (rejection-of
+                (with-bs "(kernel-uefi-alloc-region bs 40 0 2 1)")))))
+  (testing "seven is refused"
+    (is (some? (rejection-of
+                (with-bs "(kernel-uefi-alloc-region bs 40 0 2 1 0 0)"))))))
+
+(deftest the-head-is-reserved-so-a-function-cannot-shadow-it
+  ;; `kernel-privileged-operations`' keys are reserved wholesale, so this is
+  ;; not a separate registration -- it is the assertion that the row above is
+  ;; in the table the reservation is derived from. A function with this name
+  ;; would turn every call into an ordinary call with six i64 arguments.
+  (is (contains? frontend/reserved-function-names 'kernel-uefi-alloc-region))
+  (is (some? (rejection-of
+              "(defn kernel-uefi-alloc-region [a b c d e g] :i64 0)"))))
+
+;; ── the page count is a literal ────────────────────────────────────────────
+
+(deftest the-page-count-must-be-a-compile-time-literal
+  ;; This is what makes the root worth having. `page-count * 4096` is the
+  ;; length the firmware allocated, and a length this pass cannot compute is a
+  ;; region it cannot bound a window against.
+  (is (= :kotoba.error/kernel-alloc-region-pages
+         (rejection-code
+          "(defn f [bs n] :i64 (kernel-uefi-alloc-region bs 40 0 2 n 0))")))
+  (testing "and it is refused even when nothing ever writes to the result"
+    ;; The window check only runs when the region reaches a base position;
+    ;; this refusal has to be independent of that or a program could obtain an
+    ;; unbounded region and pass it somewhere else.
+    (is (= :kotoba.error/kernel-alloc-region-pages
+           (rejection-code
+            (str "(defn f [bs n] :i64 (let [p (kernel-uefi-alloc-region bs 40 0 2 n 0)] "
+                 "(+ p 1)))")))))
+  (testing "zero pages is refused"
+    (is (= :kotoba.error/kernel-alloc-region-pages
+           (rejection-code (with-bs "(kernel-uefi-alloc-region bs 40 0 2 0 0)")))))
+  (testing "the ceiling keeps the byte length an exact i64"
+    (is (= 1099511627776 frontend/alloc-region-maximum-pages))
+    (is (analyzes?
+         (with-bs (str "(kernel-uefi-alloc-region bs 40 0 2 "
+                       frontend/alloc-region-maximum-pages " 0)"))))
+    (is (= :kotoba.error/kernel-alloc-region-pages
+           (rejection-code
+            (with-bs (str "(kernel-uefi-alloc-region bs 40 0 2 "
+                          (inc frontend/alloc-region-maximum-pages) " 0)")))))))
+
+;; ── the root ───────────────────────────────────────────────────────────────
+
+(deftest the-allocation-is-a-provenance-root
+  (is (analyzes?
+       (with-bs (str "(kernel-store-u64-4k " one-page " 4096 0 7)"))))
+  (testing "through a let binding, like every other root"
+    (is (analyzes?
+         (with-bs (str "(let [p " one-page "] (kernel-store-u64-4k p 4096 0 7))")))))
+  (testing "and through a checked narrowing of it"
+    (is (analyzes?
+         (with-bs (str "(kernel-store-u64-4k (kernel-subregion " one-page
+                       " 4096 8 16) 16 0 7)")))))
+  (testing "but arithmetic on it is refused, as it is on every other root"
+    (is (= "kernel memory base must name a region, not compute one"
+           (rejection-of
+            (with-bs (str "(kernel-store-u64-4k (+ " one-page " 8) 4096 0 7)")))))))
+
+(deftest a-region-the-program-did-not-obtain-is-still-refused
+  ;; The measured shape from kotoba-gmir ADR-0030's context: the out-word of a
+  ;; plain `kernel-uefi-call4` allocation, read back and used as a base.
+  ;; Admitting THIS is what "widen traceable-base? to any loaded word" would
+  ;; have meant, and it stays refused.
+  (is (= :kotoba.error/kernel-region-provenance
+         (rejection-code
+          (with-bs (str "(let [s (kernel-scratch-region) "
+                        "      a (kernel-uefi-call4 bs 40 0 2 1 (kernel-subregion s 16384 64 8)) "
+                        "      page (kernel-load-u64-16k s 16384 64)] "
+                        "  (kernel-store-u64-4k page 4096 0 7))")))))
+  (testing "and so is `kernel-load-ptr`'s answer, which is the same shape"
+    (is (= :kotoba.error/kernel-region-provenance
+           (rejection-code
+            (with-bs "(kernel-store-u64-4k (kernel-load-ptr bs 40) 4096 0 7)")))))
+  (testing "and so is an address a helper is handed -- the taint reaches the caller"
+    (is (= :kotoba.error/kernel-region-provenance
+           (rejection-code
+            (str "(defn put [p] :i64 (kernel-store-u64-4k p 4096 0 7))\n"
+                 "(defn f [bs] :i64 (put (kernel-load-ptr bs 40)))")))))
+  (testing "while the allocation flows into that same helper"
+    (is (analyzes?
+         (str "(defn put [p] :i64 (kernel-store-u64-4k p 4096 0 7))\n"
+              "(defn f [bs] :i64 (put " one-page "))")))))
+
+;; ── the window ─────────────────────────────────────────────────────────────
+
+(deftest a-window-may-not-exceed-what-the-allocation-obtained
+  (testing "one page carries a 4096-byte window"
+    (is (analyzes?
+         (with-bs (str "(kernel-load-u64-4k " one-page " 4096 0)")))))
+  (testing "one byte more is refused, and the refusal names the byte count"
+    (let [message (rejection-of
+                   (with-bs (str "(kernel-load-u64-16k " one-page " 4097 0)")))]
+      (is (some? message))
+      (is (str/includes? message "4096"))))
+  (testing "the widest tier over a one-page allocation is refused"
+    ;; This is the case the ceiling exists for. Every checked window is
+    ;; already bounded by its tier; 65536 is inside the tier and outside the
+    ;; page.
+    (is (= :kotoba.error/kernel-alloc-region-window
+           (rejection-code
+            (with-bs (str "(kernel-store-u64-64k " one-page " 65536 0 7)"))))))
+  (testing "sixteen pages carry it, because sixteen pages are 65536 bytes"
+    (is (analyzes?
+         (with-bs "(kernel-store-u64-64k (kernel-uefi-alloc-region bs 40 0 2 16 0) 65536 0 7)"))))
+  (testing "a non-literal length over the region is refused"
+    (is (= :kotoba.error/kernel-alloc-region-window
+           (rejection-code
+            (str "(defn f [bs n] :i64 (kernel-load-u64-4k " one-page " n 0))")))))
+  (testing "the ceiling follows a let binding"
+    (is (= :kotoba.error/kernel-alloc-region-window
+           (rejection-code
+            (with-bs (str "(let [p " one-page "] "
+                          "(kernel-store-u64-64k p 65536 0 7))"))))))
+  (testing "and an `if` is bounded by the SMALLER of its two allocations"
+    (is (analyzes?
+         (with-bs (str "(kernel-load-u64-16k (if (= bs 0) "
+                       "(kernel-uefi-alloc-region bs 40 0 2 4 0) "
+                       "(kernel-uefi-alloc-region bs 40 0 2 8 0)) 16384 0)"))))
+    (is (= :kotoba.error/kernel-alloc-region-window
+           (rejection-code
+            (with-bs (str "(kernel-load-u64-16k (if (= bs 0) "
+                          "(kernel-uefi-alloc-region bs 40 0 2 1 0) "
+                          "(kernel-uefi-alloc-region bs 40 0 2 8 0)) 16384 0)")))))))
+
+(deftest an-if-can-no-longer-launder-the-scratch-ceiling
+  ;; Not this stream's operation, and this stream's operation is why it was
+  ;; found: `traceable-base?` follows both arms of an `if` and `scratch-rooted?`
+  ;; did not, so `(if c (kernel-scratch-region) x)` was a rooted base with no
+  ;; ceiling at all. A 65536-byte window over the 16384-byte reservation
+  ;; compiled.
+  (is (= :kotoba.error/kernel-scratch-window
+         (rejection-code
+          "(defn f [p] :i64 (kernel-load-u64-64k (if (= p 0) (kernel-scratch-region) p) 65536 0))")))
+  (testing "the other arm, so it is not an accident of which one is looked at"
+    (is (= :kotoba.error/kernel-scratch-window
+           (rejection-code
+            "(defn f [p] :i64 (kernel-load-u64-64k (if (= p 0) p (kernel-scratch-region)) 65536 0))"))))
+  (testing "and a window that fits the reservation still compiles"
+    (is (analyzes?
+         "(defn f [p] :i64 (kernel-load-u64-16k (if (= p 0) (kernel-scratch-region) p) 16384 0))"))))

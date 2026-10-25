@@ -1,0 +1,139 @@
+(ns kotoba.compiler.boot-scratch-test
+  "boot-scratch: the writable region a UEFI image owns, and the address of a
+  function in the same module.
+
+  What this suite decides is what the frontend decides: that
+  `(kernel-scratch-region)` is a provenance ROOT like `kernel-boot-info`, that
+  a window declared over it is bounded by the reservation, and that
+  `(kernel-function-address f)` takes a NAME -- checked against this module's
+  own functions, not typed as an expression. Which TARGET may name either is
+  amu's, exactly as it is for the literal heads."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.lang.text :as str]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.sema :as sema]))
+
+(defn- unit [source] (str source "\n(defn main [] :i64 0)"))
+
+(defn- analyzes? [source]
+  (try (do (sema/analyze (unit source)) true)
+       (catch #?(:clj Throwable :cljs :default) _ false)))
+
+(defn- rejection-of [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+;; ── the region ─────────────────────────────────────────────────────────────
+
+(deftest the-scratch-region-is-a-zero-arity-privileged-head
+  (is (= 0 (get frontend/kernel-privileged-operations 'kernel-scratch-region)))
+  (is (analyzes? "(defn f [] :i64 (kernel-scratch-region))"))
+  (testing "and takes no arguments"
+    (is (some? (rejection-of "(defn f [] :i64 (kernel-scratch-region 0))")))))
+
+(deftest the-region-is-a-provenance-root-beside-boot-info
+  ;; The rule this joins: a base must flow unmodified from a literal, from
+  ;; `kernel-boot-info`, or from a parameter -- never from arithmetic, a load
+  ;; or a call result.
+  (is (analyzes?
+       "(defn f [] :i64 (kernel-load-u64 (kernel-scratch-region) 512 0))"))
+  (testing "through a let binding, like every other root"
+    (is (analyzes?
+         (str "(defn f [] :i64 (let [p (kernel-scratch-region)] "
+              "(kernel-store-u64 p 512 0 7)))"))))
+  (testing "and a bounded window derived from it with the checked primitive"
+    (is (analyzes?
+         (str "(defn f [] :i64 (kernel-load-u64 "
+              "(kernel-subregion (kernel-scratch-region) 512 8 16) 16 0))"))))
+  (testing "but arithmetic on it is still refused, as it is on boot-info"
+    (is (= "kernel memory base must name a region, not compute one"
+           (rejection-of
+            (str "(defn f [] :i64 (kernel-load-u64 "
+                 "(+ (kernel-scratch-region) 8) 512 0))"))))))
+
+(deftest a-literal-base-is-a-root-on-both-runtimes
+  ;; Not this stream's operation, and this stream's operation is why it is
+  ;; here: `integer?` is false for the BigInt a `.kotoba` integer literal is
+  ;; under ClojureScript, so the literal-base clause of the provenance rule
+  ;; answered `true` on the JVM and `false` under nbb. Four of the positive
+  ;; cases above were refused that way before `integer-literal?` existed.
+  (is (analyzes? "(defn f [] :i64 (kernel-load-u64 4096 512 0))")))
+
+(deftest a-window-over-the-region-may-not-exceed-the-reservation
+  (is (= 16384 frontend/image-scratch-bytes))
+  (testing "the reservation itself is admitted"
+    (is (analyzes?
+         (str "(defn f [] :i64 (kernel-load-u64-16k (kernel-scratch-region) "
+              (str frontend/image-scratch-bytes) " 0))"))))
+  (testing "one byte more is refused, and the refusal names both numbers"
+    (let [message (rejection-of
+                   (str "(defn f [] :i64 (kernel-load-u64-64k "
+                        "(kernel-scratch-region) "
+                        (str (inc frontend/image-scratch-bytes)) " 0))"))]
+      (is (some? message))
+      (is (str/includes? message "16384"))))
+  (testing "the 64k tier over the region is refused at its own tier's length"
+    (is (some? (rejection-of
+                (str "(defn f [] :i64 (kernel-load-u64-64k "
+                     "(kernel-scratch-region) 65536 0))")))))
+  (testing "a non-literal length over the region is refused too"
+    ;; An expression cannot be compared against the ceiling, and admitting it
+    ;; would leave exactly the hole this check exists to close.
+    (is (some? (rejection-of
+                (str "(defn f [n] :i64 (kernel-load-u64-16k "
+                     "(kernel-scratch-region) n 0))")))))
+  (testing "and the ceiling applies to a store as well as a load"
+    (is (some? (rejection-of
+                (str "(defn f [] :i64 (kernel-store-u64-64k "
+                     "(kernel-scratch-region) 65536 0 7))")))))
+  (testing "a window that wide over a PARAMETER is still admitted"
+    ;; The ceiling is a fact about the reservation, not about the tier.
+    (is (analyzes?
+         "(defn f [p] :i64 (kernel-load-u64-64k p 65536 0))"))))
+
+;; ── the address of a function ──────────────────────────────────────────────
+
+(deftest the-function-address-head-is-declared-at-arity-one
+  (is (= '{kernel-function-address 1} frontend/image-symbol-operations))
+  (testing "and it is reserved, so a function cannot shadow it silently"
+    (is (contains? frontend/reserved-function-names 'kernel-function-address))))
+
+(deftest a-function-address-names-a-function-this-module-defines
+  (is (analyzes?
+       (str "(defn helper [] :i64 7)\n"
+            "(defn f [] :i64 (kernel-function-address helper))")))
+  (testing "its own name, and the entry, resolve too"
+    (is (analyzes? "(defn f [] :i64 (kernel-function-address f))"))
+    (is (analyzes? "(defn f [] :i64 (kernel-function-address main))")))
+  (testing "a name nothing defines is refused HERE, naming the operation"
+    (is (= "kernel-function-address names no function in this module"
+           (rejection-of "(defn f [] :i64 (kernel-function-address absent))"))))
+  (testing "a local is refused rather than silently taken as a name"
+    (is (= "kernel-function-address names a function, not a local"
+           (rejection-of
+            (str "(defn helper [] :i64 7)\n"
+                 "(defn f [helper] :i64 (kernel-function-address helper))")))))
+  (testing "and so is a parameter that shadows nothing"
+    (is (= "kernel-function-address names a function, not a local"
+           (rejection-of "(defn f [g] :i64 (kernel-function-address g))"))))
+  (testing "a string is not a name"
+    (is (= "kernel-function-address requires a function name"
+           (rejection-of "(defn f [] :i64 (kernel-function-address \"main\"))"))))
+  (testing "nor is an integer"
+    (is (= "kernel-function-address requires a function name"
+           (rejection-of "(defn f [] :i64 (kernel-function-address 0))"))))
+  (testing "and the arity is one"
+    (is (= "image symbol operation arity mismatch: kernel-function-address takes 1 argument; got 0"
+           (rejection-of "(defn f [] :i64 (kernel-function-address))")))))
+
+(deftest an-address-is-an-i64-and-jump-to-takes-it
+  ;; This is the whole point: `kernel-jump-to` has been admitted since the
+  ;; UEFI boundary landed and nothing produced its first argument.
+  (is (analyzes?
+       (str "(defn target [] :i64 7)\n"
+            "(defn f [b] :i64 (kernel-jump-to (kernel-function-address target) b))")))
+  (testing "and the address is usable wherever an i64 is"
+    (is (analyzes?
+         (str "(defn target [] :i64 7)\n"
+              "(defn f [] :i64 (+ (kernel-function-address target) 0))")))))

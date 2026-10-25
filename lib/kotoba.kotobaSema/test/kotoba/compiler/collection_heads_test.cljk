@@ -1,0 +1,281 @@
+(ns kotoba.compiler.collection-heads-test
+  "`count` had no desugar arm at all, and `first`/`second`/`rest` refused every
+  collection with a message about i64.
+
+  `lang/guest-grammar.edn` has carried
+
+    :count {:desugars-to \"bounded pair-chain walk\" :level \"L2\"
+            :backends #{:compiler :kotoba-wasm :kotoba-cljs}}
+
+  since the head was declared, and `lang/surface-status.edn`
+  `:persistent-collection-semantics` claims `:operations #{count nth peek pop
+  keys vals get assoc dissoc conj disj contains?}` on the same three backends.
+  Measured 2026-09-03 against sema `df383ba0` and amu `57ba0ee0`, BEFORE this
+  change:
+
+    (count [7 8 9])   operation has no admitted lowering
+    (count #{:a})     operation has no admitted lowering
+    (first [7 8 9])   expression type mismatch: expected i64, got vector-i64
+
+  The two refusals are the same gap wearing different faces, and the second is
+  worse: `no admitted lowering` at least names the operation, while `expected
+  i64` reads as a defect in the caller's program -- the reader is told their
+  vector is the wrong type for an operation whose Clojure meaning it satisfies
+  exactly. `vector-count`, `vector-f64-count`, `hetero-vector-count`,
+  `typed-set-count`, `typed-map-count`, `vector-at` and `vector-drop` all sat
+  next to these heads, already lowered, already returning the right types.
+  Nothing was missing but the dispatch. It is the defect `contains?`,
+  `dissoc`, `conj` and `disj` had earlier the same day.
+
+  What is pinned here:
+
+  1. positives, run to a VALUE on the KIR interpreter -- not merely admitted;
+  2. the REASON each refusal is raised, by its stable code, so a program that
+     fails for some other cause cannot be counted as this arm discriminating
+     (ADR-2608136000 question 6);
+  3. both directions for every arm -- each says yes on one receiver and no on
+     another;
+  4. `count` is now RESERVED, and the heads that gained no implementation are
+     deliberately NOT reserved: taking a name away without implementing it is
+     a regression, not a protection;
+  5. the parameter-inference control. A rewrite alone was not enough: parameter
+     inference runs BEFORE `rewrite-record-projections` and reads a refused
+     operand's required type out of the refusal's ex-data, so a head with only
+     a rewrite was still refused during that earlier pass and its
+     `:kotoba.error/expected :i64` was attributed to an unrelated synthesized
+     parameter. That is why these heads gained a type signature as well;
+  6. the byte-identity control: the pair accessors over an actual pair chain
+     lower exactly as before, because that is the closure, lazy-cell, cursor
+     and destructuring vocabulary of the whole desugarer."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- unit [body] (str "(ns m.probe)\n(defn main [] " body ")\n"))
+
+(defn- run
+  ([body] (run "" body))
+  ([defs body]
+   (let [source (str "(ns m.probe)\n" defs "(defn main [] " body ")\n")
+         value (kir/execute (kir/lower (sema/analyze source)) 'main [] {})]
+     value)))
+
+(defn- i64
+  ([body] (i64 "" body))
+  ([defs body] (let [v (run defs body)] #?(:clj v :cljs (js/Number v)))))
+
+(defn- refusal
+  ([body] (refusal "" body))
+  ([defs body]
+   (try (do (sema/analyze (str "(ns m.probe)\n" defs "(defn main [] " body ")\n")) nil)
+        (catch #?(:clj Throwable :cljs :default) e
+          {:message (ex-message e) :code (:kotoba.error/code (ex-data e))}))))
+
+(defn- definition-refusal [head]
+  (try (do (sema/analyze (str "(ns m.probe)\n(defn " head " [a] :i64 a)\n"
+                              "(defn main [] :i64 0)\n"))
+           nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+;; --- count, executed -------------------------------------------------------
+
+(deftest count-runs-on-every-collection-that-has-a-count-primitive
+  (testing "a bounded i64 vector"
+    (is (= 3 (i64 "(count [7 8 9])")))
+    (is (= 0 (i64 "(count (vector-i64))"))))
+  (testing "a bounded f64 vector.
+            Written `vector-f64-new` rather than the `[1.0 2.0]` LITERAL: that
+            literal is refused `expression type mismatch: expected i64, got
+            f64` under nbb and admitted on the JVM. Measured 2026-09-03 on the
+            PINNED sema `df383ba0` as well, so it is a runtime divergence in
+            the f64 vector literal that predates this change and is not this
+            change's to fix -- but a test that used it would report this
+            change as broken on one runtime."
+    (is (= 2 (i64 "(count (vector-f64-new 1.0 2.0))"))))
+  (testing "a heterogeneous bounded vector"
+    (is (= 2 (i64 "(count (hetero-vector-new [:vector [:i64 :string]] 1 \"a\"))"))))
+  (testing "a typed set -- and it is a SET, so a duplicate does not grow it"
+    (is (= 2 (i64 "(count #{:a :b})")))
+    (is (= 1 (i64 "(count (conj #{:a} :a))")))
+    (is (= 2 (i64 "(count (typed-set-new [:set :i64] 1 2))"))))
+  (testing "a canonical typed map, on a key type no literal can spell"
+    (is (= 2 (i64 "(count (typed-map-new [:map :i64 :i64] 1 10 2 20))")))
+    (is (= 1 (i64 "(count (dissoc (typed-map-new [:map :i64 :i64] 1 10 2 20) 1))"))))
+  (testing "it composes with the heads that landed before it"
+    (is (= 1 (i64 "(count (disj (conj #{:a} :b) :a))"))))
+  (testing "the emptiness test the authority should point at, now that it works"
+    (is (= 1 (i64 "(if (= (count (vector-i64)) 0) 1 0)")))
+    (is (= 0 (i64 "(if (= (count [7]) 0) 1 0)")))))
+
+;; --- first / second / rest on a bounded vector, executed -------------------
+
+(deftest the-pair-accessors-reach-a-bounded-vector
+  (testing "first is element 0"
+    (is (= 7 (i64 "(first [7 8 9])"))))
+  (testing "second is element 1, because it is first of rest"
+    (is (= 8 (i64 "(second [7 8 9])"))))
+  (testing "rest drops the head and stays a vector, so it nests"
+    (is (= 2 (i64 "(count (rest [7 8 9]))")))
+    (is (= 9 (i64 "(first (rest (rest [7 8 9])))"))))
+  (testing "persistent: the receiver is not consumed"
+    (is (= 10 (i64 "(let [v [7 8 9]] (+ (first v) (count v)))"))))
+  (testing "a f64 vector answers the same heads (see the literal note above)"
+    (is (= 1 (i64 "(f64-to-i64-truncating (first (vector-f64-new 1.0 2.0)))")))
+    (is (= 1 (i64 "(count (rest (vector-f64-new 1.0 2.0)))"))))
+  (testing "pair-first written literally reaches a vector too -- after
+            desugaring `first` IS `pair-first`, and the language authority's
+            own collections/higher_order fixture spells it that way over a
+            `filter` result, which is a bounded vector"
+    (is (= 4 (i64 "(defn above-two [x] (> x 2))\n"
+                  "(pair-first (filter above-two [1 4 2]))")))))
+
+;; --- the refusals, by the reason they name ---------------------------------
+
+(deftest count-refuses-a-receiver-with-no-count-and-says-what-to-write
+  (testing "a string, where the honest answer is that BYTES are not characters"
+    (let [r (refusal "(count \"abc\")")]
+      (is (= :kotoba.error/count-receiver (:code r)))
+      (is (re-find #"string-byte-length" (:message r)))
+      (is (re-find #"BYTES" (:message r)))))
+  (testing "the legacy keyword-keyed bounded map, which has no count primitive"
+    (let [r (refusal "(count {:a 1})")]
+      (is (= :kotoba.error/count-receiver (:code r)))
+      (is (re-find #"get and assoc" (:message r)))))
+  ;; A canonical [:list T] was refused here until the collection primitives
+  ;; landed later the same day. It is not a refusal any more --
+  ;; `count-and-nth-now-reach-a-canonical-list` below is the value it has.
+  (testing "and an i64, which is no collection at all"
+    (is (= :kotoba.error/count-receiver (:code (refusal "(count 1)")))))
+  (testing "arity"
+    (is (= :kotoba.error/count-arity (:code (refusal "(count [1] [2])"))))))
+
+(deftest nth-refuses-a-receiver-it-does-not-index-and-names-the-primitive
+  (let [r (refusal "(nth #{:a :b} 0)")]
+    (is (= :kotoba.error/nth-receiver (:code r)))
+    (is (re-find #"typed-set-nth" (:message r))))
+  (let [r (refusal "(nth (typed-map-new [:map :i64 :i64] 1 10) 0)")]
+    (is (= :kotoba.error/nth-receiver (:code r)))
+    (is (re-find #"typed-map-entry-at" (:message r))))
+  (testing "and it still indexes the vector it always did"
+    (is (= 8 (i64 "(nth [7 8 9] 1)")))
+    (is (= 0 (i64 "(nth [7 8 9] 9 0)")))))
+
+(deftest the-pair-accessors-refuse-a-typed-collection-and-name-its-own-primitive
+  (testing "first on a typed set"
+    (let [r (refusal "(first #{:a})")]
+      (is (= :kotoba.error/pair-first-receiver (:code r)))
+      (is (re-find #"typed-set-nth" (:message r)))))
+  (testing "rest on a canonical typed map"
+    (let [r (refusal "(rest (typed-map-new [:map :i64 :i64] 1 10))")]
+      (is (= :kotoba.error/pair-second-receiver (:code r)))
+      (is (re-find #"typed-map-entry-at" (:message r)))))
+  (testing "first on a string"
+    (is (= :kotoba.error/pair-first-receiver (:code (refusal "(first \"abc\")")))))
+  (testing "the message names the head the author wrote, not only the pair one"
+    (is (re-find #"first \(pair-first\)" (:message (refusal "(first #{:a})"))))
+    (is (re-find #"rest \(pair-second\)" (:message (refusal "(rest #{:a})"))))))
+
+;; --- the byte-identity control ---------------------------------------------
+
+(defn- shape
+  "The lowered body with its non-symbol leaves printed. A `.kotoba` integer is
+  a host bigint under ClojureScript and a long on the JVM -- and a bigint is
+  not `number?` in ClojureScript, so it does not even normalise -- which makes
+  comparing a body against a quoted form a runtime-dependent assertion. That
+  is the class of defect `case-uniqueness-test` exists for, and a
+  byte-identity control that only holds on one runtime measures nothing on the
+  other."
+  [form]
+  (cond
+    (seq? form) (map shape form)
+    (vector? form) (mapv shape form)
+    (or (symbol? form) (keyword? form) (string? form)
+        (boolean? form) (nil? form)) form
+    :else (str form)))
+
+(deftest a-pair-chain-still-lowers-to-the-pair-accessors
+  ;; The pair heads are the closure, lazy-cell, cursor and destructuring
+  ;; vocabulary of this desugarer. A receiver that is not a vector must pass
+  ;; through UNCHANGED, or every one of those lowerings moves.
+  (let [hir (sema/analyze (unit "(first (rest (list 1 2 3)))"))
+        body (:body (first (filter #(= 'main (:name %)) (:functions hir))))]
+    (is (= (shape '(pair-first (pair-second (pair 1 (pair 2 (pair 3 0))))))
+           (shape body))
+        "the pair chain must still lower to pair-first/pair-second"))
+  (is (= 2 (i64 "(first (rest (list 1 2 3)))")))
+  (testing "a vector receiver is the only thing that moves"
+    (let [hir (sema/analyze (unit "(first [7 8 9])"))
+          body (:body (first (filter #(= 'main (:name %)) (:functions hir))))]
+      (is (= (shape '(vector-at (vector-new 7 8 9) 0)) (shape body))))))
+
+;; --- the parameter-inference control ---------------------------------------
+
+(deftest the-heads-carry-a-type-so-parameter-inference-is-not-poisoned
+  ;; A rewrite alone was not enough. `infer-absent-parameter-types` runs BEFORE
+  ;; `rewrite-record-projections` and reads a refused operand's required type
+  ;; out of the refusal's ex-data. With only the rewrite, this program's
+  ;; `reduce` loop helper had its collection parameter typed `:i64` instead of
+  ;; `:vector-i64`, and the program was refused naming `__kotoba_reduce_v_1` --
+  ;; a binding the author never wrote. The same program with `vector-at`
+  ;; spelled by hand always compiled, which is how the difference was isolated:
+  ;; identical bodies, different `:param-types`.
+  (let [defs "(defn add [a b] (+ a b))\n(defn above-two [x] (> x 2))\n"]
+    (is (= 11 (i64 defs "(+ (pair-first [1 4 2]) (reduce add 4 [1 2 3]))")))
+    (is (= 13 (i64 defs "(+ (count [1 4 2]) (reduce add 4 [1 2 3]))")))
+    (is (= 14 (i64 defs "(+ (first (filter above-two [1 4 2])) (reduce add 4 [1 2 3]))")))
+    (testing "the language authority's own collections/higher_order fixture"
+      (is (= 24 (i64 defs
+                     "(+ (nth (map add [1 2] [7 8]) 1 0)
+                         (+ (pair-first (filter above-two [1 4 2]))
+                            (reduce add 4 [1 2 3])))"))))))
+
+;; --- reservation, in both directions ---------------------------------------
+
+(deftest count-is-reserved-so-a-definition-cannot-shadow-it
+  ;; The rewrite dispatches on the head name before signatures are consulted,
+  ;; so without reservation `(defn count ...)` was ACCEPTED -- measured
+  ;; 2026-09-03 against sema `df383ba0` -- and its calls would have been
+  ;; rewritten out from under it silently.
+  (is (= "reserved function name" (definition-refusal "count"))))
+
+(deftest the-heads-no-authority-claims-are-still-not-reserved
+  ;; This assertion was written on 2026-09-03 over `peek`, `pop`, `keys`,
+  ;; `vals`, `seq` and `last`, for a reason that was right for all six on that
+  ;; morning: taking a name away without implementing it is a regression, not
+  ;; a protection.
+  ;;
+  ;; Four of the six no longer belong to it. `peek`, `pop`, `keys` and `vals`
+  ;; gained lowerings later the same day -- `vector-take`, `vector-f64-take`,
+  ;; `typed-list-nth`, `typed-map-keys` and `typed-map-vals` in kotoba-kir --
+  ;; and a head with a rewrite MUST be reserved, because the rewrite
+  ;; dispatches on the name before signatures are consulted. They moved to
+  ;; `kotoba.compiler.vector-end-and-map-projection-test`, which pins both
+  ;; directions there.
+  ;;
+  ;; `seq` and `last` stay here unchanged: no authority claims them, nothing
+  ;; implements them, and the original reason still holds.
+  (doseq [head ["seq" "last"]]
+    (is (nil? (definition-refusal head))
+        (str "(defn " head " ...) must remain a name a program may define"))))
+
+(deftest the-heads-that-gained-a-lowering-are-no-longer-definable
+  ;; The turn-around, asserted here as well as in the new namespace, so that
+  ;; deleting this file's stale expectation cannot be mistaken for deleting
+  ;; the check.
+  (doseq [head ["peek" "pop" "keys" "vals"]]
+    (is (= "reserved function name" (definition-refusal head)))))
+
+;; --- the refusals this file recorded that are now answers ------------------
+
+(deftest count-and-nth-now-reach-a-canonical-list
+  ;; `count-refuses-a-receiver-with-no-count-and-says-what-to-write` above
+  ;; asserted that `(count (typed-list-new [:list :i64] 1 2))` was refused,
+  ;; naming `typed-list-new` as the type's only primitive. That was the
+  ;; measurement of the morning and is no longer true in either half:
+  ;; `vector-count` was ALREADY walking the list carrier -- measured, for any
+  ;; item type -- so only the dispatch was missing, and `typed-list-nth`
+  ;; closed the indexing half. The assertion above is updated rather than
+  ;; deleted; this is the value it now has.
+  (is (= 2 (i64 "(count (typed-list-new [:list :i64] 1 2))")))
+  (is (= 8 (i64 "(nth (typed-list-new [:list :i64] 7 8) 1)"))))

@@ -1,0 +1,358 @@
+(ns kotoba.compiler.pure-head-slice-test
+  "ADR-544 step 1: the pure S-expression heads admitted as DESUGARING source
+  forms, and the ones that are not.
+
+  Admitted, each onto machinery the frontend already had:
+
+      (lam [params] body)     -> (fn [params] body)
+      (app f a ...)           -> (f a ...)
+      (ref name)              -> name
+      (perform :kind/op v)    -> (cap-call :kind/op v)
+
+  Not admitted: `rel`, `query`, `handle`. They are refused, and the tests
+  below assert the refusal REASON, not just that something was thrown --
+  `(rel x)` with an unbound `x` would be refused either way, so an assertion
+  that only checks `threw?` would keep passing after `rel` landed.
+
+  These run on BOTH runtimes. The first version of this file was `.cljc` but
+  caught a bare `Exception` and was never registered in `run-tests.cljk`, so
+  its ClojureScript half had never executed -- and that is exactly where the
+  application bug this slice fixes lived: `((lam [x] (+ x 1)) n)` raised
+  `Cannot create property 'closure_uid_...' on bigint '1'` under nbb (a call
+  form used as a map key, hashing its own bigint literal) while the JVM
+  refused the same program cleanly."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- unit [source] (str source "\n(defn main [] :i64 0)"))
+
+(defn- refusal [source]
+  (try (do (sema/analyze (unit source)) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e)
+          :code (:kotoba.error/code (ex-data e))
+          :phase (:phase (ex-data e))})))
+
+(defn- answer
+  "Run `run` and return its value as a plain integer. `.kotoba` integers are
+  bigints under ClojureScript, so the comparison is made in one width."
+  [source arguments]
+  (let [out (kir/execute (kir/lower (sema/analyze (unit source))) 'run arguments {})]
+    #?(:clj (long out) :cljs (js/Number out))))
+
+(defn- analyzed [source opts]
+  (try {:ok (sema/analyze source opts)}
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+;; ---------------------------------------------------------------------------
+;; lam / app -- slice 1, kept measured here
+
+(deftest lam-is-a-fn-value
+  (testing "bound to a local, called by name"
+    (is (= 2 (answer "(defn run [n :i64] :i64 (let [f (lam [x] (+ x 1))] (f n)))" [1]))))
+  (testing "captures its enclosing scope"
+    (is (= 10 (answer "(defn run [n :i64] :i64 (let [y 9 f (lam [x] (+ x y))] (app f n)))" [1])))))
+
+(deftest app-applies
+  (testing "a top-level definition"
+    (is (= 2 (answer (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                          "(defn run [n :i64] :i64 (app inc1 n))")
+                     [1]))))
+  (testing "an operator with no arguments at all"
+    (is (= 42 (answer "(defn run [n :i64] :i64 (+ n (app (lam [] 41))))" [1])))))
+
+;; ---------------------------------------------------------------------------
+;; The beta-redex: an application whose operator is the lambda itself.
+;;
+;; Both spellings lower to the same shape a `let`-bound closure call already
+;; had, so this admits no new runtime behaviour -- only the spelling.
+
+(deftest an-operator-may-be-the-lambda-itself
+  (testing "pure spelling"
+    (is (= 2 (answer "(defn run [n :i64] :i64 (app (lam [x] (+ x 1)) n))" [1]))))
+  (testing "clojure-shaped spelling, which used to be an internal failure under cljs"
+    (is (= 2 (answer "(defn run [n :i64] :i64 ((fn [x] (+ x 1)) n))" [1]))))
+  (testing "two arguments"
+    (is (= 11 (answer "(defn run [n :i64] :i64 (app (lam [x y] (+ x y)) n 10))" [1]))))
+  (testing "no internal failure is reported for any of these"
+    (doseq [source ["(defn run [n :i64] :i64 (app (lam [x] (+ x 1)) n))"
+                    "(defn run [n :i64] :i64 ((fn [x] (+ x 1)) n))"]]
+      (is (nil? (refusal source))
+          (str "expected no refusal at all, got: " (pr-str (refusal source)))))))
+
+;; ---------------------------------------------------------------------------
+;; ref
+
+(deftest ref-names-a-definition
+  (testing "in operator position, directly"
+    (is (= 2 (answer (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                          "(defn run [n :i64] :i64 ((ref inc1) n))")
+                     [1]))))
+  (testing "as the operator of an app"
+    (is (= 2 (answer (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                          "(defn run [n :i64] :i64 (app (ref inc1) n))")
+                     [1]))))
+  (testing "nested"
+    (is (= 3 (answer (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                          "(defn run [n :i64] :i64 (app (ref inc1) (app (ref inc1) n)))")
+                     [1])))))
+
+(deftest ref-takes-exactly-one-name-this-module-defines
+  (testing "a literal"
+    (is (= :kotoba.error/ambient-forbidden
+           (:code (refusal "(defn run [n :i64] :i64 (app (ref 1) n))")))))
+  (testing "two names"
+    (is (= :kotoba.error/ambient-forbidden
+           (:code (refusal "(defn run [n :i64] :i64 (app (ref a b) n))")))))
+  (testing "none"
+    (is (= :kotoba.error/ambient-forbidden
+           (:code (refusal "(defn run [n :i64] :i64 (app (ref) n))")))))
+  (testing "a name the module does not define"
+    (is (= :kotoba.error/ambient-forbidden
+           (:code (refusal "(defn run [n :i64] :i64 (app (ref nowhere) n))"))))))
+
+;; ---------------------------------------------------------------------------
+;; `ref` is also Clojure's STM constructor, which this language forbids.
+;;
+;; `lang/surface-status.edn` `:no-ambient-mutation` names `ref` on the
+;; `:authority` shielding axis and `lang/guest-grammar.edn` `:forbidden-heads`
+;; lists it beside `dosync`, `locking`, `volatile!`, `var` and `binding`.
+;; The pure-head rewrite runs BEFORE `forbidden-heads` is consulted, so an
+;; unrestricted pure `ref` takes that refusal away silently -- and did:
+;; measured 2026-09-06 against a2f86f87, `(let [r (ref n)] n)` was ADMITTED.
+;;
+;; A definition name is the one shape the two readings do not share. STM's
+;; `(ref x)` takes an initial VALUE; ADR-544's `(ref name)` names a definition.
+
+(deftest the-stm-reading-of-ref-keeps-its-security-refusal
+  (doseq [[what source]
+          [["an initial value that is a literal"
+            "(defn run [n :i64] :i64 (let [r (ref 0)] n))"]
+           ["an initial value that is a local"
+            "(defn run [n :i64] :i64 (let [r (ref n)] n))"]
+           ["read back through deref"
+            "(defn run [n :i64] :i64 (let [r (ref n)] (deref r)))"]
+           ["inside dosync"
+            "(defn run [n :i64] :i64 (dosync (ref n)))"]
+           ["altered"
+            "(defn run [n :i64] :i64 (let [r (ref n)] (alter r inc)))"]
+           ["commuted"
+            "(defn run [n :i64] :i64 (let [r (ref n)] (commute r inc)))"]
+           ["ref-set"
+            "(defn run [n :i64] :i64 (let [r (ref n)] (ref-set r 1)))"]]]
+    (let [r (refusal source)]
+      (is (= :kotoba.error/ambient-forbidden (:code r))
+          (str what " must keep the ambient-mutation refusal, not merely be "
+               "refused -- a `no admitted lowering` here would mean the "
+               "security constraint had stopped firing and something else "
+               "happened to catch it. Got: " (pr-str r))))))
+
+(deftest the-definition-name-restriction-is-what-separates-the-two-readings
+  ;; The negative control for the test above. If this ever goes red because
+  ;; the pure reading stopped working, the STM assertions became vacuous --
+  ;; they would pass for a `ref` that was refused everywhere.
+  (is (= 2 (answer (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                        "(defn run [n :i64] :i64 (app (ref inc1) n))")
+                   [1]))
+      "the pure reading must still work, or the STM refusals above prove nothing")
+  ;; And the discriminator itself: the SAME source shape, one name defined and
+  ;; one not. Nothing but the definition set differs.
+  (is (nil? (refusal (str "(defn thing [x :i64] :i64 x)\n"
+                          "(defn run [n :i64] :i64 (app (ref thing) n))"))))
+  (is (= :kotoba.error/ambient-forbidden
+         (:code (refusal "(defn run [n :i64] :i64 (app (ref thing) n))")))))
+
+;; ---------------------------------------------------------------------------
+;; perform
+
+(deftest perform-carries-exactly-cap-calls-authority
+  (testing "same effect row and same named operation as the cap-call spelling"
+    (let [pure (:ok (analyzed (str "(ns m (:capabilities #{:clock/now}))\n"
+                                   "(defn run [] :i64 (perform :clock/now 0))\n"
+                                   "(defn main [] :i64 (run))")
+                              nil))
+          shaped (:ok (analyzed (str "(ns m (:capabilities #{:clock/now}))\n"
+                                     "(defn run [] :i64 (cap-call :clock/now 0))\n"
+                                     "(defn main [] :i64 (run))")
+                                nil))]
+      (is (some? pure))
+      (is (some? shaped))
+      (is (= (:effects shaped) (:effects pure)))
+      (is (= (:named-operations shaped) (:named-operations pure)))))
+  (testing "an undeclared capability is refused, exactly as for cap-call"
+    (is (some? (:code (refusal (str "(ns m (:capabilities #{:log/write}))\n"
+                                    "(defn run [] :i64 (perform :clock/now 0))"))))))
+  (testing "an unregistered capability is refused"
+    (is (some? (:code (refusal "(defn run [] :i64 (perform :nope/nope 0))"))))))
+
+(deftest perform-does-not-admit-the-wire-id-form
+  ;; Numeric capability ids are the wire ABI. Admitting them as a source
+  ;; spelling would make the pure surface carry a number whose meaning lives
+  ;; in a registry the source cannot see.
+  (testing "an integer id"
+    (is (= :kotoba.error/pure-perform-capability
+           (:code (refusal "(defn run [n :i64] :i64 (perform 7 n))")))))
+  (testing "an unqualified keyword"
+    (is (= :kotoba.error/pure-perform-capability
+           (:code (refusal "(defn run [n :i64] :i64 (perform :now n))"))))))
+
+(deftest pure-product-refuses-perform-and-names-the-head-the-author-wrote
+  (let [pure (analyzed (str "(defn run [] :i64 (perform :clock/now 0))\n"
+                            "(defn main [] :i64 (run))")
+                       {:language-profile :pure-product})
+        shaped (analyzed (str "(defn run [] :i64 (cap-call :clock/now 0))\n"
+                              "(defn main [] :i64 (run))")
+                         {:language-profile :pure-product})]
+    (is (= :kotoba.error/pure-product-forbidden (:code pure)))
+    (is (= :kotoba.error/pure-product-forbidden (:code shaped)))
+    (is (= "form outside pure-product profile: perform" (:message pure)))
+    (is (= "form outside pure-product profile: cap-call" (:message shaped)))))
+
+(deftest lam-app-and-ref-are-inside-the-pure-product-profile
+  (doseq [source ["(defn run [n :i64] :i64 (app (lam [x] (+ x 1)) n))\n(defn main [] :i64 (run 1))"
+                  (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                       "(defn run [n :i64] :i64 (app (ref inc1) n))\n"
+                       "(defn main [] :i64 (run 1))")]]
+    (is (some? (:ok (analyzed source {:language-profile :pure-product})))
+        (str "should be admitted under :pure-product: "
+             (pr-str (analyzed source {:language-profile :pure-product}))))))
+
+;; ---------------------------------------------------------------------------
+;; The heads that are NOT admitted, refused for the reason they are not.
+
+(deftest rel-and-query-are-the-kgraph-pair
+  (testing "a datom asserted by rel reads back through query"
+    (is (= 42 (answer "(defn run [n :i64] :i64 (do (rel 1 2 42) (query 1 2)))" [0]))))
+  (testing "each is refused by name at the wrong arity, not by whatever trips later"
+    (is (= :kotoba.error/pure-rel-arity
+           (:code (refusal "(defn run [n :i64] :i64 (rel 1 2))"))))
+    (is (= :kotoba.error/pure-query-arity
+           (:code (refusal "(defn run [n :i64] :i64 (query 1))"))))))
+
+(deftest rel-and-query-add-no-authority
+  ;; The heads are a second spelling of operations the profile already
+  ;; permits. If that stops being true -- if the kgraph primitives are ever
+  ;; removed from `:pure-product` without the pure heads following -- this
+  ;; goes red, and it should: the spelling would then be a way in.
+  (doseq [[pure primitive]
+          [["(defn run [n :i64] :i64 (rel 1 2 42))"
+            "(defn run [n :i64] :i64 (kgraph-assert! 1 2 42))"]
+           ["(defn run [n :i64] :i64 (query 1 2))"
+            "(defn run [n :i64] :i64 (kgraph-get 1 2))"]]]
+    (let [p (analyzed (str pure "\n(defn main [] :i64 0)") {:language-profile :pure-product})
+          q (analyzed (str primitive "\n(defn main [] :i64 0)") {:language-profile :pure-product})]
+      (is (= (some? (:ok p)) (some? (:ok q)))
+          (str "the pure head and the primitive it spells must be admitted or "
+               "refused together under :pure-product. pure=" (pr-str p)
+               " primitive=" (pr-str q))))))
+
+;; ---------------------------------------------------------------------------
+;; `handle` is the elimination form for the ONE ability a guest can handle.
+;;
+;; Kotoba has two: capability effects, whose answer comes from the HOST, and
+;; `:abort` (lang/abort-ability.edn), which `try` eliminates. `handle` is
+;; `try`, and it therefore CANNOT reach the capability half.
+;;
+;; That is enforced rather than conventional, and the enforcement is what the
+;; tests below pin: a `cap-call` contributes no `:abort` to the effect row, so
+;; a `handle` wrapped around one is refused for having nothing to catch.
+
+(deftest handle-eliminates-the-abort-ability
+  (is (some? (:ok (analyzed
+                   "(defn main [] :i64 (handle (if (> 1 0) (throw \"boom\") 5) (catch e 7)))"
+                   nil)))))
+
+(deftest handle-cannot-intercept-a-capability-call
+  (doseq [[what source]
+          [["cap-call" (str "(ns m (:capabilities #{:clock/now}) (:export [main]))\n"
+                            "(defn main [] :i64 (handle (cap-call :clock/now 0) (catch e 7)))")]
+           ["perform"  (str "(ns m (:capabilities #{:clock/now}) (:export [main]))\n"
+                            "(defn main [] :i64 (handle (perform :clock/now 0) (catch e 7)))")]]]
+    (let [r (analyzed source nil)]
+      (is (nil? (:ok r)) (str what " must be refused"))
+      (is (= "try body cannot abort; there is nothing to catch" (:message r))
+          (str what ": the refusal must be that a capability call contributes "
+               "no :abort to the row -- that is WHY a guest cannot intercept "
+               "an effect the host answers. A refusal for any other reason "
+               "would leave this green while the protection was gone. Got: "
+               (pr-str r)))))
+  ;; The control. Without it the two assertions above pass for a `handle` that
+  ;; is refused everywhere, which is what it looked like before it landed.
+  (is (some? (:ok (analyzed
+                   "(defn main [] :i64 (handle (if (> 1 0) (throw \"boom\") 5) (catch e 7)))"
+                   nil)))
+      "handle must WORK for an abort, or the interception assertions prove nothing"))
+
+(deftest handle-is-outside-the-pure-product-profile-and-says-so-by-its-own-name
+  (let [r (analyzed "(defn main [] :i64 (handle (if (> 1 0) (throw \"boom\") 5) (catch e 7)))"
+                    {:language-profile :pure-product})]
+    (is (= :kotoba.error/pure-product-forbidden (:code r)))
+    (is (= "form outside pure-product profile: handle" (:message r))
+        "the refusal must name `handle`, which is what the author wrote, not
+         `try`, which is what the rewrite produced")))
+
+(deftest app-with-no-operator-is-refused-where-the-operator-is-missing
+  (is (= :kotoba.error/pure-app-operator
+         (:code (refusal "(defn run [n :i64] :i64 (app))")))))
+
+;; Reader-tagged host literals (2026-09-11, adr-2609111900 iteration 2). The
+;; reader reads `#"..."` and `#js` so a discarded :clj / :cljs branch can hold
+;; them; if one is SELECTED and reaches admission it is refused by name.
+(deftest host-regex-literal-is-refused-by-name-when-selected
+  (is (= :kotoba.error/host-regex-literal
+         (:code (refusal "(defn run [n :i64] :i64 (if (kotoba.reader/regex \"x\") n 0))"))))
+  (is (= :kotoba.error/host-regex-literal
+         (:code (refusal "(defn run [n :i64] :i64 (if #?(:kotoba #\"x\") n 0))")))))
+
+(deftest host-js-literal-is-refused-by-name-when-selected
+  (is (= :kotoba.error/host-js-literal
+         (:code (refusal "(defn run [n :i64] :i64 (if #?(:kotoba #js {:a 1}) n 0))")))))
+
+(deftest host-literals-in-a-discarded-branch-do-not-refuse
+  (is (= 2 (answer (str "(defn run [n :i64] :i64 #?(:clj (re-find #\"x\" n) :cljs #js [n] :kotoba (+ n 1)))")
+                   [1]))))
+
+(deftest host-char-literal-is-refused-by-name-when-selected
+  (is (= :kotoba.error/host-char-literal
+         (:code (refusal "(defn run [n :i64] :i64 (if #?(:kotoba \\a) n 0))")))))
+
+(deftest host-precision-literals-are-refused-by-name-when-selected
+  (is (= :kotoba.error/host-literal
+         (:code (refusal "(defn run [n :i64] :i64 (if #?(:kotoba 0N) n 0))")))))
+
+(deftest large-integer-set-is-refused-by-name-not-as-an-internal-error
+  (let [r (refusal "(defn run [n :i64] :i64 (if #?(:kotoba #{1 2 3 4 5 6 7 8 9}) n 0))")]
+    (is (= :kotoba.error/host-literal (:code r)) (pr-str r))))
+
+;; `into` with a single-step transducer (2026-09-11, adr-2609111900): the
+;; 3-arity `(into to (map f) src)` is rewritten to `(into to (map f src))`.
+(deftest into-with-a-single-step-transducer-is-the-two-arity-into
+  (testing "map"
+    (is (= 9 (answer (str "(defn inc1 [x :i64] :i64 (+ x 1))\n"
+                          "(defn run [n :i64] :i64 (vector-count (into (vector-alloc 0) (map inc1) [1 2 3 4 5 6 7 8 9])))")
+                     [1]))))
+  (testing "filter keeps the value, not just the count"
+    (is (= 6 (answer (str "(defn even2? [x :i64] :bool (= 0 (- x (* 2 (quot x 2)))))\n"
+                          "(defn run [n :i64] :i64 (vector-at (into (vector-alloc 0) (filter even2?) [1 2 3 4 5 6]) 2))")
+                     [1]))))
+  (testing "a composed transducer is refused by name"
+    (is (= "into with a transducer admits only (map f) (filter f) (remove f) (keep f) (mapcat f) as the middle argument"
+           (:message (refusal "(defn run [n :i64] :i64 (vector-count (into (vector-alloc 0) (comp (map n) (filter n)) [1 2])))"))))))
+
+(deftest a-clojure-core-qualified-head-is-the-bare-head
+  (is (= 3 (answer "(defn run [n :i64] :i64 (clojure.core/+ n 2))" [1])))
+  ;; and a bare head that is refused stays refused under the prefix
+  (is (some? (:code (refusal "(defn run [n :i64] :i64 (clojure.core/load-string n))")))))
+
+;; -------------------------------------------------------------------------
+;; map-indexed (adr-2609111900): the callback takes the index FIRST, then
+;; the item -- (fn [i x] ...). The shape-by-shape refusals and the own-name
+;; rule are measured in kotoba.compiler.map-indexed-test; this is the one
+;; value-checked positive on the interpreter.
+
+(deftest map-indexed-passes-the-index-first
+  (is (= 32 (answer "(defn run [n :i64] :i64 (vector-at (map-indexed (fn [i x] (+ i x)) [10 20 30]) 2))"
+                    [0]))))

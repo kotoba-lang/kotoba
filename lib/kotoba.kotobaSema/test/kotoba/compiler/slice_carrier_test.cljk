@@ -1,0 +1,340 @@
+(ns kotoba.compiler.slice-carrier-test
+  "slice-value: `[:slice T]` as a carried value, and the places it may not go.
+
+  Two claims are checked here, and they are different claims.
+
+  The first is that the carrier ERASES: a slice parameter becomes two i64
+  parameters, a slice binding becomes two bindings, and every slice operation
+  becomes one the machine already had. That is checked by reading the analysed
+  HIR rather than by compiling, because the property is that no slice survives
+  analysis -- a byte-level check would say the object is fine without saying
+  the type is gone.
+
+  The second is that a slice cannot reach a position two words cannot cross.
+  Each of those is a distinct refusal with its own `:kotoba.error/` code, and
+  every one is pinned by code AND by message here: a refusal that fires for a
+  different reason than the one it names would otherwise count as a pass."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.hir :as hir]
+            [kotoba.sema :as sema]))
+
+(defn- analyse [src] (sema/analyze src))
+
+(defn- function [hir name]
+  (first (filter #(= name (:name %)) (:functions hir))))
+
+(defn- refusal
+  "Analyse SRC, expecting a refusal, and return its `[code message]`."
+  [src]
+  (try
+    (analyse src)
+    ::no-refusal
+    (catch kerror/ExceptionInfo e
+      [(:kotoba.error/code (ex-data e)) (.getMessage e)])))
+
+(defn- heads [body]
+  (into #{} (comp (filter seq?) (map first)) (tree-seq coll? seq body)))
+
+;; ── the table ───────────────────────────────────────────────────────────────
+
+(deftest the-carried-family-is-eight-operations-and-none-of-them-is-a-machine-op
+  ;; The carried family and the machine family are deliberately separate
+  ;; tables. `kernel-memory-operations` is read by the provenance walk, which
+  ;; reads argument 0 as a base -- correct for `(slice-load-u8 base len i)` and
+  ;; meaningless for `(slice-get s i)`, whose argument 0 is a VALUE. Merging
+  ;; them would make the taint analysis look at the wrong operand.
+  (is (= 8 (count frontend/slice-value-operations)))
+  (doseq [op '[slice-of-u8 slice-of-u16 slice-of-u32 slice-of-u64
+               slice-length slice-get slice-set! slice-sub]]
+    (is (contains? frontend/slice-value-operations op) (str op))
+    (is (not (contains? frontend/kernel-memory-operations op))
+        (str op " is the carried spelling, not the machine one"))
+    (testing "and is reserved, so no user function can shadow it"
+      (is (contains? frontend/reserved-function-names op) (str op)))))
+
+(deftest a-user-function-may-not-take-a-reserved-slice-name
+  (let [[code message] (refusal "(ns t)(defn- slice-get [a b] 0)(defn main [] 0)")]
+    (is (= :kotoba.error/subset-reject code))
+    (is (str/includes? message "reserved function name"))))
+
+;; ── erasure ─────────────────────────────────────────────────────────────────
+
+(def ^:private carried
+  "(ns t)
+   (defn- sum [s [:slice :u8] index :i64 total :i64]
+     (if (< index (slice-length s))
+       (sum s (+ index 1) (+ total (slice-get s index)))
+       total))
+   (defn main []
+     (sum (slice-of-u8 (kernel-boot-info) 4096) 0 0))")
+
+(def ^:private machine
+  "The same traversal written with the machine operations, three i64
+  parameters at a time. The carried form must analyse to this."
+  "(ns t)
+   (defn- sum [base :i64 length :i64 index :i64 total :i64]
+     (if (< index length)
+       (sum base length (+ index 1)
+            (+ total (slice-load-u8 base length index)))
+       total))
+   (defn main []
+     (sum (kernel-boot-info) 4096 0 0))")
+
+(deftest a-slice-parameter-becomes-two-i64-parameters
+  (let [hir (analyse carried)
+        sum (function hir 'sum)]
+    (is (hir/valid? hir))
+    (is (= 4 (count (:params sum)))
+        "three source parameters, four machine words")
+    (is (= '[__kotoba_slice_s_base __kotoba_slice_s_len index total]
+           (:params sum))
+        "the two halves are named after the parameter they came from")
+    (testing "and nothing downstream is told about a slice"
+      (is (= :i64 (:result sum)))
+      (is (empty? (filter #(and (vector? %) (= :slice (first %)))
+                          (tree-seq coll? seq hir)))
+          "no [:slice T] survives analysis anywhere in the HIR"))))
+
+(deftest the-carried-form-and-the-machine-form-analyse-to-the-same-program
+  ;; The strongest statement of what erasure means: after this pass the two
+  ;; sources are not merely equivalent, they are the same tree once the
+  ;; synthesised parameter names are put back. Renaming is done by position,
+  ;; so a rewrite that dropped or reordered an operand would not survive it.
+  (let [carried-sum (function (analyse carried) 'sum)
+        machine-sum (function (analyse machine) 'sum)
+        rename (zipmap (:params carried-sum) (:params machine-sum))
+        renamed (clojure.walk/postwalk-replace rename (:body carried-sum))]
+    (is (= (:params machine-sum) (mapv rename (:params carried-sum))))
+    (is (= (:body machine-sum) renamed))))
+
+(deftest a-let-bound-slice-becomes-two-bindings-evaluated-once-each
+  (let [hir (analyse
+             "(ns t)
+              (defn main []
+                (let [s (slice-of-u8 (kernel-boot-info) 64)]
+                  (+ (slice-get s 1) (slice-length s))))")
+        body (:body (function hir 'main))
+        bindings (second body)]
+    (is (= 'let (first body)))
+    (is (= '[__kotoba_slice_s_base (kernel-boot-info) __kotoba_slice_s_len 64]
+           bindings)
+        "the base and the length are each bound once, not re-evaluated per use")
+    (is (= '(+ (slice-load-u8 __kotoba_slice_s_base __kotoba_slice_s_len 1)
+               __kotoba_slice_s_len)
+           (nth body 2))
+        "slice-length is the length binding, not a call")))
+
+(deftest slice-sub-is-a-checked-narrowing-with-the-element-scale-applied
+  ;; `kernel-subregion` reads BYTES; `slice-sub` is written in ELEMENTS. The
+  ;; scale is the whole difference, and it is applied here rather than left to
+  ;; the caller -- which is the bug this operation exists to make impossible.
+  (let [hir (analyse
+             "(ns t)
+              (defn- p [s [:slice :u32] i :i64] (slice-get (slice-sub s 1 2) i))
+              (defn main [] (p (slice-of-u32 (kernel-boot-info) 8) 0))")
+        body (:body (function hir 'p))]
+    (is (= 'slice-load-u32 (first body)))
+    (is (= '(kernel-subregion __kotoba_slice_s_base (* __kotoba_slice_s_len 4) 4 8)
+           (second body))
+        "offset 1 and count 2 elements are 4 and 8 bytes at :u32")
+    (is (= 2 (nth body 2))
+        "the narrowed length is still counted in ELEMENTS")
+    (testing "and at :u8 the scale disappears rather than multiplying by one"
+      (let [body (:body (function
+                         (analyse
+                          "(ns t)
+                           (defn- p [s [:slice :u8] i :i64] (slice-get (slice-sub s 1 2) i))
+                           (defn main [] (p (slice-of-u8 (kernel-boot-info) 8) 0))")
+                         'p))]
+        (is (= '(kernel-subregion __kotoba_slice_s_base __kotoba_slice_s_len 1 2)
+               (second body)))))))
+
+(deftest a-store-through-the-carrier-is-the-machine-store
+  (let [body (:body (function
+                     (analyse
+                      "(ns t)
+                       (defn main []
+                         (let [s (slice-of-u16 (kernel-boot-info) 64)]
+                           (slice-set! s 3 7)))")
+                     'main))]
+    (is (contains? (heads body) 'slice-store-u16))
+    (is (= '(slice-store-u16 __kotoba_slice_s_base __kotoba_slice_s_len 3 7)
+           (nth body 2)))))
+
+(deftest a-module-that-does-not-use-the-carrier-is-untouched
+  ;; The erasure pass returns a function it did not rewrite as the IDENTICAL
+  ;; object. Without that, adding this pass would risk moving the bytes of
+  ;; every shipped aiueos object for no reason of their own.
+  (let [src "(ns t)
+             (defn- p [base :i64 length :i64 index :i64]
+               (kernel-load-u8 base length index))
+             (defn main [] (p (kernel-boot-info) 512 0))"
+        a (analyse src)
+        b (analyse src)]
+    (is (= (:functions a) (:functions b)))
+    (is (= '(kernel-load-u8 base length index) (:body (function a 'p))))))
+
+;; ── provenance ──────────────────────────────────────────────────────────────
+
+(deftest a-slice-built-from-arithmetic-is-refused-by-name
+  ;; The provenance rule, at the constructor. After erasure
+  ;; `check-kernel-region-provenance!` would catch this too -- by following the
+  ;; synthesised `let` -- but it would name the machine operation and the
+  ;; synthesised binding, neither of which the author wrote. This refusal names
+  ;; the slice.
+  (let [[code message]
+        (refusal "(ns t)
+                  (defn- p [i :i64] (slice-get (slice-of-u8 (+ i 1) 16) 0))
+                  (defn main [] (p 1))")]
+    (is (= :kotoba.error/slice-region-provenance code))
+    (is (str/includes? message "slice base must name a region, not compute one")))
+  (testing "and a load result as a base is refused for the same reason"
+    (let [[code _] (refusal "(ns t)
+                             (defn- p [b :i64] (slice-get (slice-of-u8 (kernel-load-u8 b 512 0) 16) 0))
+                             (defn main [] (p 0))")]
+      (is (= :kotoba.error/slice-region-provenance code)))))
+
+(deftest the-taint-scanner-sees-the-base-inside-a-carried-slice
+  ;; `kernel-base-uses` reads argument 0 of a machine operation. A carried
+  ;; operation's base is INSIDE the value, so before erasure there is nothing
+  ;; at argument 0 for it to read. Erasure is what makes the base visible to
+  ;; the scanner, and this is the assertion that says so: the erased base
+  ;; parameter must be reported at the ABI boundary exactly the way a
+  ;; hand-written base parameter is.
+  (let [report (sema/kernel-region-report
+                (:functions (analyse carried)))]
+    (is (= #{0} (get (:tainted report) 'sum))
+        "the erased base is parameter 0 of sum and is tainted as a region")
+    (is (true? (:uses-boot-info? report))
+        "and the root the module reaches is boot info, which the report names")
+    (is (nil? (get (:abi-boundary report) 'sum))
+        "not an ABI boundary here: main supplies the region, so it is verifiable"))
+  (testing "with no internal caller the same parameter IS the ABI boundary"
+    ;; The other half of the same fact. `sum` is only verifiable above because
+    ;; `main` hands it a rooted base; a carried traversal nobody in the module
+    ;; calls is exactly the unverifiable boundary the report exists to name,
+    ;; and the name it prints is the erased half, not the slice.
+    (let [report (sema/kernel-region-report
+                  (:functions
+                   (analyse "(ns t)
+                             (defn- p [s [:slice :u8] i :i64] (slice-get s i))
+                             (defn main [] 0)")))]
+      (is (= #{0} (get (:tainted report) 'p)))
+      (is (= '[__kotoba_slice_s_base] (get (:abi-boundary report) 'p))))))
+
+(deftest a-carried-narrowing-is-reported-as-a-derived-base
+  (let [report (sema/kernel-region-report
+                (:functions
+                 (analyse
+                  "(ns t)
+                   (defn- p [s [:slice :u8] i :i64] (slice-get (slice-sub s 1 2) i))
+                   (defn main [] (p (slice-of-u8 (kernel-boot-info) 8) 0))")))]
+    (is (= 1 (count (:derived-bases report)))
+        "slice-sub is a kernel-subregion and is listed as one")
+    (is (true? (:offset-static? (first (:derived-bases report)))))))
+
+;; ── the boundary ────────────────────────────────────────────────────────────
+
+(deftest every-position-two-words-cannot-cross-is-refused-by-its-own-code
+  (doseq [[label code fragment src]
+          [["returned"
+            :kotoba.error/slice-result-type
+            "a slice value cannot be returned"
+            "(ns t)(defn- p [b :i64] [:slice :u8] (slice-of-u8 b 8))(defn main [] 0)"]
+           ["stored in a pair"
+            :kotoba.error/slice-escape
+            "a slice value can only be indexed"
+            "(ns t)(defn- p [s [:slice :u8]] (pair s 1))
+             (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"]
+           ["passed to an i64 parameter"
+            :kotoba.error/slice-escape
+            "a slice value can only be indexed"
+            "(ns t)(defn- q [x :i64] x)
+             (defn- p [s [:slice :u8]] (q s))
+             (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"]
+           ["used as an integer"
+            :kotoba.error/slice-escape
+            "a slice value can only be indexed"
+            "(ns t)(defn- p [s [:slice :u8]] (+ s 1))
+             (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"]
+           ["constructed in an i64 position"
+            :kotoba.error/slice-escape
+            "a slice value can only be indexed"
+            "(ns t)(defn main [] (+ (slice-of-u8 (kernel-boot-info) 8) 1))"]
+           ["crossing an export boundary"
+            :kotoba.error/slice-export-boundary
+            "cannot cross an export boundary"
+            "(ns t)(defn p [s [:slice :u8]] (slice-get s 0))(defn main [] 0)"]
+           ["past the ABI arity after erasure"
+            :kotoba.error/slice-erased-max-parameters
+            "exceed ABI-supported arity after slice erasure"
+            "(ns t)(defn- p [a [:slice :u8] b [:slice :u8] c [:slice :u8]] (slice-get a 0))
+             (defn main [] 0)"]
+           ["an element type with no native load"
+            :kotoba.error/slice-element-not-admitted
+            "declared but not admitted"
+            "(ns t)(defn- p [s [:slice :f32]] (slice-get s 0))(defn main [] 0)"]
+           ["an element type that is not a machine width"
+            :kotoba.error/slice-element-type
+            "slice element type must be one of"
+            "(ns t)(defn- p [s [:slice :u7]] (slice-get s 0))(defn main [] 0)"]
+           ["a slice of slices"
+            :kotoba.error/slice-element-type
+            "slice element type must be one of"
+            "(ns t)(defn- p [s [:slice [:slice :u8]]] 0)(defn main [] 0)"]
+           ["a slice given to the wrong element type"
+            :kotoba.error/slice-element-mismatch
+            "slice element type mismatch"
+            "(ns t)(defn- p [s [:slice :u64]] (slice-get s 0))
+             (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"]
+           ["an i64 given to a slice parameter"
+            :kotoba.error/slice-operand
+            "requires a slice value"
+            "(ns t)(defn- p [s [:slice :u8]] (slice-get s 0))(defn main [] (p 17))"]
+           ["a slice operation at the wrong arity"
+            :kotoba.error/slice-arity
+            "slice-get arity mismatch"
+            "(ns t)(defn- p [s [:slice :u8]] (slice-get s 0 1))(defn main [] 0)"]]]
+    (let [[actual message] (refusal src)]
+      (is (= code actual) label)
+      (is (and (string? message) (str/includes? message fragment)) label))))
+
+(deftest the-boundary-refusals-are-not-vacuous
+  ;; Every source above is one edit away from a source that compiles. If the
+  ;; refusals were firing for some unrelated reason -- a syntax error, a
+  ;; missing `main` -- these would fail too.
+  (doseq [src ["(ns t)(defn- p [b :i64] (slice-get (slice-of-u8 b 8) 0))(defn main [] (p 0))"
+               "(ns t)(defn- p [s [:slice :u8]] (pair (slice-get s 0) 1))
+                (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"
+               "(ns t)(defn- q [x :i64] x)
+                (defn- p [s [:slice :u8]] (q (slice-length s)))
+                (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"
+               "(ns t)(defn- p [s [:slice :u8]] (+ (slice-length s) 1))
+                (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"
+               "(ns t)(defn main [] (+ (slice-get (slice-of-u8 (kernel-boot-info) 8) 0) 1))"
+               "(ns t)(defn- p [s [:slice :u8]] (slice-get s 0))
+                (defn main [] (p (slice-of-u8 (kernel-boot-info) 8)))"
+               "(ns t)(defn- p [a [:slice :u8] b [:slice :u8]] (slice-get a 0))
+                (defn main [] 0)"
+               "(ns t)(defn- p [s [:slice :u32]] (slice-get s 0))(defn main [] 0)"
+               "(ns t)(defn- p [s [:slice :u64]] (slice-get s 0))
+                (defn main [] (p (slice-of-u64 (kernel-boot-info) 8)))"
+               "(ns t)(defn- p [s [:slice :u8]] (slice-get s 1))(defn main [] 0)"]]
+      (is (hir/valid? (analyse src)) src)))
+
+(deftest every-element-width-carries
+  (doseq [[element load store] [[:u8 'slice-load-u8 'slice-store-u8]
+                                [:u16 'slice-load-u16 'slice-store-u16]
+                                [:u32 'slice-load-u32 'slice-store-u32]
+                                [:u64 'slice-load-u64 'slice-store-u64]]]
+    (let [src (format "(ns t)
+                       (defn- p [s [:slice %s] i :i64] (slice-set! s i (slice-get s i)))
+                       (defn main [] (p (slice-of-%s (kernel-boot-info) 8) 0))"
+                      element (name element))
+          hir (analyse src)
+          used (heads (:body (function hir 'p)))]
+      (is (hir/valid? hir) (str element))
+      (is (contains? used load) (str element))
+      (is (contains? used store) (str element)))))

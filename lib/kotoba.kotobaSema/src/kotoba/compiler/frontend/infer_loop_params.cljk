@@ -1,0 +1,201 @@
+(ns kotoba.compiler.frontend.infer-loop-params
+  "Kotoba-native loop-helper parameter type inference split from frontend.infer."
+  #?(:kotoba {:kotoba/export [resolve-loop-helper-param-types]})
+  (:require #?@(:kotoba [[kotoba.form :as form]])
+            [kotoba.compiler.frontend.base :refer [#?@(:kotoba [fget fl-has? fput ftruthy?] :default [])]]
+            #?@(:kotoba [[kotoba.compiler.frontend.infer :refer [empty-fmap ie-ctx ie-infer tk zip-locals]]]))
+
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                          [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                                 :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                                 :ie/ctx [:record :ie/ctx [[:schemas [:ref :form/r]] [:row-schemas [:ref :form/r]] [:handlers [:ref :form/r]] [:final :bool] [:tail :bool] [:names [:ref :form/r]] [:recording :bool] [:recorded [:ref :form/r]] [:collect :bool] [:throws [:list [:ref :form/r]]] [:known [:ref :form/r]] [:tbl [:ref :form/r]] [:rec-limit :i64] [:rec-count :i64]]]})))
+
+;; Small immutable-set operations local to parameter inference.
+#?(:kotoba
+(defn- cs-set-empty [] [:ref :form/r]
+  (form/form-set (form/no-forms)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-set-has? [s [:ref :form/r] x [:ref :form/r]] :bool
+  (fl-has? (form/kids-of s) x 0))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-set-add [s [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (if (fl-has? (form/kids-of s) x 0)
+    s
+    (form/form-set (form/append-form (form/kids-of s) x))))
+   :default nil)
+
+;; ── Kotoba route: resolve-loop-helper-param-types (the analyze.cljk host form; here because the context and the ie- passes live in this module) ──
+;; ---- resolve-loop-helper-param-types (analyze.cljk) ----
+;; A loop-helper has no param-type annotations: its parameters' types are the argument types of its (unique,
+;; non-recursive) call site. Each round infers every function whose param types are known, with the context
+;; recording (`:recording`, `:names` the unresolved helpers, `:recorded` name -> argument types); enclosing callers
+;; resolve first, nested loops converge. Fixes: a refusal inside a body drops the recordings that body made before it.
+#?(:kotoba
+(defn- lh-names [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)]
+      (lh-names functions (+ i 1) (if (ftruthy? (fget f :loop-helper?)) (cs-set-add acc (fget f :name)) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-unresolved [helper-names [:ref :form/r] resolved [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of helper-names))
+    acc
+    (let [name (form/nth-of helper-names i)]
+      (lh-unresolved helper-names resolved (+ i 1) (if (form/form-has? resolved name) acc (cs-set-add acc name))))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-placeholder [params [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of params))
+    (form/form-vec acc)
+    (lh-placeholder params (+ i 1) (form/append-form acc (tk :i64)))))
+   :default nil)
+
+;; the parameter types a function is inferred under in this round
+#?(:kotoba
+(defn- lh-param-types [f [:ref :form/r] helper-names [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+  (let [name (fget f :name)
+        declared (fget f :param-types)]
+    (cond
+      (form/form-has? resolved name) (form/form-get resolved name)
+      (cs-set-has? helper-names name) (lh-placeholder (fget f :params) 0 (form/no-forms))
+      (ftruthy? declared) declared
+      :else (lh-placeholder (fget f :params) 0 (form/no-forms)))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-round-sigs [functions [:ref :form/r] i :i64 helper-names [:ref :form/r] resolved [:ref :form/r] acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)
+          ptypes (lh-param-types f helper-names resolved)
+          result (fget f :result)
+          shown (if (ftruthy? result) result (tk :i64))
+          sig (fput (fput (fput (empty-fmap) :params (fget f :params)) :param-types ptypes) :result shown)]
+      (lh-round-sigs functions (+ i 1) helper-names resolved (form/assoc-form acc (fget f :name) sig)))))
+   :default nil)
+
+;; the context after inferring F's body (the recordings it made), or CTX when the body is refused
+#?(:kotoba
+(defn- lh-infer-body [ctx [:ref :ie/ctx] f [:ref :form/r] sigs [:ref :form/r]] [:ref :ie/ctx]
+  (try (lh-infer-body-ctx ctx f sigs)
+       (catch [:ref :fe/err] e (lh-partial ctx f sigs 0 (record-get [:ref :ie/ctx] ctx :recorded)))))
+   :default nil)
+
+;; The host keeps the recordings a refused body made before it was refused (a volatile outlives the throw). Here they are
+;; recovered by re-running the body with a record limit K = 0, 1, ...: a run that reaches record K+1 throws it as pending
+;; (HAVE is the recordings so far), a run refused before that has exactly the recordings HAVE.
+#?(:kotoba
+(defn- lh-partial [ctx [:ref :ie/ctx] f [:ref :form/r] sigs [:ref :form/r] k :i64 have [:ref :form/r]] [:ref :ie/ctx]
+  (let [limited (record-assoc [:ref :ie/ctx] (record-assoc [:ref :ie/ctx] ctx :rec-limit k) :rec-count 0)]
+    (try (let [done (lh-infer-body-ctx limited f sigs)]
+           (lh-with-recorded ctx have))
+         (catch [:ref :fe/err] e (lh-partial-next ctx f sigs k have e)))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-partial-next [ctx [:ref :ie/ctx] f [:ref :form/r] sigs [:ref :form/r] k :i64 have [:ref :form/r] e [:ref :fe/err]] [:ref :ie/ctx]
+  (if (string=? (record-get [:ref :fe/err] e :code) "kotoba.internal/record-limit")
+    (let [pending (fget (record-get [:ref :fe/err] e :data) :pending)
+          next-have (form/assoc-form have (form/nth-of pending 0) (form/nth-of pending 1))]
+      (lh-partial ctx f sigs (+ k 1) next-have))
+    (lh-with-recorded ctx have)))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-with-recorded [ctx [:ref :ie/ctx] have [:ref :form/r]] [:ref :ie/ctx]
+  (record-assoc [:ref :ie/ctx] ctx :recorded have))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-infer-body-ctx [ctx [:ref :ie/ctx] f [:ref :form/r] sigs [:ref :form/r]] [:ref :ie/ctx]
+  (let [sig (form/form-get sigs (fget f :name))
+        ptypes (fget sig :param-types)
+        locals (zip-locals (fget f :params) ptypes)
+        body (fget f :body)
+        r (ie-infer ctx body locals sigs)]
+    (ie-ctx r)))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-round-bodies [ctx [:ref :ie/ctx] functions [:ref :form/r] i :i64 helper-names [:ref :form/r] resolved [:ref :form/r] sigs [:ref :form/r]] [:ref :ie/ctx]
+  (if (>= i (form/count-of functions))
+    ctx
+    (let [f (form/nth-of functions i)
+          name (fget f :name)
+          run (or (not (cs-set-has? helper-names name)) (form/form-has? resolved name))
+          next-ctx (if run (lh-infer-body ctx f sigs) ctx)]
+      (lh-round-bodies next-ctx functions (+ i 1) helper-names resolved sigs))))
+   :default nil)
+
+;; RESOLVED with every recorded name -> types merged over it
+#?(:kotoba
+(defn- lh-merge [resolved [:ref :form/r] recorded [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of recorded))
+    resolved
+    (lh-merge (form/assoc-form resolved (form/nth-of recorded i) (form/nth-of recorded (+ i 1))) recorded (+ i 2))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-round [ctx [:ref :ie/ctx] functions [:ref :form/r] helper-names [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+  (let [sigs (lh-round-sigs functions 0 helper-names resolved (empty-fmap))
+        names (lh-unresolved helper-names resolved 0 (cs-set-empty))
+        start (record-assoc [:ref :ie/ctx] (record-assoc [:ref :ie/ctx] (record-assoc [:ref :ie/ctx] ctx :names names) :recording true) :recorded (empty-fmap))
+        end (lh-round-bodies start functions 0 helper-names resolved sigs)]
+    (lh-merge resolved (record-get [:ref :ie/ctx] end :recorded) 0)))
+   :default nil)
+
+;; T4.5 map/filter/reduce overlay `:known-types` from the shapes: the source is :vector-i64 by construction
+#?(:kotoba
+(defn- lh-overlay [known [:ref :form/r] params [:ref :form/r] recorded [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (or (>= i (form/count-of params)) (>= i (form/count-of recorded)))
+    (form/form-vec acc)
+    (let [k (form/form-get known (form/nth-of params i))
+          t (if (ftruthy? k) k (form/nth-of recorded i))]
+      (lh-overlay known params recorded (+ i 1) (form/append-form acc t)))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-final-types [f [:ref :form/r] shapes [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+  (let [name (fget f :name)
+        params (fget f :params)
+        found (form/form-get resolved name)
+        recorded (if (form/is-nil? found) (lh-placeholder params 0 (form/no-forms)) found)
+        known (fget (form/form-get shapes name) :known-types)]
+    (if (ftruthy? known)
+      (lh-overlay known params recorded 0 (form/no-forms))
+      recorded)))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-finish [functions [:ref :form/r] i :i64 helper-names [:ref :form/r] shapes [:ref :form/r] resolved [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    (form/form-vec acc)
+    (let [f (form/nth-of functions i)
+          g (if (cs-set-has? helper-names (fget f :name)) (fput f :param-types (lh-final-types f shapes resolved)) f)]
+      (lh-finish functions (+ i 1) helper-names shapes resolved (form/append-form acc g)))))
+   :default nil)
+
+#?(:kotoba
+(defn- lh-fixpoint [ctx [:ref :ie/ctx] functions [:ref :form/r] helper-names [:ref :form/r] shapes [:ref :form/r] resolved [:ref :form/r]] [:ref :form/r]
+  (let [next-resolved (lh-round ctx functions helper-names resolved)]
+    (if (or (= (form/count-of next-resolved) (form/count-of helper-names))
+            (= (form/count-of next-resolved) (form/count-of resolved)))
+      (lh-finish functions 0 helper-names shapes next-resolved (form/no-forms))
+      (lh-fixpoint ctx functions helper-names shapes next-resolved))))
+   :default nil)
+
+;; Give every loop-helper its :param-types. Answers FUNCTIONS with them filled in.
+#?(:kotoba
+(defn resolve-loop-helper-param-types [ctx [:ref :ie/ctx] functions [:ref :form/r] shapes [:ref :form/r]] [:ref :form/r]
+  (let [helper-names (lh-names functions 0 (cs-set-empty))]
+    (if (= 0 (form/count-of helper-names))
+      functions
+      (lh-fixpoint ctx functions helper-names shapes (empty-fmap)))))
+   :default nil)

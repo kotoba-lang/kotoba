@@ -1,0 +1,341 @@
+(ns kotoba.compiler.state-ability-test
+  "The state ability, slice 1 (kotoba-lang `lang/state-ability.edn`, superproject
+  adr-2609242200): get/put over one typed cell, answered by a handler written in
+  the language, lowered by state passing.
+
+  What is pinned here, in the order a reader needs it:
+
+  - the programs RUN on the reference interpreter to the value the handler
+    semantics gives, including a nested handler that shadows the outer one and
+    one function handled at two state types;
+  - the ability is in the TYPE: the specialization carries :state in its row,
+    the function that installs the handler does not, and a declared ceiling
+    that omits :state is refused;
+  - the lowering is what the contract says: get/put are two calls to the split
+    clause functions and allocate nothing; a pair is built only at a
+    specialization's return and at a non-tail join;
+  - every refusal, by its exact text and its code;
+  - a program with no state in it analyses and lowers byte for byte as it did
+    before the pass existed."
+  (:require [kotoba.bytes :as kbytes]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.kir :as kir]
+            [kotoba.sema :as sema]
+            [sha2.core :as sha2]))
+
+(defn- run
+  "Run `source`'s `main` on the reference interpreter. The second arity names
+  the run's budgets (superproject adr-2609242100 P4: the profile defaults are
+  per-run overridable); the first arity takes the profile defaults."
+  ([source] (str (kir/execute (kir/lower (sema/analyze source)) 'main [])))
+  ([source opts] (str (kir/execute (kir/lower (sema/analyze source)) 'main [] opts))))
+
+(defn- refusal [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :code (:kotoba.error/code (ex-data e))})))
+
+(defn- function-named [hir name]
+  (first (filter #(= name (:name %)) (:functions hir))))
+
+(defn- heads [form]
+  (keep #(when (and (seq? %) (seq %)) (first %)) (tree-seq coll? seq form)))
+
+(def ^:private cell
+  "(defhandler cell [:state :i64]
+     (get [s] (resume s s))
+     (put [s v] (resume v v)))\n")
+
+(def ^:private counter
+  (str cell
+       "(defn- tick [] (perform :state/put (+ 1 (perform :state/get))))
+        (defn main [] :i64 (handle (do (tick) (tick) (perform :state/get)) (with cell 40)))"))
+
+;; ---------------------------------------------------------------------------
+;; Positive: the programs run
+
+(deftest a-counter-under-a-handler
+  (is (= "42" (run counter)))
+  (testing "the same operations written inline, with no stateful function"
+    (is (= "42" (run (str cell "(defn main [] :i64
+                                  (handle (do (perform :state/put (+ 1 (perform :state/get)))
+                                              (perform :state/put (+ 1 (perform :state/get)))
+                                              (perform :state/get))
+                                          (with cell 40)))"))))))
+
+(deftest an-inner-handler-shadows-the-outer-one
+  ;; outer 10 -> bump 1 -> 11; inner 1000 -> bump 5 twice -> 1010; the outer
+  ;; read after the inner handle is still 11: 1010 + 100 * 11
+  (is (= "2110"
+         (run (str cell
+                   "(defn- bump [n :i64] :i64 (perform :state/put (+ n (perform :state/get))))
+                    (defn main [] :i64
+                      (handle
+                        (let [before (bump 1)
+                              inner (handle (do (bump 5) (bump 5) (perform :state/get)) (with cell 1000))
+                              after (perform :state/get)]
+                          (+ inner (* 100 after)))
+                        (with cell 10)))")))))
+
+(def ^:private two-state-types
+  "(defhandler count-i64 [:state :i64] (get [s] (resume s s)) (put [s v] (resume v v)))
+   (defhandler keep-string [:state :string] (get [s] (resume s s)) (put [s v] (resume v v)))
+   (defn- replace-twice [] (do (perform :state/put (perform :state/get)) (perform :state/get)))
+   (defn main [] :i64
+     (let [n (handle (do (replace-twice) (perform :state/get)) (with count-i64 7))
+           s (handle (do (replace-twice) (perform :state/get)) (with keep-string \"abc\"))]
+       (+ n (string-byte-length s))))")
+
+(deftest one-function-is-handled-at-two-state-types
+  (is (= "10" (run two-state-types)))
+  (testing "by specialization: one function per handler, each at its own S"
+    (let [hir (sema/analyze two-state-types)
+          i64 (function-named hir '__kotoba_state_replace-twice_under_count-i64)
+          text (function-named hir '__kotoba_state_replace-twice_under_keep-string)]
+      (is (= :i64 (first (:param-types i64))))
+      (is (= :string (first (:param-types text))))
+      (is (nil? (function-named hir 'replace-twice))
+          "the source function exists only as its specializations"))))
+
+(deftest a-stateful-loop-is-a-loop
+  (let [source (str cell
+                    "(defn- add! [x :i64] :i64 (perform :state/put (+ x (perform :state/get))))
+                     (defn- sum-to [n :i64] :i64
+                       (loop [i 1] (if (> i n) (perform :state/get) (do (add! i) (recur (+ i 1))))))
+                     (defn main [] :i64 (handle (sum-to 100) (with cell 0)))")]
+    ;; The run names its budget. 100 iterations of (add! i) is ~600 charged
+    ;; units: the handler clauses are function entries (the self-tail
+    ;; trampoline re-entries are free) and, since amu ADR 0353 floor
+    ;; :allocation-budget (2026-09-30), one unit per constructed cell as well.
+    ;; The profile default of 512 predates that floor and no longer pays for
+    ;; this program -- re-measured 2026-10-24 on the mono (a7ef280) and split
+    ;; arms alike, byte-identical: traps
+    ;; :budget/fuel at 512 / 550 / 600, answers "5050" at 650. A caller names
+    ;; its budget per run (superproject adr-2609242100 P4).
+    (is (= "5050" (run source {:fuel 4096})))
+    (testing "under the profile default the trap names the budget, not an internal error"
+      (let [e (try (run source) nil (catch #?(:clj Throwable :cljs :default) e e))]
+        (is (= "budget/fuel" (ex-message e)))
+        (is (= :budget/fuel (:trap (ex-data e))))))
+    (testing "the loop helper's specialization is itself a __kotoba_loop_N, so
+              the reference interpreter's self-tail trampoline still applies"
+      (is (some #(and (re-matches #"__kotoba_loop_\d+" (str (:name %)))
+                      (contains? (:effects %) :state))
+                (:functions (sema/analyze source)))))))
+
+(deftest the-handler-is-code-in-the-language
+  ;; put never stores a negative; every get costs one
+  (is (= "77004"
+         (run "(defhandler clamped \"doc\" [:state :i64]
+                 (get [s] (resume s (- s 1)))
+                 (put [s v] (if (< v 0) (resume 0 0) (resume v v))))
+               (defn- step [x :i64] :i64
+                 (if (> x 5) (perform :state/put x) (perform :state/put (- 0 x))))
+               (defn main [] :i64
+                 (handle (let [a (step 7) b (perform :state/get) c (step 2)
+                               d (perform :state/get) e (perform :state/get)]
+                           (+ (* 10000 a) (* 1000 b) (* 100 c) (* 10 d) (+ e 5)))
+                         (with clamped 3)))"))))
+
+(deftest a-branch-whose-value-and-state-are-both-needed-joins
+  (let [source (str cell
+                    "(defn- f [c :i64] :i64
+                       (let [x (if (> c 0) (perform :state/put c) 100)]
+                         (when (> c 5) (perform :state/put (* c 2)))
+                         (+ x (perform :state/get))))
+                     (defn main [] :i64
+                       (handle (+ (f 3) (* 1000 (f 7)) (* 1000000 (f -1))) (with cell 1)))")]
+    (is (= "114021006" (run source)))
+    (testing "the let-bound if becomes one join function; the `when` statement
+              needs only the state and takes no join"
+      (let [joins (filter #(str/starts-with? (str (:name %)) "__kotoba_state_join_")
+                          (:functions (sema/analyze source)))]
+        (is (= 1 (count joins)))
+        (is (= #{:state} (:effects (first joins))))))))
+
+;; ---------------------------------------------------------------------------
+;; The ability is in the type
+
+(deftest the-row-carries-state-where-it-is-performed-and-nowhere-else
+  (let [hir (sema/analyze counter)
+        tick (function-named hir '__kotoba_state_tick_under_cell)]
+    (is (= #{:state} (:effects tick)))
+    (is (= #{} (:effects (function-named hir 'main))))
+    (is (= #{:state} (:effects hir)) "the module row is the union of function rows")
+    (testing "every handler clause function is pure"
+      (doseq [f (:functions hir)
+              :when (str/starts-with? (str (:name f)) "__kotoba_state_cell_")]
+        (is (= #{} (:effects f)) (str (:name f)))))
+    (testing "the specialization takes the state first and returns the pair"
+      (is (= :i64 (first (:param-types tick))))
+      (is (= [:record :kotoba.state/ret1 [[:value :i64] [:state :i64]]] (:result tick))))))
+
+(deftest a-ceiling-may-declare-state-and-one-that-omits-it-is-refused
+  (let [program (fn [ceiling]
+                  (str "(ns ceiling {:kotoba/export [main]})\n" cell
+                       "(defn- tick [] {:effects " ceiling "} (perform :state/put (+ 1 (perform :state/get))))
+                        (defn main [] :i64 (handle (tick) (with cell 41)))"))]
+    (is (= "42" (run (program "#{:state}"))))
+    (is (= "inferred effects exceed declared effect ceiling for tick: #{:state}"
+           (:message (refusal (program "#{:clock/now}")))))))
+
+;; ---------------------------------------------------------------------------
+;; The lowering
+
+(deftest get-and-put-are-calls-to-the-split-clauses-and-allocate-nothing
+  (let [hir (sema/analyze (str cell "(defn main [] :i64
+                                      (handle (do (perform :state/put (+ 1 (perform :state/get)))
+                                                  (perform :state/get))
+                                              (with cell 40)))"))
+        main-heads (set (heads (:body (function-named hir 'main))))]
+    (is (contains? main-heads '__kotoba_state_cell_get_value))
+    (is (contains? main-heads '__kotoba_state_cell_get_state))
+    (is (contains? main-heads '__kotoba_state_cell_put_value))
+    (is (contains? main-heads '__kotoba_state_cell_put_state))
+    (is (not (contains? main-heads 'record-new))
+        "no pair is built when nothing is called across a function boundary")))
+
+(deftest a-pair-is-built-only-at-a-specializations-return
+  (let [tick (function-named (sema/analyze counter) '__kotoba_state_tick_under_cell)]
+    (is (= 1 (count (filter #{'record-new} (heads (:body tick))))))))
+
+(deftest no-state-head-survives-elaboration
+  (let [hir (sema/analyze counter)]
+    (is (not-any? #{'perform 'handle 'resume '__kotoba_state_perform '__kotoba_state_op
+                    '__kotoba_state_handle '__kotoba_state_with '__kotoba_state_resume}
+                  (heads (mapv :body (:functions hir)))))))
+
+;; ---------------------------------------------------------------------------
+;; Refusals, by exact text and code
+
+(def ^:private refusals
+  [["get outside any handler"
+    "(defn main [] :i64 (perform :state/get))"
+    "unhandled ability :state at export boundary; handle it with (handle body (with handler init)): main"
+    :kotoba.error/state-unhandled-export]
+   ["a public stateful function is exported"
+    (str cell "(defn tick [] :i64 (perform :state/put 1))
+               (defn main [] :i64 (handle (tick) (with cell 0)))")
+    "unhandled ability :state at export boundary; handle it with (handle body (with handler init)): tick"
+    :kotoba.error/state-unhandled-export]
+   ["a clause resumes with the wrong type"
+    "(defhandler bad [:state :i64] (get [s] (resume \"zero\" s)) (put [s v] (resume v v)))
+     (defn main [] :i64 (handle (do (perform :state/put 1) 0) (with bad 0)))"
+    "handler bad resumes state/get with string, but state/get returns i64 in a [:state :i64] handler"
+    :kotoba.error/state-handler-type]
+   ["a clause's next state has the wrong type"
+    "(defhandler bad [:state :i64] (get [s] (resume s \"x\")) (put [s v] (resume v v)))
+     (defn main [] :i64 (handle (perform :state/get) (with bad 0)))"
+    "handler bad resumes state/get with next state string, but the handler's state is i64 in a [:state :i64] handler"
+    :kotoba.error/state-handler-type]
+   ["a clause takes the wrong parameters"
+    "(defhandler bad [:state :i64] (get [s] (resume s s)) (put [s] (resume s s)))
+     (defn main [] :i64 (handle (perform :state/get) (with bad 0)))"
+    "handler bad does not match the :state ability: its put clause takes [state value], got [s]"
+    :kotoba.error/state-handler-type]
+   ["a clause is missing"
+    "(defhandler bad [:state :i64] (get [s] (resume s s)))
+     (defn main [] :i64 (handle (perform :state/get) (with bad 0)))"
+    "handler bad does not match the :state ability: it must define exactly get and put, once each; it defines get"
+    :kotoba.error/state-handler-type]
+   ["a handler performs a host ability"
+    "(ns impure {:kotoba/capabilities #{:clock/now} :kotoba/export [main]})
+     (defhandler stamped [:state :i64]
+       (get [s] (resume s s))
+       (put [s v] (resume v (+ v (perform :clock/now 0)))))
+     (defn main [] :i64 (handle (do (perform :state/put 1) (perform :state/get)) (with stamped 0)))"
+    "handler stamped is not pure: its put clause performs #{:clock/now}; a handler for the pure ability :state must be pure"
+    :kotoba.error/state-handler-impure]
+   ["a handler performs the ability it handles"
+    "(defhandler loopy [:state :i64] (get [s] (resume (perform :state/get) s)) (put [s v] (resume v v)))
+     (defn main [] :i64 (handle (perform :state/get) (with loopy 0)))"
+    "handler loopy is not pure: its get clause performs #{:state}; a handler for the pure ability :state must be pure"
+    :kotoba.error/state-handler-impure]
+   ["resume is not in tail position"
+    "(defhandler twice [:state :i64] (get [s] (+ 1 (resume s s))) (put [s v] (resume v v)))
+     (defn main [] :i64 (handle (perform :state/get) (with twice 0)))"
+    "handler twice clause get must end every branch in exactly one (resume value state) in tail position"
+    :kotoba.error/state-resume]
+   ["a branch does not resume"
+    "(defhandler partial [:state :i64] (get [s] (if (> s 0) (resume s s) 0)) (put [s v] (resume v v)))
+     (defn main [] :i64 (handle (perform :state/get) (with partial 0)))"
+    "handler partial clause get must end every branch in exactly one (resume value state) in tail position"
+    :kotoba.error/state-resume]
+   ["perform inside a fn literal"
+    (str cell "(defn main [] :i64 (handle (let [f (fn [x] (+ x (perform :state/get)))] (f 1)) (with cell 0)))")
+    "state slice 1 does not admit perform :state/get inside a fn literal"
+    :kotoba.error/state-position]
+   ["a stateful function as a value"
+    (str cell "(defn- tick [x :i64] :i64 (perform :state/put x))
+               (defn main [] :i64 (handle (let [f tick] (f 1)) (with cell 0)))")
+    "stateful function tick cannot be used as a value in state slice 1; call it under a handler"
+    :kotoba.error/state-position]
+   ["throw inside a stateful function"
+    (str cell "(defn- tick [x :i64] :i64 (if (< x 0) (throw \"negative\") (perform :state/put x)))
+               (defn main [] :i64 (handle (try (tick 1) (catch e 0)) (with cell 0)))")
+    "state slice 1 does not admit throw or try inside a stateful function or a handle body: tick"
+    :kotoba.error/state-abort]
+   ["handle names no handler"
+    "(defn main [] :i64 (handle (perform :state/get) (with nobody 0)))"
+    "handle names no handler: nobody"
+    :kotoba.error/state-shape]
+   ["put without a value"
+    (str cell "(defn main [] :i64 (handle (perform :state/put) (with cell 0)))")
+    "perform :state/put takes exactly one value; got 0"
+    :kotoba.error/state-shape]
+   ["a stateful call at the wrong arity names the source function"
+    (str cell "(defn- tick [x :i64] :i64 (perform :state/put x))
+               (defn main [] :i64 (handle (tick 1 2) (with cell 0)))")
+    "function call arity mismatch: tick takes 1 argument; got 2"
+    :kotoba.error/call-arity]
+   ["a handler for an ability slice 1 does not have"
+    "(defhandler h [:async :i64] (get [s] (resume s s)))
+     (defn main [] :i64 0)"
+    "defhandler supports only the :state ability in state slice 1; h names :async"
+    :kotoba.error/state-handler-shape]])
+
+(deftest every-refusal-is-pinned-by-its-text-and-its-code
+  (doseq [[label source message code] refusals]
+    (testing label
+      (let [r (refusal source)]
+        (is (some? r) "admitted")
+        (is (= message (:message r)))
+        (is (= code (:code r))))))
+  (println (str "REFUSED\t" (count refusals) "\tstate refusals by exact text")))
+
+(deftest put-at-the-wrong-type-is-an-ordinary-type-error
+  (let [r (refusal (str cell "(defn main [] :i64 (handle (perform :state/put \"x\") (with cell 0)))"))]
+    (is (some? r))
+    (is (not (str/starts-with? (str (:code r)) ":kotoba.error/state-"))
+        "the program is wrong, not the ability: the checker's own refusal")))
+
+;; ---------------------------------------------------------------------------
+;; Control
+
+(def ^:private control
+  "A program with none of the ability in it: let, do, if, cond, case, when, a
+  constant, a helper call and a function-local atom."
+  "(ns state.control {:kotoba/export [main]})
+   (def limit 6)
+   (defn- clampish [x :i64 lo :i64 hi :i64] :i64 (if (< x lo) lo (if (> x hi) hi x)))
+   (defn- accumulate [n :i64] :i64
+     (let [base (* n 2) bump (+ base 1)]
+       (do (+ base 0)
+           (cond (> bump 100) 100 (> bump 10) bump :else (+ bump 1)))))
+   (defn- perform-free [x :i64] :i64 (let [a (atom x)] (swap! a + 1) @a))
+   (defn main [] :i64
+     (let [a (clampish 9 0 limit) b (accumulate 3) c (perform-free 1)]
+       (+ a b c (case b 8 1 9 2 3) (when (> a 0) a))))")
+
+(deftest a-program-without-the-ability-lowers-byte-for-byte-as-before
+  ;; Both digests were taken on kotoba-sema bc7fdb37, the main tip before this
+  ;; pass landed, from `(pr-str hir)` and `(pr-str (dissoc kir :oracle-value))`.
+  (let [hir (sema/analyze control)
+        kir (kir/lower hir)
+        digest #(sha2/sha256-hex (kbytes/utf8-bytes %))]
+    (is (= "6bf8f132cb233b66c296c9ec52076aff8fdeadd7c64539ededc4c5de89cc92a6"
+           (digest (pr-str hir))))
+    (is (= "0db2043435891b9470132e8263f75625625a07382abb57f98272ab9de853de6f"
+           (digest (pr-str (dissoc kir :oracle-value)))))
+    (is (= "23" (str (kir/execute kir 'main []))))))

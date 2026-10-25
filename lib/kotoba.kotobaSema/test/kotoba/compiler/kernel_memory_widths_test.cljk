@@ -1,0 +1,135 @@
+(ns kotoba.compiler.kernel-memory-widths-test
+  "memwidth: every transfer width and window tier the frontend admits, and the
+  provenance rule they inherit by being in the same table.
+
+  The point of widening `kernel-memory-operations` rather than adding a second
+  family beside it is that `kernel-memory-op?` reads that map: a new width gets
+  the taint analysis on its first argument without a line being written for it.
+  This namespace says so out loud -- if a width were added to the arity table
+  while the provenance walk kept its own list,
+  `a-new-width-inherits-the-provenance-rule` would fail while everything else
+  stayed green."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.frontend :as frontend]
+            [kotoba.hir :as hir]
+            [kotoba.sema :as sema]))
+
+(def ^:private widths ["u8" "u16" "u32" "u64"])
+(def ^:private tiers ["" "-4k" "-16k" "-64k"])
+
+(def ^:private window-loads (for [w widths t tiers] (str "kernel-load-" w t)))
+(def ^:private window-stores (for [w widths t tiers] (str "kernel-store-" w t)))
+(def ^:private slice-loads (for [w widths] (str "slice-load-" w)))
+(def ^:private slice-stores (for [w widths] (str "slice-store-" w)))
+(def ^:private every-load (concat window-loads slice-loads))
+(def ^:private every-store (concat window-stores slice-stores))
+
+(defn- beside-main
+  "`main` must take zero arguments, so the function under test is `p` beside
+  it -- the same shape `kotoba.sema-test`'s own `result-of` uses."
+  [src]
+  (str src "\n(defn main [] 0)"))
+
+(deftest the-table-is-four-widths-by-four-tiers-plus-the-slice-family
+  ;; Counted per family, not as a table total: other streams add to this same
+  ;; map (the general atomics, for one), and a total would make their work
+  ;; fail this test for no reason of its own.
+  (is (= 16 (count (filter #(str/starts-with? (name %) "kernel-load-u")
+                           (keys frontend/kernel-memory-operations))))
+      "four widths by four tiers of loads")
+  (is (= 16 (count (filter #(str/starts-with? (name %) "kernel-store-u")
+                           (keys frontend/kernel-memory-operations))))
+      "and the same for stores")
+  (is (= 8 (count (filter #(str/starts-with? (name %) "slice-")
+                          (keys frontend/kernel-memory-operations))))
+      "four widths of element-indexed load/store")
+  (is (contains? frontend/kernel-memory-operations 'kernel-subregion))
+  (doseq [op every-load]
+    (is (= 3 (get frontend/kernel-memory-operations (symbol op))) op))
+  (doseq [op every-store]
+    (is (= 4 (get frontend/kernel-memory-operations (symbol op))) op))
+  (testing "every one is a reserved name, so no user function can shadow it"
+    (doseq [op (concat every-load every-store)]
+      (is (contains? frontend/reserved-function-names (symbol op)) op))))
+
+(deftest every-width-and-tier-analyses-to-i64
+  (doseq [op every-load]
+    (let [result (sema/analyze
+                  (beside-main
+                   (str "(defn p [base length index] (" op " base length index))")))]
+      (is (hir/valid? result) op)
+      (is (= :i64 (->> (:functions result) (filter #(= 'p (:name %))) first :result))
+          op)))
+  (doseq [op every-store]
+    (let [result (sema/analyze
+                  (beside-main
+                   (str "(defn p [base length index value] ("
+                        op " base length index value))")))]
+      (is (hir/valid? result) op)
+      (is (= :i64 (->> (:functions result) (filter #(= 'p (:name %))) first :result))
+          op))))
+
+(deftest arity-is-checked-for-every-width-and-tier
+  ;; A load with four arguments and a store with three both have to be refused,
+  ;; and refused BY ARITY. An operation absent from the table would instead
+  ;; fall through to "unknown function", which is a different failure -- so the
+  ;; message is pinned rather than merely asserting that something threw.
+  (doseq [op every-load]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"kernel memory operation arity mismatch"
+         (sema/analyze (beside-main (str "(defn p [a b c d] (" op " a b c d))"))))
+        op))
+  (doseq [op every-store]
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"kernel memory operation arity mismatch"
+         (sema/analyze (beside-main (str "(defn p [a b c] (" op " a b c))"))))
+        op)))
+
+(deftest a-new-width-inherits-the-provenance-rule
+  ;; The whole reason to widen the table rather than add a family beside it.
+  ;; `:tainted` maps a function to the parameter INDEXES used as a region base;
+  ;; `:abi-boundary` names the ones no internal caller supplies, i.e. what the
+  ;; C kernel is trusted to hand in.
+  (doseq [op (concat every-load every-store)]
+    (let [store? (str/includes? op "store")
+          src (if store?
+                (str "(defn p [base length index value] ("
+                     op " base length index value))")
+                (str "(defn p [base length index] (" op " base length index))"))
+          report (sema/kernel-region-report (:functions (sema/analyze (beside-main src))))]
+      (is (= #{0} (get (:tainted report) 'p))
+          (str op " must taint parameter 0 as a region base"))
+      (is (= ['base] (get (:abi-boundary report) 'p))
+          (str op " must report its base as an unverifiable ABI boundary"))))
+  (testing "and only the base -- length, index and value are not regions"
+    (let [report (sema/kernel-region-report
+                  (:functions
+                   (sema/analyze
+                    (beside-main
+                     "(defn p [base length index value]
+                        (kernel-store-u64-64k base length index value))"))))]
+      (is (= #{0} (get (:tainted report) 'p))))))
+
+(deftest a-computed-base-is-still-refused-at-every-width
+  ;; The provenance rule's teeth: a base must NAME a region, not compute one.
+  ;; If a new width reached the analyser without reaching the taint walk, this
+  ;; would compile.
+  (doseq [op ["kernel-load-u16-16k" "kernel-load-u64" "slice-load-u32"
+              "slice-store-u8"]]
+    (let [store? (str/includes? op "store")
+          src (if store?
+                (str "(defn p [a b] (" op " (+ a 1) b 0 7))")
+                (str "(defn p [a b] (" op " (+ a 1) b 0))"))]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo
+           #"kernel memory base must name a region, not compute one"
+           (sema/analyze (beside-main src)))
+          op))))
+
+(deftest a-literal-base-is-reported-for-every-width
+  (doseq [op ["kernel-load-u16-16k" "kernel-load-u64" "slice-load-u32"]]
+    (let [report (sema/kernel-region-report
+                  (:functions
+                   (sema/analyze (str "(defn main [] (" op " 4096 8 0))"))))]
+      (is (contains? (set (:literal-bases report)) 4096) op))))

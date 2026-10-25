@@ -1,0 +1,293 @@
+(ns kotoba.compiler.loop-accumulator-type-test
+  "A loop's accumulator may be any value the frontend admits, not only an i64.
+
+  `loop`/`recur` lowers to a synthesized recursive helper function, and that
+  helper's RESULT type used to be a constant with exactly two possible values:
+  `:i64`, or `:vector-i64` when the T4.5 `map`/`filter` desugarings bound
+  `*loop-result-type*`. Nothing read the loop body. So the ordinary
+  Clojure-shaped
+
+      (loop [i 0 acc 0.0] (if (< i 3) (recur (+ i 1) (f64-add acc x)) acc))
+
+  was refused with `expression type mismatch: expected f64, got i64` pointing
+  at the loop's own call site -- even though the accumulator's type was already
+  known, because `resolve-loop-helper-param-types` recovers it from the loop's
+  inits. Only the result type did not read it.
+
+  The rule tested here: a loop leaves through its non-`recur` tail exits, so
+  the helper's result is the type those exits agree on; exits that disagree are
+  refused naming both types and both exits; a `recur` argument must have the
+  type of the binding it rebinds, refused naming the binding and the argument
+  position.
+
+  The controls matter as much as the positives. This pass runs on every module
+  that uses `loop` -- including `map` and `filter`, which are loops -- so the
+  last deftest pins what an unchanged integer program still emits: the same HIR
+  format, the same function-map key order, the same results. The key order is
+  not decoration: the first version of this change carried its two extra facts
+  in the helper's own function map, which pushed it past the eight-entry
+  array-map threshold, and every loop-using module's HIR text moved without a
+  single value in it changing."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.sema :as sema]
+            [kotoba.kir :as kir]))
+
+(defn- hir [source] (sema/analyze source))
+
+(defn- loop-helpers [source]
+  (filterv :loop-helper? (:functions (hir source))))
+
+(defn- loop-result [source] (:result (first (loop-helpers source))))
+
+(defn- loop-param-types [source] (:param-types (first (loop-helpers source))))
+
+(defn- rejection [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+(defn- rejection-code [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e (:kotoba.error/code (ex-data e)))))
+
+(defn- run
+  "Run `main` and normalise the integer the two runtimes hand back: a Kotoba
+  i64 is a JVM long and a JavaScript BigInt, and `(= 3 (js/BigInt 3))` is
+  false. Non-integers (a bool, a keyword) are returned as they are."
+  [source]
+  (let [value (kir/execute (kir/lower (hir source)) 'main [])]
+    #?(:clj  (if (integer? value) (long value) value)
+       ;; A BigInt is not `number?` in ClojureScript, and nothing else this
+       ;; namespace runs to comes back as one.
+       :cljs (if (or (number? value) (boolean? value) (keyword? value) (string? value))
+               value
+               (js/Number value)))))
+
+;; 1.0 as f64 bits, spelled the way the JVM-free reader leaves a decimal literal.
+(def ^:private one-f64 "(f64-from-bits 4607182418800017408)")
+
+(defn- f64-sum-loop
+  "Sum 1.0 three times into an f64 accumulator and truncate, so the whole
+  program's boundary stays :i64 and only the loop is typed."
+  []
+  (str "(ns p)(defn main [] :i64 (f64-to-i64-truncating"
+       " (loop [i 0 acc (f64-from-bits 0)]"
+       "   (if (< i 3) (recur (+ i 1) (f64-add acc " one-f64 ")) acc))))"))
+
+(deftest an-accumulator-may-be-a-float
+  (testing "the measured defect: this was `expected f64, got i64` at the loop's call site"
+    (is (= :f64 (loop-result (f64-sum-loop))))
+    (is (= [:i64 :f64] (loop-param-types (f64-sum-loop))))
+    (is (= 3 (run (f64-sum-loop)))))
+  (testing "f32 as well as f64"
+    (let [source (str "(ns p)(defn main [] :i64 (f32-to-i64-truncating"
+                      " (loop [i 0 acc (f32-from-bits 0)]"
+                      "   (if (< i 3) (recur (+ i 1) (f32-add acc (f32-from-bits 1065353216))) acc))))")]
+      (is (= :f32 (loop-result source)))
+      (is (= 3 (run source))))))
+
+(deftest an-accumulator-may-be-a-string
+  (let [source (str "(ns p)(defn main [] :i64 (string-byte-length"
+                    " (loop [i 0 acc \"\"]"
+                    "   (if (< i 3) (recur (+ i 1) (string-concat acc \"x\")) acc))))")]
+    (is (= :string (loop-result source)))
+    (is (= [:i64 :string] (loop-param-types source)))
+    (is (= 3 (run source)))))
+
+(deftest an-accumulator-may-be-a-bool-or-a-keyword
+  (testing "bool -- the type a comparison already has, which a loop could not carry"
+    (let [source (str "(ns p)(defn main [] :bool"
+                      " (loop [i 0 acc true] (if (< i 3) (recur (+ i 1) (if acc false true)) acc)))")]
+      (is (= :bool (loop-result source)))
+      (is (= false (run source)))))
+  (testing "keyword"
+    (let [source (str "(ns p)(defn main [] :keyword"
+                      " (loop [i 0 acc :zero] (if (< i 3) (recur (+ i 1) :many) acc)))")]
+      (is (= :keyword (loop-result source)))
+      (is (= :many (run source))))))
+
+(deftest an-accumulator-may-be-a-vector
+  (testing "vector-i64 -- what map/filter needed a hard-coded override for"
+    (let [source (str "(ns p)(defn main [] :i64 (vector-count"
+                      " (loop [i 0 acc (vector-i64)]"
+                      "   (if (< i 3) (recur (+ i 1) (vector-conj acc i)) acc))))")]
+      (is (= :vector-i64 (loop-result source)))
+      (is (= 3 (run source)))))
+  (testing "vector-f64"
+    (let [source (str "(ns p)(defn main [] :i64 (vector-f64-count"
+                      " (loop [i 0 acc (vector-f64)]"
+                      "   (if (< i 3) (recur (+ i 1) (vector-f64-conj acc (f64-from-bits 0))) acc))))")]
+      (is (= :vector-f64 (loop-result source)))
+      (is (= 3 (run source))))))
+
+(deftest an-accumulator-may-be-a-record
+  (let [descriptor "[:record :p/pt [[:x :i64] [:y :i64]]]"
+        source (str "(ns p (:schemas {:p/pt " descriptor "}))"
+                    "(defn main [] :i64 (record-get [:ref :p/pt]"
+                    " (loop [i 0 acc (record-new " descriptor " 0 0)]"
+                    "   (if (< i 3) (recur (+ i 1) (record-new " descriptor " i i)) acc)) :x))")]
+    (is (= [:record :p/pt [[:x :i64] [:y :i64]]] (loop-result source)))
+    (is (= 2 (run source)))))
+
+(deftest an-accumulator-may-be-an-option-or-a-result
+  (testing "option-i64"
+    (let [source (str "(ns p)(defn main [] :i64 (option-value"
+                      " (loop [i 0 acc (option-none)]"
+                      "   (if (< i 3) (recur (+ i 1) (option-some i)) acc)) 0))")]
+      (is (= :option-i64 (loop-result source)))
+      (is (= 2 (run source)))))
+  (testing "result-i64"
+    (let [source (str "(ns p)(defn main [] :i64 (result-value"
+                      " (loop [i 0 acc (result-ok 0)]"
+                      "   (if (< i 3) (recur (+ i 1) (result-ok i)) acc)) 0))")]
+      (is (= :result-i64 (loop-result source)))
+      (is (= 2 (run source))))))
+
+(deftest accumulators-of-different-types-share-one-loop
+  (testing "an i64 counter, an f64 sum and a string, in one loop"
+    (let [source (str "(ns p)(defn main [] :i64"
+                      " (loop [i 0 acc (f64-from-bits 0) nm \"x\"]"
+                      "   (if (< i 2)"
+                      "     (recur (+ i 1) (f64-add acc " one-f64 ") (string-concat nm \"y\"))"
+                      "     (+ (f64-to-i64-truncating acc) (string-byte-length nm)))))")]
+      (is (= [:i64 :f64 :string] (loop-param-types source)))
+      (is (= :i64 (loop-result source)))
+      ;; two iterations: acc = 2.0, nm = "xyy" (3 bytes)
+      (is (= 5 (run source))))))
+
+(deftest a-tail-exit-inside-let-is-still-an-exit
+  (testing "`let` is tail-transparent in both directions"
+    (let [exit-in-let (str "(ns p)(defn main [] :i64 (f64-to-i64-truncating"
+                           " (loop [i 0 acc " one-f64 "]"
+                           "   (if (< i 3) (recur (+ i 1) acc) (let [b acc] b)))))")
+          recur-in-let (str "(ns p)(defn main [] :i64 (f64-to-i64-truncating"
+                            " (loop [i 0 acc (f64-from-bits 0)]"
+                            "   (if (< i 3) (let [n (+ i 1)] (recur n (f64-add acc " one-f64 "))) acc))))")]
+      (is (= :f64 (loop-result exit-in-let)))
+      (is (= 1 (run exit-in-let)))
+      (is (= :f64 (loop-result recur-in-let)))
+      (is (= 3 (run recur-in-let))))))
+
+(deftest exits-that-disagree-are-refused-naming-both
+  (let [source (str "(ns p)(defn main [] :i64"
+                    " (loop [i 0 a 0 b (f64-from-bits 0)]"
+                    "   (if (< i 3) (if (> i 1) b (recur (+ i 1) a b)) a)))")]
+    (is (= "loop exits with two different value types: f64 from b and i64 from a"
+           (rejection source)))
+    (is (= :kotoba.error/loop-exit-type (rejection-code source)))))
+
+(deftest a-recur-argument-must-match-its-binding
+  (testing "named: which binding, which argument position, both types"
+    (let [source (str "(ns p)(defn main [] :i64 (f64-to-i64-truncating"
+                      " (loop [i 0 acc (f64-from-bits 0)]"
+                      "   (if (< i 3) (recur (+ i 1) 7) acc))))")]
+      (is (= (str "recur argument 2 rebinds the loop binding `acc`, which is f64, "
+                  "with an expression of type i64")
+             (rejection source)))
+      (is (= :kotoba.error/loop-recur-type (rejection-code source)))))
+  (testing "and in the other direction"
+    (let [source (str "(ns p)(defn main [] :i64 (string-byte-length"
+                      " (loop [i 0 acc \"x\"] (if (< i 3) (recur (+ i 1) 7) acc))))")]
+      (is (= (str "recur argument 2 rebinds the loop binding `acc`, which is string, "
+                  "with an expression of type i64")
+             (rejection source))))))
+
+(defn- loop-source
+  "A loop of n bindings b0..b(n-1), counting b0 to 3 and answering the last."
+  [n]
+  (let [bs (map #(str "b" %) (range n))]
+    (str "(ns p)(defn main [] :i64 (loop [" (apply str (interpose " " (mapcat (fn [b] [b "0"]) bs)))
+         "] (if (< b0 3) (recur (+ b0 1) " (apply str (interpose " " (rest bs))) ") "
+         (last bs) ")))")))
+
+(deftest the-parameter-ceiling-is-named-not-implied
+  ;; 64 since 2026-09-23 (5 before: the native register count, which stack
+  ;; arguments made no longer the language's bound).
+  (testing "sixty-four bindings and nothing captured is the most a loop can carry"
+    (let [source (loop-source 64)]
+      (is (nil? (rejection source)))
+      (is (= 0 (run source)))))
+  (testing "sixty-five is refused, and the refusal does the arithmetic"
+    (let [source (loop-source 65)]
+      (is (= (str "loop bindings plus captured outer variables exceed this compiler's "
+                  "ABI-supported arity: 65 bindings plus 0 captured outer variables is 65, "
+                  "and the limit is 64")
+             (rejection source)))
+      (is (= :kotoba.error/loop-parameter-ceiling (rejection-code source)))))
+  (testing "a captured outer variable costs a binding, and the refusal says which"
+    ;; The ceiling on BINDINGS is 64 minus however many outer variables the
+    ;; body mentions -- not a constant, and not anything the author wrote down.
+    (let [bs (map #(str "b" %) (range 63))
+          source (str "(ns p)(defn g [n :i64 m :i64] :i64"
+                      " (loop [" (apply str (interpose " " (mapcat (fn [b] [b "0"]) bs)))
+                      "] (if (< b0 n) (recur (+ b0 1) "
+                      (apply str (interpose " " (butlast (rest bs))))
+                      " (+ b62 m)) b62)))"
+                      "(defn main [] :i64 (g 1 2))")]
+      (is (= (str "loop bindings plus captured outer variables exceed this compiler's "
+                  "ABI-supported arity: 63 bindings plus 2 captured outer variables is 65, "
+                  "and the limit is 64; the captured variables are m, n")
+             (rejection source))))))
+
+(deftest a-loop-with-no-exit-keeps-the-type-it-had
+  ;; Every tail is a `recur`, so there is no exit to read a type from. Nothing
+  ;; is inferred and nothing is refused: the loop keeps :i64 and lowers as it
+  ;; always did.
+  (let [source "(ns p)(defn main [] :i64 (loop [i 0] (recur (+ i 1))))"]
+    (is (nil? (rejection source)))
+    (is (= :i64 (loop-result source)))))
+
+(deftest later-loops-capture-earlier-vector-loop-results
+  (let [source (str "(ns g.capture)(defn main [] :i64"
+                    " (let [first (loop [i 0 v [1 2]]"
+                    "               (if (= i 1) v (recur (+ i 1) v)))"
+                    "       second (loop [i 0 v first]"
+                    "                (if (= i 1) v (recur (+ i 1) (vector-conj v 3))))]"
+                    "   (loop [i 0 total 0]"
+                    "     (if (= i 3) total"
+                    "       (recur (+ i 1) (+ total (vector-at second i)))))))")
+        helpers (loop-helpers source)]
+    (is (= [:vector-i64 :vector-i64 :i64] (mapv :result helpers)))
+    (is (= :vector-i64 (last (:param-types (nth helpers 1)))))
+    (is (= :vector-i64 (last (:param-types (nth helpers 2)))))
+    (is (= 6 (run source)))))
+
+(deftest an-unchanged-integer-program-is-unchanged
+  ;; The byte-identity control. Full HIR/KIR text cannot be pinned portably --
+  ;; `pr-str` writes a Kotoba integer as `0` on the JVM and `#object[BigInt 0]`
+  ;; on ClojureScript -- so what is pinned here is everything that is portable
+  ;; and everything that actually moved when this was got wrong: the HIR
+  ;; format, the helper's key ORDER, and the results.
+  (testing "a plain integer loop still emits compatibility HIR"
+    (let [source (str "(ns g.a)(defn main [] :i64"
+                      " (loop [i 0 acc 0] (if (< i 5) (recur (+ i 1) (+ acc i)) acc)))")
+          module (hir source)
+          helper (first (filterv :loop-helper? (:functions module)))]
+      (is (= :kotoba.hir/v2 (:format module)))
+      (is (= :i64 (:result helper)))
+      (is (= [:name :params :result :effects :loop-helper? :body] (vec (keys helper))))))
+  (testing "map is a loop and still emits exactly what it did"
+    (let [source (str "(ns g.b)(defn main [] :i64 (vector-at"
+                      " (map (fn [x] (* x 2)) (vector-conj (vector-conj (vector-i64) 3) 4)) 1))")
+          helper (first (loop-helpers source))]
+      (is (= :vector-i64 (:result helper)))
+      (is (= [:i64 :vector-i64 :vector-i64] (:param-types helper)))
+      (is (= [:name :params :result :effects :loop-helper? :body :param-types]
+             (vec (keys helper))))
+      (is (= 8 (run source)))))
+  (testing "and filter"
+    (let [source (str "(ns g.c)(defn main [] :i64 (vector-count"
+                      " (filter (fn [x] (> x 2)) (vector-conj (vector-conj (vector-i64) 3) 1))))")
+          helper (first (loop-helpers source))]
+      (is (= :vector-i64 (:result helper)))
+      (is (= [:name :params :result :effects :loop-helper? :body :param-types]
+             (vec (keys helper))))
+      (is (= 1 (run source)))))
+  (testing "a nested integer loop"
+    (let [source (str "(ns g.e)(defn main [] :i64"
+                      " (loop [i 0 a 0]"
+                      "   (if (< i 3)"
+                      "     (recur (+ i 1) (+ a (loop [j 0 b 0] (if (< j 2) (recur (+ j 1) (+ b j)) b))))"
+                      "     a)))")]
+      (is (= [:i64 :i64] (mapv :result (loop-helpers source))))
+      (is (= 3 (run source))))))

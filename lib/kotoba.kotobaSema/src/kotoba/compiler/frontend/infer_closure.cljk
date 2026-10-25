@@ -1,0 +1,743 @@
+(ns kotoba.compiler.frontend.infer-closure
+  "Kotoba-only closure refinement pass, split from frontend.infer to keep each native semantic unit bounded."
+  #?(:kotoba {:kotoba/export [infer-closure-refinements]})
+  (:require #?@(:kotoba [[kotoba.form :as form]
+                         [kotoba.compiler.frontend-tables :as tables]
+                         [kotoba.compiler.frontend.base :refer [fe-reject fget fl-has? fl-nth fl-slice form-text fput ftruthy?]]
+                         [kotoba.compiler.frontend.closure-types :refer [callable-type? record-type? schema-ref-type?]]
+                         [kotoba.compiler.frontend.infer :refer [record-field-type]]]))
+  #?(:kotoba (:schemas {:form/r [:record :form/r [[:tag :i64] [:s :string] [:n :i64] [:k :keyword]
+                                                  [:kids [:list [:ref :form/r]]] [:span :i64] [:data :bytes]]]
+                         :fe/err [:record :fe/err [[:msg :string] [:code :string] [:form [:ref :form/r]] [:phase :string] [:data [:ref :form/r]]]]
+                         :ie/ctx [:record :ie/ctx [[:schemas [:ref :form/r]] [:row-schemas [:ref :form/r]] [:handlers [:ref :form/r]] [:final :bool] [:tail :bool] [:names [:ref :form/r]] [:recording :bool] [:recorded [:ref :form/r]] [:collect :bool] [:throws [:list [:ref :form/r]]] [:known [:ref :form/r]] [:tbl [:ref :form/r]] [:rec-limit :i64] [:rec-count :i64]]]})))
+
+;; Keep these small form/context operations local so the extracted pass has no dependency on infer's private helpers.
+#?(:kotoba
+(defn- sym-is? [x [:ref :form/r] name :string] :bool
+  (and (form/is-symbol? x) (string=? (form/symbol-value x) name)))
+   :default nil)
+
+#?(:kotoba
+(defn- tk [k :keyword] [:ref :form/r]
+  (form/keyword-form k))
+   :default nil)
+
+#?(:kotoba
+(defn- a [form [:ref :form/r] i :i64] [:ref :form/r]
+  (form/nth-of form (+ i 1)))
+   :default nil)
+
+#?(:kotoba
+(defn- argc [form [:ref :form/r]] :i64
+  (- (form/count-of form) 1))
+   :default nil)
+
+#?(:kotoba
+(defn- ctx-schemas [c [:ref :ie/ctx]] [:ref :form/r]
+  (record-get [:ref :ie/ctx] c :schemas))
+   :default nil)
+
+#?(:kotoba
+(defn- ctx-tbl [c [:ref :ie/ctx]] [:ref :form/r]
+  (record-get [:ref :ie/ctx] c :tbl))
+   :default nil)
+
+#?(:kotoba
+(defn- ie-tbl-has? [c [:ref :ie/ctx] k :keyword x [:ref :form/r]] :bool
+  (tables/table-has? (form/form-get (ctx-tbl c) (form/keyword-form k)) x))
+   :default nil)
+
+#?(:kotoba
+(defn- empty-fmap [] [:ref :form/r]
+  (form/form-map (form/no-forms)))
+   :default nil)
+
+;; ── Kotoba route: infer-closure-refinements (ported from the host form above; facts threaded by value) ──
+;; ---- infer-closure-refinements ----
+;; The facts the fixed point grows: Form map  function-name -> {:params #{index...} :result? bool}. The host's volatile
+;; `next-facts` is threaded by value through the walkers, each answering the facts after it. Statuses of an
+;; expression are i64: 0 unknown, 1 closure, 2 trap. Constants (lambda ids and infos, function names, schemas) are the
+;; Form map K. Env entries are {:form :env :status} (status absent until computed).
+#?(:kotoba
+(defn- cs-set-empty [] [:ref :form/r]
+  (form/form-set (form/no-forms)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-set-has? [s [:ref :form/r] x [:ref :form/r]] :bool
+  (fl-has? (form/kids-of s) x 0))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-set-add [s [:ref :form/r] x [:ref :form/r]] [:ref :form/r]
+  (if (fl-has? (form/kids-of s) x 0)
+    s
+    (form/form-set (form/append-form (form/kids-of s) x))))
+   :default nil)
+
+;; whether S ends the way `#"__kotoba_invoke(?:_.+)?\$arity[0-4]"` requires, scanned without slicing inside a character
+#?(:kotoba
+(defn- cs-last-index [s :string needle :string from :i64 best :i64] :i64
+  (let [at (string-index-of-from s needle from)]
+    (if (< at 0)
+      best
+      (cs-last-index s needle (+ at 1) at))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-invoke-name? [s :string] :bool
+  (let [pn (string-length "__kotoba_invoke")
+        n (string-length s)
+        last (cs-last-index s "$arity" 0 (- 0 1))]
+    (and (= 0 (string-index-of s "__kotoba_invoke"))
+         (>= last pn)
+         (= n (+ last 7))
+         (>= (string-code-point-at s (+ last 6)) 48)
+         (<= (string-code-point-at s (+ last 6)) 52)
+         (or (= last pn)
+             (and (>= (- last pn) 2) (= 95 (string-code-point-at s pn)))))))
+   :default nil)
+
+;; The synthetic entry points whose first physical i64 word is a closure pair.
+#?(:kotoba
+(defn- closure-dispatcher-function? [name [:ref :form/r]] :bool
+  (and (form/is-symbol? name)
+       (or (string=? (form/symbol-value name) "__kotoba_closure_apply")
+           (cs-invoke-name? (form/symbol-value name)))))
+   :default nil)
+
+;; a top-level schema reference resolved to its descriptor
+#?(:kotoba
+(defn- cs-canonical [k [:ref :form/r] t [:ref :form/r]] [:ref :form/r]
+  (let [schemas (fget k :schemas)]
+    (if (and (schema-ref-type? t) (form/is-map? schemas))
+      (let [r (form/form-get schemas (form/nth-of t 1))]
+        (if (form/is-nil? r) t r))
+      t)))
+   :default nil)
+
+;; `(record-get T v :f)` where T declares :f as `[:fn ...]`
+#?(:kotoba
+(defn- cs-callable-field-read? [k [:ref :form/r] form [:ref :form/r]] :bool
+  (if (and (form/is-seq? form) (sym-is? (form/nth-of form 0) "record-get") (= 4 (form/count-of form)))
+    (let [t (cs-canonical k (a form 0))]
+      (and (record-type? t)
+           (callable-type? (record-field-type t (a form 2) (fget k :schemas)))))
+    false))
+   :default nil)
+
+;; the values a record-new / record-assoc form stores in [:fn ...] fields
+#?(:kotoba
+(defn- cs-new-field-values [fields [:ref :form/r] form [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (or (>= i (form/count-of fields)) (>= (+ i 2) (form/count-of form)))
+    acc
+    (let [field-type (form/nth-of (form/nth-of fields i) 1)
+          value (form/nth-of form (+ i 2))
+          keep (and (callable-type? field-type) (ftruthy? value))]
+      (cs-new-field-values fields form (+ i 1) (if keep (form/append-form acc value) acc)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-callable-field-values [k [:ref :form/r] form [:ref :form/r]] [:list [:ref :form/r]]
+  (if (and (form/is-seq? form) (>= (form/count-of form) 2))
+    (let [op (form/nth-of form 0)
+          t (cs-canonical k (a form 0))]
+      (cond
+        (not (or (sym-is? op "record-new") (sym-is? op "record-assoc"))) (form/no-forms)
+        (not (record-type? t)) (form/no-forms)
+        (sym-is? op "record-new") (cs-new-field-values (form/nth-of t 2) form 0 (form/no-forms))
+        (callable-type? (record-field-type t (a form 2) (fget k :schemas))) (form/one-form (a form 3))
+        :else (form/no-forms)))
+    (form/no-forms)))
+   :default nil)
+
+;; `(= __kotoba_... 0)`: the empty test a lazy sequence's desugaring writes
+#?(:kotoba
+(defn- cs-generated-symbol? [x [:ref :form/r]] :bool
+  (and (form/is-symbol? x) (= 0 (string-index-of (form/symbol-value x) "__kotoba_"))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-zero? [x [:ref :form/r]] :bool
+  (and (form/is-int? x) (= 0 (form/int-value x))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-generated-empty-test? [form [:ref :form/r]] :bool
+  (and (form/is-seq? form) (sym-is? (form/nth-of form 0) "=") (= 3 (form/count-of form))
+       (or (and (cs-generated-symbol? (a form 0)) (cs-zero? (a form 1)))
+           (and (cs-zero? (a form 0)) (cs-generated-symbol? (a form 1))))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-lambda-info [k [:ref :form/r] id [:ref :form/r] i :i64] [:ref :form/r]
+  (let [infos (fget k :infos)]
+    (if (>= i (form/count-of infos))
+      (form/nil-form)
+      (if (form/eq (fget (form/nth-of infos i) :id) id)
+        (form/nth-of infos i)
+        (cs-lambda-info k id (+ i 1))))))
+   :default nil)
+
+;; the heads of a `pair` chain ending in 0, or nil
+#?(:kotoba
+(defn- cs-chain-values [chain [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (cond
+    (cs-zero? chain) (form/form-vec acc)
+    (and (form/is-seq? chain) (sym-is? (form/nth-of chain 0) "pair") (= 3 (form/count-of chain))) (cs-chain-values (form/nth-of chain 2) (form/append-form acc (form/nth-of chain 1)))
+    :else (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-closure-literal? [k [:ref :form/r] form [:ref :form/r]] :bool
+  (and (form/is-seq? form) (= 3 (form/count-of form)) (sym-is? (form/nth-of form 0) "pair")
+       (form/is-int? (form/nth-of form 1))
+       (fl-has? (form/kids-of (fget k :lambda-ids)) (form/nth-of form 1) 0)))
+   :default nil)
+
+;; `(= x 0)` / `(= 0 x)` with a symbol x: x, else nil
+#?(:kotoba
+(defn- cs-zero-tested-symbol [form [:ref :form/r]] [:ref :form/r]
+  (if (and (form/is-seq? form) (sym-is? (form/nth-of form 0) "=") (= 3 (form/count-of form)))
+    (cond
+      (and (form/is-symbol? (a form 0)) (cs-zero? (a form 1))) (a form 0)
+      (and (form/is-symbol? (a form 1)) (cs-zero? (a form 0))) (a form 1)
+      :else (form/nil-form))
+    (form/nil-form)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-fn-name? [k [:ref :form/r] op [:ref :form/r]] :bool
+  (cs-set-has? (fget k :names) op))
+   :default nil)
+
+;; ---- facts ----
+#?(:kotoba
+(defn- cs-entry [facts [:ref :form/r] name [:ref :form/r]] [:ref :form/r]
+  (let [e (form/form-get facts name)]
+    (if (form/is-nil? e) (empty-fmap) e)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-params-of [facts [:ref :form/r] name [:ref :form/r]] [:ref :form/r]
+  (let [p (fget (cs-entry facts name) :params)]
+    (if (form/is-nil? p) (cs-set-empty) p)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-result? [facts [:ref :form/r] name [:ref :form/r]] :bool
+  (ftruthy? (fget (cs-entry facts name) :result?)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-mark-param [facts [:ref :form/r] name [:ref :form/r] index [:ref :form/r]] [:ref :form/r]
+  (if (form/is-nil? index)
+    facts
+    (let [e (cs-entry facts name)
+          ps (cs-set-add (cs-params-of facts name) index)]
+      (form/assoc-form facts name (fput e :params ps)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-mark-result [facts [:ref :form/r] name [:ref :form/r]] [:ref :form/r]
+  (form/assoc-form facts name (fput (cs-entry facts name) :result? (form/bool-form true))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-param-indexes [params [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of params))
+    acc
+    (cs-param-indexes params (+ i 1) (form/assoc-form acc (form/nth-of params i) (form/int-form i)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-binding [value [:ref :form/r] env [:ref :form/r] status :i64] [:ref :form/r]
+  (fput (fput (fput (empty-fmap) :form value) :env env) :status (form/int-form status)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-binding-plain [value [:ref :form/r] env [:ref :form/r]] [:ref :form/r]
+  (fput (fput (empty-fmap) :form value) :env env))
+   :default nil)
+
+;; ---- expression-status ----
+#?(:kotoba
+(defn- cs-status [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (cond
+    (cs-closure-literal? k form) 1
+    (form/is-symbol? form) (cs-status-symbol k fname form env pidx facts seen)
+    (form/is-seq? form) (cs-status-seq k fname form env pidx facts seen)
+    :else 0))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-status-symbol [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (if (cs-set-has? seen form)
+    0
+    (let [entry (form/form-get env form)]
+      (if (form/is-nil? entry)
+        (if (fl-has? (form/kids-of (cs-params-of facts fname)) (form/form-get pidx form) 0) 1 0)
+        (let [status (fget entry :status)]
+          (if (ftruthy? status)
+            (form/int-value status)
+            (cs-status k fname (fget entry :form) (fget entry :env) pidx facts (cs-set-add seen form))))))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-status-seq [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (let [op (form/nth-of form 0)]
+    (cond
+      (sym-is? op "let") (cs-status-let k fname (a form 0) 0 (a form 1) env pidx facts seen)
+      (sym-is? op "if") (cs-status-if k fname form env pidx facts seen)
+      (sym-is? op "do") (cs-status-do k fname form 1 env pidx facts seen)
+      (and (sym-is? op "quot") (= 3 (form/count-of form)) (form/eq (a form 0) (form/int-form 1)) (form/eq (a form 1) (form/int-form 0))) 2
+      (cs-callable-field-read? k form) 1
+      :else (cs-status-call k fname form env pidx facts seen))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-status-let [k [:ref :form/r] fname [:ref :form/r] bindings [:ref :form/r] i :i64 body [:ref :form/r] current [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (if (< (+ i 1) (form/count-of bindings))
+    (let [name (form/nth-of bindings i)
+          value (form/nth-of bindings (+ i 1))
+          status (cs-status k fname value current pidx facts seen)
+          entry (cs-binding value current status)
+          next-env (form/assoc-form current name entry)]
+      (if (= status 2)
+        2
+        (cs-status-let k fname bindings (+ i 2) body next-env pidx facts seen)))
+    (cs-status k fname body current pidx facts seen)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-closure-or-trap? [status :i64] :bool
+  (or (= status 1) (= status 2)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-status-if [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (let [test-status (cs-status k fname (a form 0) env pidx facts seen)]
+    (if (= test-status 2)
+      2
+      (let [then-status (cs-status k fname (a form 1) env pidx facts seen)
+            else-status (cs-status k fname (a form 2) env pidx facts seen)]
+        (cond
+          (and (= then-status 2) (= else-status 2)) 2
+          (and (or (= then-status 1) (= else-status 1)) (cs-closure-or-trap? then-status) (cs-closure-or-trap? else-status)) 1
+          :else 0)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-status-do [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (if (>= i (form/count-of form))
+    0
+    (let [value (form/nth-of form i)]
+      (if (ftruthy? value)
+        (let [status (cs-status k fname value env pidx facts seen)]
+          (if (or (= status 2) (= i (- (form/count-of form) 1)))
+            status
+            (cs-status-do k fname form (+ i 1) env pidx facts seen)))
+        0))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-any-trap? [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :bool
+  (if (>= i (form/count-of form))
+    false
+    (if (= 2 (cs-status k fname (form/nth-of form i) env pidx facts seen))
+      true
+      (cs-any-trap? k fname form (+ i 1) env pidx facts seen))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-status-call [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r] seen [:ref :form/r]] :i64
+  (let [op (form/nth-of form 0)]
+    (cond
+      (cs-any-trap? k fname form 1 env pidx facts seen) 2
+      (and (cs-fn-name? k op) (cs-result? facts op)) 1
+      :else 0)))
+   :default nil)
+
+;; ---- require-closure! ----
+#?(:kotoba
+(defn- cs-require [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] seen [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (cond
+    (= 2 (cs-status k fname form env pidx facts seen)) facts
+    (cs-closure-literal? k form) facts
+    (form/is-symbol? form) (cs-require-symbol k fname form env pidx narrowed seen facts)
+    (form/is-seq? form) (cs-require-seq k fname form env pidx narrowed seen facts)
+    :else facts))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-require-symbol [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] seen [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (or (cs-set-has? narrowed form) (cs-set-has? seen form))
+    facts
+    (let [entry (form/form-get env form)]
+      (if (form/is-nil? entry)
+        (cs-mark-param facts fname (form/form-get pidx form))
+        (cs-require k fname (fget entry :form) (fget entry :env) pidx narrowed (cs-set-add seen form) facts)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-require-let [k [:ref :form/r] fname [:ref :form/r] bindings [:ref :form/r] i :i64 body [:ref :form/r] current [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] seen [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (< (+ i 1) (form/count-of bindings))
+    (let [entry (cs-binding-plain (form/nth-of bindings (+ i 1)) current)
+          next-env (form/assoc-form current (form/nth-of bindings i) entry)]
+      (cs-require-let k fname bindings (+ i 2) body next-env pidx narrowed seen facts))
+    (cs-require k fname body current pidx narrowed seen facts)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-require-branches [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] seen [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of form))
+    facts
+    (let [next-facts (cs-require k fname (form/nth-of form i) env pidx narrowed seen facts)]
+      (cs-require-branches k fname form (+ i 1) env pidx narrowed seen next-facts))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-require-seq [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] seen [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (let [op (form/nth-of form 0)]
+    (cond
+      (sym-is? op "let") (cs-require-let k fname (a form 0) 0 (a form 1) env pidx narrowed seen facts)
+      (sym-is? op "if") (cs-require-branches k fname form 2 env pidx narrowed seen facts)
+      (sym-is? op "do") (if (and (> (argc form) 0) (ftruthy? (form/last-of form)))
+                          (cs-require k fname (form/last-of form) env pidx narrowed seen facts)
+                          facts)
+      (and (cs-fn-name? k op) (not (closure-dispatcher-function? op))) (cs-mark-result facts op)
+      :else facts)))
+   :default nil)
+
+;; ---- scan-calls! ----
+#?(:kotoba
+(defn- cs-scan-all [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of form))
+    facts
+    (let [next-facts (cs-scan k fname (form/nth-of form i) env pidx narrowed facts)]
+      (cs-scan-all k fname form (+ i 1) env pidx narrowed next-facts))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-scan-values [k [:ref :form/r] fname [:ref :form/r] values [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of values))
+    facts
+    (let [next-facts (cs-scan k fname (form/nth-of values i) env pidx narrowed facts)]
+      (cs-scan-values k fname values (+ i 1) env pidx narrowed next-facts))))
+   :default nil)
+
+;; for each index of the snapshot INDEXES below LIMIT, require the value at VALUES[index] to be a closure
+#?(:kotoba
+(defn- cs-require-at [k [:ref :form/r] fname [:ref :form/r] indexes [:ref :form/r] i :i64 limit :i64 values [:ref :form/r] offset :i64 env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of indexes))
+    facts
+    (let [index (form/int-value (form/nth-of indexes i))
+          value (form/nth-of values (+ index offset))
+          go (and (< index limit) (ftruthy? value))
+          next-facts (if go (cs-require k fname value env pidx narrowed (cs-set-empty) facts) facts)]
+      (cs-require-at k fname indexes (+ i 1) limit values offset env pidx narrowed next-facts))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-scan-literal [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (let [info (cs-lambda-info k (a form 0) 0)
+        helper (fget info :helper)
+        capture-values (cs-chain-values (a form 1) (form/no-forms))
+        capture-count (form/count-of (fget info :captures))
+        f1 (cs-scan-values k fname capture-values 0 env pidx narrowed facts)
+        indexes (cs-params-of f1 (fget helper :name))]
+    (cs-require-at k fname indexes 0 capture-count capture-values 0 env pidx narrowed f1)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-scan-let [k [:ref :form/r] fname [:ref :form/r] bindings [:ref :form/r] i :i64 body [:ref :form/r] current [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (if (< (+ i 1) (form/count-of bindings))
+    (let [value (form/nth-of bindings (+ i 1))
+          f1 (cs-scan k fname value current pidx narrowed facts)
+          entry (cs-binding-plain value current)
+          next-env (form/assoc-form current (form/nth-of bindings i) entry)]
+      (cs-scan-let k fname bindings (+ i 2) body next-env pidx narrowed f1))
+    (cs-scan k fname body current pidx narrowed facts)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-scan-if [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (let [test (a form 0)
+        nonzero (cs-zero-tested-symbol test)
+        f1 (cs-scan k fname test env pidx narrowed facts)
+        f2 (cs-scan k fname (a form 1) env pidx narrowed f1)
+        else-narrowed (if (form/is-nil? nonzero) narrowed (cs-set-add narrowed nonzero))]
+    (cs-scan k fname (a form 2) env pidx else-narrowed f2)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-scan-call [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (let [op (form/nth-of form 0)
+        f1 (cs-scan-all k fname form 1 env pidx narrowed facts)]
+    (if (and (cs-fn-name? k op) (not (closure-dispatcher-function? fname)))
+      (cs-require-at k fname (cs-params-of f1 op) 0 (argc form) form 1 env pidx narrowed f1)
+      f1)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-scan [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] narrowed [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (cond
+    (not (form/is-seq? form)) facts
+    (cs-closure-literal? k form) (cs-scan-literal k fname form env pidx narrowed facts)
+    (sym-is? (form/nth-of form 0) "let") (cs-scan-let k fname (a form 0) 0 (a form 1) env pidx narrowed facts)
+    (sym-is? (form/nth-of form 0) "if") (cs-scan-if k fname form env pidx narrowed facts)
+    :else (cs-scan-call k fname form env pidx narrowed facts)))
+   :default nil)
+
+;; ---- one pass, the fixed point ----
+#?(:kotoba
+(defn- cs-pass-function [k [:ref :form/r] f [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (let [fname (fget f :name)
+        body (fget f :body)
+        pidx (cs-param-indexes (fget f :params) 0 (empty-fmap))
+        none-env (empty-fmap)
+        none-set (cs-set-empty)
+        f1 (if (= 1 (cs-status k fname body none-env pidx facts none-set)) (cs-mark-result facts fname) facts)
+        f2 (if (cs-result? f1 fname) (cs-require k fname body none-env pidx none-set none-set f1) f1)]
+    (cs-scan k fname body none-env pidx none-set f2)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-pass [k [:ref :form/r] functions [:ref :form/r] i :i64 facts [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    facts
+    (cs-pass k functions (+ i 1) (cs-pass-function k (form/nth-of functions i) facts))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-not-converged [iteration :i64] [:ref :fe/err]
+  (fe-reject "closure refinement inference did not converge" "kotoba.error/subset-reject"
+             (fput (empty-fmap) :iterations (form/int-form iteration))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-fixpoint [k [:ref :form/r] functions [:ref :form/r] facts [:ref :form/r] iteration :i64 limit :i64] [:ref :form/r]
+  (let [next-facts (cs-pass k functions 0 facts)]
+    (cond
+      (form/eq facts next-facts) facts
+      (>= iteration limit) (throw (cs-not-converged iteration))
+      :else (cs-fixpoint k functions next-facts (+ iteration 1) limit))))
+   :default nil)
+
+;; ---- the seed ----
+#?(:kotoba
+(defn- cs-map-keys [m [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of m))
+    acc
+    (cs-map-keys m (+ i 2) (form/append-form acc (form/nth-of m i)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-union [s [:ref :form/r] xs [:ref :form/r] i :i64] [:ref :form/r]
+  (if (>= i (form/count-of xs))
+    s
+    (cs-union (cs-set-add s (form/nth-of xs i)) xs (+ i 1))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-seed-entry [f [:ref :form/r]] [:ref :form/r]
+  (let [fname (fget f :name)
+        contracts (fget f :callable-param-contracts)
+        s1 (cs-union (cs-set-empty) (fget f :closure-param-indexes) 0)
+        s2 (cs-union s1 (form/form-vec (cs-map-keys contracts 0 (form/no-forms))) 0)
+        s3 (if (closure-dispatcher-function? fname) (cs-set-add s2 (form/int-form 0)) s2)
+        result (or (form/is-true? (fget f :closure-result?)) (not (form/is-nil? (fget f :callable-result-contract))))]
+    (fput (fput (empty-fmap) :params s3) :result? (form/bool-form result))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-seed [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (let [f (form/nth-of functions i)]
+      (cs-seed functions (+ i 1) (form/assoc-form acc (fget f :name) (cs-seed-entry f))))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-names [functions [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    acc
+    (cs-names functions (+ i 1) (cs-set-add acc (fget (form/nth-of functions i) :name)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-ids [infos [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of infos))
+    (form/form-vec acc)
+    (cs-ids infos (+ i 1) (form/append-form acc (fget (form/nth-of infos i) :id)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-total-params [functions [:ref :form/r] i :i64 acc :i64] :i64
+  (if (>= i (form/count-of functions))
+    acc
+    (cs-total-params functions (+ i 1) (+ acc (form/count-of (fget (form/nth-of functions i) :params))))))
+   :default nil)
+
+;; ---- the closure-is-not-a-number refusals ----
+#?(:kotoba
+(defn- cs-refuse-fields! [k [:ref :form/r] form [:ref :form/r] values [:list [:ref :form/r]] i :i64] :i64
+  (if (>= i (vector-count values))
+    0
+    (if (cs-closure-literal? k (fl-nth values i))
+      (cs-refuse-fields! k form values (+ i 1))
+      (throw (fe-reject "a [:fn ...] record field takes a fn literal; this value is not a closure (ADR 0353)"
+                        "kotoba.error/function-value-field" form)))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-number-op? [ctx [:ref :ie/ctx] op [:ref :form/r]] :bool
+  (or (ie-tbl-has? ctx :arithmetic op) (ie-tbl-has? ctx :comparisons op)
+      (ie-tbl-has? ctx :i64-operations op) (ie-tbl-has? ctx :i32-operations op)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-operand-error [op [:ref :form/r] form [:ref :form/r]] [:ref :fe/err]
+  (if (sym-is? op "=")
+    (fe-reject (str "a function value has no equality: (= f g) would compare two closure handles, and equality over "
+                    "handles stays refused (ADR 0353)")
+               "kotoba.error/function-value-equality" form)
+    (let [op-text (form-text op)]
+      (fe-reject (str "a function value is not a number: " op-text " over a closure is refused; call it instead (ADR 0353)")
+                 "kotoba.error/function-value-arithmetic" form))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refuse-operand-args! [k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r]] :i64
+  (if (>= i (form/count-of form))
+    0
+    (if (= 1 (cs-status k fname (form/nth-of form i) env pidx facts (cs-set-empty)))
+      (throw (cs-operand-error (form/nth-of form 0) form))
+      (cs-refuse-operand-args! k fname form (+ i 1) env pidx facts))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refuse-operands! [ctx [:ref :ie/ctx] k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r]] :i64
+  (if (and (cs-number-op? ctx (form/nth-of form 0)) (not (cs-generated-empty-test? form)))
+    (cs-refuse-operand-args! k fname form 1 env pidx facts)
+    0))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refuse-args [ctx [:ref :ie/ctx] k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] i :i64 env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r]] :i64
+  (if (>= i (form/count-of form))
+    0
+    (let [_ (cs-refuse-walk ctx k fname (form/nth-of form i) env pidx facts)]
+      (cs-refuse-args ctx k fname form (+ i 1) env pidx facts))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refuse-let [ctx [:ref :ie/ctx] k [:ref :form/r] fname [:ref :form/r] bindings [:ref :form/r] i :i64 body [:ref :form/r] current [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r]] :i64
+  (if (< (+ i 1) (form/count-of bindings))
+    (let [value (form/nth-of bindings (+ i 1))
+          _ (cs-refuse-walk ctx k fname value current pidx facts)
+          entry (cs-binding-plain value current)
+          next-env (form/assoc-form current (form/nth-of bindings i) entry)]
+      (cs-refuse-let ctx k fname bindings (+ i 2) body next-env pidx facts))
+    (cs-refuse-walk ctx k fname body current pidx facts)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refuse-walk [ctx [:ref :ie/ctx] k [:ref :form/r] fname [:ref :form/r] form [:ref :form/r] env [:ref :form/r] pidx [:ref :form/r] facts [:ref :form/r]] :i64
+  (if (form/is-seq? form)
+    (if (sym-is? (form/nth-of form 0) "let")
+      (cs-refuse-let ctx k fname (a form 0) 0 (a form 1) env pidx facts)
+      (let [values (cs-callable-field-values k form)
+            _ (cs-refuse-fields! k form values 0)
+            _ (cs-refuse-operands! ctx k fname form env pidx facts)]
+        (cs-refuse-args ctx k fname form 1 env pidx facts)))
+    0))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refuse-functions [ctx [:ref :ie/ctx] k [:ref :form/r] functions [:ref :form/r] i :i64 facts [:ref :form/r]] :i64
+  (if (>= i (form/count-of functions))
+    0
+    (let [f (form/nth-of functions i)
+          pidx (cs-param-indexes (fget f :params) 0 (empty-fmap))
+          _ (cs-refuse-walk ctx k (fget f :name) (fget f :body) (empty-fmap) pidx facts)]
+      (cs-refuse-functions ctx k functions (+ i 1) facts))))
+   :default nil)
+
+;; ---- the result: the refined functions ----
+#?(:kotoba
+(defn- cs-sorted-insert [xs [:ref :form/r] x [:ref :form/r] i :i64 acc [:list [:ref :form/r]]] [:list [:ref :form/r]]
+  (if (>= i (form/count-of xs))
+    (form/append-form acc x)
+    (if (< (form/int-value x) (form/int-value (form/nth-of xs i)))
+      (form/append-many (form/append-form acc x) (fl-slice (form/kids-of xs) i (form/count-of xs) (form/no-forms)))
+      (cs-sorted-insert xs x (+ i 1) (form/append-form acc (form/nth-of xs i))))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-sorted [xs [:ref :form/r] i :i64 acc [:ref :form/r]] [:ref :form/r]
+  (if (>= i (form/count-of xs))
+    acc
+    (cs-sorted xs (+ i 1) (form/form-vec (cs-sorted-insert acc (form/nth-of xs i) 0 (form/no-forms))))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-index-error [name [:ref :form/r] index [:ref :form/r]] [:ref :fe/err]
+  (fe-reject "closure refinement requires an i64 parameter" "kotoba.error/subset-reject"
+             (fput (fput (empty-fmap) :function name) :parameter-index index)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-check-indexes! [f [:ref :form/r] indexes [:ref :form/r] i :i64] :i64
+  (if (>= i (form/count-of indexes))
+    0
+    (if (form/eq (tk :i64) (form/nth-of (fget f :param-types) (form/int-value (form/nth-of indexes i))))
+      (cs-check-indexes! f indexes (+ i 1))
+      (throw (cs-index-error (fget f :name) (form/nth-of indexes i))))))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-result-error [name [:ref :form/r] result [:ref :form/r]] [:ref :fe/err]
+  (fe-reject "closure refinement requires an i64 result" "kotoba.error/subset-reject"
+             (fput (fput (empty-fmap) :function name) :result result)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-check-result! [f [:ref :form/r] result? :bool] :i64
+  (if (and result? (not (form/eq (tk :i64) (fget f :result))))
+    (throw (cs-result-error (fget f :name) (fget f :result)))
+    0))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refine-function [f [:ref :form/r] facts [:ref :form/r]] [:ref :form/r]
+  (let [fname (fget f :name)
+        indexes (cs-sorted (cs-params-of facts fname) 0 (form/form-vec (form/no-forms)))
+        result? (form/is-true? (fget (cs-entry facts fname) :result?))
+        _ (cs-check-indexes! f indexes 0)
+        _ (cs-check-result! f result?)
+        f1 (if (> (form/count-of indexes) 0) (fput f :closure-param-indexes indexes) f)]
+    (if result? (fput f1 :closure-result? (form/bool-form true)) f1)))
+   :default nil)
+
+#?(:kotoba
+(defn- cs-refine-all [functions [:ref :form/r] i :i64 facts [:ref :form/r] acc [:list [:ref :form/r]]] [:ref :form/r]
+  (if (>= i (form/count-of functions))
+    (form/form-vec acc)
+    (let [g (cs-refine-function (form/nth-of functions i) facts)]
+      (cs-refine-all functions (+ i 1) facts (form/append-form acc g)))))
+   :default nil)
+
+;; Infer checked closure positions without adding a public closure value type. Facts only grow: dispatcher arguments seed the
+;; graph, static calls propagate requirements to callers, and closure-valued results propagate back through aliases and
+;; return positions; the finite function/parameter graph has a deterministic fixed point.
+#?(:kotoba
+(defn infer-closure-refinements [ctx [:ref :ie/ctx] functions [:ref :form/r] lambda-infos [:ref :form/r]] [:ref :form/r]
+  (let [k (fput (fput (fput (fput (empty-fmap) :lambda-ids (cs-ids lambda-infos 0 (form/no-forms))) :names (cs-names functions 0 (cs-set-empty))) :infos lambda-infos) :schemas (ctx-schemas ctx))
+        seed (cs-seed functions 0 (empty-fmap))
+        limit (+ 1 (form/count-of functions) (cs-total-params functions 0 0))
+        facts (cs-fixpoint k functions seed 0 limit)
+        _ (cs-refuse-functions ctx k functions 0 facts)]
+    (cs-refine-all functions 0 facts (form/no-forms))))
+   :default nil)
+

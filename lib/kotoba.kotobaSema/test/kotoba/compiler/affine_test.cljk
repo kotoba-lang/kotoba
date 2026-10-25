@@ -1,0 +1,551 @@
+(ns kotoba.compiler.affine-test
+  "A wrong `true` here silently mutates a value somebody still holds, so most
+  of these assert refusals."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.affine :as aff]
+            [kotoba.sema :as sema]))
+
+(defn- analyze-refusal
+  "nil when `sema/analyze` admits `source`, else the refusal's message."
+  [source]
+  (try (sema/analyze source) nil
+       (catch #?(:clj Throwable :cljs :default) e (ex-message e))))
+
+;; ── the shape a struct of arrays writes ─────────────────────────────────────
+
+(deftest a-threaded-let-is-linear
+  ;; Distinct names: a `let` that binds `v` twice is nested lets, each
+  ;; shadowing the last (ADR 0353 floor :let-rebinding), not one thread.
+  (is (aff/linear-let-thread?
+       '(let [a (vector-new 1 2 3)
+              b (vector-assoc a 0 9)]
+          (vector-at b 0))
+       '[a b])))
+
+(deftest a-longer-thread-is-linear
+  (is (aff/linear-let-thread?
+       '(let [a (vector-new 0 0 0)
+              b (vector-assoc a 0 7)
+              c (vector-assoc b 1 9)]
+          (vector-count c))
+       '[a b c])))
+
+(deftest a-name-read-after-being-consumed-is-not-linear
+  ;; `a` is consumed by `b` and then read again. An in-place store would be
+  ;; visible through a handle somebody still holds.
+  (is (not (aff/linear-let-thread?
+            '(let [a (vector-new 1 2 3)
+                   b (vector-assoc a 0 9)]
+               (+ (vector-at b 0) (vector-at a 0)))
+            '[a b]))))
+
+;; ── the shape Kotoba actually uses ──────────────────────────────────────────
+
+(deftest a-parameter-threaded-through-tail-recursion-is-linear
+  ;; `let` cannot rebind, so a loop threads the handle through a parameter.
+  ;; `v` appears in both arms of the `if` and only one arm runs, so this is
+  ;; ONE use per path -- which the analysis only sees if alternatives are
+  ;; counted as alternatives rather than summed.
+  (is (aff/linear-parameter?
+       '(if (>= i n)
+          (vector-at v 0)
+          (go (vector-assoc v 0 i) (+ i 1) n))
+       'v)))
+
+(deftest two-reads-in-one-arm-are-reads
+  ;; Two reads and no store: nothing an in-place store could be visible to.
+  ;; Refused under the old use COUNT, which was never the safety property.
+  (is (aff/linear-parameter?
+       '(if (>= i n)
+          (+ (vector-at v 0) (vector-at v 1))
+          (go (vector-assoc v 0 i) (+ i 1) n))
+       'v))
+  (testing "a store of a store's RESULT consumes v once -- the outer one
+            writes the fresh value the inner one returned"
+    (is (aff/linear-parameter?
+         '(if (>= i n)
+            (vector-at v 0)
+            (go (vector-assoc (vector-assoc v 0 i) 1 i) (+ i 1) n))
+         'v)))
+  (testing "but two stores of v itself on one path are two"
+    (is (not (aff/linear-parameter?
+              '(if (>= i n)
+                 (vector-at v 0)
+                 (do (vector-assoc! v 0 i) (go (vector-assoc! v 1 i) (+ i 1) n)))
+              'v)))))
+
+(deftest a-read-in-the-test-runs-before-the-arm
+  ;; The test is evaluated before either arm, so a read there sees the value
+  ;; the arm is about to replace -- exactly what a copy would have shown it.
+  (is (aff/linear-parameter?
+       '(if (> (vector-at v 0) n)
+          0
+          (go (vector-assoc v 0 i) (+ i 1) n))
+       'v))
+  (testing "a STORE in the test is seen by a read in the arm, and is refused"
+    (is (not (aff/linear-parameter?
+              '(if (> (vector-at (vector-assoc! v 0 9) 0) n)
+                 (vector-at v 0)
+                 0)
+              'v)))))
+
+;; ── the refusals, one per way a live value could be corrupted ───────────────
+
+(deftest reads-before-the-store-are-admitted
+  ;; The store's own arguments are evaluated before it runs, so a read among
+  ;; them -- at any index -- sees the old value, as a copy would.
+  (testing "a read inside the store's value, at another index"
+    (is (aff/linear? '(vector-assoc! v 0 (vector-at v 1)) 'v)))
+  (testing "reads only"
+    (is (aff/linear? '(+ (vector-at v 0) (vector-at v 1)) 'v)))
+  (testing "several reads bound first, then one store -- what a struct of
+            arrays has to write, and could not"
+    (is (aff/linear? '(let [h (vector-at v 3)
+                            t (vector-at v 4)]
+                        (vector-assoc! v (+ h 1) t))
+                     'v))))
+
+(deftest a-read-after-the-store-is-refused-in-every-order
+  ;; The property the gate exists for. Each shape is one way a read can run
+  ;; after the store through the name that still means the old value.
+  (testing "sequenced by do"
+    (is (not (aff/linear? '(do (vector-assoc! v 0 5) (vector-at v 0)) 'v))))
+  (testing "sequenced by let"
+    (is (not (aff/linear? '(let [w (vector-assoc! v 0 5)] (vector-at v 0)) 'v))))
+  (testing "sibling arguments of one call, whose order is not relied on"
+    (is (not (aff/linear? '(+ (vector-at (vector-assoc! v 0 5) 0) (vector-at v 0)) 'v))))
+  (testing "a store inside the index of a read"
+    (is (not (aff/linear? '(vector-at v (vector-at (vector-assoc! v 0 5) 0)) 'v))))
+  (testing "a store inside the arguments of another store"
+    (is (not (aff/linear? '(vector-assoc! v (vector-at (vector-assoc! v 0 5) 0) 1) 'v)))))
+
+(deftest when-bodies-are-sequences-not-alternatives
+  ;; Measured 2026-09-23 on amu 34bba745, aarch64-macos under kexe_loader:
+  ;;
+  ;;   (defn peek0 [v :vector-i64 c :i64] :i64
+  ;;     (when (= c 1) (vector-assoc! v 0 5) (vector-at v 0)))
+  ;;
+  ;; was admitted and answered 5 for c = 1. With the copying `vector-assoc`
+  ;; it answers 0, and so must any in-place lowering. `when` sat in the set
+  ;; of branching heads, so its two body forms were counted as ALTERNATIVES
+  ;; and the maximum over them was one use.
+  (is (not (aff/linear? '(when (= c 1) (vector-assoc! v 0 5) (vector-at v 0)) 'v)))
+  (is (not (aff/linear? '(when-not (= c 0) (vector-assoc! v 0 5) (vector-at v 0)) 'v)))
+  (is (not (aff/linear? '(when-let [x (f c)] (vector-assoc! v 0 x) (vector-at v 0)) 'v)))
+  (testing "and a store in a one-armed branch is still a store after it"
+    (is (not (aff/linear? '(do (if (= c 1) (vector-assoc! v 0 5)) (vector-at v 0)) 'v)))
+    (is (not (aff/linear? '(do (when (= c 1) (vector-assoc! v 0 5)) (vector-at v 0)) 'v))))
+  (testing "reads then a store inside when is fine"
+    (is (aff/linear? '(when (= c 1) (vector-at v 1) (vector-assoc! v 0 5)) 'v))))
+
+(deftest cond-tests-are-walked-before-any-arm
+  (is (aff/linear? '(cond (> (vector-at v 0) 1) (vector-assoc! v 0 1)
+                          (> (vector-at v 1) 1) (vector-assoc! v 1 1)
+                          :else 0)
+                   'v))
+  (is (not (aff/linear? '(cond (> (vector-at (vector-assoc! v 0 9) 0) 1) 0
+                               (> (vector-at v 1) 1) 1
+                               :else 2)
+                        'v))))
+
+(deftest a-body-that-runs-later-may-not-mention-the-handle
+  ;; A closure can be called after the store; its read would see it.
+  (is (not (aff/linear? '(let [f (fn [] (vector-at v 0))
+                               w (vector-assoc! v 0 5)]
+                           (f))
+                        'v)))
+  (testing "even a store alone, since the closure may run twice"
+    (is (not (aff/linear? '(let [f (fn [] (vector-assoc! v 0 5))] (f)) 'v)))))
+
+(deftest a-loop-may-read-but-not-store
+  (is (aff/linear? '(let [s (loop [k 0 acc 0]
+                              (if (= k 4) acc (recur (+ k 1) (+ acc (vector-at v k)))))]
+                      (vector-assoc! v 0 s))
+                   'v))
+  (is (not (aff/linear? '(loop [k 0]
+                           (if (= k 4) 0 (do (vector-assoc! v k k) (recur (+ k 1)))))
+                        'v))
+      "each iteration would store through a handle the first one spent"))
+
+(deftest a-bare-reference-is-not-linear
+  ;; Returning the handle, or handing it to something that is not a vector
+  ;; operation, puts it somewhere this analysis cannot see.
+  (is (not (aff/linear? 'v 'v)))
+  (is (not (aff/linear? '(some-function v) 'v)))
+  (is (not (aff/linear? '[v] 'v))))
+
+(deftest storing-the-handle-into-itself-is-not-linear
+  ;; `(vector-assoc v 0 v)` is the handle reaching an element slot, where a
+  ;; later in-place write would be visible through a value nobody expected to
+  ;; change.
+  (is (not (aff/linear? '(vector-assoc v 0 v) 'v))))
+
+(deftest a-view-consumes-its-parent
+  ;; `vector-drop` returns a view of a suffix. Treating it as a read would
+  ;; make the one operation that ALIASES the safe one -- a view whose parent
+  ;; is later written in place is a view of something else.
+  (is (contains? aff/consuming 'vector-drop))
+  (is (not (contains? aff/reading 'vector-drop))))
+
+(deftest a-single-binding-is-not-a-thread
+  ;; Nothing to lower in place: no handle is consumed.
+  (is (not (aff/linear-let-thread?
+            '(let [a (vector-new 1 2)] (vector-at a 0)) '[a]))))
+
+(deftest an-escaping-body-refuses-the-whole-thread
+  (is (not (aff/linear-let-thread?
+            '(let [a (vector-new 1 2)
+                   b (vector-assoc a 0 1)]
+               (some-function b))
+            '[a b]))))
+
+(deftest a-read-in-the-consuming-initialiser-is-before-the-store
+  ;; The index is evaluated before the update runs.
+  (is (aff/linear-let-thread?
+       '(let [a (vector-new 1 2)
+              b (vector-assoc a (vector-at a 0) 1)]
+          (vector-count b))
+       '[a b]))
+  (testing "a name read in a LATER initialiser than the one that consumed it"
+    (is (not (aff/linear-let-thread?
+              '(let [a (vector-new 1 2)
+                     b (vector-assoc a 0 1)
+                     x (vector-at a 1)]
+                 (vector-count b))
+              '[a b])))))
+
+;; ── the analysis says nothing about unrelated names ─────────────────────────
+
+(deftest an-unrelated-binding-does-not-make-this-one-non-linear
+  (is (aff/linear-let-thread?
+       '(let [w (vector-new 9)
+              a (vector-new 1 2)
+              b (vector-assoc a 0 1)]
+          (vector-at b 0))
+       '[a b])))
+
+(deftest the-bang-form-consumes-like-the-one-it-replaces
+  ;; It was missing from `consuming`, which made every linear program fail the
+  ;; gate that exists to admit it -- and fail with a message saying the handle
+  ;; was used more than once when it was used exactly once.
+  (is (contains? aff/consuming 'vector-assoc!))
+  (is (aff/linear-parameter?
+       '(if (>= i n)
+          (vector-at v 0)
+          (go (vector-assoc! v 0 i) (+ i 1) n))
+       'v))
+  (is (not (aff/linear-parameter?
+            '(+ (vector-at v 1) (vector-at (vector-assoc! v 0 i) 0))
+            'v))))
+
+;; The gate calls `linear?`, not the two predicates above. Those were tested
+;; in isolation and passed, while `check-affine-writes!` -- the only caller --
+;; consulted neither, so nothing here covered the decision that is actually
+;; made. Measured 2026-09-01: `amu check` refused a correctly threaded
+;; program, naming the handle as "used more than once", because `sym-uses`
+;; counted the `let` BINDER as a use and `position-ok?` read the bare name in
+;; the binding vector as an escape. Two independent reasons, both of which
+;; made every let-bound handle unadmittable. These pin the live path.
+
+(deftest a-let-binder-is-not-a-use-of-the-name
+  (let [form '(do (let [v (vector-alloc 4)
+                        a (vector-assoc! v 0 1)
+                        b (vector-assoc! a 1 2)]
+                    (vector-at b 0)))]
+    (testing "the threaded handles are admitted"
+      (is (aff/linear? form 'v))
+      (is (aff/linear? form 'a)))))
+
+(deftest a-let-bound-handle-written-twice-is-refused
+  (is (not (aff/linear? '(do (let [v (vector-alloc 4)
+                                   a (vector-assoc! v 0 1)
+                                   b (vector-assoc! v 1 2)]
+                               (vector-at b 0)))
+                        'v))))
+
+(deftest a-let-bound-handle-read-after-being-consumed-is-refused
+  (is (not (aff/linear? '(do (let [v (vector-alloc 4)
+                                   a (vector-assoc! v 0 1)]
+                               (vector-at v 0)))
+                        'v))))
+
+(deftest a-let-bound-handle-that-escapes-is-refused
+  ;; Not a vector operation, so the analysis cannot see who keeps it.
+  (is (not (aff/linear? '(do (let [v (vector-alloc 4)
+                                   a (vector-assoc! v 0 1)]
+                               (keeper v)))
+                        'v))))
+
+;; ── fused read-modify-write: `v[k] += delta` has no other expression ───────
+;;
+;; `lvl-qty[k] += qty` (superproject ADR-2609010500; `torihiki.book/slab/add!`,
+;; two call sites) has no expression in Kotoba except
+;; `(vector-assoc! v k (+ (vector-at v k) delta))` -- two separate calls,
+;; which `sym-uses` counted as two uses and `position-ok?` counted as an
+;; escape (the value argument mentions `v`). Both refused it correctly under
+;; the OLD rule, because the old rule could not tell this shape apart from an
+;; unrelated double use. Measured on unmodified `kotoba-sema` (2026-09-01,
+;; before this file's `fused-rmw?`): `kotoba.sema/analyze` on
+;;
+;;     (defn add! [v :vector-i64 k :i64 delta :i64] :vector-i64
+;;       (vector-assoc! v k (+ (vector-at v k) delta)))
+;;
+;; throws `vector-assoc! requires a linear handle: v is used more than once
+;; on some path through add!, or reaches somewhere this cannot see` --
+;; `sema/analyze` is the same entry point `kotoba.sema-test` uses, so this is
+;; the live path, not a hypothetical one.
+
+(deftest a-fused-read-then-write-at-the-same-index-is-one-use
+  (is (aff/linear? '(vector-assoc! v k (+ (vector-at v k) delta)) 'v))
+  (testing "the f64 sibling, since the rule is data-driven off consuming/reading"
+    (is (aff/linear? '(vector-f64-assoc! v k (+ (vector-f64-at v k) delta)) 'v)))
+  (testing "threaded through the tail-recursive parameter shape Kotoba uses"
+    (is (aff/linear-parameter?
+         '(if (>= i n)
+            (vector-at v 0)
+            (go (vector-assoc! v i (+ (vector-at v i) delta)) (+ i 1) n delta))
+         'v))))
+
+(deftest a-read-at-another-index-inside-the-update-is-before-it
+  ;; This was refused on the argument that a store at k1 "could be visible
+  ;; through whatever the read at k2 feeds". It cannot: the read is an
+  ;; argument of the store, evaluated before it, and yields an i64 that holds
+  ;; nothing afterwards. The same program with the copying `vector-assoc`
+  ;; computes the same value.
+  (is (aff/linear? '(vector-assoc! v k1 (+ (vector-at v k2) delta)) 'v))
+  (is (aff/linear? '(vector-assoc! v k (+ (vector-at v k) (vector-count v))) 'v))
+  (testing "the handle itself as a stored value is still an escape"
+    (is (not (aff/linear? '(vector-assoc! v k (+ (vector-at v k) (keep v))) 'v)))))
+
+(deftest a-handle-read-after-a-fused-write-consumed-it-is-still-refused
+  (is (not (aff/linear? '(do (vector-assoc! v k (+ (vector-at v k) delta))
+                             (vector-at v 0))
+                        'v))))
+
+(deftest two-fused-writes-on-one-path-are-still-two-uses
+  ;; Each call is individually fused -- one use each -- but a path that runs
+  ;; both is two uses of the same live handle, which is exactly what the
+  ;; gate exists to refuse: the second write is unaware the first happened.
+  (is (not (aff/linear? '(do (vector-assoc! v k1 (+ (vector-at v k1) d1))
+                             (vector-assoc! v k2 (+ (vector-at v k2) d2)))
+                        'v))))
+
+(deftest the-index-argument-cannot-itself-be-the-handle
+  ;; Degenerate self-index: `fused-read-in-value` alone would not catch this,
+  ;; because the extra occurrence of `v` is in the OUTER form's index
+  ;; position, not inside the value expression it inspects.
+  (is (not (aff/linear? '(vector-assoc! v v (+ (vector-at v v) delta)) 'v))))
+
+(deftest a-fused-call-is-not-mistaken-for-a-plain-assoc-when-the-value-is-not-a-call
+  ;; `(vector-assoc! v 0 i)` -- the existing bang-form shape, value is a bare
+  ;; symbol, not a compound read+op expression. `fused-rmw?` must fall
+  ;; through to the plain count (which already admits this) rather than
+  ;; misfire on it.
+  (is (aff/linear-parameter?
+       '(if (>= i n)
+          (vector-at v 0)
+          (go (vector-assoc! v 0 i) (+ i 1) n))
+       'v)))
+
+;; Provenance. `linear?` asked how many times a name is used and where, and
+;; not where its value came from -- so a handle fetched out of an aggregate
+;; counted as one use, in vector-operation position, and was admitted while
+;; the aggregate still held it. Measured 2026-09-01 on amu 0bf63c94: a record
+;; with two vector-i64 fields, one fetched with record-get, written with
+;; vector-assoc!, and the SAME field read from the record again, compiled and
+;; returned 7 rather than 0. The store was visible to a reader that never
+;; asked for it, which is the one thing the bang promises cannot happen.
+
+(deftest a-handle-fetched-out-of-a-record-is-not-dead
+  (is (not (aff/linear? '(do (let [b (record T (vector-alloc 4))
+                                   v (record-get T b :bids)
+                                   w (vector-assoc! v 0 7)]
+                               (vector-at w 0)))
+                        'v))))
+
+(deftest a-handle-returned-by-an-unknown-call-is-not-dead
+  ;; Fail closed: this analysis cannot see who else the callee handed it to.
+  (is (not (aff/linear? '(do (let [v (make-slab 4)
+                                   a (vector-assoc! v 0 7)]
+                               (vector-at a 0)))
+                        'v))))
+
+(deftest a-handle-the-binding-owns-is-still-linear
+  ;; The producing heads must keep working, or this fix would close the gate
+  ;; on every program it exists to admit -- which is how it was broken before.
+  (testing "vector-alloc"
+    (is (aff/linear? '(do (let [v (vector-alloc 4)
+                                a (vector-assoc! v 0 7)]
+                            (vector-at a 0)))
+                     'v)))
+  (testing "vector-new"
+    (is (aff/linear? '(do (let [v (vector-new 1 2 3)
+                                a (vector-assoc! v 0 9)]
+                            (vector-at a 0)))
+                     'v)))
+  (testing "a consuming update, which owns what it returns"
+    (is (aff/linear? '(do (let [v (vector-alloc 4)
+                                a (vector-assoc! v 0 1)
+                                b (vector-assoc! a 1 2)]
+                            (vector-at b 0)))
+                     'a))))
+
+;; ── the accumulator a helper builds and hands back ──────────────────────────
+;;
+;; `linear?` refuses a returned handle, correctly: the caller can hold it. That
+;; single refusal is what makes every accumulator loop copy, and the cost is
+;; not marginal -- measured 2026-09-08 on aarch64, the same 3000-iteration
+;; loop takes 3001 vector handles and 48,016 arena items copying and 1 handle
+;; and 16 items in place.
+;;
+;; `module-linear-returning` admits it, and only ever as a PAIR of
+;; obligations: the callee lets the handle escape nowhere but its return, and
+;; every caller gives it up at the call. Each half alone is unsound, so each
+;; half is asserted alone below.
+
+(def ^:private accumulator-module
+  "The shape `x25519.field/mul` has: an inner loop, an outer loop, and an
+  owner that allocates the accumulator and reads a value out of it."
+  [{:name 'inner :params '[x y i j t]
+    :body ['(if (>= j 16)
+              t
+              (inner x y i (+ j 1)
+                     (vector-assoc! t (+ i j) (+ (vector-at t (+ i j)) 1))))]}
+   {:name 'outer :params '[x y i t]
+    :body ['(if (>= i 16) t (outer x y (+ i 1) (inner x y i 0 t)))]}
+   {:name 'mul :params '[x y]
+    :body ['(let [t (vector-alloc 31)
+                  u (outer x y 0 t)]
+              (vector-at u 0))]}])
+
+(deftest an-accumulator-threaded-through-helpers-is-linear-returning
+  (let [proved (aff/module-linear-returning accumulator-module)]
+    (is (contains? proved '[inner 4]))
+    (is (contains? proved '[outer 3])
+        "the obligation is handed on: outer returns the handle too, and its
+         own caller gives it up")
+    (testing "and nothing else is claimed -- the read-only inputs are not
+              linear, because they are read many times"
+      (is (not (contains? proved '[inner 0])))
+      (is (not (contains? proved '[mul 0]))))))
+
+(deftest the-caller-must-give-the-handle-up
+  ;; The callee half alone. `inner` is impeccable in isolation -- one use, in
+  ;; vector-operation position, returned -- and admitting it on that basis
+  ;; would let `caller` read a value the callee had already overwritten. The
+  ;; bang gate cannot catch this: `caller` writes no bang.
+  (is (empty?
+       (aff/module-linear-returning
+        [{:name 'inner :params '[t]
+          :body ['(vector-assoc! t 0 (+ (vector-at t 0) 1))]}
+         {:name 'caller :params []
+          :body ['(let [t (vector-alloc 4)
+                        u (inner t)]
+                    (+ (vector-at u 0) (vector-at t 0)))]}]))))
+
+(deftest a-callee-that-keeps-the-handle-is-not-linear-returning
+  ;; The caller half alone. `caller` is impeccable -- it hands the handle over
+  ;; and never looks at it again -- and the callee stores it where this
+  ;; analysis cannot follow.
+  (is (empty?
+       (aff/module-linear-returning
+        [{:name 'stash :params '[t]
+          :body ['(record-new [:record :box [[:v :vector-i64]]] t)]}
+         {:name 'caller :params []
+          :body ['(let [t (vector-alloc 4)] (stash t))]}]))))
+
+(deftest returning-is-not-a-licence-to-use-it-twice
+  (testing "a read in the test, then a store or the return: one consume per path"
+    (is (= #{'[twice 0]}
+           (aff/module-linear-returning
+            [{:name 'twice :params '[t]
+              :body ['(if (< (vector-at t 0) 0)
+                        (vector-assoc! t 0 1)
+                        t)]}
+             {:name 'caller :params []
+              :body ['(let [t (vector-alloc 4)] (vector-at (twice t) 0))]}]))))
+  (testing "a store and then the return is a second use of a spent handle"
+    (is (empty?
+         (aff/module-linear-returning
+          [{:name 'twice :params '[t]
+            :body ['(do (vector-assoc! t 0 1) t)]}
+           {:name 'caller :params []
+            :body ['(let [t (vector-alloc 4)] (vector-at (twice t) 0))]}])))))
+
+(deftest linear-returning-is-off-unless-a-module-proves-it
+  ;; `linear?` is what the frontend has always called, and a call to a user
+  ;; function is an escape to it. This is the assertion that a program which
+  ;; compiled yesterday still compiles: the extension is opt-in through
+  ;; `*linear-returning*`, and empty is the default.
+  (is (not (aff/linear? '(do (if (>= j 16) t (inner x y i 0 t))) 't)))
+  (is (aff/linear-returning? '(do (if (>= j 16) t (vector-assoc! t 0 1))) 't)))
+
+;; ── threads are expanded before anything is counted ─────────────────────────
+;;
+;; Measured 2026-09-23 (amu, kotoba-sema 3fdaefb6, aarch64-macos, kexe_loader):
+;; `(let [w (-> v (vector-assoc! 0 5))] (+ (vector-at w 0) (vector-at v 0)))`
+;; was admitted and answered 10; `vector-assoc` answers 5. The gate read the
+;; source as written, so the threaded handle `v` was never a target, and the
+;; literal 0 in the step was taken for one.
+
+(deftest threads-expand-to-what-they-mean
+  (is (= '(vector-assoc! (vector-assoc! v 0 5) 1 6)
+         (aff/expand-threads '(-> v (vector-assoc! 0 5) (vector-assoc! 1 6)))))
+  (is (= '(f 1 (g 2 v))
+         (aff/expand-threads '(->> v (g 2) (f 1)))))
+  (testing "as-> the way the frontend's desugar-as-thread writes it"
+    (is (= '(let [x (let [x v] (vector-assoc! x 0 1))] (vector-at x 0))
+           (aff/expand-threads '(as-> v x (vector-assoc! x 0 1) (vector-at x 0))))))
+  (testing "a form with no thread is returned as is, not rebuilt"
+    (let [form '(typed-map-count [:map :i64 :i64] {0 0 1 1})]
+      (is (identical? form (aff/expand-threads form)))))
+  (testing "nested, and inside other forms"
+    (is (= '(let [w (vector-assoc! v 0 5)] w)
+           (aff/expand-threads '(let [w (-> v (vector-assoc! 0 5))] w))))))
+
+(deftest a-read-after-a-threaded-store-is-refused
+  (is (not (aff/linear? (aff/expand-threads
+                         '(let [w (-> v (vector-assoc! 0 5))]
+                            (+ (vector-at w 0) (vector-at v 0))))
+                        'v)))
+  (testing "end to end, through the frontend"
+    (is (re-find #"requires a linear handle"
+                 (str (analyze-refusal
+                       "(defn peek0 [v :vector-i64] :i64
+                          (let [w (-> v (vector-assoc! 0 5))]
+                            (+ (vector-at w 0) (vector-at v 0))))
+                        (defn main [] 0)")))))
+  (testing "and the threaded store with nothing after it is admitted"
+    (is (nil? (analyze-refusal
+               "(defn put [v :vector-i64 k :i64 x :i64] :vector-i64
+                  (let [old (vector-at v k)]
+                    (-> v (vector-assoc! k (+ old x)) (vector-assoc! 0 old))))
+                (defn main [] 0)")))))
+
+(deftest a-local-in-a-threaded-step-is-not-taken-for-a-handle
+  ;; `(vector-assoc! slot 5)` inside `->` writes the threaded value at index
+  ;; `slot`; `slot` read elsewhere was refused as a handle used twice.
+  (is (nil? (analyze-refusal
+             "(defn put [v :vector-i64 slot :i64] :vector-i64
+                (let [old (vector-at v slot)]
+                  (-> v (vector-assoc! slot (+ old 1)) (vector-assoc! (+ slot 1) slot))))
+              (defn main [] 0)"))))
+
+(deftest a-store-inside-cond-thread-is-refused-not-guessed
+  (is (some? (aff/unanalysable-thread '(cond-> v c (vector-assoc! 0 5)))))
+  (is (nil? (aff/unanalysable-thread '(cond-> x c (+ 1)))))
+  (is (re-find #"cannot be checked for linearity"
+               (str (analyze-refusal
+                     "(defn f [v :vector-i64 c :i64] :vector-i64
+                        (cond-> v (= c 1) (vector-assoc! 0 5)))
+                      (defn main [] 0)")))))
+
+(deftest the-f64-store-is-checked-too
+  ;; `in-place-targets` listed only `vector-assoc!`, so a `vector-f64-assoc!`
+  ;; handle was never a target and nothing about it was checked.
+  (is (re-find #"requires a linear handle"
+               (str (analyze-refusal
+                     "(defn f [v :vector-f64] :f64
+                        (let [w (vector-f64-assoc! v 0 1.5)]
+                          (vector-f64-at v 0)))
+                      (defn main [] 0)")))))

@@ -1,0 +1,260 @@
+(ns kotoba.compiler.reader-metadata-test
+  "`^meta` reads, and `^:private` on a `defn` name means what `defn-` means.
+
+  Measured 2026-09-11 at 8b28804 through `kotoba.sema/analyze`. The source
+  reader (`kotoba.compiler.kotoba-reader/read-form`) had no arm for `^`, and
+  `^` is not a delimiter, so `^:private` fell through to
+  `read-symbol-or-number` and was read as the SYMBOL `^:private`. Every
+  element after the head shifted by two:
+
+      (defn ^:private h [x :i64] :i64 x)        function parameters must be a vector   :form h
+      (defn ^{:private true} h [x :i64] :i64 x) function parameters must be a vector   :form {:private true}
+      (def k ^:no-doc 1)                        constant must contain exactly one literal value
+      (defrecord ^:no-doc Sq [side])            defrecord requires a bounded name and field vector
+      (defprotocol ^:no-doc IP (area [this]))   defprotocol requires unique bounded (method [this ...]) signatures
+      (defrecord Sq [^:no-doc side])            admitted -- as a TWO-field record, `^:no-doc` and `side`
+      (defn- h [x :i64] :i64 x)                 admitted (the supported private spelling)
+
+  Each refusal is a true sentence about what the reader handed over and a
+  false one about the author's source.
+
+  Two decisions this suite pins, both taken to match Clojure as measured on
+  1.12 rather than as remembered:
+
+  - metadata before a form that cannot carry it (keyword, number, string,
+    nil, boolean) is REFUSED in `:phase :read`, not dropped. So the third
+    probe above, `(def k ^:no-doc 1)`, is still refused -- now for the true
+    reason, with the metadata on the name (`(def ^:no-doc k 1)`) admitted.
+    Dropping would be worse than either: `^:private` on the wrong element
+    would compile as public.
+  - stacked metadata merges with the OUTERMOST (leftmost) form winning a
+    shared key: `(meta '^{:a 1} ^{:a 2} x)` is `{:a 1}` on Clojure 1.12,
+    because the inner form is read first and the outer map is assoc'd over
+    it.
+
+  Every admission here is paired with the check it used to trip still
+  firing on what it is for, and privacy is proved by the export refusal --
+  parsing `^:private` is not honouring it."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [kotoba.compiler.kotoba-reader :as kr]
+            [kotoba.sema :as sema]))
+
+(defn- outcome
+  "nil when SOURCE is admitted, else {:message :code :span :phase :cause}.
+  `:cause` is the message of the wrapped reader refusal, when there is one:
+  `frontend/read-forms` rethrows every reader error as `source reader
+  rejected input` with the reader's own ex-info as the cause, so the
+  read-phase sentence is only observable there."
+  [source]
+  (try (do (sema/analyze source) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e)
+          :code (:kotoba.error/code (ex-data e))
+          :span (:span (ex-data e))
+          :phase (:phase (ex-data e))
+          :cause (some-> (ex-cause e) ex-message)})))
+
+(defn- exports
+  "The export vector `analyze` produced for an admitted SOURCE."
+  [source]
+  (:exports (sema/analyze source)))
+
+(defn- read-outcome
+  "nil when SOURCE reads, else {:message :phase} from the reader itself."
+  [source]
+  (try (do (kr/read-forms source) nil)
+       (catch #?(:clj Throwable :cljs :default) e
+         {:message (ex-message e) :phase (:phase (ex-data e))})))
+
+(def ^:private main "(defn main [] 0)")
+
+(defn- unit [declaration] (str "(ns probe.p)\n" declaration "\n" main "\n"))
+
+(def ^:private cannot-carry
+  "metadata may only precede a symbol or a collection")
+
+;; --- 1. the reader: what `^` produces ---------------------------------------
+
+(deftest metadata-normalises-like-clojure
+  (testing "^:kw is {:kw true}"
+    (is (= true (:a (meta (first (kr/read-forms "^:a x")))))))
+  (testing "^sym is {:tag sym}"
+    (is (= 'String (:tag (meta (first (kr/read-forms "^String x")))))))
+  (testing "^\"str\" is {:tag \"str\"}"
+    (is (= "s" (:tag (meta (first (kr/read-forms "^\"s\" x")))))))
+  (testing "^{...} is the map"
+    (let [m (meta (first (kr/read-forms "^{:private true :doc \"d\"} x")))]
+      (is (= true (:private m)))
+      (is (= "d" (:doc m)))))
+  (testing "the form itself is unchanged -- a symbol is still that symbol"
+    (is (= 'x (first (kr/read-forms "^:a x"))))
+    (is (= '(f y) (first (kr/read-forms "^:a (f y)"))))
+    ;; an integer literal is a BigInt on nbb, so count the vector rather
+    ;; than compare it
+    (let [v (first (kr/read-forms "^:a [1 2]"))]
+      (is (vector? v))
+      (is (= 2 (count v))))))
+
+(deftest stacked-metadata-merges-outermost-wins
+  (testing "distinct keys accumulate"
+    (let [m (meta (first (kr/read-forms "^:a ^:b x")))]
+      (is (= true (:a m)))
+      (is (= true (:b m)))))
+  (testing "a shared key takes the OUTER (leftmost) value, as Clojure 1.12 does"
+    (is (= :outer (:a (meta (first (kr/read-forms "^{:a :outer} ^{:a :inner} x"))))))))
+
+(deftest metadata-merges-with-source-location-not-over-it
+  ;; `located` adds :line/:column/:offset/:end-offset. If either side
+  ;; replaced the other's map, one of the two sets of keys would be gone.
+  (let [m (meta (first (kr/read-forms "^:private h")))]
+    (is (= true (:private m)))
+    (is (= 1 (:line m)))
+    (is (= 1 (:column m)) "the span starts at the `^`, as Clojure's does")
+    (is (= 0 (:offset m)))
+    (is (= 11 (:end-offset m)) "and ends at the end of the form")))
+
+(deftest metadata-before-a-form-that-cannot-carry-it-is-refused
+  ;; Not dropped. The literal is pinned: a caller who writes `^:private 1`
+  ;; is told the one sentence that names the rule.
+  (doseq [source ["^:a 1" "^:a :kw" "^:a \"s\"" "^:a nil" "^:a true" "^:a 1.5"]]
+    (let [r (read-outcome source)]
+      (is (= cannot-carry (:message r)) source)
+      (is (= :read (:phase r)) source)))
+  (testing "and the metadata form itself must be one of the four shapes"
+    (let [r (read-outcome "^1 x")]
+      (is (= "metadata must be a keyword, symbol, string, or map" (:message r)))
+      (is (= :read (:phase r)))))
+  (testing "a reader conditional that selects nothing leaves nothing to attach to"
+    (is (= "metadata must precede a form" (:message (read-outcome "^:a #?(:clj x)")))))
+  (testing "and `^` at the end of input is the end of input"
+    (is (= "unexpected end of input" (:message (read-outcome "^"))))))
+
+;; --- 2. the five refused forms are admitted; the two controls still are ---
+
+(deftest the-shifted-declarations-are-admitted
+  (testing "the negative control for the shift: no longer `function parameters must be a vector`"
+    (let [r (outcome (unit "(defn ^:private h [x :i64] :i64 x)"))]
+      (is (nil? r) (pr-str r))
+      (is (not= "function parameters must be a vector" (:message r)))))
+  (testing "map-form metadata on a defn name"
+    (is (nil? (outcome (unit "(defn ^{:private true} h [x :i64] :i64 x)")))))
+  (testing "metadata on a def NAME"
+    (is (nil? (outcome (unit "(def ^:no-doc k 1)")))))
+  (testing "metadata on a defrecord name"
+    (is (nil? (outcome (unit "(defrecord ^:no-doc Sq [side])")))))
+  (testing "metadata on a defprotocol name"
+    (is (nil? (outcome (unit "(defprotocol ^:no-doc IP (area [this]))")))))
+  (testing "metadata on a record field, which was admitted before as a two-field record"
+    (is (nil? (outcome (unit "(defrecord Sq [^:no-doc side])"))))
+    ;; The proof that it is now ONE field: a constructor call with one
+    ;; argument is admitted and one with two is not.
+    (is (nil? (outcome (str "(ns probe.p)\n(defrecord Sq [^:no-doc side])\n"
+                            "(defn main [] (:side (->Sq 1)))\n"))))
+    (is (some? (outcome (str "(ns probe.p)\n(defrecord Sq [^:no-doc side])\n"
+                             "(defn main [] (:side (->Sq 1 2)))\n")))))
+  (testing "the supported private spelling is unchanged"
+    (is (nil? (outcome (unit "(defn- h [x :i64] :i64 x)"))))))
+
+(deftest the-third-probe-as-written-is-refused-for-the-true-reason
+  ;; `(def k ^:no-doc 1)` puts metadata on a number. It was refused with
+  ;; `constant must contain exactly one literal value` (a sentence about
+  ;; the shifted arity); it is refused now in the read phase, by name.
+  (let [r (outcome (unit "(def k ^:no-doc 1)"))]
+    (is (= :read (:phase r)))
+    (is (= cannot-carry (:cause r)))))
+
+(deftest what-the-checks-are-for-still-fires
+  (testing "parameters that are not a vector"
+    (let [r (outcome (unit "(defn ^:private h x :i64 x)"))]
+      (is (= "function parameters must be a vector" (:message r)))))
+  (testing "a def with two values"
+    (is (= "constant must contain exactly one literal value"
+           (:message (outcome (unit "(def ^:no-doc k 1 2)"))))))
+  (testing "a defrecord without a field vector"
+    (is (= :kotoba.error/record-declaration
+           (:code (outcome (unit "(defrecord ^:no-doc Sq side)"))))))
+  (testing "a defprotocol with a malformed signature"
+    (is (= :kotoba.error/protocol-declaration
+           (:code (outcome (unit "(defprotocol ^:no-doc IP (area this))")))))))
+
+;; --- 3. `^:private` is `defn-` ---------------------------------------------
+
+(deftest a-private-defn-is-not-public
+  (testing "it is not in the implicit export set"
+    (is (= '[main] (exports (unit "(defn ^:private h [x :i64] :i64 x)"))))
+    (is (= '[main] (exports (unit "(defn- h [x :i64] :i64 x)"))) "the control")
+    (is (= '[h main] (exports (unit "(defn h [x :i64] :i64 x)"))) "and the public control"))
+  (testing "exporting it explicitly is refused, on the same path as defn-"
+    (let [private (outcome (str "(ns probe.p (:export [h main]))\n"
+                                "(defn ^:private h [x :i64] :i64 x)\n" main "\n"))
+          dash (outcome (str "(ns probe.p (:export [h main]))\n"
+                             "(defn- h [x :i64] :i64 x)\n" main "\n"))]
+      (is (= :kotoba.error/export-names-private-function (:code private)))
+      (is (= :kotoba.error/export-names-private-function (:code dash)))
+      (is (= (str "namespace exports must name declared public functions: h is "
+                  "declared with ^:private, which is private; drop the ^:private "
+                  "metadata to export it")
+             (:message private)))
+      (is (str/includes? (:message dash) "declared with defn-")
+          "the defn- sentence names its own fix")))
+  (testing "^{:private true} and ^:private behave identically"
+    (is (= (exports (unit "(defn ^:private h [x :i64] :i64 x)"))
+           (exports (unit "(defn ^{:private true} h [x :i64] :i64 x)"))))
+    (is (= :kotoba.error/export-names-private-function
+           (:code (outcome (str "(ns probe.p (:export [h main]))\n"
+                                "(defn ^{:private true} h [x :i64] :i64 x)\n" main "\n"))))))
+  (testing "stacked metadata still carries :private"
+    (is (= '[main] (exports (unit "(defn ^:no-doc ^:private h [x :i64] :i64 x)"))))
+    (is (= '[main] (exports (unit "(defn ^:private ^:no-doc h [x :i64] :i64 x)")))))
+  (testing "^{:private false} is public -- the value is read, not the key's presence"
+    (is (= '[h main] (exports (unit "(defn ^{:private false} h [x :i64] :i64 x)"))))))
+
+(deftest a-private-defn-can-still-be-called-in-its-module
+  ;; Privacy is about export, not existence.
+  (is (nil? (outcome (str "(ns probe.p)\n(defn ^:private h [x :i64] :i64 x)\n"
+                          "(defn main [] (h 1))\n"))))
+  (testing "and the call is checked like any other -- the name resolved to the function"
+    (is (= :kotoba.error/call-arity
+           (:code (outcome (str "(ns probe.p)\n(defn ^:private h [x :i64] :i64 x)\n"
+                                "(defn main [] (h 1 2))\n")))))))
+
+(deftest other-metadata-is-documentation
+  ;; Nothing in the analyzer reads these keys; the declarations compile as
+  ;; if the metadata were not there, and stay public.
+  (is (= '[h main] (exports (unit "(defn ^:no-doc h [x :i64] :i64 x)"))))
+  (is (= '[h main] (exports (unit "(defn ^:deprecated h [x :i64] :i64 x)"))))
+  (is (= '[h main] (exports (unit "(defn ^{:added \"1.0\" :arbitrary 42} h [x :i64] :i64 x)"))))
+  (is (= '[h main] (exports (unit "(defn ^i64 h [x :i64] :i64 x)")))))
+
+(deftest def-has-no-privacy-to-honour
+  ;; A `def` constant is never exportable (`:kotoba.error/export-names-constant`
+  ;; refuses the attempt), so there is no public/private notion for
+  ;; `^:private` to change. It is admitted and ignored, and the constant is
+  ;; still usable.
+  (is (nil? (outcome (str "(ns probe.p)\n(def ^:private k 1)\n"
+                          "(defn main [] k)\n"))))
+  (is (= :kotoba.error/export-names-constant
+         (:code (outcome (str "(ns probe.p (:export [k main]))\n(def ^:private k 1)\n"
+                              main "\n"))))))
+
+;; --- 4. spans survive the metadata -----------------------------------------
+
+(deftest a-refusal-inside-a-private-function-still-has-a-span
+  (let [r (outcome (str "(ns probe.p)\n(defn ^:private h [x :i64] :i64 (undefined-thing x))\n"
+                        main "\n"))]
+    (is (= :kotoba.error/unknown-operation (:code r)))
+    (is (map? (:span r)) (pr-str r))
+    (is (= 2 (:line (:span r))))))
+
+(deftest a-refusal-pointed-at-the-annotated-name-still-has-a-span
+  ;; This is the assertion that distinguishes merging from clobbering. The
+  ;; refusal below is raised ON the name symbol, so its span comes from the
+  ;; metadata that symbol carries -- the same map `^:private` was merged
+  ;; into. If the `^` arm replaced the reader's location keys with the
+  ;; user's map, this refusal would have no span at all.
+  (let [r (outcome (unit "(defn ^:private h$arity$1 [x :i64] :i64 x)"))]
+    (is (= "function name uses reserved multi-arity ABI marker" (:message r)))
+    (is (map? (:span r)) (pr-str r))
+    (is (= 2 (:line (:span r))))
+    (is (= 7 (:column (:span r))) "the span starts at the `^`")))
