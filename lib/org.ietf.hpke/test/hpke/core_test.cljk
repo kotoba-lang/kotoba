@@ -1,0 +1,159 @@
+(ns hpke.core-test
+  "## Where these vectors come from, precisely
+
+  `ikmE` is **RFC 9180 Appendix A.2's**, and `ikmR` is **A.1's**. Both derive
+  to the public keys those sections publish, and the suite asserts exactly
+  that — which is real RFC anchoring for `DeriveKeyPair`, the one function
+  where a wrong answer would be silent.
+
+  The pairing of an A.2 ephemeral with an A.1 recipient is not a published
+  combination, so the ciphertexts and exports below are **BouncyCastle
+  1.78.1's**, produced before this implementation was written.
+
+  That mixture is stated rather than smoothed over: an earlier draft of this
+  file claimed the whole set was A.2 verbatim, and it was not. The recalled
+  `ikmR` turned out to be A.1's, which the `pkRm` assertion caught."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [hpke.core :as hpke]
+            [hpke.dhkem :as dhkem]
+            [hpke.kdf :as kdf]))
+
+(defn- h [s] (hpke/unhex s))
+
+(def ikm-e (h "909a9b35d3dc4713a5e72a4da274b55d3d3821a37e5d099e74a647db583a904b"))
+(def ikm-r (h "6db9df30aa07dd42ee5e8181afdb977e538f5e1fec8a06223f33f7013e525037"))
+(def info (h "4f6465206f6e2061204772656369616e2055726e"))
+
+(def kp-e (delay (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm-e)))
+(def kp-r (delay (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm-r)))
+
+;; ── DeriveKeyPair, against the RFC's published keys ──────────────────────────
+
+(deftest derive-key-pair-matches-the-rfc
+  (testing "RFC 9180 A.2's ikmE derives A.2's published ephemeral key"
+    (is (= "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a"
+           (hpke/hex (:public @kp-e))))
+    (is (= "f4ec9b33b792c372c1d2c2063507b684ef925b8c75a42dbcbf57d63ccd381600"
+           (hpke/hex (:private @kp-e)))))
+  (testing "RFC 9180 A.1's ikmR derives A.1's published recipient key"
+    (is (= "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d"
+           (hpke/hex (:public @kp-r))))
+    (is (= "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8"
+           (hpke/hex (:private @kp-r))))))
+
+;; ── the whole exchange, against BouncyCastle's answers ───────────────────────
+
+(def ^:private pt (h "4265617574792069732074727574682c20747275746820626561757479"))
+
+(deftest base-mode-known-answers
+  (let [s (hpke/setup-base-sender (:public @kp-r) info @kp-e)]
+    (is (= :ok (:status s)))
+    (is (= "1afa08d3dec047a643885163f1180476fa7ddb54c6a8029ea33f95796bf2ac4a"
+           (hpke/hex (:enc s)))
+        "the encapsulation is the ephemeral public key")
+    (testing "three sequential messages, each with its own nonce"
+      (let [expected ["2126982b65cc7b6a5e35bbf612c044cd0d58a80c9bd3c823d1b3425cf9aad94c16782648257a46cc5182234861"
+                      "6e2f9c922fc04ae0efe097746575b89d280b8a5a15d78846c2da9df029dc11bad4a0c14073325a8c1667f0c9b8"
+                      "a04b05f7fc6ee420504366f7e4c547ea073472e7dc3fc7f16530b899bdd49456c2094d172cc4c3edea46572617"]]
+        (loop [ctx (:context s) i 0]
+          (when (< i 3)
+            (let [r (hpke/seal ctx (h (nth ["436f756e742d30" "436f756e742d31" "436f756e742d32"] i)) pt)]
+              (is (= (nth expected i) (hpke/hex (:bytes r))) (str "seq " i))
+              (recur (:context r) (inc i)))))))
+    (testing "and the exporter"
+      (is (= "3930ab6c08b71ce2567e19a25c945b166dbfd2d404027783c9d99962eccffeff"
+             (hpke/hex (hpke/export (:context s) [] 32))))
+      (is (= "8ed04a3f16c7541a83cfd395cf5df47b12090584dfd46558fea07e19cd64af1d"
+             (hpke/hex (hpke/export (:context s) (h "00") 32))))
+      (is (= "fad62a714c6cf547c819f595b29101b626de906fd483bbcf0e5eea1484a67b3c"
+             (hpke/hex (hpke/export (:context s) (h "54657374436f6e74657874") 32)))))))
+
+;; ── the round trip ───────────────────────────────────────────────────────────
+
+(deftest sender-and-recipient-agree
+  (let [s (hpke/setup-base-sender (:public @kp-r) info @kp-e)
+        r (hpke/setup-base-recipient (:enc s) @kp-r info)]
+    (is (= :ok (:status r)))
+    (testing "the two derive the same key schedule"
+      (is (= (hpke/hex (:key (:context s))) (hpke/hex (:key (:context r)))))
+      (is (= (hpke/hex (:base-nonce (:context s))) (hpke/hex (:base-nonce (:context r)))))
+      (is (= (hpke/hex (:exporter-secret (:context s)))
+             (hpke/hex (:exporter-secret (:context r))))))
+    (testing "and a stream of messages round-trips in order"
+      (loop [sc (:context s) rc (:context r) i 0]
+        (when (< i 5)
+          (let [msg (mapv #(mod (* (inc i) (inc %)) 251) (range (* 7 i)))
+                aad (mapv #(+ i %) (range 3))
+                sealed (hpke/seal sc aad msg)
+                opened (hpke/open rc aad (:bytes sealed))]
+            (is (= :ok (:status opened)) (str "message " i))
+            (is (= msg (:bytes opened)))
+            (recur (:context sealed) (:context opened) (inc i))))))))
+
+(deftest the-context-is-a-value
+  ;; seal/open return a NEW context. A mutable counter shared by two callers
+  ;; is how a nonce gets reused, and the AEAD underneath is a stream cipher.
+  (let [s (hpke/setup-base-sender (:public @kp-r) info @kp-e)
+        c0 (:context s)
+        a (hpke/seal c0 [] [1 2 3])
+        b (hpke/seal c0 [] [1 2 3])]
+    (is (= 0 (:seq c0)) "the original is unchanged")
+    (is (= 1 (:seq (:context a))))
+    (is (= (hpke/hex (:bytes a)) (hpke/hex (:bytes b)))
+        "reusing a context reproduces the same ciphertext -- which is exactly
+         the nonce reuse a value type makes visible rather than prevents")))
+
+;; ── failures ─────────────────────────────────────────────────────────────────
+
+(deftest failures
+  (let [s (hpke/setup-base-sender (:public @kp-r) info @kp-e)
+        sealed (hpke/seal (:context s) (h "aabb") pt)]
+    (testing "a wrong info gives a different key schedule, so open fails"
+      (let [r (hpke/setup-base-recipient (:enc s) @kp-r (h "00"))]
+        (is (= :authentication-failed
+               (:reason (hpke/open (:context r) (h "aabb") (:bytes sealed)))))))
+    (testing "a wrong aad fails"
+      (let [r (hpke/setup-base-recipient (:enc s) @kp-r info)]
+        (is (= :authentication-failed
+               (:reason (hpke/open (:context r) (h "aacc") (:bytes sealed)))))))
+    (testing "opening out of order fails, because the nonce is the sequence number"
+      (let [r (hpke/setup-base-recipient (:enc s) @kp-r info)
+            r1 (hpke/open (:context r) (h "aabb") (:bytes sealed))]
+        (is (= :ok (:status r1)))
+        (is (= :authentication-failed
+               (:reason (hpke/open (:context r1) (h "aabb") (:bytes sealed)))))))
+    (testing "a failed open does NOT advance the sequence number"
+      (let [r (hpke/setup-base-recipient (:enc s) @kp-r info)
+            bad (hpke/open (:context r) (h "ffff") (:bytes sealed))]
+        (is (= :authentication-failed (:reason bad)))
+        (is (nil? (:context bad)))
+        (is (= :ok (:status (hpke/open (:context r) (h "aabb") (:bytes sealed))))
+            "the original context still opens the message"))))
+  (testing "a malformed encapsulation is refused by length"
+    (is (= :bad-encapsulation-length
+           (:reason (hpke/setup-base-recipient (vec (repeat 31 0)) @kp-r info)))))
+  (testing "a low-order encapsulation is refused, not silently accepted"
+    (is (= :non-contributory-dh
+           (:reason (hpke/setup-base-recipient (vec (repeat 32 0)) @kp-r info))))))
+
+;; ── the KDF underneath ───────────────────────────────────────────────────────
+
+(deftest hkdf-rfc-5869
+  (testing "RFC 5869 Appendix A.1 -- basic SHA-256"
+    (let [prk (kdf/extract kdf/hkdf-sha256 (h "000102030405060708090a0b0c") (h "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"))]
+      (is (= "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5"
+             (hpke/hex prk)))
+      (is (= (str "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                  "34007208d5b887185865")
+             (hpke/hex (kdf/expand! kdf/hkdf-sha256 prk (h "f0f1f2f3f4f5f6f7f8f9") 42))))))
+  (testing "RFC 5869 A.3 -- zero-length salt and info"
+    (let [prk (kdf/extract kdf/hkdf-sha256 [] (h "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"))]
+      (is (= "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04"
+             (hpke/hex prk)))
+      (is (= (str "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
+                  "9d201395faa4b61a96c8")
+             (hpke/hex (kdf/expand! kdf/hkdf-sha256 prk [] 42))))))
+  (testing "expand refuses past 255 blocks rather than wrapping its counter"
+    (is (= :expand-length-too-large
+           (:reason (kdf/expand kdf/hkdf-sha256 (vec (repeat 32 0)) [] (inc (* 255 32))))))
+    (is (= :ok (:status (kdf/expand kdf/hkdf-sha256 (vec (repeat 32 0)) [] (* 255 32)))))))
