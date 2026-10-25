@@ -1,0 +1,275 @@
+(ns isobmff.aac-stsd-test
+  "Tests for `isobmff.mux/aac-stsd`/`esds`/`aac-track` — the one codec
+   declaration this repo BUILDS instead of passing through.
+
+   ## Two independent references, because a writer can always agree with itself
+
+   1. **Real ffmpeg's own box.** `av_sample.mp4` (this repo's existing
+      libx264+aac fixture) contains an `mp4a`/`esds` that ffmpeg wrote. The
+      tests below parse it and require this writer, given the same parameters,
+      to produce the same field values and the same descriptor nesting. A
+      hand-rolled descriptor tree that no other muxer would recognise cannot
+      pass that.
+   2. **A parser written differently from the writer.** `parse-descriptors`
+      below walks the `expandable` length encoding independently, so a
+      writer/reader pair that agreed on a wrong length encoding would still be
+      caught — the tests assert the parse against ffmpeg's bytes too, not only
+      against ours.
+
+   ## The one place we deliberately differ from ffmpeg
+
+   ffmpeg's DecoderSpecificInfo is FIVE bytes for a plain mono AAC-LC track:
+   the 2-byte AudioSpecificConfig plus the optional 0x2B7 sync extension
+   spelling out `extensionAudioObjectType = SBR, sbrPresentFlag = 0`. That is
+   backward-compatibility signalling for HE-AAC-aware decoders; a bare 2-byte
+   AudioSpecificConfig already means the same thing implicitly. This writer
+   emits exactly the DecoderSpecificInfo it is handed, and
+   `ffmpeg-writes-an-extra-sbr-sync-extension` pins that difference so it stays
+   a known, stated one rather than turning into a suspected bug later.
+
+   ## `aac_mono.mp4`
+
+   Built by the pipeline this box exists to enable — `kotoba-lang/org-iso-aac`'s
+   encoder -> `aac-track` -> `mux` — and then verified with real ffmpeg:
+   `ffprobe` reports `Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono` and
+   `ffmpeg -i aac_mono.mp4 -f s16le` returns PCM **byte-identical** to decoding
+   the same access units as a raw ADTS stream, i.e. the container contributes no
+   error and the `esds` is read as intended. It is committed as the bytes ffmpeg
+   accepted; the test asserts this writer still reproduces its stsd exactly.
+   Regenerating it needs org-iso-aac, which this repo does not depend on, so it
+   is a fixture rather than a test step (see `com-junkawasaki/root`
+   ADR-2800002800)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [isobmff.box :as box]
+            [isobmff.bytes :as b]
+            [isobmff.demux :as demux]
+            [isobmff.mux :as mux]))
+
+(defn- rd-bytes [p]
+  (mapv #(bit-and (int %) 0xff)
+        #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+           :cljs (js->clj (.readFileSync (js/require "fs")
+                                         (str "lib/org.iso.isobmff/resources/" p))))))
+
+;; --- an independently-written descriptor parser --------------------------
+
+(defn- read-expandable
+  "Read an MPEG-4 `expandable` length at `i`: 7 bits per byte, high bit means
+   another byte follows. Returns [value next-index]. Accepts the redundant
+   multi-byte form real muxers emit."
+  [bs i]
+  (loop [i i value 0 guard 0]
+    (when (> guard 4)
+      (throw (ex-info "expandable length longer than 4 bytes" {:at i})))
+    (let [byte (b/u8 bs i)
+          value (bit-or (bit-shift-left value 7) (bit-and byte 0x7f))]
+      (if (zero? (bit-and byte 0x80))
+        [value (inc i)]
+        (recur (inc i) value (inc guard))))))
+
+(defn- parse-descriptors
+  "Parse a run of MPEG-4 descriptors in `[start, end)` into
+   [{:tag :length :payload-start :payload-end} ...] (not recursive — callers
+   re-enter on a payload range)."
+  [bs start end]
+  (loop [i start acc []]
+    (if (>= i end)
+      acc
+      (let [tag (b/u8 bs i)
+            [length after] (read-expandable bs (inc i))]
+        (recur (+ after length)
+               (conj acc {:tag tag :length length
+                          :payload-start after :payload-end (+ after length)}))))))
+
+(defn- find-descriptor [descs tag]
+  (first (filter #(= tag (:tag %)) descs)))
+
+(defn- parse-esds
+  "Pull the fields an AAC track's `esds` carries out of `esds-box-bytes` (the
+   whole box, size+type included): {:es-id :object-type :stream-type
+   :buffer-size :max-bitrate :avg-bitrate :audio-specific-config :tags}."
+  [bs]
+  (let [payload-start 12                                  ; size(4) + type(4) + version/flags(4)
+        es (first (parse-descriptors bs payload-start (count bs)))
+        _ (when-not (= 0x03 (:tag es))
+            (throw (ex-info "esds does not start with an ES_Descriptor" {:tag (:tag es)})))
+        ;; ES_ID(2) + flags(1), then the child descriptors
+        children (parse-descriptors bs (+ (:payload-start es) 3) (:payload-end es))
+        dcd (find-descriptor children 0x04)
+        dsi (first (parse-descriptors bs (+ (:payload-start dcd) 13) (:payload-end dcd)))]
+    {:es-id (b/u16 bs (:payload-start es))
+     :object-type (b/u8 bs (:payload-start dcd))
+     :stream-type (b/u8 bs (inc (:payload-start dcd)))
+     :buffer-size (b/u24 bs (+ (:payload-start dcd) 2))
+     :max-bitrate (b/u32 bs (+ (:payload-start dcd) 5))
+     :avg-bitrate (b/u32 bs (+ (:payload-start dcd) 9))
+     :audio-specific-config (subvec bs (:payload-start dsi) (:payload-end dsi))
+     :tags (mapv :tag children)}))
+
+(defn- audio-sample-entry
+  "Pull the `mp4a` fields out of a whole stsd box."
+  [stsd]
+  (let [entry-start 16]                                   ; size+type+version/flags+entry_count
+    {:fourcc (b/ascii4 stsd (+ entry-start 4))
+     :data-reference-index (b/u16 stsd (+ entry-start 14))
+     :channel-count (b/u16 stsd (+ entry-start 24))
+     :sample-size (b/u16 stsd (+ entry-start 26))
+     :sample-rate (b/u16 stsd (+ entry-start 32))
+     :sample-rate-fraction (b/u16 stsd (+ entry-start 34))
+     :child-start (+ entry-start 36)}))
+
+(defn- esds-bytes-of [stsd]
+  (let [{:keys [child-start]} (audio-sample-entry stsd)
+        size (b/u32 stsd child-start)]
+    (is (= "esds" (b/ascii4 stsd (+ child-start 4))))
+    (subvec stsd child-start (+ child-start size))))
+
+(defn- ffmpeg-audio-stsd []
+  (let [d (demux/demux (rd-bytes "isobmff/fixtures/av_sample.mp4"))]
+    (:stsd (first (filter #(= "soun" (:handler %)) (:tracks d))))))
+
+;; --- cross-validation against ffmpeg ------------------------------------
+
+(deftest matches-the-mp4a-fields-ffmpeg-writes
+  (let [theirs (audio-sample-entry (ffmpeg-audio-stsd))
+        ours (audio-sample-entry
+               (mux/aac-stsd {:channel-count (:channel-count theirs)
+                              :sample-rate (:sample-rate theirs)
+                              :audio-specific-config [0x12 0x08]}))]
+    (testing "the fixture is the mono 44100 Hz AAC track this comparison assumes"
+      (is (= "mp4a" (:fourcc theirs)))
+      (is (= 1 (:channel-count theirs)))
+      (is (= 44100 (:sample-rate theirs)))
+      (is (= 16 (:sample-size theirs)))
+      (is (zero? (:sample-rate-fraction theirs))))
+    (testing "every AudioSampleEntry field this writer sets matches ffmpeg's"
+      (is (= (select-keys theirs [:fourcc :data-reference-index :channel-count
+                                  :sample-size :sample-rate :sample-rate-fraction])
+             (select-keys ours [:fourcc :data-reference-index :channel-count
+                                :sample-size :sample-rate :sample-rate-fraction]))))))
+
+(deftest matches-the-esds-descriptor-tree-ffmpeg-writes
+  (let [theirs (parse-esds (esds-bytes-of (ffmpeg-audio-stsd)))
+        ours (parse-esds (esds-bytes-of
+                           (mux/aac-stsd {:channel-count 1 :sample-rate 44100
+                                          :audio-specific-config [0x12 0x08]})))]
+    (testing "same descriptor nesting: ES_Descriptor holding DecoderConfig + SLConfig"
+      (is (= [0x04 0x06] (:tags theirs)))
+      (is (= (:tags theirs) (:tags ours))))
+    (testing "same codec identification"
+      (is (= 0x40 (:object-type theirs)) "MPEG-4 Audio")
+      (is (= 0x15 (:stream-type theirs)) "AudioStream, upStream 0, reserved 1")
+      (is (= (:object-type theirs) (:object-type ours)))
+      (is (= (:stream-type theirs) (:stream-type ours))))
+    (testing "and the AudioSpecificConfig that actually selects the decoder agrees"
+      ;; ffmpeg appends an optional extension — see the next test.
+      (is (= [0x12 0x08] (subvec (:audio-specific-config theirs) 0 2)))
+      (is (= [0x12 0x08] (:audio-specific-config ours))))))
+
+(deftest ffmpeg-writes-an-extra-sbr-sync-extension
+  (testing "ffmpeg's DecoderSpecificInfo is 5 bytes, not 2: the AudioSpecificConfig plus the optional 0x2B7 sync extension explicitly signalling `no SBR`, which a bare AAC-LC config already implies"
+    (let [dsi (:audio-specific-config (parse-esds (esds-bytes-of (ffmpeg-audio-stsd))))]
+      (is (= 5 (count dsi)))
+      (is (= [0x12 0x08 0x56 0xe5 0x00] dsi))
+      (testing "bits 16.. are syncExtensionType 0x2B7 then extensionAudioObjectType 5 (SBR) then sbrPresentFlag 0"
+        (let [tail (bit-or (bit-shift-left (nth dsi 2) 16)
+                           (bit-shift-left (nth dsi 3) 8)
+                           (nth dsi 4))]
+          (is (= 0x2B7 (bit-and (bit-shift-right tail 13) 0x7FF)))
+          (is (= 5 (bit-and (bit-shift-right tail 8) 0x1F)))
+          (is (zero? (bit-and (bit-shift-right tail 7) 1))))))))
+
+;; --- the length encoding, independently parsed --------------------------
+
+(deftest descriptor-lengths-round-trip
+  (testing "the compact expandable length this writer emits parses back, for payloads either side of the 127-byte single-byte boundary"
+    (doseq [n [2 5 100 127 128 200 300]]
+      (let [asc (vec (repeat n 0xAB))
+            parsed (parse-esds (mux/esds {:audio-specific-config asc}))]
+        (is (= asc (:audio-specific-config parsed))
+            (str "DecoderSpecificInfo of " n " bytes")))))
+  (testing "and the redundant multi-byte form ffmpeg emits parses too (80 80 80 25 = 37)"
+    ;; The 4th byte of ffmpeg's ES_Descriptor length; if this parser only
+    ;; accepted the compact form, the cross-validation above would be reading
+    ;; ffmpeg's box wrong rather than checking it.
+    (let [esds (esds-bytes-of (ffmpeg-audio-stsd))]
+      (is (= 0x80 (b/u8 esds 13)))
+      (is (= 0x25 (b/u8 esds 16)))
+      (is (= 0x40 (:object-type (parse-esds esds)))))))
+
+(deftest esds-refuses-to-omit-the-codec-config
+  (testing "an AAC track with no DecoderSpecificInfo is undecodable, so it fails instead of being written"
+    (is (thrown? js/Error (mux/esds {})))
+    (is (thrown? js/Error (mux/esds {:audio-specific-config []})))
+    (is (thrown? js/Error
+                 (mux/aac-stsd {:sample-rate 44100 :audio-specific-config [0x12 0x08]})))
+    (is (thrown? js/Error
+                 (mux/aac-stsd {:channel-count 1 :audio-specific-config [0x12 0x08]})))))
+
+(deftest esds-carries-optional-rate-fields-when-given
+  (testing "buffer size and bitrates default to 0 (what ffmpeg writes for bufferSizeDB) but are written when supplied"
+    (let [d (parse-esds (mux/esds {:audio-specific-config [0x12 0x08]}))]
+      (is (zero? (:buffer-size d)))
+      (is (zero? (:max-bitrate d)))
+      (is (zero? (:avg-bitrate d)))
+      (is (zero? (:es-id d))))
+    (let [d (parse-esds (mux/esds {:audio-specific-config [0x12 0x08] :es-id 2
+                                   :buffer-size 6144 :max-bitrate 65800 :avg-bitrate 65800}))]
+      (is (= 6144 (:buffer-size d)))
+      (is (= 65800 (:max-bitrate d)))
+      (is (= 65800 (:avg-bitrate d)))
+      (is (= 2 (:es-id d))))))
+
+;; --- track shape --------------------------------------------------------
+
+(deftest aac-track-is-sample-exact
+  (let [units [[1 2 3] [4 5] [6 7 8 9]]
+        t (mux/aac-track {:access-units units :sample-rate 44100 :channel-count 2
+                          :audio-specific-config [0x12 0x10]})]
+    (testing "timescale is the sample rate and each access unit lasts 1024 samples, so track time is exact rather than rounded"
+      (is (= 44100 (:timescale t)))
+      (is (= [1024 1024 1024] (mapv :duration (:samples t)))))
+    (testing "sizes come from the units themselves"
+      (is (= [3 2 4] (mapv :size (:samples t)))))
+    (testing "every AAC access unit is independently decodable, so all are sync samples (mux then writes no stss)"
+      (is (every? :keyframe (:samples t))))
+    (testing "handler is soun, so mux picks smhd"
+      (is (= "soun" (:handler t))))
+    (testing "and the stsd declares the channel count it was given"
+      (is (= 2 (:channel-count (audio-sample-entry (:stsd t))))))))
+
+;; --- the MP4 ffmpeg actually accepted ------------------------------------
+
+(deftest reproduces-the-stsd-of-the-mp4-ffmpeg-accepted
+  (let [d (demux/demux (rd-bytes "isobmff/fixtures/aac_mono.mp4"))
+        track (first (:tracks d))
+        stsd (:stsd track)
+        entry (audio-sample-entry stsd)
+        parsed (parse-esds (esds-bytes-of stsd))]
+    (testing "one mono 44100 Hz AAC track, 9 access units of 1024 samples each"
+      (is (= 1 (count (:tracks d))))
+      (is (= "soun" (:handler track)))
+      (is (= 44100 (:timescale track)))
+      (is (= 9 (count (:samples track))))
+      (is (every? #(= 1024 (:duration %)) (:samples track)))
+      (is (= "mp4a" (:fourcc entry)))
+      (is (= 1 (:channel-count entry)))
+      (is (= 44100 (:sample-rate entry))))
+    (testing "this writer still regenerates that exact stsd from the AudioSpecificConfig inside it"
+      (is (= stsd (mux/aac-stsd {:channel-count (:channel-count entry)
+                                 :sample-rate (:sample-rate entry)
+                                 :audio-specific-config (:audio-specific-config parsed)}))))
+    (testing "and muxing the demuxed track back reproduces the file"
+      (is (= (rd-bytes "isobmff/fixtures/aac_mono.mp4")
+             (mux/mux {:timescale (:timescale track) :tracks [track]}))))))
+
+(deftest boxes-are-structurally-valid
+  (testing "the generated stsd parses as boxes, so a strict reader finds an mp4a with an esds child"
+    (let [stsd (mux/aac-stsd {:channel-count 1 :sample-rate 48000
+                              :audio-specific-config [0x11 0x88]})
+          boxes (box/parse-boxes stsd 0 (count stsd))]
+      (is (= ["stsd"] (mapv :type boxes)))
+      (is (= (count stsd) (:size (first boxes))))
+      (is (= 48000 (:sample-rate (audio-sample-entry stsd))))
+      (is (= [0x11 0x88] (:audio-specific-config (parse-esds (esds-bytes-of stsd))))))))

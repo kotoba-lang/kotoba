@@ -211,6 +211,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.which` | `org.ieee.which/src` | `` (an external specification, publisher ieee.org) |
 | `org.aomedia.av1` | `org.aomedia.av1/src` | `av1.bitreader`, `av1.bitwriter`, `av1.bool-decoder`, `av1.bool-encoder` (an external specification, publisher aomedia.org) |
 | `org.iso.h264` | `org.iso.h264/src` | `h264.bitstream`, `h264.cabac`, `h264.cavlc`, `h264.decode` (an external specification, publisher iso.org) |
+| `org.iso.isobmff` | `org.iso.isobmff/src` | `isobmff.blob`, `isobmff.box`, `isobmff.bytes`, `isobmff.demux` (an external specification, publisher iso.org) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |
