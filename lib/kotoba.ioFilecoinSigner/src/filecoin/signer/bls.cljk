@@ -1,0 +1,177 @@
+(ns filecoin.signer.bls
+  "BLS12-381 for Filecoin — the curve `f3` accounts and block signatures use.
+
+  **This implements no cryptography.** Pairing-friendly curve arithmetic is
+  the last thing anyone should hand-roll, so the primitives come from
+  `@noble/curves`, which is audited and pure JavaScript. What is here is the
+  Filecoin-specific part: which domain separation tag, which group holds
+  what, and where a public key comes from.
+
+  ## The parameters, and each is silent when wrong
+
+      signature   96 bytes, G2 (compressed)
+      public key  48 bytes, G1 (compressed)
+      DST         BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_
+
+  The trailing `NUL_` is the **basic** scheme. `@noble/curves` defaults to
+  `POP_` (proof-of-possession), which is a different hash-to-curve domain and
+  therefore a different message point — every signature simply fails to
+  verify, with no indication that the tag is the reason. There is a test that
+  fails if this constant is changed.
+
+  ## Where a public key comes from
+
+  An `f3` address **is** the public key: 48 bytes, carried verbatim as the
+  address payload rather than hashed. That is why `f3` addresses are 86
+  characters where `f1` is 41, and it is what makes a block's aggregate
+  checkable without touching chain state. An `f0` sender needs
+  `StateAccountKey` to resolve first.
+
+  ## What a block's aggregate is
+
+  A header's `BLSAggregate` is **one** signature over *every* BLS message in
+  that block — each signed by its own sender, then aggregated. Verifying it
+  is a batch check over (public key, message) pairs, and the message is the
+  binary message CID, exactly as `filecoin.message/signing-bytes` gives it.
+
+  Aggregate verification in the basic scheme requires the messages to be
+  **distinct**, which they are: two messages with the same CID are the same
+  message.
+
+  ## ClojureScript only
+
+  There is no pure-Java BLS12-381 in this workspace and no good one to pull
+  in — the JVM options are JNI bindings to `blst`, which would pin a native
+  library and a platform. The `:clj` side therefore throws, with the same
+  shape `multiformats.core` and `eth-crypto` have used for the same reason.
+  This is also the order `AGENTS.md` sets: ClojureScript ranks above the JVM,
+  so a cljs-only capability is a normal state rather than a gap to apologise
+  for."
+  (:require #?@(:cljs [["@noble/curves/bls12-381.js" :refer [bls12_381]]])
+            [filecoin.address :as addr]
+            [filecoin.message :as msg]))
+
+(def ^:const dst
+  "`lib/sigs/bls`'s DST. The `NUL_` suffix is the basic scheme; `POP_` is a
+  different domain and would fail every verification silently."
+  "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_")
+
+(def ^:const public-key-bytes 48)
+(def ^:const signature-bytes 96)
+
+(defn- ->ints [x]
+  (cond (nil? x) []
+        (vector? x) (mapv #(bit-and (int %) 0xff) x)
+        :else (mapv #(bit-and (int %) 0xff) (seq x))))
+
+#?(:cljs
+   (defn- u8 [ints] (js/Uint8Array.from (clj->js (vec ints)))))
+
+#?(:cljs (def ^:private long-sigs (.-longSignatures bls12_381)))
+
+#_{:clj-kondo/ignore [:unused-private-var]}   ; called only from :clj branches
+(defn- unsupported
+  "The `:clj` answer. Carries what it was asked to do, so the message names
+  the operation rather than the file."
+  [op detail]
+  (throw (ex-info
+          (str "filecoin.signer.bls/" op " is :cljs-only. BLS12-381 pairings "
+               "need a real implementation, and the JVM options are JNI "
+               "bindings to blst, which would pin a native library and a "
+               "platform. Run this path under nbb or in a browser/Worker.")
+          (assoc detail :op op :namespace "filecoin.signer.bls"))))
+
+;; ── keys ─────────────────────────────────────────────────────────────────────
+
+(defn public-key
+  "The 48-byte public key an `f3` address carries.
+
+  Not a hash of the key — the key itself. Passing an `f1` here would hand
+  back its 20-byte payload, so the protocol is checked rather than assumed."
+  [address]
+  (let [a (if (string? address) (addr/from-string address) address)]
+    (when-not (= addr/bls-protocol (addr/protocol a))
+      (throw (ex-info "bls: only an f3 address carries a public key"
+                      {:protocol (addr/protocol a)
+                       :hint "an f0 sender needs StateAccountKey to resolve"})))
+    (addr/payload a)))
+
+(defn address
+  "The inverse: an `f3` address for a public key."
+  ([pk] (address pk :mainnet))
+  ([pk network]
+   (let [k (->ints pk)]
+     (when-not (= public-key-bytes (count k))
+       (throw (ex-info "bls: a public key is 48 bytes" {:bytes (count k)})))
+     (addr/bls k network))))
+
+;; ── verification ─────────────────────────────────────────────────────────────
+
+(defn hashed
+  "A message hashed to its G2 point under Filecoin's DST. Exposed because
+  batch verification takes points, and because getting the DST wrong is
+  invisible otherwise."
+  [message-bytes]
+  #?(:clj (unsupported "hashed" {:message-bytes (count (->ints message-bytes))})
+     :cljs (.hash long-sigs (u8 (->ints message-bytes)) dst)))
+
+(defn verify
+  "One signature over `message-bytes` for one public key."
+  [signature message-bytes public-key-bytes*]
+  #?(:clj (unsupported "verify" {:signature-bytes (count (->ints signature))
+                                 :message-bytes (count (->ints message-bytes))
+                                 :key-bytes (count (->ints public-key-bytes*))})
+     :cljs (.verify long-sigs
+                    (u8 (->ints signature))
+                    (hashed message-bytes)
+                    (u8 (->ints public-key-bytes*)))))
+
+(defn verify-aggregate
+  "One aggregate signature over many (public key, message) pairs.
+
+  `items` is a seq of `{:public-key … :message …}`. The basic scheme requires
+  the messages to be distinct, which for Filecoin they are — two messages
+  with the same CID are the same message."
+  [signature items]
+  #?(:clj (unsupported "verify-aggregate" {:signature-bytes (count (->ints signature))
+                                           :items (count items)})
+     :cljs
+     (let [sig (->ints signature)]
+       (when-not (= signature-bytes (count sig))
+         (throw (ex-info "bls: an aggregate signature is 96 bytes"
+                         {:bytes (count sig)})))
+       (when (empty? items)
+         (throw (ex-info "bls: nothing to verify against" {})))
+       (.verifyBatch long-sigs (u8 sig)
+                     (clj->js (mapv (fn [i]
+                                      #js {:message (hashed (:message i))
+                                           :publicKey (u8 (->ints (:public-key i)))})
+                                    items))))))
+
+(defn verify-block-aggregate
+  "A block header's `BLSAggregate` against the BLS messages of that block.
+
+  Each message contributes its sender's key and its own binary CID — which is
+  what a BLS signature covers, unhashed, unlike secp256k1's second BLAKE2b.
+
+  Senders must be `f3`; an `f0` one needs `StateAccountKey` first, and this
+  refuses rather than guessing."
+  [aggregate-signature messages]
+  (verify-aggregate aggregate-signature
+                    (mapv (fn [m]
+                            {:public-key (public-key (:from m))
+                             :message (msg/signing-bytes m)})
+                          messages)))
+
+(defn verify-message
+  "A single BLS-signed message against its own sender.
+
+  Rarely useful on chain — individual BLS signatures are aggregated into the
+  block header and not stored — but it is the check a mempool makes on a
+  message it has just been handed."
+  [signed]
+  (let [{:keys [message signature]} signed]
+    (and (= 2 (:type signature))
+         (verify (:data signature)
+                 (msg/signing-bytes message)
+                 (public-key (:from message))))))

@@ -1,0 +1,186 @@
+(ns filecoin.signer.eth-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [eth-crypto.core :as eth]
+            [filecoin.address :as addr]
+            [filecoin.message :as msg]
+            [filecoin.method :as method]
+            [filecoin.signature :as sig]
+            [filecoin.signer :as signer]
+            [filecoin.signer.eth :as ethtx]))
+
+(def test-key
+  "4646464646464646464646464646464646464646464646464646464646464646")
+
+(def contract "0xBADd0B92C1c71d02E7d520f64c0876538fa2557F")
+(def calldata "0xf83758fe")                     ; getChallengeFinality()
+
+(defn- a-tx []
+  (ethtx/transaction {:chain-id 314159 :nonce 7 :to contract :value "0"
+                      :max-fee-per-gas "100000" :max-priority-fee-per-gas "1000"
+                      :gas-limit 1000000 :input calldata}))
+
+(defn- hexify [bs]
+  (apply str (map #(let [h #?(:clj (Integer/toHexString %) :cljs (.toString % 16))]
+                     (if (= 1 (count h)) (str "0" h) h))
+                  bs)))
+
+;; ── the account ──────────────────────────────────────────────────────────────
+
+(deftest the-sender-is-the-f410f-of-the-key-not-its-f1
+  ;; Same private key, two different Filecoin accounts. Signing a delegated
+  ;; message as the f1 would be a message from an account that did not sign
+  ;; it, which is exactly what AuthenticateMessage rejects.
+  (let [f4 (ethtx/address test-key :calibration)
+        f1 (signer/address test-key :testnet)]
+    (is (= addr/delegated-protocol (addr/protocol f4)))
+    (is (= addr/secp256k1-protocol (addr/protocol f1)))
+    (is (not= (:payload f4) (:payload f1)))
+    (testing "and the f4 is the EAM namespace over the Ethereum address"
+      (is (= addr/eth-namespace (addr/namespace-of f4)))
+      (is (= (ethtx/eth-address test-key) (addr/to-eth-address f4))))
+    (testing "which matches what eth-crypto derives independently"
+      (is (= (str/lower (eth/address-of-privkey
+                                         #?(:clj (byte-array (map unchecked-byte (eth/hex->bytes test-key)))
+                                            :cljs (eth/hex->bytes test-key))))
+             (ethtx/eth-address test-key))))))
+
+;; ── the RLP, where the order is not the message's ────────────────────────────
+
+(deftest rlp-puts-the-priority-fee-before-the-max-fee
+  ;; The Filecoin message carries GasFeeCap then GasPremium; EIP-1559 signs
+  ;; them the other way round. Swapping them gives a well-formed transaction
+  ;; that signs for different gas terms, and the node reports it as a
+  ;; roundtrip mismatch rather than as what it is.
+  (let [tx (a-tx)
+        fields (ethtx/rlp-fields tx)
+        as-ints (mapv #(if (sequential? %) % (vec (map (fn [b] (bit-and (int b) 0xff)) (seq %)))) fields)]
+    (is (= 9 (count fields)))
+    (is (= [] (nth as-ints 8)) "access list is always empty")
+    (testing "field 2 is the priority fee (1000), field 3 the max fee (100000)"
+      (is (= "03e8" (hexify (nth as-ints 2))))
+      (is (= "0186a0" (hexify (nth as-ints 3)))))
+    (testing "and they are genuinely different, so a swap would be visible"
+      (is (not= (nth as-ints 2) (nth as-ints 3))))))
+
+(deftest rlp-integers-are-minimal-and-zero-is-empty
+  ;; Leading zeros are stripped and zero becomes the empty byte string, not
+  ;; 0x00 — which RLP would encode as a one-byte string instead.
+  (is (= [] (ethtx/minimal [0])))
+  (is (= [] (ethtx/minimal [0 0 0])))
+  (is (= [1] (ethtx/minimal [0 0 1])))
+  (is (= [0x01 0x86 0xa0] (ethtx/minimal [0 0 0x01 0x86 0xa0])))
+  (testing "so a zero value field is empty in the packed fields"
+    (let [fields (ethtx/rlp-fields (a-tx))
+          value (nth fields 6)]
+      (is (= 0 (count (vec (seq value))))))))
+
+(deftest the-signing-payload-is-type-byte-then-rlp
+  (let [tx (a-tx)
+        payload (ethtx/rlp-unsigned tx)]
+    (is (= 0x02 (first payload)) "EIP1559TxType")
+    (is (<= 0xc0 (nth payload 1) 0xff) "then an RLP list header")
+    (testing "short form: header is 0xc0 + payload length, payload under 56 bytes"
+      (let [payload-len (- (count payload) 2)]
+        (is (< payload-len 56))
+        (is (= (+ 0xc0 payload-len) (nth payload 1)))))
+    (testing "and the digest is keccak of that, 32 bytes"
+      (is (= 32 (count (ethtx/signing-digest tx)))))
+    (testing "which is NOT the message's BLAKE2b digest"
+      (let [m (ethtx/->message tx (ethtx/address test-key :calibration))]
+        (is (not= (ethtx/signing-digest tx) (msg/digest-for-secp256k1 m)))))))
+
+;; ── the mapping the node re-derives ──────────────────────────────────────────
+
+(deftest the-message-is-the-transaction-re-encoded
+  (let [tx (a-tx)
+        from (ethtx/address test-key :calibration)
+        m (ethtx/->message tx from)]
+    (is (= 0 (:version m)))
+    (is (= method/invoke-contract (:method m)))
+    (is (= from (:from m)))
+    (is (= (str/lower contract) (addr/to-eth-address (:to m)))
+        "to-eth-address is lowercase; EIP-55 casing is a display concern")
+    (testing "gas fields cross over: max fee -> cap, priority -> premium"
+      (is (= "100000" (:gas-fee-cap m)))
+      (is (= "1000" (:gas-premium m))))
+    (is (= 7 (:nonce m)))
+    (is (= 1000000 (:gas-limit m)))))
+
+(deftest params-are-cbor-wrapped-only-when-there-is-input
+  ;; getFilecoinMethodInfo guards on len(input) > 0. An empty input gives
+  ;; zero-length Params; writing 0x40 (CBOR empty byte string) there is a
+  ;; different message and the round-trip fails.
+  (let [from (ethtx/address test-key :calibration)
+        with-input (ethtx/->message (a-tx) from)
+        no-input (ethtx/->message
+                  (ethtx/transaction {:chain-id 314159 :nonce 7 :to contract
+                                      :value "0" :gas-limit 1000000
+                                      :max-fee-per-gas "100000"
+                                      :max-priority-fee-per-gas "1000"})
+                  from)]
+    (is (= [] (:params no-input)) "empty, not 0x40")
+    (testing "and a 4-byte input gets the short CBOR header 0x44"
+      (is (= [0x44 0xf8 0x37 0x58 0xfe] (:params with-input))))
+    (testing "past 23 bytes it switches to the one-byte-length form"
+      (let [big (ethtx/->message
+                 (ethtx/transaction {:chain-id 314159 :nonce 0 :to contract
+                                     :input (vec (repeat 100 0xab))})
+                 from)]
+        (is (= 0x58 (first (:params big))))
+        (is (= 100 (second (:params big))))))))
+
+;; ── the signature ────────────────────────────────────────────────────────────
+
+(deftest the-delegated-signature-is-65-bytes-r-s-v
+  (let [signed (ethtx/sign-message test-key
+                                   {:nonce 7 :to contract :value "0"
+                                    :max-fee-per-gas "100000"
+                                    :max-priority-fee-per-gas "1000"
+                                    :gas-limit 1000000 :input calldata}
+                                   :calibration)
+        s (:signature signed)]
+    (is (= sig/delegated (:type s)))
+    (is (= 3 (:type s)))
+    (is (= 65 (count (:data s))))
+    (is (contains? #{0 1} (last (:data s))) "v is a recovery id, not 27/28")))
+
+(deftest it-recovers-to-the-sending-account
+  ;; The check the node makes, made locally: recover the key from the
+  ;; signature over the transaction digest and confirm it is the f410f in
+  ;; `From`.
+  (let [tx (a-tx)
+        from (ethtx/address test-key :calibration)
+        s (ethtx/signature test-key tx)
+        pub (eth/ecrecover-pubkey
+             #?(:clj (byte-array (map unchecked-byte (ethtx/signing-digest tx)))
+                :cljs (ethtx/signing-digest tx))
+             #?(:clj (byte-array (map unchecked-byte (:data s)))
+                :cljs (:data s)))
+        recovered (str "0x" (eth/bytes->hex
+                             (vec (drop 12 (map #(bit-and (int %) 0xff)
+                                                (seq (eth/keccak256 pub)))))))]
+    (is (= (addr/to-eth-address from) recovered))))
+
+(deftest a-delegated-message-is-not-signed-like-an-f1-one
+  ;; Both are secp256k1 over 32 bytes; the 32 bytes are different, and so is
+  ;; the account. This is the confusion the whole namespace exists to prevent.
+  (let [tx (a-tx)
+        m (ethtx/->message tx (ethtx/address test-key :calibration))
+        delegated (:data (ethtx/signature test-key tx))
+        as-f1 (signer/sign-digest test-key (msg/digest-for-secp256k1 m))]
+    (is (not= delegated as-f1))
+    (testing "and filecoin.signer/verify-message correctly refuses the type"
+      (is (not (signer/verify-message
+                (sig/signed-message m (sig/signature sig/delegated delegated))))))))
+
+(deftest signing-is-deterministic-across-both-runtimes
+  ;; RFC-6979 again: eth-crypto implements the nonce separately per runtime,
+  ;; so identical bytes on both is a cross-implementation check.
+  (let [opts {:nonce 7 :to contract :value "0" :max-fee-per-gas "100000"
+              :max-priority-fee-per-gas "1000" :gas-limit 1000000 :input calldata}
+        a (:data (:signature (ethtx/sign-message test-key opts :calibration)))
+        b (:data (:signature (ethtx/sign-message test-key opts :calibration)))]
+    (is (= a b))
+    (testing "and the chain id is part of what is signed"
+      (is (not= a (:data (:signature (ethtx/sign-message test-key opts :mainnet))))))))

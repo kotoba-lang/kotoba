@@ -1,0 +1,180 @@
+(ns filecoin.signer-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [filecoin.address :as addr]
+            [filecoin.message :as msg]
+            [filecoin.protocols :as p]
+            [filecoin.rpc :as rpc]
+            [filecoin.signature :as sig]
+            [filecoin.signer :as signer]
+            [filecoin.signer.vectors :as v]))
+
+;; ── against mainnet ──────────────────────────────────────────────────────────
+;; The only assertions here that are not this library talking to itself. Every
+;; signature below was made by somebody else's wallet, over a message the
+;; network accepted. Recovering the signer and getting back `From` exercises
+;; CBOR field order, the message CID, the second BLAKE2b-256, ECDSA recovery,
+;; the 0x04 prefix and BLAKE2b-160 in one comparison — and nothing this
+;; library computes is an input to it.
+
+(deftest recovering-a-mainnet-signature-gives-back-its-sender
+  (is (seq v/secp256k1-messages))
+  (doseq [{:keys [message from signature]} v/secp256k1-messages]
+    (testing from
+      (let [m (rpc/json->message message)
+            recovered (signer/recover-address (msg/digest-for-secp256k1 m)
+                                              (rpc/base64-decode (:data signature)))]
+        (is (= from (addr/to-string recovered)))))))
+
+(deftest verify-message-accepts-what-the-network-accepted
+  (doseq [{:keys [message signature]} v/secp256k1-messages]
+    (let [m (rpc/json->message message)
+          signed (sig/signed-message
+                  m (sig/signature (:type signature)
+                                   (rpc/base64-decode (:data signature))))]
+      (is (signer/verify-message signed))
+      (testing "and rejects it once a field has moved"
+        (is (not (signer/verify-message
+                  (sig/signed-message (assoc m :nonce (inc (:nonce m)))
+                                      (:signature signed)))))))))
+
+(deftest a-delegated-signature-is-not-a-secp256k1-signature-over-this-digest
+  ;; ADR-2607299300's correction, asserted against the network rather than
+  ;; against a reading of lotus — and the network says something stronger than
+  ;; the ADR did. A delegated signature is not merely over a different
+  ;; payload; it is not always the same *shape*:
+  ;;
+  ;;   EIP-1559 (type 2)  r ‖ s ‖ v            65 bytes, v ∈ {0,1}
+  ;;   legacy EIP-155     0x02 ‖ r ‖ s ‖ v     67 bytes on mainnet, because
+  ;;                                           v = chainId·2 + 35 = 663 needs
+  ;;                                           two bytes and lotus prefixes
+  ;;                                           the blob to say which kind it is
+  ;;
+  ;; So `recover-public-key` refusing a 67-byte input is correct rather than
+  ;; over-strict, and lotus has `ToVerifiableSignature` for precisely this
+  ;; normalisation.
+  (is (seq v/delegated-messages))
+  (doseq [{:keys [message from signature]} v/delegated-messages]
+    (testing from
+      (let [m (rpc/json->message message)
+            data (rpc/base64-decode (:data signature))
+            digest (msg/digest-for-secp256k1 m)]
+        (case (count data)
+          65 (testing "EIP-1559 shape — recovery works and gives the wrong sender"
+               (is (not= from (addr/to-string (signer/recover-address digest data)))
+                   "if this ever passes, the delegated rule is not what the ADR says"))
+          (testing "legacy EIP-155 shape — not even 65 bytes, and prefixed"
+            (is (= 67 (count data)))
+            (is (= 0x02 (bit-and (int (first data)) 0xff))
+                "EthLegacy155TxSignaturePrefix")
+            (is (= 663 (+ (* 256 (bit-and (int (nth data 65)) 0xff))
+                          (bit-and (int (nth data 66)) 0xff)))
+                "v = chainId·2 + 35, chainId 314")
+            (is (thrown? #?(:clj Exception :cljs js/Error)
+                         (signer/recover-address digest data)))))
+        (testing "and verify-message refuses it on the type alone"
+          (is (not (signer/verify-message
+                    (sig/signed-message m (sig/signature (:type signature) data))))))))))
+
+;; ── keys and addresses ───────────────────────────────────────────────────────
+
+(def test-key
+  ;; The EIP-155 worked example's private key, which is public by construction
+  ;; and controls nothing. Using a well-known one on purpose: a key generated
+  ;; here would make the vectors unreproducible, and a real one has no place
+  ;; in a test file.
+  "4646464646464646464646464646464646464646464646464646464646464646")
+
+(deftest a-public-key-carries-its-0x04-prefix
+  ;; Ethereum hashes the 64-byte key; Filecoin hashes the 65-byte SEC1 form.
+  ;; Dropping the prefix yields a well-formed f1 address for an account
+  ;; nobody controls, and nothing complains until a transfer vanishes.
+  (let [pk (signer/public-key test-key)]
+    (is (= 65 (count pk)))
+    (is (= 0x04 (first pk)))
+    (testing "and the address is BLAKE2b-160 of all 65 bytes"
+      (is (= (addr/to-string (addr/secp256k1 pk))
+             (signer/address-string test-key)))
+      (is (not= (addr/to-string (addr/secp256k1 (vec (rest pk))))
+                (signer/address-string test-key))))))
+
+(deftest an-address-is-f1-and-network-tagged
+  (is (= addr/secp256k1-protocol (addr/protocol (signer/address test-key))))
+  (is (re-find #"^f1" (signer/address-string test-key)))
+  (is (re-find #"^t1" (signer/address-string test-key :testnet)))
+  (testing "and the two spellings name the same account"
+    (is (= (:payload (signer/address test-key))
+           (:payload (signer/address test-key :testnet))))))
+
+(deftest a-key-that-is-not-32-bytes-is-refused
+  (is (thrown? #?(:clj Exception :cljs js/Error) (signer/public-key "00")))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (signer/public-key (str test-key "00")))))
+
+;; ── signing ──────────────────────────────────────────────────────────────────
+
+(defn- a-message []
+  (msg/message {:to (signer/address-string test-key)
+                :from (signer/address-string test-key)
+                :nonce 3 :value "1000000000000000000"
+                :gas-limit 2000000 :gas-fee-cap "100000" :gas-premium "99000"
+                :method 0}))
+
+(deftest sign-then-recover-is-the-same-address
+  (let [m (a-message)
+        signed (signer/sign-message test-key m)]
+    (is (= sig/secp256k1 (:type (:signature signed))))
+    (is (= 65 (count (:data (:signature signed)))))
+    (is (signer/verify-message signed))
+    (is (= (signer/address-string test-key)
+           (addr/to-string (signer/recover-address (msg/digest-for-secp256k1 m)
+                                                   (:data (:signature signed))))))))
+
+(deftest the-signature-is-deterministic-and-identical-on-both-runtimes
+  ;; RFC-6979: the same key and digest always give the same bytes. Because
+  ;; both runtimes run this suite, and eth-crypto implements the nonce
+  ;; separately on each, a pinned value is a cross-implementation check as
+  ;; well as a regression one. A random nonce would make this untestable —
+  ;; and a repeated or biased one leaks the key outright.
+  (let [m (a-message)
+        a (:data (:signature (signer/sign-message test-key m)))
+        b (:data (:signature (signer/sign-message test-key m)))]
+    (is (= a b))
+    (is (= a (signer/sign-digest test-key (msg/digest-for-secp256k1 m))))
+    (testing "and a different message signs differently"
+      (is (not= a (signer/sign-digest test-key
+                                      (msg/digest-for-secp256k1
+                                       (assoc m :nonce 4))))))))
+
+(deftest the-digest-is-hashed-twice-and-that-is-not-optional
+  ;; The CID is already a BLAKE2b-256; secp256k1 signs BLAKE2b-256 *of* it.
+  ;; Signing the CID unhashed produces a signature nothing accepts, and it is
+  ;; the same length, so nothing catches it locally.
+  (let [m (a-message)
+        right (signer/sign-digest test-key (msg/digest-for-secp256k1 m))
+        wrong (signer/sign-digest test-key (vec (take 32 (msg/signing-bytes m))))]
+    (is (not= right wrong))
+    (is (= (signer/address-string test-key)
+           (addr/to-string (signer/recover-address (msg/digest-for-secp256k1 m) right))))
+    (is (not= (signer/address-string test-key)
+              (addr/to-string (signer/recover-address (msg/digest-for-secp256k1 m) wrong))))))
+
+(deftest a-digest-must-be-32-bytes
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (signer/sign-digest test-key (vec (repeat 31 0)))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (signer/recover-public-key (vec (repeat 32 0)) (vec (repeat 64 0))))))
+
+;; ── the seam ─────────────────────────────────────────────────────────────────
+
+(deftest the-signer-implements-isigner-and-refuses-other-addresses
+  (let [s (signer/signer test-key)
+        m (a-message)
+        digest (msg/digest-for-secp256k1 m)
+        result (p/sign s (signer/address test-key) digest)]
+    (is (= sig/secp256k1 (:type result)))
+    (is (= (signer/sign-digest test-key digest) (:data result)))
+    (testing "signing as someone else is refused, not silently done anyway"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (p/sign s "f1xpbyy4tkdx5si2bgo37dubc2xwv6fum5tk57mia" digest))))
+    (testing "and nil means \"whoever you are\""
+      (is (= result (p/sign s nil digest))))))
