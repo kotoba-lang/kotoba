@@ -1,0 +1,202 @@
+(ns kotobase.ethereum.client-test
+  "Deterministic, network-free tests of kotobase.ethereum.client's caching
+  policy and enforcement, via an injected fake `:fetch-fn` (no real
+  socket/HTTP I/O — safe to run in CI on every push, unlike a real-network
+  smoke test). The real-network round-trip proof lives in
+  test/kotobase/ethereum/live_smoke_demo.cljk, run manually per its own
+  docstring — same split this workspace's DTN/nostr repos use between
+  deterministic unit suites and executable real-transport demos."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [kotobase.ethereum.client :as client]
+            [kotobase.ethereum.rpc :as rpc]
+            [kotobase.local :as local]
+            [kotobase.protocols.json :as json]))
+
+(defn- fake-response [json-str]
+  #js {:text (fn [] (js/Promise.resolve json-str))})
+
+(defn- make-fetch
+  "handler: (fn [request-map] -> jsonrpc-response-map-with-string-keys).
+  Returns [fetch-fn calls-atom] where calls-atom accumulates a vector of
+  every `method` name actually POSTed, so tests can assert a cache hit
+  made zero additional network calls."
+  [handler]
+  (let [calls (atom [])]
+    [(fn [_url init]
+       (let [req (json/parse (.-body init))]
+         (swap! calls conj (get req "method"))
+         (js/Promise.resolve (fake-response (json/encode (handler req))))))
+     calls]))
+
+(defn- ok-response [req result]
+  {"jsonrpc" "2.0" "id" (get req "id") "result" result})
+
+(defn- test-client [handler]
+  (let [[fetch-fn calls] (make-fetch handler)]
+    [(client/create-client {:endpoint "http://fake.test/rpc"
+                             :store (local/local-store)
+                             :fetch-fn fetch-fn})
+     calls]))
+
+;; --------------------------------------------------------------- basics
+
+(deftest create-client-requires-endpoint
+  (is (thrown? js/Error (client/create-client {}))))
+
+(deftest call!-enforces-whitelist-at-the-client-entrypoint-too
+  ;; kotobase.ethereum.rpc/build-request is the single enforcement point;
+  ;; prove client/call! actually routes through it and doesn't POST.
+  (let [posted? (atom false)
+        client (client/create-client
+                {:endpoint "http://fake.test/rpc"
+                 :fetch-fn (fn [_ _] (reset! posted? true) (js/Promise.resolve (fake-response "{}")))})]
+    (is (thrown? js/Error (client/call! client "eth_sendTransaction" [{}])))
+    (is (false? @posted?) "must not have sent any HTTP request")))
+
+;; ----------------------------------------------------------- chain-id!
+
+(deftest chain-id!-cached-forever
+  (async done
+    (let [[c calls] (test-client (fn [req] (ok-response req "0xaa36a7")))]
+      (-> (client/chain-id! c)
+          (.then (fn [v1]
+                   (is (= 11155111 v1))
+                   (client/chain-id! c)))
+          (.then (fn [v2]
+                   (is (= 11155111 v2))
+                   (is (= ["eth_chainId"] @calls)
+                       "second call must be served from cache, no 2nd POST")
+                   (done)))))))
+
+;; ------------------------------------------------------ get-block-by-number!
+
+(deftest get-block-by-number!-caches-concrete-tag
+  (async done
+    (let [[c calls] (test-client
+                      (fn [req] (ok-response req {"number" "0xac4938" "hash" "0xblockhash"
+                                                   "transactions" [] "uncles" []})))]
+      (-> (client/get-block-by-number! c "0xac4938" false)
+          (.then (fn [b1]
+                   (is (= 11290936 (:number b1)))
+                   (client/get-block-by-number! c "0xac4938" false)))
+          (.then (fn [b2]
+                   (is (= 11290936 (:number b2)))
+                   (is (= ["eth_getBlockByNumber"] @calls))
+                   (done)))))))
+
+(deftest get-block-by-number!-does-not-cache-mutable-tag
+  (async done
+    (let [n (atom 0xac4938)
+          [c calls] (test-client
+                     (fn [req]
+                       (swap! n inc)
+                       (ok-response req {"number" (str "0x" (.toString @n 16)) "hash" "0xh"
+                                          "transactions" [] "uncles" []})))]
+      (-> (client/get-block-by-number! c "latest" false)
+          (.then (fn [_]
+                   (client/get-block-by-number! c "latest" false)))
+          (.then (fn [_]
+                   (is (= ["eth_getBlockByNumber" "eth_getBlockByNumber"] @calls)
+                       "\"latest\" must never be served from cache")
+                   (done)))))))
+
+;; ------------------------------------------------------------ get-logs!
+
+(deftest get-logs!-caches-concrete-range
+  (async done
+    (let [[c calls] (test-client (fn [req] (ok-response req [])))
+          filter {"address" "0xabc" "fromBlock" "0x1" "toBlock" "0x2"}]
+      (-> (client/get-logs! c filter)
+          (.then (fn [_] (client/get-logs! c filter)))
+          (.then (fn [_]
+                   (is (= ["eth_getLogs"] @calls))
+                   (done)))))))
+
+(deftest get-logs!-does-not-cache-mutable-range
+  (async done
+    (let [[c calls] (test-client (fn [req] (ok-response req [])))
+          filter {"address" "0xabc" "fromBlock" "0x1" "toBlock" "latest"}]
+      (-> (client/get-logs! c filter)
+          (.then (fn [_] (client/get-logs! c filter)))
+          (.then (fn [_]
+                   (is (= ["eth_getLogs" "eth_getLogs"] @calls))
+                   (done)))))))
+
+;; ---------------------------------------------- get-transaction-by-hash!
+
+(deftest get-transaction-by-hash!-caches-only-once-mined
+  (async done
+    (let [mined? (atom false)
+          tx-hash "0xdeadbeef"
+          [c calls] (test-client
+                     (fn [req]
+                       (ok-response req
+                                     (if @mined?
+                                       {"hash" tx-hash "blockHash" "0xb" "blockNumber" "0x1"
+                                        "transactionIndex" "0x0" "from" "0xa" "to" "0xb"
+                                        "nonce" "0x0" "value" "0x0" "gas" "0x1"}
+                                       nil))))]
+      (-> (client/get-transaction-by-hash! c tx-hash)
+          (.then (fn [pending]
+                   (is (nil? pending) "pending tx has no result yet")
+                   (reset! mined? true)
+                   (client/get-transaction-by-hash! c tx-hash)))
+          (.then (fn [mined]
+                   (is (= tx-hash (:hash mined)))
+                   (is (= ["eth_getTransactionByHash" "eth_getTransactionByHash"] @calls)
+                       "pending result must not have been cached")
+                   (client/get-transaction-by-hash! c tx-hash)))
+          (.then (fn [cached]
+                   (is (= tx-hash (:hash cached)))
+                   (is (= ["eth_getTransactionByHash" "eth_getTransactionByHash"] @calls)
+                       "mined result must now be served from cache")
+                   (done)))))))
+
+;; --------------------------------------------- never-cached read paths
+
+(deftest block-number!-never-cached
+  (async done
+    (let [[c calls] (test-client (fn [req] (ok-response req "0x1")))]
+      (-> (client/block-number! c)
+          (.then (fn [_] (client/block-number! c)))
+          (.then (fn [_]
+                   (is (= ["eth_blockNumber" "eth_blockNumber"] @calls))
+                   (done)))))))
+
+(deftest get-balance!-never-cached
+  (async done
+    (let [[c calls] (test-client (fn [req] (ok-response req "0x1")))]
+      (-> (client/get-balance! c "0xabc" "latest")
+          (.then (fn [v] (is (= "1" v)) (client/get-balance! c "0xabc" "latest")))
+          (.then (fn [_]
+                   (is (= ["eth_getBalance" "eth_getBalance"] @calls))
+                   (done)))))))
+
+(deftest call-contract!-never-cached-and-is-read-only-passthrough
+  (async done
+    (let [[c calls] (test-client (fn [req] (ok-response req "0xcafebabe")))]
+      (-> (client/call-contract! c {"to" "0xabc" "data" "0x95d89b41"} "latest")
+          (.then (fn [v]
+                   (is (= "0xcafebabe" v))
+                   (client/call-contract! c {"to" "0xabc" "data" "0x95d89b41"} "latest")))
+          (.then (fn [_]
+                   (is (= ["eth_call" "eth_call"] @calls))
+                   (done)))))))
+
+;; ------------------------------------------------------------ error path
+
+(deftest rpc-error-rejects-the-promise
+  (async done
+    (let [[c _] (test-client
+                 (fn [req] {"jsonrpc" "2.0" "id" (get req "id")
+                            "error" {"code" -32601 "message" "boom"}}))]
+      (-> (client/block-number! c)
+          (.then (fn [_] (is false "should have rejected"))
+                 ;; NOTE: under nbb/SCI, ex-data doesn't reliably survive a
+                 ;; thrown ex-info crossing back out through a Promise
+                 ;; boundary (see kotobase.ethereum.client/rpc-fail's
+                 ;; docstring) — assert on the message text instead.
+                 (fn [err]
+                   (is (re-find #"eth_blockNumber failed" (.-message err)))
+                   (is (re-find #"boom" (.-message err)))
+                   (done)))))))
