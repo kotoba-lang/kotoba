@@ -148,6 +148,7 @@ The bundled standard libraries live in this repository:
 | `org.openstreetmap.overpass` | `org.openstreetmap.overpass/src` | `org-openstreetmap-overpass.core`, `org-openstreetmap-overpass.fetch` (an external specification, publisher openstreetmap.org) |
 | `org.si2.def` | `org.si2.def/src` | `def-format.component`, `def-format.design`, `def-format.net`, `def-format.parser` (an external specification, publisher si2.org) |
 | `org.etsi.pades` | `org.etsi.pades/src` | `pades.core` (an external specification, publisher etsi.org) |
+| `org.ros.urdf` | `org.ros.urdf/src` | `articulated_scene` (an external specification, publisher ros.org) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
 | `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |

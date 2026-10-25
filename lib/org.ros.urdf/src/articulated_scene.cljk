@@ -1,0 +1,519 @@
+(ns articulated_scene
+  "Restored from the legacy kami-engine/kami-articulated-scene Rust crate
+  (kotoba-lang/kami-engine, deleted in PR #82 \"Remove Rust workspace from
+  kami-engine\") as zero-dep portable CLJC, per ADR-2607010930 (clj-wgsl
+  migration, com-junkawasaki/root).
+
+  Purpose (from the original crate docstring): the EDN authoring surface for
+  an articulated-scene (robot arm) description. It turns canonical `:arm/*`
+  EDN into an `ArticulatedSystem` (links + joints), using tolerant accessors
+  the same way games parse `scene.edn` — missing keys fall back to defaults,
+  namespaced keywords match on `ns/name`, ints coerce to floats. It also
+  reads the per-joint actuator BOM (`:joint/actuator`) inlined on the chain
+  and validates continuous-torque requirements against assigned actuators.
+
+  This is load-time DATA parsing only: no IO, no GPU, no solver — pure data
+  in, pure data out. The original crate depended on the sibling `kami-scene`
+  crate for its tolerant EDN accessors (`mget`/`num`/`vec3`/`root_map`) and
+  on `kami-articulated` for the `ArticulatedSystem`/`Link`/`Joint`/`Inertia`/
+  `Pose`/`JointKind` types; since those crates are out of scope for this
+  restoration, the small tolerant-accessor surface is reimplemented locally
+  here (trivial given CLJC's native EDN reader), and the domain structs are
+  represented as plain keyword maps rather than a `kami-articulated`
+  dependency.
+
+  The `giemon_arm6` fixture EDN/URDF pair (originally `include_str!`-embedded
+  from `fixtures/giemon_arm6/`) is embedded below as string constants,
+  mirroring the original's `GIEMON_ARM6_EDN` / `GIEMON_ARM6_URDF`.")
+
+#?(:clj (require '[kotoba.lang.edn :as edn])
+   :cljs (require '[cljs.reader :as edn]))
+
+;; ---------------------------------------------------------------------------
+;; Fixtures — canonical giemon_arm6 articulation (source of truth is the EDN;
+;; the URDF is kept as a parity oracle for the ported `edn-urdf-parity` test).
+;; ---------------------------------------------------------------------------
+
+(def giemon-arm6-edn
+  "The canonical giemon_arm6 articulation shipped as EDN (source of truth)."
+";; giemon_arm6 — canonical 6-DOF manipulator articulation, as EDN.
+;;
+;; clj/edn が主(ADR-0040/0042/0046): 本 EDN が正本。giemon_arm6.urdf は
+;; builtin()/parity-oracle として残し、`from_edn(edn) == parse_urdf(urdf)` で検証する。
+;; `from_edn` で kami-genesis World へ流す(kami-articulated は kami-scene-free を維持し、
+;; ローダ/データは kami-articulated-scene 側に置く想定)。
+;;
+;; 単一の真実: 各 joint の :joint/limit(effort=設計連続トルク要求) と
+;; :joint/actuator(割当アクチュエータ=既定 all-qdd BOM) を同じ場所に置く。
+;; 別の :bom リストで二重管理しない。変種は :arm/realization :variants の :override で表す。
+;;
+;; Units: metres / kg / kg·m² / N·m. Links stack along +z; wrist (z,y,y,z,y,z).
+{:arm/name \"giemon_arm6\"
+ :arm/dof 6
+ :arm/units {:length :m :mass :kg :inertia :kg-m2 :torque :n-m}
+ :arm/convention \"links stack along +z; a typical 6-DOF wrist (z,y,y,z,y,z)\"
+ :arm/solver \"kami-genesis 3-D reduced-coordinate spatial solver (RNEA + CRBA) + contact\"
+
+ :arm/base
+ {:link/name \"base_link\"
+  :link/inertial {:origin [0 0 0.04] :mass 2.0
+                  :inertia {:ixx 0.004 :iyy 0.004 :izz 0.004 :ixy 0 :ixz 0 :iyz 0}}}
+
+ ;; 各エントリ = URDF の joint とその child link を1組に束ねたもの(親→子で連鎖)。
+ ;; :joint/actuator は既定(all-qdd)の実機割当。価格は概算 $≒150円/EUR≒165円・税送料別。
+ :arm/chain
+ [{:joint/name \"j1\" :joint/type :revolute :joint/parent \"base_link\" :joint/child \"link1\"
+   :joint/origin [0 0 0.08] :joint/axis [0 0 1]
+   :joint/limit {:lower -3.0 :upper 3.0 :effort 40 :velocity 3} :joint/damping 0.06
+   :joint/actuator {:role :base :model \"RobStride 04\" :cont-nm 40 :peak-nm 120 :ratio \"9:1\"
+                    :mass-kg 1.42 :comm :can :enc :abs-single-turn :price-jpy 42000 :buy \"OpenELAB(EU)/Taobao\"}
+   :child/link {:link/name \"link1\"
+                :link/inertial {:origin [0 0 0.03] :mass 0.6
+                                :inertia {:ixx 0.0012 :iyy 0.0012 :izz 0.0008}}}}
+
+  {:joint/name \"j2\" :joint/type :revolute :joint/parent \"link1\" :joint/child \"link2\"
+   :joint/origin [0 0 0.06] :joint/axis [0 1 0]
+   :joint/limit {:lower -2.2 :upper 2.2 :effort 40 :velocity 3} :joint/damping 0.08
+   :joint/actuator {:role :shoulder :model \"RobStride 04\" :cont-nm 40 :peak-nm 120 :ratio \"9:1\"
+                    :mass-kg 1.42 :comm :can :enc :abs-single-turn :price-jpy 42000 :buy \"OpenELAB(EU)/Taobao\"
+                    :limits-payload true :note \"肩律速。連続40N·m=可搬~1.5-2kg。3kgは :harmonic-shoulder へ\"}
+   :child/link {:link/name \"link2\"
+                :link/inertial {:origin [0 0 0.09] :mass 0.5
+                                :inertia {:ixx 0.0030 :iyy 0.0030 :izz 0.0006}}}}
+
+  {:joint/name \"j3\" :joint/type :revolute :joint/parent \"link2\" :joint/child \"link3\"
+   :joint/origin [0 0 0.18] :joint/axis [0 1 0]
+   :joint/limit {:lower -2.5 :upper 2.5 :effort 30 :velocity 3} :joint/damping 0.06
+   :joint/actuator {:role :elbow :model \"Damiao DM-J10010-2EC\" :cont-nm 40 :peak-nm 150 :ratio \"10:1\"
+                    :comm :can :enc :abs-single-turn :price-jpy 54000 :buy \"Foxtech(在庫あり) $357\"}
+   :child/link {:link/name \"link3\"
+                :link/inertial {:origin [0 0 0.07] :mass 0.35
+                                :inertia {:ixx 0.0016 :iyy 0.0016 :izz 0.0004}}}}
+
+  {:joint/name \"j4\" :joint/type :revolute :joint/parent \"link3\" :joint/child \"link4\"
+   :joint/origin [0 0 0.14] :joint/axis [0 0 1]
+   :joint/limit {:lower -3.0 :upper 3.0 :effort 14 :velocity 4} :joint/damping 0.04
+   :joint/actuator {:role :wrist :model \"Damiao DM-J8009-2EC\" :cont-nm 20 :peak-nm 40 :ratio \"9:1\"
+                    :mass-kg 0.896 :comm :can :enc :dual :price-jpy 33000 :note \"j4(連続14要求)を満たす中型機・やや重い\"}
+   :child/link {:link/name \"link4\"
+                :link/inertial {:origin [0 0 0.04] :mass 0.22
+                                :inertia {:ixx 0.0006 :iyy 0.0006 :izz 0.0003}}}}
+
+  {:joint/name \"j5\" :joint/type :revolute :joint/parent \"link4\" :joint/child \"link5\"
+   :joint/origin [0 0 0.10] :joint/axis [0 1 0]
+   :joint/limit {:lower -2.0 :upper 2.0 :effort 10 :velocity 4} :joint/damping 0.03
+   :joint/actuator {:role :wrist :model \"Unitree GO-M8010-6\" :cont-nm 10 :peak-nm 23.7 :mass-kg 0.53
+                    :price-jpy 60000 :note \"j5 effort=10 を満たす連続~10N·m。余裕僅少(production は一段上推奨)。AK70-10(連続8.3)では不足\"}
+   :child/link {:link/name \"link5\"
+                :link/inertial {:origin [0 0 0.03] :mass 0.16
+                                :inertia {:ixx 0.0003 :iyy 0.0003 :izz 0.0002}}}}
+
+  {:joint/name \"j6\" :joint/type :revolute :joint/parent \"link5\" :joint/child \"link6\"
+   :joint/origin [0 0 0.06] :joint/axis [0 0 1]
+   :joint/limit {:lower -3.0 :upper 3.0 :effort 6 :velocity 5} :joint/damping 0.02
+   :joint/actuator {:role :wrist :model \"CubeMars AK70-10 / Unitree GO-M8010-6\" :cont-nm 8.3 :peak-nm 24.8
+                    :mass-kg 0.521 :price-jpy 60000 :note \"j6 effort=6 に対し連続8.3で可\"}
+   :child/link {:link/name \"link6\"
+                :link/inertial {:origin [0 0 0.025] :mass 0.12
+                                :inertia {:ixx 0.0002 :iyy 0.0002 :izz 0.0001}}}}]
+
+ ;; --- 実機マッピングのメタ層 (Gate-0 deep-research 2026-06-25 で確定)。
+ ;;     既定BOM(all-qdd)は上の :arm/chain の :joint/actuator がそれ。
+ ;;     変種は :variants の :override(joint→actuator 差分)で表す。重複リストは持たない。
+ :arm/realization
+ {:status :gate0-resolved
+  :default :all-qdd
+  :torque-rule \"連続(定格)トルク = ピークの 1/2〜1/3。関節選定は必ず連続値で評価する。\"
+  :key-finding \"QDDの連続トルク上限は約40N·m(RobStride04/DM-J10010)。肘(40-50)・ベース(40-60)は
+                満たすが、肩(60-80連続)を単機で満たすQDDは無い。真3kgの肩は波動歯車が必要。\"
+  :single-source \"各 :arm/chain joint の :joint/limit(effort) と :joint/actuator(cont-nm)を
+                  同じ場所に置き、別の :bom リストでの二重管理を廃した。validate_torque は
+                  同一 joint エントリから設計要求と実機定格を読む。\"
+  :variants
+  {:all-qdd
+   {:payload-kg \"~1.5-2.0\" :total-jpy \"~29-33万\"
+    :note \"上の :arm/chain の :joint/actuator がこの構成。肩40N·m律速・背面駆動性◎・予算内\"}
+   :harmonic-shoulder
+   {:payload-kg 3 :total-jpy \">55-65万(予算超)\"
+    :note \"肩のみ波動歯車へ差し替え。高精度だが高価・低バックドライブ・要ヒートシンク\"
+    :override {\"j2\" {:role :shoulder :model \"Harmonic Drive FHA-25C-H(比100)\" :cont-nm 72 :peak-nm 233
+                     :ratio \"100:1\" :mass-kg 4.6 :comm #{:canopen :ethercat} :enc :abs :price-jpy 250000}}}}
+
+  :encoder-comms-ok \"MyActuator RMD-X V4系=EtherCAT&CAN+出力側絶対値。Damiao/RobStride=CAN+出力軸
+                     シングルターン絶対値(電源断保持)。Harmonic SHA/FHA=絶対値+CANopen/EtherCAT。\"
+  :unresolved
+  [\"肩を単機で満たす安価QDDは証拠集合内に無し(QDD連続上限~40N·m)。2段減速の自作も選択肢\"
+   \"MyActuator RMD-X V4系の連続トルク実数値・国内価格は未確証\"
+   \"AK70-10は品切れ・J4は連続トルクやや不足→AK80-9等の上位も要検討\"
+   \"全機 日本正規代理店少(OpenELAB/Foxtech/Taobao中心)。為替/送料/保守/安全認証に留意\"]}}
+"  )
+
+(def giemon-arm6-urdf
+  "The parity-oracle URDF for giemon_arm6 (asserted equal to the EDN in tests)."
+"<?xml version=\"1.0\"?>
+<!-- GIEMON 6-DOF manipulator — articulation spec (PARITY ORACLE).
+     clj/edn が主 (ADR-0040/0042/0046): 正本は giemon_arm6.edn。この URDF は
+     互換ローダの parity oracle として残し、from_edn(edn) == parse_urdf(urdf) を検証する。
+     Parsed at runtime by kami_articulated::parse_urdf and driven by the
+     kami-genesis 3-D reduced-coordinate spatial solver (RNEA + CRBA) with the
+     contact/collision solver. Links stack along +z; a typical 6-DOF wrist
+     (z, y, y, z, y, z). Units: metres / kg / kg·m². -->
+<robot name=\"giemon_arm6\">
+
+  <link name=\"base_link\">
+    <inertial>
+      <origin xyz=\"0 0 0.04\" rpy=\"0 0 0\"/>
+      <mass value=\"2.0\"/>
+      <inertia ixx=\"0.004\" iyy=\"0.004\" izz=\"0.004\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+  <joint name=\"j1\" type=\"revolute\">
+    <parent link=\"base_link\"/>
+    <child link=\"link1\"/>
+    <origin xyz=\"0 0 0.08\" rpy=\"0 0 0\"/>
+    <axis xyz=\"0 0 1\"/>
+    <limit lower=\"-3.0\" upper=\"3.0\" effort=\"40\" velocity=\"3\"/>
+    <dynamics damping=\"0.06\"/>
+  </joint>
+  <link name=\"link1\">
+    <inertial>
+      <origin xyz=\"0 0 0.03\" rpy=\"0 0 0\"/>
+      <mass value=\"0.6\"/>
+      <inertia ixx=\"0.0012\" iyy=\"0.0012\" izz=\"0.0008\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+  <joint name=\"j2\" type=\"revolute\">
+    <parent link=\"link1\"/>
+    <child link=\"link2\"/>
+    <origin xyz=\"0 0 0.06\" rpy=\"0 0 0\"/>
+    <axis xyz=\"0 1 0\"/>
+    <limit lower=\"-2.2\" upper=\"2.2\" effort=\"40\" velocity=\"3\"/>
+    <dynamics damping=\"0.08\"/>
+  </joint>
+  <link name=\"link2\">
+    <inertial>
+      <origin xyz=\"0 0 0.09\" rpy=\"0 0 0\"/>
+      <mass value=\"0.5\"/>
+      <inertia ixx=\"0.0030\" iyy=\"0.0030\" izz=\"0.0006\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+  <joint name=\"j3\" type=\"revolute\">
+    <parent link=\"link2\"/>
+    <child link=\"link3\"/>
+    <origin xyz=\"0 0 0.18\" rpy=\"0 0 0\"/>
+    <axis xyz=\"0 1 0\"/>
+    <limit lower=\"-2.5\" upper=\"2.5\" effort=\"30\" velocity=\"3\"/>
+    <dynamics damping=\"0.06\"/>
+  </joint>
+  <link name=\"link3\">
+    <inertial>
+      <origin xyz=\"0 0 0.07\" rpy=\"0 0 0\"/>
+      <mass value=\"0.35\"/>
+      <inertia ixx=\"0.0016\" iyy=\"0.0016\" izz=\"0.0004\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+  <joint name=\"j4\" type=\"revolute\">
+    <parent link=\"link3\"/>
+    <child link=\"link4\"/>
+    <origin xyz=\"0 0 0.14\" rpy=\"0 0 0\"/>
+    <axis xyz=\"0 0 1\"/>
+    <limit lower=\"-3.0\" upper=\"3.0\" effort=\"14\" velocity=\"4\"/>
+    <dynamics damping=\"0.04\"/>
+  </joint>
+  <link name=\"link4\">
+    <inertial>
+      <origin xyz=\"0 0 0.04\" rpy=\"0 0 0\"/>
+      <mass value=\"0.22\"/>
+      <inertia ixx=\"0.0006\" iyy=\"0.0006\" izz=\"0.0003\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+  <joint name=\"j5\" type=\"revolute\">
+    <parent link=\"link4\"/>
+    <child link=\"link5\"/>
+    <origin xyz=\"0 0 0.10\" rpy=\"0 0 0\"/>
+    <axis xyz=\"0 1 0\"/>
+    <limit lower=\"-2.0\" upper=\"2.0\" effort=\"10\" velocity=\"4\"/>
+    <dynamics damping=\"0.03\"/>
+  </joint>
+  <link name=\"link5\">
+    <inertial>
+      <origin xyz=\"0 0 0.03\" rpy=\"0 0 0\"/>
+      <mass value=\"0.16\"/>
+      <inertia ixx=\"0.0003\" iyy=\"0.0003\" izz=\"0.0002\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+  <joint name=\"j6\" type=\"revolute\">
+    <parent link=\"link5\"/>
+    <child link=\"link6\"/>
+    <origin xyz=\"0 0 0.06\" rpy=\"0 0 0\"/>
+    <axis xyz=\"0 0 1\"/>
+    <limit lower=\"-3.0\" upper=\"3.0\" effort=\"6\" velocity=\"5\"/>
+    <dynamics damping=\"0.02\"/>
+  </joint>
+  <link name=\"link6\">
+    <inertial>
+      <origin xyz=\"0 0 0.025\" rpy=\"0 0 0\"/>
+      <mass value=\"0.12\"/>
+      <inertia ixx=\"0.0002\" iyy=\"0.0002\" izz=\"0.0001\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/>
+    </inertial>
+  </link>
+
+</robot>
+"  )
+
+;; ---------------------------------------------------------------------------
+;; Errors — the original's `thiserror` `Error` enum, as tagged maps raised
+;; via `ex-info`. `:error/type` is one of the keywords below; `ex-message`
+;; carries the human-readable text (same wording as the Rust `#[error(...)]`
+;; messages).
+;; ---------------------------------------------------------------------------
+
+(def error-types
+  "Valid `:error/type` values raised by this namespace (mirrors the original
+  `Error` enum variants: NotAMap / NoBase / NoChain / BadChainEntry /
+  NoLinkName / NoJointName / NoRealization / NoBom / NoDefaultBom)."
+  #{:not-a-map :no-base :no-chain :bad-chain-entry :no-link-name
+    :no-joint-name :no-realization :no-bom :no-default-bom})
+
+(defn- arm-error
+  [type message data]
+  (ex-info message (merge {:error/type type} data)))
+
+;; ---------------------------------------------------------------------------
+;; Tolerant EDN accessors — a local, minimal reimplementation of the subset
+;; of `kami-scene`'s tolerant accessors this crate used (`mget`/`num`/`vec3`/
+;; `root_map`). CLJC's native EDN reader already gives typed values (keywords,
+;; numbers, vectors, maps), so these mostly just add defaulting/coercion.
+;; ---------------------------------------------------------------------------
+
+(defn root-map
+  "Parse `src` as EDN and return it iff the top-level form is a map, else nil."
+  [src]
+  (let [v (edn/read-string src)]
+    (when (map? v) v)))
+
+(defn mget
+  "Tolerant map accessor: `(mget m \"arm/name\")` reads `(:arm/name m)` — `k` is
+  a bare or namespaced key name string, converted to a keyword (Clojure's
+  `keyword` already splits on `/`). Returns nil if `m` is not a map."
+  [m k]
+  (when (map? m) (get m (keyword k))))
+
+(defn num*
+  "Coerce an EDN value to a double, defaulting missing/nil to 0.0 (mirrors
+  the original `num` helper: ints coerce to floats, missing keys are 0.0)."
+  [v]
+  (double (or v 0)))
+
+(defn kw-name*
+  "Read a keyword *value* (`:revolute`) as its bare name (`\"revolute\"`),
+  else nil."
+  [v]
+  (when (keyword? v) (name v)))
+
+(defn vec3*
+  "`[x y z]` -> `[x y z]` as doubles, defaulting to `[0.0 0.0 0.0]` when `v`
+  is not a 3-vector."
+  [v]
+  (if (and (vector? v) (= 3 (count v)))
+    (mapv double v)
+    [0.0 0.0 0.0]))
+
+(defn pose-xyz
+  "`[x y z]` -> a `Pose` map. `:rpy` is always zero in this schema, mirroring
+  the URDF fixtures which carry no rpy."
+  [v]
+  {:xyz (vec3* v) :rpy [0.0 0.0 0.0]})
+
+;; ---------------------------------------------------------------------------
+;; Domain data — `ArticulatedSystem` / `Link` / `Joint` / `Inertia` / `Pose`
+;; are plain keyword maps (the original's Rust structs). `JointKind` is a
+;; keyword drawn from `joint-kind-values`.
+;; ---------------------------------------------------------------------------
+
+(def joint-kind-values
+  "Valid `:joint/kind` values (mirrors the original `JointKind` enum)."
+  #{:revolute :prismatic :fixed :continuous})
+
+(def default-inertia
+  "The zero `Inertia` (mirrors `Inertia::default()`)."
+  {:mass 0.0 :ixx 0.0 :iyy 0.0 :izz 0.0 :ixy 0.0 :ixz 0.0 :iyz 0.0
+   :com {:xyz [0.0 0.0 0.0] :rpy [0.0 0.0 0.0]}})
+
+(defn inertia-of
+  "Build an `Inertia` map from a map that contains a `:link/inertial` sub-map."
+  [link-map]
+  (let [inr (mget link-map "link/inertial")]
+    (if-not (map? inr)
+      default-inertia
+      (let [inertia (mget inr "inertia")
+            g (fn [k] (if (map? inertia) (num* (mget inertia k)) 0.0))]
+        {:mass (num* (mget inr "mass"))
+         :ixx (g "ixx") :iyy (g "iyy") :izz (g "izz")
+         :ixy (g "ixy") :ixz (g "ixz") :iyz (g "iyz")
+         :com (pose-xyz (mget inr "origin"))}))))
+
+(defn link-of
+  "Build a `Link` map from a `:link/*` map. Throws `:no-link-name` if
+  `:link/name` is missing."
+  [link-map]
+  (let [nm (mget link-map "link/name")]
+    (when-not (string? nm)
+      (throw (arm-error :no-link-name "link map missing `:link/name`" {})))
+    {:link/name nm :link/inertia (inertia-of link-map)}))
+
+(defn joint-kind
+  "String -> `JointKind` keyword, defaulting unknown strings to `:revolute`
+  (mirrors the original `joint_kind` match with its `_ => Revolute` arm)."
+  [s]
+  (case s
+    "prismatic" :prismatic
+    "fixed" :fixed
+    "continuous" :continuous
+    :revolute))
+
+(defn link-index
+  "Index of the link named `nm` in `sys`, else nil."
+  [sys nm]
+  (first (keep-indexed (fn [i l] (when (= (:link/name l) nm) i)) (:links sys))))
+
+(defn joint-index
+  "Index of the joint named `nm` in `sys`, else nil."
+  [sys nm]
+  (first (keep-indexed (fn [i j] (when (= (:joint/name j) nm) i)) (:joints sys))))
+
+(defn from-edn
+  "Parse canonical `:arm/*` EDN into an `ArticulatedSystem` map
+  (`{:name :links :joints}`). Link order matches URDF document order: the
+  base link first, then each chain entry's `:child/link` in declaration
+  order. Throws `ex-info` (see `error-types`) on malformed input."
+  [src]
+  (let [root (root-map src)
+        _ (when-not root (throw (arm-error :not-a-map "arm EDN root is not a map" {})))
+        arm-name (or (mget root "arm/name") "robot")
+        base (mget root "arm/base")
+        _ (when-not (map? base) (throw (arm-error :no-base "`:arm/base` missing or not a map" {})))
+        base-link (link-of base)
+        chain (mget root "arm/chain")
+        _ (when-not (vector? chain) (throw (arm-error :no-chain "`:arm/chain` missing or not a vector" {})))]
+    (loop [i 0, entries (seq chain), links [base-link], joints []]
+      (if (empty? entries)
+        {:name arm-name :links links :joints joints}
+        (let [entry (first entries)
+              e (when (map? entry) entry)
+              _ (when-not e (throw (arm-error :bad-chain-entry (str "chain entry " i " is not a well-formed map") {:index i})))
+              jname (mget e "joint/name")
+              _ (when-not (string? jname) (throw (arm-error :no-joint-name (str "chain joint " i " missing `:joint/name`") {:index i})))
+              kind (joint-kind (or (kw-name* (mget e "joint/type")) "revolute"))
+              axis (vec3* (mget e "joint/axis"))
+              limit (mget e "joint/limit")
+              lg (fn [k] (if (map? limit) (num* (mget limit k)) 0.0))
+              joint {:joint/name jname
+                     :joint/kind kind
+                     :joint/parent (or (mget e "joint/parent") "")
+                     :joint/child (or (mget e "joint/child") "")
+                     :joint/origin (pose-xyz (mget e "joint/origin"))
+                     :joint/axis axis
+                     :joint/lower (lg "lower")
+                     :joint/upper (lg "upper")
+                     :joint/effort (lg "effort")
+                     :joint/velocity (lg "velocity")
+                     :joint/damping (num* (mget e "joint/damping"))
+                     :joint/friction (num* (mget e "joint/friction"))}
+              child (mget e "child/link")
+              _ (when-not (map? child) (throw (arm-error :bad-chain-entry (str "chain entry " i " is not a well-formed map") {:index i})))
+              link (link-of child)]
+          (recur (inc i) (rest entries) (conj links link) (conj joints joint)))))))
+
+(defn giemon-arm6
+  "Load the shipped giemon_arm6 articulation from its canonical EDN."
+  []
+  (from-edn giemon-arm6-edn))
+
+;; ---------------------------------------------------------------------------
+;; Realization layer (`:arm/realization`) — actuator BOM <-> sim integrity.
+;; ---------------------------------------------------------------------------
+
+(defn actuator-of
+  "One actuator assignment (`ActuatorChoice`) from a `:joint/actuator` map."
+  [joint a]
+  {:actuator/joint joint
+   :actuator/model (or (mget a "model") "")
+   :actuator/cont-nm (num* (mget a "cont-nm"))
+   :actuator/peak-nm (num* (mget a "peak-nm"))})
+
+(defn chain-actuators-from-edn
+  "Read the per-joint actuators inlined on `:arm/chain` (`:joint/actuator`).
+  This *is* the default (`:all-qdd`) BOM — there is no separate `:bom` list."
+  [src]
+  (let [root (root-map src)
+        _ (when-not root (throw (arm-error :not-a-map "arm EDN root is not a map" {})))
+        chain (mget root "arm/chain")
+        _ (when-not (vector? chain) (throw (arm-error :no-chain "`:arm/chain` missing or not a vector" {})))]
+    (into []
+          (keep (fn [entry]
+                  (when (map? entry)
+                    (let [jname (mget entry "joint/name")]
+                      (when (string? jname)
+                        (let [a (mget entry "joint/actuator")]
+                          (when (map? a) (actuator-of jname a))))))))
+          chain)))
+
+(defn default-bom-from-edn
+  "The default BOM is the inline chain actuators (single source of truth)."
+  [src]
+  (chain-actuators-from-edn src))
+
+(defn bom-from-edn
+  "BOM for a named `variant` (a string). The base is the inline chain
+  actuators; the `:default` variant returns them unchanged, any other
+  variant applies `:arm/realization :variants <variant> :override` (a
+  `{joint actuator}` map) on top. Unknown variants throw `:no-bom`."
+  [src variant]
+  (let [base (chain-actuators-from-edn src)
+        root (root-map src)
+        real (mget root "arm/realization")
+        _ (when-not (map? real) (throw (arm-error :no-realization "`:arm/realization` missing or not a map" {})))
+        default-v (kw-name* (mget real "default"))
+        _ (when-not default-v (throw (arm-error :no-default-bom "`:arm/realization :default` (default BOM variant) missing" {})))]
+    (if (= variant default-v)
+      base
+      (let [variants (mget real "variants")
+            vmap (when (map? variants) (mget variants variant))
+            _ (when-not (map? vmap)
+                (throw (arm-error :no-bom (str "BOM variant `" variant "` not found under `:arm/realization :variants`") {:variant variant})))
+            over (mget vmap "override")]
+        (if (map? over)
+          (reduce-kv
+           (fn [acc jname am]
+             (if-not (and (string? jname) (map? am))
+               acc
+               (let [choice (actuator-of jname am)
+                     idx (first (keep-indexed (fn [i c] (when (= (:actuator/joint c) jname) i)) acc))]
+                 (if idx (assoc acc idx choice) (conj acc choice)))))
+           base
+           over)
+          base)))))
+
+(defn validate-torque
+  "Check each chain joint's continuous-torque requirement (`:joint/effort`)
+  against its assigned actuator's rated continuous torque in `bom`. Returns
+  the under-spec'd joints (`TorqueViolation` maps; empty ⇒ the BOM can hold
+  the sim spec continuously). Joints with no actuator in `bom` are skipped."
+  [sys bom]
+  (into []
+        (keep (fn [j]
+                (when-let [a (first (filter #(= (:actuator/joint %) (:joint/name j)) bom))]
+                  ;; Tiny epsilon so a spec that exactly meets the rating passes.
+                  (when (> (:joint/effort j) (+ (:actuator/cont-nm a) 1e-4))
+                    {:violation/joint (:joint/name j)
+                     :violation/model (:actuator/model a)
+                     :violation/required-nm (:joint/effort j)
+                     :violation/cont-nm (:actuator/cont-nm a)}))))
+        (:joints sys)))
