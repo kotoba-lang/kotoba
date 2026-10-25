@@ -1,0 +1,2 @@
+declare module "dmn-js";
+
