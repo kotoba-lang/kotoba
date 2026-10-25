@@ -1,0 +1,143 @@
+(ns kotoba.component-heap-test
+  "ADR 0076 section 4a, step 1: a component module has a real linear memory and
+  a real bump `cm32p2_realloc`.
+
+  A component cannot import `kotoba:typed`/`kotoba:heap`, so anything that is
+  not a bare scalar must live in the module's own memory. Until now the emitter
+  declared a zero-page memory and a realloc whose whole body was `i32.const 0`.
+  These tests run the emitted allocator, rather than inspecting it, because a
+  byte-level port is exactly the kind of change that can look right and be
+  wrong."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [kotoba.wasm.core :as wasm]
+            [kotoba.wasm.tools :as wasm-tools]))
+
+(def ^:private wasmtime-binary
+  "Resolve the Wasmtime CLI the same way `scripts/wasmtime_tool.cljs` installs
+   it: the pinned, SHA-verified binary under `.tools/wasmtime/wasmtime` that
+   `npm run test-wasmtime` downloads. The CI `test` job runs that step before
+   `kbb -M:test`, so the binary is present there even though it is not on
+   PATH -- invoking a bare `\"wasmtime\"` PATH lookup is what left this test
+   erroring in CI. Fall back to a PATH lookup for local machines that have
+   Wasmtime installed directly."
+  (let [pinned (kio/file ".tools/wasmtime/wasmtime")]
+    (if (kio/can-execute? pinned) (str pinned) "wasmtime")))
+
+(def ^:private scalar-kir
+  {:format :kotoba.kir/v4 :exports ['add] :schemas {}
+   :functions [{:name 'add :params ['l 'r] :param-types [:i64 :i64]
+                :result :i64 :body '(+ l r)}]})
+
+(defn- component-core-bytes []
+  (wasm/emit-component-core scalar-kir :wasm32-wasi-kotoba-v1))
+
+(defn- with-temp-module
+  "Write the emitted core module to a temp file and hand the path to `f`."
+  [f]
+  (let [dir (kio/temp-dir "kotoba-heap-")
+        module (kio/file dir "core.wasm")]
+    (try
+      (kio/write-bytes module ^bytes (component-core-bytes))
+      (f (str module))
+      (finally
+        (kio/delete-if-exists module)
+        (kio/delete-if-exists dir)))))
+
+(deftest emitted-component-module-is-valid-wasm
+  (testing "the module with a real memory and allocator still validates"
+    (with-temp-module
+      (fn [path]
+        ;; wasm-tools validate exits non-zero on a malformed module, and
+        ;; run-command! turns that into an exception -- so reaching the
+        ;; assertion at all is the check.
+        (is (string? (wasm-tools/run-command!
+                      ["wasm-tools" "validate" "--features" "all" path])))))))
+
+(deftest module-declares-a-usable-memory-and-arena
+  (with-temp-module
+    (fn [path]
+      (let [text (wasm-tools/run-command! ["wasm-tools" "print" path])]
+        (testing "memory is no longer zero pages"
+          ;; wasm-tools prints `(memory (;0;) 1)`; the index comment contains a
+          ;; `)`, so match the declared minimum after it rather than before.
+          (is (re-find #"\(memory \(;\d+;\) [1-9]" text)
+              "a component module must declare at least one page"))
+        (testing "the bump pointer is a mutable i32 global, not address 0"
+          (is (re-find #"\(global.*mut i32" text))
+          (is (= 8 wasm/component-arena-base)
+              "address 0 must stay reserved for the Canonical ABI's null old-ptr"))
+        (testing "fuel stays global 0 so every prologue is unchanged"
+          ;; The fuel global must be declared before the bump pointer.
+          (let [fuel-at (str/index-of text "mut i64")
+                next-at (str/index-of text "mut i32")]
+            (is (and fuel-at next-at (< fuel-at next-at)))))
+        (testing "realloc is no longer a stub"
+          (is (re-find #"cm32p2_realloc" text))
+          (is (re-find #"memory\.copy" text)
+              "grow must preserve old content, as the Canonical ABI requires"))))))
+
+(deftest arena-capacity-and-declared-memory-cannot-drift
+  ;; ADR 0077 decision 3. These two constants live in different places and are
+  ;; edited for different reasons; nothing else in the build would notice one
+  ;; moving without the other. A capacity above the declared memory lets a write
+  ;; run off it; below, a declared page is wasted.
+  (testing "capacity is exactly the declared memory"
+    (is (= wasm/component-arena-capacity
+           (* wasm/component-memory-pages 65536))))
+  (testing "the arena covers a maximum request and result in one call"
+    ;; wasm/component-vector-item-budget i64 elements: the per-host budget the
+    ;; memory is sized from (adr-2609242100 P1), no longer the language's
+    ;; value/vector-item-limit (2^24 since 2026-09-16, which would need 257
+    ;; pages). If the budget moves, the page count must move with it.
+    (is (<= (* 2 wasm/component-vector-item-budget 8)
+            (- wasm/component-arena-capacity wasm/component-arena-base))
+        "maximum :vector-i64 request and result must coexist above the base"))
+  (testing "the module declares the pages the capacity assumes"
+    (with-temp-module
+      (fn [path]
+        (let [text (wasm-tools/run-command! ["wasm-tools" "print" path])]
+          (is (re-find (re-pattern (str "\\(memory \\(;\\d+;\\) "
+                                        wasm/component-memory-pages))
+                       text)))))))
+
+(deftest allocator-behaviour-is-exercised-not-assumed
+  (with-temp-module
+    (fn [path]
+      ;; The execution below only means anything if the module can be
+      ;; instantiated standalone. Assert that rather than skipping quietly:
+      ;; a scalar component core must not carry host imports at all.
+      (is (not (str/includes? (wasm-tools/run-command! ["wasm-tools" "print" path])
+                              "(import"))
+          "a scalar component core module must have no imports")
+      ;; This is a core module, not a component: wasmtime takes the export
+      ;; name and the arguments as separate positional args. The WAVE call
+      ;; syntax `f(a, b)` is for components only.
+      (letfn [(call [& args]
+                ;; run-command! merges stderr, and wasmtime prints two
+                ;; `--invoke is experimental` warnings before the value, so
+                ;; take the last non-blank line rather than the whole output.
+                ;; On nbb the merge is stdout THEN stderr, so the warnings come
+                ;; last; drop them by their prefix rather than by position.
+                (->> (wasm-tools/run-command!
+                      (concat [wasmtime-binary "run" "--invoke" "cm32p2_realloc" path]
+                              (map str args)))
+                     str str/split-lines
+                     (remove str/blank?)
+                     (remove #(str/starts-with? (str/trim %) "warning:"))
+                     last str/trim))]
+        ;; wasmtime prints the returned i32; a trap makes run-command! throw.
+        (testing "a zero-sized request returns the null pointer"
+          (is (= "0" (call 0 0 8 0))))
+        (testing "allocations start at the arena base and advance"
+          (let [first-ptr (call 0 0 8 16)]
+            (is (= (str wasm/component-arena-base) first-ptr))))
+        (testing "an over-capacity request traps rather than corrupting memory"
+          (is (thrown? kerror/ExceptionInfo
+                       (call 0 0 8 (inc wasm/component-arena-capacity)))))
+        (testing "a non-power-of-two alignment traps"
+          (is (thrown? kerror/ExceptionInfo (call 0 0 3 8))))
+        (testing "an alignment beyond 8 traps"
+          (is (thrown? kerror/ExceptionInfo (call 0 0 16 8))))
+        (testing "a zero alignment traps"
+          (is (thrown? kerror/ExceptionInfo (call 0 0 0 8))))))))

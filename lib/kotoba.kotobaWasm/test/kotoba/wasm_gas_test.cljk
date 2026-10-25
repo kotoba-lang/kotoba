@@ -1,0 +1,105 @@
+(ns kotoba.wasm-gas-test
+  "Consensus gas on the Wasm emitter (superproject adr-2610092340 D12): one
+  debit per evaluated KIR application form, weighed by the schedule, the same
+  count osaho's reference interpreter (`kotoba.kir/execute-metered`) makes.
+  The modules and counts here are the ones osaho's `kotoba.kir-gas-test`
+  asserts, so the two suites state the same numbers. Every count is shown in
+  both directions: the module answers at exactly that gas and traps one unit
+  short."
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.wasm.core :as wasm]))
+
+(defn- lit [n] #?(:clj (long n) :cljs (js/BigInt n)))
+
+(def v0
+  {:gas-schedule/id :kotoba.gas/v0-draft :gas-schedule/version 0
+   :call 1 :default 1 :weights {}})
+
+(defn- module [& functions]
+  {:format :kotoba.kir/v3 :exports ['main] :functions (vec functions)})
+
+(defn- fn-of [name params body]
+  {:name name :params params :result :i64 :effects #{} :body body})
+
+;; (+ 1 (* 2 3)): two application forms.
+(def arithmetic
+  (module (fn-of 'main [] (list '+ (lit 1) (list '* (lit 2) (lit 3))))))
+
+;; (sq 3) is a call, (* x x) inside it a builtin.
+(def call
+  (module (fn-of 'sq '[x] '(* x x)) (fn-of 'main [] (list 'sq (lit 3)))))
+
+;; Only the taken arm: if, <, + -- the (* 9 9) never runs.
+(def branch
+  (module (fn-of 'main [] (list 'if (list '< (lit 1) (lit 2))
+                                (list '+ (lit 1) (lit 1))
+                                (list '* (lit 9) (lit 9))))))
+
+;; Ten iterations of a loop helper: 1 + 10*5 + 2 = 53 (see osaho's test).
+(def counted-loop
+  (module (fn-of '__kotoba_loop_1 '[i acc]
+                 (list 'if (list '< 'i (lit 10))
+                       (list '__kotoba_loop_1 (list '+ 'i (lit 1)) (list '+ 'acc 'i))
+                       'acc))
+          (fn-of 'main [] (list '__kotoba_loop_1 (lit 0) (lit 0)))))
+
+(defn- emit [kir gas schedule]
+  (wasm/emit kir :wasm32-kotoba-v1 {:fuel 100000 :gas gas :gas-schedule schedule}))
+
+#?(:cljs
+   (defn- run [kir gas schedule]
+     (try {:value (str (.main (.-exports (js/WebAssembly.Instance.
+                                          (js/WebAssembly.Module. (emit kir gas schedule)) #js {}))))}
+          (catch :default e
+            (if (= "RuntimeError" (.-name e)) {:trap true} {:other (.-message e)})))))
+
+#?(:cljs
+   (defn- answers-at-and-traps-below [kir used expected schedule]
+     (is (= {:value expected} (run kir used schedule)))
+     (is (= {:trap true} (run kir (dec used) schedule)))))
+
+#?(:cljs
+   (deftest one-debit-per-evaluated-application-form
+     (answers-at-and-traps-below arithmetic 2 "7" v0)
+     (answers-at-and-traps-below call 2 "9" v0)
+     (answers-at-and-traps-below branch 3 "2" v0)
+     (answers-at-and-traps-below counted-loop 53 "45" v0)))
+
+#?(:cljs
+   (deftest the-schedule-sets-the-weights
+     (answers-at-and-traps-below arithmetic 6 "7" (assoc v0 :weights {'* 5}))
+     (answers-at-and-traps-below call 11 "9" (assoc v0 :call 10))))
+
+(defn- refusal-of [thunk]
+  (try (thunk) :no-refusal
+       (catch #?(:clj Throwable :cljs :default) e (:reason (ex-data e)))))
+
+(deftest gas-and-its-schedule-come-together-or-not-at-all
+  (is (= :gas-schedule (refusal-of #(wasm/emit call :wasm32-kotoba-v1 {:gas 10}))))
+  (is (= :gas-outside-admitted-range
+         (refusal-of #(wasm/emit call :wasm32-kotoba-v1 {:gas-schedule v0}))))
+  (is (= :gas-schedule (refusal-of #(emit call 10 (assoc v0 :default 0)))))
+  (is (= :gas-schedule (refusal-of #(emit call 10 (assoc v0 :weights {'* -1}))))))
+
+;; The check half of every debit: i64.const 0; i64.lt_s; if; unreachable;
+;; end. Fuel's check is `eqz`, so this sequence counts gas debits only.
+(def gas-check [0x42 0x00 0x53 0x04 0x40 0x00 0x0b])
+
+(defn- subvector-count [haystack needle]
+  (count (filter #(= needle (vec %)) (partition (count needle) 1 haystack))))
+
+(deftest a-typed-module-is-metered-by-the-same-rule
+  ;; Since 2026-10-10 the typed (KIR v4) emitter puts the same per-form debit
+  ;; in front of every application form. Its RUN-TIME counts are compared
+  ;; with osaho and native by amu's fuel differential (--gas); recursive-list
+  ;; is 19011 on all four backends. Here: one debit per written form.
+  (let [typed-call (assoc call :format :kotoba.kir/v4
+                          :functions [{:name 'sq :params '[x] :param-types [:i64] :result :i64
+                                       :effects #{} :body '(* x x)}
+                                      {:name 'main :params [] :param-types [] :result :i64
+                                       :effects #{} :body (list 'sq (lit 3))}])]
+    (is (= 2 (subvector-count (vec (emit typed-call 10 v0)) gas-check))
+        "(sq 3) and (* x x)")
+    (is (zero? (subvector-count (vec (wasm/emit typed-call :wasm32-kotoba-v1 {:fuel 100000})) gas-check))
+        "no debit without a schedule")))
