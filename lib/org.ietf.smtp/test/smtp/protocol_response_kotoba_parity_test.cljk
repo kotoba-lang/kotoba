@@ -1,0 +1,219 @@
+;; `kotoba/smtp/protocol_response.kotoba` against `smtp.protocol/response-line`.
+;;
+;; The slice is reply-line structure: three digits, one separator, text.
+;; ADR-2608650000 decision 6 says a design that scans with a regular
+;; expression gets the design change before the migration, not a wait for
+;; regex to be admitted. RFC 5321 4.2 fixes the first four octets, so the
+;; parse is positional and needs no scan at all.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+;;
+;; The negative control is `separator-swap-must-go-red`: a guest that reads
+;; "-" as final inverts multiline continuation. It asserts the mutation
+;; actually changed the emitted value BEFORE asserting disagreement, so a
+;; guest broken some other way cannot be counted as the control firing.
+
+(ns smtp.protocol-response-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [smtp.protocol :as p]))
+
+(def ^:private kotoba-file
+  (io/file (System/getProperty "user.dir") "kotoba" "smtp" "protocol_response.kotoba"))
+
+(def ^:private cljk-file
+  (io/file (System/getProperty "user.dir") "kotoba" "smtp" "protocol_response.cljk"))
+
+(defn- source-available? []
+  (let [kotoba? (io/exists? kotoba-file)
+        cljk? (io/exists? cljk-file)]
+    (is kotoba? (str "kotoba object not found at " kotoba-file))
+    (is cljk? (str "cljk object not found at " cljk-file))
+    (and kotoba? cljk?)))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp kotoba-file) :wasm32-kotoba-v1 {}))))
+
+(def ^:private cljk-kir
+  (delay (:kir (compiler/compile-source (slurp cljk-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [compiled f args]
+  (ir/execute compiled f args))
+
+;; Every line the transport can hand `smtp.client`: well formed finals,
+;; continuations, and the four ways to be malformed (too short, non-digit,
+;; wrong separator, empty).
+(def ^:private lines
+  ["250 OK"
+   "250-STARTTLS"
+   "250-mail.example.com Hello"
+   "250 "
+   "250-"
+   "220 mail.example.com ESMTP ready"
+   "334 "
+   "354 Start mail input; end with <CRLF>.<CRLF>"
+   "421 Service not available"
+   "550 5.1.1 No such user"
+   "999 Out of range but well formed"
+   "000 Zero is three digits"
+   "25 Too short"
+   "2500 OK"
+   "abc OK"
+   "25x OK"
+   "250:OK"
+   "250"
+   ""
+   " 250 OK"])
+
+;; The oracle read through the four accessors the guest exports.
+(defn- oracle [line]
+  (let [r (p/response-line line)]
+    {:line? (some? r)
+     :code (if r (:code r) -1)
+     :final? (boolean (and r (:final? r)))
+     :text (if r (:text r) "")}))
+
+(deftest kotoba-response-objects-are-present
+  (source-available?))
+
+(deftest response-structure-agrees-with-the-cljc-oracle
+  (when (source-available?)
+    (doseq [line lines]
+      (let [{:keys [line? code final? text]} (oracle line)]
+        (is (= line? (call @kir 'response-line? [line])) (str "response-line? " (pr-str line)))
+        (is (= code (call @kir 'response-code [line])) (str "response-code " (pr-str line)))
+        (is (= final? (call @kir 'response-final? [line])) (str "response-final? " (pr-str line)))
+        (is (= text (call @kir 'response-text [line])) (str "response-text " (pr-str line)))))))
+
+(deftest cljk-twin-agrees-with-the-kotoba-guest
+  (when (source-available?)
+    (doseq [line lines
+            f '[response-line? response-code response-final? response-text]]
+      (is (= (call @kir f [line]) (call @cljk-kir f [line]))
+          (str "cljk drifted from kotoba on " f " " (pr-str line))))))
+
+(deftest separator-swap-must-go-red
+  "Reading \"-\" as final inverts multiline continuation: the client would
+  stop reading an EHLO response after its first line. Assert the mutation
+  changed the emitted value first — a guest that fails to compile, or fails
+  for some other reason, must not be counted as this control firing."
+  (when (source-available?)
+    (let [mutated (str/replace (slurp kotoba-file)
+                               "(string=? sep \" \")"
+                               "(string=? sep \"-\")")
+          _ (is (not= mutated (slurp kotoba-file))
+                "the separator test was not found — the control did not mutate anything")
+          mutated-kir (:kir (compiler/compile-source mutated :wasm32-kotoba-v1 {}))
+          continuation (call mutated-kir 'response-final? ["250-STARTTLS"])
+          final (call mutated-kir 'response-final? ["250 OK"])]
+      (is (true? continuation) "the mutation has to actually flip the separator")
+      (is (false? final) "the mutation has to actually flip the separator")
+      (is (not= (:final? (oracle "250-STARTTLS")) continuation)
+          "a continuation line must not pass as final"))))
+
+(deftest embedded-newline-is-a-stated-boundary
+  "`re-matches` with `.` rejects a line containing a newline; the guest's
+  positional parse accepts it as text. `transport/read-line!` returns one
+  CRLF-terminated line WITHOUT the terminator, so no such line reaches
+  either implementation. Asserted rather than omitted, so the difference is
+  on the record instead of hiding inside a passing suite."
+  (when (source-available?)
+    (let [line "250 a\nb"]
+      (is (nil? (p/response-line line)) "the oracle rejects an embedded newline")
+      (is (true? (call @kir 'response-line? [line])) "the guest accepts it")
+      (is (= "a\nb" (call @kir 'response-text [line]))))))
+
+;; ------------------------------------------- enhanced status (RFC 3463)
+
+;; `550` says a message was rejected; `5.1.1` says the mailbox does not exist
+;; and `5.7.1` says it was refused on policy grounds. The transaction records
+;; it per refused recipient, so it is reply-text structure and belongs here.
+(def ^:private texts
+  ["5.1.1 No such user here"
+   "  2.0.0 OK"
+   "\t5.2.2 Mailbox full"
+   "5.7.1"
+   "2.0.0"
+   "4.4.1 retry later"
+   "5.11.222 three-digit subject and detail"
+   ""
+   "OK"
+   "550 5.1.1 the code is not at the front"
+   "3.1.1 class 3 is not an enhanced status"
+   "5.1.1234 detail longer than three digits"
+   "5.1234.1 subject longer than three digits"
+   "5..1 empty subject"
+   "5.1. empty detail"
+   "5.1.1-hyphen still ends the word"
+   "5.1.1_underscore does not"
+   "2.0.0extra"])
+
+(deftest enhanced-status-agrees-with-the-cljc-oracle
+  (when (source-available?)
+    (doseq [text texts]
+      (is (= (or (p/enhanced-status text) "")
+             (call @kir 'enhanced-status [text]))
+          (str "enhanced-status " (pr-str text)))
+      (is (= (call @kir 'enhanced-status [text])
+             (call @cljk-kir 'enhanced-status [text]))
+          (str "cljk drifted on enhanced-status " (pr-str text))))))
+
+(deftest the-word-boundary-must-go-red
+  "Without `\\b`, \"5.1.1234\" reads as the status \"5.1.123\" and a rejection
+  is filed under a code the server never sent. Assert the mutation changed
+  the emitted value before asserting the disagreement."
+  (when (source-available?)
+    (let [mutated (str/replace (slurp kotoba-file)
+                               "(boundary? text d2)"
+                               "(not (boundary? text d2))")
+          _ (is (not= mutated (slurp kotoba-file))
+                "the boundary test was not found — the control mutated nothing")
+          mutated-kir (:kir (compiler/compile-source mutated :wasm32-kotoba-v1 {}))
+          got (call mutated-kir 'enhanced-status ["5.1.1234 detail longer than three digits"])]
+      (is (= "5.1.123" got) "the mutation has to actually drop the boundary")
+      (is (nil? (p/enhanced-status "5.1.1234 detail longer than three digits"))
+          "which the oracle refuses outright"))))
+
+(defn- kotoba-bin []
+  (or (System/getenv "KOTOBA") "kotoba"))
+
+(defn- kotoba-runnable?
+  "Whether the CLI can be EXECUTED, not whether a name resolves on PATH.
+
+  `which` answered yes for a two-line shim whose exec target had been
+  cleaned out of /tmp; the shell then exited 126 and this test reported a
+  compile failure that was really an absent toolchain. Run it and look at
+  the exit code."
+  []
+  (try (zero? (:exit (shell/sh (kotoba-bin) "--help")))
+       (catch Exception _ false)))
+
+(deftest kotoba-cli-compiles-response-sources
+  "The public compile path is the CLI. `-M` is the execution boundary the
+  current CLI requires, the wasm target is `wasm32-browser`, the flag is
+  `--output`, and the source path must be absolute — a relative path comes
+  back `:decode` / \"input could not be read\". Skip rather than fail when
+  no runnable binary is present: that is a host fact, not a disagreement
+  between the two implementations."
+  (when (source-available?)
+    (if (kotoba-runnable?)
+      (let [dir (io/file (System/getProperty "java.io.tmpdir")
+                         (str "smtp-response-" (System/nanoTime)))]
+        (io/mkdirs dir)
+        (doseq [[label src] [["kotoba" kotoba-file] ["cljk" cljk-file]]
+                [target ext] [["wasm32-browser" ".wasm"] ["js-browser" ".mjs"]]
+                :let [out (io/file dir (str label "-" target ext))
+                      result (shell/sh (kotoba-bin) "-M" "compile"
+                                       (io/absolute-path src)
+                                       "--target" target
+                                       "--output" (io/absolute-path out))]]
+          (is (zero? (:exit result))
+              (str label " -M compile --target " target "\n" (:err result) (:out result)))
+          (is (io/file? out) (str label " " target " emitted nothing"))))
+      (println "SKIP kotoba-cli-compiles-response-sources: no runnable"
+               (kotoba-bin) "— set KOTOBA to a working CLI"))))

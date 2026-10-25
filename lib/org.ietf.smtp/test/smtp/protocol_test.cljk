@@ -1,0 +1,118 @@
+(ns smtp.protocol-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [smtp.protocol :as p]))
+
+(deftest response-line-parses-final-vs-continuation-lines
+  (is (= {:code 250 :final? true :text "OK"} (p/response-line "250 OK")))
+  (is (= {:code 250 :final? false :text "PIPELINING"} (p/response-line "250-PIPELINING")))
+  (is (nil? (p/response-line "not a response"))))
+
+(deftest positive-is-true-for-2xx-and-3xx-only
+  (is (true? (p/positive? 250)))
+  (is (true? (p/positive? 354)))
+  (is (false? (p/positive? 421)))
+  (is (false? (p/positive? 550)))
+  (is (false? (p/positive? nil))))
+
+(deftest xoauth2-continue-is-only-334
+  (is (true? (p/xoauth2-continue? 334)))
+  (is (false? (p/xoauth2-continue? 235)))
+  (is (false? (p/xoauth2-continue? 535))))
+
+(deftest auth-pick-distinguishes-empty-auth-from-unimplemented
+  (is (= p/auth-xoauth2 (p/auth-pick-from #{"XOAUTH2"} {:access-token "t"})))
+  (is (= p/auth-plain (p/auth-pick-from #{"PLAIN" "LOGIN"} {:password "pw"})))
+  (is (= p/auth-login (p/auth-pick-from #{"LOGIN"} {:password "pw"})))
+  (is (= p/auth-none (p/auth-pick-from #{} {:password "pw"})))
+  (is (= p/auth-unsupported (p/auth-pick-from #{"GSSAPI"} {:password "pw"}))
+      "GSSAPI-only is not the same as no AUTH line"))
+
+(deftest command-joins-parts-with-spaces-and-crlf-terminates
+  (is (= "EHLO example.com\r\n" (p/command "EHLO" "example.com")))
+  (is (= "QUIT\r\n" (p/command "QUIT")))
+  (is (= "MAIL FROM:<a@b.com>\r\n" (p/command "MAIL" "FROM:<a@b.com>"))))
+
+(deftest named-command-lines-are-the-session-verbs
+  (is (= (p/command "EHLO" "example.com") (p/ehlo-line "example.com")))
+  (is (= (p/command "STARTTLS") (p/starttls-line)))
+  (is (= (p/command "MAIL" "FROM:<a@b.com>") (p/mail-from-line "a@b.com")))
+  (is (= (p/command "RCPT" "TO:<b@c.com>") (p/rcpt-to-line "b@c.com")))
+  (is (= (p/command "DATA") (p/data-line)))
+  (is (= (p/command "RSET") (p/rset-line)))
+  (is (= (p/command "NOOP") (p/noop-line)))
+  (is (= (p/command "QUIT") (p/quit-line)))
+  (is (= (p/command "AUTH" "LOGIN") (p/auth-login-line)))
+  (is (= (p/command "AUTH" "PLAIN" "abc") (p/auth-plain-line "abc")))
+  (is (= (p/command "AUTH" "XOAUTH2" "tok") (p/auth-xoauth2-line "tok")))
+  (is (= "dXNlcg==\r\n" (p/payload-line "dXNlcg==")))
+  (is (= "\r\n" (p/empty-line))))
+
+(deftest dot-stuff-doubles-leading-dots-and-appends-the-terminator
+  (is (= "hello\r\n.\r\n" (p/dot-stuff "hello")))
+  (is (= "..leading dot\r\nplain\r\n.\r\n" (p/dot-stuff ".leading dot\nplain")))
+  (testing "accepts \\r\\n input too"
+    (is (= "a\r\nb\r\n.\r\n" (p/dot-stuff "a\r\nb")))))
+
+(deftest mime-message-builds-headers-and-body
+  (let [msg (p/mime-message {:from "a@x.com" :to "b@x.com" :subject "hi" :body "hello"})]
+    (is (re-find #"From: a@x\.com\r\n" msg))
+    (is (re-find #"To: b@x\.com\r\n" msg))
+    (is (re-find #"Subject: hi\r\n" msg))
+    (is (re-find #"\r\n\r\nhello$" msg))))
+
+(deftest mime-message-includes-in-reply-to-when-given
+  (is (re-find #"In-Reply-To: <1@x>\r\n"
+              (p/mime-message {:from "a" :to "b" :subject "s" :body "" :in-reply-to "<1@x>"}))))
+
+;; --- ESMTP / SASL / enhanced status -----------------------------------------
+
+(deftest parse-extensions-drops-the-greeting-and-upper-cases-keywords
+  (let [ext (p/parse-extensions ["smtp.example.com Hello"
+                                 "SIZE 35882577"
+                                 "8bitmime"
+                                 "AUTH LOGIN PLAIN XOAUTH2"])]
+    (is (= "35882577" (get ext "SIZE")))
+    (is (= "" (get ext "8BITMIME")) "a keyword with no parameter is still there")
+    (is (nil? (get ext "SMTP.EXAMPLE.COM")) "the greeting is not an extension")))
+
+(deftest auth-mechanisms-and-max-size-read-what-a-client-decides-on
+  (let [ext (p/parse-extensions ["greeting" "AUTH PLAIN LOGIN" "SIZE 100"])]
+    (is (= #{"PLAIN" "LOGIN"} (p/auth-mechanisms ext)))
+    (is (= 100 (p/max-size ext))))
+  (testing "absent extensions are nil/empty rather than an error"
+    (is (= #{} (p/auth-mechanisms {})))
+    (is (nil? (p/max-size {})))))
+
+(deftest plain-credentials-carry-the-empty-authorization-identity
+  (is (= (str (char 0) "me" (char 0) "pw") (p/plain-credentials "me" "pw"))))
+
+(deftest xoauth2-credentials-have-the-shape-google-accepts
+  (is (= (str "user=me" (char 0) "auth=Bearer tok" (char 0) (char 0))
+         (p/xoauth2-credentials "me" "tok"))))
+
+(deftest enhanced-status-separates-refusals-that-need-different-answers
+  (testing "550 says rejected; 5.1.1 says no such mailbox and 5.7.1 says
+            refused on policy, which are different conversations to have
+            with whoever sent it"
+    (is (= "5.1.1" (p/enhanced-status "5.1.1 No such user here")))
+    (is (= "5.7.1" (p/enhanced-status "5.7.1 Message refused")))
+    (is (= "2.1.5" (p/enhanced-status "2.1.5 Recipient OK"))))
+  (testing "and a response without one is not invented"
+    (is (nil? (p/enhanced-status "No such user here")))
+    (is (nil? (p/enhanced-status "")))))
+
+(deftest mime-message-renders-many-recipients-and-never-a-bcc
+  (let [msg (p/mime-message {:from "me@example.com"
+                             :to ["a@example.com" "b@example.com"]
+                             :cc "c@example.com"
+                             :bcc "secret@example.com"
+                             :subject "s" :body "hi"})]
+    (is (str/includes? msg "To: a@example.com, b@example.com\r\n"))
+    (is (str/includes? msg "Cc: c@example.com\r\n"))
+    (is (not (str/includes? msg "secret@example.com"))
+        "a blind copy that appears in the message is not blind")))
+
+(deftest mime-message-omits-cc-entirely-when-there-is-none
+  (is (not (str/includes? (p/mime-message {:from "a" :to "b" :subject "s" :body "x"})
+                          "Cc:"))))
