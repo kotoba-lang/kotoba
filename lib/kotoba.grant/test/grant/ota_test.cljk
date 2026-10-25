@@ -1,0 +1,152 @@
+(ns grant.ota-test
+  (:require [grant.ota :as ota]
+            [grant.publisher :as publisher]
+            [grant.update :as update]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def root {:keys #{"k1" "k2"} :threshold 2})
+(def sigs [{:key-id "k1" :verified? true :status-index 0}
+           {:key-id "k2" :verified? true :status-index 1}])
+(def artifacts [{:kind :component :sha256 "aaa"} {:kind :guest :sha256 "bbb"}])
+(def manifest {:manifest-id "m-42" :sequence 42 :signatures sigs
+               :artifact-digests-match? true :timestamp-ms 1000
+               :artifacts artifacts})
+(def pub-state {:installed-sequence 41 :now-ms 2000 :root root :revocation-bits [0 0 0 0]})
+
+(def admission (:aiueos.ota/admission (ota/admit manifest pub-state)))
+
+(defn- ota-state [& {:as over}]
+  (merge {:manifest-id "m-42" :admission admission :now-ms 2000
+          :step :idle :class :blue-green :kinds [:component :guest]
+          :artifacts artifacts
+          :observed-digests {:component "aaa" :guest "bbb"}
+          :previous-preserved? true :rollback-window 1}
+         over))
+
+;; ── admission is stamped with the release it was about ────────────────────
+
+(deftest an-admission-carries-the-release-it-was-about
+  (is (= "m-42" (:manifest-id admission)))
+  (is (= 42 (:sequence admission)))
+  (is (= 2000 (:taken-ms admission))))
+
+(deftest a-refused-release-yields-the-publishers-own-reason
+  (let [v (ota/admit (assoc manifest :sequence 41) pub-state)]
+    (is (= :sequence-not-monotonic (:aiueos.publisher/reason v))
+        "the reason is the publisher's, not a paraphrase"))
+  (is (= :manifest-id-missing (:aiueos.ota/reason (ota/admit (dissoc manifest :manifest-id) pub-state)))))
+
+;; ── THE HOLE THIS NAMESPACE EXISTS TO CLOSE ───────────────────────────────
+
+(deftest a-verdict-about-one-release-cannot-advance-another
+  (testing "grant.update alone accepts any true boolean, whatever it was about"
+    (is (update/granted?
+         (update/admit-step {:step :idle :class :live :kinds [:component]
+                             :publisher-admitted? true}))
+        "this is the seam: a bare boolean, unbound to a release"))
+  (testing "ota refuses, because the admission names the release it was about"
+    (let [v (ota/advance (ota-state :manifest-id "m-43"))]
+      (is (= :admission-for-another-release (:aiueos.ota/reason v)))
+      (is (= "m-42" (:aiueos.ota/admitted-id v)))
+      (is (= "m-43" (:aiueos.ota/in-hand-id v))))))
+
+(deftest an-admission-goes-cold
+  (let [late (+ 2000 (:max-admission-age-ms ota/default-policy) 1)
+        v (ota/advance (ota-state :now-ms late))]
+    (is (= :admission-expired (:aiueos.ota/reason v))
+        "staging can take minutes, and a freeze attack is exactly time passing"))
+  (is (ota/granted? (ota/advance (ota-state :now-ms (+ 2000 60000))))))
+
+(deftest no-admission-at-all-is-its-own-reason
+  (is (= :no-admission (:aiueos.ota/reason (ota/advance (ota-state :admission nil))))))
+
+;; ── artifacts ─────────────────────────────────────────────────────────────
+
+(deftest bytes-must-be-what-the-manifest-named
+  (is (= :artifact-digest-mismatch
+         (:aiueos.ota/reason (ota/advance (ota-state :observed-digests
+                                                     {:component "aaa" :guest "WRONG"})))))
+  (is (= [:guest] (:aiueos.ota/mismatched
+                   (ota/advance (ota-state :observed-digests
+                                           {:component "aaa" :guest "WRONG"}))))))
+
+(deftest a-half-fetched-update-is-refused-not-partially-applied
+  (let [v (ota/advance (ota-state :observed-digests {:component "aaa"}))]
+    (is (= :artifact-missing (:aiueos.ota/reason v)))
+    (is (= [:guest] (:aiueos.ota/missing v)))))
+
+(deftest verify-artifacts-reports-both-kinds-of-wrong
+  (let [r (ota/verify-artifacts artifacts {:component "zzz"})]
+    (is (false? (:aiueos.ota/ok? r)))
+    (is (= [:guest] (:aiueos.ota/missing r)))
+    (is (= [:component] (:aiueos.ota/mismatched r))))
+  (is (true? (:aiueos.ota/ok? (ota/verify-artifacts artifacts {:component "aaa" :guest "bbb"})))))
+
+;; ── the step machine still owns the step rules ────────────────────────────
+
+(deftest update-rules-pass-through-unchanged
+  (is (= :no-previous-version-preserved
+         (:aiueos.update/reason (ota/advance (ota-state :step :staged
+                                                        :previous-preserved? false)))))
+  (is (= :health-unknown
+         (:aiueos.update/reason (ota/advance (ota-state :step :probing)))))
+  (is (= :consent-required
+         (:aiueos.update/reason (ota/advance (ota-state :step :probing :class :ab-reboot
+                                                        :kinds [:kernel] :health :pass))))))
+
+(deftest a-clean-run-advances
+  (is (ota/granted? (ota/advance (ota-state))))
+  (is (= :fetched (:aiueos.update/step (ota/advance (ota-state)))))
+  (is (ota/granted? (ota/advance (ota-state :step :probing :health :pass)))))
+
+;; ── receipts ──────────────────────────────────────────────────────────────
+
+(def good-receipt
+  (ota/receipt {:manifest-id "m-42" :sequence 42 :class :blue-green :outcome :committed
+                :previous-digest "p1" :updated-digest "u1" :recovery-digest "r1"
+                :artifacts artifacts :admission admission :committed-ms 3000}))
+
+(deftest a-receipt-checks-out-against-its-manifest
+  (is (true? (:aiueos.ota/valid? (ota/verify-receipt good-receipt manifest "r1")))))
+
+(deftest a-receipt-for-another-release-does-not-check-out
+  (is (= [:manifest-id-mismatch]
+         (:aiueos.ota/faults (ota/verify-receipt good-receipt (assoc manifest :manifest-id "m-99") "r1")))))
+
+(deftest a-moved-recovery-partition-is-a-fault
+  (is (= [:recovery-moved]
+         (:aiueos.ota/faults (ota/verify-receipt good-receipt manifest "r-CHANGED")))))
+
+(deftest a-commit-that-changed-nothing-is-a-fault
+  (let [r (assoc good-receipt :aiueos.ota/updated-digest "p1")]
+    (is (= [:swap-did-not-happen] (:aiueos.ota/faults (ota/verify-receipt r manifest "r1"))))))
+
+(deftest every-fault-is-reported-not-just-the-first
+  (let [r (assoc good-receipt :aiueos.ota/manifest-id "m-99"
+                 :aiueos.ota/outcome :something-else
+                 :aiueos.ota/updated-digest "p1")
+        faults (set (:aiueos.ota/faults (ota/verify-receipt r manifest "r-CHANGED")))]
+    (is (= #{:manifest-id-mismatch :admission-mismatch :unknown-outcome :recovery-moved}
+           faults)
+        "a receipt is read after the fact; a second round-trip may be to a machine that is gone")
+    (is (every? ota/receipt-faults faults))
+    (is (not (contains? faults :swap-did-not-happen))
+        "the swap check is scoped to :committed -- a rolled-back receipt legitimately
+         has previous = updated, and flagging that would make every rollback look broken")))
+
+(deftest the-swap-check-fires-only-for-a-commit
+  (let [committed (assoc good-receipt :aiueos.ota/updated-digest "p1")
+        rolled-back (assoc good-receipt :aiueos.ota/updated-digest "p1"
+                           :aiueos.ota/outcome :rolled-back)]
+    (is (= [:swap-did-not-happen] (:aiueos.ota/faults (ota/verify-receipt committed manifest "r1"))))
+    (is (true? (:aiueos.ota/valid? (ota/verify-receipt rolled-back manifest "r1"))))))
+
+(deftest a-receipt-must-cover-every-artifact
+  (is (= [:artifacts-not-covered]
+         (:aiueos.ota/faults
+          (ota/verify-receipt (ota/receipt {:manifest-id "m-42" :outcome :committed
+                                            :previous-digest "p1" :updated-digest "u1"
+                                            :recovery-digest "r1"
+                                            :artifacts [(first artifacts)]
+                                            :admission admission})
+                              manifest "r1")))))

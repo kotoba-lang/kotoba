@@ -1,0 +1,271 @@
+(ns storj.node.identity-test
+  "Certificate reading and chain admission, against a real Storj identity.
+
+  The certificates below were produced by `testdata/gen_identity.go`, which
+  calls `identity.NewCA` and `ca.NewIdentity` — the same code a node operator
+  runs. They are checked in rather than regenerated, because generation is
+  random; CI instead runs that program with `-verify`, which parses these same
+  bytes with `storj.io/common` and asserts the node id, version and chain
+  relationships this file claims. Holding the fixture to the reference
+  implementation is a better check than holding it to a previous run of the
+  generator.
+
+  The node id in particular is not this library's own arithmetic: it was also
+  reproduced independently with `openssl`/`shasum` before any of this code
+  existed."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [storj.node.bytes :as b]
+            [storj.node.der :as der]
+            [storj.node.fixture :refer [ca-der ca-spki-der chain expected-difficulty
+                                        leaf-der node-id-b58 node-id-hex unhex]]
+            [storj.node.id :as node-id]
+            [storj.node.host.verify :as v]
+            [storj.node.identity :as ident]
+            [storj.node.protocols :as p]))
+
+;; ── DER ─────────────────────────────────────────────────────────────────────
+
+(deftest reads-the-certificate-structure
+  (let [cert (der/parse ca-der)]
+    (is (der/tag? cert :sequence))
+    (is (= 3 (count (der/children cert)))
+        "tbsCertificate, signatureAlgorithm, signatureValue")))
+
+(deftest oid-arcs-above-eighty
+  ;; 2.999.2.1 encodes its first two arcs as the single byte pair 88 37. The
+  ;; obvious rule — divide by 40 — turns that into 24.39 and every Storj
+  ;; extension becomes unrecognisable.
+  (let [el (der/parse (unhex "060488370201"))]
+    (is (= "2.999.2.1" (der/oid el))))
+  (testing "and the ordinary branch still works"
+    (is (= "2.5.29.15" (der/oid (der/parse (unhex "0603551d0f")))))
+    (is (= "1.2.840.10045.4.3.2"
+           (der/oid (der/parse (unhex "06082a8648ce3d040302")))))))
+
+(deftest der-refuses-what-it-cannot-represent
+  (testing "trailing bytes after the certificate"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (der/parse (conj ca-der 0x00)))))
+  (testing "indefinite length is not DER"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (der/parse [0x30 0x80 0x00 0x00]))))
+  (testing "a length that runs past the input"
+    (is (thrown? #?(:clj Exception :cljs js/Error) (der/parse [0x30 0x7f 0x01]))))
+  (testing "a bit string claiming unused bits"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (der/bit-string-bytes (der/parse [0x03 0x02 0x04 0xff]))))))
+
+;; ── the certificate's fields ────────────────────────────────────────────────
+
+(deftest certificate-fields
+  (let [ca (ident/certificate ca-der)]
+    (is (= ca-spki-der (:spki-der ca))
+        "the public key, as Go's MarshalPKIXPublicKey produced it")
+    (is (= :ecdsa-sha256 (:algorithm ca)))
+    (is (= 0x30 (first (:tbs-der ca))) "tbs includes its own tag and length")
+    (is (= 0x30 (first (:signature ca))) "an ECDSA signature is a DER SEQUENCE")
+    (testing "extensions, by OID"
+      (is (= #{"2.5.29.15" "2.5.29.19" "2.5.29.14" "2.999.2.1"}
+             (set (keys (:extensions ca)))))
+      (is (= [0x00] (get (:extensions ca) ident/identity-version-ext))))))
+
+(deftest the-leaf-is-a-different-key
+  (is (not= (:spki-der (ident/certificate ca-der))
+            (:spki-der (ident/certificate leaf-der)))
+      "which is why the node id must come from the CA"))
+
+;; ── the node id ─────────────────────────────────────────────────────────────
+
+(deftest node-id-derives-from-the-ca-key
+  (let [ca (ident/certificate ca-der)]
+    (is (= node-id-hex (b/hex (ident/node-id ca))))
+    (is (= node-id-b58 (node-id/format (ident/node-id ca)))))
+
+  (testing "the version byte is the last byte, not part of the digest"
+    (let [ca     (ident/certificate ca-der)
+          digest (b/sha256d (:spki-der ca))]
+      (is (not= digest (ident/node-id ca)))
+      (is (= (subvec digest 0 31) (subvec (ident/node-id ca) 0 31)))
+      (is (= 0 (last (ident/node-id ca))))))
+
+  (testing "using the leaf instead yields a different, meaningless id"
+    (is (not= (ident/node-id (ident/certificate ca-der))
+              (ident/node-id (ident/certificate leaf-der)))))
+
+  (testing "and nothing at all is refused rather than hashed"
+    ;; SHA-256 of the empty input is a perfectly good digest, so without a
+    ;; check this returns an id of the right length with a valid version byte
+    ;; and a difficulty of 10 — the same one, for every caller. Reading Storj's
+    ;; own shipped test identities produced exactly that: three distinct CAs,
+    ;; one convincing id, because the DER had been passed unparsed and
+    ;; `:spki-der` was nil.
+    (doseq [empty-key [nil []]]
+      (is (thrown-with-msg?
+           #?(:clj Exception :cljs js/Error)
+           #"no public key to derive a node id from"
+           (ident/node-id-from-public-key empty-key 0))))
+    (testing "including via node-id, where the mistake actually happens"
+      (is (thrown-with-msg?
+           #?(:clj Exception :cljs js/Error)
+           #"no public key to derive a node id from"
+           ;; unparsed DER rather than a certificate map
+           (ident/node-id ca-der)))))
+
+  (testing "difficulty"
+    (is (= expected-difficulty
+           (node-id/difficulty (ident/node-id (ident/certificate ca-der)))))))
+
+(deftest version-defaults-to-v0-when-absent
+  ;; certificates minted before the extension existed carry no version, and
+  ;; IDVersionFromCert treats them as V0 rather than rejecting them
+  (is (= 0 (ident/version {:extensions {}})))
+  (is (= 0 (ident/version (ident/certificate ca-der))))
+  (is (= 7 (ident/version {:extensions {ident/identity-version-ext [7 9]}}))
+      "and it is the first raw byte, not an ASN.1 integer"))
+
+;; ── admission ───────────────────────────────────────────────────────────────
+
+(defn- verifier [answer] (reify p/IVerifier (-verify [_ _ _ _ _] answer)))
+
+(deftest a-real-chain-is-admitted
+  (let [r (ident/admit-chain chain {:verifier (verifier true)})]
+    (is (:ok? r) (pr-str (:reasons r)))
+    (is (= node-id-hex (b/hex (:node-id r))))
+    (is (= expected-difficulty (:difficulty r)))))
+
+(deftest the-node-must-be-the-one-dialled
+  (let [r (ident/admit-chain chain {:verifier (verifier true)
+                                    :expected-node-id (vec (repeat 32 0x11))})]
+    (is (not (:ok? r)))
+    (is (= #{:node-id-mismatch} (set (map :reason (:reasons r)))))))
+
+(deftest difficulty-floor
+  (is (:ok? (ident/admit-chain chain {:verifier (verifier true)
+                                      :minimum-difficulty expected-difficulty})))
+  (let [r (ident/admit-chain chain {:verifier (verifier true)
+                                    :minimum-difficulty 36})]
+    (is (not (:ok? r)))
+    (is (= #{:insufficient-difficulty} (set (map :reason (:reasons r)))))
+    (is (= 36 (:minimum (first (:reasons r)))))))
+
+(deftest a-chain-without-a-ca-names-nobody
+  (let [r (ident/admit-chain [leaf-der] {:verifier (verifier true)})]
+    (is (not (:ok? r)))
+    (is (contains? (set (map :reason (:reasons r))) :chain-too-short))))
+
+(deftest signatures-are-checked-and-checked-last
+  (testing "a chain whose signatures do not verify is refused"
+    (let [r (ident/admit-chain chain {:verifier (verifier false)})]
+      (is (not (:ok? r)))
+      (is (= #{:chain-signature-invalid} (set (map :reason (:reasons r)))))))
+
+  (testing "no verifier is a refusal, not a pass"
+    (let [r (ident/admit-chain chain {})]
+      (is (not (:ok? r)))
+      (is (= #{:no-verifier-configured} (set (map :reason (:reasons r)))))))
+
+  (testing "a structurally bad chain costs no asymmetric crypto"
+    (let [calls (atom 0)
+          v (reify p/IVerifier (-verify [_ _ _ _ _] (swap! calls inc) true))]
+      (ident/admit-chain chain {:verifier v :expected-node-id (vec (repeat 32 1))})
+      (is (zero? @calls))
+      (ident/admit-chain chain {:verifier v})
+      (is (= 2 @calls) "leaf against the CA, and the CA against itself"))))
+
+(deftest the-last-certificate-must-sign-itself
+  ;; verifyChainSignatures ends with a self-signature check. Without it a chain
+  ;; can end in a certificate nobody vouched for — and the node id comes from a
+  ;; key in that chain.
+  (let [seen (atom [])
+        v (reify p/IVerifier
+            (-verify [_ _ key data _]
+              (swap! seen conj [(b/hex key) (b/hex data)])
+              true))]
+    (ident/admit-chain chain {:verifier v})
+    (let [ca   (ident/certificate ca-der)
+          leaf (ident/certificate leaf-der)]
+      (is (= [[(b/hex (:spki-der ca)) (b/hex (:tbs-der leaf))]
+              [(b/hex (:spki-der ca)) (b/hex (:tbs-der ca))]]
+             @seen)
+          "the leaf is checked against the CA's key, then the CA against its own"))))
+
+(deftest the-pow-counter-extension-stops-admission
+  ;; 2.999.2.2 says the id is derived by hashing a different number of times.
+  ;; Nothing in storj/common implements it, so a chain carrying it is either
+  ;; from a future this build does not know, or an attempt to be hashed
+  ;; differently by different peers. Ignoring it would mean two nodes
+  ;; disagreeing about who the presenter is.
+  (let [ca (assoc-in (ident/certificate ca-der)
+                     [:extensions ident/identity-pow-counter-ext] [3])
+        r  (ident/admit-chain [(ident/certificate leaf-der) ca]
+                              {:verifier (verifier true)})]
+    (is (not (:ok? r)))
+    (is (contains? (set (map :reason (:reasons r))) :pow-counter-extension-present))))
+
+(deftest unknown-signature-algorithms-are-refused
+  (let [ca (assoc (ident/certificate ca-der) :algorithm [:unknown "1.2.3"])
+        r  (ident/admit-chain [(ident/certificate leaf-der) ca]
+                              {:verifier (verifier true)})]
+    (is (not (:ok? r)))
+    (is (contains? (set (map :reason (:reasons r)))
+                   :unsupported-signature-algorithm))))
+
+(deftest an-unsupported-identity-version-is-refused
+  (let [ca (assoc-in (ident/certificate ca-der)
+                     [:extensions ident/identity-version-ext] [9])
+        r  (ident/admit-chain [(ident/certificate leaf-der) ca]
+                              {:verifier (verifier true)})]
+    (is (not (:ok? r)))
+    (is (contains? (set (map :reason (:reasons r))) :unsupported-identity-version))))
+
+(deftest duplicate-extensions-are-refused-at-parse-time
+  ;; ErrUniqueExtensions. Two extensions with the same id let a reader that
+  ;; takes the first and a reader that takes the last disagree about what the
+  ;; certificate says — including, for 2.999.2.1, which version it is.
+  (let [ext (unhex "3009060488370201040100")
+        two (into [] (concat ext ext))
+        tbs-tail (into [0xa3 (+ 2 (count two)) 0x30 (count two)] two)]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (#'ident/extensions-of
+                  (der/children (der/parse (into [0x30 (count tbs-tail)] tbs-tail))))))))
+
+;; ── with the real verifier ──────────────────────────────────────────────────
+
+(defn- subsequence-index [haystack needle]
+  (first (keep-indexed (fn [i _]
+                         (when (= (subvec (vec haystack) i (+ i (count needle)))
+                                  (vec needle))
+                           i))
+                       (take (inc (- (count haystack) (count needle))) haystack))))
+
+(defn- flip-public-key
+  "One bit changed in the last byte of the certificate's public key.
+
+  Tampering has to land on data rather than on a tag or a length, or the
+  certificate stops parsing and the test proves that DER is strict instead of
+  proving that the signature is checked. The final byte of the EC point is
+  data by construction, and it is inside the tbsCertificate, which is what the
+  signature covers."
+  [cert-der spki-der]
+  (let [i (subsequence-index cert-der spki-der)]
+    (update (vec cert-der) (+ i (dec (count spki-der))) bit-xor 0x01)))
+
+(deftest a-real-chain-is-admitted-by-real-crypto
+  ;; Everything above this point stubs `IVerifier`, which means the rules were
+  ;; checked and the signatures never were. This runs the same chain through
+  ;; `storj.node.host.verify`, so the ECDSA check is the platform's own.
+  (let [r (ident/admit-chain chain {:verifier v/verifier})]
+    (is (:ok? r) (pr-str (:reasons r)))
+    (is (= node-id-hex (b/hex (:node-id r))))
+    (is (= 10 (:difficulty r)) "the difficulty testdata/identity.edn recorded"))
+  (testing "a leaf whose key was altered is refused"
+    (let [r (ident/admit-chain [(flip-public-key leaf-der (:spki-der (ident/certificate leaf-der))) ca-der]
+                               {:verifier v/verifier})]
+      (is (not (:ok? r)))
+      (is (= #{:chain-signature-invalid} (set (map :reason (:reasons r)))))))
+  (testing "a CA whose key was altered is refused, and would have renamed the node"
+    ;; the node id comes from this key, so accepting the chain would mean
+    ;; accepting a peer's own choice of name
+    (let [tampered (flip-public-key ca-der ca-spki-der)
+          r (ident/admit-chain [leaf-der tampered] {:verifier v/verifier})]
+      (is (not (:ok? r)))
+      (is (= #{:chain-signature-invalid} (set (map :reason (:reasons r)))))
+      (is (not= node-id-hex (b/hex (:node-id r)))))))

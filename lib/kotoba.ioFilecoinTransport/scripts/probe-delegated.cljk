@@ -1,0 +1,105 @@
+#!/usr/bin/env kbb
+;; Three-way differential on the DELEGATED (FEVM) sender path.
+;;
+;; lotus's AuthenticateMessage does, in this order:
+;;   1. rebuild the EthTransaction from the message
+;;   2. rebuild the message from that transaction; require byte equality
+;;   3. verify the signature over the RLP-encoded unsigned transaction
+;;
+;; So three deliberately different pushes give three distinguishable errors,
+;; and only that pattern shows the mapping AND the signature are both right:
+;;
+;;   correct               -> past all three (actor/state error)
+;;   corrupted signature   -> "failed to validate signature"
+;;   gas fields swapped    -> "roundtrip mismatch" (the message no longer
+;;                            re-encodes to the transaction that was signed)
+;;
+;; Nothing is spent: the sending f410f has never existed, balance is checked
+;; first, and every push is rejected by construction. Calibration.
+(ns probe-delegated
+  (:require [kotoba.lang.text :as str]
+            [filecoin.client :as client]
+            [filecoin.cloud.chain :as chain]
+            [filecoin.signature :as sig]
+            [filecoin.signer.eth :as ethtx]
+            [filecoin.transport :as transport]))
+
+(def endpoint (:rpc (chain/chain :calibration)))
+(def http (transport/http))
+(def probe-key "00000000000000000000000000000000000000000000000000000000feedface")
+(def contract (chain/contract :calibration :pdp-verifier))
+(def calldata "0xf83758fe")  ; getChallengeFinality()
+
+(def tx-opts {:nonce 0 :to contract :value "0"
+              :max-fee-per-gas "100000" :max-priority-fee-per-gas "1000"
+              :gas-limit 1000000 :input calldata})
+
+(defn- push [label signed]
+  (-> (client/push http endpoint signed)
+      (.then (fn [cid] [label :ACCEPTED (str cid)]))
+      (.catch (fn [e]
+                (let [t (str (or (:body (ex-data e)) e))
+                      m (or (second (re-find #"\"message\":\"([^\"]{0,110})" t)) (subs t 0 (min 110 (count t))))]
+                  [label :rejected m])))))
+
+(defn -main []
+  (let [from (ethtx/address-string probe-key :calibration)
+        good (ethtx/sign-message probe-key tx-opts :calibration)
+        bad-sig (assoc good :signature
+                       (sig/signature sig/delegated
+                                      (let [d (vec (:data (:signature good)))]
+                                        (assoc d 10 (bit-xor (nth d 10) 0x01)))))
+        ;; Same signature; the method changed to Send. Two earlier attempts
+        ;; at this case failed to isolate the round-trip:
+        ;;   - swapping the gas fields makes premium > cap, which
+        ;;     ValidForBlockInclusion refuses before the round-trip runs;
+        ;;   - bumping the nonce round-trips FINE (message -> tx -> message
+        ;;     reproduces the mutated nonce) and surfaces at the signature.
+        ;; The method is not a transaction field — an EthTransaction always
+        ;; maps back to InvokeContract — so this is a mutation the round-trip
+        ;; must catch and nothing earlier can.
+        swapped (assoc good :message (assoc (:message good) :method 0))]
+    (println "endpoint:" endpoint)
+    (println "from:    " from)
+    (-> (client/balance http endpoint from)
+        (.then (fn [bal]
+                 (println "balance: " (str bal))
+                 (when-not (= "0" (str bal))
+                   (throw (ex-info "probe: account not empty, refusing to push" {})))
+                 (js/Promise.all
+                  #js [(push "correct" good)
+                       (push "corrupted signature" bad-sig)
+                       (push "method changed" swapped)])))
+        (.then (fn [rs]
+                 (println)
+                 (doseq [[label status m] (array-seq rs)]
+                   (println (str "  " (subs (str label "                      ") 0 22)
+                                 " " (name status) "  " m)))
+                 (let [[[_ _ g] [_ _ b] [_ _ w]] (array-seq rs)
+                       sig-err #(boolean (re-find #"(?i)signature" (str %)))
+                       accepted #(boolean (re-find #"ACCEPTED" (str %)))]
+                   (println)
+                   ;; What case 1 establishes, precisely. Reaching
+                   ;; getStateNonce is only possible THROUGH AuthenticateMessage
+                   ;; in full — round-trip check first, signature second — so a
+                   ;; state/actor error means BOTH passed. Case 2 shows the
+                   ;; signature branch is live rather than skipped. Case 3 is
+                   ;; supporting evidence only: lotus rejects a bad method
+                   ;; earlier than the round-trip, so its wording cannot be
+                   ;; used to prove which check caught it.
+                   (cond
+                     (accepted g) (do (println "FAIL: the message was ACCEPTED — the account was not empty after all")
+                                      (js/process.exit 1))
+                     (sig-err g) (do (println "FAIL: the node rejected OUR signature") (js/process.exit 1))
+                     (not (sig-err b)) (do (println "INCONCLUSIVE: a corrupted signature was not rejected as one")
+                                           (js/process.exit 1))
+                     :else
+                     (do (println "PASS — established:")
+                         (println "  · the message round-trips to the signed transaction and back")
+                         (println "  · lotus accepts the delegated signature over the RLP")
+                         (println "    (both are inside AuthenticateMessage, which case 1 passed through)")
+                         (println "  · the signature check is live, not skipped (case 2)")
+                         (println "  NOT established: that a delegated message executes. Needs funds."))))))
+        (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1))))))
+
+(-main)

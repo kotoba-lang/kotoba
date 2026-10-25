@@ -1,0 +1,202 @@
+(ns bitcoin.node.wire
+  "Fail-closed Bitcoin P2P decoding at the node's untrusted wire boundary.
+
+  The portable protocol dependency supplies encoders and structural decoders.
+  This namespace adds resource bounds, canonical CompactSize checks, strict
+  frame consumption, valid command bytes, and one typed failure vocabulary so
+  malformed peers cannot leak JVM assertion/index/UTF decoding failures."
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.codec :as codec]
+            [kotobase.bitcoin.protocol :as protocol]))
+
+(def maximum-user-agent-bytes 256)
+
+(defn- fail! [type message data]
+  (codec/fail! type message data))
+
+(defn- node-error? [error]
+  (= "bitcoin.node" (some-> error ex-data :type namespace)))
+
+(defn- decode!
+  [type message operation]
+  (try
+    (operation)
+    (catch kerror/ExceptionInfo error
+      (if (node-error? error)
+        (throw error)
+        (throw
+         (ex-info message
+                  {:type type :cause-type (:type (ex-data error))}
+                  error))))
+    (catch Throwable error
+      (throw
+       (ex-info message
+                {:type type :cause-class (.getName (class error))}
+                error)))))
+
+(defn- byte-vector
+  [value type label maximum]
+  (when-not (and (sequential? value)
+                 (<= (count value) maximum)
+                 (every? #(and (integer? %) (<= 0 % 255)) value))
+    (fail! type
+           (str label " must be a bounded sequence of unsigned bytes.")
+           {:length (when (counted? value) (count value))
+            :limit maximum}))
+  (vec value))
+
+(defn- valid-command-bytes?
+  [bytes]
+  (loop [remaining bytes terminated? false]
+    (if-let [byte (first remaining)]
+      (cond
+        terminated? (and (zero? byte)
+                         (recur (next remaining) true))
+        (zero? byte) (recur (next remaining) true)
+        (<= 0x20 byte 0x7e) (recur (next remaining) false)
+        :else false)
+      true)))
+
+(defn decode-message-header
+  "Decode one exact 24-byte header and bind it to expected-magic.
+
+  Commands must use printable ASCII before their first NUL and only NUL bytes
+  afterwards, matching Bitcoin Core's command validity rule."
+  [value expected-magic]
+  (decode!
+   :bitcoin.node/peer-malformed-header
+   "Bitcoin peer message header is malformed."
+   (fn []
+     (let [bytes
+           (byte-vector value :bitcoin.node/peer-malformed-header
+                        "Bitcoin message header" protocol/header-size)]
+       (when-not (= protocol/header-size (count bytes))
+         (fail! :bitcoin.node/peer-malformed-header
+                "Bitcoin peer message header is truncated."
+                {:length (count bytes) :expected protocol/header-size}))
+       (let [command-bytes (subvec bytes 4 16)]
+         (when-not (valid-command-bytes? command-bytes)
+           (fail! :bitcoin.node/peer-command
+                  "Bitcoin peer message command is not canonical printable ASCII."
+                  {})))
+       (let [header (protocol/decode-message-header bytes)]
+         (when-not (= expected-magic (:magic header))
+           (fail! :bitcoin.node/peer-network-mismatch
+                  "Bitcoin peer sent another network's magic."
+                  {:expected expected-magic :actual (:magic header)}))
+         (when (> (:length header) protocol/max-protocol-payload-bytes)
+           (fail! :bitcoin.node/peer-oversized-message
+                  "Bitcoin peer declared an oversized payload."
+                  {:length (:length header)
+                   :limit protocol/max-protocol-payload-bytes}))
+         header)))))
+
+(defn decode-message-payload
+  "Authenticate one exact payload against an already validated header."
+  [header value]
+  (decode!
+   :bitcoin.node/peer-malformed-payload
+   "Bitcoin peer message payload is malformed."
+   (fn []
+     (let [payload
+           (byte-vector value :bitcoin.node/peer-malformed-payload
+                        "Bitcoin message payload"
+                        protocol/max-protocol-payload-bytes)]
+       (when-not (= (:length header) (count payload))
+         (fail! :bitcoin.node/peer-message-length
+                "Bitcoin peer payload length differs from its header."
+                {:declared (:length header) :actual (count payload)}))
+       (when-not (protocol/checksum-valid? header payload)
+         (fail! :bitcoin.node/peer-checksum
+                "Bitcoin peer message checksum is invalid."
+                {:command (:command header)}))
+       {:command (:command header) :payload payload}))))
+
+(defn decode-frame
+  "Decode one complete bounded Bitcoin P2P frame with no trailing bytes."
+  [value expected-magic]
+  (decode!
+   :bitcoin.node/peer-malformed-frame
+   "Bitcoin peer frame is malformed."
+   (fn []
+     (let [bytes
+           (byte-vector
+            value :bitcoin.node/peer-malformed-frame "Bitcoin message frame"
+            (+ protocol/header-size protocol/max-protocol-payload-bytes))]
+       (when (< (count bytes) protocol/header-size)
+         (fail! :bitcoin.node/peer-malformed-header
+                "Bitcoin peer message header is truncated."
+                {:length (count bytes) :expected protocol/header-size}))
+       (let [header
+             (decode-message-header
+              (subvec bytes 0 protocol/header-size) expected-magic)
+             expected-length (+ protocol/header-size (:length header))]
+         (when-not (= expected-length (count bytes))
+           (fail! :bitcoin.node/peer-message-length
+                  "Bitcoin peer frame does not contain exactly one payload."
+                  {:declared (:length header)
+                   :actual (- (count bytes) protocol/header-size)}))
+         (decode-message-payload
+          header (subvec bytes protocol/header-size expected-length)))))))
+
+(defn decode-version-payload
+  "Decode a canonical, exactly consumed version payload.
+
+  The optional BIP37 relay byte may be absent, but no further trailing bytes
+  are accepted and the user-agent is capped at Core's 256-byte limit."
+  [value]
+  (decode!
+   :bitcoin.node/peer-malformed-version
+   "Bitcoin peer version payload is malformed."
+   (fn []
+     (let [bytes
+           (byte-vector value :bitcoin.node/peer-malformed-version
+                        "Bitcoin version payload"
+                        protocol/max-protocol-payload-bytes)
+           [_ offset] (codec/read-bytes bytes 0 80)
+           [_ offset]
+           (codec/read-var-bytes
+            bytes offset maximum-user-agent-bytes "peer user agent")
+           [_ offset] (codec/read-bytes bytes offset 4)
+           remaining (- (count bytes) offset)]
+       (when-not (<= 0 remaining 1)
+         (fail! :bitcoin.node/peer-version-trailing-data
+                "Bitcoin peer version payload contains trailing data."
+                {:offset offset :length (count bytes)}))
+       (protocol/decode-version-payload bytes)))))
+
+(defn decode-headers-payload
+  "Decode a canonical headers payload with exact consumption and zero tx counts."
+  [value]
+  (decode!
+   :bitcoin.node/peer-malformed-headers
+   "Bitcoin peer headers payload is malformed."
+   (fn []
+     (let [bytes
+           (byte-vector value :bitcoin.node/peer-malformed-headers
+                        "Bitcoin headers payload"
+                        protocol/max-protocol-payload-bytes)
+           [header-count offset] (codec/read-compact-size bytes 0)]
+       (when (> header-count protocol/max-headers-per-message)
+         (fail! :bitcoin.node/peer-too-many-headers
+                "Bitcoin peer headers message exceeds the protocol limit."
+                {:count header-count
+                 :limit protocol/max-headers-per-message}))
+       (let [end
+             (loop [remaining header-count offset offset]
+               (if (zero? remaining)
+                 offset
+                 (let [[_ offset]
+                       (codec/read-bytes bytes offset
+                                         protocol/block-header-size)
+                       [transaction-count offset]
+                       (codec/read-compact-size bytes offset)]
+                   (when-not (zero? transaction-count)
+                     (fail! :bitcoin.node/peer-header-transaction-count
+                            "Bitcoin headers entry has a non-zero tx count."
+                            {:transaction-count transaction-count}))
+                   (recur (dec remaining) offset))))]
+         (when-not (= end (count bytes))
+           (fail! :bitcoin.node/peer-headers-trailing-data
+                  "Bitcoin peer headers payload contains trailing data."
+                  {:offset end :length (count bytes)}))
+         (protocol/decode-headers-payload bytes))))))

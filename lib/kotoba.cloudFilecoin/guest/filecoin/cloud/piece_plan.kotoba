@@ -1,0 +1,140 @@
+;; filecoin.cloud.piece-plan — upload planning for Filecoin Onchain Cloud.
+;;
+;; PURE. The judgment half of filecoin.cloud.piece (the .cljc oracle in
+;; src/), rewritten over the walkable i64 domain: BEFORE a byte is hashed
+;; or moved, a client decides WHAT the upload will cost in tree geometry
+;; and whether the size is admissible at all. The bytes themselves, the
+;; FR32 expansion and the SHA-256 Merkle tree stay host-side (io-filecoin
+;; signs, the provider transfer moves bytes); this module answers the
+;; questions a guest can be trusted with on i64 scalars alone.
+;;
+;; The numbers are the same constants the oracle encodes (FRC-0069):
+;; a quad is 127 source bytes expanded to 128, leaves are 32 bytes,
+;; the height-2 floor is 65 source bytes. The 20 SDK-generated vectors
+;; in test/filecoin/cloud/vectors.cljk are the ground truth; the golden
+;; runner (guest/verify.clj) pins 20 of them as literals.
+
+(ns filecoin.cloud.piece-plan
+  (:export [highest-bit zero-padded-size piece-size height-for
+            padded-size expanded-size padding-for
+            plan-ok? size-quota-ok? plan-fields plan-fields-unpacks]))
+
+;; 4 field elements x 254 bits: what 128 output bytes are made from.
+(def in-bytes-per-quad 127)
+
+;; 4 field elements x 64 bits: what one quad becomes after FR32 expansion.
+(def out-bytes-per-quad 128)
+
+;; A Merkle leaf is 32 bytes.
+(def node-size 32)
+
+;; 2 nodes and one byte. Below this, FR32 expansion has no defined
+;; result: the floor is explicit rather than silently promoted.
+(def min-payload-size 65)
+
+;; The largest payload a guest may plan here. The .kotoba profile
+;; bounds what this module reasons about; a real sector is the host's
+;; problem and the oracle's.
+(def max-planned-size 4194304)
+
+(defn highest-bit-loop [v :i64 b :i64] :i64
+  ;; Halve until zero; the accumulator counts the halvings.
+  (if (= v 0) b
+    (highest-bit-loop (quot v 2) (+ b 1))))
+
+(defn highest-bit [n :i64] :i64
+  ;; floor(log2 n) by halving, not by a float log: a float log of a
+  ;; power of two is not reliably exact, and being one off here changes
+  ;; the padded size and therefore the CID.
+  (if (< n 1) (- 0 1)
+    (highest-bit-loop n (- 0 1))))
+
+(defn pow2 [k :i64] :i64
+  ;; 2^k by doubling. The walkable profile's arithmetic set has no
+  ;; shifts (`lang/guest-grammar.edn :arithmetic`), so powers of two
+  ;; are built by multiplication -- exact for every k this module
+  ;; reasons about.
+  (if (< k 1) 1 (* 2 (pow2 (- k 1)))))
+
+(defn zero-padded-size [payload-size :i64] :i64
+  ;; Source bytes after zero-padding: the next 127 x 2^n at or above
+  ;; the payload, with the 65-byte floor. ceil(127 x 2^(b+1) / 128) is
+  ;; exact because 2^(b+1) is a multiple of 128 at or above the floor.
+  (let [size (if (< payload-size min-payload-size) min-payload-size payload-size)
+        b (highest-bit size)
+        bound (quot (* in-bytes-per-quad (pow2 (+ b 1)))
+                    out-bytes-per-quad)]
+    (if (<= size bound)
+      bound
+      (quot (* in-bytes-per-quad (pow2 (+ b 2)))
+            out-bytes-per-quad))))
+
+(defn piece-size [payload-size :i64] :i64
+  ;; FR32-expanded size: the bytes the tree's leaves cover.
+  (quot (* (zero-padded-size payload-size) out-bytes-per-quad)
+        in-bytes-per-quad))
+
+(defn height-for [payload-size :i64] :i64
+  ;; Tree height for a payload size: 2^height leaves.
+  (highest-bit (quot (piece-size payload-size) node-size)))
+
+(defn padded-size [height :i64] :i64
+  ;; The SOURCE-byte capacity of a height: 127 x 2^(height-2).
+  (* in-bytes-per-quad (pow2 (- height 2))))
+
+(defn expanded-size [height :i64] :i64
+  ;; The TREE's own size in bytes: 2^height x 32. Not padded-size --
+  ;; the two differ by the FR32 ratio and confusing them is a 1/128
+  ;; error that looks like a rounding bug.
+  (* node-size (pow2 height)))
+
+(defn padding-for [payload-size :i64] :i64
+  ;; Zero bytes step 1 will add: capacity minus payload. Carried in the
+  ;; PieceCID digest, so the original size is recoverable from the CID.
+  (- (padded-size (height-for payload-size)) payload-size))
+
+(defn size-quota-ok? [payload-size :i64] :bool
+  ;; Inside the bounds this profile plans for: the floor with a defined
+  ;; expansion, and the planned ceiling.
+  (if (< payload-size min-payload-size) false
+    (if (> payload-size max-planned-size) false true)))
+
+(defn plan-ok? [payload-size :i64] :bool
+  ;; The single question an upload client asks first. A size that
+  ;; passes here has a well-formed tree geometry on every network.
+  (size-quota-ok? payload-size))
+
+(defn plan-fields [payload-size :i64] :i64
+  ;; The three geometry numbers folded into one i64 so the whole plan
+  ;; crosses the ABI in one argument:
+  ;;   tree (expanded) size in the low 24 bits   (<= 8388608 = 2^23)
+  ;;   padding in bits 24..45                    (<= 4128768 < 2^22)
+  ;;   height from bit 46 up                     (<= 18 inside the ceiling)
+  ;; The first packing used 16/32-bit fields, and the ceiling broke it
+  ;; silently: padding crosses 2^16 near 128 KiB of payload and
+  ;; overlapped the height field from there to the 4 MiB ceiling. The
+  ;; widest planned values now fit with room, and the word is still
+  ;; below 2^51 -- far inside i64.
+  (+ (* (height-for payload-size) 70368744177664)
+     (* (padding-for payload-size) 16777216)
+     (expanded-size (height-for payload-size))))
+
+(defn plan-fields-unpacks [payload-size :i64] :i64
+  ;; 1 when decoding the packed word by field width returns exactly the
+  ;; three numbers packed into it. Binds height ONCE and derives
+  ;; padding and tree from it: every height-for call re-walks the
+  ;; geometry recursion, and the native loader's budget is fixed at
+  ;; 512 (measured :trap exit 120 when the word was recomputed per
+  ;; assertion). Decode is quot-only -- the admitted arithmetic set
+  ;; has no rem and no shifts.
+  (let [h (height-for payload-size)
+        pad (- (padded-size h) payload-size)
+        tree (expanded-size h)
+        word (+ (* h 70368744177664) (* pad 16777216) tree)
+        high (quot word 70368744177664)
+        mid (quot (- word (* high 70368744177664)) 16777216)
+        low (- word (* (quot word 16777216) 16777216))]
+    (if (= high h) 1
+      (if (= mid pad) 0
+        (if (= low tree) 0
+          0)))))

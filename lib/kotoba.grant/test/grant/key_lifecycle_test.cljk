@@ -1,0 +1,197 @@
+(ns grant.key-lifecycle-test
+  (:require [kotoba.bytes :as kbytes] [grant.key-lifecycle :as lifecycle]
+            [grant.signing :as signing]
+            [kotoba.test :refer [deftest is]])
+  (:import
+           [java.security Signature]))
+
+(def now-ms 2000)
+
+(defn- entry
+  [keys status parent components & {:keys [may-delegate?]}]
+  (cond-> {:public-key (lifecycle/raw-public-hex keys)
+           :status status
+           :not-before-ms 1000
+           :expires-at-ms 10000
+           :components components}
+    parent (assoc :delegated-by parent)
+    may-delegate? (assoc :may-delegate? true)))
+
+(defn- bundle
+  [root epoch previous keys]
+  (lifecycle/sign-bundle
+   {:version 1
+    :epoch epoch
+    :previous-digest previous
+    :issued-at-ms 1000
+    :expires-at-ms 9000
+    :root-id :authority/root
+    :keys keys}
+   (.getPrivate root)))
+
+(defn- manifest-signature [key-pair manifest]
+  (let [signer (Signature/getInstance "Ed25519")]
+    (.initSign signer (.getPrivate key-pair))
+    (.update signer
+             (kbytes/utf8-bytes ^String (signing/signed-message manifest)))
+    (signing/hex-encode (.sign signer))))
+
+(defn- signed-manifest [signer-id key-pair]
+  (let [manifest {:aiueos/component :app/payments
+                  :aiueos/wasm-sha256 "deadbeef"
+                  :aiueos/signer signer-id}]
+    (assoc manifest :aiueos/signature
+           (manifest-signature key-pair manifest))))
+
+(defn- base-keys [root release]
+  {:authority/root
+   (entry root :active nil #{:*} :may-delegate? true)
+   :signer/release
+   (entry release :active :authority/root #{:app/payments})})
+
+;; `deployment-policy-loader-admits-the-signed-next-epoch` is NOT here. It
+;; needs `aiueos.launcher/load-policy` -- a policy file read off a disk the
+;; machine owns -- so it stays in aiueos as a cross-repository test. The other
+;; five deftests never needed the machine at all; they were in aiueos only
+;; because this file was, and they moved back with the code they exercise
+;; (root ADR-2608219500).
+(deftest delegated-signer-materializes-into-real-manifest-verification
+  (let [root (lifecycle/generate-key-pair)
+        release (lifecycle/generate-key-pair)
+        epoch1 (bundle root 1 nil (base-keys root release))
+        applied (lifecycle/apply-bundle
+                 (lifecycle/initial-node-state)
+                 (lifecycle/public-key-base64 root)
+                 epoch1 now-ms)
+        policy (lifecycle/apply-to-policy {} (:state applied) now-ms)
+        result (signing/verify
+                (signed-manifest :signer/release release)
+                policy)]
+    (is (true? (:ok? applied)))
+    (is (= #{:signer/release}
+           (get-in policy
+                   [:aiueos.policy/component-signers :app/payments])))
+    (is (= :verified (:aiueos.signing/status result)))))
+
+(deftest rotation-revocation-and-compromise-recovery-are-monotonic
+  (let [root (lifecycle/generate-key-pair)
+        old (lifecycle/generate-key-pair)
+        new (lifecycle/generate-key-pair)
+        keys1 (base-keys root old)
+        epoch1 (bundle root 1 nil keys1)
+        state1 (:state (lifecycle/apply-bundle
+                        (lifecycle/initial-node-state)
+                        (lifecycle/public-key-base64 root)
+                        epoch1 now-ms))
+        keys2 (assoc keys1 :signer/release-next
+                     (entry new :active :authority/root #{:app/payments}))
+        epoch2 (bundle root 2 (:bundle-digest state1) keys2)
+        state2 (:state (lifecycle/apply-bundle
+                        state1 (lifecycle/public-key-base64 root)
+                        epoch2 now-ms))
+        keys3 (-> keys2
+                  (assoc-in [:signer/release :status] :compromised))
+        epoch3 (bundle root 3 (:bundle-digest state2) keys3)
+        state3 (:state (lifecycle/apply-bundle
+                        state2 (lifecycle/public-key-base64 root)
+                        epoch3 now-ms))
+        policy2 (lifecycle/apply-to-policy {} state2 now-ms)
+        policy3 (lifecycle/apply-to-policy {} state3 now-ms)]
+    (is (= #{:signer/release :signer/release-next}
+           (get-in policy2
+                   [:aiueos.policy/component-signers :app/payments])))
+    (is (= :verified
+           (:aiueos.signing/status
+            (signing/verify (signed-manifest :signer/release old)
+                            policy2))))
+    (is (= #{:signer/release-next}
+           (get-in policy3
+                   [:aiueos.policy/component-signers :app/payments])))
+    (is (signing/violation?
+         (signing/verify (signed-manifest :signer/release old) policy3)))
+    (is (= :verified
+           (:aiueos.signing/status
+            (signing/verify
+             (signed-manifest :signer/release-next new)
+             policy3))))))
+
+(deftest rollback-gap-fork-and-signature-tampering-fail-closed
+  (let [root (lifecycle/generate-key-pair)
+        release (lifecycle/generate-key-pair)
+        epoch1 (bundle root 1 nil (base-keys root release))
+        state1 (:state (lifecycle/apply-bundle
+                        (lifecycle/initial-node-state)
+                        (lifecycle/public-key-base64 root)
+                        epoch1 now-ms))
+        epoch2 (bundle root 2 (:bundle-digest state1)
+                       (base-keys root release))]
+    (is (= :rollback
+           (:reason (lifecycle/apply-bundle
+                     state1 (lifecycle/public-key-base64 root)
+                     epoch1 now-ms))))
+    (is (= :epoch-gap
+           (:reason (lifecycle/apply-bundle
+                     state1 (lifecycle/public-key-base64 root)
+                     (assoc epoch2 :epoch 3) now-ms))))
+    (is (= :previous-digest-mismatch
+           (:reason
+            (lifecycle/apply-bundle
+             state1 (lifecycle/public-key-base64 root)
+             (bundle root 2 (apply str (repeat 64 "0"))
+                     (base-keys root release))
+             now-ms))))
+    (is (= :bad-root-signature
+           (:reason
+            (lifecycle/apply-bundle
+             state1 (lifecycle/public-key-base64 root)
+             (assoc-in epoch2 [:keys :signer/release :status] :revoked)
+             now-ms))))))
+
+(deftest invalid-delegation-and-expiry-fail-closed
+  (let [root (lifecycle/generate-key-pair)
+        release (lifecycle/generate-key-pair)
+        unauthorized
+        (assoc (base-keys root release)
+               :authority/root
+               (entry root :active nil #{:app/other}
+                      :may-delegate? true))
+        invalid (bundle root 1 nil unauthorized)]
+    (is (= :invalid-lifecycle
+           (:reason
+            (lifecycle/apply-bundle
+             (lifecycle/initial-node-state)
+             (lifecycle/public-key-base64 root)
+             invalid now-ms))))
+    (is (= :invalid-lifecycle
+           (:reason
+            (lifecycle/apply-bundle
+             (lifecycle/initial-node-state)
+             (lifecycle/public-key-base64 root)
+             (bundle root 1 nil
+                     (assoc-in (base-keys root release)
+                               [:signer/release :expires-at-ms] 1500))
+             now-ms))))))
+
+(deftest nodes-converge-only-after-consuming-the-same-signed-epochs
+  (let [root (lifecycle/generate-key-pair)
+        release (lifecycle/generate-key-pair)
+        epoch1 (bundle root 1 nil (base-keys root release))
+        node-a1 (:state (lifecycle/apply-bundle
+                         (lifecycle/initial-node-state)
+                         (lifecycle/public-key-base64 root)
+                         epoch1 now-ms))
+        node-b1 (:state (lifecycle/apply-bundle
+                         (lifecycle/initial-node-state)
+                         (lifecycle/public-key-base64 root)
+                         epoch1 now-ms))
+        epoch2 (bundle root 2 (:bundle-digest node-a1)
+                       (base-keys root release))
+        node-a2 (:state (lifecycle/apply-bundle
+                         node-a1 (lifecycle/public-key-base64 root)
+                         epoch2 now-ms))]
+    (is (not= (:epoch node-a2) (:epoch node-b1)))
+    (let [node-b2 (:state (lifecycle/apply-bundle
+                           node-b1 (lifecycle/public-key-base64 root)
+                           epoch2 now-ms))]
+      (is (= (select-keys node-a2 [:epoch :bundle-digest])
+             (select-keys node-b2 [:epoch :bundle-digest]))))))

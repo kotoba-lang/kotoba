@@ -1,0 +1,168 @@
+;; kbb --backend sci --classpath "src:resources:test:<deps>" test/native_wire_parity.cljk [--control]
+;;
+;; Native parity for dango.caveat-wire, the evaluator that decides a caveat
+;; from its kotoba.value.v1 BYTES. For every case below this encodes the
+;; caveat and the request with the real codec (kotoba.value.codec), asks the
+;; oracle (dango.caveat: problems, then holds?) for the answer, and runs
+;; `holds-wire` natively on the same bytes: one granted region (loader
+;; `g:<hex>`, its length `gl:0`) and the split, one process per case.
+;;
+;; Answers: 1 holds, 0 does not hold, 3 malformed, 4 too large.
+;; Exit 0 -- every case agreed (prints SCANNED<TAB>n).
+;; Exit 1 -- a disagreement; the cases are named with both answers.
+;; Exit 2 -- could not answer (amu / engine / cc missing, compile refused, a
+;;           case printed something else). Never read as a pass.
+;;
+;; --control compiles the guest with two-valued `not` and exits 0 only if it
+;; then disagrees on EXACTLY the cases whose names start with "unknown-".
+;;
+;; Fuel is the CALLER's per-run budget (kotoba-lang lang/limits.edn
+;; :profile/native): the loader's default is 512 function entries, and a
+;; four-fact request already needs ~650, so this sets KEXE_FUEL explicitly
+;; and reports the most any case used. Running out is a named failure here,
+;; not a disagreement -- the loader reports it only as SIGTRAP today.
+;;
+;; AMU (default ../amu) and KBB_ENGINE (default ../org-babashka-nbb/cli.js).
+(ns native-wire-parity
+  (:require [clojure.string :as s]
+            [dango.caveat :as caveat]
+            [kotoba.value.codec :as codec]))
+
+(def cp (js/require "child_process"))
+(def fs (js/require "fs"))
+(def os (js/require "os"))
+(def path (js/require "path"))
+
+(def here (.cwd js/process))
+(def amu-root (or (.. js/process -env -AMU) (.resolve path here "../amu")))
+(def engine (or (.. js/process -env -KBB_ENGINE)
+                (.resolve path here "../org-babashka-nbb/cli.js")))
+(def control? (some #{"--control"} *command-line-args*))
+(def fuel-budget "1000000")
+
+(def req {:req/path "ds/raw/a.parquet" :req/bytes 1000 :req/now 1700000000
+          :req/kind :data/read})
+
+(def cases
+  ;; [name caveat request]
+  [["prefix-holds" [:prefix? :req/path "ds/raw/"] req]
+   ["prefix-fails" [:prefix? :req/path "ds/cooked/"] req]
+   ["and-not" [:and [:<= :req/bytes 1000] [:not [:= :req/kind :data/write]]] req]
+   ["boundary-lt" [:< :req/bytes 1000] req]
+   ["boundary-le" [:<= :req/bytes 1000] req]
+   ["or-member" [:or [:> :req/bytes 5000] [:member? :req/kind #{:data/read}]] req]
+   ["member-miss" [:member? :req/kind #{:data/write "x" 3}] req]
+   ["absent-fact" [:< :req/holder 5] req]
+   ["type-mismatch" [:< :req/path 5] req]
+   ["unknown-not" [:not [:< :req/holder 5]] req]
+   ["unknown-not-absent" [:not [:= :req/holder "did:key:zX"]] req]
+   ["unknown-through-or" [:or [:not [:< :req/path 5]] false] req]
+   ["unknown-through-and" [:and true [:not [:< :req/holder 5]]] req]
+   ["or-one-true" [:or [:< :req/holder 5] [:= :req/bytes 1000]] req]
+   ["negative-int" [:> :req/bytes -5] req]
+   ["kw-vs-str" [:= :req/kind "data/read"] req]
+   ["str-eq" [:= :req/path "ds/raw/a.parquet"] req]
+   ["holder-present" [:= :req/holder "did:key:zA"] (assoc req :req/holder "did:key:zA")]
+   ["empty-request" [:= :req/bytes 1000] {}]
+   ["bad-operator" [:eval "x"] req]
+   ["bad-fact" [:= :req/secret 1] req]
+   ["bad-arity" [:= 1 2 3] req]
+   ["no-args" [:and] req]
+   ["a-list" '(and true) req]
+   ["too-deep" (reduce (fn [f _] [:not f]) true (range 20)) req]
+   ["too-many-nodes" (into [:and] (repeat 300 true)) req]
+   ["int64-literal" [:< :req/bytes (codec/int64 5)] req]])
+
+(defn- oracle [form request]
+  (let [ps (caveat/problems form)]
+    (cond (seq ps) (if (= :dango/caveat-too-large (ffirst ps)) "4" "3")
+          (caveat/holds? form request) "1"
+          :else "0")))
+
+(defn- hex [b]
+  (apply str (map #(let [h (.toString % 16)] (if (= 1 (count h)) (str "0" h) h))
+                  (js/Array.from b))))
+
+(defn- cannot [msg]
+  (throw (ex-info msg {:exit 2})))
+
+(defn- run [cmd args]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      #js {:encoding "utf8"
+                           :env (js/Object.assign #js {} (.-env js/process)
+                                                  #js {:KBB_ENGINE engine
+                                                       :KEXE_FUEL fuel-budget
+                                                       :KEXE_STRUCTURED_REPORT "1"})})]
+    {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+(defn- target []
+  (case [(.platform os) (.arch os)]
+    ["darwin" "arm64"] ["aarch64-macos" "aarch64"]
+    ["linux" "arm64"] ["aarch64-linux" "aarch64"]
+    ["linux" "x64"] ["x86_64-linux" "x86_64"]
+    ["darwin" "x64"] ["x86_64-macos" "x86_64"]
+    (cannot (str "no native target for " (.platform os) "/" (.arch os)))))
+
+(defn- source []
+  (let [src (str (.readFileSync fs "lib/kotoba.dango/src/dango/caveat_wire.kotoba"))
+        from "(= op 3) (let [t (tri (term m a0 r))] (cond (= t 0) 1 (= t 1) 0 :else 2))"
+        to "(= op 3) (let [t (tri (term m a0 r))] (cond (= t 0) 1 (= t 1) 0 :else 1))"]
+    (if control?
+      (if (s/includes? src from) (s/replace src from to) (cannot "control mutation did not apply"))
+      src)))
+
+(defn main []
+  (doseq [[what p] [["amu" (.join path amu-root "bin/amu")] ["engine" engine]
+                    ["loader source" (.join path amu-root "tools/kexe_loader.c")]]]
+    (when-not (.existsSync fs p) (cannot (str what " not found at " p))))
+  (let [[tgt isa] (target)
+        dir (.mkdtempSync fs (.join path (.tmpdir os) "dango-wire-"))
+        src-file (.join path dir "caveat_wire.kotoba")
+        kexe (.join path dir "wire.kexe")
+        bin (.join path dir "holds.bin")
+        loader (.join path dir "kexe_loader")
+        amu (.join path amu-root "bin/amu")]
+    (.writeFileSync fs src-file (source))
+    (let [c (run amu ["compile" src-file "--jvm-free" "--target" tgt "--output" kexe])]
+      (when-not (and (zero? (:exit c)) (.existsSync fs kexe))
+        (cannot (str "compile refused (exit " (:exit c) "): " (subs (str (:out c) (:err c)) 0 400)))))
+    (let [l (run "cc" ["-O2" "-o" loader (.join path amu-root "tools/kexe_loader.c")])]
+      (when-not (zero? (:exit l)) (cannot (str "cc failed: " (:err l)))))
+    (let [x (run amu ["extract-native" kexe "--symbol" "holds-wire" "--output" bin])
+          off (or (second (re-find #":offset (\d+)" (:out x)))
+                  (cannot (str "extract-native: " (:out x) (:err x))))
+          results (vec (for [[nm form request] cases]
+                         (let [cb (codec/encode-value form)
+                               rb (codec/encode-value request)
+                               region (str (hex cb) (hex rb))
+                               r (run loader [bin off "3" isa "-" (str "g:" region) "gl:0"
+                                              (str (.-length cb))])
+                               report (str (:out r) (:err r))
+                               v (second (re-find #":status :ok :result (-?\d+)" report))
+                               [_ fi fr] (re-find #":fuel \{:initial (\d+) :remaining (\d+)\}" report)]
+                           (when-not (#{"0" "1" "3" "4"} v)
+                             (cannot (str nm ": no answer (loader exit " (:exit r) ") "
+                                          (subs report 0 (min 300 (count report))))))
+                           [nm (oracle form request) v (- (js/parseInt fi) (js/parseInt fr))])))
+          disagree (filterv (fn [[_ o v _]] (not= o v)) results)]
+      (println (str "SCANNED\t" (count results)))
+      (println "target" tgt "native" (s/join "" (map #(nth % 2) results))
+               "oracle" (s/join "" (map second results)))
+      (println "fuel budget" fuel-budget "max used" (apply max (map #(nth % 3) results))
+               "by" (first (apply max-key #(nth % 3) results)))
+      (if control?
+        (let [names (set (map first disagree))
+              want (set (filter #(s/starts-with? % "unknown-") (map first cases)))]
+          (if (= names want)
+            (println "CONTROL OK: two-valued not disagrees on exactly" (sort names))
+            (do (println "CONTROL FAILED: expected" (sort want) "got" (sort names))
+                (set! (.-exitCode js/process) 1))))
+        (if (empty? disagree)
+          (println "PARITY OK: all" (count results) "cases agree with the oracle")
+          (do (doseq [[nm o v _] disagree] (println "DISAGREE" nm "oracle" o "native" v))
+              (set! (.-exitCode js/process) 1)))))))
+
+(try (main)
+     (catch :default e
+       (println "CANNOT-ANSWER" (ex-message e))
+       (set! (.-exitCode js/process) 2)))

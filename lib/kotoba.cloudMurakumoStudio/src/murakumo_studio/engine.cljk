@@ -1,0 +1,197 @@
+(ns murakumo-studio.engine
+  "The murakumo-studio inference sidecar: a localhost-only HTTP server the
+  Tauri Rust shell spawns and supervises (tauri/src-tauri/src/main.rs). The
+  CLJS frontend never touches the JVM directly — it only speaks HTTP/JSON to
+  this process (ADR-2607032700 §2). Exposes model management, an
+  OpenAI-compatible /v1/chat/completions (also usable by other local apps,
+  not just this one — LM Studio's \"Local Server\" tab equivalent), and
+  murakumo fleet announce.
+
+  `kotodama.inference.host.jvm/generate` is resolved dynamically at request
+  time (not required at namespace load) so this server boots and every other
+  feature (model manager, fleet) works even before that function lands /
+  if its signature moves again — chat requests get a clear 503 instead of
+  the whole sidecar failing to start.
+
+  KNOWN LIMITATION (kotoba-lang/inference#5, merged 2026-07-03): generation
+  runs end-to-end without crashing across all 42 real layers, and KV-cache is
+  verified as a pure optimization (identical output with/without), but output
+  quality is NOT coherent yet — a deep-layer numerical drift versus reference
+  implementations is still open. Every chat response returned by this engine
+  right now is real model output, not a mock, but expect garbled text, not
+  fluent language. See the model note this ns attaches to every response."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [kotoba.lang.http.host.httpkit :as http]
+            [json.compat :as json]
+            [kotoba.lang.text :as str]
+            [murakumo-studio.models :as models]
+            [murakumo-studio.fleet :as fleet])
+  (:gen-class))
+
+(def port (Integer/parseInt (or (System/getenv "MURAKUMO_STUDIO_PORT") "8721")))
+
+(defn- json-response [status body]
+  {:status status
+   :headers {"Content-Type" "application/json"
+             "Access-Control-Allow-Origin" "*"}
+   :body (json/generate-string body)})
+
+(defn- read-json-body [{:keys [body]}]
+  (when body
+    (json/parse-string (slurp body) true)))
+
+(defn- parse-query [query-string]
+  (when-not (str/blank? query-string)
+    (into {}
+          (map (fn [kv]
+                 (let [[k v] (str/split kv #"=" 2)]
+                   [(keyword k) (some-> v (form-urlencoded/form-decode))])))
+          (str/split query-string #"&"))))
+
+(defn- generate-fn
+  "nil if kotoba-lang/inference hasn't shipped a working generate fn, or the
+  ns fails to load (e.g. a transitive dep isn't resolvable in this deps.edn
+  profile) — callers must handle nil, not assume it's always present."
+  []
+  (try
+    (requiring-resolve 'kotodama.inference.host.jvm/generate)
+    (catch Throwable _ nil)))
+
+(def ^:private quality-note
+  "Known limitation (kotoba-lang/inference#5): full 42-layer CPU generation
+  runs without crashing/NaN'ing, but a deep-layer numerical drift versus
+  reference implementations means output is not coherent yet.")
+
+(defn- ->model-descriptor [m]
+  {:id (:id m) :object "model" :owned_by "murakumo-studio"
+   :size_bytes (:size_bytes m) :context_length (:context_length m)
+   :backend (:backend m) :source (:source m)})
+
+(defn- handle-models-list [_req]
+  (json-response 200 {:object "list" :data (mapv ->model-descriptor (models/list-models))}))
+
+(defn- handle-models-scan [_req]
+  (json-response 200 {:object "list" :data (mapv ->model-descriptor (models/refresh!))}))
+
+(defn- handle-models-download [req]
+  (try
+    (let [{:keys [repo_id file]} (read-json-body req)]
+      (json-response 200 (models/download! {:repo-id repo_id :file file})))
+    (catch Exception e
+      (json-response 400 {:error (.getMessage e)}))))
+
+(defn- handle-models-search [req]
+  (try
+    (let [{:keys [q]} (parse-query (:query-string req))]
+      (json-response 200 {:object "list" :data (models/search-hf! q)}))
+    (catch Exception e
+      (json-response 400 {:error (.getMessage e)}))))
+
+(defn- handle-models-hf-files [req]
+  (try
+    (let [{:keys [repo_id]} (parse-query (:query-string req))]
+      (json-response 200 {:object "list" :data (models/list-hf-gguf-files! repo_id)}))
+    (catch Exception e
+      (json-response 400 {:error (.getMessage e)}))))
+
+(defn- chat-completion-args [{:keys [messages max_tokens temperature]} model-path on-token]
+  (let [prompt (->> messages (map :content) (str/join "\n"))]
+    (cond-> {:kotodama/model-path model-path
+             :kotodama/prompt prompt
+             :kotodama/max-tokens (or max_tokens 256)
+             :kotodama/sample-opts {:kotodama/temperature (or temperature 0.7)}}
+      on-token (assoc :kotodama/on-token on-token))))
+
+(defn- handle-chat-completions-blocking [req parsed]
+  (let [{:keys [model]} parsed]
+    (if-let [generate (generate-fn)]
+      (if-let [model-path (models/path-for model)]
+        (try
+          (let [result (generate (chat-completion-args parsed model-path nil))
+                text (:kotodama/text result)]
+            (json-response 200
+                           {:id (str "chatcmpl-" (System/currentTimeMillis))
+                            :object "chat.completion"
+                            :model model
+                            :choices [{:index 0
+                                       :message {:role "assistant" :content text}
+                                       :finish_reason (name (or (:kotodama/stop-reason result) :stop))}]
+                            :murakumo_studio/quality_note quality-note}))
+          (catch Throwable e
+            (json-response 500 {:error (str "generate failed: " (.getMessage e))})))
+        (json-response 404 {:error (str "unknown model: " model)}))
+      (json-response 503 {:error "kotodama.inference.host.jvm/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))))
+
+(defn- handle-chat-completions-stream [req parsed]
+  (http/with-channel req channel
+    (http/send! channel
+                {:status 200
+                 :headers {"Content-Type" "text/event-stream"
+                           "Cache-Control" "no-cache"
+                           "Access-Control-Allow-Origin" "*"}}
+                false)
+    (let [{:keys [model]} parsed
+          sse! (fn [data] (http/send! channel (str "data: " (json/generate-string data) "\n\n") false))
+          on-token (fn [_token-id token-text _elapsed-nanos]
+                     (sse! {:object "chat.completion.chunk" :model model
+                            :choices [{:index 0 :delta {:content token-text}}]}))]
+      (future
+        (try
+          (if-let [generate (generate-fn)]
+            (if-let [model-path (models/path-for model)]
+              (try
+                (sse! {:object "chat.completion.chunk" :model model
+                       :murakumo_studio/quality_note quality-note})
+                (generate (chat-completion-args parsed model-path on-token))
+                (catch Throwable e
+                  (sse! {:error (str "generate failed: " (.getMessage e))})))
+              (sse! {:error (str "unknown model: " model)}))
+            (sse! {:error "kotodama.inference.host.jvm/generate is not available yet in this build — see ADR-2607032700 Phase 1 status"}))
+          (catch Throwable e
+            (sse! {:error (str e)}))
+          (finally
+            (http/send! channel "data: [DONE]\n\n" false)
+            (http/close channel)))))))
+
+(defn- handle-chat-completions [req]
+  (let [parsed (read-json-body req)]
+    (if (:stream parsed)
+      (handle-chat-completions-stream req parsed)
+      (handle-chat-completions-blocking req parsed))))
+
+(defn- handle-fleet-status [_req] (json-response 200 (fleet/status)))
+(defn- handle-fleet-join [_req] (json-response 200 (fleet/join!)))
+(defn- handle-fleet-leave [_req] (json-response 200 (fleet/leave!)))
+
+(defn- router [{:keys [request-method uri] :as req}]
+  (cond
+    (and (= request-method :get) (= uri "/health"))
+    (json-response 200 {:status "ok" :engine (boolean (generate-fn))})
+
+    (and (= request-method :get) (= uri "/v1/models")) (handle-models-list req)
+    (and (= request-method :post) (= uri "/models/scan")) (handle-models-scan req)
+    (and (= request-method :post) (= uri "/models/download")) (handle-models-download req)
+    (and (= request-method :get) (= uri "/models/search")) (handle-models-search req)
+    (and (= request-method :get) (= uri "/models/hf-files")) (handle-models-hf-files req)
+    (and (= request-method :post) (= uri "/v1/chat/completions")) (handle-chat-completions req)
+    (and (= request-method :get) (= uri "/fleet/status")) (handle-fleet-status req)
+    (and (= request-method :post) (= uri "/fleet/join")) (handle-fleet-join req)
+    (and (= request-method :post) (= uri "/fleet/leave")) (handle-fleet-leave req)
+    (= request-method :options) {:status 204 :headers {"Access-Control-Allow-Origin" "*"
+                                                         "Access-Control-Allow-Methods" "GET,POST,OPTIONS"
+                                                         "Access-Control-Allow-Headers" "Content-Type"}}
+    :else (json-response 404 {:error "no such route" :uri uri})))
+
+(defonce server (atom nil))
+
+(defn start! []
+  (models/refresh!)
+  (reset! server (http/run-server #'router {:port port :ip "127.0.0.1"}))
+  (println (str "murakumo-studio engine listening on http://127.0.0.1:" port)))
+
+(defn stop! []
+  (when-let [s @server] (s :timeout 100) (reset! server nil)))
+
+(defn -main [& _args]
+  (start!)
+  ;; keep the JVM alive; the Tauri shell kills this process on app exit
+  @(promise))

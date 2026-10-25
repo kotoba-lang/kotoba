@@ -1,0 +1,245 @@
+(ns kotoba.lang.checkpointer.msgpack
+  "Hand-rolled MessagePack (msgpack.org spec) encode/decode.
+
+  Why hand-rolled instead of a JVM library (e.g. `org.msgpack:msgpack-core`
+  on Maven Central): (a) msgpack's format is materially simpler than CBOR's
+  (no canonical-sort requirement, no CID-link concept) -- the same
+  'small, hand-rolled, zero-transitive-deps codec' shape that worked well
+  for `kotoba-lang/dag-cbor`; (b) this sidecar is a long-lived JVM daemon
+  process (a launchd/systemd/K8s-CronJob-equivalent, per checkpointer-bin.ts
+  -- NOT a `bb` script), so there is no babashka-classlist-compatibility
+  reason to prefer a Java library; (c) msgpack here is a WIRE PROTOCOL, not
+  a content-addressing scheme -- unlike the MST/CAR dag-cbor layer, there is
+  no 'same bytes' determinism contract to honor, only 'a conformant msgpack
+  decoder (Python's `msgpack`, `@msgpack/msgpack`) can read what we write,
+  and we can read what it writes'. Byte-for-byte identity with
+  `@msgpack/msgpack`'s own output is nevertheless what this port aims for
+  (and mostly achieves, since both implementations pick the
+  smallest-representation encoding for a given value) and is checked in
+  test/kotoba/lang/checkpointer/mst_vectors.edn's `:msgpack_vectors` --
+  generated via `node -e` against the REAL @msgpack/msgpack (see
+  scripts/gen-mst-vectors.mjs) -- but round-trip correctness, not
+  byte-identity, is the actual correctness bar.
+
+  Covers: nil, bool, int (all signed/unsigned widths, incl. full unsigned
+  64-bit on decode/encode via BigInteger when a value doesn't fit a signed
+  Long), float32 (decode only; this port never emits float32)/float64, str
+  (fixstr/str8/16/32), bin (bin8/16/32), array (fixarray/array16/32), map
+  (fixmap/map16/32).
+
+  NOT supported: extension types (fixext/ext*) and the msgpack timestamp
+  extension. The TS sidecar's own wire protocol never emits them (its
+  envelope fields are plain strings/bytes/numbers/booleans/null/nested
+  maps-arrays -- see checkpointer.ts's Request/Response/SaverIndexRow
+  interfaces), and @msgpack/msgpack's default encode of those same JS value
+  shapes never produces one either.
+
+  Portability: `.cljc`, whole-file `#?(:clj (do ...))`-wrapped with throwing
+  `:cljs` stubs, matching the established `multiformats.core` /
+  `kotoba.lang.checkpointer.dagcbor` precedent in this ecosystem. Unlike
+  dagcbor, this codec has no upstream `:clj`-only dependency forcing the
+  wrap -- it's a self-contained wire-protocol codec that COULD be ported to
+  cljs (`js/DataView`/`Uint8Array` in place of `ByteBuffer`/
+  `ByteArrayOutputStream`, `js/BigInt` in place of `BigInteger` for the
+  uint64-beyond-Long case). It is wrapped anyway because: (a) every byte
+  read/write here (`write-be`/`write-be-big`/`read-uint64`/etc.) is exactly
+  the kind of JVM-array/BigInteger-representation-specific logic this port's
+  own task brief calls out as acceptable to defer; (b) a faithful port would
+  need independent cljs-side verification against the same
+  `mst_vectors.edn` `:msgpack_vectors` (generated from the REAL
+  `@msgpack/msgpack`) that JVM tests already check byte-for-byte, which is
+  out of scope for this compliance pass; (c) this sidecar's OWN deployment
+  model is JVM-only (see below) so there is no in-repo cljs caller today.
+  Porting the actual bit-twiddling to cljs is a reasonable, independently
+  reviewable follow-up, not attempted here."
+  #?(:clj (:import (java.io ByteArrayOutputStream ByteArrayInputStream)
+                   (java.nio ByteBuffer)
+                   (java.math BigInteger)))
+  (:require [kotoba.bytes :as kbytes]))
+
+#?(:clj
+(do
+
+;; ---------------------------------------------------------------------------
+;; encode
+;; ---------------------------------------------------------------------------
+
+(defn- write-u8 [^ByteArrayOutputStream o n] (.write o (int (bit-and (long n) 0xff))))
+
+(defn- write-be
+  "Write the low `nbytes` bytes of `n` (a long, its two's-complement bit
+  pattern -- sign is irrelevant here since we only ever slice out bytes)
+  big-endian."
+  [^ByteArrayOutputStream o ^long n nbytes]
+  (doseq [i (range (dec (long nbytes)) -1 -1)]
+    (write-u8 o (bit-and (unsigned-bit-shift-right n (* 8 i)) 0xff))))
+
+(def ^:private uint64-max (biginteger "18446744073709551615"))
+
+(defn- write-be-big
+  "Write the low `nbytes` bytes of a non-negative BigInteger `n`, big-endian,
+  zero-padded on the left (used only for the uint64 values that don't fit a
+  signed Long, i.e. n >= 2^63)."
+  [^ByteArrayOutputStream o ^BigInteger n nbytes]
+  (let [out (byte-array nbytes)
+        raw (.toByteArray n)                    ; big-endian two's complement (may have a leading 0x00 sign byte)
+        src-len (alength raw)
+        copy-len (min src-len nbytes)
+        src-off (max 0 (- src-len nbytes))
+        dst-off (max 0 (- nbytes src-len))]
+    (System/arraycopy raw src-off out dst-off copy-len)
+    (.write o out)))
+
+(defn- encode-int [^ByteArrayOutputStream o n]
+  (cond
+    (and (>= n 0) (<= n 127)) (write-u8 o n)
+    (and (< n 0) (>= n -32)) (write-u8 o (bit-and (long n) 0xff))
+    (and (< n 0) (>= n -128)) (do (write-u8 o 0xd0) (write-be o (long n) 1))
+    (and (>= n 0) (<= n 0xff)) (do (write-u8 o 0xcc) (write-be o (long n) 1))
+    (and (< n 0) (>= n -32768)) (do (write-u8 o 0xd1) (write-be o (long n) 2))
+    (and (>= n 0) (<= n 0xffff)) (do (write-u8 o 0xcd) (write-be o (long n) 2))
+    (and (< n 0) (>= n -2147483648)) (do (write-u8 o 0xd2) (write-be o (long n) 4))
+    (and (>= n 0) (<= n 0xffffffff)) (do (write-u8 o 0xce) (write-be o (long n) 4))
+    (and (< n 0) (>= n Long/MIN_VALUE)) (do (write-u8 o 0xd3) (write-be o (long n) 8))
+    (and (>= n 0) (<= n Long/MAX_VALUE)) (do (write-u8 o 0xcf) (write-be o (long n) 8))
+    (and (>= n 0) (<= n uint64-max)) (do (write-u8 o 0xcf) (write-be-big o (biginteger n) 8))
+    :else (throw (ex-info "msgpack: integer out of supported range" {:n n}))))
+
+(defn- encode-float64 [^ByteArrayOutputStream o ^double d]
+  (write-u8 o 0xcb)
+  (write-be o (Double/doubleToLongBits d) 8))
+
+(defn- encode-str [^ByteArrayOutputStream o ^String s]
+  (let [b (kbytes/utf8-bytes s) n (alength b)]
+    (cond
+      (<= n 31) (write-u8 o (bit-or 0xa0 n))
+      (<= n 0xff) (do (write-u8 o 0xd9) (write-be o n 1))
+      (<= n 0xffff) (do (write-u8 o 0xda) (write-be o n 2))
+      :else (do (write-u8 o 0xdb) (write-be o n 4)))
+    (.write o b)))
+
+(defn- encode-bin [^ByteArrayOutputStream o ^bytes b]
+  (let [n (alength b)]
+    (cond
+      (<= n 0xff) (do (write-u8 o 0xc4) (write-be o n 1))
+      (<= n 0xffff) (do (write-u8 o 0xc5) (write-be o n 2))
+      :else (do (write-u8 o 0xc6) (write-be o n 4)))
+    (.write o b)))
+
+(defn- encode-array-header [^ByteArrayOutputStream o n]
+  (cond
+    (<= n 15) (write-u8 o (bit-or 0x90 n))
+    (<= n 0xffff) (do (write-u8 o 0xdc) (write-be o n 2))
+    :else (do (write-u8 o 0xdd) (write-be o n 4))))
+
+(defn- encode-map-header [^ByteArrayOutputStream o n]
+  (cond
+    (<= n 15) (write-u8 o (bit-or 0x80 n))
+    (<= n 0xffff) (do (write-u8 o 0xde) (write-be o n 2))
+    :else (do (write-u8 o 0xdf) (write-be o n 4))))
+
+(declare encode-into)
+
+(defn- encode-into [^ByteArrayOutputStream o x]
+  (cond
+    (nil? x) (write-u8 o 0xc0)
+    (true? x) (write-u8 o 0xc3)
+    (false? x) (write-u8 o 0xc2)
+    (float? x) (encode-float64 o (double x))
+    (integer? x) (encode-int o x)
+    (string? x) (encode-str o x)
+    (keyword? x) (encode-str o (name x))
+    (bytes? x) (encode-bin o x)
+    (map? x) (do (encode-map-header o (count x))
+                 (doseq [[k v] x] (encode-into o k) (encode-into o v)))
+    (sequential? x) (do (encode-array-header o (count x)) (doseq [e x] (encode-into o e)))
+    :else (throw (ex-info "msgpack: unsupported type" {:type (type x) :value x}))))
+
+(defn encode ^bytes [x]
+  (let [o (ByteArrayOutputStream.)] (encode-into o x) (.toByteArray o)))
+
+;; ---------------------------------------------------------------------------
+;; decode
+;; ---------------------------------------------------------------------------
+
+(defn- read-u8 [^ByteArrayInputStream in]
+  (let [v (.read in)]
+    (when (neg? v) (throw (ex-info "msgpack: unexpected end of input" {})))
+    v))
+
+(defn- read-bytes ^bytes [^ByteArrayInputStream in ^long n]
+  (let [b (byte-array n)
+        got (.read in b 0 n)]
+    (when (and (pos? n) (< got n)) (throw (ex-info "msgpack: unexpected end of input" {})))
+    b))
+
+(defn- bb ^ByteBuffer [^bytes b] (ByteBuffer/wrap b))
+
+(defn- read-uint16 ^long [in] (bit-and (long (.getShort (bb (read-bytes in 2)))) 0xffff))
+(defn- read-int16 ^long [in] (long (.getShort (bb (read-bytes in 2)))))
+(defn- read-uint32 ^long [in] (Integer/toUnsignedLong (.getInt (bb (read-bytes in 4)))))
+(defn- read-int32 ^long [in] (long (.getInt (bb (read-bytes in 4)))))
+
+(defn- read-uint64 [in]
+  (let [b (read-bytes in 8)]
+    (if (neg? (aget b 0))
+      (BigInteger. 1 ^bytes b)
+      (.getLong (kbb -M:b)))))
+
+(defn- read-int64 ^long [in] (.getLong (bb (read-bytes in 8))))
+(defn- read-float32 ^double [in] (double (.getFloat (bb (read-bytes in 4)))))
+(defn- read-float64 ^double [in] (.getDouble (bb (read-bytes in 8))))
+
+(defn- read-str ^String [in n] (kbytes/utf8-string (read-bytes in n)))
+
+(declare decode-from)
+
+(defn- read-array [in n] (vec (repeatedly n #(decode-from in))))
+(defn- read-map [in n] (into {} (repeatedly n (fn [] [(decode-from in) (decode-from in)]))))
+
+(defn- decode-from [^ByteArrayInputStream in]
+  (let [b0 (read-u8 in)]
+    (cond
+      (<= b0 0x7f) b0                                        ; positive fixint
+      (<= 0xe0 b0 0xff) (- b0 256)                           ; negative fixint
+      (<= 0x80 b0 0x8f) (read-map in (- b0 0x80))             ; fixmap
+      (<= 0x90 b0 0x9f) (read-array in (- b0 0x90))           ; fixarray
+      (<= 0xa0 b0 0xbf) (read-str in (- b0 0xa0))             ; fixstr
+      (= b0 0xc0) nil
+      (= b0 0xc2) false
+      (= b0 0xc3) true
+      (= b0 0xc4) (read-bytes in (read-u8 in))                ; bin8
+      (= b0 0xc5) (read-bytes in (read-uint16 in))            ; bin16
+      (= b0 0xc6) (read-bytes in (read-uint32 in))            ; bin32
+      (= b0 0xca) (read-float32 in)
+      (= b0 0xcb) (read-float64 in)
+      (= b0 0xcc) (read-u8 in)                                ; uint8
+      (= b0 0xcd) (read-uint16 in)
+      (= b0 0xce) (read-uint32 in)
+      (= b0 0xcf) (read-uint64 in)
+      (= b0 0xd0) (long (unchecked-byte (read-u8 in)))        ; int8
+      (= b0 0xd1) (read-int16 in)
+      (= b0 0xd2) (read-int32 in)
+      (= b0 0xd3) (read-int64 in)
+      (= b0 0xd9) (read-str in (read-u8 in))                  ; str8
+      (= b0 0xda) (read-str in (read-uint16 in))
+      (= b0 0xdb) (read-str in (read-uint32 in))
+      (= b0 0xdc) (read-array in (read-uint16 in))
+      (= b0 0xdd) (read-array in (read-uint32 in))
+      (= b0 0xde) (read-map in (read-uint16 in))
+      (= b0 0xdf) (read-map in (read-uint32 in))
+      :else (throw (ex-info "msgpack: unsupported/ext type byte" {:byte b0})))))
+
+(defn decode [^bytes b]
+  (decode-from (ByteArrayInputStream. b)))
+
+)) ;; end #?(:clj (do …))
+
+;; ── ClojureScript: same public API, throwing (see namespace docstring's
+;; Portability note -- deferred, not blocked by an upstream dependency) ────
+#?(:cljs
+(do
+  (defn- nope [n] (throw (ex-info (str "kotoba.lang.checkpointer.msgpack/" n " is :clj-only "
+                                       "(hand-rolled msgpack codec; cljs port deferred, see namespace docstring)") {})))
+  (defn encode [& _] (nope "encode"))
+  (defn decode [& _] (nope "decode"))))

@@ -1,0 +1,157 @@
+(ns kotoba.lang.checkpointer.sidecar
+  "Unix-domain-socket server -- a thin, separately-testable wrapper around
+  kotoba.lang.checkpointer.dispatch/handle-request. Frames: 4-byte
+  big-endian length prefix + msgpack request/response, exactly matching
+  checkpointer.ts's #handleConnection/#writeFrame.
+
+  Uses JDK 16+'s native Unix-domain-socket support
+  (`java.net.UnixDomainSocketAddress` + `ServerSocketChannel.open(
+  StandardProtocolFamily/UNIX)`) -- no extra dependency. This is
+  deliberately NOT behind an injectable protocol the way the HTTP transport
+  (kotoba.lang.ipfs/IHttp) is: running a Unix-socket server IS this
+  process's job, not an abstractable I/O seam. What IS kept separately
+  testable is everything AROUND the socket: `read-frame`/`write-frame!`
+  (pure framing over a channel) and `handle-request` (fully pure-callable,
+  see kotoba.lang.checkpointer.dispatch).
+
+  `.clj`, genuinely JVM-only (not a compliance gap): `java.net`/
+  `java.nio.channels` Unix-domain-socket server + JVM daemon threads, no
+  cljs analog."
+  (:require [kotoba.io :as io]
+            [kotoba.lang.checkpointer.dispatch :as dispatch]
+            [kotoba.lang.checkpointer.msgpack :as msgpack]
+            [kotoba.lang.checkpointer.index :as index]
+            [kotoba.lang.checkpointer.spool :as spool]
+            [kotoba.lang.checkpointer.keystore :as keystore]
+            [kotoba.lang.checkpointer.pin :as pin]
+            [kotoba.lang.checkpointer.commit :as commit]
+            [kotoba.lang.checkpointer.http-jdk :as http-jdk])
+  (:import (java.net StandardProtocolFamily UnixDomainSocketAddress)
+           (java.nio ByteBuffer)
+           (java.nio.channels ClosedChannelException ServerSocketChannel SocketChannel)))
+
+;; ---------------------------------------------------------------------------
+;; Framing (pure-ish: only touches the channel, no dispatch/business logic)
+;; ---------------------------------------------------------------------------
+
+(defn- read-n
+  "Read exactly `n` bytes from `ch`, or nil if EOF hits before ANY byte of
+  this read (a clean disconnect between frames); throws for a genuinely
+  truncated frame (partial read then EOF)."
+  [^SocketChannel ch ^long n]
+  (let [buf (ByteBuffer/allocate n)]
+    (loop [total 0]
+      (if (.hasRemaining buf)
+        (let [r (.read ch buf)]
+          (cond
+            (neg? r) (if (zero? total)
+                       nil
+                       (throw (java.io.EOFException. "socket closed mid-frame")))
+            :else (recur (+ total r))))
+        (.array buf)))))
+
+(defn read-frame
+  "Read one 4-byte-big-endian-length-prefixed frame body from `ch`. Returns
+  nil on a clean disconnect (no partial frame in flight)."
+  [^SocketChannel ch]
+  (when-let [len-bytes (read-n ch 4)]
+    (let [len (.getInt (ByteBuffer/wrap len-bytes))]
+      (read-n ch len))))
+
+(defn write-frame!
+  "Write `payload` as a 4-byte-big-endian-length-prefixed frame to `ch`."
+  [^SocketChannel ch ^bytes payload]
+  (let [buf (ByteBuffer/allocate (+ 4 (alength payload)))]
+    (.putInt buf (alength payload))
+    (.put buf payload)
+    (.flip buf)
+    (while (.hasRemaining buf) (.write ch buf))))
+
+;; ---------------------------------------------------------------------------
+;; Connection handling
+;; ---------------------------------------------------------------------------
+
+(defn handle-connection!
+  "Reads frames from `ch` in a loop, decoding+dispatching+encoding each via
+  `env`/`handle-request`, until the peer disconnects or errors. Mirrors
+  #handleConnection (incl. its `sock.on('error', destroy)` swallow-and-close
+  behavior)."
+  [env ^SocketChannel ch]
+  (try
+    (loop []
+      (when-let [frame (read-frame ch)]
+        (let [res (try
+                    (dispatch/handle-request env (msgpack/decode frame))
+                    (catch Exception e
+                      (dispatch/err (or (.getMessage e) (str e)))))]
+          (write-frame! ch (msgpack/encode res)))
+        (recur)))
+    (catch Exception _e nil)
+    (finally (try (.close ch) (catch Exception _e nil)))))
+
+;; ---------------------------------------------------------------------------
+;; env wiring (production: real filesystem / real pqh crypto / real IPFS pin
+;; over a JDK HttpClient) + start!/stop!
+;; ---------------------------------------------------------------------------
+
+(defn make-env
+  "cfg: {:state-dir :allowed-dids :encrypt-cells :blob-inline-threshold
+  :anchor-chain-id :ipfs-api-url}. index-atom: atom of {index-key -> row}."
+  [cfg index-atom]
+  (let [state-dir (:state-dir cfg)
+        http (http-jdk/jdk-http)]
+    {:index-atom index-atom
+     :allowed-dids (:allowed-dids cfg)
+     :encrypt-cells (or (:encrypt-cells cfg) #{})
+     :blob-inline-threshold (:blob-inline-threshold cfg commit/default-blob-inline-threshold)
+     :anchor-chain-id (:anchor-chain-id cfg 8453)
+     :spool-car! (fn [cell-did checkpoint-id bytes] (spool/spool-car! state-dir cell-did checkpoint-id bytes))
+     :spool-payload! (fn [cell-did checkpoint-id bytes] (spool/spool-payload! state-dir cell-did checkpoint-id bytes))
+     :load-payload (fn [cell-did checkpoint-id] (spool/load-payload state-dir cell-did checkpoint-id))
+     :persist-index! (fn [idx] (index/persist-index! state-dir idx))
+     :get-cell-key! (fn [cell-did] (keystore/load-or-create-cell-key! state-dir cell-did))
+     :pin! (fn [car-bytes on-result] (pin/pin-soon! http (:ipfs-api-url cfg) car-bytes on-result))}))
+
+(defrecord Sidecar [cfg ^ServerSocketChannel server accept-thread running index-atom])
+
+(defn- delete-stale-socket! [socket-path]
+  (let [f (io/file (str socket-path))]
+    (when (io/exists? f) (io/delete f))))
+
+(defn start!
+  "Binds the Unix socket, loads the on-disk index, and starts a daemon
+  accept-loop thread (one further daemon thread per connection). Mirrors
+  #start (mkdir -p state-dir/queue, unlink stale socket, loadIndex, listen)."
+  [cfg]
+  (let [socket-path (:socket-path cfg)
+        state-dir (:state-dir cfg)]
+    (io/make-parents (io/file (str socket-path) "placeholder"))
+    (io/mkdirs (io/file (str state-dir)))
+    (io/mkdirs (io/file (str state-dir) "queue"))
+    (delete-stale-socket! socket-path)
+    (let [index-atom (atom (index/load-index! state-dir))
+          env (make-env cfg index-atom)
+          server (ServerSocketChannel/open StandardProtocolFamily/UNIX)]
+      (.bind server (UnixDomainSocketAddress/of (str socket-path)))
+      (let [running (atom true)
+            thread (Thread.
+                    ^Runnable
+                    (fn []
+                      (while @running
+                        (try
+                          (let [ch (.accept server)]
+                            (when ch
+                              (.start (Thread. ^Runnable (fn [] (handle-connection! env ch))))))
+                          (catch ClosedChannelException _e nil)
+                          (catch Exception e
+                            (when @running
+                              (binding [*out* *err*]
+                                (println "[checkpointer] accept error:" (.getMessage e)))))))))]
+        (.setDaemon thread true)
+        (.start thread)
+        (->Sidecar cfg server thread running index-atom)))))
+
+(defn stop! [^Sidecar sidecar]
+  (reset! (:running sidecar) false)
+  (try (.close ^ServerSocketChannel (:server sidecar)) (catch Exception _e nil))
+  sidecar)

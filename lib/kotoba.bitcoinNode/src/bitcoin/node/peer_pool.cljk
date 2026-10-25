@@ -1,0 +1,587 @@
+(ns bitcoin.node.peer-pool
+  "Bounded DNS discovery and health-aware rotation for Bitcoin P2P peers.
+
+  DNS seeds only bootstrap public IP candidates. Every candidate still passes
+  the normal version handshake and all consensus validation; discovery never
+  creates a trust anchor."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.storage :as storage]
+            [bitcoin.node.peer :as peer]
+            [kotoba.lang.text :as str])
+  (:import [java.net Inet4Address InetAddress]
+           [java.nio.channels FileChannel]
+           [java.nio.file AtomicMoveNotSupportedException Files LinkOption
+            OpenOption Path StandardCopyOption StandardOpenOption]
+           [java.security MessageDigest SecureRandom]
+           [java.util ArrayList]
+           [java.util.concurrent Callable ExecutorService Executors TimeUnit]))
+
+(def dns-seeds
+  {:mainnet
+   ["dnsseed.bluematt.me."
+    "seed.bitcoin.jonasschnelli.ch."
+    "seed.btc.petertodd.net."
+    "seed.bitcoin.sprovoost.nl."
+    "dnsseed.emzy.de."
+    "seed.bitcoin.wiz.biz."
+    "seed.mainnet.achownodes.xyz."]
+   :testnet
+   ["testnet-seed.bitcoin.jonasschnelli.ch."
+    "seed.tbtc.petertodd.net."
+    "testnet-seed.bluematt.me."
+    "seed.testnet.achownodes.xyz."]
+   :testnet4
+   ["seed.testnet4.bitcoin.sprovoost.nl."
+    "seed.testnet4.wiz.biz."]
+   :signet
+   ["seed.signet.bitcoin.sprovoost.nl."
+    "seed.signet.achownodes.xyz."]
+   :regtest []})
+
+(def default-discovery-timeout-ms 5000)
+(def default-cooldown-ms 30000)
+(def maximum-cooldown-ms (* 60 60 1000))
+(def maximum-pool-size 1024)
+(def pool-format "bitcoin.node.peer-pool.v2")
+(def legacy-pool-format "bitcoin.node.peer-pool.v1")
+(def selection-key-bytes 16)
+
+(defn- fail! [type message data]
+  (codec/fail! type message data))
+
+(defn- peer-port [configuration]
+  (or (:port configuration)
+      (get-in peer/network-configuration
+              [(or (:network configuration) :mainnet) :port])))
+
+(defn peer-id [configuration]
+  [(or (:network configuration) :mainnet)
+   (:host configuration)
+   (peer-port configuration)])
+
+(defn- random-selection-key []
+  (let [bytes (byte-array selection-key-bytes)]
+    (.nextBytes (SecureRandom.) bytes)
+    (mapv #(bit-and 0xff %) bytes)))
+
+(defn- valid-selection-key? [selection-key]
+  (and (vector? selection-key)
+       (= selection-key-bytes (count selection-key))
+       (every? #(and (integer? %) (<= 0 % 255)) selection-key)))
+
+(defn- normalize-configuration [configuration]
+  (let [[network host port] (peer-id configuration)]
+    (when-not (and (contains? peer/network-configuration network)
+                   (string? host)
+                   (not-empty host)
+                   (integer? port)
+                   (<= 1 port 65535)
+                   (integer? (or (:timeout-ms configuration) 10000))
+                   (pos? (or (:timeout-ms configuration) 10000))
+                   (integer? (or (:required-services configuration) 0))
+                   (<= 0 (or (:required-services configuration) 0)
+                       peer/maximum-service-mask)
+                   (contains? #{:dns :explicit :operator}
+                              (or (:source configuration) :explicit)))
+      (fail! :bitcoin.node/peer-configuration
+             "Peer configuration is invalid."
+             {:configuration configuration}))
+    {:host host :port port :network network
+     :timeout-ms (or (:timeout-ms configuration) 10000)
+     :required-services (or (:required-services configuration) 0)
+     :anchor? (true? (:anchor? configuration))
+     :source (or (:source configuration) :explicit)}))
+
+(defn network-group
+  "Return an eclipse-resistance group for peer selection.
+
+  Public IPv4 peers are grouped by /16. Hostnames and other explicit address
+  forms receive distinct normalized host groups until a resolved address is
+  available."
+  [configuration]
+  (let [host (:host configuration)
+        parts (when (string? host) (str/split host #"\."))]
+    (if (and (= 4 (count parts))
+             (every? #(re-matches #"[0-9]{1,3}" %) parts)
+             (every? #(<= 0 (parse-long %) 255) parts))
+      [:ipv4 (parse-long (nth parts 0)) (parse-long (nth parts 1))]
+      [:host (str/lower (or host ""))])))
+
+(defn create
+  "Create a bounded peer pool from explicit or discovered configurations."
+  ([configurations] (create configurations {}))
+  ([configurations {:keys [selection-key]
+                    :or {selection-key (random-selection-key)}}]
+   (when-not (valid-selection-key? selection-key)
+     (fail! :bitcoin.node/peer-pool-selection-key
+            "Peer selection key must contain 16 bytes."
+            {}))
+   (let [values (vec (distinct (map normalize-configuration configurations)))]
+     (when (> (count values) maximum-pool-size)
+       (fail! :bitcoin.node/peer-pool-limit
+              "Peer pool exceeds its resource limit."
+              {:count (count values) :limit maximum-pool-size}))
+     {:selection-key selection-key
+      :selection-counter 0
+      :peers
+      (into {}
+            (map
+             (fn [configuration]
+               [(peer-id configuration)
+                {:configuration configuration
+                 :successes 0
+                 :failures 0
+                 :consecutive-failures 0
+                 :latency-ema-ms nil
+                 :cooldown-until 0
+                 :last-selected-at 0
+                 :last-success-at nil
+                 :last-failure-at nil
+                 :last-error nil}]))
+            values)})))
+
+(defn add-peers
+  "Merge new candidates without erasing existing health history."
+  [pool configurations]
+  (reduce
+   (fn [result configuration]
+     (let [configuration (normalize-configuration configuration)
+           id (peer-id configuration)]
+       (if (contains? (:peers result) id)
+         (update-in
+          result [:peers id :configuration]
+          (fn [existing]
+            (cond-> existing
+              (:anchor? configuration)
+              (assoc :anchor? true :source :operator)
+
+              (pos? (:required-services configuration))
+              (assoc :required-services
+                     (:required-services configuration)))))
+         (do
+           (when (>= (count (:peers result)) maximum-pool-size)
+             (fail! :bitcoin.node/peer-pool-limit
+                    "Peer pool exceeds its resource limit."
+                    {:limit maximum-pool-size}))
+           (assoc-in
+            result [:peers id]
+            {:configuration configuration
+             :successes 0 :failures 0 :consecutive-failures 0
+             :latency-ema-ms nil :cooldown-until 0
+             :last-selected-at 0 :last-success-at nil
+             :last-failure-at nil :last-error nil})))))
+   pool configurations))
+
+(defn- failure-cooldown [consecutive-failures]
+  (min maximum-cooldown-ms
+       (* default-cooldown-ms
+          (bit-shift-left 1 (min 10 (dec consecutive-failures))))))
+
+(defn record-success
+  ([pool configuration now elapsed-ms]
+   (record-success pool configuration now elapsed-ms nil))
+  ([pool configuration now elapsed-ms services]
+   (let [id (peer-id configuration)]
+     (if-not (contains? (:peers pool) id)
+       pool
+       (update-in
+        pool [:peers id]
+        (fn [entry]
+          (let [previous (:latency-ema-ms entry)
+                latency (double (max 0 (or elapsed-ms 0)))]
+            (cond->
+             (-> entry
+                 (update :successes inc)
+                 (assoc :consecutive-failures 0
+                        :cooldown-until 0
+                        :last-success-at now
+                        :last-error nil
+                        :latency-ema-ms
+                        (if previous
+                          (+ (* 0.75 previous) (* 0.25 latency))
+                          latency)))
+              (integer? services)
+              (assoc :last-services services)))))))))
+
+(defn record-failure
+  [pool configuration now error-type elapsed-ms]
+  (let [id (peer-id configuration)]
+    (if-not (contains? (:peers pool) id)
+      pool
+      (update-in
+       pool [:peers id]
+       (fn [entry]
+         (let [failures (inc (:consecutive-failures entry))
+               severe?
+               (contains?
+                #{:bitcoin.node/peer-network-mismatch
+                  :bitcoin.node/peer-required-services
+                  :bitcoin.node/peer-checksum
+                  :bitcoin.node/peer-oversized-message
+                  :bitcoin.node/peer-unrequested-block
+                  :bitcoin.node/block-response-mismatch
+                  :bitcoin.node/peer-invalid-block
+                  :bitcoin.node/peer-mutated-block}
+                error-type)
+               cooldown
+               (if severe?
+                 maximum-cooldown-ms
+                 (failure-cooldown failures))]
+           (-> entry
+               (update :failures inc)
+               (assoc :consecutive-failures failures
+                      :last-failure-at now
+                      :last-error error-type
+                      :last-failure-elapsed-ms elapsed-ms
+                      :cooldown-until (+ now cooldown)))))))))
+
+(defn- selection-rank [pool id]
+  (let [digest (MessageDigest/getInstance "SHA-256")]
+    (.update digest
+             (byte-array
+              (map unchecked-byte (:selection-key pool))))
+    (.update digest
+             (kbytes/utf8-bytes
+              (str ":" (:selection-counter pool) ":" (pr-str id))))
+    (mapv #(bit-and 0xff %) (.digest digest))))
+
+(defn candidates
+  "Return eligible configurations in health-, diversity-, and salt-aware order."
+  ([pool now] (candidates pool now 8))
+  ([pool now limit]
+   (when-not (and (integer? limit) (<= 1 limit 32))
+     (fail! :bitcoin.node/peer-pool-limit
+            "Peer selection limit must be between 1 and 32."
+            {:limit limit}))
+   (let [ranked
+         (->> (:peers pool)
+              (keep
+               (fn [[id entry]]
+                 (when (<= (:cooldown-until entry) now)
+                   [id entry])))
+              (sort-by
+               (fn [[id entry]]
+                 [(:consecutive-failures entry)
+                  (if (get-in entry [:configuration :anchor?]) 0 1)
+                  (:last-selected-at entry)
+                  (or (:latency-ema-ms entry) Double/MAX_VALUE)
+                  (selection-rank pool id)
+                  id])))
+         {:keys [selected deferred]}
+         (reduce
+          (fn [{:keys [selected groups] :as result} candidate]
+            (let [group (network-group
+                         (get-in candidate [1 :configuration]))]
+              (if (and (< (count selected) limit)
+                       (not (contains? groups group)))
+                (-> result
+                    (update :selected conj candidate)
+                    (update :groups conj group))
+                (update result :deferred conj candidate))))
+          {:selected [] :groups #{} :deferred []}
+          ranked)]
+     (->> (concat selected deferred)
+          (take limit)
+          (mapv (comp :configuration second))))))
+
+(defn mark-selected [pool configurations now]
+  (-> (reduce
+       (fn [result configuration]
+         (assoc-in result
+                   [:peers (peer-id configuration) :last-selected-at]
+                   now))
+       pool configurations)
+      (update :selection-counter inc)))
+
+(defn status [pool now]
+  (let [entries (vals (:peers pool))]
+    {:peers (count entries)
+     :eligible (count (filter #(<= (:cooldown-until %) now) entries))
+     :cooling-down (count (filter #(< now (:cooldown-until %)) entries))
+     :successful (count (filter #(pos? (:successes %)) entries))
+     :anchors
+     (count (filter #(get-in % [:configuration :anchor?]) entries))
+     :eligible-network-groups
+     (count
+      (into #{}
+            (comp
+             (filter #(<= (:cooldown-until %) now))
+             (map #(network-group (:configuration %))))
+            entries))
+     :next-retry-at
+     (when-let [times (seq (keep #(when (< now (:cooldown-until %))
+                                    (:cooldown-until %))
+                                 entries))]
+       (apply min times))}))
+
+(defn- valid-entry? [id entry]
+  (let [configuration (:configuration entry)]
+    (and (= id (peer-id configuration))
+         (string? (:host configuration))
+         (not-empty (:host configuration))
+         (contains? peer/network-configuration (:network configuration))
+         (integer? (:port configuration))
+         (<= 1 (:port configuration) 65535)
+         (contains? #{true false nil} (:anchor? configuration))
+         (contains? #{nil :dns :explicit :operator}
+                    (:source configuration))
+         (or (nil? (:required-services configuration))
+             (and (integer? (:required-services configuration))
+                  (<= 0 (:required-services configuration)
+                      peer/maximum-service-mask)))
+         (or (nil? (:last-services entry))
+             (and (integer? (:last-services entry))
+                  (<= 0 (:last-services entry)
+                      peer/maximum-service-mask)))
+         (every? #(and (integer? %) (not (neg? %)))
+                 ((juxt :successes :failures :consecutive-failures
+                        :cooldown-until :last-selected-at)
+                  entry))
+         (or (nil? (:latency-ema-ms entry))
+             (and (number? (:latency-ema-ms entry))
+                  (Double/isFinite (double (:latency-ema-ms entry)))
+                  (not (neg? (:latency-ema-ms entry))))))))
+
+(defn validate
+  "Validate a decoded peer pool before it can influence outbound networking."
+  [pool]
+  (when-not (and (map? pool)
+                 (valid-selection-key? (:selection-key pool))
+                 (integer? (:selection-counter pool))
+                 (not (neg? (:selection-counter pool)))
+                 (map? (:peers pool))
+                 (<= (count (:peers pool)) maximum-pool-size)
+                 (every? (fn [[id entry]] (valid-entry? id entry))
+                         (:peers pool)))
+    (fail! :bitcoin.node/peer-pool-corrupt
+           "Persisted peer pool violates structural bounds." {}))
+  pool)
+
+(defn encode [pool]
+  (storage/encode-value {:format pool-format :pool (validate pool)}))
+
+(defn decode [bytes]
+  (let [value (storage/decode-value bytes)]
+    (when-not (contains? #{pool-format legacy-pool-format} (:format value))
+      (fail! :bitcoin.node/peer-pool-format
+             "Persisted peer pool has an unsupported format."
+             {:format (:format value)}))
+    (validate
+     (cond-> (:pool value)
+       (= legacy-pool-format (:format value))
+       (assoc :selection-key (random-selection-key)
+              :selection-counter 0)))))
+
+(defn save!
+  "Durably and atomically replace a peer-pool snapshot."
+  [path pool]
+  (let [target (.toAbsolutePath
+                (Path/of (str path) (make-array String 0)))
+        parent (.getParent target)
+        _ (Files/createDirectories
+           parent (make-array java.nio.file.attribute.FileAttribute 0))
+        temporary
+        (Files/createTempFile
+         parent ".bitcoin-peer-pool-" ".tmp"
+         (make-array java.nio.file.attribute.FileAttribute 0))]
+    (try
+      (Files/write
+       temporary (encode pool)
+       (into-array
+        OpenOption
+        [StandardOpenOption/WRITE StandardOpenOption/TRUNCATE_EXISTING]))
+      (with-open [channel
+                  (FileChannel/open
+                   temporary
+                   (into-array OpenOption [StandardOpenOption/WRITE]))]
+        (.force channel true))
+      (try
+        (Files/move
+         temporary target
+         (into-array
+          java.nio.file.CopyOption
+          [StandardCopyOption/ATOMIC_MOVE
+           StandardCopyOption/REPLACE_EXISTING]))
+        (catch AtomicMoveNotSupportedException _
+          (Files/move
+           temporary target
+           (into-array
+            java.nio.file.CopyOption
+            [StandardCopyOption/REPLACE_EXISTING]))))
+      target
+      (finally
+        (Files/deleteIfExists temporary)))))
+
+(defn load!
+  [path]
+  (let [target (Path/of (str path) (make-array String 0))]
+    (when-not (Files/exists target (make-array LinkOption 0))
+      (fail! :bitcoin.node/peer-pool-not-found
+             "Peer pool snapshot does not exist."
+             {:path (str path)}))
+    (decode (Files/readAllBytes target))))
+
+(defn report-block-validation-failure!
+  "Apply and optionally persist severe feedback for a block's source peer.
+
+  Network download success is provisional until consensus validates the body.
+  This second-stage report prevents the same peer from immediately supplying
+  another invalid or mutated body on the next synchronization cycle."
+  [pool-atom configuration now error-type
+   {:keys [elapsed-ms pool-path]}]
+  (swap! pool-atom record-failure
+         configuration now error-type (or elapsed-ms 0))
+  (when pool-path
+    (save! pool-path @pool-atom))
+  (status @pool-atom now))
+
+(defn- public-ipv4? [^InetAddress address]
+  (when (instance? Inet4Address address)
+    (let [octets (.getAddress address)
+          a (bit-and 0xff (aget octets 0))
+          b (bit-and 0xff (aget octets 1))
+          c (bit-and 0xff (aget octets 2))]
+      ;; Globally routed unicast only. InetAddress's local predicates do not
+      ;; cover CGNAT, documentation, benchmarking, or reserved ranges.
+      (not (or (= a 0)
+               (= a 10)
+               (= a 127)
+               (>= a 224)
+               (and (= a 100) (<= 64 b 127))
+               (and (= a 169) (= b 254))
+               (and (= a 172) (<= 16 b 31))
+               (and (= a 192) (= b 0) (= c 0))
+               (and (= a 192) (= b 0) (= c 2))
+               (and (= a 192) (= b 88) (= c 99))
+               (and (= a 192) (= b 168))
+               (and (= a 198) (<= 18 b 19))
+               (and (= a 198) (= b 51) (= c 100))
+               (and (= a 203) (= b 0) (= c 113)))))))
+
+(defn- default-resolver [seed]
+  (seq (InetAddress/getAllByName ^String seed)))
+
+(defn discover-dns!
+  "Resolve Core-compatible DNS seeds concurrently within one overall timeout.
+
+  Non-global, reserved, multicast, and non-IPv4 results are rejected.
+  `:resolver` and `:seeds` are injectable for deterministic tests."
+  ([network] (discover-dns! network {}))
+  ([network {:keys [resolver seeds timeout-ms maximum-results]
+             :or {resolver default-resolver
+                  timeout-ms default-discovery-timeout-ms
+                  maximum-results 256}}]
+   (let [seeds (vec (or seeds (get dns-seeds network)))]
+     (when-not (contains? peer/network-configuration network)
+       (fail! :bitcoin.node/peer-network
+              "Unsupported Bitcoin peer network." {:network network}))
+     (when-not (and (integer? timeout-ms) (pos? timeout-ms)
+                    (integer? maximum-results)
+                    (<= 1 maximum-results maximum-pool-size)
+                    (<= (count seeds) 16))
+       (fail! :bitcoin.node/peer-discovery-configuration
+              "DNS discovery bounds are invalid."
+              {:timeout-ms timeout-ms :maximum-results maximum-results
+               :seed-count (count seeds)}))
+     (if (empty? seeds)
+       []
+       (let [^ExecutorService executor
+             (Executors/newFixedThreadPool (min 4 (count seeds)))
+             tasks (ArrayList.)]
+         (try
+           (doseq [seed seeds]
+             (.add
+              tasks
+              (reify Callable
+                (call [_]
+                  (try
+                    (vec (resolver seed))
+                    (catch Throwable _ []))))))
+           (let [futures
+                 (.invokeAll executor tasks timeout-ms TimeUnit/MILLISECONDS)
+                 addresses
+                 (mapcat
+                  (fn [future]
+                    (if (.isCancelled future) [] (.get future)))
+                  futures)
+                 port (get-in peer/network-configuration [network :port])]
+             (->> addresses
+                  (filter public-ipv4?)
+                  (map #(.getHostAddress ^InetAddress %))
+                  distinct
+                  sort
+                  (take maximum-results)
+                  (mapv #(hash-map :host % :port port :network network
+                                   :timeout-ms 10000 :source :dns))))
+           (finally
+             (.shutdownNow executor))))))))
+
+(defn sync-headers!
+  "Run one health-aware peer-set sync and update the supplied pool atom."
+  [pool-atom locator-fn accept-batch!
+   {:keys [now-ms maximum-peers pool-path]
+    :or {now-ms (System/currentTimeMillis) maximum-peers 8}
+    :as options}]
+  (let [selected (candidates @pool-atom now-ms maximum-peers)]
+    (when (empty? selected)
+      (fail! :bitcoin.node/peer-pool-cooldown
+             "No peer is currently outside cooldown."
+             (status @pool-atom now-ms)))
+    (swap! pool-atom mark-selected selected now-ms)
+    (try
+      (let [result
+            (peer/sync-headers-from-peers!
+             selected locator-fn accept-batch!
+             (dissoc options :now-ms :maximum-peers :pool-path))]
+        (doseq [{:keys [peer elapsed-ms services]} (:observations result)]
+          (swap! pool-atom record-success
+                 peer now-ms elapsed-ms services))
+        (doseq [{:keys [peer type elapsed-ms]} (:failures result)]
+          (swap! pool-atom record-failure
+                 peer now-ms type elapsed-ms))
+        (assoc result :pool (status @pool-atom now-ms)))
+      (catch kerror/ExceptionInfo error
+        (doseq [{:keys [peer type elapsed-ms]} (:failures (ex-data error))]
+          (swap! pool-atom record-failure
+                 peer now-ms type elapsed-ms))
+        (throw error))
+      (finally
+        ;; Selection is health history too. Persist it even when an unexpected
+        ;; callback exception interrupts the managed synchronization.
+        (when pool-path (save! pool-path @pool-atom))))))
+
+(defn download-blocks!
+  "Download one bounded block window through diverse, health-scored peers.
+
+  Selection history is persisted before network I/O. Successful peers update
+  latency/service evidence; failed peers enter the same typed exponential
+  cooldown used by header synchronization."
+  [pool-atom block-hashes
+   {:keys [now-ms maximum-peers pool-path]
+    :or {now-ms (System/currentTimeMillis) maximum-peers 8}
+    :as options}]
+  (let [selected (candidates @pool-atom now-ms maximum-peers)]
+    (when (empty? selected)
+      (fail! :bitcoin.node/peer-pool-cooldown
+             "No peer is currently outside cooldown."
+             (status @pool-atom now-ms)))
+    (swap! pool-atom mark-selected selected now-ms)
+    (try
+      (let [result
+            (peer/download-blocks-from-peers!
+             selected block-hashes
+             (dissoc options :now-ms :maximum-peers :pool-path))]
+        (doseq [{:keys [peer elapsed-ms services]} (:observations result)]
+          (swap! pool-atom record-success
+                 peer now-ms elapsed-ms services))
+        (doseq [{:keys [peer type elapsed-ms]} (:failures result)]
+          (swap! pool-atom record-failure
+                 peer now-ms type elapsed-ms))
+        (assoc result :pool (status @pool-atom now-ms)))
+      (catch kerror/ExceptionInfo error
+        (doseq [{:keys [peer type elapsed-ms]} (:failures (ex-data error))]
+          (swap! pool-atom record-failure
+                 peer now-ms type elapsed-ms))
+        (throw error))
+      (finally
+        (when pool-path (save! pool-path @pool-atom))))))

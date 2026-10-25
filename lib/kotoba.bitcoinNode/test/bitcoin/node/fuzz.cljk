@@ -1,0 +1,318 @@
+(ns bitcoin.node.fuzz
+  "Deterministic fuzzing for untrusted P2P input and durable chainstate."
+  (:refer-clojure :exclude [run!])
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.transaction :as transaction]
+            [bitcoin.consensus.utxo :as utxo]
+            [bitcoin.node.compact-filter :as compact-filter]
+            [bitcoin.node.consensus-test :as fixture]
+            [bitcoin.node.disk-consensus :as disk]
+            [bitcoin.node.peer :as peer]
+            [bitcoin.node.wire :as wire]
+            [kotobase.bitcoin.protocol :as protocol])
+  (:import [java.nio.charset StandardCharsets]
+           [java.nio.file Files Path StandardOpenOption]
+           [java.nio.file.attribute FileAttribute]
+           [java.util Random]))
+
+(def schema "kotoba.bitcoin.node-fuzz.v1")
+(def failure-schema "kotoba.bitcoin.node-fuzz-failure.v1")
+(def default-seed 21000000)
+(def default-iterations 5000)
+(def maximum-iterations 1000000)
+(def maximum-input-bytes 4096)
+
+(def ^:private regtest-magic
+  (get-in peer/network-configuration [:regtest :magic]))
+
+(def ^:private canonical-version
+  (protocol/encode-version-payload
+   {:timestamp 1 :nonce 2 :user-agent "/kotoba-fuzz:1/"
+    :start-height 3 :relay? false}))
+
+(def ^:private genesis-bytes
+  (fixture/hex->bytes fixture/regtest-genesis))
+
+(def ^:private canonical-header
+  (protocol/decode-block-header (subvec genesis-bytes 0 80)))
+
+(def ^:private canonical-headers
+  (protocol/encode-headers-payload [canonical-header]))
+
+(def ^:private canonical-frame
+  (protocol/encode-message regtest-magic "version" canonical-version))
+
+(def ^:private canonical-filter
+  (compact-filter/encode (vec (repeat 32 7))
+                         [[1 2 3] [4 5] [6 7 8 9]]))
+
+(def ^:private compact-size-bombs
+  [[0xfd 0xfc 0x00]
+   [0xfe 0xff 0xff 0xff 0x7f]
+   [0xff 0xff 0xff 0xff 0xff 0xff 0xff 0xff 0x7f]])
+
+(defn- bytes->hex [value]
+  (apply str (map #(format "%02x" %) value)))
+
+(defn- hex->bytes [value]
+  (when-not (and (string? value)
+                 (<= (count value) (* 2 maximum-input-bytes))
+                 (even? (count value))
+                 (re-matches #"[0-9a-fA-F]*" value))
+    (throw
+     (ex-info "Fuzz artifact contains invalid input hex."
+              {:type :bitcoin.node.fuzz/artifact-input})))
+  (mapv #(Integer/parseInt (apply str %) 16)
+        (partition 2 value)))
+
+(defn- random-bytes [^Random random maximum]
+  (vec (repeatedly (.nextInt random (inc maximum))
+                   #(.nextInt random 256))))
+
+(defn- insert-at [value index addition]
+  (vec (concat (subvec value 0 index) addition (subvec value index))))
+
+(defn- mutate [^Random random canonical]
+  (let [canonical (vec canonical)
+        size (count canonical)]
+    (case (.nextInt random 9)
+      0 (random-bytes random maximum-input-bytes)
+      1 (if (zero? size) []
+            (update canonical (.nextInt random size)
+                    bit-xor (bit-shift-left 1 (.nextInt random 8))))
+      2 (subvec canonical 0 (.nextInt random (inc size)))
+      3 (vec (take maximum-input-bytes
+                   (concat canonical (random-bytes random 64))))
+      4 (if (zero? size) [0xff]
+            (assoc canonical (.nextInt random size) (.nextInt random 256)))
+      5 (let [addition (random-bytes random 32)]
+          (vec (take maximum-input-bytes
+                     (insert-at canonical (.nextInt random (inc size))
+                                addition))))
+      6 (let [bomb (nth compact-size-bombs
+                        (.nextInt random (count compact-size-bombs)))]
+          (vec (take maximum-input-bytes
+                     (insert-at canonical (.nextInt random (inc size)) bomb))))
+      7 (vec (reverse canonical))
+      8 (vec (repeat (.nextInt random (inc maximum-input-bytes))
+                     (.nextInt random 256))))))
+
+(defn- typed-bitcoin-error? [error]
+  (contains? #{"bitcoin.node" "bitcoin.consensus"}
+             (some-> error ex-data :type namespace)))
+
+(defn- input-evidence [value]
+  {:length (count value)
+   :input-hex (bytes->hex value)
+   :prefix-hex
+   (bytes->hex (take 256 value))})
+
+(defn- exercise!
+  [target seed case-index value operation]
+  (try
+    (operation)
+    (catch kerror/ExceptionInfo error
+      (when-not (typed-bitcoin-error? error)
+        (throw
+         (ex-info "Fuzz target returned an untyped Bitcoin failure."
+                  (merge {:type :bitcoin.node.fuzz/untyped-failure
+                          :target target :seed seed :case case-index
+                          :failure-data (ex-data error)}
+                         (input-evidence value))
+                  error))))
+    (catch Throwable error
+      (throw
+       (ex-info "Fuzz target escaped with a host exception."
+                (merge {:type :bitcoin.node.fuzz/host-exception
+                        :target target :seed seed :case case-index
+                        :host-exception (.getName (class error))}
+                       (input-evidence value))
+                error)))))
+
+(defn- frame-case! [seed case-index value]
+  (exercise!
+   :p2p-frame seed case-index value
+   #(let [{:keys [command payload]}
+          (wire/decode-frame value regtest-magic)]
+      (when-not (= value
+                   (protocol/encode-message regtest-magic command payload))
+        (throw
+         (ex-info "Decoded P2P frame did not round-trip canonically."
+                  {:type :bitcoin.node.fuzz/roundtrip}))))))
+
+(defn- version-case! [seed case-index value]
+  (exercise! :version seed case-index value
+             #(wire/decode-version-payload value)))
+
+(defn- headers-case! [seed case-index value]
+  (exercise!
+   :headers seed case-index value
+   #(let [headers (wire/decode-headers-payload value)]
+      (when-not (= value (protocol/encode-headers-payload headers))
+        (throw
+         (ex-info "Decoded headers payload did not round-trip canonically."
+                  {:type :bitcoin.node.fuzz/roundtrip}))))))
+
+(defn- compact-filter-case! [seed case-index value]
+  (exercise! :compact-filter seed case-index value
+             #(compact-filter/decode-values value)))
+
+(defn- coinbase [height marker]
+  (transaction/parse
+   (transaction/serialize
+    {:version 1
+     :inputs [{:txid-natural (vec (repeat 32 0))
+               :vout 0xffffffff
+               :script-sig
+               (conj (get-in (fixture/regtest-coinbase height)
+                             [:inputs 0 :script-sig])
+                     marker)
+               :sequence 0xffffffff}]
+     :outputs [{:value (utxo/block-subsidy height 150)
+                :script-pubkey [81]}]
+     :witnesses nil :locktime 0 :segwit? false})))
+
+(defn- mine-block [parent height marker]
+  (let [tx (coinbase height marker)
+        template
+        {:version 4
+         :prev-block (get-in parent [:header :hash])
+         :merkle-root (:txid-natural tx)
+         :timestamp (inc (get-in parent [:header :timestamp]))
+         :bits 0x207fffff}]
+    (loop [nonce 0]
+      (let [header-bytes
+            (protocol/encode-block-header (assoc template :nonce nonce))
+            decoded (protocol/decode-block-header header-bytes)]
+        (if (protocol/hash-meets-target? (:hash decoded) (:bits decoded))
+          (block/parse
+           (vec (concat header-bytes [1] (:raw tx))))
+          (recur (inc nonce)))))))
+
+(defn- branch [parent length marker-base]
+  (loop [height 1 parent parent result []]
+    (if (> height length)
+      result
+      (let [next-block
+            (mine-block parent height (mod (+ marker-base height) 256))]
+        (recur (inc height) next-block (conj result next-block))))))
+
+(def ^:private durable-status-keys
+  [:height :best-block :best-header :best-header-height :utxo-count
+   :pending-blocks :invalid-blocks :available-reorg-depth])
+
+(defn- property! [condition message data]
+  (when-not condition
+    (throw
+     (ex-info message (assoc data :type :bitcoin.node.fuzz/property)))))
+
+(defn- assert-durable! [path node seed step]
+  (let [status (disk/consensus-status node)
+        expected (select-keys status durable-status-keys)
+        integrity (disk/integrity-check! node)
+        reopened (disk/open {:path path :network :regtest})
+        actual (select-keys (disk/consensus-status reopened)
+                            durable-status-keys)]
+    (property! (= :ok (:integrity integrity))
+               "SQLite integrity check failed during state fuzzing."
+               {:seed seed :step step :integrity integrity})
+    (property! (= expected actual)
+               "Durable consensus status changed across reopen."
+               {:seed seed :step step :before expected :after actual})
+    (property!
+     (= (:best-block status)
+        (disk/active-block-hash-at-height reopened (:height status)))
+     "Active-chain height lookup disagrees with the durable tip."
+     {:seed seed :step step :status expected})
+    reopened))
+
+(defn- delete-store! [directory path]
+  (doseq [target [path
+                  (Path/of (str path ".background") (make-array String 0))
+                  (Path/of (str path ".headers") (make-array String 0))
+                  (Path/of (str path ".reindex") (make-array String 0))
+                  (Path/of (str path ".reindex-pointer")
+                           (make-array String 0))]
+          suffix ["-shm" "-wal" ""]]
+    (Files/deleteIfExists
+     (Path/of (str target suffix) (make-array String 0))))
+  (Files/deleteIfExists directory))
+
+(defn- chainstate-case! [^Random random seed]
+  (let [directory
+        (Files/createTempDirectory
+         "bitcoin-node-fuzz-" (make-array FileAttribute 0))
+        path (.resolve directory "chainstate.sqlite")]
+    (try
+      (let [genesis (block/parse genesis-bytes)
+            main-length (+ 4 (.nextInt random 5))
+            side-length (+ main-length 1 (.nextInt random 2))
+            main (branch genesis main-length (+ 1 (.nextInt random 64)))
+            side (branch genesis side-length (+ 128 (.nextInt random 64)))
+            candidates (vec (concat main side))]
+        (loop [node
+               (disk/open {:path path :network :regtest
+                           :genesis-bytes genesis-bytes})
+               step 0]
+          (if (= step (count candidates))
+            (let [status (disk/consensus-status node)
+                  expected-tip (get-in (peek side) [:header :hash-hex])
+                  invalid-child
+                  (mine-block (peek side) (inc side-length) 253)
+                  serialized-invalid-child (block/serialize invalid-child)
+                  invalid-raw
+                  (update serialized-invalid-child
+                          (dec (count serialized-invalid-child)) bit-xor 1)
+                  failure
+                  (try
+                    (disk/accept-block! node invalid-raw 2000000000)
+                    nil
+                    (catch kerror/ExceptionInfo error error))]
+              (property! (= side-length (:height status))
+                         "Most-work side branch did not become active."
+                         {:seed seed :status status})
+              (property! (= expected-tip (:best-block status))
+                         "Durable fork choice selected an unexpected tip."
+                         {:seed seed :expected expected-tip
+                          :actual (:best-block status)})
+              (property! (typed-bitcoin-error? failure)
+                         "Invalid block did not fail with typed evidence."
+                         {:seed seed :failure (some-> failure ex-data)})
+              (assert-durable! path node seed step)
+              {:state-steps (inc step)
+               :main-blocks main-length :side-blocks side-length})
+            (let [candidate (nth candidates step)
+                  _ (disk/accept-block!
+                     node (block/serialize candidate) 2000000000)
+                  reopened (assert-durable! path node seed step)]
+              (recur reopened (inc step))))))
+      (finally
+        (delete-store! directory path)))))
+
+(defn run!
+  "Run deterministic wire mutations and one durable fork/restart scenario."
+  [seed iterations]
+  (when-not (and (integer? seed)
+                 (integer? iterations)
+                 (<= 1 iterations maximum-iterations))
+    (throw
+     (ex-info "Fuzz seed or iteration count is invalid."
+              {:type :bitcoin.node.fuzz/configuration
+               :seed seed :iterations iterations})))
+  (let [random (Random. (long seed))]
+    (dotimes [case-index iterations]
+      (frame-case! seed case-index (mutate random canonical-frame))
+      (version-case! seed case-index (mutate random canonical-version))
+      (headers-case! seed case-index (mutate random canonical-headers))
+      (compact-filter-case! seed case-index
+                            (mutate random canonical-filter)))
+    (merge
+     {:schema schema :seed seed :iterations iterations
+      :target-cases (* 4 iterations) :result :passed}
+     (chainstate-case! random seed))))
+
+(defn -main [& [seed iterations]]
+  (let [seed (if seed (parse-long seed) default-seed)
+        iterations (if iterations (parse-long iterations)
+                       default-iterations)]
+    (println (pr-str (run! seed iterations)))))

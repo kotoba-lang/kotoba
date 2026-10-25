@@ -1,0 +1,110 @@
+(ns grant.publisher-test
+  (:require [grant.publisher :as p]
+            [grant.clock :as clock]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def root {:keys #{"k1" "k2" "k3"} :threshold 2})
+(def bits [0 0 0 0])                       ; nobody revoked
+(def sigs [{:key-id "k1" :verified? true :status-index 0}
+           {:key-id "k2" :verified? true :status-index 1}])
+(def release {:sequence 7 :signatures sigs :artifact-digests-match? true :timestamp-ms 1000})
+(def state {:installed-sequence 6 :now-ms 2000 :root root :revocation-bits bits})
+
+(deftest a-well-formed-release-is-admitted
+  (let [v (p/admit-release release state)]
+    (is (p/admitted? v))
+    (is (= 2 (count (:aiueos.publisher/live v))))))
+
+(deftest one-stolen-key-is-not-enough
+  (let [v (p/admit-release (assoc release :signatures [(first sigs)]) state)]
+    (is (= :below-threshold (:aiueos.publisher/reason v)))))
+
+(deftest a-revoked-key-stops-counting-even-though-its-signature-verifies
+  (let [v (p/admit-release release (assoc state :revocation-bits [1 0 0 0]))]
+    (is (= :below-threshold (:aiueos.publisher/reason v))
+        "one live signer left, threshold is 2")
+    (is (= ["k1"] (:aiueos.publisher/revoked v))))
+  (let [v (p/admit-release release (assoc state :revocation-bits [1 1 0 0]))]
+    (is (= :key-revoked (:aiueos.publisher/reason v)))))
+
+(deftest an-index-the-bitmap-does-not-cover-is-revoked
+  (is (true? (p/revoked? [0 0] 5)) "a list that has not grown to cover a key does not vouch for it")
+  (is (true? (p/revoked? [0 0] nil)))
+  (is (false? (p/revoked? [0 0] 1))))
+
+(deftest keys-the-root-does-not-name-are-named-as-such
+  (let [v (p/admit-release (assoc release :signatures
+                                  [{:key-id "kX" :verified? true :status-index 0}
+                                   {:key-id "kY" :verified? true :status-index 1}])
+                           state)]
+    (is (= :key-not-in-root (:aiueos.publisher/reason v)))))
+
+(deftest a-downgrade-is-refused
+  (is (= :sequence-not-monotonic
+         (:aiueos.publisher/reason (p/admit-release (assoc release :sequence 6) state))))
+  (is (= :sequence-not-monotonic
+         (:aiueos.publisher/reason (p/admit-release (assoc release :sequence 5) state)))))
+
+(deftest a-stale-timestamp-refuses-new-releases
+  (let [old (+ 1000 (:freshness-ttl-ms p/default-policy) 1)]
+    (is (= :timestamp-expired
+           (:aiueos.publisher/reason (p/admit-release release (assoc state :now-ms old)))))
+    (is (= :timestamp-missing
+           (:aiueos.publisher/reason (p/admit-release (dissoc release :timestamp-ms) state))))))
+
+(deftest a-network-outage-does-not-become-a-fleet-outage
+  (testing "the running system stays up inside the grace window, while new releases are refused"
+    (let [stale (+ 1000 (:freshness-ttl-ms p/default-policy) 1)]
+      (is (true? (p/keep-running? {:now-ms stale :timestamp-ms 1000})))
+      (is (not (p/admitted? (p/admit-release release (assoc state :now-ms stale)))))))
+  (let [way-past (+ 1000 (:freshness-ttl-ms p/default-policy)
+                    (:offline-grace-ms p/default-policy) 1)]
+    (is (false? (p/keep-running? {:now-ms way-past :timestamp-ms 1000})))))
+
+(deftest structural-problems-are-named-before-trust-ones
+  (is (= :no-signatures (:aiueos.publisher/reason (p/admit-release (assoc release :signatures []) state))))
+  (is (= :digest-mismatch
+         (:aiueos.publisher/reason (p/admit-release (assoc release :artifact-digests-match? false) state))))
+  (is (= :root-expired
+         (:aiueos.publisher/reason (p/admit-release release (assoc state :root-expires-ms 1500)))))
+  (is (= :threshold-unsatisfiable
+         (:aiueos.publisher/reason
+          (p/admit-release release (assoc state :root {:keys #{"k1"} :threshold 2})))))) 
+
+(deftest root-rotation-needs-both-roots
+  (let [old {:keys #{"a" "b"} :threshold 2} new* {:keys #{"c" "d"} :threshold 2}
+        sig (fn [id i] {:key-id id :verified? true :status-index i})
+        base {:old-root old :new-root new* :revocation-bits [0 0 0 0]}]
+    (is (p/admitted? (p/admit-root-rotation
+                      (assoc base :old-root-signatures [(sig "a" 0) (sig "b" 1)]
+                             :new-root-signatures [(sig "c" 2) (sig "d" 3)]))))
+    (is (= :root-old (:aiueos.publisher/role
+                      (p/admit-root-rotation
+                       (assoc base :old-root-signatures [(sig "a" 0)]
+                              :new-root-signatures [(sig "c" 2) (sig "d" 3)]))))
+        "without the old root, anyone who can deliver bytes replaces the anchor")
+    (is (= :root-new (:aiueos.publisher/role
+                      (p/admit-root-rotation
+                       (assoc base :old-root-signatures [(sig "a" 0) (sig "b" 1)]
+                              :new-root-signatures [(sig "c" 2)]))))
+        "without the new root, a typo bricks the fleet's ability to update")))
+
+;; ── freshness through grant.clock ────────────────────────────────────────
+
+(deftest a-clockless-machine-refuses-a-new-release-rather-than-guessing
+  (let [clockless (clock/resolve-time {:build-stamp-ms 500})
+        v (p/admit-release release (-> state (dissoc :now-ms) (assoc :clock clockless)))]
+    (is (= :freshness-undecidable (:aiueos.publisher/reason v))
+        "neither fresh nor stale is not admitted, and is not reported as expiry")
+    (is (= :no-reading-only-a-bound (:aiueos.publisher/freshness-reason v)))))
+
+(deftest a-clockless-machine-can-still-reject-a-stale-release
+  (let [clockless (clock/resolve-time {:build-stamp-ms (+ 1000 (:freshness-ttl-ms p/default-policy) 1)})
+        v (p/admit-release release (-> state (dissoc :now-ms) (assoc :clock clockless)))]
+    (is (= :timestamp-expired (:aiueos.publisher/reason v)))
+    (is (= :older-than-lower-bound (:aiueos.publisher/freshness-reason v))
+        "the anti-freeze half survives with no clock at all")))
+
+(deftest a-signed-reading-lets-the-same-machine-accept
+  (let [ok (clock/resolve-time {:signed-ms 2000 :build-stamp-ms 500})]
+    (is (p/admitted? (p/admit-release release (-> state (dissoc :now-ms) (assoc :clock ok)))))))

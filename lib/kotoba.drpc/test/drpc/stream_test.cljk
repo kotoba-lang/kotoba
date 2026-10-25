@@ -1,0 +1,152 @@
+(ns drpc.stream-test
+  "Streams: many messages in one direction or both.
+
+  Upload, Download, SettlementWithWindow and RetainBig are all this shape, and
+  none of them can be expressed as a unary call. The rule that changes is when
+  a receive is finished: a unary call ends at its first message, and a stream
+  ends when the peer says so. Applying the unary rule to a download reads the
+  first chunk and calls it complete."
+  (:require [kotoba.test :refer [deftest is]]
+            [drpc.client :as c]
+            [drpc.server :as srv]
+            [drpc.session :as s]
+            [drpc.wire :as w]))
+
+(defn- text [bs] (apply str (map char bs)))
+
+(defn- client-stream
+  "Open a stream, send each chunk, close the sending side. Returns
+  `[state stream-id bytes]`."
+  [rpc chunks]
+  (let [[st open] (s/begin-stream (s/session) {:rpc rpc})
+        [st bodies] (reduce (fn [[st acc] chunk]
+                              (let [[st bs] (s/send-on st (:stream open)
+                                                       (c/ascii-bytes chunk))]
+                                [st (into acc bs)]))
+                            [st []] chunks)
+        [st done] (s/end-send st (:stream open))]
+    [st (:stream open) (vec (concat (:bytes open) bodies done))]))
+
+;; ── sending ─────────────────────────────────────────────────────────────────
+
+(deftest opening-a-stream-says-only-its-name
+  ;; `doNewStream` writes the invoke and leaves the stream open, which is what
+  ;; makes it a stream rather than a call
+  (let [[_ _ bs] (client-stream "/a/A" [])
+        packets (:packets (w/feed (w/reader) bs))]
+    (is (= [:invoke :close-send] (mapv :kind packets))
+        "and a stream with nothing in it is still a stream")))
+
+(deftest message-ids-advance-across-every-packet
+  ;; a caller tracking these itself gets one call's numbering wrong the first
+  ;; time two streams are open at once
+  (let [[_ _ bs] (client-stream "/a/A" ["one" "two" "three"])
+        packets (:packets (w/feed (w/reader) bs))]
+    (is (= [:invoke :message :message :message :close-send] (mapv :kind packets)))
+    (is (= [1 2 3 4 5] (mapv :message packets)))))
+
+(deftest metadata-shifts-the-numbering
+  (let [[st open] (s/begin-stream (s/session) {:rpc "/a/A" :metadata [7]})
+        [_ bs] (s/send-on st (:stream open) [1])
+        packets (:packets (w/feed (w/reader) (vec (concat (:bytes open) bs))))]
+    (is (= [:invoke-metadata :invoke :message] (mapv :kind packets)))
+    (is (= [1 2 3] (mapv :message packets)))))
+
+(deftest sending-on-a-stream-that-does-not-exist-is-refused
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no such stream"
+                        (s/send-on (s/session) 7 [1]))))
+
+;; ── receiving ───────────────────────────────────────────────────────────────
+
+(defn- server-stream
+  "The bytes a server writes for a streamed response: `n` messages then
+  CloseSend."
+  [stream chunks]
+  (vec (concat (mapcat (fn [i chunk]
+                         (srv/send-message stream (inc i) (c/ascii-bytes chunk)))
+                       (range) chunks)
+               (srv/end-response stream (inc (count chunks))))))
+
+(deftest a-streamed-response-is-not-finished-at-its-first-message
+  ;; the whole reason `stream-complete?` exists
+  (let [[st stream _] (client-stream "/a/A" ["x"])
+        reply (server-stream stream ["one" "two" "three"])
+        first-only (subvec reply 0 (count (srv/send-message stream 1 (c/ascii-bytes "one"))))
+        {st' :state completed :completed} (s/feed st first-only)]
+    (is (empty? completed) "one message is not the end of a stream")
+    (let [{:keys [completed]} (s/feed st' (subvec reply (count first-only)))]
+      (is (= 1 (count completed)))
+      (is (= ["one" "two" "three"] (mapv text (:messages (:result (first completed)))))))))
+
+(deftest a-unary-call-still-ends-at-its-first-message
+  ;; the two rules coexist on one connection, and the session remembers which
+  ;; kind each call is
+  (let [[st a] (s/begin (s/session) {:rpc "/a/A" :request []})
+        reply (w/encode-packet {:kind :message :stream (:stream a) :message 1
+                                :data (c/ascii-bytes "only")})
+        {:keys [completed]} (s/feed st reply)]
+    (is (= 1 (count completed)))
+    (is (= "only" (text (:message (:result (first completed))))))))
+
+(deftest a-unary-and-a-streaming-call-can-be-open-at-once
+  (let [[st u] (s/begin (s/session) {:rpc "/u/U" :request []})
+        [st sm] (s/begin-stream st {:rpc "/s/S"})
+        reply (vec (concat (w/encode-packet {:kind :message :stream (:stream u)
+                                             :message 1 :data (c/ascii-bytes "u")})
+                           (server-stream (:stream sm) ["a" "b"])))
+        {:keys [completed]} (s/feed st reply)]
+    (is (= 2 (count completed)))
+    (let [by-stream (into {} (map (juxt :stream :result)) completed)]
+      (is (= "u" (text (:message (get by-stream (:stream u))))))
+      (is (= ["a" "b"] (mapv text (:messages (get by-stream (:stream sm)))))))))
+
+(deftest an-error-ends-a-stream-too
+  ;; not only CloseSend: a peer that gives up mid-stream ends the call too, and
+  ;; a client waiting for a CloseSend that is never coming waits forever
+  (let [[st stream _] (client-stream "/a/A" [])
+        {:keys [completed]} (s/feed st (srv/respond-error stream 17 "gone"))]
+    (is (= 1 (count completed)))
+    (is (= 17 (get-in (first completed) [:result :error :code])))
+    (is (empty? (s/pending (:state (s/feed st (srv/respond-error stream 17 "gone"))))))))
+
+;; ── the server side ─────────────────────────────────────────────────────────
+
+(deftest a-server-hears-every-message-as-it-arrives
+  ;; a handler that waited for the whole stream would buffer a piece in memory
+  ;; before writing a byte of it
+  (let [[_ _ bs] (client-stream "/piecestore.Piecestore/Upload" ["aa" "bb" "cc"])
+        thirds (partition-all (max 1 (quot (count bs) 4)) bs)
+        {:keys [heard calls]}
+        (reduce (fn [{:keys [state heard calls]} chunk]
+                  (let [r (srv/feed state (vec chunk))]
+                    {:state (:state r)
+                     :heard (into heard (map :data (:messages r)))
+                     :calls (into calls (:calls r))}))
+                {:state (srv/incoming) :heard [] :calls []}
+                thirds)]
+    (is (= ["aa" "bb" "cc"] (mapv text heard)))
+    (is (= 1 (count calls)) "and the call itself arrives when the client stops")
+    (is (= ["aa" "bb" "cc"] (mapv text (:requests (first calls)))))))
+
+(deftest a-completed-streaming-call-carries-every-request
+  (let [[_ _ bs] (client-stream "/a/A" ["one" "two"])
+        {:keys [calls messages]} (srv/feed (srv/incoming) bs)]
+    (is (= 1 (count calls)))
+    (is (= ["one" "two"] (mapv text (:requests (first calls)))))
+    (is (= "two" (text (:request (first calls)))) "the last one, for a unary handler")
+    (is (= 2 (count messages)))))
+
+(deftest a-server-can-stream-its-answer
+  (let [bs (server-stream 1 ["a" "b" "c"])
+        packets (:packets (w/feed (w/reader) bs))]
+    (is (= [:message :message :message :close-send] (mapv :kind packets)))
+    (is (= [1 2 3 4] (mapv :message packets)))
+    (is (= ["a" "b" "c"] (mapv (comp text :data) (butlast packets))))))
+
+(deftest a-unary-reply-is-a-one-message-stream
+  ;; `respond` is `send-message` plus `end-response`, and a streaming client
+  ;; reading it sees exactly one message and a close
+  (let [[st stream _] (client-stream "/a/A" [])
+        {:keys [completed]} (s/feed st (srv/respond stream (c/ascii-bytes "just one")))]
+    (is (= 1 (count completed)))
+    (is (= ["just one"] (mapv text (:messages (:result (first completed))))))))

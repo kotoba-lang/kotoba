@@ -1,0 +1,699 @@
+(ns bitcoin.node.peer-test
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.codec :as codec]
+            [bitcoin.node.compact-filter :as compact-filter]
+            [bitcoin.node.consensus-test :as fixture]
+            [bitcoin.node.peer :as peer]
+            [kotoba.test :refer [deftest is]]
+            [kotobase.bitcoin.protocol :as protocol])
+  (:import [java.io DataInputStream DataOutputStream]
+           [java.net ServerSocket Socket]))
+
+(defn- read-bytes [^DataInputStream input length]
+  (let [value (byte-array length)]
+    (.readFully input value)
+    (mapv #(bit-and 0xff %) value)))
+
+(defn- read-message [^DataInputStream input]
+  (let [header
+        (protocol/decode-message-header
+         (read-bytes input protocol/header-size))
+        payload (read-bytes input (:length header))]
+    (is (protocol/checksum-valid? header payload))
+    {:command (:command header) :payload payload}))
+
+(defn- send-message!
+  [^DataOutputStream output magic command payload]
+  (.write output
+          (byte-array
+           (map unchecked-byte
+                (protocol/encode-message magic command payload))))
+  (.flush output))
+
+(defn- send-raw! [^DataOutputStream output bytes]
+  (.write output (byte-array (map unchecked-byte bytes)))
+  (.flush output))
+
+(defn- handshake-error-type [frame]
+  (with-open [server (ServerSocket. 0)]
+    (let [served
+          (future
+            (with-open [^Socket socket (.accept server)
+                        input (DataInputStream. (.getInputStream socket))
+                        output (DataOutputStream. (.getOutputStream socket))]
+              (is (= "version" (:command (read-message input))))
+              (send-raw! output frame)))
+          type
+          (:type
+           (ex-data
+            (try
+              (peer/connect!
+               {:host "127.0.0.1" :port (.getLocalPort server)
+                :network :regtest :timeout-ms 5000})
+              (catch kerror/ExceptionInfo error error))))]
+      @served
+      type)))
+
+(deftest jvm-peer-handshake-ping-and-getheaders-round-trip
+  (with-open [server (ServerSocket. 0)]
+    (let [magic (get-in peer/network-configuration [:regtest :magic])
+          genesis
+          (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+          block-1 (fixture/mine-regtest-block genesis 1)
+          block-2 (fixture/mine-regtest-block block-1 2)
+          expected [(:header block-1) (:header block-2)]
+          server-result
+          (future
+            (with-open [^Socket socket (.accept server)
+                        input (DataInputStream. (.getInputStream socket))
+                        output (DataOutputStream. (.getOutputStream socket))]
+              (let [version (read-message input)]
+                (is (= "version" (:command version)))
+                (send-message!
+                 output magic "version"
+                (protocol/encode-version-payload
+                  {:timestamp 1 :nonce 18446744073709551615N
+                   :start-height 2}))
+                (send-message! output magic "verack" [])
+                (is (= "verack" (:command (read-message input))))
+                (let [request (read-message input)
+                      decoded
+                      (protocol/decode-getheaders-payload
+                       (:payload request))]
+                  (is (= "getheaders" (:command request)))
+                  ;; Exercise control traffic while a response is pending.
+                  (send-message!
+                   output magic "ping"
+                   (protocol/encode-ping-payload 42))
+                  (is (= "pong" (:command (read-message input))))
+                  (send-message!
+                   output magic "headers"
+                   (protocol/encode-headers-payload expected))
+                  (let [block-request (read-message input)]
+                    (is (= "getdata" (:command block-request)))
+                    (send-message!
+                     output magic "block" (block/serialize block-1))
+                    (assoc decoded
+                           :block-request (:payload block-request)))))))
+          connection
+          (peer/connect!
+           {:host "127.0.0.1" :port (.getLocalPort server)
+            :network :regtest :timeout-ms 5000})]
+      (try
+        (is (= 2 (get-in connection [:peer-version :start-height])))
+        (let [accepted (atom nil)
+              result
+              (peer/sync-headers!
+               connection [(get-in genesis [:header :hash])]
+               #(reset! accepted %)
+               {:max-batches 2})]
+          (is (= (mapv :hash-hex expected)
+                 (mapv :hash-hex @accepted)))
+          (is (= {:status :synced :batches 1 :accepted 2
+                  :locator (get-in block-2 [:header :hash])}
+                 result)))
+        (is (= (block/serialize block-1)
+               (peer/get-block!
+                connection (get-in block-1 [:header :hash]))))
+        (is (= [(get-in genesis [:header :hash])]
+               (:locator-hashes @server-result)))
+        (is (= (vec
+                (concat
+                 [1]
+                 (protocol/uint-le->bytes
+                  peer/witness-block-inventory-type 4)
+                 (get-in block-1 [:header :hash])))
+               (:block-request @server-result)))
+        (finally
+          (peer/close! connection))))))
+
+(deftest authenticated-compact-filter-round-trip
+  (with-open [server (ServerSocket. 0)]
+    (let [magic (get-in peer/network-configuration [:regtest :magic])
+          block-hash (vec (range 32))
+          previous-header (vec (repeat 32 0))
+          encoded (compact-filter/encode block-hash [[1 2 3] [4 5]])
+          filter-hash (compact-filter/filter-hash encoded)
+          expected-header
+          (compact-filter/filter-header encoded previous-header)
+          served
+          (future
+            (with-open [^Socket socket (.accept server)
+                        input (DataInputStream. (.getInputStream socket))
+                        output (DataOutputStream. (.getOutputStream socket))]
+              (is (= "version" (:command (read-message input))))
+              (send-message!
+               output magic "version"
+               (protocol/encode-version-payload
+                {:services peer/node-compact-filters-service
+                 :timestamp 1 :nonce 2 :start-height 10}))
+              (send-message! output magic "verack" [])
+              (is (= "verack" (:command (read-message input))))
+              (let [request (read-message input)]
+                (is (= "getcfheaders" (:command request)))
+                (is (= (vec (concat [0] (codec/uint-le 10 4) block-hash))
+                       (:payload request)))
+                (send-message!
+                 output magic "cfheaders"
+                 (vec
+                  (concat [0] block-hash previous-header
+                          (codec/compact-size 1) filter-hash))))
+              (let [request (read-message input)]
+                (is (= "getcfilters" (:command request)))
+                (is (= (vec (concat [0] (codec/uint-le 10 4) block-hash))
+                       (:payload request)))
+                (send-message!
+                 output magic "cfilter"
+                 (vec
+                  (concat [0] block-hash
+                          (codec/compact-size (count encoded)) encoded))))))
+          connection
+          (peer/connect!
+           {:host "127.0.0.1" :port (.getLocalPort server)
+            :network :regtest :timeout-ms 5000
+            :required-services peer/node-compact-filters-service})]
+      (try
+        (is (= [{:filter-hash filter-hash :header expected-header}]
+               (peer/get-basic-filter-headers!
+                connection 10 10 block-hash previous-header)))
+        (is (= encoded
+               (peer/get-basic-filter!
+                connection 10 block-hash previous-header expected-header)))
+        (is (= :bitcoin.node/peer-compact-filters-unavailable
+               (:type
+                (ex-data
+                 (try
+                   (peer/get-basic-filter-headers!
+                    (assoc connection :peer-version {:services 0})
+                    10 10 block-hash previous-header)
+                   (catch kerror/ExceptionInfo error error))))))
+        (finally
+          (peer/close! connection)))
+      @served)))
+
+(deftest obsolete-peer-version-fails-closed
+  (with-open [server (ServerSocket. 0)]
+    (let [magic (get-in peer/network-configuration [:regtest :magic])
+          served
+          (future
+            (with-open [^Socket socket (.accept server)
+                        input (DataInputStream. (.getInputStream socket))
+                        output (DataOutputStream. (.getOutputStream socket))]
+              (is (= "version" (:command (read-message input))))
+              (send-message!
+               output magic "version"
+               (protocol/encode-version-payload
+                {:version (dec peer/minimum-peer-version)
+                 :timestamp 1 :nonce 2}))
+              (send-message! output magic "verack" [])
+              (read-message input)))]
+      (is (= :bitcoin.node/peer-version
+             (:type
+              (ex-data
+               (try
+                 (peer/connect!
+                  {:host "127.0.0.1" :port (.getLocalPort server)
+                   :network :regtest :timeout-ms 5000})
+                 (catch kerror/ExceptionInfo error error))))))
+      @served)))
+
+(deftest peer-must-advertise-required-service-bits
+  (letfn [(connect-to [advertised-services required-services]
+            (with-open [server (ServerSocket. 0)]
+              (let [magic
+                    (get-in peer/network-configuration [:regtest :magic])
+                    served
+                    (future
+                      (with-open
+                       [^Socket socket (.accept server)
+                        input (DataInputStream. (.getInputStream socket))
+                        output (DataOutputStream. (.getOutputStream socket))]
+                        (is (= "version" (:command (read-message input))))
+                        (send-message!
+                         output magic "version"
+                         (protocol/encode-version-payload
+                          {:services advertised-services
+                           :timestamp 1 :nonce 2}))
+                        (send-message! output magic "verack" [])
+                        (is (= "verack" (:command (read-message input))))))
+                    result
+                    (try
+                      (peer/connect!
+                       {:host "127.0.0.1"
+                        :port (.getLocalPort server)
+                        :network :regtest
+                        :timeout-ms 5000
+                        :required-services required-services})
+                      (catch kerror/ExceptionInfo error error))]
+                @served
+                result)))]
+    (let [failure (connect-to 0 peer/node-network-service)]
+      (is (= :bitcoin.node/peer-required-services
+             (:type (ex-data failure))))
+      (is (= peer/node-network-service
+             (:required (ex-data failure))))
+      (is (= 0 (:actual (ex-data failure)))))
+    (let [connection
+          (connect-to peer/node-network-service
+                      peer/node-network-service)]
+      (try
+        (is (= peer/node-network-service
+               (get-in connection [:peer-version :services])))
+        (finally
+          (peer/close! connection))))))
+
+(deftest control-traffic-cannot-extend-an-overall-request-deadline
+  (with-open [server (ServerSocket. 0)]
+    (let [magic (get-in peer/network-configuration [:regtest :magic])
+          served
+          (future
+            (try
+              (with-open [^Socket socket (.accept server)
+                          input (DataInputStream. (.getInputStream socket))
+                          output (DataOutputStream. (.getOutputStream socket))]
+                (is (= "version" (:command (read-message input))))
+                (send-message!
+                 output magic "version"
+                 (protocol/encode-version-payload
+                  {:timestamp 1 :nonce 2 :start-height 1}))
+                (send-message! output magic "verack" [])
+                (is (= "verack" (:command (read-message input))))
+                (is (= "getheaders" (:command (read-message input))))
+                (dotimes [nonce 20]
+                  (send-message!
+                   output magic "ping"
+                   (protocol/encode-ping-payload nonce))
+                  (Thread/sleep 50)))
+              (catch Throwable _ :client-closed)))
+          connection
+          (peer/connect!
+           {:host "127.0.0.1" :port (.getLocalPort server)
+            :network :regtest :timeout-ms 500})
+          started (System/nanoTime)]
+      (try
+        (let [failure
+              (try
+                (peer/get-headers!
+                 connection [(vec (repeat 32 0))])
+                (catch kerror/ExceptionInfo error error))
+              elapsed-ms (/ (- (System/nanoTime) started) 1e6)]
+          (is (= :bitcoin.node/peer-timeout
+                 (:type (ex-data failure))))
+          (is (= :headers (:operation (ex-data failure))))
+          (is (< elapsed-ms 1500.0)))
+        (finally
+          (peer/close! connection)))
+      @served)))
+
+(deftest malformed-peer-framing-fails-closed
+  (let [regtest-magic (get-in peer/network-configuration [:regtest :magic])
+        mainnet-magic (get-in peer/network-configuration [:mainnet :magic])
+        version-payload
+        (protocol/encode-version-payload
+         {:timestamp 1 :nonce 2 :start-height 2})
+        valid (protocol/encode-message
+               regtest-magic "version" version-payload)
+        bad-checksum (update (vec valid) (dec (count valid)) bit-xor 1)
+        oversized
+        (reduce
+         (fn [message [index byte]] (assoc message index byte))
+         (vec (protocol/encode-message regtest-magic "version" []))
+         (map-indexed
+          (fn [index byte] [(+ 16 index) byte])
+          (protocol/uint-le->bytes
+           (inc protocol/max-protocol-payload-bytes) 4)))]
+    (is (= :bitcoin.node/peer-network-mismatch
+           (handshake-error-type
+            (protocol/encode-message
+             mainnet-magic "version" version-payload))))
+    (is (= :bitcoin.node/peer-checksum
+           (handshake-error-type bad-checksum)))
+    (is (= :bitcoin.node/peer-oversized-message
+           (handshake-error-type oversized)))))
+
+(deftest peer-configuration-fails-before-network-io
+  (is (= :bitcoin.node/peer-network
+         (:type
+          (ex-data
+           (try
+             (peer/connect! {:network :unknown})
+             (catch kerror/ExceptionInfo error error))))))
+  (is (= :bitcoin.node/peer-locator
+         (:type
+          (ex-data
+           (try
+             (peer/get-headers! {} [])
+             (catch kerror/ExceptionInfo error error))))))
+  (is (= :bitcoin.node/peer-block-hash
+         (:type
+          (ex-data
+           (try
+             (peer/get-block! {} [])
+             (catch kerror/ExceptionInfo error error)))))))
+
+(deftest bounded-peer-set-fails-over-and-resumes-from-current-locator
+  (let [locators (atom [])
+        closed (atom [])
+        tip (vec (repeat 32 7))]
+    (with-redefs
+     [peer/connect!
+      (fn [{:keys [host]}]
+        (if (= host "unreachable")
+          (throw (ex-info "offline" {:type :test/offline}))
+          {:id host :peer-version {:start-height 42}}))
+      peer/close! #(swap! closed conj (:id %))
+      peer/sync-headers!
+      (fn [_ locator _ options]
+        (swap! locators conj locator)
+        (is (= {:max-batches 3} options))
+        {:status :synced :batches 1 :accepted 2 :locator tip})]
+     (let [result
+           (peer/sync-headers-from-peers!
+            [{:host "unreachable" :network :regtest}
+             {:host "healthy" :network :regtest}]
+            #(vec (repeat 1 (vec (repeat 32 1))))
+            (constantly nil)
+            {:max-batches 3})]
+       (is (= :synced (:status result)))
+       (is (= 1 (:successful-peers result)))
+       (is (= 2 (:attempted result)))
+       (is (= :test/offline (get-in result [:failures 0 :type])))
+       (is (= [42] (mapv :start-height (:observations result))))
+       (is (= ["healthy"] @closed))
+       (is (= 1 (count @locators)))))))
+
+(deftest multiple-successful-peers-surface-chain-disagreement
+  (let [next-tip (atom 0)
+        presync-calls (atom 0)
+        presync-anchors (atom [])]
+    (with-redefs
+     [peer/connect!
+      (fn [{:keys [host]}]
+        {:id host :peer-version {:start-height 2}})
+      peer/close! (constantly nil)
+      peer/sync-headers!
+      (fn [_ _ _ options]
+        (swap! presync-anchors conj (get-in options [:presync :anchor]))
+        (let [byte (swap! next-tip inc)]
+          {:status :synced :batches 1 :accepted 1
+           :locator (vec (repeat 32 byte))}))]
+     (let [result
+           (peer/sync-headers-from-peers!
+            [{:host "peer-a"} {:host "peer-b"}]
+            #(vector (vec (repeat 32 0)))
+            (constantly nil)
+            {:required-successes 2
+             :presync-fn
+             #(hash-map :anchor (swap! presync-calls inc))})]
+       (is (= 2 (:successful-peers result)))
+       (is (true? (:disagreement? result)))
+       (is (= 2 (count (:observations result))))
+       (is (= [1 2] @presync-anchors)
+           "each replacement peer must use a fresh durable pre-sync anchor")))))
+
+(deftest exhausted-peer-set-preserves-typed-failure-evidence
+  (with-redefs
+   [peer/connect!
+    (fn [{:keys [host]}]
+      (throw (ex-info host {:type :test/rejected})))]
+   (let [failure
+         (try
+           (peer/sync-headers-from-peers!
+            [{:host "a"} {:host "b"}]
+            (constantly [(vec (repeat 32 0))])
+            (constantly nil) {})
+           (catch kerror/ExceptionInfo error error))]
+     (is (= :bitcoin.node/peer-set-exhausted
+            (:type (ex-data failure))))
+     (is (= 2 (count (:failures (ex-data failure))))))))
+
+(deftest block-download-runs-in-parallel-and-requeues-a-failed-prefix
+  (let [genesis
+        (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+        blocks
+        (vec
+         (rest
+          (reductions fixture/mine-regtest-block genesis (range 1 5))))
+        hashes (mapv #(get-in % [:header :hash]) blocks)
+        raws (into {} (map #(vector (get-in % [:header :hash])
+                                    (block/serialize %))
+                           blocks))
+        requests (atom [])
+        closed (atom [])]
+    (with-redefs
+     [peer/connect!
+      (fn [{:keys [host]}]
+        {:id host :peer-version {:services peer/node-network-service}})
+      peer/close! #(swap! closed conj (:id %))
+      peer/get-block!
+      (fn [connection hash]
+        (swap! requests conj [(:id connection) hash])
+        (if (and (= "peer-a" (:id connection))
+                 (= (second hashes) hash))
+          (throw (ex-info "stalled" {:type :bitcoin.node/peer-timeout}))
+          (get raws hash)))]
+     (let [result
+           (peer/download-blocks-from-peers!
+            [{:host "peer-a"} {:host "peer-b"} {:host "peer-c"}]
+            hashes
+            {:parallel-peers 2 :per-peer-limit 2})]
+       (is (= :downloaded (:status result)))
+       (is (= 4 (:downloaded result)))
+       (is (= (mapv raws hashes) (:blocks result))
+           "network completion order must not change chain commit order")
+       (is (= ["peer-a" "peer-b" "peer-b" "peer-b"]
+              (mapv :host (:block-sources result)))
+           "each chronological body retains its actual source peer")
+       (is (= :bitcoin.node/peer-timeout
+              (get-in result [:failures 0 :type])))
+       (is (= "peer-a"
+              (get-in result [:failures 0 :peer :host])))
+       (is (= 2 (count (filter #(= (second hashes) (second %))
+                              @requests)))
+           "the failed in-flight block is requeued exactly once")
+       (is (= #{"peer-a" "peer-b"} (set @closed)))
+       (is (= #{"peer-b"}
+              (set (map #(get-in % [:peer :host])
+                        (:observations result)))))))))
+
+(deftest block-download-correlates-parsed-hashes-before-acceptance
+  (let [genesis
+        (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+        block-1 (fixture/mine-regtest-block genesis 1)
+        block-2 (fixture/mine-regtest-block block-1 2)
+        requested (get-in block-1 [:header :hash])
+        attempts (atom [])]
+    (with-redefs
+     [peer/connect!
+      (fn [{:keys [host]}]
+        {:id host :peer-version {:services 1}})
+      peer/close! (constantly nil)
+      peer/get-block!
+      (fn [connection _]
+        (swap! attempts conj (:id connection))
+        (if (= "equivocating" (:id connection))
+          (block/serialize block-2)
+          (block/serialize block-1)))]
+     (let [result
+           (peer/download-blocks-from-peers!
+            [{:host "equivocating"} {:host "honest"}]
+            [requested]
+            {:parallel-peers 1})]
+       (is (= [(block/serialize block-1)] (:blocks result)))
+       (is (= ["honest"] (mapv :host (:block-sources result))))
+       (is (= ["equivocating" "honest"] @attempts))
+       (is (= :bitcoin.node/block-response-mismatch
+              (get-in result [:failures 0 :type])))
+       (is (= :wrong-block
+              (get-in result [:failures 0 :reason])))))))
+
+(deftest block-download-correlates-only-the-header-and-defers-body-consensus
+  (let [genesis
+        (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+        value (fixture/mine-regtest-block genesis 1)
+        requested (get-in value [:header :hash])
+        raw (block/serialize value)
+        bad-merkle-body (update raw (dec (count raw)) bit-xor 1)]
+    (is (= :bitcoin.consensus/bad-merkle-root
+           (:type
+            (ex-data
+             (try
+               (block/parse bad-merkle-body)
+               (catch kerror/ExceptionInfo error error))))))
+    (with-redefs
+     [peer/connect!
+      (fn [_] {:peer-version {:services 1}})
+      peer/close! (constantly nil)
+      peer/get-block! (fn [& _] bad-merkle-body)]
+      (let [result
+            (peer/download-blocks-from-peers!
+             [{:host "body-provider" :network :regtest}]
+             [requested] {:parallel-peers 1})]
+        (is (= [bad-merkle-body] (:blocks result)))
+        (is (= ["body-provider"]
+               (mapv :host (:block-sources result))))
+        (is (empty? (:failures result))
+            "the disk consensus owner classifies the correlated body")))))
+
+(deftest malformed-block-header-is-severe-response-mismatch
+  (let [genesis
+        (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+        value (fixture/mine-regtest-block genesis 1)
+        requested (get-in value [:header :hash])]
+    (with-redefs
+     [peer/connect!
+      (fn [{:keys [host]}]
+        {:id host :peer-version {:services 1}})
+      peer/close! (constantly nil)
+      peer/get-block!
+      (fn [connection _]
+        (if (= "malformed" (:id connection))
+          [0 1 2]
+          (block/serialize value)))]
+      (let [result
+            (peer/download-blocks-from-peers!
+             [{:host "malformed" :network :regtest}
+              {:host "honest" :network :regtest}]
+             [requested] {:parallel-peers 1})]
+        (is (= ["honest"] (mapv :host (:block-sources result))))
+        (is (= :bitcoin.node/block-response-mismatch
+               (get-in result [:failures 0 :type])))
+        (is (= :malformed-block-header
+               (get-in result [:failures 0 :reason])))
+        (is (= :bitcoin.consensus/truncated
+               (get-in result [:failures 0 :validation-type])))))))
+
+(deftest block-download-exhaustion-retains-every-typed-peer-failure
+  (let [hash (vec (repeat 32 1))]
+    (with-redefs
+     [peer/connect!
+      (fn [{:keys [host]}]
+        (throw (ex-info host {:type :test/offline})))]
+     (let [failure
+           (try
+             (peer/download-blocks-from-peers!
+              [{:host "peer-a"} {:host "peer-b"}]
+              [hash] {:parallel-peers 2})
+             (catch kerror/ExceptionInfo error error))]
+       (is (= :bitcoin.node/block-peer-set-exhausted
+              (:type (ex-data failure))))
+       (is (= 2 (count (:failures (ex-data failure))))
+           "all assigned failures survive into operator evidence")
+       (is (= #{"peer-a" "peer-b"}
+              (set (map #(get-in % [:peer :host])
+                        (:failures (ex-data failure))))))))))
+
+(deftest block-download-deadline-bounds-an-entire-peer-batch
+  (let [hash (vec (repeat 32 1))
+        closed (atom false)
+        started (System/nanoTime)]
+    (with-redefs
+     [peer/connect!
+      (fn [_] {:id "slow" :peer-version {:services 1}})
+      peer/get-block!
+      (fn [& _] (Thread/sleep 5000))
+      peer/close!
+      (fn [_] (reset! closed true))]
+     (let [failure
+           (try
+             (peer/download-blocks-from-peers!
+              [{:host "slow"}] [hash]
+              {:batch-timeout-ms 1000})
+             (catch kerror/ExceptionInfo error error))
+           elapsed-ms (/ (- (System/nanoTime) started) 1e6)]
+       (is (= :bitcoin.node/block-peer-set-exhausted
+              (:type (ex-data failure))))
+       (is (= :bitcoin.node/block-download-timeout
+              (get-in (ex-data failure) [:failures 0 :type])))
+       (is @closed "the timed-out socket is actively closed")
+       (is (< elapsed-ms 2500)
+           "per-block deadlines cannot accumulate across a 16-block batch")))))
+
+(deftest compact-filter-headers-require-byte-identical-peer-quorum
+  (let [agreed
+        [{:filter-hash (vec (repeat 32 1))
+          :header (vec (repeat 32 2))}
+         {:filter-hash (vec (repeat 32 3))
+          :header (vec (repeat 32 4))}]
+        conflicting
+        [{:filter-hash (vec (repeat 32 5))
+          :header (vec (repeat 32 6))}
+         {:filter-hash (vec (repeat 32 7))
+          :header (vec (repeat 32 8))}]
+        configured (atom [])
+        closed (atom [])]
+    (with-redefs
+     [peer/connect!
+      (fn [configuration]
+        (swap! configured conj configuration)
+        {:id (:host configuration)})
+      peer/close! #(swap! closed conj (:id %))
+      peer/get-basic-filter-headers!
+      (fn [connection start stop stop-hash previous]
+        (is (= [100 101 (vec (repeat 32 9)) (vec (repeat 32 0))]
+               [start stop stop-hash previous]))
+        (if (= "peer-b" (:id connection)) conflicting agreed))]
+     (let [result
+           (peer/get-basic-filter-headers-from-peers!
+            [{:host "peer-a" :required-services peer/node-network-service}
+             {:host "peer-b"}
+             {:host "peer-c"}]
+            100 101 (vec (repeat 32 9)) (vec (repeat 32 0))
+            {:required-successes 2})]
+       (is (= :agreed (:status result)))
+       (is (= agreed (:headers result)))
+       (is (= 2 (:agreement-peers result)))
+       (is (= 3 (:successful-peers result)))
+       (is (true? (:disagreement? result)))
+       (is (= #{"peer-a" "peer-b" "peer-c"} (set @closed)))
+       (is (every?
+            #(.testBit (biginteger (:required-services %)) 6)
+            @configured))
+       (is (every? #(nil? (:headers %)) (:observations result)))))))
+
+(deftest conflicting-compact-filter-peers-fail-closed
+  (with-redefs
+   [peer/connect! (fn [configuration] {:id (:host configuration)})
+    peer/close! (constantly nil)
+    peer/get-basic-filter-headers!
+    (fn [connection & _]
+      [{:filter-hash (vec (repeat 32 1))
+        :header
+        (vec
+         (repeat 32 (if (= "peer-a" (:id connection)) 2 3)))}])]
+   (let [failure
+         (try
+           (peer/get-basic-filter-headers-from-peers!
+            [{:host "peer-a"} {:host "peer-b"}]
+            10 10 (vec (repeat 32 4)) (vec (repeat 32 0)) {})
+           (catch kerror/ExceptionInfo error error))]
+     (is (= :bitcoin.node/compact-filter-quorum
+            (:type (ex-data failure))))
+     (is (= 2 (:successful-peers (ex-data failure))))
+     (is (= 2 (:distinct-responses (ex-data failure))))
+     (is (= 2 (count (:observations (ex-data failure))))))))
+
+(deftest authenticated-compact-filter-fetch-fails-over
+  (let [encoded [0]
+        closed (atom [])]
+    (with-redefs
+     [peer/connect! (fn [configuration] {:id (:host configuration)})
+      peer/close! #(swap! closed conj (:id %))
+      peer/get-basic-filter!
+      (fn [connection & _]
+        (if (= "stale" (:id connection))
+          (throw
+           (ex-info "header mismatch"
+                    {:type :bitcoin.node/peer-compact-filter-header}))
+          encoded))]
+     (let [result
+           (peer/get-basic-filter-from-peers!
+            [{:host "stale"} {:host "healthy"}]
+            42 (vec (repeat 32 1))
+            (vec (repeat 32 2)) (vec (repeat 32 3)))]
+       (is (= :authenticated (:status result)))
+       (is (= encoded (:encoded result)))
+       (is (= "healthy" (get-in result [:peer :host])))
+       (is (= :bitcoin.node/peer-compact-filter-header
+              (get-in result [:failures 0 :type])))
+       (is (= ["stale" "healthy"] @closed))))))

@@ -1,0 +1,95 @@
+;; filecoin-clock-probe.cljs — one endpoint-health-shaped probe for the
+;; filecoin.cloud guest clock: fetch a REAL calibration block header over
+;; read-only RPC, run the native guest (kototama executor) against the
+;; chain's own claimed height, and report drift + verdict.
+;;
+;; This is the agent-side measurement half. The endpoint-health manifest
+;; probes run plain HTTP; this one additionally runs a local native binary
+;; (kexe via kototama), so it lives as its own script rather than a manifest
+;; row. Output shape mirrors verify-endpoint-health's verdict vocabulary:
+;;   ok | answered-badly | unanswered  (+ skipped when the amu/runtime
+;;   measurement is missing on this machine)
+;;
+;; Read-only: no keys, no signing, no spend. RPC calls: 1 (eth_getBlockByNumber).
+;;
+;; Prereqs (measured on this machine 2026-09-04):
+;;   /tmp/fc-runtime.edn + /tmp/fc-loader  from: amu measure-runtime
+;;   /tmp/fc-cp.txt                        from: kbb -Spath -M:native-run in amu
+;;   host/live_probe.cljk also on the classpath (/tmp/fc_live_probe.clj)
+
+(ns filecoin-clock-probe
+  (:require ["node:child_process" :as child]
+            ["node:fs" :as fs]
+            [kotoba.lang.text :as str]))
+
+(def home (or (.-env.HOME js/process) (.-HOME js/process) "/Users/junkawasaki"))
+(def amu-dir (str home "/github/com-junkawasaki/orgs/kotoba-lang/amu"))
+(def rpc-url "https://api.calibration.node.glif.io/rpc/v1")
+
+(defn sh [cmd]
+  (str (.execSync child cmd #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "pipe"]})))
+
+(defn fetch-block! []
+  (let [raw (sh (str "curl -s -m 20 -X POST " rpc-url
+                     " -H 'Content-Type: application/json' "
+                     "-d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBlockByNumber\",\"params\":[\"latest\",false]}'"))
+        resp (js/JSON.parse raw)
+        block (.-result resp)
+        height (js/parseInt (subs (.-number block) 2) 16)
+        ts (js/parseInt (subs (.-timestamp block) 2) 16)]
+    {:height height :timestamp ts}))
+
+(defn prereqs-ok? []
+  (and (.existsSync fs "/tmp/fc-runtime.edn")
+       (.existsSync fs "/tmp/fc-loader")
+       (.existsSync fs "/tmp/fc-cp.txt")))
+
+(defn guest-verdict! [claimed-height block-ts]
+  (let [cp-cmd (str "cp " home
+                    "/github/com-junkawasaki/orgs/kotoba-lang/cloud-filecoin/host/live_probe.cljk /tmp/fc_live_probe.clj")]
+    (sh cp-cmd)
+    (let [out (sh (str "cd " amu-dir
+                       " && java -cp \"/tmp:$(cat /tmp/fc-cp.txt)\" clojure.main -e \""
+                       "(require 'fc-live-probe) (fc-live-probe/-main \\\"" claimed-height "\\\" \\\"" block-ts "\\\")\""))
+          ;; the driver prints :key value lines; parse the three we need
+          status (nth (re-find #":status :([a-z-]+)" out) 1)
+          word (js/parseInt (nth (re-find #":verdict-word (\d+)" out) 1))
+          base 1000000000000
+          abs-delta (quot (- word base) 1048576)
+          drift-ok (mod (- word base) 1048576)]
+      {:status (keyword status) :abs-delta abs-delta :drift-ok drift-ok})))
+
+(defn -main [& _]
+  (let [result
+        (try
+          (if-not (prereqs-ok?)
+            {:verdict :skipped
+             :note "runtime measurement or loader missing; run amu measure-runtime first"}
+            (let [{:keys [height timestamp]} (fetch-block!)
+                  claimed-unix (+ 1667326380 (* height 30))
+                  drift (- timestamp claimed-unix)
+                  v (guest-verdict! height timestamp)
+                  verdict (cond
+                            (and (= :ok (:status v)) (= 1 (:drift-ok v))
+                                 (<= (:abs-delta v) 2) (<= -300 drift 300))
+                            :ok
+                            (= :ok (:status v)) :answered-badly
+                            :else :unanswered)]
+              {:verdict verdict :height height :timestamp timestamp
+               :drift drift :abs-delta (:abs-delta v) :drift-ok (:drift-ok v)}))
+          (catch :default e
+            {:verdict :unanswered :error (.-message e)}))]
+    (println (str "probe-id: filecoin/calibration-clock"))
+    (when (:height result) (println (str "height: " (:height result))))
+    (when (:timestamp result) (println (str "block-timestamp: " (:timestamp result))))
+    (when (:drift result) (println (str "drift-seconds: " (:drift result))))
+    (when (:note result) (println (str "note: " (:note result))))
+    (when (:error result) (println (str "error: " (:error result))))
+    (println (str "verdict: " (name (:verdict result))))
+    (if (= :ok (:verdict result))
+      (.exit js/process 0)
+      (if (= :skipped (:verdict result))
+        (.exit js/process 0)
+        (.exit js/process 1)))))
+
+(apply -main (js->clj (.-argv js/process)))

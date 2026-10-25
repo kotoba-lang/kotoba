@@ -1,0 +1,133 @@
+(ns storj.node.pem-test
+  "PEM, and the identity files it wraps.
+
+  The test that carries the most weight is the shortest: the chain this
+  library renders is **byte-identical** to what Go's `pkcrypto.WriteCertPEM`
+  wrote for the same certificates. Everything else here is about what happens
+  to a file that is not quite right, because that file is a real operator's
+  identity and losing part of it silently is worse than refusing it."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [storj.node.fixture :refer [ca-der chain chain-pem leaf-der]]
+            [storj.node.identity :as ident]
+            [storj.node.pem :as pem]))
+
+;; ── base64 ──────────────────────────────────────────────────────────────────
+
+(def ^:private rfc4648
+  ;; RFC 4648 §10, the vectors every base64 implementation is checked against
+  {""       ""
+   "f"      "Zg=="
+   "fo"     "Zm8="
+   "foo"    "Zm9v"
+   "foob"   "Zm9vYg=="
+   "fooba"  "Zm9vYmE="
+   "foobar" "Zm9vYmFy"})
+
+(defn- ascii [s] (mapv #?(:clj int :cljs #(.charCodeAt % 0)) s))
+
+(deftest base64-matches-rfc-4648
+  (doseq [[plain encoded] rfc4648]
+    (testing (pr-str plain)
+      (is (= encoded (pem/base64-encode (ascii plain))))
+      (is (= (ascii plain) (pem/base64-decode encoded))))))
+
+(deftest base64-round-trips-every-length-across-the-padding-boundary
+  (doseq [n (range 0 33)]
+    (let [bs (mapv #(mod (* 37 (inc %)) 256) (range n))]
+      (is (= bs (pem/base64-decode (pem/base64-encode bs))) (str n " bytes")))))
+
+(deftest base64-refuses-what-it-cannot-represent
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"multiple of four"
+                        (pem/base64-decode "Zm9")))
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"outside the base64 alphabet"
+                        (pem/base64-decode "Zm9-"))
+      "not base64url")
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"padding"
+                        (pem/base64-decode "Z===")))
+  (testing "whitespace is not a character, it is layout"
+    (is (= (ascii "foobar") (pem/base64-decode "Zm9v\nYmFy")))
+    (is (= (ascii "foobar") (pem/base64-decode "  Zm9v YmFy  ")))))
+
+;; ── the shape Go writes ─────────────────────────────────────────────────────
+
+(deftest renders-a-chain-byte-identically-to-go
+  (is (= chain-pem (ident/chain-pem chain))))
+
+(deftest reads-back-what-go-wrote
+  (is (= chain (ident/parse-chain-pem chain-pem)))
+  (is (= [leaf-der ca-der] (ident/parse-chain-pem chain-pem))
+      "leaf first — the order FullIdentity.Chain() uses and admit-chain expects"))
+
+(deftest lines-wrap-where-go-wraps-them
+  (let [body (->> (str/split-lines (pem/encode "CERTIFICATE" (vec (range 200))))
+                  (drop 1) butlast)]
+    (is (every? #(<= (count %) pem/line-length) body))
+    (is (every? #(= pem/line-length (count %)) (butlast body))
+        "only the last line is short")))
+
+;; ── files that are not quite right ──────────────────────────────────────────
+
+(deftest text-around-the-blocks-is-ignored
+  ;; identity files in the wild carry comments, and `encoding/pem` skips them
+  (let [decorated (str "# an identity, generated 2019\n" chain-pem "\ntrailing notes\n")]
+    (is (= chain (ident/parse-chain-pem decorated)))))
+
+(deftest an-unterminated-block-is-an-error-not-a-shorter-chain
+  ;; Go's pem.Decode returns the rest of the input here, and a caller reading a
+  ;; chain gets one certificate fewer than the file holds — with no error to
+  ;; tell it apart from a file that really had one certificate.
+  ;;
+  ;; `thrown-with-msg?` rather than `thrown?` throughout this file, and not for
+  ;; tidiness: the first version of this test used `thrown?` and passed under a
+  ;; control that removed the check entirely, because the missing END then
+  ;; produced a null-pointer exception instead. A test that accepts any
+  ;; exception is not testing the refusal it claims to.
+  (let [truncated (subs chain-pem 0 (- (count chain-pem) 30))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no matching END"
+                          (ident/parse-chain-pem truncated)))))
+
+(deftest a-mismatched-end-label-is-refused
+  (let [mangled (str/replace chain-pem "-----END CERTIFICATE-----"
+                             "-----END CERTIFICATE X-----")]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no matching END"
+                          (ident/parse-chain-pem mangled)))))
+
+(deftest a-chain-file-may-only-hold-certificates
+  (let [with-key (str chain-pem (pem/encode "PRIVATE KEY" [1 2 3 4]))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"only hold certificates"
+                          (ident/parse-chain-pem with-key))
+        "a key in a chain file is a mistake to report, not to filter out")))
+
+(deftest an-empty-file-names-nobody
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no PEM blocks"
+                        (ident/parse-chain-pem "")))
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no PEM blocks"
+                        (ident/parse-chain-pem "# nothing here\n"))))
+
+;; ── key files ───────────────────────────────────────────────────────────────
+
+(deftest reads-both-private-key-encodings-and-says-which
+  (let [der [0x30 0x03 0x02 0x01 0x00]]
+    (is (= {:der der :encoding :pkcs8}
+           (ident/parse-private-key-pem (pem/encode "PRIVATE KEY" der))))
+    (is (= {:der der :encoding :sec1}
+           (ident/parse-private-key-pem (pem/encode "EC PRIVATE KEY" der)))
+        "older identities carry SEC1, and PrivateKeyFromPEM still accepts it")))
+
+(deftest a-key-file-with-two-keys-is-refused
+  ;; the caller would get the first one and have no way to learn there was a
+  ;; second — which is Go's behaviour, noted in its own comment
+  (let [two (str (pem/encode "PRIVATE KEY" [1 2 3 4])
+                 (pem/encode "PRIVATE KEY" [5 6 7 8]))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"exactly one key"
+                          (ident/parse-private-key-pem two)))))
+
+(deftest a-certificate-is-not-a-key
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"not a private key block"
+                        (ident/parse-private-key-pem (pem/encode "CERTIFICATE" [1 2 3 4])))))
+
+(deftest a-key-file-round-trips
+  (let [der (vec (range 67))]
+    (is (= {:der der :encoding :pkcs8}
+           (ident/parse-private-key-pem (ident/private-key-pem der))))))

@@ -1,0 +1,152 @@
+(ns kotoba.lang.checkpointer.dispatch-test
+  "Pure(ish) op-dispatch tests -- no socket, no msgpack framing. Filesystem-
+  touching collaborators (spool/index/keystore) are wired to a real
+  `java.nio.file.Files/createTempDirectory` temp dir per test (per this
+  port's testing discipline: avoid real fs only where reasonably
+  avoidable, but DO use a temp dir rather than mocking it away entirely for
+  the parts that inherently need it); `:pin!` and `:now-ms` are simple fakes
+  since pinning is fire-and-forget/network and time is nondeterministic.
+
+  `.clj`, deliberately (not a compliance gap): `dispatch/handle-request`
+  itself is `.cljc`/portable (pure op-dispatch over an injected `env`), but
+  this test wires REAL `spool`/`index`/`keystore` collaborators (genuinely
+  `.clj`-only filesystem I/O, see their namespace docstrings) as that `env`
+  for an integration-style exercise, so the test as a whole is JVM-only."
+  (:require [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.checkpointer.dispatch :as dispatch]
+            [kotoba.lang.checkpointer.spool :as spool]
+            [kotoba.lang.checkpointer.index :as index]
+            [kotoba.lang.checkpointer.keystore :as keystore]
+            [kotoba.lang.checkpointer.msgpack :as msgpack]
+            [kotoba.lang.checkpointer.commit :as commit]))
+
+(defn- temp-dir []
+  (str (kio/temp-dir "checkpointer-dispatch-test")))
+
+(defn- test-env
+  [& {:keys [allowed-dids encrypt-cells now]
+      :or {allowed-dids #{"did:key:zCell"} encrypt-cells #{} now 1700000000000}}]
+  (let [dir (temp-dir)
+        index-atom (atom {})
+        pin-calls (atom [])]
+    {:env {:index-atom index-atom
+           :allowed-dids allowed-dids
+           :encrypt-cells encrypt-cells
+           :blob-inline-threshold commit/default-blob-inline-threshold
+           :anchor-chain-id 8453
+           :spool-car! (fn [cell-did checkpoint-id bytes] (spool/spool-car! dir cell-did checkpoint-id bytes))
+           :spool-payload! (fn [cell-did checkpoint-id bytes] (spool/spool-payload! dir cell-did checkpoint-id bytes))
+           :load-payload (fn [cell-did checkpoint-id] (spool/load-payload dir cell-did checkpoint-id))
+           :persist-index! (fn [idx] (index/persist-index! dir idx))
+           :get-cell-key! (fn [cell-did] (keystore/load-or-create-cell-key! dir cell-did))
+           :pin! (fn [car-bytes on-result] (swap! pin-calls conj car-bytes) (on-result nil))
+           :now-ms (fn [] now)}
+     :dir dir
+     :pin-calls pin-calls}))
+
+(defn- put-req [overrides]
+  (merge {"v" 1 "op" "put" "cell_did" "did:key:zCell" "thread_id" "t1" "checkpoint_ns" ""
+          "checkpoint_id" "cp-1" "payload" (msgpack/encode {"step" 1}) "meta" {}}
+         overrides))
+
+(deftest health-op-test
+  (let [{:keys [env]} (test-env)]
+    (testing "health is answered without allowed-dids check"
+      (let [res (dispatch/handle-request env {"v" 1 "op" "health" "cell_did" "unprovisioned"})]
+        (is (get res "ok"))
+        (is (= {"status" "ok"} (msgpack/decode (get res "data"))))))))
+
+(deftest unsupported-protocol-version-test
+  (let [{:keys [env]} (test-env)
+        res (dispatch/handle-request env {"v" 2 "op" "health"})]
+    (is (false? (get res "ok")))
+    (is (re-find #"unsupported protocol version" (get res "error")))))
+
+(deftest unprovisioned-cell-test
+  (let [{:keys [env]} (test-env)
+        res (dispatch/handle-request env (put-req {"cell_did" "did:key:zUnknown"}))]
+    (is (false? (get res "ok")))
+    (is (re-find #"not provisioned" (get res "error")))))
+
+(deftest put-and-get-tuple-round-trip-test
+  (let [{:keys [env]} (test-env)
+        payload-value {"messages" ["hi"] "step" 1}
+        put-res (dispatch/handle-request env (put-req {"payload" (msgpack/encode payload-value)}))]
+    (testing "put succeeds and returns a root CID"
+      (is (get put-res "ok"))
+      (is (string? (get put-res "mst_root_cid"))))
+    (testing "get_tuple (explicit checkpoint_id) returns the same root CID + original payload bytes"
+      (let [res (dispatch/handle-request env {"v" 1 "op" "get_tuple" "cell_did" "did:key:zCell"
+                                                "thread_id" "t1" "checkpoint_ns" "" "checkpoint_id" "cp-1"})]
+        (is (get res "ok"))
+        (is (= (get put-res "mst_root_cid") (get res "mst_root_cid")))
+        (is (= payload-value (msgpack/decode (get res "data"))))))
+    (testing "get_tuple (no checkpoint_id -> latest) also resolves"
+      (let [res (dispatch/handle-request env {"v" 1 "op" "get_tuple" "cell_did" "did:key:zCell"
+                                                "thread_id" "t1" "checkpoint_ns" "" "checkpoint_id" nil})]
+        (is (= payload-value (msgpack/decode (get res "data"))))))
+    (testing "get_tuple for a nonexistent checkpoint returns ok with nil data"
+      (let [res (dispatch/handle-request env {"v" 1 "op" "get_tuple" "cell_did" "did:key:zCell"
+                                                "thread_id" "t1" "checkpoint_ns" "" "checkpoint_id" "no-such-cp"})]
+        (is (get res "ok"))
+        (is (nil? (get res "data")))))))
+
+(deftest put-requires-payload-and-checkpoint-id-test
+  (let [{:keys [env]} (test-env)]
+    (is (false? (get (dispatch/handle-request env (put-req {"payload" nil})) "ok")))
+    (is (false? (get (dispatch/handle-request env (put-req {"checkpoint_id" nil})) "ok")))))
+
+(deftest encrypted-cell-round-trip-test
+  (let [{:keys [env]} (test-env :encrypt-cells #{"did:key:zCell"})
+        payload-value {"secret" "message"}
+        _ (dispatch/handle-request env (put-req {"payload" (msgpack/encode payload-value)}))
+        res (dispatch/handle-request env {"v" 1 "op" "get_tuple" "cell_did" "did:key:zCell"
+                                            "thread_id" "t1" "checkpoint_ns" "" "checkpoint_id" "cp-1"})]
+    (testing "encrypted cell's payload comes back decrypted to the original value"
+      (is (= payload-value (msgpack/decode (get res "data")))))))
+
+(deftest list-op-test
+  (let [{:keys [env]} (test-env)]
+    (dispatch/handle-request env (put-req {"checkpoint_id" "cp-1"}))
+    (dispatch/handle-request env (put-req {"checkpoint_id" "cp-2"}))
+    (let [res (dispatch/handle-request env {"v" 1 "op" "list" "cell_did" "did:key:zCell"
+                                              "thread_id" "t1" "checkpoint_ns" ""})
+          rows (msgpack/decode (get res "data"))]
+      (testing "both checkpoints listed"
+        (is (= 2 (count rows)))
+        (is (= #{"cp-1" "cp-2"} (set (map #(get % "checkpoint_id") rows))))))))
+
+(deftest put-writes-tags-meta-kind-test
+  (let [{:keys [env]} (test-env)
+        res (dispatch/handle-request env
+                                       {"v" 1 "op" "put_writes" "cell_did" "did:key:zCell" "thread_id" "t1"
+                                        "checkpoint_ns" "" "checkpoint_id" "cp-writes"
+                                        "payload" (msgpack/encode {"w" 1}) "meta" {"kind" "orig"}})]
+    (is (get res "ok"))))
+
+(deftest anchor-pending-and-commit-test
+  (let [{:keys [env]} (test-env)
+        put-res (dispatch/handle-request env (put-req {"checkpoint_id" "cp-anchor"}))]
+    (testing "anchor_pending is empty before any pin lands (pin! fake calls on-result with nil)"
+      (let [res (dispatch/handle-request env {"v" 1 "op" "anchor_pending" "cell_did" "did:key:zCell"})]
+        (is (empty? (msgpack/decode (get res "data"))))))
+    (testing "anchor_commit updates the row"
+      (let [commits [{"thread_id" "t1" "checkpoint_ns" "" "checkpoint_id" "cp-anchor"
+                       "anchor_tx_hash" "0xabc" "anchor_block_number" 42 "anchor_log_index" 0}]
+            res (dispatch/handle-request env {"v" 1 "op" "anchor_commit" "cell_did" "did:key:zCell"
+                                                "payload" (msgpack/encode commits)})]
+        (is (get res "ok"))
+        (let [list-res (dispatch/handle-request env {"v" 1 "op" "list" "cell_did" "did:key:zCell"
+                                                        "thread_id" "t1" "checkpoint_ns" ""})
+              row (first (msgpack/decode (get list-res "data")))]
+          (is (= "0xabc" (get row "anchor_tx_hash"))))))
+    (testing "anchor_commit requires payload"
+      (let [res (dispatch/handle-request env {"v" 1 "op" "anchor_commit" "cell_did" "did:key:zCell" "payload" nil})]
+        (is (false? (get res "ok")))))
+    (is (some? put-res))))
+
+(deftest unknown-op-test
+  (let [{:keys [env]} (test-env)
+        res (dispatch/handle-request env {"v" 1 "op" "bogus" "cell_did" "did:key:zCell"})]
+    (is (false? (get res "ok")))
+    (is (re-find #"unknown op" (get res "error")))))

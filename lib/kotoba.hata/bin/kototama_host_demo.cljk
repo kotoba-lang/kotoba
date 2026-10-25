@@ -1,0 +1,161 @@
+(ns kototama-host-demo
+  "P3 合否条件 (2) の実走: 実 kototama 宿（jco-component-host、JSON-protocol
+  Component host）で itonami-hello の logic を動かし、その receipt を 糸 に残す。
+
+    kbb --backend sci --classpath src:test:<codec paths> bin/kototama_host_demo.cljk
+
+  流れ: amu で logic.kotoba を wasm に実コンパイル → 宿 を spawn し
+  {\"type\":\"run\"} を 1 行送る → \"result\" の i64 を受け取る → receipt-v1 を
+  組み、hata.receipt の gate に通してから 糸 に記録する。
+
+  測っているもの: 実 amu コンパイル・実 Component host プロセス・実 i64
+  結果・receipt 形の fail-closed 検証・糸 の記録。
+  偽っていないもの: :fuel-used はこの宿 が報告しないため :not-reported-by-host。
+  :authority-decision は demo 値（admission stack 未接続）。"
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            [hata.conductor :as conductor]
+            [hata.receipt :as receipt]
+            [kotoba.lang.text :as str]
+            [ipld.core :as ipld]))
+
+(def ^:private amu "/Users/junkawasaki/github/kotoba-lang/amu/bin/amu")
+(def ^:private jco-host
+  "/Users/junkawasaki/github/kotoba-lang/kototama-component/native/jco-component-host.mjs")
+(def ^:private logic-src "examples/itonami-hello/logic.kotoba")
+(def ^:private workdir "/Users/junkawasaki/.hermes/cache/scratch")
+
+(defn- exit! [code] (.exit js/process code))
+
+(defn- sha256-hex [bytes]
+  (-> (.createHash crypto "sha256") (.update bytes) (.digest "hex")))
+
+(def ^:private app-world-wit
+  "kotoba:app@0.2.0 —— export main: func() -> s64 の最小 world（abi の
+  kotoba-app world の主幹 export）。embed がこの world と core module の
+  canonical ABI を結び、component new が本物の component に仕立てる。"
+  "package kotoba:app@0.2.0;\n\nworld kotoba-app {\n  export main: func() -> s64;\n}\n")
+
+(defn- compile-logic! []
+  ;; 測って開けた経路（2026-10-19）: amu core（wasm32-browser）→
+  ;; wasm-tools component embed（wit world と core の canonical ABI を結合）→
+  ;; wasm-tools component new → 実宿 が main を呼べる component。
+  ;; ⚠ amu compile --target wasm-component 自体は nbb route 未実装のまま —
+  ;; ここは packaging を wasm-tools に委ねた driver 側の経路。
+  (let [core (str workdir "/hata-hello-logic.wasm")
+        wit-dir (str workdir "/hata-wit")
+        emb (str workdir "/hata-hello-logic.emb.wasm")
+        comp (str workdir "/hata-hello-logic.comp2.wasm")
+        r (.spawnSync cp amu
+                      #js ["compile" logic-src "--target" "wasm32-browser" "--output" core]
+                      #js {:encoding "utf8"})]
+    (if-not (zero? (.-status r))
+      (do (println "COMPILE-FAILED" (.-stdout r) (.-stderr r)) (exit! 2))
+      (do
+        (.mkdirSync fs wit-dir #js {:recursive true})
+        (.writeFileSync fs (str wit-dir "/kotoba-app.wit") app-world-wit)
+        (println "COMPILED core" (str "sha256=" (sha256-hex (.readFileSync fs core))))
+        (let [e (.spawnSync cp "wasm-tools"
+                            #js ["component" "embed" wit-dir core
+                                 "--world" "kotoba-app" "-o" emb]
+                            #js {:encoding "utf8"})]
+          (if-not (zero? (.-status e))
+            (do (println "EMBED-FAILED" (.-stdout e) (.-stderr e)) (exit! 2))
+            (let [w (.spawnSync cp "wasm-tools" #js ["component" "new" emb "-o" comp]
+                                #js {:encoding "utf8"})]
+              (if-not (zero? (.-status w))
+                (do (println "COMPONENTIZE-FAILED" (.-stdout w) (.-stderr w)) (exit! 2))
+                (do (println "COMPONENTIZED" comp
+                             (str "sha256=" (sha256-hex (.readFileSync fs comp))))
+                    comp)))))))))
+
+(defn- run-on-host!
+  "宿 を 1 回起動し、JSON-line protocol で {\"type\":\"run\"} を送って i64 を受ける。"
+  [wasm-path]
+  (let [proc (.spawn cp "node" #js [jco-host] #js {:stdio #js ["pipe" "pipe" "pipe"]})
+        out (atom "")
+        result (atom nil)]
+    (.on (.-stdout proc) "data"
+         (fn [chunk]
+           (swap! out str chunk)
+           (doseq [line (str/split-lines @out)]
+             (when-let [msg (try (js->clj (.parse js/JSON line) :keywordize-keys true)
+                                 (catch :default _ nil))]
+               (when (= "result" (:type msg))
+                 (reset! result (:value msg)))))))
+    (.on (.-stderr proc) "data" (fn [chunk] (print (str "host-err: " chunk))))
+    (.end (.-stdin proc)
+          (str (.stringify js/JSON
+                           #js {:type "run"
+                                :component wasm-path
+                                :capability-mode "function"
+                                :imports #js []
+                                :fuel 1
+                                :memory-pages 1})
+               "\n"))
+    (js/Promise.
+     (fn [resolve reject]
+       (.on proc "close"
+            (fn [code]
+              (if (some? @result)
+                (resolve @result)
+                (do (println "HOST-PROTOCOL" (pr-str @out))
+                    (reject (str "host closed without a result, code " code))))))))))
+
+(defn- receipt-for [wasm-bytes call-doc result]
+  {:machine-spec "kototama.component/jco-host"
+   :implementation "jco-component-host (pinned @bytecodealliance/jco)"
+   :profile :core/v1
+   :message-cid (:cid (ipld/node->block {"call" "main"}))
+   :program-cid (ipld/cid wasm-bytes)
+   :state-before (:cid (ipld/node->block {"state" 0}))
+   :state-after (:cid (ipld/node->block {"state" result}))
+   :outcome (if (= 42 result) :ran :other)
+   :fuel-used :not-reported-by-host
+   :events []
+   :authority-decision {:manifest-cid "demo" :grant-ids []
+                        :policy-id "demo-unwired" :world :browser :epoch 0}})
+
+(defn- machine [host-fn]
+  (conductor/resident
+   {:cid-fn ipld/cid
+    :sign-fn (fn [a x] (str "sig:" a ":" (hash x)))
+    :verify-fn (fn [a x s] (= s (str "sig:" a ":" (hash x))))
+    :device-key "jco-demo-device"
+    :membrane-check-fn (constantly true)
+    :host-fn host-fn}))
+
+(defn -main [& _]
+  (let [wasm-path (compile-logic!)
+        wasm-bytes (.readFileSync fs wasm-path)
+        call-doc {:call "main" :args []}]
+    (-> (run-on-host! wasm-path)
+        (.then
+         (fn [result]
+           (println "HOST-RESULT" result)
+           (let [receipt (receipt-for wasm-bytes call-doc result)
+                 rprobs (receipt/problems receipt)]
+             (println "RECEIPT-GATE" (if (empty? rprobs) "ACCEPTED" (pr-str rprobs)))
+             (let [m (machine (fn [_ _] receipt))
+                   id ["mon-jco" "jco-demo-device"]
+                   _ (conductor/start-cell! m {:mon-cid "mon-jco"
+                                               :agent-key "jco-demo-device"
+                                               :membrane-proof "p"})
+                   genesis {:hata.action/action {:hata.action/kind :open
+                                                 :hata.action/mon "mon-jco"
+                                                 :hata.action/prev nil}
+                            :author "jco-demo-device"
+                            :signature ((:sign-fn m) "jco-demo-device"
+                                        {:hata.action/kind :open
+                                         :hata.action/mon "mon-jco"
+                                         :hata.action/prev nil})}
+                   _ (conductor/record! m id genesis)
+                   ran (conductor/run-logic! m id call-doc)]
+               (println "RECORDED" (pr-str (select-keys ran [:ok :recorded :receipt-refused])))
+               (println "ITO" (pr-str (mapv #(get-in % [:hata.action/action :hata.action/kind])
+                                            (:hata.cell/ito (get @(:cells m) id)))))
+               (exit! (if (:ok ran) 0 1))))))
+        (.catch (fn [e] (println "UNANSWERED" (str e)) (exit! 2))))))
+
+(-main)

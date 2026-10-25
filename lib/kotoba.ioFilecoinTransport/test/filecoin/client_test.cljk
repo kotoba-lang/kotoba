@@ -1,0 +1,224 @@
+(ns filecoin.client-test
+  "Note the shape of every test that touches a transport.
+
+  `IHttp` returns a map on the JVM and a **Promise** under ClojureScript, so
+  assertions written inside a `.then` run after `run-tests` has already
+  reported. Written the obvious way, this suite passed on both runtimes while
+  the ClojureScript side silently asserted half as much — 10 assertions where
+  the JVM ran 19, and the reporter said green either way. `clojure.test/async`
+  is what makes the runner wait."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :as t :refer [deftest is]]
+            [filecoin.client :as client]
+            [filecoin.message :as msg]
+            [filecoin.protocols :as p]
+            [filecoin.rpc :as rpc]
+            [filecoin.signature :as sig]
+            [filecoin.signer :as signer]
+            [filecoin.transport :as transport]
+            [json.core :as json]))
+
+(def endpoint "https://example.invalid/rpc/v1")
+
+(def test-key
+  "4646464646464646464646464646464646464646464646464646464646464646")
+
+(def sender (signer/address-string test-key))
+
+(defn- method-of [req]
+  (-> (:body req) (str/split #"\"method\":\"") second (str/split #"\"") first))
+
+(defn- responses
+  "A transport that answers each JSON-RPC method from `m`, keyed by method
+  name, so the fixture reads as the conversation it is."
+  [m]
+  (let [seen (atom [])]
+    (reify
+      p/IHttp
+      (request [_ req]
+        (swap! seen conj req)
+        (let [r (get m (method-of req))]
+          (when (nil? r)
+            (throw (ex-info "test: no fixture for method" {:method (method-of req)})))
+          (let [resp {:status 200
+                      :body (str "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":" r "}")}]
+            #?(:clj resp :cljs (js/Promise.resolve resp)))))
+      transport/IRecorder
+      (-requests [_] @seen))))
+
+(defn- methods-called [t]
+  (mapv method-of (transport/requests t)))
+
+(defn- static [status body]
+  (reify p/IHttp
+    (request [_ _]
+      (let [r {:status status :body body}]
+        #?(:clj r :cljs (js/Promise.resolve r))))))
+
+;; ── the sequence, which is the whole point ───────────────────────────────────
+
+(def a-message
+  (msg/message {:to sender :from sender :value "1000" :method 0}))
+
+(def gas-filled
+  (msg/message (assoc a-message :nonce 7 :gas-limit 2000000
+                      :gas-fee-cap "100000" :gas-premium "99000")))
+
+(def gas-filled-json (json/encode (rpc/message->json gas-filled)))
+
+(deftest gas-is-estimated-after-the-nonce-not-before
+  ;; The mistake this ordering exists to prevent: the estimate is computed
+  ;; from the serialised message and the nonce is part of it, so estimating
+  ;; first gives a limit for a different message.
+  (let [t (responses {"Filecoin.MpoolGetNonce" "7"
+                      "Filecoin.GasEstimateMessageGas"
+                      (json/encode (rpc/message->json
+                                    (msg/message (assoc a-message :nonce 7))))})
+        check-it (fn [_]
+                   (is (= ["Filecoin.MpoolGetNonce" "Filecoin.GasEstimateMessageGas"]
+                          (methods-called t)))
+                   (is (str/includes? (:body (second (transport/requests t)))
+                                      "\"Nonce\":7")
+                       "the message sent for estimation already has the nonce"))]
+    #?(:clj (check-it (client/prepare t endpoint a-message))
+       :cljs (t/async done
+                      (-> (client/prepare t endpoint a-message)
+                          (.then check-it)
+                          (.then (fn [_] (done)))
+                          (.catch (fn [e] (is false (str e)) (done))))))))
+
+(deftest estimate-gas-keeps-the-whole-message
+  ;; Lotus fills the fields in and hands the message back. Taking only
+  ;; GasLimit and keeping your own fee cap is how a message ends up priced
+  ;; below the base fee and sits in the pool.
+  (let [t (responses {"Filecoin.GasEstimateMessageGas" gas-filled-json})
+        check-it (fn [m]
+                   (is (= 2000000 (:gas-limit m)))
+                   (is (= "100000" (:gas-fee-cap m)))
+                   (is (= "99000" (:gas-premium m))))]
+    #?(:clj (check-it (client/estimate-gas t endpoint a-message))
+       :cljs (t/async done
+                      (-> (client/estimate-gas t endpoint a-message)
+                          (.then check-it)
+                          (.then (fn [_] (done)))
+                          (.catch (fn [e] (is false (str e)) (done))))))))
+
+(deftest send-is-prepare-then-sign-then-push
+  (let [t (responses {"Filecoin.MpoolGetNonce" "7"
+                      "Filecoin.GasEstimateMessageGas" gas-filled-json
+                      "Filecoin.MpoolPush" "{\"/\":\"bafy2bzacea\"}"})
+        check-it (fn [cid]
+                   (is (= {"/" "bafy2bzacea"} cid))
+                   (is (= ["Filecoin.MpoolGetNonce" "Filecoin.GasEstimateMessageGas"
+                           "Filecoin.MpoolPush"]
+                          (methods-called t)))
+                   (let [body (:body (last (transport/requests t)))]
+                     (is (str/includes? body "\"GasLimit\":2000000")
+                         "the signature covers the message *after* gas")
+                     (is (str/includes? body "\"Type\":1"))))]
+    #?(:clj (check-it (client/send-message-with-key t endpoint test-key a-message))
+       :cljs (t/async done
+                      (-> (client/send-message-with-key t endpoint test-key a-message)
+                          (.then check-it)
+                          (.then (fn [_] (done)))
+                          (.catch (fn [e] (is false (str e)) (done))))))))
+
+(deftest a-signature-taken-before-gas-would-not-match
+  ;; Stated as a test rather than a comment: the CID moves when gas is filled
+  ;; in, so a signature over the pre-gas message is over a different message.
+  (let [before (msg/message (assoc a-message :nonce 7))]
+    (is (not= (msg/cid before) (msg/cid gas-filled)))
+    (is (not (signer/verify-message
+              (sig/signed-message
+               gas-filled
+               (:signature (signer/sign-message test-key before))))))))
+
+;; ── failures that arrive looking like successes ──────────────────────────────
+
+(deftest a-jsonrpc-error-arrives-with-http-200
+  (let [t (static 200 (str "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":"
+                           "{\"code\":-32601,\"message\":\"method not found\"}}"))]
+    #?(:clj (is (thrown? Exception (client/chain-head t endpoint)))
+       :cljs (t/async done
+                      (-> (client/chain-head t endpoint)
+                          (.then (fn [_] (is false "should have thrown") (done)))
+                          (.catch (fn [e] (is (some? e)) (done))))))))
+
+(deftest a-non-2xx-status-is-not-a-result
+  (let [t (static 502 "bad gateway")]
+    #?(:clj (is (thrown? Exception (client/chain-head t endpoint)))
+       :cljs (t/async done
+                      (-> (client/chain-head t endpoint)
+                          (.then (fn [_] (is false "should have thrown") (done)))
+                          (.catch (fn [e] (is (some? e)) (done))))))))
+
+(deftest a-response-repeated-twice-is-still-one-answer
+  ;; Glif's public endpoint answers with the body duplicated, newline
+  ;; separated. Every JSON parser rejects that, and the chain-vector
+  ;; generators in this family were silently broken by it for a while.
+  (let [one "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"Height\":6232564}}"
+        t (static 200 (str one "\n" one "\n"))
+        check-it (fn [h] (is (= 6232564 h)))]
+    #?(:clj (check-it (client/height t endpoint))
+       :cljs (t/async done
+                      (-> (client/height t endpoint)
+                          (.then check-it)
+                          (.then (fn [_] (done)))
+                          (.catch (fn [e] (is false (str e)) (done))))))))
+
+;; ── contract reads ───────────────────────────────────────────────────────────
+
+(def a-return
+  ;; base64 → CBOR byte string → ABI data. 150 is what mainnet's PDPVerifier
+  ;; actually returns for getChallengeFinality(); the live suite reads it.
+  (let [word "0000000000000000000000000000000000000000000000000000000000000096"
+        cbor (into [0x58 0x20]
+                   (mapv #(#?(:clj Integer/parseInt :cljs js/parseInt) (apply str %) 16)
+                         (partition 2 word)))]
+    (str "{\"MsgRct\":{\"ExitCode\":0,\"Return\":\"" (rpc/base64 cbor) "\"}}")))
+
+(deftest a-contract-return-is-unwrapped-twice
+  ;; Handing the CBOR straight to the ABI decoder leaves the two-byte header
+  ;; on the front and shifts every word.
+  (let [t (responses {"Filecoin.StateCall" a-return})
+        check-it (fn [v] (is (= ["150"] v)))]
+    #?(:clj (check-it (client/read-contract t endpoint a-message ["uint256"]))
+       :cljs (t/async done
+                      (-> (client/read-contract t endpoint a-message ["uint256"])
+                          (.then check-it)
+                          (.then (fn [_] (done)))
+                          (.catch (fn [e] (is false (str e)) (done))))))))
+
+(deftest a-revert-is-not-an-empty-answer
+  ;; A reverting call still returns HTTP 200; decoding its empty Return would
+  ;; hand back [] and read as success.
+  (let [t (responses {"Filecoin.StateCall"
+                      "{\"MsgRct\":{\"ExitCode\":33,\"Return\":\"\"},\"Error\":\"boom\"}"})]
+    #?(:clj (is (thrown? Exception (client/read-contract t endpoint a-message ["uint256"])))
+       :cljs (t/async done
+                      (-> (client/read-contract t endpoint a-message ["uint256"])
+                          (.then (fn [_] (is false "should have thrown") (done)))
+                          (.catch (fn [e] (is (some? e)) (done))))))))
+
+;; ── the recording transport ──────────────────────────────────────────────────
+
+(deftest the-recording-transport-records
+  (let [t (transport/recording {endpoint {:status 200 :body "{\"result\":1}"}})
+        check-it (fn [r]
+                   (is (= 1 r))
+                   (is (= 1 (count (transport/requests t))))
+                   (is (= :post (:method (first (transport/requests t))))))]
+    #?(:clj (check-it (client/call t endpoint (rpc/chain-head)))
+       :cljs (t/async done
+                      (-> (client/call t endpoint (rpc/chain-head))
+                          (.then check-it)
+                          (.then (fn [_] (done)))
+                          (.catch (fn [e] (is false (str e)) (done))))))))
+
+(deftest an-unknown-url-answers-404-which-is-not-a-result
+  (let [t (transport/recording {})]
+    #?(:clj (is (thrown? Exception (client/chain-head t endpoint)))
+       :cljs (t/async done
+                      (-> (client/chain-head t endpoint)
+                          (.then (fn [_] (is false "should have thrown") (done)))
+                          (.catch (fn [e] (is (some? e)) (done))))))))

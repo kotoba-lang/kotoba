@@ -1,0 +1,156 @@
+(ns ifc.corpus-runner
+  "Fetch and verify pinned, large external IFC conformance fixtures."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as string]
+            [ifc.core :as ifc])
+  (:import [java.net URI]
+           [java.security MessageDigest]))
+
+(def manifest-path "test/fixtures/external/manifest.edn")
+
+(defn- hex [bytes]
+  (apply str (map #(format "%02x" (bit-and 0xff %)) bytes)))
+
+(defn- sha256 [bytes]
+  (hex (.digest (doto (MessageDigest/getInstance "SHA-256") (.update bytes)))))
+
+(defn- encoded-path [path]
+  (string/join "/" (map #(string/replace
+                           (form-urlencoded/form-encode %) "+" "%20")
+                         (string/split path #"/"))))
+
+(defn- fixture-url [manifest fixture]
+  (str (or (:source/raw-base fixture)
+           "https://raw.githubusercontent.com/buildingSMART/Sample-Test-Files/")
+       (or (:source/commit fixture) (:source/commit manifest)) "/"
+       (encoded-path (:source/path fixture))))
+
+(defn fetch-fixture
+  "Fetch one pinned remote fixture and reject content that does not match its
+  manifest digest."
+  [manifest fixture]
+  (let [url (fixture-url manifest fixture)
+        bytes (with-open [stream (.openStream (.toURL (URI. url)))] (.readAllBytes stream))
+        digest (sha256 bytes)]
+    (when-not (= (:sha256 fixture) digest)
+      (throw (ex-info "external IFC fixture checksum mismatch"
+                      {:name (:name fixture) :expected (:sha256 fixture)
+                       :actual digest :url url})))
+    {:url url :bytes bytes :text (kbytes/utf8-string bytes)}))
+
+(defn- near? [expected actual]
+  (<= (Math/abs (- (double expected) (double actual)))
+      (* 1.0e-10 (max 1.0 (Math/abs (double expected))))))
+
+(defn- verify-fixture [manifest fixture]
+  (let [{:keys [text]} (fetch-fixture manifest fixture)
+        document (ifc/read-document text)
+        report (ifc/roundtrip-report text)
+        edited-name (str "Kotoba round-trip — " (:name fixture))
+        edit (fn [document]
+               (if (seq (:ifc/elements document))
+                 (assoc-in document [:ifc/elements 0 :name] edited-name)
+                 document))
+        hybrid (ifc/hybrid-roundtrip-report text edit)
+        edited-document (ifc/read-document (:roundtrip/output hybrid))
+        geometry-edit (ifc/edit-first-geometry document)
+        geometry-hybrid (when geometry-edit
+                          (ifc/hybrid-roundtrip-report text (constantly geometry-edit)))
+        expected-georef (:expected/georeference fixture)
+        georef (:ifc/georeference document)
+        projected (when expected-georef
+                    (ifc/model-to-map-coordinate georef (:model-point expected-georef)))
+        restored (when expected-georef
+                   (ifc/map-to-model-coordinate georef projected))
+        result {:name (:name fixture) :schema (:roundtrip/input-schema report)
+                :products (:roundtrip/input-elements report)
+                :lossless? (:roundtrip/lossless? report)
+                :hybrid-semantic-lossless? (:roundtrip/semantic-lossless? hybrid)
+                :hybrid-opaque-lossless? (:roundtrip/opaque-lossless? hybrid)
+                :hybrid-edit-observed?
+                (= edited-name (get-in edited-document [:ifc/elements 0 :name]))
+                :geometry-editable? (boolean geometry-edit)
+                :geometry-schema-native? (boolean
+                                          (and geometry-edit
+                                               (ifc/schema-native-geometry-edit?
+                                                geometry-edit)))
+                :geometry-semantic-lossless?
+                (some-> geometry-hybrid :roundtrip/semantic-lossless?)
+                :geometry-opaque-lossless?
+                (some-> geometry-hybrid :roundtrip/opaque-lossless?)
+                :geometry-edit-observed?
+                (when geometry-edit
+                  (not= (ifc/semantic-fingerprint document)
+                        (ifc/semantic-fingerprint geometry-edit)))
+                :opaque-entities (:roundtrip/opaque-input-count hybrid)
+                :georeference?
+                (when expected-georef
+                  (and (= (:crs expected-georef) (get-in georef [:projected-crs :name]))
+                       (every? true? (map near? (:map-point expected-georef) projected))
+                       (every? true? (map near? (:model-point expected-georef) restored))))}]
+    (when-not (and (= (:expected/schema fixture) (:schema result))
+                   (= (:expected/products fixture) (:products result))
+                   (not= false (:georeference? result))
+                   (:lossless? result)
+                   (:hybrid-semantic-lossless? result)
+                   (:hybrid-opaque-lossless? result)
+                   (:hybrid-edit-observed? result)
+                   (or (not (:geometry-editable? result))
+                       (and (:geometry-semantic-lossless? result)
+                            (:geometry-opaque-lossless? result)
+                            (:geometry-edit-observed? result))))
+      (throw (ex-info "external IFC conformance failed" result)))
+    result))
+
+(def ^:private max-corpus-duration-ms
+  "Generous upper bound on total corpus round-trip time -- this exists to
+  catch a catastrophic (e.g. accidentally-quadratic) performance
+  regression, not to hold the parser to a tight budget, so it stays well
+  above observed timings across machines/CI runners."
+  30000)
+
+(defn- timed-verify-fixture [manifest fixture]
+  (let [started (System/nanoTime)
+        result (verify-fixture manifest fixture)
+        elapsed-ms (/ (- (System/nanoTime) started) 1.0e6)]
+    (assoc result :roundtrip-ms elapsed-ms)))
+
+(defn -main [& _]
+  (let [manifest (edn/read-string (slurp manifest-path))
+        started (System/nanoTime)
+        results (mapv (fn [fixture]
+                        (try
+                          (timed-verify-fixture manifest fixture)
+                          (catch Exception error
+                            (throw (ex-info "external IFC fixture failed"
+                                            {:name (:name fixture)
+                                             :source/path (:source/path fixture)}
+                                            error)))))
+                      (:remote-fixtures manifest))
+        total-ms (/ (- (System/nanoTime) started) 1.0e6)
+        slowest (apply max-key :roundtrip-ms results)]
+    (when (> total-ms max-corpus-duration-ms)
+      (throw (ex-info "external IFC corpus round-trip performance regression"
+                      {:total-ms total-ms :budget-ms max-corpus-duration-ms
+                       :slowest-file (:name slowest) :slowest-ms (:roundtrip-ms slowest)})))
+    (prn {:corpus/source (:source/repository manifest)
+          :corpus/commit (:source/commit manifest)
+          :corpus/total-roundtrip-ms total-ms
+          :corpus/slowest-file (:name slowest)
+          :corpus/slowest-roundtrip-ms (:roundtrip-ms slowest)
+          :corpus/files results
+          :corpus/products (reduce + (map :products results))
+          :corpus/lossless? (every? :lossless? results)
+          :corpus/hybrid-edit-lossless?
+          (every? #(and (:hybrid-semantic-lossless? %)
+                        (:hybrid-opaque-lossless? %)
+                        (:hybrid-edit-observed? %)) results)
+          :corpus/geometry-editable-files (count (filter :geometry-editable? results))
+          :corpus/geometry-schema-native-files
+          (count (filter :geometry-schema-native? results))
+          :corpus/geometry-edit-lossless?
+          (every? #(or (not (:geometry-editable? %))
+                       (and (:geometry-semantic-lossless? %)
+                            (:geometry-opaque-lossless? %)
+                            (:geometry-edit-observed? %)))
+                  results)})))

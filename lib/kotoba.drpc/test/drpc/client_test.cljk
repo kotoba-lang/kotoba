@@ -1,0 +1,130 @@
+(ns drpc.client-test
+  "A unary call, checked against the bytes storj.io/drpc writes for the same
+  one.
+
+  The first test is the load-bearing one: `testdata/echo_server.go -dump`
+  drives a real `drpcconn.Conn` over a transport that records what it wrote,
+  so the expected value is the reference implementation's output rather than
+  this library's own. The rest is about what comes back — which is where a
+  client that only ever talks to a healthy server gets it wrong."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [drpc.client :as c]
+            [drpc.wire :as w]))
+
+(defn- unhex [s]
+  (mapv #?(:clj  #(Integer/parseInt % 16)
+           :cljs #(js/parseInt % 16))
+        (re-seq #"[0-9a-fA-F]{2}" s)))
+
+(defn- ascii [s] (mapv #?(:clj int :cljs #(.charCodeAt % 0)) s))
+
+;; ── testdata/client-vectors.edn, generated — do not hand-edit ───────────────
+
+(def rpc "/echo.Echo/Echo")
+(def payload "hello storj")
+(def request-bytes
+  (unhex (str "0301010f2f6563686f2e4563686f2f4563686f0501020b68656c6c6f2073746f726a"
+              "0d010300")))
+
+(deftest a-unary-call-is-byte-identical-to-storj-drpc
+  (is (= request-bytes (c/request {:stream 1 :rpc rpc :request (ascii payload)}))))
+
+(deftest the-sequence-is-invoke-then-message-then-close-send
+  (let [ps (c/packets {:stream 7 :rpc rpc :request (ascii payload)})]
+    (is (= [:invoke :message :close-send] (mapv :kind ps)))
+    (is (= [7 7 7] (mapv :stream ps)))
+    (testing "message ids start at 1 and advance — a call that restarts them
+              is a call the far side discards as a replay"
+      (is (= [1 2 3] (mapv :message ps))))
+    (is (= (ascii rpc) (:data (first ps))))
+    (is (= (ascii payload) (:data (second ps))))
+    (is (= [] (:data (last ps))) "CloseSend carries no body")))
+
+(deftest metadata-goes-first-and-shifts-everything-after-it
+  (let [ps (c/packets {:rpc rpc :request [1] :metadata [9 9]})]
+    (is (= [:invoke-metadata :invoke :message :close-send] (mapv :kind ps)))
+    (is (= [1 2 3 4] (mapv :message ps)))))
+
+(deftest empty-metadata-is-no-metadata
+  ;; `doInvoke` only writes the packet when there is something in it, and an
+  ;; empty one would shift every id by one for no reason
+  (is (= [:invoke :message :close-send]
+         (mapv :kind (c/packets {:rpc rpc :request [1] :metadata []}))))
+  (is (= [:invoke :message :close-send]
+         (mapv :kind (c/packets {:rpc rpc :request [1] :metadata nil})))))
+
+(deftest the-request-reads-back-as-the-packets-it-was
+  (let [{:keys [packets]} (w/feed (w/reader) (c/request {:rpc rpc :request (ascii payload)}))]
+    (is (= [:invoke :message :close-send] (mapv :kind packets)))
+    (is (= (ascii rpc) (vec (:data (first packets)))))))
+
+(deftest a-large-request-still-reads-back-as-one-packet
+  ;; the split is invisible to the far side, which is the point of packets
+  (let [big (vec (repeat 200000 0x41))
+        {:keys [packets]} (w/feed (w/reader) (c/request {:rpc rpc :request big}))
+        msg (first (filter #(= :message (:kind %)) packets))]
+    (is (= 200000 (count (:data msg))))))
+
+(deftest an-rpc-name-that-is-not-ascii-is-refused
+  ;; protobuf's own grammar says these are ASCII; mangling one produces a name
+  ;; no server routes and an error that says nothing about why
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"ASCII"
+                        (c/packets {:rpc "/エコー/Echo" :request []}))))
+
+;; ── what comes back ─────────────────────────────────────────────────────────
+
+(deftest errors-carry-a-code-and-a-message
+  ;; eight bytes of big-endian code, then the text
+  (let [body (into [0 0 0 0 0 0 0 17] (ascii "no such rpc"))
+        e (c/error->map body)]
+    (is (= 17 (:code e)))
+    (is (= "no such rpc" (:message e))))
+  (testing "a body too short to hold a code is still telling you something"
+    (let [e (c/error->map (ascii "oops"))]
+      (is (= 0 (:code e)))
+      (is (= "oops" (:message e))))))
+
+(deftest error-text-is-utf-8
+  (is (= "エラー" (c/utf8-string (unhex "e382a8e383a9e383bc"))))
+  (is (= "ok" (c/utf8-string (ascii "ok"))))
+  (is (= "" (c/utf8-string [])))
+  (testing "astral planes survive as a surrogate pair"
+    (is (= 2 (count (c/utf8-string (unhex "f09f9880"))))))
+  (testing "bad bytes become replacement characters, not exceptions"
+    (is (= "�" (c/utf8-string [0xff])))
+    ;; one per byte, as Go's utf8.DecodeRune does — not the single U+FFFD the
+    ;; maximal-subpart rule would give for a truncated three-byte sequence
+    (is (= "��" (c/utf8-string [0xe3 0x82])))
+    (is (= "ok��" (c/utf8-string (into (ascii "ok") [0xe3 0x82]))))))
+
+(deftest collect-takes-the-first-message
+  (let [r (c/collect [{:kind :message :stream 1 :message 1 :data [1 2]}
+                      {:kind :message :stream 1 :message 2 :data [3 4]}] 1)]
+    (is (= [1 2] (:message r)))))
+
+(deftest collect-records-an-error-and-a-close
+  (let [body (into [0 0 0 0 0 0 0 5] (ascii "bad"))
+        r (c/collect [{:kind :error :stream 1 :message 1 :data body}
+                      {:kind :close :stream 1 :message 2 :data []}] 1)]
+    (is (nil? (:message r)))
+    (is (= 5 (get-in r [:error :code])))
+    (is (= "bad" (get-in r [:error :message])))
+    (is (:closed? r))))
+
+(deftest packets-for-other-streams-are-set-aside-not-dropped
+  ;; a connection carries more than one call over its life, and discarding
+  ;; another call's response is a hang rather than an error
+  (let [r (c/collect [{:kind :message :stream 2 :message 1 :data [9]}
+                      {:kind :message :stream 1 :message 1 :data [1]}] 1)]
+    (is (= [1] (:message r)))
+    (is (= 1 (count (:ignored r))))
+    (is (= 2 (:stream (first (:ignored r)))))))
+
+(deftest a-call-is-complete-when-it-has-an-answer-or-a-hangup
+  (is (not (c/complete? (c/collect [] 1))))
+  (is (c/complete? {:message [1]}))
+  (is (c/complete? {:error {:code 1}}))
+  (is (c/complete? {:closed? true})
+      "a peer that hung up without answering has still ended the call")
+  (is (not (c/complete? {:closed-send? true}))
+      "but CloseSend only says it will send no more, not that it is done"))

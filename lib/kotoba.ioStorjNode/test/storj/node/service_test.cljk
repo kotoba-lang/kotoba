@@ -1,0 +1,166 @@
+(ns storj.node.service-test
+  "What a node answers when it is asked.
+
+  The wire shapes here are small enough that the interesting part is not the
+  encoding but the meaning: `Exists` answers with indices and not ids,
+  `DeletePieces` counts what it could *not* do, and `Retain` deliberately
+  deletes nothing. Each of those reads backwards from the obvious guess."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [proto.wire :as w]
+            [storj.node.host.blobs :as blobs]
+            [storj.node.piece :as piece]
+            [storj.node.protocols :as p]
+            [storj.node.service :as svc]))
+
+(def ^:private satellite (vec (repeat 32 1)))
+(defn- paths [id] (piece/blob-path satellite id))
+(defn- pid [fill] (mapv (fn [i] (mod (+ fill (* i 7)) 256)) (range 32)))
+
+(defn- node-holding [& fills]
+  (let [store (blobs/in-memory)]
+    (doseq [f fills] (p/-put store (paths (pid f)) [1 2 3]))
+    {:blobs store :paths paths}))
+
+(defn- ids-request [& fills]
+  (w/encode (mapv (fn [f] (w/bytes-field 1 (pid f))) fills)))
+
+(defn- varints [bs] (mapv w/varint-value (w/fields (w/decode bs) 1)))
+
+;; ── ping ────────────────────────────────────────────────────────────────────
+
+(deftest ping-answers-with-an-empty-message
+  ;; ContactPingRequest and ContactPingResponse have no fields; the satellite
+  ;; is checking that the address reaches something that can answer at all
+  (let [r (svc/handle {} {:rpc svc/ping-rpc :request []})]
+    (is (= [] (:response r)))
+    (is (nil? (:error r)))))
+
+;; ── exists ──────────────────────────────────────────────────────────────────
+
+(deftest exists-answers-with-indices-not-ids
+  ;; a node answering with ids would be answering a different question, and
+  ;; the satellite would read the first varint of an id as an index
+  (let [state (node-holding 0x11)
+        r (svc/handle state {:rpc svc/exists-rpc :request (ids-request 0x11 0x99)})]
+    (is (= [1] (varints (:response r))))
+    (is (= 2 (:checked r)))
+    (is (= [1] (:missing r)))))
+
+(deftest a-node-holding-everything-reports-nothing-missing
+  (let [state (node-holding 0x11 0x99)
+        r (svc/handle state {:rpc svc/exists-rpc :request (ids-request 0x11 0x99)})]
+    (is (= [] (varints (:response r))))
+    (is (= [] (:response r)) "an empty response, not an absent one")))
+
+(deftest a-node-holding-nothing-reports-every-index
+  (let [state (node-holding)
+        r (svc/handle state {:rpc svc/exists-rpc :request (ids-request 0x11 0x99 0x40)})]
+    (is (= [0 1 2] (varints (:response r))))))
+
+(deftest exists-with-no-ids-is-not-an-error
+  (let [r (svc/handle (node-holding) {:rpc svc/exists-rpc :request []})]
+    (is (= [] (:response r)))
+    (is (= 0 (:checked r)))))
+
+;; ── delete ──────────────────────────────────────────────────────────────────
+
+(deftest delete-counts-what-it-could-not-do
+  ;; unhandled_count is the opposite of the obvious reading: a node reporting
+  ;; its successes there tells a satellite that everything failed
+  (let [state (node-holding 0x11)
+        r (svc/handle state {:rpc svc/delete-rpc :request (ids-request 0x11 0x99)})]
+    (is (= 1 (:deleted r)))
+    (is (= 1 (:unhandled r)) "0x99 was never held")
+    (is (= [1] (varints (:response r))))
+    (testing "and the one that was held is gone"
+      (is (not (p/-exists? (:blobs state) (paths (pid 0x11))))))))
+
+(deftest deleting-everything-successfully-reports-zero
+  (let [state (node-holding 0x11 0x99)
+        r (svc/handle state {:rpc svc/delete-rpc :request (ids-request 0x11 0x99)})]
+    (is (= 0 (:unhandled r)))
+    (is (= [] (:response r)) "proto3 omits a zero, so the response is empty")))
+
+;; ── retain ──────────────────────────────────────────────────────────────────
+
+(deftest retain-decides-and-does-not-delete
+  ;; carrying it out means walking every piece the node holds for that
+  ;; satellite, which is hours of disk and the caller's to schedule
+  (let [seen (atom nil)
+        state (assoc (node-holding 0x11)
+                     :pieces [(pid 0x11) (pid 0x99)]
+                     :created-at-of (constantly 900)
+                     :on-retain #(reset! seen %))
+        ;; a filter with one hash function over a table of 0xff bytes says
+        ;; maybe to everything, so nothing is proposed for deletion
+        all-yes (into [1 0 1] (repeat 64 0xff))
+        request (w/encode [(w/bytes-field 2 all-yes)])
+        r (svc/handle state {:rpc svc/retain-rpc :request request})]
+    (is (= [] (:response r)) "RetainResponse has no fields")
+    (is (= 2 (:keep r)))
+    (is (= 0 (:delete r)))
+    (is (some? @seen) "the caller is handed the decision")
+    (is (p/-exists? (:blobs state) (paths (pid 0x11)))
+        "and nothing was removed")))
+
+(deftest a-filter-that-matches-nothing-still-keeps-newer-pieces
+  (let [state (assoc (node-holding)
+                     :pieces [(pid 0x11)]
+                     :created-at-of (constantly 5000))
+        all-no (into [1 0 1] (repeat 64 0x00))
+        request (w/encode [(w/bytes-field 2 all-no)
+                           (w/message-field 1 [(w/varint-field 1 1000)])])
+        r (svc/handle state {:rpc svc/retain-rpc :request request})]
+    (is (= 1 (:keep r)) "created after the filter, so it cannot be in it")
+    (is (= 0 (:delete r)))))
+
+;; ── routing ─────────────────────────────────────────────────────────────────
+
+(deftest an-unknown-rpc-is-an-error-not-silence
+  ;; a server that ignored it would leave the satellite waiting for a reply
+  ;; that is never coming
+  (let [r (svc/handle {} {:rpc "/piecestore.Piecestore/Upload" :request []})]
+    (is (nil? (:response r)))
+    (is (= svc/unimplemented-code (get-in r [:error :code])))
+    (is (re-find #"unimplemented rpc" (get-in r [:error :message])))))
+
+(deftest a-handler-that-throws-does-not-take-the-connection-with-it
+  ;; this side is reachable by whoever completed a handshake
+  (let [r (svc/handle {:blobs nil :paths paths}
+                      {:rpc svc/exists-rpc :request (ids-request 0x11)})]
+    (is (nil? (:response r)))
+    (is (some? (:error r)))
+    (is (re-find #"Exists failed" (get-in r [:error :message])))))
+
+(deftest a-malformed-request-is-an-error-and-not-a-crash
+  (let [r (svc/handle (node-holding) {:rpc svc/retain-rpc :request [0xff 0xff]})]
+    (is (some? (:error r)))))
+
+(deftest the-served-set-is-what-a-satellite-can-ask-for
+  (is (= #{"/contact.Contact/PingNode"
+           "/piecestore.Piecestore/Exists"
+           "/piecestore.Piecestore/Retain"
+           "/piecestore.Piecestore/DeletePieces"
+           "/piecestore.Piecestore/RestoreTrash"}
+         (svc/served)))
+  (testing "Upload and Download are absent because they are streams"
+    (is (not (clojure.core/contains? (svc/served) "/piecestore.Piecestore/Upload")))
+    (is (not (clojure.core/contains? (svc/served) "/piecestore.Piecestore/Download")))))
+
+;; ── the blob store ──────────────────────────────────────────────────────────
+
+(deftest deleting-what-is-not-there-is-not-success
+  ;; DeletePieces counts what it could not handle; silently succeeding would
+  ;; report a clean sweep over pieces this node never had
+  (let [store (blobs/in-memory)]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no such blob"
+                          (p/-delete store "missing")))))
+
+(deftest the-in-memory-store-round-trips
+  (let [store (blobs/in-memory)]
+    (is (not (p/-exists? store "a")))
+    (p/-put store "a" [1 2 3])
+    (is (p/-exists? store "a"))
+    (is (= [1 2 3] (p/-get store "a")))
+    (p/-delete store "a")
+    (is (not (p/-exists? store "a")))))

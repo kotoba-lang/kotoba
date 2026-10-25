@@ -1,0 +1,122 @@
+(ns murakumo-studio.client
+  "HTTP client for the local murakumo-studio-engine sidecar
+  (src/murakumo_studio/engine.cljk), spawned and supervised by the Tauri Rust
+  shell (tauri/src-tauri/src/main.rs). The frontend never talks to
+  kotoba-lang/inference directly — it only ever speaks HTTP/JSON to this
+  localhost process, which is the only thing running on the JVM."
+  (:require [kotoba.lang.text :as str]))
+
+(def default-port 8721)
+
+(defn base-url []
+  (str "http://127.0.0.1:" default-port))
+
+(defn- json-fetch [path opts]
+  (-> (js/fetch (str (base-url) path)
+                (clj->js (merge {:headers {"Content-Type" "application/json"}} opts)))
+      (.then (fn [res]
+               (if (.-ok res)
+                 (.json res)
+                 (.then (.text res)
+                        (fn [body]
+                          (throw (js/Error. (str "HTTP " (.-status res) ": " body))))))))
+      (.then #(js->clj % :keywordize-keys true))))
+
+(defn health []
+  (json-fetch "/health" {:method "GET"}))
+
+(defn list-models []
+  (json-fetch "/v1/models" {:method "GET"}))
+
+(defn scan-local-models []
+  (json-fetch "/models/scan" {:method "POST"}))
+
+(defn download-model [{:keys [repo-id file]}]
+  (json-fetch "/models/download"
+              {:method "POST"
+               :body (js/JSON.stringify (clj->js {:repo_id repo-id :file file}))}))
+
+(defn search-hf [query]
+  (json-fetch (str "/models/search?q=" (js/encodeURIComponent query)) {:method "GET"}))
+
+(defn list-hf-gguf-files [repo-id]
+  (json-fetch (str "/models/hf-files?repo_id=" (js/encodeURIComponent repo-id)) {:method "GET"}))
+
+(defn chat-completion
+  "Non-streaming. Kept alongside chat-completion-stream for callers that just
+  want the final text (e.g. non-UI scripting)."
+  [{:keys [model messages temperature max-tokens]}]
+  (json-fetch "/v1/chat/completions"
+              {:method "POST"
+               :body (js/JSON.stringify
+                      (clj->js {:model model
+                                :messages messages
+                                :temperature (or temperature 0.7)
+                                :max_tokens (or max-tokens 256)
+                                :stream false}))}))
+
+(defn- process-sse-buffer! [buf-atom done? {:keys [on-chunk on-done on-error on-note]}]
+  (let [lines (str/split @buf-atom #"\n" -1)
+        complete (if done? lines (butlast lines))
+        remainder (if done? "" (or (last lines) ""))]
+    (reset! buf-atom remainder)
+    (doseq [line complete]
+      (when (str/starts-with? line "data: ")
+        (let [payload (subs line 6)]
+          (cond
+            (= payload "[DONE]") (when on-done (on-done))
+            (seq payload)
+            (let [data (js->clj (js/JSON.parse payload) :keywordize-keys true)]
+              (cond
+                (:error data) (when on-error (on-error (:error data)))
+                (:murakumo_studio/quality_note data)
+                (when on-note (on-note (:murakumo_studio/quality_note data)))
+                :else
+                (when-let [content (get-in data [:choices 0 :delta :content])]
+                  (when on-chunk (on-chunk content)))))))))))
+
+(defn chat-completion-stream
+  "Streams /v1/chat/completions over SSE. `callbacks` is
+  {:on-chunk (fn [content-str]) :on-done (fn []) :on-error (fn [msg])
+   :on-note (fn [note-str])} — each optional. :on-note carries engine-side
+  caveats (e.g. kotoba-lang/inference's current output-quality limitation),
+  sent once per response before any :on-chunk. Returns nothing; the caller
+  drives UI state from the callbacks."
+  [{:keys [model messages temperature max-tokens]} callbacks]
+  (-> (js/fetch (str (base-url) "/v1/chat/completions")
+                (clj->js {:method "POST"
+                          :headers {"Content-Type" "application/json"}
+                          :body (js/JSON.stringify
+                                 (clj->js {:model model
+                                           :messages messages
+                                           :temperature (or temperature 0.7)
+                                           :max_tokens (or max-tokens 256)
+                                           :stream true}))}))
+      (.then
+       (fn [res]
+         (if-not (.-ok res)
+           (.then (.text res)
+                  (fn [body] (throw (js/Error. (str "HTTP " (.-status res) ": " body)))))
+           (let [reader (.getReader (.-body res))
+                 decoder (js/TextDecoder. "utf-8")
+                 buf (atom "")]
+             (letfn [(pump []
+                       (.then (.read reader)
+                              (fn [result]
+                                (let [done (.-done result)
+                                      value (.-value result)]
+                                  (when value
+                                    (swap! buf str (.decode decoder value #js {:stream true})))
+                                  (process-sse-buffer! buf done callbacks)
+                                  (when-not done (pump))))))]
+               (pump))))))
+      (.catch (fn [e] (when-let [on-error (:on-error callbacks)] (on-error (str e)))))))
+
+(defn fleet-status []
+  (json-fetch "/fleet/status" {:method "GET"}))
+
+(defn fleet-join []
+  (json-fetch "/fleet/join" {:method "POST"}))
+
+(defn fleet-leave []
+  (json-fetch "/fleet/leave" {:method "POST"}))

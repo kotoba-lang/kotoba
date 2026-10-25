@@ -1,0 +1,136 @@
+#!/usr/bin/env kbb
+;; End-to-end against a real storage provider, read-only.
+;;
+;;   chain  -> a PieceCID that is genuinely stored (PDPVerifier.getPieceCid)
+;;   HTTP   -> that provider's pdp/ping, pdp/piece?pieceCid=, piece/<cid>
+;;   verify -> recompute the PieceCID from the downloaded bytes
+;;
+;; The last step is the point. Everything before it could be right by accident;
+;; bytes that hash back to the CID they were fetched under cannot be.
+;;
+;;   npm run probe:provider
+(ns probe-provider
+  (:require ["@filoz/synapse-core/chains" :as chains]
+            ["@filoz/synapse-core/sp-registry" :as registry]
+            ["viem" :as viem]
+            [filecoin.client :as client]
+            [filecoin.cloud.chain :as chain]
+            [filecoin.cloud.evm :as evm]
+            [filecoin.cloud.pdp :as pdp]
+            [filecoin.cloud.piece :as piece]
+            [filecoin.cloud.provider :as prov]
+            [filecoin.protocols :as p]
+            [filecoin.transport :as transport]
+            [multiformats.core :as mf]))
+
+(def http (transport/http {:timeout-ms 30000}))
+(def ep (:rpc (chain/chain :mainnet)))
+(def from (chain/eth->f4 (chain/contract :mainnet :pdp-verifier)))
+
+(defn- ->u8 [ints] (js/Uint8Array.from (clj->js (vec ints))))
+
+(defn- call [cd types]
+  (client/read-contract
+   http ep
+   (evm/call-message :mainnet :pdp-verifier cd
+                     {:from from :nonce 0 :gas-limit 100000000
+                      :gas-fee-cap "0" :gas-premium "0"})
+   types))
+
+(defn- chain-piece
+  "A PieceCID the PDPVerifier says is live, as a bafkzcib… string."
+  [set-id]
+  (.then (call (pdp/call :get-piece-cid [(str set-id) "0"]) ["(bytes)"])
+         (fn [r] (str "b" (mf/base32 (->u8 (vec (first (first r)))))))))
+
+(defn- provider-urls
+  "Discovery only. Decoding getProviderWithProduct's nested struct is the one
+  part of this surface still missing from cloud-filecoin, so the SDK stands in
+  for it here — as an oracle, the same way it does for PieceCID vectors."
+  []
+  (let [c (viem/createPublicClient
+           (clj->js {:chain chains/mainnet :transport (viem/http)}))]
+    (.then (registry/getPDPProviders c)
+           (fn [r]
+             (mapv (fn [x] {:name (aget x "name")
+                            :url (some-> (aget x "pdp") (aget "serviceURL"))})
+                   (array-seq (aget r "providers")))))))
+
+(defn- holds?
+  "Does this provider answer ping AND report holding `cid`?"
+  [cid entry]
+  (let [url (:url entry)]
+    (if-not url
+      (js/Promise.resolve nil)
+      (-> (p/request http (prov/ping-request url))
+          (.then (fn [r]
+                   (if-not (:alive? (prov/ping-response r))
+                     nil
+                     (.then (p/request http (prov/find-piece-request url cid))
+                            (fn [f]
+                              (let [st (:state (prov/find-piece-response f))]
+                                (println "   " (:name entry) "ping=ok find=" (str st))
+                                (when (= :present st) entry)))))))
+          (.catch (fn [_] nil))))))
+
+(defn- all-holders
+  "Every reachable provider that reports holding the piece. Plural on purpose:
+  the first one that said `:present` served a 27-byte nginx placeholder, so a
+  single sample cannot distinguish a client bug from a provider bug."
+  [cid providers]
+  (if (empty? providers)
+    (js/Promise.resolve [])
+    (.then (holds? cid (first providers))
+           (fn [hit]
+             (.then (all-holders cid (rest providers))
+                    (fn [rest-hits] (if hit (into [hit] rest-hits) rest-hits)))))))
+
+(defn- fetch-bytes
+  "Retrieve through the same byte-safe IHttp path used by provider clients."
+  [url]
+  (-> (p/request http (prov/get-piece-request url))
+      (.then (fn [r] {:status (:status r) :bytes (vec (:body r))}))))
+
+(defn- download-and-verify [cid entry]
+  (let [u (prov/piece-url (:url entry) cid)]
+    (-> (fetch-bytes u)
+        (.then (fn [resp]
+                 (let [bytes (:bytes resp)
+                       v (prov/verify-bytes cid bytes)]
+                   {:name (:name entry) :url u :status (:status resp)
+                    :bytes (count bytes) :ok? (:ok? v) :computed (:computed v)})))
+        (.catch (fn [e] {:name (:name entry) :url u :error (str e)})))))
+
+(defn -main []
+  (-> (js/Promise.all #js [(chain-piece 1416) (provider-urls)])
+      (.then (fn [pair]
+               (let [cid (aget pair 0)
+                     providers (aget pair 1)]
+                 (println "piece (from PDPVerifier):" cid)
+                 (println "parsed:"
+                          (pr-str (select-keys (piece/parse cid)
+                                               [:height :padding :size :padded-size])))
+                 (println "providers advertised:" (count providers))
+                 (.then (all-holders cid providers)
+                        (fn [hits]
+                          (println)
+                          (println "providers reporting :present —" (count hits))
+                          (if (empty? hits)
+                            (println "none; nothing to download")
+                            (.then (js/Promise.all
+                                    (clj->js (mapv #(download-and-verify cid %) hits)))
+                                   (fn [rs]
+                                     (doseq [r (array-seq rs)]
+                                       (println (str "  " (:name r)
+                                                     " status=" (:status r)
+                                                     " bytes=" (:bytes r)
+                                                     " verified=" (:ok? r)
+                                                     (when (:error r) (str " error=" (:error r))))))
+                                     (let [good (filter :ok? (array-seq rs))]
+                                       (println)
+                                       (if (seq good)
+                                         (println "PASS —" (count good) "provider(s) served bytes that hash back to the PieceCID")
+                                         (println "NO PROVIDER served verifiable bytes for this piece")))))))))))
+      (.catch (fn [e] (println "ERR" (str e)) (js/process.exit 1)))))
+
+(-main)

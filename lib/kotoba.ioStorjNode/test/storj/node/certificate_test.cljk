@@ -1,0 +1,115 @@
+(ns storj.node.certificate-test
+  "Writing the certificates a Storj identity is made of.
+
+  The first two tests are the ones that matter, and they are stronger than
+  anything a writer usually gets: the fixture is a certificate Go's
+  `x509.CreateCertificate` produced for a real `identity.NewCA`, and this
+  rebuilds its signed body from the serial, key and extensions it contains
+  and asserts the result is **byte-identical**. A certificate that merely
+  parses, or that some verifier accepts, leaves room for a field encoded a
+  legal-but-different way; equality does not."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [storj.node.certificate :as cert]
+            [storj.node.der :as der]
+            [storj.node.fixture :refer [ca-der ca-spki-der leaf-der unhex]]
+            [storj.node.identity :as ident]))
+
+(def ^:private ca (ident/certificate ca-der))
+(def ^:private leaf (ident/certificate leaf-der))
+
+(defn- serial-of [tbs-der]
+  (der/integer-bytes (nth (der/children (der/parse tbs-der)) 1)))
+
+(defn- subject-key-id-of [cert]
+  (:contents (der/parse (get (:extensions cert) (:subject-key-identifier cert/oids)))))
+
+;; ── byte-for-byte against a real Storj certificate ──────────────────────────
+
+(deftest rebuilds-a-real-ca-certificate-body-exactly
+  (is (= (:tbs-der ca)
+         (cert/ca-tbs {:serial         (serial-of (:tbs-der ca))
+                       :spki-der       ca-spki-der
+                       :subject-key-id (subject-key-id-of ca)
+                       :version        0}))))
+
+(deftest rebuilds-a-real-leaf-certificate-body-exactly
+  (let [tbs (:tbs-der leaf)]
+    (is (= tbs
+           (cert/leaf-tbs {:serial   (serial-of tbs)
+                           :spki-der (:spki-der leaf)})))))
+
+(deftest reassembles-a-whole-certificate-exactly
+  ;; the algorithm identifier appears twice in a certificate and the two must
+  ;; agree; equality with the original is the check that they do
+  (is (= ca-der (cert/certificate (:tbs-der ca) (:signature ca))))
+  (is (= leaf-der (cert/certificate (:tbs-der leaf) (:signature leaf)))))
+
+;; ── the shape that was got wrong first ──────────────────────────────────────
+
+(deftest extensions-are-a-sequence-inside-the-context-tag
+  ;; `[3] EXPLICIT Extensions` where `Extensions ::= SEQUENCE OF Extension` is
+  ;; two nested constructions. Emitting the extensions directly inside the
+  ;; context tag produces a certificate whose first extension's *fields* parse
+  ;; as extensions — which is what happened, and what the reader's
+  ;; duplicate-extension rule caught.
+  (let [holder (first (filter #(and (= :context (:class %)) (= 3 (:tag %)))
+                              (der/children (der/parse (:tbs-der ca)))))
+        inner  (der/children holder)]
+    (is (= 1 (count inner)) "exactly one element: the SEQUENCE OF")
+    (is (der/tag? (first inner) :sequence))
+    (is (= 4 (count (der/children (first inner))))
+        "keyUsage, basicConstraints, subjectKeyIdentifier, identity version")))
+
+;; ── the writer's pieces ─────────────────────────────────────────────────────
+
+(deftest object-identifiers-round-trip
+  (doseq [oid ["2.999.2.1" "2.999.1.2" "2.5.4.10" "2.5.29.15" "2.5.29.37"
+               "1.2.840.10045.4.3.2" "1.3.6.1.5.5.7.3.1" "1.3.101.112"]]
+    (testing oid
+      (is (= oid (der/oid (der/parse (der/encode-oid oid))))))))
+
+(deftest the-first-two-arcs-share-one-subidentifier
+  ;; 40*a + b, which is why `2.999` needs two octets and why nothing in the
+  ;; encoding records that the first arc was 2
+  (is (= (unhex "060488370201") (der/encode-oid "2.999.2.1")))
+  (is (= (unhex "060355040a") (der/encode-oid "2.5.4.10")))
+  (is (= (unhex "06082a8648ce3d040302") (der/encode-oid "1.2.840.10045.4.3.2"))))
+
+(deftest key-usage-bits-are-counted-from-the-top
+  ;; keyCertSign is bit 5, so one octet 0x04 with two unused bits
+  (is (= (unhex "03020204") (cert/key-usage [:key-cert-sign])))
+  ;; digitalSignature and keyEncipherment are bits 0 and 2 — 0xa0, five unused
+  (is (= (unhex "030205a0") (cert/key-usage [:digital-signature :key-encipherment])))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (cert/key-usage [:nonrepudiation]))))
+
+(deftest integers-carry-a-sign-byte-only-when-they-need-one
+  (is (= [0x02 0x01 0x02] (der/encode-integer [2])))
+  (is (= [0x02 0x02 0x00 0x80] (der/encode-integer [0x80]))
+      "a leading byte with the top bit set would otherwise be negative")
+  (is (= [0x02 0x01 0x7f] (der/encode-integer [0x00 0x7f]))
+      "and leading zeros are not part of the value")
+  (is (= [0x02 0x01 0x00] (der/encode-integer [0 0 0]))))
+
+(deftest lengths-cross-the-long-form-boundary
+  (doseq [n [0 1 127 128 255 256 65535 65536]]
+    (testing (str n " bytes")
+      (let [e (der/encode-octet-string (vec (repeat n 0x41)))]
+        (is (= n (count (:contents (der/parse e)))))
+        (is (= (vec (repeat n 0x41)) (:contents (der/parse e))))))))
+
+(deftest booleans-and-times-and-strings
+  (is (= [0x01 0x01 0xff] (der/encode-boolean true)))
+  (is (= [0x01 0x01 0x00] (der/encode-boolean false)))
+  (is (= (unhex "180f30303031303130313030303030305a")
+         (der/encode-generalized-time cert/zero-time)))
+  (is (= (unhex "130553746f726a") (der/encode-printable-string "Storj")))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (der/encode-printable-string "Storj™"))))
+
+(deftest the-identity-version-is-a-bare-byte
+  ;; not an ASN.1 INTEGER — `IDVersionFromCert` reads the first byte of the
+  ;; extension value directly, and an INTEGER's tag byte would read as 2
+  (let [[oid value] (der/children (der/parse (cert/identity-version-extension 7)))]
+    (is (= "2.999.2.1" (der/oid oid)))
+    (is (= [7] (:contents value)))
+    (is (= 7 (ident/version {:extensions {ident/identity-version-ext (:contents value)}})))))

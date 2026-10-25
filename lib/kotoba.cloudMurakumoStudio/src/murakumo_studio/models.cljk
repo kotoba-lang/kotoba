@@ -1,0 +1,168 @@
+(ns murakumo-studio.models
+  "Local model discovery + Hugging Face Hub search/download. Scans
+  ~/.murakumo-studio/models/*.gguf (models murakumo-studio itself downloaded)
+  and, read-only, an existing Ollama install's blob store so users don't have
+  to re-download models they already have (ADR-2607032700 §4)."
+  (:require [kotoba.http.form-urlencoded :as form-urlencoded] [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [json.compat :as json])
+  (:import [java.io File]
+           [java.net URI]
+           [java.net.http HttpClient HttpClient$Redirect HttpRequest HttpResponse HttpResponse$BodyHandlers]
+           [java.time Duration]))
+
+(defn- home [] (System/getProperty "user.home"))
+
+(defn studio-home
+  "Base dir for murakumo-studio's own state (models/config). Public so tests
+  can `with-redefs` it to a temp dir instead of touching the real $HOME."
+  ^File []
+  (io/file (or (System/getenv "MURAKUMO_STUDIO_HOME") (str (home) "/.murakumo-studio"))))
+
+(defn studio-models-dir ^File []
+  (doto (io/file (studio-home) "models") (.mkdirs)))
+
+(defn ollama-root
+  "Public (like studio-home) so tests can point it at a synthetic manifest
+  tree instead of the real Ollama install."
+  ^File []
+  (io/file (or (System/getenv "OLLAMA_MODELS") (str (home) "/.ollama/models"))))
+
+(defn- scan-local-gguf []
+  (for [^File f (or (.listFiles (studio-models-dir)) [])
+        :when (and (.isFile f) (str/ends-with? (.getName f) ".gguf"))]
+    {:id (.getName f)
+     :path (.getAbsolutePath f)
+     :size_bytes (.length f)
+     :backend "cpu"
+     :context_length nil
+     :source "local"}))
+
+(defn- ollama-manifest-models
+  "Ollama stores `models/manifests/<registry>/<namespace>/<name>/<tag>` JSON
+  files pointing at content-addressed blobs in `models/blobs/sha256-<hex>`.
+  We only care about the layer whose mediaType marks it as the GGUF weights."
+  []
+  (let [root (ollama-root)
+        manifests-root (io/file root "manifests")]
+    (when (.isDirectory manifests-root)
+      (let [prefix-len (inc (count (.getAbsolutePath manifests-root)))]
+        (keep
+         (fn [^File f]
+           (when (.isFile f)
+             (let [rel (subs (.getAbsolutePath f) prefix-len)
+                   parts (str/split rel (re-pattern (str "\\" File/separator)))]
+               (when (>= (count parts) 3)
+                 (let [tag (peek parts)
+                       ;; parts = [registry-host namespace... name tag]; drop
+                       ;; the host, keep namespace/name as the model id.
+                       name-parts (butlast (rest parts))
+                       model-name (str/join "/" name-parts)]
+                   (when-let [manifest (try (json/parse-string (slurp f) true)
+                                             (catch Exception _ nil))]
+                     (when-let [gguf-layer (first (filter #(= (:mediaType %)
+                                                               "application/vnd.ollama.image.model")
+                                                           (:layers manifest)))]
+                       (let [blob (io/file root "blobs" (str/replace (:digest gguf-layer) ":" "-"))]
+                         (when (.isFile blob)
+                           {:id (str model-name ":" tag)
+                            :path (.getAbsolutePath blob)
+                            :size_bytes (or (:size gguf-layer) (.length blob))
+                            :backend "cpu"
+                            :context_length nil
+                            :source "ollama"})))))))))
+         (file-seq manifests-root))))))
+
+(defn scan-all []
+  (vec (concat (scan-local-gguf) (ollama-manifest-models))))
+
+(defonce cache (atom []))
+
+(defn refresh! []
+  (reset! cache (scan-all))
+  @cache)
+
+(defn list-models [] @cache)
+
+(defn path-for [id]
+  (:path (first (filter #(= (:id %) id) @cache))))
+
+;; HttpClient defaults to NOT following redirects; HF's /resolve/ endpoint
+;; 307-redirects to a signed CDN URL, so this must be explicit (found by
+;; actually running a real download against huggingface.co, not assumed).
+(def ^:private http-client
+  (delay (-> (HttpClient/newBuilder) (.followRedirects HttpClient$Redirect/NORMAL) (.build))))
+
+(defn- hf-get-json [path]
+  (let [req (-> (HttpRequest/newBuilder)
+                (.uri (URI. (str "https://huggingface.co" path)))
+                (.timeout (Duration/ofSeconds 15))
+                (.GET)
+                (.build))
+        res (.send ^HttpClient @http-client req (HttpResponse$BodyHandlers/ofString))]
+    (if (= 200 (.statusCode res))
+      (json/parse-string (.body res) true)
+      (throw (ex-info (str "Hugging Face Hub request failed: HTTP " (.statusCode res))
+                       {:path path :status (.statusCode res)})))))
+
+(defn search-hf!
+  "Search public Hugging Face Hub model repos by query string. Returns a
+  vector of `{:id \"org/repo\" :downloads N :likes N}`; does not filter by
+  GGUF presence up front (a repo can host GGUF alongside other formats) —
+  call `list-hf-gguf-files!` on a chosen repo to see its actual .gguf files."
+  [query]
+  (when (str/blank? query)
+    (throw (ex-info "query is required" {:query query})))
+  (let [encoded (form-urlencoded/form-encode query)
+        results (hf-get-json (str "/api/models?search=" encoded "&limit=25"))]
+    (mapv (fn [m] {:id (:id m) :downloads (:downloads m) :likes (:likes m)}) results)))
+
+(defn list-hf-gguf-files!
+  "List every *.gguf sibling file in a Hugging Face Hub repo."
+  [repo-id]
+  (when (str/blank? repo-id)
+    (throw (ex-info "repo-id is required" {:repo-id repo-id})))
+  (let [info (hf-get-json (str "/api/models/" repo-id))]
+    (->> (:siblings info)
+         (map :rfilename)
+         (filter #(str/ends-with? % ".gguf"))
+         (mapv (fn [f] {:filename f})))))
+
+(defn- write-body-to-file! [^HttpResponse res ^File dest append?]
+  (with-open [in (.body res)
+              out (io/output-stream dest :append append?)]
+    (io/copy in out)))
+
+(defn download!
+  "Resumable (HTTP Range) download of a single GGUF file from a public
+  Hugging Face Hub repo, into studio-models-dir. Downloads to a `.part`
+  sidecar and only renames to the final name on completion, so a killed/
+  interrupted download resumes instead of restarting, and a half-downloaded
+  file never shows up as a usable model. If the final file already exists
+  (previously completed), returns it immediately without re-downloading."
+  [{:keys [repo-id file]}]
+  (when (or (str/blank? repo-id) (str/blank? file))
+    (throw (ex-info "repo-id and file are required" {:repo-id repo-id :file file})))
+  (let [url (str "https://huggingface.co/" repo-id "/resolve/main/" file "?download=true")
+        fname (last (str/split file #"/"))
+        dest (io/file (studio-models-dir) fname)
+        part (io/file (studio-models-dir) (str fname ".part"))]
+    (if (.isFile dest)
+      {:path (.getAbsolutePath dest) :size_bytes (.length dest) :repo_id repo-id :file file :resumed false :already-present true}
+      (let [offset (if (.isFile part) (.length part) 0)
+            req-builder (-> (HttpRequest/newBuilder)
+                             (.uri (URI. url))
+                             (.timeout (Duration/ofMinutes 30)))
+            req-builder (if (pos? offset)
+                          (.header req-builder "Range" (str "bytes=" offset "-"))
+                          req-builder)
+            res (.send ^HttpClient @http-client (.build req-builder) (HttpResponse$BodyHandlers/ofInputStream))
+            status (.statusCode res)]
+        (cond
+          (= 206 status) (write-body-to-file! res part true)   ; server honored our Range resume
+          (= 200 status) (write-body-to-file! res part false)  ; server ignored Range -> full body, start over
+          :else (throw (ex-info (str "download failed: HTTP " status) {:repo-id repo-id :file file :status status})))
+        (io/make-parents dest)
+        (.renameTo part dest)
+        (refresh!)
+        {:path (.getAbsolutePath dest) :size_bytes (.length dest) :repo_id repo-id :file file :resumed (pos? offset)}))))

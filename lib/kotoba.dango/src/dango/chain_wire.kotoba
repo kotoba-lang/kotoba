@@ -1,0 +1,433 @@
+;; dango.chain-wire -- decide a dango PRESENTATION natively
+;; (ADR adr-2609242100-capability-chain-is-ipld-sexpr-biscuit-is-an-adapter §3).
+;;
+;; The host grants ONE region holding the kotoba.value.v1 encoding of
+;;
+;;   [presentation roots revoked request]
+;;
+;;   presentation  {:blocks [{:bytes <block> :sig <64 bytes>} ...] :seal <64 bytes>}
+;;   roots         [<32-byte public key> ...]
+;;   revoked       [<36-byte binary CIDv1 dag-cbor sha2-256> ...]
+;;   request       {:req/kind kw :req/resource str :req/now int ...}
+;;
+;; and calls (verify-presentation base len). The answer is a reason code,
+;; in the oracle's order (src/dango/chain.cljk, `verify`):
+;;
+;;    1 granted            17 broken-link          23 not-covered
+;;   10 malformed-block    18 bad-signature        24 expired
+;;   11 malformed-caveat   19 bad-seal             25 wrong-holder
+;;      (incl. unknown     20 holder-readdressed   26 caveat-false
+;;       operator / fact)  21 revoked              30 input not the 4-vector
+;;   14 caveat-too-large   22 malformed-request
+;;   15 empty-chain  16 chain-too-long
+;;
+;; What runs where. CIDs (SHA-256 of each block's bytes) are computed in the
+;; guest (dango.sha256). Signatures -- each block's, and the seal -- are
+;; checked by the declared capability identity/verify, over spans of this
+;; same region named by address; the loader refuses any span outside the
+;; grant. Caveats are dango.caveat-wire. Authority is the oracle's
+;; `authority.chain/fold` + `covers?`, decided without building the meet:
+;; the scopes that cover one request form a chain, so the request is covered
+;; by the meet of all blocks exactly when every block has a cap covering it.
+;;
+;; A slice cannot cross a module boundary, so this module keeps its own copy
+;; of the small CBOR reader (at, heads, forms) and calls the other two
+;; modules with (base, len, position).
+;;
+;; Not enforced here, deliberately: canonical CBOR. The oracle refuses a
+;; non-canonical block (non-minimal integer, unsorted or duplicate map key);
+;; this reader reads the first match. Every such block is still SIGNED by the
+;; key the chain says may sign it, so the divergence cannot widen authority --
+;; but it is a divergence, and the parity suite does not cover it.
+(ns dango.chain-wire
+  (:export [verify-presentation])
+  (:require [dango.sha256 :as sha]
+            [dango.caveat-wire :as cw]))
+
+(def max-blocks 16)
+(def max-epoch 999999999999)
+
+;; ── bytes, CBOR heads, value.v1 forms (a copy; see header) ───────────────────
+
+(defn at [m [:slice :u8] p :i64] :i64
+  (if (and (>= p 0) (< p (slice-length m))) (slice-get m p) -1))
+(defn low5 [b :i64] :i64 (- b (* 32 (quot b 32))))
+(defn major [m [:slice :u8] p :i64] :i64 (let [b (at m p)] (if (< b 0) -1 (quot b 32))))
+(defn hlen [m [:slice :u8] p :i64] :i64
+  (let [b (at m p)]
+    (if (< b 0) -1
+      (let [i (low5 b)] (cond (< i 24) 1 (= i 24) 2 (= i 25) 3 (= i 26) 5 (= i 27) 9 :else -1)))))
+(defn be [m [:slice :u8] p :i64 k :i64 acc :i64] :i64
+  (if (= k 0) acc (be m (+ p 1) (- k 1) (+ (* acc 256) (at m p)))))
+(defn harg [m [:slice :u8] p :i64] :i64
+  (let [b (at m p) i (low5 b)]
+    (cond (< b 0) -1
+          (< i 24) i
+          (= i 24) (at m (+ p 1))
+          (= i 25) (be m (+ p 1) 2 0)
+          (= i 26) (be m (+ p 1) 4 0)
+          (and (= i 27) (< (at m (+ p 1)) 128)) (be m (+ p 1) 8 0)
+          :else -1)))
+(defn skip [m [:slice :u8] p :i64 depth :i64] :i64
+  (let [mj (major m p) h (hlen m p) a (harg m p)]
+    (cond
+      (or (< mj 0) (< h 0) (< a 0) (> depth 64)) -1
+      (or (= mj 0) (= mj 1) (= mj 7)) (+ p h)
+      (or (= mj 2) (= mj 3)) (+ p (+ h a))
+      (= mj 4) (skip-n m (+ p h) a (+ depth 1))
+      (= mj 5) (skip-n m (+ p h) (* 2 a) (+ depth 1))
+      (= mj 6) (skip m (+ p h) (+ depth 1))
+      :else -1)))
+(defn skip-n [m [:slice :u8] p :i64 n :i64 depth :i64] :i64
+  (cond (< p 0) -1 (= n 0) p :else (skip-n m (skip m p depth) (- n 1) depth)))
+
+;; the form's type code, or -1 unless p holds array(2) [small-uint payload]
+(defn code [m [:slice :u8] p :i64] :i64
+  (let [c (at m (+ p 1))] (if (and (= (at m p) 130) (>= c 0) (< c 24)) c -1)))
+(defn payload [p :i64] :i64 (+ p 2))
+;; text / byte-string payload bounds (major 3 / major 2)
+(defn str-off [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (if (or (= (major m q) 3) (= (major m q) 2)) (+ q (hlen m q)) -1)))
+(defn str-len [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (if (or (= (major m q) 3) (= (major m q) 2)) (harg m q) -1)))
+;; array payload (vector, set, map's pair list): count and first element
+(defn arr-n [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (if (= (major m q) 4) (harg m q) -1)))
+(defn arr-first [m [:slice :u8] p :i64] :i64
+  (let [q (payload p)] (+ q (hlen m q))))
+(defn nth-elem [m [:slice :u8] p :i64 k :i64] :i64
+  (if (= k 0) p (nth-elem m (skip m p 0) (- k 1))))
+
+(defn lit-eq-from [m [:slice :u8] off :i64 s :string i :i64 n :i64] :i64
+  (cond (= i n) 1
+        (= (string-find-byte s (at m (+ off i)) i) i) (lit-eq-from m off s (+ i 1) n)
+        :else 0))
+(defn lit-eq [m [:slice :u8] off :i64 len :i64 s :string] :i64
+  (if (= len (string-length s)) (lit-eq-from m off s 0 len) 0))
+(defn range-eq-from [m [:slice :u8] a :i64 b :i64 i :i64 n :i64] :i64
+  (cond (= i n) 1
+        (= (at m (+ a i)) (at m (+ b i))) (range-eq-from m a b (+ i 1) n)
+        :else 0))
+(defn range-eq [m [:slice :u8] a :i64 al :i64 b :i64 bl :i64] :i64
+  (if (= al bl) (range-eq-from m a b 0 al) 0))
+
+;; the value position for keyword KEY in the map form at p, or -1
+(defn field-from [m [:slice :u8] q :i64 n :i64 key :string] :i64
+  (if (or (= n 0) (< q 0))
+    -1
+    (let [k (+ q (hlen m q))]
+      (if (and (= 4 (major m q)) (= 5 (code m k)) (= 1 (lit-eq m (str-off m k) (str-len m k) key)))
+        (skip m k 0)
+        (field-from m (skip m q 0) (- n 1) key)))))
+(defn field [m [:slice :u8] p :i64 key :string] :i64
+  (if (= 19 (code m p)) (field-from m (arr-first m p) (arr-n m p) key) -1))
+
+;; every key of the map at p is one of the four block keys (and there are 4)
+(defn block-keys-ok [m [:slice :u8] q :i64 n :i64] :i64
+  (if (= n 0)
+    1
+    (let [k (+ q (hlen m q))
+          o (str-off m k) l (str-len m k)]
+      (if (and (= 5 (code m k))
+               (or (= 1 (lit-eq m o l "prev")) (= 1 (lit-eq m o l "grant"))
+                   (= 1 (lit-eq m o l "caveats")) (= 1 (lit-eq m o l "next-key"))))
+        (block-keys-ok m (skip m q 0) (- n 1))
+        0))))
+
+;; ── decimal text for the identity/verify request ─────────────────────────────
+
+(defn decimal [n :i64] :string
+  (if (< n 10)
+    (string-substring "0123456789" n (+ n 1))
+    (let [d (- n (* 10 (quot n 10)))]
+      (string-concat (decimal (quot n 10)) (string-substring "0123456789" d (+ d 1))))))
+
+(defn verify-request [key :i64 msg :i64 mlen :i64 sig :i64] :string
+  (string-concat (decimal key)
+    (string-concat " " (string-concat (decimal msg)
+      (string-concat " " (string-concat (decimal mlen)
+        (string-concat " " (decimal sig))))))))
+
+(defn verify-call [req :string] :string (identity/verify req))
+
+;; Ed25519: key (32 bytes at kp), message [mp, mp+ml), signature (64 at sp),
+;; all positions in the region at base
+(defn sig-ok [base :i64 kp :i64 mp :i64 ml :i64 sp :i64] :i64
+  (if (string=? (verify-call (verify-request (+ base kp) (+ base mp) ml (+ base sp))) "1") 1 0))
+
+;; ── keywords, resources, scopes ──────────────────────────────────────────────
+
+;; index of the first byte b in [o, o+l) or -1
+(defn find-byte [m [:slice :u8] o :i64 l :i64 b :i64 i :i64] :i64
+  (cond (= i l) -1 (= (at m (+ o i)) b) i :else (find-byte m o l b (+ i 1))))
+(defn count-byte [m [:slice :u8] o :i64 l :i64 b :i64 i :i64 acc :i64] :i64
+  (if (= i l) acc (count-byte m o l b (+ i 1) (if (= (at m (+ o i)) b) (+ acc 1) acc))))
+
+;; a segment: non-empty, no "/", not exactly "*"
+(defn segment-ok [m [:slice :u8] o :i64 l :i64] :i64
+  (if (and (> l 0) (= -1 (find-byte m o l 47 0)) (not (and (= l 1) (= (at m o) 42)))) 1 0))
+
+;; a kind: the keyword text "ns/name", both valid segments
+(defn kind-ok [m [:slice :u8] o :i64 l :i64] :i64
+  (let [s (find-byte m o l 47 0)]
+    (if (and (> s 0) (= 1 (count-byte m o l 47 0 0))
+             (= 1 (segment-ok m o s)) (= 1 (segment-ok m (+ o (+ s 1)) (- l (+ s 1)))))
+      1 0)))
+
+;; index of "://" in [o, o+l), or -1
+(defn find-sep [m [:slice :u8] o :i64 l :i64 i :i64] :i64
+  (cond (> (+ i 3) l) -1
+        (and (= (at m (+ o i)) 58) (= (at m (+ o (+ i 1))) 47) (= (at m (+ o (+ i 2))) 47)) i
+        :else (find-sep m o l (+ i 1))))
+
+;; path segments from p to e: each a segment, except "*" as the LAST one
+(defn path-ok [m [:slice :u8] p :i64 e :i64] :i64
+  (let [n (find-byte m p (- e p) 47 0)
+        se (if (< n 0) e (+ p n))
+        star (and (= (- se p) 1) (= (at m p) 42))]
+    (cond (< n 0) (if (or star (= 1 (segment-ok m p (- se p)))) 1 0)
+          (= 1 (segment-ok m p (- se p))) (path-ok m (+ se 1) e)
+          :else 0)))
+
+;; authority.scope/parse + valid? on the resource string [o, o+l)
+(defn resource-ok [m [:slice :u8] o :i64 l :i64] :i64
+  (let [i (find-sep m o l 0)]
+    (if (<= i 0)
+      0
+      (let [p (+ o (+ i 3)) e (+ o l)]
+        (if (and (< p e) (= 1 (segment-ok m o i))
+                 (not (= (at m p) 47)) (not (= (at m (- e 1)) 47)))
+          (path-ok m p e)
+          0)))))
+
+;; covers? of parent path [pp, pe) over child path [cp, ce), segment by
+;; segment; a trailing "*" covers any STRICTLY longer child
+(defn seg-end [m [:slice :u8] p :i64 e :i64] :i64
+  (let [n (find-byte m p (- e p) 47 0)] (if (< n 0) e (+ p n))))
+(defn path-covers [m [:slice :u8] pp :i64 pe :i64 cp :i64 ce :i64] :i64
+  (if (>= pp pe)
+    (if (>= cp ce) 1 0)
+    (let [ps (seg-end m pp pe)]
+      (if (and (= (- ps pp) 1) (= (at m pp) 42))
+        (if (< cp ce) 1 0)
+        (if (>= cp ce)
+          0
+          (let [cs (seg-end m cp ce)]
+            (if (= 1 (range-eq m pp (- ps pp) cp (- cs cp)))
+              (path-covers m (if (< ps pe) (+ ps 1) pe) pe (if (< cs ce) (+ cs 1) ce) ce)
+              0)))))))
+
+;; resource [ro, ro+rl) covers request resource [qo, qo+ql): same scheme, path covers
+(defn resource-covers [m [:slice :u8] ro :i64 rl :i64 qo :i64 ql :i64] :i64
+  (let [ri (find-sep m ro rl 0) qi (find-sep m qo ql 0)]
+    (if (= 1 (range-eq m ro ri qo qi))
+      (path-covers m (+ ro (+ ri 3)) (+ ro rl) (+ qo (+ qi 3)) (+ qo ql))
+      0)))
+
+;; ── one block ────────────────────────────────────────────────────────────────
+
+;; every cap in the set payload [q, n): a vector [qualified-kind string] with
+;; a valid kind and resource. 1 all ok, 2 a cap not [kw str] (shape), 3 a
+;; cap whose scope is invalid
+(defn caps-ok [m [:slice :u8] q :i64 n :i64 worst :i64] :i64
+  (if (= n 0)
+    worst
+    (let [kp (arr-first m q) rp (skip m kp 0)
+          shape (and (= 16 (code m q)) (= 2 (arr-n m q)) (= 5 (code m kp)) (= 4 (code m rp))
+                     (> (find-byte m (str-off m kp) (str-len m kp) 47 0) 0))
+          scope (and shape (= 1 (kind-ok m (str-off m kp) (str-len m kp)))
+                     (= 1 (resource-ok m (str-off m rp) (str-len m rp))))]
+      (caps-ok m (skip m q 0) (- n 1)
+               (cond (not shape) 2 (and (not scope) (< worst 2)) 3 :else worst)))))
+
+;; shape of the block form at b (oracle: dango.shape/findings). 0 ok, 10 malformed
+(defn block-shape [m [:slice :u8] b :i64] :i64
+  (if (not (and (= 19 (code m b)) (= 4 (arr-n m b)) (= 1 (block-keys-ok m (arr-first m b) 4))))
+    10
+    (let [pv (field m b "prev") g (field m b "grant")
+          cv (field m b "caveats") nk (field m b "next-key")
+          caps (field m g "caps") holder (field m g "holder") before (field m g "before")]
+      (cond
+        (not (or (= 0 (code m pv)) (= 8 (code m pv)))) 10
+        (not (= 19 (code m g))) 10
+        (not (and (= 18 (code m caps)) (> (arr-n m caps) 0))) 10
+        (= 2 (caps-ok m (arr-first m caps) (arr-n m caps) 1)) 10
+        (not (or (< holder 0) (= 0 (code m holder)) (= 4 (code m holder)))) 10
+        (and (>= before 0) (not (and (= 2 (code m before)) (= 0 (major m (payload before)))
+                                     (<= (harg m (payload before)) max-epoch)))) 10
+        (not (= 16 (code m cv))) 10
+        (not (and (= 7 (code m nk)) (= 32 (str-len m nk)))) 10
+        :else 0))))
+
+;; every caveat in [q, n) passes caveat-check: 0 ok, 11 malformed, 14 too large
+(defn caveats-check [base :i64 len :i64 m [:slice :u8] q :i64 n :i64] :i64
+  (if (= n 0)
+    0
+    (let [c (cw/caveat-check base len q)]
+      (cond (= c -1) 11 (= c -2) 14 :else (caveats-check base len m (skip m q 0) (- n 1))))))
+
+;; the :prev of block b links the block bytes [po, po+pl): 1 or 0
+(defn link-ok [base :i64 len :i64 m [:slice :u8] pv :i64 po :i64 pl :i64] :i64
+  ;; value.v1 link: 82 08 d8 2a 58 25 00 01 71 12 20 <32-byte digest>
+  (if (and (= 8 (code m pv)) (= (at m (+ pv 2)) 216) (= (at m (+ pv 3)) 42)
+           (= (at m (+ pv 4)) 88) (= (at m (+ pv 5)) 37) (= (at m (+ pv 6)) 0)
+           (= (at m (+ pv 7)) 1) (= (at m (+ pv 8)) 113) (= (at m (+ pv 9)) 18) (= (at m (+ pv 10)) 32))
+    (sha/digest-eq-region base len po pl (+ pv 11))
+    0))
+
+;; some root key verifies the signature (64 at sp) over [bo, bo+bl)
+(defn root-signed [base :i64 m [:slice :u8] q :i64 n :i64 bo :i64 bl :i64 sp :i64] :i64
+  (cond (= n 0) 0
+        (and (= 7 (code m q)) (= 32 (str-len m q))
+             (= 1 (sig-ok base (str-off m q) bo bl sp))) 1
+        :else (root-signed base m (skip m q 0) (- n 1) bo bl sp)))
+
+;; some revoked CID names the block bytes [bo, bo+bl)
+(defn revoked [base :i64 len :i64 m [:slice :u8] q :i64 n :i64 bo :i64 bl :i64] :i64
+  (cond (= n 0) 0
+        (let [o (str-off m q)]
+          (and (= 7 (code m q)) (= 36 (str-len m q))
+               (= (at m o) 1) (= (at m (+ o 1)) 113) (= (at m (+ o 2)) 18) (= (at m (+ o 3)) 32)
+               (= 1 (sha/digest-eq-region base len bo bl (+ o 4))))) 1
+        :else (revoked base len m (skip m q 0) (- n 1) bo bl)))
+
+;; ── the chain ────────────────────────────────────────────────────────────────
+
+;; walk blocks from env position q, i of n. pbo/pbl: previous block bytes;
+;; pnk: previous next-key form; hold: holder string form or -1.
+;; Returns 0 when every block passed, else the reason code.
+(defn walk [base :i64 len :i64 m [:slice :u8] q :i64 i :i64 n :i64
+            pbo :i64 pbl :i64 pnk :i64 hold :i64 roots :i64 rev :i64] :i64
+  (if (= i n)
+    0
+    (let [bf (field m q "bytes")
+          sg (field m q "sig")
+          bo (str-off m bf) bl (str-len m bf)]
+      (cond
+        (not (and (= 19 (code m q)) (= 7 (code m bf)))) 10
+        (not (= (skip m bo 0) (+ bo bl))) 10
+        :else
+        (let [shape (block-shape m bo)]
+          (if (> shape 0)
+            shape
+            (let [cv (field m bo "caveats")
+                  cav (caveats-check base len m (arr-first m cv) (arr-n m cv))]
+              (if (> cav 0)
+                cav
+                (let [g (field m bo "grant")
+                      caps (field m g "caps")]
+                  (if (= 3 (caps-ok m (arr-first m caps) (arr-n m caps) 1))
+                    10
+                    (let [pv (field m bo "prev")
+                          h (field m g "holder")
+                          hs (if (and (>= h 0) (= 4 (code m h))) h -1)]
+                      (cond
+                        (if (= i 0) (not (= 0 (code m pv))) (not (= 1 (link-ok base len m pv pbo pbl)))) 17
+                        (not (and (= 7 (code m sg)) (= 64 (str-len m sg))
+                                  (if (= i 0)
+                                    (= 1 (root-signed base m (arr-first m roots) (arr-n m roots) bo bl (str-off m sg)))
+                                    (= 1 (sig-ok base (str-off m pnk) bo bl (str-off m sg))))))
+                        18
+                        (and (>= hold 0) (>= hs 0)
+                             (= 0 (range-eq m (str-off m hold) (str-len m hold) (str-off m hs) (str-len m hs))))
+                        20
+                        (= 1 (revoked base len m (arr-first m rev) (arr-n m rev) bo bl)) 21
+                        :else (walk base len m (skip m q 0) (+ i 1) n bo bl (field m bo "next-key")
+                                    (if (>= hold 0) hold hs) roots rev)))))))))))))
+
+;; the block env at k: its bytes' form position
+(defn block-at [m [:slice :u8] blocks :i64 k :i64] :i64
+  (field m (nth-elem m (arr-first m blocks) k) "bytes"))
+
+;; every block's :before (if any) is after now: 1 live, 0 expired
+(defn live [m [:slice :u8] blocks :i64 k :i64 n :i64 now :i64] :i64
+  (if (= k n)
+    1
+    (let [bf (block-at m blocks k)
+          before (field m (field m (str-off m bf) "grant") "before")]
+      (if (and (>= before 0) (<= (harg m (payload before)) now))
+        0
+        (live m blocks (+ k 1) n now)))))
+
+;; the holder the chain ends with (first non-nil holder), as a form, or -1
+(defn chain-holder [m [:slice :u8] blocks :i64 k :i64 n :i64] :i64
+  (if (= k n)
+    -1
+    (let [h (field m (field m (str-off m (block-at m blocks k)) "grant") "holder")]
+      (if (and (>= h 0) (= 4 (code m h))) h (chain-holder m blocks (+ k 1) n)))))
+
+;; some cap in the set payload [q, n) covers kind [ko, kl) + resource [ro, rl)
+(defn some-cap-covers [m [:slice :u8] q :i64 n :i64 ko :i64 kl :i64 ro :i64 rl :i64] :i64
+  (if (= n 0)
+    0
+    (let [kp (arr-first m q) rp (skip m kp 0)]
+      (if (and (= 1 (range-eq m (str-off m kp) (str-len m kp) ko kl))
+               (= 1 (resource-covers m (str-off m rp) (str-len m rp) ro rl)))
+        1
+        (some-cap-covers m (skip m q 0) (- n 1) ko kl ro rl)))))
+
+;; every block has a covering cap: 1 covered, 0 not
+(defn covered [m [:slice :u8] blocks :i64 k :i64 n :i64 ko :i64 kl :i64 ro :i64 rl :i64] :i64
+  (if (= k n)
+    1
+    (let [caps (field m (field m (str-off m (block-at m blocks k)) "grant") "caps")]
+      (if (= 1 (some-cap-covers m (arr-first m caps) (arr-n m caps) ko kl ro rl))
+        (covered m blocks (+ k 1) n ko kl ro rl)
+        0))))
+
+;; every caveat of every block holds: 1, or 0 at the first that does not
+(defn caveats-hold-from [base :i64 len :i64 m [:slice :u8] q :i64 n :i64 r :i64] :i64
+  (cond (= n 0) 1
+        (= 0 (cw/caveat-holds base len q r)) 0
+        :else (caveats-hold-from base len m (skip m q 0) (- n 1) r)))
+(defn caveats-hold [base :i64 len :i64 m [:slice :u8] blocks :i64 k :i64 n :i64 r :i64] :i64
+  (if (= k n)
+    1
+    (let [cv (field m (str-off m (block-at m blocks k)) "caveats")]
+      (if (= 1 (caveats-hold-from base len m (arr-first m cv) (arr-n m cv) r))
+        (caveats-hold base len m blocks (+ k 1) n r)
+        0))))
+
+(defn verify-presentation [base :i64 len :i64] :i64
+  (let [m (slice-of-u8 base len)]
+    (if (not (and (= 16 (code m 0)) (= 4 (arr-n m 0)) (= len (skip m 0 0))))
+      30
+      (let [pres (arr-first m 0)
+            roots (skip m pres 0)
+            rev (skip m roots 0)
+            req (skip m rev 0)
+            blocks (field m pres "blocks")
+            n (arr-n m blocks)]
+        (cond
+          (not (and (= 16 (code m roots)) (= 16 (code m rev)) (= 19 (code m req)))) 30
+          (or (not (= 16 (code m blocks))) (< n 1)) 15
+          (> n max-blocks) 16
+          :else
+          (let [w (walk base len m (arr-first m blocks) 0 n -1 0 -1 -1 roots rev)]
+            (if (> w 0)
+              w
+              (let [last (block-at m blocks (- n 1))
+                    lo (str-off m last) ll (str-len m last)
+                    seal (field m pres "seal")
+                    nk (field m lo "next-key")]
+                (if (not (and (= 7 (code m seal)) (= 64 (str-len m seal))
+                              (= 1 (sig-ok base (str-off m nk) lo ll (str-off m seal)))))
+                  19
+                  (let [kf (field m req "req/kind") rf (field m req "req/resource")
+                        nf (field m req "req/now") hf (field m req "req/holder")
+                        ko (str-off m kf) kl (str-len m kf) ro (str-off m rf) rl (str-len m rf)]
+                    (cond
+                      (not (and (= 5 (code m kf)) (= 1 (kind-ok m ko kl))
+                                (= 4 (code m rf)) (= 1 (resource-ok m ro rl)))) 22
+                      (not (and (= 2 (code m nf)) (= 0 (major m (payload nf)))
+                                (<= (harg m (payload nf)) max-epoch))) 22
+                      (= 0 (live m blocks 0 n (harg m (payload nf)))) 24
+                      (let [ch (chain-holder m blocks 0 n)]
+                        (and (>= ch 0)
+                             (not (and (= 4 (code m hf))
+                                       (= 1 (range-eq m (str-off m ch) (str-len m ch)
+                                                      (str-off m hf) (str-len m hf)))))))
+                      25
+                      (= 0 (covered m blocks 0 n ko kl ro rl)) 23
+                      (= 0 (caveats-hold base len m blocks 0 n req)) 26
+                      :else 1)))))))))))

@@ -1,0 +1,192 @@
+(ns storj.node.host.rpc-test
+  "The wiring between a socket and a call.
+
+  Everything `storj.node.host.rpc` does that is worth testing involves a
+  socket, so these use a real one on loopback rather than a fake: the JVM and
+  Node socket APIs differ enough that a fake would be two fakes, and two fakes
+  agreeing with each other prove nothing about either runtime.
+
+  The happy path is also covered end-to-end in CI against a Go peer running
+  `tlsopts` and `drpcserver`. What is here is the rest — the peer that sends
+  an error, the peer that hangs up, the peer that answers on the wrong
+  stream — which a healthy server never produces and which a client meets
+  anyway."
+  (:require [kotoba.test :refer [deftest is] :as t]
+            [drpc.client :as drpc]
+            [drpc.wire :as w]
+            [storj.node.bytes :as b]
+            [storj.node.host.rpc :as rpc]
+            #?(:cljs ["node:net" :as net]))
+  #?(:clj (:import (java.net InetAddress ServerSocket Socket))))
+
+(def ^:private rpc-name "/echo.Echo/Echo")
+
+(defn- message-packet [stream data]
+  (w/encode-packet {:kind :message :stream stream :message 1 :data data}))
+
+(defn- error-packet [stream code text]
+  (w/encode-packet {:kind :error :stream stream :message 1
+                    :data (into (conj (vec (repeat 7 0)) code) (drpc/ascii-bytes text))}))
+
+;; ── a peer that says exactly what the test wants ────────────────────────────
+;;
+;; `reply` is the bytes to send once the request has arrived; nil means hang up
+;; without saying anything.
+
+#?(:clj
+   (defn- with-peer
+     "Run `f` with a socket connected to a peer that answers with `reply`.
+
+      `reply` of nil means hang up without saying anything; `:silent` means
+      hold the connection open and say nothing, which is the only way to reach
+      the timeout."
+     [reply f]
+     (let [server (ServerSocket. 0 1 (InetAddress/getByName "127.0.0.1"))
+           done   (promise)]
+       (future
+         (try
+           (with-open [s (.accept server)]
+             ;; read enough to know the request arrived, then answer
+             (.read (.getInputStream s) (byte-array 4096))
+             (when (and reply (not= :silent reply))
+               (doto (.getOutputStream s)
+                 (.write (b/->native reply))
+                 (.flush)))
+             ;; hold the connection open long enough for the client to read,
+             ;; or long enough to time out
+             (when reply (Thread/sleep (if (= :silent reply) 3000 200))))
+           (finally (deliver done true))))
+       (try
+         (with-open [sock (Socket. "127.0.0.1" (.getLocalPort server))]
+           (f sock))
+         (finally (.close server))))))
+
+#?(:cljs
+   (defn- with-peer [reply f]
+     (js/Promise.
+      (fn [resolve reject]
+        (let [server (.createServer
+                      net (fn [s]
+                            (.once s "data"
+                                   (fn [_]
+                                     (cond
+                                       (= :silent reply) nil
+                                       reply             (.write s (b/->native reply))
+                                       :else             (.end s))))))]
+          (.listen server 0 "127.0.0.1"
+                   (fn []
+                     (let [port (.-port (.address server))
+                           sock (.connect net #js {:host "127.0.0.1" :port port})]
+                       (.on sock "connect"
+                            (fn []
+                              (-> (f sock)
+                                  (.then (fn [r]
+                                           (.destroy sock) (.close server) (resolve r)))
+                                  (.catch (fn [e]
+                                            (.destroy sock) (.close server) (reject e))))))))))))))
+
+;; ── the tests ───────────────────────────────────────────────────────────────
+
+(defn- check-answer [result]
+  (is (rpc/ok? result))
+  (is (= (drpc/ascii-bytes "pong") (:message result)))
+  (is (nil? (:error result))))
+
+(deftest an-answer-comes-back
+  #?(:clj  (check-answer (with-peer (message-packet 1 (drpc/ascii-bytes "pong"))
+                                    #(rpc/call % {:rpc rpc-name :request [1 2 3]})))
+     :cljs (t/async done
+                   (-> (with-peer (message-packet 1 (drpc/ascii-bytes "pong"))
+                                  #(rpc/call % {:rpc rpc-name :request [1 2 3]}))
+                       (.then (fn [r] (check-answer r) (done)))
+                       (.catch (fn [e] (is false (str e)) (done)))))))
+
+(defn- check-error [result]
+  (is (not (rpc/ok? result)))
+  (is (nil? (:message result)))
+  (is (= 17 (get-in result [:error :code])))
+  (is (= "no such rpc" (get-in result [:error :message]))))
+
+(deftest an-error-is-reported-with-its-code
+  ;; the case a client that only ever talks to a healthy server never writes
+  #?(:clj  (check-error (with-peer (error-packet 1 17 "no such rpc")
+                                   #(rpc/call % {:rpc rpc-name :request []})))
+     :cljs (t/async done
+                   (-> (with-peer (error-packet 1 17 "no such rpc")
+                                  #(rpc/call % {:rpc rpc-name :request []}))
+                       (.then (fn [r] (check-error r) (done)))
+                       (.catch (fn [e] (is false (str e)) (done)))))))
+
+(defn- check-hangup [result]
+  (is (not (rpc/ok? result)))
+  (is (nil? (:message result)))
+  (is (nil? (:error result)))
+  (is (not (:closed? result))
+      "the peer never sent a Close packet — it simply stopped, which is not
+       the same thing and is not reported as one"))
+
+(deftest a-peer-that-hangs-up-is-not-an-answer
+  #?(:clj  (check-hangup (with-peer nil #(rpc/call % {:rpc rpc-name :request []})))
+     :cljs (t/async done
+                   (-> (with-peer nil #(rpc/call % {:rpc rpc-name :request []}))
+                       (.then (fn [r] (check-hangup r) (done)))
+                       (.catch (fn [e] (is false (str e)) (done)))))))
+
+(defn- check-foreign [result]
+  (is (rpc/ok? result))
+  (is (= (drpc/ascii-bytes "mine") (:message result)))
+  (is (= 1 (count (:ignored result))))
+  (is (= 1 (:stream (first (:ignored result))))))
+
+(deftest an-answer-on-another-stream-is-not-this-call-s
+  ;; DRPC multiplexes; taking the first message that arrives regardless of
+  ;; stream is how one call quietly answers with another call's response.
+  ;;
+  ;; The call is on stream 2 and the foreign packet on stream 1, in that order,
+  ;; because the reader enforces id monotonicity — the first version of this
+  ;; test had the foreign packet on the *higher* stream and the reader refused
+  ;; the reply outright. Which is the protocol working: a peer cannot send a
+  ;; packet for a stream it has already moved past.
+  (let [reply (into (message-packet 1 (drpc/ascii-bytes "someone else"))
+                    (message-packet 2 (drpc/ascii-bytes "mine")))
+        call  #(rpc/call % {:rpc rpc-name :request [] :stream 2})]
+    #?(:clj  (check-foreign (with-peer reply call))
+       :cljs (t/async done
+                     (-> (with-peer reply call)
+                         (.then (fn [r] (check-foreign r) (done)))
+                         (.catch (fn [e] (is false (str e)) (done))))))))
+
+(deftest a-silent-peer-times-out-rather-than-waiting-forever
+  ;; a peer that holds the socket open and says nothing. Without the timeout
+  ;; this blocks until whoever is waiting gives up, which for a node dialling
+  ;; a satellite means never checking in and never saying why.
+  #?(:clj
+     (is (thrown-with-msg?
+          Exception #"timed out"
+          (with-peer :silent
+                     (fn [sock] (rpc/call sock {:rpc rpc-name :request []
+                                                :timeout-ms 300})))))
+     :cljs
+     (t/async done
+             (-> (with-peer :silent
+                            (fn [sock] (rpc/call sock {:rpc rpc-name :request []
+                                                       :timeout-ms 300})))
+                 (.then (fn [_] (is false "should have timed out") (done)))
+                 (.catch (fn [e]
+                           (is (re-find #"timed out" (str (ex-message e) (.-message e))))
+                           (done)))))))
+
+(deftest the-socket-is-left-open
+  ;; a connection outlives a call; closing it here would make the common case —
+  ;; several calls to the same satellite — impossible to write
+  #?(:clj (with-peer (message-packet 1 [1])
+            (fn [sock]
+              (rpc/call sock {:rpc rpc-name :request []})
+              (is (not (.isClosed sock)))))
+     :cljs (t/async done
+                   (-> (with-peer (message-packet 1 [1])
+                                  (fn [sock]
+                                    (-> (rpc/call sock {:rpc rpc-name :request []})
+                                        (.then (fn [_] (is (false? (.-destroyed sock))) true)))))
+                       (.then (fn [_] (done)))
+                       (.catch (fn [e] (is false (str e)) (done)))))))

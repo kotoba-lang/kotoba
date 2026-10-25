@@ -1,0 +1,223 @@
+(ns grant.broker-test
+  (:require [kotoba.bytes :as kbytes] [grant.broker :as broker]
+            [grant.contract :as contract]
+            [grant.graph :as graph]
+            [grant.policy :as policy]
+            [grant.signing :as signing]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]])
+  #?(:clj (:import [java.security KeyPairGenerator Signature])))
+
+;; ───────── JVM test helpers: real Ed25519 keypairs (mirrors signing_test) ─────────
+
+#?(:clj
+   (defn- gen-keypair []
+     (.generateKeyPair (KeyPairGenerator/getInstance "Ed25519"))))
+
+#?(:clj
+   (defn- raw-public-key-hex [pub]
+     (signing/hex-encode (drop 12 (seq (.getEncoded pub))))))
+
+#?(:clj
+   (defn- sign-hex [priv ^String msg]
+     (let [s (doto (Signature/getInstance "Ed25519") (.initSign priv))]
+       (.update s (kbytes/utf8-bytes msg))
+       (signing/hex-encode (.sign s)))))
+
+(def empty-graph (graph/build []))
+
+(deftest verify-one-grants-an-unsigned-verified-component
+  (let [m {:aiueos/component :service/log :aiueos/kind :service :aiueos/trust :verified
+           :aiueos/imports #{:log/write} :aiueos/exports #{}}
+        decision (broker/verify-one m empty-graph policy/default-policy)]
+    (is (= :grant (:aiueos/decision decision)))
+    (is (contains? (:aiueos/capabilities decision) :log/write))
+    (is (= 1 (count (:aiueos.broker/audit-entries decision))))
+    (is (= :grant (:aiueos/event (first (:aiueos.broker/audit-entries decision)))))
+    (is (true? (:valid? (contract/validate-audit-event (first (:aiueos.broker/audit-entries decision))))))))
+
+(deftest verify-one-denies-and-audits-every-violation
+  (let [m {:aiueos/component :app/notes :aiueos/kind :app :aiueos/trust :ai-generated
+           :aiueos/effects #{:network :secrets}}
+        decision (broker/verify-one m empty-graph policy/default-policy)]
+    (is (= :deny (:aiueos/decision decision)))
+    (is (= 2 (count (:aiueos/violations decision))))
+    (is (= 2 (count (:aiueos.broker/audit-entries decision))))
+    (is (every? #(= :deny (:aiueos/event %)) (:aiueos.broker/audit-entries decision)))))
+
+(deftest verify-one-enforces-kagi-reference-policy
+  (let [m {:aiueos/component :service/log :aiueos/kind :service :aiueos/trust :verified
+           :aiueos/imports #{:log/write} :aiueos/exports #{}
+           :aiueos/kagi-requests [{:secret-ref "kagi://ops/log-key" :purpose :logging
+                                   :operation :sign}]}
+        denied (broker/verify-one m empty-graph policy/default-policy)
+        granted (broker/verify-one
+                 m empty-graph
+                 (assoc policy/default-policy :aiueos.policy/kagi-grants
+                        {:service/log #{[:kagi/sign :logging]}}))]
+    (is (= :deny (:aiueos/decision denied)))
+    (is (= [:kagi-secret-denied] (mapv :aiueos/kind (:aiueos/violations denied))))
+    (is (= :grant (:aiueos/decision granted)))
+    (is (= "kagi://ops/log-key"
+           (get-in granted [:aiueos.broker/kagi-decisions 0 :secret-ref])))))
+
+#?(:clj
+   (deftest verify-one-elevates-trust-on-valid-signature
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           policy* (policy/parse-policy {:aiueos/signers {:root pub-hex}})
+           unsigned-m {:aiueos/component :driver/blk :aiueos/wasm-sha256 "deadbeef"}
+           msg (signing/signed-message unsigned-m)
+           sig-hex (sign-hex (.getPrivate kp) msg)
+           m (assoc unsigned-m
+                    :aiueos/kind :driver :aiueos/signer :root :aiueos/signature sig-hex)
+           decision (broker/verify-one m empty-graph policy*)]
+       (is (= :grant (:aiueos/decision decision)))
+       (is (str/includes?
+            (:aiueos/detail (first (:aiueos.broker/audit-entries decision)))
+            "signer: root")))))
+
+#?(:clj
+   (deftest verify-one-denies-a-forged-signature
+     (let [kp (gen-keypair)
+           pub-hex (raw-public-key-hex (.getPublic kp))
+           policy* (policy/parse-policy {:aiueos/signers {:root pub-hex}})
+           m {:aiueos/component :driver/blk :aiueos/kind :driver
+              :aiueos/wasm-sha256 "deadbeef" :aiueos/signer :root
+              :aiueos/signature "00"}
+           decision (broker/verify-one m empty-graph policy*)]
+       (is (= :deny (:aiueos/decision decision)))
+       (is (= [:bad-signature] (mapv :aiueos/kind (:aiueos/violations decision)))))))
+
+#?(:clj
+   (deftest component-signers-binding-closes-the-any-registered-signer-can-claim-any-id-gap
+     (testing "ADR-0012: the ORIGINAL vulnerability, end to end -- a compromised/
+               malicious but VALIDLY REGISTERED signer (:attacker, not the intended
+               :owner) signs a manifest claiming a privileged id it isn't bound to.
+               The signature itself is genuinely valid (require-signed's own
+               authenticity check has nothing to complain about) -- but since the
+               component DECLARES an import (:fs/admin) that only resolves via the
+               id-specific grant this signer isn't authorized for, and nothing else
+               in this graph exports it, the component is denied outright
+               (:unresolved-capability) rather than silently running with less than
+               it declared needing. :owner, the signer this id IS explicitly bound
+               to, presenting the SAME manifest shape with their own valid
+               signature, is granted with :fs/admin resolved."
+       (let [owner-kp (gen-keypair)
+             attacker-kp (gen-keypair)
+             owner-pub-hex (raw-public-key-hex (.getPublic owner-kp))
+             attacker-pub-hex (raw-public-key-hex (.getPublic attacker-kp))
+             policy* (policy/parse-policy
+                      {:aiueos/grants {:driver/privileged #{:fs/admin}}
+                       :aiueos/signers {:owner owner-pub-hex :attacker attacker-pub-hex}
+                       :aiueos/component-signers {:driver/privileged #{:owner}}
+                       :aiueos/require-signed true})
+             unsigned-m {:aiueos/component :driver/privileged :aiueos/kind :driver
+                        :aiueos/wasm-sha256 "deadbeef" :aiueos/imports #{:fs/admin}}
+             msg (signing/signed-message unsigned-m)
+             attacker-sig (sign-hex (.getPrivate attacker-kp) msg)
+             attacker-m (assoc unsigned-m
+                               :aiueos/signer :attacker :aiueos/signature attacker-sig)
+             attacker-decision (broker/verify-one attacker-m empty-graph policy*)
+             owner-sig (sign-hex (.getPrivate owner-kp) msg)
+             owner-m (assoc unsigned-m
+                            :aiueos/signer :owner :aiueos/signature owner-sig)
+             owner-decision (broker/verify-one owner-m empty-graph policy*)]
+         (is (= :deny (:aiueos/decision attacker-decision))
+             "the elevated :fs/admin import this id carries must NOT resolve for a
+              registered-but-unauthorized-for-THIS-id signer, even though their
+              signature itself is genuinely valid")
+         (is (= [:unresolved-capability] (mapv :aiueos/kind (:aiueos/violations attacker-decision)))
+             "denied for the right reason -- an unresolvable import, not a bad
+              signature (require-signed's authenticity check passed)")
+         (is (= :grant (:aiueos/decision owner-decision)))
+         (is (contains? (:aiueos/capabilities owner-decision) :fs/admin)
+             "the signer this id IS bound to still gets the elevated grant --
+              the fix denies the unauthorized claimant, it doesn't deny everyone")))))
+
+(deftest verify-one-honors-require-signed
+  (let [policy* (policy/parse-policy {:aiueos/require-signed true})
+        m {:aiueos/component :app/plain :aiueos/kind :app :aiueos/trust :verified}
+        decision (broker/verify-one m empty-graph policy*)]
+    (is (= :deny (:aiueos/decision decision)))
+    (is (= [:bad-signature] (mapv :aiueos/kind (:aiueos/violations decision))))))
+
+(deftest verify-system-grants-when-every-component-passes
+  (let [fs-service {:aiueos/component :service/fs :aiueos/kind :service :aiueos/trust :verified
+                    :aiueos/exports #{:fs/read} :aiueos/imports #{}}
+        notes-app {:aiueos/component :app/notes :aiueos/kind :app :aiueos/trust :verified
+                   :aiueos/imports #{:fs/read} :aiueos/exports #{}}
+        result (broker/verify-system [fs-service notes-app] policy/default-policy)]
+    (is (= :grant (:aiueos/decision result)))
+    (is (= 2 (count (:aiueos/grants result))))
+    (is (= 2 (count (:aiueos.broker/audit-entries result))))))
+
+(deftest verify-system-denies-and-aggregates-across-components
+  (let [ok {:aiueos/component :service/log :aiueos/kind :service :aiueos/trust :verified
+            :aiueos/exports #{:log/write} :aiueos/imports #{}}
+        bad {:aiueos/component :app/notes :aiueos/kind :app :aiueos/trust :verified
+             :aiueos/imports #{:net/fetch} :aiueos/exports #{}}
+        result (broker/verify-system [ok bad] policy/default-policy)]
+    (is (= :deny (:aiueos/decision result)))
+    (is (= [:unresolved-capability] (mapv :aiueos/kind (:aiueos/violations result))))
+    ;; the OK component's grant is not returned, but its audit entry is still recorded
+    (is (= 2 (count (:aiueos.broker/audit-entries result))))
+    (is (some #(= :grant (:aiueos/event %)) (:aiueos.broker/audit-entries result)))
+    (is (some #(= :deny (:aiueos/event %)) (:aiueos.broker/audit-entries result)))))
+
+(deftest verify-admission-floors-trust-to-ai-generated
+  (let [m {:aiueos/component :agent/researcher :aiueos/kind :agent :aiueos/trust :trusted
+           :aiueos/effects #{:network}}
+        decision (broker/verify-admission m empty-graph policy/default-policy)]
+    ;; even though the submitted manifest claimed :trusted, the ai-generated
+    ;; lockdown still applies -- an agent can never grant itself trust.
+    (is (= :deny (:aiueos/decision decision)))
+    (is (= [:forbidden-effect] (mapv :aiueos/kind (:aiueos/violations decision))))))
+
+(deftest verify-admission-can-still-grant-a-clean-component
+  (let [m {:aiueos/component :agent/clean :aiueos/kind :agent
+           :aiueos/imports #{:log/write}}
+        decision (broker/verify-admission m empty-graph policy/default-policy)]
+    (is (= :grant (:aiueos/decision decision)))))
+
+;; JVM-only below: `contract/load-component-boundary` reads
+;; `resources/aiueos/component_boundary.edn` off the CLASSPATH, and aiueos has
+;; no portable resource seam (see `grant.cli/read-contract`'s docstring, which
+;; tells CLJS callers to parse the EDN themselves and pass the map in -- and
+;; nothing in this repository does that yet). Previously this `def` sat at the
+;; top level unguarded, so requiring this namespace on ClojureScript died
+;; during analysis and took ALL fifteen tests here with it, including the ten
+;; that need no resource at all.
+#?(:clj (def sample-boundary (contract/load-component-boundary)))
+
+#?(:clj
+   (deftest run-plan-shapes-a-valid-plan-on-grant
+     (let [m {:aiueos/component :service/log :aiueos/kind :service :aiueos/trust :verified
+              :aiueos/imports #{:log/write} :aiueos/exports #{} :aiueos/entry "main"}
+           plan (broker/run-plan m empty-graph policy/default-policy sample-boundary)]
+       (is (true? (:valid? (contract/validate-run-plan plan))))
+       (is (= :grant (:aiueos/decision (:aiueos/decision plan))))
+       (is (some? (:aiueos/grant plan)))
+       (is (contains? (:aiueos/capabilities (:aiueos/grant plan)) :log/write)))))
+
+#?(:clj
+   (deftest run-plan-omits-grant-on-deny
+     (let [m {:aiueos/component :app/notes :aiueos/kind :app :aiueos/trust :verified
+              :aiueos/imports #{:net/fetch}}
+           plan (broker/run-plan m empty-graph policy/default-policy sample-boundary)]
+       (is (true? (:valid? (contract/validate-run-plan plan))))
+       (is (= :deny (:aiueos/decision (:aiueos/decision plan))))
+       (is (not (contains? plan :aiueos/grant))))))
+
+(deftest run-receipt-shapes-a-valid-succeeded-receipt
+  (let [receipt (broker/run-receipt :service/log :succeeded
+                                     :result 42 :started-at 0 :finished-at 1
+                                     :audit-events [])]
+    (is (true? (:valid? (contract/validate-run-receipt receipt))))
+    (is (= 42 (:aiueos/result receipt)))))
+
+(deftest run-receipt-shapes-a-valid-failed-receipt
+  (let [receipt (broker/run-receipt :driver/blk :failed :error "trap: fuel exhausted")]
+    (is (true? (:valid? (contract/validate-run-receipt receipt))))
+    (is (= "trap: fuel exhausted" (:aiueos/error receipt)))
+    (is (not (contains? receipt :aiueos/result)))))
