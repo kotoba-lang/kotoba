@@ -223,6 +223,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.denwa` | `kotoba.denwa/src` | `denwa.bearer`, `denwa.call`, `denwa.media`, `denwa.pcmu` (Kotoba project library) |
 | `kotoba.nafuda` | `kotoba.nafuda/src` | `nafuda.core`, `nafuda.registry`, `nafuda.statement` (Kotoba project library) |
 | `kotoba.tsunagi` | `kotoba.tsunagi/src` | `tsunagi.announce`, `tsunagi.crypto`, `tsunagi.identity`, `tsunagi.link` (Kotoba project library) |
 | `kotoba.map` | `kotoba.map/src` | `kotoba.map`, `kotoba.map.color`, `kotoba.map.constants`, `kotoba.map.data` (Kotoba project library) |

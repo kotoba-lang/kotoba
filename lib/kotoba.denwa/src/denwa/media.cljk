@@ -1,0 +1,116 @@
+(ns denwa.media
+  "Voice frames and the jitter buffer.
+
+      frame = sequence (u16) ++ timestamp (u32, samples) ++ codec id (u8) ++ payload
+
+  Frames ride a tsunagi link with context :media; the link supplies
+  encryption, integrity and replay protection, so the frame header only has
+  to order and time the audio.
+
+  ## Jitter buffer
+
+  A mesh delivers packets late and out of order. The buffer holds frames by
+  sequence number and releases one per frame period, `target` frames behind
+  the newest arrival. A frame that has not arrived when its turn comes is
+  answered with `:conceal` (the decoder repeats or fades the last frame); a
+  frame arriving after its turn is dropped. The target follows the measured
+  interarrival jitter (RFC 3550 §6.4.1 estimator), clamped between a floor
+  and a ceiling, so a quiet Wi-Fi hop keeps latency low and a LoRa hop gets
+  the slack it needs."
+  (:require [tsunagi.wire :as w]))
+
+(defn encode-frame [{:keys [seq timestamp codec-id payload]}]
+  (w/cat-bytes (w/u16 (bit-and seq 0xffff)) (w/u32 timestamp) [codec-id] payload))
+
+(defn decode-frame [bs]
+  (let [c (w/cursor bs)]
+    (when-let [[seq c] (w/take-u16 c)]
+      (when-let [[ts c] (w/take-u32 c)]
+        (when-let [[cid c] (w/take-u8 c)]
+          {:seq seq :timestamp ts :codec-id cid :payload (first (w/take-rest c))})))))
+
+;; ---------------------------------------------------------------------------
+;; Sequence arithmetic (u16, wrapping)
+
+(defn seq-diff
+  "Signed distance from `b` to `a` on the wrapping 16-bit circle."
+  [a b]
+  (let [d (bit-and (- a b) 0xffff)]
+    (if (>= d 32768) (- d 65536) d)))
+
+;; ---------------------------------------------------------------------------
+;; Jitter buffer
+
+(defn jitter-buffer
+  [{:keys [frame-ms min-frames max-frames] :or {frame-ms 40 min-frames 1 max-frames 25}}]
+  {:frame-ms frame-ms :min-frames min-frames :max-frames max-frames
+   :target min-frames
+   :frames {}        ; seq → frame
+   :next nil         ; next seq to play
+   :jitter 0.0       ; ms, RFC 3550 estimator
+   :last-transit nil
+   :stats {:played 0 :concealed 0 :late 0 :duplicate 0}})
+
+(defn- abs* [x] (if (neg? x) (- x) x))
+
+(defn- update-jitter [jb frame arrival-ms]
+  (let [;; transit in ms; the media clock is 8 kHz
+        transit (- arrival-ms (/ (:timestamp frame) 8))
+        jb (if-let [lt (:last-transit jb)]
+             (let [d (abs* (- transit lt))]
+               (update jb :jitter #(+ % (/ (- d %) 16))))
+             jb)
+        target (-> (/ (* 3 (:jitter jb)) (:frame-ms jb))
+                   (+ (:min-frames jb))
+                   int
+                   (max (:min-frames jb))
+                   (min (:max-frames jb)))]
+    (assoc jb :last-transit transit :target target)))
+
+(defn push
+  "Add an arrived frame."
+  [jb frame arrival-ms]
+  (let [s (:seq frame)]
+    (cond
+      (and (:next jb) (neg? (seq-diff s (:next jb))))
+      (update-in jb [:stats :late] inc)
+
+      (contains? (:frames jb) s)
+      (update-in jb [:stats :duplicate] inc)
+
+      :else
+      (-> jb
+          (update-jitter frame arrival-ms)
+          (assoc-in [:frames s] frame)
+          (update :next #(or % s))))))
+
+(defn depth [jb]
+  (if-let [n (:next jb)]
+    (let [newest (reduce (fn [m s] (if (pos? (seq-diff s m)) s m)) n (keys (:frames jb)))]
+      (inc (seq-diff newest n)))
+    0))
+
+(defn pop-frame
+  "Called once per frame period. Answers `[jb out]` where `out` is a frame,
+  `:conceal` for a missing one, or nil while buffering."
+  [jb]
+  (let [n (:next jb)]
+    (cond
+      (nil? n) [jb nil]
+      (and (not (:playing? jb)) (< (depth jb) (inc (:target jb)))) [jb nil]
+      ;; After a long outage, skip ahead to the oldest frame we hold rather
+      ;; than concealing a gap longer than the buffer itself.
+      (and (nil? (get (:frames jb) n)) (seq (:frames jb))
+           (> (reduce min (map #(seq-diff % n) (keys (:frames jb)))) (:max-frames jb)))
+      (recur (assoc jb :next (reduce (fn [m s] (if (neg? (seq-diff s m)) s m))
+                                     (keys (:frames jb)))))
+
+      :else
+      (let [f (get (:frames jb) n)
+            jb (-> jb
+                   (assoc :playing? true)
+                   (update :frames dissoc n)
+                   (assoc :next (bit-and (inc n) 0xffff)))]
+        (if f
+          [(update-in jb [:stats :played] inc) f]
+          [(update-in jb [:stats :concealed] inc) :conceal])))))

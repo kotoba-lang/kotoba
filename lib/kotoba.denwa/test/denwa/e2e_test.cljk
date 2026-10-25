@@ -1,0 +1,190 @@
+(ns denwa.e2e-test
+  "A whole call across an in-memory mesh, every layer real:
+
+      alice-phone ─── relay ─── bob-phone
+                        │
+                     bob-home
+
+  1. Everyone announces; paths form.
+  2. Alice opens a link to Bob's home node and sends her invite (split into
+     tsunagi resource parts — it carries her device certificate).
+  3. The home node checks the certificate, runs monban (Alice is a contact),
+     and pages Bob's phone with a ring through the relay.
+  4. Bob's phone verifies the ring, acks the home node, and dials Alice's
+     callback destination; the call comes up after Alice verifies Bob's device.
+  5. Alice speaks: LPC-2400 frames reach Bob's jitter buffer and decode."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [denwa.call :as call]
+            [kowane.lpc :as lpc]
+            [yobidashi.home :as home]
+            [yobidashi.invite :as inv]
+            [yobidashi.ring :as ring]
+            [nafuda.core :as n]
+            [tsunagi.transport :as t]
+            [tsunagi.identity :as id]
+            [tsunagi.link :as link]
+            [tsunagi.resource :as res]
+            [tsunagi.wire :as w]))
+
+(defn- seed [k] (vec (map #(bit-and (+ k (* 23 %)) 0xff) (range 32))))
+
+(def alice-root (id/from-seed (seed 1)))
+(def alice-phone (id/from-seed (seed 2)))
+(def bob-root (id/from-seed (seed 3)))
+(def bob-phone (id/from-seed (seed 4)))
+(def bob-home (id/from-seed (seed 5)))
+(def relay (id/from-seed (seed 6)))
+(def hx n/hex-of)
+(defn- pub [i] (id/public-only (:public i)))
+
+(def alice-cert (n/device-cert alice-root alice-phone {:roles #{:call} :serial 1}))
+(def bob-statements
+  [(n/device-cert bob-root bob-phone {:roles #{:call :page} :serial 1})
+   (n/device-cert bob-root bob-home {:roles #{:home} :serial 2})])
+
+;; --- the radio: who hears whom ------------------------------------------------
+
+(def wires
+  {[:alice :r] [[:relay :x]]
+   [:bob :r] [[:relay :x]]
+   [:home :r] [[:relay :x]]
+   [:relay :x] [[:alice :r] [:bob :r] [:home :r]]})
+
+(defn- world []
+  {:nodes {:alice (t/node {:identity alice-phone :interfaces #{:r}})
+           :bob (t/node {:identity bob-phone :interfaces #{:r}})
+           :home (t/node {:identity bob-home :interfaces #{:r}})
+           :relay (t/node {:identity relay :transport? true :interfaces #{:x}})}
+   :queue [] :inbox {}})
+
+(defn- deliver-effects [w from effects]
+  (reduce (fn [w e]
+            (case (:effect e)
+              :send (update w :queue into (for [[to i] (get wires [from (:interface e)])] [to i (:bytes e)]))
+              :deliver (update-in w [:inbox from] (fnil conj []) (:packet e))
+              w))
+          w effects))
+
+(defn- settle [w]
+  (loop [w w n 0]
+    (if (or (empty? (:queue w)) (> n 2000))
+      w
+      (let [[[to i bs] & more] (:queue w)
+            {:keys [node effects]} (t/inbound (get-in w [:nodes to]) i bs 100)]
+        (recur (deliver-effects (assoc (assoc-in w [:nodes to] node) :queue (vec more)) to effects)
+               (inc n))))))
+
+(defn- send! [w who f]
+  (let [{:keys [node effects]} (f (get-in w [:nodes who]))]
+    (settle (deliver-effects (assoc-in w [:nodes who] node) who effects))))
+
+(defn- take-inbox [w who]
+  [(assoc-in w [:inbox who] []) (get-in w [:inbox who] [])])
+
+(defn- emit [w who pkts] (reduce (fn [w p] (send! w who #(t/outbound % p 100))) w pkts))
+
+;; --- the scenario ---------------------------------------------------------------
+
+(deftest whole-call
+  (let [callback (id/destination-hash alice-phone call/callback-app)
+        home-dest (id/destination-hash bob-home "yobidashi.invite")
+        page-dest (id/destination-hash bob-phone ring/page-app)
+        ack-dest (id/destination-hash bob-home ring/home-app)
+        ;; 1. announces
+        w (-> (world)
+              (send! :alice #(t/announce % alice-phone call/callback-app {:random [1 1 1 1 1]} 100))
+              (send! :bob #(t/announce % bob-phone ring/page-app {:random [2 2 2 2 2]} 100))
+              (send! :home #(t/announce % bob-home "yobidashi.invite" {:random [3 3 3 3 3]} 100))
+              (send! :home #(t/announce % bob-home ring/home-app {:random [4 4 4 4 4]} 100)))
+        _ (is (= 2 (:hops (t/path (get-in w [:nodes :alice]) home-dest))))
+        ;; home enrolls Bob and learns his phone's location
+        [h _] (home/enroll (home/home bob-home) (hx bob-root) bob-statements
+                           {:contacts #{(hx alice-root)}} 0)
+        [h _] (home/update-location h (home/location bob-phone (hx bob-root)
+                                                     {:profile :wifi :bearers #{:mesh} :not-after 100000})
+                                    0)
+        ;; 2. Alice → home: link + invite as resource parts
+        [la req] (link/request (t/known-identity (get-in w [:nodes :alice]) home-dest) home-dest (seed 50))
+        w (update-in w [:nodes :alice] t/track-link (:link-id la))
+        w (emit w :alice [req])
+        [w [req-at-home]] (take-inbox w :home)
+        [lh proof] (link/accept bob-home req-at-home (seed 51))
+        w (update-in w [:nodes :home] t/track-link (:link-id lh))
+        w (emit w :home [proof])
+        [w [proof-at-alice]] (take-inbox w :alice)
+        la (link/complete la proof-at-alice)
+        _ (is (= :active (:status la)))
+        bundle (inv/invite alice-phone {:call-id [9 8 7 6 5 4 3 2] :callee (hx bob-root)
+                                        :caller (hx alice-root) :callback callback
+                                        :bearers #{:mesh} :expires 1000 :attachments [alice-cert]})
+        parts (res/split (inv/encode bundle) 300)
+        [la sealed] (reduce (fn [[l acc] part] (let [[l p] (link/seal l :none part)] [l (conj acc p)]))
+                            [la []] parts)
+        w (emit w :alice sealed)
+        [w at-home] (take-inbox w :home)
+        [_ whole] (reduce (fn [[asm done] pkt]
+                            (let [[_ pt] (link/open lh pkt)
+                                  [asm r] (res/accept asm pt)]
+                              [asm (or done r)]))
+                          [(res/assembler) nil] at-home)
+        ;; 3. home decides and pages
+        {h :home effects :effects} (home/handle-invite h (inv/decode whole) 10000)
+        [reply page] effects]
+    (testing "the home node accepted the invite and paged Bob's phone"
+      (is (> (count parts) 1) "the invite needed more than one packet")
+      (is (= :paging (:status reply)))
+      (is (= page-dest (get-in page [:packet :destination]))))
+    (let [w (emit w :home [(:packet page)])
+          [w [ring-pkt]] (take-inbox w :bob)
+          rng (ring/open bob-phone (pub bob-home) ring-pkt 10)]
+      (testing "the ring crossed the relay and verifies on Bob's phone"
+        (is (= (:hash alice-root) (:caller-root-hash rng)))
+        (is (= callback (:callback rng))))
+      ;; 4. Bob answers: ack to home, link to Alice's callback
+      (let [w (emit w :bob [(ring/ack bob-phone (pub bob-home) (:call-id rng) :accepted)])
+            [w [ack-pkt]] (take-inbox w :home)
+            {reply2 :effects} (home/handle-ack h ack-pkt 11000)
+            _ (is (= :answered (:status (first reply2))))
+            caller-call (call/caller {:identity alice-phone :call-id [9 8 7 6 5 4 3 2]
+                                      :callee-root (hx bob-root) :callee-statements bob-statements
+                                      :codecs [:lpc-2400 :pcmu] :bearers #{:lora} :now 0})
+            {cc :call [lreq] :packets} (call/callee {:identity bob-phone :ring rng
+                                                     :caller-device (t/known-identity (get-in w [:nodes :bob]) callback)
+                                                     :codecs [:lpc-2400] :now 0}
+                                                    (seed 60))
+            w (update-in w [:nodes :bob] t/track-link (get-in cc [:link :link-id]))
+            w (update-in w [:nodes :alice] t/register callback :single)
+            w (emit w :bob [lreq])
+            [w [lreq-at-alice]] (take-inbox w :alice)
+            {caller-call :call [proof2] :packets} (call/step caller-call {:type :packet :packet lreq-at-alice} 0)
+            w (update-in w [:nodes :alice] t/track-link (get-in caller-call [:link :link-id]))
+            w (emit w :alice [proof2])
+            [w [proof2-at-bob]] (take-inbox w :bob)
+            {cc :call out :packets} (call/step cc {:type :packet :packet proof2-at-bob} 0)
+            w (emit w :bob out)
+            [w at-alice] (take-inbox w :alice)
+            [caller-call outs] (reduce (fn [[c acc] p] (let [r (call/step c {:type :packet :packet p} 0)]
+                                                         [(:call r) (into acc (:packets r))]))
+                                       [caller-call []] at-alice)
+            w (emit w :alice outs)
+            [w at-bob] (take-inbox w :bob)
+            cc (reduce (fn [c p] (:call (call/step c {:type :packet :packet p} 0))) cc at-bob)]
+        (testing "the call is up on the low-rate codec on both ends"
+          (is (= :active (:status caller-call)))
+          (is (= :active (:status cc)))
+          (is (= :lpc-2400 (:codec caller-call) (:codec cc))))
+        ;; 5. Alice speaks
+        (let [tone (mapv #(* 3000 (Math/sin (/ (* 2 Math/PI 200 %) 8000))) (range 160))
+              payload (lpc/encode :lpc-2400 tone)
+              ;; two frames: the jitter buffer holds one in reserve before playing
+              {caller-call :call f1 :packets} (call/step caller-call {:type :audio :timestamp 0 :payload payload} 0)
+              {caller-call :call f2 :packets} (call/step caller-call {:type :audio :timestamp 160 :payload payload} 20)
+              w (emit w :alice (into f1 f2))
+              [_ media-at-bob] (take-inbox w :bob)
+              cc (reduce (fn [c p] (:call (call/step c {:type :packet :packet p} 40))) cc media-at-bob)
+              [cc f] (call/play cc)
+              [_ pcm] (lpc/decode :lpc-2400 (:payload f))]
+          (testing "her voice arrives as 6 bytes per 20 ms and decodes to 160 samples"
+            (is (= 6 (count payload)))
+            (is (= payload (:payload f)))
+            (is (= 160 (count pcm)))))))))
