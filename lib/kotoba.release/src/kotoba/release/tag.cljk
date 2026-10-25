@@ -1,0 +1,99 @@
+(ns kotoba.release.tag
+  "Fail-closed verification of release-tag envelopes described by a Kotoba
+  language version policy.
+
+  ## Why this is still `.clj` while `kotoba.release.admission` is `.cljc`
+
+  Not for want of trying, and not because of `java.util.Base64` — that has a
+  portable replacement in `kotoba.bytes/base64-decode`, and `ed25519.core` is
+  already `.cljc`. The blocker is one call:
+
+      (version/parse-semver release-version)
+
+  `kotoba.lang.version-policy` is a `.clj` namespace in
+  `kotoba-lang/kotoba-lang` that imports `java.time`. ClojureScript cannot
+  load it, so nothing that asks it a question can be portable either.
+
+  There are exactly two ways past that and this repo may take neither:
+
+  - Make `version-policy` portable. That is a change to
+    `kotoba-lang/kotoba-lang`, not to this repository.
+  - Parse the semver here instead. `resources/repository-rules.edn` names
+    this repo `:role :runtime` with
+    `:must-not [:define-language-semantics …]`, and what counts as a valid
+    Kotoba version IS language semantics. Duplicating the parser to gain a
+    file extension would trade a rule that is enforced for portability that
+    is only claimed — and would leave two definitions of a valid version
+    that can drift apart, one of them in the repository that is supposed to
+    be downstream of the other.
+
+  So this file waits on the upstream namespace. `test/run_portable.cljk`
+  says so too, and does not list this suite rather than listing it and
+  failing to load.
+
+  ## And when that unblocks, `canonical-body` is a second thing to check
+
+  `canonical-body` is `pr-str` over the envelope, and that string is what
+  gets SIGNED. ClojureScript has no distinct floating-point type — its
+  reader turns 1.0 into 1 — so an envelope carrying any non-integral
+  number would print differently on the two runtimes, and a signature made
+  on one would not verify on the other. Today's envelopes are strings,
+  keywords and integers below 2^53, which print identically, so nothing is
+  broken; but the day this becomes `.cljc` that has to be established
+  rather than assumed. Measured 2026-08-18: `(pr-str 1.0)` is \"1.0\" on the
+  JVM and \"1\" under ClojureScript, and `(pr-str -0.0)` is \"-0.0\" and
+  \"0\"."
+  (:require [kotoba.bytes :as kbytes] [ed25519.core :as ed]
+            [kotoba.lang.version-policy :as version]))
+
+(defn- stable-compare [a b]
+  (compare (pr-str a) (pr-str b)))
+
+(defn canonical-value
+  "Recursively canonicalize EDN containers before signing. Top-level sorting
+  alone is insufficient because artifact digest maps may be constructed in a
+  different order by each platform builder."
+  [value]
+  (cond
+    (map? value) (into (sorted-map-by stable-compare)
+                       (map (fn [[k v]] [k (canonical-value v)])) value)
+    (set? value) (into (sorted-set-by stable-compare)
+                       (map canonical-value) value)
+    (vector? value) (mapv canonical-value value)
+    (list? value) (apply list (map canonical-value value))
+    (seq? value) (doall (map canonical-value value))
+    :else value))
+
+(defn canonical-body [envelope]
+  (pr-str (canonical-value (dissoc envelope :signature))))
+
+(defn verify
+  "Verify tag shape, v<semver>, complete content binding, signer trust/status,
+  and Ed25519 signature. TRUST maps DID to {:status :active}."
+  [policy trust envelope]
+  (let [release-version (:version envelope)
+        signer (:signer envelope)
+        tag (:tag envelope)
+        required (get-in policy [:release-tags :binds])
+        body (canonical-body envelope)
+        signature (try (kbytes/base64-decode-bytes
+                                ^String (:signature envelope))
+                       (catch Exception _ nil))
+        missing (remove #(contains? envelope %) required)
+        code (cond
+               (nil? (version/parse-semver release-version))
+               :tag/invalid-version
+               (not= tag (str (get-in policy [:release-tags :prefix])
+                              release-version))
+               :tag/name-mismatch
+               (seq missing) :tag/incomplete-binding
+               (not= :active (get-in trust [signer :status]))
+               :tag/signer-untrusted
+               (nil? signature) :tag/invalid-signature
+               (not (try
+                      (ed/verify-did signer (kbytes/utf8-bytes body) signature)
+                      (catch Exception _ false)))
+               :tag/invalid-signature
+               :else nil)]
+    {:valid? (nil? code) :code code :tag tag :version release-version
+     :signer signer}))

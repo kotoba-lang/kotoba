@@ -1,0 +1,295 @@
+(ns mutate
+  "Prove the suite can fail.
+
+  A test that has never gone red is a test nobody has measured. This applies
+  one single-token mutation to one source file, runs `kbb -M:test`, and
+  records which tests reddened — then restores the file. A mutation that
+  reddens NOTHING is reported as a SURVIVOR, which is a finding about the
+  suite, not about the mutation.
+
+  Usage (from the repo root):
+
+      kbb --backend sci tools/mutate.cljk             # every mutation in the table
+      kbb --backend sci tools/mutate.cljk :duplicate  # one, by id
+
+  The table lives in `tools/mutations.edn`. Each entry names the invariant,
+  the file, an EXACT substring to find (it must occur exactly once — a
+  mutation that matched a comment instead of the code would produce a red
+  suite that proves nothing, which happened four times in this workspace on
+  2026-08-13), and what to replace it with.
+
+  ## Leaving a mutated file behind is the worst thing this tool can do
+
+  Between `apply-mutation!` and `restore!` the working tree holds a source
+  file that is deliberately WRONG. If the process dies in that window the
+  repo is left mutated, with a `<file>.orig` beside it — and a tool whose
+  whole job is to stop silent wrongness has just introduced some. It
+  happened three times on this workstation on 2026-08-18 (twice in
+  cloud-itonami-isco-4311, once in kotoba-lang/psa) when long runs were
+  killed by `timeout`/SIGTERM under load ~240. Each was caught by a human
+  noticing an unexpected entry in `git status`, which is luck, not a
+  mechanism.
+
+  There are two mechanisms here and they cover different failures. Neither
+  is redundant with the other:
+
+  1. RESTORE ON THE WAY OUT — a `finally` around the per-mutation body, plus
+     SIGINT/SIGTERM/SIGHUP/uncaughtException/exit handlers that put the file
+     back. This is BEST-EFFORT BY CONSTRUCTION. `kill -9`, a power cut, or
+     an OOM kill run no user code at all, and nothing written here can
+     change that.
+
+  2. REFUSE TO START ON A STALE `.orig` — the backstop for exactly the case
+     the handlers cannot cover. It converts a silent stranding into a loud
+     one at the next run, which is the only guarantee available once the
+     process can be destroyed without warning.
+
+  ## Why a signal handler alone would not have been enough
+
+  Measured, not assumed. `kbb -M:test` runs under `execSync`, which
+  blocks the JS thread, and this whole script is synchronous top to bottom.
+  A signal arriving mid-suite is queued by libuv but its JS callback CANNOT
+  RUN until the stack unwinds to the event loop — which here never happens,
+  because `-main` ends in `js/process.exit`. Registering the listener also
+  removes Node's default \"die on SIGTERM\", so the naive fix has a nasty
+  shape: SIGTERM'd mid-mutation, the run went on to finish normally and
+  exited 0. The tree was clean, but `timeout` no longer stopped anything.
+
+  So interruption is detected from the CHILD instead. When a signal is sent
+  to the process group — which is what `timeout` does by default, and what
+  Ctrl-C does — `clojure` dies with it, `execSync` throws, and the error
+  carries `.signal`. A test run killed by a signal was not measured, so the
+  harness restores and exits 128+signum rather than scoring it. That path
+  is synchronous and needs no event loop.
+
+  The listeners stay for the cases they do cover: a signal arriving while
+  the loop is free (between mutations, during the fs writes), and `exit`,
+  which fires on every `js/process.exit` in this file.
+
+  When only THIS process is signalled and the child survives, restoration
+  waits for that one suite to finish and the run then continues to the end.
+  Slow, but it never strands a file."
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+(defn- orig-path [file] (str file ".orig"))
+
+(def ^:private in-flight
+  "The mutation currently applied to the working tree, or nil.
+
+  Read by the signal handlers, which have no other way to know what to put
+  back. Set BEFORE the mutated bytes are written, so that dying between the
+  `.orig` write and the mutation write also restores cleanly (a no-op
+  restore that deletes the `.orig`) rather than leaving the stray file."
+  (atom nil))
+
+(defn- restore!
+  "Put `file` back from its `.orig`, then delete the `.orig`.
+
+  Idempotent: a missing `.orig` means someone already restored, so do
+  nothing rather than fail. The handlers can be reached more than once."
+  [{:keys [file]}]
+  (let [o (orig-path file)]
+    (when (.existsSync fs o)
+      (.writeFileSync fs file (.readFileSync fs o "utf8"))
+      (.unlinkSync fs o))))
+
+(defn- restore-in-flight!
+  "Restore whatever mutation is currently applied. Returns the file restored,
+  or nil if there was nothing to do."
+  []
+  (when-let [m @in-flight]
+    ;; Clear first: a second signal arriving during the write must not
+    ;; re-enter and restore on top of a half-written file.
+    (reset! in-flight nil)
+    (restore! m)
+    (:file m)))
+
+(def ^:private signums
+  {"SIGHUP" 1 "SIGINT" 2 "SIGQUIT" 3 "SIGKILL" 9 "SIGTERM" 15})
+
+(defn- signal-exit-code [sig] (+ 128 (get signums sig 0)))
+
+(defn- install-restore-on-death!
+  "Best-effort restoration for every way out of this process that still runs
+  user code. See the namespace docstring for what this cannot cover."
+  []
+  (doseq [sig ["SIGINT" "SIGTERM" "SIGHUP"]]
+    (.on js/process sig
+         (fn [_]
+           (when-let [f (restore-in-flight!)]
+             (println (str "\n" sig " — restored " f " and removed its .orig.")))
+           (js/process.exit (signal-exit-code sig)))))
+  (.on js/process "uncaughtException"
+       (fn [e]
+         (when-let [f (restore-in-flight!)]
+           (println (str "\nuncaught exception — restored " f
+                         " and removed its .orig.")))
+         (println (str e))
+         (js/process.exit 1)))
+  ;; Last net. Runs on normal return and on every `js/process.exit` above,
+  ;; so a path that exits without restoring still cannot strand a file.
+  ;; Must stay synchronous — only the *Sync fs calls above are used.
+  (.on js/process "exit" (fn [_] (restore-in-flight!))))
+
+(defn- stale-origs
+  "Every `<file>.orig` in the table that is already on disk before we start.
+  Scans the WHOLE table, not the selected subset: a file stranded by
+  mutation X poisons a later run of mutation Y just as thoroughly."
+  [table]
+  (->> table (map :file) distinct
+       (filterv #(.existsSync fs (orig-path %)))))
+
+(defn- refuse-on-stale!
+  "Stop, loudly, if an earlier run left a `.orig` behind.
+
+  This DELIBERATELY does not restore for you. At this point the tool cannot
+  tell which of three states it is looking at:
+
+    - the harness died mid-run and `file` is the mutated copy   → restore
+    - a human already restored `file` and left the `.orig`      → deleting
+      the `.orig` is right, restoring is a no-op
+    - a human restored `file` and has since edited it           → restoring
+      would OVERWRITE THEIR WORK with a stale copy
+
+  The third case turns a recoverable mess into lost work, and it is
+  indistinguishable from the first without asking. So the tool reports what
+  it found, shows how to see the difference, and lets a human decide. Being
+  refused costs one command; being silently reverted costs an edit."
+  [table]
+  (when-let [stale (seq (stale-origs table))]
+    (println "REFUSING TO START — a .orig from an earlier run is still here.")
+    (println "The previous run was killed between mutating a file and putting")
+    (println "it back, so these source files may currently hold a MUTATION:")
+    (println)
+    (doseq [f stale]
+      (println (str "  " f))
+      (println (str "    diff:    diff -u " (orig-path f) " " f))
+      (println (str "    restore: mv -f " (orig-path f) " " f)))
+    (println)
+    (println "Check the diff before restoring: if you already put the file")
+    (println "back by hand and edited it since, the .orig is stale and")
+    (println "restoring it would discard your edits — delete it instead.")
+    (js/process.exit 2)))
+
+(defn- run-tests []
+  (try
+    (let [out (.toString (cp/execSync "kbb -M:test 2>&1"))]
+      {:exit 0 :out out})
+    (catch :default e
+      ;; `:signal` is the name of the signal that KILLED THE CHILD, or nil if
+      ;; it merely exited non-zero. It is how this synchronous script learns
+      ;; that the process group was signalled — see the namespace docstring.
+      {:exit (or (.-status e) 1)
+       :signal (.-signal e)
+       :out (str (some-> (.-stdout e) .toString)
+                 (some-> (.-stderr e) .toString))})))
+
+(defn- failing-tests
+  "Test names clojure.test reported as FAIL or ERROR, deduplicated."
+  [out]
+  (->> (re-seq #"(?:FAIL|ERROR) in \(([^)]+)\)" out)
+       (map second)
+       distinct
+       sort
+       vec))
+
+(defn- summary-line [out]
+  (or (second (re-find #"(Ran \d+ tests containing \d+ assertions\.)" out)) "no summary"))
+
+(defn- apply-mutation! [{:keys [file find replace] :as m}]
+  (let [src (.readFileSync fs file "utf8")
+        ;; JS String.split with a STRING separator — no regex, so a find
+        ;; string full of parens counts what it looks like it counts.
+        n (alength (.split src find))]
+    (when (not= 2 n)
+      (throw (ex-info (str "find string must occur exactly once in " file
+                           " — occurrences: " (dec n))
+                      {:file file :find find})))
+    (.writeFileSync fs (orig-path file) src)
+    ;; Armed from here: the handlers now know what to put back. Set before
+    ;; the mutation is written, never after.
+    (reset! in-flight m)
+    (.writeFileSync fs file (str/replace-first src find replace))))
+
+(defn- run-one [m]
+  (println (str "\n=== " (:id m) " — " (:invariant m)))
+  (apply-mutation! m)
+  (try
+    (let [{:keys [exit out signal]} (run-tests)
+          _ (when signal
+              ;; The suite did not finish; it was shot. Restore now and leave.
+              ;; `js/process.exit` does not unwind the stack, so the `finally`
+              ;; below will NOT run — restore explicitly here. (The "exit"
+              ;; listener is the belt to this pair of braces.)
+              (println (str "\n    " signal
+                            " killed the test run — the process group was"
+                            " signalled."))
+              (when-let [f (restore-in-flight!)]
+                (println (str "    restored " f " and removed its .orig.")))
+              (js/process.exit (signal-exit-code signal)))
+          reds (failing-tests out)
+          summary (summary-line out)
+          ran? (not= "no summary" summary)]
+      (println "   " summary)
+      (cond
+        ;; The suite never ran. A non-zero exit alone used to score this as a
+        ;; kill, which is how `:stream-seq-advances` passed for a while with an
+        ;; unbalanced paren: the file stopped READING, nothing was measured,
+        ;; and the tally said 57/57. A mutation that breaks the reader
+        ;; demonstrates the reader. Its own outcome, and not zero.
+        (not ran?)
+        (do (println "    UNMEASURED — the suite did not run. The mutation broke"
+                     "\n    the build rather than an invariant; fix the mutation.")
+            (assoc m :unmeasured? true :survived? false :reddened []))
+
+        (and (zero? exit) (empty? reds))
+        (do (println "    SURVIVOR — no test noticed. The invariant is unmeasured.")
+            (assoc m :survived? true :reddened []))
+
+        :else
+        (do (println (str "    reddened " (count reds) ":"))
+            (doseq [t reds] (println (str "      - " t)))
+            (assoc m :survived? false :reddened reds))))
+    ;; Not just the happy path: an exception anywhere above (a bad regex, a
+    ;; full disk, a throw from run-tests' own error handling) must not leave
+    ;; the file mutated either.
+    (finally (restore-in-flight!))))
+
+(defn -main [& args]
+  (install-restore-on-death!)
+  (let [table (edn/read-string (.readFileSync fs "tools/mutations.edn" "utf8"))
+        _ (refuse-on-stale! table)
+        wanted (set (map #(keyword (str/replace % #"^:" "")) args))
+        ms (if (seq wanted) (filterv #(wanted (:id %)) table) table)
+        baseline (run-tests)]
+    ;; A baseline killed by a signal is neither GREEN nor RED — it is
+    ;; unanswered, and saying "RED — fix before mutating" about it would
+    ;; send someone hunting a failure that was never observed.
+    (when-let [sig (:signal baseline)]
+      (println (str "baseline: " sig
+                    " killed the test run — nothing was measured."))
+      (js/process.exit (signal-exit-code sig)))
+    (println "baseline:" (summary-line (:out baseline))
+             (if (zero? (:exit baseline)) "GREEN" "RED — fix before mutating"))
+    (when-not (zero? (:exit baseline))
+      (println (:out baseline))
+      (js/process.exit 2))
+    (when (empty? ms)
+      (println "no mutations selected — refusing to report a pass")
+      (js/process.exit 2))
+    (let [results (mapv run-one ms)
+          survivors (filterv :survived? results)
+          unmeasured (filterv :unmeasured? results)]
+      (println (str "\n=== " (count results) " mutations, "
+                    (- (count results) (count survivors) (count unmeasured))
+                    " killed, "
+                    (count survivors) " survived, "
+                    (count unmeasured) " unmeasured"))
+      (doseq [s survivors] (println "  SURVIVOR:" (:id s)))
+      (doseq [u unmeasured] (println "  UNMEASURED:" (:id u)))
+      (js/process.exit (if (or (seq survivors) (seq unmeasured)) 1 0)))))
+
+(apply -main *command-line-args*)
