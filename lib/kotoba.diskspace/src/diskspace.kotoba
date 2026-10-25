@@ -1,0 +1,298 @@
+(ns diskspace)
+
+;; The host observation is a bounded pair-chain.
+;; metadata:
+;;   [snapshot-id captured-at duration-ms root capacity used free
+;;    observed-count recorded-count total-bytes scan-mode
+;;    source-captured-at cache-age-ms]
+;; row:
+;;   [entry-id snapshot-id path parent bytes depth modified-at age-days
+;;    git-state symlink? custody candidate-id]
+
+(defn prefix-at? [text needle start index]
+  (if (= index (count needle))
+    true
+    (if (>= (+ start index) (count text))
+      false
+      (if (= (byte-at text (+ start index))
+             (byte-at needle index))
+        (prefix-at? text needle start (inc index))
+        false))))
+
+(defn contains-from? [text needle start]
+  (if (> (+ start (count needle)) (count text))
+    false
+    (if (prefix-at? text needle start 0)
+      true
+      (contains-from? text needle (inc start)))))
+
+(defn string-contains? [text needle]
+  (if (= (count needle) 0)
+    true
+    (contains-from? text needle 0)))
+
+(defn component-match-at? [text needle start]
+  (if (prefix-at? text needle start 0)
+    (let [end (+ start (count needle))]
+      (if (= end (count text))
+        true
+        (= (byte-at text end) (byte-at "/" 0))))
+    false))
+
+(defn component-from? [text needle start]
+  (if (> (+ start (count needle)) (count text))
+    false
+    (if (component-match-at? text needle start)
+      true
+      (component-from? text needle (inc start)))))
+
+(defn path-component? [text needle]
+  (component-from? text needle 0))
+
+(defn entry-kind [depth]
+  (if (= depth 0)
+    :diskspace.kind/root
+    (if (= depth 1)
+      :diskspace.kind/branch
+      :diskspace.kind/leaf)))
+
+(defn entry-category [path]
+  (if (or (string-contains? path "/Library/Caches")
+          (path-component? path "/.cache"))
+    :diskspace.category/cache
+    (if (or (path-component? path "/node_modules")
+            (path-component? path "/target")
+            (path-component? path "/.lake/build")
+            (path-component? path "/.next")
+            (path-component? path "/.turbo"))
+      :diskspace.category/build-artifact
+      (if (path-component? path "/CoreSimulator")
+        :diskspace.category/simulator
+        (if (path-component? path "/vm_bundles")
+          :diskspace.category/runtime-bundle
+          (if (path-component? path "/OptGuideOnDeviceModel")
+            :diskspace.category/model
+            :diskspace.category/data))))))
+
+(defn cleanup-policy [category]
+  (if (or (= category :diskspace.category/cache)
+          (= category :diskspace.category/build-artifact))
+    :cleanup/rebuildable
+    (if (or (= category :diskspace.category/simulator)
+            (= category :diskspace.category/runtime-bundle)
+            (= category :diskspace.category/model))
+      :cleanup/review
+      :cleanup/preserve)))
+
+;; custody が『消してはいけない』と言っているか。
+;;
+;; :custody/absent は content がどこにも無い状態（annex pointer だけが残る）。
+;; 消せる対象ではなく **既に失われている**ことの報告で、path を消すと最後の
+;; 手掛かり（どの key が失われたか）まで消える。
+;;
+;; :custody/single-copy は唯一のコピー。category が cache に見えても消さない ——
+;; **path の見た目より custody が強い。**
+(defn custody-preserves? [custody]
+  (or (= custody :custody/absent)
+      (= custody :custody/single-copy)
+      (= custody :custody/unknown)))
+
+(defn effective-cleanup-policy [category git-state symlink? custody]
+  ;; custody を最優先にする。ここを category より後ろに置くと
+  ;; 『cache に見える唯一のコピー』を消す。cleanup-recovery が
+  ;; :recreate-cache と主張しても、copy が無ければ再生成できない ——
+  ;; **再生成できるという主張は copy の有無を知らないと嘘になりうる。**
+  (if (custody-preserves? custody)
+    :cleanup/preserve
+    (if symlink?
+      :cleanup/preserve
+      (if (= git-state :git/tracked)
+        :cleanup/preserve
+        (cleanup-policy category)))))
+
+(defn cleanup-confidence [policy git-state]
+  (if (= policy :cleanup/rebuildable)
+    (if (or (= git-state :git/untracked)
+            (= git-state :git/not-repository))
+      :cleanup.confidence/high
+      :cleanup.confidence/medium)
+    :cleanup.confidence/medium))
+
+(defn cleanup-risk [policy]
+  (if (= policy :cleanup/rebuildable)
+    :cleanup.risk/low
+    :cleanup.risk/medium))
+
+(defn cleanup-action [policy]
+  (if (= policy :cleanup/rebuildable)
+    :cleanup.action/propose-delete
+    :cleanup.action/request-review))
+
+(defn cleanup-recovery [category]
+  (if (= category :diskspace.category/build-artifact)
+    :cleanup.recovery/rebuild
+    (if (= category :diskspace.category/cache)
+      :cleanup.recovery/recreate-cache
+      (if (= category :diskspace.category/simulator)
+        :cleanup.recovery/redownload-runtime
+        (if (= category :diskspace.category/runtime-bundle)
+          :cleanup.recovery/recreate-runtime
+          (if (= category :diskspace.category/model)
+            :cleanup.recovery/redownload-model
+            :cleanup.recovery/unknown))))))
+
+(defn custody-evidence [custody]
+  (if (= custody :custody/absent)
+    :cleanup.evidence/custody-absent
+    (if (= custody :custody/single-copy)
+      :cleanup.evidence/custody-single-copy
+      (if (= custody :custody/replicated)
+        :cleanup.evidence/custody-replicated
+        (if (= custody :custody/unknown)
+          :cleanup.evidence/custody-unknown
+          :cleanup.evidence/custody-unmanaged)))))
+
+(defn cleanup-reasons [policy git-state age-days custody]
+  (let [policy-reason
+        (if (= policy :cleanup/rebuildable)
+          :cleanup.evidence/rebuildable-path-rule
+          :cleanup.evidence/review-path-rule)
+        git-reason
+        (if (= git-state :git/untracked)
+          :cleanup.evidence/git-untracked
+          (if (= git-state :git/not-repository)
+            :cleanup.evidence/outside-git
+            :cleanup.evidence/git-unknown))
+        age-reason
+        (if (>= age-days 30)
+          :cleanup.evidence/not-modified-30-days
+          :cleanup.evidence/recent-or-unknown-age)]
+    ;; custody を証跡の先頭に置く。preserve の理由が custody なのか
+    ;; path 規則なのかが読み手に分からないと、判断を検算できない。
+    (pair (custody-evidence custody)
+          (pair policy-reason
+                (pair git-reason
+                      (pair age-reason 0))))))
+
+(defn row->entry [row]
+  (let [entry-id (nth row 0)
+        snapshot-id (nth row 1)
+        path (nth row 2)
+        parent (nth row 3)
+        bytes (nth row 4)
+        depth (nth row 5)
+        modified-at (nth row 6)
+        age-days (nth row 7)
+        git-state (nth row 8)
+        symlink? (nth row 9)
+        custody (nth row 10)
+        category (entry-category path)
+        policy (effective-cleanup-policy category git-state symlink? custody)]
+    {:db/id [:diskspace.entry/id entry-id]
+     :diskspace.entry/id entry-id
+     :diskspace.entry/snapshot [:diskspace.snapshot/id snapshot-id]
+     :diskspace.entry/path path
+     :diskspace.entry/parent parent
+     :diskspace.entry/bytes bytes
+     :diskspace.entry/depth depth
+     :diskspace.entry/kind (entry-kind depth)
+     :diskspace.entry/category category
+     :diskspace.entry/cleanup-policy policy
+     :diskspace.entry/modified-at modified-at
+     :diskspace.entry/age-days age-days
+     :diskspace.entry/git-state git-state
+     :diskspace.entry/custody custody
+     :diskspace.entry/symlink? symlink?}))
+
+(defn row->candidate [row]
+  (let [entry-id (nth row 0)
+        snapshot-id (nth row 1)
+        path (nth row 2)
+        parent (nth row 3)
+        bytes (nth row 4)
+        age-days (nth row 7)
+        git-state (nth row 8)
+        symlink? (nth row 9)
+        custody (nth row 10)
+        candidate-id (nth row 11)
+        category (entry-category path)
+        parent-category (entry-category parent)
+        policy (effective-cleanup-policy category git-state symlink? custody)]
+    (if (or (= policy :cleanup/preserve)
+            (= category parent-category))
+      0
+      {:db/id [:cleanup.candidate/id candidate-id]
+       :cleanup.candidate/id candidate-id
+       :cleanup.candidate/snapshot [:diskspace.snapshot/id snapshot-id]
+       :cleanup.candidate/entry [:diskspace.entry/id entry-id]
+       :cleanup.candidate/path path
+       :cleanup.candidate/bytes bytes
+       :cleanup.candidate/class policy
+       :cleanup.candidate/confidence (cleanup-confidence policy git-state)
+       :cleanup.candidate/risk (cleanup-risk policy)
+       :cleanup.candidate/action (cleanup-action policy)
+       :cleanup.candidate/status :cleanup.status/proposed
+       :cleanup.candidate/recovery (cleanup-recovery category)
+       :cleanup.candidate/evidence
+       (cleanup-reasons policy git-state age-days custody)})))
+
+(defn metadata->snapshot [metadata]
+  (let [snapshot-id (nth metadata 0)]
+    {:db/id [:diskspace.snapshot/id snapshot-id]
+     :diskspace.snapshot/id snapshot-id
+     :diskspace.snapshot/captured-at (nth metadata 1)
+     :diskspace.snapshot/duration-ms (nth metadata 2)
+     :diskspace.snapshot/root (nth metadata 3)
+     :diskspace.snapshot/volume-capacity-bytes (nth metadata 4)
+     :diskspace.snapshot/volume-used-bytes (nth metadata 5)
+     :diskspace.snapshot/volume-free-bytes (nth metadata 6)
+     :diskspace.snapshot/observed-count (nth metadata 7)
+     :diskspace.snapshot/recorded-count (nth metadata 8)
+     :diskspace.snapshot/total-bytes (nth metadata 9)
+     :diskspace.snapshot/scan-mode (nth metadata 10)
+     :diskspace.snapshot/source-captured-at (nth metadata 11)
+     :diskspace.snapshot/cache-age-ms (nth metadata 12)}))
+
+(defn rows->entries [rows]
+  (if (= rows 0)
+    0
+    (pair (row->entry (pair-first rows))
+          (rows->entries (pair-second rows)))))
+
+(defn rows->candidates [rows]
+  (if (= rows 0)
+    0
+    (let [candidate (row->candidate (pair-first rows))
+          remaining (rows->candidates (pair-second rows))]
+      (if (= candidate 0)
+        remaining
+        (pair candidate remaining)))))
+
+(defn append-chain [left right]
+  (if (= left 0)
+    right
+    (pair (pair-first left)
+          (append-chain (pair-second left) right))))
+
+(defn take-entries [entries remaining]
+  (if (or (= entries 0) (= remaining 0))
+    0
+    (pair (pair-first entries)
+          (take-entries (pair-second entries) (dec remaining)))))
+
+(defn main []
+  (let [observation (fs-read "scan://root")
+        metadata (nth observation 0)
+        rows (nth observation 1)
+        snapshot (metadata->snapshot metadata)
+        entries (rows->entries rows)
+        candidates (rows->candidates rows)
+        transaction (pair snapshot (append-chain entries candidates))
+        report {:diskspace.report/schema "diskspace.report.v2"
+                :diskspace.report/snapshot snapshot
+                :diskspace.report/largest (take-entries entries 20)
+                :diskspace.report/cleanup-candidates
+                (take-entries candidates 20)}
+        _tx-written (fs-write "data/latest-tx.edn" transaction)
+        _report-written (fs-write "data/latest.edn" report)]
+    (nth metadata 9)))

@@ -1,0 +1,563 @@
+(ns kotoba.lang.diskspace.host
+  "Capability adapter for diskspace.kotoba.
+
+  The adapter owns OS observation and atomic persistence only. Classification,
+  cleanup policy, report shape, and Datomic projection remain in .kotoba."
+  (:require [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.host-providers :as host-providers]
+            [kotoba.launcher :as launcher]
+            [kotoba.runtime :as runtime])
+  (:import [java.nio.file Files StandardCopyOption]
+           [java.time Instant]
+           [java.util Comparator]))
+
+(def defaults
+  {:root (System/getProperty "user.home")
+   :depth 3
+   :limit 120
+   :max-age-seconds 900
+   :refresh? false
+   :check? false})
+
+(defn parse-positive-long [flag value]
+  (let [n (parse-long value)]
+    (when-not (and n (pos? n))
+      (throw (ex-info (str flag " must be a positive integer")
+                      {:flag flag :value value})))
+    n))
+
+(defn parse-nonnegative-long [flag value]
+  (let [n (parse-long value)]
+    (when-not (and n (not (neg? n)))
+      (throw (ex-info (str flag " must be a non-negative integer")
+                      {:flag flag :value value})))
+    n))
+
+(defn parse-args [argv]
+  (loop [opts defaults
+         args (seq argv)]
+    (if-not args
+      opts
+      (case (first args)
+        "--root" (recur (assoc opts :root (second args)) (nnext args))
+        "--depth" (recur (assoc opts :depth
+                                (parse-positive-long "--depth" (second args)))
+                         (nnext args))
+        "--limit" (recur (assoc opts :limit
+                                (parse-positive-long "--limit" (second args)))
+                         (nnext args))
+        "--max-age-seconds"
+        (recur (assoc opts :max-age-seconds
+                      (parse-nonnegative-long "--max-age-seconds" (second args)))
+               (nnext args))
+        "--refresh" (recur (assoc opts :refresh? true) (next args))
+        "--check" (recur (assoc opts :check? true) (next args))
+        "--help" (assoc opts :help? true)
+        (throw (ex-info "unknown argument" {:argument (first args)}))))))
+
+(defn usage []
+  (str "Usage: kbb -M:run [--root PATH] [--depth N] [--limit K]\n"
+       "                       [--max-age-seconds N] [--refresh]\n"
+       "       kbb -M:check\n"))
+
+(defn pair-chain [values]
+  (reduce (fn [tail value] (list value tail)) 0 (reverse values)))
+
+(defn path-component-host? [text needle]
+  (loop [start 0]
+    (let [found (.indexOf ^String text ^String needle (int start))]
+      (cond
+        (neg? found) false
+        (= (+ found (count needle)) (count text)) true
+        (= \/ (.charAt ^String text (+ found (count needle)))) true
+        :else (recur (inc found))))))
+
+(defn canonical-file [path]
+  (.getCanonicalFile (io/file path)))
+
+(defn path-depth [root path]
+  (let [root-path (.toPath root)
+        path-path (.toPath (canonical-file path))]
+    (if (= root-path path-path)
+      0
+      (.getNameCount (.relativize root-path path-path)))))
+
+(defn parse-du-line [root line]
+  (when-let [[_ kib path] (re-matches #"^([0-9]+)\t(.*)$" line)]
+    (let [source-file (io/file path)
+          file (canonical-file path)
+          parent (.getParentFile file)]
+      {:path (.getPath file)
+       :parent (if parent (.getPath parent) "")
+       :bytes (* 1024 (parse-long kib))
+       :depth (path-depth root (.getPath file))
+       :symlink? (Files/isSymbolicLink (.toPath source-file))})))
+
+(defn run-du [{:keys [root depth]}]
+  (let [root-file (canonical-file root)
+        root-path (.getPath root-file)
+        command
+        (vec
+         (concat ["/usr/bin/du" "-k" "-x" "-d" (str depth)]
+                 ;; macOS firmlinks expose Data both as logical paths
+                 ;; (/Users, /Library, /private, ...) and through the physical
+                 ;; /System/Volumes mount. Keep only the logical view.
+                 (when (= "/" root-path) ["-I" "Volumes"])
+                 [root-path]))
+        process (.start (doto (ProcessBuilder. command)
+                          (.redirectErrorStream false)))
+        stderr-future (future (slurp (.getErrorStream process)))
+        rows (with-open [reader (io/reader (.getInputStream process))]
+               (->> (line-seq reader)
+                    (keep #(parse-du-line root-file %))
+                    vec))
+        exit (.waitFor process)
+        stderr @stderr-future]
+    (when (or (empty? rows) (> exit 1))
+      (throw (ex-info "du failed"
+                      {:exit exit :command command :stderr stderr})))
+    {:root root-file
+     :rows rows
+     :warnings
+     (cond-> (vec (remove str/blank? (str/split-lines stderr)))
+       (not (zero? exit)) (conj (str "du exited " exit " with partial results")))}))
+
+(defn volume-stats [root]
+  (let [store (Files/getFileStore (.toPath root))
+        capacity (.getTotalSpace store)
+        free (.getUsableSpace store)]
+    {:capacity capacity
+     :used (- capacity free)
+     :free free}))
+
+(defn snapshot-id [captured-at]
+  (str "diskspace-"
+       (-> captured-at
+           (str/replace #":" "-")
+           (str/replace #"\." "-"))))
+
+(declare atomic-write-edn!)
+
+(defn cache-file [repo root depth]
+  (let [key (Integer/toHexString (hash [(.getPath root) depth]))]
+    (io/file repo "data" "cache" (str key ".edn"))))
+
+(defn read-cache [file]
+  (when (.isFile file)
+    (try
+      (edn/read-string (slurp file))
+      (catch Exception _ nil))))
+
+(defn cache-source
+  [repo {:keys [root depth max-age-seconds refresh?] :as opts}]
+  (let [root-file (canonical-file root)
+        file (cache-file repo root-file depth)
+        cached (when-not refresh? (read-cache file))
+        now-ms (System/currentTimeMillis)
+        age-ms (when cached (- now-ms (:created-epoch-ms cached)))
+        valid?
+        (and cached
+             (= "diskspace.scan-cache.v3" (:schema cached))
+             (= (.getPath root-file) (:root cached))
+             (= depth (:depth cached))
+             (<= 0 age-ms (* 1000 max-age-seconds)))]
+    (if valid?
+      {:root root-file
+       :rows (:rows cached)
+       :warnings (:warnings cached)
+       :scan-mode :diskspace.scan/cache
+       :source-captured-at (:captured-at cached)
+       :cache-age-ms age-ms}
+      (let [{:keys [root rows warnings]} (run-du opts)
+            captured-at (str (Instant/now))
+            value {:schema "diskspace.scan-cache.v3"
+                   :root (.getPath root)
+                   :depth depth
+                   :captured-at captured-at
+                   :created-epoch-ms now-ms
+                   :warnings warnings
+                   :rows rows}]
+        (atomic-write-edn! file value)
+        {:root root
+         :rows rows
+         :warnings warnings
+         :scan-mode :diskspace.scan/full
+         :source-captured-at captured-at
+         :cache-age-ms 0}))))
+
+(defn nearest-git-root [file]
+  (loop [cursor (if (.isDirectory file) file (.getParentFile file))]
+    (cond
+      (nil? cursor) nil
+      (.exists (io/file cursor ".git")) cursor
+      :else (recur (.getParentFile cursor)))))
+
+(defn load-tracked-files [repo]
+  (try
+    (let [process (.start
+                   (doto
+                    (ProcessBuilder.
+                     ["/usr/bin/git" "-C" (.getPath repo) "ls-files" "-z"])
+                     (.redirectErrorStream true)))
+          output (slurp (.getInputStream process))
+          exit (.waitFor process)]
+      (if (zero? exit)
+        (set (remove str/blank? (str/split output #"\u0000")))
+        ::unknown))
+    (catch Exception _ ::unknown)))
+
+(defn tracked-path? [repo tracked file]
+  (let [relative (str (.relativize (.toPath repo) (.toPath file)))
+        prefix (str relative java.io.File/separator)]
+    (or (and (str/blank? relative) (seq tracked))
+        (contains? tracked relative)
+        (some #(str/starts-with? % prefix) tracked))))
+
+(defn git-state [tracked-cache file]
+  (if-let [repo (nearest-git-root file)]
+    (let [repo-path (.getPath repo)
+          tracked (if (contains? @tracked-cache repo-path)
+                    (get @tracked-cache repo-path)
+                    (let [loaded (load-tracked-files repo)]
+                      (swap! tracked-cache assoc repo-path loaded)
+                      loaded))]
+      (if (= ::unknown tracked)
+        :git/unknown
+        (if (tracked-path? repo tracked file)
+          :git/tracked
+          :git/untracked)))
+    :git/not-repository))
+
+(defn- annex-repo
+  "`file` を含む git-annex リポジトリ（無ければ nil）。
+
+   annex は git repo の一種なので `nearest-git-root` を再利用し、
+   `.git/annex` の存在で annex かどうかを分ける。"
+  [file]
+  (when-let [repo (nearest-git-root file)]
+    (let [ad (io/file repo ".git" "annex")]
+      (when (.isDirectory ad) repo))))
+
+(defn- annex-under-replicated
+  "その annex repo で **copy が `want` 本に満たない**ファイルの相対パス集合。
+
+   `git annex find --lackingcopies=N` は『numcopies を満たすのにあと N 本要る』
+   を意味するので、repo の numcopies 既定（1）ではなく **policy 側の want** を
+   `--numcopies` で明示的に渡す。
+
+   ⚠ 既定に頼ると危険側に倒れる（実測 2026-08-03）: 既定 numcopies=1 では
+   『B2 に 1 本あるだけ』が充足扱いになり、**単一障害点が健全に見える**。
+   custody を測る目的では want=2 が最低線。
+
+   観測のみ。判断（preserve するか alarm を上げるか）は `.kotoba` 側。"
+  [repo want]
+  (try
+    (let [pb (doto (ProcessBuilder.
+                    ["/usr/bin/git" "-C" (.getPath repo) "annex" "find"
+                     "--numcopies" (str want) "--lackingcopies" "1"])
+               (.redirectErrorStream false))
+          process (.start pb)
+          output (slurp (.getInputStream process))]
+      (.waitFor process)
+      (set (remove str/blank? (str/split output #"\n"))))
+    (catch Exception _ ::unknown)))
+
+(defn- annex-absent
+  "content がどこにも無い（copies=0）ファイルの相対パス集合。
+
+   annex pointer は在るのに実体が世界のどこにも無い状態。**repo は『持って
+   いる』と主張しているが取り出せない。** 実測 2026-08-03、m365-archive で
+   3,894 件（生成物 `facts/blobs.edn` 等、push されないまま drop されたもの）。"
+  [repo]
+  (try
+    (let [pb (ProcessBuilder.
+              ["/usr/bin/git" "-C" (.getPath repo) "annex" "find"
+               "--numcopies" "1" "--lackingcopies" "1"])
+          process (.start pb)
+          output (slurp (.getInputStream process))]
+      (.waitFor process)
+      (set (remove str/blank? (str/split output #"\n"))))
+    (catch Exception _ ::unknown)))
+
+(defn covers?
+  "観測ノード（多くはディレクトリ）が、その相対パス集合のどれかを含むか。
+
+   このファイルの他の判定 helper（`tracked-path?` / `path-component-host?`）と
+   同じく public にしてある —— **境界の判定はテストできる場所に置く**。
+   接頭辞一致をラベル境界で見ないと `/repo/ab` が `/repo/a` 配下の欠損を
+   自分のものとして報告する。"
+  [repo file rels]
+  (let [relative (str (.relativize (.toPath repo) (.toPath file)))
+        prefix (if (str/blank? relative) "" (str relative "/"))]
+    (boolean (some #(or (= % relative)
+                        (str/blank? relative)
+                        (str/starts-with? % prefix))
+                   rels))))
+
+(defn custody-state
+  "この path の custody 状態（**観測のみ、判断しない**）。
+
+     :custody/absent       annex 管理だが content がどこにも無い
+     :custody/single-copy  copy が want 本に満たない（= 単一障害点）
+     :custody/replicated   want 本以上ある
+     :custody/unmanaged    annex 管理下ではない
+
+   annex への問い合わせは **repo 単位で 1 回**にして cache する。observed node は
+   高々 120 件、annex repo は数個なので、path ごとに叩くより桁で安い。"
+  [cache want file]
+  (if-let [repo (annex-repo file)]
+    (let [rp (.getPath repo)
+          {:keys [lacking absent]}
+          (if (contains? @cache rp)
+            (get @cache rp)
+            (let [v {:lacking (annex-under-replicated repo want)
+                     :absent (annex-absent repo)}]
+              (swap! cache assoc rp v)
+              v))]
+      (cond
+        (or (= ::unknown lacking) (= ::unknown absent)) :custody/unknown
+        (covers? repo file absent) :custody/absent
+        (covers? repo file lacking) :custody/single-copy
+        :else :custody/replicated))
+    :custody/unmanaged))
+
+(defn file-age [captured-epoch-ms file]
+  (try
+    (let [modified-ms (.toMillis (Files/getLastModifiedTime (.toPath file)
+                                                            (make-array java.nio.file.LinkOption 0)))
+          age-ms (max 0 (- captured-epoch-ms modified-ms))]
+      {:modified-at (str (Instant/ofEpochMilli modified-ms))
+       :age-days (quot age-ms 86400000)})
+    (catch Exception _
+      {:modified-at ""
+       :age-days 0})))
+
+(def default-want-copies
+  "custody を満たすとみなす最小 copy 数。
+
+   **1 にしない。** repo 既定の numcopies=1 では『B2 に 1 本あるだけ』が充足に
+   なり、単一障害点が健全に見える（実測 2026-08-03）。"
+  2)
+
+(defn enrich-rows
+  ([rows] (enrich-rows rows default-want-copies))
+  ([rows want-copies]
+   (let [captured-epoch-ms (System/currentTimeMillis)
+         tracked-cache (atom {})
+         custody-cache (atom {})]
+     (mapv
+      (fn [{:keys [path] :as row}]
+        (let [file (canonical-file path)
+              age (file-age captured-epoch-ms file)]
+          (merge row age {:git-state (git-state tracked-cache file)
+                          :custody (custody-state custody-cache want-copies file)
+                          :symlink? (boolean (:symlink? row))})))
+      rows))))
+
+(defn bounded-observation [repo {:keys [limit] :as opts}]
+  (let [started (System/nanoTime)
+        captured-at (str (Instant/now))
+        {:keys [root rows warnings scan-mode source-captured-at cache-age-ms]}
+        (cache-source repo opts)
+        volume (volume-stats root)
+        root-path (.getPath root)
+        root-row (some #(when (= root-path (:path %)) %) rows)
+        sorted-rows (sort-by (juxt (comp - :bytes) :path) rows)
+        retained (vec (take (min limit 120) sorted-rows))
+        retained (if (or (nil? root-row)
+                         (some #(= root-path (:path %)) retained))
+                   retained
+                   (conj (vec (butlast retained)) root-row))
+        retained (enrich-rows retained)
+        id (snapshot-id captured-at)
+        total-bytes (or (:bytes root-row) 0)
+        duration-ms (quot (- (System/nanoTime) started) 1000000)
+        row-values
+        (mapv (fn [{:keys [path parent bytes depth modified-at age-days
+                           git-state symlink? custody]}]
+                ;; custody は index 10。candidate-id は 11 へずれる
+                ;; （`.kotoba` 側の row->entry / row->candidate と対で変える）。
+                (pair-chain [(str id "|" path) id path parent bytes depth
+                             modified-at age-days git-state symlink?
+                             (or custody :custody/unmanaged)
+                             (str id "|" path "|candidate")]))
+              retained)
+        metadata
+        (pair-chain [id captured-at duration-ms root-path
+                     (:capacity volume) (:used volume) (:free volume)
+                     (count rows) (count retained) total-bytes scan-mode
+                     source-captured-at cache-age-ms])]
+    {:id id
+     :warnings warnings
+     :payload (pair-chain [metadata (pair-chain row-values)])
+     :summary {:snapshot-id id
+               :root root-path
+               :duration-ms duration-ms
+               :scan-mode scan-mode
+               :source-captured-at source-captured-at
+               :cache-age-ms cache-age-ms
+               :observed-count (count rows)
+               :recorded-count (count retained)
+               :total-bytes total-bytes
+               :volume volume}}))
+
+(defn pair-chain? [value]
+  (and (seq? value) (= 2 (count value))))
+
+(defn pair-nth
+  ([value index] (pair-nth value index nil))
+  ([value index default]
+   (loop [cursor value
+          remaining index]
+     (cond
+       (neg? remaining) default
+       (zero? remaining)
+       (if (pair-chain? cursor) (first cursor) default)
+       (pair-chain? cursor)
+       (recur (second cursor) (dec remaining))
+       :else default))))
+
+(declare normalize-edn)
+
+(defn normalize-pair-chain [value]
+  (loop [cursor value
+         out []]
+    (cond
+      (= 0 cursor) out
+      (pair-chain? cursor)
+      (recur (second cursor) (conj out (normalize-edn (first cursor))))
+      :else
+      (throw (ex-info "invalid Kotoba pair-chain"
+                      {:cursor cursor :value value})))))
+
+(defn normalize-edn [value]
+  (cond
+    (pair-chain? value) (normalize-pair-chain value)
+    (map? value) (into {} (map (fn [[k v]] [k (normalize-edn v)])) value)
+    (vector? value) (mapv normalize-edn value)
+    (set? value) (set (map normalize-edn value))
+    :else value))
+
+(defn atomic-write-edn! [file value]
+  (let [file (canonical-file file)
+        parent (.getParentFile file)
+        _ (.mkdirs parent)
+        temp (io/file parent (str "." (.getName file) ".tmp"))]
+    (spit temp (str (pr-str (normalize-edn value)) "\n"))
+    (try
+      (Files/move (.toPath temp) (.toPath file)
+                  (into-array StandardCopyOption
+                              [StandardCopyOption/ATOMIC_MOVE
+                               StandardCopyOption/REPLACE_EXISTING]))
+      (catch Exception _
+        (Files/move (.toPath temp) (.toPath file)
+                    (into-array StandardCopyOption
+                                [StandardCopyOption/REPLACE_EXISTING]))))
+    (.length file)))
+
+(defn safe-output-file [repo path]
+  (let [data-root (canonical-file (io/file repo "data"))
+        output (canonical-file (io/file repo path))]
+    (when-not (str/starts-with? (.getPath output)
+                                (str (.getPath data-root) java.io.File/separator))
+      (throw (ex-info "output escapes data directory" {:path path})))
+    output))
+
+(defn handlers [repo observation]
+  (merge
+   host-providers/default-handlers
+   {'fs-read
+    (fn [_cap [resource]]
+      (when-not (= "scan://root" resource)
+        (throw (ex-info "unknown diskspace observation resource"
+                        {:resource resource})))
+      (:payload observation))
+    'fs-write
+    (fn [_cap [path value]]
+      (when-not (#{"data/latest.edn" "data/latest-tx.edn"} path)
+        (throw (ex-info "unknown diskspace output" {:path path})))
+      (let [latest (safe-output-file repo path)
+            transaction? (= path "data/latest-tx.edn")
+            history-dir (if transaction? "transactions" "snapshots")
+            history (safe-output-file
+                     repo
+                     (str "data/" history-dir "/" (:id observation) ".edn"))
+            bytes (atomic-write-edn! latest value)]
+        (atomic-write-edn! history value)
+        bytes))}))
+
+(defn run-kotoba! [repo observation]
+  (let [source (io/file repo "src/diskspace.kotoba")
+        policy (edn/read-string (slurp (io/file repo "policy.edn")))
+        forms (runtime/read-file (.getPath source) :clj)
+        journal (host-providers/journal)
+        host-call
+        (host-providers/host-call
+         policy
+         {:record! (:record! journal)
+          :handlers (handlers repo observation)})
+        result
+        (runtime/run
+         (launcher/safe-analyzer-fact-classification)
+         {:kotoba.source/path (.getPath source)
+          :kotoba.source/reader-target :clj}
+         forms
+         {:policy policy
+          :step-limit (:kotoba.policy/interpreter-step-limit policy)
+          :host-call host-call
+          :capability-query (host-providers/capability-query-fn policy)
+          :host-fns
+          {'pair (fn [head tail] (list head tail))
+           'pair-first first
+           'pair-second second
+           'nth pair-nth
+           ;; Pure acceleration for the same byte-wise reference semantics
+           ;; defined in diskspace.kotoba. This grants no host capability.
+           'string-contains? str/includes?
+           'path-component? path-component-host?}})]
+    (assoc result :kotoba.host/receipts ((:entries journal)))))
+
+(defn check-kotoba [repo]
+  (let [source (io/file repo "src/diskspace.kotoba")
+        policy (edn/read-string (slurp (io/file repo "policy.edn")))
+        forms (runtime/read-file (.getPath source) :clj)]
+    (runtime/check
+     (launcher/safe-analyzer-fact-classification)
+     {:kotoba.source/path (.getPath source)
+      :kotoba.source/reader-target :clj}
+     forms
+     policy)))
+
+(defn repo-root []
+  (canonical-file (io/file (System/getProperty "user.dir"))))
+
+(defn -main [& argv]
+  (let [{:keys [help? check?] :as opts} (parse-args argv)
+        repo (repo-root)]
+    (try
+      (cond
+        help? (print (usage))
+        check?
+        (let [checked (check-kotoba repo)]
+          (prn (select-keys checked
+                            [:kotoba.runtime/ok? :kotoba.runtime/problems]))
+          (when-not (:kotoba.runtime/ok? checked)
+            (throw (ex-info "Kotoba check failed" checked))))
+        :else
+        (let [observation (bounded-observation repo opts)
+              result (run-kotoba! repo observation)
+              summary (assoc (:summary observation)
+                             :kotoba-ok? (:kotoba.runtime/ok? result)
+                             :kotoba-value (:kotoba.runtime/value result)
+                             :warnings (:warnings observation)
+                             :receipt-count
+                             (count (:kotoba.host/receipts result)))]
+          (prn summary)
+          (when-not (:kotoba.runtime/ok? result)
+            (throw (ex-info "Kotoba execution failed"
+                            {:summary summary
+                             :problems (:kotoba.runtime/problems result)})))))
+      (finally
+        (shutdown-agents)))))
