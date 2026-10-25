@@ -1,0 +1,190 @@
+(ns kami.fsm-oracle
+  "Runs the shipped decision core.
+
+  `src/kami/fsm.kotoba` holds the player profile's transition rule;
+  `resources/kami/fsm/oracle/player.kir.edn` is what was compiled from it and
+  what ships. This namespace is the seam, and it is deliberately thin: it
+  resolves a resource, executes an export, and decides nothing.
+
+  ## Why this exists
+
+  The profile landed with `fsm-parity-test`, which compiled the `.kotoba` and
+  required it to answer as `kami.fsm/advance` over `default-player-fsm` did.
+  That was the right first step and it is still here. But two implementations
+  bound by a test are still two implementations, and the measure of the port is
+  not how many host lines went away; it is whether the AUTHORITY moved. Until
+  now it had not: the `.kotoba` was a checked replica and the `.cljc` was what
+  ran. Now the `.kotoba` is what runs for the calls it can express, and the
+  `.cljc` keeps the generic engine, which the profile deliberately does not
+  cover.
+
+  ## The guest ABI, and the two places the host has to meet it
+
+  Both boundary shapes below were MEASURED against the pinned interpreter, not
+  guessed:
+
+    * a variant crosses as `[schema case-tag payload]` — `idle-state` returns
+      `[[:variant :kami.fsm/player-state-v1
+         [[:idle :i64] [:move :i64] [:jump :i64]]] :idle 0]`.
+      A bare `:idle` is refused with \"value is not the declared variant type\",
+      and a case the schema does not declare with \"variant case is not
+      declared\".
+    * a `[:set :keyword]` crosses as `[type items-vector]` — NOT a Clojure set,
+      which is refused with \"value is not the declared typed set\". The
+      interpreter sorts the items itself, rejects a duplicate (\"typed set
+      contains a duplicate item\") and rejects a non-keyword item (\"value is
+      not a keyword\").
+
+  Neither schema is written down in this namespace or in `kami.fsm`: they are
+  read back out of the shipped artifact, which IS the `.kotoba` compiled, so a
+  host builds its arguments from the source of the rule rather than from a copy
+  of it.
+
+  ## No fallback around a missing artifact
+
+  A missing or unreadable artifact throws. It does not quietly run something
+  else, because a silent fallback is how a decision stops being the one that
+  shipped. Which path `kami.fsm/advance` takes is decided by the VALUES it was
+  handed, never by whether this namespace could load anything.
+
+  ## ClojureScript hosts must register the KIR
+
+  There is no classpath to read a resource from, so `register-kir!` is the only
+  way in and `kir` throws without it. That is a real narrowing of what this
+  library used to do on that runtime and it is stated rather than discovered:
+  see the boundary note on `kami.fsm`."
+  (:require [kotoba.kir :as kir]
+            ;; Both only exist on the branch that has a classpath to read from.
+            #?@(:clj [[kotoba.lang.edn :as edn]
+                      [kotoba.io :as io]])))
+
+(def cores
+  "Oracle id -> the .kotoba it was compiled from, under src/."
+  {:player "kami/fsm.kotoba"})
+
+(defn resource-path [id]
+  (str "kami/fsm/oracle/" (name id) ".kir.edn"))
+
+(def ^:private registered
+  "Pre-parsed KIR, for runtimes with no classpath, and for the test that has to
+  prove the host reads this rather than keeping its own copy."
+  (atom {}))
+
+(defn register-kir!
+  "Install a parsed KIR for `id`, bypassing the resource read."
+  [id kir]
+  (swap! registered assoc id kir)
+  kir)
+
+(defn deregister-kir!
+  "Drop a registration, so `id` reads the shipped artifact again."
+  [id]
+  (swap! registered dissoc id)
+  nil)
+
+(defn- read-artifact [id]
+  #?(:clj
+     (let [path (resource-path id)]
+       (if-let [url (io/resource path)]
+         (edn/read-string (slurp url))
+         (throw (ex-info "shipped decision core is missing — run `kbb -M:test:gen`"
+                         {:oracle id :path path}))))
+     :cljs
+     (throw (ex-info "no classpath on this runtime — register-kir! first"
+                     {:oracle id}))))
+
+(def ^:private cache (atom {}))
+
+(defn kir
+  "The shipped KIR for `id`, read once."
+  [id]
+  ;; A registration wins over the cache: it is an explicit instruction, and a
+  ;; caller that registers after something already read the artifact means the
+  ;; registration, not the read.
+  (or (get @registered id)
+      (get @cache id)
+      (let [loaded (read-artifact id)]
+        (swap! cache assoc id loaded)
+        loaded)))
+
+(defn signature
+  "The shipped declaration of `export`: `:params`, `:param-types`, `:result`.
+
+  This is how a host learns the state variant's schema without writing it down
+  a second time. Throws if the export is not there, because a host asking for a
+  signature is about to build an argument out of it."
+  [id export]
+  (let [export (symbol (name export))]
+    (or (first (filter #(= export (:name %)) (:functions (kir id))))
+        (throw (ex-info "shipped core does not declare that export"
+                        {:oracle id :export export})))))
+
+(defn param-types
+  "Declared parameter types of `export`, in order. Aliases are already resolved
+  by the compiler, so a `[:alias player-state-type]` parameter reads back as the
+  `[:variant …]` it names."
+  [id export]
+  (:param-types (signature id export)))
+
+(defn call
+  "Execute an export of a shipped core. Args and result are guest ABI values;
+  see `variant`, `variant-tag` and `typed-set` for the conversions."
+  [id export args]
+  (kir/execute (kir id) (symbol (name export)) (vec args)))
+
+;; ── the guest values that are not plain host values ──────────────────
+
+(defn variant-cases
+  "`[[case-tag payload-type] …]` of a `[:variant name cases]` descriptor, in
+  declared order. A host asks this rather than listing the cases itself, so
+  \"which states can the shipped profile express\" is answered by the artifact."
+  [variant-type]
+  (nth variant-type 2))
+
+(defn case-payload-type
+  "The payload type the descriptor declares for `tag`, or nil if it declares no
+  such case."
+  [variant-type tag]
+  (some (fn [[case-tag payload-type]] (when (= tag case-tag) payload-type))
+        (variant-cases variant-type)))
+
+(defn variant
+  "Build a guest variant argument: the descriptor, then the case tag, then the
+  payload."
+  [variant-type tag payload]
+  [variant-type tag payload])
+
+(defn variant-tag
+  "The case tag of a variant `kir/execute` returned."
+  [variant-value]
+  (nth variant-value 1))
+
+(defn variant-payload
+  "The payload of a variant `kir/execute` returned."
+  [variant-value]
+  (nth variant-value 2))
+
+(def max-typed-set-items
+  "How many items a `[:set …]` argument may carry.
+
+  MEASURED against the pinned interpreter: 32 crosses, 33 is refused with
+  \"value is not the declared typed set\". It is an interpreter limit, not
+  something KIR declares, which is why it is the one boundary fact written down
+  here rather than read out of the artifact. It is also the reason this is a
+  bound and not a blocker: the player profile's alphabet is three events, so
+  there is ten times the headroom (ADR-2608112100 — what matters is whether the
+  value's size grows with the domain, not whether it is a collection)."
+  32)
+
+(defn typed-set
+  "Host collection -> a guest `[:set member-type]` argument.
+
+  The items cross as a VECTOR; the interpreter sorts them and refuses a
+  duplicate, so callers pass something that has none — a Clojure set does."
+  [set-type items]
+  [set-type (vec items)])
+
+(defn set-member-type
+  "The member type of a `[:set member-type]` descriptor."
+  [set-type]
+  (nth set-type 1))
