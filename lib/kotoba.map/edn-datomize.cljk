@@ -1,0 +1,174 @@
+#!/usr/bin/env kbb
+;; edn-datomize.cljk — EDN → Datomic/Datascript tx-data conversion tool
+;; (kotoba-lang/map copy, adapted from com-junkawasaki/root manifest/edn-datomize.cljk).
+;;
+;; "datomic/datascript queryable" here means: a file's top-level content is a
+;; tx-data vector (a vector of entity maps, each with :db/id) that can be
+;; passed directly to (d/transact conn (edn/read-string (slurp file))).
+;;
+;; A single top-level map gets wrapped in [{...:db/id -1}], with each
+;; existing bare key namespaced per file. Values outside Datomic's scalar
+;; valueTypes (string/long/double/boolean/keyword, or homogeneous
+;; collections thereof) are pr-str'd into a blob string attribute
+;; (valueType=string) -- entity+attribute-level querying still works, and
+;; callers can edn/read-string the blob to get the original value back.
+;; Attribute defs are (re)written to schema.edn at repo root (Datomic +
+;; Datascript compatible; no Datomic-only keys like :db.install/_attribute).
+;;
+;; Usage:
+;;   kbb --backend sci edn-datomize.cljk wrap-map <path> <ns>
+
+(require '[kotoba.lang.edn :as edn]
+         '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def child-process (js/require "node:child_process"))
+
+(defn sh-out [& args]
+  (let [r (.spawnSync child-process (first args) (to-array (rest args)) #js {:encoding "utf8"})]
+    (str/trim (or (.-stdout r) ""))))
+
+(def root (sh-out "git" "rev-parse" "--show-toplevel"))
+
+(defn resolve-path [rel] (.resolve path root rel))
+
+(defn slurp [p] (.readFileSync fs p "utf8"))
+(defn spit [p s] (.writeFileSync fs p (str s)))
+
+(defn schema-path [] (resolve-path "schema.edn"))
+
+(defn slurp-edn [p] (edn/read-string (slurp p)))
+
+(defn already-tx-data?
+  [content]
+  (and (vector? content) (seq content) (map? (first content)) (contains? (first content) :db/id)))
+
+;; NOTE (kotoba-lang/map adaptation, 2026-07-10): ClojureScript numbers have no
+;; separate integer/double boxed types (unlike JVM Long/Double), so a
+;; whole-valued double literal like `2048.0` reads back as plain JS number
+;; `2048` -- `integer?` AND `double?` are BOTH true for it, and generic
+;; `pr-str` prints it as `2048` (silently dropping the `.0`). The upstream
+;; JVM-babashka version of this tool didn't have this problem. Left
+;; unpatched, `classify` (which checks `integer?` before `double?`) would
+;; misclassify every whole-valued double as :db.type/long and the value would
+;; lose its float-ness on write -- a real data-fidelity regression, not just
+;; cosmetic, for files like this repo's constants.edn where several
+;; geometry/scale constants are intentionally doubles (2048.0, 22.0, etc,
+;; mirroring the JVM/.cljc `def`s they're a canonical copy of). Fixed here by
+;; scanning the ORIGINAL SOURCE TEXT for `<key> <digits>.<digits>` literals
+;; to recover which bare keys were authored as float literals, and steering
+;; classify + serialization for exactly those keys.
+(defn detect-double-keys
+  "Bare (un-namespaced) top-level keys whose value in the raw source text is
+   written as a float literal (contains a decimal point)."
+  [raw-text]
+  (into #{}
+        (map second)
+        (re-seq #":([a-zA-Z][a-zA-Z0-9\-]*)\s+-?\d+\.\d+" raw-text)))
+
+(defn double-repr
+  "Render a JS number as an EDN double literal, forcing a trailing `.0` when
+   the value happens to be whole (cljs `(str 2048.0)` => \"2048\", not
+   \"2048.0\" -- see note above)."
+  [n]
+  (let [s (str n)]
+    (if (re-find #"\." s) s (str s ".0"))))
+
+(defn classify
+  ([v] (classify v false))
+  ([v force-double?]
+   (cond
+     (string? v)  {:type :db.type/string  :card :db.cardinality/one}
+     (boolean? v) {:type :db.type/boolean :card :db.cardinality/one}
+     force-double? {:type :db.type/double :card :db.cardinality/one}
+     (integer? v) {:type :db.type/long    :card :db.cardinality/one}
+     (double? v)  {:type :db.type/double  :card :db.cardinality/one}
+     (keyword? v) {:type :db.type/keyword :card :db.cardinality/one}
+     (nil? v)     {:type :db.type/string  :card :db.cardinality/one}
+     (and (coll? v) (empty? v))
+     {:type :db.type/string :card :db.cardinality/many}
+     (and (coll? v) (every? string? v))  {:type :db.type/string  :card :db.cardinality/many}
+     (and (coll? v) (every? keyword? v)) {:type :db.type/keyword :card :db.cardinality/many}
+     (and (coll? v) (every? integer? v)) {:type :db.type/long    :card :db.cardinality/many}
+     :else {:type :db.type/string :card :db.cardinality/one :blob true})))
+
+(defn attr-value [v force-double?]
+  (let [{:keys [blob]} (classify v force-double?)]
+    (if blob (pr-str v) v)))
+
+(defn namespaced-key [ns-name k]
+  (keyword ns-name (name k)))
+
+(defn value->edn-str
+  "Serialize a single attribute value to EDN text, respecting the
+   double-vs-long distinction recovered by detect-double-keys (plain pr-str
+   would silently collapse e.g. 2048.0 -> 2048, see note above)."
+  [v force-double?]
+  (let [{:keys [type blob]} (classify v force-double?)]
+    (cond
+      blob (pr-str (attr-value v force-double?))
+      (= type :db.type/double) (if (coll? v)
+                                  (str "[" (str/join " " (map double-repr v)) "]")
+                                  (double-repr v))
+      :else (pr-str v))))
+
+(defn entity-str
+  [content ns-name double-keys]
+  (str "{:db/id -1"
+       (apply str
+              (map (fn [[k v]]
+                     (str ", " (pr-str (namespaced-key ns-name k)) " "
+                          (value->edn-str v (contains? double-keys (name k)))))
+                   content))
+       "}"))
+
+(defn schema-attrs
+  [content ns-name double-keys]
+  (for [[k v] content]
+    (let [{:keys [type card]} (classify v (contains? double-keys (name k)))]
+      {:db/ident (namespaced-key ns-name k)
+       :db/valueType type
+       :db/cardinality card})))
+
+(defn load-schema []
+  (let [f (schema-path)]
+    (if (.existsSync fs f) (slurp-edn f) [])))
+
+(defn merge-schema! [new-attrs]
+  (let [existing (load-schema)
+        by-ident (into {} (map (juxt :db/ident identity)) existing)
+        merged-by-ident (reduce (fn [acc {:keys [db/ident] :as attr}]
+                                   (if (contains? acc ident) acc (assoc acc ident attr)))
+                                 by-ident
+                                 new-attrs)
+        merged (vec (sort-by (comp str :db/ident) (vals merged-by-ident)))]
+    (spit (schema-path)
+          (str ";; schema.edn — Datomic/Datascript-compatible schema (auto-generated by edn-datomize.cljk)\n"
+               ";; List of :db/ident attribute defs. No Datomic-only keys (:db.install/_attribute etc).\n"
+               ";; Do not hand-edit -- regenerating overwrites this file.\n\n"
+               (pr-str merged)
+               "\n"))
+    merged))
+
+(defn wrap-map! [rel-path ns-name]
+  (let [f (resolve-path rel-path)
+        raw (slurp f)
+        content (edn/read-string raw)]
+    (if (already-tx-data? content)
+      (println "skip (already tx-data):" rel-path)
+      (let [double-keys (detect-double-keys raw)
+            attrs (schema-attrs content ns-name double-keys)]
+        (spit f (str "[" (entity-str content ns-name double-keys) "]\n"))
+        (merge-schema! attrs)
+        (println "wrapped" rel-path "->" (count content) "attrs, ns=" ns-name
+                 "(" (count double-keys) "double keys recovered from source text)")))))
+
+(defn -main [& args]
+  (let [[mode a b] args]
+    (case mode
+      "wrap-map" (wrap-map! a b)
+      (do (println "usage: kbb --backend sci edn-datomize.cljk wrap-map <path> <ns>")
+          (js/process.exit 1)))))
+
+(apply -main *command-line-args*)
