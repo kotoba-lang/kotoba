@@ -1,0 +1,208 @@
+(ns dnp3.objects
+  "DNP3 application-layer object payloads for a useful subset of the object
+  library (IEEE Std 1815-2012 Part 4, \"Object Library\"): binary input
+  (group 1/2), analog input (group 30/32), control relay output block
+  (group 12 var 1), and the zero-length class-data objects (group 60).
+
+  This is deliberately a slice, the same way `org-modbus` implements
+  thirteen function codes and not the whole 0x18+ file-transfer family: the
+  groups here are the common SCADA point types, and adding untested decoders
+  for the rest of the object library is how a protocol codec acquires bugs
+  nobody finds.
+
+  Every fixed-size point payload is packed **little-endian** — DNP3, unlike
+  Modbus and unlike IEC 60870-5-104's information-object addresses, is
+  little-endian throughout the application layer, matching the link layer's
+  `Destination`/`Source` fields."
+  )
+
+;; ── little-endian integer codecs ────────────────────────────────────────────
+;;
+;; `byte-at` extracts one byte of a two's-complement value using an
+;; *arithmetic* right shift, which sign-extends identically whether the host
+;; integer is the JVM's 64-bit long or JavaScript's 32-bit int: shifting -1
+;; right by any amount, on either platform, keeps producing all-one bits.
+;; That lets one implementation serve both encode directions without a
+;; separate `#?(:clj … :cljs …)` branch.
+
+(defn- byte-at [v shift] (bit-and (bit-shift-right v shift) 0xFF))
+
+(defn write-u8 [v] [(bit-and v 0xFF)])
+(defn write-i16-le [v] [(byte-at v 0) (byte-at v 8)])
+(defn write-i32-le [v] [(byte-at v 0) (byte-at v 8) (byte-at v 16) (byte-at v 24)])
+(def write-u32-le write-i32-le) ;; the byte pattern is identical; only the reader distinguishes sign
+
+(defn read-i16-le
+  [bs i]
+  (let [u (bit-or (nth bs i) (bit-shift-left (nth bs (inc i)) 8))]
+    (if (>= u 0x8000) (- u 0x10000) u)))
+
+(defn read-i32-le
+  "Assemble 4 little-endian bytes into a signed 32-bit integer.
+
+  `u`'s low-level assembly differs by platform under the hood — on
+  ClojureScript, shifting the top byte left 24 already overflows into
+  JavaScript's signed int32 representation, so `u` may already be negative
+  there, while on the JVM it stays a positive long up to 0xFFFFFFFF — but
+  the sign-extension check below is a no-op on a value that is already
+  correctly negative, so one formula covers both."
+  [bs i]
+  (let [u (bit-or (nth bs i)
+                   (bit-shift-left (nth bs (+ i 1)) 8)
+                   (bit-shift-left (nth bs (+ i 2)) 16)
+                   (bit-shift-left (nth bs (+ i 3)) 24))]
+    (if (>= u 0x80000000) (- u 0x100000000) u)))
+
+(defn read-u32-le
+  [bs i]
+  (let [u (bit-or (nth bs i)
+                   (bit-shift-left (nth bs (+ i 1)) 8)
+                   (bit-shift-left (nth bs (+ i 2)) 16)
+                   (bit-shift-left (nth bs (+ i 3)) 24))]
+    (if (neg? u) (+ u 0x100000000) u)))
+
+;; The 48-bit absolute-time field (group 2 var 2 etc.) exceeds the 32-bit
+;; range JavaScript's bitwise operators are defined over, so it is built
+;; with plain arithmetic instead — safe here because 2^48 is well inside the
+;; 53 bits IEEE-754 doubles represent exactly, unlike a bitwise shift would be.
+(def ^:private byte-place [1 256 65536 16777216 4294967296 1099511627776])
+
+(defn write-u48-le [v] (mapv (fn [place] (mod (quot v place) 256)) byte-place))
+(defn read-u48-le [bs i]
+  (reduce + 0 (map-indexed (fn [k place] (* (nth bs (+ i k)) place)) byte-place)))
+
+;; ── object flags ─────────────────────────────────────────────────────────
+
+(defn encode-binary-flags
+  "The binary-point flags octet common to group 1 and group 2 objects. Bit 7
+  is the point's actual state — DNP3 folds the value into the flags byte for
+  these variations rather than giving it a separate field."
+  [{:keys [online restart comm-lost remote-forced local-forced chatter-filter state]}]
+  (bit-or (if online 0x01 0) (if restart 0x02 0) (if comm-lost 0x04 0)
+          (if remote-forced 0x08 0) (if local-forced 0x10 0) (if chatter-filter 0x20 0)
+          (if state 0x80 0)))
+
+(defn decode-binary-flags
+  [b]
+  {:online (bit-test b 0) :restart (bit-test b 1) :comm-lost (bit-test b 2)
+   :remote-forced (bit-test b 3) :local-forced (bit-test b 4) :chatter-filter (bit-test b 5)
+   :state (bit-test b 7)})
+
+(defn encode-analog-flags
+  "The analog-point flags octet common to group 30 and group 32. Unlike the
+  binary flags octet the value is a separate field, not folded into bit 7;
+  bit 7 here is reserved and always 0."
+  [{:keys [online restart comm-lost remote-forced local-forced over-range reference-err]}]
+  (bit-or (if online 0x01 0) (if restart 0x02 0) (if comm-lost 0x04 0)
+          (if remote-forced 0x08 0) (if local-forced 0x10 0) (if over-range 0x20 0)
+          (if reference-err 0x40 0)))
+
+(defn decode-analog-flags
+  [b]
+  {:online (bit-test b 0) :restart (bit-test b 1) :comm-lost (bit-test b 2)
+   :remote-forced (bit-test b 3) :local-forced (bit-test b 4) :over-range (bit-test b 5)
+   :reference-err (bit-test b 6)})
+
+;; ── control relay output block (group 12 var 1) ─────────────────────────────
+;;
+;; ;; constructed, not a published spec vector — the CROB byte layout below
+;; (control-code octet, count, on-time, off-time, status) follows the
+;; structure widely documented in open DNP3 implementations, but this
+;; session has not cross-checked it against IEEE 1815's own Part 4 table
+;; text, so no byte sequence for it is presented as a verbatim spec example.
+
+(def trip-close-codes {:nul 0 :close 1 :trip 2})
+(def ^:private trip-close-codes-inv (into {} (map (juxt val key)) trip-close-codes))
+(def op-types {:nul 0 :pulse-on 1 :pulse-off 2 :latch-on 3 :latch-off 4})
+(def ^:private op-types-inv (into {} (map (juxt val key)) op-types))
+(def command-statuses
+  {:success 0 :timeout 1 :no-select 2 :format-error 3 :not-supported 4
+   :already-active 5 :hardware-error 6 :local 7 :too-many-ops 8 :not-authorized 9})
+(def ^:private command-statuses-inv (into {} (map (juxt val key)) command-statuses))
+
+(defn encode-control-code
+  [{:keys [tcc clear op-type]}]
+  (bit-or (bit-shift-left (get trip-close-codes tcc 0) 6)
+          (if clear 0x20 0)
+          (get op-types op-type 0)))
+
+(defn decode-control-code
+  [b]
+  {:tcc (get trip-close-codes-inv (bit-and (unsigned-bit-shift-right b 6) 0x03) :reserved)
+   :clear (bit-test b 5)
+   :op-type (get op-types-inv (bit-and b 0x0F) :reserved)})
+
+(defn encode-crob
+  "Group 12 var 1 — Control Relay Output Block, 11 bytes:
+  control-code(1) count(1) on-time-ms(4 LE) off-time-ms(4 LE) status(1)."
+  [{:keys [control-code count on-time off-time status]}]
+  (into [(encode-control-code control-code) (bit-and count 0xFF)]
+        (into (write-u32-le on-time)
+              (into (write-u32-le off-time)
+                    [(if (keyword? status) (get command-statuses status 0) (bit-and status 0xFF))]))))
+
+(defn decode-crob
+  [bs i]
+  {:point {:control-code (decode-control-code (nth bs i))
+           :count (nth bs (+ i 1))
+           :on-time (read-u32-le bs (+ i 2))
+           :off-time (read-u32-le bs (+ i 6))
+           :status (get command-statuses-inv (nth bs (+ i 10)) (nth bs (+ i 10)))}
+   :size 11})
+
+;; ── point codec registry ────────────────────────────────────────────────────
+
+(def point-codecs
+  "`[group variation] -> {:size :encode :decode}`. `:encode` takes a point
+  map and returns its fixed-size byte vector; `:decode` takes `bs` and a
+  start index and returns `{:point {...} :size n}`."
+  {[1 2] {:size 1
+          :encode (fn [{:keys [flags]}] [(encode-binary-flags flags)])
+          :decode (fn [bs i] {:point {:flags (decode-binary-flags (nth bs i))} :size 1})}
+   [2 1] {:size 1
+          :encode (fn [{:keys [flags]}] [(encode-binary-flags flags)])
+          :decode (fn [bs i] {:point {:flags (decode-binary-flags (nth bs i))} :size 1})}
+   [2 2] {:size 7
+          :encode (fn [{:keys [flags timestamp]}]
+                     (into [(encode-binary-flags flags)] (write-u48-le timestamp)))
+          :decode (fn [bs i] {:point {:flags (decode-binary-flags (nth bs i))
+                                       :timestamp (read-u48-le bs (inc i))}
+                               :size 7})}
+   [30 1] {:size 5
+           :encode (fn [{:keys [flags value]}]
+                      (into [(encode-analog-flags flags)] (write-i32-le value)))
+           :decode (fn [bs i] {:point {:flags (decode-analog-flags (nth bs i))
+                                        :value (read-i32-le bs (inc i))}
+                                :size 5})}
+   [30 2] {:size 3
+           :encode (fn [{:keys [flags value]}]
+                      (into [(encode-analog-flags flags)] (write-i16-le value)))
+           :decode (fn [bs i] {:point {:flags (decode-analog-flags (nth bs i))
+                                        :value (read-i16-le bs (inc i))}
+                                :size 3})}
+   [32 1] {:size 5
+           :encode (fn [{:keys [flags value]}]
+                      (into [(encode-analog-flags flags)] (write-i32-le value)))
+           :decode (fn [bs i] {:point {:flags (decode-analog-flags (nth bs i))
+                                        :value (read-i32-le bs (inc i))}
+                                :size 5})}
+   [32 2] {:size 3
+           :encode (fn [{:keys [flags value]}]
+                      (into [(encode-analog-flags flags)] (write-i16-le value)))
+           :decode (fn [bs i] {:point {:flags (decode-analog-flags (nth bs i))
+                                        :value (read-i16-le bs (inc i))}
+                                :size 3})}
+   [12 1] {:size 11
+           :encode encode-crob
+           :decode decode-crob}
+   ;; Class 0..3 data (§ the class-poll objects): zero-length. They exist
+   ;; only as the group/variation in a header whose qualifier carries no
+   ;; range (0x06, "all points of this class") — there is nothing to encode
+   ;; or decode per point.
+   [60 1] {:size 0 :encode (constantly []) :decode (fn [_ _] {:point {} :size 0})}
+   [60 2] {:size 0 :encode (constantly []) :decode (fn [_ _] {:point {} :size 0})}
+   [60 3] {:size 0 :encode (constantly []) :decode (fn [_ _] {:point {} :size 0})}
+   [60 4] {:size 0 :encode (constantly []) :decode (fn [_ _] {:point {} :size 0})}})
+
+(def class-data-group-var
+  {:class0 [60 1] :class1 [60 2] :class2 [60 3] :class3 [60 4]})

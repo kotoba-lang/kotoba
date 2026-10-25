@@ -1,0 +1,128 @@
+(ns ethereum.abi-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ethereum.abi :as abi]
+            [ethereum.abi.word :as w]
+            [ethereum.vectors :as v]))
+
+;; ── against viem ─────────────────────────────────────────────────────────────
+;; The only assertions here that are not this library talking to itself.
+
+(deftest encoding-matches-viem
+  (is (< 30 (count v/vectors)))
+  (doseq [{:keys [label types values encoded]} v/vectors]
+    (testing label
+      (is (= encoded (abi/encode-hex types values))))))
+
+(deftest decoding-recovers-the-values
+  ;; Not a round trip of this library's own output: the input is viem's
+  ;; bytes. Comparison is on the re-encoding because the value forms differ
+  ;; (integers come back as decimal strings, `bytes` as int vectors).
+  (doseq [{:keys [label types encoded]} v/vectors]
+    (testing label
+      (let [decoded (abi/decode types encoded)]
+        (is (= encoded (abi/encode-hex types decoded)))))))
+
+;; ── the type parser ──────────────────────────────────────────────────────────
+
+(deftest what-is-dynamic-is-structural
+  ;; Getting this wrong produces a well-formed call that reads garbage; the
+  ;; ABI has no tags for a decoder to notice with.
+  (doseq [[t dynamic?] [["uint256" false]
+                        ["address" false]
+                        ["bool" false]
+                        ["bytes32" false]
+                        ["bytes" true]
+                        ["string" true]
+                        ["uint256[]" true]
+                        ["uint256[3]" false]
+                        ["bytes[2]" true]        ; fixed length, dynamic element
+                        ["(uint256,address)" false]
+                        ["(uint256,bytes)" true] ; one dynamic component is enough
+                        ["(uint256,address)[]" true]
+                        ["(uint256,address)[2]" false]]]
+    (testing t
+      (is (= dynamic? (:dynamic? (abi/parse-type t)))))))
+
+(deftest array-suffixes-peel-right-to-left
+  (let [t (abi/parse-type "uint256[2][3]")]
+    (is (= :fixed-array (:kind t)))
+    (is (= 3 (:length t)) "the outer array is the last suffix")
+    (is (= 2 (:length (:element t))))))
+
+(deftest an-unknown-type-is-refused
+  (doseq [t ["uint257" "uint7" "bytes0" "bytes33" "uint256[x]" "widget" "int9"]]
+    (testing t
+      (is (thrown? #?(:clj Exception :cljs js/Error) (abi/parse-type t))))))
+
+;; ── refusals ─────────────────────────────────────────────────────────────────
+
+(deftest out-of-range-values-are-refused-not-wrapped
+  ;; Reducing mod 2^256 turns a caller's mistake into a valid-looking call
+  ;; that moves some other amount.
+  (is (thrown? #?(:clj Exception :cljs js/Error) (abi/encode ["uint8"] [256])))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (abi/encode ["uint256"] [-1])))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (abi/encode ["int8"] [128])))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (abi/encode ["int8"] [-129])))
+  (testing "at the boundary, on both sides"
+    (doseq [[t signed? bits] [["uint256" false 256] ["uint8" false 8]
+                              ["int256" true 256] ["int8" true 8]]]
+      (let [over (w/one-more-than-max bits signed?)]
+        (is (thrown? #?(:clj Exception :cljs js/Error) (abi/encode [t] [over])))))))
+
+(deftest length-mismatches-are-refused
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (abi/encode ["bytes32"] ["0xdeadbeef"])))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (abi/encode ["uint256[3]"] [[1 2]])))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (abi/encode ["uint256" "uint256"] [1])))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (abi/encode ["address"] [(str "0x" (apply str (repeat 42 "a")))]))))
+
+;; ── calls ────────────────────────────────────────────────────────────────────
+
+(deftest a-call-is-a-selector-and-a-block
+  ;; ERC-20 transfer, whose selector everyone can check by eye.
+  (let [d (abi/encode-call-hex
+           "0xa9059cbb" ["address" "uint256"]
+           ["0xBADd0B92C1c71d02E7d520f64c0876538fa2557F" "1000000000000000000"])]
+    (is (= "0xa9059cbb" (subs d 0 10)))
+    (is (= (+ 10 (* 2 64)) (count d)))
+    (is (= ["0xbadd0b92c1c71d02e7d520f64c0876538fa2557f" "1000000000000000000"]
+           (abi/decode ["address" "uint256"] (str "0x" (subs d 10)))))))
+
+(deftest a-selector-is-four-bytes
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (abi/encode-call "0xa9059c" ["uint256"] [1])))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (abi/encode-call "0xa9059cbbaa" ["uint256"] [1]))))
+
+;; ── the word layer ───────────────────────────────────────────────────────────
+
+(deftest two-s-complement-is-not-sign-magnitude
+  ;; The confusion this library shares a workspace with: Filecoin's amounts
+  ;; are sign-magnitude, where -1 is two bytes. Here it is thirty-two.
+  (is (= (vec (repeat 32 0xff)) (w/->word "-1" 256 true)))
+  (is (= (conj (vec (repeat 31 0)) 1) (w/->word "1" 256 false)))
+  (is (= "-1" (w/word-> (vec (repeat 32 0xff)) true)))
+  (testing "and unsigned reads the same bytes as a large positive"
+    (is (= "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+           (w/word-> (vec (repeat 32 0xff)) false)))))
+
+(deftest hex-round-trips-including-odd-digit-counts
+  (is (= [0x0a] (w/hex->ints "a")) "left-padded, not truncated")
+  (is (= [0xde 0xad] (w/hex->ints "0xdead")))
+  (is (= "dead" (w/ints->hex [0xde 0xad])))
+  (is (= [] (w/hex->ints "0x"))))
+
+(deftest argument-types-splits-a-signature
+  ;; A tuple argument contains its own commas, so this cannot be `split`.
+  (is (= [] (abi/argument-types "getChallengeFinality()")))
+  (is (= ["uint256"] (abi/argument-types "dataSetLive(uint256)")))
+  (is (= ["uint256" "address" "(bytes)[]" "bytes"]
+         (abi/argument-types "addPieces(uint256,address,(bytes)[],bytes)")))
+  (is (= ["uint256" "(bytes32,bytes32[])[]"]
+         (abi/argument-types "provePossession(uint256,(bytes32,bytes32[])[])")))
+  (testing "and the result is what encode takes"
+    (is (= "0x0000000000000000000000000000000000000000000000000000000000000001"
+           (abi/encode-hex (abi/argument-types "dataSetLive(uint256)") [1])))))

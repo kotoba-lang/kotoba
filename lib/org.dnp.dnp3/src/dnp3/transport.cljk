@@ -1,0 +1,93 @@
+(ns dnp3.transport
+  "DNP3 transport function — IEEE Std 1815-2012 §9.3 (\"Data Link Layer to
+  Application Layer\" transport segmentation, historically called the
+  pseudo-transport layer).
+
+  A single application-layer fragment can be longer than the 250 bytes of
+  user data one data-link frame carries. The transport function splits it
+  into segments, each prefixed with a 1-byte transport header:
+
+      bit 7   FIN   1 on the last segment of the fragment
+      bit 6   FIR   1 on the first segment of the fragment
+      bits 5-0      SEQUENCE, 0..63, incremented (mod 64) per segment
+
+  A one-segment fragment has FIR and FIN both set. `dnp3.dl/max-user-data-bytes`
+  is 250, one of which is this header, so a segment carries at most 249
+  application-layer bytes."
+  )
+
+(def max-segment-app-bytes
+  "250 (a link frame's user-data ceiling) minus the 1-byte transport header."
+  249)
+
+(defn- header-byte [fir fin seq]
+  (bit-or (if fin 0x80 0) (if fir 0x40 0) (bit-and seq 0x3F)))
+
+(defn segment
+  "Split `app-bytes` into a vector of `{:fir :fin :sequence :bytes}` segments,
+  each `:bytes` already including its 1-byte transport header — i.e. each is
+  ready to hand to `dnp3.dl/encode` as `user-data` unchanged.
+
+  `start-sequence` is the sequence number of the first segment (default 0);
+  it wraps mod 64 across segments, per §9.3.3."
+  ([app-bytes] (segment app-bytes 0))
+  ([app-bytes start-sequence]
+   (let [chunks (if (empty? app-bytes)
+                  [[]]
+                  (loop [rem (vec app-bytes) out []]
+                    (if (empty? rem)
+                      out
+                      (let [n (min max-segment-app-bytes (count rem))]
+                        (recur (subvec rem n) (conj out (subvec rem 0 n)))))))
+         last-i (dec (count chunks))]
+     (vec (map-indexed
+           (fn [i chunk]
+             (let [fir (zero? i)
+                   fin (= i last-i)
+                   sq (mod (+ start-sequence i) 64)]
+               {:fir fir :fin fin :sequence sq
+                :bytes (into [(header-byte fir fin sq)] chunk)}))
+           chunks)))))
+
+(defn decode-segment
+  "Split one transport segment's raw bytes (a data-link frame's user data)
+  into its header fields and application-layer payload."
+  [bs]
+  (let [bs (vec bs)]
+    (if (empty? bs)
+      {:status :error :reason :empty-segment}
+      (let [h (nth bs 0)]
+        {:status :ok
+         :fin (bit-test h 7)
+         :fir (bit-test h 6)
+         :sequence (bit-and h 0x3F)
+         :payload (subvec bs 1)}))))
+
+(defn reassemble
+  "Reassemble a sequence of already-decoded segments (as returned by
+  `decode-segment`, in link-arrival order) into one application fragment.
+
+  Enforces the ordering rules a real transport implementation must: the
+  first segment must have `:fir`, sequence numbers must increment by 1 (mod
+  64) with no gap, and the last segment must have `:fin` with none after it.
+  Any violation is a named `:error` rather than a byte soup that happens to
+  concatenate."
+  [segments]
+  (cond
+    (empty? segments) {:status :error :reason :no-segments}
+    (not (:fir (first segments))) {:status :error :reason :missing-fir}
+    :else
+    (loop [segs segments prev-seq nil acc []]
+      (if (empty? segs)
+        {:status :error :reason :missing-fin}
+        (let [{:keys [fir fin sequence payload]} (first segs)
+              acc' (into acc payload)]
+          (cond
+            (and prev-seq (not fir) (not= sequence (mod (inc prev-seq) 64)))
+            {:status :error :reason :sequence-gap :expected (mod (inc prev-seq) 64) :got sequence}
+            fin
+            (if (next segs)
+              {:status :error :reason :segment-after-fin}
+              {:status :ok :bytes acc'})
+            :else
+            (recur (next segs) sequence acc')))))))

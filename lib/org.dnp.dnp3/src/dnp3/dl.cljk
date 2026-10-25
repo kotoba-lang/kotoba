@@ -1,0 +1,208 @@
+(ns dnp3.dl
+  "DNP3 data link layer framing — IEEE Std 1815-2012 §9.2.
+
+  A frame is a 10-byte header block, followed by zero or more 16-byte user
+  data blocks, each of which carries its own trailing CRC-16/DNP:
+
+      Start1  Start2  Length  Control  Dest(2, LE)  Source(2, LE)  CRC(2)
+      0x05    0x64    1 byte  1 byte   2 bytes      2 bytes        2 bytes
+
+      [ up to 16 data bytes ]  CRC(2)
+      [ up to 16 data bytes ]  CRC(2)
+      ...
+
+  `Length` counts Control + Dest + Source + all user data bytes — five plus
+  the payload — but **not** any of the CRCs and not the two start bytes
+  themselves. A frame with no user data (an ACK, for example) has Length 5.
+  Since Length is one byte, user data is capped at 250 bytes per frame; a
+  longer application fragment is the job of the transport function
+  (`dnp3.transport`) to split across several link frames.
+
+  Each 16-byte data block gets its **own** CRC, computed with a fresh
+  init of 0x0000 — there is no CRC running across the whole frame the way a
+  single Modbus RTU frame has one CRC over the whole message. The header's
+  CRC covers all eight header bytes, start bytes included: the two 0x05 0x64
+  sync bytes are covered so a corrupted sync pattern is itself detectable."
+  (:require [dnp3.crc :as crc]))
+
+(def start-byte-1 0x05)
+(def start-byte-2 0x64)
+(def header-block-bytes 10)
+(def max-block-bytes 16)
+(def max-user-data-bytes
+  "Length is a single byte and must be at least 5 (Control + Dest + Source),
+  so the largest Length value 255 leaves 250 bytes of user data."
+  250)
+
+;; Broadcast destination addresses, §9.2.3.2. Only 0xFFFC..0xFFFF are
+;; reserved; ordinary station addresses are 0x0000..0xFFEF.
+(def broadcast-no-confirm 0xFFFC)
+(def broadcast-confirm-required 0xFFFD)
+(def broadcast-confirm-optional 0xFFFE)
+(def self-address 0xFFFF)
+
+;; Control-byte function codes, §9.2.4. DIR/PRM select which table applies;
+;; the four low bits mean different things for a primary station's request
+;; than for a secondary station's reply.
+(def primary-function-codes
+  {:reset-link-states 0
+   :test-link-states 2
+   :confirmed-user-data 3
+   :unconfirmed-user-data 4
+   :request-link-status 9})
+
+(def secondary-function-codes
+  {:ack 0
+   :nack 1
+   :link-status 11
+   :not-supported 15})
+
+(def ^:private primary-function-codes-inv (into {} (map (juxt val key)) primary-function-codes))
+(def ^:private secondary-function-codes-inv (into {} (map (juxt val key)) secondary-function-codes))
+
+(defn- be-lo [n] (bit-and n 0xFF))
+(defn- le16 [n] [(bit-and n 0xFF) (bit-and (unsigned-bit-shift-right n 8) 0xFF)])
+(defn- rd-le16 [bs i] (+ (nth bs i) (* 256 (nth bs (inc i)))))
+
+(defn encode-control
+  "Pack the control-byte fields into one byte.
+
+  `:prm true` (a primary-station frame, i.e. a request) uses `:fcb` (Frame
+  Count Bit) and `:fcv` (Frame Count Valid) in bits 5 and 4. `:prm false` (a
+  secondary-station frame, i.e. a reply) instead carries `:dfc` (Data Flow
+  Control, \"my receive buffer is full\") in bit 4, with bit 5 reserved-zero."
+  [{:keys [dir prm fcb fcv dfc function]}]
+  (let [code-map (if prm primary-function-codes secondary-function-codes)
+        fc (get code-map function)]
+    (cond
+      (nil? fc) {:status :error :reason :unknown-function-code :function function :prm prm}
+      :else
+      {:status :ok
+       :byte (bit-or (if dir 0x80 0)
+                     (if prm 0x40 0)
+                     (if prm (if fcb 0x20 0) 0)
+                     (if prm (if fcv 0x10 0) (if dfc 0x10 0))
+                     (bit-and fc 0x0F))})))
+
+(defn decode-control
+  "Unpack a control byte. `:function` is looked up in the primary or
+  secondary table depending on the decoded `:prm`; an unrecognised low
+  nibble comes back as `:reason :unknown-function-code` rather than a
+  fabricated keyword."
+  [b]
+  (let [dir (bit-test b 7)
+        prm (bit-test b 6)
+        low (bit-and b 0x0F)
+        inv (if prm primary-function-codes-inv secondary-function-codes-inv)
+        fn-kw (get inv low)]
+    (if (nil? fn-kw)
+      {:status :error :reason :unknown-function-code :code low :prm prm}
+      {:status :ok
+       :control (merge {:dir dir :prm prm :function fn-kw}
+                        (if prm
+                          {:fcb (bit-test b 5) :fcv (bit-test b 4)}
+                          {:dfc (bit-test b 4)}))})))
+
+(defn- split-blocks
+  "User data bytes chunked into ≤16-byte blocks, per §9.2.5.2."
+  [user-data]
+  (if (empty? user-data)
+    []
+    (loop [rem (vec user-data) out []]
+      (if (empty? rem)
+        out
+        (let [n (min max-block-bytes (count rem))]
+          (recur (subvec rem n) (conj out (subvec rem 0 n))))))))
+
+(defn encode
+  "Build one complete data-link frame.
+
+  `header` is `{:dir :prm :fcb :fcv :dfc :function :destination :source}`.
+  `user-data` is the transport-segment bytes (`dnp3.transport`), 0..250 of
+  them. Returns `{:status :ok :bytes […]}` or a named `:error`."
+  [{:keys [destination source] :as header} user-data]
+  (let [n (count user-data)]
+    (cond
+      (> n max-user-data-bytes)
+      {:status :error :reason :user-data-too-long :length n :maximum max-user-data-bytes}
+      (not (<= 0 destination 0xFFFF))
+      {:status :error :reason :destination-out-of-range :value destination}
+      (not (<= 0 source 0xFFFF))
+      {:status :error :reason :source-out-of-range :value source}
+      :else
+      (let [ctrl (encode-control header)]
+        (if (= :error (:status ctrl))
+          ctrl
+          (let [len (+ 5 n)
+                header-body (into [start-byte-1 start-byte-2 (be-lo len) (:byte ctrl)]
+                                   (into (le16 destination) (le16 source)))
+                header-bytes (into header-body (crc/crc16-bytes header-body))
+                blocks (split-blocks user-data)
+                data-bytes (reduce (fn [acc block]
+                                      (into acc (into (vec block) (crc/crc16-bytes block))))
+                                    []
+                                    blocks)]
+            {:status :ok :bytes (into header-bytes data-bytes)}))))))
+
+
+(defn- read-blocks
+  "Read `n-blocks` data blocks starting at `pos` in `buf` (length `n`),
+  verifying each block's own CRC. Returns `{:status :ok :pos :data}`,
+  `{:status :incomplete :need}`, or `{:status :error :reason
+  :block-crc-mismatch :block-index :received :computed}`."
+  [buf n n-blocks pos0 user-len]
+  (loop [i 0 pos pos0 remaining user-len acc []]
+    (if (= i n-blocks)
+      {:status :ok :pos pos :data acc}
+      (let [block-len (min max-block-bytes remaining)
+            need (+ pos block-len 2)]
+        (if (> need n)
+          {:status :incomplete :need (- need n)}
+          (let [block (subvec buf pos (+ pos block-len))
+                got (rd-le16 buf (+ pos block-len))
+                want (crc/crc16 block)]
+            (if (not= got want)
+              {:status :error :reason :block-crc-mismatch
+               :block-index i :received got :computed want}
+              (recur (inc i) (+ pos block-len 2) (- remaining block-len)
+                     (into acc block)))))))))
+
+(defn decode
+  "Read one data-link frame from the front of `buf`.
+
+  Returns `{:status :ok :frame {…} :consumed n}`, `{:status :incomplete :need
+  n}` (n is a lower bound — the true need isn't known until the length byte,
+  and not fully known even then since block-CRC bytes add to it), or a named
+  `:error`. `:frame` carries `:control :destination :source :user-data`."
+  [buf]
+  (let [buf (vec buf) n (count buf)]
+    (cond
+      (< n header-block-bytes) {:status :incomplete :need (- header-block-bytes n)}
+      (not= (nth buf 0) start-byte-1) {:status :error :reason :bad-start-byte-1 :got (nth buf 0)}
+      (not= (nth buf 1) start-byte-2) {:status :error :reason :bad-start-byte-2 :got (nth buf 1)}
+      :else
+      (let [len (nth buf 2)
+            header-body (subvec buf 0 8)
+            header-crc-got (rd-le16 buf 8)
+            header-crc-want (crc/crc16 header-body)]
+        (cond
+          (< len 5) {:status :error :reason :length-too-small :length len}
+          (not= header-crc-got header-crc-want)
+          {:status :error :reason :header-crc-mismatch :received header-crc-got :computed header-crc-want}
+          :else
+          (let [ctrl (decode-control (nth buf 3))]
+            (if (= :error (:status ctrl))
+              ctrl
+              (let [user-len (- len 5)
+                    ;; integer ceil-div, portable across clj/cljs
+                    n-blocks (if (zero? user-len) 0 (quot (+ user-len (dec max-block-bytes)) max-block-bytes))
+                    result (read-blocks buf n n-blocks header-block-bytes user-len)]
+                (case (:status result)
+                  :incomplete result
+                  :error result
+                  :ok {:status :ok
+                       :consumed (:pos result)
+                       :frame {:control (:control ctrl)
+                               :destination (rd-le16 buf 4)
+                               :source (rd-le16 buf 6)
+                               :user-data (:data result)}})))))))))

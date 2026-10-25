@@ -170,6 +170,19 @@ The bundled standard libraries live in this repository:
 | `org.opcfoundation.ua` | `org.opcfoundation.ua/src` | `opcua.builtin`, `opcua.nodeid`, `opcua.transport`, `opcua.variant` (an external specification, publisher opcfoundation.org) |
 | `org.iso.std15118` | `org.iso.std15118/src` | `v2gtp.bits`, `v2gtp.frame`, `v2gtp.payload-type` (an external specification, publisher iso.org) |
 | `org.fixtrading.fix` | `org.fixtrading.fix/src` | `fix.bytes`, `fix.checksum`, `fix.codec`, `fix.dictionary` (an external specification, publisher fixtrading.org) |
+| `org.ethereum.abi` | `org.ethereum.abi/src` | `ethereum.abi`, `ethereum.abi.word` (an external specification, publisher ethereum.org) |
+| `org.csaIot.zigbee` | `org.csaIot.zigbee/src` | `ieee802154.mac`, `zigbee.aps`, `zigbee.nwk` (an external specification, publisher csaIot.org) |
+| `org.ashrae.bacnet` | `org.ashrae.bacnet/src` | `bacnet.apdu`, `bacnet.bvlc`, `bacnet.npdu`, `bacnet.services` (an external specification, publisher ashrae.org) |
+| `org.ansi.iges` | `org.ansi.iges/src` | `iges.core` (an external specification, publisher ansi.org) |
+| `org.si2.lef` | `org.si2.lef/src` | `lef.core` (an external specification, publisher si2.org) |
+| `org.openehr.adl` | `org.openehr.adl/src` | `adl.archetype`, `adl.cadl`, `adl.dadl`, `adl.lexer` (an external specification, publisher openehr.org) |
+| `org.oasisOpen.mqtt` | `org.oasisOpen.mqtt/src` | `mqtt.fixed-header`, `mqtt.packet`, `mqtt.properties`, `mqtt.utf8` (an external specification, publisher oasisOpen.org) |
+| `org.ieee.verilog` | `org.ieee.verilog/src` | `kotoba.verilog`, `verilog.core` (an external specification, publisher ieee.org) |
+| `org.ieee.std1588` | `org.ieee.std1588/src` | `ptp.header`, `ptp.message`, `ptp.offset`, `ptp.timestamp` (an external specification, publisher ieee.org) |
+| `org.dnp.dnp3` | `org.dnp.dnp3/src` | `dnp3.app`, `dnp3.crc`, `dnp3.dl`, `dnp3.objects` (an external specification, publisher dnp.org) |
+| `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
+| `com.synopsys.liberty` | `com.synopsys.liberty/src` | `liberty.core` (Kotoba project library) |
+| `io.toml.core` | `io.toml.core/src` | `toml.reader` (Kotoba project library) |
 | `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |

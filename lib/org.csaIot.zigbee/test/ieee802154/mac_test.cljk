@@ -1,0 +1,149 @@
+(ns ieee802154.mac-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ieee802154.mac :as mac]))
+
+;; ;; constructed, not a published spec vector — a data frame, short
+;; addressing both ends, PAN ID compression on (so only one PAN ID is on
+;; the wire), no security.
+(def data-frame-short
+  {:frame-type :data :ack-request? true :pan-id-compression? true
+   :frame-version :v2006 :dest-addr-mode :short :src-addr-mode :short
+   :seq-num 0x42 :dest-pan-id 0x1234 :dest-addr 0xBEEF
+   :src-pan-id 0x1234 :src-addr 0xCAFE :payload [0xAA 0xBB 0xCC]})
+
+(deftest round-trip-basic
+  (let [[st bs] (mac/encode data-frame-short)]
+    (is (= :ok st))
+    ;; FCF LE bytes, seq, dest-pan(2) dest-addr(2) src-addr(2, no src-pan
+    ;; since compression+both present) payload(3) = 2+1+2+2+2+3 = 12
+    (is (= 12 (count bs)))
+    (let [[dst fr] (mac/decode bs)]
+      (is (= :ok dst))
+      (is (= 0x42 (:seq-num fr)))
+      (is (= 0x1234 (:dest-pan-id fr)))
+      (is (= 0xBEEF (:dest-addr fr)))
+      (is (= 0xCAFE (:src-addr fr)))
+      (is (not (contains? fr :src-pan-id)) "compressed away")
+      (is (= [0xAA 0xBB 0xCC] (:payload fr))))))
+
+(deftest extended-addressing-64-bit
+  ;; ;; constructed, not a published spec vector — extended (EUI-64) on
+  ;; both ends, no compression, so both PAN IDs are on the wire.
+  ;;
+  ;; `:dest-addr` here is 2^53-1 (0x1FFFFFFFFFFFFF) — the largest integer
+  ;; JavaScript can represent exactly — not the naive "top bit set" value
+  ;; 0xFFFFFFFFFFFFFFFF a real EUI-64 could legally carry. That larger
+  ;; value round-trips exactly on the JVM (arbitrary-precision `+'`/`*'`)
+  ;; but NOT on ClojureScript, where every number is a double: this is the
+  ;; documented, bounded precision gap `ieee802154.mac`'s `u64le`/
+  ;; `rd-u64le` docstring names, not a hidden one — see
+  ;; `precision-boundary-is-documented-not-silent` below, which asserts
+  ;; the gap exists on :cljs rather than pretending it doesn't.
+  (let [f {:frame-type :data :dest-addr-mode :extended :src-addr-mode :extended
+           :frame-version :v2006 :seq-num 1
+           :dest-pan-id 0xABCD :dest-addr 0x1FFFFFFFFFFFFF
+           :src-pan-id 0xABCD :src-addr 0x0001020304050607
+           :payload []}
+        [st bs] (mac/encode f)]
+    (is (= :ok st))
+    (let [[dst fr] (mac/decode bs)]
+      (is (= :ok dst))
+      (is (= 0x1FFFFFFFFFFFFF (:dest-addr fr)))
+      (is (= 0x0001020304050607 (:src-addr fr))))))
+
+(deftest precision-boundary-is-documented-not-silent
+  ;; A full EUI-64 with its top bit set (0xFFFFFFFFFFFFFFFF, a perfectly
+  ;; legal extended address) round-trips exactly on the JVM and does NOT
+  ;; on ClojureScript, because it exceeds 2^53. This test asserts BOTH
+  ;; behaviours explicitly per platform, so the gap stays a documented,
+  ;; measured fact rather than something only discovered by accident on
+  ;; whichever runtime happens to be run.
+  (let [f {:frame-type :data :dest-addr-mode :extended :src-addr-mode :none
+           :frame-version :v2006 :seq-num 1
+           :dest-pan-id 0x0001 :dest-addr 0xFFFFFFFFFFFFFFFF :payload []}
+        [st bs] (mac/encode f)
+        [dst fr] (mac/decode bs)]
+    (is (= :ok st))
+    (is (= :ok dst))
+    #?(:clj (is (= 0xFFFFFFFFFFFFFFFF (:dest-addr fr))
+                "JVM: exact via BigInt-promoting +'/*'")
+       :cljs (is (not= 0xFFFFFFFFFFFFFFFF (:dest-addr fr))
+                 "cljs: NOT exact beyond 2^53 — the documented gap, reproduced"))))
+
+(deftest addressing-mode-sweep
+  ;; Every combination of {none short extended} x {none short extended}
+  ;; for dest/src, x pan-id-compression on/off. A small space (18
+  ;; combinations) where a full sweep is cheap and catches the classic
+  ;; "field presence depends on bits parsed earlier" bug directly.
+  (testing "round trip for every addressing-mode combination"
+    (doseq [dam [:none :short :extended]
+            sam [:none :short :extended]
+            compress? [false true]]
+      (let [dest-present? (not= dam :none)
+            src-present? (not= sam :none)
+            f (cond-> {:frame-type :data :dest-addr-mode dam :src-addr-mode sam
+                       :pan-id-compression? compress? :frame-version :v2006
+                       :seq-num 7 :payload [0x01 0x02]}
+                dest-present? (assoc :dest-pan-id 0x5678
+                                      :dest-addr (if (= dam :extended) 0x1122334455667788 0x9999))
+                src-present? (assoc :src-pan-id 0x5678
+                                     :src-addr (if (= sam :extended) 0x8877665544332211 0x8888)))
+            [st bs] (mac/encode f)]
+        (is (= :ok st) (str "encode failed for " dam "/" sam "/" compress?))
+        (let [[dst fr] (mac/decode bs)]
+          (is (= :ok dst) (str "decode failed for " dam "/" sam "/" compress?))
+          (when dest-present?
+            (is (= (:dest-pan-id f) (:dest-pan-id fr)))
+            (is (= (:dest-addr f) (:dest-addr fr))))
+          (when src-present?
+            (is (= (:src-addr f) (:src-addr fr)))
+            ;; src PAN ID elided exactly when both present and compressed
+            (if (and dest-present? compress?)
+              (is (not (contains? fr :src-pan-id)))
+              (is (= (:src-pan-id f) (:src-pan-id fr))))))))))
+
+(deftest negative-reserved-frame-type
+  (let [[st reason code] (mac/encode (assoc data-frame-short :frame-type :bogus))]
+    (is (= :error st))
+    (is (= :ieee802154/reserved-frame-type reason))))
+
+(deftest negative-reserved-frame-type-decode
+  ;; FCF with frame-type bits 0-2 = 100 (4, the first reserved code —
+  ;; 4-7 are all reserved and none has a keyword in `frame-type-by-code`).
+  (let [reserved-fcf 0x0004
+        bs [(bit-and reserved-fcf 0xFF) (bit-and (unsigned-bit-shift-right reserved-fcf 8) 0xFF) 0x00]
+        [st reason code] (mac/decode bs)]
+    (is (= :error st))
+    (is (= :ieee802154/reserved-frame-type reason))
+    (is (= 4 code))))
+
+(deftest negative-reserved-addressing-mode-decode
+  ;; FCF with dest-addr-mode bits = 01 (reserved value 1, never assigned
+  ;; a keyword) at bits 10-11, everything else zero.
+  (let [reserved-fcf (bit-shift-left 1 10)
+        bs [(bit-and reserved-fcf 0xFF) (bit-and (unsigned-bit-shift-right reserved-fcf 8) 0xFF) 0x00]
+        [st reason code] (mac/decode bs)]
+    (is (= :error st))
+    (is (= :ieee802154/reserved-addressing-mode reason))
+    (is (= 1 code))))
+
+(deftest negative-frame-too-short
+  (let [[st reason] (mac/decode [0x01])]
+    (is (= :error st))
+    (is (= :ieee802154/frame-too-short reason))))
+
+(deftest negative-truncated-addressing-fields
+  ;; FCF claims short dest addressing (mode=2) but only the FCF+seq are
+  ;; present — nothing for dest PAN ID/address.
+  (let [[st fcf] (mac/build-fcf {:frame-type :data :dest-addr-mode :short
+                                  :src-addr-mode :none :frame-version :v2006})
+        _ (is (= :ok st))
+        bs [(bit-and fcf 0xFF) (bit-and (unsigned-bit-shift-right fcf 8) 0xFF) 0x00]
+        [dst reason] (mac/decode bs)]
+    (is (= :error dst))
+    (is (= :ieee802154/frame-too-short reason))))
+
+(deftest negative-sequence-number-out-of-range
+  (let [[st reason] (mac/encode (assoc data-frame-short :seq-num 300))]
+    (is (= :error st))
+    (is (= :ieee802154/sequence-number-out-of-range reason))))

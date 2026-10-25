@@ -1,0 +1,236 @@
+(ns zigbee.nwk
+  "The Zigbee NWK (Network) layer header — the frame that rides inside an
+  IEEE 802.15.4 MAC frame's payload (`ieee802154.mac/encode`'s `:payload`)
+  and carries Zigbee's own routing: 16-bit short addresses, a hop-count
+  radius, an optional pair of 64-bit IEEE addresses, multicast group
+  routing, and AODV-style source routes.
+
+  ## Provenance
+
+  The Zigbee Specification (Connectivity Standards Alliance) is a CSA
+  member document, not freely republishable, so nothing here is quoted
+  from it. This structural knowledge is reconstructed from Wireshark's
+  open-source `epan/dissectors/packet-zbee-nwk.c` (the `zbee_nwk_fcf_*`
+  field table and the source-route/multicast-control subframe parsing) and
+  from `zigpy`'s `zigpy/zigbee/zdp`/`zigpy/types` NWK models, both
+  independent open-source implementations that agree on frame shape.
+  **Every concrete frame in this library's tests is `;; constructed, not a
+  published spec vector`.**
+
+  ## NWK Frame Control (2 bytes, little-endian):
+
+    0-1   Frame Type      00 Data, 01 NWK Command, 10 reserved, 11 Inter-PAN
+    2-5   Protocol Version
+    6-7   Discover Route  00 suppress, 01 enable route discovery
+    8     Multicast flag
+    9     Security
+    10    Source Route
+    11    Destination IEEE address present
+    12    Source IEEE address present
+    13-15 Reserved
+
+  Field order after Frame Control: Destination (short, 2B) · Source (short,
+  2B) · Radius (1B) · Sequence Number (1B) · [Destination IEEE (8B), iff
+  bit 11] · [Source IEEE (8B), iff bit 12] · [Multicast Control (1B), iff
+  Multicast flag] · [Source Route Subframe, iff Source Route flag].
+
+  **Least confident item in this repo**: the exact bit split of the
+  Multicast Control byte (Mode:2 / NonmemberRadius:3 / MaxNonmemberRadius:3
+  here — reconstructed from `packet-zbee-nwk.c`'s
+  `zbee_nwk_multicast_control` bitmask table; the field's presence and byte
+  position are solid, its internal three-way bit split is the one thing in
+  this file taken furthest from a primary source.")
+
+;; ── little-endian helpers ───────────────────────────────────────────────
+
+(defn- u16le [n] [(bit-and n 0xFF) (bit-and (unsigned-bit-shift-right n 8) 0xFF)])
+(defn- rd-u16le [bs off] (bit-or (bit-and (nth bs off) 0xFF)
+                                  (bit-shift-left (bit-and (nth bs (inc off)) 0xFF) 8)))
+(defn- u64le [n]
+  (loop [x n i 0 acc []]
+    (if (= i 8) acc (recur (quot x 256) (inc i) (conj acc (int (mod x 256)))))))
+(defn- rd-u64le [bs off]
+  (reduce (fn [acc b] #?(:clj (+' (*' acc 256) b) :cljs (+ (* acc 256) b)))
+          0 (reverse (subvec (vec bs) off (+ off 8)))))
+
+;; ── vocabulary ──────────────────────────────────────────────────────────
+
+(def frame-types {:data 0 :nwk-command 1 :inter-pan 3})
+(def frame-type-by-code (into {} (map (fn [[k v]] [v k]) frame-types)))
+
+(def discover-route-modes {:suppress 0 :enable 1})
+(def discover-route-by-code (into {} (map (fn [[k v]] [v k]) discover-route-modes)))
+
+;; ── Frame Control (16 bits) ─────────────────────────────────────────────
+
+(defn build-fcf
+  "`{:frame-type :protocol-version :discover-route :multicast?
+  :security? :source-route? :dest-ieee? :src-ieee?}` -> `[:ok u16]` or
+  `[:error reason ...]`."
+  [{:keys [frame-type protocol-version discover-route multicast? security?
+           source-route? dest-ieee? src-ieee?]
+    :or {protocol-version 2 discover-route :suppress}}]
+  (cond
+    (not (contains? frame-types frame-type))
+    [:error :zigbee.nwk/reserved-frame-type frame-type]
+
+    (not (<= 0 protocol-version 0x0F))
+    [:error :zigbee.nwk/protocol-version-out-of-range protocol-version]
+
+    (not (contains? discover-route-modes discover-route))
+    [:error :zigbee.nwk/reserved-discover-route discover-route]
+
+    :else
+    [:ok (bit-or (bit-and (frame-types frame-type) 0x03)
+                 (bit-shift-left (bit-and protocol-version 0x0F) 2)
+                 (bit-shift-left (bit-and (discover-route-modes discover-route) 0x03) 6)
+                 (bit-shift-left (if multicast? 1 0) 8)
+                 (bit-shift-left (if security? 1 0) 9)
+                 (bit-shift-left (if source-route? 1 0) 10)
+                 (bit-shift-left (if dest-ieee? 1 0) 11)
+                 (bit-shift-left (if src-ieee? 1 0) 12))]))
+
+(defn parse-fcf
+  [u16]
+  (let [ft-code (bit-and u16 0x03)
+        dr-code (bit-and (unsigned-bit-shift-right u16 6) 0x03)]
+    (cond
+      (not (contains? frame-type-by-code ft-code))
+      [:error :zigbee.nwk/reserved-frame-type ft-code]
+
+      (not (contains? discover-route-by-code dr-code))
+      [:error :zigbee.nwk/reserved-discover-route dr-code]
+
+      :else
+      [:ok {:frame-type (frame-type-by-code ft-code)
+            :protocol-version (bit-and (unsigned-bit-shift-right u16 2) 0x0F)
+            :discover-route (discover-route-by-code dr-code)
+            :multicast? (bit-test u16 8)
+            :security? (bit-test u16 9)
+            :source-route? (bit-test u16 10)
+            :dest-ieee? (bit-test u16 11)
+            :src-ieee? (bit-test u16 12)}])))
+
+;; ── multicast control byte ──────────────────────────────────────────────
+
+(def multicast-modes {:member 0 :nonmember 1})
+(def multicast-mode-by-code (into {} (map (fn [[k v]] [v k]) multicast-modes)))
+
+(defn build-multicast-control
+  [{:keys [mode nonmember-radius max-nonmember-radius]
+    :or {nonmember-radius 0 max-nonmember-radius 0}}]
+  (cond
+    (not (contains? multicast-modes mode))
+    [:error :zigbee.nwk/reserved-multicast-mode mode]
+
+    (not (<= 0 nonmember-radius 7))
+    [:error :zigbee.nwk/radius-out-of-range nonmember-radius]
+
+    (not (<= 0 max-nonmember-radius 7))
+    [:error :zigbee.nwk/radius-out-of-range max-nonmember-radius]
+
+    :else
+    [:ok (bit-or (bit-and (multicast-modes mode) 0x03)
+                 (bit-shift-left (bit-and nonmember-radius 0x07) 2)
+                 (bit-shift-left (bit-and max-nonmember-radius 0x07) 5))]))
+
+(defn parse-multicast-control
+  [b]
+  (let [mode-code (bit-and b 0x03)]
+    (if-not (contains? multicast-mode-by-code mode-code)
+      [:error :zigbee.nwk/reserved-multicast-mode mode-code]
+      [:ok {:mode (multicast-mode-by-code mode-code)
+            :nonmember-radius (bit-and (unsigned-bit-shift-right b 2) 0x07)
+            :max-nonmember-radius (bit-and (unsigned-bit-shift-right b 5) 0x07)}])))
+
+;; ── full header ─────────────────────────────────────────────────────────
+
+(defn encode
+  "`{:frame-type ... :dest-addr :src-addr :radius :seq-num :dest-ieee
+  :src-ieee :multicast-control {...} :relay-list [addr ...] :relay-index
+  :payload}` -> `[:ok bytes]` | `[:error reason ...]`. `relay-list`/
+  `relay-index` build the Source Route Subframe (relay count is derived
+  from `(count relay-list)`, never passed separately, so it cannot
+  disagree with the list)."
+  [{:keys [dest-addr src-addr radius seq-num dest-ieee src-ieee
+           multicast-control relay-list relay-index payload]
+    :or {relay-list [] relay-index 0 payload []} :as m}]
+  (let [[st fcf-or-reason & extra] (build-fcf m)]
+    (if (= st :error)
+      (into [st fcf-or-reason] extra)
+      (let [fcf fcf-or-reason
+            [_ pfcf] (parse-fcf fcf)
+            {:keys [multicast? source-route? dest-ieee? src-ieee?]} pfcf]
+        (cond
+          (not (<= 0 dest-addr 0xFFFF)) [:error :zigbee.nwk/address-out-of-range dest-addr]
+          (not (<= 0 src-addr 0xFFFF)) [:error :zigbee.nwk/address-out-of-range src-addr]
+          (not (<= 0 radius 0xFF)) [:error :zigbee.nwk/radius-out-of-range radius]
+          (not (<= 0 seq-num 0xFF)) [:error :zigbee.nwk/sequence-number-out-of-range seq-num]
+          (and dest-ieee? (nil? dest-ieee)) [:error :zigbee.nwk/missing-dest-ieee]
+          (and src-ieee? (nil? src-ieee)) [:error :zigbee.nwk/missing-src-ieee]
+          (> (count relay-list) 0xFF) [:error :zigbee.nwk/relay-count-out-of-range (count relay-list)]
+          (and source-route? (not (<= 0 relay-index (count relay-list))))
+          [:error :zigbee.nwk/relay-index-out-of-range relay-index]
+
+          :else
+          (let [[mst mc-or-reason :as mc-built] (if multicast?
+                                      (build-multicast-control multicast-control)
+                                      [:ok nil])]
+            (if (= mst :error)
+              (vec mc-built)
+              [:ok (vec (concat (u16le fcf)
+                                 (u16le dest-addr)
+                                 (u16le src-addr)
+                                 [(bit-and radius 0xFF) (bit-and seq-num 0xFF)]
+                                 (when dest-ieee? (u64le dest-ieee))
+                                 (when src-ieee? (u64le src-ieee))
+                                 (when multicast? [mc-or-reason])
+                                 (when source-route?
+                                   (concat [(count relay-list) (bit-and relay-index 0xFF)]
+                                           (mapcat u16le relay-list)))
+                                 payload))])))))))
+
+(defn decode
+  [bs]
+  (let [bs (vec bs) n (count bs)]
+    (if (< n 8)
+      [:error :zigbee.nwk/frame-too-short n]
+      (let [[st fcf :as parsed] (parse-fcf (rd-u16le bs 0))]
+        (if (= st :error)
+          (vec parsed)
+          (let [{:keys [dest-ieee? src-ieee? multicast? source-route?]} fcf
+                dest-addr (rd-u16le bs 2)
+                src-addr (rd-u16le bs 4)
+                radius (nth bs 6)
+                seq-num (nth bs 7)
+                off (atom 8)
+                take-ieee! (fn [] (let [v (rd-u64le bs @off)] (swap! off + 8) v))]
+            (if (< n (+ 8 (if dest-ieee? 8 0) (if src-ieee? 8 0) (if multicast? 1 0)
+                         (if source-route? 2 0)))
+              [:error :zigbee.nwk/frame-too-short n]
+              (let [dest-ieee (when dest-ieee? (take-ieee!))
+                    src-ieee (when src-ieee? (take-ieee!))
+                    [mst mc :as mc-parsed] (if multicast?
+                               (let [r (parse-multicast-control (nth bs @off))]
+                                 (swap! off inc) r)
+                               [:ok nil])]
+                (if (= mst :error)
+                  (vec mc-parsed)
+                  (let [relay-count (when source-route? (nth bs @off))
+                        relay-index (when source-route? (nth bs (inc @off)))
+                        _ (when source-route? (swap! off + 2))
+                        need (+ @off (* 2 (or relay-count 0)))]
+                    (if (< n need)
+                      [:error :zigbee.nwk/frame-too-short n]
+                      (let [relay-list (when source-route?
+                                          (vec (for [i (range relay-count)]
+                                                 (rd-u16le bs (+ @off (* 2 i))))))
+                            _ (when source-route? (swap! off + (* 2 relay-count)))]
+                        [:ok (cond-> {:fcf fcf :dest-addr dest-addr :src-addr src-addr
+                                      :radius radius :seq-num seq-num
+                                      :payload (subvec bs @off n)}
+                               dest-ieee? (assoc :dest-ieee dest-ieee)
+                               src-ieee? (assoc :src-ieee src-ieee)
+                               multicast? (assoc :multicast-control mc)
+                               source-route? (assoc :relay-list relay-list
+                                                     :relay-index relay-index))]))))))))))))

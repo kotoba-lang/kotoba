@@ -1,0 +1,272 @@
+(ns ptp.core-test
+  "Header/message-type facts (messageType nibbles, controlField, the header
+  being exactly 34 bytes) are IEEE 1588-2019 clause 13.3 and are the same
+  in every PTP stack; there is no worked byte-for-byte example of a full
+  frame in the specification text the way Modbus's Annex has one, so every
+  concrete byte vector below is `;; constructed, not a published spec
+  vector` — built from the field widths and semantics the specification
+  defines, not copied from a worked example."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ptp.header :as header]
+            [ptp.timestamp :as ts]
+            [ptp.message :as msg]
+            [ptp.offset :as offset]))
+
+;; ── messageType nibble, clause 13.3.2.2 ─────────────────────────────────────
+;; Not constructed — these values are the specification's own assignment
+;; and are load-bearing in every PTP implementation that exists.
+
+(deftest message-type-nibbles
+  (is (= :sync (header/message-types 0x0)))
+  (is (= :delay-req (header/message-types 0x1)))
+  (is (= :pdelay-req (header/message-types 0x2)))
+  (is (= :pdelay-resp (header/message-types 0x3)))
+  (is (= :follow-up (header/message-types 0x8)))
+  (is (= :delay-resp (header/message-types 0x9)))
+  (is (= :announce (header/message-types 0xB)))
+  (is (nil? (header/message-types 0x4)) "0x4-0x7 and 0xE-0xF are reserved"))
+
+(deftest control-field-derivation
+  ;; clause 13.3.2.14 — derived from messageType, never independent data.
+  (is (= 0x00 (header/control-field-for :sync)))
+  (is (= 0x01 (header/control-field-for :delay-req)))
+  (is (= 0x02 (header/control-field-for :follow-up)))
+  (is (= 0x03 (header/control-field-for :delay-resp)))
+  (is (= 0x05 (header/control-field-for :announce)) "all others -> 0x05")
+  (is (= 0x05 (header/control-field-for :pdelay-req))))
+
+;; ── header round-trip ────────────────────────────────────────────────────────
+
+(def clock-id [0x00 0x1B 0x21 0xFF 0xFE 0x3C 0x9A 0x01]) ; constructed EUI-64-shaped id
+
+(defn- base-header []
+  {:transport-specific 0
+   :version-ptp 2
+   :domain-number 0
+   :flags #{:two-step}
+   :correction 1234
+   :source-port-identity {:clock-identity clock-id :port-number 1}
+   :sequence-id 42
+   :log-message-interval 0})
+
+(deftest header-encode-is-34-bytes
+  ;; constructed, not a published spec vector — the length itself (34) is
+  ;; the specification's own fact (clause 13.3), the content is ours.
+  (let [[st bytes] (header/encode-header (assoc (base-header)
+                                                 :message-type :sync
+                                                 :message-length 44))]
+    (is (= :ok st))
+    (is (= 34 (count bytes)))))
+
+(deftest header-round-trip
+  (doseq [mt [:sync :delay-req :pdelay-req :pdelay-resp :follow-up :delay-resp :announce]]
+    (testing mt
+      (let [[est ebytes] (header/encode-header (assoc (base-header)
+                                                        :message-type mt
+                                                        :message-length 100))
+            [dst dh] (header/decode-header ebytes)]
+        (is (= :ok est))
+        (is (= :ok dst))
+        (is (= mt (:message-type dh)))
+        (is (= #{:two-step} (:flags dh)))
+        (is (= 42 (:sequence-id dh)))
+        (is (= clock-id (:clock-identity (:source-port-identity dh))))
+        (is (= 1 (:port-number (:source-port-identity dh))))
+        (is (= (header/control-field-for mt) (:control-field dh)))))))
+
+(deftest flag-round-trip-every-known-flag
+  (doseq [f (keys header/flag-bits)]
+    (let [[o0 o1] (header/encode-flags #{f})]
+      (is (= #{f} (header/decode-flags o0 o1)) (str "flag " f)))))
+
+(deftest flags-combine-without-interference
+  (let [[o0 o1] (header/encode-flags #{:two-step :unicast :ptp-timescale})]
+    (is (= #{:two-step :unicast :ptp-timescale} (header/decode-flags o0 o1)))))
+
+;; ── timestamp (80-bit) ───────────────────────────────────────────────────────
+
+(deftest timestamp-round-trip
+  (doseq [v [{:seconds 0 :nanoseconds 0}
+             {:seconds 1 :nanoseconds 1}
+             {:seconds 0xFFFFFFFFFFFF :nanoseconds 0xFFFFFFFF} ; max 48/32-bit
+             {:seconds 1735689600 :nanoseconds 500000000}]]
+    (let [[est ebytes] (ts/encode-timestamp v)
+          [dst dv] (ts/decode-timestamp ebytes)]
+      (is (= :ok est))
+      (is (= 10 (count ebytes)))
+      (is (= :ok dst))
+      (is (= v dv)))))
+
+(deftest timestamp-out-of-range-is-refused
+  (is (= :ptp/seconds-out-of-range (second (ts/encode-timestamp {:seconds (inc ts/max-seconds) :nanoseconds 0}))))
+  (is (= :ptp/nanoseconds-out-of-range (second (ts/encode-timestamp {:seconds 0 :nanoseconds (inc ts/max-nanoseconds)})))))
+
+;; ── correctionField (64-bit scaled nanoseconds) ─────────────────────────────
+
+(deftest correction-is-scaled-by-2-16
+  ;; clause 13.3.2.6 — the wire value is nanoseconds * 2^16, not the raw
+  ;; nanosecond count. Constructed, but the ×65536 factor itself is the
+  ;; specification's definition, not a guess.
+  (let [[st bytes] (ts/encode-correction 1)]
+    (is (= :ok st))
+    ;; 1 ns * 65536 = 0x10000, so the low three bytes are 01 00 00.
+    (is (= [0x00 0x00 0x00 0x00 0x00 0x01 0x00 0x00] bytes))))
+
+(deftest correction-round-trip
+  (doseq [ns [0 1 -1 1000 -1000 500000 -500000 1000000000 -1000000000]]
+    (let [[est ebytes] (ts/encode-correction ns)
+          [dst dv] (ts/decode-correction ebytes)]
+      (is (= :ok est) (str "encode " ns))
+      (is (= 8 (count ebytes)))
+      (is (= :ok dst))
+      (is (= ns (:nanoseconds dv)) (str "round trip " ns)))))
+
+(deftest correction-negative-top-bit-is-set
+  ;; sign bit of a negative Integer64 is the top bit of byte 0. -1 ns
+  ;; scaled is -0x10000 (-1 * 2^16), whose 8-byte two's complement is
+  ;; FF FF FF FF FF FF 00 00 — the low two bytes are zero because -1 ns is
+  ;; an exact multiple of 2^16, not because the value is small.
+  (let [[_ bytes] (ts/encode-correction -1)]
+    (is (= [0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0x00 0x00] bytes))))
+
+;; ── whole message round-trip, over all seven implemented types ─────────────
+
+(defn- rand-ts [] {:seconds (rand-int 2000000000) :nanoseconds (rand-int 1000000000)})
+(defn- rand-clock-id [] (vec (repeatedly 8 #(rand-int 256))))
+(defn- rand-port-id [] {:clock-identity (rand-clock-id) :port-number (rand-int 65536)})
+
+(defn- rand-body [mt]
+  (case mt
+    (:sync :delay-req :pdelay-req) {:origin-timestamp (rand-ts)}
+    :follow-up {:precise-origin-timestamp (rand-ts)}
+    :delay-resp {:receive-timestamp (rand-ts) :requesting-port-identity (rand-port-id)}
+    :pdelay-resp {:request-receipt-timestamp (rand-ts) :requesting-port-identity (rand-port-id)}
+    :announce {:origin-timestamp (rand-ts)
+               :current-utc-offset (- (rand-int 100) 50)
+               :grandmaster-priority1 (rand-int 256)
+               :grandmaster-clock-quality {:clock-class (rand-int 256)
+                                            :clock-accuracy (rand-int 256)
+                                            :offset-scaled-log-variance (rand-int 65536)}
+               :grandmaster-priority2 (rand-int 256)
+               :grandmaster-identity (rand-clock-id)
+               :steps-removed (rand-int 65536)
+               :time-source (rand-int 256)}))
+
+(deftest whole-message-round-trip-sweep
+  (doseq [mt [:sync :delay-req :pdelay-req :pdelay-resp :follow-up :delay-resp :announce]
+          _run (range 25)]
+    (testing (str mt)
+      (let [m (assoc (base-header)
+                      :message-type mt
+                      :sequence-id (rand-int 65536)
+                      :correction (- (rand-int 1000000) 500000)
+                      :source-port-identity (rand-port-id)
+                      :body (rand-body mt))
+            [est ebytes] (msg/encode m)]
+        (is (= :ok est) (str "encode " mt " " est " " ebytes))
+        (when (= :ok est)
+          (let [[dst dm] (msg/decode ebytes)]
+            (is (= :ok dst))
+            (when (= :ok dst)
+              (is (= mt (get-in dm [:header :message-type])))
+              (is (= (:sequence-id m) (get-in dm [:header :sequence-id])))
+              (is (= (:body m) (:body dm)) (str mt " body round-trip")))))))))
+
+;; ── offset / delay arithmetic ────────────────────────────────────────────────
+;; constructed, not a published spec vector — the ((t2-t1)-(t4-t3))/2 and
+;; ((t2-t1)+(t4-t3))/2 formulas are clause 11.3's, the numbers are ours.
+
+(deftest offset-and-delay-textbook-example
+  ;; Symmetric 500 ns path, slave clock 200 ns ahead of master:
+  ;;   t1 = 0, t2 = 700 (500 delay + 200 ahead), t3 = 1000, t4 = 1300
+  (let [t1 {:seconds 0 :nanoseconds 0}
+        t2 {:seconds 0 :nanoseconds 700}
+        t3 {:seconds 0 :nanoseconds 1000}
+        t4 {:seconds 0 :nanoseconds 1300}]
+    (is (= 200 (offset/offset-from-master t1 t2 t3 t4)))
+    (is (= 500 (offset/mean-path-delay t1 t2 t3 t4)))))
+
+(deftest offset-crosses-a-second-boundary
+  ;; t2-t1 = (11-10)*1e9 + (500-999999800) = 700 ns, crossing a second
+  ;; boundary the naive "just subtract .nanoseconds" approach would get
+  ;; wrong (500 - 999999800 is negative; it is the seconds carry that
+  ;; makes the true difference +700, not -999999300).
+  (let [t1 {:seconds 10 :nanoseconds 999999800}
+        t2 {:seconds 11 :nanoseconds 500}
+        t3 {:seconds 20 :nanoseconds 0}
+        t4 {:seconds 20 :nanoseconds 500}]
+    (is (= 100 (offset/offset-from-master t1 t2 t3 t4)))
+    (is (= 600 (offset/mean-path-delay t1 t2 t3 t4)))))
+
+;; ── negative tests: named, discriminating errors ────────────────────────────
+
+(deftest short-header-is-refused
+  (is (= :ptp/short-header (second (header/decode-header (vec (repeat 33 0))))))
+  (is (= :ptp/short-header (second (header/decode-header [])))))
+
+(deftest unknown-message-type-code-is-refused
+  ;; nibble 0x4 is reserved — never a valid messageType.
+  (let [bs (assoc (vec (repeat 34 0)) 0 0x04)]
+    (is (= :ptp/unknown-message-type-code (second (header/decode-header bs))))))
+
+(deftest unknown-message-type-symbol-is-refused-on-encode
+  (is (= :ptp/unknown-message-type
+         (second (header/encode-header (assoc (base-header)
+                                               :message-type :not-a-real-type
+                                               :message-length 44))))))
+
+(deftest bad-clock-identity-length-is-refused
+  (is (= :ptp/bad-clock-identity-length
+         (second (header/encode-port-identity {:clock-identity [1 2 3] :port-number 1})))))
+
+(deftest message-length-mismatch-is-refused
+  (let [[_ ebytes] (msg/encode (assoc (base-header)
+                                       :message-type :sync
+                                       :body {:origin-timestamp (rand-ts)}))]
+    (is (= :ptp/message-length-mismatch
+           (second (msg/decode (conj (vec ebytes) 0)))) "one extra trailing byte")))
+
+(deftest header-only-frame-is-refused-as-length-mismatch
+  ;; A header alone (34 bytes) claiming to be a 44-byte Sync message, but
+  ;; with no body bytes actually supplied. Caught by the length-mismatch
+  ;; check (34 supplied != 44 declared) before the body decoder ever runs.
+  (let [[_ hbytes] (header/encode-header (assoc (base-header)
+                                                 :message-type :sync
+                                                 :message-length 44))]
+    (is (= :ptp/message-length-mismatch (second (msg/decode hbytes)))
+        "34 supplied bytes disagree with the header's own claimed 44")))
+
+(deftest short-body-is-refused
+  ;; A header whose OWN claimed :message-length agrees with what is
+  ;; actually supplied (43 bytes: 34 header + 9), which is why this does
+  ;; NOT hit :ptp/message-length-mismatch — but 9 bytes is one short of the
+  ;; 10 a Sync body needs, so the body-length check must catch it instead.
+  ;; Proves the two checks are independent, not the same check reported
+  ;; under two names.
+  (let [[_ hbytes] (header/encode-header (assoc (base-header)
+                                                 :message-type :sync
+                                                 :message-length 43))
+        frame (into (vec hbytes) (repeat 9 0))]
+    (is (= 43 (count frame)))
+    (is (= :ptp/short-body (second (msg/decode frame))))))
+
+(deftest correction-non-integer-is-refused
+  (is (= :ptp/correction-must-be-integer-nanoseconds (second (ts/encode-correction 1.5)))))
+
+(deftest correction-out-of-range-is-refused
+  (is (= :ptp/correction-out-of-range (second (ts/encode-correction 999999999999999)))))
+
+;; ── discrimination: a broken frame is refused for the SPECIFIC reason ──────
+;; (not merely "refused somehow" — see module docstring / repo README for
+;; what was actually broken and restored to prove this.)
+
+(deftest decode-refuses-truncated-timestamp-inside-a-valid-header
+  ;; Same shape as short-body-is-refused, restated with a non-zero
+  ;; declared length that still agrees with the (still too-short) supplied
+  ;; bytes, so it is exercising the same discriminating branch from a
+  ;; different starting header.
+  (let [[_ hbytes] (header/encode-header (assoc (base-header)
+                                                 :message-type :delay-req
+                                                 :message-length 43))
+        too-short-body (vec (repeat 9 0))] ; Delay_Req body must be 10 bytes
+    (is (= :ptp/short-body (second (msg/decode (into (vec hbytes) too-short-body)))))))

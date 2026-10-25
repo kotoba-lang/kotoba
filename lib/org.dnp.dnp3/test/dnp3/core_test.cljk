@@ -1,0 +1,328 @@
+(ns dnp3.core-test
+  "Structural correctness over the DNP3 (IEEE Std 1815-2012) stack this repo
+  implements: data link framing (§9.2), transport segmentation (§9.3), and
+  application-layer object headers (§9.4/§9.5) over the point subset in
+  `dnp3.objects`.
+
+  The CRC check value and the wire layout of the data-link header (start
+  bytes, Length semantics, per-block CRC) are the two facts in this suite
+  independently cross-checked against outside sources — the CRC against the
+  CRC RevEng catalogue's published check value for CRC-16/DNP, the frame
+  layout against the structural description of §9.2 this session recalls
+  with high confidence from prior exposure to the standard. Object-group
+  qualifiers, function codes, CROB fields and IIN bits are exercised for
+  internal consistency (round trip, and the well-known
+  read-classes-0-through-3 integrity-poll byte sequence for the request
+  side) but are not claimed as verbatim quotations of the standard's own
+  tables; see the `;; constructed` notes in `dnp3.objects` and `dnp3.app`."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [dnp3.crc :as crc]
+            [dnp3.dl :as dl]
+            [dnp3.transport :as transport]
+            [dnp3.objects :as objects]
+            [dnp3.app :as app]))
+
+;; ── CRC-16/DNP ───────────────────────────────────────────────────────────
+
+(defn- str->bytes
+  "UTF-8 byte values of an ASCII string, portably. `(map int s)` is a trap
+  here: on the JVM, iterating a string gives `Character`s and `int` of one
+  is its code point — but on ClojureScript, iterating a string gives
+  one-character *strings*, and `int` of a one-character numeric string
+  string-coerces it to that small integer instead (`(int \"7\")` => `7`,
+  not `55`) — a wrong-and-plausible answer this repo's `org-modbus` sibling
+  documents hitting the same way."
+  [s]
+  #?(:clj (mapv int s)
+     :cljs (mapv #(.charCodeAt % 0) s)))
+
+(deftest crc-check-value
+  ;; CRC RevEng catalogue, CRC-16/DNP: width=16 poly=0x3D65 init=0x0000
+  ;; refin=true refout=true xorout=0xFFFF, check="123456789" -> 0xEA82.
+  (let [bs (str->bytes "123456789")]
+    (is (= 0xEA82 (crc/crc16 bs)))
+    (is (= 0xEA82 (crc/crc16-bitwise-complemented bs)))))
+
+(deftest crc-bitwise-and-table-agree-over-all-two-byte-inputs
+  ;; The same cross-check org-modbus's suite makes: two independently
+  ;; written implementations agreeing over the full two-byte input space is
+  ;; a stronger statement than either matching one remembered constant.
+  (is (every? (fn [hi]
+                (every? (fn [lo]
+                          (= (crc/crc16 [hi lo]) (crc/crc16-bitwise-complemented [hi lo])))
+                        (range 256)))
+              (range 256))))
+
+(deftest crc-detects-every-single-bit-error
+  (let [frame (vec (range 1 21)) ;; 20 arbitrary bytes
+        good (crc/crc16 frame)]
+    (is (every? (fn [byte-i]
+                  (every? (fn [bit-i]
+                            (let [flipped (update frame byte-i bit-xor (bit-shift-left 1 bit-i))]
+                              (not= good (crc/crc16 flipped))))
+                          (range 8)))
+                (range (count frame))))))
+
+;; ── data link layer ──────────────────────────────────────────────────────
+
+(defn- dl-roundtrip [header user-data]
+  (let [enc (dl/encode header user-data)]
+    (is (= :ok (:status enc)) (str "encode: " enc))
+    (let [dec (dl/decode (:bytes enc))]
+      (is (= :ok (:status dec)) (str "decode: " dec))
+      (is (= (count (:bytes enc)) (:consumed dec)))
+      (is (= (vec user-data) (get-in dec [:frame :user-data])))
+      dec)))
+
+(deftest data-link-roundtrip-no-user-data
+  ;; An ACK: no user data, Length = 5.
+  (dl-roundtrip {:dir false :prm false :function :ack :destination 1 :source 4} []))
+
+(deftest data-link-roundtrip-small-user-data
+  (dl-roundtrip {:dir true :prm true :fcb false :fcv false :function :unconfirmed-user-data
+                 :destination 4 :source 1}
+                [1 2 3 4 5]))
+
+(deftest data-link-roundtrip-exactly-one-block
+  (dl-roundtrip {:dir true :prm true :fcb true :fcv true :function :confirmed-user-data
+                 :destination 1 :source 1024}
+                (vec (range 16))))
+
+(deftest data-link-roundtrip-multi-block
+  ;; 250 bytes, the per-frame ceiling: 15 full 16-byte blocks + one 10-byte block.
+  (let [dec (dl-roundtrip {:dir true :prm true :fcb false :fcv false :function :unconfirmed-user-data
+                            :destination 1 :source 2}
+                           (vec (range 250)))]
+    (is (= :unconfirmed-user-data (get-in dec [:frame :control :function])))
+    (is (= 1 (get-in dec [:frame :destination])))
+    (is (= 2 (get-in dec [:frame :source])))))
+
+(deftest data-link-control-byte-fields-roundtrip
+  (let [dec (dl-roundtrip {:dir true :prm true :fcb true :fcv false :function :test-link-states
+                            :destination 7 :source 8}
+                           [])]
+    (is (= {:dir true :prm true :function :test-link-states :fcb true :fcv false}
+           (:control (:frame dec))))))
+
+(deftest data-link-rejects-bad-start-bytes
+  (let [enc (dl/encode {:dir false :prm false :function :ack :destination 1 :source 1} [])
+        bad (assoc (vec (:bytes enc)) 0 0x00)]
+    (is (= :bad-start-byte-1 (:reason (dl/decode bad))))))
+
+(deftest data-link-rejects-header-crc-mismatch
+  (let [enc (dl/encode {:dir true :prm true :fcb false :fcv false :function :unconfirmed-user-data
+                         :destination 4 :source 1}
+                        [1 2 3])
+        corrupted (update (vec (:bytes enc)) 8 bit-xor 0xFF)]
+    (is (= :header-crc-mismatch (:reason (dl/decode corrupted))))))
+
+(deftest data-link-rejects-block-crc-mismatch
+  (let [enc (dl/encode {:dir true :prm true :fcb false :fcv false :function :unconfirmed-user-data
+                         :destination 4 :source 1}
+                        (vec (range 20))) ;; 2 blocks
+        corrupted (update (vec (:bytes enc)) 12 bit-xor 0xFF)] ;; inside block 1's data
+    (is (= :block-crc-mismatch (:reason (dl/decode corrupted))))))
+
+(deftest data-link-incomplete-buffer
+  (let [enc (dl/encode {:dir true :prm true :fcb false :fcv false :function :unconfirmed-user-data
+                         :destination 4 :source 1}
+                        (vec (range 20)))]
+    (is (= :incomplete (:status (dl/decode (subvec (vec (:bytes enc)) 0 5)))))
+    (is (= :incomplete (:status (dl/decode (subvec (vec (:bytes enc)) 0 15)))))))
+
+(deftest data-link-rejects-unknown-function-code
+  ;; Low nibble 5 is not assigned in either the primary or secondary table.
+  ;; The header CRC covers the control byte, so it has to be recomputed
+  ;; after corrupting the function code, or the frame would (correctly)
+  ;; fail on :header-crc-mismatch instead of the thing this test targets.
+  (let [enc (dl/encode {:dir true :prm true :fcb false :fcv false :function :unconfirmed-user-data
+                         :destination 1 :source 1} [])
+        with-bad-fn (update (vec (:bytes enc)) 3 (fn [b] (bit-or (bit-and b 0xF0) 0x05)))
+        header-body (subvec with-bad-fn 0 8)
+        corrupted (into header-body (into (crc/crc16-bytes header-body) (subvec with-bad-fn 10)))]
+    (is (= :error (:status (dl/decode corrupted))))
+    (is (= :unknown-function-code (:reason (dl/decode corrupted))))))
+
+;; ── transport function ───────────────────────────────────────────────────
+
+(deftest transport-roundtrip-single-segment
+  (let [segs (transport/segment [1 2 3 4 5])
+        decoded (map transport/decode-segment (map :bytes segs))
+        r (transport/reassemble decoded)]
+    (is (= 1 (count segs)))
+    (is (:fir (first segs)))
+    (is (:fin (first segs)))
+    (is (= :ok (:status r)))
+    (is (= [1 2 3 4 5] (:bytes r)))))
+
+(deftest transport-roundtrip-multi-segment-with-sequence-wrap
+  (let [app-bytes (vec (range 0 600))
+        segs (transport/segment app-bytes 62) ;; wraps 62 63 0
+        decoded (map transport/decode-segment (map :bytes segs))
+        r (transport/reassemble decoded)]
+    (is (= 3 (count segs)))
+    (is (= [62 63 0] (mapv :sequence segs)))
+    (is (= :ok (:status r)))
+    (is (= app-bytes (:bytes r)))))
+
+(deftest transport-roundtrip-empty-application-fragment
+  (let [segs (transport/segment [])
+        decoded (map transport/decode-segment (map :bytes segs))
+        r (transport/reassemble decoded)]
+    (is (= 1 (count segs)))
+    (is (= :ok (:status r)))
+    (is (= [] (:bytes r)))))
+
+(deftest transport-rejects-missing-fir
+  (let [segs (transport/segment (vec (range 600)))
+        decoded (map transport/decode-segment (map :bytes segs))]
+    (is (= :missing-fir (:reason (transport/reassemble (rest decoded)))))))
+
+(deftest transport-rejects-sequence-gap
+  (let [segs (transport/segment (vec (range 600)))
+        decoded (vec (map transport/decode-segment (map :bytes segs)))]
+    (is (= :sequence-gap (:reason (transport/reassemble [(nth decoded 0) (nth decoded 2)]))))))
+
+(deftest transport-rejects-missing-fin
+  (let [segs (transport/segment (vec (range 600)))
+        decoded (map transport/decode-segment (map :bytes segs))]
+    (is (= :missing-fin (:reason (transport/reassemble (butlast decoded)))))))
+
+;; ── object payload codecs ────────────────────────────────────────────────
+
+(defn- point-roundtrip [group variation point]
+  (let [codec (get objects/point-codecs [group variation])
+        bs ((:encode codec) point)]
+    (is (= (:size codec) (count bs)))
+    (let [decoded ((:decode codec) bs 0)]
+      (is (= (:size codec) (:size decoded)))
+      (:point decoded))))
+
+(deftest g1v2-binary-input-with-flags-roundtrip
+  (let [p {:flags {:online true :restart false :comm-lost false :remote-forced false
+                    :local-forced false :chatter-filter true :state true}}]
+    (is (= p (point-roundtrip 1 2 p)))))
+
+(deftest g2v2-binary-input-event-with-time-roundtrip
+  (let [p {:flags {:online true :restart false :comm-lost false :remote-forced false
+                    :local-forced false :chatter-filter false :state false}
+           :timestamp 1700000000123}]
+    (is (= p (point-roundtrip 2 2 p)))))
+
+(deftest g30v1-analog-input-32-roundtrip-negative-value
+  (let [p {:flags {:online true :restart false :comm-lost false :remote-forced false
+                    :local-forced false :over-range false :reference-err false}
+           :value -123456}]
+    (is (= p (point-roundtrip 30 1 p)))))
+
+(deftest g32v2-analog-input-event-16-roundtrip-extremes
+  (doseq [v [32767 -32768 0 -1]]
+    (let [p {:flags {:online true :restart false :comm-lost false :remote-forced false
+                      :local-forced false :over-range false :reference-err false}
+             :value v}]
+      (is (= p (point-roundtrip 32 2 p))))))
+
+(deftest g12v1-crob-roundtrip
+  (let [p {:control-code {:tcc :close :clear false :op-type :latch-on}
+           :count 1 :on-time 1000 :off-time 500 :status :success}]
+    (is (= p (point-roundtrip 12 1 p)))))
+
+;; ── application layer ────────────────────────────────────────────────────
+
+(deftest integrity-poll-request-self-consistent-encoding
+  ;; "Read Class 0/1/2/3" (an integrity poll) with no confirmation, SEQUENCE
+  ;; 3. The resulting bytes (0xC3 0x01 0x3C 0x01 0x06 ...) resemble the
+  ;; integrity-poll byte pattern this session has seen in general DNP3
+  ;; discussion, which is some evidence the qualifier/header framing above
+  ;; is shaped correctly — but this suite has not checked it against IEEE
+  ;; 1815's own text in this session, so it is asserted here only as a
+  ;; fixed-point/self-consistency check (this encoder producing this output
+  ;; today and in the future), not as a verified spec vector.
+  ;; ;; constructed, not a published spec vector
+  (let [req {:fir true :fin true :con false :uns false :sequence 3 :function :read
+             :object-groups [{:group 60 :variation 1 :qualifier-kind :no-range}
+                              {:group 60 :variation 2 :qualifier-kind :no-range}
+                              {:group 60 :variation 3 :qualifier-kind :no-range}
+                              {:group 60 :variation 4 :qualifier-kind :no-range}]}
+        enc (app/encode-request req)]
+    (is (= :ok (:status enc)))
+    (is (= [0xC3 0x01 0x3C 0x01 0x06 0x3C 0x02 0x06 0x3C 0x03 0x06 0x3C 0x04 0x06]
+           (:bytes enc)))
+    (let [dec (app/decode-request (:bytes enc))]
+      (is (= :ok (:status dec)))
+      (is (= :read (get-in dec [:fragment :function])))
+      (is (= 3 (get-in dec [:fragment :sequence])))
+      (is (= 4 (count (get-in dec [:fragment :object-groups])))))))
+
+(deftest binary-input-response-roundtrip
+  (let [resp {:fir true :fin true :con false :uns false :sequence 3 :function :response
+              :iin {:device-restart false :need-time false}
+              :object-groups [{:group 1 :variation 2 :qualifier-kind :range-8 :start 0 :stop 2
+                                :points [{:flags {:online true :state true}}
+                                          {:flags {:online true :state false}}
+                                          {:flags {:online true :state true}}]}]}
+        enc (app/encode-response resp)
+        dec (app/decode-response (:bytes enc))]
+    (is (= :ok (:status enc)))
+    (is (= :ok (:status dec)))
+    (is (= [true false true]
+           (map #(get-in % [:flags :state]) (get-in dec [:fragment :object-groups 0 :points]))))))
+
+(deftest crob-direct-operate-roundtrip
+  (let [req {:fir true :fin true :con true :uns false :sequence 1 :function :direct-operate
+             :object-groups [{:group 12 :variation 1 :qualifier-kind :indexed-count-8
+                               :points [{:index 5
+                                         :point {:control-code {:tcc :close :clear false :op-type :latch-on}
+                                                  :count 1 :on-time 1000 :off-time 0 :status :success}}]}]}
+        enc (app/encode-request req)
+        dec (app/decode-request (:bytes enc))]
+    (is (= :ok (:status enc)))
+    (is (= :ok (:status dec)))
+    (is (= (get-in req [:object-groups 0 :points])
+           (get-in dec [:fragment :object-groups 0 :points])))))
+
+(deftest app-rejects-unknown-function-code
+  (let [enc (app/encode-request {:fir true :fin true :con false :uns false :sequence 0 :function :read
+                                  :object-groups []})
+        corrupted (assoc (vec (:bytes enc)) 1 250)]
+    (is (= :unknown-function-code (:reason (app/decode-request corrupted))))))
+
+(deftest app-rejects-unknown-group-variation
+  (let [enc (app/encode-request {:fir true :fin true :con false :uns false :sequence 0 :function :read
+                                  :object-groups [{:group 60 :variation 1 :qualifier-kind :no-range}]})
+        corrupted (assoc (vec (:bytes enc)) 2 99)] ;; group byte -> unregistered group
+    (is (= :unknown-group-variation (:reason (app/decode-request corrupted))))))
+
+(deftest app-truncated-response-is-incomplete-not-thrown
+  (let [enc (app/encode-response {:fir true :fin true :con false :uns false :sequence 0 :function :response
+                                   :iin {}
+                                   :object-groups [{:group 1 :variation 2 :qualifier-kind :range-8
+                                                     :start 0 :stop 0 :points [{:flags {:state true}}]}]})]
+    (is (= :incomplete (:status (app/decode-response (subvec (vec (:bytes enc)) 0 5)))))))
+
+;; ── end-to-end: application fragment -> transport segments -> link frames
+;;    -> back to an application fragment ──────────────────────────────────
+
+(deftest full-stack-roundtrip
+  (let [req {:fir true :fin true :con false :uns false :sequence 7 :function :read
+             :object-groups [{:group 60 :variation 1 :qualifier-kind :no-range}]}
+        {:keys [status bytes]} (app/encode-request req)
+        _ (is (= :ok status))
+        segs (transport/segment bytes)
+        frames (map (fn [seg]
+                      (dl/encode {:dir true :prm true :fcb false :fcv false
+                                  :function :unconfirmed-user-data :destination 4 :source 1}
+                                 (:bytes seg)))
+                     segs)
+        _ (is (every? #(= :ok (:status %)) frames))
+        decoded-frames (map #(dl/decode (:bytes %)) frames)
+        _ (is (every? #(= :ok (:status %)) decoded-frames))
+        decoded-segs (map #(transport/decode-segment (get-in % [:frame :user-data])) decoded-frames)
+        reassembled (transport/reassemble decoded-segs)
+        _ (is (= :ok (:status reassembled)))
+        final (app/decode-request (:bytes reassembled))]
+    (is (= :ok (:status final)))
+    (is (= :read (get-in final [:fragment :function])))
+    (is (= 7 (get-in final [:fragment :sequence])))
+    (is (= 1 (count (get-in final [:fragment :object-groups]))))))
