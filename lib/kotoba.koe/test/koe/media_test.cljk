@@ -1,0 +1,142 @@
+(ns koe.media-test
+  "The audio side of a live call, driven from vectors of frames.
+
+  None of this can wait for a carrier account, and none of it should: deciding
+  where an utterance ends is the decision the whole turn hangs on, and it is
+  entirely a function of the bytes. The G.711 values below are the standard's,
+  not this code's."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [koe.media :as media]))
+
+;; ── G.711 ────────────────────────────────────────────────────────────────────
+
+(deftest test-ulaw-known-values
+  (testing "the standard's own endpoints, not values this code produced"
+    (is (= 0 (media/ulaw->linear 0xFF)) "0xFF is digital silence")
+    (is (= 0 (media/ulaw->linear 0x7F)) "0x7F is the negative zero")
+    (is (= -32124 (media/ulaw->linear 0x00)) "full-scale negative")
+    (is (= 32124 (media/ulaw->linear 0x80)) "full-scale positive")))
+
+(deftest test-silence-and-speech-are-far-apart
+  (let [silence (repeat 160 0xFF)
+        loud (repeat 160 0x00)]
+    (is (= 0 (media/frame-energy silence)))
+    (is (> (media/frame-energy loud) 30000))
+    (testing "and an empty frame is 0 rather than a division by zero"
+      (is (= 0 (media/frame-energy []))))))
+
+;; ── the carrier's frames ─────────────────────────────────────────────────────
+
+(deftest test-frames-are-recognised
+  (is (= :connected (:media/event (media/parse-frame {"event" "connected"}))))
+  (is (= :start (:media/event (media/parse-frame {"event" "start" "start" {"streamSid" "MZ1" "callSid" "CA1"}}))))
+  (is (= "MZ1" (:media/stream-id (media/parse-frame {"event" "start" "start" {"streamSid" "MZ1"}}))))
+  (is (= "abc" (:media/payload (media/parse-frame {"event" "media" "media" {"payload" "abc"}}))))
+  (is (= :stop (:media/event (media/parse-frame {"event" "stop"})))))
+
+(deftest test-an-unknown-event-is-visible-not-dropped
+  (testing "a carrier adding an event should show up, not vanish"
+    (let [f (media/parse-frame {"event" "somethingNew"})]
+      (is (= :unknown (:media/event f)))
+      (is (= "somethingNew" (:media/raw f))))))
+
+(deftest test-outbound-frames-address-the-stream
+  (is (= {"event" "media" "streamSid" "MZ1" "media" {"payload" "AAA"}}
+         (media/outbound-audio "MZ1" "AAA")))
+  (is (= "MZ1" (get (media/outbound-mark "MZ1" "greeting") "streamSid")))
+  (is (= "clear" (get (media/clear-audio "MZ1") "event"))))
+
+;; ── where an utterance ends ──────────────────────────────────────────────────
+
+(def ^:private quiet (vec (repeat 160 0xFF)))
+(def ^:private loud (vec (repeat 160 0x00)))
+
+(defn- feed [state frames] (reduce media/absorb-frame state frames))
+
+(defn- run
+  "Fold frames and collect every utterance the segmenter emitted."
+  [frames & [vad]]
+  (let [{:keys [utterances]}
+        (reduce (fn [{:keys [state utterances]} f]
+                  (let [s (media/absorb-frame state f)]
+                    {:state s
+                     :utterances (cond-> utterances (:media/utterance s) (conj (:media/utterance s)))}))
+                {:state (media/segmenter (or vad {})) :utterances []}
+                frames)]
+    utterances))
+
+(deftest test-speech-then-a-pause-is-one-utterance
+  (let [frames (concat (repeat 20 loud)     ; 400ms of speech
+                       (repeat 40 quiet))]  ; 800ms of silence > 700ms
+    (is (= 1 (count (run frames))))))
+
+(deftest test-a-pause-shorter-than-the-threshold-does-not-split
+  (testing "「えーと、四人です」 has a gap in the middle and is ONE utterance"
+    (let [frames (concat (repeat 15 loud)    ; 300ms
+                         (repeat 25 quiet)   ; 500ms gap, under 700
+                         (repeat 15 loud)    ; 300ms
+                         (repeat 40 quiet))] ; 800ms, ends it
+      (is (= 1 (count (run frames)))))))
+
+(deftest test-a-click-is-not-an-utterance
+  (testing "100ms of noise then silence produces nothing to transcribe"
+    (let [frames (concat (repeat 5 loud) (repeat 40 quiet))]
+      (is (= [] (run frames))))))
+
+(deftest test-silence-before-speech-is-not-collected
+  (testing "otherwise the engine spends its fixed window on nothing"
+    (let [frames (concat (repeat 50 quiet) (repeat 20 loud) (repeat 40 quiet))
+          [u] (run frames)]
+      (is (some? u))
+      (is (< (media/utterance-ms u) 1500)
+          (str "utterance was " (media/utterance-ms u) "ms; the 1s of leading silence is not in it")))))
+
+(deftest test-a-caller-who-never-stops-is-cut-off
+  (let [frames (repeat 800 loud)]           ; 16s, over the 15s ceiling
+    (is (= 1 (count (run frames))))))
+
+(deftest test-two-sentences-are-two-utterances
+  (let [frames (concat (repeat 20 loud) (repeat 40 quiet)
+                       (repeat 20 loud) (repeat 40 quiet))]
+    (is (= 2 (count (run frames))))))
+
+(deftest test-thresholds-are-data
+  (testing "a shorter pause can be configured without editing code"
+    (let [frames (concat (repeat 20 loud) (repeat 15 quiet))]  ; 300ms pause
+      (is (= [] (run frames)))
+      (is (= 1 (count (run frames {:media.vad/silence-ms 200})))))))
+
+;; ── barge-in ─────────────────────────────────────────────────────────────────
+
+(deftest test-a-cough-does-not-cut-the-receptionist-off
+  (let [after-one-frame (feed (media/segmenter) [loud])]
+    (is (not (media/barge-in? after-one-frame)) "20ms is a click"))
+  (let [after-speech (feed (media/segmenter) (repeat 15 loud))]
+    (is (media/barge-in? after-speech) "300ms is somebody talking")))
+
+;; ── the file the engine is handed ────────────────────────────────────────────
+
+(deftest test-the-wav-header-says-ulaw-8k-mono
+  (let [h (media/wav-header 1000)]
+    ;; 46, not 44: a non-PCM WAV needs the extended fmt chunk (18 bytes with
+    ;; cbSize), and 44 is the PCM-only figure. The test said 44 first; the code
+    ;; was right.
+    (is (= 46 (count h)))
+    ;; The bytes are written as numbers, not as `(int \R)`.
+    ;;
+    ;; A character literal is a `Character` on the JVM and a one-character
+    ;; STRING under ClojureScript, where `int` of one is 0 -- so the old
+    ;; expectation `[(int \R) …]` evaluated to `[0 0 0 0]` there, and so did
+    ;; the header the code produced. Both sides degraded together and the
+    ;; assertion passed. That is why this shipped: the test could not fail.
+    (is (= [82 73 70 70] (take 4 h)) "RIFF")
+    (is (= [87 65 86 69] (subvec h 8 12)) "WAVE")
+    (is (= [102 109 116 32] (subvec h 12 16)) "fmt ")
+    (is (= [100 97 116 97] (subvec h 38 42)) "data")
+    (testing "and none of the magic is zero, which is what the bug produced"
+      (is (not-any? zero? (concat (take 4 h) (subvec h 8 16) (subvec h 38 42)))))
+    (testing "format tag 7 is μ-law; 1 would be PCM and would transcribe as noise"
+      (is (= 7 (nth h 20))))
+    (testing "one channel at 8000 Hz"
+      (is (= 1 (nth h 22)))
+      (is (= [0x40 0x1F 0 0] (subvec h 24 28))))))

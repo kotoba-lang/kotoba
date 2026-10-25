@@ -1,0 +1,146 @@
+(ns koe.bridge-test
+  "A whole call, folded from frames.
+
+  This is the suite that stands in for the socket. Every decision a live call
+  makes — when a sentence has ended, when the receptionist may speak, who wins
+  when both talk — is exercised here without a carrier, a socket or a thread."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [koe.bridge :as bridge]
+            [koe.media :as media]))
+
+(def ^:private quiet (vec (repeat 160 0xFF)))
+(def ^:private loud (vec (repeat 160 0x00)))
+
+(defn- audio [payload] {"event" "media" "media" {"payload" payload}})
+(def ^:private start-msg {"event" "start" "start" {"streamSid" "MZ1" "callSid" "CA1"}})
+
+(defn- feed
+  "Fold frames in, collecting outbound messages and any utterance to transcribe."
+  [b frames]
+  (reduce (fn [{:keys [b out transcribed]} f]
+            (let [r (bridge/on-frame b f)]
+              {:b (:koe/bridge r)
+               :out (into out (:koe/out r))
+               :transcribed (cond-> transcribed (:koe/transcribe r) (conj (:koe/transcribe r)))}))
+          {:b b :out [] :transcribed []}
+          frames))
+
+(defn- new-call [& [opts]]
+  (:koe/bridge (bridge/on-frame (bridge/start (merge {:stream-id "MZ1"} opts)) start-msg)))
+
+;; ── the ordinary turn ────────────────────────────────────────────────────────
+
+(deftest test-a-sentence-then-a-pause-is-handed-to-the-engine
+  (let [{:keys [transcribed]} (feed (new-call)
+                                    (concat (map audio (repeat 20 loud))
+                                            (map audio (repeat 40 quiet))))]
+    (is (= 1 (count transcribed)))
+    (is (> (media/utterance-ms (first transcribed)) 300))))
+
+(deftest test-nothing-is-handed-over-mid-sentence
+  (let [{:keys [transcribed]} (feed (new-call) (map audio (repeat 20 loud)))]
+    (is (= [] transcribed) "still talking")))
+
+(deftest test-the-stream-id-is-learned-from-the-start-frame
+  (let [b (:koe/bridge (bridge/on-frame (bridge/start {}) start-msg))]
+    (is (= "MZ1" (:koe/stream-id b)))))
+
+;; ── speaking, and coming back ────────────────────────────────────────────────
+
+(defn- turn-fn [_state _utterance] {:state {:said true} :reply "何名さまでしょうか。"})
+
+(deftest test-a-reply-puts-the-call-into-speaking
+  (let [r (bridge/on-transcript (new-call) "予約をお願いします" turn-fn)]
+    (is (= :speaking (get-in r [:koe/bridge :koe/state])))
+    (is (= "何名さまでしょうか。" (:koe/say r)))))
+
+(deftest test-an-interruption-keeps-what-was-already-said
+  (testing "barge-in is detected part-way through 「いや、6人で」; resetting the"
+    (testing "segmenter there would transcribe 「人で」"
+      (let [speaking (:koe/bridge (bridge/on-transcript (new-call) "はい" turn-fn))
+            {:keys [transcribed]} (feed speaking (concat (map audio (repeat 20 loud))
+                                                         (map audio (repeat 40 quiet))))]
+        (is (= 1 (count transcribed)) "the interruption becomes the utterance")
+        (is (>= (media/utterance-ms (first transcribed)) 400)
+            (str "kept " (media/utterance-ms (first transcribed))
+                 "ms; the 400ms that triggered barge-in must still be in it"))))))
+
+(deftest test-the-mark-is-what-returns-the-call-to-listening
+  (testing "not a timer and not the length of the audio, either of which is wrong"
+    (testing "whenever the network is"
+      (let [speaking (:koe/bridge (bridge/on-transcript (new-call) "はい" turn-fn))
+            after (:koe/bridge (bridge/on-frame speaking {"event" "mark" "mark" {"name" "r1"}}))]
+        (is (= :listening (:koe/state after)))))))
+
+(deftest test-after-the-mark-the-next-sentence-is-heard
+  (let [speaking (:koe/bridge (bridge/on-transcript (new-call) "はい" turn-fn))
+        listening (:koe/bridge (bridge/on-frame speaking {"event" "mark" "mark" {"name" "r1"}}))
+        {:keys [transcribed]} (feed listening (concat (map audio (repeat 20 loud))
+                                                      (map audio (repeat 40 quiet))))]
+    (is (= 1 (count transcribed)))))
+
+;; ── barge-in ─────────────────────────────────────────────────────────────────
+
+(deftest test-the-caller-wins
+  (let [speaking (:koe/bridge (bridge/on-transcript (new-call) "はい" turn-fn))
+        {:keys [b out]} (feed speaking (map audio (repeat 15 loud)))]
+    (is (some #(= "clear" (get % "event")) out) "queued audio is dropped")
+    (is (= :listening (:koe/state b)))))
+
+(deftest test-a-cough-does-not-interrupt
+  (let [speaking (:koe/bridge (bridge/on-transcript (new-call) "はい" turn-fn))
+        {:keys [b out]} (feed speaking (map audio (repeat 3 loud)))]
+    (is (= [] out))
+    (is (= :speaking (:koe/state b)))))
+
+;; ── what must never reach the dialog ─────────────────────────────────────────
+
+(deftest test-a-failed-transcription-is-not-an-utterance
+  (testing "the engine failing must not arrive as something the caller said"
+    (doseq [t [nil "" "   "]]
+      (let [calls (atom 0)
+            r (bridge/on-transcript (new-call) t (fn [s u] (swap! calls inc) {:state s :reply "x"}))]
+        (is (zero? @calls) (str "transcript=" (pr-str t)))
+        (is (nil? (:koe/say r)))
+        (is (= :listening (get-in r [:koe/bridge :koe/state])))))))
+
+;; ── ending ───────────────────────────────────────────────────────────────────
+
+(deftest test-stop-ends-the-call
+  (let [b (:koe/bridge (bridge/on-frame (new-call) {"event" "stop"}))]
+    (is (bridge/ended? b))))
+
+(deftest test-audio-after-the-end-is-ignored
+  (let [ended (:koe/bridge (bridge/on-frame (new-call) {"event" "stop"}))
+        {:keys [transcribed]} (feed ended (concat (map audio (repeat 20 loud))
+                                                  (map audio (repeat 40 quiet))))]
+    (is (= [] transcribed))))
+
+(deftest test-a-dialog-that-says-it-is-done-ends-the-call
+  (let [r (bridge/on-transcript (new-call) "はい"
+                                (fn [s _] {:state s :reply "承りました。" :ended? true}))]
+    (is (bridge/ended? (:koe/bridge r)))
+    (is (= "承りました。" (:koe/say r)) "and the last line is still said")))
+
+;; ── frames out ───────────────────────────────────────────────────────────────
+
+(deftest test-rendered-audio-becomes-frames-plus-a-mark
+  (let [frames (bridge/audio-frames (new-call) ["AAA" "BBB"] "reply-1")]
+    (is (= 3 (count frames)))
+    (is (= "media" (get (first frames) "event")))
+    (is (= "mark" (get (last frames) "event")))
+    (is (= "reply-1" (get-in (last frames) ["mark" "name"])))
+    (is (every? #(= "MZ1" (get % "streamSid")) frames))))
+
+(deftest test-audio-without-a-mark-would-leave-it-speaking-forever
+  (testing "so the mark is not optional — it is the last frame, always"
+    (is (= "mark" (get (last (bridge/audio-frames (new-call) [] "m")) "event")))))
+
+;; ── base64 is the host's ─────────────────────────────────────────────────────
+
+(deftest test-the-payload-decoder-is-injected
+  (let [calls (atom 0)
+        decode (fn [_] (swap! calls inc) loud)
+        r (bridge/on-frame (new-call) (audio "cGF5bG9hZA==") decode)]
+    (is (= 1 @calls))
+    (is (some? (:koe/bridge r)))))
