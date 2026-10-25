@@ -223,6 +223,30 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.officeStyle` | `kotoba.officeStyle/src` | `` (Kotoba project library) |
+| `kotoba.actorIpc` | `kotoba.actorIpc/src` | `actor-ipc`, `actor-ipc.actor`, `actor-ipc.ipc`, `actor-ipc.time` (Kotoba project library) |
+| `kotoba.xrpc` | `kotoba.xrpc/src` | `` (Kotoba project library) |
+| `kotoba.vitePluginSafeBuilder` | `kotoba.vitePluginSafeBuilder/src` | `` (Kotoba project library) |
+| `kotoba.vectorEmbedding` | `kotoba.vectorEmbedding/src` | `` (Kotoba project library) |
+| `kotoba.svelteDesignSystem` | `kotoba.svelteDesignSystem/src` | `` (Kotoba project library) |
+| `kotoba.svelteAuth` | `kotoba.svelteAuth/src` | `` (Kotoba project library) |
+| `kotoba.sumitsuboCad` | `kotoba.sumitsuboCad/src` | `` (Kotoba project library) |
+| `kotoba.skillLoopSystemDynamics` | `kotoba.skillLoopSystemDynamics/src` | `` (Kotoba project library) |
+| `kotoba.skillGuestAuthoring` | `kotoba.skillGuestAuthoring/src` | `` (Kotoba project library) |
+| `kotoba.sdkMock` | `kotoba.sdkMock/src` | `` (Kotoba project library) |
+| `kotoba.sdkAuth` | `kotoba.sdkAuth/src` | `` (Kotoba project library) |
+| `kotoba.pregel` | `kotoba.pregel/src` | `` (Kotoba project library) |
+| `kotoba.outlook` | `kotoba.outlook/src` | `` (Kotoba project library) |
+| `kotoba.openWellbecoming` | `kotoba.openWellbecoming/src` | `` (Kotoba project library) |
+| `kotoba.music` | `kotoba.music/src` | `` (Kotoba project library) |
+| `kotoba.kotobaIso20022` | `kotoba.kotobaIso20022/src` | `` (Kotoba project library) |
+| `kotoba.kotobaActorSdk` | `kotoba.kotobaActorSdk/src` | `` (Kotoba project library) |
+| `kotoba.externalServiceAdapter` | `kotoba.externalServiceAdapter/src` | `` (Kotoba project library) |
+| `kotoba.kaigi` | `kotoba.kaigi/src` | `kaigi.invite`, `kaigi.model`, `kaigi.plan`, `kaigi.realtimekit` (Kotoba project library) |
+| `kotoba.comEtzhayyimOpenSeiyaku` | `kotoba.comEtzhayyimOpenSeiyaku/src` | `` (Kotoba project library) |
+| `kotoba.celler` | `kotoba.celler/src` | `` (Kotoba project library) |
+| `kotoba.cards` | `kotoba.cards/src` | `` (Kotoba project library) |
+| `kotoba.bpmnSdk` | `kotoba.bpmnSdk/src` | `` (Kotoba project library) |
 | `kotoba.yobidashi` | `kotoba.yobidashi/src` | `yobidashi.home`, `yobidashi.invite`, `yobidashi.ring`, `yobidashi.schedule` (Kotoba project library) |
 | `kotoba.monban` | `kotoba.monban/src` | `monban.policy`, `monban.postage`, `monban.stamp` (Kotoba project library) |
 | `kotoba.kotobaseServer` | `kotoba.kotobaseServer/src` | `kotobase.server.admission`, `kotobase.server.cypher`, `kotobase.server.datom-plan`, `kotobase.server.handler` (Kotoba project library) |

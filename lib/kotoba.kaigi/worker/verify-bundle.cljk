@@ -1,0 +1,163 @@
+#!/usr/bin/env kbb
+;; Verify the built Worker bundle by actually loading it.
+;;
+;; This exists because the cheap checks lie. `amu compile --target wasm32-browser` exits 0 and
+;; emits every expected export name; `node --check` validates syntax; neither
+;; notices that a dev-mode artifact imports a machine-local
+;; `/private/tmp/cljs-runtime/...` path and therefore cannot load standalone at
+;; all. cloud-itonami's shadow-cljs.edn records that shipping exactly that
+;; passed review more than once. The only check that catches it is an actual
+;; `import()`.
+;;
+;; What is asserted here:
+;;   - the module loads
+;;   - `default.fetch` exists and is callable
+;;   - `KaigiRoom` is a constructor whose prototype carries the four method
+;;     names the Durable Object runtime calls by name (a munged prototype is
+;;     the specific way a ClojureScript-defined DO class fails: the binding
+;;     resolves, the object constructs, and every callback silently does not
+;;     exist)
+;;   - /api/kaigi/health answers, and reports mesh when no SFU is configured
+;;   - a bad meeting id is rejected
+;;
+;; Run: kbb --backend sci verify-bundle.cljk
+
+(ns verify-bundle
+  (:require ["node:child_process" :as cp]
+            ["node:path" :as path]
+            ["node:url" :as url]
+            ["node:fs" :as fs]))
+
+(def bundle (path/resolve "dist/kaigi-worker.js"))
+
+(defn- staleness-guard!
+  "Refuse to verify an artifact older than the newest source file.
+
+  This check exists because its absence already cost a cycle: a build failed
+  with a compile error, `dist/` kept the previous artifact, and this script
+  cheerfully reported six passing checks against it — a green verification of
+  code that did not compile. A verifier that can pass on a stale bundle is
+  worse than no verifier, because it converts a loud failure into a quiet
+  one."
+  []
+  (let [newest (->> (cp/execSync
+                     (str "find src ../src ../../webrtc/src "
+                          "../../org-w3-webrtc-signaling/src "
+                          "-name '*.clj[cs]' -newer " bundle " 2>/dev/null | head -5")
+                     #js {:encoding "utf8"})
+                    (.trim)
+                    (#(if (empty? %) [] (.split % "\n"))))]
+    (when (seq newest)
+      (println "FAIL: dist/kaigi-worker.js is OLDER than these sources:")
+      (doseq [f newest] (println "        " f))
+      (println "      the build did not succeed — re-run `npx shadow-cljs release worker`")
+      (println "      and read its output rather than only its exit code")
+      (set! (.-exitCode js/process) 1)
+      true)))
+
+(defn- fail! [msg]
+  (println "FAIL:" msg)
+  (set! (.-exitCode js/process) 1))
+
+(defn- ok! [msg] (println "ok  :" msg))
+
+(defn- check-methods
+  [ctor]
+  (let [proto (.-prototype ctor)
+        wanted ["fetch" "webSocketMessage" "webSocketClose" "webSocketError"]
+        missing (remove #(fn? (aget proto %)) wanted)]
+    (if (seq missing)
+      (fail! (str "KaigiRoom.prototype is missing " (pr-str (vec missing))
+                  " — the prototype was munged, so the DO runtime's callbacks "
+                  "would silently not exist"))
+      (ok! (str "KaigiRoom.prototype carries " (pr-str wanted))))))
+
+(defn- check-health
+  [handler]
+  (-> ((.-fetch handler)
+       (js/Request. "https://kaigi.example/api/kaigi/health")
+       #js {}                                   ; no REALTIME_* bindings
+       #js {})
+      (.then (fn [res]
+               (if (not= 200 (.-status res))
+                 (js/Promise.resolve (fail! (str "health returned " (.-status res))))
+                 (-> (.json res)
+                     (.then (fn [body]
+                              (if (= "mesh" (aget body "transport"))
+                                (ok! "health reports transport=mesh with no SFU bindings")
+                                (fail! (str "health reported transport="
+                                            (aget body "transport")
+                                            " with no SFU bindings")))))))))))
+
+(defn- check-bad-meeting-id
+  [handler]
+  (-> ((.-fetch handler)
+       (js/Request. "https://kaigi.example/api/kaigi/ws?meeting=has%20a%20space")
+       #js {} #js {})
+      (.then (fn [res]
+               (if (= 400 (.-status res))
+                 (ok! "a malformed meeting id is rejected with 400")
+                 (fail! (str "malformed meeting id returned " (.-status res)
+                             ", expected 400")))))))
+
+(defn- check-navigation-without-assets
+  "A navigation request on a deployment with no ASSETS binding must answer,
+  not throw. Exercised here because the misconfiguration is silent until a
+  browser hits it."
+  [handler]
+  (-> ((.-fetch handler)
+       (js/Request. "https://kaigi.example/deep/link"
+                    #js {:headers #js {"Accept" "text/html"}})
+       #js {} #js {})
+      (.then (fn [res]
+               (if (= 404 (.-status res))
+                 (ok! "a navigation with no ASSETS binding answers 404 instead of throwing")
+                 (fail! (str "navigation without ASSETS returned " (.-status res))))))
+      (.catch (fn [e] (fail! (str "navigation without ASSETS threw: " (.-message e)))))))
+
+(defn- check-404
+  [handler]
+  (-> ((.-fetch handler)
+       (js/Request. "https://kaigi.example/nope") #js {} #js {})
+      (.then (fn [res]
+               (if (= 404 (.-status res))
+                 (ok! "an unknown path is 404")
+                 (fail! (str "unknown path returned " (.-status res))))))))
+
+(defn -main []
+  (cond
+    (not (fs/existsSync bundle))
+    (fail! (str bundle " does not exist — run `amu compile --target wasm32-browser worker` first"))
+
+    (staleness-guard!) nil
+
+    :else
+    (-> (js/import (url/pathToFileURL bundle))
+        (.then (fn [mod]
+                 (ok! "bundle imports standalone")
+                 (let [handler (.-default mod)
+                       ctor    (.-KaigiRoom mod)]
+                   (cond
+                     (not (and handler (fn? (.-fetch handler))))
+                     (js/Promise.resolve (fail! "default export has no callable .fetch"))
+
+                     (not (fn? ctor))
+                     (js/Promise.resolve (fail! "KaigiRoom is not exported as a constructor"))
+
+                     :else
+                     (do (ok! "default.fetch is callable")
+                         (check-methods ctor)
+                         (-> (check-health handler)
+                             (.then #(check-bad-meeting-id handler))
+                             (.then #(check-404 handler))
+                             (.then #(check-navigation-without-assets handler))))))))
+        (.then (fn [_]
+                 (println)
+                 (println (if (= 1 (.-exitCode js/process))
+                            "bundle verification FAILED"
+                            "bundle verification passed"))))
+        (.catch (fn [e]
+                  (fail! (str "import() threw: " (.-message e)))
+                  (println (.-stack e)))))))
+
+(-main)

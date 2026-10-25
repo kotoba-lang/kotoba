@@ -1,0 +1,118 @@
+(ns actor-ipc-test
+  "Tests restored from the legacy kami-engine/kami-core Rust crate's `#[test]`
+  modules (deleted in kotoba-lang/kami-engine PR #82 \"Remove Rust workspace
+  from kami-engine\"), ported 1:1 to clojure.test, as part of the clj-wgsl
+  migration (ADR-2607010930, com-junkawasaki/root). `actor.rs` and `time.rs` had
+  no `#[test]`s in the original crate; only `ipc.rs` (`mod tests`) did."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [actor-ipc]
+            [actor-ipc.actor :as actor]
+            [actor-ipc.ipc :as ipc]
+            [actor-ipc.time :as time]
+            [kotoba.value.codec :as value]))
+
+(deftest namespace-loads
+  (testing "the restored CLJC namespace loads"
+    (is (some? (find-ns 'actor-ipc)))
+    (is (some? (find-ns 'actor-ipc.actor)))
+    (is (some? (find-ns 'actor-ipc.ipc)))
+    (is (some? (find-ns 'actor-ipc.time)))))
+
+;; --- ported from kami-core/src/ipc.rs `mod tests` ---------------------
+
+(deftest column-size
+  ;; Rust: `assert_eq!(mem::size_of::<Column>(), 16);`
+  ;; Adapted: CLJC Column maps have no fixed byte size (no raw pointer /
+  ;; #[repr(C, align(16))] struct layout); the 16-byte metadata size is instead
+  ;; a documented constant kept for wire-size-accounting parity.
+  (is (= 16 ipc/column-metadata-bytes)))
+
+(deftest frame-efficiency
+  ;; Rust:
+  ;;   let positions: Vec<f32> = (0..3000).map(|i| i as f32 * 0.1).collect();
+  ;;   let mut frame = Frame::new(1, 1000);
+  ;;   frame.push_f32_column(&positions, 3);
+  ;;   assert!(frame.efficiency() > 0.99);
+  (let [positions (mapv #(* % 0.1) (range 3000))
+        frame (-> (ipc/make-frame 1 1000)
+                  (ipc/push-f32-column positions 3))]
+    (is (> (ipc/frame-efficiency frame) 0.99))))
+
+(deftest delta-roundtrip
+  ;; Rust:
+  ;;   let mut prev_pos: Vec<f32> = vec![0.0; 30]; // 10 entities x 3
+  ;;   let mut curr_pos = prev_pos.clone();
+  ;;   curr_pos[0] = 1.0; curr_pos[1] = 2.0; curr_pos[2] = 3.0; // entity 0
+  ;;   curr_pos[9] = 5.0;                                       // entity 3
+  ;;   let delta = compute_delta(&prev, &curr);
+  ;;   assert_eq!(delta.changed_indices.len(), 2);
+  ;;   let bytes = delta.to_bytes();
+  ;;   let restored = Delta::from_bytes(&bytes).unwrap();
+  ;;   assert_eq!(restored.changed_indices, vec![0, 3]);
+  ;;   assert_eq!(restored.tick, 1);
+  ;;   assert_eq!(restored.n_columns(), 1);
+  (let [prev-pos (vec (repeat 30 0.0))
+        curr-pos (-> prev-pos
+                     (assoc 0 1.0)
+                     (assoc 1 2.0)
+                     (assoc 2 3.0)
+                     (assoc 9 5.0))
+        prev (-> (ipc/make-frame 0 10) (ipc/push-f32-column prev-pos 3))
+        curr (-> (ipc/make-frame 1 10) (ipc/push-f32-column curr-pos 3))
+        delta (ipc/compute-delta prev curr)]
+    (is (= 2 (count (:changed-indices delta))))
+
+    (let [bytes (ipc/delta-to-bytes delta)
+          restored (ipc/delta-from-bytes bytes)
+          envelope (value/decode-value bytes)]
+      (is #?(:clj (bytes? bytes)
+             :cljs (instance? js/Uint8Array bytes)))
+      (is (= ipc/delta-wire-format (:format envelope)))
+      (is (value/float64?
+           (get-in envelope [:delta :columns 0 :data 0])))
+      (is (= [0 3] (:changed-indices restored)))
+      (is (= 1 (:tick restored)))
+      (is (= 1 (ipc/delta-n-columns restored)))
+      (is (= (:columns delta) (:columns restored)))
+      (is (= (mapv #(bit-and % 0xff) (seq bytes))
+             (mapv #(bit-and % 0xff) (seq (ipc/delta-to-bytes delta))))))))
+
+(deftest delta-wire-is-bounded-versioned-and-fail-closed
+  (let [delta (-> (ipc/make-delta 3 4)
+                  (assoc :changed-indices [2])
+                  (ipc/delta-push-column-owned [7] :u32 1))
+        bytes (ipc/delta-to-bytes delta)
+        size #?(:clj (alength ^bytes bytes) :cljs (.-length bytes))]
+    (is (= delta (ipc/delta-from-bytes bytes size)))
+    (is (nil? (ipc/delta-from-bytes bytes (dec size))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                 (ipc/delta-to-bytes delta (dec size))))
+    (is (nil? (ipc/delta-from-bytes "{:base-tick 3}")))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                 (ipc/delta-to-bytes (assoc delta :changed-indices [2 2]))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                 (ipc/delta-to-bytes
+                  (assoc-in delta [:columns 0 :data 0] 4294967296))))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs ExceptionInfo)
+                 (ipc/delta-to-bytes (assoc delta :unknown true))))))
+
+;; --- actor.rs had no #[test]s in the original crate; light shape checks -----
+
+(deftest actor-id-shape
+  (let [id (actor/make-actor-id 7 1 :player :server)]
+    (is (= 7 (:entity-id id)))
+    (is (= 1 (:island-id id)))
+    (is (contains? actor/actor-type-values (:actor-type id)))
+    (is (contains? actor/authority-values (:authority id)))
+    (is (= 0 (actor/actor-type->code :player)))
+    (is (= :player (actor/code->actor-type 0)))))
+
+;; --- time.rs had no #[test]s in the original crate; light shape checks -----
+
+(deftest game-clock-advance
+  (let [clock (time/make-clock 60)
+        {:keys [clock ticks]} (time/advance clock 1000000000)] ; 1 second, 60hz
+    (is (= 60 ticks))
+    (is (= 60 (time/clock-tick clock)))
+    (is (= 60 (time/clock-tick-rate clock)))))

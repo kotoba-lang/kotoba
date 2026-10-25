@@ -1,0 +1,137 @@
+(ns kaigi.recording-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kaigi.model :as m]
+            [kaigi.recording :as rec]))
+
+(defn- two-person-meeting
+  "jun (host) and rin, both admitted and in the room, both consenting."
+  []
+  (-> (m/meeting "m-1" "jun" {:title "週次" :lobby :open :channel "general"})
+      (m/start)
+      (m/join "jun")
+      (m/request-admission (m/participant "rin"))
+      (m/join "rin")
+      (m/grant-recording-consent "jun")
+      (m/grant-recording-consent "rin")))
+
+(deftest capturing-follows-the-model-not-a-local-flag
+  (let [m (two-person-meeting)]
+    (testing "nobody records before it is armed"
+      (is (not (rec/capturing? m "jun")))
+      (is (not (rec/capturing? m "rin"))))
+    (let [on (m/start-recording m "jun")]
+      (is (rec/capturing? on "jun"))
+      (is (rec/capturing? on "rin"))
+      (testing "a withdrawal stops EVERY recorder, because it turns the model off"
+        ;; This is the property the whole design exists for: revocation is not
+        ;; a message anyone has to deliver, it is a change to the value every
+        ;; recorder reads.
+        (let [after (m/revoke-recording-consent on "rin")]
+          (is (not (m/recording-on? after)))
+          (is (not (rec/capturing? after "jun")))
+          (is (not (rec/capturing? after "rin")))))
+      (testing "and ending the meeting stops it too"
+        (let [ended (m/end on)]
+          (is (not (rec/capturing? ended "jun"))))))))
+
+(deftest a-participant-who-has-not-joined-captures-nothing
+  (let [m (-> (m/meeting "m-1" "jun" {:lobby :approval-required})
+              (m/start)
+              (m/join "jun")
+              (m/request-admission (m/participant "rin"))
+              (m/admit "jun" "rin")           ; admitted but never joined
+              (m/grant-recording-consent "jun")
+              (m/grant-recording-consent "rin")
+              (m/start-recording "jun"))]
+    (is (rec/capturing? m "jun"))
+    (is (not (rec/capturing? m "rin")) "there is no stream to capture")))
+
+(deftest object-keys-sort-in-capture-order
+  (testing "lexical order is capture order — object stores list lexically"
+    (let [ks (mapv #(rec/object-key "m-1" "jun" %) [1 2 10 100])]
+      (is (= ks (sort ks))
+          "unpadded, part-10 would sort before part-2 and the stitched recording would be scrambled")
+      (is (= "kaigi/m-1/jun/000001.webm" (first ks))))))
+
+(deftest object-keys-round-trip
+  (let [k (rec/object-key "m-1" "rin" 7)
+        p (rec/parse-object-key k)]
+    (is (= {:kaigi.recording/meeting-id "m-1"
+            :kaigi.recording/participant-id "rin"
+            :kaigi.recording/seq 7}
+           p))
+    (testing "and anything else parses to nil rather than a wrong answer"
+      (is (nil? (rec/parse-object-key "kaigi/m-1/jun/notanumber.webm")))
+      (is (nil? (rec/parse-object-key "other/m-1/jun/000001.webm")))
+      (is (nil? (rec/parse-object-key "kaigi/m-1/000001.webm"))))))
+
+(deftest the-manifest-says-it-is-not-composited
+  (let [m (two-person-meeting)
+        parts [(rec/object-key "m-1" "jun" 1)
+               (rec/object-key "m-1" "jun" 2)
+               (rec/object-key "m-1" "rin" 1)]
+        mf (rec/manifest m parts)]
+    (is (false? (:kaigi.recording/composited? mf))
+        "a mesh has one stream per participant and nothing mixed them; claiming one file would be a lie")
+    (is (= #{"jun" "rin"} (set (keys (:kaigi.recording/participants mf)))))
+    (is (= 2 (count (get-in mf [:kaigi.recording/participants "jun"]))))
+    (testing "parts are listed in sequence order"
+      (is (= [(rec/object-key "m-1" "jun" 1) (rec/object-key "m-1" "jun" 2)]
+             (get-in mf [:kaigi.recording/participants "jun"]))))))
+
+(deftest an-asset-ref-is-a-prefix-not-a-url
+  (is (= "kaigi/m-1/" (rec/asset-ref "m-1")))
+  (is (not (re-find #"https?://" (rec/asset-ref "m-1")))
+      "a signed URL expires and a bucket name is deployment config; neither belongs in a stored value"))
+
+(deftest a-handoff-needs-a-recording-an-ended-meeting-and-unanimous-consent
+  (let [live (m/start-recording (two-person-meeting) "jun")]
+    (testing "still running"
+      (is (some #(= :handoff/not-ended (:kaigi.recording/code %)) (rec/handoff-problems live)))
+      (is (nil? (rec/handoff live))))
+    (testing "ended but nothing captured"
+      (let [ended (m/end live)]
+        (is (some #(= :handoff/no-asset-ref (:kaigi.recording/code %))
+                  (rec/handoff-problems ended)))
+        (is (nil? (rec/handoff ended)))))
+    (testing "ended with a recording and full consent"
+      (let [done (-> live
+                     (m/stop-recording "jun" (rec/asset-ref "m-1"))
+                     (m/end))
+            h (rec/handoff done)]
+        (is (empty? (rec/handoff-problems done)))
+        (is (some? h))
+        (is (= "kaigi/m-1/" (:gijiroku/asset-ref h)))
+        (is (= ["jun" "rin"] (:gijiroku/participants h)))
+        (is (= ["jun" "rin"] (:gijiroku/consents h)))
+        (is (= "general" (:gijiroku/channel h)) "the kaisha channel it was called from")))))
+
+(deftest consent-is-re-checked-at-handoff-not-inferred-from-the-file
+  (testing "gijiroku G3: consent is a ground fact, never inferred"
+    ;; A recording exists AND the meeting ended, but somebody who was admitted
+    ;; never agreed. \"There is a file, so they must have agreed\" is exactly the
+    ;; inference the charter forbids.
+    (let [m (-> (two-person-meeting)
+                (m/start-recording "jun")
+                (m/request-admission (m/participant "kai"))
+                (m/join "kai")                      ; joins after recording began
+                (m/stop-recording "jun" (rec/asset-ref "m-1"))
+                (m/end))
+          probs (rec/handoff-problems m)]
+      (is (some #(= :handoff/consent-missing (:kaigi.recording/code %)) probs))
+      (is (re-find #"kai" (:kaigi.recording/message
+                           (first (filter #(= :handoff/consent-missing (:kaigi.recording/code %))
+                                          probs)))))
+      (is (nil? (rec/handoff m)) "no handoff is produced at all"))))
+
+(deftest a-handoff-carries-no-media
+  (let [done (-> (two-person-meeting)
+                 (m/start-recording "jun")
+                 (m/stop-recording "jun" (rec/asset-ref "m-1"))
+                 (m/end))
+        h (rec/handoff done)
+        s (pr-str h)]
+    (is (not (re-find #"(?i)base64|blob|arraybuffer|data:" s))
+        "gijiroku G4: raw audio/video never enters the record — only a reference")
+    (is (= (rec/handoff done) (rec/handoff done))
+        "two handoffs for the same meeting are equal values, so the consumer can deduplicate")))

@@ -1,0 +1,149 @@
+#!/usr/bin/env kbb
+;; A real call on the RealtimeKit plane.
+;;
+;; `e2e-media.cljs` pins `?transport=mesh` and asserts PeerConnections and
+;; inbound-rtp counters. None of that vocabulary exists here: the SDK owns
+;; transport, so `window.kaigi.peerIds()` is empty on this plane and a run that
+;; looked for it would report a broken call that is working perfectly.
+;;
+;; What is asserted instead:
+;;   1. the room actually negotiated `:realtimekit` (not a silent mesh
+;;      fallback, which would make every check below pass for the wrong reason)
+;;   2. the SDK reports a joined room that can see the other participant
+;;   3. a REMOTE `<video>` is painting frames — `videoWidth > 0` on an element
+;;      whose id is not our own. A joined room with no picture is exactly the
+;;      failure this plane was wired to fix.
+;;
+;; Needs a deployment with real RealtimeKit credentials; there is no local
+;; equivalent, because the plane is the service.
+;;
+;;   kbb --backend sci e2e-realtimekit.cljk https://kaigi.<subdomain>.workers.dev
+
+(ns e2e-realtimekit
+  (:require ["playwright" :as pw]))
+
+(def base
+  (or (first (filter #(re-find #"^https?://" %) (js->clj (.-argv js/process))))
+      "http://127.0.0.1:8799"))
+
+(def meeting (str "rk-" (js/Math.floor (* 1e9 (js/Math.random)))))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check!
+  [label pass? & [detail]]
+  (swap! checks inc)
+  (println (if pass? "ok  :" "FAIL:") label)
+  (when (and (not pass?) detail) (println "        " detail))
+  (when-not pass? (swap! failures inc)))
+
+(defn- launch []
+  (.launch (.-chromium pw)
+           #js {:headless true
+                :executablePath (.executablePath (.-chromium pw))
+                :args #js ["--use-fake-device-for-media-stream"
+                           "--use-fake-ui-for-media-stream"
+                           "--autoplay-policy=no-user-gesture-required"]}))
+
+(defn- open-page
+  [browser who]
+  (-> (.newPage browser)
+      (.then (fn [page]
+               (.on page "console"
+                    (fn [m] (when (#{"error" "warning"} (.type m))
+                              (println "  [" who (.type m) "]" (.text m)))))
+               (.on page "pageerror"
+                    (fn [e] (println "  [" who "pageerror ]" (.-message e))))
+               ;; No `?transport=` override — the whole point is to take
+               ;; whatever plane the deployment and the bundle negotiate, and
+               ;; then assert it was the one we expect.
+               (-> (.goto page (str base "/?meeting=" meeting "&me=" who)
+                          #js {:waitUntil "load"})
+                   (.then (fn [_] (.waitForSelector page "[data-act=\"join\"]"
+                                                    #js {:timeout 30000})))
+                   (.then (fn [_] (.fill page "#kaigi-name" who)))
+                   (.then (fn [_] (.click page "[data-act=\"join\"]")))
+                   (.then (fn [_] page)))))))
+
+(defn- wait-for-fn
+  [page expr timeout-ms label]
+  (let [deadline (+ (js/Date.now) timeout-ms)]
+    (letfn [(tick []
+              (-> (.evaluate page expr)
+                  (.then (fn [v]
+                           (cond
+                             v (js/Promise.resolve true)
+                             (> (js/Date.now) deadline)
+                             (do (println "        (" label "timed out, last value:" (pr-str v) ")")
+                                 (js/Promise.resolve false))
+                             :else (js/Promise. (fn [r] (js/setTimeout #(r (tick)) 500))))))))]
+      (tick))))
+
+(def remote-painting-js
+  "Frames on a video element that is NOT our own.
+
+  `videoWidth > 0` only becomes true once decoded frames have arrived, so it
+  is evidence of media rather than of markup — and excluding our own id is
+  what stops the local preview from satisfying the check on its own."
+  "(() => {
+     const me = window.kaigi.state().me;
+     return Array.from(document.querySelectorAll('[data-kaigi-participant]'))
+       .filter(d => d.getAttribute('data-kaigi-participant') !== me)
+       .map(d => d.querySelector('video'))
+       .filter(v => v && v.srcObject && v.videoWidth > 0).length;
+   })()")
+
+(defn -main []
+  (println "realtimekit meeting:" meeting "at" base)
+  (let [st (atom {})]
+    (-> (js/Promise.all #js [(launch) (launch)])
+        (.then (fn [bs]
+                 (swap! st assoc :b1 (aget bs 0) :b2 (aget bs 1))
+                 (open-page (aget bs 0) "jun")))
+        (.then (fn [p] (swap! st assoc :jun p) (open-page (:b2 @st) "rin")))
+        (.then (fn [p]
+                 (swap! st assoc :rin p)
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st) "window.kaigi && window.kaigi.participantCount() === 2"
+                                    30000 "jun sees 2 participants")
+                       (wait-for-fn (:rin @st) "window.kaigi && window.kaigi.participantCount() === 2"
+                                    30000 "rin sees 2 participants")])))
+        (.then (fn [res]
+                 (check! "both tabs see a two-person roster" (and (aget res 0) (aget res 1)))
+                 (js/Promise.all #js [(.evaluate (:jun @st) "window.kaigi.state().transport")
+                                      (.evaluate (:rin @st) "window.kaigi.state().transport")])))
+        (.then (fn [tr]
+                 (check! "the room negotiated the RealtimeKit plane"
+                         (= "realtimekit" (aget tr 0) (aget tr 1))
+                         (str "jun=" (aget tr 0) " rin=" (aget tr 1)
+                              " — a mesh fallback would make every check below"
+                              " pass without exercising RealtimeKit at all"))
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st) "window.kaigi.realtimekit().joined" 45000 "jun joined the RK room")
+                       (wait-for-fn (:rin @st) "window.kaigi.realtimekit().joined" 45000 "rin joined the RK room")])))
+        (.then (fn [res]
+                 (check! "the SDK joined on both sides" (and (aget res 0) (aget res 1)))
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st) "window.kaigi.realtimekit().others >= 1" 45000 "jun sees a remote RK participant")
+                       (wait-for-fn (:rin @st) "window.kaigi.realtimekit().others >= 1" 45000 "rin sees a remote RK participant")])))
+        (.then (fn [res]
+                 (check! "each side sees the other on the media plane"
+                         (and (aget res 0) (aget res 1)))
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st) (str remote-painting-js " >= 1") 45000 "jun paints a remote video")
+                       (wait-for-fn (:rin @st) (str remote-painting-js " >= 1") 45000 "rin paints a remote video")])))
+        (.then (fn [res]
+                 (check! "a remote video is actually painting frames"
+                         (and (aget res 0) (aget res 1))
+                         "joined with no picture is the failure this plane exists to fix")))
+        (.then (fn [_]
+                 (println)
+                 (println @checks "checks," @failures "failures")
+                 (js/Promise.all #js [(.close (:b1 @st)) (.close (:b2 @st))])))
+        (.then (fn [_] (set! (.-exitCode js/process) (if (pos? @failures) 1 0))))
+        (.catch (fn [e]
+                  (println "harness error:" (.-message e))
+                  (set! (.-exitCode js/process) 1))))))
+
+(-main)

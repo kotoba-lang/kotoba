@@ -1,0 +1,180 @@
+(ns kaigi.worker.entry
+  "Worker entry: the `KaigiRoom` Durable Object class and the default fetch
+  handler, both defined in ClojureScript.
+
+  ## Why the class is a `deftype`
+
+  A Durable Object binding needs a real exported class whose prototype carries
+  `fetch`, `webSocketMessage`, `webSocketClose` and `webSocketError` under
+  exactly those names, and whose constructor takes `(ctx, env)` positionally.
+  ClojureScript's `deftype` emits precisely that: positional constructor
+  fields and `Object` protocol methods written to the prototype un-munged. So
+  the class needs no JavaScript shim — which matters here because AGENTS.md
+  forbids new hand-written `.mjs`, and a shim is where the logic would start
+  leaking back into JS.
+
+  The methods hold no logic of their own; they delegate to
+  `kaigi.worker.room`, which is where the decisions are and where the state
+  registry lives.
+
+  ## Build
+
+      amu compile --target wasm32-browser worker
+
+  `release`, never `compile` — a `compile` build exits 0 and emits every
+  expected export name while importing a machine-local `/tmp/cljs-runtime`
+  path that cannot load standalone at all. cloud-itonami's `:edge-api`
+  comment records that this passed review more than once. Verify with
+  `kbb --backend sci verify-bundle.cljk`, which actually `import()`s the artifact."
+  (:require [kotoba.lang.text :as str]
+            [kaigi.plan :as plan]
+            [kaigi.realtimekit :as rk]
+            [kaigi.turn :as turn]
+            [kaigi.worker.room :as room]))
+
+(deftype KaigiRoom [ctx env]
+  Object
+  (fetch [_ request]
+    (room/on-fetch ctx env request))
+  (webSocketMessage [_ ws message]
+    (room/on-message ctx env ws message))
+  (webSocketClose [_ ws _code _reason _was-clean]
+    (room/on-close ctx env ws))
+  (webSocketError [_ ws _error]
+    (room/on-close ctx env ws)))
+
+(def ^:private meeting-id-pattern #"^[A-Za-z0-9_.:-]{1,128}$")
+
+(defn- json
+  [status body]
+  (js/Response. (js/JSON.stringify (clj->js body))
+                #js {:status status
+                     :headers #js {"content-type" "application/json; charset=utf-8"}}))
+
+(defn- turn-status
+  "`\"absent\"`, `\"ok\"`, or `\"error: …\"`."
+  [env]
+  (let [cfg (turn/config-from-env (fn [k] (aget env k)))]
+    (if-not (turn/turn-configured? cfg)
+      "absent"
+      (try
+        (let [servers (turn/ice-servers cfg "healthcheck" 0)]
+          (if (turn/relay-available? servers) "ok" "error: no relay in result"))
+        (catch :default e (str "error: " (.-message e)))))))
+
+(defn- navigation?
+  "Whether `request` is a browser navigating to a page, as opposed to fetching
+  a subresource or calling an API.
+
+  Keyed on the `Accept` header rather than on the path shape: a path-based rule
+  has to guess which extensions are assets, and guesses wrong for exactly the
+  deep links a meeting URL produces."
+  [request]
+  (and (= "GET" (.-method request))
+       (let [accept (or (.get (.-headers request) "Accept") "")]
+         (.includes accept "text/html"))))
+
+;; The `(aget env "ASSETS")` guard on the branch below is not defensive
+;; boilerplate: without it a deployment whose assets binding is missing would
+;; throw on every navigation instead of answering the JSON 404, turning a
+;; configuration mistake into a crash with a stack trace where a diagnosable
+;; response belongs.
+
+(defn- route-to-room
+  "Forward a request to the DO instance for `meeting-id`.
+
+  `idFromName` rather than a random id: the meeting id in the URL has to map
+  to the same object for every participant, which is the entire point of the
+  routing."
+  [env meeting-id request]
+  (let [ns' (aget env "KAIGI_ROOMS")
+        id  (.idFromName ns' meeting-id)]
+    (.fetch (.get ns' id) request)))
+
+(defn on-fetch
+  "Route table.
+
+    GET /api/kaigi/ws?meeting=<id>   WebSocket upgrade into the room
+    GET /api/kaigi/health            liveness plus which transport is active
+
+  The health response reports `transport` because 'is the SFU configured'
+  is the one operational question whose wrong answer is invisible: a
+  deployment missing `REALTIME_APP_ID` still works, in mesh, until the fifth
+  participant joins and the uplinks give out.
+
+  Always returns a Promise, even for the routes that could answer
+  synchronously. The Workers runtime accepts either, but a function that
+  returns a bare Response on one path and a Promise on another cannot be
+  driven uniformly by a caller — including the bundle verifier, which is the
+  first caller that tripped over it."
+  [request env _ctx]
+  (let [url  (js/URL. (.-url request))
+        path (.-pathname url)]
+    (js/Promise.resolve
+     (cond
+       (= path "/api/kaigi/health")
+       (json 200 {:ok true
+                  ;; Reported through `plan/transport` rather than re-derived
+                  ;; here: two places deciding which plane is active is how a
+                  ;; health check comes to disagree with the rooms it reports on.
+                  :transport (name (plan/transport
+                                    (merge {:app-id (some-> (aget env "REALTIME_APP_ID") str)
+                                            :app-token (some-> (aget env "REALTIME_APP_TOKEN") str)}
+                                           (rk/config-from-env (fn [k] (aget env k))))))
+                  ;; Not just "is TURN configured" but "does minting a
+                  ;; credential actually work here". Those differ, and the
+                  ;; difference is invisible from outside: a mint that throws
+                  ;; inside the room takes the WebSocket down with a bare 1006
+                  ;; and nothing in the logs. Reporting it here is what turns
+                  ;; that into one curl.
+                  :turn (turn-status env)
+                  ;; Which parts of the RealtimeKit configuration are present.
+                  ;; Names only, never values — the same reason `turn` reports
+                  ;; ok/absent/error rather than the secret: "configured" and
+                  ;; "actually reachable" are different questions, and a
+                  ;; transport that silently reads as mesh because ONE binding
+                  ;; is blank is invisible from outside.
+                  :realtimekit (let [cfg (rk/config-from-env (fn [k] (aget env k)))]
+                                 {:accountId (boolean (seq (str (:account-id cfg))))
+                                  :appId (boolean (seq (str (:app-id cfg))))
+                                  :apiToken (boolean (seq (str (:api-token cfg))))
+                                  :preset (boolean (seq (str (:preset cfg))))
+                                  :configured (rk/configured? cfg)})})
+
+       ;; Recording upload. Routed to the room rather than to a bucket so the
+       ;; Durable Object — the only holder of the live meeting — is what
+       ;; authorizes it. See kaigi.worker.room/upload-part!.
+       (and (= path "/api/kaigi/recording") (= "PUT" (.-method request)))
+       (let [meeting (or (.get (.-searchParams url) "meeting") "")]
+         (if (and (seq meeting) (re-matches meeting-id-pattern meeting))
+           (route-to-room env meeting request)
+           (json 400 {:error "meeting id must match [A-Za-z0-9_.:-]{1,128}"})))
+
+       (= path "/api/kaigi/ws")
+       (let [meeting (or (.get (.-searchParams url) "meeting") "")]
+         (if (and (seq meeting) (re-matches meeting-id-pattern meeting))
+           (route-to-room env meeting request)
+           (json 400 {:error "meeting id must match [A-Za-z0-9_.:-]{1,128}"})))
+
+       ;; Anything else is either a real asset miss or a deep link into the
+       ;; console. Serve the shell for navigations.
+       ;;
+       ;; This branch exists because of a production failure that `curl` could
+       ;; not reproduce: with both `main` and `assets` configured, an asset
+       ;; lookup that misses falls through to HERE rather than to the asset
+       ;; layer's `not_found_handling`. One of two browsers in the same meeting
+       ;; got a 404 for the console page while the other loaded normally, so the
+       ;; meeting silently had one participant and no error named the cause.
+       (and (navigation? request) (aget env "ASSETS"))
+       (.fetch (aget env "ASSETS")
+               (js/Request. (str (.-origin url) "/") request))
+
+       :else
+       (json 404 {:error (str "no route for " path)})))))
+
+(def handler
+  "The Worker's default export."
+  #js {:fetch (fn [request env ctx] (on-fetch request env ctx))})
+
+;; Referenced so the compiler cannot elide the namespace under :advanced.
+(defn- ^:export keep-alive [] (str/join "" ["kaigi"]))

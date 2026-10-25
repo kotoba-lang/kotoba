@@ -1,0 +1,126 @@
+(ns kaigi.signal-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kaigi.model :as m]
+            [kaigi.signal :as sig]))
+
+(defn- room-of-three []
+  (-> (m/meeting "m-1" "jun" {:lobby :open})
+      (m/start)
+      (m/join "jun")
+      (m/request-admission (m/participant "rin"))
+      (m/join "rin")
+      (m/request-admission (m/participant "kai"))
+      (m/join "kai")))
+
+(deftest broadcast-reaches-every-other-admitted-member
+  (let [m (room-of-three)
+        out (sig/route m {:from "jun" :payload {:sdp "offer"}})]
+    (is (vector? out))
+    (is (= #{"rin" "kai"} (set (map :to out))))
+    (is (every? #(= {:sdp "offer"} (:payload %)) out))))
+
+(deftest unicast-reaches-exactly-one
+  (let [m (room-of-three)
+        out (sig/route m {:from "jun" :to "rin" :payload {:ice "cand"}})]
+    (is (= [{:to "rin" :payload {:ice "cand"}}] out))))
+
+(deftest the-two-kinds-of-absence-are-distinguished
+  (testing "a participant waiting in the lobby is told they are waiting"
+    (let [m (-> (m/meeting "m-1" "jun" {:lobby :approval-required})
+                (m/start)
+                (m/join "jun")
+                (m/request-admission (m/participant "rin")))
+          out (sig/route m {:from "rin" :payload {:sdp "offer"}})]
+      (is (sig/error? out))
+      (is (= :kaigi.signal/not-admitted (:kaigi.signal/error out)))))
+  (testing "a stranger is told they are not in this meeting"
+    (let [out (sig/route (room-of-three) {:from "nobody" :payload {}})]
+      (is (= :kaigi.signal/not-a-participant (:kaigi.signal/error out))))))
+
+(deftest a-lobby-participant-cannot-send-sdp-to-anyone
+  (testing "this is what keeps an unapproved joiner off the media plane"
+    (let [m (-> (m/meeting "m-1" "jun" {:lobby :approval-required})
+                (m/start)
+                (m/join "jun")
+                (m/request-admission (m/participant "rin")))]
+      (is (sig/error? (sig/route m {:from "rin" :to "jun" :payload {:sdp "offer"}})))
+      (testing "and nobody can address them either"
+        (is (= :kaigi.signal/recipient-not-admitted
+               (:kaigi.signal/error (sig/route m {:from "jun" :to "rin" :payload {}}))))))))
+
+(deftest an-ended-meeting-routes-nothing
+  (let [m (m/end (room-of-three))]
+    (is (= :kaigi.signal/meeting-ended
+           (:kaigi.signal/error (sig/route m {:from "jun" :payload {}}))))))
+
+(deftest relay-errors-keep-their-own-vocabulary
+  (testing "an admitted participant who is not in the media room hits the relay's error, namespaced"
+    (let [m (-> (m/meeting "m-1" "jun" {:lobby :open})
+                (m/start)
+                (m/join "jun")
+                (m/request-admission (m/participant "rin")))]
+      ;; rin is admitted but never joined the room
+      (let [out (sig/route m {:from "rin" :payload {}})]
+        (is (sig/error? out))
+        (is (= :kaigi.signal.relay/sender-not-in-room (:kaigi.signal/error out))
+            "distinguishable from this layer's admission errors")))))
+
+(deftest classify-separates-control-from-relay
+  (is (= :control (sig/classify {:type :admit})))
+  (is (= :control (sig/classify {:type :end})))
+  (is (= :signal (sig/classify {:type :signal})))
+  (is (= :unknown (sig/classify {:type :something-else})))
+  (testing "a client cannot get a control type relayed by mislabelling it"
+    (is (not= :signal (sig/classify {:type :admit})))))
+
+(deftest control-authorization-is-by-role
+  (let [m (-> (room-of-three) (m/promote "jun" "rin"))]
+    (testing "host only"
+      (is (sig/may? m "jun" :end))
+      (is (not (sig/may? m "rin" :end)) "a cohost may moderate but not end")
+      (is (not (sig/may? m "kai" :promote))))
+    (testing "moderator"
+      (is (sig/may? m "jun" :admit))
+      (is (sig/may? m "rin" :admit))
+      (is (not (sig/may? m "kai" :admit))))
+    (testing "anyone admitted"
+      (is (sig/may? m "kai" :start-share))
+      (is (sig/may? m "kai" :consent-recording)))
+    (testing "nobody in the lobby"
+      (let [waiting (-> (m/meeting "m-2" "jun" {:lobby :approval-required})
+                        (m/start)
+                        (m/request-admission (m/participant "zzz")))]
+        (is (not (sig/may? waiting "zzz" :consent-recording)))
+        (is (not (sig/may? waiting "zzz" :start-share)))))))
+
+(deftest apply-control-returns-the-refusal-instead-of-a-silent-noop
+  (let [m (room-of-three)]
+    (testing "refused"
+      (let [out (sig/apply-control m {:type :end :from "kai"})]
+        (is (sig/error? out))
+        (is (= :kaigi.signal/forbidden (:kaigi.signal/error out)))
+        (is (re-find #"may not end" (:kaigi.signal/message out)))))
+    (testing "applied"
+      (let [out (sig/apply-control m {:type :end :from "jun"})]
+        (is (not (sig/error? out)))
+        (is (m/ended? (:kaigi.signal/meeting out)))))
+    (testing "unknown"
+      (is (= :kaigi.signal/unknown-control
+             (:kaigi.signal/error (sig/apply-control m {:type :nope :from "jun"})))))))
+
+(deftest apply-control-threads-through-the-model
+  (let [m (-> (m/meeting "m-1" "jun" {:lobby :approval-required})
+              (m/start)
+              (m/request-admission (m/participant "rin")))]
+    (let [admitted (:kaigi.signal/meeting
+                    (sig/apply-control m {:type :admit :from "jun" :target "rin"}))]
+      (is (m/admitted? admitted "rin"))
+      (testing "and a mute of self works while a remote unmute does not"
+        (let [muted (:kaigi.signal/meeting
+                     (sig/apply-control admitted {:type :mute :from "rin" :payload true}))]
+          (is (true? (-> muted (m/participant-by-id "rin") :kaigi.participant/muted?)))
+          (let [attempt (:kaigi.signal/meeting
+                         (sig/apply-control muted {:type :mute :from "jun"
+                                                   :target "rin" :payload false}))]
+            (is (true? (-> attempt (m/participant-by-id "rin") :kaigi.participant/muted?))
+                "the model refuses a remote unmute even though the control was authorized")))))))
