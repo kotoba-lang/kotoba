@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.statementFetch` | `kotoba.statementFetch/src` | `kotoba.statement-fetch`, `kotoba.statement-fetch.agent-browser`, `kotoba.statement-fetch.api`, `kotoba.statement-fetch.connector` (Kotoba project library) |
 | `kotoba.shohyo` | `kotoba.shohyo/src` | `kotoba.shohyo`, `kotoba.shohyo.genka`, `kotoba.shohyo.ifrs`, `kotoba.shohyo.jp` (Kotoba project library) |
 | `kotoba.sgp4` | `kotoba.sgp4/src` | `sgp4.core`, `sgp4.frames`, `sgp4.time`, `sgp4.tle` (Kotoba project library) |
 | `kotoba.importer` | `kotoba.importer/src` | `importer.connector`, `importer.coverage`, `importer.cursor`, `importer.model` (Kotoba project library) |
