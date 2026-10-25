@@ -1,0 +1,148 @@
+(ns iec61850.goose-test
+  (:require [asn1.core :as asn1]
+            [kotoba.test :refer [deftest is testing]]
+            [iec61850.appdu :as appdu]
+            [iec61850.goose :as goose]))
+
+(def ^:private dst [0x01 0x0C 0xCD 0x01 0x00 0x01])
+(def ^:private src [0x00 0x30 0xA7 0x12 0x34 0x56])
+
+(def ^:private sample-pdu
+  {:gocbRef "IED1LD0/LLN0$GO$gcb01"
+   :timeAllowedToLive 2000
+   :datSet "IED1LD0/LLN0$DataSet1"
+   :goID "IED1LD0/LLN0$GO$gcb01"
+   :t {:seconds 1735689600 :fraction 0.25 :leap-seconds-known? true :time-accuracy 20}
+   :stNum 5
+   :sqNum 0
+   :simulation false
+   :confRev 1
+   :ndsCom false
+   :allData [[:boolean true]
+             [:integer -12]
+             [:floating-point 50.5]
+             [:structure [[:visible-string "phase-A"] [:unsigned 400]]]]})
+
+(defn- full-frame [pdu]
+  (let [apdu (goose/encode pdu)]
+    (appdu/encode {:dst-mac dst :src-mac src :ethertype appdu/ethertype-goose
+                    :appid 0x0001 :apdu apdu})))
+
+(deftest goosepdu-round-trip-through-a-full-ethernet-frame
+  (let [frame (full-frame sample-pdu)
+        [fstatus fdecoded] (appdu/decode frame)]
+    (is (= :ok fstatus))
+    (is (= appdu/ethertype-goose (:ethertype fdecoded)))
+    (let [[gstatus decoded] (goose/decode (:apdu fdecoded))]
+      (is (= :ok gstatus))
+      (is (= (:gocbRef sample-pdu) (:gocbRef decoded)))
+      (is (= (:timeAllowedToLive sample-pdu) (:timeAllowedToLive decoded)))
+      (is (= (:datSet sample-pdu) (:datSet decoded)))
+      (is (= (:goID sample-pdu) (:goID decoded)))
+      (is (= (:stNum sample-pdu) (:stNum decoded)))
+      (is (= (:sqNum sample-pdu) (:sqNum decoded)))
+      (is (false? (:simulation decoded)))
+      (is (= (:confRev sample-pdu) (:confRev decoded)))
+      (is (false? (:ndsCom decoded)))
+      (is (= 4 (:numDatSetEntries decoded)))
+      (is (= [:boolean true] (nth (:allData decoded) 0)))
+      (is (= [:integer -12] (nth (:allData decoded) 1)))
+      (is (= :floating-point (first (nth (:allData decoded) 2))))
+      (is (= [:structure [[:visible-string "phase-A"] [:unsigned 400]]]
+             (nth (:allData decoded) 3)))
+      (testing "t round-trips through the 8-octet UtcTime encoding"
+        (is (= (:seconds (:t sample-pdu)) (:seconds (:t decoded))))
+        (is (true? (:leap-seconds-known? (:t decoded))))
+        (is (= 20 (:time-accuracy (:t decoded))))))))
+
+(deftest goosepdu-without-optional-goid
+  (let [pdu (dissoc sample-pdu :goID)
+        apdu (goose/encode pdu)
+        [status decoded] (goose/decode apdu)]
+    (is (= :ok status))
+    (is (nil? (:goID decoded)))))
+
+(deftest goosepdu-application-tag-is-0x61
+  ;; [APPLICATION 1] constructed = class 0x40 | constructed 0x20 | tag 1 =
+  ;; 0x61 — a mechanical consequence of X.690 tag encoding for those three
+  ;; fields (already verified independently in org-ietf-asn1's suite), not
+  ;; a transcribed spec byte.
+  (let [apdu (goose/encode sample-pdu)]
+    (is (= 0x61 (first apdu)))))
+
+;; ── negative: named reasons, discriminated ────────────────────────────────────
+
+(deftest bad-pdu-tag-is-refused
+  (let [not-a-goose-pdu (asn1/encode-ints (asn1/sequence* [(asn1/integer 1)]))
+        [status kw data] (goose/decode not-a-goose-pdu)]
+    (is (= :error status))
+    (is (= :iec61850.goose/bad-pdu-tag kw))
+    (is (= :universal (:class data)))))
+
+(deftest missing-required-field-is-refused
+  ;; Build the SEQUENCE by hand, omitting gocbRef (context tag 0), to
+  ;; simulate a malformed publisher rather than going through `goose/encode`
+  ;; (which cannot itself produce this — the omission has to be injected at
+  ;; the wire level, which is exactly the thing a subscriber has to defend
+  ;; against).
+  (let [element {:asn1/class :application :asn1/tag goose/application-tag
+                  :asn1/constructed? true
+                  :asn1/elements [(asn1/implicit 1 (asn1/integer 1000))]}
+        apdu (asn1/encode-ints element)
+        [status kw data] (goose/decode apdu)]
+    (is (= :error status))
+    (is (= :iec61850.goose/missing-field kw))
+    (is (= :gocbRef (:field data)))))
+
+(deftest numdatasetentries-mismatch-is-refused
+  (let [pdu (assoc sample-pdu :allData [[:boolean true]]) ; only 1, but we'll lie about the count below
+        apdu-ok (goose/encode pdu)
+        ;; Re-decode the honestly-encoded frame to confirm the happy path
+        ;; agrees, then hand-corrupt just the numDatSetEntries element to
+        ;; prove the check fires specifically on the mismatch.
+        element (first (asn1/decode-at apdu-ok 0))
+        elements (:asn1/elements element)
+        corrupted (mapv (fn [e] (if (= 10 (:asn1/tag e)) (asn1/implicit 10 (asn1/integer 99)) e))
+                         elements)
+        corrupted-apdu (asn1/encode-ints (assoc element :asn1/elements corrupted))
+        [status kw data] (goose/decode corrupted-apdu)]
+    (is (= :ok (first (goose/decode apdu-ok))))
+    (is (= :error status))
+    (is (= :iec61850.goose/numdatasetentries-mismatch kw))
+    (is (= 99 (:declared data)))
+    (is (= 1 (:actual data)))))
+
+(deftest malformed-ber-is-refused-not-thrown
+  (let [apdu (goose/encode sample-pdu)
+        truncated (subvec (vec apdu) 0 (- (count apdu) 5))
+        [status kw data] (goose/decode truncated)]
+    (is (= :error status))
+    (is (= :iec61850.goose/malformed-ber kw))
+    (is (some? (:asn1-error data)))))
+
+;; ── stNum/sqNum retransmission semantics ──────────────────────────────────────
+
+(deftest data-change-classification
+  (is (goose/data-change? {:stNum 5 :sqNum 3} {:stNum 6 :sqNum 0}))
+  (is (not (goose/data-change? {:stNum 5 :sqNum 3} {:stNum 6 :sqNum 1})))
+  (is (= :data-change (goose/classify-transition {:stNum 5 :sqNum 3} {:stNum 6 :sqNum 0}))))
+
+(deftest retransmission-classification
+  (is (goose/retransmission? {:stNum 6 :sqNum 0} {:stNum 6 :sqNum 1}))
+  (is (goose/retransmission? {:stNum 6 :sqNum 1} {:stNum 6 :sqNum 2}))
+  (is (not (goose/retransmission? {:stNum 6 :sqNum 0} {:stNum 7 :sqNum 0})))
+  (is (= :retransmission (goose/classify-transition {:stNum 6 :sqNum 5} {:stNum 6 :sqNum 6}))))
+
+(deftest restart-classification
+  (is (goose/restart? {:stNum 500} {:stNum 1 :sqNum 0}))
+  (is (= :restart (goose/classify-transition {:stNum 500 :sqNum 12} {:stNum 1 :sqNum 0}))))
+
+(deftest invalid-classification
+  ;; sqNum advances while stNum ALSO changes — neither a clean data change
+  ;; (sqNum must be 0) nor a clean retransmission (stNum must be unchanged).
+  (is (= :invalid (goose/classify-transition {:stNum 6 :sqNum 3} {:stNum 7 :sqNum 4}))))
+
+(deftest stnum-and-sqnum-wrap-at-2-32
+  (is (= 0 (goose/next-stnum 0xFFFFFFFF)))
+  (is (= 0 (goose/next-sqnum 0xFFFFFFFF)))
+  (is (goose/data-change? {:stNum 0xFFFFFFFF :sqNum 9} {:stNum 0 :sqNum 0})))

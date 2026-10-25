@@ -104,6 +104,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `kotoba.chIec61850` | `kotoba.chIec61850/src` | `iec61850.appdu`, `iec61850.data`, `iec61850.goose`, `iec61850.utctime` (Kotoba project library) |
 | `kotoba.oidc` | `kotoba.oidc/src` | `oidc.adapters.discovery`, `oidc.adapters.identity-bridge`, `oidc.adapters.jwks`, `oidc.adapters.jwt-claims` (Kotoba project library) |
 | `kotoba.codebase` | `kotoba.codebase/src` | `kotoba.codebase.actor`, `kotoba.codebase.authoring`, `kotoba.codebase.backend`, `kotoba.codebase.backend.kotobase` (Kotoba project library) |
 | `kotoba.arrangement` | `kotoba.arrangement/src` | `arrangement.core`, `arrangement.datalog`, `arrangement.partitioned`, `arrangement.query` (Kotoba project library) |
