@@ -1,0 +1,142 @@
+(ns pricing-oracle.core
+  "Market-analogy price prediction: given a set of verticals where some have a
+  real, researched price band (:band-low/:band-high, e.g. from real competitor
+  research) and some do not (quote-only/opaque markets with no self-serve
+  price anywhere), predict a plausible band for the gaps from the *other*
+  verticals that ARE priced — never from a model's prior, always from
+  comparables actually present in the input data.
+
+  Domain-agnostic: this ns knows nothing about cloud-itonami, ISIC/ISCO, or
+  ¥/$ — it operates over a generic item shape:
+
+    {:id \"...\" :cluster :some/keyword :unit \"$/seat/mo\"
+     :band-low 10.0 :band-high 20.0}   ; band-low/band-high nil == a gap to predict
+
+  Pure .cljc, no I/O, no host interop — runs under kotoba wasm / clojurewasm /
+  ClojureScript / nbb / JVM equally (ADR-0016 runtime-priority order). The
+  cloud-itonami-specific EDN loading/joining lives in bin/predict.cljk, which
+  adapts pricing-intelligence's :vertical/*, :rec/* shape into this ns's
+  generic item shape and back — this core never touches that vocabulary.
+
+  Method, honestly stated: this is a same-cluster / same-unit median-of-real-
+  comparables estimator, not a trained statistical or ML model. It has no
+  concept of a prior, confidence interval in the technical sense, or feature
+  weighting — 'confidence' below is just a coarse label for how many real,
+  independently-researched comparables backed the prediction and how directly
+  comparable they are (same cluster+unit > same unit only > same shape-family
+  only), not a calibrated probability. Predictions must always carry
+  :basis-ids so a human can check the actual comparables a prediction rests
+  on -- treat any :pred/* value that would come from this ns as a market
+  estimate to disclose as such, never as a real observed or quoted price."
+  (:require [kotoba.lang.text :as str]))
+
+(defn known?
+  "An item counts as 'known' (usable as a comparable) only if BOTH bounds are present."
+  [item]
+  (and (some? (:band-low item)) (some? (:band-high item))))
+
+(defn median
+  "Pure median of a coll of numbers. nil on empty input."
+  [nums]
+  (when (seq nums)
+    (let [sorted (vec (sort nums))
+          n (count sorted)
+          mid (quot n 2)]
+      (if (odd? n)
+        (double (nth sorted mid))
+        (/ (+ (nth sorted (dec mid)) (nth sorted mid)) 2.0)))))
+
+(defn shape-family
+  "Coarse bucket derived from the unit string, used only as a last-resort
+  fallback grouping when nothing shares cluster+unit or unit alone. Buckets by
+  vocabulary actually seen in cloud-itonami's pricing-intelligence units
+  (seat/user, per-unit-managed, per-task/order, enterprise/contract, flat) --
+  extend the cond here if a future domain introduces a genuinely new shape,
+  don't force it into an existing bucket."
+  [unit]
+  (let [u (str/lower (or unit ""))]
+    (cond
+      (or (str/includes? u "no self-serve") (str/includes? u "enterprise")
+          (str/includes? u "contract"))
+      :enterprise-contract
+
+      (or (str/includes? u "seat") (str/includes? u "user"))
+      :per-seat
+
+      (or (str/includes? u "unit") (str/includes? u "bed") (str/includes? u "location")
+          (str/includes? u "device") (str/includes? u "guard"))
+      :per-unit-managed
+
+      (or (str/includes? u "task") (str/includes? u "order") (str/includes? u "booking")
+          (str/includes? u "run"))
+      :per-transaction
+
+      :else :flat-or-other)))
+
+(defn- candidates-by
+    [items pred]
+  (filter #(and (known? %) (pred %)) items))
+
+(defn predict-band
+  "Predict a band for `target` (a gap item, :band-low/:band-high nil) from the
+  other known items in `items` (target itself is excluded automatically since
+  it isn't :known?). Falls back through four widening comparable sets, most
+  specific first -- :cluster is checked before :unit because free-text unit
+  strings (e.g. researched rationale prose) rarely match verbatim across
+  verticals even within the same market, whereas :cluster (the actual
+  industry/market segment) is the strongest real signal for 'is this a
+  comparable price scale':
+  1. same :cluster AND same :unit           (tightest, most defensible)
+  2. same :cluster, any :unit                (same market segment -- the
+                                               dominant, most trustworthy path
+                                               since unit text rarely matches
+                                               verbatim but industry does)
+  3. same :unit, any cluster                 (unit string matched verbatim
+                                               across an unrelated industry)
+  4. same shape-family (see `shape-family`)  (coarsest, cross-industry,
+                                               last resort -- can blend very
+                                               different price scales, e.g.
+                                               monthly per-seat SaaS with
+                                               annual enterprise contracts;
+                                               always :low confidence)
+  Returns nil if there is truly no comparable anywhere in `items` (all-gaps
+  input) -- callers must handle nil, not synthesize a number for it."
+  [target items]
+  (let [same-cluster-unit (candidates-by items #(and (= (:cluster %) (:cluster target))
+                                                       (= (:unit %) (:unit target))))
+        same-cluster      (candidates-by items #(= (:cluster %) (:cluster target)))
+        same-unit         (candidates-by items #(= (:unit %) (:unit target)))
+        same-shape        (candidates-by items #(= (shape-family (:unit %))
+                                                     (shape-family (:unit target))))
+        [basis method] (cond
+                         (>= (count same-cluster-unit) 1) [same-cluster-unit :cluster-same-unit]
+                         (>= (count same-cluster) 1)      [same-cluster :cluster-fallback]
+                         (>= (count same-unit) 1)         [same-unit :unit-fallback]
+                         (>= (count same-shape) 1)        [same-shape :shape-fallback]
+                         :else [nil nil])]
+    (when basis
+      (let [n (count basis)
+            confidence (cond
+                         (and (= method :cluster-same-unit) (>= n 5)) :high
+                         (and (contains? #{:cluster-same-unit :cluster-fallback} method) (>= n 2)) :medium
+                         :else :low)]
+        {:predicted-band-low (median (map :band-low basis))
+         :predicted-band-high (median (map :band-high basis))
+         :unit (:unit target)
+         :method method
+         :confidence confidence
+         :basis-count n
+         :basis-ids (mapv :id basis)}))))
+
+(defn predict-all-gaps
+  "Run predict-band for every item in `items` where (known? item) is false.
+  Returns a vector of {:id <gap item id> ...prediction-map-or-nil-merged}."
+  [items]
+  (let [gaps (remove known? items)]
+    (mapv (fn [gap]
+            (if-let [pred (predict-band gap items)]
+              (merge {:id (:id gap) :cluster (:cluster gap)} pred)
+              {:id (:id gap) :cluster (:cluster gap) :unit (:unit gap)
+               :predicted-band-low nil :predicted-band-high nil
+               :method nil :confidence :none :basis-count 0 :basis-ids []}))
+          gaps)))
