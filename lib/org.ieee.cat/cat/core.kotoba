@@ -1,0 +1,191 @@
+;; cat -- POSIX cat (IEEE Std 1003.1) as a Kotoba command.
+;;
+;; Writes the contents of each operand to standard output, in order. With no
+;; operands POSIX reads standard input; there is no stdin capability, so this
+;; implementation writes nothing and answers 0 -- see the README, which says
+;; so rather than pretending the case is handled.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37). The
+;; filesystem scope is a constant of the packaged binary, so `./cat` reads
+;; exactly the tree it was packaged for and the caller cannot widen it.
+;;
+;; ## The size it works at, and why it is not the file API
+;;
+;; A native guest's strings live in one 65,536-byte arena in the loader that
+;; is a bump allocator and never reclaims. Reading a file puts its whole
+;; content there, so the ceiling is not "how big a file can be read" but
+;; "how many bytes this process ever allocates". Measured by bisection
+;; 2026-09-09, reading one file and writing it:
+;;
+;;   operand path 127 bytes -> largest file 65,404
+;;   operand path 178 bytes -> largest file 65,353
+;;
+;; The ceiling falls by exactly the 51 bytes the path grew, and in both cases
+;; path + file = 65,531, with the remaining 5 the decimal count :io/write
+;; answers. So the model is closed: everything this process allocates has to
+;; fit in the arena, and the operands are part of it.
+;;
+;; With SEVERAL operands the contents share that one budget, which is why
+;; this does not stream: there is nothing to stream into.
+(ns cat.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+;; A one-byte "\n", cut from a two-line literal: Kotoba source cannot write a
+;; control character and has no char-to-string builtin.
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; Write each operand's contents in order. The loop counts UP and compares
+;; the RENDERED index against the rendered count, because the count arrives
+;; as decimal text and the guest has no text->number builtin. It does not
+;; stop at the first empty answer: an empty ARGUMENT is legal and an empty
+;; FILE reads as the empty string, so either would end the loop early.
+;; `cat: PATH: No such file or directory`, exit 1. Measured against /bin/cat
+;; 2026-09-10 -- each utility words this differently, so none of them is
+;; assumed from another: wc inserts `open:`, sort omits the path entirely,
+;; and sort and grep exit 2 where these exit 1.
+(defn complain [path :string] :i64
+  (do
+    (emit-error "cat: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; The check is per OPERAND and the walk continues past a bad one, because
+;; that is what cat does: `cat good missing good` prints both good files and
+;; complains once. The worst answer is remembered rather than returned early.
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+;; Left-pad to at least six columns, then a TAB: `%6d\t`, measured against
+;; /bin/cat. Six is a MINIMUM, so a seven-digit count widens the field rather
+;; than truncating -- the same shape org-ieee-wc's `" %7d"` has.
+(defn pad-to [s :string width :i64] :string
+  (if (>= (string-byte-length s) width)
+    s
+    (pad-to (string-concat " " s) width)))
+
+(defn numbered [n :i64] :string
+  (string-concat (pad-to (decimal-of n) 6) (tab)))
+
+;; --- flags ---------------------------------------------------------------
+;; Argument 0's SHAPE, never the argument COUNT: `cat a b` is also two
+;; arguments. Four sibling commands had that bug and it stayed invisible
+;; until a second operand existed.
+(defn flag [] :string
+  (let [a (arg "0")]
+    (if (= (string-index-of a "-") 0) a "")))
+
+(defn numbering? [] :bool
+  (if (string=? (flag) "-n") true (string=? (flag) "-b")))
+
+(defn blanks-too? [] :bool
+  (string=? (flag) "-n"))
+
+(defn squeeze? [] :bool
+  (string=? (flag) "-s"))
+
+(defn first-operand [] :i64
+  (if (string=? (flag) "") 0 1))
+
+(defn first-line [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn rest-lines [s :string] :string
+  (let [i (string-index-of s "\n")]
+    (if (< i 0) "" (string-substring s (+ i 1) (string-byte-length s)))))
+
+;; One file, line by line.
+;;
+;; `n` is the next number to hand out and `prev-blank?` whether the previous
+;; line was empty, for -s. The last line is emitted WITHOUT a newline when the
+;; input had none -- measured, `cat -n` over a file holding `x` answers
+;; "     1\tx" with no terminator, so cat adds nothing of its own here either.
+(defn lines [rest :string n :i64 prev-blank? :i64] :i64
+  (if (= (string-byte-length rest) 0)
+    n
+    (let [line (first-line rest)
+          more (rest-lines rest)
+          last? (if (< (string-index-of rest "\n") 0) 1 0)
+          blank? (if (= (string-byte-length line) 0) 1 0)]
+      (if (if (squeeze?)
+            (if (= blank? 1) (if (= prev-blank? 1) true false) false)
+            false)
+        ;; -s: a blank line whose predecessor was blank is dropped entirely.
+        (lines more n 1)
+        (do
+          (if (numbering?)
+            ;; -b numbers only NON-blank lines; a blank one gets no number and
+            ;; no tab, just its newline.
+            (if (if (blanks-too?) true (= blank? 0)) (emit (numbered n)) "")
+            "")
+          (emit line)
+          (if (= last? 1) "" (emit (nl)))
+          (lines more
+                 (if (numbering?)
+                   (if (if (blanks-too?) true (= blank? 0)) (+ n 1) n)
+                   n)
+                 blank?))))))
+
+;; The counter RESTARTS for each operand. Measured on /bin/cat (BSD):
+;; `cat -n a a` answers 1 2 1 2, not 1 2 3 4. GNU cat numbers continuously,
+;; so this is one of the places the two disagree and the comparison is
+;; against the one on this machine.
+(defn walk [i :i64 total :string worst :i64 n :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do
+          (if (if (numbering?) true (squeeze?))
+            (lines (slurp-file path) n 0)
+            ;; `lines` answers the next number (an i64) and `emit` answers the
+            ;; string it wrote, so the plain branch is wrapped to agree --
+            ;; both arms of an `if` must have one value type.
+            (do (emit (slurp-file path)) 0))
+          (walk (+ i 1) total worst 1))
+        (walk (+ i 1) total (complain path) 1)))))
+
+(defn main [] :i64
+  (let [total (arg "")
+        start (first-operand)]
+    ;; No operand is NOT refused here, unlike the siblings: measured,
+    ;; `cat -n` with no file exits 0 having read an empty stdin, and the walk
+    ;; already answers 0 when there is nothing to visit. Refusing with 1 broke
+    ;; a case the original passed.
+    (walk start total 0 1)))

@@ -185,6 +185,7 @@ The bundled standard libraries live in this repository:
 | `org.accellera.uvm` | `org.accellera.uvm/src` | `uvm.component`, `uvm.factory`, `uvm.phase`, `uvm.rtl-driver` (an external specification, publisher accellera.org) |
 | `org.ieee.awk` | `org.ieee.awk/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.basename` | `org.ieee.basename/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.cat` | `org.ieee.cat/src` | `` (an external specification, publisher ieee.org) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |
