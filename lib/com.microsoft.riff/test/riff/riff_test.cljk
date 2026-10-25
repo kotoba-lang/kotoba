@@ -1,0 +1,212 @@
+(ns riff.riff-test
+  "Runtime-agnostic RIFF/WAVE suite: recorded reference files, no shell, no
+   filesystem. The oracle suite adds ffmpeg in both directions."
+  (:require [kotoba.bytes :as kbytes] [riff.bytes :as b]
+            [riff.core :as riff]
+            [riff.fixtures :as fixtures]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- b64->bytes [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff)
+                (kbytes/base64-decode-bytes ^String s))
+     :cljs (let [d (js/atob s)]
+             (mapv #(.charCodeAt d %) (range (.-length d))))))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))
+
+(defn- file [name] (b64->bytes (get fixtures/files name)))
+
+;; ---------------------------------------------------------------------------
+;; IEEE-754, arithmetically
+;; ---------------------------------------------------------------------------
+
+(deftest float-codec-is-exact
+  (testing "the byte layouts match the well-known patterns"
+    (is (= [0 0 128 63] (b/put-f32 1.0)))
+    (is (= [0 0 0 0 0 0 240 63] (b/put-f64 1.0)))
+    (is (= [0 0 0 0 0 0 0 192] (b/put-f64 -2.0))))
+  (testing "f64 round-trips every double exactly, denormals included"
+    ;; An earlier version assembled all eight bytes into one integer, which is
+    ;; past 2^53 and loses the low mantissa bits: 0.1 came back as
+    ;; 0.10000000000000142.
+    (doseq [x [0.0 1.0 -1.0 0.5 3.14159 0.1 1e-30 1e30 255.75 -1e-7
+               2.2250738585072014e-308                      ; smallest normal
+               5e-324                                       ; smallest denormal
+               1e-320]]
+      (is (= x (b/f64 (b/put-f64 x) 0)) (str x))))
+  (testing "f32 round-trips every value that is a float32"
+    (doseq [x [0.0 1.0 -1.0 0.5 255.75 -0.25 1024.0
+               1.1754943508222875e-38                       ; smallest normal
+               1.401298464324817e-45]]                      ; smallest denormal
+      (is (= x (b/f32 (b/put-f32 x) 0)) (str x))))
+  (testing "and a value that is not a float32 lands on the nearest one"
+    (is (= 1.401298464324817e-45 (b/f32 (b/put-f32 1.4e-45) 0))))
+  (testing "the integer codecs cover their full ranges"
+    (is (= -32768 (b/i16 (b/put-i16 -32768) 0)))
+    (is (= 32767 (b/i16 (b/put-i16 32767) 0)))
+    (is (= -8388608 (b/i24 (b/put-i24 -8388608) 0)))
+    (is (= 8388607 (b/i24 (b/put-i24 8388607) 0)))
+    (is (= -2147483648 (b/i32 (b/put-i32 -2147483648) 0)))
+    (is (= 2147483647 (b/i32 (b/put-i32 2147483647) 0)))
+    (is (= 4294967295 (b/u32 (b/put-u32 4294967295) 0)))))
+
+;; ---------------------------------------------------------------------------
+;; Chunks
+;; ---------------------------------------------------------------------------
+
+(deftest walks-chunks
+  (let [parsed (riff/chunks (file "s16"))]
+    (is (= "WAVE" (:form parsed)))
+    (is (= ["fmt " "LIST" "data"] (mapv :id (:chunks parsed))))
+    (testing "a chunk that is not fmt or data is kept, not skipped"
+      (is (some #(= "LIST" (:id %)) (:chunks parsed))))
+    (testing "the chunks tile the file, allowing for pad bytes"
+      (let [last-chunk (last (:chunks parsed))]
+        (is (<= (+ (:offset last-chunk) (:size last-chunk)) (count (file "s16"))))))))
+
+(deftest odd-sized-chunks-are-padded
+  ;; The pad byte is not counted in the chunk's size. A walker that forgets it
+  ;; drifts one byte per odd chunk and then reads a garbage id.
+  (let [;; one 3-sample 8-bit mono file: the data chunk is odd-sized
+        wav (riff/build {:channels [[1 2 3]] :bits 8 :sample-rate 8000})
+        parsed (riff/chunks wav)
+        data (riff/chunk-named parsed "data")]
+    (is (= 3 (:size data)))
+    (is (odd? (:size data)))
+    (is (= [1 2 3] (first (riff/samples wav))))
+    (testing "the file length includes the pad byte"
+      (is (even? (count wav))))))
+
+;; ---------------------------------------------------------------------------
+;; Reading real files
+;; ---------------------------------------------------------------------------
+
+(deftest reads-every-sample-format
+  (doseq [[name format bits channels]
+          [["u8" :pcm 8 1] ["s16" :pcm 16 2] ["s24" :pcm 24 2]
+           ["s32" :pcm 32 2] ["f32" :float 32 2]]]
+    (testing name
+      (let [p (riff/parse (file name))
+            s (riff/samples (file name))]
+        (is (= format (:format p)))
+        (is (= bits (:bits p)))
+        (is (= channels (:channels p)))
+        (is (= 8000 (:sample-rate p)))
+        (is (= channels (count s)))
+        (is (= (:frames p) (count (first s))))
+        (is (pos? (:frames p)))
+        (testing "byte rate and block align agree with the other fields"
+          (is (= (* channels (quot bits 8)) (:block-align p)))
+          (is (= (* (:sample-rate p) (:block-align p)) (:byte-rate p))))))))
+
+(deftest handles-wave-format-extensible
+  ;; ffmpeg writes 24- and 32-bit PCM as WAVE_FORMAT_EXTENSIBLE, so the format
+  ;; tag is 0xFFFE and the real one lives in a SubFormat GUID.
+  (doseq [name ["s24" "s32"]]
+    (testing name
+      (let [p (riff/parse (file name))]
+        (is (:extensible? p))
+        (is (= 0xfffe (:format-tag p)))
+        (is (= :pcm (:format p)) "resolved from the GUID, not the tag")))))
+
+(deftest eight-bit-pcm-is-unsigned
+  ;; The one place in WAVE where sample sign flips with width: 8-bit is stored
+  ;; unsigned with a 128 bias, everything wider is two's complement.
+  (let [s (first (riff/samples (file "u8")))]
+    (is (some neg? s) "a sine wave must go below zero once de-biased")
+    (is (every? #(and (>= % -128) (<= % 127)) s))))
+
+;; ---------------------------------------------------------------------------
+;; Writing
+;; ---------------------------------------------------------------------------
+
+(deftest round-trips-every-format
+  (doseq [name ["u8" "s16" "s24" "s32" "f32"]]
+    (testing name
+      (let [p (riff/parse (file name))
+            s (riff/samples (file name))
+            ours (riff/build {:channels s :sample-rate (:sample-rate p)
+                              :bits (:bits p) :format (:format p)})]
+        (is (riff/riff? ours))
+        (is (= s (riff/samples ours)) "samples survive a write and a read")
+        (is (= (:bits p) (:bits (riff/parse ours))))
+        (is (= (:format p) (:format (riff/parse ours))))
+        (is (= (:channels p) (:channels (riff/parse ours))))))))
+
+(deftest writes-extensible-when-asked
+  (let [s [[0.0 0.5 -0.5] [1.0 -1.0 0.25]]
+        plain (riff/build {:channels s :bits 32 :format :float})
+        ext (riff/build {:channels s :bits 32 :format :float :extensible? true})]
+    (is (= 0x0003 (:format-tag (riff/parse plain))))
+    (is (= 0xfffe (:format-tag (riff/parse ext))))
+    (is (:extensible? (riff/parse ext)))
+    (testing "both decode to the same samples"
+      (is (= s (riff/samples plain)))
+      (is (= s (riff/samples ext))))))
+
+(deftest writes-are-reproducible
+  ;; No timestamps, no encoder tag: the samples alone decide the bytes.
+  (let [opts {:channels [[1 2 3 4]] :bits 16 :sample-rate 22050}]
+    (is (= (riff/build opts) (riff/build opts)))))
+
+(deftest full-scale-values-survive
+  (doseq [[bits lo hi] [[8 -128 127] [16 -32768 32767]
+                        [24 -8388608 8388607] [32 -2147483648 2147483647]]]
+    (testing (str bits "-bit extremes")
+      (let [s [[lo hi 0 -1 1]]
+            back (riff/samples (riff/build {:channels s :bits bits}))]
+        (is (= s back))))))
+
+;; ---------------------------------------------------------------------------
+;; Refusals
+;; ---------------------------------------------------------------------------
+
+(deftest refuses-what-it-cannot-honestly-read
+  (testing "not a RIFF file"
+    (is (false? (riff/riff? [1 2 3 4])))
+    (is (= :not-riff (reason-of #(riff/chunks (vec (repeat 40 0x41)))))))
+  (testing "too short to be one"
+    (is (= :truncated (reason-of #(riff/chunks [0x52 0x49 0x46 0x46])))))
+  (testing "a RIFF file that is not WAVE"
+    (let [avi (into (into (b/->fourcc "RIFF") (b/put-u32 4)) (b/->fourcc "AVI "))]
+      (is (= "AVI " (:form (riff/chunks avi))) "the container still parses")
+      (is (= :not-wave (reason-of #(riff/parse avi))))))
+  (testing "a chunk whose size runs past the end"
+    (let [wav (riff/build {:channels [[1 2 3 4]] :bits 16})
+          data (riff/chunk-named (riff/chunks wav) "data")
+          broken (reduce (fn [v [i x]] (assoc v i x))
+                         wav
+                         (map vector (range (- (:offset data) 4) (:offset data))
+                              (b/put-u32 999999)))]
+      (is (= :truncated (reason-of #(riff/chunks broken))))))
+  (testing "compressed WAVE codecs are named, never returned as samples"
+    (doseq [[tag expected] [[0x0002 :ms-adpcm] [0x0011 :ima-adpcm]
+                            [0x0006 :a-law] [0x0007 :mu-law] [0x0055 :mp3]]]
+      (let [wav (riff/build {:channels [[1 2 3 4]] :bits 16})
+            fmt (riff/chunk-named (riff/chunks wav) "fmt ")
+            tagged (reduce (fn [v [i x]] (assoc v i x))
+                           wav
+                           (map vector (range (:offset fmt) (+ (:offset fmt) 2))
+                                (b/put-u16 tag)))]
+        (is (= :unsupported-format (reason-of #(riff/parse tagged)))
+            (str (name expected) " must be refused"))
+        (is (= expected (:format (try (riff/parse tagged) nil
+                                      (catch #?(:clj Exception :cljs :default) e
+                                        (ex-data e)))))
+            "and named in the ex-data"))))
+  (testing "writing refuses what it cannot encode"
+    (is (= :unsupported-format
+           (reason-of #(riff/build {:channels [[1]] :bits 16 :format :mu-law}))))
+    (is (= :unsupported-format
+           (reason-of #(riff/build {:channels [[1]] :bits 12})))
+        "12-bit PCM is not a thing WAVE writers should emit")
+    (is (= :unsupported-format
+           (reason-of #(riff/build {:channels [[1.0]] :bits 16 :format :float})))
+        "float must be 32 or 64 bits"))
+  (testing "channels of different lengths are a caller bug, not silent truncation"
+    (is (= :bad-fmt (reason-of #(riff/build {:channels [[1 2 3] [1 2]] :bits 16})))))
+  (testing "no channels at all"
+    (is (= :bad-fmt (reason-of #(riff/build {:channels [] :bits 16}))))))
