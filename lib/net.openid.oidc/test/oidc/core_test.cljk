@@ -1,0 +1,142 @@
+(ns oidc.core-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotoba.lang.text :as str]
+            [oidc.core :as oidc]))
+
+;; --- minimal test-only JSON codec + base64url encoder, so this test file
+;; has zero deps beyond clojure.test, matching the library's own policy. ---
+
+(defn- json-write-min
+  "Just enough EDN->JSON to build the tiny fixed-shape maps this test uses."
+  [m]
+  (str "{"
+       (str/join "," (map (fn [[k v]]
+                             (str "\"" (name k) "\":"
+                                  (cond
+                                    (string? v) (str "\"" v "\"")
+                                    (sequential? v) (str "[" (str/join "," (map #(str "\"" % "\"") v)) "]")
+                                    :else (str v))))
+                           m))
+       "}"))
+
+(defn- json-read-min
+  "Just enough JSON->EDN for this test's own fixtures (flat string/number/
+   string-array values only)."
+  [s]
+  (let [body (subs s 1 (dec (count s)))]
+    (into {}
+          (for [pair (when (seq body) (str/split body #","))]
+            (let [[k v] (str/split pair #":" 2)
+                  k (keyword (subs k 1 (dec (count k))))
+                  v (cond
+                      (str/starts-with? v "\"") (subs v 1 (dec (count v)))
+                      (str/starts-with? v "[")
+                      (let [inner (subs v 1 (dec (count v)))]
+                        (mapv #(subs % 1 (dec (count %))) (str/split inner #",")))
+                      :else (Long/parseLong v))]
+              [k v])))))
+
+(def ^:private b64url-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+(defn- drain-sextets
+  "Emit every full 6-bit sextet available in `acc` (which holds `bits`
+   significant bits), returning `[remaining-acc remaining-bits emitted]`."
+  [acc bits emitted]
+  (if (>= bits 6)
+    (let [shift (- bits 6)
+          sextet (bit-and (bit-shift-right acc shift) 0x3F)
+          acc' (bit-and acc (dec (bit-shift-left 1 shift)))]
+      (recur acc' shift (conj emitted (nth b64url-alphabet sextet))))
+    [acc bits emitted]))
+
+(defn- base64url-encode-bytes [bytes]
+  (apply str
+         (loop [b (seq bytes) acc 0 bits 0 out []]
+           (if (empty? b)
+             (if (pos? bits)
+               (conj out (nth b64url-alphabet (bit-and (bit-shift-left acc (- 6 bits)) 0x3F)))
+               out)
+             (let [acc' (bit-or (bit-shift-left acc 8) (bit-and (first b) 0xFF))
+                   bits' (+ bits 8)
+                   [acc'' bits'' out'] (drain-sextets acc' bits' out)]
+               (recur (rest b) acc'' bits'' out'))))))
+
+(defn- base64url-encode-str [s]
+  (base64url-encode-bytes (map (comp int) s)))
+
+(defn- fake-jwt [header-map claims-map]
+  (str (base64url-encode-str (json-write-min header-map)) "."
+       (base64url-encode-str (json-write-min claims-map)) "."
+       (base64url-encode-str "sig")))
+
+(deftest base64url-round-trip
+  (is (= "hello world" (oidc/base64url-decode (base64url-encode-str "hello world")))))
+
+(deftest decode-jwt-segments-test
+  (let [jwt (fake-jwt {:alg "RS256" :typ "JWT"}
+                       {:iss "https://issuer.example" :aud "client-1" :exp 9999999999 :sub "u1"})
+        {:keys [header claims signing-input signature]} (oidc/decode-jwt-segments jwt json-read-min)]
+    (is (= "RS256" (:alg header)))
+    (is (= "https://issuer.example" (:iss claims)))
+    (is (= "client-1" (:aud claims)))
+    (is (string? signing-input))
+    (is (= 2 (count (str/split signing-input #"\."))))
+    (is (vector? signature))))
+
+(deftest decode-jwt-segments-malformed
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo)
+               (oidc/decode-jwt-segments "not-a-jwt" json-read-min))))
+
+(deftest validate-id-token-claims-happy-path
+  (let [claims {:iss "https://issuer.example" :aud "client-1" :exp 2000000000 :iat 1000000000 :nonce "n123"}
+        result (oidc/validate-id-token-claims claims {:issuer "https://issuer.example"
+                                                        :audience "client-1"
+                                                        :nonce "n123"
+                                                        :now 1999999999})]
+    (is (:valid? result))
+    (is (empty? (:errors result)))))
+
+(deftest validate-id-token-claims-iss-mismatch
+  (let [claims {:iss "https://wrong.example" :aud "client-1" :exp 2000000000}
+        result (oidc/validate-id-token-claims claims {:issuer "https://issuer.example"
+                                                        :audience "client-1" :now 1000000000})]
+    (is (not (:valid? result)))
+    (is (some #{:iss-mismatch} (:errors result)))))
+
+(deftest validate-id-token-claims-aud-mismatch
+  (let [claims {:iss "https://issuer.example" :aud ["other-client"] :exp 2000000000}
+        result (oidc/validate-id-token-claims claims {:issuer "https://issuer.example"
+                                                        :audience "client-1" :now 1000000000})]
+    (is (some #{:aud-mismatch} (:errors result)))))
+
+(deftest validate-id-token-claims-expired
+  (let [claims {:iss "https://issuer.example" :aud "client-1" :exp 1000000000}
+        result (oidc/validate-id-token-claims claims {:issuer "https://issuer.example"
+                                                        :audience "client-1" :now 2000000000 :leeway 0})]
+    (is (some #{:expired} (:errors result)))))
+
+(deftest validate-id-token-claims-nonce-mismatch
+  (let [claims {:iss "https://issuer.example" :aud "client-1" :exp 2000000000 :nonce "abc"}
+        result (oidc/validate-id-token-claims claims {:issuer "https://issuer.example"
+                                                        :audience "client-1" :nonce "xyz" :now 1000000000})]
+    (is (some #{:nonce-mismatch} (:errors result)))))
+
+(deftest parse-discovery-document-test
+  (let [doc (oidc/parse-discovery-document
+             {"issuer" "https://issuer.example"
+              "authorization_endpoint" "https://issuer.example/authorize"
+              "token_endpoint" "https://issuer.example/token"
+              "userinfo_endpoint" "https://issuer.example/userinfo"
+              "jwks_uri" "https://issuer.example/jwks"
+              "some_future_field" "kept-as-is"})]
+    (is (= "https://issuer.example" (:issuer doc)))
+    (is (= "https://issuer.example/authorize" (:authorization-endpoint doc)))
+    (is (= "kept-as-is" (get doc "some_future_field")))))
+
+(deftest userinfo-request-test
+  (let [req (oidc/userinfo-request {:userinfo-endpoint "https://issuer.example/userinfo"
+                                     :access-token "tok123"})]
+    (is (= "https://issuer.example/userinfo" (:url req)))
+    (is (= "GET" (:method req)))
+    (is (= "Bearer tok123" (get (:headers req) "Authorization")))))

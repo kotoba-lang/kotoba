@@ -1,0 +1,126 @@
+(ns oidc.core
+  "OpenID Connect ID Token / discovery / UserInfo as data — no crypto or
+   network I/O; JWT signature verification and JSON parsing are injected
+   host capabilities. `.cljc`, zero third-party runtime deps.
+
+   This repo never fabricates trust: `decode-jwt-segments` only splits and
+   base64url-decodes a compact JWT into header/claims maps (via an injected
+   `json-read`) — it does NOT verify the signature. `validate-id-token-claims`
+   only checks the claims a host has *already* signature-verified against
+   the OIDC Core §3.1.3.7 rules (iss/aud/exp/iat/nonce). Sibling of
+   `kotoba-lang/org-ietf-oauth2` (OIDC layers on OAuth2's authorization-code
+   flow) — no hard code dependency between the two."
+  (:require [kotoba.lang.text]))
+
+(def ^:private b64url-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+
+(def ^:private b64url-index
+  (into {} (map-indexed (fn [i c] [c i]) b64url-alphabet)))
+
+(defn base64url-decode-bytes
+  "Decode a base64url string (RFC 4648 §5, padding optional/ignored) into a
+   vector of byte values (0-255). Pure bit-accumulator algorithm — no
+   platform base64 primitives, so it behaves identically on every `.cljc`
+   target."
+  [s]
+  (loop [chars (seq (remove #{\=} s))
+         acc 0
+         bits 0
+         out []]
+    (if (empty? chars)
+      out
+      (let [c (first chars)
+            v (get b64url-index c)]
+        (when (nil? v)
+          (throw (ex-info "invalid base64url character" {:char c :input s})))
+        (let [acc' (bit-or (bit-shift-left acc 6) v)
+              bits' (+ bits 6)]
+          (if (>= bits' 8)
+            (let [shift (- bits' 8)
+                  byte-val (bit-and (bit-shift-right acc' shift) 0xFF)]
+              (recur (rest chars) (bit-and acc' (dec (bit-shift-left 1 shift))) shift (conj out byte-val)))
+            (recur (rest chars) acc' bits' out)))))))
+
+(defn bytes->utf8-string
+  "Decode a seq/vector of byte values (0-255) as a UTF-8 string."
+  [bytes]
+  #?(:clj (String. (byte-array (map unchecked-byte bytes)) "UTF-8")
+     :cljs (let [arr (js/Uint8Array. (clj->js bytes))]
+             (.decode (js/TextDecoder. "utf-8") arr))))
+
+(defn base64url-decode
+  "Decode a base64url string straight to a UTF-8 string."
+  [s]
+  (bytes->utf8-string (base64url-decode-bytes s)))
+
+(defn decode-jwt-segments
+  "Split a compact JWT (`header.payload.signature`) on `.`, base64url-decode
+   the header and payload segments, and parse each with the injected
+   `json-read` fn (`[string] -> map`). Returns
+   `{:header {...} :claims {...} :signing-input \"header.payload\"
+     :signature (base64url-decode-bytes signature-segment)}`.
+   Throws `ex-info` if `jwt-string` doesn't have exactly 3 dot-separated
+   segments. Does NOT verify the signature — that's a host concern."
+  [jwt-string json-read]
+  (let [segments (kotoba.lang.text/split jwt-string #"\." )]
+    (when (not= 3 (count segments))
+      (throw (ex-info "malformed JWT: expected 3 dot-separated segments"
+                       {:segment-count (count segments) :input jwt-string})))
+    (let [[header-seg payload-seg sig-seg] segments]
+      {:header (json-read (base64url-decode header-seg))
+       :claims (json-read (base64url-decode payload-seg))
+       :signing-input (str header-seg "." payload-seg)
+       :signature (base64url-decode-bytes sig-seg)})))
+
+(defn- aud-matches? [aud audience]
+  (cond
+    (nil? aud) false
+    (sequential? aud) (boolean (some #(= % audience) aud))
+    :else (= aud audience)))
+
+(defn validate-id-token-claims
+  "Validate a decoded ID Token claims map against OIDC Core §3.1.3.7:
+   `iss` equals `issuer`, `aud` contains/equals `audience`, `exp` is in the
+   future (allowing `leeway` seconds), `iat` is not in the future beyond
+   `leeway`, and — when `nonce` is supplied — it matches `(:nonce claims)`.
+   Never throws. Returns `{:valid? bool :errors [keyword...]}`."
+  [claims {:keys [issuer audience nonce now leeway] :or {leeway 60}}]
+  (let [now (or now #?(:clj (quot (System/currentTimeMillis) 1000)
+                        :cljs (quot (.getTime (js/Date.)) 1000)))
+        errors (cond-> []
+                 (not= (:iss claims) issuer) (conj :iss-mismatch)
+                 (not (aud-matches? (:aud claims) audience)) (conj :aud-mismatch)
+                 (or (nil? (:exp claims)) (< (+ (:exp claims) leeway) now)) (conj :expired)
+                 (and (:iat claims) (> (:iat claims) (+ now leeway))) (conj :iat-in-future)
+                 (and nonce (not= nonce (:nonce claims))) (conj :nonce-mismatch))]
+    {:valid? (empty? errors) :errors errors}))
+
+(defn parse-discovery-document
+  "Normalize a decoded `.well-known/openid-configuration` JSON map into
+   kebab-case keys for the fields this library cares about
+   (:issuer :authorization-endpoint :token-endpoint :userinfo-endpoint
+   :jwks-uri :response-types-supported :subject-types-supported
+   :id-token-signing-alg-values-supported). Unknown keys are left untouched
+   under their original string key — nothing is silently dropped."
+  [decoded-json-map]
+  (let [known {"issuer" :issuer
+               "authorization_endpoint" :authorization-endpoint
+               "token_endpoint" :token-endpoint
+               "userinfo_endpoint" :userinfo-endpoint
+               "jwks_uri" :jwks-uri
+               "response_types_supported" :response-types-supported
+               "subject_types_supported" :subject-types-supported
+               "id_token_signing_alg_values_supported" :id-token-signing-alg-values-supported}]
+    (reduce-kv (fn [m k v]
+                 (assoc m (get known k k) v))
+               {}
+               decoded-json-map)))
+
+(defn userinfo-request
+  "Build the UserInfo request map for the given discovery-normalized
+   endpoint and bearer access token."
+  [{:keys [userinfo-endpoint access-token]}]
+  {:url userinfo-endpoint
+   :method "GET"
+   :headers {"Authorization" (str "Bearer " access-token)}})
