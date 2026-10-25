@@ -1,0 +1,156 @@
+(ns crowdfunding.passthrough-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [crowdfunding.fixtures :as fx]
+            [crowdfunding.passthrough :as sut]))
+
+;; Numbers follow ADR-2607268000's MK-1 shape, in JPY minor units (= yen):
+;; a build slot deposit, a fixed margin, and a cap the backer agreed to.
+(def q
+  (sut/quotation {:deposit-minor  100000
+                  :margin-minor   80000
+                  :cap-minor      600000
+                  :estimate-minor 380000
+                  :basis-note     "B70 x1, DDR5 128GB, 2TB NVMe — 2026-07 spot"}))
+
+(defn basis [ddr5]
+  (sut/cost-basis [(sut/cost-line {:part "gpu-b70" :qty 1 :unit-minor 170000
+                                   :source "distributor-a" :purchased-at "2026-11-01"})
+                   (sut/cost-line {:part "ddr5-128gb" :qty 1 :unit-minor ddr5
+                                   :source "distributor-b" :purchased-at "2026-11-01"})
+                   (sut/cost-line {:part "nvme-2tb" :qty 1 :unit-minor 40000
+                                   :source "distributor-b" :purchased-at "2026-11-01"})]))
+
+(deftest a-well-formed-quote-is-accepted
+  (is (= [] (sut/quotation-errors q)))
+  (is (= [] (sut/basis-errors (basis 170000)))))
+
+(deftest a-cap-that-does-not-cap-is-refused
+  (is (some #{:cap-below-deposit}
+            (map :passthrough.error/code
+                 (sut/quotation-errors (assoc q :quote/cap-minor 50000)))))
+  (testing "a creator whose own estimate already breaches the cap is not quoting, they are hoping"
+    (is (some #{:cap-below-own-estimate}
+              (map :passthrough.error/code
+                   (sut/quotation-errors (assoc q :quote/cap-minor 400000)))))))
+
+(deftest a-price-with-no-stated-basis-is-just-a-price
+  (is (some #{:missing-basis-note}
+            (map :passthrough.error/code
+                 (sut/quotation-errors (assoc q :quote/basis-note ""))))))
+
+(deftest headroom-is-the-inflation-the-cap-absorbs
+  (is (= 140000 (sut/headroom-minor q))
+      "600000 cap - 380000 estimate - 80000 margin"))
+
+;; ───────────────────────── settlement ─────────────────────────
+
+(deftest components-at-estimate-settle-at-the-expected-balance
+  (let [s (sut/settle q (basis 170000))]
+    (is (= 380000 (:settlement/parts-minor s)))
+    (is (= 460000 (:settlement/true-total-minor s)))
+    (is (= 360000 (:settlement/balance-due-minor s)) "460000 total less the 100000 deposit")
+    (is (false? (:settlement/over-cap? s)))
+    (is (zero? (:settlement/vs-estimate-minor s)))))
+
+(deftest components-that-rose-pass-through-up-to-the-cap
+  (let [s (sut/settle q (basis 250000))]
+    (is (= 460000 (:settlement/parts-minor s)))
+    (is (= 80000 (:settlement/vs-estimate-minor s)) "DDR5 rose 80000 against the estimate")
+    (is (= 540000 (:settlement/true-total-minor s)))
+    (is (= 440000 (:settlement/balance-due-minor s)))
+    (is (false? (:settlement/over-cap? s)) "still inside the 600000 the backer agreed to")))
+
+(deftest past-the-cap-the-creator-absorbs-it-and-there-is-no-branch-that-does-not
+  (let [s (sut/settle q (basis 400000))]
+    (is (= 690000 (:settlement/true-total-minor s)))
+    (is (true? (:settlement/over-cap? s)))
+    (is (= 600000 (:settlement/billable-total-minor s)) "never more than the cap")
+    (is (= 500000 (:settlement/balance-due-minor s)))
+    (is (= 90000 (:settlement/creator-absorbs-minor s)))))
+
+(deftest a-settlement-below-the-deposit-is-a-refund-not-a-negative-charge
+  (testing "a negative charge is something a payment rail will happily run backwards"
+    (let [cheap (sut/settle (assoc q :quote/deposit-minor 500000
+                                   :quote/cap-minor 900000)
+                            (basis 100000))]
+      (is (= 310000 (:settlement/parts-minor cheap)))
+      (is (= 390000 (:settlement/true-total-minor cheap)))
+      (is (zero? (:settlement/balance-due-minor cheap)))
+      (is (= 110000 (:settlement/refund-due-minor cheap))))))
+
+;; ───────────────────────── reconsent ─────────────────────────
+
+(deftest the-only-way-past-a-cap-is-a-new-agreement
+  (is (nil? (sut/reconsent q {:new-cap-minor 800000 :agreed-by ""})))
+  (is (nil? (sut/reconsent q {:new-cap-minor 600000 :agreed-by "backer@example"}))
+      "a reconsent that repeats the cap is a record being manufactured")
+  (is (nil? (sut/reconsent q {:new-cap-minor 500000 :agreed-by "backer@example"}))
+      "and one that lowers it is a mistake")
+  (let [q2 (sut/reconsent q {:new-cap-minor 750000 :agreed-by "backer@example"
+                             :agreed-at "2026-11-05T00:00:00Z"
+                             :rationale "accepts DDR5 spot increase"})
+        s  (sut/settle q2 (basis 400000))]
+    (is (= 600000 (get-in q2 [:quote/reconsent :reconsent/prior-cap-minor])))
+    (is (true? (get-in q2 [:quote/reconsent :reconsent/human?])))
+    (is (false? (:settlement/over-cap? s)) "the settlement is recomputed from the new agreement")
+    (is (= 590000 (:settlement/balance-due-minor s)))
+    (is (zero? (:settlement/creator-absorbs-minor s)))))
+
+;; ───────────────────────── exposure ─────────────────────────
+
+(deftest exposure-is-aggregate-because-that-is-what-decides-solvency
+  (let [ss (concat (repeat 900 (sut/settle q (basis 400000)))
+                   (repeat 100 (sut/settle q (basis 170000))))
+        e  (sut/campaign-exposure ss)]
+    (is (= 1000 (:exposure/units e)))
+    (is (= 900 (:exposure/over-cap-units e)))
+    (is (= 81000000 (:exposure/absorbed-minor e))
+        "90000 absorbed on each of 900 units — a rounding error on one order, the company on nine hundred")
+    (is (zero? (:exposure/refund-due-minor e)))))
+
+;; ───────────────────────── campaign / pledge agreement ─────────────────────────
+
+(def ^:private passthrough-campaign
+  (assoc (fx/a-campaign) :campaign/pricing-model :deposit-plus-settlement))
+
+(deftest a-passthrough-pledge-without-a-quote-has-no-cap-at-all
+  (testing "which is the unbounded commitment this namespace exists to prevent"
+    (let [ps [(fx/a-pledge "p1") (fx/a-pledge "p2")]]
+      (is (= [:missing-quote :missing-quote]
+             (map :passthrough.error/code
+                  (sut/campaign-quote-errors passthrough-campaign ps {}))))
+      (is (= [] (sut/campaign-quote-errors passthrough-campaign ps
+                                           {"p1" q "p2" q}))))))
+
+(deftest an-invalid-quote-is-attributed-to-its-pledge
+  (let [ps   [(fx/a-pledge "p1")]
+        errs (sut/campaign-quote-errors passthrough-campaign ps
+                                        {"p1" (assoc q :quote/cap-minor 50000)})]
+    (is (some #{:cap-below-deposit} (map :passthrough.error/code errs)))
+    (is (= #{"p1"} (set (map :passthrough.error/pledge errs))))))
+
+(deftest a-quote-on-a-fixed-price-campaign-is-a-backer-who-thinks-they-have-a-cap
+  (let [ps [(fx/a-pledge "p1")]]
+    (is (= [:quote-on-fixed-price-campaign]
+           (map :passthrough.error/code
+                (sut/campaign-quote-errors (fx/a-campaign) ps {"p1" q}))))
+    (is (= [] (sut/campaign-quote-errors (fx/a-campaign) ps {})))))
+
+(deftest withdrawn-pledges-need-no-quote
+  (let [ps [(fx/a-pledge "p1" {:pledge/state :cancelled})
+            (fx/a-pledge "p2" {:pledge/state :dropped})]]
+    (is (= [] (sut/campaign-quote-errors passthrough-campaign ps {})))))
+
+(deftest cost-basis-is-order-stable-so-settlements-are-diffable
+  (let [a (sut/cost-basis [(sut/cost-line {:part "b" :qty 1 :unit-minor 2 :source "s"})
+                           (sut/cost-line {:part "a" :qty 1 :unit-minor 1 :source "s"})])
+        b (sut/cost-basis [(sut/cost-line {:part "a" :qty 1 :unit-minor 1 :source "s"})
+                           (sut/cost-line {:part "b" :qty 1 :unit-minor 2 :source "s"})])]
+    (is (= a b))
+    (is (= 3 (:basis/total-minor a)))))
+
+(deftest an-unsourced-part-is-not-evidence
+  (is (some #{:missing-source}
+            (map :passthrough.error/code
+                 (sut/basis-errors
+                  (sut/cost-basis [(sut/cost-line {:part "x" :qty 1 :unit-minor 1})]))))))

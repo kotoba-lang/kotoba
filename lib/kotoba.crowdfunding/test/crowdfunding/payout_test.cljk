@@ -1,0 +1,128 @@
+(ns crowdfunding.payout-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [crowdfunding.campaign :as campaign]
+            [crowdfunding.collection :as collection]
+            [crowdfunding.fee :as fee]
+            [crowdfunding.fixtures :as fx]
+            [crowdfunding.payout :as sut]))
+
+(def pledges
+  [(fx/a-pledge "c1" {:pledge/state :collected})
+   (fx/a-pledge "c2" {:pledge/state :collected})
+   (fx/a-pledge "d1" {:pledge/state :dropped})])
+
+(def coll
+  (collection/finalize
+   (-> (fx/live) (campaign/advance :funding-succeeded) (campaign/advance :collecting))
+   pledges fx/rewards))
+
+(defn plan [tranches]
+  (sut/payout-plan {:collection coll :pledges pledges :rewards fx/rewards
+                    :fee-schedule fee/kickstarter-like
+                    :creator "did:web:kawasaki.example"
+                    :platform "did:web:itonami.example"
+                    :tranches tranches}))
+
+(def dest
+  (sut/payout-destination {:creator "did:web:kawasaki.example" :rail :bank-transfer
+                           :address "JP-BANK-0001" :verified? true}))
+
+;; ───────────────────────── schedules ─────────────────────────
+
+(deftest named-schedules-are-valid
+  (is (= [] (sut/schedule-errors sut/immediate)))
+  (is (= [] (sut/schedule-errors sut/staged))))
+
+(deftest a-schedule-that-does-not-allocate-everything-is-refused
+  (testing "the silent kind of holdback: bps that never add up to a release path"
+    (is (some #{:tranche-bps-not-total}
+              (map :payout.error/code
+                   (sut/schedule-errors [(sut/tranche {:id "a" :bps 9000 :gate :on-collection})]))))
+    (is (some #{:empty-schedule} (map :payout.error/code (sut/schedule-errors []))))))
+
+(deftest gates-are-a-closed-set
+  (is (some #{:unknown-gate}
+            (map :payout.error/code
+                 (sut/schedule-errors [(sut/tranche {:id "a" :bps 10000 :gate :when-we-feel-ready})])))))
+
+;; ───────────────────────── the plan ─────────────────────────
+
+(deftest a-payout-plan-conserves-in-both-directions
+  (let [p (plan sut/staged)]
+    (is (= 51200 (:payout/charged-minor p)))
+    (is (= 47064 (:payout/creator-net-minor p)))
+    (is (= 4136 (:payout/platform-minor p)))
+    (is (true? (:payout/fees-conserved? p)))
+    (is (true? (:payout/tranches-conserved? p)))
+    (is (= 47064 (reduce + 0 (map :tranche/amount-minor (:payout/tranches p)))))
+    (is (false? (:payout/custodial? p)) "a plan is a computation, not a transfer")))
+
+(deftest rounding-dust-reaches-the-creator-soonest
+  (let [ts (:payout/tranches (plan sut/staged))]
+    (is (= [32946 9412 4706] (mapv :tranche/amount-minor ts))
+        "2 minor units of dust land in the FIRST tranche, not in a holdback")
+    (is (= 47064 (reduce + 0 (map :tranche/amount-minor ts))))))
+
+(deftest immediate-pays-everything-on-collection
+  (is (= [47064] (mapv :tranche/amount-minor (:payout/tranches (plan sut/immediate))))))
+
+(deftest an-unverified-destination-is-refused-before-approval-not-at-release
+  (let [p (plan sut/staged)]
+    (is (= [] (sut/plan-errors p dest)))
+    (is (some #{:payout-destination-unverified}
+              (map :settlement.error/code
+                   (sut/plan-errors p (assoc dest :payout/verified? false)))))
+    (is (some #{:missing-payout-destination}
+              (map :payout.error/code (sut/plan-errors p nil))))))
+
+;; ───────────────────────── release ─────────────────────────
+
+(deftest a-later-tranche-cannot-clear-before-an-earlier-one
+  (let [p (plan sut/staged)]
+    (is (= ["build"] (mapv :tranche/id (sut/releasable p #{:on-collection}))))
+    (is (= ["build" "ship"]
+           (mapv :tranche/id (sut/releasable p #{:on-collection :on-first-shipment}))))
+    (testing "a gate met out of order does not jump the queue"
+      (is (= [] (sut/releasable p #{:on-first-shipment})))
+      (is (= [] (sut/releasable p #{:on-fulfillment-complete}))))
+    (is (= ["build" "ship" "complete"]
+           (mapv :tranche/id (sut/releasable p #{:on-collection :on-first-shipment
+                                                 :on-fulfillment-complete}))))))
+
+(deftest a-held-tranche-blocks-and-only-a-human-unblocks-it
+  (let [p  (plan sut/staged)
+        t  (first (:payout/tranches p))]
+    (is (nil? (sut/hold t {:by "" :reason :fraud-signal}))
+        "a hold nobody can be asked about is indistinguishable from a bug")
+    (let [held (sut/hold t {:by "risk@example" :at "2026-10-10T00:00:00Z"
+                            :reason :backer-complaints})
+          p'   (assoc p :payout/tranches (assoc (:payout/tranches p) 0 held))]
+      (is (= :held (:tranche/state held)))
+      (is (= [] (sut/releasable p' #{:on-collection :on-first-shipment}))
+          "a held tranche blocks the ones behind it too")
+      (is (nil? (sut/resolve-hold held {:decision :release :decided-by ""})))
+      (is (nil? (sut/resolve-hold held {:decision :whatever :decided-by "risk@example"})))
+      (let [r (sut/resolve-hold held {:decision :release :decided-by "risk@example"
+                                      :decided-at "2026-10-12T00:00:00Z"
+                                      :rationale "complaints resolved"})]
+        (is (= :pending (:tranche/state r)))
+        (is (true? (get-in r [:tranche/resolution :resolution/human?]))))
+      (is (= :cancelled (:tranche/state (sut/resolve-hold held {:decision :refund-backers
+                                                                :decided-by "risk@example"})))))))
+
+;; ───────────────────────── refunds ─────────────────────────
+
+(deftest a-refund-states-what-the-creator-must-find-beyond-what-they-hold
+  (let [r (sut/refund-plan {:pledges pledges :rewards fx/rewards
+                            :fee-schedule fee/kickstarter-like
+                            :reason :unable-to-manufacture
+                            :requested-by "creator@example"
+                            :requested-at "2027-05-01T00:00:00Z"})]
+    (is (= 51200 (:refund/gross-minor r)) "backers get back what they paid")
+    (is (= 1576 (:refund/unrecoverable-fees-minor r))
+        "processing fees generally do not come back from the processor")
+    (is (= 47064 (:refund/creator-held-minor r)))
+    (is (= 4136 (:refund/creator-owes-minor r))
+        "the gap a creator otherwise discovers only at the moment of refunding")
+    (is (= 2 (count (:refund/lines r))))
+    (is (false? (:refund/custodial? r)))))

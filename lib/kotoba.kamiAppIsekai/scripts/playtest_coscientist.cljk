@@ -1,0 +1,380 @@
+(ns playtest-coscientist
+  "スライムハント (Slime Hunt) Playtest Co-Scientist — the outer generate -> play ->
+  evaluate -> evolve loop, modeled on `isekai.ux.coscientist`'s `kaizen-cycle` shape
+  (propose -> evaluate -> iterate CLI) and `ai-gftd-animeka`'s fixed-round coscientist loop
+  (generate a candidate recipe, score it with a real vision LLM, keep the winner, re-apply
+  next generation — the pattern with measured production scores 82 -> 85 -> 88 this whole
+  feature follows). Each round:
+
+    1. generate a candidate via `kami-app-isekai.playtest.tuning` (a random-walk perturbation
+       of the baseline's :fx/:audio \"juice\" params, see that namespace for bounds/rationale)
+    2. write it into public/games/slime-hunt/scene.edn
+    3. run scripts/playtest/driver.mjs (a real headless-Chromium playthrough -> 5 screenshots)
+    4. score each screenshot via kami-app-isekai.playtest.vision-score (live Claude vision
+       model, or a real pixel heuristic offline — never a fake constant)
+    5. wrap the round's aggregate per-axis scores as qa_governor proposals
+       ({:category :score :evidence}, one entry per :juice/:feel/:bugs/:clarity — categories
+       added to a governor rubric via `qa-governor.rubric/extend-rubric`) and run them through
+       `qa-governor.governor/evaluate-proposal` PLUS a gameplay-specific contradiction check
+       this script adds locally (see `gameplay-contradicts?` below — `qa-governor.governor`'s
+       own contradiction-pattern table is private and hardcoded to :stability/:correctness
+       only, so it can't be extended from outside; this is the documented adaptation the
+       task's own \"if genuinely stuck\" guidance calls for, not a workaround of a missing
+       qa-governor feature)
+    6. record the round in an append-only `qa-governor.ledger`
+
+  After all rounds: if any :approved-overall? candidate's weighted total beats the baseline's,
+  scene.edn is left set to that winner; otherwise scene.edn is restored to its ORIGINAL bytes
+  (not just the original parsed values — byte-identical restore, so a no-op run leaves zero
+  diff). A markdown report is written to docs/playtest-coscientist/iteration-01.md mirroring
+  network-isekai's `90-docs/coscientist/iteration-NN.md` convention.
+
+  IMPORTANT ADAPTATION vs the task's literal wording (\"write it into scene.edn -> rebuild ->
+  run driver.mjs\"): dev/slime_hunt/game.cljk fetches public/games/slime-hunt/scene.edn at
+  RUNTIME (`fetch-text`), it is NOT baked into dev/out/game.js at cljs-build time — so
+  rewriting scene.edn between rounds needs no `kbb -M:slime-hunt-build` recompile, only a fresh
+  page load (which driver.mjs already does per invocation). This script builds dev/out/
+  game.js ONCE up front (only if missing) and then just rewrites scene.edn each round — this
+  is what keeps a real end-to-end round cheap enough to run N=1-3 times per the task's own
+  \"keep this SMALL\" instruction.
+
+  Usage (from the kami-app-isekai repo root):
+    kbb -M:playtest -m playtest-coscientist [--rounds N] [--out-dir DIR]
+                                                 [--report PATH] [--skip-build] [--backend B]
+  Default N=3 (override with --rounds; the task explicitly asks for a small N since every
+  round is a real page load + playthrough, not instant — a verification run used --rounds 1).
+  ANTHROPIC_API_KEY unset -> every round's scoring runs through the offline pixel heuristic
+  (kami-app-isekai.playtest.vision-score/heuristic-score) automatically; no separate flag.
+
+  --backend selects the scoring backend (default :auto):
+    auto      — murakumo (see below) when MURAKUMO_CLAUDE_TOKEN is set, else the original
+                live-model/heuristic path (score-screenshot's own ANTHROPIC_API_KEY check).
+    murakumo  — forces kami-app-isekai.playtest.vision-score/murakumo-critique, REAL VISION
+                as of 2026-07-09 over api.murakumo.cloud's qwen3.6-35b-a3b (confirmed
+                vision-capable, gftdcojp/local-murakumo PR #34) — sends the actual screenshot
+                as a base64 PNG image content block (same multimodal-message code the direct-
+                Anthropic path uses), with the captured game state (driver.mjs's
+                window.__slimeHunt* debug-hook reads) folded in as extra text context. Falls
+                back to the original TEXT-ONLY structured-state critic (pixel-stats + state,
+                never an image) ONLY if the vision reply fails to parse — a defensive path,
+                not the normal case; see vision-score's namespace docstring. Needs
+                MURAKUMO_CLAUDE_TOKEN.
+    anthropic — forces the original score-screenshot path (live Claude vision model or the
+                offline pixel heuristic, per ANTHROPIC_API_KEY)."
+  (:require [kotoba.process :as sh]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [jsonista.core :as j]
+            [kami-app-isekai.playtest.tuning :as tune]
+            [kami-app-isekai.playtest.vision-score :as vs]
+            [qa-governor.rubric :as rubric]
+            [qa-governor.governor :as governor]
+            [qa-governor.ledger :as ledger]))
+
+;; ───────────────────────── CLI args ─────────────────────────
+
+(defn- parse-args [argv]
+  (loop [args argv out {:rounds 3 :out-dir "dev/out/playtest-screenshots"
+                         :report "docs/playtest-coscientist/iteration-01.md"
+                         :skip-build false :backend :auto}]
+    (if (empty? args)
+      out
+      (let [[a & more] args]
+        (case a
+          "--rounds" (recur (rest more) (assoc out :rounds (Long/parseLong (first more))))
+          "--out-dir" (recur (rest more) (assoc out :out-dir (first more)))
+          "--report" (recur (rest more) (assoc out :report (first more)))
+          "--skip-build" (recur more (assoc out :skip-build true))
+          "--backend" (recur (rest more) (assoc out :backend (keyword (first more))))
+          (recur more out))))))
+
+;; ───────────────────────── driver.mjs invocation ─────────────────────────
+
+(def scene-path "public/games/slime-hunt/scene.edn")
+(def game-js-path "dev/out/game.js")
+
+(defn- ensure-game-built! [skip-build?]
+  (when (and (not skip-build?) (not (io/exists? (io/file game-js-path))))
+    (println "[playtest-coscientist] dev/out/game.js missing -> bb slime-hunt-build (one-time; scene.edn tuning itself needs no rebuild, see namespace docstring)")
+    (let [{:keys [exit err]} (sh/sh "bb" "slime-hunt-build")]
+      (when-not (zero? exit)
+        (throw (ex-info "kbb -M:slime-hunt-build failed" {:exit exit :err err}))))))
+
+(defn- run-driver!
+  "Runs scripts/playtest/driver.mjs against whatever's CURRENTLY on disk at scene-path,
+  screenshots into `out-dir`, returns the parsed JSON summary (see driver.mjs's own
+  docstring for the shape: {ok outDir baseUrl shots victory lose} or {ok:false error})."
+  [out-dir]
+  (let [{:keys [exit out err]} (sh/sh "node" "scripts/playtest/driver.mjs" "--out-dir" out-dir)]
+    (let [parsed (try (j/read-value (str/trim out) j/keyword-keys-object-mapper)
+                       (catch Exception _ nil))]
+      (cond
+        (and parsed (:ok parsed)) parsed
+        parsed (throw (ex-info (str "driver.mjs reported failure: " (:error parsed)) {:parsed parsed}))
+        :else (throw (ex-info (str "driver.mjs produced no parseable JSON (exit " exit ")")
+                               {:exit exit :out out :err err}))))))
+
+;; ───────────────────────── scoring ─────────────────────────
+
+(def ^:private axes [:juice :feel :bugs :clarity])
+
+(defn- score-shots
+  "{shot-name -> score-map} for every {:name :path :state} driver.mjs produced (:state is
+  the window.__slimeHunt* debug-hook read captured at the same instant as the screenshot —
+  see driver.mjs's shoot(), added alongside this backend). `backend` (see -main docstring)
+  picks which of vision-score's 3 backends actually does the scoring:
+    :murakumo  — murakumo-critique (REAL VISION as of 2026-07-09: the actual screenshot image,
+                 with pixel-stats + :state text fallback only on an unparseable vision reply)
+    :anthropic — score-screenshot (the original live-vision-or-heuristic path, unchanged)
+    :auto      — murakumo when available, else the same :anthropic path (backward-compatible
+                 default: a checkout without MURAKUMO_CLAUDE_TOKEN behaves exactly as before
+                 this backend was added)."
+  [shots backend]
+  (into {}
+        (map (fn [{:keys [name path state]}]
+               (let [b64 (vs/file->b64 path)
+                     moment (keyword name)]
+                 [name (case backend
+                         :murakumo (vs/murakumo-critique b64 moment state)
+                         :anthropic (vs/score-screenshot b64 moment)
+                         #_:auto (if (vs/murakumo-available?)
+                                   (vs/murakumo-critique b64 moment state)
+                                   (vs/score-screenshot b64 moment)))])))
+        shots))
+
+(defn- aggregate
+  "{axis -> mean score across every screenshot that actually parsed a number for that axis}.
+  A screenshot whose axis is nil (live call returned unparseable JSON, see vision-score's
+  score-screenshot docstring) is excluded from THAT axis's mean rather than treated as 0 —
+  a parse failure is a missing observation, not evidence of a bad frame."
+  [scores-by-shot]
+  (into {}
+        (map (fn [axis]
+               (let [vs* (keep #(get % axis) (vals scores-by-shot))]
+                 [axis (if (seq vs*) (/ (reduce + vs*) (double (count vs*))) 0.0)])))
+        axes))
+
+(def ^:private axis-labels
+  {:juice "Juice (見た目・演出)" :feel "Feel (遊びやすさ・バランス)"
+   :bugs "Bug-free-ness" :clarity "Clarity (feedback legibility)"})
+
+;; Weights: :juice weighted highest since :fx/:audio "juice" params are literally what this
+;; loop tunes (the signal we most want the aggregate to move on); :bugs weighted meaningfully
+;; too since a regression there should sink an otherwise-juicier candidate; :feel/:clarity
+;; moderate (real but secondary signals for a params-only, no-gameplay-logic-change pass).
+;; A standalone rubric (NOT extending qa-governor.rubric/default-rubric — this loop doesn't
+;; score :stability/:correctness/:robustness/:documentation/:consistency at all, and
+;; weighted-score treats an unscored-but-in-rubric category as a hard 0, which would silently
+;; crater every round's total against categories this loop was never trying to measure).
+(def playtest-rubric
+  (rubric/extend-rubric {} {:juice {:weight 0.30 :label (:juice axis-labels)}
+                             :feel {:weight 0.20 :label (:feel axis-labels)}
+                             :bugs {:weight 0.25 :label (:bugs axis-labels)}
+                             :clarity {:weight 0.25 :label (:clarity axis-labels)}}))
+
+;; ───────────────────────── governor wiring ─────────────────────────
+
+;; qa-governor.governor's own contradiction-patterns table (`(?i)hang|hung|crash|deadlock|
+;; timeout` for :stability, `failure|error|fail\b` for :correctness) is `def ^:private` and
+;; keyed to exactly those 2 built-in category names — there is no extension point to register
+;; a pattern for a NEW category like :bugs from outside that namespace. This is the "add a
+;; gameplay-specific contradiction regex" the task asks for, implemented as a small local
+;; check this script runs ALONGSIDE (not instead of) qa-governor.governor/evaluate-proposal —
+;; a round is approved only if BOTH pass.
+(def gameplay-contradiction-pattern #"(?i)stuck|softlock|glitch|invisible|no feedback")
+(def gameplay-contradiction-threshold 70)
+
+(defn gameplay-contradicts?
+  "True if ANY proposal entry claims a high score (>= threshold) while its own evidence text
+  mentions a red-flag word — the same 'don't trust a high score next to bad-smelling
+  evidence' shape as qa-governor.governor/contradicts?, just with a repo-local pattern."
+  [proposal]
+  (boolean (some (fn [{:keys [score evidence]}]
+                    (and score (>= score gameplay-contradiction-threshold)
+                         (re-find gameplay-contradiction-pattern (str evidence))))
+                  proposal)))
+
+(defn- build-proposal [agg evidence-text]
+  (mapv (fn [axis] {:category axis :score (get agg axis) :evidence evidence-text}) axes))
+
+(defn- round-verdict [proposal]
+  (let [gov (governor/evaluate-proposal proposal)
+        gameplay-bad? (gameplay-contradicts? proposal)]
+    (assoc gov
+           :gameplay-contradiction? gameplay-bad?
+           :approved-overall? (and (:all-approved? gov) (not gameplay-bad?)))))
+
+;; ───────────────────────── one full round ─────────────────────────
+
+(defn- run-round!
+  "Writes `scene` to scene-path, plays it (driver.mjs), scores every screenshot, evaluates
+  through the governor, records the round in `ledger`. Returns
+  {:label :scene :agg :total :grade :verdict :driver :scores :ledger}."
+  [ledger label scene out-dir backend]
+  (println (str "[playtest-coscientist] round " label " -> writing scene.edn, playing…"))
+  (tune/write-scene! scene-path scene)
+  (let [driver (run-driver! (str out-dir "/" label))
+        scores (score-shots (:shots driver) backend)
+        agg (aggregate scores)
+        total (rubric/weighted-score playtest-rubric agg)
+        grade (rubric/grade total)
+        evidence (str/join " | " (keep #(get-in scores [% :notes]) (keys scores)))
+        proposal (build-proposal agg evidence)
+        verdict (round-verdict proposal)
+        ledger' (ledger/record ledger
+                                {:repo (str "kami-app-isekai/slime-hunt/" label)
+                                 :timestamp-ms (System/currentTimeMillis)
+                                 :scores agg :total total :grade grade
+                                 :verdict (if (:approved-overall? verdict) :approved :rejected)})]
+    (println (format "[playtest-coscientist] round %s: total=%.1f grade=%s verdict=%s (victory=%s lose=%s)"
+                      label (double total) (name grade)
+                      (if (:approved-overall? verdict) "approved" "rejected")
+                      (get-in driver [:victory :phase]) (get-in driver [:lose :phase])))
+    {:label label :scene scene :agg agg :total total :grade grade
+     :verdict verdict :driver driver :scores scores :ledger ledger'}))
+
+;; ───────────────────────── report ─────────────────────────
+
+(defn- fmt-scores [agg]
+  (str/join ", " (map (fn [axis] (format "%s=%.1f" (name axis) (double (get agg axis 0.0)))) axes)))
+
+(defn- params-diff
+  "A short human-readable list of the tunable keypaths that actually changed vs the
+  baseline params, `old -> new` per line — makes each round's report entry show WHAT was
+  tried, not just the resulting score."
+  [baseline-params candidate-params]
+  (->> tune/tunable-paths
+       (keep (fn [kp]
+               (let [ov (get baseline-params kp) nv (get candidate-params kp)]
+                 (when (not= ov nv) (str (str/join " " (map name kp)) ": " ov " -> " nv)))))
+       (str/join "\n")))
+
+(defn- write-report! [path {:keys [rounds baseline winner reverted? anthropic-live? backend]}]
+  (io/make-parents path)
+  (spit path
+        (str "# Playtest Co-Scientist — iteration 01 (スライムハント / Slime Hunt)\n\n"
+             "> Driver: scripts/playtest/driver.mjs (real headless-Chromium playthrough, "
+             "kotoba-lang/webgpu PR #9's `chromium.executablePath()` technique) · "
+             "Scorer: kami-app-isekai.playtest.vision-score (" (count rounds) " candidate round(s) + 1 baseline round) · "
+             "Judge: kotoba-lang/qa-governor (rubric + governor + append-only ledger) · "
+             "following the ai-gftd-animeka coscientist pattern (generate -> score -> keep-winner) "
+             "and isekai.ux.coscientist's propose/evaluate/iterate CLI shape.\n\n"
+             "Generated " (java.time.Instant/now) " by `scripts/playtest_coscientist.cljk`.\n\n"
+             "Scoring backend: "
+             (case backend
+               :murakumo "**murakumo vision critic** (api.murakumo.cloud / qwen3.6-35b-a3b — confirmed vision-capable as of 2026-07-09, sent the actual screenshot as an image content block, with pixel-stats + captured game state as fallback-only text if the vision reply failed to parse; see `kami-app-isekai.playtest.vision-score/murakumo-critique`)"
+               :anthropic (if anthropic-live? "**live Claude vision model** (ANTHROPIC_API_KEY set)"
+                              "**offline pixel heuristic** (ANTHROPIC_API_KEY unset — see `kami-app-isekai.playtest.vision-score/heuristic-score`)")
+               (str backend))
+             "\n\n"
+             "## ★ Measured baseline\n\n"
+             "- total=" (format "%.1f" (double (:total baseline))) " grade=" (name (:grade baseline))
+             " verdict=" (if (get-in baseline [:verdict :approved-overall?]) "approved" "rejected") "\n"
+             "- scores: " (fmt-scores (:agg baseline)) "\n"
+             "- driver: victory phase=" (get-in baseline [:driver :victory :phase])
+             ", lose phase=" (get-in baseline [:driver :lose :phase]) "\n\n"
+             "## Per-moment director-persona notes (baseline)\n\n"
+             (str/join "\n"
+                       (map (fn [[shot-name score]]
+                              (str "- **" (name shot-name) "**: " (:notes score "(no notes)")))
+                            (:scores baseline)))
+             "\n\n## Roadmap (rounds tried)\n\n"
+             "| round | total | grade | verdict | scores | victory | lose |\n"
+             "|---|---|---|---|---|---|---|\n"
+             (str/join "\n"
+                       (map (fn [r]
+                              (str "| " (:label r) " | " (format "%.1f" (double (:total r))) " | "
+                                   (name (:grade r)) " | "
+                                   (if (get-in r [:verdict :approved-overall?]) "approved" "rejected") " | "
+                                   (fmt-scores (:agg r)) " | "
+                                   (get-in r [:driver :victory :phase]) " | "
+                                   (get-in r [:driver :lose :phase]) " |"))
+                            rounds))
+             "\n\n## Params tried per round\n\n"
+             (str/join "\n\n"
+                       (map (fn [r]
+                              (str "### " (:label r) "\n\n```\n"
+                                   (let [d (params-diff (tune/extract (:scene baseline)) (tune/extract (:scene r)))]
+                                     (if (str/blank? d) "(baseline — no perturbation)" d))
+                                   "\n```"))
+                            rounds))
+             "\n\n## ✅ Verdict — "
+             (if reverted? "reverted to baseline" (str "BUILD " (:label winner)))
+             "\n\n"
+             (if reverted?
+               (str "No round beat the baseline's total (" (format "%.1f" (double (:total baseline))) ") "
+                    "with an approved verdict — `scene.edn` was restored to its original bytes "
+                    "(byte-identical, zero working-tree diff).\n")
+               (str "**" (:label winner) "** beat the baseline (" (format "%.1f" (double (:total baseline)))
+                    " -> " (format "%.1f" (double (:total winner))) ", +"
+                    (format "%.1f" (- (double (:total winner)) (double (:total baseline)))) ") and was "
+                    "governor-approved — `scene.edn` was left set to this candidate's params.\n"))
+             "\n## Screenshots (not published — local-only PNGs, see --out-dir)\n\n"
+             (str/join "\n"
+                       (map (fn [r] (str "- " (:label r) ": " (str/join ", " (map :name (get-in r [:driver :shots])))))
+                            (cons baseline rounds)))
+             "\n\n## → Seed for next iteration\n\n"
+             "This pass only tunes :fx/:audio params (kami-app-isekai.playtest.tuning/tunable-paths) — "
+             "logic.cljc gameplay speeds/ranges/layout are explicitly out of scope (documented follow-up, "
+             "not built now). A follow-up iteration could: (1) extend tunable-paths to :render/sky or "
+             "particle :colors as a small categorical choice set (deliberately excluded from this pass's "
+             "numeric random-walk, see tuning.cljc), (2) raise --rounds once round latency is validated "
+             "in CI, (3) wire the live Claude vision path into a scheduled run once ANTHROPIC_API_KEY is "
+             "available in that environment.\n")))
+
+;; ───────────────────────── main ─────────────────────────
+
+(defn- resolve-backend
+  "Turns --backend :auto into the concrete backend actually used this run (for the report),
+  same semantics as score-shots' :auto branch."
+  [backend]
+  (if (= backend :auto)
+    (if (vs/murakumo-available?) :murakumo :anthropic)
+    backend))
+
+(defn -main [& argv]
+  (let [{:keys [rounds out-dir report skip-build backend]} (parse-args argv)
+        _ (ensure-game-built! skip-build)
+        original-bytes (slurp scene-path)
+        baseline-scene (tune/read-scene scene-path)
+        rng (let [r (java.util.Random.)] (fn [] (.nextDouble r)))
+        resolved-backend (resolve-backend backend)
+        anthropic-live? (some? (System/getenv "ANTHROPIC_API_KEY"))]
+    (println (str "[playtest-coscientist] scoring backend: " (name resolved-backend)
+                   (when (= backend :auto) " (auto)")))
+    (try
+      (let [ledger0 ledger/empty-ledger
+            baseline (run-round! ledger0 "baseline" baseline-scene out-dir resolved-backend)
+            baseline-params (tune/extract baseline-scene)
+            [rounds* ledgerN]
+            (loop [i 1 acc [] ledg (:ledger baseline)]
+              (if (> i rounds)
+                [acc ledg]
+                (let [cand-params (tune/perturb baseline-params rng)
+                      cand-scene (tune/apply-params baseline-scene cand-params)
+                      r (run-round! ledg (str "gen-" i) cand-scene out-dir resolved-backend)]
+                  (recur (inc i) (conj acc r) (:ledger r)))))
+            approved-better (->> rounds*
+                                  (filter #(get-in % [:verdict :approved-overall?]))
+                                  (filter #(> (:total %) (:total baseline)))
+                                  (sort-by :total >)
+                                  first)]
+        (if approved-better
+          (do (tune/write-scene! scene-path (:scene approved-better))
+              (println (format "[playtest-coscientist] WINNER: %s (total %.1f > baseline %.1f) — scene.edn left set to it"
+                                (:label approved-better) (double (:total approved-better)) (double (:total baseline)))))
+          (do (spit scene-path original-bytes)
+              (println "[playtest-coscientist] no approved candidate beat the baseline — scene.edn restored to original")))
+        (write-report! report {:rounds rounds* :baseline baseline :winner approved-better
+                                :reverted? (nil? approved-better) :anthropic-live? anthropic-live?
+                                :backend resolved-backend})
+        (println (str "[playtest-coscientist] report written to " report))
+        (println (str "[playtest-coscientist] ledger entries: " (count ledgerN)))
+        (when (nil? approved-better) (println "[playtest-coscientist] done (reverted to baseline)"))
+        (System/exit 0))
+      (catch Exception e
+        (println "[playtest-coscientist] FAILED:" (.getMessage e))
+        (spit scene-path original-bytes)
+        (println "[playtest-coscientist] scene.edn restored to original after failure")
+        (.printStackTrace e)
+        (System/exit 1)))))

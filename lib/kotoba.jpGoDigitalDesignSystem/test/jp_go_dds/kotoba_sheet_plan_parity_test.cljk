@@ -1,0 +1,200 @@
+(ns jp-go-dds.kotoba-sheet-plan-parity-test
+  "W6 slice for jp-go-dds: which stylesheets make up a page, in what order.
+
+  `jp-go-dds.css/css-for` is one decision wrapped in one effect — pick the
+  components `dds.css` does not already bundle, keep the caller's order, put
+  `global.css` first when asked, then read those files and join them with a
+  newline. `kotoba/sheet_plan.kotoba` owns the first three; the fourth stays
+  in `.cljc`, where the I/O already lives.
+
+  The gate does not compare plans to plans. It resolves the guest's plan with
+  the host's own `slurp` and requires the bytes to equal what `css-for`
+  returns for the same request, over the real vendored catalogue — so a
+  different set, a different order, or a lost de-duplication shows up as a
+  byte difference in the sheet a page would actually ship.
+
+  Consumer APIs are unchanged; `jp-go-dds.css` remains what callers require,
+  and `kotoba-lang/compiler` is a test-only dep."
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is testing]]
+            [jp-go-dds.css :as dcss]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def module (slurp "lib/kotoba.jpGoDigitalDesignSystem/kotoba/sheet_plan.kotoba"))
+
+(def ^:private fuel 262144)
+
+(def ^:private chunk-size
+  "kotoba-kir `value/document-container-item-limit`."
+  32)
+
+(def ^:private catalogue
+  "Every component the vendor script wrote a sheet for."
+  (edn/read-string (slurp (io/resource "jp_go_dds/components.edn"))))
+
+(defn- kotoba-literal [s]
+  (str \" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) \"))
+
+(defn- names-form
+  "A `:document` vector of component names, as the guest reads them."
+  [names]
+  (str "(document-vector "
+       (str/join " " (map #(str "(document-string " (kotoba-literal (name %)) ")") names))
+       ")"))
+
+(def ^:private core-form
+  "`css/core-components` handed in as data. The guest does not restate it."
+  (names-form dcss/core-components))
+
+(defn- compile-and-run
+  "Append zero-arg `:string` cases and execute each through KIR."
+  [cases]
+  (let [defs (for [[name body] cases]
+               (str "(defn " name " [] :string " body ")"))
+        widened (str/replace-first module #"\(:export \[[^\]]+\]\)"
+                                   (str "(:export [main global-path component-path "
+                                        "component-path-of-keyword core? plan-chunk "
+                                        "join-plan with-global "
+                                        (str/join " " (map first cases)) "])"))
+        kir (:kir (compiler/compile-source
+                   (str widened "\n" (str/join "\n" defs))
+                   :js-kotoba-v1))]
+    (into {} (map (fn [[name _]]
+                    [name (ir/execute kir (symbol name) [] {:fuel fuel})])
+                  cases))))
+
+(defn- plan-form
+  "One chunk's plan. `core` is what `dds.css` is presumed to already carry —
+  `css-for` presumes the 14 core components, `all-css` presumes nothing, and
+  that difference is the whole difference between them."
+  ([names] (plan-form core-form names))
+  ([core names]
+   (str "(plan-chunk " core " " (names-form names) ")")))
+
+(defn- chunked-plan-form
+  "The catalogue is larger than one document value, so a whole-catalogue plan
+  is several chunks joined — the same shape `bridge_document` uses."
+  [core names]
+  (let [chunks (partition-all chunk-size names)]
+    (reduce (fn [acc chunk] (str "(join-plan " acc " " (plan-form core chunk) ")"))
+            (plan-form core (first chunks))
+            (rest chunks))))
+
+(defn- resolve-plan
+  "The host half: read each planned path and join the CONTENTS the way
+  `css-for` does. Everything this function knows is `slurp` and `\\n`."
+  [plan]
+  (if (str/blank? plan)
+    ""
+    (str/join "\n" (map (comp slurp io/resource) (str/split plan #"\n")))))
+
+;; --- 1. the plan, resolved, is the sheet ----------------------------------
+
+(deftest planned-sheet-is-byte-identical-to-css-for
+  (testing "one extra component"
+    (let [ask [:date-picker]
+          out (compile-and-run {"plan" (plan-form ask)})]
+      (is (= "jp_go_dds/components/date-picker.css" (get out "plan")))
+      (is (= (dcss/css-for ask) (resolve-plan (get out "plan")))
+          "the guest's plan, resolved by slurp, must be what css-for returns")
+      (is (str/includes? (dcss/css-for ask) "dads-date-picker")
+          "sanity: the compared value is a real sheet, not an empty string")))
+  (testing "several, order preserved, core dropped"
+    (let [ask [:date-picker :button :carousel :table :modal-dialog]
+          out (compile-and-run {"plan" (plan-form ask)})]
+      (is (= ["jp_go_dds/components/date-picker.css"
+              "jp_go_dds/components/carousel.css"
+              "jp_go_dds/components/modal-dialog.css"]
+             (str/split (get out "plan") #"\n"))
+          "button and table are in dds.css already; the rest keep the caller's order")
+      (is (= (dcss/css-for ask) (resolve-plan (get out "plan"))))))
+  (testing "global first"
+    (let [ask [:date-picker :modal-dialog]
+          out (compile-and-run {"plan" (str "(with-global " (plan-form ask) ")")})]
+      (is (= "jp_go_dds/global.css" (first (str/split (get out "plan") #"\n")))
+          "global defines what every component sheet then references")
+      (is (= (dcss/css-for ask {:global? true}) (resolve-plan (get out "plan")))))))
+
+(deftest the-whole-catalogue-plans-to-all-css
+  (testing "40 components, chunked, nothing presumed bundled, equals all-css"
+    (is (< chunk-size (count catalogue))
+        "sanity: the catalogue really is larger than one document value")
+    (let [out (compile-and-run
+               {"plan" (str "(with-global "
+                            (chunked-plan-form "(document-vector)" catalogue) ")")})
+          planned (str/split (get out "plan") #"\n")]
+      (is (= (inc (count catalogue)) (count planned))
+          "all-css sends every component, core included, plus global")
+      (is (= (dcss/all-css) (resolve-plan (get out "plan")))
+          "the guest's whole-catalogue plan is all-css byte for byte"))))
+
+(deftest chunk-boundaries-leave-no-trace
+  (testing "the same names in different chunkings plan identically"
+    (let [ask (vec (remove (set dcss/core-components) catalogue))
+          out (compile-and-run
+               {"whole" (plan-form (take chunk-size ask))
+                "halved" (str "(join-plan "
+                              (plan-form (take 7 ask)) " "
+                              (plan-form (take (- chunk-size 7) (drop 7 ask)))
+                              ")")})]
+      (is (= (get out "whole") (get out "halved"))
+          "chunking is mechanism; it must not be observable in the plan"))))
+
+;; --- 2. the individual decisions match .cljc ------------------------------
+
+(deftest component-path-matches-cljc-for-every-vendored-component
+  (let [cases (into {} (for [[i c] (map-indexed vector catalogue)]
+                         [(str "p" i) (str "(component-path " (kotoba-literal (name c)) ")")]))
+        out (compile-and-run cases)]
+    (is (= 40 (count catalogue)) "every vendored component is covered")
+    (doseq [[i c] (map-indexed vector catalogue)]
+      (is (= (dcss/component-path c) (get out (str "p" i)))
+          (str "component-path parity for " c)))
+    (is (every? #(some? (io/resource (dcss/component-path %))) catalogue)
+        "sanity: the paths the guest agrees with are paths that exist")))
+
+(deftest a-keyword-does-not-carry-its-colon-into-the-path
+  (let [out (compile-and-run
+             {"kw" "(component-path-of-keyword :date-picker)"
+              "global" "(global-path)"})]
+    (is (= (dcss/component-path :date-picker) (get out "kw")))
+    (is (not (str/includes? (get out "kw") ":date-picker"))
+        "a bare stringify would ask for components/:date-picker.css")
+    (is (= dcss/global-path (get out "global")))))
+
+(deftest core-membership-matches-cljc
+  (let [out (compile-and-run
+             (into {} (for [[i c] (map-indexed vector catalogue)]
+                        [(str "c" i)
+                         (str "(if (core? " core-form " " (kotoba-literal (name c)) ") \"y\" \"n\")")])))]
+    (doseq [[i c] (map-indexed vector catalogue)]
+      (is (= (if (contains? dcss/core-component-set c) "y" "n") (get out (str "c" i)))
+          (str "core? parity for " c)))
+    (is (= 14 (count dcss/core-components))
+        "sanity: the core list the guest was handed is the one dds.css bundles")))
+
+(deftest extra-components-matches-cljc-on-a-mixed-request
+  (testing "the guest's plan names exactly what extra-components selects"
+    (let [ask (vec (interleave (take 10 dcss/core-components)
+                               (take 10 (remove (set dcss/core-components) catalogue))))
+          out (compile-and-run {"plan" (plan-form ask)})]
+      (is (= (mapv dcss/component-path (dcss/extra-components ask))
+             (str/split (get out "plan") #"\n"))))))
+
+;; --- 3. the empty cases ---------------------------------------------------
+
+(deftest an-all-core-request-plans-nothing
+
+  (testing "and css-for returns the empty string for it"
+    (let [ask (vec (take 5 dcss/core-components))
+          out (compile-and-run {"plan" (plan-form ask)
+                                "globalized" (str "(with-global " (plan-form ask) ")")})]
+      (is (= "" (get out "plan")))
+      (is (= "" (dcss/css-for ask)))
+      (is (= "jp_go_dds/global.css" (get out "globalized"))
+          "an empty plan must not leave a blank line naming the empty path")
+      (is (= (dcss/css-for ask {:global? true})
+             (resolve-plan (get out "globalized")))))))

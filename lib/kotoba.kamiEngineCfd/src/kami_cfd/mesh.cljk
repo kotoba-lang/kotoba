@@ -1,0 +1,136 @@
+(ns kami-cfd.mesh
+  "Mesh import + parametric geometry — real vehicle surfaces voxelised into
+  the D3Q19 solver (`kami-cfd.d3`), replacing the box/fastback primitives.
+  Migrated in place from the kami-engine-cfd Rust crate (`src/mesh.rs`, 65
+  lines) as part of the repo-wide Rust-demotion / clj-wgsl-migration runtime
+  priority (com-junkawasaki/root AGENTS.md, ADR-2607010930) — see the
+  `kami-cfd` namespace docstring and this repo's README for full migration
+  context. Binary STL parser plus an Ahmed-body generator (the canonical
+  automotive CFD validation bluff body: a block with a slanted rear).
+  Winding is irrelevant downstream — `kami-cfd.d3/from-triangles` voxelises
+  via ray-parity, which only counts surface crossings.
+
+  A triangle (`Tri`) is `[[x y z] [x y z] [x y z]]` — three vertices, each a
+  3-vector of doubles, mirroring the original `type Tri = [[f64; 3]; 3]`.
+
+  `parse-stl` takes any indexed, `count`-able sequence of byte values 0-255
+  (a JVM `byte-array`, a plain vector of ints, or a converted JS byte array
+  under cljs/nbb — see `parse-stl` docstring) and decodes little-endian
+  u32/f32 fields with pure integer arithmetic (no `java.nio.ByteBuffer` /
+  `js/DataView`), so the decoder itself needs zero reader conditionals and
+  runs unmodified on JVM Clojure, ClojureScript, and nbb.")
+
+;; ---------------------------------------------------------------------------
+;; Portable little-endian binary decoding (pure arithmetic, no platform APIs)
+;; ---------------------------------------------------------------------------
+
+(defn- unsigned-byte
+  "The byte at index `i`, normalised to 0-255. `bit-and 0xff` makes this
+  correct whether `bytes` is a JVM `byte-array` (signed -128..127) or a
+  cljs/nbb byte sequence that is already unsigned 0-255."
+  [bytes i]
+  (bit-and (nth bytes i) 0xff))
+
+(defn- read-u32-le
+  "Little-endian u32 at byte offset `offset`. Built with `+`/`*` (not
+  bit-shifting) so it never touches the sign bit of a host 32-bit int on
+  either platform — safe up to 2^32-1, well inside the 2^53 exact-integer
+  range of a JS/JVM double."
+  [bytes offset]
+  (+ (unsigned-byte bytes offset)
+     (* (unsigned-byte bytes (+ offset 1)) 256)
+     (* (unsigned-byte bytes (+ offset 2)) 65536)
+     (* (unsigned-byte bytes (+ offset 3)) 16777216)))
+
+(defn- pow2
+  "2^n for integer n (positive, negative, or zero) via repeated
+  multiplication/division — avoids any platform `Math/pow` call."
+  [n]
+  (loop [n (long n) acc 1.0]
+    (cond
+      (zero? n) acc
+      (pos? n) (recur (dec n) (* acc 2.0))
+      :else (recur (inc n) (/ acc 2.0)))))
+
+(defn- read-f32-le
+  "Little-endian IEEE-754 single-precision float at byte offset `offset`,
+  decoded from its sign/exponent/mantissa bit fields via pure integer
+  arithmetic (quot/rem on the u32 bit pattern) — no `Float/intBitsToFloat` /
+  `DataView.getFloat32`. Handles zero, subnormals, +-infinity and NaN;
+  STL vertex data in practice is always a normal finite float."
+  [bytes offset]
+  (let [bits (read-u32-le bytes offset)
+        sign-bit (quot bits 2147483648)
+        rem31 (- bits (* sign-bit 2147483648))
+        exponent (quot rem31 8388608)
+        mantissa (- rem31 (* exponent 8388608))
+        sign (if (zero? sign-bit) 1.0 -1.0)]
+    (cond
+      (and (zero? exponent) (zero? mantissa)) (* sign 0.0)
+      (zero? exponent) (* sign mantissa (pow2 -149)) ; subnormal
+      (= exponent 255) (if (zero? mantissa) (* sign ##Inf) ##NaN)
+      :else (* sign (+ 1.0 (/ mantissa 8388608.0)) (pow2 (- exponent 127))))))
+
+(defn parse-stl
+  "Parse a binary STL (80-byte header, u32 triangle count, 50 bytes/triangle:
+  3 floats normal + 3x3 floats verts + 2 attr bytes). Returns a vector of
+  `Tri`s (empty if `bytes` is too short to hold the header). `bytes` must
+  support `count` and `nth` — a JVM `byte-array` or plain vector works
+  directly; a cljs/nbb `js/Uint8Array` should be converted first (e.g.
+  `(js/Array.from arr)` or `(vec arr)`) for guaranteed cross-platform `nth`
+  support."
+  [bytes]
+  (if (< (count bytes) 84)
+    []
+    (let [n (long (read-u32-le bytes 80))]
+      (loop [tri-i 0 off 84 tris (transient [])]
+        (if (or (>= tri-i n) (> (+ off 50) (count bytes)))
+          (persistent! tris)
+          (let [vert (fn [v]
+                       (let [b (+ off 12 (* v 12))] ; skip the 12-byte normal
+                         [(read-f32-le bytes b)
+                          (read-f32-le bytes (+ b 4))
+                          (read-f32-le bytes (+ b 8))]))]
+            (recur (inc tri-i) (+ off 50)
+                   (conj! tris [(vert 0) (vert 1) (vert 2)]))))))))
+
+;; ---------------------------------------------------------------------------
+;; Ahmed body (parametric bluff-body validation geometry)
+;; ---------------------------------------------------------------------------
+
+(def ^:private pi 3.141592653589793)
+
+(defn- tan* [x]
+  #?(:clj (Math/tan (double x))
+     :cljs (js/Math.tan x)))
+
+(defn- to-radians [deg] (* deg (/ pi 180.0)))
+
+(defn- prism
+  "Extrude a side profile (CCW list of `[x z]` points) along y from 0..width
+  into a closed triangle soup."
+  [profile width]
+  (let [n (count profile)
+        p (fn [i y] (let [[px pz] (nth profile i)] [px y pz]))]
+    (vec
+     (concat
+      (mapcat (fn [i]
+                [[(p 0 0.0) (p i 0.0) (p (inc i) 0.0)]         ; near cap
+                 [(p 0 width) (p (inc i) width) (p i width)]]) ; far cap
+              (range 1 (dec n)))
+      (mapcat (fn [i]
+                (let [j (mod (inc i) n)]
+                  [[(p i 0.0) (p i width) (p j 0.0)]
+                   [(p j 0.0) (p i width) (p j width)]]))
+              (range n))))))
+
+(defn ahmed-body
+  "Ahmed-like body: length 10, height 3, width 4, with a rear-roof slant.
+  `slant-deg >= 90` -> squareback (vertical rear). Sits on z=0."
+  [slant-deg]
+  (let [l 10.0 h 3.0 w 4.0]
+    (if (>= slant-deg 90.0)
+      (prism [[0.0 0.0] [l 0.0] [l h] [0.0 h]] w)
+      (let [slant-x 3.0
+            hr (max (- h (* slant-x (tan* (to-radians slant-deg)))) 0.2)]
+        (prism [[0.0 0.0] [l 0.0] [l hr] [(- l slant-x) h] [0.0 h]] w)))))

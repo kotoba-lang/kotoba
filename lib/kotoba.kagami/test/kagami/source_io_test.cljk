@@ -1,0 +1,125 @@
+(ns kagami.source-io-test
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [kagami.source :as s]
+            [kagami.source-io :as io]
+            [kagami.source-test :as st]))
+
+(def tmp (.-SOURCE_TEST_TMPDIR js/process.env))
+(def factory (.-SOURCE_FOREST_COMMAND js/process.env))
+(s/require! (and tmp factory) :integration-test-environment-required {})
+(fs/mkdirSync tmp #js {:recursive true})
+
+(defn git [p & args] (str/trim (apply io/git p args)))
+(defn init-repo! [p]
+  (fs/mkdirSync p #js {:recursive true})
+  (git p "init" "-q" "--initial-branch=main")
+  (git p "config" "user.name" "Source fixture")
+  (git p "config" "user.email" "source@example.invalid")
+  (git p "config" "commit.gpgsign" "false")
+  (git p "config" "core.hooksPath" (path/join p ".git/fixture-hooks")) p)
+
+(defn commit! [p text]
+  (fs/writeFileSync (path/join p "value.txt") text)
+  (git p "add" "value.txt") (git p "commit" "-qm" text)
+  (git p "rev-parse" "HEAD"))
+
+(defn fixture []
+  (let [base (fs/mkdtempSync (path/join tmp "source-")) root (path/join base "github")
+        _ (fs/mkdirSync (path/join root ".west") #js {:recursive true})
+        _ (fs/writeFileSync (path/join root ".west/config") "[manifest]\npath = manifest\nfile = west.yml\n")
+        repos (mapv (fn [name]
+                      (let [p (init-repo! (path/join root "acme" name))
+                            old (commit! p "old") new (commit! p "new")
+                            r (assoc (st/repo name) :repo/oid {:algorithm :sha1 :hex old})]
+                        (git p "remote" "add" "origin" (:repo/url r))
+                        {:owner p :old old :new new :repo r})) ["app" "lib"])
+        snapshot (s/record :snapshot (assoc st/base-value :snapshot/repos (mapv :repo repos)))
+        file (path/join base "snapshot.edn")]
+    (io/write-record! file snapshot)
+    {:base base :root root :repos repos :snapshot snapshot :file file}))
+
+(defn options [f task]
+  {:snapshot (:file f) :roots "acme/app" :root (:root f) :agent "fixture" :task task
+   :apply "true" :forest-command factory})
+
+(deftest fixed-workspace-preserves-owner-wip-and-west-sees-exact-pins
+  (let [f (fixture) owner (get-in f [:repos 0 :owner]) before (io/owner-state owner)]
+    (fs/writeFileSync (path/join owner "value.txt") "unrelated WIP")
+    (fs/writeFileSync (path/join owner "untracked.txt") "keep me")
+    (let [wip (io/owner-state owner) receipt (io/workspace! (options f "fixed"))
+          dest (:workspace/path receipt)]
+      (is (= :complete (:workspace/state receipt)))
+      (is (= (:source/cid (:snapshot f)) (:workspace/snapshot receipt)))
+      (is (= "old" (io/read-text (path/join dest "acme/app/value.txt"))))
+      (is (= wip (io/owner-state owner)))
+      (is (= (:head before) (:head (io/owner-state owner))))
+      (is (= (set (map #(str (get-in % [:repo :repo/name]) " " (:old %)) (:repos f)))
+             (set (str/split-lines (str/trim (io/run ["west" "list" "app" "lib" "-f" "{name} {revision}"] dest))))))
+      (is (= receipt (io/workspace! (assoc (options f "fixed") :resume "true")))))))
+
+(deftest workspace-preflight-refuses-occupied-unsupported-and-escaping-paths
+  (let [f (fixture) dest (path/join (:root f) "workspaces/west/occupied")]
+    (fs/mkdirSync dest #js {:recursive true})
+    (fs/writeFileSync (path/join dest "owner.txt") "preserve")
+    (is (= :destination-occupied (st/reason #(io/workspace! (options f "occupied")))))
+    (is (= "preserve" (io/read-text (path/join dest "owner.txt"))))
+    (let [bad (s/record :snapshot (assoc-in (get-in f [:snapshot :source/value])
+                                         [:snapshot/repos 1 :repo/materialization] :submodules))
+          bad-file (path/join (:base f) "unsupported.edn")]
+      (io/write-record! bad-file bad)
+      (is (= :unsupported-materialization
+             (st/reason #(io/workspace! (assoc (options f "unsupported") :snapshot bad-file)))))
+      (is (not (fs/existsSync (path/join (:root f) "workspaces/west/unsupported"))))))
+  (let [f (fixture) outside (path/join (:base f) "outside")]
+    (fs/mkdirSync outside)
+    (fs/symlinkSync outside (path/join (:root f) "workspaces") "dir")
+    (is (= :path-escapes-scope (st/reason #(io/workspace! (options f "escaped")))))
+    (is (empty? (fs/readdirSync outside)))))
+
+(deftest interrupted-materialization-is-journalled-and-explicitly-resumable
+  (let [f (fixture) real-git io/git opts (options f "interrupted")
+        fail-git (fn [p & args]
+                   (if (and (str/ends-with? p "/lib") (= "worktree" (first args)))
+                     (throw (ex-info "injected worktree failure" {:reason :fixture-interrupted}))
+                     (apply real-git p args)))
+        result (with-redefs [io/git fail-git] (st/reason #(io/workspace! opts)))
+        dest (path/join (:root f) "workspaces/west/interrupted")]
+    (is (= :workspace-incomplete result))
+    (is (= :incomplete (:workspace/state (io/read-edn (path/join dest ".source-workspace.edn")))))
+    (is (= "old" (io/read-text (path/join dest "acme/app/value.txt"))))
+    (is (= :complete (:workspace/state (io/workspace! (assoc opts :resume "true")))))))
+
+(deftest an-existing-workspace-lock-is-never-broken-on-age-alone
+  (let [f (fixture) opts (options f "locked") receipt (io/workspace! opts)
+        lock (path/join (:workspace/path receipt) ".source-workspace.lock")]
+    (fs/writeFileSync lock "{:pid 1 :at \"old-but-unknown\"}")
+    (is (= :workspace-locked (st/reason #(io/workspace! (assoc opts :resume "true")))))
+    (is (fs/existsSync lock))
+    (is (= "old" (io/read-text (path/join (:workspace/path receipt) "acme/app/value.txt"))))))
+
+(deftest completed-workspace-resume-preserves-local-west-config-edits
+  (let [f (fixture) opts (options f "config-edited") receipt (io/workspace! opts)
+        file (path/join (:workspace/path receipt) ".west/config")
+        edited (str (io/read-text file) "\n[local]\nkeep = true\n")]
+    (fs/writeFileSync file edited)
+    (is (= :workspace-control-diverged (st/reason #(io/workspace! (assoc opts :resume "true")))))
+    (is (= edited (io/read-text file)))))
+
+(deftest workspace-resume-refuses-redirected-control-paths
+  (let [f (fixture) opts (options f "config-link") receipt (io/workspace! opts)
+        file (path/join (:workspace/path receipt) ".west/config")
+        outside (path/join (:base f) "keep-config")]
+    (fs/writeFileSync outside "unrelated config")
+    (fs/unlinkSync file) (fs/symlinkSync outside file)
+    (is (= :path-escapes-scope (st/reason #(io/workspace! (assoc opts :resume "true")))))
+    (is (= "unrelated config" (io/read-text outside))))
+  (let [f (fixture) opts (options f "projection-link") receipt (io/workspace! opts)
+        manifest (path/join (:workspace/path receipt) "snapshot-manifest")
+        outside (path/join (:base f) "keep-manifest")]
+    (fs/renameSync manifest (str manifest "-preserved"))
+    (fs/mkdirSync outside) (fs/symlinkSync outside manifest "dir")
+    (is (= :path-escapes-scope (st/reason #(io/workspace! (assoc opts :resume "true")))))
+    (is (empty? (fs/readdirSync outside)))))

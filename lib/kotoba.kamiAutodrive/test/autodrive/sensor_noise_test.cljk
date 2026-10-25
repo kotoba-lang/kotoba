@@ -1,0 +1,62 @@
+(ns autodrive.sensor-noise-test
+  "Ported 1:1 from `kami-autodrive`'s `tests/sensor_noise.rs`.
+
+  Robustness: the autonomy must still navigate when the lidar is noisy.
+  Deterministic per-beam range noise is injected each tick; the occupancy
+  grid + configuration-space inflation should absorb the jitter."
+  (:require [kotoba.test :refer [deftest is]]
+            [autodrive.geom :as g]
+            [autodrive.types :as t]
+            [autodrive.classes :as classes]
+            [autodrive.plant :as plant]
+            [autodrive.autopilot :as ap]
+            [autodrive.sensor-sim :as sim]))
+
+(def MOUNT-Z 1.0)
+
+;; Tiny deterministic LCG -> uniform noise in [-amp, amp]. `unchecked-*`
+;; wraps within a 64-bit `long`, matching Rust's `u64::wrapping_{mul,add}`
+;; bit pattern exactly (same two's-complement representation).
+(defn- lcg-next [state]
+  (unchecked-add (unchecked-multiply state 6364136223846793005) 1442695040888963407))
+
+(defn- noise [state amp]
+  (let [state' (lcg-next state)
+        u (/ (double (bit-and (unsigned-bit-shift-right state' 40) 0xFFFFFF)) (double (bit-shift-left 1 24)))]
+    [state' (* (- (* u 2.0) 1.0) amp)]))
+
+(defn- noisy-sweep [scn pose rng amp]
+  (let [intr (sim/lidar-intrinsics :hfov (* 2.0 Math/PI) :vfov 0.05 :h-beams 240 :v-beams 1
+                                    :range-min 0.2 :range-max 80.0)
+        returns (sim/ring-sweep intr pose MOUNT-Z scn)]
+    (loop [rs returns rng rng out []]
+      (if (empty? rs)
+        [out rng]
+        (let [r (first rs)]
+          (if (g/finite? (:range r))
+            (let [[rng' dn] (noise rng amp)
+                  rng2 (+ (:range r) dn)
+                  scale (max 0.1 (/ rng2 (:range r)))
+                  p (:point-sensor r)]
+              (recur (rest rs) rng' (conj out (assoc r :range rng2 :point-sensor (g/scale3 p scale)))))
+            (recur (rest rs) rng (conj out r))))))))
+
+(deftest navigates-with-noisy-lidar
+  (let [dt (/ 1.0 30)
+        scn (sim/scene-add (sim/scene) (sim/aabb (g/v3 18.0 -5.0 -1.0) (g/v3 22.0 5.0 3.0)))
+        start (t/pose2 0.0 0.0 0.0)
+        goal (g/v2 40.0 0.0)
+        limits (classes/limits :car)]
+    (loop [plant-i (plant/bicycle-model start limits)
+           ap-i (ap/set-goal (ap/new-autopilot (ap/autopilot-config :car limits) start) goal)
+           rng 0x123456789abcdef0 i 0 collided false]
+      (let [pose (plant/pose plant-i)
+            collided (or collided (and (> (:x pose) 17.0) (< (:x pose) 23.0) (< (Math/abs (:y pose)) 5.0)))]
+        (if (or (= :arrived (:state ap-i)) (>= i 1500))
+          (do
+            (is (= :arrived (:state ap-i)) "car should still reach the goal under noisy sensing")
+            (is (not collided) "car must not drive into the wall despite sensor noise"))
+          (let [[returns rng'] (noisy-sweep scn pose rng 0.25)
+                [ap' cmd] (ap/step ap-i pose (plant/speed plant-i) returns pose dt)
+                plant' (plant/step plant-i cmd dt)]
+            (recur plant' ap' rng' (inc i) collided)))))))

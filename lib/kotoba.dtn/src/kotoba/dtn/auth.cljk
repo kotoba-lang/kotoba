@@ -1,0 +1,268 @@
+(ns kotoba.dtn.auth
+  "Origin authentication + tamper-evidence for a DTN bundle, via a
+  pre-shared symmetric secret per peer and HMAC-SHA256 — NOT full BPSec
+  (RFC 9172) security blocks, NOT a PKI/certificate-issuance system, NOT
+  TLS. Closes a real gap in `kotoba.dtn.transport.tcp`: that transport
+  previously accepted any bundle from any TCP client with zero
+  authentication, so any client could connect and inject a bundle
+  claiming to be from an arbitrary :dtn/source E.164.
+
+  MECHANISM. Each pair of peers that wants integrity/origin-checking
+  shares one secret string out of band (this namespace does not
+  distribute or negotiate secrets — see kotoba.dtn.transport.tcp's
+  :peer-secrets option, a plain {e164 secret} map the operator
+  configures). sign-bundle computes HMAC-SHA256 over the bundle's
+  canonical `pr-str` representation — with the :dtn/signature field
+  itself stripped out FIRST (dissoc'd), so the signature is never
+  computed over a self-referential structure that includes itself — and
+  assocs the resulting hex digest back in as :dtn/signature. verify-bundle
+  strips :dtn/signature the same way, recomputes, and compares.
+
+  This is an HONEST SUBSET, same 'claim exactly what you built'
+  discipline as kotoba.dtn.router's direct-neighbor-or-store heuristic
+  (not full CGR) and kotoba.dtn's primary-block fields (not a CBOR
+  codec). Explicitly, this mechanism:
+
+    DOES:     - detect a bundle whose body was altered in transit or by
+                an intermediary after signing (tamper-evidence)
+              - reject a bundle claiming a :dtn/source this node has no
+                shared secret for, or one signed with the wrong secret
+                (origin authentication within the small pre-configured
+                peer set)
+
+    DOES NOT: - provide a PKI or certificate-issuance/revocation system
+                (deferred, same as this repo's original BPSec deferral —
+                a shared-secret scheme doesn't need one, but also can't
+                scale past a small pre-configured peer set the way a PKI
+                would)
+              - provide TLS / transport-layer confidentiality (bundle
+                bodies still travel in cleartext over the TCP transport;
+                this only lets the receiver detect forgery/tampering, it
+                does not hide the payload from an eavesdropper)
+              - provide forward secrecy (a single leaked shared secret
+                compromises every past and future bundle signed with it
+                until the operator rotates it)
+              - protect a peer relationship whose secret has actually
+                leaked (a holder of the secret can forge bundles
+                indistinguishable from genuine ones — this is
+                origin-authentication-within-trust-boundary, not a
+                defense against a compromised peer)
+
+  An honest tamper-evidence/origin-check for a small, pre-configured peer
+  set — not a general Internet-security solution.
+
+  REPLAY PROTECTION (added on top of the above). `kotoba.dtn/bundle`
+  already has a `:dtn/sequence-number` field (defaults to 0, previously
+  never actually incremented by any caller). Because `sign-bundle` signs
+  the ENTIRE bundle map, `:dtn/sequence-number` is already covered by the
+  signature once a peer secret is configured — an attacker without the
+  shared secret cannot forge a higher sequence number, and a captured,
+  validly-signed bundle can be detected as a replay if the receiver
+  tracks the highest sequence number it has already accepted from that
+  exact source and rejects anything at or below it. `replay?` and
+  `update-high-water-mark` below are that check, as pure functions;
+  `kotoba.dtn.transport.tcp` is the impure caller that wires them into
+  the inbound bundle handler (stamping fresh outbound sequence numbers in
+  `send-message!`, checking + updating a per-source high-water mark in
+  `handle-inbound-bundle!`), and `load-high-water-marks!`/
+  `save-high-water-marks!` further below persist that high-water-mark
+  state to disk (mirroring `kotoba.dtn.store`'s durability pattern) so it
+  survives a node restart when `:replay-state-path` is configured.
+
+  **Replay protection is a property of AUTHENTICATED peers ONLY — it
+  only applies when a `:peer-secrets` entry is configured for that
+  source.** Without a real signature backing it, a claimed sequence
+  number proves nothing: an unauthenticated attacker could just as
+  easily forge a high one. This is NOT a general replay-protection
+  mechanism for the transport as a whole — see
+  `kotoba.dtn.transport.tcp`'s docstring for exactly where the
+  authenticated-vs-unauthenticated line is drawn.
+
+  CRYPTO IMPLEMENTATION. The bundle-shape/canonicalization logic
+  (sign-bundle, verify-bundle, canonical-string below) is pure .cljc and
+  identical on both platforms. The actual HMAC-SHA256 computation is
+  platform-specific — #?(:clj ...) uses javax.crypto.Mac (JDK standard
+  library, no external Maven dependency, which is what makes this whole
+  namespace, including sign/verify, testable under plain `clojure
+  -M:test`), #?(:cljs ...) uses Node's core node:crypto module (no npm
+  dependency, matching kotoba.dtn.transport.tcp's existing node:net/node:fs
+  convention). Both platforms are exercised for real in this repo: the
+  JVM path by test/kotoba/dtn/auth_test.cljk, the Node path by
+  kotoba.dtn.transport.tcp wiring bundles signed and verified live over a
+  real TCP socket (test/kotoba/dtn/transport/tcp_demo.cljk scenario 4b).
+  Sign and verify always run on the SAME runtime for a given
+  send/receive pair in this repo's actual usage (kotoba.dtn.transport.tcp
+  is Node/.cljs-only), so cross-platform pr-str byte-for-byte parity
+  between JVM Clojure and ClojureScript is not required for correctness
+  here — only that pr-str is deterministic for a given map value WITHIN
+  one runtime process, which it is.
+
+  Portable (.cljc) across JVM / ClojureScript / SCI / GraalVM."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            #?(:cljs ["node:crypto" :as crypto])
+            #?(:cljs ["node:fs" :as fs]))
+  #?(:clj (:import [javax.crypto Mac]
+                    [javax.crypto.spec SecretKeySpec])))
+
+;; ---------------------------------------------------------------------------
+;; Platform-specific HMAC-SHA256 -> lowercase hex digest
+;; ---------------------------------------------------------------------------
+
+#?(:clj
+   (defn- hmac-sha256-hex
+     "HMAC-SHA256(message, secret) -> lowercase hex digest string, via
+     javax.crypto.Mac (JDK standard library — no external dependency)."
+     [message secret]
+     (let [mac (Mac/getInstance "HmacSHA256")
+           key-spec (SecretKeySpec. (.getBytes ^String secret "UTF-8") "HmacSHA256")]
+       (.init mac key-spec)
+       (let [digest (.doFinal mac (.getBytes ^String message "UTF-8"))]
+         (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))))))
+
+#?(:cljs
+   (defn- hmac-sha256-hex
+     "HMAC-SHA256(message, secret) -> lowercase hex digest string, via
+     Node's core node:crypto module (no npm dependency)."
+     [message secret]
+     (-> (crypto/createHmac "sha256" secret)
+         (.update message "utf8")
+         (.digest "hex"))))
+
+;; ---------------------------------------------------------------------------
+;; Canonicalization + sign/verify — pure, identical on both platforms
+;; ---------------------------------------------------------------------------
+
+(defn- canonical-string
+  "The exact string signed/verified: bundle's `pr-str`, with any existing
+  :dtn/signature stripped first. Stripping first is what makes this safe
+  to call from BOTH sign-bundle (bundle never had a signature yet) and
+  verify-bundle (bundle already carries one, which must not be part of
+  what it's being verified against — signing a self-referential
+  structure that includes its own signature is never correct)."
+  [bundle]
+  (pr-str (dissoc bundle :dtn/signature)))
+
+(defn sign-bundle
+  "Compute an HMAC-SHA256 signature over bundle (see canonical-string)
+  keyed by secret, and return bundle with that hex digest assoc'd in as
+  :dtn/signature. secret is a pre-shared secret string associated with
+  bundle's claimed :dtn/source (the caller, e.g.
+  kotoba.dtn.transport.tcp, is responsible for looking up the right
+  secret for the destination peer — this function just signs with
+  whatever secret it's given)."
+  [bundle secret]
+  (assoc bundle :dtn/signature (hmac-sha256-hex (canonical-string bundle) secret)))
+
+(defn verify-bundle
+  "true iff bundle carries a :dtn/signature that matches
+  HMAC-SHA256(canonical-string(bundle), secret) — i.e. bundle was signed
+  with this exact secret and has not been altered since. false when
+  :dtn/signature is missing, or does not match (wrong secret, or the
+  bundle body was tampered with after signing)."
+  [bundle secret]
+  (let [claimed (:dtn/signature bundle)]
+    (boolean
+     (and (string? claimed)
+          (= claimed (hmac-sha256-hex (canonical-string bundle) secret))))))
+
+;; ---------------------------------------------------------------------------
+;; Replay protection — pure decision logic, identical on both platforms
+;;
+;; ONLY meaningful for a bundle whose signature has already verify-bundle'd
+;; true against a real :peer-secrets entry (see namespace docstring) —
+;; kotoba.dtn.transport.tcp is responsible for only calling replay? /
+;; update-high-water-mark once that's established, never for an
+;; unauthenticated peer.
+;; ---------------------------------------------------------------------------
+
+(defn replay?
+  "true iff bundle is a replay (the exact same sequence number seen
+  before) or an out-of-order/older bundle (a lower sequence number than
+  one already accepted), relative to high-water-mark — the highest
+  :dtn/sequence-number already accepted from bundle's claimed
+  :dtn/source, or nil when this is the first bundle ever accepted from
+  that source (never a replay, no matter what sequence number it
+  carries — there is nothing to be lower-or-equal to yet).
+
+  bundle's :dtn/sequence-number missing/nil is treated as 0 (matches
+  kotoba.dtn/bundle's own default when a caller never passes :seq-num)."
+  [bundle high-water-mark]
+  (let [seq-num (or (:dtn/sequence-number bundle) 0)]
+    (boolean (and high-water-mark (<= seq-num high-water-mark)))))
+
+(defn update-high-water-mark
+  "Return hwm-map (a {source-e164 highest-sequence-number-accepted} map)
+  with source-e164's entry advanced to seq-num. Defensive on its own: if
+  seq-num is not actually higher than what's already recorded for
+  source-e164, this is a no-op rather than a regression — callers in
+  practice only ever call this once replay? has already confirmed
+  seq-num is higher, but this function never lowers a high-water mark
+  even if called out of that order.
+
+  Sequence tracking is independent per source: only source-e164's own
+  entry is touched, every other source's high-water mark in hwm-map is
+  untouched."
+  [hwm-map source-e164 seq-num]
+  (update hwm-map source-e164 (fn [prior] (if prior (max prior seq-num) seq-num))))
+
+;; ---------------------------------------------------------------------------
+;; Replay high-water-mark persistence — same pure/impure split as
+;; kotoba.dtn.store: format + parsing is portable .cljc, the actual disk
+;; I/O is Node-only, behind #?(:cljs ...) reader conditionals. Unlike
+;; kotoba.dtn.store's append-only bundle log, this is "latest state, one
+;; small map", not a growing history, so it's always a single
+;; self-contained overwrite (serialize-high-water-marks /
+;; save-high-water-marks!), never an append.
+;; ---------------------------------------------------------------------------
+
+(defn serialize-high-water-marks
+  "hwm-map -> a single pr-str'd EDN line — the complete per-source
+  high-water-mark state as of right now."
+  [hwm-map]
+  (pr-str hwm-map))
+
+(defn deserialize-high-water-marks
+  "The inverse of serialize-high-water-marks. Returns {} when text is
+  blank, nil, fails to parse as EDN, or does not parse to a map —
+  tolerant of a missing/corrupt file the same way kotoba.dtn.store's
+  deserialize-line is tolerant of a malformed line, so a corrupt
+  high-water-mark file degrades to 'no replay history yet' (widening the
+  post-restart replay window — see kotoba.dtn.transport.tcp's
+  :replay-state-path docstring) rather than crashing start-node!."
+  [text]
+  (let [trimmed (when (string? text) (str/trim text))]
+    (if (seq trimmed)
+      (let [parsed (try
+                     (edn/read-string trimmed)
+                     (catch #?(:clj Exception :cljs :default) _e nil))]
+        (if (map? parsed) parsed {}))
+      {})))
+
+#?(:cljs
+   (defn load-high-water-marks
+     "Read path (a replay high-water-mark state file) if it exists,
+     deserializing its contents (see deserialize-high-water-marks).
+     Returns {} when path doesn't exist yet (a node's first-ever run with
+     this :replay-state-path configured)."
+     [path]
+     (if (fs/existsSync path)
+       (deserialize-high-water-marks (str (fs/readFileSync path "utf8")))
+       {})))
+
+#?(:cljs
+   (defn save-high-water-marks!
+     "Overwrite path with hwm-map's current state (fs.writeFileSync — same
+     NOT-crash-atomic caveat as kotoba.dtn.store/rewrite-store!: a crash
+     mid-write can leave this file empty or partially written, in which
+     case load-high-water-marks falls back to {} on the next start,
+     WIDENING the replay window rather than narrowing it, never the
+     reverse — a corrupt/lost high-water-mark file can only make this
+     node accept something it should have rejected, never reject
+     something legitimate). Called synchronously every time a node
+     accepts a new high-water mark from an authenticated peer, same
+     'write to disk in the same step as the in-memory update' discipline
+     kotoba.dtn.transport.tcp's store-bundle! already uses for
+     :store-path."
+     [path hwm-map]
+     (fs/writeFileSync path (serialize-high-water-marks hwm-map))))

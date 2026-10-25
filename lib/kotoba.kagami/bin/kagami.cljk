@@ -1,0 +1,1083 @@
+#!/usr/bin/env kbb
+(ns fleet.cli
+  "kotoba-fleet CLI (Phase 0, ADR-2607160005).
+
+  Commands:
+    import  --west <west.yml> --out <fleet-db.edn>
+    check   --west <west.yml> [--db <fleet-db.edn>]     ;; byte-exact round-trip
+    stats   --db <fleet-db.edn>
+    list    --db <fleet-db.edn> [--org O] [--group G]
+    sync    --db <fleet-db.edn> --workspace <dir>
+            [--names a,b,c] [--org O] [--group G] [--jobs N] [--dry-run]
+    pin-advance --db <fleet-db.edn> --repo <name> --new <sha> [--actor A]
+            ;; Phase 0 two-phase: ledger event + db update, then delegates
+            ;; west.yml reflection to the existing verified path
+            ;; (kbb --backend sci scripts/gen-west-manifest.cljk --entry <name>)."
+  (:require ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kagami.db :as db]
+            [kagami.did :as did]
+            [kagami.ci :as ci]
+            [kagami.grant :as grant]
+            [kagami.pin :as pin]
+            [kagami.reach :as reach]
+            [kagami.p2p]
+            [kagami.sync :as sync]
+            [kagami.west :as west]
+            [kagami.ws :as ws]
+            [promesa.core :as p]))
+
+;; ---------------------------------------------------------------------------
+;; args
+
+(defn parse-args [argv]
+  (loop [opts {} [a & more] argv]
+    (cond
+      (nil? a) opts
+      (str/starts-with? a "--")
+      (let [k (keyword (subs a 2))]
+        (if (or (nil? (first more)) (str/starts-with? (first more) "--"))
+          (recur (assoc opts k true) more)
+          (recur (assoc opts k (first more)) (rest more))))
+      :else (recur (update opts :_ (fnil conj []) a) more))))
+
+(defn die [msg]
+  (js/console.error (str "fleet: " msg))
+  (js/process.exit 1))
+
+;; ---------------------------------------------------------------------------
+;; io
+
+(defn slurp* [f] (fs/readFileSync f "utf8"))
+(defn spit* [f s] (fs/writeFileSync f s))
+(defn load-db [f] (reader/read-string (slurp* f)))
+
+(defn forest-root
+  "west forest root (west topdir, `~/github`): repos live at
+  `<forest>/<org>/<repo>`. `$GITHUB_FOREST_ROOT` wins; otherwise derived from
+  the root checkout (FLEET_ROOT, else CWD) as the grandparent of its main
+  checkout — via git's common dir so a linked worktree resolves the same way.
+  Same rule as com-junkawasaki/root scripts/forest_root.cljk."
+  []
+  (or (not-empty (.-GITHUB_FOREST_ROOT js/process.env))
+      (let [root (or (.-FLEET_ROOT js/process.env) (js/process.cwd))]
+        (try
+          (path/resolve (str/trim (cp/execFileSync "git"
+                                                   #js ["-C" root "rev-parse" "--path-format=absolute" "--git-common-dir"]
+                                                   #js {:encoding "utf8" :stdio #js ["ignore" "pipe" "ignore"]}))
+                        ".." ".." "..")
+          (catch :default _ (path/resolve root ".." ".."))))))
+
+(defn kagi-bin [] (path/join (forest-root) "kotoba-lang" "kagi" "bin" "kagi"))
+
+(defn read-key
+  "Resolve a signing key from either --key <pem-file> or --kagi <name>.
+  kagi is the preferred store (OS-Keychain unlock, no interactive prompt;
+  ADR-2606272330). Runs <forest>/kotoba-lang/kagi/bin/kagi (see forest-root)."
+  [{:keys [key kagi]}]
+  (cond
+    key  (slurp* key)
+    kagi (let [r (try (cp/execFileSync (kagi-bin)
+                                       #js ["get" kagi "--compartment" "personal"]
+                                       #js {:encoding "utf8" :timeout 120000})
+                      (catch :default e (die (str "kagi get failed: " e))))]
+           (str/trim-newline r))
+    :else nil))
+
+(defn lock-db!
+  "Mutual exclusion for db+ledger+head mutations across concurrent agent
+  sessions (fixes last-writer-wins). mkdir is the atomic primitive; stale
+  locks (>60s — a fleet command never legitimately holds one that long)
+  are broken. Released on process exit."
+  [dbf]
+  (let [lock (str dbf ".lock")]
+    (loop [i 0]
+      (let [ok (try (fs/mkdirSync lock) true (catch :default _ false))]
+        (cond
+          ok (.on js/process "exit" (fn [] (try (fs/rmdirSync lock) (catch :default _))))
+          (> i 40)
+          (let [age (- (js/Date.now) (.-mtimeMs (fs/statSync lock)))]
+            (if (> age 60000)
+              (do (try (fs/rmdirSync lock) (catch :default _)) (recur 0))
+              (die (str "fleet-db is locked by another session (" lock ")"))))
+          :else (do (cp/execSync "sleep 0.25") (recur (inc i))))))))
+
+(defn sh
+  "Run argv, resolve {:ok? bool :out str :err str}. Never rejects."
+  [[cmd & args]]
+  (p/create
+   (fn [resolve _]
+     (let [ps (cp/spawn cmd (clj->js args) #js {:stdio #js ["ignore" "pipe" "pipe"]})
+           out (atom "") err (atom "")]
+       (.on (.-stdout ps) "data" #(swap! out str %))
+       (.on (.-stderr ps) "data" #(swap! err str %))
+       (.on ps "close" #(resolve {:ok? (zero? %) :out @out :err @err}))
+       (.on ps "error" #(resolve {:ok? false :out @out :err (str %)}))))))
+
+(defn pmap-pool
+  "Run (f item) -> promise over items with at most n in flight."
+  [n f items]
+  (let [results (atom (vec (repeat (count items) nil)))
+        queue   (atom (map-indexed vector items))]
+    (p/create
+     (fn [resolve _]
+       (let [active (atom 0)
+             step (fn step []
+                    (if-let [[i item] (first @queue)]
+                      (do (swap! queue rest)
+                          (swap! active inc)
+                          (-> (f item)
+                              (p/then (fn [r]
+                                        (swap! results assoc i r)
+                                        (swap! active dec)
+                                        (step)))))
+                      (when (zero? @active) (resolve @results))))]
+         (if (empty? items)
+           (resolve [])
+           (dotimes [_ (min n (count items))] (step))))))))
+
+;; ---------------------------------------------------------------------------
+;; commands
+
+(defn cmd-import [{:keys [west out]}]
+  (when-not (and west out) (die "import needs --west and --out"))
+  (let [d (west/parse (slurp* west))]
+    (spit* out (pr-str d))
+    (println "imported" (count (:fleet/repos d)) "repos ->" out)))
+
+(defn cmd-check [{:keys [west db]}]
+  (when-not west (die "check needs --west"))
+  (let [text (slurp* west)
+        d    (if db (load-db db) (west/parse text))
+        out  (west/emit d)]
+    (if (= out text)
+      (println "OK: projection is byte-identical to" west
+               (str "(" (count (:fleet/repos d)) " repos)"))
+      (let [a (str/split text #"\n") b (str/split out #"\n")
+            i (or (first (keep-indexed #(when (not= %2 (get b %1)) %1) a))
+                  (min (count a) (count b)))]
+        (println "STALE: first divergence at line" (inc i))
+        (println "  west.yml :" (pr-str (get a i)))
+        (println "  fleet-db :" (pr-str (get b i)))
+        (js/process.exit 1)))))
+
+(defn cmd-stats [{:keys [db]}]
+  (when-not db (die "stats needs --db"))
+  (prn (db/stats (load-db db))))
+
+(defn cmd-list [{:keys [db org group]}]
+  (when-not db (die "list needs --db"))
+  (let [d (load-db db)]
+    (doseq [e (sync/working-set d {:org org :group group})]
+      (println (:repo/name e) (:repo/revision e) (:repo/path e)))))
+
+(defn observe-state [dir]
+  (if-not (fs/existsSync dir)
+    (p/resolved {:exists? false})
+    (p/let [dirty (sh ["git" "-C" dir "status" "--porcelain"])
+            head  (sh ["git" "-C" dir "rev-parse" "HEAD"])]
+      {:exists? true
+       :dirty?  (not (str/blank? (:out dirty)))
+       :head    (when (:ok? head) (str/trim (:out head)))})))
+
+(defn run-plan [entity {:keys [action steps]} dir dry-run?]
+  (if (or dry-run? (empty? steps))
+    (p/resolved {:repo (:repo/name entity) :action action :ok? true :dry-run? dry-run?})
+    (p/loop [[s & more] steps]
+      (if (nil? s)
+        {:repo (:repo/name entity) :action action :ok? true}
+        (p/let [r (sh s)]
+          (if (:ok? r)
+            (p/recur more)
+            {:repo (:repo/name entity) :action action :ok? false
+             :step s :err (str/trim (:err r))}))))))
+
+(defn cmd-sync [{:keys [db workspace names org group jobs dry-run]}]
+  (when-not (and db workspace) (die "sync needs --db and --workspace"))
+  (let [d    (load-db db)
+        ws   (sync/working-set d {:names (when names (str/split names #","))
+                                  :org org :group group})
+        n    (js/parseInt (or jobs "8"))
+        t0   (js/Date.now)]
+    (when (empty? ws) (die "working set is empty"))
+    (println "sync:" (count ws) "repos, jobs =" n (if dry-run "(dry-run)" ""))
+    (-> (pmap-pool
+         n
+         (fn [entity]
+           (let [dir (path/join workspace (:repo/path entity))]
+             (p/let [st   (observe-state dir)
+                     plan (p/resolved (sync/plan d entity st dir))
+                     res  (run-plan entity plan dir (boolean dry-run))]
+               (when-not (:ok? res)
+                 (js/console.error "  FAIL" (:repo res) (pr-str (:step res)) (:err res)))
+               res)))
+         ws)
+        (p/then (fn [results]
+                  (let [sum (sync/summarize results)
+                        dt  (/ (- (js/Date.now) t0) 1000.0)]
+                    (println "done in" (.toFixed dt 1) "s:" (pr-str sum))
+                    (when (pos? (:failed sum 0)) (js/process.exit 1))))))))
+
+;; ---------------------------------------------------------------------------
+;; ed25519 via node:crypto (Phase 1; ids are ed25519:<pubkey-hex>)
+
+(def ^:private spki-prefix "302a300506032b6570032100") ;; DER SPKI header for raw ed25519 pubkey
+
+(defn pubkey-object [pubkey-hex]
+  (crypto/createPublicKey
+   #js {:key (js/Buffer.from (str spki-prefix pubkey-hex) "hex")
+        :format "der" :type "spki"}))
+
+(defn node-verify [pubkey-hex payload sig-hex]
+  (try
+    (crypto/verify nil (js/Buffer.from payload "utf8")
+                   (pubkey-object pubkey-hex)
+                   (js/Buffer.from sig-hex "hex"))
+    (catch :default _ false)))
+
+(defn node-sign [privkey-pem payload]
+  (-> (crypto/sign nil (js/Buffer.from payload "utf8")
+                   (crypto/createPrivateKey privkey-pem))
+      (.toString "hex")))
+
+(defn node-sha256 [s]
+  (-> (crypto/createHash "sha256") (.update s "utf8") (.digest "hex")))
+
+(defn pubkey-hex-of-priv [privkey-pem]
+  (let [pub (crypto/createPublicKey (crypto/createPrivateKey privkey-pem))
+        der (.export pub #js {:format "der" :type "spki"})]
+    (-> der (.subarray (- (.-length der) 32)) (.toString "hex"))))
+
+(defn kagi-put!
+  "Store a PEM into kagi (compartment personal). Returns kagi name."
+  [name pem]
+  (cp/execFileSync (kagi-bin) #js ["add" name "--compartment" "personal"]
+                   #js {:input pem :stdio #js ["pipe" "ignore" "inherit"] :timeout 120000})
+  name)
+
+(defn cmd-enroll
+  "Per-agent identity (⑥ hard-flip prerequisite): mint a keypair into kagi
+  and append its did:key to the append-only agent registry --registry
+  (fleet-agents.edn) with a scoped grant, so each agent session signs with
+  its OWN key. The hand-maintained governance keyring (fleet-keys.edn,
+  roots/canonical) is left untouched — humans own governance, the registry
+  is machine-managed. Read paths merge registry entries into the keyring."
+  [{:keys [agent grant registry]}]
+  (when-not (and agent grant registry)
+    (die "enroll needs --agent NAME --grant PATH --registry fleet-agents.edn"))
+  (let [kp  (crypto/generateKeyPairSync
+             "ed25519" #js {:privateKeyEncoding #js {:format "pem" :type "pkcs8"}
+                            :publicKeyEncoding  #js {:format "der" :type "spki"}})
+        pem (.-privateKey kp)
+        raw (-> (.-publicKey kp) (.subarray (- (.-length (.-publicKey kp)) 32)) (.toString "hex"))
+        kname (str "fleet-agent-" agent)
+        _   (kagi-put! kname pem)
+        entry {:signer (str "ed25519:" raw) :did (did/pubkey-hex->did raw)
+               :agent agent :kagi kname :grants #{grant}
+               :enrolled (.toISOString (js/Date.))}]
+    (fs/appendFileSync registry (str (pr-str entry) "\n"))
+    (println "enrolled agent" agent "-> registry" registry)
+    (println "  kagi key :" kname "(compartment personal)")
+    (println "  did      :" (:did entry))
+    (println "  grant    :" grant)))
+
+(defn merge-registry
+  "Merge append-only agent registry entries into a keyring map (governance
+  keyring wins on conflict — an enrolled key can't override a governance grant)."
+  [keyring registry-file]
+  (if-not (fs/existsSync registry-file)
+    keyring
+    (reduce (fn [kr {:keys [signer grants did]}]
+              (-> kr
+                  (update-in [:keys signer] #(or % {:grants grants}))
+                  (update :delta/editors (fnil conj #{}) did)))
+            keyring
+            (mapv reader/read-string (remove str/blank? (str/split (slurp* registry-file) #"\n"))))))
+
+(defn cmd-keygen [{:keys [out]}]
+  (when-not out (die "keygen needs --out <privkey.pem>"))
+  (let [kp (crypto/generateKeyPairSync
+            "ed25519" #js {:privateKeyEncoding #js {:format "pem" :type "pkcs8"}
+                           :publicKeyEncoding  #js {:format "der" :type "spki"}})
+        pem (.-privateKey kp)
+        raw (-> (.-publicKey kp) (.subarray (- (.-length (.-publicKey kp)) 32)) (.toString "hex"))]
+    (fs/writeFileSync out pem #js {:mode 0600})
+    (println "private key:" out "(mode 0600 — keep out of git; see secrets-location-map)")
+    (println "signer id  : " (str "ed25519:" raw))
+    (println "did        : " (did/pubkey-hex->did raw))))
+
+(defn gh-reachable?
+  "Server-side reachability: pin must be identical|behind vs default branch.
+  404/API failure -> :unknown (fail-open, same as verify-west-pins)."
+  [org-repo sha]
+  (p/let [r (sh ["gh" "api" (str "repos/" org-repo "/compare/HEAD..." sha)
+                 "--jq" ".status"])]
+    (if-not (:ok? r)
+      :unknown
+      (contains? #{"identical" "behind"} (str/trim (:out r))))))
+
+(defn gh-value-advance?
+  "verify-west-pins Rule 2, server-side: old..new must be ahead.
+  behind = silent regression, diverged = wrong lineage -> false.
+  No old value -> true; API failure -> :unknown (fail-open)."
+  [org-repo old-sha new-sha]
+  (if-not old-sha
+    (p/resolved true)
+    (p/let [r (sh ["gh" "api" (str "repos/" org-repo "/compare/" old-sha "..." new-sha)
+                   "--jq" ".status"])]
+      (if-not (:ok? r)
+        :unknown
+        (= "ahead" (str/trim (:out r)))))))
+
+(def ^:private reach-counter (atom 0))
+
+(defn reach-local-git
+  "SOVEREIGN reachability (no gh API, no PAT): materialize the repo's full
+  commit graph locally (treeless clone via git/SSH — works for private repos
+  as the owner) and answer both ancestry questions with local git, against
+  the fleet's own materialized copy rather than GitHub's server-side view.
+
+  Treeless (--filter=blob:none) = full commit ancestry, no file blobs, so it
+  is fast AND immune to the shallow-clone false-ancestry trap (AGENTS.md).
+  -> {:reachable? bool|:unknown :value-advance? bool|:unknown}"
+  [url pin old-value]
+  (let [tmp (str "/tmp/fleet-reach-" (.-pid js/process) "-" (swap! reach-counter inc))]
+    (p/let [c (sh ["git" "clone" "--filter=blob:none" "--no-checkout" "--quiet" url tmp])]
+      (if-not (:ok? c)
+        (do (sh ["rm" "-rf" tmp]) {:reachable? :unknown :value-advance? :unknown})
+        (p/let [_    (sh ["git" "-C" tmp "fetch" "--filter=blob:none" "--quiet" "origin" pin])
+                dref (sh ["git" "-C" tmp "rev-parse" "--abbrev-ref" "origin/HEAD"])
+                defb (let [o (str/trim (:out dref))] (if (str/blank? o) "origin/HEAD" o))
+                ex   (sh ["git" "-C" tmp "cat-file" "-e" (str pin "^{commit}")])
+                rc   (sh ["git" "-C" tmp "merge-base" "--is-ancestor" pin defb])
+                va   (if old-value
+                       (sh ["git" "-C" tmp "merge-base" "--is-ancestor" old-value pin])
+                       (p/resolved {:ok? true}))
+                _    (sh ["rm" "-rf" tmp])]
+          {:reachable? (if (:ok? ex) (:ok? rc) false)
+           :value-advance? (if old-value (:ok? va) true)})))))
+
+(defn http-get-edn
+  "GET a URL, parse EDN body. -> edn or :error."
+  [url]
+  (p/create
+   (fn [resolve _]
+     (try
+       (let [mod (if (str/starts-with? url "https") (js/require "node:https") (js/require "node:http"))
+             req (.get mod url
+                       (fn [res]
+                         (let [body (atom "")]
+                           (.on res "data" #(swap! body str %))
+                           (.on res "end" #(resolve (if (= 200 (.-statusCode res))
+                                                      (try (reader/read-string @body) (catch :default _ :error))
+                                                      :error))))))]
+         (.on req "error" (fn [_] (resolve :error)))
+         (.setTimeout req 5000 (fn [] (.destroy req) (resolve :error))))
+       (catch :default _ (resolve :error))))))
+
+(defn reach-peer
+  "Trust a peer's SIGNED reachability receipt instead of cloning (clone-free,
+  no gh API). Fetches from http://<peer>/reach?repo=&pin=, verifies signature
+  + trust + freshness. peer-spec = 'peer:<base-url>'. Needs the keyring trust
+  set + this repo's name."
+  [peer-spec repo pin keyring-file]
+  (let [base (subs peer-spec (count "peer:"))
+        cfg (reader/read-string (slurp* keyring-file))
+        trust (into (or (:roots cfg) #{}) (get-in cfg [:canonical :allow]))]
+    (p/let [r (http-get-edn (str base "/reach?repo=" repo "&pin=" pin))]
+      (if (= r :error)
+        {:reachable? :unknown :value-advance? :unknown}
+        (let [v (reach/verify-receipt r {:trust trust :verify-fn node-verify
+                                         :did->pubkey #(did/did->pubkey-hex %)
+                                         :repo repo :pin pin
+                                         :now (.now js/Date) :max-age-ms 86400000})]
+          (if (:ok? v)
+            {:reachable? (:reachable? v) :value-advance? (:value-advance? v)}
+            {:reachable? :unknown :value-advance? :unknown}))))))
+
+(defn compute-reach
+  "Reachability provider dispatch:
+   :local-git (default, sovereign) — materialize the commit graph locally.
+   peer:<url> — trust a peer's SIGNED reachability receipt (clone-free, no
+     gh API); needs `keys` (keyring for trust) + `repo` (name).
+   :github — gh compare API (needs a token; PAT for private in CI).
+   Returns {:reachable? :value-advance?}."
+  [provider url org-repo pin old-value & [{:keys [repo keys]}]]
+  (cond
+    (and (string? provider) (str/starts-with? provider "peer:"))
+    (reach-peer provider repo pin keys)
+    (= :github (keyword (or provider "local-git")))
+    (p/let [r (gh-reachable? org-repo pin)
+            v (gh-value-advance? org-repo old-value pin)]
+      {:reachable? r :value-advance? v})
+    :else (reach-local-git url pin old-value)))
+
+(defn cmd-reach-emit
+  "Emit a SIGNED reachability receipt for a pin (after a local-git check),
+  appended to --out. Peers fetch it (fleet serve /reach) to trust reachability
+  without cloning. This is the producer side of the clone-free path."
+  [{:keys [db repo key kagi out] :as opts}]
+  (when-not (and db repo (or key kagi)) (die "reach-emit needs --db --repo (--key|--kagi) [--out]"))
+  (let [d (load-db db)
+        e (or (west/find-repo d repo) (die (str "unknown repo " repo)))
+        pem (read-key opts)
+        signer (did/pubkey-hex->did (pubkey-hex-of-priv pem))
+        outf (or out (str/replace db #"[^/]+$" "reach-receipts.edn"))]
+    (p/let [rv (reach-local-git (west/remote-url d e) (:repo/revision e) nil)]
+      (let [receipt (reach/make-receipt
+                     {:repo repo :pin (:repo/revision e) :default-tip nil
+                      :reachable? (true? (:reachable? rv))
+                      :value-advance? true :at (.toISOString (js/Date.))})
+            signed (reach/sign-receipt #(node-sign pem %) signer receipt)]
+        (fs/appendFileSync outf (str (pr-str signed) "\n"))
+        (println (if (:reach/reachable? receipt) "reachable" "UNREACHABLE")
+                 "— signed reach receipt for" repo (subs (:repo/revision e) 0 12)
+                 "-> " outf "(signer" signer ")")))))
+
+(defn org-repo-of [d entity]
+  (let [base (some #(when (= (:remote/name %) (:repo/remote entity)) (:remote/url-base %))
+                   (:fleet/remotes d))
+        org  (last (str/split base #"[:/]"))]
+    (str org "/" (or (:repo/repo-path entity) (:repo/name entity)))))
+
+(defn load-ledger [f]
+  (if (fs/existsSync f)
+    (mapv reader/read-string (remove str/blank? (str/split (slurp* f) #"\n")))
+    []))
+
+(defn last-signed
+  "Last pin event (single-key or quorum) for repo — the head of its record chain."
+  [ledger repo]
+  (->> ledger
+       (filter #(and (#{:pin/advance-signed :pin/advance-quorum} (:event/type %))
+                     (= repo (get-in % [:pin/record :pin/name]))))
+       last))
+
+(defn cmd-pin-advance-signed
+  "Signed pin advance (Phase 1): sign -> admission gate -> ledger + db +
+  west.yml projection splice. Rejection exits 1 with reasons."
+  [{:keys [db repo new key kagi keys registry west reach] :as opts}]
+  (when-not (and db repo new keys (or key kagi))
+    (die "pin-advance needs --db --repo --new (--key PEM|--kagi NAME) --keys <fleet-keys.edn>"))
+  (lock-db! db)
+  (let [d       (load-db db)
+        entity  (or (west/find-repo d repo) (die (str "unknown repo " repo)))
+        keyring (cond-> (reader/read-string (slurp* keys))
+                  registry (merge-registry registry))
+        pem     (read-key opts)
+        signer  (str "ed25519:" (pubkey-hex-of-priv pem))
+        ledgerf (str/replace db #"\.edn$" ".ledger.edn")
+        ledger  (load-ledger ledgerf)
+        cur-ev  (last-signed ledger repo)
+        current (when cur-ev
+                  {:record (:pin/record cur-ev)
+                   :signature (or (:pin/signature cur-ev)
+                                  (:signature (first (sort-by :signer (:pin/signatures cur-ev)))))})
+        record  (pin/make-record
+                 {:repo repo :value new
+                  :sequence (inc (get-in current [:record :pin/sequence] 0))
+                  :parent (when current
+                            (pin/record-hash node-sha256 (:record current)
+                                             (:signature current)))})
+        sig     (node-sign pem (pin/canonical-str record))]
+    (p/let [orl   (p/resolved (org-repo-of d entity))
+            url   (p/resolved (west/remote-url d entity))
+            rv    (compute-reach reach url orl new (get-in current [:record :pin/value]))
+            reach (p/resolved (:reachable? rv))
+            vadv  (p/resolved (:value-advance? rv))]
+      (let [proposal {:record record :signature sig :signer signer}
+            verdict  (pin/admit proposal
+                                {:repo-path (:repo/path entity)
+                                 :current current
+                                 :keyring keyring
+                                 :verify-fn node-verify
+                                 :hash-fn node-sha256
+                                 :reachable? reach
+                                 :value-advance? vadv})]
+        (if (= :reject (:verdict verdict))
+          (do (js/console.error "REJECTED:" (pr-str (:reasons verdict)))
+              (js/process.exit 1))
+          (let [ev (pin/accepted-event proposal verdict (db/next-seq ledger)
+                                       (.toISOString (js/Date.)))
+                d' (db/apply-pin-advance d {:repo/name repo :pin/new new})]
+            (fs/appendFileSync ledgerf (str (pr-str ev) "\n"))
+            (spit* db (pr-str d'))
+            (when west
+              (let [w (west/parse (slurp* west))
+                    w' (update w :fleet/repos
+                               (fn [rs] (mapv #(if (= (:repo/name %) repo)
+                                                 (assoc % :repo/revision new) %)
+                                              rs)))]
+                (spit* west (west/emit w'))))
+            (println (name (:verdict verdict)) "— seq" (:pin/sequence record)
+                     "signer" signer)
+            (when (seq (:reasons verdict)) (println "  note:" (pr-str (:reasons verdict))))
+            (println "ledger:" ledgerf (if west (str "/ projected: " west) ""))))))))
+
+(defn cmd-pin-advance [{:keys [db repo new actor]}]
+  (when-not (and db repo new) (die "pin-advance needs --db --repo --new"))
+  (lock-db! db)
+  (let [dbf    db
+        d      (load-db dbf)
+        entity (or (west/find-repo d repo) (die (str "unknown repo " repo)))
+        ledgerf (str/replace dbf #"\.edn$" ".ledger.edn")
+        events (if (fs/existsSync ledgerf)
+                 (mapv reader/read-string
+                       (remove str/blank? (str/split (slurp* ledgerf) #"\n")))
+                 [])
+        ev     (db/pin-advance-event
+                events {:repo repo :old-rev (:repo/revision entity) :new-rev new
+                        :actor (or actor "fleet-cli")
+                        :at (.toISOString (js/Date.))})]
+    (fs/appendFileSync ledgerf (str (pr-str ev) "\n"))
+    (spit* dbf (pr-str (db/apply-pin-advance d ev)))
+    (println "ledger:" (pr-str ev))
+    (println "fleet-db updated. Reflect to west.yml via the existing verified path:")
+    (println "  kbb --backend sci scripts/gen-west-manifest.cljk --entry" repo)))
+
+;; ---------------------------------------------------------------------------
+;; Phase 2: grants, propose, governed land-back
+
+(defn- did-of-priv [pem] (did/pubkey-hex->did (pubkey-hex-of-priv pem)))
+
+(defn- event->current [ev]
+  (when ev
+    {:record (:pin/record ev)
+     :signature (or (:pin/signature ev)
+                    (:signature (first (sort-by :signer (:pin/signatures ev)))))}))
+
+(defn- last-pin-event [ledger repo]
+  (->> ledger
+       (filter #(and (#{:pin/advance-signed :pin/advance-quorum} (:event/type %))
+                     (= repo (get-in % [:pin/record :pin/name]))))
+       last))
+
+(defn cmd-grant [{:keys [issuer-key aud resources exp chain out]}]
+  (when-not (and issuer-key aud resources out)
+    (die "grant needs --issuer-key --aud <did> --resources a,b --out [--exp iso] [--chain in.edn]"))
+  (let [pem  (slurp* issuer-key)
+        prev (if (and chain (fs/existsSync chain)) (reader/read-string (slurp* chain)) [])
+        link {:grant/iss (did-of-priv pem) :grant/aud aud
+              :grant/resources (set (str/split resources #",")) :grant/exp exp}
+        link (assoc link :grant/sig (node-sign pem (grant/link-canonical link)))]
+    (spit* out (pr-str (conj prev link)))
+    (println "chain:" out "links:" (inc (count prev)) "holder:" aud)))
+
+(defn cmd-propose [{:keys [db keys repo branch key chain]}]
+  (when-not (and db keys repo branch key chain)
+    (die "propose needs --db --keys --repo --branch --key agent.pem --chain chain.edn"))
+  (let [d       (load-db db)
+        entity  (or (west/find-repo d repo) (die (str "unknown repo " repo)))
+        cfg     (reader/read-string (slurp* keys))
+        ch      (reader/read-string (slurp* chain))
+        v       (grant/verify-chain ch {:roots (:roots cfg) :verify-fn node-verify
+                                        :now (.toISOString (js/Date.))})
+        agent-did (did-of-priv (slurp* key))
+        resource  (str "land:" (:repo/path entity))]
+    (cond
+      (not (:ok? v)) (do (js/console.error "REJECTED: grant chain invalid" (pr-str (:reasons v)))
+                         (js/process.exit 1))
+      (not= agent-did (:holder v)) (do (js/console.error "REJECTED: key is not the chain holder")
+                                       (js/process.exit 1))
+      (not (grant/holds? v resource)) (do (js/console.error "REJECTED: grant does not cover" resource)
+                                          (js/process.exit 1))
+      :else
+      (p/let [r (sh ["gh" "api" (str "repos/" (org-repo-of d entity) "/commits/" branch)
+                     "--jq" ".sha"])]
+        (let [head (str/trim (:out r))
+              ledgerf (str/replace db #"\.edn$" ".ledger.edn")
+              ledger (load-ledger ledgerf)
+              ev {:event/seq (db/next-seq ledger) :event/type :land/proposal
+                  :event/at (.toISOString (js/Date.)) :event/actor agent-did
+                  :repo/name repo :land/branch branch :land/head head
+                  :land/grant-holder (:holder v)}]
+          (fs/appendFileSync ledgerf (str (pr-str ev) "\n"))
+          (println "proposal recorded: seq" (:event/seq ev) repo branch "@" (subs head 0 12)))))))
+
+(defn cmd-govern
+  "Governed land-back: server-side merge of an agent branch into the child
+  repo's default branch, then a quorum-signed canonical pin advance."
+  [{:keys [db keys repo branch gov-keys gov-kagi west]}]
+  (when-not (and db keys repo branch (or gov-keys gov-kagi))
+    (die "govern needs --db --keys --repo --branch (--gov-keys k1.pem,k2|--gov-kagi n1,n2) [--west]"))
+  (lock-db! db)
+  (let [d       (load-db db)
+        entity  (or (west/find-repo d repo) (die (str "unknown repo " repo)))
+        cfg     (reader/read-string (slurp* keys))
+        policy  (:canonical cfg)
+        pems    (if gov-kagi
+                  (mapv #(read-key {:kagi %}) (str/split gov-kagi #","))
+                  (mapv slurp* (str/split gov-keys #",")))
+        orl     (org-repo-of d entity)
+        ledgerf (str/replace db #"\.edn$" ".ledger.edn")
+        ledger  (load-ledger ledgerf)
+        current (event->current (last-pin-event ledger repo))
+        ;; pre-check BEFORE the merge side effect: enough eligible governor
+        ;; keys in hand? (full signature gate still runs after the merge)
+        gov-dids (set (map did-of-priv pems))
+        eligible (count (filter (:allow policy) gov-dids))]
+    (when (< eligible (:threshold policy))
+      (js/console.error "REJECTED (pre-merge): quorum not satisfiable —"
+                        eligible "eligible governor key(s), threshold"
+                        (:threshold policy) "— no merge performed")
+      (js/process.exit 1))
+    (p/let [m (sh ["gh" "api" (str "repos/" orl "/merges") "-f" "base=main"
+                   "-f" (str "head=" branch)
+                   "-f" (str "commit_message=fleet govern: land " branch " (quorum canonical advance)")
+                   "--jq" ".sha"])]
+      (when-not (:ok? m)
+        (js/console.error "server-side merge failed:" (str/trim (:err m)))
+        (js/process.exit 1))
+      (let [new-sha (str/trim (:out m))
+            record  (pin/make-record
+                     {:repo repo :value new-sha
+                      :sequence (inc (get-in current [:record :pin/sequence] 0))
+                      :parent (when current
+                                (pin/record-hash node-sha256 (:record current)
+                                                 (:signature current)))})
+            payload (pin/canonical-str record)
+            sigs    (mapv (fn [pem] {:signer (did-of-priv pem)
+                                     :signature (node-sign pem payload)}) pems)]
+        (p/let [reach (gh-reachable? orl new-sha)
+                vadv  (gh-value-advance? orl (get-in current [:record :pin/value]) new-sha)]
+          (let [verdict (grant/admit-quorum
+                         {:record record :signatures sigs}
+                         {:policy policy :current current :verify-fn node-verify
+                          :hash-fn node-sha256 :reachable? reach :value-advance? vadv})]
+            (if (= :reject (:verdict verdict))
+              (do (js/console.error "REJECTED:" (pr-str (:reasons verdict))
+                                    "valid-signers:" (pr-str (:valid-signers verdict)))
+                  (js/process.exit 1))
+              (let [ev {:event/seq (db/next-seq ledger) :event/type :pin/advance-quorum
+                        :event/at (.toISOString (js/Date.))
+                        :event/verdict (:verdict verdict)
+                        :pin/record record :pin/signatures (vec (sort-by :signer sigs))}
+                    d' (db/apply-pin-advance d {:repo/name repo :pin/new new-sha})]
+                (fs/appendFileSync ledgerf (str (pr-str ev) "\n"))
+                (spit* db (pr-str d'))
+                (when west
+                  (let [w (west/parse (slurp* west))
+                        w' (update w :fleet/repos
+                                   (fn [rs] (mapv #(if (= (:repo/name %) repo)
+                                                     (assoc % :repo/revision new-sha) %) rs)))]
+                    (spit* west (west/emit w'))))
+                (println (name (:verdict verdict)) "— landed" branch "->" (subs new-sha 0 12)
+                         "quorum" (count (:valid-signers verdict)) "/"
+                         (:threshold policy) "seq" (:pin/sequence record))))))))))
+
+(defn run-gate
+  "Run a quality gate command under a capability bound (timeout budget — the
+  kototama HostCaps analog; literal WASM confinement via the kototama Chicory
+  tender is the JVM follow-up). Produces a hinshitsu-evidence-compatible check
+  map (interop by data shape, not by require — the ops-runner decoupling
+  principle). name=cmd, cwd optional, timeout ms.
+
+  :detail carries `exit <code> — <tail of the gate's own output>`. A bare
+  \"exit 0\" is NOT evidence: ADR-2607178000's false-pass bug (an unstripped
+  tarball left clojure with no deps.edn, so it dropped to a REPL and exited 0
+  on closed stdin) produced receipts that looked identical to real passes.
+  Keeping the tail means the receipt itself shows \"Ran 18 tests containing 107
+  assertions\" — a human or query can tell a real pass from an empty one."
+  [gate-name cmd cwd timeout-ms]
+  (p/create
+   (fn [resolve _]
+     (let [ps (cp/spawn "bash" #js ["-lc" cmd]
+                        #js {:cwd (or cwd (js/process.cwd))
+                             :stdio #js ["ignore" "pipe" "pipe"]})
+           out (atom "") done (atom false)
+           finish (fn [status detail]
+                    (when-not @done
+                      (reset! done true)
+                      (resolve {:name (keyword (str "gate/" gate-name))
+                                :outcome status :detail detail
+                                ;; hinshitsu.evidence.v0-compatible shape
+                                :hinshitsu/status (if (= :pass status) :passed :failed)
+                                :hinshitsu/checks [gate-name]})))
+           timer (js/setTimeout
+                  (fn [] (try (.kill ps "SIGKILL") (catch :default _))
+                    (finish :fail (str "timeout after " timeout-ms "ms"))) timeout-ms)]
+       (.on (.-stdout ps) "data" #(swap! out str %))
+       (.on (.-stderr ps) "data" #(swap! out str %))
+       (.on ps "close" (fn [code] (js/clearTimeout timer)
+                         (finish (if (zero? code) :pass :fail)
+                                 (ci/gate-detail code @out))))
+       (.on ps "error" (fn [e] (js/clearTimeout timer) (finish :fail (str e))))))))
+
+(defn cmd-ci-verify
+  "Native CI (ADR-2607160005): run pin-reachability checks over the named
+  repos — and optional quality GATES (--gate 'name=cmd', capability-bounded
+  by --gate-timeout) — then emit a signed, content-addressed verification
+  receipt (kagami.ci, modelled on kotobase code_graph execution-receipt:
+  verdict = required ⊆ passed). Gates produce hinshitsu-evidence-compatible
+  checks. Appended to an append-only receipt log (--out, default
+  fleet-ci.edn). Follows the cloud-itonami ops-runner pattern (verify ->
+  signed receipt). Exit 1 if the receipt verdict is :fail.
+
+  --subject-extra <edn-map> merges extra keys into the receipt SUBJECT (which
+  the signature covers), so a caller can record WHAT was actually tested when
+  that is not the pin — e.g. a tip-driven runner recording
+  '{:tips {\"kagami\" \"<sha>\"} :trigger :tip-change}'. Without it a receipt
+  can only say which repos were checked, not at which commit, and the tested
+  SHA would have to be smuggled into gate names.
+  --policy <string> overrides the recorded policy id (default
+  fleet-ci/pin-reachability/v1) so a different verification contract
+  (e.g. fleet-ci/tip-verify/v1) is distinguishable by consumers."
+  [{:keys [db repos key kagi out required gate gate-cwd gate-timeout
+           subject-extra policy] :as opts}]
+  (when-not (and db repos (or key kagi)) (die "ci-verify needs --db --repos (--key|--kagi) [--out] [--required a,b] [--gate 'name=cmd'] [--subject-extra EDN] [--policy ID]"))
+  (let [d (load-db db)
+        names (str/split repos #",")
+        pem (read-key opts)
+        signer (did/pubkey-hex->did (pubkey-hex-of-priv pem))
+        outf (or out (str/replace db #"[^/]+$" "fleet-ci.edn"))
+        ;; Each line is parsed independently and defensively: cljs.reader is
+        ;; stricter than the pr-str writer here allows (e.g. a `:gate/<name>`
+        ;; keyword containing '@' round-trips through pr-str fine but cljs.reader
+        ;; rejects it on re-read) — one malformed historical line must not brick
+        ;; every future append. Skip unparsable lines (warn to stderr) rather than
+        ;; crashing; the chain link (:parent) simply restarts from the last
+        ;; parseable receipt. History itself is never rewritten.
+        prev (when (fs/existsSync outf)
+               (->> (str/split (slurp* outf) #"\n")
+                    (remove str/blank?)
+                    (keep (fn [line]
+                            (try (reader/read-string line)
+                                 (catch :default e
+                                   (js/console.error "fleet: skipping unparsable fleet-ci.edn line (chain restarts here):" (ex-message e))
+                                   nil))))
+                    last))]
+    (-> (p/all
+         (concat
+          (for [nm names]
+            (let [e (west/find-repo d nm)]
+              (if-not e (p/resolved {:name (keyword (str "pin-reachable/" nm)) :outcome :fail :detail :unknown-repo})
+                  (p/let [r (gh-reachable? (org-repo-of d e) (:repo/revision e))]
+                    {:name (keyword (str "pin-reachable/" nm))
+                     :outcome (if (= true r) :pass (if (= :unknown r) :pass :fail))
+                     :detail (str r)}))))
+          ;; optional quality gates (hinshitsu-shaped), capability-bounded
+          (when gate
+            (for [spec (str/split gate #";;")]
+              (let [[gname gcmd] (str/split spec #"=" 2)]
+                (run-gate gname gcmd gate-cwd (js/parseInt (or gate-timeout "120000"))))))))
+        (p/then
+         (fn [checks]
+           (let [req (if required (set (map keyword (str/split required #",")))
+                         (into #{} (map :name) checks))
+                 extra (when subject-extra
+                         (let [m (reader/read-string subject-extra)]
+                           (when-not (map? m)
+                             (die "--subject-extra must be an EDN map"))
+                           m))
+                 receipt (ci/make-receipt
+                          {:subject (merge {:repos names
+                                            :fleet-db-head (node-sha256 (slurp* db))}
+                                           extra)
+                           :checks checks :required req
+                           :policy (or policy "fleet-ci/pin-reachability/v1")
+                           :at (.toISOString (js/Date.))
+                           :parent (:cid prev)})
+                 signed (ci/sign-receipt node-sha256 #(node-sign pem %) signer receipt)]
+             (fs/appendFileSync outf (str (pr-str signed) "\n"))
+             (println (name (:ci/outcome receipt)) "— receipt" (subs (:cid signed) 0 12)
+                      "checks" (count checks) "required" (count req)
+                      "signer" signer)
+             (doseq [c checks] (println "  " (name (:outcome c)) (name (:name c)) (:detail c)))
+             (when (= :fail (:ci/outcome receipt)) (js/process.exit 1))))))))
+
+(defn cmd-verify-pins
+  "A (daily-driver): verify each named repo's pin is reachable from its
+  upstream default branch. Default --reach local-git is SOVEREIGN — it
+  verifies against the fleet's own materialized commit graph (treeless
+  clone via git/SSH), so PRIVATE repos verify STRICTLY with NO gh API and
+  NO PAT (the owner's git access suffices). --reach github uses the compare
+  API (needs a token that can read private cross-org repos = a PAT in CI).
+  CONFIRMED unreachable -> exit 1; :unknown -> WARN passthrough."
+  [{:keys [db repos reach keys]}]
+  (when-not (and db repos) (die "verify-pins needs --db --repos a,b,c [--reach local-git|github|peer:URL] [--keys keyring]"))
+  (let [d (load-db db)
+        names (str/split repos #",")]
+    (-> (p/all
+         (for [nm names]
+           (let [e (west/find-repo d nm)]
+             (if-not e (p/resolved {:repo nm :verdict :unknown-repo})
+                 (p/let [rv (compute-reach reach (west/remote-url d e)
+                                           (org-repo-of d e) (:repo/revision e) nil
+                                           {:repo nm :keys keys})
+                         r (:reachable? rv)]
+                   {:repo nm :verdict (case r true :ok false :unreachable :unknown :warn)})))))
+        (p/then (fn [results]
+                  (doseq [{:keys [repo verdict]} results]
+                    (println (case verdict :ok "OK  " :warn "WARN" :unreachable "FAIL"
+                                   :unknown-repo "MISS") repo
+                             (when (= verdict :warn) "(private/unverifiable — token can't read; fail-open)")))
+                  (let [bad (filter #(= :unreachable (:verdict %)) results)]
+                    (when (seq bad)
+                      (js/console.error "CONFIRMED unreachable pins:" (pr-str (map :repo bad)))
+                      (js/process.exit 1))))))))
+
+;; ---------------------------------------------------------------------------
+;; Phase 2 remainder: workspace GC + checkpoints (Plane 3)
+
+(defn- dir-dirty? [ws-dir]
+  ;; any git checkout under <ws>/orgs/*/* with porcelain output
+  (let [orgs (path/join ws-dir "orgs")]
+    (if-not (fs/existsSync orgs)
+      (p/resolved false)
+      (p/let [repos (p/resolved
+                     (for [org (js->clj (fs/readdirSync orgs))
+                           :let [od (path/join orgs org)]
+                           :when (.isDirectory (fs/statSync od))
+                           r (js->clj (fs/readdirSync od))]
+                       (path/join od r)))
+              flags (p/all (for [r repos]
+                             (p/let [s (sh ["git" "-C" r "status" "--porcelain"])]
+                               (not (str/blank? (:out s))))))]
+        (boolean (some true? flags))))))
+
+(defn cmd-ws-gc
+  "Cursor-style workspace GC: age + count caps, dirty never removed."
+  [{:keys [root max-age-h max-count dry-run]}]
+  (when-not root (die "ws-gc needs --root [--max-age-h N] [--max-count N] [--dry-run]"))
+  (let [now (js/Date.now)
+        entries (for [d (js->clj (fs/readdirSync root))
+                      :let [p (path/join root d)]
+                      :when (.isDirectory (fs/statSync p))]
+                  {:path p :age-h (/ (- now (.-mtimeMs (fs/statSync p))) 3600000.0)})]
+    (-> (p/all (for [e entries]
+                 (p/let [d? (dir-dirty? (:path e))] (assoc e :dirty? d?))))
+        (p/then
+         (fn [wss]
+           (let [plan (ws/gc-plan (vec wss)
+                                  {:max-age-h (when max-age-h (js/parseFloat max-age-h))
+                                   :max-count (when max-count (js/parseInt max-count))})]
+             (doseq [p (:remove plan)]
+               (if dry-run
+                 (println "would remove" p)
+                 (do (fs/rmSync p #js {:recursive true :force true})
+                     (println "removed" p))))
+             (println "kept" (count (:keep plan)) "/ dirty-skipped"
+                      (count (:skipped-dirty plan)) "/ removed" (count (:remove plan)))))))))
+
+(defn cmd-checkpoint
+  "Conversation-scoped snapshot outside git (Cursor checkpoints pattern).
+  create: --dir <workspace> --store <dir>; restore: --restore <tgz> --dir <ws>."
+  [{:keys [dir store restore]}]
+  (cond
+    restore
+    (do (when-not dir (die "checkpoint --restore needs --dir"))
+        (p/let [_ (p/resolved (fs/rmSync dir #js {:recursive true :force true}))
+                _ (p/resolved (fs/mkdirSync dir #js {:recursive true}))
+                r (sh ["tar" "xzf" restore "-C" dir])]
+          (if (:ok? r)
+            (println "restored" restore "->" dir)
+            (do (js/console.error "restore failed:" (:err r)) (js/process.exit 1)))))
+    (and dir store)
+    (let [_ (fs/mkdirSync store #js {:recursive true})
+          f (path/join store (str "ckpt-" (.toISOString (js/Date.))
+                                  ".tgz"))]
+      (p/let [r (sh ["tar" "czf" f "-C" dir "."])]
+        (if (:ok? r)
+          (println "checkpoint:" f)
+          (do (js/console.error "checkpoint failed:" (:err r)) (js/process.exit 1)))))
+    :else (die "checkpoint needs --dir --store | --restore <tgz> --dir <ws>")))
+
+;; ---------------------------------------------------------------------------
+;; Phase 1.5 reconcile + Phase 3a signed fleet head
+
+(defn- scoped-reconcile-target
+  "Build a targeted reconcile for named existing repos. This intentionally
+  keeps unrelated projection drift in the old database. Entry additions and
+  non-pin metadata edits need a separate writer and are rejected here."
+  [d-old d-new full-diff only-repos]
+  (let [names (if (string? only-repos)
+                (->> (str/split only-repos #",")
+                     (map str/trim)
+                     (remove str/blank?)
+                     set)
+                #{})
+        old-by-name (into {} (map (juxt :repo/name identity)) (:fleet/repos d-old))
+        new-by-name (into {} (map (juxt :repo/name identity)) (:fleet/repos d-new))
+        diff (db/scope-diff-repos full-diff names)
+        metadata-drift? (some (fn [name]
+                               (let [old (old-by-name name)
+                                     new (new-by-name name)]
+                                 (and old new
+                                      (not= (dissoc old :repo/revision)
+                                            (dissoc new :repo/revision)))))
+                             names)]
+    (when (empty? names)
+      (die "--only-repos needs at least one comma-separated repo name"))
+    (when (seq (:added diff))
+      (die "--only-repos does not admit repo additions; use the registration writer"))
+    (when metadata-drift?
+      (die "--only-repos handles pin changes and removals only; selected repo metadata changed"))
+    [diff
+     (update d-old :fleet/repos
+             (fn [repos]
+               (into []
+                     (keep (fn [entry]
+                             (if (contains? names (:repo/name entry))
+                               (get new-by-name (:repo/name entry))
+                               entry))
+                           repos))))]))
+
+(defn cmd-reconcile
+  "Absorb legacy-path (gen --entry / API single-entry) west.yml writes into
+  fleet-db as attributed ledger events. --check: exit 1 on drift, write
+  nothing. --enforce: the HARD-FLIP switch — drift is a REJECTION, not an
+  absorption (legacy writes forbidden; fleet-db is the sole writer). Flip
+  the CI to --enforce only after every writer session is enrolled. --only-repos
+  scopes a legacy pin/removal reconcile and preserves drift outside that set."
+  [{:keys [db west check enforce enforce-orgs enforce-repos only-repos]}]
+  (when-not (and db west) (die "reconcile needs --db --west [--check|--enforce] [--enforce-orgs a,b] [--enforce-repos a,b] [--only-repos a,b]"))
+  (when (and only-repos (or enforce enforce-orgs enforce-repos))
+    (die "--only-repos cannot be combined with enforce options"))
+  (when-not (or check enforce) (lock-db! db))
+  (let [d-old (load-db db)
+        d-new (west/parse (slurp* west))
+        full-diff (db/diff-dbs d-old d-new)
+        [diff d-apply] (if only-repos
+                         (scoped-reconcile-target d-old d-new full-diff only-repos)
+                         [full-diff d-new])
+        ;; staged hard flip (D): tightest -> widest scope.
+        ;; --enforce-repos: only these named repos (the fleet's own signed-path
+        ;;   repos — safe first activation, breaks no legacy session).
+        ;; --enforce-orgs: repos under these orgs (e.g. kotoba-lang public).
+        ;; --enforce: all. Drift outside the scope is still absorbed.
+        enforce-diff (cond
+                       enforce-repos (db/scope-diff-repos full-diff (str/split enforce-repos #","))
+                       enforce-orgs (db/scope-diff full-diff d-new (set (str/split enforce-orgs #",")))
+                       :else full-diff)]
+    (if-not (db/drift? diff)
+      (println (if only-repos
+                 (str "clean: selected repos in projection of " west)
+                 (str "clean: fleet-db == projection of " west)))
+      (let [summary {:changed (count (:changed diff)) :added (count (:added diff))
+                     :removed (count (:removed diff)) :meta (:meta-changed? diff)}]
+        (when (and (or enforce enforce-orgs enforce-repos) (db/drift? enforce-diff))
+          (js/console.error "FLIP VIOLATION: west.yml written outside the signed fleet-db path"
+                            (if enforce-orgs (str "(enforced orgs: " enforce-orgs ")") ""))
+          (js/console.error "  in-scope drift:" (pr-str {:changed (count (:changed enforce-diff))
+                                                         :added (count (:added enforce-diff))
+                                                         :removed (count (:removed enforce-diff))}))
+          (doseq [c (:changed enforce-diff)] (js/console.error "  pin" (:name c) "changed via legacy path"))
+          (js/console.error "  advance in-scope pins with `fleet pin-advance` (signed), not gen --entry")
+          (js/process.exit 1))
+        (if check
+          (do (println "DRIFT:" (pr-str summary))
+              (doseq [c (:changed diff)] (println "  pin" (:name c) (subs (:old c) 0 8) "->" (subs (:new c) 0 8)))
+              (doseq [a (:added diff)] (println "  +" (:repo/name a)))
+              (doseq [r (:removed diff)] (println "  -" r))
+              (js/process.exit 1))
+          (let [ledgerf (str/replace db #"\.edn$" ".ledger.edn")
+                ledger  (load-ledger ledgerf)
+                evs     (db/reconcile-events ledger diff (.toISOString (js/Date.)))]
+            (doseq [ev evs] (fs/appendFileSync ledgerf (str (pr-str ev) "\n")))
+            (spit* db (pr-str d-apply))
+            (println "reconciled:" (pr-str summary) "->" (count evs) "ledger event(s)")))))))
+
+(defn cmd-head
+  "Phase 3a: self-certifying signed head over the fleet-db content —
+  the record a p2p head-announce (kotoba-lang/p2p) carries between fleet
+  machines. --verify checks signature + content hash against the db file."
+  [{:keys [db key kagi out verify delta-log] :as opts}]
+  (let [headf (or out (str/replace db #"\.edn$" ".head.edn"))
+        db-hash (node-sha256 (slurp* db))
+        ;; ③ fold the delta op-log head into the signed fleet head, so one
+        ;; signature certifies the manifest (fleet-db) AND the edit provenance
+        ;; (op-log). value = H(db-hash | delta:H(op-log)) when --delta-log given.
+        delta-hash (when (and delta-log (fs/existsSync delta-log))
+                     (node-sha256 (slurp* delta-log)))
+        content-hash (if delta-hash
+                       (node-sha256 (str db-hash "|delta:" delta-hash))
+                       db-hash)]
+    (if verify
+      (let [{:keys [record signature signer]} (reader/read-string (slurp* headf))]
+        (cond
+          (not= (:pin/value record) content-hash)
+          (do (js/console.error "HEAD MISMATCH: db content" (subs content-hash 0 12)
+                                "!= head" (subs (:pin/value record) 0 12))
+              (js/process.exit 1))
+          (not (node-verify (did/did->pubkey-hex signer) (pin/canonical-str record) signature))
+          (do (js/console.error "HEAD SIGNATURE INVALID") (js/process.exit 1))
+          :else (println "head OK: seq" (:pin/sequence record) "value"
+                         (subs content-hash 0 12)
+                         (if delta-hash (str "(manifest+delta:" (subs delta-hash 0 8) ")") "")
+                         "signer" signer)))
+      (do
+        (when-not (and db (or key kagi)) (die "head needs --db (--key PEM|--kagi NAME) [--out] | --verify"))
+        (let [pem  (read-key opts)
+              prev (when (fs/existsSync headf) (reader/read-string (slurp* headf)))
+              rec  (pin/make-record
+                    {:repo "fleet-db" :value content-hash
+                     :sequence (inc (get-in prev [:record :pin/sequence] 0))
+                     :parent (when prev (pin/record-hash node-sha256 (:record prev)
+                                                         (:signature prev)))})
+              sig  (node-sign pem (pin/canonical-str rec))
+              head {:record rec :signature sig :signer (did-of-priv pem)}]
+          (spit* headf (pr-str head))
+          (println "head announced: seq" (:pin/sequence rec) "value"
+                   (subs content-hash 0 12)
+                   (if delta-hash (str "(manifest+delta:" (subs delta-hash 0 8) ")") "")
+                   "->" headf))))))
+
+;; ---------------------------------------------------------------------------
+;; Phase 3b: fleet head gossip (wire-compatible with kotoba-lang/p2p)
+
+(defn cmd-announce
+  "Emit the current signed fleet head as a p2p head-announce message (EDN)
+  to --out (default stdout). This is what a fleet machine gossips."
+  [{:keys [head out node]}]
+  (when-not head (die "announce needs --head <fleet-head.edn> [--node ID] [--out msg.edn]"))
+  (let [h (reader/read-string (slurp* head))
+        msg (kagami.p2p/head->announce h (or node "this-machine"))]
+    (if out (do (spit* out (pr-str msg)) (println "announce ->" out
+                                                   "seq" (:seq msg) "cid" (subs (:head-cid msg) 0 12)))
+        (println (pr-str msg)))))
+
+(defn cmd-receive
+  "Verify a received p2p announce against the fleet trust set (keyring
+  roots + canonical allow) and adopt it if it advances. --state persists
+  the adopted head across calls (a machine's known fleet-db head)."
+  [{:keys [msg keys state]}]
+  (when-not (and msg keys) (die "receive needs --msg <announce.edn> --keys <fleet-keys.edn> [--state s.edn]"))
+  (let [announce (reader/read-string (slurp* msg))
+        cfg (reader/read-string (slurp* keys))
+        trust (into (or (:roots cfg) #{}) (get-in cfg [:canonical :allow]))
+        ctx {:trust trust :verify-fn node-verify
+             :did->pubkey #(did/did->pubkey-hex %)}
+        node0 (if (and state (fs/existsSync state))
+                (reader/read-string (slurp* state)) (kagami.p2p/new-node "this-machine"))
+        v (kagami.p2p/verify-announce announce ctx)
+        node1 (kagami.p2p/adopt node0 announce ctx)]
+    (if (:ok? v)
+      (let [h (kagami.p2p/local-head node1)]
+        (when state (spit* state (pr-str node1)))
+        (println "adopted: seq" (:seq h) "cid" (subs (:head-cid h) 0 12)
+                 (if (= (:seq h) (:seq announce)) "(advanced)" "(kept newer local)")))
+      (do (js/console.error "REJECTED announce:" (pr-str (:reasons v)))
+          (js/process.exit 1)))))
+
+(def commands
+  {"import" cmd-import "check" cmd-check "stats" cmd-stats
+   "reconcile" cmd-reconcile "head" cmd-head "verify-pins" cmd-verify-pins "ci-verify" cmd-ci-verify "reach-emit" cmd-reach-emit
+   "announce" cmd-announce "receive" cmd-receive
+   "ws-gc" cmd-ws-gc "checkpoint" cmd-checkpoint
+   "list" cmd-list "sync" cmd-sync
+   "keygen" cmd-keygen "enroll" cmd-enroll
+   "grant" cmd-grant
+   "propose" cmd-propose
+   "govern" cmd-govern
+   "pin-advance" cmd-pin-advance-signed
+   "pin-advance-unsigned" cmd-pin-advance})
+
+(let [[cmd & rest-args] *command-line-args*
+      f (get commands cmd)]
+  (if f
+    (f (parse-args rest-args))
+    (die (str "usage: fleet {" (str/join "|" (keys commands)) "} ..."))))

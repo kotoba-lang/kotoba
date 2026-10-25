@@ -1,0 +1,104 @@
+(ns ekyc-native-provider.core-test
+  (:require [kotoba.test :refer [deftest is]]
+            [ekyc.adapters.provider :as ekyc-provider]
+            [ekyc-native-provider.core :as core]
+            [ekyc-native-provider.ports :as ports]
+            [face-liveness.model :as liveness-model]))
+
+(def now 1700000000000)
+(defn- clock [] now)
+
+;; The real ICAO Doc 9303 published TD3 worked example (also used as
+;; kotoba-lang/mrz's own conformance fixture) -- proves this repo's
+;; :document-ocr path really calls the real mrz.core, not a stub.
+(def valid-mrz-lines
+  ["P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<"
+   "L898902C36UTO7408122F1204159ZE184226B<<<<<10"])
+(def tampered-mrz-lines
+  ["P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<"
+   "L898902C46UTO7408122F1204159ZE184226B<<<<<10"]) ; corrupted doc number
+
+(def open-eye {:p1 [0 0] :p4 [10 0] :p2 [3 2] :p6 [3 -2] :p3 [7 2] :p5 [7 -2]})
+(def closed-eye {:p1 [0 0] :p4 [10 0] :p2 [3 0.2] :p6 [3 -0.2] :p3 [7 0.2] :p5 [7 -0.2]})
+(defn- blink-frames []
+  (map-indexed (fn [i eye] (liveness-model/frame i {:left-eye eye}))
+               [open-eye open-eye closed-eye open-eye]))
+(defn- no-blink-frames []
+  (map-indexed (fn [i eye] (liveness-model/frame i {:left-eye eye})) [open-eye open-eye open-eye]))
+
+(defn- fixed-fetcher [ref->content]
+  (reify ports/IEvidenceFetcher
+    (fetch-evidence [_ _check evidence-ref] (get ref->content evidence-ref))))
+
+;; --- score-check unit coverage ---------------------------------------------
+
+(deftest score-check-document-ocr-valid-and-tampered
+  (is (= :verified (:status (core/score-check :document-ocr {:mrz-lines valid-mrz-lines} now))))
+  (is (= :rejected (:status (core/score-check :document-ocr {:mrz-lines tampered-mrz-lines} now)))))
+
+(deftest score-check-liveness-verified-and-rejected
+  (let [challenge (liveness-model/challenge "c1" :blink {:issued-at now :ttl-ms 100000})]
+    (is (= :verified (:status (core/score-check :liveness {:challenge challenge :frames (blink-frames)} now))))
+    (is (= :rejected (:status (core/score-check :liveness {:challenge challenge :frames (no-blink-frames)} now))))))
+
+(deftest score-check-liveness-expired-maps-to-expired-not-rejected
+  (let [challenge (liveness-model/challenge "c1" :blink {:issued-at 0 :ttl-ms 1000})]
+    (is (= :expired (:status (core/score-check :liveness {:challenge challenge :frames (blink-frames)} 999999))))))
+
+(deftest score-check-face-match-always-reviews-with-no-matcher
+  (is (= :review (:status (core/score-check :face-match {:selfie "s" :document-photo "d"} now)))))
+
+(deftest score-check-nil-content-and-unsupported-check-both-review
+  (is (= :review (:status (core/score-check :document-ocr nil now))))
+  (is (= :review (:status (core/score-check :pep {:anything true} now)))))
+
+;; --- provider-client (IEkycProviderClient) end-to-end -----------------------
+
+(deftest create-session-returns-submitted-with-a-session-ref
+  (let [client (core/provider-client (fixed-fetcher {}) clock)
+        response (ekyc-provider/create-session! client {:id "sess-1" :expires-at 9999999} {})]
+    (is (= :submitted (:status response)))
+    (is (= "ekyc-native://sess-1" (:session-ref response)))))
+
+(deftest upload-evidence-document-ocr-resolves-through-the-fetcher
+  (let [fetcher (fixed-fetcher {"kagi://doc-1" {:mrz-lines valid-mrz-lines}})
+        client (core/provider-client fetcher clock)]
+    (ekyc-provider/create-session! client {:id "sess-1"} {})
+    (let [response (ekyc-provider/upload-evidence!
+                     client {:session-id "sess-1" :check :document-ocr :evidence-ref "kagi://doc-1"} {})]
+      (is (= :verified (:status response)))
+      (is (= 1.0 (:confidence response))))))
+
+(deftest upload-evidence-prefers-custody-ref-over-evidence-ref
+  (let [fetcher (fixed-fetcher {"kagi://custody-1" {:mrz-lines valid-mrz-lines}
+                                 "caller-ref" {:mrz-lines tampered-mrz-lines}})
+        client (core/provider-client fetcher clock)]
+    (ekyc-provider/create-session! client {:id "sess-1"} {})
+    (let [response (ekyc-provider/upload-evidence!
+                     client {:session-id "sess-1" :check :document-ocr
+                              :evidence-ref "caller-ref" :custody-ref "kagi://custody-1"} {})]
+      (is (= :verified (:status response)) "custody-ref (kagi's own record) wins over the caller-asserted evidence-ref"))))
+
+(deftest upload-evidence-unresolvable-ref-reviews-not-fails
+  (let [client (core/provider-client (fixed-fetcher {}) clock)]
+    (ekyc-provider/create-session! client {:id "sess-1"} {})
+    (let [response (ekyc-provider/upload-evidence!
+                     client {:session-id "sess-1" :check :document-ocr :evidence-ref "missing"} {})]
+      (is (= :review (:status response))))))
+
+(deftest retrieve-result-aggregates-across-checks-worst-status-wins
+  (let [fetcher (fixed-fetcher {"doc" {:mrz-lines valid-mrz-lines}
+                                 "live" {:challenge (liveness-model/challenge "c1" :blink {:issued-at now :ttl-ms 100000})
+                                         :frames (no-blink-frames)}})
+        client (core/provider-client fetcher clock)]
+    (ekyc-provider/create-session! client {:id "sess-1"} {})
+    (ekyc-provider/upload-evidence! client {:session-id "sess-1" :check :document-ocr :evidence-ref "doc"} {})
+    (ekyc-provider/upload-evidence! client {:session-id "sess-1" :check :liveness :evidence-ref "live"} {})
+    (let [result (ekyc-provider/retrieve-result! client {:session-id "sess-1"} {})]
+      (is (= :rejected (:status result)) "one rejected check drags the whole session to :rejected")
+      (is (= 2 (count (:evidence result)))))))
+
+(deftest retrieve-result-empty-session-reviews
+  (let [client (core/provider-client (fixed-fetcher {}) clock)]
+    (ekyc-provider/create-session! client {:id "sess-1"} {})
+    (is (= :review (:status (ekyc-provider/retrieve-result! client {:session-id "sess-1"} {}))))))

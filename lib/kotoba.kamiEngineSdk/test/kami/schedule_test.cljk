@@ -1,0 +1,119 @@
+(ns kami.schedule-test
+  "Phase 2.4 — system schedule contract tests. Pins the invariant: a system
+  receives ONLY entities matching its `:query`, the runner threads `world` in
+  `:order`, and the runner itself does NOT loop per-entity (it hands the whole
+  queried seq to the system fn once). See ADR-2607010930."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kami.ecs      :as ecs]
+            [kami.schedule :as sched]))
+
+;; --- fixtures ---------------------------------------------------------------
+
+(def e1 #uuid "00000000-0000-0000-0000-000000000001")
+(def e2 #uuid "00000000-0000-0000-0000-000000000002")
+(def e3 #uuid "00000000-0000-0000-0000-000000000003")
+(def e4 #uuid "00000000-0000-0000-0000-000000000004")
+
+(defn world
+  "Small ECS world (component keys match the task example — bare keywords):
+     e1 :transform :velocity
+     e2 :transform :mesh
+     e3 :transform :velocity :mesh
+     e4 :mesh  (no transform)"
+  []
+  (-> (ecs/world)
+      (ecs/add {:kami/eid e1 :transform {:translation [0 0 0]} :velocity {:linear [1 0 0]}})
+      (ecs/add {:kami/eid e2 :transform {:translation [2 0 0]} :mesh {:asset "m/cube"}})
+      (ecs/add {:kami/eid e3 :transform {:translation [3 0 0]} :velocity {:linear [0 1 0]}
+                :mesh {:asset "m/cube"}})
+      (ecs/add {:kami/eid e4 :mesh {:asset "m/cube"}})))
+
+;; --- tests ------------------------------------------------------------------
+
+(deftest schedule-sorts-by-order
+  (let [s (sched/schedule [{:system :c :order 30}
+                           {:system :a :order 10}
+                           {:system :b :order 20}])]
+    (is (= [:a :b :c] (mapv :system s)))
+    (is (every? #(int? (:order %)) s))
+    (testing "missing :order defaults to 0"
+      (let [s2 (sched/schedule [{:system :z} {:system :y :order -1}])]
+        (is (= [:y :z] (mapv :system s2)))))))
+
+(deftest run-schedule-filters-by-query
+  (let [saw-physics (atom #{})
+        saw-render  (atom #{})
+        s (sched/schedule
+           [{:system :physics-step :order 10 :query #{:transform :velocity}
+             :fn (fn [_ _ ents] (reset! saw-physics (into #{} (map first ents))) nil)}
+            {:system :render-cull :order 20 :query #{:transform :mesh}
+             :fn (fn [_ _ ents] (reset! saw-render (into #{} (map first ents))) nil)}])]
+    (sched/run-schedule s (world) 16.0)
+    (testing "physics-step saw only entities with BOTH :transform and :velocity"
+      (is (= #{e1 e3} @saw-physics))
+      (is (not (contains? @saw-physics e2)))
+      (is (not (contains? @saw-physics e4))))
+    (testing "render-cull saw only entities with BOTH :transform and :mesh"
+      (is (= #{e2 e3} @saw-render))
+      (is (not (contains? @saw-render e1)))
+      (is (not (contains? @saw-render e4))))))
+
+(deftest run-schedule-threads-world-in-order
+  (testing "each system sees the world as the prior system returned it"
+    (let [log (atom [])
+          s (sched/schedule
+             [{:system :first  :order 10 :query #{:transform}
+               :fn (fn [w _dt ents]
+                     (let [w' (assoc w ::marker :first)]
+                       (swap! log conj [:first (count ents) (::marker w)])
+                       w'))}
+              {:system :second :order 20 :query #{:transform}
+               :fn (fn [w _dt ents]
+                     (swap! log conj [:second (count ents) (::marker w)])
+                     (assoc w ::marker :second))}
+              {:system :third  :order 30 :query #{:transform}
+               :fn (fn [w _dt ents]
+                     (swap! log conj [:third (count ents) (::marker w)])
+                     (assoc w ::marker :third))}])
+          out (sched/run-schedule s (world) 16.0)]
+      (is (= :third (::marker out)))
+      (is (= [[:first 3 nil] [:second 3 :first] [:third 3 :second]] @log)))))
+
+(deftest run-schedule-no-per-entity-loop
+  "The runner hands the WHOLE queried seq to each fn exactly once — it does not
+  call the fn once per entity. We assert the fn is invoked once per system, and
+  that the seq it receives has the expected count (the runner is coarse-grained;
+  per-entity iteration is the fn's / GPU's job, not the runner's)."
+  (let [calls (atom 0)
+        ents-seen (atom nil)
+        s (sched/schedule
+           [{:system :physics-step :order 10 :query #{:transform :velocity}
+             :fn (fn [_ _ ents]
+                   (swap! calls inc)
+                   (reset! ents-seen (count ents))
+                   nil)}])]
+    (sched/run-schedule s (world) 16.0)
+    (is (= 1 @calls) "system fn invoked exactly once (not once per entity)")
+    (is (= 2 @ents-seen) "fn received the full 2-entity queried seq")))
+
+(deftest run-schedule-nil-return-is-identity
+  (testing "a system fn returning nil leaves world unchanged"
+    (let [w (world)
+          s (sched/schedule
+             [{:system :noop :order 0 :query #{:transform}
+               :fn (fn [_ _ _] nil)}])]
+      (is (identical? w (sched/run-schedule s w 16.0))))))
+
+;; An empty :query (#{}) matches every entity in the world (per kami.ecs/query).
+(deftest run-schedule-empty-query-matches-all
+  (let [saw (atom #{})
+        s (sched/schedule
+           [{:system :all :order 0 :query #{}
+             :fn (fn [_ _ ents] (reset! saw (into #{} (map first ents))) nil)}])]
+    (sched/run-schedule s (world) 16.0)
+    (is (= #{e1 e2 e3 e4} @saw))))
+
+(deftest specs-by-system-indexes
+  (let [s (sched/schedule [{:system :a :order 1} {:system :b :order 2}])]
+    (is (= :a (:system (get (sched/specs-by-system s) :a))))
+    (is (= :b (:system (get (sched/specs-by-system s) :b))))))

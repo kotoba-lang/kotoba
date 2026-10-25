@@ -1,0 +1,453 @@
+(ns ioplan.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [ioplan.core :as io]
+            [machine.core :as m]))
+
+(def mach
+  {:format m/format-id
+   :machine/id "fixture"
+   :machine/provenance :measured
+   :machine/source "test fixture"
+   :storage [{:id :nvme :kind :nvme :block-bytes 4096 :queue-depth 4
+              :seek-cost :none :max-transfer-bytes 131072}
+             {:id :disk :kind :hdd :block-bytes 4096 :queue-depth 1
+              :seek-cost :high :max-transfer-bytes 1048576}
+             {:id :ssd :kind :sata-ssd :block-bytes 4096 :queue-depth 32
+              :seek-cost :low :max-transfer-bytes 262144}]})
+
+(defn- r [id off bytes & [op]]
+  {:id id :op (or op :read) :offset off :bytes bytes})
+
+(deftest fixture-machine-is-valid (is (m/valid? mach)))
+
+(deftest an-unknown-device-is-refused
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (io/plan mach :ssd-that-does-not-exist [(r :a 0 4096)]))))
+
+(deftest bad-requests-are-refused
+  (is (some #(= :invalid-op (:error %)) (io/request-errors [(r :a 0 4096 :trim)])))
+  (is (some #(= :invalid-offset (:error %)) (io/request-errors [(r :a -1 4096)])))
+  (is (some #(= :invalid-bytes (:error %)) (io/request-errors [(r :a 0 0)])))
+  (is (some #(= :duplicate-request-id (:error %))
+            (io/request-errors [(r :a 0 4096) (r :a 8192 4096)]))))
+
+;; ── alignment ────────────────────────────────────────────────────────────
+
+(deftest alignment-makes-amplification-visible-rather-than-adding-it
+  (let [p (io/plan mach :nvme [(r :a 100 100)])]
+    (testing "the device was always going to move a whole block"
+      (is (= 100 (get-in p [:stats :bytes-requested])))
+      (is (= 4096 (get-in p [:stats :bytes-transferred])))
+      (is (= 40.96 (get-in p [:stats :read-amplification]))))))
+
+(deftest a-request-straddling-a-block-boundary-costs-two
+  (let [p (io/plan mach :nvme [(r :a 4090 12)])]
+    (is (= 8192 (get-in p [:stats :bytes-transferred])))
+    (is (= 0 (:aligned-offset (ffirst (:batches p)))))))
+
+;; ── merging ──────────────────────────────────────────────────────────────
+
+(deftest adjacent-requests-become-one-command
+  (let [p (io/plan mach :nvme [(r :a 0 4096) (r :b 4096 4096) (r :c 8192 4096)])]
+    (is (= 1 (get-in p [:stats :commands])))
+    (is (= 2 (get-in p [:stats :merges])))
+    (is (= [:a :b :c] (:covers (ffirst (:batches p)))))
+    (testing "and the transfer is exactly what was asked for"
+      (is (= 1.0 (get-in p [:stats :read-amplification]))))))
+
+(deftest merging-never-crosses-an-op-boundary
+  (testing "a read absorbed into a write would return bytes nobody read"
+    (let [p (io/plan mach :nvme [(r :a 0 4096 :read) (r :b 4096 4096 :write)])]
+      (is (= 2 (get-in p [:stats :commands]))))))
+
+(deftest merging-stops-at-the-devices-maximum-transfer
+  (let [reqs (mapv (fn [i] (r (keyword (str "r" i)) (* i 4096) 4096)) (range 64))
+        p (io/plan mach :nvme reqs)]
+    (testing "64 blocks is 256 KiB against a 128 KiB maximum, so two commands"
+      (is (= 2 (get-in p [:stats :commands])))
+      (is (every? #(<= (:aligned-bytes %) 131072) (apply concat (:batches p)))))))
+
+(deftest a-seeking-device-merges-across-a-small-hole
+  (testing "skipping the gap costs a seek; reading through it costs bandwidth"
+    (let [p (io/plan mach :disk [(r :a 0 4096) (r :b 8192 4096)])]
+      (is (= 1 (get-in p [:stats :commands])))
+      (is (= 12288 (get-in p [:stats :bytes-transferred])))))
+  (testing "on a zero-seek device there is nothing to buy, so it does not"
+    (let [p (io/plan mach :nvme [(r :a 0 4096) (r :b 8192 4096)])]
+      (is (= 2 (get-in p [:stats :commands]))))))
+
+;; ── ordering ─────────────────────────────────────────────────────────────
+
+(def ^:private scattered
+  [(r :a 40960 4096) (r :b 4096 4096) (r :c 81920 4096)
+   (r :d 0 4096) (r :e 61440 4096)])
+
+(deftest an-elevator-sort-helps-a-seeking-device
+  (let [p (io/plan mach :disk scattered)
+        {:keys [head-travel head-travel-submitted]} (:stats p)]
+    (is (:reordered? (:stats p)))
+    (testing "0 and 4096 touch, so they arrive as one command"
+      (is (= [0 40960 61440 81920] (:order p))))
+    (testing "one ascending sweep: travel is the span, not the zig-zag"
+      (is (= 81920 head-travel))
+      (is (< head-travel head-travel-submitted)))))
+
+(deftest the-same-sort-is-refused-on-a-device-that-charges-nothing-to-seek
+  (let [p (io/plan mach :nvme scattered)]
+    (testing "reordering buys nothing and costs the order the caller chose"
+      (is (not (:reordered? (:stats p))))
+      (is (= [40960 4096 81920 0 61440] (:order p)))
+      (is (nil? (get-in p [:stats :head-travel]))))))
+
+(deftest merging-does-not-reorder-a-zero-seek-device-by-the-back-door
+  (testing "only submission neighbours combine there, so the plan stays in order"
+    (let [p (io/plan mach :nvme [(r :a 40960 4096) (r :b 0 4096) (r :c 4096 4096)])]
+      (is (= [40960 0] (:order p)))
+      (is (= 2 (get-in p [:stats :commands])))
+      (is (not (:reordered? (:stats p))))))
+  (testing "while a seeking device is free to sort first and merge more"
+    (let [p (io/plan mach :disk [(r :a 40960 4096) (r :b 0 4096) (r :c 4096 4096)])]
+      (is (= 2 (get-in p [:stats :commands])))
+      (is (= [0 40960] (:order p))))))
+
+(deftest head-travel-counts-from-where-the-head-is
+  (is (= 81920 (io/head-travel (io/align (m/storage-device mach :disk)
+                                         [(r :a 81920 4096)]) 0)))
+  (is (= 4096 (io/head-travel (io/align (m/storage-device mach :disk)
+                                        [(r :a 81920 4096)]) 77824))))
+
+;; ── batching ─────────────────────────────────────────────────────────────
+
+(deftest batches-follow-the-devices-queue-depth
+  (let [reqs (mapv (fn [i] (r (keyword (str "r" i)) (* i 65536) 4096)) (range 10))
+        p (io/plan mach :nvme reqs)]
+    (testing "queue depth 4, nothing mergeable: three batches"
+      (is (= 10 (get-in p [:stats :commands])))
+      (is (= 3 (get-in p [:stats :batches])))
+      (is (= [4 4 2] (mapv count (:batches p))))))
+  (testing "a single-queue disk gets one request per batch"
+    (let [p (io/plan mach :disk scattered)]
+      (is (= 1 (:queue-depth (:device p))))
+      (is (every? #(= 1 (count %)) (:batches p))))))
+
+;; ── writes ───────────────────────────────────────────────────────────────
+
+(deftest a-sub-block-write-is-a-read-modify-write-and-says-so
+  (let [p (io/plan mach :nvme [(r :a 0 512 :write)])]
+    (is (= 8.0 (get-in p [:stats :write-amplification]))))
+  (testing "a whole-block write amplifies by nothing"
+    (let [p (io/plan mach :nvme [(r :a 0 4096 :write)])]
+      (is (= 1.0 (get-in p [:stats :write-amplification])))))
+  (testing "and a read-only workload reports no write amplification at all"
+    (is (nil? (get-in (io/plan mach :nvme [(r :a 0 4096)]) [:stats :write-amplification])))))
+
+;; ── plan as a whole ──────────────────────────────────────────────────────
+
+(deftest the-plan-carries-its-model
+  (let [p (io/plan mach :disk scattered)]
+    (is (= :kotoba.ioplan/block-transfers-v1 (get-in p [:model :model/id])))
+    (is (seq (get-in p [:model :model/does-not-model])))))
+
+(deftest explain-says-what-it-did-and-what-it-declined-to-do
+  (let [lines (io/explain (io/plan mach :nvme scattered))]
+    (is (= 4 (count lines)))
+    (is (re-find #"not reordered" (last lines))))
+  (let [lines (io/explain (io/plan mach :disk scattered))]
+    (is (re-find #"reordered: head travel" (last lines)))))
+
+(deftest planning-is-deterministic
+  (let [a (io/plan mach :disk scattered)
+        b (io/plan mach :disk scattered)]
+    (is (= (:order a) (:order b)))
+    (is (= (:stats a) (:stats b)))))
+
+;; ── how much is there to win? ────────────────────────────────────────────
+
+(deftest optimal-travel-has-a-closed-form
+  (testing "outside the span you walk it once"
+    (is (= 100 (io/optimal-travel [50 100 150] 50)))
+    (is (= 100 (io/optimal-travel [50 100 150] 150))))
+  (testing "inside it you must double back over one side, so take the near one first"
+    (is (= 150 (io/optimal-travel [0 100] 50)))
+    (is (= 110 (io/optimal-travel [0 100] 10))))
+  (is (= 0 (io/optimal-travel [] 0)))
+  (is (= 0 (io/optimal-travel [42] 42))))
+
+(deftest an-already-minimal-request-list-is-not-worth-planning
+  (testing "three block-aligned, non-overlapping, non-adjacent reads on flash"
+    (let [b (io/benefit mach :nvme [(r :a 0 4096) (r :b 65536 4096) (r :c 131072 4096)])]
+      (is (= 12288 (get-in b [:floors :bytes]) (get-in b [:submitted :bytes])))
+      (is (= 3 (get-in b [:floors :commands]) (get-in b [:submitted :commands])))
+      (is (not (:worth-planning? b)))
+      (testing "and no credit is claimed for removing an excess that was zero"
+        (is (nil? (get-in b [:captured :bytes])))
+        (is (nil? (get-in b [:captured :commands])))))))
+
+(deftest contiguous-requests-have-command-excess-and-the-plan-takes-all-of-it
+  (let [b (io/benefit mach :nvme [(r :a 0 4096) (r :b 4096 4096) (r :c 8192 4096)])]
+    (testing "one union run, so one command is the floor"
+      (is (= 1 (get-in b [:floors :commands])))
+      (is (= 3 (get-in b [:submitted :commands]))))
+    (is (:worth-planning? b))
+    (testing "merging captured the whole excess"
+      (is (= 1.0 (get-in b [:captured :commands]))))
+    (testing "bytes were already minimal — merging removes overlap, not alignment"
+      (is (= 12288 (get-in b [:floors :bytes])))
+      (is (nil? (get-in b [:captured :bytes]))))))
+
+(deftest overlapping-requests-are-where-bytes-can-be-removed
+  (testing "two reads covering the same block twice"
+    (let [b (io/benefit mach :nvme [(r :a 0 4096) (r :b 2048 2048)])]
+      (is (= 4096 (get-in b [:floors :bytes])))
+      (is (= 8192 (get-in b [:submitted :bytes])))
+      (is (:worth-planning? b))
+      (is (= 1.0 (get-in b [:captured :bytes]))))))
+
+(deftest travel-is-nil-on-a-device-that-charges-nothing-to-seek
+  (testing "not zero — the quantity does not apply rather than being minimal"
+    (let [b (io/benefit mach :nvme scattered)]
+      (is (nil? (get-in b [:floors :travel])))
+      (is (nil? (get-in b [:captured :travel]))))))
+
+(deftest the-elevator-captures-all-of-the-travel-excess-on-a-disk
+  (let [b (io/benefit mach :disk scattered {:head 0})]
+    (testing "the head starts below the span, so one ascending sweep is optimal"
+      (is (= 81920 (get-in b [:floors :travel])))
+      (is (= 81920 (get-in b [:planned :travel]))))
+    (is (< (get-in b [:floors :travel]) (get-in b [:submitted :travel])))
+    (is (= 1.0 (get-in b [:captured :travel])))
+    (is (:worth-planning? b))))
+
+(deftest a-mid-span-head-still-lets-c-scan-be-optimal
+  (testing "doubling back over the lower half is what the optimum does too"
+    (let [b (io/benefit mach :disk scattered {:head 40960})]
+      (is (= 122880 (get-in b [:floors :travel])))
+      (is (= 1.0 (get-in b [:captured :travel]))))))
+
+(deftest c-scan-from-above-the-span-costs-the-span-twice-over
+  (testing "the ascending sweep walks DOWN to the lowest request and then back
+            up over the same ground, while the shortest walk just descends. So
+            C-SCAN pays (head - lo) + span against an optimum of (head - lo):
+            the ratio is 1 + span/(head - lo), which is exactly 2 when the head
+            sits on the top of the span and decays toward 1 as it moves away.
+            This is the price of the anti-starvation choice `order` documents,
+            and `benefit` is what turns it from prose into a number."
+    (let [span 81920]
+      (testing "head exactly on the top of the span: the worst case, exactly 2x"
+        (let [b (io/benefit mach :disk scattered {:head 81920})]
+          (is (= 81920 (get-in b [:floors :travel])))
+          (is (= 163840 (get-in b [:planned :travel])))))
+      (testing "further above, the penalty decays as 1 + span/(head - lo)"
+        (let [b (io/benefit mach :disk scattered {:head 100000})
+              floor (get-in b [:floors :travel])
+              planned (get-in b [:planned :travel])]
+          (is (= 100000 floor))
+          (is (= (+ floor span) planned))
+          (is (< 1.81 (/ (double planned) floor) 1.83)))))))
+
+;; ── a request larger than the device can transfer ────────────────────────
+
+(deftest an-oversized-request-is-split-into-commands-the-device-can-run
+  (testing "merging refuses to GROW past the maximum, which is not the same as
+            ensuring nothing exceeds it — a single 1 MiB read against a 128 KiB
+            device used to pass through whole"
+    (let [p (io/plan mach :nvme [(r :big 0 1048576)])
+          cmds (vec (apply concat (:batches p)))]
+      (is (= 8 (count cmds)))
+      (is (every? #(<= (:aligned-bytes %) 131072) cmds))
+      (is (= 1048576 (reduce + 0 (map :aligned-bytes cmds))) "no bytes lost")
+      (testing "the pieces are contiguous and block-aligned"
+        (is (= (range 0 1048576 131072) (map :aligned-offset cmds)))
+        (is (every? #(zero? (mod (:aligned-offset %) 4096)) cmds)))
+      (is (= 7 (get-in p [:stats :splits]))))))
+
+(deftest the-plan-now-meets-its-own-floor-instead-of-beating-it
+  (testing "benefit said 8 commands were the floor while plan emitted 1, which
+            is incoherent: a plan cannot be below its own lower bound"
+    (let [reqs [(r :big 0 1048576)]
+          b (io/benefit mach :nvme reqs)]
+      (is (= 8 (get-in b [:floors :commands])))
+      (is (= 8 (get-in b [:planned :commands]))))))
+
+(deftest splitting-leaves-ordinary-requests-alone
+  (let [p (io/plan mach :nvme [(r :a 0 4096) (r :b 65536 4096)])]
+    (is (zero? (get-in p [:stats :splits])))
+    (is (= 2 (get-in p [:stats :commands])))))
+
+(deftest a-seeking-device-splits-and-still-sweeps
+  (let [p (io/plan mach :disk [(r :big 0 4194304) (r :far 8388608 4096)] {:head 0})
+        cmds (vec (apply concat (:batches p)))]
+    (is (every? #(<= (:aligned-bytes %) 1048576) cmds))
+    (testing "the split pieces stay in ascending order with the rest"
+      (is (= (sort (map :aligned-offset cmds)) (map :aligned-offset cmds))))))
+
+;; ── a real layout, a computed order ──────────────────────────────────────
+;;
+;; Every other test here uses offsets chosen to exercise a branch. These use
+;; the real byte layout of 256 objects in a git packfile from this workspace
+;; -- what a planner is actually handed when asked to fetch a set of objects.
+;;
+;; The layout is real and checked in; the ORDER requests arrive in is computed
+;; here, because that is the variable a planner exists to change. Nothing is
+;; timed, so this says the same thing on a loaded machine as on an idle one.
+
+(def ^:private layout
+  (-> "packfile-layout.edn" clojure.java.io/resource slurp read-string))
+
+(defn- fetch-order
+  "Objects in id order, which is uncorrelated with offset -- the pattern you
+  get asking for a set of objects by name rather than by position."
+  []
+  (->> layout
+       (sort-by :id)
+       (mapv (fn [o] {:id (:id o) :op :read :offset (:offset o) :bytes (:bytes o)}))))
+
+(deftest the-real-layout-is-a-valid-request-list
+  (is (= 256 (count layout)))
+  (is (empty? (io/request-errors (fetch-order))))
+  (testing "and it spans the pack rather than one hot region, or the ordering
+            question this is here to ask would be trivial"
+    (let [offs (map :offset layout)]
+      (is (< 4000000 (- (apply max offs) (apply min offs)))))))
+
+(deftest every-floor-holds-on-real-offsets
+  (testing "a plan can equal a floor but never beat one. These are the bounds
+            the whole namespace is judged against, and until now none of them
+            had been checked against a layout somebody did not invent"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [reqs (fetch-order)
+            b (io/benefit mach dev reqs)
+            ;; merge-gap 0: the floors below bound a planner that does not
+            ;; bridge gaps, and `plan` bridges by default. Comparing the two
+            ;; is the same category error as running a prefetching cache
+            ;; against Belady -- see the test just after this one.
+            p (io/plan mach dev reqs {:merge-gap 0})]
+        (is (<= (get-in b [:floors :bytes]) (get-in p [:stats :bytes-transferred]))
+            (str dev " moved fewer bytes than the union of aligned ranges"))
+        (is (<= (get-in b [:floors :commands]) (get-in p [:stats :commands]))
+            (str dev " issued fewer commands than the union runs allow"))
+        (when-let [floor-travel (get-in b [:floors :travel])]
+          (is (<= floor-travel (get-in p [:stats :head-travel]))
+              (str dev " travelled less than the optimal tour")))))))
+
+(deftest ordering-buys-something-real-on-a-seeking-device
+  (testing "requests arriving in id order are scattered across the pack.
+            Sorting them is the entire point of `order`, and on real offsets
+            it should collapse travel by a wide margin"
+    (let [reqs (fetch-order)
+          submitted (get-in (io/plan mach :disk reqs) [:stats :head-travel-submitted])
+          planned (get-in (io/plan mach :disk reqs) [:stats :head-travel])]
+      (is (< (* 10 planned) submitted)
+          (str "planned travel " planned " against submitted " submitted)))))
+
+(deftest a-zero-seek-device-reports-travel-as-absent-not-zero
+  (testing "on nvme the quantity does not apply. Reporting 0 would read as
+            'already optimal' and invite a planner to sort for nothing"
+    (is (nil? (get-in (io/benefit mach :nvme (fetch-order)) [:floors :travel])))
+    (is (some? (get-in (io/benefit mach :disk (fetch-order)) [:floors :travel])))))
+
+(deftest no-command-exceeds-what-the-device-accepts
+  (testing "merging refuses to GROW a command past the maximum, which is not
+            the same as guaranteeing none exceeds it -- a 1 MiB command was
+            once emitted against a 128 KiB device because those two were
+            confused. Real offsets with real sizes are a fair test of that"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [maxt (:max-transfer-bytes (first (filter #(= dev (:id %)) (:storage mach))))
+            p (io/plan mach dev (fetch-order))]
+        (is (<= (get-in p [:stats :bytes-transferred])
+                (* maxt (get-in p [:stats :commands])))
+            (str dev ": total bytes exceed what its command count can carry, so
+                 at least one command is over the device maximum"))))))
+
+(deftest the-command-floor-bounds-a-planner-that-does-not-bridge-gaps
+  (testing "on real offsets the default plan issues FEWER commands than
+            benefit's floor -- 73 against 82 -- which looks like a broken
+            bound and is not. Bridging a gap smaller than a seek buys a
+            command by transferring bytes nobody asked for, and the floor
+            bounds a planner that never does it. Same shape as running a
+            prefetching cache against a demand-paging bound: the bound was
+            fine, the comparison was not"
+    (let [reqs (fetch-order)
+          b (io/benefit mach :disk reqs)
+          bridged (io/plan mach :disk reqs)
+          strict (io/plan mach :disk reqs {:merge-gap 0})]
+      (testing "with bridging off, the plan lands exactly on both floors"
+        (is (= (get-in b [:floors :commands]) (get-in strict [:stats :commands])))
+        (is (= (get-in b [:floors :bytes]) (get-in strict [:stats :bytes-transferred]))))
+      (testing "with bridging on, it goes below the command floor"
+        (is (< (get-in bridged [:stats :commands]) (get-in b [:floors :commands]))))
+      (testing "and pays for it in bytes, which is the trade the floor cannot see"
+        (is (> (get-in bridged [:stats :bytes-transferred])
+               (get-in b [:floors :bytes])))))))
+
+(deftest captured-never-exceeds-what-was-removable
+  (testing "a fraction of the removable excess cannot exceed 1.0. On the real
+            packfile layout this reported 1.05 for commands -- a plan credited
+            with removing 105% of what could be removed -- because :planned
+            was measured with gap bridging on and the floors bound a planner
+            without it. Both sides now describe the same lever"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [b (io/benefit mach dev (fetch-order))]
+        (is (= :merging-and-ordering (:bounds b)))
+        (is (= :disabled-for-this-comparison (:gap-bridging b)))
+        (doseq [k [:bytes :commands :travel]]
+          (when-let [v (get-in b [:captured k])]
+            (is (<= 0.0 v 1.0)
+                (str dev " captured " (name k) " = " v))))))))
+
+(deftest benefit-reports-the-plan-you-get-by-asking-for-that-lever
+  (testing ":planned here is deliberately not the default plan. Anyone
+            reproducing it needs merge-gap 0, and if that ever drifts the two
+            halves of the comparison stop describing the same thing again"
+    (doseq [dev [:nvme :ssd :disk]]
+      (let [b (io/benefit mach dev (fetch-order))
+            strict (io/plan mach dev (fetch-order) {:merge-gap 0})]
+        (is (= (:planned b)
+               {:bytes (get-in strict [:stats :bytes-transferred])
+                :commands (get-in strict [:stats :commands])
+                :travel (get-in strict [:stats :head-travel])})
+            (str dev))))))
+
+(deftest the-bridging-lever-now-has-the-ceiling-it-was-promised
+  (testing "benefit's floors bound merging and ordering and say so. The other
+            lever was described as having a separate ceiling and did not have
+            one, which left `plan` issuing 73 commands against a floor of 82
+            with no way to tell whether that was good"
+    (doseq [dev [:disk :ssd]]
+      (let [reqs (fetch-order)
+            b (io/benefit mach dev reqs)
+            p (io/plan mach dev reqs)
+            spent (- (get-in p [:stats :bytes-transferred]) (get-in b [:floors :bytes]))
+            f (io/bridging-floor mach dev reqs {:extra-bytes spent})]
+        (is (= :gap-bridging (:bounds f)))
+        (testing "the plan cannot beat the floor for the bytes it actually spent"
+          (is (<= (:commands-floor f) (get-in p [:stats :commands])) (str dev)))
+        (testing "and on this trace it exactly meets it -- 36864 extra bytes buy
+                  9 bridged gaps and 9 commands, which is all they can buy"
+          (is (= (:commands-floor f) (get-in p [:stats :commands])) (str dev)))))))
+
+(deftest spending-nothing-bridges-nothing
+  (testing "the budget is the whole lever: with no bytes to spend the floor
+            falls back to the merge-and-order figure"
+    (let [reqs (fetch-order)
+          b (io/benefit mach :disk reqs)
+          f (io/bridging-floor mach :disk reqs {:extra-bytes 0})]
+      (is (zero? (:gaps-bridged f)))
+      (is (= (get-in b [:floors :commands]) (:commands-floor f))))))
+
+(deftest more-budget-never-raises-the-floor
+  (testing "monotone in the budget, which a greedy-over-sorted-gaps bound must
+            be, and a broken one would not"
+    (let [reqs (fetch-order)
+          floors (map #(:commands-floor (io/bridging-floor mach :disk reqs {:extra-bytes %}))
+                      [0 10000 36864 100000 10000000])]
+      (is (apply >= floors) (pr-str floors))
+      (testing "and enough budget bridges every gap there is"
+        (let [f (io/bridging-floor mach :disk reqs {:extra-bytes 10000000})]
+          (is (= (:gaps-available f) (:gaps-bridged f))))))))
+
+(deftest a-zero-seek-device-has-no-bridging-lever-at-all
+  (testing "nil rather than a floor equal to the base: on nvme the default gap
+            is already 0, so a byte budget spent there buys nothing rather than
+            buying a little, and reporting a number would invite spending it"
+    (is (nil? (io/bridging-floor mach :nvme (fetch-order) {:extra-bytes 100000})))))

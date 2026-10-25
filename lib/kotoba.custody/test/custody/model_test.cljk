@@ -1,0 +1,195 @@
+(ns custody.model-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [custody.model :as m]
+            [custody.shamir :as s]
+            [custody.shamir-test :refer [det-rand]]))
+
+(def secret [11 22 33 44])
+
+(defn digest
+  "Test double for the injected hash. A real caller passes SHA-256; the
+  property under test is that SOMETHING verifies the reconstruction, not
+  which function does."
+  [bytes]
+  (str "d:" (pr-str (vec bytes))))
+
+(defn mk
+  "A deal over `domains` (one per custodian, in share order) with the given
+  threshold, plus the shares that back it."
+  ([domains threshold] (mk domains threshold secret det-rand))
+  ([domains threshold sec rnd]
+   (let [total (count domains)
+         shares (s/split sec threshold total rnd)
+         custodians (vec (map-indexed
+                          (fn [i d] {:custodian/id (str "did:key:c" (inc i))
+                                     :custodian/domain d
+                                     :custodian/pub (str "pub" (inc i))})
+                          domains))]
+     {:deal (m/deal "deal:test"
+                    {:secret-id "sec:test"
+                     :threshold threshold
+                     :total total
+                     :custodians custodians
+                     :secret-digest (digest sec)})
+      :shares shares
+      :secret sec})))
+
+(defn releases-for
+  "Releases from the custodians sitting at share coordinates `xs`."
+  [{:keys [deal shares]} xs]
+  (mapv (fn [x]
+          (let [c (first (filter #(= x (:custodian/share-x %)) (:deal/custodians deal)))
+                sh (first (filter #(= x (:share/x %)) shares))]
+            (m/release deal c sh {:at "2026-07-28T00:00:00Z" :reason "test"})))
+        xs))
+
+;; ------------------------------------------------------- independence
+
+(deftest three-shares-in-one-domain-is-not-a-threshold
+  ;; The failure this whole namespace exists to catch: the arithmetic is a
+  ;; correct 3-of-5, and it is worth nothing, because one party holds three.
+  (let [{:keys [deal]} (mk [:operator :operator :operator :tenant :notary] 3)
+        ind (m/independence deal)]
+    (is (= :operator (m/captured-by deal)))
+    (is (= 1 (:independence/min-domains-to-open ind)))
+    (is (false? (:independence/sound? ind)))
+    (is (= {:operator 3 :tenant 1 :notary 1} (:independence/domains ind)))))
+
+(deftest a-sound-deal-cannot-be-opened-by-any-single-party
+  (let [{:keys [deal]} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        ind (m/independence deal)]
+    (is (nil? (:independence/captured-by ind)))
+    (is (= 2 (:independence/min-domains-to-open ind)))
+    (is (= 4 (:independence/distinct-domains ind)))
+    (is (true? (:independence/sound? ind)))
+    (is (empty? (:independence/can-deny ind)))))
+
+(deftest denial-is-reported-but-is-not-a-confidentiality-failure
+  ;; A tenant that can block its own recovery is usually the design intent;
+  ;; an operator that can is a hostage situation. The library reports the
+  ;; capability and refuses to guess which one the caller meant, so `sound?`
+  ;; stays true here on purpose.
+  (let [{:keys [deal]} (mk [:tenant :tenant :tenant :operator :notary] 4)
+        ind (m/independence deal)]
+    (is (= #{:tenant} (:independence/can-deny ind)))
+    (is (nil? (:independence/captured-by ind)))
+    (is (true? (:independence/sound? ind)))))
+
+(deftest a-threshold-nobody-can-reach-is-reported-as-unopenable
+  (let [deal (assoc (:deal (mk [:a :b :c] 3)) :deal/threshold 3
+                    :deal/custodians [{:custodian/id "x" :custodian/domain :a
+                                       :custodian/share-x 1}])]
+    (is (nil? (m/min-domains-to-open deal)))
+    (is (false? (:independence/sound? (m/independence deal))))))
+
+;; -------------------------------------------------------------- quorum
+
+(deftest a-quorum-opens-and-the-result-is-verified-not-assumed
+  (let [{:keys [deal] :as d} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        r (m/open deal (releases-for d [1 3 5]) digest)]
+    (is (true? (:custody/opened? r)))
+    (is (= secret (:custody/secret r)))))
+
+(deftest a-below-threshold-quorum-is-refused-before-any-interpolation
+  (let [{:keys [deal] :as d} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        r (m/open deal (releases-for d [1 2]) digest)]
+    (is (false? (:custody/opened? r)))
+    (is (= :below-threshold (:custody/reason r)))
+    (is (nil? (:custody/secret r)))))
+
+(deftest a-mixed-epoch-quorum-is-refused
+  ;; Replaying a share released under a retired generation is the attack the
+  ;; epoch exists for, and it is refused structurally — before the digest,
+  ;; because a mixed-epoch set could in principle still hash correctly if an
+  ;; epoch bump were ever done without re-splitting.
+  (let [{:keys [deal] :as d} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        rs (releases-for d [1 2 3])
+        stale (assoc-in (vec rs) [1 :release/epoch] 1)]
+    (is (= :mixed-epoch (m/quorum-error deal stale)))
+    (is (= :mixed-epoch (:custody/reason (m/open deal stale digest))))))
+
+(deftest a-share-from-another-deal-is-refused
+  (let [{:keys [deal] :as d} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        rs (vec (releases-for d [1 2 3]))]
+    (is (= :foreign-deal
+           (m/quorum-error deal (assoc-in rs [0 :release/deal-id] "deal:other"))))
+    (is (= :foreign-secret
+           (m/quorum-error deal (assoc-in rs [2 :release/secret-id] "sec:other"))))))
+
+(deftest a-custodian-cannot-present-another-custodians-coordinate
+  (let [{:keys [deal] :as d} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        rs (vec (releases-for d [1 2 3]))]
+    (testing "the release claims custodian 1 but carries coordinate 2"
+      (is (= :custodian-share-mismatch
+             (m/quorum-error deal (assoc-in rs [0 :release/share-x] 2)))))
+    (testing "an x that belongs to no custodian at all"
+      (is (= :unknown-share-x
+             (m/quorum-error deal (-> rs
+                                      (assoc-in [0 :release/custodian-id] "did:key:nobody")
+                                      (assoc-in [0 :release/share-x] 9))))))
+    (testing "the envelope of the release and the share inside it must agree"
+      (is (= :share-x-disagreement
+             (m/quorum-error deal (assoc-in rs [0 :release/share :share/x] 4)))))
+    (testing "the same custodian twice is not two shares"
+      (is (= :duplicate-share
+             (m/quorum-error deal (conj (vec (releases-for d [1 2])) (first rs))))))))
+
+(deftest a-stale-share-fails-loudly-instead-of-yielding-a-plausible-secret
+  ;; Structurally impeccable — right deal, right epoch, right custodians —
+  ;; but one share comes from a different split of the same secret. Shamir
+  ;; alone would hand back a wrong byte vector and say nothing. This is what
+  ;; :deal/secret-digest buys.
+  (let [{:keys [deal] :as d} (mk [:operator :tenant :tenant :notary :counsel] 3)
+        other (s/split secret 3 5 (fn [n] (vec (take n (cycle [200 13 77 9])))))
+        rs (vec (releases-for d [1 2 3]))
+        swapped (assoc-in rs [2 :release/share]
+                          (first (filter #(= 3 (:share/x %)) other)))]
+    (is (nil? (m/quorum-error deal swapped)))
+    (let [r (m/open deal swapped digest)]
+      (is (false? (:custody/opened? r)))
+      (is (= :digest-mismatch (:custody/reason r)))
+      (is (nil? (:custody/secret r))))))
+
+;; ----------------------------------------------------------------- AAD
+
+(deftest share-aad-binds-every-substitution-it-claims-to
+  (let [{:keys [deal]} (mk [:operator :tenant :notary] 2)
+        base (m/share-aad deal "did:key:c1" 1)]
+    (is (string? base))
+    (testing "epoch"
+      (is (not= base (m/share-aad (update deal :deal/epoch inc) "did:key:c1" 1))))
+    (testing "custodian"
+      (is (not= base (m/share-aad deal "did:key:c2" 1))))
+    (testing "coordinate"
+      (is (not= base (m/share-aad deal "did:key:c1" 2))))
+    (testing "deal"
+      (is (not= base (m/share-aad (assoc deal :deal/id "deal:other") "did:key:c1" 1))))
+    (testing "which secret it is a share of"
+      (is (not= base (m/share-aad (assoc deal :deal/secret-id "sec:other")
+                                  "did:key:c1" 1))))))
+
+;; ------------------------------------------------------------- rotation
+
+(deftest rotation-clears-what-a-bookkeeping-rotation-would-have-kept
+  (let [{:keys [deal]} (mk [:operator :tenant :notary] 2)
+        next (m/rotate deal)]
+    (is (= 1 (:deal/epoch next)))
+    (is (empty? (:deal/custodians next)))
+    (is (nil? (:deal/secret-digest next)))
+    (testing "the shell is not a usable deal until it is re-split and re-wrapped"
+      (is (some? (m/deal-error next))))))
+
+;; ---------------------------------------------------------------- shape
+
+(deftest a-deal-that-cannot-be-opened-is-not-constructible-quietly
+  (let [{:keys [deal]} (mk [:operator :tenant :notary] 2)]
+    (is (nil? (m/deal-error deal)))
+    (is (true? (m/valid? deal)))
+    (is (= [1 2 3] (mapv :custodian/share-x (:deal/custodians deal))))
+    (is (= :missing-secret-digest (m/deal-error (dissoc deal :deal/secret-digest))))
+    (is (= :unknown-digest-alg (m/deal-error (assoc deal :deal/digest-alg :md5))))
+    (is (= :custodian-count-mismatch (m/deal-error (assoc deal :deal/total 9))))
+    (is (= :threshold-below-2 (m/deal-error (assoc deal :deal/threshold 1))))
+    (is (= :custodian-missing-domain
+           (m/deal-error (update-in deal [:deal/custodians 0]
+                                    dissoc :custodian/domain))))))

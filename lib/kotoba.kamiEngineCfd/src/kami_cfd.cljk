@@ -1,0 +1,249 @@
+(ns kami-cfd
+  "Zero-dep portable CLJC. Migrated in place from the kami-engine-cfd Rust
+  crate (`src/lib.rs`, 209 lines) as part of the repo-wide Rust-demotion /
+  clj-wgsl-migration runtime priority (com-junkawasaki/root AGENTS.md,
+  \".cljc/.kotoba ランタイム優先順位\" section, 2026-07-10 revision;
+  ADR-2607010930 \"clj-wgsl migration\" is the precedent this follows, per
+  sibling repos `kotoba-lang/mesher`/`pnr`/`rtl`/`ic-packaging`).
+
+  Note on this repo's history: on 2026-07-01 (commit `755fa13`, \"Remove Rust
+  runtime from CFD contract\") this repo deleted its Rust solver and replaced
+  it with an EDN-contract-only design (`kami-engine.cfd.contract`, still
+  present and unrelated/complementary to this namespace — it validates
+  request/result *shapes*, this namespace *is* a solver) — without ever
+  porting the actual LBM math anywhere. This namespace (plus `kami-cfd.mesh`
+  and `kami-cfd.d3`) completes that migration properly: the solver restored
+  as portable `.cljc` instead of left unimplemented. See README for the full
+  history and rationale.
+
+  Clean-room D2Q9 (2D, 9-velocity) single-relaxation-time BGK lattice-
+  Boltzmann solver. `block`/`teardrop` build a `Body` (a rectangular block or
+  tapered-teardrop shape via a solid-cell mask); `lbm-new`/`step`/`run` are
+  the `Lbm` solver (collide + stream + bounce-back momentum-exchange drag
+  measurement); `sectional-cd` is the convenience entry point. Pure math, no
+  I/O. The 3D extension (`kami-cfd.d3`, D3Q19) yields a true vehicle Cd
+  normalised by frontal area.
+
+  Performance note: `f`/`ftmp` (the 9-velocity distribution per cell) and
+  each body's `solid` mask are backed by mutable `double-array`/
+  `boolean-array` (not persistent vectors) — this mirrors the original Rust
+  `Vec<f64>`/`Vec<bool>` buffers directly and is a deliberate choice:
+  collide/stream touches every cell every step across thousands of steps,
+  and persistent-vector copies would make that O(cells) per step instead of
+  O(1). `aget`/`aset`/`double-array`/`int-array` are portable
+  (`boolean-array` is NOT — see `bool-array` below)
+  across JVM Clojure, ClojureScript, and nbb. `Lbm`/`Body` values are plain
+  immutable maps threading these mutable buffers through — 'swapping
+  f/ftmp' (as the Rust `std::mem::swap` did) is a cheap `assoc` of array
+  references, not a data copy.")
+
+;; ---------------------------------------------------------------------------
+;; D2Q9 lattice constants
+;; ---------------------------------------------------------------------------
+
+
+;; ---------------------------------------------------------------------------
+;; Portable boolean array (2026-07-27 portability fix).
+;;
+;; `boolean-array` is a JVM-only Clojure primitive — cljs.core has
+;; `int-array`/`double-array`/`object-array` but NO `boolean-array`. Both this
+;; repo's solvers used it for the solid mask, so **neither actually loaded on
+;; ClojureScript/nbb**, despite the docstrings and README claiming JVM/cljs/nbb
+;; portability. The claim was never exercised because the only runner was the
+;; JVM `.clj` CLI and JVM tests.
+;;
+;; A `js/Uint8Array` would be the obvious cljs substitute and is WRONG here:
+;; in ClojureScript `0` is truthy, so `(if (aget solid n) ...)` would treat
+;; every empty cell as solid and the whole domain would silently become a
+;; block of metal. A real JS array filled with `false` keeps the truthiness
+;; semantics the solver relies on.
+;; ---------------------------------------------------------------------------
+
+(defn bool-array
+  "`n`-element mutable boolean array, `false`-filled, portable across JVM and
+  ClojureScript. See the note above for why Uint8Array is not usable."
+  [n]
+  #?(:clj (boolean-array (long n) false)
+     :cljs (.fill (js/Array. n) false)))
+
+(def ^:private ex (int-array [0 1 0 -1 0 1 -1 -1 1]))
+(def ^:private ey (int-array [0 0 1 0 -1 1 1 -1 -1]))
+(def ^:private w (double-array [(/ 4.0 9.0)
+                                 (/ 1.0 9.0) (/ 1.0 9.0) (/ 1.0 9.0) (/ 1.0 9.0)
+                                 (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0)]))
+;; Opposite-direction index, for bounce-back.
+(def ^:private opp (int-array [0 3 4 1 2 7 8 5 6]))
+
+(defn- feq [i rho ux uy]
+  (let [exi (aget ^ints ex i) eyi (aget ^ints ey i)
+        eu (+ (* exi ux) (* eyi uy))
+        usq (+ (* ux ux) (* uy uy))]
+    (* (aget ^doubles w i) rho (+ 1.0 (* 3.0 eu) (* 4.5 eu eu) (* -1.5 usq)))))
+
+;; ---------------------------------------------------------------------------
+;; Body — a 2D profile placed in the channel, defined by a solid mask
+;; ---------------------------------------------------------------------------
+
+(defn- solid-at? [body x y]
+  (aget ^booleans (:solid body) (+ (* y (long (:nx body))) x)))
+
+(defn block
+  "A rectangular block of width `w`, height `h`, leading edge at `x0`,
+  vertically centred — the bluff/squareback reference."
+  [nx ny x0 w h]
+  (let [solid (bool-array (* nx ny))
+        y0 (quot (- ny h) 2)
+        x-hi (min (+ x0 w) nx)
+        y-hi (min (+ y0 h) ny)]
+    (doseq [x (range x0 x-hi) y (range y0 y-hi)]
+      (aset solid (+ (* y nx) x) true))
+    {:nx nx :ny ny :solid solid :height h}))
+
+(defn teardrop
+  "A tapered teardrop of the same frontal height `h`, length `len`, tail
+  shrinking linearly to a point — the streamlined reference."
+  [nx ny x0 len h]
+  (let [solid (bool-array (* nx ny))
+        cy (quot ny 2)]
+    (loop [k 0]
+      (when (< k len)
+        (let [x (+ x0 k)]
+          (when (< x nx)
+            ;; full height at the nose, tapering to ~0 at the tail
+            (let [frac (- 1.0 (/ (double k) (double len)))
+                  half (long #?(:clj (Math/round (double (* h 0.5 frac)))
+                                :cljs (js/Math.round (* h 0.5 frac))))
+                  y-lo (max 0 (- cy half))
+                  y-hi (min (dec ny) (+ cy half))]
+              (doseq [y (range y-lo (inc y-hi))]
+                (aset solid (+ (* y nx) x) true)))
+            (recur (inc k))))))
+    {:nx nx :ny ny :solid solid :height h}))
+
+;; ---------------------------------------------------------------------------
+;; Lbm — D2Q9 BGK lattice-Boltzmann solver over a channel with a body
+;; ---------------------------------------------------------------------------
+
+(defn lbm-new
+  "Build a solver for a body at inflow speed set by `re` (Reynolds number on
+  the body height). `u0` lattice velocity kept small for stability."
+  [body re]
+  (let [nx (:nx body) ny (:ny body)
+        u0 0.05
+        nu (/ (* u0 (double (:height body))) re) ; nu = u0*D/Re
+        tau (+ 0.5 (* 3.0 nu))
+        n-cells (* nx ny)
+        f (double-array (* n-cells 9))]
+    (dotimes [n n-cells]
+      (dotimes [i 9] (aset ^doubles f (+ (* n 9) i) (double (feq i 1.0 u0 0.0)))))
+    {:nx nx :ny ny :tau tau :u0 u0 :f f :ftmp (aclone f) :body body}))
+
+(defn macros
+  "[rho ux uy] at cell index `n`. Public so consumers can probe the flow
+  field (density, velocity) at any cell — e.g. kotoba.biomech.hemodynamics
+  reading back a velocity probe without re-implementing the moment sum."
+  [f n]
+  (loop [i 0 rho 0.0 mx 0.0 my 0.0]
+    (if (< i 9)
+      (let [fi (aget ^doubles f (+ (* n 9) i))]
+        (recur (inc i) (+ rho fi) (+ mx (* fi (aget ^ints ex i))) (+ my (* fi (aget ^ints ey i)))))
+      (if (<= rho 0.0) [1.0 0.0 0.0] [rho (/ mx rho) (/ my rho)]))))
+
+(defn cell-at
+  "[rho ux uy] at lattice position (x, y), or nil if (x, y) is solid or
+  out of range. A thin (x, y) wrapper over `macros`."
+  [lbm x y]
+  (let [{:keys [nx ny f body]} lbm]
+    (when (and (<= 0 x) (< x nx) (<= 0 y) (< y ny)
+               (not (solid-at? body x y)))
+      (macros f (+ (* y nx) x)))))
+
+(defn velocity-at
+  "[ux uy] at lattice position (x, y), or nil if the cell is solid / out of
+  range. Use to read back a flow probe after stepping."
+  [lbm x y]
+  (some-> (cell-at lbm x y) rest vec))
+
+(defn density-at
+  "Density rho at lattice position (x, y), or nil if solid / out of range."
+  [lbm x y]
+  (first (cell-at lbm x y)))
+
+(defn- apply-boundaries!
+  "Left inflow (equilibrium at u0), right outflow (zero-gradient). Mutates
+  `(:f lbm)` in place."
+  [lbm]
+  (let [{:keys [nx ny u0 body]} lbm f (:f lbm)]
+    (dotimes [y ny]
+      (let [n (* y nx)]
+        (when-not (solid-at? body 0 y)
+          (dotimes [i 9] (aset ^doubles f (+ (* n 9) i) (double (feq i 1.0 u0 0.0)))))
+        (let [no (+ n (dec nx)) np (+ n (- nx 2))]
+          (when-not (solid-at? body (dec nx) y)
+            (dotimes [i 9] (aset ^doubles f (+ (* no 9) i) (aget ^doubles f (+ (* np 9) i)))))))))
+  lbm)
+
+(defn step
+  "One collide + stream step. Returns `[lbm' drag]` where `drag` is the
+  x-drag on the body this step (momentum exchanged at bounce-back links) and
+  `lbm'` is the updated solver state (f/ftmp swapped + boundaries
+  re-applied — same mutable arrays, new map wrapper, mirroring the Rust
+  `&mut self` + `mem::swap`)."
+  [lbm]
+  (let [{:keys [nx ny tau body]} lbm
+        f (:f lbm) ftmp (:ftmp lbm)]
+    ;; collision (BGK), in place
+    (dotimes [y ny]
+      (dotimes [x nx]
+        (when-not (solid-at? body x y)
+          (let [n (+ (* y nx) x)
+                [rho ux uy] (macros f n)]
+            (dotimes [i 9]
+              (let [idx (+ (* n 9) i)
+                    fi (aget ^doubles f idx)]
+                (aset ^doubles f idx (double (- fi (/ (- fi (feq i rho ux uy)) tau))))))))))
+    ;; streaming + bounce-back, accumulating drag
+    (dotimes [k (alength ^doubles ftmp)] (aset ^doubles ftmp k 0.0))
+    (let [drag (atom 0.0)]
+      (dotimes [y ny]
+        (dotimes [x nx]
+          (when-not (solid-at? body x y)
+            (let [n (+ (* y nx) x)]
+              (dotimes [i 9]
+                (let [xn (+ x (aget ^ints ex i)) yn (+ y (aget ^ints ey i))
+                      idx (+ (* n 9) i)
+                      fi (aget ^doubles f idx)]
+                  (cond
+                    ;; walls (top/bottom) and out-of-range -> bounce back to self
+                    (or (< yn 0) (>= yn ny) (< xn 0) (>= xn nx))
+                    (let [oidx (+ (* n 9) (aget ^ints opp i))]
+                      (aset ^doubles ftmp oidx (+ (aget ^doubles ftmp oidx) fi)))
+
+                    ;; bounce-back off the body; momentum exchange (Ladd)
+                    (solid-at? body xn yn)
+                    (let [oidx (+ (* n 9) (aget ^ints opp i))]
+                      (aset ^doubles ftmp oidx (+ (aget ^doubles ftmp oidx) fi))
+                      (swap! drag + (* 2.0 (aget ^ints ex i) fi)))
+
+                    :else
+                    (let [nidx (+ (* (+ (* yn nx) xn) 9) i)]
+                      (aset ^doubles ftmp nidx (+ (aget ^doubles ftmp nidx) fi))))))))))
+      (let [lbm' (-> lbm (assoc :f ftmp :ftmp f) apply-boundaries!)]
+        [lbm' @drag]))))
+
+(defn run
+  "Run `steps` and return the sectional drag coefficient, averaged over the
+  last 20% of steps. Cd = F_x / (0.5*rho*u0^2*D), rho ~= 1."
+  [lbm steps]
+  (let [tail (max (quot steps 5) 1)]
+    (loop [s 0 lbm lbm sum 0.0]
+      (if (>= s steps)
+        (let [favg (/ sum tail)]
+          (/ favg (* 0.5 (:u0 lbm) (:u0 lbm) (double (:height (:body lbm))))))
+        (let [[lbm' drag] (step lbm)]
+          (recur (inc s) lbm' (if (>= s (- steps tail)) (+ sum drag) sum)))))))
+
+(defn sectional-cd
+  "Convenience: sectional Cd of a body at a Reynolds number."
+  [body re steps]
+  (run (lbm-new body re) steps))

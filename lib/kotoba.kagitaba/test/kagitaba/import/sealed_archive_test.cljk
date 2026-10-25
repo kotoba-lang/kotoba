@@ -1,0 +1,132 @@
+(ns kagitaba.import.sealed-archive-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
+            [kagitaba.import.sealed-archive :as sealed]))
+
+(def digest "sha256:ciphertext")
+(def decrypt-calls (atom 0))
+
+(def request
+  {:envelope {:envelope/algorithms [:x25519 :ml-kem-768 :aes-256-gcm]
+              :envelope/provider {:provider/id :qualified-provider
+                                  :provider/fips-validated false}
+              :envelope/epoch 2 :envelope/kem? true :envelope/hybrid? true}
+   :ciphertext [1 2 3] :ciphertext-digest digest
+   :ciphertext-size-fn count :max-ciphertext-bytes 1024
+   :verify-digest-fn (fn [bytes expected]
+                       (and (= [1 2 3] bytes) (= digest expected)))
+   :decrypt-fn (fn [_ _] (swap! decrypt-calls inc) :plaintext)
+   :capability-token
+   {:capability/version 1 :capability/audience :kagitaba/import
+    :capability/subject :local-user :capability/actions #{:secret-archive/import}
+    :capability/resources #{digest} :capability/request-digest digest
+    :capability/not-before-ms 1000 :capability/expires-at-ms 2000
+    :capability/nonce "sealed-1" :capability/signature [:valid digest]}
+   :capability-context
+   {:subject :local-user :now-ms 1500 :consume-nonce-fn (constantly true)
+    :verify-signature-fn
+    (fn [body signature] (= signature [:valid (:capability/request-digest body)]))}
+   :hardware-signing-evidence
+   {:provider-id :apple-secure-enclave :hardware-backed? true
+    :provider-origin-verified? true :private-exported? false
+    :sign-verified? true :unavailable-failed-closed? true}
+   :audit-receipt
+   {:receipt/version 1 :receipt/environment :production
+    :receipt/authority-id :import-audit :receipt/artifact-digest digest
+    :receipt/issued-at-ms 1500 :receipt/signature [:valid digest]}
+   :receipt-context
+   {:environment :production :authority-id :import-audit :now-ms 1600
+    :max-age-ms 500
+    :verify-signature-fn
+    (fn [body signature] (= signature [:valid (:receipt/artifact-digest body)]))}
+   :abac-attributes
+   {:subject {:id :local-user :role :vault-owner :clearance :restricted
+              :tenant "personal"}
+    :resource {:tenant "personal" :trust :secret-archive
+               :classification :restricted}
+    :environment {:surface :local-import :network-zone :isolated
+                  :device-trusted? true}
+    :purpose :vault-migration}
+   :abac-policy
+   {:policy/id :kagitaba/sealed-import
+    :subject/ids #{:local-user} :subject/roles #{:vault-owner}
+    :resource/ids #{digest} :resource/trust #{:secret-archive}
+    :action/ids #{:secret-archive/import}
+    :action/capabilities #{:archive/decrypt}
+    :environment/surfaces #{:local-import}
+    :environment/network-zones #{:isolated}
+    :environment/require-device-trust? true
+    :purpose/allowed #{:vault-migration} :tenant/isolation? true}
+   :approvals
+   [{:approval/version 1 :approval/approver :alice :approval/role :security
+     :approval/request-digest digest :approval/not-before-ms 1000
+     :approval/expires-at-ms 2000 :approval/signature [:valid :alice digest]}
+    {:approval/version 1 :approval/approver :bob :approval/role :vault-owner
+     :approval/request-digest digest :approval/not-before-ms 1000
+     :approval/expires-at-ms 2000 :approval/signature [:valid :bob digest]}]
+   :approval-context
+   {:initiator :local-user :required-roles #{:security :vault-owner}
+    :min-approvals 2 :now-ms 1500
+    :verify-signature-fn
+    (fn [body signature]
+      (= signature [:valid (:approval/approver body)
+                    (:approval/request-digest body)]))}
+   :restore-receipt
+   {:restore-drill/status :passed :restore-drill/destructive? true
+    :restore-drill/sites #{:region-a :region-b}
+    :restore-drill/backups-encrypted? true
+    :restore-drill/backups-immutable? true
+    :restore-drill/artifact-digest digest
+    :restore-drill/digest-verified? true
+    :restore-drill/rto-ms 40 :restore-drill/rto-limit-ms 100
+    :restore-drill/rpo-ms 20 :restore-drill/rpo-limit-ms 60}
+   :restore-attestation
+   {:receipt/version 1 :receipt/environment :production
+    :receipt/authority-id :recovery-operations
+    :receipt/artifact-digest digest :receipt/issued-at-ms 1500
+    :receipt/signature [:valid digest]}
+   :restore-attestation-context
+   {:environment :production :authority-id :recovery-operations
+    :now-ms 1600 :max-age-ms 500
+    :verify-signature-fn
+    (fn [body signature]
+      (= signature [:valid (:receipt/artifact-digest body)]))}})
+
+(deftest hybrid-ciphertext-is-admitted-before-decryption
+  (reset! decrypt-calls 0)
+  (is (= :plaintext (:sealed-import/plaintext
+                     (sealed/decrypt-admitted! request))))
+  (is (= 1 @decrypt-calls)))
+
+(deftest downgrade-tamper-and-missing-evidence-never-reach-decryptor
+  (doseq [bad [(assoc-in request [:envelope :envelope/algorithms] [:x25519])
+               (assoc-in request [:envelope :envelope/hybrid?] false)
+               (assoc-in request [:envelope :envelope/epoch] 0)
+               (assoc request :ciphertext [])
+               (assoc request :verify-digest-fn (constantly false))
+               (dissoc request :verify-digest-fn)
+               (assoc request :max-ciphertext-bytes 2)
+               (dissoc request :ciphertext-size-fn)
+               (assoc-in request [:abac-attributes :subject :id] :attacker)
+               (assoc-in request [:abac-attributes :environment
+                                  :device-trusted?] false)
+               (assoc request :approvals [(first (:approvals request))])
+               (assoc-in request [:approvals 1 :approval/approver] :alice)
+               (assoc-in request [:restore-receipt
+                                  :restore-drill/backups-immutable?] false)
+               (assoc-in request [:restore-receipt :restore-drill/sites]
+                         #{:region-a})
+               (assoc-in request [:restore-attestation :receipt/signature]
+                         [:forged])
+               (assoc-in request [:audit-receipt :receipt/artifact-digest]
+                         "sha256:other")]]
+    (reset! decrypt-calls 0)
+    (is (false? (:sealed-import/allowed? (sealed/evaluate bad))))
+    (is (thrown-with-msg? kerror/ExceptionInfo
+                          #"sealed archive import denied"
+                          (sealed/decrypt-admitted! bad)))
+    (is (zero? @decrypt-calls))))
+
+(deftest missing-decryptor-fails-after-admission-without-plaintext
+  (is (thrown-with-msg? kerror/ExceptionInfo
+                        #"sealed archive decryptor required"
+                        (sealed/decrypt-admitted! (dissoc request :decrypt-fn)))))

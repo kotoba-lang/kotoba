@@ -1,0 +1,173 @@
+(ns kagami.source-publication
+  "Grouped publication contracts. Reuses kagami CI signatures, pin admission,
+   genpon events and west projection. Authority comes from committed policy."
+  (:require [kotoba.lang.text :as str]
+            [kagami.source :as s]
+            [kagami.ci :as ci]
+            [kagami.db :as db]
+            [kagami.did :as did]
+            [kagami.pin :as pin]))
+
+(def policy-path "manifest/source-policy.edn")
+(def lock-path "manifest/source-lock.edn")
+(def snapshot-path "manifest/source-snapshot.edn")
+(def publication-path "manifest/source-publication.edn")
+(def state-paths ["manifest/west.yml" "manifest/fleet-db.edn"
+                  "manifest/fleet-db.ledger.edn" "manifest/fleet-head.edn" lock-path])
+
+(defn policy! [p]
+  (s/fields! p #{:policy/version :policy/channel :policy/ref :policy/required
+                 :policy/publishers :policy/runners :policy/reviewers :policy/inputs :policy/sources}
+             #{:policy/delta-path})
+  (s/require! (and (= 1 (:policy/version p)) (s/segment? (:policy/channel p))
+                    (string? (:policy/ref p)) (str/starts-with? (:policy/ref p) "refs/heads/"))
+                :invalid-publication-policy {})
+  (doseq [k [:policy/required :policy/publishers :policy/runners]]
+    (s/unique-vector! (get p k) #(and (string? %) (not (str/blank? %))))
+    (s/require! (seq (get p k)) :empty-policy-requirement {:field k}))
+  (s/fields! (:policy/inputs p) #{:inputs/toolchain :inputs/environment :inputs/checks :inputs/target} #{})
+  (doseq [k [:inputs/toolchain :inputs/environment :inputs/checks]]
+    (s/require! (s/cid? (get-in p [:policy/inputs k])) :invalid-policy-input {:field k}))
+  (s/text! (get-in p [:policy/inputs :inputs/target]))
+  (s/require! (and (map? (:policy/reviewers p)) (map? (:policy/sources p))) :invalid-policy {})
+  (doseq [[repo reviewers] (:policy/reviewers p)]
+    (s/require! (s/repo-id? repo) :invalid-review-scope {})
+    (s/unique-vector! reviewers string?)
+    (s/require! (seq reviewers) :empty-review-authority {}))
+  (doseq [[repo provider] (:policy/sources p)]
+    (s/require! (s/repo-id? repo) :invalid-source-authority {})
+    (case (:provider provider)
+      :github (s/fields! provider #{:provider} #{})
+      :git (do (s/fields! provider #{:provider :url :ref} #{})
+               (s/require! (and (string? (:url provider))
+                                (or (s/remote-url? (:url provider))
+                                    (re-matches #"file:///[^\s]+" (:url provider)))
+                                (string? (:ref provider)) (str/starts-with? (:ref provider) "refs/heads/"))
+                           :invalid-source-authority {}))
+      (throw (ex-info "unsupported source authority" {:reason :unsupported-source-authority})))) p)
+
+(defn check-plan [snapshot revision policy]
+  (policy! policy) (s/kind! snapshot :snapshot) (s/kind! revision :revision)
+  {:plan/version 1 :plan/snapshot (:source/cid snapshot) :plan/revision (:source/cid revision)
+   :plan/policy (s/value-cid policy) :plan/required (:policy/required policy)})
+
+(defn inputs [snapshot policy]
+  (assoc (:policy/inputs policy) :inputs/snapshot (:source/cid snapshot)))
+
+(defn subject [snapshot revision policy]
+  {:source/snapshot (:source/cid snapshot) :source/revision (:source/cid revision)
+   :source/plan (s/value-cid (check-plan snapshot revision policy))
+   :source/inputs (s/value-cid (inputs snapshot policy))})
+
+(defn evidence [snapshot revision policy signed-ci]
+  (let [e {:evidence/version 1 :evidence/inputs (inputs snapshot policy) :evidence/ci signed-ci}]
+    (assoc e :evidence/cid (s/value-cid e))))
+
+(defn verify-evidence! [e snapshot revision policy hash-fn verify-fn]
+  (s/fields! e #{:evidence/version :evidence/inputs :evidence/ci :evidence/cid} #{})
+  (let [signed (:evidence/ci e) receipt (:receipt signed)]
+    (s/fields! signed #{:receipt :cid :signature :signer} #{})
+    (s/fields! receipt #{:ci/subject :ci/checks :ci/required :ci/passed :ci/outcome :ci/policy :ci/at :ci/parent} #{})
+    (s/require! (vector? (:ci/checks receipt)) :invalid-check-results {})
+    (s/unique-vector! (mapv :name (:ci/checks receipt)) string?)
+    (doseq [check (:ci/checks receipt)]
+      (s/fields! check #{:name :outcome} #{:detail})
+      (s/require! (#{:pass :fail :skip} (:outcome check)) :invalid-check-outcome {}))
+    (s/require! (and (= 1 (:evidence/version e))
+                     (= (:evidence/cid e) (s/value-cid (dissoc e :evidence/cid)))
+                     (= (inputs snapshot policy) (:evidence/inputs e))
+                     (= (subject snapshot revision policy) (:ci/subject receipt))
+                     (= (s/value-cid policy) (:ci/policy receipt))
+                     (= (set (:policy/required policy)) (:ci/required receipt))
+                     (= (:ci/passed receipt) (:passed (ci/verdict (:ci/checks receipt) (:ci/required receipt))))
+                     (= :pass (:ci/outcome receipt))
+                     ((set (:policy/runners policy)) (:signer signed))
+                     (:ok? (ci/verify-receipt hash-fn verify-fn signed (:signer signed))))
+                 :evidence-invalid-or-untrusted {})) e)
+
+(defn review-payload [review] (s/canonical-str (dissoc review :review/signature :review/cid)))
+(defn review [snapshot revision policy repos signer sign-fn]
+  (s/unique-vector! repos s/repo-id?)
+  (let [r {:review/version 1 :review/snapshot (:source/cid snapshot)
+           :review/revision (:source/cid revision) :review/policy (s/value-cid policy)
+           :review/repos repos :review/signer signer}
+        signed (assoc r :review/signature (sign-fn (review-payload r)))]
+    (assoc signed :review/cid (s/value-cid signed))))
+
+(defn verify-reviews! [reviews snapshot revision policy verify-fn]
+  (s/require! (and (vector? reviews) (seq reviews)) :owner-approval-missing {})
+  (let [changed (set (map :repo/id (get-in revision [:source/value :revision/changes])))
+        covered
+        (reduce
+         (fn [covered r]
+           (s/fields! r #{:review/version :review/snapshot :review/revision :review/policy
+                          :review/repos :review/signer :review/signature :review/cid} #{})
+           (s/unique-vector! (:review/repos r) changed)
+           (s/require! (and (= 1 (:review/version r))
+                            (= (:review/cid r) (s/value-cid (dissoc r :review/cid)))
+                            (= (:source/cid snapshot) (:review/snapshot r))
+                            (= (:source/cid revision) (:review/revision r))
+                            (= (s/value-cid policy) (:review/policy r))
+                            (verify-fn (:review/signer r) (review-payload r) (:review/signature r)))
+                        :review-invalid {})
+           (doseq [repo (:review/repos r)]
+             (s/require! ((set (get-in policy [:policy/reviewers repo])) (:review/signer r))
+                         :reviewer-not-authorized {:repo repo}))
+           (into covered (:review/repos r))) #{} reviews)]
+    (s/require! (= changed covered) :owner-approval-missing {:uncovered (vec (remove covered changed))})) reviews)
+
+(defn verify-candidate! [base candidate revision lock]
+  (s/kind! base :snapshot) (s/kind! candidate :snapshot) (s/kind! revision :revision)
+  (s/require! (= candidate (s/candidate base revision lock)) :candidate-scope-mismatch {}) candidate)
+
+(defn last-pin [ledger name]
+  (when-let [e (last (filter #(and (#{:pin/advance-signed :pin/advance-quorum} (:event/type %))
+                                   (= name (get-in % [:pin/record :pin/name]))) ledger))]
+    {:record (:pin/record e)
+     :signature (or (:pin/signature e) (:signature (first (sort-by :signer (:pin/signatures e)))))}))
+
+(defn advance
+  "All source authorities have already returned positive forward/reachability
+   proofs. Reuse pin/admit strictly; warn-accept can never publish a group."
+  [db ledger candidate revision signer sign-fn hash-fn verify-fn at]
+  (let [repos (into {} (map (juxt :repo/id identity)) (get-in candidate [:source/value :snapshot/repos]))
+        pubhex (did/did->pubkey-hex signer) pin-signer (str "ed25519:" pubhex)]
+    (reduce
+     (fn [{:keys [db ledger]} c]
+       (let [repo (repos (:repo/id c)) name (:repo/name repo) current (last-pin ledger name)
+             record (pin/make-record
+                     {:repo name :value (get-in c [:revision/new :hex])
+                      :sequence (inc (get-in current [:record :pin/sequence] 0))
+                      :parent (when current (pin/record-hash hash-fn (:record current) (:signature current)))})
+             sig (sign-fn (pin/canonical-str record))
+             proposal {:record record :signature sig :signer pin-signer}
+             verdict (pin/admit proposal
+                       {:repo-path (:repo/id c) :current current
+                        :keyring {:keys {pin-signer {:grants #{(:repo/id c)}}}}
+                        :hash-fn hash-fn :verify-fn #(verify-fn (did/pubkey-hex->did %1) %2 %3)
+                        :reachable? true :value-advance? true})
+             _ (s/require! (= :accept (:verdict verdict)) :pin-admission-failed {:verdict verdict})
+             event (assoc (pin/accepted-event proposal verdict (db/next-seq ledger) at)
+                          :repo/name name :pin/old (get-in c [:revision/old :hex])
+                          :pin/new (get-in c [:revision/new :hex])
+                          :source/snapshot (:source/cid candidate) :source/revision (:source/cid revision))]
+         {:db (db/apply-pin-advance db event) :ledger (conj ledger event)}))
+     {:db db :ledger ledger} (get-in revision [:source/value :revision/changes]))))
+
+(defn publication-payload [p] (s/canonical-str (dissoc p :publication/signature :publication/cid)))
+(defn sign-publication [value signer sign-fn]
+  (let [p (assoc value :publication/version 1 :publication/signer signer)
+        signed (assoc p :publication/signature (sign-fn (publication-payload p)))]
+    (assoc signed :publication/cid (s/value-cid signed))))
+
+(defn verify-publication! [p policy verify-fn]
+  (s/fields! p #{:publication/version :publication/signer :publication/signature :publication/cid
+                 :publication/parent :publication/manifest-parent :publication/remote-url :publication/base :publication/snapshot
+                 :publication/revision :publication/policy :publication/projections
+                 :publication/evidence :publication/reviews} #{})
+  (s/require! (and (= 1 (:publication/version p))
+                   (= (:publication/cid p) (s/value-cid (dissoc p :publication/cid)))
+                   (= (s/value-cid policy) (:publication/policy p))
+                   ((set (:policy/publishers policy)) (:publication/signer p))
+                   (verify-fn (:publication/signer p) (publication-payload p) (:publication/signature p)))
+               :publication-invalid-or-untrusted {}) p)

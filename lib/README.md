@@ -105,6 +105,40 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
+| `kotoba.kamiEngineCfd` | `kotoba.kamiEngineCfd/src` | `kami-cfd`, `kami-cfd.d3`, `kami-cfd.duct`, `kami-cfd.mesh` (Kotoba project library) |
+| `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |
+| `kotoba.kamiCadImport` | `kotoba.kamiCadImport/src` | `cad-import`, `cad-import.demos`, `cad-import.demos.roadster`, `cad-import.demos.synth-sedan` (Kotoba project library) |
+| `kotoba.kamiAutodrive` | `kotoba.kamiAutodrive/src` | `autodrive`, `autodrive.autopilot`, `autodrive.classes`, `autodrive.control` (Kotoba project library) |
+| `kotoba.kamiAppShibuya` | `kotoba.kamiAppShibuya/src` | `kotoba.shibuya` (Kotoba project library) |
+| `kotoba.kamiAppIsekai` | `kotoba.kamiAppIsekai/src` | `kami-app-isekai`, `kami-app-isekai.heightmap-color`, `kami-app-isekai.omniverse`, `kami-app-isekai.pipelines` (Kotoba project library) |
+| `kotoba.kamiAppFixtures` | `kotoba.kamiAppFixtures/src` | `kami.app-fixtures`, `kami.provider.contract` (Kotoba project library) |
+| `kotoba.kagitaba` | `kotoba.kagitaba/src` | `kagitaba.capability`, `kagitaba.category`, `kagitaba.contract`, `kagitaba.field` (Kotoba project library) |
+| `kotoba.kagami` | `kotoba.kagami/src` | `kagami.ci`, `kagami.db`, `kagami.did`, `kagami.governor-bridge` (Kotoba project library) |
+| `kotoba.jpGoDigitalDesignSystem` | `kotoba.jpGoDigitalDesignSystem/src` | `jp-go-dds.behavior`, `jp-go-dds.core`, `jp-go-dds.css`, `jp-go-dds.dark` (Kotoba project library) |
+| `kotoba.iso3166` | `kotoba.iso3166/src` | `kotoba.iso3166`, `kotoba.iso3166.embedded` (Kotoba project library) |
+| `kotoba.ioplan` | `kotoba.ioplan/src` | `ioplan.core` (Kotoba project library) |
+| `kotoba.ioFilecoinSigner` | `kotoba.ioFilecoinSigner/src` | `filecoin.signer`, `filecoin.signer.bls`, `filecoin.signer.eth` (Kotoba project library) |
+| `kotoba.ioFilecoinNode` | `kotoba.ioFilecoinNode/src` | `filecoin.node.actors`, `filecoin.node.basefee`, `filecoin.node.block`, `filecoin.node.mpool` (Kotoba project library) |
+| `kotoba.industry` | `kotoba.industry/src` | `kotoba.industry`, `kotoba.industry.embedded`, `kotoba.industry.wave` (Kotoba project library) |
+| `kotoba.ieFlow` | `kotoba.ieFlow/src` | `etzhayyim.ie-flow.boundary`, `etzhayyim.ie-flow.colony`, `etzhayyim.ie-flow.control`, `etzhayyim.ie-flow.coscientist` (Kotoba project library) |
+| `kotoba.i18nCid` | `kotoba.i18nCid/src` | `i18n-cid.core`, `i18n-cid.pack`, `i18n-cid.pin`, `i18n-cid.seam` (Kotoba project library) |
+| `kotoba.i18n` | `kotoba.i18n/src` | `i18n.core`, `i18n.messages`, `i18n.plural`, `i18n.re-frame` (Kotoba project library) |
+| `kotoba.hls` | `kotoba.hls/src` | `kotoba.hls`, `kotoba.hls.player`, `kotoba.hls.view` (Kotoba project library) |
+| `kotoba.erasure` | `kotoba.erasure/src` | `erasure.codec`, `erasure.gf`, `erasure.kotoba-oracle`, `erasure.lrc` (Kotoba project library) |
+| `kotoba.ekycNativeProvider` | `kotoba.ekycNativeProvider/src` | `ekyc-native-provider.core`, `ekyc-native-provider.ports` (Kotoba project library) |
+| `kotoba.mrz` | `kotoba.mrz/src` | `mrz.adapters.template-ocr`, `mrz.checksum`, `mrz.core`, `mrz.glyph` (Kotoba project library) |
+| `kotoba.dtn` | `kotoba.dtn/src` | `kotoba.dtn`, `kotoba.dtn.auth`, `kotoba.dtn.discovery`, `kotoba.dtn.discovery.presence` (Kotoba project library) |
+| `kotoba.ioLibp2p` | `kotoba.ioLibp2p/src` | `goog.crypt.Sha256`, `kotoba.net.bitswap`, `kotoba.net.gossip`, `kotoba.net.ipns-router` (Kotoba project library) |
+| `kotoba.noise` | `kotoba.noise/src` | `noise.blake2s`, `noise.cipher-state`, `noise.core`, `noise.handshake-state` (Kotoba project library) |
+| `kotoba.domainBilling` | `kotoba.domainBilling/src` | `domain-billing.core` (Kotoba project library) |
+| `kotoba.docs` | `kotoba.docs/src` | `docs.docx`, `docs.html`, `docs.markdown`, `docs.model` (Kotoba project library) |
+| `kotoba.custody` | `kotoba.custody/src` | `custody.model`, `custody.seal`, `custody.shamir` (Kotoba project library) |
+| `kotoba.crowdfunding` | `kotoba.crowdfunding/src` | `crowdfunding.campaign`, `crowdfunding.collection`, `crowdfunding.discovery`, `crowdfunding.fee` (Kotoba project library) |
+| `kotoba.chobo` | `kotoba.chobo/src` | `chobo.events`, `chobo.invoice`, `chobo.ledger`, `chobo.ssr` (Kotoba project library) |
+| `kotoba.appkit` | `kotoba.appkit/src` | `appkit.core` (Kotoba project library) |
+| `kotoba.kotobaUi` | `kotoba.kotobaUi/src` | `kotoba-ui.core`, `kotoba-ui.product`, `kotoba-ui.shell`, `kotoba-ui.shell.style` (Kotoba project library) |
+| `kotoba.liquidGlassUi` | `kotoba.liquidGlassUi/src` | `liquid-glass.components`, `liquid-glass.demo`, `liquid-glass.style`, `liquid-glass.tokens` (Kotoba project library) |
 | `kotoba.marketplace` | `kotoba.marketplace/src` | `marketplace.acceptance`, `marketplace.buyer`, `marketplace.catalog`, `marketplace.crossborder` (Kotoba project library) |
 | `kotoba.kamiNvCompat` | `kotoba.kamiNvCompat/src` | `kotoba.lang.kami-nv-compat.actions.action-term`, `kotoba.lang.kami-nv-compat.actions.articulated-env`, `kotoba.lang.kami-nv-compat.actions.task-space-actions`, `kotoba.lang.kami-nv-compat.alpamayo` (Kotoba project library) |
 | `kotoba.ioAlembic` | `kotoba.ioAlembic/src` | `alembic.objects`, `alembic.properties`, `ogawa.core` (Kotoba project library) |

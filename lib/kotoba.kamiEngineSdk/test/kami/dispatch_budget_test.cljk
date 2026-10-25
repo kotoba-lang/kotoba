@@ -1,0 +1,121 @@
+(ns kami.dispatch-budget-test
+  "Phase 3.3 — wasmi dispatch-budget invariant (ADR-2607010930).
+
+  This test guards the wasmi no-JIT constraint at the CLJ tick layer. The
+  structural hazard it pins: `kami.schedule/run-schedule` must dispatch
+  per-system (coarse-grained), NEVER per-entity. Under wasmi — which has no
+  JIT — a regression that makes the runner iterate per-entity would make every
+  iOS/console CLJ-WASM tick O(N) in entity count: the host would call into CLJ
+  once per entity per system per tick, blowing the frame budget as scenes grow.
+
+  The correct shape (asserted here): for K ticks over a world with M entities
+  matching a system's `:query`, the system fn is invoked exactly K times
+  (once per tick) — NOT K×M times (once per entity per tick). Per-entity work
+  is the system fn's job, which dispatches a bulk buffer to WGSL/native compute
+  rather than looping per-entity in CLJ on the hot path. The runner hands the
+  fn the whole queried entity seq each tick (batched); the fn's body, not the
+  runner, decides what to do with it.
+
+  See ADR-2607010930 Phase 3.3 and ARCHITECTURE.md §10. The single-tick
+  coarse-grain is already pinned by `kami.schedule-test`; this namespace pins
+  the multi-tick dispatch budget — the budget grows linearly with tick count,
+  never with tick-count × entity-count."
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kami.ecs      :as ecs]
+            [kami.schedule :as sched]))
+
+;; --- fixtures ---------------------------------------------------------------
+
+(defn matching-world
+  "An ECS world with `m` entities, every one carrying `:transform` and
+  `:velocity` (so all `m` match the `#{:transform :velocity}` query). Bare
+  keywords for component keys, matching `kami.schedule-test`'s convention."
+  [m]
+  (let [ents (map (fn [i]
+                    {:kami/eid   (str "eid-" (inc i))
+                     :transform  {:translation [i 0 0]}
+                     :velocity   {:linear [1 0 0]}})
+                  (range m))]
+    (reduce ecs/add (ecs/world) ents)))
+
+(defn counting-system
+  "A system fn that records every invocation. Swaps an invocation counter and a
+  per-tick entity-count log into the supplied atoms so the dispatch budget is
+  observable from outside. Returns `world` unchanged (a pure observer system)."
+  [invocations ents-per-tick]
+  (fn [w _dt ents]
+    (swap! invocations inc)
+    (swap! ents-per-tick conj (count ents))
+    w))
+
+(defn tick
+  "One tick = one `run-schedule` pass threading `world` through `schedule`.
+  This is the durable outer loop's single-tick unit (StateGraph-free; the actor
+  loop calls this once per frame)."
+  [schedule world dt]
+  (sched/run-schedule schedule world dt))
+
+;; --- tests ------------------------------------------------------------------
+
+(deftest dispatch-budget-is-per-tick-not-per-entity
+  "The core wasmi no-JIT invariant. Over K ticks with M matching entities the
+  system fn is invoked exactly K times (once per tick) — NOT K×M times (once
+  per entity per tick). A regression to per-entity dispatch would make the
+  invocation count K×M, failing the first assertion."
+  (let [m 50                                  ; matching entities
+        k 7                                   ; ticks
+        invocations  (atom 0)
+        ents-per-tick (atom [])
+        s (sched/schedule
+           [{:system :physics-step :order 10 :query #{:transform :velocity}
+             :fn (counting-system invocations ents-per-tick)}])
+        w0 (matching-world m)]
+    (reduce (fn [w _] (tick s w 16.0)) w0 (range k))
+    (testing "system fn invoked once per tick (K), NOT once per entity per tick (K×M)"
+      (is (= k @invocations)
+          (str "expected " k " invocations (per-tick), got " @invocations
+               " — a per-entity regression would yield " (* k m))))
+    (testing "budget does NOT scale with entity count"
+      (is (not= (* k m) @invocations)
+          "regression: budget scaled as ticks × entities (per-entity dispatch)"))
+    (testing "each tick the fn received all M matching entities (batched)"
+      (is (= (repeat k m) @ents-per-tick)
+          (str "expected " k " ticks each receiving " m " entities, got " @ents-per-tick))
+      (is (every? #(= m %) @ents-per-tick)
+          "no tick received a partial batch — runner hands the full queried seq"))))
+
+(deftest dispatch-budget-scales-with-ticks-not-entities
+  "Holding ticks constant and multiplying entities must NOT multiply dispatch
+  count. Doubling the world must leave the budget unchanged: this is the shape
+  that keeps wasmi ticks O(ticks), not O(ticks × entities)."
+  (let [k 3]
+    (doseq [m [1 2 5 10 25 100]]
+      (let [invocations  (atom 0)
+            ents-per-tick (atom [])
+            s (sched/schedule
+               [{:system :physics-step :order 10 :query #{:transform :velocity}
+                 :fn (counting-system invocations ents-per-tick)}])
+            w0 (matching-world m)]
+        (reduce (fn [w _] (tick s w 16.0)) w0 (range k))
+        (is (= k @invocations)
+            (str "m=" m ": budget must stay " k " (per-tick), not scale to "
+                 (* k m) " — got " @invocations))
+        (is (every? #(= m %) @ents-per-tick)
+            (str "m=" m ": each tick must receive all " m " entities"))))))
+
+(deftest dispatch-budget-multiple-systems-is-sum-of-systems-not-entities
+  "With S systems, K ticks, M entities: budget = K×S (each system once per
+  tick), never K×S×M. Pins that adding systems is cheap-ish (linear) while
+  adding entities is free at the dispatch layer — the wasmi-safety promise."
+  (let [m 20 k 4
+        invocations (atom 0)
+        sys (fn [_id] (fn [w _dt _ents] (swap! invocations inc) w))
+        s (sched/schedule
+           [{:system :a :order 10 :query #{:transform :velocity} :fn (sys :a)}
+            {:system :b :order 20 :query #{:transform :velocity} :fn (sys :b)}
+            {:system :c :order 30 :query #{:transform :velocity} :fn (sys :c)}])
+        w0 (matching-world m)]
+    (reduce (fn [w _] (tick s w 16.0)) w0 (range k))
+    (is (= (* k 3) @invocations)
+        (str "3 systems × " k " ticks = " (* k 3) " invocations, not "
+             (* k 3 m) " — got " @invocations))))

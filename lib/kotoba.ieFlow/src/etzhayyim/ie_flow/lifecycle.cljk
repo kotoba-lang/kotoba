@@ -1,0 +1,247 @@
+(ns etzhayyim.ie-flow.lifecycle
+  "ie-flow.lifecycle — the unified agent lifecycle: kotoba + organism react-loop + Google
+  co-scientist over the information-energy flow. ADR-2606211200.
+
+  This is THE loop the user asked to design: an actor SENSES its own flow off the kotoba ledger,
+  reasons like a scientist (the co-scientist tournament) about how to act on society so the flow
+  keeps paying for itself AND keeps returning order (共生), pre-registers a DRY-RUN experiment
+  (leak-free — the prediction is recorded BEFORE the outcome, the mitooshi discipline), scores the
+  PRIOR beat's experiment against what actually happened to net-gain (Brier proper-score), learns
+  a per-mechanism weight (kaizen), and persists the whole beat to a content-addressed commit-DAG.
+
+    SENSE     fold the flow ledger → the IE-flow state (net-gain / order-index / agent-efficiency)
+    ORIENT    surprise = distance from 'my flow will keep paying and keep returning order'
+    HYPOTHESIZE/REVIEW/RANK/EVOLVE  the co-scientist tournament (charter-gated catalog)
+    ACT       the top reviewed hypothesis → a PRE-REGISTERED dry-run施策 (outward = member-principal)
+    OBSERVE   measure the prior beat's experiment against the now-observed net-gain
+    LEARN     Brier proper-score → update the per-mechanism kaizen weight
+    PERSIST   one content-addressed tx on the loop's own commit-DAG (idempotent, resume-safe)
+
+  Deterministic: logical beat = loop-log length (no wall clock, no randomness). No network I/O, no
+  held key (the Murakumo narrator + live persistence are injected/operator-gated). Stdlib + the
+  shared kotoba.datom + ie-flow.{metrics,coscientist,ledger}."
+  (:require [kotoba.lang.text :as str]
+            [etzhayyim.ie-flow.coscientist :as cosci]
+            [etzhayyim.ie-flow.ledger :as ledger]
+            [etzhayyim.ie-flow.metrics :as metrics]
+            [kotoba.datom :as kd]
+            #?(:clj [kotoba.io :as io])))
+
+(def learning-rate 0.4)
+(def weight-floor 0.25)
+(def weight-ceil 2.0)
+(def top-hyps-persisted 3)
+(def order-target
+  "The order-index the actor wants its flow to reach — the reserve floor analog for surprise."
+  0.5)
+
+(defn- milli ^long [x] (long (Math/round (* 1000.0 (double x)))))
+(defn- unmilli [x] (/ (double (long x)) 1000.0))
+
+;; ── ORIENT ──────────────────────────────────────────────────────────────────
+
+(defn surprise
+  "Variational-free-energy proxy: distance from 'my flow will keep paying (net≥0) and keep returning
+  order (order-index≥target)'. →1 near collapse, 0 when comfortably above both floors. Pure."
+  [{:keys [net-gain order-index]}]
+  (let [net-pain   (if (neg? (double net-gain)) 1.0 0.0)
+        order-gap  (max 0.0 (/ (- order-target (double (or order-index 0))) order-target))]
+    (cosci/clamp01 (+ (* 0.5 net-pain) (* 0.5 order-gap)))))
+
+;; ── OBSERVE + LEARN (leak-free Brier; ibuki react_loop pattern) ─────────────
+
+(defn read-weights
+  "Per-mechanism learned weights off the loop log (entity \"ie:coscientist\"). Missing → 1.0."
+  [txs]
+  (let [m (ledger/fold-entity txs "ie:coscientist")]
+    (reduce-kv (fn [w a v]
+                 (if (str/starts-with? (str a) ":coscientist.weight/")
+                   (assoc w (subs (str a) (count ":coscientist.weight/")) (unmilli v))
+                   w))
+               {} m)))
+
+(defn read-experiment
+  "The experiment pre-registered at beat `n` (entity \"ie:experiment-<n>\"), or nil."
+  [txs n]
+  (let [m (ledger/fold-entity txs (str "ie:experiment-" n))]
+    (when (seq m)
+      {:beat n
+       :mechanism (get m ":experiment/mechanism")
+       :predicted-up (unmilli (get m ":experiment/predicted-up-milli" 500))
+       :net-at-act (unmilli (get m ":experiment/net-at-act-milli" 0))})))
+
+(defn score-outcome
+  "Proper-score the prior experiment against the now-observed net-gain. Brier loss → 1 − Brier."
+  [experiment net-now]
+  (let [actual-up (> (double net-now) (double (:net-at-act experiment)))
+        o (if actual-up 1.0 0.0)
+        p (double (:predicted-up experiment))
+        brier (* (- p o) (- p o))]
+    {:scored-beat (:beat experiment)
+     :mechanism (:mechanism experiment)
+     :actual-up actual-up
+     :brier brier
+     :score (- 1.0 brier)}))
+
+(defn update-weight
+  "Kaizen update: verified (score>0.5) → amplify, falsified → suppress; bounded. Pure."
+  [weights mechanism score]
+  (let [w (double (get weights mechanism 1.0))
+        w' (-> (+ w (* learning-rate (- (double score) 0.5)))
+               (max weight-floor) (min weight-ceil))]
+    (assoc weights mechanism w')))
+
+;; ── projection to datoms ────────────────────────────────────────────────────
+
+(defn- state-datoms [beatn as-of state]
+  (let [e "ie:flow-state"]
+    [(kd/add e ":flow-state/beat" (long beatn))
+     (kd/add e ":flow-state/flows-n" (long (:flows-n state)))
+     (kd/add e ":flow-state/net-gain-milli" (milli (:net-gain state)))
+     (kd/add e ":flow-state/order-index-milli" (milli (:order-index state)))
+     (kd/add e ":flow-state/throughput-milli" (milli (:throughput state)))
+     (kd/add e ":flow-state/total-value-milli" (milli (:total-value state)))
+     (kd/add e ":flow-state/total-cost-milli" (milli (:total-cost state)))
+     (kd/add e ":flow-state/agent-eff-milli"
+             (let [ae (double (:agent-efficiency state))]
+               (if (Double/isInfinite ae) 999999 (milli ae))))
+     (kd/add e ":flow-state/parasitic" (boolean (:parasitic? state)))
+     (kd/add e ":flow-state/as-of" as-of)]))
+
+(defn- hyp-datoms [beatn ranked]
+  (vec (mapcat
+        (fn [h]
+          (let [e (str "ie:hyp-" beatn "-" (:id h))]
+            [(kd/add e ":hyp/beat" (long beatn))
+             (kd/add e ":hyp/intervention" (str (:intervention h)))
+             (kd/add e ":hyp/mechanism" (str (:mechanism h)))
+             (kd/add e ":hyp/elo-milli" (milli (:elo h 1000.0)))
+             (kd/add e ":hyp/utility-milli" (milli (:utility h 0)))
+             (kd/add e ":hyp/expected-d-net-milli" (milli (:expected-d-net h 0)))
+             (kd/add e ":hyp/expected-d-order-milli" (milli (:expected-d-order h 0)))
+             (kd/add e ":hyp/reviewed" true)]))
+        (take top-hyps-persisted ranked))))
+
+(defn- experiment-datoms [beatn as-of state chosen]
+  (let [e (str "ie:experiment-" beatn)
+        p-up (cosci/clamp01 (+ 0.5 (* 0.5 (double (:expected-d-net chosen 0)))))]
+    [(kd/add e ":experiment/beat" (long beatn))
+     (kd/add e ":experiment/intervention" (str (:intervention chosen)))
+     (kd/add e ":experiment/mechanism" (str (:mechanism chosen)))
+     (kd/add e ":experiment/predicted-up-milli" (milli p-up))
+     (kd/add e ":experiment/net-at-act-milli" (milli (:net-gain state)))
+     (kd/add e ":experiment/status" "dry-run")
+     (kd/add e ":experiment/as-of" as-of)]))
+
+(defn- outcome-datoms [as-of outcome]
+  (when outcome
+    (let [e (str "ie:outcome-" (:scored-beat outcome))]
+      [(kd/add e ":outcome/scored-experiment" (long (:scored-beat outcome)))
+       (kd/add e ":outcome/mechanism" (str (:mechanism outcome)))
+       (kd/add e ":outcome/actual-up" (boolean (:actual-up outcome)))
+       (kd/add e ":outcome/brier-milli" (milli (:brier outcome)))
+       (kd/add e ":outcome/score-milli" (milli (:score outcome)))
+       (kd/add e ":outcome/as-of" as-of)])))
+
+(defn- weight-datoms [as-of weights]
+  (let [e "ie:coscientist"]
+    (conj (vec (for [[mech w] (sort-by key weights)]
+                 (kd/add e (str ":coscientist.weight/" mech) (milli w))))
+          (kd/add e ":coscientist/as-of" as-of))))
+
+(defn- meta-datoms [beatn as-of meta generated surviving]
+  (let [e (str "ie:meta-" beatn)]
+    [(kd/add e ":meta/beat" (long beatn))
+     (kd/add e ":meta/pattern" (str (:pattern meta)))
+     (kd/add e ":meta/winner-mechanism" (str (get-in meta [:winner :mechanism])))
+     (kd/add e ":meta/via" (str (:via meta)))
+     (kd/add e ":meta/generated" (long generated))
+     (kd/add e ":meta/surviving" (long surviving))
+     (kd/add e ":meta/as-of" as-of)]))
+
+;; ── the pure beat ────────────────────────────────────────────────────────────
+
+(defn plan
+  "PURE core of one beat. inputs:
+    :txs        the loop's own commit-DAG (cognitive history; priors fold off this)
+    :events     the measured flow EVENTS for this beat's window (SENSE; from ledger/read-events)
+    :catalog    optional actor-specific intervention catalog extension
+    :infer      optional Murakumo narrator for the meta-review
+  Returns everything the projection needs. No I/O."
+  [{:keys [txs events catalog infer]}]
+  (let [beatn (count txs)
+        state (metrics/flow-state (or events []))
+        surp (surprise state)
+        state (assoc state :surprise surp)
+        weights0 (read-weights txs)
+        prior-exp (read-experiment txs (dec beatn))
+        outcome (when prior-exp (score-outcome prior-exp (:net-gain state)))
+        weights (if outcome (update-weight weights0 (:mechanism prior-exp) (:score outcome)) weights0)
+        hyps (cosci/generate state (cond-> {:weights weights} catalog (assoc :catalog catalog)))
+        surv (cosci/surviving state hyps)
+        ranked0 (cosci/rank surv)
+        evolved (cosci/evolve ranked0)
+        evolved-ok (when (and evolved (get (cosci/review state evolved) :ok?)) evolved)
+        ranked (if evolved-ok (cosci/rank (conj surv evolved-ok)) ranked0)
+        chosen (first ranked)
+        meta (cosci/meta-review ranked state infer)]
+    {:beat beatn :state state :weights weights :outcome outcome
+     :generated (count hyps) :surviving (count surv)
+     :ranked ranked :chosen chosen :meta meta}))
+
+(defn project
+  "Project the plan into one beat's datoms (deterministic, ordered)."
+  [{:keys [beat state weights outcome ranked chosen meta generated surviving]} as-of]
+  (vec (concat (state-datoms beat as-of state)
+               (outcome-datoms as-of outcome)
+               (weight-datoms as-of weights)
+               (hyp-datoms beat ranked)
+               (when chosen (experiment-datoms beat as-of state chosen))
+               (meta-datoms beat as-of meta generated surviving))))
+
+;; ── persist (idempotent-by-content) ─────────────────────────────────────────
+
+#?(:clj
+   (defn persist!
+     [datoms {:keys [tx-id as-of log-path]}]
+     (let [txs (kd/read-log log-path)
+           prev (kd/head-cid log-path)
+           last-ds (some-> (peek txs) :tx/datoms)
+           base {:count (count datoms) :head prev}]
+       (if (= (kd/normalize-datoms datoms) last-ds)
+         (assoc base :appended false :reason :no-change)
+         (let [tx (kd/make-tx datoms {:tx-id tx-id :as-of as-of :prev-cid prev})]
+           (io/make-parents log-path)
+           (kd/append-tx! tx log-path)
+           (assoc base :appended true :head (:tx/cid tx)))))))
+
+#?(:clj
+   (defn beat
+     "Run one full IE-flow co-scientist ReAct beat and persist it to the loop log.
+       :log-path    the loop's own commit-DAG
+       :flow-log    the actor's measured flow ledger (SENSE source); default = log-path
+       :events      explicit SENSE events (overrides :flow-log)
+       :catalog     optional actor-specific intervention catalog
+       :infer       optional Murakumo narrator (fn prompt fallback → {:text :via})
+       :tx-id :as-of caller-supplied (no wall clock)
+     Returns a compact status map."
+     [{:keys [log-path flow-log events catalog infer tx-id as-of]}]
+     (let [txs (kd/read-log log-path)
+           ev (or events (ledger/read-events (kd/read-log (or flow-log log-path))))
+           p (plan {:txs txs :events ev :catalog catalog :infer infer})
+           as-of (or as-of (str "as-of:" (:beat p)))
+           ds (project p as-of)
+           persisted (persist! ds {:tx-id (or tx-id (str "ie-flow-" (:beat p)))
+                                   :as-of as-of :log-path log-path})]
+       {:beat (:beat p)
+        :net-gain (get-in p [:state :net-gain])
+        :order-index (get-in p [:state :order-index])
+        :agent-efficiency (get-in p [:state :agent-efficiency])
+        :surprise (get-in p [:state :surprise])
+        :parasitic? (get-in p [:state :parasitic?])
+        :chosen (get-in p [:chosen :id])
+        :mechanism (get-in p [:chosen :mechanism])
+        :winner-pattern (get-in p [:meta :pattern])
+        :outcome-score (get-in p [:outcome :score])
+        :generated (:generated p) :surviving (:surviving p)
+        :appended (:appended persisted) :reason (:reason persisted) :head (:head persisted)})))

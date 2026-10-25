@@ -1,0 +1,379 @@
+(ns kami-cfd.d3
+  "D3Q19 lattice-Boltzmann — the 3D extension that yields a TRUE vehicle drag
+  coefficient (force normalised by frontal area), not just the 2D sectional
+  ranking (`kami-cfd`). Same BGK scheme as the 2D solver, one dimension up,
+  plus a Smagorinsky LES subgrid turbulence model and free-slip far-field
+  boundaries. A car-ish body (or a voxelised triangle mesh, see
+  `from-triangles` / `kami-cfd.mesh`) is placed in the domain; drag is
+  measured by momentum exchange and divided by the projected frontal cell
+  count. Migrated in place from the kami-engine-cfd Rust crate (`src/d3.rs`,
+  376 lines) — see the `kami-cfd` namespace docstring and this repo's README
+  for migration context.
+
+  Deliberately dropped: the original Rust `collide_parallel` /
+  `stream_drag_parallel` split work across `std::thread::scope` (collide is
+  per-cell independent; streaming used a 'pull'/gather form specifically so
+  each cell only writes its own output, avoiding write conflicts, which is
+  what made safe parallel chunking possible in the first place). This port
+  keeps the exact same math and the exact same pull/gather streaming form —
+  chosen deliberately in the original design — but iterates it as a single
+  sequential loop instead of splitting across `std::thread::scope` chunks.
+  Portability across JVM Clojure / ClojureScript / nbb takes priority over
+  multi-threaded performance per repo policy (AGENTS.md '.cljc/.kotoba
+  ランタイム優先順位'); native OS threads have no clean portable equivalent
+  across those three hosts. Same result, single-threaded, function names
+  keep the `-parallel`-derived Rust names as `collide!`/`stream-drag!` (the
+  `!` marks that they mutate the passed arrays in place, not that they are
+  parallel).")
+
+;; ---------------------------------------------------------------------------
+;; Portable math helpers (#?(:clj ...) / #?(:cljs ...) reader conditionals so
+;; this namespace runs unmodified on the JVM and in ClojureScript/nbb).
+;; ---------------------------------------------------------------------------
+
+(defn sqrt* [x]
+  #?(:clj (Math/sqrt (double x))
+     :cljs (js/Math.sqrt x)))
+
+(defn- abs* [x]
+  #?(:clj (Math/abs (double x))
+     :cljs (js/Math.abs x)))
+
+(defn- round* [x]
+  #?(:clj (Math/round (double x))
+     :cljs (js/Math.round x)))
+
+(defn- ceil* [x]
+  #?(:clj (Math/ceil (double x))
+     :cljs (js/Math.ceil x)))
+
+(defn- floor* [x]
+  #?(:clj (Math/floor (double x))
+     :cljs (js/Math.floor x)))
+
+
+;; ---------------------------------------------------------------------------
+;; Portable boolean array (2026-07-27 portability fix).
+;;
+;; `boolean-array` is a JVM-only Clojure primitive — cljs.core has
+;; `int-array`/`double-array`/`object-array` but NO `boolean-array`. Both this
+;; repo's solvers used it for the solid mask, so **neither actually loaded on
+;; ClojureScript/nbb**, despite the docstrings and README claiming JVM/cljs/nbb
+;; portability. The claim was never exercised because the only runner was the
+;; JVM `.clj` CLI and JVM tests.
+;;
+;; A `js/Uint8Array` would be the obvious cljs substitute and is WRONG here:
+;; in ClojureScript `0` is truthy, so `(if (aget solid n) ...)` would treat
+;; every empty cell as solid and the whole domain would silently become a
+;; block of metal. A real JS array filled with `false` keeps the truthiness
+;; semantics the solver relies on.
+;; ---------------------------------------------------------------------------
+
+(defn bool-array
+  "`n`-element mutable boolean array, `false`-filled, portable across JVM and
+  ClojureScript. See the note above for why Uint8Array is not usable."
+  [n]
+  #?(:clj (boolean-array (long n) false)
+     :cljs (.fill (js/Array. n) false)))
+
+;; ---------------------------------------------------------------------------
+;; PUBLIC D3Q19 kernel surface (2026-07-27).
+;;
+;; The lattice constants, `feq` and `collide!` were `^:private` because the
+;; only consumer was this namespace's own vehicle/far-field boundary scheme
+;; (`stream-drag!` hardcodes: z<0 no-slip road, y sides free-slip, z top
+;; free-slip, x ends inflow/outflow). Internal flows — an enclosure, a duct,
+;; a cold plate — need the SAME collision kernel with DIFFERENT boundaries.
+;;
+;; Duplicating a 19-velocity lattice into a sibling namespace would create two
+;; sources of truth for `ex/ey/ez/opp/w`, and a transcription slip there is
+;; silent (the solver still runs, it just conserves the wrong thing). So the
+;; kernel is exposed instead: `kami-cfd.duct` reuses these and supplies its
+;; own streaming/boundary pass. Collision is boundary-agnostic by
+;; construction — it is per-cell and reads no neighbour — so sharing it is
+;; safe. Nothing about the vehicle path changed.
+;; ---------------------------------------------------------------------------
+;; ---------------------------------------------------------------------------
+;; D3Q19 lattice constants
+;; ---------------------------------------------------------------------------
+
+(def ex (int-array [0  1 -1  0  0  0  0  1 -1  1 -1  1 -1  1 -1  0  0  0  0]))
+(def ey (int-array [0  0  0  1 -1  0  0  1 -1 -1  1  0  0  0  0  1 -1  1 -1]))
+(def ez (int-array [0  0  0  0  0  1 -1  0  0  0  0  1 -1 -1  1  1 -1 -1  1]))
+(def w (double-array [(/ 1.0 3.0)
+                                 (/ 1.0 18.0) (/ 1.0 18.0) (/ 1.0 18.0) (/ 1.0 18.0) (/ 1.0 18.0) (/ 1.0 18.0)
+                                 (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0)
+                                 (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0)
+                                 (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0) (/ 1.0 36.0)]))
+;; Opposite-direction index, for bounce-back.
+(def opp (int-array [0 2 1 4 3 6 5 8 7 10 9 12 11 14 13 16 15 18 17]))
+;; Specular reflection across a y-wall: (ex,ey,ez) -> (ex,-ey,ez). Free-slip.
+(def reflect-y (int-array [0 1 2 4 3 5 6 9 10 7 8 11 12 13 14 18 17 16 15]))
+;; Specular reflection across a z-wall: (ex,ey,ez) -> (ex,ey,-ez). Free-slip.
+(def reflect-z (int-array [0 1 2 3 4 6 5 7 8 9 10 13 14 11 12 17 18 15 16]))
+
+(defn feq
+  "D3Q19 equilibrium distribution. Public: shared with kami-cfd.duct."
+  [i rho ux uy uz]
+  (let [exi (aget ^ints ex i) eyi (aget ^ints ey i) ezi (aget ^ints ez i)
+        eu (+ (* exi ux) (* eyi uy) (* ezi uz))
+        usq (+ (* ux ux) (* uy uy) (* uz uz))]
+    (* (aget ^doubles w i) rho (+ 1.0 (* 3.0 eu) (* 4.5 eu eu) (* -1.5 usq)))))
+
+;; ---------------------------------------------------------------------------
+;; Body3 — a voxelised 3D body in the wind-tunnel. z is height (ground at
+;; z=0), flow +x.
+;; ---------------------------------------------------------------------------
+
+(defn- solid3-at? [body x y z]
+  (let [{:keys [nx ny solid]} body]
+    (aget ^booleans solid (+ (* (+ (* z ny) y) nx) x))))
+
+(defn- count-frontal-cells
+  "Projected frontal area: count of y-z columns containing any solid cell."
+  [nx ny nz solid]
+  (let [c (atom 0)]
+    (dotimes [z nz]
+      (dotimes [y ny]
+        (let [base (* (+ (* z ny) y) nx)]
+          (loop [x 0]
+            (when (< x nx)
+              (if (aget ^booleans solid (+ base x))
+                (swap! c inc)
+                (recur (inc x))))))))
+    @c))
+
+(defn box-car
+  "A squareback box car: full-height block, leading edge at `x0`."
+  [nx ny nz x0 len w h]
+  (let [solid (bool-array (* nx ny nz))
+        y0 (quot (- ny w) 2)
+        x-hi (min (+ x0 len) nx)
+        y-hi (min (+ y0 w) ny)
+        z-hi (min (+ 1 h) nz)]
+    (doseq [x (range x0 x-hi) y (range y0 y-hi) z (range 1 z-hi)]
+      (aset solid (+ (* (+ (* z ny) y) nx) x) true))
+    {:nx nx :ny ny :nz nz :solid solid :frontal-cells (count-frontal-cells nx ny nz solid)}))
+
+(defn fastback-car
+  "Same frontal face as `box-car`, but the roof tapers down over the rear
+  half (fastback) — lower drag at equal frontal area."
+  [nx ny nz x0 len w h]
+  (let [solid (bool-array (* nx ny nz))
+        y0 (quot (- ny w) 2)
+        half (quot len 2)
+        y-hi (min (+ y0 w) ny)]
+    (loop [k 0]
+      (when (< k len)
+        (let [x (+ x0 k)]
+          (when (< x nx)
+            ;; full height for the front half, tapering to ~40% at the tail
+            (let [hz (if (< k half)
+                       h
+                       (let [frac (- 1.0 (* 0.6 (/ (double (- k half)) (double (max half 1)))))]
+                         (long (round* (* h frac)))))
+                  z-hi (min (+ 1 hz) nz)]
+              (doseq [y (range y0 y-hi) z (range 1 z-hi)]
+                (aset solid (+ (* (+ (* z ny) y) nx) x) true)))
+            (recur (inc k))))))
+    {:nx nx :ny ny :nz nz :solid solid :frontal-cells (count-frontal-cells nx ny nz solid)}))
+
+(defn- tri-bbox
+  "[[minx miny minz] [maxx maxy maxz]] over all triangle vertices."
+  [tris]
+  (reduce (fn [[lo hi] tri]
+            (reduce (fn [[lo hi] v]
+                      [(mapv min lo v) (mapv max hi v)])
+                    [lo hi] tri))
+          [[##Inf ##Inf ##Inf] [##-Inf ##-Inf ##-Inf]]
+          tris))
+
+(defn- ray-x-cross
+  "Intersection x of a +x ray at (y=uc, z=vc) with triangle `t`, via
+  barycentric containment in the y-z projection. nil if the ray misses or
+  the triangle is edge-on to the projection."
+  [t uc vc]
+  (let [[[x0 u0 v0] [x1 u1 v1] [x2 u2 v2]] t
+        det (+ (* (- v1 v2) (- u0 u2)) (* (- u2 u1) (- v0 v2)))]
+    (when-not (< (abs* det) 1e-9)
+      (let [a (/ (+ (* (- v1 v2) (- uc u2)) (* (- u2 u1) (- vc v2))) det)
+            b (/ (+ (* (- v2 v0) (- uc u2)) (* (- u0 u2) (- vc v2))) det)
+            c (- 1.0 a b)]
+        (when-not (or (< a -1e-9) (< b -1e-9) (< c -1e-9))
+          (+ (* a x0) (* b x1) (* c x2)))))))
+
+(defn from-triangles
+  "Voxelise a triangle mesh (REAL geometry, e.g. an STL or `ahmed-body`) into
+  the domain. The mesh is uniformly scaled so its length maps to
+  `len-cells`, centred in y, sitting on the ground (z=1). Solid filling is
+  per-(y,z)-column ray parity: cast a +x ray through each column, sort the
+  surface crossings, fill between entry/exit pairs (watertight meshes)."
+  [nx ny nz tris len-cells x0]
+  (let [[[lo0 lo1 lo2] [hi0 hi1 _hi2]] (tri-bbox tris)
+        scale (/ len-cells (max (- hi0 lo0) 1e-9))
+        ymid (* 0.5 (+ lo1 hi1))
+        tf (fn [[vx vy vz]]
+             [(+ x0 (* (- vx lo0) scale))
+              (+ (/ ny 2.0) (* (- vy ymid) scale))
+              (+ 1.0 (* (- vz lo2) scale))])
+        lt (mapv (fn [[a b c]] [(tf a) (tf b) (tf c)]) tris)
+        solid (bool-array (* nx ny nz))]
+    (dotimes [z nz]
+      (dotimes [y ny]
+        (let [uc (+ y 0.5) vc (+ z 0.5)
+              xs (sort (keep #(ray-x-cross % uc vc) lt))]
+          (when (>= (count xs) 2)
+            (doseq [[xa xb] (partition 2 xs)]
+              (let [a (long (max (ceil* xa) 0.0))
+                    b (long (min (floor* xb) (double (dec nx))))]
+                (loop [x a]
+                  (when (<= x b)
+                    (when (and (>= x 0) (< x nx))
+                      (aset ^booleans solid (+ (* (+ (* z ny) y) nx) x) true))
+                    (recur (inc x))))))))))
+    {:nx nx :ny ny :nz nz :solid solid :frontal-cells (count-frontal-cells nx ny nz solid)}))
+
+;; ---------------------------------------------------------------------------
+;; Lbm3 — D3Q19 BGK + Smagorinsky LES solver
+;; ---------------------------------------------------------------------------
+
+(defn lbm3-new
+  [body re]
+  (let [nx (:nx body) ny (:ny body) nz (:nz body)
+        u0 0.05
+        ;; reference length = sqrt(frontal area) for the Reynolds/viscosity set
+        d (max (sqrt* (double (:frontal-cells body))) 1.0)
+        nu (/ (* u0 d) re)
+        tau (+ 0.5 (* 3.0 nu))
+        n-cells (* nx ny nz)
+        f (double-array (* n-cells 19))]
+    (dotimes [n n-cells]
+      (dotimes [i 19] (aset ^doubles f (+ (* n 19) i) (double (feq i 1.0 u0 0.0 0.0)))))
+    {:nx nx :ny ny :nz nz :tau tau :u0 u0 :f f :ftmp (aclone f) :body body}))
+
+(defn collide!
+  "BGK collision with a Smagorinsky LES subgrid model — per-cell independent
+  (originally split across threads via `std::thread::scope`; see namespace
+  docstring for why this port runs it sequentially instead). The local
+  strain rate is read from the non-equilibrium momentum-flux tensor
+  Q_ab = sum_i e_ia*e_ib*(f_i-feq_i); a turbulent eddy viscosity
+  nu_t = (Cs*delta)^2 * Sbar raises tau where the flow is sheared. This keeps
+  tau clear of 0.5 at high Re (stability) AND models subgrid turbulence —
+  the physical requirement for the drag to fall toward the real
+  attached-flow value, which single-relaxation BGK alone cannot do."
+  [lbm]
+  (let [{:keys [nx ny nz tau body]} lbm
+        f (:f lbm) solid (:solid body)
+        ncells (* nx ny nz)
+        cs 0.16
+        sqrt2 1.4142135623730951
+        feqs (double-array 19)]
+    (dotimes [n ncells]
+      (when-not (aget ^booleans solid n)
+        (loop [i 0 rho 0.0 mx 0.0 my 0.0 mz 0.0]
+          (if (< i 19)
+            (let [fi (aget ^doubles f (+ (* n 19) i))]
+              (recur (inc i) (+ rho fi)
+                     (+ mx (* fi (aget ^ints ex i))) (+ my (* fi (aget ^ints ey i))) (+ mz (* fi (aget ^ints ez i)))))
+            (let [pos? (> rho 0.0)
+                  ux (if pos? (/ mx rho) 0.0)
+                  uy (if pos? (/ my rho) 0.0)
+                  uz (if pos? (/ mz rho) 0.0)
+                  rho (if (<= rho 0.0) 1.0 rho)]
+              ;; non-equilibrium momentum-flux tensor Q_ab
+              (loop [i 0 qxx 0.0 qyy 0.0 qzz 0.0 qxy 0.0 qxz 0.0 qyz 0.0]
+                (if (< i 19)
+                  (let [fv (double (feq i rho ux uy uz))
+                        _ (aset ^doubles feqs i fv)
+                        neq (- (aget ^doubles f (+ (* n 19) i)) fv)
+                        exi (double (aget ^ints ex i)) eyi (double (aget ^ints ey i)) ezi (double (aget ^ints ez i))]
+                    (recur (inc i)
+                           (+ qxx (* exi exi neq)) (+ qyy (* eyi eyi neq)) (+ qzz (* ezi ezi neq))
+                           (+ qxy (* exi eyi neq)) (+ qxz (* exi ezi neq)) (+ qyz (* eyi ezi neq))))
+                  (let [qnorm (sqrt* (+ (* 2.0 (+ (* qxx qxx) (* qyy qyy) (* qzz qzz)))
+                                         (* 4.0 (+ (* qxy qxy) (* qxz qxz) (* qyz qyz)))))
+                        ;; total relaxation time incl. Smagorinsky eddy viscosity
+                        tau-t (* 0.5 (- (sqrt* (+ (* tau tau) (/ (* 18.0 sqrt2 cs cs qnorm) rho))) tau))
+                        omega (/ 1.0 (+ tau tau-t))]
+                    (dotimes [i 19]
+                      (let [idx (+ (* n 19) i)]
+                        (aset ^doubles f idx (double (- (aget ^doubles f idx) (* omega (- (aget ^doubles f idx) (aget ^doubles feqs i))))))))))))))))
+    lbm))
+
+(defn- inflow-outflow!
+  "Left inflow (equilibrium at u0), right outflow (zero-gradient). Mutates
+  `(:f lbm)` in place."
+  [lbm]
+  (let [{:keys [nx ny nz u0 body]} lbm f (:f lbm)]
+    (dotimes [z nz]
+      (dotimes [y ny]
+        (let [n (* (+ (* z ny) y) nx)]
+          (when-not (solid3-at? body 0 y z)
+            (dotimes [i 19] (aset ^doubles f (+ (* n 19) i) (double (feq i 1.0 u0 0.0 0.0)))))
+          (let [no (+ n (dec nx)) np (+ n (- nx 2))]
+            (when-not (solid3-at? body (dec nx) y z)
+              (dotimes [i 19] (aset ^doubles f (+ (* no 19) i) (aget ^doubles f (+ (* np 19) i))))))))))
+  lbm)
+
+(defn- stream-drag!
+  "Streaming + drag, PULL form (gather): each cell writes only its own
+  ftmp, reading upstream f. Wall/solid upstream -> halfway bounce-back or
+  free-slip reflection (see boundary table below). Drag (momentum exchange)
+  is a read-only reduction over fluid-solid links. Returns `[lbm' drag]`
+  with f/ftmp swapped and inflow/outflow boundaries re-applied."
+  [lbm]
+  (let [{:keys [nx ny nz]} lbm
+        body (:body lbm)
+        f (:f lbm) ftmp (:ftmp lbm) solid (:solid body)
+        ncells (* nx ny nz)
+        nxy (* nx ny)
+        drag (atom 0.0)]
+    (dotimes [n ncells]
+      (let [z (quot n nxy)
+            y (mod (quot n nx) ny)
+            x (mod n nx)]
+        (if (aget ^booleans solid n)
+          (dotimes [j 19] (aset ^doubles ftmp (+ (* n 19) j) 0.0))
+          (do
+            (dotimes [j 19]
+              (let [sx (- x (aget ^ints ex j)) sy (- y (aget ^ints ey j)) sz (- z (aget ^ints ez j))
+                    val (cond
+                          (< sz 0) (aget ^doubles f (+ (* n 19) (aget ^ints opp j)))             ; ground: no-slip road
+                          (or (< sy 0) (>= sy ny)) (aget ^doubles f (+ (* n 19) (aget ^ints reflect-y j))) ; sides: free-slip
+                          (>= sz nz) (aget ^doubles f (+ (* n 19) (aget ^ints reflect-z j)))      ; top: free-slip
+                          (or (< sx 0) (>= sx nx)) (aget ^doubles f (+ (* n 19) (aget ^ints opp j))) ; x ends: inflow/outflow sets this
+                          :else
+                          (let [sn (+ (* (+ (* sz ny) sy) nx) sx)]
+                            (if (aget ^booleans solid sn)
+                              (aget ^doubles f (+ (* n 19) (aget ^ints opp j))) ; body bounce-back
+                              (aget ^doubles f (+ (* sn 19) j)))))]      ; pull from upstream
+                (aset ^doubles ftmp (+ (* n 19) j) (double val))))
+            ;; momentum exchange on links pointing into the body
+            (dotimes [i 19]
+              (let [dx (+ x (aget ^ints ex i)) dy (+ y (aget ^ints ey i)) dz (+ z (aget ^ints ez i))]
+                (when (and (>= dx 0) (< dx nx) (>= dy 0) (< dy ny) (>= dz 0) (< dz nz))
+                  (let [dn (+ (* (+ (* dz ny) dy) nx) dx)]
+                    (when (aget ^booleans solid dn)
+                      (swap! drag + (* 2.0 (aget ^ints ex i) (aget ^doubles f (+ (* n 19) i)))))))))))))
+    (let [lbm' (inflow-outflow! (assoc lbm :f ftmp :ftmp f))]
+      [lbm' @drag])))
+
+(defn step
+  [lbm]
+  (stream-drag! (collide! lbm)))
+
+(defn run
+  "Run `steps`; return the vehicle Cd = F_x / (0.5*rho*u0^2*A_frontal)."
+  [lbm steps]
+  (let [tail (max (quot steps 5) 1)]
+    (loop [s 0 lbm lbm sum 0.0]
+      (if (>= s steps)
+        (let [favg (/ sum tail)]
+          (/ favg (* 0.5 (:u0 lbm) (:u0 lbm) (double (:frontal-cells (:body lbm))))))
+        (let [[lbm' drag] (step lbm)]
+          (recur (inc s) lbm' (if (>= s (- steps tail)) (+ sum drag) sum)))))))
+
+(defn vehicle-cd
+  "Vehicle Cd of a 3D body at a Reynolds number."
+  [body re steps]
+  (run (lbm3-new body re) steps))

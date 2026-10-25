@@ -1,0 +1,143 @@
+(ns crowdfunding.fulfillment-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [crowdfunding.fulfillment :as sut]
+            [crowdfunding.payout :as payout]))
+
+(def now "2027-05-01T00:00:00Z")
+
+(defn a-line [id & [overrides]]
+  (merge (sut/line {:pledge id :backer (str "did:web:b-" id) :campaign "kb-split"
+                    :reward "standard" :estimated-delivery "2027-04-01"})
+         overrides))
+
+;; ───────────────────────── survey ─────────────────────────
+
+(deftest a-survey-response-carries-references-never-addresses
+  (let [s (sut/survey {:pledge "p1" :backer "b1" :campaign "kb-split"
+                       :sent-at "2027-01-01T00:00:00Z"})
+        r (sut/survey-response {:pledge "p1" :address-ref "addr:abc" :contact-ref "c:def"
+                                :options ["blue" "iso-jp"] :responded-at "2027-01-05T00:00:00Z"})]
+    (is (= [] (sut/response-errors s r)))
+    (is (not-any? #{:response/address :response/postcode} (keys r))
+        "a pure domain value gets copied into logs, ledgers and fixtures")))
+
+(deftest an-incomplete-response-is-refused-now-not-at-the-warehouse
+  (let [s (sut/survey {:pledge "p1" :backer "b1" :campaign "kb-split"})]
+    (is (some #{:missing-address-ref}
+              (map :fulfillment.error/code
+                   (sut/response-errors s (sut/survey-response {:pledge "p1" :contact-ref "c"})))))
+    (is (some #{:pledge-mismatch}
+              (map :fulfillment.error/code
+                   (sut/response-errors s (sut/survey-response {:pledge "other"
+                                                                :address-ref "a"
+                                                                :contact-ref "c"})))))))
+
+;; ───────────────────────── per-backer ─────────────────────────
+
+(deftest shipping-without-a-tracking-reference-is-refused
+  (testing ":shipped must be something the backer can check, not something the creator asserts"
+    (let [l (sut/advance (a-line "p1") :survey-received)]
+      (is (nil? (sut/ship l {:carrier "yamato" :at now})))
+      (let [s (sut/ship l {:tracking-ref "YT-1" :carrier "yamato" :at now})]
+        (is (= :shipped (:fulfillment/state s)))
+        (is (= "YT-1" (:fulfillment/tracking-ref s)))))))
+
+(deftest an-unreachable-backer-can-come-back
+  (let [l (-> (a-line "p1") (sut/advance :survey-received))
+        u (sut/undeliverable l {:reason :address-incomplete :at now})]
+    (is (= :undeliverable (:fulfillment/state u)))
+    (is (= :address-incomplete (:fulfillment/undeliverable-reason u)))
+    (is (= :survey-received (:fulfillment/state (sut/advance u :survey-received))))))
+
+(deftest refunded-is-terminal
+  (let [r (sut/advance (a-line "p1") :refunded)]
+    (doseq [to sut/states] (is (nil? (sut/advance r to))))))
+
+(deftest overdue-is-a-fact-about-a-date-not-a-breach
+  (is (sut/overdue? (a-line "p1") now))
+  (is (not (sut/overdue? (a-line "p1") "2027-03-01T00:00:00Z")))
+  (is (not (sut/overdue? (sut/advance (-> (a-line "p1")
+                                          (sut/advance :survey-received)
+                                          (sut/ship {:tracking-ref "t" :at now}))
+                                      :delivered)
+                         now))
+      "delivered lines are not overdue"))
+
+;; ───────────────────────── roll-up ─────────────────────────
+
+(def lines
+  [(a-line "p1" {:fulfillment/state :delivered})
+   (a-line "p2" {:fulfillment/state :shipped})
+   (a-line "p3" {:fulfillment/state :undeliverable})
+   (a-line "p4" {:fulfillment/state :refunded})])
+
+(deftest an-unreachable-backer-is-an-open-obligation-not-a-rounding-error
+  (let [p (sut/progress lines now)]
+    (is (= 4 (:fulfillment/total p)))
+    (is (= 5000 (:fulfillment/completion-bps p)) "delivered + refunded, out of four")
+    (is (false? (:fulfillment/complete? p)))
+    (is (true? (:fulfillment/first-shipment? p)))
+    (is (= 2 (:fulfillment/overdue p)) "shipped and undeliverable are both still open")))
+
+(deftest completion-requires-every-backer
+  (let [done [(a-line "p1" {:fulfillment/state :delivered})
+              (a-line "p2" {:fulfillment/state :refunded})]]
+    (is (true? (:fulfillment/complete? (sut/progress done now))))
+    (is (false? (:fulfillment/complete? (sut/progress [] now)))
+        "an empty campaign has not completed fulfilment, it has no fulfilment")))
+
+;; ───────────────────────── payout gates ─────────────────────────
+
+(deftest gates-are-derived-here-so-no-tranche-releases-against-an-unchecked-fact
+  (let [p (sut/progress lines now)]
+    (is (= #{:on-collection :on-first-shipment}
+           (sut/gate-facts p {:collection-closed? true})))
+    (is (contains? (sut/gate-facts p {:collection-closed? true
+                                      :production-evidence {:photos 3}})
+                   :on-production-start))
+    (testing "production having begun is not observable from fulfilment states"
+      (is (not (contains? (sut/gate-facts p {:collection-closed? true})
+                          :on-production-start))))
+    (testing "and the facts plug straight into the payout schedule"
+      (let [plan {:payout/tranches (mapv #(assoc % :tranche/state :pending
+                                                 :tranche/amount-minor 1)
+                                         payout/staged)}]
+        (is (= ["build" "ship"]
+               (mapv :tranche/id
+                     (payout/releasable plan (sut/gate-facts p {:collection-closed? true})))))))))
+
+;; ───────────────────────── accountability ─────────────────────────
+
+(deftest staleness-is-nil-when-it-was-not-measured
+  (testing "'we did not measure' and 'they are not stale' are different statements"
+    (let [a (sut/accountability {:campaign "kb-split" :lines lines :now now
+                                 :last-update-at "2027-04-20T00:00:00Z"})]
+      (is (nil? (:accountability/stale? a)))
+      (is (false? (:accountability/owes-disclosure? a))))))
+
+(deftest overdue-plus-silent-is-the-pattern-backers-cannot-distinguish-from-abandonment
+  (let [stale-before "2027-02-01T00:00:00Z"
+        quiet (sut/accountability {:campaign "kb-split" :lines lines :now now
+                                   :stale-before stale-before
+                                   :last-update-at "2026-12-01T00:00:00Z"})
+        chatty (sut/accountability {:campaign "kb-split" :lines lines :now now
+                                    :stale-before stale-before
+                                    :last-update-at "2027-04-20T00:00:00Z"})]
+    (is (true? (:accountability/stale? quiet)))
+    (is (true? (:accountability/overdue? quiet)))
+    (is (true? (:accountability/owes-disclosure? quiet)))
+    (is (false? (:accountability/stale? chatty)))
+    (is (false? (:accountability/owes-disclosure? chatty))
+        "late while posting is ordinary; a single post ends the ambiguity")
+    (is (false? (:accountability/adjudicated? quiet)))))
+
+(deftest a-disclosure-needs-an-author-and-a-remedy-from-a-closed-set
+  (is (nil? (sut/failure-disclosure {:campaign "c" :stated-by "" :remedy :refund})))
+  (is (nil? (sut/failure-disclosure {:campaign "c" :stated-by "creator@example"
+                                     :remedy :were-working-on-it}))
+      "'we're working on it' is an update, not a disclosure")
+  (let [d (sut/failure-disclosure {:campaign "c" :stated-by "creator@example"
+                                   :stated-at now :reason :tooling-cost-overrun
+                                   :remedy :partial-refund :detail "60% returned"})]
+    (is (= :partial-refund (:disclosure/remedy d)))
+    (is (true? (:disclosure/human? d)))))

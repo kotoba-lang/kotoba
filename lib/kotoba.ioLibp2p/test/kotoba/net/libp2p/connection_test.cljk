@@ -1,0 +1,84 @@
+(ns kotoba.net.libp2p.connection-test
+  "The muxer loop, and the framing mistake that made a connection look like a
+  peer problem."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.net.libp2p.connection :as connection]
+            [libp2p.yamux :as yamux]))
+
+(defn- scripted-port
+  "A port that reads from a fixed octet script and records what is written."
+  [octets]
+  (let [pending (volatile! (vec octets))
+        written (volatile! [])]
+    {:read! (fn [n]
+              (let [taken (vec (take n @pending))]
+                (when (< (count taken) n)
+                  (throw (ex-info "script exhausted" {:wanted n :got (count taken)})))
+                (vswap! pending #(vec (drop n %)))
+                taken))
+     :write! (fn [octets] (vswap! written into octets))
+     :written written
+     :pending pending}))
+
+(deftest a-data-frames-payload-is-consumed-with-its-header
+  ;; The regression. `yamux/decode` returns {:frame … :rest …}, not the frame;
+  ;; reading its fields off the wrapper gave nil for every one, so nothing
+  ;; looked like DATA, no payload was ever consumed, and the next read took
+  ;; that payload as a header. The connection desynchronized on frame one and
+  ;; the peer -- which had just accepted us -- reset it.
+  (let [payload (vec (range 5))
+        script (into (yamux/data-frame 1 #{} payload)
+                     (yamux/window-update 1 #{} 256))
+        port (scripted-port script)
+        session (volatile! (yamux/session :dialer))
+        inboxes (volatile! {1 []})]
+    (connection/pump! port session inboxes)
+    (is (= payload (get @inboxes 1))
+        "the payload reached the stream's inbox")
+    (testing "and the reader is positioned at the next frame, not inside the last one"
+      (let [frame (connection/pump! port session inboxes)]
+        (is (= :window-update (:type frame)))
+        (is (= 1 (:stream-id frame)))))))
+
+(deftest a-window-update-consumes-no-payload
+  ;; `length` is a credit delta here. Reading it as a byte count eats the next
+  ;; header, and the bytes stay structurally valid so nothing errors.
+  (let [script (into (yamux/window-update 1 #{} 262144)
+                     (yamux/data-frame 1 #{} [42]))
+        port (scripted-port script)
+        session (volatile! (yamux/session :dialer))
+        inboxes (volatile! {1 []})]
+    (connection/pump! port session inboxes)
+    (connection/pump! port session inboxes)
+    (is (= [42] (get @inboxes 1)))))
+
+(deftest an-inbound-stream-is-reset-rather-than-ignored
+  ;; go-libp2p opens `/ipfs/id/1.0.0` at us the moment it accepts. Measured
+  ;; against a local Kubo node: ignoring it made its negotiation time out after
+  ;; 5 s and tear the connection down. A reset answers in one frame.
+  (let [port (scripted-port (yamux/data-frame 2 #{:syn} []))
+        session (volatile! (yamux/session :dialer))
+        inboxes (volatile! {1 []})]
+    (connection/pump! port session inboxes)
+    (let [reply (yamux/decode (vec @(:written port)))]
+      (is (= 2 (get-in reply [:frame :stream-id])))
+      (is (contains? (get-in reply [:frame :flags]) :rst)))))
+
+(deftest a-ping-is-answered-with-an-ack
+  (let [port (scripted-port (yamux/ping 7))
+        session (volatile! (yamux/session :dialer))
+        inboxes (volatile! {1 []})]
+    (connection/pump! port session inboxes)
+    (let [reply (yamux/decode (vec @(:written port)))]
+      (is (= :ping (get-in reply [:frame :type])))
+      (is (= 7 (get-in reply [:frame :length])))
+      (is (contains? (get-in reply [:frame :flags]) :ack)))))
+
+(deftest frames-for-other-streams-do-not-fill-our-inbox
+  (let [port (scripted-port (into (yamux/data-frame 3 #{} [9 9 9])
+                                  (yamux/data-frame 1 #{} [1])))
+        session (volatile! (yamux/session :dialer))
+        inboxes (volatile! {1 []})]
+    (connection/pump! port session inboxes)
+    (connection/pump! port session inboxes)
+    (is (= [1] (get @inboxes 1)))))

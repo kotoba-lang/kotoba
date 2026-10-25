@@ -1,0 +1,62 @@
+(ns autodrive.estimator-drive-test
+  "Ported 1:1 from `kami-autodrive`'s `tests/estimator_drive.rs`.
+
+  End-to-end localisation robustness: the car drives autonomously on its
+  estimated pose (IMU dead-reckoning between sparse absolute fixes), not the
+  ground truth, and still routes around a wall to the goal."
+  (:require [kotoba.test :refer [deftest is]]
+            [autodrive.geom :as g]
+            [autodrive.types :as t]
+            [autodrive.classes :as classes]
+            [autodrive.plant :as plant]
+            [autodrive.autopilot :as ap]
+            [autodrive.estimator :as est]
+            [autodrive.sensor-sim :as sim]))
+
+(def MOUNT-Z 1.0)
+
+(defn- lcg-next [state]
+  (unchecked-add (unchecked-multiply state 6364136223846793005) 1442695040888963407))
+
+(defn- noise [state amp]
+  (let [state' (lcg-next state)
+        u (/ (double (bit-and (unsigned-bit-shift-right state' 40) 0xFFFFFF)) (double (bit-shift-left 1 24)))]
+    [state' (* (- (* u 2.0) 1.0) amp)]))
+
+(defn- sweep [scn true-pose]
+  (sim/ring-sweep (sim/lidar-intrinsics :hfov (* 2.0 Math/PI) :vfov 0.05 :h-beams 240 :v-beams 1
+                                         :range-min 0.2 :range-max 80.0)
+                   true-pose MOUNT-Z scn))
+
+(deftest drives-on-estimated-pose-through-fix-dropout
+  (let [dt (/ 1.0 50)
+        scn (sim/scene-add (sim/scene) (sim/aabb (g/v3 18.0 -5.0 -1.0) (g/v3 22.0 5.0 3.0)))
+        start (t/pose2 0.0 0.0 0.0)
+        goal (g/v2 40.0 0.0)
+        limits (classes/limits :car)]
+    (loop [car (plant/bicycle-model start limits)
+           estimator (est/new-estimator start)
+           ap-i (ap/set-goal (ap/new-autopilot (ap/autopilot-config :car limits) start) goal)
+           rng 0x0badc0de13374242
+           step 0 prev-speed 0.0 prev-yaw 0.0 collided false max-est-err 0.0]
+      (let [truth (plant/pose car)
+            collided (or collided (and (> (:x truth) 18.0) (< (:x truth) 22.0) (< (Math/abs (:y truth)) 5.0)))]
+        (if (or (= :arrived (:state ap-i)) (>= step 2000))
+          (let [truth (plant/pose car)]
+            (is (= :arrived (:state ap-i)) "should reach the goal driving on the estimate")
+            (is (< (g/distance2 (t/pos truth) goal) 3.0) "true pose should end near goal")
+            (is (not collided) "must not hit the wall despite navigating on a noisy estimate")
+            (is (< max-est-err 2.0) "estimate drifted too far"))
+          (let [true-accel (/ (- (plant/speed car) prev-speed) dt)
+                true-yaw-rate (/ (- (:yaw truth) prev-yaw) dt)
+                [rng1 n1] (noise rng 0.12)
+                [rng2 n2] (noise rng1 0.006)
+                est1 (est/predict estimator (+ true-accel 0.05 n1) (+ true-yaw-rate 0.008 n2) dt)
+                fix? (= 11 (mod step 12))
+                est2 (if fix? (est/correct-speed (est/correct est1 truth 0.8) (plant/speed car) 0.8) est1)
+                max-est-err' (max max-est-err (g/distance2 (t/pos (est/pose est2)) (t/pos truth)))
+                ep (est/pose est2)
+                returns (sweep scn truth)
+                [ap' cmd] (ap/step ap-i ep (est/speed est2) returns ep dt)
+                car' (plant/step car cmd dt)]
+            (recur car' est2 ap' rng2 (inc step) (plant/speed car) (:yaw truth) collided max-est-err')))))))

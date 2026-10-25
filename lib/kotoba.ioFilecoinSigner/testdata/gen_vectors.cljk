@@ -1,0 +1,129 @@
+#!/usr/bin/env kbb
+;; Snapshot real signed messages off Filecoin mainnet into
+;; test/filecoin/signer/vectors.cljk.
+;;
+;; This is the only check that proves the signer, and it proves it in the one
+;; direction that cannot be faked: **recovery**. Every signature below was
+;; produced by somebody else's wallet, on the real network, over a message the
+;; network accepted. Recovering the signer and getting back the `From` address
+;; exercises the whole path at once — CBOR field order, the message CID, the
+;; second BLAKE2b-256, ECDSA recovery, the 0x04 prefix, and BLAKE2b-160.
+;; Nothing this library computes is an input to the comparison.
+;;
+;; Two kinds are collected on purpose:
+;;
+;;   type 1 (secp256k1) — recovery MUST return `From`.
+;;   type 3 (delegated) — recovery with the same digest must NOT, because a
+;;                        delegated signature covers the RLP-encoded Ethereum
+;;                        transaction and not the CID. That is the correction
+;;                        recorded in ADR-2607299300, asserted against the
+;;                        network rather than against a reading of the source.
+;;
+;; Type 1 is a minority of mainnet's non-BLS traffic now that most of it is
+;; FEVM, so this walks back over blocks until it has enough.
+;;
+;;   kbb --backend sci testdata/gen_vectors.cljk > test/filecoin/signer/vectors.cljk
+(ns gen-vectors
+  (:require [kotoba.lang.text :as str]))
+
+(def endpoint "https://api.node.glif.io/rpc/v1")
+(def want-secp 3)
+(def want-delegated 2)
+(def max-blocks 40)
+
+(defn- parse-first-document
+  "Glif's public endpoint answers with the response repeated, newline
+  separated. `Response.json()` rejects that; take the first line."
+  [text]
+  (js/JSON.parse (first (remove str/blank? (str/split-lines text)))))
+
+(defn- rpc [method params]
+  (-> (js/fetch endpoint
+                #js {:method "POST"
+                     :headers #js {"content-type" "application/json"}
+                     :body (js/JSON.stringify
+                            (clj->js {:jsonrpc "2.0" :method method
+                                      :params params :id 1}))})
+      (.then #(.text %))
+      (.then (fn [t]
+               (let [r (parse-first-document t)]
+                 (if-let [e (aget r "error")]
+                   (throw (ex-info (str "rpc: " (js/JSON.stringify e)) {}))
+                   (aget r "result")))))))
+
+(defn- emit-message [m]
+  (str "{\"Version\" " (aget m "Version")
+       " \"To\" " (pr-str (aget m "To"))
+       " \"From\" " (pr-str (aget m "From"))
+       " \"Nonce\" " (aget m "Nonce")
+       " \"Value\" " (pr-str (aget m "Value"))
+       " \"GasLimit\" " (aget m "GasLimit")
+       " \"GasFeeCap\" " (pr-str (aget m "GasFeeCap"))
+       " \"GasPremium\" " (pr-str (aget m "GasPremium"))
+       " \"Method\" " (aget m "Method")
+       " \"Params\" " (if-let [p (aget m "Params")] (pr-str p) "nil")
+       "}"))
+
+(defn- emit [sm]
+  (let [m (aget sm "Message")
+        s (aget sm "Signature")]
+    (str "  {:message " (emit-message m)
+         "\n   :from " (pr-str (aget m "From"))
+         "\n   :signature {:type " (aget s "Type")
+         " :data " (pr-str (aget s "Data")) "}"
+         "\n   :signed-cid " (pr-str (aget (aget sm "CID") "/")) "}")))
+
+(defn- collect
+  "Walk back from `cids`, gathering signed messages until both quotas are
+  filled or `max-blocks` blocks have been read."
+  [cids secp delegated seen]
+  (if (or (and (>= (count secp) want-secp) (>= (count delegated) want-delegated))
+          (>= seen max-blocks)
+          (empty? cids))
+    (js/Promise.resolve {:secp (take want-secp secp)
+                         :delegated (take want-delegated delegated)
+                         :blocks seen})
+    (let [c (first cids)]
+      (-> (rpc "Filecoin.ChainGetBlockMessages" [{"/" c}])
+          (.then
+           (fn [r]
+             (let [msgs (array-seq (aget r "SecpkMessages"))
+                   t1 (filter #(= 1 (aget (aget % "Signature") "Type")) msgs)
+                   t3 (filter #(= 3 (aget (aget % "Signature") "Type")) msgs)]
+               (-> (rpc "Filecoin.ChainGetBlock" [{"/" c}])
+                   (.then (fn [blk]
+                            (collect (concat (rest cids)
+                                             (map #(aget % "/")
+                                                  (array-seq (aget blk "Parents"))))
+                                     (concat secp t1)
+                                     (concat delegated t3)
+                                     (inc seen))))))))))))
+
+(defn -main []
+  (-> (rpc "Filecoin.ChainHead" [])
+      (.then (fn [head]
+               (-> (collect (map #(aget % "/") (array-seq (aget head "Cids"))) [] [] 0)
+                   (.then (fn [{:keys [secp delegated blocks]}]
+                            (when (< (count secp) 1)
+                              (throw (ex-info "no type-1 secp256k1 message found" {})))
+                            (println
+                             (str ";; GENERATED by testdata/gen_vectors.cljk — do not edit by hand.\n"
+                                  ";; Real signed messages from Filecoin mainnet near height "
+                                  (aget head "Height") ",\n"
+                                  ";; found by walking back " blocks " blocks. NOT regenerated in CI:\n"
+                                  ";; the chain moves, but these are history.\n"
+                                  "(ns filecoin.signer.vectors)\n\n"
+                                  ";; type 1 — recovery must return :from\n"
+                                  "(def secp256k1-messages\n [\n"
+                                  (str/join "\n" (map emit secp))
+                                  "\n ])\n\n"
+                                  ";; type 3 — a delegated signature covers the RLP-encoded Ethereum\n"
+                                  ";; transaction, so recovery over the message digest must NOT\n"
+                                  ";; return :from. Asserting that is how the rule is checked against\n"
+                                  ";; the network rather than against a reading of lotus.\n"
+                                  "(def delegated-messages\n [\n"
+                                  (str/join "\n" (map emit delegated))
+                                  "\n ])\n")))))))
+      (.catch (fn [e] (js/console.error (str e)) (js/process.exit 1)))))
+
+(-main)

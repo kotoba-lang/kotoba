@@ -1,0 +1,146 @@
+(ns crowdfunding.collection-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [crowdfunding.campaign :as campaign]
+            [crowdfunding.collection :as sut]
+            [crowdfunding.fixtures :as fx]))
+
+(defn collecting []
+  (-> (fx/live) (campaign/advance :funding-succeeded) (campaign/advance :collecting)))
+
+(def w (sut/window {:opened-at "2026-10-01T00:00:00Z" :closes-at "2026-10-08T00:00:00Z"}))
+(def day2 "2026-10-02T00:00:00Z")
+(def after-window "2026-10-09T00:00:00Z")
+
+;; ───────────────────────── plan ─────────────────────────
+
+(deftest a-live-campaign-cannot-be-charged
+  (testing "all-or-nothing is enforced by the plan refusing to exist"
+    (is (= :not-collectible-state
+           (:plan/refused (sut/collection-plan (fx/live) [(fx/a-pledge "p1")] fx/rewards))))
+    (is (= :not-collectible-state
+           (:plan/refused (sut/collection-plan (fx/a-campaign) [(fx/a-pledge "p1")] fx/rewards))))))
+
+(deftest the-plan-charges-the-full-total-in-a-total-order
+  (let [plan (sut/collection-plan (collecting)
+                                  [(fx/a-pledge "p2") (fx/a-pledge "p1")
+                                   (fx/a-pledge "p3" {:pledge/state :collected})
+                                   (fx/a-pledge "p4" {:pledge/state :cancelled})]
+                                  fx/rewards)]
+    (is (= ["p1" "p2"] (mapv :charge/pledge (:plan/charges plan)))
+        "ordered by id so a plan can be diffed against what was attempted")
+    (is (= [25600 25600] (mapv :charge/amount-minor (:plan/charges plan)))
+        "the backer's statement shows goods plus shipping")
+    (is (= 51200 (:plan/total-minor plan)))
+    (is (false? (:plan/custodial? plan)))))
+
+(deftest unpriceable-pledges-are-named-never-guessed
+  (let [plan (sut/collection-plan (collecting)
+                                  [(fx/a-pledge "p1")
+                                   (fx/a-pledge "bad" {:pledge/add-ons
+                                                       [{:add-on/reward "ghost" :add-on/qty 1}]})]
+                                  fx/rewards)]
+    (is (= ["bad"] (:plan/unresolved plan)))
+    (is (= 25600 (:plan/total-minor plan)))))
+
+;; ───────────────────────── attempts ─────────────────────────
+
+(deftest an-unknown-outcome-is-neither-a-success-nor-a-decline
+  (is (nil? (sut/record-attempt (fx/a-pledge "p1") {:outcome :maybe :at day2}))))
+
+(deftest a-successful-attempt-collects
+  (let [p (sut/record-attempt (fx/a-pledge "p1") {:outcome :ok :at day2})]
+    (is (= :collected (:pledge/state p)))
+    (is (= 1 (:pledge/attempts p)))
+    (is (= day2 (:pledge/collected-at p)))))
+
+(deftest a-soft-decline-is-retryable-and-a-hard-one-is-not
+  (let [soft (sut/record-attempt (fx/a-pledge "p1") {:outcome :soft-decline :at day2
+                                                     :reason :insufficient-funds})
+        hard (sut/record-attempt (fx/a-pledge "p2") {:outcome :hard-decline :at day2
+                                                     :reason :account-closed})]
+    (is (= :failed (:pledge/state soft)))
+    (is (true? (:pledge/retryable? soft)))
+    (is (sut/retryable? soft w day2))
+    (is (= :failed (:pledge/state hard)) "no :authorized -> :dropped edge exists")
+    (is (false? (:pledge/retryable? hard)))
+    (is (not (sut/retryable? hard w day2))
+        "retrying a hard decline is a fraud signal, not persistence")))
+
+(deftest retries-are-bounded-by-attempts-and-by-time
+  (let [failed (sut/record-attempt (fx/a-pledge "p1") {:outcome :soft-decline :at day2})]
+    (is (= :retrying (:pledge/state (sut/retry failed w day2))))
+    (testing "attempts run out"
+      (let [spent (assoc failed :pledge/attempts (:window/max-attempts w))]
+        (is (not (sut/retryable? spent w day2)))
+        (is (nil? (sut/retry spent w day2)))))
+    (testing "the window closes"
+      (is (sut/window-closed? w after-window))
+      (is (not (sut/retryable? failed w after-window)))
+      (is (nil? (sut/retry failed w after-window))))))
+
+(deftest expiry-refuses-to-drop-a-backer-early
+  (let [failed (sut/record-attempt (fx/a-pledge "p1") {:outcome :soft-decline :at day2})]
+    (is (nil? (sut/expire failed w day2))
+        "an early drop is indistinguishable, in the totals, from a backer who never existed")
+    (let [dropped (sut/expire failed w after-window)]
+      (is (= :dropped (:pledge/state dropped)))
+      (is (= :window-closed (:pledge/drop-reason dropped))))
+    (let [hard (sut/record-attempt (fx/a-pledge "p2") {:outcome :hard-decline :at day2})]
+      (is (= :hard-decline (:pledge/drop-reason (sut/expire hard w day2)))))))
+
+;; ───────────────────────── finalize ─────────────────────────
+
+(def settled
+  [(fx/a-pledge "c1" {:pledge/state :collected})
+   (fx/a-pledge "c2" {:pledge/state :collected})
+   (fx/a-pledge "d1" {:pledge/state :dropped})])
+
+(deftest finalize-separates-money-in-from-money-promised
+  (let [f (sut/finalize (collecting) settled fx/rewards)]
+    (is (= 51200 (:collection/collected-minor f)))
+    (is (= 49600 (:collection/collected-goods-minor f)) "goods, for the goal comparison")
+    (is (= 25600 (:collection/dropped-minor f)))
+    (is (= 3333 (:collection/drop-off-bps f)) "one in three authorisations never paid")
+    (is (= 2 (:collection/collected-backers f)))
+    (is (true? (:collection/complete? f)))))
+
+(deftest a-shortfall-is-reported-not-acted-on
+  (let [f (sut/finalize (collecting) settled fx/rewards)]
+    (is (false? (:collection/goal-still-met? f)))
+    (is (= 4950400 (:collection/shortfall-minor f)))
+    (is (= :fulfilling (:collection/proposed-state f))
+        "backers were charged, so the obligation stands even though collections fell short"))
+  (testing "a campaign whose collections all dropped did not happen"
+    (let [f (sut/finalize (collecting) [(fx/a-pledge "d1" {:pledge/state :dropped})] fx/rewards)]
+      (is (= :funding-failed (:collection/proposed-state f)))
+      (is (= 10000 (:collection/drop-off-bps f)))))
+  (testing "and a small goal is genuinely met on collections"
+    (let [c (-> (fx/a-campaign {:campaign/goal-minor 49600})
+                (assoc :campaign/state :funding-succeeded)
+                (campaign/advance :collecting))
+          f (sut/finalize c settled fx/rewards)]
+      (is (true? (:collection/goal-still-met? f)))
+      (is (zero? (:collection/shortfall-minor f))))))
+
+(deftest finalization-is-applied-separately-from-being-computed
+  (let [c (collecting)
+        f (sut/finalize c settled fx/rewards)]
+    (is (= :fulfilling (:campaign/state (sut/apply-finalization c f))))
+    (is (nil? (sut/apply-finalization
+               (campaign/suspend c {:by "trust@example" :reason :hold}) f))
+        "a suspended campaign does not advance itself out of review")))
+
+(deftest unpriceable-pledges-are-named-in-the-finalisation-too
+  (testing "a drop-off ratio over a set that quietly lost members reads better than the truth"
+    (let [broken (fx/a-pledge "bad" {:pledge/state :dropped
+                                     :pledge/add-ons [{:add-on/reward "ghost" :add-on/qty 1}]})
+          f      (sut/finalize (collecting) (conj settled broken) fx/rewards)]
+      (is (= ["bad"] (:collection/unresolved f)))
+      (is (= 25600 (:collection/dropped-minor f))
+          "the unpriceable one cannot be added, so it is named instead")
+      (is (= 3333 (:collection/drop-off-bps f))))))
+
+(deftest pending-pledges-keep-the-window-open
+  (let [f (sut/finalize (collecting) (conj settled (fx/a-pledge "p9")) fx/rewards)]
+    (is (= 1 (:collection/pending-count f)))
+    (is (false? (:collection/complete? f)))))

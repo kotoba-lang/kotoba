@@ -1,0 +1,123 @@
+(ns crowdfunding.trust-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [crowdfunding.discovery :as discovery]
+            [crowdfunding.fixtures :as fx]
+            [crowdfunding.trust :as sut]))
+
+(def full-evidence
+  {:email true :payment-method true :identity-document true
+   :address-proof true :sanctions-screen true :aml/status :clear})
+
+(defn review [& [{:keys [campaign rewards disclosures evidence context]}]]
+  (sut/review {:campaign    (or campaign (fx/a-campaign))
+               :rewards     (or rewards fx/rewards)
+               :disclosures (or disclosures sut/required-disclosures)
+               :evidence    (or evidence full-evidence)
+               :context     (or context {:prototype-exists? true})}))
+
+(defn rules [r] (set (map :finding/rule (:review/findings r))))
+
+(deftest a-complete-campaign-reviews-clean
+  (let [r (review)]
+    (is (true? (:review/clean? r)))
+    (is (zero? (:review/blocking-count r)))))
+
+(deftest a-clean-review-is-still-a-human-decision
+  (testing "letting a stranger take money from the public has an author either way"
+    (is (true? (:review/human-required? (review))))
+    (is (false? (:review/adjudicated? (review))))))
+
+;; ───────────────────────── policy ─────────────────────────
+
+(deftest financial-instruments-are-not-rewards-campaigns
+  (doseq [cat [:equity :revenue-share :loan]]
+    (is (contains? (rules (review {:campaign (fx/a-campaign {:campaign/category cat})}))
+                   :prohibited-category)
+        (str cat " is a security or a loan, not a reward")))
+  (is (contains? sut/prohibited-categories :lottery)))
+
+(deftest restricted-categories-are-advisory-not-blocking
+  (let [r (review {:campaign (fx/a-campaign {:campaign/category :food})})]
+    (is (contains? (rules r) :restricted-category))
+    (is (true? (:review/clean? r)) "a human must look, but the rule does not block")))
+
+(deftest every-restriction-is-keyed-on-a-category-a-campaign-can-be-filed-under
+  (testing "a rule that never fires reads like coverage and is not"
+    (is (every? discovery/categories (keys sut/restricted-categories)))))
+
+(deftest missing-disclosures-block
+  (let [r (review {:disclosures #{:risks}})]
+    (is (contains? (rules r) :missing-disclosure))
+    (is (= 3 (:review/blocking-count r)))))
+
+(deftest a-one-line-risks-section-is-a-formality-not-a-disclosure
+  (let [r (review {:campaign (fx/a-campaign {:campaign/risks "Some risk."})})]
+    (is (contains? (rules r) :risks-section-too-thin))
+    (is (false? (:review/clean? r)))))
+
+;; ───────────────────────── verification ─────────────────────────
+
+(deftest verification-scales-with-the-ask
+  (is (= #{:email :payment-method} (:floor/requires (sut/floor-for 100000))))
+  (is (contains? (:floor/requires (sut/floor-for 5000000)) :identity-document))
+  (is (contains? (:floor/requires (sut/floor-for 50000000)) :sanctions-screen)))
+
+(deftest a-large-ask-with-thin-evidence-is-blocked
+  (let [r (review {:campaign (fx/a-campaign {:campaign/goal-minor 50000000})
+                   :evidence {:email true :payment-method true}})]
+    (is (contains? (rules r) :insufficient-verification))
+    (is (contains? (rules r) :aml-not-run))
+    (is (false? (:review/clean? r)))))
+
+(deftest an-absent-aml-result-is-not-a-pass
+  (testing "'not run' and 'clear' are different statements and only one is evidence"
+    (let [base {:email true :payment-method true :identity-document true
+                :address-proof true :sanctions-screen true}
+          c    (fx/a-campaign {:campaign/goal-minor 50000000})]
+      (is (contains? (rules (review {:campaign c :evidence base})) :aml-not-run))
+      (is (contains? (rules (review {:campaign c :evidence (assoc base :aml/status :not-run)}))
+                     :aml-not-run))
+      (is (contains? (rules (review {:campaign c :evidence (assoc base :aml/status :hold)}))
+                     :aml-hold))
+      (is (not (contains? (rules (review {:campaign c :evidence (assoc base :aml/status :clear)}))
+                          :aml-not-run))))))
+
+;; ───────────────────────── rewards and presentation ─────────────────────────
+
+(deftest a-rewards-campaign-needs-a-reward
+  (is (contains? (rules (review {:rewards [fx/wrist-rest]})) :no-reward-tiers)
+      "an add-on is not a tier"))
+
+(deftest delivery-before-the-deadline-is-flagged
+  (let [early (assoc fx/standard :reward/estimated-delivery "2026-09-01")
+        r     (review {:rewards [early]})]
+    (is (contains? (rules r) :delivery-before-deadline))))
+
+(deftest renders-without-a-prototype-are-advisory
+  (let [r (review {:context {:prototype-exists? false :imagery [:photoreal-render]}})]
+    (is (contains? (rules r) :no-working-prototype))
+    (is (contains? (rules r) :render-may-read-as-product))
+    (is (true? (:review/clean? r))
+        "only a human can look at an image and say which it is")))
+
+;; ───────────────────────── the decision ─────────────────────────
+
+(deftest approval-needs-an-author
+  (is (nil? (sut/decision (review) {:outcome :approved :decided-by ""})))
+  (is (nil? (sut/decision (review) {:outcome :maybe :decided-by "ops@example"})))
+  (let [d (sut/decision (review) {:outcome :approved :decided-by "ops@example"
+                                  :decided-at "2026-08-01T00:00:00Z"
+                                  :rationale "prototype video and BOM reviewed"})]
+    (is (= :approved (:decision/outcome d)))
+    (is (true? (:decision/human? d)))))
+
+(deftest a-blocking-finding-cannot-be-approved-past-without-being-named
+  (let [r (review {:campaign (fx/a-campaign {:campaign/risks "Some risk."})})]
+    (is (= [:risks-section-too-thin] (mapv :finding/rule (sut/launch-blocked-by r))))
+    (is (nil? (sut/decision r {:outcome :approved :decided-by "ops@example"}))
+        "a blanket override is not expressible")
+    (is (some? (sut/decision r {:outcome :approved :decided-by "ops@example"
+                                :waived [:risks-section-too-thin]
+                                :rationale "risks live in an attached PDF"})))
+    (is (some? (sut/decision r {:outcome :rejected :decided-by "ops@example"}))
+        "rejecting never needs a waiver")))

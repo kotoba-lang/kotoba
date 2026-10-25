@@ -1,0 +1,171 @@
+(ns domain-billing.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [domain-billing.core :as bill]
+            [srs.core :as srs]
+            [srs.time :as t]))
+
+(def t0 (t/civil->ms {:year 2024 :month 1 :day 15 :ms-of-day 0}))
+(defn d+ [n] (t/plus-days t0 n))
+
+(def usd #(bill/money % "USD"))
+
+(def book
+  (bill/price-book
+   {"com" {:create (usd 900) :renew (usd 900) :auto-renew (usd 900)
+           :transfer (usd 900) :restore (usd 8000)
+           :icann-fee (usd 18)}
+    "jp"  {:create (bill/money 3000 "JPY") :renew (bill/money 3000 "JPY")}}))
+
+;; ── money ─────────────────────────────────────────────────────────────────
+
+(deftest amounts-are-integer-minor-units
+  (is (= 900 (:money/amount (usd 900))))
+  (is (thrown? #?(:clj AssertionError :cljs js/Error) (bill/money 9.5 "USD"))
+      "floating point cannot represent 0.1; a summed price book drifts")
+  (testing "formatting uses the currency's real minor-unit count"
+    (is (= "USD 9.00" (bill/format-money (usd 900))))
+    (is (= "USD 0.18" (bill/format-money (usd 18))))
+    (is (= "-USD 9.00" (bill/format-money (bill/negate (usd 900)))))
+    (is (= "JPY 3000" (bill/format-money (bill/money 3000 "JPY")))
+        "yen has no minor unit; formatting it as 30.00 is off by a hundred")))
+
+(deftest mixing-currencies-is-refused-rather-than-summed
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (bill/add (usd 900) (bill/money 3000 "JPY")))))
+
+(deftest scaling-is-integer-only
+  (is (= 2700 (:money/amount (bill/scale (usd 900) 3))))
+  (is (thrown? #?(:clj AssertionError :cljs js/Error) (bill/scale (usd 900) 1.5))
+      "there is no such thing as two and a half years of registration"))
+
+;; ── charging from real srs events ─────────────────────────────────────────
+
+(deftest a-create-is-charged-per-year-with-the-icann-fee-per-year
+  (let [r (srs/execute (srs/empty-registry "com")
+                       {:command/kind :domain/create :command/name "example.com"
+                        :command/registrar "reg-a" :years 3
+                        :nameservers ["ns1.example.net"] :auth-info "x"}
+                       t0)
+        [entry] (bill/ledger book (:events r))]
+    (is (= :charge (:entry/kind entry)))
+    (is (= 3 (:entry/years entry)))
+    (is (= (usd (+ (* 3 900) (* 3 18))) (:entry/amount entry)))
+    (is (= (usd 54) (:entry/icann-fee entry))
+        "the pass-through is reported separately from the registry's own price")))
+
+(deftest a-delete-inside-the-add-grace-refunds-the-create
+  (let [reg (:registry (srs/execute (srs/empty-registry "com")
+                                    {:command/kind :domain/create :command/name "example.com"
+                                     :command/registrar "reg-a" :years 1 :auth-info "x"}
+                                    t0))
+        r (srs/execute reg {:command/kind :domain/delete :command/name "example.com"
+                            :command/registrar "reg-a"} (d+ 3))
+        entries (bill/ledger book (:events r))]
+    (is (= [:refund] (mapv :entry/kind entries)))
+    (is (= (usd -900) (:entry/amount (first entries))))
+    (is (= :add (:entry/within-grace (first entries))))))
+
+(deftest a-delete-outside-any-grace-refunds-nothing
+  (let [reg (:registry (srs/execute (srs/empty-registry "com")
+                                    {:command/kind :domain/create :command/name "example.com"
+                                     :command/registrar "reg-a" :years 1 :auth-info "x"}
+                                    t0))
+        r (srs/execute reg {:command/kind :domain/delete :command/name "example.com"
+                            :command/registrar "reg-a"} (d+ 10))]
+    (is (empty? (bill/ledger book (:events r))))))
+
+(deftest refund-eligibility-is-read-from-the-event-not-recomputed
+  (testing "billing never looks at a date; it reads what the lifecycle decided"
+    (is (nil? (bill/charge-for book {:event/kind :domain/deleted
+                                     :event/domain "example.com"
+                                     :event/billable :delete-refund
+                                     :event/at (d+ 3)
+                                     :event/refundable? false})))
+    (is (= :refund (:entry/kind (bill/charge-for book {:event/kind :domain/deleted
+                                                       :event/domain "example.com"
+                                                       :event/billable :delete-refund
+                                                       :event/at (d+ 999)
+                                                       :event/refundable? true
+                                                       :event/within-grace :add})))
+        "same instant, opposite answer — the date is not the input")))
+
+(deftest an-auto-renew-grace-delete-refunds-the-renewal-not-the-create
+  (let [e {:event/kind :domain/deleted :event/domain "example.com"
+           :event/billable :delete-refund :event/at (d+ 400)
+           :event/refundable? true :event/within-grace :auto-renew}
+        r (bill/charge-for book e)]
+    (is (= (usd -900) (:entry/amount r)))
+    (is (= :auto-renew (:entry/within-grace r))
+        "refunding a create here would hand back a year the registrar never paid for")))
+
+(deftest a-decade-of-auto-renewals-bills-once-a-year
+  (let [reg (:registry (srs/execute (srs/empty-registry "com")
+                                    {:command/kind :domain/create :command/name "example.com"
+                                     :command/registrar "reg-a" :years 1 :auth-info "x"}
+                                    t0))
+        swept (srs/advance reg (t/plus-years t0 6))
+        entries (bill/ledger book (:events swept))]
+    (is (= 6 (count entries)))
+    (is (every? #(= :auto-renew (:entry/action %)) entries))
+    (is (= (usd (* 6 (+ 900 18))) (bill/total entries)))
+    (testing "the events were not coalesced — six renewals are six lines"
+      (is (= 6 (count (distinct (map :entry/at entries))))))))
+
+(deftest an-unpriced-tld-is-reported-not-silently-free
+  (let [b (bill/price-book {"com" {:create (usd 900)}})
+        e {:event/kind :domain/created :event/domain "example.xyz"
+           :event/billable :create :event/at t0 :event/years 1}
+        entry (bill/charge-for b e)]
+    (is (= :unpriced (:entry/kind entry)))
+    (is (= [entry] (bill/unpriced [entry])))
+    (is (nil? (bill/total [entry])) "an unpriced entry contributes nothing to a total")
+    (testing "and so is a priced TLD missing one action"
+      (is (= :unpriced (:entry/kind
+                        (bill/charge-for b {:event/kind :domain/restored
+                                            :event/domain "example.com"
+                                            :event/billable :restore
+                                            :event/at t0})))))))
+
+(deftest a-default-tld-entry-catches-everything-else
+  (let [b (bill/price-book {:default {:create (usd 1200)}})]
+    (is (= (usd 1200) (:entry/amount (bill/charge-for b {:event/kind :domain/created
+                                                         :event/domain "example.anything"
+                                                         :event/billable :create
+                                                         :event/at t0 :event/years 1}))))))
+
+(deftest non-billable-events-produce-nothing
+  (doseq [k [:domain/updated :domain/purged :domain/transfer-requested
+             :domain/pending-delete :domain/restore-expired]]
+    (is (nil? (bill/charge-for book {:event/kind k :event/domain "example.com"
+                                     :event/at t0})))))
+
+;; ── invoices ──────────────────────────────────────────────────────────────
+
+(deftest an-invoice-separates-the-icann-pass-through-from-the-total
+  (let [entries (bill/ledger book [{:event/kind :domain/created :event/domain "a.com"
+                                    :event/billable :create :event/at t0 :event/years 2}
+                                   {:event/kind :domain/renewed :event/domain "b.com"
+                                    :event/billable :renew :event/at t0 :event/years 1}])
+        inv (bill/invoice entries {:registrar "reg-a"
+                                   :period-start t0 :period-end (d+ 30)})]
+    (is (= 2 (count (:invoice/entries inv))))
+    (is (= (usd (+ (* 2 918) 918)) (:invoice/total inv)))
+    (is (= (usd (+ 36 18)) (:invoice/icann-fees inv))
+        "reporting only the gross makes the margin look larger and the remittance unreconcilable")
+    (is (empty? (:invoice/unpriced inv)))))
+
+(deftest entries-group-by-the-registrar-who-held-the-domain-then
+  (let [entries (bill/ledger book [{:event/kind :domain/created :event/domain "a.com"
+                                    :event/billable :create :event/at t0 :event/years 1}
+                                   {:event/kind :domain/renewed :event/domain "b.com"
+                                    :event/billable :renew :event/at t0 :event/years 1}])
+        owner {"a.com" "reg-a" "b.com" "reg-b"}
+        grouped (bill/by-registrar entries #(owner (:entry/domain %)))]
+    (is (= #{"reg-a" "reg-b"} (set (keys grouped))))
+    (is (= 1 (count (get grouped "reg-a"))))))
+
+(deftest a-total-sums-refunds-as-negatives-rather-than-subtracting-twice
+  (let [entries [{:entry/kind :charge :entry/amount (usd 900)}
+                 {:entry/kind :charge :entry/amount (usd 900)}
+                 {:entry/kind :refund :entry/amount (usd -900)}]]
+    (is (= (usd 900) (bill/total entries)))))
