@@ -1,0 +1,296 @@
+(ns kotoba.codebase.typed-code-v2-test
+  "Identity layer 2: the CID a typed definition gets IS the payload-v2 DefCID
+  `kotoba.kir.definition-identity` mints.
+
+  The divergence suite next door pins that layer 1 answers `what is this
+  definition` differently from the contract's implementation. This suite is
+  the other half: under `:identity-version 2` there is one answer, layer 1 is
+  untouched, and every route from one to the other either produces that same
+  answer or refuses out loud.
+
+  Layer 2 is opt-in and layer 1 is the default because layer-1 CIDs are
+  published. Measured 2026-09-02: kotoba-lang `lang/package-registry.edn`
+  `:registry/definition-cids` names
+  bafyreif7drknz5fumncb5gqdo2jqel7hulxbzwcoohq2gsds2zm26pe6oe, whose block is
+  committed at `site/{assets,dist}/ipfs/`, sits inside a signed publication
+  record and an ML-DSA attestation, and answers 200 from kotoba-lang.org and
+  kotoba.cloud."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]
+            [kotoba.codebase.typed-code :as typed]
+            [kotoba.codebase.typed-eval :as typed-eval]
+            [kotoba.codebase.typed-migrate :as migrate]
+            [kotoba.kir.definition-identity :as di]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-typed-v2-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- with-store [body-fn]
+  (let [root (temp-store)]
+    (try (store/initialize! root) (body-fn root)
+         (finally (delete-tree root)))))
+
+(defn- kir [functions]
+  {:format :kotoba.kir/v3 :exports (mapv :name functions) :schemas nil
+   :functions (vec functions)})
+
+(def ^:private double-fn
+  {:name 'double :params '[x] :param-types [:i64] :result :i64 :effects #{}
+   :body '(* x 2)})
+
+(def ^:private quadruple-fn
+  {:name 'quadruple :params '[x] :param-types [:i64] :result :i64 :effects #{}
+   :body '(double (double x))})
+
+(def ^:private named-effect-fn
+  "The effect row already in the sealed vocabulary: named operations."
+  {:name 'write :params '[x] :param-types [:i64] :result :i64
+   :effects #{:log/write}
+   :body '(typed-cap-call 9 :i64 :i64 x)})
+
+(def ^:private wire-effect-fn
+  "The effect row as the compiler reports it."
+  {:name 'emit :params '[x] :param-types [:i64] :result :i64
+   :effects #{[:cap/call 9]}
+   :body '(typed-cap-call 9 :i64 :i64 x)})
+
+(def ^:private even-fn
+  {:name 'even :params '[n] :param-types [:i64] :result :i64 :effects #{}
+   :body '(if (= n 0) 1 (odd (- n 1)))})
+
+(def ^:private odd-fn
+  {:name 'odd :params '[n] :param-types [:i64] :result :i64 :effects #{}
+   :body '(if (= n 0) 0 (even (- n 1)))})
+
+(defn- compiled [function & {:as opts}]
+  (get-in (typed/compile-module (kir [function]) (assoc opts :identity-version 2))
+          [:definitions (:name function)]))
+
+(defn- problem-of [f]
+  (try (f) ::no-refusal
+       (catch kerror/ExceptionInfo e (:problem (ex-data e)))))
+
+(defn- message-of [f]
+  (try (f) ::no-refusal
+       (catch kerror/ExceptionInfo e (.getMessage e))))
+
+;; ---------------------------------------------------------------------------
+;; The identity itself
+
+(deftest layer-2-delegates-its-cid-to-definition-identity
+  (testing "the CID is the DefCID over the six sealed inputs, not a second hash"
+    (let [d (compiled double-fn)]
+      (is (= 2 (:identity-version d)))
+      (is (= (:cid d) (di/definition-cid (:payload d)))
+          "typed-code no longer answers `what is this definition` on its own")
+      (is (= [:definition/profile-version :definition/desugar-contract-version
+              :definition/kir :definition/effect-row :definition/interface
+              :definition/dependencies]
+             (vec di/definition-required))
+          "and the payload it delegates is exactly the contract's sealed input list")))
+
+  (testing "the stored block hashes to that same CID"
+    ;; This is the invariant that decides the block SHAPE rather than
+    ;; decorating it: `store/put-block!` re-encodes a block and refuses one
+    ;; whose bytes do not hash to the name it is filed under. A CID minted by
+    ;; `definition-cid` can therefore name only the canonical payload itself.
+    (let [d (compiled double-fn)]
+      (is (= (:cid d) (semantic/block-cid (:block d))))
+      (is (:ok? (semantic/verify-block (:cid d) (:block d))))))
+
+  (testing "a layer-2 block survives a real store round trip"
+    (with-store
+      (fn [root]
+        (let [d (compiled double-fn)]
+          (is (= (:cid d) (store/put-block! root (:cid d) (:block d))))
+          (is (= (:block d) (store/get-block root (:cid d)))
+              "CBOR round trip is byte-stable, which is what put-block! verified"))))))
+
+(deftest layer-2-seals-the-schema-tag-inside-the-identity
+  (let [d (compiled double-fn)]
+    (is (= typed/schema-v2 (get-in d [:payload :definition/interface :schema])))
+    (is (= 2 (typed/block-identity-version (:block d))))
+    (is (not= (:cid d)
+              (di/definition-cid
+               (assoc-in (:payload d) [:definition/interface :schema] "something.else")))
+        "the tag is part of the identity, so it cannot be restated differently
+         for the same CID")))
+
+(deftest the-two-layers-discriminate-without-guessing
+  (let [v1 (get-in (typed/compile-module (kir [double-fn])) [:definitions 'double])
+        v2 (compiled double-fn)]
+    (is (= 1 (typed/block-identity-version (:block v1))))
+    (is (= 2 (typed/block-identity-version (:block v2))))
+    (is (nil? (typed/block-identity-version {"schema" "kotoba.namespace.v1"}))
+        "an unrecognised block gets nil, never a default -- a reader that
+         guesses layer 1 accepts a layer-2 block and decodes it as something
+         it is not")
+    (is (nil? (typed/block-identity-version ["map" []])))))
+
+(deftest layer-1-is-unchanged-and-remains-the-default
+  (testing "the default is still layer 1"
+    (is (= 1 typed/default-identity-version))
+    (is (= 1 (get-in (typed/compile-module (kir [double-fn]))
+                     [:definitions 'double :identity-version]))))
+  (testing "and its CIDs have not moved"
+    ;; Frozen because they are published. If either changes, a signed record
+    ;; and a live URL stop resolving.
+    (is (= "bafyreihetwjs6fjj63z5zqnho7befbvw2h5igtmvujuaaiqfnjrg5uq7yq"
+           (get-in (typed/compile-module (kir [double-fn])) [:definitions 'double :cid])))
+    (is (= "bafyreibsdyuxvctmdtocmrwidacdflmq7disy7h2oogvsf4u2hyye75gcq"
+           (get-in (typed/compile-module (kir [wire-effect-fn])) [:definitions 'emit :cid])))))
+
+;; ---------------------------------------------------------------------------
+;; The effect row
+
+(deftest layer-2-seals-the-named-operation-row-and-never-a-string
+  (testing "a keyword row is already the sealed vocabulary"
+    (is (= #{:log/write}
+           (get-in (compiled named-effect-fn) [:payload :definition/effect-row]))))
+
+  (testing "a compiler wire row is bridged through the catalog"
+    (let [d (compiled wire-effect-fn :capability-id->name {9 :log/write})]
+      (is (= #{:log/write} (get-in d [:payload :definition/effect-row])))
+      (is (= (:cid d) (:cid (compiled named-effect-fn)))
+          "a bridged row seals exactly the bytes a hand-resolved row seals, so
+           the wire ABI is not in the identity")))
+
+  (testing "and it is never stringified, which is the layer-1 defect"
+    (let [row (get-in (compiled named-effect-fn) [:payload :definition/effect-row])]
+      (is (every? keyword? row))
+      (is (not (contains? row "log/write")))
+      (is (not (contains? row "[:cap/call 9]")))))
+
+  (testing "a wire row with no catalog is refused, not guessed"
+    (is (= :typed-code/effect-row-unbridged
+           (problem-of #(compiled wire-effect-fn))))
+    (is (= "effect row wire id has no catalog name: [:cap/call 9]"
+           (message-of #(compiled wire-effect-fn :capability-id->name {}))))))
+
+;; ---------------------------------------------------------------------------
+;; Dependencies
+
+(deftest a-dependency-is-a-cid-in-the-body-and-in-the-sealed-input
+  (with-store
+    (fn [_root]
+      (let [module (typed/compile-module (kir [double-fn quadruple-fn])
+                                         {:identity-version 2})
+            d (get-in module [:definitions 'double])
+            q (get-in module [:definitions 'quadruple])]
+        (is (= [(:cid d)] (get-in q [:payload :definition/dependencies])))
+        (is (= {:op :kir/definition-ref :cid (:cid d)}
+               (first (filter map? (tree-seq coll? seq
+                                             (get-in q [:payload :definition/kir :body])))))
+            "ordinary data, because the canonical identity domain admits no CBOR tag")
+        (is (= (:cid q) (di/definition-cid (:payload q))))
+        (is (= (:cid q) (semantic/block-cid (:block q))))))))
+
+;; ---------------------------------------------------------------------------
+;; What layer 2 refuses rather than approximating
+
+(deftest layer-2-refuses-a-recursive-group
+  (is (= :typed-code/recursive-group-unsupported-under-v2
+         (problem-of #(typed/compile-module (kir [even-fn odd-fn]) {:identity-version 2}))))
+  (testing "layer 1 still compiles the same group"
+    (is (= 2 (count (:definitions (typed/compile-module (kir [even-fn odd-fn]))))))))
+
+(deftest an-unknown-identity-version-is-refused
+  (is (= :typed-code/unknown-identity-version
+         (problem-of #(typed/compile-module (kir [double-fn]) {:identity-version 3})))))
+
+(deftest typed-eval-refuses-a-layer-2-block-by-name
+  ;; A layer-2 block has no "schema" key, so an unguarded reader reports the
+  ;; same nil-schema failure it reports for an unrelated corrupt block.
+  (with-store
+    (fn [root]
+      (let [d (compiled double-fn)]
+        (store/put-block! root (:cid d) (:block d))
+        (is (= :typed-eval/identity-layer-2-not-executable
+               (problem-of #(typed-eval/assemble root (:cid d)))))
+        (is (re-find #"kotoba\.codebase\.typed-migrate"
+                     (message-of #(typed-eval/assemble root (:cid d))))
+            "and names where the relationship between the layers is written")))))
+
+;; ---------------------------------------------------------------------------
+;; Migration
+
+(defn- store-layer-1! [root function]
+  (let [module (typed/compile-module (kir [function]))
+        d (get-in module [:definitions (:name function)])]
+    (store/put-block! root (:interface-cid d) (:interface-block d))
+    (store/put-block! root (:cid d) (:block d))
+    d))
+
+(deftest migrating-a-stored-layer-1-definition-lands-on-the-compiled-identity
+  ;; The load-bearing claim. If migration produced its own answer it would be
+  ;; a THIRD identity, which is the defect this layer exists to close.
+  (with-store
+    (fn [root]
+      (let [v1 (store-layer-1! root double-fn)
+            planned (migrate/migrate! root (:cid v1))
+            fresh (compiled double-fn)]
+        (is (= (:cid v1) (:v1-cid planned)))
+        (is (= (:cid fresh) (:v2-cid planned))
+            "migrating a stored block and compiling the same KIR under layer 2
+             produce one CID")
+        (is (= (:block fresh) (:block planned)))
+        (is (= (:v2-cid planned) (semantic/block-cid (:block planned))))
+        (is (= (:block planned) (store/get-block root (:v2-cid planned)))
+            "and migrate! actually wrote it")
+        ;; Compared by CID, not by value: a decoded block carries
+        ;; `cbor.core.Tagged` links whose payload is a byte array, and a byte
+        ;; array compares by identity. `get-block` re-derives the CID before
+        ;; returning, so reading it back at all is the assertion.
+        (is (:ok? (semantic/verify-block (:cid v1) (store/get-block root (:cid v1))))
+            "while the layer-1 block stays exactly where a published record
+             points at it")))))
+
+(deftest migration-carries-a-named-effect-row-through
+  (with-store
+    (fn [root]
+      (let [v1 (store-layer-1! root named-effect-fn)
+            planned (migrate/plan root (:cid v1))]
+        (is (= #{:log/write} (get-in planned [:payload :definition/effect-row])))
+        (is (= (:cid (compiled named-effect-fn)) (:v2-cid planned)))))))
+
+(deftest migration-refuses-a-stringified-wire-row-rather-than-parsing-it-back
+  (with-store
+    (fn [root]
+      (let [v1 (store-layer-1! root wire-effect-fn)]
+        (is (= ["[:cap/call 9]"] (get (:interface-block v1) "effects"))
+            "layer 1 sealed the printed vector, which is the thing that cannot
+             be undone")
+        (is (= :typed-migrate/effect-row-unmigratable
+               (problem-of #(migrate/plan root (:cid v1)))))
+        (is (= "stored effect row member is a stringified compiler wire row: [:cap/call 9]"
+               (message-of #(migrate/plan root (:cid v1)))))))))
+
+(deftest migration-refuses-what-it-cannot-address
+  (with-store
+    (fn [root]
+      (testing "a recursive group member"
+        (let [module (typed/compile-module (kir [even-fn odd-fn]))
+              d (get-in module [:definitions 'even])]
+          (store/put-block! root (:interface-cid d) (:interface-block d))
+          (store/put-block! root (:group-cid d) (:group-block d))
+          (store/put-block! root (:cid d) (:block d))
+          (is (= :typed-migrate/recursive-group-unmigratable
+                 (problem-of #(migrate/plan root (:cid d)))))))
+
+      (testing "a block that is already layer 2"
+        (let [d (compiled double-fn)]
+          (store/put-block! root (:cid d) (:block d))
+          (is (= :typed-migrate/already-migrated
+                 (problem-of #(migrate/plan root (:cid d)))))))
+
+      (testing "a block that is not a typed definition at all"
+        (let [block {"schema" "kotoba.namespace.v1" "parents" [] "bindings" {}}
+              cid (semantic/block-cid block)]
+          (store/put-block! root cid block)
+          (is (= :typed-migrate/not-a-typed-definition
+                 (problem-of #(migrate/plan root cid)))))))))

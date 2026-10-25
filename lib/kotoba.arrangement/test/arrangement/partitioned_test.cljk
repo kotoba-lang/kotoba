@@ -1,0 +1,135 @@
+(ns arrangement.partitioned-test
+  "Partitioned-root writer discipline.
+
+  The claim under test is not `it stores things` — `arrangement.core` already
+  does that — but `many writers may commit without contending, AND a reader
+  still sees one joinable plane`. The second half is the one that is easy to
+  lose: drop it and this is sharding, which buys the same write throughput by
+  giving up the cross-partition question. So the central test compares a
+  partitioned root against a single-lane commit of the SAME facts and requires
+  identical query answers.
+
+  JVM-only for the same reason `arrangement.core-test`'s commit/restore tests
+  are: `commit!`/`restore` are synchronous on clj and Promise-based on cljs,
+  and the crypto fixtures follow. `restore-all`'s cljs branch is therefore NOT
+  exercised here."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [arrangement.core :as arr]
+            [arrangement.partitioned :as part]
+            [arrangement.core-test :refer [test-blind-fn test-encrypt-fn test-decrypt-fn]]
+            [ipld.core :as ipld]))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+(defn- db-of [quads]
+  (reduce arr/assert-quad (arr/empty-db) quads))
+
+(defn- commit-db! [put! db]
+  (arr/commit! put! db nil arr/current-schema-version test-blind-fn test-encrypt-fn))
+
+;; Three writers' worth of facts, deliberately overlapping in predicate so a
+;; cross-partition query has something to find.
+(def ^:private facts
+  {:chain-base   [{:s "0xaa" :p "chain" :o "base"} {:s "0xaa" :p "paid" :o "100"}]
+   :chain-eth    [{:s "0xbb" :p "chain" :o "ethereum"} {:s "0xbb" :p "paid" :o "250"}]
+   :chain-arb    [{:s "0xcc" :p "chain" :o "arbitrum"} {:s "0xcc" :p "paid" :o "100"}]})
+
+#?(:clj
+   (deftest partitioned-root-preserves-join-reach
+     (let [{:keys [put! get-fn]} (mem-store)
+           ;; single lane: every fact in one db, one snapshot
+           single (arr/restore get-fn (commit-db! put! (db-of (mapcat val facts)))
+                               test-decrypt-fn)
+           ;; partitioned: one snapshot per writer, then one root over them
+           parts (into {} (map (fn [[k qs]] [k (commit-db! put! (db-of qs))])) facts)
+           root (part/put-root! put! parts nil)
+           merged (part/restore-all get-fn root test-decrypt-fn)]
+       (testing "the merged view holds exactly the same facts"
+         (is (= (set (part/db->quads single)) (set (part/db->quads merged)))))
+       (testing "all four indices agree, not just the covering one"
+         (is (= (:eavt single) (:eavt merged)))
+         (is (= (:aevt single) (:aevt merged)))
+         (is (= (:avet single) (:avet merged)))
+         (is (= (:vaet single) (:vaet merged))))
+       (testing "a query that CROSSES partitions returns the same answer --
+                this is the property sharding would have destroyed"
+         ;; \"which addresses paid 100\" spans the base and arbitrum writers
+         (is (= #{"0xaa" "0xcc"} (arr/by-predicate-value merged "paid" "100")))
+         (is (= (arr/by-predicate-value single "paid" "100")
+                (arr/by-predicate-value merged "paid" "100")))
+         (is (= 3 (count (arr/by-predicate merged "chain"))))))))
+
+#?(:clj
+   (deftest root-is-content-addressed
+     (let [{:keys [put! get-fn]} (mem-store)
+           a (commit-db! put! (db-of (:chain-base facts)))
+           b (commit-db! put! (db-of (:chain-eth facts)))]
+       (testing "same partition set → same root CID, whatever order it is built in"
+         (is (= (part/put-root! put! {:x a :y b} nil)
+                (part/put-root! put! {:y b :x a} nil))))
+       (testing "a different partition set → a different root"
+         (is (not= (part/put-root! put! {:x a :y b} nil)
+                   (part/put-root! put! {:x a} nil))))
+       (testing "the root round-trips"
+         (let [r (part/read-root get-fn (part/put-root! put! {:x a :y b} nil))]
+           (is (= {"x" a "y" b} (:partitions r)))
+           (is (nil? (:prev r)))))
+       (testing "a nil root is genesis, not an error"
+         (is (= {} (:partitions (part/read-root get-fn nil))))))))
+
+#?(:clj
+   (deftest an-unknown-root-version-is-refused-not-guessed
+     (let [{:keys [put! get-fn]} (mem-store)
+           bad (ipld/put-node! put! {"root-version" 99 "partitions" {} "prev" nil})]
+       (is (thrown? clojure.lang.ExceptionInfo (part/read-root get-fn bad))))))
+
+;; ── the CAS half ─────────────────────────────────────────────────────
+;; `advance-root!` reports its attempt count because that number IS the
+;; design claim. A fixture that steals the root out from under the first
+;; read proves the loop actually re-reads rather than blindly overwriting.
+
+(defn- cas-ops [store-fns root-atom]
+  {:read-current (fn [] @root-atom)
+   :cas! (fn [expected new] (compare-and-set! root-atom expected new))
+   :put! (:put! store-fns)
+   :get-fn (:get-fn store-fns)})
+
+#?(:clj
+   (deftest advance-root-retries-and-does-not-clobber
+     (let [{:keys [put! get-fn] :as s} (mem-store)
+           a (commit-db! put! (db-of (:chain-base facts)))
+           b (commit-db! put! (db-of (:chain-eth facts)))
+           root (atom nil)
+           ops (cas-ops s root)
+           interfere (atom true)
+           ;; a rival writer lands :y exactly once, between our read and our CAS
+           racing-ops (assoc ops :read-current
+                             (fn [] (let [cur @root]
+                                      (when (compare-and-set! interfere true false)
+                                        (part/advance-root! ops :y b))
+                                      cur)))
+           r (part/advance-root! racing-ops :x a)]
+       (testing "the loop noticed the rival and retried"
+         (is (= 2 (:attempts r))))
+       (testing "and the rival's partition SURVIVED -- a blind overwrite would
+                have dropped :y, silently losing another writer's commit"
+         (is (= {"x" a "y" b} (:partitions (part/read-root get-fn @root))))))))
+
+#?(:clj
+   (deftest batching-collapses-many-advances-into-one-cas
+     (let [{:keys [put! get-fn] :as s} (mem-store)
+           cids (into {} (map (fn [[k qs]] [k (commit-db! put! (db-of qs))])) facts)
+           root (atom nil)
+           r (part/advance-root-batched! (cas-ops s root) cids)]
+       (is (= 1 (:attempts r)))
+       (is (= 3 (:applied r)))
+       (testing "one contended operation carried three writers' worth of work"
+         (is (= 3 (count (:partitions (part/read-root get-fn @root))))))
+       (testing "and the batched root is queryable as one plane"
+         (is (= #{"0xaa" "0xcc"}
+                (arr/by-predicate-value
+                 (part/restore-all get-fn @root test-decrypt-fn) "paid" "100")))))))

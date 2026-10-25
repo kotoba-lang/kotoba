@@ -1,0 +1,301 @@
+(ns prolly-tree.range-diff-test
+  "`range-diff` — the diff restricted to a key window.
+
+  Two claims, and they need different kinds of test. That the answer is right
+  is checked against `diff` itself, over many random windows: interval
+  arithmetic goes wrong by dropping keys, and a dropped key is invisible in
+  the result. That the answer is CHEAP is checked with block counters, because
+  a range walk that quietly read the whole tree and filtered at the end would
+  satisfy every correctness assertion here."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [ipld.core :as ipld]
+            [prolly-tree.core :as pt]
+            [prolly-tree.diff :as d]))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))
+     :store store}))
+
+(defn- key-str [i]
+  (let [s (str i)]
+    (str "repo/" (apply str (repeat (- 5 (count s)) "0")) s)))
+
+(defn- fleet [n f] (mapv (fn [i] [(key-str i) (f i)]) (range n)))
+
+(defn- lcg
+  "A deterministic pseudo-random sequence. Portable and reproducible, which
+  `rand-int` is neither: a failing window has to be re-runnable to be worth
+  reporting."
+  [seed n]
+  (loop [x seed i 0 acc []]
+    (if (= i n) acc
+        (let [x' (mod (+ (* x 1103515245) 12345) 2147483648)]
+          (recur x' (inc i) (conj acc x'))))))
+
+(defn- in-window [rows lo hi]
+  (filterv (fn [[k]] (and (or (nil? lo) (>= (compare k lo) 0))
+                          (or (nil? hi) (neg? (compare k hi)))))
+           rows))
+
+(defn- two-trees
+  "A base tree and one with every `step`-th key rewritten, so that changes are
+  spread across every leaf rather than clustered in one."
+  [n step]
+  (let [{:keys [put! get-fn store]} (mem-store)
+        base (fleet n #(str "pin-" %))
+        touched? (fn [i] (zero? (mod i step)))]
+    {:get-fn get-fn :store store
+     :a (pt/build-tree put! base)
+     :b (pt/build-tree put!
+                       (mapv (fn [[k v]]
+                               (let [i #?(:clj (Long/parseLong (subs k 5))
+                                          :cljs (js/parseInt (subs k 5) 10))]
+                                 (if (touched? i) [k (str "pin-NEW-" i)] [k v])))
+                             base))
+     :base base}))
+
+;; ── the answer is right ─────────────────────────────────────────────────────
+
+(deftest a-window-agrees-with-the-whole-diff-filtered
+  (testing "the oracle: over many windows, range-diff = diff ∩ window.
+
+            This is the assertion that matters. Interval arithmetic goes wrong
+            by DROPPING keys, and a dropped key is invisible in the result --
+            there is nothing in a smaller answer that says it should have been
+            bigger. Checking against the unrestricted diff is the only thing
+            that can see it."
+    (let [{:keys [get-fn a b]} (two-trees 4000 17)
+          whole (d/diff get-fn a b)
+          random-windows (->> (lcg 20260817 120)
+                              (map #(mod % 4200))
+                              (partition 2)
+                              (mapv (fn [[x y]] [(key-str (min x y))
+                                                 (key-str (max x y))])))]
+      (is (pos? (count (:changed whole))) "the fixture actually changed things")
+      (doseq [[lo hi] (concat
+                       random-windows
+                       [[(key-str 0) (key-str 1)]
+                       [(key-str 100) (key-str 110)]
+                       [(key-str 500) (key-str 1500)]
+                       [(key-str 1999) (key-str 2000)]
+                       [(key-str 0) (key-str 2000)]
+                       [nil (key-str 50)]
+                       [(key-str 1950) nil]
+                       [nil nil]
+                       ;; windows that fall outside the tree entirely
+                       [(key-str 5000) (key-str 6000)]
+                       ["aaa" "bbb"]
+                       ;; an empty window
+                       [(key-str 300) (key-str 300)]])]
+        (let [r (d/range-diff get-fn a b lo hi)]
+          (is (= (in-window (:changed whole) lo hi) (:changed r))
+              (str "changed mismatch for [" lo ", " hi ")"))
+          (is (= (in-window (:added whole) lo hi) (:added r)))
+          (is (= (in-window (:removed whole) lo hi) (:removed r))))))))
+
+(deftest added-and-removed-keys-land-in-the-right-window
+  (let [{:keys [put! get-fn]} (mem-store)
+        base (fleet 800 #(str "pin-" %))
+        a (pt/build-tree put! base)
+        ;; "repo/00400a" sorts between 00400 and 00401 and is NOT already in
+        ;; the fixture -- the first draft used key-str 401, which is, so the
+        ;; "add" added nothing and the test failed against correct code.
+        b (pt/build-tree put!
+                         (vec (sort-by first
+                                       (-> (into [] (remove #(= (key-str 400) (first %))) base)
+                                           (conj ["repo/00400a" "brand-new"])))))
+        whole (d/diff get-fn a b)]
+    (is (= 1 (count (:removed whole))))
+    (is (= 1 (count (:added whole))))
+    (testing "a window containing both sees both"
+      (let [r (d/range-diff get-fn a b (key-str 390) (key-str 410))]
+        (is (= [[(key-str 400) "pin-400"]] (:removed r)))
+        (is (= [["repo/00400a" "brand-new"]] (:added r)))))
+    (testing "a window containing neither sees neither"
+      (let [r (d/range-diff get-fn a b (key-str 600) (key-str 700))]
+        (is (= [] (:added r) (:removed r) (:changed r)))))
+    (testing "a window containing only the removal"
+      (let [r (d/range-diff get-fn a b (key-str 400) "repo/00400a")]
+        (is (= 1 (count (:removed r))))
+        (is (= [] (:added r)))))))
+
+(deftest one-side-empty-still-respects-the-window
+  (testing "a nil root is the empty tree, and the other side is collected in
+            range rather than whole — the branch a whole-tree diff has no
+            reason to get right"
+    ;; 4,000 keys, not 500: measured 2026-08-17, this tree is a SINGLE leaf
+    ;; below about 1,000 keys (17 leaves at 4,000, 92 at 20,000, and one
+    ;; internal level throughout). A pruning assertion on a one-leaf tree
+    ;; asserts nothing, and the first draft of this test failed for that
+    ;; reason against correct code.
+    (let [{:keys [put! get-fn]} (mem-store)
+          root (pt/build-tree put! (fleet 4000 #(str "pin-" %)))
+          r (d/range-diff* get-fn nil root (key-str 10) (key-str 20))]
+      (is (= 10 (count (:added r))))
+      (is (= (mapv key-str (range 10 20)) (mapv first (:added r))))
+      (is (pos? (:by-range (:pruned r)))
+          "and it pruned rather than walking all 17 leaves to filter them")
+      (is (<= (:blocks-read r) 3)
+          (str "root plus the one leaf that can hold them: " (pr-str r))))))
+
+;; ── the answer is cheap, and for the right reason ───────────────────────────
+
+(deftest a-narrow-window-does-not-pay-for-the-whole-tree
+  (let [{:keys [get-fn a b]} (two-trees 4000 20)
+        whole (d/diff* get-fn a b)
+        narrow (d/range-diff* get-fn a b (key-str 1000) (key-str 1010))]
+    (is (= 200 (count (:changed whole))))
+    (is (= 1 (count (:changed narrow))))
+    (is (< (:blocks-read narrow) (:blocks-read whole))
+        (str "narrow " (:blocks-read narrow) " vs whole " (:blocks-read whole)))
+    (is (<= (:blocks-read narrow) 6)
+        (str "a 10-key window in a 4,000-key tree should cost the spine and one
+              leaf pair, not the tree: " (pr-str narrow)))
+    (testing "and it was cheap because of the range, not because nothing changed"
+      (is (pos? (:by-range (:pruned narrow))))
+      (is (= 200 (count (:changed (d/range-diff get-fn a b nil nil))))
+          "with the window opened right up, every change is still found — so
+           the saving above is pruning, not blindness"))))
+
+(deftest the-two-prunings-are-counted-apart
+  (testing "equal CIDs mean nothing changed here; a disjoint span means nothing
+            here was asked about. An implementation that had lost the second
+            would still be correct, and on a tree where most subtrees differ it
+            would still look fast"
+    (let [{:keys [get-fn a b]} (two-trees 4000 20)]
+      (testing "same root: pruned by CID before a single block is read"
+        (let [r (d/range-diff* get-fn a a (key-str 100) (key-str 200))]
+          (is (zero? (:blocks-read r)))
+          (is (= 1 (:by-cid (:pruned r))))
+          (is (zero? (:by-range (:pruned r))))))
+      (testing "different roots, narrow window: pruned by range"
+        (let [r (d/range-diff* get-fn a b (key-str 100) (key-str 110))]
+          (is (pos? (:by-range (:pruned r))))))
+      (testing "different roots, whole window: nothing to prune by range"
+        (let [r (d/range-diff* get-fn a b nil nil)]
+          (is (zero? (:by-range (:pruned r)))
+              "every subtree intersects an open window, so any pruning here
+               would be a bug in the span arithmetic"))))))
+
+(deftest a-window-in-an-unchanged-region-is-cheaper-than-one-in-a-changed-one
+  ;; The two skips compose. A window over keys nobody touched should stop at
+  ;; the first equal CID inside the spine.
+  (let [{:keys [put! get-fn]} (mem-store)
+        base (fleet 4000 #(str "pin-" %))
+        a (pt/build-tree put! base)
+        b (pt/build-tree put! (mapv (fn [[k v]]
+                                      (if (= k (key-str 3999)) [k "moved"] [k v]))
+                                    base))
+        quiet (d/range-diff* get-fn a b (key-str 100) (key-str 110))
+        loud (d/range-diff* get-fn a b (key-str 3990) (key-str 4000))]
+    (is (= [] (:changed quiet)))
+    (is (= 1 (count (:changed loud))))
+    (is (< (:blocks-read quiet) (:blocks-read loud))
+        (str "quiet " (:blocks-read quiet) " vs loud " (:blocks-read loud)))
+    (is (pos? (:by-cid (:pruned quiet)))
+        "the quiet window stopped at an equal CID rather than reaching a leaf")))
+
+;; ── the span arithmetic itself ──────────────────────────────────────────────
+
+(defn- all-changed
+  "Two 4,000-key trees where EVERY value differs, so a window that drops a key
+  is visible immediately rather than only when the dropped key happened to be
+  one of the changed ones."
+  []
+  (let [{:keys [put! get-fn]} (mem-store)
+        base (fleet 4000 #(str "pin-" %))]
+    {:get-fn get-fn :put! put!
+     :a (pt/build-tree put! base)
+     :b (pt/build-tree put! (mapv (fn [[k _]] [k "ALL-NEW"]) base))}))
+
+(defn- root-children
+  "The root's `[max-key cid]` children, read from the tree itself.
+
+  Derived rather than hard-coded: chunk boundaries come out of a content hash,
+  so a literal list would stop being a boundary the day anything about
+  encoding changed, and the test would go on passing while testing nothing."
+  [get-fn root]
+  (let [node (ipld/decode (get-fn root))]
+    (when-not (= "leaf" (get node "kind"))
+      (mapv (fn [e] [(first e) (ipld/link-cid (second e))]) (get node "children")))))
+
+(deftest a-window-starting-exactly-on-a-boundary-still-finds-that-key
+  ;; The subtree ending at max-key M holds M itself, so a window [M, ...) must
+  ;; read it. Comparing `upper` to `lo` with > instead of >= prunes it and
+  ;; silently loses one key per boundary -- a mutation that survived every
+  ;; other test in this namespace, including 60 pseudo-random windows, because
+  ;; a random `lo` almost never lands exactly on one of 16 boundaries.
+  (let [{:keys [get-fn a b]} (all-changed)
+        boundaries (mapv first (root-children get-fn a))]
+    (is (< 5 (count boundaries))
+        (str "the fixture needs real internal structure; got " (count boundaries)))
+    (doseq [m boundaries]
+      (let [r (d/range-diff get-fn a b m (str m "0"))]
+        (is (= [[m "pin-" "ALL-NEW"]]
+               (mapv (fn [[k _ nv]] [k "pin-" nv]) (:changed r)))
+            (str "the key at boundary " m " was dropped"))))))
+
+(deftest a-window-ending-exactly-on-a-boundary-does-not-read-past-it
+  ;; The mirror, and it is a COST claim, so no assertion about the returned
+  ;; keys can make it: the subtree beginning just after M holds only keys > M,
+  ;; and the window ends at M. Comparing `lower` to `hi` with <= instead of <
+  ;; keeps that subtree -- still correct, one extra block per boundary, and
+  ;; invisible to every correctness test.
+  (let [{:keys [get-fn a b]} (all-changed)
+        [[m0 _] _] (root-children get-fn a)
+        at (d/range-diff* get-fn a b (key-str 0) m0)
+        past (d/range-diff* get-fn a b (key-str 0) (str m0 "0"))]
+    (is (= 4 (:blocks-read at))
+        (str "root pair plus the one leaf pair the window covers: " (pr-str at)))
+    (is (= 6 (:blocks-read past))
+        (str "one character further and the next leaf pair is genuinely
+              needed: " (pr-str past)))
+    (is (= (inc (count (:changed at))) (count (:changed past)))
+        "and the extra block bought exactly the one extra key")))
+
+(deftest the-last-child-is-unbounded-above
+  ;; `core/descend-cid` routes a key larger than every max-key to the LAST
+  ;; child, so the last child's span has no upper bound.
+  ;;
+  ;; No tree this library builds can exhibit that: `insert` and `insert-many`
+  ;; are byte-identical to `build-tree`, so the last max-key is always the
+  ;; tree's maximum. An earlier version of this test used `build-tree` and
+  ;; proved nothing -- worse, it used 1,000 keys, which is a SINGLE LEAF, so
+  ;; it never reached the span code at all and passed with the bound removed.
+  ;;
+  ;; So the tree here is hand-built: real leaves, with the last child's
+  ;; max-key understated. That is precisely the case the +infinity defends
+  ;; against -- a tree from a writer that is not this one.
+  (let [{:keys [get-fn put! a b]} (all-changed)
+        understate
+        (fn [root]
+          (let [kids (root-children get-fn root)
+                [last-key last-cid] (peek kids)
+                _ (is (= (key-str 3999) last-key))
+                doctored {"kind" "internal"
+                          "children" (conj (mapv (fn [[k c]] [k (ipld/link c)])
+                                                 (pop kids))
+                                           ["repo/03960" (ipld/link last-cid)])}
+                bytes (ipld/encode doctored)
+                cid (ipld/cid bytes)]
+            (put! cid bytes)
+            cid))
+        da (understate a)
+        db (understate b)
+        r (d/range-diff get-fn da db "repo/03970" nil)]
+    (is (= 30 (count (:changed r)))
+        (str "keys above the last child's claimed max-key still live under it,
+              and a bound of that max-key prunes them: "
+             (pr-str (mapv first (:changed r)))))))
+
+(deftest an-empty-or-inverted-window-finds-nothing-and-says-so
+  (let [{:keys [get-fn a b]} (two-trees 1000 10)]
+    (doseq [[lo hi] [[(key-str 500) (key-str 500)]
+                     [(key-str 700) (key-str 300)]]]
+      (let [r (d/range-diff* get-fn a b lo hi)]
+        (is (= [] (:added r) (:removed r) (:changed r)))
+        (is (<= (:blocks-read r) 2)
+            (str "an empty window should not walk the tree: " (pr-str r)))))))

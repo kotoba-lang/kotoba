@@ -100,6 +100,9 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
 | `org.w3.png` | `org.w3.png/src` | `png.bytes`, `png.core`, `png.decode`, `png.encode` (an external specification, publisher w3.org) |
+| `kotoba.codebase` | `kotoba.codebase/src` | `kotoba.codebase.actor`, `kotoba.codebase.authoring`, `kotoba.codebase.backend`, `kotoba.codebase.backend.kotobase` (Kotoba project library) |
+| `kotoba.arrangement` | `kotoba.arrangement/src` | `arrangement.core`, `arrangement.datalog`, `arrangement.partitioned`, `arrangement.query` (Kotoba project library) |
+| `kotoba.prollyTree` | `kotoba.prollyTree/src` | `prolly-tree.adl`, `prolly-tree.core`, `prolly-tree.diff`, `prolly-tree.ordered-map` (Kotoba project library) |
 | `kotoba.image` | `kotoba.image/src` | `kotoba.image`, `kotoba.image.gray` (Kotoba project library) |
 | `kotoba.atprotocol` | `kotoba.atprotocol/src` | `atprotocol.app-record`, `atprotocol.boundary`, `atprotocol.profile`, `atprotocol.projection` (Kotoba project library) |
 | `kotoba.artifact` | `kotoba.artifact/src` | `kotoba.artifact.content-identity`, `kotoba.artifact.core`, `kotoba.artifact.descriptor-table`, `kotoba.artifact.execution` (Kotoba project library) |

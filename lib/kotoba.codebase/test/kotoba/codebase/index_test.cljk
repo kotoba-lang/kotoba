@@ -1,0 +1,105 @@
+(ns kotoba.codebase.index-test
+  "Read counts, not adjectives.
+
+  `dependents` got faster is the kind of claim that is easy to write and hard
+  to believe. The store is a value since ADR-2608580000 S1, so the honest form
+  of the claim is available: put a counter in front of a real backend and say
+  what the number IS."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.backend :as backend]
+            [kotoba.codebase.backend.kotobase :as kotobase-backend]
+            [kotoba.codebase.index :as index]
+            [kotoba.codebase.names :as names]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]
+            [kotobase.storage.memory :as memory]))
+
+(defrecord CountingStore [inner reads]
+  backend/ICodebaseStore
+  (-initialize! [_] (backend/-initialize! inner))
+  (-initialized? [_] (backend/-initialized? inner))
+  (-put-bytes! [_ space key value] (backend/-put-bytes! inner space key value))
+  (-get-bytes [_ space key]
+    (when (= :block space) (swap! reads inc))
+    (backend/-get-bytes inner space key))
+  (-list-keys [_ space] (backend/-list-keys inner space))
+  (-read-head [_ namespace] (backend/-read-head inner namespace))
+  (-swap-head! [_ namespace expected next-cid]
+    (backend/-swap-head! inner namespace expected next-cid)))
+
+(defn- counting-codebase []
+  (->CountingStore (kotobase-backend/open (memory/memory-store)) (atom 0)))
+
+(defn- store-definitions! [root forms]
+  (let [compiled (semantic/compile-definitions forms)]
+    (into {}
+          (map (fn [[name {:keys [cid block type-cid type-block
+                                  group-cid group-block]}]]
+                 (when type-cid (store/put-block! root type-cid type-block))
+                 (when group-cid (store/put-block! root group-cid group-block))
+                 (store/put-block! root cid block)
+                 [(str name) cid]))
+          (:definitions compiled))))
+
+;; A shared leaf with several independent dependents is exactly the shape the
+;; old implementation was worst at: every binding re-walked `base`.
+(def ^:private fan-in
+  '[(defn base [x] (+ x 1))
+    (defn a [x] (base x))
+    (defn b [x] (base (a x)))
+    (defn c [x] (base (b x)))
+    (defn d [x] (base (c x)))
+    (defn e [x] (base (d x)))])
+
+(deftest dependents-reads-each-reachable-block-once
+  (let [root (counting-codebase)]
+    (store/initialize! root)
+    (let [cids (store-definitions! root fan-in)
+          _ (store/commit-namespace! root "demo" cids nil)
+          reachable (:definitions (index/scan root (vals cids)))
+          ;; What the previous shape cost: one closure walk per binding, with
+          ;; every shared dependency re-read inside each one.
+          per-binding (reduce + (map #(count (:definitions (index/scan root [%])))
+                                     (vals cids)))
+          _ (reset! (:reads root) 0)
+          found (names/dependents root "demo" (get cids "base"))
+          reads @(:reads root)]
+      (is (= ["a" "b" "c" "d" "e"] found)
+          "every definition transitively depends on base")
+      (testing "one pass, not one pass per binding"
+        ;; +1 for the namespace commit block `bindings-of` has to read first.
+        (is (<= reads (inc (count reachable)))
+            (str "read " reads " blocks for a closure of " (count reachable)))
+        (is (< reads per-binding)
+            (str "read " reads " blocks; the per-binding shape read "
+                 per-binding))))))
+
+(deftest a-definition-nothing-depends-on-has-no-dependents
+  (let [root (counting-codebase)]
+    (store/initialize! root)
+    (let [cids (store-definitions! root fan-in)]
+      (store/commit-namespace! root "demo" cids nil)
+      (is (= [] (names/dependents root "demo" (get cids "e")))))))
+
+(deftest transitive-edges-are-followed-backwards
+  (let [root (counting-codebase)]
+    (store/initialize! root)
+    (let [cids (store-definitions! root '[(defn leaf [x] (* x 2))
+                                          (defn middle [x] (leaf x))
+                                          (defn top [x] (middle x))])]
+      (store/commit-namespace! root "demo" cids nil)
+      (is (= ["middle" "top"] (names/dependents root "demo" (get cids "leaf")))
+          "top depends on leaf only through middle")
+      (is (= ["top"] (names/dependents root "demo" (get cids "middle")))))))
+
+(deftest short-hash-degrades-to-the-namespace-closure-rather-than-breaking
+  (testing "a store that cannot enumerate still resolves an abbreviation, and says so"
+    (let [root (counting-codebase)]
+      (store/initialize! root)
+      (let [cids (store-definitions! root '[(defn only [x] (+ x 1))])
+            cid (get cids "only")
+            _ (store/commit-namespace! root "demo" cids nil)
+            resolved (names/resolve-token root "demo" (str "#" (subs cid 0 12)))]
+        (is (= cid (:cid resolved)))
+        (is (= :namespace-closure (:scope resolved))
+            "the narrower scope is reported, not hidden")))))

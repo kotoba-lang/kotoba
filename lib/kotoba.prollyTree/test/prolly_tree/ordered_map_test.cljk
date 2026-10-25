@@ -1,0 +1,113 @@
+(ns prolly-tree.ordered-map-test
+  "A real Prolly tree on one side of the oracle.
+
+  The contract's own suite compares two adapters built from lifted
+  predicates, which proves the adaptation arithmetic. It does not prove that
+  this substrate does what it declares. Here the rows come out of an actual
+  tree -- built, chunked, and scanned through `core/scan-range` -- so the
+  declaration in `prolly-tree.ordered-map/profile` is checked against
+  behaviour rather than against a reading of the source.
+
+  Enough keys to force more than one leaf, because a single-leaf tree never
+  exercises the child pruning where a bound is compared against a subtree
+  span rather than a key."
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotobase.storage.ordered-map :as om]
+            [prolly-tree.core :as pt]
+            [prolly-tree.ordered-map :as pom]))
+
+(defn- err [f]
+  (try (f) nil
+       (catch #?(:clj Exception :cljs :default) e (:type (ex-data e)))))
+
+(defn- mem-store []
+  (let [store (atom {})]
+    {:put! (fn [cid bytes] (swap! store assoc cid bytes))
+     :get-fn (fn [cid] (get @store cid))}))
+
+(defn- key-str [i]
+  (let [s (str i)]
+    (str "key-" (apply str (repeat (- 4 (count s)) "0")) s)))
+
+(def entries (mapv (fn [i] [(key-str i) i]) (range 200)))
+
+(defn- tree []
+  (let [{:keys [put! get-fn]} (mem-store)]
+    {:get-fn get-fn :root (pt/build-tree put! entries)}))
+
+;; The other substrate: same rows, inclusive upper bound. Predicate verbatim
+;; from `kotobase.projection/decode-range`.
+(defn- inclusive-adapter [rows]
+  {:profile (assoc pom/profile :bounds :inclusive-upper)
+   :scan (fn [lower upper]
+           (vec (filter (fn [[k _]]
+                          (and (or (nil? lower) (not (neg? (compare k lower))))
+                               (or (nil? upper) (not (pos? (compare k upper))))))
+                        rows)))})
+
+(deftest a_real_tree_scans_half_open_as_it_declares
+  (let [{:keys [get-fn root]} (tree)
+        rows (pom/scan get-fn root (om/range (key-str 10) (key-str 20)))]
+    (is (= (mapv key-str (range 10 20)) (mapv first rows))
+        "the upper-bound key is excluded, which is what :half-open means")
+    (is (= 10 (count rows)))))
+
+(deftest the_real_tree_and_an_inclusive_substrate_agree_once_adapted
+  (let [{:keys [get-fn root]} (tree)
+        a (pom/adapter get-fn root)
+        b (inclusive-adapter entries)]
+    (doseq [[lo hi] [[(key-str 0) (key-str 50)]
+                     [(key-str 41) (key-str 42)]
+                     [(key-str 150) nil]
+                     [nil (key-str 3)]
+                     [nil nil]]]
+      (testing (str "range [" lo ", " hi ")")
+        (let [r (om/range-oracle a b (om/range lo hi))]
+          (is (:agree? r))
+          (is (:order-agrees? r))
+          (is (false? (:vacuous? r))
+              "every range here selects rows, so agreement is evidence"))))))
+
+(deftest the_boundary_row_is_where_they_would_have_differed
+  ;; Without adaptation the inclusive substrate returns one extra row. The
+  ;; oracle names it rather than absorbing it.
+  (let [{:keys [get-fn root]} (tree)
+        a (pom/adapter get-fn root)
+        misdeclared (assoc (inclusive-adapter entries)
+                           :profile pom/profile) ; claims :half-open, is not
+        r (om/range-oracle a misdeclared (om/range (key-str 10) (key-str 20)))]
+    (is (false? (:agree? r)))
+    (is (= [(key-str 20)] (:only-in-b r))
+        "exactly the row whose key equals the upper bound")))
+
+(deftest an_empty_tree_agrees_with_everything_and_the_oracle_says_so
+  (let [{:keys [get-fn]} (mem-store)
+        a (pom/adapter get-fn nil)
+        r (om/range-oracle a (inclusive-adapter []) (om/range nil nil))]
+    (is (:agree? r))
+    (is (:vacuous? r)
+        "a nil root is the empty tree; agreeing on nothing proves nothing")))
+
+(deftest a_deleted_key_is_absent_rather_than_suppressing
+  ;; The declaration says :absent. A Merkle-LSM tombstone is :suppress-key,
+  ;; and the contract refuses to compare the two -- so this substrate had
+  ;; better actually be :absent.
+  (let [{:keys [put! get-fn]} (mem-store)
+        root (pt/build-tree put! entries)
+        pruned (pt/delete put! get-fn root (key-str 15))
+        rows (pom/scan get-fn pruned (om/range (key-str 10) (key-str 20)))]
+    (is (= :absent (:tombstones pom/profile)))
+    (is (= (mapv key-str (concat (range 10 15) (range 16 20))) (mapv first rows))
+        "no row remains where the key was")))
+
+(deftest a_caller_whose_encoding_lost_the_order_is_refused
+  ;; scan-range's own docstring: HMAC-blinded leaf keys do not compare as the
+  ;; query range. Such a caller declares it and gets a refusal, not rows.
+  (let [{:keys [get-fn root]} (tree)]
+    (is (= :kotobase.storage/unordered-range-refused
+           (err #(om/scan (pom/adapter get-fn root :opaque-unordered)
+                          (om/range (key-str 10) (key-str 20))))))))
+
+(deftest the_declared_profile_is_complete
+  (is (map? (om/validate-profile! pom/profile))))
