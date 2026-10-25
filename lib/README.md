@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.jpGoDigitalDesignSystem` | `kotoba.jpGoDigitalDesignSystem/src` | `jp-go-dds.behavior`, `jp-go-dds.core`, `jp-go-dds.css`, `jp-go-dds.dark` (Kotoba project library) |
 | `kotoba.iso3166` | `kotoba.iso3166/src` | `kotoba.iso3166`, `kotoba.iso3166.embedded` (Kotoba project library) |
 | `kotoba.ioplan` | `kotoba.ioplan/src` | `ioplan.core` (Kotoba project library) |
 | `kotoba.ioFilecoinSigner` | `kotoba.ioFilecoinSigner/src` | `filecoin.signer`, `filecoin.signer.bls`, `filecoin.signer.eth` (Kotoba project library) |

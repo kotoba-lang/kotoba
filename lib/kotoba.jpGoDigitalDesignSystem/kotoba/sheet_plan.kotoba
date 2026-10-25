@@ -1,0 +1,203 @@
+(ns sheet-plan
+  ;; The entry points are exported, so a host can call them without
+  ;; recompiling. The parity harness widens this list with its own case names,
+  ;; because `ir/execute` runs exported functions only.
+  (:export [main global-path component-path component-path-of-keyword
+            core? plan-chunk join-plan with-global])
+  (:schemas {:plan/member-from [:record :plan/member-from
+                                [[:names :document]
+                                 [:needle :string]
+                                 [:index :i64]
+                                 [:n :i64]]]
+             :plan/plan-from [:record :plan/plan-from
+                              [[:core :document]
+                               [:names :document]
+                               [:index :i64]
+                               [:n :i64]
+                               [:acc :string]]]}))
+
+;; Which stylesheets make up a page, in what order — `jp-go-dds.css` as a
+;; Kotoba decision.
+;;
+;; W6 slice for `jp-go-digital-design-system` (ADR-2607279200 / migration plan
+;; W6). The bridge (`bridge_document`), the dark ramp (`dark_mirror`,
+;; `dark_declarations`) and four component renderers already crossed. What had
+;; not is the other half of what a DADS page ships: `jp-go-dds.css` decides
+;; WHICH of the 40 vendored component sheets go on the page, in which order,
+;; and which are already inside `dds.css` and must not be sent twice.
+;;
+;; ## The plan is the decision; the slurp is not
+;;
+;; `css-for` is one decision wrapped in one effect:
+;;
+;;   1. drop the components `dds.css` already bundles (sending one twice
+;;      defines the same custom property twice);
+;;   2. keep the caller's order;
+;;   3. put `global.css` first when asked;
+;;   4. read those files and join them with a newline.
+;;
+;; Steps 1–3 are a pure function from names to resource paths — a PLAN. Step 4
+;; is I/O and stays in `.cljc`, where it already is (`slurp-resource`). This
+;; module owns the plan. The gate resolves the plan with the host's own
+;; `slurp` and requires the result to equal `jp-go-dds.css/css-for` byte for
+;; byte, so the split is proven rather than asserted: if the guest chose a
+;; different set, a different order, or dropped a de-duplication, the bytes
+;; differ.
+;;
+;; This is the same division `jp-go-dds.css`'s own docstring already draws for
+;; nbb — "read it yourself, this library stays a pure function" — stated as a
+;; type rather than as advice.
+;;
+;; ## Core membership is DATA, passed in
+;;
+;; The 14 names in `dds.css` are not restated here. They arrive as a
+;; `:document` from `css/core-components`, the way `dark_declarations` takes
+;; the palette from generated EDN rather than re-deriving it. A second copy
+;; would be a second thing to keep in step with a re-vendor, and the whole
+;; point of a bridge library is that exactly one place derives it.
+;;
+;; ## Chunking
+;;
+;; `document-container-item-limit` is 32 (kotoba-kir `value.cljc`) and the
+;; vendored catalogue has 40 components, so a whole-catalogue request does not
+;; fit in one document value. `plan-chunk` therefore plans one chunk and
+;; `join-plan` concatenates plans, exactly as `bridge_document` does for the
+;; 71-entry bridge. Chunking is mechanism: the gate feeds the catalogue as one
+;; 32 + one 8 and requires the joined plan to equal the whole.
+;;
+;; ## What stayed in .cljc, and why (measured 2026-08-12)
+;;
+;; `css-for` / `all-css` / `root-css-resource` are I/O. They stay, by design:
+;; this module is the plan they execute.
+;;
+;; `jp-go-dds.tokens/root-css` — cutting the leading `:root { … }` block out of
+;; the vendored sheet — is NOT a design decision to leave host-side, and it is
+;; not the string-value limit either. It is a measured cost:
+;;
+;;   * `string-substring` refuses a byte index that splits a UTF-8 code point,
+;;     and the vendored header carries an em dash, so a raw byte scan traps
+;;     within the first 100 bytes. A boundary-safe scan must walk code points.
+;;   * `string-code-point-at` is O(byte-offset) in the reference interpreter
+;;     (`kotoba-kir` `value/utf8-code-point-at!` re-walks from index 0), so
+;;     scanning to the block's end at byte 8,942 is O(n²) — about 37M
+;;     interpreter steps, measured at 27 s for one call. A gate that costs half
+;;     a minute per assertion is not one this repo should carry.
+;;   * The whole sheet is also over `string-value-byte-limit` (72,114 bytes vs
+;;     65,536), which `kotoba-dark-mirror-parity-test/measured-input-bounds`
+;;     already records; `global.css` carries the same block under the limit, so
+;;     that bound alone is not what stops it.
+;;
+;; The right fix is the one slice 3 already made for the palette: recovering
+;; structure from CSS text is a design change before it is a migration, so let
+;; `scripts/vendor.cljk` record the block at vendor time and let Kotoba decide
+;; over the result. Until then the scan stays where it can afford to run.
+;;
+;; `tokens/a11y-css` is not here for a different reason: rendering it needs the
+;; number→`px` and keyword→name rules of `css.core/value-str`, and those
+;; already have a `.kotoba` authority in `kotoba-lang/css`
+;; (`kotoba/css_core.kotoba`: `unitless?`, `number-value`, `declaration`).
+;; A copy here would be a second implementation of someone else's decision.
+;;
+;; Capability-free (kotoba/pure).
+
+;; --- paths ----------------------------------------------------------------
+;; Resource-relative, usable both from `io/resource` and from
+;; `<repo>/resources/`, which is what `jp-go-dds.css` promises of them.
+
+(defn global-path [] :string
+  "jp_go_dds/global.css")
+
+(defn component-path [c :string] :string
+  (string-concat "jp_go_dds/components/"
+                 (string-concat c ".css")))
+
+(defn component-path-of-keyword [k :keyword] :string
+  ;; `keyword-name` is what keeps the leading colon out of the path. Spelling
+  ;; this as its own entry point rather than letting a caller stringify is the
+  ;; same fix `bridge_document/custom-property-of-keyword` makes for token
+  ;; names, where a bare `str` over a keyword produced `--hig-:color-tint`.
+  ;; Here the same mistake would ask for `components/:button.css`, which no
+  ;; re-vendor will ever create.
+  (component-path (keyword-name k)))
+
+;; --- projections ----------------------------------------------------------
+
+(defn name-at [names :document i :i64] :string
+  (option-or
+    (document-string-value (option-or (document-vector-at names i) (document-null)))
+    ""))
+
+;; --- core membership ------------------------------------------------------
+;; Linear over the core vector: `dds.css` bundles 14 components, so an index
+;; would be a second representation to keep in step for no measurable gain.
+
+(defn member-from [x [:ref :plan/member-from]] :bool
+  (let [names (record-get x :names)
+        needle (record-get x :needle)
+        i (record-get x :index)
+        n (record-get x :n)]
+    (if (>= i n)
+      false
+      (or (string=? (name-at names i) needle)
+          (member-from (record-new [:ref :plan/member-from]
+                                   names needle (+ i 1) n))))))
+
+(defn core? [core :document c :string] :bool
+  ;; True when `dds.css` already carries this component. Such a name is
+  ;; dropped silently rather than refused: `css-for` documents that, and a
+  ;; caller listing everything a page uses should not have to know which half
+  ;; of the list is already bundled.
+  (member-from (record-new [:ref :plan/member-from]
+                           core c 0 (document-count core))))
+
+;; --- the plan -------------------------------------------------------------
+;; A plan is the resource paths to concatenate, newline-separated, in order.
+;; Newline is the separator `css-for` joins the FILE CONTENTS with, so a plan
+;; and the sheet it plans have the same shape; the host splits on it, reads
+;; each path, and joins the contents the same way.
+
+(defn plan-from [x [:ref :plan/plan-from]] :string
+  (let [core (record-get x :core)
+        names (record-get x :names)
+        i (record-get x :index)
+        n (record-get x :n)
+        acc (record-get x :acc)]
+    (if (>= i n)
+      acc
+      (let [c (name-at names i)]
+        (if (core? core c)
+          (plan-from (record-new [:ref :plan/plan-from] core names (+ i 1) n acc))
+          (plan-from (record-new [:ref :plan/plan-from]
+                                 core names (+ i 1) n
+                                 (if (string=? acc "")
+                                   (component-path c)
+                                   (string-concat acc
+                                                  (string-concat "\n"
+                                                                 (component-path c)))))))))))
+
+(defn plan-chunk [core :document names :document] :string
+  (plan-from (record-new [:ref :plan/plan-from]
+                         core names 0 (document-count names) "")))
+
+(defn join-plan [a :string b :string] :string
+  ;; The same single-newline join `plan-from` uses within a chunk, so a chunk
+  ;; boundary leaves no trace. An empty side contributes nothing rather than a
+  ;; blank line — a blank line in a plan would name the empty path.
+  (if (string=? a "")
+    b
+    (if (string=? b "")
+      a
+      (string-concat a (string-concat "\n" b)))))
+
+(defn with-global [plan :string] :string
+  ;; `global.css` goes FIRST when the caller is not already loading `dds.css`.
+  ;; Order is the decision here, not a formatting detail: global defines the
+  ;; custom properties every component sheet then references.
+  (join-plan (global-path) plan))
+
+(defn main []
+  (string-byte-length
+   (with-global
+     (plan-chunk (document-vector (document-string "button"))
+                 (document-vector (document-string "button")
+                                  (document-string "date-picker"))))))

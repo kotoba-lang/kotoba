@@ -1,0 +1,241 @@
+(ns jp-go-dds.kotoba-document-parity-test
+  "W6 next-cohort slice for jp-go-dds: the `--hig-*` → DADS bridge as a logical
+  `:document` value.
+
+  `kotoba/bridge_document.kotoba` must byte-agree with `jp-go-dds.tokens`:
+  the same full bridge (every entry of hig->dads) renders to the same `:root { … }` stream, the same
+  brand exclusion renders to the same stream, the same tokens normalize to the
+  same custom-property names, and the same tokens answer `bridged?`.
+
+  It must also fail closed where css.core throws: a value carrying `{ } ;` or
+  `/*` is rejected as an `[:result :string :string]` error rather than spliced
+  into the sheet. Kotoba has no `throw` — that is an intentional security
+  constraint, not a backend gap — so the guest returns the failure as a value.
+
+  The bridge is fed in chunks of at most `document-container-item-limit` (32)
+  entries because it does not fit in one document value; see the module header.
+  Joining chunks must leave no trace, which is itself asserted here.
+
+  Consumer APIs are unchanged; `jp-go-dds.tokens` remains what 170 repos
+  require. This gate is what keeps a second derivation of the token contract
+  from drifting away from it."
+  (:require [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is testing]]
+            [css.core :as css]
+            [jp-go-dds.tokens :as tokens]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def bridge-doc (slurp "lib/kotoba.jpGoDigitalDesignSystem/kotoba/bridge_document.kotoba"))
+
+(def ^:private fuel 262144)
+
+(def ^:private chunk-size
+  "kotoba-kir `value/document-container-item-limit`."
+  32)
+
+(defn- kotoba-literal [s]
+  (str \" (-> s (str/replace "\\" "\\\\") (str/replace "\"" "\\\"")) \"))
+
+(defn- entry-form [k v]
+  (str "(entry (record-new [:ref :bridge/entry] "
+       (kotoba-literal (str k)) " " (kotoba-literal (str v)) "))"))
+
+(defn- chunk-form
+  "One chunk as a `:bridge/table` document. Entry order is the caller's."
+  [entries]
+  (str "(table-doc (record-new [:ref :bridge/table] \":root\" (document-vector "
+       (str/join " " (map (fn [[k v]] (entry-form k v)) entries))
+       ")))"))
+
+(defn- names-form
+  "An exclusion set is carried in the same `:name`-bearing entry shape the
+  bridge uses, so membership is one projection rather than two."
+  [names]
+  (str "(document-vector "
+       (str/join " " (map #(entry-form % "") (sort names)))
+       ")"))
+
+(def ^:private sorted-bridge
+  "Key-sorted, exactly as `jp-go-dds.tokens/bridge-rules` sorts before handing
+  declarations to css.core."
+  (sort-by key tokens/hig->dads))
+
+(def ^:private chunks (vec (partition-all chunk-size sorted-bridge)))
+
+(defn- compile-and-run
+  "Append zero-arg `:string` cases and execute each through KIR."
+  [cases]
+  (let [defs (for [[name body] cases]
+               (str "(defn " name " [] :string " body ")"))
+        ;; Widen the module's export list to name the cases too:
+        ;; `ir/execute` runs exported functions only, and the module now
+        ;; declares a list so that a host can call it without recompiling.
+        widened (str/replace-first bridge-doc #"\(:export \[[^\]]+\]\)"
+                                   (str "(:export [main custom-property custom-property-of-keyword hig-var entry table-doc bridged? render-body-except render-body join-decls wrap render bridge-digest bridge-print bridge-read "
+                                        (str/join " " (map first cases)) "])"))
+        kir (:kir (compiler/compile-source
+                   (str widened "\n" (str/join "\n" defs))
+                   :js-kotoba-v1))]
+    (into {} (map (fn [[name _]]
+                    [name (ir/execute kir (symbol name) [] {:fuel fuel})])
+                  cases))))
+
+(defn- ok-or-err
+  "Unwrap either arm as text so a case can assert on the failure message."
+  [expr]
+  (str "(match-result " expr " [:result :string :string] (ok t t) (err m m))"))
+
+(defn- body-of
+  "A chunk's declarations. An error surfaces as the sentinel, which cannot
+  equal a real sheet, so a failure here fails the equality assertion."
+  [entries excluded]
+  (str "(result-value-of [:result :string :string] "
+       (if excluded
+         (str "(render-body-except " (chunk-form entries) " " excluded ")")
+         (str "(render-body " (chunk-form entries) ")"))
+       " \"CHUNK-ERROR\")"))
+
+(defn- sheet-form
+  "Join every chunk's body in the guest, then close the sheet once."
+  ([] (sheet-form nil))
+  ([excluded]
+   (ok-or-err
+    (str "(wrap \":root\" "
+         (reduce (fn [acc entries]
+                   (str "(join-decls " acc " " (body-of entries excluded) ")"))
+                 (body-of (first chunks) excluded)
+                 (rest chunks))
+         ")"))))
+
+(defn- bool-case [expr]
+  (str "(if " expr " \"true\" \"false\")"))
+
+;; --- the bridge itself ----------------------------------------------------
+
+(deftest bridge-document-renders-byte-identical-css
+  (testing "the full bridge, assembled from chunks"
+    (is (< 1 (count chunks))
+        "sanity: the bridge really is larger than one document value")
+    (let [out (compile-and-run {"full" (sheet-form)})]
+      (is (= tokens/bridge-css (get out "full"))
+          "logical bridge document must render byte-identically to css.core")
+      (is (str/starts-with? (get out "full") ":root { --hig-color-label: ")
+          "sanity: the compared value is a real sheet, not an error message")
+      (is (not (str/includes? (get out "full") "CHUNK-ERROR"))
+          "no chunk fell back to the sentinel"))))
+
+(deftest chunk-boundaries-leave-no-trace
+  (testing "the same entries in different chunkings render identically"
+    (let [regrouped (vec (partition-all 16 sorted-bridge))
+          out (compile-and-run
+               {"sixteens"
+                (ok-or-err
+                 (str "(wrap \":root\" "
+                      (reduce (fn [acc entries]
+                                (str "(join-decls " acc " " (body-of entries nil) ")"))
+                              (body-of (first regrouped) nil)
+                              (rest regrouped))
+                      ")"))})]
+      (is (= tokens/bridge-css (get out "sixteens"))
+          "chunking is mechanism; it must not be observable in the output"))))
+
+(deftest brand-exclusion-matches-cljc
+  (testing "withholding the accent leaves it to shitsuke.hig rather than overriding it"
+    (let [excluded (names-form tokens/brand-tokens)
+          out (compile-and-run {"except" (sheet-form excluded)})]
+      (is (= (tokens/bridge-css-except tokens/brand-tokens) (get out "except")))
+      (is (not (str/includes? (get out "except") "--hig-color-tint:"))
+          "the excluded token is absent, not redefined")
+      (is (str/includes? (get out "except") "--hig-color-label:")
+          "only the excluded token is withheld"))))
+
+;; --- normalization --------------------------------------------------------
+
+(deftest custom-property-normalization-matches-cljc
+  (testing "keyword, short string, and full name all reach one property"
+    (let [out (compile-and-run
+               {"kw" "(custom-property-of-keyword :color-tint)"
+                "short" "(custom-property \"color-tint\")"
+                "full" "(custom-property \"--hig-color-tint\")"
+                "var-short" "(hig-var \"color-tint\")"
+                "var-full" "(hig-var \"--hig-color-tint\")"
+                "short-name" "(custom-property \"x\")"})]
+      (is (= "--hig-color-tint" (get out "kw"))
+          "a keyword must not carry its colon into the property name")
+      (is (= "--hig-color-tint" (get out "short")))
+      (is (= "--hig-color-tint" (get out "full")))
+      (is (= (tokens/hig-var :color-tint) (get out "var-short"))
+          "the keyword and short-string spellings name the same var()")
+      (is (= (tokens/hig-var "color-tint") (get out "var-short")))
+      (is (= (tokens/hig-var "--hig-color-tint") (get out "var-full")))
+      (is (= "--hig-x" (get out "short-name"))
+          "a name shorter than the `--` probe must not be mis-sliced")))
+  (testing "the measured regression stays fixed"
+    (let [out (compile-and-run
+               {"kw" "(hig-var (custom-property-of-keyword :color-tint))"})]
+      (is (not (str/includes? (get out "kw") ":color-tint"))
+          "var(--hig-:color-tint) never resolves; it must not be constructible"))))
+
+;; --- membership -----------------------------------------------------------
+
+(def ^:private membership-tokens
+  ["color-tint" "--hig-color-tint" "--hig-hairline" "palette-teal"])
+
+(deftest bridged-matches-cljc
+  (testing "asked of every chunk, membership agrees with the whole-map .cljc"
+    (let [cases (into {}
+                      (for [t membership-tokens
+                            [i entries] (map-indexed vector chunks)]
+                        [(str "m" i "_" (str/replace t #"[^a-z]" ""))
+                         (bool-case (str "(bridged? " (chunk-form entries) " "
+                                         (kotoba-literal t) ")"))]))
+          out (compile-and-run cases)]
+      (doseq [t membership-tokens]
+        (let [any? (boolean
+                    (some (fn [i]
+                            (= "true" (get out (str "m" i "_"
+                                                    (str/replace t #"[^a-z]" "")))))
+                          (range (count chunks))))]
+          (is (= (boolean (tokens/bridged? t)) any?)
+              (str "bridged? parity for " t))))
+      (is (not (boolean (tokens/bridged? "palette-teal")))
+          "teal is one of the six HIG palette members DADS has no hue for"))))
+
+;; --- fail closed ----------------------------------------------------------
+
+(deftest unsafe-values-fail-closed
+  (testing "the four sequences css.core rejects are rejected here as values"
+    (let [unsafe (fn [v]
+                   (str "(render " (chunk-form [["--hig-color-tint" v]]) ")"))
+          out (compile-and-run
+               {"brace" (ok-or-err (unsafe "red; } .evil { background: url(x)"))
+                "semi" (ok-or-err (unsafe "red; color: blue"))
+                "comment" (ok-or-err (unsafe "red /* swallow"))
+                "selector" (ok-or-err
+                            (str "(wrap \":root { } .evil\" \"\")"))})]
+      (is (= "unsafe value for --hig-color-tint" (get out "brace")))
+      (is (= "unsafe value for --hig-color-tint" (get out "semi")))
+      (is (= "unsafe value for --hig-color-tint" (get out "comment")))
+      (is (= "unsafe selector" (get out "selector")))))
+  (testing "css.core rejects the same input by throwing, so the guard is not redundant"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (css/css {:rules [[":root" [["--hig-color-tint"
+                                              "red; } .evil { background: url(x)"]]]]})))))
+
+;; --- identity -------------------------------------------------------------
+
+(deftest bridge-document-identity-round-trips
+  (let [first-chunk (chunk-form (first chunks))
+        out (compile-and-run
+             {"digest" (str "(bridge-digest " first-chunk ")")
+              "reread" (str "(bridge-digest (bridge-read (bridge-print "
+                            first-chunk ")))")
+              ;; case names become guest defn names, so no reserved word here
+              "other-chunk" (str "(bridge-digest " (chunk-form (second chunks)) ")")})]
+    (is (= 64 (count (get out "digest")))
+        "document-sha256 is a hex digest over the canonical encoding")
+    (is (= (get out "digest") (get out "reread"))
+        "print/read round-trips without changing content identity")
+    (is (not= (get out "digest") (get out "other-chunk"))
+        "a different token set is a different contract")))
