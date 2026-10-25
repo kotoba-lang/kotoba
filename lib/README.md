@@ -113,6 +113,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
 | `org.loraAlliance.lorawan` | `org.loraAlliance.lorawan/src` | `lorawan.bytes`, `lorawan.cmac`, `lorawan.crypt`, `lorawan.frame` (an external specification, publisher loraAlliance.org) |
+| `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
 | `co.huggingface.safetensors` | `co.huggingface.safetensors/src` | `safetensors.bytes`, `safetensors.core`, `safetensors.dtype`, `safetensors.json` (Kotoba project library) |
 | `kotoba.netsync` | `kotoba.netsync/src` | `kami.netsync`, `kami.netsync.fighting`, `kami.netsync.fps`, `kami.relevancy` (Kotoba project library) |
 | `kotoba.mermaid` | `kotoba.mermaid/src` | `kotoba.mermaid`, `mermaid.core` (Kotoba project library) |
