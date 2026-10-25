@@ -1,0 +1,112 @@
+(ns filecoin.cloud.provider-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [filecoin.cloud.piece :as piece]
+            [filecoin.cloud.provider :as prov]))
+
+(def service "https://pdp.example.org")
+(def cid "bafkzcibet2xqgdjls7iwpgilo53vqicctadkcqwygxujnun7qlfmw5s5ekja4kmtey")
+
+;; ── request shapes ───────────────────────────────────────────────────────────
+
+(deftest urls-join-without-doubling-or-losing-a-slash
+  (doseq [base [service (str service "/") (str service "///")]]
+    (testing base
+      (is (= "https://pdp.example.org/pdp/ping" (:url (prov/ping-request base))))))
+  (is (= (str "https://pdp.example.org/pdp/piece?pieceCid=" cid)
+         (:url (prov/find-piece-request service cid))))
+  (is (= (str "https://pdp.example.org/piece/" cid) (prov/piece-url service cid))))
+
+(deftest the-cdn-url-is-a-per-client-subdomain
+  ;; Not <domain>/piece/<cid>. That form resolves, 404s, and reads as a
+  ;; missing piece rather than a malformed request — which is how it got into
+  ;; cloud-itonami-app's first read-through and stayed invisible.
+  (is (= (str "https://0xabc.filbeam.io/" cid)
+         (prov/cdn-url "0xABC" "filbeam.io" cid)))
+  (is (not (str/includes? (prov/cdn-url "0xabc" "filbeam.io" cid) "/piece/"))))
+
+(deftest begin-upload-announces-the-cid-as-json
+  (let [r (prov/begin-upload-request service cid)]
+    (is (= :post (:method r)))
+    (is (= "https://pdp.example.org/pdp/piece" (:url r)))
+    (is (= "application/json" (get (:headers r) "content-type")))
+    (is (= (str "{\"pieceCid\":\"" cid "\"}") (:body r)))))
+
+(deftest retrieval-asks-for-unmodified-bytes
+  (let [url (prov/piece-url service cid)
+        r (prov/get-piece-request url)]
+    (is (= :get (:method r)))
+    (is (= url (:url r)))
+    (is (= :bytes (:response-type r)))))
+
+(deftest sending-bytes-declares-its-length
+  (let [bytes (vec (repeat 200 0x41))
+        r (prov/send-bytes-request service "abc-123" bytes)]
+    (is (= :put (:method r)))
+    (is (= "https://pdp.example.org/pdp/piece/upload/abc-123" (:url r)))
+    (is (= "application/octet-stream" (get (:headers r) "content-type")))
+    (is (= "200" (get (:headers r) "content-length")))))
+
+;; ── responses, where collapsing states loses the useful one ───────────────────
+
+(deftest a-200-on-begin-upload-means-do-not-upload
+  ;; Deduplication by PieceCID. Treating this as "proceed" re-sends the whole
+  ;; payload for nothing.
+  (is (= :already-present (:next (prov/begin-upload-response {:status 200}))))
+  (testing "and any other success needs the Location header"
+    (is (= {:next :upload :upload-id "u-9"}
+           (prov/begin-upload-response
+            {:status 201 :headers {"Location" "/pdp/piece/upload/u-9"}})))
+    (testing "case-insensitively, because both spellings occur"
+      (is (= "u-9" (:upload-id (prov/begin-upload-response
+                                {:status 201 :headers {"location" "/pdp/piece/upload/u-9"}})))))
+    (testing "and its absence is an error, not a shrug"
+      (let [r (prov/begin-upload-response {:status 201 :headers {}})]
+        (is (= :error (:state r)))
+        (is (nil? (:next r)))))))
+
+(deftest find-piece-keeps-processing-distinct-from-present-and-absent
+  ;; 202 means the provider has it and is still parking it. Folding 202 into
+  ;; "absent" makes a client re-upload data the provider already holds.
+  (is (= :present (:state (prov/find-piece-response {:status 200 :body "{}"}))))
+  (is (= :processing (:state (prov/find-piece-response {:status 202}))))
+  (is (= :absent (:state (prov/find-piece-response {:status 404}))))
+  (is (= :error (:state (prov/find-piece-response {:status 500})))))
+
+(deftest ping-is-strict-about-what-alive-means
+  ;; Mainnet currently has providers answering 502 on pdp/ping. A client that
+  ;; accepts any response will select one of them.
+  (is (:alive? (prov/ping-response {:status 200})))
+  (is (not (:alive? (prov/ping-response {:status 502}))))
+  (is (not (:alive? (prov/ping-response {:status 404}))))
+  (is (not (:alive? (prov/ping-response {})))))
+
+;; ── refusals ─────────────────────────────────────────────────────────────────
+
+(deftest sizes-are-refused-before-the-bytes-go-on-the-wire
+  (is (= 127 (prov/check-size! 127)))
+  (is (= prov/max-upload-size (prov/check-size! prov/max-upload-size)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (prov/check-size! 126)))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (prov/check-size! (inc prov/max-upload-size))))
+  (testing "the floor is the FR32 quad, not a round number"
+    (is (= 127 prov/min-upload-size))))
+
+;; ── the check a caller must not skip ─────────────────────────────────────────
+
+(deftest verify-bytes-is-what-catches-a-provider-serving-garbage
+  ;; Measured on mainnet 2026-07-30: of 13 providers reporting `:present` for
+  ;; one piece, 1 served a 27-byte nginx placeholder as
+  ;; `application/octet-stream` with status 200, 10 served an identical wrong
+  ;; 81,918 bytes, and 2 served the real 204,898. Every one of the 11 looked
+  ;; like a success at the HTTP layer.
+  (let [payload (vec (map #(mod % 251) (range 300)))
+        real (:cid (piece/calculate payload))]
+    (is (:ok? (prov/verify-bytes real payload)))
+    (testing "a placeholder body does not pass"
+      (let [v (prov/verify-bytes real (mapv int "Server is ready for certbot"))]
+        (is (not (:ok? v)))
+        (is (= real (:expected v)))
+        (is (not= real (:computed v)))))
+    (testing "nor does a truncation"
+      (is (not (:ok? (prov/verify-bytes real (vec (take 200 payload)))))))))

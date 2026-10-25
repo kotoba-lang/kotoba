@@ -1,0 +1,148 @@
+(ns filecoin.cloud.contracts-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ethereum.abi :as abi]
+            [filecoin.cloud.chain :as chain]
+            [filecoin.cloud.pay :as pay]
+            [filecoin.cloud.pdp :as pdp]
+            [filecoin.cloud.piece :as piece]
+            [filecoin.cloud.vectors :as v]
+            [filecoin.cloud.warm :as warm]))
+
+(def by-signature
+  (into {} (map (juxt (juxt :contract :signature) :selector) v/selectors)))
+
+(defn- check-selectors
+  "Every signature this library claims must exist in the deployed ABI, and
+  every selector must be the one viem derives from it.
+
+  This is the whole reason the constants are safe to hold. There is no keccak
+  on both runtimes, so a selector cannot be computed at load time — and four
+  wrong bytes are indistinguishable from four right ones until a call reverts
+  with no reason."
+  [contract signatures selectors]
+  (doseq [[k sig] signatures]
+    (testing (str contract " " sig)
+      (let [expected (get by-signature [contract sig])]
+        (is (some? expected) "signature is not in the deployed ABI")
+        (is (= expected (get selectors k)))))))
+
+(deftest pdp-selectors-match-the-deployed-abi
+  (is (= (set (keys pdp/signatures)) (set (keys pdp/selectors))))
+  (check-selectors "pdp" pdp/signatures pdp/selectors))
+
+(deftest pay-selectors-match-the-deployed-abi
+  (is (= (set (keys pay/signatures)) (set (keys pay/selectors))))
+  (check-selectors "filecoinPay" pay/signatures pay/selectors))
+
+(deftest warm-storage-selectors-match-the-deployed-abi
+  (is (= (set (keys warm/signatures)) (set (keys warm/selectors))))
+  (is (= (set (keys warm/view-signatures)) (set (keys warm/view-selectors))))
+  (check-selectors "fwss" warm/signatures warm/selectors)
+  (check-selectors "fwssView" warm/view-signatures warm/view-selectors))
+
+(deftest the-two-warm-storage-halves-are-different-contracts
+  ;; Sending a getter to the service address reverts with no reason string,
+  ;; which looks exactly like a missing data set.
+  (is (not= (set (keys warm/selectors)) (set (keys warm/view-selectors))))
+  (is (nil? (get warm/selectors :get-data-set)))
+  (is (some? (get warm/view-selectors :get-data-set)))
+  (doseq [c [:mainnet :calibration]]
+    (is (not= (chain/contract c :warm-storage) (chain/contract c :warm-storage-view)))))
+
+(deftest an-overloaded-name-keeps-both-arities
+  ;; `terminateService` exists twice; a single key could only name one.
+  (is (= "terminateService(uint256)" (:terminate-service warm/signatures)))
+  (is (= "terminateService(uint256,bytes)" (:terminate-service-2 warm/signatures)))
+  (is (not= (:terminate-service warm/selectors)
+            (:terminate-service-2 warm/selectors))))
+
+;; ── addresses ────────────────────────────────────────────────────────────────
+
+(deftest deployed-addresses-match-the-published-ones
+  (doseq [{:keys [chain chain-id genesis-timestamp contracts]} v/chains]
+    (testing chain
+      (is (= chain-id (:chain-id (chain/chain chain))))
+      (is (= genesis-timestamp (:genesis-timestamp (chain/chain chain))))
+      (doseq [[published local]
+              [[:usdfc :usdfc] [:filecoinPay :filecoin-pay]
+               [:fwss :warm-storage] [:fwssView :warm-storage-view]
+               [:serviceProviderRegistry :service-provider-registry]
+               [:sessionKeyRegistry :session-key-registry]
+               [:pdp :pdp-verifier]]]
+        (is (= (get contracts published) (chain/contract chain local))
+            (str local))))))
+
+(deftest a-chain-can-be-named-by-id
+  (is (= (chain/chain :mainnet) (chain/chain 314)))
+  (is (= (chain/chain :calibration) (chain/chain 314159)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (chain/chain :devnet)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (chain/contract :mainnet :nope))))
+
+;; ── the clock ────────────────────────────────────────────────────────────────
+
+(deftest epochs-are-thirty-seconds-since-a-per-network-genesis
+  ;; The same epoch number is two years apart on the two networks. Arithmetic
+  ;; with the wrong genesis gives no sign of it.
+  (is (= 1598306400 (chain/epoch->unix :mainnet 0)))
+  (is (= 1598306430 (chain/epoch->unix :mainnet 1)))
+  (is (= 1667326380 (chain/epoch->unix :calibration 0)))
+  (is (not= (chain/epoch->unix :mainnet 6232564)
+            (chain/epoch->unix :calibration 6232564)))
+  (testing "and back"
+    (doseq [e [0 1 6232564]]
+      (is (= e (chain/unix->epoch :mainnet (chain/epoch->unix :mainnet e))))))
+  (testing "floored — an epoch is the one that has started"
+    (is (= 1 (chain/unix->epoch :mainnet (+ 1598306400 59)))))
+  (is (= 2880 chain/epochs-per-day))
+  (is (= 2880 (chain/epochs-in 86400))))
+
+(deftest an-fevm-contract-has-two-addresses-for-the-same-actor
+  (let [eth (chain/contract :mainnet :pdp-verifier)
+        f4 (chain/eth->f4 eth)]
+    (is (= "f410f" (subs f4 0 5)))
+    (is (= (str/lower eth)
+           (str/lower (chain/f4->eth f4))))))
+
+;; ── calldata ─────────────────────────────────────────────────────────────────
+
+(deftest calldata-is-the-selector-and-the-signature-s-own-types
+  (let [d (pdp/call :data-set-live ["42"])]
+    (is (= (:data-set-live pdp/selectors) (subs d 0 10)))
+    (is (= (+ 10 64) (count d)))
+    (is (= ["42"] (abi/decode ["uint256"] (str "0x" (subs d 10)))))))
+
+(deftest a-piece-argument-is-a-tuple-of-the-binary-cid
+  ;; Not the bafkzcib… string, and not a bare bytes. Both are well-formed
+  ;; calldata naming a piece that does not exist.
+  (let [cid (:cid (piece/calculate (mapv #(mod % 251) (range 200))))
+        [bs] (pdp/piece-argument cid)]
+    (is (vector? bs))
+    (is (= 1 (nth bs 0)) "CIDv1")
+    (is (= 0x55 (nth bs 1)) "raw codec")
+    (is (< (count bs) 63) "the string form would be 63 characters")
+    (testing "and the whole call decodes back to it"
+      (let [d (pdp/add-pieces 42 (chain/contract :mainnet :pdp-verifier) [cid])]
+        (is (= (:add-pieces pdp/selectors) (subs d 0 10)))
+        (is (= [[bs]]
+               (nth (abi/decode (abi/argument-types (:add-pieces pdp/signatures))
+                                (str "0x" (subs d 10)))
+                    2)))))))
+
+(deftest an-operator-approval-is-per-epoch
+  ;; The call a client is most likely to get wrong by a factor of 2880.
+  (let [d (pay/set-operator-approval
+           (chain/contract :mainnet :usdfc)
+           (chain/contract :mainnet :warm-storage)
+           true "1000000000000" "1000000000000000000" chain/epochs-per-month)
+        args (abi/decode (abi/argument-types (:set-operator-approval pay/signatures))
+                         (str "0x" (subs d 10)))]
+    (is (= (:set-operator-approval pay/selectors) (subs d 0 10)))
+    (is (true? (nth args 2)))
+    (is (= "86400" (nth args 5)) "30 days, in epochs")))
+
+(deftest an-unknown-method-is-refused
+  (is (thrown? #?(:clj Exception :cljs js/Error) (pdp/selector :nope)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (pay/selector :nope)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (warm/selector :nope)))
+  (is (thrown? #?(:clj Exception :cljs js/Error) (warm/view-selector :nope))))
