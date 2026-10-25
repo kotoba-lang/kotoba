@@ -1,0 +1,114 @@
+;; Compile `kotoba/siwe/window.kotoba` and run the COMPILED artifact.
+;;
+;; The JVM suite drives the guest through the KIR interpreter, which is not
+;; the thing that ships. This runs the `.wasm` the public CLI produces, on
+;; real `WebAssembly`, through amu's own `runtime/browser-host.mjs`, and
+;; prints what it answered so `window_artifact_test.clj` can hold it against the
+;; interpreter.
+;;
+;; nbb rather than a `.mjs`: this workspace does not add raw JavaScript
+;; harnesses (AGENTS.md, runtime priority).
+;;
+;; Some of this guest's exports take a `:document`, which is why it is here
+;; and not in the shorter probe the string-only guests use: a document
+;; argument has to be built by the HOST, through the runtime's own
+;; `typedValues.document`, in the tagged form the KIR value plane uses
+;; (`["map" [[["keyword" ":k"] v] ...]]`). Building it any other way is
+;; refused as a forged value, which is the point of the seam.
+;;
+;; Fuel is spent over the life of an INSTANCE, not per call, so every call
+;; gets a fresh one -- the same thing amu's own `runtime/dom-driver.mjs`
+;; does per interaction.
+
+(ns siwe.artifact-probe
+  (:require ["node:fs" :as fs]
+            ["node:child_process" :as cp]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+;; Clojure data -> the tagged document the runtime admits. The same encoding
+;; `window_guest_document.clj` uses on the interpreter side, so both halves are asked with
+;; one shape.
+(defn ->doc [x]
+  (cond
+    (string? x) #js ["string" x]
+    (keyword? x) #js ["keyword" (str x)]
+    (boolean? x) #js ["bool" x]
+    (int? x) #js ["i64" (js/BigInt x)]
+    (map? x) #js ["map" (clj->js (mapv (fn [[k v]] #js [#js ["keyword" (str k)] (->doc v)])
+                                       (sort-by key x)))]
+    (sequential? x) #js ["vector" (clj->js (mapv ->doc x))]
+    :else #js ["null" nil]))
+
+(def cases
+  [["instant-ok?" "2026-08-31T12:34:56Z"] ["instant-ok?" "2016-12-31T23:59:60Z"]
+   ["instant-ok?" "2100-02-29T00:00:00Z"] ["instant-ok?" "2000-02-29T00:00:00Z"]
+   ["instant-ok?" "2026-01-01T24:00:00Z"] ["instant-ok?" "2026-01-01T00:00:00"]
+   ["instant-seconds" "1970-01-01T00:00:00Z"] ["instant-seconds" "2026-08-31T12:34:56Z"]
+   ["instant-seconds" "2026-06-15T09:00:00+09:00"]
+   ["problem" {:issued-at "2026-08-31T12:00:00Z" :expiration-time "2026-08-31T12:05:00Z" :not-before ""} {:now-sec 1788177600 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true}]
+   ["problem" {:issued-at "2026-08-31T12:00:00Z" :expiration-time "2026-08-31T11:00:00Z" :not-before ""} {:now-sec 1788177600 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true}]
+   ["problem" {:issued-at "2026-08-31T12:00:00Z" :expiration-time "" :not-before ""} {:now-sec 1788177600 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true}]
+   ["problem" {:issued-at "2026-08-31T11:59:30Z" :expiration-time "2026-08-31T12:00:30Z" :not-before "2026-08-31T12:01:00Z"} {:now-sec 1788177600 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true}]
+   ["problem" {:issued-at "2026-08-31T13:00:00Z" :expiration-time "2026-08-31T14:00:00Z" :not-before ""} {:now-sec 1788177600 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true}]
+   ["problem" {:issued-at "2026-13-01T00:00:00Z" :expiration-time "" :not-before ""} {:now-sec 1788177600 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true}]])
+
+(def amu-bin (or (first *command-line-args*) "kotoba"))
+(def guest (path/resolve "lib/org.chainagnostic.cacao/kotoba/siwe/window.kotoba"))
+(def host-url
+  (some-> (second *command-line-args*)
+          (as-> root (str "file://" root "/runtime/browser-host.mjs"))))
+
+(defn- emit [m] (println (pr-str m)))
+
+(defn- arg->js [values a]
+  (cond
+    (map? a) ((.-document values) (->doc a))
+    (int? a) (js/BigInt a)
+    :else a))
+
+(defn- run []
+  (let [wasm (path/join (or (.-TMPDIR js/process.env) "/tmp") "siwe-window-gate.wasm")
+        r (cp/spawnSync amu-bin
+                        #js ["-M" "compile" guest "--target" "wasm32-browser"
+                             "--output" wasm]
+                        #js {:encoding "utf8"})]
+    (if-not (zero? (.-status r))
+      ;; A gate that could not compile has not verified anything. Exit 3 --
+      ;; not 0 and not 1 -- so "could not measure" never reads as "measured
+      ;; and clean".
+      (do (emit {:status :compile-failed
+                 :detail (str/trim (str (.-stdout r) (.-stderr r)))})
+          (js/process.exit 3))
+      (-> (js/import host-url)
+          (.then
+           (fn [host]
+             (let [bytes (js/Uint8Array. (fs/readFileSync wasm))
+                   instantiate (.-instantiateKotoba host)]
+               (-> (js/Promise.all
+                    (clj->js
+                     (for [[f & args] cases]
+                       (-> (instantiate bytes)
+                           (.then (fn [m]
+                                    (let [v (apply (aget (.. m -instance -exports) f)
+                                                   (map #(arg->js (.-typedValues m) %) args))]
+                                      (clj->js [f (pr-str (vec args)) (str v)]))))
+                           (.catch (fn [e]
+                                     (clj->js [f (pr-str (vec args))
+                                               (str "THREW " (or (.-code e) (.-message e)))])))))))
+                   (.then (fn [results]
+                            (-> (instantiate bytes)
+                                (.then (fn [m]
+                                         (emit {:status :ok
+                                                :sha256 (.-sha256 m)
+                                                :main (str ((.. m -instance -exports -main)))
+                                                :results (mapv #(vec (js->clj %)) results)}))))))
+                   (.catch (fn [e]
+                             (emit {:status :host-failed
+                                    :detail (str (or (.-code e) "") " " (.-message e))})
+                             (js/process.exit 3)))))))
+          (.catch (fn [e]
+                    (emit {:status :host-import-failed :detail (str e)})
+                    (js/process.exit 3)))))))
+
+(run)

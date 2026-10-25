@@ -1,0 +1,267 @@
+;; `kotoba/siwe/window.kotoba` -- the EIP-4361 validity window.
+;;
+;; ## Two oracles, because the decision has two halves
+;;
+;; The arithmetic half is checked against `java.time`, which is neither
+;; side's invention: `instant-seconds` must agree with
+;; `OffsetDateTime/parse` on every instant, including the offsets, the
+;; fraction, and February 29th of a century year.
+;;
+;; The policy half has no portable oracle, and that is the finding. The
+;; temporal rules live in `siwe.edge`, which is `.cljs` and also carries
+;; secp256k1 and Keccak. `the-portable-half-has-no-temporal-check` shows
+;; what a JVM or nbb caller of `siwe.core` actually gets: a message whose
+;; Expiration Time precedes its Issued At parses `{:ok? true}` and binds
+;; with `:problem nil`.
+;;
+;; So the edge's rules are TRANSCRIBED into this file -- verbatim from
+;; `siwe.edge/temporal-problem` as measured on `cd98347`, quoted above the
+;; function -- and driven alongside the guest. That makes the difference
+;; something the suite executes rather than something a comment claims. It
+;; is test scaffolding, like `->doc`; the library did not grow a second
+;; copy (ADR-2608261100).
+;;
+;; ## What the transcription and the guest disagree about
+;;
+;; `a-window-that-never-opens-verifies-under-the-edge-rules`. Not Before at
+;; or after Expiration Time describes an interval containing no instant.
+;; `temporal-problem` compares each bound to the clock and the expiration to
+;; the issuance, but never the two bounds to each other, and the skew
+;; tolerance forgives `clock-skew-sec` at each end -- so there is a band,
+;; two minutes wide by default, in which such a message is accepted. The
+;; test puts the clock in that band and shows nil from the transcription
+;; against `:window-never-opens` from the guest.
+
+(ns siwe.window-kotoba-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [siwe.core :as core]
+            [siwe.window-guest-document :refer [->doc]])
+  (:import (java.time OffsetDateTime)))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "siwe" "window.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'siwe.window (slurp guest-file)}
+                                         'siwe.window :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(def ^:private bad-instant -8888888888888)
+
+(defn- guest-seconds [s] (call 'instant-seconds [s]))
+(defn- guest-ok? [s] (call 'instant-ok? [s]))
+
+(def ^:private default-opts
+  {:now-sec 0 :clock-skew-sec 60 :max-age-sec 300 :require-expiration? true})
+
+(defn- guest-problem [fields opts]
+  (call 'problem
+        [(->doc (merge {:issued-at "" :expiration-time "" :not-before ""} fields))
+         (->doc (merge default-opts opts))]))
+
+;; --- the edge's rules, transcribed --------------------------------------------
+;;
+;; `siwe.edge/temporal-problem`, verbatim as measured on cd98347:
+;;
+;;   (cond
+;;     (nil? issued) :invalid-issued-at
+;;     (> issued (+ now clock-skew-sec)) :issued-in-future
+;;     (> (- now issued) (+ max-age-sec clock-skew-sec)) :message-too-old
+;;     (and require-expiration? (nil? expiration-time)) :expiration-required
+;;     (and expiration-time (nil? expires)) :invalid-expiration-time
+;;     (and expires (<= expires issued)) :invalid-expiration-window
+;;     (and expires (>= now (+ expires clock-skew-sec))) :expired
+;;     (and not-before (nil? starts)) :invalid-not-before
+;;     (and starts (< (+ now clock-skew-sec) starts)) :not-yet-valid
+;;     :else nil)
+;;
+;; with `parse-seconds` gated on `core/rfc3339?` and then `Date.parse`. Here
+;; `java.time` stands in for `Date.parse`; the two agree on this grammar,
+;; and where they would not, `core/rfc3339?` has already refused.
+
+(defn- edge-parse-seconds [value]
+  (when (core/rfc3339? value)
+    (try (.toEpochSecond (OffsetDateTime/parse value)) (catch Exception _ nil))))
+
+(defn- edge-temporal-problem
+  [{:keys [issued-at expiration-time not-before]}
+   {:keys [now-sec clock-skew-sec max-age-sec require-expiration?]}]
+  (let [issued (edge-parse-seconds issued-at)
+        expires (some-> expiration-time edge-parse-seconds)
+        starts (some-> not-before edge-parse-seconds)]
+    (cond
+      (nil? issued) :invalid-issued-at
+      (> issued (+ now-sec clock-skew-sec)) :issued-in-future
+      (> (- now-sec issued) (+ max-age-sec clock-skew-sec)) :message-too-old
+      (and require-expiration? (nil? expiration-time)) :expiration-required
+      (and expiration-time (nil? expires)) :invalid-expiration-time
+      (and expires (<= expires issued)) :invalid-expiration-window
+      (and expires (>= now-sec (+ expires clock-skew-sec))) :expired
+      (and not-before (nil? starts)) :invalid-not-before
+      (and starts (< (+ now-sec clock-skew-sec) starts)) :not-yet-valid
+      :else nil)))
+
+;; --- the instants ---------------------------------------------------------------
+
+(def ^:private instants
+  ["1970-01-01T00:00:00Z"
+   "2026-08-31T12:34:56Z"
+   "1999-12-31T23:59:59Z"
+   "2000-02-29T00:00:00Z"          ; a century year that IS a leap year
+   "2100-03-01T00:00:00Z"          ; the day after the one 2100 does not have
+   "2026-01-01T00:00:00.123456Z"
+   "2026-06-15T09:00:00+09:00"
+   "2026-06-15T09:00:00-05:30"
+   "2024-02-29T23:59:59+00:00"])
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest instants-agree-with-java-time
+  (doseq [s instants]
+    (is (true? (guest-ok? s)) s)
+    (is (= (.toEpochSecond (OffsetDateTime/parse s)) (guest-seconds s)) s)))
+
+(def ^:private malformed-by-shape
+  ["2026-01-01T00:00:00"       ; no designator, so no instant
+   "2026-01-01 00:00:00Z"      ; a space where the T belongs
+   "2026-01-01T00:00:00.Z"     ; a fraction with no digits
+   "2026-01-01T00:00:00+9:00"  ; an offset that is not two digits
+   "2026-01-01T00:00:00Z "     ; a trailing byte
+   ""])
+
+(deftest the-guest-and-the-library-agree-on-shape
+  (doseq [s (concat instants malformed-by-shape)]
+    (is (= (core/rfc3339? s) (guest-ok? s)) s)))
+
+(deftest the-librarys-pattern-admits-dates-that-do-not-exist
+  ;; `rfc3339-re` spells the fields as `[0-9]{2}`, so it is a shape and not
+  ;; a calendar. Each of these passes `siwe.core/rfc3339?` -- which is what
+  ;; `fields-problem` uses to accept an Issued At -- and names no instant.
+  ;;
+  ;; `siwe.edge` does not inherit the problem, because `Date.parse` returns
+  ;; NaN and `parse-seconds` turns that into nil. So this is the same shape
+  ;; as the finding below: the portable half admits what only the `.cljs`
+  ;; half refuses, and a JVM or nbb caller has neither.
+  (doseq [[s why] [["2026-13-01T00:00:00Z" "a thirteenth month"]
+                   ["2026-02-30T00:00:00Z" "a February with thirty days"]
+                   ["2100-02-29T00:00:00Z" "a leap day in a century year that has none"]
+                   ["2026-01-01T24:00:00Z" "hour twenty-four"]
+                   ["2026-01-01T00:60:00Z" "minute sixty"]]]
+    (testing why
+      (is (true? (core/rfc3339? s)) "the library accepts it")
+      (is (false? (guest-ok? s)) "the guest reads it as a calendar and does not")))
+  (testing "and 2000 IS a leap year, so the rule is the calendar and not a ban on the 29th"
+    (is (true? (guest-ok? "2000-02-29T00:00:00Z")))))
+
+(deftest a-leap-second-is-refused-rather-than-folded
+  (let [s "2016-12-31T23:59:60Z"]
+    (is (true? (core/rfc3339? s)) "RFC 3339 allows it and the library's pattern does")
+    (is (false? (guest-ok? s))
+        "and no count of seconds since the epoch can represent it, so folding
+         it onto the next minute would move the message's issuance")
+    (is (= bad-instant (guest-seconds s)))))
+
+;; --- the window ------------------------------------------------------------------
+
+(def ^:private t0 (.toEpochSecond (OffsetDateTime/parse "2026-08-31T12:00:00Z")))
+
+(deftest the-window-agrees-with-the-edge-rules
+  (doseq [[label fields opts]
+          [["bound" {:issued-at "2026-08-31T12:00:00Z"
+                     :expiration-time "2026-08-31T12:05:00Z"} {:now-sec t0}]
+           ["issued in the future" {:issued-at "2026-08-31T13:00:00Z"
+                                    :expiration-time "2026-08-31T14:00:00Z"} {:now-sec t0}]
+           ["too old" {:issued-at "2026-08-31T11:00:00Z"
+                       :expiration-time "2026-08-31T13:00:00Z"} {:now-sec t0}]
+           ["no expiration, required" {:issued-at "2026-08-31T12:00:00Z"} {:now-sec t0}]
+           ["no expiration, not required" {:issued-at "2026-08-31T12:00:00Z"}
+            {:now-sec t0 :require-expiration? false}]
+           ["expiration before issuance" {:issued-at "2026-08-31T12:00:00Z"
+                                          :expiration-time "2026-08-31T11:00:00Z"} {:now-sec t0}]
+           ["expired" {:issued-at "2026-08-31T11:58:00Z"
+                       :expiration-time "2026-08-31T11:59:00Z"} {:now-sec t0}]
+           ["not yet valid" {:issued-at "2026-08-31T12:00:00Z"
+                             :expiration-time "2026-08-31T13:00:00Z"
+                             :not-before "2026-08-31T12:30:00Z"} {:now-sec t0}]
+           ["already begun" {:issued-at "2026-08-31T12:00:00Z"
+                             :expiration-time "2026-08-31T13:00:00Z"
+                             :not-before "2026-08-31T11:00:00Z"} {:now-sec t0}]
+           ["malformed issuance" {:issued-at "2026-13-01T00:00:00Z"} {:now-sec t0}]
+           ["malformed expiration" {:issued-at "2026-08-31T12:00:00Z"
+                                    :expiration-time "nope"} {:now-sec t0}]
+           ["malformed not-before" {:issued-at "2026-08-31T12:00:00Z"
+                                    :expiration-time "2026-08-31T13:00:00Z"
+                                    :not-before "nope"} {:now-sec t0}]]]
+    (let [o (merge default-opts opts)
+          expected (or (edge-temporal-problem fields o) :none)]
+      (is (= expected (guest-problem fields opts)) label))))
+
+;; --- the finding ------------------------------------------------------------------
+
+(deftest the-portable-half-has-no-temporal-check
+  ;; What a JVM or nbb caller of this library actually gets. Both halves of
+  ;; the portable API are asked, so this is not a claim about one function.
+  (let [text (str "login.example.com wants you to sign in with your Ethereum account:\n"
+                  "0x0000000000000000000000000000000000000001\n\n"
+                  "URI: https://login.example.com\nVersion: 1\nChain ID: 1\n"
+                  "Nonce: abcdefgh\nIssued At: 2026-08-31T12:00:00Z\n"
+                  "Expiration Time: 2020-01-01T00:00:00Z")
+        parsed (core/parse-message text)]
+    (is (true? (:ok? parsed)) "an expiration six years before the issuance parses")
+    (is (nil? (core/expected-problem
+               (:message parsed)
+               {:domain "login.example.com" :uri "https://login.example.com"
+                :nonce "abcdefgh" :chain-ids [1]}))
+        "and binds to the relying party with no problem reported")
+    (testing "the guest refuses it"
+      (is (= :invalid-expiration-window
+             (guest-problem (select-keys (:message parsed)
+                                         [:issued-at :expiration-time])
+                            {:now-sec t0}))))))
+
+(deftest a-window-that-never-opens-verifies-under-the-edge-rules
+  ;; Not Before is one minute AFTER Expiration Time, so the interval holds
+  ;; no instant at all. The clock is placed between them, which is where
+  ;; both skew tolerances are open at once.
+  (let [fields {:issued-at "2026-08-31T11:59:30Z"
+                :expiration-time "2026-08-31T12:00:30Z"
+                :not-before "2026-08-31T12:01:00Z"}
+        opts {:now-sec t0}
+        o (merge default-opts opts)]
+    (testing "the transcribed rules accept it"
+      (is (nil? (edge-temporal-problem fields o))
+          "expiration is inside the skew of the clock and not-before is
+           inside the skew on the other side, and the two are never compared"))
+    (testing "the guest names it"
+      (is (= :window-never-opens (guest-problem fields opts))))
+    (testing "and the acceptance really does come from the skew band"
+      (is (= :not-yet-valid (edge-temporal-problem fields (assoc o :clock-skew-sec 0)))
+          "with no tolerance the same message is refused -- for the wrong
+           reason, but refused -- so it is the default sixty seconds on each
+           end that opens the band"))))
+
+(deftest the-guest-does-not-refuse-a-window-that-does-open
+  (is (= :none (guest-problem {:issued-at "2026-08-31T12:00:00Z"
+                               :not-before "2026-08-31T12:00:00Z"
+                               :expiration-time "2026-08-31T13:00:00Z"}
+                              {:now-sec t0}))
+      "not-before EQUAL to issued-at and strictly before expiration is a
+       window that opens now, and must not be caught by the new check"))
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed. 20000 was written here
+  ;; first, on the assumption that recursing over the digits of six fields
+  ;; would cost more than the interpreter default; the bracket said
+  ;; otherwise. That is the fifth budget this form has ruled out, against
+  ;; one it kept (org-ietf-ers).
+  (is (true? (call 'instant-ok? ["2026-08-31T12:34:56Z"]))
+      "the default budget carries the parse")
+  (is (thrown? Exception (call 'instant-ok? ["2026-08-31T12:34:56Z"] 8))
+      "and eight does not, so the assertion above is not vacuous"))
