@@ -1,0 +1,245 @@
+;; `kotoba/unixfs/shape.kotoba` against `unixfs.file/build`.
+;;
+;; The slice is the SHAPE of the balanced DAG, which is decided entirely by
+;; the file's length. So the parity is unusual and worth stating plainly:
+;; the oracle is given the bytes and builds the tree; the guest is given
+;; only how many bytes there were, and must describe the same tree.
+;;
+;; If they agree, the shape really was a function of the length, and the
+;; guest really does not need the file.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph).
+;;
+;; ## The negative controls
+;;
+;; `unixfs.file`'s own docstring names each of these as a way to build a
+;; valid-looking DAG that nothing else agrees with:
+;;
+;;   * `an-empty-file-is-one-empty-chunk` — "a file with no leaves would
+;;     have no CID at all". Zero is not a smaller answer, it is no answer;
+;;   * `a-one-chunk-file-is-the-raw-block` — no wrapper, no dag-pb node.
+;;     The reference implementation special-cases it, so a wrapper produces
+;;     a DAG no `ipfs get` will agree with;
+;;   * `the-hundred-and-seventy-fifth-chunk-gets-its-own-node` — at 175 the
+;;     root has two children and the second covers ONE chunk, still wrapped.
+;;     "A bare raw leaf as the second child would be a smaller, reasonable,
+;;     different DAG";
+;;   * `logical-size-is-not-encoded-size` — `blocksizes` is the file's
+;;     bytes; `Tsize` is the encoded subtree. Both live in every node and
+;;     confusing them produces a DAG that verifies against itself and
+;;     against nothing else.
+
+(ns unixfs.shape-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [unixfs.file :as file]
+            [unixfs.shape-guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "unixfs" "shape.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'unixfs.shape (slurp guest-file)}
+                                         'unixfs.shape :wasm32-kotoba-v1))))
+
+;; The interpreter default (512) is enough. That was not assumed: this file
+;; was written with a `test-fuel` of 60000 and a bracket test, and the
+;; bracket failed -- 512 shapes a 175-chunk file. The budget was
+;; superstition and is gone. `the-default-budget-still-suffices` at the
+;; bottom keeps that honest, and it is the third time in this migration that
+;; the two-directional form has caught a budget nobody needed.
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(defn- shaped
+  "The guest, told only how many bytes there were."
+  ([n] (shaped n {}))
+  ([n config]
+   (call 'offer-length [(call 'init [(->doc config)]) n])))
+
+;; A small chunk size keeps the fixtures cheap; `unixfs.file` takes the same
+;; option, so both sides describe the same tree. The DEFAULTS are asserted
+;; separately, because they are constants of the format rather than tuning.
+(def ^:private opts {:chunk-size 4 :max-links 3})
+(def ^:private guest-opts {:chunk-size 4 :max-links 3})
+
+(defn- bytes-of [n] (byte-array (repeat n (byte 7))))
+
+(defn- oracle-blocks
+  "How many blocks `build` actually produced, and how many of them are the
+  root's children -- read out of the built DAG rather than predicted."
+  [n]
+  (let [{:keys [blocks cid]} (file/build (bytes-of n) opts)]
+    {:block-count (count blocks) :cid cid}))
+
+;; --- the tests ---------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest the-defaults-are-the-constants-of-the-format
+  (testing "go-unixfs DefaultLinksPerBlock and the `ipfs add` chunker
+            default. A file chunked with different values is a different
+            CID, not a differently tuned one."
+    (let [s (shaped 0)]
+      (is (= 262144 (call 'chunk-size [s])))
+      (is (= 174 (call 'max-links [s])))
+      (is (= file/default-chunk-size (call 'chunk-size [s])))
+      (is (= file/default-max-links (call 'max-links [s]))))))
+
+(deftest an-empty-file-is-one-empty-chunk
+  (testing "`ipfs add` of /dev/null is the raw CID of no bytes; a file with
+            no leaves would have no CID at all"
+    (let [s (shaped 0 guest-opts)]
+      (is (= 1 (call 'chunk-count [s])) "one chunk, not zero")
+      (is (true? (call 'raw-root? [s])))
+      (is (= 0 (call 'level-count [s])))
+      (is (= 0 (call 'logical-size-at [s 0 0])) "and it covers no bytes")
+      (testing "which the oracle builds as a single block"
+        (is (= 1 (:block-count (oracle-blocks 0))))))))
+
+(deftest a-one-chunk-file-is-the-raw-block
+  (testing "no wrapper, no dag-pb node. The reference implementation
+            special-cases it, so a wrapper produces a valid-looking DAG
+            that no `ipfs get` will ever agree with."
+    (doseq [n [1 3 4]]
+      (let [s (shaped n guest-opts)]
+        (is (= 1 (call 'chunk-count [s])) n)
+        (is (true? (call 'raw-root? [s])) n)
+        (is (= 0 (call 'level-count [s])) n)
+        (is (= 1 (:block-count (oracle-blocks n)))
+            (str n " bytes is one block and no parent"))))
+    (testing "and one byte past a chunk is not"
+      (let [s (shaped 5 guest-opts)]
+        (is (= 2 (call 'chunk-count [s])))
+        (is (false? (call 'raw-root? [s])))
+        (is (= 1 (call 'level-count [s])))
+        (is (= 3 (:block-count (oracle-blocks 5))) "two leaves and a root")))))
+
+(deftest the-block-count-follows-from-the-length-alone
+  (testing "the guest predicts, from a number, how many blocks the oracle
+            will build from bytes it never sees"
+    (doseq [n [0 1 4 5 8 12 13 40 48 49 100]]
+      (let [s (shaped n guest-opts)
+            levels (call 'level-count [s])
+            predicted (reduce + 0 (map #(call 'nodes-at [s %]) (range (inc levels))))]
+        (is (= (:block-count (oracle-blocks n)) predicted)
+            (str n " bytes"))))))
+
+(deftest the-hundred-and-seventy-fifth-chunk-gets-its-own-node
+  (testing "at max-links+1 chunks the root has two children: one covering a
+            full node's worth and one covering a SINGLE chunk -- still
+            wrapped in its own dag-pb node. A bare raw leaf as the second
+            child would be a smaller, reasonable, different DAG."
+    ;; max-links 3, chunk-size 4 -> 4 chunks is the first over a full node
+    (let [s (shaped 13 guest-opts)]                    ; 4 chunks
+      (is (= 4 (call 'chunk-count [s])))
+      (is (= 2 (call 'level-count [s])) "leaves, a middle level, a root")
+      (is (= 2 (call 'nodes-at [s 1])) "the middle level has two nodes")
+      (is (= 3 (call 'children-at [s 1 0])) "the first is full")
+      (is (= 1 (call 'children-at [s 1 1])) "the second wraps one chunk")
+      (is (= 2 (call 'children-at [s 2 0])) "and the root has two children")
+      (testing "so the DAG has 4 leaves + 2 middles + 1 root"
+        (is (= 7 (:block-count (oracle-blocks 13))))))
+    (testing "and at the real constant, 175 chunks behaves the same way"
+      (let [s (shaped (* 175 262144))]
+        (is (= 175 (call 'chunk-count [s])))
+        (is (= 2 (call 'level-count [s])))
+        (is (= 174 (call 'children-at [s 1 0])))
+        (is (= 1 (call 'children-at [s 1 1])))
+        (is (= 2 (call 'children-at [s 2 0])))))))
+
+(deftest a-full-node-does-not-grow-a-level
+  (testing "exactly max-links chunks is one root over them, not a root over
+            a root"
+    (let [s (shaped 12 guest-opts)]                    ; 3 chunks
+      (is (= 3 (call 'chunk-count [s])))
+      (is (= 1 (call 'level-count [s])))
+      (is (= 3 (call 'children-at [s 1 0])))
+      (is (= 4 (:block-count (oracle-blocks 12))) "three leaves and a root"))
+    (testing "at the real constant too"
+      (let [s (shaped (* 174 262144))]
+        (is (= 174 (call 'chunk-count [s])))
+        (is (= 1 (call 'level-count [s])))))))
+
+(deftest logical-size-is-not-encoded-size
+  (testing "`blocksizes` is the FILE's bytes under a node. `Tsize` -- the
+            encoded size of the subtree, block headers included -- is a
+            different number that lives in the same nodes, and is not
+            computed here because it depends on how each node encodes."
+    (let [s (shaped 13 guest-opts)]                    ; 4 chunks of 4,4,4,1
+      (is (= 4 (call 'logical-size-at [s 0 0])))
+      (is (= 4 (call 'logical-size-at [s 0 2])))
+      (is (= 1 (call 'logical-size-at [s 0 3])) "the last chunk is short")
+      (is (= 12 (call 'logical-size-at [s 1 0])) "three full chunks")
+      (is (= 1 (call 'logical-size-at [s 1 1])) "the lone one")
+      (is (= 13 (call 'logical-size-at [s 2 0])) "the root covers the file")
+      (testing "and the root's logical size is the file size, always"
+        (doseq [n [0 1 5 13 40]]
+          (let [s (shaped n guest-opts)]
+            (is (= n (call 'logical-size-at [s (call 'level-count [s]) 0]))
+                (str n " bytes"))))))))
+
+(deftest leaves-are-covered-left-to-right-without-gaps
+  (testing "every leaf belongs to exactly one node at every level"
+    (doseq [n [5 13 40 100]]
+      (let [s (shaped n guest-opts)
+            levels (call 'level-count [s])
+            chunks (call 'chunk-count [s])]
+        (doseq [level (range 1 (inc levels))]
+          (let [nodes (call 'nodes-at [s level])
+                spans (map (fn [i] [(call 'first-leaf-at [s level i])
+                                    (call 'leaf-span-at [s level i])])
+                           (range nodes))]
+            (is (= 0 (ffirst spans)) [n level "starts at leaf 0"])
+            (is (= chunks (reduce + 0 (map second spans)))
+                [n level "covers every leaf exactly once"])
+            (is (= (map (fn [[a b]] (+ a b)) (butlast spans))
+                   (map first (rest spans)))
+                [n level "with no gaps and no overlap"])))))))
+
+(deftest bad-options-are-refused
+  (testing "`unixfs.file` refuses both, and a node holding one child never
+            gets smaller -- it would recurse forever"
+    (let [s (call 'init [(->doc {:chunk-size 0 :max-links 3})])]
+      (is (= :refused (call 'phase [s])))
+      (is (= :unixfs/invalid-chunk-size (call 'reason [s]))))
+    (let [s (call 'init [(->doc {:chunk-size 4 :max-links 1})])]
+      (is (= :refused (call 'phase [s])))
+      (is (= :unixfs/invalid-max-links (call 'reason [s]))))
+    (testing "and a refused shaper answers nothing about a length"
+      (let [s (call 'offer-length
+                    [(call 'init [(->doc {:chunk-size 4 :max-links 1})]) 100])]
+        (is (= :refused (call 'phase [s])))
+        (is (= -1 (call 'chunk-count [s])))))))
+
+(deftest a-negative-length-is-not-a-file
+  (let [s (shaped -1 guest-opts)]
+    (is (= :refused (call 'phase [s])))
+    (is (= :unixfs/negative-length (call 'reason [s])))))
+
+;; --- the budget --------------------------------------------------------------
+
+(defn- completes-within? [fuel]
+  (try
+    (let [s (call 'offer-length [(call 'init [(->doc {})] fuel) (* 175 262144)] fuel)]
+      (= 2 (call 'level-count [s] fuel)))
+    (catch clojure.lang.ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest the-default-budget-still-suffices
+  (testing "no `:fuel` option is passed anywhere in this file, so this is
+            the assertion that keeps that honest"
+    (is (true? (completes-within? 512))))
+  (testing "and the margin is visible, so a guest that grows is noticed
+            before it trips the default rather than after"
+    (let [minimum (first (filter completes-within?
+                                 [150 200 250 300 350 400 450 512]))]
+      (is (some? minimum) "a 175-chunk file does not shape even at the default")
+      (println (format "  [fuel] a 175-chunk file shapes at %d; the default is 512"
+                       minimum)))))
