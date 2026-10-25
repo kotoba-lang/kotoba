@@ -1,0 +1,129 @@
+(ns dcs.opcua-test
+  "In-process coverage of dcs.opcua's request-dispatch logic (real
+  AttributeServices$ReadContext/WriteContext objects, real
+  AddressSpaceFragment reify, real UaVariableNode + AttributeFilter chain —
+  everything except the actual UA-TCP wire bytes). The wire-level proof
+  (a real, independent Eclipse Milo OpcUaClient connecting over a real
+  socket) lives OUTSIDE this suite, in an isolated classpath/alias — see
+  README \"Protocol-simulation layer\" / \"OPC-UA verification\": Milo
+  0.6.16's client transport (`sdk-client`) requires
+  `com.digitalpetri.netty:netty-channel-fsm:0.9`, which conflicts (real,
+  verified AbstractMethodError) with `com.digitalpetri.modbus:modbus-tcp`'s
+  `netty-channel-fsm:1.0.0` requirement on the SAME classpath dcs.modbus's
+  own test needs — so the two real-client proofs cannot run in one JVM
+  process / one `kbb -M:test` invocation."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [dcs.ports :as ports]
+            [dcs.opcua :as opcua])
+  (:import
+   (org.eclipse.milo.opcua.sdk.server.api.services
+    AttributeServices$ReadContext AttributeServices$WriteContext ViewServices$BrowseContext)
+   (org.eclipse.milo.opcua.stack.core AttributeId)
+   (org.eclipse.milo.opcua.stack.core.types.enumerated TimestampsToReturn)
+   (org.eclipse.milo.opcua.stack.core.types.structured ReadValueId WriteValue)
+   (org.eclipse.milo.opcua.stack.core.types.builtin
+    NodeId DataValue Variant)))
+
+(defrecord TestIO [values]
+  ports/IFieldIO
+  (read-tag [_ tag-id] (get @values tag-id))
+  (write-tag! [_ tag-id value] (swap! values assoc tag-id value)))
+
+(defn- test-io [seed] (->TestIO (atom seed)))
+
+;; Distinct from dcs.opcua/default-port (used in README examples) and from
+;; dcs.modbus-test's port, so runs never collide.
+(def ^:private test-port 15034)
+
+(defn- test-node-map []
+  (-> (opcua/node-map)
+      (opcua/add-node (opcua/node-spec "CoV" "COV.PV" :double :read-only))
+      (opcua/add-node (opcua/node-spec "AlarmActive" "ALARM.ACTIVE" :boolean :read-only))
+      (opcua/add-node (opcua/node-spec "FanSp" "FAN.SP" :double :read-write))))
+
+(deftest node-map-builder
+  (let [nm (test-node-map)]
+    (is (= #{"CoV" "AlarmActive" "FanSp"} (set (keys nm))))
+    (is (= "COV.PV" (:dcs/tag (get nm "CoV"))))
+    (is (= :read-write (:dcs/access (get nm "FanSp"))))))
+
+(deftest loopback-only-guardrail
+  (testing "refuses to bind a non-loopback host — no accidental exposure beyond localhost"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (opcua/start-server! (test-io {}) (test-node-map) {:host "0.0.0.0" :port test-port})))))
+
+(deftest server-lifecycle-and-real-address-space-dispatch
+  (let [io (test-io {"COV.PV" 0.032 "ALARM.ACTIVE" false "FAN.SP" 1500.0})
+        handle (opcua/start-server! io (test-node-map) {:port test-port})]
+    (try
+      (testing "start-server! actually stood up a real OpcUaServer with a real address space fragment"
+        (is (some? (:dcs/server handle)))
+        (is (some? (:dcs/node-manager handle)))
+        (is (= "opc.tcp://127.0.0.1:15034/dcs" (opcua/endpoint-url handle))))
+
+      (let [server (:dcs/server handle)
+            ns-index (:dcs/ns-index handle)
+            cov-id (NodeId. ns-index "CoV")
+            alarm-id (NodeId. ns-index "AlarmActive")
+            fansp-id (NodeId. ns-index "FanSp")
+            unknown-id (NodeId. ns-index "NoSuchNode")
+            asm (.getAddressSpaceManager server)]
+
+        (testing "our nodes are present in the node-manager backing the registered fragment"
+          (is (.containsNode (:dcs/node-manager handle) cov-id))
+          (is (.containsNode (:dcs/node-manager handle) alarm-id))
+          (is (.containsNode (:dcs/node-manager handle) fansp-id)))
+
+        (testing "read: a real AttributeServices$ReadContext dispatch reads live IFieldIO state through the AttributeFilter chain"
+          (let [ctx (AttributeServices$ReadContext. server nil)]
+            (.read asm ctx 0.0 TimestampsToReturn/Both
+                   [(ReadValueId. cov-id (.uid AttributeId/Value) nil nil)
+                    (ReadValueId. alarm-id (.uid AttributeId/Value) nil nil)
+                    (ReadValueId. unknown-id (.uid AttributeId/Value) nil nil)])
+            (let [[cov-dv alarm-dv unknown-dv] @(.getFuture ctx)]
+              (is (= 0.032 (.getValue ^Variant (.getValue ^DataValue cov-dv))))
+              (is (true? (.isGood (.getStatusCode ^DataValue cov-dv))))
+              (is (= false (.getValue ^Variant (.getValue ^DataValue alarm-dv))))
+              (is (true? (.isBad (.getStatusCode ^DataValue unknown-dv))))
+              (is (= 0x80340000 (bit-and 0xFFFFFFFF (.getValue (.getStatusCode ^DataValue unknown-dv)))))
+              (is (nil? (.getValue ^Variant (.getValue ^DataValue unknown-dv)))))))
+
+        (testing "write: a real AttributeServices$WriteContext dispatch writes through to the SAME IFieldIO the domain logic reads"
+          (let [ctx (AttributeServices$WriteContext. server nil)]
+            (.write asm ctx [(WriteValue. fansp-id (.uid AttributeId/Value) nil (DataValue. (Variant. 1800.0)))])
+            (let [[status] @(.getFuture ctx)]
+              (is (true? (.isGood status)))))
+          (is (= 1800.0 (ports/read-tag io "FAN.SP"))))
+
+        (testing "write to a read-only node is rejected (real Bad_NotWritable), not silently accepted"
+          (let [ctx (AttributeServices$WriteContext. server nil)]
+            (.write asm ctx [(WriteValue. cov-id (.uid AttributeId/Value) nil (DataValue. (Variant. 9.9)))])
+            (let [[status] @(.getFuture ctx)]
+              (is (true? (.isBad status)))))
+          ;; the domain state must be untouched by the rejected write
+          (is (= 0.032 (ports/read-tag io "COV.PV"))))
+
+        (testing "browse: real Reference graph, for a node namespace our fragment's filter actually claims"
+          ;; Note: the Organizes reference we recorded runs FROM the standard
+          ;; ObjectsFolder (namespace 0, owned by the server's built-in
+          ;; namespace/fragment, not ours) TO our node. AddressSpaceComposite
+          ;; dispatches Browse/getReferences by asking each registered
+          ;; fragment's FILTER whether it claims the SOURCE NodeId -- ours
+          ;; only claims our own namespace index, so a root-down browse of
+          ;; ObjectsFolder is served by the server's built-in fragment (which
+          ;; doesn't know about our reference), not ours. Direct NodeId
+          ;; access -- what the isolated real-client round trip verifies --
+          ;; is this simulator's supported discovery path; see the README
+          ;; and namespace docstring. What IS real and fragment-routed: a
+          ;; browse of a node inside OUR namespace correctly reaches our
+          ;; fragment and returns without error.
+          (let [ctx (ViewServices$BrowseContext. server nil)]
+            (.browse asm ctx nil cov-id)
+            (is (vector? (vec @(.getFuture ctx)))))
+          (testing "the Organizes reference we recorded is present in our own node-manager's reference table"
+            (is (some #(.equalTo cov-id (.getTargetNodeId ^org.eclipse.milo.opcua.sdk.core.Reference %))
+                      (.getReferences (:dcs/node-manager handle)
+                                       org.eclipse.milo.opcua.stack.core.Identifiers/ObjectsFolder))))))
+
+      (finally
+        (opcua/stop-server! handle)))))

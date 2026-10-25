@@ -1,0 +1,130 @@
+(ns dcs.modbus-test
+  "Wire-protocol round-trip test for dcs.modbus. The client here is a REAL,
+  independent Modbus TCP client — com.digitalpetri.modbus's own
+  ModbusTcpClient, connecting over a real loopback TCP socket with real MBAP
+  framing — not an internal function call into dcs.modbus. This is the
+  genuine external-observability proof: if this test only called
+  dcs.modbus's Clojure functions directly, it would prove nothing about
+  wire-protocol compatibility."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [dcs.ports :as ports]
+            [dcs.modbus :as modbus])
+  (:import
+   (com.digitalpetri.modbus.client ModbusTcpClient)
+   (com.digitalpetri.modbus.tcp.client NettyTcpClientTransport)
+   (com.digitalpetri.modbus.pdu
+    ReadHoldingRegistersRequest
+    ReadInputRegistersRequest
+    WriteSingleRegisterRequest
+    WriteMultipleRegistersRequest)
+   (com.digitalpetri.modbus.exceptions ModbusResponseException)
+   (java.nio ByteBuffer)
+   (java.util.function Consumer)))
+
+(defrecord TestIO [values]
+  ports/IFieldIO
+  (read-tag [_ tag-id] (get @values tag-id))
+  (write-tag! [_ tag-id value] (swap! values assoc tag-id value)))
+
+(defn- test-io [seed] (->TestIO (atom seed)))
+
+;; Distinct from dcs.modbus/default-port (15020, used in the README example)
+;; so this test never collides with a manually-started demo server.
+(def ^:private test-port 15021)
+
+(defn- test-register-map []
+  (-> (modbus/register-map)
+      (modbus/add-input (modbus/input-register 0 "COV.PV" (modbus/scaled-int16 1000 false)))
+      (modbus/add-input (modbus/input-register 1 "PH.PV" (modbus/scaled-int16 100 false)))
+      (modbus/add-holding (modbus/holding-register 0 "FAN.SP" (modbus/scaled-int16 1 false) :read-write))
+      (modbus/add-holding (modbus/holding-register 1 "TEMP.SP" (modbus/scaled-int16 100 false) :read-write))
+      (modbus/add-holding (modbus/holding-register 2 "ALARM.ACTIVE" modbus/bool16 :read-only))))
+
+(defn- real-client ^ModbusTcpClient [port]
+  (let [transport (NettyTcpClientTransport/create
+                    (reify Consumer
+                      (accept [_this b]
+                        (set! (.hostname b) "127.0.0.1")
+                        (set! (.port b) (int port)))))]
+    (ModbusTcpClient/create transport)))
+
+(defn- unsigned-words [^bytes bs]
+  (let [bb (ByteBuffer/wrap bs)]
+    (vec (repeatedly (/ (alength bs) 2) #(bit-and (int (.getShort bb)) 0xFFFF)))))
+
+(deftest scaled-int16-encode-decode-roundtrip
+  (is (= 32 (modbus/encode-register (modbus/scaled-int16 1000 false) 0.032)))
+  (is (= 0.032 (modbus/decode-register (modbus/scaled-int16 1000 false) 32)))
+  (testing "clamps to the representable 16-bit range instead of wrapping/corrupting"
+    (is (= 65535 (modbus/encode-register (modbus/scaled-int16 1 false) 999999)))
+    (is (= 0 (modbus/encode-register (modbus/scaled-int16 1 false) -50))))
+  (testing "signed round-trip"
+    (is (= 65516 (modbus/encode-register (modbus/scaled-int16 1 true) -20))) ; two's complement wire word
+    (is (= -20.0 (modbus/decode-register (modbus/scaled-int16 1 true) 65516))))
+  (testing "bool16"
+    (is (= 1 (modbus/encode-register modbus/bool16 true)))
+    (is (= 0 (modbus/encode-register modbus/bool16 false)))
+    (is (true? (modbus/decode-register modbus/bool16 1)))
+    (is (false? (modbus/decode-register modbus/bool16 0)))))
+
+(deftest modbus-tcp-real-client-round-trip
+  (let [io (test-io {"COV.PV" 0.032 "PH.PV" 7.24 "FAN.SP" 0.0 "TEMP.SP" 0.0 "ALARM.ACTIVE" false})
+        rm (test-register-map)
+        handle (modbus/start-server! io rm {:port test-port})]
+    (try
+      (let [client (real-client test-port)]
+        (.connect client)
+        (try
+          (testing "FC04 read input registers: a real client reads the SAME live IFieldIO state the domain logic would"
+            (let [resp (.readInputRegisters client 1 (ReadInputRegistersRequest. 0 2))]
+              (is (= [32 724] (unsigned-words (.registers resp))))))
+
+          (testing "FC03 read holding registers: initial FAN.SP"
+            (let [resp (.readHoldingRegisters client 1 (ReadHoldingRegistersRequest. 0 1))]
+              (is (= [0] (unsigned-words (.registers resp))))))
+
+          (testing "FC06 write single register: an external Modbus master sets FAN.SP through the wire, not a function call"
+            (.writeSingleRegister client 1 (WriteSingleRegisterRequest. 0 1800))
+            (is (= 1800.0 (ports/read-tag io "FAN.SP"))))
+
+          (testing "FC16 write multiple registers, both writable"
+            (let [bb (doto (ByteBuffer/allocate 4)
+                       (.putShort (unchecked-short 2100))
+                       (.putShort (unchecked-short 2550)))]
+              (.writeMultipleRegisters client 1 (WriteMultipleRegistersRequest. 0 2 (.array bb))))
+            (is (= 2100.0 (ports/read-tag io "FAN.SP")))
+            (is (= 25.5 (ports/read-tag io "TEMP.SP"))))
+
+          (testing "FC16 spanning a read-only register is rejected ATOMICALLY (real ILLEGAL_FUNCTION, no partial write)"
+            (let [bb (doto (ByteBuffer/allocate 4)
+                       (.putShort (unchecked-short 1111))
+                       (.putShort (unchecked-short 1)))]
+              (is (thrown? ModbusResponseException
+                           (.writeMultipleRegisters client 1 (WriteMultipleRegistersRequest. 1 2 (.array bb))))))
+            ;; rejected before any register in the request was written
+            (is (= 25.5 (ports/read-tag io "TEMP.SP")))
+            (is (false? (ports/read-tag io "ALARM.ACTIVE"))))
+
+          (testing "unmapped register address -> real Modbus ILLEGAL_DATA_ADDRESS exception, not silent success"
+            (is (thrown? ModbusResponseException
+                         (.readHoldingRegisters client 1 (ReadHoldingRegistersRequest. 99 1))))
+            (is (thrown? ModbusResponseException
+                         (.readInputRegisters client 1 (ReadInputRegistersRequest. 99 1)))))
+
+          (testing "a read-only holding register rejects a direct single-register write -> ILLEGAL_FUNCTION"
+            (is (thrown? ModbusResponseException
+                         (.writeSingleRegister client 1 (WriteSingleRegisterRequest. 2 1)))))
+
+          (testing "every other function code (unimplemented here) still answers with a real ILLEGAL_FUNCTION response, not a hang/close"
+            (is (thrown? ModbusResponseException
+                         (.readCoils client 1 (com.digitalpetri.modbus.pdu.ReadCoilsRequest. 0 1)))))
+
+          (finally
+            (.disconnect client))))
+      (finally
+        (modbus/stop-server! handle)))))
+
+(deftest loopback-only-guardrail
+  (testing "refuses to bind a non-loopback host — no accidental exposure beyond localhost"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (modbus/start-server! (test-io {}) (test-register-map) {:host "0.0.0.0" :port test-port})))))

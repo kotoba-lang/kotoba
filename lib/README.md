@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.dcs` | `kotoba.dcs/src` | `dcs.alarm`, `dcs.execute`, `dcs.gpio`, `dcs.modbus` (Kotoba project library) |
 | `kotoba.dance` | `kotoba.dance/src` | `kami.dance`, `kotoba.dance` (Kotoba project library) |
 | `kotoba.cue` | `kotoba.cue/src` | `cue.core`, `kotoba.cue` (Kotoba project library) |
 | `kotoba.chie` | `kotoba.chie/src` | `chie.cell`, `chie.cells.social-post.state-machine`, `chie.methods.analyze`, `chie.methods.autorun` (Kotoba project library) |
