@@ -1,0 +1,73 @@
+(ns kotoba.native.inline-handle-ops-test
+  "ADR 0084: five handle operations are emitted in line on both ISAs -- the
+  range check, the table read and the access -- and never through the
+  context slot. The bytes are pinned against the system assembler's
+  encodings (2026-09-16)."
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.native.x86-64 :as x86]))
+
+(defn- program [params types body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params params :param-types types :result :i64 :body body}]})
+
+(defn- contains-bytes? [code needle]
+  (boolean (some #(= (vec needle) %) (partition (count needle) 1 code))))
+
+(def ^:private cases
+  [['(vector-at v 3) '[v] [:vector-i64] 176]
+   ['(vector-count v) '[v] [:vector-i64] 168]
+   ['(string-byte-length s) '[s] [:string] 72]
+   ['(pair-first p) '[p] [:i64] 64]
+   ['(vector-count (vector-assoc! v 0 7)) '[v] [:vector-i64] 208]])
+
+(deftest aarch64-emits-the-check-and-never-the-slot
+  (doseq [[body params types slot] cases]
+    (let [code (:code (arm/emit-program (program params types body)))
+          slot-load [(bit-and 0xff (bit-or 0xf0 0)) (bit-and (bit-shift-right (bit-or 0xf9400000 (bit-shift-left (quot slot 8) 10) (bit-shift-left 7 5) 16) 8) 0xff)]]
+      ;; the handle check: sub x17, x1, #1 ; cmp x17, x16 ; b.hs
+      (is (contains-bytes? code [0x31 0x04 0x00 0xd1 0x3f 0x02 0x10 0xeb]) (pr-str body))
+      ;; the failure is udf #0, i.e. SIGILL
+      (is (contains-bytes? code [0x00 0x00 0x00 0x00]) (pr-str body))
+      ;; and no `ldr x16, [x7, #slot]` for this operation's slot
+      (is (not (contains-bytes? code (vec (concat slot-load [0x40 0xf9])))) (pr-str [body slot])))))
+
+(deftest aarch64-vector-at-loads-through-the-item-arena
+  (let [code (:code (arm/emit-program (program '[v] [:vector-i64] '(vector-at v 3))))]
+    (is (contains-bytes? code [0xf0 0x9c 0x40 0xf9]) "ldr x16, [x7, #312] -- the vector-used pointer")
+    (is (contains-bytes? code [0x11 0x42 0x40 0xa9 0x5f 0x00 0x10 0xeb]) "ldp x17, x16, [x16] ; cmp x2, x16 -- the index bound, the length kept out of x3")
+    (is (contains-bytes? code [0x00 0x7a 0x71 0xf8]) "ldr x0, [x16, x17, lsl #3]")))
+
+(deftest aarch64-assoc-stores-and-answers-the-handle
+  (let [code (:code (arm/emit-program (program '[v] [:vector-i64] '(vector-count (vector-assoc! v 0 7)))))]
+    (is (contains-bytes? code [0x03 0x7a 0x31 0xf8 0xe0 0x03 0x01 0xaa]) "str x3, [x16, x17, lsl #3] ; mov x0, x1")
+    ;; The value register survives to the store: nothing between the
+    ;; argument moves and `str x3` writes x3. The first cut loaded the
+    ;; length into x3 and stored 4 in every slot.
+    (is (not (contains-bytes? code [0x11 0x0e 0x40 0xa9])) "no ldp into x3 anywhere in the sequence")))
+
+(deftest x86-64-emits-the-check-and-never-the-slot
+  (doseq [[body params types slot] cases]
+    (let [code (:code (x86/emit-program (program params types body)))]
+      ;; lea r11, [rsi - 1] ; cmp r11, r10 ; jae
+      (is (contains-bytes? code [0x4c 0x8d 0x5e 0xff 0x4d 0x39 0xd3 0x0f 0x83]) (pr-str body))
+      ;; ud2
+      (is (contains-bytes? code [0x0f 0x0b]) (pr-str body))
+      ;; no `call [r9 + slot]` in either encoding of the slot
+      (is (not (contains-bytes? code [0x41 0xff 0x51 slot])) (pr-str [body slot]))
+      (is (not (contains-bytes? code (vec (concat [0x41 0xff 0x91] [slot 0 0 0])))) (pr-str [body slot])))))
+
+(deftest x86-64-vector-at-loads-through-the-item-arena
+  (let [code (:code (x86/emit-program (program '[v] [:vector-i64] '(vector-at v 3))))]
+    (is (contains-bytes? code [0x4d 0x8b 0x91 0x38 0x01 0x00 0x00]) "mov r10, [r9 + 312]")
+    (is (contains-bytes? code [0x4c 0x39 0xd2 0x0f 0x83]) "cmp rdx, r10 ; jae -- the index bound")
+    (is (contains-bytes? code [0x4b 0x8b 0x04 0xda]) "mov rax, [r10 + r11*8]")))
+
+(deftest a-search-is-still-a-call
+  (let [arm-code (:code (arm/emit-program (program '[s t] [:string :string] '(string-index-of-from s t 0))))
+        x86-code (:code (x86/emit-program (program '[s t] [:string :string] '(string-index-of-from s t 0))))]
+    (is (contains-bytes? arm-code [0xf0 0x88 0x40 0xf9]) "AArch64 slot 272 is loaded")
+    (is (contains-bytes? x86-code [0x41 0xff 0x91 0x10 0x01 0x00 0x00]) "x86-64 slot 272 is called")))

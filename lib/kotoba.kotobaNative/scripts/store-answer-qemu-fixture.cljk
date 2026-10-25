@@ -1,0 +1,128 @@
+#!/usr/bin/env kbb
+;; storefix: boot a Kotoba kernel image that stores a word at every transfer
+;; width and prints, for each, whether the store's ANSWER was the word it was
+;; handed and whether a load back agrees.
+;;
+;; This repository does not run compiled programs, so its own suite is
+;; encodings only -- `store_result_test.clj` says the bytes are the
+;; instructions they are named for, and nothing there says the CPU agrees. This
+;; does. It is a FIXTURE and not a test: it needs amu, QEMU and OVMF, none of
+;; which this repo depends on, so it is run by hand and its result is quoted in
+;; the ADR rather than gating a suite.
+;;
+;;   kbb --backend sci scripts/store-answer-qemu-fixture.cljk --amu <path-to-amu-worktree>
+;;
+;; `--expect X5X6X7X8` asks for the PRE-FIX console instead, which is how the
+;; defect was shown to be real before it was fixed. Anything else is refused.
+;;
+;; It refuses rather than skipping when a tool is missing. A fixture that
+;; prints "ok" because it could not find QEMU is the failure class this
+;; workspace keeps finding: a check that could not run answering like a check
+;; that ran and found nothing wrong.
+
+(ns store-answer-qemu-fixture
+  (:require ["child_process" :as cp]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [kotoba.lang.text :as str]))
+
+(def fixed-console
+  "One digit per question, in the order the fixture asks them: store answer and
+  load-back for u8, u16, u32, u64."
+  "15263748")
+
+(def broken-console
+  "What the same image printed before the store's destination register was
+  written: every load-back agrees, every ANSWER does not."
+  "X5X6X7X8")
+
+;; isa-debug-exit at 0xf4 answers with (value << 1) | 1, and the fixture's
+;; body writes 16.
+(def expected-status 33)
+
+(defn- die! [& parts]
+  (.error js/console (str/join " " parts))
+  (.exit js/process 3))
+
+(defn- unanswered! [& parts]
+  ;; Neither pass nor fail: exit 2, so "could not run" cannot be read as
+  ;; "ran and was clean".
+  (.error js/console (str/join " " (cons "UNANSWERED" parts)))
+  (.exit js/process 2))
+
+(defn- run! [label cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args)
+                        #js {:encoding "utf8" :stdio "pipe"})]
+    (when (.-error r) (die! label "could not start:" (.-message (.-error r))))
+    (when-not (zero? (.-status r))
+      (die! label "exited" (.-status r) "\n" (.-stdout r) "\n" (.-stderr r)))
+    (.-stdout r)))
+
+(defn- arg [argv flag]
+  (second (drop-while #(not= flag %) argv)))
+
+(def ^:private ovmf-candidates
+  ["/opt/homebrew/share/qemu/edk2-x86_64-code.fd"
+   "/usr/share/OVMF/OVMF_CODE_4M.fd"
+   "/usr/share/OVMF/OVMF_CODE.fd"
+   "/usr/share/edk2/x64/OVMF_CODE.fd"])
+
+(defn -main [script & argv]
+  ;; `js/__filename` is undefined under nbb, so the repository root is derived
+  ;; from the script path nbb was given rather than from the module's own.
+  (let [root (path/dirname (path/dirname (path/resolve script)))
+        amu (or (arg argv "--amu") (die! "usage: --amu <path>"))
+        source (or (arg argv "--source")
+                   (path/join root "test" "fixtures" "store-answer-qemu.kotoba"))
+        expected (or (arg argv "--expect") fixed-console)
+        _ (when-not (contains? #{fixed-console broken-console} expected)
+            (die! "REFUSED: --expect must be" fixed-console "or" broken-console
+                  "-- a fixture whose expectation is a parameter proves nothing"))
+        out (or (arg argv "--out")
+                (fs/mkdtempSync (path/join (os/tmpdir) "kotoba-store-")))
+        qemu (or (arg argv "--qemu") "qemu-system-x86_64")
+        ovmf (or (arg argv "--ovmf") (first (filter #(fs/existsSync %) ovmf-candidates)))
+        amu-bin (path/join amu "bin" "amu")
+        kernel (path/join out "KERNEL.ELF")
+        esp (path/join out "esp")
+        efi (path/join esp "EFI" "BOOT" "BOOTX64.EFI")
+        log (path/join out "debug.log")]
+    (when-not (fs/existsSync source) (unanswered! "source missing:" source))
+    (when-not (fs/existsSync amu-bin) (unanswered! "amu missing:" amu-bin))
+    (when-not ovmf (unanswered! "no OVMF firmware found in" (str/join " " ovmf-candidates)))
+    (fs/mkdirSync (path/dirname efi) #js {:recursive true})
+    (println "compiling" source)
+    (run! "amu compile" amu-bin
+          ["compile" source "--target" "x86_64-aiueos-kernel-v1"
+           "--artifact" "image" "--fuel" "32768" "--output" kernel])
+    (println "packaging the UEFI boot chain")
+    (run! "amu package-aiueos-boot" amu-bin
+          ["package-aiueos-boot" kernel "--output" efi])
+    (when (fs/existsSync log) (fs/rmSync log))
+    (println "booting" qemu)
+    (let [r (cp/spawnSync
+             qemu
+             (clj->js
+              ["-machine" "q35,accel=tcg" "-cpu" "max" "-m" "128M" "-smp" "2"
+               "-drive" (str "if=pflash,format=raw,readonly=on,file=" ovmf)
+               "-drive" (str "format=raw,file=fat:rw:" esp)
+               "-device" "isa-debugcon,iobase=0xe9,chardev=debug"
+               "-chardev" (str "file,id=debug,path=" log)
+               "-device" "isa-debug-exit,iobase=0xf4,iosize=0x04"
+               "-display" "none" "-serial" "none" "-no-reboot"])
+             #js {:encoding "utf8" :stdio "pipe" :timeout 300000})
+          status (.-status r)
+          console (if (fs/existsSync log) (fs/readFileSync log "utf8") "")]
+      (println "console  =" (pr-str console))
+      (println "exit     =" status)
+      (println "expected =" (pr-str expected) expected-status)
+      (if (and (= console expected) (= status expected-status))
+        (do (println (if (= expected fixed-console)
+                       "AIUEOS_KOTOBA_STORE_ANSWER_QEMU_OK"
+                       "AIUEOS_KOTOBA_STORE_ANSWER_QEMU_DEFECT_REPRODUCED")
+                     "widths=u8,u16,u32,u64 window=4096 image=" kernel)
+            (.exit js/process 0))
+        (die! "REFUSED: the console is neither the fixed nor the requested one")))))
+
+(apply -main (drop 2 (js->clj js/process.argv)))

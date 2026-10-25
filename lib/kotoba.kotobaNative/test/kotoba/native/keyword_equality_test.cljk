@@ -1,0 +1,123 @@
+(ns kotoba.native.keyword-equality-test
+  "`=` on keywords reaches native as `string=?` (kotoba.native.keyword-equality).
+
+  Three things, proved separately:
+
+  **The rewrite is the one described.** Every `=` with a keyword-typed operand
+  -- a literal, a `:keyword` parameter, a `let` binding of one, a `record-get`
+  of a `:keyword` field, a call returning `:keyword`, an `if` of keywords --
+  becomes `string=?`; an `=` on two integers, or on a value the pass cannot
+  see the type of, is left alone. Both directions, so an over-eager rewrite
+  (bytes compared as if they were a string handle) is caught as well as an
+  absent one.
+
+  **It computes what the oracle computes.** Every keyword program below is run
+  through `kotoba.kir/execute` twice, once as written and once rewritten; the
+  expected value is the oracle's, never written down.
+
+  **Both backends emit it, identically shaped.** `emit-program` of a program
+  that compares keywords produces exactly the bytes of the program with the
+  rewrite already written out. Per ISA, on both ISAs.
+
+  Machine-code EXECUTION is not here: this repository has no loader
+  (`tools/kexe_loader.c` belongs to kotoba-lang/amu). The defect was measured
+  there: `(= :end :end)` answered 0 on aarch64 at amu 73ddd26 (2026-09-15)
+  while KIR, js and wasm answered 1."
+  (:require [kotoba.lang.text] #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.kir :as ir]
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.native.keyword-equality :as kweq]
+            [kotoba.native.x86-64 :as x86]))
+
+(def ^:private backends [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]])
+
+(def ^:private record-type [:record :t/R [[:phase :keyword] [:n :i64]]])
+
+(defn- module [functions]
+  {:format :kotoba.kir/v4 :exports ['main] :functions functions})
+
+(defn- run [m] (ir/execute m 'main [] {:fuel 100000}))
+
+;; ---------------------------------------------------------------------------
+;; the rewrite, form by form
+;; ---------------------------------------------------------------------------
+
+(deftest keyword-operands-become-string-equality
+  (let [f (fn [body & [params types]]
+            (:body (kweq/rewrite-function {:name 'f :params (or params []) :param-types (or types [])
+                                           :result :i64 :body body}
+                                          {'phase-of :keyword 'count-of :i64})))]
+    (testing "a keyword literal on either side"
+      (is (= '(string=? :a k) (f '(= :a k) '[k] [:keyword])))
+      (is (= '(string=? k :a) (f '(= k :a) '[k] [:keyword])))
+      (is (= '(string=? :a :b) (f '(= :a :b)))))
+    (testing "two keyword parameters, no literal"
+      (is (= '(string=? a b) (f '(= a b) '[a b] [:keyword :keyword]))))
+    (testing "a let binding of a keyword, then of a record field"
+      (is (= (list 'let ['k :end] '(string=? k :end)) (f (list 'let ['k :end] '(= k :end)))))
+      (is (= (list 'let ['k (list 'record-get record-type 'r :phase)] '(string=? :end k))
+             (f (list 'let ['k (list 'record-get record-type 'r :phase)] '(= :end k)) '[r] [record-type]))))
+    (testing "a record-get of a :keyword field, inline"
+      (is (= (list 'string=? :end (list 'record-get record-type 'r :phase))
+             (f (list '= :end (list 'record-get record-type 'r :phase)) '[r] [record-type]))))
+    (testing "a call to a function whose :result is :keyword"
+      (is (= '(string=? (phase-of r) :end) (f '(= (phase-of r) :end) '[r] [record-type]))))
+    (testing "an if whose arms are both keywords"
+      (is (= '(string=? (if c :a :b) :a) (f '(= (if c :a :b) :a) '[c] [:bool]))))
+    (testing "case's desugared shape: a let of the subject, then = chains"
+      (is (= '(let [s k] (if (string=? s :a) 1 (if (string=? s :b) 2 0)))
+             (f '(let [s k] (if (= s :a) 1 (if (= s :b) 2 0))) '[k] [:keyword]))))
+    (testing "boundary: integers stay a word compare"
+      (is (= '(= n 3) (f '(= n 3) '[n] [:i64])))
+      (is (= (list '= (list 'record-get record-type 'r :n) 3)
+             (f (list '= (list 'record-get record-type 'r :n) 3) '[r] [record-type])))
+      (is (= '(= (count-of r) 0) (f '(= (count-of r) 0) '[r] [record-type]))))
+    (testing "boundary: a value of unknown type stays a word compare"
+      (is (= '(= a b) (f '(= a b) '[a b] [:i64 :i64])))
+      ;; a keyword literal decides on its own: `(= x :a)` with x an i64 is a
+      ;; program the frontend refuses before KIR exists, so the pass does not
+      ;; second-guess the literal
+      (is (= '(string=? x :a) (f '(= x :a) '[x] [:i64]))))))
+
+;; ---------------------------------------------------------------------------
+;; oracle parity on the interpreter
+;; ---------------------------------------------------------------------------
+
+(def ^:private programs
+  [["two equal literals"
+    [{:name 'main :params [] :result :i64 :body '(if (= :end :end) 1 0)}]]
+   ["two different literals"
+    [{:name 'main :params [] :result :i64 :body '(if (= :end :go) 1 0)}]]
+   ["a keyword through a record field"
+    [{:name 'main :params [] :result :i64
+      :body (list 'let ['r (list 'record-new record-type :end 7)
+                        'k (list 'record-get record-type 'r :phase)]
+                  '(+ (if (= :end k) 1 0) (if (= k :go) 10 0)))}]]
+   ["case on a keyword parameter"
+    [{:name 'pick :params '[k] :param-types [:keyword] :result :i64
+      :body '(let [s k] (if (= s :a) 1 (if (= s :b) 2 0)))}
+     {:name 'main :params [] :result :i64 :body '(+ (pick :a) (* 10 (pick :b)) (* 100 (pick :zz)))}]]
+   ["keyword returned from a function"
+    [{:name 'phase :params '[n] :param-types [:i64] :result :keyword :body '(if (< n 2) :go :end)}
+     {:name 'main :params [] :result :i64
+      :body '(+ (if (= (phase 1) :go) 1 0) (if (= (phase 5) :end) 10 0) (if (= (phase 5) :go) 100 0))}]]])
+
+(deftest rewritten-programs-answer-what-the-oracle-answers
+  (doseq [[label functions] programs]
+    (let [m (module functions)]
+      (is (= (run m) (run (kweq/rewrite-program m))) label)
+      (is (not= (pr-str m) (pr-str (kweq/rewrite-program m)))
+          (str label ": the rewrite changed something (a program it did not touch proves nothing)")))))
+
+;; ---------------------------------------------------------------------------
+;; both backends
+;; ---------------------------------------------------------------------------
+
+(deftest both-backends-emit-the-rewrite
+  (doseq [[isa emit] backends
+          [label functions] programs]
+    (let [m (module functions)
+          pre (kweq/rewrite-program m)]
+      (is (= (emit pre) (emit m))
+          (str isa ": " label " -- emit-program of the program equals emit-program of the pre-rewritten program")))))

@@ -1,0 +1,157 @@
+(ns kotoba.native.stack-arguments-test
+  "Stack-passed arguments (2026-09-23): a call passes five arguments in
+  registers and argument i >= 5 at [sp + 8(i - 5)] of the caller's frame. These
+  pin the bytes each ISA emits for the three stack-argument instructions, the
+  aarch64 range bound, and that a 7- and a 64-argument call lower and encode
+  end to end on both targets with the stores at the displacements the ABI
+  names."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.coll]
+            [kotoba.gmir :as gmir]
+            [kotoba.native.machine-ir :as machine]))
+
+(def ^:private x86-disp @#'machine/x86-stack-displacement)
+(def ^:private a64-disp @#'machine/a64-stack-displacement)
+
+(defn- problem-of [f]
+  (try (f) nil
+       (catch :default e (:problem (ex-data e)))))
+
+(deftest x86-stack-argument-bytes
+  (testing "mov [rsp+disp32], r64 -- ModRM mod=10 rm=100, SIB 0x24"
+    (is (= [0x48 0x89 0x84 0x24 0x08 0x00 0x00 0x00]
+           (vec (x86-disp 0x89 :x86-64/rax 8))))
+    (is (= [0x4c 0x89 0x8c 0x24 0x10 0x00 0x00 0x00]
+           (vec (x86-disp 0x89 :x86-64/r9 16)))
+        "REX.R for r9"))
+  (testing "mov r64, [rsp+disp32]"
+    (is (= [0x48 0x8b 0x84 0x24 0x18 0x00 0x00 0x00]
+           (vec (x86-disp 0x8b :x86-64/rax 24))))))
+
+(defn- le-word [bytes]
+  (reduce + (map-indexed (fn [i b] (* b (reduce * (repeat i 256)))) bytes)))
+
+(deftest aarch64-stack-argument-bytes-and-range
+  (is (= 0xf90007e0 (le-word (a64-disp 0xf9000000 :aarch64/x0 8)))
+      "str x0, [sp, #8]")
+  (is (= 0xf9400be1 (le-word (a64-disp 0xf9400000 :aarch64/x1 16)))
+      "ldr x1, [sp, #16]")
+  (is (= 0xf93fffe0 (le-word (a64-disp 0xf9000000 :aarch64/x0 32760)))
+      "the largest scaled imm12, 4095 * 8")
+  (is (= :stack-argument-out-of-range
+         (problem-of #(a64-disp 0xf9000000 :aarch64/x0 32768)))
+      "one slot past imm12")
+  (is (= :stack-argument-out-of-range
+         (problem-of #(a64-disp 0xf9000000 :aarch64/x0 12)))
+      "not a multiple of eight"))
+
+(defn- wide-module [arity]
+  (let [args (mapv gmir/vreg (range arity))
+        sums (mapv gmir/vreg (range arity (* 2 arity)))
+        result (gmir/vreg (* 2 arity))]
+    {:gmir/version 3
+     :gmir/entry 'main
+     :gmir/functions
+     [{:gmir/name 'sum-wide
+       :gmir/arity arity
+       :gmir/instructions
+       (vec (concat
+             (map-indexed (fn [i v] {:gmir/op :gmir/argument :gmir/dst v :gmir/index i}) args)
+             (map (fn [i] {:gmir/op :gmir/add :gmir/dst (sums i)
+                           :gmir/left (if (= 1 i) (args 0) (sums (dec i)))
+                           :gmir/right (args i)})
+                  (range 1 arity))
+             [{:gmir/op :gmir/return :gmir/value (sums (dec arity))}]))}
+      {:gmir/name 'main
+       :gmir/arity 0
+       :gmir/instructions
+       (vec (concat
+             (map-indexed (fn [i v] {:gmir/op :gmir/constant :gmir/dst v :gmir/value (inc i)}) args)
+             [{:gmir/op :gmir/call :gmir/dst result :gmir/callee 'sum-wide :gmir/arguments args}
+              {:gmir/op :gmir/return :gmir/value result}]))}]}))
+
+(defn- x86-rsp-stores
+  "Displacements of every `mov [rsp+disp32], r64` in CODE."
+  [code]
+  (let [code (vec code)]
+    (for [i (range (- (count code) 7))
+          :when (and (contains? #{0x48 0x4c} (code i))
+                     (= 0x89 (code (+ i 1)))
+                     (= 0x84 (bit-and (code (+ i 2)) 0xc7))
+                     (= 0x24 (code (+ i 3))))]
+      (le-word (subvec code (+ i 4) (+ i 8))))))
+
+(defn- a64-sp-stores
+  "Byte offsets of every `str xN, [sp, #imm]` in CODE (word-aligned scan)."
+  [code]
+  (for [word (map le-word (partition 4 (vec code)))
+        ;; Arithmetic, not bit-and: on this host bit-and is signed 32-bit, and
+        ;; every one of these words is above 2^31.
+        :when (and (= 0x3e4 (quot word 0x400000))           ; STR Xt, [Xn, #imm]
+                   (= 31 (mod (quot word 32) 32)))]         ; Xn = sp
+    (* 8 (mod (quot word 1024) 4096))))
+
+(deftest wide-calls-lower-and-encode-on-both-targets
+  (doseq [arity [7 64]
+          target [:x86-64 :aarch64]]
+    (let [mc (machine/compile-gmir target (wide-module arity))
+          {:keys [code]} (machine/encode-mc-module mc)
+          stores (set (if (= :x86-64 target) (x86-rsp-stores code) (a64-sp-stores code)))
+          wanted (set (map #(* 8 %) (range (- arity 5))))]
+      (is (seq code) [target arity])
+      (is (= wanted (kotoba.lang.coll/intersection wanted stores))
+          [target arity "a store at [sp + 8(i - 5)] for every stack argument"])
+      (is (= code (:code (machine/encode-mc-module
+                          (machine/compile-gmir target (wide-module arity)))))
+          [target arity "deterministic"]))))
+
+;; The byte scans above see every sp-relative store, spills included, so a
+;; stack argument written one slot off can still find some store at the
+;; displacement it wanted (at arity 64 it did). These read the MC the encoder
+;; lays out instead, where each stack-argument instruction names its index.
+
+(def ^:private stack-argument-frame @#'machine/stack-argument-frame)
+(def ^:private function-frame @#'machine/function-frame)
+(def ^:private resolve-offsets @#'machine/resolve-stack-argument-offsets)
+(def ^:private incoming-base @#'machine/incoming-argument-base)
+
+(defn- laid-out [target function]
+  (let [{:mc/keys [frame-slots frame-policy instructions] :as f}
+        (stack-argument-frame function)
+        {:keys [frame-bytes saved-registers]}
+        (function-frame target frame-slots frame-policy instructions)]
+    {:function f
+     :base (incoming-base target frame-bytes saved-registers frame-policy)
+     :instructions (resolve-offsets target frame-bytes saved-registers
+                                    frame-policy instructions)}))
+
+(defn- encoding= [op instruction]
+  (some-> (:mc/encoding instruction) name (= op)))
+
+(deftest stack-argument-displacements-are-exact
+  (doseq [arity [6 7 64]
+          target [:x86-64 :aarch64]]
+    (let [functions (into {} (map (juxt :mc/name identity))
+                          (:mc/functions (machine/compile-gmir target (wide-module arity))))
+          caller (laid-out target (functions 'main))
+          callee (laid-out target (functions 'sum-wide))
+          stack-indices (range 5 arity)
+          outgoing (filter #(encoding= "outgoing-argument" %) (:instructions caller))
+          incoming (filter #(or (encoding= "incoming-load" %)
+                                (encoding= "incoming-argument-store" %))
+                           (:instructions callee))
+          reserve (- arity 5)]
+      (testing [target arity "caller"]
+        (is (= (sort (map #(* 8 (- % 5)) stack-indices))
+               (sort (map :mir/displacement outgoing)))
+            "one store per stack argument, at exactly 8(i - 5)")
+        (is (every? #(>= (:mir/slot %) reserve)
+                    (filter :mir/slot (:mc/instructions (:function caller))))
+            "no spill slot overlaps the outgoing-argument area"))
+      (testing [target arity "callee"]
+        (is (= (set stack-indices) (set (map :mir/index incoming)))
+            "every stack argument is read")
+        (is (every? #(= (:mir/displacement %)
+                        (+ (:base callee) (* 8 (- (:mir/index %) 5))))
+                    incoming)
+            "read at base + 8(i - 5)")))))

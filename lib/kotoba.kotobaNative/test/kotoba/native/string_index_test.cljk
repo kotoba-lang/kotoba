@@ -1,0 +1,79 @@
+(ns kotoba.native.string-index-test
+  (:require #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.native.aarch64 :as arm]
+            [kotoba.native.string-index :as string-index]
+            [kotoba.native.x86-64 :as x86]))
+
+(def ^:private backends
+  [["x86-64" x86/emit-program] ["AArch64" arm/emit-program]])
+
+(defn- program [result body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions
+   (string-index/augment-functions
+    [{:name 'main :params [] :param-types [] :result result :body body}])})
+
+(defn- rewritten [result body]
+  (let [op (first body)
+        functions (:functions (program result body))]
+    {:format :kotoba.kir/v4 :exports ['main]
+     :functions
+     (into [(assoc (first functions)
+                   :body (string-index/lower op (rest body)))]
+           (rest functions))}))
+
+(deftest every-operation-is-the-shared-written-out-rewrite-on-both-isas
+  ;; amu ADR 0353 floor :allocation-budget-native: fuel is charged per SOURCE
+  ;; constructor, before this rewrite runs, so `string-index-assoc` costs the
+  ;; reference's one unit however many vector operations it lowers to. The
+  ;; written-out rewrite of `get` (an option) and `assoc` (a vector-conj
+  ;; chain) builds values the source does not, so written out by hand they
+  ;; are a different program with a higher price; for those two the direct
+  ;; emission is compared with the hand-written one only in that it is
+  ;; cheaper, not byte for byte.
+  (doseq [[result body same-price?]
+          [[:string-index '(string-index-new) true]
+           [:i64 '(string-index-count (string-index-new)) true]
+           [:bool '(string-index-contains (string-index-new) "cid") true]
+           [[:option :i64] '(string-index-get (string-index-new) "cid") false]
+           [:string-index
+            '(string-index-assoc (string-index-new) "cid" 7) false]]]
+    (doseq [[label emit] backends]
+      (testing (str label " " body)
+        (let [direct (emit (program result body))
+              expanded (emit (rewritten result body))]
+          (is (seq (:code direct)))
+          (if same-price?
+            (is (= (:code direct) (:code expanded)))
+            (is (< (count (:code direct)) (count (:code expanded)))))
+          (is (= ['main] (keys (:exports direct)))
+              "private helpers must not expand the kexe surface"))))))
+
+(deftest helper-injection-is-bounded-idempotent-and-collision-safe
+  (let [plain [{:name 'main :params [] :body '(+ 1 2)}]
+        indexed (:functions
+                 (program :i64
+                          '(string-index-count
+                            (string-index-assoc
+                             (string-index-new) "cid" 1))))]
+    (is (identical? plain (string-index/augment-functions plain)))
+    (is (= ['main string-index/find-name string-index/key-bytes-name]
+           (mapv :name indexed)))
+    (is (= indexed (string-index/augment-functions indexed))))
+  (is (thrown-with-msg?
+       #?(:clj ExceptionInfo :cljs ExceptionInfo)
+       #"collides with a native string-index helper"
+       (string-index/augment-functions
+        [{:name 'main :params [] :body '(string-index-new)}
+         {:name string-index/find-name :params [] :body 0}]))))
+
+(deftest assoc-rederives-both-language-limits-in-emitted-kotoba
+  (let [form (string-index/lower
+              'string-index-assoc
+              ['index "new-key" 9])
+        nodes (tree-seq coll? seq form)]
+    (is (some #{256} nodes) "128 entries occupy 256 alternating words")
+    (is (some #{65536} nodes) "aggregate UTF-8 key bytes stay bounded")
+    (is (some #{'vector-at} nodes)
+        "limit rejection uses the existing native trap path")))

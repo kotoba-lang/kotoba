@@ -1,0 +1,311 @@
+(ns kotoba.native.store-result-test
+  "storefix: a bounded store is an EXPRESSION, and its value is the word it
+  stored.
+
+  The KIR reference interpreter has always said so. `kotoba.kir`'s
+  `kernel-store-*` arm is `(do (vswap! bytes assoc slot (word-byte-at operand
+  0)) operand)` and its wider twin is `(do (write-word! operand) operand)`:
+  both answer with the fourth argument, UNTRUNCATED, so `(kernel-store-u8 b l i
+  300)` stores 44 and answers 300.
+
+  The stack emitter in `kotoba.native.x86-64` agreed with it for free --
+  `emit-kernel-store-u8` leaves the evaluated value in RAX and the store reads
+  AL out of it -- and the oracle carries a comment saying exactly that. The
+  machine-IR emitter, which is the one `emit-program` actually reaches, did
+  not: it passed the STORED register to `x86-memory-access` as the access's
+  register operand and never wrote `:mir/dst` at all. The destination register
+  the allocator had reserved was therefore whatever it happened to hold.
+
+  Measured on this repository at 8a8c510, `(kernel-store-u8 b l i v)`:
+
+      49 89 c3     mov r11, rax          ; base
+      49 01 d3     add r11, rdx          ; + index
+      45 88 03     mov byte ptr [r11], r8b
+      e9 ...       jmp done
+      0f 0b        ud2
+      48 89 f8     mov rax, rdi          ; <- the ANSWER: rdi, still the base
+
+  and on AArch64 the same fixture answered with X5, which nothing in the
+  function had ever written.
+
+  Every assertion below is about ENCODINGS. This repository does not run
+  compiled programs. The execution claim is made elsewhere and is a different
+  claim: `scripts/store-answer-qemu-fixture.cljk` boots
+  `test/fixtures/store-answer-qemu.kotoba` on a real x86-64 CPU under QEMU and
+  reads the console it wrote.
+
+  Decided by docs/adr/0051-a-bounded-store-answers-with-the-word-it-stored.md."
+  (:refer-clojure :exclude [bit-and bit-or bit-shift-left bit-shift-right])
+  (:require [kotoba.native.test-support :refer [bit-and bit-or bit-shift-left bit-shift-right]]
+            [kotoba.native.test-support :as support]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.machine-ir :as machine]))
+
+(def ^:private window-store-ops
+  "memwidth: four transfer widths by four window tiers."
+  (vec (for [width ["u8" "u16" "u32" "u64"]
+             tier ["" "-4k" "-16k" "-64k"]]
+         (symbol (str "kernel-store-" width tier)))))
+
+(def ^:private slice-store-ops
+  (mapv #(symbol (str "slice-store-" %)) ["u8" "u16" "u32" "u64"]))
+
+(def ^:private store-ops (into window-store-ops slice-store-ops))
+
+(def ^:private load-ops
+  "The control direction: a load writes its destination through the access
+  itself, so it must NOT acquire a second move."
+  (into (vec (for [width ["u8" "u16" "u32" "u64"]
+                   tier ["" "-4k" "-16k" "-64k"]]
+               (symbol (str "kernel-load-" width tier))))
+        (mapv #(symbol (str "slice-load-" %)) ["u8" "u16" "u32" "u64"])))
+
+(defn- bytes-for [target op]
+  (machine/compile-expression target '[b l i v] (list op 'b 'l 'i 'v)))
+
+;; ---------------------------------------------------------------------------
+;; x86-64 decoding. Enough of the instruction set to name the three
+;; instructions this test is about, and no more.
+
+(def ^:private x86-store-opcode
+  {"u8" 0x88 "u16" 0x89 "u32" 0x89 "u64" 0x89})
+
+(defn- transfer-width [op]
+  (let [n (name op)]
+    (cond (re-find #"-u8(-|$)" n) "u8"
+          (re-find #"-u16(-|$)" n) "u16"
+          (re-find #"-u32(-|$)" n) "u32"
+          (re-find #"-u64(-|$)" n) "u64")))
+
+(defn- x86-access-end
+  "The offset just past the memory access in BYTES, plus the register the
+  access names. The access is found by its addressing form -- mod=00, r/m=011,
+  which is `[r11]`, the register both the window and the slice preamble leave
+  the address in -- and its length is read off its own opcode.
+
+  For a store the register named is the STORED word; for a load it is the
+  destination the access writes itself. Returns [end register] or nil."
+  [bytes op store?]
+  (let [width (transfer-width op)
+        two-byte? (and (not store?) (contains? #{"u8" "u16"} width))
+        opcode (if store?
+                 (x86-store-opcode width)
+                 (case width "u8" 0xb6 "u16" 0xb7 0x8b))
+        length (if two-byte? 4 3)
+        modrm-at (if two-byte? 3 2)]
+    (first
+     (keep (fn [index]
+             (let [rex (nth bytes index)
+                   modrm (nth bytes (+ index modrm-at))]
+               (when (and (= 0x40 (bit-and rex 0xf0))
+                          (if two-byte?
+                            (and (= 0x0f (nth bytes (inc index)))
+                                 (= opcode (nth bytes (+ index 2))))
+                            (= opcode (nth bytes (inc index))))
+                          (= 0x03 (bit-and modrm 0xc7)))
+                 [(+ index length)
+                  (+ (* 8 (bit-and (bit-shift-right rex 2) 1))
+                     (bit-and (bit-shift-right modrm 3) 7))])))
+           (range 0 (- (count bytes) 4))))))
+
+(defn- x86-mov-rr
+  "Decode a REX.W `mov r64, r64` at INDEX as [dst src], or nil."
+  [bytes index]
+  (when (<= (+ index 3) (count bytes))
+    (let [rex (nth bytes index)
+          opcode (nth bytes (inc index))
+          modrm (nth bytes (+ index 2))]
+      (when (and (= 0x48 (bit-and rex 0xf8)) (= 0x89 opcode)
+                 (= 0xc0 (bit-and modrm 0xc0)))
+        [(+ (* 8 (bit-and rex 1)) (bit-and modrm 7))
+         (+ (* 8 (bit-and (bit-shift-right rex 2) 1))
+            (bit-and (bit-shift-right modrm 3) 7))]))))
+
+(defn- x86-returned-register
+  "Which register the compiled expression leaves in RAX. The tail is `mov rax,
+  dst; ret`, so it is that move's source; when the answer is already in RAX the
+  emitter writes no move and the answer is RAX itself (code 0)."
+  [bytes]
+  (let [n (count bytes)]
+    (if (and (= 0xc3 (nth bytes (dec n)))
+             (some-> (x86-mov-rr bytes (- n 4)) first zero?))
+      (second (x86-mov-rr bytes (- n 4)))
+      0)))
+
+;; ---------------------------------------------------------------------------
+;; AArch64 decoding. Fixed-width, so this is just three masks.
+
+(defn- a64-words [bytes]
+  (mapv (fn [[a b c d]]
+          (bit-or a (bit-shift-left b 8) (bit-shift-left c 16)
+                  (bit-shift-left d 24)))
+        (partition 4 bytes)))
+
+(def ^:private a64-access-opcode
+  {[true "u8"] 0x39000000 [true "u16"] 0x79000000
+   [true "u32"] 0xb9000000 [true "u64"] 0xf9000000
+   [false "u8"] 0x39400000 [false "u16"] 0x79400000
+   [false "u32"] 0xb9400000 [false "u64"] 0xf9400000})
+
+(defn- a64-access-index
+  "The index of the access word, found by its base register: every width uses
+  the unsigned-offset form off X16 with a zero offset. Returns [index Rt]."
+  [words op store?]
+  (let [expected (bit-or (a64-access-opcode [store? (transfer-width op)])
+                         (bit-shift-left 16 5))]
+    (first (keep-indexed (fn [index word]
+                           (when (= expected (bit-and word 0xffffffe0))
+                             [index (bit-and word 0x1f)]))
+                         words))))
+
+(defn- a64-mov
+  "Decode `orr Xd, XZR, Xm` at INDEX as [dst src], or nil."
+  [words index]
+  (when-let [word (get words index)]
+    (when (= 0xaa0003e0 (bit-and word 0xffe0ffe0))
+      [(bit-and word 0x1f) (bit-and (bit-shift-right word 16) 0x1f)])))
+
+(defn- a64-returned-register [words]
+  (let [n (count words)]
+    (if (and (= 0xd65f03c0 (peek words))
+             (some-> (a64-mov words (- n 2)) first zero?))
+      (second (a64-mov words (- n 2)))
+      0)))
+
+;; ---------------------------------------------------------------------------
+
+(deftest x86-every-store-width-answers-with-the-word-it-stored
+  (let [scanned (atom 0)]
+    (doseq [op store-ops]
+      (let [bytes (bytes-for :x86-64 op)
+            [end stored] (or (x86-access-end bytes op true) [nil nil])]
+        (is (some? end) (str op " must emit a store to [r11]"))
+        (when end
+          (swap! scanned inc)
+          (let [answer (x86-mov-rr bytes end)]
+            (is (some? answer)
+                (str op ": the store's result register is not written -- the "
+                     "instruction after the store must be `mov dst, stored`, "
+                     "and instead the sequence continues with "
+                     (support/format "%02x %02x %02x" (nth bytes end)
+                             (nth bytes (inc end)) (nth bytes (+ end 2)))))
+            (when answer
+              (is (= stored (second answer))
+                  (str op ": the answer move must read the STORED register"))
+              (is (= (first answer) (x86-returned-register bytes))
+                  (str op ": the register the expression answers with must be "
+                       "the one the store wrote"))
+              (is (= 0xe9 (nth bytes (+ end 3)))
+                  (str op ": the answer move is the last thing before the "
+                       "jump over the trap")))))))
+    (is (= (count store-ops) @scanned))
+    (println "SCANNED" @scanned "x86-64 store forms")))
+
+(deftest aarch64-every-store-width-answers-with-the-word-it-stored
+  (let [scanned (atom 0)]
+    (doseq [op store-ops]
+      (let [words (a64-words (bytes-for :aarch64 op))
+            [index stored] (or (a64-access-index words op true) [nil nil])]
+        (is (some? index) (str op " must emit a store off X16"))
+        (when index
+          (swap! scanned inc)
+          (let [answer (a64-mov words (inc index))]
+            (is (some? answer)
+                (str op ": the store's result register is not written -- the "
+                     "word after the store must be `mov dst, stored`, and "
+                     "instead it is "
+                     (support/format "%08x" (get words (inc index) 0))))
+            (when answer
+              (is (= stored (second answer))
+                  (str op ": the answer move must read the STORED register"))
+              (is (= (first answer) (a64-returned-register words))
+                  (str op ": the register the expression answers with must be "
+                       "the one the store wrote")))))))
+    (is (= (count store-ops) @scanned))
+    (println "SCANNED" @scanned "aarch64 store forms")))
+
+(deftest a-load-does-not-acquire-an-answer-move
+  ;; The control direction. A load's access writes `:mir/dst` itself, so a
+  ;; second move would be dead weight -- and its presence would mean the fix
+  ;; had been applied to the wrong half of the branch. What follows a load's
+  ;; access is the jump over the trap, with nothing in between.
+  (let [scanned (atom 0)]
+    (doseq [op load-ops]
+      (let [bytes (machine/compile-expression :x86-64 '[b l i] (list op 'b 'l 'i))
+            [end dst] (or (x86-access-end bytes op false) [nil nil])
+            words (a64-words (machine/compile-expression
+                              :aarch64 '[b l i] (list op 'b 'l 'i)))
+            [index rt] (or (a64-access-index words op false) [nil nil])]
+        (is (some? end) (str op " must emit a load from [r11]"))
+        (is (some? index) (str op " must emit a load off X16"))
+        (when (and end index)
+          (swap! scanned inc)
+          (is (nil? (x86-mov-rr bytes end))
+              (str op ": a load must not acquire an answer move on x86-64"))
+          (is (= 0xe9 (nth bytes end))
+              (str op ": a load's access is followed by the jump directly"))
+          (is (nil? (a64-mov words (inc index)))
+              (str op ": a load must not acquire an answer move on AArch64"))
+          (is (= dst (x86-returned-register bytes))
+              (str op ": a load answers with the register its access wrote"))
+          (is (= rt (a64-returned-register words))
+              (str op ": and the same on AArch64")))))
+    (is (= (count load-ops) @scanned))
+    (println "SCANNED" @scanned "load forms (control)")))
+
+(deftest the-canonical-fixture-byte-for-byte
+  (testing "x86-64: (kernel-store-u8 b 512 0 7) answers 7"
+    (is (= [0x48 0x89 0xf8                          ; mov rax, rdi   (base)
+            0xb9 0x00 0x02 0x00 0x00                ; mov ecx, 512   (length)
+            0xba 0x00 0x00 0x00 0x00                ; mov edx, 0     (index)
+            0x41 0xb8 0x07 0x00 0x00 0x00           ; mov r8d, 7     (stored)
+            0x48 0x81 0xf9 0x00 0x02 0x00 0x00      ; cmp rcx, 512
+            0x0f 0x87 0x23 0x00 0x00 0x00           ; ja  trap
+            0x48 0x85 0xc0                          ; test rax, rax
+            0x0f 0x84 0x1a 0x00 0x00 0x00           ; jz  trap
+            0x48 0x39 0xca                          ; cmp rdx, rcx
+            0x0f 0x83 0x11 0x00 0x00 0x00           ; jae trap
+            0x49 0x89 0xc3                          ; mov r11, rax
+            0x49 0x01 0xd3                          ; add r11, rdx
+            0x45 0x88 0x03                          ; mov [r11], r8b
+            0x4c 0x89 0xc7                          ; mov rdi, r8    <- the answer
+            0xe9 0x02 0x00 0x00 0x00                ; jmp done
+            0x0f 0x0b                               ; trap: ud2
+            0x48 0x89 0xf8                          ; done: mov rax, rdi
+            0xc3]                                   ; ret
+           (machine/compile-expression :x86-64 '[b] '(kernel-store-u8 b 512 0 7)))))
+  (testing "AArch64: the same fixture, where the pre-fix answer was never written"
+    (is (= [0x01 0x40 0x80 0xd2                     ; movz x1, #512
+            0x02 0x00 0x80 0xd2                     ; movz x2, #0
+            0xe3 0x00 0x80 0xd2                     ; movz x3, #7
+            0x10 0x40 0x80 0xd2                     ; movz x16, #512
+            0x3f 0x00 0x10 0xeb                     ; cmp  x1, x16
+            0x08 0x01 0x00 0x54                     ; b.hi trap
+            0xe0 0x00 0x00 0xb4                     ; cbz  x0, trap
+            0x5f 0x00 0x01 0xeb                     ; cmp  x2, x1
+            0xa2 0x00 0x00 0x54                     ; b.cs trap
+            0x10 0x00 0x02 0x8b                     ; add  x16, x0, x2
+            0x03 0x02 0x00 0x39                     ; strb w3, [x16]
+            0xe5 0x03 0x03 0xaa                     ; mov  x5, x3    <- the answer
+            0x02 0x00 0x00 0x14                     ; b    done
+            0x00 0x00 0x20 0xd4                     ; trap: brk #0
+            0xe0 0x03 0x05 0xaa                     ; done: mov x0, x5
+            0xc0 0x03 0x5f 0xd6]                    ; ret
+           (machine/compile-expression :aarch64 '[b]
+                                       '(kernel-store-u8 b 512 0 7))))))
+
+(deftest the-answer-is-the-whole-word-not-the-transferred-width
+  ;; `(kernel-store-u8 b l i 300)` stores 44 and answers 300, because the
+  ;; oracle returns the operand it was given rather than the byte it wrote.
+  ;; A width-masked move would be a different program.
+  (doseq [op store-ops]
+    (let [bytes (bytes-for :x86-64 op)
+          [end _] (x86-access-end bytes op true)
+          rex (nth bytes end)]
+      (is (= 0x48 (bit-and rex 0xf8))
+          (str op ": the answer move must be REX.W -- a 32-bit move would "
+               "silently truncate an operand above 2^32")))
+    (let [words (a64-words (bytes-for :aarch64 op))
+          [index _] (a64-access-index words op true)]
+      (is (= 0xaa0003e0 (bit-and (get words (inc index)) 0xffe0ffe0))
+          (str op ": the answer move must be the 64-bit ORR form")))))

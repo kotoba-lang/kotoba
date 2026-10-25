@@ -1,0 +1,266 @@
+(ns kotoba.native.fuel64-test
+  "fuel64: the object replenish is a 64-bit budget written in one of two forms.
+
+  What this file has to hold down is not that the wide form encodes -- an
+  assembler agrees with that in one line -- but the three ways a widening like
+  this silently goes wrong:
+
+    1. Every existing object's bytes move, because the encoder was rewritten
+       and the narrow path was rewritten with it. `every-shipped-objects-bytes`
+       is a golden taken at the commit BEFORE the change, over all 108 entries
+       the table had then.
+    2. The line between the forms is drawn at 2^32 rather than 2^31, because
+       `little-endian` at width 4 accepts unsigned values and the CPU
+       sign-extends the immediate. That produces a NEGATIVE fuel word, which
+       `cmp qword [r9+8],0` reads as `has fuel` and `dec` walks away from zero:
+       the object never traps again. `the-line-is-signed` pins 2147483648 as
+       the first wide value.
+    3. The wide form is reachable only from a test. `aiueos-fuel-wide-probe`
+       is in the production table, so the packager emits it on every build."
+  (:refer-clojure :exclude [bit-shift-left])
+  (:require [kotoba.native.test-support :refer [bit-shift-left]]
+            [kotoba.kir.cljs-i64 :as i64]
+            [kotoba.native.test-support :as support]
+            [kotoba.lang.edn :as edn]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.artifact.core :as artifact]
+            [kotoba.native.elf64 :as elf64]
+            [kotoba.native.interrupt-abi :as interrupt-abi]))
+
+(defn- packaged [entry arity]
+  (-> {:target :x86_64-aiueos-kernel-v1
+       :target-profile {:runtime :none :ambient-syscalls false}
+       :program {:entry 'main}
+       :exports {entry {:offset 0 :arity arity} 'main {:offset 1 :arity 0}}
+       :limits {:fuel 512}
+       :fuel-abi {:initial 512}
+       :code [0xc3 0xc3]}
+      artifact/seal
+      elf64/package-kernel-object))
+
+(defn- sha256-hex [bytes] (support/sha256-hex bytes))
+
+(def ^:private replenish #'elf64/replenish-bytes)
+(def ^:private object-entries @#'elf64/kernel-object-entries)
+
+;; The two forms, as bytes. Verified against clang -masm=intel on 2026-09-03:
+;;
+;;   49 c7 41 08 ff ff ff 7f              movq $0x7fffffff, 0x8(%r9)
+;;   49 ba ff ff ff ff ff ff 1f 00        movabsq $0x1fffffffffffff, %r10
+;;   4d 89 51 08                          movq %r10, 0x8(%r9)
+(deftest the-two-replenish-forms
+  (testing "narrow: REX.W C7 /0 with a four-byte immediate"
+    (is (= [0x49 0xc7 0x41 0x08 0x00 0x04 0x00 0x00] (replenish 1024)))
+    (is (= [0x49 0xc7 0x41 0x08 0xff 0xff 0xff 0x7f] (replenish 2147483647)))
+    (is (= 8 (count (replenish 2147483647)))))
+  (testing "wide: movabs r10, imm64 then mov [r9+8], r10"
+    (is (= [0x49 0xba 0x00 0x00 0x00 0x80 0x00 0x00 0x00 0x00
+            0x4d 0x89 0x51 0x08]
+           (replenish 2147483648)))
+    (is (= [0x49 0xba 0xff 0xff 0xff 0xff 0xff 0xff 0x1f 0x00
+            0x4d 0x89 0x51 0x08]
+           (replenish elf64/max-object-fuel)))
+    (is (= 14 (count (replenish elf64/max-object-fuel))))))
+
+;; The failure this rules out is not "a big number is rejected". It is that
+;; 2147483648..4294967295 encode as a width-4 little-endian integer without
+;; complaint -- `kotoba.object.elf64/little-endian` admits the whole unsigned
+;; range at that width -- and the CPU then sign-extends them into the qword.
+(deftest the-line-is-signed
+  (is (= 8 (count (replenish 2147483647))) "the last narrow value")
+  (is (= 14 (count (replenish 2147483648))) "the first wide value")
+  (testing "the value the narrow form would have carried, had the line been unsigned"
+    (let [wide (replenish 3000000000)]
+      (is (= 14 (count wide)))
+      (is (= [0x00 0x5e 0xd0 0xb2 0x00 0x00 0x00 0x00] (subvec wide 2 10))
+          "3,000,000,000 as an unsigned qword, not as a sign-extended imm32"))))
+
+(deftest a-tier-outside-the-admitted-range-is-refused-by-name
+  (doseq [[label fuel] [["zero" 0] ["negative" -1]
+                        ["one past the ceiling" (inc elf64/max-object-fuel)]
+                        ["2^63-1" i64/max-i64]]]
+    (let [thrown (try (replenish fuel) nil
+                      (catch ExceptionInfo e e))]
+      (is (some? thrown) (str label " must be refused"))
+      (is (= :object-fuel-tier-outside-admitted-range (:reason (ex-data thrown)))
+          (str label " must be refused for THIS reason, not another"))
+      (is (= elf64/max-object-fuel (:maximum (ex-data thrown))) label))))
+
+(deftest the-ceiling-is-where-both-counters-are-still-exact
+  (is (= 9007199254740991 elf64/max-object-fuel))
+  (is (= elf64/max-object-fuel (dec (js/Math.pow 2 53)))
+      "2^53-1: the largest budget a JavaScript double still decrements")
+  (is (< (js/BigInt elf64/max-object-fuel) i64/max-i64)
+      "deliberately below what the qword and the movabs could carry"))
+
+;; The one landed proof that the widening moved nothing. 108 rows, taken at
+;; 452422f5 before any of this existed.
+(deftest every-shipped-objects-bytes
+  (let [golden (edn/read-string (support/resource-text "kotoba/native/fuel64_object_digests.edn"))
+        scanned (atom 0)]
+    (is (= 108 (count golden)) "the table had 108 entries at the golden commit")
+    (doseq [[entry expected] golden]
+      (let [{:keys [arity]} (get object-entries entry)]
+        (is (some? arity) (str entry " left the table; the golden cannot speak for it"))
+        (when arity
+          (swap! scanned inc)
+          (is (= expected (sha256-hex (:bytes (packaged entry arity))))
+              (str entry " must package to the same bytes it did before the widening")))))
+    (println "SCANNED" @scanned)
+    (is (= 108 @scanned) "n=0 is not a pass")))
+
+(deftest the-wide-form-is-reachable-from-the-production-table
+  (let [entry 'aiueos-fuel-wide-probe
+        {:keys [arity symbol]} (get object-entries entry)]
+    (is (= 1 arity))
+    (is (= "kotoba_aiueos_fuel_wide_probe" symbol))
+    (let [image (:bytes (packaged entry arity))
+          ;; 64 bytes of ELF header, then `lea r9,[rip+.data]` (7 bytes).
+          wrapper (subvec image 71 85)]
+      (is (= [0x49 0xba 0x00 0xcb 0x4c 0x00 0x01 0x00 0x00 0x00
+              0x4d 0x89 0x51 0x08]
+             wrapper)
+          "4,300,000,000 as a full 64-bit immediate")
+      (is (= 5032704 (reduce (fn [v i] (+ v (* (nth wrapper (+ 2 i)) (js/Math.pow 256 i))))
+                             0 (range 4)))
+          "its low word is what a truncating encoder would have written -- the
+           number a probe run has to be able to walk past"))))
+
+;; The interrupt entry did NOT widen, and the refusal is what says so out loud.
+;; `le32` is `(mod n 4294967296)` on purpose (RIP displacements are negative),
+;; so before this a fuel of 2^32 wrote four zero bytes: the entry replenished
+;; to zero and the callee's first charge took vector 6 on every interrupt.
+(deftest interrupt-entry-refuses-a-fuel-it-would-truncate
+  (testing "the shipped tier still encodes"
+    (is (vector? (interrupt-abi/entry-bytes
+                  {:vector 6 :fuel interrupt-abi/entry-fuel
+                   :context-displacement -4 :call-displacement 0}))))
+  (doseq [[label fuel] [["2^31" 2147483648]
+                        ["2^32, which used to write four zero bytes" 4294967296]
+                        ["zero" 0]]]
+    (let [thrown (try (interrupt-abi/entry-bytes
+                       {:vector 6 :fuel fuel
+                        :context-displacement -4 :call-displacement 0})
+                      nil
+                      (catch ExceptionInfo e e))]
+      (is (some? thrown) (str label " must be refused"))
+      (is (= :isr-entry-fuel-exceeds-imm32 (:reason (ex-data thrown))) label))))
+
+;; The image route never had the immediate at all -- both architectures write
+;; the budget as eight data bytes -- so a budget past 2^31 has always been
+;; carried there. Asserted rather than assumed, because "AArch64 has the same
+;; 32-bit prologue limit" was a live hypothesis until this ran: it does not,
+;; and the reason is that AArch64 has no object route to have one in.
+(deftest the-image-context-word-was-always-64-bit
+  (doseq [[target package] [[:x86_64-aiueos-kernel-v1 elf64/package-kernel]
+                            [:aarch64-aiueos-kernel-v1 elf64/package-kernel-aarch64]]]
+    (doseq [fuel [4096 2147483648 elf64/max-object-fuel]]
+      (let [artifact (artifact/seal
+                      {:target target
+                       :target-profile {:runtime :none :ambient-syscalls false}
+                       :program {:entry 'main}
+                       :exports {'main {:offset 0 :arity 0}}
+                       :limits {:fuel fuel}
+                       :fuel-abi {:initial fuel}
+                       :code [0xc3]})
+            image (:bytes (package artifact))
+            data (if (= target :x86_64-aiueos-kernel-v1) 0x8000 0x8000)]
+        ;; Eight bytes little-endian as a double: exact up to 2^53, which is
+        ;; where `max-object-fuel` stops, so every budget this test writes
+        ;; reads back exactly (bit-shift-left would truncate to int32 here).
+        (is (= fuel (reduce (fn [v i] (+ v (* (nth image (+ data 8 i)) (js/Math.pow 256 i))))
+                            0 (range 8)))
+            (str target " " fuel))))))
+
+;; ── the budget the machine runs on is the budget somebody wrote ────────────
+;;
+;; A ceiling that can be raised and a budget that is silently discarded are the
+;; same defect at two layers, and the second one shipped for longer. Until
+;; 2026-09-03 `package-user` wrote the CONSTANT 512 into its context, so a
+;; ring-3 image ran on 512 whatever `--fuel` said -- the flag is parsed,
+;; validated, sealed into `:limits :fuel` and `:fuel-abi :initial`, and then
+;; the one place that decides what the machine gets ignored all of it. The same
+;; line was in amu's PE32+ packager, where the LOADER stream found it from the
+;; other end: `sha256-region` costs 1,772 fuel per 64-byte block, so ONE block
+;; could not fit in 512 and the loader's `integrity` module had never returned.
+;;
+;; The test is DIFFERENTIAL rather than positional. Reading the word at a fixed
+;; offset would need a different offset per route and would go stale the moment
+;; a context grows; two budgets that must not produce the same bytes needs no
+;; offset at all, and is exactly the observation that found the defect --
+;; `--fuel 512` and `--fuel 1048576` produced identical images.
+;;
+;; THE OBJECT ROUTE IS LISTED AS INSENSITIVE ON PURPOSE, not omitted. Its
+;; `.data` really does hold 512 and really is independent of the sealed budget,
+;; because the wrapper replenishes on every call and overwrites it before the
+;; entry runs. Leaving it out would make this test read as "every packager is
+;; fuel-sensitive", which is false; listing it with its reason means a future
+;; edit that makes the object route sensitive has to come here and say why.
+(deftest every-image-route-carries-the-declared-budget
+  (let [budgets [512 1048576 2147483648 elf64/max-object-fuel]
+        image (fn [package target fuel]
+                (:bytes (package
+                         (artifact/seal
+                          {:target target
+                           :target-profile {:runtime :none :ambient-syscalls false}
+                           :program {:entry 'main}
+                           :exports {'main {:offset 0 :arity 0}}
+                           :limits {:fuel fuel}
+                           :fuel-abi {:initial fuel}
+                           :code [0xc3]}))))
+        scanned (atom 0)]
+    (doseq [[label package target]
+            [["x86-64 kernel image" elf64/package-kernel :x86_64-aiueos-kernel-v1]
+             ["aarch64 kernel image" elf64/package-kernel-aarch64 :aarch64-aiueos-kernel-v1]
+             ["x86-64 user image" elf64/package-user :x86_64-aiueos-user-v1]]]
+      (let [digests (mapv #(sha256-hex (image package target %)) budgets)]
+        (swap! scanned inc)
+        (is (= (count budgets) (count (set digests)))
+            (str label " must produce a different image for every budget; got "
+                 (count (set digests)) " distinct for " (count budgets)
+                 " budgets -- a packager that writes a constant answers the same"
+                 " bytes for all of them"))))
+    (println "SCANNED" @scanned)
+    (is (= 3 @scanned) "n=0 is not a pass")))
+
+(deftest the-object-route-is-insensitive-and-that-is-correct
+  (let [object (fn [fuel]
+                 (:bytes (elf64/package-kernel-object
+                          (artifact/seal
+                           {:target :x86_64-aiueos-kernel-v1
+                            :target-profile {:runtime :none :ambient-syscalls false}
+                            :program {:entry 'main}
+                            :exports {'aiueos-sha256-region {:offset 0 :arity 4}
+                                      'main {:offset 1 :arity 0}}
+                            :limits {:fuel fuel}
+                            :fuel-abi {:initial fuel}
+                            :code [0xc3 0xc3]}))))]
+    (is (= (sha256-hex (object 512)) (sha256-hex (object 1048576)))
+        "an object's `.data` 512 is overwritten by the wrapper's replenish
+         before the entry runs, so the sealed budget is unobservable there --
+         the per-call TIER is what bounds an object, and it comes from the
+         table, not from --fuel")))
+
+(deftest an-image-with-a-contradictory-fuel-seal-is-refused
+  ;; `:limits :fuel` and `:fuel-abi :initial` are two statements of one number
+  ;; and the verifier re-derives one from the other. A packager that read only
+  ;; one of them could ship an image whose running budget contradicts its own
+  ;; receipt, which is why `artifact-fuel` checks the agreement rather than
+  ;; just the range.
+  (doseq [[label package target]
+          [["x86-64 kernel image" elf64/package-kernel :x86_64-aiueos-kernel-v1]
+           ["x86-64 user image" elf64/package-user :x86_64-aiueos-user-v1]]]
+    (let [thrown (try (package
+                       (artifact/seal
+                        {:target target
+                         :target-profile {:runtime :none :ambient-syscalls false}
+                         :program {:entry 'main}
+                         :exports {'main {:offset 0 :arity 0}}
+                         :limits {:fuel 4096}
+                         :fuel-abi {:initial 8192}
+                         :code [0xc3]}))
+                      nil
+                      (catch ExceptionInfo e e))]
+      (is (some? thrown) (str label " must refuse a fuel seal that disagrees with itself"))
+      (is (= 4096 (:fuel (ex-data thrown))) label)
+      (is (= 8192 (:fuel-abi-initial (ex-data thrown))) label))))

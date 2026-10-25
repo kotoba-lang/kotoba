@@ -1,0 +1,105 @@
+(ns kotoba.native.uefi-boundary-test
+  "boot: byte goldens for the four UEFI firmware-boundary operations.
+
+  Every literal below was cross-checked against `llvm-mc --show-encoding` on
+  2026-09-02 before it was written down, so a disagreement here is this
+  encoder's, not an assembler's opinion. The long one is `kernel-uefi-call2`,
+  and what its goldens are really asserting is the register discipline rather
+  than the instruction selection: three separate things have to hold at a
+  Microsoft x64 call site and none of them holds on arrival."
+  (:refer-clojure :exclude [bit-and])
+  (:require [kotoba.native.test-support :refer [bit-and]]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.x86-64 :as x86]))
+
+(defn- program [params body]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params params :body body}]})
+
+(defn- code [params body]
+  (vec (map #(bit-and (long %) 0xff) (:code (x86/emit-program (program params body))))))
+
+(defn- contains-bytes? [haystack needle]
+  (let [n (count needle)]
+    (boolean (some #(= needle (subvec haystack % (+ % n)))
+                   (range 0 (inc (- (count haystack) n)))))))
+
+(defn- count-bytes [haystack needle]
+  (let [n (count needle)]
+    (count (filter #(= needle (subvec haystack % (+ % n)))
+                   (range 0 (inc (- (count haystack) n)))))))
+
+(deftest system-table-reads-the-slot-beside-boot-info
+  (let [table (code [] '(kernel-system-table))
+        info  (code [] '(kernel-boot-info))]
+    (testing "mov r10,[r9+0x58]"
+      (is (contains-bytes? table [0x4d 0x8b 0x51 0x58])))
+    (testing "and boot-info still reads [r9+0x50], one slot below"
+      (is (contains-bytes? info [0x4d 0x8b 0x51 0x50])))
+    (testing "the two differ in exactly the displacement byte"
+      (is (not (contains-bytes? table [0x4d 0x8b 0x51 0x50])))
+      (is (not (contains-bytes? info [0x4d 0x8b 0x51 0x58]))))))
+
+(deftest load-ptr-is-one-unchecked-indexed-read
+  (let [bytes (code '[b o] '(kernel-load-ptr b o))]
+    (testing "mov r10,[r10+r11]"
+      (is (contains-bytes? bytes [0x4f 0x8b 0x14 0x1a])))
+    (testing "and nothing else: no bounds compare, no ud2"
+      ;; The checked family emits `cmp rcx,imm32` (0x48 0x81 0xf9) and `ud2`
+      ;; (0x0f 0x0b) for every access. This operation is at the firmware
+      ;; boundary, where the guest has no length to check against, so the
+      ;; absence is the decision -- asserted rather than merely true.
+      (is (not (contains-bytes? bytes [0x48 0x81 0xf9])))
+      (is (not (contains-bytes? bytes [0x0f 0x0b]))))))
+
+(deftest jump-to-sets-the-sysv-first-argument-and-does-not-return
+  (let [bytes (code '[a i] '(kernel-jump-to a i))]
+    (testing "mov rdi,r11 then jmp r10"
+      (is (contains-bytes? bytes [0x4c 0x89 0xdf 0x41 0xff 0xe2])))
+    (testing "the transfer is a jump, not a call"
+      ;; `call r10` would be 0x41 0xff 0xd2 -- one ModRM bit away, and the
+      ;; difference between a kernel entered on a clean stack and one entered
+      ;; with a return address it will never use.
+      (is (not (contains-bytes? bytes [0x41 0xff 0xd2]))))))
+
+(deftest uefi-call2-aligns-reserves-saves-and-restores
+  (let [bytes (code '[b o x y] '(kernel-uefi-call2 b o x y))]
+    (testing "the target is loaded from [base+offset] into r11"
+      (is (contains-bytes? bytes [0x4f 0x8b 0x1c 0x1a])))
+    (testing "rsp is aligned at run time, not assumed"
+      ;; mov r10,rsp / and rsp,-16 / sub rsp,0x60
+      (is (contains-bytes? bytes [0x49 0x89 0xe2 0x48 0x83 0xe4 0xf0
+                                  0x48 0x83 0xec 0x50])))
+    (testing "0x50 is 32 bytes of shadow space plus six saved words, and 16-aligned"
+      (is (= 0x50 (+ 0x20 (* 6 8))))
+      (is (zero? (mod 0x50 16))))
+    (testing "the call is indirect through r11"
+      (is (contains-bytes? bytes [0x41 0xff 0xd3])))
+    (testing "the status is taken out of rax before anything is restored"
+      (is (contains-bytes? bytes [0x49 0x89 0xc2])))
+    (testing "rsp is restored from the slot it was parked in"
+      (is (contains-bytes? bytes [0x48 0x8b 0xa4 0x24 0x20 0x00 0x00 0x00])))
+    (testing "r9 -- the guest context -- is saved and restored"
+      ;; MS x64 lists R9 volatile, and it is an ARGUMENT register there, so a
+      ;; callee is entitled to destroy it. It carries the guest's hidden
+      ;; context. Saved at [rsp+0x48], reloaded from the same slot.
+      (is (contains-bytes? bytes [0x4c 0x89 0x8c 0x24 0x48 0x00 0x00 0x00]))
+      (is (contains-bytes? bytes [0x4c 0x8b 0x8c 0x24 0x48 0x00 0x00 0x00])))
+    (testing "every register in the scratch tier is saved exactly once"
+      (doseq [save [[0x48 0x89 0x84 0x24 0x28 0x00 0x00 0x00]   ; rax
+                    [0x48 0x89 0x8c 0x24 0x30 0x00 0x00 0x00]   ; rcx
+                    [0x48 0x89 0x94 0x24 0x38 0x00 0x00 0x00]   ; rdx
+                    [0x4c 0x89 0x84 0x24 0x40 0x00 0x00 0x00]]] ; r8
+        (is (= 1 (count-bytes bytes save)) (str save))))
+    (testing "rcx is written after rdx, so an argument living in rcx survives"
+      ;; `a` is staged through r10 -- outside every allocator tier -- and rcx
+      ;; is written last. Writing rcx first would destroy `b` whenever the
+      ;; allocator put `b` there, and that is invisible in a test that only
+      ;; checks the instructions are present.
+      (let [rcx-from-r10 [0x4c 0x89 0xd1]
+            index (fn [needle]
+                    (first (filter #(= needle (subvec bytes % (+ % (count needle))))
+                                   (range 0 (inc (- (count bytes) (count needle)))))))]
+        (is (some? (index rcx-from-r10)))
+        (is (< (index [0x41 0xff 0xd3]) (count bytes)))
+        (is (< (index rcx-from-r10) (index [0x41 0xff 0xd3])))))))

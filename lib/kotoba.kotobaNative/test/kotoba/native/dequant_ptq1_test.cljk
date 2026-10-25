@@ -1,0 +1,103 @@
+(ns kotoba.native.dequant-ptq1-test
+  "dequant-ptq1: PTQ1_0's fused dequantize-and-dot (ADR 0088), as geometry and
+  as bytes.
+
+  1. THE GEOMETRY IS RIGHT. `ptq1-0-element` and the sixteen groups built on
+     it are compared with an INDEPENDENT transcription of
+     `dequantize_row_ptq1_0` (PrismML-Eng/llama.cpp @9a9394a8) written with
+     the C's own three stage loops and an output cursor, element by element,
+     and a perturbation of the recipe is asserted to disagree.
+
+  2. THE BYTES ARE THE SEQUENCE INTENDED. The runs pinned below were
+     assembled from this emitter's output and read back with Apple LLVM
+     `objdump -d` (x86_64 Mach-O, 2026-09-26), not derived from the manual.
+
+  WHAT THEY DO NOT SAY. Nothing here executes anything. That both arms
+  compute the number `kotoba.kir` answers is a claim about a machine and is
+  measured in aiueos `os/aiueos/scripts/smoke-qemu-dequant-ptq1.cljk` under
+  `-cpu max` and `-cpu qemu64`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.native.machine-ir :as mir]
+            [kotoba.native.x86-64 :as x86]
+            [kotoba.native.aarch64 :as a64]))
+
+(def ^:private element @#'mir/ptq1-0-element)
+(def ^:private groups @#'mir/x86-dequant-ptq1-0-groups)
+
+(defn- program [head]
+  {:format :kotoba.kir/v4 :exports ['main]
+   :functions [{:name 'main :params '[w wl x xl n]
+                :body (list head 'w 'wl 'x 'xl 'n)}]})
+
+(defn- code [] (vec (:code (x86/emit-program (program 'kernel-dequant-dot-ptq1-0)))))
+
+(defn- byte-run-count [haystack needle]
+  (count (filter #(= needle (subvec haystack % (+ % (count needle))))
+                 (range (inc (- (count haystack) (count needle)))))))
+
+;; ---------------------------------------------------------------------------
+;; the C, transcribed: [byte digit] per output element, in the C's order
+;; ---------------------------------------------------------------------------
+
+(defn- c-recipe []
+  (let [out (volatile! [])]
+    (dotimes [n 5] (dotimes [m 16] (vswap! out conj [m n])))
+    (dotimes [n 5] (dotimes [m 8] (vswap! out conj [(+ 16 m) n])))
+    (dotimes [n 4] (dotimes [h 2] (vswap! out conj [(+ 24 h) n])))
+    @out))
+
+(deftest the-element-geometry-is-the-cs
+  (let [recipe (c-recipe)]
+    (is (= 128 (count recipe)))
+    (is (= recipe (mapv element (range 128))))
+    (testing "and the groups' lanes are the same 128 in the same order"
+      (is (= recipe (vec (mapcat :lanes groups)))))
+    (testing "a perturbed recipe disagrees (digit q mod 4 in the qh stage)"
+      (is (not= recipe
+                (vec (concat (subvec recipe 0 120)
+                             (for [q (range 8)] [(+ 24 (mod q 2)) (mod q 4)])))))))
+  (testing "fifteen groups are one load at one digit; one is gathered"
+    (is (= 16 (count groups)))
+    (is (= [15] (mapv :group (filter :gathered? groups))))
+    (doseq [{:keys [group q-offset digit lanes gathered?]} groups
+            :when (not gathered?)]
+      (is (= lanes (mapv (fn [j] [(+ q-offset j) digit]) (range 8))) (str "group " group)))
+    (is (= (mapv #(* 32 %) (range 16)) (mapv :x-offset groups)))))
+
+;; ---------------------------------------------------------------------------
+;; the bytes
+;; ---------------------------------------------------------------------------
+
+(def ^:private times-three [0xc5 0xed 0x72 0xf1 0x02   ; vpslld $2,%ymm1,%ymm2
+                            0xc5 0xed 0xfa 0xc9])      ; vpsubd %ymm1,%ymm2,%ymm1
+(def ^:private mask-255 [0xc5 0xf5 0xdb 0xcc])         ; vpand %ymm4,%ymm1,%ymm1
+(def ^:private shift-8 [0xc5 0xf5 0x72 0xd1 0x08])     ; vpsrld $8,%ymm1,%ymm1
+(def ^:private gather [0xc4 0xe1 0xf9 0x6e 0xca        ; vmovq %rdx,%xmm1
+                       0xc4 0xe2 0x7d 0x31 0xc9])      ; vpmovzxbd %xmm1,%ymm1
+
+(deftest the-avx-arm-extracts-each-digit-with-the-intended-sequence
+  (let [c (code)
+        ;; digit n needs n mod-256 steps and one final 3t: sum over the
+        ;; fifteen loaded groups of (n + 1) = 30 + 15.
+        digits (reduce + (keep :digit groups))]
+    (is (= 30 digits))
+    (is (= (+ digits 15) (byte-run-count c times-three)) "3t = 4t - t, per step")
+    (is (= digits (byte-run-count c (into times-three mask-255))) "mod 256 after each step")
+    (is (= 15 (byte-run-count c (into times-three shift-8))) ">> 8 closes each group")
+    (is (= 1 (byte-run-count c gather)) "the qh group moves its digits in once")))
+
+(deftest the-scalar-arm-is-one-element-at-a-time
+  ;; `cvtsi2ss %rax,%xmm4` -- F3 REX.W 0F 2A /r, once per element.
+  (is (= 128 (byte-run-count (code) [0xf3 0x48 0x0f 0x2a 0xe0]))))
+
+(deftest ptq1-0-is-refused-by-name-on-aarch64
+  ;; Asserted, so writing the arm is a red test someone has to look at. The
+  ;; refusal comes from the SIMD target check before the format table, and
+  ;; it is the same one Q4_K (x86-only too) gets -- the control that says the
+  ;; reason is the family's and not an accident of this head.
+  (let [problem (fn [head]
+                  (try (a64/emit-program (program head)) nil
+                       (catch :default e (:problem (ex-data e)))))]
+    (is (= :x86-simd-target-mismatch (problem 'kernel-dequant-dot-ptq1-0)))
+    (is (= (problem 'kernel-dequant-dot-q4-k) (problem 'kernel-dequant-dot-ptq1-0)))
+    (is (nil? (problem 'kernel-dequant-dot-q8-0)) "Q8_0 is emitted on AArch64")))
