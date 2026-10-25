@@ -1,0 +1,169 @@
+(ns shugyo.cartpole-test
+  "Port of `cartpole_env.rs` + `vectorized_env.rs`'s `#[cfg(test)] mod tests`,
+  adapted to construct a CartpoleConfig + scene EDN map directly instead of
+  the original `fixtures/cartpole/{cartpole.urdf,scene.yaml}` (duck-typed —
+  see `shugyo.cartpole` namespace docstring)."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [shugyo.cartpole :as cp]
+            [shugyo.dr :as dr]
+            [shugyo.scene-cfg :as sc]
+            [shugyo.traits :as t]))
+
+(defn cartpole-cfg []
+  (dr/cartpole-config
+   {:cart-mass 1.0
+    :pole-mass 0.1
+    :pole-half-length 0.25
+    :gravity 9.81
+    :force-mag 100.0
+    :dt (/ 1.0 60.0)}))
+
+(defn scene [] sc/cartpole-scene-edn)
+
+(defn make-env []
+  (cp/cartpole-env-new (scene) (cartpole-cfg)))
+
+(defn make-vec-env [num-envs]
+  (cp/vectorized-cartpole-env-new num-envs (scene) (cartpole-cfg)))
+
+;; ---------------------------------------------------------------------------
+;; Single-env (`cartpole_env.rs`)
+;; ---------------------------------------------------------------------------
+
+(deftest reset-produces-4dim-observation
+  (let [env (make-env)
+        obs (t/reset! env 42)]
+    (is (= (count obs) 4))
+    (is (= (t/observation-dim env) 4))
+    (is (= (t/action-dim env) 1))))
+
+(deftest reset-is-seed-deterministic
+  (let [a (make-env) b (make-env)
+        oa (t/reset! a 1337) ob (t/reset! b 1337)]
+    (is (= oa ob))))
+
+(deftest null-policy-terminates-eventually
+  (let [env (make-env)]
+    (t/reset! env 7)
+    (loop [i 0]
+      (if (>= i 1000)
+        (is false "should have terminated or truncated within 1000 steps")
+        (let [r (t/step! env [0.0])]
+          (if (or (:terminated? r) (:truncated? r))
+            (is (:terminated? r) "passive cartpole should tip over from small init")
+            (recur (inc i))))))))
+
+(deftest alive-reward-accumulates-while-balanced
+  (let [env (make-env)]
+    (t/reset! env 123)
+    (loop [i 0 total-r 0.0]
+      (if (>= i 30)
+        (is (> total-r 0.0) "good balancing should yield positive cumulative reward")
+        (let [obs (cp/env-state env)
+              action [(* -10.0 (:theta obs))]
+              r (t/step! env action)
+              total-r' (+ total-r (:reward r))]
+          (if (or (:terminated? r) (:truncated? r))
+            (is (> total-r' 0.0) "good balancing should yield positive cumulative reward")
+            (recur (inc i) total-r')))))))
+
+;; ---------------------------------------------------------------------------
+;; Vectorized (`vectorized_env.rs`)
+;; ---------------------------------------------------------------------------
+
+(deftest implements-vec-rl-env-trait
+  (let [env (make-vec-env 4)]
+    (is (= (t/num-envs env) 4))
+    (is (= (t/action-dim-per-env env) 1))
+    (let [total (t/run-zero-action-rollout env 10 0)]
+      (is (not (Double/isNaN total))))))
+
+(deftest reset-produces-correct-observation-layout
+  (let [env (make-vec-env 8)
+        obs (t/reset-all! env 42)]
+    (is (= (count obs) (* 8 4)))
+    (doseq [i (range 8) j (range 4)]
+      (is (<= (Math/abs (nth obs (+ (* i 4) j))) 0.05)))))
+
+(deftest step-advances-all-envs-in-lockstep
+  (let [env (make-vec-env 16)]
+    (t/reset-all! env 123)
+    (let [actions (vec (repeat 16 10.0))
+          results (t/step-all! env actions)]
+      (is (= (count results) 16))
+      (doseq [r results]
+        (is (> (nth (:observation r) 1) 0.0))
+        (is (not (Double/isNaN (:reward r))))))))
+
+(deftest distinct-per-env-actions-diverge
+  (let [env (make-vec-env 2)]
+    (t/reset-all! env 1)
+    (let [actions [10.0 -10.0]]
+      (dotimes [_ 10] (t/step-all! env actions))
+      (let [obs (t/observations-flat env)]
+        (is (> (nth obs 1) 0.0))
+        (is (< (nth obs 5) 0.0))))))
+
+(deftest termination-per-env-works-independently
+  (let [env (make-vec-env 4)]
+    (t/reset-all! env 42)
+    (cp/set-env-state! env 0 (assoc (nth (cp/env-states env) 0) :theta 1.0))
+    (let [r (t/step-all! env (vec (repeat 4 0.0)))]
+      (is (:terminated? (nth r 0)) "env 0 with theta=1.0 must terminate")
+      (doseq [i (range 1 4)]
+        (is (every? #(not (Double/isNaN %)) (:observation (nth r i))))))))
+
+(deftest reset-envs-only-resets-specified
+  (let [env (make-vec-env 4)]
+    (t/reset-all! env 7)
+    (let [actions (vec (repeat 4 5.0))]
+      (dotimes [_ 30] (t/step-all! env actions))
+      (let [pre-obs (t/observations-flat env)]
+        (cp/reset-envs! env [0 2])
+        (let [post-obs (t/observations-flat env)]
+          (is (< (Math/abs (nth post-obs (* 0 4))) 0.06))
+          (is (< (Math/abs (nth post-obs (* 2 4))) 0.06))
+          (is (= (nth pre-obs (* 1 4)) (nth post-obs (* 1 4))))
+          (is (= (nth pre-obs (* 3 4)) (nth post-obs (* 3 4)))))))))
+
+(deftest matches-single-env-when-num-envs-eq-1
+  (let [v (make-vec-env 1)
+        s (make-env)]
+    (t/reset-all! v 99)
+    (t/reset! s 99)
+    (dotimes [_ 50]
+      (let [rv (t/step-all! v [3.0])
+            rs (t/step! s [3.0])]
+        (is (every? #(not (Double/isNaN %)) (:observation (nth rv 0))))
+        (is (every? #(not (Double/isNaN %)) (:observation rs)))))))
+
+(deftest scales-to-1024-envs
+  (let [env (make-vec-env 1024)]
+    (t/reset-all! env 7)
+    (let [actions (mapv #(- (* % 0.01) 5.0) (range 1024))]
+      (dotimes [_ 30]
+        (let [r (t/step-all! env actions)]
+          (is (every? #(not (Double/isNaN (:reward %))) r)))))))
+
+(deftest per-env-dr-drives-state-divergence
+  (let [env (make-vec-env 16)
+        base (cp/base-cfg env)
+        drc (dr/dr-around base)
+        cfgs (dr/dr-sample-n drc base 16 7)]
+    (cp/set-per-env-configs! env cfgs)
+    (t/reset-all! env 1)
+    (let [actions (vec (repeat 16 3.0))]
+      (dotimes [_ 50] (t/step-all! env actions))
+      (let [obs (t/observations-flat env)
+            x-dots (map #(nth obs (+ (* % 4) 1)) (range 16))]
+        (is (> (- (apply max x-dots) (apply min x-dots)) 1e-3)
+            "per-env DR should diverge x_dot across envs")))))
+
+(deftest clear-per-env-configs-reverts-to-shared
+  (let [env (make-vec-env 4)
+        base (cp/base-cfg env)
+        drc (dr/dr-around base)]
+    (cp/set-per-env-configs! env (dr/dr-sample-n drc base 4 1))
+    (is (some? (cp/per-env-configs env)))
+    (cp/clear-per-env-configs! env)
+    (is (nil? (cp/per-env-configs env)))))
