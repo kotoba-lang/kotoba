@@ -214,6 +214,7 @@ The bundled standard libraries live in this repository:
 | `org.iso.isobmff` | `org.iso.isobmff/src` | `isobmff.blob`, `isobmff.box`, `isobmff.bytes`, `isobmff.demux` (an external specification, publisher iso.org) |
 | `org.vrmC.vrm` | `org.vrmC.vrm/src` | `vrm`, `vrm.compat`, `vrm.compose`, `vrm.constraint` (an external specification, publisher vrmC.org) |
 | `org.signal.protocol` | `org.signal.protocol/src` | `kotoba.signal.group`, `kotoba.signal.hkdf`, `kotoba.signal.ratchet`, `kotoba.signal.sealed` (an external specification, publisher signal.org) |
+| `kotoba.envelope` | `kotoba.envelope/src` | `envelope.kem`, `envelope.keystore`, `envelope.model`, `envelope.passkey` (Kotoba project library) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |

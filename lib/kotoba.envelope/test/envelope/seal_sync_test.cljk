@@ -1,0 +1,239 @@
+(ns envelope.seal-sync-test
+  "envelope.seal-sync against the other two backends, with real crypto.
+
+  Interop is the claim, so most of this is cross-backend: what seal-sync
+  seals, envelope.seal (Web Crypto) opens, and the reverse -- classical and
+  hybrid, object and bare wrap. envelope.seal-jvm cannot run under kbb, so
+  it is reached through the fixed chunk vector its own test pins (the same
+  string seal_test pins for the browser): three backends, one ciphertext.
+  The negative cases are the other half: a backend that opens everything it
+  is handed is interoperable with an attacker too."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [envelope.model :as m]
+            [envelope.kem :as kem]
+            [envelope.seal :as seal]
+            [envelope.seal-sync :as sync]
+            [kotoba.signal.hkdf :as signal-hkdf]
+            [kotoba.signal.x25519 :as x25519]))
+
+(defn- utf8 [s] (.encode (js/TextEncoder.) s))
+(defn- text [u8] (.decode (js/TextDecoder.) u8))
+(defn- bytes= [^js a ^js b]
+  (and (= (.-length a) (.-length b))
+       (every? #(= (aget a %) (aget b %)) (range (.-length a)))))
+(defn- hex->u8 [h] (js/Uint8Array.from (map #(js/parseInt (apply str %) 16) (partition 2 h))))
+
+(defn- throws? [f]
+  (try (f) false (catch :default _ true)))
+
+(defn- fails [p]
+  (-> p (.then (constantly false)) (.catch (constantly true))))
+
+(defn- recipient [id] (merge {:id id} (sync/generate-recipient)))
+(defn- hybrid [id] (merge {:id id} (sync/generate-hybrid-recipient)))
+(defn- flip [^js u8 i] (let [c (js/Uint8Array.from u8)] (aset c i (bit-xor 1 (aget c i))) c))
+
+;; ── one ciphertext across all three backends ─────────────────────────────
+
+(deftest browser-jvm-and-sync-chunk-wire-format-is-identical
+  ;; The exact vector seal_jvm_test (JCA) and seal_test (Web Crypto) assert.
+  (let [env (m/envelope "drive:interop" {:chunks 1})
+        key (js/Uint8Array.from (range 32))
+        sealed (sync/seal-chunk env key 0 (utf8 "kotoba interop"))]
+    (is (= "ZdPBsddNo9Rm3MxHd1wuyUwjQ4EYutao8uhPqTmW" (sync/b64url sealed)))
+    (is (= "kotoba interop" (text (sync/open-chunk env key 0 sealed))))))
+
+(deftest hkdf-is-rfc-5869-and-agrees-with-org-signal
+  (async done
+    ;; RFC 5869 A.1, through wrap-under-key's HKDF would be indirect; the
+    ;; private fn is reached via the var so the vector checks it directly.
+    (let [hkdf @#'sync/hkdf
+          ikm (hex->u8 "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")
+          salt (hex->u8 "000102030405060708090a0b0c")
+          info (hex->u8 "f0f1f2f3f4f5f6f7f8f9")
+          okm (hkdf salt ikm info 42)]
+      (is (= "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+             (apply str (map #(.padStart (.toString % 16) 2 "0") okm))))
+      (testing "a nil salt is what org-signal's HKDF means by it"
+        (-> (signal-hkdf/hkdf nil ikm info 32)
+            (.then (fn [theirs]
+                     (is (bytes= theirs (hkdf nil ikm info 32)))
+                     (done)))
+            (.catch (fn [e] (is false (str e)) (done))))))))
+
+;; ── classical: sync -> Web Crypto, Web Crypto -> sync ────────────────────
+
+(deftest sync-sealed-object-opens-in-envelope-seal
+  (async done
+    (let [alice (recipient "did:key:alice")
+          {:keys [envelope chunks]} (sync/seal-object "obj:x1" [(utf8 "zero") (utf8 "one")]
+                                                      [{:id (:id alice) :pub (:pub alice)}])]
+      (is (m/valid? envelope))
+      (is (= ["zero" "one"] (mapv text (sync/open-object envelope (sync/entry-for envelope (:id alice))
+                                                         (:priv alice) chunks))))
+      (-> (seal/open-object envelope (seal/entry-for envelope (:id alice)) (:priv alice) chunks)
+          (.then (fn [opened] (is (= ["zero" "one"] (mapv text opened))) (done)))
+          (.catch (fn [e] (is false (str e)) (done)))))))
+
+(deftest envelope-seal-sealed-object-opens-in-sync
+  (async done
+    (let [alice (recipient "did:key:alice")
+          bob (recipient "did:key:bob")]
+      (-> (seal/seal-object "obj:x2" [(utf8 "web") (utf8 "crypto")]
+                            [{:id (:id alice) :pub (:pub alice)}])
+          (.then (fn [{:keys [envelope chunks]}]
+                   (is (= ["web" "crypto"]
+                          (mapv text (sync/open-object envelope (sync/entry-for envelope (:id alice))
+                                                       (:priv alice) chunks))))
+                   (testing "sync shares an async-sealed object, and async opens the share"
+                     (let [shared (sync/share-with envelope (sync/entry-for envelope (:id alice))
+                                                   (:priv alice) {:id (:id bob) :pub (:pub bob)})]
+                       (-> (seal/open-object shared (seal/entry-for shared (:id bob)) (:priv bob) chunks)
+                           (.then (fn [opened] (is (= ["web" "crypto"] (mapv text opened))))))))))
+          (.then (fn [_] (done)))
+          (.catch (fn [e] (is false (str e)) (done)))))))
+
+(deftest bare-wraps-interoperate-and-bind-their-aad
+  (async done
+    (let [{:keys [priv pub]} (x25519/generate-keypair)
+          secret (utf8 "a share of something")
+          ours (sync/wrap-bytes secret pub "ctx/a")]
+      (is (throws? #(sync/unwrap-bytes ours priv "ctx/b")) "the AAD is part of the wrap")
+      (-> (seal/unwrap-bytes ours priv "ctx/a")
+          (.then (fn [opened] (is (bytes= secret opened))
+                   (seal/wrap-bytes secret pub "ctx/a")))
+          (.then (fn [theirs] (is (bytes= secret (sync/unwrap-bytes theirs priv "ctx/a")))))
+          (.then (fn [_] (seal/wrap-under-key secret (utf8 "prf-output-32-bytes-of-secret!!") (utf8 "salt") "sym")))
+          (.then (fn [theirs]
+                   (is (bytes= secret (sync/unwrap-under-key theirs (utf8 "prf-output-32-bytes-of-secret!!") "sym")))
+                   (seal/unwrap-under-key (sync/wrap-under-key secret (utf8 "prf-output-32-bytes-of-secret!!")
+                                                               (utf8 "salt") "sym")
+                                          (utf8 "prf-output-32-bytes-of-secret!!") "sym")))
+          (.then (fn [opened] (is (bytes= secret opened)) (done)))
+          (.catch (fn [e] (is false (str e)) (done)))))))
+
+;; ── hybrid: sync -> Web Crypto, Web Crypto -> sync ───────────────────────
+
+(defn- hybrid-env [id] (assoc (m/envelope id {:chunks 1}) :envelope/kem m/hybrid-kem))
+
+(deftest sync-hybrid-object-opens-in-envelope-seal
+  (async done
+    (let [alice (hybrid "did:key:alice")
+          {:keys [envelope chunks]}
+          (sync/seal-object "obj:pq1" [(utf8 "post-quantum")]
+                            [(select-keys alice [:id :pub :pq-pub])]
+                            {:envelope/kem m/hybrid-kem})
+          entry (sync/entry-for envelope (:id alice))]
+      (is (m/valid? envelope))
+      (is (= m/hybrid-kem (:recipient/kem entry)))
+      (is (= kem/ciphertext-bytes (.-length (sync/unb64url (:recipient/pq-ct entry)))))
+      (is (= ["post-quantum"] (mapv text (sync/open-object envelope entry
+                                                           (select-keys alice [:priv :pq-priv]) chunks))))
+      (testing "the X25519 key alone does not open a hybrid entry"
+        (is (throws? #(sync/open-object envelope entry (:priv alice) chunks))))
+      (-> (seal/unwrap-with envelope entry (:priv alice) (:pq-priv alice))
+          (.then (fn [ck] (seal/open-chunk envelope ck 0 (first chunks))))
+          (.then (fn [pt] (is (= "post-quantum" (text pt))) (done)))
+          (.catch (fn [e] (is false (str e)) (done)))))))
+
+(deftest envelope-seal-hybrid-entry-opens-in-sync
+  (async done
+    (let [alice (hybrid "did:key:alice")
+          env (hybrid-env "obj:pq2")
+          ck (sync/generate-content-key)
+          ct (sync/seal-chunk env ck 0 (utf8 "from the browser"))]
+      (-> (seal/wrap-for-hybrid env (select-keys alice [:id :pub :pq-pub]) ck)
+          (.then (fn [entry]
+                   (let [env (m/put-recipient env entry)]
+                     (is (= ["from the browser"]
+                            (mapv text (sync/open-object env entry (select-keys alice [:priv :pq-priv]) [ct]))))
+                     (testing "a substituted encapsulation does not open"
+                       (let [pq-ct (flip (sync/unb64url (:recipient/pq-ct entry)) 0)]
+                         (is (throws? #(sync/unwrap-with env (assoc entry :recipient/pq-ct (sync/b64url pq-ct))
+                                                         (:priv alice) (:pq-priv alice))))))
+                     (testing "a hybrid entry relabelled classical does not open"
+                       (is (throws? #(sync/unwrap-with env (dissoc entry :recipient/kem) (:priv alice) nil)))))
+                   (done)))
+          (.catch (fn [e] (is false (str e)) (done)))))))
+
+(deftest hybrid-bare-wraps-interoperate-and-refuse-the-other-opener
+  (async done
+    (let [r (sync/generate-hybrid-recipient)
+          secret (utf8 "hybrid secret")
+          ours (sync/wrap-bytes-hybrid secret r "ctx/pq")]
+      (is (throws? #(sync/unwrap-bytes ours (:priv r) "ctx/pq")) "never opened classically")
+      (is (throws? #(sync/unwrap-bytes-hybrid (sync/wrap-bytes secret (:pub r) "ctx/pq")
+                                              r "ctx/pq"))
+          "a classical wrap is not opened as a hybrid one")
+      (is (throws? #(sync/unwrap-bytes-hybrid ours (dissoc r :pq-priv) "ctx/pq")))
+      (-> (seal/unwrap-bytes-hybrid ours r "ctx/pq")
+          (.then (fn [opened] (is (bytes= secret opened))
+                   (seal/wrap-bytes-hybrid secret r "ctx/pq")))
+          (.then (fn [theirs]
+                   (is (bytes= secret (sync/unwrap-bytes-hybrid theirs r "ctx/pq")))
+                   (is (throws? #(sync/unwrap-bytes-hybrid theirs r "ctx/other")))
+                   (done)))
+          (.catch (fn [e] (is false (str e)) (done)))))))
+
+(deftest a-hybrid-envelope-takes-only-hybrid-entries
+  (let [alice (hybrid "did:key:alice")
+        bob (recipient "did:key:bob")
+        {:keys [envelope]} (sync/seal-object "obj:pq3" [(utf8 "x")]
+                                             [(select-keys alice [:id :pub :pq-pub])]
+                                             {:envelope/kem m/hybrid-kem})
+        entry (sync/entry-for envelope (:id alice))
+        keys (select-keys alice [:priv :pq-priv])]
+    (is (throws? #(sync/seal-object "obj:pq4" [(utf8 "x")] [{:id (:id bob) :pub (:pub bob)}]
+                                    {:envelope/kem m/hybrid-kem}))
+        "a recipient without an ML-KEM key is refused, not downgraded")
+    (is (throws? #(sync/share-with envelope entry keys {:id (:id bob) :pub (:pub bob)})))
+    (is (throws? #(sync/mint-link envelope entry keys)))))
+
+;; ── the classical negatives, on this backend ─────────────────────────────
+
+(deftest tampering-relocation-reordering-and-strangers-fail-closed
+  (let [alice (recipient "did:key:alice")
+        mallory (recipient "did:key:mallory")
+        {:keys [envelope chunks]} (sync/seal-object "obj:neg" [(utf8 "a") (utf8 "b")]
+                                                    [{:id (:id alice) :pub (:pub alice)}])
+        entry (sync/entry-for envelope (:id alice))]
+    (is (throws? #(sync/open-object envelope entry (:priv mallory) chunks)) "stranger")
+    (is (throws? #(sync/open-object envelope entry (:priv alice) [(flip (first chunks) 0) (second chunks)]))
+        "flipped bit")
+    (is (throws? #(sync/open-object envelope entry (:priv alice) (vec (reverse chunks)))) "reordered")
+    (is (throws? #(sync/open-object (assoc envelope :envelope/id "obj:elsewhere") entry (:priv alice) chunks))
+        "moved to another object")
+    (is (throws? #(sync/open-chunk envelope (sync/generate-content-key) 0 (js/Uint8Array. 3)))
+        "shorter than a tag")))
+
+(deftest two-seals-of-the-same-bytes-differ-and-keys-are-fresh
+  (let [alice (recipient "did:key:alice")
+        seal1 (sync/seal-object "obj:same" [(utf8 "same")] [{:id (:id alice) :pub (:pub alice)}])
+        seal2 (sync/seal-object "obj:same" [(utf8 "same")] [{:id (:id alice) :pub (:pub alice)}])]
+    (is (not (bytes= (first (:chunks seal1)) (first (:chunks seal2)))))
+    (is (not (bytes= (sync/generate-content-key) (sync/generate-content-key))))
+    (is (= 32 (.-length (sync/generate-content-key))))))
+
+(deftest link-holders-open-with-the-fragment-secret
+  (let [alice (recipient "did:key:alice")
+        {:keys [envelope chunks]} (sync/seal-object "obj:link" [(utf8 "linked")]
+                                                    [{:id (:id alice) :pub (:pub alice)}])
+        {env' :envelope grant :grant} (sync/mint-link envelope (sync/entry-for envelope (:id alice))
+                                                      (:priv alice))]
+    (is (= :url-fragment (:grant/placement grant)))
+    (is (= ["linked"] (mapv text (sync/open-object env' (sync/entry-for env' (:grant/recipient-id grant))
+                                                   (:grant/secret grant) chunks))))))
+
+(deftest host-byte-arrays-are-read-as-octets
+  ;; kotoba.bytes/utf8-bytes answers an Int8Array on kbb; a byte >= 0x80 must
+  ;; seal as the octet, not as a negative number clamped to zero.
+  (let [alice (recipient "did:key:alice")
+        signed (js/Int8Array.from #js [-1 -128 0 127])
+        {:keys [envelope chunks]} (sync/seal-object "obj:i8" [signed] [{:id (:id alice) :pub (:pub alice)}])]
+    (is (= [255 128 0 127]
+           (vec (js/Array.from (first (sync/open-object envelope (sync/entry-for envelope (:id alice))
+                                                        (:priv alice) chunks)))))))
+  (let [raw (js/Uint8Array.from #js [251 255 254 255 0 1 62 63])]
+    (is (= (seal/b64url raw) (sync/b64url raw)) "the same unpadded base64url as envelope.seal")
+    (is (not (re-find #"[+/=]" (sync/b64url raw)))))
+  (is (= [251 255 254 0 1 62 63] (vec (js/Array.from (sync/unb64url (sync/b64url (js/Uint8Array.from #js [251 255 254 0 1 62 63]))))))))
