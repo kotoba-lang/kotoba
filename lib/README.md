@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |
 | `kotoba.kamiCadImport` | `kotoba.kamiCadImport/src` | `cad-import`, `cad-import.demos`, `cad-import.demos.roadster`, `cad-import.demos.synth-sedan` (Kotoba project library) |
 | `kotoba.kamiAutodrive` | `kotoba.kamiAutodrive/src` | `autodrive`, `autodrive.autopilot`, `autodrive.classes`, `autodrive.control` (Kotoba project library) |
 | `kotoba.kamiAppShibuya` | `kotoba.kamiAppShibuya/src` | `kotoba.shibuya` (Kotoba project library) |
