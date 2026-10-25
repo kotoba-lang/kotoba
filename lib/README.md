@@ -181,6 +181,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.std1588` | `org.ieee.std1588/src` | `ptp.header`, `ptp.message`, `ptp.offset`, `ptp.timestamp` (an external specification, publisher ieee.org) |
 | `org.dnp.dnp3` | `org.dnp.dnp3/src` | `dnp3.app`, `dnp3.crc`, `dnp3.dl`, `dnp3.objects` (an external specification, publisher dnp.org) |
 | `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
+| `kotoba.cloudMurakumoLangchain` | `kotoba.cloudMurakumoLangchain/src` | `murakumo.fleet`, `murakumo.host`, `murakumo.model` (Kotoba project library) |
 | `kotoba.buildbench` | `kotoba.buildbench/src` | `buildbench.host`, `buildbench.lanes`, `buildbench.measure`, `buildbench.report` (Kotoba project library) |
 | `kotoba.bangou` | `kotoba.bangou/src` | `kotoba.bangou` (Kotoba project library) |
 | `kotoba.genome` | `kotoba.genome/src` | `kotoba.genome.app`, `kotoba.genome.core`, `kotoba.genome.runner`, `kotoba.genome.ui` (Kotoba project library) |

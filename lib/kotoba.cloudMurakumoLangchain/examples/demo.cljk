@@ -1,0 +1,75 @@
+(ns demo
+  "Live demo: langchain-clj + langgraph-clj を Murakumo fleet の gemma4 で動かす。
+
+    cd 70-tools/clj/murakumo-langchain && kbb -m demo
+
+  1. LCEL chain     — prompt → gemma4 → str-parser
+  2. StateGraph     — 2 ノード + mem-checkpointer (実行履歴 = checkpoint)
+  3. ReAct agent    — gemma4 native tool-calling で tool 実行ループ"
+  (:require [langchain.runnable :as r]
+            [langchain.prompt :as prompt]
+            [langchain.parser :as parser]
+            [langchain.model :as model]
+            [langchain.message :as msg]
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [langgraph.prebuilt :as prebuilt]
+            [murakumo.fleet]
+            [murakumo.host :as host]))
+
+(defn demo-chain [llm]
+  (println "── 1. LCEL chain (translate) ──")
+  (let [chain (r/pipe (prompt/chat-template
+                       [:system "You translate to {lang}. Reply with the translation only."]
+                       [:user "{text}"])
+                      (model/as-runnable llm)
+                      (parser/str-parser))]
+    (println " " (r/invoke chain {:lang "Japanese" :text "The tree of life"}))))
+
+(defn demo-graph [llm]
+  (println "── 2. StateGraph + checkpointer ──")
+  (let [ckpt (cp/mem-checkpointer)
+        ask (fn [prompt-text]
+              (fn [{:keys [messages]}]
+                {:messages [(model/-generate llm
+                                             (conj (vec messages) (msg/user prompt-text))
+                                             {})]}))
+        graph (-> (g/state-graph {:channels {:messages {:reducer (fnil into []) :default []}}})
+                  (g/add-node :draft (ask "Draft one short sentence about Mount Fuji."))
+                  (g/add-node :polish (ask "Polish the draft into florid prose, one sentence."))
+                  (g/set-entry-point :draft)
+                  (g/add-edge :draft :polish)
+                  (g/set-finish-point :polish)
+                  (g/compile-graph {:checkpointer ckpt}))
+        {:keys [status state]} (g/run* graph {:messages [(msg/user "Begin.")]}
+                                       {:thread-id "demo-1"})]
+    (println "  status:" status)
+    (println "  final:" (msg/text (msg/last-message (:messages state))))
+    (println "  checkpoints:" (count (cp/list-checkpoints ckpt "demo-1")))))
+
+(def fleet-status-tool
+  {:name "fleet_node_count"
+   :description "Returns how many Murakumo fleet nodes are in the roster."
+   :schema {:type "object" :properties {}}
+   :fn (fn [_] (count murakumo.fleet/nodes))})
+
+(defn demo-react [llm]
+  (println "── 3. ReAct agent (gemma4 tool-calling) ──")
+  (let [agent (prebuilt/create-react-agent
+               {:model llm
+                :tools [fleet-status-tool]
+                :system (str "Answer using tools when available. After a tool "
+                             "result arrives, answer the user in one sentence.")})
+        state (g/invoke agent {:messages [(msg/user "How many Murakumo fleet nodes are there?")]})]
+    (doseq [m (:messages state)]
+      (println " " (:role m)
+               (or (some->> (:tool-calls m) (mapv :name) (str "calls: "))
+                   (msg/text m))))))
+
+(defn -main [& _]
+  (let [llm (host/gemma)] ; round-robin e4b-it-qat across the fleet
+    (demo-chain llm)
+    (demo-graph llm)
+    ;; tool 結果後の最終応答は e4b だと空になることがある — 12b が確実
+    (demo-react (host/gemma {:model "gemma4:12b-it-qat"})))
+  (println "All demos done."))
