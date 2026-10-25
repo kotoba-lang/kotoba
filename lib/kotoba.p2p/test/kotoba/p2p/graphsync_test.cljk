@@ -1,0 +1,119 @@
+(ns kotoba.p2p.graphsync-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [ipld.core :as ipld]
+            [kotoba.p2p.graphsync :as gs]
+            [multiformats.core :as mf]))
+
+(def wire-limits
+  {:max-message-bytes 65536 :max-requests 8 :max-responses 8 :max-blocks 32})
+(def traversal-limits
+  {:max-blocks 8 :max-bytes 4096 :max-depth 8 :max-matches 8})
+
+(defn request-id []
+  #?(:clj (byte-array (map unchecked-byte (range 16)))
+     :cljs (js/Uint8Array.from (clj->js (range 16)))))
+
+(defn bytes= [a b] (= (vec a) (vec b)))
+
+(defn normalize-bytes [message]
+  (update message :requests
+          (fn [requests]
+            (mapv #(update % :id vec) requests))))
+
+(deftest go-graphsync-v2-cancel-fixture
+  ;; This exact frame was decoded and re-encoded byte-for-byte by
+  ;; github.com/ipfs/go-graphsync/message/v2 v0.18.2.
+  (let [hex "27a163677332a16372657181a262696450000102030405060708090a0b0c0d0e0f64747970656163"
+        message {:requests [{:id (request-id) :type :cancel}]}
+        frame (gs/encode-frame message wire-limits)]
+    (is (= hex (mf/hexify frame)))
+    (is (= (normalize-bytes message)
+           (normalize-bytes (gs/decode-frame (mf/unhex hex) wire-limits))))))
+
+(deftest graphsync-v2-request-round-trips-through-dag-cbor-and-framing
+  (let [store (atom {})
+        root (ipld/put-node! (fn [cid bytes] (swap! store assoc cid bytes))
+                             {"hello" "world"})
+        request {:id (request-id) :type :new :root root
+                 :priority 7
+                 :selector {:selector :explore-fields
+                            :fields {"hello" {:selector :matcher}}}
+                 :extensions {"example" {"enabled" true}}}
+        message {:requests [request]}
+        decoded (gs/decode-message (gs/encode-message message wire-limits) wire-limits)
+        framed (gs/decode-frame (gs/encode-frame message wire-limits) wire-limits)]
+    (is (= gs/protocol-id "/ipfs/graphsync/2.0.0"))
+    (is (= (normalize-bytes message) (normalize-bytes decoded)))
+    (is (= (normalize-bytes decoded) (normalize-bytes framed)))))
+
+(deftest responder-uses-bounded-verified-ipld-traversal
+  (let [store (atom {})
+        put! (fn [cid bytes] (swap! store assoc cid bytes))
+        leaf (ipld/put-node! put! {"name" "leaf"})
+        root (ipld/put-node! put! {"child" (ipld/link leaf)})
+        request {:id (request-id) :type :new :root root
+                 :selector {:selector :explore-fields
+                            :fields {"child" {:selector :explore-fields
+                                               :fields {"name" {:selector :matcher}}}}}}
+        response (gs/fulfill-request #(get @store %) request traversal-limits)
+        decoded (gs/decode-message (gs/encode-message response wire-limits) wire-limits)]
+    (is (= [root leaf] (mapv :cid (:blocks response))))
+    (is (= 20 (get-in response [:responses 0 :status])))
+    (is (= [:present :present]
+           (mapv :action (get-in decoded [:responses 0 :metadata]))))
+    (is (= [root leaf] (mapv :cid (:blocks decoded))))
+    (is (every? true? (map (fn [a b] (bytes= (:bytes a) (:bytes b)))
+                           (:blocks response) (:blocks decoded))))))
+
+(deftest recursive-selector-round-trips-and-fulfills-the-whole-linked-dag
+  (let [store (atom {})
+        put! (fn [cid bytes] (swap! store assoc cid bytes))
+        leaf (ipld/put-node! put! {"name" "leaf"})
+        middle (ipld/put-node! put! {"name" "middle" "child" (ipld/link leaf)})
+        root (ipld/put-node! put! {"name" "root" "child" (ipld/link middle)})
+        selector {:selector :explore-recursive
+                  :limit {:mode :none}
+                  :sequence {:selector :explore-union
+                             :members [{:selector :matcher}
+                                       {:selector :explore-all
+                                        :next {:selector :explore-recursive-edge}}]}}
+        request {:id (request-id) :type :new :root root :selector selector}
+        decoded-request (-> {:requests [request]}
+                            (gs/encode-frame wire-limits)
+                            (gs/decode-frame wire-limits)
+                            :requests first)
+        response (gs/fulfill-request #(get @store %) decoded-request traversal-limits)
+        decoded-response (gs/decode-message
+                          (gs/encode-message response wire-limits) wire-limits)]
+    (is (= selector (:selector decoded-request)))
+    (is (= [root middle leaf] (mapv :cid (:blocks response))))
+    (is (= [root middle leaf] (mapv :cid (:blocks decoded-response))))
+    (is (= 3 (count (get-in decoded-response [:responses 0 :metadata]))))))
+
+(deftest malformed-or-over-budget-wire-data-fails-closed
+  (let [store (atom {})
+        root (ipld/put-node! (fn [cid bytes] (swap! store assoc cid bytes)) {"v" 1})
+        message {:requests [{:id (request-id) :type :new :root root
+                             :selector {:selector :matcher}}]}
+        frame (gs/encode-frame message wire-limits)]
+    (testing "outer byte budget is checked before DAG-CBOR decode"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (gs/decode-frame frame (assoc wire-limits :max-message-bytes 1)))))
+    (testing "trailing frame data is not silently accepted"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (gs/decode-frame
+                    #?(:clj (byte-array (concat (seq frame) [0]))
+                       :cljs (js/Uint8Array.from (clj->js (concat (seq frame) [0]))))
+                    wire-limits))))
+    (testing "request identifiers are UUID-width"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (gs/encode-message
+                    {:requests [{:id #?(:clj (byte-array 4) :cljs (js/Uint8Array. 4))
+                                 :type :new :root root :selector {:selector :matcher}}]}
+                    wire-limits))))
+    (testing "traversal budgets remain authoritative"
+      (is (thrown? #?(:clj Exception :cljs js/Error)
+                   (gs/fulfill-request #(get @store %)
+                                       (get-in message [:requests 0])
+                                       (assoc traversal-limits :max-bytes 1)))))))
