@@ -1,0 +1,78 @@
+(ns kotoba.plm.routing-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotoba.plm.db :as db]
+            #?(:clj [kotoba.plm.db-host :as db-host])
+            [kotoba.plm.item :as plm]
+            [kotoba.plm.routing :as routing]
+            [kotoba.plm.cost :as cost]
+            [kotoba.plm.erp :as erp]
+            [kotoba.plm.thread :as thread]
+            [kotoba.plm.production :as prod]))
+
+(defn- world []
+  (let [conn #?(:clj (db-host/fresh-conn (str "t-routing-" (System/nanoTime)))
+                :cljs (throw (ex-info "Datomic Local test oracle is JVM-only" {})))]
+    (db/tx! conn erp/chart)
+    (db/tx! conn
+      [(plm/item {:part-no "PN-2000" :make-buy :buy :std-unit-cost 100})
+       (plm/item {:part-no "PN-2001" :make-buy :buy :std-unit-cost 50})
+       (plm/item {:part-no "PN-1000" :make-buy :make})])
+    (db/tx! conn
+      [(plm/bom-edge {:parent "PN-1000@A" :child "PN-2000@A" :qty 4 :find-no 1})
+       (plm/bom-edge {:parent "PN-1000@A" :child "PN-2001@A" :qty 2 :find-no 2})])
+    conn))
+
+(defn- add-routing! [conn]
+  ;; work center first (like item.cljc's seed convention) so the operation's
+  ;; [:plm.wc/id ...] lookup ref resolves against an already-committed entity.
+  (db/tx! conn [(routing/work-center {:id "WC-1" :name "CNC mill" :rate 60})])
+  (db/tx! conn [(routing/operation {:item "PN-1000@A" :seq 1 :name "mill"
+                                    :work-center "WC-1" :std-time-hr 0.5M :setup-time-hr 0.1M})]))
+
+(deftest process-cost-sums-routing-steps
+  (let [conn (world)]
+    (is (= 0M (routing/process-cost (db/db conn) "PN-1000@A"))
+        "no routing defined yet ⇒ 0")
+    (add-routing! conn)
+    (is (= 36.0M (routing/process-cost (db/db conn) "PN-1000@A"))
+        "(0.5 + 0.1) x 60 = 36")))
+
+(deftest rolled-cost-include-process-is-opt-in
+  (let [conn (world)]
+    (add-routing! conn)
+    (testing "existing 2/3-arity call sites are unaffected by routing"
+      (is (= 500M (cost/rolled-cost (db/db conn) "PN-1000@A")))
+      (is (= 500M (cost/rolled-cost (db/db conn) "PN-1000@A" nil))))
+    (testing "4-arity :include-process? true folds in the process cost"
+      (is (= 536.0M (cost/rolled-cost (db/db conn) "PN-1000@A" nil {:include-process? true}))))
+    (testing "item with no routing still contributes 0 even opted in"
+      (is (= 100M (cost/rolled-cost (db/db conn) "PN-2000@A" nil {:include-process? true}))))))
+
+(deftest release-and-backflush-absorb-process-cost
+  (let [conn (world)]
+    (add-routing! conn)
+    (doseq [iid ["PN-2000@A" "PN-2001@A" "PN-1000@A"]] (thread/release-item! conn iid))
+    (testing "release-item! folds process cost into the released standard"
+      (is (= 536.0M (db/attr (db/db conn) :erp.inventory/std-cost [:erp.inventory/id "INV-PN-1000@A"]))))
+    (thread/receive-goods! conn "PN-2000@A" 20)
+    (thread/receive-goods! conn "PN-2001@A" 10)
+    (let [r (prod/complete-production! conn "PN-1000@A" 5)]
+      (testing "backflush absorbs labor/overhead and still zeroes WIP"
+        (is (:ok r))
+        (is (= 180.0M (:process-cost r)) "36 x 5")
+        (is (= 0M (get-in (erp/trial-balance (db/db conn)) ["1500" :balance]))
+            "WIP closes to zero even with process-cost absorption"))
+      (testing "5100 Labor & Overhead Absorbed carries the absorbed amount"
+        (is (= -180.0M (get-in (erp/trial-balance (db/db conn)) ["5100" :balance]))
+            "credit balance on the absorption account")))))
+
+(deftest no-routing-is-byte-identical-to-before
+  (let [conn (world)]
+    (doseq [iid ["PN-2000@A" "PN-2001@A" "PN-1000@A"]] (thread/release-item! conn iid))
+    (thread/receive-goods! conn "PN-2000@A" 20)
+    (thread/receive-goods! conn "PN-2001@A" 10)
+    (let [r (prod/complete-production! conn "PN-1000@A" 5)]
+      (is (= 0M (:process-cost r)))
+      (is (= 2500M (:wip-cleared r)) "5 x 500, unchanged from the pre-BOP invariant")
+      (is (nil? (get (erp/trial-balance (db/db conn)) "5100"))
+          "no 5100 line at all when there's no routing"))))
