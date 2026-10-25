@@ -1,0 +1,112 @@
+(ns kakeibo.tx-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [kakeibo.tx :as tx]))
+
+(def jp-mapping
+  {:mapping/institution :jp-rakuten-bank
+   :mapping/document    :transaction-detail-ja
+   :mapping/account     :acct/rakuten-ordinary
+   :mapping/currency    "JPY"
+   :mapping/scale       1
+   :mapping/columns     {:date "取引日" :description "入出金先内容"
+                         :in "入金金額" :out "出金金額"}})
+
+(def us-mapping
+  {:mapping/institution :us-example-bank
+   :mapping/document    :statement
+   :mapping/account     :acct/us-checking
+   :mapping/currency    "USD"
+   :mapping/scale       100
+   :mapping/date-order  :mdy
+   :mapping/columns     {:date "Date" :description "Description"
+                         :amount "Amount" :ref "Reference"}})
+
+(deftest date-normalization
+  (is (= "2026-07-01" (:date/iso (tx/normalize-date "2026-07-01"))))
+  (is (= "2026-07-01" (:date/iso (tx/normalize-date "2026/7/1"))))
+  (is (= "2026-07-01" (:date/iso (tx/normalize-date "2026.07.01"))))
+  (is (= "2026-07-01" (:date/iso (tx/normalize-date "2026年7月1日"))))
+  (is (= "2026-07-01" (:date/iso (tx/normalize-date "２０２６年７月１日")))
+      "full-width dates normalize too")
+  (testing "column order must be declared, because 03/04/2026 is genuinely ambiguous"
+    (is (= :non-four-digit-year (:date/problem (tx/normalize-date "03/04/2026"))))
+    (is (= "2026-03-04" (:date/iso (tx/normalize-date "03/04/2026" :mdy))))
+    (is (= "2026-04-03" (:date/iso (tx/normalize-date "03/04/2026" :dmy)))))
+  (testing "out-of-range and unreadable dates are problems"
+    (is (= :month-out-of-range (:date/problem (tx/normalize-date "2026-13-01"))))
+    (is (= :day-out-of-range (:date/problem (tx/normalize-date "2026-01-32"))))
+    (is (= :unrecognized-date (:date/problem (tx/normalize-date "July 2026"))))
+    (is (= :blank (:date/problem (tx/normalize-date ""))))
+    (is (= :unsupported-date-order (:date/problem (tx/normalize-date "2026-01-01" :ydm))))))
+
+(deftest description-normalization
+  (is (= "AMAZON CO JP" (tx/normalize-description "ＡＭＡＺＯＮ  CO\tJP ")))
+  (is (nil? (tx/normalize-description nil))))
+
+(deftest mapping-validation
+  (is (empty? (tx/validate-mapping jp-mapping)))
+  (is (empty? (tx/validate-mapping us-mapping)))
+  (let [problems (tx/validate-mapping {:mapping/columns {}})]
+    (is (some #{:missing-institution} problems))
+    (is (some #{:missing-account} problems))
+    (is (some #{:missing-currency} problems))
+    (is (some #{:missing-date-column} problems))
+    (is (some #{:missing-amount-columns} problems)))
+  (is (some #{:unsupported-scale}
+            (tx/validate-mapping (assoc jp-mapping :mapping/scale 7)))))
+
+(deftest row-conversion-in-out
+  (let [{:keys [kakeibo/tx]} (tx/row->tx jp-mapping
+                                        {"取引日" "2026/7/1"
+                                         "入出金先内容" "ＡＭＡＺＯＮ．ＣＯ．ＪＰ"
+                                         "入金金額" ""
+                                         "出金金額" "3,240"}
+                                        0)]
+    (is (= :acct/rakuten-ordinary (:tx/account tx)))
+    (is (= "2026-07-01" (:tx/date tx)))
+    (is (= -3240 (:tx/amount tx)) "an outflow is negative")
+    (is (= "JPY" (:tx/currency tx)))
+    (is (= "AMAZON.CO.JP" (:tx/normalized tx)))
+    (is (= {:source/institution :jp-rakuten-bank
+            :source/document :transaction-detail-ja
+            :source/row 0}
+           (:tx/source tx)))
+    (is (nil? (:tx/ref tx)))))
+
+(deftest row-conversion-signed-with-ref
+  (let [{:keys [kakeibo/tx]} (tx/row->tx us-mapping
+                                        {"Date" "07/01/2026"
+                                         "Description" "Coffee"
+                                         "Amount" "-4.50"
+                                         "Reference" "TXN-99"}
+                                        3)]
+    (is (= -450 (:tx/amount tx)))
+    (is (= "2026-07-01" (:tx/date tx)))
+    (is (= "TXN-99" (:tx/ref tx)))
+    (is (= 3 (get-in tx [:tx/source :source/row])))))
+
+(deftest bad-rows-are-rejected-not-dropped
+  (let [rows [{"取引日" "2026/7/1" "入出金先内容" "OK" "入金金額" "" "出金金額" "100"}
+              {"取引日" "not a date" "入出金先内容" "BAD" "入金金額" "" "出金金額" "100"}
+              {"取引日" "2026/7/2" "入出金先内容" "" "入金金額" "" "出金金額" "100"}
+              {"取引日" "2026/7/3" "入出金先内容" "BOTH" "入金金額" "1" "出金金額" "2"}]
+        result (tx/normalize-rows jp-mapping rows)]
+    (is (= 4 (:kakeibo/read result)) "every row is accounted for")
+    (is (= 1 (count (:kakeibo/txs result))))
+    (is (= 3 (count (:kakeibo/rejected result))))
+    (is (= 4 (+ (count (:kakeibo/txs result)) (count (:kakeibo/rejected result))))
+        "read == kept + rejected, so nothing vanished")
+    (testing "each rejection carries its reason and the original row"
+      (let [[bad-date blank-desc both] (:kakeibo/rejected result)]
+        (is (= [:unrecognized-date] (mapv :problem (:kakeibo/problems bad-date))))
+        (is (= [:blank-description] (mapv :problem (:kakeibo/problems blank-desc))))
+        (is (= [:both-in-and-out] (mapv :problem (:kakeibo/problems both))))
+        (is (= "BAD" (get (:kakeibo/row bad-date) "入出金先内容")))))))
+
+(deftest invalid-mapping-ingests-nothing
+  (testing "a wrong mapping produces plausible-looking transactions, so it must not partially ingest"
+    (let [result (tx/normalize-rows {:mapping/columns {}} [{"a" "b"} {"c" "d"}])]
+      (is (empty? (:kakeibo/txs result)))
+      (is (= 2 (:kakeibo/read result)))
+      (is (seq (:kakeibo/mapping-problems result))))))

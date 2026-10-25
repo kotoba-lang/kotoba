@@ -1,0 +1,102 @@
+(ns kakeibo.core-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])
+            [kakeibo.core :as kakeibo]))
+
+(def mapping
+  {:mapping/institution :jp-rakuten-bank
+   :mapping/document    :transaction-detail-ja
+   :mapping/account     :acct/rakuten-ordinary
+   :mapping/currency    "JPY"
+   :mapping/scale       1
+   :mapping/columns     {:date "取引日" :description "入出金先内容"
+                         :in "入金金額" :out "出金金額"}})
+
+(def rules
+  [{:rule/id :cat/utilities :rule/category :utilities
+    :rule/match {:description/regex "東京電力" :amount/sign :negative}}
+   {:rule/id :cat/groceries :rule/category :groceries
+    :rule/match {:description/contains ["スーパー"]}}
+   {:rule/id :cat/salary :rule/category :salary
+    :rule/match {:amount/sign :positive}}])
+
+(defn- row [date desc in out]
+  {"取引日" date "入出金先内容" desc "入金金額" in "出金金額" out})
+
+(def week1-rows
+  [(row "2026/7/1" "まいばすスーパー" "" "3,240")
+   (row "2026/7/2" "東京電力エナジー" "" "12,000")
+   (row "2026/7/3" "キユウヨ" "300,000" "")])
+
+(deftest first-ingest
+  (let [result (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules})
+        s (kakeibo/summary result)]
+    (is (true? (kakeibo/clean? result)))
+    (is (= {:summary/read 3 :summary/rejected 0 :summary/suppressed 0
+            :summary/txs 3 :summary/new 3 :summary/postings 3
+            :summary/unpostable 0 :summary/uncategorized 0
+            :summary/mapping-problems []}
+           s))
+    (is (= [:groceries :utilities :salary] (mapv :tx/category (:kakeibo/txs result))))
+    (is (every? :ledger/balanced? (:kakeibo/postings result)))
+    (is (= {:groceries -3240 :utilities -12000 :salary 300000}
+           (get-in result [:kakeibo/report :report/by-category])))))
+
+(deftest re-ingesting-an-overlapping-window-adds-nothing
+  (testing "the same file twice must not double the ledger"
+    (let [first-pass (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules})
+          second-pass (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules
+                                       :existing (:kakeibo/txs first-pass)})]
+      (is (= 3 (count (:kakeibo/txs second-pass))) "the transaction set is unchanged")
+      (is (= 0 (count (:kakeibo/new second-pass))) "nothing is new")
+      (is (= 0 (count (:kakeibo/postings second-pass))) "nothing is posted again")
+      (is (= 3 (:kakeibo/suppressed second-pass)) "and the suppression is reported"))))
+
+(deftest a-wider-window-posts-only-the-additions
+  (let [first-pass (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules})
+        week2 (conj (vec week1-rows) (row "2026/7/8" "まいばすスーパー" "" "1,500"))
+        second-pass (kakeibo/ingest {:mapping mapping :rows week2 :rules rules
+                                     :existing (:kakeibo/txs first-pass)})]
+    (is (= 4 (count (:kakeibo/txs second-pass))))
+    (is (= 1 (count (:kakeibo/new second-pass))))
+    (is (= -1500 (:tx/amount (first (:kakeibo/new second-pass)))))
+    (is (= 1 (count (:kakeibo/postings second-pass))))))
+
+(deftest a-broken-row-is-reported-and-blocks-the-clean-gate
+  (let [rows (conj (vec week1-rows) (row "not a date" "MYSTERY" "" "100"))
+        result (kakeibo/ingest {:mapping mapping :rows rows :rules rules})]
+    (is (false? (kakeibo/clean? result))
+        "a tick must exit non-zero rather than report success with a footnote")
+    (is (= 4 (:kakeibo/read result)))
+    (is (= 1 (count (:kakeibo/rejected result))))
+    (is (= 3 (count (:kakeibo/txs result))) "the readable rows still ingest")))
+
+(deftest an-invalid-mapping-ingests-nothing-at-all
+  (let [result (kakeibo/ingest {:mapping {:mapping/columns {}} :rows week1-rows :rules rules})]
+    (is (false? (kakeibo/clean? result)))
+    (is (empty? (:kakeibo/txs result)))
+    (is (empty? (:kakeibo/postings result)))
+    (is (seq (:kakeibo/mapping-problems result)))))
+
+(deftest uncategorized-spending-is-visible-in-the-summary
+  (let [rows [(row "2026/7/1" "UNKNOWN PAYEE" "" "777")]
+        result (kakeibo/ingest {:mapping mapping :rows rows :rules rules})]
+    (is (= 1 (:summary/uncategorized (kakeibo/summary result))))
+    (is (= :uncategorized (:tx/category (first (:kakeibo/txs result)))))
+    (testing "it still posts, to an explicitly uncategorized expense account"
+      (is (= :expense/uncategorized
+             (:ledger/account (first (:ledger/entries (first (:kakeibo/postings result))))))))))
+
+(deftest budget-comparison-is-optional-and-period-scoped
+  (let [result (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules
+                                :budget {:groceries 5000 :travel 20000}
+                                :budget-period "2026-07"})]
+    (is (= :under (get-in result [:kakeibo/budget :budget/lines :groceries :budget/status])))
+    (is (= :unobserved (get-in result [:kakeibo/budget :budget/lines :travel :budget/status])))
+    (is (not (contains? (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules})
+                        :kakeibo/budget)))))
+
+(deftest determinism
+  (testing "same inputs, same output — what makes a tamaki exec receipt meaningful"
+    (is (= (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules})
+           (kakeibo/ingest {:mapping mapping :rows week1-rows :rules rules})))))
