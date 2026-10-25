@@ -161,6 +161,7 @@ The bundled standard libraries live in this repository:
 | `org.loinc.core` | `org.loinc.core/src` | `loinc.check-digit`, `loinc.code`, `loinc.parts`, `loinc.release-csv` (an external specification, publisher loinc.org) |
 | `org.hl7.v2` | `org.hl7.v2/src` | `hl7-v2.ack`, `hl7-v2.delimiters`, `hl7-v2.escape`, `hl7-v2.mllp` (an external specification, publisher hl7.org) |
 | `org.farama.gymnasium` | `org.farama.gymnasium/src` | `cartpole-wasm` (an external specification, publisher farama.org) |
+| `org.ethercat.core` | `org.ethercat.core/src` | `ethercat.datagram`, `ethercat.ethernet`, `ethercat.frame`, `ethercat.wkc` (an external specification, publisher ethercat.org) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
