@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.provider` | `kotoba.provider/src` | `provider.clock`, `provider.clock-transport`, `provider.conformance`, `provider.dataspace` (Kotoba project library) |
 | `kotoba.pricingOracle` | `kotoba.pricingOracle/src` | `pricing-oracle.core` (Kotoba project library) |
 | `kotoba.plm` | `kotoba.plm/src` | `kotoba.plm.app`, `kotoba.plm.core`, `kotoba.plm.cost`, `kotoba.plm.db` (Kotoba project library) |
 | `kotoba.paging` | `kotoba.paging/src` | `paging.core` (Kotoba project library) |

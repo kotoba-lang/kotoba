@@ -1,0 +1,154 @@
+(ns kotoba.git.edn-package
+  ;; T8.3 ADR 0240/0241/0280: git EDN on a nominal request record.
+  ;; Request: host-sequenced args fold into EDN vector + max-stdout + timeout.
+  ;; Reply: ok (exit/stdout/stderr) + error (code/message). Dual quote/backslash
+  ;; scan on string leaves. Complements git walk 0184. OS git run remains
+  ;; host-injected. W4 recursive nested EDN open; wasm-aot stays :partial.
+  (:export [git_req_begin
+            git_req_arg
+            git_req_code
+            git_req_argc
+            git_req_edn
+            git_reply_ok_edn
+            git_reply_error_edn
+            main]))
+
+(defrecord GitRequest [argv-edn :string argc :i64 code :i64])
+
+;; Sticky codes (request path):
+;;   0 ok
+;;  -1 empty arg
+;;  -2 argc would exceed 64
+;;  -3 forbidden " or \ in arg
+;;  -4 max-stdout not in (0,65536]
+;;  -5 timeout not in (0,600000]
+
+(defn- has-forbidden [s :string] :i64
+  (let [n (string-length s)]
+    (loop [i 0]
+      (if (>= i n) 0
+        (let [c (string-code-point-at s i)]
+          (if (= c 34) 1
+            (if (= c 92) 1 (recur (+ i 1)))))))))
+
+(defn- digit-char [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn- nat-str [n :i64] :string
+  (if (< n 10)
+    (digit-char n)
+    (string-concat (nat-str (quot n 10))
+                   (digit-char (- n (* (quot n 10) 10))))))
+
+(defn git_req_begin []
+  [:ref :kotoba.git.edn-package/GitRequest]
+  (->GitRequest "[]" 0 0))
+
+(defn git_req_code
+  [st [:ref :kotoba.git.edn-package/GitRequest]]
+  :i64
+  (:code st))
+
+(defn git_req_argc
+  [st [:ref :kotoba.git.edn-package/GitRequest]]
+  :i64
+  (:argc st))
+
+(defn git_req_arg
+  [st [:ref :kotoba.git.edn-package/GitRequest] arg :string]
+  [:ref :kotoba.git.edn-package/GitRequest]
+  (let [{:keys [argv-edn argc code]} st
+        argv argv-edn]
+    (if (not= code 0)
+      (->GitRequest argv argc code)
+      (if (= (string-length arg) 0)
+        (->GitRequest argv argc -1)
+        (if (= (has-forbidden arg) 1)
+          (->GitRequest argv argc -3)
+          (if (>= argc 64)
+            (->GitRequest argv argc -2)
+            (let [piece (string-concat "\"" (string-concat arg "\""))
+                  argv2 (if (string=? argv "[]")
+                          (string-concat "[" (string-concat piece "]"))
+                          (string-concat
+                           (string-substring argv 0 (- (string-length argv) 1))
+                           (string-concat " " (string-concat piece "]"))))]
+              (->GitRequest argv2 (+ argc 1) 0))))))))
+
+(defn git_req_edn
+  [st [:ref :kotoba.git.edn-package/GitRequest]
+   max-stdout :i64 timeout-ms :i64]
+  :string
+  (let [{:keys [code argv-edn argc]} st
+        argv argv-edn]
+    (if (not= code 0)
+      ""
+      (if (<= argc 0)
+        ""
+        (if (or (<= max-stdout 0) (> max-stdout 65536))
+          ""
+          (if (or (<= timeout-ms 0) (> timeout-ms 600000))
+            ""
+            (string-concat "{:args "
+                           (string-concat argv
+                                          (string-concat " :max-stdout-bytes "
+                                                         (string-concat (nat-str max-stdout)
+                                                                        (string-concat " :timeout-ms "
+                                                                                       (string-concat (nat-str timeout-ms) "}"))))))))))))
+
+(defn git_reply_ok_edn
+  [exit :i64 stdout :string stderr :string]
+  :string
+  (if (or (= (has-forbidden stdout) 1) (= (has-forbidden stderr) 1))
+    ""
+    (if (< exit 0)
+      ""
+      (string-concat "{:tag :ok :exit "
+                     (string-concat (nat-str exit)
+                                    (string-concat " :stdout \""
+                                                   (string-concat stdout
+                                                                  (string-concat "\" :stderr \""
+                                                                                 (string-concat stderr "\"}")))))))))
+
+(defn git_reply_error_edn
+  [code :string message :string]
+  :string
+  (if (or (= (string-length code) 0)
+          (= (has-forbidden code) 1)
+          (= (has-forbidden message) 1))
+    ""
+    (string-concat "{:tag :error :code \""
+                   (string-concat code
+                                  (string-concat "\" :message \""
+                                                 (string-concat message "\"}"))))))
+
+;; main → -2311: req with 2 args + bounds, ok reply, err reply, rejects
+(defn main [] :i64
+  (let [s0 (git_req_begin)
+        s1 (git_req_arg s0 "status")
+        s2 (git_req_arg s1 "--short")
+        req (git_req_edn s2 4096 5000)
+        ok (git_reply_ok_edn 0 " M file\n" "")
+        err (git_reply_error_edn "spawn-failed" "ENOENT")
+        empty-arg (git_req_arg s0 "")
+        ec (git_req_code empty-arg)
+        bad-req (git_req_edn s2 0 5000)
+        bad-ok (git_reply_ok_edn 0 "a\"b" "")
+        bad-err (git_reply_error_edn "" "m")
+        good (if (string-contains? req ":args")
+               (if (string-contains? req "status")
+                 (if (string-contains? req "timeout-ms")
+                   (if (string-contains? ok ":tag :ok")
+                     (if (string-contains? err ":tag :error") 1 0)
+                     0)
+                   0)
+                 0)
+               0)]
+    (if (and (= good 1)
+             (= ec -1)
+             (= (string-length bad-req) 0)
+             (= (string-length bad-ok) 0)
+             (= (string-length bad-err) 0)
+             (= (git_req_argc s2) 2))
+      -2311
+      -1)))
