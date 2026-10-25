@@ -169,6 +169,7 @@ The bundled standard libraries live in this repository:
 | `org.thorchain.core` | `org.thorchain.core/src` | `thorchain.asset`, `thorchain.memo`, `thorchain.quote` (an external specification, publisher thorchain.org) |
 | `org.opcfoundation.ua` | `org.opcfoundation.ua/src` | `opcua.builtin`, `opcua.nodeid`, `opcua.transport`, `opcua.variant` (an external specification, publisher opcfoundation.org) |
 | `org.iso.std15118` | `org.iso.std15118/src` | `v2gtp.bits`, `v2gtp.frame`, `v2gtp.payload-type` (an external specification, publisher iso.org) |
+| `org.fixtrading.fix` | `org.fixtrading.fix/src` | `fix.bytes`, `fix.checksum`, `fix.codec`, `fix.dictionary` (an external specification, publisher fixtrading.org) |
 | `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |

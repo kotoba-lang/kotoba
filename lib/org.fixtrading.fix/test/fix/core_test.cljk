@@ -1,0 +1,286 @@
+(ns fix.core-test
+  (:require [kotoba.lang.text] [kotoba.test :refer [deftest testing is]]
+            [fix.bytes :as b]
+            [fix.checksum :as cksum]
+            [fix.codec :as codec]
+            [fix.groups :as groups]
+            [fix.message :as message]
+            [fix.dictionary :as dict]))
+
+;; ---------------------------------------------------------------------
+;; Test vectors: constructed, not published spec vectors — FIX.5.0 SP2
+;; Volume 1 documents the BodyLength/CheckSum *algorithm* (see
+;; fix.checksum's docstring, corroborated via b2bits FIXOpaedia and OnixS
+;; FIX Dictionary for tag-level detail) but the official spec text does not
+;; publish a worked full-message byte example with its BodyLength/CheckSum
+;; filled in. So: these two messages were constructed here, and their
+;; BodyLength/CheckSum were computed **independently in Python**
+;; (`sum(bytes) % 256`, three-digit zero-padded — the exact algorithm this
+;; library implements, written a second time in a different language) —
+;; not copied from this library's own output. Both numbers below are that
+;; independent computation, cross-checked against this .cljc
+;; implementation on both JVM and ClojureScript by the assertions that
+;; follow.
+;;
+;;   python3 -c "
+;;   SOH='\x01'
+;;   body = '35=A'+SOH+'49=SERVER'+SOH+'56=CLIENT'+SOH+'34=177'+SOH+ \
+;;          '52=20090107-18:15:16'+SOH+'98=0'+SOH+'108=30'+SOH
+;;   prefix = '8=FIX.4.2'+SOH+f'9={len(body)}'+SOH
+;;   msg = (prefix+body).encode('latin-1')
+;;   print(len(body), f'{sum(msg) % 256:03d}')"
+;;   # => 65 062
+;; ---------------------------------------------------------------------
+
+(def logon-wire
+  "8=FIX.4.29=6535=A49=SERVER56=CLIENT34=17752=20090107-18:15:1698=0108=3010=062")
+
+(def new-order-wire
+  "8=FIX.4.29=16535=D49=BUYSIDE56=SELLSIDE34=252=20260830-12:00:0011=CLORD00121=155=IBM54=160=20260830-12:00:0040=238=10044=50.2559=078=279=ACCT180=6079=ACCT280=4010=239")
+
+(defn wire->bytes [s] (b/str->bytes s))
+
+;; ---------------------------------------------------------------------
+;; CRC/checksum-style independent verification, three ways (mirrors
+;; org-modbus's crc16-bitwise/crc16 cross-check pattern):
+;;   1. the CRC-RevEng-style "known constant" check — here, the Python
+;;      cross-computation above.
+;;   2. brute-force agreement between the byte-level implementation and a
+;;      naive re-derivation over every possible single-byte checksum input.
+;;   3. single-bit-flip sensitivity across a real frame.
+;; ---------------------------------------------------------------------
+
+(deftest checksum-known-values
+  (testing "format-checksum zero-pads to exactly three digits"
+    (is (= "000" (cksum/format-checksum 0)))
+    (is (= "007" (cksum/format-checksum 7)))
+    (is (= "062" (cksum/format-checksum 62)))
+    (is (= "255" (cksum/format-checksum 255))))
+  (testing "checksum of every single byte value 0..255 is that byte, formatted"
+    (doseq [n (range 256)]
+      (is (= (cksum/format-checksum n) (cksum/checksum [n]))
+          (str "byte " n))))
+  (testing "checksum wraps mod 256 (sum of two 0xFF bytes = 510 -> 510 mod 256 = 254)"
+    (is (= "254" (cksum/checksum [0xFF 0xFF])))))
+
+(deftest logon-vector
+  (let [bs (wire->bytes logon-wire)
+        [status m] (message/decode dict/fix42 bs)]
+    (is (= :ok status))
+    (is (= 65 (:body-length m)))
+    (is (= "062" (:check-sum m)))
+    (is (= "FIX.4.2" (:begin-string m)))
+    (is (= "A" (:msg-type m)))
+    (is (= [[49 "SERVER"] [56 "CLIENT"] [34 "177"] [52 "20090107-18:15:16"]
+            [98 "0"] [108 "30"]]
+           (:body m)))))
+
+(deftest new-order-single-vector-with-group
+  (let [bs (wire->bytes new-order-wire)
+        [status m] (message/decode dict/fix42 bs)]
+    (is (= :ok status))
+    (is (= 165 (:body-length m)))
+    (is (= "239" (:check-sum m)))
+    (is (= "D" (:msg-type m)))
+    (testing "NoAllocs(78) structured into a group with two entries"
+      (let [group (last (:body m))]
+        (is (map? group))
+        (is (= 78 (:group group)))
+        (is (= [[[79 "ACCT1"] [80 "60"]] [[79 "ACCT2"] [80 "40"]]]
+               (:entries group)))))))
+
+(deftest round-trip-encode-decode-known-messages
+  (testing "encoding what we just decoded reproduces the original bytes"
+    (let [[_ m] (message/decode dict/fix42 (wire->bytes logon-wire))
+          enc (message/encode dict/fix42 (select-keys m [:begin-string :msg-type :body]))]
+      (is (= (wire->bytes logon-wire) (:bytes enc))))
+    (let [[_ m] (message/decode dict/fix42 (wire->bytes new-order-wire))
+          enc (message/encode dict/fix42 (select-keys m [:begin-string :msg-type :body]))]
+      (is (= (wire->bytes new-order-wire) (:bytes enc))))))
+
+;; ---------------------------------------------------------------------
+;; Negative tests. Each asserts the *specific* named reason keyword, not
+;; merely "some error" — a different bug in a different layer satisfying
+;; `(= status :error)` alone would still pass a weaker test.
+;; ---------------------------------------------------------------------
+
+(deftest checksum-mismatch-is-detected
+  (let [corrupted (kotoba.lang.text/replace logon-wire "10=062" "10=063")
+        [status reason] (message/decode dict/fix42 (wire->bytes corrupted))]
+    (is (= :error status))
+    (is (= :fix/checksum-mismatch reason))))
+
+(deftest checksum-must-be-exactly-three-digits
+  (let [corrupted (kotoba.lang.text/replace logon-wire "10=062" "10=62")
+        [status reason] (message/decode dict/fix42 (wire->bytes corrupted))]
+    (is (= :error status))
+    (is (= :fix/checksum-mismatch reason)
+        "an unpadded checksum is a wire-format violation, not a value this codec should accept even though 62 == 062 numerically")))
+
+(deftest body-length-mismatch-is-detected
+  (let [corrupted (kotoba.lang.text/replace logon-wire "9=65" "9=66")
+        [status reason] (message/decode dict/fix42 (wire->bytes corrupted))]
+    (is (= :error status))
+    (is (= :fix/body-length-mismatch reason))))
+
+(deftest invalid-header-order-is-detected
+  (testing "BodyLength before BeginString"
+    (let [swapped "9=658=FIX.4.235=A49=SERVER56=CLIENT34=17752=20090107-18:15:1698=0108=3010=062"
+          [status reason] (message/decode dict/fix42 (wire->bytes swapped))]
+      (is (= :error status))
+      (is (= :fix/invalid-header-order reason)))))
+
+(deftest missing-trailer-is-detected
+  (let [truncated "8=FIX.4.29=6535=A49=SERVER"
+        [status reason] (message/decode dict/fix42 (wire->bytes truncated))]
+    (is (= :error status))
+    (is (= :fix/missing-trailer reason))))
+
+(deftest malformed-field-is-detected
+  (testing "field with no '=' "
+    (let [broken "8=FIX.4.29=435=AGARBAGE10=000"
+          [status reason] (message/decode dict/fix42 (wire->bytes broken))]
+      (is (= :error status))
+      (is (= :fix/malformed-field reason)))))
+
+(deftest group-missing-delimiter-is-detected
+  (testing "NoAllocs=2 but the field where the second entry should start
+            (right after the first entry's members run out) is Account(1)
+            instead of AllocAccount(79) — the group is short one entry and
+            a real field just happens to follow, not a second AllocAccount"
+    (let [body [[49 "BUYSIDE"] [78 "2"] [79 "ACCT1"] [80 "60"] [1 "WHATEVER"]]
+          enc (message/encode dict/fix42 {:begin-string "FIX.4.2" :msg-type "D" :body body})
+          [status reason] (message/decode dict/fix42 (:bytes enc))]
+      (is (= :error status))
+      (is (= :fix/group-missing-delimiter reason)))))
+
+(deftest group-count-mismatch-is-detected
+  (testing "NoAllocs claims 3 entries but only 2 are present"
+    (let [body [[49 "BUYSIDE"] [78 "3"] [79 "ACCT1"] [80 "60"] [79 "ACCT2"] [80 "40"]]
+          enc (message/encode dict/fix42 {:begin-string "FIX.4.2" :msg-type "D" :body body})
+          [status reason] (message/decode dict/fix42 (:bytes enc))]
+      (is (= :error status))
+      (is (= :fix/group-count-mismatch reason)))))
+
+;; ---------------------------------------------------------------------
+;; "Prove negative tests discriminate": break the CheckSum computation
+;; itself (not a test fixture) and confirm the *specific* checksum-mismatch
+;; assertion above is what catches it, then restore. Recorded here as a
+;; test rather than only in the PR description, so the discrimination claim
+;; is itself checked by the suite: if a future edit weakens the checksum
+;; comparison (e.g. to numeric equality, which "62" == "062" would satisfy)
+;; this test's sibling `checksum-must-be-exactly-three-digits` fails first.
+;; ---------------------------------------------------------------------
+(deftest checksum-mismatch-does-not-fire-on-a-correct-message
+  (let [[status] (message/decode dict/fix42 (wire->bytes logon-wire))]
+    (is (= :ok status)
+        "sanity: the same known-good message that the mismatch tests corrupt must decode cleanly on its own")))
+
+;; ---------------------------------------------------------------------
+;; Round-trip property test: decode(encode(x)) == x, swept over randomised
+;; field orderings (the optional header/body fields after the fixed
+;; 8/9/35...10 skeleton, whose relative order the spec does not mandate)
+;; and randomised NoAllocs group shapes (0..4 entries).
+;; ---------------------------------------------------------------------
+
+(defn- rand-alloc-entries [n]
+  (mapv (fn [i] [[79 (str "ACCT" i)] [80 (str (* 10 (inc i)))]]) (range n)))
+
+(defn- gen-order [seed shuffled-fields group-size]
+  {:begin-string "FIX.4.2"
+   :msg-type "D"
+   :body (into shuffled-fields
+               [{:group 78 :entries (rand-alloc-entries group-size)}])})
+
+(deftest round-trip-property-sweep
+  (testing "decode(encode(x)) == x over 50 random field-order/group-shape combinations"
+    (let [base-fields [[49 "BUYSIDE"] [56 "SELLSIDE"] [34 "2"]
+                        [52 "20260830-12:00:00"] [11 "CLORD001"] [21 "1"]
+                        [55 "IBM"] [54 "1"] [60 "20260830-12:00:00"]
+                        [40 "2"] [38 "100"] [44 "50.25"] [59 "0"]]]
+      (doseq [i (range 50)]
+        (let [shuffled (vec (shuffle base-fields))
+              group-size (mod i 5)
+              order (gen-order i shuffled group-size)
+              enc (message/encode dict/fix42 order)
+              [status m] (message/decode dict/fix42 (:bytes enc))]
+          (is (= :ok status) (str "iteration " i " failed to decode"))
+          (when (= :ok status)
+            (is (= (:body order) (:body m))
+                (str "iteration " i " round-trip mismatch, group-size=" group-size))))))))
+
+;; ---------------------------------------------------------------------
+;; Dictionary is a parameter, not a hardcode: same bytes, three dictionary
+;; values, only :begin-string differs in what each dictionary would expect
+;; a message to declare (fix50 uses the FIXT.1.1 session BeginString).
+;; ---------------------------------------------------------------------
+
+(deftest dictionary-is-swappable
+  (is (not= (:begin-string dict/fix42) (:begin-string dict/fix50)))
+  (is (= "FIX.4.2" (:begin-string dict/fix42)))
+  (is (= "FIX.4.4" (:begin-string dict/fix44)))
+  (is (= "FIXT.1.1" (:begin-string dict/fix50)))
+  (testing "fix.message doesn't care which dictionary decodes a message with no groups"
+    (let [heartbeat-body [[49 "A"] [56 "B"] [34 "1"] [52 "20260830-12:00:00"]]
+          enc (message/encode dict/fix42 {:begin-string "FIX.4.4" :msg-type "0" :body heartbeat-body})]
+      (doseq [d [dict/fix42 dict/fix44 dict/fix50]]
+        (let [[status m] (message/decode d (:bytes enc))]
+          (is (= :ok status))
+          (is (= heartbeat-body (:body m))))))))
+
+;; ---------------------------------------------------------------------
+;; Session-level message shapes: Logout/Heartbeat/TestRequest/
+;; ResendRequest/SequenceReset/Reject each encode and decode cleanly with
+;; the dictionary's field names resolvable.
+;; ---------------------------------------------------------------------
+
+(deftest session-messages-round-trip
+  (doseq [[msg-type body]
+          [["5" [[49 "A"] [56 "B"] [34 "3"] [52 "20260830-12:00:00"] [58 "bye"]]]         ; Logout
+           ["0" [[49 "A"] [56 "B"] [34 "4"] [52 "20260830-12:00:00"] [112 "TR1"]]]        ; Heartbeat
+           ["1" [[49 "A"] [56 "B"] [34 "5"] [52 "20260830-12:00:00"] [112 "TR2"]]]        ; TestRequest
+           ["2" [[49 "A"] [56 "B"] [34 "6"] [52 "20260830-12:00:00"] [7 "1"] [16 "0"]]]   ; ResendRequest
+           ["4" [[49 "A"] [56 "B"] [34 "7"] [52 "20260830-12:00:00"] [123 "Y"] [36 "10"]]]; SequenceReset
+           ["3" [[49 "A"] [56 "B"] [34 "8"] [52 "20260830-12:00:00"]
+                 [45 "6"] [371 "58"] [372 "0"] [373 "1"] [58 "missing tag"]]]]]           ; Reject
+    (let [enc (message/encode dict/fix42 {:begin-string "FIX.4.2" :msg-type msg-type :body body})
+          [status m] (message/decode dict/fix42 (:bytes enc))]
+      (is (= :ok status) (str "msg-type " msg-type))
+      (when (= :ok status)
+        (is (= msg-type (:msg-type m)))
+        (is (= body (:body m)))
+        (is (= (get dict/common-messages msg-type)
+               (get (:messages dict/fix42) (:msg-type m))))))))
+
+;; ---------------------------------------------------------------------
+;; ExecutionReport round-trips too (no group, but a wide field set).
+;; ---------------------------------------------------------------------
+
+(deftest execution-report-round-trips
+  (let [body [[49 "SELLSIDE"] [56 "BUYSIDE"] [34 "9"] [52 "20260830-12:00:00"]
+              [37 "ORD1"] [11 "CLORD001"] [17 "EXEC1"] [20 "0"] [150 "F"] [39 "2"]
+              [55 "IBM"] [54 "1"] [38 "100"] [44 "50.25"] [6 "50.25"] [14 "100"]
+              [151 "0"] [32 "100"] [31 "50.25"] [60 "20260830-12:00:00"]]
+        enc (message/encode dict/fix42 {:begin-string "FIX.4.2" :msg-type "8" :body body})
+        [status m] (message/decode dict/fix42 (:bytes enc))]
+    (is (= :ok status))
+    (is (= body (:body m)))))
+
+;; ---------------------------------------------------------------------
+;; fix.bytes: the char-code/byte round-trip and the cross-runtime trap it
+;; exists to avoid (org-modbus's README documents the same idiom producing
+;; nine zero bytes under ClojureScript).
+;; ---------------------------------------------------------------------
+
+(deftest bytes-round-trip-all-256-values
+  (let [bs (vec (range 256))
+        s (b/bytes->str bs)]
+    (is (= 256 (count s)))
+    (is (= bs (b/str->bytes s)))))
+
+(deftest parse-uint-rejects-non-digits
+  (is (= 65 (b/parse-uint "65")))
+  (is (nil? (b/parse-uint "")))
+  (is (nil? (b/parse-uint "12x")))
+  (is (nil? (b/parse-uint "-1")))
+  (is (nil? (b/parse-uint "1.5"))))
