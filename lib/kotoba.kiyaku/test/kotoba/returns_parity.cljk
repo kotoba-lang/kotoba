@@ -1,0 +1,131 @@
+#!/usr/bin/env kbb
+;; Differential parity: `kiyaku.returns` (the .cljc that ships today) against
+;; `kotoba/returns_core.kotoba` compiled to restricted ESM.
+;;
+;; Both sides RUN. The oracle is not a table of remembered answers -- it is the
+;; namespace itself, required from this repo's own src with its siblings on the
+;; classpath -- and the port is not the source, it is the artifact amu emitted.
+;; A test that compared the port against hand-written expectations would agree
+;; with whatever the author believed on the day.
+;;
+;; Two differences are INTENDED and asserted as such rather than smoothed over:
+;;
+;;   * a refused transition is `nil` in the .cljc and
+;;     `{:error :transition/not-allowed}` from the port. Kotoba has no nil, and
+;;     the ok/err arms are what make a caller handle the refusal. The .cljc
+;;     idiom for the same thing is `(or (transition r to) r)` -- which is in
+;;     kiyaku.events today, and which silently keeps the old status.
+;;   * money is :i64 in the port. Only integer cases are compared; a decimal
+;;     price is a value-shape question for the whole ledger.
+;;
+;; Exit codes: 0 passed, 1 failed, 2 REFUSED (the tools or the sibling
+;; checkouts needed to answer are missing -- which is not a pass).
+;;
+;;   kbb --backend sci --classpath "src:../chobo/src:../text/src" test/kotoba/returns_parity.cljk
+
+(ns kotoba.returns-parity
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kiyaku.returns :as oracle]))
+
+(def script
+  (or (first (filter (fn [a] (.endsWith a ".cljk")) (rest (.slice js/process.argv 0))))
+      "lib/kotoba.kiyaku/test/kotoba/returns_parity.cljk"))
+(def repo-root (path/resolve (path/dirname (path/resolve script)) ".." ".."))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check! [label expected actual]
+  (swap! checks inc)
+  (when-not (= expected actual)
+    (swap! failures inc)
+    (println "  FAIL" label "\n    oracle:" (pr-str expected) "\n    port:  " (pr-str actual))))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8" :timeout 900000})]
+    {:exit (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+;; The corpus. Every case is a return the .cljc can be handed today, and the
+;; last three exist because a comparison with no boundary in it is not testing
+;; the comparison: zero quantity beside one, a zero unit price beside a
+;; negative one, and a status on each side of every allowed edge.
+(def returns
+  [{:id "empty" :status :requested :items []}
+   {:id "two-lines" :status :received
+    :items [{:sku "a" :qty 2 :unit-price 100}
+            {:sku "b" :qty 1 :unit-price 50}]}
+   {:id "damaged" :status :received
+    :items [{:sku "a" :qty 2 :unit-price 100}
+            {:sku "b" :qty 1 :unit-price 50 :damaged true}
+            {:sku "c" :qty 3 :unit-price 10 :final-sale true}]}
+   {:id "price-fallback" :status :received
+    :items [{:sku "a" :qty 3 :price 40}]}
+   {:id "no-qty" :status :received :items [{:sku "a" :unit-price 40}]}
+   {:id "zero-qty" :status :received
+    :items [{:sku "a" :qty 0 :unit-price 40} {:sku "b" :qty 1 :unit-price 40}]}
+   {:id "zero-price" :status :received
+    :items [{:sku "a" :qty 9 :unit-price 0} {:sku "b" :qty 1 :unit-price -5}]}
+   {:id "no-status" :items [{:sku "a" :qty 1 :unit-price 7}]}
+   {:id "shipped" :status :shipped :items [{:sku "a" :qty 1 :unit-price 7}]}
+   {:id "refunded" :status :refunded :items []}
+   {:id "rejected" :status :rejected :items []}])
+
+(def targets [:approved :rejected :shipped :received :refunded])
+
+(defn main []
+  (when-not (zero? (:exit (sh "kotoba" ["--help"])))
+    (println "REFUSED: the kotoba CLI is not runnable here (measured by running it)")
+    (js/process.exit 2))
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) "kiyaku-parity-"))
+        out (path/join dir "returns_core.mjs")
+        c (sh "kotoba" ["-M" "compile" (path/join repo-root "kotoba" "returns_core.kotoba")
+                        "--target" "js" "--output" out])]
+    (when-not (zero? (:exit c))
+      (println "compile failed:" (:err c))
+      (js/process.exit 1))
+    (-> (js/import out)
+        (.then
+         (fn [mod]
+           (let [call (fn [export & args]
+                        ;; a fresh instance per call: fuel is spent, not renewed
+                        (let [inst (.instantiateKotoba mod)]
+                          (edn/read-string (.apply (aget inst export) inst (clj->js args)))))]
+             (doseq [r returns]
+               (let [text (pr-str r)]
+                 (check! (str "total-return-qty " (:id r))
+                         (oracle/total-return-qty r) (call "qty-text" text))
+                 (check! (str "total-refund-amount " (:id r))
+                         (oracle/total-refund-amount r) (call "total-refund-text" text))
+                 (check! (str "restock-items " (:id r))
+                         (oracle/restock-items r) (call "restock-text" text))
+                 (doseq [to targets]
+                   (let [expected (oracle/transition r to)
+                         actual (call "transition-text" text (pr-str to))]
+                     (check! (str "transition " (:id r) " -> " to)
+                             (if (nil? expected)
+                               ;; the intended difference, spelled out
+                               {:error :transition/not-allowed}
+                               (select-keys expected [:id :status]))
+                             (if (:error actual) actual (select-keys actual [:id :status])))))
+                 (let [expected (oracle/refund-with-restock r)
+                       actual (call "refund-text" text)]
+                   (check! (str "refund-with-restock " (:id r))
+                           (if (nil? expected)
+                             {:error :transition/not-allowed}
+                             (select-keys expected [:status :refund-amount :restock-items]))
+                           (if (:error actual)
+                             actual
+                             (select-keys actual [:status :refund-amount :restock-items]))))))
+             (println (str "SCANNED\t" @checks))
+             (println (if (zero? @failures)
+                        (str "kiyaku.returns parity: " @checks "/" @checks
+                             " agree between the .cljc and the emitted ESM")
+                        (str "kiyaku.returns parity: " (- @checks @failures) "/" @checks " DISAGREE")))
+             (js/process.exit (if (zero? @failures) 0 1)))))
+        (.catch (fn [e] (println "ERROR" (str e)) (js/process.exit 1))))))
+
+(main)

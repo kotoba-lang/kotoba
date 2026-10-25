@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.kiyaku` | `kotoba.kiyaku/src` | `kiyaku.account`, `kiyaku.events`, `kiyaku.projection`, `kiyaku.return-analytics` (Kotoba project library) |
 | `kotoba.mise` | `kotoba.mise/src` | `mise.billing`, `mise.cart`, `mise.catalog`, `mise.checkout` (Kotoba project library) |
 | `kotoba.kessai` | `kotoba.kessai/src` | `kotoba.kessai`, `kotoba.kessai.card`, `kotoba.kessai.redirect`, `kotoba.kessai.wire` (Kotoba project library) |
 | `kotoba.kakeibo` | `kotoba.kakeibo/src` | `kakeibo.accounting`, `kakeibo.amount`, `kakeibo.category`, `kakeibo.core` (Kotoba project library) |
