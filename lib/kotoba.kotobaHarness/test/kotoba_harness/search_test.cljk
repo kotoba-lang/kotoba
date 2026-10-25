@@ -1,0 +1,102 @@
+(ns kotoba-harness.search-test
+  (:require [cljs.test :refer [deftest is async]] [clojure.edn :as edn]
+            [kotoba-harness.catalog :as c] [kotoba-harness.search :as s]))
+(def fs (js/require "node:fs"))
+(def project (edn/read-string (.readFileSync fs "lib/kotoba.kotobaHarness/projects/itonami.edn" "utf8")))
+(def program (c/compile-program (:program project)))
+
+(defn scripted [script requests]
+  (let [left (atom script)]
+    (fn [{:keys [criteria] :as req}]
+      (swap! requests conj req)
+      (let [choice (first @left)]
+        (swap! left rest)
+        (when-not (contains? criteria choice) (throw (ex-info (str "script choice not offered: " choice) {:offered (keys criteria)})))
+        (js/Promise.resolve {:choice choice :confidence 0.9
+                             :probabilities (into {} (map (fn [k] [k (if (= k choice) 1 0)]) (keys criteria)))})))))
+
+(def correct {"account-left" "(max 0 (- 3 used))" "admit" "(if (< 0 (account-left account-used)) (< service-used 100) false)"})
+(defn fake-verify [bodies]
+  (js/Promise.resolve {:passed (every? (fn [[k v]] (= v (get correct k))) bodies) :failures (if (every? (fn [[k v]] (= v (get correct k))) bodies) "0" "3")}))
+
+(deftest stop-escalates-to-the-outermost-choice
+  ;; Reproduces the 2026-10-07 itonami refusal: the policy picks subtract as the
+  ;; outermost operation, verification fails, and it answers stop at the leaf.
+  ;; Chronological retry refused there; escalation reaches the root.
+  (async done
+    (let [requests (atom []) audit (atom []) attempts (atom [])
+          script ["subtract" "literal-three" "argument-used"      ; wrong root, rejected
+                  "stop" "stop"                                   ; leaf, then literal-three: escalate
+                  "maximum" "literal-zero" "subtract" "literal-three" "argument-used"
+                  "if-bool" "less-than" "literal-zero" "call-account-left" "argument-account-used"
+                  "less-than" "argument-service-used" "literal-one-hundred" "literal-false"]]
+      (-> (s/run! program (scripted script requests) fake-verify {} audit attempts)
+          (.then (fn [r]
+                   (is (= correct (:bodies r)))
+                   (is (= [:verification-failed :stop-escalation :stop-escalation] (keep :event @audit)))
+                   (is (= ["argument-used" "literal-three" "subtract"] (keep :rewound-to @audit)))
+                   (is (= 3 (count @attempts)))
+                   ;; the rejected assembly is shown to the policy afterwards
+                   (is (re-find #"\(- 3 used\)" (:state (last @requests))))
+                   ;; frozen stage-1 body is shown, not re-assembled
+                   (is (re-find #"verified-functions \{\"account-left\" \"\(max 0 \(- 3 used\)\)\"" (:state (last @requests))))))
+          (.catch (fn [e] (is false (str e (pr-str (ex-data e))))))
+          (.finally done)))))
+
+(deftest exhausted-search-refuses
+  (async done
+    (let [only-stops (repeat 50 "stop")]
+      (-> (s/run! program (scripted only-stops (atom [])) fake-verify {} (atom []) (atom []))
+          (.then (fn [_] (is false "expected refusal")))
+          (.catch (fn [e] (is (= :search-exhausted (:reason (c/refusal e))))))
+          (.finally done)))))
+
+(deftest admission-requires-the-distribution-winner
+  (let [choices [{:id "a"} {:id "b"}]]
+    (is (= {:id "a"} (s/admit choices {:choice "a" :confidence 0.6 :probabilities {"a" 0.6 "b" 0.4}})))
+    (is (thrown? js/Error (s/admit choices {:choice "b" :confidence 0.4 :probabilities {"a" 0.6 "b" 0.4}})))
+    (is (thrown? js/Error (s/admit choices {:choice "a" :confidence 0.6 :probabilities {"a" 0.6}})))
+    ;; two-decimal rounding as Jev reports it (observed 0.55 0.33 0.02 0 0.09 = 0.99)
+    (is (= {:id "a"} (s/admit choices {:choice "a" :confidence 0.6 :probabilities {"a" 0.6 "b" 0.39}})))
+    (is (thrown? js/Error (s/admit choices {:choice "a" :confidence 0.6 :probabilities {"a" 0.6 "b" 0.3}})))
+    (is (thrown? js/Error (s/admit choices {:choice "c" :confidence 0.6 :probabilities {"a" 0.6 "b" 0.4}})))))
+
+(deftest catalog-refusals-and-splice
+  (is (thrown? js/Error (c/compile-program (assoc-in (:program project) [:stages 0 :operations] ["filterv"]))))
+  (is (thrown? js/Error (c/compile-program (assoc-in (:program project) [:stages 0 :calls] ["admit"]))))
+  (is (thrown? js/Error (c/compile-program (assoc-in (:program project) [:functions 0 :returns] :string))))
+  (let [out (c/splice program (:baseline project) correct)]
+    (is (= (count (:baseline project)) (- (count out) (- (count (apply str (vals correct))) (count "0false")))))
+    (is (re-find #"\(defn marker \[\] :i64 7\)" out))
+    (is (thrown? js/Error (c/splice program "(ns x)\n" correct))))
+  (let [state {:bodies {"account-left" (c/hole :i64 0)}} target (c/first-hole program state)]
+    (is (= #{"argument-used" "literal-zero" "literal-three" "literal-one-hundred" "subtract" "maximum"}
+           (set (map :id (c/candidates program target)))))
+    (is (thrown? js/Error (c/apply-choice program state target {:id "less-than"})))))
+
+(deftest without-escalation-stop-refuses
+  (async done
+    (-> (s/run! program (scripted ["subtract" "literal-three" "argument-used" "stop"] (atom [])) fake-verify {:escalate? false} (atom []) (atom []))
+        (.then (fn [_] (is false "expected refusal")))
+        (.catch (fn [e] (is (= :policy-stopped (:reason (c/refusal e))))))
+        (.finally done))))
+
+(deftest siblings-in-one-stage-are-verified-separately
+  ;; Two functions share a stage. A wrong first function is rejected and
+  ;; repaired before the second is assembled, so backtracking never works on
+  ;; the sibling that was not at fault.
+  (async done
+    (let [p (c/compile-program {:goal "g" :stages [{:id "s" :goal "g" :operations ["less-than"] :calls [] :depends-on []}]
+                                :functions [{:id "a" :stage "s" :goal "x < y" :args [{:name "x" :type :i64} {:name "y" :type :i64}] :returns :bool}
+                                            {:id "b" :stage "s" :args [{:name "x" :type :i64} {:name "y" :type :i64}] :returns :bool}]
+                                :literals [] :max-decisions 32 :max-depth 3 :candidate-limit 8})
+          want {"a" "(< x y)" "b" "(< y x)"} requests (atom []) attempts (atom [])
+          verify (fn [bodies] (js/Promise.resolve {:passed (every? (fn [[k v]] (= v (want k))) bodies) :failures "1"}))]
+      (-> (s/run! p (scripted ["less-than" "argument-y" "argument-x" "stop" "argument-x" "argument-y"
+                               "less-than" "argument-y" "argument-x"] requests) verify {} (atom []) attempts)
+          (.then (fn [r]
+                   (is (= want (:bodies r)))
+                   (is (= [["a" #{"a"}] ["a" #{"a"}] ["b" #{"a" "b"}]] (mapv (juxt :function (comp set keys :bodies)) @attempts)))
+                   (is (re-find #":function-goal \"x < y\"" (:state (first @requests))))))
+          (.catch (fn [e] (is false (str e (pr-str (c/refusal e))))))
+          (.finally done)))))
