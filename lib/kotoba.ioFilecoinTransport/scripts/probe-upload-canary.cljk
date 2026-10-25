@@ -1,0 +1,108 @@
+#!/usr/bin/env kbb
+;; Bounded public-byte provider transfer canary. No wallet, contract, or funds.
+;; Upload alone is temporary provider custody, not a storage deal.
+(ns probe-upload-canary
+  (:require ["@filoz/synapse-core/chains" :as chains]
+            ["@filoz/synapse-core/sp-registry" :as registry]
+            ["viem" :as viem]
+            [filecoin.cloud.piece :as piece]
+            [filecoin.cloud.provider :as provider]
+            [filecoin.protocols :as p]
+            [filecoin.transport :as transport]))
+
+(def provider-name "ezpdpz-main2")
+(def canary-file (aget (.-env js/process) "FILECOIN_CANARY_FILE"))
+(def bytes
+  (if canary-file
+    (let [expected-sha (aget (.-env js/process) "FILECOIN_CANARY_SHA256")
+          expected-cid (aget (.-env js/process) "FILECOIN_CANARY_PIECE_CID")]
+      (when-not (and expected-sha expected-cid)
+        (throw (ex-info "file canary requires its expected SHA-256 and PieceCID" {})))
+      (let [fs (js/require "node:fs")
+            size (.-size (.statSync fs canary-file))
+            _ (when (> size 4194304)
+                (throw (ex-info "file canary exceeds 4 MiB probe ceiling" {})))
+            raw (.readFileSync fs canary-file)
+            sha (-> (.createHash (js/require "node:crypto") "sha256")
+                    (.update raw) (.digest "hex"))
+            payload (vec (seq raw))]
+        (when-not (= expected-sha sha)
+          (throw (ex-info "file canary SHA-256 differs" {})))
+        (provider/check-size! (count payload))
+        (when-not (= expected-cid (:cid (piece/calculate payload)))
+          (throw (ex-info "file canary PieceCID differs" {})))
+        payload))
+    (mapv #(mod (+ % 138) 256) (range 127))))
+(def cid (:cid (piece/calculate bytes)))
+(def http (transport/http {:timeout-ms 30000}))
+
+(defn- provider-url []
+  (let [client (viem/createPublicClient
+                (clj->js {:chain chains/mainnet :transport (viem/http)}))]
+    (.then (registry/getPDPProviders client)
+           (fn [result]
+             (let [entry (first (filter #(= provider-name (aget % "name"))
+                                        (array-seq (aget result "providers"))))
+                   url (some-> entry (aget "pdp") (aget "serviceURL"))]
+               (when-not (and (string? url) (.startsWith url "https://"))
+                 (throw (ex-info "selected provider has no HTTPS service URL"
+                                 {:provider provider-name})))
+               url)))))
+
+(defn- check-retrieval [url attempt]
+  (-> (p/request http (provider/get-piece-request (provider/piece-url url cid)))
+      (.then (fn [response]
+               (let [body (vec (seq (:body response)))
+                     check (when (= 200 (:status response))
+                             (provider/verify-bytes cid body))]
+                 (cond
+                   (and (= 200 (:status response)) (:ok? check))
+                   (do (println "PASS provider-byte-roundtrip"
+                                provider-name "bytes=" (count body) "cid=" cid)
+                       true)
+
+                   (and (< attempt 5) (#{202 404} (:status response)))
+                   (js/Promise.
+                    (fn [resolve reject]
+                      (js/setTimeout
+                       (fn [] (-> (check-retrieval url (inc attempt))
+                                  (.then resolve) (.catch reject))) 3000)))
+
+                   :else
+                   (throw (ex-info "provider did not return verified canary bytes"
+                                   {:status (:status response)
+                                    :bytes (when body (count body))
+                                    :attempt attempt
+                                    :cid-match (:ok? check)}))))))))
+
+(defn- upload [url]
+  (-> (p/request http (provider/begin-upload-request url cid))
+      (.then (fn [response]
+               (let [{:keys [next upload-id] :as decision}
+                     (provider/begin-upload-response response)]
+                 (case next
+                   :already-present (do (println "provider already has canary")
+                                        (check-retrieval url 0))
+                   :upload (-> (p/request http (provider/send-bytes-request
+                                                 url upload-id bytes))
+                               (.then (fn [result]
+                                        (when-not (<= 200 (:status result) 299)
+                                          (throw (ex-info "provider rejected byte PUT"
+                                                          {:status (:status result)})))
+                                        (println "provider accepted byte PUT"
+                                                 "status=" (:status result))
+                                        (check-retrieval url 0))))
+                   (throw (ex-info "provider refused upload ticket" decision))))))))
+
+(-> (provider-url)
+    (.then (fn [url]
+             (println "provider=" provider-name "cid=" cid "bytes=" (count bytes))
+             (-> (p/request http (provider/ping-request url))
+                 (.then (fn [response]
+                          (when-not (:alive? (provider/ping-response response))
+                            (throw (ex-info "provider ping failed"
+                                            {:status (:status response)})))
+                          (upload url))))))
+    (.catch (fn [error]
+              (println "REFUSED" (str error))
+              (set! (.-exitCode js/process) 2))))

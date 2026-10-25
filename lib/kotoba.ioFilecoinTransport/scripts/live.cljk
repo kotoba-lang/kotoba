@@ -1,0 +1,172 @@
+#!/usr/bin/env kbb
+;; Talk to Filecoin mainnet, for real.
+;;
+;; Every check here is **read-only**: `ChainHead`, `StateGetActor`,
+;; `MpoolGetNonce`, `GasEstimateMessageGas` and `StateCall`. None of them
+;; needs a key, none of them costs anything, and none of them puts a byte on
+;; chain — `StateCall` executes a message against current state and throws
+;; the result away.
+;;
+;; That is enough to close the sentence every README in this family carries:
+;; "no live request has ever been made from this code". The last check is the
+;; interesting one — it runs an FEVM contract call built by
+;; `filecoin.cloud.evm`, against the real PDPVerifier at its real mainnet
+;; address, and decodes the answer. Passing it means the method number, the
+;; CBOR params wrapper, the f410f addressing, the function selector and the
+;; ABI decoding are all right *together*, which no offline test can show.
+;;
+;;   npm run live
+(ns live
+  (:require [filecoin.client :as client]
+            [filecoin.cloud.chain :as chain]
+            [filecoin.cloud.evm :as evm]
+            [filecoin.cloud.pdp :as pdp]
+            [filecoin.message :as msg]
+            [filecoin.protocols :as p]
+            [filecoin.signature :as sig]
+            [filecoin.signer :as signer]
+            [filecoin.transport :as transport]))
+
+(def endpoint (:rpc (chain/chain :mainnet)))
+(def http (transport/http))
+
+;; An address with a long history, taken from this family's own mainnet
+;; vectors. Read-only: we ask the network about it, we do not act as it.
+(def observed-account "f12rtnjcyf7h2xobmhtblat7usff7fjqu4crcob5q")
+
+(def results (atom []))
+
+(defn- check [label p]
+  (-> (p)
+      (.then (fn [v] (swap! results conj [:ok label v]) (println "  ok  " label "→" (pr-str v))))
+      (.catch (fn [e] (swap! results conj [:fail label (str e)])
+                (println "  FAIL" label "→" (str e))))))
+
+(def calibration (:rpc (chain/chain :calibration)))
+
+(def probe-key
+  "A fixed, obviously-a-test private key. Deterministic so the run is
+  reproducible, and never used for anything but this — the balance is checked
+  before the push, so a key that somehow held funds would abort rather than
+  spend them."
+  "00000000000000000000000000000000000000000000000000000000feedface")
+
+(defn- push-and-catch
+  "Push `signed` to calibration and return what the node said. A rejection is
+  the expected outcome, so the error text is the result."
+  [signed]
+  (-> (client/push http calibration signed)
+      (.then (fn [cid] {:accepted cid}))
+      (.catch (fn [e] {:error (str (or (:body (ex-data e)) e))}))))
+
+(defn- corrupt
+  "Flip a bit in the middle of the signature. Still 65 bytes, still a
+  well-formed ECDSA signature — it just recovers to a different key."
+  [signed]
+  (let [data (vec (:data (:signature signed)))
+        i 10]
+    (assoc signed :signature
+           (sig/signature (:type (:signature signed))
+                          (assoc data i (bit-xor (nth data i) 0x01))))))
+
+(defn- probe-write
+  "Establish, from the node rather than from reading lotus, that a signature
+  produced here is accepted by a real implementation.
+
+  Nothing is spent and nothing lands. The account is empty — checked first —
+  so both messages are rejected; the question is *where*. lotus validates in
+  `Add` as checkMessage → ValidForBlockInclusion → VerifyMsgSig, and only
+  afterwards looks the sender's actor up. So:
+
+    correct signature   → rejected past VerifyMsgSig (an actor/state error)
+    corrupted signature → rejected AT VerifyMsgSig
+
+  Two different errors is the evidence. One error, or the same error twice,
+  would mean the signature was never checked and the run proves nothing."
+  []
+  (let [from (signer/address-string probe-key :testnet)]
+    (-> (client/balance http calibration from)
+        (.then
+         (fn [bal]
+           (when-not (= "0" (str bal))
+             (throw (ex-info "probe: account is not empty, refusing to push"
+                             {:address from :balance bal})))
+           (let [m (msg/message {:to from :from from :value "0" :method 0
+                                 :nonce 0 :gas-limit 1000000
+                                 :gas-fee-cap "100000" :gas-premium "1000"})
+                 signed (signer/sign-message probe-key m)]
+             (-> (js/Promise.all
+                  #js [(push-and-catch signed) (push-and-catch (corrupt signed))])
+                 (.then
+                  (fn [[good bad]]
+                    (let [g (str (:error good)) b (str (:error bad))
+                          sig-error #(boolean (re-find #"(?i)signature" %))]
+                      (when (:accepted good)
+                        (throw (ex-info "probe: message was ACCEPTED — unexpected"
+                                        {:cid (:accepted good)})))
+                      (when (sig-error g)
+                        (throw (ex-info "probe: the node rejected OUR signature"
+                                        {:error g})))
+                      (when-not (sig-error b)
+                        (throw (ex-info "probe: a corrupted signature was NOT rejected as one — this run proves nothing"
+                                        {:error b})))
+                      {:address from
+                       :valid-signature (subs g 0 (min 90 (count g)))
+                       :corrupted-signature (subs b 0 (min 90 (count b)))
+                       :verdict "VerifyMsgSig ran and accepted ours"}))))))))))
+
+(defn -main []
+  (println "endpoint:" endpoint)
+  (-> (js/Promise.resolve nil)
+      (.then #(check "ChainHead height" (fn [] (client/height http endpoint))))
+      (.then #(check "StateNetworkName" (fn [] (client/network-name http endpoint))))
+      (.then #(check "MpoolGetNonce" (fn [] (client/nonce http endpoint observed-account))))
+      (.then #(check "WalletBalance (attoFIL)"
+                     (fn [] (client/balance http endpoint observed-account))))
+      (.then #(check "GasEstimateMessageGas"
+                     (fn []
+                       (-> (client/estimate-gas
+                            http endpoint
+                            {:to observed-account :from observed-account
+                             :value "1" :method 0 :nonce 0})
+                           (.then (fn [m] (select-keys m [:gas-limit :gas-fee-cap :gas-premium])))))))
+      ;; the one that exercises the whole stack
+      (.then #(check "PDPVerifier.getChallengeFinality() via StateCall"
+                     (fn []
+                       (client/read-contract
+                        http endpoint
+                        (evm/call-message :mainnet :pdp-verifier
+                                          (pdp/call :get-challenge-finality [])
+                                          {:from observed-account :nonce 0
+                                           :gas-limit 100000000
+                                           :gas-fee-cap "0" :gas-premium "0"})
+                        ["uint256"]))))
+      (.then #(check "PDPVerifier.getNextDataSetId() via StateCall"
+                     (fn []
+                       (client/read-contract
+                        http endpoint
+                        (evm/call-message :mainnet :pdp-verifier
+                                          (pdp/call :get-next-data-set-id [])
+                                          {:from observed-account :nonce 0
+                                           :gas-limit 100000000
+                                           :gas-fee-cap "0" :gas-premium "0"})
+                        ["uint256"]))))
+      ;; ── the write path, without writing ─────────────────────────────────
+      ;; lotus validates a pushed message in this order (chain/messagepool:
+      ;; checkMessage → ValidForBlockInclusion → VerifyMsgSig, and only later
+      ;; Add → checkBalance). So a correctly signed message from an account
+      ;; with **no funds** is rejected at the balance check — and that error
+      ;; is proof the signature was accepted.
+      ;;
+      ;; Nothing is spent because nothing can be: the balance is read first
+      ;; and the push is skipped unless it is exactly zero. Calibration
+      ;; rather than mainnet, because a probe belongs on a testnet.
+      (.then #(check "signature accepted by a real node (differential probe)"
+                     (fn [] (probe-write))))
+      (.then (fn [_]
+               (let [failed (filter #(= :fail (first %)) @results)]
+                 (println)
+                 (println (count @results) "checks," (count failed) "failed")
+                 (when (seq failed) (js/process.exit 1)))))))
+
+(-main)
