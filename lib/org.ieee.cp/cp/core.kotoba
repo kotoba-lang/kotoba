@@ -1,0 +1,287 @@
+;; cp -- POSIX cp (IEEE Std 1003.1), the single-source form.
+;;
+;;   cp SRC DST        copy SRC's contents to DST
+;;   cp SRC DIR        copy SRC into DIR, keeping its name
+;;
+;; ## The mode of a newly created destination
+;;
+;; /bin/cp gives a NEW destination the source's permissions, and the shape of
+;; that is not "the source's mode" -- it is the source's mode as open(2)
+;; renders it, which is `mode & ~umask`. Measured 2026-09-10 across five
+;; umasks and thirteen source modes, sixty-five rows, every one of them:
+;;
+;;   umask 022  src 777 -> 755      umask 077  src 755 -> 700
+;;   umask 022  src 666 -> 644      umask 002  src 777 -> 775
+;;   umask 022  src 755 -> 755      umask 027  src 711 -> 710
+;;
+;; So copying the source's mode verbatim would agree for 755, 700 and 600 and
+;; then silently hand out a world-writable file for a 666 or 777 source, which
+;; /bin/cp never does. The umask has to be applied, and the guest cannot read
+;; it -- there is no wire form that answers it.
+;;
+;; It can be MEASURED instead. The host's MKDIR form passes 0777 and lets the
+;; process umask apply, exactly as mkdir(1) does, so a directory created right
+;; now comes back at `0777 & ~umask` -- which is ~umask itself, in the nine
+;; bits that matter. The probe is created AT THE DESTINATION PATH, which has
+;; just been shown not to exist: no name is invented, so no name can collide,
+;; and if the parent will not take a directory it would not have taken the
+;; file either. It is removed before the copy is written. The same sixty-five
+;; measured rows are reproduced by `(source mode) AND (probe mode)`.
+;;
+;; Overwriting an EXISTING destination changes no mode at all, under either
+;; implementation, and not by luck: open(2) ignores its mode argument when the
+;; file already exists. So the probe and the chmod are skipped on that path --
+;; a 600 destination stays 600 even when the source is 755.
+;;
+;; ## The ceiling that is still here
+;;
+;; The content travels as a guest STRING, and the host validates every string
+;; result as canonical UTF-8. A file whose bytes are not valid UTF-8 therefore
+;; cannot cross the wire at all -- the copy TRAPS. It does not truncate and it
+;; does not write mangled bytes. `cp` is otherwise a byte copier, so this is a
+;; real restriction of domain and the README names it rather than hiding it
+;; behind a "text files only" note. A byte-typed result would close it.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :fs/browse (34),
+;; :io/write-error (39).
+(ns cp.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn spit-file [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat (string-concat path "WRITE_SEP") content)))
+
+(defn exists? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+;; "<mode> <size> <blocks> <isdir>" in DECIMAL, or "" when the path cannot be
+;; stat'ed. Only the mode is wanted here.
+(defn stat-answer [path :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path "STAT_SEP")))
+
+;; The mode goes the other way as OCTAL TEXT -- the wire is asymmetric, and
+;; the conversion below is why.
+(defn set-mode [path :string octal :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat (string-concat path "CHMOD_SEP") octal))
+            "1"))
+
+(defn make-dir [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "MKDIR_SEP"))
+            "1"))
+
+(defn remove-dir [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "RMDIR_SEP"))
+            "1"))
+
+(defn listing [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+;; --- numbers -------------------------------------------------------------
+;; Numbers cross the wire as text in both directions and there is no
+;; formatting builtin, so both conversions are written out here.
+(defn first-field [s :string] :string
+  (let [i (string-index-of s " ")]
+    (if (< i 0) s (string-substring s 0 i))))
+
+(defn decimal-value [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (decimal-value s (+ i 1) n
+                   (+ (* acc 10) (- (string-code-point-at s i) 48)))))
+
+;; -1 for "no answer": the empty result the stat form gives a path it cannot
+;; open. Distinguishing that from mode 0 is the whole point of returning a
+;; number that is not a mode.
+(defn mode-of [path :string] :i64
+  (let [field (first-field (stat-answer path))
+        n (string-byte-length field)]
+    (if (= n 0) -1 (decimal-value field 0 n 0))))
+
+(defn octal-digit-text [d :i64] :string
+  (string-substring "01234567" d (+ d 1)))
+
+;; Repeated division by 8, most significant digit first.
+(defn octal-of [n :i64] :string
+  (if (< n 8)
+    (octal-digit-text n)
+    (string-concat (octal-of (quot n 8))
+                   (octal-digit-text (- n (* 8 (quot n 8)))))))
+
+;; (n / place) mod 2, for place one of 1 2 4 ... 256.
+(defn bit-of [n :i64 place :i64] :i64
+  (- (quot n place) (* 2 (quot n (* 2 place)))))
+
+(defn and-at [a :i64 b :i64 place :i64] :i64
+  (* place (* (bit-of a place) (bit-of b place))))
+
+;; Bitwise AND of two nine-bit modes, one bit at a time. There is no bit-and
+;; on the wire and none is needed: the bits are reachable with quot.
+(defn mode-and [a :i64 b :i64 place :i64 acc :i64] :i64
+  (if (> place 256)
+    acc
+    (mode-and a b (* place 2) (+ acc (and-at a b place)))))
+
+;; --- paths ---------------------------------------------------------------
+;; There is no last-index-of on the wire, so the last separator is found by
+;; walking the first ones. Every offset here lands on a "/" , which is ASCII,
+;; so the substring bounds are code-point boundaries by construction.
+(defn last-slash [p :string from :i64 best :i64] :i64
+  (let [rest (string-substring p from (string-byte-length p))
+        i (string-index-of rest "/")]
+    (if (< i 0)
+      best
+      (last-slash p (+ from (+ i 1)) (+ from i)))))
+
+(defn parent-of [p :string] :string
+  (let [i (last-slash p 0 -1)]
+    (if (< i 0)
+      "."
+      (if (= i 0) "/" (string-substring p 0 i)))))
+
+(defn base-of [p :string] :string
+  (let [i (last-slash p 0 -1)]
+    (if (< i 0) p (string-substring p (+ i 1) (string-byte-length p)))))
+
+;; --- is this path a directory? ------------------------------------------
+;; The browse wire answers "NAME<TAB>D" per entry, so a path's own kind is
+;; read out of its PARENT's listing. The stat form could answer this directly
+;; now, but the browse walk is what `find` uses and it is what keeps the two
+;; commands reading the tree the same way.
+(defn line-flag [line :string name :string] :i64
+  (let [t (string-index-of line (tab))]
+    (if (< t 0)
+      -1
+      (if (string=? (string-substring line 0 t) name)
+        (if (string=? (string-substring line (+ t 1) (+ t 2)) "1") 1 0)
+        -1))))
+
+(defn flag-in [rest :string name :string] :i64
+  (let [n (string-byte-length rest)]
+    (if (= n 0)
+      -1
+      (let [i (string-index-of rest "\n")]
+        (if (< i 0)
+          (line-flag rest name)
+          (let [f (line-flag (string-substring rest 0 i) name)]
+            (if (>= f 0) f (flag-in (string-substring rest (+ i 1) n) name))))))))
+
+(defn dir-flag [p :string] :i64
+  (flag-in (listing (parent-of p)) (base-of p)))
+
+;; --- diagnostics ---------------------------------------------------------
+(defn no-such [path :string] :i64
+  (do (emit-error "cp: ")
+      (emit-error path)
+      (emit-error ": No such file or directory")
+      (emit-error (nl))
+      1))
+
+(defn is-a-dir [path :string] :i64
+  (do (emit-error "cp: ")
+      (emit-error path)
+      (emit-error " is a directory (not copied).")
+      (emit-error (nl))
+      1))
+
+;; Both lines, verbatim from /usr/bin/cp, measured 2026-09-10. cp exits 64
+;; -- not 1 -- for a wrong operand count.
+(defn usage [] :i64
+  (do (emit-error "usage: cp [-R [-H | -L | -P]] [-fi | -n] [-aclpSsvXx] source_file target_file")
+      (emit-error (nl))
+      (emit-error "       cp [-R [-H | -L | -P]] [-fi | -n] [-aclpSsvXx] source_file ... target_directory")
+      (emit-error (nl))
+      64))
+
+;; --- the copy ------------------------------------------------------------
+;; ~umask, measured. See the header. -1 when the parent would not take a
+;; directory, in which case it will not take the file either and the write
+;; below is the honest place for that to fail.
+(defn creation-mask [target :string] :i64
+  (if (make-dir target)
+    (let [m (mode-of target)]
+      (if (remove-dir target) m -1))
+    -1))
+
+;; The write form opens with 0644, so the file lands at `0644 & ~umask` and
+;; is then moved to where /bin/cp would have put it. chmod is not masked by
+;; the umask, which is precisely why the mask has to be applied here.
+(defn write-new [src :string target :string mask :i64] :i64
+  (do (spit-file target (slurp-file src))
+      (let [m (mode-of src)]
+        (if (< m 0)
+          0
+          (if (< mask 0)
+            0
+            (do (set-mode target (octal-of (mode-and m mask 1 0))) 0))))))
+
+(defn write-to [src :string target :string] :i64
+  (if (exists? (parent-of target))
+    (if (exists? target)
+      ;; Existing destination: open(2) ignores its mode argument, so neither
+      ;; implementation touches the mode and neither does this.
+      (do (spit-file target (slurp-file src)) 0)
+      (write-new src target (creation-mask target)))
+    (no-such target)))
+
+;; `cp SRC DIR` copies INTO the directory under SRC's own name -- it does not
+;; replace the directory. Resolving that here, before the write, is what
+;; keeps the write form from ever being handed a directory (which the host
+;; refuses with a trap rather than a diagnostic).
+(defn target-for [src :string dst :string] :string
+  (if (exists? dst)
+    (if (= (dir-flag dst) 1)
+      (string-concat (string-concat dst "/") (base-of src))
+      dst)
+    dst))
+
+(defn identical-refusal [src :string dst :string] :i64
+  (do (emit-error "cp: ")
+      (emit-error src)
+      (emit-error " and ")
+      (emit-error dst)
+      (emit-error " are identical (not copied).")
+      (emit-error (nl))
+      1))
+
+;; cp refuses to copy a file onto itself. /bin/cp decides that by identity
+;; (device and inode), so it also catches two DIFFERENT spellings of one
+;; file. The stat form now answers a size and a mode but still no inode, so
+;; this compares the resolved paths as strings: it catches `cp x x`, and it
+;; does not catch `cp x ./x` or a copy through a symlink. Named rather than
+;; left silent, because the unchecked version truncates the destination
+;; before writing it back.
+(defn copy [src :string dst :string] :i64
+  (if (exists? src)
+    (if (= (dir-flag src) 1)
+      (is-a-dir src)
+      (let [target (target-for src dst)]
+        (if (string=? target src)
+          (identical-refusal src dst)
+          (write-to src target))))
+    (no-such src)))
+
+(defn main [] :i64
+  (if (string=? (arg "") "2")
+    (copy (arg "0") (arg "1"))
+    (usage)))

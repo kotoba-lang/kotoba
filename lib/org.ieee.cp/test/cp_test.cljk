@@ -1,0 +1,314 @@
+;; test/cp_test.cljk -- build the command and compare it with the system cp
+;; on stdout, stderr, exit status AND the resulting directory tree.
+;;
+;; A copy tool that printed nothing and exited 0 would pass an output-only
+;; comparison completely, so the tree is what carries the weight here: after
+;; each case both implementations' directories are walked and compared file by
+;; file, each file as [MODE, sha256 of contents].
+;;
+;; The MODE in that pair is not decoration. It is the whole of what part A
+;; asserts about permissions: with the chmod removed from the guest and the
+;; mode dropped back out of the snapshot, every case passes again -- measured,
+;; and reported in the commit that added it.
+;;
+;; Both implementations run in the SAME directory, one after the other, with
+;; the fixtures rebuilt in between. That is not tidiness -- the diagnostics
+;; contain absolute paths, so two parallel trees would differ in stderr for
+;; reasons that have nothing to do with the behaviour under test.
+;;
+;; Part B is the umask: a new destination gets `source mode & ~umask` under
+;; /bin/cp, so the same must be true here, under umasks the suite chooses
+;; rather than under whichever one the invoking shell happened to have.
+;;
+;; Part C asserts the two remaining KNOWN divergences still diverge exactly as
+;; the README describes them. A divergence that stops being true is as much a
+;; finding as one that appears.
+
+(ns cp-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]
+            ["crypto" :as crypto]))
+
+(def cp-mod (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp-mod cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer"} opts)))]
+    {:status (.-status r) :signal (.-signal r)
+     :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-cp "/bin/cp")
+
+;; The fixture tree, rebuilt before every single run. Every mode is set
+;; explicitly, so the fixture itself does not move when part B changes the
+;; umask underneath it.
+;;   a.txt       644, ordinary content
+;;   pre.txt     600 and ALREADY EXISTS -- the overwrite case, where both
+;;               implementations must leave the destination's own mode alone
+;;   exec.sh     755 -- a new destination must come out executable
+;;   p700.txt    700
+;;   p600.txt    600
+;;   rw666.txt   666 -- the umask has something to remove from this one
+;;   rwx777.txt  777 -- and from this one
+;;   utf8.txt    multi-byte content
+;;   empty.txt   zero bytes: reads as the empty string, which must not be
+;;               confused with "could not read"
+;;   bin.dat     NOT valid UTF-8 -- part C
+;;   dir/        a directory, as both a source (refused) and a destination
+;;               (copied into)
+(def files
+  {"a.txt"      ["hello\n" 0x1a4]
+   "pre.txt"    ["old\n" 0x180]
+   "exec.sh"    ["#!/bin/sh\necho hi\n" 0x1ed]
+   "p700.txt"   ["seven hundred\n" 0x1c0]
+   "p600.txt"   ["six hundred\n" 0x180]
+   "rw666.txt"  ["six six six\n" 0x1b6]
+   "rwx777.txt" ["seven seven seven\n" 0x1ff]
+   "utf8.txt"   ["日本語\n" 0x1a4]
+   "empty.txt"  ["" 0x1a4]})
+
+(defn- reset! [data]
+  (.rmSync fs data #js {:recursive true :force true})
+  (.mkdirSync fs data #js {:recursive true})
+  (.chmodSync fs data 0x1ed)
+  (doseq [[n [c _]] files] (.writeFileSync fs (.join path data n) c "utf8"))
+  (doseq [[n [_ m]] files] (.chmodSync fs (.join path data n) m))
+  (.writeFileSync fs (.join path data "bin.dat")
+                  (.from js/Buffer #js [0xff 0xfe 0x00 0x01 0x62 0x61 0x64]))
+  (.chmodSync fs (.join path data "bin.dat") 0x1a4)
+  (.mkdirSync fs (.join path data "dir"))
+  (.chmodSync fs (.join path data "dir") 0x1ed))
+
+(defn- mode-of [p] (bit-and (.-mode (.statSync fs p)) 0x1ff))
+
+;; relative path -> [mode "<dir>"] or [mode content-hash], for every file
+;; under the tree. Hashed rather than read as text because bin.dat is not
+;; valid UTF-8 and reading it as one would compare two replacement characters
+;; and call them equal.
+;; A file the walker cannot READ still has to be reported, not thrown on: a
+;; wrong mode is exactly the kind of bug this suite is here to catch, and the
+;; first shape it took was an unreadable destination (a 700 source rendered
+;; as 007 by a deliberately broken octal conversion). Without this the harness
+;; died with a stack trace instead of naming the case.
+(defn- digest [full]
+  (try (-> (.createHash crypto "sha256")
+           (.update (.readFileSync fs full))
+           (.digest "hex"))
+       (catch :default e (str "<unreadable " (.-code e) ">"))))
+
+(defn- snapshot [root]
+  (letfn [(walk [dir prefix acc]
+            (reduce (fn [a e]
+                      (let [full (.join path dir e)
+                            rel (if (= prefix "") e (str prefix "/" e))]
+                        (if (.isDirectory (.statSync fs full))
+                          (walk full rel (assoc a (str rel "/") [(mode-of full) "<dir>"]))
+                          (assoc a rel [(mode-of full) (digest full)]))))
+                    acc
+                    (sort (.readdirSync fs dir))))]
+    (walk root "" {})))
+
+;; Each case is an argv of names relative to the data directory; anything
+;; that is not a bare name is passed through untouched.
+(def cases
+  [;; the basic contract: a new destination
+   ["a.txt" "new.txt"]
+   ;; a NEW destination takes the source's mode -- 755, 700 and 600 are the
+   ;; three the umask leaves alone, so these hold whatever it is
+   ["exec.sh" "new.sh"]
+   ["p700.txt" "new.txt"]
+   ["p600.txt" "new.txt"]
+   ;; and these two it does not leave alone: 666 -> 644 and 777 -> 755 under
+   ;; the 022 this part fixes. Copying the source's mode verbatim would hand
+   ;; out a world-writable file here; /bin/cp does not, and neither must this
+   ["rw666.txt" "new.txt"]
+   ["rwx777.txt" "new.txt"]
+   ;; overwriting an existing destination -- its own mode must be left alone
+   ;; by both, even when the source's mode differs from it
+   ["a.txt" "pre.txt"]
+   ["exec.sh" "pre.txt"]
+   ;; into a directory, under the source's own name -- and with its mode
+   ["a.txt" "dir"]
+   ["exec.sh" "dir"]
+   ;; a multi-byte source
+   ["utf8.txt" "new.txt"]
+   ;; an EMPTY source: reads as "", which must not be taken for a failure
+   ["empty.txt" "new.txt"]
+   ;; copying a file onto itself is refused by cp; this asserts we agree
+   ["a.txt" "a.txt"]
+   ;; missing source
+   ["missing.txt" "new.txt"]
+   ;; the source is a directory and there is no -R
+   ["dir" "new.txt"]
+   ;; the destination's parent does not exist
+   ["a.txt" "nodir/x.txt"]
+   ;; wrong operand counts: cp exits 64 with a two-line usage, not 1
+   ["a.txt"]
+   []])
+
+;; [umask, source, expected mode of a new destination]. The expectation is
+;; written down as well as compared against /bin/cp, so a run in which BOTH
+;; implementations drifted the same way is still a failure.
+(def umask-cases
+  [[0x12 "rwx777.txt" 0x1ed]   ;; 022: 777 -> 755
+   [0x12 "rw666.txt"  0x1a4]   ;; 022: 666 -> 644
+   [0x12 "exec.sh"    0x1ed]   ;; 022: 755 -> 755, the umask has nothing to take
+   [0x3f "exec.sh"    0x1c0]   ;; 077: 755 -> 700
+   [0x3f "rw666.txt"  0x180]   ;; 077: 666 -> 600
+   [0x02 "rwx777.txt" 0x1fd]   ;; 002: 777 -> 775
+   [0x17 "exec.sh"    0x1e8]]) ;; 027: 755 -> 750
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-cp) (refuse (str "no " system-cp " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-cp-"))
+        src (.resolve path (.cwd js/process) "cp" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "cp.kexe")
+        blob (.join path tmp "cp.bin")
+        exe (.join path tmp "cp")
+        data (.join path tmp "data")]
+    (.writeFileSync fs policy
+                    "{:allow #{[:cap/call 34] [:cap/call 35] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.mkdirSync fs data)
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      (let [real (.realpathSync fs data)
+            p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                          "--allow" "34,35,38,39"
+                          "--fs-scope" real "--browse-scope" real
+                          "--string-pool" "8000000" "--fuel" "50000000"
+                          "--pairs" "200000" "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+
+    (let [real (.realpathSync fs data)
+          abs (fn [n] (if (re-find #"^[-/]" n) n (.join path real n)))
+          b64 (fn [b] (if b (.toString b "base64") ""))
+          ;; Run one implementation over a freshly rebuilt tree.
+          once (fn [cmd argv]
+                 (reset! real)
+                 (let [r (run cmd (mapv abs argv) {:cwd real})]
+                   (assoc r :tree (snapshot real))))
+          ;; Part A runs at a FIXED umask, so the suite does not quietly
+          ;; inherit the invoking shell's and report a different set of
+          ;; agreements from one terminal to the next.
+          _ (.umask js/process 0x12)
+          results
+          (for [argv cases]
+            (let [k (once exe argv)
+                  s (once system-cp argv)
+                  same? (and (= (b64 (:out k)) (b64 (:out s)))
+                             (= (b64 (:err k)) (b64 (:err s)))
+                             (= (:status k) (:status s))
+                             (= (:tree k) (:tree s)))]
+              {:argv argv :ok same?
+               :exit [(:status k) (:status s)]
+               :err [(.toString (:err k) "utf8") (.toString (:err s) "utf8")]
+               :tree-same (= (:tree k) (:tree s))
+               :tree-diff (when-not (= (:tree k) (:tree s))
+                            (into {} (for [key (sort (distinct (concat (keys (:tree k))
+                                                                      (keys (:tree s)))))
+                                           :when (not= (get (:tree k) key) (get (:tree s) key))]
+                                       [key [(get (:tree k) key) (get (:tree s) key)]])))}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))
+                      " exit " (pr-str (:exit r))
+                      (when-not (:ok r)
+                        (str " tree-same=" (:tree-same r)
+                             " diff=" (pr-str (:tree-diff r))
+                             " err=" (pr-str (:err r)))))))
+
+      ;; --- Part B: the umask -------------------------------------------
+      ;; The guest cannot read the umask; it measures it, by creating a
+      ;; directory (0777 & ~umask) at the destination path and removing it
+      ;; again. This is where that measurement is tested, because part A runs
+      ;; at one umask and a hard-coded ~umask would pass all of it.
+      (println "\n  -- the umask on a NEW destination --")
+      (let [umask-results
+            (doall
+             (for [[um source expected] umask-cases]
+               (let [prev (.umask js/process um)
+                     _ (reset! real)
+                     _ (run exe [(abs source) (abs "new.out")] {:cwd real})
+                     k (mode-of (.join path real "new.out"))
+                     _ (reset! real)
+                     _ (run system-cp [(abs source) (abs "new.out")] {:cwd real})
+                     s (mode-of (.join path real "new.out"))]
+                 (.umask js/process prev)
+                 {:umask um :source source :expected expected :kotoba k :system s
+                  :ok (and (= k s) (= k expected))})))]
+        (doseq [r umask-results]
+          (println (str (if (:ok r) "  ok   " "  FAIL ")
+                        "umask " (.toString (:umask r) 8)
+                        " source " (:source r)
+                        " -> kotoba " (.toString (:kotoba r) 8)
+                        ", " system-cp " " (.toString (:system r) 8)
+                        " (expected " (.toString (:expected r) 8) ")")))
+
+        ;; --- Part C: the divergences the README still names ---------------
+        (println "\n  -- named divergences (each must still be true) --")
+        (.umask js/process 0x12)
+        (let [;; 1. three operands
+              _ (reset! real)
+              k3 (run exe [(abs "a.txt") (abs "b.txt") (abs "c.txt")] {:cwd real})
+              _ (reset! real)
+              s3 (run system-cp [(abs "a.txt") (abs "b.txt") (abs "c.txt")] {:cwd real})
+              three-diverges (not= (:status k3) (:status s3))]
+          (println (str (if three-diverges "  ok   " "  FAIL ")
+                        "three operands: kotoba exits " (:status k3)
+                        " (usage), " system-cp " exits " (:status s3)
+                        " -- unsupported, named in the README"))
+
+          ;; 2. bytes that are not valid UTF-8
+          (reset! real)
+          (let [kb (run exe [(abs "bin.dat") (abs "out.dat")] {:cwd real})
+                ;; Read the destination's existence HERE, while the guest's own
+                ;; tree is still standing. Read after the system run below and
+                ;; this measures /bin/cp's output instead -- which it did on the
+                ;; first run of this suite, reporting "destination written:
+                ;; true" for a guest that had written nothing.
+                kb-wrote (.existsSync fs (.join path real "out.dat"))
+                _ (reset! real)
+                sb (run system-cp [(abs "bin.dat") (abs "out.dat")] {:cwd real})
+                sb-ok (and (= 0 (:status sb))
+                           (.existsSync fs (.join path real "out.dat")))
+                ;; The guest must NOT have produced a destination: a trap, not
+                ;; a truncated or mangled copy.
+                kb-trapped (and (not= 0 (:status kb)) (not kb-wrote))]
+            (println (str (if (and sb-ok kb-trapped) "  ok   " "  FAIL ")
+                          "invalid UTF-8: " system-cp " copies it (exit " (:status sb)
+                          "), kotoba refuses (exit " (pr-str (:status kb))
+                          " signal " (pr-str (:signal kb))
+                          ", destination written: " kb-wrote ")"))
+            (let [umask-bad (remove :ok umask-results)
+                  extras (+ (if three-diverges 0 1)
+                            (if (and sb-ok kb-trapped) 0 1))]
+              (println (pr-str {:ok (and (empty? bad) (empty? umask-bad) (zero? extras))
+                                :cases (count results) :failed (count bad)
+                                :umask-cases (count umask-results)
+                                :umask-failed (count umask-bad)
+                                :divergence-checks-failed extras}))
+              (.exit js/process (if (or (seq bad) (seq umask-bad) (pos? extras)) 1 0)))))))))
