@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.ioLibp2p` | `kotoba.ioLibp2p/src` | `goog.crypt.Sha256`, `kotoba.net.bitswap`, `kotoba.net.gossip`, `kotoba.net.ipns-router` (Kotoba project library) |
 | `kotoba.noise` | `kotoba.noise/src` | `noise.blake2s`, `noise.cipher-state`, `noise.core`, `noise.handshake-state` (Kotoba project library) |
 | `kotoba.domainBilling` | `kotoba.domainBilling/src` | `domain-billing.core` (Kotoba project library) |
 | `kotoba.docs` | `kotoba.docs/src` | `docs.docx`, `docs.html`, `docs.markdown`, `docs.model` (Kotoba project library) |
