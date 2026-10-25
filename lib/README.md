@@ -153,6 +153,7 @@ The bundled standard libraries live in this repository:
 | `org.sbml.core` | `org.sbml.core/src` | `sbml.execute`, `sbml.mathml`, `sbml.model`, `sbml.validate` (an external specification, publisher sbml.org) |
 | `org.iso.std8583` | `org.iso.std8583/src` | `iso-8583.bcd`, `iso-8583.bitmap`, `iso-8583.charcode`, `iso-8583.codec` (an external specification, publisher iso.org) |
 | `org.si2.openaccess` | `org.si2.openaccess/src` | `openaccess.design`, `openaccess.library`, `openaccess.query`, `openaccess.shape` (an external specification, publisher si2.org) |
+| `org.sae.j1939` | `org.sae.j1939/src` | `j1939.identifier`, `j1939.spn`, `j1939.tp` (an external specification, publisher sae.org) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
