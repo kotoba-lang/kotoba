@@ -116,6 +116,7 @@ The bundled standard libraries live in this repository:
 | `org.openusd.usd` | `org.openusd.usd/src` | `kotoba.usd`, `usd.core`, `usd.usdc-bridge` (an external specification, publisher openusd.org) |
 | `org.threadgroup.thread` | `org.threadgroup.thread/src` | `thread.dispatch`, `thread.frag`, `thread.iphc`, `thread.mesh` (an external specification, publisher threadgroup.org) |
 | `org.threejs.core` | `org.threejs.core/src` | `org-threejs.core`, `org-threejs.gltf`, `org-threejs.interop`, `org-threejs.vrm` (an external specification, publisher threejs.org) |
+| `kotoba.pipelines` | `kotoba.pipelines/src` | `kami.pipelines`, `kotoba.pipelines` (Kotoba project library) |
 | `kotoba.physics` | `kotoba.physics/src` | `kami.physics`, `kotoba.physics`, `kotoba.physics.cloth`, `kotoba.physics.contract` (Kotoba project library) |
 | `co.huggingface.safetensors` | `co.huggingface.safetensors/src` | `safetensors.bytes`, `safetensors.core`, `safetensors.dtype`, `safetensors.json` (Kotoba project library) |
 | `kotoba.netsync` | `kotoba.netsync/src` | `kami.netsync`, `kami.netsync.fighting`, `kami.netsync.fps`, `kami.relevancy` (Kotoba project library) |
