@@ -181,6 +181,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.std1588` | `org.ieee.std1588/src` | `ptp.header`, `ptp.message`, `ptp.offset`, `ptp.timestamp` (an external specification, publisher ieee.org) |
 | `org.dnp.dnp3` | `org.dnp.dnp3/src` | `dnp3.app`, `dnp3.crc`, `dnp3.dl`, `dnp3.objects` (an external specification, publisher dnp.org) |
 | `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
+| `kotoba.spriteGpu` | `kotoba.spriteGpu/src` | `kami.sprite-gpu`, `kotoba.sprite-gpu` (Kotoba project library) |
 | `kotoba.codecPrimitives` | `kotoba.codecPrimitives/src` | `codec-primitives.motion`, `codec-primitives.quant`, `codec-primitives.scan`, `codec-primitives.transform` (Kotoba project library) |
 | `com.synopsys.liberty` | `com.synopsys.liberty/src` | `liberty.core` (Kotoba project library) |
 | `io.toml.core` | `io.toml.core/src` | `toml.reader` (Kotoba project library) |
