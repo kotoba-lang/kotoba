@@ -1,0 +1,243 @@
+;; The UnixFS balanced-DAG shape, as a Kotoba application
+;; (ADR-2608261100) — the tree `ipfs add` builds.
+;;
+;;   init          (config)         -> state
+;;   offer-length  (state, bytes)   -> state
+;;
+;; ## The bytes are not here, and do not need to be
+;;
+;; A file is exactly the thing that cannot be a guest value. But the SHAPE
+;; of its DAG is decided entirely by its LENGTH, and the shape is where the
+;; silent wrong answers live:
+;;
+;;   the guest owns   how many chunks, whether the root is a raw leaf or a
+;;                    dag-pb node, how many levels, how many children each
+;;                    node has, and how many logical bytes each covers
+;;   the host owns    the bytes, the chunking, sha2-256, the CIDs and the
+;;                    protobuf
+;;
+;; So `offer-length` takes an integer and the guest answers questions about
+;; a tree it will never see a byte of. Everything below is arithmetic over
+;; that one number, which is the whole point: `unixfs.file/build` derives
+;; the same shape while it has the bytes in hand, and cannot be asked what
+;; it decided without also handing it a file.
+;;
+;; ## Three shapes that are valid-looking and wrong
+;;
+;; `unixfs.file`'s own docstring names each of them, and each is a control
+;; below:
+;;
+;;   * **an empty file is ONE empty chunk, not zero.** *"`ipfs add` of
+;;     /dev/null is the raw CID of no bytes, and a file with no leaves
+;;     would have no CID at all."* A chunk count of zero is not a smaller
+;;     answer; it is no answer;
+;;   * **a one-chunk file IS the raw block.** No wrapper, no dag-pb node,
+;;     and the CID starts `bafkrei…`. *"Getting this wrong produces a
+;;     valid-looking DAG that no `ipfs get` will ever agree with, because
+;;     the reference implementation special-cases it"*;
+;;   * **the 175th chunk gets its own node.** At 175 chunks the root has
+;;     two children: one covering a full 174, and one covering a single
+;;     chunk — *"a bare raw leaf as the second child would be a smaller,
+;;     reasonable, different DAG."*
+;;
+;; ## 174 is a constant of the format
+;;
+;; go-unixfs `DefaultLinksPerBlock`: an 8 KiB target block over a ~47-byte
+;; link. *"A file chunked with a different value is a different CID, not a
+;; differently tuned one."* It is configurable here only because
+;; `unixfs.file` makes it configurable for tests; a deployment that changes
+;; it has changed which file it is describing.
+;;
+;; ## Logical size is not encoded size
+;;
+;; `logical-size-at` is `blocksizes` — the bytes of the FILE a node covers.
+;; A link's `Tsize` is a different measure (the encoded size of everything
+;; under it, block headers included) and is NOT computed here: it depends
+;; on how each node encodes, which is the host's business. Both numbers
+;; live in every node and confusing them produces a DAG that verifies
+;; against itself and against nothing else.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/unixfs/shape.kotoba \
+;;     --target wasm32-browser --output shape.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 5408-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns unixfs.shape
+  (:export [init offer-length
+            phase reason
+            chunk-count raw-root? level-count
+            nodes-at children-at first-leaf-at leaf-span-at logical-size-at
+            chunk-size max-links file-size]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+;; --- the constants of the format ------------------------------------------
+
+(defn- default-chunk-size [] :i64 262144)
+
+;; go-unixfs `DefaultLinksPerBlock`.
+(defn- default-max-links [] :i64 174)
+
+;; --- arithmetic -----------------------------------------------------------
+
+(defn- ceil-div [a :i64 b :i64] :i64 (quot (+ a (- b 1)) b))
+
+(defn- imin [a :i64 b :i64] :i64 (if (< a b) a b))
+
+;; How many nodes exist at `level`, counting the leaves as level 0. Each
+;; level above is the one below divided by `max-links`, rounded up -- which
+;; is `partition-all` and nothing more.
+(defn- nodes-at-level [leaves :i64 links :i64 level :i64] :i64
+  (if (<= level 0) leaves (ceil-div (nodes-at-level leaves links (- level 1)) links)))
+
+;; The number of dag-pb levels ABOVE the leaves. Zero when the root IS a
+;; leaf, which is the one-chunk case.
+(defn- levels-above [leaves :i64 links :i64 level :i64] :i64
+  (if (<= (nodes-at-level leaves links level) 1)
+    level
+    (levels-above leaves links (+ level 1))))
+
+;; `max-links^level`, computed rather than stored: how many leaves one node
+;; at `level` covers when the tree is full beneath it.
+(defn- span-of [links :i64 level :i64] :i64
+  (if (<= level 0) 1 (* links (span-of links (- level 1)))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+(defn init [config :document] :document
+  (let [cs (di config :chunk-size)
+        ml (di config :max-links)
+        base (document-map :phase (document-keyword :want-length)
+                           :reason (document-keyword :none)
+                           :chunk-size (document-i64
+                                        (if (> cs 0) cs (default-chunk-size)))
+                           :max-links (document-i64
+                                       (if (> ml 0) ml (default-max-links)))
+                           :bytes (document-i64 -1)
+                           :chunks (document-i64 -1)
+                           :levels (document-i64 -1))]
+    (cond
+      (and (> cs -1) (<= cs 0)) (refuse base :unixfs/invalid-chunk-size)
+      ;; `unixfs.file` refuses below 2, and the reason is that a tree whose
+      ;; nodes hold one child never gets smaller: it would recurse forever.
+      (and (> ml -1) (< ml 2)) (refuse base :unixfs/invalid-max-links)
+      :else base)))
+
+;; --- the shape ------------------------------------------------------------
+
+(defn offer-length [state :document byte-length :i64] :document
+  (if (not (= (dk state :phase) :want-length))
+    state
+    (if (< byte-length 0)
+      (refuse state :unixfs/negative-length)
+      (let [cs (di state :chunk-size)
+            ml (di state :max-links)
+            ;; An empty file is ONE empty chunk, not zero: a file with no
+            ;; leaves would have no CID at all.
+            chunks (if (= byte-length 0) 1 (ceil-div byte-length cs))]
+        (document-assoc
+         (document-assoc
+          (document-assoc
+           (document-assoc state :phase (document-keyword :shaped))
+           :bytes (document-i64 byte-length))
+          :chunks (document-i64 chunks))
+         :levels (document-i64 (levels-above chunks ml 0)))))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+(defn chunk-size [state :document] :i64 (di state :chunk-size))
+
+(defn max-links [state :document] :i64 (di state :max-links))
+
+(defn file-size [state :document] :i64 (di state :bytes))
+
+(defn chunk-count [state :document] :i64 (di state :chunks))
+
+;; A one-chunk file IS the raw block: no wrapper, no dag-pb node, and the
+;; CID starts `bafkrei…`. The reference implementation special-cases it, so
+;; a wrapper here produces a DAG that no `ipfs get` will agree with.
+(defn raw-root? [state :document] :bool (= (di state :chunks) 1))
+
+;; dag-pb levels ABOVE the leaves. Zero exactly when the root is raw.
+(defn level-count [state :document] :i64 (di state :levels))
+
+;; Level 0 is the leaves.
+(defn nodes-at [state :document level :i64] :i64
+  (if (or (< level 0) (> level (di state :levels)))
+    -1
+    (nodes-at-level (di state :chunks) (di state :max-links) level)))
+
+;; How many children the node at `(level, index)` has. Full to the left; the
+;; last node of a level carries the remainder. At 175 chunks the root has
+;; two, and the second covers a single chunk -- which is still its own
+;; dag-pb node, not a bare raw leaf.
+(defn children-at [state :document level :i64 index :i64] :i64
+  (let [links (di state :max-links)
+        below (nodes-at state (- level 1))]
+    (if (or (< level 1) (< index 0))
+      -1
+      (if (>= index (nodes-at state level))
+        -1
+        (imin links (- below (* index links)))))))
+
+;; The first LEAF covered by the node at `(level, index)`.
+(defn first-leaf-at [state :document level :i64 index :i64] :i64
+  (if (or (< level 0) (< index 0))
+    -1
+    (if (>= index (nodes-at state level))
+      -1
+      (* index (span-of (di state :max-links) level)))))
+
+;; How many leaves it covers. The last node of a level covers the
+;; remainder, which is what makes a partly-filled tree different from a
+;; full one.
+(defn leaf-span-at [state :document level :i64 index :i64] :i64
+  (let [first-leaf (first-leaf-at state level index)]
+    (if (< first-leaf 0)
+      -1
+      (imin (span-of (di state :max-links) level)
+            (- (di state :chunks) first-leaf)))))
+
+;; `blocksizes`: the LOGICAL bytes of the file this node covers -- not the
+;; encoded size of its subtree, which is `Tsize` and is the host's to
+;; compute. Both live in every node and they are not the same number.
+(defn logical-size-at [state :document level :i64 index :i64] :i64
+  (let [first-leaf (first-leaf-at state level index)
+        span (leaf-span-at state level index)
+        cs (di state :chunk-size)
+        total (di state :bytes)]
+    (cond
+      (< first-leaf 0) -1
+      ;; Every leaf but the last is a full chunk; the last carries what is
+      ;; left, which for an empty file is nothing.
+      (>= (+ first-leaf span) (di state :chunks))
+      (- total (* first-leaf cs))
+      :else (* span cs))))

@@ -1,0 +1,174 @@
+;; tenken-model — wrangler 設定 1 件を EDN に正規化する (.cljc, kbb/SCI 対応)
+;;
+;; 規則 (ADR-2809151400):
+;; - 未知 shape は nil に握り潰さない。読めない設定は {:tenken/status :unreadable}
+;;   を返し、eval 側で fail にする。
+;; - jsonc はコメントを剥がしてから parse する。
+;; - toml のドット付き array-of-tables ([[durable_objects.bindings]] 等) を
+;;   1 キーの map に落とす (awai checker 実測: ドット無し一致では落ちる形)。
+(ns tenken.model
+  (:require ["node:fs" :as fs]
+            [clojure.string :as str]))
+
+(defn strip-jsonc-comments
+  "jsonc の // 行コメントと /* */ ブロックコメントを剥がす (文字列内は保持)。"
+  [s]
+  (let [n (count s)]
+    (loop [i 0 acc ""]
+      (if (>= i n)
+        acc
+        (let [c (nth s i)
+              two (subs s i (min n (+ i 2)))]
+          (cond
+            (= two "//") (let [j (or (str/index-of s "\n" i) n)]
+                           (recur j (str acc "\n")))
+            (= two "/*") (let [j (str/index-of s "*/" (+ i 2))
+                               j (or j n)]
+                           (recur (+ j 2) acc))
+            (= c \") (let [j (loop [k (inc i)]
+                               (let [ck (nth s k)]
+                                 (cond
+                                   (= ck \\) (recur (+ k 2))
+                                   (= ck \") (inc k)
+                                   :else (recur (inc k)))))]
+                       (recur (inc j) (str acc (subs s i (inc j)))))
+            :else (recur (inc i) (str acc c))))))))
+
+(defn strip-trailing-commas
+  "wrangler の jsonc は実測で trailing comma を含む (cloud-murakumo/wrangler.jsonc 3827)。
+   } / ] の直前の `,` を剥がす (文字列内は strip 済みの前提)。"
+  [s]
+  (str/replace s #",\s*([}\]])" "$1"))
+
+(defn parse-jsonc
+  [s]
+  (js/JSON.parse (strip-trailing-commas (strip-jsonc-comments s))))
+
+(defn- js->clj-keywords
+  "JSON object を keyword map へ (配列は保持)。"
+  [o]
+  (cond
+    (nil? o) nil
+    (array? o) (mapv js->clj-keywords o)
+    (object? o) (into {}
+                      (for [k (js/Object.keys o)]
+                        [(keyword k) (js->clj-keywords (aget o k))]))
+    :else o))
+
+(defn- toml-line-kind
+  "行の種別: :table / :array-table / :keyval / :other"
+  [line]
+  (let [t (str/trim line)]
+    (cond
+      (str/blank? t) nil
+      (str/starts-with? t "#") nil
+      (and (str/starts-with? t "[") (< (count t) 3)) nil  ; 単独 "]" / "[]" は配列の閉じ — 無視
+      (str/starts-with? t "[[") :array-table
+      (str/starts-with? t "[") :table
+      :else :keyval)))
+
+(defn- split-keyval
+  "key = value 行を [key value] に。value は quote 剥がし + 配列の目印だけ保持。"
+  [line]
+  (let [i (str/index-of line "=")]
+    (when i
+      (let [k (str/trim (subs line 0 i))
+            v (str/trim (subs line (inc i)))]
+        [k v]))))
+
+(defn- toml-value-shape
+  "toml の値の形を軽く正規化する (文字列 / 数 / 真偽 / 配列の有無)。"
+  [v]
+  (cond
+    (str/starts-with? v "\"") (subs v 1 (dec (count v)))
+    (str/starts-with? v "'") (subs v 1 (dec (count v)))
+    (= v "true") true
+    (= v "false") false
+    (str/starts-with? v "[") :tenken.toml/array
+    :else v))
+
+(defn parse-toml-loose
+  "toml を 1 段 map へ。配列テーブルはキー名をそのまま 1 キーに落とす
+   ([[durable_objects.bindings]] → {:durable_objects.bindings [..]})。
+   十分な深さの表は tenken の用途 (binding 存在判定) に不要なので 1 段で足りる。"
+  [s]
+  (let [lines (str/split-lines s)]
+    (loop [acc {}
+           tables {}
+           cur nil
+           [line & rest] lines]
+      (cond
+        (nil? line) acc
+        :else
+        (let [kind (toml-line-kind line)]
+          (cond
+            (nil? kind) (recur acc tables cur rest)
+            ;; tables は必ず "]" で終わるので末尾から剥がす
+            ;; (この SCI 環境では str/last-index-of / .lastIndexOf が信頼できない実測あり)
+            (= kind :table) (let [t (str/trim (subs line 1 (dec (count line))))]
+                              (recur acc tables t rest))
+            (= kind :array-table) (let [t (str/trim (subs line 2 (- (count line) 2)))]
+                                    (recur acc tables t rest))
+            (= kind :keyval)
+            (let [[k v] (split-keyval line)
+                  acc (if (nil? k)
+                        acc
+                        (let [full-k (if (and cur (not (str/starts-with? k "[")))
+                                       (keyword (str cur "." k))
+                                       (keyword k))]
+                          (assoc acc full-k (toml-value-shape v))))]
+              (recur acc tables cur rest))
+            :else (recur acc tables cur rest)))))))
+
+(def config-filenames
+  "走査対象の wrangler 設定ファイル名 (awai checker 実測と同じ集合)。"
+  #{"wrangler.json" "wrangler.jsonc" "wrangler.toml"})
+
+(defn read-config
+  "1 ファイルを読んで設定 map へ。読めなければ status :unreadable。
+   出力 shape: {:tenken/path <abs or rel path>
+                :tenken/format :jsonc|json|toml
+                :tenken/status :ok|:unreadable
+                :tenken/data <map>|:tenken/unreadable}"
+  [path]
+  (let [fmt (cond
+              (str/ends-with? path ".jsonc") :jsonc
+              (str/ends-with? path ".json") :json
+              (str/ends-with? path ".toml") :toml
+              :else :unknown)]
+    (try
+      (let [s (fs/readFileSync path "utf8")]
+        (if (str/blank? s)
+          {:tenken/path path :tenken/format fmt :tenken/status :unreadable
+           :tenken/data :tenken/unreadable :tenken/reason "empty file"}
+          (if (= fmt :toml)
+            {:tenken/path path :tenken/format fmt :tenken/status :ok
+             :tenken/data (parse-toml-loose s)}
+            (let [o (parse-jsonc s)]
+              {:tenken/path path :tenken/format fmt :tenken/status :ok
+               :tenken/data (js->clj-keywords o)}))))
+      (catch :default e
+        {:tenken/path path :tenken/format fmt :tenken/status :unreadable
+         :tenken/data :tenken/unreadable :tenken/reason (str (.-message e))}))))
+
+(defn walk-configs
+  "dir 配下の wrangler 設定ファイルを全て列挙する。除外 dir は awai checker 実測集合。
+   深さ上限は使わない (実測: 5 段目より深い設定が在る)。"
+  [root dir excluded]
+  (let [entries (try
+                  (fs/readdirSync dir #js {:withFileTypes true})
+                  (catch :default _ nil))]
+    (if (nil? entries)
+      []
+      (reduce (fn [acc e]
+                (let [p (str dir "/" (.-name e))]
+                  (cond
+                    (.isDirectory e)
+                    (if (contains? excluded (.-name e))
+                      acc
+                      (into acc (walk-configs root p excluded)))
+                    (contains? config-filenames (.-name e))
+                    (conj acc p)
+                    :else acc)))
+              []
+              entries))))
