@@ -1,0 +1,95 @@
+(ns commoncrawl.sim
+  "Offline demo runner — drives four seeds through one IngestActor with
+  entirely mocked (in-process, no network) capabilities, so the whole
+  intake -> fetch -> advise -> govern -> decide -> commit/hold path and
+  the Governor's three rules are visible without any live dependency.
+
+    seed1  a configured seed, clean high-confidence extraction  → commit
+    seed2  a domain NOT in the seed list                        → hold (out-of-scope, hard)
+    seed3  a configured seed, but the CDX/WARC fetch misses      → hold (fetch-miss)
+    seed4  a configured seed, extraction confidence below floor  → hold (low-confidence, soft)
+
+  Run: kbb -M:dev:run"
+  (:require [commoncrawl.operation :as op]
+            [commoncrawl.report :as report]
+            [commoncrawl.store :as store]))
+
+(defn- line [& xs] (println (apply str xs)))
+
+(def demo-seeds
+  [{:domain "www.gleif.org" :url "https://www.gleif.org/"}
+   {:domain "www.sec.gov" :url "https://www.sec.gov/"}])
+
+(defn- mock-fetch-fn [routes]
+  (fn [{:keys [query]}]
+    (get routes (get query "url") [])))
+
+(defn- mock-warc-fetch-fn [texts]
+  (fn [capture] (get texts (:url capture))))
+
+(defn- mock-advise-fn [proposals]
+  (fn [page] (get proposals (:url page) {:category "" :summary "" :entities [] :confidence 0.0})))
+
+(defn -main [& _]
+  (let [db (store/mem-store)
+        capture-of (fn [url ts] {:url url :timestamp ts :status "200"
+                                 :filename "demo.warc.gz" :offset "0" :length "1"})
+        ;; seed1: real capture + real text + confident extraction → commit
+        ;; seed3 (fetch-miss demo): a configured seed with NO capture at all
+        fetch-fn (mock-fetch-fn
+                  {"https://www.gleif.org/" [(capture-of "https://www.gleif.org/" "20260701000000")]
+                   "https://www.sec.gov/" []
+                   ;; seed2 DOES have a real capture -- the point of this seed is to prove the
+                   ;; Governor's out-of-scope check fires even when the page fetches fine, not
+                   ;; to demonstrate a fetch-miss (that's seed3's job).
+                   "https://evil.example.com/" [(capture-of "https://evil.example.com/" "20260701000000")]})
+        warc-fetch-fn (mock-warc-fetch-fn
+                       {"https://www.gleif.org/"
+                        (str "WARC/1.0\r\nWARC-Type: response\r\n\r\n"
+                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+                             "<html><title>GLEIF</title><body>Global LEI Foundation registry.</body></html>")
+                        "https://evil.example.com/"
+                        (str "WARC/1.0\r\nWARC-Type: response\r\n\r\n"
+                             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+                             "<html><title>Evil Inc</title><body>Not a configured seed.</body></html>")})
+        advise-fn (mock-advise-fn
+                   {"https://www.gleif.org/"
+                    {:category "corporate registry" :summary "The Global LEI Foundation's registry site."
+                     :entities ["GLEIF"] :confidence 0.92}
+                    "https://evil.example.com/"
+                    {:category "unknown" :summary "Some other site." :entities [] :confidence 0.95}})
+        ingest-fn (fn [_payload] {:ok true :status 200})
+        actor (op/build db {:advise-fn (fn [page] (advise-fn page))
+                            :embed-fn (constantly nil)
+                            :fetch-fn fetch-fn
+                            :warc-fetch-fn warc-fetch-fn
+                            :ingest-fn ingest-fn
+                            :collection-id "CC-MAIN-2026-25"})
+        ctx (fn [] {:seeds demo-seeds :exclude #{} :budget {:used 0 :cap 10}})]
+
+    (line "── seed1: configured seed, clean confident extraction ──")
+    (let [r (op/run-seed! actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))]
+      (line "  disposition = " (get-in r [:state :disposition])))
+
+    (line "\n── seed2: domain NOT in the seed list (out-of-scope, hard) ──")
+    (let [r (op/run-seed! actor {:domain "evil.example.com" :url "https://evil.example.com/"} (ctx))]
+      (line "  disposition = " (get-in r [:state :disposition])
+            "  violations=" (get-in r [:state :verdict :violations])))
+
+    (line "\n── seed3: configured seed, CDX fetch misses ──")
+    (let [r (op/run-seed! actor {:domain "www.sec.gov" :url "https://www.sec.gov/"} (ctx))]
+      (line "  disposition = " (get-in r [:state :disposition])))
+
+    (line "\n── seed4: configured seed, low-confidence extraction (soft) ──")
+    (let [low-actor (op/build (store/mem-store)
+                              {:advise-fn (constantly {:category "?" :summary "?" :entities [] :confidence 0.1})
+                               :fetch-fn fetch-fn :warc-fetch-fn warc-fetch-fn
+                               :ingest-fn ingest-fn :collection-id "CC-MAIN-2026-25"})
+          r (op/run-seed! low-actor {:domain "www.gleif.org" :url "https://www.gleif.org/"} (ctx))]
+      (line "  disposition = " (get-in r [:state :disposition])
+            "  soft?=" (get-in r [:state :verdict :soft?])))
+
+    (line "\n── audit ledger (seed1/seed3 actor) ──")
+    (doseq [f (store/ledger db)] (line "  " (report/ledger-line f)))
+
+    (line "\ndone.")))

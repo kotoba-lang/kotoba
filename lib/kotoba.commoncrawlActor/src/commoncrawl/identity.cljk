@@ -1,0 +1,190 @@
+(ns commoncrawl.identity
+  "CACAO self-mint identity for this actor — the kotobase-server convention
+  documented in skill `build-actor`: 'actor ごとに鍵を発行し、その鍵由来
+  IPNS 名がその actor の graph' — an actor holding its own Ed25519 seed is
+  structurally authorized to self-mint a CACAO for its OWN did:key, no
+  owner hand-off / shared operator token required.
+
+  Built on `cacao.core` (kotoba-lang/org-chainagnostic-cacao, mint/verify)
+  + `ed25519.core` (kotoba-lang/org-ietf-ed25519, did:key derivation) —
+  BOTH already `.cljc` with a live-verified nbb (:cljs) branch (see this
+  repo's own README: `kbb --backend sci --classpath ... test/nbb_smoke.cljk` exercises
+  mint/verify/verify-chain on the Node runtime and is proven working here),
+  so this ns is portable per repo-wide runtime priority (nbb primary).
+
+  The resource scope minted here follows
+  `cloud_itonami.identity_core/kotobase-resources` byte-for-byte
+  (`kotoba://op/datom:read`, `kotoba://op/datom:transact`,
+  `kotoba://can/kotobase:pin`, `kotoba://graph/<db-name>`) — that exact
+  scope (specifically including the easy-to-miss `kotobase:pin` capability
+  string) is what CLOSED two real live 401s against production
+  `backend.kotobase.net` on 2026-07-18 (see that ns's docstring); this
+  actor's own writes go through the identical `ai.gftd.apps.kotobase.web.
+  ingest` write plane (`datomic.transact` underneath), so the same scope
+  requirement applies unchanged.
+
+  SECURITY: the raw seed NEVER leaves `load-or-create-identity!`'s return
+  map's use inside this process — only the derived did:key and a minted,
+  short-lived CACAO are ever handed to a caller/logged. The seed is
+  persisted to `.<actor>/identity.edn`, which MUST be gitignored (see this
+  repo's `.gitignore`) — never commit it."
+  (:require [cacao.core :as cacao]
+            [ed25519.core :as ed]
+            #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])))
+
+(def default-actor "commoncrawl")
+
+(def default-kotobase-aud
+  "net-kotobase's pod enforces aud == did:web:kotobase.net (confirmed,
+  cloud_itonami.identity_core/default-kotobase-aud) — a mismatch is
+  rejected with 'cacao audience mismatch'."
+  "did:web:kotobase.net")
+
+(def default-kotobase-domain "kotobase.net")
+
+(def default-db-name
+  "web.ingest/web.search's own default tenant db_name (kotobase.web
+  lexicons) — this actor's ingested pages live in the SAME well-known
+  per-tenant graph every caller gets by default, rather than a bespoke
+  db_name that would only this actor's own writes are searchable under."
+  "webpages")
+
+;; ── seed generation (fresh identity only) ────────────────────────────────
+
+(defn random-seed
+  "32 cryptographically-random bytes for a fresh Ed25519 seed. :clj
+  `java.security.SecureRandom`; :cljs Node's `crypto.randomBytes` (nbb has
+  Node's builtin `crypto` module available, no extra dependency)."
+  []
+  #?(:clj (let [b (byte-array 32)]
+            (.nextBytes (java.security.SecureRandom.) b)
+            b)
+     :cljs (js/Uint8Array. (.randomBytes (js/require "crypto") 32))))
+
+(defn- b64->bytes [^String s]
+  #?(:clj (.decode (java.util.Base64/getDecoder) s)
+     :cljs (js/Uint8Array. (js/Buffer.from s "base64"))))
+
+(defn- bytes->b64 [b]
+  #?(:clj (.encodeToString (java.util.Base64/getEncoder) b)
+     :cljs (.toString (js/Buffer.from b) "base64")))
+
+;; ── persistence (.{actor}/identity.edn, gitignored) ──────────────────────
+
+(defn identity-path [actor] (str "." actor "/identity.edn"))
+
+(defn- ensure-dir! [dir]
+  #?(:clj (.mkdirs (java.io.File. ^String dir))
+     :cljs (let [fs (js/require "fs")]
+             (when-not (.existsSync fs dir) (.mkdirSync fs dir #js {:recursive true})))))
+
+(defn- read-identity-file [path]
+  (try
+    #?(:clj (when (.exists (java.io.File. ^String path))
+              (edn/read-string (slurp path)))
+       :cljs (let [fs (js/require "fs")]
+               (when (.existsSync fs path)
+                 (edn/read-string (.readFileSync fs path "utf8")))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn- write-identity-file! [path data]
+  #?(:clj (spit path (pr-str data))
+     :cljs (.writeFileSync (js/require "fs") path (pr-str data) "utf8")))
+
+(defn load-or-create-identity!
+  "Load `.{actor}/identity.edn` (creating it, and its parent dir, on first
+  use with a fresh random seed) — mirrors
+  `cloud_itonami.identity/load-or-create-identity!`'s contract. Returns
+  {:actor :did :seed-b64} — `:seed-b64` stays inside this process (never
+  logged/returned across a network boundary by any caller in this repo);
+  only `:did` and a subsequently-minted CACAO are ever handed out."
+  ([] (load-or-create-identity! default-actor))
+  ([actor]
+   (let [path (identity-path actor)
+         existing (read-identity-file path)]
+     (if-let [seed-b64 (:seed-b64 existing)]
+       {:actor actor :did (or (:did existing) (ed/did-key-from-seed (b64->bytes seed-b64)))
+        :seed-b64 seed-b64}
+       (let [seed (random-seed)
+             seed-b64 (bytes->b64 seed)
+             did (ed/did-key-from-seed seed)]
+         (ensure-dir! (str "." actor))
+         (write-identity-file! path {:actor actor :did did :seed-b64 seed-b64
+                                     :created-at #?(:clj (str (java.time.Instant/now))
+                                                    :cljs (.toISOString (js/Date.)))})
+         {:actor actor :did did :seed-b64 seed-b64})))))
+
+;; ── resource scope + timestamps ───────────────────────────────────────────
+
+(defn kotobase-resources
+  "CACAO resource scope for a kotobase.net graph write — matches
+  `cloud_itonami.identity_core/kotobase-resources` byte-for-byte (see ns
+  docstring for why `kotoba://can/kotobase:pin` specifically is
+  non-optional)."
+  [db-name]
+  [(str "kotoba://op/datom:read")
+   (str "kotoba://op/datom:transact")
+   (str "kotoba://can/kotobase:pin")
+   (str "kotoba://graph/" db-name)])
+
+(defn iso8601-seconds
+  "epoch-ms -> \"YYYY-MM-DDTHH:MM:SSZ\" — the EXACT format
+  `kotobase-cf-wasm.auth`/`cloud_itonami.edge.cacao`'s `parse-utc-seconds`
+  requires (no fractional seconds; a bare `.toISOString()` — which emits
+  milliseconds — would fail that regex and every CACAO this ns mints would
+  be rejected as having an 'invalid CACAO iat/exp')."
+  [epoch-ms]
+  #?(:clj (-> (java.time.Instant/ofEpochMilli epoch-ms)
+              (.truncatedTo java.time.temporal.ChronoUnit/SECONDS)
+              .toString)
+     :cljs (let [d (js/Date. epoch-ms)
+                 pad #(.padStart (str %) 2 "0")]
+             (str (.getUTCFullYear d) "-" (pad (inc (.getUTCMonth d))) "-" (pad (.getUTCDate d))
+                  "T" (pad (.getUTCHours d)) ":" (pad (.getUTCMinutes d)) ":" (pad (.getUTCSeconds d))
+                  "Z"))))
+
+(defn now-ms [] #?(:clj (System/currentTimeMillis) :cljs (js/Date.now)))
+
+(defn fresh-nonce
+  "A random hex nonce — MUST be fresh per mint (`cacao.core/mint` throws
+  without one; the backend's nonce store rejects reuse, see
+  `cloud_itonami.net_kotobase/kg-ingest!`'s docstring on
+  auth/nonce-seen?/record-nonce!)."
+  []
+  (let [bytes #?(:clj (let [b (byte-array 16)] (.nextBytes (java.security.SecureRandom.) b) b)
+                 :cljs (.randomBytes (js/require "crypto") 16))]
+    (ed/hexify bytes)))
+
+;; ── mint ──────────────────────────────────────────────────────────────────
+
+(defn mint-kotobase-session
+  "identity ({:seed-b64 ...}, from load-or-create-identity!) + {:db-name
+  :ttl-seconds} -> {:did :cacao-b64 :db-name :resources}. Mints a
+  short-lived (default 1h — this actor mints per-tick, not per-day like
+  cloud-itonami's default 24h session, since a tick is a bounded, scheduled
+  run rather than a long-lived interactive CLI) CACAO scoped to
+  `kotobase-resources db-name`, aud/domain fixed to net-kotobase's pod
+  requirements (see `default-kotobase-aud`/`default-kotobase-domain`)."
+  [{:keys [seed-b64 did]} & [{:keys [db-name ttl-seconds] :or {db-name default-db-name ttl-seconds 3600}}]]
+  (let [seed (b64->bytes seed-b64)
+        now (now-ms)
+        resources (kotobase-resources db-name)
+        {:keys [cacao-b64 iss]} (cacao/mint
+                                  {:seed seed
+                                   :aud default-kotobase-aud
+                                   :domain default-kotobase-domain
+                                   :nonce (fresh-nonce)
+                                   :iat (iso8601-seconds now)
+                                   :exp (iso8601-seconds (+ now (* 1000 (long ttl-seconds))))
+                                   :resources resources})]
+    {:did (or did iss) :cacao-b64 cacao-b64 :db-name db-name :resources resources}))
+
+(defn auth-headers
+  "{:cacao-b64 :did} -> the two headers kotobase.net's edge gate requires
+  (`Authorization: CACAO <b64>` + `X-Kotoba-Did: <did>`) — same shape as
+  `cacao.core/auth-header` and `cloud_itonami.net_kotobase/kg-ingest!`'s
+  header-setting code."
+  [{:keys [cacao-b64 did]}]
+  {"Authorization" (str "CACAO " cacao-b64)
+   "X-Kotoba-Did" did})

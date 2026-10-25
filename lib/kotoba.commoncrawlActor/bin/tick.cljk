@@ -1,0 +1,83 @@
+;; bin/tick.cljk — the LIVE production entry point. Run by a scheduled
+;; routine (cron / claude-code `schedule` skill), NOT an always-on
+;; process — see commoncrawl.loop's ns docstring. Every real IO capability
+;; (CDX/WARC fetch, LLM extraction, embeddings, net-kotobase ingest) comes
+;; from commoncrawl.live-http; every domain/policy/graph namespace this
+;; wires together is the SAME portable .cljc code the offline test suite
+;; exercises against fakes — this file is pure wiring, no new logic.
+;;
+;; Usage:
+;;   kbb --backend sci --classpath "src:<sibling checkouts>..." bin/tick.cljk [--budget N] [--store PATH]
+;;
+;; Env:
+;;   COMMONCRAWL_MURAKUMO_TOKEN or KAGI_BIN  — murakumo /v1/messages + /v1/embeddings auth
+;;   (see commoncrawl.live-http/murakumo-token)
+;;   CF_CATALOG_TOKEN  — Cloudflare R2 Data Catalog token (this tick's ONLY
+;;   optional capability: absent/empty degrades this tick's `:iceberg`
+;;   summary to {:ok? false :error :could-not-answer ...}, it never blocks
+;;   or holds a page's net-kotobase ingest — see commoncrawl.live-iceberg)
+(require '[commoncrawl.cdx :as cdx]
+         '[commoncrawl.embeddings :as embeddings]
+         '[commoncrawl.identity :as identity]
+         '[commoncrawl.kotobase :as kotobase]
+         '[commoncrawl.live-http :as net]
+         '[commoncrawl.live-iceberg :as live-iceberg]
+         '[commoncrawl.llm :as llm]
+         '[commoncrawl.loop :as loop]
+         '[commoncrawl.operation :as op]
+         '[commoncrawl.report :as report]
+         '[commoncrawl.seeds :as seeds]
+         '[commoncrawl.store :as store]
+         '[kotoba.lang.text :as str])
+
+(defn- parse-args [args]
+  (loop [args (seq args) flags {}]
+    (if-let [a (first args)]
+      (if (str/starts-with? a "--")
+        (recur (nnext args) (assoc flags (keyword (subs a 2)) (fnext args)))
+        (recur (next args) flags))
+      flags)))
+
+(defn -main [& args]
+  (let [{:keys [budget store db-name]} (parse-args args)
+        budget-cap (if budget (js/parseInt budget 10) loop/default-budget-cap)
+        store-path (or store ".commoncrawl/store.edn")
+        db-name (or db-name identity/default-db-name)
+
+        seeds (seeds/load-seeds "resources/seeds.edn")
+        id (identity/load-or-create-identity!)
+        session (identity/mint-kotobase-session id {:db-name db-name})
+
+        complete-fn (net/llm-complete-fn)
+        embed-net-fn (net/embed-fn)
+        st (store/file-store store-path)
+
+        advise-fn (fn [page] (llm/advise complete-fn page))
+        embed-fn (fn [text] (embeddings/embed embed-net-fn text))
+        ingest-fn (fn [payload]
+                    (kotobase/ingest! net/kotobase-http-fn
+                                      {:cacao-b64 (:cacao-b64 session) :did (:did session)}
+                                      (assoc payload :db-name db-name)))
+        collection-id (or (cdx/latest-collection-id net/collections-fn) "CC-MAIN-2026-25")
+
+        actor (op/build st {:advise-fn advise-fn
+                            :embed-fn embed-fn
+                            :fetch-fn net/cdx-http-fn
+                            :warc-fetch-fn net/warc-fetch-fn
+                            :ingest-fn ingest-fn
+                            :collection-id collection-id})
+
+        summary (loop/tick! {:store st :actor actor :seeds seeds
+                             :budget-cap budget-cap :owner (str "tick-" (identity/now-ms))
+                             :collection-id collection-id
+                             :iceberg-sync-fn live-iceberg/sync-fn})]
+    (println "actor DID:" (:did id))
+    (println "collection:" collection-id)
+    (println (pr-str summary))
+    (println "iceberg sync:" (pr-str (:iceberg summary)))
+    (when-not (:skipped summary)
+      (println "\n── this tick's ledger entries ──")
+      (doseq [f (take-last (:attempted summary 0) (store/ledger st))]
+        (println " " (report/ledger-line f))))))
+
+(apply -main *command-line-args*)

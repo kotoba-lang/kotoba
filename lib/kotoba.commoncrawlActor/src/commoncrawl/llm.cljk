@@ -1,0 +1,118 @@
+(ns commoncrawl.llm
+  "The `:advise` node's contained intelligence — an LLM extraction call
+  following the `70-tools/bmc/src/gftd/cli.cljc` `llm-complete-fn`
+  convention: `murakumo-main` alias resolution (AGENTS.md's repo-wide
+  mandatory LLM model-selection rule, ADR-2607173100 — never hardcode a
+  concrete model id), a single `(fn [prompt] -> completion-string)`
+  capability, dual OpenAI/Anthropic response-shape tolerance. This is
+  DELIBERATELY not `cloud_itonami.murakumo`'s `GatewayInference` client —
+  that ns's own docstring says it has zero callers and shouldn't be wired
+  yet (ADR-2607192200 decision 5).
+
+  Like `talent.hrllm`, this is a *smart-but-untrusted advisor*: it returns a
+  PROPOSAL (category/summary/entities + a self-reported confidence), never
+  a committed record — `commoncrawl.policy`'s `:govern` node is the only
+  thing that decides whether a proposal is trustworthy enough to reach
+  `:commit`. An unparseable/garbage response degrades to a safe, empty,
+  zero-confidence proposal (never a thrown exception, never a fabricated
+  guess) — same discipline as `talent.hrllm/parse-proposal`.
+
+  `complete-fn` is the ONLY capability this ns takes: `(fn [prompt] ->
+  completion-string)`, exactly `gftd.cli`'s `llm-complete-fn` return shape —
+  tests inject a fn returning a canned EDN string (see
+  test/commoncrawl/llm_test.cljk); the real nbb implementation
+  (`commoncrawl.live-http/llm-complete-fn`) shells out to `curl` against
+  `api.murakumo.cloud/v1/messages`, same idiom as `gftd.cli`'s own :cljs
+  branch."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]))
+
+(def system-prompt
+  "Instructs the model to return ONE EDN map and nothing else — same
+  discipline as talent.hrllm's system-prompt (no prose, no markdown fence,
+  a single parseable data literal)."
+  (str "You are a web-page content classifier. Given a page's title and "
+       "body text, return EXACTLY ONE EDN map and nothing else (no prose, "
+       "no markdown fences). Keys: :category (a short string, e.g. "
+       "\"corporate registry\" / \"news\" / \"product page\"), :summary "
+       "(a plain-language summary, at most 3 sentences), :entities (a "
+       "vector of notable named-entity strings mentioned on the page, at "
+       "most 10), :confidence (a number 0..1, how confident you are the "
+       "category/summary/entities are accurate given the provided text). "
+       "Base every field ONLY on the given title/text — never invent "
+       "facts not present in the input."))
+
+(def ^:private max-prompt-chars
+  "Keep the page text handed to the model bounded — this is a classification
+  prompt, not a full-document analysis; a very long page is truncated
+  rather than sent whole (bounds request size/cost/latency)."
+  6000)
+
+(defn build-prompt
+  "{:url :title :text} -> the user-turn prompt string."
+  [{:keys [url title text]}]
+  (str "URL: " url "\n"
+       "Title: " (or title "") "\n"
+       "Text: " (subs (str text) 0 (min (count (str text)) max-prompt-chars))))
+
+(defn- coerce-entities [v]
+  (cond
+    (sequential? v) (vec (take 10 (filter #(and (string? %) (seq %)) (map str v))))
+    :else []))
+
+(defn- coerce-confidence [v]
+  (cond
+    (and (number? v) #?(:clj (Double/isFinite (double v)) :cljs (js/Number.isFinite v)))
+    (max 0.0 (min 1.0 (double v)))
+    :else 0.0))
+
+(defn parse-extraction
+  "The model's raw completion string -> a defensively-parsed proposal map
+  {:category :summary :entities :confidence :raw}. ANY parse/shape failure
+  (not a map, unreadable EDN, model refusal prose, ...) yields a safe
+  all-empty, zero-confidence proposal — `commoncrawl.policy`'s confidence
+  floor then naturally routes this to HOLD, same as talent.hrllm's
+  unparseable-output handling. Also tolerates a ```edn ... ``` markdown
+  fence (observed model behavior, same normalization `gftd.cli`'s
+  `strip-fences` performs) even though the system prompt asks the model
+  not to add one."
+  [content]
+  (let [s (-> (str content) str/trim)
+        s (if (str/starts-with? s "```")
+            (-> s (str/replace #"^```[a-zA-Z0-9]*\s*" "") (str/replace #"\s*```\s*$" ""))
+            s)
+        p (try (edn/read-string s) (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      {:category (let [c (:category p)] (if (string? c) c ""))
+       :summary (let [s2 (:summary p)] (if (string? s2) s2 ""))
+       :entities (coerce-entities (:entities p))
+       :confidence (coerce-confidence (:confidence p))
+       :raw content}
+      {:category "" :summary "" :entities [] :confidence 0.0 :raw content})))
+
+(defn advise
+  "`complete-fn` (a `(fn [prompt] -> string)`) + `{:url :title :text}` -> the
+  parsed extraction proposal. Never throws — `complete-fn` itself failing
+  (network error, etc.) is caught and yields the same safe empty/zero-
+  confidence proposal `parse-extraction` uses for an unparseable response,
+  so a live-LLM outage degrades to HOLD via the confidence floor rather
+  than crashing the graph run."
+  [complete-fn page]
+  (try
+    (parse-extraction (complete-fn (build-prompt page)))
+    (catch #?(:clj Exception :cljs :default) e
+      {:category "" :summary "" :entities [] :confidence 0.0
+       :raw (str "advise error: " #?(:clj (.getMessage e) :cljs (.-message e)))})))
+
+(defn trace
+  "Audit record for the :advise step — the LLM's own extraction is a key
+  interpretable asset (same role talent.hrllm/trace's rationale/cites play
+  for HR evaluations)."
+  [{:keys [url]} proposal]
+  {:t :llm-extraction
+   :url url
+   :category (:category proposal)
+   :summary (:summary proposal)
+   :entities (:entities proposal)
+   :confidence (:confidence proposal)})

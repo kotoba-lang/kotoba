@@ -1,0 +1,121 @@
+(ns commoncrawl.kotobase
+  "net-kotobase `web.ingest` / `web.search` XRPC client — the `:commit`
+  node's ONLY write path. Wire shape (URL, headers, body fields) verified
+  directly against net-kotobase's own edge code and lexicons:
+
+    POST https://kotobase.net/xrpc/ai.gftd.apps.kotobase.web.ingest
+    POST https://kotobase.net/xrpc/ai.gftd.apps.kotobase.web.search
+    headers: Authorization: CACAO <cacao-b64>
+             X-Kotoba-Did: <did>
+    (both required by kotobase.net's edge `resolveViewer` gate — see
+    `commoncrawl.identity`'s ns docstring; `cacao_b64` ALSO rides in the
+    JSON body per the lexicons, matching every other caller's convention)
+
+  `web.ingest` body: {url title? text? lang? extracted_category?
+  extracted_summary? extracted_entities? embedding? db_name? cacao_b64?
+  expected_parent?} (`kotobase.web/validate-webpage` +
+  `kotobase.domain-search/handle-web-ingest`, ADR-2607192200's additive
+  extracted-metadata/embedding fields).
+
+  `web.search` body: {q db_name? graph? limit? query_embedding? cacao_b64?}
+  (`kotobase.domain-search/handle-web-search`).
+
+  Pure payload-building + response-parsing; `http-fn` is the ONLY injected
+  capability: `(fn [{:keys [url method headers body]}] -> {:status :body})`
+  where `:body` is the ALREADY-JSON-parsed response map (or nil on a
+  transport failure) — tests inject a fn recording/returning canned data
+  (test/commoncrawl/kotobase_test.cljk); the real nbb POST+JSON-parse lives
+  in `commoncrawl.live-http`.")
+
+(def base-url "https://kotobase.net")
+(def ingest-path "/xrpc/ai.gftd.apps.kotobase.web.ingest")
+(def search-path "/xrpc/ai.gftd.apps.kotobase.web.search")
+
+(defn ingest-url [] (str base-url ingest-path))
+(defn search-url [] (str base-url search-path))
+
+(defn auth-headers
+  "The two headers every write/search call needs (see ns docstring) plus
+  `content-type` — a plain map, so `http-fn` implementations can merge it
+  straight into whatever request-options shape they use."
+  [{:keys [cacao-b64 did]}]
+  (cond-> {"Content-Type" "application/json"}
+    cacao-b64 (assoc "Authorization" (str "CACAO " cacao-b64))
+    did       (assoc "X-Kotoba-Did" did)))
+
+;; ── web.ingest ────────────────────────────────────────────────────────────
+
+(defn build-ingest-body
+  "{:url :title? :text? :lang? :extracted-category? :extracted-summary?
+  :extracted-entities? :embedding? :db-name? :cacao-b64?} -> the JSON body
+  map, snake_case field names per the lexicon. Only present (some?)
+  optional keys are included — omitting extracted-*/embedding is
+  byte-identical to a pre-ADR-2607192200 plain ingest call, matching the
+  lexicon's own additive-field discipline."
+  [{:keys [url title text lang extracted-category extracted-summary
+           extracted-entities embedding db-name cacao-b64 expected-parent]}]
+  (cond-> {"url" url}
+    (some? title) (assoc "title" title)
+    (some? text) (assoc "text" text)
+    (some? lang) (assoc "lang" lang)
+    (some? extracted-category) (assoc "extracted_category" extracted-category)
+    (some? extracted-summary) (assoc "extracted_summary" extracted-summary)
+    (and (sequential? extracted-entities) (seq extracted-entities))
+    (assoc "extracted_entities" (vec extracted-entities))
+    (and (sequential? embedding) (seq embedding)) (assoc "embedding" (vec embedding))
+    (some? db-name) (assoc "db_name" db-name)
+    (some? cacao-b64) (assoc "cacao_b64" cacao-b64)
+    (some? expected-parent) (assoc "expected_parent" expected-parent)))
+
+(defn ingest!
+  "POST one page to web.ingest. `http-fn` per ns docstring. Returns
+  {:ok bool :status :body}; never throws — a kotobase outage degrades to
+  {:ok false ...}, same discipline as
+  `cloud_itonami.net_kotobase/kg-ingest!`."
+  [http-fn session page]
+  (try
+    (let [{:keys [status body]}
+          (http-fn {:url (ingest-url) :method :post
+                    :headers (auth-headers session)
+                    :body (build-ingest-body (merge page (select-keys session [:cacao-b64])))})
+          ok? (and status (<= 200 status 299))]
+      (cond-> {:ok (boolean ok?) :status status}
+        (not ok?) (assoc :body body)
+        ok? (assoc :body body)))
+    (catch #?(:clj Exception :cljs :default) e
+      {:ok false :error #?(:clj (.getMessage e) :cljs (.-message e))})))
+
+;; ── web.search ────────────────────────────────────────────────────────────
+
+(defn build-search-body
+  "{:q :limit? :query-embedding? :db-name? :cacao-b64?} -> the JSON body
+  map. `query_embedding` is optional/additive (ADR-2607192200) — omitting
+  it is the original token-only search call shape."
+  [{:keys [q limit query-embedding db-name cacao-b64]}]
+  (cond-> {"q" q}
+    (some? limit) (assoc "limit" limit)
+    (and (sequential? query-embedding) (seq query-embedding))
+    (assoc "query_embedding" (vec query-embedding))
+    (some? db-name) (assoc "db_name" db-name)
+    (some? cacao-b64) (assoc "cacao_b64" cacao-b64)))
+
+(defn search!
+  "POST a web.search query. Returns {:ok bool :results [...] :count :body}
+  on a parseable response, {:ok false ...} on transport/shape failure.
+  Never throws."
+  [http-fn session q & [opts]]
+  (try
+    (let [{:keys [status body]}
+          (http-fn {:url (search-url) :method :post
+                    :headers (auth-headers session)
+                    :body (build-search-body (merge {:q q} opts
+                                                     (select-keys session [:cacao-b64])))})
+          ok? (and status (<= 200 status 299) (map? body) (true? (get body "ok" (get body :ok))))]
+      (if ok?
+        {:ok true
+         :results (or (get body "results") (get body :results) [])
+         :count (or (get body "count") (get body :count))
+         :body body}
+        {:ok false :status status :body body}))
+    (catch #?(:clj Exception :cljs :default) e
+      {:ok false :error #?(:clj (.getMessage e) :cljs (.-message e))})))
