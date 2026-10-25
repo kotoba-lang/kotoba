@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.comLinkedin` | `kotoba.comLinkedin/src` | `linkedin.client` (Kotoba project library) |
 | `kotoba.comLineMessaging` | `kotoba.comLineMessaging/src` | `line-messaging.async-signature`, `line-messaging.client`, `line-messaging.events`, `line-messaging.signature` (Kotoba project library) |
 | `kotoba.comInstagram` | `kotoba.comInstagram/src` | `instagram.client` (Kotoba project library) |
 | `kotoba.comAviationIaArinc664` | `kotoba.comAviationIaArinc664/src` | `afdx.bag`, `afdx.bytes`, `afdx.ethernet`, `afdx.frame` (Kotoba project library) |
