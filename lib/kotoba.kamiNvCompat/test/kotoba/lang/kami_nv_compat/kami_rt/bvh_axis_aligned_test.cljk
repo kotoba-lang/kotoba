@@ -1,0 +1,106 @@
+(ns kotoba.lang.kami-nv-compat.kami-rt.bvh-axis-aligned-test
+  "Regression: an axis-aligned ray must not miss geometry it passes through.
+
+   ## The defect
+
+   `slab-hit` divides by each direction component up front (`inv-d`), which is
+   the standard fast slab test. When a component is exactly `0.0`, `inv-d` is
+   infinite, and if the node's slab boundary on that axis *equals the ray origin*
+   the product is `(0.0 * Infinity)` = `NaN`. Every comparison against `NaN` is
+   false, so the test concludes 'miss' and the traversal skips that node **and
+   its whole subtree**.
+
+   That coincidence is not rare. A median-split BVH over a box centred on the
+   origin splits at 0, and a ray fired from the origin along an axis has origin
+   0 on the very axis whose slab boundary is 0. Measured before the fix: of 512
+   directions from the centre of a closed 12-triangle box, **344 escaped** —
+   the box leaked two thirds of its rays.
+
+   It surfaced through occlusion queries (`kotoba.render.probe-bake` asks 'does
+   this ray reach the sky'), where axis-aligned directions are common because
+   low-discrepancy sequences put many samples exactly on the axes: a Hammersley
+   phi of 0, pi/2, pi or 3pi/2 makes `cos` or `sin` exactly zero.
+
+   ## Why a closed box is the right shape for this test
+
+   A ray fired from inside a sealed solid must hit something in *every*
+   direction. Any escape is a bug, with no tolerance argument available — unlike
+   a grazing-angle test, where two implementations may legitimately disagree."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.kami-nv-compat.kami-rt.bvh :as bvh]))
+
+(defn closed-box
+  "12 triangles forming a closed axis-aligned box."
+  [[x0 y0 z0] [x1 y1 z1]]
+  (let [v [[x0 y0 z0] [x1 y0 z0] [x1 y1 z0] [x0 y1 z0]
+           [x0 y0 z1] [x1 y0 z1] [x1 y1 z1] [x0 y1 z1]]
+        quad (fn [a b c d] [[(v a) (v b) (v c)] [(v a) (v c) (v d)]])]
+    (vec (concat (quad 0 1 2 3) (quad 4 5 6 7)
+                 (quad 0 1 5 4) (quad 3 2 6 7)
+                 (quad 0 3 7 4) (quad 1 2 6 5)))))
+
+(defn- traced [tris origin dir]
+  (let [soup (bvh/triangle-soup tris)
+        accel (bvh/build-bvh soup)]
+    (bvh/trace-closest soup accel origin dir)))
+
+(def ^:private box (closed-box [-5.0 -5.0 -5.0] [5.0 5.0 5.0]))
+
+(deftest axis-aligned-rays-from-the-centre-all-hit
+  (testing "the six cardinal directions have two exactly-zero components each,
+            and the split plane of a centred box sits on the ray origin"
+    (doseq [d [[1.0 0.0 0.0] [-1.0 0.0 0.0]
+               [0.0 1.0 0.0] [0.0 -1.0 0.0]
+               [0.0 0.0 1.0] [0.0 0.0 -1.0]]]
+      (is (some? (traced box [0.0 0.0 0.0] d))
+          (str "a ray from inside a sealed box must hit a wall, direction " d)))))
+
+(deftest one-zero-component-rays-from-the-centre-all-hit
+  (testing "a single exactly-zero component is enough to trigger it"
+    (doseq [d [[0.6 0.0 0.8] [-0.6 0.0 0.8] [0.6 0.0 -0.8]
+               [0.0 0.6 0.8] [0.0 -0.6 0.8]
+               [0.8 0.6 0.0] [-0.8 0.6 0.0]]]
+      (is (some? (traced box [0.0 0.0 0.0] d))
+          (str "direction " d)))))
+
+(deftest no-ray-escapes-a-sealed-box
+  (testing "the aggregate statement, over a deterministic sweep that deliberately
+            includes exact axis values. Before the fix, 344 of 512 escaped."
+    (let [dirs (for [i (range 16) j (range 16)
+                     :let [u (/ (+ i 0.5) 16)
+                           ;; phi values that land exactly on the axes
+                           phi (* 2.0 Math/PI (/ j 16.0))
+                           z (- 1.0 (* 2.0 u))
+                           r (Math/sqrt (max 0.0 (- 1.0 (* z z))))]]
+                 [(* r (Math/cos phi)) (* r (Math/sin phi)) z])
+          escaped (remove #(some? (traced box [0.0 0.0 0.0] %)) dirs)]
+      (is (zero? (count escaped))
+          (str (count escaped) " of " (count dirs)
+               " rays escaped a sealed box; first few: " (vec (take 3 escaped)))))))
+
+(deftest rays-that-should-miss-still-miss
+  (testing "the fix must not turn the test into 'always hit' — that would make
+            every occlusion query report full shadow"
+    (is (nil? (traced box [50.0 0.0 0.0] [1.0 0.0 0.0]))
+        "outside, pointing away")
+    (is (some? (traced box [50.0 0.0 0.0] [-1.0 0.0 0.0]))
+        "outside, pointing back at the box")
+    (is (nil? (traced box [0.0 50.0 0.0] [0.0 1.0 0.0]))
+        "above, pointing up — axis-aligned, and must still miss")
+    (is (nil? (traced box [20.0 20.0 0.0] [0.0 0.0 1.0]))
+        "beside the box on two axes, travelling parallel to the third")))
+
+(deftest parallel-ray-outside-the-slab-misses
+  (testing "a ray travelling exactly parallel to an axis, offset so it passes
+            outside the box, must miss — this is the case the NaN guard must not
+            accidentally turn into a hit"
+    (is (nil? (traced box [0.0 8.0 0.0] [1.0 0.0 0.0])))
+    (is (nil? (traced box [8.0 0.0 0.0] [0.0 1.0 0.0])))
+    (is (nil? (traced box [0.0 0.0 8.0] [1.0 0.0 0.0])))))
+
+(deftest ray-grazing-exactly-along-a-face-plane
+  (testing "origin exactly on a face plane, direction parallel to it: the ray
+            lies in the boundary, which is the precise configuration that
+            produced NaN"
+    (is (some? (traced box [0.0 5.0 0.0] [0.0 -1.0 0.0]))
+        "starting on the +y face pointing inward must hit the far wall")))
