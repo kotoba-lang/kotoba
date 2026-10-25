@@ -1,0 +1,143 @@
+(ns kotobase.lfs.batch
+  "The Git LFS Batch API wire: request validation and response construction.
+
+  Pure data in, pure data out — no store, no clock, no transport. The engine
+  layer decides what exists and what a client may have; this namespace only
+  knows what a well-formed batch looks like.
+
+  Two wire facts that are easy to get wrong and expensive to get wrong:
+
+  1. **An upload of an object the server already has must omit `actions`
+     entirely.** Not an empty map, not an upload href the client is expected
+     to skip. Omission is how the protocol says `already uploaded`, and
+     sending an href instead makes every client re-upload every object it
+     already pushed.
+
+  2. **LFS is an HTTP-status protocol.** It is not XRPC: a 200 carrying
+     `{ok: false}` reads as success to every LFS client. The kotobase datom
+     plane speaks the opposite convention on the same host, so the two must
+     not be routed through one shared response helper (superproject
+     ADR-2608012600 D6, and the mirror image of the client-side bug recorded
+     in ADR-2607175000 (3)).
+
+  Values on the wire are strings and numbers only — never keywords. A
+  keyword serialises to a JSON string that no longer round-trips back to a
+  keyword, so a wire map built with keyword values is a map that means
+  something different after one hop (ADR-2608019000)."
+  (:require [kotoba.lang.text :as str]))
+
+(def content-type "application/vnd.git-lfs+json")
+
+(def operations #{"download" "upload"})
+(def supported-transfer "basic")
+(def supported-hash-algo "sha256")
+
+;; No limit exists in the spec, so the server has to pick one. A batch is a
+;; single request that fans out to one grant per object; leaving it unbounded
+;; makes one request as expensive as the client wants it to be.
+(def ^:const max-objects 1000)
+
+(def ^:private oid-re #"^[0-9a-f]{64}$")
+
+(defn- valid-oid? [oid]
+  (and (string? oid) (boolean (re-matches oid-re oid))))
+
+(defn- valid-size? [size]
+  (and (integer? size) (not (neg? size))))
+
+(defn error
+  "A request-level LFS error body. The HTTP status is carried alongside as
+  `:status` and must be used — this body means nothing on a 200."
+  ([status message] (error status message nil))
+  ([status message request-id]
+   {:status status
+    :body (cond-> {:message message}
+            request-id (assoc :request_id request-id))}))
+
+(defn parse-request
+  "Decoded JSON body → {:operation .. :objects [{:oid :size}..] :ref ..}
+  or {:status 422 :body {..}}.
+
+  Rejects rather than coerces: an oid with uppercase hex, a float size or an
+  unknown transfer are all the client telling us something we would have to
+  guess about."
+  [body]
+  (let [{:keys [operation objects transfers hash_algo]} body]
+    (cond
+      (not (map? body))
+      (error 422 "request body must be a JSON object")
+
+      (not (contains? operations operation))
+      (error 422 "operation must be \"download\" or \"upload\"")
+
+      (and (some? hash_algo) (not= supported-hash-algo hash_algo))
+      (error 422 (str "unsupported hash_algo; this server implements only "
+                      supported-hash-algo))
+
+      (and (seq transfers) (not (some #{supported-transfer} transfers)))
+      (error 422 (str "no supported transfer adapter offered; this server "
+                      "implements only \"" supported-transfer "\""))
+
+      (or (not (sequential? objects)) (empty? objects))
+      (error 422 "objects must be a non-empty array")
+
+      (> (count objects) max-objects)
+      (error 422 (str "batch exceeds " max-objects " objects"))
+
+      (not (every? (fn [o] (and (map? o) (valid-oid? (:oid o)) (valid-size? (:size o))))
+                   objects))
+      (error 422 "every object needs a lower-case sha256 oid and a non-negative integer size")
+
+      :else
+      {:operation operation
+       :objects (mapv (fn [o] {:oid (:oid o) :size (:size o)}) objects)
+       ;; Idempotent: a already-parsed request carries :ref as the name
+       ;; string, a wire request as {:name ..}.
+       :ref (let [r (:ref body)] (if (string? r) r (:name r)))})))
+
+;; ── response construction ───────────────────────────────────────────────────
+
+(defn action
+  "One entry of the `actions` map.
+
+  `expires-in` is seconds and is REQUIRED for a signed href: a grant with no
+  advertised expiry invites a client to cache a URL that stops working, and
+  it hides from the client that the URL is a credential at all."
+  [{:keys [href headers expires-in]}]
+  (cond-> {:href href}
+    (seq headers) (assoc :header headers)
+    (some? expires-in) (assoc :expires_in expires-in)))
+
+(defn object-with-actions
+  [{:keys [oid size]} actions]
+  (cond-> {:oid oid :size size :authenticated true}
+    (seq actions) (assoc :actions actions)))
+
+(defn object-already-present
+  "The upload response for an object the server already holds.
+
+  `actions` is OMITTED, which is the protocol's way of saying so."
+  [{:keys [oid size]}]
+  {:oid oid :size size :authenticated true})
+
+(defn object-error
+  [{:keys [oid size]} code message]
+  {:oid oid :size size :error {:code code :message message}})
+
+(defn response
+  "The batch response body. Always reports which transfer adapter was chosen
+  so a client that offered several knows which one it got."
+  [objects]
+  {:transfer supported-transfer
+   :objects (vec objects)
+   :hash_algo supported-hash-algo})
+
+(defn accepts?
+  "True when the client asked for the LFS media type.
+
+  Git LFS always sends it; a request without it is usually a browser or a
+  probe, and answering those with a batch response encourages treating this
+  endpoint as a generic API."
+  [accept-header]
+  (and (string? accept-header)
+       (str/includes? accept-header content-type)))

@@ -1,0 +1,207 @@
+diff --git a/deps.edn b/deps.edn
+index 452b993..a052b7c 100644
+--- a/deps.edn
++++ b/deps.edn
+@@ -21,4 +21,30 @@
+   ;; every provider in this family actually deploys on.
+   :cljs-test {:extra-paths ["test"]
+               :extra-deps {org.clojure/clojurescript
+-                           {:mvn/version "1.11.132"}}}}}
++                           {:mvn/version "1.11.132"}}}
++
++  ;; `clojure -M:cljs-compile`
++  ;;
++  ;; Not a third test suite — it runs no assertions. It asks the one question
++  ;; neither existing gate can: does this namespace COMPILE with the
++  ;; ClojureScript compiler.
++  ;;
++  ;; `clojure -M:test` runs on the JVM and `nbb test/run.cljs` runs on SCI,
++  ;; and in both of those `satisfies?` is an ordinary function. In compiled
++  ;; ClojureScript it is a macro that resolves its protocol argument at
++  ;; compile time, so a computed protocol is not a slower spelling of the
++  ;; same thing — it is a namespace that does not build. That shipped in
++  ;; `validate-object-store!` on 2026-08-16 and both gates stayed green,
++  ;; because an interpreter cannot fail a macroexpansion the way a compiler
++  ;; does. It was found by a downstream Worker build, which is the wrong
++  ;; place to find it: every provider in this family deploys through
++  ;; shadow-cljs, and this library sits under all of them.
++  :cljs-compile
++  {:extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}
++   :main-opts ["-m" "cljs.main" "-t" "node" "-O" "none"
++               "-d" "target/cljs-compile"
++               "-c" "kotobase.storage.object"
++               "-c" "kotobase.storage.core"
++               "-c" "kotobase.storage.observed-ref"
++               "-c" "kotobase.storage.signed-head"
++               "-c" "kotobase.storage.verify"]}}}
+diff --git a/src/kotobase/storage/object.cljc b/src/kotobase/storage/object.cljc
+index 44e03bd..81a7ccf 100644
+--- a/src/kotobase/storage/object.cljc
++++ b/src/kotobase/storage/object.cljc
+@@ -43,6 +43,23 @@
+   (-put-object! [store cid bytes])
+   (-get-object [store cid] "bytes, or nil."))
+ 
++(defprotocol IRangeRead
++  (-get-object-range [store cid start end]
++    "The bytes of `[start, end)` — HALF-OPEN, like `subs`.
++
++     HTTP `Range` is inclusive at both ends, so a provider sends
++     `bytes=<start>-<end - 1>`. Getting that conversion wrong costs or gains
++     exactly one byte, which for a CAR frame means a varint that parses and a
++     block that does not — so the boundary is stated here rather than left to
++     each provider.
++
++     Returns nil when the object does not exist. When the object is shorter
++     than `end` it returns the overlap, exactly as HTTP 206 does; a caller
++     that needs the full width must check the length it got. Returning fewer
++     bytes than asked WITHOUT the caller being able to tell is the failure
++     this signature is shaped to avoid — hence bytes or nil, never a short
++     read dressed as a complete one."))
++
+ (defprotocol IObjectCapabilities
+   (-object-capabilities [store] "A set of capability keywords."))
+ 
+@@ -55,8 +72,26 @@
+ (def required-capabilities #{:large-objects})
+ 
+ (def optional-capabilities
++  "Two of these are about ranges and they are NOT the same claim.
++
++  `:range-grant` is a property of the URL this store hands out: the caller
++  fetches the range itself, directly from the endpoint, and the bytes never
++  enter this process. That is the meaning `:range-read` carried when this
++  set was first written, and it is the one a presigned store can make.
++
++  `:range-read` is a property of this store: it will return `[start, end)`
++  itself, through `IRangeRead`. A packed block store needs THIS one — it has
++  to hold the bytes to parse a CAR frame out of them — and a presigned store
++  that can only hand out URLs cannot make the claim by having a signing key.
++
++  They were conflated on 2026-08-16 when the pack plane gave `:range-read`
++  an operation, which silently redefined a word the S3 adapter was already
++  declaring correctly under the old meaning. Splitting them is the fix; the
++  old word keeps the new, narrower meaning because that is the one with a
++  protocol behind it, and the grant property gets the name that says grant."
+   #{:object-delete   ; -delete-object! actually removes the bytes
+-    :range-read      ; a get grant honours an HTTP Range
++    :range-read      ; this store implements IRangeRead
++    :range-grant     ; a get grant it hands out honours an HTTP Range
+     :multipart-put}) ; objects larger than one part can be uploaded
+ 
+ (defn object-store? [value]
+@@ -72,6 +107,28 @@
+ (defn presigned? [store] (= :presigned-transfer (transfer-profile store)))
+ (defn deletes? [store] (contains? (-object-capabilities store) :object-delete))
+ 
++(defn range-read?
++  "True when the store both declares `:range-read` and implements it.
++
++  Both halves are required because they fail differently: a declaration
++  without an implementation crashes the first pack read, and an
++  implementation without a declaration is invisible to every caller that
++  branches on capabilities. `validate-object-store!` refuses the first."
++  [store]
++  (and (contains? (-object-capabilities store) :range-read)
++       (satisfies? IRangeRead store)))
++
++(defn range-grant?
++  "True when a GET grant this store hands out honours an HTTP `Range`.
++
++  Nothing here can verify that — it is a statement about the endpoint the
++  URL points at, and the fetch happens somewhere else entirely. Which is
++  exactly why it is a different word from `:range-read`: one is checkable
++  here and one is not, and a caller deciding whether it can read part of an
++  object needs to know which kind of promise it is holding."
++  [store]
++  (contains? (-object-capabilities store) :range-grant))
++
+ (defn validate-object-store!
+   "Validate a large-object provider, or throw.
+ 
+@@ -96,13 +153,29 @@
+                          {:type :kotobase.storage/undeclared-transfer-profile
+                           :expected transfer-profiles
+                           :declared (set (filter caps transfer-profiles))})))
+-       (when-not (satisfies? (if (= :presigned-transfer profile)
+-                               IPresignedTransfer
+-                               IProxiedTransfer)
+-                             store)
++       ;; The branch is on the RESULT of two `satisfies?` calls, not on which
++       ;; protocol gets passed to one. In ClojureScript `satisfies?` is a
++       ;; macro that resolves its protocol argument at compile time, so
++       ;; `(satisfies? (if ... A B) store)` is not a slightly awkward spelling
++       ;; of the same thing — it fails to macroexpand, and the whole namespace
++       ;; stops compiling. It reads as correct because on the JVM `satisfies?`
++       ;; is an ordinary function and the computed form works there, as it
++       ;; does under nbb's interpreter; the toolchain that rejects it is
++       ;; shadow-cljs, which is the one that builds the Workers. Keep the two
++       ;; calls literal.
++       (when-not (if (= :presigned-transfer profile)
++                   (satisfies? IPresignedTransfer store)
++                   (satisfies? IProxiedTransfer store))
+          (throw (ex-info "Kotobase large-object store declares a transfer profile it does not implement"
+                          {:type :kotobase.storage/transfer-profile-mismatch
+-                          :profile profile})))))
++                          :profile profile})))
++       ;; Same rule, one capability lower down: `:range-read` used to be a
++       ;; word with no operation behind it, so nothing could contradict it.
++       ;; A pack reader is the first caller that depends on it, and it must
++       ;; not discover the gap on the first fetch.
++       (when (and (caps :range-read) (not (satisfies? IRangeRead store)))
++         (throw (ex-info "Kotobase large-object store declares :range-read without IRangeRead"
++                         {:type :kotobase.storage/range-read-capability-mismatch})))))
+    store))
+ 
+ ;; ── grants ──────────────────────────────────────────────────────────────────
+diff --git a/src/kotobase/storage/object_memory.cljc b/src/kotobase/storage/object_memory.cljc
+index f354816..21fa190 100644
+--- a/src/kotobase/storage/object_memory.cljc
++++ b/src/kotobase/storage/object_memory.cljc
+@@ -5,7 +5,7 @@
+   client to — which is exactly the case the profile exists to describe."
+   (:require [kotobase.storage.object :as object]))
+ 
+-(defrecord MemoryObjectStore [state delete?]
++(defrecord MemoryObjectStore [state delete? ranges]
+   object/IObjectStore
+   (-stat-object [_ cid]
+     (object/assert-object-cid! cid)
+@@ -30,14 +30,35 @@
+     (object/assert-object-cid! cid)
+     (get @state cid))
+ 
++  object/IRangeRead
++  (-get-object-range [_ cid start end]
++    (object/assert-object-cid! cid)
++    (when-let [bytes (get @state cid)]
++      ;; Counted, because the whole reason the pack plane exists is that
++      ;; requests are the cost. A store that cannot be asked how many it
++      ;; served cannot be used to check the claim.
++      (swap! ranges conj [cid start end])
++      (let [v (vec bytes)
++            hi (min end (count v))]
++        (when (< start hi)
++          #?(:clj (byte-array (subvec v start hi))
++             :cljs (js/Uint8Array. (clj->js (subvec v start hi))))))))
++
+   object/IObjectCapabilities
+   (-object-capabilities [_]
+-    (cond-> #{:large-objects :proxied-transfer}
++    (cond-> #{:large-objects :proxied-transfer :range-read}
+       delete? (conj :object-delete))))
+ 
+ (defn memory-object-store
+   ([] (memory-object-store {}))
+   ([{:keys [delete?] :or {delete? true}}]
+-   (->MemoryObjectStore (atom {}) delete?)))
++   (->MemoryObjectStore (atom {}) delete? (atom []))))
+ 
+ (defn snapshot [^MemoryObjectStore store] @(.-state store))
++
++(defn ranges-served
++  "Every `[cid start end]` this store has answered, in order. The oracle for
++  a round-trip count."
++  [^MemoryObjectStore store] @(.-ranges store))
++
++(defn reset-ranges! [^MemoryObjectStore store] (reset! (.-ranges store) []))
