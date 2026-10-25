@@ -1,0 +1,121 @@
+#!/usr/bin/env kbb
+;; The backend absences `kotoba/w3/webcodecs/codec_string.kotoba` is written
+;; around, asserted to STILL REPRODUCE -- and failing when they stop.
+;;
+;; Each one cost a compile-and-read cycle to find, and each is worked around in
+;; the component with a comment saying why. A comment is what nobody re-reads, so
+;; this probe holds the same facts as executable assertions: while they hold it
+;; exits 0, and the day any of them is fixed it exits 1 and names what to
+;; simplify.
+;;
+;; Availability is measured by RUNNING the CLI and reading its exit code, not by
+;; `which`: a shim that resolves and then fails to exec turns a skip into a red
+;; for the wrong reason.
+;;
+;;   kbb --backend sci test/w3/webcodecs/backend_gap_probe.cljk
+
+(ns backend-gap-probe
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(defn- sh [cmd args]
+  (let [r (cp/spawnSync cmd (clj->js args) #js {:encoding "utf8"})]
+    {:exit (or (.-status r) -1) :out (str (.-stdout r) (.-stderr r))}))
+
+(defn- cli-usable? [] (zero? (:exit (sh "kotoba" ["--help"]))))
+
+(def ^:private tmp (fs/mkdtempSync (path/join (os/tmpdir) "codec-string-gap-")))
+
+(defn- write! [name source]
+  (let [p (path/join tmp (str name ".kotoba"))]
+    (fs/writeFileSync p source)
+    p))
+
+;; `-M check` admits it, or it does not.
+(defn- checks? [name source]
+  (let [{:keys [out]} (sh "kotoba" ["-M" "check" (write! name source)])]
+    (boolean (re-find #":ok true" out))))
+
+;; `-M compile --target js-browser` lowers it, or it does not. This is a SECOND
+;; gate: `bit-or` passes the first and fails this one.
+(defn- lowers-to-js? [name source]
+  (let [p (write! name source)
+        out (path/join tmp (str name ".mjs"))]
+    (zero? (:exit (sh "kotoba" ["-M" "compile" p "--target" "js-browser" "--output" out])))))
+
+;; `-M test` runs the `test-*` exports on jvm-kir, js AND wasm. A fact that only
+;; one target disagrees about can only be measured here.
+(defn- runs-everywhere? [name source]
+  ;; The TOP-LEVEL `:ok`, anchored to the report header. A bare `#":ok true"`
+  ;; matches the per-test entries inside a FAILING report, so this probe reported
+  ;; a closed gap for a divergence that was still there -- caught the first time
+  ;; it ran, which is the argument for running a probe before trusting it.
+  (let [{:keys [out]} (sh "kotoba" ["-M" "test" (write! name source) "--json"])]
+    (boolean (re-find #"kotoba\.test-report/v1, :ok true" out))))
+
+(def ^:private ns-line "(ns probe.gap\n  (:export [v]))\n\n")
+
+(def ^:private facts
+  ;; Float division is NOT in this list, and that is deliberate: it is admitted,
+   ;; lowered and correct on all three targets. The first version of this probe
+   ;; claimed otherwise because the measurement wrote `(/ (f64 i) 10.0)` -- one
+   ;; expression containing both operations -- and blamed the division for the
+   ;; conversion's refusal. Each fact below is one operation.
+  [{:label "int-to-float conversion has no lowering"
+    :simplify "the level can be computed from level_idc inside the guest"
+    :still-broken?
+    (fn [] (not (checks? "itof" (str ns-line "(defn v [i :i64] :f64\n  (f64 i))\n"))))}
+   {:label "no bit shift has a lowering (any spelling)"
+    :simplify "`hex2` can shift instead of dividing by 16, and the flag mask table goes"
+    :still-broken?
+    (fn [] (not (or (checks? "shr" (str ns-line "(defn v [x :i64] :i64\n  (bit-shift-right x 4))\n"))
+                    (checks? "shr2" (str ns-line "(defn v [x :i64] :i64\n  (i64shr x 4))\n")))))}
+   {:label "bit-or passes -M check and has NO js lowering"
+    :simplify "`format-avc-codec-string` can set constraint_set3 with `bit-or`"
+    :still-broken?
+    (fn [] (let [src (str ns-line "(defn v [x :i64] :i64\n  (bit-or x 16))\n")]
+             ;; BOTH halves, so this stays honest if `check` ever starts refusing
+             ;; it: the fact is the DIVERGENCE, not either gate alone.
+             (and (checks? "bor" src) (not (lowers-to-js? "bor-js" src)))))}
+   {:label "jvm-kir refuses document-bool of a function-returned :bool"
+    :simplify "the `(if x true false)` wrapper in `parse-avc-codec-string` goes"
+    :still-broken?
+    (fn []
+      (let [bare (str "(ns probe.gap\n  (:export [d test-it]))\n\n"
+                      "(defn- p [a :i64 b :i64] :bool\n  (and (= a 11) (= (bit-and b 16) 16)))\n\n"
+                      "(defn d [] :document\n  (document-map :x (document-bool (p 11 16))))\n\n"
+                      "(defn test-it [] :i64\n  (if (if (= (document-kind (d)) :map) true false) 1 0))\n")
+            wrapped (.replace bare "(document-bool (p 11 16))" "(document-bool (if (p 11 16) true false))")]
+        ;; The pair is the measurement: the bare form must fail and the wrapped
+        ;; one must pass. If the bare form starts passing the gap is closed; if
+        ;; the WRAPPED one starts failing something else broke and this probe
+        ;; must not report either as the known gap.
+        (and (not (runs-everywhere? "docbool-bare" bare))
+             (runs-everywhere? "docbool-wrapped" wrapped))))}])
+
+(defn -main []
+  (if-not (cli-usable?)
+    (do (println "SKIP: the kotoba CLI did not run (non-zero exit).")
+        (println "      A skip, not a pass: these gaps are UNVERIFIED today.")
+        (js/process.exit 0))
+    (let [results (mapv (fn [{:keys [label simplify still-broken?]}]
+                          {:label label :simplify simplify :broken? (still-broken?)})
+                        facts)
+          fixed (remove :broken? results)]
+      (println "backend gaps behind kotoba/w3/webcodecs/codec_string.kotoba:")
+      (doseq [{:keys [label broken?]} results]
+        (println "  " (if broken? "still true " "NO LONGER  ") label))
+      (println)
+      (if (seq fixed)
+        (do (println (count fixed) "of" (count results) "gaps are gone. What can be simplified:")
+            (doseq [{:keys [simplify]} fixed] (println "   -" simplify))
+            (println)
+            (println "Re-run `kotoba -M test` and `kbb -M:test` after simplifying,")
+            (println "and delete the corresponding note from the component header.")
+            (js/process.exit 1))
+        (do (println "All" (count results) "still hold, so the component's shape is still the right one.")
+            (js/process.exit 0))))))
+
+(-main)

@@ -1,0 +1,327 @@
+;; w3.webcodecs.codec-string as a Kotoba component -- the WebCodecs codec string
+;; (`avc1.PPCCLL`), per the AVC Codec Registration spec, which borrows the syntax
+;; from RFC 6381 / ISO-IEC 14496-15. ADR-q9-whole-component-build-migration,
+;; `:migration-unit :whole-component`.
+;;
+;; The whole namespace moves: the profile table both ways, the constraint-flag
+;; test, the level_idc/level_1b ambiguity, the parser, the formatter and the
+;; simple-token parser. There is no host mechanism in it -- `w3.webcodecs.cljs`
+;; owns VideoDecoder/VideoEncoder and is untouched.
+;;
+;; ## Three design changes, and the measurement behind the third
+;;
+;; 1. NO REGEX. The oracle matches
+;;    `(avc[13])\.([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})([0-9A-Fa-f]{2})`, which is a
+;;    fixed 11-character shape: four-cc, a dot, six hex digits. So there is
+;;    nothing to search for and the parse is positional (ADR-2608650000
+;;    decision 6). Hex digits are range tests on `string-code-point-at`.
+;;
+;; 2. MAPS BECOME DOCUMENTS. `parse-avc-codec-string` returns nil or a map; the
+;;    guest returns `(document-null)` or the same map as a document, so a
+;;    malformed string is still distinguishable from a parsed one and the keys
+;;    are the oracle keys.
+;;
+;; 3. THE LEVEL IS CARRIED AS level_idc, NOT AS A FLOAT -- and that is a
+;;    measured backend gap, not a preference.
+;;
+;;    The oracle answers `level_idc / 10.0` (3.1 for 0x1F) or the keyword `:1b`
+;;    for the ambiguous 11-with-constraint_set3 case. Measured 2026-09-09: f64
+;;    literals, `+`, `*`, `<` AND `/` are all admitted and lowered -- float
+;;    division works and runs on jvm-kir, js and wasm. What is missing is the
+;;    CONVERSION: `(f64 i)`, `(f32 i)` and `(i64 x)` all answer `operation has no
+;;    admitted lowering`. So the arithmetic is available and there is no way to
+;;    get an integer into it.
+;;
+;;    That correction is itself measured. An earlier version of this note said
+;;    float division was missing too, because the first probe wrote
+;;    `(/ (f64 i) 10.0)` -- one expression containing both -- and attributed the
+;;    refusal to the division. `backend_gap_probe.cljs` tests them separately for
+;;    that reason.
+;;
+;;    No information is lost by carrying level_idc: level_idc <-> level is a
+;;    bijection apart from the 1b case, and that case is exported separately as
+;;    `level-1b?`. The division is a rendering, and it stays with the caller,
+;;    which is where floats exist. The parity test does the division on the JVM
+;;    side and compares against the oracle, so the claim that nothing is lost is
+;;    asserted rather than argued.
+;;
+;;    Two more measured absences, worked around in place rather than assumed:
+;;    NO SHIFT is lowered in any spelling (`bit-shift-right`, `bit-shift-left`,
+;;    `i64shr`, `i64ushr`, `i64shl`), `i64and` / `i64or` are refused outright,
+;;    and `bit-or` passes `-M check` and then has NO js LOWERING -- the same
+;;    class as `string-upper` and `string-split-count`. Only `bit-and` survives
+;;    both gates. So `hex2` divides by 16, the constraint-flag mask is a
+;;    six-entry table, and setting one flag is an addition guarded by the
+;;    `bit-and` test for whether it is already set.
+;;
+;;    Removal: when an int-to-float conversion is admitted, `avc-level` can
+;;    divide by 10.0 itself and the caller stops doing it.
+;;    `test/w3/webcodecs/backend_gap_probe.cljk` asserts every absence here STILL
+;;    reproduces and goes red on the day any of them does not.
+;;
+;; `.cljc` remains the oracle. Clojure-shaped twin: codec_string.cljk.
+;;
+;; Compile / run (the CLI needs -M and an ABSOLUTE path):
+;;   kotoba -M test /abs/kotoba/w3/webcodecs/codec_string.kotoba --json
+
+(ns w3.webcodecs.codec-string
+  (:export [hex2 parse-hex-byte avc-profile-name avc-profile-idc
+            constraint-set-flag? level-1b? avc-level-tenths
+            avc-codec-string? parse-avc-codec-string
+            format-avc-codec-string parse-simple-codec
+            test-hex test-profiles test-flags test-level-1b
+            test-shape test-parse-kind test-parse-bytes test-format test-simple
+            test-malformed]))
+
+;; --- hex ------------------------------------------------------------------
+;;
+;; `Integer/toHexString` + `str/upper` + a zero pad in the oracle. Here the
+;; digits are a 16-character table indexed by the nibble, which is one
+;; `string-substring` per digit and needs no case folding at all.
+
+(defn- nibble [n :i64] :string
+  (string-substring "0123456789ABCDEF" n (+ n 1)))
+
+;; `quot`, not a shift: measured 2026-09-09, `bit-and` and `bit-or` are lowered
+;; and NO shift is, in any spelling -- `bit-shift-right`, `bit-shift-left`,
+;; `i64shr`, `i64ushr`, `i64shl` all answer `operation has no admitted lowering`
+;; (and the `i64and` / `i64or` spellings are refused too; only the `bit-*` pair
+;; works). Division by 16 is the same value for a byte.
+(defn hex2 [b :i64] :string
+  (let [v (bit-and b 255)]
+    (string-concat (nibble (quot v 16)) (nibble (bit-and v 15)))))
+
+;; A hex digit or -1. The oracle accepts either case (`[0-9A-Fa-f]`), so all
+;; three ranges are tested rather than folding the string first.
+(defn- hex-digit [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (cond
+      (and (>= c 48) (<= c 57)) (- c 48)
+      (and (>= c 65) (<= c 70)) (- c 55)
+      (and (>= c 97) (<= c 102)) (- c 87)
+      :else -1)))
+
+;; The byte at `i`, or -1 when either digit is not hex.
+(defn parse-hex-byte [s :string i :i64] :i64
+  (if (> (+ i 2) (string-length s))
+    -1
+    (let [hi (hex-digit s i)
+          lo (hex-digit s (+ i 1))]
+      (if (or (< hi 0) (< lo 0))
+        -1
+        (+ (* hi 16) lo)))))
+
+;; --- the profile table ----------------------------------------------------
+;;
+;; Table A-1 of the AVC spec, the subset browsers emit. `:unknown` is the
+;; guest's answer for an unlisted profile_idc; the document the parser returns
+;; carries `(document-null)` there instead, which is what the oracle's map has
+;; (`avc-profile-names` is a map lookup and misses as nil).
+
+(defn avc-profile-name [idc :i64] :keyword
+  (cond
+    (= idc 66) :baseline
+    (= idc 77) :main
+    (= idc 88) :extended
+    (= idc 100) :high
+    (= idc 110) :high-10
+    (= idc 122) :high-422
+    (= idc 244) :high-444-predictive
+    :else :unknown))
+
+(defn avc-profile-idc [name :keyword] :i64
+  (cond
+    (= name :baseline) 66
+    (= name :main) 77
+    (= name :extended) 88
+    (= name :high) 100
+    (= name :high-10) 110
+    (= name :high-422) 122
+    (= name :high-444-predictive) 244
+    :else -1))
+
+;; --- constraint flags and the 1b ambiguity --------------------------------
+;;
+;; constraint_setN_flag is bit (7 - N) of the CC byte, MSB first, so
+;; constraint_set3_flag is 0x10. level_idc 11 means level 1.1 normally and level
+;; "1b" when that flag is set -- a historical artifact the spec folded into this
+;; one bit, and the only place the codec string is ambiguous.
+
+;; The mask is a table rather than `1 << (7 - n)`, for the same reason `hex2`
+;; divides: there is no admitted shift. Six entries, because the spec has six
+;; flags -- bits 1..0 of the CC byte are reserved-zero and `n` outside 0..5 is
+;; false on both sides.
+(defn- flag-mask [n :i64] :i64
+  (cond
+    (= n 0) 128
+    (= n 1) 64
+    (= n 2) 32
+    (= n 3) 16
+    (= n 4) 8
+    (= n 5) 4
+    :else 0))
+
+(defn constraint-set-flag? [flags :i64 n :i64] :bool
+  (let [m (flag-mask n)]
+    (and (> m 0) (= (bit-and flags m) m))))
+
+(defn level-1b? [level-idc :i64 flags :i64] :bool
+  (and (= level-idc 11) (constraint-set-flag? flags 3)))
+
+;; The level in TENTHS, which is level_idc itself. The oracle divides by 10.0 to
+;; render it; a float cannot be computed from an integer on this backend (see
+;; the header), so the division stays with the caller and nothing is lost --
+;; level_idc <-> level is a bijection apart from the 1b case above.
+(defn avc-level-tenths [level-idc :i64] :i64 level-idc)
+
+;; --- parse ----------------------------------------------------------------
+;;
+;; `avc1.PPCCLL` and `avc3.PPCCLL`: exactly 11 characters, a dot at index 4, and
+;; six hex digits after it. Anything else is not a codec string, which is the
+;; oracle's nil.
+
+(defn avc-codec-string? [s :string] :bool
+  (and (= (string-length s) 11)
+       (and (or (string=? (string-substring s 0 4) "avc1")
+                (string=? (string-substring s 0 4) "avc3"))
+            (and (string=? (string-substring s 4 5) ".")
+                 (and (>= (parse-hex-byte s 5) 0)
+                      (and (>= (parse-hex-byte s 7) 0)
+                           (>= (parse-hex-byte s 9) 0)))))))
+
+(defn parse-avc-codec-string [s :string] :document
+  (if (not (avc-codec-string? s))
+    (document-null)
+    (let [profile-idc (parse-hex-byte s 5)
+          flags (parse-hex-byte s 7)
+          level-idc (parse-hex-byte s 9)
+          name (avc-profile-name profile-idc)]
+      (document-map
+        :four-cc (document-string (string-substring s 0 4))
+        :profile-idc (document-i64 profile-idc)
+        :profile (if (= name :unknown) (document-null) (document-keyword name))
+        :constraint-flags (document-i64 flags)
+        :level-idc (document-i64 level-idc)
+        :level-tenths (document-i64 level-idc)
+        ;; `(if x true false)` around a `:bool` a FUNCTION returned, not
+        ;; decoration. Measured 2026-09-09 and reduced to six lines: on jvm-kir
+        ;; `(document-bool (p ...))` where `p` returns `:bool` from an `and`
+        ;; fails with `value is not a boolean`, while the js and wasm lowerings
+        ;; of the same source accept it. Wrapping makes the boolean explicit and
+        ;; all three agree. `test/w3/webcodecs/backend_gap_probe.cljk` asserts the
+        ;; divergence still reproduces and goes red when it stops.
+        :level-1b (document-bool (if (level-1b? level-idc flags) true false))))))
+
+;; --- format ---------------------------------------------------------------
+;;
+;; The oracle takes a map with defaults (`constraint-flags` 0, `four-cc`
+;; "avc1") and a `:level` that may be the keyword `:1b`, in which case it sets
+;; constraint_set3_flag and emits level_idc 11. Here the caller passes the
+;; level_idc and says whether it is the 1b spelling -- five parameters, which is
+;; the admitted maximum, and no default is silently applied.
+
+(defn format-avc-codec-string [four-cc :string profile-idc :i64
+                               flags :i64 level-idc :i64 one-b? :bool] :string
+  ;; Setting constraint_set3_flag by ADDING 16 when it is clear, not `bit-or`:
+  ;; measured 2026-09-09, `bit-or` passes `-M check` and then fails the js
+  ;; backend with `unsupported KIR operation` -- the same class as
+  ;; `string-upper` and `string-split-count`, where the subset check admits what
+  ;; the emitter cannot lower. `bit-and` is lowered, so the test that decides
+  ;; whether the bit is already set is a real test rather than an assumption.
+  (let [cc (if (and one-b? (not (constraint-set-flag? flags 3))) (+ flags 16) flags)
+        ll (if one-b? 11 level-idc)]
+    (string-concat
+      (string-concat four-cc ".")
+      (string-concat (hex2 profile-idc) (string-concat (hex2 cc) (hex2 ll))))))
+
+;; --- simple tokens --------------------------------------------------------
+;;
+;; "opus", "alaw", "ulaw", "flac" and the dotted mp4a form: the oracle only
+;; round-trips the token, and an empty string is nil rather than `{:codec ""}`.
+
+(defn parse-simple-codec [s :string] :document
+  (if (= (string-length s) 0)
+    (document-null)
+    (document-map :codec (document-string s))))
+
+;; --- tests ----------------------------------------------------------------
+;;
+;; `kind?` exists because `(kind? d :map)` inside an `and` failed at
+;; RUN time on js and wasm with `value is not a boolean` -- keyword equality does
+;; not yield a boolean the `and` lowering accepts, though `cond` tolerates it
+;; (which is why `session.kotoba` gets away with the same shape). Measured, not
+;; guessed: the suite compiled for all three targets and then trapped, and this
+;; wrapper makes the boolean explicit.
+(defn- kind? [d :document k :keyword] :bool
+  (if (= (document-kind d) k) true false))
+
+;;
+;; `test-*` returns i64 1 on pass (the T9.3 harness contract) and these run on
+;; jvm-kir, js AND wasm. The table against the oracle is the JVM parity test;
+;; these are the three-target evidence that the component runs, kept small
+;; because the harness spends one 512-unit fuel instance on the whole suite.
+;; Every string here is 11 characters, so nothing scans far.
+
+(defn test-hex [] :i64
+  (if (and (string=? (hex2 66) "42")
+           (and (string=? (hex2 0) "00")
+                (and (string=? (hex2 31) "1F")
+                     (and (string=? (hex2 244) "F4") (string=? (hex2 11) "0B")))))
+    1 0))
+
+(defn test-profiles [] :i64
+  ;; The keyword comparisons are each wrapped, for the reason `kind?` exists.
+  (let [a (if (= (avc-profile-name 66) :baseline) true false)
+        b (if (= (avc-profile-name 100) :high) true false)
+        c (if (= (avc-profile-name 1) :unknown) true false)]
+    (if (and a (and b (and c (and (= (avc-profile-idc :main) 77)
+                                  (= (avc-profile-idc :nope) -1)))))
+      1 0)))
+
+(defn test-flags [] :i64
+  (if (and (constraint-set-flag? 16 3)
+           (and (not (constraint-set-flag? 0 3))
+                (and (constraint-set-flag? 128 0)
+                     (and (not (constraint-set-flag? 16 4))
+                          (not (constraint-set-flag? 255 6))))))
+    1 0))
+
+(defn test-level-1b [] :i64
+  (if (and (level-1b? 11 16)
+           (and (not (level-1b? 11 0))
+                (and (level-1b? 11 144) (not (level-1b? 31 16)))))
+    1 0))
+
+(defn test-shape [] :i64
+  (if (and (avc-codec-string? "avc1.42001f")
+           (not (avc-codec-string? "avc1.42")))
+    1 0))
+
+(defn test-parse-kind [] :i64
+  (if (kind? (parse-avc-codec-string "avc1.42001f") :map) 1 0))
+
+(defn test-parse-bytes [] :i64
+  (if (and (= (parse-hex-byte "42001f" 0) 66)
+           (= (parse-hex-byte "1f" 0) 31))
+    1 0))
+
+(defn test-format [] :i64
+  (if (and (string=? (format-avc-codec-string "avc1" 66 0 31 false) "avc1.42001F")
+           (and (string=? (format-avc-codec-string "avc3" 66 0 31 false) "avc3.42001F")
+                (string=? (format-avc-codec-string "avc1" 66 0 0 true) "avc1.42100B")))
+    1 0))
+
+(defn test-simple [] :i64
+  (if (and (kind? (parse-simple-codec "opus") :map)
+           (kind? (parse-simple-codec "") :null))
+    1 0))
+
+;; Malformed strings are the oracle's nil, and the four ways to be malformed
+;; that its own test pins: too short, a different codec family, empty, and a
+;; non-hex digit.
+(defn test-malformed [] :i64
+  (if (and (kind? (parse-avc-codec-string "avc1.42") :null)
+           (and (kind? (parse-avc-codec-string "vp09.00.10.08") :null)
+                (and (kind? (parse-avc-codec-string "") :null)
+                     (kind? (parse-avc-codec-string "avc1.42001g") :null))))
+    1 0))
