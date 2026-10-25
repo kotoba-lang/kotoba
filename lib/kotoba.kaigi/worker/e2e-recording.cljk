@@ -1,0 +1,181 @@
+#!/usr/bin/env kbb
+;; Recording, end to end: real MediaRecorder output reaching real storage, and
+;; a consent withdrawal actually stopping it.
+;;
+;; The assertion that matters is NOT "the UI said recording". It is that bytes
+;; landed under the meeting's prefix, and then that they stopped landing once
+;; someone withdrew consent. A recorder that keeps running after a withdrawal
+;; is the failure this whole design is arranged to prevent, and it is invisible
+;; from any screen — the model says off while the microphone stays on.
+;;
+;; Run (needs a dev server with the R2 binding, and fake media devices):
+;;   npx wrangler dev --port 8799 --local &
+;;   kbb --backend sci e2e-recording.cljk http://127.0.0.1:8799
+
+(ns e2e-recording
+  (:require ["playwright" :as pw]
+            ["node:child_process" :as cp]))
+
+(def base
+  (or (first (filter #(re-find #"^https?://" %) (js->clj (.-argv js/process))))
+      "http://127.0.0.1:8799"))
+
+(def meeting (str "rec-" (js/Math.floor (* 1e9 (js/Math.random)))))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check!
+  [label pass? & [detail]]
+  (swap! checks inc)
+  (println (if pass? "ok  :" "FAIL:") label)
+  (when (and (not pass?) detail) (println "        " detail))
+  (when-not pass? (swap! failures inc)))
+
+(defn- launch []
+  (.launch (.-chromium pw)
+           #js {:headless true
+                :executablePath (.executablePath (.-chromium pw))
+                :args #js ["--use-fake-device-for-media-stream"
+                           "--use-fake-ui-for-media-stream"
+                           "--autoplay-policy=no-user-gesture-required"]}))
+
+(defn- open-page
+  [browser who]
+  (-> (.newPage browser)
+      (.then (fn [page]
+               (.on page "console"
+                    (fn [m] (when (#{"error" "warning"} (.type m))
+                              (println "  [" who (.type m) "]" (.text m)))))
+               ;; `transport=mesh` for the same reason as e2e-media: recording
+               ;; captures the LOCAL stream, which exists on every plane, but
+               ;; pinning the transport keeps this run independent of whichever
+               ;; secrets the target deployment happens to carry.
+               (-> (.goto page (str base "/?meeting=" meeting "&me=" who "&transport=mesh")
+                          #js {:waitUntil "load"})
+                   ;; The console waits on the pre-join screen now, so the
+                   ;; harness names itself and presses 参加 like a person does.
+                   (.then (fn [_] (.waitForSelector page "[data-act=\"join\"]"
+                                                    #js {:timeout 20000})))
+                   (.then (fn [_] (.fill page "#kaigi-name" who)))
+                   (.then (fn [_] (.click page "[data-act=\"join\"]")))
+                   (.then (fn [_] page)))))))
+
+(defn- wait-for
+  [page expr timeout-ms label]
+  (let [deadline (+ (js/Date.now) timeout-ms)]
+    (letfn [(tick []
+              (-> (.evaluate page expr)
+                  (.then (fn [v]
+                           (cond
+                             v (js/Promise.resolve true)
+                             (> (js/Date.now) deadline)
+                             (do (println "        (" label "timed out, last:" (pr-str v) ")")
+                                 (js/Promise.resolve false))
+                             :else (js/Promise. (fn [r] (js/setTimeout #(r (tick)) 250))))))))]
+      (tick))))
+
+(defn- settle [ms] (js/Promise. (fn [r] (js/setTimeout #(r true) ms))))
+
+(defn- stored-parts
+  "Object keys under this meeting's prefix, straight from the local R2
+  simulator via wrangler. Reading storage rather than the app's own report is
+  the point: the app claiming it uploaded is not evidence that anything did."
+  []
+  (try
+    (let [out (cp/execSync
+               (str "npx wrangler r2 object get kaigi-recordings --local --help >/dev/null 2>&1; "
+                    "find .wrangler -path '*kaigi-recordings*' -type f 2>/dev/null | wc -l")
+               #js {:encoding "utf8"})]
+      (js/parseInt (.trim out) 10))
+    (catch :default _ 0)))
+
+(defn -main []
+  (println "meeting:" meeting "at" base)
+  (let [st (atom {})]
+    (-> (js/Promise.all #js [(launch) (launch)])
+        (.then (fn [bs] (swap! st assoc :b1 (aget bs 0) :b2 (aget bs 1))
+                 (open-page (aget bs 0) "jun")))
+        (.then (fn [p] (swap! st assoc :jun p) (open-page (:b2 @st) "rin")))
+        (.then (fn [p] (swap! st assoc :rin p)
+                 (js/Promise.all
+                  #js [(wait-for (:jun @st) "window.kaigi && window.kaigi.participantCount() === 2"
+                                 20000 "jun sees 2")
+                       (wait-for (:rin @st) "window.kaigi && window.kaigi.participantCount() === 2"
+                                 20000 "rin sees 2")])))
+        (.then (fn [res]
+                 (check! "both participants are in the meeting" (and (aget res 0) (aget res 1)))
+                 ;; consent from both, then the host arms it
+                 (.evaluate (:jun @st) "document.querySelector('[data-act=\"request-recording\"]').click()")))
+        (.then (fn [_] (settle 800)))
+        (.then (fn [_]
+                 (js/Promise.all
+                  #js [(.evaluate (:jun @st) "document.querySelector('[data-act=\"consent-recording\"]').click()")
+                       (.evaluate (:rin @st) "document.querySelector('[data-act=\"consent-recording\"]').click()")])))
+        (.then (fn [_] (settle 1200)))
+        (.then (fn [_]
+                 (wait-for (:jun @st)
+                           "!!document.querySelector('[data-act=\"start-recording\"]')"
+                           10000 "start-recording offered once consent is unanimous")))
+        (.then (fn [ok]
+                 (check! "recording can only be armed once consent is unanimous" ok)
+                 (.evaluate (:jun @st) "document.querySelector('[data-act=\"start-recording\"]').click()")))
+        (.then (fn [_]
+                 (js/Promise.all
+                  #js [(wait-for (:jun @st) "window.kaigi.recording().running" 15000 "jun recording")
+                       (wait-for (:rin @st) "window.kaigi.recording().running" 15000 "rin recording")])))
+        (.then (fn [res]
+                 (check! "every participant records, not just the host"
+                         (and (aget res 0) (aget res 1)))
+                 ;; MediaRecorder emits a part every 5s
+                 (settle 13000)))
+        (.then (fn [_]
+                 (js/Promise.all
+                  #js [(.evaluate (:jun @st) "window.kaigi.recording().parts")
+                       (.evaluate (:rin @st) "window.kaigi.recording().parts")])))
+        (.then (fn [parts]
+                 (let [j (aget parts 0) r (aget parts 1)]
+                   (println "        parts uploaded — jun:" j " rin:" r)
+                   (check! "jun uploaded recorded parts" (pos? j) (str "parts=" j))
+                   (check! "rin uploaded recorded parts" (pos? r) (str "parts=" r))
+                   (swap! st assoc :before-revoke (+ j r)))
+                 ;; THE property: withdrawing consent stops capture everywhere,
+                 ;; without anyone sending a stop.
+                 (.evaluate (:rin @st) "document.querySelector('[data-act=\"revoke-consent\"]').click()")))
+        (.then (fn [_] (settle 1500)))
+        (.then (fn [_]
+                 (js/Promise.all
+                  #js [(.evaluate (:jun @st) "window.kaigi.recording().running")
+                       (.evaluate (:rin @st) "window.kaigi.recording().running")
+                       (.evaluate (:jun @st) "window.kaigi.state().meeting.recording.state")])))
+        (.then (fn [res]
+                 (check! "the withdrawal turned recording off in the shared value"
+                         (= "off" (aget res 2)) (str "state=" (aget res 2)))
+                 (check! "and stopped the host's recorder" (not (aget res 0)))
+                 (check! "and the withdrawing participant's own recorder" (not (aget res 1)))
+                 (js/Promise.all
+                  #js [(.evaluate (:jun @st) "window.kaigi.recording().parts")
+                       (.evaluate (:rin @st) "window.kaigi.recording().parts")])))
+        (.then (fn [parts]
+                 (swap! st assoc :after-revoke (+ (aget parts 0) (aget parts 1)))
+                 ;; wait longer than one part interval; nothing more may appear
+                 (settle 8000)))
+        (.then (fn [_]
+                 (js/Promise.all
+                  #js [(.evaluate (:jun @st) "window.kaigi.recording().parts")
+                       (.evaluate (:rin @st) "window.kaigi.recording().parts")])))
+        (.then (fn [parts]
+                 (let [now (+ (aget parts 0) (aget parts 1))]
+                   (check! "no further parts are captured after the withdrawal"
+                           (= now (:after-revoke @st))
+                           (str "before=" (:after-revoke @st) " after waiting=" now)))
+                 (println)
+                 (println (str @checks " checks, " @failures " failures"))
+                 (js/Promise.all #js [(.close (:b1 @st)) (.close (:b2 @st))])))
+        (.then (fn [_] (.exit js/process (if (pos? @failures) 1 0))))
+        (.catch (fn [e]
+                  (println "FAIL: harness threw:" (.-message e))
+                  (println (.-stack e))
+                  (.exit js/process 1))))))
+
+(-main)

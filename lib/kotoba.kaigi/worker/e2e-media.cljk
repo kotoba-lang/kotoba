@@ -1,0 +1,241 @@
+#!/usr/bin/env kbb
+;; A real call: two browsers, real PeerConnections, real RTP.
+;;
+;; `e2e.cljs` proves the signaling plane — two sockets, one roster, frames
+;; delivered to the right peer. It cannot prove a call happened, because a
+;; connection can report `connected` while carrying no media at all (a peer
+;; that answered before its local tracks existed negotiates a silent session
+;; and looks healthy). So the assertion that matters here is **bytesReceived
+;; from an inbound-rtp stat is greater than zero on both sides**. Everything
+;; else — participant counts, tiles, connection state — is necessary and
+;; insufficient.
+;;
+;; Chromium is launched with fake media devices, so there is a deterministic
+;; test pattern and tone to measure instead of whatever camera the machine has:
+;;   --use-fake-device-for-media-stream  synthesizes camera/mic
+;;   --use-fake-ui-for-media-stream      auto-grants permission
+;; `chromium.executablePath()` is passed explicitly rather than relying on
+;; launch()'s default, following the finding baked into
+;; wasm-webcomponent/test/render/lib/webgpu-harness.
+;;
+;; Two separate browser instances, not two pages in one: pages in one browser
+;; share a media-device backend, and a bug that only appears across processes
+;; would be invisible.
+;;
+;; Run (against a dev server or the deployment):
+;;   npx wrangler dev --port 8799 --local &
+;;   kbb --backend sci e2e-media.cljk http://127.0.0.1:8799
+
+(ns e2e-media
+  (:require ["playwright" :as pw]))
+
+(def base
+  (or (first (filter #(re-find #"^https?://" %) (js->clj (.-argv js/process))))
+      "http://127.0.0.1:8799"))
+
+(def meeting (str "media-" (js/Math.floor (* 1e9 (js/Math.random)))))
+
+(def relay-only?
+  "With `--relay`, both browsers are forced onto `iceTransportPolicy: \"relay\"`.
+
+  Without it, two browsers on one machine connect over host candidates and the
+  TURN configuration is never exercised — a completely broken relay passes every
+  other assertion in this file. `--relay` is therefore the only run that proves
+  the relay path, and it additionally asserts the selected candidate type is
+  actually `relay`."
+  (boolean (some #(= "--relay" %) (js->clj (.-argv js/process)))))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check!
+  [label pass? & [detail]]
+  (swap! checks inc)
+  (println (if pass? "ok  :" "FAIL:") label)
+  (when (and (not pass?) detail) (println "        " detail))
+  (when-not pass? (swap! failures inc)))
+
+(def launch-args
+  #js ["--use-fake-device-for-media-stream"
+       "--use-fake-ui-for-media-stream"
+       "--autoplay-policy=no-user-gesture-required"])
+
+(defn- launch []
+  (.launch (.-chromium pw)
+           #js {:headless true
+                :executablePath (.executablePath (.-chromium pw))
+                :args launch-args}))
+
+(defn- open-page
+  [browser who]
+  (-> (.newPage browser)
+      (.then (fn [page]
+               (.on page "console"
+                    (fn [msg]
+                      (when (#{"error" "warning"} (.type msg))
+                        (println "  [" who (.type msg) "]" (.text msg)))))
+               (.on page "pageerror"
+                    (fn [e] (println "  [" who "pageerror ]" (.-message e))))
+               ;; Name the URL of any failing request. A bare
+               ;; "Failed to load resource: 404" in the console is the kind of
+               ;; noise that gets ignored until it turns out to be the thing
+               ;; that was broken.
+               (.on page "response"
+                    (fn [r] (when (>= (.status r) 400)
+                              (println "  [" who (.status r) "]" (.url r)))))
+               (-> (.goto page (str base "/?meeting=" meeting "&me=" who
+                                    ;; Pin the mesh explicitly.
+                                    ;;
+                                    ;; Everything this file asserts —
+                                    ;; PeerConnection count, ICE state,
+                                    ;; inbound-rtp bytes — is mesh vocabulary.
+                                    ;; On a Worker configured for RealtimeKit
+                                    ;; the SDK owns transport and holds no
+                                    ;; RTCPeerConnection this harness can see,
+                                    ;; so without this the run would report
+                                    ;; zero peers and zero RTP against a call
+                                    ;; that was working fine.
+                                    ;;
+                                    ;; It is also the regression test for the
+                                    ;; 2026-08-01 outage: it proves the mesh
+                                    ;; still carries media on a deployment
+                                    ;; whose secrets say RealtimeKit, which is
+                                    ;; precisely the combination that carried
+                                    ;; none.
+                                    "&transport=mesh"
+                                    (when relay-only? "&ice=relay"))
+                          #js {:waitUntil "load"})
+                   ;; Past the pre-join screen. The console no longer joins on
+                   ;; load — a person names themselves and presses 参加 — so
+                   ;; the harness has to do the same thing a person does.
+                   ;; Filling the name field is not incidental: it is what
+                   ;; makes the roster assert on a real display name instead
+                   ;; of a random per-tab id.
+                   (.then (fn [_] (.waitForSelector page "[data-act=\"join\"]"
+                                                    #js {:timeout 20000})))
+                   (.then (fn [_] (.fill page "#kaigi-name" who)))
+                   (.then (fn [_] (.click page "[data-act=\"join\"]")))
+                   (.then (fn [_] page)))))))
+
+(defn- wait-for-fn
+  "Poll a page-evaluated predicate. Playwright's own waitForFunction would do,
+  but this reports the last observed value on timeout, which is what makes a
+  failure diagnosable rather than just late."
+  [page expr timeout-ms label]
+  (let [deadline (+ (js/Date.now) timeout-ms)]
+    (letfn [(tick []
+              (-> (.evaluate page expr)
+                  (.then (fn [v]
+                           (cond
+                             v (js/Promise.resolve true)
+                             (> (js/Date.now) deadline)
+                             (do (println "        (" label "timed out, last value:"
+                                          (pr-str v) ")")
+                                 (js/Promise.resolve false)
+                             )
+                             :else (js/Promise. (fn [r] (js/setTimeout #(r (tick)) 200))))))))]
+      (tick))))
+
+(defn- eval-page [page expr] (.evaluate page expr))
+
+(defn -main []
+  (println "meeting:" meeting "at" base)
+  (let [st (atom {})]
+    (-> (js/Promise.all #js [(launch) (launch)])
+        (.then (fn [bs]
+                 (swap! st assoc :b1 (aget bs 0) :b2 (aget bs 1))
+                 (open-page (aget bs 0) "jun")))
+        (.then (fn [p] (swap! st assoc :jun p)
+                 (open-page (:b2 @st) "rin")))
+        (.then (fn [p] (swap! st assoc :rin p)
+                 ;; both tabs present: wait until each sees two admitted
+                 ;; participants, which means the DO relayed the roster
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st) "window.kaigi && window.kaigi.participantCount() === 2"
+                                    20000 "jun sees 2 participants")
+                       (wait-for-fn (:rin @st) "window.kaigi && window.kaigi.participantCount() === 2"
+                                    20000 "rin sees 2 participants")])))
+        (.then (fn [res]
+                 (check! "both tabs see a two-person roster"
+                         (and (aget res 0) (aget res 1)))
+                 ;; a peer connection exists on both sides
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st) "window.kaigi.peerIds().length === 1" 20000 "jun has 1 peer")
+                       (wait-for-fn (:rin @st) "window.kaigi.peerIds().length === 1" 20000 "rin has 1 peer")])))
+        (.then (fn [res]
+                 (check! "each side holds exactly one PeerConnection"
+                         (and (aget res 0) (aget res 1)))
+                 (js/Promise.all
+                  #js [(wait-for-fn (:jun @st)
+                                    "Object.values(window.kaigi.connectionStates()).includes('connected')"
+                                    30000 "jun ICE connected")
+                       (wait-for-fn (:rin @st)
+                                    "Object.values(window.kaigi.connectionStates()).includes('connected')"
+                                    30000 "rin ICE connected")])))
+        (.then (fn [res]
+                 (check! "ICE connected on both sides" (and (aget res 0) (aget res 1)))
+                 ;; THE assertion: real RTP arrived. Give the media a moment to
+                 ;; actually flow after connecting.
+                 (js/Promise. (fn [r] (js/setTimeout #(r true) 3000)))))
+        (.then (fn [_]
+                 (js/Promise.all
+                  #js [(eval-page (:jun @st) "window.kaigi.inboundBytes().then(a => a.reduce((x,y)=>x+y,0))")
+                       (eval-page (:rin @st) "window.kaigi.inboundBytes().then(a => a.reduce((x,y)=>x+y,0))")])))
+        (.then (fn [bytes]
+                 (let [jb (aget bytes 0) rb (aget bytes 1)]
+                   (println "        inbound RTP bytes — jun:" jb " rin:" rb)
+                   (check! "jun received real RTP media" (> jb 0) (str "bytesReceived=" jb))
+                   (check! "rin received real RTP media" (> rb 0) (str "bytesReceived=" rb)))
+                 ;; the UI actually rendered the tiles and attached video
+                 (js/Promise.all
+                  #js [(eval-page (:jun @st) "document.querySelectorAll('[data-kaigi-tile]').length")
+                       (eval-page (:jun @st)
+                                  "Array.from(document.querySelectorAll('[data-kaigi-participant] video')).filter(v => v.srcObject && v.videoWidth > 0).length")])))
+        (.then (fn [ui]
+                 (when relay-only?
+                   (println "        (relay-only run: iceTransportPolicy=relay)"))
+                 (check! "two participant tiles rendered" (= 2 (aget ui 0))
+                         (str "tiles=" (aget ui 0)))
+                 (check! "video elements are attached and have real frame dimensions"
+                         (>= (aget ui 1) 1)
+                         (str "videos with frames=" (aget ui 1)))
+                 ;; mute is enforced end to end: the control reaches the DO,
+                 ;; the roster changes, and the other tab sees it
+                 (eval-page (:rin @st)
+                            "document.querySelector('[data-act=\"toggle-mute\"]').click()")))
+        (.then (fn [_]
+                 (wait-for-fn (:jun @st)
+                              ;; clj->js renders keywords with `name`, so the
+                              ;; namespaces are GONE in this view:
+                              ;; :kaigi/participants -> "participants",
+                              ;; :kaigi.participant/muted? -> "muted?".
+                              ;; Asserting on the namespaced spelling silently
+                              ;; reads undefined and looks like the feature is
+                              ;; broken.
+                              "(() => { const p = ((window.kaigi.state().meeting||{}).participants||{}).rin; return !!p && p['muted?'] === true; })()"
+                              10000 "jun sees rin muted")))
+        (.then (fn [ok]
+                 (check! "a mute in one tab is visible in the other" ok)
+                 (if relay-only?
+                   (js/Promise.all
+                    #js [(eval-page (:jun @st) "window.kaigi.selectedCandidateTypes()")
+                         (eval-page (:rin @st) "window.kaigi.selectedCandidateTypes()")])
+                   (js/Promise.resolve nil))))
+        (.then (fn [types]
+                 (when relay-only?
+                   (let [j (js->clj (aget types 0)) r (js->clj (aget types 1))]
+                     (println "        selected remote candidate types — jun:"
+                              (pr-str j) " rin:" (pr-str r))
+                     (check! "media went through the TURN relay, not around it"
+                             (and (some #{"relay"} j) (some #{"relay"} r))
+                             (str "jun=" (pr-str j) " rin=" (pr-str r)))))
+                 (println)
+                 (println (str @checks " checks, " @failures " failures"))
+                 (js/Promise.all #js [(.close (:b1 @st)) (.close (:b2 @st))])))
+        (.then (fn [_] (.exit js/process (if (pos? @failures) 1 0))))
+        (.catch (fn [e]
+                  (println "FAIL: harness threw:" (.-message e))
+                  (println (.-stack e))
+                  (.exit js/process 1))))))
+
+(-main)

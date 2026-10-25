@@ -1,0 +1,245 @@
+#!/usr/bin/env kbb
+;; End-to-end test of a real room: two WebSocket clients against a running
+;; kaigi Worker, exercising the Durable Object for real.
+;;
+;; This is the test the unit suite cannot be: `kaigi.signal/route` is proven
+;; pure and correct in isolation, but nothing in that suite shows that a second
+;; client actually receives the first one's SDP — which requires the DO to have
+;; serialized two sockets, kept one roster across them, and delivered to the
+;; right one. Every bug in the glue between the pure core and the runtime lives
+;; here.
+;;
+;; Node 22+ ships a global WebSocket, so there is no client dependency.
+;;
+;; Run against a local dev server:
+;;   npx wrangler dev --port 8799 --local &
+;;   kbb --backend sci e2e.cljk ws://127.0.0.1:8799
+;; or against the deployment:
+;;   kbb --backend sci e2e.cljk wss://kaigi.<subdomain>.workers.dev
+;;
+;; Written as a flat list of steps rather than a nested promise tree: the
+;; nested version was written first and had a paren mismatch that took longer
+;; to find than the whole rewrite.
+
+(ns e2e
+  (:require [cljs.reader :as reader]))
+
+;; Picked by shape, not by position: under nbb, argv is
+;; [node, /path/to/nbb, e2e.cljs, <arg>], so indexing into it gets the nbb
+;; binary and a confusing "Invalid URL" from the WebSocket constructor.
+(def base
+  (or (first (filter #(re-find #"^wss?://" %) (js->clj (.-argv js/process))))
+      "ws://127.0.0.1:8799"))
+(def meeting (str "e2e-" (js/Math.floor (* 1e9 (js/Math.random)))))
+
+(def failures (atom 0))
+(def checks (atom 0))
+
+(defn check!
+  "`detail` is printed only on failure, and only when given — the same shape
+  `e2e-media.cljs` uses. A failing check that names nothing but its own label
+  makes the reader re-derive what the room actually answered."
+  [label pass? & [detail]]
+  (swap! checks inc)
+  (println (if pass? "ok  :" "FAIL:") label)
+  (when (and (not pass?) detail) (println "        " detail))
+  (when-not pass? (swap! failures inc)))
+
+(defn- connect
+  [label]
+  (let [ws (js/WebSocket. (str base "/api/kaigi/ws?meeting=" meeting))
+        frames (atom [])]
+    (set! (.-onmessage ws)
+          (fn [ev]
+            (try (swap! frames conj (reader/read-string (.-data ev)))
+                 (catch :default e
+                   (println "  (" label "unparseable frame:" (.-message e) ")")))))
+    (set! (.-onerror ws) (fn [_] (println "  (" label "socket error )")))
+    {:ws ws :frames frames :label label}))
+
+(defn- open!
+  [{:keys [ws]}]
+  (js/Promise.
+   (fn [resolve reject]
+     (if (= 1 (.-readyState ws))
+       (resolve true)
+       (do (set! (.-onopen ws) (fn [_] (resolve true)))
+           (set! (.-onclose ws) (fn [_] (reject (js/Error. "closed before open")))))))))
+
+(defn- send! [{:keys [ws]} m] (.send ws (pr-str m)))
+
+(defn- settle
+  "Give the DO a moment to broadcast: real sockets, real storage writes."
+  [ms]
+  (js/Promise. (fn [resolve] (js/setTimeout #(resolve true) ms))))
+
+(defn- wait-for
+  "Poll `pred` until it is true or `timeout-ms` elapses. Resolves either way —
+  the assertion that follows is what reports the failure.
+
+  Fixed sleeps are why this helper exists. The first version of this harness
+  waited a flat 1.2s after each send, which passed locally and against the
+  deployment three runs out of four; the fourth ran seconds after a deploy,
+  when edge propagation was slower than the sleep, and reported a roster
+  defect that did not exist. A test that fails for a reason unrelated to the
+  code under test is worse than no test, because the next person spends their
+  time on the harness."
+  ([pred] (wait-for pred 8000))
+  ([pred timeout-ms]
+   (let [deadline (+ (js/Date.now) timeout-ms)]
+     (js/Promise.
+      (fn [resolve]
+        (letfn [(tick []
+                  (cond
+                    (pred) (resolve true)
+                    (> (js/Date.now) deadline) (resolve false)
+                    :else (js/setTimeout tick 100)))]
+          (tick)))))))
+
+(defn- frames-of [c] @(:frames c))
+(defn- of-type [c t] (filterv #(= t (:t %)) (frames-of c)))
+(defn- last-state [c] (last (of-type c :state)))
+(defn- last-plan [c] (last (of-type c :plan)))
+(defn- signals-of [c] (of-type c :signal))
+(defn- errors-of [c] (of-type c :error))
+(defn- meeting-of [c] (:kaigi/meeting (last-state c)))
+
+(defn- got-error?
+  "Whether `c` ever received an error frame carrying `code`. A named helper
+  because the steps below are `#()` thunks and a nested `#()` is a reader
+  error, not a style preference."
+  [c code]
+  (boolean (some (fn [f] (= code (:kaigi/code f))) (errors-of c))))
+
+(def a (connect "jun"))
+(def b (connect "rin"))
+
+(defn- steps
+  "Each step is a thunk returning a promise. Run in order."
+  []
+  [;; --- first participant ------------------------------------------------
+   #(open! a)
+   ;; Declares `#{:mesh}`, and that is load-bearing rather than incidental.
+   ;;
+   ;; Everything below asserts mesh vocabulary — `:kaigi.plan/peers`, offerer
+   ;; and answerer roles. A Worker configured for RealtimeKit answers a client
+   ;; with no declared plane by putting the room on RealtimeKit, where there
+   ;; are no peers to name and no offer direction to hold, and this file would
+   ;; report three failures against a room behaving exactly as designed.
+   ;;
+   ;; Declaring the plane is also what exercises the negotiation over the real
+   ;; wire: the check below asserts the room came back with mesh, which on a
+   ;; RealtimeKit-configured deployment is only true if the declaration was
+   ;; read, sanitized and intersected.
+   #(do (send! a {:t :hello :kaigi/participant-id "jun" :kaigi/name "Jun"
+                  :kaigi/transports #{:mesh}})
+        (wait-for (fn [] (some? (last-state a)))))
+   #(let [st (last-state a) mtg (:kaigi/meeting st)]
+      (check! "first participant receives a state frame" (some? st))
+      (check! "first participant becomes the host" (= "jun" (:kaigi/host mtg)))
+      (check! "host is admitted"
+              (= :admitted (get-in mtg [:kaigi/participants "jun"
+                                        :kaigi.participant/admission])))
+      (check! "the room honours the plane the client said it can drive"
+              (= :mesh (:kaigi/transport st))
+              (str "got " (pr-str (:kaigi/transport st))
+                   " — a room that answers a mesh-only client with another"
+                   " plane is the 2026-08-01 outage"))
+      (check! "ice servers are reported as data" (vector? (:kaigi/ice-servers st)))
+      (check! "EDN survived the wire — role is a keyword, not a string"
+              (keyword? (get-in mtg [:kaigi/participants "jun" :kaigi.participant/role])))
+      (settle 0))
+
+   ;; --- second participant ----------------------------------------------
+   #(open! b)
+   #(do (send! b {:t :hello :kaigi/participant-id "rin" :kaigi/name "Rin"
+                  :kaigi/transports #{:mesh}})
+        ;; wait until BOTH sides have seen the two-person roster, not a clock
+        (wait-for (fn [] (and (contains? (:kaigi/participants (meeting-of b)) "jun")
+                              (contains? (:kaigi/participants (meeting-of b)) "rin")
+                              (contains? (:kaigi/participants (meeting-of a)) "rin")
+                              (some? (last-plan a))
+                              (some? (last-plan b))))))
+   #(let [mtg (meeting-of b)]
+      (check! "second participant sees the same meeting" (= meeting (:kaigi/id mtg)))
+      (check! "second participant is admitted (bare room has an open lobby)"
+              (= :admitted (get-in mtg [:kaigi/participants "rin"
+                                        :kaigi.participant/admission])))
+      (let [ks (set (keys (:kaigi/participants mtg)))]
+        (check! "one roster across two sockets — the DO serialized them"
+                (= #{"jun" "rin"} ks))
+        (when-not (= #{"jun" "rin"} ks)
+          (println "        actual participant keys:" (pr-str (vec (sort-by str ks))))
+          (println "        state frames seen by rin:" (count (of-type b :state)))
+          (println "        host:" (pr-str (:kaigi/host mtg)))))
+      (check! "the second participant is not the host" (= "jun" (:kaigi/host mtg)))
+      (check! "the first participant was told about the second"
+              (contains? (:kaigi/participants (meeting-of a)) "rin"))
+      (settle 0))
+   #(let [peers-a (get-in (last-plan a) [:kaigi/plan :kaigi.plan/peers])
+          role-a (:kaigi.plan/role (first peers-a))
+          role-b (-> (last-plan b) :kaigi/plan :kaigi.plan/peers first :kaigi.plan/role)]
+      (check! "host got a media plan naming the peer"
+              (= ["rin"] (mapv :kaigi.plan/peer-id peers-a)))
+      (check! "exactly one side is the offerer (no glare)"
+              (and (some? role-a) (some? role-b) (not= role-a role-b)))
+      (settle 0))
+
+   ;; --- the actual relay -------------------------------------------------
+   #(do (send! a {:t :signal :to "rin" :payload {:kind :offer :sdp "v=0 E2E-OFFER"}})
+        (wait-for (fn [] (seq (signals-of b)))))
+   #(let [got (signals-of b)]
+      (check! "unicast SDP reached the other participant" (= 1 (count got)))
+      (check! "payload arrived verbatim"
+              (= "v=0 E2E-OFFER" (get-in (first got) [:kaigi/payload :sdp])))
+      (check! "sender is named" (= "jun" (:kaigi/from (first got))))
+      (check! "the sender did not receive its own frame" (zero? (count (signals-of a))))
+      (settle 0))
+
+   ;; --- published tracks reach the roster --------------------------------
+   #(do (send! b {:t :publish :kaigi/tracks ["cam-rin" "mic-rin"]})
+        (wait-for (fn [] (seq (get-in (meeting-of a)
+                                      [:kaigi/room :webrtc.room/participants
+                                       "rin" :webrtc.room/tracks])))))
+   #(let [mtg (meeting-of a)]
+      (check! "published track names propagated to every viewer's roster"
+              (= #{"cam-rin" "mic-rin"}
+                 (set (get-in mtg [:kaigi/room :webrtc.room/participants
+                                   "rin" :webrtc.room/tracks]))))
+      (settle 0))
+
+   ;; --- authorization is enforced at the runtime, not just in tests ------
+   #(do (send! b {:t :control :type :end})
+        (wait-for (fn [] (got-error? b :kaigi.signal/forbidden))))
+   #(do (check! "a non-host is refused the :end control"
+                (got-error? b :kaigi.signal/forbidden))
+        (check! "and the meeting is still live"
+                (not= :ended (:kaigi/state (meeting-of a))))
+        (settle 0))
+   #(do (send! a {:t :control :type :end})
+        (wait-for (fn [] (= :ended (:kaigi/state (meeting-of a))))))
+   #(do (check! "the host can end it" (= :ended (:kaigi/state (meeting-of a))))
+        (send! a {:t :signal :to "rin" :payload {:sdp "late"}})
+        (wait-for (fn [] (got-error? a :kaigi.signal/meeting-ended))))
+   #(do (check! "a post-end signal is refused, not relayed"
+                (and (got-error? a :kaigi.signal/meeting-ended)
+                     (= 1 (count (signals-of b)))))
+        (settle 0))])
+
+(defn -main []
+  (println "meeting:" meeting "at" base)
+  (-> (reduce (fn [p step] (.then p (fn [_] (step))))
+              (js/Promise.resolve true)
+              (steps))
+      (.then (fn [_]
+               (.close (:ws a))
+               (.close (:ws b))
+               (println)
+               (println (str @checks " checks, " @failures " failures"))
+               (js/setTimeout #(.exit js/process (if (pos? @failures) 1 0)) 300)))
+      (.catch (fn [e]
+                (println "FAIL: harness threw:" (.-message e))
+                (println (.-stack e))
+                (js/setTimeout #(.exit js/process 1) 300)))))
+
+(-main)

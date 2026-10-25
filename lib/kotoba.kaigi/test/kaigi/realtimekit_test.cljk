@@ -1,0 +1,131 @@
+(ns kaigi.realtimekit-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kaigi.model :as m]
+            [kaigi.realtimekit :as rk]))
+
+(def config
+  {:account-id "4da88288dc30d9ee257f319d3c33ecf0"
+   :app-id "dbdc47c6-e97b-4573-919c-d47258bc40d3"
+   :api-token "cf-token"
+   :preset "kaigi_participant"})
+
+(defn- live-meeting []
+  (-> (m/meeting "m-1" "jun" {:title "週次" :lobby :approval-required})
+      (m/start)
+      (m/join "jun")
+      (m/request-admission (m/participant "rin"))))
+
+(deftest urls-are-account-scoped-not-a-separate-host
+  (testing "RealtimeKit lives under the Cloudflare API; the SFU has its own host"
+    (is (= (str "https://api.cloudflare.com/client/v4/accounts/"
+                (:account-id config) "/realtime/kit/" (:app-id config) "/meetings")
+           (:kaigi.rk/url (rk/create-meeting-request config {}))))
+    (is (= (str "https://api.cloudflare.com/client/v4/accounts/"
+                (:account-id config) "/realtime/kit/" (:app-id config)
+                "/meetings/rk-9/participants")
+           (:kaigi.rk/url (rk/participant-request config "rk-9" {:participant-id "rin"
+                                                                 :preset "p"}))))
+    (is (not (re-find #"rtc\.live\.cloudflare\.com"
+                      (:kaigi.rk/url (rk/create-meeting-request config {})))))))
+
+(deftest a-meeting-never-starts-recording-on-its-own
+  (testing "recording requires unanimous consent, which cannot exist at creation"
+    (let [b (:kaigi.rk/body (rk/create-meeting-request config {:title "週次"}))]
+      (is (false? (:record_on_start b))
+          "record_on_start would begin capture before anyone agreed")
+      (is (= "週次" (:title b))))))
+
+(deftest identity-is-shared-not-mapped
+  (testing "kaigi's participant id IS the RealtimeKit participant id"
+    (let [b (:kaigi.rk/body (rk/participant-request config "rk-9"
+                                                    {:participant-id "rin"
+                                                     :display-name "Rin"
+                                                     :preset "kaigi_participant"}))]
+      (is (= "rin" (:custom_participant_id b))
+          "a mapping table can go stale, and a stale identity puts someone else's video under your name")
+      (is (= "kaigi_participant" (:preset_name b)))
+      (is (= "Rin" (:name b))))))
+
+(deftest the-token-is-not-in-the-request
+  (let [req (rk/create-meeting-request config {})]
+    (is (not (contains? req :kaigi.rk/headers)))
+    (is (not (re-find #"cf-token" (pr-str req)))
+        "a descriptor with no credential can be logged and asserted on"))
+  (let [authed (rk/authorize (rk/create-meeting-request config {}) "cf-token")]
+    (is (= "Bearer cf-token" (get-in authed [:kaigi.rk/headers "Authorization"])))))
+
+(deftest success-is-read-not-inferred-from-the-status
+  (testing "the Cloudflare API returns success:false with a 200"
+    (let [p (rk/parse-response {:success false
+                                :errors [{:code 10000 :message "Authentication error"}]})]
+      (is (not (:kaigi.rk/ok? p)))
+      (is (= 10000 (-> p :kaigi.rk/errors first :kaigi.rk/code)))
+      (is (nil? (rk/participant-token p))
+          "a nil token sent to a browser fails inside the SDK, far from the request that went wrong")))
+  (let [p (rk/parse-response {:success true :data {:id "rk-9"}})]
+    (is (:kaigi.rk/ok? p))
+    (is (= "rk-9" (rk/meeting-id p))))
+  (testing "and a result envelope is read the same way"
+    (is (= "rk-9" (rk/meeting-id (rk/parse-response {:success true :result {:id "rk-9"}}))))))
+
+(deftest a-participant-token-comes-back
+  (let [p (rk/parse-response {:success true
+                              :data {:id "p-1" :token "eyJhbGci..." :preset_name "x"}})]
+    (is (= "eyJhbGci..." (rk/participant-token p)))))
+
+;; ---------------------------------------------------------------------------
+;; the gate — the reason kaigi keeps its own model
+;; ---------------------------------------------------------------------------
+
+(deftest a-participant-waiting-in-the-lobby-gets-no-token
+  (testing "RealtimeKit knows nothing about kaigi's lobby; the mint is the gate"
+    (let [mtg (live-meeting)]
+      (is (rk/may-mint-token? mtg "jun"))
+      (is (not (rk/may-mint-token? mtg "rin")))
+      (is (= :kaigi.signal/not-admitted (:kaigi.rk/reason (rk/token-refusal mtg "rin"))))
+      (testing "and once admitted, they do"
+        (is (rk/may-mint-token? (m/admit mtg "jun" "rin") "rin"))))))
+
+(deftest a-denied-or-removed-participant-gets-no-token
+  (let [mtg (-> (live-meeting) (m/deny "jun" "rin"))]
+    (is (not (rk/may-mint-token? mtg "rin")))
+    (is (= :kaigi.signal/not-admitted (:kaigi.rk/reason (rk/token-refusal mtg "rin")))))
+  (let [mtg (-> (live-meeting) (m/admit "jun" "rin") (m/join "rin")
+                (m/remove-participant "jun" "rin"))]
+    (is (not (rk/may-mint-token? mtg "rin"))
+        "an ejection has to survive the next token request, or ejecting achieves nothing")))
+
+(deftest a-stranger-gets-no-token
+  (is (= :kaigi.signal/not-a-participant
+         (:kaigi.rk/reason (rk/token-refusal (live-meeting) "nobody")))))
+
+(deftest an-ended-meeting-mints-nothing
+  (let [mtg (m/end (live-meeting))]
+    (is (not (rk/may-mint-token? mtg "jun")))
+    (is (= :kaigi.signal/meeting-ended (:kaigi.rk/reason (rk/token-refusal mtg "jun"))))))
+
+(deftest refusal-reasons-match-the-signaling-vocabulary
+  (testing "one set of reasons regardless of which layer refused"
+    (let [mtg (live-meeting)]
+      (doseq [r [(rk/token-refusal mtg "rin") (rk/token-refusal mtg "nobody")
+                 (rk/token-refusal (m/end mtg) "jun")]]
+        (is (= "kaigi.signal" (namespace (:kaigi.rk/reason r))))))))
+
+;; ---------------------------------------------------------------------------
+;; configuration
+;; ---------------------------------------------------------------------------
+
+(deftest every-part-is-required
+  (is (rk/configured? config))
+  (doseq [k [:account-id :app-id :api-token :preset]]
+    (is (not (rk/configured? (assoc config k "")))
+        (str "missing " k " must not read as configured"))
+    (is (not (rk/configured? (dissoc config k))))))
+
+(deftest env-reading-defaults-the-preset-to-empty-not-to-a-guess
+  (let [cfg (rk/config-from-env {"REALTIMEKIT_ACCOUNT_ID" "acct"
+                                 "REALTIMEKIT_APP_ID" "app"
+                                 "REALTIMEKIT_API_TOKEN" "tok"})]
+    (is (= "" (:preset cfg)))
+    (is (not (rk/configured? cfg))
+        "guessing a preset name would produce joins that fail inside the SDK")))

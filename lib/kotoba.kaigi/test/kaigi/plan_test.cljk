@@ -1,0 +1,201 @@
+(ns kaigi.plan-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kaigi.model :as m]
+            [kaigi.plan :as plan]))
+
+(defn- three-way
+  "jun (host), rin and kai all admitted, in the room, each publishing a
+  camera and a mic."
+  []
+  (-> (m/meeting "m-1" "jun" {:lobby :open})
+      (m/start)
+      (m/join "jun")
+      (m/request-admission (m/participant "rin"))
+      (m/join "rin")
+      (m/request-admission (m/participant "kai"))
+      (m/join "kai")
+      (m/publish-track "jun" "cam-jun")
+      (m/publish-track "jun" "mic-jun")
+      (m/publish-track "rin" "cam-rin")
+      (m/publish-track "rin" "mic-rin")
+      (m/publish-track "kai" "cam-kai")
+      (m/publish-track "kai" "mic-kai")))
+
+(def sessions {"jun" "s-jun" "rin" "s-rin" "kai" "s-kai"})
+
+(deftest transport-follows-configuration-not-headcount
+  (is (= :mesh (plan/transport {})))
+  (is (= :mesh (plan/transport {:app-id "a"})))
+  (is (= :sfu (plan/transport {:app-id "a" :app-token "t"}))))
+
+(deftest desired-pulls-is-everyone-elses-tracks
+  (let [m (three-way)]
+    (is (= #{["s-rin" "cam-rin"] ["s-rin" "mic-rin"]
+             ["s-kai" "cam-kai"] ["s-kai" "mic-kai"]}
+           (plan/desired-pulls m sessions "jun")))
+    (testing "and never your own"
+      (is (not (contains? (plan/desired-pulls m sessions "jun") ["s-jun" "cam-jun"]))))))
+
+(deftest participants-without-a-session-are-skipped-not-errored
+  (testing "admitted but PeerConnection not yet created is a normal transient state"
+    (let [m (three-way)
+          partial-sessions (dissoc sessions "kai")]
+      (is (= #{["s-rin" "cam-rin"] ["s-rin" "mic-rin"]}
+             (plan/desired-pulls m partial-sessions "jun"))))))
+
+(deftest lobby-participants-are-not-published-to-anyone
+  (let [m (-> (m/meeting "m-1" "jun" {:lobby :approval-required})
+              (m/start)
+              (m/join "jun")
+              (m/request-admission (m/participant "rin")))]
+    (is (empty? (plan/desired-pulls m sessions "jun")))
+    (is (empty? (plan/desired-pulls m sessions "rin")))))
+
+(deftest pull-diff-only-reports-changes
+  (let [m (three-way)
+        desired (plan/desired-pulls m sessions "jun")]
+    (testing "from nothing, everything is pulled and nothing closed"
+      (let [d (plan/pull-diff {} desired)]
+        (is (= 4 (count (:kaigi.plan/pull d))))
+        (is (empty? (:kaigi.plan/close d)))))
+    (testing "when already fully subscribed the plan is empty"
+      (let [subscribed (into {} (map-indexed (fn [i k] [k (str i)]) (sort desired)))
+            d (plan/pull-diff subscribed desired)]
+        (is (plan/empty-plan? d))
+        (is (empty? (:kaigi.plan/pull d)))
+        (is (empty? (:kaigi.plan/close d)))))
+    (testing "a track that disappeared is closed by its mid, not re-pulled"
+      (let [subscribed {["s-rin" "cam-rin"] "2"
+                        ["s-rin" "mic-rin"] "3"
+                        ["s-kai" "cam-kai"] "4"
+                        ["s-kai" "mic-kai"] "5"
+                        ["s-kai" "screen-kai"] "6"}
+            d (plan/pull-diff subscribed desired)]
+        (is (empty? (:kaigi.plan/pull d)))
+        (is (= ["6"] (:kaigi.plan/close d)))))))
+
+(deftest unpublishing-removes-it-from-every-viewers-plan
+  (testing "camera off unpublishes; it must not stay subscribed and show a black tile"
+    (let [m (m/unpublish-track (three-way) "rin" "cam-rin")]
+      (is (= #{["s-rin" "mic-rin"] ["s-kai" "cam-kai"] ["s-kai" "mic-kai"]}
+             (plan/desired-pulls m sessions "jun")))
+      (let [d (plan/pull-diff {["s-rin" "cam-rin"] "2"} (plan/desired-pulls m sessions "jun"))]
+        (is (= ["2"] (:kaigi.plan/close d)))))))
+
+(deftest plans-are-sorted-so-they-are-stable
+  (let [m (three-way)
+        a (plan/pull-diff {} (plan/desired-pulls m sessions "jun"))
+        b (plan/pull-diff {} (plan/desired-pulls m sessions "jun"))]
+    (is (= a b))
+    (is (= (:kaigi.plan/pull a) (sort-by (juxt :session-id :track-name) (:kaigi.plan/pull a))))))
+
+(deftest mesh-initiator-is-a-total-order
+  (testing "exactly one side offers, decided identically on both sides"
+    (is (= "a" (plan/mesh-initiator "a" "b")))
+    (is (= "a" (plan/mesh-initiator "b" "a")))
+    (is (= (plan/mesh-initiator "rin" "jun") (plan/mesh-initiator "jun" "rin")))))
+
+(deftest mesh-plan-gives-complementary-roles
+  (let [m (three-way)
+        jun (plan/mesh-plan m "jun")
+        rin (plan/mesh-plan m "rin")]
+    (is (= [{:kaigi.plan/peer-id "kai" :kaigi.plan/role :offerer}
+            {:kaigi.plan/peer-id "rin" :kaigi.plan/role :offerer}]
+           jun)
+        "jun sorts before both, so jun offers to both")
+    (testing "and the other side sees itself as the answerer for the same pair"
+      (let [rin->jun (first (filter #(= "jun" (:kaigi.plan/peer-id %)) rin))]
+        (is (= :answerer (:kaigi.plan/role rin->jun))
+            "no glare: never both offering")))))
+
+(deftest mesh-warns-past-its-ceiling-in-data-not-logs
+  (let [m (reduce (fn [acc id]
+                    (-> acc (m/request-admission (m/participant id)) (m/join id)))
+                  (-> (m/meeting "m-1" "jun" {:lobby :open}) (m/start) (m/join "jun"))
+                  ["a" "b" "c" "d"])]
+    (is (not (plan/mesh-viable? m)))
+    (let [p (plan/plan-for m {} "jun" {} {})]
+      (is (= :mesh (:kaigi.plan/transport p)))
+      (is (= :mesh/over-ceiling (get-in p [:kaigi.plan/warning :kaigi.plan/code])))
+      (is (= 5 (get-in p [:kaigi.plan/warning :kaigi.plan/count])))
+      (is (= 4 (get-in p [:kaigi.plan/warning :kaigi.plan/ceiling]))))
+    (testing "and a small meeting carries no warning"
+      (let [small (-> (m/meeting "m-2" "jun" {:lobby :open}) (m/start) (m/join "jun"))]
+        (is (plan/mesh-viable? small))
+        (is (not (contains? (plan/plan-for small {} "jun" {} {}) :kaigi.plan/warning)))))))
+
+(deftest plan-for-switches-shape-with-the-transport
+  (let [m (three-way)
+        sfu (plan/plan-for m sessions "jun" {} {:app-id "a" :app-token "t"})
+        mesh (plan/plan-for m sessions "jun" {} {})]
+    (is (= :sfu (:kaigi.plan/transport sfu)))
+    (is (contains? sfu :kaigi.plan/pull))
+    (is (not (contains? sfu :kaigi.plan/peers)))
+    (is (= :mesh (:kaigi.plan/transport mesh)))
+    (is (contains? mesh :kaigi.plan/peers))
+    (is (not (contains? mesh :kaigi.plan/pull)))))
+
+(deftest realtimekit-wins-when-configured
+  (testing "they are alternatives, not layers — RealtimeKit is built ON the SFU"
+    (let [rk-cfg {:account-id "a" :app-id "b" :api-token "c" :preset "p"}
+          sfu-cfg {:app-id "a" :app-token "t"}]
+      (is (= :realtimekit (plan/transport rk-cfg)))
+      (is (= :sfu (plan/transport sfu-cfg)))
+      (is (= :realtimekit (plan/transport (merge sfu-cfg rk-cfg)))
+          "a deployment carrying both must behave predictably, not by check order")
+      (is (= :mesh (plan/transport {}))))))
+
+(deftest a-realtimekit-plan-has-no-subscription-opinion
+  (testing "the SDK owns track subscription; an empty diff would imply otherwise"
+    (let [p (plan/plan-for (three-way) sessions "jun" {}
+                           {:account-id "a" :app-id "b" :api-token "c" :preset "p"})]
+      (is (= :realtimekit (:kaigi.plan/transport p)))
+      (is (not (contains? p :kaigi.plan/pull)))
+      (is (not (contains? p :kaigi.plan/peers))))))
+
+;; ---------------------------------------------------------------------------
+;; capability negotiation
+;;
+;; These cover the production failure of 2026-08-01 directly: RealtimeKit
+;; secrets on a Worker whose bundle could only drive the mesh, which reported
+;; `:realtimekit`, handed out plans nothing acted on, and carried zero RTP.
+;; ---------------------------------------------------------------------------
+
+(def rk-cfg {:account-id "a" :app-id "b" :api-token "c" :preset "p"})
+
+(deftest a-plane-no-client-can-drive-is-not-chosen
+  (testing "configured for RealtimeKit, but every client speaks only mesh"
+    (is (= :mesh (plan/transport rk-cfg #{:mesh})))
+    (is (= :mesh (plan/negotiate rk-cfg [#{:mesh} #{:mesh}]))))
+  (testing "and it IS chosen once the clients can drive it"
+    (is (= :realtimekit (plan/negotiate rk-cfg [#{:realtimekit :mesh}
+                                                #{:realtimekit :mesh}])))))
+
+(deftest one-stale-client-moves-the-whole-room
+  (testing "mesh needs both ends to agree, so the room takes the intersection"
+    (is (= :mesh (plan/negotiate rk-cfg [#{:realtimekit :mesh} #{:mesh}])))))
+
+(deftest a-client-that-has-not-declared-yet-does-not-empty-the-intersection
+  (testing "nil is 'no opinion' — a socket mid-connect must not drop the room"
+    (is (= :realtimekit (plan/negotiate rk-cfg [#{:realtimekit :mesh} nil])))
+    (is (= :realtimekit (plan/negotiate rk-cfg [nil nil])))
+    (is (= :realtimekit (plan/negotiate rk-cfg [])))))
+
+(deftest a-client-cannot-conjure-a-plane-the-deployment-lacks
+  (testing "declaring RealtimeKit against an unconfigured Worker stays mesh"
+    (is (= :mesh (plan/transport {} #{:realtimekit :mesh})))
+    (is (= :mesh (plan/negotiate {} [#{:realtimekit}])))))
+
+(deftest an-empty-intersection-falls-back-to-mesh-rather-than-nil
+  (testing "a plane of nil is a client that no-ops — the failure being fixed"
+    (is (= :mesh (plan/transport rk-cfg #{})))
+    (is (= :mesh (plan/negotiate {:app-id "a" :app-token "t"} [#{:realtimekit}])))))
+
+(deftest the-announced-plane-and-the-plan-cannot-disagree
+  (testing "a room that negotiated mesh must hand out mesh plans, not RK ones"
+    (let [chosen (plan/negotiate rk-cfg [#{:mesh}])
+          p (plan/plan-for (three-way) sessions "jun" {} rk-cfg chosen)]
+      (is (= :mesh chosen))
+      (is (= :mesh (:kaigi.plan/transport p)))
+      (is (seq (:kaigi.plan/peers p))
+          "the whole point: there is something for the client to act on"))))

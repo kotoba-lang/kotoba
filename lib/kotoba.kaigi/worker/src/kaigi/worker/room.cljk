@@ -1,0 +1,550 @@
+(ns kaigi.worker.room
+  "KaigiRoom — the Durable Object that serializes one meeting.
+
+  A meeting needs exactly one writer. Two participants admitting the same
+  knock, or two joins racing to publish a track, produce a roster that
+  disagrees with itself; and every fix for that from the outside is a lease,
+  a fencing token, or a compare-and-swap loop. A Durable Object is globally
+  unique and single-threaded per id, so `one writer` is a property of where
+  the code runs rather than something this file has to implement. That is the
+  use AGENTS.md sanctions: **DO as serializer and realtime room, D1 for
+  storage.**
+
+  Accordingly the authoritative *live* meeting value lives here (in memory,
+  rehydrated from DO storage on wake), and anything that has to be queryable
+  across meetings goes to D1 through `kaigi.worker.journal`. Putting the
+  cross-meeting plane in DO storage would give one private SQLite per room —
+  as many islands as there are meetings, and no way to ask a question that
+  spans them.
+
+  ## Hibernation
+
+  Sockets are accepted with `ctx.acceptWebSocket`, so the room survives
+  isolate eviction without staying warm. The participant id is carried in the
+  socket's serialized attachment rather than an in-memory map, because that
+  map does not survive the eviction the hibernation API exists to allow.
+
+  ## Wire format is EDN, not JSON
+
+  Both ends of this socket are ClojureScript, and the meeting model is
+  EDN-native: `:kaigi.recording/consents` is a set, `:webrtc.room/tracks` is a
+  set, admission and roles are keywords. JSON round-trips none of those
+  faithfully — a set becomes an array and comes back a vector, a keyword
+  becomes a string — so every message would need a translation layer whose
+  only job is undoing the format. `cljs.reader/read-string` reads data only
+  (no evaluation), which is what makes this safe on untrusted input."
+  (:require [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kaigi.model :as m]
+            [kaigi.plan :as plan]
+            [kaigi.realtimekit :as rk]
+            [kaigi.recording :as recording]
+            [kaigi.signal :as sig]
+            [kaigi.turn :as turn]
+            [kaigi.validate :as v]))
+
+(def ^:const max-frame-bytes
+  "Frames larger than this are dropped. An SDP offer with a dozen codecs and
+  ICE candidates runs a few kilobytes; 64 KiB is generous for that and still
+  far below anything that could be used to make the room allocate."
+  65536)
+
+(def ^:const id-pattern
+  "Participant and meeting ids are opaque to this file but must be safe to
+  embed in storage keys and echo back to other participants."
+  #"^[A-Za-z0-9_.:-]{1,128}$")
+
+(defn- valid-id? [s]
+  (and (string? s) (some? (re-matches id-pattern s))))
+
+;; ---------------------------------------------------------------------------
+;; framing
+;; ---------------------------------------------------------------------------
+
+(defn- encode [m] (pr-str m))
+
+(defn- decode
+  "Parse a frame, returning nil rather than throwing on anything malformed.
+  A participant sending garbage must not be able to fault the room for
+  everyone else in it."
+  [s]
+  (try
+    (let [v (reader/read-string s)]
+      (when (map? v) v))
+    (catch :default _ nil)))
+
+;; ---------------------------------------------------------------------------
+;; socket helpers
+;; ---------------------------------------------------------------------------
+
+(defn- attach!
+  "Bind the identity and the declared media capability to the socket itself.
+
+  Both go in the serialized attachment rather than an in-memory map for the
+  same reason: hibernation. The isolate can be evicted between two frames, and
+  anything held in a module-level map is gone when it wakes while the socket
+  is not — a woken room would then know who is connected but not what any of
+  them can drive, and would have to guess."
+  [ws id planes]
+  (.serializeAttachment ws (encode {:kaigi/participant-id id
+                                    :kaigi/transports planes})))
+
+(defn- id-of
+  "The participant id bound to `ws`, or nil before `hello`."
+  [ws]
+  (some-> (.deserializeAttachment ws) decode :kaigi/participant-id))
+
+(defn- planes-of
+  "The media planes the client on `ws` said it can drive, or nil if it did not
+  say.
+
+  Nil and `#{}` are deliberately different: nil is a client from before this
+  negotiation existed (or one that has not said hello yet) and means \"no
+  opinion\", while an explicit empty set would mean \"I can drive nothing\" and
+  would collapse the whole room's intersection. `kaigi.plan/negotiate` drops
+  the nils rather than treating them as empty."
+  [ws]
+  (some-> (.deserializeAttachment ws) decode :kaigi/transports))
+
+(defn- send!
+  [ws msg]
+  (try (.send ws (encode msg))
+       (catch :default _ nil)))
+
+(defn- sockets [ctx] (array-seq (.getWebSockets ctx)))
+
+(defn- socket-for
+  [ctx id]
+  (first (filter #(= id (id-of %)) (sockets ctx))))
+
+;; ---------------------------------------------------------------------------
+;; the object
+;; ---------------------------------------------------------------------------
+
+(defn- config-of
+  "Media configuration read off the Worker env — both planes at once.
+
+  `kaigi.plan/transport` picks between them (RealtimeKit first, then SFU, then
+  mesh). Absent bindings yield blanks, which reads as `:mesh` — the deployment
+  degrades to a working mesh instead of failing to start."
+  [env]
+  (merge {:app-id    (some-> (aget env "REALTIME_APP_ID") str)
+          :app-token (some-> (aget env "REALTIME_APP_TOKEN") str)}
+         (rk/config-from-env (fn [k] (aget env k)))))
+
+;; ---------------------------------------------------------------------------
+;; RealtimeKit: one meeting per room, one token per admitted participant
+;; ---------------------------------------------------------------------------
+
+(defn- rk-fetch!
+  "Send an authorized RealtimeKit request and parse the reply.
+
+  The token is attached here and nowhere else — `kaigi.realtimekit` builds
+  descriptors that carry no credential precisely so they can be logged."
+  [cfg req]
+  (let [authed (rk/authorize req (:api-token cfg))]
+    (-> (js/fetch (:kaigi.rk/url authed)
+                  #js {:method (str/upper (name (:kaigi.rk/method authed)))
+                       :headers (clj->js (:kaigi.rk/headers authed))
+                       :body (js/JSON.stringify (clj->js (:kaigi.rk/body authed)))})
+        (.then (fn [res] (.json res)))
+        (.then (fn [body] (rk/parse-response (js->clj body :keywordize-keys true)))))))
+
+(declare current-state put-state! room-key)
+
+;; In-flight `create-meeting` calls, keyed by room. (A `defonce` takes no
+;; docstring, which is why this is a comment — same shape as `room-states`.)
+;;
+;; Separate from `room-states` on purpose, and both halves of that matter.
+;;
+;; It holds a PROMISE, not an id, because the id does not exist yet while the
+;; call is in the air — and that gap is exactly where two participants arrive.
+;; A Durable Object is single-threaded but not single-*task*: the two `hello`
+;; frames of a two-person meeting land microseconds apart, both find
+;; `:rk-meeting-id` still nil, and both POST a create. Measured against
+;; production 2026-08-01 — both tabs joined RealtimeKit successfully and each
+;; saw zero other participants, because they had been put in two different
+;; RealtimeKit meetings.
+;;
+;; And it is a separate atom because `room-states` is rewritten wholesale:
+;; `handle-frame` takes a state snapshot and its return value is `put-state!`d
+;; after `broadcast-state!` has already run, so anything stored there
+;; synchronously would be overwritten by a value read before it existed.
+(defonce ^:private rk-creating (atom {}))
+
+(defn- ensure-rk-meeting!
+  "The RealtimeKit meeting id for this room, created on first need — and
+  created exactly once.
+
+  Created lazily rather than when the room wakes: a room nobody joins should
+  not allocate anything. The resolved id is durable state, so it survives
+  hibernation; the in-flight promise is not, because a room that is evicted
+  mid-create has nothing to resume."
+  [ctx cfg mtg]
+  (let [k (room-key ctx)]
+    (cond
+      (get @rk-creating k) (get @rk-creating k)
+
+      (:rk-meeting-id (current-state ctx))
+      (js/Promise.resolve (:rk-meeting-id (current-state ctx)))
+
+      :else
+      (let [p (-> (rk-fetch! cfg (rk/create-meeting-request cfg {:title (:kaigi/title mtg)}))
+                  (.then (fn [parsed]
+                           (if-let [id (rk/meeting-id parsed)]
+                             (do (put-state! ctx (assoc (current-state ctx) :rk-meeting-id id))
+                                 (.put (.-storage ctx) "rk-meeting-id" id)
+                                 (swap! rk-creating dissoc k)
+                                 id)
+                             (do (swap! rk-creating dissoc k)
+                                 (throw (ex-info "RealtimeKit meeting creation failed"
+                                                 {:errors (:kaigi.rk/errors parsed)}))))))
+                  ;; Cleared on failure too, or one transient error from the
+                  ;; Cloudflare API would leave every later join in this room
+                  ;; awaiting a promise that will never resolve.
+                  (.catch (fn [e] (swap! rk-creating dissoc k) (throw e))))]
+        (swap! rk-creating assoc k p)
+        p))))
+
+(defn- rk-token!
+  "Mint a client token for `participant-id`, or nil when the model refuses.
+
+  `token-refusal` is consulted BEFORE the call, not after: a token that has
+  been issued is a join that is already possible, so there is no point at
+  which an issued token can be taken back."
+  [ctx env mtg participant-id]
+  (let [cfg (config-of env)]
+    (if-let [refusal (rk/token-refusal mtg participant-id)]
+      (js/Promise.resolve {:refused refusal})
+      (-> (ensure-rk-meeting! ctx cfg mtg)
+          (.then (fn [rk-id]
+                   (rk-fetch! cfg (rk/participant-request
+                                   cfg rk-id
+                                   {:participant-id participant-id
+                                    :display-name (:kaigi.participant/name
+                                                   (m/participant-by-id mtg participant-id))
+                                    :preset (:preset cfg)}))))
+          (.then (fn [parsed]
+                   (if-let [t (rk/participant-token parsed)]
+                     {:token t}
+                     {:refused {:kaigi.rk/reason :kaigi.rk/mint-failed
+                                :kaigi.rk/message (pr-str (:kaigi.rk/errors parsed))}})))
+          (.catch (fn [e]
+                    {:refused {:kaigi.rk/reason :kaigi.rk/unreachable
+                               :kaigi.rk/message (.-message e)}}))))))
+
+(defn- ice-servers
+  "ICE servers for one participant, with a freshly minted TURN credential when
+  a relay is configured.
+
+  Per-participant and per-call rather than computed once: the credential
+  expires and is bound to the participant id (`kaigi.turn`), so it cannot be
+  shared between the roster and cannot outlive the meeting. The clock is read
+  here — this is the host layer — and handed to the pure minting function."
+  [env participant-id]
+  (turn/ice-servers (turn/config-from-env (fn [k] (aget env k)))
+                    participant-id
+                    (js/Math.floor (/ (js/Date.now) 1000))))
+
+(defn- persist!
+  "Write the live meeting value to DO storage so a woken room resumes instead
+  of dropping everyone into an empty meeting."
+  [ctx mtg]
+  (.put (.-storage ctx) "meeting" (encode mtg)))
+
+(defn- restore
+  [ctx]
+  (-> (.get (.-storage ctx) "meeting")
+      (.then (fn [s] (when s (decode s))))))
+
+(defn- broadcast-state!
+  "Push the roster to everyone, and each participant's own media plan.
+
+  The plan is per-participant (who *you* should pull or offer to), so it
+  cannot ride along with the shared roster frame — sending one participant's
+  plan to another is how you end up with two peers both trying to be the
+  offerer."
+  [ctx env mtg sessions]
+  (let [cfg (config-of env)
+        ;; One plane for the whole room, negotiated across every connected
+        ;; client, and then used for BOTH the announcement and every plan.
+        ;; Deriving it twice is how a room comes to tell a participant it is
+        ;; on RealtimeKit while handing them a mesh plan.
+        chosen (plan/negotiate cfg (map planes-of (sockets ctx)))]
+    (doseq [ws (sockets ctx)]
+      (let [id (id-of ws)]
+        (send! ws {:t :state
+                   :kaigi/meeting mtg
+                   :kaigi/you id
+                   :kaigi/transport chosen
+                   :kaigi/ice-servers (ice-servers env (or id ""))})
+        (when (and id (m/admitted? mtg id) (m/in-room? mtg id))
+          (let [p (plan/plan-for mtg sessions id {} cfg chosen)]
+            (if (= :realtimekit (:kaigi.plan/transport p))
+              ;; The plan for RealtimeKit is a token, not a topology: the SDK
+              ;; owns subscription. Minting is per participant and happens here
+              ;; because this is the only place that holds both the live
+              ;; meeting and the credential.
+              (-> (rk-token! ctx env mtg id)
+                  (.then (fn [{:keys [token refused]}]
+                           (send! ws (cond-> {:t :plan :kaigi/plan p}
+                                       token   (assoc :kaigi/rk-token token)
+                                       refused (assoc :kaigi/rk-refused refused))))))
+              (send! ws {:t :plan :kaigi/plan p}))))))))
+
+(defn- declared-planes
+  "The media planes named in a `hello`, keeping only ones kaigi actually has.
+
+  Frames arrive as EDN read off an untrusted socket, so this is filtered
+  rather than trusted: without it a client could name a plane that does not
+  exist and the room's intersection would quietly empty out, dropping
+  everyone to mesh — or, if a future plane were added, name one the
+  deployment holds no credentials for.
+
+  Returns nil when the frame declares nothing, which `planes-of` documents as
+  distinct from an empty set."
+  [declared]
+  (when (coll? declared)
+    (let [known (set (filter (set plan/planes) declared))]
+      (when (seq known) known))))
+
+(defn- handle-hello
+  "First frame on a socket: bind an identity, declare what the client can
+  drive, and knock."
+  [state ctx env ws {:keys [kaigi/participant-id kaigi/name kaigi/did
+                            kaigi/transports]}]
+  (if-not (valid-id? participant-id)
+    (do (send! ws {:t :error :kaigi/code :bad-id
+                   :kaigi/message "participant id must match [A-Za-z0-9_.:-]{1,128}"})
+        state)
+    (let [mtg  (:meeting state)
+          mtg' (-> mtg
+                   (m/request-admission (m/participant participant-id
+                                                       {:name name :did did}))
+                   (m/join participant-id))]
+      (attach! ws participant-id (declared-planes transports))
+      (persist! ctx mtg')
+      (broadcast-state! ctx env mtg' (:sessions state))
+      (assoc state :meeting mtg'))))
+
+(defn- handle-signal
+  [state ctx ws frame]
+  (let [from (id-of ws)
+        mtg  (:meeting state)
+        out  (sig/route mtg (assoc frame :from from :type :signal))]
+    (if (sig/error? out)
+      (send! ws {:t :error
+                 :kaigi/code (:kaigi.signal/error out)
+                 :kaigi/message (:kaigi.signal/message out)})
+      (doseq [{:keys [to payload]} out]
+        (when-let [peer (socket-for ctx to)]
+          (send! peer {:t :signal :kaigi/from from :kaigi/payload payload}))))
+    state))
+
+(defn- handle-control
+  [state ctx env ws frame]
+  (let [from (id-of ws)
+        mtg  (:meeting state)
+        out  (sig/apply-control mtg (assoc frame :from from))]
+    (if (sig/error? out)
+      (do (send! ws {:t :error
+                     :kaigi/code (:kaigi.signal/error out)
+                     :kaigi/message (:kaigi.signal/message out)})
+          state)
+      (let [mtg' (:kaigi.signal/meeting out)]
+        ;; A control that would corrupt the meeting is refused rather than
+        ;; persisted. The model's own guards make this unreachable for the
+        ;; control types routed here, which is exactly why it is checked:
+        ;; the day a new control type is added, this is what catches it.
+        (if (v/valid? mtg')
+          (do (persist! ctx mtg')
+              (broadcast-state! ctx env mtg' (:sessions state))
+              (assoc state :meeting mtg'))
+          (do (send! ws {:t :error :kaigi/code :would-corrupt
+                         :kaigi/message (pr-str (mapv :kaigi/code (v/errors mtg')))})
+              state))))))
+
+(defn- handle-publish
+  "A participant reports the track names it is publishing, so every other
+  participant's plan can include them."
+  [state ctx env ws {:keys [kaigi/tracks kaigi/session-id]}]
+  (let [from (id-of ws)
+        mtg  (reduce (fn [acc t] (m/publish-track acc from t))
+                     (:meeting state)
+                     (filter string? tracks))
+        state' (cond-> (assoc state :meeting mtg)
+                 (valid-id? session-id) (assoc-in [:sessions from] session-id))]
+    (persist! ctx mtg)
+    (broadcast-state! ctx env mtg (:sessions state'))
+    state'))
+
+(defn- handle-frame
+  [state ctx env ws frame]
+  (case (:t frame)
+    :hello   (handle-hello state ctx env ws frame)
+    :signal  (handle-signal state ctx ws frame)
+    :control (handle-control state ctx env ws frame)
+    :publish (handle-publish state ctx env ws frame)
+    (do (send! ws {:t :error :kaigi/code :unknown-frame
+                   :kaigi/message (str "unknown frame type " (pr-str (:t frame)))})
+        state)))
+
+;; Live state per room, keyed by the Durable Object's own id.
+;;
+;; NOT a single module-level cell. Distinct DO instances of the same class can
+;; share an isolate, so one cell would let two different meetings overwrite
+;; each other's roster — a bug that only appears under the load that puts two
+;; rooms on one isolate, which is to say in production and not in a test. The
+;; DO id is unique per object and stable across hibernation, so it is the
+;; correct key.
+(defonce ^:private room-states (atom {}))
+
+(defn- room-key [ctx] (str (.-id ctx)))
+
+(defn- current-state [ctx] (get @room-states (room-key ctx)))
+
+(defn- put-state!
+  [ctx state]
+  (swap! room-states assoc (room-key ctx) state)
+  state)
+
+(defn- ensure-state!
+  [ctx meeting-id]
+  (if-let [s (current-state ctx)]
+    (js/Promise.resolve s)
+    (-> (js/Promise.all #js [(restore ctx) (.get (.-storage ctx) "rk-meeting-id")])
+        (.then (fn [res]
+                 (let [stored (aget res 0)
+                       rk-id (aget res 1)]
+                 (put-state! ctx
+                             {:meeting (or stored
+                                           ;; A room woken with no stored
+                                           ;; meeting has an open lobby and no
+                                           ;; host yet: the first participant
+                                           ;; to say hello becomes the host.
+                                           (m/meeting meeting-id "" {:lobby :open}))
+                              :sessions {}
+                              :rk-meeting-id rk-id})))))))
+
+(defn- adopt-first-host
+  "The first participant to arrive in a room with no host becomes it.
+
+  A meeting created out of band (from a calendar entry, from a kaisha
+  channel) knows its host up front and this never fires. A bare room link
+  does not, and the alternative is a meeting nobody can moderate.
+
+  A room with no host yet is constructed by `ensure-state!` with a blank host
+  id, which `kaigi.model/meeting` faithfully turns into a participant keyed by
+  the empty string. That placeholder MUST be dropped here: leaving it behind
+  puts a nameless ghost in every roster and in every participant grid, and it
+  is invisible to both the unit suite (which never builds a hostless meeting)
+  and `kaigi.validate` (the placeholder is a structurally valid participant).
+  The end-to-end run against a real Durable Object is what surfaced it."
+  [state id]
+  (let [mtg (:meeting state)]
+    (if (str/blank? (:kaigi/host mtg))
+      (assoc state :meeting
+             (-> mtg
+                 (assoc :kaigi/host id)
+                 (m/leave "")
+                 (update :kaigi/participants dissoc "")
+                 (assoc-in [:kaigi/participants id]
+                           (assoc (m/participant id {:role :host})
+                                  :kaigi.participant/admission :admitted))
+                 ;; A room someone has walked into IS live. Without this the
+                 ;; meeting sits at `:scheduled` forever, because nothing sends
+                 ;; the `:start` control — and `:scheduled` silently disables
+                 ;; everything gated on `live?`: recording cannot be armed and
+                 ;; `kaigi.recording/capturing?` is false for everyone. The
+                 ;; symptom is a start-recording button that does nothing, with
+                 ;; no error anywhere. Found by the recording end-to-end run.
+                 (m/start)))
+      state)))
+
+(defn- upload-part!
+  "Store one recorded part in R2, authorized against the LIVE meeting.
+
+  Authorization is the reason this goes through the Durable Object at all
+  rather than straight to a bucket: the DO holds the only authoritative answer
+  to \"is recording on, and is this participant admitted and in the room\".
+  `kaigi.recording/capturing?` is the same predicate the browser uses to decide
+  whether to record, so a client that keeps recording after consent is
+  withdrawn finds its uploads refused rather than quietly accepted.
+
+  A bucket-scoped presigned URL would be faster and would move that decision
+  to whoever holds the URL — which is exactly the decision that must not
+  move."
+  [ctx env request]
+  (let [url (js/URL. (.-url request))
+        participant (or (.get (.-searchParams url) "participant") "")
+        seq-n (or (.get (.-searchParams url) "seq") "")
+        bucket (aget env "KAIGI_RECORDINGS")]
+    (-> (ensure-state! ctx (or (.get (.-searchParams url) "meeting") "kaigi"))
+        (.then (fn [state]
+                 (let [mtg (:meeting state)]
+                   (cond
+                     (not bucket)
+                     (js/Response. "recording storage is not configured" #js {:status 501})
+
+                     (not (and (valid-id? participant) (re-matches #"^\d{1,6}$" (str seq-n))))
+                     (js/Response. "bad participant or seq" #js {:status 400})
+
+                     (not (recording/capturing? mtg participant))
+                     ;; 409, not 403: the participant may be perfectly
+                     ;; legitimate and simply recording after consent was
+                     ;; withdrawn. The distinction is what tells a client to
+                     ;; stop rather than to re-authenticate.
+                     (js/Response. "recording is not active for this participant"
+                                   #js {:status 409})
+
+                     :else
+                     (let [k (recording/object-key (:kaigi/id mtg) participant
+                                                   (js/parseInt seq-n 10))]
+                       (-> (.put bucket k (.-body request))
+                           (.then (fn [_]
+                                    (js/Response. (encode {:t :stored :kaigi/key k})
+                                                  #js {:status 201})))))))))
+        (.catch (fn [e]
+                  (js/Response. (str "upload failed: " (.-message e)) #js {:status 500}))))))
+
+(defn on-fetch
+  "WebSocket upgrade for one room, or a recording upload."
+  [ctx env request]
+  (if (not= "websocket" (some-> (.get (.-headers request) "Upgrade") str/lower))
+    (if (= "PUT" (.-method request))
+      (upload-part! ctx env request)
+      (js/Promise.resolve (js/Response. "expected websocket" #js {:status 426})))
+    (let [url (js/URL. (.-url request))
+          meeting-id (or (.get (.-searchParams url) "meeting") "kaigi")]
+      (-> (ensure-state! ctx meeting-id)
+          (.then (fn [_]
+                   (let [pair (js/WebSocketPair.)
+                         client (aget pair "0")
+                         server (aget pair "1")]
+                     (.acceptWebSocket ctx server)
+                     (js/Response. nil #js {:status 101 :webSocket client}))))))))
+
+(defn on-message
+  [ctx env ws message]
+  (when (and (string? message) (<= (count message) max-frame-bytes))
+    (when-let [frame (decode message)]
+      (-> (ensure-state! ctx "kaigi")
+          (.then (fn [state]
+                   (let [state (if (and (= :hello (:t frame))
+                                        (valid-id? (:kaigi/participant-id frame)))
+                                 (adopt-first-host state (:kaigi/participant-id frame))
+                                 state)]
+                     (put-state! ctx (handle-frame state ctx env ws frame)))))))))
+
+(defn on-close
+  "A closed socket leaves the media room but keeps its admission — a dropped
+  connection is not an ejection (`kaigi.model/leave`)."
+  [ctx env ws]
+  (when-let [id (id-of ws)]
+    (when-let [s (current-state ctx)]
+      (let [state (put-state! ctx (-> s
+                                      (update :meeting m/leave id)
+                                      (update :sessions dissoc id)))]
+        (persist! ctx (:meeting state))
+        (broadcast-state! ctx env (:meeting state) (:sessions state)))))
+  (try (.close ws) (catch :default _ nil)))

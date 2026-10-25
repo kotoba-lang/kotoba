@@ -1,0 +1,120 @@
+(ns kaigi.sfu-test
+  "The wire shapes are asserted literally.
+
+  These tests are transcriptions of Cloudflare's published OpenAPI document
+  (`realtime-api-2024-05-21.yaml`), not of what this namespace happens to
+  produce. That is the whole point: a typo in `trackName` would still make a
+  round trip through `push-tracks-request` and back, so the assertion has to
+  come from outside the implementation."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kaigi.sfu :as sfu]))
+
+(def app "1a4b7c")
+(def sess "e017a2629c754fedc1f7d8587e06d126")
+
+(deftest urls-carry-the-version-segment
+  (is (= "https://rtc.live.cloudflare.com/v1/apps/1a4b7c/sessions/new"
+         (:kaigi.sfu/url (sfu/new-session-request app))))
+  (is (= (str "https://rtc.live.cloudflare.com/v1/apps/" app "/sessions/" sess "/tracks/new")
+         (:kaigi.sfu/url (sfu/pull-tracks-request app sess []))))
+  (is (= (str "https://rtc.live.cloudflare.com/v1/apps/" app "/sessions/" sess "/renegotiate")
+         (:kaigi.sfu/url (sfu/renegotiate-request app sess "sdp"))))
+  (is (= (str "https://rtc.live.cloudflare.com/v1/apps/" app "/sessions/" sess "/tracks/close")
+         (:kaigi.sfu/url (sfu/close-tracks-request app sess ["0"]))))
+  (is (= (str "https://rtc.live.cloudflare.com/v1/apps/" app "/sessions/" sess)
+         (:kaigi.sfu/url (sfu/session-state-request app sess)))))
+
+(deftest methods-match-the-spec
+  (is (= :post (:kaigi.sfu/method (sfu/new-session-request app))))
+  (is (= :post (:kaigi.sfu/method (sfu/pull-tracks-request app sess []))))
+  (is (= :put  (:kaigi.sfu/method (sfu/renegotiate-request app sess "s"))))
+  (is (= :put  (:kaigi.sfu/method (sfu/close-tracks-request app sess ["0"]))))
+  (is (= :get  (:kaigi.sfu/method (sfu/session-state-request app sess)))))
+
+(deftest new-session-without-an-offer-sends-an-empty-body
+  (testing "a participant who is only watching has nothing to offer yet"
+    (is (= {} (:kaigi.sfu/body (sfu/new-session-request app)))))
+  (is (= {:sessionDescription {:type "offer" :sdp "v=0..."}}
+         (:kaigi.sfu/body (sfu/new-session-request app "v=0...")))))
+
+(deftest push-tracks-body-is-the-local-shape
+  (is (= {:sessionDescription {:type "offer" :sdp "v=0..."}
+          :tracks [{:location "local" :mid "4" :trackName "cam-rin"}
+                   {:location "local" :mid "5" :trackName "mic-rin"
+                    :kind "audio" :bidirectionalMediaStream true}]}
+         (:kaigi.sfu/body
+          (sfu/push-tracks-request app sess "v=0..."
+                                   [{:mid "4" :track-name "cam-rin"}
+                                    {:mid "5" :track-name "mic-rin"
+                                     :kind :audio :bidirectional? true}])))))
+
+(deftest pull-tracks-body-sends-no-session-description
+  (testing "pulling is the direction where the SFU generates the offer"
+    (let [body (:kaigi.sfu/body
+                (sfu/pull-tracks-request app sess
+                                         [{:session-id "2a45361d" :track-name "cam-jun"}]))]
+      (is (= {:tracks [{:location "remote" :sessionId "2a45361d" :trackName "cam-jun"}]}
+             body))
+      (is (not (contains? body :sessionDescription))
+          "sending an offer here is the mistake the separate arity prevents"))))
+
+(deftest close-tracks-force-is-opt-in
+  (is (= {:tracks [{:mid "0"} {:mid "1"}]}
+         (:kaigi.sfu/body (sfu/close-tracks-request app sess ["0" "1"]))))
+  (is (= {:tracks [{:mid "0"}] :force true}
+         (:kaigi.sfu/body (sfu/close-tracks-request app sess ["0"] {:force? true})))))
+
+(deftest the-token-is-not-in-the-request
+  (testing "a descriptor can be logged without leaking the app secret"
+    (let [req (sfu/pull-tracks-request app sess [])]
+      (is (not (contains? req :kaigi.sfu/headers)))
+      (is (not (re-find #"secret" (pr-str req)))))
+    (let [authed (sfu/authorize (sfu/pull-tracks-request app sess []) "s3cret")]
+      (is (= "Bearer s3cret" (get-in authed [:kaigi.sfu/headers "Authorization"])))
+      (is (= "application/json" (get-in authed [:kaigi.sfu/headers "Content-Type"]))))))
+
+(deftest parse-new-session-response
+  (let [p (sfu/parse-response {:sessionId sess
+                               :sessionDescription {:type "answer" :sdp "v=0 answer"}})]
+    (is (sfu/ok? p))
+    (is (= sess (:kaigi.sfu/session-id p)))
+    (is (= "v=0 answer" (:kaigi.sfu/sdp p)))
+    (is (= :answer (:kaigi.sfu/sdp-type p)))
+    (is (not (sfu/needs-renegotiation? p)))))
+
+(deftest renegotiation-flag-is-surfaced
+  (let [p (sfu/parse-response {:requiresImmediateRenegotiation true
+                               :sessionDescription {:type "offer" :sdp "v=0 offer"}
+                               :tracks [{:location "remote" :trackName "cam-jun" :mid "2"}]})]
+    (is (sfu/ok? p))
+    (is (sfu/needs-renegotiation? p))
+    (is (= :offer (:kaigi.sfu/sdp-type p)))
+    (is (= 1 (count (:kaigi.sfu/tracks p))))))
+
+(deftest a-per-track-error-fails-the-whole-response
+  (testing "the SFU reports partial failures inside a 200"
+    (let [p (sfu/parse-response
+             {:requiresImmediateRenegotiation false
+              :tracks [{:location "remote" :trackName "cam-jun" :mid "2"}
+                       {:location "remote" :trackName "cam-gone"
+                        :errorCode "TRACK_NOT_FOUND"
+                        :errorDescription "no such track"}]})]
+      (is (not (sfu/ok? p))
+          "a caller that only checks the HTTP status records a subscription that was refused")
+      (is (= 1 (count (:kaigi.sfu/errors p))))
+      (is (= "TRACK_NOT_FOUND" (-> p :kaigi.sfu/errors first :kaigi.sfu/error-code)))
+      (is (= "cam-gone" (-> p :kaigi.sfu/errors first :kaigi.sfu/track-name))))))
+
+(deftest a-top-level-error-fails-too
+  (let [p (sfu/parse-response {:errorCode "SESSION_NOT_FOUND"
+                               :errorDescription "gone"})]
+    (is (not (sfu/ok? p)))
+    (is (= "SESSION_NOT_FOUND" (-> p :kaigi.sfu/errors first :kaigi.sfu/error-code)))))
+
+(deftest configured-needs-both-halves
+  (is (not (sfu/configured? {})))
+  (is (not (sfu/configured? {:app-id "a"})))
+  (is (not (sfu/configured? {:app-token "t"})))
+  (is (not (sfu/configured? {:app-id "" :app-token "t"})))
+  (is (not (sfu/configured? {:app-id "a" :app-token nil})))
+  (is (sfu/configured? {:app-id "a" :app-token "t"})))
