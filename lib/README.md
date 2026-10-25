@@ -180,6 +180,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.verilog` | `org.ieee.verilog/src` | `kotoba.verilog`, `verilog.core` (an external specification, publisher ieee.org) |
 | `org.ieee.std1588` | `org.ieee.std1588/src` | `ptp.header`, `ptp.message`, `ptp.offset`, `ptp.timestamp` (an external specification, publisher ieee.org) |
 | `org.dnp.dnp3` | `org.dnp.dnp3/src` | `dnp3.app`, `dnp3.crc`, `dnp3.dl`, `dnp3.objects` (an external specification, publisher dnp.org) |
+| `org.kernel.fuse` | `org.kernel.fuse/src` | `` (an external specification, publisher kernel.org) |
 | `com.synopsys.liberty` | `com.synopsys.liberty/src` | `liberty.core` (Kotoba project library) |
 | `io.toml.core` | `io.toml.core/src` | `toml.reader` (Kotoba project library) |
 | `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
