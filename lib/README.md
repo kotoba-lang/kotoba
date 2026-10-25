@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.domGpu` | `kotoba.domGpu/src` | `kotoba.wasm.abi`, `kotoba.wasm.debug`, `kotoba.wasm.demo`, `kotoba.wasm.demo-document` (Kotoba project library) |
 | `kotoba.codeGraph` | `kotoba.codeGraph/src` | `code-graph.async`, `code-graph.core`, `code-graph.evidence` (Kotoba project library) |
 | `kotoba.yield` | `kotoba.yield/src` | `yield`, `yield.aging`, `yield.corner`, `yield.monte-carlo` (Kotoba project library) |
 | `kotoba.watchlistScreen` | `kotoba.watchlistScreen/src` | `watchlist.adapters.aml-port`, `watchlist.adapters.edn-index`, `watchlist.adapters.eu-consolidated`, `watchlist.adapters.jp-mof` (Kotoba project library) |
