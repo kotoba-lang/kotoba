@@ -157,6 +157,7 @@ The bundled standard libraries live in this repository:
 | `org.msgpack.core` | `org.msgpack.core/src` | `msgpack.bytes`, `msgpack.core` (an external specification, publisher msgpack.org) |
 | `org.khronos.glb` | `org.khronos.glb/src` | `glb`, `glb.json` (an external specification, publisher khronos.org) |
 | `org.ros.core` | `org.ros.core/src` | `kotoba.ros.cdr`, `kotoba.ros.msgs`, `kotoba.ros.qos`, `kotoba.ros.rosbridge` (an external specification, publisher ros.org) |
+| `org.modbus.core` | `org.modbus.core/src` | `modbus.crc`, `modbus.pdu`, `modbus.rtu`, `modbus.tcp` (an external specification, publisher modbus.org) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |

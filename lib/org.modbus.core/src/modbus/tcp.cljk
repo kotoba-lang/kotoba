@@ -1,0 +1,86 @@
+(ns modbus.tcp
+  "Modbus TCP framing — the MBAP header, §4.1 of the MODBUS Messaging on
+  TCP/IP Implementation Guide.
+
+      transaction id  2 bytes   echoed by the server, matches reply to request
+      protocol id     2 bytes   always 0 for Modbus
+      length          2 bytes   bytes that FOLLOW this field: unit id + PDU
+      unit id         1 byte    the device behind a gateway; 0xFF when direct
+
+  The length field counting the unit id is the detail that gets this wrong
+  most often: it is `1 + (count pdu)`, not `(count pdu)`, and an
+  implementation that omits the one desynchronises the stream one frame later
+  rather than at the frame it got wrong.
+
+  There is no checksum. TCP already provides one, so an RTU CRC here would be
+  redundant — and adding it produces a frame every real device rejects."
+  (:require [modbus.pdu :as pdu]))
+
+(def header-bytes 7)
+
+(defn- be16 [n] [(bit-and (unsigned-bit-shift-right n 8) 0xFF) (bit-and n 0xFF)])
+(defn- rd16 [bs i] (+ (* 256 (nth bs i)) (nth bs (inc i))))
+
+(defn encode
+  "Wrap `pdu-bytes` in an MBAP header.
+
+  `:transaction-id` defaults to 0 and `:unit-id` to 0xFF, the value §4.1 gives
+  for a device addressed directly rather than through a serial gateway."
+  [{:keys [transaction-id unit-id] :or {transaction-id 0 unit-id 0xFF}} pdu-bytes]
+  (let [n (count pdu-bytes)]
+    (cond
+      (not (<= 0 transaction-id 0xFFFF))
+      {:status :error :reason :transaction-id-out-of-range :value transaction-id}
+      (not (<= 0 unit-id 0xFF))
+      {:status :error :reason :unit-id-out-of-range :value unit-id}
+      (> n pdu/max-pdu-bytes)
+      {:status :error :reason :pdu-too-long :length n :maximum pdu/max-pdu-bytes}
+      :else
+      {:status :ok
+       :bytes (into (into (be16 transaction-id)
+                          (into [0 0] (be16 (inc n))))
+                    (into [unit-id] pdu-bytes))})))
+
+(defn decode
+  "Read one MBAP-framed message from the front of `buf`.
+
+  Returns `{:status :ok :frame {…} :consumed n}`, `{:status :incomplete
+  :need n}`, or `{:status :error :reason kw}`. `:frame` carries
+  `:transaction-id :unit-id :pdu-bytes`; decoding the PDU is
+  `modbus.pdu/decode-request` or `-response`, because only the caller knows
+  which direction the message travelled."
+  [buf]
+  (let [buf (vec buf) n (count buf)]
+    (if (< n header-bytes)
+      {:status :incomplete :need (- header-bytes n)}
+      (let [proto (rd16 buf 2)
+            len (rd16 buf 4)]
+        (cond
+          (not (zero? proto))
+          {:status :error :reason :not-modbus-protocol :protocol-id proto}
+          ;; The length counts the unit id, so a frame claiming 0 has no unit
+          ;; id and cannot be a message.
+          (zero? len)
+          {:status :error :reason :zero-length}
+          (> len (inc pdu/max-pdu-bytes))
+          {:status :error :reason :length-too-large :length len}
+          :else
+          (let [total (+ 6 len)]
+            (if (< n total)
+              {:status :incomplete :need (- total n)}
+              {:status :ok
+               :consumed total
+               :frame {:transaction-id (rd16 buf 0)
+                       :unit-id (nth buf 6)
+                       :pdu-bytes (subvec buf 7 total)}})))))))
+
+(defn decode-all
+  "Drain a read buffer. Returns `{:frames […] :rest […]}`, with `:error` added
+  when a frame was malformed."
+  [buf]
+  (loop [buf (vec buf) out []]
+    (let [r (decode buf)]
+      (case (:status r)
+        :ok (recur (subvec buf (:consumed r)) (conj out (:frame r)))
+        :incomplete {:frames out :rest buf}
+        :error {:frames out :rest buf :error r}))))

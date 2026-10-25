@@ -1,0 +1,310 @@
+(ns modbus.pdu
+  "Modbus PDUs — the function code and its data, independent of how the frame
+  is carried.
+
+  MODBUS Application Protocol Specification V1.1b3. The PDU is the part that
+  is identical on TCP, RTU and ASCII; only the wrapper differs, and
+  `modbus.tcp` and `modbus.rtu` supply those.
+
+  Errors are returned, never thrown: every function answers a map whose
+  `:status` is `:ok` or `:error`, and an error carries a keyword `:reason`.
+  Those keywords are contract. An exception RESPONSE — a device saying no —
+  is `{:status :ok :pdu {:exception …}}`, not an `:error`: it is a
+  well-formed message that happens to carry a refusal, and collapsing the two
+  loses the difference between 'the device rejected this' and 'these bytes
+  are not a Modbus message'.")
+
+(def function-codes
+  {0x01 :read-coils
+   0x02 :read-discrete-inputs
+   0x03 :read-holding-registers
+   0x04 :read-input-registers
+   0x05 :write-single-coil
+   0x06 :write-single-register
+   0x07 :read-exception-status
+   0x0B :get-comm-event-counter
+   0x0F :write-multiple-coils
+   0x10 :write-multiple-registers
+   0x11 :report-server-id
+   0x16 :mask-write-register
+   0x17 :read-write-multiple-registers})
+
+(def code->function (into {} (map (fn [[k v]] [v k])) function-codes))
+
+(def exception-codes
+  "§7. `:acknowledge` and `:server-busy` are not failures — they mean the
+  request was accepted and the caller must poll."
+  {0x01 :illegal-function
+   0x02 :illegal-data-address
+   0x03 :illegal-data-value
+   0x04 :server-device-failure
+   0x05 :acknowledge
+   0x06 :server-device-busy
+   0x08 :memory-parity-error
+   0x0A :gateway-path-unavailable
+   0x0B :gateway-target-failed-to-respond})
+
+(def ^:private exception-code->kw (into {} (map (fn [[k v]] [v k])) exception-codes))
+
+;; ── limits ───────────────────────────────────────────────────────────────────
+
+(def max-read-coils 2000)       ; §6.1
+(def max-read-registers 125)    ; §6.3
+(def max-write-coils 1968)      ; §6.11
+(def max-write-registers 123)   ; §6.12
+(def max-pdu-bytes 253)         ; §4.1 — 256 on the wire less address and CRC
+
+;; ── helpers ──────────────────────────────────────────────────────────────────
+
+(defn- be16 [n] [(bit-and (unsigned-bit-shift-right n 8) 0xFF) (bit-and n 0xFF)])
+(defn- rd16 [bs i] (+ (* 256 (nth bs i)) (nth bs (inc i))))
+
+(defn- bits->bytes
+  "Pack booleans least-significant-bit first, which is the order §6.1 uses for
+  coil status and the opposite of how the values are written down."
+  [bits]
+  (mapv (fn [chunk]
+          (reduce (fn [acc [i b]] (if b (bit-or acc (bit-shift-left 1 i)) acc))
+                  0
+                  (map-indexed vector chunk)))
+        (partition-all 8 bits)))
+
+(defn- bytes->bits [bs n]
+  (vec (take n (mapcat (fn [b] (map #(bit-test b %) (range 8))) bs))))
+
+(defn- addr-ok? [n] (<= 0 n 0xFFFF))
+
+;; ── requests ─────────────────────────────────────────────────────────────────
+
+(defn encode-request
+  "A request PDU as bytes.
+
+  `pdu` is `{:function kw …}`; the remaining keys depend on the function:
+
+    :read-coils / :read-discrete-inputs      :address :quantity
+    :read-holding-registers / :read-input-registers  :address :quantity
+    :write-single-coil                       :address :value (boolean)
+    :write-single-register                   :address :value
+    :write-multiple-coils                    :address :values (booleans)
+    :write-multiple-registers                :address :values
+
+  Quantity limits are enforced here rather than left to the device, because a
+  request over the limit is answered with an exception the caller then has to
+  interpret, and the limits are fixed by the specification."
+  [{:keys [function address quantity value values]}]
+  (let [fc (code->function function)]
+    (cond
+      (nil? fc) {:status :error :reason :unknown-function :function function}
+
+      (and (some? address) (not (addr-ok? address)))
+      {:status :error :reason :address-out-of-range :address address}
+
+      :else
+      (case function
+        (:read-coils :read-discrete-inputs)
+        (if-not (<= 1 quantity max-read-coils)
+          {:status :error :reason :quantity-out-of-range :quantity quantity
+           :maximum max-read-coils}
+          {:status :ok :bytes (into [fc] (into (be16 address) (be16 quantity)))})
+
+        (:read-holding-registers :read-input-registers)
+        (if-not (<= 1 quantity max-read-registers)
+          {:status :error :reason :quantity-out-of-range :quantity quantity
+           :maximum max-read-registers}
+          {:status :ok :bytes (into [fc] (into (be16 address) (be16 quantity)))})
+
+        :write-single-coil
+        ;; §6.5: 0xFF00 is on and 0x0000 is off. No other value is legal, which
+        ;; is why this takes a boolean rather than a number.
+        {:status :ok :bytes (into [fc] (into (be16 address) (be16 (if value 0xFF00 0))))}
+
+        :write-single-register
+        (if-not (<= 0 value 0xFFFF)
+          {:status :error :reason :value-out-of-range :value value}
+          {:status :ok :bytes (into [fc] (into (be16 address) (be16 value)))})
+
+        :write-multiple-coils
+        (if-not (<= 1 (count values) max-write-coils)
+          {:status :error :reason :quantity-out-of-range :quantity (count values)
+           :maximum max-write-coils}
+          (let [packed (bits->bytes values)]
+            {:status :ok
+             :bytes (into (into [fc] (into (be16 address) (be16 (count values))))
+                          (into [(count packed)] packed))}))
+
+        :write-multiple-registers
+        (cond
+          (not (<= 1 (count values) max-write-registers))
+          {:status :error :reason :quantity-out-of-range :quantity (count values)
+           :maximum max-write-registers}
+          (not (every? #(<= 0 % 0xFFFF) values))
+          {:status :error :reason :value-out-of-range}
+          :else
+          {:status :ok
+           :bytes (into (into [fc] (into (be16 address) (be16 (count values))))
+                        (into [(* 2 (count values))] (mapcat be16 values)))})
+
+        (:read-exception-status :report-server-id)
+        {:status :ok :bytes [fc]}
+
+        {:status :error :reason :unsupported-function :function function}))))
+
+;; ── responses ────────────────────────────────────────────────────────────────
+
+(defn encode-response
+  "A response PDU as bytes. `pdu` may instead be
+  `{:function kw :exception kw}`, which produces the §7 exception response:
+  the function code with its high bit set, then the exception code."
+  [{:keys [function exception address quantity value bits registers]}]
+  (let [fc (code->function function)]
+    (cond
+      (nil? fc) {:status :error :reason :unknown-function :function function}
+
+      exception
+      (if-let [ec (exception-code->kw exception)]
+        {:status :ok :bytes [(bit-or fc 0x80) ec]}
+        {:status :error :reason :unknown-exception :exception exception})
+
+      :else
+      (case function
+        (:read-coils :read-discrete-inputs)
+        (let [packed (bits->bytes bits)]
+          {:status :ok :bytes (into [fc (count packed)] packed)})
+
+        (:read-holding-registers :read-input-registers :read-write-multiple-registers)
+        {:status :ok :bytes (into [fc (* 2 (count registers))] (mapcat be16 registers))}
+
+        :write-single-coil
+        {:status :ok :bytes (into [fc] (into (be16 address) (be16 (if value 0xFF00 0))))}
+
+        :write-single-register
+        {:status :ok :bytes (into [fc] (into (be16 address) (be16 value)))}
+
+        (:write-multiple-coils :write-multiple-registers)
+        {:status :ok :bytes (into [fc] (into (be16 address) (be16 quantity)))}
+
+        {:status :error :reason :unsupported-function :function function}))))
+
+;; ── decoding ─────────────────────────────────────────────────────────────────
+
+(defn- want
+  "`:incomplete` when the PDU is shorter than the function needs. A partial
+  PDU on a stream transport is normal, not an error."
+  [bs n]
+  (when (< (count bs) n) {:status :incomplete :need (- n (count bs))}))
+
+(defn decode-request
+  "Bytes -> a request PDU map."
+  [bs]
+  (let [bs (vec bs)]
+    (or (want bs 1)
+        (let [raw (nth bs 0)
+              fc (function-codes raw)]
+          (cond
+            (nil? fc) {:status :error :reason :unknown-function :code raw}
+            :else
+            (case fc
+              (:read-coils :read-discrete-inputs :read-holding-registers
+               :read-input-registers)
+              (or (want bs 5)
+                  {:status :ok
+                   :pdu {:function fc :address (rd16 bs 1) :quantity (rd16 bs 3)}})
+
+              :write-single-coil
+              (or (want bs 5)
+                  (let [v (rd16 bs 3)]
+                    (if-not (#{0x0000 0xFF00} v)
+                      {:status :error :reason :illegal-coil-value :value v}
+                      {:status :ok
+                       :pdu {:function fc :address (rd16 bs 1) :value (= v 0xFF00)}})))
+
+              :write-single-register
+              (or (want bs 5)
+                  {:status :ok
+                   :pdu {:function fc :address (rd16 bs 1) :value (rd16 bs 3)}})
+
+              :write-multiple-coils
+              (or (want bs 6)
+                  (let [n (rd16 bs 3) bc (nth bs 5)]
+                    (or (want bs (+ 6 bc))
+                        {:status :ok
+                         :pdu {:function fc :address (rd16 bs 1)
+                               :values (bytes->bits (subvec bs 6 (+ 6 bc)) n)}})))
+
+              :write-multiple-registers
+              (or (want bs 6)
+                  (let [bc (nth bs 5)]
+                    (or (want bs (+ 6 bc))
+                        (if (odd? bc)
+                          {:status :error :reason :odd-register-byte-count :count bc}
+                          {:status :ok
+                           :pdu {:function fc :address (rd16 bs 1)
+                                 :values (mapv #(rd16 bs (+ 6 (* 2 %)))
+                                               (range (quot bc 2)))}}))))
+
+              (:read-exception-status :report-server-id)
+              {:status :ok :pdu {:function fc}}
+
+              {:status :error :reason :unsupported-function :function fc}))))))
+
+(defn decode-response
+  "Bytes -> a response PDU map. `quantity` is needed for the bit-reading
+  functions, because the response says how many BYTES it carries and only the
+  request knows how many of the trailing bits are padding."
+  ([bs] (decode-response bs nil))
+  ([bs quantity]
+   (let [bs (vec bs)]
+     (or (want bs 1)
+         (let [raw (nth bs 0)]
+           (if (pos? (bit-and raw 0x80))
+             ;; §7 exception response
+             (or (want bs 2)
+                 (let [fc (function-codes (bit-and raw 0x7F))
+                       ec (exception-codes (nth bs 1))]
+                   (cond
+                     (nil? fc) {:status :error :reason :unknown-function :code raw}
+                     (nil? ec) {:status :error :reason :unknown-exception :code (nth bs 1)}
+                     :else {:status :ok :pdu {:function fc :exception ec}})))
+             (let [fc (function-codes raw)]
+               (cond
+                 (nil? fc) {:status :error :reason :unknown-function :code raw}
+                 :else
+                 (case fc
+                   (:read-coils :read-discrete-inputs)
+                   (or (want bs 2)
+                       (let [bc (nth bs 1)]
+                         (or (want bs (+ 2 bc))
+                             {:status :ok
+                              :pdu {:function fc
+                                    :bits (bytes->bits (subvec bs 2 (+ 2 bc))
+                                                       (or quantity (* 8 bc)))}})))
+
+                   (:read-holding-registers :read-input-registers
+                    :read-write-multiple-registers)
+                   (or (want bs 2)
+                       (let [bc (nth bs 1)]
+                         (or (want bs (+ 2 bc))
+                             (if (odd? bc)
+                               {:status :error :reason :odd-register-byte-count :count bc}
+                               {:status :ok
+                                :pdu {:function fc
+                                      :registers (mapv #(rd16 bs (+ 2 (* 2 %)))
+                                                       (range (quot bc 2)))}}))))
+
+                   :write-single-coil
+                   (or (want bs 5)
+                       {:status :ok
+                        :pdu {:function fc :address (rd16 bs 1)
+                              :value (= 0xFF00 (rd16 bs 3))}})
+
+                   :write-single-register
+                   (or (want bs 5)
+                       {:status :ok
+                        :pdu {:function fc :address (rd16 bs 1) :value (rd16 bs 3)}})
+
+                   (:write-multiple-coils :write-multiple-registers)
+                   (or (want bs 5)
+                       {:status :ok
+                        :pdu {:function fc :address (rd16 bs 1) :quantity (rd16 bs 3)}})
+
+                   {:status :error :reason :unsupported-function :function fc})))))))))
