@@ -1,0 +1,130 @@
+(ns kotoba.shibuya-test
+  "Parity tests against a synthetic scene fixture (the real OSM-baked Shibuya
+  fixture is unavailable in this checkout — see README). These exercise the
+  same properties the original Rust `#[cfg(test)]` module checked, adapted
+  to the ported (pre-physics) scope: scene parses; building-obstacles count
+  matches building count; objects carry valid attrs; every object kind
+  resolves a footprint + colour; agent-urdf produces well-formed-looking
+  4-DOF XML."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            #?(:clj [clojure.edn :as edn])
+            #?(:clj [kotoba.io :as io])
+            [kotoba.shibuya :as shibuya]))
+
+;; The fixture EDN is stored as Datomic/Datascript tx-data
+;; (`[{:db/id -1 :shibuya.scramble/name ... :shibuya.scramble/buildings
+;; "<pr-str blob>" ...}]`, see resources/kotoba/shibuya/shibuya_scramble.synthetic.edn
+;; and scripts/edn-datomize.bb `wrap-map`). `reconstitute-entity` un-namespaces
+;; the single entity's keys back to the bare `:name`/`:bbox-m`/`:buildings`/
+;; `:roads`/`:objects` shape `shibuya/parse-scene` destructures, and `unblob`
+;; parses any pr-str'd non-scalar (nested-map/vector-of-maps) attrs back into
+;; live EDN data.
+#?(:clj
+   (defn- unblob [v]
+     (if (string? v)
+       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+            (catch Exception _ v))
+       v)))
+
+#?(:clj
+   (defn- reconstitute-entity [tx-data]
+     (into {} (map (fn [[k v]] [(keyword (name k)) (unblob v)]))
+           (dissoc (first tx-data) :db/id))))
+
+(defn- load-fixture []
+  #?(:clj (with-open [r (io/reader (io/resource "kotoba/shibuya/shibuya_scramble.synthetic.edn"))]
+            (reconstitute-entity (edn/read (java.io.PushbackReader. r))))
+     :cljs (throw (ex-info "fixture loading is JVM-only in this test suite" {}))))
+
+(def raw-fixture (load-fixture))
+(def scene (shibuya/parse-scene raw-fixture))
+
+(deftest scene-parses
+  (is (map? scene))
+  (is (string? (:scene/name scene)))
+  (is (= 4 (count (:scene/bbox-m scene))))
+  (is (shibuya/valid-scene? scene)))
+
+(deftest building-obstacles-count-matches
+  (let [obstacles (shibuya/building-obstacles scene)]
+    (is (= (count (:scene/buildings scene)) (count obstacles)))
+    (testing "every obstacle bound has min < max on x/y and 0 <= height"
+      (doseq [{:keys [min max]} obstacles]
+        (is (< (nth min 0) (nth max 0)))
+        (is (< (nth min 1) (nth max 1)))
+        (is (zero? (nth min 2)))
+        (is (>= (nth max 2) 0.0))))))
+
+(deftest scene-center-is-bbox-midpoint
+  (let [[min-x min-y max-x max-y] (:scene/bbox-m scene)
+        [cx cy cz] (shibuya/scene-center scene)]
+    (is (= cx (* 0.5 (+ min-x max-x))))
+    (is (= cy (* 0.5 (+ min-y max-y))))
+    (is (zero? cz))))
+
+(deftest scene-has-valid-point-objects
+  (is (seq (:scene/objects scene)) "expected clickable point assets")
+  (doseq [o (:scene/objects scene)]
+    (is (seq (:object/id o)))
+    (is (seq (:object/kind o)))
+    (let [attrs (:object/attrs o)]
+      (is (<= 1900 (:attrs/install-year attrs) 2025))
+      (is (pos? (:attrs/cost-jpy attrs)))
+      (is (seq (:attrs/company attrs)))
+      (is (contains? shibuya/provenance-values (:attrs/provenance attrs))))
+    ;; every asset kind resolves a render footprint + colour
+    (is (= 2 (count (shibuya/object-footprint (:object/kind o)))))
+    (is (= 3 (count (shibuya/object-color (:object/kind o)))))))
+
+(deftest object-lookup-tables-have-sane-defaults
+  (testing "unknown kind falls back to the pole default"
+    (is (= [0.5 0.5] (shibuya/object-footprint "no-such-kind")))
+    (is (= [0.70 0.70 0.72] (shibuya/object-color "no-such-kind")))))
+
+(deftest spawn-points-sampled-from-roads
+  (let [pts (shibuya/spawn-points scene 6)]
+    (is (<= (count pts) 6))
+    (is (<= (count pts) (count (:scene/roads scene))))
+    (doseq [{:keys [pos yaw]} pts]
+      (is (= 3 (count pos)))
+      (is (number? yaw)))))
+
+(deftest spawn-points-respects-n
+  (let [pts (shibuya/spawn-points scene 1)]
+    (is (= 1 (count pts)))))
+
+(deftest agent-spawn-config-cycles-colors-and-scales-drive
+  (let [pts (shibuya/spawn-points scene 3)
+        cfgs (map-indexed (fn [k pt] (shibuya/agent-spawn-config pt k)) pts)]
+    (doseq [[k cfg] (map-indexed vector cfgs)]
+      (is (= (nth shibuya/agent-colors (mod k (count shibuya/agent-colors))) (:color cfg)))
+      (is (= (* shibuya/default-agent-mass shibuya/drive-accel) (:drive cfg)))
+      (is (= (* k 1.3) (:steer-phase cfg)))
+      (is (= shibuya/default-agent-size (:size cfg))))))
+
+(deftest agent-urdf-is-4dof-well-formed
+  (let [xml (shibuya/agent-urdf [4.0 2.0 1.5] 1000.0)]
+    (is (string? xml))
+    (is (str/starts-with? xml "<robot name=\"agent\">"))
+    (is (str/ends-with? xml "</robot>"))
+    (testing "4 dof: jx, jy, jz, jyaw"
+      (is (str/includes? xml "name=\"jx\""))
+      (is (str/includes? xml "name=\"jy\""))
+      (is (str/includes? xml "name=\"jz\""))
+      (is (str/includes? xml "name=\"jyaw\"")))
+    (testing "body link carries the requested mass"
+      (is (str/includes? xml "mass value=\"1000.0\"")))
+    (testing "balanced tags (rough well-formedness check)"
+      ;; "world" is a bare self-closing link (`<link name="world"/>`, no
+      ;; body/no closing tag); the other 4 links (lx, ly, lz, body) each
+      ;; have an <inertial> body and a matching </link>.
+      (is (str/includes? xml "<link name=\"world\"/>"))
+      (is (= 5 (count (re-seq #"<link " xml))))
+      (is (= 4 (count (re-seq #"</link>" xml))))
+      (is (= (count (re-seq #"<joint " xml)) (count (re-seq #"</joint>" xml)))))))
+
+(deftest agent-urdf-inertia-scales-with-mass
+  (let [light (shibuya/agent-urdf [4.0 2.0 1.5] 100.0)
+        heavy (shibuya/agent-urdf [4.0 2.0 1.5] 1000.0)]
+    (is (not= light heavy))))
