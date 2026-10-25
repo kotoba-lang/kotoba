@@ -123,6 +123,7 @@ The bundled standard libraries live in this repository:
 | `org.oasisOpen.odf` | `org.oasisOpen.odf/src` | `` (an external specification, publisher oasisOpen.org) |
 | `org.w3.activitypub` | `org.w3.activitypub/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.activitystreams` | `org.w3.activitystreams/src` | `` (an external specification, publisher w3.org) |
+| `org.w3.epub` | `org.w3.epub/src` | `` (an external specification, publisher w3.org) |
 | `kotoba.ops` | `kotoba.ops/src` | `` (Kotoba project library) |
 | `kotoba.nQuads` | `kotoba.nQuads/src` | `` (Kotoba project library) |
 | `kotoba.microsoft` | `kotoba.microsoft/src` | `` (Kotoba project library) |

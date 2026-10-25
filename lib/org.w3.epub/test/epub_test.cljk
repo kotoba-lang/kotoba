@@ -1,0 +1,110 @@
+(ns epub-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.compiler.ir :as ir])
+  (:import [java.util.zip ZipInputStream]))
+
+(def source (slurp "lib/org.w3.epub/src/epub.kotoba"))
+(defn call [kir function & args] (ir/execute kir function (vec args)))
+(defn present [option] (when (second option) (nth option 2)))
+(defn di64 [value] ["i64" value])
+(defn dget [document key]
+  (some (fn [[candidate value]] (when (= candidate key) value)) (second document)))
+
+(defn unzip-resource [path]
+  (with-open [zis (ZipInputStream. (io/input-stream (io/resource path)))]
+    (loop [entries {}]
+      (if-let [entry (.getNextEntry zis)]
+        (let [output (java.io.ByteArrayOutputStream.)]
+          (io/copy zis output)
+          (recur (assoc entries (.getName entry) (.toByteArray output))))
+        entries))))
+(defn utf8 [bytes] (kbytes/utf8-string ^bytes bytes))
+(defn parent-path [path]
+  (let [index (.lastIndexOf ^String path "/")]
+    (if (neg? index) "" (subs path 0 (inc index)))))
+
+(deftest reference-preserves-epub-contract
+  (let [kir (:kir (compiler/compile-source source :js-kotoba-v1))
+        container "<?xml version=\"1.0\"?><container><rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>"
+        opf "<package><metadata><dc:title>Test Book</dc:title></metadata><manifest><item id=\"c1\" href=\"ch1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"c1\"/></spine></package>"
+        xhtml "<?xml version=\"1.0\"?><!DOCTYPE html><html><head><title>ch1.xhtml</title></head><body><h1>Chapter</h1><p>Hello epub world</p></body></html>"
+        result (call kir 'summary opf 4)]
+    (is (= "OEBPS/content.opf" (present (call kir 'package-path container))))
+    (is (= "Test Book" (present (call kir 'title opf))))
+    (is (= 1 (call kir 'manifest-count opf)))
+    (is (= "c1" (present (call kir 'manifest-id opf 0))))
+    (is (= "ch1.xhtml" (present (call kir 'manifest-href opf 0))))
+    (is (= 1 (call kir 'spine-count opf)))
+    (is (= "c1" (present (call kir 'spine-idref opf 0))))
+    (is (= "ch1.xhtml Chapter Hello epub world"
+           (present (call kir 'chapter-text xhtml))))
+    (is (= (di64 4) (dget result :entry-count)))
+    (is (= (di64 1) (dget result :manifest-count)))
+    (is (= (di64 1) (dget result :spine-count)))
+    (is (= #{} (set (:effects kir))))
+    (testing "absent values and hostile doctypes fail closed"
+      (is (nil? (present (call kir 'manifest-id opf 1))))
+      (is (thrown? kerror/ExceptionInfo
+                   (call kir 'chapter-text
+                         "<!DOCTYPE html SYSTEM 'external'><html/>"))))))
+
+(deftest real-pandoc-epub-preserves-observable-content
+  (let [entries (unzip-resource "epub/fixtures/pandoc_book.epub")
+        container (utf8 (get entries "META-INF/container.xml"))
+        kir (:kir (compiler/compile-source source :js-kotoba-v1))
+        opf-path (present (call kir 'package-path container))
+        opf (utf8 (get entries opf-path))
+        manifest
+        (into {}
+              (map (fn [index]
+                     [(present (call kir 'manifest-id opf index))
+                      (str (parent-path opf-path)
+                           (present (call kir 'manifest-href opf index)))])
+                   (range (call kir 'manifest-count opf))))
+        chapter-paths (mapv #(get manifest (present (call kir 'spine-idref opf %)))
+                            (range (call kir 'spine-count opf)))
+        chapters (mapv #(present (call kir 'chapter-text (utf8 (get entries %))))
+                       chapter-paths)]
+    (is (= "EPUB/content.opf" opf-path))
+    (is (= "My Real Book" (present (call kir 'title opf))))
+    (is (= 3 (call kir 'spine-count opf)))
+    (is (= 10 (count entries)))
+    (is (= "ch001.xhtml Chapter One Hello epub world from a real pandoc export."
+           (second chapters)))
+    (is (= "ch002.xhtml Chapter Two Second chapter content here."
+           (nth chapters 2)))))
+
+(defn compiler-root []
+  (nth (iterate #(.getParent ^java.nio.file.Path %)
+                (java.nio.file.Path/of (.toURI (io/resource "kotoba/compiler/core.clj")))) 4))
+(defn base64 [value] (kbytes/base64-encode value))
+
+(deftest restricted-javascript-and-typed-wasm-conform-semantically
+  (let [javascript (compiler/compile-source source :js-kotoba-v1)
+        wasm (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        js64 (base64 (kbytes/utf8-bytes ^String (:source javascript)))
+        wasm64 (base64 ^bytes (:bytes wasm))
+        probe
+        (shell/sh
+          "node" "--input-type=module" "-e"
+          (str "import(process.argv[1]).then(async host=>{"
+               "const j=await import('data:text/javascript;base64," js64 "');"
+               "const w=await host.instantiateKotoba(Buffer.from(process.argv[2],'base64'));"
+               "const run=x=>{const container='<container><rootfiles><rootfile full-path=\"EPUB/content.opf\"/></rootfiles></container>';"
+               "const opf='<package><metadata><dc:title>Book</dc:title></metadata><manifest><item id=\"c1\" href=\"c1.xhtml\"/></manifest><spine><itemref idref=\"c1\"/></spine></package>';"
+               "const page='<?xml version=\"1.0\"?><!DOCTYPE html><html><head><title>c1.xhtml</title></head><body><h1>One</h1><p>Hello</p></body></html>';"
+               "if(x['package-path'](container)[2]!=='EPUB/content.opf'||x.title(opf)[2]!=='Book'||x['manifest-count'](opf)!==1n||x['spine-count'](opf)!==1n)throw Error('metadata');"
+               "if(x['manifest-id'](opf,0n)[2]!=='c1'||x['manifest-href'](opf,0n)[2]!=='c1.xhtml'||x['spine-idref'](opf,0n)[2]!=='c1')throw Error('spine');"
+               "if(x['chapter-text'](page)[2]!=='c1.xhtml One Hello')throw Error('chapter');"
+               "let rejected=false;try{x['chapter-text']('<!DOCTYPE html SYSTEM \"external\"><html/>')}catch(e){rejected=true}if(!rejected)throw Error('reject');};"
+               "run(j.instantiateKotoba({}));run(w.instance.exports);"
+               "}).catch(e=>{console.error(e);process.exit(99)})")
+          (.toString (.toUri (.resolve (compiler-root) "runtime/browser-host.mjs"))) wasm64)]
+    (is (zero? (:exit probe)) (str (:out probe) (:err probe)))))
+
+(deftest production-source-authority
+  (is (= ["lib/org.w3.epub/src/epub.kotoba"]
+         (->> (file-seq (io/file "src")) (filter #(.isFile %)) (map str) sort vec))))
