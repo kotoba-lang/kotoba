@@ -1,0 +1,692 @@
+(ns paging.core
+  "A page cache that does not belong to an operating system.
+
+  Every layer in this workspace ends up wanting the same thing — keep the hot
+  pages, notice a sequential scan and get ahead of it, do not let one cold
+  streaming pass flush the metadata, write dirty pages back before dropping
+  them. The kernel does it for files, a database does it for blocks, a worker
+  does it for object-store reads. Written three times it is three sets of
+  bugs; the interesting part is identical every time and none of it needs to
+  perform I/O.
+
+  So this is the policy, as a pure function:
+
+      state + event -> {:state next :effects [...]}
+
+  The host performs `:fetch`, `:writeback` and `:drop`, and feeds results
+  back as `:fill` events. Nothing here touches a device, a socket or a clock.
+
+  Four decisions are load-bearing.
+
+  **There is no wall clock.** Recency is a logical sequence number stepped by
+  each event. That is what makes a run replayable — the same event list gives
+  the same evictions, on any machine, forever — and it is also what makes the
+  thing testable at all. A cache keyed on `System/currentTimeMillis` cannot be
+  regression-tested.
+
+  **A fetch in flight is not a fetch to reissue.** A page requested but not
+  yet filled sits in `:in-flight`. A second miss on it counts as a miss and
+  emits nothing. Duplicate fetches are the classic bug of a cache whose miss
+  path is a function call rather than an effect.
+
+  **Readahead is a detector, not a constant.** A stream must confirm a stable
+  stride before any speculative fetch happens, the window doubles while it
+  keeps paying off, and it collapses to zero the moment the stride breaks.
+  Readahead applied to random access is not a small waste — it multiplies the
+  I/O of the exact workload that could least afford it.
+
+  **Speculation does not earn promotion.** Under `:slru` a page reaches the
+  protected region only on a hit that follows a demand it has already served,
+  so the pages of a streaming scan — touched exactly once each — never leave
+  probation and are always the next thing evicted. A working set survives a
+  40-page scan through an 8-page cache; under plain `:lru` it does not, and
+  the tests assert that failure rather than implying otherwise.
+
+  Inserting readahead at the cold end of a plain LRU list was the obvious
+  alternative and is worse than it sounds: the next speculative fill then
+  evicts the previous one, so readahead destroys itself before the scan
+  reaches it. Scan resistance has to be a promotion rule, not an insertion
+  position.
+
+  Pure `.cljc`. Depends only on `kotoba-lang/machine`."
+  (:require [machine.core :as m]))
+
+(def format-id :kotoba.paging/v1)
+
+(def policies
+  "`:lru` — exact recency, a list move per access. Not scan-resistant, and
+   the tests say so out loud rather than implying otherwise.
+   `:clock` — reference bits and a sweeping hand: no per-access list surgery,
+   which is why a kernel uses it and a textbook uses LRU.
+   `:slru` — segmented LRU. A page enters *probation* and only reaches
+   *protected* on a hit that follows a demand it has already served. That
+   second-touch rule is what makes a streaming scan unable to evict a working
+   set: scan pages are touched once each and never leave probation."
+  #{:lru :clock :slru})
+
+(def default-protected-ratio
+  "Share of an `:slru` segment reserved for twice-touched pages."
+  0.8)
+
+(def default-readahead
+  {:confirm-after 2      ; consecutive equal strides before speculating
+   :initial-window 2     ; pages ahead on the first confirmed hit
+   :max-window 32})      ; ceiling; doubles while readahead keeps being used
+
+;; ── construction ─────────────────────────────────────────────────────────
+
+(defn- segment [{:keys [id capacity-pages policy protected-ratio]
+                 :or {policy :lru protected-ratio default-protected-ratio}}]
+  (when-not (pos-int? capacity-pages)
+    (throw (ex-info "segment needs a positive capacity"
+                    {:phase :paging/segment :id id :capacity-pages capacity-pages})))
+  (when-not (policies policy)
+    (throw (ex-info "unknown replacement policy"
+                    {:phase :paging/segment :id id :policy policy :known policies})))
+  {:id id
+   :capacity-pages capacity-pages
+   :policy policy
+   :resident {}          ; key -> {:dirty? :ref? :speculative? :demanded?}
+   :order []             ; LRU: most-recent first. CLOCK: frame ring.
+   :hand 0
+   :protected []         ; SLRU, most-recent first
+   :probation []         ; SLRU, most-recent first
+   :protected-capacity (max 1 (int (* capacity-pages protected-ratio)))})
+
+(defn cache
+  "A page cache sized in pages of `page-bytes`, split into `segments`.
+
+  Segments exist because one cold streaming pass should not be able to evict
+  the small hot metadata that everything else depends on — the same reason
+  `kotobase-peer` splits its block cache by size class. Give the scan its own
+  budget and it can churn without touching anything else.
+
+  When the machine declares a base page size, `page-bytes` must be a multiple
+  of it: a cache page that is not a whole number of hardware pages produces
+  partial-page writebacks the host cannot express."
+  [machine {:keys [page-bytes segments readahead]
+            :or {readahead default-readahead}}]
+  (when-not (pos-int? page-bytes)
+    (throw (ex-info "page-bytes must be a positive integer"
+                    {:phase :paging/cache :page-bytes page-bytes})))
+  (when-let [hw (m/page-bytes machine)]
+    (when-not (zero? (mod page-bytes hw))
+      (throw (ex-info "cache page must be a whole number of hardware pages"
+                      {:phase :paging/cache :page-bytes page-bytes :hardware-page-bytes hw}))))
+  (let [segs (or (seq segments) [{:id :default :capacity-pages 64 :policy :lru}])]
+    {:format format-id
+     :page-bytes page-bytes
+     :machine (:machine/id machine)
+     :segments (into {} (map (juxt :id segment)) segs)
+     :readahead (merge default-readahead readahead)
+     :streams {}          ; stream -> {:last :stride :runs :window}
+     :in-flight {}        ; key -> {:segment :reason}
+     :seq 0
+     :stats {:hits 0 :misses 0 :in-flight-hits 0
+             :demand-fetches 0 :readahead-fetches 0
+             :readahead-used 0 :readahead-wasted 0
+             :evictions 0 :writebacks 0 :full-page-write-allocations 0}}))
+
+;; ── keys ─────────────────────────────────────────────────────────────────
+
+(defn- check-key! [k]
+  (when-not (and (vector? k) (= 2 (count k)) (integer? (second k)))
+    (throw (ex-info "a page key is [stream index] with an integer index"
+                    {:phase :paging/key :key k})))
+  k)
+
+(defn- stream-of [k] (first k))
+(defn- index-of [k] (second k))
+
+;; ── replacement ──────────────────────────────────────────────────────────
+
+(defn- without [coll k] (vec (remove #(= k %) coll)))
+
+(defn- lru-promote [seg k]
+  (assoc seg :order (into [k] (without (:order seg) k))))
+
+(defn- lru-insert [seg k]
+  (assoc seg :order (into [k] (without (:order seg) k))))
+
+;; ── segmented LRU ────────────────────────────────────────────────────────
+
+(defn- slru-promote
+  "Move `k` to protected, demoting protected's coldest page if that overflows.
+
+  Called only when `k` has already served a demand — the second-touch rule.
+  A page touched exactly once, which is every page of a streaming scan, stays
+  in probation and is the first thing evicted."
+  [seg k]
+  (let [seg (-> seg
+                (update :probation without k)
+                (update :protected #(into [k] (without % k))))]
+    (if (> (count (:protected seg)) (:protected-capacity seg))
+      (let [demoted (last (:protected seg))]
+        (-> seg
+            (update :protected without demoted)
+            (update :probation #(into [demoted] %))))
+      seg)))
+
+(defn- slru-victim
+  "Probation's coldest page, or protected's if probation is empty."
+  [seg]
+  (or (last (:probation seg)) (last (:protected seg))))
+
+(defn- clock-victim
+  "Sweep the hand, clearing reference bits, until a frame has none set.
+
+  Terminates because a full sweep clears every bit, so the second pass finds
+  one. Returns the victim, its slot in the ring, and the segment with the
+  cleared bits and advanced hand."
+  [seg]
+  (loop [hand (:hand seg) resident (:resident seg) guard 0]
+    (let [order (:order seg)
+          n (count order)
+          hand (if (>= hand n) 0 hand)
+          k (nth order hand)]
+      (cond
+        (> guard (* 2 n))
+        (throw (ex-info "clock sweep failed to find a victim"
+                        {:phase :paging/clock :segment (:id seg)}))
+        (:ref? (get resident k))
+        (recur (inc hand) (assoc-in resident [k :ref?] false) (inc guard))
+        :else
+        {:victim k
+         :index hand
+         :seg (assoc seg :resident resident :hand (mod (inc hand) (max 1 n)))}))))
+
+(defn- forget [seg k]
+  (-> seg
+      (update :resident dissoc k)
+      (update :order without k)
+      (update :protected without k)
+      (update :probation without k)))
+
+(defn- touch
+  "Bookkeeping for a hit, per policy.
+
+  `already-demanded?` is the second-touch test: `:slru` promotes only when the
+  page has served a demand before this one. A page filled speculatively and
+  then demanded once has been touched once, whatever the fetch count says."
+  [seg k already-demanded?]
+  (case (:policy seg)
+    :lru (lru-promote seg k)
+    :clock seg                              ; the ref bit is the whole update
+    :slru (if already-demanded?
+            (slru-promote seg k)
+            seg)))
+
+;; ── admission ────────────────────────────────────────────────────────────
+
+(defn- admit
+  "Put `k` in `seg`, evicting if the segment is full.
+
+  Returns `[seg effects stats-delta]`. Eviction emits `:writeback` before
+  `:drop` — a dirty page dropped without a writeback is data loss, and the
+  ordering is the only thing that says so.
+
+  CLOCK replaces the victim *in its slot* rather than removing and appending,
+  so the hand keeps pointing where the sweep left it. Rebuilding the ring on
+  every admission would silently turn CLOCK into something with no memory of
+  its own position."
+  [seg k {:keys [dirty? speculative?]}]
+  (let [full? (>= (count (:resident seg)) (:capacity-pages seg))
+        new-entry {:dirty? (boolean dirty?)
+                   :ref? (not speculative?)
+                   :speculative? (boolean speculative?)
+                   :demanded? (not speculative?)}
+        evict (fn [seg victim]
+                (let [entry (get-in seg [:resident victim])
+                      ;; A page fetched on speculation and never demanded is
+                      ;; readahead that did not pay. Counting it is what
+                      ;; makes `readahead-accuracy` mean anything.
+                      wasted? (and (:speculative? entry) (not (:demanded? entry)))]
+                  [(cond-> []
+                     (:dirty? entry) (conj {:effect :writeback :key victim :segment (:id seg)})
+                     true (conj {:effect :drop :key victim :segment (:id seg)}))
+                   (cond-> {:evictions 1}
+                     (:dirty? entry) (assoc :writebacks 1)
+                     wasted? (assoc :readahead-wasted 1))]))]
+    (case (:policy seg)
+      :lru
+      (let [[seg effects delta]
+            (if-not full?
+              [seg [] {}]
+              (let [victim (last (:order seg))
+                    [effects delta] (evict seg victim)]
+                [(forget seg victim) effects delta]))]
+        ;; Plain LRU, speculative or not. Inserting readahead at the cold end
+        ;; instead was tried and is worse than it sounds: the next speculative
+        ;; fill then evicts the previous one, so readahead destroys itself
+        ;; before the scan reaches it. Scan resistance belongs to `:slru`,
+        ;; where it is a promotion rule rather than an insertion position.
+        [(-> seg
+             (assoc-in [:resident k] new-entry)
+             (lru-insert k))
+         effects delta])
+
+      :clock
+      (if-not full?
+        [(-> seg
+             (assoc-in [:resident k] new-entry)
+             (update :order conj k))
+         [] {}]
+        (let [{:keys [victim index seg]} (clock-victim seg)
+              [effects delta] (evict seg victim)]
+          [(-> seg
+               (update :resident dissoc victim)
+               (assoc-in [:order index] k)
+               (assoc-in [:resident k] new-entry))
+           effects delta]))
+
+      :slru
+      (let [[seg effects delta]
+            (if-not full?
+              [seg [] {}]
+              (let [victim (slru-victim seg)
+                    [effects delta] (evict seg victim)]
+                [(forget seg victim) effects delta]))]
+        ;; Everything enters probation, demand and speculation alike. What
+        ;; separates them is that a demand-filled page has already served the
+        ;; access that fetched it, so its NEXT hit promotes; a speculative
+        ;; page needs one more.
+        [(-> seg
+             (assoc-in [:resident k] new-entry)
+             (update :probation #(into [k] (without % k))))
+         effects delta]))))
+
+;; ── readahead ────────────────────────────────────────────────────────────
+
+(defn- observe-stream
+  "Update the per-stream stride detector.
+
+  Confidence is consecutive equal strides. It resets to zero — not down by
+  one — the moment the stride changes, because a stream that alternates
+  between two strides is not a stream, and letting it keep credit is how
+  readahead survives into random access."
+  [streams k {:keys [confirm-after initial-window max-window]}]
+  (let [s (stream-of k) i (index-of k)
+        prev (get streams s)
+        stride (when prev (- i (:last prev)))
+        continuing? (and prev (= stride (:stride prev)) (pos? (or stride 0)))
+        runs (cond
+               (nil? prev) 0
+               continuing? (inc (:runs prev))
+               :else 0)
+        window (cond
+                 (< runs confirm-after) 0
+                 (zero? (:window prev 0)) initial-window
+                 :else (min max-window (* 2 (:window prev))))]
+    (assoc streams s {:last i
+                      :stride (if continuing? stride (or stride 0))
+                      :runs runs
+                      :window window})))
+
+(defn- readahead-keys
+  "Pages to speculate on, given a confirmed stream. Empty until confirmed.
+
+  The window is capped at half the segment's capacity, which is not a tuning
+  knob but a correctness bound: a window wider than the cache evicts its own
+  results before the stream reaches them. Measured on an 8-page segment, an
+  uncapped window doubling to 32 drove readahead accuracy to 2% — the
+  prefetcher was doing nothing but competing with the demand stream for
+  frames. Half leaves the other half for the pages actually being read."
+  [streams k capacity]
+  (let [s (stream-of k) i (index-of k)
+        {:keys [stride window]} (get streams s)
+        window (min (or window 0) (max 1 (quot capacity 2)))]
+    (if (and (pos? window) stride (pos? stride))
+      (mapv (fn [n] [s (+ i (* n stride))]) (range 1 (inc window)))
+      [])))
+
+;; ── the step function ────────────────────────────────────────────────────
+
+(defn- bump [state deltas]
+  (update state :stats #(reduce (fn [acc [k v]] (update acc k (fnil + 0) v)) % deltas)))
+
+(defn- seg-of [state event]
+  (let [id (:segment event :default)]
+    (or (get-in state [:segments id])
+        (throw (ex-info "unknown segment" {:phase :paging/step :segment id
+                                           :known (vec (keys (:segments state)))})))))
+
+(defn- on-access [state {:keys [key op full-page?] :or {op :read} :as event}]
+  (check-key! key)
+  (let [seg (seg-of state event)
+        sid (:id seg)
+        resident? (contains? (:resident seg) key)
+        in-flight? (contains? (:in-flight state) key)
+        ;; The stride detector sees every demand access, hit or miss. A
+        ;; sequential scan that hits in cache is still a sequential scan, and
+        ;; stopping the detector on hits is how readahead dies exactly when
+        ;; it is working.
+        streams (observe-stream (:streams state) key (:readahead state))
+        state (assoc state :streams streams)
+        entry (get-in seg [:resident key])
+        promoted-speculation? (and resident? (:speculative? entry) (not (:demanded? entry)))
+        [state seg demand-effects delta]
+        (cond
+          resident?
+          [state
+           (-> seg
+               (touch key (:demanded? entry))
+               (assoc-in [:resident key :ref?] true)
+               (assoc-in [:resident key :demanded?] true)
+               (cond-> (= op :write) (assoc-in [:resident key :dirty?] true)))
+           []
+           (cond-> {:hits 1} promoted-speculation? (assoc :readahead-used 1))]
+
+          in-flight?
+          ;; The page is coming; the pending write intent must ride along with
+          ;; it, or the fill lands clean and the write is lost.
+          [(cond-> state (= op :write) (assoc-in [:in-flight key :op] :write))
+           seg [] {:misses 1 :in-flight-hits 1}]
+
+          ;; A write that covers the whole page has nothing to read: fetching
+          ;; first would pull bytes that are about to be overwritten. This is
+          ;; the write-allocate the hardware cannot avoid and software can.
+          (and (= op :write) full-page?)
+          (let [[seg effects d] (admit seg key {:dirty? true})]
+            [state seg effects (merge-with + {:misses 1 :full-page-write-allocations 1} d)])
+
+          :else
+          ;; `:op` rides in the in-flight record so a write that missed still
+          ;; lands dirty when the page arrives. Dropping it here is a silent
+          ;; lost update, which is the reason the write intent is state and
+          ;; not just a branch.
+          [(assoc-in state [:in-flight key] {:segment sid :reason :demand :op op})
+           seg
+           [{:effect :fetch :key key :segment sid :reason :demand}]
+           {:misses 1 :demand-fetches 1}])
+        ;; Speculate only on pages that are neither resident nor already
+        ;; requested — the whole point of tracking in-flight.
+        candidates (->> (readahead-keys streams key (:capacity-pages seg))
+                        (remove #(contains? (:resident seg) %))
+                        (remove #(contains? (:in-flight state) %))
+                        vec)
+        state (reduce (fn [st k] (assoc-in st [:in-flight k]
+                                           {:segment sid :reason :readahead}))
+                      state candidates)
+        ra-effects (mapv (fn [k] {:effect :fetch :key k :segment sid :reason :readahead})
+                         candidates)]
+    {:state (-> state
+                (assoc-in [:segments sid] seg)
+                (bump (merge-with + delta {:readahead-fetches (count candidates)})))
+     :effects (into (vec demand-effects) ra-effects)}))
+
+(defn- on-fill [state {:keys [key] :as _event}]
+  (check-key! key)
+  (if-let [{:keys [segment reason op]} (get-in state [:in-flight key])]
+    (let [seg (get-in state [:segments segment])
+          [seg effects delta] (admit seg key {:speculative? (= reason :readahead)
+                                              :dirty? (= op :write)})]
+      {:state (-> state
+                  (update :in-flight dissoc key)
+                  (assoc-in [:segments segment] seg)
+                  (bump delta))
+       :effects effects})
+    ;; A fill nobody asked for is a host bug, not a cache state to absorb.
+    (throw (ex-info "fill for a page that was never requested"
+                    {:phase :paging/fill :key key}))))
+
+(defn- on-flush [state event]
+  (let [ids (if-let [s (:segment event)] [s] (keys (:segments state)))
+        dirty (for [id ids
+                    [k e] (get-in state [:segments id :resident])
+                    :when (:dirty? e)]
+                [id k])
+        ;; Sorted so a flush is deterministic: the same dirty set produces the
+        ;; same writeback order on every run and in every runtime.
+        dirty (sort-by (fn [[id k]] [(str id) (str (stream-of k)) (index-of k)]) dirty)]
+    {:state (-> (reduce (fn [st [id k]] (assoc-in st [:segments id :resident k :dirty?] false))
+                        state dirty)
+                (bump {:writebacks (count dirty)}))
+     :effects (mapv (fn [[id k]] {:effect :writeback :key k :segment id}) dirty)}))
+
+(defn- on-invalidate [state {:keys [key] :as event}]
+  (check-key! key)
+  (let [seg (seg-of state event)
+        entry (get-in seg [:resident key])]
+    (if entry
+      {:state (assoc-in state [:segments (:id seg)] (forget seg key))
+       ;; Invalidate discards; it does not write back. A caller that wanted
+       ;; the bytes preserved wanted :flush.
+       :effects [{:effect :drop :key key :segment (:id seg)}]}
+      {:state state :effects []})))
+
+(defn step
+  "Advance the cache by one event. Returns `{:state … :effects […]}`.
+
+  Events: `:access` (`:key`, `:op`, `:full-page?`, `:segment`), `:fill`
+  (`:key`), `:flush` (optional `:segment`), `:invalidate` (`:key`)."
+  [state event]
+  (let [state (update state :seq inc)]
+    (case (:event event)
+      :access (on-access state event)
+      :fill (on-fill state event)
+      :flush (on-flush state event)
+      :invalidate (on-invalidate state event)
+      (throw (ex-info "unknown event" {:phase :paging/step :event event})))))
+
+(defn run
+  "Fold `events` through `step`, collecting every effect in order."
+  [state events]
+  (reduce (fn [{:keys [state effects]} e]
+            (let [r (step state e)]
+              {:state (:state r) :effects (into effects (:effects r))}))
+          {:state state :effects []}
+          events))
+
+(defn run-with-host
+  "Fold events, letting a host satisfy every `:fetch` immediately.
+
+  The point of the split is that a real host may take as long as it likes;
+  this models the degenerate case where it does not, which is what makes a
+  hit-rate assertion possible without an I/O layer."
+  [state events]
+  (reduce
+   (fn [{:keys [state effects]} e]
+     (loop [st state acc effects queue [e] guard 0]
+       (if (or (empty? queue) (> guard 100000))
+         {:state st :effects acc}
+         (let [{st' :state fx :effects} (step st (first queue))
+               fills (mapv (fn [f] {:event :fill :key (:key f)})
+                           (filter #(= :fetch (:effect %)) fx))]
+           (recur st' (into acc fx) (into (vec (rest queue)) fills) (inc guard))))))
+   {:state state :effects []}
+   events))
+
+;; ── inspection ───────────────────────────────────────────────────────────
+
+(defn resident? [state segment key] (contains? (get-in state [:segments segment :resident]) key))
+(defn resident-keys [state segment] (set (keys (get-in state [:segments segment :resident]))))
+(defn dirty-keys [state segment]
+  (set (keep (fn [[k e]] (when (:dirty? e) k)) (get-in state [:segments segment :resident]))))
+
+(defn stats
+  "Counters plus the two ratios worth looking at.
+
+  `:readahead-accuracy` is the one that tells you whether speculation is
+  helping or just competing with the demand stream for bandwidth and frames.
+  A high hit rate with low readahead accuracy means the cache is working
+  *despite* the prefetcher."
+  [state]
+  (let [{:keys [hits misses readahead-used readahead-wasted] :as s} (:stats state)
+        touched (+ hits misses)
+        judged (+ readahead-used readahead-wasted)]
+    (assoc s
+           :hit-rate (if (pos? touched) (double (/ hits touched)) 0.0)
+           :readahead-accuracy (if (pos? judged) (double (/ readahead-used judged)) nil))))
+
+;; ── how much is there to win? ────────────────────────────────────────────
+;;
+;; Every policy question in this namespace — LRU or CLOCK or SLRU, how wide a
+;; readahead window, how to split the segments — is a question about closing a
+;; gap. Nobody ever measures the gap first, so the tuning either looks
+;; impressive against a bad baseline or disappointing against an impossible
+;; one.
+;;
+;; Two bounds make it answerable, and both are computable from the trace alone
+;; before any policy runs:
+;;
+;;   compulsory — one miss per distinct page. No cache of any size or policy
+;;                takes fewer, because the first touch cannot hit.
+;;   optimal    — Belady's clairvoyant replacement: on eviction, discard the
+;;                page whose next use is furthest away. No online policy beats
+;;                it, so it is the real ceiling rather than the aspirational
+;;                one.
+;;
+;; A policy sitting near OPT has nothing left to give and tuning it is wasted
+;; effort; a policy far from OPT has headroom worth chasing. Which of those is
+;; true is a property of the workload, not of the policy.
+
+(defn compulsory-misses
+  "The floor: one per distinct key. Unbeatable at any capacity."
+  [trace]
+  (count (distinct trace)))
+
+(defn optimal-misses
+  "Belady's OPT — the fewest misses any replacement policy could take.
+
+  Clairvoyant, so unimplementable online; that is the point. It is the ceiling
+  a real policy is measured against, and the gap between them is the only
+  honest statement of how much tuning is left.
+
+  `trace` is a sequence of keys. Cost is O(n × capacity): the eviction scan
+  looks at the resident set, which is bounded by capacity."
+  [trace capacity]
+  (let [trace (vec trace)
+        n (count trace)
+        ;; next-use[i] = the next index after i holding the same key, or n.
+        next-use (let [last-seen (volatile! {})]
+                   (->> (range (dec n) -1 -1)
+                        (reduce (fn [acc i]
+                                  (let [k (nth trace i)
+                                        nxt (get @last-seen k n)]
+                                    (vswap! last-seen assoc k i)
+                                    (assoc acc i nxt)))
+                                {})))]
+    ;; `next-of` maps each resident key to the index of its next use. It is
+    ;; maintained from `next-use` on every touch, which is the whole reason
+    ;; that table is precomputed — the first version built the table and then
+    ;; never read it, rescanning the tail of the trace for every resident key
+    ;; on every eviction. That is O(n^2 * capacity), invisible on the
+    ;; fifty-access fixtures here and hopeless on a real trace.
+    (loop [i 0 resident #{} next-of {} misses 0]
+      (if (= i n)
+        misses
+        (let [k (nth trace i)
+              nxt (assoc next-of k (get next-use i))]
+          (cond
+            (contains? resident k) (recur (inc i) resident nxt misses)
+            (< (count resident) capacity) (recur (inc i) (conj resident k) nxt (inc misses))
+            :else
+            ;; Evict whichever resident key is next needed furthest away. A key
+            ;; never needed again has `n`, which wins outright.
+            (let [victim (apply max-key #(get nxt % n) resident)]
+              (recur (inc i) (-> resident (disj victim) (conj k))
+                     (dissoc nxt victim) (inc misses)))))))))
+
+(defn demand-only
+  "The same cache with readahead switched off.
+
+  `optimal-misses` bounds REPLACEMENT: it assumes a page arrives only when it
+  is demanded. A prefetching cache is playing a different game, and comparing
+  the two is not conservative, it is meaningless — the first version of
+  `headroom` did exactly that and reported LRU taking 4 misses against an
+  \"optimum\" of 12, i.e. a real policy beating the clairvoyant bound by 3x.
+  The bound was not wrong; the comparison was."
+  [state]
+  (assoc-in state [:readahead :confirm-after] Long/MAX_VALUE))
+
+(defn headroom
+  "What is left to win on this trace, before any policy is chosen.
+
+  **Replacement only.** Readahead is switched off for the policy run, because
+  the bound it is measured against assumes demand paging. Prefetching is a
+  separate lever with a separate ceiling, and mixing them produces the
+  nonsense described in `demand-only`.
+
+  `:policy-misses` comes from actually running the cache; the other two are
+  properties of the trace. `:headroom` is the fraction of the policy's misses
+  that a clairvoyant replacement would avoid — 0.0 means the policy is already
+  optimal and tuning it cannot help."
+  [state trace {:keys [segment] :or {segment :default}}]
+  (let [capacity (get-in state [:segments segment :capacity-pages])
+        events (mapv (fn [k] {:event :access :key k :segment segment}) trace)
+        {final :state} (run-with-host (demand-only state) events)
+        policy (:misses (:stats final))
+        opt (optimal-misses trace capacity)
+        compulsory (compulsory-misses trace)]
+    {:accesses (count trace)
+     :bounds :replacement-only
+     :readahead :disabled-for-this-comparison
+     :capacity-pages capacity
+     :policy (get-in state [:segments segment :policy])
+     :compulsory-misses compulsory
+     :optimal-misses opt
+     :policy-misses policy
+     :policy-hit-rate (if (pos? (count trace))
+                        (double (/ (- (count trace) policy) (count trace))) 0.0)
+     :optimal-hit-rate (if (pos? (count trace))
+                         (double (/ (- (count trace) opt) (count trace))) 0.0)
+     :headroom (if (pos? policy) (double (/ (- policy opt) policy)) 0.0)
+     :note (cond
+             (<= policy opt) "already at the clairvoyant optimum; tuning cannot help"
+             (< (/ (- policy opt) (double policy)) 0.05)
+             "within 5% of optimal; tuning this policy is not where the win is"
+             :else "real headroom — a better policy would take measurably fewer misses")}))
+
+;; ── getting a real trace out of a real cache ─────────────────────────────
+
+(defn recorder
+  "A key recorder to wrap around a live cache's read path.
+
+  `headroom` answers the question a hit rate cannot: is 60% close to the
+  ceiling for this workload, or is a better policy leaving half the wins on
+  the table? It needs the access SEQUENCE, and a running cache reports
+  counters rather than sequences — `block-cache`, the one in production in
+  this workspace, exposes `stats` and `hit-rate` and no way to ask whether
+  either is any good.
+
+  So: wrap the read path, run the workload, hand `@rec` to `headroom`. This
+  deliberately knows nothing about any particular cache — it takes a key and
+  returns it — so it composes with `block-cache`'s `wrap-get-fn`, with a
+  `merkle-lsm` effect handler, or with anything else that can call a function
+  on the way past.
+
+      (let [rec (recorder)
+            get' (fn [cid] (get-fn (record! rec cid)))]
+        ;; ... run the real workload through get' ...
+        (headroom (cache machine {...}) @rec {}))
+
+  Bounded on purpose. A trace is for analysis, not for production telemetry,
+  and an unbounded vector behind a long-lived cache is a leak with a
+  respectable name. Past `limit` it stops recording and says so rather than
+  silently truncating, because a trace that quietly lost its tail produces a
+  headroom figure that is wrong in the optimistic direction."
+  ([] (recorder 1000000))
+  ([limit] (atom {:keys [] :limit limit :dropped 0})))
+
+(defn record!
+  "Note one access and return `k` unchanged, so this drops into a read path."
+  [rec k]
+  (swap! rec (fn [{:keys [keys limit dropped] :as s}]
+               (if (< (count keys) limit)
+                 (assoc s :keys (conj keys k))
+                 (assoc s :dropped (inc dropped)))))
+  k)
+
+(defn recorded
+  "The trace, or a refusal if it overflowed.
+
+  Returns `{:trace [...]}` or `{:overflowed n :recorded m}`. Not the bare
+  vector: a caller that got a truncated trace and did not notice would
+  compute `headroom` over a prefix and read it as the whole workload."
+  [rec]
+  (let [{:keys [keys dropped]} @rec]
+    (if (pos? dropped)
+      {:overflowed dropped :recorded (count keys)
+       :note "raise the recorder's limit, or record a representative window
+              deliberately rather than accidentally"}
+      {:trace keys})))
