@@ -1,0 +1,135 @@
+(ns loop-game-autoplay.train
+  "The training loop: `shinka` proposes genomes, a real browser scores them.
+
+  ```
+  kbb --backend sci --classpath src:../shinka/src -m loop-game-autoplay.train \\
+      --game ../../cloud-itonami/gameka/playtest/survivors-zombie.html \\
+      --generations 12 --population 24 --episode-ms 60000 --seeds 3
+  ```
+
+  Training is headless and off-simulator, and that is a decision rather than
+  a shortcut. A generation of 24 genomes x 3 seeds is 72 episodes; at 60 s of
+  simulated time each that is 216,000 physics steps. Driving those through a
+  phone would take hours of wall clock to produce the same numbers, because
+  the Simulator renders every frame at real-time speed and cannot be told not
+  to. The Simulator's job is to qualify the champion against real WebKit and
+  produce the video -- see `loop-game-autoplay.qualify`.
+
+  Everything is written as EDN. A run is evidence only if someone else can
+  replay it: the champion carries its search seed, its evaluation seeds and
+  its episode length, so `qualify` and any re-run start from stated inputs."
+  (:require ["fs" :as fs]
+            ["path" :as path]
+            [shinka.evolve :as evolve]
+            [loop-game-autoplay.policy :as policy]
+            [loop-game-autoplay.server :as server]
+            [loop-game-autoplay.env :as env]))
+
+(defn- arg [args k default]
+  (if-let [i (first (keep-indexed #(when (= %2 (str "--" k)) %1) args))]
+    (nth args (inc i) default)
+    default))
+
+(defn- num-arg [args k default] (js/parseFloat (arg args k (str default))))
+(defn- fmt [x] (.toFixed (js/Number x) 2))
+
+(defn- evaluate-serially
+  "Score genomes one at a time on one page.
+
+  Serial on purpose for v1: the game keeps its state in module-scope globals,
+  so two episodes in the same page would interleave, and a page per genome
+  would pay a page load per evaluation. Parallelism belongs at the
+  browser-context level and is worth adding when the search, rather than the
+  harness, is the bottleneck."
+  [page genomes seeds episode-ms]
+  (let [step (fn step [i acc]
+               (if (= i (count genomes))
+                 (js/Promise.resolve acc)
+                 (-> (env/evaluate-genome! page (nth genomes i) seeds episode-ms)
+                     (.then (fn [f] (step (inc i) (conj acc f)))))))]
+    (step 0 [])))
+
+(defn- generation-line [rec i generations elapsed-s]
+  (str "  gen " i "/" generations
+       "  best " (fmt (:best-fitness rec))
+       "  mean " (fmt (:mean rec))
+       "  div " (fmt (:diversity rec))
+       (when (pos? (:immigrants rec)) (str "  immigrants " (:immigrants rec)))
+       "  (" (fmt elapsed-s) "s)"))
+
+(defn- evolve-loop
+  "Returns a promise of `[state history]`."
+  [page s i generations seeds episode-ms history]
+  (if (= i generations)
+    (js/Promise.resolve [s history])
+    (let [{:keys [genomes]} (evolve/ask s)
+          t0 (js/Date.now)]
+      (-> (evaluate-serially page genomes seeds episode-ms)
+          (.then (fn [fitnesses]
+                   (let [[s' rec] (evolve/tell s fitnesses)]
+                     (println (generation-line rec (inc i) generations
+                                               (/ (- (js/Date.now) t0) 1000)))
+                     (evolve-loop page s' (inc i) generations seeds episode-ms
+                                  (conj history (dissoc rec :best-genome))))))))))
+
+(defn- write-outputs! [out cfg state history]
+  (let [best (evolve/best state)
+        dir (path/dirname out)]
+    (when (and dir (not (fs/existsSync dir)))
+      (fs/mkdirSync dir #js {:recursive true}))
+    (fs/writeFileSync (str out "-champion.edn")
+                      (pr-str (merge {:schema "loop-game-autoplay.champion/v1"
+                                      :driver "autoplay-driver/v1"
+                                      :obs-dim policy/obs-dim
+                                      :act-dim policy/act-dim
+                                      :fitness (:fitness best)
+                                      :found-in-generation (:generation best)
+                                      :genome (:genome best)}
+                                     cfg)))
+    (fs/writeFileSync (str out "-history.edn")
+                      (pr-str {:schema "loop-game-autoplay.history/v1"
+                               :config cfg
+                               :generations history}))
+    (println (str "\nbest fitness " (fmt (:fitness best))
+                  " (found in generation " (:generation best) ")"))
+    (println (str "wrote " out "-champion.edn and " out "-history.edn"))))
+
+(defn -main [& args]
+  (let [game (arg args "game" "../../cloud-itonami/gameka/playtest/survivors-zombie.html")
+        generations (int (num-arg args "generations" 10))
+        population (int (num-arg args "population" 24))
+        episode-ms (int (num-arg args "episode-ms" 60000))
+        n-seeds (int (num-arg args "seeds" 3))
+        search-seed (int (num-arg args "seed" 2026))
+        out (arg args "out" "target/run")
+        seeds (vec (range 1 (inc n-seeds)))
+        cfg {:game game :seeds seeds :episode-ms episode-ms
+             :generations generations :population population
+             :search-seed search-seed}
+        held (atom {})]
+    (when-not (fs/existsSync game)
+      (println "game file not found:" game)
+      (js/process.exit 2))
+    (println (str "train: " generations " generations x " population " genomes x "
+                  (count seeds) " seeds @ " (/ episode-ms 1000) "s simulated"))
+    (println (str "game:  " game))
+    (-> (server/start! {:game-file game})
+        (.then (fn [srv]
+                 (swap! held assoc :srv srv)
+                 (println (str "serve: " (:url srv)))
+                 (env/launch! {})))
+        (.then (fn [browser]
+                 (swap! held assoc :browser browser)
+                 (env/open-page! browser (:url (:srv @held)))))
+        (.then (fn [page]
+                 (evolve-loop page
+                              (evolve/init (merge policy/spec-opts
+                                                  {:seed search-seed :population population}))
+                              0 generations seeds episode-ms [])))
+        (.then (fn [[state history]]
+                 (write-outputs! out cfg state history)
+                 (.close (:browser @held))))
+        (.then (fn [_] (server/stop! (:srv @held))))
+        (.catch (fn [e]
+                  (println "ERROR" (str e))
+                  (js/process.exit 1))))))
