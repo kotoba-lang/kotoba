@@ -1,0 +1,578 @@
+(ns yoro-ui.interop.signal
+  "Signal v3 — real E2E encryption for aozora DMs, with post-compromise
+  security (90-docs/yoro/260630-app-aozora-yoro-messenger-design.md
+  \"Encryption policy\").
+
+  v2 upgraded v1's per-direction-only HMAC chain (forward secrecy but no
+  healing after a key compromise) to a real Double Ratchet — kotoba.signal.
+  ratchet (kotoba-lang/org-signal, cljs sibling of its JVM package) — mixing
+  a fresh DH exchange in every time either side switches from receiving to
+  sending.
+
+  v3 upgrades session establishment from \"X3DH-lite\" (identity key + signed
+  prekey only, 3 DHs, this file's own hand-rolled sha256 root) to full X3DH
+  with one-time prekeys (kotoba.signal.x3dh, RFC-5869-HKDF root, up to 4
+  DHs) — a real, distinct root-derivation formula from v2's, so an old v2
+  session must never be misread as v3 or vice versa (same reasoning v1→v2
+  bumped scheme/content-type; a stale client fails closed on a scheme
+  mismatch instead of silently misinterpreting bytes).
+
+  There's still NO out-of-order delivery — decrypt-message advances the
+  chain by exactly one step and must be called once, in delivery order, per
+  incoming message (callers are responsible for caching the plaintext
+  result; re-decrypting the same message is not supported, the same way a
+  real ratchet can't re-derive a key it has already erased).
+
+  Session establishment (full X3DH via kotoba.signal.x3dh/x3dh-initiate,
+  x3dh-respond — this ns supplies the DH-input keys and bootstraps
+  kotoba.signal.ratchet from the resulting root, not its own DH/KDF math):
+    root = HKDF(F ‖ DH1 ‖ DH2 ‖ DH3 ‖ [DH4], info, 32)
+      DH1 = ECDH(myIK,  peerSPK)   DH2 = ECDH(myEK/peerEK, otherIK)
+      DH3 = ECDH(mySPK/myEK, peerSPK/peerEK)   DH4 = ECDH(myEK/peerEK, otherOPK) [if an OPK was available]
+
+  **oneTimePreKeys is a POOL, not single-use-consumed the way a real Signal
+  prekey SERVER tracks OPKs.** aozora has no stateful prekey service — a
+  peer's read (getPrekeyBundle) can't also mark one consumed on the
+  publisher's OWN self-sovereign repo, since only the owner's session can
+  write there. So `establish-as-initiator` picks ONE OPK pseudo-randomly
+  from the published pool per session instead of the pool being drawn down
+  one-at-a-time; the WHOLE pool rotates on the same 7-day cadence as the
+  signed prekey, bounding (not eliminating) cross-session OPK reuse. This is
+  a deliberate, documented deviation from single-use OPKs given the
+  self-sovereign-repo architecture, not an oversight. A bundle published
+  with an empty/missing OPK pool degrades gracefully to X3DH without DH4 —
+  the prior X3DH-lite security level for that specific actor, since
+  kotoba.signal.x3dh only computes DH4 when an OPK is present on either side.
+
+  Identity binding: the signed prekey's signature covers `identityKey ‖
+  signedPreKey` (not just the SPK alone) — so a party who can't forge the
+  registrant's Ed25519 did:key signature can't substitute a different
+  identityKey either. Signing key = the account's *existing* Ed25519 actor
+  identity (yoro-ui.interop.actor-key/seed) — no separate signing keypair,
+  and NOT kotoba.signal.x3dh/generate-identity's own :sign-seed (that would
+  bind the prekey bundle to a fresh throwaway key instead of the account's
+  real, externally-verifiable did:key identity peers already trust); this ns
+  calls kotoba.signal.x3dh's lower-level x3dh-initiate/x3dh-respond directly
+  with a hand-built identity map instead of its generate-identity/
+  publish-bundle/verify-bundle, which is why.
+
+  Fail-closed: every public fn here rejects (never silently degrades to
+  plaintext or a fabricated result) on missing/unverifiable prekey bundles,
+  signature failures, or AES-GCM tag mismatches."
+  (:require [kotobase.cacao :as cacao]
+            [kotobase.cid :as cid]
+            [yoro-ui.interop.key-crypto :as kc]
+            [yoro-ui.interop.actor-key :as ak]
+            [yoro-ui.interop.atproto :as at]
+            [kotoba.signal.x25519 :as x25519]
+            [kotoba.signal.x3dh :as x3dh]
+            [kotoba.signal.ratchet :as ratchet]
+            ["@noble/curves/ed25519.js" :refer [ed25519]]))
+
+(def scheme "signal-v3")
+(def content-type "application/x-aozora-signal-v3+json")
+
+(def ^:private spk-rotation-ms (* 7 24 60 60 1000))
+(def ^:private opk-pool-size
+  "How many one-time prekeys ensure-identity! generates per rotation. Not
+  single-use-tracked (see ns docstring) — just needs to be large enough that
+  an initiator picking one at random keeps cross-session OPK reuse rare
+  within one 7-day rotation window, not a hard security boundary."
+  20)
+
+;; ── localStorage (per my-did / per (my-did,peer-did) pair) ──────────────────
+
+(def ^:private ns-prefix "aozora-signal:")
+
+(defn- ls-get [k] (when (exists? js/localStorage) (try (.getItem js/localStorage k) (catch :default _ nil))))
+(defn- ls-set! [k v] (when (exists? js/localStorage) (try (.setItem js/localStorage k v) (catch :default _ nil))))
+
+(defn- json-get [k]
+  (when-let [s (ls-get k)]
+    (try (js->clj (js/JSON.parse s) :keywordize-keys true) (catch :default _ nil))))
+
+(defn- json-set! [k v] (ls-set! k (js/JSON.stringify (clj->js v))))
+
+(defn- identity-key [did] (str ns-prefix "identity:" did))
+(defn- load-identity [did] (json-get (identity-key did)))
+(defn- store-identity! [did m] (json-set! (identity-key did) m))
+
+(defn- session-key [my-did peer-did] (str ns-prefix "session-v2:" my-did ":" peer-did))
+
+;; ── ratchet state ⇄ localStorage (bytes ⇄ base64url) ─────────────────────────
+
+(defn- b64u [v] (when v (cacao/bytes->base64url v)))
+(defn- unb64u [v] (when v (cacao/base64url->bytes v)))
+
+(defn- ratchet-state->stored [state]
+  {:dhPriv (b64u (:dh-priv state)) :dhPub (b64u (:dh-pub state)) :dhRemote (b64u (:dh-remote state))
+   :rootKey (b64u (:root-key state))
+   :sendChainKey (b64u (:send-chain-key state)) :sendChainRemote (b64u (:send-chain-remote state))
+   :recvChainKey (b64u (:recv-chain-key state)) :recvChainRemote (b64u (:recv-chain-remote state))
+   :sendN (:send-n state) :recvN (:recv-n state)
+   :mailboxKey (b64u (:mailbox-key state))})
+
+(defn- stored->ratchet-state [stored]
+  {:dh-priv (unb64u (:dhPriv stored)) :dh-pub (unb64u (:dhPub stored)) :dh-remote (unb64u (:dhRemote stored))
+   :root-key (unb64u (:rootKey stored))
+   :send-chain-key (unb64u (:sendChainKey stored)) :send-chain-remote (unb64u (:sendChainRemote stored))
+   :recv-chain-key (unb64u (:recvChainKey stored)) :recv-chain-remote (unb64u (:recvChainRemote stored))
+   :send-n (or (:sendN stored) 0) :recv-n (or (:recvN stored) 0)
+   :mailbox-key (unb64u (:mailboxKey stored))})
+
+(defn- load-session-state [my-did peer-did]
+  (when-let [stored (json-get (session-key my-did peer-did))]
+    (stored->ratchet-state stored)))
+
+(defn- store-session-state! [my-did peer-did state]
+  (json-set! (session-key my-did peer-did) (ratchet-state->stored state)))
+
+;; ── identity registration (full X3DH prekey bundle) ──────────────────────────
+
+(defn- sign-bundle
+  "Sign identityKey‖signedPreKey with the account's Ed25519 actor identity
+  key. nil when this device holds no actor key (caller must fail closed)."
+  [ik-pub spk-pub]
+  (when-let [actor-seed (ak/seed)]
+    (.sign ed25519 (kc/concat-bytes ik-pub spk-pub) actor-seed)))
+
+(defn- gen-opks []
+  (mapv (fn [i] (assoc (x25519/generate-keypair) :id i)) (range opk-pool-size)))
+
+(defn- opks->stored [opks]
+  (mapv (fn [k] {:priv (cacao/bytes->base64url (:priv k)) :pub (cacao/bytes->base64url (:pub k)) :id (:id k)}) opks))
+
+(defn- stored->opks [stored]
+  (mapv (fn [k] {:priv (cacao/base64url->bytes (:priv k)) :pub (cacao/base64url->bytes (:pub k)) :id (:id k)})
+        (or stored [])))
+
+(defn ensure-identity!
+  "Create (first run) or rotate (every 7 days) this device's X25519 identity
+  key + signed prekey + one-time-prekey pool for `did`, then (re-)register
+  the public bundle with the PDS. Idempotent — safe to call on every
+  sign-in/sign-up. → Promise<nil>, rejects if there's no local actor
+  identity key to sign with OR the PDS rejects registration (e.g.
+  IdentityConflict — see aozora.pds.prekeys — a DIFFERENT identityKey is
+  already registered for this account, most likely because this is a new,
+  not-yet-linked device).
+
+  Registers with the PDS BEFORE persisting locally, not after: persisting
+  first and registering second would leave this device believing its NEW
+  identity is active even when the server rejected it and kept the OLD one,
+  silently desyncing this device's outgoing encryption from what peers
+  fetch — every message to/from this device would then fail to decrypt
+  until the mismatch was somehow noticed. Rejecting here instead just means
+  the SAME stale local identity gets retried next call, same as any other
+  ensure-identity! failure.
+
+  The identity X25519 key (:ik) survives rotation (same account, same
+  device); the signed prekey AND the whole one-time-prekey pool are FRESH
+  every rotation — see ns docstring for why the OPK pool rotates wholesale
+  rather than being drawn down one-at-a-time."
+  [did]
+  (let [existing (load-identity did)
+        stale? (or (nil? existing)
+                   (> (- (js/Date.now) (or (:updatedAt existing) 0)) spk-rotation-ms))]
+    (if-not stale?
+      (js/Promise.resolve nil)
+      (let [ik (if existing
+                 {:priv (cacao/base64url->bytes (:ikPriv existing))
+                  :pub (cacao/base64url->bytes (:ikPub existing))}
+                 (x25519/generate-keypair))
+            spk (x25519/generate-keypair)
+            spk-id (inc (or (:spkId existing) 0))
+            opks (gen-opks)
+            sig (sign-bundle (:pub ik) (:pub spk))]
+        (if-not sig
+          (js/Promise.reject (js/Error. "signal: no local actor identity key — sign in first"))
+          (-> (at/at-procedure "app.aozora.convo.registerPrekeys"
+                               {:identityKey (cacao/bytes->base64url (:pub ik))
+                                :signedPreKey (cacao/bytes->base64url (:pub spk))
+                                :signedPreKeySig (cacao/bytes->base64url sig)
+                                :signedPreKeyId spk-id
+                                :oneTimePreKeys (mapv #(cacao/bytes->base64url (:pub %)) opks)})
+              (.then (fn [resp]
+                       (if (:error resp)
+                         (throw (ex-info (str "signal: registerPrekeys rejected: " (:error resp))
+                                         {:error (:error resp) :message (:message resp)}))
+                         (store-identity! did {:ikPriv (cacao/bytes->base64url (:priv ik))
+                                               :ikPub (cacao/bytes->base64url (:pub ik))
+                                               :spkPriv (cacao/bytes->base64url (:priv spk))
+                                               :spkPub (cacao/bytes->base64url (:pub spk))
+                                               :spkId spk-id
+                                               :opks (opks->stored opks)
+                                               :updatedAt (js/Date.now)}))))
+              (.then (fn [_] nil))))))))
+
+;; ── prekey bundle fetch + verify ─────────────────────────────────────────────
+
+(defn- fetch-verified-bundle
+  "→ Promise<bundle-map>; rejects when the peer has no bundle registered or
+  the signature over identityKey‖signedPreKey doesn't verify against the
+  peer's did:key — never resolves with an unverified bundle."
+  [peer-did]
+  (-> (at/at-appview-query "app.aozora.convo.getPrekeyBundle" {:did peer-did})
+      (.then (fn [resp]
+               (if-not (:found resp)
+                 (js/Promise.reject (js/Error. (str "signal: no prekey bundle registered for " peer-did)))
+                 (let [sign-pub (cid/did-key->ed25519-pub peer-did)
+                       ik-pub (cacao/base64url->bytes (:identityKey resp))
+                       spk-pub (cacao/base64url->bytes (:signedPreKey resp))
+                       sig (cacao/base64url->bytes (:signedPreKeySig resp))]
+                   (if (and sign-pub (.verify ed25519 sig (kc/concat-bytes ik-pub spk-pub) sign-pub))
+                     resp
+                     (js/Promise.reject (js/Error. (str "signal: prekey bundle signature verification failed for " peer-did))))))))))
+
+;; ── session mailbox (ADR-2610081200 R1: accountability-tiered anonymity) ────
+;;
+;; A sealed message routed by `toDid` tells the storage/AppView layer who it
+;; is FOR. Once a session exists both parties hold the same X3DH shared
+;; secret SK, so they can agree on an opaque per-session, per-direction
+;; routing label instead — the server stores and lists by that label and
+;; never learns which DID it belongs to (beyond what it learns from the
+;; authenticated request itself, see listSealedMessages' description).
+;;
+;;   mailbox-key = HKDF-SHA256(ikm = SK, salt = 32 zero bytes,
+;;                             info = "aozora/mailbox/v1", L = 32)
+;;   mailbox-id(recipient-did) = base64url-unpadded(
+;;                 HMAC-SHA256(mailbox-key, "aozora/mailbox/v1|" ‖ recipient-did))
+;;
+;; mailbox-key is derived ONCE at session establishment (finish-initiator! /
+;; finish-responder!, the only two places SK exists) and persisted with the
+;; session state; the Double Ratchet never touches it, so it is stable for
+;; the session's whole life. The two directions get different ids (the
+;; recipient DID is in the HMAC input), so the A→B and B→A streams are not
+;; trivially linkable to each other by id equality either. A session created
+;; before this existed has no mailbox-key; send-sealed! then keeps using the
+;; toDid (intro) route for it — fail-visible, never a fabricated id.
+
+(def ^:private mailbox-info "aozora/mailbox/v1")
+
+(defn- derive-mailbox-key
+  "Promise<Uint8Array(32)> — HKDF-SHA256(sk, zero salt, mailbox-info) via
+  WebCrypto deriveBits."
+  [^js sk]
+  (-> (js/crypto.subtle.importKey "raw" sk "HKDF" false #js ["deriveBits"])
+      (.then (fn [k]
+               (js/crypto.subtle.deriveBits
+                #js {:name "HKDF" :hash "SHA-256" :salt (js/Uint8Array. 32)
+                     :info (kc/utf8->bytes mailbox-info)}
+                k 256)))
+      (.then #(js/Uint8Array. %))))
+
+(defn mailbox-id
+  "Promise<string> — the opaque mailbox id for messages addressed TO
+  `recipient-did` within the session whose mailbox key is `mailbox-key`
+  (Uint8Array(32)). Deterministic; both session parties compute the same
+  value for the same recipient, and a different one per direction."
+  [^js mailbox-key recipient-did]
+  (-> (kc/hmac-sha256 mailbox-key (kc/utf8->bytes (str mailbox-info "|" recipient-did)))
+      (.then cacao/bytes->base64url)))
+
+(defn session-mailbox-id
+  "Promise<string|nil> — mailbox-id for `recipient-did` (either my-did or
+  peer-did) in the stored (my-did, peer-did) session; nil when there is no
+  session or it predates mailbox keys."
+  [my-did peer-did recipient-did]
+  (if-let [k (:mailbox-key (load-session-state my-did peer-did))]
+    (mailbox-id k recipient-did)
+    (js/Promise.resolve nil)))
+
+;; ── full X3DH root secret (kotoba.signal.x3dh) → kotoba.signal.ratchet bootstrap ──
+
+(defn- pick-opk
+  "One {:pub :id} chosen pseudo-randomly from a fetched bundle's base64url
+  oneTimePreKeys pool, or nil if the pool is empty/absent (graceful
+  degradation to X3DH without DH4 — see ns docstring)."
+  [bundle]
+  (when-let [pool (seq (:oneTimePreKeys bundle))]
+    (let [i (js/Math.floor (* (js/Math.random) (count pool)))]
+      {:pub (cacao/base64url->bytes (nth pool i)) :id i})))
+
+(defn- finish-initiator!
+  "Bootstrap init-sender from x3dh-initiate's result, derive the session's
+  mailbox key from the same shared secret (derive-mailbox-key), persist,
+  return the live state (with :pending-first attached — see
+  establish-as-initiator)."
+  [my-did peer-did bundle {:keys [shared-secret ek-pub opk-id]}]
+  (let [peer-spk-pub (cacao/base64url->bytes (:signedPreKey bundle))]
+    (-> (js/Promise.all #js [(ratchet/init-sender shared-secret peer-spk-pub)
+                             (derive-mailbox-key shared-secret)])
+        (.then (fn [^js pair]
+                 (let [state (assoc (aget pair 0) :mailbox-key (aget pair 1))
+                       state' (assoc state :pending-first
+                                      {:ek (cacao/bytes->base64url ek-pub)
+                                       :spkId (:signedPreKeyId bundle)
+                                       :opkId opk-id})]
+                   (store-session-state! my-did peer-did state')
+                   state'))))))
+
+(defn- initiate-x3dh
+  "Promise<{:shared-secret :ek-pub :opk-id}> — x3dh-initiate against a
+  verified fetched `bundle`, with one of its one-time prekeys attached if
+  the pool is non-empty (see pick-opk)."
+  [my-id bundle]
+  (let [ik-priv (cacao/base64url->bytes (:ikPriv my-id))
+        peer-spk-pub (cacao/base64url->bytes (:signedPreKey bundle))
+        opk (pick-opk bundle)
+        their-bundle (cond-> {:ik (cacao/base64url->bytes (:identityKey bundle))
+                              :spk peer-spk-pub}
+                       opk (assoc :opk (:pub opk) :opk-id (:id opk)))]
+    (x3dh/x3dh-initiate {:ik {:priv ik-priv}} their-bundle)))
+
+(defn- establish-as-initiator
+  "Alice's side: fetch + verify Bob's bundle, delegate the DH+KDF math to
+  kotoba.signal.x3dh/x3dh-initiate (initiate-x3dh — also generates the
+  ephemeral key and picks one of Bob's one-time prekeys if any), bootstrap
+  the Double Ratchet from the resulting root secret (kotoba.signal.ratchet/
+  init-sender, via finish-initiator!). → Promise<live-state-with-
+  :pending-first>, already persisted; :pending-first is the one-shot X3DH
+  header the very first outgoing message must also carry so Bob can replay
+  the same DHs (separate from the ratchet's OWN per-message {:dh-pub :n}
+  header, which init-sender already builds into the state)."
+  [my-did peer-did]
+  (let [my-id (load-identity my-did)]
+    (if-not my-id
+      (js/Promise.reject (js/Error. "signal: call ensure-identity! before starting a session"))
+      (-> (fetch-verified-bundle peer-did)
+          (.then (fn [bundle]
+                   (-> (initiate-x3dh my-id bundle)
+                       (.then #(finish-initiator! my-did peer-did bundle %)))))))))
+
+(defn- finish-responder!
+  "Bootstrap init-receiver from x3dh-respond's root secret, derive the
+  session's mailbox key from the same secret (derive-mailbox-key), persist,
+  return the live state."
+  [my-did peer-did spk-priv spk-pub root-secret]
+  (-> (js/Promise.all #js [(ratchet/init-receiver root-secret {:priv spk-priv :pub spk-pub})
+                           (derive-mailbox-key root-secret)])
+      (.then (fn [^js pair]
+               (let [state (assoc (aget pair 0) :mailbox-key (aget pair 1))]
+                 (store-session-state! my-did peer-did state)
+                 state)))))
+
+(defn- respond-x3dh
+  "Promise<Uint8Array(32)> root secret — x3dh-respond against a verified
+  fetched `bundle` (Alice's), replaying the DHs with Bob's own IK/SPK/OPK
+  privkeys, Alice's ephemeral pubkey, and the opk-id she used (if any)."
+  [my-id bundle ek-pub opk-id]
+  (let [ik-priv (cacao/base64url->bytes (:ikPriv my-id))
+        spk-priv (cacao/base64url->bytes (:spkPriv my-id))
+        peer-ik-pub (cacao/base64url->bytes (:identityKey bundle))
+        my-identity {:ik {:priv ik-priv} :spk {:priv spk-priv}
+                     :opks (stored->opks (:opks my-id))}]
+    (x3dh/x3dh-respond my-identity peer-ik-pub ek-pub opk-id)))
+
+(defn- establish-as-responder
+  "Bob's side: replays the same DHs kotoba.signal.x3dh/x3dh-respond
+  computes (respond-x3dh) using his own IK/SPK/OPK privkeys against Alice's
+  identityKey (from her verified bundle) and ephemeral key + chosen opk-id
+  (from the incoming envelope's :pending-first header), bootstraps the
+  Double Ratchet as the receiver (finish-responder! → init-receiver, using
+  Bob's own SPK keypair as the initial ratchet key — the same convention
+  init-sender's peer-spk-pub argument assumes). A stale/rotated-away opk-id
+  (Bob rotated his pool between Alice fetching the bundle and her first
+  message arriving) means x3dh-respond either can't find that index or
+  finds a DIFFERENT keypair than Alice used — the derived secrets won't
+  match and the ratchet's own AES-GCM tag check on the first message fails
+  closed, same as any other bad session (rare race, not a security hole;
+  see ns docstring on OPK pool rotation). → Promise<live-state>."
+  [my-did peer-did ek-b64u opk-id]
+  (let [my-id (load-identity my-did)]
+    (if-not my-id
+      (js/Promise.reject (js/Error. "signal: call ensure-identity! before receiving a session"))
+      (-> (fetch-verified-bundle peer-did)
+          (.then (fn [bundle]
+                   (let [spk-priv (cacao/base64url->bytes (:spkPriv my-id))
+                         spk-pub (cacao/base64url->bytes (:spkPub my-id))
+                         ek-pub (cacao/base64url->bytes ek-b64u)]
+                     (-> (respond-x3dh my-id bundle ek-pub opk-id)
+                         (.then #(finish-responder! my-did peer-did spk-priv spk-pub %))))))))))
+
+;; ── public encrypt / decrypt ─────────────────────────────────────────────────
+
+(defn encrypt-message
+  "Encrypt `plaintext` for `peer-did`, establishing a session first if none
+  exists. → Promise<envelope-map> — JSON-serialize this into the message's
+  `text` field, with `contentType`/`encryption` set to the constants above."
+  [my-did peer-did plaintext]
+  (-> (or (some-> (load-session-state my-did peer-did) js/Promise.resolve)
+          (establish-as-initiator my-did peer-did))
+      (.then (fn [state]
+               (-> (ratchet/encrypt-message (dissoc state :pending-first) (kc/utf8->bytes plaintext))
+                   (.then (fn [[state' {:keys [header iv ciphertext]}]]
+                            (store-session-state! my-did peer-did state')
+                            (cond-> {:v 3 :alg scheme
+                                     :header {:dhPub (b64u (:dh-pub header)) :n (:n header)}
+                                     :iv (b64u iv) :ct (b64u ciphertext)}
+                              (:pending-first state) (merge (:pending-first state))))))))))
+
+(defn decrypt-message
+  "Decrypt one incoming `envelope` (parsed from a message's `text` field) from
+  `peer-did`. Must be called exactly once per message, in delivery order —
+  each call advances the receive ratchet by one step (DH-ratcheting first if
+  the sender's header dh-pub is new) and the consumed key is gone afterward
+  (that's forward secrecy/post-compromise security working as intended, not
+  a bug). Callers own caching the returned plaintext. → Promise<string>;
+  rejects (never returns garbage) on a bad session, wrong scheme, or a
+  failed AES-GCM tag."
+  [my-did peer-did envelope]
+  (if (not= (:alg envelope) scheme)
+    (js/Promise.reject (js/Error. (str "signal: unsupported/mismatched scheme " (:alg envelope))))
+    (-> (let [state (load-session-state my-did peer-did)]
+          (cond
+            (and (:ek envelope) (nil? state)) (establish-as-responder my-did peer-did (:ek envelope) (:opkId envelope))
+            state (js/Promise.resolve state)
+            :else (js/Promise.reject (js/Error. (str "signal: no session and no session-establishing header for " peer-did)))))
+        (.then (fn [state]
+                 (let [live-envelope {:header {:dh-pub (unb64u (get-in envelope [:header :dhPub]))
+                                               :n (get-in envelope [:header :n])}
+                                      :iv (unb64u (:iv envelope))
+                                      :ciphertext (unb64u (:ct envelope))}]
+                   (-> (ratchet/decrypt-message state live-envelope)
+                       (.then (fn [[state' pt]]
+                                (store-session-state! my-did peer-did state')
+                                (kc/bytes->utf8 pt))))))))))
+
+
+;; ── sealed sending payload convention (Sealed Sender-equivalent) ────────────
+;;
+;; app.aozora.convo.sendSealed stores the record with NO plaintext senderDid
+;; field, under a neutral non-attributing repo — see that lexicon's
+;; description and aozora.pds.convo/send-sealed-message's docstring for the
+;; full design. This layer is a PAYLOAD-SHAPE convention on top of the SAME
+;; signal-v3 encrypt-message/decrypt-message above, not a new crypto scheme:
+;; the sender's own DID (and, since R1, the convoId) ride INSIDE the
+;; already-E2E-encrypted JSON payload instead of as plaintext record fields,
+;; so only the one party who can decrypt it (the intended recipient, via
+;; their established ratchet session) ever learns who sent it.
+
+(defn encrypt-sealed-message
+  "→ Promise<envelope-map> — same shape as encrypt-message's, but the
+  encrypted plaintext is {:senderDid my-did :text plaintext [:convoId …]}
+  JSON instead of the bare text, so decrypt-sealed-message's caller learns
+  the sender (and convo) only after decrypting."
+  ([my-did peer-did plaintext] (encrypt-sealed-message my-did peer-did plaintext nil))
+  ([my-did peer-did plaintext convo-id]
+   (encrypt-message my-did peer-did
+                    (js/JSON.stringify (clj->js (cond-> {:senderDid my-did :text plaintext}
+                                                  convo-id (assoc :convoId convo-id)))))))
+
+(defn decrypt-sealed-message
+  "→ Promise<{:senderDid :text [:convoId]}> — decrypts exactly like
+  decrypt-message, then unwraps encrypt-sealed-message's JSON payload shape."
+  [my-did peer-did envelope]
+  (-> (decrypt-message my-did peer-did envelope)
+      (.then (fn [json-str] (js->clj (js/JSON.parse json-str) :keywordize-keys true)))))
+
+;; ── sealed mailbox XRPC (app.aozora.convo.sendSealed / listSealedMessages) ──
+;;
+;; Two routes (ADR-2610081200 R1):
+;;
+;;   intro   — the ONE session-establishing message (the envelope carrying
+;;             the X3DH header :ek). Routed by `toDid` + `convoId`, exactly
+;;             as before R1: the responder cannot compute the session
+;;             mailbox before decrypting this message, so it has to be
+;;             findable by DID. The intro record therefore STILL reveals
+;;             the recipient DID and convoId to the storage/AppView layer.
+;;             Also used for a legacy session that predates mailbox keys.
+;;   mailbox — every later sealed message. Routed by the opaque session
+;;             mailbox id for the recipient (see `mailbox-id`). The stored
+;;             record carries no toDid, no convoId (it is inside the
+;;             ciphertext) and no senderDid; its rkey is random. An
+;;             observer of the store sees only "something was posted to
+;;             mailbox X at time T".
+;;
+;; fetch-sealed-messages! still takes `peer-did` explicitly — receiving a
+;; sealed message REQUIRES already knowing who it's from: sessions are looked
+;; up by (my-did, peer-did) pair (load-session-state), and the mailbox id is a
+;; function of that pair's session. That is a deliberate scope boundary (this
+;; hides per-message metadata from storage/AppView, it is not "receive
+;; anonymous mail from strangers").
+
+(defn send-sealed!
+  "Encrypt `plaintext` for `peer-did` (as the recipient) with the sender's
+  DID and `convo-id` sealed inside the payload, then POST
+  app.aozora.convo.sendSealed. Establishes a session first if none exists,
+  same as encrypt-message. The session-establishing message (envelope with
+  :ek) — or any message on a legacy session without a mailbox key — goes by
+  the intro route ({:toDid :convoId}); every other message goes by
+  {:mailboxId} only. → Promise<xrpc-response>."
+  [my-did peer-did convo-id plaintext]
+  (-> (encrypt-sealed-message my-did peer-did plaintext convo-id)
+      (.then (fn [envelope]
+               (let [ciphertext (js/JSON.stringify (clj->js envelope))
+                     intro! #(at/at-procedure "app.aozora.convo.sendSealed"
+                                              {:convoId convo-id :toDid peer-did :ciphertext ciphertext})]
+                 (if (:ek envelope)
+                   (intro!)
+                   (-> (session-mailbox-id my-did peer-did peer-did)
+                       (.then (fn [mid]
+                                (if mid
+                                  (at/at-procedure "app.aozora.convo.sendSealed"
+                                                   {:mailboxId mid :ciphertext ciphertext})
+                                  (intro!)))))))))))
+
+(defn- decrypt-sealed-record
+  "One listSealedMessages row → Promise<{:convoId :rkey :createdAt :senderDid
+  :text} | nil>; nil (not a rejection) on a record this device can't
+  decrypt (e.g. already consumed by an earlier fetch, genuinely corrupt, or
+  addressed to a DIFFERENT session than the one `peer-did` names). A mailbox
+  listing should show what it CAN decrypt, not fail the whole page over one
+  bad row. convoId comes from the decrypted payload when present (mailbox
+  records carry none in the clear), else from the intro record."
+  [my-did peer-did record]
+  (-> (js/Promise.resolve nil)
+      (.then (fn [_] (js->clj (js/JSON.parse (:ciphertext record)) :keywordize-keys true)))
+      (.then #(decrypt-sealed-message my-did peer-did %))
+      (.then (fn [{:keys [senderDid text convoId]}]
+               {:convoId (or convoId (:convoId record)) :rkey (:rkey record) :createdAt (:createdAt record)
+                :senderDid senderDid :text text}))
+      (.catch (fn [_] nil))))
+
+(defn- decrypt-sealed-records-in-order
+  "Decrypt `records` ONE AT A TIME, oldest first — the ratchet advances one
+  step per message and decrypt-message reads the stored session state at
+  call time, so concurrent decrypts would all start from the same state.
+  → Promise<[result-or-nil …]>."
+  [my-did peer-did records]
+  (reduce (fn [p record]
+            (.then p (fn [acc]
+                       (.then (decrypt-sealed-record my-did peer-did record) #(conj acc %)))))
+          (js/Promise.resolve [])
+          (sort-by :createdAt records)))
+
+(defn fetch-sealed-messages!
+  "Fetch and decrypt the sealed messages `peer-did` sent to `my-did`:
+    1. the intro route — listSealedMessages {:toDid my-did :convoId convo-id};
+       decrypting the session-establishing message here creates the session
+       (and its mailbox key) if this device didn't have one yet;
+    2. the mailbox route — listSealedMessages {:mailboxIds <id for my-did in
+       the (my-did, peer-did) session>}, once a session with a mailbox key
+       exists.
+  Both are decrypted strictly in order (intro first, then mailbox), merged,
+  and dropped where decryption failed. Mailbox records carry no convoId in
+  the clear, so convo scoping happens after decryption: rows whose sealed
+  payload names a different convoId are omitted (pass convo-id nil to get
+  every message from this peer — the session, and therefore the ratchet, is
+  per peer pair, not per convo, so a row consumed here can't be decrypted
+  again later). → Promise<[{:convoId :rkey :createdAt :senderDid :text} …]>,
+  oldest first."
+  [my-did peer-did convo-id]
+  (-> (at/at-appview-query "app.aozora.convo.listSealedMessages"
+                           (cond-> {:toDid my-did} convo-id (assoc :convoId convo-id)))
+      (.then (fn [{:keys [messages]}] (decrypt-sealed-records-in-order my-did peer-did messages)))
+      (.then (fn [intro-results]
+               (-> (session-mailbox-id my-did peer-did my-did)
+                   (.then (fn [mid]
+                            (if mid
+                              (-> (at/at-appview-query "app.aozora.convo.listSealedMessages" {:mailboxIds mid})
+                                  (.then (fn [{:keys [messages]}]
+                                           (decrypt-sealed-records-in-order my-did peer-did messages))))
+                              [])))
+                   (.then (fn [mailbox-results]
+                            (->> (concat intro-results mailbox-results)
+                                 (remove nil?)
+                                 (filter #(or (nil? convo-id) (= convo-id (:convoId %))))
+                                 (sort-by :createdAt)
+                                 vec))))))))

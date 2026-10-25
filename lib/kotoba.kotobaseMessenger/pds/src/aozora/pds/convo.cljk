@@ -1,0 +1,547 @@
+(ns aozora.pds.convo
+  "app.aozora.convo.* write handlers over the kotobase operator db.
+
+  Conversations are stored as generic AT records under `app.aozora.convo.*`
+  collections so AppView can project them without introducing a second storage
+  path."
+  (:require [kotoba.lang.text :as str]
+            [aozora.pds.repo :as repo]
+            [aozora.pds.push :as push]
+            [aozora.appview.convo :as appview-convo]
+            [aozora.appview.actor :as appview-actor]
+            [aozora.pds.per-actor :as per-actor]))
+
+(defn- non-blank [s] (when (and (string? s) (seq s)) s))
+(defn- now-iso [] (.toISOString (js/Date.)))
+
+(defn- random-hex-suffix
+  "4 random bytes -> 8 lowercase hex chars, to disambiguate an rkey
+  otherwise built from `(.getTime (js/Date.))` alone -- millisecond
+  resolution, so two calls in the same JS tick (a client that fires two
+  sends without awaiting the first, e.g. paste-and-hit-enter-twice, or a
+  retry-on-timeout that doesn't cancel the original request) would
+  otherwise generate the SAME rkey. Not a security nonce -- collision
+  odds only need to be negligible for this purpose, not cryptographic."
+  []
+  (let [bytes (js/Uint8Array. 4)]
+    (.getRandomValues js/crypto bytes)
+    (apply str (map (fn [b] (let [h (.toString b 16)] (if (= 1 (count h)) (str "0" h) h)))
+                    (array-seq bytes)))))
+
+(defn- unique-rkey
+  "A timestamp-prefixed rkey that can't collide across two calls in the
+  same JS millisecond (see random-hex-suffix) -- the timestamp prefix is
+  kept for readability/rough chronological grouping, but nothing in this
+  codebase sorts BY rkey (message/convo ordering is by the separate
+  :createdAt field, aozora.appview.convo), so the suffix is safe to add."
+  []
+  (str (.getTime (js/Date.)) "-" (random-hex-suffix)))
+
+(defn- require-auth [input]
+  (or (non-blank (:_auth-did input))
+      (non-blank (:repo input))))
+
+(defn- create [client db repo-id collection value rkey]
+  (repo/create-record client db {:repo repo-id
+                                 :collection collection
+                                 :rkey rkey
+                                 :record value}))
+
+(defn- other-dm-member
+  "The single OTHER member of a would-be 1:1 DM, or nil when this isn't a
+  2-party DM (a group, or a self-DM/malformed members list) — block
+  enforcement only applies to the well-defined \"exactly one other party\"
+  case; see aozora.pds.actor/block's lexicon description for why group
+  creation isn't enforced here."
+  [kind members creator-did]
+  (when (and (= (or kind "dm") "dm") (sequential? members) (= 2 (count members)))
+    (first (remove #(= % creator-did) members))))
+
+(defn- actor-blocked?
+  "Promise<boolean> — has `blocker-did` blocked `blocked-did`? nil `env`
+  (tests/local dev without a Worker Env) short-circuits to false, same
+  fail-permissive convention aozora.pds.prekeys' existing-bundle uses for
+  its own optional pre-write check."
+  [env blocker-did blocked-did]
+  (if (nil? env)
+    (js/Promise.resolve false)
+    (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+      (-> (appview-actor/blocked? appview-client appview-db blocker-did blocked-did)
+          (.catch (fn [_] false))))))
+
+(defn- rejected-by-block? [env creator-did kind members]
+  (if-let [other (other-dm-member kind members creator-did)]
+    (actor-blocked? env other creator-did)
+    (js/Promise.resolve false)))
+
+(defn create-convo
+  "POST app.aozora.convo.createConvo.
+
+  Creates the convo metadata record and returns the generated convoId.
+  Rejects with {:error \"Blocked\"} when creating a NEW 1:1 DM (exactly one
+  other member, kind=\"dm\") and that other party has blocked the caller —
+  see other-dm-member/rejected-by-block? and aozora.pds.actor/block's
+  lexicon description for the enforcement scope (1:1 creation only, not
+  groups or already-existing conversations)."
+  [client db {:keys [kind title members createdAt convoId encryption _env] :as input}]
+  (let [repo-id (require-auth input)
+        convo-id (or (non-blank convoId)
+                     (str "convo-" (unique-rkey)))
+        rkey convo-id
+        value (cond-> {:convoId convo-id
+                       :kind (or kind "dm")
+                       :createdAt (or createdAt (now-iso))
+                       :creatorDid repo-id}
+                (non-blank title) (assoc :title title)
+                (non-blank encryption) (assoc :encryption encryption)
+                (sequential? members) (assoc :members (vec members)))]
+    (if (nil? repo-id)
+      (js/Promise.resolve {:error "AuthMissing" :message "valid session required"})
+      (-> (rejected-by-block? _env repo-id kind members)
+          (.then (fn [blocked?]
+                   (if blocked?
+                     {:error "Blocked" :message "this actor is not accepting messages from you"}
+                     (-> (create client db repo-id "app.aozora.convo.convo" value rkey)
+                         (.then (fn [r] (assoc r :convoId convo-id :did repo-id)))))))))))
+
+(defn- require-creator
+  "Promise<did|:error-map> — `owner` must be `convoId`'s creator to change
+  membership. Fails CLOSED: no `env` (a request that somehow reached this
+  handler without router.cljc's dispatch, which always sets :_env) means the
+  check literally cannot run, so it's treated as unauthorized rather than
+  silently skipped — group membership must never be checkable-but-unchecked.
+  This is the enforcement half of the fix; aozora.appview.convo/member-records
+  trusting ONLY creator-authored records is the other half, closing the
+  bypass via a direct com.atproto.repo.createRecord write (ADR: messenger
+  access-control fix)."
+  [env owner convo-id]
+  (if (nil? env)
+    (js/Promise.resolve {:error "AuthRequired" :message "membership check unavailable"})
+    (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+      (-> (appview-convo/creator-did appview-client appview-db convo-id)
+          (.then (fn [creator]
+                   (if (= creator owner)
+                     owner
+                     {:error "AuthRequired"
+                      :message "only the convo creator can change membership"})))))))
+
+(defn- own-convo-lookup
+  "Promise<convo-record-value-or-nil>. nil `env` (tests/local dev without a
+  Worker Env) can't derive an AppView client, so this can't look anything
+  up; treated as \"not found\" by update-convo, same reasoning as
+  own-message-lookup below."
+  [env convo-id]
+  (if (nil? env)
+    (js/Promise.resolve nil)
+    (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+      (-> (appview-convo/get-convo-record appview-client appview-db convo-id)
+          (.catch (fn [_] nil))))))
+
+(defn- write-renamed-convo [client db owner convo-id title existing]
+  (if (nil? existing)
+    (js/Promise.resolve {:error "NotFound" :message "no existing convo to update"})
+    (-> (create client db owner "app.aozora.convo.convo" (assoc existing :title title) convo-id)
+        (.then (fn [r] (assoc r :convoId convo-id :title title :did owner))))))
+
+(defn- finish-update-convo! [client db owner convo-id title env]
+  (-> (own-convo-lookup env convo-id)
+      (.then (fn [existing] (write-renamed-convo client db owner convo-id title existing)))))
+
+(defn update-convo
+  "POST app.aozora.convo.updateConvo.
+
+  Renames the convo (title only, for now). Only the creator may call this
+  (require-creator, same authorization as add-member/remove-member).
+  Reads the existing record first (own-convo-lookup) to preserve every
+  field the update doesn't touch — kotobase stores a record's whole value
+  as one blob per entity, so a naive partial create-record call would
+  silently drop kind/createdAt/creatorDid/encryption/members."
+  [client db {:keys [convoId title _env] :as input}]
+  (let [owner (require-auth input)]
+    (if (or (nil? owner) (str/blank? (or convoId "")) (str/blank? (or title "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, title, and valid session required"})
+      (-> (require-creator _env owner convoId)
+          (.then (fn [result]
+                   (if (map? result)
+                     result
+                     (finish-update-convo! client db owner convoId title _env))))))))
+
+(defn send-message
+  "POST app.aozora.convo.send.
+
+  Persists one conversation message record under the sender DID. Fires a
+  best-effort Web Push notification to the convo's other members after the
+  write lands (never awaited — see aozora.pds.push's docstring for why this
+  is the ONLY message-adjacent write that pushes, not send-key-distribution
+  too)."
+  [client db {:keys [convoId text facets embed kind contentType replyTo encryption createdAt _env] :as input}]
+  (let [sender (require-auth input)
+        rkey (unique-rkey)
+        value (cond-> {:convoId convoId
+                       :senderDid sender
+                       :text text
+                       :rkey rkey
+                       :createdAt (or createdAt (now-iso))}
+                (seq facets) (assoc :facets facets)
+                embed (assoc :embed embed)
+                (non-blank kind) (assoc :kind kind)
+                (non-blank contentType) (assoc :contentType contentType)
+                (non-blank replyTo) (assoc :replyTo replyTo)
+                (non-blank encryption) (assoc :encryption encryption))]
+    (if (or (nil? sender) (str/blank? (or convoId "")) (str/blank? (or text "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, text, and valid session required"})
+      (-> (create client db sender "app.aozora.convo.message" value rkey)
+          (.then (fn [r]
+                   (push/notify-new-message! _env {:convo-id convoId :sender-did sender})
+                   (assoc r :convoId convoId :did sender)))))))
+
+(defn- own-message-lookup
+  "Promise<message-value-or-nil>. nil `env` (no Worker Env — tests/local dev)
+  can't derive an AppView client, so this can't look anything up; treated as
+  \"not found\" by edit-message, same as a genuinely missing message —
+  unlike aozora.pds.prekeys' existing-bundle or actor-blocked? above, this
+  lookup isn't an optional pre-check that's safe to skip: it supplies the
+  fields the edit itself needs to preserve, so failing closed is correct."
+  [env sender convo-id rkey]
+  (if (nil? env)
+    (js/Promise.resolve nil)
+    (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+      (-> (appview-convo/get-own-message appview-client appview-db sender convo-id rkey)
+          (.catch (fn [_] nil))))))
+
+(defn edit-message
+  "POST app.aozora.convo.editMessage.
+
+  Re-writes the sender's own message record at the SAME rkey with new text
+  (and optional facets) plus an editedAt stamp. kotobase stores a record's
+  whole value as one blob per entity, so this reads the existing record
+  first (own-message-lookup) to preserve every field the edit doesn't
+  touch. For e2ee convos the caller is expected to have already
+  re-encrypted client-side and pass the new ciphertext envelope as `text`,
+  exactly like send — the PDS never sees plaintext either way."
+  [client db {:keys [convoId rkey text facets _env] :as input}]
+  (let [sender (require-auth input)]
+    (if (or (nil? sender) (str/blank? (or convoId "")) (str/blank? (or rkey ""))
+            (str/blank? (or text "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, rkey, text, and valid session required"})
+      (-> (own-message-lookup _env sender convoId rkey)
+          (.then (fn [existing]
+                   (if (nil? existing)
+                     {:error "NotFound" :message "no existing message to edit"}
+                     (let [edited-at (now-iso)
+                           value (cond-> (assoc existing :text text :editedAt edited-at)
+                                   (seq facets) (assoc :facets facets))]
+                       (-> (create client db sender "app.aozora.convo.message" value rkey)
+                           (.then (fn [r]
+                                    (assoc r :convoId convoId :rkey rkey :did sender
+                                           :editedAt edited-at))))))))))))
+
+(defn delete-message
+  "POST app.aozora.convo.deleteMessage.
+
+  Tombstones the caller's own message record. Structurally self-sovereign:
+  delete-record can only ever touch a URI under the caller's own repo, so
+  this can never delete someone else's message — passing an rkey the
+  caller never sent is a harmless no-op, not an error. aozora.appview.scan
+  already drops tombstoned entities from every projection, so listMessages/
+  getConvo stop returning it with no further AppView change needed.
+  Reactions/receipts/attachments already attached to this rkey are NOT
+  cascade-deleted — a deliberate, documented scope limit (see the lexicon
+  description), same class of decision as aozora.pds.actor/block's
+  enforcement scope."
+  [client db {:keys [convoId rkey] :as input}]
+  (let [sender (require-auth input)]
+    (if (or (nil? sender) (str/blank? (or rkey "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "rkey and valid session required"})
+      (-> (repo/delete-record client db {:repo sender
+                                         :collection "app.aozora.convo.message"
+                                         :rkey rkey})
+          (.then (fn [r] (assoc r :convoId convoId :did sender)))))))
+
+(def ^:private mailbox-repo
+  "The neutral, non-attributing :repo every app.aozora.convo.sealedMessage
+  record is written under — deliberately NOT the sender's own DID, so
+  :atproto.record/did (aozora.pds.encode/record->entity*'s did-from-uri,
+  what an AppView scan sees as \"who wrote this\") never reveals the real
+  sender. See sendSealed's lexicon description for the full design."
+  "mailbox")
+
+(def ^:private mailbox-id-re
+  "A session mailbox id is base64url-unpadded HMAC-SHA256 output
+  (yoro-ui.interop.signal/mailbox-id) — exactly 43 chars of [A-Za-z0-9_-].
+  Enforcing the shape keeps a client from smuggling a DID (or anything else
+  with `:`/`.`) into the field that is supposed to be opaque."
+  #"^[A-Za-z0-9_-]{43}$")
+
+(defn- sealed-route
+  "Classify a sendSealed input: [:intro] (toDid only), [:mailbox] (mailboxId
+  only), or [:invalid message] (both, neither, or a malformed mailboxId)."
+  [{:keys [convoId toDid mailboxId]}]
+  (let [to? (not (str/blank? (or toDid "")))
+        mb? (not (str/blank? (or mailboxId "")))]
+    (cond
+      (and to? mb?) [:invalid "exactly one of toDid or mailboxId, not both"]
+      (and (not to?) (not mb?)) [:invalid "exactly one of toDid or mailboxId is required"]
+      (and to? (str/blank? (or convoId ""))) [:invalid "convoId is required with toDid"]
+      (and mb? (not (re-matches mailbox-id-re mailboxId))) [:invalid "mailboxId must be a 43-char base64url session mailbox id"]
+      to? [:intro]
+      :else [:mailbox])))
+
+(defn- write-sealed! [client db value rkey]
+  (create client db mailbox-repo "app.aozora.convo.sealedMessage" value rkey))
+
+(defn- send-sealed-intro
+  [client db {:keys [convoId toDid ciphertext createdAt _env]} sender]
+  (let [rkey (str "sealed-" (unique-rkey))
+        value {:convoId convoId
+               :toDid toDid
+               :ciphertext ciphertext
+               :rkey rkey
+               :createdAt (or createdAt (now-iso))}]
+    (-> (actor-blocked? _env toDid sender)
+        (.then (fn [blocked?]
+                 (if blocked?
+                   {:error "Blocked" :message "this actor is not accepting messages from you"}
+                   (-> (write-sealed! client db value rkey)
+                       (.then (fn [r]
+                                (push/notify-sealed-message! _env {:convo-id convoId :to-did toDid})
+                                (assoc r :convoId convoId))))))))))
+
+(defn- send-sealed-mailbox
+  [client db {:keys [mailboxId ciphertext createdAt]}]
+  (let [rkey (str "sealed-" (unique-rkey))
+        value {:mailboxId mailboxId
+               :ciphertext ciphertext
+               :rkey rkey
+               :createdAt (or createdAt (now-iso))}]
+    (-> (write-sealed! client db value rkey)
+        (.then (fn [r] (assoc r :mailboxId mailboxId))))))
+
+(defn send-sealed-message
+  "POST app.aozora.convo.sendSealed.
+
+  Persists one sender-metadata-sealed message under `mailbox-repo`. The
+  caller's identity is checked (require-auth) but never stored —
+  authentication and attribution are deliberately separate. Exactly one
+  route (sealed-route; both/neither is InvalidRequest):
+
+  - intro (`toDid` + `convoId`): the session-establishing message, which the
+    recipient must be able to find by DID before it has a session. Stored
+    WITH toDid and convoId — the recipient is visible for this one record,
+    the same scope as before ADR-2610081200 R1. Block-checked against toDid
+    and pushed to toDid (aozora.pds.push/notify-sealed-message!).
+  - mailbox (`mailboxId`): every later message in an established session.
+    Stored with ONLY {mailboxId ciphertext rkey createdAt} — no toDid, no
+    convoId (a convoId would link back to the convo's public member list;
+    the client seals it inside the ciphertext instead; one sent here is
+    dropped, not stored), no senderDid. The server cannot know the
+    recipient, so it can neither block-check nor push this route: blocks
+    are only enforced at the intro (an established session predates any
+    later block — the recipient's client must drop it), and the recipient
+    learns of new mailbox messages by polling listSealedMessages.
+
+  rkeys on both routes are `sealed-<ms>-<random hex>` (unique-rkey), so
+  neither the recipient DID nor the mailbox id appears in the record URI."
+  [client db {:keys [ciphertext] :as input}]
+  (let [sender (require-auth input)
+        [route msg] (sealed-route input)]
+    (cond
+      (or (nil? sender) (str/blank? (or ciphertext "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "ciphertext and valid session required"})
+
+      (= route :invalid)
+      (js/Promise.resolve {:error "InvalidRequest" :message msg})
+
+      (= route :intro)
+      (send-sealed-intro client db input sender)
+
+      :else
+      (send-sealed-mailbox client db input))))
+
+(defn mark-read
+  "POST app.aozora.convo.markRead.
+
+  Stores a deterministic read-receipt record for the viewer/convo pair."
+  [client db {:keys [convoId lastSeenRkey seenAt] :as input}]
+  (let [did (require-auth input)
+        rkey (str "read-" convoId "-" did)
+        value {:convoId convoId
+               :did did
+               :lastSeenRkey lastSeenRkey
+               :seenAt (or seenAt (now-iso))}]
+    (if (or (nil? did) (str/blank? (or convoId "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId and valid session required"})
+      (-> (create client db did "app.aozora.convo.readReceipt" value rkey)
+          (.then (fn [r] (assoc r :convoId convoId :did did)))))))
+
+(defn set-typing
+  "POST app.aozora.convo.setTyping.
+
+  Ephemeral typing-presence heartbeat: a deterministic rkey per (caller,
+  convoId) means each isTyping=true call OVERWRITES the same record rather
+  than accumulating — aozora.appview.convo/list-typing treats any record
+  older than a few seconds as stale, so there's no separate cleanup job.
+  isTyping=false deletes the record immediately (belt-and-suspenders — the
+  frontend best-effort calls this when the composer clears, so peers stop
+  seeing the indicator right away instead of waiting out the staleness
+  window)."
+  [client db {:keys [convoId isTyping] :as input}]
+  (let [did (require-auth input)
+        rkey (str "typing-" convoId "-" did)]
+    (if (or (nil? did) (str/blank? (or convoId "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId and valid session required"})
+      (if (false? isTyping)
+        (-> (repo/delete-record client db {:repo did :collection "app.aozora.convo.typing" :rkey rkey})
+            (.then (fn [r] (assoc r :convoId convoId :did did))))
+        (-> (create client db did "app.aozora.convo.typing" {:convoId convoId :did did :updatedAt (now-iso)} rkey)
+            (.then (fn [r] (assoc r :convoId convoId :did did))))))))
+
+(defn add-member
+  [client db {:keys [convoId did role joinedAt _env] :as input}]
+  (let [owner (require-auth input)
+        member-did (or (non-blank did) owner)
+        rkey (str "member-" convoId "-" member-did)
+        value {:convoId convoId
+               :did member-did
+               :role (or role "member")
+               :joinedAt (or joinedAt (now-iso))}]
+    (if (or (nil? owner) (str/blank? (or convoId "")) (str/blank? (or member-did "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, did, and valid session required"})
+      (-> (require-creator _env owner convoId)
+          (.then (fn [result]
+                   (if (map? result)
+                     result
+                     (-> (create client db owner "app.aozora.convo.member" value rkey)
+                         (.then (fn [r] (assoc r :convoId convoId :did member-did)))))))))))
+
+(defn- do-remove-member [client db owner convoId member-did rkey]
+  (-> (repo/delete-record client db {:repo owner
+                                     :collection "app.aozora.convo.member"
+                                     :rkey rkey})
+      (.then (fn [r] (assoc r :convoId convoId :did member-did)))))
+
+(defn remove-member
+  "Leaving a group yourself (member-did == owner) never needs the creator
+  check — removing your OWN membership can't be a privilege-escalation risk,
+  and gating it the same as removing someone ELSE would make a future
+  self-serve \"leave group\" UI impossible to implement correctly."
+  [client db {:keys [convoId did _env] :as input}]
+  (let [owner (require-auth input)
+        member-did (or (non-blank did) owner)
+        rkey (str "member-" convoId "-" member-did)]
+    (cond
+      (or (nil? owner) (str/blank? (or convoId "")) (str/blank? (or member-did "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, did, and valid session required"})
+
+      (= owner member-did)
+      (do-remove-member client db owner convoId member-did rkey)
+
+      :else
+      (-> (require-creator _env owner convoId)
+          (.then (fn [result]
+                   (if (map? result)
+                     result
+                     (do-remove-member client db owner convoId member-did rkey))))))))
+
+(defn add-reaction
+  [client db {:keys [convoId messageRkey emoji createdAt] :as input}]
+  (let [did (require-auth input)
+        rkey (str "reaction-" convoId "-" messageRkey "-" did)
+        value {:convoId convoId
+               :messageRkey messageRkey
+               :did did
+               :emoji (or emoji "👍")
+               :createdAt (or createdAt (now-iso))}]
+    (if (or (nil? did) (str/blank? (or convoId "")) (str/blank? (or messageRkey "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, messageRkey, and valid session required"})
+      (-> (create client db did "app.aozora.convo.reaction" value rkey)
+          (.then (fn [r] (assoc r :convoId convoId :did did)))))))
+
+(defn add-attachment
+  [client db {:keys [convoId messageRkey uri cid contentType createdAt] :as input}]
+  (let [did (require-auth input)
+        rkey (str "attachment-" convoId "-" messageRkey "-" did)
+        value {:convoId convoId
+               :messageRkey messageRkey
+               :did did
+               :uri uri
+               :cid cid
+               :contentType contentType
+               :createdAt (or createdAt (now-iso))}]
+    (if (or (nil? did) (str/blank? (or convoId "")) (str/blank? (or messageRkey "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, messageRkey, and valid session required"})
+      (-> (create client db did "app.aozora.convo.attachment" value rkey)
+          (.then (fn [r] (assoc r :convoId convoId :did did)))))))
+
+(defn send-key-distribution
+  "POST app.aozora.convo.distributeSenderKey.
+
+  Delivers a group sender-key distribution to one member, over an existing
+  1:1 Signal session (`text` is that session's ciphertext envelope — this
+  handler never sees plaintext key material). Deterministic rkey per
+  (convoId, toDid, sender) — a re-send (e.g. after a rotation, or a retry)
+  overwrites rather than accumulating; the caller distinguishes rotations by
+  the iteration number carried INSIDE the encrypted payload, not by rkey."
+  [client db {:keys [convoId toDid text contentType encryption createdAt] :as input}]
+  (let [did (require-auth input)
+        rkey (str "keydist-" convoId "-" toDid "-" did)
+        value (cond-> {:convoId convoId
+                       :toDid toDid
+                       :fromDid did
+                       :text text
+                       :createdAt (or createdAt (now-iso))}
+                (non-blank contentType) (assoc :contentType contentType)
+                (non-blank encryption) (assoc :encryption encryption))]
+    (if (or (nil? did) (str/blank? (or convoId "")) (str/blank? (or toDid "")) (str/blank? (or text "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId, toDid, text, and valid session required"})
+      (-> (create client db did "app.aozora.convo.keyDistribution" value rkey)
+          (.then (fn [r] (assoc r :convoId convoId :toDid toDid :did did)))))))
+
+(defn- merged-preference-value
+  "Partial-update semantics (setConvoPreference lexicon): only keys PRESENT
+  in `input` override `existing`; an omitted field keeps whatever was there
+  before (muting doesn't reset a previously-set pin)."
+  [did convo-id existing {:keys [muted archived pinned]}]
+  (cond-> {:did did :convoId convo-id
+          :muted (if (some? muted) muted (boolean (:muted existing)))
+          :archived (if (some? archived) archived (boolean (:archived existing)))
+          :pinned (if (some? pinned) pinned (boolean (:pinned existing)))}
+    true (assoc :updatedAt (now-iso))))
+
+(defn- existing-preference [env convo-id did]
+  (if (nil? env)
+    (js/Promise.resolve nil)
+    (let [[appview-client appview-db] (per-actor/appview-client-db env)]
+      (-> (appview-convo/get-convo-preference appview-client appview-db convo-id did)
+          (.catch (fn [_] nil))))))
+
+(defn set-convo-preference
+  "POST app.aozora.convo.setConvoPreference.
+
+  Reads the caller's OWN current preference for convoId first (partial
+  update — see merged-preference-value), then overwrites the deterministic
+  (did, convoId)-keyed record with the merged result."
+  [client db {:keys [convoId muted archived pinned _env] :as input}]
+  (let [did (require-auth input)
+        rkey convoId]
+    (if (or (nil? did) (str/blank? (or convoId "")))
+      (js/Promise.resolve {:error "InvalidRequest"
+                           :message "convoId and valid session required"})
+      (-> (existing-preference _env convoId did)
+          (.then (fn [existing]
+                   (let [value (merged-preference-value did convoId existing
+                                                         {:muted muted :archived archived :pinned pinned})]
+                     (-> (create client db did "app.aozora.convo.convoPreference" value rkey)
+                         (.then (fn [r] (merge r value)))))))))))

@@ -1,0 +1,443 @@
+(ns aozora.appview.convo-test
+  "Backend read-projection tests for aozora.appview.convo. There was NO
+  coverage here before this fix (the messenger coverage audit flagged the
+  whole AppView read layer as untested) — these specifically pin down two
+  bugs found while fixing the group-membership access-control hole:
+
+  1. related-items checked :convoId on RAW scan rows (which don't have that
+     key — it's inside :value), so get-convo's receipts/reactions/
+     attachments/members were ALWAYS [] regardless of what was stored.
+  2. member-records trusted ANY app.aozora.convo.member record regardless of
+     who wrote it, so a stranger could self-write a membership claim under
+     their own repo and have it counted as real."
+  (:require [cljs.test :refer-macros [deftest is async]]
+            [kotoba.lang.text :as str]
+            [kotobase.client :as kc]
+            [aozora.appview.convo :as convo]))
+
+(def db-name "yoro-social")
+
+(defn- edn-str
+  "EDN string-literal encoding of a JSON string, matching how kotobase
+  actually stores :atproto.record/json (a JSON string wrapped as an EDN
+  string value — see router_test.cljc's prekey-bundle fixture for the
+  established hand-rolled-fixture pattern this mirrors)."
+  [s]
+  (str "\"" (str/replace s "\"" "\\\"") "\""))
+
+(defn- record-datoms
+  "Datoms for one generic :atproto.record/* entity: `author-did` is who
+  actually signed the write (aozora.pds.encode/record->entity*'s
+  did-from-uri), `value` is the record's own JSON payload. :uri is REQUIRED
+  — aozora.appview.scan/scan only classifies an entity as a generic record
+  at all (contains? attrs \":atproto.record/uri\") when it has one."
+  [entity-id collection author-did value]
+  [#js {:e entity-id :a ":atproto.record/uri"
+       :v_edn (edn-str (str "at://" author-did "/" collection "/" entity-id)) :added true}
+   #js {:e entity-id :a ":atproto.record/collection" :v_edn (edn-str collection) :added true}
+   #js {:e entity-id :a ":atproto.record/did" :v_edn (edn-str author-did) :added true}
+   #js {:e entity-id :a ":atproto.record/json" :v_edn (edn-str (js/JSON.stringify (clj->js value))) :added true}])
+
+(defn- stub-datoms [entities-datoms]
+  (let [all (into-array (apply concat entities-datoms))]
+    (fn ([_ _ _] (js/Promise.resolve #js {:datoms all}))
+        ([_ _ _ _] (js/Promise.resolve #js {:datoms all})))))
+
+(defn- with-datoms [entities-datoms f]
+  (let [orig kc/datoms]
+    (set! kc/datoms (stub-datoms entities-datoms))
+    (-> (f) (.finally (fn [] (set! kc/datoms orig))))))
+
+(deftest get-convo-includes-members-authored-by-creator
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "group" :creatorDid "did:web:alice"})
+       (record-datoms "m1" "app.aozora.convo.member" "did:web:alice"
+                       {:convoId "convo-1" :did "did:web:bob" :role "member" :joinedAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1"})
+           (.then (fn [{:keys [convo]}]
+                    (is (= 1 (count (:members convo))))
+                    (is (= "did:web:bob" (:did (first (:members convo)))))
+                    (done)))))))
+
+(deftest get-convo-excludes-members-authored-by-a-stranger
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "group" :creatorDid "did:web:alice"})
+       ;; "did:web:mallory" writes this under HER OWN repo, claiming
+       ;; herself as a member — she is not the creator, so it must not count.
+       (record-datoms "m1" "app.aozora.convo.member" "did:web:mallory"
+                       {:convoId "convo-1" :did "did:web:mallory" :role "admin" :joinedAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1"})
+           (.then (fn [{:keys [convo]}]
+                    (is (empty? (:members convo)) "an unauthorized self-asserted membership claim is ignored")
+                    (done)))))))
+
+(deftest get-convo-includes-receipts-reactions-attachments
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+       (record-datoms "r1" "app.aozora.convo.readReceipt" "did:web:bob"
+                       {:convoId "convo-1" :did "did:web:bob" :lastSeenRkey "m1" :seenAt "2026-07-01T00:00:00Z"})
+       (record-datoms "rx1" "app.aozora.convo.reaction" "did:web:bob"
+                       {:convoId "convo-1" :messageRkey "m1" :did "did:web:bob" :emoji "👍" :createdAt "2026-07-01T00:00:00Z"})
+       (record-datoms "a1" "app.aozora.convo.attachment" "did:web:alice"
+                       {:convoId "convo-1" :messageRkey "m1" :did "did:web:alice" :uri "at://x" :cid "bafy" :contentType "image/png" :createdAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1"})
+           (.then (fn [{:keys [convo]}]
+                    (is (= 1 (count (:receipts convo))))
+                    (is (= 1 (count (:reactions convo))))
+                    (is (= 1 (count (:attachments convo))))
+                    (done)))))))
+
+(defn- five-messages []
+  (for [n (range 1 6)]
+    (record-datoms (str "m" n) "app.aozora.convo.message" "did:web:alice"
+                    {:convoId "convo-1" :rkey (str "m" n) :senderDid "did:web:alice"
+                     :text (str "msg " n) :createdAt (str "2026-07-0" n "T00:00:00Z")})))
+
+(deftest get-convo-defaults-to-the-newest-page-oldest-first-within-it
+  (async done
+    (with-datoms
+      (cons (record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                            {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+            (five-messages))
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1" :limit 2})
+           (.then (fn [{:keys [messages cursor hasMore]}]
+                    (is (= ["m4" "m5"] (map :rkey messages))
+                        "newest 2, oldest-first within the page")
+                    (is (= "m4" cursor))
+                    (is (true? hasMore))
+                    (done)))))))
+
+(deftest get-convo-before-cursor-fetches-the-next-older-page
+  (async done
+    (with-datoms
+      (cons (record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                            {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+            (five-messages))
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1" :limit 2 :before "m4"})
+           (.then (fn [{:keys [messages cursor hasMore]}]
+                    (is (= ["m2" "m3"] (map :rkey messages)))
+                    (is (= "m2" cursor))
+                    (is (true? hasMore))
+                    (done)))))))
+
+(deftest get-convo-last-page-has-no-cursor-and-hasMore-false
+  (async done
+    (with-datoms
+      (cons (record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                            {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+            (five-messages))
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1" :limit 2 :before "m2"})
+           (.then (fn [{:keys [messages cursor hasMore]}]
+                    (is (= ["m1"] (map :rkey messages)))
+                    (is (nil? cursor))
+                    (is (false? hasMore))
+                    (done)))))))
+
+(deftest get-convo-lastMessageAt-reflects-the-true-latest-regardless-of-paging
+  (async done
+    (with-datoms
+      (cons (record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                            {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+            (five-messages))
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1" :limit 2 :before "m4"})
+           (.then (fn [{:keys [convo]}]
+                    (is (= "msg 5" (get-in convo [:lastMessage :text]))
+                        "the convo's own lastMessage is always the true newest, even when the messages PAGE returned is older")
+                    (done)))))))
+
+(deftest list-messages-supports-the-same-before-cursor-pagination
+  (async done
+    (with-datoms (five-messages)
+      #(-> (convo/list-messages nil db-name {:convoId "convo-1" :limit 2 :before "m4"})
+           (.then (fn [{:keys [messages cursor hasMore]}]
+                    (is (= ["m2" "m3"] (map :rkey messages)))
+                    (is (= "m2" cursor))
+                    (is (true? hasMore))
+                    (done)))))))
+
+(deftest get-convo-does-not-leak-other-convos-items
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+       (record-datoms "c2" "app.aozora.convo.convo" "did:web:carol"
+                       {:convoId "convo-2" :kind "dm" :creatorDid "did:web:carol"})
+       (record-datoms "m2" "app.aozora.convo.member" "did:web:carol"
+                       {:convoId "convo-2" :did "did:web:dave" :role "member" :joinedAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/get-convo nil db-name {:convoId "convo-1"})
+           (.then (fn [{:keys [convo]}]
+                    (is (empty? (:members convo)) "convo-2's member doesn't leak into convo-1")
+                    (done)))))))
+
+(deftest creator-did-resolves-the-convo-creator
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})]
+      #(-> (convo/creator-did nil db-name "convo-1")
+           (.then (fn [creator] (is (= "did:web:alice" creator)) (done)))))))
+
+(deftest get-convo-record-returns-the-full-stored-value
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "group" :creatorDid "did:web:alice" :title "Book Club"})]
+      #(-> (convo/get-convo-record nil db-name "convo-1")
+           (.then (fn [record]
+                    (is (= "Book Club" (:title record)))
+                    (is (= "group" (:kind record)))
+                    (done)))))))
+
+(deftest get-convo-record-nil-for-unknown-convo
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})]
+      #(-> (convo/get-convo-record nil db-name "does-not-exist")
+           (.then (fn [record] (is (nil? record)) (done)))))))
+
+(deftest get-own-message-finds-callers-own-record
+  (async done
+    (with-datoms
+      [(record-datoms "m1" "app.aozora.convo.message" "did:web:alice"
+                       {:convoId "convo-1" :rkey "m1" :senderDid "did:web:alice" :text "hi"})]
+      #(-> (convo/get-own-message nil db-name "did:web:alice" "convo-1" "m1")
+           (.then (fn [found] (is (= "hi" (:text found))) (done)))))))
+
+(deftest get-own-message-ignores-a-strangers-record-under-their-own-repo
+  (async done
+    (with-datoms
+      ;; mallory writes an app.aozora.convo.message record under HER OWN
+      ;; repo with the same convoId/rkey but claiming :senderDid alice —
+      ;; get-own-message is keyed by the caller's TRUE authorship (raw scan
+      ;; row :did), so it must not find this when asked for alice's message.
+      [(record-datoms "m1" "app.aozora.convo.message" "did:web:mallory"
+                       {:convoId "convo-1" :rkey "m1" :senderDid "did:web:alice" :text "forged"})]
+      #(-> (convo/get-own-message nil db-name "did:web:alice" "convo-1" "m1")
+           (.then (fn [found] (is (nil? found)) (done)))))))
+
+(deftest get-own-message-nil-for-unknown-rkey
+  (async done
+    (with-datoms
+      [(record-datoms "m1" "app.aozora.convo.message" "did:web:alice"
+                       {:convoId "convo-1" :rkey "m1" :senderDid "did:web:alice" :text "hi"})]
+      #(-> (convo/get-own-message nil db-name "did:web:alice" "convo-1" "does-not-exist")
+           (.then (fn [found] (is (nil? found)) (done)))))))
+
+(deftest creator-did-nil-for-unknown-convo
+  (async done
+    (with-datoms []
+      #(-> (convo/creator-did nil db-name "convo-missing")
+           (.then (fn [creator] (is (nil? creator)) (done)))))))
+
+(deftest list-sealed-messages-returns-messages-addressed-to-to-did
+  (async done
+    (with-datoms
+      [(record-datoms "s1" "app.aozora.convo.sealedMessage" "mailbox"
+                       {:convoId "convo-1" :toDid "did:web:bob" :ciphertext "opaque1" :createdAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/list-sealed-messages nil db-name {:toDid "did:web:bob"})
+           (.then (fn [{:keys [messages]}]
+                    (is (= 1 (count messages)))
+                    (is (= "opaque1" (:ciphertext (first messages))))
+                    (done)))))))
+
+(deftest list-sealed-messages-excludes-messages-addressed-to-someone-else
+  (async done
+    (with-datoms
+      [(record-datoms "s1" "app.aozora.convo.sealedMessage" "mailbox"
+                       {:convoId "convo-1" :toDid "did:web:carol" :ciphertext "not-for-bob" :createdAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/list-sealed-messages nil db-name {:toDid "did:web:bob"})
+           (.then (fn [{:keys [messages]}]
+                    (is (empty? messages) "a message addressed to carol must not show up in bob's list")
+                    (done)))))))
+
+(deftest list-sealed-messages-requires-to-did
+  (async done
+    (with-datoms
+      [(record-datoms "s1" "app.aozora.convo.sealedMessage" "mailbox"
+                       {:convoId "convo-1" :toDid "did:web:bob" :ciphertext "opaque1" :createdAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/list-sealed-messages nil db-name {:convoId "convo-1"})
+           (.then (fn [{:keys [messages]}]
+                    (is (empty? messages) "no toDid means no results, not every sealed message ever sent")
+                    (done)))))))
+
+(deftest list-sealed-messages-record-values-never-carry-sender-did
+  (async done
+    (with-datoms
+      [(record-datoms "s1" "app.aozora.convo.sealedMessage" "mailbox"
+                       {:convoId "convo-1" :toDid "did:web:bob" :ciphertext "opaque1" :createdAt "2026-07-01T00:00:00Z"})]
+      #(-> (convo/list-sealed-messages nil db-name {:toDid "did:web:bob"})
+           (.then (fn [{:keys [messages]}]
+                    (is (not (contains? (first messages) :senderDid))
+                        "the projection has no senderDid key to leak in the first place")
+                    (done)))))))
+
+;; ── mailbox route (ADR-2610081200 R1) ─────────────────────────────────────
+
+(def ^:private mb-bob "bobMailboxIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+(def ^:private mb-alice "aliceMailboxIdAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+
+(def ^:private mixed-sealed-datoms
+  [(record-datoms "s1" "app.aozora.convo.sealedMessage" "mailbox"
+                  {:convoId "convo-1" :toDid "did:web:bob" :ciphertext "intro" :createdAt "2026-07-01T00:00:00Z"})
+   (record-datoms "s2" "app.aozora.convo.sealedMessage" "mailbox"
+                  {:mailboxId mb-bob :ciphertext "mb-to-bob" :createdAt "2026-07-01T00:01:00Z"})
+   (record-datoms "s3" "app.aozora.convo.sealedMessage" "mailbox"
+                  {:mailboxId mb-alice :ciphertext "mb-to-alice" :createdAt "2026-07-01T00:02:00Z"})])
+
+(deftest list-sealed-messages-by-mailbox-ids-returns-mailbox-id-not-to-did
+  (async done
+    (with-datoms
+      mixed-sealed-datoms
+      #(-> (convo/list-sealed-messages nil db-name {:mailboxIds [mb-bob]})
+           (.then (fn [{:keys [messages]}]
+                    (is (= ["mb-to-bob"] (mapv :ciphertext messages))
+                        "only the record in the requested mailbox, not the intro or the other direction")
+                    (is (= mb-bob (:mailboxId (first messages))))
+                    (is (not (contains? (first messages) :toDid)) "a mailbox row has no toDid to return")
+                    (is (not (contains? (first messages) :convoId)) "nor a convoId")
+                    (done)))))))
+
+(deftest list-sealed-messages-accepts-comma-joined-mailbox-ids
+  (async done
+    (with-datoms
+      mixed-sealed-datoms
+      #(-> (convo/list-sealed-messages nil db-name {:mailboxIds (str mb-bob "," mb-alice)})
+           (.then (fn [{:keys [messages]}]
+                    (is (= ["mb-to-bob" "mb-to-alice"] (mapv :ciphertext messages))
+                        "a GET query string carries several ids comma-joined in one parameter")
+                    (done)))))))
+
+(deftest list-sealed-messages-by-to-did-excludes-mailbox-records
+  (async done
+    (with-datoms
+      mixed-sealed-datoms
+      #(-> (convo/list-sealed-messages nil db-name {:toDid "did:web:bob"})
+           (.then (fn [{:keys [messages]}]
+                    (is (= ["intro"] (mapv :ciphertext messages))
+                        "toDid finds only intro-route records; mailbox records are not addressable by DID")
+                    (done)))))))
+
+(deftest list-sealed-messages-unknown-or-empty-mailbox-ids-return-nothing
+  (async done
+    (with-datoms
+      mixed-sealed-datoms
+      #(-> (js/Promise.all
+            #js [(convo/list-sealed-messages nil db-name {:mailboxIds ["nobodyMailboxIdAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]})
+                 (convo/list-sealed-messages nil db-name {:mailboxIds []})
+                 (convo/list-sealed-messages nil db-name {:mailboxIds ""})])
+           (.then (fn [^js rs]
+                    (is (every? (fn [r] (empty? (:messages r))) (array-seq rs))
+                        "an unknown id, or no ids at all, never falls back to listing every mailbox")
+                    (done)))))))
+
+(deftest list-convos-includes-callers-own-preference
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+       (record-datoms "p1" "app.aozora.convo.convoPreference" "did:web:alice"
+                       {:convoId "convo-1" :did "did:web:alice" :muted true :archived false :pinned false})]
+      #(-> (convo/list-convos nil db-name {:did "did:web:alice"})
+           (.then (fn [{:keys [convos]}]
+                    (is (true? (:muted (first convos))))
+                    (is (false? (:pinned (first convos))))
+                    (done)))))))
+
+(deftest list-convos-does-not-leak-someone-elses-preference
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})
+       ;; bob pinned convo-1 for HIMSELF — alice's own view of it must not
+       ;; show as pinned just because bob (a different member) pinned it.
+       (record-datoms "p1" "app.aozora.convo.convoPreference" "did:web:bob"
+                       {:convoId "convo-1" :did "did:web:bob" :muted false :archived false :pinned true})]
+      #(-> (convo/list-convos nil db-name {:did "did:web:alice"})
+           (.then (fn [{:keys [convos]}]
+                    (is (false? (:pinned (first convos))))
+                    (done)))))))
+
+(deftest list-convos-defaults-to-unset-preference-when-none-exists
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})]
+      #(-> (convo/list-convos nil db-name {:did "did:web:alice"})
+           (.then (fn [{:keys [convos]}]
+                    (is (false? (:muted (first convos))))
+                    (is (false? (:archived (first convos))))
+                    (is (false? (:pinned (first convos))))
+                    (done)))))))
+
+(deftest list-convos-sorts-pinned-first
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice" :lastMessageAt "2026-07-05T00:00:00Z"})
+       (record-datoms "c2" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-2" :kind "dm" :creatorDid "did:web:alice" :lastMessageAt "2026-07-06T00:00:00Z"})
+       (record-datoms "p1" "app.aozora.convo.convoPreference" "did:web:alice"
+                       {:convoId "convo-1" :did "did:web:alice" :muted false :archived false :pinned true})]
+      #(-> (convo/list-convos nil db-name {:did "did:web:alice"})
+           (.then (fn [{:keys [convos]}]
+                    (is (= "convo-1" (:convoId (first convos)))
+                        "convo-1 is older but pinned, so it sorts ahead of the newer, unpinned convo-2")
+                    (done)))))))
+
+(deftest get-convo-preference-returns-nil-when-unset
+  (async done
+    (with-datoms
+      [(record-datoms "c1" "app.aozora.convo.convo" "did:web:alice"
+                       {:convoId "convo-1" :kind "dm" :creatorDid "did:web:alice"})]
+      #(-> (convo/get-convo-preference nil db-name "convo-1" "did:web:alice")
+           (.then (fn [p] (is (nil? p)) (done)))))))
+
+(deftest get-convo-preference-returns-the-callers-own-record
+  (async done
+    (with-datoms
+      [(record-datoms "p1" "app.aozora.convo.convoPreference" "did:web:alice"
+                       {:convoId "convo-1" :did "did:web:alice" :muted true :archived false :pinned false})]
+      #(-> (convo/get-convo-preference nil db-name "convo-1" "did:web:alice")
+           (.then (fn [p] (is (true? (:muted p))) (done)))))))
+
+(deftest list-typing-includes-a-fresh-heartbeat-from-another-member
+  (async done
+    (with-datoms
+      [(record-datoms "t1" "app.aozora.convo.typing" "did:web:bob"
+                       {:convoId "convo-1" :did "did:web:bob" :updatedAt (.toISOString (js/Date.))})]
+      #(-> (convo/list-typing nil db-name {:convoId "convo-1" :did "did:web:alice"})
+           (.then (fn [{:keys [typing]}]
+                    (is (= 1 (count typing)))
+                    (is (= "did:web:bob" (:did (first typing))))
+                    (done)))))))
+
+(deftest list-typing-excludes-a-stale-heartbeat
+  (async done
+    (with-datoms
+      [(record-datoms "t1" "app.aozora.convo.typing" "did:web:bob"
+                       {:convoId "convo-1" :did "did:web:bob" :updatedAt "2000-01-01T00:00:00.000Z"})]
+      #(-> (convo/list-typing nil db-name {:convoId "convo-1" :did "did:web:alice"})
+           (.then (fn [{:keys [typing]}] (is (empty? typing)) (done)))))))
+
+(deftest list-typing-excludes-the-callers-own-heartbeat
+  (async done
+    (with-datoms
+      [(record-datoms "t1" "app.aozora.convo.typing" "did:web:alice"
+                       {:convoId "convo-1" :did "did:web:alice" :updatedAt (.toISOString (js/Date.))})]
+      #(-> (convo/list-typing nil db-name {:convoId "convo-1" :did "did:web:alice"})
+           (.then (fn [{:keys [typing]}] (is (empty? typing) "you never see your own heartbeat in the results") (done)))))))
+
+(deftest list-typing-excludes-a-different-convos-heartbeat
+  (async done
+    (with-datoms
+      [(record-datoms "t1" "app.aozora.convo.typing" "did:web:bob"
+                       {:convoId "convo-2" :did "did:web:bob" :updatedAt (.toISOString (js/Date.))})]
+      #(-> (convo/list-typing nil db-name {:convoId "convo-1" :did "did:web:alice"})
+           (.then (fn [{:keys [typing]}] (is (empty? typing)) (done)))))))

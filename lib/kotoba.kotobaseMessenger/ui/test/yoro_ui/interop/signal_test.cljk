@@ -1,0 +1,367 @@
+(ns yoro-ui.interop.signal-test
+  "Full crypto round trip for yoro-ui.interop.signal, with no real network —
+  ak/seed, at/at-procedure, at/at-appview-query are stubbed the same way
+  post_thread_test.cljc stubs at/at-appview-or-public: cljs allows set! on
+  any qualified var, restore once the whole async chain settles (not with
+  with-redefs, which unwinds before the .then chain resolves)."
+  (:require [cljs.test :refer-macros [deftest is async]]
+            [kotoba.lang.text :as str]
+            [yoro-ui.interop.signal :as signal]
+            [yoro-ui.interop.actor-key :as ak]
+            [yoro-ui.interop.atproto :as at]
+            [kotobase.cid :as cid]
+            [kotobase.cacao :as cacao]
+            ["@noble/curves/ed25519.js" :refer [ed25519]]))
+
+;; Node's built-in Web Storage global only activates with a --localstorage-file
+;; flag this project's `pnpm test` doesn't pass (silently a no-op otherwise —
+;; every yoro-ui.interop.signal storage read/write becomes a nil/no-op, which
+;; surfaces here as "no local identity" rather than a loud error). Install a
+;; hermetic in-memory stand-in so the round trip doesn't depend on Node flags.
+(when-not (and (exists? js/localStorage) (fn? (.-setItem js/localStorage)))
+  (let [store (js/Map.)]
+    (set! js/localStorage
+          #js {:getItem (fn [k] (if (.has store k) (.get store k) nil))
+               :setItem (fn [k v] (.set store k v) nil)
+               :removeItem (fn [k] (.delete store k) nil)})))
+
+(defn- cacao-b64u [b] (cacao/bytes->base64url b))
+
+(defn- rand-seed [] (doto (js/Uint8Array. 32) (js/crypto.getRandomValues)))
+
+(defn- make-party []
+  (let [seed (rand-seed)]
+    {:seed seed :did (cid/did-key-from-ed25519-pub (.getPublicKey ed25519 seed))}))
+
+;; A fake single-record PDS/AppView: registerPrekeys writes into `bundles`,
+;; getPrekeyBundle reads from it. `current-seed` stands in for "whichever
+;; party's browser is currently calling" — ensure-identity!/encrypt-message
+;; read ak/seed synchronously at call time, so swapping it between calls
+;; (not mid-promise-chain) correctly simulates two separate devices sharing
+;; one node process.
+(defn- install-fakes!
+  "at-procedure/at-appview-query are multi-arity (nsid) / (nsid body|params) in
+  atproto.cljc — cljs compiles call sites against that arity shape, so the
+  stub must also be a multi-arity `fn` (the `([args] body)` clause form) or
+  the compiled arity-2 dispatch on the replaced var throws
+  \"...cljs$core$IFn$_invoke$arity$2 is not a function\". `mailbox` (default
+  a fresh atom) holds app.aozora.convo.sendSealed writes, keyed by :toDid
+  (intro route) or :mailboxId (mailbox route), each entry a vector of the
+  posted body + :rkey/:createdAt — same shape aozora.appview.convo/
+  list-sealed-messages would project. `sent` (optional atom) records every
+  sendSealed body in order."
+  ([current-seed bundles] (install-fakes! current-seed bundles (atom {})))
+  ([current-seed bundles mailbox] (install-fakes! current-seed bundles mailbox (atom [])))
+  ([current-seed bundles mailbox sent]
+   (set! ak/seed (fn [] @current-seed))
+   (set! at/at-procedure
+         (fn
+           ([nsid] (at/at-procedure nsid {}))
+           ([nsid body]
+            (cond
+              (= nsid "app.aozora.convo.registerPrekeys")
+              (let [did (cid/did-key-from-ed25519-pub (.getPublicKey ed25519 @current-seed))]
+                (swap! bundles assoc did body)
+                (js/Promise.resolve {:did did :uri "at://x/y/self" :cid "bafyx" :rkey "self"}))
+
+              (= nsid "app.aozora.convo.sendSealed")
+              (let [rkey (str "sealed-" (random-uuid))]
+                (swap! sent conj body)
+                (swap! mailbox update (or (:toDid body) (:mailboxId body)) (fnil conj [])
+                       (assoc body :rkey rkey :createdAt (or (:createdAt body) (.toISOString (js/Date.)))))
+                (js/Promise.resolve {:rkey rkey :uri (str "at://mailbox/app.aozora.convo.sealedMessage/" rkey) :cid "bafyx"}))
+
+              :else
+              (js/Promise.reject (js/Error. (str "unexpected procedure " nsid)))))))
+   (set! at/at-appview-query
+         (fn
+           ([nsid] (at/at-appview-query nsid {}))
+           ([nsid params]
+            (cond
+              (= nsid "app.aozora.convo.getPrekeyBundle")
+              (js/Promise.resolve (if-let [b (get @bundles (:did params))]
+                                    (assoc b :found true)
+                                    {:found false}))
+
+              (= nsid "app.aozora.convo.listSealedMessages")
+              (js/Promise.resolve
+               {:messages (if-let [mids (:mailboxIds params)]
+                            (vec (mapcat #(get @mailbox % []) (str/split mids #",")))
+                            (->> (get @mailbox (:toDid params) [])
+                                 (filter #(or (nil? (:convoId params)) (= (:convoId params) (:convoId %))))
+                                 vec))})
+
+              :else
+              (js/Promise.reject (js/Error. (str "unexpected query " nsid)))))))))
+
+(defn- restore-fakes! [orig]
+  (set! ak/seed (:seed orig))
+  (set! at/at-procedure (:proc orig))
+  (set! at/at-appview-query (:query orig)))
+
+(deftest round-trip-encrypt-decrypt
+  (async done
+    (let [alice (make-party)
+          bob (make-party)
+          bundles (atom {})
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))]
+      (install-fakes! current-seed bundles)
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (reset! current-seed (:seed bob)) (signal/ensure-identity! (:did bob))))
+          (.then (fn [_] (reset! current-seed (:seed alice))
+                   (signal/encrypt-message (:did alice) (:did bob) "hello bob")))
+          (.then (fn [env1] (-> (signal/decrypt-message (:did bob) (:did alice) env1)
+                                (.then (fn [pt1] [env1 pt1])))))
+          (.then (fn [[env1 pt1]]
+                   (is (= "hello bob" pt1) "first message round-trips through full X3DH session establishment")
+                   (is (some? (:opkId env1))
+                       "bob published a one-time-prekey pool (ensure-identity!'s default), so the
+                        first session-establishing envelope should carry the opk-id alice consumed —
+                        confirms the OPK path (x3dh-initiate's DH4) actually ran, not just X3DH-lite's 3 DHs")
+                   (signal/encrypt-message (:did alice) (:did bob) "msg two")))
+          (.then (fn [env2] (-> (signal/decrypt-message (:did bob) (:did alice) env2)
+                                (.then (fn [pt2] [env2 pt2])))))
+          (.then (fn [[env2 pt2]]
+                   (is (= "msg two" pt2) "second message round-trips on the ratcheted chain")
+                   (is (= 1 (get-in env2 [:header :n])) "chain counter advanced to n=1 for the second message")
+                   (signal/encrypt-message (:did bob) (:did alice) "hi alice")))
+          (.then (fn [env3] (-> (signal/decrypt-message (:did alice) (:did bob) env3)
+                                (.then (fn [pt3] [env3 pt3])))))
+          (.then (fn [[_env3 pt3]]
+                   (is (= "hi alice" pt3) "reply round-trips on the independent B->A chain")
+                   ;; A FRESH message, never seen by Alice: the ratchet is
+                   ;; one-shot, so tampering with an ALREADY-decrypted
+                   ;; envelope and redecrypting would fail for the wrong
+                   ;; reason (stale chain position, not the tamper) — this
+                   ;; needs a message Alice hasn't consumed yet.
+                   (signal/encrypt-message (:did bob) (:did alice) "never seen untampered")))
+          (.then (fn [env4]
+                   ;; tampered ciphertext (correct header, wrong bytes) must
+                   ;; fail closed via the AES-GCM tag, not resolve with
+                   ;; garbage or throw uncaught
+                   (-> (signal/decrypt-message (:did alice) (:did bob) (assoc env4 :ct "AAAAAAAAAAAAAAAA"))
+                       (.then (fn [_] (is false "tampered ciphertext must reject")))
+                       (.catch (fn [_] (is true "tampered ciphertext correctly rejected (GCM tag mismatch)"))))))
+          (.then finish!)
+          (.catch (fn [e]
+                    (is false (str "unexpected rejection in round trip: " e))
+                    (finish!)))))))
+
+(deftest round-trip-degrades-gracefully-without-a-published-opk-pool
+  (async done
+    (let [alice (make-party)
+          bob (make-party)
+          bundles (atom {})
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))]
+      (install-fakes! current-seed bundles)
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (reset! current-seed (:seed bob)) (signal/ensure-identity! (:did bob))))
+          (.then (fn [_]
+                   ;; simulate a legacy/emptied bundle: strip bob's published
+                   ;; OPK pool AFTER ensure-identity! registered it, so
+                   ;; establish-as-initiator sees none to pick from.
+                   (swap! bundles update (:did bob) dissoc :oneTimePreKeys)
+                   (reset! current-seed (:seed alice))
+                   (signal/encrypt-message (:did alice) (:did bob) "no opk needed")))
+          (.then (fn [env1]
+                   (is (nil? (:opkId env1)) "no OPK available -> x3dh-initiate's opk-id is nil (DH4 skipped)")
+                   (signal/decrypt-message (:did bob) (:did alice) env1)))
+          (.then (fn [pt1]
+                   (is (= "no opk needed" pt1)
+                       "X3DH without DH4 still establishes a working session (graceful degradation, not a hard failure)")))
+          (.then finish!)
+          (.catch (fn [e]
+                    (is false (str "unexpected rejection: " e))
+                    (finish!)))))))
+
+(deftest decrypt-rejects-wrong-peer
+  (async done
+    (let [alice (make-party)
+          bob (make-party)
+          mallory (make-party)
+          bundles (atom {})
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))]
+      (install-fakes! current-seed bundles)
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (reset! current-seed (:seed bob)) (signal/ensure-identity! (:did bob))))
+          (.then (fn [_] (reset! current-seed (:seed mallory)) (signal/ensure-identity! (:did mallory))))
+          (.then (fn [_] (reset! current-seed (:seed alice))
+                   (signal/encrypt-message (:did alice) (:did bob) "for bob only")))
+          (.then (fn [env]
+                   ;; Mallory has no session with Alice and isn't the intended
+                   ;; recipient — decrypting as her must not silently succeed.
+                   (-> (signal/decrypt-message (:did mallory) (:did alice) env)
+                       (.then (fn [_] (is false "wrong-peer decrypt must reject")))
+                       (.catch (fn [_] (is true "wrong-peer decrypt correctly rejected"))))))
+          (.then finish!)
+          (.catch (fn [e]
+                    (is false (str "unexpected rejection: " e))
+                    (finish!)))))))
+
+(deftest ensure-identity!-rejects-on-server-conflict-without-persisting-locally
+  (async done
+    (let [alice (make-party)
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))]
+      (set! ak/seed (fn [] @current-seed))
+      (set! at/at-procedure
+            (fn ([nsid] (at/at-procedure nsid {}))
+                ([nsid _body]
+                 (if (= nsid "app.aozora.convo.registerPrekeys")
+                   (js/Promise.resolve {:error "IdentityConflict" :message "a different identityKey is already registered"})
+                   (js/Promise.reject (js/Error. (str "unexpected procedure " nsid)))))))
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (is false "must reject, not resolve, when the PDS rejects registration")))
+          (.catch (fn [e]
+                    (is (some? e) "rejects with the server's conflict as the reason")
+                    ;; a SECOND call must retry (not think it's already registered) —
+                    ;; only possible if the failed attempt never persisted locally.
+                    (is (nil? (#'signal/load-identity (:did alice)))
+                        "a rejected registration must not be persisted as this device's active identity")))
+          (.then finish!)
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (finish!)))))))
+
+(deftest sealed-send-receive-round-trips-and-never-stores-sender-did
+  (async done
+    (let [alice (make-party)
+          bob (make-party)
+          bundles (atom {})
+          mailbox (atom {})
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))]
+      (install-fakes! current-seed bundles mailbox)
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (reset! current-seed (:seed bob)) (signal/ensure-identity! (:did bob))))
+          (.then (fn [_] (reset! current-seed (:seed alice))
+                   (signal/send-sealed! (:did alice) (:did bob) "convo-1" "sealed hello")))
+          (.then (fn [_] (reset! current-seed (:seed bob))
+                   (signal/fetch-sealed-messages! (:did bob) (:did alice) "convo-1")))
+          (.then (fn [received]
+                   (is (= 1 (count received)))
+                   (is (= "sealed hello" (:text (first received))) "message content round-trips")
+                   (is (= (:did alice) (:senderDid (first received)))
+                       "senderDid is recovered from the DECRYPTED payload, not from a plaintext record field")
+                   (is (every? #(not (str/includes? (js/JSON.stringify (clj->js %)) "\"senderDid\""))
+                               (get @mailbox (:did bob)))
+                       "the mailbox record itself (what an AppView scan would see) never has a top-level senderDid")))
+          (.then finish!)
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (finish!)))))))
+
+;; ── session mailbox (ADR-2610081200 R1) ───────────────────────────────────
+
+(deftest mailbox-id-is-deterministic-and-direction-asymmetric
+  (async done
+    (let [k1 (rand-seed) k2 (rand-seed)]
+      (-> (js/Promise.all #js [(signal/mailbox-id k1 "did:key:bob")
+                               (signal/mailbox-id k1 "did:key:bob")
+                               (signal/mailbox-id k1 "did:key:alice")
+                               (signal/mailbox-id k2 "did:key:bob")])
+          (.then (fn [^js r]
+                   (let [[b1 b1' a1 b2] (array-seq r)]
+                     (is (= b1 b1') "same key + same recipient -> same id")
+                     (is (not= b1 a1) "the two directions of one session get different ids")
+                     (is (not= b1 b2) "a different session key gives a different id")
+                     (is (re-matches #"^[A-Za-z0-9_-]{43}$" b1) "43-char unpadded base64url (32-byte HMAC)")
+                     (is (not (str/includes? b1 "did:")) "the id is opaque — no DID inside"))))
+          (.then done)
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(defn- stored-mailbox-key [my-did peer-did]
+  (some-> (#'signal/load-session-state my-did peer-did) :mailbox-key cacao-b64u))
+
+(deftest mailbox-key-agrees-across-parties-and-survives-ratchet-steps
+  (async done
+    (let [alice (make-party)
+          bob (make-party)
+          bundles (atom {})
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))
+          k0 (atom nil)]
+      (install-fakes! current-seed bundles)
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (reset! current-seed (:seed bob)) (signal/ensure-identity! (:did bob))))
+          (.then (fn [_] (reset! current-seed (:seed alice))
+                   (signal/encrypt-message (:did alice) (:did bob) "one")))
+          (.then (fn [env] (signal/decrypt-message (:did bob) (:did alice) env)))
+          (.then (fn [_]
+                   (reset! k0 (stored-mailbox-key (:did alice) (:did bob)))
+                   (is (some? @k0) "initiator persisted a mailbox key at establishment")
+                   (is (= @k0 (stored-mailbox-key (:did bob) (:did alice)))
+                       "responder derived the SAME key from the same X3DH secret")
+                   ;; several DH-ratchet turns in both directions
+                   (signal/encrypt-message (:did bob) (:did alice) "two")))
+          (.then (fn [env] (signal/decrypt-message (:did alice) (:did bob) env)))
+          (.then (fn [_] (signal/encrypt-message (:did alice) (:did bob) "three")))
+          (.then (fn [env] (signal/decrypt-message (:did bob) (:did alice) env)))
+          (.then (fn [_] (signal/encrypt-message (:did bob) (:did alice) "four")))
+          (.then (fn [env] (signal/decrypt-message (:did alice) (:did bob) env)))
+          (.then (fn [_]
+                   (is (= @k0 (stored-mailbox-key (:did alice) (:did bob)))
+                       "alice's mailbox key unchanged after the ratchet advanced")
+                   (is (= @k0 (stored-mailbox-key (:did bob) (:did alice)))
+                       "bob's mailbox key unchanged after the ratchet advanced")
+                   (js/Promise.all #js [(signal/session-mailbox-id (:did alice) (:did bob) (:did bob))
+                                        (signal/session-mailbox-id (:did bob) (:did alice) (:did bob))])))
+          (.then (fn [^js r]
+                   (is (= (aget r 0) (aget r 1)) "both parties compute the same id for the bob-bound direction")))
+          (.then finish!)
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (finish!)))))))
+
+(deftest sealed-mailbox-route-round-trips-without-to-did
+  (async done
+    (let [alice (make-party)
+          bob (make-party)
+          bundles (atom {})
+          mailbox (atom {})
+          sent (atom [])
+          current-seed (atom (:seed alice))
+          orig {:seed ak/seed :proc at/at-procedure :query at/at-appview-query}
+          finish! (fn [] (restore-fakes! orig) (done))]
+      (install-fakes! current-seed bundles mailbox sent)
+      (-> (signal/ensure-identity! (:did alice))
+          (.then (fn [_] (reset! current-seed (:seed bob)) (signal/ensure-identity! (:did bob))))
+          (.then (fn [_] (reset! current-seed (:seed alice))
+                   (signal/send-sealed! (:did alice) (:did bob) "convo-1" "first (intro)")))
+          (.then (fn [_] (signal/send-sealed! (:did alice) (:did bob) "convo-1" "second (mailbox)")))
+          (.then (fn [_]
+                   (let [[intro later] @sent]
+                     (is (= (:did bob) (:toDid intro)) "the session-establishing message goes by toDid")
+                     (is (= "convo-1" (:convoId intro)))
+                     (is (nil? (:mailboxId intro)))
+                     (is (some? (:mailboxId later)) "the next message goes by mailboxId")
+                     (is (= #{:mailboxId :ciphertext} (set (keys later)))
+                         "and carries nothing else in the clear — no toDid, no convoId")
+                     (is (not (str/includes? (js/JSON.stringify (clj->js later)) (:did bob)))))
+                   (reset! current-seed (:seed bob))
+                   (signal/fetch-sealed-messages! (:did bob) (:did alice) "convo-1")))
+          (.then (fn [received]
+                   (is (= ["first (intro)" "second (mailbox)"] (mapv :text received))
+                       "bob finds the intro by DID, then the mailbox message by his derived id")
+                   (is (every? #(= (:did alice) (:senderDid %)) received))
+                   (is (every? #(= "convo-1" (:convoId %)) received)
+                       "convoId of the mailbox message comes from the sealed payload")
+                   (signal/send-sealed! (:did bob) (:did alice) "convo-1" "reply (mailbox)")))
+          (.then (fn [_]
+                   (let [reply (last @sent)]
+                     (is (nil? (:toDid reply)) "the responder's first reply already uses the mailbox route")
+                     (is (not= (:mailboxId reply) (:mailboxId (second @sent)))
+                         "the alice-bound mailbox differs from the bob-bound one"))
+                   (reset! current-seed (:seed alice))
+                   (signal/fetch-sealed-messages! (:did alice) (:did bob) "convo-1")))
+          (.then (fn [received]
+                   (is (= ["reply (mailbox)"] (mapv :text received)))
+                   (is (= (:did bob) (:senderDid (first received))))
+                   (signal/fetch-sealed-messages! (:did alice) (:did bob) "other-convo")))
+          (.then (fn [received]
+                   (is (empty? received) "nothing new, and nothing from another convo")))
+          (.then finish!)
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (finish!)))))))

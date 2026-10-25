@@ -1,0 +1,674 @@
+(ns aozora.pds.convo-test
+  (:require [cljs.test :refer-macros [deftest is testing async]]
+            [kotoba.lang.text :as str]
+            [kotobase.client :as kc]
+            [aozora.appview.convo :as appview-convo]
+            [aozora.appview.actor :as appview-actor]
+            [aozora.pds.convo :as convo]))
+
+(defn- stub-transact [sink]
+  (fn ([_ _ tx] (reset! sink tx) (js/Promise.resolve #js {}))
+      ([_ _ tx _] (reset! sink tx) (js/Promise.resolve #js {}))))
+
+;; add-member/remove-member's creator check only runs when `_env` is
+;; non-nil (see aozora.pds.convo/require-creator) — fake env is just a
+;; marker, the stubbed creator-did below ignores the client/db it'd derive.
+(def ^:private fake-env #js {})
+
+(defn- with-creator [creator-did f]
+  (let [orig appview-convo/creator-did]
+    (set! appview-convo/creator-did (fn [_ _ _] (js/Promise.resolve creator-did)))
+    (-> (f) (.finally (fn [] (set! appview-convo/creator-did orig))))))
+
+(defn- with-existing-preference [existing f]
+  (let [orig appview-convo/get-convo-preference]
+    (set! appview-convo/get-convo-preference (fn [_ _ _ _] (js/Promise.resolve existing)))
+    (-> (f) (.finally (fn [] (set! appview-convo/get-convo-preference orig))))))
+
+(defn- with-own-message [existing f]
+  (let [orig appview-convo/get-own-message]
+    (set! appview-convo/get-own-message (fn [_ _ _ _ _] (js/Promise.resolve existing)))
+    (-> (f) (.finally (fn [] (set! appview-convo/get-own-message orig))))))
+
+(defn- with-convo-record [existing f]
+  (let [orig appview-convo/get-convo-record]
+    (set! appview-convo/get-convo-record (fn [_ _ _] (js/Promise.resolve existing)))
+    (-> (f) (.finally (fn [] (set! appview-convo/get-convo-record orig))))))
+
+(defn- with-blocked [blocked? f]
+  (let [orig appview-actor/blocked?]
+    (set! appview-actor/blocked? (fn [_ _ _ _] (js/Promise.resolve blocked?)))
+    (-> (f) (.finally (fn [] (set! appview-actor/blocked? orig))))))
+
+(defn- tx-record-json
+  "Decode the :atproto.record/jsonB64 payload out of a captured tx_edn string
+  (record JSON is base64 on the wire — kotobase tx_edn brace-split workaround)."
+  [tx]
+  (some->> (re-find #":atproto\.record/jsonB64 \"([^\"]+)\"" (or tx ""))
+           second
+           (#(.toString (js/Buffer.from % "base64") "utf-8"))))
+
+(deftest send-message-persists-aozora-convo-record
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/send-message nil "yoro-social"
+                              {:_auth-did "did:web:alice"
+                               :convoId "convo-1"
+                               :text "hello"
+                               :kind "dm"
+                               :encryption "e2ee"})
+          (.then (fn [res]
+                   (is (str/starts-with? (:uri res) "at://did:web:alice/app.aozora.convo.message/"))
+                   (is (str/includes? @tx ":atproto.record/collection \"app.aozora.convo.message\""))
+                   (is (str/includes? @tx ":atproto.record/jsonB64"))
+                   (is (str/includes? (tx-record-json @tx) "\"encryption\":\"e2ee\""))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest send-message-rkeys-dont-collide-on-rapid-back-to-back-calls
+  (testing "two send-message calls fired without awaiting the first (the
+            exact double-send/retry-without-cancel shape that used to
+            collide on (.getTime (js/Date.)) alone -- create-record is
+            upsert-by-(collection,rkey), so a colliding rkey silently
+            drops the first message) must produce DIFFERENT rkeys, and
+            therefore land as two separate records, not one overwrite"
+    (async done
+      (let [txs (atom [])
+            orig kc/transact]
+        (set! kc/transact (fn
+                            ([_ _ tx] (swap! txs conj tx) (js/Promise.resolve #js {}))
+                            ([_ _ tx _] (swap! txs conj tx) (js/Promise.resolve #js {}))))
+        (-> (js/Promise.all
+             #js [(convo/send-message nil "yoro-social"
+                                      {:_auth-did "did:web:alice" :convoId "convo-1" :text "first"})
+                  (convo/send-message nil "yoro-social"
+                                      {:_auth-did "did:web:alice" :convoId "convo-1" :text "second"})])
+            (.then (fn [_]
+                     (is (= 2 (count @txs)) "both sends actually attempted a write")
+                     (let [rkeys (map #(.-rkey (js/JSON.parse (tx-record-json %))) @txs)]
+                       (is (apply not= rkeys) "the two rkeys must differ"))))
+            (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest send-sealed-message-persists-under-neutral-mailbox-repo-without-sender-did
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact
+          ;; a real ciphertext is opaque base64/JSON produced by
+          ;; yoro-ui.interop.signal/encrypt-message — this fake stands in for
+          ;; that and deliberately does NOT contain the real sender's DID as
+          ;; a literal substring, so "not stored in the clear" is meaningful.
+          fake-ciphertext "eyJhbGciOiJvcGFxdWUiLCJjdCI6IjB4ZGVhZGJlZWYifQ=="]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/send-sealed-message nil "yoro-social"
+                                     {:_auth-did "did:web:alice"
+                                      :convoId "convo-1"
+                                      :toDid "did:web:bob"
+                                      :ciphertext fake-ciphertext})
+          (.then (fn [res]
+                   (is (str/starts-with? (:uri res) "at://mailbox/app.aozora.convo.sealedMessage/")
+                       "written under the neutral mailbox repo, NOT did:web:alice")
+                   (is (str/includes? @tx ":atproto.record/collection \"app.aozora.convo.sealedMessage\""))
+                   (let [stored (tx-record-json @tx)]
+                     (is (str/includes? stored "\"toDid\":\"did:web:bob\""))
+                     (is (not (str/includes? stored "did:web:alice"))
+                         "the real sender's DID appears nowhere in the stored plaintext record fields"))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest send-sealed-message-does-not-store-a-senderdid-field
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/send-sealed-message nil "yoro-social"
+                                     {:_auth-did "did:web:alice"
+                                      :convoId "convo-1"
+                                      :toDid "did:web:bob"
+                                      :ciphertext "opaque-envelope-json"})
+          (.then (fn [_]
+                   (is (not (str/includes? (tx-record-json @tx) "senderDid"))
+                       "no senderDid key anywhere in the stored record value")))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest send-sealed-message-rejects-without-auth
+  (async done
+    (-> (convo/send-sealed-message nil "yoro-social"
+                                   {:convoId "convo-1" :toDid "did:web:bob" :ciphertext "x"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest send-sealed-message-rejects-when-recipient-has-blocked-sender
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-blocked true
+        #(-> (convo/send-sealed-message nil "yoro-social"
+                                        {:_auth-did "did:web:alice" :_env fake-env
+                                         :convoId "convo-1"
+                                         :toDid "did:web:bob"
+                                         :ciphertext "opaque-envelope-json"})
+             (.then (fn [res]
+                      (is (= "Blocked" (:error res)))
+                      (is (nil? @tx) "no write happened")))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest send-sealed-message-allows-when-not-blocked
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-blocked false
+        #(-> (convo/send-sealed-message nil "yoro-social"
+                                        {:_auth-did "did:web:alice" :_env fake-env
+                                         :convoId "convo-1"
+                                         :toDid "did:web:bob"
+                                         :ciphertext "opaque-envelope-json"})
+             (.then (fn [res]
+                      (is (nil? (:error res)))
+                      (is (str/starts-with? (:uri res) "at://mailbox/app.aozora.convo.sealedMessage/"))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest send-sealed-message-rejects-without-to-did
+  (async done
+    (-> (convo/send-sealed-message nil "yoro-social"
+                                   {:_auth-did "did:web:alice" :convoId "convo-1" :ciphertext "x"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+;; ── mailbox route (ADR-2610081200 R1) ─────────────────────────────────────
+
+(def ^:private mailbox-id
+  "43-char base64url, the shape yoro-ui.interop.signal/mailbox-id produces."
+  "q3V2l0aF9vcGFxdWVfbWFpbGJveF9pZF8zMmJ5dGVzX")
+
+(deftest send-sealed-message-rejects-both-to-did-and-mailbox-id
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/send-sealed-message nil "yoro-social"
+                                     {:_auth-did "did:web:alice" :convoId "convo-1"
+                                      :toDid "did:web:bob" :mailboxId mailbox-id :ciphertext "x"})
+          (.then (fn [res]
+                   (is (= "InvalidRequest" (:error res)))
+                   (is (nil? @tx) "nothing written")))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest send-sealed-message-rejects-neither-to-did-nor-mailbox-id
+  (async done
+    (-> (convo/send-sealed-message nil "yoro-social"
+                                   {:_auth-did "did:web:alice" :ciphertext "x"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest send-sealed-message-rejects-malformed-mailbox-id
+  (async done
+    (-> (js/Promise.all
+         #js [(convo/send-sealed-message nil "yoro-social"
+                                         {:_auth-did "did:web:alice" :mailboxId "did:web:bob" :ciphertext "x"})
+              (convo/send-sealed-message nil "yoro-social"
+                                         {:_auth-did "did:web:alice" :mailboxId "short" :ciphertext "x"})])
+        (.then (fn [^js rs]
+                 (is (every? #(= "InvalidRequest" (:error %)) (array-seq rs))
+                     "a DID (or anything not a 43-char base64url id) can't be smuggled into mailboxId")
+                 (done))))))
+
+(deftest send-sealed-message-mailbox-route-requires-auth
+  (async done
+    (-> (convo/send-sealed-message nil "yoro-social" {:mailboxId mailbox-id :ciphertext "x"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest send-sealed-message-mailbox-route-stores-no-to-did-anywhere
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/send-sealed-message nil "yoro-social"
+                                     {:_auth-did "did:web:alice"
+                                      :mailboxId mailbox-id
+                                      ;; a client that still sends convoId must not get it stored
+                                      :convoId "convo-1"
+                                      :ciphertext "opaque-envelope-json"})
+          (.then (fn [res]
+                   (is (nil? (:error res)))
+                   (is (str/starts-with? (:uri res) "at://mailbox/app.aozora.convo.sealedMessage/sealed-")
+                       "neutral mailbox repo, random rkey")
+                   (let [stored (tx-record-json @tx)
+                         value (js->clj (js/JSON.parse stored) :keywordize-keys true)]
+                     (is (= #{:mailboxId :ciphertext :rkey :createdAt} (set (keys value)))
+                         "the record value is exactly the opaque routing id + ciphertext + rkey + time")
+                     (is (= mailbox-id (:mailboxId value)))
+                     (is (not (str/includes? @tx "toDid")) "no toDid field anywhere in the tx")
+                     (is (not (str/includes? @tx "did:web:bob")))
+                     (is (not (str/includes? @tx "did:web:alice")) "nor the sender")
+                     (is (not (str/includes? @tx "convo-1")) "nor the convoId")
+                     (is (not (str/includes? (:rkey value) mailbox-id)) "rkey doesn't embed the mailbox id")
+                     (is (not (str/includes? (:uri res) mailbox-id)) "nor does the record URI"))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest send-sealed-message-mailbox-route-is-not-block-checked
+  (testing "the server can't know a mailbox's recipient, so it can't consult
+            their block list — blocks apply at the intro route only"
+    (async done
+      (let [tx (atom nil)
+            orig kc/transact]
+        (set! kc/transact (stub-transact tx))
+        (with-blocked true
+          #(-> (convo/send-sealed-message nil "yoro-social"
+                                          {:_auth-did "did:web:alice" :_env fake-env
+                                           :mailboxId mailbox-id :ciphertext "opaque"})
+               (.then (fn [res]
+                        (is (nil? (:error res)))
+                        (is (some? @tx))))
+               (.finally (fn [] (set! kc/transact orig) (done)))))))))
+
+(deftest send-sealed-message-intro-rkey-does-not-embed-to-did
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/send-sealed-message nil "yoro-social"
+                                     {:_auth-did "did:web:alice" :convoId "convo-1"
+                                      :toDid "did:web:bob" :ciphertext "opaque"})
+          (.then (fn [res]
+                   (is (not (str/includes? (:uri res) "did:web:bob"))
+                       "the intro record's VALUE still has toDid (by design), but its rkey/URI no longer does")))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest create-convo-generates-id
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/create-convo nil "yoro-social"
+                             {:_auth-did "did:web:alice"
+                              :kind "dm"
+                              :encryption "e2ee"
+                              :members ["did:web:bob"]})
+          (.then (fn [res]
+                   (is (str/starts-with? (:convoId res) "convo-"))
+                   (is (str/includes? @tx ":atproto.record/collection \"app.aozora.convo.convo\""))
+                   (is (str/includes? (tx-record-json @tx) "\"encryption\":\"e2ee\""))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest create-convo-generated-ids-dont-collide-on-rapid-back-to-back-calls
+  (testing "same underlying defect as send-message's rkey (both used to be
+            (.getTime (js/Date.)) alone) -- two createConvo calls with no
+            convoId, fired without awaiting the first, must not silently
+            upsert-overwrite each other's convo metadata under the same
+            generated convoId"
+    (async done
+      (let [txs (atom [])
+            orig kc/transact]
+        (set! kc/transact (fn
+                            ([_ _ tx] (swap! txs conj tx) (js/Promise.resolve #js {}))
+                            ([_ _ tx _] (swap! txs conj tx) (js/Promise.resolve #js {}))))
+        (-> (js/Promise.all
+             #js [(convo/create-convo nil "yoro-social"
+                                      {:_auth-did "did:web:alice" :kind "dm" :members ["did:web:bob"]})
+                  (convo/create-convo nil "yoro-social"
+                                      {:_auth-did "did:web:alice" :kind "dm" :members ["did:web:carol"]})])
+            (.then (fn [[res1 res2]]
+                     (is (not= (:convoId res1) (:convoId res2)))))
+            (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest update-convo-renames-and-preserves-other-fields
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact
+          existing {:convoId "convo-1" :kind "group" :createdAt "2026-07-01T00:00:00Z"
+                    :creatorDid "did:web:alice" :title "Old Name"
+                    :members ["did:web:alice" "did:web:bob"]}]
+      (set! kc/transact (stub-transact tx))
+      (with-creator "did:web:alice"
+        #(with-convo-record existing
+           (fn []
+             (-> (convo/update-convo nil "yoro-social"
+                                     {:_auth-did "did:web:alice" :_env fake-env
+                                      :convoId "convo-1" :title "New Name"})
+                 (.then (fn [res]
+                          (is (= "did:web:alice" (:did res)))
+                          (is (= "New Name" (:title res)))
+                          (let [stored (tx-record-json @tx)]
+                            (is (str/includes? stored "\"title\":\"New Name\""))
+                            (is (str/includes? stored "\"kind\":\"group\""))
+                            (is (str/includes? stored "\"creatorDid\":\"did:web:alice\""))
+                            (is (str/includes? stored "\"did:web:bob\"") "members preserved"))))
+                 (.finally (fn [] (set! kc/transact orig) (done))))))))))
+
+(deftest update-convo-rejects-non-creator-caller
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-creator "did:web:alice"
+        #(-> (convo/update-convo nil "yoro-social"
+                                 {:_auth-did "did:web:mallory" :_env fake-env
+                                  :convoId "convo-1" :title "Hijacked"})
+             (.then (fn [res]
+                      (is (= "AuthRequired" (:error res)))
+                      (is (nil? @tx) "no write happened")))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest update-convo-rejects-without-env
+  (async done
+    (-> (convo/update-convo nil "yoro-social"
+                            {:_auth-did "did:web:alice" :convoId "convo-1" :title "New Name"})
+        (.then (fn [res]
+                 (is (= "AuthRequired" (:error res)) "fail closed when the creator check can't run")
+                 (done))))))
+
+(deftest update-convo-rejects-when-no-existing-convo-found
+  (async done
+    (with-creator "did:web:alice"
+      #(with-convo-record nil
+         (fn []
+           (-> (convo/update-convo nil "yoro-social"
+                                   {:_auth-did "did:web:alice" :_env fake-env
+                                    :convoId "convo-1" :title "New Name"})
+               (.then (fn [res] (is (= "NotFound" (:error res))) (done)))))))))
+
+(deftest update-convo-rejects-without-title
+  (async done
+    (-> (convo/update-convo nil "yoro-social" {:_auth-did "did:web:alice" :convoId "convo-1"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest create-convo-rejects-a-new-dm-when-the-other-party-has-blocked-caller
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-blocked true
+        #(-> (convo/create-convo nil "yoro-social"
+                                 {:_auth-did "did:web:alice" :_env fake-env
+                                  :kind "dm"
+                                  :members ["did:web:alice" "did:web:bob"]})
+             (.then (fn [res]
+                      (is (= "Blocked" (:error res)))
+                      (is (nil? @tx) "no write happened")))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest create-convo-allows-a-new-dm-when-not-blocked
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-blocked false
+        #(-> (convo/create-convo nil "yoro-social"
+                                 {:_auth-did "did:web:alice" :_env fake-env
+                                  :kind "dm"
+                                  :members ["did:web:alice" "did:web:bob"]})
+             (.then (fn [res]
+                      (is (str/starts-with? (:convoId res) "convo-"))
+                      (is (nil? (:error res)))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest create-convo-skips-block-check-for-groups
+  (async done
+    (let [tx (atom nil)
+          orig-transact kc/transact
+          orig-blocked appview-actor/blocked?
+          called? (atom false)]
+      (set! kc/transact (stub-transact tx))
+      (set! appview-actor/blocked? (fn [_ _ _ _] (reset! called? true) (js/Promise.resolve false)))
+      (-> (convo/create-convo nil "yoro-social"
+                              {:_auth-did "did:web:alice" :_env fake-env
+                               :kind "group"
+                               :members ["did:web:alice" "did:web:bob" "did:web:carol"]})
+          (.then (fn [res]
+                   (is (str/starts-with? (:convoId res) "convo-"))
+                   (is (false? @called?) "block check only applies to a new 1:1 DM, not groups")))
+          (.finally (fn [] (set! kc/transact orig-transact)
+                      (set! appview-actor/blocked? orig-blocked)
+                      (done)))))))
+
+(deftest mark-read-persists-receipt
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/mark-read nil "yoro-social"
+                           {:_auth-did "did:web:alice"
+                            :convoId "convo-1"
+                            :lastSeenRkey "m2"})
+          (.then (fn [res]
+                   (is (= "convo-1" (:convoId res)))
+                   (is (str/includes? @tx ":atproto.record/collection \"app.aozora.convo.readReceipt\""))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest set-typing-persists-under-a-deterministic-rkey
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/set-typing nil "yoro-social"
+                            {:_auth-did "did:web:alice" :convoId "convo-1" :isTyping true})
+          (.then (fn [res]
+                   (is (= "did:web:alice" (:did res)))
+                   (is (= "convo-1" (:convoId res)))
+                   (is (str/includes? @tx "at://did:web:alice/app.aozora.convo.typing/typing-convo-1-did:web:alice"))
+                   (is (str/includes? @tx ":atproto.record/collection \"app.aozora.convo.typing\""))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest set-typing-re-ping-overwrites-the-same-record-not-a-new-one
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/set-typing nil "yoro-social"
+                            {:_auth-did "did:web:alice" :convoId "convo-1" :isTyping true})
+          (.then (fn [res1]
+                   (-> (convo/set-typing nil "yoro-social"
+                                        {:_auth-did "did:web:alice" :convoId "convo-1" :isTyping true})
+                       (.then (fn [res2] (is (= (:uri res1) (:uri res2)) "same deterministic rkey both times"))))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest set-typing-false-deletes-the-record
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/set-typing nil "yoro-social"
+                            {:_auth-did "did:web:alice" :convoId "convo-1" :isTyping false})
+          (.then (fn [res]
+                   (is (= "did:web:alice" (:did res)))
+                   (is (str/includes? @tx "at://did:web:alice/app.aozora.convo.typing/typing-convo-1-did:web:alice"))
+                   (is (str/includes? @tx ":atproto.record/deleted"))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest set-typing-rejects-without-auth
+  (async done
+    (-> (convo/set-typing nil "yoro-social" {:convoId "convo-1" :isTyping true})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest add-member-persists-member-row-when-caller-is-creator
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-creator "did:web:alice"
+        #(-> (convo/add-member nil "yoro-social"
+                               {:_auth-did "did:web:alice" :_env fake-env
+                                :convoId "convo-1"
+                                :did "did:web:bob"})
+             (.then (fn [res]
+                      (is (= "did:web:bob" (:did res)))
+                      (is (str/includes? @tx ":atproto.record/collection \"app.aozora.convo.member\""))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest add-member-rejects-non-creator-caller
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-creator "did:web:alice"
+        #(-> (convo/add-member nil "yoro-social"
+                               {:_auth-did "did:web:mallory" :_env fake-env
+                                :convoId "convo-1"
+                                :did "did:web:mallory"})
+             (.then (fn [res]
+                      (is (= "AuthRequired" (:error res)))
+                      (is (nil? @tx) "no write happened")))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest add-member-rejects-without-env
+  (async done
+    (-> (convo/add-member nil "yoro-social"
+                          {:_auth-did "did:web:alice"
+                           :convoId "convo-1"
+                           :did "did:web:bob"})
+        (.then (fn [res]
+                 (is (= "AuthRequired" (:error res)) "fail closed when the check can't run")
+                 (done))))))
+
+(deftest remove-member-allows-self-removal-without-creator-check
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      ;; deliberately NOT stubbing appview-convo/creator-did — self-removal
+      ;; must never call it, so a real (unstubbed) call would blow up here
+      ;; if the exemption path were wrong.
+      (-> (convo/remove-member nil "yoro-social"
+                               {:_auth-did "did:web:bob" :_env fake-env
+                                :convoId "convo-1"
+                                :did "did:web:bob"})
+          (.then (fn [res] (is (= "did:web:bob" (:did res)))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest remove-member-rejects-non-creator-removing-someone-else
+  (async done
+    (with-creator "did:web:alice"
+      #(-> (convo/remove-member nil "yoro-social"
+                                {:_auth-did "did:web:mallory" :_env fake-env
+                                 :convoId "convo-1"
+                                 :did "did:web:bob"})
+           (.then (fn [res] (is (= "AuthRequired" (:error res))) (done)))))))
+
+(deftest remove-member-allows-creator-removing-someone-else
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-creator "did:web:alice"
+        #(-> (convo/remove-member nil "yoro-social"
+                                  {:_auth-did "did:web:alice" :_env fake-env
+                                   :convoId "convo-1"
+                                   :did "did:web:bob"})
+             (.then (fn [res] (is (= "did:web:bob" (:did res)))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest set-convo-preference-persists-under-callers-own-repo
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-existing-preference nil
+        #(-> (convo/set-convo-preference nil "yoro-social"
+                                         {:_auth-did "did:web:alice" :_env fake-env
+                                          :convoId "convo-1" :muted true})
+             (.then (fn [res]
+                      (is (true? (:muted res)))
+                      (is (str/starts-with? (:uri res) "at://did:web:alice/app.aozora.convo.convoPreference/convo-1"))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest set-convo-preference-partial-update-keeps-other-fields
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (with-existing-preference {:muted false :archived false :pinned true}
+        #(-> (convo/set-convo-preference nil "yoro-social"
+                                         {:_auth-did "did:web:alice" :_env fake-env
+                                          :convoId "convo-1" :muted true})
+             (.then (fn [res]
+                      (is (true? (:muted res)) "the field we set")
+                      (is (true? (:pinned res)) "previously-pinned stays pinned — muting doesn't reset it")
+                      (is (false? (:archived res)))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest set-convo-preference-rejects-without-auth
+  (async done
+    (-> (convo/set-convo-preference nil "yoro-social" {:convoId "convo-1" :muted true})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest edit-message-rewrites-text-and-preserves-other-fields
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact
+          existing {:convoId "convo-1" :senderDid "did:web:alice" :text "old-ciphertext"
+                    :rkey "m1" :createdAt "2026-07-01T00:00:00Z" :encryption "signal-v3"
+                    :contentType "application/json"}]
+      (set! kc/transact (stub-transact tx))
+      (with-own-message existing
+        #(-> (convo/edit-message nil "yoro-social"
+                                 {:_auth-did "did:web:alice" :_env fake-env
+                                  :convoId "convo-1" :rkey "m1" :text "new-ciphertext"})
+             (.then (fn [res]
+                      (is (= "did:web:alice" (:did res)))
+                      (is (= "m1" (:rkey res)))
+                      (is (some? (:editedAt res)))
+                      (let [stored (tx-record-json @tx)]
+                        (is (str/includes? stored "\"text\":\"new-ciphertext\""))
+                        (is (str/includes? stored "\"senderDid\":\"did:web:alice\"")
+                            "the original senderDid is preserved, not dropped")
+                        (is (str/includes? stored "\"encryption\":\"signal-v3\"")
+                            "the original encryption tag is preserved"))))
+             (.finally (fn [] (set! kc/transact orig) (done))))))))
+
+(deftest edit-message-rejects-when-no-existing-message-found
+  (async done
+    (with-own-message nil
+      #(-> (convo/edit-message nil "yoro-social"
+                               {:_auth-did "did:web:alice" :_env fake-env
+                                :convoId "convo-1" :rkey "m1" :text "new-text"})
+           (.then (fn [res] (is (= "NotFound" (:error res))) (done)))))))
+
+(deftest edit-message-rejects-without-env
+  (async done
+    (-> (convo/edit-message nil "yoro-social"
+                            {:_auth-did "did:web:alice"
+                             :convoId "convo-1" :rkey "m1" :text "new-text"})
+        (.then (fn [res]
+                 (is (= "NotFound" (:error res)) "no env means the read-before-write can't run, fail closed")
+                 (done))))))
+
+(deftest edit-message-rejects-without-auth
+  (async done
+    (-> (convo/edit-message nil "yoro-social" {:convoId "convo-1" :rkey "m1" :text "x"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
+
+(deftest delete-message-tombstones-under-callers-own-repo
+  (async done
+    (let [tx (atom nil)
+          orig kc/transact]
+      (set! kc/transact (stub-transact tx))
+      (-> (convo/delete-message nil "yoro-social"
+                                {:_auth-did "did:web:alice" :convoId "convo-1" :rkey "m1"})
+          (.then (fn [res]
+                   (is (= "did:web:alice" (:did res)))
+                   (is (= "convo-1" (:convoId res)))
+                   (is (str/includes? @tx "at://did:web:alice/app.aozora.convo.message/m1"))
+                   (is (str/includes? @tx ":atproto.record/deleted"))))
+          (.finally (fn [] (set! kc/transact orig) (done)))))))
+
+(deftest delete-message-rejects-without-auth
+  (async done
+    (-> (convo/delete-message nil "yoro-social" {:convoId "convo-1" :rkey "m1"})
+        (.then (fn [res]
+                 (is (= "InvalidRequest" (:error res)))
+                 (done))))))
