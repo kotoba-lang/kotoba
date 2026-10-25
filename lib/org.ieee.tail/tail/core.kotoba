@@ -1,0 +1,212 @@
+;; tail -- POSIX tail (IEEE Std 1003.1) for ONE operand.
+;;
+;;   tail FILE          the last 10 lines
+;;   tail -n N FILE     the last N lines, N >= 0 (also -N and -nN)
+;;   ... | tail [-n N]  the same, from standard input (wire 41, 2026-09-16:
+;;                      94% of tail's invocations in agent tool use are a
+;;                      later pipeline segment, 38,255 of 40,584 measured).
+;;                      tail needs the END of its input, so this is the
+;;                      whole-input form; input past the string pool is
+;;                      refused (exit 120), never silently truncated.
+;;
+;; ## What tail does NOT do, measured against head in the same session
+;;
+;; It adds no newline. `x\ny` with `-n 1` answers `y` -- ONE byte. grep, sort
+;; and uniq all add one in the same situation; head and tail do not. Six
+;; commands, two contracts, and running them is the only way to know which is
+;; which.
+;;
+;; And `-n 0` is NOT an error here. /usr/bin/head refuses it with
+;; `illegal line count` and exits 1; /usr/bin/tail answers nothing and exits
+;; 0. Measured on both.
+;;
+;; ## The model
+;;
+;;   lines = newlines, or newlines + 1 when the text does not end in one
+;;   skip  = lines - N, floored at 0
+;;   emit  = the bytes from just after the skip-th newline to the end
+;;
+;; Emitting a SPAN of the original bytes is what makes "adds nothing" fall
+;; out rather than being a special case, and it makes `-n 0` fall out too:
+;; skip reaches the last newline and the span is empty.
+;;
+;; ## The boundary test this does not use
+;;
+;; "does the text end in a newline" is NOT `(string-substring text (- n 1) n)`.
+;; A substring offset must be a code-point boundary and n-1 is not one when
+;; the last character is multi-byte -- the same trap org-ieee-ls hit, where
+;; it listed every ASCII entry and then trapped SIGILL on `é`. Here the
+;; question is answered from the newline walk instead: the text ends in a
+;; newline exactly when the offset just after the LAST newline is the length.
+(ns tail.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+;; Both walks use `string-find-byte` (context ABI v10): a host scan from a
+;; boundary that mints NOTHING. They used to cut a substring per line and
+;; search it, one pair each -- three walks over 65,536 lines was 196,000
+;; pairs, which is where a 4 MB input met the 200,000-pair budget at exit
+;; 120 (measured 2026-09-16, on the stdin path; the file path had the same
+;; walk and the same ceiling).
+(defn count-newlines [s :string from :i64 acc :i64] :i64
+  (let [i (string-find-byte s 10 from)]
+    (if (< i 0) acc (count-newlines s (+ i 1) (+ acc 1)))))
+
+;; The byte offset one past the nth newline, or -1 when there are fewer.
+(defn after-nth-newline [s :string from :i64 remaining :i64] :i64
+  (if (= remaining 0)
+    from
+    (let [i (string-find-byte s 10 from)]
+      (if (< i 0)
+        -1
+        (after-nth-newline s (+ i 1) (- remaining 1))))))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; With TWO OR MORE files each is introduced by `==> FILE <==`, and with one
+;; there is no header. A blank line precedes every header EXCEPT the first
+;; one PRINTED -- a missing operand does not count. Measured against
+;; /usr/bin/tail 2026-09-10, and identical to head's rule, which is why the
+;; same shape appears in both: the two utilities agree here.
+;;
+;;   tail -n 1 nope.txt h1.txt      h1's header has NO blank line before it
+;;   tail -n 1 h1.txt nope.txt h2   h2's header DOES
+(defn header [path :string] :string
+  (do (emit "==> ") (emit path) (emit " <==") (emit (nl))))
+
+;; Returns 1, because after this a header has been written.
+;; The last COUNT lines of TEXT, as a span of its own bytes.
+(defn show-text [text :string count :i64] :i64
+  (let [len (string-byte-length text)
+        nls (count-newlines text 0 0)
+        ends-nl? (if (= nls 0) false (= (after-nth-newline text 0 nls) len))
+        lines (if (= len 0) 0 (if ends-nl? nls (+ nls 1)))
+        skip (if (> lines count) (- lines count) 0)]
+    (do (emit (string-substring text (after-nth-newline text 0 skip) len)) 0)))
+
+(defn show [path :string count :i64 multi? :i64 printed? :i64] :i64
+  (do
+    (if (= multi? 1)
+      (do (if (= printed? 1) (emit (nl)) "")
+          (header path))
+      "")
+    (show-text (slurp-file path) count)
+    1))
+
+(defn complain [path :string] :i64
+  (do
+    (emit-error "tail: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; One word carries both the header flag (bit 0) and the failure (bit 1),
+;; because five parameters is the compiler's limit and this walk needs the
+;; index, the total, the count and the multi flag as well.
+(defn each [i :i64 total :string count :i64 multi? :i64 state :i64] :i64
+  (if (string=? (decimal-of i) total)
+    state
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (each (+ i 1) total count multi?
+              (+ (show path count multi? (- state (* 2 (quot state 2))))
+                 (* 2 (quot state 2))))
+        (each (+ i 1) total count multi?
+              (do (complain path)
+                  (+ (- state (* 2 (quot state 2))) 2)))))))
+
+;; The count flag in its three spellings, measured 2026-09-17 over 1,268,018
+;; agent Bash calls: `tail -1` 16,939 and `tail -2` 7,336 -- the NUMERIC
+;; SHORTHAND is the most frequent form by far -- then `-n N` and `-nN`. A
+;; leading dash followed by a digit is a count; `-n` takes the next
+;; argument or its attached tail.
+(defn- dash-digit? [a :string] :bool
+  (if (< (string-byte-length a) 2)
+    false
+    (if (= (string-code-point-at a 0) 45)
+      (let [c (string-code-point-at a 1)] (if (>= c 48) (<= c 57) false))
+      false)))
+
+;; How many arguments the count flag consumed: 0, 1 (`-N`, `-nN`) or 2 (`-n N`).
+(defn- flag-width [] :i64
+  (let [a (arg "0")]
+    (if (string=? a "-n")
+      2
+      (if (dash-digit? a)
+        1
+        (if (if (>= (string-byte-length a) 3) (string=? (string-substring a 0 2) "-n") false)
+          1
+          0)))))
+
+(defn- count-text [] :string
+  (let [a (arg "0")]
+    (if (string=? a "-n")
+      (arg "1")
+      (if (dash-digit? a)
+        (string-substring a 1 (string-byte-length a))
+        (string-substring a 2 (string-byte-length a))))))
+
+(defn main [] :i64
+  (let [total (arg "")
+        width (flag-width)
+        count (if (= width 0) 10 (parse-count (count-text)))
+        first-file width
+        files (- (parse-count total) first-file)]
+    (if (< count 0)
+      (do
+        ;; Verbatim: `tail: illegal offset -- x: Invalid argument`.
+        (emit-error "tail: illegal offset -- ")
+        (emit-error (count-text))
+        (emit-error ": Invalid argument")
+        (emit-error (nl))
+        1)
+      (if (< files 1)
+        ;; No file operand: standard input, whole (see the header).
+        (show-text (stdin "") count)
+        (quot (each first-file total count (if (> files 1) 1 0) 0) 2)))))
