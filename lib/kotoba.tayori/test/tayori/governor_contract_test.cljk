@@ -1,0 +1,217 @@
+(ns tayori.governor-contract-test
+  "The propose→draft/revise-only contract as executable tests — tayori's
+  analog of kekkai's governor_contract_test / robotaxi's safety_contract_test.
+  Invariant: the actor never sends a message or publishes a document the
+  ComplianceGovernor would reject; drafting/revising never auto-actuates;
+  sending/publishing always routes to a human regardless of phase."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [tayori.store :as store]
+            [tayori.channel :as channel]
+            [tayori.docport :as docport]
+            [tayori.replyllm :as replyllm]
+            [tayori.operation :as op]))
+
+(defn- fresh []
+  (let [s (store/seed-db) sent (atom []) published (atom {})
+        ch (channel/mock-channel sent) dp (docport/mock-doctarget published)]
+    [s (op/build s {:channel ch :docport dp}) sent published]))
+
+(defn- ctx [phase] {:phase phase})
+(defn- run [actor tid req phase] (g/run* actor {:request req :context (ctx phase)} {:thread-id tid}))
+
+(deftest ingest-always-records
+  (testing "observe path records a ground fact regardless of phase"
+    (let [[s actor] (fresh)
+          res (run actor "i" {:op :contact/register :contact "c-x"
+                              :value {:id "c-x" :channel :email :address "x@example.com"
+                                      :consent :known :first-contact? false}} 0)]
+      (is (= :record (get-in res [:state :disposition])))
+      (is (= "x@example.com" (:address (store/contact s "c-x")))))))
+
+(deftest clean-draft-auto-commits-no-human-needed
+  (testing "phase 3: a clean+confident draft is data, not actuation — it commits without interrupting"
+    (let [[s actor] (fresh)
+          res (run actor "d" {:op :reply/draft :thread "t-status"} 3)]
+      (is (not= :interrupted (:status res)) "drafting is not high-stakes")
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= "proposed" (name (:status (store/draft-of s "t-status"))))))))
+
+(deftest missing-phase-context-does-not-grant-max-autonomy
+  ;; default-phase is the fallback both when :phase is entirely absent
+  ;; from context (tayori.operation) and when an unrecognized phase
+  ;; number is passed (phase/gate). It used to be 3 -- where
+  ;; :reply/draft can auto-commit -- so a caller that simply forgot to
+  ;; set :phase silently got MAXIMUM autonomy instead of the safe
+  ;; "start narrow" default.
+  (testing "omitting :phase from context still requires human approval on a clean draft"
+    (let [[s actor] (fresh)
+          res (g/run* actor {:request {:op :reply/draft :thread "t-status"} :context {}}
+                      {:thread-id "mp"})]
+      (is (not= :commit (get-in res [:state :disposition]))
+          "a clean draft must not auto-commit when :phase is unset")
+      (is (nil? (store/draft-of s "t-status")) "SSoT untouched without explicit phase"))))
+
+(deftest sending-always-requires-human-signoff
+  (testing "even a clean draft never auto-sends — it interrupts for a human"
+    (let [[s actor sent] (fresh)
+          _  (run actor "d2" {:op :reply/draft :thread "t-status"} 3)
+          r1 (run actor "s2" {:op :reply/send :thread "t-status"} 3)]
+      (is (= :interrupted (:status r1)) "sending is high-stakes → always human")
+      (is (empty? @sent) "nothing sent before sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "s2" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= "sent" (name (:status (store/draft-of s "t-status")))))
+        (is (= 1 (count @sent)))))))
+
+(deftest consent-blocked-send-is-held-and-unoverridable
+  (testing "t-blocked: the contact's consent is :blocked → HOLD, never reaches a human"
+    (let [[s actor] (fresh)
+          _   (run actor "d3" {:op :reply/draft :thread "t-blocked"} 3)
+          res (run actor "s3" {:op :reply/send :thread "t-blocked"} 3)
+          basis (-> (store/ledger s) last :basis)]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:consent-blocked} basis)))))
+
+(deftest missing-redaction-is-held
+  (testing "a proposal citing protected content without :redactions is held"
+    (let [[s _] (fresh)
+          bad-adv (reify replyllm/Advisor
+                    (-advise [_ _ _] {:recommendation :draft :text "..." :effect :draft
+                                      :cites [:health] :redactions [] :confidence 0.9
+                                      :summary "x" :rationale "x"}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request {:op :reply/draft :thread "t-status"} :context (ctx 3)}
+                      {:thread-id "mr"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-redaction} (-> (store/ledger s) last :basis))))))
+
+(deftest no-actuation-invariant
+  (testing "a draft proposal that claims it already sent is held"
+    (let [[s _] (fresh)
+          bad-adv (reify replyllm/Advisor
+                    (-advise [_ _ _] {:recommendation :draft :text "..." :effect :sent
+                                      :cites [] :redactions [] :confidence 0.9
+                                      :summary "x" :rationale "x"}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request {:op :reply/draft :thread "t-status"} :context (ctx 3)}
+                      {:thread-id "na"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-actuation} (-> (store/ledger s) last :basis))))))
+
+(deftest phase0-disables-assessments
+  (let [[s actor] (fresh)
+        res (run actor "p0" {:op :reply/draft :thread "t-status"} 0)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))))
+
+(deftest document-revise-auto-commits-and-records-a-real-branch
+  (testing "phase 3: a clean revision commits and propose-revision! recorded a :branch on it"
+    (let [[s actor] (fresh)
+          res (run actor "rv" {:op :document/revise :document "d-memo"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= "tayori/d-memo" (:branch (store/revision-of s "d-memo")))))))
+
+(deftest document-publish-always-requires-signoff
+  (testing "publishing (merging) is always high-stakes, even with a clean matching target"
+    (let [[_s actor _ published] (fresh)
+          _  (run actor "rv2" {:op :document/revise :document "d-memo"} 3)
+          r1 (run actor "pub" {:op :document/publish :document "d-memo" :target "memos/status.md"} 3)]
+      (is (= :interrupted (:status r1)))
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "pub" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (contains? @published "d-memo"))))))
+
+(deftest document-publish-tenant-mismatch-is-held
+  (testing "a publish target that doesn't match the document's own path is a hijack — HOLD"
+    (let [[s actor] (fresh)
+          _   (run actor "rv3" {:op :document/revise :document "d-memo"} 3)
+          res (run actor "pub2" {:op :document/publish :document "d-memo" :target "other/path.md"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:tenant-mismatch} (-> (store/ledger s) last :basis))))))
+
+(deftest missing-thread-is-held
+  (testing "the governor never trusts a proposal's confidence alone for subject existence"
+    (let [[s actor] (fresh)
+          res (run actor "mt" {:op :reply/draft :thread "t-ghost"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-thread} (-> (store/ledger s) last :basis))))))
+
+(deftest send-against-missing-thread-is-held
+  (let [[s actor] (fresh)
+        res (run actor "ms" {:op :reply/send :thread "t-ghost"} 3)]
+    (is (not= :interrupted (:status res)))
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (some #{:no-thread} (-> (store/ledger s) last :basis)))))
+
+(deftest missing-document-is-held
+  (let [[s actor] (fresh)
+        res (run actor "md" {:op :document/revise :document "d-ghost"} 3)]
+    (is (not= :interrupted (:status res)))
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (some #{:no-document} (-> (store/ledger s) last :basis)))))
+
+(deftest publish-against-missing-document-is-held
+  (let [[s actor] (fresh)
+        res (run actor "mp" {:op :document/publish :document "d-ghost" :target "x"} 3)]
+    (is (not= :interrupted (:status res)))
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (some #{:no-document} (-> (store/ledger s) last :basis)))))
+
+(deftest consent-blocked-participant-not-first-is-held
+  (testing "a blocked contact anywhere in :participants holds sending, not only when listed first"
+    (let [[s actor] (fresh)]
+      (run actor "mc-c1" {:op :contact/register :contact "c-ok2"
+                          :value {:id "c-ok2" :channel :email :address "ok2@example.com"
+                                  :consent :known :first-contact? false}} 3)
+      (run actor "mc-t1" {:op :thread/register :thread "t-multi"
+                          :value {:id "t-multi" :channel :email :external-id "gm-multi"
+                                  :participants ["c-ok2" "c-blocked"] :tenant "alice" :status :open}} 3)
+      (run actor "mc-d" {:op :reply/draft :thread "t-multi"} 3)
+      (let [res (run actor "mc-s" {:op :reply/send :thread "t-multi"} 3)]
+        (is (not= :interrupted (:status res)))
+        (is (= :hold (get-in res [:state :disposition])))
+        (is (some #{:consent-blocked} (-> (store/ledger s) last :basis)))))))
+
+(deftest unrecognized-op-is-held
+  (testing "fail-closed: an op the governor doesn't recognize is a hard violation, not a silent pass"
+    (let [[s actor] (fresh)
+          res (run actor "uo" {:op :reply/teleport :thread "t-status"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:unrecognized-op} (-> (store/ledger s) last :basis))))))
+
+(deftest a-throwing-channel-leaves-no-false-sent-status
+  (testing "the external effect runs BEFORE the store is mutated — a throw leaves no false :sent claim"
+    (let [s  (store/seed-db)
+          bad-ch (reify channel/Channel
+                   (fetch-thread [_ thread-id] {:id thread-id})
+                   (list-new-messages [_ _thread-id] [])
+                   (send-reply! [_ _thread _body] (throw (ex-info "smtp down" {}))))
+          actor (op/build s {:channel bad-ch})]
+      (run actor "d5" {:op :reply/draft :thread "t-status"} 3)
+      (let [r1 (run actor "s5" {:op :reply/send :thread "t-status"} 3)]
+        (is (= :interrupted (:status r1)))
+        (is (thrown? Exception
+                     (g/run* actor {:approval {:status :approved :by "alice"}}
+                             {:thread-id "s5" :resume? true}))))
+      (is (= "proposed" (name (:status (store/draft-of s "t-status"))))
+          "the draft must NOT have been flipped to :sent")
+      (is (empty? (filter #(and (= :committed (:t %)) (= :reply/send (:op %))) (store/ledger s)))
+          "no :committed ledger fact for the :reply/send that never actually happened"))))
+
+(deftest reject-signoff-holds
+  (testing "a human rejection records a hold, not a send"
+    (let [[_s actor sent] (fresh)
+          _  (run actor "d4" {:op :reply/draft :thread "t-status"} 3)
+          _  (run actor "s4" {:op :reply/send :thread "t-status"} 3)
+          r2 (g/run* actor {:approval {:status :rejected :by "alice"}}
+                     {:thread-id "s4" :resume? true})]
+      (is (= :hold (get-in r2 [:state :disposition])))
+      (is (empty? @sent)))))

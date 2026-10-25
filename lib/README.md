@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.tayori` | `kotoba.tayori/src` | `tayori.cacao`, `tayori.channel`, `tayori.channel.email`, `tayori.channel.slack` (Kotoba project library) |
 | `kotoba.godaddyDns` | `kotoba.godaddyDns/src` | `godaddydns.agent`, `godaddydns.dns`, `godaddydns.godaddy`, `godaddydns.tool` (Kotoba project library) |
 | `kotoba.gijiroku` | `kotoba.gijiroku/src` | `gijiroku.bot-join`, `gijiroku.cacao`, `gijiroku.consent`, `gijiroku.google-meet` (Kotoba project library) |
 | `kotoba.denrei` | `kotoba.denrei/src` | `denrei.cacao`, `denrei.channelport`, `denrei.cli`, `denrei.coordllm` (Kotoba project library) |
