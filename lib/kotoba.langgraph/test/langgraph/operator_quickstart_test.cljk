@@ -1,0 +1,130 @@
+(ns langgraph.operator-quickstart-test
+  "Pins the operational claims made by docs/operator-quickstart.md.
+
+  The quickstart tells an operator four things that are NOT obvious from
+  the API and that would silently mislead a supervisor author if they
+  ever stopped being true. Prose can rot without anyone noticing; these
+  assertions can't. Each deftest below carries the § of the quickstart
+  it pins, so a failure here means the doc is now wrong — fix both
+  together or delete both together."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [langchain.db :as db]))
+
+(defn- gated-graph
+  "draft → (gate) → send. `runs` counts executions of the gated node."
+  [checkpointer runs]
+  (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+      (g/add-node :draft (fn [_] {:log [:draft]}))
+      (g/add-node :send (fn [_] (swap! runs inc) {:log [:send]}))
+      (g/set-entry-point :draft)
+      (g/add-edge :draft :send)
+      (g/compile-graph {:checkpointer checkpointer
+                        :interrupt-before #{:send}})))
+
+;; ── §5.1 ─────────────────────────────────────────────────────────────
+(deftest run*-is-one-tick-not-resume-to-completion
+  (testing "quickstart §5.1: `run*` with nil input on a thread whose
+            latest checkpoint is :done does NOT no-op — it starts a
+            fresh tick from the entry point, which re-arms
+            interrupt-before. So a supervisor written as `(while (not=
+            :done (:status (run* cg nil opts))) ...)` never terminates,
+            and re-runs the gated node on every other call. This exact
+            alternation is the table printed in the quickstart."
+    (let [runs (atom 0)
+          cg (gated-graph (cp/mem-checkpointer) runs)
+          call! (fn [input] [(:status (g/run* cg input {:thread-id "t"})) @runs])]
+      (is (= [:interrupted 0] (call! {})) "first run stops before the gate")
+      (is (= [:done 1] (call! nil)) "nil input resumes through the gate")
+      (is (= [:interrupted 1] (call! nil)) "a :done thread starts a NEW tick")
+      (is (= [:done 2] (call! nil)) "…and the next nil call resumes through the gate AGAIN")
+      (is (= [:interrupted 2] (call! nil))))))
+
+(deftest channel-state-accumulates-across-ticks-on-a-done-thread
+  (testing "quickstart §5.1 companion: a fresh tick on a :done thread
+            re-arms interrupt-before from the entry point, but channel
+            reducers still see the prior tick's accumulated state —
+            run* seeds from (merge (initial-state channels) (:state latest)).
+            A supervisor that assumes each tick starts from channel
+            defaults will mis-count approvals, double-charge ledgers, or
+            drop audit history that the graph deliberately carried."
+    (let [runs (atom 0)
+          cg (gated-graph (cp/mem-checkpointer) runs)]
+      (is (= :interrupted (:status (g/run* cg {} {:thread-id "t"}))))
+      (is (= :done (:status (g/run* cg nil {:thread-id "t"}))))
+      (is (= [:draft :send] (:log (:state (cp/get-latest (get-in cg [:opts :checkpointer]) "t")))))
+      (is (= :interrupted (:status (g/run* cg {} {:thread-id "t"})))
+      (is (= [:draft :send :draft]
+             (:log (:state (cp/get-latest (get-in cg [:opts :checkpointer]) "t"))))
+          "the second tick's :draft ran against the first tick's log, not a blank slate")))))
+
+;; ── §5.2 ─────────────────────────────────────────────────────────────
+(deftest which-checkpointers-claim
+  (testing "quickstart §5.2 hazard table: `run*` only takes an atomic
+            resume claim when the checkpointer implements
+            ClaimableCheckpointer, and that is currently true of
+            mem-checkpointer alone. If a backend gains the protocol,
+            this test fails and the doc's table must be updated with it."
+    (is (satisfies? cp/ClaimableCheckpointer (cp/mem-checkpointer))
+        "mem-checkpointer claims")
+    (is (not (satisfies? cp/ClaimableCheckpointer
+                         (cp/datomic-checkpointer (db/create-conn cp/checkpoint-schema))))
+        "datomic-checkpointer does NOT claim — documented gap, not an oversight")))
+
+;; §5.2's residual risk — that a claiming checkpointer still lets the
+;; gated node run more than once across several callers — is NOT pinned
+;; by a concurrency test here. A thread race can only ever observe one
+;; interleaving, so asserting a number would be flaky and asserting a
+;; bound would be a tautology (both are the "gate that cannot fail"
+;; failure mode). The risk is fully determined by two facts that ARE
+;; pinned deterministically above: only mem-checkpointer claims
+;; (which-checkpointers-claim), and any caller observing a :done thread
+;; re-arms the gate (run*-is-one-tick-not-resume-to-completion). The
+;; quickstart reports the measured race number as an observation with a
+;; reproduction, not as a guarantee.
+
+;; ── §5.3 ─────────────────────────────────────────────────────────────
+(deftest recursion-limit-throws-and-is-not-a-status
+  (testing "quickstart §5.3: exceeding :recursion-limit throws ex-info —
+            it does not come back as {:status :limit}. A supervisor that
+            only inspects :status will crash instead of parking the
+            thread, so the doc tells operators to catch it. The ex-data
+            keys are part of that contract."
+    (let [cg (-> (g/state-graph)
+                 (g/add-node :loop (fn [s] s))
+                 (g/set-entry-point :loop)
+                 (g/add-edge :loop :loop)
+                 (g/compile-graph {:recursion-limit 5}))
+          e (try (g/run* cg {} {}) nil
+                 (catch js/Error e e))]
+      (is (some? e) "must throw, not return")
+      (is (= "Recursion limit reached" (ex-message e)))
+      (is (= [:frontier :limit :state] (vec (sort (keys (ex-data e)))))
+          "ex-data carries enough to park and inspect the thread")
+      (is (= 5 (:limit (ex-data e))))
+      (is (= [:loop] (:frontier (ex-data e))) "where it was when it gave up"))))
+
+;; ── §4 ───────────────────────────────────────────────────────────────
+(deftest checkpoint-history-is-readable-without-running-the-graph
+  (testing "quickstart §4: an operator inspecting a stuck thread reads
+            history through the checkpointer, never by re-running the
+            graph. list-checkpoints is ascending by :step and
+            get-state-at addresses one of them."
+    (let [runs (atom 0)
+          cpr (cp/datomic-checkpointer (db/create-conn cp/checkpoint-schema))
+          cg (gated-graph cpr runs)]
+      ;; Drive a FULL cycle, not just the first tick: with a single
+      ;; checkpoint the ordering assertion below would be vacuously
+      ;; true, which is exactly how an ordering test stops biting.
+      (g/run* cg {} {:thread-id "t"})
+      (g/run* cg nil {:thread-id "t"})
+      (let [driven @runs
+            ckpts (cp/list-checkpoints cpr "t")
+            steps (mapv :step ckpts)]
+        (is (< 1 (count ckpts)) "more than one step, or the sort below proves nothing")
+        (is (= steps (vec (sort steps))) "ascending by :step")
+        (is (= :done (:status (cp/get-latest cpr "t"))))
+        (is (= (first ckpts) (cp/get-state-at cpr "t" (first steps)))
+            "get-state-at addresses a step directly")
+        (is (= driven @runs) "reading history never runs a node")))))

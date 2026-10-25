@@ -1,0 +1,120 @@
+(ns langgraph.core-parity-test
+  "The oracle half of the langgraph.core (Kotoba) parity: the nine scenarios
+  of `test/langgraph/kotoba/scenarios.kotoba`, run through `langgraph.graph`
+  and folded into the same i64 code, must equal
+  `test/langgraph/kotoba/expected.edn` -- the literals the guest's own
+  `test-sN` pin. Node ids 0..3 are the nodes :n0 .. :n3 here; the guest's
+  packed frontier is a vector of node names; a status the guest returns is,
+  on this side, what `run*` returns or throws.
+
+  Where the oracle THROWS the guest returns a status, and the guest's
+  checkpoint at that point is the oracle's latest saved checkpoint (the
+  `:running` one written before the superstep) -- or the entry, when
+  nothing was saved yet. So every scenario runs with a `mem-checkpointer`
+  and a thread id, and a thrown scenario reads step and frontier from it."
+  (:require [kotoba.lang.error :as kerror] #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            #?(:clj [kotoba.lang.edn :as edn] :cljs [cljs.reader :as edn])
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]))
+
+(def ^:private expected
+  (edn/read-string
+   #?(:clj (slurp "lib/kotoba.langgraph/test/langgraph/kotoba/expected.edn")
+      :cljs (.readFileSync (js/require "fs") "lib/kotoba.langgraph/test/langgraph/kotoba/expected.edn" "utf8"))))
+
+(def ^:private END g/END)
+(def ^:private names [:n0 :n1 :n2 :n3])
+(defn- id-of [n]
+  ;; :n9 (an id the graph does not have) must still read as 9
+  (let [digits (subs (name n) 1)]
+    #?(:clj (Long/parseLong digits) :cljs (js/parseInt digits 10))))
+
+;; node id -> +1 / +10 / +100 / +1000, trace appends (id + 1)
+(defn- node-fn [id]
+  (fn [s]
+    {:count (+ (:count s) (nth [1 10 100 1000] id))
+     :trace (+ (* 10 (:trace s)) (inc id))}))
+
+(defn- graph
+  "entry: node names; ib/ia: interrupt sets; extra: more (from to) edges."
+  [& {:keys [entry limit ib ia] :or {limit 25 ib #{} ia #{}}}]
+  (-> (reduce (fn [gr [i n]] (g/add-node gr n (node-fn i)))
+              (g/state-graph {:channels {:count {:default 0} :trace {:default 0}}})
+              (map-indexed vector names))
+      (as-> gr (reduce #(g/add-edge %1 g/START %2) gr entry))
+      (g/add-edge :n0 :n1)
+      (g/add-conditional-edges :n1 (fn [s] (if (< (:count s) 30) :n1 END)))
+      (g/add-edge :n2 :n3)
+      (g/set-finish-point :n3)
+      (g/compile-graph {:recursion-limit limit
+                        :interrupt-before ib :interrupt-after ia
+                        :checkpointer (cp/mem-checkpointer)})))
+
+(def ^:private status-digit
+  {:done 1 :interrupted 2 :running 3 :recursion-limit 4 :unknown-node 5 :no-entry 6})
+
+(defn- code [{:keys [state step status frontier]}]
+  (let [fcount (count frontier)
+        f0 (if (zero? fcount) 0 (id-of (first frontier)))]
+    (+ (* (+ (* (+ (* (+ (* (:count state) 1000) step) 10) (status-digit status)) 100)
+             (+ (* fcount 10) f0))
+          1000000)
+       (:trace state))))
+
+(defn- run
+  "run* on thread `tid`, or the thrown status with the checkpointer's view of
+  step and frontier."
+  [cg input tid]
+  (try (let [r (g/run* cg input {:thread-id tid})
+             latest (cp/get-latest (get-in cg [:opts :checkpointer]) tid)]
+         (assoc r :step (:step latest)))
+       (catch kerror/ExceptionInfo e
+         (let [latest (cp/get-latest (get-in cg [:opts :checkpointer]) tid)
+               data (ex-data e)
+               message (ex-message e)]
+           {:state (or (:state data) (:state latest) {:count 0 :trace 0})
+            :step (or (:step latest) 0)
+            :frontier (or (:frontier data) (:frontier latest)
+                          (vec (remove #{END} (get-in cg [:graph :edges g/START]))))
+            :status (cond (re-find #"Recursion limit" message) :recursion-limit
+                          (re-find #"Unknown node" message) :unknown-node
+                          (re-find #"No entry point" message) :no-entry
+                          :else (throw e))}))))
+
+(deftest s1-linear-then-self-loop
+  (is (= (:s1 expected) (code (run (graph :entry [:n0]) {} "t")))))
+
+(deftest s2-fan-out-runs-in-insertion-order
+  (is (= (:s2 expected) (code (run (graph :entry [:n0 :n2]) {} "t")))))
+
+(deftest s3-interrupt-before
+  (is (= (:s3 expected) (code (run (graph :entry [:n0] :ib #{:n1}) {} "t")))))
+
+(deftest s4-resume-hits-the-gate-again-on-the-self-loop
+  (let [cg (graph :entry [:n0] :ib #{:n1})]
+    (run cg {} "t")
+    (is (= (:s4 expected) (code (run cg nil "t"))))))
+
+(deftest s5-interrupt-after
+  (is (= (:s5 expected) (code (run (graph :entry [:n0] :ia #{:n0}) {} "t")))))
+
+(deftest s6-recursion-limit
+  (is (= (:s6 expected) (code (run (graph :entry [:n0] :limit 2) {} "t")))))
+
+(deftest s7-unknown-node
+  ;; a graph whose entry names a node that was never added
+  (let [cg (-> (graph :entry [:n0])
+               (update-in [:graph :edges g/START] (constantly [:n9])))]
+    (is (= (:s7 expected) (code (run cg {} "t"))))))
+
+(deftest s8-update-state-then-resume
+  (let [cg (graph :entry [:n0] :ib #{:n1})]
+    (run cg {} "t")
+    (g/update-state! cg "t" {:count 25})
+    (is (= (:s8 expected) (code (run cg nil "t"))))))
+
+(deftest s9-a-finished-thread-continues-from-the-entry
+  (let [cg (graph :entry [:n0])]
+    (run cg {} "t")
+    (is (= (:s9 expected) (code (run cg nil "t"))))))

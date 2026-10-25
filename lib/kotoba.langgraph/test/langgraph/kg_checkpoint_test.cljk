@@ -1,0 +1,149 @@
+(ns langgraph.kg-checkpoint-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.kotoba-db    :as kdb]
+            [langgraph.kg-checkpoint :as kgcp]
+            [langgraph.checkpoint    :as cp]))
+
+;; ─── mock helpers ────────────────────────────────────────────────────────────
+
+(defn- nsid-from-url [url] (last (str/split url #"/xrpc/")))
+
+(defn- make-caps
+  "Builds host-caps that capture calls and dispatches to respond-fn.
+  respond-fn: (fn [nsid parsed-body] => clj-map)
+  captured:   atom collecting {:nsid :body} per call."
+  [captured respond-fn]
+  {:http-fn
+   (fn [{:keys [url body]}]
+     (let [nsid   (nsid-from-url url)
+           parsed (edn/read-string body)
+           resp   (respond-fn nsid parsed)]
+       (swap! captured conj {:nsid nsid :body parsed})
+       {:status 200 :body (pr-str resp)}))
+   :json-write pr-str
+   :json-read  edn/read-string})
+
+(def ^:private kg-conn
+  (kdb/kotoba-conn "http://kotoba.test:8080" kdb/KG-GRAPH-CID {:token "test-token"}))
+
+;; ─── helpers ─────────────────────────────────────────────────────────────────
+
+(defn- ingest-resp []
+  {:ok true :entity_cid "cid-x" :kind "langgraph/checkpoint" :quad_count 6})
+
+(defn- q-rows
+  "Build rows_edn for a single checkpoint (step, state, frontier, status).
+  Values are pr-str'd EDN strings since kg.ingest stores text claims."
+  [step state frontier status]
+  [[(pr-str (str step))
+    (pr-str (pr-str state))
+    (pr-str (pr-str frontier))
+    (pr-str (pr-str status))]])
+
+;; ─── -put! ───────────────────────────────────────────────────────────────────
+
+(deftest put-writes-kg-ingest
+  (let [captured (atom [])
+        caps     (make-caps captured (fn [nsid _] (when (= nsid "ai.gftd.apps.kotobase.kg.ingest") (ingest-resp))))
+        cp       (kgcp/kg-checkpointer kg-conn caps)]
+    (cp/put! cp "thread-A" {:step 0 :state {:count 0} :frontier [:counter] :status :running})
+    (testing "posts to kg.ingest NSID"
+      (is (= "ai.gftd.apps.kotobase.kg.ingest" (:nsid (first @captured)))))
+    (testing "entity id is thread/step"
+      (is (= "thread-A/0" (:id (:body (first @captured))))))
+    (testing "kind is langgraph/checkpoint"
+      (is (= "langgraph/checkpoint" (:kind (:body (first @captured))))))
+    (testing "claims include thread, step, state, frontier, status"
+      (let [claims (:claims (:body (first @captured)))
+            pred->val (into {} (map (juxt :pred :value) claims))]
+        (is (= "thread-A" (get pred->val "thread")))
+        (is (= "0"        (get pred->val "step")))
+        (is (string? (get pred->val "state")))
+        (is (string? (get pred->val "frontier")))
+        (is (string? (get pred->val "status")))))))
+
+(deftest put-returns-ckpt
+  (let [caps (make-caps (atom []) (fn [_ _] (ingest-resp)))
+        cp   (kgcp/kg-checkpointer kg-conn caps)
+        ckpt {:step 1 :state {:count 1} :frontier [:decider] :status :running}
+        ret  (cp/put! cp "thread-A" ckpt)]
+    (is (= ckpt ret))))
+
+;; ─── -get-latest ─────────────────────────────────────────────────────────────
+
+(deftest get-latest-returns-max-step
+  (let [captured (atom [])
+        caps     (make-caps captured
+                            (fn [nsid _body]
+                              (if (= nsid "ai.gftd.apps.kotobase.datomic.q")
+                                {:graph kdb/KG-GRAPH-CID :basis_t nil
+                                 :rows_edn (concat
+                                            (q-rows 0 {:count 0} [] :running)
+                                            (q-rows 1 {:count 1} [:counter] :running)
+                                            (q-rows 2 {:count 2} [:decider] :done))}
+                                {})))
+        cp       (kgcp/kg-checkpointer kg-conn caps)
+        latest   (cp/get-latest cp "thread-A")]
+    (testing "queries datomic.q"
+      (is (= "ai.gftd.apps.kotobase.datomic.q" (:nsid (first @captured)))))
+    (testing "queries kotobase-kg-v1 graph"
+      (is (= kdb/KG-GRAPH-CID (:graph (:body (first @captured))))))
+    (testing "returns checkpoint with highest step"
+      (is (= 2 (:step latest))))
+    (testing "state is decoded from EDN"
+      (is (= {:count 2} (:state latest))))
+    (testing "frontier is decoded from EDN"
+      (is (= [:decider] (:frontier latest))))
+    (testing "status is decoded from EDN"
+      (is (= :done (:status latest))))))
+
+(deftest get-latest-returns-nil-when-no-checkpoints
+  (let [caps (make-caps (atom []) (fn [_ _] {:graph kdb/KG-GRAPH-CID :basis_t nil :rows_edn []}))
+        cp   (kgcp/kg-checkpointer kg-conn caps)]
+    (is (nil? (cp/get-latest cp "thread-A")))))
+
+;; ─── -list-checkpoints ───────────────────────────────────────────────────────
+
+(deftest list-checkpoints-sorted-by-step
+  (let [caps (make-caps (atom [])
+                        (fn [_ _]
+                          {:graph kdb/KG-GRAPH-CID :basis_t nil
+                           :rows_edn (concat
+                                      (q-rows 2 {:count 2} [:decider] :running)
+                                      (q-rows 0 {:count 0} [:counter] :running)
+                                      (q-rows 1 {:count 1} [:counter] :running))}))
+        cp   (kgcp/kg-checkpointer kg-conn caps)
+        ckpts (cp/list-checkpoints cp "thread-A")]
+    (testing "returns all checkpoints sorted asc by step"
+      (is (= [0 1 2] (map :step ckpts))))
+    (testing "state is decoded"
+      (is (= {:count 0} (:state (first ckpts)))))
+    (testing "frontier is decoded"
+      (is (= [:counter] (:frontier (first ckpts)))))
+    (testing "status is decoded"
+      (is (= :running (:status (first ckpts)))))))
+
+(deftest list-checkpoints-empty-when-none
+  (let [caps (make-caps (atom []) (fn [_ _] {:graph kdb/KG-GRAPH-CID :basis_t nil :rows_edn []}))
+        cp   (kgcp/kg-checkpointer kg-conn caps)]
+    (is (= [] (cp/list-checkpoints cp "thread-A")))))
+
+;; ─── get-state-at (time travel) ──────────────────────────────────────────────
+
+(deftest get-state-at-finds-correct-step
+  (let [caps (make-caps (atom [])
+                        (fn [_ _]
+                          {:graph kdb/KG-GRAPH-CID :basis_t nil
+                           :rows_edn (concat
+                                      (q-rows 0 {:count 0} [] :running)
+                                      (q-rows 1 {:count 1} [:counter] :done))}))
+        cp   (kgcp/kg-checkpointer kg-conn caps)]
+    (testing "returns checkpoint at step 1"
+      (let [at1 (cp/get-state-at cp "thread-A" 1)]
+        (is (= 1 (:step at1)))
+        (is (= {:count 1} (:state at1)))))
+    (testing "returns nil for non-existent step"
+      (is (nil? (cp/get-state-at cp "thread-A" 99))))))

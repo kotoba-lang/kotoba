@@ -1,0 +1,156 @@
+(ns nintendo-loop-live
+  "LIVE wiring of the Nintendo Loop (examples/nintendo_loop.cljk) against the REAL
+   network-isekai game `gftd/yoro` — headless, no browser, no API key.
+
+   The langgraph-clj graph is unchanged; only the injected host capabilities are real:
+
+     :observe  → shells `node quality/observe.mjs <gameDir>` — compiles logic.clj → wasm with
+                 kototama (in Node) and runs the deterministic playtester, returning objective
+                 game‑feel scores + named defects as EDN. (The *visual test*, headless half.)
+     :judge    → merges the harness scores with a static SFX audit of scene.edn. (The vision
+                 dims — readability/juice/composition — are the documented Claude hook; this
+                 live run uses the objective + audio rubric so it closes fully autonomously.)
+     :reason   → a rule‑based critic: maps the worst harness defect to ONE concrete tuning
+                 patch (e.g. 'jump too weak' → raise the `jump` constant). (Swap for a
+                 create‑react‑agent + Claude to author free‑form edits.)
+     :apply    → edits the game's logic.clj in place (with a content backup for rollback).
+     :rollback → restores the backup (the graph's time‑travel branch).
+
+   Run:
+     cd com-junkawasaki/langgraph-clj
+     kbb -Sdeps '{:paths [\"src\" \"examples\"] \\
+       :deps {io.github.com-junkawasaki/langchain-clj {:local/root \"../langchain-clj\"}}}' \\
+       -M -e \"(require 'nintendo-loop-live)(nintendo-loop-live/-main)\""
+  (:require [nintendo-loop :as nl]
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [langchain.db :as db]
+            [clojure.java.shell :as sh]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.coll :as set]
+            [kotoba.lang.edn :as edn]))
+
+(def REPO  (or (System/getenv "ISEKAI_REPO")
+               "/Users/junkawasaki/github/com-junkawasaki/orgs/gftdcojp/network-isekai"))
+(def GAME-DIR "public/games/gftd/yoro")
+
+;; objective + audio rubric — every dimension here is auto‑measured, so the loop converges
+;; on its own via the rule‑based critic.
+(def rubric
+  {:threshold 85 :margin 6
+   :dimensions [{:key :game-feel  :how :harness :desc "jump apex/airtime/float in band"}
+                {:key :responsive :how :harness :desc "input ≤1 frame, perf headroom"}
+                {:key :difficulty :how :harness :desc "no soft‑lock; inhale usable; few deaths"}
+                {:key :audio      :how :audit   :desc "a distinct SFX per game event"}]})
+
+;; full Nintendo bar — adds the VISION dims judged by Gemma 4 12B IT QAT on the murakumo Mac
+;; mini fleet (quality/vision.mjs). Use this when a rendered frame is available.
+(def rubric+vision
+  (update rubric :dimensions into
+          [{:key :readability :how :vision :desc "contrast/silhouette; HUD never hides play (Gemma)"}
+           {:key :juice       :how :vision :desc "squash&stretch, particles, dust, shake (Gemma)"}
+           {:key :composition :how :vision :desc "palette, parallax depth, framing (Gemma)"}]))
+
+;; ── caps ──────────────────────────────────────────────────────────────────────────────
+
+(defn- sh! [& args]
+  (let [{:keys [exit out err]} (apply sh/sh (concat args [:dir REPO]))]
+    (when-not (zero? exit) (println "  ! shell" (pr-str args) "→" err))
+    out))
+
+(defn- observe [target]
+  (assoc (-> (sh! "node" "quality/observe.mjs" (:dir target)) str/trim edn/read-string)
+         :target target))
+
+(defn- audio-audit [target]
+  (let [scene (edn/read-string (slurp (str (:dir target) "/scene.edn")))
+        want  #{:inhale :collect :collect-gold :catch}
+        have  (set (keys (:audio scene)))
+        miss  (set/difference want have)]
+    {:score (int (* 100 (/ (count (set/intersection want have)) (count want))))
+     :defects (mapv (fn [k] {:dim "audio" :issue (str "missing SFX " k)}) miss)}))
+
+;; VISION judge — Gemma 4 12B IT QAT on the murakumo fleet (quality/vision.mjs). Only runs
+;; when the target names a rendered :frame; otherwise the vision dims are left to the rubric
+;; default (so the headless, frame‑less loop stays fast and offline).
+(defn- vision-judge [target]
+  (when-let [frame (:frame target)]
+    (-> (sh! "node" "quality/vision.mjs" frame) str/trim edn/read-string)))
+
+(defn- judge [obs rubric]
+  (let [aud (audio-audit (:target obs))
+        vis (when (some #(= :vision (:how %)) (:dimensions rubric))
+              (vision-judge (:target obs)))]
+    {:scores  (merge (assoc (:scores obs) :audio (:score aud)) (:scores vis))
+     :defects (-> (vec (:defects obs))
+                  (into (:defects aud))
+                  (into (map #(update % :dim name) (:defects vis))))}))
+
+;; rule‑based Reason: the worst harness defect → one tuning patch on a `(def sym (f32 N))`.
+(defn- reason [{:keys [worst defects target]}]
+  (let [d (first defects)
+        issue (str (:issue d))
+        rule (cond
+               (re-find #"too weak" issue)   {:sym "jump"   :delta 140.0 :why "raise jump height"}
+               (re-find #"too floaty" issue) {:sym "jump"   :delta -120.0 :why "tighten jump"}
+               (re-find #"inhale" issue)     {:sym "suck"   :delta 250.0 :why "stronger inhale pull"}
+               (re-find #"not applied" issue){:sym "run"    :delta 40.0  :why "snappier run"}
+               :else                          {:sym "jump"  :delta 80.0  :why (str "nudge " (name (:key worst)))})]
+    {:rationale (str (:why rule) " (defect: " issue ")")
+     :patch (assoc rule :file (str (:dir target) "/logic.clj")
+                   :summary (str (:sym rule) (if (pos? (:delta rule)) "+" "") (:delta rule)))}))
+
+(defn- apply-patch [{:keys [patch]}]
+  (let [{:keys [file sym delta]} patch
+        src (slurp file)
+        re  (re-pattern (str "\\(def\\s+" sym "\\s+\\(f32\\s+(-?[0-9.]+)\\)\\)"))
+        m   (re-find re src)]
+    (if-not m
+      {:applied? false :build-ok? true :backup {:file file :content src}}
+      (let [cur (Double/parseDouble (second m))
+            nv  (+ cur delta)
+            src' (str/replace src re (str "(def " sym " (f32 " (format "%.1f" nv) "))"))]
+        (spit file src')
+        {:applied? true :build-ok? true :smoke {:ok true}
+         :backup {:file file :content src} :was cur :now nv}))))
+
+(defn- rollback [{:keys [file content] :as backup}]
+  (if backup (do (spit file content) {:restored? true}) {:restored? false}))
+
+;; ── run ──────────────────────────────────────────────────────────────────────────────
+
+(defn make-live-graph [cpr]
+  (nl/make-graph
+   {:observe observe :judge judge :reason reason :apply apply-patch :rollback rollback}
+   rubric
+   {:checkpointer cpr :max-iter 8}))
+
+(defn -main [& _]
+  (let [logic (str REPO "/" GAME-DIR "/logic.clj")
+        original (slurp logic)
+        cpr (cp/datomic-checkpointer (db/create-conn cp/checkpoint-schema))
+        target {:game "gftd/yoro" :dir (str REPO "/" GAME-DIR)}]
+    (try
+      ;; DEMO: introduce a real defect — detune the jump so the apex falls below the band —
+      ;; then let the live loop detect → reason → patch logic.clj → re‑measure → converge.
+      (spit logic (str/replace original
+                              #"\(def jump\s+\(f32\s+[0-9.]+\)\)"
+                              "(def jump   (f32 360.0))"))   ;; too weak on purpose
+      (println "── Nintendo Loop · LIVE on gftd/yoro (headless wasm) ───────────")
+      (println "detuned jump → 360 (apex will fall below the 110‑200 band)\n")
+      (let [{:keys [state]} (g/run* (make-live-graph cpr)
+                                    {:target target}
+                                    {:thread-id "yoro-live"})]
+        (println "quality trajectory (min dimension per iteration):")
+        (doseq [h (:history state)]
+          (println (format "  iter %2d   min %3d   worst %-11s" (:iter h) (:min h) (name (:worst h)))))
+        (println "\nReAct transcript:")
+        (doseq [[tag line] (:messages state)] (println (format "  %-9s %s" (str tag) line)))
+        (println "\nfinal scores:" (into (sorted-map) (:scores state))
+                 "| nintendo‑bar:" (nl/nintendo-bar? rubric (:scores state)))
+        (println "current jump in logic.clj:"
+                 (second (re-find #"\(def jump\s+\(f32\s+([0-9.]+)\)\)" (slurp logic))))
+        (println "checkpoints (datoms):" (count (cp/list-checkpoints cpr "yoro-live"))))
+      (finally
+        (spit logic original)        ;; restore the canonical game after the demo
+        (println "\n(restored logic.clj to its canonical version)")))))

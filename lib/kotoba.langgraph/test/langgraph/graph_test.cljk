@@ -1,0 +1,165 @@
+(ns langgraph.graph-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [langchain.db :as db]))
+
+(defn- linear-graph []
+  (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+      (g/add-node :a (fn [_] {:log [:a]}))
+      (g/add-node :b (fn [_] {:log [:b]}))
+      (g/set-entry-point :a)
+      (g/add-edge :a :b)
+      (g/set-finish-point :b)))
+
+(deftest linear-execution
+  (let [cg (g/compile-graph (linear-graph))]
+    (is (= [:a :b] (:log (g/invoke cg {}))))
+    (testing "stream yields one event per node run"
+      (is (= [:a :b] (mapv :node (g/stream cg {})))))))
+
+(deftest channels-and-reducers
+  (let [cg (-> (g/state-graph {:channels {:n {:reducer + :default 0}
+                                          :last {}}})
+               (g/add-node :inc1 (fn [_] {:n 1 :last :inc1}))
+               (g/add-node :inc2 (fn [_] {:n 10 :last :inc2}))
+               (g/set-entry-point :inc1)
+               (g/add-edge :inc1 :inc2)
+               (g/compile-graph))]
+    (let [out (g/invoke cg {:n 100})]
+      (is (= 111 (:n out)) "reducer accumulates input + both nodes")
+      (is (= :inc2 (:last out)) "default channel is last-write-wins"))))
+
+(deftest conditional-routing
+  (let [cg (-> (g/state-graph)
+               (g/add-node :start (fn [s] s))
+               (g/add-node :small (fn [s] (assoc s :result :small)))
+               (g/add-node :big (fn [s] (assoc s :result :big)))
+               (g/set-entry-point :start)
+               (g/add-conditional-edges :start
+                                        (fn [s] (if (> (:x s) 10) :big :small)))
+               (g/compile-graph))]
+    (is (= :big (:result (g/invoke cg {:x 11}))))
+    (is (= :small (:result (g/invoke cg {:x 1}))))))
+
+(deftest recursion-limit
+  (let [cg (-> (g/state-graph)
+               (g/add-node :loop (fn [s] s))
+               (g/set-entry-point :loop)
+               (g/add-edge :loop :loop)
+               (g/compile-graph {:recursion-limit 5}))]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (g/invoke cg {})))))
+
+(defn- interrupting-graph [checkpointer]
+  (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+      (g/add-node :draft (fn [_] {:log [:draft]}))
+      (g/add-node :send (fn [_] {:log [:send]}))
+      (g/set-entry-point :draft)
+      (g/add-edge :draft :send)
+      (g/compile-graph {:checkpointer checkpointer
+                        :interrupt-before #{:send}})))
+
+(deftest interrupt-and-resume-mem
+  (let [cpr (cp/mem-checkpointer)
+        cg (interrupting-graph cpr)
+        r1 (g/run* cg {} {:thread-id "t1"})]
+    (is (= :interrupted (:status r1)))
+    (is (= [:draft] (:log (:state r1))) "stopped before :send")
+    (testing "human-in-the-loop state edit, then resume with nil input"
+      (g/update-state! cg "t1" {:log [:human-approved]})
+      (let [r2 (g/run* cg nil {:thread-id "t1"})]
+        (is (= :done (:status r2)))
+        (is (= [:draft :human-approved :send] (:log (:state r2))))))))
+
+#?(:clj
+   (deftest claim-resume!-under-real-thread-contention-only-one-winner
+     (testing "the core atomic-claim primitive itself, isolated from run*'s
+               broader semantics (re-invoking an already-:done thread for a
+               new tick is legitimate, separate behavior -- NOT what's
+               under test here): N threads all racing to claim-resume! the
+               SAME :interrupted checkpoint must have EXACTLY ONE winner"
+       (let [cpr (cp/mem-checkpointer)
+             _ (cp/put! cpr "t" {:step 0 :state {} :frontier [:send] :status :interrupted})
+             expected (cp/get-latest cpr "t")
+             n 20
+             wins (atom 0)
+             threads (mapv (fn [_]
+                             (Thread. (fn []
+                                       (when (cp/claim-resume! cpr "t" expected)
+                                         (swap! wins inc)))))
+                          (range n))]
+         (run! #(.start ^Thread %) threads)
+         (run! #(.join ^Thread %) threads)
+         (is (= 1 @wins) "exactly one of N concurrent claims on the identical checkpoint must win")))))
+
+#?(:clj
+   (deftest concurrent-resume-does-not-run-the-gated-node-twice
+     (testing "interrupt-before is langgraph's entire human-in-the-loop
+               safety gate -- without an atomic claim, two callers racing
+               to resume the SAME :interrupted checkpoint (a retry, a
+               double-click, a racing worker -- realistic, not contrived)
+               could both run the gated node. Forces genuine simultaneity
+               with a CountDownLatch (both threads block until released
+               together) so this isolates the SAME-checkpoint race
+               specifically, not the separate/legitimate case of a caller
+               observing an ALREADY-:done thread and starting a fresh new
+               tick (that's expected re-invocation behavior, not a bug).
+
+               Two DIFFERENT legitimate outcome shapes are both correct,
+               depending on exactly how the two threads interleave after
+               release, and this test must accept either: (a) both threads
+               see the SAME :interrupted checkpoint -> one wins the claim
+               (:ok, runs :send), the other loses it cleanly (:claim-lost,
+               throws, does NOT run :send); or (b) the loser's own read
+               happens to land AFTER the winner has already fully finished
+               (a real possibility even with the latch, since .await
+               releasing both threads doesn't guarantee lock-step
+               execution past that point) -- it then sees :done, takes the
+               legitimate fresh-tick path, immediately re-hits :send's own
+               interrupt-before gate, and returns normally (:ok) WITHOUT
+               running :send. Either way :send runs exactly once -- that
+               invariant, not the exact outcome-label pairing, is what's
+               actually under test."
+       (let [runs (atom 0)
+             cpr (cp/mem-checkpointer)
+             cg (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+                    (g/add-node :draft (fn [_] {:log [:draft]}))
+                    (g/add-node :send (fn [_] (swap! runs inc) {:log [:send]}))
+                    (g/set-entry-point :draft)
+                    (g/add-edge :draft :send)
+                    (g/compile-graph {:checkpointer cpr :interrupt-before #{:send}}))
+             gate (java.util.concurrent.CountDownLatch. 1)
+             outcomes (atom [])
+             run-one (fn []
+                       (.await gate)
+                       (try
+                         (g/run* cg nil {:thread-id "race"})
+                         (swap! outcomes conj :ok)
+                         (catch Exception e
+                           (swap! outcomes conj
+                                  (if (re-find #"Concurrent resume" (ex-message e)) :claim-lost :other-error)))))
+             threads (mapv (fn [_] (Thread. run-one)) (range 2))]
+         (g/run* cg {} {:thread-id "race"}) ;; interrupt before :send
+         (run! #(.start ^Thread %) threads)
+         (.countDown gate) ;; release both threads at once -- genuine simultaneity
+         (run! #(.join ^Thread %) threads)
+         (is (= 1 @runs) ":send must run EXACTLY once between the two SAME-checkpoint racers")
+         (is (not (contains? (set @outcomes) :other-error))
+             (str "no unexpected exception -- outcomes were " @outcomes))))))
+
+(deftest interrupt-and-resume-datomic
+  (let [conn (db/create-conn cp/checkpoint-schema)
+        cpr (cp/datomic-checkpointer conn)
+        cg (interrupting-graph cpr)]
+    (g/run* cg {} {:thread-id "t1"})
+    (testing "checkpoints are queryable datoms"
+      (is (pos? (count (cp/list-checkpoints cpr "t1"))))
+      (is (= :interrupted (:status (cp/get-latest cpr "t1")))))
+    (testing "resume from datomic-backed checkpoint"
+      (let [r2 (g/run* cg nil {:thread-id "t1"})]
+        (is (= :done (:status r2)))
+        (is (= [:draft :send] (:log (:state r2))))))
+    (testing "time travel via get-state-at"
+      (let [steps (mapv :step (cp/list-checkpoints cpr "t1"))]
+        (is (= steps (vec (sort steps))))
+        (is (some? (cp/get-state-at cpr "t1" (first steps))))))))

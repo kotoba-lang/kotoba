@@ -1,0 +1,211 @@
+(ns langgraph.superstep-test
+  "Superstep semantics that the API does not show, and that no other
+  test in this repo pins.
+
+  Every deftest here names the concrete damage its invariant prevents.
+  That is deliberate: an assertion whose failure reads as \"a number
+  changed\" gets deleted by the next person in a hurry, and then the
+  behaviour it guarded goes with it."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]))
+
+;; ── fan-in ───────────────────────────────────────────────────────────
+
+(deftest a-fan-in-node-runs-once-per-superstep-not-once-per-inbound-edge
+  (testing "diamond: a → {b, c} → d. b and c run in the SAME superstep
+            and both name d as their successor, so d is enqueued twice
+            and the frontier has to collapse it. Nodes are effectful in
+            practice — they call models, tools, payment APIs — so the
+            damage when the frontier does not dedup is not a slower
+            graph. It is the effect happening twice for one logical
+            step, on the fan-in node specifically, which is exactly
+            where a graph puts the thing it must do once."
+    (let [runs (atom [])
+          hit! (fn [n] (fn [_] (swap! runs conj n) {:log [n]}))
+          cg (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+                 (g/add-node :a (hit! :a))
+                 (g/add-node :b (hit! :b))
+                 (g/add-node :c (hit! :c))
+                 (g/add-node :d (hit! :d))
+                 (g/set-entry-point :a)
+                 (g/add-edge :a :b)
+                 (g/add-edge :a :c)
+                 (g/add-edge :b :d)
+                 (g/add-edge :c :d)
+                 (g/set-finish-point :d)
+                 (g/compile-graph))
+          out (g/invoke cg {})]
+      (is (= 1 (count (filter #{:d} @runs)))
+          ":d runs once, not once per inbound edge")
+      (is (= [:a :b :c :d] @runs)
+          "…and only after both of its predecessors have run")
+      (is (= [:a :b :c :d] (:log out))
+          "the channel reducer folds each node's update exactly once — a
+           duplicated run would also duplicate the accumulated state"))))
+
+;; ── interrupt-after ──────────────────────────────────────────────────
+
+(deftest interrupt-after-parks-past-the-node-that-tripped-it
+  (testing "interrupt-before parks BEFORE a node; interrupt-after parks
+            AFTER one, and the difference is the whole point of having
+            both. The node named by interrupt-after has already run when
+            the thread parks, so the saved frontier must be its
+            successors — not the frontier that was current when the
+            superstep began. Save the wrong one and resuming re-runs the
+            node the operator was reviewing: here, charging the card a
+            second time while a human looks at the receipt."
+    (let [runs (atom [])
+          cpr (cp/mem-checkpointer)
+          hit! (fn [n] (fn [_] (swap! runs conj n) {:log [n]}))
+          cg (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+                 (g/add-node :charge (hit! :charge))
+                 (g/add-node :receipt (hit! :receipt))
+                 (g/set-entry-point :charge)
+                 (g/add-edge :charge :receipt)
+                 (g/set-finish-point :receipt)
+                 (g/compile-graph {:checkpointer cpr :interrupt-after #{:charge}}))
+          r1 (g/run* cg {} {:thread-id "t"})]
+      (is (= :interrupted (:status r1)))
+      (is (= [:charge] @runs) ":charge ran before the park")
+      (is (= [:receipt] (:frontier r1))
+          "parked with :charge behind it, not in front of it")
+      (is (= [:charge] (:log (:state r1))))
+      (testing "resuming continues from the saved frontier"
+        (let [r2 (g/run* cg nil {:thread-id "t"})]
+          (is (= :done (:status r2)))
+          (is (= [:charge :receipt] @runs)
+              ":charge must NOT run a second time on resume")
+          (is (= [:charge :receipt] (:log (:state r2)))))))))
+
+;; ── conditional edges with a path-map ────────────────────────────────
+
+(deftest a-path-map-translates-router-output-and-may-name-end
+  (testing "add-conditional-edges' 3-arity exists so the router can
+            speak the vocabulary of whatever produced the decision — a
+            model emitting \"continue\"/\"stop\", a rules table, an
+            external policy service — while the graph keeps its own node
+            names. Two things have to hold for that to work: the router
+            output is translated before it is looked up as a node, and
+            END is recognised AFTER translation so a path-map entry can
+            terminate the graph. Skip the translation and the raw string
+            reaches the node table, where it is simply an unknown node."
+    (let [cg (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+                 (g/add-node :plan (fn [_] {:log [:plan]}))
+                 (g/add-node :act (fn [_] {:log [:act]}))
+                 (g/set-entry-point :plan)
+                 (g/add-conditional-edges :plan
+                                          (fn [s] (if (:go? s) "continue" "stop"))
+                                          {"continue" :act
+                                           "stop" g/END})
+                 (g/set-finish-point :act)
+                 (g/compile-graph))]
+      (is (= [:plan :act] (:log (g/invoke cg {:go? true})))
+          "\"continue\" is translated to :act and the graph continues")
+      (is (= [:plan] (:log (g/invoke cg {:go? false})))
+          "\"stop\" is translated to END, which ends the graph rather
+           than being looked up as a node called \"stop\"")
+      (testing "the router sees the state produced by the node it follows"
+        (let [cg2 (-> (g/state-graph {:channels {:n {:reducer + :default 0}}})
+                      (g/add-node :bump (fn [_] {:n 1}))
+                      (g/add-node :again (fn [_] {:n 1}))
+                      (g/set-entry-point :bump)
+                      (g/add-conditional-edges :bump
+                                               (fn [s] (if (< (:n s) 2) "loop" "done"))
+                                               {"loop" :again "done" g/END})
+                      (g/set-finish-point :again)
+                      (g/compile-graph))]
+          (is (= 2 (:n (g/invoke cg2 {})))
+              "routed on the POST-node state (:n 1), so :again ran"))))))
+
+;; ── non-map node returns ─────────────────────────────────────────────
+
+(deftest a-node-that-returns-a-non-map-leaves-the-state-alone
+  (testing "nodes are Runnables, and plenty of real ones return
+            something other than an update map — a guard that only
+            decides routing, a logging step, a node whose whole job is a
+            side effect and which returns whatever the side effect
+            returned. The superstep must read that as 'no update to the
+            channels', not as the new state. Treating it as the new
+            state discards every channel the graph has accumulated, and
+            the loss is silent: the run still reports :done and still
+            hands back a value, just not the one the graph built."
+    (let [cg (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+                 (g/add-node :write (fn [_] {:log [:write]}))
+                 (g/add-node :audit (fn [_] :logged))
+                 (g/set-entry-point :write)
+                 (g/add-edge :write :audit)
+                 (g/set-finish-point :audit)
+                 (g/compile-graph))
+          r (g/run* cg {} {})]
+      (is (= :done (:status r)))
+      (is (= {:log [:write]} (:state r))
+          ":audit's :logged is not the new state")
+      (is (= :logged (:updates (last (:events r))))
+          "the raw return still reaches the event stream — dropping it
+           would hide the node from anyone watching the run")
+      (testing "nil is the same case"
+        (let [cg2 (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}}})
+                      (g/add-node :write (fn [_] {:log [:write]}))
+                      (g/add-node :quiet (fn [_] nil))
+                      (g/set-entry-point :write)
+                      (g/add-edge :write :quiet)
+                      (g/set-finish-point :quiet)
+                      (g/compile-graph))]
+          (is (= {:log [:write]} (:state (g/run* cg2 {} {})))))))))
+
+;; ── wiring mistakes ──────────────────────────────────────────────────
+
+(deftest a-graph-with-no-entry-point-refuses-to-run
+  (testing "forgetting set-entry-point is the commonest wiring mistake,
+            and an empty starting frontier is indistinguishable from a
+            finished run: the loop's first branch reports :done on an
+            empty frontier. Reporting success for a graph that ran
+            nothing is worse than throwing, because the caller gets back
+            a well-formed initial state and has no reason to doubt it."
+    (let [ran (atom false)
+          cg (-> (g/state-graph {:channels {:log {:default []}}})
+                 (g/add-node :a (fn [_] (reset! ran true) {:log [:a]}))
+                 (g/compile-graph))
+          e (try (g/run* cg {} {}) nil
+                 (catch js/Error e e))]
+      (is (some? e) "must throw rather than report a vacuous :done")
+      (is (= "No entry point — call set-entry-point" (ex-message e)))
+      (is (false? @ran) "and no node ran"))))
+
+(deftest an-edge-to-a-node-that-was-never-added-is-refused
+  (testing "add-edge takes names, not runnables, so an edge can point at
+            a node that does not exist — a typo, or a node deleted while
+            its edges stayed. The superstep must say so. Skipping the
+            missing node instead would route around the deleted step and
+            still report :done."
+    (let [cg (-> (g/state-graph)
+                 (g/add-node :a (fn [_] {}))
+                 (g/set-entry-point :a)
+                 (g/add-edge :a :typoo)
+                 (g/compile-graph))
+          e (try (g/run* cg {} {}) nil
+                 (catch js/Error e e))]
+      (is (some? e))
+      (is (= "Unknown node" (ex-message e)))
+      (is (= :typoo (:node (ex-data e))) "…and it names which one"))))
+
+;; ── channel defaults ─────────────────────────────────────────────────
+
+(deftest only-channels-that-declare-a-default-are-seeded
+  (testing "a channel spec without :default must leave its key ABSENT
+            from the initial state, not present-and-nil. Nodes ask
+            `contains?` to tell 'nobody has written this yet' from
+            'someone wrote nil', and seeding every declared channel with
+            nil erases that distinction for every graph at once."
+    (let [seen (atom nil)
+          cg (-> (g/state-graph {:channels {:log {:reducer (fnil into []) :default []}
+                                            :verdict {}}})
+                 (g/add-node :peek (fn [s] (reset! seen s) {:log [:peek]}))
+                 (g/set-entry-point :peek)
+                 (g/set-finish-point :peek)
+                 (g/compile-graph))]
+      (g/invoke cg {})
+      (is (= [] (:log @seen)) ":log declared a default, so it is seeded")
+      (is (not (contains? @seen :verdict))
+          ":verdict declared none, so it is absent — not nil"))))
