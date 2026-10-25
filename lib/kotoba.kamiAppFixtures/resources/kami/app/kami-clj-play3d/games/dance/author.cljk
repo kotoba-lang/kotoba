@@ -1,0 +1,164 @@
+;; author.clj — KAMI VRM Dance scene authoring, datalevin as the source of truth.
+;;
+;; ADR-0036: clj is the brain, datalevin (Datalog) owns the scene data, and the
+;; Rust/wgpu player is the GPU arm. This script TRANSACTS the dance setlist +
+;; cues + avatar binding as datoms, reads them back with a Datalog QUERY, and
+;; PROJECTS that to `scene.edn` — the snapshot the Rust host consumes (parsed by
+;; `kami_live::scene::DanceScene::from_edn`). Editing the choreography is now a
+;; transaction, not a hand-edited file.
+;;
+;;   kbb -M author.clj
+;;
+;; Re-run after changing the data below; the player picks up the new scene.edn.
+
+(require '[datalevin.core :as d]
+         '[kotoba.pprint :as pp])
+
+;; ── schema (the Datalog vocabulary for a dance scene) ───────────────────────
+(def schema
+  {;; one track (dance section) per row, ordered along the show timeline
+   :track/order {:db/valueType :db.type/long    :db/unique :db.unique/identity}
+   :track/title {:db/valueType :db.type/string}
+   :track/bpm   {:db/valueType :db.type/double}
+   :track/bars  {:db/valueType :db.type/long}
+   :track/dance {:db/valueType :db.type/keyword}
+   :track/audio {:db/valueType :db.type/keyword}
+   ;; cues reference their owning track (cardinality-many via :cue/track ref)
+   :cue/track   {:db/valueType :db.type/ref}
+   :cue/beat    {:db/valueType :db.type/long}
+   :cue/kind    {:db/valueType :db.type/keyword}
+   :cue/tag     {:db/valueType :db.type/string}})
+
+;; ── show + avatar config (small globals, kept as plain maps) ────────────────
+(def show
+  {:bpm 128.0 :stage :hall :swing 0.08 :meter [4 8] :performer "Mitama"})
+
+(def avatar
+  {:vrm "models/mitama.vrm" :home [0.0 1.0 0.0] :scale 1.0
+   :look-at true :spring-bones true :clip "idle"})
+
+;; EDN-authored animation clips (no binary .vrma); host loads via clip_from_edn.
+(def clips
+  [{:name "idle" :duration 2.0 :loop true
+    :tracks [{:bone "spine" :interp :cubic
+              :keys [{:t 0.0 :rot [0 0 0 1]}
+                     {:t 1.0 :rot [0.0 0.0 0.04 0.999]}
+                     {:t 2.0 :rot [0 0 0 1]}]}
+             {:bone "hips" :interp :linear
+              :keys [{:t 0.0 :pos [0 0 0]} {:t 1.0 :pos [0 0.02 0]} {:t 2.0 :pos [0 0 0]}]}]}])
+
+;; an alternative 2D (Live2D) performer driven by the same setlist (ADR-0045).
+(def live2d
+  {:model "models/haru.model3.json" :home [2.0 0.0 0.0] :scale 1.0
+   :physics true :lipsync :ParamMouthOpenY
+   :params {:ParamEyeLOpen 1.0}
+   :motions [{:name "idle" :file "idle.motion3.json"}]})
+
+;; post-processing chain (kami-postfx-scene effect ids), applied in order.
+(def post
+  [{:effect :bloom :threshold 1.0 :intensity 0.6}
+   {:effect :color-grade :lift [0.0 0.0 0.03] :gamma [1.0 1.0 1.0] :gain [1.05 1.0 0.95]}
+   {:effect :vignette :intensity 0.35}])
+
+;; audience density (deterministic placement from :seed) + lighting rig.
+(def crowd {:fans 240 :cap 4096 :pit-bias 0.7 :seed 1})
+
+(def lighting
+  [{:fixture :front-par :color [1.0 0.6 0.4]  :intensity 0.85 :envelope :breathe       :bars 64 :at-bar 0}
+   {:fixture :back-par  :color [0.3 0.5 1.0]  :intensity 0.7  :envelope :hold          :bars 64 :at-bar 0}
+   {:fixture :spot      :color [1.0 1.0 0.95] :intensity 0.9  :envelope :hold          :bars 64 :at-bar 0}
+   {:fixture :strobe    :color [1.0 1.0 1.0]  :intensity 1.0  :envelope {:strobe 0.25} :bars 16 :at-bar 32}
+   {:fixture :laser     :color [0.6 1.0 0.7]  :intensity 0.8  :envelope {:pulse 0.6}   :bars 16 :at-bar 56}])
+
+;; VJ deck: per-phrase (pattern, palette). Palette = named const or inline map.
+(def vj
+  [{:pattern :stripes :palette :cool-wave}
+   {:pattern :pulse   :palette :neon-pink}
+   {:pattern :rings   :palette :sunset}
+   {:pattern :scope   :palette :cool-wave}
+   {:pattern :noise   :palette :monochrome}])
+
+;; EDN-declared reactions to show events (drop/breakdown/callout/phrase/bar).
+;; Action keys (:fx :sound :camera …) are free-form data the host applies.
+(def triggers
+  [{:on :drop      :fx :confetti :sound :coin   :camera :punch}
+   {:on :breakdown :fx :dim      :sound :whoosh :camera :wide}
+   {:on :callout   :tag "intro"  :camera :closeup}
+   {:on :phrase    :vj-cut true}
+   {:on :bar :every 8 :fx :pyro}])
+
+;; ── the authored choreography (this is what a designer edits) ───────────────
+;; tmpids let cues point at their track within one transaction.
+(def tracks
+  [{:db/id -1 :track/order 0 :track/title "Opening" :track/bpm 128.0 :track/bars 16 :track/dance :idle}
+   {:db/id -2 :track/order 1 :track/title "Verse"   :track/bpm 128.0 :track/bars 16 :track/dance :shuffle}
+   {:db/id -3 :track/order 2 :track/title "Chorus"  :track/bpm 128.0 :track/bars 16 :track/dance :wota      :track/audio :opener}
+   {:db/id -4 :track/order 3 :track/title "Bridge"  :track/bpm 128.0 :track/bars 8  :track/dance :hold}
+   {:db/id -5 :track/order 4 :track/title "Final"   :track/bpm 132.0 :track/bars 16 :track/dance :kpop-point}])
+
+;; cue :beat ≥ 1 — beat-0 cues never fire (dispatch is open-closed (prev, beat]).
+(def cues
+  [{:cue/track -1 :cue/beat 1  :cue/kind :callout   :cue/tag "intro"}
+   {:cue/track -2 :cue/beat 1  :cue/kind :callout   :cue/tag "verse"}
+   {:cue/track -3 :cue/beat 1  :cue/kind :drop      :cue/tag "hook"}
+   {:cue/track -3 :cue/beat 32 :cue/kind :drop      :cue/tag "hook-2"}
+   {:cue/track -4 :cue/beat 1  :cue/kind :breakdown :cue/tag "bridge"}
+   {:cue/track -5 :cue/beat 1  :cue/kind :drop      :cue/tag "last-chorus"}])
+
+(def db-dir (str (System/getProperty "user.dir") "/.datalevin"))
+
+(defn -main []
+  (let [conn (d/get-conn db-dir schema)]
+    (d/clear conn)
+    (let [conn (d/get-conn db-dir schema)]
+      (d/transact! conn tracks)
+      (d/transact! conn cues)
+      (let [db (d/db conn)
+            ;; pull each track + its cues, ordered along the timeline
+            track-rows (sort-by first
+                                (d/q '[:find ?order ?e ?title ?bpm ?bars ?dance
+                                       :where
+                                       [?e :track/order ?order]
+                                       [?e :track/title ?title]
+                                       [?e :track/bpm ?bpm]
+                                       [?e :track/bars ?bars]
+                                       [?e :track/dance ?dance]]
+                                     db))
+            audio-of (fn [e] (ffirst (d/q '[:find ?a :in $ ?e
+                                            :where [?e :track/audio ?a]] db e)))
+            cues-of  (fn [e]
+                       (->> (d/q '[:find ?beat ?kind ?tag :in $ ?e
+                                   :where
+                                   [?c :cue/track ?e]
+                                   [?c :cue/beat ?beat]
+                                   [?c :cue/kind ?kind]
+                                   [?c :cue/tag ?tag]] db e)
+                            (sort-by first)
+                            (mapv (fn [[beat kind tag]]
+                                    {:beat beat :kind kind :tag tag}))))
+            setlist (vec
+                     (for [[_order e title bpm bars dance] track-rows]
+                       (cond-> {:title title :bpm bpm :bars bars :dance dance
+                                :cues (cues-of e)}
+                         (audio-of e) (assoc :audio (audio-of e)))))
+            scene {:game/id        :gftd.games/vrm-dance
+                   :game/title     "KAMI VRM Dance"
+                   :dance/show     show
+                   :dance/avatar   avatar
+                   :dance/clips    clips
+                   :dance/live2d   live2d
+                   :dance/post     post
+                   :dance/crowd    crowd
+                   :dance/lighting lighting
+                   :dance/vj       vj
+                   :dance/triggers triggers
+                   :dance/setlist  setlist}
+            header (str ";; GENERATED by author.clj — datalevin (Datalog) is the source of truth.\n"
+                        ";; Edit author.clj data + re-run `clojure -M author.clj`; do not hand-edit.\n"
+                        ";; ADR-0036: datoms → Datalog query → scene snapshot the Rust host reads.\n\n")]
+        (spit "scene.edn" (str header (with-out-str (pp/pprint scene))))
+        (d/close conn)
+        (println (str "author: transacted " (count tracks) " tracks + "
+                      (count cues) " cues into datalevin, wrote scene.edn"))))))
+
+(-main)
