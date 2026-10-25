@@ -1,0 +1,555 @@
+;; `kotoba/imap/session.kotoba` against `imap.client` + `imap.protocol`.
+;;
+;; The slice is opening a mailbox: greeting, CAPABILITY, the strongest
+;; authentication the server advertised, SELECT (or EXAMINE), and the fold
+;; of everything the server said on the way in. The guest is an application
+;; — state in, one reply line in, next state and one inert effect out — so
+;; the oracle and the guest are driven by the SAME script and compared on
+;; what went on the wire and on what the mailbox turned out to be.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). Nothing but this file notices the two drifting apart.
+;;
+;; ## What is compared, and what deliberately is not
+;;
+;; The guest never receives a credential (see the module header): `init` is
+;; told *whether* a password exists, never what it is. Where the oracle
+;; writes `A2 LOGIN "me" "secret"` the guest emits `:credential/login` and
+;; the tag. Comparing those literally would assert the very thing this
+;; design removes, so `normalise` maps BOTH sides onto one vocabulary. It
+;; is deliberately the only place the two effect representations meet.
+;;
+;; ## The negative controls
+;;
+;; Five, each for a rule that a careless port loses while every happy-path
+;; script still passes:
+;;
+;;   * `uidvalidity-survives-select` — RFC 3501 §2.3.1.1, the reason this
+;;     module exists. A port that folds only `EXISTS`/`RECENT` passes every
+;;     "did we open the mailbox" assertion and silently loses the one value
+;;     that makes a cached UID mean anything;
+;;   * `an-untagged-ok-is-not-our-completion` — §7. `* OK …` looks exactly
+;;     like a completion to a port that matches on "OK";
+;;   * `another-tags-completion-is-not-ours` — the tag must match, and `A1`
+;;     is a prefix of `A10`;
+;;   * `select-tagged-ok-carries-read-only` — the tagged line is the ONLY
+;;     place `[READ-ONLY]` appears; a port that folds only untagged lines
+;;     reports a read-only mailbox as writable;
+;;   * `unmodelled-untagged-lines-are-tolerated` — §7 requires it.
+
+(ns imap.session-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [imap.client :as client]
+            [imap.fake-transport :as fake]
+            [imap.guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "imap" "session.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'imap.session (slurp guest-file)}
+                                         'imap.session
+                                         :wasm32-kotoba-v1))))
+
+;; The interpreter's default fuel is 512, which `org-ietf-smtp` and
+;; `org-ietf-pop3` both fit inside. This guest crosses it -- but only just:
+;; the richest script completes at 600 (measured by the test at the bottom
+;; of this file, not assumed). `step` tests a line against every untagged
+;; shape it models and each test is a byte-wise case-insensitive compare,
+;; so the cost is O(line length x shapes); the SELECT response is simply a
+;; few lines longer and richer than POP3's.
+;;
+;; This number is MEASURED, not assumed --
+;; `fuel-budget-is-measured-in-both-directions` searches for the smallest
+;; budget that completes the richest script and asserts a bracket around it,
+;; so the number goes red if the guest becomes much more expensive AND if it
+;; becomes cheap enough that the budget is superstition. It is the
+;; interpreter config a parity harness chooses, not a language limit; a
+;; deployment budgets its own.
+(def ^:private test-fuel 2000)
+
+(defn- call
+  ([f args] (call f args test-fuel))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+;; --- the one place the two effect representations meet ---------------------
+
+(def ^:private credential-kinds
+  #{:credential/login :credential/sasl-plain :credential/sasl-xoauth2})
+
+(defn- tagged-write?
+  "`A<digits> ` -- the shape `imap.client/tag!` produces. Base64 can begin
+  with `A`, so the digits and the separator are part of the test."
+  [w]
+  (boolean (re-find #"^A\d+ " w)))
+
+(defn- normalise
+  "Both sides' write logs, on one vocabulary: the tag is dropped (it is a
+  counter, and both sides start at A1 only by agreement, not by contract),
+  a credential-bearing write becomes its tag, and everything else is the
+  verb line as sent."
+  [written]
+  (into []
+        (keep (fn [w]
+                (cond
+                  (= :closed w) nil
+                  (keyword? w) (if (#{:credential/sasl-plain
+                                      :credential/sasl-xoauth2} w)
+                                 :credential/sasl
+                                 w)
+                  (tagged-write? w) (let [body (str/trim (subs w (inc (str/index-of w " "))))]
+                                      (if (str/starts-with? body "LOGIN")
+                                        :credential/login
+                                        body))
+                  ;; Not tagged: the base64 SASL initial response, the only
+                  ;; untagged thing a client writes. Note it can BEGIN with
+                  ;; "A" -- base64 of a NUL-led PLAIN payload does -- which
+                  ;; is why `tagged-write?` requires the digits and the
+                  ;; space rather than testing the first letter.
+                  :else :credential/sasl)))
+        written))
+
+;; --- driving the guest -----------------------------------------------------
+
+(defn- ->guest-config
+  "The oracle's config, minus the secrets. This asymmetry is the point."
+  [{:keys [user password access-token mailbox read-only? want uid]}]
+  (cond-> {:user user
+           :has-password? (some? password)
+           :has-access-token? (some? access-token)
+           :mailbox mailbox}
+    (some? read-only?) (assoc :read-only? read-only?)
+    (some? want) (assoc :want want)
+    (some? uid) (assoc :uid uid)))
+
+(defn- guest-run
+  "Drive the guest with `script`, one reply line per `step`.
+
+  A script that runs out before the session finishes is EOF, which is what
+  `closed` is for."
+  [config script]
+  (loop [state (call 'init [(->doc (->guest-config config))])
+         lines script
+         written []
+         literals []]
+    (let [kind (call 'outgoing-kind [state])
+          out (call 'outgoing [state])
+          written (cond
+                    (credential-kinds kind) (conj written kind)
+                    (seq out) (conj written out)
+                    :else written)
+          phase (call 'phase [state])
+          ;; What a host does with the literal channel: when the guest says
+          ;; n > 0, read exactly n bytes off the wire and append them. The
+          ;; script carries them as {:literal "..."}, exactly as
+          ;; `imap.fake-transport` hands them to the oracle's `read-n!`.
+          ;;
+          ;; A host cannot decline. If the guest announces a literal the wire
+          ;; does not carry, the host has already consumed bytes belonging to
+          ;; the next response and the stream is desynchronised from there on
+          ;; -- so this throws rather than shrugging. The first version
+          ;; shrugged, and a left-scanning `literal-size` passed all 22 tests
+          ;; because of it.
+          n (call 'literal-bytes [state])
+          _ (when (and (pos? n) (not (map? (first lines))))
+              (throw (ex-info "guest announced a literal the wire does not carry"
+                              {:bytes n :next (first lines)})))
+          [literals lines]
+          (if (pos? n)
+            [(conj literals (:literal (first lines))) (rest lines)]
+            [literals lines])
+          done? (contains? #{:done :failed} phase)]
+      (if (or done? (empty? lines))
+        (let [final (if done? state (call 'closed [state]))]
+          {:state final
+           :phase (call 'phase [final])
+           :literals literals
+           :body-state (call 'body-state [final])
+           :written (normalise written)
+           :error (call 'error-text [final])
+           :mailbox {:exists (call 'mailbox-exists [final])
+                     :recent (call 'mailbox-recent [final])
+                     :uidvalidity (call 'uidvalidity [final])
+                     :uidnext (call 'uidnext [final])
+                     :unseen (call 'unseen [final])
+                     :read-only (call 'read-only-state [final])}})
+        (recur (call 'step [state (first lines)]) (rest lines) written literals)))))
+
+;; --- driving the oracle ----------------------------------------------------
+
+(defn- oracle-mailbox
+  "The oracle's `:mailbox` map, on the guest's vocabulary: -1 for a value
+  the server never sent (the guest has no nil), and a three-state
+  read-only."
+  [m]
+  {:exists (or (:exists m) -1)
+   :recent (or (:recent m) -1)
+   :uidvalidity (or (:uidvalidity m) -1)
+   :uidnext (or (:uidnext m) -1)
+   :unseen (or (:unseen m) -1)
+   :read-only (case (:read-only? m) true :yes false :no :unknown)})
+
+(defn- oracle-run
+  [{:keys [user password access-token mailbox read-only?] :as _config} script]
+  (let [{:keys [transport written]} (fake/make script)]
+    (try
+      (let [session (-> (client/connect! "imap.example.com" {:transport transport})
+                        (client/capabilities!))
+            session (cond
+                      (and access-token (client/supports? session "AUTH=XOAUTH2"))
+                      (client/authenticate-xoauth2! session user access-token)
+                      (and password (client/supports? session "AUTH=PLAIN"))
+                      (client/authenticate-plain! session user password)
+                      :else (client/login! session user password))
+            session (if read-only?
+                      (client/examine! session mailbox)
+                      (client/select! session mailbox))]
+        {:ok true
+         :written (normalise @written)
+         :mailbox (oracle-mailbox (:mailbox session))})
+      (catch clojure.lang.ExceptionInfo e
+        {:ok false :written (normalise @written) :error (ex-message e)}))))
+
+;; --- shared fixtures -------------------------------------------------------
+
+(def ^:private login-config
+  {:user "me@example.com" :password "secret" :mailbox "INBOX"})
+
+(def ^:private greeting-and-capability
+  ["* OK IMAP4rev1 Service Ready"
+   "* CAPABILITY IMAP4rev1 IDLE UIDPLUS"
+   "A1 OK CAPABILITY completed"])
+
+(def ^:private select-response
+  ["* 172 EXISTS"
+   "* 1 RECENT"
+   "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)"
+   "* OK [UIDVALIDITY 3857529045] UIDs valid"
+   "* OK [UIDNEXT 4392] Predicted next UID"
+   "* OK [UNSEEN 12] Message 12 is first unseen"
+   "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited"
+   "A3 OK [READ-WRITE] SELECT completed"])
+
+;; --- the tests -------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-login-select-session-agrees-with-the-oracle
+  (let [script (concat greeting-and-capability
+                       ["A2 OK LOGIN completed"]
+                       select-response)
+        guest (guest-run login-config script)
+        oracle (oracle-run login-config script)]
+    (testing "the session completed on both sides"
+      (is (= :done (:phase guest)) (:error guest))
+      (is (:ok oracle) (:error oracle)))
+    (testing "the same commands went on the wire, in the same order"
+      (is (= (:written oracle) (:written guest))))
+    (testing "and the mailbox is what the server said it was"
+      (is (= (:mailbox oracle) (:mailbox guest))))))
+
+(deftest uidvalidity-survives-select
+  (testing "RFC 3501 §2.3.1.1: a UID cached under one UIDVALIDITY names a
+            different message, or none, once the server reissues it. A port
+            that folds only EXISTS/RECENT passes every 'did we open the
+            mailbox' assertion and loses this silently."
+    (let [script (concat greeting-and-capability
+                         ["A2 OK LOGIN completed"]
+                         select-response)
+          guest (guest-run login-config script)]
+      (is (= 3857529045 (:uidvalidity (:mailbox guest))))
+      (is (= 4392 (:uidnext (:mailbox guest))))
+      (is (= 12 (:unseen (:mailbox guest)))))))
+
+(deftest an-untagged-ok-is-not-our-completion
+  (testing "RFC 3501 §7: `* OK …` looks exactly like a completion to a port
+            that matches on the word. If it completed the SELECT, the later
+            untagged lines would never be folded."
+    (let [script (concat greeting-and-capability
+                         ["A2 OK LOGIN completed"]
+                         ["* OK still working"
+                          "* 172 EXISTS"
+                          "* OK [UIDVALIDITY 99] UIDs valid"
+                          "A3 OK [READ-WRITE] SELECT completed"])
+          guest (guest-run login-config script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= 172 (:exists (:mailbox guest)))
+          "an untagged OK must not end the command")
+      (is (= 99 (:uidvalidity (:mailbox guest)))))))
+
+(deftest another-tags-completion-is-not-ours
+  (testing "the tag must match, and `A1` is a prefix of `A10`"
+    (let [script (concat greeting-and-capability
+                         ["A2 OK LOGIN completed"]
+                         ["A30 OK some other command completed"
+                          "* 7 EXISTS"
+                          "A3 OK [READ-WRITE] SELECT completed"])
+          guest (guest-run login-config script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= 7 (:exists (:mailbox guest)))
+          "A30's completion must not have ended A3"))))
+
+(deftest select-tagged-ok-carries-read-only
+  (testing "the tagged line is the ONLY place [READ-ONLY] appears; a port
+            that folds untagged lines alone reports a read-only mailbox as
+            writable, and then a sync writes \\Seen on a shared mailbox"
+    (let [config (assoc login-config :read-only? true)
+          script (concat greeting-and-capability
+                         ["A2 OK LOGIN completed"]
+                         ["* 4 EXISTS"
+                          "* OK [UIDVALIDITY 1] UIDs valid"
+                          "A3 OK [READ-ONLY] EXAMINE completed"])
+          guest (guest-run config script)
+          oracle (oracle-run config script)]
+      (is (= :yes (:read-only (:mailbox guest))))
+      (is (= (:mailbox oracle) (:mailbox guest)))
+      (testing "and EXAMINE, not SELECT, was the command"
+        (is (some #(str/starts-with? % "EXAMINE") (:written guest)))
+        (is (= (:written oracle) (:written guest)))))))
+
+(deftest unmodelled-untagged-lines-are-tolerated
+  (testing "RFC 3501 §7 asks a client to tolerate untagged responses it did
+            not request and cannot interpret"
+    (let [script (concat greeting-and-capability
+                         ["A2 OK LOGIN completed"]
+                         ["* SEARCH 3 5 9"
+                          "* 99 FETCH (UID 4 FLAGS (\\Seen))"
+                          "* QUOTAROOT INBOX \"\""
+                          "* 4 EXISTS"
+                          "* OK [UIDVALIDITY 1] UIDs valid"
+                          "A3 OK [READ-WRITE] SELECT completed"])
+          guest (guest-run login-config script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= 4 (:exists (:mailbox guest))))
+      (is (= 1 (:uidvalidity (:mailbox guest)))))))
+
+(deftest sasl-plain-is-preferred-when-the-server-offers-it
+  (let [config login-config
+        script ["* OK IMAP4rev1 Service Ready"
+                "* CAPABILITY IMAP4rev1 AUTH=PLAIN"
+                "A1 OK CAPABILITY completed"
+                "+ "
+                "A2 OK AUTHENTICATE completed"
+                "* 0 EXISTS"
+                "* OK [UIDVALIDITY 7] UIDs valid"
+                "A3 OK [READ-WRITE] SELECT completed"]
+        guest (guest-run config script)
+        oracle (oracle-run config script)]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (:ok oracle) (:error oracle))
+    (is (some #{"AUTHENTICATE PLAIN"} (:written guest)))
+    (is (nil? (some #{:credential/login} (:written guest))))
+    (is (= (:written oracle) (:written guest)))
+    (is (= (:mailbox oracle) (:mailbox guest)))))
+
+(deftest xoauth2-wins-when-a-token-exists-and-the-server-offers-it
+  (let [config (assoc login-config :access-token "ya29.token")
+        script ["* OK IMAP4rev1 Service Ready"
+                "* CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=XOAUTH2"
+                "A1 OK CAPABILITY completed"
+                "+ "
+                "A2 OK AUTHENTICATE completed"
+                "* 0 EXISTS"
+                "* OK [UIDVALIDITY 7] UIDs valid"
+                "A3 OK [READ-WRITE] SELECT completed"]
+        guest (guest-run config script)
+        oracle (oracle-run config script)]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (:ok oracle) (:error oracle))
+    (is (some #{"AUTHENTICATE XOAUTH2"} (:written guest)))
+    (is (= (:written oracle) (:written guest)))))
+
+(deftest flags-are-case-insensitive-and-lose-the-backslash
+  (testing "RFC 3501 §2.3.2; two clients disagreeing about \\SEEN and \\Seen
+            is a bug that only appears against one server"
+    (let [script (concat greeting-and-capability
+                         ["A2 OK LOGIN completed"]
+                         ["* FLAGS (\\SEEN \\answered $Forwarded)"
+                          "* OK [PERMANENTFLAGS (\\Deleted)] Limited"
+                          "A3 OK [READ-WRITE] SELECT completed"])
+          {:keys [state phase error]} (guest-run login-config script)]
+      (is (= :done phase) error)
+      (is (true? (call 'has-flag? [state "seen"])))
+      (is (true? (call 'has-flag? [state "\\Answered"])))
+      (is (true? (call 'has-flag? [state "$forwarded"])))
+      (is (false? (call 'has-flag? [state "deleted"])))
+      (is (true? (call 'has-permanent-flag? [state "Deleted"])))
+      (is (false? (call 'has-permanent-flag? [state "Seen"]))))))
+
+(deftest capabilities-are-read-from-the-untagged-line
+  (let [script (concat greeting-and-capability
+                       ["A2 OK LOGIN completed"]
+                       select-response)
+        {:keys [state]} (guest-run login-config script)]
+    (is (true? (call 'capability? [state "IDLE"])))
+    (is (true? (call 'capability? [state "uidplus"])))
+    (is (false? (call 'capability? [state "AUTH=XOAUTH2"])))))
+
+(deftest a-bad-greeting-fails-with-the-oracles-words
+  (let [script ["* BYE mailbox unavailable"]
+        guest (guest-run login-config script)
+        oracle (oracle-run login-config script)]
+    (is (= :failed (:phase guest)))
+    (is (= "IMAP greeting was not * OK" (:error guest)))
+    (is (false? (:ok oracle)))
+    (is (str/includes? (:error oracle) "greeting"))))
+
+(deftest a-refused-select-is-a-failure-with-the-servers-words
+  (let [script (concat greeting-and-capability
+                       ["A2 OK LOGIN completed"
+                        "A3 NO [NONEXISTENT] Unknown Mailbox"])
+        guest (guest-run login-config script)]
+    (is (= :failed (:phase guest)))
+    (is (= "IMAP SELECT failed: [NONEXISTENT] Unknown Mailbox" (:error guest)))))
+
+(deftest eof-mid-response-is-the-hosts-fact-and-the-guests-meaning
+  (let [guest (guest-run login-config ["* OK IMAP4rev1 Service Ready"])]
+    (is (= :failed (:phase guest)))
+    (is (= "IMAP connection closed mid-response" (:error guest)))))
+
+(deftest no-credential-at-all-is-refused-before-any-is-named
+  (let [guest (guest-run {:user "me@example.com" :mailbox "INBOX"}
+                         greeting-and-capability)]
+    (is (= :failed (:phase guest)))
+    (is (= "IMAP の認証情報がありません。" (:error guest)))
+    (is (nil? (some credential-kinds (:written guest))))))
+
+;; --- the budget itself -----------------------------------------------------
+
+(def ^:private richest-script
+  ["* OK IMAP4rev1 Service Ready"
+   "* CAPABILITY IMAP4rev1 IDLE UIDPLUS AUTH=PLAIN AUTH=XOAUTH2"
+   "A1 OK CAPABILITY completed"
+   "A2 OK LOGIN completed"
+   "* 172 EXISTS"
+   "* 1 RECENT"
+   "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)"
+   "* OK [UIDVALIDITY 3857529045] UIDs valid"
+   "* OK [UIDNEXT 4392] Predicted next UID"
+   "* OK [UNSEEN 12] Message 12 is first unseen"
+   "* OK [PERMANENTFLAGS (\\Deleted \\Seen \\*)] Limited"
+   "A3 OK [READ-WRITE] SELECT completed"])
+
+(defn- completes-within?
+  "Does the richest script run to :done inside `fuel`?"
+  [fuel]
+  (try
+    (let [final (reduce (fn [st line] (call 'step [st line] fuel))
+                        (call 'init [(->doc (->guest-config login-config))] fuel)
+                        richest-script)]
+      (= :done (call 'phase [final] fuel)))
+    (catch clojure.lang.ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest fuel-budget-is-measured-in-both-directions
+  (testing "the default budget is genuinely insufficient -- otherwise
+            `test-fuel` is superstition and should be deleted"
+    (is (false? (completes-within? 512))))
+  (testing "and the chosen budget is sufficient"
+    (is (true? (completes-within? test-fuel))))
+  (testing "the smallest sufficient budget, so the margin is visible"
+    (let [minimum (first (filter completes-within?
+                                 [550 600 650 700 750 800 900 1000 1250 1500 2000]))]
+      (is (some? minimum) "no budget in the search range completes the script")
+      (is (<= minimum test-fuel)
+          (str "measured minimum " minimum " exceeds test-fuel " test-fuel))
+      (println (format "  [fuel] richest script completes at %d; test-fuel is %d"
+                       minimum test-fuel)))))
+
+;; --- FETCH: the literal passes through and is never a guest value --------
+
+(def ^:private fetch-config
+  (assoc login-config :want :fetch :uid 5))
+
+(def ^:private opened
+  (concat greeting-and-capability
+          ["A2 OK LOGIN completed"]
+          ["* 4 EXISTS" "* OK [UIDVALIDITY 1] UIDs valid"
+           "A3 OK [READ-WRITE] SELECT completed"]))
+
+(deftest a-fetched-literal-reaches-the-host-and-not-the-guest
+  (let [message "From: a@example.com\r\nSubject: hi\r\n\r\nbody"
+        script (concat opened
+                       [(str "* 1 FETCH (UID 5 BODY[] {" (count message) "}")
+                        {:literal message}
+                        ")"
+                        "A4 OK UID FETCH completed"])
+        guest (guest-run fetch-config script)]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (= :closed (:body-state guest)))
+    (testing "the host received the message the count named"
+      (is (= [message] (:literals guest))))
+    (testing "and the command that asked for it went out tagged"
+      (is (some #{"UID FETCH 5 (BODY.PEEK[])"} (:written guest))))))
+
+(deftest the-uid-goes-on-the-wire-as-text
+  (testing "there is no integer-to-string builtin; a multi-digit uid is the
+            case that catches a digits-from-a-literal implementation"
+    (let [script (concat opened
+                         ["* 1 FETCH (UID 4071 BODY[] {2}"
+                          {:literal "hi"}
+                          ")"
+                          "A4 OK UID FETCH completed"])
+          guest (guest-run (assoc fetch-config :uid 4071) script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (is (some #{"UID FETCH 4071 (BODY.PEEK[])"} (:written guest))))))
+
+(deftest fetch-carries-no-message-bytes
+  (testing "the design claim, tested: a `:document` cannot hold a message,
+            so a guest that kept the literal could not finish this. It
+            finishes because the guest only ever reads the count."
+    (let [message (apply str (repeat 400000 "x"))
+          script (concat opened
+                         [(str "* 1 FETCH (UID 5 BODY[] {" (count message) "}")
+                          {:literal message}
+                          ")"
+                          "A4 OK UID FETCH completed"])
+          guest (guest-run fetch-config script)]
+      (is (< 65536 (count message)) "only meaningful past the aggregate bound")
+      (is (= :done (:phase guest)) (:error guest))
+      (is (= [message] (:literals guest)))
+      (testing "and the guest's own record of it is the count, nothing more"
+        (is (= 0 (call 'literal-bytes [(:state guest)]))
+            "cleared once the step that announced it is past")))))
+
+(deftest a-brace-that-is-not-a-trailing-marker-announces-nothing
+  (testing "RFC 3501 4.3: only a TRAILING `{n}` announces a literal. A port
+            that searches from the left finds a brace in a mailbox name or a
+            flag and tells the host to read bytes that are not coming, which
+            desynchronises the stream from that point on.
+
+            This test was written first in a form that did not discriminate
+            -- its announcing line had no earlier brace, so a left-scanning
+            implementation passed it. Verified by writing that
+            implementation and watching all 22 tests stay green."
+    (let [script (concat opened
+                         ["* LIST () \"/\" \"In{9}box\""
+                          "* 1 FETCH (UID 5 BODY[] {4}"
+                          {:literal "body"}
+                          ")"
+                          "A4 OK UID FETCH completed"])
+          guest (guest-run fetch-config script)]
+      (is (= :done (:phase guest)) (:error guest))
+      (testing "the LIST line announced no literal, so only the FETCH body
+                was read -- a left scan would have consumed it for the LIST"
+        (is (= ["body"] (:literals guest)))))))
+
+(deftest a-refused-fetch-is-a-failure-with-the-servers-words
+  (let [script (concat opened ["A4 NO [TRYCREATE] no such uid"])
+        guest (guest-run fetch-config script)]
+    (is (= :failed (:phase guest)))
+    (is (= "IMAP UID FETCH failed: [TRYCREATE] no such uid" (:error guest)))
+    (is (= :none (:body-state guest)))))
+
+(deftest select-only-is-still-the-default
+  (let [guest (guest-run login-config (concat greeting-and-capability
+                                              ["A2 OK LOGIN completed"]
+                                              select-response))]
+    (is (= :done (:phase guest)) (:error guest))
+    (is (= :none (:body-state guest)))
+    (is (nil? (some #(str/starts-with? % "UID FETCH") (:written guest))))))

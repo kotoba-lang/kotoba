@@ -106,6 +106,7 @@ The bundled standard libraries live in this repository:
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
 | `org.ietf.epp` | `org.ietf.epp/src` | `epp.command`, `epp.response`, `epp.server`, `epp.transport` (an external specification, publisher ietf.org) |
+| `org.ietf.imap` | `org.ietf.imap/src` | `imap.client`, `imap.protocol`, `imap.transport` (an external specification, publisher ietf.org) |
 | `kotoba.nostr` | `kotoba.nostr/src` | `nostr.blossom`, `nostr.crypto`, `nostr.event`, `nostr.http` (Kotoba project library) |
 | `kotoba.mokurokuUi` | `kotoba.mokurokuUi/src` | `mokuroku-ui.core` (Kotoba project library) |
 | `kotoba.traversal` | `kotoba.traversal/src` | `traversal.core` (Kotoba project library) |
