@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.cloudMurakumoGeneration` | `kotoba.cloudMurakumoGeneration/src` | `murakumo.generation`, `murakumo.generation.client`, `murakumo.generation.digest`, `murakumo.generation.image` (Kotoba project library) |
 | `kotoba.cljHost` | `kotoba.cljHost/src` | `kotoba.clj-host`, `kotoba.clj-host.frame` (Kotoba project library) |
 | `kotoba.ci` | `kotoba.ci/src` | `ci.execute`, `ci.model`, `ci.run`, `ci.validate` (Kotoba project library) |
 | `kotoba.chainObserver` | `kotoba.chainObserver/src` | `chain.observer`, `chain.observer.contract`, `chain.observer.cosmos`, `chain.observer.evm` (Kotoba project library) |

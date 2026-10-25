@@ -1,0 +1,185 @@
+(ns murakumo.generation-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [murakumo.generation :as gen]
+            [murakumo.generation.digest :as digest]))
+
+(deftest endpoint-resolution
+  (testing "the scoped generation proxy is the default — not api.murakumo.cloud"
+    (is (= "https://generation.murakumo.cloud/api/v1/generation" gen/default-endpoint))
+    (is (= gen/default-endpoint (gen/endpoint nil)))
+    (is (= gen/default-endpoint (gen/endpoint "   "))))
+  (testing "an override wins and loses trailing slashes"
+    (is (= "https://staging.example/api/v1/generation"
+           (gen/endpoint "https://staging.example/api/v1/generation//"))))
+  (testing "job status url hangs off the base we are authenticated to"
+    (is (= "https://h/api/v1/generation/jobs/abc" (gen/job-url "https://h/api/v1/generation/" "abc")))))
+
+(deftest fleet-accepted-ranges
+  (testing "720 is not a multiple of 32 — a vertical short's own width is a 400"
+    (is (= 736 (gen/snap-dimension 720)) "rounds up: generate wider, scale down, never upscale")
+    (is (zero? (mod (gen/snap-dimension 720) 32))))
+  (testing "1280 is valid and is the ceiling; 256 is the floor"
+    (is (= 1280 (gen/snap-dimension 1280)))
+    (is (= 1280 (gen/snap-dimension 4096)))
+    (is (= 256 (gen/snap-dimension 10)))
+    (is (= 256 (gen/snap-dimension nil))))
+  (testing "every snapped dimension is on the accepted grid and in range"
+    (is (every? #(zero? (mod (gen/snap-dimension %) 32)) (range 1 2000 7)))
+    (is (every? #(<= 256 (gen/snap-dimension %) 1280) (range 1 2000 7))))
+  (testing "frames must be 8n+1 in 9..121"
+    (is (= 121 (gen/snap-frames 120)) "120 is rejected; 121 is the nearest 8n+1")
+    (is (= 97 (gen/snap-frames 97)))
+    (is (= 9 (gen/snap-frames 1)))
+    (is (= 121 (gen/snap-frames 10000)))
+    (is (every? #(zero? (mod (dec (gen/snap-frames %)) 8)) (range 1 200)))
+    (is (every? #(<= 9 (gen/snap-frames %) 121) (range 1 200)))))
+
+(deftest video-body-shape
+  (let [b (gen/video-body {:prompt "pre-dawn market" :seconds 7 :width 720 :height 1280})]
+    (testing "the caller's art direction goes through unedited"
+      (is (= "pre-dawn market" (get-in b [:input :prompt]))))
+    (testing "geometry is snapped for the caller"
+      (is (= [736 1280] [(get-in b [:params :width]) (get-in b [:params :height])])))
+    (testing "7s at the fleet's 24fps exceeds the per-job cap"
+      (is (= 121 (get-in b [:params :frames]))))
+    (testing "no model is pinned, so a fleet-side swap arrives without a release"
+      (is (not (contains? b :model)))))
+  (testing "omitted geometry stays omitted — the fleet picks"
+    (let [b (gen/video-body {:prompt "p" :seconds 2})]
+      (is (not (contains? (:params b) :width)))
+      (is (= 49 (get-in b [:params :frames])) "2s*24 = 48 -> 49")))
+  (testing "an image ref makes it image-to-video"
+    (is (= "https://x/y.png"
+           (get-in (gen/video-body {:prompt "p" :image-url "https://x/y.png"}) [:input :image])))))
+
+(deftest voice-body-shape
+  (testing "locale is BCP-47 — \"ja\" and \"ja_JP\" are both rejected by the fleet"
+    (is (= "ja-JP" (get-in (gen/voice-body {:text "t"}) [:params :locale])))
+    (is (= "en-US" (get-in (gen/voice-body {:text "t" :locale "en-US"}) [:params :locale]))))
+  (testing "an unmapped role sends no voice rather than guessing one"
+    (is (not (contains? (get (gen/voice-body {:text "t"}) :params) :voice))))
+  (is (= "こんにちは" (get-in (gen/voice-body {:text "こんにちは"}) [:input :text]))))
+
+(deftest sound-body-shape
+  (testing "only \"music\" selects the music function"
+    (is (= "music" (get-in (gen/sound-body {:prompt "p" :kind :music}) [:params :sound_kind])))
+    (is (= "sfx" (get-in (gen/sound-body {:prompt "p"}) [:params :sound_kind]))))
+  (testing "seconds become duration_ms; a bed asks to loop"
+    (let [b (gen/sound-body {:prompt "p" :kind :music :seconds 60 :loop? true
+                             :model "ace-step" :seed 0})]
+      (is (= 60000 (get-in b [:params :duration_ms])))
+      (is (= "ace-step" (:model b)))
+      (is (= 0 (get-in b [:params :seed])) "seed 0 is explicit, not absent")
+      (is (true? (get-in b [:params :loop]))))))
+
+(deftest submit-response-fails-closed
+  (is (= "abc" (gen/submitted-id {:jobId "abc"})))
+  (is (= "abc" (gen/submitted-id {"jobId" "abc"})) "string keys too")
+  (testing "no jobId is not a job, however 200 it looked"
+    (is (nil? (gen/submitted-id {:status "queued"})))
+    (is (nil? (gen/submitted-id {:jobId ""})))
+    (is (nil? (gen/submitted-id nil)))))
+
+(deftest artifact-host-is-rebased
+  (testing "the advertised host is replaced, the job-id path is kept"
+    (is (= "https://generation.murakumo.cloud/api/v1/generation/jobs/abc/artifact"
+           (gen/rebase-host "https://generation.murakumo.cloud/api/v1/generation"
+                            "https://murakumo.cloud/api/v1/generation/jobs/abc/artifact"))))
+  (testing "a blank url stays nil rather than becoming the bare origin"
+    (is (nil? (gen/rebase-host "https://h/api" nil)))
+    (is (nil? (gen/rebase-host "https://h/api" ""))))
+  (testing "a relative url is left alone"
+    (is (= "not-a-url" (gen/rebase-host "https://h/api" "not-a-url")))))
+
+(deftest artifact-integrity-and-naming
+  (let [body {:artifacts [{:kind "sound-wav"
+                           :url "https://murakumo.cloud/api/v1/generation/jobs/j1/artifact"
+                           :bytes 144044
+                           :contentHash "sha256:6cd744be6fa6c41884893d4b9f610e3d918bfcdad9505b66aaf389668274ea2f"}]}]
+    (testing "the declared digest is what a download gets verified against"
+      (is (= "6cd744be6fa6c41884893d4b9f610e3d918bfcdad9505b66aaf389668274ea2f"
+             (gen/artifact-sha256 body))))
+    (testing "that digest IS the storage name — one name across compute and storage"
+      (is (= (digest/sha256-hex->cid (gen/artifact-sha256 body)) (gen/artifact-cid body)))
+      (is (str/starts-with? (gen/artifact-cid body) "bafkrei")))
+    (testing "the url is rebased, not followed verbatim"
+      (is (= "https://gen.example/api/v1/generation/jobs/j1/artifact"
+             (gen/artifact-url "https://gen.example/api/v1/generation" body)))))
+  (testing "a malformed digest yields no name, not a wrong one"
+    (is (nil? (gen/artifact-sha256 {:artifacts [{:contentHash "md5:abc"}]})))
+    (is (nil? (gen/artifact-cid {:artifacts [{:contentHash "sha256:short"}]}))))
+  (testing "an explicit cid is taken verbatim"
+    (is (= "bafk1" (gen/artifact-cid {:artifacts [{:cid "bafk1"}]}))))
+  (testing "the top-level artifactUrl is honoured when the array is empty"
+    (is (= "https://g/api/v1/generation/jobs/j2/artifact"
+           (gen/artifact-url "https://g/api/v1/generation"
+                             {:artifacts [] :artifactUrl "https://murakumo.cloud/api/v1/generation/jobs/j2/artifact"}))))
+  (testing "done with no artifact at all is not success"
+    (is (nil? (gen/artifact-url "https://g/api" {:status "done" :artifacts []})))))
+
+(deftest status-and-errors
+  (is (gen/done? {:status "done"}))
+  (is (gen/failed? {:status "failed"}))
+  (is (gen/terminal? {:status "failed"}))
+  (is (not (gen/terminal? {:status "running"})))
+  (is (= "out of vram" (gen/job-error {:status "failed" :error {:message "out of vram"}})))
+  (is (some? (gen/job-error {:status "failed"})) "a failure always carries a reason")
+  (is (nil? (gen/job-error {:status "running"}))))
+
+(deftest cold-fleet-is-not-a-dead-job
+  (testing "the exact messages measured against a cold fleet on 2026-07-29"
+    (is (gen/cold-start? "<urlopen error [Errno 111] Connection refused>"))
+    (is (gen/cold-start? "[Errno 104] Connection reset by peer")))
+  (testing "gateway-class transients too"
+    (is (gen/cold-start? "upstream returned 503"))
+    (is (gen/cold-start? "request timed out")))
+  (testing "a real refusal must NOT be retried into a stall"
+    (is (not (gen/cold-start? "out of vram")))
+    (is (not (gen/cold-start? "params.width must be a multiple of 32 in 256..1280")))
+    (is (not (gen/cold-start? nil)))
+    (is (not (gen/cold-start? "")))))
+
+(deftest poll-backoff-ramps-and-holds
+  (is (= 2000 (gen/poll-backoff-ms 0)))
+  (is (= 7000 (gen/poll-backoff-ms 5)))
+  (is (= 15000 (gen/poll-backoff-ms 100)) "held, so a long video job is not hammered")
+  (is (apply <= (map gen/poll-backoff-ms (range 20)))))
+
+(deftest transient-submit-classification
+  (testing "rate limiting and dead hops are worth retrying"
+    (is (gen/transient-submit? 429 nil))
+    (is (gen/transient-submit? 503 nil))
+    (is (gen/transient-submit? 0 nil) "transport failure"))
+  (testing "a 400 that describes a capacity condition is retryable"
+    (is (gen/transient-submit? 400 {:message "upstream connection refused"})))
+  (testing "a 400 that describes a WRONG REQUEST must fail fast — the next
+            attempt would be byte-identical"
+    (is (not (gen/transient-submit? 400 {:message "params.width must be a multiple of 32 in 256..1280"})))
+    (is (not (gen/transient-submit? 400 {:message "params.locale is unsupported"})))
+    (is (not (gen/transient-submit? 400 {:error "invalid-request"}))))
+  (testing "auth is never retried — a bad token stays bad"
+    (is (not (gen/transient-submit? 401 nil)))
+    (is (not (gen/transient-submit? 403 nil)))))
+
+(deftest locale-default-survives-an-explicit-nil
+  (testing "a caller forwarding an absent optional argument still gets a locale"
+    ;; The fleet rejects a MISSING locale ("params.locale is unsupported"), and
+    ;; destructuring's :or does not fire for a key present with a nil value —
+    ;; which is what `{:locale locale}` produces when the caller has none.
+    (is (= "ja-JP" (get-in (gen/voice-body {:text "t" :locale nil}) [:params :locale])))
+    (is (= "ja-JP" (get-in (gen/voice-body {:text "t"}) [:params :locale])))
+    (is (= "ja-JP" (get-in (gen/voice-body {:text "t" :locale nil :voice nil :model nil})
+                           [:params :locale])))
+    (is (contains? (:params (gen/voice-body {:text "t" :locale nil})) :locale)
+        "the field must survive prune — an absent locale is a 400")))
+
+(deftest optional-arguments-forwarded-as-nil-still-default
+  (testing "sound kind — (name nil) would throw, not default"
+    (is (= "sfx" (get-in (gen/sound-body {:prompt "p" :kind nil}) [:params :sound_kind])))
+    (is (= "music" (get-in (gen/sound-body {:prompt "p" :kind :music}) [:params :sound_kind]))))
+  (testing "every optional field a consumer might forward as nil is safe"
+    (is (map? (gen/voice-body {:text "t" :voice nil :locale nil :model nil})))
+    (is (map? (gen/sound-body {:prompt "p" :kind nil :seconds nil :model nil :seed nil})))
+    (is (map? (gen/video-body {:prompt "p" :seconds nil :width nil :height nil
+                               :seed nil :model nil :image-url nil})))))
