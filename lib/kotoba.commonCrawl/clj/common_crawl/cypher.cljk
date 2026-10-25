@@ -1,0 +1,103 @@
+#!/usr/bin/env kbb
+;; etzhayyim-project-common-crawl — Phase 5b Cypher-batch parser (clj/cljc port of
+;; scripts/phase5b_inject_pages.py; ADR-2606280030).
+;;
+;; Pure parse of the Phase-3 `batch_*.cypher` MERGE statements into PageRecord /
+;; HOSTS_PAGE / LINKS_TO structures + the per-label write records. The actual writes
+;; go through the injectable `common-crawl.store` seam (was a "graph adapter" HTTP
+;; endpoint — kept, since it is the kotoba-side write surface, not RisingWave).
+(ns common-crawl.cypher
+  "Phase 5b — Cypher batch parsing + per-label record building (pure)."
+  (:require [kotoba.lang.text :as str]))
+
+(def site-did-prefix "did:web:site.etzhayyim.com:")
+
+(def ^:private page-full-re
+  #"MERGE \(p:PageRecord \{rkey: \"([^\"]+)\"\}\) ON CREATE SET p\.url = \"([^\"]*)\", p\.domainDid = \"([^\"]*)\", p\.domain = \"([^\"]*)\", p\.title = \"([^\"]*)\", p\.description = \"([^\"]*)\", p\.language = \"([^\"]*)\", p\.contentType = \"([^\"]*)\", p\.statusCode = \"([^\"]*)\", p\.outlinkCount = (\d+), p\.crawl = \"([^\"]*)\"")
+
+(def ^:private page-short-re
+  #"MERGE \(tp:PageRecord \{rkey: \"([^\"]+)\"\}\) ON CREATE SET tp\.url = \"([^\"]*)\", tp\.domainDid = \"([^\"]*)\", tp\.domain = \"([^\"]*)\"")
+
+(def ^:private hosts-re
+  #"MATCH \(d:DomainDID \{did: \"([^\"]+)\"\}\), \(p:PageRecord \{rkey: \"([^\"]+)\"\}\) MERGE \(d\)-\[:HOSTS_PAGE\]->\(p\)")
+
+(def ^:private links-re
+  #"MATCH \(s:PageRecord \{rkey: \"([^\"]+)\"\}\), \(t:PageRecord \{rkey: \"([^\"]+)\"\}\) MERGE \(s\)-\[:LINKS_TO\]->\(t\)")
+
+(defn parse-cypher-page
+  "Extract a PageRecord map from a Cypher MERGE line (full or short format), or nil."
+  [line]
+  (if-let [m (re-find page-full-re line)]
+    {:rkey (nth m 1) :url (nth m 2) :domain_did (nth m 3) :domain (nth m 4)
+     :title (nth m 5) :description (nth m 6) :language (nth m 7)
+     :content_type (nth m 8) :outlink_count (parse-long (nth m 10)) :crawl (nth m 11)}
+    (when-let [m2 (re-find page-short-re line)]
+      {:rkey (nth m2 1) :url (nth m2 2) :domain_did (nth m2 3) :domain (nth m2 4)
+       :title "" :description "" :language "" :content_type "" :outlink_count 0 :crawl ""})))
+
+(defn parse-cypher-hosts-page
+  "Extract a HOSTS_PAGE edge [src-did dst-rkey] from a Cypher line, or nil."
+  [line]
+  (when-let [m (re-find hosts-re line)] [(nth m 1) (nth m 2)]))
+
+(defn parse-cypher-links-to
+  "Extract a LINKS_TO edge [src-rkey dst-rkey] from a Cypher line, or nil."
+  [line]
+  (when-let [m (re-find links-re line)] [(nth m 1) (nth m 2)]))
+
+(defn slug-of-domain-did
+  "Strip the site DID prefix → domain slug."
+  [domain-did]
+  (str/replace domain-did site-did-prefix ""))
+
+(defn- clamp [s n] (let [s (or s "")] (if (> (count s) n) (subs s 0 n) s)))
+
+(defn page-record
+  "Build the graphar.vertex_page write record from a parsed page (mirror phase5b)."
+  [p]
+  {:_table "graphar.vertex_page"
+   :vertex_id (:rkey p) :rkey (:rkey p) :repo (:domain_did p) :did (:domain_did p)
+   :label "Page" :url (clamp (:url p) 2048) :domain (:domain p)
+   :title (clamp (:title p) 1024) :description (clamp (:description p) 2048)
+   :language (:language p) :content_type (:content_type p)
+   :outlink_count (:outlink_count p) :crawl (:crawl p) :_alive true :_seq 0})
+
+(defn hosts-record
+  "Build the graphar.edge_hosts_page write record from [src-did dst-rkey]."
+  [[src-did dst-rkey]]
+  {:_table "graphar.edge_hosts_page" :edge_id (str src-did "::" dst-rkey)
+   :src_vid src-did :dst_vid dst-rkey :_alive true :_seq 0})
+
+(defn links-record
+  "Build the graphar.edge_links_to write record from [src-rkey dst-rkey]."
+  [[src-rkey dst-rkey]]
+  {:_table "graphar.edge_links_to" :edge_id (str src-rkey "::" dst-rkey)
+   :src_vid src-rkey :dst_vid dst-rkey :_alive true :_seq 0})
+
+(defn process-batch-lines
+  "Parse a seq of Cypher lines into {:pages :hosts :links}, applying the phase5b
+   filters: pages/hosts keep only registered domain slugs; pages dedup on rkey;
+   links are unfiltered. Pure — the write step is separate."
+  [lines registered-slugs]
+  (let [reg (set registered-slugs)]
+    (loop [ls lines, pages (transient []), hosts (transient []),
+           links (transient []), seen #{}]
+      (if-let [raw (first ls)]
+        (let [line (str/trim raw)]
+          (if (str/blank? line)
+            (recur (rest ls) pages hosts links seen)
+            (if-let [page (parse-cypher-page line)]
+              (let [slug (slug-of-domain-did (:domain_did page))]
+                (if (or (not (contains? reg slug)) (contains? seen (:rkey page)))
+                  (recur (rest ls) pages hosts links seen)
+                  (recur (rest ls) (conj! pages page) hosts links (conj seen (:rkey page)))))
+              (if-let [hp (parse-cypher-hosts-page line)]
+                (if (contains? reg (slug-of-domain-did (first hp)))
+                  (recur (rest ls) pages (conj! hosts hp) links seen)
+                  (recur (rest ls) pages hosts links seen))
+                (if-let [lt (parse-cypher-links-to line)]
+                  (recur (rest ls) pages hosts (conj! links lt) seen)
+                  (recur (rest ls) pages hosts links seen))))))
+        {:pages (persistent! pages)
+         :hosts (persistent! hosts)
+         :links (persistent! links)}))))
