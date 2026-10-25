@@ -1,0 +1,282 @@
+;; authority.delegation -- folding a delegation chain into a decision, as pure Kotoba.
+;;
+;; root ADR-2610082200 §16 (W1). authority.grant and authority.chain stay as the
+;; oracle (grant.cljk, chain.cljk); this is their canonical form for a guest, on
+;; top of authority.lattice. It answers the one question the fleet asks --
+;; `authority.chain/authorize` -- with the same reason, in the same order:
+;;
+;;   1 granted   2 escalation-attempted   3 empty-chain
+;;   4 expired-or-no-trusted-time   5 wrong-holder   6 out-of-scope
+;;   7 malformed-chain (the three columns do not all hold keys 0..n-1; the oracle
+;;     has no such input, since it takes a vector of maps)
+;;
+;; ## Shape
+;; A chain is three typed maps keyed 0..n-1, root first: each link's scope set
+;; (resource strings), its holder and its expiry. Measured 2026-10-09: a list of
+;; records is outside the value profile ([:list Grant] refused) and a [:list T]
+;; has no count operation (the canonical list operations are typed-list-new and
+;; typed-list-nth), so the record is split into columns and each column is a
+;; [:map :i64 T], which has typed-map-count and a defaulted get. "" stands for an
+;; absent holder, an absent bound and an absent clock -- the oracle's nil.
+;;
+;; ## No meet of sets
+;; The oracle reduces the chain with grant/meet, which meets scope sets. Scopes
+;; form a tree under covers?, so the meet of every link covers a request exactly
+;; when every link has a scope that covers it (two scopes that both cover one
+;; request are comparable, and their meet is the narrower). That is what is
+;; computed: covered? per link. dango's chain_wire.kotoba makes the same move.
+;;
+;; ## The rest is the oracle's, unchanged
+;; - the effective holder is the LEAF's (a delegation ends at whoever holds it),
+;;   and only a bound holder is checked
+;; - the effective expiry is the earliest bound; no bound is unbounded
+;; - live? needs a clock: no now is a denial even for an unbounded grant
+;; - instants compare as strings (ISO-8601 UTC, as cacao.core does), by instant-compare
+;; - an escalation is a child scope its parent link does not cover, or a child
+;;   that outlives a bounded parent; it is evidence, and refuses only when strict
+
+(ns authority.delegation
+  (:require [authority.lattice :as lat])
+  (:export [main live? authorize escalations
+            test-live test-escalations test-malformed
+            test-oracle-cases-a test-oracle-cases-b]))
+
+(defn- instant-compare [a :string b :string] :i64
+  ;; -1 / 0 / 1 in code point order, a proper prefix first. The language's
+  ;; string-compare does the same in byte order but does not lower to wasm32
+  ;; yet (measured 2026-10-09: unsupported typed Wasm expression). For UTF-8
+  ;; the two orders agree; for the ISO-8601 UTC instants this compares, both
+  ;; agree with the oracle's String.compareTo.
+  (let [na (string-length a) nb (string-length b)]
+    (loop [i 0]
+      (if (or (>= i na) (>= i nb))
+        (if (< na nb) -1 (if (> na nb) 1 0))
+        (let [ca (string-code-point-at a i) cb (string-code-point-at b i)]
+          (if (< ca cb) -1 (if (> ca cb) 1 (recur (+ i 1)))))))))
+
+(defn live? [expires :string now :string] :bool
+  (if (= (string-byte-length now) 0)
+    false
+    (if (= (string-byte-length expires) 0)
+      true
+      (< (instant-compare now expires) 0))))
+
+(defn- earlier [a :string b :string] :string
+  (if (= (string-byte-length a) 0)
+    b
+    (if (= (string-byte-length b) 0)
+      a
+      (if (< (instant-compare a b) 0) a b))))
+
+(defn- effective-expiry [expires [:map :i64 :string] n :i64] :string
+  (loop [i 0 acc ""]
+    (if (>= i n)
+      acc
+      (recur (+ i 1) (earlier acc (get expires i ""))))))
+
+(defn- well-formed? [scopes [:map :i64 [:set :string]] holders [:map :i64 :string]
+                     expires [:map :i64 :string]] :bool
+  ;; all three columns hold exactly the keys 0..n-1
+  (let [n (typed-map-count [:map :i64 [:set :string]] scopes)]
+    (if (or (not (= n (typed-map-count [:map :i64 :string] holders)))
+            (not (= n (typed-map-count [:map :i64 :string] expires))))
+      false
+      (loop [i 0]
+        (if (>= i n)
+          true
+          (if (and (typed-map-contains [:map :i64 [:set :string]] scopes i)
+                   (typed-map-contains [:map :i64 :string] holders i)
+                   (typed-map-contains [:map :i64 :string] expires i))
+            (recur (+ i 1))
+            false))))))
+
+(defn- every-link-covers? [scopes [:map :i64 [:set :string]] n :i64 requested :string] :bool
+  (loop [i 0]
+    (if (>= i n)
+      true
+      (if (lat/covered? (get scopes i (typed-set-new [:set :string])) requested)
+        (recur (+ i 1))
+        false))))
+
+(defn- uncovered-count [parent [:set :string] child [:set :string]] :i64
+  ;; child scopes the parent does not cover; an invalid child scope is dropped
+  ;; by the oracle's normalize, so it is not counted here either
+  (let [n (typed-set-count [:set :string] child)]
+    (loop [i 0 acc 0]
+      (if (>= i n)
+        acc
+        (let [s (typed-set-nth [:set :string] child i)]
+          (recur (+ i 1)
+                 (if (and (lat/valid? s) (not (lat/covered? parent s))) (+ acc 1) acc)))))))
+
+(defn- extends? [parent :string child :string] :bool
+  (if (= (string-byte-length parent) 0)
+    false
+    (if (= (string-byte-length child) 0)
+      true
+      (> (instant-compare child parent) 0))))
+
+(defn escalations [scopes [:map :i64 [:set :string]] expires [:map :i64 :string]] :i64
+  ;; the number of links (after the root) that attempted escalation
+  (let [n (typed-map-count [:map :i64 [:set :string]] scopes)
+        none (typed-set-new [:set :string])]
+    (loop [i 1 acc 0]
+      (if (>= i n)
+        acc
+        (let [over (> (uncovered-count (get scopes (- i 1) none) (get scopes i none)) 0)
+              outlives (extends? (get expires (- i 1) "") (get expires i ""))]
+          (recur (+ i 1) (if (or over outlives) (+ acc 1) acc)))))))
+
+(defn authorize
+  [scopes [:map :i64 [:set :string]] holders [:map :i64 :string] expires [:map :i64 :string]
+   requested :string now :string holder :string strict :bool] :i64
+  (let [n (typed-map-count [:map :i64 [:set :string]] scopes)]
+    (if (not (well-formed? scopes holders expires))
+      7
+      (let [leaf-holder (if (= n 0) "" (get holders (- n 1) ""))
+            bound (effective-expiry expires n)
+            alive (live? bound now)
+            holder-ok (or (= (string-byte-length leaf-holder) 0) (string=? holder leaf-holder))
+            blocked (and strict (> (escalations scopes expires) 0))
+            ok (and (not blocked) (> n 0) alive holder-ok (every-link-covers? scopes n requested))]
+        (if ok 1
+            (if blocked 2
+                (if (= n 0) 3
+                    (if (not alive) 4
+                        (if (not holder-ok) 5 6)))))))))
+
+;; --- tests: exported zero-arity test-* return i64 1 on pass ----------------
+
+(defn- pass [b :bool] :i64 (if b 1 0))
+
+(defn test-live [] :i64
+  (pass (and (live? "" "2026-06-01T00:00:00Z")
+             (not (live? "" ""))
+             (live? "2027-01-01T00:00:00Z" "2026-06-01T00:00:00Z")
+             (not (live? "2026-06-01T00:00:00Z" "2026-06-01T00:00:00Z"))
+             (not (live? "2026-01-01T00:00:00Z" "2026-06-01T00:00:00Z")))))
+
+(defn test-escalations [] :i64
+  (pass (and (= 1 (escalations (typed-map-new [:map :i64 [:set :string]]
+                                              0 (typed-set-new [:set :string] "k://a/*")
+                                              1 (typed-set-new [:set :string] "k://a/*" "k://b/*"))
+                               (typed-map-new [:map :i64 :string] 0 "" 1 "")))
+             (= 0 (escalations (typed-map-new [:map :i64 [:set :string]]
+                                              0 (typed-set-new [:set :string] "k://a/*")
+                                              1 (typed-set-new [:set :string] "k://a/b" "bad"))
+                               (typed-map-new [:map :i64 :string] 0 "" 1 ""))))))
+
+(defn test-malformed [] :i64
+  (pass (and (= 7 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*"))
+                             (typed-map-new [:map :i64 :string])
+                             (typed-map-new [:map :i64 :string] 0 "")
+                             "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))
+             ;; keys must be 0..n-1, not just the right count
+             (= 7 (authorize (typed-map-new [:map :i64 [:set :string]] 1 (typed-set-new [:set :string] "k://a/*"))
+                             (typed-map-new [:map :i64 :string] 1 "")
+                             (typed-map-new [:map :i64 :string] 1 "")
+                             "k://a/x" "2026-06-01T00:00:00Z" "did:a" false)))))
+
+;; The rows of scripts/delegation-oracle-cases.cljk, which asks
+;; authority.chain/authorize the same questions (22 cases, 2026-10-09).
+(defn test-oracle-cases-a [] :i64
+  (pass (and
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*"))
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; one grant covers
+    (= 3 (authorize (typed-map-new [:map :i64 [:set :string]])
+                    (typed-map-new [:map :i64 :string])
+                    (typed-map-new [:map :i64 :string])
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; empty chain
+    (= 4 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*"))
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    (typed-map-new [:map :i64 :string] 0 "2026-01-01T00:00:00Z")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; expired
+    (= 4 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*"))
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "k://graph/g1" "" "did:a" false))  ; no trusted time
+    (= 5 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*"))
+                    (typed-map-new [:map :i64 :string] 0 "did:b")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; wrong holder
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*"))
+                    (typed-map-new [:map :i64 :string] 0 "did:a")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; right holder
+    (= 6 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*"))
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "k://op/write" "2026-06-01T00:00:00Z" "did:a" false))  ; out of scope
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*") 1 (typed-set-new [:set :string] "k://graph/*" "k://op/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; over-claim lenient
+    (= 2 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*") 1 (typed-set-new [:set :string] "k://graph/*" "k://op/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" true))  ; over-claim strict
+    (= 6 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*") 1 (typed-set-new [:set :string] "k://graph/*" "k://op/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://op/read" "2026-06-01T00:00:00Z" "did:a" false))  ; over-claimed scope stays out
+    (= 6 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*") 1 (typed-set-new [:set :string] "k://graph/g1"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://graph/g2" "2026-06-01T00:00:00Z" "did:a" false))  ; child narrows
+    )))
+
+(defn test-oracle-cases-b [] :i64
+  (pass (and
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://graph/*") 1 (typed-set-new [:set :string] "k://graph/g1"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://graph/g1" "2026-06-01T00:00:00Z" "did:a" false))  ; child narrows and covers
+    (= 4 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/*") 2 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "" 2 "")
+                    (typed-map-new [:map :i64 :string] 0 "2027-01-01T00:00:00Z" 1 "2026-01-01T00:00:00Z" 2 "2028-01-01T00:00:00Z")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; tightest expiry in the middle
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "2027-01-01T00:00:00Z" 1 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; unbounded child lenient
+    (= 2 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "2027-01-01T00:00:00Z" 1 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" true))  ; unbounded child strict
+    (= 4 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "2026-01-01T00:00:00Z" 1 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; unbounded child cannot outlive
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "did:b" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; leaf holder decides
+    (= 5 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "did:b")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; leaf holder bound
+    (= 6 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://b/*") 2 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "" 2 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "" 2 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; authority does not creep back
+    (= 6 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "nonsense" "2026-06-01T00:00:00Z" "did:a" false))  ; malformed request
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "bad" "k://a/*"))
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    (typed-map-new [:map :i64 :string] 0 "")
+                    "k://a/x" "2026-06-01T00:00:00Z" "did:a" false))  ; malformed scope ignored
+    (= 1 (authorize (typed-map-new [:map :i64 [:set :string]] 0 (typed-set-new [:set :string] "k://a/*") 1 (typed-set-new [:set :string] "k://a/b"))
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    (typed-map-new [:map :i64 :string] 0 "" 1 "")
+                    "k://a/b" "2026-06-01T00:00:00Z" "did:a" true))  ; clean chain strict
+    )))
+
+;; main: the number of test-* that pass (5 when all do). The browser host admits
+;; a module only with a main export.
+(defn main [] :i64
+  (+ (test-live) (test-escalations) (test-malformed)
+     (test-oracle-cases-a) (test-oracle-cases-b)))
