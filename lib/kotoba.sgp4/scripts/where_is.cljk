@@ -1,0 +1,115 @@
+;; Where a satellite is, from the element set the world publishes about it.
+;;
+;; The library returns refusals as values, because it is called in a loop over
+;; thousands of objects. A command line is the one place that must not: a shell
+;; reads exit status, and a refusal that exits 0 is indistinguishable from an
+;; answer. So the three outcomes are three different exit codes.
+;;
+;;   0  every element set in the input produced a position
+;;   1  at least one was REFUSED, and each refusal is named on stderr. Not
+;;      "some worked so we are fine" -- a catalog with a bad entry must not
+;;      exit like a clean one.
+;;   2  the question could not be ASKED -- no network, no such object, no
+;;      readable input, bad arguments. Not 1, because "we did not look" must
+;;      not read as "we looked and that orbit is unsupported".
+;;
+;;   kbb --backend sci --classpath src scripts/where_is.cljk 25544
+;;   kbb --backend sci --classpath src scripts/where_is.cljk 25544 --at 2026-09-01T12:00:00Z
+;;   kbb --backend sci --classpath src scripts/where_is.cljk --file iss.tle
+(ns where-is
+  (:require [sgp4.core :as sgp4]
+            [sgp4.frames :as frames]
+            [sgp4.time :as time]
+            [sgp4.tle :as tle]
+            [kotoba.lang.text :as str]
+            ["fs" :as fs]))
+
+(def celestrak "https://celestrak.org/NORAD/elements/gp.php")
+
+(defn- warn! [& msg]
+  (binding [*print-fn* *print-err-fn*] (apply println msg)))
+
+(defn- die! [code & msg]
+  (apply warn! msg)
+  (js/process.exit code))
+
+(defn- parse-args [argv]
+  (loop [[a & more] argv acc {}]
+    (cond
+      (nil? a) acc
+      (= a "--file") (recur (rest more) (assoc acc :file (first more)))
+      (= a "--at") (recur (rest more) (assoc acc :at (first more)))
+      (str/starts-with? a "--") (die! 2 "unknown flag:" a)
+      :else (recur more (assoc acc :catnr a)))))
+
+(defn- fetch-tle
+  "CelesTrak, or exit 2. A 404 here is 'No GP data found' for that catalog
+  number -- the object decayed, never existed, or is not public. That is a
+  question we could not ask, not an orbit we decline to model."
+  [catnr]
+  (-> (js/fetch (str celestrak "?CATNR=" catnr "&FORMAT=tle"))
+      (.then (fn [r]
+               (if (.-ok r)
+                 (.text r)
+                 (die! 2 (str "celestrak: HTTP " (.-status r) " for CATNR=" catnr
+                              " -- no element set to propagate")))))
+      ;; undici puts "fetch failed" in .message and the reason an operator can
+      ;; act on (ENOTFOUND, ECONNREFUSED, certificate) in .cause.
+      (.catch (fn [e] (die! 2 (str "celestrak: " (.-message e)
+                                   (when-let [c (.-cause e)] (str " -- " (.-message c)))))))))
+
+(defn- at-ms [s]
+  (if (nil? s)
+    (.now js/Date)
+    (let [t (.parse js/Date s)]
+      (if (js/isNaN t) (die! 2 (str "--at: not a date: " s)) t))))
+
+(defn- report!
+  "Print one object, or name the refusal on stderr. Returns true when a
+  position was produced."
+  [tle-rec ms]
+  (let [init (sgp4/initialize tle-rec)]
+    (if-not (:ok? init)
+      (do (warn! (str "REFUSED " (:error init) " -- " (:detail init))) false)
+      (let [sat (:sat init)
+            [jd f] (time/unix-ms->jd ms)
+            st (sgp4/propagate-at sat ms)]
+        (if-not (:ok? st)
+          (do (warn! (str "REFUSED " (:error st) " -- " (:detail st))) false)
+          (let [p (frames/subpoint st jd f)
+                age-d (/ (:tsince st) 1440.0)]
+            (println (str "object    " (or (:name tle-rec) (:satnum tle-rec))
+                          "  (NORAD " (:satnum tle-rec) ")"))
+            (println (str "at        " (.toISOString (js/Date. ms))))
+            (println (str "lat/lon   " (.toFixed (:lat-deg p) 4) "  " (.toFixed (:lon-deg p) 4)))
+            (println (str "altitude  " (.toFixed (:alt-km p) 1) " km"))
+            (println (str "speed     " (.toFixed (:speed-km-s p) 3) " km/s"))
+            ;; The element set's own age is the largest term in the error budget
+            ;; and nothing else in this output reveals it, so it is printed
+            ;; every time rather than only when it is bad.
+            (println (str "epoch age " (.toFixed age-d 2) " d"
+                          (when (< 1.0 (Math/abs age-d))
+                            "   <- propagated far from epoch; refetch")))
+            true))))))
+
+(defn- handle [text ms]
+  (let [{:keys [ok failed]} (tle/parse-catalog text)]
+    ;; :failed is never dropped.
+    (doseq [b failed]
+      (warn! (str "REFUSED " (:error b) " -- " (:detail b))))
+    (when (and (empty? ok) (empty? failed))
+      (die! 2 "no element set found in the input"))
+    (let [produced (doall (map #(report! % ms) ok))]
+      (js/process.exit (if (and (empty? failed) (every? true? produced)) 0 1)))))
+
+(defn- run [{:keys [catnr file at]}]
+  (let [ms (at-ms at)]
+    (cond
+      file (handle (try (fs/readFileSync file "utf8")
+                        (catch :default e (die! 2 (str "--file: " (.-message e)))))
+                   ms)
+      catnr (-> (fetch-tle catnr) (.then #(handle % ms)))
+      :else (die! 2 (str "usage: where_is.cljs <NORAD-ID> [--at <ISO8601>]"
+                         " | --file <path> [--at <ISO8601>]")))))
+
+(run (parse-args (vec *command-line-args*)))

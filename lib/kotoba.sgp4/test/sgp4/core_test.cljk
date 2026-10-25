@@ -1,0 +1,160 @@
+(ns sgp4.core-test
+  "The propagator against an independent oracle.
+
+  The assertions here are on *distance from the oracle's answer*, not on
+  digits of our own output. A test that pins this implementation's own
+  numbers would stay green through any change that is self-consistent, and
+  the thing worth knowing about a propagator is whether it agrees with the
+  reference one."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.edn :as edn]
+            [sgp4.core :as sgp4]
+            [sgp4.tle :as tle]
+            [sgp4.time :as stime]
+            [sgp4.fixtures :as fx]))
+
+(def golden (delay (edn/read-string (fx/slurp-fixture "golden.edn"))))
+
+(defn- dist [a b]
+  (Math/sqrt (reduce + (map (fn [x y] (let [d (- x y)] (* d d))) a b))))
+
+;; 1 metre. The oracle and this implementation evaluate the same closed-form
+;; expressions in a different association order, so they differ by rounding
+;; only; measured worst case over the fixture is 3.8e-4 km (0.38 mm) at
+;; t=2880 min. The threshold is set three orders of magnitude above that so
+;; it fails on an algorithmic change, not on a compiler's FMA decision.
+(def tolerance-km 1.0e-3)
+
+(deftest fixture-is-not-empty
+  ;; An evidence floor. Every assertion below is inside a doseq; if the
+  ;; fixture failed to load, all of them would pass by iterating nothing.
+  (is (<= 9 (count @golden)) "golden fixture did not load")
+  (is (<= 2 (count (filter #(= "d" (:method %)) @golden)))
+      "fixture must contain deep-space cases, which are the refusal path")
+  (is (<= 6 (count (filter #(= "n" (:method %)) @golden)))
+      "fixture must contain near-earth cases"))
+
+(deftest parses-every-fixture-tle
+  (doseq [c @golden]
+    (testing (:label c)
+      (let [r (tle/parse (:line1 c) (:line2 c))]
+        (is (:ok? r) (str (:label c) " did not parse: " (pr-str r)))
+        (when (:ok? r)
+          (let [t (:tle r)]
+            ;; The oracle's own parse of the same two lines.
+            (is (< (Math/abs (- (:no-kozai t) (:no-kozai c))) 1e-15)
+                "mean motion disagrees with the oracle's parse")
+            (is (< (Math/abs (- (:ecco t) (:ecco c))) 1e-15) "eccentricity")
+            (is (< (Math/abs (- (:inclo t) (:inclo c))) 1e-14) "inclination")
+            (is (< (Math/abs (- (:nodeo t) (:nodeo c))) 1e-14) "RAAN")
+            (is (< (Math/abs (- (:argpo t) (:argpo c))) 1e-14) "arg of perigee")
+            (is (< (Math/abs (- (:mo t) (:mo c))) 1e-14) "mean anomaly")
+            ;; BSTAR is the assumed-decimal field; a whitespace-splitting
+            ;; parser gets exactly this one wrong and still returns a number.
+            (is (< (Math/abs (- (:bstar t) (:bstar c))) 1e-18) "BSTAR")
+            ;; Read the oracle's key explicitly first. On ClojureScript a
+            ;; missing key is nil and `(+ 2451723.5 nil)` is 2451723.5 --
+            ;; a renamed fixture key would make this assertion compare the
+            ;; date against itself minus the fraction and still look like a
+            ;; real check. It did, once.
+            (is (number? (:jdsatepoch-frac c)) "fixture lost :jdsatepoch-frac")
+            (is (< (Math/abs (- (+ (:jdsatepoch t) (:jdsatepoch-frac t))
+                                (+ (:jdsatepoch c) (:jdsatepoch-frac c))))
+                   1e-9)
+                "epoch Julian date")))))))
+
+(deftest deep-space-is-refused-not-approximated
+  (let [deep (filter #(= "d" (:method %)) @golden)]
+    (is (seq deep))
+    (doseq [c deep]
+      (testing (:label c)
+        (let [r (sgp4/initialize-tle (:line1 c) (:line2 c))]
+          (is (false? (:ok? r))
+              (str (:label c) " is deep space (the oracle used SDP4) but "
+                   "initialize accepted it -- it would have returned a "
+                   "confidently wrong position"))
+          ;; Pin the reason, not just the refusal. A refusal for some other
+          ;; cause would otherwise count as this test discriminating.
+          (is (= :sgp4/deep-space-unsupported (:error r))
+              (str "refused for the wrong reason: " (pr-str (:error r)))))))))
+
+(deftest near-earth-matches-the-oracle
+  (let [near (filter #(= "n" (:method %)) @golden)
+        checked (atom 0)]
+    (doseq [c near]
+      (testing (:label c)
+        (let [i (sgp4/initialize-tle (:line1 c) (:line2 c))]
+          (is (:ok? i) (str (:label c) " failed to initialize: " (pr-str i)))
+          (when (:ok? i)
+            (doseq [s (:samples c)]
+              (let [r (sgp4/propagate (:sat i) (:minutes s))]
+                (if (zero? (:error s))
+                  (do
+                    (is (:ok? r) (str (:label c) " t=" (:minutes s)
+                                      " refused but the oracle propagated: "
+                                      (pr-str r)))
+                    (when (:ok? r)
+                      (swap! checked inc)
+                      (is (< (dist (:r r) (:r s)) tolerance-km)
+                          (str (:label c) " t=" (:minutes s) " position off by "
+                               (dist (:r r) (:r s)) " km"))
+                      (is (< (dist (:v r) (:v s)) 1.0e-6)
+                          (str (:label c) " t=" (:minutes s) " velocity off by "
+                               (dist (:v r) (:v s)) " km/s"))))
+                  ;; The oracle itself reported an error at this sample.
+                  (is (not (:ok? r))
+                      (str (:label c) " t=" (:minutes s)
+                           " succeeded where the oracle returned error "
+                           (:error s) " (" (:error-msg s) ")")))))))))
+    ;; Floor: an empty inner loop must not read as a pass.
+    (is (<= 25 @checked)
+        (str "only " @checked " propagation samples were compared"))))
+
+(deftest refusals-name-their-reason
+  (testing "a non-positive mean motion is refused at initialize"
+    (let [r (sgp4/initialize {:no-kozai 0.0 :ecco 0.001 :inclo 0.9 :nodeo 0.0
+                              :argpo 0.0 :mo 0.0 :bstar 0.0
+                              :jdsatepoch 2451545.0 :jdsatepoch-frac 0.0})]
+      (is (false? (:ok? r)))
+      (is (= :sgp4/non-positive-mean-motion (:error r)))))
+  (testing "an out-of-range eccentricity is refused at initialize"
+    (let [r (sgp4/initialize {:no-kozai 0.06 :ecco 1.5 :inclo 0.9 :nodeo 0.0
+                              :argpo 0.0 :mo 0.0 :bstar 0.0
+                              :jdsatepoch 2451545.0 :jdsatepoch-frac 0.0})]
+      (is (false? (:ok? r)))
+      (is (= :sgp4/eccentricity-out-of-range (:error r)))))
+  (testing "propagating far past epoch on a decaying fit refuses rather than
+            returning a subterranean position"
+    ;; 29141 is the Vallado decay case. Somewhere past its useful span the
+    ;; reference implementation reports an error; whatever this one does, it
+    ;; must not hand back a radius inside the Earth.
+    (let [i (sgp4/initialize-tle
+             "1 29141U 85108AA  06170.26783845  .99999999  00000-0  13519-0 0   718"
+             "2 29141  82.4288 273.4882 0015848 277.2124  83.9133 15.93343074  6828")]
+      (is (:ok? i))
+      (let [outcomes (for [t (range 0 2000 50)]
+                       (sgp4/propagate (:sat i) t))
+            bad (filter (fn [o]
+                          (and (:ok? o)
+                               (< (Math/sqrt (reduce + (map * (:r o) (:r o))))
+                                  6300.0)))
+                        outcomes)]
+        (is (empty? bad)
+            (str "returned " (count bad) " positions below the Earth's "
+                 "surface instead of refusing"))))))
+
+(deftest propagate-at-uses-absolute-time
+  ;; propagate-at must agree with propagate on the equivalent tsince. If it
+  ;; did not, every caller working in wall-clock time would be silently off.
+  (let [i (sgp4/initialize-tle
+           "1 25544U 98067A   26237.66055538  .00007716  00000+0  14485-3 0  9993"
+           "2 25544  51.6329 316.2335 0007673  83.1052 277.0809 15.49625410582525")
+        sat (:sat i)
+        epoch-ms (stime/jd->unix-ms (:jdsatepoch sat) (:jdsatepoch-frac sat))]
+    (is (:ok? i))
+    (doseq [mins [0.0 37.5 -120.0 1440.0]]
+      (let [a (sgp4/propagate sat mins)
+            b (sgp4/propagate-at sat (+ epoch-ms (* mins 60000.0)))]
+        (is (:ok? a)) (is (:ok? b))
+        (is (< (dist (:r a) (:r b)) 1.0e-6)
+            (str "propagate-at disagrees with propagate at " mins " min"))))))
