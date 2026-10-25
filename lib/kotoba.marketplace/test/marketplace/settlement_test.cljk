@@ -1,0 +1,163 @@
+(ns marketplace.settlement-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [marketplace.settlement :as st]))
+
+(def operator "merchant.marketplace-operator")
+
+(defn- fs [bps & {:keys [fixed hold] :or {fixed 0 hold 0}}]
+  (st/fee-schedule {:commission-bps bps :fixed-minor fixed :payout-hold-days hold}))
+
+(defn- lines [& pairs]
+  (mapv (fn [[seller amount]]
+          (st/basket-line {:seller seller :offer (str "offer." seller)
+                           :amount-minor amount :qty 1}))
+        pairs))
+
+(defn- plan [ls commission]
+  (st/settlement-plan {:lines ls :currency "JPY"
+                       :fee-schedule (fs commission) :operator operator}))
+
+(defn- dest [seller & {:keys [verified?] :or {verified? true}}]
+  (st/payout-destination {:seller seller :rail :x402
+                          :address "0xabc" :verified? verified?}))
+
+(deftest multi-seller-basket-splits-per-seller
+  (let [p (plan (lines ["merchant.a" 1000] ["merchant.b" 2000] ["merchant.a" 500]) 1000)]
+    (is (= 3500 (:plan/gross-minor p)))
+    (testing "lines are grouped by seller — a is one allocation, not two"
+      (is (= 2 (count (:plan/allocations p))))
+      (is (= ["merchant.a" "merchant.b"] (mapv :alloc/seller (:plan/allocations p))))
+      (is (= 1500 (:alloc/subtotal-minor (first (:plan/allocations p))))))))
+
+(deftest conservation-holds-exactly
+  (testing "seller payouts + commission always equal gross, with no rounding leak"
+    (doseq [commission [0 1 250 1000 3333 9999 10000]
+            amounts [[1] [7] [999] [1000 2000] [3 5 7 11 13] [123457 76543] [1 1 1 1 1 1 1]]]
+      (let [ls (map-indexed (fn [i a] [(str "merchant.s" i) a]) amounts)
+            p (plan (apply lines ls) commission)]
+        (is (true? (:plan/conserved? p))
+            (str "commission=" commission " amounts=" (vec amounts)))
+        (is (= (:plan/gross-minor p)
+               (+ (:plan/seller-payout-total-minor p)
+                  (:plan/commission-total-minor p)))
+            (str "commission=" commission " amounts=" (vec amounts)))))))
+
+(deftest rounding-dust-goes-to-the-seller
+  (testing "an amount that cannot divide evenly gives the remainder to the
+            seller, never to the operator — on many small orders that choice
+            is real money"
+    ;; 1 minor unit at 10% commission: 10% of 1 = 0 by integer division,
+    ;; so the dust (the whole unit) must land on the seller.
+    (let [p (plan (lines ["merchant.a" 1]) 1000)
+          a (first (:plan/allocations p))]
+      (is (= 1 (:alloc/seller-payout-minor a)))
+      (is (= 0 (:alloc/commission-minor a))))
+    (let [p (plan (lines ["merchant.a" 999]) 3333)
+          a (first (:plan/allocations p))]
+      (is (= 999 (+ (:alloc/seller-payout-minor a) (:alloc/commission-minor a))))
+      (is (>= (:alloc/seller-payout-minor a) (quot (* 999 6667) 10000))))))
+
+(deftest commission-boundaries
+  (testing "zero commission pays the seller everything"
+    (let [a (first (:plan/allocations (plan (lines ["merchant.a" 1000]) 0)))]
+      (is (= 1000 (:alloc/seller-payout-minor a)))
+      (is (= 0 (:alloc/commission-minor a)))))
+  (testing "a 100% commission is arithmetically expressible but still conserves"
+    (let [p (plan (lines ["merchant.a" 1000]) 10000)
+          a (first (:plan/allocations p))]
+      (is (= 0 (:alloc/seller-payout-minor a)))
+      (is (= 1000 (:alloc/commission-minor a)))
+      (is (true? (:plan/conserved? p)))))
+  (testing "an out-of-range commission is refused by the fee schedule"
+    (is (seq (st/fee-schedule-errors (fs 10001))))
+    (is (seq (st/fee-schedule-errors (fs -1))))))
+
+(deftest fixed-fee-is-charged-to-the-buyer-not-taken-from-goods
+  (let [p (st/settlement-plan {:lines (lines ["merchant.a" 1000])
+                               :currency "JPY"
+                               :fee-schedule (fs 1000 :fixed 50)
+                               :operator operator})]
+    (is (= 1000 (:plan/gross-minor p)))
+    (is (= 1050 (:plan/buyer-charge-minor p)))
+    (is (true? (:plan/conserved? p)) "conservation is checked against goods")
+    (is (= 150 (:plan/operator-total-minor p)) "100 commission + 50 fixed")))
+
+(deftest plan-is-never-custodial
+  (let [p (plan (lines ["merchant.a" 1000]) 1000)]
+    (is (false? (:plan/custodial? p)))
+    (is (true? (:plan/non-adjudicating p)))))
+
+(deftest unverified-payout-destination-blocks-the-plan
+  (let [p (plan (lines ["merchant.a" 1000]) 1000)]
+    (is (empty? (st/plan-errors p {"merchant.a" (dest "merchant.a")})))
+    (testing "an unverified destination is caught before approval, not at execution"
+      (is (some #(= :payout-destination-unverified (:settlement.error/code %))
+                (st/plan-errors p {"merchant.a" (dest "merchant.a" :verified? false)}))))
+    (testing "a missing destination names the seller it is missing for"
+      (is (some #(and (= :missing-payout-destination (:settlement.error/code %))
+                      (= "merchant.a" (:settlement.error/detail %)))
+                (st/plan-errors p {}))))
+    (testing "an unknown rail is refused"
+      (is (some #(= :unknown-rail (:settlement.error/code %))
+                (st/plan-errors p {"merchant.a" (st/payout-destination
+                                                 {:seller "merchant.a" :rail :carrier-pigeon
+                                                  :address "x" :verified? true})}))))))
+
+(deftest broken-conservation-is-caught-by-plan-errors
+  (let [p (assoc (plan (lines ["merchant.a" 1000]) 1000)
+                 :plan/seller-payout-total-minor 1)]
+    (is (some #(= :not-conserved (:settlement.error/code %))
+              (st/plan-errors (assoc p :plan/conserved? false)
+                              {"merchant.a" (dest "merchant.a")})))))
+
+;; ───────────────────────────── escrow ─────────────────────────────
+
+(deftest escrow-lifecycle
+  (let [e (st/escrow {:id "esc-1" :plan (plan (lines ["merchant.a" 1000]) 1000)
+                      :basket "basket-1"
+                      :opened-at "2026-06-01T00:00:00Z"
+                      :release-after "2026-06-08T00:00:00Z"})]
+    (is (= :held (:escrow/state e)))
+    (is (= "basket-1" (:escrow/basket e))
+        "an escrow must be able to say which order it covers, or it cannot
+         be released against a delivery confirmation")
+    (is (false? (:escrow/custodial? e)))
+    (is (= :released (:escrow/state (st/advance-escrow e :released))))
+    (is (nil? (st/advance-escrow (st/advance-escrow e :released) :refunded))
+        "a released escrow is terminal")))
+
+(deftest release-requires-both-window-and-delivery
+  (let [e (st/escrow {:id "esc-1" :plan {} :opened-at "2026-06-01T00:00:00Z"
+                      :release-after "2026-06-08T00:00:00Z"})]
+    (is (true? (st/releasable? e "2026-06-08T00:00:00Z" true)))
+    (testing "an elapsed hold window must NOT auto-release an undelivered order"
+      (is (false? (st/releasable? e "2026-07-01T00:00:00Z" false))))
+    (testing "delivery before the window still waits"
+      (is (false? (st/releasable? e "2026-06-02T00:00:00Z" true))))))
+
+(deftest disputed-escrow-has-no-automatic-exit
+  (let [d (st/advance-escrow (st/escrow {:id "e" :plan {} :opened-at "t"}) :disputed)]
+    (is (= :disputed (:escrow/state d)))
+    (testing "no transition-table edge leads out of :disputed"
+      (is (nil? (st/advance-escrow d :released)))
+      (is (nil? (st/advance-escrow d :refunded))))
+    (testing "only an explicitly attributed human decision resolves it"
+      (is (nil? (st/resolve-dispute d {:decision :release :decided-by ""})))
+      (is (nil? (st/resolve-dispute d {:decision :something-else :decided-by "jun"})))
+      (let [r (st/resolve-dispute d {:decision :refund :decided-by "jun@gftd.group"
+                                     :decided-at "2026-06-10T00:00:00Z"
+                                     :rationale "未着"})]
+        (is (= :refunded (:escrow/state r)))
+        (is (true? (get-in r [:escrow/resolution :resolution/human?])))
+        (is (= "jun@gftd.group" (get-in r [:escrow/resolution :resolution/decided-by])))))))
+
+;; ───────────────────────────── pay bridge ─────────────────────────────
+
+(deftest pay-bridge-does-not-conflate-units
+  (testing "USD cents -> USDC micros is 10,000x, not identity"
+    (is (= 1000000 (st/->pay-micros 100 100)) "$1.00 = 100 cents = 1,000,000 micros"))
+  (testing "JPY has no minor unit subdivision"
+    (is (= 1000000 (st/->pay-micros 1 1)) "1 JPY unit maps to one whole unit of micros"))
+  (testing "a nonsense exponent yields nil rather than a wrong number"
+    (is (nil? (st/->pay-micros 100 0)))
+    (is (nil? (st/->pay-micros 100.5 100)))))

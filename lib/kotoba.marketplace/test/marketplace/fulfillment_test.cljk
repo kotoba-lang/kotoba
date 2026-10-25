@@ -1,0 +1,162 @@
+(ns marketplace.fulfillment-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.okaimono :as ok]
+            [kotoba.robotics :as robo]
+            [marketplace.fulfillment :as ff]
+            [marketplace.order :as order]))
+
+(def ^:private the-order
+  (order/order {:id "ord-1" :buyer "buyer-1"
+                :lines [{:seller "merchant.a" :sku "A1" :name "Cola" :qty 2 :unit-price-minor 600}
+                        {:seller "merchant.a" :sku "A2" :name "Water" :qty 3 :unit-price-minor 100}]}))
+
+(def ^:private sub (order/sub-order the-order "merchant.a"))
+
+(defn- tasks [] (ff/plan-tasks "ord-1" sub :station "ST-1" :robot "amr-07"))
+(defn- task-of [kind] (first (filter #(= kind (:task/kind %)) (tasks))))
+
+(deftest tasks-are-planned-from-the-sub-order-itself
+  (let [ts (tasks)]
+    (is (= [:pick :pack :handover] (mapv :task/kind ts)))
+    (testing "lines come from the okaimono sub-order, so a task can never
+              reference an item the buyer did not order"
+      (is (every? #(= (:okaimono/lines sub) (:task/lines %)) ts)))
+    (is (every? #(empty? (ff/task-errors %)) ts))))
+
+(deftest a-task-with-no-robot-cannot-be-planned
+  (is (some #(= :missing-robot (:fulfillment.error/code %))
+            (ff/task-errors (ff/task {:order-id "o" :seller "s" :kind :pick
+                                      :lines (:okaimono/lines sub)})))))
+
+;; ───────────────────── the over-pick guard ─────────────────────
+
+(deftest picking-something-not-in-the-order-is-an-error
+  (testing "a mechanically perfect robot still ships the wrong box if
+            nothing checks this against the order"
+    (is (some #(= :sku-not-in-order (:fulfillment.error/code %))
+              (ff/pick-errors sub [{:sku "ZZ" :qty 1}])))))
+
+(deftest over-picking-is-an-error
+  (is (some #(= :over-pick (:fulfillment.error/code %))
+            (ff/pick-errors sub [{:sku "A1" :qty 3}])) "ordered 2")
+  (testing "quantities are aggregated per SKU — two passes of 2 and 1 against
+            an order for 2 must not both pass individually while three units
+            leave the shelf. A second pass is the normal way a short pick gets
+            topped up, so this is not hypothetical"
+    (is (some #(= :over-pick (:fulfillment.error/code %))
+              (ff/pick-errors sub [{:sku "A1" :qty 2} {:sku "A1" :qty 1}])))
+    (is (empty? (ff/pick-errors sub [{:sku "A1" :qty 1} {:sku "A1" :qty 1}]))
+        "two passes summing to exactly the order are clean"))
+  (is (empty? (ff/pick-errors sub [{:sku "A1" :qty 2} {:sku "A2" :qty 3}]))
+      "picking exactly the order is clean"))
+
+(deftest a-short-pick-is-reported-not-refused
+  (testing "a stock discrepancy is an ordinary warehouse state a human must
+            see, not a rule the system should refuse"
+    (is (empty? (ff/pick-errors sub [{:sku "A1" :qty 1}]))
+        "not an error")
+    (is (= [{:sku "A1" :ordered 2 :picked 1} {:sku "A2" :ordered 3 :picked 0}]
+           (ff/short-picks sub [{:sku "A1" :qty 1}])))
+    (is (empty? (ff/short-picks sub [{:sku "A1" :qty 2} {:sku "A2" :qty 3}])))))
+
+(deftest invalid-pick-quantities-are-refused
+  (is (seq (ff/pick-errors sub [{:sku "A1" :qty 0}])))
+  (is (seq (ff/pick-errors sub [{:sku "A1" :qty -1}]))))
+
+;; ───────────────────── robotics composition ─────────────────────
+
+(deftest one-bounded-mission-per-task
+  (let [m (ff/mission-for (task-of :pick))]
+    (is (= "amr-07" (:mission/robot m)))
+    (is (= :planned (:mission/status m)))
+    (is (= 2 (:mission/max-steps m)) "two SKU lines")
+    (is (= "ST-1" (:mission/boundaries m)))))
+
+(deftest actions-carry-a-real-safety-class
+  (let [pick (ff/actions-for (task-of :pick))
+        hand (ff/actions-for (task-of :handover))]
+    (is (= 2 (count pick)) "one action per line")
+    (is (every? #(= :grasp (:action/kind %)) pick))
+    (is (every? #(= :medium (:action/safety %)) pick))
+    (testing "handover is :high because it is the step where a robot moves a
+              parcel into a space a human courier occupies"
+      (is (every? #(= :move (:action/kind %)) hand))
+      (is (every? #(= :high (:action/safety %)) hand))
+      (is (every? #(robo/requires-sign-off? %) hand)
+          "and :high is in kotoba.robotics/human-sign-off-classes"))
+    (testing "every action actuates hardware, so none may bypass the gate"
+      (is (every? robo/actuates-hardware? (concat pick hand))))))
+
+(deftest the-gate-keeps-sign-off-separate-from-permitted
+  (let [g (ff/gate-actions (task-of :handover) #{:low :medium :high})]
+    (is (empty? (:permitted g))
+        "a :high action is NOT permitted outright even though its class is allowed")
+    (is (= 2 (count (:needs-sign-off g))))
+    (is (empty? (:denied g)))
+    (testing "which matches kotoba.robotics/action-permitted? exactly"
+      (is (not-any? #(robo/action-permitted? % #{:low :medium :high})
+                    (ff/actions-for (task-of :handover)))))))
+
+(deftest a-disallowed-safety-class-is-denied
+  (let [g (ff/gate-actions (task-of :pick) #{:none :low})]
+    (is (empty? (:permitted g)))
+    (is (= 2 (count (:denied g))))
+    (is (every? #(= :safety-class-not-allowed (:gate/reason %)) (:denied g)))))
+
+(deftest a-task-with-any-denied-action-dispatches-nothing
+  (testing "a partially-executed physical task is worse than an unstarted
+            one — the warehouse then does not know where the goods are"
+    (is (nil? (ff/dispatchable-actions (task-of :pick) #{:none :low})))
+    (is (nil? (ff/dispatchable-actions (task-of :handover) #{:low :medium}))))
+  (testing "a fully permitted task dispatches all of its actions"
+    (let [d (ff/dispatchable-actions (task-of :pack) #{:low})]
+      (is (= 2 (count d)))
+      (is (every? #(= :actuate (:action/kind %)) d))))
+  (testing "and a sign-off-class task dispatches nothing, ever, by this path"
+    (is (empty? (or (ff/dispatchable-actions (task-of :handover) #{:high}) [])))))
+
+(deftest nothing-here-talks-to-a-robot
+  (testing "the library is policy, not control — dispatchable-actions
+            returns records, it does not send them anywhere"
+    (let [d (ff/dispatchable-actions (task-of :pack) #{:low})]
+      (is (every? map? d))
+      (is (every? #(contains? % :action/params) d)))))
+
+;; ───────────────────── halting ─────────────────────
+
+(deftest a-halt-is-terminal-and-needs-a-known-reason
+  (let [t (task-of :pick)
+        h (ff/halt t :e-stop :source "floor-button" :detail "human entered aisle")]
+    (is (= :halted (:task/status (:halt/task-after h))))
+    (is (= :e-stop (:stop/reason (:halt/stop h))))
+    (testing "recovering means planning a NEW task — the physical state after
+              a stop is unknown"
+      (is (nil? (ff/advance-task (:halt/task-after h) :in-progress)))
+      (is (nil? (ff/advance-task (:halt/task-after h) :done))))
+    (testing "an unrecognised stop cause cannot be recorded as if understood"
+      (is (nil? (ff/halt t :vibes))))))
+
+(deftest task-transitions
+  (let [t (task-of :pick)]
+    (is (= :in-progress (:task/status (ff/advance-task t :in-progress))))
+    (is (= :done (:task/status (ff/advance-task (ff/advance-task t :in-progress) :done))))
+    (is (nil? (ff/advance-task t :done)) "planned -> done skips the work")))
+
+;; ───────────────────── readiness ─────────────────────
+
+(deftest handover-requires-both-views-to-agree
+  (let [packed-sub (-> sub (ok/advance :confirmed) (ok/advance :packed))
+        done-pack  (mapv #(if (= :pack (:task/kind %))
+                            (assoc % :task/status :done) %)
+                         (tasks))]
+    (is (true? (ff/ready-for-handover? done-pack packed-sub)))
+    (testing "warehouse says packed but the order does not"
+      (is (false? (ff/ready-for-handover? done-pack sub))))
+    (testing "order says packed but the warehouse never finished packing"
+      (is (false? (ff/ready-for-handover? (tasks) packed-sub))))))
+
+(deftest telemetry-proof-links-sensing-to-the-ledger
+  (let [p (ff/proof (task-of :pick) :barcode "A1" :timestamp "2026-06-01T00:00:00Z")]
+    (is (= "m.ff.ord-1.merchant.a.pick" (:proof/mission p)))
+    (is (= :barcode (:proof/sensor p)))
+    (is (= "A1" (:proof/reading p)))))
