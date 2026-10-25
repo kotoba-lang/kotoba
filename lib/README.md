@@ -142,6 +142,7 @@ The bundled standard libraries live in this repository:
 | `org.sevenZip.sevenZ` | `org.sevenZip.sevenZ/src` | `sevenz.core` (an external specification, publisher sevenZip.org) |
 | `org.iso.std10303` | `org.iso.std10303/src` | `brep`, `brep.assembly`, `brep.config`, `brep.config-loader` (an external specification, publisher iso.org) |
 | `org.csaIot.matter` | `org.csaIot.matter/src` | `matter.message`, `matter.protocol`, `matter.tlv` (an external specification, publisher csaIot.org) |
+| `org.bitcoin.p2p` | `org.bitcoin.p2p/src` | `kotobase.bitcoin.protocol`, `kotobase.bitcoin.transport` (an external specification, publisher bitcoin.org) |
 | `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |
 | `com.adobe.tiff` | `com.adobe.tiff/src` | `tiff.bytes`, `tiff.codec`, `tiff.core` (Kotoba project library) |
 | `app.bsky.atproto` | `app.bsky.atproto/src` | `atproto.core`, `atproto.sdk` (Kotoba project library) |
