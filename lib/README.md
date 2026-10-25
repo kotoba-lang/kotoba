@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.comMetaWebhook` | `kotoba.comMetaWebhook/src` | `meta-webhook.async-signature`, `meta-webhook.handshake`, `meta-webhook.instagram-client`, `meta-webhook.instagram-events` (Kotoba project library) |
 | `kotoba.comMattermost` | `kotoba.comMattermost/src` | `mattermost.client` (Kotoba project library) |
 | `kotoba.comMatrix` | `kotoba.comMatrix/src` | `matrix.client` (Kotoba project library) |
 | `kotoba.comMapillaryGraphApi` | `kotoba.comMapillaryGraphApi/src` | `com-mapillary-graph-api.core`, `com-mapillary-graph-api.fetch` (Kotoba project library) |
