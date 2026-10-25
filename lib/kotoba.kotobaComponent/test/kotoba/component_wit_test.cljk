@@ -1,0 +1,155 @@
+(ns kotoba.component-wit-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.process :as shell]
+            [kotoba.component.wit :as wit]))
+
+(def kir
+  {:format :kotoba.kir/v4
+   :exports ['invoke]
+   :schemas {:app/request [:record :app/request [[:url :string]]]
+             :app/result [:variant :app/result
+                          [[:ok [:ref :app/request]] [:error :string]]]}
+   :functions [{:name 'invoke :params ['request]
+                :param-types [[:ref :app/request]] :result [:ref :app/result]
+                :body '(typed-cap-call 4 [:ref :app/request]
+                                        [:ref :app/result] request)}]})
+
+(deftest typed-v03-profile-uses-explicit-bounded-resources
+  (let [profile (get-in wit/contract [:profiles :typed-capability-v3])
+        transport (:capability-transport profile)]
+    (is (= :wasm-component-kotoba-v2 (:target profile)))
+    (is (= "aiueos:capability/application@0.3.0" (:world profile)))
+    (is (= :named-operation (get-in transport [:grant :acquire])))
+    (is (= :borrow (get-in transport [:grant :provider-argument])))
+    (is (= [:poll :cancel] (get-in transport [:bytes-task :operations])))
+    (is (= [:read :cancel] (get-in transport [:bytes-stream :operations])))
+    (is (= 65536 (get-in transport [:bytes-stream :max-pull-bytes])))
+    (is (false? (:ambient-executor transport)))
+    (is (false? (:wasi-native-future-stream profile)))))
+
+(deftest emits-deterministic-closed-wit-world
+  (let [a (wit/emit kir)
+        b (wit/emit kir)]
+    (is (= a b))
+    (is (= "0.3.0" (:wasi-version a)))
+    (is (= [:http/post] (:imports a)))
+    (is (= ['invoke] (:exports a)))
+    (is (re-find #"package kotoba:application@1.0.0" (:source a)))
+    (is (re-find #"interface http-post" (:source a)))
+    (is (re-find #"import http-post;" (:source a)))
+    (is (re-find #"export invoke: func\(request: app-request\) -> app-result;" (:source a)))
+    (is (not (re-find #"wasi:filesystem|wasi:sockets" (:source a))))))
+
+(deftest emitted-package-is-accepted-by-the-official-wit-toolchain
+  (let [path (kio/temp-file "kotoba-component-" ".wit")]
+    (try
+      (kio/write-string path (:source (wit/emit kir)))
+      (let [result (shell/sh "wasm-tools" "component" "embed" (str path) "--dummy" "-t")]
+        (is (zero? (:exit result)) (:err result))
+        (is (re-find #"component-type" (:out result))))
+      (finally (kio/delete-if-exists path)))))
+
+(deftest sealed-inline-record-exports-use-their-nominal-wit-type
+  (let [record-type [:record :app/point [[:x :i64] [:visible :bool]]]
+        value {:format :kotoba.kir/v4 :exports ['echo]
+               :schemas {:app/point record-type}
+               :functions [{:name 'echo :params ['point] :param-types [record-type]
+                            :result record-type :body 'point}]}
+        source (:source (wit/emit value))]
+    (is (re-find #"export echo: func\(point: app-point\) -> app-point" source))
+    (is (thrown-with-msg? kerror/ExceptionInfo #"differs from sealed schema identity"
+                          (wit/emit (assoc-in value [:functions 0 :result]
+                                              [:record :app/point [[:x :f64]]]))))))
+
+(deftest rejects-unregistered-capabilities-and-name-collisions
+  (is (thrown-with-msg? kerror/ExceptionInfo #"no WIT contract"
+                        (wit/emit (assoc-in kir [:functions 0 :body]
+                                           '(typed-cap-call 255 :i64 :i64 0)))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"collide"
+                        (wit/emit (assoc kir :schemas
+                                         {:app/a [:record :app/a [[:x :i64]]]
+                                          :app.a [:record :app.a [[:x :i64]]]}))))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"export names collide"
+       (wit/emit {:format :kotoba.kir/v4
+                  :exports ['do-work 'do_work]
+                  :schemas {}
+                  :functions [{:name 'do-work :params [] :param-types []
+                               :result :i64 :body 0}
+                              {:name 'do_work :params [] :param-types []
+                               :result :i64 :body 0}]})))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"parameter names collide"
+       (wit/emit {:format :kotoba.kir/v4
+                  :exports ['invoke]
+                  :schemas {}
+                  :functions [{:name 'invoke
+                               :params ['item-id 'item_id]
+                               :param-types [:i64 :i64]
+                               :result :i64 :body 'item-id}]}))))
+
+(deftest internal-recursive-schemas-omitted-from-wit-when-exports-are-scalar
+  "W4 record-kv residual: guest may use recursive :edn/node ADTs internally
+  while exporting only :string / :i64 kit codecs. Those schemas must not be
+  forced onto the WIT surface (no representation) and must not block emit."
+  (let [edn-kv [:record :edn/kv [[:k :string] [:v :string]]]
+        edn-node [:variant :edn/node
+                  [[:atom :string]
+                   [:entry [:ref :edn/kv]]
+                   [:pair [:vector [[:ref :edn/node] [:ref :edn/node]]]]]]
+        value {:format :kotoba.kir/v4
+               :exports ['request-edn 'main]
+               :schemas {:edn/kv edn-kv :edn/node edn-node}
+               :functions [{:name 'request-edn
+                            :params ['url]
+                            :param-types [:string]
+                            :result :string
+                            :body 'url}
+                           {:name 'main :params [] :param-types []
+                            :result :i64 :body -2506}]}
+        out (wit/emit value)
+        source (:source out)]
+    (is (= ['main 'request-edn] (:exports out))) ; emit sorts export names
+    (is (re-find #"export request-edn: func\(url: string\) -> string;" source))
+    (is (re-find #"export main: func\(\) -> s64;" source))
+    ;; Internal recursive ADTs must not appear in WIT types.
+    (is (not (re-find #"edn-node|edn-kv|interface types" source)))
+    (is (nil? (re-find #"recursive" source)))))
+
+(deftest surface-recursive-schemas-still-rejected
+  "Recursive ADTs on the Canonical export surface remain reject-v1."
+  (let [edn-node [:variant :edn/node
+                  [[:atom :string]
+                   [:pair [:vector [[:ref :edn/node] [:ref :edn/node]]]]]]
+        value {:format :kotoba.kir/v4
+               :exports ['echo]
+               :schemas {:edn/node edn-node}
+               :functions [{:name 'echo
+                            :params ['n]
+                            :param-types [[:ref :edn/node]]
+                            :result [:ref :edn/node]
+                            :body 'n}]}]
+    (is (thrown-with-msg? kerror/ExceptionInfo
+                          #"recursive schema has no WIT representation"
+                          (wit/emit value)))))
+
+(deftest ops-kit-wire-ids-19-23-are-registered-for-wit
+  "ADR 0120: ops kit capabilities are inventory rows so typed-cap-call emits WIT."
+  (let [by-id (into {} (map (juxt :id :name) (:capabilities wit/contract)))]
+    (is (= :fs/transact (get by-id 19)))
+    (is (= :process/spawn (get by-id 20)))
+    (is (= :secret/get (get by-id 21)))
+    (is (= :git/run (get by-id 22)))
+    (is (= :entropy/draw (get by-id 23)))
+    (is (= :dataspace/transact (get by-id 24)))
+    (is (= 24 (count (:capabilities wit/contract)))))
+  (let [ops-kir {:format :kotoba.kir/v4
+                 :exports ['run]
+                 :schemas {}
+                 :functions [{:name 'run :params ['req] :param-types [:string]
+                              :result :string
+                              :body '(typed-cap-call 20 :string :string req)}]}
+        package (wit/emit ops-kir)]
+    (is (= [:process/spawn] (:imports package)))
+    (is (re-find #"interface process" (:source package)))
+    (is (re-find #"spawn: func\(request: string\) -> string" (:source package)))))
