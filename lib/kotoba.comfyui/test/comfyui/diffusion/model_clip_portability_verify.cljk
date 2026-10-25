@@ -1,0 +1,161 @@
+(ns comfyui.diffusion.model-clip-portability-verify
+  "comfyui.diffusion.model and comfyui.clip.encoder were JVM-only (.clj) even
+  though neither touches JVM I/O directly — both receive already-decoded
+  tensors through a component's :comfyui/read-tensor injection point, so the
+  only JVM-specific surface was bare `Math/foo` calls (ClojureScript resolves
+  `Math/foo` to `Math.foo` natively — see num.tensor/num.autograd/
+  num.tensor-async for the same established convention in this workspace, so
+  no js/Math wrapper is needed). Converting them to .cljc and running this
+  under Node proves real ClojureScript/nbb portability, not just compilation.
+
+  This is NOT a new fixture: both cases are the exact fixtures from
+  test/comfyui/diffusion/model_test.cljk
+  (learned-cross-attention-and-timestep-embedding-execute, denoise sample 10
+  condition-a only) and test/comfyui/clip/encoder_test.cljk
+  (checkpoint-backed-causal-clip-transformer-encodes-tokens), and the
+  expected vectors below were captured by running those same fixtures on the
+  JVM (`kbb -M -e ...`) before this conversion. Passing here means CLJS
+  and JVM independently compute IDENTICAL floating-point output from the same
+  source for real UNet cross-attention/timestep-embedding math and real CLIP
+  self-attention/layer-norm/quick-GELU math.
+
+  Run under Node:
+    kbb -M:model-clip-portability-verify && node target/model-clip-portability-verify.cjs"
+  (:require [comfyui.clip.encoder :as clip]
+            [comfyui.diffusion.model :as model]
+            [num.array :as arr]
+            [num.cpu :as cpu]))
+
+(defn- approx? [a b] (< (Math/abs (- (double a) (double b))) 1e-9))
+(defn- approx-vec? [u v] (and (= (count u) (count v)) (every? true? (map approx? u v))))
+
+(def backend (cpu/cpu-backend))
+
+(defn- identity-values [rows columns scale]
+  (mapv (fn [index]
+          (let [row (quot index columns) column (mod index columns)]
+            (if (= row column) scale 0.0)))
+        (range (* rows columns))))
+
+(defn- verify-diffusion-model []
+  (let [arrays
+        {"q.w" (arr/from-vec backend (identity-values 4 4 1.0) [4 4])
+         "q.b" (arr/from-vec backend [0 0 0 0] [4])
+         "k.w" (arr/from-vec backend
+                             [1 0 0, 0 1 0, 0 0 1, 0.25 0.25 0.25] [4 3])
+         "k.b" (arr/from-vec backend [0 0 0 0] [4])
+         "v.w" (arr/from-vec backend
+                             [0.5 0 0, 0 0.5 0, 0 0 0.5, 0.1 0.2 0.3] [4 3])
+         "v.b" (arr/from-vec backend [0 0 0 0] [4])
+         "o.w" (arr/from-vec backend (identity-values 4 4 0.75) [4 4])
+         "o.b" (arr/from-vec backend [0.01 -0.02 0.03 -0.04] [4])
+         "time.0.w" (arr/from-vec backend (identity-values 4 4 0.1) [4 4])
+         "time.0.b" (arr/from-vec backend [0 0 0 0] [4])
+         "time.2.w" (arr/from-vec backend (identity-values 4 4 0.2) [4 4])
+         "time.2.b" (arr/from-vec backend [0 0 0 0] [4])}
+        component {:comfyui/read-tensor (fn [_ tensor-name] (get arrays tensor-name))}
+        spec {:layers
+              [{:op :timestep-embedding
+                :first-weight "time.0.w" :first-bias "time.0.b"
+                :second-weight "time.2.w" :second-bias "time.2.b"}
+               {:op :cross-attention :heads 2
+                :query-weight "q.w" :query-bias "q.b"
+                :key-weight "k.w" :key-bias "k.b"
+                :value-weight "v.w" :value-bias "v.b"
+                :output-weight "o.w" :output-bias "o.b"}]}
+        denoise (model/compile-denoiser component backend spec)
+        sample (arr/from-vec backend
+                             [0.2 -0.1 0.3 0.4, -0.2 0.1 0.5 -0.3,
+                              0.6 0.2 -0.4 0.1, 0.1 0.7 -0.2 0.3]
+                             [1 4 2 2])
+        condition-a (arr/from-vec backend
+                                  [1 0 0, 0 1 0, 0 0 1] [1 3 3])
+        output-a (denoise sample 10 condition-a)
+        ;; captured from `kbb -M -e ...` against comfyui.diffusion.model
+        ;; on the JVM, before this .clj -> .cljc conversion
+        expected
+        [0.34741008017511876 0.020680008609955544 0.4310500214747317
+         0.5630464866716833 -0.11204006631202496 0.21410141901506086
+         0.6260916098986218 -0.22310630059909795 0.7838808985053127
+         0.35851618792992496 -0.27582901317098774 0.252437379415158
+         0.2315755181502296 0.8239661049776131 -0.08633745535266066
+         0.4221424624231831]
+        actual (arr/->vec output-a)]
+    (assert (= [1 4 2 2] (:shape output-a)) (str "shape mismatch: " (:shape output-a)))
+    (assert (approx-vec? expected actual)
+            (str "diffusion.model cross-attention/timestep-embedding mismatch\n"
+                 "expected " expected "\nactual   " (vec actual)))
+    (println "OK comfyui.diffusion.model: cross-attention + timestep-embedding"
+              "match JVM reference under CLJS" (vec actual))))
+
+(defn- matrix [rows columns f]
+  (arr/from-vec backend
+                (vec (for [row (range rows) column (range columns)]
+                       (double (f row column))))
+                [rows columns]))
+
+(defn- vector* [values] (arr/from-vec backend values [(count values)]))
+
+(defn- verify-clip-encoder []
+  (let [identity4 (matrix 4 4 #(if (= %1 %2) 1.0 0.0))
+        zero4 (vector* [0 0 0 0])
+        one4 (vector* [1 1 1 1])
+        arrays
+        {"token" (matrix 6 4 #(* 0.05 (+ 1 (* %1 4) %2)))
+         "position" (matrix 5 4 #(* 0.01 (+ %1 %2)))
+         "n1.w" one4 "n1.b" zero4
+         "q.w" identity4 "q.b" zero4
+         "k.w" identity4 "k.b" zero4
+         "v.w" identity4 "v.b" zero4
+         "o.w" identity4 "o.b" zero4
+         "n2.w" one4 "n2.b" zero4
+         "fc1.w" (matrix 8 4 #(if (= (mod %1 4) %2) 0.5 0.0))
+         "fc1.b" (vector* (repeat 8 0.0))
+         "fc2.w" (matrix 4 8 #(if (or (= %2 %1) (= %2 (+ 4 %1))) 0.25 0.0))
+         "fc2.b" zero4
+         "final.w" one4 "final.b" zero4}
+        component {:comfyui/read-tensor (fn [_ name] (get arrays name))}
+        layer {:norm1-weight "n1.w" :norm1-bias "n1.b"
+               :query-weight "q.w" :query-bias "q.b"
+               :key-weight "k.w" :key-bias "k.b"
+               :value-weight "v.w" :value-bias "v.b"
+               :output-weight "o.w" :output-bias "o.b"
+               :norm2-weight "n2.w" :norm2-bias "n2.b"
+               :fc1-weight "fc1.w" :fc1-bias "fc1.b"
+               :fc2-weight "fc2.w" :fc2-bias "fc2.b"}
+        spec {:token-embedding "token" :position-embedding "position"
+              :layers [layer] :heads 2
+              :final-norm-weight "final.w" :final-norm-bias "final.b"}
+        encode (clip/compile-encoder component backend spec)
+        tokens {:input-ids [1 2 3 4 0] :attention-mask [1 1 1 1 0]}
+        result (encode tokens)
+        ;; captured from `kbb -M -e ...` against comfyui.clip.encoder on
+        ;; the JVM, before this .clj -> .cljc conversion
+        expected-tensor
+        [-1.309052932144666 -0.4788847200254251 0.41508410605962026
+         1.3728535461104707 -1.3090529321446658 -0.4788847200254254
+         0.4150841060596204 1.372853546110471 -1.309052932144666
+         -0.47888472002542526 0.4150841060596201 1.3728535461104712
+         -1.3090529321446656 -0.4788847200254255 0.4150841060596198
+         1.3728535461104712 -1.3090529321446658 -0.4788847200254252
+         0.41508410605962015 1.372853546110471]
+        expected-pooled
+        [-1.3090529321446656 -0.4788847200254255 0.4150841060596198
+         1.3728535461104712]]
+    (assert (= [1 5 4] (:shape (:tensor result))) "clip tensor shape mismatch")
+    (assert (= [1 4] (:shape (:pooled result))) "clip pooled shape mismatch")
+    (assert (approx-vec? expected-tensor (arr/->vec (:tensor result)))
+            (str "clip encoder tensor mismatch\nexpected " expected-tensor
+                 "\nactual   " (vec (arr/->vec (:tensor result)))))
+    (assert (approx-vec? expected-pooled (arr/->vec (:pooled result)))
+            (str "clip encoder pooled mismatch\nexpected " expected-pooled
+                 "\nactual   " (vec (arr/->vec (:pooled result)))))
+    (println "OK comfyui.clip.encoder: self-attention + layer-norm + quick-GELU"
+              "match JVM reference under CLJS" (vec (arr/->vec (:pooled result))))))
+
+(defn -main [& _]
+  (verify-diffusion-model)
+  (verify-clip-encoder)
+  (println "\nAll comfyui.diffusion.model / comfyui.clip.encoder portability checks passed."))
+
+(-main)

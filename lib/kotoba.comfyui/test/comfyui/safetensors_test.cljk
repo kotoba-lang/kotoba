@@ -1,0 +1,84 @@
+(ns comfyui.safetensors-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [kotoba.test :refer [deftest is testing]]
+            [comfyui.safetensors :as safe]
+            [num.array :as arr]
+            [num.cpu :as cpu])
+  (:import [java.nio ByteBuffer ByteOrder]
+           [java.nio.file Files OpenOption]
+           [java.nio.file.attribute FileAttribute]))
+
+(def backend (cpu/cpu-backend))
+
+(defn- fixture-bytes []
+  (let [header (json/write-str
+                {"__metadata__" {"format" "pt"}
+                 "float.weight" {"dtype" "F32" "shape" [2] "data_offsets" [0 8]}
+                 "half.weight" {"dtype" "F16" "shape" [2] "data_offsets" [8 12]}
+                 "bfloat.weight" {"dtype" "BF16" "shape" [2] "data_offsets" [12 16]}})
+        header-bytes (kbytes/utf8-bytes header)
+        out (doto (ByteBuffer/allocate (+ 8 (alength header-bytes) 16))
+              (.order ByteOrder/LITTLE_ENDIAN))]
+    (.putLong out (long (alength header-bytes)))
+    (.put out header-bytes)
+    (.putFloat out (float 1.5))
+    (.putFloat out (float -2.25))
+    (.putShort out (unchecked-short 0x3c00)) ; F16 1.0
+    (.putShort out (unchecked-short 0xc000)) ; F16 -2.0
+    (.putShort out (unchecked-short 0x3fc0)) ; BF16 1.5
+    (.putShort out (unchecked-short 0xc010)) ; BF16 -2.25
+    (.array out)))
+
+(deftest reads-real-safetensors-windows-and-dtypes
+  (let [path (Files/createTempFile "comfyui-safetensors-" ".safetensors"
+                                   (make-array FileAttribute 0))]
+    (try
+      (Files/write path (fixture-bytes) (make-array OpenOption 0))
+      (with-open [checkpoint (safe/open-file path)]
+        (is (= {"format" "pt"} (:metadata checkpoint)))
+        (is (= ["bfloat.weight" "float.weight" "half.weight"]
+               (safe/tensor-names checkpoint)))
+        (doseq [[name expected]
+                [["float.weight" [1.5 -2.25]]
+                 ["half.weight" [1.0 -2.0]]
+                 ["bfloat.weight" [1.5 -2.25]]]]
+          (testing name
+            (let [tensor (safe/read-tensor checkpoint backend name)]
+              (is (= [2] (:shape tensor)))
+              (is (= :f32 (:dtype tensor)))
+              (is (= expected (arr/->vec tensor))))))
+        (testing "native half storage"
+          (doseq [[name expected-dtype expected]
+                  [["half.weight" :f16 [1.0 -2.0]]
+                   ["bfloat.weight" :bf16 [1.5 -2.25]]]]
+            (let [tensor (safe/read-tensor checkpoint backend name
+                                           {:dtype-policy :native})]
+              (is (= expected-dtype (:dtype tensor)))
+              (is (= expected-dtype (get-in tensor [:handle :dtype])))
+              (is (= 2 (alength ^shorts (get-in tensor [:handle :data]))))
+              (is (= expected (arr/->vec tensor))))))
+        (is (thrown-with-msg? kerror/ExceptionInfo #"dtype-policy"
+                              (safe/read-tensor checkpoint backend "half.weight"
+                                                {:dtype-policy :float16})))
+        (is (thrown-with-msg? kerror/ExceptionInfo #"not found"
+                              (safe/read-tensor checkpoint backend "missing"))))
+      (finally
+        (Files/deleteIfExists path)))))
+
+(deftest rejects-a-tensor-window-outside-the-payload
+  (let [header (kbytes/utf8-bytes
+                (json/write-str {"x" {"dtype" "F32" "shape" [2]
+                                      "data_offsets" [0 8]}}))
+        out (doto (ByteBuffer/allocate (+ 8 (alength header) 4))
+              (.order ByteOrder/LITTLE_ENDIAN))
+        path (Files/createTempFile "comfyui-bad-safetensors-" ".safetensors"
+                                   (make-array FileAttribute 0))]
+    (try
+      (.putLong out (long (alength header)))
+      (.put out header)
+      (.putFloat out (float 1.0))
+      (Files/write path (.array out) (make-array OpenOption 0))
+      (is (thrown-with-msg? kerror/ExceptionInfo #"invalid safetensors tensor entry"
+                            (safe/open-file path)))
+      (finally
+        (Files/deleteIfExists path)))))

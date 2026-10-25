@@ -1,0 +1,149 @@
+(ns comfyui.safetensors
+  "JVM safetensors reader for real diffusion checkpoints.
+
+  The format is deliberately simple: an unsigned little-endian u64 JSON
+  header length, the UTF-8 header, then contiguous tensor payloads. This
+  namespace validates every declared window before exposing it and reads only
+  requested tensors, so multi-gigabyte checkpoints are not materialized."
+  (:require [kotoba.bytes :as kbytes] [json.data-json :as json]
+            [num.array :as arr])
+  (:import [java.io Closeable RandomAccessFile]
+           [java.nio ByteBuffer ByteOrder]
+           [java.nio.channels FileChannel]))
+
+(def ^:private max-header-bytes (* 128 1024 1024))
+(def ^:private dtype-bytes
+  {"F16" 2 "BF16" 2 "F32" 4 "F64" 8
+   "I8" 1 "U8" 1 "I16" 2 "U16" 2 "I32" 4 "U32" 4 "I64" 8 "U64" 8})
+
+(defrecord SafeTensorFile [^RandomAccessFile file ^FileChannel channel path data-start tensors metadata]
+  Closeable
+  (close [_]
+    (.close channel)
+    (.close file)))
+
+(defn- read-fully-at! [^FileChannel channel ^ByteBuffer buffer position]
+  (loop [position (long position)]
+    (when (.hasRemaining buffer)
+      (let [n (.read channel buffer position)]
+        (when (neg? n)
+          (throw (ex-info "truncated safetensors file" {:position position})))
+        (recur (+ position n)))))
+  (.flip buffer)
+  buffer)
+
+(defn- nelems [shape]
+  (reduce * 1 (map long shape)))
+
+(defn open-file
+  "Open and validate a safetensors file. The returned value implements
+  `java.io.Closeable`; use `with-open` or call `close!`. Tensor payloads stay
+  on disk until `read-tensor` is called."
+  [path]
+  (let [file (RandomAccessFile. (str path) "r")
+        channel (.getChannel file)]
+    (try
+      (let [length-buffer (doto (ByteBuffer/allocate 8) (.order ByteOrder/LITTLE_ENDIAN))
+            _ (read-fully-at! channel length-buffer 0)
+            header-length (.getLong length-buffer)
+            file-length (.size channel)]
+        (when (or (neg? header-length) (> header-length max-header-bytes)
+                  (> (+ 8 header-length) file-length))
+          (throw (ex-info "invalid safetensors header length"
+                          {:header-length header-length :file-length file-length})))
+        (let [header-buffer (ByteBuffer/allocate (int header-length))
+              _ (read-fully-at! channel header-buffer 8)
+              header-json (kbytes/utf8-string (.array header-buffer))
+              header (json/read-str header-json)
+              metadata (get header "__metadata__" {})
+              tensors (dissoc header "__metadata__")
+              data-start (+ 8 header-length)
+              payload-length (- file-length data-start)]
+          (doseq [[tensor-name {:strs [dtype shape data_offsets]}] tensors]
+            (let [[start end] data_offsets
+                  width (get dtype-bytes dtype)
+                  expected (when width (* width (nelems shape)))]
+              (when-not (and width (vector? shape) (= 2 (count data_offsets))
+                             (integer? start) (integer? end)
+                             (<= 0 start end payload-length)
+                             (= expected (- end start)))
+                (throw (ex-info "invalid safetensors tensor entry"
+                                {:tensor tensor-name :entry (get tensors tensor-name)
+                                 :payload-length payload-length :expected-bytes expected})))))
+          (->SafeTensorFile file channel (str path) data-start tensors metadata)))
+      (catch Throwable e
+        (.close channel)
+        (.close file)
+        (throw e)))))
+
+(defn close! [^SafeTensorFile checkpoint]
+  (.close checkpoint)
+  {:closed true})
+
+(defn tensor-names [checkpoint]
+  (vec (sort (keys (:tensors checkpoint)))))
+
+(defn tensor-info [checkpoint tensor-name]
+  (get (:tensors checkpoint) tensor-name))
+
+(defn- half->double [bits]
+  (let [sign (if (zero? (bit-and bits 0x8000)) 1.0 -1.0)
+        exponent (bit-and (unsigned-bit-shift-right bits 10) 0x1f)
+        fraction (bit-and bits 0x3ff)]
+    (cond
+      (zero? exponent) (* sign (Math/pow 2.0 -14.0) (/ fraction 1024.0))
+      (= exponent 31) (if (zero? fraction) (* sign Double/POSITIVE_INFINITY) Double/NaN)
+      :else (* sign (Math/pow 2.0 (- exponent 15.0)) (+ 1.0 (/ fraction 1024.0))))))
+
+(defn- decode-values [^ByteBuffer buffer dtype n]
+  (mapv (fn [_]
+          (double
+           (case dtype
+             "F16" (half->double (bit-and 0xffff (int (.getShort buffer))))
+             "BF16" (Float/intBitsToFloat
+                      (unchecked-int
+                       (bit-shift-left (bit-and 0xffff (int (.getShort buffer))) 16)))
+             "F32" (.getFloat buffer)
+             "F64" (.getDouble buffer)
+             "I8" (.get buffer)
+             "U8" (bit-and 0xff (int (.get buffer)))
+             "I16" (.getShort buffer)
+             "U16" (bit-and 0xffff (int (.getShort buffer)))
+             "I32" (.getInt buffer)
+             "U32" (Integer/toUnsignedLong (.getInt buffer))
+             "I64" (.getLong buffer)
+             "U64" (Double/parseDouble (Long/toUnsignedString (.getLong buffer))))))
+        (range n)))
+
+(defn read-tensor
+  "Read one named tensor and upload it to `backend` as a num NDArray. Supports
+  the numeric safetensors dtypes used by diffusion checkpoints, including
+  F16/BF16/F32 without converting the entire checkpoint.
+
+  `:dtype-policy` is `:f32` (the compatibility default) or `:native`. Native
+  preserves F16 and BF16 as physical two-byte num storage; all other
+  safetensors numeric types are uploaded as F32 because num intentionally has
+  no integer/F64 tensor storage yet."
+  ([checkpoint backend tensor-name]
+   (read-tensor checkpoint backend tensor-name {}))
+  ([^SafeTensorFile checkpoint backend tensor-name
+    {:keys [dtype-policy] :or {dtype-policy :f32}}]
+   (when-not (contains? #{:f32 :native} dtype-policy)
+     (throw (ex-info "safetensors dtype-policy must be :f32 or :native"
+                     {:dtype-policy dtype-policy})))
+   (let [{:strs [dtype shape data_offsets] :as info} (tensor-info checkpoint tensor-name)]
+     (when-not info
+       (throw (ex-info "safetensors tensor not found"
+                       {:tensor tensor-name :path (:path checkpoint)})))
+     (let [[start end] data_offsets
+           byte-count (- end start)
+           storage-dtype (if (= :native dtype-policy)
+                           (case dtype "F16" :f16 "BF16" :bf16 :f32)
+                           :f32)
+           buffer (doto (ByteBuffer/allocate (int byte-count))
+                    (.order ByteOrder/LITTLE_ENDIAN))]
+       (read-fully-at! (:channel checkpoint) buffer (+ (:data-start checkpoint) start))
+       (arr/from-vec backend
+                     (decode-values buffer dtype (nelems shape))
+                     (mapv long shape)
+                     storage-dtype)))))

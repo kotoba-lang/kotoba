@@ -1,0 +1,175 @@
+(ns comfyui.clip.encoder
+  "Checkpoint-backed OpenAI CLIP text transformer reference executor."
+  (:require [num.array :as arr]
+            [num.core :as nm]
+            [num.tensor :as t]))
+
+(defn- fail [message data]
+  (throw (ex-info (str "comfyui.clip.encoder: " message) data)))
+
+(defn- dtype [tensor] (or (:dtype tensor) :f32))
+
+(defn- cast-to [tensor target-dtype]
+  (if (= (dtype tensor) target-dtype) tensor (arr/cast tensor target-dtype)))
+
+(defn- softmax [tensor]
+  (cast-to (t/softmax (cast-to tensor :f32)) (dtype tensor)))
+
+(defn- linear [x weight bias]
+  (let [target-dtype (dtype weight)
+        x (cast-to x target-dtype)
+        bias (when bias (cast-to bias target-dtype))
+        transposed (t/transpose weight)
+        multiplied (t/matmul x transposed)
+        output (if bias (t/add multiplied bias) multiplied)]
+    (arr/release! transposed)
+    (when bias (arr/release! multiplied))
+    output))
+
+(defn- layer-norm [x weight bias eps]
+  (t/layer-norm-last x weight bias eps))
+
+(defn- quick-gelu [x]
+  (let [scaled (t/scale x 1.702)
+        gate (nm/sigmoid scaled)
+        output (nm/mul x gate)]
+    (arr/release-all! [scaled gate])
+    output))
+
+(defn- embeddings [backend input-ids token-weight position-weight]
+  (let [[vocab hidden] (:shape token-weight)
+        [positions position-hidden] (:shape position-weight)
+        length (count input-ids)]
+    (when-not (and (= hidden position-hidden) (<= length positions)
+                   (every? #(and (integer? %) (<= 0 % (dec vocab))) input-ids))
+      (fail "token IDs/embedding shapes are incompatible"
+            {:tokens length :token-shape (:shape token-weight)
+             :position-shape (:shape position-weight)}))
+    (let [indices (arr/from-vec backend input-ids [length])
+          tokens (t/embedding indices token-weight)
+          position (t/slice-axis position-weight 0 0 length)
+          output (t/add (t/reshape tokens [1 length hidden])
+                        (t/reshape position [1 length hidden]))]
+      (arr/release-all! [indices tokens position])
+      output)))
+
+(defn- slice-first-axis [tensor start length]
+  (let [[rows _columns] (:shape tensor)]
+    (when (> (+ start length) rows)
+      (fail "projection slice exceeds tensor" {:shape (:shape tensor)
+                                                :start start :length length}))
+    (t/slice-axis tensor 0 start (+ start length))))
+
+(defn- slice-vector [tensor start length]
+  (t/slice-axis tensor 0 start (+ start length)))
+
+(defn- self-attention [x tensor! layer heads]
+  (let [[_batch _length hidden] (:shape x)
+        fused? (:in-proj-weight layer)
+        fused-weight (when fused? (tensor! (:in-proj-weight layer)))
+        fused-bias (when fused? (tensor! (:in-proj-bias layer)))
+        projection-index {"query" 0 "key" 1 "value" 2}
+        project (fn [name]
+                  (if fused?
+                    (let [offset (* hidden (projection-index name))
+                          weight (slice-first-axis fused-weight offset hidden)
+                          bias (slice-vector fused-bias offset hidden)
+                          output (linear x weight bias)]
+                      (arr/release-all! [weight bias])
+                      output)
+                    (linear x (tensor! (get layer (keyword (str name "-weight"))))
+                            (tensor! (get layer (keyword (str name "-bias")))))))
+        q (project "query")
+        k (project "key")
+        v (project "value")
+        attended (t/multi-head-attention q k v heads {:causal? true})
+        output (linear attended (tensor! (:output-weight layer))
+                       (tensor! (:output-bias layer)))]
+    (arr/release-all! [q k v attended])
+    output))
+
+(defn compile-encoder
+  "Compile a CLIP transformer spec. Returns a function accepting a tokenizer
+  result map and producing it with `:tensor [1,seq,hidden]` and `:pooled`."
+  [component backend {:keys [token-embedding position-embedding layers
+                             final-norm-weight final-norm-bias heads eps
+                             return-penultimate? text-projection]
+                      :or {eps 1.0e-5} :as spec}]
+  (when-not (and backend (fn? (:comfyui/read-tensor component))
+                 (seq layers) (pos-int? heads))
+    (fail "encoder requires backend, tensor reader, layers, and heads" {:spec spec}))
+  (let [cache (atom {})
+        tensor! (fn [name]
+                  (or (get @cache name)
+                      (let [value ((:comfyui/read-tensor component) backend name)]
+                        (swap! cache assoc name value) value)))]
+    (with-meta
+      (fn [{:keys [input-ids] :as tokenized}]
+        (let [initial (embeddings backend input-ids
+                                  (tensor! token-embedding) (tensor! position-embedding))
+              block
+              (fn [x layer]
+                 (let [normalized (layer-norm x (tensor! (:norm1-weight layer))
+                                              (tensor! (:norm1-bias layer)) eps)
+                       attention (self-attention normalized tensor! layer heads)
+                       residual (nm/add x attention)
+                       _ (arr/release-all! [x normalized attention])
+                       normalized2 (layer-norm residual
+                                               (tensor! (:norm2-weight layer))
+                                               (tensor! (:norm2-bias layer)) eps)
+                       expanded (linear normalized2
+                                        (tensor! (:fc1-weight layer))
+                                        (tensor! (:fc1-bias layer)))
+                       activated (quick-gelu expanded)
+                       mlp (linear activated (tensor! (:fc2-weight layer))
+                                   (tensor! (:fc2-bias layer)))
+                       output (nm/add residual mlp)]
+                   (arr/release-all! [normalized2 expanded activated residual mlp])
+                   output))
+              active-layers (if return-penultimate? (butlast layers) layers)
+              hidden (reduce block initial active-layers)
+              output (layer-norm hidden (tensor! final-norm-weight)
+                                 (tensor! final-norm-bias) eps)
+              [_ length hidden-size] (:shape output)
+              eos-index (max 0 (dec (or (first (keep-indexed
+                                                (fn [index mask]
+                                                  (when (zero? mask) index))
+                                                (:attention-mask tokenized)))
+                                        length)))
+              pooled-base (t/reshape (t/slice-axis output 1 eos-index (inc eos-index))
+                                     [1 hidden-size])
+              pooled (if text-projection
+                       (cast-to (t/matmul pooled-base (tensor! text-projection))
+                                (dtype pooled-base))
+                       pooled-base)]
+          (arr/release! hidden)
+          (when text-projection (arr/release! pooled-base))
+          (assoc tokenized :tensor output :pooled pooled)))
+      {:comfyui/clip-spec spec :comfyui/tensor-cache cache})))
+
+(defn compile-dual-encoder
+  "Compile two CLIP encoders, concatenate token features, and retain the
+  second encoder's pooled embedding for SDXL added conditioning."
+  [component backend {:keys [encoders retain-encoder-outputs?] :as spec}]
+  (when-not (= 2 (count encoders))
+    (fail "dual encoder requires exactly two encoder specs" {:spec spec}))
+  (let [[encode-l encode-g] (mapv #(compile-encoder component backend %) encoders)]
+    (with-meta
+      (fn [tokenized]
+        (let [left (encode-l tokenized)
+              right (encode-g tokenized)
+              left-tensor (:tensor left)
+              right-tensor (:tensor right)]
+          (when-not (= (subvec (:shape left-tensor) 0 2)
+                       (subvec (:shape right-tensor) 0 2))
+            (fail "dual encoder batch/token dimensions differ"
+                  {:left (:shape left-tensor) :right (:shape right-tensor)}))
+          (let [combined (t/cat [left-tensor (cast-to right-tensor (dtype left-tensor))] 2)
+                result (cond-> (assoc tokenized
+                                      :tensor combined :pooled (:pooled right))
+                         retain-encoder-outputs?
+                         (assoc :clip-l left :clip-g right))]
+            (when-not retain-encoder-outputs?
+              (arr/release-all! [left-tensor right-tensor (:pooled left)]))
+            result)))
+      {:comfyui/clip-spec spec})))

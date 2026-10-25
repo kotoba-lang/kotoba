@@ -1,0 +1,119 @@
+(ns comfyui.exec-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [comfyui.node :as node]
+            [comfyui.std :as std]
+            [comfyui.exec :as exec]
+            [comfyui.queue :as q]
+            [langchain.db :as db]))
+
+(defn- reg []
+  (node/registry std/all))
+
+(def wf-math
+  ;; (2 + 3) * 10 = 50
+  {"1" {:class_type "PrimitiveInt" :inputs {:value 2}}
+   "2" {:class_type "PrimitiveInt" :inputs {:value 3}}
+   "3" {:class_type "Add" :inputs {:a ["1" 0] :b ["2" 0]}}
+   "4" {:class_type "Multiply" :inputs {:a ["3" 0] :b 10}}})
+
+(deftest basic-execution
+  (let [{:keys [results executed cached]}
+        (exec/execute {:registry (reg)} wf-math)]
+    (is (= [50] (get results "4")))
+    (is (= 4 (count executed)))
+    (is (empty? cached))
+    (testing "multiple outputs"
+      (let [w {"1" {:class_type "DivMod" :inputs {:a 17 :b 5}}}
+            r (:results (exec/execute {:registry (reg)} w))]
+        (is (= [3 2] (get r "1")))))))
+
+(deftest content-addressed-caching
+  (let [ctx {:registry (reg) :cache (exec/mem-cache)}]
+    (testing "second identical run executes nothing"
+      (exec/execute ctx wf-math)
+      (let [{:keys [executed cached]} (exec/execute ctx wf-math)]
+        (is (empty? executed))
+        (is (= 4 (count cached)))))
+    (testing "changing one constant re-executes only downstream"
+      (let [wf' (assoc-in wf-math ["2" :inputs :value] 4)
+            {:keys [executed cached results]} (exec/execute ctx wf')]
+        (is (= [60] (get results "4")))
+        (is (= #{"2" "3" "4"} (set executed)) "node 1 untouched")
+        (is (= ["1"] cached))))))
+
+(deftest targets-select-subgraph
+  (let [calls (atom [])
+        spy {:type "Spy" :category "test"
+             :inputs {:x {:type "INT" :default 0}}
+             :outputs [{:name "x" :type "INT"}]
+             :fn (fn [{:keys [x]}] (swap! calls conj x) [x])}
+        r (doto (reg) (node/register! spy))
+        w {"1" {:class_type "Spy" :inputs {:x 1}}
+           "2" {:class_type "Spy" :inputs {:x 2}}     ; not an ancestor of "3"
+           "3" {:class_type "Add" :inputs {:a ["1" 0] :b 0}}}
+        {:keys [results executed]} (exec/execute {:registry r} w {:targets ["3"]})]
+    (is (= [1] @calls) "only the ancestor Spy ran")
+    (is (= #{"1" "3"} (set executed)))
+    (is (nil? (get results "2")))))
+
+(deftest node-start-precedes-node-failure
+  (let [starts (atom [])
+        completions (atom [])
+        failing {:type "Fail" :category "test"
+                 :inputs {} :outputs [{:name "value" :type "INT"}]
+                 :fn (fn [_] (throw (ex-info "intentional failure" {})))}
+        registry (doto (reg) (node/register! failing))]
+    (try
+      (exec/execute {:registry registry
+                     :on-node-start #(swap! starts conj %)
+                     :on-event #(swap! completions conj %)}
+                    {"failed" {:class_type "Fail" :inputs {}}})
+      (is false "failing node must throw")
+      (catch #?(:clj Exception :cljs :default) error
+        (is (= "intentional failure" (ex-message error)))))
+    (is (= [{:node "failed" :class "Fail" :cached? false}] @starts))
+    (is (empty? @completions))))
+
+(deftest datomic-cache-and-history
+  (let [conn (db/create-conn exec/exec-schema)
+        ctx {:registry (reg)
+             :cache (exec/datomic-cache conn)
+             :history-conn conn}
+        r1 (exec/execute ctx wf-math)
+        ;; fresh executor over the same conn — cache survives as datoms
+        r2 (exec/execute {:registry (reg)
+                          :cache (exec/datomic-cache conn)
+                          :history-conn conn}
+                         wf-math)]
+    (is (= 1 (:run-id r1)))
+    (is (= 2 (:run-id r2)))
+    (is (= 4 (count (:executed r1))))
+    (is (= 4 (count (:cached r2))) "cache persisted across executor instances")
+    (testing "run history is queryable datoms"
+      (is (= #{[1 4 0] [2 4 4]}
+             (db/q '[:find ?id ?total ?cached
+                     :where [?r :run/id ?id]
+                            [?r :run/total ?total]
+                            [?r :run/cached ?cached]]
+                   (db/db conn))))
+      (is (= #{"1" "2" "3" "4"}
+             (set (db/q '[:find [?n ...]
+                          :in $ ?run
+                          :where [?r :run/id ?run]
+                                 [?e :exec/run ?r]
+                                 [?e :exec/node ?n]
+                                 [?e :exec/cached false]]
+                        (db/db conn) 1)))))))
+
+(deftest queue-test
+  (let [ctx {:registry (reg) :cache (exec/mem-cache)}
+        pq (q/make-queue)
+        id1 (q/enqueue! pq wf-math)
+        id2 (q/enqueue! pq {"1" {:class_type "Nope" :inputs {}}})]
+    (is (= [id1 id2] (q/pending pq)))
+    (let [entries (q/run-all! pq ctx)]
+      (is (= [:done :error] (mapv :status entries)))
+      (is (empty? (q/pending pq)))
+      (is (= [50] (get-in (q/history pq id1) [:results "4"])))
+      (is (= :error (:status (q/history pq id2)))))
+    (is (nil? (q/run-next! pq ctx)))))
