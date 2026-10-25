@@ -1,0 +1,118 @@
+(ns storj.node.piece-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [proto.wire :as w]
+            [storj.node.pb :as pb]
+            [storj.node.piece :as piece]))
+
+(defn- unhex [s]
+  (mapv #?(:clj  #(Integer/parseInt % 16)
+           :cljs #(js/parseInt % 16))
+        (re-seq #"[0-9a-fA-F]{2}" s)))
+
+;; from testdata/gen_vectors.go
+(def piece-id-hex
+  "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f")
+(def piece-id-b32-from-go
+  "OBYXE43UOV3HO6DZPJ5XY7L6P6AIDAUDQSCYNB4IRGFIXDENR2HQ")
+(def satellite-id-hex
+  "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f")
+
+(deftest piece-id-strings-match-storjs-own
+  (is (= piece-id-b32-from-go (piece/id->string (unhex piece-id-hex)))
+      "PieceID.String() is uppercase base32, no padding"))
+
+(deftest blob-paths-use-the-lowercase-table
+  (let [path (piece/blob-path (unhex satellite-id-hex) (unhex piece-id-hex))]
+    (testing "the shape"
+      (let [[ns-dir prefix rest] (str/split path #"/")]
+        (is (= 52 (count ns-dir)) "32 bytes of satellite ID in base32")
+        (is (= 2 (count prefix)))
+        (is (str/ends-with? rest ".sj1"))))
+
+    (testing "the key is the same base32 as PieceID.String(), lowercased"
+      ;; The two encodings differ only in case: filestore.PathEncoding uses
+      ;; abcdefghijklmnopqrstuvwxyz234567, PieceID.String() the standard
+      ;; uppercase table. Deriving one from Go's output of the other is what
+      ;; makes this a check rather than a restatement.
+      (let [lower  (str/lower piece-id-b32-from-go)
+            [_ prefix rest] (str/split path #"/")]
+        (is (= lower (str prefix (str/replace rest #"\.sj1$" ""))))))
+
+    (testing "and it is not uppercase"
+      (is (= path (str/lower path))
+          "an uppercase path would put every piece where the node never looks"))))
+
+(deftest format-versions
+  (let [sat (unhex satellite-id-hex) pid (unhex piece-id-hex)]
+    (is (str/ends-with? (piece/blob-path sat pid :v1) ".sj1"))
+    (is (not (str/ends-with? (piece/blob-path sat pid :v0) ".sj1"))
+        "V0 files carry no suffix at all")
+    (is (= (str (piece/blob-path sat pid :v0) ".sj1")
+           (piece/blob-path sat pid :v1))
+        "the two differ by exactly the suffix")
+    (is (= 0 (piece/body-offset :v0)) "V0 keeps its header in a database")
+    (is (= 512 (piece/body-offset :v1)))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (piece/blob-path sat pid :v7)))))
+
+(deftest short-keys-are-padded-so-the-split-is-always-possible
+  ;; cannot arise from a 32-byte piece ID, but blob-path is also the path
+  ;; function for shorter keys, and `subs key 0 2` on a one-character string
+  ;; would throw instead.
+  (let [sat (unhex satellite-id-hex)]
+    (is (str/includes? (piece/blob-path sat [0x00] :v1) "/11/"))))
+
+;; ── the V1 header ────────────────────────────────────────────────────────────
+
+(def a-header
+  [(w/varint-field 1 1)                      ; format_version = FORMAT_V1
+   (w/bytes-field  2 (unhex piece-id-hex))   ; hash
+   (w/message-field 3 [(w/varint-field 1 1785240000)])  ; creation_time
+   (w/bytes-field  4 [0xaa 0xbb])])          ; signature
+
+(deftest header-framing
+  (let [framed (piece/encode-header a-header)]
+    (is (= 512 (count framed)) "the header area is exactly the reserved size")
+    (is (= (count (w/encode a-header)) (+ (* 256 (nth framed 0)) (nth framed 1)))
+        "big-endian length first — protobuf is not self-delimiting")
+    (is (every? zero? (drop (+ 2 (count (w/encode a-header))) framed))
+        "and the rest is zero padding, not stale bytes")
+
+    (testing "round trip"
+      (is (= (w/encode a-header) (w/encode (piece/decode-header framed)))))
+
+    (testing "reading it back as data"
+      (let [f (piece/header-fields (piece/decode-header framed))]
+        (is (= :v1 (:format-version f)))
+        (is (= 1785240000 (:creation-time f)))
+        (is (= [0xaa 0xbb] (:signature f)))
+        (is (= 32 (count (:hash f))))))
+
+    (testing "the framing is followed, not the padding"
+      ;; append a whole extra piece body; decode must stop at the declared
+      ;; length rather than trying to parse the payload as more header
+      (is (= (w/encode a-header)
+             (w/encode (piece/decode-header (into framed (repeat 4096 0x41)))))))))
+
+(deftest header-rejects-damage
+  (testing "a length that would read past the reserved area"
+    (let [framed (piece/encode-header a-header)
+          lying  (assoc framed 0 0xff 1 0xff)]
+      (is (thrown? #?(:clj Exception :cljs js/Error) (piece/decode-header lying)))))
+
+  (testing "a truncated file"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (piece/decode-header (vec (repeat 100 0))))))
+
+  (testing "a header too large to frame"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (piece/encode-header [(w/bytes-field 2 (repeat 600 0))])))))
+
+(deftest header-carries-the-order-limit
+  ;; the piece header embeds the OrderLimit that authorised the write, which
+  ;; is what lets a node prove later why it is holding a piece
+  (let [limit  [(w/varint-field 6 1024)]
+        header (conj a-header (w/message-field 5 limit))
+        back   (piece/decode-header (piece/encode-header header))]
+    (is (= 1024 (pb/get-varint (:order-limit (piece/header-fields back))
+                               pb/order-limit :limit)))))

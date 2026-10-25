@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.ioStorjNode` | `kotoba.ioStorjNode/src` | `storj.node.bytes`, `storj.node.certificate`, `storj.node.contact`, `storj.node.der` (Kotoba project library) |
 | `kotoba.ioFilecoinTransport` | `kotoba.ioFilecoinTransport/src` | `filecoin.client`, `filecoin.transport` (Kotoba project library) |
 | `kotoba.grant` | `kotoba.grant/src` | `grant.acoustic-onboard`, `grant.anchors`, `grant.audit`, `grant.authority` (Kotoba project library) |
 | `kotoba.drpc` | `kotoba.drpc/src` | `drpc.client`, `drpc.server`, `drpc.session`, `drpc.wire` (Kotoba project library) |

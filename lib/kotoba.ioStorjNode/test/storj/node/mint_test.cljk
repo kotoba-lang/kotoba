@@ -1,0 +1,139 @@
+(ns storj.node.mint-test
+  "Minting: the loop, and the identity it produces.
+
+  Two kinds of test, deliberately separated. The loop is checked against a
+  fake `IKeyMaterial` handing out a known sequence of keys, so that *which*
+  key it stops on is an assertion rather than a coincidence — a loop that
+  accepted the first key would pass every test that only mints real
+  identities, because at difficulty 8 the first key almost always qualifies.
+
+  The identity itself is minted with real crypto and then read back by the
+  same library that judges a peer's chain. The check that matters most is not
+  here at all: `testdata/verify_minted.go` hands the result to
+  `storj.io/common` and asks whether it is a Storj identity, because a parser
+  agreeing with its own writer proves nothing."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [storj.node.bytes :as b]
+            [storj.node.certificate :as cert]
+            [storj.node.der :as der]
+            [storj.node.host.keys :as hk]
+            [storj.node.host.verify :as v]
+            [storj.node.id :as id]
+            [storj.node.identity :as ident]
+            [storj.node.mint :as mint]
+            [storj.node.protocols :as p]))
+
+;; ── the loop ────────────────────────────────────────────────────────────────
+;;
+;; `node-id-from-public-key` only hashes, so a "key" here can be any bytes and
+;; its difficulty is a fact about SHA-256 rather than about EC. `[0 151]` is
+;; the first two-byte key whose id reaches 19; everything before it sits at 8
+;; to 11.
+
+(defn- fake-keys
+  "An `IKeyMaterial` that hands out `spkis` in order and refuses to sign."
+  [spkis]
+  (let [remaining (atom spkis)
+        n         (atom 0)]
+    {:material (reify p/IKeyMaterial
+                 (-generate-keypair [_]
+                   (swap! n inc)
+                   (let [k (first @remaining)]
+                     (swap! remaining rest)
+                     {:private [:private-for k] :public-spki k}))
+                 (-sign [_ _ _ _] (throw (ex-info "not signing in this test" {})))
+                 (-random-bytes [_ len] (vec (repeat len 0x7f))))
+     :generated n}))
+
+(def ^:private weak  [0 1])    ; difficulty 8
+(def ^:private weak2 [0 2])    ; difficulty 8
+(def ^:private strong [0 151]) ; difficulty 19
+
+(deftest the-fixed-keys-have-the-difficulties-this-file-assumes
+  ;; without this, the tests below would still pass if `difficulty` changed
+  ;; meaning, and they would be asserting nothing
+  (is (= 8 (id/difficulty (ident/node-id-from-public-key weak 0))))
+  (is (= 8 (id/difficulty (ident/node-id-from-public-key weak2 0))))
+  (is (= 19 (id/difficulty (ident/node-id-from-public-key strong 0)))))
+
+(deftest keeps-generating-until-the-difficulty-is-met
+  (let [{:keys [material generated]} (fake-keys [weak weak2 strong])
+        r (mint/find-key material {:difficulty 16})]
+    (is (= 3 (:attempts r)))
+    (is (= 3 @generated))
+    (is (= strong (:public-spki r)))
+    (is (= 19 (:difficulty r)))
+    (is (= (ident/node-id-from-public-key strong 0) (:node-id r)))))
+
+(deftest stops-at-the-first-key-that-qualifies
+  (let [{:keys [material generated]} (fake-keys [strong weak weak2])
+        r (mint/find-key material {:difficulty 16})]
+    (is (= 1 (:attempts r)))
+    (is (= 1 @generated) "and does not keep hashing after it has won")))
+
+(deftest gives-up-rather-than-running-forever
+  (let [{:keys [material]} (fake-keys (repeat weak))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (mint/find-key material {:difficulty 16 :max-attempts 20})))))
+
+(deftest the-version-travels-into-the-id
+  (let [{:keys [material]} (fake-keys [strong])
+        r (mint/find-key material {:difficulty 16 :version 3})]
+    (is (= 3 (last (:node-id r))) "the byte is placed where it was asked for")
+    (is (= id/version-0 (id/version (:node-id r)))
+        "but reading it back gives V0 — `Version()` falls back rather than
+         failing on a version this build does not know, so minting one
+         produces an id the network would read as V0")))
+
+;; ── a real identity ─────────────────────────────────────────────────────────
+
+(def ^:private minted (delay (mint/mint hk/key-material {:difficulty 16})))
+
+(deftest mints-an-identity-this-library-would-accept-from-a-peer
+  (let [m @minted
+        r (ident/admit-chain (:chain m) {:verifier v/verifier})]
+    (is (:ok? r) (pr-str (:reasons r)))
+    (is (= (:node-id m) (:node-id r)))
+    (is (= (:difficulty m) (:difficulty r)))
+    (is (>= (:difficulty m) 16))
+    (is (>= (:attempts m) 1))))
+
+(deftest the-id-comes-from-the-ca-and-the-leaf-is-a-different-key
+  (let [m    @minted
+        ca   (ident/certificate (get-in m [:ca :der]))
+        leaf (ident/certificate (get-in m [:leaf :der]))]
+    (is (= (:node-id m) (ident/node-id ca)))
+    (is (not= (:spki-der ca) (:spki-der leaf))
+        "a leaf sharing the CA's key would make the proof of work decorative")
+    (is (not= (:node-id m) (ident/node-id leaf)))))
+
+(deftest the-minted-certificates-say-what-they-should
+  (let [m    @minted
+        ca   (ident/certificate (get-in m [:ca :der]))
+        leaf (ident/certificate (get-in m [:leaf :der]))]
+    (is (= 0 (ident/version ca)))
+    (is (= :ecdsa-sha256 (:algorithm ca)))
+    (is (= :ecdsa-sha256 (:algorithm leaf)))
+    (is (contains? (:extensions ca) (:subject-key-identifier cert/oids)))
+    (is (not (contains? (:extensions leaf) (:subject-key-identifier cert/oids))))
+    (is (not (contains? (:extensions ca) ident/identity-pow-counter-ext))
+        "minting an extension nothing implements would make the chain refusable")
+    (testing "the subjectKeyIdentifier is SHA-1 of the public key bits"
+      (is (= (b/sha1 (cert/public-key-bits (:spki-der ca)))
+             (:contents (der/parse (get (:extensions ca)
+                                        (:subject-key-identifier cert/oids)))))))))
+
+(deftest the-serial-numbers-are-not-shared
+  (let [m @minted
+        serial (fn [der-bytes]
+                 (der/integer-bytes
+                  (nth (der/children (der/parse (:tbs-der (ident/certificate der-bytes)))) 1)))]
+    (is (not= (serial (get-in m [:ca :der])) (serial (get-in m [:leaf :der])))
+        "a shared serial is the one thing X.509 asks a serial not to be")
+    ;; Not a length assertion: `integer-bytes` returns the INTEGER's contents
+    ;; unmodified, and a 128-bit serial encodes as 17 bytes whenever its top
+    ;; bit is set. Asserting 16 here passed about half the time — which is how
+    ;; it was found, on a rerun that disagreed with the run before it.
+    (is (>= cert/serial-number-bytes
+            (count (drop-while zero? (serial (get-in m [:ca :der])))))
+        "128 bits of value, whatever the encoding needed to carry it")))

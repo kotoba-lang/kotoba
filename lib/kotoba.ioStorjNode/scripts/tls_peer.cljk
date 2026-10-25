@@ -1,0 +1,625 @@
+(ns tls-peer
+  "A Storj TLS peer built out of this library, mirroring `testdata/tls_peer.go`
+  so the two can be pointed at each other.
+
+      kbb -M:tls-peer serve /tmp/id-a 19443
+      kbb -M:tls-peer dial  /tmp/id-b 127.0.0.1:19443 <expected-hex>
+      kbb -M:tls-peer call  /tmp/id-b 127.0.0.1:19443 <expected-hex> \\
+        /echo.Echo/Echo hello
+      kbb --backend sci --classpath \"$(kbb -A:cljs -Spath)\" scripts/tls_peer.cljk \\
+        dial /tmp/id-b 127.0.0.1:19443 <expected-hex>
+
+  In serve mode it prints `listening <port>` once bound, then accepts one
+  connection, prints the peer's node id and exits — the same contract the Go
+  peer follows, so CI can drive either side with either implementation.
+
+  This is a test harness, not part of the library: nothing under `src/`
+  requires it, and `scripts/` is not on `:paths`."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            [drpc.client :as drpc]
+            [storj.node.contact :as contact]
+            [storj.node.host.blobs :as blobs]
+            [storj.node.piece :as piece]
+            [storj.node.service :as svc]
+            [storj.node.bytes :as b]
+            [storj.node.host.rpc :as rpc]
+            [storj.node.host.keys :as hk]
+            [proto.wire :as w]
+            [storj.node.pb :as pb]
+            [storj.node.protocols :as p]
+            [storj.node.host.verify :as v]
+            [storj.node.transfer :as tr]
+            [storj.node.host.tls :as htls]
+            [storj.node.identity :as ident]
+            #?(:cljs ["node:fs" :as fs])))
+
+(defn- slurp* [path]
+  #?(:clj (slurp path) :cljs (fs/readFileSync path "utf8")))
+
+(defn- unhex [s]
+  (mapv #?(:clj  #(Integer/parseInt % 16)
+           :cljs #(js/parseInt % 16))
+        (re-seq #"[0-9a-fA-F]{2}" s)))
+
+(defn load-identity
+  "An identity directory, in the form `storj.node.host.tls` wants.
+
+  The leaf key, not the CA key: `identity.key` is what signs on the wire,
+  while the CA key stays offline once the identity exists."
+  [dir]
+  (let [chain (ident/parse-chain-pem (slurp* (str dir "/identity.cert")))
+        key   (ident/parse-private-key-pem (slurp* (str dir "/identity.key")))]
+    {:chain chain
+     :private-key (hk/import-private-key (:der key) (:encoding key))}))
+
+(def greeting
+  "Exchanged after the handshake so that both peers have to finish it, rather
+  than one of them merely believing it did. On TLS 1.3 a client that hangs up
+  straight after its own Finished leaves the server reporting EOF while the
+  client reports success — which is exactly what happened the first time this
+  harness was run against the Go peer."
+  "storj\n")
+
+(defn- exchange!
+  "`:serve` writes the greeting and reads it back; `:dial` reads it and echoes.
+  Returns a promise on cljs and blocks on the JVM."
+  [socket role]
+  #?(:clj
+     (let [out (.getOutputStream socket)
+           in  (.getInputStream socket)
+           buf (byte-array (count greeting))
+           read-all (fn []
+                      (loop [off 0]
+                        (when (< off (count greeting))
+                          (let [n (.read in buf off (- (count greeting) off))]
+                            (when (neg? n) (throw (ex-info "tls-peer: closed early" {})))
+                            (recur (+ off n))))))]
+       (if (= :serve role)
+         (do (.write out (kbytes/utf8-bytes greeting)) (.flush out) (read-all))
+         (do (read-all) (.write out buf) (.flush out)))
+       (when (not= greeting (kbytes/utf8-string buf))
+         (throw (ex-info "tls-peer: greeting mismatch" {:got (kbytes/utf8-string buf)}))))
+     :cljs
+     (js/Promise.
+      (fn [resolve reject]
+        (let [seen (atom "")]
+          (.on socket "data"
+               (fn [chunk]
+                 (swap! seen str (.toString chunk "utf8"))
+                 (when (>= (count @seen) (count greeting))
+                   (if (= greeting (subs @seen 0 (count greeting)))
+                     (do (when (= :dial role) (.write socket greeting))
+                         (resolve true))
+                     (reject (js/Error. (str "tls-peer: greeting mismatch: " @seen)))))))
+          (.on socket "error" reject)
+          (when (= :serve role) (.write socket greeting)))))))
+
+(defn- report [peer expect]
+  (let [got (b/hex (:node-id peer))]
+    (when (and expect (not= got expect))
+      (println (str "FAIL peer id " got ", expected " expect))
+      #?(:clj (System/exit 1) :cljs (js/process.exit 1)))
+    (println (str "ok   handshake complete, peer " got))
+    (println (str "peer " got))))
+
+(defn serve [dir port expect]
+  (let [identity (load-identity dir)
+        done (fn [{:keys [socket peer]}]
+               (report peer expect)
+               #?(:clj (do (exchange! socket :serve)
+                           (println "ok   application data flowed both ways")
+                           (System/exit 0))
+                  :cljs (-> (exchange! socket :serve)
+                            (.then (fn [_]
+                                     (println "ok   application data flowed both ways")
+                                     (js/process.exit 0)))
+                            (.catch (fn [e] (println (str "FAIL " (.-message e)))
+                                      (js/process.exit 1))))))
+        refused (fn [r] (println (str "FAIL refused: " (pr-str r)))
+                  #?(:clj (System/exit 1) :cljs (js/process.exit 1)))]
+    #?(:clj
+       (let [l (htls/listen {:port port :identity identity :verify-opts {}
+                             :on-connection done :on-refused refused})]
+         (println (str "listening " (:port l)))
+         (flush)
+         ((:accept l)))
+       :cljs
+       (let [{:keys [server]} (htls/listen {:port port :identity identity
+                                            :verify-opts {}
+                                            :on-connection done
+                                            :on-refused refused})]
+         (.on server "listening"
+              #(println (str "listening " (.-port (.address server)))))))))
+
+(defn- getenv
+  "One environment variable, on either runtime."
+  [k]
+  #?(:clj (System/getenv k) :cljs (aget (.-env js/process) k)))
+
+(defn dial [dir addr expect]
+  (let [identity (load-identity dir)
+        [host port] (str/split addr #":")
+        opts {:host host :port #?(:clj (parse-long port) :cljs (js/parseInt port 10))
+              :identity identity
+              :verify-opts (cond-> {} expect (assoc :expected-node-id (unhex expect)))
+              ;; STORJ_MUX=1 when the peer is a real Storj node or satellite,
+              ;; which routes several protocols on one port and needs to be
+              ;; told which this is before the handshake. A plain TLS peer —
+              ;; testdata/tls_peer.go — must not be sent it.
+              :preamble (when (getenv "STORJ_MUX") htls/drpc-mux-header)}]
+    #?(:clj
+       (let [c (htls/connect opts)]
+         (report (:peer c) expect)
+         (exchange! (:socket c) :dial)
+         (println "ok   application data flowed both ways")
+         (htls/close! c))
+       :cljs
+       (-> (htls/connect opts)
+           (.then (fn [c]
+                    (report (:peer c) expect)
+                    (-> (exchange! (:socket c) :dial)
+                        (.then (fn [_]
+                                 (println "ok   application data flowed both ways")
+                                 ;; `end` rather than `destroy`: a half-close
+                                 ;; lets the peer finish reading what was just
+                                 ;; written, where destroy discards it
+                                 (.end (:socket c))
+                                 (js/process.exit 0))))))
+           (.catch (fn [e]
+                     (println (str "FAIL " (or (some-> e .-message) (str e))))
+                     (js/process.exit 1)))))))
+
+(defn- report-call [result rpc-name]
+  (cond
+    (:message result)
+    (do (println (str "response " (drpc/utf8-string (:message result))))
+        #?(:clj (System/exit 0) :cljs (js/process.exit 0)))
+
+    (:error result)
+    (do (println (str "FAIL error " (get-in result [:error :code])
+                      " " (get-in result [:error :message])))
+        #?(:clj (System/exit 1) :cljs (js/process.exit 1)))
+
+    :else
+    (do (println (str "FAIL " rpc-name " closed with no answer"))
+        #?(:clj (System/exit 1) :cljs (js/process.exit 1)))))
+
+(defn call
+  "Dial over TLS, verify the peer, then make one DRPC call on that connection.
+
+  The whole stack in one command: mutual TLS with Storj's rules, the node id
+  checked against what was asked for, and a unary call on the socket that came
+  out of it."
+  [dir addr expect rpc-name payload]
+  (let [identity (load-identity dir)
+        [host port] (str/split addr #":")
+        opts {:host host :port #?(:clj (parse-long port) :cljs (js/parseInt port 10))
+              :identity identity
+              :verify-opts (cond-> {} expect (assoc :expected-node-id (unhex expect)))
+              ;; STORJ_MUX=1 when the peer is a real Storj node or satellite,
+              ;; which routes several protocols on one port and needs to be
+              ;; told which this is before the handshake. A plain TLS peer —
+              ;; testdata/tls_peer.go — must not be sent it.
+              :preamble (when (getenv "STORJ_MUX") htls/drpc-mux-header)}
+        call-opts {:rpc rpc-name :request (drpc/ascii-bytes payload)}]
+    #?(:clj
+       (let [c (htls/connect opts)]
+         (report (:peer c) expect)
+         (report-call (rpc/call (:socket c) call-opts) rpc-name))
+       :cljs
+       (-> (htls/connect opts)
+           (.then (fn [c]
+                    (report (:peer c) expect)
+                    (-> (rpc/call (:socket c) call-opts)
+                        (.then #(report-call % rpc-name)))))
+           (.catch (fn [e]
+                     (println (str "FAIL " (or (some-> e .-message) (str e))))
+                     (js/process.exit 1)))))))
+
+(defn- report-check-in [result]
+  (if-let [msg (:message result)]
+    (let [r (contact/read-check-in-response (proto.wire/decode msg))]
+      (println (str "check-in ping=" (:ping-node-success r)
+                    " quic=" (:ping-node-success-quic r)))
+      (if (contact/admitted? r)
+        (do (println "ok   the satellite dialled this node back")
+            #?(:clj (System/exit 0) :cljs (js/process.exit 0)))
+        (do (println (str "refused " (:message (contact/refusal r))))
+            ;; a refusal is a *successful* exchange — the call worked and the
+            ;; introduction did not, and a harness that exits non-zero here
+            ;; cannot tell that apart from a broken transport
+            #?(:clj (System/exit 0) :cljs (js/process.exit 0)))))
+    (do (println (str "FAIL no response: " (pr-str result)))
+        #?(:clj (System/exit 1) :cljs (js/process.exit 1)))))
+
+(defn check-in
+  "Dial over TLS, verify the peer, then introduce this node to it."
+  [dir addr expect address]
+  (let [identity (load-identity dir)
+        [host port] (str/split addr #":")
+        opts {:host host :port #?(:clj (parse-long port) :cljs (js/parseInt port 10))
+              :identity identity
+              :verify-opts (cond-> {} expect (assoc :expected-node-id (unhex expect)))
+              ;; STORJ_MUX=1 when the peer is a real Storj node or satellite,
+              ;; which routes several protocols on one port and needs to be
+              ;; told which this is before the handshake. A plain TLS peer —
+              ;; testdata/tls_peer.go — must not be sent it.
+              :preamble (when (getenv "STORJ_MUX") htls/drpc-mux-header)}
+        request (contact/check-in-request
+                 {:address  address
+                  :version  {:version "1.104.5" :release? true}
+                  :capacity {:free-disk 1099511627776}
+                  :operator {:email "op@example.com" :wallet "0xabc"}})
+        call-opts {:rpc contact/rpc :request request}]
+    #?(:clj
+       (let [c (htls/connect opts)]
+         (report (:peer c) expect)
+         (report-check-in (rpc/call (:socket c) call-opts)))
+       :cljs
+       (-> (htls/connect opts)
+           (.then (fn [c]
+                    (report (:peer c) expect)
+                    (-> (rpc/call (:socket c) call-opts)
+                        (.then report-check-in))))
+           (.catch (fn [e]
+                     (println (str "FAIL " (or (some-> e .-message) (str e))))
+                     (js/process.exit 1)))))))
+
+(defn node
+  "Serve the unary surface a satellite asks for, over Storj mutual TLS.
+
+  Seeded with one piece so `Exists` has something to say yes to and something
+  to say no about — a node that holds nothing answers every question the same
+  way, and a test against it proves nothing."
+  [dir port expect]
+  (let [identity (load-identity dir)
+        satellite (vec (repeat 32 1))
+        ;; the version is part of the address — .sj1 for V1, nothing for V0
+        paths     (fn ([id] (piece/blob-path satellite id))
+                    ([id version] (piece/blob-path satellite id version)))
+        held      (mapv (fn [i] (mod (+ 0x11 (* i 7)) 256)) (range 32))
+        store     (blobs/in-memory)
+        node-id   (ident/node-id (ident/certificate (second (:chain identity))))
+        state     {:blobs store :paths paths}
+        ;; what `orders/admit` reads. The satellite signature is accepted
+        ;; here because producing one means holding a satellite's key —
+        ;; every *other* rule (is this addressed to me, has it expired, is
+        ;; the action the one being asked for, is the range inside the
+        ;; limit) is really applied, and the verifier is the one seam a
+        ;; harness has to stub.
+        xctx      {:node-id  node-id
+                   ;; the node signs its own PieceHash with its identity key
+                   :signer      hk/key-material
+                   :private-key (:private-key identity)
+                   ;; `admit` refuses without a key as well as without a
+                   ;; verifier — a stub verifier and no key is a node that
+                   ;; skipped the check while looking like it did not
+                   :satellite-key (vec (repeat 32 0x02))
+                   :verifier (reify p/IVerifier (-verify [_ _ _ _ _] true))
+                   :clock    (reify p/IClock
+                               (-now-seconds [_]
+                                 #?(:clj (quot (System/currentTimeMillis) 1000)
+                                    :cljs (js/Math.floor (/ (js/Date.now) 1000)))))}]
+    (rpc/-put-seed store (paths held))
+    (let [handle (fn [call]
+                   (let [r (svc/handle state call)]
+                     (println (str "rpc " (:rpc call) " -> "
+                                   (if (:error r) (str "error " (:message (:error r)))
+                                       (str (count (:response r)) " bytes"))))
+                     r))
+          ;; the streaming half. `serve-connection` routes messages here and
+          ;; calls there, and `transfer/streaming?` is what keeps an upload
+          ;; from falling through to `service/handle` and being answered
+          ;; `unimplemented`.
+          xfers (atom (tr/transfers))
+          on-message
+          (fn [{:keys [rpc] :as m}]
+            (if-not (or (tr/streaming? rpc) (get @xfers (:stream m)))
+              {:out []}
+              (let [r (tr/message @xfers (merge state xctx) m)]
+                (reset! xfers (:state r))
+                (doseq [o (:out r)]
+                  (println (str "stream " (:stream m) " " rpc " -> "
+                                (cond (:error o) (str "error " (:message (:error o)))
+                                      (:end o)   "end"
+                                      :else      (str (count (:message o)) " bytes")))))
+                ;; whether the uplink's signature on `done` was checked. This
+                ;; harness sends a limit with no `uplink_public_key` and an
+                ;; unsigned `done`, so the answer is no — printed rather than
+                ;; left implicit, because a node that stored a piece it could
+                ;; not verify and a node that verified one must not look the
+                ;; same in a log. The signature path itself is held to a real
+                ;; Go-generated one in piecestore_test.
+                (when-let [s (:stored r)]
+                  (println (str "stored " (:size s) " bytes, hash-verified? "
+                                (:hash-verified? s) ", format " (name (:format s)))))
+                r)))]
+      #?(:clj
+         (let [l (htls/listen {:port port :identity identity :verify-opts {}
+                               ;; a satellite dials back through the same
+                               ;; connector it accepts on, so the ping arrives
+                               ;; with the mux header in front of its ClientHello
+                               :expect-preamble (when (getenv "STORJ_MUX")
+                                                  htls/drpc-mux-header)
+                               :on-connection
+                               (fn [{:keys [socket peer]}]
+                                 (report peer expect)
+                                 (rpc/serve-connection socket handle on-message)
+                                 (System/exit 0))
+                               :on-refused
+                               (fn [r] (println (str "FAIL refused: " (pr-str r)))
+                                 (System/exit 1))})]
+           (println (str "listening " (:port l)))
+           (flush)
+           ((:accept l)))
+         :cljs
+         (let [{:keys [server]} (htls/listen
+                                 {:port port :identity identity :verify-opts {}
+                                  :expect-preamble (when (getenv "STORJ_MUX")
+                                                     htls/drpc-mux-header)
+                                  :on-connection
+                                  (fn [{:keys [socket peer]}]
+                                    (report peer expect)
+                                    (-> (rpc/serve-connection socket handle on-message)
+                                        (.then (fn [_] (js/process.exit 0)))))
+                                  :on-refused
+                                  (fn [r] (println (str "FAIL refused: " (pr-str r)))
+                                    (js/process.exit 1))})]
+           (.on server "listening"
+                #(println (str "listening " (.-port (.address server))))))))))
+
+(defn satellite
+  "A satellite, enough of one to introduce a node to.
+
+  Not a stand-in for the real thing and not treated as one: it was written
+  after a real satellite corrected three things about this library, and every
+  one of them was invisible to `testdata/tls_peer.go` because that harness is
+  *permissive* — it serves whatever rpc name it is handed over plain TLS. A
+  counterparty written by the same hand as the client can only confirm what
+  that hand already believes, so the value here is not agreement. It is that
+  this one is **strict** about the things the real satellite turned out to be
+  strict about:
+
+  - the mux header is required, not optional
+  - `/contact.Node/CheckIn` is the only rpc it answers; anything else is an
+    error, which is how the wrong path would have been caught
+  - `ping_node_success` is earned by actually dialling the address back, with
+    the header, and getting an answer to `/contact.Contact/PingNode`
+
+  What it is for: the whole check-in loop, on both runtimes, in CI, with no
+  Docker and no network. What it is not for: deciding that this library is
+  correct. That question is only answered by `storj-up`.
+
+  JVM only. The dial-back has to happen before the response is written, and
+  `host.rpc/serve-connection` calls its handler synchronously on cljs — a
+  promise-returning handler would be a change to that contract rather than to
+  this script. The node under test is unaffected: it runs on either runtime
+  against this."
+  [dir port expect]
+  #?(:clj
+     (let [identity (load-identity dir)
+           ping-back
+           (fn [address]
+             ;; the address is what the node claimed; this is what makes it a
+             ;; claim that was checked
+             (try
+               (let [[h p] (str/split address #":")
+                     c (htls/connect {:host h :port (parse-long p)
+                                      :identity identity :verify-opts {}
+                                      :preamble htls/drpc-mux-header
+                                      :timeout-ms 10000})
+                     r (rpc/call (:socket c) {:rpc contact/ping-rpc :request []})]
+                 (htls/close! {:socket (:socket c)})
+                 (if (:message r)
+                   {:ok? true}
+                   {:ok? false :why (str "no answer to " contact/ping-rpc)}))
+               (catch Exception e
+                 {:ok? false :why (or (.getMessage e) (str e))})))
+           handle
+           (fn [{:keys [rpc request] :as call}]
+             (if-not (= rpc contact/rpc)
+               (do (println (str "rpc " rpc " -> refused, this is not a path a satellite serves"))
+                   {:error {:code 2 :message (str "unknown rpc: " rpc)}})
+               (let [req  (contact/read-check-in-request (proto.wire/decode request))
+                     _    (println (str "check-in from " (:address req)
+                                        " version=" (get-in req [:version :version])
+                                        " operator=" (get-in req [:operator :email])))
+                     ping (ping-back (:address req))]
+                 (println (str "dialled back " (:address req) " -> "
+                               (if (:ok? ping) "answered" (str "no: " (:why ping)))))
+                 {:response (contact/check-in-response
+                             (if (:ok? ping)
+                               {:ping-node-success true}
+                               {:ping-node-success false
+                                :ping-error-message
+                                (str "failed to ping storage node at address "
+                                     (:address req) ": " (:why ping))}))
+                  :stream (:stream call)})))
+           l (htls/listen {:port port :identity identity :verify-opts {}
+                           :expect-preamble htls/drpc-mux-header
+                           :on-connection
+                           (fn [{:keys [socket peer]}]
+                             (report peer expect)
+                             (rpc/serve-connection socket handle)
+                             (System/exit 0))
+                           :on-refused
+                           (fn [r] (println (str "FAIL refused: " (pr-str r)))
+                             (System/exit 1))})]
+       (println (str "listening " (:port l)))
+       (flush)
+       ((:accept l)))
+     :cljs
+     (do (println "satellite: JVM only — see the docstring")
+         (js/process.exit 2))))
+
+(defn- sign-limit
+  "Sign an unsigned `OrderLimit` the way a satellite does.
+
+  `signing.SignOrderLimit` signs `EncodeOrderLimit` — the limit with its
+  signature field removed and the zero-valued optional fields dropped — with
+  the satellite's *leaf* key. Same rule as every other signature here: the id
+  comes from the CA, the signing from the leaf."
+  [identity fields]
+  (let [unsigned (w/decode (w/encode fields))
+        sig (hk/sign :ecdsa-sha256 (:private-key identity)
+                     (pb/encode-order-limit-for-signing unsigned))]
+    (w/encode (conj (vec fields) (w/bytes-field 10 (vec sig))))))
+
+(defn issue
+  "Print a signed `OrderLimit` as hex — what a satellite hands an uplink.
+
+  The harness node stubs its verifier, so it never needed one of these. A
+  node that checks signatures for real does, and without it every transfer it
+  is offered is refused for a reason that looks like a bug and is not.
+
+      issue <satellite-dir> <node-id-hex> <piece-id-hex> put|get [ttl-seconds]"
+  [dir node-id piece-id action ttl]
+  #?(:clj
+     (let [identity (load-identity dir)
+           expiry (+ (or (some-> ttl parse-long) 3600)
+                     (quot (System/currentTimeMillis) 1000))
+           fields [(w/bytes-field 1 (vec (repeat 16 0x01)))
+                   (w/bytes-field 2 (vec (repeat 32 0x02)))
+                   (w/bytes-field 4 (unhex node-id))
+                   (w/bytes-field 5 (unhex piece-id))
+                   (w/varint-field 6 1048576)
+                   (w/varint-field 7 (pb/enum-value pb/piece-action (keyword action)))
+                   (w/message-field 9 [(w/varint-field 1 expiry)])]]
+       (println (b/hex (sign-limit identity fields)))
+       (System/exit 0))
+     :cljs
+     (do (println "issue: JVM only") (js/process.exit 2))))
+
+(defn- uplink-limit
+  "An `OrderLimit` addressed to `node-id`, for `action`.
+
+  Not signed by anything. `orders/admit` checks the signature through an
+  `IVerifier`, and the node in this harness accepts whatever it is given —
+  which is stated where that verifier is built. Every other field is real and
+  every other rule really applies, so a limit naming the wrong node or the
+  wrong action is refused here exactly as it would be by a node that could
+  check the signature."
+  [node-id piece-id action expiry]
+  (w/encode
+   [(w/bytes-field 1 (vec (repeat 16 0x01)))          ; serial number
+    (w/bytes-field 2 (vec (repeat 32 0x02)))          ; satellite id
+    (w/bytes-field 4 (vec node-id))                   ; storage node id
+    (w/bytes-field 5 (vec piece-id))                  ; piece id
+    (w/varint-field 6 1048576)                        ; limit: 1 MiB
+    (w/varint-field 7 (pb/enum-value pb/piece-action action))
+    (w/message-field 9 [(w/varint-field 1 expiry)])   ; order expiration
+    (w/bytes-field 10 (vec (repeat 8 0xde)))]))       ; satellite signature
+
+(defn uplink
+  "Upload a piece to a node and read it back, over real TLS and real DRPC.
+
+  This is the direction the library never had: `piecestore` decided what an
+  upload was allowed to be long before anything could carry one, and
+  `serve-connection` read `:messages` off the wire and dropped them — which
+  was invisible, because a unary call also produces a message and its `:calls`
+  entry arrives right behind it. Only a stream that never closes shows it.
+
+  Sends limit, three chunks and `done`; then asks for the whole piece back
+  and compares. A node that stored nothing, stored the wrong bytes, or
+  answered the first chunk and stopped all fail here and in different ways."
+  [dir addr expect]
+  #?(:clj
+     (let [identity (load-identity dir)
+           [host port] (str/split addr #":")
+           connect (fn []
+                     (htls/connect {:host host :port (parse-long port)
+                                    :identity identity
+                                    :verify-opts (cond-> {} expect
+                                                   (assoc :expected-node-id (unhex expect)))
+                                    :preamble (when (getenv "STORJ_MUX")
+                                                htls/drpc-mux-header)}))
+           node-id  (unhex expect)
+           piece-id (vec (repeat 32 0x5a))
+           body     (mapv #(mod (* % 7) 256) (range 300))
+           expiry   (+ 3600 (quot (System/currentTimeMillis) 1000))
+           chunk    (fn [off bs]
+                      (w/encode [(w/message-field 3 [(w/varint-field 1 off)
+                                                     (w/bytes-field 2 (vec bs))])]))
+           c1 (connect)]
+       (report (:peer c1) expect)
+       ;; both transfers on one connection, on different streams. A node that
+       ;; only works when each stream gets its own socket has not multiplexed
+       ;; anything, and a real uplink does not reconnect between the two.
+       (let [up (rpc/stream-call
+                 (:socket c1)
+                 {:rpc tr/upload-rpc
+                  :messages [(w/encode [(w/bytes-field 1 (or (some-> (getenv "PUT_LIMIT") unhex)
+                                                             (uplink-limit node-id piece-id :put expiry)))])
+                             (chunk 0 (subvec body 0 128))
+                             (chunk 128 (subvec body 128 256))
+                             (chunk 256 (subvec body 256))
+                             (w/encode [(w/message-field 4 [(w/bytes-field 1 piece-id)
+                                                            (w/varint-field 4 300)])])]})]
+         (when (:error up)
+           (println (str "FAIL upload: " (:message (:error up))))
+           (System/exit 1))
+         (let [done (pb/get-msg (w/decode (:message up)) pb/piece-upload-response :done)
+               sig  (pb/get-bytes done pb/piece-hash :signature)
+               spki (:signing-key (:peer c1))]
+           ;; what an uplink actually does with the node's response: check it
+           ;; was signed by the node it dialled. The key comes from the chain
+           ;; the handshake already admitted, not from anywhere on disk.
+           (if (and sig spki
+                    (p/-verify v/verifier :ecdsa-sha256 spki
+                               (pb/encode-piece-hash-for-signing done) sig))
+             (println "ok   the node signed its response, and it verifies")
+             (do (println (str "FAIL the node's signature did not verify"
+                               " (signature " (if sig "present" "absent")
+                               ", key " (if spki "present" "absent") ")"))
+                 (System/exit 1)))
+           (println (str "upload accepted: " (pb/get-varint done pb/piece-hash :piece-size)
+                         " bytes, piece "
+                         (subs (b/hex (pb/get-bytes done pb/piece-hash :piece-id)) 0 12) "…"))
+           (when-not (= 300 (pb/get-varint done pb/piece-hash :piece-size))
+             (println "FAIL the node acknowledged a different size") (System/exit 1))))
+       (let [down (rpc/stream-call
+                   (:socket c1)
+                   {:rpc tr/download-rpc
+                    :stream 2
+                    :messages [(w/encode [(w/bytes-field 1 (or (some-> (getenv "GET_LIMIT") unhex)
+                                                               (uplink-limit node-id piece-id :get expiry)))
+                                          (w/message-field 3 [(w/varint-field 1 0)
+                                                              (w/varint-field 2 300)])
+                                          (w/varint-field 4 128)])]})]
+         (when (:error down)
+           (println (str "FAIL download: " (:message (:error down))))
+           (System/exit 1))
+         (let [chunks (mapv #(-> (w/decode %)
+                                 (pb/get-msg pb/piece-download-response :chunk)
+                                 (pb/get-bytes pb/download-response-chunk :data))
+                            (:messages down))
+               got    (vec (apply concat chunks))]
+           (println (str "download: " (count chunks) " messages, " (count got) " bytes"))
+           (when (< (count chunks) 2)
+             (println "FAIL a 300-byte piece in 128-byte chunks is more than one message")
+             (System/exit 1))
+           (if (= body got)
+             (do (println "ok   the piece came back byte for byte")
+                 (htls/close! {:socket (:socket c1)})
+                 (System/exit 0))
+             (do (println "FAIL the bytes that came back are not the bytes that went up")
+                 (System/exit 1))))))
+     :cljs
+     (do (println "uplink: JVM only for now") (js/process.exit 2))))
+
+(defn run [[mode dir arg expect rpc-name payload]]
+  (case mode
+    "serve" (serve dir #?(:clj (parse-long (or arg "0")) :cljs (js/parseInt (or arg "0") 10)) expect)
+    "dial"  (dial dir arg expect)
+    "call"  (call dir arg expect rpc-name payload)
+    "check-in" (check-in dir arg expect (or rpc-name "127.0.0.1:28967"))
+    "issue" (issue dir arg expect rpc-name payload)
+    "uplink" (uplink dir arg expect)
+    "satellite" (satellite dir #?(:clj (parse-long (or arg "0")) :cljs 0) expect)
+    "node"  (node dir #?(:clj (parse-long (or arg "0")) :cljs (js/parseInt (or arg "0") 10)) expect)
+    (do (println (str "usage: serve <dir> <port> | dial <dir> <host:port> [expect-hex]"
+                      " | call <dir> <host:port> <expect-hex> <rpc> <payload>"))
+        #?(:clj (System/exit 1) :cljs (js/process.exit 1)))))
+
+#?(:clj (defn -main [& args] (run args)))
+#?(:cljs (run (vec *command-line-args*)))

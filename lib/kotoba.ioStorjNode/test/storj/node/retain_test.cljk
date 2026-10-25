@@ -1,0 +1,152 @@
+(ns storj.node.retain-test
+  "The bloom filter, against every answer Storj's own gives.
+
+  Not a round trip. A filter that decodes is not a filter that agrees: each
+  probe takes a little-endian `uint64` modulo the table size, and that number
+  does not survive a JavaScript double. Two implementations disagreeing about
+  which bucket a piece lands in disagree about which pieces to delete.
+
+  The seed is 200 on purpose. `initialConditions` divides the seed by 32 to
+  choose a range offset, so an implementation that hardcodes the first one
+  passes every test written with seed 0."
+  (:refer-clojure :exclude [contains?])
+  (:require [kotoba.test :refer [deftest is testing]]
+            [storj.node.retain :as r]))
+
+(defn- unhex [s]
+  (mapv #?(:clj  #(Integer/parseInt % 16)
+           :cljs #(js/parseInt % 16))
+        (re-seq #"[0-9a-fA-F]{2}" s)))
+
+;; ── testdata/bloom-vectors.edn, generated — do not hand-edit ────────────────
+
+(def filter-hex
+  (str "01c804800000000000000001040000000000000000000000000000800000000000000080"
+       "020000000000002002000000000000000000000000080000004000000000000040000000"
+       "000020000000000001000000000000000100000000000000010000000000000000000000"
+       "0004000000000000080400000020000000000000010000000000000000000000"))
+
+(def zero-seed-filter-hex
+  (str "010003000000000000000000000000000000800102000000000000000000000000000000"
+       "00000000000000000000000000000000000000000000000000000000000000"))
+
+;; piece ids are `fill + i*7` per byte, which testdata/gen_bloom.go builds the
+;; same way; the first one is recorded so the formula cannot drift
+(defn- piece-id [fill]
+  (mapv (fn [i] (mod (+ fill (* i 7)) 256)) (range 32)))
+
+(def first-piece-id-hex "00070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9")
+
+(def expected-contains
+  ;; one per fill in (range 0 256 8), Storj's own answers
+  [true false false false false false false false true false false false false false false false false false false false false false false false false false false false false false true false])
+
+(def expected-fill-rate 0.018248)
+
+;; ── the filter agrees ───────────────────────────────────────────────────────
+
+(deftest the-piece-id-formula-matches-the-generator
+  (is (= (unhex first-piece-id-hex) (piece-id 0))))
+
+(deftest every-answer-matches-storjs-own
+  (let [f (r/parse (unhex filter-hex))]
+    (is (= 32 (count expected-contains)))
+    (doseq [[i expected] (map-indexed vector expected-contains)]
+      (let [fill (* i 8)]
+        (is (= expected (r/contains? f (piece-id fill)))
+            (str "fill " fill))))))
+
+(deftest the-seed-chooses-where-probing-starts-and-how-far-it-steps
+  ;; seed 200: 200 mod 32 = 8, and 200/32 = 6, 6 mod 4 = 2, so rangeOffsets[2]
+  (let [f (r/parse (unhex filter-hex))]
+    (is (= 8 (:offset f)))
+    (is (= 19 (:range-offset f))
+        "not 9 — an implementation that hardcodes the first range offset gets
+         this wrong and every seed-0 test still passes"))
+  (testing "and seed 0 is the one that hides the mistake"
+    (is (= {:offset 0 :range-offset 9} (r/initial-conditions 0)))
+    (is (= {:offset 1 :range-offset 13} (r/initial-conditions 33)))
+    (is (= {:offset 0 :range-offset 23} (r/initial-conditions 96)))
+    (is (= {:offset 0 :range-offset 9} (r/initial-conditions 128))
+        "the range offsets wrap after four")))
+
+(deftest fill-rate-matches
+  (let [d (- expected-fill-rate (r/fill-rate (r/parse (unhex filter-hex))))]
+    (is (< (if (neg? d) (- d) d) 1e-6))))
+
+(deftest a-zero-seed-filter-also-agrees
+  (let [f (r/parse (unhex zero-seed-filter-hex))]
+    (is (= 0 (:offset f)))
+    (is (r/contains? f (piece-id 0x11)))
+    (is (not (r/contains? f (piece-id 0x22))))))
+
+;; ── refusals ────────────────────────────────────────────────────────────────
+
+(deftest a-filter-that-cannot-be-consulted-is-refused
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"at least a version"
+                        (r/parse [1 2])))
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"unsupported filter version"
+                        (r/parse [2 0 1 0xff])))
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"no hash functions"
+                        (r/parse [1 0 0 0xff]))
+      "hashCount 0 would make every probe loop end immediately and say yes")
+  (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"empty table"
+                        (r/parse [1 0 1]))
+      "and an empty table divides by zero at the first probe rather than here"))
+
+(deftest a-piece-id-is-thirty-two-bytes
+  (let [f (r/parse (unhex filter-hex))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"32 bytes"
+                          (r/contains? f (vec (repeat 31 0)))))))
+
+;; ── the decision ────────────────────────────────────────────────────────────
+
+(def ^:private absent
+  ;; a piece the filter says no to — found rather than assumed, so this cannot
+  ;; quietly become a test about a piece the filter happens to contain
+  (first (for [fill (range 0 256 8)
+               :let [f (r/parse (unhex filter-hex))]
+               :when (not (r/contains? f (piece-id fill)))]
+           (piece-id fill))))
+
+(deftest absence-alone-is-not-a-reason-to-delete
+  ;; the filter was built at a moment; a piece accepted after that cannot be
+  ;; in it, and deleting on absence alone destroys exactly what the satellite
+  ;; most recently entrusted to this node
+  (let [f (r/parse (unhex filter-hex))]
+    (is (some? absent))
+    (is (not (r/contains? f absent)))
+    (testing "older than the filter — safe to delete"
+      (is (not (r/keep? f absent {:created-at 900 :filter-created-at 1000}))))
+    (testing "newer than the filter — kept"
+      (is (r/keep? f absent {:created-at 1100 :filter-created-at 1000})))
+    (testing "exactly as old as the filter — kept, because the boundary is not
+              worth being clever at"
+      (is (r/keep? f absent {:created-at 1000 :filter-created-at 1000})))
+    (testing "creation time unknown — kept"
+      (is (r/keep? f absent {:created-at nil :filter-created-at 1000}))
+      (is (r/keep? f absent {:created-at 900 :filter-created-at nil})))))
+
+(deftest a-piece-in-the-filter-is-kept-whatever-its-age
+  (let [f (r/parse (unhex filter-hex))
+        present (first (for [fill (range 0 256 8)
+                             :when (r/contains? f (piece-id fill))]
+                         (piece-id fill)))]
+    (is (some? present))
+    (is (r/keep? f present {:created-at 1 :filter-created-at 1000000}))))
+
+(deftest partitioning-keeps-what-it-cannot-justify-deleting
+  (let [f (r/parse (unhex filter-hex))
+        ids (mapv piece-id (range 0 256 8))
+        {:keys [keep delete]} (r/partition-pieces f ids
+                                                  {:filter-created-at 1000
+                                                   :created-at-of (constantly 900)})]
+    (is (= (count ids) (+ (count keep) (count delete))))
+    (is (every? (fn [id] (r/contains? f id)) keep))
+    (is (not-any? (fn [id] (r/contains? f id)) delete)))
+  (testing "with no creation times at all, nothing is deleted"
+    (let [f (r/parse (unhex filter-hex))
+          ids (mapv piece-id (range 0 256 8))
+          {:keys [keep delete]} (r/partition-pieces f ids {:filter-created-at 1000})]
+      (is (empty? delete))
+      (is (= (count ids) (count keep))))))

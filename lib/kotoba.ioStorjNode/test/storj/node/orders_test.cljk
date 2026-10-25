@@ -1,0 +1,139 @@
+(ns storj.node.orders-test
+  "Admission tests.
+
+  The order limit used here is the real one from `testdata/gen_vectors.go`, so
+  the fields being checked are in the positions a satellite actually puts
+  them. Each test then damages exactly one thing — a different node ID, a
+  passed deadline, a mismatched action — and asserts the specific reason comes
+  back. A test that only asserted `not ok?` would pass just as well if the
+  code rejected everything."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [proto.wire :as w]
+            [storj.node.orders :as orders]
+            [storj.node.protocols :as p]))
+
+(defn- unhex [s]
+  (mapv #?(:clj  #(Integer/parseInt % 16)
+           :cljs #(js/parseInt % 16))
+        (re-seq #"[0-9a-fA-F]{2}" s)))
+
+(def order-limit-wire
+  (str "0a100102030405060708090a0b0c0d0e0f10"
+       "1220101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+       "2220404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"
+       "2a20707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f"
+       "308080403801"
+       "420b088092b8c398feffffff01"
+       "4a0608c0b3a2d306"
+       "5204deadbeef"
+       "620608b097a2d306"
+       "6a20a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"))
+
+(def this-node
+  "the storage_node_id inside that limit: 0x40 … 0x5f"
+  (unhex "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f"))
+
+(def order-expiry 1785240000) ; 2026-07-28T12:00:00Z
+
+(defn- clock-at [t] (reify p/IClock (-now-seconds [_] t)))
+(defn- verifier [answer] (reify p/IVerifier (-verify [_ _ _ _ _] answer)))
+
+(defn- admit [limit-hex opts]
+  (orders/admit (w/decode (unhex limit-hex))
+                (merge {:node-id       this-node
+                        :action        :put
+                        :satellite-key [0x01]
+                        :clock         (clock-at (- order-expiry 60))
+                        :verifier      (verifier true)}
+                       opts)))
+
+(defn- reasons [r] (set (map :reason (:reasons r))))
+
+(deftest a-good-limit-is-admitted
+  (let [r (admit order-limit-wire {})]
+    (is (:ok? r))
+    (is (empty? (:reasons r)))
+    (is (= :put (:action r)))
+    (is (= 1048576 (:limit r)))
+    (is (= 32 (count (:piece-id r))))))
+
+(deftest addressed-to-another-node
+  (let [r (admit order-limit-wire {:node-id (vec (repeat 32 0x99))})]
+    (is (not (:ok? r)))
+    (is (contains? (reasons r) :addressed-to-another-node))))
+
+(deftest no-node-id-configured-is-not-a-pass
+  ;; the failure mode this guards is a node that treats "I do not know who I
+  ;; am" as "this must be for me"
+  (let [r (admit order-limit-wire {:node-id nil})]
+    (is (not (:ok? r)))
+    (is (contains? (reasons r) :no-node-id-configured))))
+
+(deftest expiry
+  (testing "before the deadline"
+    (is (:ok? (admit order-limit-wire {:clock (clock-at (dec order-expiry))}))))
+  (testing "after it"
+    (let [r (admit order-limit-wire {:clock (clock-at (inc order-expiry))})]
+      (is (not (:ok? r)))
+      (is (contains? (reasons r) :order-expired))))
+  (testing "clock skew extends the deadline, and only forwards"
+    (is (:ok? (admit order-limit-wire {:clock (clock-at (+ order-expiry 30))
+                                       :skew-seconds 60})))
+    (is (not (:ok? (admit order-limit-wire {:clock (clock-at (+ order-expiry 90))
+                                            :skew-seconds 60}))))))
+
+(deftest action-must-match-the-request
+  (let [r (admit order-limit-wire {:action :get})]
+    (is (not (:ok? r)))
+    (is (contains? (reasons r) :action-mismatch))
+    (is (= {:requested :get :authorised :put}
+           (-> (filter #(= :action-mismatch (:reason %)) (:reasons r))
+               first (select-keys [:requested :authorised]))))))
+
+(deftest signature
+  (testing "a limit the satellite did not sign is refused"
+    (let [r (admit order-limit-wire {:verifier (verifier false)})]
+      (is (not (:ok? r)))
+      (is (contains? (reasons r) :bad-satellite-signature))))
+
+  (testing "no verifier configured is a refusal, not a pass"
+    (let [r (admit order-limit-wire {:verifier nil})]
+      (is (not (:ok? r)))
+      (is (contains? (reasons r) :no-verifier-configured))))
+
+  (testing "the bytes handed to the verifier are the signing form"
+    (let [seen (atom nil)
+          v (reify p/IVerifier
+              (-verify [_ _ _ data _] (reset! seen data) true))]
+      (admit order-limit-wire {:verifier v})
+      (is (some? @seen))
+      (is (not= (unhex order-limit-wire) @seen)
+          "verifying the received bytes as-is would accept nothing")
+      (is (< (count @seen) (count (unhex order-limit-wire)))
+          "the signature and the unset timestamp are gone"))))
+
+(deftest crypto-runs-last
+  ;; a node under a flood of malformed limits should do no asymmetric crypto
+  (let [calls (atom 0)
+        v (reify p/IVerifier (-verify [_ _ _ _ _] (swap! calls inc) true))]
+    (admit order-limit-wire {:node-id (vec (repeat 32 0x99)) :verifier v})
+    (is (zero? @calls) "a limit addressed elsewhere never reaches the verifier")
+    (admit order-limit-wire {:verifier v})
+    (is (= 1 @calls) "a coherent one does")))
+
+(deftest every-reason-not-just-the-first
+  (let [r (admit order-limit-wire {:node-id (vec (repeat 32 0x99))
+                                   :action  :get
+                                   :clock   (clock-at (+ order-expiry 3600))})]
+    (is (<= 3 (count (:reasons r))))
+    (is (= #{:addressed-to-another-node :action-mismatch :order-expired}
+           (reasons r)))))
+
+(deftest transfer-accounting
+  (let [r (admit order-limit-wire {})]
+    (is (orders/within-limit? r 0 1048576))
+    (is (not (orders/within-limit? r 0 1048577)))
+    (is (orders/within-limit? r 1048575 1))
+    (is (not (orders/within-limit? r 1048576 1))
+        "the limit is a total, not a per-message allowance — a node that
+         re-checks from zero on every chunk has not checked anything")))
