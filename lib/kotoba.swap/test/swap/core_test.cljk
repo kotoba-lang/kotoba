@@ -1,0 +1,189 @@
+(ns swap.core-test
+  "The core is where the money-safety rules live, so the tests are mostly about
+  what must be REFUSED: a quote with no minimum-output guard, a min-out that
+  ignores the caller's slippage, a fee that was requested but never encoded, an
+  expired quote, an empty plan."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [swap.core :as core]))
+
+(def eth {:chain "ETH" :chain-id 1 :asset "ETH.ETH" :symbol "ETH" :decimals 18})
+(def usdc {:chain "ETH" :chain-id 1 :asset "ETH.USDC" :symbol "USDC" :decimals 6
+           :address "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"})
+(def btc {:chain "BTC" :asset "BTC.BTC" :symbol "BTC" :decimals 8})
+
+(def base-intent
+  {:from usdc :to eth :amount "1.5" :destination "0xabc" :taker "0xabc"
+   :slippage-bps 100 :fee-bps 30 :fee-recipient "0xfee"})
+
+(def ok-quote
+  {:rail :aggregator :provider :test
+   :expected-out "1000000000000000000"
+   :min-out "995000000000000000"          ; 50 bps below expected: within 100
+   :fee-bps 30 :fee-mechanism :protocol-affiliate
+   :expires-at 2000
+   :steps [{:step/kind :evm-call :step/why "swap" :to "0xr" :data "0x" :value "0"}]})
+
+;; ── intent normalization ──
+
+(deftest intent-defaults
+  (let [i (core/intent {:from usdc :to eth :amount "1.5"})]
+    (is (= 100 (:slippage-bps i)))
+    (is (= 0 (:fee-bps i)))
+    (is (= 1200 (:deadline-seconds i)))))
+
+(deftest intent-rejects-float-amount
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (core/intent {:from usdc :to eth :amount 1.5}))
+      "amounts must be decimal STRINGS — a double corrupts a uint256"))
+
+(deftest intent-rejects-missing-side-fields
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (core/intent {:from {:chain "ETH" :asset "ETH.ETH"} :to eth
+                             :amount "1"}))
+      "missing :decimals would silently mis-scale every amount"))
+
+(deftest intent-rejects-fee-without-recipient
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (core/intent {:from usdc :to eth :amount "1" :fee-bps 30}))
+      "a fee charged and paid to nobody"))
+
+(deftest intent-rejects-absurd-fee
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (core/intent {:from usdc :to eth :amount "1" :fee-bps 1001
+                             :fee-recipient "0xfee"}))
+      "1001 bps > 10%"))
+
+(deftest cross-chain-detection
+  (is (false? (core/cross-chain? {:from usdc :to eth})))
+  (is (true? (core/cross-chain? {:from btc :to eth}))))
+
+;; ── check: what must be refused ──
+
+(deftest check-passes-a-sound-quote
+  (is (= {:ok? true} (core/check base-intent ok-quote 1000))))
+
+(deftest check-refuses-missing-min-out
+  (let [{:keys [ok? problems]} (core/check base-intent (dissoc ok-quote :min-out) 1000)]
+    (is (false? ok?))
+    (is (= :missing-min-out (:problem (first problems))))))
+
+(deftest check-refuses-zero-min-out
+  (let [{:keys [problems]} (core/check base-intent (assoc ok-quote :min-out "0") 1000)]
+    (is (some #(= :zero-min-out (:problem %)) problems))))
+
+(deftest check-refuses-min-out-below-requested-slippage
+  (testing "min-out 500 bps below expected while the caller allowed 100"
+    (let [{:keys [ok? problems]}
+          (core/check base-intent (assoc ok-quote :min-out "950000000000000000") 1000)]
+      (is (false? ok?))
+      (is (some #(= :min-out-below-requested-slippage (:problem %)) problems)))))
+
+(deftest check-accepts-min-out-exactly-at-tolerance
+  (is (:ok? (core/check base-intent (assoc ok-quote :min-out "990000000000000000") 1000))
+      "exactly 100 bps below expected is within a 100 bps tolerance"))
+
+(deftest check-refuses-unencoded-fee
+  (testing "a fee was requested but the provider encoded none — earns nothing, silently"
+    (let [{:keys [ok? problems]}
+          (core/check base-intent (assoc ok-quote :fee-mechanism :none) 1000)]
+      (is (false? ok?))
+      (is (some #(= :fee-not-encoded (:problem %)) problems)))))
+
+(deftest check-refuses-fee-bps-mismatch
+  (let [{:keys [problems]} (core/check base-intent (assoc ok-quote :fee-bps 5) 1000)]
+    (is (some #(= :fee-bps-mismatch (:problem %)) problems))))
+
+(deftest check-refuses-expired-quote
+  (let [{:keys [problems]} (core/check base-intent ok-quote 3000)]
+    (is (some #(= :quote-expired (:problem %)) problems))))
+
+(deftest check-ignores-expiry-when-provider-gives-none
+  (is (:ok? (core/check base-intent (assoc ok-quote :expires-at nil) 9999999))))
+
+(deftest check-refuses-empty-plan
+  (let [{:keys [problems]} (core/check base-intent (assoc ok-quote :steps []) 1000)]
+    (is (some #(= :no-steps (:problem %)) problems))))
+
+(deftest check-reports-every-problem-at-once
+  (let [{:keys [problems]} (core/check base-intent
+                                       (assoc ok-quote :min-out "0" :steps []
+                                              :fee-mechanism :none)
+                                       3000)]
+    (is (<= 4 (count problems))
+        "a UI should be able to show all of them, not just the first")))
+
+(deftest zero-fee-intent-does-not-require-a-mechanism
+  (let [i (core/intent {:from usdc :to eth :amount "1.5"})]
+    (is (:ok? (core/check i (assoc ok-quote :fee-bps 0 :fee-mechanism :none) 1000)))))
+
+;; ── plan ──
+
+(deftest plan-returns-steps-when-sound
+  (is (= (:steps ok-quote) (core/plan base-intent ok-quote 1000))))
+
+(deftest plan-throws-when-unsound
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (core/plan base-intent (assoc ok-quote :min-out "0") 1000))))
+
+;; ── amount< (portable, exact) ──
+
+(deftest amount-compare-is-exact-past-2-53
+  (is (true? (core/amount< "9007199254740993" "9007199254740994"))
+      "consecutive integers above 2^53 are indistinguishable as doubles")
+  (is (false? (core/amount< "9007199254740994" "9007199254740993")))
+  (is (false? (core/amount< "1000" "1000")))
+  (is (true? (core/amount< "999" "1000")) "shorter is smaller")
+  (is (false? (core/amount< "0010" "9")) "leading zeros normalized"))
+
+;; ── execution state machine ──
+
+(def two-step-quote
+  (assoc ok-quote :steps
+         [{:step/kind :erc20-approve :step/why "allowance" :to "0xt" :data "0x"}
+          {:step/kind :evm-call :step/why "swap" :to "0xr" :data "0x"}]))
+
+(deftest state-machine-walks-steps-in-order
+  (let [s0 (core/begin base-intent two-step-quote)]
+    (is (= :ready (:status s0)))
+    (is (= :erc20-approve (:step/kind (core/current-step s0))))
+    (let [s1 (core/advance s0 {:event :submitted :tx-id "0xa"})]
+      (is (= :pending (:status s1)))
+      (is (nil? (core/current-step s1)) "nothing to do while a tx is in flight")
+      (let [s2 (core/advance s1 {:event :confirmed :tx-id "0xa"})]
+        (is (= :ready (:status s2)))
+        (is (= :evm-call (:step/kind (core/current-step s2))) "advanced to the swap")
+        (let [s3 (-> s2
+                     (core/advance {:event :submitted :tx-id "0xb"})
+                     (core/advance {:event :confirmed :tx-id "0xb"}))]
+          (is (= :confirmed (:status s3)))
+          (is (true? (core/done? s3)))
+          (is (= ["0xa" "0xb"] (:submitted s3)) "tx ids kept in order"))))))
+
+(deftest state-machine-records-every-event
+  (let [s (-> (core/begin base-intent ok-quote)
+              (core/advance {:event :submitted :tx-id "0xa"})
+              (core/advance {:event :confirmed :tx-id "0xa"}))]
+    (is (= 2 (count (:events s))) "the event log is the audit trail")))
+
+(deftest state-machine-terminal-states-are-absorbing
+  (doseq [[ev status] [[{:event :failed :reason "reverted"} :failed]
+                       [{:event :refunded :tx-id "0xr"} :refunded]
+                       [{:event :expired} :expired]]]
+    (let [s (core/advance (core/begin base-intent ok-quote) ev)]
+      (is (= status (:status s)))
+      (is (true? (core/done? s)))
+      (is (= status (:status (core/advance s {:event :confirmed :tx-id "0xz"})))
+          "a late confirmation must not resurrect a finished swap")
+      (is (= 2 (count (:events (core/advance s {:event :confirmed :tx-id "0xz"}))))
+          "…but it is still recorded"))))
+
+(deftest state-machine-keeps-failure-reason
+  (is (= "reverted"
+         (:failure (core/advance (core/begin base-intent ok-quote)
+                                 {:event :failed :reason "reverted"})))))
+
+(deftest state-machine-ignores-unknown-events
+  (let [s0 (core/begin base-intent ok-quote)
+        s1 (core/advance s0 {:event :who-knows})]
+    (is (= :ready (:status s1)))
+    (is (= 1 (count (:events s1))) "unknown events are logged, not applied")))

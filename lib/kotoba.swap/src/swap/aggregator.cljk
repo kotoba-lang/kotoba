@@ -1,0 +1,313 @@
+(ns swap.aggregator
+  "Same-chain EVM rail: a DEX aggregator driver.
+
+  WHY AN AGGREGATOR AND NOT A ROUTER: quoting a swap well means splitting it
+  across pools, comparing venues, and re-checking every block. An aggregator
+  already does that, AND it exposes a fee parameter that skims our basis points
+  on-chain to a recipient we name — so there is no fee contract to write, deploy,
+  audit, or custody funds in. This is what MetaMask does; it is not a shortcut.
+
+  VENDOR MAPPING IS DATA, NOT CODE. Aggregator APIs rename fields between
+  versions, so an adapter is a map: which query parameters carry the fee, and
+  where in the response the transaction, the expected output and the minimum
+  output live. Correcting a vendor change is a one-line data edit, and the plan
+  builder below is tested against fixtures rather than against a live vendor.
+
+  STATUS OF THE SHIPPED ADAPTERS — the difference a live call makes:
+
+    :lifi        LIVE-VERIFIED 2026-07-26 against li.quest (keyless). The first
+                 live call FAILED, and found two real defects the fixtures could
+                 not: `toChain` is a REQUIRED parameter and was missing, and `fee`
+                 is a decimal FRACTION (0.02 = 2%), not basis points — sending
+                 bps there would have been rejected as out of range, or silently
+                 meant something else entirely. Both fixed; see `:fee-unit`.
+    :zero-ex-v2  DOCS-VERIFIED, NOT live-verified. Parameter names, the bps unit
+                 of `swapFeeBps` (0–1000), the `issues.allowance` semantics and
+                 the `0x-version: v2` header are confirmed against 0x's current
+                 published documentation, but 0x requires an API key and this repo
+                 has none, so no live call has exercised the RESPONSE field paths.
+                 Stays `:verified? false` until a real key produces a real quote.
+
+  The LI.FI result is the argument for why `:verified?` is a field and not a
+  comment: two of its parameters were wrong in a way no amount of fixture testing
+  would have caught, because fixtures encode what the author believed the vendor
+  wanted. So the flag is ENFORCED — `adapter` refuses an unverified one unless the
+  caller opts in explicitly, rather than trusting that someone read this docstring.
+
+  Current position (owner decision 2026-07-26): **LI.FI only**. 0x is deferred, not
+  abandoned — the mapping stays, ready for one live call once a key exists.
+
+  `parse-quote` fails loudly with the adapter's own path when a field is missing,
+  rather than returning a quote with a nil min-out (which `swap.core/check` would
+  then reject as unsafe anyway)."
+  (:require [kotoba.lang.text :as str]
+            [erc20.core :as erc20]
+            [swap.core :as core]
+            [swap.fee :as fee]))
+
+(def adapters
+  "Declarative vendor adapters. `:params` / `:fee-params` map our concepts onto
+  the vendor's query parameters; `:paths` maps normalized quote fields onto paths
+  into the vendor's response body (string keys, as JSON decodes).
+
+  `:fee-unit` and `:slippage-unit` are load-bearing and NOT cosmetic: 0x wants
+  basis points while LI.FI wants a decimal fraction, so the same 30 bps is `30`
+  for one vendor and `0.003` for the other, and 100 bps of slippage is `100` vs
+  `0.01`. Getting it wrong is either a rejected request or — worse — a value three
+  orders of magnitude off. Both of LI.FI's units were wrong here until a live call
+  said so, one after the other.
+
+  `:cross-chain?` says whether the vendor can settle across chains at all. It is
+  per-adapter and not per-rail because the two shipped adapters genuinely differ:
+  LI.FI is a bridge aggregator over 72 chains, 0x's Swap API settles on one.
+
+  `:fee-recipient-kind` says what the recipient parameter actually IS: an on-chain
+  ADDRESS for 0x, but a registered INTEGRATOR ID for LI.FI, whose payout wallet is
+  configured out-of-band in their partner portal rather than passed per request.
+  Passing an address where an integrator id belongs looks like it works."
+  {:zero-ex-v2
+   {:id :zero-ex-v2
+    :verified? false                      ; docs-verified only — see ns docstring
+    :base-url "https://api.0x.org"
+    :path "/swap/allowance-holder/quote"
+    :headers {"0x-version" "v2"}          ; API key (0x-api-key) added by the caller
+    :fee-unit :bps                        ; swapFeeBps: 0–1000, 1000 = 10%
+    :slippage-unit :bps                   ; slippageBps
+    :fee-recipient-kind :address
+    :cross-chain? false                   ; 0x's Swap API settles on ONE chain
+    :params {:chain-id "chainId"
+             :sell-token "sellToken"
+             :buy-token "buyToken"
+             :sell-amount "sellAmount"
+             :taker "taker"
+             :slippage-bps "slippageBps"}
+    :fee-params {:recipient "swapFeeRecipient"
+                 :bps "swapFeeBps"
+                 :token "swapFeeToken"}   ; must be the buy or the sell token
+    :paths {:tx-to ["transaction" "to"]
+            :tx-data ["transaction" "data"]
+            :tx-value ["transaction" "value"]
+            :tx-gas ["transaction" "gas"]
+            :expected-out ["buyAmount"]
+            :min-out ["minBuyAmount"]
+            :allowance-spender ["issues" "allowance" "spender"]
+            :allowance-current ["issues" "allowance" "actual"]}}
+
+   :lifi
+   {:id :lifi
+    :verified? true                       ; live-verified 2026-07-26, keyless
+    :base-url "https://li.quest"
+    :path "/v1/quote"
+    :headers {}
+    :fee-unit :fraction                   ; fee: 0 <= x < 1, 0.02 = 2%
+    :slippage-unit :fraction              ; slippage: must be <= 1, 0.01 = 1%
+    :fee-recipient-kind :integrator-id
+    :cross-chain? true                    ; LI.FI is a BRIDGE aggregator: 72 chains
+    :params {:chain-id "fromChain"
+             :to-chain-id "toChain"       ; REQUIRED — the live call 400s without it
+             :sell-token "fromToken"
+             :buy-token "toToken"
+             :sell-amount "fromAmount"
+             :taker "fromAddress"
+             :slippage-bps "slippage"}
+    :fee-params {:recipient "integrator" :bps "fee"}
+    :paths {:tx-to ["transactionRequest" "to"]
+            :tx-data ["transactionRequest" "data"]
+            :tx-value ["transactionRequest" "value"]
+            :tx-gas ["transactionRequest" "gasLimit"]
+            :expected-out ["estimate" "toAmount"]
+            :min-out ["estimate" "toAmountMin"]}}})
+
+(def default-adapter
+  "The adapter to use unless a caller says otherwise: `:lifi`.
+
+  Owner decision 2026-07-26 — LI.FI only for now, 0x deferred (not abandoned).
+  LI.FI is also the only adapter that has been live-verified, so the default and
+  the verified one are deliberately the same thing."
+  :lifi)
+
+(defn adapter
+  "Resolve an adapter by id, defaulting to `default-adapter`, and REFUSE an
+  unverified one unless the caller opts in explicitly.
+
+  This is why `:verified?` is a field: after a live call found four defects in a
+  mapping that had been written carefully from the vendor's own documentation, an
+  unverified mapping is not a smaller risk than an untested one — it is the same
+  risk wearing documentation. So the flag is enforced here rather than left as a
+  note somebody is supposed to have read.
+
+  `(adapter)` -> the default. `(adapter :zero-ex-v2)` -> throws.
+  `(adapter :zero-ex-v2 {:allow-unverified? true})` -> allowed, on your head."
+  ([] (adapter default-adapter {}))
+  ([id] (adapter id {}))
+  ([id {:keys [allow-unverified?]}]
+   (let [a (get adapters id)]
+     (when-not a
+       (throw (ex-info (str "swap: no such aggregator adapter: " (pr-str id))
+                       {:known (sort (keys adapters))})))
+     (when (and (not (:verified? a)) (not allow-unverified?))
+       (throw (ex-info
+               (str "swap: adapter " id " has never been verified against the live API"
+                    " (:verified? false) — its request parameters are docs-checked but its"
+                    " RESPONSE field paths have never been exercised. A live call against"
+                    " :lifi found four defects in a mapping written just as carefully, so"
+                    " this is not a theoretical risk. Verify it with bin/verify_live.cljk"
+                    " and set :verified? true, or pass :allow-unverified? true deliberately.")
+               {:adapter id :verified? false
+                :verified-adapters (sort (keep (fn [[k v]] (when (:verified? v) k)) adapters))})))
+     a)))
+
+(defn bps->param
+  "Render basis points in a vendor's unit: `:bps` -> `30`, `:fraction` -> `0.003`.
+  Used for BOTH the fee and the slippage parameter, because a vendor that wants
+  fractions wants them everywhere.
+
+  Done with string arithmetic rather than `(/ bps 10000.0)` for the same reason
+  every other amount in this plane avoids floats — and because a double formatted
+  by the platform's default printer can come out as `3.0E-4`, and finding out in
+  production that a vendor does not parse exponent notation is not a good way to
+  learn it. bps is an integer 0..1000, so the fraction is exactly four decimal
+  places and needs no arithmetic at all."
+  [fee-unit bps]
+  (case (or fee-unit :bps)
+    :bps (str bps)
+    :fraction (if (zero? bps)
+                "0"
+                (let [padded (str (apply str (repeat (- 4 (count (str bps))) "0")) bps)
+                      trimmed (str/replace padded #"0+$" "")]
+                  (str "0." trimmed)))))
+
+(defn- fee-token
+  "Which token the fee is skimmed in. Taking it in the BUY token is the norm (the
+  user's sell balance is already committed) and keeps the fee denominated in what
+  the user receives."
+  [intent]
+  (get-in intent [:to :address]))
+
+(defn quote-request
+  "Build an aggregator quote request as data: `{:method :get :url … :headers …}`.
+  No HTTP here — the caller owns the transport.
+
+  `:amount` is converted from the human decimal string to the sell token's
+  smallest unit with `erc20/->units`, which is exact string arithmetic: `0.1` at
+  18 decimals is `100000000000000000`, not `99999999999999999`."
+  [{:keys [from to amount taker slippage-bps fee-bps fee-recipient] :as intent}
+   {:keys [id params fee-params base-url path headers fee-unit slippage-unit
+           cross-chain?]}]
+  ;; Cross-chain is refused per-ADAPTER, not per-rail. This used to be a blanket
+  ;; "the aggregator rail is same-chain only", which was wrong about the vendor we
+  ;; actually use: LI.FI is a BRIDGE aggregator spanning 72 chains, so the rail was
+  ;; artificially restricted to a fraction of what it can do. 0x's Swap API really
+  ;; does settle on one chain, so the refusal belongs to the adapter that needs it.
+  (when (and (core/cross-chain? intent) (not cross-chain?))
+    (throw (ex-info (str "swap: adapter " id " settles on a single chain — "
+                         (:chain from) " -> " (:chain to)
+                         " needs a cross-chain-capable adapter (:lifi) or the"
+                         " native rail (swap.thorchain)")
+                    {:adapter id :from (:chain from) :to (:chain to)})))
+  (let [sell-units (erc20/->units amount (:decimals from))
+        q (cond-> {(params :chain-id) (str (:chain-id from))
+                   (params :sell-token) (or (:address from) (:asset from))
+                   (params :buy-token) (or (:address to) (:asset to))
+                   (params :sell-amount) sell-units
+                   (params :slippage-bps) (bps->param slippage-unit slippage-bps)}
+            ;; a same-chain swap still has to state the destination chain when the
+            ;; vendor asks for it — LI.FI 400s outright without toChain
+            (params :to-chain-id) (assoc (params :to-chain-id) (str (:chain-id to)))
+            taker (assoc (params :taker) taker)
+            (and fee-bps (pos? fee-bps))
+            (cond-> (:recipient fee-params) (assoc (:recipient fee-params) fee-recipient)
+                    (:bps fee-params) (assoc (:bps fee-params)
+                                             (bps->param fee-unit fee-bps))
+                    (:token fee-params) (assoc (:token fee-params) (fee-token intent))))]
+    {:method :get
+     :provider id
+     :url (str base-url path "?"
+               (str/join "&" (for [[k v] (sort q) :when (some? v)]
+                               (str k "=" #?(:clj (java.net.URLEncoder/encode (str v) "UTF-8")
+                                             :cljs (js/encodeURIComponent (str v)))))))
+     :headers headers
+     :sell-units sell-units}))
+
+(defn- at
+  "Follow a field path into a decoded response body, tolerating string or keyword
+  keys. `nil`/empty path -> nil, NOT the whole body: an adapter that declares no
+  allowance paths at all (LI.FI does not) would otherwise get the entire response
+  map back as its `spender`, which is truthy — so `needs-approve?` became true and
+  the plan builder threw on a map where it wanted an address. `reduce` over an
+  empty path returning its init is exactly right in general and exactly wrong
+  here."
+  [body path]
+  (when (seq path)
+    (reduce (fn [m k] (when (map? m) (or (get m k) (get m (keyword k))))) body path)))
+
+(defn- require-at [body path field id]
+  (or (at body path)
+      (throw (ex-info (str "swap/" (name id) ": response is missing " field
+                           " at " (pr-str path)
+                           " — the adapter's field mapping does not match this vendor's"
+                           " current response shape. Fix swap.aggregator/adapters;"
+                           " do not proceed with a partial quote.")
+                      {:provider id :field field :path path :body body}))))
+
+(defn parse-quote
+  "Vendor response -> a normalized `swap.core` quote with an execution plan.
+
+  Builds an `:erc20-approve` step ONLY when the response says an allowance is
+  actually missing. An unconditional approve costs the user a transaction they
+  may not need; skipping a needed one makes the swap revert."
+  [{:keys [fee-bps fee-recipient] :as intent}
+   {:keys [id paths] :as adapter}
+   body
+   {:keys [sell-units]}]
+  (let [tx-to (require-at body (:tx-to paths) "transaction target" id)
+        tx-data (require-at body (:tx-data paths) "transaction calldata" id)
+        tx-value (or (at body (:tx-value paths)) "0")
+        expected-out (str (require-at body (:expected-out paths) "expected output" id))
+        min-out (str (require-at body (:min-out paths) "minimum output" id))
+        spender (at body (:allowance-spender paths))
+        current (at body (:allowance-current paths))
+        ;; Approve ONLY when the vendor says the allowance is actually short. An
+        ;; unconditional approve costs the user a transaction they may not need;
+        ;; skipping a needed one makes the swap revert. When the vendor reports a
+        ;; spender but no current allowance, assume the worst (approve).
+        needs-approve? (and spender
+                            (or (nil? current)
+                                (not (re-matches #"\d+" (str/trim (str current))))
+                                (core/amount< (str current) sell-units)))
+        approve-step
+        (when needs-approve?
+          {:step/kind :erc20-approve
+           :step/why (str "the router (" spender ") needs an allowance for "
+                          (erc20/->display sell-units (get-in intent [:from :decimals]))
+                          " " (get-in intent [:from :symbol] "tokens"))
+           :chain (get-in intent [:from :chain])
+           :chain-id (get-in intent [:from :chain-id])
+           :to (get-in intent [:from :address])
+           :data (erc20/approve spender sell-units)
+           :value "0"})
+        swap-step
+        {:step/kind :evm-call
+         :step/why (str "swap " (erc20/->display sell-units (get-in intent [:from :decimals]))
+                        " " (get-in intent [:from :symbol] "")
+                        " for at least " (erc20/->display min-out (get-in intent [:to :decimals]))
+                        " " (get-in intent [:to :symbol] "")
+                        (when (pos? (or fee-bps 0))
+                          (str ", including a " (/ (double fee-bps) 100.0)
+                               "% fee to " fee-recipient)))
+         :chain (get-in intent [:to :chain])
+         :chain-id (get-in intent [:from :chain-id])
+         :to tx-to
+         :data tx-data
+         :value (str tx-value)
+         :gas (some-> (at body (:tx-gas paths)) str)}]
+    {:rail :aggregator
+     :provider id
+     :verified-adapter? (boolean (:verified? adapter))
+     :expected-out expected-out
+     :min-out min-out
+     :fee-bps (or fee-bps 0)
+     :fee-mechanism (:mechanism (fee/quote-fee intent :protocol-affiliate))
+     :expires-at nil                      ; these APIs are quote-per-request
+     :steps (vec (keep identity [approve-step swap-step]))
+     :raw body}))
