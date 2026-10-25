@@ -1,0 +1,275 @@
+;; wc -- POSIX wc (IEEE Std 1003.1) as a Kotoba command, for ONE operand.
+;;
+;;   wc FILE        lines, words and bytes
+;;   wc -l FILE     lines
+;;   wc -w FILE     words
+;;   wc -c FILE     bytes
+;;   ... | wc [-lwcm]  the same over standard input, no name column (wire 41,
+;;                  2026-09-16: 84% of wc's invocations in agent tool use are
+;;                  a later pipeline segment, 5,092 of 6,096 measured; the
+;;                  `wc -l | tr -d ' '` idiom alone is 2,273). Whole-input
+;;                  form; input past the string pool is refused, not counted
+;;                  short.
+;;
+;; ## The output format, measured rather than guessed
+;;
+;; macOS /usr/bin/wc prints each count as `" %7d"` -- one leading space and
+;; the number right-aligned in seven columns -- and then a space and the
+;; operand. Measured 2026-09-10: a count of 5 prints as eight characters
+;; (seven spaces then `5`), and 12345678 prints as nine (one space then the
+;; eight digits), which is what says the seven is a MINIMUM width and the
+;; leading space is unconditional. A fixed field of eight would have matched
+;; the first and not the second.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37).
+;;
+;; ## Fuel
+;;
+;; Counting words walks the operand one CODE POINT at a time, so the guest
+;; recursion is as long as the file. Fuel is a constant of the packaged
+;; binary (`--fuel`), not something the caller supplies -- like the grant,
+;; the scopes and the string arena. The default 512 counts almost nothing;
+;; package with a budget that matches the files you mean to count.
+(ns wc.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+;; Is PATH a file this command may read? Wire 35's EXISTS form answers "1" or
+;; "0"; a path outside the granted scope answers "0", which is what the read
+;; form would trap on.
+;;
+;; This has to be ASKED. The read form TRAPS on a path it cannot serve, and a
+;; trap cannot be caught, so there is no way to notice afterwards.
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; Left-pad to at least seven columns, then the unconditional leading space:
+;; `" %7d"`. Recursion depth is the padding, which is at most six.
+(defn pad-to [s :string width :i64] :string
+  (if (>= (string-byte-length s) width)
+    s
+    (pad-to (string-concat " " s) width)))
+
+(defn field [n :i64] :string
+  (string-concat " " (pad-to (decimal-of n) 7)))
+
+;; --- counting -----------------------------------------------------------
+
+;; Lines are NEWLINES, not "pieces": a file with no trailing newline has one
+;; fewer line than it has pieces of text, which is why `wc` answers 0 for a
+;; one-line file that does not end in one. Measured against /usr/bin/wc.
+(defn count-newlines-from [s :string pos :i64 n :i64 acc :i64] :i64
+  ;; One host search from POS (`string-index-of-from`, context ABI v8), no
+  ;; view; the needle literal is a handle each time it is evaluated, so
+  ;; the search is a region (arena-scope, ABI v6) and the walk carries only
+  ;; scalars.
+  (let [i (string-find-byte s 10 pos)]
+    (if (< i 0)
+      acc
+      (count-newlines-from s (+ i 1) n (+ acc 1)))))
+
+(defn count-newlines [s :string acc :i64] :i64
+  (count-newlines-from s 0 (string-byte-length s) acc))
+
+;; The UTF-8 width of the code point starting at byte offset I, derived from
+;; its VALUE -- the contract `string-code-point-at` states, and the only way
+;; to walk a string without constructing an offset that splits a code point.
+(defn cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+;; -m counts CODE POINTS, which is a different question from -c's bytes:
+;; measured, a file holding 日本語 plus a space, an `a` and a newline is 12
+;; bytes and 6 characters. The walk advances by the width the leading byte
+;; declares, the same step count-words takes.
+(defn count-chars [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (count-chars s (+ i (cp-width (string-code-point-at s i))) n (+ acc 1))))
+
+;; A word is a maximal run of non-blank, so the count is the number of such
+;; runs: skip the blanks to the run's start, find the blank that ends it,
+;; and again from there -- two host scans per word (`string-skip-blank` /
+;; `string-find-blank`, context ABI v7, 2026-09-16) where this was one
+;; guest call per CODE POINT. The blank set is the host's: space, \t, \n,
+;; \v, \f, \r -- the six `space?` named, and the six /usr/bin/wc splits
+;; on in the C locale (measured on the suite's tab and blank-line cases).
+(defn count-words [s :string i :i64 n :i64 acc :i64] :i64
+  (let [start (string-skip-blank s i)]
+    (if (>= start n)
+      acc
+      (let [end (string-find-blank s start)]
+        (if (< end 0)
+          (+ acc 1)
+          (count-words s end n (+ acc 1)))))))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; Each operand gets its own line, and TWO OR MORE get a `total` line after
+;; them. Measured against /usr/bin/wc 2026-09-10: an unreadable operand is
+;; reported, excluded from the totals, and makes the exit status 1 while the
+;; readable ones still print and still sum -- `wc h1 nope h2` totals 5, which
+;; is 3 + 2 and not 3 + 0 + 2.
+;;
+;; The totals come from a SECOND walk rather than from accumulators threaded
+;; through the first. Three sums plus the index, the operand count and the
+;; flag is seven parameters where the compiler admits five
+;; (`kotoba.compiler.frontend/max-parameters`, an ABI arity limit rather than
+;; a language decision), and a recursion can carry back only one i64 in any
+;; case. The cost is real and worth naming: with no flag each operand is read
+;; four times and its words counted twice. Words are two host scans per
+;; word since ABI v7, so the read is now the larger share. If the arity
+;; limit moves, this collapses into one walk.
+(defn metric-of [text :string which :i64] :i64
+  (if (= which 0)
+    (count-newlines text 0)
+    (if (= which 1)
+      (count-words text 0 (string-byte-length text) 0)
+      (if (= which 3)
+        (count-chars text 0 (string-byte-length text) 0)
+        (string-byte-length text)))))
+
+(defn sum-of [i :i64 total :string which :i64 acc :i64] :i64
+  (if (string=? (decimal-of i) total)
+    acc
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (sum-of (+ i 1) total which
+                (+ acc (metric-of (slurp-file path) which)))
+        (sum-of (+ i 1) total which acc)))))
+
+;; --- the flag ------------------------------------------------------------
+;; Derived, not threaded. It used to be a `flagged?` parameter carried through
+;; four functions, which is a value every one of them could have disagreed
+;; about; there is one argument vector and one answer.
+(defn flag [] :string
+  (let [a (arg "0")]
+    (if (= (string-index-of a "-") 0) a "")))
+
+(defn flagged? [] :i64
+  (let [f (flag)]
+    (if (string=? f "-l") 1
+      (if (string=? f "-w") 1
+        (if (string=? f "-c") 1
+          (if (string=? f "-m") 1 0))))))
+
+;; The fields, in wc's order, for whichever the flag selects. With no flag it
+;; is lines, words and BYTES -- never characters, which only -m asks for.
+(defn fields-of [lines :i64 words :i64 bytes :i64 chars :i64] :i64
+  (if (= (flagged?) 1)
+    (let [f (flag)]
+      (do
+        (if (string=? f "-l") (emit (field lines)) "")
+        (if (string=? f "-w") (emit (field words)) "")
+        (if (string=? f "-c") (emit (field bytes)) "")
+        (if (string=? f "-m") (emit (field chars)) "")
+        0))
+    (do (emit (field lines)) (emit (field words)) (emit (field bytes)) 0)))
+
+;; Each count is taken only when it is going to be printed. The word walk is
+;; one guest call per code point and so is the character walk, which on a
+;; large operand is the whole cost of the command -- computing either for `-c`
+;; would make the cheapest question the most expensive one.
+;; The counts of TEXT, then whatever follows them on the line: ` PATH` for
+;; an operand, nothing for standard input -- measured, `wc` on stdin prints
+;; the fields and the newline only.
+(defn print-text [text :string tail :string] :i64
+  (let [bytes (string-byte-length text)
+        f (flag)
+        on? (= (flagged?) 1)
+        words (if (if on? (string=? f "-w") true)
+                (count-words text 0 bytes 0)
+                0)
+        lines (if (if on? (string=? f "-l") true)
+                (count-newlines text 0)
+                0)
+        chars (if (if on? (string=? f "-m") false) (count-chars text 0 bytes 0) 0)]
+    (do
+      (fields-of lines words bytes chars)
+      (emit tail)
+      (emit (nl))
+      0)))
+
+(defn print-one [path :string] :i64
+  (print-text (slurp-file path) (string-concat " " path)))
+
+;; `wc: PATH: open: No such file or directory` -- wc says `open:` and the
+;; others do not. Measured, not copied from a sibling.
+(defn complain [path :string] :i64
+  (do
+    (emit-error "wc: ")
+    (emit-error path)
+    (emit-error ": open: No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; Returns 1 if any operand was unreadable. The walk continues past one.
+(defn print-each [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    0
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do (print-one path) (print-each (+ i 1) total))
+        (do (complain path) (print-each (+ i 1) total) 1)))))
+
+(defn print-total [i :i64 total :string] :i64
+  (do
+    (fields-of (sum-of i total 0 0) (sum-of i total 1 0)
+               (sum-of i total 2 0) (sum-of i total 3 0))
+    (emit " total")
+    (emit (nl))
+    0))
+
+(defn main [] :i64
+  (let [total (arg "")
+        first-file (if (= (flagged?) 1) 1 0)
+        files (- (parse-count total) first-file)]
+    (if (< files 1)
+      ;; No file operand: standard input, whole, and no name column.
+      (print-text (stdin "") "")
+      (let [failed (print-each first-file total)]
+        (do
+          (if (> files 1) (print-total first-file total) 0)
+          failed)))))
