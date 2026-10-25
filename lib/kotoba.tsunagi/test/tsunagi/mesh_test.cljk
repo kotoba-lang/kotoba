@@ -1,0 +1,96 @@
+(ns tsunagi.mesh-test
+  "A four-node line, run entirely in memory:
+
+      alice ─r─a─ relay-a ─b─a─ relay-b ─b─r─ bob
+
+  Leaves do not relay; the two relays do."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [tsunagi.transport :as t]
+            [tsunagi.identity :as id]
+            [tsunagi.link :as link]
+            [tsunagi.packet :as p]
+            [tsunagi.wire :as w]
+            [tsunagi.fixtures :refer [alice bob relay-a relay-b seed]]))
+
+(def wires
+  {[:alice :r] [[:relay-a :a]]
+   [:relay-a :a] [[:alice :r] [:carol :r]]
+   [:carol :r] [[:relay-a :a]]
+   [:relay-a :b] [[:relay-b :a]]
+   [:relay-b :a] [[:relay-a :b]]
+   [:relay-b :b] [[:bob :r]]
+   [:bob :r] [[:relay-b :b]]})
+
+(defn- world []
+  {:nodes {:alice (t/node {:identity alice :interfaces #{:r}})
+           :bob (t/node {:identity bob :interfaces #{:r}})
+           :relay-a (t/node {:identity relay-a :transport? true :interfaces #{:a :b}})
+           :relay-b (t/node {:identity relay-b :transport? true :interfaces #{:a :b}})}
+   :queue []
+   :events []})
+
+(defn- apply-effects [w from effects]
+  (reduce (fn [w e]
+            (if (= :send (:effect e))
+              (update w :queue into (for [[to iface] (get wires [from (:interface e)])
+                                          :when (get-in w [:nodes to])]
+                                      [to iface (:bytes e)]))
+              (update w :events conj (assoc e :at from))))
+          w effects))
+
+(defn- run [w]
+  (loop [w w steps 0]
+    (if (or (empty? (:queue w)) (> steps 500))
+      w
+      (let [[[to iface bs] & more] (:queue w)
+            {:keys [node effects]} (t/inbound (get-in w [:nodes to]) iface bs 100)]
+        (recur (apply-effects (assoc (assoc-in w [:nodes to] node) :queue (vec more)) to effects)
+               (inc steps))))))
+
+(defn- originate [w who f]
+  (let [{:keys [node effects]} (f (get-in w [:nodes who]))]
+    (run (apply-effects (assoc-in w [:nodes who] node) who effects))))
+
+(defn- events [w who effect]
+  (filterv #(and (= who (:at %)) (= effect (:effect %))) (:events w)))
+
+(def bob-dest (id/destination-hash bob "denwa.call"))
+
+(deftest announce-propagation
+  (let [w (originate (world) :bob #(t/announce % bob "denwa.call" {:random [1 1 1 1 1]} 100))]
+    (testing "every node learns the path, with hop counts that grow by one"
+      (is (= 1 (:hops (t/path (get-in w [:nodes :relay-b]) bob-dest))))
+      (is (= 2 (:hops (t/path (get-in w [:nodes :relay-a]) bob-dest))))
+      (is (= 3 (:hops (t/path (get-in w [:nodes :alice]) bob-dest)))))
+    (testing "alice's next hop is relay-a, relay-b's is bob himself"
+      (is (= (:hash relay-a) (:next-hop (t/path (get-in w [:nodes :alice]) bob-dest))))
+      (is (nil? (:next-hop (t/path (get-in w [:nodes :relay-b]) bob-dest)))))
+    (testing "alice knows bob's key from the announce alone"
+      (is (= (:public bob) (:public (t/known-identity (get-in w [:nodes :alice]) bob-dest)))))))
+
+(deftest link-across-the-mesh
+  (let [w (originate (world) :bob #(t/announce % bob "denwa.call" {:random [1 1 1 1 1]} 100))
+        peer (t/known-identity (get-in w [:nodes :alice]) bob-dest)
+        [li req] (link/request peer bob-dest (seed 30))
+        w (update-in w [:nodes :alice] t/track-link (:link-id li))
+        w (originate w :alice #(t/outbound % req 100))
+        delivered (:packet (first (events w :bob :deliver)))]
+    (is (= :link-request (:packet-type delivered)))
+    (let [[lr proof] (link/accept bob delivered (seed 31))
+          w (update-in w [:nodes :bob] t/track-link (:link-id lr))
+          w (originate w :bob #(t/outbound % proof 100))
+          proof-at-alice (:packet (last (events w :alice :deliver)))
+          li (link/complete li proof-at-alice)]
+      (is (= :active (:status li)))
+      (let [[_ data] (link/seal li :call (w/utf8 "INVITE"))
+            w (originate w :alice #(t/outbound % data 100))
+            got (:packet (last (events w :bob :deliver)))]
+        (is (= "INVITE" (w/utf8-str (second (link/open lr got)))))))))
+
+(deftest path-request
+  (let [w (originate (world) :bob #(t/announce % bob "denwa.call" {:random [1 1 1 1 1]} 100))
+        carol (id/from-seed (seed 5))
+        w (assoc-in w [:nodes :carol] (t/node {:identity carol :interfaces #{:r}}))
+        w (originate w :carol #(t/request-path % bob-dest (vec (range 16)) 100))]
+    (testing "a late joiner learns the path from a relay's cache"
+      (is (= 3 (:hops (t/path (get-in w [:nodes :carol]) bob-dest)))))))

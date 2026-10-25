@@ -1,0 +1,157 @@
+(ns tsunagi.message
+  "Signed, encrypted, store-and-forward messages, plus a propagation store.
+
+  A missed call's voicemail, a text, or a ring for a phone that is out of
+  range all travel this way: a relay holds the message until the recipient
+  comes back.
+
+      message  = destination (16) ++ source public key (64) ++ signature (64) ++ body
+      body     = timestamp seconds (u32) ++ title (lp8) ++ content (lp16) ++ fields (lp16)
+      id       = SHA-256(destination ++ source public key ++ body)
+      envelope = destination (16) ++ stamp (lp8) ++ token(encrypted to destination identity, message)
+
+  The source key is inside the message, so the recipient verifies the
+  signature without having heard the sender's announce. The envelope exposes
+  only the destination and the stamp — a relay learns who a message is for,
+  not who sent it nor what it says.
+
+  `fields` are application bytes (yobidashi puts a voicemail's codec frames
+  there). The `stamp` is opaque to tsunagi: the propagation store takes an
+  `:admit?` predicate, which is where monban's proof-of-work check plugs in."
+  (:require [tsunagi.crypto :as c]
+            [tsunagi.identity :as id]
+            [tsunagi.wire :as w]))
+
+(defn- body-bytes [{:keys [timestamp title content fields]}]
+  (w/cat-bytes (w/u32 (or timestamp 0))
+               (w/lp8 (w/utf8 (or title "")))
+               (w/lp16 (w/utf8 (or content "")))
+               (w/lp16 (or fields []))))
+
+(defn pack
+  "Signed message bytes from `source` (private identity) to `destination`."
+  [source destination msg]
+  (let [body (body-bytes msg)
+        sig (id/sign source (w/cat-bytes destination (:public source) body))]
+    (w/cat-bytes destination (:public source) sig body)))
+
+(defn message-id [packed]
+  (let [v (vec packed)]
+    (c/sha256 (w/cat-bytes (subvec v 0 80) (subvec v 144)))))
+
+(defn unpack
+  "Verified message map, or nil."
+  [packed]
+  (let [cur (w/cursor packed)]
+    (when-let [[dest cur] (w/take-bytes cur 16)]
+      (when-let [[public cur] (w/take-bytes cur 64)]
+        (when-let [[sig cur] (w/take-bytes cur 64)]
+          (let [[body _] (w/take-rest cur)
+                source (id/public-only public)
+                bc (w/cursor body)]
+            (when (and source (id/verify source (w/cat-bytes dest public body) sig))
+              (when-let [[ts bc] (w/take-u32 bc)]
+                (when-let [[title bc] (w/take-lp8 bc)]
+                  (when-let [[content bc] (w/take-lp16 bc)]
+                    (when-let [[fields bc] (w/take-lp16 bc)]
+                      (when (w/done? bc)
+                        {:id (message-id packed)
+                         :destination dest
+                         :source source
+                         :timestamp ts
+                         :title (w/utf8-str title)
+                         :content (w/utf8-str content)
+                         :fields fields}))))))))))))
+
+(defn seal
+  "An envelope for `recipient` (public identity), optionally carrying a stamp."
+  ([recipient destination packed] (seal recipient destination packed []))
+  ([recipient destination packed stamp]
+   (w/cat-bytes destination (w/lp8 stamp) (id/encrypt recipient packed))))
+
+(defn envelope-parts
+  "`{:destination … :stamp … :token …}` or nil."
+  [envelope]
+  (let [cur (w/cursor envelope)]
+    (when-let [[dest cur] (w/take-bytes cur 16)]
+      (when-let [[stamp cur] (w/take-lp8 cur)]
+        (let [[token _] (w/take-rest cur)]
+          {:destination dest :stamp stamp :token token})))))
+
+(defn stamp-target
+  "The bytes a stamp is computed over: everything but the stamp."
+  [{:keys [destination token]}]
+  (c/sha256 (w/cat-bytes destination token)))
+
+(defn open-envelope
+  "Decrypt and verify an envelope addressed to one of `identity`'s
+  destinations. Answers the message map or nil."
+  [identity envelope]
+  (when-let [{:keys [destination token]} (envelope-parts envelope)]
+    (when-let [packed (id/decrypt identity token)]
+      (when-let [m (unpack packed)]
+        (when (w/bytes-eq? destination (:destination m)) m)))))
+
+;; ---------------------------------------------------------------------------
+;; Propagation store
+
+(defn store
+  "An empty propagation store. `:admit?` gets the envelope parts and answers
+  whether to accept them (stamp check, size limits); `:per-destination` caps
+  how many envelopes one recipient may have waiting; `:ttl` is in seconds."
+  [{:keys [admit? per-destination ttl]
+    :or {admit? (constantly true) per-destination 64 ttl (* 7 24 3600)}}]
+  {:admit? admit? :per-destination per-destination :ttl ttl :held {}})
+
+(defn deposit
+  "Accept an envelope. Answers `[store status]`, status one of :stored,
+  :duplicate, :rejected, :full, :malformed."
+  [st envelope now]
+  (if-let [parts (envelope-parts envelope)]
+    (let [dk (w/hex (:destination parts))
+          eid (w/hex (c/sha256 envelope))
+          held (get-in st [:held dk] [])]
+      (cond
+        (some #(= eid (:id %)) held) [st :duplicate]
+        (not ((:admit? st) parts)) [st :rejected]
+        (>= (count held) (:per-destination st)) [st :full]
+        :else [(assoc-in st [:held dk] (conj held {:id eid :envelope (vec envelope)
+                                                   :expires (+ now (:ttl st))}))
+               :stored]))
+    [st :malformed]))
+
+(defn fetch-request
+  "A request proving ownership of `destination` — signed by its identity, so
+  a stranger cannot drain someone else's mailbox."
+  [identity destination now]
+  (let [m (w/cat-bytes destination (w/u32 now))]
+    (w/cat-bytes m (:public identity) (id/sign identity m))))
+
+(defn fetch
+  "Envelopes waiting for the destination named in a valid fetch request.
+  The requester must own the destination: its identity, under `app-name`,
+  must hash to it. Requests older than `max-age` seconds are refused to stop
+  replays. Answers `[store envelopes-or-nil]`; the store forgets what it
+  hands out."
+  ([st request app-name now] (fetch st request app-name now 300))
+  ([st request app-name now max-age]
+   (let [cur (w/cursor request)
+         [dest cur] (or (w/take-bytes cur 16) [nil nil])
+         [ts cur] (or (and cur (w/take-u32 cur)) [nil nil])
+         [public cur] (or (and cur (w/take-bytes cur 64)) [nil nil])
+         [sig cur] (or (and cur (w/take-bytes cur 64)) [nil nil])
+         ident (and public (id/public-only public))]
+     (if (and ident sig (w/done? cur)
+              (<= (- max-age) (- now ts) max-age)
+              (w/bytes-eq? dest (id/destination-hash ident app-name))
+              (id/verify ident (w/cat-bytes dest (w/u32 ts)) sig))
+       (let [dk (w/hex dest)
+             live (filterv #(> (:expires %) now) (get-in st [:held dk] []))]
+         [(update st :held dissoc dk) (mapv :envelope live)])
+       [st nil]))))
+
+(defn expire [st now]
+  (update st :held (fn [h] (into {} (keep (fn [[k v]]
+                                            (let [v (filterv #(> (:expires %) now) v)]
+                                              (when (seq v) [k v]))))
+                                 h))))

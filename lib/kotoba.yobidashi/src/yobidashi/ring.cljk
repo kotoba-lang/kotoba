@@ -1,0 +1,118 @@
+(ns yobidashi.ring
+  "The ring: the few bytes that wake a phone.
+
+  Sent by the callee's **home node**, not by the caller — the home node has
+  already checked the caller (monban), so the device does no policy work and
+  wakes only for calls that passed.
+
+      plaintext = version (1) ++ call id (8) ++ expires (u32 s) ++ verdict (1)
+               ++ caller root hash (16) ++ callback destination (16) ++ bearers (1)
+               ++ signature (64)   home node, over \"yobidashi/ring\" ++ page destination ++ all above
+      packet    = destination: device page destination, context :page,
+                  payload: tsunagi single-packet encryption of plaintext to the device
+
+  About 180 bytes on air — one LoRa frame. A relay sees only the page
+  destination; who is calling, and from where, is inside the encryption.
+
+  The device answers with an **ack**, encrypted to the home node and signed
+  by the device, which stops the home node paging the user's other devices.
+
+  `wake-frame` is what a LoRa companion hands the phone over BLE: just enough
+  for the phone to show who is calling and bring up a faster bearer."
+  (:require [tsunagi.identity :as id]
+            [tsunagi.wire :as w]))
+
+(def version 1)
+(def page-app "yobidashi.page")
+(def home-app "yobidashi.home")
+
+(def verdicts {:ring 0 :screen 1})
+(def verdict-of {0 :ring 1 :screen})
+(def bearer-bits {:mesh 1 :wifi 2 :lte 4 :internet 8 :lora 16})
+(def ack-statuses {:ringing 0 :accepted 1 :declined 2 :busy 3})
+(def ack-status-of (into {} (map (fn [[k v]] [v k])) ack-statuses))
+
+(defn bearers->byte [bs] (reduce + 0 (map #(get bearer-bits % 0) (set bs))))
+(defn byte->bearers [b] (set (keep (fn [[k v]] (when (pos? (bit-and b v)) k)) bearer-bits)))
+
+(defn- body [{:keys [call-id expires verdict caller-root-hash callback bearers]}]
+  (w/cat-bytes [version] call-id (w/u32 expires) [(get verdicts verdict 0)]
+               caller-root-hash callback [(bearers->byte bearers)]))
+
+(defn- ring-signed-bytes [page-destination b]
+  (w/cat-bytes (w/utf8 "yobidashi/ring") page-destination b))
+
+(defn build
+  "A ring packet map from `home` (private identity) to `device` (public
+  identity of the callee's device)."
+  ([home device ring] (build home device ring nil))
+  ([home device ring ephemeral-secret]
+   (let [page-dest (id/destination-hash device page-app)
+         b (body ring)
+         pt (w/cat-bytes b (id/sign home (ring-signed-bytes page-dest b)))]
+     {:packet-type :data :destination-type :single :destination page-dest :context :page
+      :payload (if ephemeral-secret
+                 (id/encrypt device pt ephemeral-secret)
+                 (id/encrypt device pt))})))
+
+(defn open
+  "The ring map, if this packet is a ring for `device` (private identity)
+  signed by `home` (public identity) and not expired at `now`. nil otherwise."
+  [device home {:keys [destination payload context]} now]
+  (when (= :page context)
+    (when-let [pt (id/decrypt device payload)]
+      (let [cur (w/cursor pt)]
+        (when-let [[[v] cur] (w/take-bytes cur 1)]
+          (when (= version v)
+            (let [[call-id cur] (w/take-bytes cur 8)
+                  [expires cur] (w/take-u32 cur)
+                  [verdict cur] (w/take-u8 cur)
+                  [caller cur] (w/take-bytes cur 16)
+                  [callback cur] (w/take-bytes cur 16)
+                  [bearers cur] (w/take-u8 cur)
+                  [sig cur] (w/take-bytes cur 64)]
+              (when (and sig (w/done? cur)
+                         (id/verify home (ring-signed-bytes destination (subvec (vec pt) 0 47)) sig)
+                         (< now expires))
+                {:call-id call-id :expires expires :verdict (verdict-of verdict)
+                 :caller-root-hash caller :callback callback
+                 :bearers (byte->bearers bearers)}))))))))
+
+;; ---------------------------------------------------------------------------
+;; Ack
+
+(defn ack
+  "The device's answer to a ring, encrypted to the home node."
+  [device home call-id status]
+  (let [m (w/cat-bytes call-id [(get ack-statuses status)] (:public device))
+        sig (id/sign device (w/cat-bytes (w/utf8 "yobidashi/ack") m))]
+    {:packet-type :data :destination-type :single
+     :destination (id/destination-hash home home-app) :context :page-ack
+     :payload (id/encrypt home (w/cat-bytes m sig))}))
+
+(defn open-ack
+  "`{:call-id … :status … :device public-identity}` or nil."
+  [home {:keys [payload context]}]
+  (when (= :page-ack context)
+    (when-let [pt (id/decrypt home payload)]
+      (when (= (+ 8 1 64 64) (count pt))
+        (let [pt (vec pt)
+              m (subvec pt 0 73)
+              dev (id/public-only (subvec pt 9 73))]
+          (when (and dev (id/verify dev (w/cat-bytes (w/utf8 "yobidashi/ack") m) (subvec pt 73)))
+            {:call-id (subvec pt 0 8)
+             :status (ack-status-of (nth pt 8))
+             :device dev}))))))
+
+;; ---------------------------------------------------------------------------
+;; BLE wake frame (companion radio → phone)
+
+(defn wake-frame
+  "28 bytes: magic 'YB', version, call id, caller root hash, flags."
+  [{:keys [call-id caller-root-hash]}]
+  (w/cat-bytes [0x59 0x42 version] call-id caller-root-hash [0]))
+
+(defn parse-wake-frame [bs]
+  (let [bs (vec bs)]
+    (when (and (= 28 (count bs)) (= [0x59 0x42 version] (subvec bs 0 3)))
+      {:call-id (subvec bs 3 11) :caller-root-hash (subvec bs 11 27)})))

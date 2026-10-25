@@ -1,0 +1,151 @@
+(ns monban.policy
+  "Whether an incoming call may ring. Evaluated on the callee's home node,
+  before the callee's phone is woken — a rejected call costs the callee no
+  battery and no attention.
+
+  ## The ladder
+
+      on a subscribed blocklist                 → :reject
+      in the callee's contacts                  → :ring
+      contact of a contact (vouched)            → :ring     (shown as \"via …\")
+      introduced by a contact                   → :ring     (shown as \"introduced by …\")
+      member of a trusted community, in quota   → :ring
+      unknown, with enough stamp work or stake  → :screen   (voicemail / AI screening first)
+      unknown, nothing paid                     → :voicemail, or :reject if voicemail is off
+
+  Every rung that admits a caller is also rate limited per caller (a token
+  bucket on the home node), so even a contact's stolen phone cannot dial the
+  callee a hundred times.
+
+  No global reputation exists. Blocklists are statements published by people
+  or groups the callee chose to subscribe to; reports are statements the
+  callee publishes. Who to believe stays the callee's decision."
+  (:require [nafuda.statement :as st]
+            [monban.stamp :as stamp]))
+
+;; ---------------------------------------------------------------------------
+;; Signed social statements
+
+(defn vouch
+  "`voucher` says they know `subject` (published to their contacts)."
+  [voucher subject-hex issued-at]
+  (st/sign voucher {:nafuda/kind :vouch :nafuda/subject subject-hex :nafuda/issued-at issued-at}))
+
+(defn introduction
+  "`introducer` vouches for `caller-hex` calling `callee-hex`, until `not-after`."
+  [introducer caller-hex callee-hex not-after]
+  (st/sign introducer {:nafuda/kind :introduction
+                       :nafuda/subject caller-hex
+                       :nafuda/callee callee-hex
+                       :nafuda/not-after not-after}))
+
+(defn report
+  "`reporter` says `subject-hex` placed an abusive call."
+  [reporter subject-hex reason issued-at]
+  (st/sign reporter {:nafuda/kind :report :nafuda/subject subject-hex
+                     :nafuda/reason reason :nafuda/issued-at issued-at}))
+
+(defn blocklist
+  "A publisher's list of identities they advise rejecting."
+  [publisher subject-hexes issued-at]
+  (st/sign publisher {:nafuda/kind :blocklist :nafuda/entries (set subject-hexes)
+                      :nafuda/issued-at issued-at}))
+
+(defn- kind? [s k] (= k (get-in s [:statement :nafuda/kind])))
+(defn- signer [s] (get-in s [:statement :nafuda/signer]))
+
+(defn blocked-by
+  "Publishers among `subscriptions` whose latest list names `caller`."
+  [subscriptions lists caller]
+  (let [latest (->> lists
+                    (filter #(kind? % :blocklist))
+                    (filter #(contains? subscriptions (signer %)))
+                    (filter st/valid?)
+                    (group-by signer)
+                    (map (fn [[_ ls]] (last (sort-by #(get-in % [:statement :nafuda/issued-at]) ls)))))]
+    (set (keep #(when (contains? (get-in % [:statement :nafuda/entries]) caller) (signer %)) latest))))
+
+;; ---------------------------------------------------------------------------
+;; Rate limiting
+
+(defn bucket-take
+  "Token bucket per caller: `rate` tokens per hour, at most `burst`.
+  Answers `[buckets allowed?]`."
+  [buckets caller now {:keys [rate burst]}]
+  (let [{:keys [tokens at] :or {tokens burst at now}} (get buckets caller)
+        refilled (min burst (+ tokens (* rate (/ (- now at) 3600))))]
+    (if (>= refilled 1)
+      [(assoc buckets caller {:tokens (dec refilled) :at now}) true]
+      [(assoc buckets caller {:tokens refilled :at now}) false])))
+
+;; ---------------------------------------------------------------------------
+;; Decision
+
+(def default-config
+  {:contacts #{}            ; caller hexes the callee knows
+   :vouches []              ; vouch statements from contacts
+   :communities #{}         ; registry hexes whose members may ring
+   :subscriptions #{}       ; blocklist publisher hexes
+   :stamp-cost 16           ; bits demanded from an unknown caller
+   :postage 1               ; units of credit an unknown caller may stake instead
+   :voicemail? true
+   :limits {:known {:rate 30 :burst 10}
+            :community {:rate 4 :burst 2}
+            :unknown {:rate 2 :burst 1}}})
+
+(defn decide
+  "The verdict for one call attempt. `attempt`:
+
+      {:caller hex                      ; verified caller root (from the ring)
+       :now seconds
+       :stamp-target bytes :stamp bytes ; optional
+       :postage-held? bool              ; a monban.postage hold succeeded
+       :introductions [statements]
+       :memberships [registry claims about the caller]
+       :blocklists [statements]}
+
+  Answers `{:verdict … :reason … :state state'}`; `state` holds the rate
+  buckets and is threaded between calls."
+  [config state {:keys [caller now stamp-target stamp postage-held? introductions
+                        memberships blocklists]}]
+  (let [cfg (merge default-config config)
+        contacts (set (:contacts cfg))
+        rung (fn [verdict reason tier]
+               (let [[buckets ok?] (bucket-take (get state :buckets {}) [tier caller] now
+                                                (get-in cfg [:limits tier]))]
+                 {:verdict (if ok? verdict (if (:voicemail? cfg) :voicemail :reject))
+                  :reason (if ok? reason :rate-limited)
+                  :state (assoc state :buckets buckets)}))
+        blocked (blocked-by (set (:subscriptions cfg)) blocklists caller)
+        vouched-by (->> (:vouches cfg)
+                        (filter #(kind? % :vouch))
+                        (filter #(contains? contacts (signer %)))
+                        (filter #(= caller (get-in % [:statement :nafuda/subject])))
+                        (filter st/valid?)
+                        (map signer) first)
+        introduced-by (->> introductions
+                           (filter #(kind? % :introduction))
+                           (filter #(contains? contacts (signer %)))
+                           (filter #(= caller (get-in % [:statement :nafuda/subject])))
+                           (filter #(= (:callee cfg) (get-in % [:statement :nafuda/callee])))
+                           (filter #(st/in-force? % now))
+                           (filter st/valid?)
+                           (map signer) first)
+        member-of (->> memberships
+                       (filter #(kind? % :name))
+                       (filter #(contains? (:communities cfg) (signer %)))
+                       (filter #(= caller (get-in % [:statement :nafuda/subject])))
+                       (filter #(st/in-force? % now))
+                       (filter st/valid?)
+                       (map #(get-in % [:statement :nafuda/community])) first)
+        paid? (or postage-held?
+                  (and stamp stamp-target (stamp/valid? stamp-target stamp (:stamp-cost cfg))))]
+    (cond
+      (seq blocked) {:verdict :reject :reason [:blocklisted blocked] :state state}
+      (contains? contacts caller) (rung :ring :contact :known)
+      vouched-by (rung :ring [:vouched-by vouched-by] :known)
+      introduced-by (rung :ring [:introduced-by introduced-by] :known)
+      member-of (rung :ring [:community member-of] :community)
+      paid? (rung :screen (if postage-held? :postage :stamp) :unknown)
+      (:voicemail? cfg) {:verdict :voicemail :reason :unknown-caller :state state}
+      :else {:verdict :reject :reason :unknown-caller :state state})))

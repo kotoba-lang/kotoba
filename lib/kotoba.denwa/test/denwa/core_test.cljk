@@ -1,0 +1,113 @@
+(ns denwa.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [denwa.signal :as sig]
+            [denwa.media :as media]
+            [denwa.pcmu :as pcmu]
+            [denwa.bearer :as bearer]
+            [denwa.call :as call]
+            [nafuda.core :as n]
+            [tsunagi.identity :as id]
+            [tsunagi.packet :as p]))
+
+(defn- seed [k] (vec (map #(bit-and (+ k (* 19 %)) 0xff) (range 32))))
+(def callee-root (id/from-seed (seed 1)))
+(def callee-phone (id/from-seed (seed 2)))
+(def caller-phone (id/from-seed (seed 3)))
+(def impostor (id/from-seed (seed 4)))
+(def callee-statements
+  [(n/device-cert callee-root callee-phone {:roles #{:call :page} :serial 1})])
+
+(deftest signal-test
+  (doseq [m [{:type :answer :codecs [:pcmu :lpc-1200] :frame-ms 40}
+             {:type :accept :codec :lpc-1200 :frame-ms 200}
+             {:type :bye :reason :busy}
+             {:type :hold :hold? true}
+             {:type :ping}]]
+    (let [m (assoc m :call-id [1 2 3 4 5 6 7 8])]
+      (is (= m (sig/decode (sig/encode m))))))
+  (is (nil? (sig/decode [9 1 2 3 4 5 6 7 8]))))
+
+(deftest pcmu-test
+  (testing "ITU reference points"
+    (is (= 0xFF (pcmu/encode-sample 0)))
+    (is (= 0x80 (pcmu/encode-sample 32767)))
+    (is (= 0x00 (pcmu/encode-sample -32768))))
+  (testing "round trip stays within one quantisation step"
+    (doseq [x [-30000 -1000 -100 -1 0 1 100 1000 8000 30000]]
+      (let [y (pcmu/decode-sample (pcmu/encode-sample x))
+            tol (max 8 (quot (if (neg? x) (- x) x) 16))]
+        (is (<= (- tol) (- x y) tol) (str x " -> " y))))))
+
+(deftest jitter-test
+  (let [frames (for [s (range 10)] {:seq s :timestamp (* s 320) :codec-id 0 :payload [s]})
+        ;; arrive out of order, one lost (5), one duplicated (3)
+        order [0 2 1 3 3 4 6 7 8 9]
+        jb (reduce (fn [jb s] (media/push jb (nth frames s) (* 40 s))) (media/jitter-buffer {:frame-ms 40 :min-frames 2}) order)
+        [jb outs] (reduce (fn [[jb acc] _] (let [[jb o] (media/pop-frame jb)] [jb (conj acc o)]))
+                          [jb []] (range 10))]
+    (is (= [0 1 2 3 4 :conceal 6 7 8 9] (mapv #(if (map? %) (:seq %) %) outs)))
+    (is (= 1 (get-in jb [:stats :duplicate])))
+    (is (= 1 (get-in jb [:stats :concealed]))))
+  (testing "sequence numbers wrap"
+    (is (= 1 (media/seq-diff 0 65535)))
+    (is (= -1 (media/seq-diff 65535 0)))))
+
+(deftest bearer-test
+  (testing "wifi gets full-duplex PCMU; LoRa gets push-to-talk LPC"
+    (is (= {:bearer :wifi :codec :pcmu :frame-ms 20 :mode :duplex}
+           (bearer/choose #{:wifi :lora} [:pcmu :lpc-1200])))
+    (is (= {:bearer :lora :codec :lpc-1200 :frame-ms 200 :mode :push-to-talk}
+           (bearer/choose #{:lora} [:pcmu :lpc-1200])))
+    (is (nil? (bearer/choose #{:lora} [:pcmu]))))
+  (testing "LoRa airtime of a 180-byte ring: ~0.29 s at SF7, ~0.92 s at SF9 (125 kHz)"
+    (is (< 280 (bearer/airtime-ms 180 {:sf 7}) 300))
+    (is (< 900 (bearer/airtime-ms 180 {:sf 9}) 950)))
+  (is (= 350 (bearer/budget-left [{:at-ms 0 :airtime-ms 10000}] 1000))))
+
+(defn- wire [pkt] (p/decode (p/encode pkt)))
+
+(defn- run-call [answering-identity]
+  (let [callback (id/destination-hash caller-phone call/callback-app)
+        c0 (call/caller {:identity caller-phone :call-id [1 2 3 4 5 6 7 8]
+                         :callee-root (n/hex-of callee-root) :callee-statements callee-statements
+                         :codecs [:pcmu :lpc-1200] :bearers #{:wifi} :now 0})
+        {e0 :call [req] :packets} (call/callee {:identity answering-identity
+                                                :ring {:call-id [1 2 3 4 5 6 7 8] :callback callback :bearers #{:wifi}}
+                                                :caller-device (id/public-only (:public caller-phone))
+                                                :now 0}
+                                               (seed 40))
+        {c1 :call [proof] :packets} (call/step c0 {:type :packet :packet (wire req)} 10)
+        {e1 :call [idp ans] :packets} (call/step e0 {:type :packet :packet (wire proof)} 20)
+        {c2 :call} (call/step c1 {:type :packet :packet (wire idp)} 30)
+        r (call/step c2 {:type :packet :packet (wire ans)} 40)]
+    {:caller (:call r) :callee e1 :answer-out r}))
+
+(deftest call-flow-test
+  (let [{:keys [caller callee answer-out]} (run-call callee-phone)
+        [acc] (:packets answer-out)
+        {callee :call notify :notify} (call/step callee {:type :packet :packet (wire acc)} 50)]
+    (testing "both ends active on the codec the bearer allows"
+      (is (= :active (:status caller)))
+      (is (= :active (:status callee)))
+      (is (= :pcmu (:codec caller) (:codec callee)))
+      (is (= [{:notify :connected :codec :pcmu}] notify)))
+    (testing "media flows callee → caller into the jitter buffer"
+      (let [samples (vec (range -800 800 10))
+            {callee :call [m1] :packets} (call/step callee {:type :audio :timestamp 0 :payload (pcmu/encode samples)} 60)
+            {callee :call [m2] :packets} (call/step callee {:type :audio :timestamp 160 :payload (pcmu/encode samples)} 80)
+            caller (:call (call/step caller {:type :packet :packet (wire m1)} 90))
+            caller (:call (call/step caller {:type :packet :packet (wire m2)} 110))
+            [caller f] (call/play caller)]
+        (is (= 0 (:seq f)))
+        (is (= (pcmu/encode samples) (:payload f)))
+        (testing "hang-up reaches the other side"
+          (let [{[bye] :packets} (call/step callee {:type :hangup} 200)
+                {caller :call notify :notify} (call/step caller {:type :packet :packet (wire bye)} 210)]
+            (is (= :ended (:status caller)))
+            (is (= [{:notify :ended :reason :normal}] notify))))))))
+
+(deftest impostor-test
+  (testing "a device the callee's root never certified cannot answer the call"
+    (let [{:keys [caller]} (run-call impostor)]
+      (is (= :ended (:status caller)))
+      (is (= :callee-not-verified (:end-reason caller))))))

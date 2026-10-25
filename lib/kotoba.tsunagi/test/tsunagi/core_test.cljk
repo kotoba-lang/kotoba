@@ -1,0 +1,125 @@
+(ns tsunagi.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [tsunagi.wire :as w]
+            [tsunagi.identity :as id]
+            [tsunagi.packet :as p]
+            [tsunagi.announce :as ann]
+            [tsunagi.link :as link]
+            [tsunagi.message :as msg]
+            [tsunagi.resource :as res]
+            [tsunagi.fixtures :refer [alice bob seed]]))
+
+(deftest wire-test
+  (testing "integers round-trip at their widths, including values ClojureScript shifts would sign"
+    (doseq [n [0 1 255 256 65535 4294967295 (+ 4294967295 12345)]]
+      (when (<= n 4294967295)
+        (is (= n (first (w/take-u32 (w/cursor (w/u32 n)))))))
+      (is (= n (first (w/take-u48 (w/cursor (w/u48 n))))))))
+  (testing "a short input decodes to nil, never throws"
+    (is (nil? (w/take-u32 (w/cursor [1 2 3]))))
+    (is (nil? (w/take-lp8 (w/cursor [5 1 2]))))))
+
+(deftest identity-test
+  (testing "derivation is deterministic and the address is self-certifying"
+    (is (= (:public alice) (:public (id/from-seed (seed 1)))))
+    (is (= 16 (count (:hash alice))))
+    (is (= (id/destination-hash alice "denwa.call")
+           (id/destination-hash (id/public-only (:public alice)) "denwa.call")))
+    (is (not= (id/destination-hash alice "denwa.call")
+              (id/destination-hash alice "denwa.page"))))
+  (testing "single-packet encryption reaches only the recipient"
+    (let [token (id/encrypt (id/public-only (:public bob)) (w/utf8 "もしもし") (seed 9))]
+      (is (= "もしもし" (w/utf8-str (id/decrypt bob token))))
+      (is (nil? (id/decrypt alice token)))
+      (is (nil? (id/decrypt bob (update token 40 #(bit-xor % 1))))))))
+
+(deftest packet-test
+  (let [pkt {:packet-type :data :destination-type :single :hops 3
+             :transport-id (vec (range 16)) :destination (vec (range 16 32))
+             :context :page :payload [1 2 3]}
+        bs (p/encode pkt)]
+    (is (= pkt (p/decode bs)))
+    (testing "hops and transport header do not change the packet hash"
+      (is (= (p/packet-hash pkt)
+             (p/packet-hash (assoc pkt :hops 9 :transport-id nil)))))
+    (is (nil? (p/decode [0x80 0 1 2])))))
+
+(deftest announce-test
+  (let [pkt (ann/build alice "denwa.call" {:app-data (w/utf8 "Alice") :now 1000 :random [1 2 3 4 5]})
+        wire-pkt (p/decode (p/encode pkt))
+        a (ann/parse wire-pkt)]
+    (is (some? a))
+    (is (= "Alice" (w/utf8-str (:app-data a))))
+    (is (= 1000 (:emitted-at a)))
+    (is (= (:public alice) (:public (:identity a))))
+    (testing "a forged destination or a tampered byte is rejected"
+      (is (nil? (ann/parse (assoc wire-pkt :destination (id/destination-hash bob "denwa.call")))))
+      (is (nil? (ann/parse (update wire-pkt :payload #(update % 70 bit-xor 1))))))
+    (testing "newer emission ordering"
+      (let [later (ann/build alice "denwa.call" {:now 1001 :random [0 0 0 0 0]})]
+        (is (ann/newer? (:emission (ann/parse later)) (:emission a)))
+        (is (not (ann/newer? (:emission a) (:emission (ann/parse later)))))))))
+
+(deftest link-test
+  (let [dest (id/destination-hash bob "denwa.call")
+        [li req] (link/request (id/public-only (:public bob)) dest (seed 20))
+        [lr proof] (link/accept bob (p/decode (p/encode req)) (seed 21))
+        li (link/complete li (p/decode (p/encode proof)))]
+    (is (= :active (:status li)))
+    (is (= (:link-id li) (:link-id lr)))
+    (testing "both directions carry data"
+      (let [[li pkt] (link/seal li :call (w/utf8 "INVITE"))
+            [lr pt] (link/open lr (p/decode (p/encode pkt)))
+            [_ pkt2] (link/seal lr :call (w/utf8 "RINGING"))
+            [_ pt2] (link/open li (p/decode (p/encode pkt2)))]
+        (is (= "INVITE" (w/utf8-str pt)))
+        (is (= "RINGING" (w/utf8-str pt2)))
+        (testing "a replayed packet is refused"
+          (is (nil? (link/open lr pkt))))
+        (testing "a context byte swapped in flight fails authentication"
+          (is (nil? (link/open (first (link/accept bob req (seed 21))) (assoc pkt :context :media)))))))
+    (testing "a proof signed by someone else is refused"
+      (let [[li2 req2] (link/request (id/public-only (:public bob)) dest (seed 22))
+            [_ fake] (link/accept alice req2 (seed 23))]
+        (is (nil? (link/complete li2 fake)))))
+    (testing "identify reveals the caller inside the channel"
+      (let [[_ pkt] (link/identify li alice)
+            [_ pt] (link/open lr pkt)]
+        (is (= (:public alice) (:public (link/verify-identify lr pt))))))))
+
+(deftest message-test
+  (let [dest (id/destination-hash bob "denwa.mail")
+        packed (msg/pack alice dest {:timestamp 42 :title "留守電" :content "折り返してください" :fields [9 9]})
+        env (msg/seal (id/public-only (:public bob)) dest packed [7 7 7])
+        m (msg/open-envelope bob env)]
+    (is (= "折り返してください" (:content m)))
+    (is (= (:public alice) (:public (:source m))))
+    (is (= [9 9] (:fields m)))
+    (is (nil? (msg/open-envelope alice env)))
+    (testing "propagation store: deposit, duplicate, quota, authorised fetch"
+      (let [st (msg/store {:per-destination 1})
+            [st s1] (msg/deposit st env 100)
+            [st s2] (msg/deposit st env 100)
+            [st s3] (msg/deposit st (msg/seal (id/public-only (:public bob)) dest packed [1]) 100)
+            [st stolen] (msg/fetch st (msg/fetch-request alice dest 100) "denwa.mail" 100)
+            [st got] (msg/fetch st (msg/fetch-request bob dest 100) "denwa.mail" 100)]
+        (is (= [:stored :duplicate :full] [s1 s2 s3]))
+        (is (nil? stolen))
+        (is (= [env] got))
+        (is (empty? (get-in st [:held (w/hex dest)])))))
+    (testing "the admit predicate sees the stamp"
+      (let [st (msg/store {:admit? #(= [7 7 7] (:stamp %))})]
+        (is (= :stored (second (msg/deposit st env 0))))
+        (is (= :rejected (second (msg/deposit st (msg/seal (id/public-only (:public bob)) dest packed []) 0))))))))
+
+(deftest resource-test
+  (let [payload (vec (map #(bit-and % 0xff) (range 1000)))
+        parts (res/split payload 300)
+        [asm r1] (reduce (fn [[a _] part] (res/accept a part)) [(res/assembler) nil] (reverse parts))]
+    (is (= 4 (count parts)))
+    (is (= payload r1))
+    (is (empty? asm))
+    (testing "a corrupted part yields nothing rather than wrong bytes"
+      (let [bad (update parts 1 #(update % 20 bit-xor 1))
+            [_ r] (reduce (fn [[a _] part] (res/accept a part)) [(res/assembler) nil] bad)]
+        (is (nil? r))))))

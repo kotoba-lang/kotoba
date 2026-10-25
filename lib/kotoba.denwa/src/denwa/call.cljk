@@ -1,0 +1,213 @@
+(ns denwa.call
+  "One call, from either end, as a pure state machine over a tsunagi link.
+
+  After the callee's phone has been rung (yobidashi), the **callee** opens a
+  link to the caller's callback destination — the callee dials back, so the
+  caller's device never has to find the callee's current location. Over the
+  link the callee proves who it is (`link/identify`) and offers codecs; the
+  caller checks the callee's device against the root it meant to call and
+  picks a codec. Then media flows.
+
+      caller                                         callee
+      :waiting   ◄── LINK-REQUEST ──────────────────  :linking
+                 ── PROOF ─────────────────────────►
+      :linked    ◄── IDENTIFY, ANSWER(codecs) ──────  :answered
+      :active    ── ACCEPT(codec) ─────────────────►  :active
+                 ◄═══════════ media ═══════════════►
+      :ended     ◄── BYE ──── or ──── BYE ─────────►  :ended
+
+  `step` takes the call and one event, and answers
+
+      {:call call' :packets [packet maps to send] :notify [things for the UI]}
+
+  Events: `{:type :packet :packet p}` for anything received on the link or its
+  destination, `{:type :audio :payload bytes :timestamp n}` to send a frame,
+  `{:type :hangup}`, `{:type :hold :hold? bool}`."
+  (:require [denwa.signal :as sig]
+            [denwa.media :as media]
+            [denwa.bearer :as bearer]
+            [nafuda.core :as n]
+            [tsunagi.link :as link]
+            [tsunagi.identity :as id]
+            [tsunagi.wire :as w]))
+
+(def callback-app "denwa.call")
+
+(defn- out [call packets notify] {:call call :packets (vec packets) :notify (vec notify)})
+
+(defn- seal [call context plaintext]
+  (let [[l pkt] (link/seal (:link call) context plaintext)]
+    [(assoc call :link l) pkt]))
+
+;; ---------------------------------------------------------------------------
+;; Construction
+
+(defn caller
+  "The caller's side, created when the invite is sent.
+
+  `callee-root` is the root hex the caller meant to call; `callee-statements`
+  are what the caller holds about them (from their card) to check the device
+  that answers."
+  [{:keys [identity call-id callee-root callee-statements codecs bearers now]}]
+  {:role :caller :status :waiting
+   :identity identity
+   :call-id (vec call-id)
+   :callee-root callee-root
+   :callee-statements (vec callee-statements)
+   :codecs (vec (or codecs [:pcmu :lpc-1200]))
+   :bearers (set (or bearers [:mesh]))
+   :started-at now})
+
+(defn callee
+  "The callee's side, created when the user answers a ring. `caller-device`
+  is the public identity behind the ring's callback destination (from its
+  announce). Answers `{:call … :packets [link-request]}`."
+  ([opts] (callee opts nil))
+  ([{:keys [identity ring caller-device codecs bearers now]} ephemeral-secret]
+   (let [[l req] (if ephemeral-secret
+                   (link/request caller-device (:callback ring) ephemeral-secret)
+                   (link/request caller-device (:callback ring)))]
+     (out {:role :callee :status :linking
+           :identity identity
+           :call-id (vec (:call-id ring))
+           :codecs (vec (or codecs [:pcmu :lpc-1200]))
+           :bearers (set (or bearers (:bearers ring) [:mesh]))
+           :link l
+           :started-at now}
+          [req] []))))
+
+;; ---------------------------------------------------------------------------
+;; Events
+
+(defn- signal [call m]
+  (seal call :call (sig/encode (assoc m :call-id (:call-id call)))))
+
+(defn- on-caller-packet [call pkt now]
+  (cond
+    ;; The callee's link request to our callback destination.
+    (and (= :waiting (:status call)) (= :link-request (:packet-type pkt)))
+    (if-let [[l proof] (link/accept (:identity call) pkt)]
+      (out (assoc call :status :linked :link l) [proof] [])
+      (out call [] []))
+
+    (and (:link call) (= :link (:destination-type pkt)))
+    (if-let [[l pt] (link/open (:link call) pkt)]
+      (let [call (assoc call :link l)]
+        (case (:context pkt)
+          :link-identify
+          (let [dev (link/verify-identify l pt)]
+            (if (and dev (n/authorized? (:callee-root call) (:callee-statements call)
+                                        dev :call (quot now 1000)))
+              (out (assoc call :peer dev :status :identified) [] [{:notify :callee-verified}])
+              (let [[call bye] (signal call {:type :bye :reason :failure})]
+                (out (assoc call :status :ended :end-reason :callee-not-verified) [bye]
+                     [{:notify :ended :reason :callee-not-verified}]))))
+
+          :call
+          (let [m (sig/decode pt)]
+            (cond
+              (not= (:call-id m) (:call-id call)) (out call [] [])
+
+              (and (= :answer (:type m)) (= :identified (:status call)))
+              (let [mine (set (:codecs call))
+                    ok (filterv mine (:codecs m))
+                    choice (or (bearer/choose (:bearers call) ok) {:codec (first ok) :frame-ms (:frame-ms m)})]
+                (if (:codec choice)
+                  (let [[call acc] (signal call {:type :accept :codec (:codec choice)
+                                                 :frame-ms (:frame-ms choice)})]
+                    (out (assoc call :status :active :codec (:codec choice)
+                                :frame-ms (:frame-ms choice) :mode (:mode choice :duplex)
+                                :tx-seq 0 :jitter (media/jitter-buffer {:frame-ms (:frame-ms choice)}))
+                         [acc] [{:notify :connected :codec (:codec choice) :mode (:mode choice :duplex)}]))
+                  (let [[call bye] (signal call {:type :bye :reason :failure})]
+                    (out (assoc call :status :ended :end-reason :no-common-codec) [bye]
+                         [{:notify :ended :reason :no-common-codec}]))))
+
+              (= :bye (:type m))
+              (out (assoc call :status :ended :end-reason (:reason m)) [] [{:notify :ended :reason (:reason m)}])
+
+              :else (out call [] [])))
+
+          :media
+          (if-let [f (and (= :active (:status call)) (media/decode-frame pt))]
+            (out (update call :jitter media/push f now) [] [])
+            (out call [] []))
+
+          (out call [] [])))
+      (out call [] []))
+
+    :else (out call [] [])))
+
+(defn- on-callee-packet [call pkt now]
+  (cond
+    (and (= :linking (:status call)) (= :link-proof (:context pkt)))
+    (if-let [l (link/complete (:link call) pkt)]
+      (let [call (assoc call :link l)
+            [l idp] (link/identify l (:identity call))
+            call (assoc call :link l)
+            [call ans] (signal call {:type :answer :codecs (:codecs call) :frame-ms 40})]
+        (out (assoc call :status :answered) [idp ans] []))
+      (out call [] []))
+
+    (and (= :link (:destination-type pkt)) (= :active (get-in call [:link :status])))
+    (if-let [[l pt] (link/open (:link call) pkt)]
+      (let [call (assoc call :link l)]
+        (case (:context pkt)
+          :call
+          (let [m (sig/decode pt)]
+            (cond
+              (not= (:call-id m) (:call-id call)) (out call [] [])
+              (and (= :accept (:type m)) (= :answered (:status call)))
+              (out (assoc call :status :active :codec (:codec m) :frame-ms (:frame-ms m) :tx-seq 0
+                          :jitter (media/jitter-buffer {:frame-ms (:frame-ms m)}))
+                   [] [{:notify :connected :codec (:codec m)}])
+              (= :bye (:type m))
+              (out (assoc call :status :ended :end-reason (:reason m)) [] [{:notify :ended :reason (:reason m)}])
+              :else (out call [] [])))
+          :media
+          (if-let [f (and (= :active (:status call)) (media/decode-frame pt))]
+            (out (update call :jitter media/push f now) [] [])
+            (out call [] []))
+          (out call [] [])))
+      (out call [] []))
+
+    :else (out call [] [])))
+
+(defn step
+  "Advance the call by one event at `now` (ms)."
+  [call event now]
+  (case (:type event)
+    :packet (if (= :caller (:role call))
+              (on-caller-packet call (:packet event) now)
+              (on-callee-packet call (:packet event) now))
+
+    :audio
+    (if (= :active (:status call))
+      (let [cid (get-in sig/codecs [(:codec call) :id])
+            frame (media/encode-frame {:seq (:tx-seq call) :timestamp (:timestamp event)
+                                       :codec-id cid :payload (:payload event)})
+            [call pkt] (seal call :media frame)]
+        (out (update call :tx-seq #(bit-and (inc %) 0xffff)) [pkt] []))
+      (out call [] []))
+
+    :hold
+    (if (= :active (:status call))
+      (let [[call pkt] (signal call {:type :hold :hold? (:hold? event)})]
+        (out (assoc call :held? (:hold? event)) [pkt] []))
+      (out call [] []))
+
+    :hangup
+    (if (and (:link call) (= :active (get-in call [:link :status])) (not= :ended (:status call)))
+      (let [[call bye] (signal call {:type :bye :reason :normal})]
+        (out (assoc call :status :ended :end-reason :normal :link (link/close (:link call)))
+             [bye] [{:notify :ended :reason :normal}]))
+      (out (assoc call :status :ended :end-reason :normal) [] [{:notify :ended :reason :normal}]))
+
+    (out call [] [])))
+
+(defn play
+  "Take the next frame for the speaker (once per frame period)."
+  [call]
+  (if-let [jb (:jitter call)]
+    (let [[jb f] (media/pop-frame jb)] [(assoc call :jitter jb) f])
+    [call nil]))

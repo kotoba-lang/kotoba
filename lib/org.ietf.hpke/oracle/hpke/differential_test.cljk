@@ -1,0 +1,104 @@
+(ns hpke.differential-test
+  "This implementation against BouncyCastle's HPKE, over many key pairs and
+  message sequences.
+
+  A separate source root reached only by the `:oracle` alias, because
+  BouncyCastle must never become a dependency: it is what this is CHECKED
+  AGAINST, not something it builds on.
+
+      kbb -M:oracle
+
+  The known-answer suite pins one ephemeral against one recipient. What it
+  leaves untested is everything that varies: other key pairs, other `info`,
+  other aad and plaintext lengths, and the sequence number past the first few
+  messages -- which is where `compute-nonce`'s big-endian counter would show
+  an error only after a carry crossed a byte."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [hpke.core :as hpke]
+            [hpke.dhkem :as dhkem])
+  (:import (org.bouncycastle.crypto.hpke HPKE)))
+
+(def ^:private bc
+  (HPKE. HPKE/mode_base HPKE/kem_X25519_SHA256 HPKE/kdf_HKDF_SHA256
+         HPKE/aead_CHACHA20_POLY1305))
+
+(defn- ba [v] (byte-array (map unchecked-byte v)))
+
+(defn- lcg
+  "A fixed byte sequence. `unchecked-*` because a 64-bit LCG is defined by its
+  wraparound and Clojure's checked arithmetic throws on exactly that."
+  [seed n]
+  (->> (iterate (fn [v] (unchecked-add (unchecked-multiply v 6364136223846793005)
+                                       1442695040888963407))
+                (long seed))
+       (drop 1) (take n)
+       (mapv #(bit-and (unsigned-bit-shift-right % 24) 0xFF))))
+
+(deftest derive-key-pair-agrees
+  (doseq [i (range 25)]
+    (let [ikm (lcg (+ 4000 i) 32)
+          mine (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm)
+          theirs (.deriveKeyPair bc (ba ikm))]
+      (is (= (hpke/hex (.serializePublicKey bc (.getPublic theirs)))
+             (hpke/hex (:public mine)))
+          (str "public " i))
+      (is (= (hpke/hex (.serializePrivateKey bc (.getPrivate theirs)))
+             (hpke/hex (:private mine)))
+          (str "private " i)))))
+
+(deftest base-mode-agrees
+  (doseq [i (range 12)]
+    (let [ikm-e (lcg (+ 200 i) 32)
+          ikm-r (lcg (+ 900 i) 32)
+          info (lcg (+ 30 i) (mod (* 5 i) 23))
+          kp-e (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm-e)
+          kp-r (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm-r)
+          bc-e (.deriveKeyPair bc (ba ikm-e))
+          bc-r (.deriveKeyPair bc (ba ikm-r))
+          theirs (.setupBaseS bc (.getPublic bc-r) (ba info) bc-e)
+          mine (hpke/setup-base-sender (:public kp-r) info kp-e)]
+      (is (= (hpke/hex (.getEncapsulation theirs)) (hpke/hex (:enc mine)))
+          (str "enc " i))
+      (testing "a run of messages, so the sequence-number carry is exercised"
+        (loop [ctx (:context mine) n 0]
+          (when (< n 6)
+            (let [aad (lcg (+ 70 i n) (mod (* 3 n) 11))
+                  pt (lcg (+ 800 i n) (mod (* 17 (inc n)) 40))
+                  r (hpke/seal ctx aad pt)]
+              (is (= (hpke/hex (.seal theirs (ba aad) (ba pt))) (hpke/hex (:bytes r)))
+                  (str "case " i " seq " n))
+              (recur (:context r) (inc n))))))
+      (testing "and the exporter"
+        (doseq [[l ctxt] [[16 []] [32 (lcg (+ 5 i) 4)] [64 (lcg (+ 6 i) 20)]]]
+          (is (= (hpke/hex (.export theirs (ba ctxt) l))
+                 (hpke/hex (hpke/export (:context mine) ctxt l)))
+              (str "export " i " len " l)))))))
+
+(deftest bouncycastle-opens-what-this-seals
+  ;; The strongest statement available: an independent implementation
+  ;; decrypting this one's output, rather than two implementations agreeing
+  ;; on bytes they both computed the same wrong way.
+  (doseq [i (range 8)]
+    (let [ikm-e (lcg (+ 2200 i) 32)
+          ikm-r (lcg (+ 3300 i) 32)
+          info (lcg (+ 44 i) 7)
+          aad (lcg (+ 55 i) 5)
+          pt (lcg (+ 66 i) (+ 1 (* 9 i)))
+          kp-e (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm-e)
+          kp-r (dhkem/derive-key-pair! dhkem/x25519-hkdf-sha256 ikm-r)
+          bc-r (.deriveKeyPair bc (ba ikm-r))
+          sealed (hpke/seal-base (:public kp-r) info aad pt kp-e)]
+      (is (= :ok (:status sealed)))
+      (let [their-ctx (.setupBaseR bc (ba (:enc sealed)) bc-r (ba info))]
+        (is (= (vec pt)
+               (vec (map #(bit-and % 0xFF)
+                         (.open their-ctx (ba aad) (ba (:bytes sealed))))))
+            (str "BouncyCastle opens case " i))))))
+
+(deftest the-oracle-can-fail
+  (testing "a differential test that cannot report a difference proves nothing"
+    (let [a (.deriveKeyPair bc (ba (lcg 1 32)))
+          b (.deriveKeyPair bc (ba (lcg 2 32)))]
+      (is (not= (hpke/hex (.serializePublicKey bc (.getPublic a)))
+                (hpke/hex (.serializePublicKey bc (.getPublic b))))
+          "BouncyCastle must distinguish two ikms, or the comparisons above are vacuous"))))

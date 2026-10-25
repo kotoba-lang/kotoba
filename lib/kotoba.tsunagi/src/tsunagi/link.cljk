@@ -1,0 +1,169 @@
+(ns tsunagi.link
+  "Links: an encrypted, forward-secret, bidirectional channel to a destination.
+
+  A call's signalling and media run over a link. Establishing one costs one
+  round trip:
+
+      initiator                                   responder (owns destination)
+        LINK-REQUEST  dest, payload = eA (32)  ─►
+                                               ◄─  PROOF  dest = link id
+                                                   payload = eB (32) ++ sig
+
+      link id  = SHA-256(destination ++ eA)[0..16]
+      sig      = Ed25519_responder(link id ++ eA ++ eB)
+      keys     = HKDF-SHA256(X25519(eA, eB), salt = link id, \"tsunagi/1 link\", 64)
+                 → initiator→responder key (32) ++ responder→initiator key (32)
+
+  Both ephemeral keys die with the link, so recorded traffic stays sealed
+  even if the long-term identity key is later taken (forward secrecy). The
+  signature binds the responder's long-term identity to this exchange, so a
+  relay in the middle cannot substitute its own eB.
+
+  The initiator stays anonymous unless it calls `identify`, which sends its
+  public key and a signature over the link id inside the encrypted channel —
+  the callee learns who is calling, a relay does not.
+
+  Each data packet carries a 48-bit counter; the AEAD nonce is the counter
+  plus a direction tag, and the receiver keeps a 64-wide replay window."
+  (:require [tsunagi.crypto :as c]
+            [tsunagi.identity :as id]
+            [tsunagi.packet :as p]
+            [tsunagi.wire :as w]))
+
+(def window 64)
+
+(defn link-id [destination initiator-ephemeral-public]
+  (c/truncated-hash (w/cat-bytes destination initiator-ephemeral-public) 16))
+
+(defn- derive-keys [shared lid]
+  (let [okm (c/hkdf shared lid (w/utf8 "tsunagi/1 link") 64)]
+    {:i->r (subvec okm 0 32) :r->i (subvec okm 32 64)}))
+
+(defn request
+  "Start a link to `destination` (16 bytes) owned by `peer` (a public
+  identity, learned from its announce). Answers `[link packet-map]`."
+  ([peer destination] (request peer destination (c/random-bytes 32)))
+  ([peer destination ephemeral-secret]
+   (let [ea (c/x25519-public ephemeral-secret)
+         lid (link-id destination ea)]
+     [{:link-id lid
+       :role :initiator
+       :status :pending
+       :destination destination
+       :peer peer
+       :ephemeral-secret (vec ephemeral-secret)
+       :ephemeral-public ea}
+      {:packet-type :link-request
+       :destination-type :single
+       :destination destination
+       :context :none
+       :payload ea}])))
+
+(defn- active [link keys]
+  (-> link
+      (dissoc :ephemeral-secret)
+      (assoc :status :active
+             :tx-key (if (= :initiator (:role link)) (:i->r keys) (:r->i keys))
+             :rx-key (if (= :initiator (:role link)) (:r->i keys) (:i->r keys))
+             :tx-direction (if (= :initiator (:role link)) 1 2)
+             :rx-direction (if (= :initiator (:role link)) 2 1)
+             :tx-counter 0
+             :rx-high -1
+             :rx-seen #{})))
+
+(defn accept
+  "Answer a link request addressed to one of `identity`'s destinations.
+  Answers `[link proof-packet]`, or nil for a malformed request."
+  ([identity request-packet] (accept identity request-packet (c/random-bytes 32)))
+  ([identity {:keys [destination payload packet-type]} ephemeral-secret]
+   (when (and (= :link-request packet-type) (= 32 (count payload)))
+     (let [ea (vec payload)
+           eb (c/x25519-public ephemeral-secret)
+           lid (link-id destination ea)]
+       (when-let [shared (c/x25519-shared ephemeral-secret ea)]
+         (let [sig (id/sign identity (w/cat-bytes lid ea eb))]
+           [(active {:link-id lid :role :responder :destination destination}
+                    (derive-keys shared lid))
+            {:packet-type :proof
+             :destination-type :link
+             :destination lid
+             :context :link-proof
+             :payload (w/cat-bytes eb sig)}]))))))
+
+(defn complete
+  "Finish the initiator's side from the responder's proof. Answers the active
+  link, or nil when the proof is not from the identity we asked for."
+  [link {:keys [destination payload context]}]
+  (when (and (= :pending (:status link))
+             (= :link-proof context)
+             (w/bytes-eq? destination (:link-id link))
+             (= 96 (count payload)))
+    (let [eb (subvec (vec payload) 0 32)
+          sig (subvec (vec payload) 32 96)]
+      (when (id/verify (:peer link)
+                       (w/cat-bytes (:link-id link) (:ephemeral-public link) eb)
+                       sig)
+        (when-let [shared (c/x25519-shared (:ephemeral-secret link) eb)]
+          (active link (derive-keys shared (:link-id link))))))))
+
+(defn seal
+  "Encrypt `plaintext` for the peer. Answers `[link packet-map]`."
+  [link context plaintext]
+  (let [n (:tx-counter link)
+        ctx-byte (if (keyword? context) (get p/contexts context) context)
+        nonce (c/counter-nonce (:tx-direction link) n)
+        aad (w/cat-bytes [ctx-byte] (w/u48 n))]
+    [(update link :tx-counter inc)
+     {:packet-type :data
+      :destination-type :link
+      :destination (:link-id link)
+      :context context
+      :payload (w/cat-bytes (w/u48 n) (c/seal (:tx-key link) nonce aad plaintext))}]))
+
+(defn- replay? [link n]
+  (or (<= n (- (:rx-high link) window))
+      (contains? (:rx-seen link) n)))
+
+(defn- remember [link n]
+  (let [high (max n (:rx-high link))]
+    (assoc link
+           :rx-high high
+           :rx-seen (into #{} (filter #(> % (- high window))) (conj (:rx-seen link) n)))))
+
+(defn open
+  "Decrypt a data packet on this link. Answers `[link plaintext]`, or nil for
+  a forged, corrupted or replayed packet (the link is then unchanged)."
+  [link {:keys [destination payload context]}]
+  (when (and (= :active (:status link))
+             (w/bytes-eq? destination (:link-id link))
+             (>= (count payload) (+ 6 c/aead-tag-bytes)))
+    (let [cur (w/cursor payload)
+          [n cur] (w/take-u48 cur)
+          [sealed _] (w/take-rest cur)
+          ctx-byte (if (keyword? context) (get p/contexts context) context)]
+      (when-not (replay? link n)
+        (when-let [pt (c/open (:rx-key link)
+                              (c/counter-nonce (:rx-direction link) n)
+                              (w/cat-bytes [ctx-byte] (w/u48 n))
+                              sealed)]
+          [(remember link n) pt])))))
+
+(defn identify
+  "Reveal the initiator's identity to the responder, inside the encryption.
+  Answers `[link packet-map]`."
+  [link identity]
+  (seal link :link-identify
+        (w/cat-bytes (:public identity)
+                     (id/sign identity (w/cat-bytes (:link-id link) (:public identity))))))
+
+(defn verify-identify
+  "The caller's public identity from an `identify` plaintext, or nil."
+  [link plaintext]
+  (when (= 128 (count plaintext))
+    (let [public (subvec (vec plaintext) 0 64)
+          sig (subvec (vec plaintext) 64 128)
+          ident (id/public-only public)]
+      (when (and ident (id/verify ident (w/cat-bytes (:link-id link) public) sig))
+        ident))))
+
+(defn close [link] (assoc link :status :closed :tx-key nil :rx-key nil))

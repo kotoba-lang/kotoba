@@ -1,0 +1,116 @@
+(ns yobidashi.core-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [yobidashi.schedule :as sched]
+            [yobidashi.ring :as ring]
+            [yobidashi.invite :as inv]
+            [yobidashi.home :as home]
+            [nafuda.core :as n]
+            [tsunagi.identity :as id]
+            [tsunagi.packet :as p]
+            [tsunagi.wire :as w]))
+
+(defn- seed [k] (vec (map #(bit-and (+ k (* 17 %)) 0xff) (range 32))))
+(def callee-root (id/from-seed (seed 1)))
+(def callee-phone (id/from-seed (seed 2)))
+(def home-node (id/from-seed (seed 3)))
+(def caller-root (id/from-seed (seed 4)))
+(def caller-phone (id/from-seed (seed 5)))
+(def hx n/hex-of)
+
+(def callee-statements
+  [(n/device-cert callee-root callee-phone {:roles #{:call :page} :serial 1 :not-before 0 :not-after 100000})
+   (n/device-cert callee-root home-node {:roles #{:home} :serial 2 :not-before 0 :not-after 100000})])
+
+(def caller-cert
+  (n/device-cert caller-root caller-phone {:roles #{:call} :serial 1 :not-before 0 :not-after 100000}))
+
+(def callback (id/destination-hash caller-phone "denwa.call"))
+
+(defn- invite [call-id opts]
+  (inv/invite caller-phone (merge {:call-id call-id :callee (hx callee-root) :caller (hx caller-root)
+                                   :callback callback :expires 200 :attachments [caller-cert]}
+                                  opts)))
+
+(defn- enrolled [policy]
+  (let [[h status] (home/enroll (home/home home-node) (hx callee-root) callee-statements policy 0)
+        [h loc-status] (home/update-location h (home/location callee-phone (hx callee-root)
+                                                              {:profile :lora :bearers #{:lora} :not-after 1000})
+                                             0)]
+    (is (= [:enrolled :stored] [status loc-status]))
+    h))
+
+(deftest schedule-test
+  (let [prof (:lora sched/profiles)
+        dest (id/destination-hash callee-phone ring/page-app)
+        wake (sched/next-wake prof dest 5000)
+        tx (sched/transmit-at prof dest 5000)]
+    (is (>= wake 5000))
+    (is (< wake (+ 5000 (:cycle-ms prof))))
+    (testing "the ring is transmitted while the device is listening"
+      (is (sched/listening? prof dest tx))
+      (is (not (sched/listening? prof dest (+ tx (quot (:cycle-ms prof) 2)))))))
+  (testing "a 60 ms window per 2.56 s cycle on a 1000 mAh cell lasts months"
+    (is (< 60 (sched/battery-days (:lora sched/profiles) 1000 12 0.002) 200))))
+
+(deftest ring-test
+  (let [r {:call-id [1 2 3 4 5 6 7 8] :expires 300 :verdict :ring
+           :caller-root-hash (:hash caller-root) :callback callback :bearers #{:mesh :wifi}}
+        pkt (p/decode (p/encode (ring/build home-node (id/public-only (:public callee-phone)) r)))]
+    (is (< (count (p/encode pkt)) 200) "one LoRa frame")
+    (is (= r (ring/open callee-phone (id/public-only (:public home-node)) pkt 100)))
+    (testing "rejected when expired, when not from our home node, or not for us"
+      (is (nil? (ring/open callee-phone (id/public-only (:public home-node)) pkt 300)))
+      (is (nil? (ring/open callee-phone (id/public-only (:public caller-root)) pkt 100)))
+      (is (nil? (ring/open caller-phone (id/public-only (:public home-node)) pkt 100))))
+    (testing "wake frame"
+      (is (= {:call-id (:call-id r) :caller-root-hash (:caller-root-hash r)}
+             (ring/parse-wake-frame (ring/wake-frame r)))))))
+
+(deftest call-flow-test
+  (testing "a contact's call pages the phone, and its answer reaches the caller"
+    (let [h (enrolled {:contacts #{(hx caller-root)}})
+          {h1 :home effects :effects} (home/handle-invite h (inv/decode (inv/encode (invite "0102030405060708" {}))) 1000)
+          [reply page] effects]
+      (is (= :paging (:status reply)))
+      (is (= :lora (:bearer page)))
+      (let [rng (ring/open callee-phone (id/public-only (:public home-node))
+                           (p/decode (p/encode (:packet page))) 1)]
+        (is (= :ring (:verdict rng)))
+        (is (= (:hash caller-root) (:caller-root-hash rng)))
+        (let [ack (p/decode (p/encode (ring/ack callee-phone (id/public-only (:public home-node))
+                                                (:call-id rng) :accepted)))
+              {h2 :home effects :effects} (home/handle-ack h1 ack 1500)]
+          (is (= :answered (:status (first effects))))
+          (testing "an answered call is no longer re-paged"
+            (is (empty? (:effects (home/tick h2 2000)))))))))
+  (testing "an unknown caller without a stamp goes to voicemail"
+    (let [h (enrolled {})
+          {effects :effects} (home/handle-invite h (invite "1111111111111111" {}) 1000)]
+      (is (= :voicemail (:status (first effects))))))
+  (testing "an unknown caller who paid a stamp is screened and paged"
+    (let [h (enrolled {:stamp-cost 8})
+          {effects :effects} (home/handle-invite h (invite "2222222222222222" {:stamp-cost 8}) 1000)]
+      (is (= [:paging :screen] [(:status (first effects))
+                                 (:verdict (ring/open callee-phone (id/public-only (:public home-node))
+                                                      (:packet (second effects)) 1))]))))
+  (testing "a caller device without a certificate is refused"
+    (let [h (enrolled {:contacts #{(hx caller-root)}})
+          {effects :effects} (home/handle-invite h (invite "3333333333333333" {:attachments []}) 1000)]
+      (is (= :caller-device-not-certified (:reason (first effects))))))
+  (testing "unanswered pages repeat each tick, then expire to voicemail"
+    (let [h (enrolled {:contacts #{(hx caller-root)}})
+          {h :home} (home/handle-invite h (invite "4444444444444444" {}) 1000)]
+      (is (= :page (:effect (first (:effects (home/tick h 5000))))))
+      (is (= :voicemail (:status (first (:effects (home/tick h 200000)))))))))
+
+(deftest location-test
+  (let [h (enrolled {})
+        stranger (id/from-seed (seed 9))]
+    (testing "an uncertified device cannot redirect someone's calls"
+      (is (= :not-authorized
+             (second (home/update-location h (home/location stranger (hx callee-root)
+                                                            {:profile :lora :bearers #{:lora} :not-after 1000})
+                                           0)))))
+    (testing "a home node the user did not certify cannot enroll them"
+      (is (= :not-authorized
+             (second (home/enroll (home/home stranger) (hx callee-root) callee-statements {} 0)))))))

@@ -1,0 +1,120 @@
+(ns tsunagi.identity
+  "A tsunagi identity: an X25519 key for encryption and an Ed25519 key for
+  signatures, both derived from one 32-byte seed.
+
+      public key     = x25519-pub (32) ++ ed25519-pub (32)     ; 64 bytes
+      identity hash  = SHA-256(public key)[0..16]
+
+  A **destination** is an identity bound to a dotted application name, the
+  same idea Reticulum uses — one identity can be reachable as
+  `denwa.call` and as `denwa.page` with two unrelated addresses:
+
+      name hash      = SHA-256(utf8 name)[0..10]
+      destination    = SHA-256(name hash ++ identity hash)[0..16]
+
+  Addresses are therefore self-certifying: anyone holding the public key and
+  the name recomputes the address, so an announce that claims an address its
+  key does not produce is rejected without consulting anyone.
+
+  Single-packet encryption to an identity (`encrypt` / `decrypt`) uses a fresh
+  ephemeral X25519 key per packet, HKDF-SHA256 salted with the recipient's
+  identity hash, and ChaCha20-Poly1305:
+
+      token = ephemeral-pub (32) ++ AEAD(key, nonce, aad = ephemeral-pub, plaintext)"
+  (:require [tsunagi.crypto :as c]
+            [tsunagi.wire :as w]))
+
+(def public-bytes 64)
+(def hash-bytes 16)
+(def name-hash-bytes 10)
+(def signature-bytes 64)
+
+(defn from-seed
+  "A full (private) identity from a 32-byte seed."
+  [seed]
+  (let [seed (w/->bytes seed)
+        _ (when (not= 32 (count seed))
+            (throw (ex-info "tsunagi.identity: seed must be 32 bytes" {:length (count seed)})))
+        enc-secret (c/hkdf seed [] (w/utf8 "tsunagi/1 identity x25519") 32)
+        sig-seed (c/hkdf seed [] (w/utf8 "tsunagi/1 identity ed25519") 32)
+        sig (c/ed25519-secret sig-seed)
+        enc-pub (c/x25519-public enc-secret)
+        public (w/cat-bytes enc-pub (:public sig))]
+    {:seed seed
+     :enc-secret enc-secret
+     :sig-secret sig
+     :public public
+     :hash (c/truncated-hash public hash-bytes)}))
+
+(defn generate
+  "A fresh identity from host randomness."
+  []
+  (from-seed (c/random-bytes 32)))
+
+(defn public-only
+  "The publishable half of an identity, or a peer's identity rebuilt from its
+  64-byte public key. Answers nil on a wrong-length key."
+  [public]
+  (let [public (w/->bytes public)]
+    (when (= public-bytes (count public))
+      {:public public
+       :hash (c/truncated-hash public hash-bytes)})))
+
+(defn enc-public [id] (subvec (vec (:public id)) 0 32))
+(defn sig-public [id] (subvec (vec (:public id)) 32 64))
+
+(defn private? [id] (some? (:sig-secret id)))
+
+(defn sign [id message]
+  (when-not (private? id)
+    (throw (ex-info "tsunagi.identity/sign: public-only identity" {:hash (w/hex (:hash id))})))
+  (c/ed25519-sign (:sig-secret id) message))
+
+(defn verify [id message signature]
+  (and (= signature-bytes (count signature))
+       (c/ed25519-verify (sig-public id) message signature)))
+
+(defn name-hash [app-name]
+  (c/truncated-hash (w/utf8 app-name) name-hash-bytes))
+
+(defn destination-hash-from
+  "The destination address for a name hash and an identity hash."
+  [name-hash identity-hash]
+  (c/truncated-hash (w/cat-bytes name-hash identity-hash) hash-bytes))
+
+(defn destination-hash [id app-name]
+  (destination-hash-from (name-hash app-name) (:hash id)))
+
+(defn plain-destination-hash
+  "An unencrypted, ownerless destination (a broadcast channel such as path
+  requests): the name alone."
+  [app-name]
+  (c/truncated-hash (name-hash app-name) hash-bytes))
+
+;; ---------------------------------------------------------------------------
+;; Single-packet encryption to an identity
+
+(defn- token-keys [shared identity-hash]
+  (let [okm (c/hkdf shared identity-hash (w/utf8 "tsunagi/1 token") 44)]
+    {:key (subvec okm 0 32) :nonce (subvec okm 32 44)}))
+
+(defn encrypt
+  "Encrypt `plaintext` so only `recipient` (a public identity) can read it.
+  `ephemeral-secret` defaults to fresh randomness."
+  ([recipient plaintext]
+   (encrypt recipient plaintext (c/random-bytes 32)))
+  ([recipient plaintext ephemeral-secret]
+   (let [eph-pub (c/x25519-public ephemeral-secret)
+         shared (c/x25519-shared ephemeral-secret (enc-public recipient))
+         {:keys [key nonce]} (token-keys shared (:hash recipient))]
+     (w/cat-bytes eph-pub (c/seal key nonce eph-pub plaintext)))))
+
+(defn decrypt
+  "Plaintext, or nil if the token was not for `id` or was tampered with."
+  [id token]
+  (let [token (vec token)]
+    (when (>= (count token) (+ 32 c/aead-tag-bytes))
+      (let [eph-pub (subvec token 0 32)]
+        (when-let [shared (c/x25519-shared (:enc-secret id) eph-pub)]
+          (let [{:keys [key nonce]} (token-keys shared (:hash id))]
+            (c/open key nonce eph-pub (subvec token 32))))))))

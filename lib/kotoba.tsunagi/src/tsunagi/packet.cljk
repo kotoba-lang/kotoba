@@ -1,0 +1,105 @@
+(ns tsunagi.packet
+  "The tsunagi packet.
+
+      byte 0   flags   bit 7     header type  0 = one address, 1 = transport + destination
+                       bits 5-4  destination  0 single · 1 group · 2 plain · 3 link
+                       bits 3-2  packet type  0 data · 1 announce · 2 link-request · 3 proof
+      byte 1   hops
+      [16]     transport id   (header type 1 only — the next relay that must forward)
+      16       destination
+      1        context
+      …        payload
+
+  The whole packet is at most `mtu` bytes, small enough for one LoRa frame at
+  the slower spreading factors to carry a ring and for every bearer to carry
+  any packet unfragmented.
+
+  The **packet hash** used for duplicate suppression covers only what does
+  not change in flight — the low flag bits, destination, context and payload —
+  so the same packet arriving over two paths, or one hop later, hashes the same."
+  (:require [tsunagi.crypto :as c]
+            [tsunagi.wire :as w]))
+
+(def mtu 500)
+(def address-bytes 16)
+
+(def destination-types {:single 0 :group 1 :plain 2 :link 3})
+(def packet-types {:data 0 :announce 1 :link-request 2 :proof 3})
+
+(def contexts
+  "Context byte values. Anything else is carried through as an integer."
+  {:none 0x00
+   :path-response 0x0B
+   :message 0x10          ; tsunagi.message envelope
+   :page 0x20             ; yobidashi ring
+   :page-ack 0x21
+   :location 0x22         ; yobidashi location record to a home node
+   :call 0x30             ; denwa signalling
+   :media 0x31            ; denwa voice frame
+   :keepalive 0xFA
+   :link-identify 0xFB
+   :link-rtt 0xFE
+   :link-close 0xFC
+   :link-proof 0xFF})
+
+(def ^:private by-value (fn [m] (into {} (map (fn [[k v]] [v k])) m)))
+(def ^:private destination-type-of (by-value destination-types))
+(def ^:private packet-type-of (by-value packet-types))
+(def ^:private context-of (by-value contexts))
+
+(defn encode
+  "Bytes for a packet map:
+
+      {:packet-type :data :destination-type :single :hops 0
+       :transport-id nil-or-16-bytes :destination 16-bytes
+       :context :none :payload bytes}"
+  [{:keys [packet-type destination-type hops transport-id destination context payload]
+    :or {hops 0 context :none payload []}}]
+  (let [ctx (if (keyword? context) (get contexts context) context)
+        flags (+ (if transport-id 0x80 0)
+                 (* 16 (get destination-types destination-type))
+                 (* 4 (get packet-types packet-type)))
+        bs (w/cat-bytes [flags (min hops 255)]
+                        (or transport-id [])
+                        destination
+                        [ctx]
+                        payload)]
+    (when (> (count bs) mtu)
+      (throw (ex-info "tsunagi.packet: packet exceeds MTU" {:length (count bs) :mtu mtu})))
+    bs))
+
+(defn decode
+  "A packet map, or nil for anything malformed."
+  [bs]
+  (let [bs (w/->bytes bs)]
+    (when (<= (count bs) mtu)
+      (let [c (w/cursor bs)]
+        (when-let [[flags c] (w/take-u8 c)]
+          (when-let [[hops c] (w/take-u8 c)]
+            (let [two? (pos? (bit-and flags 0x80))
+                  [tid c] (if two? (or (w/take-bytes c address-bytes) [nil nil]) [nil c])]
+              (when c
+                (when-let [[dest c] (w/take-bytes c address-bytes)]
+                  (when-let [[ctx c] (w/take-u8 c)]
+                    (let [[payload _] (w/take-rest c)]
+                      {:packet-type (packet-type-of (bit-and (quot flags 4) 3))
+                       :destination-type (destination-type-of (bit-and (quot flags 16) 3))
+                       :hops hops
+                       :transport-id tid
+                       :destination dest
+                       :context (get context-of ctx ctx)
+                       :payload payload})))))))))))
+
+(defn packet-hash
+  "Hash identifying a packet independently of hops and of the relay it was
+  addressed through."
+  [{:keys [packet-type destination-type destination context payload]}]
+  (let [ctx (if (keyword? context) (get contexts context) context)]
+    (c/sha256 (w/cat-bytes [(+ (* 16 (get destination-types destination-type))
+                               (* 4 (get packet-types packet-type)))]
+                           destination [ctx] payload))))
+
+(defn max-payload
+  "Payload room in a packet with or without a transport header."
+  [transport?]
+  (- mtu 2 (if transport? address-bytes 0) address-bytes 1))

@@ -1,0 +1,1861 @@
+(ns kotobase.server.handler-test
+  (:require #?(:clj  [clojure.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing async] :include-macros true])
+            #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [kotobase.server.handler :as h]))
+
+(defn- passthrough
+  "kotobase-peer's crypto seam is synchronous on JVM but Promise-returning
+  on cljs (ADR-2607051000) -- EVEN a plaintext-passthrough profile must
+  respect that platform split, or kotobase-peer's own `.then` calls on the
+  result throw on cljs. `identity` alone is wrong there."
+  [x] #?(:clj x :cljs (js/Promise.resolve x)))
+
+(defn- mem-store
+  "An in-memory store with a plaintext-passthrough crypto profile -- the
+  simplest possible `store` satisfying `kotobase.server.handler`'s
+  contract, for node-testability without any real storage backend."
+  []
+  (let [blocks (atom {})
+        heads (atom {})]
+    {:get-fn (fn [cid] (get @blocks cid))
+     :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+     :head-get (fn [graph] (get @heads graph))
+     :head-put! (fn [graph chain] (swap! heads assoc graph chain))
+     :blind-fn passthrough
+     :encrypt-fn passthrough
+     :decrypt-fn passthrough}))
+
+;; `handle` returns a plain value on :clj, a js/Promise on :cljs
+;; (ADR-2607051000's platform split, inherited unchanged). `run-steps`
+;; threads a sequence of (fn [] ...) steps through that split uniformly:
+;; on :clj each step runs synchronously in order; on :cljs each step's
+;; Promise is awaited before the next runs, and `cljs.test/async`'s `done`
+;; is called only once the whole chain settles -- otherwise cljs.test moves
+;; on before any assertion inside a `.then` callback ever runs, silently
+;; reporting 0 assertions instead of failing loudly.
+(defn- run-steps [steps]
+  #?(:clj (doseq [step steps] (step))
+     :cljs (reduce (fn [p step] (.then p (fn [_] (step)))) (js/Promise.resolve nil) steps)))
+
+(deftest transact-datoms-q-pull-fold-roundtrip
+  (let [store (mem-store)]
+    #?(:clj
+       (run-steps
+        [(fn []
+           (let [tx (h/handle store "transact"
+                               {:graph "g1" :tx_edn "[{:db/id \"e1\" :yoro.post/text \"hello\"}]"} "did:key:ztest")]
+             (is (:ok tx))
+             (is (= 1 (:datom_count tx)))))
+         (fn []
+           (let [datoms (h/handle store "datoms" {:graph "g1"} nil)]
+             (is (:ok datoms))
+             (is (= 1 (count (:datoms datoms))))
+             (is (= ":yoro.post/text" (:a (first (:datoms datoms)))))))
+         (fn []
+           (let [q (h/handle store "q" {:graph "g1" :query_edn "[nil \":yoro.post/text\" nil]"} nil)]
+             (is (:ok q))
+             (is (= 1 (count (:rows q))))
+             (is (= "hello" (:o (first (:rows q)))))))
+         (fn []
+           (let [pull (h/handle store "pull" {:graph "g1" :entity "e1"} nil)]
+             (is (:ok pull))
+             (is (contains? (:attrs pull) ":yoro.post/text"))))
+         (fn []
+           (let [fold (h/handle store "fold" {:graph "g1"} nil)]
+             (is (:ok fold))
+             (is (:folded fold))))])
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (.then (h/handle store "transact"
+                                     {:graph "g1" :tx_edn "[{:db/id \"e1\" :yoro.post/text \"hello\"}]"} "did:key:ztest")
+                            (fn [tx]
+                              (is (:ok tx))
+                              (is (= 1 (:datom_count tx))))))
+              (fn [] (.then (h/handle store "datoms" {:graph "g1"} nil)
+                            (fn [datoms]
+                              (is (:ok datoms))
+                              (is (= 1 (count (:datoms datoms))))
+                              (is (= ":yoro.post/text" (:a (first (:datoms datoms))))))))
+              (fn [] (.then (h/handle store "q" {:graph "g1" :query_edn "[nil \":yoro.post/text\" nil]"} nil)
+                            (fn [q]
+                              (is (:ok q))
+                              (is (= 1 (count (:rows q))))
+                              (is (= "hello" (:o (first (:rows q))))))))
+              (fn [] (.then (h/handle store "pull" {:graph "g1" :entity "e1"} nil)
+                            (fn [pull]
+                              (is (:ok pull))
+                              (is (contains? (:attrs pull) ":yoro.post/text")))))
+              (fn [] (.then (h/handle store "fold" {:graph "g1"} nil)
+                            (fn [fold]
+                              (is (:ok fold))
+                              (is (:folded fold)))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest transact-accepts-db-add-list-form
+  (testing "standard Datomic list-form [:db/add e a v] tuples -- NOT just
+           map-form entities -- e.g. cloud-murakumo.queue-kotoba's
+           job->tx/event->tx build tx_edn exclusively out of these; before
+           this fix every such transact hit tx-edn->quads's :else branch
+           (\"unrecognized tx_edn item\"), surfaced by `handle`'s outer
+           try/catch as a generic {:ok false :error \"InternalError\"} with
+           no indication of the real cause"
+    (let [store (mem-store)]
+      #?(:clj
+         (run-steps
+          [(fn []
+             (let [tx (h/handle store "transact"
+                                 {:graph "g2"
+                                  :tx_edn "[[:db/add \"e1\" :gen.job/id \"job-1\"] [:db/add \"e1\" :gen.job/status :queued]]"}
+                                 "did:key:ztest")]
+               (is (:ok tx))
+               (is (= 2 (:datom_count tx)))))
+           (fn []
+             (let [datoms (h/handle store "datoms" {:graph "g2"} nil)]
+               (is (:ok datoms))
+               (is (= 2 (count (:datoms datoms))))
+               (is (some #(= ":gen.job/id" (:a %)) (:datoms datoms)))
+               (is (some #(= ":gen.job/status" (:a %)) (:datoms datoms)))))])
+         :cljs
+         (async
+          done
+          (-> (run-steps
+               [(fn [] (.then (h/handle store "transact"
+                                       {:graph "g2"
+                                        :tx_edn "[[:db/add \"e1\" :gen.job/id \"job-1\"] [:db/add \"e1\" :gen.job/status :queued]]"}
+                                       "did:key:ztest")
+                              (fn [tx]
+                                (is (:ok tx))
+                                (is (= 2 (:datom_count tx))))))
+                (fn [] (.then (h/handle store "datoms" {:graph "g2"} nil)
+                              (fn [datoms]
+                                (is (:ok datoms))
+                                (is (= 2 (count (:datoms datoms)))))))])
+              (.then (fn [_] (done)))
+              (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))))
+
+(deftest tx-edn->quads-db-add-matches-map-form-shape
+  (testing "list-form and map-form produce the same {:s :p :o} quad shape
+           for equivalent data (no :op key on either -- that's retract-only)"
+    (is (= (h/tx-edn->quads "[{:db/id \"e1\" :ns/attr \"v\"}]")
+           (h/tx-edn->quads "[[:db/add \"e1\" :ns/attr \"v\"]]")))))
+
+(deftest unknown-method-is-clean-error
+  (let [store (mem-store)]
+    #?(:clj
+       (let [resp (h/handle store "bogus" {} nil)]
+         (is (not (:ok resp)))
+         (is (= "MethodNotImplemented" (:error resp))))
+       :cljs
+       (async
+        done
+        (-> (h/handle store "bogus" {} nil)
+            (.then (fn [resp]
+                     (is (not (:ok resp)))
+                     (is (= "MethodNotImplemented" (:error resp)))
+                     (done))))))))
+
+;; ── datomic.* extension coverage ──────────────────────────────────────────
+;; `step` collapses the platform-split boilerplate `run-steps` (above)
+;; already threads through: :clj calls `f` synchronously on `handle`'s
+;; plain return; :cljs chains `f` via `.then` on `handle`'s Promise, and
+;; the resulting Promise is itself what `run-steps`'s own `.then`-reduce
+;; chains on -- composes correctly either way, `f` only ever does `is`
+;; assertions and its return value is discarded.
+
+(defn- step [store method body auth-did f]
+  (fn []
+    #?(:clj (f (h/handle store method body auth-did))
+       :cljs (.then (h/handle store method body auth-did) f))))
+
+(defn- run-async [steps]
+  #?(:clj (run-steps steps)
+     :cljs (async done
+             (-> (run-steps steps)
+                 (.then (fn [_] (done)))
+                 (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(deftest entity-entid-ident-and-pattern-pull-roundtrip
+  (let [store (mem-store)]
+    (run-async
+     [(step store "transact"
+            {:graph "g2" :tx_edn "[{:db/id \"alice\" :name \"Alice\" :db/ident :person/alice} {:db/id \"bob\" :name \"Bob\"}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "entity" {:graph "g2" :entity "alice"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= {":name" #{"Alice"} ":db/ident" #{":person/alice"}} (edn/read-string (:entity_edn resp))))))
+      (step store "entid" {:graph "g2" :ident_edn ":person/alice"} nil
+            (fn [resp] (is (:ok resp)) (is (= "alice" (:entity_id resp)))))
+      (step store "entid" {:graph "g2" :ident_edn "\"bob\""} nil
+            (fn [resp] (is (:ok resp)) (is (= "bob" (:entity_id resp)))
+              "a plain (non-keyword) id passes through unchanged"))
+      (step store "ident" {:graph "g2" :entity "alice"} nil
+            (fn [resp] (is (:ok resp)) (is (= :person/alice (edn/read-string (:ident_edn resp))))))
+      (step store "ident" {:graph "g2" :entity "bob"} nil
+            (fn [resp] (is (:ok resp)) (is (nil? (edn/read-string (:ident_edn resp))))))
+      (step store "pull" {:graph "g2" :entity "alice" :pattern_edn "[\":name\"]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= {":name" #{"Alice"}} (edn/read-string (:result_edn resp))))
+              "pattern path returns exactly the requested attrs, not the whole entity"))
+      (step store "pullMany" {:graph "g2" :entities ["alice" "bob"] :pattern_edn "[*]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:results_edn resp))))
+              (is (= #{"Alice"} (get (edn/read-string (first (:results_edn resp))) ":name")))))
+      (step store "indexPull" {:graph "g2" :entities ["bob"] :pattern_edn "[*]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{"Bob"} (get (edn/read-string (first (:results_edn resp))) ":name")))
+              "indexPull is a direct alias of pullMany"))])))
+
+(deftest as-of-since-history-across-two-commits
+  (let [store (mem-store)
+        t0 (atom nil)]
+    (run-async
+     [(step store "transact" {:graph "g3" :tx_edn "[{:db/id \"e1\" :n 1}]"} "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "basisT" {:graph "g3"} nil
+            (fn [resp] (is (:ok resp)) (reset! t0 (:t resp))))
+      (step store "transact" {:graph "g3" :tx_edn "[{:db/id \"e2\" :n 2}]"} "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      ;; asOf/since's body depends on t0, only known after the first
+      ;; `step` above actually runs -- `step`'s own `body` arg is
+      ;; evaluated eagerly at list-construction time, before t0 is set, so
+      ;; these two can't use `step` the way the other calls do; write the
+      ;; platform split directly instead, same as `step` does internally.
+      (fn []
+        #?(:clj (let [resp (h/handle store "asOf" {:graph "g3" :t @t0} nil)]
+                  (is (:ok resp))
+                  (is (= 1 (count (:datoms resp))))
+                  (is (= "e1" (:e (first (:datoms resp))))
+                      "asOf t0 must not see e2, committed after t0"))
+           :cljs (.then (h/handle store "asOf" {:graph "g3" :t @t0} nil)
+                        (fn [resp]
+                          (is (:ok resp))
+                          (is (= 1 (count (:datoms resp))))
+                          (is (= "e1" (:e (first (:datoms resp)))))))))
+      (fn []
+        #?(:clj (let [resp (h/handle store "since" {:graph "g3" :t @t0} nil)]
+                  (is (:ok resp))
+                  (is (= 1 (count (:datoms resp))))
+                  (is (= "e2" (:e (first (:datoms resp))))
+                      "since t0 must see ONLY e2, the commit after t0"))
+           :cljs (.then (h/handle store "since" {:graph "g3" :t @t0} nil)
+                        (fn [resp]
+                          (is (:ok resp))
+                          (is (= 1 (count (:datoms resp))))
+                          (is (= "e2" (:e (first (:datoms resp)))))))))
+      (step store "history" {:graph "g3"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:datoms resp))) "history sees both commits, unfiltered")))
+      (step store "history" {:graph "g3" :entity "e1"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 1 (count (:datoms resp))))
+              (is (= "e1" (:e (first (:datoms resp)))) "entity filter narrows correctly")))])))
+
+(deftest basis-t-and-db-stats
+  (let [store (mem-store)]
+    (run-async
+     [(step store "basisT" {:graph "fresh-graph"} nil
+            (fn [resp] (is (:ok resp)) (is (nil? (:t resp))) "no commit yet -> nil t, not an error"))
+      (step store "dbStats" {:graph "fresh-graph"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (false? (:has_snapshot resp)))
+              (is (zero? (:novelty_size resp)))))
+      (step store "transact" {:graph "g4" :tx_edn "[{:db/id \"e1\" :n 1}]"} "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "basisT" {:graph "g4"} nil
+            (fn [resp] (is (:ok resp)) (is (= 0 (:t resp)))))
+      (step store "dbStats" {:graph "g4"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 0 (:t resp)))
+              (is (false? (:has_snapshot resp)) "no fold yet")
+              (is (= 1 (:novelty_size resp)))))])))
+
+(deftest seek-datoms-and-index-range
+  (let [store (mem-store)]
+    (run-async
+     [(step store "transact"
+            {:graph "g5" :tx_edn "[{:db/id \"e1\" :score 10} {:db/id \"e2\" :score 20} {:db/id \"e3\" :score 30}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "seekDatoms" {:graph "g5" :index ":eavt" :components_edn ["e2"]} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 1 (count (:datoms resp))))
+              (is (= "e2" (:e (first (:datoms resp)))))))
+      ;; start_edn/end_edn must be EDN-typed to match what's actually
+      ;; stored -- this engine stringifies every non-Link value at write
+      ;; time (kotobase-server's own tx-edn->quads, `(str v)`), so
+      ;; `:score 10` is stored (and v_edn-decodes back) as the STRING
+      ;; "10", never the number 10. A bare `"15"` here would edn/read-string
+      ;; to the NUMBER 15, and `compare`ing a String against a Long throws
+      ;; -- see do-index-range's own docstring for why this is a real,
+      ;; documented engine limitation (lexicographic, not numeric, string
+      ;; comparison), not something to silently paper over here.
+      (step store "indexRange" {:graph "g5" :attr ":score" :start_edn "\"15\"" :end_edn "\"25\""} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 1 (count (:datoms resp))))
+              (is (= "e2" (:e (first (:datoms resp)))) "only score=20 falls in [15,25]")))
+      (step store "indexRange" {:graph "g5" :attr ":score" :start_edn "\"15\""} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:datoms resp))) "unbounded end -> e2,e3 (score>=15)")))
+      (step store "indexRange" {:graph "g5" :attr ":score" :start_edn "15"} nil
+            (fn [resp]
+              (is (not (:ok resp)))
+              (is (= "InternalError" (:error resp)))
+              "a bare (non-string) start_edn edn/read-strings to a NUMBER,
+               which `compare`s against the stored STRING and throws
+               SYNCHRONOUSLY, before do-index-range ever reaches its own
+               then*/hot-datoms call -- regression coverage for `handle`'s
+               own cljs Promise-contract gap on that path (previously
+               untested: a plain map instead of a Promise, breaking every
+               caller's `.then`)"))])))
+
+(deftest tx-tx-range-log-sync
+  (let [store (mem-store)]
+    (run-async
+     [(step store "transact" {:graph "g6" :tx_edn "[{:db/id \"e1\" :n 1}]"} "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "transact" {:graph "g6" :tx_edn "[{:db/id \"e2\" :n 2}]"} "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "tx" {:graph "g6" :t 0} nil
+            (fn [resp] (is (:ok resp)) (is (true? (:found resp))) (is (some? (:tx_cid resp)))))
+      (step store "tx" {:graph "g6" :t 99} nil
+            (fn [resp] (is (:ok resp)) (is (false? (:found resp))) (is (nil? (:tx_cid resp)))))
+      (step store "txRange" {:graph "g6" :start 0 :end 1} nil
+            (fn [resp] (is (:ok resp)) (is (= 1 (count (:txs resp)))) (is (= 0 (:t (first (:txs resp)))))))
+      (step store "log" {:graph "g6"} nil
+            (fn [resp] (is (:ok resp)) (is (= 2 (count (:txs resp))) "log with no bounds = the whole tx-range")))
+      (step store "sync" {:graph "g6" :t 1} nil
+            (fn [resp] (is (:ok resp)) (is (true? (:caught_up resp)))))
+      (step store "sync" {:graph "g6" :t 99} nil
+            (fn [resp] (is (:ok resp)) (is (false? (:caught_up resp)))
+              "an unreached t is reported honestly, not blocked on"))])))
+
+(deftest tx-range-log-sync-reject-non-integer-bounds
+  (testing "a non-integer :start/:end/:t must be REJECTED, not silently
+            read as 'nothing in range'/'not caught up' -- in cljs, bare
+            `>=`/`<` compile to native JS relational operators, and
+            `(>= 5 \"abc\")` is `false` (no throw), the same silently-
+            wrong-not-rejected shape as the already-fixed do-q bug"
+    (let [store (mem-store)]
+      (run-async
+       [(step store "transact" {:graph "g7" :tx_edn "[{:db/id \"e1\" :n 1}]"} "did:key:ztest"
+              (fn [tx] (is (:ok tx))))
+        (step store "txRange" {:graph "g7" :start "abc" :end 1} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))))
+        (step store "txRange" {:graph "g7" :start 0 :end "abc"} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))))
+        (step store "log" {:graph "g7" :start "abc"} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))
+                "do-log is a direct alias of do-tx-range -- same guard applies"))
+        (step store "sync" {:graph "g7" :t "abc"} nil
+              (fn [resp]
+                (is (not (:ok resp)))
+                (is (= "InternalError" (:error resp)))))]))))
+
+(deftest do-q-routes-datalog-map-queries-to-the-right-engine
+  (let [store (mem-store)]
+    (run-async
+     [(step store "transact"
+            {:graph "g7" :tx_edn "[{:db/id \"e1\" :name \"Alice\" :role \"admin\"} {:db/id \"e2\" :name \"Bob\" :role \"user\"}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "q" {:graph "g7" :query_edn "[nil \":role\" \"admin\"]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 1 (count (:rows resp))))
+              (is (= "e1" (:s (first (:rows resp)))) "unchanged: triple-pattern still routes to eng/q")))
+      (step store "q" {:graph "g7"
+                        :query_edn "{:find [?n] :where [[?e \":role\" \"admin\"] [?e \":name\" ?n]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["Alice"]} (set (:rows resp))))
+              "map-shaped query_edn now actually routes to eng/query (the real
+               Datalog engine) instead of being silently mistreated as an
+               empty/malformed triple pattern"))])))
+
+(deftest with-produces-a-non-durable-db-after-for-follow-on-reads
+  (let [store (mem-store)
+        speculative "[[:db/add \"e1\" :name \"Alicia\"]]"
+        query "{:find [?n] :where [[\"e1\" :name ?n]]}"]
+    (run-async
+     [(step store "transact"
+            {:graph "with-g" :tx_edn "[{:db/id \"e1\" :name \"Alice\"}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "basisT" {:graph "with-g"} nil
+            (fn [resp] (is (= 0 (:t resp)))))
+      (step store "with" {:graph "with-g" :tx_edn speculative} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 0 (:basis_t resp)))
+              (is (= speculative (:with_edn resp)))
+              (is (= 1 (count (:tx_data resp))))))
+      (step store "q" {:graph "with-g" :query_edn query :with_edn speculative} nil
+            (fn [resp]
+              (is (= #{["Alice"] ["Alicia"]} (set (:rows resp))))
+              "db-after is addressable by carrying its speculative tx-data"))
+      (step store "datoms" {:graph "with-g" :with_edn speculative} nil
+            (fn [resp]
+              (is (= #{"Alice" "Alicia"}
+                     (set (map #(edn/read-string (:v_edn %)) (:datoms resp)))))))
+      (step store "q" {:graph "with-g" :query_edn query} nil
+            (fn [resp]
+              (is (= #{["Alice"]} (set (:rows resp))))
+              "ordinary reads remain on the durable database"))
+      (step store "basisT" {:graph "with-g"} nil
+            (fn [resp]
+              (is (= 0 (:t resp)) "with never advances the durable head")))])))
+
+(deftest hosted-client-transactions-enforce-schema-and-builtins-atomically
+  (let [store (mem-store)
+        schema-tx
+        (pr-str [{:db/id "schema/name" :db/ident :person/name
+                  :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/one}
+                 {:db/id "schema/email" :db/ident :person/email
+                  :db/valueType :db.type/string
+                  :db/unique :db.unique/identity}
+                 {:db/id "schema/age" :db/ident :person/age
+                  :db/valueType :db.type/long
+                  :db/cardinality :db.cardinality/one}
+                 {:db/id "schema/tags" :db/ident :person/tags
+                  :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/many}])
+        basis (atom nil)]
+    (run-async
+     [(step store "transact" {:graph "schema-g" :tx_edn schema-tx
+                                :enforce_schema true} "did:key:ztest"
+            (fn [resp] (is (:ok resp) (pr-str resp))))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[{:db/id \"alice\" :person/name \"Alice\" :person/email \"a@example.test\" :person/age 42 :person/tags [\"author\" \"admin\"]}]"}
+            "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "q"
+            {:graph "schema-g"
+             :query_edn "{:find [?tag] :where [[\"alice\" :person/tags ?tag]]}"}
+            nil
+            (fn [resp]
+              (is (= #{["author"] ["admin"]} (set (:rows resp)))
+                  "cardinality-many entity-map values expand to individual datoms")))
+      (step store "basisT" {:graph "schema-g"} nil
+            (fn [resp] (reset! basis (:t resp))))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[{:db/id \"bob\" :person/email \"a@example.test\"}]"}
+            "did:key:ztest"
+            (fn [resp]
+              (is (false? (:ok resp)))
+              (is (= "InternalError" (:error resp)))))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[{:db/id \"alice\" :person/age \"forty-two\"}]"}
+            "did:key:ztest"
+            (fn [resp] (is (false? (:ok resp)))))
+      (step store "basisT" {:graph "schema-g"} nil
+            (fn [resp]
+              (is (= @basis (:t resp))
+                  "failed schema transactions never advance the head")))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[[:db.fn/cas \"alice\" :person/name \"Alice\" \"Alicia\"]]"}
+            "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "q"
+            {:graph "schema-g"
+             :query_edn "{:find [?n] :where [[\"alice\" :person/name ?n]]}"}
+            nil
+            (fn [resp]
+              (is (= #{["Alicia"]} (set (:rows resp)))
+                  "CAS plus cardinality-one leaves exactly the replacement")))
+      (step store "transact"
+            {:graph "schema-g" :enforce_schema true
+             :tx_edn "[[:db.fn/retractAttribute \"alice\" :person/name]]"}
+            "did:key:ztest" (fn [resp] (is (:ok resp))))
+      (step store "q"
+            {:graph "schema-g"
+             :query_edn "{:find [?n] :where [[\"alice\" :person/name ?n]]}"}
+            nil (fn [resp] (is (empty? (:rows resp)))))])))
+
+;; ── query-literal normalization (the live "q sees nothing datoms sees"
+;; bug, confirmed against backend.kotobase.net 2026-07-09): the write path
+;; stores every non-Link position stringified (tx-edn->quads, `(str v)`),
+;; so a query written the natural Datomic way -- keyword attributes,
+;; keyword/number value literals -- previously compared a keyword/number
+;; against the stored string, matched nothing, and returned ok+empty rows.
+
+(deftest do-q-normalizes-keyword-and-number-literals-to-the-stored-strings
+  (let [store (mem-store)]
+    (run-async
+     [(step store "transact"
+            {:graph "g8"
+             :tx_edn "[{:db/id \"w1\" :gh.genko/title \"First\" :gh.genko/status :draft :gh.genko/rev 3} {:db/id \"w2\" :gh.genko/title \"Second\" :gh.genko/status :done :gh.genko/rev 7}]"}
+            "did:key:ztest"
+            (fn [tx] (is (:ok tx))))
+      (step store "q" {:graph "g8" :query_edn "[nil :gh.genko/title nil]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:rows resp)))
+                  "triple pattern with a KEYWORD attribute now matches the stored string attr")))
+      (step store "q" {:graph "g8" :query_edn "{:find [?e ?t] :where [[?e :gh.genko/title ?t]]}"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["w1" "First"] ["w2" "Second"]} (set (:rows resp)))
+                  "Datalog clause with a KEYWORD attribute now matches")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :where [[?e :gh.genko/status :draft] [?e :gh.genko/title ?t]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["First"]} (set (:rows resp)))
+                  "a KEYWORD value literal matches the stored \":draft\" string")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :where [[?e :gh.genko/rev 7] [?e :gh.genko/title ?t]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["Second"]} (set (:rows resp)))
+                  "a NUMBER value literal matches the stored \"7\" string")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :in [?s] :where [[?e :gh.genko/status ?s] [?e :gh.genko/title ?t]]}"
+                        :inputs_edn "[:done]"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["Second"]} (set (:rows resp)))
+                  "a KEYWORD input (:in binding) is coerced the same way")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :where [[?e :gh.genko/title ?t] (not [?e :gh.genko/status :done])]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["First"]} (set (:rows resp)))
+                  "literals inside (not [...]) are normalized too")))
+      (step store "q" {:graph "g8"
+                        :query_edn "{:find [?t] :rules [[(drafted ?e) [?e :gh.genko/status :draft]]] :where [(drafted ?e) [?e :gh.genko/title ?t]]}"}
+            nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= #{["First"]} (set (:rows resp)))
+                  "literals inside :rules bodies are normalized too")))
+      ;; unchanged behavior: string-literal queries (every existing caller)
+      (step store "q" {:graph "g8" :query_edn "[nil \":gh.genko/title\" nil]"} nil
+            (fn [resp]
+              (is (:ok resp))
+              (is (= 2 (count (:rows resp))) "pre-existing string-attr form still works")))])))
+
+(deftest normalize-query-literals-is-precise-about-what-it-touches
+  (testing "pattern syntax and structured literals pass through untouched"
+    (is (= [nil ":a/b" nil] (h/normalize-query-literals [nil :a/b nil])))
+    (is (= '{:find [?e] :where [[?e ":x" "s"] [(> ?n 18)] [(str ?a ?b) ?c]]}
+           (h/normalize-query-literals
+            '{:find [?e] :where [[?e :x "s"] [(> ?n 18)] [(str ?a ?b) ?c]]}))
+        "predicate/function clauses are NOT coerced -- they evaluate over
+         bound values, they aren't matched against stored datoms")
+    (is (= '{:where [[?e ":ref" ["ipld/link" "bafy..."]]]}
+           (h/normalize-query-literals '{:where [[?e :ref ["ipld/link" "bafy..."]]]}))
+        "collection literals (a Link's wire form) keep today's behavior")
+    (is (= '{:where [[?e ":x" ?v] (or [?v ":k" "1"] [?v ":k" "2"])]}
+           (h/normalize-query-literals
+            '{:where [[?e :x ?v] (or [?v :k 1] [?v :k 2])]}))
+        "or-branches are normalized; lvars stay lvars")
+    (is (= '{:where [(or-join [?v] [?v ":k" ":kw"])]}
+           (h/normalize-query-literals '{:where [(or-join [?v] [?v :k :kw])]}))
+        "or-join keeps its shared-vars vector, normalizes its branches")))
+
+;; ── blob surface (ADR-2607175000: DataLad/git-annex content-addressed 永続化) ──
+
+(deftest blob-put-get-head-roundtrip
+  (testing "blob-put で保存 → head present → get で bytes 復元（datom 面と独立）"
+    (let [store (mem-store)
+          key "SHA256E-s3--abc"
+          bytes "BYTES"]
+      (is (= {:ok true :key key} (h/handle-blob store "put" key bytes "did:example:owner")))
+      (is (= {:ok true :key key :present true} (h/handle-blob store "head" key nil nil)))
+      (is (= {:ok true :key key :data bytes} (h/handle-blob store "get" key nil nil))))))
+
+(deftest blob-head-absent
+  (let [store (mem-store)]
+    (is (= {:ok true :key "K" :present false} (h/handle-blob store "head" "K" nil nil)))
+    (is (= "NotFound" (:error (h/handle-blob store "get" "K" nil nil))))))
+
+(deftest blob-remove-tombstones-then-reput-clears
+  (testing "REMOVE で present=false（immutable block は残るが tombstone）、再 PUT で解除"
+    (let [store (mem-store)
+          key "SHA256E-s1--z"]
+      (h/handle-blob store "put" key "v" "did:owner")
+      (is (:present (h/handle-blob store "head" key nil nil)))
+      (h/handle-blob store "remove" key nil "did:owner")
+      (is (not (:present (h/handle-blob store "head" key nil nil))) "removed → absent")
+      (is (= "NotFound" (:error (h/handle-blob store "get" key nil nil))))
+      (h/handle-blob store "put" key "v2" "did:owner")
+      (is (:present (h/handle-blob store "head" key nil nil)) "re-put clears tombstone")
+      (is (= "v2" (:data (h/handle-blob store "get" key nil nil)))))))
+
+(deftest blob-writes-require-auth
+  (testing "put/remove は auth-did 無しで Unauthorized、get/head は auth 不要"
+    (let [store (mem-store)]
+      (is (= "Unauthorized" (:error (h/handle-blob store "put" "K" "v" nil))))
+      (is (= "Unauthorized" (:error (h/handle-blob store "remove" "K" nil nil))))
+      ;; auth 無しでも read は通る
+      (is (= false (:present (h/handle-blob store "head" "K" nil nil)))))))
+
+(deftest blob-unknown-op
+  (is (= "MethodNotImplemented" (:error (h/handle-blob (mem-store) "frob" "K" nil "did:x")))))
+
+(deftest private-blob-surface-requires-resource-capability-and-content-digest
+  (let [store (assoc (mem-store) :security-mode :private)
+        key (str "SHA256E-s3--"
+                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        bytes #?(:clj (byte-array (map byte [97 98 99]))
+                 :cljs (js/Uint8Array.from #js [97 98 99]))
+        resource (str "kotoba://blob/" key)
+        writer {:did "did:owner" :effective-caps #{resource "kotoba://can/blob:put"}}
+        reader {:did "did:reader" :effective-caps #{resource "kotoba://can/blob:read"}}
+        remover {:did "did:owner" :effective-caps #{resource "kotoba://can/blob:remove"}}]
+    (is (= "AccessDenied" (:error (h/handle-blob store "put" key bytes "did:owner"))))
+    (is (= "ContentDigestMismatch"
+           (:error (h/handle-blob store "put" key
+                                  #?(:clj (byte-array (map byte [120 121 122]))
+                                     :cljs (js/Uint8Array.from #js [120 121 122]))
+                                  writer))))
+    (is (:ok (h/handle-blob store "put" key bytes writer)))
+    (is (= "AccessDenied" (:error (h/handle-blob store "get" key nil nil))))
+    (is (:ok (h/handle-blob store "get" key nil reader)))
+    (is (= "AccessDenied" (:error (h/handle-blob store "remove" key nil writer))))
+    (is (:ok (h/handle-blob store "remove" key nil remover)))))
+
+;; ── visibility redaction (ADR-2607174500 Phase 3b) ────────────────────────────
+
+#?(:cljs
+   (deftest visibility-policy-redacts-reads-and-capability-opens
+     (async done
+       (let [store (mem-store)
+             caps {:did "did:web:reader"
+                   :resources ["kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact"
+                       {:graph "vis-g"
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":dm.\\\"]\"} "
+                                     "{:db/id \"m1\" :dm.message/text \"secret\"} "
+                                     "{:db/id \"p1\" :public/note \"open\"}]")}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph "vis-g"} nil)))
+             (.then (fn [r]
+                      (let [attrs (set (map :a (:datoms r)))]
+                        (is (contains? attrs ":public/note"))
+                        (is (not (contains? attrs ":dm.message/text"))
+                            "datoms redacts for anonymous"))
+                      (h/handle store "pull" {:graph "vis-g" :entity "m1"} nil)))
+             (.then (fn [r]
+                      (is (empty? (:attrs r)) "pull (flat) redacts the protected entity")
+                      (h/handle store "entity" {:graph "vis-g" :entity "m1"} nil)))
+             (.then (fn [r]
+                      (is (= "{}" (:entity_edn r)) "entity map redacted for anonymous")
+                      (h/handle store "q" {:graph "vis-g" :query_edn "[nil \":dm.message/text\" nil]"} nil)))
+             (.then (fn [r]
+                      (is (empty? (:rows r)) "q redacts protected rows")
+                      (h/handle store "datoms" {:graph "vis-g"} caps)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "datom:read-protected opens datoms")
+                      (h/handle store "entity" {:graph "vis-g" :entity "m1"} caps)))
+             (.then (fn [r]
+                      (is (re-find #"secret" (str (:entity_edn r)))
+                          "capability opens entity pull")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest visibility-policy-less-graph-is-public
+     (async done
+       (let [store (mem-store)]
+         (-> (h/handle store "transact"
+                       {:graph "vis-g" :tx_edn "[{:db/id \"m1\" :dm.message/text \"hi\"}]"}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph "vis-g"} nil)))
+             (.then (fn [r]
+                      (is (contains? (set (map :a (:datoms r))) ":dm.message/text")
+                          "no policy → fully public (zero regression)")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   ;; ADR-2607280100 D3, at the SERVER surface. kotobase-peer decides the row
+   ;; filter (D6: the judgment lives in one place); this test only pins that
+   ;; the decision REACHES a request that arrives over the wire, which is the
+   ;; thing an untrusted client cannot be relied on to do for itself.
+   ;;
+   ;; It discriminates in both directions on purpose. Before the kotobase-peer
+   ;; pin advance (4926d13 -> ed3ae49) clearance was binary, so a
+   ;; `read-classified/confidential` capability granted NOTHING and the
+   ;; `:dm.` assertions below were invisible -- this test fails at the old pin
+   ;; for the reason it names, not by crashing.
+   (deftest clearance-levels-are-enforced-at-the-server-surface
+     (async done
+       (let [store (mem-store)
+             ;; The prefix LIST says what is protected; a level says how much.
+             ;; `:secret.` is deliberately left UNLEVELLED -- that means
+             ;; `:restricted`, the top case, which is exactly what the binary
+             ;; rule already meant.
+             tx (pr-str [{:db/id "kotobase.policy/read"
+                          :kotobase.policy/protected-prefixes
+                          (pr-str [":dm." ":secret."])
+                          :kotobase.policy/prefix-levels {":dm." :confidential}}
+                         {:db/id "m1" :dm.message/text "conf"}
+                         {:db/id "s1" :secret.key/value "top"}
+                         {:db/id "p1" :public/note "open"}])
+             attrs-for (fn [caps]
+                         (-> (h/handle store "datoms" {:graph "clr-g"} caps)
+                             (.then (fn [r] (set (map :a (:datoms r)))))))
+             confidential {:did "did:web:analyst"
+                           :resources ["kotoba://can/datom:read-classified/confidential"]}
+             legacy {:did "did:web:admin"
+                     :resources ["kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact" {:graph "clr-g" :tx_edn tx} "did:web:x")
+             (.then (fn [r] (is (:ok r) (pr-str r)) (attrs-for nil)))
+             (.then (fn [a]
+                      (is (contains? a ":public/note"))
+                      (is (not (contains? a ":dm.message/text"))
+                          "anonymous reaches neither level")
+                      (is (not (contains? a ":secret.key/value")))
+                      (attrs-for confidential)))
+             (.then (fn [a]
+                      (is (contains? a ":public/note"))
+                      (is (contains? a ":dm.message/text")
+                          "confidential clearance reaches a :confidential prefix")
+                      (is (not (contains? a ":secret.key/value"))
+                          "and no higher: an unlevelled prefix is :restricted")
+                      (attrs-for legacy)))
+             (.then (fn [a]
+                      (is (contains? a ":dm.message/text"))
+                      (is (contains? a ":secret.key/value")
+                          "the legacy read-protected grant is still top clearance")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest private-metadata-surface-requires-read-capability
+     (async done
+       (let [store (assoc (mem-store) :security-mode :private)
+             reader {:did "did:web:reader"
+                     :resources ["kotoba://can/datom:read"]}]
+         (-> (h/handle store "transact"
+                       {:graph "private-g"
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":secret.\\\"]\" "
+                                     ":kotobase.policy/write-prefixes \"[\\\":app.\\\"]\" "
+                                     ":kotobase.policy/security-mode :private}]")}
+                       "did:web:admin")
+             (.then (fn [tx]
+                      (is (:ok tx))
+                      (h/handle store "transact"
+                                {:graph "private-g"
+                                 :tx_edn "[{:db/id \"e\" :app.value \"x\"}]"}
+                                "did:web:admin")))
+             (.then (fn [tx]
+                      (is (:ok tx))
+                      (h/handle store "dbStats" {:graph "private-g"} nil)))
+             (.then (fn [denied]
+                      (is (= "AccessDenied" (:error denied)))
+                      (h/handle store "dbStats" {:graph "private-g"} reader)))
+             (.then (fn [allowed]
+                      (is (:ok allowed))
+                      (is (= 2 (:novelty_size allowed)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest owner-based-disclosure-server
+     (async done
+       (let [store (mem-store)
+             alice {:did "did:web:alice" :resources []}]
+         (-> (h/handle store "transact"
+                       {:graph "own-g"
+                        :tx_edn (str "[{:db/id \"kotobase.policy/read\" "
+                                     ":kotobase.policy/protected-prefixes \"[\\\":dm.\\\"]\" "
+                                     ":kotobase.policy/owner-attrs \"[\\\":dm.message/author\\\"]\"} "
+                                     "{:db/id \"m1\" :dm.message/author \"did:web:alice\" :dm.message/text \"mine\"} "
+                                     "{:db/id \"m2\" :dm.message/author \"did:web:bob\" :dm.message/text \"hers\"}]")}
+                       "did:web:x")
+             (.then (fn [_] (h/handle store "datoms" {:graph "own-g"} alice)))
+             (.then (fn [r]
+                      (let [texts (set (keep #(when (= ":dm.message/text" (:a %)) (:v_edn %)) (:datoms r)))]
+                        (is (contains? texts "\"mine\"") "owner sees own protected row")
+                        (is (not (contains? texts "\"hers\"")) "owner does not see another's"))
+                      (h/handle store "datoms" {:graph "own-g"} nil)))
+             (.then (fn [r]
+                      (is (empty? (filter #(= ":dm.message/text" (:a %)) (:datoms r)))
+                          "anonymous sees no protected rows")
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+#?(:cljs
+   (deftest protected-rows-cannot-influence-joins-aggregates-pull-or-history
+     (async done
+       (let [store (assoc (mem-store) :security-mode :private)
+             reader {:did "did:reader" :resources ["kotoba://can/datom:read"]}
+             protected-reader {:did "did:auditor"
+                               :resources ["kotoba://can/datom:read"
+                                           "kotoba://can/datom:read-protected"]}]
+         (-> (h/handle store "transact"
+                       {:graph "infer-g"
+                        :tx_edn (pr-str [{:db/id "kotobase.policy/read"
+                                         :kotobase.policy/protected-prefixes
+                                         (pr-str [":secret."])
+                                         :kotobase.policy/write-prefixes
+                                         (pr-str [":public." ":secret."])
+                                         :kotobase.policy/security-mode :private}])}
+                       "did:admin")
+             (.then (fn [_]
+                      (h/handle store "transact"
+                                {:graph "infer-g"
+                                 :tx_edn "[{:db/id \"e1\" :public.name \"Alice\" :secret.flag \"yes\"}]"}
+                                "did:admin")))
+             (.then (fn [_]
+                      (h/handle store "q"
+                                {:graph "infer-g"
+                                 :query_edn "{:find [?name] :where [[?e \":secret.flag\" \"yes\"] [?e \":public.name\" ?name]]}"}
+                                reader)))
+             (.then (fn [joined]
+                      (is (empty? (:rows joined)) "hidden clause cannot select a public projection")
+                      (h/handle store "q"
+                                {:graph "infer-g"
+                                 :query_edn "{:find [(count ?e)] :where [[?e \":secret.flag\" _]]}"}
+                                reader)))
+             (.then (fn [aggregate]
+                      (is (= [[0]] (:rows aggregate)) "aggregate observes zero authorized rows")
+                      (h/handle store "pullMany"
+                                {:graph "infer-g" :entities ["e1"] :pattern_edn "[*]"}
+                                reader)))
+             (.then (fn [pulled]
+                      (is (not (re-find #"secret" (str (:results_edn pulled)))))
+                      (h/handle store "history" {:graph "infer-g" :entity "e1"} reader)))
+             (.then (fn [history]
+                      (is (empty? (filter #(= ":secret.flag" (:a %)) (:datoms history))))
+                      (h/handle store "q"
+                                {:graph "infer-g"
+                                 :query_edn "{:find [(count ?e)] :where [[?e \":secret.flag\" _]]}"}
+                                protected-reader)))
+             (.then (fn [allowed]
+                      (is (= [[1]] (:rows allowed)))
+                      (done)))
+             (.catch (fn [e] (is false (str "rejected: " e)) (done))))))))
+
+;; ── kg.ingest / kg.ingest_batch (ai.gftd.apps.kotobase.kg.*) ────────────────
+
+(deftest kg-entity->quads-projects-scalars-claims-and-relations
+  (is (= #{{:s "e1" :p "kg/entity/type" :o "plm.item"}
+           {:s "e1" :p "kg/entity/labelEn" :o "Widget"}
+           {:s "e1" :p "kg/claim/plm.item/part-no" :o "PN-1"}
+           {:s "e1" :p "kg/relation/plm.bom/child" :o "e2"}}
+         (set (h/kg-entity->quads
+               {:id "e1" :type "plm.item" :labelEn "Widget"
+                :claims [{:pred "plm.item/part-no" :value "PN-1"}]
+                :relations [{:pred "plm.bom/child" :dstId "e2"}]})))
+      "the REAL live caller's camelCase pred/value/dstId shape (cloud-itonami)"))
+
+(deftest kg-entity->quads-accepts-the-lexicons-snake-case-shape-too
+  (is (= #{{:s "e1" :p "kg/entity/labelEn" :o "Widget"}
+           {:s "e1" :p "kg/claim/plm.item/part-no" :o "PN-1"}
+           {:s "e1" :p "kg/relation/plm.bom/child" :o "e2"}}
+         (set (h/kg-entity->quads
+               {:id "e1" :label_en "Widget"
+                :claims [{:predicate "plm.item/part-no" :object "PN-1"}]
+                :relations [{:predicate "plm.bom/child" :target "e2"}]})))
+      "ai.gftd.apps.kotobase.kg.ingest's own documented predicate/object/target shape"))
+
+(deftest kg-entity->quads-requires-an-id
+  (is (thrown? #?(:clj Exception :cljs :default)
+               (h/kg-entity->quads {:type "plm.item"}))))
+
+(deftest kg-subject-cid-is-deterministic-content-addressed-and-real
+  (let [entity {:id "e1" :type "x"}]
+    (is (= (h/kg-subject-cid entity) (h/kg-subject-cid entity))
+        "same entity -> same CID (deterministic)")
+    (is (not= (h/kg-subject-cid entity) (h/kg-subject-cid (assoc entity :type "y")))
+        "different content -> different CID (content-addressed, not a fabricated string)")
+    (is (str/starts-with? (h/kg-subject-cid entity) "b")
+        "CIDv1 base32-lower multibase, ipld.core's own convention")))
+
+(deftest kg-ingest-commits-quads-and-returns-a-real-content-cid
+  (let [store (mem-store)]
+    (run-async
+     [(step store "kg.ingest"
+            {:graph "kg1" :id "crm.lead:1" :type "crm.lead" :labelEn "selftest"
+             :claims [{:pred "crm.lead/source" :value "kg-ingest-test"}]
+             :relations []}
+            "did:key:ztest"
+            (fn [r]
+              (is (:ok r))
+              (is (string? (:subjectCid r)))
+              (is (= 3 (:quadCount r)) "2 entity-scalar quads (type, labelEn) + 1 claim quad")
+              (is (some? (:commit r)))))
+      (step store "datoms" {:graph "kg1"} nil
+            (fn [r]
+              (let [rows (set (map #(select-keys % [:e :a :v_edn]) (:datoms r)))]
+                (is (contains? rows {:e "crm.lead:1" :a "kg/entity/labelEn" :v_edn "\"selftest\""}))
+                (is (contains? rows {:e "crm.lead:1" :a "kg/claim/crm.lead/source" :v_edn "\"kg-ingest-test\""})))))])))
+
+(deftest kg-ingest-batch-commits-every-entity-in-one-chain-advance
+  (let [store (mem-store)
+        entities [{:id "e1" :type "plm.item" :claims [{:pred "p" :value "v1"}] :relations []}
+                  {:id "e2" :type "plm.item" :claims [{:pred "p" :value "v2"}] :relations []}]]
+    (run-async
+     [(step store "kg.ingest_batch" {:graph "kg2" :entities entities} "did:key:ztest"
+            (fn [r]
+              (is (:ok r))
+              (is (= 2 (:ingested r)))
+              (is (= 2 (count (:subjectCids r))))
+              (is (= 4 (:quadCount r)) "2 entities x (1 type quad + 1 claim quad)")))
+      (step store "datoms" {:graph "kg2"} nil
+            (fn [r] (is (= 4 (count (:datoms r))))))])))
+
+(deftest kg-ingest-is-exactly-as-write-gated-as-a-datom-write
+  ;; A verified viewer lacking the transact capability must be denied --
+  ;; kg.ingest reuses policy/assert-write-authorized! verbatim (kg-commit!),
+  ;; the SAME gate datomic.transact itself cannot bypass.
+  (let [store (mem-store)
+        no-transact-cap {:did "did:web:reader" :effective-caps #{}}]
+    (run-async
+     [(step store "kg.ingest" {:graph "kg3" :id "e1" :type "x"} no-transact-cap
+            (fn [r]
+              (is (not (:ok r)))
+              (is (= "AccessDenied" (:error r)))
+              (is (nil? ((:head-get store) "kg3")) "denied write never advances the graph head")))])))
+
+(deftest hot-db-memoization-seam
+  ;; :db-cache-get/:db-cache-put! (optional, chain-cid-keyed): a cache HIT
+  ;; must serve `q` without touching :get-fn at all (no rehydration); a
+  ;; write moves the head to a NEW chain-cid, so the next `q` is a MISS
+  ;; (fresh hydration, new cache entry) -- staleness is impossible by
+  ;; construction, not by invalidation.
+  (let [base (mem-store)
+        gets (atom 0)
+        miss-gets (atom 0)
+        db-cache (atom {})
+        store (assoc base
+                     :get-fn (fn [cid] (swap! gets inc) ((:get-fn base) cid))
+                     :db-cache-get (fn [chain] (get @db-cache chain))
+                     :db-cache-put! (fn [chain db] (swap! db-cache assoc chain db)))
+        tx1 (fn [] (h/handle store "transact"
+                             {:graph "gm" :tx_edn "[{:db/id \"e1\" :memo/v \"a\"}]"} "did:key:ztest"))
+        tx2 (fn [] (h/handle store "transact"
+                             {:graph "gm" :tx_edn "[{:db/id \"e2\" :memo/v \"b\"}]"} "did:key:ztest"))
+        q (fn [] (h/handle store "q" {:graph "gm" :query_edn "[nil \":memo/v\" nil]"} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx1))))
+         (fn []
+           (let [r (q)]
+             (is (:ok r))
+             (is (= 1 (count (:rows r))))
+             (is (= 1 (count @db-cache)) "first q populates one chain-cid entry")))
+         (fn []
+           (let [miss-gets @gets]
+             (reset! gets 0)
+             (let [r (q)]
+               (is (= 1 (count (:rows r))))
+               (is (< @gets miss-gets)
+                   "cache hit: no rehydration -- only the O(1) per-request policy read remains"))))
+         (fn [] (is (:ok (tx2))))
+         (fn []
+           (reset! gets 0)
+           (let [r (q)]
+             (is (= 2 (count (:rows r))) "post-write q sees new data (new chain-cid = miss)")
+             (is (pos? @gets) "miss hydrates through :get-fn again")
+             (is (= 2 (count @db-cache)) "each chain-cid gets its own entry")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx1))
+             (.then (fn [tx] (is (:ok tx)) (q)))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= 1 (count (:rows r))))
+                      (is (= 1 (count @db-cache)) "first q populates one chain-cid entry")
+                      (reset! miss-gets @gets)
+                      (reset! gets 0)
+                      (q)))
+             (.then (fn [r]
+                      (is (= 1 (count (:rows r))))
+                      (is (< @gets @miss-gets)
+                          "cache hit: no rehydration -- only the O(1) per-request policy read remains")
+                      (tx2)))
+             (.then (fn [tx] (is (:ok tx)) (reset! gets 0) (q)))
+             (.then (fn [r]
+                      (is (= 2 (count (:rows r))) "post-write q sees new data (new chain-cid = miss)")
+                      (is (pos? @gets) "miss hydrates through :get-fn again")
+                      (is (= 2 (count @db-cache)) "each chain-cid gets its own entry")
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest hot-db-rows-cache-seam-serves-the-snapshot-across-fresh-stores
+  ;; :rows-cache-get/:rows-cache-put! (snapshot-cid-keyed, serialized rows):
+  ;; unlike the L1 db cache (in-process value), this tier survives across
+  ;; store instances -- the shape of "another isolate in the same colo".
+  ;; Only populated once a fold has produced an indexed snapshot.
+  (let [blocks (atom {}) heads (atom {}) rows-cache (atom {}) gets (atom 0)
+        mk-store (fn []
+                   {:get-fn (fn [cid] (swap! gets inc) (get @blocks cid))
+                    :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+                    :head-get (fn [graph] (get @heads graph))
+                    :head-put! (fn [graph chain] (swap! heads assoc graph chain))
+                    :blind-fn passthrough :encrypt-fn passthrough :decrypt-fn passthrough
+                    ;; engine contract (hydrate-db-cached): sync bytes|nil on
+                    ;; JVM, Promise-returning on cljs -- a sync value on cljs
+                    ;; throws inside the engine's own .then chain.
+                    :rows-cache-get (fn [k] (passthrough (get @rows-cache k)))
+                    :rows-cache-put! (fn [k s] (passthrough (swap! rows-cache assoc k s)))})
+        store1 (mk-store)
+        q1 (fn [s] (h/handle s "q" {:graph "gr" :query_edn "[nil \":rc/v\" nil]"} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (h/handle store1 "transact"
+                                   {:graph "gr" :tx_edn "[{:db/id \"e1\" :rc/v \"a\"}]"} "did:key:ztest"))))
+         (fn [] (is (:ok (h/handle store1 "fold" {:graph "gr"} nil)) "fold produces the snapshot"))
+         (fn []
+           (let [r (q1 store1)]
+             (is (= 1 (count (:rows r))))
+             (is (= 1 (count @rows-cache)) "snapshot rows cached under its snapshot-cid")))
+         (fn []
+           (let [store2 (mk-store)          ; fresh store value = fresh isolate shape
+                 miss-free-baseline @gets]
+             (reset! gets 0)
+             (let [r (q1 store2)]
+               (is (= 1 (count (:rows r))) "second store answers identically")
+               (is (< @gets miss-free-baseline)
+                   "snapshot came from the rows cache, not a fresh block walk"))))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (h/handle store1 "transact"
+                                           {:graph "gr" :tx_edn "[{:db/id \"e1\" :rc/v \"a\"}]"} "did:key:ztest"))
+             (.then (fn [tx] (is (:ok tx)) (h/handle store1 "fold" {:graph "gr"} nil)))
+             (.then (fn [f] (is (:ok f) "fold produces the snapshot") (q1 store1)))
+             (.then (fn [r]
+                      (is (= 1 (count (:rows r))))
+                      (is (= 1 (count @rows-cache)) "snapshot rows cached under its snapshot-cid")
+                      (let [baseline @gets]
+                        (reset! gets 0)
+                        (-> (js/Promise.resolve (q1 (mk-store)))
+                            (.then (fn [r2]
+                                     (is (= 1 (count (:rows r2))) "second store answers identically")
+                                     (is (< @gets baseline)
+                                         "snapshot came from the rows cache, not a fresh block walk")
+                                     (done)))))))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest sparql-answers-the-same-rows-as-datalog
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gs" :tx_edn "[{:db/id \"e1\" :sp/name \"alice\" :sp/age 30} {:db/id \"e2\" :sp/name \"bob\"}]"}
+                            "did:key:ztest"))
+        sparql (fn [q] (h/handle store "sparql" {:graph "gs" :sparql q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (sparql "SELECT ?e WHERE { ?e <:sp/name> \"alice\" }")]
+             (is (:ok r))
+             (is (= [["e1"]] (:rows r)))
+             (is (= ["?e"] (:vars r)))))
+         (fn []
+           (let [r (sparql "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } LIMIT 1")]
+             (is (:ok r))
+             (is (= 1 (count (:rows r))) "LIMIT applied")))
+         (fn []
+           (let [r (sparql "SELECT * WHERE { ?e <:sp/age> ?v }")]
+             (is (:ok r))
+             (is (= [["e1" "30"]] (:rows r)) "SELECT * binds all vars; numbers stored as strings")))
+         (fn []
+           ;; The retired subset refused a WHERE whose only content is an
+           ;; OPTIONAL. That is legal SPARQL and it binds ?e perfectly well,
+           ;; so the surface answers it now — the one deliberate divergence
+           ;; of the swap (ADR-2608039970; recorded in
+           ;; sparql_snapshot_test's `snapshot` too).
+           (let [r (sparql "SELECT ?e WHERE { OPTIONAL { ?e <:sp/name> ?n } }")]
+             (is (:ok r))
+             (is (= #{["e1"] ["e2"]} (set (:rows r))))))
+         (fn []
+           (let [r (sparql "SELECT ?x WHERE { ?e <:sp/name> ?n }")]
+             (is (false? (:ok r)) "unbound SELECT var rejected")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (sparql "SELECT ?e WHERE { ?e <:sp/name> \"alice\" }")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["e1"]] (:rows r)))
+                      (is (= ["?e"] (:vars r)))
+                      (sparql "SELECT ?e ?n WHERE { ?e <:sp/name> ?n } LIMIT 1")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= 1 (count (:rows r))) "LIMIT applied")
+                      (sparql "SELECT * WHERE { ?e <:sp/age> ?v }")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["e1" "30"]] (:rows r)))
+                      (sparql "SELECT ?e WHERE { OPTIONAL { ?e <:sp/name> ?n } }")))
+             (.then (fn [r]
+                      ;; see the :clj branch — the swap's one deliberate
+                      ;; divergence: an OPTIONAL-only WHERE is legal and is
+                      ;; answered now instead of refused.
+                      (is (:ok r))
+                      (is (= #{["e1"] ["e2"]} (set (:rows r))))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-basic-subset-compiles-to-the-same-rows-as-datalog
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gc" :tx_edn "[{:db/id \"p1\" :sp/name \"alice\" :sp/knows \"p2\"} {:db/id \"p2\" :sp/name \"bob\"}]"}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "gc" :cypher q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (cy "MATCH (a {sp/name: \"alice\"}) RETURN a")]
+             (is (:ok r))
+             (is (= [["p1"]] (:rows r)))
+             (is (= ["?a"] (:vars r)))))
+         (fn []
+           (let [r (cy "MATCH (a)-[:sp/knows]->(b) RETURN a, b")]
+             (is (:ok r))
+             (is (= [["p1" "p2"]] (:rows r)) "relationship chain compiles to a join clause")))
+         (fn []
+           (let [r (cy "MATCH (a)-[:sp/knows]->(b) WHERE a.sp/name = \"alice\" RETURN b LIMIT 1")]
+             (is (:ok r))
+             (is (= [["p2"]] (:rows r)))))
+         (fn []
+           (let [r (cy "MATCH (a) RETURN a")]
+             (is (false? (:ok r)) "bare unbound node rejected, never an implicit scan")
+             (is (= "UnsupportedCypher" (:error r)))))
+         (fn []
+           (let [r (cy "OPTIONAL MATCH (a {sp/name: \"x\"}) RETURN a")]
+             (is (false? (:ok r)))
+             (is (re-find #"MATCH" (:message r)) "error carries the supported grammar")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy "MATCH (a {sp/name: \"alice\"}) RETURN a")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["p1"]] (:rows r)))
+                      (cy "MATCH (a)-[:sp/knows]->(b) RETURN a, b")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["p1" "p2"]] (:rows r)))
+                      (cy "MATCH (a)-[:sp/knows]->(b) WHERE a.sp/name = \"alice\" RETURN b LIMIT 1")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= [["p2"]] (:rows r)))
+                      (cy "MATCH (a) RETURN a")))
+             (.then (fn [r]
+                      (is (false? (:ok r)) "bare unbound node rejected")
+                      (is (= "UnsupportedCypher" (:error r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-handler-executes-primary-and-optional-paths
+  ;; Parser/executor tests supply adjacency directly. This handler-level test
+  ;; guards the production seam: do-cypher must derive adjacency from the hot
+  ;; db or every accepted path query fails only after deployment.
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gcp"
+                             :tx_edn (str "[{:db/id \"p1\" :label \"Person\" :id \"1\" :knows \"p2\"} "
+                                          "{:db/id \"p2\" :label \"Person\" :id \"2\" :knows \"p3\"} "
+                                          "{:db/id \"p3\" :label \"Person\" :id \"3\"} "
+                                          "{:db/id \"c9\" :label \"City\" :id \"9\"}]")}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "gcp" :cypher q} nil))
+        primary "MATCH (a:Person {id: \"1\"})-[:knows*1..2]-(b:Person) RETURN b.id ORDER BY b.id"
+        optional (str "MATCH (a:Person {id: \"1\"}) "
+                      "OPTIONAL MATCH (a)-[:knows*1..2]-(b:Person) "
+                      "RETURN a.id, b.id ORDER BY b.id")
+        miss (str "MATCH (a:City {id: \"9\"}) "
+                  "OPTIONAL MATCH (a)-[:knows*1..2]-(b) RETURN a.id, b.id")]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn [] (is (= [["2"] ["3"]] (:rows (cy primary)))))
+         (fn [] (is (= [["1" "2"] ["1" "3"]] (:rows (cy optional)))))
+         (fn [] (is (= [["9" nil]] (:rows (cy miss)))))] )
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy primary)))
+             (.then (fn [r]
+                      (is (= [["2"] ["3"]] (:rows r)))
+                      (cy optional)))
+             (.then (fn [r]
+                      (is (= [["1" "2"] ["1" "3"]] (:rows r)))
+                      (cy miss)))
+             (.then (fn [r]
+                      (is (= [["9" nil]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-create-reuses-the-authorized-transaction-path
+  (let [store (mem-store)
+        create-q "CREATE (n:Person {id: \"cp1\", name: \"Ada\"}) RETURN n"
+        create! #(h/handle store "cypher" {:graph "gcw" :cypher create-q}
+                           "did:key:ztest")
+        read! #(h/handle store "cypher"
+                         {:graph "gcw"
+                          :cypher "MATCH (n:Person {id: \"cp1\"}) RETURN n.name"}
+                         nil)]
+    #?(:clj
+       (run-steps
+        [(fn []
+           (let [denied (h/handle store "cypher" {:graph "gcw" :cypher create-q} nil)]
+             (is (= "AccessDenied" (:error denied)))))
+         (fn []
+           (let [created (create!)]
+             (is (:ok created))
+             (is (= "CREATE" (:write created)))
+             (is (= ["cp1"] (:created created)))
+             (is (= [["cp1"]] (:rows created)))))
+         (fn [] (is (= [["Ada"]] (:rows (read!)))))])
+       :cljs
+       (async done
+         (-> (h/handle store "cypher" {:graph "gcw" :cypher create-q} nil)
+             (.then (fn [denied]
+                      (is (= "AccessDenied" (:error denied)))
+                      (create!)))
+             (.then (fn [created]
+                      (is (:ok created))
+                      (is (= "CREATE" (:write created)))
+                      (is (= ["cp1"] (:created created)))
+                      (is (= [["cp1"]] (:rows created)))
+                      (read!)))
+             (.then (fn [read]
+                      (is (= [["Ada"]] (:rows read)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-reads-query-index-ranges-without-hydrating-the-graph
+  (let [hydrations (atom 0)
+        store (assoc (mem-store)
+                     :db-cache-get (constantly nil)
+                     :db-cache-put! (fn [_ _] (swap! hydrations inc)))
+        tx #(h/handle store "transact"
+                      {:graph "gc-indexed"
+                       :tx_edn "[{:db/id \"p1\" :sp/name \"alice\" :sp/knows \"p2\"} {:db/id \"p2\" :unrelated/value \"large-graph-tail\"}]"}
+                      "did:key:ztest")
+        cy #(h/handle store "cypher"
+                      {:graph "gc-indexed"
+                       :cypher "MATCH (a {sp/name: \"alice\"})-[:sp/knows]->(b) RETURN b"}
+                      nil)]
+    #?(:clj
+       (do
+         (is (:ok (tx)))
+         (is (= [["p2"]] (:rows (cy))))
+         (is (zero? @hydrations)
+             "Cypher must not populate the full-db hydration cache"))
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy)))
+             (.then (fn [r]
+                      (is (= [["p2"]] (:rows r)))
+                      (is (zero? @hydrations)
+                          "Cypher must not populate the full-db hydration cache")
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest sparql-depth-optional-filter-aggregates
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gd" :tx_edn "[{:db/id \"p1\" :d/name \"alice\" :d/age 30 :d/city \"tokyo\"} {:db/id \"p2\" :d/name \"bob\" :d/age 20 :d/city \"tokyo\"} {:db/id \"p3\" :d/name \"carol\" :d/city \"osaka\"}]"}
+                            "did:key:ztest"))
+        sq (fn [q] (h/handle store "sparql" {:graph "gd" :sparql q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (sq "SELECT ?n ?a WHERE { ?e <:d/name> ?n . OPTIONAL { ?e <:d/age> ?a } }")]
+             (is (:ok r))
+             (is (= #{["alice" "30"] ["bob" "20"] ["carol" nil]} (set (:rows r)))
+                 "OPTIONAL left-joins; unmatched rows nil-fill")))
+         (fn []
+           (let [r (sq "SELECT ?n WHERE { ?e <:d/name> ?n . ?e <:d/age> ?a . FILTER(?a > 25) }")]
+             (is (:ok r))
+             (is (= [["alice"]] (:rows r)) "numeric FILTER on stringified numbers")))
+         (fn []
+           (let [r (sq "SELECT (COUNT(?e) AS ?c) ?city WHERE { ?e <:d/city> ?city } GROUP BY ?city")]
+             (is (:ok r))
+             (is (= #{[2 "tokyo"] [1 "osaka"]} (set (:rows r))))
+             (is (= ["?c" "?city"] (:vars r)))))
+         (fn []
+           (let [r (sq "SELECT (COUNT(?e) AS ?c) ?city WHERE { ?e <:d/city> ?city }")]
+             (is (false? (:ok r)) "bare var with aggregate but no GROUP BY rejected")))
+         (fn []
+           (let [r (sq "SELECT (SUM(?a) AS ?s) WHERE { ?e <:d/age> ?a }")]
+             (is (:ok r))
+             (is (= [[50.0]] (:rows r)) "SUM over numeric strings")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (sq "SELECT ?n ?a WHERE { ?e <:d/name> ?n . OPTIONAL { ?e <:d/age> ?a } }")))
+             (.then (fn [r]
+                      (is (:ok r))
+                      (is (= #{["alice" "30"] ["bob" "20"] ["carol" nil]} (set (:rows r))))
+                      (sq "SELECT ?n WHERE { ?e <:d/name> ?n . ?e <:d/age> ?a . FILTER(?a > 25) }")))
+             (.then (fn [r]
+                      (is (= [["alice"]] (:rows r)))
+                      (sq "SELECT (COUNT(?e) AS ?c) ?city WHERE { ?e <:d/city> ?city } GROUP BY ?city")))
+             (.then (fn [r]
+                      (is (= #{[2 "tokyo"] [1 "osaka"]} (set (:rows r))))
+                      (sq "SELECT (SUM(?a) AS ?s) WHERE { ?e <:d/age> ?a }")))
+             (.then (fn [r]
+                      (is (= [[50]] (:rows r)) "SUM over numeric strings (js number)")
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-depth-comparisons-and-count
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "ge" :tx_edn "[{:db/id \"p1\" :d/name \"alice\" :d/age 30} {:db/id \"p2\" :d/name \"bob\" :d/age 20}]"}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "ge" :cypher q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (cy "MATCH (p {d/name: \"alice\"}) WHERE p.d/age >= 25 RETURN p")]
+             (is (:ok r))
+             (is (= [["p1"]] (:rows r)) "comparison operator routes through the filter post-pass")))
+         (fn []
+           (let [r (cy "MATCH (p)-[:d/name]->(n) RETURN count(p)")]
+             (is (:ok r))
+             (is (= [[2]] (:rows r)))
+             (is (= ["?count_p"] (:vars r)) "default aggregate alias")))
+         (fn []
+           (let [r (cy "MATCH (p)-[:d/name]->(n) WHERE p.d/age < 25 RETURN count(p) AS c")]
+             (is (:ok r))
+             (is (= [[1]] (:rows r)))
+             (is (= ["?c"] (:vars r)))))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [r] (is (:ok r)) (cy "MATCH (p {d/name: \"alice\"}) WHERE p.d/age >= 25 RETURN p")))
+             (.then (fn [r]
+                      (is (= [["p1"]] (:rows r)))
+                      (cy "MATCH (p)-[:d/name]->(n) RETURN count(p)")))
+             (.then (fn [r]
+                      (is (= [[2]] (:rows r)))
+                      (cy "MATCH (p)-[:d/name]->(n) WHERE p.d/age < 25 RETURN count(p) AS c")))
+             (.then (fn [r]
+                      (is (= [[1]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest sparql-union-and-order-by
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gu" :tx_edn "[{:db/id \"p1\" :u/a \"x\" :u/n 3} {:db/id \"p2\" :u/b \"y\" :u/n 1} {:db/id \"p3\" :u/a \"z\" :u/n 2}]"}
+                            "did:key:ztest"))
+        sq (fn [q] (h/handle store "sparql" {:graph "gu" :sparql q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (sq "SELECT ?e WHERE { { ?e <:u/a> ?v } UNION { ?e <:u/b> ?v } }")]
+             (is (:ok r))
+             (is (= #{["p1"] ["p2"] ["p3"]} (set (:rows r))) "UNION is the bag union of both branches")))
+         (fn []
+           (let [r (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY DESC(?n)")]
+             (is (:ok r))
+             (is (= [["p1" "3"] ["p3" "2"] ["p2" "1"]] (:rows r)) "numeric DESC order")))
+         (fn []
+           (let [r (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY ?n LIMIT 2")]
+             (is (= [["p2" "1"] ["p3" "2"]] (:rows r)) "ASC + LIMIT top-n")))
+         (fn []
+           (let [r (sq "SELECT ?e WHERE { ?e <:u/n> ?n } ORDER BY ?missing")]
+             (is (false? (:ok r)) "ORDER BY unprojected var rejected")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [_] (sq "SELECT ?e WHERE { { ?e <:u/a> ?v } UNION { ?e <:u/b> ?v } }")))
+             (.then (fn [r]
+                      (is (= #{["p1"] ["p2"] ["p3"]} (set (:rows r))))
+                      (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY DESC(?n)")))
+             (.then (fn [r]
+                      (is (= [["p1" "3"] ["p3" "2"] ["p2" "1"]] (:rows r)))
+                      (sq "SELECT ?e ?n WHERE { ?e <:u/n> ?n } ORDER BY ?n LIMIT 2")))
+             (.then (fn [r]
+                      (is (= [["p2" "1"] ["p3" "2"]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+(deftest cypher-order-by
+  (let [store (mem-store)
+        tx (fn [] (h/handle store "transact"
+                            {:graph "gco" :tx_edn "[{:db/id \"p1\" :o/name \"c\" :o/n 3} {:db/id \"p2\" :o/name \"a\" :o/n 1}]"}
+                            "did:key:ztest"))
+        cy (fn [q] (h/handle store "cypher" {:graph "gco" :cypher q} nil))]
+    #?(:clj
+       (run-steps
+        [(fn [] (is (:ok (tx))))
+         (fn []
+           (let [r (cy "MATCH (p)-[:o/name]->(n) RETURN p, n ORDER BY n")]
+             (is (:ok r))
+             (is (= [["p2" "a"] ["p1" "c"]] (:rows r)) "ORDER BY the name var, ascending")))])
+       :cljs
+       (async done
+         (-> (js/Promise.resolve (tx))
+             (.then (fn [_] (cy "MATCH (p)-[:o/name]->(n) RETURN p, n ORDER BY n")))
+             (.then (fn [r]
+                      (is (= [["p2" "a"] ["p1" "c"]] (:rows r)))
+                      (done)))
+             (.catch (fn [e] (is false (str "unexpected: " e)) (done))))))))
+
+;; ── bounded fold (`max_novelty`) ────────────────────────────────────────────
+;; Root ADR-2609100100. `do-fold` passed nil/nil for `fold!`'s hydrate cache
+;; slots. Its own docstring explained why -- the store's `:db-cache-*` is
+;; CHAIN-keyed while `fold!`'s memo is SNAPSHOT-keyed, so feeding one into the
+;; other collides two key spaces -- and that reasoning is right. It simply
+;; never considered that the store carries a SECOND, snapshot-keyed pair:
+;; `:rows-cache-*`. So a fold re-paid the whole decrypt-and-scan on every
+;; attempt, which is the one thing `hydrate-db-cached` exists to prevent.
+;;
+;; This asserts the WIRING, because that is what was missing and because nil
+;; slots are silent: a fold with nil slots consults nothing and stores nothing
+;; while returning exactly the same answer. The counters go to zero if the
+;; slots are removed again, and the result assertions catch a fold that
+;; reaches the memo and gets it wrong.
+
+(defn- counting-rows-cache
+  "A `:rows-cache-*` pair over a plain map, counting both directions.
+   Promise-returning on cljs, plain on clj -- the same platform split the
+   real Cache-API-backed pair in xrpc.cljs has."
+  [gets puts]
+  (let [entries (atom {})]
+    {:rows-cache-get (fn [k]
+                       (swap! gets inc)
+                       #?(:clj (get @entries k)
+                          :cljs (js/Promise.resolve (get @entries k))))
+     :rows-cache-put! (fn [k v]
+                        (swap! puts inc)
+                        (swap! entries assoc k v)
+                        #?(:clj nil :cljs (js/Promise.resolve nil)))}))
+
+(defn- rows-cache-steps
+  "transact, fold, transact, fold. The SECOND fold is the one that matters:
+   the first has no prior snapshot -- `(indexed-cid state)` is nil -- so there
+   are no rows to memoise and the slots are correctly never touched. Asserting
+   on the first fold is how this test failed the first time it was written."
+  [store gets puts]
+  [(fn [] (h/handle store "transact"
+                    {:graph "rc" :tx_edn "[{:db/id \"a\" :t/v \"1\"}]"} "did:key:ztest"))
+   (fn [] (h/handle store "fold" {:graph "rc"} nil))
+   (fn [] (h/handle store "transact"
+                    {:graph "rc" :tx_edn "[{:db/id \"b\" :t/v \"2\"}]"} "did:key:ztest"))
+   (fn [] (do (reset! gets 0) (reset! puts 0) nil))
+   (fn [] (h/handle store "fold" {:graph "rc"} nil))
+   (fn []
+     (is (#?(:clj pos? :cljs zero?) @gets)
+         "incremental cljs fold does not hydrate the snapshot; JVM rebuild uses the cache")
+     (is (#?(:clj pos? :cljs zero?) @puts)
+         "incremental cljs fold does not serialize whole snapshot rows")
+     nil)
+   (fn [] (h/handle store "datoms" {:graph "rc"} nil))])
+
+(deftest fold-consults-and-fills-the-rows-cache
+  (let [gets (atom 0) puts (atom 0)
+        store (merge (mem-store) (counting-rows-cache gets puts))
+        steps (rows-cache-steps store gets puts)]
+    #?(:clj (run-steps steps)
+       :cljs (async done (-> (run-steps steps)
+                             (.then (fn [_] (done)))
+                             (.catch (fn [e] (is false (str "rows-cache steps rejected: " e)) (done))))))))
+
+;; Regression guard for a SILENT wire-field drop: `do-fold` used to
+;; destructure only `:graph`, so kotobase-client's long-standing
+;; `:max-novelty` opt (sent on the wire as `max_novelty`) was accepted and
+;; then ignored -- every fold ran unbounded. That is the exact runaway
+;; kotobase-peer's `fold!` docstring warns about: novelty only shrinks
+;; through a successful fold, so once one unbounded fold no longer fits in
+;; the Worker's CPU budget, nothing can ever shrink it again. Observed live
+;; on backend.kotobase.net 2026-07-25 (`outcome: exceededCpu`, 32.5s CPU).
+
+(defn- fold-steps-clj [store]
+  (doseq [n ["e1" "e2" "e3"]]
+    (is (:ok (h/handle store "transact"
+                       {:graph "bf" :tx_edn (str "[{:db/id \"" n "\" :t/v \"" n "\"}]")}
+                       "did:key:ztest"))))
+  (let [f1 (h/handle store "fold" {:graph "bf" :max_novelty 1} nil)]
+    (is (:ok f1))
+    (is (:folded f1))
+    (is (= 1 (:novelty_folded f1)) "bounded to the oldest 1")
+    (is (= 2 (:novelty_remaining f1)) "the other 2 are left for a later call"))
+  (let [f2 (h/handle store "fold" {:graph "bf" :max_novelty 10} nil)]
+    (is (= 2 (:novelty_folded f2)) "a bound larger than the backlog folds what is there")
+    (is (= 0 (:novelty_remaining f2))))
+  (let [f3 (h/handle store "fold" {:graph "bf" :max_novelty 5} nil)]
+    (is (:ok f3))
+    (is (false? (:folded f3)) "nothing left to fold is still a cheap no-op"))
+  (let [d (h/handle store "datoms" {:graph "bf"} nil)]
+    (is (:ok d))
+    (is (= 3 (count (:datoms d))) "every datom survives being folded in slices")))
+
+(deftest fold-max-novelty-bounds-one-call
+  (let [store (mem-store)]
+    #?(:clj (fold-steps-clj store)
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact" {:graph "bf" :tx_edn "[{:db/id \"e1\" :t/v \"e1\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "transact" {:graph "bf" :tx_edn "[{:db/id \"e2\" :t/v \"e2\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "transact" {:graph "bf" :tx_edn "[{:db/id \"e3\" :t/v \"e3\"}]"} "did:key:ztest"))
+              (fn [] (.then (h/handle store "fold" {:graph "bf" :max_novelty 1} nil)
+                            (fn [f]
+                              (is (:ok f))
+                              (is (:folded f))
+                              (is (= 1 (:novelty_folded f)) "bounded to the oldest 1")
+                              (is (= 2 (:novelty_remaining f)) "the other 2 are left for a later call"))))
+              (fn [] (.then (h/handle store "fold" {:graph "bf" :max_novelty 10} nil)
+                            (fn [f]
+                              (is (= 2 (:novelty_folded f)) "a bound larger than the backlog folds what is there")
+                              (is (= 0 (:novelty_remaining f))))))
+              (fn [] (.then (h/handle store "fold" {:graph "bf" :max_novelty 5} nil)
+                            (fn [f]
+                              (is (:ok f))
+                              (is (false? (:folded f)) "nothing left to fold is still a cheap no-op"))))
+              (fn [] (.then (h/handle store "datoms" {:graph "bf"} nil)
+                            (fn [d]
+                              (is (:ok d))
+                              (is (= 3 (count (:datoms d))) "every datom survives being folded in slices"))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest fold-ignores-non-positive-max-novelty
+  ;; Never trust a wire number straight into the engine: a 0/negative/non-
+  ;; numeric bound must degrade to the unbounded default, not to "fold
+  ;; nothing" (which would look like success while making no progress).
+  (let [store (mem-store)]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"a\" :t/v \"a\"}]"} "did:key:ztest")))
+         (is (:ok (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"b\" :t/v \"b\"}]"} "did:key:ztest")))
+         (let [f (h/handle store "fold" {:graph "bz" :max_novelty 0} nil)]
+           (is (:folded f))
+           (is (= 2 (:novelty_folded f)) "0 is ignored -> unbounded")
+           (is (= 0 (:novelty_remaining f)))))
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"a\" :t/v \"a\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "transact" {:graph "bz" :tx_edn "[{:db/id \"b\" :t/v \"b\"}]"} "did:key:ztest"))
+              (fn [] (.then (h/handle store "fold" {:graph "bz" :max_novelty 0} nil)
+                            (fn [f]
+                              (is (:folded f))
+                              (is (= 2 (:novelty_folded f)) "0 is ignored -> unbounded")
+                              (is (= 0 (:novelty_remaining f))))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+;; ── materialized views (`datomic.view`, ADR-2607166600) ─────────────────────
+;; Regression guard for the SAME class of silent wire-field drop as
+;; fold-max-novelty above: `do-fold` used to destructure `:graph`/
+;; `:max_novelty` but never `:views_edn`, so a caller's view declaration
+;; was accepted on the wire and silently dropped -- `do-view`/`datomic.view`
+;; had nothing to read because `eng/fold!` was always called with
+;; `views=nil`. There was also no `"view"` case in `handle` at all.
+
+(deftest fold-with-views-declares-a-view-then-view-reads-it-fresh
+  (let [store (mem-store)
+        view-spec {"v1" {"attrs" [":t/v"]}}
+        steps
+        [(fn [] (h/handle store "transact" {:graph "vw" :tx_edn "[{:db/id \"e1\" :t/v \"a\"} {:db/id \"e2\" :other/attr \"x\"}]"} "did:key:ztest"))
+         (fn [] (h/handle store "fold" {:graph "vw" :views_edn (pr-str view-spec)} nil))
+         (fn [] (h/handle store "transact" {:graph "vw" :tx_edn "[{:db/id \"e3\" :t/v \"b\"}]"} "did:key:ztest"))]]
+    #?(:clj
+       (do
+         (doseq [step (butlast steps)] (step))
+         (let [fold-resp ((second steps))]
+           (is (:ok fold-resp))
+           (is (:folded fold-resp) "a view declaration forces the fold even with novelty to spare"))
+         ((last steps))
+         (let [v (h/handle store "view" {:graph "vw" :view "v1"} nil)]
+           (is (:ok v))
+           (is (= 2 (count (:rows v))) "1 folded row + 1 fresh novelty row for the declared attr")
+           (is (every? #(= ":t/v" (:a %)) (:rows v)) "only the declared attr, :other/attr excluded")))
+       :cljs
+       (async
+        done
+        (-> ((first steps))
+            (.then (fn [_]
+                     (.then ((second steps))
+                            (fn [fold-resp]
+                              (is (:ok fold-resp))
+                              (is (:folded fold-resp) "a view declaration forces the fold even with novelty to spare")))))
+            (.then (fn [_] ((nth steps 2))))
+            (.then (fn [_] (h/handle store "view" {:graph "vw" :view "v1"} nil)))
+            (.then (fn [v]
+                     (is (:ok v))
+                     (is (= 2 (count (:rows v))) "1 folded row + 1 fresh novelty row for the declared attr")
+                     (is (every? #(= ":t/v" (:a %)) (:rows v)) "only the declared attr, :other/attr excluded")
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest fold-with-views-forces-the-fold-even-below-novelty-threshold
+  ;; Same silent-drop failure mode fold-max-novelty guards against, for
+  ;; the OTHER path into it: a caller can fold+declare a view in one call
+  ;; right after a PRIOR fold already cleared novelty to 0. Below-threshold
+  ;; folds are ordinarily a cheap no-op (see fold-ignores-non-positive-
+  ;; max-novelty) -- but that no-op must not also silently eat the view
+  ;; declaration.
+  (let [store (mem-store)]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact" {:graph "vw2" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")))
+         (is (:folded (h/handle store "fold" {:graph "vw2"} nil)) "clears novelty to 0 first")
+         (let [f (h/handle store "fold" {:graph "vw2" :views_edn (pr-str {"v2" {"attrs" [":t/v"]}})} nil)]
+           (is (:ok f))
+           (is (:folded f) "views forces the fold to actually run despite zero novelty"))
+         (let [v (h/handle store "view" {:graph "vw2" :view "v2"} nil)]
+           (is (:ok v))
+           (is (= 1 (count (:rows v))))))
+       :cljs
+       (async
+        done
+        (-> (h/handle store "transact" {:graph "vw2" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")
+            (.then (fn [_] (h/handle store "fold" {:graph "vw2"} nil)))
+            (.then (fn [f0] (is (:folded f0) "clears novelty to 0 first")))
+            (.then (fn [_] (h/handle store "fold" {:graph "vw2" :views_edn (pr-str {"v2" {"attrs" [":t/v"]}})} nil)))
+            (.then (fn [f]
+                     (is (:ok f))
+                     (is (:folded f) "views forces the fold to actually run despite zero novelty")))
+            (.then (fn [_] (h/handle store "view" {:graph "vw2" :view "v2"} nil)))
+            (.then (fn [v]
+                     (is (:ok v))
+                     (is (= 1 (count (:rows v))))
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest view-is-not-found-when-undeclared
+  (let [store (mem-store)]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact" {:graph "vw3" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")))
+         (let [v (h/handle store "view" {:graph "vw3" :view "nope"} nil)]
+           (is (false? (:ok v)))
+           (is (= "ViewNotFound" (:error v)))))
+       :cljs
+       (async
+        done
+        (-> (h/handle store "transact" {:graph "vw3" :tx_edn "[{:db/id \"e1\" :t/v \"a\"}]"} "did:key:ztest")
+            (.then (fn [_] (h/handle store "view" {:graph "vw3" :view "nope"} nil)))
+            (.then (fn [v]
+                     (is (false? (:ok v)))
+                     (is (= "ViewNotFound" (:error v)))
+                     (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest datoms-uses-async-get-fn-when-the-store-supplies-one
+  ;; The store seam that closes the O(N^2) trampoline cost: when
+  ;; `:async-get-fn` is present it must actually be REACHED by the read
+  ;; path (a silently-unused seam would look identical in every other
+  ;; assertion, which is how this stayed broken in production).
+  (let [store (mem-store)
+        calls (atom 0)
+        store (assoc store :async-get-fn
+                     (fn [cid]
+                       (swap! calls inc)
+                       #?(:clj ((:get-fn store) cid)
+                          :cljs (js/Promise.resolve ((:get-fn store) cid)))))]
+    #?(:clj
+       ;; :clj has no async path by contract (hot-datoms' async-get-fn is
+       ;; a :cljs-only effect) -- assert only that supplying it is inert
+       ;; there, never that it is called.
+       (do
+         (is (:ok (h/handle store "transact" {:graph "ag" :tx_edn "[{:db/id \"x\" :t/v \"x\"}]"} "did:key:ztest")))
+         (is (:ok (h/handle store "fold" {:graph "ag"} nil)))
+         (let [d (h/handle store "datoms" {:graph "ag"} nil)]
+           (is (:ok d))
+           (is (= 1 (count (:datoms d))))))
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact" {:graph "ag" :tx_edn "[{:db/id \"x\" :t/v \"x\"}]"} "did:key:ztest"))
+              (fn [] (h/handle store "fold" {:graph "ag"} nil))
+              (fn [] (reset! calls 0) nil)
+              (fn [] (.then (h/handle store "datoms" {:graph "ag"} nil)
+                            (fn [d]
+                              (is (:ok d))
+                              (is (= 1 (count (:datoms d))))
+                              (is (pos? @calls)
+                                  "the snapshot half went through async-get-fn, not the sync trampoline"))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+(deftest write-policy-reads-use-async-get-fn-after-fold
+  ;; A write still performs one narrow policy lookup. Once a graph has an
+  ;; indexed snapshot that lookup must use the same async block-discovery
+  ;; seam as ordinary reads; otherwise cljs falls back to sync scan-prefix
+  ;; inside a Promise continuation and leaks/retries block-miss one node at
+  ;; a time. Cover both shared write gates: transact and KG.
+  (let [store (mem-store)
+        calls (atom 0)
+        store (assoc store :async-get-fn
+                     (fn [cid]
+                       (swap! calls inc)
+                       #?(:clj ((:get-fn store) cid)
+                          :cljs (js/Promise.resolve ((:get-fn store) cid)))))]
+    #?(:clj
+       (do
+         (is (:ok (h/handle store "transact"
+                            {:graph "aw" :tx_edn "[{:db/id \"e1\" :t/v 1}]"}
+                            "did:key:ztest")))
+         (is (:ok (h/handle store "fold" {:graph "aw"} nil)))
+         (is (:ok (h/handle store "transact"
+                            {:graph "aw" :tx_edn "[{:db/id \"e2\" :t/v 2}]"}
+                            "did:key:ztest"))))
+       :cljs
+       (async
+        done
+        (-> (run-steps
+             [(fn [] (h/handle store "transact"
+                              {:graph "aw" :tx_edn "[{:db/id \"e1\" :t/v 1}]"}
+                              "did:key:ztest"))
+              (fn [] (h/handle store "fold" {:graph "aw"} nil))
+              (fn [] (reset! calls 0) nil)
+              (fn [] (.then (h/handle store "transact"
+                                     {:graph "aw" :tx_edn "[{:db/id \"e2\" :t/v 2}]"}
+                                     "did:key:ztest")
+                            (fn [result]
+                              (is (:ok result))
+                              (is (pos? @calls)
+                                  "transact policy lookup used async block discovery"))))
+              (fn [] (h/handle store "kg.ingest"
+                              {:graph "kg-aw" :id "kg-1" :type "test"}
+                              "did:key:ztest"))
+              (fn [] (h/handle store "fold" {:graph "kg-aw"} nil))
+              (fn [] (reset! calls 0) nil)
+              (fn [] (.then (h/handle store "kg.ingest"
+                                     {:graph "kg-aw" :id "kg-2" :type "test"}
+                                     "did:key:ztest")
+                            (fn [result]
+                              (is (:ok result))
+                              (is (pos? @calls)
+                                  "KG policy lookup used async block discovery"))))])
+            (.then (fn [_] (done)))
+            (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done))))))))
+
+#?(:cljs
+   (deftest cold-policy-and-owner-reads-use-direct-discovery
+     (async done
+       (let [store (mem-store)
+             tx (pr-str [{:db/id "kotobase.policy/read"
+                          :kotobase.policy/protected-prefixes "[\":dm.\"]"
+                          :kotobase.policy/owner-attrs "[\":dm.message/author\"]"}
+                         {:db/id "m1" :dm.message/text "one" :dm.message/author "did:web:alice"}
+                         {:db/id "m2" :dm.message/text "two" :dm.message/author "did:web:bob"}])]
+         (-> (h/handle store "transact" {:graph "cold-policy" :tx_edn tx} "did:web:x")
+             (.then (fn [_] (h/handle store "fold" {:graph "cold-policy"} nil)))
+             (.then
+              (fn [_]
+                (let [head ((:head-get store) "cold-policy")
+                      cold (assoc store
+                                  :get-fn (fn [cid]
+                                            (if (= cid head) ((:get-fn store) cid)
+                                                (throw (js/Error. "synchronous cold block read"))))
+                                  :async-get-fn (fn [cid] (js/Promise.resolve ((:get-fn store) cid))))
+                      read! (fn [auth] (h/handle cold "datoms" {:graph "cold-policy"} auth))
+                      messages (fn [r] (set (map :e (filter #(= ":dm.message/text" (:a %)) (:datoms r)))))]
+                  (-> (read! nil)
+                      (.then (fn [r]
+                               (is (:ok r)) (is (empty? (messages r)))
+                               (read! {:did "did:web:alice" :resources []})))
+                      (.then (fn [r]
+                               (is (:ok r)) (is (= #{"m1"} (messages r)))
+                               (read! {:did "did:web:reader" :resources ["kotoba://can/datom:read-protected"]})))
+                      (.then (fn [r]
+                               (is (:ok r)) (is (= #{"m1" "m2"} (messages r)))))))))
+             (.then (fn [_] (done)))
+             (.catch (fn [e] (is false (str e)) (done))))))))
+
+#?(:cljs
+   (deftest writes-persist-pruning-metadata-for-policy-and-attribute-reads
+     (async done
+       (-> (reduce
+            (fn [p method]
+              (.then p
+                     (fn [_]
+                       (let [decrypts (atom 0)
+                             store (assoc (mem-store) :decrypt-fn
+                                          (fn [bytes] (swap! decrypts inc) (passthrough bytes)))
+                             write! (fn [i]
+                                      (h/handle store method
+                                                (if (= method "transact")
+                                                  {:graph "metadata" :tx_edn (pr-str [{:db/id (str "noise-" i) :noise/value i}])}
+                                                  {:graph "metadata" :id (str "noise-" i) :type "noise"})
+                                                "did:key:ztest"))]
+                         (-> (reduce (fn [prior i] (.then prior (fn [_] (write! i))))
+                                     (js/Promise.resolve nil) (range 20))
+                             (.then (fn [_]
+                                      (reset! decrypts 0)
+                                      (write! 20)))
+                             (.then (fn [response]
+                                      (is (:ok response))
+                                      (is (= 0 @decrypts) (str method " policy lookup skips unrelated payloads"))
+                                      (reset! decrypts 0)
+                                      (h/handle store "datoms" {:graph "metadata" :index "aevt" :components_edn ["missing/attribute"]} nil)))
+                             (.then (fn [response]
+                                      (is (:ok response))
+                                      (is (empty? (:datoms response)))
+                                      (is (= 0 @decrypts) (str method " attribute lookup skips unrelated payloads")))))))))
+            (js/Promise.resolve nil) ["transact" "kg.ingest"])
+           (.catch #(is false (str %)))
+           (.finally done)))))
+
+#?(:cljs
+   (deftest cold-materialized-view-forwards-direct-block-discovery
+     (async done
+       (let [store (mem-store) sync-reads (atom 0) direct-reads (atom 0)]
+         (-> (h/handle store "transact" {:graph "view-cold"
+                                         :tx_edn "[{:db/id \"a\" :view/value \"kept\"}]"} "did:key:ztest")
+             (.then (fn [_] (h/handle store "fold" {:graph "view-cold"
+                                                    :views_edn "{\"values\" {\"attrs\" [\":view/value\"]}}"} nil)))
+             (.then
+              (fn [_]
+                (h/do-view (assoc store
+                                 :get-fn (fn [cid]
+                                           (when (> (swap! sync-reads inc) 2)
+                                             (throw (js/Error. "synchronous view data discovery")))
+                                           ((:get-fn store) cid))
+                                 :async-get-fn (fn [cid] (swap! direct-reads inc)
+                                                 (js/Promise.resolve ((:get-fn store) cid))))
+                           {:graph "view-cold" :view "values"})))
+             (.then (fn [result]
+                      (is (:ok result))
+                      (is (= ["a"] (mapv :e (:rows result))))
+                      (is (pos? @direct-reads))))
+             (.catch #(is false (str %))) (.finally done))))))

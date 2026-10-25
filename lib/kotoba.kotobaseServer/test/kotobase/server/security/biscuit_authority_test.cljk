@@ -1,0 +1,323 @@
+(ns kotobase.server.security.biscuit-authority-test
+  "The biscuit path into the same `:effective-caps` the handler reads."
+  (:require [biscuit.token :as bt]
+            [biscuit.wire :as bw]
+            ["node:fs" :as fs]
+            [protobuf.wire :as pb]
+            [cljs.test :refer-macros [deftest is testing]]
+            [kotobase.server.security.authority :as auth]
+            ["@noble/curves/ed25519.js" :refer [ed25519]]))
+
+(defn- keypair [seed]
+  (let [priv (js/Uint8Array.from (clj->js (vec seed)))]
+    {:private priv :public (vec (.getPublicKey ed25519 priv))}))
+
+(def root (keypair (range 32)))
+(def k1 (keypair (range 32 64)))
+(def attacker (keypair (map #(+ 100 %) (range 32))))
+
+(defn- sign-fn [priv payload]
+  (vec (.sign ed25519 (.encode (js/TextEncoder.) payload) priv)))
+
+(defn- token [facts & [{:keys [signer]}]]
+  (bt/authority {:facts facts :next-public-key (:public k1)
+                 :root-private-key (or signer (:private root)) :sign-fn sign-fn}))
+
+(def opts {:graph "acme" :tenant-id "t1" :root-public-key (:public root)
+           :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})
+
+(deftest a-biscuit-yields-the-same-shape-cacao-does
+  (let [r (auth/verify-biscuit (token '[[scope "kotoba://graph/acme"]
+                                        [scope "kotoba://can/read"]])
+                               opts)]
+    (is (true? (:delegated? r)))
+    (is (= :biscuit (:wire r)))
+    (is (contains? (:effective-caps r) "kotoba://graph/acme"))
+    (is (contains? (:effective-caps r) "kotoba://can/read"))))
+
+(deftest verification-uses-only-the-root-public-key
+  (testing "the property that lets this run at an edge"
+    (is (some? (auth/verify-biscuit (token '[[scope "kotoba://graph/acme"]]) opts)))
+    (testing "and a token minted by anyone else is refused"
+      (is (nil? (auth/verify-biscuit
+                 (token '[[scope "kotoba://graph/acme"]] {:signer (:private attacker)})
+                 opts))))))
+
+(deftest a-later-block-can-only-narrow
+  (let [t (-> (token '[[scope "kotoba://graph/acme"] [scope "kotoba://can/read"]])
+              (bt/append {:facts '[[scope "kotoba://graph/acme"]
+                                   [scope "kotoba://can/write"]]
+                          :next-public-key (:public k1)
+                          :private-key (:private k1) :sign-fn sign-fn}))
+        r (auth/verify-biscuit t opts)]
+    (testing "can/write was never conferred, so appending it confers nothing"
+      (is (= #{"kotoba://graph/acme"} (:effective-caps r))))))
+
+(deftest a-biscuit-cannot-name-a-resource-a-cacao-could-not
+  (testing "same three shape rules verify-grant enforces"
+    (is (nil? (auth/verify-biscuit (token '[[scope "kotoba://graph/acme"]
+                                            [scope "kotoba://evil/anything"]])
+                                   opts)))))
+
+(deftest the-graph-must-be-in-the-token
+  (is (nil? (auth/verify-biscuit (token '[[scope "kotoba://can/read"]]) opts))))
+
+(deftest tenant-binding-is-enforced-when-required
+  (let [t (token '[[scope "kotoba://graph/acme"]])]
+    (is (some? (auth/verify-biscuit t opts)))
+    (is (nil? (auth/verify-biscuit t (assoc opts :require-tenant-binding? true))))
+    (is (some? (auth/verify-biscuit (token '[[scope "kotoba://graph/acme"]
+                                             [scope "kotoba://tenant/t1"]])
+                                    (assoc opts :require-tenant-binding? true))))))
+
+(deftest an-expired-token-is-refused
+  (let [t (token '[[scope "kotoba://graph/acme"] [before "2026-08-01T00:00:00Z"]])]
+    (is (nil? (auth/verify-biscuit t opts)))
+    (is (some? (auth/verify-biscuit t (assoc opts :now-ms (.parse js/Date "2026-07-01T00:00:00Z")))))))
+
+(deftest a-tampered-block-is-refused
+  (let [t (token '[[scope "kotoba://graph/acme"]])
+        forged (assoc-in t [:biscuit/blocks 0 :block/facts]
+                         '[[scope "kotoba://graph/acme"] [scope "kotoba://can/admin"]])]
+    (is (nil? (auth/verify-biscuit forged opts)))))
+
+;; ── the wire path: a token another implementation minted ────────────────────
+
+(def ^:private samples-root-key
+  "biscuit-auth/biscuit samples/current/samples.json, `root_public_key`."
+  (mapv #(js/parseInt (subs "1055c750b1a1505937af1537c626ba3263995c33a64758aaafb1275b0312e284" % (+ % 2)) 16)
+        (range 0 64 2)))
+
+(deftest the-wire-entry-point-verifies-a-foreign-token
+  (testing "signature-wise: this is a real biscuit-auth token, and the server
+            path verifies it holding only the root public key"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test001_basic.bc")))]
+      ;; Its resources are `right(...)` facts, not kotoba:// scopes, so it
+      ;; confers nothing here — which is the correct answer, and a different
+      ;; one from "the signature was bad".
+      (is (nil? (auth/verify-biscuit-wire bytes
+                                          {:graph "acme" :tenant-id "t1"
+                                           :root-public-key samples-root-key
+                                           :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))
+      (testing "and the signature itself does verify, which is why the nil above
+                is about authority rather than about integrity"
+        (is (:ok? (bw/verify (bw/decode-token bytes)
+                                       samples-root-key
+                                       (fn [pk payload sig]
+                                         (try (.verify ed25519
+                                                       (js/Uint8Array.from (clj->js (vec sig)))
+                                                       (js/Uint8Array.from (clj->js (vec payload)))
+                                                       (js/Uint8Array.from (clj->js (vec pk))))
+                                              (catch :default _ false))))))))))
+
+(deftest the-wire-entry-point-refuses-a-token-signed-by-someone-else
+  (testing "and it must refuse before deciding what the token SAYS — deciding
+            first would mean reading an attacker's facts"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test002_different_root_key.bc")))]
+      (is (nil? (auth/verify-biscuit-wire bytes
+                                          {:graph "acme" :tenant-id "t1"
+                                           :root-public-key samples-root-key
+                                           :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))
+      (is (false? (:ok? (bw/verify (bw/decode-token bytes) samples-root-key
+                                   (fn [pk payload sig]
+                                     (try (.verify ed25519
+                                                   (js/Uint8Array.from (clj->js (vec sig)))
+                                                   (js/Uint8Array.from (clj->js (vec payload)))
+                                                   (js/Uint8Array.from (clj->js (vec pk))))
+                                          (catch :default _ false))))))))))
+
+(deftest the-wire-entry-point-refuses-a-token-whose-facts-were-rewritten
+  (testing "the attack the signature check exists for, and the only test here
+            that can tell whether it happens"
+    ;; Both official samples carry `right(...)` facts rather than kotoba://
+    ;; scopes, so they confer nothing HERE whether or not the signature is
+    ;; checked -- which means neither can distinguish a path that verifies
+    ;; from one that does not. This token can: its authority block is rewritten
+    ;; to grant kotoba://graph/acme while keeping the original signature, so a
+    ;; path that skips verification returns that capability and a path that
+    ;; checks returns nil.
+    (let [bytes (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test001_basic.bc")))
+          block-schema {1 {:name :symbols :type :string :repeated true}
+                        4 {:name :facts :type :bytes :repeated true}}
+          term-schema {3 {:name :string :type :uint64}}
+          predicate-schema {1 {:name :name :type :uint64}
+                            2 {:name :terms :type :bytes :repeated true}}
+          fact-schema {1 {:name :predicate :type :bytes}}
+          signed-block-schema {1 {:name :block :type :bytes}
+                               2 {:name :next-key :type :bytes}
+                               3 {:name :signature :type :bytes}}
+          biscuit-schema {2 {:name :authority :type :bytes}
+                          3 {:name :blocks :type :bytes :repeated true}
+                          4 {:name :proof :type :bytes}}
+          ;; symbols 1024 = "scope", 1025 = the resource
+          forged-block (pb/encode block-schema
+                                  {:symbols ["scope" "kotoba://graph/acme"]
+                                   :facts [(pb/encode fact-schema
+                                                      {:predicate (pb/encode predicate-schema
+                                                                             {:name 1024
+                                                                              :terms [(pb/encode term-schema {:string 1025})]})})]})
+          original (pb/decode biscuit-schema bytes)
+          orig-auth (pb/decode signed-block-schema (:authority original))
+          forged (pb/encode biscuit-schema
+                            (assoc original :authority
+                                   (pb/encode signed-block-schema
+                                              (assoc orig-auth :block forged-block))))
+          opts {:graph "acme" :tenant-id "t1" :root-public-key samples-root-key
+                :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}]
+      (testing "the rewrite really does say what it claims to say"
+        (is (= '[[scope "kotoba://graph/acme"]]
+               (:block/facts (first (:biscuit/blocks (bw/token->model (bw/decode-token forged))))))))
+      (testing "and the server refuses it, because the signature no longer covers it"
+        (is (nil? (auth/verify-biscuit-wire forged opts)))))))
+
+;; ── the single entry a Worker calls ─────────────────────────────────────────
+
+(deftest one-entry-binds-both-wires
+  (testing "so a caller cannot wire only one of them, or both as a chain"
+    (let [t (token '[[scope "kotoba://graph/acme"] [scope "kotoba://can/read"]])
+          ;; The model-shaped token goes through the model verifier; a Worker
+          ;; would send wire bytes. Both paths exist; this checks the binding.
+          r (auth/delegation-for-request
+             {} {:graph "acme" :tenant-id "t1" :root-public-key (:public root)
+                 :biscuit-enabled-graphs #{"acme"}
+                 :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
+      (is (= :no-delegation-presented (:reason r)))
+      (is (nil? (:wire r)))
+      (is (some? t)))))
+
+(deftest the-entry-refuses-a-biscuit-for-a-graph-that-has-not-enabled-it
+  (let [bytes (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test001_basic.bc")))
+        r (auth/delegation-for-request
+           {:biscuit_b64 bytes}
+           {:graph "other" :tenant-id "t1" :root-public-key samples-root-key
+            :biscuit-enabled-graphs #{"acme"}
+            :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
+    (is (= :biscuit-not-enabled-for-graph (:refused r)))))
+
+(deftest the-entry-refuses-both-wires-at-once
+  (let [r (auth/delegation-for-request
+           {:biscuit_b64 [1 2 3] :delegations_b64 ["x"]}
+           {:graph "acme" :tenant-id "t1" :root-public-key samples-root-key
+            :biscuit-enabled-graphs #{"acme"}})]
+    (is (= :ambiguous-credential (:refused r)))))
+
+(deftest the-entry-reports-a-failed-biscuit-as-a-denial
+  (testing "and does not reach for the CACAO verifier"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test002_different_root_key.bc")))
+          r (auth/delegation-for-request
+             {:biscuit_b64 bytes}
+             {:graph "acme" :tenant-id "t1" :root-public-key samples-root-key
+              :biscuit-enabled-graphs #{"acme"}
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})]
+      (is (= :verification-failed (:refused r)))
+      (is (= :biscuit (:wire r))))))
+
+;; ── a rotating root key set ─────────────────────────────────────────────────
+
+(deftest a-rotation-overlap-accepts-tokens-under-either-root
+  (testing "a rotation has to overlap: tokens minted under the old key are
+            still live when the new one starts being used"
+    (let [bytes (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test001_basic.bc")))
+          decoded (bw/decode-token bytes)
+          verify (fn [pk payload sig]
+                   (try (.verify ed25519
+                                 (js/Uint8Array.from (clj->js (vec sig)))
+                                 (js/Uint8Array.from (clj->js (vec payload)))
+                                 (js/Uint8Array.from (clj->js (vec pk))))
+                        (catch :default _ false)))
+          other (:public (keypair (map #(+ 7 %) (range 32))))]
+      (testing "the token verifies under the samples root and not under the other"
+        (is (:ok? (bw/verify decoded samples-root-key verify)))
+        (is (false? (:ok? (bw/verify decoded other verify)))))
+      (testing "and a set containing both accepts it, in either order"
+        (doseq [ks [[other samples-root-key] [samples-root-key other]]]
+          ;; test001 grants right(...) rather than kotoba:// scopes, so the
+          ;; caps answer is nil either way; what this asserts is that the
+          ;; SIGNATURE step accepted it from a set, in either order.
+          (is (:ok? (first (filter :ok? (map #(bw/verify decoded % verify) ks))))
+              "a rotation overlap must not depend on which key is tried first")))
+      (testing "a set containing NEITHER is still refused"
+        (is (nil? (auth/verify-biscuit-wire
+                   bytes {:graph "acme" :tenant-id "t1"
+                          :root-public-keys [other]
+                          :biscuit-enabled-graphs #{"acme"}
+                          :now-ms (.parse js/Date "2026-08-19T00:00:00Z")})))))))
+
+(defn- mint-wire-facts [signer-private facts]
+  (let [next-seed (vec (map #(+ 33 %) (range 32)))
+        next-kp (keypair next-seed)]
+    (bw/encode-authority-token
+     {:facts facts
+      :root-private-key signer-private
+      :next-secret next-seed
+      :next-public-key (:public next-kp)
+      :sign-fn (fn [private payload]
+                 (vec (.sign ed25519 (js/Uint8Array.from (clj->js payload)) private)))})))
+
+(defn- mint-wire-token
+  "A minimal first-party Biscuit v3 token carrying one scope fact. The writer
+  is independently accepted by the official Rust verifier in org-biscuitsec."
+  [signer-private _signer-public resource]
+  (mint-wire-facts signer-private [['scope resource]]))
+
+(deftest the-multi-root-loop-tries-every-root
+  (let [a (keypair (map #(+ 11 %) (range 32)))
+        b (keypair (map #(+ 55 %) (range 32)))
+        token (mint-wire-token (:private a) (:public a) "kotoba://graph/acme")
+        opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}]
+    (testing "the token is accepted under its own root"
+      (is (= #{"kotoba://graph/acme"}
+             (:effective-caps (auth/verify-biscuit-wire token (assoc opts :root-public-keys [(:public a)]))))))
+    (testing "and under a rotation set containing it, in EITHER order"
+      (doseq [ks [[(:public b) (:public a)] [(:public a) (:public b)]]]
+        (is (= #{"kotoba://graph/acme"}
+               (:effective-caps (auth/verify-biscuit-wire token (assoc opts :root-public-keys ks))))
+            "a rotation overlap must not depend on which key is tried first")))
+    (testing "and refused under a set containing neither"
+      (is (nil? (auth/verify-biscuit-wire token (assoc opts :root-public-keys [(:public b)])))))))
+
+;; ── the read-side shape a Worker consumes ───────────────────────────────────
+
+(deftest read-auth-produces-the-shape-the-read-path-already-uses
+  (let [a (keypair (map #(+ 11 %) (range 32)))
+        token (mint-wire-token (:private a) (:public a) "kotoba://graph/acme")
+        opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :root-public-keys [(:public a)]
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}
+        r (auth/read-auth-for-request {:biscuit_b64 token} opts)]
+    (is (= #{"kotoba://graph/acme"} (:resources r)))
+    (is (= :biscuit (:wire r)))
+    (testing "and it collapses to exactly {:did :resources}"
+      (is (= #{:did :resources} (set (keys (auth/->legacy-read-auth r))))))))
+
+(deftest wire-holder-becomes-the-request-principal-and-revocation-denies
+  (let [a (keypair (map #(+ 11 %) (range 32)))
+        token (mint-wire-facts (:private a)
+                               '[[scope "kotoba://graph/acme"]
+                                 [holder "did:key:zAlice"]])
+        opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :root-public-keys [(:public a)]
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}
+        r (auth/read-auth-for-request {:biscuit_b64 token} opts)
+        signature (second (first (bw/revocation-ids (bw/decode-token token))))]
+    (is (= "did:key:zAlice" (:did r)))
+    (is (seq (:revocation-ids (auth/verify-biscuit-wire token opts))))
+    (is (nil? (auth/verify-biscuit-wire
+               token (assoc opts :revoked-biscuit-signatures #{signature}))))))
+
+(deftest read-auth-keeps-refused-and-absent-apart
+  (let [opts {:graph "acme" :tenant-id "t1" :biscuit-enabled-graphs #{"acme"}
+              :root-public-keys [samples-root-key]
+              :now-ms (.parse js/Date "2026-08-19T00:00:00Z")}
+        bad (vec (js/Array.from (fs/readFileSync "lib/kotoba.kotobaseServer/test/fixtures/test002_different_root_key.bc")))]
+    (testing "nothing presented is nil"
+      (is (nil? (auth/read-auth-for-request {} opts))))
+    (testing "presented and rejected is a refusal, not nil"
+      (let [r (auth/read-auth-for-request {:biscuit_b64 bad} opts)]
+        (is (= :verification-failed (:refused r)))
+        (is (nil? (:resources r)))))
+    (testing "and the collapse to the legacy shape turns BOTH into anonymous —
+              which is why the collapse is a named call and not the default"
+      (is (nil? (auth/->legacy-read-auth (auth/read-auth-for-request {} opts))))
+      (is (nil? (auth/->legacy-read-auth (auth/read-auth-for-request {:biscuit_b64 bad} opts)))))))

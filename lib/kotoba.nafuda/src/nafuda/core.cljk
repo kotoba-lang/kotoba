@@ -1,0 +1,203 @@
+(ns nafuda.core
+  "Who someone is, without a numbering authority.
+
+  ## Keys
+
+      root identity ── kept offline; its hash is the person's stable id
+        ├─ device certificate   phone, PC, radio handset    roles #{:call :page}
+        ├─ device certificate   home node                   roles #{:home}
+        └─ guardian set         k-of-n friends who can name a new root
+
+  A **device certificate** is a statement signed by the root naming a device
+  key, the roles it may act in, and a validity window. A caller checks the
+  callee's device against the root it trusts; the root itself never has to be
+  online. A lost phone is cut off by a **revocation** of its serial.
+
+  A lost *root* is replaced by **succession** (the old root names a new one)
+  or, if the old root is gone too, by **recovery**: at least `threshold`
+  members of the guardian set the old root published each sign the new root.
+  `current-root` follows either kind of link.
+
+  ## Contact card
+
+  The card is what two people exchange in person (QR / NFC): root public key,
+  display name, device certificates and home-node destinations, signed by the
+  root. Scanning a card is the strongest trust there is — no registry is
+  involved."
+  (:require [nafuda.statement :as st]
+            [shamir.core :as shamir]
+            [kotoba.bytes :as kb]
+            [tsunagi.crypto :as c]
+            [tsunagi.identity :as id]
+            [tsunagi.wire :as w]))
+
+(def roles #{:call :page :home :message})
+
+(defn hex-of [x] (if (string? x) x (w/hex (:public x x))))
+
+;; ---------------------------------------------------------------------------
+;; Device certificates and revocation
+
+(defn device-cert
+  "Root-signed certificate for `device` (a public identity)."
+  [root device {:keys [roles serial not-before not-after label]}]
+  (st/sign root (cond-> {:nafuda/kind :device
+                         :nafuda/subject (hex-of device)
+                         :nafuda/roles (set roles)
+                         :nafuda/serial serial
+                         :nafuda/not-before not-before
+                         :nafuda/not-after not-after}
+                  label (assoc :nafuda/label label))))
+
+(defn revocation
+  "Root-signed revocation of certificate serials."
+  [root serials issued-at]
+  (st/sign root {:nafuda/kind :revocation
+                 :nafuda/serials (set serials)
+                 :nafuda/issued-at issued-at}))
+
+(defn revoked-serials
+  "Serials revoked by valid revocations from `root-hex`."
+  [root-hex revocations]
+  (into #{} (comp (filter #(st/signed-by? % root-hex))
+                  (filter #(= :revocation (get-in % [:statement :nafuda/kind])))
+                  (mapcat #(get-in % [:statement :nafuda/serials])))
+        revocations))
+
+;; ---------------------------------------------------------------------------
+;; Root continuity
+
+(defn succession [old-root new-root issued-at]
+  (st/sign old-root {:nafuda/kind :succession
+                     :nafuda/successor (hex-of new-root)
+                     :nafuda/issued-at issued-at}))
+
+(defn guardian-set [root guardians threshold issued-at]
+  (when-not (<= 1 threshold (count guardians))
+    (throw (ex-info "nafuda: threshold out of range" {:threshold threshold :n (count guardians)})))
+  (st/sign root {:nafuda/kind :guardians
+                 :nafuda/members (set (map hex-of guardians))
+                 :nafuda/threshold threshold
+                 :nafuda/issued-at issued-at}))
+
+(defn recovery-vote
+  "One guardian's statement that `lost-root` is succeeded by `new-root`."
+  [guardian lost-root new-root issued-at]
+  (st/sign guardian {:nafuda/kind :recovery
+                     :nafuda/root (hex-of lost-root)
+                     :nafuda/successor (hex-of new-root)
+                     :nafuda/issued-at issued-at}))
+
+(defn- latest-guardians [root-hex statements]
+  (->> statements
+       (filter #(st/signed-by? % root-hex))
+       (filter #(= :guardians (get-in % [:statement :nafuda/kind])))
+       (sort-by #(get-in % [:statement :nafuda/issued-at]))
+       last))
+
+(defn- successor-of [root-hex statements]
+  (or
+   ;; the root's own word wins
+   (some->> statements
+            (filter #(st/signed-by? % root-hex))
+            (filter #(= :succession (get-in % [:statement :nafuda/kind])))
+            (sort-by #(get-in % [:statement :nafuda/issued-at]))
+            last :statement :nafuda/successor)
+   ;; otherwise a guardian quorum
+   (when-let [gs (latest-guardians root-hex statements)]
+     (let [{:nafuda/keys [members threshold]} (:statement gs)
+           votes (->> statements
+                      (filter st/valid?)
+                      (filter #(= :recovery (get-in % [:statement :nafuda/kind])))
+                      (filter #(= root-hex (get-in % [:statement :nafuda/root])))
+                      (filter #(contains? (set members) (get-in % [:statement :nafuda/signer]))))
+           by-successor (group-by #(get-in % [:statement :nafuda/successor]) votes)]
+       (some (fn [[succ vs]]
+               (when (>= (count (set (map #(get-in % [:statement :nafuda/signer]) vs))) threshold)
+                 succ))
+             (sort-by key by-successor))))))
+
+(defn current-root
+  "Follow succession and recovery links from `original-root-hex`. Answers the
+  hex public key of the root in force now. Cycles stop the walk."
+  [original-root-hex statements]
+  (loop [r original-root-hex seen #{}]
+    (let [nxt (successor-of r statements)]
+      (if (or (nil? nxt) (contains? seen nxt))
+        r
+        (recur nxt (conj seen r))))))
+
+;; ---------------------------------------------------------------------------
+;; Authorization
+
+(defn authorized?
+  "Whether `device` may act as `role` for the person whose root is
+  `root-hex`, at time `now`, given every statement we hold about them."
+  [root-hex statements device role now]
+  (let [root (current-root root-hex statements)
+        revoked (revoked-serials root statements)
+        dev (hex-of device)]
+    (boolean
+     (some (fn [s]
+             (let [m (:statement s)]
+               (and (= :device (:nafuda/kind m))
+                    (= dev (:nafuda/subject m))
+                    (contains? (set (:nafuda/roles m)) role)
+                    (not (contains? revoked (:nafuda/serial m)))
+                    (st/in-force? s now)
+                    (st/signed-by? s root))))
+           statements))))
+
+;; ---------------------------------------------------------------------------
+;; Contact card
+
+(defn card
+  "A root-signed contact card."
+  [root {:keys [name devices homes issued-at]}]
+  (st/sign root {:nafuda/kind :card
+                 :nafuda/name name
+                 :nafuda/devices (vec devices)       ; signed device certs
+                 :nafuda/homes (mapv hex-of homes)   ; home-node destinations (hex)
+                 :nafuda/issued-at issued-at}))
+
+(defn card->qr
+  "Text for a QR code: `nafuda:` ++ base64url of the canonical card."
+  [signed-card]
+  (str "nafuda:" (kb/base64url-encode (st/encode signed-card))))
+
+(defn qr->card
+  "The verified card from QR text, or nil."
+  [text]
+  (when (and (string? text) (= "nafuda:" (subs text 0 (min 7 (count text)))))
+    (when-let [bs (try (kb/base64url-decode-bytes (subs text 7))
+                       (catch #?(:clj Exception :cljs :default :default :default) _ nil))]
+      (let [s (st/decode (mapv #(bit-and % 0xff) bs))]
+        (when (and s (st/valid? s) (= :card (get-in s [:statement :nafuda/kind])))
+          s)))))
+
+;; ---------------------------------------------------------------------------
+;; Root seed backup to guardians
+
+(defn backup-shares
+  "Split a root seed among guardians (public identities): each share is
+  encrypted to its guardian. `threshold` of them recover the seed. The
+  commitment lets the recoverer tell a right combination from a wrong one."
+  ([seed guardians threshold] (backup-shares seed guardians threshold c/random-bytes))
+  ([seed guardians threshold random-bytes]
+   (let [shares (shamir/split seed threshold (count guardians) random-bytes)]
+     {:commitment (w/hex (c/sha256 seed))
+      :threshold threshold
+      :shares (mapv (fn [g s] {:guardian (hex-of g)
+                               :sealed (id/encrypt g (shamir/encode-share s))})
+                    guardians shares)})))
+
+(defn open-share
+  "A guardian decrypts their share (to hand it back to the owner in person)."
+  [guardian sealed]
+  (id/decrypt guardian sealed))
+
+(defn recover-seed
+  "The seed from opened shares, or nil if they do not match the commitment."
+  [commitment opened-shares]
+  (let [seed (shamir/combine (keep shamir/decode-share opened-shares))]
+    (when (= commitment (w/hex (c/sha256 seed))) seed)))

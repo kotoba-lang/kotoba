@@ -1,0 +1,180 @@
+#!/usr/bin/env kbb
+;; The deterministic fitness function for query cost -- the judge in a
+;; co-scientist loop over this repo's read path, in the role
+;; `design-quality.audit` plays for UI (root ADR-2606141500 / isekai ADR-0007:
+;; the loop is only real if the judge measures something).
+;;
+;;   kbb --backend sci --classpath "<server/src>:<deps>" scripts/audit_query_cost.cljk
+;;
+;; ## What it measures, and why not milliseconds
+;;
+;; COUNTS: block reads (`get-fn` calls), scans issued at the source, and quads
+;; the engine actually touched. ADR-2608021000 settled this workspace on counts
+;; because this workstation runs many concurrent agent sessions and a
+;; wall-clock number here is a number about the host.
+;;
+;; ## The floor is what makes a number a finding
+;;
+;; Every shape declares the work an ideal plan would do -- `:floor-asks`, the
+;; number of index probes an ideal plan needs. For an n-clause conjunction that
+;; is n: read each clause's relation once and join in memory. Headroom is
+;; measured-minus-floor.
+;;
+;; It was `:floor-quads` first, and that was the wrong fitness. Quads asked for
+;; is dominated by the per-request scan cache `source-for` installs, so the
+;; recursive rules looked like the whole problem (75 quads asked against a
+;; 3-row answer) when the cache was already absorbing them down to 2 physical
+;; scans. Counting ASKS instead moved the entire headroom onto the joins, which
+;; is where it actually is -- and that is a finding about the FITNESS FUNCTION,
+;; recorded because a co-scientist loop is only as honest as its judge.
+
+(require '[kotobase.server.handler :as h]
+         '[kotobase.server.pattern-source :as ps]
+         '[arrangement.datalog :as datalog]
+         '[datom.source :as ds]
+         '[kotoba.lang.text :as str])
+
+(defn- passthrough [x] (js/Promise.resolve x))
+
+(defn- mem-store []
+  (let [blocks (atom {}) heads (atom {}) reads (atom 0)]
+    {:get-fn (fn [cid] (swap! reads inc) (get @blocks cid))
+     :put! (fn [cid bytes] (swap! blocks assoc cid bytes))
+     :head-get (fn [g] (get @heads g))
+     :head-put! (fn [g c] (swap! heads assoc g c))
+     :blind-fn passthrough :encrypt-fn passthrough :decrypt-fn passthrough
+     ::reads reads}))
+
+;; A small ontology plus a social graph -- the two shapes an ontology store is
+;; actually asked for. 4-level class chain so a fixpoint has somewhere to go.
+(defn- ontology-tx []
+  (str "[{:db/id \"Cat\" :rdfs/subClassOf \"Mammal\"}"
+       " {:db/id \"Mammal\" :rdfs/subClassOf \"Animal\"}"
+       " {:db/id \"Animal\" :rdfs/subClassOf \"Thing\"}"
+       (apply str (for [i (range 60)]
+                    (str " {:db/id \"i" i "\" :rdf/type \"Cat\" :name \"n" i "\"}")))
+       "]"))
+
+(defn- people-tx [n]
+  (str "[" (apply str (for [i (range n)]
+                        (str "{:db/id \"p" i "\" :knows \"p" (mod (inc i) n) "\""
+                             " :age \"" (+ 20 (mod i 40)) "\""
+                             " :city \"c" (mod i 7) "\"}")))
+       "]"))
+
+(def RULES
+  '[[(owl-subclass ?a ?b) [?a ":rdfs/subClassOf" ?b]]
+    [(owl-subclass ?a ?b) [?a ":rdfs/subClassOf" ?z] (owl-subclass ?z ?b)]
+    [(owl-type ?i ?c) [?i ":rdf/type" ?c]]
+    [(owl-type ?i ?c) (owl-type ?i ?d) (owl-subclass ?d ?c)]])
+
+(def SHAPES
+  [{:id :point
+    :why "one entity's attributes -- the cheapest thing anyone asks"
+    :query '{:find [?c] :where [["i0" ":rdf/type" ?c]]}
+    :floor-asks 1}
+   {:id :predicate-scan
+    :why "every subject under one attribute"
+    :query '{:find [?s] :where [[?s ":rdf/type" ?c]]}
+    :floor-asks 1}
+   {:id :predicate-value
+    :why "an :avet point lookup -- the selective one"
+    :query '{:find [?s] :where [[?s ":rdf/type" "Cat"]]}
+    :floor-asks 1}
+   {:id :two-clause-join
+    :why "the shape every real query has"
+    :query '{:find [?n] :where [[?s ":rdf/type" "Cat"] [?s ":name" ?n]]}
+    :floor-asks 2}
+   {:id :three-clause-join
+    :why "one more clause, to see whether cost is additive or multiplicative"
+    :query '{:find [?a] :where [[?p ":knows" ?q] [?q ":age" ?a] [?p ":city" "c0"]]}
+    :floor-asks 3}
+   {:id :subclass-closure
+    :why "a recursive rule -- the fixpoint, re-asking its clauses every round"
+    :query (list 'quote {:find '[?b] :where '[(owl-subclass "Cat" ?b)] :rules RULES})
+    :floor-asks 1}
+   {:id :type-closure
+    :why "two mutually recursive rules over the same chain"
+    :query (list 'quote {:find '[?c] :where '[(owl-type "i0" ?c)] :rules RULES})
+    :floor-asks 2}
+   {:id :closure-all-individuals
+    :why "the closure asked for every individual at once -- 60x the bindings"
+    :query (list 'quote {:find '[?i '?c] :where '[(owl-type ?i ?c)] :rules RULES})
+    :floor-asks 2}
+   {:id :count-aggregate
+    :why "an aggregate the engine can push down"
+    :query '{:find [(count ?s)] :where [[?s ":rdf/type" "Cat"]]}
+    :floor-asks 1}])
+
+(defn- unquote-query [q] (if (and (seq? q) (= 'quote (first q))) (second q) q))
+
+(defn- measure [store chain shape]
+  (let [q (unquote-query (:query shape))
+        patterns (h/datalog-source-patterns q)
+        reads (::reads store)]
+    (reset! reads 0)
+    (-> (ps/source-for store chain patterns (constantly true))
+        (.then (fn [source]
+                 (let [prefetch-reads @reads
+                       ;; OUTSIDE the per-request scan cache `source-for`
+                       ;; already installs, so this counts what the ENGINE
+                       ;; ASKED FOR. `cache-stats` on the same source is what
+                       ;; was physically scanned. Reporting only the first
+                       ;; would invent headroom the cache already absorbs;
+                       ;; reporting only the second would hide the asking,
+                       ;; which is what a fixpoint does too much of.
+                       counted (ds/counting source)
+                       hinted (assoc q :clause-cardinality (ps/clause-cardinality source q))
+                       ;; ALWAYS both, always compared. A path that asks less
+                       ;; by answering less is not cheaper, and a row COUNT
+                       ;; does not say the rows are the same rows -- so the
+                       ;; sets are compared, every shape, every run.
+                       plain-rows (datalog/q source q (constantly true))
+                       hinted-rows (datalog/q source hinted (constantly true))
+                       agree? (= (set plain-rows) (set hinted-rows))
+                       rows (datalog/q counted (if (.-HINT js/process.env) hinted q)
+                                       (constantly true))
+                       {:keys [scans quads]} (ds/counts counted)
+                       {:keys [patterns]} (ds/cache-stats source)]
+                   (assoc shape
+                          :rows (count rows)
+                          :agree? agree?
+                          :block-reads prefetch-reads
+                          :prefetched (or (ps/datom-count source) 0)
+                          :asks scans
+                          :distinct-patterns patterns
+                          :quads-asked quads
+                          :headroom (max 0 (- scans (:floor-asks shape))))))))))
+
+(defn -main []
+  (let [store (mem-store)]
+    (-> (h/handle store "transact" {:graph "g" :tx_edn (ontology-tx)} "did:key:zt")
+        (.then (fn [_] (h/handle store "transact" {:graph "g" :tx_edn (people-tx 300)} "did:key:zt")))
+        (.then (fn [_] (h/handle store "fold" {:graph "g"} "did:key:zt")))
+        (.then (fn [_]
+                 (let [chain ((:head-get store) "g")]
+                   (reduce (fn [p shape]
+                             (.then p (fn [acc]
+                                        (.then (measure store chain shape)
+                                               (fn [r] (conj acc r))))))
+                           (js/Promise.resolve [])
+                           SHAPES))))
+        (.then (fn [results]
+                 (println "shape\trows\tblocks\tprefetched\tasks\tdistinct\tquads-asked\tfloor\theadroom")
+                 (doseq [r results]
+                   (println (str (name (:id r)) "\t" (:rows r) "\t" (:block-reads r) "\t"
+                                 (:prefetched r) "\t" (:asks r) "\t" (:distinct-patterns r)
+                                 "\t" (:quads-asked r)
+                                 "\t" (:floor-asks r) "\t" (:headroom r))))
+                 (let [disagreed (remove :agree? results)]
+                   (doseq [r disagreed]
+                     (println (str "DISAGREE\t" (name (:id r))
+                                   "\tthe hint changed the ANSWER, not just the asking")))
+                   (println (str "AGREE\t" (- (count results) (count disagreed))
+                                 "/" (count results)))
+                   (when (seq disagreed) (js/process.exit 1)))
+                 (println (str "SCANNED\t" (count results)))
+                 (println (str "TOTAL-HEADROOM\t" (reduce + (map :headroom results))))))
+        (.catch (fn [e] (println "ERR" (str e)) (js/process.exit 1))))))
+
+(-main)

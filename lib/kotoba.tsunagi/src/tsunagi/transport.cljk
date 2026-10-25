@@ -1,0 +1,252 @@
+(ns tsunagi.transport
+  "The routing node, as a pure state machine.
+
+      (inbound  node interface bytes now) → {:node node' :effects [...]}
+      (outbound node packet-map now)       → {:node node' :effects [...]}
+      (tick     node now)                  → {:node node' :effects [...]}
+
+  Effects are data the host performs:
+
+      {:effect :send    :interface i :bytes b}   transmit on one interface
+      {:effect :deliver :packet p :interface i}  a packet for a local destination
+      {:effect :announce :announce a}            a verified announce was learned
+      {:effect :path-request :destination d}     someone asks for a local destination
+
+  No socket, radio or clock is touched here, so the same node runs over LoRa,
+  Wi-Fi, a community LTE cell or the Internet, and a test can run a whole mesh
+  in memory.
+
+  ## Routing
+
+  * **Announces** are flooded. A transport node re-emits each newer announce
+    once, hops + 1, with its own id in the transport header, so the receiver
+    learns which neighbour leads to the destination.
+  * **Addressed packets** carry the next relay in the transport header. The
+    relay looks up its own path; the last relay strips the header.
+  * **Links** are routed on the path their request took. Each relay that
+    forwarded a link request remembers the link id, and forwards later packets
+    of that link once (duplicate suppression stops echoes). Only on-path
+    relays carry a link, so a call does not flood the mesh.
+  * **Path requests** are flooded to a plain destination; any node holding a
+    cached announce answers with it, so a newly joined node need not wait for
+    the next periodic announce."
+  (:require [tsunagi.announce :as ann]
+            [tsunagi.identity :as id]
+            [tsunagi.link :as link]
+            [tsunagi.packet :as p]
+            [tsunagi.wire :as w]))
+
+(def path-request-name "tsunagi.path.request")
+(def path-request-destination (id/plain-destination-hash path-request-name))
+
+(def defaults
+  {:max-hops 32
+   :path-ttl 1800              ; seconds a learned path stays valid
+   :link-ttl 900               ; seconds an idle link table entry survives
+   :seen-ttl 600})             ; seconds a packet hash suppresses duplicates
+
+(defn node
+  "A node. `identity` is its private transport identity; `transport?` decides
+  whether it relays for others (a phone usually does not, a rooftop node does).
+  `interfaces` is a set of interface ids."
+  [{:keys [identity transport? interfaces] :as opts}]
+  (merge defaults
+         (dissoc opts :identity :transport? :interfaces)
+         {:identity identity
+          :transport-id (:hash identity)
+          :transport? (boolean transport?)
+          :interfaces (set interfaces)
+          :local {}          ; destination hex → {:name … :kind :single|:plain|:link}
+          :paths {}          ; destination hex → {:next-hop … :interface … :hops … :expires … :emission …}
+          :announces {}      ; destination hex → last verified announce packet map
+          :links {}          ; link id hex → {:interfaces #{…} :expires …}
+          :seen {}}))        ; packet hash hex → expiry
+
+(defn- k [bs] (w/hex bs))
+
+(defn register
+  "Make `destination` (16 bytes) local: packets for it are delivered rather
+  than forwarded. `kind` is :single, :plain or :link."
+  [node destination kind]
+  (assoc-in node [:local (k destination)] {:kind kind :destination destination}))
+
+(defn unregister [node destination]
+  (update node :local dissoc (k destination)))
+
+(defn path [node destination]
+  (get-in node [:paths (k destination)]))
+
+(defn known-identity
+  "The public identity behind a destination we hold an announce for."
+  [node destination]
+  (some-> (get-in node [:announces (k destination)]) ann/parse :identity))
+
+(defn- result [node effects] {:node node :effects (vec effects)})
+
+(defn- send-all [node bs]
+  (for [i (sort (:interfaces node))] {:effect :send :interface i :bytes bs}))
+
+(defn- seen? [node pkt now]
+  (when-let [exp (get-in node [:seen (k (p/packet-hash pkt))])]
+    (> exp now)))
+
+(defn- mark-seen [node pkt now]
+  (assoc-in node [:seen (k (p/packet-hash pkt))] (+ now (:seen-ttl node))))
+
+(defn- local? [node destination]
+  (contains? (:local node) (k destination)))
+
+;; ---------------------------------------------------------------------------
+;; Announces
+
+(defn- learn-announce [node interface pkt now]
+  (when-let [a (ann/parse pkt)]
+    (let [dk (k (:destination a))
+          current (get-in node [:paths dk])
+          better? (or (nil? current)
+                      (<= (:expires current) now)
+                      (ann/newer? (:emission a) (:emission current))
+                      (and (= (:emission a) (:emission current))
+                           (< (:hops pkt) (:hops current))))]
+      (when (and better? (not (local? node (:destination a))))
+        {:announce a
+         :node (-> node
+                   (assoc-in [:paths dk] {:destination (:destination a)
+                                          :next-hop (:transport-id pkt)
+                                          :interface interface
+                                          :hops (inc (:hops pkt))
+                                          :emission (:emission a)
+                                          :expires (+ now (:path-ttl node))})
+                   (assoc-in [:announces dk] (assoc pkt :transport-id nil)))}))))
+
+(defn- rebroadcast-announce [node pkt]
+  (when (and (:transport? node) (< (:hops pkt) (:max-hops node)))
+    (send-all node (p/encode (assoc pkt
+                                    :hops (inc (:hops pkt))
+                                    :transport-id (:transport-id node))))))
+
+;; ---------------------------------------------------------------------------
+;; Forwarding
+
+(defn- forward-addressed
+  "A packet whose transport header names this node."
+  [node pkt now]
+  (when-let [route (path node (:destination pkt))]
+    (when (> (:expires route) now)
+      (let [last-hop? (nil? (:next-hop route))
+            out (assoc pkt
+                       :hops (inc (:hops pkt))
+                       :transport-id (when-not last-hop? (:next-hop route)))
+            node (if (= :link-request (:packet-type pkt))
+                   (assoc-in node [:links (k (link/link-id (:destination pkt) (:payload pkt)))]
+                             {:expires (+ now (:link-ttl node))})
+                   node)]
+        (result node [{:effect :send :interface (:interface route) :bytes (p/encode out)}])))))
+
+(defn- forward-link [node pkt now]
+  (let [lk (k (:destination pkt))]
+    (when (and (:transport? node) (get-in node [:links lk]))
+      (result (assoc-in node [:links lk :expires] (+ now (:link-ttl node)))
+              (send-all node (p/encode (assoc pkt :hops (inc (:hops pkt)))))))))
+
+(defn- answer-path-request [node pkt now]
+  (let [wanted (vec (take 16 (:payload pkt)))]
+    (cond
+      (local? node wanted)
+      (result node [{:effect :path-request :destination wanted}])
+
+      (and (:transport? node) (get-in node [:announces (k wanted)]))
+      (let [cached (get-in node [:announces (k wanted)])]
+        ;; Re-emitted as if relayed by us: one hop further than we heard it.
+        (result node (send-all node (p/encode (assoc cached
+                                                     :context :path-response
+                                                     :hops (inc (:hops cached))
+                                                     :transport-id (:transport-id node))))))
+
+      (:transport? node)
+      (result node (send-all node (p/encode (assoc pkt :hops (inc (:hops pkt))))))
+
+      :else (result node []))))
+
+;; ---------------------------------------------------------------------------
+;; Public API
+
+(defn inbound
+  "Handle bytes received on `interface` at time `now` (seconds)."
+  [node interface bs now]
+  (let [pkt (p/decode bs)]
+    (cond
+      (nil? pkt) (result node [])
+      (seen? node pkt now) (result node [])
+      :else
+      (let [node (mark-seen node pkt now)
+            for-me? (local? node (:destination pkt))
+            addressed-to-me? (and (:transport-id pkt)
+                                  (w/bytes-eq? (:transport-id pkt) (:transport-id node)))]
+        (cond
+          (= :announce (:packet-type pkt))
+          (if-let [{a :announce n :node} (learn-announce node interface pkt now)]
+            (result n (cons {:effect :announce :announce a}
+                            (rebroadcast-announce n pkt)))
+            (result node []))
+
+          (and (= :plain (:destination-type pkt))
+               (w/bytes-eq? (:destination pkt) path-request-destination))
+          (answer-path-request node pkt now)
+
+          for-me?
+          (result node [{:effect :deliver :packet pkt :interface interface}])
+
+          addressed-to-me?
+          (or (forward-addressed node pkt now) (result node []))
+
+          (= :link (:destination-type pkt))
+          (or (forward-link node pkt now) (result node []))
+
+          :else (result node []))))))
+
+(defn outbound
+  "Send a packet map originated here. Uses the transport header when the path
+  goes through a relay; otherwise sends directly (or on every interface when
+  no path is known, which reaches neighbours and on-path link relays)."
+  [node pkt now]
+  (let [route (path node (:destination pkt))
+        route (when (and route (> (:expires route) now)) route)
+        out (assoc pkt :hops 0 :transport-id (when (and route (not= :link (:destination-type pkt)))
+                                               (:next-hop route)))
+        node (mark-seen node out now)
+        bs (p/encode out)]
+    (result node
+            (if (and route (not= :link (:destination-type pkt)))
+              [{:effect :send :interface (:interface route) :bytes bs}]
+              (send-all node bs)))))
+
+(defn request-path
+  "Ask the mesh for a path to `destination`. `tag` (16 random bytes) makes
+  repeated requests distinct packets."
+  [node destination tag now]
+  (outbound node {:packet-type :data :destination-type :plain
+                  :destination path-request-destination :context :none
+                  :payload (w/cat-bytes destination tag)}
+            now))
+
+(defn announce
+  "Emit an announce for a local destination."
+  [node identity app-name opts now]
+  (let [pkt (ann/build identity app-name (assoc opts :now now))
+        node (register node (:destination pkt) :single)]
+    (outbound node pkt now)))
+
+(defn track-link
+  "Remember a link this node is an endpoint of, so packets for it are delivered."
+  [node link-id]
+  (register node link-id :link))
+
+(defn tick
+  "Expire paths, links and duplicate-suppression entries."
+  [node now]
+  (result (-> node
+              (update :paths #(into {} (filter (fn [[_ v]] (> (:expires v) now))) %))
+              (update :links #(into {} (filter (fn [[_ v]] (> (:expires v) now))) %))
+              (update :seen #(into {} (filter (fn [[_ v]] (> v now))) %)))
+          []))

@@ -1,0 +1,83 @@
+(ns srtp.packet-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [srtp.packet :as p]
+            [srtp.kdf :as kdf]
+            [rtp.header :as rtp]))
+
+;; RFC 3711 Appendix B.3's master key/salt, reused here as a real (if
+;; not RFC-published-for-this-purpose) key material source — the
+;; packet-level protect/unprotect behavior itself has no RFC 3711
+;; worked example to cite, so these packets are constructed test
+;; fixtures exercising the transform, not spec vectors.
+
+(defn- hex [s]
+  (mapv (fn [pair] #?(:clj (Integer/parseInt (apply str pair) 16)
+                      :cljs (js/parseInt (apply str pair) 16)))
+        (partition 2 s)))
+
+(def master-key (hex "E1F97A0D3E018BE0D64FA32C06DE4139"))
+(def master-salt (hex "0EC675AD498AFEEBB6960B3AABE6"))
+
+(defn- ctx [roc]
+  (assoc (kdf/derive-srtp-keys master-key master-salt) :roc roc))
+
+(defn- sample-rtp [seq-num payload]
+  (rtp/encode {:payload-type 0 :sequence-number seq-num :timestamp 12345
+               :ssrc 0xCAFEBABE :payload payload}))
+
+(deftest protect-unprotect-round-trip
+  (doseq [[nm rtp-bytes]
+          [["small payload" (sample-rtp 100 [1 2 3 4])]
+           ["empty payload" (sample-rtp 200 [])]
+           ["payload spanning multiple AES blocks" (sample-rtp 300 (vec (range 50)))]
+           ["with CSRC list" (rtp/encode {:payload-type 8 :sequence-number 1
+                                          :timestamp 0 :ssrc 1 :csrc [10 20 30] :payload [9 9 9]})]
+           ["with header extension" (rtp/encode {:payload-type 8 :sequence-number 1 :timestamp 0
+                                                  :ssrc 1 :extension {:profile 0xBEDE :data [1 2 3 4]}
+                                                  :payload [5 6 7]})]]]
+    (testing nm
+      (let [{:keys [status bytes]} (p/protect rtp-bytes (ctx 0))]
+        (is (= :ok status))
+        (is (not= rtp-bytes bytes) "ciphertext must differ from plaintext when payload is non-empty")
+        (let [{:keys [status bytes]} (p/unprotect bytes (ctx 0))]
+          (is (= :ok status))
+          (is (= rtp-bytes bytes)))))))
+
+(deftest tag-covers-the-roc-not-just-the-wire-bytes
+  (testing "the same wire bytes authenticated under a different ROC must fail verification"
+    (let [rtp-bytes (sample-rtp 5 [1 2 3])
+          {:keys [bytes]} (p/protect rtp-bytes (ctx 0))
+          result (p/unprotect bytes (ctx 1))]
+      (is (= :error (:status result)))
+      (is (= :srtp/authentication-failure (:reason result))))))
+
+(deftest header-length-matches-rtp-header-decode
+  (testing "header-length agrees with where org-ietf-rtp says the payload starts"
+    (doseq [rtp-bytes [(sample-rtp 1 [1 2 3])
+                       (rtp/encode {:payload-type 0 :sequence-number 1 :timestamp 0
+                                    :ssrc 1 :csrc [7 8] :payload [1 2]})]]
+      (let [{:keys [payload]} (rtp/decode rtp-bytes)
+            hlen (p/header-length rtp-bytes)]
+        (is (= (count payload) (- (count rtp-bytes) hlen)))))))
+
+;; ── negative tests: named errors, discrimination ──────────────────────────
+
+(deftest tampering-is-detected
+  (let [rtp-bytes (sample-rtp 42 [1 2 3 4 5])
+        {:keys [bytes]} (p/protect rtp-bytes (ctx 0))]
+    (testing "flipping a bit in the ciphertext payload breaks verification"
+      (let [tampered (update bytes 15 bit-xor 0x01)
+            result (p/unprotect tampered (ctx 0))]
+        (is (= :error (:status result)))
+        (is (= :srtp/authentication-failure (:reason result)))))
+    (testing "flipping a bit in the tag itself also breaks verification"
+      (let [tampered (update bytes (dec (count bytes)) bit-xor 0x01)
+            result (p/unprotect tampered (ctx 0))]
+        (is (= :error (:status result)))
+        (is (= :srtp/authentication-failure (:reason result)))))
+    (testing "genuinely unmodified packet still verifies"
+      (is (= :ok (:status (p/unprotect bytes (ctx 0))))))))
+
+(deftest packet-too-short-to-hold-a-tag
+  (is (= {:status :error :reason :srtp/packet-too-short}
+         (p/unprotect [1 2 3] (ctx 0)))))

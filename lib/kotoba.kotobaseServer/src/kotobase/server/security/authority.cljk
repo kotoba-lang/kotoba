@@ -1,0 +1,260 @@
+(ns kotobase.server.security.authority
+  "Delegation, verified. Two wires, one answer.
+
+  CACAO chains (below) are ordered trusted-root to leaf and monotonically
+  attenuated. Biscuits (bottom) are attenuated by their own key chain. Both
+  produce `:effective-caps`, which is the only thing the handler reads, so
+  they are alternatives rather than layers."
+  (:require [kotoba.lang.coll :as set]
+            [kotoba.lang.text :as str]
+            [ipld.core :as ipld]
+            [kotobase.cacao :as cacao]
+            [kotobase.cid :as cid]
+            [authority.scope :as scope]
+            [biscuit.authority :as ba]
+            [biscuit.token :as bt]
+            [biscuit.wire :as bw]
+            [kotobase.server.security.credential :as cred]
+            ["@ipld/dag-cbor" :as dag-cbor]
+            ["@noble/curves/ed25519.js" :refer [ed25519]]))
+
+(defn- finite-time [s]
+  (when (string? s)
+    (let [n (js/Date.parse s)] (when (js/Number.isFinite n) n))))
+
+(defn verify-grant
+  [encoded {:keys [graph tenant-id require-tenant-binding? now-ms
+                   revoked-credential-cids max-clock-skew-ms]
+            :or {now-ms (.now js/Date) max-clock-skew-ms 60000}}]
+  (try
+    (let [bytes (cacao/base64->bytes encoded)
+          credential-cid (ipld/cid bytes)
+          ^js envelope (.decode dag-cbor bytes)
+          ^js h (.-h envelope) ^js p (.-p envelope) ^js s (.-s envelope)
+          issuer (.-iss p) audience (.-aud p)
+          resources (set (vec (.-resources p)))
+          graph-resource (str "kotoba://graph/" graph)
+          tenant-resource (str "kotoba://tenant/" tenant-id)
+          iat (finite-time (.-iat p)) exp (finite-time (.-exp p))
+          payload {:domain (.-domain p) :iss issuer :aud audience
+                   :version (.-version p) :nonce (.-nonce p)
+                   :iat (.-iat p) :exp (.-exp p) :statement (.-statement p)
+                   :resources (vec (.-resources p))}
+          pub (cid/did-key->ed25519-pub issuer)
+          sig (cacao/base64url->bytes (.-s s))]
+      (when (and (= "caip122" (.-t h)) (= "EdDSA" (.-t s))
+                 (= "kotobase.net" (.-domain p)) (= "1" (.-version p))
+                 pub (string? audience) (seq audience)
+                 iat exp (<= iat (+ now-ms max-clock-skew-ms)) (> exp now-ms)
+                 (contains? resources graph-resource)
+                 (or (not require-tenant-binding?) (contains? resources tenant-resource))
+                 (every? #(or (= graph-resource %)
+                              (= tenant-resource %)
+                              (str/starts-with? % "kotoba://can/")) resources)
+                 (not (contains? (set revoked-credential-cids) credential-cid))
+                 (.verify ed25519 sig (cid/text->bytes (cacao/cacao-siwe-message payload)) pub))
+        {:issuer issuer :audience audience :resources resources
+         :issued-at iat :expires-at exp :credential-cid credential-cid}))
+    (catch :default _ nil)))
+
+(defn verify-chain
+  "Return effective capabilities and credential CIDs, or nil."
+  [encoded-chain {:keys [principal trusted-root-dids] :as opts}]
+  (let [grants (mapv #(verify-grant % opts) encoded-chain)]
+    (when (and (seq grants) (every? some? grants)
+               (contains? (set trusted-root-dids) (:issuer (first grants)))
+               (= principal (:audience (peek grants)))
+               (every? true?
+                       (map (fn [parent child]
+                              (and (= (:audience parent) (:issuer child))
+                                   (set/subset? (:resources child) (:resources parent))
+                                   (<= (:expires-at child) (:expires-at parent))))
+                            grants (rest grants))))
+      {:effective-caps (:resources (peek grants))
+       :credential-cids (mapv :credential-cid grants)
+       :root-did (:issuer (first grants))
+       :delegated? true})))
+
+;; ── biscuit delegation (root ADR-2608180200) ─────────────────────────────────
+;;
+;; The same answer `verify-chain` gives, from the wire this fleet has chosen as
+;; its delegation centre. Both paths land on `:effective-caps`, which is the
+;; only thing the handler downstream reads, so this is additive: no route
+;; changes and the CACAO path is untouched.
+;;
+;; The difference that matters is above, not here: a CACAO chain is verified
+;; with `ed25519.verify` against issuer DIDs the server must know, while a
+;; biscuit is verified against ONE root public key. Every attenuation after
+;; that root is checked by the token's own key chain, so an edge can decide a
+;; call holding nothing secret — which is why the centre is biscuit and not a
+;; bearer format (root ADR-2608180200, `macaroon`'s README for the contrast).
+
+(defn- biscuit-verify-fn
+  "`@noble/curves` Ed25519, in the shape `biscuit.token/verify` injects.
+
+  Keys and signatures cross as raw byte vectors, and the payload is the
+  canonical string the token signs. Nothing here is biscuit-specific — it is
+  the platform's verifier, handed in."
+  [public-key payload signature]
+  (try
+    (.verify ed25519 (js/Uint8Array.from (clj->js (vec signature)))
+             (cid/text->bytes payload)
+             (js/Uint8Array.from (clj->js (vec public-key))))
+    (catch :default _ false)))
+
+(defn- authority-from-model
+  "The resources and holder a verified biscuit confers, or nil.
+
+  The three shape rules are `verify-grant`'s, deliberately: this returns
+  capabilities into the same handler, so a biscuit must not be able to name a
+  resource a CACAO could not."
+  [model {:keys [graph tenant-id require-tenant-binding? now-ms]}]
+  (let [blocks (:biscuit/blocks model)
+        base {:scopes (vec (keep (fn [[p r]] (when (= 'scope p) r))
+                                 (:block/facts (first blocks))))}
+        g (ba/->grant model base)
+        now-iso (.toISOString (js/Date. now-ms))
+        expires (:grant/expires g)
+        resources (set (scope/sorted (:grant/scopes g)))
+        graph-resource (str "kotoba://graph/" graph)
+        tenant-resource (str "kotoba://tenant/" tenant-id)]
+    (when (and (seq resources)
+               (or (nil? expires) (neg? (compare now-iso expires)))
+               (contains? resources graph-resource)
+               (or (not require-tenant-binding?) (contains? resources tenant-resource))
+               (every? #(or (= graph-resource %)
+                            (= tenant-resource %)
+                            (str/starts-with? % "kotoba://can/")) resources))
+      {:effective-caps resources
+       :holder (:grant/holder g)
+       :expires-at expires})))
+
+(defn verify-biscuit
+  "Effective capabilities from an already-decoded biscuit, or nil.
+
+  `opts` is `{:graph :tenant-id :require-tenant-binding? :root-public-key
+  :now-ms}`. `:root-public-key` is a raw 32-byte Ed25519 public key — the
+  only key material this needs, and it is public."
+  [token {:keys [root-public-key now-ms] :as opts}]
+  (try
+    (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
+          v (bt/verify token root-public-key biscuit-verify-fn)]
+      (when (:ok? v)
+        (when-let [authority (authority-from-model token opts)]
+          (merge authority
+                 {:root-public-key (vec root-public-key)
+                  :blocks (count (:biscuit/blocks token))
+                  :wire :biscuit
+                  :delegated? true}))))
+    (catch :default _ nil)))
+
+(defn verify-biscuit-wire
+  "The same, from **biscuit v3 wire bytes** — what another implementation
+  actually sends.
+
+  This is the entry point a route should use. `verify-biscuit` above takes
+  the shape this fleet writes by hand, and wiring a route to that would fix a
+  private format into a live auth path; a token minted by `biscuit-auth`
+  arrives as protobuf and enters here.
+
+  `:root-public-keys` is a SET, because a rotation has to overlap: tokens
+  minted under the old key are still live when the new one starts being used
+  (`biscuit.rootkey` is where that set comes from, verified). `:root-public-key`
+  remains accepted as the single-key case.
+
+  Trying each root is **not** the fallback pattern `credential/select`
+  refuses. There the candidates were different wires, one of which could be
+  weaker, and a caller chose which to present; here every candidate came from
+  one verified log and is equally authoritative, so there is no weaker one to
+  steer a request toward.
+
+  Signature verification happens on the WIRE token, before any fact is
+  converted, because converting first would mean deciding what an unverified
+  token says."
+  [token-bytes {:keys [root-public-key root-public-keys now-ms
+                       revoked-biscuit-signatures] :as opts}]
+  (try
+    (let [opts (assoc opts :now-ms (or now-ms (.now js/Date)))
+          decoded (bw/decode-token (vec token-bytes))
+          roots (vec (or (seq root-public-keys) [root-public-key]))
+          verify-bytes (fn [pk payload sig]
+                         (try (.verify ed25519
+                                       (js/Uint8Array.from (clj->js (vec sig)))
+                                       (js/Uint8Array.from (clj->js (vec payload)))
+                                       (js/Uint8Array.from (clj->js (vec pk))))
+                              (catch :default _ false)))
+          v (first (filter :ok? (map #(bw/verify decoded % verify-bytes) roots)))]
+      (when (and v (not (bw/revoked? decoded (set revoked-biscuit-signatures))))
+        (when-let [authority (authority-from-model (bw/token->model decoded) opts)]
+          (merge authority
+                 {:root-public-keys (mapv vec roots)
+                  :blocks (:blocks v)
+                  :revocation-ids (bw/revocation-ids decoded)
+                  :wire :biscuit-v3
+                  :delegated? true}))))
+    (catch :default _ nil)))
+
+;; ── the one call a worker makes ─────────────────────────────────────────────
+
+(defn delegation-for-request
+  "Effective capabilities a request's delegation confers, whichever wire it
+  presented — or a refusal.
+
+  This is the surface a Worker is meant to call. Both wires already exist
+  above and `kotobase.server.security.credential` already decides between
+  them; what was missing was a single place that binds the two together, so
+  that a caller cannot accidentally wire only one of them or, worse, wire
+  both as a fallback chain.
+
+  `request` carries `:delegations_b64` (CACAO) or `:biscuit_b64` (biscuit v3
+  bytes) — **never both**, which `credential/select` refuses rather than
+  resolves. `opts` is the union of what the two verifiers need; the biscuit
+  wire additionally needs `:root-public-key` and `:biscuit-enabled-graphs`.
+
+  Returns `{:effective-caps … :wire :cacao|:biscuit}`, or
+  `{:wire nil :reason :no-delegation-presented}`, or `{:refused …}`. A caller
+  that treats every non-`:effective-caps` answer as *deny* is correct; the
+  distinctions exist for the audit trail, not for control flow."
+  [request opts]
+  (cred/verify-with
+   request opts
+   {:cacao (fn [req o] (verify-chain (:delegations_b64 req) o))
+    :biscuit (fn [req o] (verify-biscuit-wire (:biscuit_b64 req) o))}))
+
+(defn read-auth-for-request
+  "The read-side auth a Worker's XRPC read path wants, from either wire.
+
+  `net-kotobase/engine`'s read path calls `verify-cacao-caps` and gets
+  `{:did :resources}` — the capability resources a viewer holds, so graph
+  policies can open protected rows. This produces the same map from a
+  delegation of either wire, so wiring it into that Worker is glue rather
+  than a second auth model.
+
+  -> `{:did :resources :wire}` on success, `{:refused …}` when a credential
+  was presented and rejected, or **nil** when none was presented.
+
+  Those three are kept apart on purpose. The existing read path collapses
+  refusal into anonymity — `nil = anonymous; reads stay open` — which is a
+  defensible contract for reads and a **lossy** one: a caller whose
+  credential was rejected is served as though they had presented nothing, and
+  never learns which. `->legacy-read-auth` performs that collapse where a
+  caller wants it, so it is a decision at a call site rather than a property
+  of this function."
+  [request opts]
+  (let [d (delegation-for-request request opts)]
+    (cond
+      (:effective-caps d) {:did (:holder d)
+                           :resources (:effective-caps d)
+                           :wire (:wire d)}
+      (:refused d) d
+      :else nil)))
+
+(defn ->legacy-read-auth
+  "Collapse to the `{:did :resources}` shape the read path already uses.
+
+  A refusal becomes `nil`, i.e. anonymous. That is what the CACAO read path
+  does today and changing it is a product decision, not a refactor — so the
+  collapse is here, named, rather than hidden inside
+  `read-auth-for-request`."
+  [r]
+  (when (:resources r) (select-keys r [:did :resources])))

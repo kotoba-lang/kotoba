@@ -1,0 +1,1677 @@
+(ns kotobase.server.handler
+  "Pure XRPC dispatch for a kotobase-peer-backed datom-plane worker --
+  platform- and storage-independent by construction. Everything here is a
+  pure function of an injected `store` and the parsed request body, so it's
+  node-testable with an in-memory store and portable to ANY storage backend
+  (Cloudflare R2, Backblaze B2, IndexedDB, a plain filesystem, ...) via a
+  thin adapter the caller supplies -- no Cloudflare-specific code lives
+  here, and no crypto POLICY is hardwired: kotobase-peer's own
+  blind-fn/encrypt-fn/decrypt-fn seam (ADR-2607051000, no silent default)
+  is threaded through as part of `store` too, so a caller can choose a
+  plaintext-passthrough profile (the pre-encryption interim posture) or a
+  real AEAD profile without forking this namespace.
+
+  store keys:
+    :get-fn      (fn [cid])          -> block bytes | nil (sync)
+    :put!        (fn [cid bytes])    -> _ (writes block, sync)
+    :head-get    (fn [graph])        -> chain-cid string | nil (sync)
+    :head-put!   (fn [graph chain])  -> _ (sync; a caller doing CAS-with-
+                                          retry against real storage, e.g.
+                                          R2's onlyIf.etagMatches, does that
+                                          OUTSIDE this namespace -- see
+                                          `do-transact`'s docstring)
+    :blind-fn    (fn [component])    -> blinded string | Promise<string>
+    :encrypt-fn  (fn [bytes])        -> ciphertext | Promise<ciphertext>
+    :decrypt-fn  (fn [bytes])        -> plaintext | Promise<plaintext>
+    :async-get-fn (fn [cid])         -> Promise<bytes> (optional, cljs;
+                                          avoids sync snapshot discovery)
+
+  Extracted 2026-07-07 from `kotoba-lang/kotobase-cljc-worker`'s
+  `handler.cljc` (the live implementation behind `kotobase.aozora.app` as of
+  this writing) -- same dispatch/error semantics, generalized so
+  `net-kotobase`'s own Cloudflare deployment (and any future consumer) can
+  share ONE implementation instead of re-deriving it. The only behavioral
+  change from the original: crypto fns move from a hardwired `require` into
+  `store`, matching how storage was already injected."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [kotoba.lang.coll :as set]
+            [kotobase-peer.core :as eng]
+            [kotobase-peer.policy :as policy]
+            [arrangement.core :as qs]
+            [arrangement.datalog :as datalog]
+            [kotobase.server.materialized :as materialized]
+            [kotobase.server.pattern-source :as pattern-source]
+            [kotobase.server.admission :as admission]
+            [kotobase.server.trampoline :as tramp]
+            [kotobase.server.sparql-protocol :as spp]
+            [kotobase.server.cypher :as cypher]
+            [kotobase.server.query-exec :as qx]
+            [multiformats.core :as mf]
+            [ipld.core :as ipld]))
+
+(def datomic-ns "ai.gftd.apps.kotobase.datomic")
+(def kg-ns "ai.gftd.apps.kotobase.kg")
+
+(defn- then*
+  "Thread `x` through `f` across the engine's platform split (ADR-2607051000:
+  kotobase-peer's crypto-touching fns are synchronous values on JVM but
+  `js/Promise`s on cljs). On cljs every handler response is therefore a
+  Promise -- a caller's HTTP shell resolves it same as any other Promise;
+  `js/Promise.resolve` flattens the non-promise case."
+  [x f]
+  #?(:clj (f x)
+     :cljs (.then (js/Promise.resolve x) f)))
+
+;; ── tx_edn (vector of entity maps) → engine quads ────────────────────────────
+
+(defn tx-edn->quads
+  "Parse a kotobase `tx_edn` string -- a vector of entity maps
+  `[{:db/id \"e\" :ns/attr v …} …]` OR standard Datomic list-form assertions
+  `[:db/add e a v]` -- into `{:s :p :o}` quads. Datafication of the map form
+  goes through the engine's canonical datom model (`eng/entities->datoms` =
+  `datom.core/eavt`), the SAME `[e a v]` representation kgraph (kotoba's
+  in-mem view) speaks -- ONE shared datom model across transport, DB, and
+  language (ADR-2607032500). List-form `:db/add` already IS an `[e a v]`
+  triple, so it's stringified the same way `(str e)`/`(str a)`/`(str v)`
+  without a round-trip through `entities->datoms`. Reads the whole string as
+  EDN (no brace-splitting) so map/vector values with literal braces are
+  safe. `(str :ns/attr)` keeps the leading ':' -- PDS datom consumers key on
+  \":ns/attr\".
+
+  Retraction forms ride the same tx_edn vector: `[:db/retract e a v]` -> an
+  :op :retract quad, `[:db/retractEntity e]` -> an :op :retract-entity quad
+  -- dispatched BEFORE eavt (which is the pure entity-map->[e a v] datafier
+  and stays map-only).
+
+  `:db/cas` (compare-and-swap) is deliberately NOT supported here -- CAS
+  needs an atomicity guarantee this engine's append-only novelty-block write
+  (`do-transact`, O(|tx|), no read-check) does not provide; a caller relying
+  on `:db/cas` (e.g. cloud-murakumo's worker job-claim race) gets the same
+  `unrecognized tx_edn item` rejection :db/add used to get, not silent
+  non-atomic best-effort semantics -- confirmed 2026-07-12 while diagnosing
+  every cloud-murakumo.queue-kotoba write returning a generic 400
+  \"InternalError\" (this fn's own `:else` throw, swallowed by `handle`'s
+  outer try/catch): queue-kotoba's job->tx/event->tx build plain `:db/add`
+  list-form tuples, which this fn rejected outright before this fix -- ANY
+  transact from that client failed, not just CAS-shaped ones."
+  [tx-edn]
+  (mapcat (fn [item]
+            (cond
+              (and (vector? item) (= 4 (count item)) (= :db/retract (first item)))
+              (let [[_ e a v] item]
+                [{:s (str e) :p (str a) :o (str v) :op :retract}])
+
+              (and (vector? item) (= 2 (count item)) (= :db/retractEntity (first item)))
+              [{:s (str (second item)) :op :retract-entity}]
+
+              (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+              (let [[_ e a v] item]
+                [{:s (str e) :p (str a) :o (str v)}])
+
+              (map? item)
+              (map (fn [[e a v]] {:s (str e) :p (str a) :o (str v)})
+                   (eng/entities->datoms [item]))
+
+              :else
+              (throw (ex-info "kotobase: unrecognized tx_edn item" {:item item}))))
+          (edn/read-string tx-edn)))
+
+(def ^:private schema-properties
+  {:db/valueType "db/valueType"
+   :db/cardinality "db/cardinality"
+   :db/unique "db/unique"
+   :db/doc "db/doc"
+   :db/tupleTypes "db/tupleTypes"})
+
+(defn- schema-value
+  "Official Datomic schema keyword -> kotobase-peer's compact schema value."
+  [value]
+  (cond
+    (vector? value) (mapv schema-value value)
+    (keyword? value) (keyword (name value))
+    :else value))
+
+(defn- schema-wire-value [value]
+  (cond
+    (vector? value) (str/join "," (map schema-wire-value value))
+    (keyword? value) (name value)
+    :else (str value)))
+
+(defn- schema-declaration? [item]
+  (and (map? item) (:db/ident item)
+       (some #(contains? item %) (keys schema-properties))))
+
+(defn- inline-schema [items]
+  (into {}
+        (keep (fn [item]
+                (when (schema-declaration? item)
+                  [(str (:db/ident item))
+                   (into {}
+                         (keep (fn [[official _wire]]
+                                 (when (contains? item official)
+                                   [official (schema-value (get item official))])))
+                         schema-properties)])))
+        items))
+
+(defn- schema-property [decl normalized official]
+  (or (get decl normalized)
+      (some-> (get decl official) schema-value name)))
+
+(defn- entity-map-operations [db schema item]
+  (let [entity (:db/id item)]
+    (when-not (some? entity)
+      (throw (ex-info "Datomic entity map requires :db/id" {:item item})))
+    (vec
+     (mapcat
+      (fn [[attribute value]]
+        (let [decl (or (get schema (str attribute))
+                       (get (eng/schema-of db) (str attribute)))
+              cardinality (schema-property decl :cardinality :db/cardinality)
+              value-type (schema-property decl :value-type :db/valueType)
+              values (if (and (= "many" cardinality)
+                              (coll? value)
+                              (not= "tuple" value-type))
+                       value
+                       [value])]
+          (map (fn [v] [:db/add entity attribute v]) values)))
+      (dissoc item :db/id)))))
+
+(defn- schema-operations [item]
+  (let [attribute (:db/ident item)]
+    (into [[:db/add (str attribute) :db/ident attribute]]
+          (keep (fn [[official wire]]
+                  (when (contains? item official)
+                    {:s (str attribute) :p wire
+                     :o (schema-wire-value (get item official))})))
+          schema-properties)))
+
+;; Read through arrangement's PUBLIC accessor, not `(get-in db [:spo ...])`.
+;; arrangement renamed its in-memory index keys `:spo`/`:pso`/`:pos`/`:ocp` ->
+;; `:eavt`/`:aevt`/`:avet`/`:vaet`; a stale `:spo` reads as nil and answers
+;; zero rows SUCCESSFULLY. Measured 2026-09-10 advancing the kotobase-peer pin
+;; 4926d13 -> ed3ae49: this fn and `db-quads` below were the only two sites
+;; still naming an index key, and both went silently empty -- which made every
+;; `enforce_schema` transaction persist an empty delta while reporting :ok.
+(defn- current-values [db entity attribute]
+  (get (qs/entity-attrs db (str entity)) (str attribute) #{}))
+
+(defn- stored-value [value]
+  (if (ipld/link? value) value (str value)))
+
+(defn- expand-hosted-builtins
+  "Expand the public built-in transaction functions against db-before.
+  Unknown function identifiers fail loudly; arbitrary persisted Clojure is
+  never evaluated in a Worker."
+  [db schema items]
+  (mapcat
+   (fn [item]
+     (cond
+       (schema-declaration? item) (schema-operations item)
+       (map? item) (entity-map-operations db schema item)
+
+       (and (sequential? item) (= :db.fn/cas (first item)) (= 5 (count item)))
+       (let [[_ entity attribute old-value new-value] item
+             actual (current-values db entity attribute)
+             expected (stored-value old-value)]
+         (when-not (= actual #{expected})
+           (throw (ex-info "Compare-and-swap failed"
+                           {:type :kotobase.datomic/cas-failed
+                            :entity entity :attribute attribute
+                            :expected old-value :actual actual})))
+         [[:db/retract entity attribute old-value]
+          [:db/add entity attribute new-value]])
+
+       (and (sequential? item) (= :db.fn/retractAttribute (first item))
+            (= 3 (count item)))
+       (let [[_ entity attribute] item]
+         (mapv (fn [value] [:db/retract entity attribute value])
+               (current-values db entity attribute)))
+
+       (and (sequential? item) (= :db.fn/retractEntity (first item))
+            (= 2 (count item)))
+       [[:db/retractEntity (second item)]]
+
+       (and (sequential? item) (keyword? (first item))
+            (not (contains? #{:db/add :db/retract :db/retractEntity}
+                            (first item))))
+       (throw (ex-info "Transaction function is not registered on this host"
+                       {:type :kotobase.datomic/unknown-transaction-function
+                        :function (first item)}))
+
+       :else [item]))
+   items))
+
+(defn- db-quads [db]
+  ;; `check-shape!` THROWS on a pre-rename db instead of letting `:eavt` read
+  ;; as nil and this fn return an empty set -- see `current-values` above.
+  ;; A whole-db scan has no public accessor (`eng/datoms` returns `:v_edn`
+  ;; wire strings, and the set-difference below needs raw values), so this one
+  ;; names the index key; the guard is what keeps that loud.
+  (qs/check-shape! db)
+  (into #{}
+        (for [[entity attrs] (:eavt db)
+              [attribute values] attrs
+              value values]
+          {:s entity :p attribute :o value})))
+
+(defn prepare-hosted-transaction
+  "Validate and expand Client API tx data against one immutable db-before.
+  Returns only effective persistence deltas, including cardinality-one
+  retractions. This function is pure; the caller commits the result only after
+  it returns successfully."
+  [db tx-edn]
+  (let [items (edn/read-string tx-edn)
+        schema (inline-schema items)
+        enforce-schema? (or (seq schema) (seq (eng/schema-of db)))
+        operations (vec (expand-hosted-builtins db schema items))
+        db-after
+        (reduce
+         (fn [current operation]
+           (let [op (when (sequential? operation) (first operation))
+                 ident-op? (and (= :db/add op) (= :db/ident (nth operation 2 nil)))]
+             (cond
+               (contains? #{:db/retract :db/retractEntity} op)
+               (eng/transact current [operation])
+
+               ident-op?
+               (eng/transact current [operation])
+
+               enforce-schema?
+               (eng/transact-with-schema current [operation] schema)
+
+               :else
+               (eng/transact current [operation]))))
+         db operations)
+        before (db-quads db)
+        after (db-quads db-after)]
+    (vec
+     (concat
+      (map #(assoc % :op :retract) (sort-by (juxt :s :p #(pr-str (:o %))) (set/difference before after)))
+      (sort-by (juxt :s :p #(pr-str (:o %))) (set/difference after before))))))
+
+;; ── read/write against the graph's persisted chain (ADR-2607032430 D1) ──────
+;; The chain's head IS the unit of state now (snapshot + pending novelty), not
+;; just its folded snapshot -- every read goes through `eng/hot-datoms` so it
+;; never misses data written since the last fold. `do-transact` never
+;; hydrates the graph: it appends one novelty tx block (O(|tx|), independent
+;; of graph size). Folding is a separate, explicit operation (`do-fold`) a
+;; cron/ops caller invokes -- never inline in a write's own request, so no
+;; single write's latency/CPU budget can include an O(graph) compaction.
+
+(defn- index-kw [index]
+  (when (seq index) (keyword (cond-> index (str/starts-with? index ":") (subs 1)))))
+
+(defn- visible-of
+  "The per-request row filter `handle` computed from (graph policy × viewer
+  CACAO capabilities), ADR-2607174500 Phase 3b; absent (writes, tests
+  calling do-* directly) → fully public, the pre-Phase-3 behavior."
+  [store]
+  (or (:visible? store) (constantly true)))
+
+(defn- owned-entities
+  "Entity ids the viewer OWNS per the policy's :owner-attrs (Phase 3c,
+  ADR-2607174500 addendum 2): one narrow :avet [owner-attr viewer-did] scan
+  per owner attr. Empty when no owner-attrs / anonymous. Promise on cljs."
+  [store chain policy viewer-did]
+  (let [owner-attrs (:owner-attrs policy)]
+    (if (or (nil? chain) (empty? owner-attrs) (nil? viewer-did))
+      #?(:clj #{} :cljs (js/Promise.resolve #{}))
+      #?(:clj
+         (into #{}
+               (mapcat (fn [attr]
+                         (->> (eng/hot-datoms (:get-fn store) chain
+                                              {:index :avet :components [attr viewer-did]}
+                                              (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                              (:async-get-fn store))
+                              (map :e))))
+               owner-attrs)
+         :cljs
+         (-> (js/Promise.all
+              (into-array
+               (map (fn [attr]
+                      (eng/hot-datoms (:get-fn store) chain
+                                      {:index :avet :components [attr viewer-did]}
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                 (:async-get-fn store)))
+                    owner-attrs)))
+             (.then (fn [^js lists]
+                      (into #{} (mapcat #(map :e %)) (array-seq lists)))))))))
+
+(defn- request-visible?
+  "policy entity の 1 narrow read × viewer caps × (Phase 3c) 所有 entity →
+  visible? (ADR-2607174500)。`viewer` は auth map {:did :resources} or nil。
+  nil chain → public. Promise on cljs."
+  [store viewer]
+  (let [caps (:resources viewer)
+        viewer-did (:did viewer)]
+    (fn [graph]
+      (let [chain ((:head-get store) graph)]
+    (if (nil? chain)
+      (let [visible? (policy/visible-for-mode nil caps #{} (:security-mode store))]
+        #?(:clj visible? :cljs (js/Promise.resolve visible?)))
+          (then* (eng/hot-datoms (:get-fn store) chain
+                                 {:index :eavt :components [policy/policy-entity]}
+                                 (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                 (:async-get-fn store))
+                 (fn [rows]
+                   (let [policy (policy/policy-of rows)]
+                     (then* (owned-entities store chain policy viewer-did)
+                            (fn [owned]
+                              (policy/visible-for-mode policy caps owned
+                                                       (:security-mode store))))))))))))
+
+(declare db-for-body hot-db)
+
+(defn do-datoms
+  "`datomic.datoms` -- filtered read via hot-datoms (snapshot + novelty
+  merge, range-pruned on the snapshot side; never a whole-graph rehydrate).
+  body: {:graph :index :components_edn :limit}.
+
+  `eng/hot-datoms`'s `visible?` is required (ADR-2607050500, same reasoning
+  as `do-q`'s `eng/q` call below) -- this handler has no capability/purpose-
+  scoped redaction wired in yet, so it passes `(constantly true)`
+  explicitly: today's behavior is unchanged, stated instead of assumed.
+
+  `:async-get-fn` (optional store key, cljs-only effect, nil-safe) is
+  forwarded to `hot-datoms`'s async arity (kotoba-lang/kotobase-peer#21).
+  Without it every read pays the sync block-miss trampoline's O(N^2)
+  block-discovery cost: `with-blocks` re-runs the WHOLE handler from
+  scratch on each cache miss, so a read touching N blocks executes the
+  read N+1 times. Measured live on backend.kotobase.net (2026-07-25, the
+  cloud-itonami-lei-catalog graph): a `:eavt` scan with `:limit 5` burned
+  32,500ms CPU against a 34,918ms wall clock -- 93% pure CPU, only ~2.4s
+  of actual I/O -- and was killed with `outcome: exceededCpu`, making the
+  graph unreadable at ANY limit. Same failure kotobase-peer#21's own
+  docstring reports from gftdcojp/app-aozora#78 (5130-leaf snapshot: 300s+
+  CPU via the trampoline vs 806ms via the async path). Stores that supply
+  no `:async-get-fn` keep exactly today's behavior."
+  [store {:keys [graph index components_edn limit] :as body}]
+  (let [chain ((:head-get store) graph)]
+    (then* (if (:with_edn body)
+             (then* (db-for-body store chain body)
+                    #(eng/datoms % {:index (or (index-kw index) :eavt)
+                                    :components (vec components_edn)
+                                    :limit limit}
+                                 (visible-of store)))
+             (eng/hot-datoms (:get-fn store) chain
+                             {:index (or (index-kw index) :eavt)
+                              :components (vec components_edn)
+                              :limit limit}
+                             (visible-of store) (:blind-fn store) (:decrypt-fn store)
+                             (:async-get-fn store)))
+           (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
+
+(defn do-transact
+  "`datomic.transact` -- append the tx quads as ONE novelty block and
+  advance the chain. O(|tx_edn|) -- independent of graph size; never
+  hydrates or rebuilds an index (ADR-2607032430 D1). `auth-did` is the
+  CACAO-verified issuer (the caller verifies it == graph owner, before
+  calling this); nil here means the caller already gated it. `novelty_size`
+  in the response is an observability signal for when a `fold` (see
+  `do-fold`) is worth invoking -- this handler never folds itself.
+
+  `((:head-put! store) graph chain)` here is NOT the durable, concurrency-
+  safe head write -- it's a hook the caller uses however it needs
+  (typically: accumulate into a buffer, then CAS the durable head pointer
+  AFTER this fn returns, retrying the WHOLE call on a lost race). See
+  `kotoba-lang/kotobase-cljc-worker`'s `worker.cljc` (`run-write-attempt`/
+  `run-write`) for the reference orchestration this was extracted from."
+  [store {:keys [graph tx_edn enforce_schema]} auth]
+  (let [get-fn (:get-fn store)
+        prev-chain ((:head-get store) graph)
+        prepared-quads (if enforce_schema
+                         (then* (hot-db store prev-chain)
+                                #(prepare-hosted-transaction % tx_edn))
+                         (vec (tx-edn->quads tx_edn)))
+        context (if (map? auth)
+                  auth
+                  {:did auth :effective-caps #{policy/transact-capability
+                                               policy/policy-admin-capability}})
+        policy-rows (if prev-chain
+                      (eng/hot-datoms get-fn prev-chain
+                                      {:index :eavt :components [policy/policy-entity]}
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                 (:async-get-fn store))
+                      #?(:clj [] :cljs (js/Promise.resolve [])))]
+    (then* prepared-quads
+           (fn [quads]
+             (then* policy-rows
+                    (fn [rows]
+                      (policy/assert-write-authorized!
+                       (policy/policy-of rows) context quads (:security-mode store))
+                      (then* (eng/commit! (:put! store) get-fn quads prev-chain
+                                         (:encrypt-fn store) (:blind-fn store))
+                             (fn [chain]
+                               ((:head-put! store) graph chain)
+                               {:ok true :graph graph :commit chain :previous_commit prev-chain
+                                :datom_count (count quads)
+                                :novelty_size (eng/novelty-size get-fn chain)}))))))))
+
+;; ── kg.ingest / kg.ingest_batch (ai.gftd.apps.kotobase.kg.*, additive) ───────
+;; A SEPARATE NSID family from datomic.* above -- extracted here (2026-07-18)
+;; alongside the datomic.* extraction so `net-kotobase`'s kotobase-cf-wasm
+;; deployment (the actual live production backend this library serves,
+;; behind kotobase.net's KOTOBA_BACKEND_URL) can share ONE kg.ingest
+;; implementation, same reasoning as this whole namespace's own extraction
+;; (see the ns docstring). Ported byte-for-byte from
+;; `kotoba-lang/kotobase-cljc-worker`'s own handler.cljc kg.* addition --
+;; see that file's equivalent section comment for the full field-shape /
+;; predicate-namespacing reasoning (cloud-itonami's real live camelCase
+;; pred/value/dstId wire shape vs. the lexicon's documented snake_case
+;; predicate/object/target shape; kg/claim/<pred>, kg/relation/<pred>,
+;; kg/entity/<field>, kg/label_vec predicate namespacing).
+;;
+;; Projects a kg "entity + claims + relations" payload into the SAME
+;; {:s :p :o} quad model tx-edn->quads already produces, then reuses do-
+;; transact's own authorization + commit machinery (kg-commit!, factored
+;; out below) verbatim -- a kg write is exactly as write-gated as a datom
+;; write, no separate/weaker policy path.
+
+(defn- kg-field
+  "`entity`'s value for one logical field, trying the camelCase key first
+  (the real live caller's wire shape), then the lexicon's snake_case key."
+  [entity camel-k snake-k]
+  (if (contains? entity camel-k) (get entity camel-k) (get entity snake-k)))
+
+(def ^:private kg-entity-scalar-fields
+  "[camel-key snake-key canonical-name] -- every ai.gftd.apps.kotobase.kg.ingest
+  entity-level scalar field besides :id/:claims/:relations/:label_vec
+  (handled separately below), projected as `kg/entity/<canonical-name>`
+  quads when present under either spelling."
+  [[:type nil "type"]
+   [:qid nil "qid"]
+   [:labelJa :label_ja "labelJa"]
+   [:labelEn :label_en "labelEn"]
+   [:confidence nil "confidence"]
+   [:license nil "license"]
+   [:extractor nil "extractor"]
+   [:sourceId :source_id "sourceId"]
+   [:validFrom :valid_from "validFrom"]
+   [:validTo :valid_to "validTo"]
+   [:ingestedAt :ingested_at "ingestedAt"]])
+
+(defn- kg-entity-scalar-quads [entity-id entity]
+  (for [[camel-k snake-k canonical] kg-entity-scalar-fields
+        :let [v (kg-field entity camel-k snake-k)]
+        :when (some? v)]
+    {:s entity-id :p (str "kg/entity/" canonical) :o (str v)}))
+
+(defn- kg-label-vec-quads [entity-id entity]
+  (let [v (kg-field entity :labelVec :label_vec)]
+    (when (some? v)
+      [{:s entity-id :p "kg/label_vec" :o (pr-str v)}])))
+
+(defn- kg-claim-quads [entity-id claims]
+  (for [c claims
+        :let [pred (kg-field c :pred :predicate)
+              value (kg-field c :value :object)]
+        :when (and (some? pred) (some? value))]
+    {:s entity-id :p (str "kg/claim/" pred) :o (str value)}))
+
+(defn- kg-relation-quads [entity-id relations]
+  (for [r relations
+        :let [pred (kg-field r :pred :predicate)
+              target (kg-field r :dstId :target)]
+        :when (and (some? pred) (some? target))]
+    {:s entity-id :p (str "kg/relation/" pred) :o (str target)}))
+
+(defn kg-entity->quads
+  "One ai.gftd.apps.kotobase.kg.ingest entity map -> its `{:s :p :o}` quads
+  (entity-level scalars + claims + relations -- see the section comment
+  above for the exact predicate shapes and dual camelCase/snake_case field
+  acceptance). Throws on a missing/blank :id -- every quad needs a
+  subject."
+  [entity]
+  (let [entity-id (some-> (:id entity) str)]
+    (when (str/blank? entity-id)
+      (throw (ex-info "kotobase kg: entity :id is required" {:entity entity})))
+    (vec (concat (kg-entity-scalar-quads entity-id entity)
+                 (kg-label-vec-quads entity-id entity)
+                 (kg-claim-quads entity-id (:claims entity))
+                 (kg-relation-quads entity-id (:relations entity))))))
+
+(defn kg-subject-cid
+  "Content-addressed CID of one kg.ingest entity payload -- CIDv1/dag-cbor/
+  sha2-256 over `(pr-str entity)` via `ipld/node->block`, the SAME
+  primitive `kotobase-peer.policy/policy-cid` already uses for the same
+  'stable content identity of an EDN blob' need. A real hash, not a
+  fabricated-looking placeholder string."
+  [entity]
+  (:cid (ipld/node->block {"type" "kotobase/kg-entity/v1" "entity" (pr-str entity)})))
+
+(defn- kg-commit!
+  "Shared write path for do-kg-ingest/do-kg-ingest-batch: the SAME
+  authorization + commit machinery do-transact uses above (read the
+  graph's in-chain policy, policy/assert-write-authorized! against it,
+  then eng/commit! + head-put!) -- factored out so neither kg entry point
+  copy-pastes (and risks silently drifting from) that gate. `quads` is the
+  full flattened set for the whole request (one entity or a batch); `auth`
+  is do-transact's own `auth` contract unchanged (a verified-CACAO
+  {:did :effective-caps ...} context map, or -- embedded/test
+  compatibility only -- a bare did)."
+  [store graph quads auth]
+  (let [get-fn (:get-fn store)
+        prev-chain ((:head-get store) graph)
+        context (if (map? auth)
+                  auth
+                  {:did auth :effective-caps #{policy/transact-capability
+                                               policy/policy-admin-capability}})
+        policy-rows (if prev-chain
+                      (eng/hot-datoms get-fn prev-chain
+                                      {:index :eavt :components [policy/policy-entity]}
+                                      (constantly true) (:blind-fn store) (:decrypt-fn store)
+                                 (:async-get-fn store))
+                      #?(:clj [] :cljs (js/Promise.resolve [])))]
+    (then* policy-rows
+           (fn [rows]
+             (policy/assert-write-authorized!
+              (policy/policy-of rows) context quads (:security-mode store))
+             (then* (eng/commit! (:put! store) get-fn quads prev-chain
+                                         (:encrypt-fn store) (:blind-fn store))
+                    (fn [chain]
+                      ((:head-put! store) graph chain)
+                      {:chain chain :previous-chain prev-chain}))))))
+
+(defn do-kg-ingest
+  "`kg.ingest` -- ingest ONE entity (see the section comment above for the
+  quad projection). body: {:graph <derived by the caller shell from the
+  verified CACAO's own kotoba://graph/<db-name> resource -- kg.ingest's
+  own wire body carries no :graph/:db_name field at all> ...entity
+  fields}. Response mirrors the lexicon: {:ok :subjectCid :quadCount}."
+  [store body auth]
+  (let [entity (dissoc body :graph :tenant_did :cacao_b64)
+        quads (kg-entity->quads entity)
+        subject-cid (kg-subject-cid entity)]
+    (then* (kg-commit! store (:graph body) quads auth)
+           (fn [{:keys [chain previous-chain]}]
+             {:ok true :graph (:graph body) :subjectCid subject-cid
+              :quadCount (count quads) :commit chain :previous_commit previous-chain}))))
+
+(defn do-kg-ingest-batch
+  "`kg.ingest_batch` -- ingest MANY entities as one commit (one novelty
+  block covering every entity's quads, not one commit per entity -- same
+  O(|tx|) reasoning as do-transact). body: {:graph <derived, see
+  do-kg-ingest> :entities [<kg.ingest-shaped entity> ...]}. Response
+  mirrors the lexicon: {:ok :ingested :subjectCids :quadCount}."
+  [store {:keys [graph entities]} auth]
+  (let [entities (vec entities)
+        per-entity (mapv (fn [e] {:quads (kg-entity->quads e) :subject-cid (kg-subject-cid e)})
+                         entities)
+        quads (vec (mapcat :quads per-entity))]
+    (then* (kg-commit! store graph quads auth)
+           (fn [{:keys [chain previous-chain]}]
+             {:ok true :graph graph :ingested (count entities)
+              :subjectCids (mapv :subject-cid per-entity)
+              :quadCount (count quads) :commit chain :previous_commit previous-chain}))))
+
+(defn- hot-db
+  "The full hot db as of `chain` (snapshot + novelty merged) -- for `do-q`/
+  `do-pull`/`do-entity`/`do-entid`/`do-ident`/`do-pull-many`, which need an
+  actual db value (to route a multi-attribute pattern through
+  arrangement.query/datalog, or to navigate ref-valued attrs via `pull`/
+  `entity`). Delegates directly to kotobase-peer's own `hydrate-chain` --
+  this fn used to hand-roll the equivalent via hot-datoms + a fresh
+  `transact` (a workaround from before kotobase-peer had this primitive
+  itself, see git history); `hydrate-chain` is kotobase-peer's own, more
+  direct implementation of exactly this, now used instead.
+
+  Optional memoization seam: a storage shell may supply `:db-cache-get` /
+  `:db-cache-put!` in the store map (`(db-cache-get chain) -> db | nil`,
+  `(db-cache-put! chain db)`; both keyed by the CHAIN CID). A chain CID is
+  a content address over the graph's entire state, so a hydrated db cached
+  under it can never go stale -- a write advances the head to a DIFFERENT
+  chain CID, which is simply a different key; no invalidation protocol
+  exists because none is needed. This is the seam that removes the
+  measured per-request rehydration cost (every `q` re-decrypting every row:
+  ~1.5s CPU at 3,000 datoms, observed live on kotobase-cf-wasm) for
+  storage shells that can hold hot state between requests (e.g. a Worker
+  isolate). Both keys absent -> behavior is byte-identical to before.
+  `db-cache-put!` receives the RESOLVED db value (never a platform
+  Promise), inside the engine's own then* continuation. Bounding/eviction
+  is the shell's responsibility -- a decrypted hydrated db lives in the
+  same trust domain as the shell's own decrypt keys, but it is plaintext
+  in memory, so shells must bound entries and never spill this cache to
+  storage.
+
+  Second, colo-shared tier (`:rows-cache-get`/`:rows-cache-put!`, plus
+  optional `:async-get-fn`, all forwarded to kotobase-peer's
+  `hydrate-chain-cached`): the SNAPSHOT rows, serialized, keyed by
+  snapshot-cid -- for shells whose sibling isolates each miss the L1 db
+  cache but share a nearby byte cache (e.g. Cloudflare Cache API). Rows
+  cross that seam decrypted: a shell whose cache medium is less trusted
+  than its own runtime memory must encrypt inside its cache fns (the
+  engine docstring's contract). All keys absent -> plain hydrate-chain,
+  byte-identical behavior."
+  [store chain]
+  (let [cache-get (:db-cache-get store)
+        cache-put! (:db-cache-put! store)
+        rows-get (:rows-cache-get store)
+        rows-put! (:rows-cache-put! store)
+        ;; `:async-get-fn` ALONE is enough to take the cached path: with nil
+        ;; cache slots `hydrate-chain-cached` falls back to plain
+        ;; `hydrate-db` behavior for the snapshot (its own docstring's
+        ;; contract) while still routing block discovery through
+        ;; `cold-datoms-async`. Gating this on the rows cache instead would
+        ;; leave every rows-cache-less shell on `hydrate-chain`, which has
+        ;; no async arity at all and therefore keeps paying the sync
+        ;; trampoline's O(N^2) cost -- the same cost that made this graph
+        ;; unreadable (see `do-datoms`).
+        hydrate (fn []
+                  (if (or rows-get rows-put! (:async-get-fn store))
+                    (eng/hydrate-chain-cached (:get-fn store) chain (:blind-fn store) (:decrypt-fn store)
+                                              rows-get rows-put! (:async-get-fn store))
+                    (eng/hydrate-chain (:get-fn store) chain (:blind-fn store) (:decrypt-fn store))))]
+    (if-some [cached (when (and cache-get chain) (cache-get chain))]
+      cached
+      (then* (hydrate)
+             (fn [db]
+               (when (and cache-put! chain) (cache-put! chain db))
+               db)))))
+
+(defn- db-for-body
+  "Hydrate the durable basis and, when `with_edn` is present, apply that
+  transaction data only to the request-local immutable db.  `with_edn` is the
+  portable representation of a Client API db-after value: it can be sent back
+  by q/pull/datoms without ever advancing the graph head."
+  [store chain {:keys [with_edn]}]
+  (then* (hot-db store chain)
+         (fn [db]
+           (if (some? with_edn)
+             (:db-after (eng/with db (vec (tx-edn->quads with_edn))))
+             db))))
+
+(defn do-with
+  "`datomic.with` -- produce a portable speculative db token.  The result
+  deliberately contains no engine-internal db maps; callers feed `with_edn`
+  back to read methods to address db-after.  No block or head write occurs."
+  [store {:keys [graph tx_edn] :as body}]
+  (let [chain ((:head-get store) graph)
+        entries (when chain (eng/chain (:get-fn store) chain))]
+    (then* (db-for-body store chain (dissoc body :with_edn))
+           (fn [db]
+             (let [quads (vec (tx-edn->quads tx_edn))
+                   report (eng/with db quads)]
+               {:ok true
+                :graph graph
+                :basis_t (:seq (last entries))
+                :with_edn tx_edn
+                :tx_data (mapv #(select-keys % [:s :p :o :op]) (:tx-data report))})))))
+
+;; ── query-literal normalization (wire symmetry with tx-edn->quads) ──────────
+;; The write path stringifies EVERY non-Link datom position before it reaches
+;; the engine (`tx-edn->quads` above: `(str a)` / `(str v)` -- a transacted
+;; `:gh.genko/title` is STORED as the string ":gh.genko/title", `:status
+;; :draft` as ":draft", `:score 10` as "10"). The read path previously passed
+;; `query_edn`'s parsed literals through to arrangement UNCHANGED, where
+;; matching is plain `=` -- so a natural Datomic-style query written with
+;; keyword attributes (`[?e :gh.genko/title ?t]`) compared a KEYWORD against
+;; the stored STRING, matched nothing, and returned `{:ok true :rows []}`:
+;; success-shaped silence for correctly-written queries over data `datoms`
+;; plainly showed (confirmed live against backend.kotobase.net, 2026-07-09;
+;; the smoke tests never caught it because they all pre-stringify attrs,
+;; `":yoro.post/text"`). These fns close that asymmetry at the SAME layer
+;; that created it: every query literal in a datom position is coerced with
+;; the write side's own `(str x)` before it reaches the engine.
+;;
+;; What is deliberately NOT coerced:
+;;   - logic vars (`?x`) / the wildcard `_` / nil -- pattern syntax, not data
+;;   - strings -- already the stored representation ((str s) = s anyway)
+;;   - collections -- `["ipld/link" cid]` (a Link's wire form) and any other
+;;     structured literal keep today's behavior; Link-valued query matching
+;;     is a separate, pre-existing gap this change doesn't paper over
+;;   - predicate/function clause args (`[(> ?n 18)]`) -- those evaluate over
+;;     already-bound values, they are not matched against stored datoms
+
+(defn- lvar? [x] (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- wire-literal
+  "One query literal -> the engine's stored representation (the write
+  side's own `(str x)` coercion). Pattern syntax (lvars/`_`/nil), strings,
+  and collections pass through unchanged -- see the section comment."
+  [x]
+  (if (or (nil? x) (string? x) (coll? x) (lvar? x) (= '_ x))
+    x
+    (str x)))
+
+(defn- normalize-clause
+  "Normalize the datom-position literals of ONE `:where`/rule-body clause,
+  preserving `arrangement.datalog`'s clause taxonomy exactly: triple
+  patterns, `(not [e a v])`, `(or ...)`/`(or-join [vars] ...)` branches,
+  and rule-invocation args are coerced; predicate/function clauses
+  (`[(fn-sym arg...)]`, distinguished the same way arrangement does -- a
+  vector whose first element is a seq) are left untouched."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause))) clause
+    (vector? clause) (mapv wire-literal clause)
+    (seq? clause)
+    (let [[head & more] clause]
+      (cond
+        (= 'not head)     (list 'not (normalize-clause (first more)))
+        (= 'or head)      (cons 'or (map normalize-clause more))
+        (= 'and head)     (cons 'and (map normalize-clause more))
+        (= 'or-join head) (list* 'or-join (first more) (map normalize-clause (rest more)))
+        :else             (cons head (map wire-literal more))))
+    :else clause))
+
+(defn- normalize-rule
+  "`[(rule-name ?param ...) body-clause ...]` -- the head (params are
+  lvars by construction) stays; body clauses normalize like `:where`'s."
+  [rule]
+  (into [(first rule)] (map normalize-clause (rest rule))))
+
+(defn normalize-query-literals
+  "Coerce every datom-position literal of a parsed `query_edn` (either
+  shape: `[s p o]` triple pattern or `{:find ... :where ... :rules ...}`
+  Datalog map) to the stored string representation -- see the section
+  comment above. Public + pure so the symmetry with `tx-edn->quads` is
+  directly unit-testable."
+  [pat]
+  (if (map? pat)
+    (cond-> pat
+      (:where pat) (update :where #(mapv normalize-clause %))
+      (:rules pat) (update :rules #(mapv normalize-rule %)))
+    (mapv wire-literal pat)))
+
+(defn- clause-triples
+  "Every `[e a v]` triple pattern reachable from ONE `:where`/rule-body
+  clause: the clause itself, both sides of an `and`, every branch of an
+  `or`/`or-join`, and the pattern a `(not ...)` negates.
+
+  A RULE INVOCATION contributes none of its own -- `(ancestor ?x ?y)` names
+  no attribute. Its body's patterns are what the source is asked for, which
+  is why `datalog-source-patterns` walks `:rules` separately and walks EVERY
+  definition rather than only the ones this `:where` reaches. A rule reached
+  only from inside another rule is still evaluated, and a prefetch that
+  missed it would not error -- `datalog.core` would scan a source that does
+  not hold those quads and report FEWER rows, which reads exactly like a
+  query that matched nothing.
+
+  Predicate/function clauses (`[(> ?n 18)]`) are skipped: they evaluate over
+  already-bound values and are never matched against stored datoms. They are
+  told apart from triples the same way `normalize-clause` and
+  `datalog.core/predicate-clause?` do it -- a vector whose first element is
+  a seq."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause))) []
+    (vector? clause) [clause]
+    (seq? clause)
+    (let [[head & more] clause]
+      (cond
+        (= 'not head)     (mapcat clause-triples more)
+        (= 'or head)      (mapcat clause-triples more)
+        (= 'and head)     (mapcat clause-triples more)
+        (= 'or-join head) (mapcat clause-triples (rest more))
+        :else             []))
+    :else []))
+
+(defn datalog-source-patterns
+  "The `[s p o]` patterns a Datalog map query needs prefetched, WIDENED to
+  what the source must hold rather than narrowed to what any one clause
+  spells.
+
+  Every logic variable becomes `nil`, so a clause is asked for at its widest
+  binding. That is the direction safety runs in: the join and the fixpoint
+  probe with variables SUBSTITUTED, i.e. with patterns narrower than these,
+  and `source-for` hands back a source over the union, which answers a
+  narrower pattern by filtering. Prefetching `[\"Cat\" attr nil]` because the
+  clause happened to name `\"Cat\"` in an argument position would make the
+  answer depend on which bindings existed at plan time -- the same reason
+  `compiled-patterns` prefetches a whole `[nil attr nil]` range for a
+  variable-length path.
+
+  Positions are read by destructuring, exactly as `datalog.query/query`
+  reads them, so a clause with the wrong arity is prefetched the way the
+  engine will actually scan it rather than being silently dropped.
+
+  A clause with a VARIABLE attribute widens to `[nil nil nil]`, one full
+  scan. That is honest and it is not a win over hydrating -- it is the same
+  work -- but it is the same answer, and the plan table in
+  `kotobase.server.datom-plan` already says so in the same words."
+  [{:keys [where rules]}]
+  (->> (concat (mapcat clause-triples where)
+               (mapcat (fn [rule] (mapcat clause-triples (rest rule))) rules))
+       (map (fn [clause]
+              (let [[s p o] clause]
+                (mapv #(when-not (symbol? %) %) [s p o]))))
+       distinct
+       vec))
+
+(defn- datalog-map-query?
+  "A `query_edn` that `arrangement.datalog` understands, as opposed to the
+  plain `[s p o]` triple-pattern vector `arrangement.query` takes."
+  [pat]
+  (and (map? pat) (or (contains? pat :find) (contains? pat :where))))
+
+(defn do-q
+  "`datomic.q` -- routes to ONE of two engines depending on `query_edn`'s
+  shape: a plain `[s p o]` vector (nil = wildcard) is a triple-pattern
+  query (`eng/q`, arrangement.query -- no joins, returns a set of `{:s :p
+  :o}` quads); a map with `:find`/`:where` keys is a full conjunctive
+  Datalog query (`eng/query`, arrangement.datalog -- multi-clause joins,
+  negation, aggregates, recursive rules; returns a set of `:find`-ordered
+  VECTORS, a different row shape from the triple-pattern branch -- the
+  caller already knows which it sent and therefore which shape comes
+  back). Previously this ALWAYS called `eng/q`, silently mistreating any
+  map-shaped query as a malformed/empty triple pattern instead of routing
+  it to the engine that actually understands it -- a real, if latent,
+  bug (see git history): `net-kotobase`'s `geo.search`/`web.search`
+  (domain_search.cljc's own \"candidate query\") send exactly this map
+  shape today. body: {:graph :query_edn :inputs_edn} -- `inputs_edn`
+  (optional) is an EDN vector matching `query_edn`'s own `:in` clause
+  order, for the Datalog form only (see `eng/query`'s docstring); ignored
+  for a triple-pattern query.
+
+  Both query shapes (and `inputs_edn`'s scalar values) pass through
+  `normalize-query-literals` first, so a query written the natural
+  Datomic way (keyword attributes, keyword/number value literals) matches
+  the stringified representation the write path actually stored -- see
+  the normalization section comment above for the live bug this fixes.
+
+  ## The Datalog form reads INDEXES, not a hydrated database
+
+  A map query runs over `pattern-source/source-for`, the same seam
+  `graph.sparql` and `graph.query` use: the patterns the query names are
+  read as index ranges and nothing else is. It used to hydrate the whole
+  chain into a db value first, which is O(database) per query however few
+  rows come back -- and this is the one method where that cost is not
+  merely a latency question, because RECURSIVE RULES run a fixpoint over
+  it. Reasoning (`subClassOf` closure, type propagation, any transitive
+  property) is what `:rules` is for, and it was the slowest thing here.
+
+  `with_edn` keeps the hydrate path: a speculative db-after is a db VALUE
+  produced by `eng/with`, and there is no index to read it out of. So is
+  the `[s p o]` vector form, which `arrangement.query` answers off a db.
+
+  **`visible?` moves with it, and that is a fix, not a side effect.** The
+  hydrate path handed the per-request ROW predicate (`{:e :a :v_edn}`,
+  `visible-of`'s own contract) to the engine, which applies its `visible?`
+  to `{:s :p :o}` QUADS -- so the predicate read `:a` off a map that has
+  no `:a` and decided every row on `nil`. Depending on which way a policy
+  is written that hid everything or hid nothing; `pattern_source`'s
+  docstring warns about this exact confusion in the other direction. Now
+  the row predicate is applied where rows exist -- inside `hot-datoms`,
+  before a quad is built -- and the engine is handed `(constantly true)`,
+  which is what `run-indexed-compiled-graph-query` already does and for
+  the same reason. `handler-test` pins both halves."
+  [store {:keys [graph query_edn inputs_edn with_edn] :as body}]
+  (let [chain ((:head-get store) graph)
+        pat (normalize-query-literals (edn/read-string query_edn))
+        inputs (when inputs_edn (mapv wire-literal (edn/read-string inputs_edn)))]
+    (if (and (datalog-map-query? pat) (nil? with_edn))
+      (let [{:keys [admitted? refusals]} (admission/admit pat)]
+        (if-not admitted?
+          (admission/refusal-response refusals)
+          (then* (pattern-source/source-for store chain (datalog-source-patterns pat)
+                                            (visible-of store))
+                 (fn [source]
+                   (if-let [over (admission/over-budget (or (pattern-source/datom-count source) 0))]
+                     (admission/refusal-response [over])
+                     ;; The hint that lets the engine hash-join instead of
+                     ;; issuing one keyed scan per binding. See
+                     ;; `pattern-source/clause-cardinality` for why counting is
+                     ;; free on this side of the seam and would not be on the
+                     ;; other.
+                     (let [planned (assoc pat :clause-cardinality
+                                          (pattern-source/clause-cardinality source pat))
+                           rows (if inputs
+                                  (datalog/q source planned (constantly true) inputs)
+                                  (datalog/q source planned (constantly true)))]
+                       {:ok true :graph graph :rows (vec rows)}))))))
+      ;; The hydrate path is gated too, and it has to be: a caller that could
+      ;; reach a whole-graph read by switching to the `[s p o]` vector form
+      ;; would make the gate above a suggestion. `admit-patterns` sees the same
+      ;; pattern the planner would.
+      (let [{:keys [admitted? refusals]}
+            (if (datalog-map-query? pat)
+              (admission/admit pat)
+              (admission/admit-patterns [(vec (take 3 (concat pat (repeat nil))))]))]
+        (if-not admitted?
+          (admission/refusal-response refusals)
+          (then* (db-for-body store chain body)
+                 (fn [db]
+                   (let [rows (materialized/query-db db pat (visible-of store) inputs)]
+                     {:ok true :graph graph :rows (vec rows)}))))))))
+
+(defn- compiled-patterns
+  "Every triple pattern the shared compiled-query executor can ask for,
+  including the edge attributes of variable-length paths and both stages of
+  a WITH pipeline. Prefetching their planned index ranges gives OPTIONAL/
+  UNION/path post-passes the same source as the base BGP without hydrating
+  unrelated predicates.
+
+  The storage planner speaks concrete `[s p o]` patterns with nil wildcards;
+  the compiled query speaks Datalog and represents wildcards as unbound
+  symbols. Convert only at this prefetch boundary -- the executor still gets
+  the original variables so it can join them.
+
+  A `:paths` / `:optional-paths` entry BFS-walks `attr` from nodes that are
+  not known until execution, so its prefetch is the whole `[nil attr nil]`
+  range: anything narrower would make reachability depend on what happened
+  to be prefetched."
+  [{:keys [where unions optionals paths optional-paths pipeline]}]
+  (if pipeline
+    (into (compiled-patterns (first pipeline))
+          (compiled-patterns (second pipeline)))
+    (-> (mapv (fn [pattern]
+                (mapv #(if (or (symbol? %) (= '_ %)) nil %) pattern))
+              (into (vec where) cat (concat (or unions []) (or optionals []))))
+        (into (map (fn [{:keys [attr]}] [nil attr nil]))
+              (concat paths (apply concat optional-paths))))))
+
+(defn- run-indexed-compiled-graph-query
+  "Execute the SPARQL/Cypher compiled shape over query-scoped index reads.
+
+  `pattern-source/source-for` applies the row-shaped visibility predicate
+  while reading snapshot + novelty and returns only the union of index ranges
+  named by the query. The Datalog engine then receives `(constantly true)`:
+  unauthorized rows never became quads, and applying the row predicate again
+  to `{:s :p :o}` would be both redundant and shape-incorrect.
+
+  `adjacency` (variable-length / undirected paths) runs over the same source:
+  `compiled-patterns` prefetched the whole `[nil attr nil]` range for every
+  path attribute, so the BFS sees every edge the hydrated executor saw."
+  [store graph parsed]
+  (let [chain ((:head-get store) graph)
+        patterns (compiled-patterns parsed)
+        {:keys [admitted? refusals]} (admission/admit-patterns patterns)]
+    (if-not admitted?
+      (admission/refusal-response refusals)
+      (then* (pattern-source/source-for store chain patterns (visible-of store))
+           (fn [source]
+             (let [engine-query (fn [q]
+                                  (datalog/q source
+                                             (assoc q :clause-cardinality
+                                                    (pattern-source/clause-cardinality source q))
+                                             (constantly true)))
+                   adjacency (fn [attr node both?]
+                               (concat
+                                (map first
+                                     (engine-query
+                                      {:find ['?object]
+                                       :where [[node attr '?object]]}))
+                                (when both?
+                                  (map first
+                                       (engine-query
+                                        {:find ['?subject]
+                                         :where [['?subject attr node]]})))))
+                   over (admission/over-budget (or (pattern-source/datom-count source) 0))]
+               (if over
+                 (admission/refusal-response [over])
+                 (let [{:keys [vars rows]} (qx/execute engine-query parsed adjacency)]
+                   {:ok true :graph graph :vars vars :rows rows}))))))))
+
+(defn do-sparql
+  "`graph.sparql` -- the SPARQL 1.1 Protocol implementation
+  (`kotoba-lang/org-w3-sparql-protocol` + `kotoba-lang/sparql`'s algebra)
+  over index reads rather than a hydrated db. body: {:graph :sparql}.
+
+  Was a 233-line hand-written subset compiling to map-form Datalog over
+  `hot-db`. Retired (superproject ADR-2608039970) once
+  `test/kotobase/server/sparql_snapshot_test.cljk` showed the two answering
+  identically across that subset's WHOLE grammar -- BGP, joins, OPTIONAL,
+  UNION, ORDER BY, LIMIT, aggregates with and without GROUP BY, and FILTER.
+  That suite is now a snapshot of those answers, so the behaviour the swap
+  preserved is still pinned with the old implementation gone."
+  [store body]
+  (spp/do-sparql store body (visible-of store)))
+
+(defn- cypher-create-entity [{:keys [id properties]}]
+  (reduce-kv (fn [entity attr value]
+               (assoc entity (keyword (str/replace-first attr #"^:" "")) value))
+             {:db/id id} properties))
+
+(defn do-cypher
+  "`graph.query` -- bounded Cypher subset over query-scoped index reads.
+  body: {:graph :cypher}. Reads compile MATCH/WHERE/WITH/RETURN to the shared
+  graph executor, whose named index ranges are prefetched through
+  `pattern-source`; it never hydrates unrelated graph predicates.
+  Authenticated standalone-node CREATE reuses `do-transact`, including graph
+  policy checks and conditional head CAS. Anything outside the subset returns
+  {:ok false :error \"UnsupportedCypher\"} with the supported grammar in
+  :message -- the same loudly-rejected-approximation doctrine as
+  `do-sparql`."
+  [store {:keys [graph cypher]} auth]
+  (let [parsed (try (cypher/parse cypher)
+                    (catch #?(:clj Exception :cljs :default) e
+                      (if (:cypher-subset (ex-data e))
+                        {::unsupported #?(:clj (.getMessage ^Exception e) :cljs (ex-message e))}
+                        (throw e))))]
+    (if-some [msg (::unsupported parsed)]
+      {:ok false :error "UnsupportedCypher" :message msg}
+      (if (= :create (:write parsed))
+        (let [auth-did (if (map? auth) (:did auth) auth)]
+          (if (str/blank? (str auth-did))
+            {:ok false :error "AccessDenied" :reason "Cypher writes require verified authorization"}
+            (let [entities (mapv cypher-create-entity (:nodes parsed))]
+              (then* (do-transact store {:graph graph :tx_edn (pr-str entities)} auth)
+                     (fn [result]
+                       (if-not (:ok result)
+                         result
+                         (let [by-var (into {} (map (juxt :variable :id) (:nodes parsed)))
+                               return-vars (:return parsed)]
+                           (cond-> (assoc result :language "cypher" :write "CREATE"
+                                                 :created (mapv :id (:nodes parsed)))
+                             (seq return-vars)
+                             (assoc :vars (mapv str return-vars)
+                                    :rows [(mapv by-var return-vars)])))))))))
+        (run-indexed-compiled-graph-query store graph parsed)))))
+
+(defn do-pull
+  "`datomic.pull` -- all attrs of one entity via hot-datoms (snapshot +
+  novelty merge), UNLESS the caller supplies `:pattern_edn` (a Datomic
+  pull-pattern EDN string -- see kotobase-peer's `pull` docstring for the
+  grammar: plain attrs, `'*` wildcard, `\"_attr\"` reverse nav, `{attr
+  [sub-pattern]}` nested pull, `{attr n}`/`{attr '...}` recursion), in
+  which case this now actually honors it (previously silently ignored --
+  kotobase-client sends the field, the handler dropped it on the floor;
+  see git history) by materializing a db (`hot-db`) and running
+  kotobase-peer's real pattern-aware `pull`.
+
+  The two response shapes are DIFFERENT and not interchangeable: the
+  no-pattern legacy path returns `:attrs {a [v_edn...]}` (per-attribute
+  wire-encoded value strings, hot-datoms rows regrouped -- unchanged, for
+  every existing caller that doesn't send `pattern_edn`); the pattern
+  path returns `:result_edn` (the WHOLE pull-pattern result tree, pr-str'd
+  once -- a pattern can nest/wildcard/reverse-nav arbitrarily, so there is
+  no single flat per-leaf v_edn encoding that composes across that the
+  way there is for a flat attr map). body: {:graph :entity :pattern_edn}."
+  [store {:keys [graph entity pattern_edn] :as body}]
+  (if pattern_edn
+    (let [chain ((:head-get store) graph)
+          pattern (edn/read-string pattern_edn)]
+      (then* (db-for-body store chain body)
+             (fn [db] {:ok true :graph graph :entity entity
+                       :result_edn (pr-str (materialized/pull db entity pattern
+                                                            (visible-of store)))})))
+    (let [chain ((:head-get store) graph)]
+      (then* (if (:with_edn body)
+               (then* (db-for-body store chain body)
+                      #(eng/datoms % {:index :eavt :components [entity]} (visible-of store)))
+               (eng/hot-datoms (:get-fn store) chain {:index :eavt :components [entity]}
+                               (visible-of store) (:blind-fn store) (:decrypt-fn store)))
+             (fn [rows]
+               {:ok true :graph graph :entity entity
+                :attrs (reduce (fn [m {:keys [a v_edn]}] (update m a (fnil conj []) v_edn)) {} rows)})))))
+
+(defn do-pull-many
+  "`datomic.pullMany` -- the same pull pattern applied to a LIST of
+  entities. body: {:graph :entities :pattern_edn} -- `:entities` a vector
+  of entity ids, `:pattern_edn` required (unlike `do-pull`, pullMany has
+  no flat-attrs legacy shape to fall back to)."
+  [store {:keys [graph entities pattern_edn] :as body}]
+  (let [chain ((:head-get store) graph)
+        pattern (edn/read-string pattern_edn)]
+    (then* (db-for-body store chain body)
+           (fn [db]
+             {:ok true :graph graph
+              :results_edn (mapv pr-str (materialized/pull-many db entities pattern
+                                                               (visible-of store)))}))))
+
+(defn do-index-pull
+  "`datomic.indexPull` -- Datomic's index-based pull, a comparatively
+  obscure/rarely-used corner of the real Datomic API. No distinct mapping
+  onto this substrate's primitives exists beyond what `datomic.pullMany`
+  already does (pull the same pattern over a caller-given list of
+  entities) -- implemented as a direct alias rather than inventing a
+  different, unproven contract for a method with no pinned wire shape and
+  no clear semantic gap `pullMany` doesn't already cover."
+  [store body]
+  (do-pull-many store body))
+
+(defn do-entity
+  "`datomic.entity` -- `pull`'s flat 2-arg form (`{p #{o...}}`) under
+  Datomic's own name. Unlike `do-pull`'s no-pattern path (hot-datoms
+  based, per-attribute `v_edn` wire strings), this needs a fully
+  materialized db (kotobase-peer's `entity` is the pull-flat-form
+  entry point a caller can then `entity-attr`-navigate further, though
+  that on-demand navigation itself isn't wired to a separate NSID here --
+  see `datomic.pull`'s `{attr [...]}` nested-pull pattern for the
+  equivalent eager form). Returns the WHOLE entity map pr-str'd
+  (`:entity_edn`), same reasoning as `do-pull`'s pattern path: raw
+  decoded values, not per-attribute wire strings. body: {:graph :entity}."
+  [store {:keys [graph entity] :as body}]
+  (let [chain ((:head-get store) graph)]
+    (then* (db-for-body store chain body)
+           (fn [db] {:ok true :graph graph :entity entity
+                     :entity_edn (pr-str (materialized/entity db entity (visible-of store)))}))))
+
+(defn do-entid
+  "`datomic.entid` -- resolve an id-or-ident to the actual entity id
+  (kotobase-peer's `entid`: a plain string id passes through unchanged;
+  a keyword id resolves via a `:db/ident` attribute lookup -- see its
+  docstring for why this substrate needs no numeric-id resolution the
+  way real Datomic's `entid` does). body: {:graph :ident_edn} --
+  `:ident_edn` is an EDN string (so the caller can send either a plain
+  string id or a keyword ident through the same field, unambiguously)."
+  [store {:keys [graph ident_edn] :as body}]
+  (let [chain ((:head-get store) graph)]
+    (then* (db-for-body store chain body)
+           (fn [db] {:ok true :graph graph
+                     :entity_id (materialized/entid db (edn/read-string ident_edn))}))))
+
+(defn do-ident
+  "`datomic.ident` -- the inverse of `entid`: the `:db/ident` keyword an
+  entity has asserted on itself, or nil. body: {:graph :entity}.
+  `:ident_edn` in the response is pr-str'd (nil pr-str's to the string
+  \"nil\", NOT omitted -- a caller distinguishes \"no ident\" from a
+  malformed response by the field always being present)."
+  [store {:keys [graph entity] :as body}]
+  (let [chain ((:head-get store) graph)]
+    (then* (db-for-body store chain body)
+           (fn [db] {:ok true :graph graph :entity entity
+                     :ident_edn (pr-str (materialized/ident db entity))}))))
+
+(defn do-as-of
+  "`datomic.asOf` -- a `datoms`-shaped read of the graph AS OF commit `t`
+  (Datomic's own term; kotobase-peer's chain calls the same value `seq`).
+  body: {:graph :t :index :components_edn :limit}, same read shape as
+  `do-datoms` beyond `:t`. A `t` beyond the chain's own tip clamps to the
+  tip (kotobase-peer's `as-of`'s own \"as-of the future just means now\"
+  behavior, matching Datomic); a nil/absent chain (fresh graph) resolves
+  to `{:datoms []}`, same as `do-datoms` on a fresh graph."
+  [store {:keys [graph t index components_edn limit]}]
+  (let [chain ((:head-get store) graph)
+        as-of-chain (eng/as-of (:get-fn store) chain t)]
+    (then* (eng/hot-datoms (:get-fn store) as-of-chain
+                           {:index (or (index-kw index) :eavt)
+                            :components (vec components_edn)
+                            :limit limit}
+                           (visible-of store) (:blind-fn store) (:decrypt-fn store))
+           (fn [rows] {:ok true :graph graph :t t :datoms (vec rows)}))))
+
+(defn do-since
+  "`datomic.since` -- quads from commits with `:seq` greater than `t`
+  (Datomic's `since`; a DIFF view, NOT merged with prior state -- see
+  `datomic.asOf`/plain `datomic.datoms` for the merged view). body:
+  {:graph :t}."
+  [store {:keys [graph t]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (eng/since (:get-fn store) chain t (:decrypt-fn store))
+           (fn [db] {:ok true :graph graph :t t
+                     :datoms (vec (eng/datoms db (visible-of store)))}))))
+
+(defn do-history
+  "`datomic.history` -- the full audit-log view: every quad EVER asserted
+  across the whole chain, including later-retracted facts, as
+  `{:e :a :v_edn :added}` rows distinguishing assert from retract
+  (Datomic's `(d/datoms (d/history db) ...)`, here via kotobase-peer's
+  `history-datoms`). body: {:graph :entity} -- `:entity` (optional)
+  narrows to one entity's history (the single most common ask, \"what
+  happened to THIS entity\"); omitting it is O(all history) -- see
+  kotobase-peer's own `history-datoms` docstring, which also documents an
+  honest limitation around `snapshot!`-seeded (migration-imported)
+  content with no individual assert event."
+  [store {:keys [graph entity]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (eng/history-datoms (:get-fn store) chain entity (visible-of store) (:decrypt-fn store))
+           (fn [rows] {:ok true :graph graph :datoms (vec rows)}))))
+
+(defn do-basis-t
+  "`datomic.basisT` -- the current basis (chain tip `:seq`), a monotonic
+  value comparable across reads of the same graph (Datomic's own basisT
+  contract: a value you can compare, not a wall-clock time -- matches
+  kotobase-peer's own design note on why commits are keyed by `:seq`, not
+  a timestamp). body: {:graph}. A fresh, never-written graph reports
+  `:t nil` (no basis yet), not an error -- same posture `do-datoms`
+  already takes for `{:datoms []}` on a nil chain. Pure/sync -- `chain`
+  touches no crypto, so this needs no `then*` wrapping on either
+  platform."
+  [store {:keys [graph]}]
+  (let [get-fn (:get-fn store)
+        chain ((:head-get store) graph)
+        entries (when chain (eng/chain get-fn chain))]
+    {:ok true :graph graph :t (:seq (last entries))}))
+
+(defn do-db-stats
+  "`datomic.dbStats` -- cheap graph-shape metadata without a full read:
+  current basis (`:t`, same value `do-basis-t` reports), whether anything
+  has been folded yet (`:has_snapshot`), and how many not-yet-folded tx
+  blocks sit on top (`:novelty_size`, the same `fold`-worthiness signal
+  `do-transact`'s own response already surfaces per-write). body:
+  {:graph}. Pure/sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph]}]
+  (let [get-fn (:get-fn store)
+        chain ((:head-get store) graph)
+        entries (when chain (eng/chain get-fn chain))]
+    {:ok true :graph graph
+     :t (:seq (last entries))
+     :has_snapshot (boolean (and chain (eng/latest-snapshot-cid get-fn chain)))
+     :novelty_size (if chain (eng/novelty-size get-fn chain) 0)}))
+
+(defn do-seek-datoms
+  "`datomic.seekDatoms` -- Datomic's index-scan-from-a-position read.
+  HONEST APPROXIMATION: this substrate's `datoms`/`hot-datoms` already do
+  an index scan filtered by a `:components` PREFIX match (not a true
+  ordered \"seek to >= these components and continue\" the way Datomic's
+  own seekDatoms works) -- for the common case (seek to an exact entity/
+  attribute prefix and read forward) this is equivalent; it is NOT
+  equivalent for a genuine \">= partial value\" ordered seek. A real
+  ordered seek would need a new kotobase-peer primitive, not implemented
+  here -- this is a thin alias of `do-datoms`, not a distinct
+  implementation. body: identical to `do-datoms`."
+  [store body]
+  (do-datoms store body))
+
+(defn do-index-range
+  "`datomic.indexRange` -- every datom for one attribute whose value
+  falls in `[start, end]` (inclusive; either bound optional), Datomic's
+  AVET range scan. HONEST APPROXIMATION, two layers of it:
+
+  1. Implemented as a full AVET scan for the attribute (`hot-datoms` with
+     `:avet` + `:components [attr]`) followed by an in-process value-range
+     filter -- correct, but O(all values for that attribute), not a true
+     ordered range-seek (no ordered-range primitive exists in
+     kotobase-peer for this yet).
+  2. MORE IMPORTANTLY: this substrate stringifies every non-Link value at
+     write time (kotobase-server's own `tx-edn->quads`, `(str v)`, before
+     the quad ever reaches kotobase-peer) -- a transacted `:score 10`
+     round-trips as the STRING `\"10\"`, never the number `10`. So
+     `start_edn`/`end_edn`, compared against each row's own
+     `edn/read-string`'d `v_edn` via `compare`, effectively do
+     LEXICOGRAPHIC string comparison for anything that started life as a
+     number (`\"9\" > \"10\"` lexicographically -- NOT the numeric range a
+     caller sending numeric-looking bounds would expect). Passing
+     type-mismatched bounds (e.g. a bare number against the stored
+     string) throws outright (surfaced as `InternalError` by `handle`,
+     not a silent empty/wrong result) -- callers MUST pass `start_edn`/
+     `end_edn` shaped like what's actually stored (a pr-str'd STRING,
+     e.g. `\"\\\"15\\\"\"`, not a bare `\"15\"`) to avoid the throw, and
+     must additionally account for lexicographic-not-numeric ordering
+     themselves (e.g. zero-padding) if the range needs to be numerically
+     correct. body: {:graph :attr :start_edn :end_edn :limit}."
+  [store {:keys [graph attr start_edn end_edn limit]}]
+  (let [chain ((:head-get store) graph)
+        start (some-> start_edn edn/read-string)
+        end (some-> end_edn edn/read-string)]
+    (then* (eng/hot-datoms (:get-fn store) chain {:index :avet :components [attr]}
+                           (visible-of store) (:blind-fn store) (:decrypt-fn store))
+           (fn [rows]
+             (let [in-range? (fn [{:keys [v_edn]}]
+                                (let [v (edn/read-string v_edn)]
+                                  (and (or (nil? start) (>= (compare v start) 0))
+                                       (or (nil? end) (<= (compare v end) 0)))))
+                   filtered (filter in-range? rows)
+                   filtered (cond->> filtered limit (take limit))]
+               {:ok true :graph graph :attr attr :datoms (vec filtered)})))))
+
+(defn do-tx
+  "`datomic.tx` -- one commit's metadata (Datomic's own tx entity is
+  mostly opaque anyway beyond `:db/txInstant`, which this substrate
+  doesn't track by design -- see kotobase-peer's \"time-travel: as-of\"
+  section comment on why: no wall-clock field on the commit envelope, so
+  a chain stays stable across a future timestamp addition). body:
+  {:graph :t}. Does NOT include per-tx datom content -- kotobase-peer has
+  no public primitive to isolate one commit's own novelty out of the
+  whole-chain replay `history-datoms` does; use `datomic.since` with
+  `t-1` for that instead (a diff view across everything after a point,
+  equivalent to \"what that one commit added\" for an exact single `t`).
+  Pure/sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph t]}]
+  (let [chain-cid ((:head-get store) graph)
+        entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
+        entry (some #(when (= t (:seq %)) %) entries)]
+    {:ok true :graph graph :t t :found (some? entry) :tx_cid (some-> entry :cid str)}))
+
+(defn- assert-integer-bound!
+  "Throws if `v` is present but not an integer. `>=`/`<`/`<=`/`>` compile
+  to native JS relational operators in cljs (unlike JVM Clojure's numeric
+  comparators, which throw a ClassCastException on a non-Number), and
+  JS's loose coercion makes e.g. `(>= 5 \"abc\")` silently `false` --
+  never a throw. Without this guard, a malformed :start/:end/:t here
+  would silently read as \"nothing in range\" / \"not caught up\" instead
+  of a clean rejection -- the same failure shape as the already-fixed
+  do-q wire-literal bug, just on a different endpoint. `handle`'s
+  existing try/catch turns this throw into a normal `{:ok false :error
+  \"InternalError\"}` response, same as do-index-range's own `edn/read-
+  string` throwing on a malformed start_edn/end_edn."
+  [k v]
+  (when (and (some? v) (not (integer? v)))
+    (throw (ex-info (str (name k) " must be an integer, got " (pr-str v)) {k v}))))
+
+(defn do-tx-range
+  "`datomic.txRange` -- commit metadata for every `:seq` in `[start,
+  end)` (Datomic's own txRange semantics: start inclusive, end exclusive;
+  either bound omitted means unbounded on that side). body: {:graph
+  :start :end :limit}. Same per-tx-datom-content limitation as
+  `datomic.tx` above. Pure/sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph start end limit]}]
+  (assert-integer-bound! :start start)
+  (assert-integer-bound! :end end)
+  (let [chain-cid ((:head-get store) graph)
+        entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
+        in-range? (fn [{:keys [seq]}]
+                    (and (or (nil? start) (>= seq start))
+                         (or (nil? end) (< seq end))))
+        filtered (filter in-range? entries)
+        filtered (cond->> filtered limit (take limit))]
+    {:ok true :graph graph
+     :txs (mapv (fn [{:keys [seq cid]}] {:t seq :tx_cid (str cid)}) filtered)}))
+
+(defn do-log
+  "`datomic.log` -- the full transaction log (or a `[start, end)` slice
+  if given) -- same shape as `datomic.txRange`, since Datomic's own
+  `log`/`txRange` overlap in practice (a bounded log IS a tx-range); not
+  a distinct implementation here either."
+  [store body]
+  (do-tx-range store body))
+
+(defn do-sync
+  "`datomic.sync` -- HONEST simplification: this substrate has no
+  distributed replication lag to wait out (the chain-cid IS the current
+  state the instant a write succeeds; there is no separate \"catching
+  up\" process an HTTP request/response cycle could meaningfully block
+  on). Reports whether the graph's current basis has already reached the
+  requested `:t`, IMMEDIATELY, rather than either (a) blocking (not
+  possible in a single request/response cycle) or (b) silently pretending
+  to have waited. A caller that actually needs \"block until this write
+  is visible\" should retry `datomic.sync` (or just re-read) rather than
+  treat this as a real async wait primitive. body: {:graph :t}. Pure/
+  sync, same reasoning as `do-basis-t`."
+  [store {:keys [graph t]}]
+  (assert-integer-bound! :t t)
+  (let [chain-cid ((:head-get store) graph)
+        entries (when chain-cid (eng/chain (:get-fn store) chain-cid))
+        current-t (:seq (last entries))]
+    {:ok true :graph graph :t t :current_t current-t
+     :caught_up (boolean (and current-t (>= current-t t)))}))
+
+(defn do-fold
+  "`datomic.fold` -- compacts a graph's accumulated novelty into a fresh
+  indexed snapshot (ADR-2607032430 D1 `fold!`). Not part of the datomic
+  surface proper -- a maintenance operation a cron/ops caller invokes to
+  keep `hot-datoms`/`do-q` reads fast as novelty grows. `:commit` is absent
+  (no head write attempted) when there's nothing to fold, so a redundant/
+  no-op call is cheap and doesn't perturb the head. Safe to call anytime,
+  including concurrently with a transact or with another fold of the same
+  graph -- `fold!` is deterministic/content-addressed, so races converge
+  rather than corrupt (the CAS layer in the caller's shell resolves any
+  actual head contention).
+
+  `max_novelty` (optional, body field; the wire name kotobase-client's
+  `fold` has always sent for its `:max-novelty` opt) bounds one call to the
+  OLDEST that-many not-yet-folded tx blocks instead of folding everything.
+  This handler previously destructured only `:graph`, so the field was
+  accepted on the wire and then SILENTLY DROPPED -- every fold was an
+  unbounded one, which is precisely the runaway `kotobase-peer`'s own
+  `fold!` docstring warns about: novelty can only shrink through a
+  successful fold, so once the backlog is large enough that one unbounded
+  fold exceeds the Worker's CPU budget, the fold that would shrink it can
+  never finish and the graph stays stuck forever. A bounded call makes
+  guaranteed forward progress (novelty strictly shrinks by up to
+  `max_novelty`), so an ops/cron driver can drain any backlog in slices.
+  Non-numeric / non-positive values are ignored (treated as unbounded),
+  never trusted straight from the wire into the engine.
+
+  `:async-get-fn` is forwarded for the same reason `do-datoms` forwards it
+  (see there). The hydrate cache slots take `:rows-cache-*`, NOT
+  `:db-cache-*`: `fold!` keys its hydrate cache by SNAPSHOT cid, the store's
+  `:db-cache-*` seam is keyed by CHAIN cid, and feeding one into the other
+  would collide two different key spaces. `:rows-cache-*` is the
+  snapshot-cid-keyed pair -- the same key space -- so it is the one that
+  fits.
+
+  This read nil/nil until 2026-09-10. The reasoning above was right about
+  `:db-cache-*` and simply never considered that the store carries a second,
+  snapshot-keyed pair. What that cost: `hydrate-db-cached` exists for exactly
+  the retried-fold case and says so, that `cache-put!` fires as soon as the
+  rows are computed, BEFORE novelty is applied -- specifically so a fold
+  attempt that hydrates successfully but then exceeds its CPU budget LATER
+  still leaves the cache populated for the next attempt. With nil slots
+  every attempt re-paid the whole decrypt-and-scan.
+
+  Measured on the graph that made this visible (root ADR-2609100100,
+  net-kotobase `yoro-social-v2`): 820 unfolded novelty entries over a
+  snapshot of ~1721 rows, a fold reaching 1725 decrypts before being killed
+  at the 30s ceiling -- i.e. the hydrate COMPLETED and the kill came after
+  it, which is precisely the case the memo was written for. Bounding did not
+  help, because the bound does not cover the hydrate: max_novelty 32, 128
+  and 400 all died at 37.0s, 33.7s and 36.0s.
+
+  Response adds `:novelty_remaining` so a driver can loop until it hits 0
+  without a separate dbStats round-trip.
+
+  `views_edn` (optional, body field; kotobase-client's `fold` `:views` opt,
+  `pr-str`'d — see client.cljs) declares/updates materialized views: a map
+  of `{view-name {\"attrs\" [attr ...]}}`, or `{view-name nil}` to remove
+  one. This handler previously destructured only `:graph`/`:max_novelty`,
+  so a caller's view declaration was silently dropped even when the fold
+  itself succeeded — `do-view`/`datomic.view` had nothing to read from
+  because `eng/fold!` was always called with `views=nil`. Threaded through
+  now via `eng/fold!`'s own `views` param (`materialize-views!` merges it
+  with whatever views the PREVIOUS fold already stored, so a fold call
+  that omits `views_edn` entirely leaves existing view declarations
+  untouched — it does not need to re-declare them every time)."
+  [store {:keys [graph max_novelty views_edn]}]
+  (let [get-fn (:get-fn store)
+        chain ((:head-get store) graph)
+        novelty-n (if chain (eng/novelty-size get-fn chain) 0)
+        max-novelty (when (and (number? max_novelty) (pos? max_novelty))
+                      (int max_novelty))
+        views (when (string? views_edn) (edn/read-string views_edn))]
+    (if (and (zero? novelty-n) (nil? views))
+      {:ok true :graph graph :folded false}
+      (then* (eng/fold! (:put! store) get-fn chain ipld/link? max-novelty
+                        (:blind-fn store) (:encrypt-fn store) (:decrypt-fn store)
+                        (:rows-cache-get store) (:rows-cache-put! store)
+                        (:async-get-fn store) views)
+             (fn [new-chain]
+               ((:head-put! store) graph new-chain)
+               (let [folded-n (if max-novelty (min max-novelty novelty-n) novelty-n)]
+                 {:ok true :graph graph :folded true :commit new-chain
+                  :previous_commit chain :novelty_folded folded-n
+                  :novelty_remaining (- novelty-n folded-n)}))))))
+
+(defn do-view
+  "`datomic.view` -- rows of a fold-materialized view (ADR-2607166600),
+  always fresh: the fold-time view rows with unfolded novelty merged on
+  top (retractions cancel stored rows; novelty assertions matching the
+  view's declared attrs are appended). body: {:graph :view}.
+
+  `{:ok false :error \"ViewNotFound\"}` when the view isn't declared (a
+  prior `datomic.fold` with `:views {view-name spec}` declares it) or the
+  graph has no head yet -- unlike `do-datoms`, an absent view is a real
+  error rather than an empty read: a typo'd view name silently returning
+  empty rows would be far harder to notice than an explicit rejection."
+  [store {:keys [graph view]}]
+  (let [chain ((:head-get store) graph)]
+    (then* (when chain
+             (eng/view-rows (:get-fn store) chain view
+                            (visible-of store) (:decrypt-fn store)
+                            (:blind-fn store) (:async-get-fn store)))
+           (fn [result]
+             (if result
+               (merge {:ok true :graph graph} result)
+               {:ok false :error "ViewNotFound"})))))
+
+;; ── blob surface ─────────────────────────────────────────────────────────────
+;; git-annex / DataLad の content-addressed 大容量バイナリ永続化面（ADR-2607175000）。
+;; datom 面（JSON body、`handle`）とは分離し、**raw bytes** を扱う。store の
+;; put!/get-fn/head をそのまま公開する薄いラッパ:
+;;   blob-put/remove  は書き込みなので auth-did（CACAO 検証済み）を要求。
+;;   blob-get/head    は読みで auth 不要。
+;; block は content-addressed で **immutable**（delete が store 契約に無い）ため、
+;; REMOVE は tombstone head で表現する（put! で再投入すると tombstone は解除）。
+;; key は git-annex key（SHA256E-s<size>--<hash>）で、そのまま block cid に使う。
+
+(defn- blob-tomb [key] (str "blob-tomb:" key))
+
+(defn- blob-present?
+  "key が present か（block があり、かつ tombstone が無い）。"
+  [store key]
+  (and (some? ((:get-fn store) key))
+       (nil? ((:head-get store) (blob-tomb key)))))
+
+(defn do-blob-put
+  "raw bytes を key（=cid）で保存。tombstone があれば解除（再投入）。auth 必須。"
+  [store key bytes _auth-did]
+  ((:put! store) key bytes)
+  ((:head-put! store) (blob-tomb key) nil)
+  {:ok true :key key})
+
+(defn do-blob-get
+  "key の bytes を返す（present でなければ NotFound）。"
+  [store key]
+  (if (blob-present? store key)
+    {:ok true :key key :data ((:get-fn store) key)}
+    {:ok false :error "NotFound" :key key}))
+
+(defn do-blob-head
+  "key の present 判定（bytes を転送しない CHECKPRESENT 用）。"
+  [store key]
+  {:ok true :key key :present (blob-present? store key)})
+
+(defn do-blob-remove
+  "key を tombstone で不在化（immutable block は残すが present? は false に）。auth 必須。"
+  [store key _auth-did]
+  ((:head-put! store) (blob-tomb key) "removed")
+  {:ok true :key key})
+
+(defn- blob-resource [key] (str "kotoba://blob/" key))
+
+(defn- blob-authorized?
+  [store auth action key]
+  (if (not (contains? #{:private :sealed} (:security-mode store)))
+    ;; Explicit local/legacy compatibility only; network private/sealed never
+    ;; reaches this branch.
+    (if (contains? #{:put :remove} action) (some? auth) true)
+    (let [caps (set (or (:effective-caps auth) (:resources auth)))]
+      (and (map? auth)
+           (contains? caps (str "kotoba://can/blob:" (name action)))
+           (contains? caps (blob-resource key))))))
+
+(defn- bytes-count [bytes]
+  #?(:clj (alength ^bytes bytes) :cljs (.-length bytes)))
+
+(defn- bytes-hex [bytes]
+  (apply str (map (fn [n]
+                    #?(:clj (format "%02x" (bit-and (int n) 0xff))
+                       :cljs (.padStart (.toString (bit-and n 0xff) 16) 2 "0")))
+                  (mf/sha256 bytes))))
+
+(defn- valid-annex-content?
+  [key bytes]
+  (when-let [[_ size digest]
+             (re-matches #"SHA256E-s([0-9]+)--([0-9a-fA-F]{64})(?:\..*)?" key)]
+    (and (= (bytes-count bytes) #?(:clj (Long/parseLong size)
+                                   :cljs (js/parseInt size 10)))
+         (= (str/lower digest) (bytes-hex bytes)))))
+
+(defn handle-blob
+  "blob 面の dispatch。`op` は put|get|head|remove、`bytes` は put 時のみ。
+   auth-did は CACAO 検証済み issuer（put/remove は nil だと Unauthorized）。"
+  [store op key bytes auth-did]
+  (letfn [(denied [action]
+            (when-not (blob-authorized? store auth-did action key)
+              {:ok false :error (if (contains? #{:private :sealed} (:security-mode store))
+                                  "AccessDenied" "Unauthorized")
+               :key key}))]
+    (case op
+      "put"    (or (denied :put)
+                   (when (and (contains? #{:private :sealed} (:security-mode store))
+                              (not (valid-annex-content? key bytes)))
+                     {:ok false :error "ContentDigestMismatch" :key key})
+                   (do-blob-put store key bytes auth-did))
+      "get"    (or (denied :read) (do-blob-get store key))
+      "head"   (or (denied :read) (do-blob-head store key))
+      "remove" (or (denied :remove) (do-blob-remove store key auth-did))
+      {:ok false :error "MethodNotImplemented" :op op})))
+
+;; ── dispatch ─────────────────────────────────────────────────────────────────
+
+(defn handle
+  "Dispatch a parsed XRPC call. `method` is the NSID suffix after
+  `ai.gftd.apps.kotobase.datomic.`; `body` is the keywordized JSON body;
+  `auth` is the CACAO-verified issuer DID (string, legacy) or an
+  {:did :resources} map (ADR-2607174500 — resources carry the viewer's
+  capability strings for read redaction). Returns a plain response map;
+  never throws for a known method (errors become `{:ok false :error …}`)
+  EXCEPT a storage-layer block-miss (`kotobase.server.trampoline`'s
+  `:block-miss` marker), which re-throws so the caller's trampoline sees it
+  and retries -- swallowing it here would surface as a spurious
+  InternalError instead."
+  [store method body auth]
+  (letfn [(err [e]
+            ;; Classify off the whole cause chain, not just `(ex-data e)`:
+            ;; nbb/SCI wraps a throw that crosses an async continuation, and
+            ;; reading one link deep turned a policy denial into a generic
+            ;; InternalError and made a retryable block-miss unretryable.
+            (let [chain (tramp/ex-data-chain e)
+                  data  (or (first (filter #(or (:block-miss %)
+                                                (= :kotobase.policy/write-denied (:type %)))
+                                           chain))
+                            (first chain))]
+              (cond
+                (:block-miss data) (throw e)
+                (= :kotobase.policy/write-denied (:type data))
+                {:ok false :error "AccessDenied"
+                 :reason (some-> data :decision :denials first :reason name)}
+                :else {:ok false :error "InternalError"
+                       :message #?(:clj (.getMessage ^Exception e)
+                                   :cljs (or (ex-message e) (.-message e)))})))
+          (dispatch [store]
+            (case method
+                "datoms"      (do-datoms store body)
+                "transact"    (do-transact store body auth)
+                "with"        (do-with store body)
+                "q"           (do-q store body)
+                "sparql"      (do-sparql store body)
+                "cypher"      (do-cypher store body auth)
+                "pull"        (do-pull store body)
+                "pullMany"    (do-pull-many store body)
+                "indexPull"   (do-index-pull store body)
+                "fold"        (do-fold store body)
+                "view"        (do-view store body)
+                "entity"      (do-entity store body)
+                "entid"       (do-entid store body)
+                "ident"       (do-ident store body)
+                "asOf"        (do-as-of store body)
+                "since"       (do-since store body)
+                "history"     (do-history store body)
+                "basisT"      (do-basis-t store body)
+                "dbStats"     (do-db-stats store body)
+                "seekDatoms"  (do-seek-datoms store body)
+                "indexRange"  (do-index-range store body)
+                "tx"          (do-tx store body)
+                "txRange"     (do-tx-range store body)
+                "log"         (do-log store body)
+                "sync"        (do-sync store body)
+                "kg.ingest"       (do-kg-ingest store body auth)
+                "kg.ingest_batch" (do-kg-ingest-batch store body auth)
+                {:ok false :error "MethodNotImplemented" :method method}))]
+    (try
+      ;; ADR-2607174500 Phase 3b: resolve (graph policy × viewer caps) into
+      ;; the per-request visible? BEFORE dispatch for redaction-relevant
+      ;; reads; each read op consumes it via (visible-of store). Writes and
+      ;; metadata-only ops (tx/txRange/log/dbStats/basisT/sync/entid/ident —
+      ;; commit metadata and id mappings, no datom content) skip the extra
+      ;; narrow read entirely.
+      (let [viewer (when (map? auth) auth)
+            row-methods #{"datoms" "q" "with" "sparql" "cypher" "pull" "pullMany" "indexPull"
+                          "entity" "asOf" "since" "history"
+                          "seekDatoms" "indexRange" "view"}
+            metadata-methods #{"entid" "ident" "basisT" "dbStats" "tx"
+                               "txRange" "log" "sync"}
+            policy-methods (into row-methods metadata-methods)
+            resp (if (and (contains? policy-methods method) (:graph body))
+                   (then* ((request-visible? store viewer) (:graph body))
+                          (fn [visible?]
+                            (let [evidence (policy/visibility-evidence visible?)
+                                  result (if (or (contains? row-methods method)
+                                                 (visible? {:e "kotobase.metadata/request"
+                                                            :a ":kotobase.metadata/read"}))
+                                           (dispatch (assoc store :visible? visible?))
+                                           {:ok false :error "AccessDenied"})]
+                              (then* result #(merge % evidence)))))
+                   (dispatch store))]
+        #?(:clj resp
+           :cljs (.catch (js/Promise.resolve resp) err)))
+      (catch #?(:clj Exception :cljs :default) e
+        ;; a do-* fn that throws SYNCHRONOUSLY lands here; Promise-wrap on
+        ;; cljs so every caller's .then keeps working (same reasoning as
+        ;; kotobase-cljc-worker's handle).
+        #?(:clj (err e)
+           :cljs (js/Promise.resolve (err e)))))))
