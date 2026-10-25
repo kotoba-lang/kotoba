@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<!--
+  N-Franka parallel-reach demo — visualises iter 90's full Franka
+  DLS-IK WGSL kernel running 64 Frankas reaching 64 different targets
+  in a single GPU dispatch per timestep.
+
+  Standalone HTML, zero build step. Opens in any modern browser; falls
+  back to sequential JS when navigator.gpu is unavailable.
+
+  All WGSL + JS reference code inlined (iter 90 frankaReachKernel).
+
+  ADR-2605261800 §D6 nv-compat namespace localization.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>N-Franka batch reach — WebGPU parallel IK (iter 90/91)</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0a0e14; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { display: flex; flex-direction: column; align-items: center; padding: 24px; gap: 16px; }
+    h1 { margin: 0; font-size: 18px; font-weight: 600; color: #7ee787; }
+    .stats { display: grid; grid-template-columns: repeat(4, auto); gap: 6px 24px; font-size: 12px; font-family: ui-monospace, "Cascadia Code", monospace; color: #8b949e; }
+    .stats span.label { color: #6e7681; margin-right: 6px; }
+    .stats span.val { color: #e6edf3; }
+    .gpu { color: #7ee787 !important; }
+    .cpu { color: #f0883e !important; }
+    canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; }
+    .controls { font-size: 12px; color: #8b949e; }
+    kbd { background: #21262d; border: 1px solid #30363d; border-bottom-width: 2px; border-radius: 4px; padding: 2px 6px; font-family: ui-monospace, monospace; color: #e6edf3; }
+    .footer { font-size: 11px; color: #6e7681; max-width: 700px; text-align: center; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>N = 64 Frankas · parallel DLS-IK · single WGSL dispatch / frame</h1>
+  <div class="stats">
+    <span><span class="label">Mode:</span><span id="mode" class="val">…</span></span>
+    <span><span class="label">Envs:</span><span id="envs" class="val">64</span></span>
+    <span><span class="label">Converged:</span><span id="conv" class="val">0</span></span>
+    <span><span class="label">Step:</span><span id="step" class="val">0</span></span>
+    <span><span class="label">Steps/s:</span><span id="rate" class="val">…</span></span>
+    <span><span class="label">Best err:</span><span id="berr" class="val">…</span></span>
+    <span><span class="label">Mean err:</span><span id="merr" class="val">…</span></span>
+    <span><span class="label">Worst err:</span><span id="werr" class="val">…</span></span>
+  </div>
+  <canvas id="cv" width="760" height="520"></canvas>
+  <div class="controls">
+    <kbd>R</kbd> reset (new random targets) · <kbd>Space</kbd> pause · <kbd>C</kbd> force JS fallback
+  </div>
+  <div class="footer">
+    Each frame: <code>wgpuLaunch({ kernel: frankaReachKernel, dim: 64 })</code> →
+    64 Frankas advance 1 DLS-IK step in parallel on GPU. Foreground arm (orange)
+    shows env 0 in detail; ghost arms (faint green) overlay all 64 envs from
+    side view. Orange crosses are 64 distinct targets. Convergence: env counts
+    as "converged" when ‖target − ee‖ &lt; 5 mm.
+  </div>
+
+<script type="module">
+  // ── iter 90 frankaReachKernel inlined (JS + WGSL) ──
+  const HALF_PI = Math.PI / 2;
+  const XYZ = [
+    [0,      0,     0.333],
+    [0,      0,     0],
+    [0,     -0.316, 0],
+    [0.0825, 0,     0],
+    [-0.0825,0.384, 0],
+    [0,      0,     0],
+    [0.088,  0,     0],
+  ];
+  const RPY_R = [0, -HALF_PI, HALF_PI, HALF_PI, -HALF_PI, HALF_PI, HALF_PI];
+
+  function rotRpyX(r) {
+    const cr = Math.cos(r), sr = Math.sin(r);
+    return [[1,0,0],[0,cr,-sr],[0,sr,cr]];
+  }
+  function rotZ(angle) {
+    const c = Math.cos(angle), s = Math.sin(angle);
+    return [[c,-s,0],[s,c,0],[0,0,1]];
+  }
+  function mat3Mul(a, b) {
+    const out = [[0,0,0],[0,0,0],[0,0,0]];
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+      let s=0; for (let k=0;k<3;k++) s+=a[i][k]*b[k][j];
+      out[i][j]=s;
+    }
+    return out;
+  }
+  function matVec3(m, v) {
+    return [m[0][0]*v[0]+m[0][1]*v[1]+m[0][2]*v[2],
+            m[1][0]*v[0]+m[1][1]*v[1]+m[1][2]*v[2],
+            m[2][0]*v[0]+m[2][1]*v[1]+m[2][2]*v[2]];
+  }
+
+  function fkJ(q) {
+    const poses_R = []; const poses_p = [];
+    let Rw = [[1,0,0],[0,1,0],[0,0,1]];
+    let pw = [0,0,0];
+    for (let i=0;i<7;i++) {
+      const Ro = rotRpyX(RPY_R[i]);
+      const Rq = rotZ(q[i]);
+      const RinP = mat3Mul(Ro, Rq);
+      const rotated = matVec3(Rw, XYZ[i]);
+      pw = [pw[0]+rotated[0], pw[1]+rotated[1], pw[2]+rotated[2]];
+      Rw = mat3Mul(Rw, RinP);
+      poses_R.push([[Rw[0][0],Rw[0][1],Rw[0][2]],[Rw[1][0],Rw[1][1],Rw[1][2]],[Rw[2][0],Rw[2][1],Rw[2][2]]]);
+      poses_p.push([pw[0],pw[1],pw[2]]);
+    }
+    const ee = poses_p[6];
+    const J = [[0,0,0,0,0,0,0],[0,0,0,0,0,0,0],[0,0,0,0,0,0,0]];
+    for (let i=0;i<7;i++) {
+      const a = [poses_R[i][0][2], poses_R[i][1][2], poses_R[i][2][2]];
+      const dp = [ee[0]-poses_p[i][0], ee[1]-poses_p[i][1], ee[2]-poses_p[i][2]];
+      J[0][i] = a[1]*dp[2]-a[2]*dp[1];
+      J[1][i] = a[2]*dp[0]-a[0]*dp[2];
+      J[2][i] = a[0]*dp[1]-a[1]*dp[0];
+    }
+    return { poses_p, ee, J };
+  }
+
+  function reachStepJS(q, target, lambda, alpha) {
+    const { ee, J } = fkJ(q);
+    const err = [target[0]-ee[0], target[1]-ee[1], target[2]-ee[2]];
+    const lam2 = lambda*lambda;
+    let A00=lam2, A01=0, A02=0, A11=lam2, A12=0, A22=lam2;
+    for (let i=0;i<7;i++) {
+      A00+=J[0][i]*J[0][i]; A01+=J[0][i]*J[1][i]; A02+=J[0][i]*J[2][i];
+      A11+=J[1][i]*J[1][i]; A12+=J[1][i]*J[2][i]; A22+=J[2][i]*J[2][i];
+    }
+    const det = A00*(A11*A22-A12*A12) - A01*(A01*A22-A12*A02) + A02*(A01*A12-A11*A02);
+    if (Math.abs(det) < 1e-18) return [...q];
+    const invDet = 1/det;
+    const inv00 = (A11*A22-A12*A12)*invDet, inv01 = (A02*A12-A01*A22)*invDet, inv02 = (A01*A12-A02*A11)*invDet;
+    const inv11 = (A00*A22-A02*A02)*invDet, inv12 = (A02*A01-A00*A12)*invDet;
+    const inv22 = (A00*A11-A01*A01)*invDet;
+    const y = [
+      inv00*err[0]+inv01*err[1]+inv02*err[2],
+      inv01*err[0]+inv11*err[1]+inv12*err[2],
+      inv02*err[0]+inv12*err[1]+inv22*err[2],
+    ];
+    const qNew = new Array(7);
+    for (let i=0;i<7;i++) {
+      qNew[i] = q[i] + alpha * (J[0][i]*y[0]+J[1][i]*y[1]+J[2][i]*y[2]);
+    }
+    return qNew;
+  }
+
+  const FRANKA_REACH_WGSL = `
+@group(0) @binding(0) var<storage, read_write> q_inout:   array<f32>;
+@group(0) @binding(1) var<storage, read_write> target_in: array<f32>;
+@group(0) @binding(2) var<uniform>             lambda_u:  vec4<f32>;
+@group(0) @binding(3) var<uniform>             alpha_u:   vec4<f32>;
+
+fn rot_rpy_x(r: f32) -> mat3x3<f32> {
+  let cr = cos(r); let sr = sin(r);
+  return mat3x3<f32>(
+    vec3<f32>(1.0, 0.0, 0.0),
+    vec3<f32>(0.0, cr, sr),
+    vec3<f32>(0.0, -sr, cr),
+  );
+}
+
+fn rot_z(angle: f32) -> mat3x3<f32> {
+  let c = cos(angle); let s = sin(angle);
+  return mat3x3<f32>(
+    vec3<f32>(c, s, 0.0),
+    vec3<f32>(-s, c, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0),
+  );
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let env = gid.x;
+  let n_envs = arrayLength(&q_inout) / 7u;
+  if (env >= n_envs) { return; }
+
+  let base_q = env * 7u;
+  let base_t = env * 3u;
+  var q = array<f32, 7>(
+    q_inout[base_q + 0u], q_inout[base_q + 1u], q_inout[base_q + 2u], q_inout[base_q + 3u],
+    q_inout[base_q + 4u], q_inout[base_q + 5u], q_inout[base_q + 6u],
+  );
+  let target = vec3<f32>(target_in[base_t + 0u], target_in[base_t + 1u], target_in[base_t + 2u]);
+
+  let half_pi: f32 = 1.5707963267948966;
+  let xyz = array<vec3<f32>, 7>(
+    vec3<f32>(0.0,      0.0,     0.333),
+    vec3<f32>(0.0,      0.0,     0.0),
+    vec3<f32>(0.0,     -0.316,   0.0),
+    vec3<f32>(0.0825,   0.0,     0.0),
+    vec3<f32>(-0.0825,  0.384,   0.0),
+    vec3<f32>(0.0,      0.0,     0.0),
+    vec3<f32>(0.088,    0.0,     0.0),
+  );
+  let rpy_r = array<f32, 7>(0.0, -half_pi, half_pi, half_pi, -half_pi, half_pi, half_pi);
+
+  var poses_R: array<mat3x3<f32>, 7>;
+  var poses_p: array<vec3<f32>, 7>;
+  var R_world = mat3x3<f32>(
+    vec3<f32>(1.0, 0.0, 0.0),
+    vec3<f32>(0.0, 1.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0),
+  );
+  var p_world = vec3<f32>(0.0, 0.0, 0.0);
+  for (var i = 0u; i < 7u; i = i + 1u) {
+    let R_origin = rot_rpy_x(rpy_r[i]);
+    let R_q = rot_z(q[i]);
+    let R_iInP = R_origin * R_q;
+    let rotated = R_world * xyz[i];
+    p_world = p_world + rotated;
+    R_world = R_world * R_iInP;
+    poses_R[i] = R_world;
+    poses_p[i] = p_world;
+  }
+  let ee_pos = poses_p[6];
+  var J: array<vec3<f32>, 7>;
+  for (var i = 0u; i < 7u; i = i + 1u) {
+    let Ri = poses_R[i];
+    let a_world = vec3<f32>(Ri[2].x, Ri[2].y, Ri[2].z);
+    let dp = ee_pos - poses_p[i];
+    J[i] = vec3<f32>(
+      a_world.y * dp.z - a_world.z * dp.y,
+      a_world.z * dp.x - a_world.x * dp.z,
+      a_world.x * dp.y - a_world.y * dp.x,
+    );
+  }
+  let err = target - ee_pos;
+  let lam = lambda_u.x;
+  let lam2 = lam * lam;
+  var A00 = lam2; var A01 = 0.0; var A02 = 0.0;
+  var A11 = lam2; var A12 = 0.0; var A22 = lam2;
+  for (var i = 0u; i < 7u; i = i + 1u) {
+    A00 = A00 + J[i].x * J[i].x;
+    A01 = A01 + J[i].x * J[i].y;
+    A02 = A02 + J[i].x * J[i].z;
+    A11 = A11 + J[i].y * J[i].y;
+    A12 = A12 + J[i].y * J[i].z;
+    A22 = A22 + J[i].z * J[i].z;
+  }
+  let det = A00 * (A11 * A22 - A12 * A12)
+          - A01 * (A01 * A22 - A12 * A02)
+          + A02 * (A01 * A12 - A11 * A02);
+  if (abs(det) < 1e-18) { return; }
+  let invDet = 1.0 / det;
+  let inv00 = (A11 * A22 - A12 * A12) * invDet;
+  let inv01 = (A02 * A12 - A01 * A22) * invDet;
+  let inv02 = (A01 * A12 - A02 * A11) * invDet;
+  let inv11 = (A00 * A22 - A02 * A02) * invDet;
+  let inv12 = (A02 * A01 - A00 * A12) * invDet;
+  let inv22 = (A00 * A11 - A01 * A01) * invDet;
+  let y = vec3<f32>(
+    inv00 * err.x + inv01 * err.y + inv02 * err.z,
+    inv01 * err.x + inv11 * err.y + inv12 * err.z,
+    inv02 * err.x + inv12 * err.y + inv22 * err.z,
+  );
+  let alpha = alpha_u.x;
+  for (var i = 0u; i < 7u; i = i + 1u) {
+    let dq_i = J[i].x * y.x + J[i].y * y.y + J[i].z * y.z;
+    q_inout[base_q + i] = q[i] + alpha * dq_i;
+  }
+}`;
+
+  // ── Sim setup ──
+  const N = 64;
+  const LAMBDA = 0.05;
+  const ALPHA = 0.3;
+  const CONVERGED = 0.005;  // 5mm convergence threshold
+  const HOME = [0, -Math.PI/4, 0, -3*Math.PI/4, 0, Math.PI/2, Math.PI/4];
+
+  const qBuf = new Float32Array(N * 7);
+  const targetBuf = new Float32Array(N * 3);
+  let stepCount = 0;
+  let paused = false;
+  let preferCPU = false;
+
+  function resetSim() {
+    // All envs start at home pose; targets distributed randomly in workspace.
+    for (let env = 0; env < N; env++) {
+      for (let i = 0; i < 7; i++) qBuf[env*7 + i] = HOME[i];
+      // Random target in a reachable annulus (radius 0.3-0.7 from base, x∈[0.2,0.7], y∈[-0.4,0.4], z∈[0.2,0.9])
+      targetBuf[env*3 + 0] = 0.25 + Math.random() * 0.5;
+      targetBuf[env*3 + 1] = -0.4 + Math.random() * 0.8;
+      targetBuf[env*3 + 2] = 0.2 + Math.random() * 0.6;
+    }
+    stepCount = 0;
+  }
+  resetSim();
+
+  // ── WebGPU backend ──
+  let device = null;
+  let pipeline = null;
+  let buffers = null;
+  let mode = "starting…";
+
+  async function initWebGPU() {
+    if (!navigator.gpu) { mode = "JS (no navigator.gpu)"; return; }
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (!adapter) { mode = "JS (no GPU adapter)"; return; }
+      device = await adapter.requestDevice();
+      const module = device.createShaderModule({ code: FRANKA_REACH_WGSL });
+      pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+      const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+      const UNIFORM = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+      const MAP_READ = GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST;
+      buffers = {
+        q:        device.createBuffer({ size: N * 7 * 4, usage: STORAGE }),
+        target:   device.createBuffer({ size: N * 3 * 4, usage: STORAGE }),
+        lambda:   device.createBuffer({ size: 16, usage: UNIFORM }),
+        alpha:    device.createBuffer({ size: 16, usage: UNIFORM }),
+        staging:  device.createBuffer({ size: N * 7 * 4, usage: MAP_READ }),
+      };
+      device.queue.writeBuffer(buffers.lambda, 0, new Float32Array([LAMBDA, 0, 0, 0]));
+      device.queue.writeBuffer(buffers.alpha,  0, new Float32Array([ALPHA, 0, 0, 0]));
+      mode = "WebGPU (WGSL)";
+    } catch (e) {
+      console.error("WebGPU init failed", e);
+      mode = "JS (WebGPU init failed)"; device = null;
+    }
+  }
+
+  async function stepWebGPU() {
+    device.queue.writeBuffer(buffers.q, 0, qBuf);
+    device.queue.writeBuffer(buffers.target, 0, targetBuf);
+    const bindGroup = device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: buffers.q } },
+        { binding: 1, resource: { buffer: buffers.target } },
+        { binding: 2, resource: { buffer: buffers.lambda } },
+        { binding: 3, resource: { buffer: buffers.alpha } },
+      ],
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(N / 64));
+    pass.end();
+    encoder.copyBufferToBuffer(buffers.q, 0, buffers.staging, 0, N * 7 * 4);
+    device.queue.submit([encoder.finish()]);
+    await buffers.staging.mapAsync(GPUMapMode.READ);
+    const view = new Float32Array(buffers.staging.getMappedRange().slice(0));
+    for (let i = 0; i < N * 7; i++) qBuf[i] = view[i];
+    buffers.staging.unmap();
+  }
+
+  function stepCPU() {
+    for (let env = 0; env < N; env++) {
+      const q = Array.from(qBuf.subarray(env*7, env*7 + 7));
+      const target = [targetBuf[env*3], targetBuf[env*3+1], targetBuf[env*3+2]];
+      const qNew = reachStepJS(q, target, LAMBDA, ALPHA);
+      for (let i = 0; i < 7; i++) qBuf[env*7 + i] = qNew[i];
+    }
+  }
+
+  // ── Renderer ──
+  const cv = document.getElementById("cv");
+  const ctx = cv.getContext("2d");
+  // Side view (yz plane): x → screen_x (right), z → screen_y (up)
+  const SCALE = 240, CX = cv.width / 2, CY = cv.height - 80;
+  function proj(p) { return [CX + p[1] * SCALE, CY - p[2] * SCALE]; }
+
+  function envFK(env) {
+    const q = Array.from(qBuf.subarray(env*7, env*7 + 7));
+    return fkJ(q).poses_p;
+  }
+
+  function render() {
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    // Ground
+    ctx.strokeStyle = "#30363d";
+    ctx.beginPath();
+    ctx.moveTo(0, CY); ctx.lineTo(cv.width, CY); ctx.stroke();
+    // Workspace circle (0.855m reach radius)
+    const [ox, oy] = proj([0, 0, 0]);
+    ctx.strokeStyle = "#21262d";
+    ctx.beginPath(); ctx.arc(ox, oy, 0.855 * SCALE, 0, Math.PI * 2); ctx.stroke();
+    // Base bar
+    ctx.fillStyle = "#21262d";
+    ctx.fillRect(ox - 14, oy - 4, 28, 8);
+    // All ghost arms
+    let convergedCount = 0;
+    let errSum = 0, errMin = Infinity, errMax = 0;
+    for (let env = 0; env < N; env++) {
+      const poses = envFK(env);
+      const ee = poses[6];
+      const target = [targetBuf[env*3], targetBuf[env*3+1], targetBuf[env*3+2]];
+      const errMag = Math.sqrt(
+        (target[0]-ee[0])**2 + (target[1]-ee[1])**2 + (target[2]-ee[2])**2
+      );
+      if (errMag < CONVERGED) convergedCount++;
+      errSum += errMag;
+      errMin = Math.min(errMin, errMag);
+      errMax = Math.max(errMax, errMag);
+      // Draw arm with low alpha
+      ctx.strokeStyle = env === 0 ? "#7ee787" : "rgba(126, 231, 135, 0.10)";
+      ctx.lineWidth = env === 0 ? 4 : 1.5;
+      ctx.beginPath();
+      const [sx, sy] = proj([0, 0, 0]);
+      ctx.moveTo(sx, sy);
+      for (const p of poses) {
+        const [px, py] = proj(p);
+        ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+      // Target marker (lower alpha for env > 0)
+      const [tx, ty] = proj(target);
+      ctx.strokeStyle = env === 0 ? "#f0883e" : "rgba(240, 136, 62, 0.4)";
+      ctx.lineWidth = env === 0 ? 2 : 1;
+      ctx.beginPath();
+      ctx.moveTo(tx - 4, ty); ctx.lineTo(tx + 4, ty);
+      ctx.moveTo(tx, ty - 4); ctx.lineTo(tx, ty + 4);
+      ctx.stroke();
+    }
+    // Foreground env 0 marker
+    const poses0 = envFK(0);
+    const [eex0, eey0] = proj(poses0[6]);
+    ctx.fillStyle = "#f0883e";
+    ctx.beginPath(); ctx.arc(eex0, eey0, 7, 0, Math.PI * 2); ctx.fill();
+
+    document.getElementById("conv").textContent = `${convergedCount}/${N}`;
+    document.getElementById("step").textContent = String(stepCount);
+    document.getElementById("berr").textContent = (errMin * 1000).toFixed(1) + " mm";
+    document.getElementById("merr").textContent = ((errSum / N) * 1000).toFixed(1) + " mm";
+    document.getElementById("werr").textContent = (errMax * 1000).toFixed(1) + " mm";
+  }
+
+  document.getElementById("envs").textContent = String(N);
+
+  // ── Loop ──
+  let lastRateTime = performance.now();
+  let lastRateStep = 0;
+  async function loop() {
+    if (!paused) {
+      if (device !== null && !preferCPU) {
+        await stepWebGPU();
+      } else {
+        stepCPU();
+      }
+      stepCount++;
+    }
+    render();
+    document.getElementById("mode").textContent = mode;
+    document.getElementById("mode").className = "val " + (device !== null && !preferCPU ? "gpu" : "cpu");
+    const now = performance.now();
+    if (now - lastRateTime > 500) {
+      const rate = (stepCount - lastRateStep) / (now - lastRateTime) * 1000;
+      document.getElementById("rate").textContent = rate.toFixed(0);
+      lastRateTime = now;
+      lastRateStep = stepCount;
+    }
+    requestAnimationFrame(loop);
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "r" || e.key === "R") resetSim();
+    if (e.key === " ") { paused = !paused; e.preventDefault(); }
+    if (e.key === "c" || e.key === "C") preferCPU = !preferCPU;
+  });
+
+  initWebGPU().then(() => loop());
+</script>
+</body>
+</html>
