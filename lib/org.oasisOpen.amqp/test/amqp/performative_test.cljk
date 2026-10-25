@@ -1,0 +1,137 @@
+(ns amqp.performative-test
+  "AMQP 1.0 Part 2 (Transport) §2.7 Performatives + §2.8.14 Error. Every
+  field name/type/order/descriptor code in `amqp.performative` was
+  transcribed verbatim from the spec's own `<field>` tables (see that
+  namespace's docstring for how); this suite proves round trips and the
+  trailing-null-omission wire optimization, and that a wrong/foreign
+  descriptor is rejected rather than silently misread."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [amqp.performative :as p]
+            [amqp.types :as t]))
+
+(deftest open-round-trips-full-and-minimal
+  (testing "every optional field populated"
+    (let [fields {:container-id "my-container" :hostname "example.com"
+                   :max-frame-size 65536 :channel-max 100 :idle-time-out 30000
+                   :outgoing-locales ["en-US"] :incoming-locales ["en-US" "fr-FR"]
+                   :offered-capabilities ["sole-connection-for-container"]
+                   :desired-capabilities []
+                   :properties {:product "test"}}
+          enc (p/encode-performative :open fields)]
+      (is (= :ok (:status enc)) (pr-str enc))
+      (let [dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+        (is (= :ok (:status dec)))
+        (is (= :open (:performative dec)))
+        (is (= "my-container" (get-in dec [:fields :container-id])))
+        (is (= "example.com" (get-in dec [:fields :hostname])))
+        (is (= 65536 (get-in dec [:fields :max-frame-size])))
+        (is (= ["en-US" "fr-FR"] (get-in dec [:fields :incoming-locales])))
+        (is (= ["sole-connection-for-container"] (get-in dec [:fields :offered-capabilities])))
+        (is (= {:product "test"} (get-in dec [:fields :properties]))))))
+  (testing "only the mandatory field — trailing nulls dropped, defaults apply on decode"
+    (let [enc (p/encode-performative :open {:container-id "c"})]
+      (is (= :ok (:status enc)))
+      ;; descriptor(2 bytes: 0x00 smallulong-code+0x10) + list8(3-byte header) + container-id(1+1+"c")
+      (is (< (count (:bytes enc)) 15) "far shorter than the full 10-field list would be")
+      (let [dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+        (is (= "c" (get-in dec [:fields :container-id])))
+        (is (= 4294967295 (get-in dec [:fields :max-frame-size])) "default, §2.7.1")
+        (is (= 65535 (get-in dec [:fields :channel-max])) "default, §2.7.1")
+        (is (= [] (get-in dec [:fields :offered-capabilities])))))))
+
+(deftest open-missing-mandatory-field-is-named-error
+  (is (= :amqp/missing-mandatory-field (:reason (p/encode-performative :open {})))))
+
+(deftest begin-round-trips
+  (let [fields {:next-outgoing-id 0 :incoming-window 100 :outgoing-window 100}
+        enc (p/encode-performative :begin fields)]
+    (is (= :ok (:status enc)))
+    (let [dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+      (is (= :begin (:performative dec)))
+      (is (= 0 (get-in dec [:fields :next-outgoing-id])))
+      (is (= 4294967295 (get-in dec [:fields :handle-max])) "default"))))
+
+(deftest attach-round-trips-including-role
+  (doseq [role [:sender :receiver]]
+    (let [fields {:name "link-1" :handle 0 :role role}
+          enc (p/encode-performative :attach fields)
+          dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+      (is (= role (get-in dec [:fields :role])))
+      (is (= "link-1" (get-in dec [:fields :name])))
+      (is (= 2 (get-in dec [:fields :snd-settle-mode])) "default")
+      (is (= 0 (get-in dec [:fields :rcv-settle-mode])) "default"))))
+
+(deftest flow-round-trips
+  (let [fields {:incoming-window 10 :next-outgoing-id 5 :outgoing-window 10
+                :handle 0 :link-credit 50 :drain true}
+        enc (p/encode-performative :flow fields)
+        dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+    (is (= 50 (get-in dec [:fields :link-credit])))
+    (is (= true (get-in dec [:fields :drain])))
+    (is (= false (get-in dec [:fields :echo])) "default")))
+
+(deftest transfer-round-trips-with-delivery-tag
+  (let [fields {:handle 3 :delivery-id 7 :delivery-tag [1 2 3 4] :settled true}
+        enc (p/encode-performative :transfer fields)
+        dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+    (is (= 3 (get-in dec [:fields :handle])))
+    (is (= [1 2 3 4] (get-in dec [:fields :delivery-tag])))
+    (is (= true (get-in dec [:fields :settled])))
+    (is (= false (get-in dec [:fields :more])) "default")))
+
+(deftest disposition-round-trips
+  (let [fields {:role :sender :first 1 :last 5 :settled true}
+        enc (p/encode-performative :disposition fields)
+        dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+    (is (= :sender (get-in dec [:fields :role])))
+    (is (= 1 (get-in dec [:fields :first])))
+    (is (= 5 (get-in dec [:fields :last])))))
+
+(deftest detach-end-close-round-trip
+  (doseq [[perf-key fields] [[:detach {:handle 2 :closed true}]
+                             [:end {}]
+                             [:close {}]]]
+    (let [enc (p/encode-performative perf-key fields)
+          dec (p/decode-performative (:value (t/decode-value (:bytes enc) 0)))]
+      (is (= :ok (:status enc)) (str perf-key))
+      (is (= perf-key (:performative dec))))))
+
+(deftest error-round-trips-and-nests-inside-close
+  (let [err (p/encode-error {:condition "amqp:not-found" :description "no such queue" :info {:queue "q1"}})]
+    (is (= :ok (:status err)))
+    (let [dec (p/decode-error (:value err))]
+      (is (= "amqp:not-found" (get-in dec [:fields :condition])))
+      (is (= "no such queue" (get-in dec [:fields :description])))
+      (is (= {:queue "q1"} (get-in dec [:fields :info]))))
+    (testing "the encoded error nests inside close's :error field opaquely"
+      (let [close-enc (p/encode-performative :close {:error (:value err)})
+            close-dec (p/decode-performative (:value (t/decode-value (:bytes close-enc) 0)))
+            nested-err (p/decode-error (get-in close-dec [:fields :error]))]
+        (is (= "amqp:not-found" (get-in nested-err [:fields :condition])))))))
+
+(deftest error-missing-mandatory-condition-is-named
+  (is (= :amqp/missing-mandatory-field (:reason (p/encode-error {})))))
+
+;; ── negative tests ───────────────────────────────────────────────────────
+
+(deftest unknown-performative-code-is-named
+  (let [fake [:described [:ulong 0x99] [:list []]]]
+    (is (= :amqp/unknown-performative (:reason (p/decode-performative fake))))))
+
+(deftest not-a-performative-when-not-described
+  (is (= :amqp/not-a-performative (:reason (p/decode-performative [:list [[:uint 1]]])))))
+
+(deftest discrimination-wrong-descriptor-fires-only-on-the-wrong-code
+  ;; Decoding an `open` performative's bytes but expecting `close`'s
+  ;; descriptor must not silently accept it — a peer sending the wrong
+  ;; frame type for its own channel is exactly the confusion this guards.
+  (let [open-enc (p/encode-performative :open {:container-id "x"})
+        decoded-value (:value (t/decode-value (:bytes open-enc) 0))]
+    (testing "control: decodes as :open"
+      (is (= :open (:performative (p/decode-performative decoded-value)))))
+    (testing "break: tamper the descriptor's ulong value to an unassigned code"
+      (let [[tag [dtag _n] value] decoded-value
+            tampered [tag [dtag 0x77] value]]
+        (is (= :amqp/unknown-performative (:reason (p/decode-performative tampered))))))
+    (testing "restore"
+      (is (= :open (:performative (p/decode-performative decoded-value)))))))
