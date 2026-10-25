@@ -131,6 +131,7 @@ The bundled standard libraries live in this repository:
 | `org.xiph.flac` | `org.xiph.flac/src` | `flac.bits`, `flac.core`, `flac.crc`, `flac.encode` (an external specification, publisher xiph.org) |
 | `org.wiFi.easyConnect` | `org.wiFi.easyConnect/src` | `dpp.uri` (an external specification, publisher wiFi.org) |
 | `org.tukaani.xz` | `org.tukaani.xz/src` | `xz.buffer`, `xz.core`, `xz.crc64`, `xz.lzma` (an external specification, publisher tukaani.org) |
+| `org.sourceware.bzip2` | `org.sourceware.bzip2/src` | `bzip2.bits`, `bzip2.bwt`, `bzip2.core`, `bzip2.crc` (an external specification, publisher sourceware.org) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
 | `kotoba.x` | `kotoba.x/src` | `` (Kotoba project library) |
 | `kotoba.tsukasa` | `kotoba.tsukasa/src` | `` (Kotoba project library) |

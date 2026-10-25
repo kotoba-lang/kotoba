@@ -1,0 +1,177 @@
+(ns bzip2.bzip2-oracle-test
+  "Conformance against the reference implementation (`bzip2` / `bunzip2`), in
+   both directions.
+
+   The portable suite already decodes recorded reference streams. What only a
+   shell can add is the other direction: our *output* handed back to the
+   reference across every level, plus `bunzip2 -t`, which runs the reference's
+   own integrity check over the stream we produced. Without that, an encoder can
+   pass a whole suite by agreeing with its own decoder.
+
+   Skipped loudly when the reference tools are missing."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [bzip2.core :as bzip2]
+            [tar.core :as tar])
+  (:import [java.io File]))
+
+(defn- have-tools? []
+  (try (and (zero? (:exit (shell/sh "bash" "-c" "command -v bzip2")))
+            (zero? (:exit (shell/sh "bash" "-c" "command -v bunzip2"))))
+       (catch Exception _ false)))
+
+(defn- ->bytes ^bytes [v] (byte-array (map unchecked-byte v)))
+(defn- ->vec [^bytes b] (mapv #(bit-and (int %) 0xff) b))
+
+(defn- sh-bytes
+  "Run `cmd` with `input` on stdin; return `{:exit n :out <byte vector>}`."
+  [cmd input]
+  (let [{:keys [exit out]} (apply shell/sh (concat cmd [:in (->bytes input) :out-enc :bytes]))]
+    {:exit exit :out (->vec out)}))
+
+(defn- reference-compress [data level]
+  (let [{:keys [exit out]} (sh-bytes ["bzip2" "-c" (str "-" level)] data)]
+    (is (zero? exit) "bzip2 -c failed")
+    out))
+
+(defn- reference-decompress [bz2]
+  (sh-bytes ["bunzip2" "-c"] bz2))
+
+(def ^:private shapes
+  {"empty" []
+   "one" [42]
+   "quad" [65 65 65 65]
+   "run-259" (vec (repeat 259 3))
+   "every-byte" (vec (mapcat identity (repeat 8 (range 256))))
+   "text" (vec (mapcat identity (repeat 200 (mapv int "the quick brown fox jumps over the lazy dog. "))))
+   "source-like" (vec (mapcat identity
+                              (repeat 120 (mapv int "(defn foo [x] (let [y (inc x)] (* y y)))\n  ;; a comment\n"))))
+   "one-value" (vec (repeat 9000 7))
+   "two-values" (vec (map #(if (even? (quot % 7)) 1 254) (range 9000)))
+   "pseudo-random" (vec (map #(mod (* 1103515245 (inc %)) 251) (range 9000)))})
+
+;; ---------------------------------------------------------------------------
+;; We read what the reference writes
+;; ---------------------------------------------------------------------------
+
+(deftest we-decode-every-level-the-reference-produces
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: bzip2/bunzip2 not available")
+    (doseq [[name data] (sort shapes)
+            level (range 1 10)]
+      (testing (str name " at level " level)
+        (is (= (vec data) (bzip2/decompress (reference-compress data level))))))))
+
+;; ---------------------------------------------------------------------------
+;; The reference reads what we write
+;; ---------------------------------------------------------------------------
+
+(deftest the-reference-decodes-our-output
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: reference tools not available")
+    (doseq [[name data] (sort shapes)
+            level [1 5 9]]
+      (testing (str name " at level " level)
+        (let [ours (bzip2/compress data {:level level})
+              {:keys [exit out]} (reference-decompress ours)]
+          (is (zero? exit) (str "bunzip2 rejected our stream for " name))
+          (is (= (vec data) out)))))))
+
+(deftest our-output-passes-the-reference-integrity-check
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: reference tools not available")
+    (doseq [[name data] (sort shapes)]
+      (testing name
+        ;; `-t` makes the reference verify the block CRCs, the combined CRC and
+        ;; every structural field it knows about
+        (let [ours (bzip2/compress data {:level 9})
+              {:keys [exit]} (sh-bytes ["bunzip2" "-t"] ours)]
+          (is (zero? exit) (str "bunzip2 -t failed for " name)))))))
+
+(deftest our-ratio-is-in-the-reference-s-league
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: reference tools not available")
+    (doseq [[name data] (sort shapes)
+            :when (> (count data) 1000)]
+      (testing name
+        (let [ours (count (bzip2/compress data {:level 9}))
+              ref (count (reference-compress data 9))]
+          ;; The four-iteration table assignment is implemented, so this is a
+          ;; real comparison rather than a formality: a bound of 1.1x catches a
+          ;; collapse (a single table, or no RLE2) without pinning us to
+          ;; libbzip2's exact tie-breaking.
+          (is (<= ours (* 1.1 ref))
+              (str name " ours=" ours " reference=" ref)))))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-block, concatenated, and a real .tar.bz2
+;; ---------------------------------------------------------------------------
+
+(deftest multi-block-streams-in-both-directions
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: reference tools not available")
+    (let [;; level 1 means 100,000-byte blocks, so this is three of them
+          data (vec (mapcat identity (repeat 25000 (mapv int "abcdefghij"))))]
+      (testing "we read the reference's multi-block stream"
+        (is (= data (bzip2/decompress (reference-compress data 1)))))
+      (testing "and the reference reads ours"
+        (let [ours (bzip2/compress data {:level 1})
+              {:keys [exit out]} (reference-decompress ours)]
+          (is (zero? exit))
+          (is (= data out)))))))
+
+(deftest concatenated-streams
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: reference tools not available")
+    (let [a (reference-compress (mapv int "first part\n") 1)
+          b (reference-compress (mapv int "second part\n") 9)]
+      (testing "two streams in one file decode as one, the way bunzip2 does it"
+        (is (= (mapv int "first part\nsecond part\n")
+               (bzip2/decompress (into a b)))))
+      (testing "and our own streams concatenate the same way"
+        (let [x (bzip2/compress (mapv int "ours one\n") {:level 1})
+              y (bzip2/compress (mapv int "ours two\n") {:level 9})]
+          (is (= (mapv int "ours one\nours two\n") (bzip2/decompress (into x y))))
+          (is (zero? (:exit (sh-bytes ["bunzip2" "-t"] (into x y))))))))))
+
+(deftest a-real-tar-bz2-that-system-tar-extracts
+  ;; The composition claim in the README, tested rather than asserted: bzip2 does
+  ;; not archive and tar does not compress, so `.tar.bz2` is these two repos
+  ;; stacked. `tar -xjf` shells out to bzip2 itself.
+  (if-not (and (have-tools?) (zero? (:exit (shell/sh "bash" "-c" "command -v tar"))))
+    (println "SKIP bzip2.bzip2-oracle-test: tar or bzip2 not available")
+    (let [dir (kio/temp-dir
+                        "org-sourceware-bzip2-")
+          hello (mapv int "hello from a portable bzip2\n")
+          big (vec (mapcat identity (repeat 300 (mapv int "a line of a larger file\n"))))
+          archive (tar/build [{:name "hello.txt" :bytes hello}
+                              {:name "nested/big.txt" :bytes big}])
+          tbz (bzip2/compress archive {:level 9})
+          f (io/file dir "test.tar.bz2")]
+      (try
+        (with-open [o (io/output-stream f)] (.write o (->bytes tbz)))
+        (let [{:keys [exit err]} (shell/sh "tar" "-xjf" "test.tar.bz2" :dir dir)]
+          (is (zero? exit) (str "tar -xjf failed: " err)))
+        (is (= (apply str (map char hello)) (slurp (io/file dir "hello.txt"))))
+        (is (= (count big) (.length (io/file dir "nested/big.txt"))))
+        (finally
+          (doseq [c (reverse (file-seq dir))] (.delete ^File c)))))))
+
+;; ---------------------------------------------------------------------------
+;; A larger input
+;; ---------------------------------------------------------------------------
+
+(deftest a-larger-input-in-both-directions
+  (if-not (have-tools?)
+    (println "SKIP bzip2.bzip2-oracle-test: reference tools not available")
+    (let [data (vec (mapcat identity
+                            (repeat 1200 (mapv int (str "Lorem ipsum dolor sit amet, consectetur "
+                                                        "adipiscing elit, sed do eiusmod tempor.\n")))))]
+      (is (> (count data) 90000))
+      (testing "the reference's output at level 9"
+        (is (= data (bzip2/decompress (reference-compress data 9)))))
+      (testing "ours, read back by the reference"
+        (let [ours (bzip2/compress data {:level 9})]
+          (is (zero? (:exit (sh-bytes ["bunzip2" "-t"] ours))))
+          (is (= data (:out (reference-decompress ours)))))))))
