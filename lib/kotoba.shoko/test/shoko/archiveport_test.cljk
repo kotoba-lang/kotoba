@@ -1,0 +1,219 @@
+(ns shoko.archiveport-test
+  "r2-archiveport — the real, opt-in Cloudflare R2 ArchiveTarget. Two layers:
+
+  1. SigV4: that `sign-request` feeds kotoba-lang/sigv4 R2's request shape,
+     and that what comes back round-trips through the same library's
+     verifier — the independent recomputation R2 itself performs. The
+     canonicalization golden vectors moved to that library with the code.
+  2. r2-archiveport request-building against an INJECTED FAKE :http-fn (a
+     plain closure capturing the request map, same convention
+     cloudflare.client-test / cloud_itonami.mail-test use) — proves share!/
+     fetch-file build well-formed SigV4-signed S3 requests (bucket/key/
+     method/signed headers) with ZERO real network or credentials. The live
+     round-trip against the actual R2 bucket is a separate manual
+     verification step (see the ADR/task notes), never part of this suite."
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [shoko.archiveport :as ap]
+            [sigv4.core :as sigv4-core]
+            [sigv4.crypto :as sigv4-crypto]
+            [sigv4.verify :as sigv4-verify]))
+
+
+;; ───────────────────────── SigV4 ─────────────────────────
+;;
+;; The canonicalization golden vectors that used to live here moved with the
+;; code, to kotoba-lang/sigv4 (ADR-2607254100), where they are pinned against
+;; AWS's own published reference signatures rather than against a sibling
+;; implementation. Two cases this repo exercised that the library did not —
+;; a colon in a key segment, and keyword-keyed query maps — went with them.
+;;
+;; What is tested here is what shoko still owns: that `sign-request` feeds the
+;; library R2's shape correctly, and that the result is one a real endpoint
+;; would accept. The round-trip through `sigv4.verify` is the independent
+;; recomputation R2 performs, so a wrong header set fails here rather than as
+;; an opaque 403 against a live bucket.
+
+(def ^:private signer-opts
+  {:bucket "shoko-archive"
+   :access-key-id "r2accesskeyid"
+   :secret-access-key "r2secretaccesskey"
+   :endpoint-host "acct123.r2.cloudflarestorage.com"
+   :now (java.time.Instant/parse "2026-01-02T03:04:05.678Z")})
+
+(defn- verifies?
+  "Recompute the signature the way R2 would."
+  [signed key method]
+  (let [headers (into {} (map (fn [[k v]] [(str/lower k) v])) (:headers signed))
+        parsed (sigv4-verify/parse-authorization (get headers "authorization"))]
+    (sigv4-verify/constant-time-eq?
+     (:signature parsed)
+     (sigv4-verify/expected-signature
+      (sigv4-crypto/crypto)
+      {:secret-key (:secret-access-key signer-opts)
+       :parsed parsed
+       :amz-date (get headers "x-amz-date")
+       :payload-hash (get headers "x-amz-content-sha256")
+       :request {:method method
+                 :path (sigv4-core/object-path (:bucket signer-opts) key)
+                 :query nil
+                 :headers headers}}))))
+
+(deftest sign-request-signs-what-r2-will-verify
+  (testing "a GET with no payload"
+    (let [key "pins/did:key/abc.json"
+          signed (ap/sign-request (assoc signer-opts :method :get :key key))]
+      (is (= (str "https://acct123.r2.cloudflarestorage.com"
+                  "/shoko-archive/pins/did%3Akey/abc.json")
+             (:url signed))
+          "colons in a key segment are percent-encoded; slashes are not")
+      (is (= "20260102T030405Z" (get (:headers signed) "x-amz-date"))
+          "the injected Instant is truncated to whole seconds")
+      (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+             (get (:headers signed) "x-amz-content-sha256"))
+          "SHA-256 of the empty payload")
+      (is (verifies? signed key :get))))
+  (testing "a PUT with bytes"
+    (let [key "files/report.pdf"
+          signed (ap/sign-request (assoc signer-opts :method :put :key key
+                                         :payload (kbytes/utf8-bytes "hello")))]
+      (is (= "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+             (get (:headers signed) "x-amz-content-sha256")))
+      (is (verifies? signed key :put)))))
+
+(deftest sign-request-keeps-r2-request-conventions
+  (let [signed (ap/sign-request (assoc signer-opts :method :get :key "a.json"))]
+    (testing "jvm-http-fn expects the capitalised header name"
+      (is (contains? (:headers signed) "Authorization"))
+      (is (not (contains? (:headers signed) "authorization"))))
+    (is (= :get (:method signed)) "the method stays a keyword for the http-fn")
+    (is (str/starts-with? (get (:headers signed) "Authorization")
+                          "AWS4-HMAC-SHA256 Credential=r2accesskeyid/20260102/auto/s3/aws4_request,")
+        "R2 signs under region \"auto\"")))
+
+(deftest sign-request-signs-query-parameters
+  (let [signed (ap/sign-request (assoc signer-opts :method :get :key nil
+                                       :query {:prefix "a/b" :list-type "2"}))]
+    (is (str/ends-with? (:url signed) "/shoko-archive?list-type=2&prefix=a%2Fb")
+        "keyword query keys, sorted and S3-encoded")))
+
+;; ───────────────────────── sign-request shape ─────────────────────────
+
+(deftest sign-request-builds-a-path-style-signed-request
+  (let [req (ap/sign-request {:method :put :bucket "cloud-itonami-shoko-archive"
+                              :key "shoko/f-handbook.edn"
+                              :payload (kbytes/utf8-bytes "hello")
+                              :headers {"content-type" "application/edn"}
+                              :access-key-id "AKID" :secret-access-key "SECRET"
+                              :endpoint-host "acct123.r2.cloudflarestorage.com"
+                              :now (java.time.Instant/parse "2026-01-02T03:04:05Z")})]
+    (is (= "https://acct123.r2.cloudflarestorage.com/cloud-itonami-shoko-archive/shoko/f-handbook.edn"
+           (:url req)))
+    (is (= :put (:method req)))
+    (is (= "acct123.r2.cloudflarestorage.com" (get-in req [:headers "host"])))
+    (is (= "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+           (get-in req [:headers "x-amz-content-sha256"]))
+        "the signed content hash must match the actual payload bytes")
+    (is (str/starts-with? (get-in req [:headers "Authorization"])
+                          "AWS4-HMAC-SHA256 Credential=AKID/20260102/auto/s3/aws4_request, SignedHeaders=")
+        "region defaults to \"auto\" (R2's SigV4 signing region)")
+    (is (str/includes? (get-in req [:headers "Authorization"]) "content-type;host;x-amz-content-sha256;x-amz-date")
+        "content-type was passed as an extra header, so it must be part of SignedHeaders too")))
+
+(deftest sign-request-get-has-empty-payload-hash
+  (let [req (ap/sign-request {:method :get :bucket "b" :key "k"
+                              :access-key-id "AKID" :secret-access-key "SECRET"
+                              :endpoint-host "acct.r2.cloudflarestorage.com"
+                              :now (java.time.Instant/parse "2026-01-02T03:04:05Z")})]
+    (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+           (get-in req [:headers "x-amz-content-sha256"])))))
+
+;; ───────────────────────── r2-archiveport against an injected fake :http-fn ─────────────────────────
+
+(defn- stub-http-fn
+  "A plain closure capturing every request it's called with (in call order)
+  and returning canned {:status :body} responses in that same order — the
+  same fake-http convention cloudflare.client-test / cloud_itonami.mail-test
+  use, so the automated suite never touches the network."
+  [& responses]
+  (let [calls (atom [])
+        remaining (atom (or (seq responses) [{:status 200 :body (byte-array 0)}]))]
+    {:calls calls
+     :http-fn (fn [req]
+                (swap! calls conj req)
+                (let [resp (first @remaining)]
+                  (when (next @remaining) (swap! remaining next))
+                  resp))}))
+
+(deftest share!-puts-the-content-and-calls-the-distributor
+  (let [{:keys [calls http-fn]} (stub-http-fn {:status 200 :body (byte-array 0)})
+        distributed (atom nil)
+        target (ap/r2-archiveport {:bucket "cloud-itonami-shoko-archive" :account-id "acct123"
+                                   :access-key-id "AKID" :secret-access-key "SECRET"
+                                   :http-fn http-fn :distributor #(reset! distributed %)})
+        content {:drive/id "f-handbook" :drive/kind :file :drive/title "従業員ハンドブック"}
+        rec (ap/share! target "f-handbook" "alice" content)]
+    (is (= {:file-id "f-handbook" :principal "alice" :content content} rec))
+    (is (= rec @distributed) "share! must call the distributor with the exact delivered record")
+    (testing "the captured request"
+      (let [req (first @calls)]
+        (is (= 1 (count @calls)))
+        (is (= :put (:method req)))
+        (is (= "https://acct123.r2.cloudflarestorage.com/cloud-itonami-shoko-archive/shoko/f-handbook.edn"
+               (:url req)))
+        (is (= "application/edn" (get-in req [:headers "content-type"])))
+        (is (str/starts-with? (get-in req [:headers "Authorization"]) "AWS4-HMAC-SHA256 Credential=AKID/"))
+        (is (= {:file-id "f-handbook" :principal "alice" :content content}
+               (edn/read-string (kbytes/utf8-string ^bytes (:body req))))
+            "the PUT body is the exact same record share! returns/hands to the distributor")))))
+
+(deftest share!-throws-on-a-non-2xx-status-and-never-calls-the-distributor
+  (let [{:keys [http-fn]} (stub-http-fn {:status 500 :body (kbytes/utf8-bytes "boom")})
+        distributed (atom :untouched)
+        target (ap/r2-archiveport {:bucket "b" :account-id "a" :access-key-id "AKID"
+                                   :secret-access-key "SECRET" :http-fn http-fn
+                                   :distributor #(reset! distributed %)})]
+    (is (thrown? kerror/ExceptionInfo (ap/share! target "f1" "alice" {:drive/id "f1"})))
+    (is (= :untouched @distributed) "a failed PUT must never reach the distributor")))
+
+(deftest fetch-file-gets-and-decodes-the-stored-record
+  (let [stored {:file-id "f-handbook" :principal "alice" :content {:drive/id "f-handbook"}}
+        {:keys [calls http-fn]} (stub-http-fn {:status 200 :body (kbytes/utf8-bytes (pr-str stored))})
+        target (ap/r2-archiveport {:bucket "cloud-itonami-shoko-archive" :account-id "acct123"
+                                   :access-key-id "AKID" :secret-access-key "SECRET" :http-fn http-fn})]
+    (is (= stored (ap/fetch-file target "f-handbook")))
+    (let [req (first @calls)]
+      (is (= :get (:method req)))
+      (is (= "https://acct123.r2.cloudflarestorage.com/cloud-itonami-shoko-archive/shoko/f-handbook.edn"
+             (:url req))))))
+
+(deftest fetch-file-returns-nil-on-a-404
+  (let [{:keys [http-fn]} (stub-http-fn {:status 404 :body (kbytes/utf8-bytes "<Error/>")})
+        target (ap/r2-archiveport {:bucket "b" :account-id "a" :access-key-id "AKID"
+                                   :secret-access-key "SECRET" :http-fn http-fn})]
+    (is (nil? (ap/fetch-file target "missing")))))
+
+(deftest fetch-file-throws-on-a-non-404-error-status
+  (let [{:keys [http-fn]} (stub-http-fn {:status 403 :body (kbytes/utf8-bytes "<Error/>")})
+        target (ap/r2-archiveport {:bucket "b" :account-id "a" :access-key-id "AKID"
+                                   :secret-access-key "SECRET" :http-fn http-fn})]
+    (is (thrown? kerror/ExceptionInfo (ap/fetch-file target "f1")))))
+
+(deftest propose-revision!-is-pure-no-network-call
+  (let [calls (atom 0)
+        http-fn (fn [_req] (swap! calls inc) {:status 200 :body (byte-array 0)})
+        target (ap/r2-archiveport {:bucket "b" :account-id "a" :access-key-id "AKID"
+                                   :secret-access-key "SECRET" :http-fn http-fn})]
+    (is (= {:branch "shoko/f-handbook"}
+           (ap/propose-revision! target {:drive/id "f-handbook"} {:drive/id "f-handbook"})))
+    (is (zero? @calls) "propose-revision! must have no external effect (only share! writes)")))
+
+;; NOTE: r2-archiveport's env-var credential fallback (R2_ACCESS_KEY_ID/
+;; R2_SECRET_ACCESS_KEY/R2_ACCOUNT_ID, "throws if neither given") is
+;; intentionally NOT covered here — asserting the throw requires those env
+;; vars to be ABSENT, which would make this suite flaky in any shell that has
+;; already `eval`'d scripts/r2-creds.bb (exactly the manual-verification
+;; workflow this port exists for). Every test above passes explicit
+;; :access-key-id/:secret-access-key/:account-id, which always takes
+;; precedence over env and so is unaffected either way.

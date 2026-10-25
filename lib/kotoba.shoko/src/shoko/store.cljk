@@ -1,0 +1,223 @@
+(ns shoko.store
+  "SSoT for shoko — a storage-governance control plane, behind a `Store`
+  protocol so the backend is a swap (MemStore default ‖ DatomicStore via
+  langchain.db, itself swappable to real Datomic Local / kotoba-server).
+
+  Domain = archiving and sharing the files/folders `kotoba-lang/drive`
+  models as pure EDN, on behalf of an itonami activity. The actor only ever
+  writes :draft records (control-plane proposals, holding a `drive.model`
+  file/folder EDN verbatim) and :grant records (its OWN ACL ledger — drive.
+  model has none); actually sharing a file is an EXTERNAL effect performed
+  by an ArchiveTarget port, and only after human approval.
+
+    activity — an itonami activity driving an archive request: id, repo (the
+               tenant it belongs to), title, status (:open/:closed).
+    file     — a durable ground fact: a `drive.model` file/folder EDN item
+               (:drive/id/kind/title/object-ref/media-type or :children)
+               plus a :tenant shoko itself adds (for tenant-isolation) —
+               recorded by the ingest flow (:file/register), no LLM
+               involved.
+    draft    — the committed/proposed archive-LLM content for a file
+               (content, confidence, cites, redactions, status :proposed).
+    grant    — shoko's own ACL ledger entry: a (principal, file-id) access
+               grant, created only after a human approves a :file/share.
+
+  Charter: the append-only **ledger is shoko's storage-governance audit
+  trail** (who drafted what, who was granted access to what, on what basis,
+  when) — the property a mutable file-share dialog can't give you.
+
+  seed! is a per-id upsert (via the same record-datom! merge MemStore
+  already uses for writes), NEVER a wholesale replace of a whole entity
+  collection — re-seeding with one new id must never wipe out unrelated
+  already-seeded entities (the bug class teian.store's MemStore.seed! was
+  fixed to avoid; store_contract_test's seed-twice test proves this here)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.db :as d]
+            [shoko.model :as model]))
+
+(defprotocol Store
+  (activity [s id])
+  (file [s id])
+  (all-files [s]              "every registered file/folder across the tenant(s)")
+  (draft-of [s file-id]       "committed/proposed draft for a file, or nil")
+  (grant-of [s principal file-id] "the grant for this exact (principal, file) pair, or nil")
+  (grants-of-file [s file-id] "every grant recorded against a file")
+  (principal-known? [s principal tenant] "has this principal received a grant on some file WITHIN this tenant? — the deny-by-default share-requires-acl check (see shoko.governor), TENANT-SCOPED: a grant recorded under an unrelated tenant must never vouch for a principal here (a principal known only in tenant A must not be treated as pre-authorized for tenant B — the confirmed privilege-escalation-shaped bug this scoping closes). The tenant a grant 'belongs to' is resolved via the file it was granted against, not stored redundantly on the grant record itself.")
+  (ledger [s])
+  (record-datom! [s record] "append/merge a shoko ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable storage-governance audit fact")
+  (seed! [s data]           "bulk-seed entity collections (idempotent, per-id upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+;; A fixed clock so grants/tests are deterministic and offline-verifiable.
+;; NEVER used as a runtime commit-time fallback for a real request — that
+;; was a confirmed audit-integrity bug (a REAL :file/share commit missing
+;; :now silently stamped this constant instead of the actual time). Use
+;; ONLY for demo/test seeding and for tests that explicitly want a
+;; deterministic :granted-at (they pass :now demo-now themselves).
+(def demo-now 1751500000) ; ~2026-07-03Z, epoch seconds
+
+(defn real-now
+  "The actual current time, epoch seconds (same unit as demo-now above) —
+  the :granted-at fallback for a REAL :file/share commit whose request
+  omitted :now, so a missing :now never silently stamps the fixed demo
+  clock into the audit ledger (see shoko.operation)."
+  []
+  #?(:clj (quot (System/currentTimeMillis) 1000)
+     :cljs (quot (.getTime (js/Date.)) 1000)))
+
+(defn demo-data
+  "cloud-itonami's book: f-handbook and f-contract are clean, known-tenant
+  files. f-rogue-tenant is registered under a DIFFERENT tenant than
+  act-archive's own repo — a draft/share request for it must HOLD on
+  tenant-isolation. alice already has a pre-existing grant on f-handbook (the
+  org's own onboarding — analogous to kekkai's pre-authorized demo nodes) so
+  she is a 'known' principal: share-requires-acl lets her receive a NEW
+  share to f-contract, whereas an entirely unregistered principal (e.g.
+  \"mallory-external\") can never receive a first share at all."
+  []
+  {:activities
+   {"act-archive" (model/activity "act-archive" "gftdcojp/cloud-itonami" "書庫アーカイブ依頼")}
+   :files
+   {"f-handbook"
+    {:drive/id "f-handbook" :drive/kind :file :drive/title "従業員ハンドブック"
+     :drive/object-ref "cid:drive:handbook" :drive/media-type "application/pdf"
+     :tenant "gftdcojp/cloud-itonami"}
+    "f-contract"
+    {:drive/id "f-contract" :drive/kind :file :drive/title "取引先契約書"
+     :drive/object-ref "cid:drive:contract" :drive/media-type "application/pdf"
+     :tenant "gftdcojp/cloud-itonami"}
+    "f-rogue-tenant"
+    {:drive/id "f-rogue-tenant" :drive/kind :file :drive/title "別テナント文書"
+     :drive/object-ref "cid:drive:rogue" :drive/media-type "application/pdf"
+     :tenant "someone-else/other-repo"}}
+   :grants
+   {(model/grant-id "alice" "f-handbook")
+    (model/grant "alice" "f-handbook" {:granted-by "hr-onboarding" :granted-at demo-now})}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (activity [_ id] (get-in @a [:activities id]))
+  (file [_ id] (get-in @a [:files id]))
+  (all-files [_] (sort-by :drive/id (vals (:files @a))))
+  (draft-of [_ file-id] (get-in @a [:drafts file-id]))
+  (grant-of [_ principal file-id] (get-in @a [:grants (model/grant-id principal file-id)]))
+  (grants-of-file [_ file-id] (filterv #(= file-id (:file-id %)) (vals (:grants @a))))
+  (principal-known? [s principal tenant]
+    (boolean (some (fn [g] (and (= principal (:principal g))
+                                (= tenant (:tenant (file s (:file-id g))))))
+                   (vals (:grants @a)))))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :activity (swap! a update-in [:activities id] merge value)
+      :file     (swap! a update-in [:files id] merge value)
+      :draft    (swap! a update-in [:drafts id] merge value)
+      :grant    (swap! a update-in [:grants id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data]
+    ;; per-id upsert (via the same record-datom! merge MemStore already uses
+    ;; for writes) — mirrors DatomicStore.seed! exactly, so seeding again with
+    ;; a new id never wipes out unrelated already-seeded entities.
+    (doseq [[id act] (:activities data)] (record-datom! s {:kind :activity :id id :value act}))
+    (doseq [[id f]   (:files data)]      (record-datom! s {:kind :file :id id :value f}))
+    (doseq [[id g]   (:grants data)]     (record-datom! s {:kind :grant :id id :value g}))
+    s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :drafts {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:activity/id {:db/unique :db.unique/identity}
+   :file/id     {:db/unique :db.unique/identity}
+   :draft/id    {:db/unique :db.unique/identity}
+   :grant/id    {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (activity [this id]
+    (-> (pull* this [:activity/edn] [:activity/id id]) :activity/edn dec*))
+  (file [this id]
+    (-> (pull* this [:file/edn] [:file/id id]) :file/edn dec*))
+  (all-files [this]
+    (->> (q* this '[:find [?id ...] :where [?e :file/id ?id]])
+         (map #(file this %)) (sort-by :drive/id)))
+  (draft-of [this file-id]
+    (-> (pull* this [:draft/edn] [:draft/id file-id]) :draft/edn dec*))
+  (grant-of [this principal file-id]
+    (-> (pull* this [:grant/edn] [:grant/id (model/grant-id principal file-id)]) :grant/edn dec*))
+  (grants-of-file [this file-id]
+    (->> (q* this '[:find [?v ...] :where [?r :grant/id _] [?r :grant/edn ?v]])
+         (mapv dec*) (filterv #(= file-id (:file-id %)))))
+  (principal-known? [this principal tenant]
+    (->> (q* this '[:find [?v ...] :where [?r :grant/id _] [?r :grant/edn ?v]])
+         (mapv dec*)
+         (some (fn [g] (and (= principal (:principal g))
+                            (= tenant (:tenant (file this (:file-id g)))))))
+         boolean))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :activity (tx* s [{:activity/id id :activity/edn (enc (merge (activity s id) value))}])
+      :file     (tx* s [{:file/id id :file/edn (enc (merge (file s id) value))}])
+      :draft    (tx* s [{:draft/id id :draft/edn (enc (merge (draft-of s id) value))}])
+      :grant    (tx* s [{:grant/id id :grant/edn (enc (merge (grant-of s
+                                                                       (:principal value) (:file-id value))
+                                                              value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id act] (:activities data)] (record-datom! s {:kind :activity :id id :value act}))
+    (doseq [[id f]   (:files data)]      (record-datom! s {:kind :file :id id :value f}))
+    (doseq [[id g]   (:grants data)]     (record-datom! s {:kind :grant :id id :value g}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see shoko.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))

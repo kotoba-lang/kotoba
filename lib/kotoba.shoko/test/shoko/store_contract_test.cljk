@@ -1,0 +1,108 @@
+(ns shoko.store-contract-test
+  "Store contract against both backends — proving MemStore ≡ DatomicStore makes
+  'swap the SSoT for Datomic / kotoba-server' a config change, not a rewrite."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [shoko.model :as model]
+            [shoko.store :as store]
+            [langchain.db :as db]))
+
+(defn- backends [] [["MemStore" (store/seed-db)] ["DatomicStore" (store/datomic-seed-db)]])
+
+(deftest read-parity
+  (doseq [[label s] (backends)]
+    (testing label
+      (is (= "gftdcojp/cloud-itonami" (:repo (store/activity s "act-archive"))))
+      (is (= "従業員ハンドブック" (:drive/title (store/file s "f-handbook"))))
+      (is (= "gftdcojp/cloud-itonami" (:tenant (store/file s "f-handbook"))))
+      (is (= "someone-else/other-repo" (:tenant (store/file s "f-rogue-tenant"))))
+      (is (= ["f-contract" "f-handbook" "f-rogue-tenant"] (mapv :drive/id (store/all-files s))))
+      (is (nil? (store/file s "f-missing")))
+      (is (nil? (store/activity s "act-missing")))
+      (is (nil? (store/draft-of s "f-handbook")))
+      (is (= "hr-onboarding" (:granted-by (store/grant-of s "alice" "f-handbook")))
+          "demo data pre-seeds alice as an already-known principal")
+      (is (nil? (store/grant-of s "alice" "f-contract")) "no grant yet on a DIFFERENT file")
+      (is (true? (store/principal-known? s "alice" "gftdcojp/cloud-itonami"))
+          "alice is known WITHIN the tenant her existing grant (f-handbook) belongs to")
+      (is (false? (store/principal-known? s "alice" "someone-else/other-repo"))
+          "alice's tenant-A grant must NOT vouch for her in an unrelated tenant B —
+           tenant-scoped share-requires-acl (the confirmed privilege-escalation-shaped
+           bug this scoping closes)")
+      (is (false? (store/principal-known? s "mallory-external" "gftdcojp/cloud-itonami"))
+          "an entirely unregistered principal is unknown by default"))))
+
+(deftest write-and-ledger-parity
+  (doseq [[label s] (backends)]
+    (testing label
+      (store/record-datom! s {:kind :draft :id "f-handbook"
+                              :value {:content {:drive/id "f-handbook"} :status :proposed :confidence 0.9}})
+      (is (= :proposed (:status (store/draft-of s "f-handbook"))))
+      (is (= 0.9 (:confidence (store/draft-of s "f-handbook"))))
+      (store/record-datom! s {:kind :draft :id "f-handbook" :value {:confidence 0.95}})
+      (is (= 0.95 (:confidence (store/draft-of s "f-handbook"))) "merge updates fields")
+      (is (= :proposed (:status (store/draft-of s "f-handbook"))) "merge preserves other fields")
+
+      (store/record-datom! s {:kind :grant :id (model/grant-id "bob" "f-contract")
+                              :value (model/grant "bob" "f-contract" {:granted-by "alice" :granted-at 1})})
+      (is (= #{:read} (:access (store/grant-of s "bob" "f-contract"))))
+      (is (true? (store/principal-known? s "bob" "gftdcojp/cloud-itonami"))
+          "bob's grant is on f-contract, which is in this tenant")
+
+      (store/append-ledger! s {:op :a :disposition :record})
+      (store/append-ledger! s {:op :b :disposition :commit})
+      (is (= [:record :commit] (mapv :disposition (store/ledger s)))))))
+
+(deftest seed-upserts-per-id-does-not-wipe-existing-files
+  (testing "seed! is an idempotent per-id upsert (Store protocol contract), NOT a
+            wholesale replace of :files/:activities/:grants — re-seeding with one new
+            entity must leave every previously-seeded entity untouched, on both backends
+            (the bug class teian.store's MemStore.seed! was fixed to avoid — see
+            docs/DESIGN.md)"
+    (doseq [[label s] (backends)]
+      (testing label
+        (is (= ["f-contract" "f-handbook" "f-rogue-tenant"] (mapv :drive/id (store/all-files s)))
+            "sanity: pre-seeded demo data present before either seed! call")
+        (store/seed! s {:files {"f-new-a" {:drive/id "f-new-a" :drive/kind :file
+                                           :drive/title "A" :tenant "gftdcojp/cloud-itonami"}}})
+        (is (= ["f-contract" "f-handbook" "f-new-a" "f-rogue-tenant"]
+               (mapv :drive/id (store/all-files s)))
+            "seeding with A must not drop f-handbook/f-contract/f-rogue-tenant")
+        (store/seed! s {:files {"f-new-b" {:drive/id "f-new-b" :drive/kind :file
+                                           :drive/title "B" :tenant "gftdcojp/cloud-itonami"}}})
+        (is (= ["f-contract" "f-handbook" "f-new-a" "f-new-b" "f-rogue-tenant"]
+               (mapv :drive/id (store/all-files s)))
+            "seeding with B must not drop f-handbook/f-contract/f-rogue-tenant/f-new-a")
+        ;; the grant ledger must survive the same per-id discipline: alice's
+        ;; pre-existing grant on f-handbook must never be wiped by re-seeding
+        ;; with an unrelated new grant.
+        (is (some? (store/grant-of s "alice" "f-handbook")) "sanity: pre-seeded grant present")
+        (store/seed! s {:grants {(model/grant-id "carol" "f-new-a")
+                                 (model/grant "carol" "f-new-a" {:granted-by "admin" :granted-at 1})}})
+        (is (some? (store/grant-of s "alice" "f-handbook"))
+            "seeding a new grant for carol must not drop alice's existing grant")
+        (is (some? (store/grant-of s "carol" "f-new-a")))))))
+
+(deftest datomic-empty-store-usable
+  (let [s (store/datomic-store)]
+    (is (nil? (store/file s "nope")))
+    (is (= [] (store/all-files s)))
+    (is (false? (store/principal-known? s "nobody" "t/t")))
+    (store/record-datom! s {:kind :file :id "x"
+                            :value {:drive/id "x" :drive/kind :file :drive/title "t"
+                                    :tenant "t/t"}})
+    (is (= "t" (:drive/title (store/file s "x"))))))
+
+(deftest datomic-ledger-append-does-not-lose-a-fact-when-two-writers-race
+  (testing "two append-ledger! callers who both read the same `(count (ledger s))`
+            before either transacts (the exact non-atomic read-modify-write
+            shape append-ledger! itself uses) must NOT collide into one
+            writer's fact silently overwriting the other's -- verified
+            against real langchain.db transact! semantics, not a stub"
+    (let [s (store/datomic-store)
+          n1 (count (store/ledger s))
+          n2 (count (store/ledger s))]
+      (is (= 0 n1 n2) "sanity: both writers observe the same pre-race count")
+      ((:transact! db/api) (:conn s) [{:ledger/fact (pr-str {:op :writer-A :disposition :commit})}])
+      ((:transact! db/api) (:conn s) [{:ledger/fact (pr-str {:op :writer-B :disposition :commit})}])
+      (is (= 2 (count (store/ledger s))) "both facts survive -- neither writer's append is lost")
+      (is (= #{:writer-A :writer-B} (set (map :op (store/ledger s))))))))

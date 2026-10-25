@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.shoko` | `kotoba.shoko/src` | `shoko.archiveport`, `shoko.cacao`, `shoko.cli`, `shoko.coordllm` (Kotoba project library) |
 | `kotoba.qaGovernor` | `kotoba.qaGovernor/src` | `qa-governor.collectors.clojure-project`, `qa-governor.collectors.clojure-project-shell`, `qa-governor.collectors.documentation`, `qa-governor.collectors.repo` (Kotoba project library) |
 | `kotoba.mailArchive` | `kotoba.mailArchive/src` | `mail-archive.auth`, `mail-archive.blob-store`, `mail-archive.datascript-store`, `mail-archive.ingest` (Kotoba project library) |
 | `kotoba.koyomi` | `kotoba.koyomi/src` | `koyomi.cacao`, `koyomi.cli`, `koyomi.coordllm`, `koyomi.distribute` (Kotoba project library) |
