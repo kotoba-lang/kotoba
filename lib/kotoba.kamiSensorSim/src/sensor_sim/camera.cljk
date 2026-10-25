@@ -1,0 +1,127 @@
+(ns sensor-sim.camera
+  "Pinhole camera — point projection + depth image rasterization.
+
+   Restored 1:1 from `camera.rs` (`kotoba-lang/kami-engine`'s deleted
+   `kami-sensor-sim` crate, removed in PR #82 \"Remove Rust workspace\"),
+   per ADR-2607010930 (`com-junkawasaki/root`).
+
+   Conventions mirror Isaac Sim / ROS / OpenCV:
+   - World frame: right-handed, gravity along -z.
+   - Camera frame: +x right, +y down, +z forward (OpenCV / Isaac Sim).
+   - Extrinsics: world->camera transform stored as an `affine3`
+     (see `sensor-sim.math`).
+   - Intrinsics: pinhole `(fx, fy, cx, cy)` + image size + (near, far) clip.
+
+   Output coordinates are integer pixel `(u, v)` with `u` = column
+   (left->right), `v` = row (top->bottom), matching standard image-buffer
+   indexing.
+
+   At R1.1 (the original crate's scope at deletion) the renderer is a
+   software splatter that projects discrete 3D points to a depth buffer (no
+   shading, no materials, no WGSL raster / ray-trace backend) -- exactly
+   what is ported here."
+  (:require [sensor-sim.math :as m]))
+
+;; ---------------------------------------------------------------------
+;; CameraIntrinsics
+;; ---------------------------------------------------------------------
+
+(defn camera-intrinsics-from-hfov
+  "Build intrinsics from a horizontal field of view (radians). Square pixels
+   assumed; cx/cy are taken at the image centre."
+  [width height hfov-rad]
+  (let [fx (/ (/ width 2.0) (Math/tan (/ hfov-rad 2.0)))]
+    {:fx fx
+     :fy fx
+     :cx (/ width 2.0)
+     :cy (/ height 2.0)
+     :width width
+     :height height
+     :near 0.05
+     :far 1000.0}))
+
+;; ---------------------------------------------------------------------
+;; DepthImage
+;; ---------------------------------------------------------------------
+
+(defn depth-image-empty
+  "Width x height float depth buffer in row-major order. `##Inf` = empty
+   pixel. Origin (0, 0) is the top-left."
+  [width height]
+  {:width width :height height :pixels (vec (repeat (* width height) ##Inf))})
+
+(defn depth-image-at [img u v]
+  (when-not (or (>= u (:width img)) (>= v (:height img)))
+    (nth (:pixels img) (+ (* v (:width img)) u))))
+
+(defn depth-image-populated-count
+  "Number of non-infinite pixels."
+  [img]
+  (count (filter m/finite? (:pixels img))))
+
+;; ---------------------------------------------------------------------
+;; Projection
+;; ---------------------------------------------------------------------
+
+;; {:u <int> :v <int> :depth <float>}
+
+;; ---------------------------------------------------------------------
+;; Camera
+;; ---------------------------------------------------------------------
+
+(defn camera-new
+  "Mirror of `isaacsim.sensors.Camera` (subset)."
+  [name prim-path intrinsics]
+  {:name name :prim-path prim-path :intrinsics intrinsics :view (m/affine3-identity)})
+
+(defn set-view
+  "Set the world->camera transform directly."
+  [camera view]
+  (assoc camera :view view))
+
+(defn look-at
+  "Set the camera pose from an eye position + look-at target + world-up.
+   Mirrors `isaacsim.core.api.Camera.set_world_pose(...)` + look-at helpers."
+  [camera eye target up]
+  ;; Camera forward (+z in OpenCV convention) points FROM camera TOWARD target.
+  (let [forward (m/v-normalize (m/v-sub target eye))
+        right (m/v-normalize (m/v-cross forward up))
+        new-up (m/v-cross right forward) ; already orthonormal
+        ;; OpenCV-style: x_cam = +right, y_cam = -world_up (image y is down),
+        ;; z_cam = +forward. Express world->camera as the rotation that maps
+        ;; those camera axes onto canonical basis vectors.
+        mat (m/mat3-transpose (m/mat3-from-cols right (m/v-negate new-up) forward))
+        t (m/v-negate (m/mat3-mul-vec3 mat eye))]
+    (assoc camera :view (m/affine3-from-mat3-translation mat t))))
+
+(defn project-world-point
+  "Project a single world-space point. Returns nil if the point is behind
+   the camera, outside the [near, far] clip range, or outside the image
+   rectangle."
+  [camera p-world]
+  (let [{:keys [fx fy cx cy width height near far]} (:intrinsics camera)
+        p-cam (m/affine3-transform-point3 (:view camera) p-world)
+        depth (m/vz p-cam)]
+    (when-not (or (<= depth near) (>= depth far))
+      (let [u-f (+ (* fx (/ (m/vx p-cam) depth)) cx)
+            v-f (+ (* fy (/ (m/vy p-cam) depth)) cy)]
+        (when (and (m/finite? u-f) (m/finite? v-f) (>= u-f 0.0) (>= v-f 0.0))
+          (let [u (long (Math/floor u-f))
+                v (long (Math/floor v-f))]
+            (when-not (or (>= u width) (>= v height))
+              {:u u :v v :depth depth})))))))
+
+(defn render-points-to-depth-image
+  "Rasterize a point cloud into a depth image (z-buffer, nearest wins)."
+  [camera points]
+  (let [{:keys [width height]} (:intrinsics camera)]
+    (reduce
+     (fn [img p]
+       (if-let [{:keys [u v depth]} (project-world-point camera p)]
+         (let [idx (+ (* v width) u)]
+           (if (< depth (nth (:pixels img) idx))
+             (update img :pixels assoc idx depth)
+             img))
+         img))
+     (depth-image-empty width height)
+     points)))

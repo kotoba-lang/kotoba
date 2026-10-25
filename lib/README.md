@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kamiSensorSim` | `kotoba.kamiSensorSim/src` | `sensor-sim`, `sensor-sim.camera`, `sensor-sim.contact`, `sensor-sim.imu` (Kotoba project library) |
 | `kotoba.kamiSceneContracts` | `kotoba.kamiSceneContracts/src` | `kami.scene.authority-manifest`, `kami.scene.contracts`, `kami.scene.fixture-sync`, `kami.scene.mirror-check` (Kotoba project library) |
 | `kotoba.kamiOngakuProject` | `kotoba.kamiOngakuProject/src` | `kami.ongaku.project` (Kotoba project library) |
 | `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
