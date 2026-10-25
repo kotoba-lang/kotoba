@@ -1,0 +1,559 @@
+(ns torihiki-terminal.view
+  "The terminal, as pure hiccup.
+
+  Built on the paved road: this ns requires `kotoba-ui.core` and nothing below
+  it, writes no raw hex outside the one theme map, takes every type size from the eleven HIG text styles, and builds
+  its layout from shell rather than from hand-written CSS. The app stylesheet
+  below is the deliberate remainder — a trading terminal needs tabular
+  numerals and a depth bar, and neither is a design-system concept.
+
+  `appkit` would be the right platform layer for a dense desktop terminal, and
+  it is not required here because it cannot be: its production `:deps` names
+  kotoba-ui as `{:local/root \"../kotoba-ui\"}`, so any consumer depending on
+  appkit through git fails to build a classpath (`Local lib
+  io.github.kotoba-lang/kotoba-ui not found: .../appkit/kotoba-ui`). The repo
+  already carries a `:local` alias holding exactly that override, which is
+  where a sibling path belongs. Filed rather than worked around silently."
+  (:require [kotoba.lang.text :as str]
+            [kotoba-ui.core :as ui]
+            [torihiki-chart.candle :as tc]
+            [torihiki-chart.depth :as td]
+            [torihiki-chart.view :as tcv]
+            [torihiki-terminal.config :as cfg]
+            [torihiki-terminal.skin :as skin]))
+
+(def theme
+  "The only place a hex color is legitimate in app code (agent-guide rule 5)."
+  {:accent "#3DD8B6" :accent-dark "#3DD8B6" :appearance :dark})
+
+;; ── formatting ──────────────────────────────────────────────────────────────
+;;
+;; Integer in, string out. The engine speaks ticks and lots; a human reads
+;; dollars and coins. Doing the conversion here — once, at the edge — is what
+;; keeps `torihiki.fixed`'s no-floating-point rule intact everywhere behind it.
+
+(defn- pad-left [s n ch] (str (apply str (repeat (max 0 (- n (count s))) ch)) s))
+
+(defn usd
+  "Price ticks → dollars. One tick is ten cents."
+  [ticks]
+  (let [cents (* ticks cfg/tick-usd-cents)
+        d (quot cents 100)
+        c (rem cents 100)
+        s (str d)
+        grouped (->> (reverse s)
+                     (partition-all 3)
+                     (map #(apply str (reverse %)))
+                     reverse
+                     (str/join ","))]
+    (str grouped "." (pad-left (str c) 2 "0"))))
+
+(defn coins
+  "Lots → units, three decimals."
+  [lots]
+  (let [neg? (neg? lots)
+        a (if neg? (- lots) lots)]
+    (str (when neg? "-") (quot a cfg/lots-per-unit) "."
+         (pad-left (str (rem a cfg/lots-per-unit)) 3 "0"))))
+
+(defn dollars
+  "Collateral and equity are in cents; `usd` takes ticks. Converting at the
+  call site is how the two got mixed up once already — the panel showed a
+  balance ten times too large and looked entirely plausible."
+  [cents]
+  (usd (quot cents cfg/tick-usd-cents)))
+
+(defn signed-usd [cents]
+  (str (if (neg? cents) "-" "+") "$" (usd (Math/abs (long (quot cents cfg/tick-usd-cents))))))
+
+(defn rate-pct
+  "A rate in torihiki.fixed's 1e9 scale → percent with four decimals."
+  [r]
+  (let [bp (quot (* r 1000000) 1000000000)]
+    (str (if (neg? r) "" "+") (/ (double bp) 10000.0) "%")))
+
+;; ── panels ──────────────────────────────────────────────────────────────────
+
+(defn- book-row [{:keys [level qty cum]} side max-cum]
+  [:div {:class (str "tk-row tk-row--" (name side))
+         :data-level level}
+   [:span {:class "tk-bar"
+           :style {:width (str (min 100 (quot (* 100 cum) (max 1 max-cum))) "%")}}]
+   [:span {:class "tk-px"} (usd level)]
+   [:span {:class "tk-sz"} (coins qty)]
+   [:span {:class "tk-cum"} (coins cum)]])
+
+(defn spread-label
+  "What sits beside the last price: the spread when both sides quote, and
+  which side is missing when one does not. This used to read \"spread\"
+  under the last price whatever the book held, so a one-sided book looked
+  like a $99 spread."
+  [bids asks]
+  (let [bid (:level (first bids)) ask (:level (first asks))]
+    (cond (and bid ask (<= ask bid)) "last · crossed book"
+          (and bid ask) (str "last · spread $" (usd (- ask bid)))
+          bid "last · no asks"
+          ask "last · no bids"
+          :else "last · empty book")))
+
+(defn order-book
+  "Panel body. The client re-renders this exact function and swaps the result
+  into `#tk-book-panel`, so the server and the browser never disagree about
+  what a row looks like."
+  [frame]
+  (let [{:keys [bids asks]} frame
+        max-cum (max 1 (apply max 1 (map :cum (concat bids asks))))]
+    (ui/panel
+     [[:div {:class "tk-panel-head"}
+       [:span {:class "hig-headline"} "Order book"]
+       [:span {:class "hig-caption2 tk-dim"} "price / size / total"]]
+      [:div {:class "tk-col-head hig-caption2 tk-dim"}
+       [:span "Price (USD)"] [:span "Size (BTC)"] [:span "Total"]]
+      [:div {:id "tk-asks" :class "tk-side tk-side--ask"}
+       (map #(book-row % :ask max-cum) (reverse asks))]
+      [:div {:id "tk-spread" :class "tk-spread"}
+       [:span {:class "hig-title3 tk-last"} (str "$" (usd (:last frame)))]
+       [:span {:class "hig-caption1 tk-dim"} (spread-label bids asks)]]
+      [:div {:id "tk-bids" :class "tk-side tk-side--bid"}
+       (map #(book-row % :bid max-cum) bids)]]
+     {:class "tk-book"})))
+
+(defn trades-panel [frame]
+  (ui/panel
+   [[:div {:class "tk-panel-head"}
+     [:span {:class "hig-headline"} "Trades"]
+     [:span {:class "hig-caption2 tk-dim"} "engine fills"]]
+    [:div {:class "tk-col-head hig-caption2 tk-dim"}
+     [:span "Price"] [:span "Size"] [:span "Block"]]
+    [:div {:id "tk-trades" :class "tk-side"}
+     (for [t (:trades frame)]
+       [:div {:class (str "tk-row tk-row--" (if (zero? (:side t)) "bid" "ask"))}
+        [:span {:class "tk-px"} (usd (:level t))]
+        [:span {:class "tk-sz"} (coins (:qty t))]
+        ;; The block, not a time. It used to arrive as `(* 1000 h)` and be
+        ;; divided back here — a round trip through milliseconds that do not
+        ;; exist, since the engine has no wall clock.
+        [:span {:class "tk-cum"} (:h t)]])]]
+   {:class "tk-trades"}))
+
+(defn chart-panel
+  "Block candles and the depth of the book.
+
+  **The x axis is block height, not time.** The engine has no wall clock —
+  logical time arrives in the block header — so a fill carries `:h` and
+  nothing else to order it by. Drawing these as if they were evenly spaced
+  minutes would be inventing a fact the chain does not have, and a block's
+  real duration is not constant: a view change or a Durable Object eviction
+  stretches it. The labels read `#4218` for that reason; `12:04` would look
+  like a clock.
+
+  The span is chosen from the tape's own height range rather than fixed,
+  because the tape is bounded by COUNT (200 fills) and so the range it covers
+  depends on how busy the book is — quiet, 200 fills span thousands of blocks;
+  busy, a few dozen.
+
+  When there are no fills this says so instead of drawing an empty frame. An
+  empty frame does not read as \"no data\", it reads as \"no price\"."
+  [frame]
+  (let [tape (:trades frame)
+        ;; The chain's candles when it has them, the tape's when it does not.
+        ;;
+        ;; Folding the tape was the only option while `/candles` lived on the
+        ;; sequencer and this page read the validators — so the chart could
+        ;; never show more than the tape's 200 fills, which on a busy book is
+        ;; a few dozen blocks. Both paths use the same fold, so the picture
+        ;; does not change shape when the source does; only how far back it
+        ;; reaches.
+        from-chain (seq (:candles frame))
+        ;; One span rule for both sources: the height range the data covers,
+        ;; divided into about 48 candles, rounded onto the 1/2/5×10^k ladder
+        ;; so the boundaries stop moving when one more fill arrives.
+        span (tc/auto-span 48 (or from-chain tape))
+        candles (if from-chain
+                  (tc/rebucket span from-chain)
+                  (tc/candles span tape))]
+    (ui/panel
+     [[:div {:class "tk-panel-head"}
+       [:span {:class "hig-headline"} "Chart"]
+       [:span {:class "hig-caption2 tk-dim"}
+        (if (seq candles)
+          (str span " block" (when (> span 1) "s") " per candle"
+               (when from-chain " · from the chain"))
+          "block candles")]]
+      (if-let [svg (tcv/candle-chart {:candles candles
+                                      :tick-cents cfg/tick-usd-cents
+                                      :height 260})]
+        [:div {:class "tk-chart"} svg]
+        [:p {:class "hig-footnote tk-dim"} "No fills on the chain yet."])
+      [:div {:class "tk-panel-head tk-chart-sub"}
+       [:span {:class "hig-caption2 tk-dim"} "Book depth"]
+       [:span {:class "hig-caption2 tk-dim"} "cumulative, from the node"]]
+      (if-let [svg (td/depth-chart {:bids (:bids frame) :asks (:asks frame)
+                                    :tick-cents cfg/tick-usd-cents
+                                    :height 140})]
+        [:div {:class "tk-chart"} svg]
+        [:p {:class "hig-footnote tk-dim"} "The book is empty."])]
+     {:class "tk-chart-panel"})))
+
+(defn order-entry []
+  (ui/panel
+   [[:div {:class "tk-panel-head"} [:span {:class "hig-headline"} "Place order"]]
+    (ui/stack
+     {:gap :3}
+     (ui/stack {:direction :horizontal :gap :2}
+               (ui/button "Buy / Long" {:act :buy :class "tk-buy"})
+               (ui/button "Sell / Short" {:act :sell :class "tk-sell"}))
+     (ui/text-field {:id "tk-price" :placeholder "Limit price (ticks)"
+                     :aria-label "Limit price" :inputmode "numeric"})
+     (ui/text-field {:id "tk-size" :placeholder "Size (lots)"
+                     :aria-label "Size" :inputmode "numeric"})
+     (ui/stack {:direction :horizontal :gap :2}
+               ;; chip carries no :id, so these are found by their act —
+               ;; adding an :id it drops would look wired and would not be
+               (ui/chip "Post only" {:act :flag-post})
+               (ui/chip "IOC" {:act :flag-ioc})
+               (ui/chip "Reduce only" {:act :flag-ro}))
+     ;; Says what happened to the last transaction, including why it was
+     ;; refused. A form that silently does nothing on a rejection teaches the
+     ;; trader that the button is broken, which is the wrong lesson when the
+     ;; chain gave a reason.
+     [:p {:id "tk-order-status" :class "hig-footnote tk-dim"}
+      "No order submitted yet."]
+     (ui/divider)
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Max leverage"] [:span (str cfg/max-leverage "x")]]
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Taker / maker fee"] [:span "3.5 bp / 1.0 bp"]]
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Maintenance margin"] [:span "1.25%"]])]
+   {:class "tk-entry"}))
+
+(defn session-panel
+  "The account this browser trades as, and where its collateral came from.
+
+  There is no wallet to connect. The key is generated here and stays here, and
+  the collateral is minted by asking — on a devnet with no bridge, that is
+  what a deposit is. Both facts are on the panel rather than in a document,
+  because the panel is what somebody about to trade actually reads."
+  []
+  (ui/panel
+   [[:div {:class "tk-panel-head"} [:span {:class "hig-headline"} "Session"]]
+    (ui/stack
+     {:gap :2}
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Account"] [:span {:id "tk-account" :class "tk-px"} "—"]]
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Collateral"] [:span {:id "tk-collateral" :class "tk-px"} "—"]]
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Free"] [:span {:id "tk-free" :class "tk-px"} "—"]]
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Next nonce"] [:span {:id "tk-nonce" :class "tk-px"} "—"]]
+     ;; The balance proved, not reported: a root more than 2/3 of the set
+     ;; signed, and this account's own leaf under it (`torihiki.light`).
+     [:div {:class "tk-kv hig-footnote"}
+      [:span "Proved"] [:span {:id "tk-verified" :class "tk-px"} "checking…"]]
+     (ui/button "Deposit 100,000 test USD" {:act :faucet :class "tk-faucet"})
+     [:p {:id "tk-session-note" :class "hig-caption2 tk-dim"}
+      "Session key generated in this browser and kept in local storage. Not a
+       wallet: it holds nothing outside this devnet, and clearing site data
+       destroys it. On a devnet without a bridge, a deposit is this key
+       crediting itself, and the node says so (`/head` :collateral is
+       \"unbacked\"). A chain in bridge mode refuses it: collateral there comes
+       only from the bridge contract."])]
+   {:class "tk-session"}))
+
+(defn positions-panel [frame]
+  (let [{:keys [size entry upnl]} (:position frame)]
+    (ui/panel
+     [[:div {:class "tk-panel-head"} [:span {:class "hig-headline"} "Position"]]
+      (if (zero? size)
+        [:p {:class "hig-footnote tk-dim"} "No open position."]
+        [:div {:class "tk-postable"}
+         [:div {:class "tk-col-head hig-caption2 tk-dim"}
+          [:span "Side"] [:span "Size"] [:span "Entry"] [:span "Unrealized"]]
+         [:div {:class "tk-row"}
+          [:span {:class (if (pos? size) "tk-up" "tk-down")}
+           (if (pos? size) "LONG" "SHORT")]
+          [:span {:id "tk-pos-size" :class "tk-px"} (coins (abs size))]
+          [:span {:id "tk-pos-entry" :class "tk-px"} (str "$" (usd entry))]
+          [:span {:id "tk-pos-upnl"
+                  :class (str "tk-px " (if (neg? upnl) "tk-down" "tk-up"))}
+           (signed-usd upnl)]]])]
+     {:class "tk-positions"})))
+
+(def roadmap-url
+  "https://github.com/kotoba-lang/torihiki/blob/main/docs/decentralization-roadmap.md")
+
+(defn path-label
+  "What the node this page reads says it is, in one line.
+
+  Taken from the node's own `/head`, never assumed from which URL was
+  configured: this panel read \"sequencer\" as a constant while the page was
+  pointed at the validators, and the constant was the only thing on the
+  screen answering the question. `:decentralization` is the current field
+  (torihiki-node.claims); `:consensus` is what a sequencer older than it
+  says; a validator older than both says neither, but it names a witness."
+  [head]
+  (or (get-in head [:decentralization :summary])
+      (when-let [c (:consensus head)] (str "devnet, single operator — " c))
+      (when (:witness head)
+        "devnet, single operator — BFT validator set whose keys one party holds")
+      "unknown — the node does not say what it is"))
+
+(defn stalled?
+  "True when the height has not moved for `threshold-ms`. A chain that stopped
+  answers `/head` exactly as a live one does, with an old height in it, and a
+  status line reading \"live\" over it invites a trade nothing will execute."
+  [{:keys [height at]} now-ms threshold-ms]
+  (boolean (and height at (>= (- now-ms at) threshold-ms))))
+
+(defn chain-panel [frame meta*]
+  (ui/panel
+   [[:div {:class "tk-panel-head"}
+     [:span {:class "hig-headline"} "Chain"]
+     [:span {:id "tk-path" :class "hig-caption2 tk-dim"} "asking the node what it is…"]]
+    [:div {:class "tk-kv hig-footnote"}
+     [:span "Block"] [:span {:id "tk-height" :class "tk-px"} (:height frame)]]
+    [:div {:class "tk-kv hig-footnote"}
+     [:span "Resting orders"] [:span {:id "tk-resting" :class "tk-px"} (:resting frame)]]
+    [:div {:class "tk-kv hig-footnote"}
+     [:span "Funding (1h)"] [:span {:id "tk-funding" :class "tk-px"} (rate-pct (:funding frame))]]
+    [:div {:class "tk-kv hig-footnote"}
+     [:span "Oracle"] [:span {:id "tk-oracle" :class "tk-px"} (str "$" (usd (:oracle frame)))]]
+    [:p {:class "hig-caption2 tk-dim"}
+     "Margin and liquidation read the MARK, never the last print. The mark is "
+     "the oracle plus a banded, size-weighted book premium — one lot lifted "
+     "through a thin book cannot move it, which is otherwise a way to "
+     "liquidate other people."]
+    [:p {:class "hig-caption2 tk-dim tk-root"}
+     "state root " [:code {:id "tk-root"} (subs (:root frame) 0 32)]]
+    [:p {:class "hig-caption2 tk-dim"}
+     "SHA-256 over a canonical encoding of the live state. A validator replays "
+     "the block and recomputes this; if it differs, whoever produced it lied."]]
+   {:class "tk-chain"}))
+
+;; ── the page ────────────────────────────────────────────────────────────────
+
+(defn ticker-body
+  "The ticker's contents, without its container — the client swaps this into
+  `#tk-ticker` rather than replacing the container it is mounted in."
+  [frame]
+  (list
+   ;; The market picker. A select rather than tabs: the number of markets is
+   ;; not fixed — `/markets` says what is listed and a market can be listed on
+   ;; a running chain — so a control whose size is the market count would grow
+   ;; through the header the day somebody lists a third.
+   ;;
+   ;; The label was the literal string `BTC-PERP` while the chain ran two
+   ;; markets, which is the same class of error as a position panel showing
+   ;; zeros it never asked about: a plausible number nobody supplied.
+   ;; The picker is rendered FROM THE FRAME, not written into by the client.
+   ;;
+   ;; It was a fixed `<option>` that the client rewrote after each fetch, and
+   ;; that never survived: this whole body is swapped on every tick, so the
+   ;; client's options were replaced by the fixed one a moment later. The
+   ;; symptom was a picker that offered both markets, accepted a choice, and
+   ;; snapped back — a control that looks wired and is not.
+   ;;
+   ;; A select rather than tabs because the number of markets is not fixed:
+   ;; `/markets` says what is listed and a market can be listed while the page
+   ;; is open, so a control sized by the market count would grow through the
+   ;; header the day somebody lists a third.
+   [:div {:class "tk-mkt"}
+    [:select {:id "tk-market" :class "hig-headline tk-mkt-pick"
+              :aria-label "Market"}
+     (for [m (or (seq (:markets frame)) [{:id (:market frame 1) :symbol "…"}])]
+       [:option (cond-> {:value (str (:id m))}
+                  (= (:id m) (:market frame 1)) (assoc :selected "selected"))
+        (or (:symbol m) (str "MKT-" (:id m)))])]
+    [:span {:class "hig-caption2 tk-dim"} "torihiki"]]
+   [:div {:class "tk-stat"}
+    [:span {:class "hig-caption2 tk-dim"} "Last"]
+    [:span {:id "tk-last" :class "hig-title3 tk-px"} (str "$" (usd (:last frame)))]]
+   [:div {:class "tk-stat"}
+    [:span {:class "hig-caption2 tk-dim"} "Mark"]
+    [:span {:class "hig-body tk-px" :id "tk-mark"} (str "$" (usd (:mark frame)))]]
+   [:div {:class "tk-stat"}
+    [:span {:class "hig-caption2 tk-dim"} "Oracle"]
+    [:span {:class "hig-body tk-px" :id "tk-oracle2"} (str "$" (usd (:oracle frame)))]]
+   [:div {:class "tk-stat"}
+    [:span {:class "hig-caption2 tk-dim"} "Block"]
+    [:span {:id "tk-height2" :class "hig-body tk-px"} (:height frame)]]))
+
+(defn ticker [frame]
+  [:div {:id "tk-ticker" :class "tk-ticker"} (ticker-body frame)])
+
+(defn view
+  "`deploy` is what the build pinned (`torihiki-terminal.deploy/from-env`);
+  without it, the local defaults in `config`."
+  [{:keys [frames meta deploy]}]
+  (let [f (first frames)
+        {:keys [nodes set epoch chain]} (or deploy {:nodes cfg/node-urls})]
+    (ui/app-shell
+     {:nav (ui/nav-bar "torihiki"
+                       {:trailing [(ui/button "GitHub" {:act :gh})]})
+      :sidebar [(session-panel)
+                (order-entry)
+                [:div {:id "tk-positions-panel"} (positions-panel f)]]
+      :id "tk-root"
+      :attrs (cond-> {:data-nodes (str/join "," nodes)}
+               (seq set) (assoc :data-set set :data-epoch (str epoch) :data-chain chain))}
+     [:div {:class "tk-live"}
+      [:span {:id "tk-status" :class "hig-caption2 tk-dim"} "connecting to the node…"]]
+     (ticker f)
+     [:div {:id "tk-chart-panel"} (chart-panel f)]
+     [:div {:class "tk-grid"}
+      [:div {:id "tk-book-panel"} (order-book f)]
+      (ui/stack {:gap :3}
+                [:div {:id "tk-trades-panel"} (trades-panel f)]
+                [:div {:id "tk-chain-panel"} (chain-panel f meta)])]
+     (ui/section
+      {:title "What you are looking at" :wide true}
+      [:p {:class "hig-body"}
+       "Every number on this page comes from "
+       [:a {:href "https://github.com/kotoba-lang/torihiki"} "torihiki"]
+       ", an open reimplementation of the exchange state machine that "
+       "Hyperliquid keeps closed, running on "
+       [:a {:href "https://github.com/kotoba-lang/torihiki-node"} "ordinary torihiki nodes"]
+       " — plain processes on any host. The page reads several of them, compares "
+       "what they say, and proves this session's balance against a state root "
+       "more than two thirds of the validator set signed: prices are integer "
+       "ticks, matching is price-time priority, and the roots are SHA-256 over a "
+       "canonical encoding."]
+      [:p {:class "hig-body"}
+       [:strong "It is a devnet run by one operator, not a decentralized exchange."]
+       " The page reads a four-replica BFT validator set, and all four keys are "
+       "held by the same party, so a quorum of them is one party's word. "
+       "Collateral is a faucet grant and nothing can be withdrawn to another "
+       "chain. The node says which of these it is in its own "
+       [:code "/head"] " response, and the Chain panel shows that answer. What "
+       "it cannot do is lie undetectably — every block can be replayed against "
+       "the same engine and its state root contradicted. What has to happen "
+       "before any of this changes is in the "
+       [:a {:href roadmap-url} "decentralization roadmap"] "."]
+      [:p {:class "hig-body"}
+       "This page renders with the same pure functions that render it on the "
+       "server, so the browser and the node never disagree about what a row "
+       "looks like. When the node is unreachable it says so above rather than "
+       "freezing on the last good frame — a terminal that silently shows "
+       "stale prices invites a trade."]
+      (ui/grid
+       {:min "230px"}
+       (ui/panel [[:h3 {:class "hig-headline"} "604 ms per block"]
+                  [:p {:class "hig-footnote tk-dim"}
+                   "Measured on this deployment: 1.66 blocks/sec, and 2.6 "
+                   "seconds from submitting an order to seeing it. Hyperliquid "
+                   "publishes a median around 0.07 s, so this is roughly "
+                   "forty times slower end to end."]])
+       (ui/panel [[:h3 {:class "hig-headline"} "Engine: not what we claimed"]
+                  [:p {:class "hig-footnote tk-dim"}
+                   "This panel used to read \"3,155,313 ops/sec — 15.8x "
+                   "HyperCore\". That number does not reproduce: the same "
+                   "benchmark on the same code measured 5,639 and 25,314 "
+                   "ops/sec on two runs of a loaded machine. Until it is "
+                   "measured somewhere quiet, the claim is withdrawn rather "
+                   "than restated with a smaller number."]])
+       (ui/panel [[:h3 {:class "hig-headline"} "One operator, not consensus"]
+                  [:p {:class "hig-footnote tk-dim"}
+                   "Four replicas vote, and one party holds all four keys. "
+                   "Every decentralization flag the node serves is false "
+                   "until its gate passes in production. The log is "
+                   "checkable by replay, which is a different guarantee from "
+                   "tamper-evidence and the stronger one."]])
+       (ui/panel [[:h3 {:class "hig-headline"} "Signed, replay-proof"]
+                  [:p {:class "hig-footnote tk-dim"}
+                   "Every transaction carries an Ed25519 signature over the "
+                   "chain id, the account, a strictly sequential nonce and "
+                   "every field. Reusing a nonce is refused; signing someone "
+                   "else's account is refused."]])
+       (ui/panel [[:h3 {:class "hig-headline"} "No floating point"]
+                  [:p {:class "hig-footnote tk-dim"}
+                   "Every value is an integer inside the range both the JVM and "
+                   "JS represent exactly, so two validators cannot disagree in "
+                   "the last bit."]]))))))
+
+(def app-css
+  "Unlayered, so it wins over the library layers without any specificity
+  fight (agent-guide rule 3). Confined to what a design system has no opinion
+  about: tabular numerals and a depth bar.
+
+  ## Three of these tokens did not exist
+
+  `--hig-label-secondary`, `--hig-color-accent` and `--hig-radius-1` are not
+  names `shitsuke.hig` emits — the real ones are `--hig-color-secondary-label`,
+  `--hig-color-tint` and `--hig-radius-xs`. An undefined custom property does
+  not fall back, it makes the whole declaration invalid, so `.tk-dim` had no
+  colour of its own, an active flag chip showed no outline, and book rows had
+  square corners. All three looked like design choices.
+
+  Found by checking every token this file uses against
+  `jp-go-dds.tokens/bridged?` while adding the DADS skin — the swap needed to
+  know which tokens had to survive it, and three of them were already gone."
+  "
+.tk-px,.tk-sz,.tk-cum{font-variant-numeric:tabular-nums;font-feature-settings:'tnum'}
+.tk-dim{color:var(--hig-color-secondary-label)}
+.tk-up{color:var(--hig-palette-green)}
+.tk-down{color:var(--hig-palette-red)}
+.tk-live{padding-top:var(--hig-spacing-2)}
+.tk-ticker{display:flex;flex-wrap:wrap;gap:var(--hig-spacing-6);align-items:baseline;
+  padding:var(--hig-spacing-4) 0}
+.tk-mkt-pick{background:transparent;border:0;color:inherit;font:inherit;
+  padding:0;cursor:pointer;-webkit-appearance:none;appearance:none;
+  /* the caret would be the only chrome in a header that has none */
+  max-width:14ch;text-overflow:ellipsis}
+.tk-mkt-pick:focus-visible{outline:2px solid var(--hig-color-accent);
+  outline-offset:2px}
+.tk-stat,.tk-mkt{display:flex;flex-direction:column;gap:var(--hig-spacing-1);min-width:0}
+.tk-grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);
+  gap:var(--hig-spacing-4);align-items:start}
+@media (max-width:820px){.tk-grid{grid-template-columns:minmax(0,1fr)}}
+.tk-panel-head{display:flex;justify-content:space-between;align-items:baseline;
+  gap:var(--hig-spacing-3);margin-bottom:var(--hig-spacing-2)}
+.tk-col-head,.tk-row{display:grid;grid-template-columns:1fr 1fr 1fr;
+  gap:var(--hig-spacing-2);padding:2px var(--hig-spacing-2)}
+.tk-postable .tk-col-head,.tk-postable .tk-row{grid-template-columns:1fr 1fr 1fr 1fr}
+.tk-chip-on{outline:2px solid var(--hig-color-accent);outline-offset:-2px}
+.tk-row{position:relative;border-radius:var(--hig-radius-xs)}
+.tk-row>span{position:relative;z-index:1;text-align:right;min-width:0}
+.tk-row>span:first-of-type{text-align:left}
+.tk-bar{position:absolute;inset:0 auto 0 0;z-index:0;border-radius:inherit;opacity:.16}
+.tk-row--bid .tk-bar{background:var(--hig-palette-green)}
+.tk-row--ask .tk-bar{background:var(--hig-palette-red)}
+.tk-row--bid .tk-px{color:var(--hig-palette-green)}
+.tk-row--ask .tk-px{color:var(--hig-palette-red)}
+.tk-spread{display:flex;justify-content:space-between;align-items:baseline;
+  padding:var(--hig-spacing-2);margin:var(--hig-spacing-1) 0}
+.tk-kv{display:flex;justify-content:space-between;gap:var(--hig-spacing-3)}
+.tk-root code{word-break:break-all}
+.tk-chart{width:100%;overflow-x:auto}
+.tk-chart svg{display:block;width:100%;height:auto}
+.tk-chart-sub{margin-top:var(--hig-spacing-3)}
+")
+
+(defn render-page
+  "`dds-css` is the vendored デジタル庁 stylesheet, read by the caller. Passing
+  it in keeps this namespace free of I/O so the browser build can require it."
+  [session dds-css]
+  (ui/->page {:title "torihiki — BTC-PERP"
+              :description
+              "An open reimplementation of Hyperliquid's closed HyperCore: order book, clearinghouse, funding and liquidation as one deterministic state machine."
+              :theme theme
+              ;; The bundle. Without this the page is a picture of a
+              ;; terminal: every panel keeps the zero frame the build rendered
+              ;; and the status line reads "connecting to the node…" forever,
+              ;; which is exactly what a page loading slowly looks like.
+              ;;
+              ;; It was missing for the whole life of the "live client" — the
+              ;; client was written, compiled, deployed to /js/app.js, and
+              ;; never referenced from the document. Nothing catches that: the
+              ;; build succeeds, the bundle exists, the HTML validates, and the
+              ;; design audit scores a page that does nothing.
+              ;; Order matters and is one-way: the skin redefines `--hig-*`
+              ;; onto DADS primitives, and `app-css` reads them. Emitting the
+              ;; app first would have it read the values the skin is about to
+              ;; replace — which produces a page that is correct on reload and
+              ;; wrong on first paint, the worst of the two.
+              :head [[:style [:hiccup/raw (skin/skin-css dds-css)]]
+                     [:style app-css]
+                     [:script {:type "module" :src "/js/app.js" :defer true}]]}
+             (view session)))

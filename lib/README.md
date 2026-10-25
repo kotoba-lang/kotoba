@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.torihikiTerminal` | `kotoba.torihikiTerminal/src` | `torihiki-terminal.client`, `torihiki-terminal.config`, `torihiki-terminal.deploy`, `torihiki-terminal.keys` (Kotoba project library) |
 | `kotoba.diskspace` | `kotoba.diskspace/src` | `` (Kotoba project library) |
 | `kotoba.mesh` | `kotoba.mesh/src` | `kotoba.mesh.kotoba-oracle`, `kotoba.mesh.node` (Kotoba project library) |
 | `kotoba.stripeOps` | `kotoba.stripeOps/src` | `stripe-ops.advisor`, `stripe-ops.governor`, `stripe-ops.model`, `stripe-ops.operation` (Kotoba project library) |
