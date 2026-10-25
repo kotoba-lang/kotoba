@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.comProfibusProfinet` | `kotoba.comProfibusProfinet/src` | `profinet.dcp`, `profinet.ethernet`, `profinet.rt` (Kotoba project library) |
 | `kotoba.comNvidiaIsaacSim` | `kotoba.comNvidiaIsaacSim/src` | `genesis`, `genesis.articulation3d`, `genesis.batched`, `genesis.cartpole` (Kotoba project library) |
 | `kotoba.comMetaWebhook` | `kotoba.comMetaWebhook/src` | `meta-webhook.async-signature`, `meta-webhook.handshake`, `meta-webhook.instagram-client`, `meta-webhook.instagram-events` (Kotoba project library) |
 | `kotoba.comMattermost` | `kotoba.comMattermost/src` | `mattermost.client` (Kotoba project library) |
