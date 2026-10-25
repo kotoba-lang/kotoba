@@ -1,0 +1,367 @@
+(ns kami.contract-test
+  "GPU-free, Datomic-free contract tests for the pure core: scene → ECS →
+  render-IR → KAMI columnar packing, plus WGSL emission and matrix math.
+  These pin the clj ↔ Rust contracts (ARCHITECTURE.md §7/§9) so they can be
+  validated long before a GPU is wired up."
+  (:require [kotoba.test :refer [deftest testing is]]
+            #?(:clj [kotoba.lang.edn :as edn])
+            #?(:clj [kotoba.io :as io])
+            [kami.scene  :as scene]
+            [kami.ecs    :as ecs]
+            [kami.render :as render]
+            [kami.render.authority :as authority]
+            [kami.ipc    :as ipc]
+            [kami.wgsl-emit   :as wgsl]
+            [kami.postfx :as postfx]
+            [kami.physics-compute :as physics]
+            [kami.fsm    :as fsm]
+            [kami.math   :as m]))
+
+;; --- fixtures ---------------------------------------------------------------
+
+(def cam-eid #uuid "00000000-0000-0000-0000-0000000000ca")
+(def tree-a  #uuid "00000000-0000-0000-0000-00000000000a")
+(def tree-b  #uuid "00000000-0000-0000-0000-00000000000b")
+
+(def assets
+  [{:asset/id "mesh/conifer" :asset/kind :mesh     :asset/uri "b2://m/conifer"}
+   {:asset/id "mat/bark"     :asset/kind :material :asset/uri "b2://m/bark"}])
+
+(def entities
+  [{:kami/eid cam-eid :kami/name "cam" :camera/active? true :camera/fov 60.0
+    :camera/near 0.1 :camera/far 100.0 :transform/translation [0.0 0.0 5.0]}
+   {:kami/eid tree-a :kami/name "tree-a" :transform/translation [-2.0 0.0 0.0]
+    :mesh/asset [:asset/id "mesh/conifer"] :material/asset [:asset/id "mat/bark"]}
+   {:kami/eid tree-b :kami/name "tree-b" :transform/translation [2.0 0.0 0.0]
+    :mesh/asset [:asset/id "mesh/conifer"] :material/asset [:asset/id "mat/bark"]}])
+
+(def snap (scene/build-snapshot entities assets {:t 1 :scene "test" :env {}}))
+
+;; --- scene ------------------------------------------------------------------
+
+(deftest scene-add-entity
+  (testing "unknown attrs rejected"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scene/add-entity {:bogus/attr 1}))))
+  (testing "auto eid"
+    (is (uuid? (-> (scene/add-entity {:kami/name "x"}) first :kami/eid)))))
+
+(deftest scene-valid
+  (testing "well-formed snapshot validates"
+    (is (true? (scene/valid? snap))))
+  (testing "dangling asset ref caught"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scene/valid?
+                  (scene/build-snapshot
+                   [{:kami/eid tree-a :mesh/asset [:asset/id "missing"]}] [] {})))))
+  (testing "two active cameras caught"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scene/valid?
+                  (scene/build-snapshot
+                   [{:kami/eid cam-eid :camera/active? true}
+                    {:kami/eid tree-a :camera/active? true}] [] {})))))
+  (testing "parent cycle caught"
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (scene/valid?
+                  (scene/build-snapshot
+                   [{:kami/eid tree-a :transform/parent {:kami/eid tree-b}}
+                    {:kami/eid tree-b :transform/parent {:kami/eid tree-a}}] [] {}))))))
+
+(deftest scene-tree
+  (let [t (scene/tree [{:kami/eid tree-a}
+                       {:kami/eid tree-b :transform/parent {:kami/eid tree-a}}]
+                      tree-a)]
+    (is (= tree-b (-> t (get tree-a) :children first :entity :kami/eid)))))
+
+;; --- ecs --------------------------------------------------------------------
+
+(deftest ecs-load+query
+  (let [w (ecs/load-snapshot snap)]
+    (is (= 1 (:basis-t w)))
+    (is (= 2 (count (ecs/query w #{:mesh/asset}))))
+    (is (= 1 (count (ecs/query w #{:camera/active?}))))
+    (is (= 0 (count (ecs/query w #{:mesh/asset :camera/active?}))))))
+
+(deftest ecs-dirty+tx
+  (let [w0 (ecs/load-snapshot snap)
+        w1 (ecs/set-component w0 tree-a :transform/translation [9.0 0.0 0.0])
+        tx (ecs/->tx w1)]
+    (testing "only the changed entity is in the tx"
+      (is (= 1 (count tx)))
+      (is (= tree-a (:kami/eid (first tx))))
+      (is (= [9.0 0.0 0.0] (:transform/translation (first tx)))))
+    (testing "no-op change yields empty tx"
+      (is (empty? (ecs/->tx w0))))
+    (testing "removal emits retractEntity"
+      (let [tx2 (ecs/->tx (ecs/remove-entity w0 tree-b))]
+        (is (= [[:db/retractEntity [:kami/eid tree-b]]] tx2))))
+    (testing "mark-saved clears dirty and re-anchors t"
+      (is (empty? (ecs/->tx (ecs/mark-saved w1 2)))))))
+
+;; --- render-IR --------------------------------------------------------------
+
+#?(:clj
+   (deftest render-authority-edn
+     ;; resources/kami/render/authority.edn is stored as Datomic/Datascript
+     ;; tx-data ([{:db/id -1 ...}], non-scalar values pr-str'd into blob
+     ;; strings) so it can be transacted as-is into a Datalog store.
+     ;; Reconstitute the plain map (same shape #'authority/reconstitute-entity
+     ;; produces) before comparing against authority/authority-edn.
+     (let [tx-data (-> "kami/render/authority.edn"
+                       io/resource
+                       slurp
+                       edn/read-string)
+           artifact (#'authority/reconstitute-entity tx-data)]
+       (is (= 1 (count tx-data)))
+       (is (contains? (first tx-data) :db/id))
+       (is (= artifact authority/authority))
+       (is (= artifact authority/authority-edn))
+       (is (authority/validate artifact))
+       (is (= #{:pbr :sky :terrain :vegetation :character :water :voxel :particle :atlas}
+              authority/builtin-pipelines))
+       (is (= "kami_render::scene_pipelines::pbr"
+              (:pipeline/adapter (authority/pipeline :pbr)))))))
+
+(deftest render-frame
+  (let [w  (ecs/load-snapshot snap)
+        fr (render/frame w {:n 7 :aspect 1.0})]
+    (testing "frame shape"
+      (is (= 7 (:frame/n fr)))
+      (is (= render/nintendo-cream (:frame/clear fr)))
+      (is (= 16 (count (-> fr :frame/camera :view))))
+      (is (= 16 (count (-> fr :frame/camera :proj)))))
+    (testing "two trees with the same (pipeline,mesh,material) merge into one instanced draw"
+      (let [draws (-> fr :frame/passes first :pass/draws)]
+        (is (= 1 (count draws)))
+        (is (= :pbr (:draw/pipeline (first draws))))
+        (is (= 2 (-> draws first :draw/instances :count)))
+        (is (= 32 (-> draws first :draw/instances :model count))))) ; 2 × mat4(16)
+    #?(:clj
+       (testing "frame is serializable plain data (record/replay surface)"
+         (is (= fr (edn/read-string (pr-str fr))))))))
+
+(deftest render-camera-translation
+  (let [w (ecs/load-snapshot snap)
+        view (-> (render/camera-ir w 1.0) :view)]
+    ;; camera at +5 z → view translation column is -5 z
+    (is (= -5.0 (nth view 14)))))
+
+;; --- KAMI columnar packing --------------------------------------------------
+
+(deftest ipc-pack
+  (let [w  (ecs/load-snapshot snap)
+        fr (render/frame w {:n 3 :aspect 1.0})
+        {:keys [buffer len ncols layout]} (ipc/pack fr)]
+    (testing "header magic 'KAMI' little-endian"
+      (is (= [0x4B 0x41 0x4D 0x49] (subvec buffer 0 4))))
+    (testing "buffer length is 16-byte aligned and matches :len"
+      (is (= len (count buffer)))
+      (is (zero? (mod len 16))))
+    (testing "column count = camera + 1 instanced draw"
+      (is (= 2 ncols))
+      (is (= 2 (count layout))))
+    (testing "every column payload offset is 16-byte aligned"
+      (is (every? #(zero? (mod (:offset %) 16)) layout)))
+    (testing "camera column is 2 mat4 items (view+proj), draw column is 2 instances"
+      (is (= [2 2] (mapv :len layout)))
+      (is (every? #(= :mat4 (:dtype %)) layout)))))
+
+(deftest ipc-byte-len
+  (is (= 64  (ipc/byte-len :mat4 1 1)))   ; one mat4 = 64B
+  (is (= 128 (ipc/byte-len :mat4 2 1)))
+  (is (= 16  (ipc/byte-len :f32 4 1))))
+
+;; --- WGSL emission ----------------------------------------------------------
+
+(def ripple-shader
+  {:wgsl/name "ripple"
+   :wgsl/bindings [{:group 0 :binding 0 :var :uniform :name "u" :type :Globals}]
+   :wgsl/structs  {:Globals [[:mvp :mat4x4<f32>]]}
+   :wgsl/vertex   {:in  [[:pos :vec3<f32> {:location 0}]]
+                   :out [[:clip :vec4<f32> :builtin/position]]
+                   :body '[(set! out.clip (* u.mvp (vec4 in.pos 1.0)))]}
+   :wgsl/fragment {:out [[:color :vec4<f32> {:location 0}]]
+                   :body '[(set! out.color (vec4 0.3 0.6 1.0 1.0))]}})
+
+(deftest wgsl-emit
+  (let [src (wgsl/emit ripple-shader)]
+    (is (re-find #"@group\(0\) @binding\(0\) var<uniform> u: Globals;" src))
+    (is (re-find #"struct Globals" src))
+    (is (re-find #"@vertex" src))
+    (is (re-find #"@fragment" src))
+    (is (re-find #"@builtin\(position\)" src))
+    (is (re-find #"out.clip = \(u.mvp \* vec4<f32>\(in.pos, 1.0\)\);" src))
+    (is (re-find #"out.color = vec4<f32>\(0.3, 0.6, 1.0, 1.0\);" src)))
+  (testing "built-in pipelines need no WGSL"
+    (is (wgsl/builtin? :pbr))
+    (is (not (wgsl/builtin? "custom/ripple")))))
+
+;; --- postfx CLJC-authored WGSL (Phase 2.3) ----------------------------------
+;;
+;; Postfx passes authored as EDN data via kami.postfx → kami.wgsl-emit/emit. These
+;; tests assert the emitted WGSL contains the expected structural tokens
+;; (uniform bindings, the postfx math, @fragment) the same way `wgsl-emit`
+;; does. Pure data → string; no GPU.
+
+(deftest postfx-shared-structure
+  (doseq [kind postfx/postfx-kinds]
+    (testing (str kind " shares the postfx bind group + params struct")
+      (let [src (postfx/emit-postfx kind)]
+        (is (re-find #"@group\(0\) @binding\(0\)" src) kind)
+        (is (re-find #"@group\(0\) @binding\(1\)" src) kind)
+        (is (re-find #"@group\(0\) @binding\(2\) var<uniform> p: P;" src) kind)
+        (is (re-find #"struct P \{" src) kind)
+        (is (re-find #"p0: vec4<f32>," src) kind)
+        (is (re-find #"p1: vec4<f32>," src) kind)
+        (is (re-find #"@vertex" src) kind)
+        (is (re-find #"@fragment" src) kind)
+        (is (re-find #"fn vertex_main" src) kind)
+        (is (re-find #"fn fragment_main" src) kind)
+        (is (re-find #"textureSample\(tex, samp" src) kind)))))
+
+(deftest postfx-vignette-emit
+  (let [src (postfx/emit-postfx :vignette)]
+    (testing "name header"
+      (is (re-find #"// kami.wgsl-emit emitted shader: postfx_vignette" src)))
+    (testing "fullscreen-triangle vertex math"
+      (is (re-find #"@builtin\(vertex_index\) vi: u32," src))
+      (is (re-find #"\(in\.vi << 1u\) & 2u" src))
+      (is (re-find #"out\.clip = vec4<f32>\(\(\(x \* 2\.0\) - 1\.0\)" src)))
+    (testing "vignette math: vig = clamp(1 - p.p0.x * 2 * dot(d,d), 0, 1); color *= vig"
+      (is (re-find #"let d = \(in\.uv - vec2<f32>\(0\.5, 0\.5\)\);" src))
+      (is (re-find #"let vig = clamp\(\(1\.0 - \(p\.p0\.x \* \(2\.0 \* dot\(d, d\)\)\)\), 0\.0, 1\.0\);" src))
+      (is (re-find #"out\.color = vec4<f32>\(\(c \* vig\), 1\.0\);" src)))))
+
+(deftest postfx-pixelate-emit
+  (let [src (postfx/emit-postfx :pixelate)]
+    (testing "name header"
+      (is (re-find #"// kami.wgsl-emit emitted shader: postfx_pixelate" src)))
+    (testing "pixelate math: snap uv to block grid, sample at block center"
+      (is (re-find #"let block = p\.p0\.x;" src))
+      (is (re-find #"textureDimensions\(tex, 0\)" src))
+      (is (re-find #"let blkIdx = floor\(\(\(in\.uv \* pix\) / block\)\);" src))
+      (is (re-find #"let quv = \(\(\(blkIdx \+ 0\.5\) \* block\) / pix\);" src))
+      (is (re-find #"out\.color = vec4<f32>\(textureSample\(tex, samp, quv\)\.rgb, 1\.0\);" src)))))
+
+(deftest postfx-outline-emit
+  (let [src (postfx/emit-postfx :outline)]
+    (testing "name header"
+      (is (re-find #"// kami.wgsl-emit emitted shader: postfx_outline" src)))
+    (testing "outline math: 4-neighbor edge detection, strength gain"
+      (is (re-find #"let texel = p\.p0\.xy;" src))
+      (is (re-find #"let c = textureSample\(tex, samp, in\.uv\)\.rgb;" src))
+      (is (re-find #"let cL = textureSample\(tex, samp, oL\)\.rgb;" src))
+      (is (re-find #"let edge = \(p\.p0\.z \* \(\(abs\(\(c - cL\)\) \+ abs\(\(c - cR\)\)\) \+ \(abs\(\(c - cU\)\) \+ abs\(\(c - cD\)\)\)\)\);" src))
+      (is (re-find #"out\.color = vec4<f32>\(\(c \+ edge\), 1\.0\);" src)))))
+
+(deftest postfx-unknown-kind-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (postfx/postfx-shader :bogus)))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (postfx/emit-postfx :bogus)))
+  (is (= #{:vignette :pixelate :outline} postfx/postfx-kinds)))
+
+;; --- WGSL compute stage (Phase 2.1) -----------------------------------------
+
+(defn- compute-shader
+  "Minimal @compute-only shader to exercise the emitter without the full
+  cartpole body."
+  []
+  {:wgsl/name    "compute_smoke"
+   :wgsl/structs {:Cfg [[:dt :f32] [:num_envs :u32]]}
+   :wgsl/bindings [{:group 0 :binding 0 :var :storage :access :read_write
+                    :name "states" :type :array<f32>}
+                   {:group 0 :binding 1 :var :uniform
+                    :name "cfg" :type :Cfg}]
+   :wgsl/compute {:workgroup-size [64 1 1]
+                  :entry          "step_main"
+                  :builtin        :global_invocation_id
+                  :builtin-name   "gid"
+                  :wgsl/body      "  let i = gid.x;\n  if (i >= cfg.num_envs) { return; }\n  states[i] = states[i] + cfg.dt;"}})
+
+(deftest wgsl-compute-emit
+  (let [src (wgsl/emit (compute-shader))]
+    (testing "entry-point scaffolding"
+      (is (re-find #"@compute @workgroup_size\(64, 1, 1\)" src))
+      (is (re-find #"fn step_main\(@builtin\(global_invocation_id\) gid: vec3<u32>\)" src)))
+    (testing "storage + uniform bindings"
+      (is (re-find #"@group\(0\) @binding\(0\) var<storage, read_write> states: array<f32>;" src))
+      (is (re-find #"@group\(0\) @binding\(1\) var<uniform> cfg: Cfg;" src)))
+    (testing "structs + raw body spliced"
+      (is (re-find #"struct Cfg" src))
+      (is (re-find #"let i = gid\.x;" src))
+      (is (re-find #"states\[i\] = states\[i\] \+ cfg\.dt;" src)))))
+
+(deftest physics-cartpole-step-emit
+  (let [src (physics/cartpole-step-emit)]
+    (testing "compute entry point"
+      (is (re-find #"@compute @workgroup_size\(64, 1, 1\)" src))
+      (is (re-find #"fn step_main\(@builtin\(global_invocation_id\) gid: vec3<u32>\)" src)))
+    (testing "storage + uniform bindings"
+      (is (re-find #"@group\(0\) @binding\(0\) var<storage, read_write> states: array<State>;" src))
+      (is (re-find #"@group\(0\) @binding\(1\) var<storage, read> actions: array<f32>;" src))
+      (is (re-find #"@group\(0\) @binding\(2\) var<uniform> cfg: Cfg;" src)))
+    (testing "structs"
+      (is (re-find #"struct State" src))
+      (is (re-find #"struct Cfg" src)))
+    (testing "math ops (semi-implicit Euler, Sutton & Barto 1983)"
+      (is (re-find #"let temp: f32 =" src))
+      (is (re-find #"let theta_acc: f32 =" src))
+      (is (re-find #"let x_acc: f32 =" src))
+      (is (re-find #"s\.x_dot     = s\.x_dot     \+ cfg\.dt \* x_acc;" src))
+      (is (re-find #"s\.theta     = s\.theta     \+ cfg\.dt \* s\.theta_dot;" src)))))
+
+;; --- math -------------------------------------------------------------------
+
+(deftest math-identity-mul
+  (is (= m/identity4 (m/mul m/identity4 m/identity4))))
+
+(deftest math-trs-translation
+  (let [mm (m/from-trs [1.0 2.0 3.0] [0.0 0.0 0.0 1.0] [1.0 1.0 1.0])]
+    (is (= [1.0 2.0 3.0] [(nth mm 12) (nth mm 13) (nth mm 14)]))))
+
+;; --- fsm (Phase 1.2: data-heavy domain interpreter → CLJC) ------------------
+
+(def guard-fsm
+  (fsm/fsm
+   [{:from :idle    :event :start   :to :running}
+    {:from :running :event :pause   :to :paused}
+    {:from :paused  :event :resume  :to :running}
+    {:from :running :event :stop    :to :idle  :guard #(> (:fuel %) 0)
+     :on-enter (fn [ctx] [:emit :stopped (:fuel ctx)])}
+    {:from :idle    :event :start   :to :idle}]           ; duplicate event, no transition
+   {:initial :idle}))
+
+(deftest fsm-advance-transition
+  (let [r (fsm/advance guard-fsm :idle :start)]
+    (is (:transitioned? r))
+    (is (= :running (:state r)))
+    (is (empty? (:actions r)))))
+
+(deftest fsm-advance-guard-rejects
+  (testing "guard fails → no transition, state unchanged"
+    (let [r (fsm/advance guard-fsm :running :stop {:fuel 0})]
+      (is (not (:transitioned? r)))
+      (is (= :running (:state r))))))
+
+(deftest fsm-advance-guard-passes-and-emits-action
+  (let [r (fsm/advance guard-fsm :running :stop {:fuel 5})]
+    (is (:transitioned? r))
+    (is (= :idle (:state r)))
+    (is (= [[:emit :stopped 5]] (:actions r)))))
+
+(deftest fsm-advance-no-matching-row
+  (is (not (:transitioned? (fsm/advance guard-fsm :paused :start)))))
+
+(deftest fsm-advance-seq-threads-state
+  (let [r (fsm/advance-seq guard-fsm :idle [[:start {}] [:pause {}] [:resume {}] [:stop {:fuel 2}]])]
+    (is (= :idle (:state r)))
+    (is (= [[:emit :stopped 2]] (:actions r)))))
+
+(deftest fsm-reachable-states-from-initial
+  (is (= #{:idle :running :paused} (fsm/reachable-states guard-fsm))))
+
+;; The `kami.input` action-map tests that used to close this file were removed with
+;; the namespace itself. `kami.input` is owned by kotoba-lang/host, which every app
+;; that actually wires input already depends on; this repo's copy had no consumer
+;; other than these tests. See the deletion commit for the full argument.
