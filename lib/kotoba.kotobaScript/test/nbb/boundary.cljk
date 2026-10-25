@@ -1,0 +1,95 @@
+(ns test.nbb.boundary
+  "P3 of superproject adr-2609242100-kotoba-safety-is-language-resource-is-
+  target-profile, on the emitted ESM: a typed value is walked in full ONCE, at
+  a trust boundary, against a traversal budget; inside the module a value is
+  never re-walked, so it has no structural limit.
+
+  Both directions, each refusal pinned to its trap name:
+    1. a 10,000-cell list built INSIDE the module is summed (it was refused
+       at 6 cells by the per-value adt-node-limit 64 / adt-depth-limit 12);
+    2. a 20,000-cell list built by the HOST and passed to an export -- 60,001
+       nodes, 40,000 levels deep -- is admitted by the iterative walk without
+       overflowing the JS stack;
+    3. a 30,000-cell host list (90,001 nodes) is refused as
+       `budget/boundary-nodes`;
+    4. an operand of the wrong type never reaches the runtime: the emitter
+       refuses the module statically, which is why the runtime may check
+       only tags.
+
+  Run from the repo root: `npm run test-boundary`. The last line is
+  `SCANNED <n> failed <k>`; n = 0 is exit 2, not a pass."
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:child_process" :as cp]
+            [kotoba.script :as script]))
+
+(def lst [:variant :app/list [[:empty :i64] [:cons [:ref :app/cell]]]])
+(def cell [:record :app/cell [[:head :i64] [:tail [:ref :app/list]]]])
+
+(defn- helper [name result body]
+  {:name name :params ['l] :param-types [[:ref :app/list]] :result result
+   :body (list 'variant-match lst 'l body)})
+
+(def kir
+  {:format :kotoba.kir/v4 :entry nil :exports ['build-and-sum 'sum] :effects #{}
+   :schemas {:app/list lst :app/cell cell}
+   :functions
+   [(helper 'cells :i64 [[:empty 'e 0] [:cons 'c 1]])
+    (helper 'head-of :i64 [[:empty 'e 0] [:cons 'c (list 'record-get cell 'c :head)]])
+    (helper 'tail-of [:ref :app/list] [[:empty 'e 'l] [:cons 'c (list 'record-get cell 'c :tail)]])
+    {:name '__kotoba_loop_1 :params ['n 'acc] :param-types [:i64 [:ref :app/list]]
+     :result [:ref :app/list]
+     :body (list 'if (list '= 'n 0) 'acc
+                 (list '__kotoba_loop_1 (list '- 'n 1)
+                       (list 'variant-new lst :cons (list 'record-new cell 'n 'acc))))}
+    {:name '__kotoba_loop_2 :params ['l 'acc] :param-types [[:ref :app/list] :i64] :result :i64
+     :body (list 'if (list '= (list 'cells 'l) 0) 'acc
+                 (list '__kotoba_loop_2 (list 'tail-of 'l) (list '+ 'acc (list 'head-of 'l))))}
+    {:name 'build-and-sum :params ['n] :param-types [:i64] :result :i64
+     :body (list '__kotoba_loop_2 (list '__kotoba_loop_1 'n (list 'variant-new lst :empty 0)) 0)}
+    {:name 'sum :params ['l] :param-types [[:ref :app/list]] :result :i64
+     :body (list '__kotoba_loop_2 'l 0)}]})
+
+;; a cons whose payload is a list, not a cell
+(def bad-kir
+  (-> kir
+      (assoc :exports ['bad])
+      (update :functions conj
+              {:name 'bad :params [] :param-types [] :result :i64
+               :body (list 'cells (list 'variant-new lst :cons (list 'variant-new lst :empty 0)))})))
+
+(def probe
+  "const m=await import(process.argv[1]);const x=m.instantiateKotoba({});
+const F=Object.freeze;
+const L=F(['variant',':app/list',F([F([':empty','i64']),F([':cons',F(['ref',':app/cell'])])])]);
+const C=F(['record',':app/cell',F([F([':head','i64']),F([':tail',F(['ref',':app/list'])])])]);
+const host=n=>{let v=[L,':empty',0n];for(let i=n;i>=1;i--)v=[L,':cons',[C,BigInt(i),v]];return v;};
+const run=f=>{try{return String(f());}catch(e){return 'trap:'+e.message;}};
+console.log(JSON.stringify({
+ internal:run(()=>x['build-and-sum'](10000n)),
+ hostDeep:run(()=>x.sum(host(20000))),
+ hostOver:run(()=>x.sum(host(30000)))}));")
+
+(def failures (atom 0))
+(def scanned (atom 0))
+(defn- check! [label expected actual]
+  (swap! scanned inc)
+  (if (= expected actual)
+    (println "ok  " label actual)
+    (do (swap! failures inc) (println "FAIL" label "expected" expected "got" actual))))
+
+(let [src (script/emit kir {:fuel 10000000})
+      tmp (str (.tmpdir os) "/kotoba-script-boundary-" (.-pid js/process) ".mjs")]
+  (fs/writeFileSync tmp src)
+  (let [r (cp/spawnSync "node" #js ["--input-type=module" "-e" probe tmp] #js {:encoding "utf8"})
+        out (try (js->clj (js/JSON.parse (.-stdout r)) :keywordize-keys true)
+                 (catch :default _ {:error (str (.-stdout r) (.-stderr r))}))]
+    (fs/unlinkSync tmp)
+    (check! "internal 10,000-cell list is summed" "50005000" (:internal out))
+    (check! "host list of 20,000 cells (40,000 deep) is admitted" "200010000" (:hostDeep out))
+    (check! "host list of 30,000 cells is refused by name" "trap:budget/boundary-nodes" (:hostOver out))
+    (check! "a wrong-typed operand is refused before it can run" "KIR expression type mismatch"
+            (try (script/emit bad-kir) "emitted" (catch :default e (ex-message e))))))
+
+(println "SCANNED" @scanned "failed" @failures)
+(set! (.-exitCode js/process) (cond (zero? @scanned) 2 (pos? @failures) 1 :else 0))
