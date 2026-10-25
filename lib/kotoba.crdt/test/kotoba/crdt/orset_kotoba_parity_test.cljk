@@ -1,0 +1,167 @@
+(ns kotoba.crdt.orset-kotoba-parity-test
+  "Binds `orset.kotoba` to `orset.cljc` — the same adds, the same survivors.
+
+  The property that matters here is not `add` or `remove` in isolation; it is
+  that a remove tombstones only the tags it has actually observed, so an add
+  concurrent with a remove survives it. Two editors depend on that: one deletes
+  a shape while the other adds one, and neither loses their edit.
+
+  Both files implement that rule, one over Clojure maps and sets and one over
+  typed guest maps with explicit index recursion. Nothing had ever run them
+  over the same operations.
+
+  ## How this is driven
+
+  Operations are data, applied to both implementations by the same interpreter
+  below, and the only thing compared is membership — `contains-elem?` on the
+  guest, `elements` on the `.cljc`. Internal state is never decoded: a replica
+  is whatever its own implementation says it is, and the question asked of both
+  is the only one a caller can ask.
+
+  `observed-tags` is chained guest-side (its result feeds `remove-tags`) rather
+  than reconstructed host-side, so a disagreement about which tags a replica
+  has observed shows up as a disagreement about membership.
+
+  ## Scope, stated rather than implied
+
+  Elements are `:i64` and tags are clock stamps, which is the guest's type and
+  a subset of what the `.cljc` accepts. `elements` has no guest counterpart —
+  only `contains-elem?` — so set-at-once equality is checked by asking about
+  every element the script mentions."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.crdt.kotoba-project :as project]
+            [kotoba.crdt.orset :as orset]
+            [kotoba.kir :as kir]))
+
+(def ^:private module (delay (project/compile-module 'kotoba.crdt.orset)))
+
+(defn- run [f & args] (kir/execute @module f (vec args)))
+
+(def ^:private elements [0 1 -2])
+
+(def ^:private tags
+  [{:crdt/counter 1 :crdt/actor 0}
+   {:crdt/counter 2 :crdt/actor 0}
+   {:crdt/counter 1 :crdt/actor 1}])
+
+;; A replica pair. Ops name which replica they touch, so a script reads as the
+;; story it is: who added what, who removed what they had seen, who synced.
+(defn- cljc-step [replicas [op & args]]
+  (case op
+    :add (let [[r elem tag] args]
+           (update replicas r orset/add elem tag))
+    :remove-observed (let [[r elem] args]
+                       (update replicas r orset/remove-tags
+                               (orset/observed-tags (get replicas r) elem)))
+    :merge (let [[into-r from-r] args]
+             (assoc replicas into-r
+                    (orset/merge-orset (get replicas into-r) (get replicas from-r))))))
+
+(defn- guest-step [replicas [op & args]]
+  (case op
+    :add (let [[r elem tag] args]
+           (assoc replicas r (run 'add (get replicas r) elem (project/->stamp tag))))
+    :remove-observed (let [[r elem] args]
+                       (assoc replicas r
+                              (run 'remove-tags (get replicas r)
+                                   (run 'observed-tags (get replicas r) elem))))
+    :merge (let [[into-r from-r] args]
+             (assoc replicas into-r
+                    (run 'merge-orset (get replicas into-r) (get replicas from-r))))))
+
+(defn- cljc-membership [replicas]
+  (into {} (for [r [:a :b]
+                 e elements]
+             [[r e] (orset/contains-elem? (get replicas r) e)])))
+
+(defn- guest-membership [replicas]
+  (into {} (for [r [:a :b]
+                 e elements]
+             [[r e] (run 'contains-elem? (get replicas r) e)])))
+
+(def ^:private scripts
+  {"add then remove what you observed"
+   [[:add :a 0 (tags 0)]
+    [:remove-observed :a 0]]
+
+   "a remove cannot touch a tag it never saw"
+   ;; The OR-Set guarantee. B removes what B has seen (nothing), then learns
+   ;; about A's add; the element must still be there.
+   [[:add :a 0 (tags 0)]
+    [:remove-observed :b 0]
+    [:merge :b :a]]
+
+   "a remove that has seen the add wins over the add"
+   [[:add :a 0 (tags 0)]
+    [:merge :b :a]
+    [:remove-observed :b 0]
+    [:merge :a :b]]
+
+   "concurrent add with a fresh tag survives a remove of the old one"
+   [[:add :a 0 (tags 0)]
+    [:merge :b :a]
+    [:remove-observed :b 0]
+    [:add :a 0 (tags 1)]
+    [:merge :a :b]
+    [:merge :b :a]]
+
+   "same tag added on both replicas is one add"
+   [[:add :a 0 (tags 0)]
+    [:add :b 0 (tags 0)]
+    [:merge :a :b]
+    [:remove-observed :a 0]]
+
+   "merging twice changes nothing"
+   [[:add :a 0 (tags 0)]
+    [:add :b 1 (tags 2)]
+    [:merge :a :b]
+    [:merge :a :b]]
+
+   "elements do not interfere"
+   [[:add :a 0 (tags 0)]
+    [:add :a 1 (tags 1)]
+    [:add :a -2 (tags 2)]
+    [:remove-observed :a 1]
+    [:merge :b :a]]})
+
+(deftest membership-agrees-after-every-step
+  (doseq [[name script] scripts]
+    (testing name
+      (loop [ops script
+             cljc {:a (orset/init) :b (orset/init)}
+             guest {:a (run 'init) :b (run 'init)}
+             step 0]
+        (is (= (cljc-membership cljc) (guest-membership guest))
+            (str name " — after step " step))
+        (when-let [op (first ops)]
+          (recur (rest ops)
+                 (cljc-step cljc op)
+                 (guest-step guest op)
+                 (inc step)))))))
+
+(deftest merge-is-commutative-on-the-kotoba-side
+  ;; Asked of the guest directly rather than of the pair: agreement between two
+  ;; implementations does not make either one a CRDT.
+  (doseq [[name script] scripts]
+    (testing name
+      (let [{:keys [a b]} (reduce guest-step
+                                  {:a (run 'init) :b (run 'init)}
+                                  script)
+            a<b (run 'merge-orset a b)
+            b<a (run 'merge-orset b a)]
+        (doseq [e elements]
+          (is (= (run 'contains-elem? a<b e)
+                 (run 'contains-elem? b<a e))
+              (str name " — element " e)))))))
+
+(deftest merging-a-replica-into-itself-changes-nothing
+  (doseq [[name script] scripts]
+    (testing name
+      (let [{:keys [a]} (reduce guest-step
+                                {:a (run 'init) :b (run 'init)}
+                                script)
+            twice (run 'merge-orset a a)]
+        (doseq [e elements]
+          (is (= (run 'contains-elem? a e)
+                 (run 'contains-elem? twice e))
+              (str name " — element " e)))))))
