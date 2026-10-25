@@ -1,0 +1,715 @@
+(ns brep.feature-eval-test
+  "Verification for the 2026-07-27 additions to `brep.feature` and
+  `brep.assembly`:
+
+  - `sketch->ring` / `extrude-prism` — an extrude now consumes its sketch
+    profile instead of producing a unit square regardless of it.
+  - `evaluate` — boolean features return an explicit error instead of the
+    previous silent no-op.
+  - `evaluate-mesh` — booleans applied for real via `brep.mesh-csg`.
+  - `brep.assembly/solve-translations` — axis-aligned translation constraints
+    actually move instances.
+
+  Every geometric assertion compares against a closed-form value (a prism's
+  volume is its footprint times its height; a box with a rectangular hole is
+  the difference of two such products), so these are verification tests, not
+  change detectors."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [brep.topology :as topo]
+            [brep.feature :as f]
+            [brep.assembly :as a]
+            [brep.kernel :as k]
+            [brep.step :as step]
+            [brep.tessellate :as tess]))
+
+(defn- rect-sketch [id w h]
+  (f/sketch-feature id (f/sketch-plane-xy)
+                    [(f/sketch-line [0 0] [w 0])
+                     (f/sketch-line [w 0] [w h])
+                     (f/sketch-line [w h] [0 h])
+                     (f/sketch-line [0 h] [0 0])]))
+
+(defn- offset-rect-sketch [id x0 y0 w h]
+  (f/sketch-feature id (f/sketch-plane-xy)
+                    [(f/sketch-line [x0 y0] [(+ x0 w) y0])
+                     (f/sketch-line [(+ x0 w) y0] [(+ x0 w) (+ y0 h)])
+                     (f/sketch-line [(+ x0 w) (+ y0 h)] [x0 (+ y0 h)])
+                     (f/sketch-line [x0 (+ y0 h)] [x0 y0])]))
+
+(defn- mesh-volume
+  "Signed volume of a closed triangle mesh via the divergence theorem."
+  [{:keys [positions indices]}]
+  (Math/abs
+   (double
+    (reduce
+     + 0.0
+     (for [t (range (quot (count indices) 3))]
+       (let [g (fn [kk] (nth positions (nth indices (+ (* t 3) kk))))
+             [ax ay az] (g 0) [bx by bz] (g 1) [cx cy cz] (g 2)]
+         (/ (+ (* ax (- (* by cz) (* bz cy)))
+               (- (* ay (- (* bx cz) (* bz cx))))
+               (* az (- (* bx cy) (* by cx))))
+            6.0)))))))
+
+;; ---------------------------------------------------------------------------
+;; sketch->ring
+;; ---------------------------------------------------------------------------
+
+(deftest sketch-ring-chains-segments-in-any-order
+  (testing "a closed rectangle chains regardless of segment order/direction"
+    (let [sk (f/sketch-feature "s" (f/sketch-plane-xy)
+                               [(f/sketch-line [10 0] [10 10])   ; deliberately not
+                                (f/sketch-line [0 10] [0 0])     ; in walk order,
+                                (f/sketch-line [10 10] [0 10])   ; and some reversed
+                                (f/sketch-line [0 0] [10 0])])
+          ring (f/sketch->ring sk)]
+      (is (= 4 (count ring)))
+      (is (= #{[0 0] [10 0] [10 10] [0 10]} (set ring))))))
+
+(deftest sketch-ring-refuses-open-and-multi-loop
+  (testing "an open chain yields nil, never a guess"
+    (is (nil? (f/sketch->ring
+               (f/sketch-feature "s" (f/sketch-plane-xy)
+                                 [(f/sketch-line [0 0] [10 0])
+                                  (f/sketch-line [10 0] [10 10])
+                                  (f/sketch-line [10 10] [5 20])])))))
+  (testing "two disjoint closed loops yield nil"
+    (is (nil? (f/sketch->ring
+               (f/sketch-feature "s" (f/sketch-plane-xy)
+                                 (concat (:entities (rect-sketch "a" 10 10))
+                                         (:entities (offset-rect-sketch "b" 100 100 5 5)))))))))
+
+(deftest sketch-ring-polygonises-circles
+  (let [sk (f/sketch-feature "s" (f/sketch-plane-xy) [(f/sketch-circle [0 0] 10)])
+        ring (f/sketch->ring sk 16)]
+    (is (= 16 (count ring)) "circle becomes the requested number of segments")))
+
+;; ---------------------------------------------------------------------------
+;; extrude consumes the profile
+;; ---------------------------------------------------------------------------
+
+(deftest extrude-uses-the-sketch-not-a-unit-square
+  (testing "prism volume = footprint x height, exactly"
+    (let [w 305.4 h 192.4 d 133.4
+          tree (-> (f/feature-tree)
+                   (f/add-feature (rect-sketch "s1" w h))
+                   (f/add-feature (f/extrude-feature "e1" "s1" [0 0 1] d :new)))
+          [st [solid edges verts]] (f/evaluate tree)]
+      (is (= :ok st))
+      (is (= 6 (k/face-count solid)) "a 4-gon prism has 4 sides + 2 caps")
+      (is (= 12 (k/edge-count solid)))
+      (is (= 8 (k/vertex-count solid edges)))   ; takes solid + edges; the third arg was an arity error, not a shape claim
+      (is (= [[0.0 0.0 0.0] [w h d]]
+             (mapv #(mapv double %) (k/bounding-box solid edges verts))))
+      (is (< (Math/abs (- (tess/volume solid edges verts) (* w h d))) 1e-6)
+          "this is the regression that matters: the old evaluator returned a 1x1 box"))))
+
+(deftest extruded-prism-is-step-exportable
+  (testing "planar faces + linear edges survive a STEP round-trip"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (rect-sketch "s1" 60 40))
+                   (f/add-feature (f/extrude-feature "e1" "s1" [0 0 1] 20 :new)))
+          [_ [solid edges verts]] (f/evaluate tree)
+          text (step/write-step solid edges verts)
+          [s2 e2 v2] (step/read-step text)]
+      (is (re-find #"^ISO-10303-21;" text))
+      (is (= (k/face-count solid) (k/face-count s2)))
+      (is (< (Math/abs (- (tess/volume solid edges verts) (tess/volume s2 e2 v2))) 1e-6)
+          "volume must survive write->read"))))
+
+(deftest extrude-refuses-an-unusable-named-sketch
+  (testing "a named-but-open sketch errors rather than silently becoming 1x1"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (f/sketch-feature "s1" (f/sketch-plane-xy)
+                                                    [(f/sketch-line [0 0] [10 0])]))
+                   (f/add-feature (f/extrude-feature "e1" "s1" [0 0 1] 5 :new)))
+          [st msg] (f/evaluate tree)]
+      (is (= :error st))
+      (is (re-find #"closed loop" msg)))))
+
+(deftest extrude-without-a-sketch-keeps-legacy-unit-square
+  (testing "no :sketch-ref at all still yields the documented unit prism"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (f/extrude-feature "e1" nil [0 0 1] 3 :new)))
+          [st [solid edges verts]] (f/evaluate tree)]
+      (is (= :ok st))
+      (is (< (Math/abs (- (tess/volume solid edges verts) 3.0)) 1e-9)
+          "1 x 1 x 3"))))
+
+;; ---------------------------------------------------------------------------
+;; booleans
+;; ---------------------------------------------------------------------------
+
+(deftest boolean-in-evaluate-is-an-explicit-error-not-a-no-op
+  (testing "the old behaviour silently returned the base solid unchanged"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (rect-sketch "s1" 100 100))
+                   (f/add-feature (f/extrude-feature "e1" "s1" [0 0 1] 100 :new))
+                   (f/add-feature (offset-rect-sketch "s2" 25 25 50 50))
+                   (f/add-feature (f/extrude-feature "e2" "s2" [0 0 1] 100 :cut)))
+          [st msg] (f/evaluate tree)]
+      (is (= :error st))
+      (is (re-find #"evaluate-mesh" msg) "the error must name the working path"))))
+
+(deftest evaluate-mesh-applies-a-real-difference
+  (testing "cutting a 50x50x100 hole from a 100x100x100 block removes 0.25 of it"
+    (let [base (-> (f/feature-tree)
+                   (f/add-feature (rect-sketch "s1" 100 100))
+                   (f/add-feature (f/extrude-feature "e1" "s1" [0 0 1] 100 :new)))
+          cut (-> base
+                  (f/add-feature (offset-rect-sketch "s2" 25 25 50 50))
+                  (f/add-feature (f/extrude-feature "e2" "s2" [0 0 1] 100 :cut)))
+          [st1 m1] (f/evaluate-mesh base)
+          [st2 m2] (f/evaluate-mesh cut)]
+      (is (= :ok st1))
+      (is (= :ok st2))
+      (is (< (Math/abs (- (mesh-volume m1) 1.0e6)) 1.0) "base = 100^3 mm3")
+      (is (< (Math/abs (- (mesh-volume m2) 0.75e6)) 1.0)
+          "after the cut = 750,000 mm3 — proves the boolean is real"))))
+
+;; ---------------------------------------------------------------------------
+;; assembly translation solver
+;; ---------------------------------------------------------------------------
+
+(defn- two-part-assembly []
+  (let [asm (a/assembly "t")
+        [i1 asm] (a/add-instance asm (a/part-ref 1 "base") {:translate [0.0 0.0 0.0]} "base")
+        [i2 asm] (a/add-instance asm (a/part-ref 2 "arm") {:translate [0.0 0.0 0.0]} "arm")]
+    [i1 i2 asm]))
+
+(deftest distance-constraint-actually-moves-the-instance
+  (let [[i1 i2 asm] (two-part-assembly)
+        asm (a/add-constraint asm (assoc (a/distance-constraint i1 "f" i2 "f" 25.0) :axis 2))
+        r (a/solve-translations asm)]
+    (is (= :ok (:status r)))
+    (is (= [[0.0 0.0 0.0] [0.0 0.0 25.0]]
+           (mapv (comp :translate :transform) (a/instances (:assembly r))))
+        "solve must change geometry, not just validate references")))
+
+(deftest mate-constraint-makes-instances-coincident-on-the-axis
+  (let [asm (a/assembly "t")
+        [i1 asm] (a/add-instance asm (a/part-ref 1 "a") {:translate [0.0 0.0 7.0]} "a")
+        [i2 asm] (a/add-instance asm (a/part-ref 2 "b") {:translate [0.0 0.0 40.0]} "b")
+        asm (a/add-constraint asm (assoc (a/mate-constraint i1 "f" i2 "f") :axis 2))
+        r (a/solve-translations asm)]
+    (is (= :ok (:status r)))
+    (is (= 7.0 (nth (:translate (:transform (second (a/instances (:assembly r))))) 2)))))
+
+(deftest solver-refuses-what-it-cannot-do
+  (testing "rotation constraints are refused, not ignored"
+    (let [[i1 i2 asm] (two-part-assembly)
+          asm (a/add-constraint asm (assoc (a/angle-constraint i1 "f" i2 "f" 1.5) :axis 0))
+          r (a/solve-translations asm)]
+      (is (= :error (:status r)))
+      (is (re-find #"rotation is not implemented" (:message r)))))
+  (testing ":identity transforms are refused"
+    (let [asm (a/assembly "t")
+          [_ asm] (a/add-instance asm (a/part-ref 1 "a") (a/affine3-identity) "a")
+          [_ asm] (a/add-instance asm (a/part-ref 2 "b") (a/affine3-identity) "b")]
+      (is (= :error (:status (a/solve-translations asm))))))
+  (testing "a missing :axis is refused"
+    (let [[i1 i2 asm] (two-part-assembly)
+          asm (a/add-constraint asm (a/distance-constraint i1 "f" i2 "f" 5.0))]
+      (is (= :error (:status (a/solve-translations asm)))))))
+
+(deftest solver-reports-non-convergence-instead-of-swallowing-it
+  (testing "a cyclic constraint pair hits the cap and says so"
+    (let [[i1 i2 asm] (two-part-assembly)
+          asm (-> asm
+                  (a/add-constraint (assoc (a/distance-constraint i1 "f" i2 "f" 10.0) :axis 0))
+                  (a/add-constraint (assoc (a/distance-constraint i2 "f" i1 "f" 10.0) :axis 0)))
+          r (a/solve-translations asm 1e-9 8)]
+      (is (= :unconverged (:status r)))
+      (is (pos? (:residual r)))
+      (is (re-find #"cyclic or" (:message r))))))
+
+;; ---------------------------------------------------------------------------
+;; The feature registry (2026-08-20).
+;;
+;; `apply-feature` is an open multimethod: registering a method IS the claim
+;; that this kernel evaluates that feature kind. Before this, the constructors
+;; above (`fillet-feature`, `sweep-feature`, …) read as capability while
+;; `evaluate-mesh` handled `:extrude` alone and answered everything else with a
+;; generic "not supported as a boolean operand" — a vocabulary and an evaluator
+;; kept as two lists that nothing compared. The tests below pin the property
+;; that replaces the second list: what is unregistered says so, by name.
+;; ---------------------------------------------------------------------------
+
+(defn- square-sketch [id plane s]
+  (f/sketch-feature
+   id plane
+   [(f/sketch-line [0 0] [s 0]) (f/sketch-line [s 0] [s s])
+    (f/sketch-line [s s] [0 s]) (f/sketch-line [0 s] [0 0])]))
+
+(defn- bbox [{:keys [positions]}]
+  [(mapv (fn [i] (apply min (map #(nth % i) positions))) [0 1 2])
+   (mapv (fn [i] (apply max (map #(nth % i) positions))) [0 1 2])])
+
+(deftest registry-answers-for-itself
+  (testing "the supported set is derived from the registry, not restated"
+    (is (contains? (f/supported-feature-kinds) :extrude))
+    (is (contains? (f/supported-feature-kinds) :sketch))
+    ;; `:fillet` was this test's example of an UNREGISTERED kind until
+    ;; 2026-08-22, which is the right way for it to have been written: the
+    ;; assertion had to change when the capability arrived, rather than the
+    ;; capability arriving unnoticed. `:revolve` has a constructor and no
+    ;; evaluator, so it plays that part now.
+    (is (contains? (f/supported-feature-kinds) :fillet))
+    (is (not (contains? (f/supported-feature-kinds) :revolve))))
+
+  (testing "an unregistered kind refuses BY NAME and names what is registered"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                   (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new))
+                   (f/add-feature (f/revolve-feature 3 1 [0 0 1] 360 :new)))
+          [status msg] (f/evaluate-mesh tree)]
+      (is (= :error status))
+      (is (string/includes? msg ":revolve"))
+      (is (string/includes? msg "no evaluator is registered"))
+      (is (string/includes? msg ":extrude"))
+      (is (string/includes? msg ":loft")))))
+
+(deftest loft-builds-a-frustum-between-two-profiles
+  (let [tree (-> (f/feature-tree)
+                 (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 6))
+                 (f/add-feature
+                  (square-sketch 2 (f/sketch-plane-custom [1.0 1.0 6.0] [0 0 1]) 4))
+                 (f/add-feature (f/loft-feature 3 [1 2] :new)))
+        [status mesh] (f/evaluate-mesh tree)]
+    (testing "it builds"
+      (is (= :ok status)))
+    (testing "the solid spans both profile planes"
+      (let [[[_ _ zmin] [_ _ zmax]] (bbox mesh)]
+        (is (= 0.0 (double zmin)))
+        (is (= 6.0 (double zmax)))))
+    (testing "side walls plus both caps, all triangles"
+      (is (zero? (mod (count (:indices mesh)) 3)))
+      (is (= 36 (count (:indices mesh)))))
+    (testing "every index addresses a position that exists"
+      (is (every? #(< -1 % (count (:positions mesh))) (:indices mesh)))))
+
+  (testing "mismatched vertex counts are refused, not silently resampled"
+    (let [tree (-> (f/feature-tree)
+                   (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 6))
+                   (f/add-feature
+                    (f/sketch-feature 2 (f/sketch-plane-custom [0.0 0.0 5.0] [0 0 1])
+                                            [(f/sketch-line [0 0] [4 0])
+                                             (f/sketch-line [4 0] [2 4])
+                                             (f/sketch-line [2 4] [0 0])]))
+                   (f/add-feature (f/loft-feature 3 [1 2] :new)))
+          [status msg] (f/evaluate-mesh tree)]
+      (is (= :error status))
+      (is (string/includes? msg "same vertex count"))
+      (is (string/includes? msg "resampling is not implemented")))))
+
+(deftest pattern-repeats-the-body-along-a-direction
+  (let [base-tree (-> (f/feature-tree)
+                      (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                      (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new)))
+        [_ base] (f/evaluate-mesh base-tree)
+        [status mesh] (f/evaluate-mesh
+                       (f/add-feature base-tree
+                                            (f/pattern-feature 3 [2] [1 0 0] 3 10)))]
+    (testing "it builds"
+      (is (= :ok status)))
+    (testing "the bounding box grows by (count - 1) x spacing along the direction"
+      (let [[[x0 _ _] [x1 _ _]] (bbox base)
+            [[px0 _ _] [px1 _ _]] (bbox mesh)]
+        (is (= (double x0) (double px0)))
+        (is (= (+ (double x1) 20.0) (double px1)))))
+    (testing "the direction is normalised, so its length does not scale the spacing"
+      (let [[_ scaled] (f/evaluate-mesh
+                        (f/add-feature base-tree
+                                             (f/pattern-feature 3 [2] [7 0 0] 3 10)))]
+        (is (= (bbox mesh) (bbox scaled))))))
+
+  (testing "degenerate patterns are refused"
+    (let [t (-> (f/feature-tree)
+                (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new)))]
+      (is (= :error (first (f/evaluate-mesh
+                            (f/add-feature t (f/pattern-feature 3 [2] [1 0 0] 1 10))))))
+      (is (= :error (first (f/evaluate-mesh
+                            (f/add-feature t (f/pattern-feature 3 [2] [0 0 0] 3 10))))))
+      (is (= :error (first (f/evaluate-mesh
+                            (f/add-feature t (f/pattern-feature 3 [2] [1 0 0] 3 0))))))))
+
+  (testing "selective patterning is refused rather than over-applied"
+    (let [t (-> (f/feature-tree)
+                (f/add-feature (square-sketch 1 (f/sketch-plane-xy) 4))
+                (f/add-feature (f/extrude-feature 2 1 [0 0 1] 3 :new))
+                (f/add-feature (square-sketch 4 (f/sketch-plane-xy) 2))
+                (f/add-feature (f/extrude-feature 5 4 [0 0 1] 9 :add))
+                (f/add-feature (f/pattern-feature 6 [2] [1 0 0] 3 10)))
+          [status msg] (f/evaluate-mesh t)]
+      (is (= :error status))
+      (is (string/includes? msg "Selective patterning is not implemented")))))
+
+(defn- unit-square-profile [id plane]
+  (f/sketch-feature id plane
+                    [(f/sketch-line [-1 -1] [1 -1]) (f/sketch-line [1 -1] [1 1])
+                     (f/sketch-line [1 1] [-1 1]) (f/sketch-line [-1 1] [-1 -1])]))
+
+(deftest sketch-polyline-chains-open-paths-only
+  (testing "an open chain walks from one free end to the other"
+    (is (= [[0 0] [0 10] [8 10]]
+           (f/sketch->polyline
+            (f/sketch-feature 1 (f/sketch-plane-xz)
+                              [(f/sketch-line [0 0] [0 10]) (f/sketch-line [0 10] [8 10])])))))
+
+  (testing "a closed loop is not an open path — ask sketch->ring"
+    (is (nil? (f/sketch->polyline (unit-square-profile 2 (f/sketch-plane-xy))))))
+
+  (testing "a branch is refused: which branch is the path is a decision"
+    (is (nil? (f/sketch->polyline
+               (f/sketch-feature 3 (f/sketch-plane-xy)
+                                 [(f/sketch-line [0 0] [4 0]) (f/sketch-line [4 0] [8 0])
+                                  (f/sketch-line [4 0] [4 4])]))))))
+
+(deftest sweep-carries-the-section-around-a-corner
+  (let [profile (unit-square-profile 1 (f/sketch-plane-xy))
+        run (fn [path-entities]
+              (f/evaluate-mesh
+               (-> (f/feature-tree)
+                   (f/add-feature profile)
+                   (f/add-feature (f/sketch-feature 2 (f/sketch-plane-xz) path-entities))
+                   (f/add-feature (f/sweep-feature 3 1 2 :new)))))]
+
+    (testing "a straight path reproduces the extrusion it is equivalent to"
+      (let [[status mesh] (run [(f/sketch-line [0 0] [0 10])])]
+        (is (= :ok status))
+        (is (= [[-1.0 -1.0 0.0] [1.0 1.0 10.0]]
+               (mapv #(mapv double %) (bbox mesh))))))
+
+    (testing "an L-path mitres the corner — the section ROTATED, it was not merely translated"
+      ;; A translate-only sweep leaves the far leg lying in the z-range of the
+      ;; first, so zmax stays 10 and the solid pinches at the turn. Carrying the
+      ;; frame puts the outer corner at 10 + half-width = 11. That single number
+      ;; is the difference between a sweep and a wrong shape that renders.
+      (let [[status mesh] (run [(f/sketch-line [0 0] [0 10]) (f/sketch-line [0 10] [8 10])])
+            [[xmin _ zmin] [xmax _ zmax]] (bbox mesh)]
+        (is (= :ok status))
+        (is (= 11.0 (double zmax)))
+        (is (= 8.0 (double xmax)))
+        (is (= [-1.0 0.0] [(double xmin) (double zmin)]))))
+
+    (testing "every index addresses a position that exists"
+      (let [[_ mesh] (run [(f/sketch-line [0 0] [0 10]) (f/sketch-line [0 10] [8 10])])]
+        (is (every? #(< -1 % (count (:positions mesh))) (:indices mesh)))))))
+
+(deftest sweep-refuses-what-it-cannot-decide
+  (testing "a profile that does not face along the path start is refused, not reinterpreted"
+    (let [[status msg] (f/evaluate-mesh
+                        (-> (f/feature-tree)
+                            (f/add-feature (unit-square-profile 1 (f/sketch-plane-xz)))
+                            (f/add-feature (f/sketch-feature 2 (f/sketch-plane-xz)
+                                                             [(f/sketch-line [0 0] [0 10])]))
+                            (f/add-feature (f/sweep-feature 3 1 2 :new))))]
+      (is (= :error status))
+      (is (string/includes? msg "perpendicular to the start of the path"))))
+
+  (testing "a closed path is refused with the reason"
+    (let [[status msg] (f/evaluate-mesh
+                        (-> (f/feature-tree)
+                            (f/add-feature (unit-square-profile 1 (f/sketch-plane-xy)))
+                            (f/add-feature (unit-square-profile 2 (f/sketch-plane-xz)))
+                            (f/add-feature (f/sweep-feature 3 1 2 :new))))]
+      (is (= :error status))
+      (is (string/includes? msg "single OPEN chain")))))
+
+(defn- mesh-volume [m]
+  (Math/abs
+   (/ (reduce + (map (fn [[a b c]]
+                       (let [p (nth (:positions m) a) q (nth (:positions m) b)
+                             r (nth (:positions m) c)]
+                         (reduce + (map * p [(- (* (q 1) (r 2)) (* (q 2) (r 1)))
+                                             (- (* (q 2) (r 0)) (* (q 0) (r 2)))
+                                             (- (* (q 0) (r 1)) (* (q 1) (r 0)))]))))
+                     (partition 3 (:indices m))))
+      6.0)))
+
+(defn- block-tree []
+  (-> (f/feature-tree)
+      (f/add-feature (f/sketch-feature 1 (f/sketch-plane-xy)
+                                       [(f/sketch-line [0 0] [10 0]) (f/sketch-line [10 0] [10 10])
+                                        (f/sketch-line [10 10] [0 10]) (f/sketch-line [0 10] [0 0])]))
+      (f/add-feature (f/extrude-feature 2 1 [0 0 1] 6 :new))))
+
+(deftest chamfer-removes-exactly-the-analytic-wedge
+  ;; A chamfer on a solid with planar faces IS a plane cut, so the material it
+  ;; takes off one edge is a triangular prism: 1/2 d^2 L exactly. Asserting the
+  ;; volume against that closed form is what separates a chamfer from a mesh
+  ;; that merely gained triangles — the first attempt here routed its result
+  ;; through `combine` with `:new`, which falls to :union, and put the removed
+  ;; material straight back: volume unchanged at 600, every dihedral still 90
+  ;; degrees, triangle count up from 12 to 52. A cut that adds triangles and
+  ;; changes nothing is the most convincing kind of wrong.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        bottom-front (first (filter (fn [[i j]]
+                                      (let [t (topo/topology m0)
+                                            a (nth (:vertices t) i) b (nth (:vertices t) j)]
+                                        (and (zero? (double (a 1))) (zero? (double (b 1)))
+                                             (zero? (double (a 2))) (zero? (double (b 2))))))
+                                    (topo/sharp-edges (topo/topology m0) :convex 0.2)))]
+    (testing "the block starts at 600"
+      (is (= 600.0 (double (mesh-volume m0)))))
+
+    (doseq [d [0.5 1.0 2.0]]
+      (testing (str "one edge chamfered at d=" d " removes 1/2 d^2 L")
+        (let [[status m] (f/evaluate-mesh
+                          (f/add-feature base (f/chamfer-feature 3 [bottom-front] d)))]
+          (is (= :ok status))
+          (is (< (Math/abs (- (mesh-volume m) (- 600.0 (* 0.5 d d 10.0)))) 1.0e-9))
+          (is (empty? (topo/boundary-edges (topo/topology m)))))))))
+
+(deftest chamfering-every-convex-edge-keeps-the-solid-closed
+  (let [[status m] (f/evaluate-mesh
+                    (f/add-feature (block-tree) (f/chamfer-feature 3 :all-convex 1.0)))
+        t (topo/topology m)
+        normal-angles (frequencies (map #(Math/round (* 180.0 (/ (:dihedral %) Math/PI)))
+                                        (filter #(= :manifold (:kind %)) (vals (:edges t)))))]
+    (is (= :ok status))
+    (testing "still a closed solid"
+      (is (empty? (topo/boundary-edges t)))
+      (is (= 2 (topo/euler-characteristic t))))
+    (testing "no 90-degree edge survives — every one was cut"
+      (is (nil? (get normal-angles 90))))
+    (testing "two chamfer edges per original edge, at 45 degrees between normals"
+      (is (= 24 (get normal-angles 45))))
+    (testing "and three chamfers meeting at each of the 8 corners"
+      (is (= 24 (get normal-angles 60))))))
+
+(deftest chamfer-refuses-selectors-it-cannot-honour
+  (let [base (block-tree)
+        err (fn [feat] (second (f/evaluate-mesh (f/add-feature base feat))))]
+    (testing "BREP edge ids do not exist on the mesh, and are refused by name"
+      ;; Guessing a mapping would chamfer edges nobody selected — a wrong part
+      ;; that builds.
+      (is (string/includes? (err (f/chamfer-feature 3 [1 2 3] 1.0)) ":all-convex")))
+    (testing "a non-positive distance is refused"
+      (is (string/includes? (err (f/chamfer-feature 3 :all-convex 0)) "positive :distance")))
+    (testing "an empty selection is refused rather than silently doing nothing"
+      (is (string/includes? (err (f/chamfer-feature 3 [] 1.0)) ":all-convex")))
+    (testing "a chamfer with no body under it is refused"
+      (is (string/includes?
+           (second (f/evaluate-mesh (-> (f/feature-tree)
+                                        (f/add-feature (f/chamfer-feature 3 :all-convex 1.0)))))
+           "no body to cut")))))
+
+(deftest shell-hollows-a-body-to-the-analytic-volume
+  ;; A shell is an inward offset and a difference, so the material it LEAVES is
+  ;; a closed form: for a 10-cube at thickness 1, 1000 - 8^3 = 488. Volume is
+  ;; the measurement that matters here, because the failure mode of this
+  ;; construction is a perfectly closed solid of the wrong size — see the
+  ;; too-thick case below, where the offset planes cross and the "shell" comes
+  ;; back at 990 of 1000, closed, Euler 2, indistinguishable from the block.
+  (let [[_ block] (f/evaluate-mesh (block-tree))   ; 10 x 10 x 6 = 600
+        closed (f/evaluate-mesh (f/add-feature (block-tree) (f/shell-feature 3 nil 1.0)))
+        opened (f/evaluate-mesh (f/add-feature (block-tree) (f/shell-feature 3 [[0 0 1]] 1.0)))]
+    (is (= 600.0 (double (mesh-volume block))))
+
+    (testing "closed on every side: a 8 x 8 x 4 void"
+      (let [[status m] closed t (topo/topology m)]
+        (is (= :ok status))
+        (is (< (Math/abs (- (mesh-volume m) (- 600.0 (* 8.0 8.0 4.0)))) 1.0e-9))
+        (is (empty? (topo/boundary-edges t)))
+        ;; two shells — an outer surface and the surface of the void inside it
+        (is (= 4 (topo/euler-characteristic t)))))
+
+    (testing "open at +Z: the void runs out through the top, so one shell"
+      (let [[status m] opened t (topo/topology m)]
+        (is (= :ok status))
+        (is (< (Math/abs (- (mesh-volume m) (- 600.0 (* 8.0 8.0 5.0)))) 1.0e-9))
+        (is (empty? (topo/boundary-edges t)))
+        (is (= 2 (topo/euler-characteristic t)))))
+
+    (testing "the same construction on a body that is not a box"
+      ;; right isoceles legs 10, height 6. Inradius (10+10-sqrt(200))/2, and the
+      ;; inward offset is the similar triangle at inradius - 1.
+      (let [prism (-> (f/feature-tree)
+                      (f/add-feature (f/sketch-feature 1 (f/sketch-plane-xy)
+                                                       [(f/sketch-line [0 0] [10 0])
+                                                        (f/sketch-line [10 0] [0 10])
+                                                        (f/sketch-line [0 10] [0 0])]))
+                      (f/add-feature (f/extrude-feature 2 1 [0 0 1] 6 :new)))
+            r (/ (- 20.0 (Math/sqrt 200.0)) 2.0)
+            inner (* 50.0 (Math/pow (/ (- r 1.0) r) 2) 4.0)
+            [status m] (f/evaluate-mesh (f/add-feature prism (f/shell-feature 3 nil 1.0)))]
+        (is (= :ok status))
+        (is (< (Math/abs (- (mesh-volume m) (- 300.0 inner))) 1.0e-6))))))
+
+(deftest shell-refuses-what-it-cannot-offset
+  (testing "a thickness the body cannot hold is rejected, not silently ignored"
+    (let [[status msg] (f/evaluate-mesh (f/add-feature (block-tree) (f/shell-feature 3 nil 9.0)))]
+      (is (= :error status))
+      (is (string/includes? msg "offset walls cross"))))
+
+  (testing "a concave body is refused, naming the representation that is missing"
+    ;; The block with a corner notched out. The plane-intersection offset is
+    ;; wrong at a reflex edge and wrong in a way that still returns a closed
+    ;; solid, so refusing is the only honest answer this kernel can give.
+    (let [notched (-> (block-tree)
+                      (f/add-feature (f/sketch-feature 3 (f/sketch-plane-xy)
+                                                       [(f/sketch-line [6 6] [12 6])
+                                                        (f/sketch-line [12 6] [12 12])
+                                                        (f/sketch-line [12 12] [6 12])
+                                                        (f/sketch-line [6 12] [6 6])]))
+                      (f/add-feature (f/extrude-feature 4 3 [0 0 1] 6 :cut)))
+          [status msg] (f/evaluate-mesh (f/add-feature notched (f/shell-feature 5 nil 1.0)))]
+      (is (= :error status))
+      (is (string/includes? msg "concave"))
+      (is (string/includes? msg "offset-surface"))))
+
+  (testing "a direction that names no face is refused with the normals it has"
+    (let [[status msg] (f/evaluate-mesh
+                        (f/add-feature (block-tree) (f/shell-feature 3 [[1 1 1]] 1.0)))]
+      (is (= :error status))
+      (is (string/includes? msg ":removed-faces named"))))
+
+  (testing "shell is registered, so the registry answers for it"
+    (is (contains? (f/supported-feature-kinds) :shell))))
+
+(defn- edge-at
+  "The convex mesh edge whose two endpoints both satisfy `pred`."
+  [m pred]
+  (let [t (topo/topology m)]
+    (first (filter (fn [[i j]]
+                     (and (pred (nth (:vertices t) i)) (pred (nth (:vertices t) j))))
+                   (topo/sharp-edges t :convex 0.2)))))
+
+(deftest fillet-removes-the-analytic-quarter-lune-and-converges
+  ;; A fillet is not a plane cut — that is the whole difference from chamfer —
+  ;; but what it removes still has a closed form: the cross-section is an
+  ;; r-by-r square with a quarter disc taken out, so one edge of length L
+  ;; loses exactly L r^2 (1 - pi/4). The arc is inscribed, so the tessellated
+  ;; tool removes slightly MORE than that, converging from above at second
+  ;; order in the segment count.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        r 1.0
+        exact (* 10.0 r r (- 1.0 (/ Math/PI 4.0)))
+        rel (fn [segs]
+              (let [[status m] (f/evaluate-mesh
+                                (f/add-feature base {:kind :fillet :id 3 :edges [e]
+                                                     :radius r :segments segs}))]
+                (is (= :ok status) (str "segments " segs ": " (pr-str m)))
+                (is (empty? (topo/boundary-edges (topo/topology m))))
+                (/ (- (- 600.0 (mesh-volume m)) exact) exact)))
+        e8 (rel 8) e16 (rel 16) e32 (rel 32)]
+    (testing "always removes more than the exact lune, because the arc is inscribed"
+      (is (pos? e8)) (is (pos? e16)) (is (pos? e32)))
+    (testing "and converges at second order"
+      (is (< (Math/abs (- (/ e8 e16) 4.0)) 0.5) (str "e8/e16 = " (/ e8 e16)))
+      (is (< (Math/abs (- (/ e16 e32) 4.0)) 0.5) (str "e16/e32 = " (/ e16 e32)))
+      (is (< e32 2.0e-3)))))
+
+(deftest a-fillet-is-smooth-where-the-edge-was-sharp
+  ;; The measurement that separates a fillet from a chamfer: after rounding,
+  ;; the facets along the old edge meet at 90/segments degrees, not at 90.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        segs 16
+        [_ m] (f/evaluate-mesh (f/add-feature base {:kind :fillet :id 3 :edges [e]
+                                                    :radius 1.0 :segments segs}))
+        t (topo/topology m)
+        angles (->> (vals (:edges t))
+                    (filter #(= :manifold (:kind %)))
+                    (map #(Math/round (* 180.0 (/ (:dihedral %) Math/PI))))
+                    frequencies)
+        arc-angle (Math/round (/ 90.0 segs))]
+    (testing "the arc contributes segments-1 interior edges at 90/segments degrees"
+      (is (= (dec segs) (get angles arc-angle))
+          (str "dihedral histogram was " (into (sorted-map) angles))))
+    (testing "and the rest of the block is still sharp"
+      (is (pos? (get angles 90 0))
+          (str "dihedral histogram was " (into (sorted-map) angles))))
+    (testing "while nothing on the rounded edge is"
+      ;; A chamfer of the same edge would leave two 45-degree edges and no arc;
+      ;; the arc angle appearing segments-1 times is what says this is a blend.
+      (is (nil? (get angles 45))))))
+
+(deftest two-edges-that-do-not-touch-remove-twice-as-much
+  ;; Adjacent edges' tools overlap near their shared vertex, so the removed
+  ;; volume is LESS than the sum — correctly, since the overlap is removed
+  ;; once. Parallel edges on opposite corners have no overlap, and there the
+  ;; sum is the right answer.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e1 (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        e2 (edge-at m0 (fn [p] (and (= 10.0 (double (p 1))) (= 6.0 (double (p 2))))))
+        ;; 20 rather than 16: measured, this pair at 16 segments comes back
+        ;; with 6 boundary edges. The sporadic failure documented in the
+        ;; evaluator is real and is not hidden by choosing round numbers.
+        r 0.5 segs 20
+        exact (* 2.0 10.0 r r (- 1.0 (/ Math/PI 4.0)))
+        [status m] (f/evaluate-mesh (f/add-feature base {:kind :fillet :id 3 :edges [e1 e2]
+                                                         :radius r :segments segs}))]
+    (is (some? e2))
+    (is (= :ok status) (pr-str m))
+    (is (empty? (topo/boundary-edges (topo/topology m))))
+    (is (< (Math/abs (/ (- (- 600.0 (mesh-volume m)) exact) exact)) 0.02)
+        (str "removed " (- 600.0 (mesh-volume m)) " vs 2 x " (/ exact 2.0)))))
+
+(deftest fillet-refuses-rather-than-returning-a-shape-nobody-asked-for
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        run (fn [feat] (f/evaluate-mesh (f/add-feature base feat)))]
+    (testing "one segment is a chamfer"
+      (let [[status msg] (run {:kind :fillet :id 3 :edges [e] :radius 1.0 :segments 1})]
+        (is (= :error status))
+        (is (string/includes? msg "is a chamfer"))))
+
+    (testing "a radius at least half the edge length would cut past the far end"
+      (let [[status msg] (run {:kind :fillet :id 3 :edges [e] :radius 6.0 :segments 8})]
+        (is (= :error status))
+        (is (string/includes? msg "no closure check would reject"))))
+
+    (is (= :error (first (run {:kind :fillet :id 3 :edges [e] :radius 0.0 :segments 8}))))
+    (is (= :error (first (run {:kind :fillet :id 3 :edges :every-edge :radius 1.0 :segments 8}))))
+
+    (testing "and when the boolean cannot do it, that is said rather than shipped"
+      ;; Measured: twelve edges at eight segments exhausts the BSP, and some
+      ;; radius/segment pairs return an OPEN surface. Both are reported.
+      (let [[status msg] (run {:kind :fillet :id 3 :edges :all-convex :radius 0.5 :segments 8})]
+        (is (= :error status))
+        (is (string/includes? msg "could not be cut"))
+        (is (string/includes? msg "overshoots tried"))))
+
+    (testing "a combination the boolean gets wrong is refused, not returned"
+      ;; Two parallel edges at 16 segments defeats all eight tool overshoots.
+      ;; A single edge at any segment count no longer does — see the sweep
+      ;; below — so the retry is not a blanket fix and this pins what is left
+      ;; of the failure. It is still a surface with boundary edges underneath,
+      ;; which is a volume that is wrong, so it is refused rather than
+      ;; returned. Removing the closure check leaves every other assertion in
+      ;; this file green, which is why this one exists.
+      (let [e2 (edge-at m0 (fn [p] (and (= 10.0 (double (p 1))) (= 6.0 (double (p 2))))))
+            [status msg] (run {:kind :fillet :id 3 :edges [e e2] :radius 0.5 :segments 16})]
+        (is (= :error status))
+        (is (string/includes? msg "could not be cut"))))
+
+    (testing "fillet is registered, so the registry answers for it"
+      (is (contains? (f/supported-feature-kinds) :fillet)))))
+
+(deftest one-edge-rounds-at-every-segment-count-tried
+  ;; Before the overshoot retry this swept 9 values and failed at 2 of them on
+  ;; the JVM and 4 under nbb — DIFFERENT ones, which is what said the boolean
+  ;; and not the geometry was at fault. Both hosts run this file.
+  (let [base (block-tree)
+        [_ m0] (f/evaluate-mesh base)
+        e (edge-at m0 (fn [p] (and (zero? (double (p 1))) (zero? (double (p 2))))))
+        exact (* 10.0 1.0 1.0 (- 1.0 (/ Math/PI 4.0)))]
+    (doseq [segs [4 8 12 16 20 24 32 48 64]]
+      (let [[status m] (f/evaluate-mesh (f/add-feature base {:kind :fillet :id 3 :edges [e]
+                                                             :radius 1.0 :segments segs}))]
+        (is (= :ok status) (str segs " segments: " (pr-str m)))
+        (when (= :ok status)
+          (is (empty? (topo/boundary-edges (topo/topology m))) (str segs " segments"))
+          (is (pos? (- (- 600.0 (mesh-volume m)) exact))
+              (str segs " segments removed less than the exact lune, which an"
+                   " inscribed arc cannot do")))))))

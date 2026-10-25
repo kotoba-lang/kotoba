@@ -140,6 +140,7 @@ The bundled standard libraries live in this repository:
 | `org.canCia.canopen` | `org.canCia.canopen/src` | `canopen.cob-id`, `canopen.emcy`, `canopen.nmt`, `canopen.pdo` (an external specification, publisher canCia.org) |
 | `org.biscuitsec.biscuit` | `org.biscuitsec.biscuit/src` | `biscuit.authority`, `biscuit.authorizer`, `biscuit.datalog`, `biscuit.effective` (an external specification, publisher biscuitsec.org) |
 | `org.sevenZip.sevenZ` | `org.sevenZip.sevenZ/src` | `sevenz.core` (an external specification, publisher sevenZip.org) |
+| `org.iso.std10303` | `org.iso.std10303/src` | `brep`, `brep.assembly`, `brep.config`, `brep.config-loader` (an external specification, publisher iso.org) |
 | `com.adobe.tiff` | `com.adobe.tiff/src` | `tiff.bytes`, `tiff.codec`, `tiff.core` (Kotoba project library) |
 | `app.bsky.atproto` | `app.bsky.atproto/src` | `atproto.core`, `atproto.sdk` (Kotoba project library) |
 | `com.microsoft.riff` | `com.microsoft.riff/src` | `riff.bytes`, `riff.core` (Kotoba project library) |

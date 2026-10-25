@@ -1,0 +1,351 @@
+(ns brep-test
+  "Restoration-fidelity tests — one per original kami-cad Rust test
+  (kami-engine/kami-cad/src/lib.rs `mod tests`, deleted PR #82) — plus
+  additional coverage for `brep.kernel` vector math, curve evaluation,
+  feature-tree edge cases, and the `brep.config` EDN authority that
+  weren't exercised by the original Rust test suite."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [brep]
+            [brep.config :as config]
+            #?(:clj [brep.config-loader :as loader])
+            [brep.kernel :as k]
+            [brep.feature :as feature]
+            [brep.assembly :as assembly]
+            [brep.tessellate :as tessellate]
+            [brep.step :as step]))
+
+(defn- close? [a b eps] (< (Math/abs (- a b)) eps))
+
+(deftest namespace-loads
+  (testing "the restored CLJC namespace loads"
+    ;; `the-ns` is JVM-only (no cljs equivalent reachable from user code);
+    ;; the whole form must be behind the reader conditional (not just a
+    ;; spliced :require) or clj-kondo's cljs analysis pass flags `the-ns`
+    ;; as an unresolved symbol.
+    (is (some? #?(:clj (the-ns 'brep) :cljs true)))))
+
+;; mirrors `create_box_solid`
+(deftest create-box-solid
+  (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [10.0 20.0 30.0])]
+    (is (= 6 (k/face-count solid)))
+    (is (= 12 (k/edge-count solid)))
+    (is (= 8 (k/vertex-count solid edges)))
+    (is (= 8 (count verts)))))
+
+;; mirrors `bounding_box_accuracy`
+(deftest bounding-box-accuracy
+  (let [vmin [-5.0 -5.0 -5.0] vmax [5.0 5.0 5.0]
+        [solid edges verts] (k/make-box 1 vmin vmax)
+        [bb-min bb-max] (k/bounding-box solid edges verts)]
+    (is (< (Math/abs (- (first bb-min) -5.0)) 1e-10))
+    (is (< (Math/abs (- (nth bb-max 2) 5.0)) 1e-10))))
+
+;; mirrors `feature_tree_extrude_produces_solid`
+(deftest feature-tree-extrude-produces-solid
+  (let [tree (-> (feature/feature-tree)
+                  (feature/add-feature
+                   (feature/sketch-feature 1 (feature/sketch-plane-xy)
+                                            [(feature/sketch-circle [0.0 0.0] 5.0)]))
+                  (feature/add-feature
+                   (feature/extrude-feature 2 1 [0.0 0.0 1.0] 10.0 :new)))]
+    (is (= 2 (feature/tree-len tree)))
+    (let [[status [solid edges verts]] (feature/evaluate tree)]
+      (is (= :ok status))
+      ;; 6 was the box-era answer, and this assertion kept failing at 34 long
+      ;; after the evaluator started honouring the sketch: a CIRCLE profile is
+      ;; tessellated, so the prism has 32 side faces and 2 caps. Asserting the
+      ;; face count alone cannot tell a correct 32-gon from a wrong one, so the
+      ;; claim that matters is the volume — a 32-gon of radius 5 has area
+      ;; 1/2 n r^2 sin(2 pi / n), which is 0.64% under pi r^2, and the solid
+      ;; must sit on the polygon value, not the circle one.
+      (is (= 34 (k/face-count solid)) "32 tessellated sides + 2 caps")
+      (let [n 32 poly-area (* 0.5 n 25.0 (Math/sin (/ (* 2.0 Math/PI) n)))]
+        (is (< (Math/abs (- (tessellate/volume solid edges verts) (* poly-area 10.0))) 1.0e-6))
+        (is (< (tessellate/volume solid edges verts) (* Math/PI 25.0 10.0))
+            "a tessellated circle is inscribed, so it is under the analytic cylinder")))))
+
+;; ── brep.feature :revolve (new — a real solid of revolution, not the
+;; box-only evaluate this repo started with) ──
+
+(deftest revolve-axis-parallel-profile-produces-a-cylinder
+  (testing "revolving a constant-radius sketch-line 2π around Z produces a
+            real cylinder (make-cylinder), not a box"
+    (let [tree (-> (feature/feature-tree)
+                    (feature/add-feature
+                     (feature/sketch-feature 1 (feature/sketch-plane-xy)
+                                              [(feature/sketch-line [3.0 0.0] [3.0 8.0])]))
+                    (feature/add-feature
+                     (feature/revolve-feature 2 1 [0.0 0.0 1.0] (* 2.0 Math/PI) :new)))
+          [status [solid edges verts]] (feature/evaluate tree)]
+      (is (= :ok status))
+      (is (= 3 (k/face-count solid)))
+      (let [[bb-min bb-max] (k/bounding-box solid edges verts)]
+        (is (close? (nth bb-min 0) -3.0 1e-6))
+        (is (close? (nth bb-max 0) 3.0 1e-6))
+        (is (close? (nth bb-min 2) 0.0 1e-6))
+        (is (close? (nth bb-max 2) 8.0 1e-6))))))
+
+(deftest revolve-rejects-partial-angle
+  (testing "a partial-angle revolve (pie slice) is not yet implemented -- errors, not a wrong shape"
+    (let [tree (-> (feature/feature-tree)
+                    (feature/add-feature
+                     (feature/sketch-feature 1 (feature/sketch-plane-xy)
+                                              [(feature/sketch-line [3.0 0.0] [3.0 8.0])]))
+                    (feature/add-feature
+                     (feature/revolve-feature 2 1 [0.0 0.0 1.0] Math/PI :new)))
+          [status _] (feature/evaluate tree)]
+      (is (= :error status)))))
+
+(deftest revolve-rejects-angled-profile
+  (testing "a non-axis-parallel profile (cone/frustum) is not yet implemented -- errors"
+    (let [tree (-> (feature/feature-tree)
+                    (feature/add-feature
+                     (feature/sketch-feature 1 (feature/sketch-plane-xy)
+                                              [(feature/sketch-line [1.0 0.0] [3.0 8.0])]))
+                    (feature/add-feature
+                     (feature/revolve-feature 2 1 [0.0 0.0 1.0] (* 2.0 Math/PI) :new)))
+          [status _] (feature/evaluate tree)]
+      (is (= :error status)))))
+
+(deftest revolve-rejects-missing-sketch
+  (testing "a dangling sketch-ref errors instead of silently producing nothing useful"
+    (let [tree (-> (feature/feature-tree)
+                    (feature/add-feature
+                     (feature/revolve-feature 2 999 [0.0 0.0 1.0] (* 2.0 Math/PI) :new)))
+          [status _] (feature/evaluate tree)]
+      (is (= :error status)))))
+
+;; mirrors `feature_suppress_unsuppress`
+(deftest feature-suppress-unsuppress
+  (let [tree (-> (feature/feature-tree)
+                  (feature/add-feature (feature/extrude-feature 1 0 [0.0 0.0 1.0] 5.0 :new))
+                  (feature/add-feature (feature/fillet-feature 2 [100] 1.0))
+                  (feature/suppress 2))
+        [status _] (feature/evaluate tree)]
+    (is (= :ok status))
+    (let [tree (feature/unsuppress tree 2)]
+      (is (= 2 (feature/tree-len tree))))))
+
+;; mirrors `assembly_bom`
+(deftest assembly-bom
+  (let [bolt (assembly/part-ref 1 "M6_bolt")
+        nut (assembly/part-ref 2 "M6_nut")
+        [_ asm] (-> (assembly/assembly "test_assembly")
+                     (assembly/add-instance bolt (assembly/affine3-identity) "bolt_1"))
+        [_ asm] (assembly/add-instance asm bolt (assembly/affine3-identity) "bolt_2")
+        [_ asm] (assembly/add-instance asm nut (assembly/affine3-identity) "nut_1")
+        [_ asm] (assembly/add-instance asm nut (assembly/affine3-identity) "nut_2")
+        [_ asm] (assembly/add-instance asm bolt (assembly/affine3-identity) "bolt_3")
+        bom (assembly/get-bom asm)]
+    (is (= 2 (count bom)))
+    (let [bolt-entry (first (filter #(= (:part-name %) "M6_bolt") bom))
+          nut-entry (first (filter #(= (:part-name %) "M6_nut") bom))]
+      (is (= 3 (:quantity bolt-entry)))
+      (is (= 2 (:quantity nut-entry))))))
+
+;; mirrors `tessellation_produces_vertices_and_indices`
+(deftest tessellation-produces-vertices-and-indices
+  (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [1.0 1.0 1.0])
+        [positions indices] (tessellate/tessellate-solid solid edges verts)]
+    (is (seq positions))
+    (is (seq indices))
+    (doseq [idx indices] (is (< idx (count positions))))
+    (is (= 0 (mod (count indices) 3)))))
+
+;; mirrors `surface_area_unit_cube`
+(deftest surface-area-unit-cube
+  (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [1.0 1.0 1.0])
+        area (tessellate/surface-area solid edges verts)]
+    (is (< (Math/abs (- area 6.0)) 0.5))))
+
+;; mirrors `volume_positive_for_solid`
+(deftest volume-positive-for-solid
+  (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [2.0 3.0 4.0])
+        vol (tessellate/volume solid edges verts)]
+    (is (> vol 0.0))))
+
+;; ── brep.kernel/make-cylinder (new — a real solid of revolution primitive,
+;; not a hand-rolled mesh; validated against analytic cylinder volume/area
+;; the same way volume-positive-for-solid/surface-area-unit-cube validate
+;; make-box) ──
+
+(deftest make-cylinder-topology
+  (let [[solid edges verts] (k/make-cylinder 1 [0.0 0.0 0.0] [0.0 0.0 1.0] 2.0 5.0)]
+    (is (= 3 (k/face-count solid)) "two caps + one cylindrical wall")
+    (is (= (* 2 config/cylinder-segments) (k/edge-count solid)))
+    (is (= (* 2 config/cylinder-segments) (k/vertex-count solid edges)))
+    (is (= (* 2 config/cylinder-segments) (count verts)))))
+
+(deftest make-cylinder-bounding-box-matches-radius-and-height
+  (let [[solid edges verts] (k/make-cylinder 1 [0.0 0.0 0.0] [0.0 0.0 1.0] 2.0 5.0)
+        [bb-min bb-max] (k/bounding-box solid edges verts)]
+    (is (close? (nth bb-min 0) -2.0 1e-9))
+    (is (close? (nth bb-max 0) 2.0 1e-9))
+    (is (close? (nth bb-min 2) 0.0 1e-9))
+    (is (close? (nth bb-max 2) 5.0 1e-9))))
+
+(deftest make-cylinder-volume-and-area-approximate-analytic-cylinder
+  (testing "24-segment polygon approximation is within ~2% of the true πr²h / (2πr² + 2πrh)"
+    (let [[solid edges verts] (k/make-cylinder 1 [0.0 0.0 0.0] [0.0 0.0 1.0] 2.0 5.0)
+          vol (tessellate/volume solid edges verts)
+          area (tessellate/surface-area solid edges verts)
+          analytic-vol (* Math/PI 2.0 2.0 5.0)
+          analytic-area (+ (* 2.0 Math/PI 2.0 2.0) (* 2.0 Math/PI 2.0 5.0))]
+      (is (< (Math/abs (- vol analytic-vol)) (* 0.02 analytic-vol)))
+      (is (< (Math/abs (- area analytic-area)) (* 0.02 analytic-area))))))
+
+(deftest make-cylinder-tessellates-to-a-watertight-mesh
+  (testing "cap segment count matches the wall's tessellation resolution --
+            no gaps between them (a real risk if the two were generated at
+            different segment counts)"
+    (let [[solid edges verts] (k/make-cylinder 1 [1.0 2.0 3.0] [1.0 0.0 0.0] 1.5 4.0)
+          [positions indices] (tessellate/tessellate-solid solid edges verts)]
+      (is (seq positions))
+      (is (seq indices))
+      (doseq [idx indices] (is (< idx (count positions))))
+      (is (= 0 (mod (count indices) 3))))))
+
+;; mirrors `assembly_constraint_solve_validates_instances`
+(deftest assembly-constraint-solve-validates-instances
+  (let [part (assembly/part-ref 1 "plate")
+        [id-a asm] (-> (assembly/assembly "constrained")
+                        (assembly/add-instance part (assembly/affine3-identity) "plate_a"))
+        [id-b asm] (assembly/add-instance asm part (assembly/affine3-identity) "plate_b")
+        asm (assembly/add-constraint asm (assembly/mate-constraint id-a 200 id-b 201))
+        [status _] (assembly/solve asm)]
+    (is (= :ok status))
+    (let [asm (assembly/add-constraint asm (assembly/distance-constraint id-a 200 999 201 5.0))
+          [status _] (assembly/solve asm)]
+      (is (= :error status)))))
+
+;; ── brep.kernel vector math (previously only exercised indirectly via
+;; make-box / bounding-box; not covered by the original Rust test suite,
+;; which had no standalone DVec3 unit tests) ──
+
+(deftest vec3-add-sub-scale
+  (is (= [4.0 6.0 8.0] (k/v+ [1.0 2.0 3.0] [3.0 4.0 5.0])))
+  (is (= [1.0 1.0 1.0] (k/v- [4.0 5.0 6.0] [3.0 4.0 5.0])))
+  (is (= [2.0 4.0 6.0] (k/v-scale [1.0 2.0 3.0] 2.0))))
+
+(deftest vec3-dot-cross
+  (is (= 32.0 (k/v-dot [1.0 2.0 3.0] [4.0 5.0 6.0])))
+  (is (= [0.0 0.0 1.0] (k/v-cross [1.0 0.0 0.0] [0.0 1.0 0.0]))))
+
+(deftest vec3-length-normalize-distance
+  (is (= 5.0 (k/v-length [3.0 4.0 0.0])))
+  (is (= [1.0 0.0 0.0] (k/v-normalize [5.0 0.0 0.0])))
+  (is (= 5.0 (k/v-distance [0.0 0.0 0.0] [3.0 4.0 0.0]))))
+
+(deftest vec3-min-max
+  (is (= [1.0 1.0 1.0] (k/v-min [1.0 5.0 1.0] [5.0 1.0 5.0])))
+  (is (= [5.0 5.0 5.0] (k/v-max [1.0 5.0 1.0] [5.0 1.0 5.0]))))
+
+;; ── brep.kernel curve evaluation (not covered by the original Rust test
+;; suite or the initial CLJC restoration's test file) ──
+
+(deftest curve-evaluate-line
+  (is (= [5.0 0.0 0.0] (k/curve-evaluate (k/line-curve [0.0 0.0 0.0] [1.0 0.0 0.0]) 5.0))))
+
+(deftest curve-evaluate-circle-stays-on-radius
+  (testing "every evaluated point of a circle curve is `radius` from `center` (invariant, independent of frame choice)"
+    (let [curve (k/circle-curve [1.0 2.0 3.0] [0.0 0.0 1.0] 2.0)]
+      (doseq [t [0.0 (/ Math/PI 4) (/ Math/PI 2) Math/PI (* 1.5 Math/PI)]]
+        (let [p (k/curve-evaluate curve t)]
+          (is (close? (k/v-distance p [1.0 2.0 3.0]) 2.0 1e-9)))))))
+
+(deftest curve-evaluate-bspline-linear-degree1
+  (testing "degree-1 clamped bspline reduces to linear interpolation between the two control points"
+    (let [curve (k/bspline-curve 1 [[0.0 0.0 0.0] [10.0 0.0 0.0]] [0.0 0.0 1.0 1.0])
+          p (k/curve-evaluate curve 0.5)]
+      (is (close? (nth p 0) 5.0 1e-9)))))
+
+;; ── brep.feature edge cases (not covered by the original Rust test
+;; suite's happy-path tests) ──
+
+(deftest feature-evaluate-empty-tree-errors
+  (let [[status _] (feature/evaluate (feature/feature-tree))]
+    (is (= :error status))))
+
+(deftest sketch-plane-normal-and-origin
+  (is (= [0.0 0.0 1.0] (feature/sketch-plane-normal (feature/sketch-plane-xy))))
+  (is (= [0.0 1.0 0.0] (feature/sketch-plane-normal (feature/sketch-plane-xz))))
+  (is (= [1.0 0.0 0.0] (feature/sketch-plane-normal (feature/sketch-plane-yz))))
+  (is (= [0.0 0.0 0.0] (feature/sketch-plane-origin (feature/sketch-plane-xy))))
+  (let [custom (feature/sketch-plane-custom [1.0 1.0 1.0] [0.0 5.0 0.0])]
+    (is (= [1.0 1.0 1.0] (feature/sketch-plane-origin custom)))
+    (is (= [0.0 1.0 0.0] (feature/sketch-plane-normal custom)))))
+
+;; ── brep.assembly edge cases (not covered by the original Rust test
+;; suite's happy-path tests) ──
+
+(deftest active-count-excludes-suppressed
+  (let [part (assembly/part-ref 1 "washer")
+        [id1 asm] (-> (assembly/assembly "a")
+                      (assembly/add-instance part (assembly/affine3-identity) "w1"))
+        [_id2 asm] (assembly/add-instance asm part (assembly/affine3-identity) "w2")]
+    (is (= 2 (assembly/active-count asm)))
+    (let [asm (update asm :instances
+                       (fn [is] (mapv (fn [i] (if (= (:id i) id1) (assoc i :suppressed true) i)) is)))]
+      (is (= 1 (assembly/active-count asm))))))
+
+;; ── brep.config EDN authority (config.cljc is the portable inline
+;; mirror; resources/brep/tessellation.edn is the human-editable
+;; authority; the two must stay byte-for-byte in sync) ──
+
+#?(:clj
+   (deftest edn-matches-resource
+     (is (= (loader/load-edn-resource loader/resource-path) config/config)
+         "resources/brep/tessellation.edn must stay byte-for-byte in sync with brep.config/config")))
+
+(deftest config-values-loaded
+  (is (= 24 config/cylinder-segments))
+  (is (= 16 config/sphere-u-segments))
+  (is (= 12 config/sphere-v-segments)))
+
+;; ── brep.step: ISO 10303-21 (STEP) reader/writer round-trip (new --
+;; entity mapping/parameter order checked against steptools.com's
+;; reference AP203 sample block.stp before writing this; correctness
+;; here is validated by round-trip topology/volume/area equality, since
+;; box-and-arbitrary-real-file compatibility beyond the LINE/PLANE subset
+;; this reader supports isn't attempted -- see brep.step's docstring) ──
+
+(deftest step-round-trip-preserves-box-topology
+  (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [10.0 20.0 30.0])
+        text (step/write-step solid edges verts)
+        [solid2 edges2 verts2] (step/read-step text)]
+    (is (= (k/face-count solid) (k/face-count solid2) 6))
+    (is (= (k/edge-count solid) (k/edge-count solid2) 12))
+    (is (= (k/vertex-count solid edges) (k/vertex-count solid2 edges2) 8))
+    (is (= (count verts) (count verts2) 8))))
+
+(deftest step-round-trip-preserves-bounding-box
+  (let [[solid edges verts] (k/make-box 1 [-5.0 -5.0 -5.0] [5.0 5.0 5.0])
+        text (step/write-step solid edges verts)
+        [solid2 edges2 verts2] (step/read-step text)]
+    (is (= (k/bounding-box solid edges verts) (k/bounding-box solid2 edges2 verts2)))))
+
+(deftest step-round-trip-preserves-volume-and-area
+  (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [2.0 3.0 4.0])
+        text (step/write-step solid edges verts)
+        [solid2 edges2 verts2] (step/read-step text)]
+    (is (= (tessellate/volume solid edges verts) (tessellate/volume solid2 edges2 verts2)))
+    (is (= (tessellate/surface-area solid edges verts) (tessellate/surface-area solid2 edges2 verts2)))))
+
+(deftest step-write-emits-real-ap203-entities
+  (testing "the exact entity names + physical-file framing a real STEP
+            reader (or a human) would look for"
+    (let [[solid edges verts] (k/make-box 1 [0.0 0.0 0.0] [1.0 1.0 1.0])
+          text (step/write-step solid edges verts)]
+      (is (str/starts-with? text "ISO-10303-21;"))
+      (is (str/includes? text "END-ISO-10303-21;"))
+      (doseq [entity ["CARTESIAN_POINT" "DIRECTION" "VECTOR" "LINE" "PLANE"
+                       "VERTEX_POINT" "EDGE_CURVE" "ORIENTED_EDGE" "EDGE_LOOP"
+                       "FACE_BOUND" "ADVANCED_FACE" "CLOSED_SHELL" "MANIFOLD_SOLID_BREP"]]
+        (is (str/includes? text entity) (str "missing " entity))))))
+
+(deftest step-write-rejects-cylinder
+  (testing "make-cylinder solids are refused, not silently mis-exported as
+            flat-faced approximations (see brep.step's docstring)"
+    (let [[solid edges verts] (k/make-cylinder 1 [0.0 0.0 0.0] [0.0 0.0 1.0] 2.0 5.0)]
+      (is (thrown? #?(:clj Exception :cljs js/Error) (step/write-step solid edges verts))))))
