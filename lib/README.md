@@ -126,6 +126,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.epub` | `org.w3.epub/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.turtle` | `org.w3.turtle/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.vc` | `org.w3.vc/src` | `` (an external specification, publisher w3.org) |
+| `kotoba.screen` | `kotoba.screen/src` | `` (Kotoba project library) |
 | `kotoba.repository` | `kotoba.repository/src` | `` (Kotoba project library) |
 | `kotoba.pluginHermes` | `kotoba.pluginHermes/src` | `` (Kotoba project library) |
 | `kotoba.osMessaging` | `kotoba.osMessaging/src` | `` (Kotoba project library) |
