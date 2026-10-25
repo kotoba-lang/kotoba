@@ -1,0 +1,30 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_isaacworldhandle_free: (a: number, b: number) => void;
+export const isaacworldhandle_add_articulation_from_urdf: (a: number, b: number, c: number) => number;
+export const isaacworldhandle_apply_effort_action: (a: number, b: number, c: number, d: number) => void;
+export const isaacworldhandle_apply_position_action: (a: number, b: number, c: number, d: number) => void;
+export const isaacworldhandle_current_time: (a: number) => number;
+export const isaacworldhandle_current_time_step_index: (a: number) => number;
+export const isaacworldhandle_dof_names: (a: number, b: number) => [number, number];
+export const isaacworldhandle_get_joint_positions: (a: number, b: number) => [number, number];
+export const isaacworldhandle_get_joint_velocities: (a: number, b: number) => [number, number];
+export const isaacworldhandle_get_physics_dt: (a: number) => number;
+export const isaacworldhandle_get_world_pose: (a: number, b: number, c: number, d: number) => [number, number];
+export const isaacworldhandle_new: (a: number) => number;
+export const isaacworldhandle_num_dof: (a: number, b: number) => number;
+export const isaacworldhandle_reset: (a: number) => void;
+export const isaacworldhandle_set_gains: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const isaacworldhandle_set_joint_efforts: (a: number, b: number, c: number, d: number) => void;
+export const isaacworldhandle_set_joint_positions: (a: number, b: number, c: number, d: number) => void;
+export const isaacworldhandle_set_joint_velocities: (a: number, b: number, c: number, d: number) => void;
+export const isaacworldhandle_set_max_efforts: (a: number, b: number, c: number, d: number) => void;
+export const isaacworldhandle_step: (a: number) => void;
+export const kamiIsaacSimWasmVersion: () => [number, number];
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __externref_drop_slice: (a: number, b: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_start: () => void;

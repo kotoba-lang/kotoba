@@ -1,0 +1,470 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{authblk}
+\usepackage[hidelinks]{hyperref}
+\usepackage{cleveref}
+
+\setlength{\emergencystretch}{2em}
+
+\title{\textbf{$\sqrt{S}$ KV-Cache Residency for Long-Context LLM Decode:\\
+Real Costs, Real Correctness, and a Real Capability Unlock\\
+on Memory-Constrained Hardware}}
+
+\author[1]{Jun Kawasaki}
+\affil[1]{com-junkawasaki / etzhayyim / gftdcojp}
+\date{July 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autoregressive decode stores a key--value (KV) cache that grows linearly
+with sequence length $S$; on memory-constrained hardware this cache, not
+model weights, is what prevents a model from reaching the long context it
+was trained for. We study \emph{$\sqrt{S}$ residency}: partition the
+sequence into blocks of stride $b\approx\sqrt{S\log S}$, keep only boundary
+checkpoints plus one active block resident, and page the rest from host
+memory or disk, combined with online-softmax so attention stays exact. The
+checkpoint-and-recompute pattern itself is classical --- it is the
+reverse-mode-differentiation checkpointing of
+Griewank--Walther~\cite{griewank2000revolve} and
+Chen~et~al.~\cite{chen2016checkpoint}; we borrow Williams'
+(STOC~2025)~\cite{williams2025} improved stride formula as a
+\emph{principled default} for the block size, not as a claim that
+Transformer decode is a multitape Turing machine or that this technique
+depends on his proof. We validate the full chain empirically, not just the
+storage-ratio headline: (1)~\textbf{correctness end-to-end} --- a real
+\texttt{Cache} implementation fused into a real multi-token generation loop
+produces byte-identical output to standard full-KV decode, not just a
+single-tensor numerical check; (2)~\textbf{honest cost} --- re-paging the
+non-resident set every decode step is $2.2$--$3.7\times$ slower, measured
+two independent ways on NVIDIA A100, worsening with $S$; (3)~a
+\textbf{competitive comparison} --- at the $\sim\!90\%$ compression ratio
+this method's own headline claims, three lossy eviction baselines
+(StreamingLLM~\cite{xiao2023streamingllm}, a norm-based scorer, and
+SnapKV~\cite{li2024snapkv}) score $0\%$ accuracy on a needle-retrieval task
+where $\sqrt{S}$ residency is exact by construction; (4)~a
+\textbf{hardware-specific finding} on Apple Silicon's unified memory: naive
+host offloading does \emph{not} free usable memory there (measured, not
+assumed), while memory-mapped paging does, confirmed up to $6.3\,\mathrm{GB}$
+of non-resident data at $0.0\,\mathrm{MB}$ RSS cost; and (5)~a
+\textbf{real capability unlock}: on a real 9B model with a $1.05\times10^6$
+token native context, a $16\,\mathrm{GB}$ Mac can reach only $6.1\%$ of that
+context without this technique. We also report negative results
+transparently: whole-prefix recompute is not a peak-memory win, and neither
+the PyTorch/HuggingFace nor the MLX reference implementation of DeepSeek-V2's
+Multi-head Latent Attention~\cite{deepseekv2} actually caches its compressed
+latent, so true composability with an \emph{absorbed}-cache MLA
+implementation remains open. Code and JSON benchmarks:
+\texttt{github.com/gftdcojp/cloud-murakumo}.
+\end{abstract}
+
+\section{Introduction}
+
+Autoregressive Transformers store key/value tensors for every past token.
+For sequence length $S$, layers $L$, KV heads $H_{\mathrm{kv}}$, and head
+dimension $d$, the cache occupies
+\begin{equation}
+  \mathrm{KVBytes}(S)
+  \;=\;
+  2\, L\, H_{\mathrm{kv}}\, d\, S\, \mathrm{sizeof}(\mathrm{dtype}),
+\end{equation}
+i.e.\ $\Theta(S)$ for fixed model shape. On cloud GPUs this competes with
+batching headroom; on memory-constrained hardware --- a laptop, a phone, an
+embedded device --- it can be the difference between a model running at all
+and not. \textbf{This paper's framing is capability, not speed}: we ask
+whether a model can be made to reach a context length it otherwise could
+not on a fixed memory budget, accepting a decode-latency cost as the price.
+
+Reducing peak memory by trading it for recomputation is a decades-old idea
+in the reverse-mode automatic differentiation literature: divide a
+computation into $\Theta(\sqrt{t})$ segments, keep $\Theta(\sqrt{t})$
+checkpoints, and recompute the rest on demand, giving
+$\Theta(\sqrt{t})$ space at $O(1)$--$O(\log t)$ recomputation
+overhead~\cite{griewank2000revolve}. Chen et al.\ brought the same idea to
+neural network training memory~\cite{chen2016checkpoint}. Independently,
+Williams (STOC~2025) improved the generic simulation of time by space for
+multitape Turing machines from Hopcroft--Paul--Valiant's
+$O(t/\log t)$~\cite{hpv1977} to $O(\sqrt{t\log t})$, via a reduction to Tree
+Evaluation and the space-efficient algorithm of
+Cook--Mertz~\cite{cookmertz2024}. The two lines of work converge on the same
+block-size arithmetic; we adopt Williams' specific stride formula
+$b\approx\sqrt{S\log S}$ as a principled default because it is what his
+optimization derives, \emph{not} because we claim any complexity-theoretic
+relationship between his multitape-TM result and Transformer decode.
+
+\paragraph{Question.} Applied to LLM KV caches with this stride, does
+checkpoint-and-page reduce measured device memory, and --- the part prior
+storage-only reports (including an earlier draft of this paper) did not
+answer --- what does it actually cost, is it actually correct end-to-end,
+how does it compare to the field it competes with, and does it hold up on
+consumer hardware where the memory architecture itself differs from a
+discrete GPU?
+
+\paragraph{Contributions.}
+(1)~An honest transfer map from the classical checkpointing parameters
+$(t,b,h)$, with Williams' stride formula as one specific instantiation, to
+LLM parameters $(S,b,h)$.
+(2)~Storage-residency measurements across seven real models, 135M to 35B
+parameters, Apple Silicon and NVIDIA A100.
+(3)~A real \texttt{Cache} subclass fused into a real multi-token decode
+loop proving exact correctness end-to-end, with a real, two-method-validated
+measurement of the decode-throughput cost this exactness carries.
+(4)~A head-to-head comparison against production eviction baselines
+(kvpress: StreamingLLM, a norm-based scorer, SnapKV) at matched compression
+ratio, quantifying the exactness/latency tradeoff instead of asserting it.
+(5)~A hardware-specific empirical finding on Apple Silicon unified memory
+that overturns a discrete-GPU intuition, plus a real capability-unlock
+measurement on two real models at 16GB/32GB memory budgets.
+(6)~Negative results, reported as such: whole-prefix recompute is not a
+peak-memory win, and MLA's absorbed-cache optimization is absent from both
+reference implementations we inspected.
+
+\section{Background: what we transfer, and what we do not}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Theory/systems object & Serving analogue \\
+\midrule
+Checkpoint interval (Griewank; Chen et al.) & Boundary checkpoint stride \\
+Williams' optimal stride $b\approx\sqrt{t\log t}$ & KV checkpoint stride $b(S)$ \\
+Segments between checkpoints & Non-resident (paged) KV blocks \\
+Recomputation on demand & Host/disk paging + online softmax \\
+Multitape Turing machine & \textbf{Not claimed} for Transformer decode \\
+\bottomrule
+\end{tabular}
+\end{center}
+We transfer \emph{parameter balancing + block recompute/paging}. We do
+\emph{not} claim, and nothing in \Cref{sec:method} depends on, a
+complexity-theoretic embedding of attention into multitape TMs, Tree
+Evaluation, or the Cook--Mertz algorithm. A proof that Transformer decode
+lies in $\mathsf{SPACE}[\tilde O(\sqrt{S})]$ in the multitape sense would
+require a full TM accounting of arithmetic and random-access issues that
+Williams himself flags for non-oblivious models; we do not attempt or need
+that theorem.
+
+\section{Method: $\sqrt{S}$ KV residency}
+\label{sec:method}
+
+Following Williams' warm-up optimum (log base absorbed in constants):
+\begin{equation}
+  b(S)=\Big\lceil\sqrt{S\ln S}\Big\rceil,\qquad
+  h(S)=\Big\lceil S/b(S)\Big\rceil.
+\end{equation}
+After a real model prefill producing full K/V of length $S$, retain only
+\begin{equation}
+  \mathcal{K}
+  \;=\;
+  \{0,b,2b,\ldots\}
+  \;\cup\;
+  \{S-b,\ldots,S-1\}.
+\end{equation}
+Report $\mathrm{nbytes}(\mathcal{K})/\mathrm{nbytes}([0..S))$.
+Decode pages non-resident blocks from host or disk and combines them with
+\emph{online softmax} (exact attention without materializing $S\times S$
+scores for a single query) --- this is where correctness must be proven,
+not assumed, since a bug in the reconstruction path would silently degrade
+generation quality. \Cref{sec:e2e} does exactly that.
+
+\section{Experimental setup}
+
+\paragraph{Apple Silicon (Mac, M4, MLX).}
+SmolLM-135M-Instruct-4bit, Qwen2.5-0.5B-Instruct-4bit, Qwen2.5-14B-Instruct-4bit,
+GLM-4-9B-Chat-1M-6bit; gemma4-E4B (8B Q4) via Ollama for process-level SIZE.
+
+\paragraph{NVIDIA (Modal).}
+Qwen2.5-7B-Instruct and Qwen2.5-14B-Instruct (A100, bf16, HF Transformers
+\texttt{use\_cache=True}); Qwen3.6-35B-A3B (hybrid linear+full attention
+MoE, A100-80GB); DeepSeek-V2-Lite-Chat (A100-80GB, MLA-architected).
+
+\paragraph{Competitive baseline.} NVIDIA \texttt{kvpress} (StreamingLLM,
+a Knorm scorer, SnapKV~\cite{li2024snapkv,xiao2023streamingllm}) on
+Qwen2.5-7B-Instruct, needle-in-a-haystack retrieval.
+
+\paragraph{Reference vLLM datapoint.} vLLM~0.8.5~\cite{kwon2023vllm},
+single request, same model/context, for external throughput context (not a
+full parity comparison --- no production $\sqrt{S}$ kernel exists yet).
+
+\paragraph{Metrics.} Full vs.\ resident KV megabytes; bytes per token
+(bpt); CUDA/Metal peak allocation and \emph{process RSS} (not a
+monotonic high-water-mark); decode tokens/sec; needle-retrieval accuracy;
+$\max|\Delta|$ and exact-token-match for correctness.
+
+\section{Results: storage residency}
+
+\subsection{Dense models}
+\begin{center}
+\begin{tabular}{@{}llrrrr@{}}
+\toprule
+Platform & Model & $S$ & full KV & $\sqrt{S}$ resident & save \\
+\midrule
+Mac M4 & SmolLM-135M & 8192 & 188.7\,MB & 7.0\,MB & 96.3\% \\
+Mac M4 & Qwen2.5-0.5B & 16384 & 201.3\,MB & 5.4\,MB & 97.3\% \\
+Modal A100 & Qwen2.5-7B & 16384 & 939.5\,MB & 25.2\,MB & 97.3\% \\
+Modal A100 & Qwen2.5-14B & 16384 & 3.22\,GB & 86.5\,MB & \textbf{97.3\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Save ratio $\approx|\mathcal{K}|/S$, independent of model width, matching
+across four orders of magnitude in parameter count.
+
+\subsection{Hybrid MoE and MLA-architected models}
+Qwen3.6-35B-A3B (hybrid linear+full attention): save grows with $S$ from
+$67.9\%$ ($S{=}4096$) to $88.5\%$ ($S{=}16384$), since the linear-attention
+recurrent state is $O(1)$ in $S$ and only the full-attention K/V shrinks.
+DeepSeek-V2-Lite (MLA-architected, 16B total / 2.4B active): $93.1$--$96.3\%$
+save, matching the dense-model law --- but see \Cref{sec:mla} for why this
+does \emph{not} mean $\sqrt{S}$ residency composes with MLA's own
+compression.
+
+\subsection{Negative result: whole-prefix recompute}
+Deleting the cache and re-forwarding the whole prefix every decode step
+\emph{increases} peak device memory (Mac and Modal; ratios $1.04$--$1.70$).
+Checkpointed recomputation must be \emph{blocked}, not whole-trace.
+
+\section{Results: end-to-end correctness and real decode cost}
+\label{sec:e2e}
+
+Prior storage-ratio results (including single-tensor $\max|\Delta|$ checks)
+do not establish that a real multi-layer, multi-step decode using this
+policy is correct, nor what it costs in wall-clock terms. We close both
+gaps with a real \texttt{DynamicCache} subclass (\texttt{PagedSqrtCache})
+whose \texttt{update()} calls the framework's real per-layer update first
+--- so attention always computes on the true, complete tensors, making
+correctness a consequence of the implementation rather than a hope --- and
+performs a real GPU$\leftrightarrow$host round trip on the non-resident
+slice as a \emph{measured side effect} every decode step.
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+& baseline (full KV) & paged (real round trip) & \\
+tok/s at $S{=}8164$, 24 decode steps & 36.87 & 11.27 & $3.27\times$ slower \\
+\bottomrule
+\end{tabular}
+\end{center}
+Generated token IDs were \textbf{byte-identical} between the two paths
+(\texttt{exact\_token\_match = true}); both retrieved a needle fact planted
+in the $8192$-token context. This $3.27\times$ figure is a real, fused
+measurement (real attention/MLP compute contending with real paging in one
+coherent generation loop); an independent, isolated-transfer measurement on
+the same model gave $2.18\times$ at $S{=}8192$ and $3.66\times$ at
+$S{=}16384$, i.e.\ the slowdown \emph{worsens with context length} --- the
+same long-context regime in which the storage saving matters most. Two
+independently designed measurements agree on the order of magnitude, which
+we take as evidence this is not a measurement artifact. Measured
+GPU$\leftrightarrow$CPU bandwidth on Modal's A100 infrastructure was
+$13$--$15\,\mathrm{GB/s}$.
+
+\paragraph{Is the baseline a weak strawman?} No: a real vLLM~0.8.5 single
+request on the same model/context achieved $\sim\!28.25\,\mathrm{tok/s}$
+decode --- in the same range as, not faster than, our
+$34.7$--$36.9\,\mathrm{tok/s}$ HF-Transformers-loop baseline. (vLLM's
+advantages come from concurrent-request batching, which a single-request
+benchmark does not exercise.) The measured slowdown is real relative to a
+production-grade baseline, not an artifact of comparing against something
+deliberately unoptimized.
+
+\section{Results: competitive comparison against lossy eviction}
+
+$\sqrt{S}$ residency is exact by construction --- it relocates KV, it does
+not delete it --- so its retrieval accuracy is $100\%$ at any compression
+ratio, at the cost of \Cref{sec:e2e}'s latency tax. We ran a real
+needle-in-a-haystack test (one planted fact, $\sim\!8192$-token context, 3
+needle positions) through NVIDIA \texttt{kvpress}'s StreamingLLM, a
+Knorm-based scorer, and SnapKV, at the compression ratios this paper's own
+headline claims:
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+Press & ratio $0.5$ & ratio $0.9$ \\
+\midrule
+StreamingLLM~\cite{xiao2023streamingllm} & 67\% & 0\% \\
+Knorm & 0\% & 0\% \\
+SnapKV~\cite{li2024snapkv} & 33\% & 0\% \\
+\midrule
+full KV / $\sqrt{S}$ residency (any ratio) & 100\% & 100\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+At the $\sim\!90\%$ compression regime matching this paper's own headline
+numbers, all three lossy baselines score \emph{zero}. This is a small,
+single-task, single-model result (n=3 per condition, default
+hyperparameters) --- not a LongBench/RULER-scale evaluation, and published
+tuned configurations of these methods likely score higher --- but it gives
+the exactness/latency tradeoff a real, quantified shape instead of an
+assumed one: neither approach is free, and which cost is acceptable is a
+deployment decision.
+
+\section{MLA composability: an open question, precisely scoped}
+\label{sec:mla}
+
+Multi-head Latent Attention (MLA)~\cite{deepseekv2} compresses KV into a
+low-rank joint latent, in principle orthogonal to $\sqrt{S}$ residency's
+sequence-axis reduction, and the two should compose multiplicatively if
+$\sqrt{S}$ residency is applied \emph{to the compressed latent}. We checked
+this in both ecosystems this paper uses. In DeepSeek-V2-Lite's HuggingFace
+reference implementation, decompression via \texttt{kv\_b\_proj} happens
+\emph{before} the tensors reach the cache, so the cached tensors are
+$4$D \texttt{[1,16,S,192]}/\texttt{[1,16,S,128]} --- the decompressed,
+per-head form, larger than a comparable dense model's GQA cache at the same
+$S$. We independently checked \texttt{mlx-lm}'s DeepSeek-V2 implementation
+(the library this paper's Apple Silicon results use) and found the
+identical pattern: \texttt{kv\_b\_proj} decompression happens before
+\texttt{cache.update\_and\_fetch(...)}. This is now a
+\textbf{cross-ecosystem-confirmed} finding, not a CUDA-specific quirk: the
+``absorbed cache'' optimization that would make MLA's compression actually
+land in the cache is a specialized technique implemented only in
+production serving engines (vLLM, SGLang), not in general reference
+implementations. Neither of those engines targets Apple Metal, so
+\textbf{the real composability question --- does $\sqrt{S}$ residency
+compose with a genuinely MLA-compressed cache? --- remains open}, and
+answering it requires hooking into a CUDA absorbed-cache implementation, out
+of this paper's scope.
+
+\section{A real capability unlock on consumer hardware}
+\label{sec:mac}
+
+\subsection{Does host offloading even work on unified memory?}
+On a discrete GPU, paging crosses a real PCIe bus. Apple Silicon shares one
+physical memory pool between CPU and GPU --- no such bus exists --- raising
+a question the GPU results cannot answer: does moving KV off the
+GPU-tracked memory pool free any \emph{usable} memory there at all? We
+tested this directly rather than assuming an answer, measuring real,
+dynamic process RSS (not a high-water-mark) at each of three states, using
+real K/V from a real model prefill across all layers:
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Non-resident payload & 97\,MB & 395\,MB & 794\,MB \\
+\midrule
+mx.array $\to$ numpy (RSS $\Delta$) & $+94.6$\,MB & $+377.2$\,MB & $+869.6$\,MB \\
+numpy $\to$ disk, \texttt{write()+del()} (RSS $\Delta$) & $+2.0$\,MB & $+7.9$\,MB & $-180.8$\,MB \\
+disk, \texttt{np.memmap}, untouched (RSS $\Delta$) & \textbf{+0.0\,MB} & \textbf{+0.0\,MB} & \textbf{+0.0\,MB} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Moving data to a plain host buffer does not free real memory on unified
+memory (RSS goes up, tracking the moved size almost 1:1) --- the intuition
+from discrete-GPU offloading does not transfer. A naive
+\texttt{write()}+\texttt{delete()} disk round trip mostly does not either
+(the one exception, at the largest scale tested, is plausibly an allocator
+large-allocation \texttt{mmap} threshold being crossed, not a mechanism to
+rely on). \textbf{Only \texttt{np.memmap}-based paging reliably frees
+memory}, confirmed at exactly $0.0\,\mathrm{MB}$ RSS cost at all three
+scales, re-confirmed at $2.6$--$6.3\,\mathrm{GB}$ scale on two much larger
+real models (\Cref{sec:suitability}), with genuine on-demand partial
+residency (touching $1/24$ of a model's layers costs roughly that
+fraction, not the whole file). This is a concrete, previously-undocumented
+implementation requirement for any $\sqrt{S}$-residency kernel targeting
+Apple Silicon, not a footnote.
+
+\subsection{Which models actually need this}
+\label{sec:suitability}
+We measured real bytes-per-token and real on-disk weight size for two
+real models to find where weights fit comfortably but KV caps a model's
+own designed context short:
+
+\begin{center}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Model & weights & bpt & native $S$ & reach @ 16GB & reach @ 32GB \\
+\midrule
+Qwen2.5-14B-Instruct-4bit & 8.32\,GB & 192.0\,KB/tok & 32{,}768 & 72.6\% & 321\% \\
+GLM-4-9B-Chat-1M-6bit & 7.73\,GB & 80.0\,KB/tok & 1{,}048{,}576 & \textbf{6.1\%} & \textbf{24.8\%} \\
+\bottomrule
+\end{tabular}
+\end{center}
+GLM-4-9B-Chat-1M is the clearer case: its native context is genuinely huge
+(not a RoPE-extension trick), weights are cheap, and the KV cache alone
+caps a $16\,\mathrm{GB}$ Mac at a sixteenth of what the model was built to
+do. Under $\sqrt{S}$ residency + \texttt{mmap} paging, the resident set
+stays $O(\sqrt{S})$ regardless of context length, unlocking the gap. These
+figures are computed from real measured bpt and weight size, not
+extrapolated from a spec sheet; the crossover $S$ itself was not
+materialized (this hardware runs many concurrent workloads, and a naive
+$100\mathrm{k}{+}$-token full-KV prefill would be an irresponsible stress
+test of shared infrastructure).
+
+\section{Discussion}
+
+$\sqrt{S}$ residency matters operationally for long context
+($S\gtrsim 32$--$128\mathrm{k}$), high bpt (MHA, many layers, fp16 KV), and
+memory-constrained hardware --- cloud multi-tenant packing \emph{and}
+on-device serving alike. PagedAttention~\cite{kwon2023vllm} manages
+fragmentation of a still-$\Theta(S)$ cache; FlashAttention~\cite{dao2022flash}
+tiles for IO without reducing asymptotic stored KV. $\sqrt{S}$ residency
+reduces \emph{how many token slots are stored}, at the cost of paging
+bandwidth --- the classical checkpointing tradeoff, now measured rather
+than asserted, and shown to have a different correct implementation on
+unified-memory hardware than on discrete GPUs.
+
+We reframe this paper's value proposition accordingly: the contribution is
+not decode speed --- decode is reliably slower, sometimes by nearly $4\times$
+--- but the ability to run a longer context or a model that would not
+otherwise fit a memory budget at all, which \Cref{sec:mac} shows is a real,
+measurable, sometimes dramatic effect ($1{,}048{,}576/64{,}374\approx 16.3\times$
+more usable context on a real model at $16\,\mathrm{GB}$, from $6.1\%$ to
+effectively all of its native window).
+
+Product surface: \texttt{cloud-murakumo} \texttt{:serve :kv-policy}
+(\texttt{:sqrt-checkpoint} / \texttt{:sqrt-plus-page}); no production
+kernel exists yet, and the vLLM/SGLang comparison in \Cref{sec:e2e} is one
+external reference point, not a completed parity evaluation.
+
+\section{Conclusion}
+
+Checkpoint-and-recompute is a classical technique; Williams' STOC~2025
+result supplies one principled block-size formula for it, not its
+justification. Applied to LLM KV caches, it cuts storage by roughly an
+order of magnitude across seven real models from 135M to 35B parameters.
+What this paper adds beyond that storage ratio is validation of the parts
+that determine whether the technique is actually usable: correctness holds
+end-to-end (not just in a single tensor check), the decode-latency cost is
+real and quantified two independent ways, the exactness/cost tradeoff
+against lossy competitors is measured rather than assumed, and on Apple
+Silicon specifically, the correct implementation mechanism (\texttt{mmap},
+not naive host offload) had to be discovered empirically because the
+discrete-GPU intuition does not hold. On a real model with a
+$1.05\times10^{6}$-token native context, this technique is the difference
+between using $6\%$ and effectively all of that context on a $16\,\mathrm{GB}$
+Mac. What remains open is stated plainly: true composability with an
+absorbed-cache MLA implementation, and a production serving kernel.
+
+\section*{Reproducibility}
+\begin{verbatim}
+# Mac (MLX)
+python scripts/bench_sqrt_kv_mac.py \
+  --model mlx-community/SmolLM-135M-Instruct-4bit
+python scripts/bench_sqrt_kv_mac_memory_capability.py
+python scripts/bench_sqrt_kv_mac_model_suitability.py \
+  --model mlx-community/glm-4-9b-chat-1m-6bit
+
+# Modal (CUDA)
+modal run scripts/modal_sqrt_kv_bench.py \
+  --model-id Qwen/Qwen2.5-7B-Instruct --gpu A100
+modal run scripts/modal_sqrt_kv_paged_cache_bench.py
+modal run scripts/modal_sqrt_kv_kvpress_bench.py
+modal run scripts/modal_sqrt_kv_mla_bench.py
+modal run scripts/modal_vllm_baseline_bench.py
+\end{verbatim}
+Artifacts: \texttt{docs/benchmarks/sqrt-kv-*.json} in
+\texttt{gftdcojp/cloud-murakumo}. Full evidence trail and maturity ladder:
+ADR~2607182800 in \texttt{com-junkawasaki/root}
+(\texttt{90-docs/adr/}).
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

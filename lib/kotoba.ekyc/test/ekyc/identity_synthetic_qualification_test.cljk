@@ -1,0 +1,124 @@
+(ns ekyc.identity-synthetic-qualification-test
+  (:require [cljs.test :refer-macros [deftest is async]]
+            [ekyc.passport :as p]
+            [ekyc.identity-intake :as intake]
+            [ekyc.identity-intake-host :as host]
+            [ekyc.identity-crypto :as crypto]
+            [ekyc.identity-key-service :as kms]
+            [ekyc.kotobase-storage-adapter :as kstorage]
+            [ekyc.researcher-profile :as profile]))
+
+(def now 1789330000000)
+
+(deftest test-synthetic-qualification-lifecycle
+  (async done
+    (let [kms-provider (kms/make-in-memory-key-provider)
+          reviewer-principal "urn:kotoba:principal:reviewer-1"
+          applicant-principal "urn:kotoba:principal:applicant-1"
+          key-id "reviewer-2026-key"
+          reviewer-keys (atom nil)
+          applicant-keys (atom nil)
+          public-jwk (atom nil)
+          applicant-jwk (atom nil)
+          ports (kstorage/make-kotobase-ports {:key-service kms-provider
+                                               :intake-enabled? true
+                                               :notice-approved? true})
+          case-id-atom (atom nil)
+          nonce-atom (atom nil)
+          doc-bytes (.encode (js/TextEncoder.) "sample document JPEG bytes")
+          video-bytes (.encode (js/TextEncoder.) "sample video WEBM bytes")]
+      (-> (.generateKey (.-subtle js/crypto) "Ed25519" true #js ["sign" "verify"])
+          (.then (fn [k]
+                   (reset! reviewer-keys k)
+                   (.exportKey (.-subtle js/crypto) "jwk" (.-publicKey k))))
+          (.then (fn [jwk]
+                   (reset! public-jwk (select-keys (js->clj jwk :keywordize-keys true) [:kty :crv :x]))
+                   (crypto/holder-key-id @public-jwk)))
+          (.then (fn [thumb]
+                   (-> ((:read! ports))
+                       (.then (fn [{:keys [revision state]}]
+                                ((:cas! ports) revision
+                                 (-> state
+                                     (update :reviewers conj reviewer-principal)
+                                     (assoc-in [:reviewer-keys reviewer-principal]
+                                               {:status :active :key-id key-id
+                                                :key-thumbprint thumb :public-jwk @public-jwk}))))))))
+          (.then (fn [_]
+                   (.generateKey (.-subtle js/crypto) "Ed25519" true #js ["sign" "verify"])))
+          (.then (fn [ak]
+                   (reset! applicant-keys ak)
+                   (.exportKey (.-subtle js/crypto) "jwk" (.-publicKey ak))))
+          (.then (fn [ajwk]
+                   (reset! applicant-jwk (select-keys (js->clj ajwk :keywordize-keys true) [:kty :crv :x]))
+                   (let [start-claims {:principal applicant-principal :aud "https://kotoba.cloud" :action "start"
+                                       :consent true :notice-version intake/version :purpose "whitehat testing"
+                                       :scope "security audits" :researcher-profile {:version profile/version :affiliation {:kind "independent"} :qualification-status "none" :qualifications []}
+                                       :iat (crypto/seconds now) :exp (+ (crypto/seconds now) 120)}]
+                     (-> (crypto/sign (.-privateKey @applicant-keys) "holder" "kotoba-intake+jwt" start-claims)
+                         (.then (fn [signed-start]
+                                  (host/dispatch! ports "start" applicant-principal
+                                                  {:holderJwk @applicant-jwk :proof signed-start}
+                                                  now)))))))
+          (.then (fn [start-receipt]
+                   (reset! case-id-atom (:id start-receipt))
+                   (reset! nonce-atom (:nonce start-receipt))
+                   (is (some? @case-id-atom))
+                   (is (some? @nonce-atom))
+                   (host/dispatch! ports "upload" applicant-principal
+                                   {:id @case-id-atom :slot "document" :mediaType "image/jpeg" :bytes doc-bytes}
+                                   now)))
+          (.then (fn [_]
+                   (host/dispatch! ports "upload" applicant-principal
+                                   {:id @case-id-atom :slot "live-video" :mediaType "video/webm" :bytes video-bytes}
+                                   now)))
+          (.then (fn [_]
+                   (p/sha256 doc-bytes)))
+          (.then (fn [doc-digest]
+                   (-> (p/sha256 video-bytes)
+                       (.then (fn [vid-digest]
+                                (let [submit-claims {:principal applicant-principal :aud "https://kotoba.cloud"
+                                                     :action "submit" :id @case-id-atom :nonce @nonce-atom
+                                                     :document-digest doc-digest :video-digest vid-digest
+                                                     :iat (crypto/seconds now) :exp (+ (crypto/seconds now) 120)}]
+                                  (-> (crypto/sign (.-privateKey @applicant-keys) "holder" "kotoba-intake+jwt" submit-claims)
+                                      (.then (fn [signed-submit]
+                                               (host/dispatch! ports "submit" applicant-principal
+                                                               {:id @case-id-atom :proof signed-submit}
+                                                               now))))))))))
+          (.then (fn [_]
+                   (host/dispatch! ports "status" reviewer-principal {} now)))
+          (.then (fn [st]
+                   (is (= true (:reviewer st)))
+                   (is (= 1 (count (:queue st))))
+                   (host/dispatch! ports "claim" reviewer-principal {:id @case-id-atom} now)))
+          (.then (fn [_]
+                   ((:read! ports))))
+          (.then (fn [st]
+                   (is (some? (get-in (:state st) [:intake @case-id-atom :revision])))))
+          (.then (fn [_]
+                   (host/dispatch! ports "evidence" reviewer-principal {:id @case-id-atom :slot "document"} now)))
+          (.then (fn [ev]
+                   (is (= "image/jpeg" (:media-type ev)))
+                   (is (= "sample document JPEG bytes" (.decode (js/TextDecoder.) (:bytes ev))))
+                   ((:read! ports))))
+          (.then (fn [st]
+                   (let [curr-rev (get-in (:state st) [:intake @case-id-atom :revision])
+                         review-claims {:actor reviewer-principal :aud "https://kotoba.cloud" :action "reject"
+                                        :id @case-id-atom :reason "document-unreadable"
+                                        :expected-revision curr-rev
+                                        :iat (crypto/seconds now) :exp (+ (crypto/seconds now) 120)}]
+                     (-> (crypto/sign (.-privateKey @reviewer-keys) key-id "kotoba-intake-review+jwt" review-claims)
+                         (.then (fn [signed-review]
+                                  (host/dispatch! ports "decision" reviewer-principal
+                                                  {:id @case-id-atom :proof signed-review}
+                                                  now)))))))
+          (.then (fn [decision-res]
+                   (is (some? decision-res))
+                   (host/dispatch! ports "delete" reviewer-principal {:id @case-id-atom} now)))
+          (.then (fn [delete-res]
+                   (is (= :committed (:status delete-res)))
+                   (-> (host/dispatch! ports "evidence" reviewer-principal {:id @case-id-atom :slot "document"} now)
+                       (.then (fn [_] (is false "Evidence should not be accessible after deletion"))
+                              (fn [err] (is (some? err)))))))
+          (.catch (fn [e] (is false (str "Synthetic qualification failure: " e))))
+          (.finally done)))))

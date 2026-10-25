@@ -1,0 +1,185 @@
+(ns collect-site-contact-points
+  "**サイト URL から**公開連絡点を集める。法人番号を一度も引かない。
+
+   判断は `kotoba.property.contact-point`（純 cljc）、fetch は
+   `kotoba.property.site-probe`。ここは引数と入出力だけを持つ。
+
+   ## なぜ registry を起点にしない口が要るか
+
+   `collect_contact_points.cljs` は法人番号 -> gBizINFO -> `company_url` の順で
+   歩く。実測 2026-08-26、節税 ICP（届出認定を持つ中小製造業）の gBizINFO URL
+   保有率は **4%** で、母集団の 96% に対して**起点そのものが存在しなかった**。
+   台帳のメール保有率が 1.0% で止まっていたのは収集器の出来ではなく、
+   **この ICP がメールを公開していない**ことによる。
+
+   だからこちらは URL の側から始める。入力は 1 行 1 サイト:
+
+     `名前<TAB>URL<TAB>区分<TAB>経路`   （区分・経路は任意）
+
+   4 列目の「経路」は `:site/discovery-query` に入る。**どの検索の結果その行が
+   在るかを行に残す** —— 経路ごとに率が違うことが実測で判ったので、経路を捨てると
+   混ざった率しか出せなくなる（実測 2026-08-26: 同じ「税理士事務所」でも、一般語の
+   検索で上位に出る事務所と、地方都市名を含む長尾の検索で出る事務所とで、窓口メールの
+   公開率が桁で違った）。
+
+   ## 何を守るか（日本側の台帳と同じ規律）
+
+   - **窓口メールだけを出力する。** 個人名のアドレスは `:role`/`:personal` の
+     判定で落とし、件数だけ `:contact/personal-emails-excluded` に残す。
+   - **robots.txt を毎回引き、拒まれたパスに行かない。** UA で名乗る。
+   - **営業お断りの観測**（`solicitation-forbidden?`）を通す。
+   - **`:fetch-failed`（見に行けなかった）と `:no-contact-point`（見に行けて
+     無かった）を 1 つの nil に畳まない。**
+
+   ## exit code
+
+   引数不足 3 / 答えられなかった 2 / 成功 0。1 サイトも歩けなかった run は
+   `Refusing to report a pass` で 2（空ファイルを書かない）。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_site_contact_points.cljk \\
+       --sites <tsv> --out <edn> [--limit N] [--concurrency N] [--delay-ms N]
+       [--discovery web-search] [--merge-into <edn>]"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]
+            [kotoba.property.contact-point :as cp]
+            [kotoba.property.site-probe :as probe]
+            ["fs" :as fs]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- int-arg [n d] (let [v (arg n nil)] (if v (js/parseInt v 10) d)))
+
+(defn- die! [code msg]
+  ;; ⚠ `exitCode` を立ててから throw しない —— その throw は `-main` の同期部分から
+  ;; 外へ抜けるので nbb の既定 exit 1 になり、契約した 2/3 が一度も出ない。
+  (js/console.error msg)
+  (.exit js/process code))
+
+(defn- parse-sites
+  "`名前<TAB>URL<TAB>区分`。URL の無い行は捨てる —— この経路は URL が起点なので、
+   起点の無い行を『連絡先の無いサイト』として並べると、測っていないものを測った
+   ことにしてしまう。**捨てた行は件数で返す。**"
+  [text]
+  (let [lines (->> (str/split-lines (str text))
+                   (map str/trim)
+                   (remove str/blank?)
+                   (remove #(str/starts-with? % "#")))
+        parsed (map (fn [line]
+                      (let [[nm url seg q] (str/split line #"\t")]
+                        {:name (some-> nm str/trim not-empty)
+                         :url (some-> url str/trim not-empty)
+                         :segment (some-> seg str/trim not-empty)
+                         :query (some-> q str/trim not-empty)}))
+                    lines)]
+    {:sites (vec (filter #(cp/normalise-url (:url %)) parsed))
+     :dropped (count (remove #(cp/normalise-url (:url %)) parsed))
+     :read (count lines)}))
+
+(defn- process-one [{:keys [name url segment] :as site} discovery delay-ms]
+  (-> (probe/probe-site url {:delay-ms delay-ms})
+      (.then (fn [obs]
+               (let [rec (cp/->site-record (assoc site :discovery discovery) obs)]
+                 (js/console.error
+                  (str "  " (clojure.core/name (:lead/status rec)) "  "
+                       (or (:site/name rec) url)
+                       (when-let [es (seq (:contact/emails rec))]
+                         (str "  <" (str/join " " es) ">"))
+                       (when-let [n (:contact/personal-emails-excluded rec)]
+                         (str "  [personal x" n " excluded]"))))
+                 {:record rec})))
+      (.catch (fn [e]
+                ;; 1 サイトの失敗で run 全体を落とさない。**ただし黙って消さない** ——
+                ;; 行として残せないなら、せめて skipped として数える。
+                (js/console.error (str "  worker error on " url ": " (.-message e)))
+                {:skipped true}))))
+
+(defn- process-all
+  "worker `n` 本。ホストが違う fetch は互いを待たないのでここが効く。
+   **`n` を上げすぎない** —— 相手は 1 サイトあたり数リクエストを受ける側である。"
+  [sites discovery delay-ms n]
+  (let [pending (atom (vec sites))
+        records (atom [])
+        skipped (atom 0)
+        done (atom 0)
+        total (count sites)
+        take-one! (fn [] (let [[head & tail] @pending]
+                           (when head (reset! pending (vec tail)) head)))]
+    (letfn [(worker []
+              (if-let [s (take-one!)]
+                (-> (process-one s discovery delay-ms)
+                    (.then (fn [{:keys [record]}]
+                             (if record (swap! records conj record) (swap! skipped inc))
+                             (let [d (swap! done inc)]
+                               (when (zero? (mod d 25))
+                                 (js/console.error (str "  ... " d "/" total))))
+                             (worker))))
+                (js/Promise.resolve nil)))]
+      (-> (js/Promise.all (clj->js (vec (repeatedly (max 1 n) worker))))
+          (.then (fn [] {:records @records :skipped @skipped}))))))
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        sites-file (arg "--sites" nil)
+        delay-ms (int-arg "--delay-ms" 400)
+        limit (int-arg "--limit" 50)
+        concurrency (int-arg "--concurrency" 4)
+        discovery (keyword (arg "--discovery" "web-search"))
+        merge-into (arg "--merge-into" nil)]
+    (when-not out (die! 3 "--out is required"))
+    (when-not sites-file (die! 3 "--sites <tsv> is required (name<TAB>url<TAB>segment)"))
+    (when-not (contains? cp/discovery-methods discovery)
+      (die! 3 (str "--discovery must be one of "
+                   (str/join " " (sort (map clojure.core/name cp/discovery-methods))))))
+    (when-not (.existsSync fs sites-file) (die! 3 (str "no such file: " sites-file)))
+    (let [existing (if (and merge-into (.existsSync fs merge-into))
+                     (vec (remove :coverage/scanned
+                                  (edn/read-string (str (fs/readFileSync merge-into "utf8")))))
+                     [])
+          already (set (keep #(cp/normalise-url (:web/url %)) existing))
+          {:keys [sites dropped read]} (parse-sites (fs/readFileSync sites-file "utf8"))
+          sites (vec (take limit (remove #(contains? already (cp/normalise-url (:url %))) sites)))]
+      (js/console.error (str "read " read " line(s); " (count sites) " site(s) to probe"
+                             (when (pos? dropped) (str "; dropped " dropped " without an absolute url"))
+                             (when (seq existing) (str "; " (count existing) " already in " merge-into))
+                             "  concurrency=" concurrency))
+      (when (zero? (count sites))
+        (die! 2 (str "Refusing to report a pass: nothing new to probe"
+                     " (read=" read " dropped=" dropped " already=" (count already) ").")))
+      (-> (process-all sites discovery delay-ms concurrency)
+          (.then
+           (fn [{:keys [records skipped]}]
+             (if (zero? (count records))
+               (die! 2 (str "Refusing to report a pass: 0 sites scanned (skipped=" skipped ")."))
+               (let [new-n (count records)
+                     records (into existing records)
+                     cov (assoc (cp/site-coverage records)
+                                :coverage/dropped-without-url dropped
+                                :coverage/skipped-by-error skipped
+                                :coverage/collected-at (probe/now)
+                                :source/attribution cp/site-attribution)]
+                 (fs/writeFileSync
+                  out (with-out-str
+                        (println ";; 生成物。手で編集しない。")
+                        (println ";; 再生成: kbb --backend sci -cp src scripts/collect_site_contact_points.cljk")
+                        (println (str ";; " cp/site-attribution))
+                        (prn (into [cov] records))))
+                 (println (str "SCANNED\t" (count records)))
+                 (when (seq existing)
+                   (println (str "PRE-EXISTING\t" (count existing)))
+                   (println (str "NEW\t" new-n)))
+                 (println (str "WITH-ROLE-EMAIL\t" (:coverage/with-role-email cov)))
+                 (println (str "EMAIL-ONLY-PERSONAL\t" (:coverage/email-only-personal cov)))
+                 (println (str "WITH-FORM-URL\t" (:coverage/with-form-url cov)))
+                 (println (str "CONTACTABLE\t" (:coverage/contactable cov)))
+                 (println (str "FORBIDDEN\t" (:coverage/solicitation-forbidden cov)))
+                 (println (str "BY-STATUS\t" (pr-str (:coverage/by-status cov))))
+                 (println (str "BY-SEGMENT\t" (pr-str (:coverage/by-segment cov))))
+                 (println (str "DROPPED-WITHOUT-URL\t" dropped))
+                 (println (str "SKIPPED\t" skipped))
+                 (println (str "OUT\t" out))))))
+          (.catch (fn [e]
+                    (js/console.error (str "collector failed: " (.-message e)))
+                    (.exit js/process 2)))))))
+
+(-main)

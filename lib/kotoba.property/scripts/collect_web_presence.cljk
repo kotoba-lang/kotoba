@@ -1,0 +1,174 @@
+(ns collect-web-presence
+  "法人番号 -> 公開面（サイト URL とフィード）を集める。
+
+   1 社につき: gBizINFO の法人基本情報で URL を引き、あればそのページを取り、
+   autodiscovery か既知パスで feed を探し、**実際に取得して中身を数える**。
+   数えられなかった候補は載せない。
+
+   出力は 2 つ:
+     --out           `:web/*` / `:press/*` の projection（面に載る）
+     --newsfeed-out  newsfeed の `resources/sources.edn` に足せる `:news.source/*`
+                     （press item の取得は既存の newsfeed に任せる。fetcher を
+                      2 つ作らない）
+
+   Requires GBIZINFO_TOKEN（env か Keychain `gbizinfo-api-token`）。無ければ exit 3。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_web_presence.cljk --numbers <file> --out <f> [--newsfeed-out <f>] [--limit N]"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.gbizinfo :as gb]
+            [kotoba.property.web-presence :as wp]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+
+(defn- token []
+  (or (.. js/process -env -GBIZINFO_TOKEN)
+      (let [r (.spawnSync cp "security"
+                          #js ["find-generic-password" "-s" "gbizinfo-api-token" "-w"]
+                          #js {:encoding "utf8"})]
+        (when (zero? (or (.-status r) 1)) (str/trim (str (.-stdout r)))))))
+
+(defn- fetch-text
+  "本文を取りに行く。落ちても例外にしない —— 1,000 社を回る job で 1 社の
+   タイムアウトが全体を止めるのは、収集器の設計としては壊れている。
+
+   `headers` を取るのは、gBizINFO がトークンをヘッダで要求するため。最初の版は
+   User-Agent しか送っておらず、**URL を持つ会社に対しても 0 件**を返した ——
+   「URL が 1 件も無い」を故障として落とす床が無ければ、そのまま空の projection を
+   commit していた。"
+  ([url ms] (fetch-text url ms nil))
+  ([url ms headers]
+   (let [ctl (js/AbortController.)
+         t (js/setTimeout #(.abort ctl) ms)]
+     (-> (js/fetch url #js {:signal (.-signal ctl)
+                            :redirect "follow"
+                            :headers (clj->js (merge {"User-Agent" "kotoba-web-presence/1.0 (+https://github.com/kotoba-lang/property)"}
+                                                     headers))})
+         (.then (fn [res]
+                  (js/clearTimeout t)
+                  (if (.-ok res)
+                    (-> (.text res) (.then (fn [b] {:ok true :body b :url (.-url res)})))
+                    {:ok false :status (.-status res)})))
+         (.catch (fn [e] (js/clearTimeout t) {:ok false :error (str (.-message e))}))))))
+
+(defn- gbiz-basic [tok n]
+  (-> (fetch-text (str gb/api-base "/" n) 20000 {gb/token-header tok})
+      (.then (fn [{:keys [ok body]}]
+               (when ok
+                 (try (let [j (js->clj (js/JSON.parse body))]
+                        (first (get j "hojin-infos")))
+                      (catch :default _ nil)))))))
+
+(defn- first-working-feed
+  "候補を順に取りに行き、**最初に中身を数えられたもの**を返す。"
+  [candidates]
+  (reduce (fn [p url]
+            (.then p (fn [found]
+                       (if found
+                         found
+                         (-> (fetch-text url 15000)
+                             (.then (fn [{:keys [ok body]}]
+                                      (when-let [m (and ok (wp/feed-measurement body))]
+                                        {:url url :measurement m}))))))))
+          (js/Promise.resolve nil)
+          candidates))
+
+(defn- probe-company [tok n state]
+  (-> (gbiz-basic tok n)
+      (.then (fn [info]
+               (swap! state update :queried inc)
+               (if-let [rec (and info (wp/basic->record n info))]
+                 (do
+                   (swap! state update :with-url inc)
+                   (-> (fetch-text (:web/url rec) 15000)
+                       (.then (fn [{:keys [ok body]}]
+                                (let [auto (when ok (wp/discover-feeds body (:web/url rec)))
+                                      guesses (map #(str (:web/url rec) %) (take 4 wp/common-feed-paths))
+                                      candidates (distinct (concat auto guesses))]
+                                  (first-working-feed candidates))))
+                       (.then (fn [found]
+                                (if found
+                                  (do (swap! state update :with-feed inc)
+                                      (wp/with-feed rec (:url found) (:measurement found)
+                                        (.toISOString (js/Date.))))
+                                  (assoc rec :source/observed-at (.toISOString (js/Date.))))))))
+                 (js/Promise.resolve nil))))))
+
+(defn -main []
+  (let [numbers-file (arg "--numbers" nil)
+        out (arg "--out" nil)
+        nf-out (arg "--newsfeed-out" nil)
+        limit (js/parseInt (arg "--limit" "0") 10)
+        tok (token)]
+    (when-not (and numbers-file out)
+      (println "usage: collect_web_presence.cljs --numbers <file> --out <file> [--newsfeed-out <file>] [--limit N]")
+      (js/process.exit 2))
+    (when (str/blank? (str tok))
+      (println (str "GBIZINFO_TOKEN is not set — refusing to run and refusing to exit 0.\n"
+                    "  URL の出所は gBizINFO なので、トークン無しでは 1 件も引けない。\n"
+                    "  security add-generic-password -s gbizinfo-api-token -a $USER -w '<token>'"))
+      (js/process.exit 3))
+    (let [all (->> (str/split (.readFileSync fs numbers-file "utf8") #"\n")
+                   (map str/trim)
+                   (filter #(re-matches #"[0-9]{13}" %))
+                   vec)
+          numbers (if (pos? limit) (vec (take limit all)) all)
+          state (atom {:queried 0 :with-url 0 :with-feed 0})
+          observed-at (.toISOString (js/Date.))
+          tmp (str out ".partial")
+          sink (.createWriteStream fs tmp)
+          records (atom [])]
+      (println (str "  " (count numbers) " company/ies to probe"))
+      (-> (reduce (fn [p [i n]]
+                    (.then p (fn [_]
+                               (-> (probe-company tok n state)
+                                   (.then (fn [rec]
+                                            (when rec
+                                              (.write sink (str (pr-str rec) "\n"))
+                                              (swap! records conj rec))
+                                            (when (zero? (mod (inc i) 100))
+                                              (println (pr-str (assoc @state :done (inc i) :of (count numbers)))))))))))
+                  (js/Promise.resolve nil)
+                  (map-indexed vector numbers))
+          (.then
+           (fn [_]
+             (.end sink
+                   (fn []
+                     (let [{:keys [queried with-url with-feed]} @state
+                           mf (wp/corpus-manifest {:observed-at observed-at
+                                                   :queried queried
+                                                   :with-url with-url
+                                                   :with-feed with-feed
+                                                   :record-count (count @records)})]
+                       (.mkdirSync fs (.dirname path out) #js {:recursive true})
+                       (.writeFileSync fs out
+                                       (str (pr-str mf) "\n" (.readFileSync fs tmp "utf8"))
+                                       "utf8")
+                       (.unlinkSync fs tmp)
+                       (when nf-out
+                         (let [sources (vec (keep wp/newsfeed-source @records))]
+                           (.writeFileSync fs nf-out
+                                           (str ";; Generated by property/scripts/collect_web_presence.cljk on "
+                                                observed-at "\n"
+                                                ";; Every feed here was FETCHED before being listed — :newsfeed/verifiedItemCount\n"
+                                                ";; is what that fetch counted. Merge into newsfeed/resources/sources.edn.\n"
+                                                (pr-str {:sources/version 1 :sources sources}) "\n")
+                                           "utf8")
+                           (println (str "  " (count sources) " verified feed(s) -> " nf-out))))
+                       ;; 0 件は「サイトを持つ会社が無かった」ではなく、ほぼ確実に
+                       ;; こちらの故障である。区別して落とす。
+                       (when (and (pos? queried) (zero? with-url))
+                         (js/console.error "collect-web-presence: queried companies but found no URL at all — that is a failure here, not a fact about them")
+                         (js/process.exit 2))
+                       (println (pr-str {:out out :queried queried :with-url with-url
+                                         :with-feed with-feed
+                                         :bytes (.-size (.statSync fs out))})))))))
+          (.catch (fn [e]
+                    (js/console.error (str "collect-web-presence failed: " (.-message e)))
+                    (js/process.exit 1)))))))
+
+(-main)

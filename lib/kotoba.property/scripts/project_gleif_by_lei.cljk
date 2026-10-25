@@ -1,0 +1,105 @@
+(ns project-gleif-by-lei
+  "Build a projection for a *known, bounded* LEI list straight from the GLEIF
+   API, without the Golden Copy corpus.
+
+   When to use which: the corpus is how you get the whole universe or a
+   jurisdiction-sized slice. This script is how you fill a join-driven
+   projection — the few thousand LEIs that already appear somewhere on the
+   query plane — because the API takes them 200 at a time, so 2,756 companies
+   is ~14 requests rather than a 3.4M-record scan.
+
+   The record shape is identical to the corpus path's (`api-record->record`
+   and `row->record` are asserted equal in the tests), so projections from
+   either source are interchangeable on the plane.
+
+   Usage:
+     kbb --backend sci -cp src scripts/project_gleif_by_lei.cljk \\
+       --lei-file /tmp/plane-leis.txt --out data/gleif-lei-joined.datoms.edn"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.gleif-golden-copy :as gc]
+            [kotoba.property.gleif-projection :as gp]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def api-root "https://api.gleif.org/api/v1/lei-records")
+(def batch-size 200)
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- fetch-batch [leis]
+  (let [url (str api-root
+                 "?filter[lei]=" (js/encodeURIComponent (str/join "," leis))
+                 "&page[size]=" batch-size)]
+    (-> (js/fetch url)
+        (.then (fn [res]
+                 (if (.-ok res)
+                   (.json res)
+                   (js/Promise.reject (js/Error. (str "GLEIF HTTP " (.-status res)))))))
+        (.then (fn [body]
+                 (->> (js->clj (.-data body) :keywordize-keys true)
+                      (keep gc/api-record->record)
+                      vec))))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        lei-file (arg-value args "--lei-file" nil)
+        out (arg-value args "--out" nil)]
+    (when-not (and lei-file out)
+      (println "usage: project_gleif_by_lei.cljs --lei-file <leis.txt> --out <projection.edn>")
+      (.exit js/process 2))
+    (coverage/assert-collectable! gc/api-source-id)
+    (let [leis (->> (str/split-lines (.readFileSync fs lei-file "utf8"))
+                    (map str/trim)
+                    (remove str/blank?)
+                    (map str/upper)
+                    distinct
+                    vec)
+          batches (partition-all batch-size leis)
+          observed-at (.toISOString (js/Date.))]
+      (println (str "requesting " (count leis) " LEI(s) in " (count batches) " batch(es)"))
+      (-> (reduce (fn [p batch]
+                    (.then p (fn [acc]
+                               (.then (fetch-batch batch)
+                                      (fn [recs] (into acc recs))))))
+                  (js/Promise.resolve [])
+                  batches)
+          (.then
+           (fn [records]
+             (let [records (vec (sort-by :company/lei records))
+                   found (into #{} (map :company/lei) records)
+                   missing (remove found leis)
+                   header (assoc (gp/projection-manifest
+                                  {:corpus/manifest true
+                                   :source/dataset gc/dataset
+                                   :source/authority gc/authority-id
+                                   :source/licence gc/licence
+                                   :source/publish (str "gleif-api " (subs observed-at 0 10))
+                                   :source/observed-at observed-at}
+                                  {:leis leis}
+                                  (count records))
+                                 :projection/source gc/api-source-id)]
+               (.mkdirSync fs (.dirname path out) #js {:recursive true})
+               (.writeFileSync fs out
+                               (str (pr-str header) "\n"
+                                    (apply str (map #(str (pr-str %) "\n") records)))
+                               "utf8")
+               ;; Requested-but-absent LEIs are reported, never silently
+               ;; dropped: a short projection and a narrow filter look the same
+               ;; from the outside.
+               (when (seq missing)
+                 (js/console.error
+                  (str "project-gleif-by-lei: WARNING " (count missing)
+                       " requested LEI(s) returned no GLEIF record and are NOT in the"
+                       " projection: " (str/join ", " (take 5 missing))
+                       (when (> (count missing) 5)
+                         (str " ... +" (- (count missing) 5) " more")))))
+               (println (pr-str {:out out
+                                 :requested (count leis)
+                                 :written (count records)
+                                 :missing (count missing)
+                                 :bytes (.-size (.statSync fs out))})))))
+          (.catch (fn [e] (println "failed:" (.-message e)) (.exit js/process 1)))))))
+
+(-main)

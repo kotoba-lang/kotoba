@@ -1,0 +1,117 @@
+(ns collect-jgrants
+  "jGrants (デジタル庁) の公開 API から補助金の**公募**カタログを集める。
+
+   The API needs no key and no account, but it also has no enumeration: a
+   `keyword` of 2+ characters is required (an empty one is HTTP 400), so this
+   unions a keyword set and records which keywords produced the result. The
+   detail endpoint is one request per programme, so it is fetched only for
+   programmes whose window is currently open.
+
+   Output is the committed artifact directly — the whole catalogue is a few
+   thousand records, which is small enough that a corpus/projection split would
+   be ceremony rather than protection.
+
+   Usage:
+     kbb --backend sci -cp src scripts/collect_jgrants.cljk --out data/jgrants-catalog.datoms.edn
+     kbb --backend sci -cp src scripts/collect_jgrants.cljk --out /tmp/j.edn --keywords 事業,補助 --no-detail"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.jgrants :as jg]
+            ["fs" :as fs]
+            ["path" :as path]))
+
+(def api "https://api.jgrants-portal.go.jp/exp/v1/public/subsidies")
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- fetch-json [url]
+  (-> (js/fetch url)
+      (.then (fn [res]
+               (if (.-ok res)
+                 (.json res)
+                 (throw (ex-info (str "HTTP " (.-status res) " for " url) {:url url})))))
+      (.then (fn [j] (js->clj j)))))
+
+(defn- list-for [kw]
+  (fetch-json (str api "?keyword=" (js/encodeURIComponent kw)
+                   "&sort=created_date&order=DESC&acceptance=0")))
+
+(defn- detail-for [id]
+  (fetch-json (str api "/id/" (js/encodeURIComponent id))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        out (arg-value args "--out" nil)
+        keywords (if-let [k (arg-value args "--keywords" nil)]
+                   (vec (remove str/blank? (map str/trim (str/split k #","))))
+                   jg/default-keywords)
+        detail? (not (flag? args "--no-detail"))
+        now (.toISOString (js/Date.))]
+    (when-not out
+      (println "usage: collect_jgrants.cljs --out <catalog.datoms.edn> [--keywords a,b] [--no-detail]")
+      (.exit js/process 2))
+    (coverage/assert-collectable! jg/source-id)
+    (-> (reduce (fn [p kw]
+                  (.then p (fn [acc]
+                             (-> (list-for kw)
+                                 (.then (fn [j]
+                                          (let [items (get j "result")
+                                                recs (keep jg/list-item->record items)]
+                                            (println (str "  " kw ": " (count items) " item(s)"))
+                                            (reduce (fn [m r] (assoc m (:subsidy/id r) r)) acc recs))))))))
+                (js/Promise.resolve {})
+                keywords)
+        (.then
+         (fn [by-id]
+           (let [recs (vec (vals by-id))
+                 open-ids (mapv :subsidy/id (filter #(jg/open-at? % now) recs))]
+             (println (str "  " (count recs) " unique programme(s), " (count open-ids) " open"))
+             (if-not detail?
+               (js/Promise.resolve {:by-id by-id :details {}})
+               ;; Sequential on purpose: a public government API answering a
+               ;; catalogue request does not need to be hit in parallel, and a
+               ;; burst is the one thing that would get this collector blocked.
+               (-> (reduce (fn [p id]
+                             (.then p (fn [acc]
+                                        (-> (detail-for id)
+                                            (.then (fn [j] (assoc acc id (first (get j "result")))))
+                                            (.catch (fn [_] acc))))))
+                           (js/Promise.resolve {})
+                           open-ids)
+                   (.then (fn [details] {:by-id by-id :details details})))))))
+        (.then
+         (fn [{:keys [by-id details]}]
+           (let [recs (->> (vals by-id)
+                           (mapv (fn [r]
+                                   (let [d (get details (:subsidy/id r))]
+                                     (cond-> (assoc r :subsidy/open? (jg/open-at? r now))
+                                       d (jg/merge-detail d)))))
+                           (sort-by :subsidy/id)
+                           vec)
+                 manifest (jg/corpus-manifest {:observed-at now
+                                               :keywords keywords
+                                               :record-count (count recs)
+                                               :open-count (count (filter :subsidy/open? recs))
+                                               :detail-count (count details)})]
+             (.mkdirSync fs (.dirname path out) #js {:recursive true})
+             (.writeFileSync fs out
+                             (str (pr-str manifest) "\n"
+                                  (str/join "\n" (map pr-str recs)) "\n")
+                             "utf8")
+             (println (pr-str {:out out
+                               :programmes (count recs)
+                               :open (count (filter :subsidy/open? recs))
+                               :details (count details)
+                               :keywords (count keywords)
+                               :bytes (.-size (.statSync fs out))}))
+             (when (zero? (count recs))
+               (js/console.error "collect-jgrants: WARNING 0 programmes — an empty catalogue and a failed fetch look the same in the file")
+               (.exit js/process 2)))))
+        (.catch (fn [e]
+                  (js/console.error (str "collect-jgrants failed: " (.-message e)))
+                  (.exit js/process 1))))))
+
+(-main)

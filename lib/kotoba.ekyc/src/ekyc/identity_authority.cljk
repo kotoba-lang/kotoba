@@ -1,0 +1,79 @@
+(ns ekyc.identity-authority
+  "Host coordination. Canonical reads/CAS are explicit private Kotobase ports.
+  No in-memory fallback; no effect may escape before its durable commit receipt.
+  Public routes must not expose execute or its verified-event input directly."
+  (:require [ekyc.identity-policy :as policy] [ekyc.identity-crypto :as crypto]
+            [ekyc.passport :as passport]))
+
+(defn execute [read! cas! event now]
+  (letfn [(attempt [remaining]
+            (-> (read!)
+                (.then
+                 (fn [{:keys [revision state]}]
+                   (passport/require! (and (integer? revision) (<= 0 revision) (map? state)) :canonical-state-unavailable)
+                   (let [result (policy/transition state event now)]
+                     (if-not (:ok result) result
+                       (-> (cas! revision (:state result))
+                           (.then (fn [receipt]
+                                    (cond
+                                      (= :conflict (:status receipt))
+                                      (if (pos? remaining) (attempt (dec remaining)) (passport/reject! :canonical-state-contention))
+                                      (and (= :committed (:status receipt)) (= (inc revision) (:revision receipt))
+                                           (policy/text? (:receipt-ref receipt)))
+                                      {:ok true :effects (:effects result) :receipt-ref (:receipt-ref receipt)}
+                                      :else (passport/reject! :canonical-commit-unconfirmed)))))))))))]
+    (attempt 2)))
+
+(defn review
+  "Only a registered operator signature can authorize approval/revocation.
+  Registry and key revocation are read from the same canonical state by the host;
+  never accept reviewer keys, signature flags, or event bodies from the applicant."
+  [operator-key operator-kid actor signed-command expected-application expected-nonce now read! cas!]
+  (-> (crypto/verify operator-key operator-kid "kotoba-review+jwt" signed-command)
+      (.then
+       (fn [command]
+         (passport/require! (and (= "https://kotoba.cloud" (:aud command)) (= actor (:actor command))
+                                (= expected-application (:id command)) (= expected-nonce (:nonce command))
+                                (contains? #{"approve" "approve-web" "link-route" "revoke-route" "revoke"} (:op command))
+                                (crypto/fresh-claims? command now)
+                                (<= (- (:exp command) (:iat command)) 120)) :invalid-review-authorization)
+         ;; String-to-keyword conversion is a closed allowlist, not arbitrary intern.
+         (let [event (assoc command :op ({"approve" :approve "approve-web" :approve-web "link-route" :link-route
+                                         "revoke-route" :revoke-route "revoke" :revoke} (:op command))
+                            :route ({"web-reviewed" :web-reviewed "app-passport" :app-passport} (:route command))
+                            :operator-signature-verified true)
+               event (if (contains? #{:approve :approve-web} (:op event))
+                       (-> event
+                           (assoc :holder-method ({"supervised-live-document-comparison" :supervised-live-document-comparison
+                                                   "supervised-live-video-document-comparison" :supervised-live-video-document-comparison} (:holder-method command)))
+                           (update :screening #(assoc % :status (when (= "clear" (:status %)) :clear)
+                                                       :coverage (mapv {"sanctions" :sanctions "pep" :pep "adverse-media" :adverse-media} (:coverage %))))
+                           (update :scope #(assoc % :status (when (= "approved" (:status %)) :approved)))) event)]
+           (execute read! cas! event now))))))
+
+(defn observe-session
+  "Verify an observer JWS using its canonical registered public key. The CAS
+  transition rechecks active key identity and kind permissions after verification."
+  [observer signed-event now read! cas!]
+  (-> (read!)
+      (.then
+       (fn [{:keys [state]}]
+         (let [registry (get-in state [:observers observer]) jwk (:public-jwk registry) kid (:key-id registry)]
+           (passport/require! (and (= :active (:status registry)) (policy/text? kid)
+                                  (= #{:kty :crv :x} (set (keys jwk))) (= "OKP" (:kty jwk)) (= "Ed25519" (:crv jwk))) :observer-not-registered)
+           (-> (crypto/holder-key-id jwk)
+               (.then
+                (fn [thumbprint]
+                  (passport/require! (= thumbprint (:key-thumbprint registry)) :observer-key-mismatch)
+                  (-> (.importKey (.-subtle js/crypto) "jwk" (clj->js jwk) "Ed25519" false #js ["verify"])
+                      (.then #(crypto/verify % kid "kotoba-session-event+jwt" signed-event))
+                      (.then
+                       (fn [event]
+                         (passport/require! (and (= "https://kotoba.cloud" (:aud event)) (= observer (:observer event))
+                                                (= (:event-id event) (:nonce event)) (crypto/fresh-claims? event now)
+                                                (<= (- (:exp event) (:iat event)) 120)) :invalid-observer-event)
+                         (execute read! cas!
+                                  (assoc event :op :observe-session :observer-signature-verified true
+                                         :observer-key-id kid :observer-key-thumbprint thumbprint
+                                         :kind ({"authenticated" :authenticated "step-up" :step-up "new-device" :new-device
+                                                 "behavior-alert" :behavior-alert "resolve" :resolve "revoke" :revoke} (:kind event))) now))))))))))))

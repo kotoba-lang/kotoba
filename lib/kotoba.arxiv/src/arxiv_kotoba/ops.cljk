@@ -1,0 +1,330 @@
+(ns arxiv-kotoba.ops
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [arxiv-kotoba.manifest :as manifest]
+            [arxiv-kotoba.policy :as policy]
+            [arxiv-kotoba.routes :as routes]
+            #?(:clj [kotoba.io :as io])))
+
+(def required-source-files
+  "Legacy kotoba package required files. Prefer package.edn :submission/source-dir listing."
+  #{"kotoba.tex" "references.bib"})
+
+(def recommended-categories
+  "Default advice for the kotoba package. Other packages set categories in package.edn."
+  {:primary "cs.CL"
+   :cross-lists ["cs.DB" "cs.DC" "cs.CR"]
+   :rationale
+   "For arXiv submission, frame Kotoba as accountable memory infrastructure for language agents; the Datalog/datom database, distributed substrate, and security architecture are supporting technical contributions."})
+
+(def sqrt-space-kv-categories
+  {:primary "cs.LG"
+   :cross-lists ["cs.CL" "cs.CC"]
+   :rationale
+   "Williams √t-space transfer to LLM KV residency: primary ML systems; cross-list language + complexity."})
+
+(def endorsement-fallbacks
+  [{:when {:server-message "You are not endorsed for this archive."}
+    :hold-reason :endorsement-required
+    :next-action :choose-endorsed-category-or-request-endorsement
+    :notes ["Record the attempted category and arXiv server message."
+            "Retry with the nearest endorsed primary category when the framing remains truthful."
+            "Do not submit to an unrelated archive solely to bypass endorsement."]}])
+
+(defn approval-alert
+  [{:keys [op message]}]
+  {:kind :approval-required
+   :level :critical
+   :presentation :alert
+   :op op
+   :title "Human approval required"
+   :message (or message
+                "Final arXiv submission creates a public scholarly record and requires explicit human approval.")
+   :actions [{:id :approve
+              :label "Approve and continue"
+              :effect :set-approved-true}
+             {:id :cancel
+              :label "Cancel"
+              :effect :stop-workflow}]})
+
+#?(:clj
+   (defn- unblob
+     "Best-effort inverse of edn-datomize.bb's attr-value: pr-str'd non-scalar
+     values come back as strings that read as coll?; try to read them back."
+     [v]
+     (if (string? v)
+       (try (let [parsed (edn/read-string v)]
+              (if (coll? parsed) parsed v))
+            (catch Exception _ v))
+       v)))
+
+#?(:clj
+   (defn- reconstitute-entity
+     "Inverse of edn-datomize.bb wrap-map-keep-ns: given a Datomic/Datascript
+     tx-data entity map, strip :db/id and unblob pr-str'd non-scalar values so
+     callers see the original flat map shape again."
+     [entity]
+     (into {} (map (fn [[k v]] [k (unblob v)])) (dissoc entity :db/id))))
+
+#?(:clj
+   (defn- read-edn-file
+     "Read an .edn file. Transparently unwraps the Datomic/Datascript
+     tx-data format ([{:db/id -1 ...}]) produced by edn-datomize.bb back into
+     the flat map shape callers expect, so package.edn/status.edn readers do
+     not need to change when those files are datomized."
+     [path]
+     (let [content (edn/read-string (slurp path))]
+       (if (and (vector? content) (map? (first content)) (contains? (first content) :db/id))
+         (reconstitute-entity (first content))
+         content))))
+
+#?(:clj
+   (defn- exists? [path]
+     (io/exists? (io/file path))))
+
+#?(:clj
+   (defn- list-file-names [dir]
+     (->> (io/list-files (io/file dir))
+          (filter #(io/file? %))
+          (map #(io/file-name %))
+          set)))
+
+(defn advise-categories
+  [_request]
+  {:status :ok
+   :advice recommended-categories
+   :endorsement-fallbacks endorsement-fallbacks})
+
+#?(:clj
+   (defn- tex-files-in [source-dir]
+     (->> (list-file-names source-dir)
+          (filter #(or (str/ends-with? % ".tex")
+                       (str/ends-with? % ".bib")
+                       (str/ends-with? % ".bbl")))
+          set)))
+
+#?(:clj
+   (defn- find-main-tex [source-dir]
+     (let [names (list-file-names source-dir)
+           texes (filter #(str/ends-with? % ".tex") names)]
+       (or (first (filter #(not (str/starts-with? % ".")) texes))
+           (first texes)))))
+
+#?(:clj
+   (defn validate-package
+     "Validate an arXiv package.edn.
+
+     Generic rules (all packages):
+       - source-dir exists and contains ≥1 .tex
+       - abstract present in .tex (\\begin{abstract}) or abstract file
+       - primary category set
+       - final-submit gated by :human-approval
+
+     Legacy kotoba package additionally checks fixed title/categories."
+     [{:keys [package-edn]}]
+     (let [package-path (or package-edn "submissions/kotoba/package.edn")
+           package (read-edn-file package-path)
+           source-dir (:submission/source-dir package)
+           source-files (when (and source-dir (exists? source-dir))
+                          (list-file-names source-dir))
+           main-tex (when source-files (find-main-tex source-dir))
+           tex-path (when main-tex (str source-dir "/" main-tex))
+           tex (when (and tex-path (exists? tex-path)) (slurp tex-path))
+           primary (:submission/primary-category package)
+           cross-lists (:submission/cross-lists package)
+           pkg-id (:submission/id package)
+           kotoba? (or (= :kotoba pkg-id)
+                       (and tex (str/includes? (str tex) "Content-Addressed Datalog")))
+           abstract-ok? (boolean
+                         (or (and tex
+                                  (str/includes? tex "\\begin{abstract}")
+                                  (str/includes? tex "\\end{abstract}"))
+                             (let [af (:submission/abstract-file package)]
+                               (and af (exists? af)))))
+           title (:submission/title package)
+           title-ok? (boolean
+                      (or (and title (seq title))
+                          (and tex (str/includes? tex "\\title"))))
+           final-gated? (= :human-approval
+                           (:submission/final-submit-requires package))
+           category-ok? (if kotoba?
+                          (and (= "cs.CL" primary)
+                               (contains? (set cross-lists) "cs.DB")
+                               (contains? (set cross-lists) "cs.DC")
+                               (contains? (set cross-lists) "cs.CR"))
+                          (boolean (and primary (seq (str primary)))))
+           missing-source (cond
+                            (not source-dir)
+                            ["<no :submission/source-dir>"]
+                            (not (exists? source-dir))
+                            [(str source-dir " (missing)")]
+                            (nil? main-tex)
+                            [".tex"]
+                            kotoba?
+                            (sort (remove (or source-files #{}) required-source-files))
+                            :else [])
+           archive (:submission/source-archive package)
+           ;; archive is optional at validate-time (built by `make arxiv`); warn only
+           archive-missing? (and archive (not (exists? archive)))
+           errors (cond-> []
+                    (seq missing-source)
+                    (conj {:error :missing-source-files :files missing-source})
+                    (not category-ok?)
+                    (conj {:error :category-mismatch
+                           :expected (if kotoba? recommended-categories :any-primary)
+                           :actual {:primary primary :cross-lists cross-lists}})
+                    (not title-ok?)
+                    (conj {:error :title-missing})
+                    (not abstract-ok?)
+                    (conj {:error :abstract-not-found})
+                    (not final-gated?)
+                    (conj {:error :final-submit-not-human-gated}))]
+       {:status (if (seq errors) :error :ok)
+        :package package-path
+        :package/id pkg-id
+        :source-dir source-dir
+        :main-tex main-tex
+        :tex-files (when source-files (sort (tex-files-in source-dir)))
+        :categories {:primary primary :cross-lists cross-lists}
+        :source-archive {:path archive :present? (not archive-missing?)}
+        :browser-runner "bin/arxiv-submit <package-dir> --op-item 'Arxiv - N24'"
+        :errors errors
+        :warnings (cond-> []
+                    archive-missing?
+                    (conj {:warning :source-archive-missing
+                           :path archive
+                           :hint "run `make arxiv` in the package dir"}))}))
+   :cljs
+   (defn validate-package
+     [_request]
+     {:status :error
+      :error :jvm-required}))
+
+(defn- submission-state
+  [status]
+  (or (:submission/state status) :draft))
+
+(defn- endorsement-hold?
+  [status]
+  (and (= :on-hold (submission-state status))
+       (= :endorsement-required (:submission/hold-reason status))))
+
+#?(:clj
+   (defn plan-submission
+     [{:keys [package-edn status-edn]}]
+     (let [package-path (or package-edn "submissions/kotoba/package.edn")
+           status-path (or status-edn "submissions/kotoba/status.edn")
+           package (read-edn-file package-path)
+           status (when (exists? status-path) (read-edn-file status-path))
+           validation (validate-package {:package-edn package-path})
+           state (submission-state status)
+           hold? (endorsement-hold? status)
+           final-alert (approval-alert
+                        {:op :arxiv/final-submit
+                         :message "Review the arXiv draft, then approve only if the final public submission should proceed."})
+           steps [{:id :validate-package
+                   :op :arxiv/validate-package
+                   :state (if (= :ok (:status validation)) :complete :blocked)}
+                  {:id :start-submission
+                   :op :arxiv/create-submission
+                   :category (:submission/primary-category package)
+                   :state (cond
+                            hold? :blocked
+                            (= :draft state) :next
+                            :else :complete)}
+                  {:id :upload-source
+                   :op :arxiv/upload-source
+                   :source-archive (:submission/source-archive package)
+                   :state (cond
+                            (not= :ok (:status validation)) :blocked
+                            hold? :blocked
+                            (#{:uploaded :pending-human-final-submit :submitted} state) :complete
+                            :else :pending)}
+                  {:id :final-submit
+                   :op :arxiv/final-submit
+                   :state (cond
+                            (= :submitted state) :complete
+                            (= :pending-human-final-submit state) :awaiting-human-approval
+                            :else :pending)
+                   :requires [:human-approval]
+                   :alert final-alert}]]
+       {:status (cond
+                  (not= :ok (:status validation)) :error
+                  hold? :hold
+                  :else :ready)
+        :submission/id (:submission/id package)
+        :package package-path
+        :state state
+        :categories {:primary (:submission/primary-category package)
+                     :cross-lists (:submission/cross-lists package)}
+        :next-action (cond
+                       (not= :ok (:status validation)) :fix-package
+                       hold? (:submission/next-action status)
+                       (= :pending-human-final-submit state) :human-final-submit-approval
+                       (= :submitted state) :none
+                       :else :continue-draft-workflow)
+        :hold (when hold?
+                {:reason (:submission/hold-reason status)
+                 :attempted-category (:submission/attempted-primary-category status)
+                 :server-message (:submission/server-message status)
+                 :fallbacks endorsement-fallbacks})
+        :alerts (cond-> []
+                  (and (= :pending-human-final-submit state)
+                       (not= :submitted state))
+                  (conj final-alert))
+        :steps steps
+        :validation validation}))
+   :cljs
+   (defn plan-submission
+     [_request]
+     {:status :error
+      :error :jvm-required}))
+
+(defn invoke-plan
+  "Pure capability dispatcher. It does not touch arXiv; it returns the route and
+  skill that a host runner should execute, or a hold/error map."
+  [{:keys [op] :as request} ctx]
+  (if-let [cap (manifest/capability op)]
+    (if-not (policy/allowed? ctx cap)
+      {:status :hold
+       :reason :approval-required
+       :op op
+       :risk (:risk cap)
+       :requires (:requires cap)
+       :alerts [(approval-alert {:op op})]}
+      (if-let [route (routes/choose-route manifest/yorishiro op ctx)]
+        {:status :ready
+         :actor/id (:actor/id manifest/actor)
+         :op op
+         :skill (:skill cap)
+         :risk (:risk cap)
+         :route/id (:route/id route)
+         :route/kind (:route/kind route)
+         :params (dissoc request :op)}
+        {:status :error
+         :error :no-route
+         :op op}))
+    {:status :error
+     :error :unknown-op
+     :op op}))
+
+(defn invoke
+  [request ctx]
+  (let [plan (invoke-plan request ctx)]
+    (case (:op request)
+      :arxiv/advise-categories
+      (if (= :ready (:status plan))
+        (assoc plan :result (advise-categories request))
+        plan)
+
+      :arxiv/validate-package
+      (if (= :ready (:status plan))
+        (assoc plan :result (validate-package (dissoc request :op)))
+        plan)
+
+      :arxiv/plan-submission
+      (if (= :ready (:status plan))
+        (assoc plan :result (plan-submission (dissoc request :op)))
+        plan)
+
+      plan)))

@@ -1,0 +1,208 @@
+(ns kotoba.property.houjin-bangou-projection
+  "Select a bounded slice of the 法人番号 corpus for the workspace query plane,
+   and resolve company *names* to corporate numbers honestly.
+
+   Why a projection exists at all: the corpus is 5.8M rows / ~5.1M live
+   entities. On this workspace's DataScript loader a million entities cost
+   ~5.6 GB and ~156 s (measured for GLEIF, `org-gleif-projections/README.md`),
+   so the whole registry is not a price a CLI query can pay. The corpus stays
+   whole on disk; the plane loads the slice a question needs.
+
+   What that costs, stated plainly (AGENTS.md, kotobase one-ref rule): a
+   corporate number outside the loaded slice does NOT join to GLEIF,
+   market-intel or cloud-itonami-lei in Datalog. It is answerable only by a
+   scan of the corpus (`scripts/query_houjin_bangou_corpus.cljk`), which
+   cannot join. Widening the join surface means widening the projection, not
+   sharding it further.
+
+   ## Name resolution is where this dataset is easy to lie with
+
+   A JP company name is not a key. `normalize-name` is exact enough to trust;
+   `name-core` (form-insensitive) is not, because 株式会社A and 有限会社A share
+   a core, as do a parent and its 100%-owned namesake. So the resolver keeps
+   three outcomes apart and never collapses them:
+
+     :exact      — one record whose normalized name equals the query
+     :core       — no exact hit, exactly one form-insensitive hit
+     :ambiguous  — more than one hit at whichever level answered
+
+   An ambiguous name resolves to NOTHING and is reported by name. Picking the
+   first candidate would produce a projection that looks complete and is
+   quietly wrong about which company it is."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.houjin-bangou-zenken :as hb]))
+
+(defn- prefecture-match?
+  "Accepts both \"JP-13\" and \"13\" so a caller does not have to remember which
+   half of the ISO code the NTA publishes."
+  [region wanted]
+  (boolean
+   (when region
+     (some (fn [w]
+             (let [w (str/upper (str/trim w))]
+               (or (= region w) (= region (str "JP-" w)))))
+           wanted))))
+
+(def prefectures
+  ["北海道" "青森県" "岩手県" "宮城県" "秋田県" "山形県" "福島県" "茨城県" "栃木県"
+   "群馬県" "埼玉県" "千葉県" "東京都" "神奈川県" "新潟県" "富山県" "石川県" "福井県"
+   "山梨県" "長野県" "岐阜県" "静岡県" "愛知県" "三重県" "滋賀県" "京都府" "大阪府"
+   "兵庫県" "奈良県" "和歌山県" "鳥取県" "島根県" "岡山県" "広島県" "山口県" "徳島県"
+   "香川県" "愛媛県" "高知県" "福岡県" "佐賀県" "長崎県" "熊本県" "大分県" "宮崎県"
+   "鹿児島県" "沖縄県"])
+
+(def ^:private prefecture->iso
+  (into {} (map-indexed (fn [i p] [p (str "JP-" (when (< (inc i) 10) "0") (inc i))])
+                        prefectures)))
+
+(defn address->region
+  "住所文字列 -> ISO 3166-2:JP（東京都千代田区… -> JP-13）。
+
+   官報の公告も落札公示も住所を持っているのに、名寄せは名前しか見ていなかった。
+   同名 2 社は**ほとんどの場合、県が違う**（株式会社うるるは中央区と香取郡東庄町）
+   ので、この 1 行で大半が解ける。"
+  [address]
+  (when address
+    (some (fn [p] (when (str/includes? (str address) p) (get prefecture->iso p)))
+          prefectures)))
+
+(defn strip-prefecture
+  "住所から都道府県を落とす。市区町村の照合は前方一致で行うので、頭が揃っている
+   必要がある。"
+  [address]
+  (when address
+    (str/trim (reduce (fn [acc p] (str/replace acc p "")) (str address) prefectures))))
+
+(defn address-in-city?
+  "住所が registry の市区町村で始まるか。
+
+   市区町村名を**切り出さない**のは、境界が一定でないから: registry は
+   「さいたま市大宮区」「香取郡東庄町」「中央区」をどれも 1 つの市区町村として持つ。
+   切り出す正規表現はこの 3 つのどれかを必ず取り違える —— 前方一致なら取り違えない。"
+  [address city]
+  (boolean (when-let [a (strip-prefecture address)]
+             (and (not (str/blank? (str city)))
+                  (str/starts-with? a (str city))))))
+
+(defn matcher
+  "Predicate over corpus records built from a selection spec.
+
+   `:numbers`     — explicit 法人番号 allowlist (the join-driven default)
+   `:name-keys`   — normalized name keys to *collect* (see `collect-names`);
+                    resolution happens after the scan, not inside it
+   `:prefectures` — \"JP-13\" or \"13\"
+   `:kinds`       — 法人種別 codes, e.g. #{\"301\"} for 設立登記法人
+   `:latest-only?` — drop superseded history rows
+   `:active-only?` — drop entities whose registration record is closed
+
+   With no criteria the matcher takes everything: a projector invoked with no
+   filter should produce the whole corpus, not silently produce nothing."
+  [{:keys [numbers name-keys prefectures kinds latest-only? active-only?]}]
+  (let [numbers (when (seq numbers) (set numbers))
+        name-keys (when (seq name-keys) (set name-keys))
+        prefectures (when (seq prefectures) (vec prefectures))
+        kinds (when (seq kinds) (set kinds))]
+    (fn [rec]
+      (and (or (nil? latest-only?) (not latest-only?) (:company/nta-latest? rec))
+           (or (nil? active-only?) (not active-only?)
+               (str/blank? (:company/closed-at rec)))
+           (or (nil? prefectures) (prefecture-match? (:company/region rec) prefectures))
+           (or (nil? kinds) (contains? kinds (:company/nta-kind rec)))
+           (or (and (nil? numbers) (nil? name-keys))
+               (boolean (or (and numbers (contains? numbers (:company/houjin-bangou rec)))
+                            (and name-keys
+                                 (or (contains? name-keys (hb/normalize-name (:company/legal-name rec)))
+                                     (contains? name-keys (hb/name-core (:company/legal-name rec))))))))))))
+
+(def max-candidates
+  "Candidates kept per name key before a key is declared ambiguous. A core like
+   \"japan\" matches thousands; holding them all would trade a bounded report
+   for an unbounded one, and the answer is the same either way."
+  50)
+
+(defn collect-candidate
+  "Fold one matched record into the per-key candidate map. `keys-of` is the set
+   of query keys this record could answer (its normalized name and its core)."
+  [acc rec]
+  (let [nm (:company/legal-name rec)]
+    (reduce (fn [m [level k]]
+              (if (nil? k)
+                m
+                (update-in m [level k]
+                           (fn [v] (if (and v (>= (count v) max-candidates))
+                                     v
+                                     (conj (or v []) rec))))))
+            acc
+            [[:exact (hb/normalize-name nm)]
+             [:core (hb/name-core nm)]])))
+
+(defn- query-name [q] (if (map? q) (:name q) q))
+(defn- query-address [q] (when (map? q) (:address q)))
+
+(defn- narrow-by-address
+  "同名の候補を住所で絞る。県が一致するものだけ残し、それでも複数なら市区町村でも
+   絞る。**推測はしない** —— 手がかりが無い（住所が無い / どれとも一致しない）なら
+   元の候補集合をそのまま返し、曖昧なままにする。"
+  [hits address]
+  (if-let [region (address->region address)]
+    (let [by-region (filterv #(= region (:company/region %)) hits)]
+      (cond
+        (= 1 (count by-region)) by-region
+        (empty? by-region) hits
+        :else (let [by-city (filterv #(address-in-city? address (:company/city %)) by-region)]
+                (if (= 1 (count by-city)) by-city by-region))))
+    hits))
+
+(defn resolve-names
+  "queries + candidate map -> {:resolved {query rec} :ambiguous {…} :unmatched […]}
+
+   query は文字列でも `{:name … :address …}` でもよい。住所を渡すと、**同名で
+   割れた候補を県（必要なら市区町村）で絞る**。実測 2026-08-19: 官報の決算公告
+   206 件・落札公示 138 件が「同名 2 社以上」で解決できずにいたが、どちらの
+   データセットも住所を持っていた。
+
+   `:company/name-match` が答えの出どころを言う: `:exact` / `:core` は名前だけ、
+   `:exact+address` / `:core+address` は住所で絞った結果。**どうやって決めたかを
+   記録しないと、後から精度を測れない。**
+
+   Exact beats core; どの水準でも絞りきれなければ解決しない。"
+  [queries candidates]
+  (reduce
+   (fn [acc q]
+     (let [nm (query-name q)
+           address (query-address q)
+           exact (get-in candidates [:exact (hb/normalize-name nm)])
+           core (get-in candidates [:core (hb/name-core nm)])
+           [level hits] (cond
+                          (seq exact) [:exact exact]
+                          (seq core) [:core core]
+                          :else [nil nil])
+           narrowed (when hits (narrow-by-address hits address))
+           narrowed? (and hits (< (count narrowed) (count hits)))
+           level (if narrowed? (keyword (str (name level) "+address")) level)]
+       (cond
+         (nil? level) (update acc :unmatched conj nm)
+         (= 1 (count narrowed)) (assoc-in acc [:resolved nm]
+                                          (assoc (first narrowed) :company/name-match level))
+         :else (assoc-in acc [:ambiguous nm] {:level level :count (count narrowed)}))))
+   {:resolved {} :ambiguous {} :unmatched []}
+   queries))
+
+(defn projection-manifest
+  "Line 1 of a projection: the corpus manifest it came from, plus the criteria
+   that produced it. A projection that does not say what it excluded reads as
+   if it were the whole registry."
+  [corpus-manifest {:keys [numbers name-keys prefectures kinds latest-only? active-only?]} record-count]
+  (cond-> (assoc (dissoc corpus-manifest :corpus/record-count)
+                 ;; Set unconditionally, not inherited: a corpus written before
+                 ;; the manifest convention would leave line 1 unmarked, and a
+                 ;; reader would then load the header as if it were a company.
+                 :corpus/manifest true
+                 :corpus/projection true
+                 :corpus/record-count record-count)
+    (seq numbers) (assoc :projection/number-count (count numbers))
+    (seq name-keys) (assoc :projection/name-count (count name-keys))
+    (seq prefectures) (assoc :projection/prefectures (vec prefectures))
+    (seq kinds) (assoc :projection/kinds (vec kinds))
+    latest-only? (assoc :projection/latest-only true)
+    active-only? (assoc :projection/active-only true)))

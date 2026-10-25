@@ -1,0 +1,286 @@
+(ns alembic.properties-test
+  "The bytes here are assembled by the rules in `WriteUtil.cpp`
+  `WritePropertyInfo`, and read by the rules in `ReadUtil.cpp`
+  `ReadPropertyHeaders`. **Those are two separate transcriptions of the same
+  format**, so a mistake in one does not cancel out in the other — which is the
+  only cross-check available without a real `.abc`, and is stated here rather
+  than implied."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [ogawa.core :as ogawa]
+            [alembic.properties :as p]))
+
+;; ── encoding, per WriteUtil.cpp ─────────────────────────────────────────────
+
+(defn- u32 [v] [(bit-and v 0xff) (bit-and (bit-shift-right v 8) 0xff)
+                (bit-and (bit-shift-right v 16) 0xff) (bit-and (bit-shift-right v 24) 0xff)])
+(defn- u64 [v] (mapv #(bit-and (bit-shift-right v (* 8 %)) 0xff) (range 8)))
+(defn- with-hint [v hint] (subvec (u32 v) 0 ({0 1 1 2 2 4} hint)))
+(defn- str->bytes [s] (mapv #(#?(:clj int :cljs identity) %) s))
+
+(def ^:dynamic *props* {:metadata ""})
+
+(def ^:private pod-index (into {} (map-indexed (fn [i k] [k i]) p/pod-types)))
+
+(defn write-property-info
+  "`WritePropertyInfo`, transcribed. `hint` is chosen by the writer from the
+  largest of nameSize / numSamples / timeSamplingIndex; passed in here so a
+  test can exercise all three widths deliberately."
+  [{:keys [kind name pod extent samples first-changed last-changed
+           time-sampling metadata-index homogenous? scalar-like? hint]
+    :or {extent 1 samples 1 first-changed 0 last-changed 0 time-sampling 0
+         metadata-index 0 hint 0}}]
+  (let [compound? (= :compound kind)
+        info (cond-> (bit-or (bit-and 0x000c (bit-shift-left hint 2))
+                             (bit-and 0xff00000 (bit-shift-left metadata-index 20)))
+               (not compound?)
+               (as-> i
+                 (cond-> (bit-or i
+                                 (bit-and 0x0003 (case kind :scalar 1 :array 2))
+                                 (if scalar-like? 1 0)
+                                 (bit-and 0x00f0 (bit-shift-left (pod-index pod) 4))
+                                 (bit-and 0xff000 (bit-shift-left extent 12)))
+                   (not (zero? time-sampling)) (bit-or 0x0100)
+                   (and (zero? first-changed) (zero? last-changed)) (bit-or 0x800)
+                   (and (not (and (zero? first-changed) (zero? last-changed)))
+                        (or (not= first-changed 1) (not= last-changed (dec samples))))
+                   (bit-or 0x0200)
+                   homogenous? (bit-or 0x400))))
+        needs-fl (not (zero? (bit-and info 0x0200)))]
+    (vec (concat
+          (u32 info)                                   ; info is always hint 2
+          (when-not compound? (with-hint samples hint))
+          (when needs-fl (concat (with-hint first-changed hint)
+                                 (with-hint last-changed hint)))
+          (when (and (not compound?) (not (zero? time-sampling)))
+            (with-hint time-sampling hint))
+          (with-hint (count name) hint)
+          (str->bytes name)
+          (when (= 0xff metadata-index)
+            (concat (with-hint (count (:metadata *props*)) hint)
+                    (str->bytes (:metadata *props*))))))))
+
+(defn- headers-block [specs] (vec (mapcat write-property-info specs)))
+
+(defn- key16 [] (vec (repeat 16 0)))
+(defn- sample-data [bytes] (ogawa/data (concat (key16) bytes)))
+(defn- f32 [x]
+  #?(:clj (u32 (bit-and (Float/floatToIntBits (float x)) 0xffffffff))
+     :cljs (let [b (js/ArrayBuffer. 4) d (js/DataView. b)]
+             (.setFloat32 d 0 x true)
+             (mapv #(.getUint8 d %) (range 4)))))
+
+;; ── headers ────────────────────────────────────────────────────────────────
+
+(deftest a-scalar-header-round-trips-between-the-two-transcriptions
+  (let [bs (headers-block [{:kind :scalar :name "visible" :pod :bool :extent 1
+                            :samples 1 :first-changed 0 :last-changed 0}])
+        [h] (p/property-headers bs [""])]
+    (is (= :scalar (:property/kind h)))
+    (is (= "visible" (:property/name h)))
+    (is (= :bool (:property/pod h)))
+    (is (= 1 (:property/extent h)))
+    (is (= 1 (:property/sample-count h)))))
+
+(deftest extent-and-pod-survive-their-bit-fields
+  ;; extent lives at bits 12-19 and the POD at 4-7. Shifting either by one
+  ;; gives a plausible-looking property with the WRONG stride — points read as
+  ;; a 2-component array parse without error and land as garbage.
+  (let [bs (headers-block [{:kind :array :name "P" :pod :float32 :extent 3
+                            :samples 1 :first-changed 0 :last-changed 0}])
+        [h] (p/property-headers bs [""])]
+    (is (= :float32 (:property/pod h)))
+    (is (= 3 (:property/extent h)))
+    (is (= :array (:property/kind h)))))
+
+(deftest every-size-hint-width-is-read
+  ;; The hint decides the width of EVERY length in the header. Reading them all
+  ;; as uint32 walks off the end of a short header; reading all as uint8
+  ;; truncates a long name. Both then "find" another property in the leftovers.
+  (doseq [hint [0 1 2]]
+    (let [bs (headers-block [{:kind :array :name "P" :pod :float32 :extent 3
+                              :samples 1 :first-changed 0 :last-changed 0 :hint hint}
+                             {:kind :scalar :name "n" :pod :int32 :extent 1
+                              :samples 1 :first-changed 0 :last-changed 0 :hint hint}])
+          hs (p/property-headers bs [""])]
+      (is (= 2 (count hs)) (str "hint " hint))
+      (is (= ["P" "n"] (mapv :property/name hs)) (str "hint " hint)))))
+
+(deftest the-implied-changed-range-differs-from-the-constant-one
+  ;; 0x0200 absent means the range is implied, and WHICH implication depends on
+  ;; 0x800. Collapsing both to [0,0] makes every animated property read as
+  ;; constant: sample 0 is still right, so it looks like "the cache is not
+  ;; animating" rather than like a parse bug.
+  (let [const (first (p/property-headers
+                      (headers-block [{:kind :array :name "P" :pod :float32 :extent 3
+                                       :samples 5 :first-changed 0 :last-changed 0}]) [""]))
+        anim (first (p/property-headers
+                     (headers-block [{:kind :array :name "P" :pod :float32 :extent 3
+                                      :samples 5 :first-changed 1 :last-changed 4}]) [""]))]
+    (is (= [0 0] [(:property/first-changed const) (:property/last-changed const)]))
+    (is (= [1 4] [(:property/first-changed anim) (:property/last-changed anim)]))
+    (testing "and they disagree about where sample 3 is stored"
+      (is (= 0 (p/stored-index const 3)))
+      (is (= 3 (p/stored-index anim 3))))))
+
+(deftest stored-index-follows-verify-index
+  (let [p {:property/first-changed 2 :property/last-changed 4 :property/sample-count 7}]
+    (is (= 0 (p/stored-index p 0)) "before the first change, everything is sample 0")
+    (is (= 0 (p/stored-index p 1)))
+    (is (= 1 (p/stored-index p 2)))
+    (is (= 2 (p/stored-index p 3)))
+    (is (= 3 (p/stored-index p 4)))
+    (is (= 3 (p/stored-index p 6)) "after the last change, it holds")
+    (is (nil? (p/stored-index p 7)) "and out of range is nil, not a clamp"))
+  (testing "a constant property stores one sample and every index maps to it"
+    (let [c {:property/first-changed 0 :property/last-changed 0 :property/sample-count 24}]
+      (is (= [0 0 0 0] (mapv #(p/stored-index c %) [0 1 12 23])))
+      (is (nil? (p/stored-index c 24))))))
+
+(deftest metadata-can-be-indexed-or-inline
+  (let [indexed (first (p/property-headers
+                        (headers-block [{:kind :compound :name ".geom" :metadata-index 2}])
+                        ["" "a" "schema=AbcGeom_PolyMesh_v1"]))]
+    (is (= "schema=AbcGeom_PolyMesh_v1" (:property/metadata indexed)))
+    (is (= :indexed (:property/metadata-source indexed))))
+  (binding [*props* {:metadata "interpretation=point"}]
+    (let [inline (first (p/property-headers
+                         (headers-block [{:kind :array :name "P" :pod :float32 :extent 3
+                                          :samples 1 :first-changed 0 :last-changed 0
+                                          :metadata-index 0xff}])
+                         [""]))]
+      (is (= "interpretation=point" (:property/metadata inline)))
+      (is (= :inline (:property/metadata-source inline))))))
+
+;; ── the tree ───────────────────────────────────────────────────────────────
+
+(defn- polymesh-object
+  "An object group whose compound property child holds `.geom`, which holds a
+  3-component float32 point array and an int32 face-index array."
+  []
+  (let [pts (sample-data (mapcat f32 [0.0 0.0 0.0,  1.0 0.0 0.0,  1.0 1.0 0.0,  0.0 1.0 0.0]))
+        idx (sample-data (mapcat u32 [0 1 2 0 2 3]))
+        geom (ogawa/group
+              (ogawa/group pts (ogawa/data []))   ; P: sample 0 data + empty dims
+              (ogawa/group idx (ogawa/data []))   ; .faceIndices
+              (ogawa/data (headers-block
+                           [{:kind :array :name "P" :pod :float32 :extent 3
+                             :samples 1 :first-changed 0 :last-changed 0}
+                            {:kind :array :name ".faceIndices" :pod :int32 :extent 1
+                             :samples 1 :first-changed 0 :last-changed 0}])))]
+    (ogawa/group
+     (ogawa/group geom
+                  (ogawa/data (headers-block [{:kind :compound :name ".geom"}])))
+     (ogawa/data []))))
+
+(deftest properties-nest-and-are-addressable-by-path
+  (let [props (p/properties (polymesh-object) [""])]
+    (is (= [".geom"] (mapv :property/name props)))
+    (is (= :compound (:property/kind (first props))))
+    (is (= ["/.geom" "/.geom/P" "/.geom/.faceIndices"] (p/property-paths props)))
+    (is (= "P" (:property/name (p/find-property props "/.geom/P"))))
+    (is (nil? (p/find-property props "/.geom/nope")))))
+
+(deftest it-reads-the-points-out-of-a-polymesh
+  ;; This is the sentence the anti-claim could not say before: not "what is in
+  ;; this file" but "here are the numbers".
+  (let [props (p/properties (polymesh-object) [""])
+        P (p/find-property props "/.geom/P")
+        [status s] (p/read-sample P 0)
+        [_ elems] (p/read-elements P 0)]
+    (is (= :ok status))
+    (is (= 12 (count (:sample/values s))) "12 floats")
+    (is (= 4 (:sample/count s)) "= 4 points at extent 3")
+    (is (= [[0.0 0.0 0.0] [1.0 0.0 0.0] [1.0 1.0 0.0] [0.0 1.0 0.0]] elems))
+    (testing "and the face indices, which are a different POD and extent"
+      (let [[_ f] (p/read-sample (p/find-property props "/.geom/.faceIndices") 0)]
+        (is (= [0 1 2 0 2 3] (:sample/values f)))
+        (is (= 6 (:sample/count f)))))))
+
+(deftest the-first-sixteen-bytes-are-a-key-not-values
+  ;; Skipping the key is the difference between reading a point list and
+  ;; reading four floats of hash followed by a shifted point list. The shifted
+  ;; version parses, has the right length, and is wrong everywhere.
+  (let [props (p/properties (polymesh-object) [""])
+        P (p/find-property props "/.geom/P")
+        [_ s] (p/read-sample P 0)]
+    (is (= 12 (count (:sample/values s)))
+        "16 key bytes + 48 data bytes -> 12 floats, not 16")
+    (is (= 0.0 (first (:sample/values s))))))
+
+(deftest dimensions-come-from-the-dims-block-when-there-is-one
+  ;; The dims block must DISAGREE with the derived count, or this test cannot
+  ;; tell the two paths apart. A rank-2 [2 2] and a derived [4] describe the
+  ;; same 4 elements, so only the shape distinguishes them — the first version
+  ;; of this test wrote [4] and stayed green with the block ignored entirely.
+  (let [pts (sample-data (mapcat f32 (repeat 12 1.0)))
+        with-dims (ogawa/group
+                    (ogawa/group pts (ogawa/data (concat (u64 2) (u64 2))))
+                    (ogawa/data (headers-block [{:kind :array :name "P" :pod :float32
+                                                 :extent 3 :samples 1
+                                                 :first-changed 0 :last-changed 0}])))
+        props (p/read-compound with-dims [""])
+        [_ s] (p/read-sample (first props) 0)]
+    (is (= [2 2] (:sample/dimensions s)) "rank 2, read from the block")
+    (testing "and are derived from the byte count when the block is empty"
+      (let [no-dims (ogawa/group
+                      (ogawa/group pts (ogawa/data []))
+                      (ogawa/data (headers-block [{:kind :array :name "P" :pod :float32
+                                                   :extent 3 :samples 1
+                                                   :first-changed 0 :last-changed 0}])))
+            [_ s2] (p/read-sample (first (p/read-compound no-dims [""])) 0)]
+        (is (= [4] (:sample/dimensions s2)))))))
+
+(deftest an-animated-array-reads-a-different-sample-per-frame
+  (let [s0 (sample-data (mapcat f32 [0.0 0.0 0.0]))
+        s1 (sample-data (mapcat f32 [1.0 0.0 0.0]))
+        s2 (sample-data (mapcat f32 [2.0 0.0 0.0]))
+        g (ogawa/group
+            (ogawa/group s0 (ogawa/data []) s1 (ogawa/data []) s2 (ogawa/data []))
+            (ogawa/data (headers-block [{:kind :array :name "P" :pod :float32 :extent 3
+                                         :samples 3 :first-changed 1 :last-changed 2}])))
+        P (first (p/read-compound g [""]))]
+    (is (= [0.0 1.0 2.0] (mapv (fn [i] (first (:sample/values (second (p/read-sample P i)))))
+                               [0 1 2]))
+        "three frames, three different points")))
+
+;; ── refusals ───────────────────────────────────────────────────────────────
+
+(deftest it-refuses-rather-than-guessing
+  (let [props (p/properties (polymesh-object) [""])
+        P (p/find-property props "/.geom/P")]
+    (testing "a sample index outside the range"
+      (let [[status msg] (p/read-sample P 7)]
+        (is (= :error status))
+        (is (string/includes? msg "outside"))))
+
+    (testing "a compound has no samples of its own"
+      (let [[status msg] (p/read-sample (first props) 0)]
+        (is (= :error status))
+        (is (string/includes? msg "compound"))))
+
+    (testing "a POD it recognises but has not transcribed a decoder for"
+      (doseq [pod [:string :wstring :float16]]
+        (let [g (ogawa/group
+                  (ogawa/group (sample-data [1 2 3 4]) (ogawa/data []))
+                  (ogawa/data (headers-block [{:kind :array :name "x" :pod pod :extent 1
+                                               :samples 1 :first-changed 0
+                                               :last-changed 0}])))
+              [status msg] (p/read-sample (first (p/read-compound g [""])) 0)]
+          (is (= :error status) (str pod " must be refused, not approximated"))
+          (is (string/includes? msg "not decoded here")))))
+
+    (testing "a group whose last child is not the header block is not a property group"
+      (is (= [] (p/read-compound (ogawa/group (ogawa/group) (ogawa/group)) [""]))))
+
+    (testing "an object with no property group"
+      (is (= [] (p/properties (ogawa/group (ogawa/data []) (ogawa/data [])) [""]))))))
+
+(deftest it-does-not-claim-to-interpret-a-schema
+  ;; `P` being the point list of a PolyMesh is an AbcGeom fact, not an
+  ;; AbcCoreOgawa one. This layer returns named typed arrays and says so.
+  (let [props (p/properties (polymesh-object) [""])]
+    (is (nil? (:property/schema (first props)))
+        "no schema interpretation is offered")
+    (is (some? (:property/metadata (first props)))
+        "the raw metadata string is there for a layer that does interpret it")))

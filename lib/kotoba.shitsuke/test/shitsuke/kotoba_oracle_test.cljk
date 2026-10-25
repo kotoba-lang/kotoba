@@ -1,0 +1,216 @@
+(ns shitsuke.kotoba-oracle-test
+  "What keeps the shipped artifacts honest, now that they are what runs.
+
+  `kotoba-parity-test` compiles each core fresh and compares it to the `.cljc`.
+  `kotoba-callable-test` proves each module exports a surface a host COULD
+  call. Both are still here and both are still right. Neither can see what
+  matters once a host actually delegates, because both compile a module on the
+  spot and neither reads `resources/shitsuke/oracle/`. Three things have to hold
+  that did not have to before:
+
+    1. the shipped artifact IS the current source, compiled
+    2. the host actually reads it, rather than having quietly kept a copy
+    3. what ships stays inside the slice that works on BOTH runtimes
+
+  The second is the one that is easy to lose and impossible to see: a
+  delegation that fell back to a host implementation would pass every parity
+  test ever written, because a host copy is exactly what those tests compare
+  against. So this asks the only question that separates them — swap in a core
+  that answers the OPPOSITE and see whether the host follows. For
+  `rawtext-breakout?` that substitution is the security question stated
+  directly: a core that says \"no breakout\" when there is one must make
+  `->html` emit the payload, and if it does not, something other than the
+  shipped core is deciding."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.coll :as walk]
+            [kotoba.compiler.core :as compiler]
+            [shitsuke.hiccup :as hiccup]
+            [shitsuke.kotoba-oracle :as oracle]
+            [shitsuke.kotoba-oracle-gen :as gen]))
+
+;; ── drift ────────────────────────────────────────────────────────────
+
+(defn- renumber-gensyms
+  "Rewrite compiler-generated `foo__1234` symbols to a counter local to this
+  value, so two compiles of the same source compare equal.
+
+  Gensym numbering is per-JVM and monotonic, so the artifact on disk was
+  numbered by the `:gen` run and a fresh compile here starts wherever this JVM
+  happens to be. Measured 2026-08-12: the shipped core contains no such symbol
+  today, because it uses neither `and` nor `or` — which is exactly why
+  this is here rather than an equality check. `and`/`or` lower to a `let` over
+  an `or-tmp__N`, so the first one added to any of these cores would otherwise
+  make this gate fail on every run, and a gate that always fails gets deleted."
+  [kir]
+  (let [seen (volatile! {})]
+    (walk/postwalk
+     (fn [x]
+       (if (and (symbol? x) (re-find #"__\d+$" (name x)))
+         (let [n (or (get @seen x)
+                     (let [n (count @seen)] (vswap! seen assoc x n) n))]
+           (symbol (str (str/replace (name x) #"__\d+$" "") "__" n)))
+         x))
+     kir)))
+
+(deftest the-shipped-artifact-is-the-current-source-compiled
+  (doseq [[id source] (sort-by key oracle/cores)]
+    (testing (str id " <- " source)
+      (let [shipped (edn/read-string (slurp (io/resource (oracle/resource-path id))))
+            fresh (gen/compile-kir source)]
+        (is (= (renumber-gensyms fresh) (renumber-gensyms shipped))
+            (str "shipped KIR for " id " is stale — run `kbb -M:test:gen`"))))))
+
+(deftest every-declared-core-actually-ships
+  (doseq [id (keys oracle/cores)]
+    (is (some? (io/resource (oracle/resource-path id)))
+        (str "no artifact for " id))
+    (is (some? (oracle/kir id)))))
+
+(deftest a-missing-artifact-throws-rather-than-deciding-anything
+  ;; The seam's one refusal. If it fell back instead, the first thing anyone
+  ;; would notice is that an unchecked payload reached a page.
+  (is (thrown-with-msg? kerror/ExceptionInfo #"shipped decision core is missing"
+                        (oracle/kir :not-a-core)))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"does not declare that export"
+                        (oracle/param-types :hiccup-core 'no-such-export))))
+
+;; ── what ships has to work on ClojureScript too ──────────────────────
+
+(deftest no-shipped-core-reaches-the-clojurescript-substring-bug
+  ;; shitsuke is a design system that ClojureScript consumers require directly,
+  ;; and this repo has no ClojureScript test runner — so the property that makes
+  ;; delegation safe on that runtime has to be asserted structurally rather than
+  ;; executed.
+  ;;
+  ;; At the kir pin this library runs (838cd77c, the one the pinned compiler
+  ;; emits for), `kotoba.kir.value/utf8-substring!` guards its offsets with
+  ;; `(integer? start)`. An `:i64` is a `js/BigInt` under ClojureScript and
+  ;; `(integer? <BigInt>)` is false there, so any core that reaches
+  ;; `string-substring` throws "string substring indexes are out of bounds" on
+  ;; ClojureScript while passing on the JVM. The compiler synthesises
+  ;; `__kotoba_string_from_i64` — whose body is a `string-substring` — for any
+  ;; core that formats an integer into a string, so "prints a number" is the
+  ;; property to keep out of what ships.
+  ;;
+  ;; Measured 2026-08-12: the shipped core does not. It composes strings from
+  ;; strings, and its one integer (`string-contains?` returning 1/0) is
+  ;; compared, never printed. This pins that, for whatever ships — so a core
+  ;; added to `oracle/cores` later is asked the same question.
+  (doseq [id (sort (keys oracle/cores))]
+    (testing (str id)
+      (let [kir (oracle/kir id)
+            symbols (let [acc (volatile! #{})]
+                      (walk/postwalk (fn [x] (when (symbol? x) (vswap! acc conj x)) x) kir)
+                      @acc)
+            offenders (filter #(re-find #"substring|from-i64|from_i64" (name %)) symbols)]
+        (is (empty? offenders)
+            (str id " reaches " (pr-str (vec offenders))
+                 " — that is the ClojureScript BigInt path; either keep it out of"
+                 " the shipped core or stop delegating it"))))))
+
+;; ── delegation ───────────────────────────────────────────────────────
+
+(def ^:private breakout-record
+  "[:record …] as `hiccup_core.kotoba` declares it. Spelled out HERE, unlike in
+  `shitsuke.hiccup`, because the substitute core below has to declare the same
+  type for the swap to be a swap and not a different module."
+  "[:record :hic/rawtext-breakout [[:tag :string] [:content :string]]]")
+
+(def ^:private inverted-hiccup-source
+  "Same exports, same signatures, deliberately INVERTED answer: content that
+  breaks out is reported clean, and content that is clean is reported as
+  breaking out.
+
+  Inverted rather than constant so the swap is observable in both directions —
+  a host that had kept its own `re-find` would keep throwing on the dirty case
+  AND keep not throwing on the clean one, and either half alone could be
+  mistaken for a passing test."
+  (str "(ns hiccup-core"
+       " (:export [main rawtext-terminator rawtext-breakout?])"
+       " (:schemas {:hic/rawtext-breakout " breakout-record "}))"
+       "(defn rawtext-terminator [tag :string] :string"
+       "  (string-concat \"</\" tag))"
+       "(defn rawtext-breakout? [x [:ref :hic/rawtext-breakout]] :bool"
+       "  (let [tag (record-get x :tag)"
+       "        content (record-get x :content)]"
+       "    (= 0 (string-contains? (string-fold-case content)"
+       "                           (string-fold-case (rawtext-terminator tag))))))"
+       "(defn main [] (string-byte-length (rawtext-terminator \"style\")))"))
+
+(defn- with-core [id kir f]
+  (try
+    (oracle/register-kir! id kir)
+    (f)
+    (finally (oracle/deregister-kir! id))))
+
+(defn- breakout-rejected?
+  "Did `->html` refuse this raw-text payload?"
+  [tag content]
+  (try (hiccup/->html [(keyword tag) [:hiccup/raw content]]) false
+       (catch kerror/ExceptionInfo _ true)))
+
+(deftest the-host-reads-the-artifact-rather-than-keeping-a-copy
+  (let [inverted (:kir (compiler/compile-source inverted-hiccup-source oracle/target {}))]
+    (testing "the shipped answers"
+      (is (true? (breakout-rejected? "script" "var a = \"</script>\";")))
+      (is (true? (breakout-rejected? "style" "x</StYlE>y")) "case-insensitively")
+      (is (false? (breakout-rejected? "style" "body { color: red; }")))
+      (is (false? (breakout-rejected? "style" "</script")) "a different tag's terminator"))
+    (with-core :hiccup-core inverted
+      (fn []
+        ;; This is the security statement. A host that had kept
+        ;; `(re-find (re-pattern (str "(?i)</" tag)) content)` would answer
+        ;; exactly as it did above, and nothing else in this repository would
+        ;; say so.
+        (is (false? (breakout-rejected? "script" "var a = \"</script>\";"))
+            "a payload that breaks out was emitted, because the substituted core said it was clean")
+        (is (false? (breakout-rejected? "style" "x</StYlE>y"))
+            "and followed it case-insensitively")
+        (is (true? (breakout-rejected? "style" "body { color: red; }"))
+            "and in the other direction: clean content was refused")
+        (testing "the emitted markup really is the payload, verbatim"
+          (is (= "<script>var a = \"</script>\";</script>"
+                 (hiccup/->html [:script [:hiccup/raw "var a = \"</script>\";"]]))))))
+    (testing "restored"
+      (is (true? (breakout-rejected? "script" "var a = \"</script>\";")))
+      (is (false? (breakout-rejected? "style" "body { color: red; }"))))))
+
+(deftest the-record-abi-is-read-out-of-the-artifact
+  ;; `shitsuke.hiccup` writes the record type down nowhere; it asks the shipped
+  ;; core for the declared field order and builds by name from that. Pinned here
+  ;; so a rename or a reordering in `hiccup_core.kotoba` shows up as this
+  ;; failing rather than as records that no longer match their declared type.
+  (is (= [:record :hic/rawtext-breakout [[:tag :string] [:content :string]]]
+         (oracle/only-param-type :hiccup-core 'rawtext-breakout?))
+      "the parameter is declared as a :ref and must resolve to its descriptor")
+  (is (= :bool (:result (oracle/signature :hiccup-core 'rawtext-breakout?))))
+  (is (thrown-with-msg? kerror/ExceptionInfo #"missing a declared field"
+                        (oracle/record-of
+                         (oracle/only-param-type :hiccup-core 'rawtext-breakout?)
+                         {:tag "script"}))))
+
+;; ── the window is mechanism, and mechanism can still be wrong ────────
+
+(deftest a-terminator-is-found-at-every-offset-including-across-windows
+  ;; The guest refuses a string over 65536 UTF-8 bytes, so `shitsuke.hiccup`
+  ;; windows long content and asks per window. That is not a decision — the
+  ;; guest still decides each window — but a window boundary that could hide a
+  ;; terminator would be a security hole introduced by the mechanism rather than
+  ;; by the rule. The stride is 16384-256, so this sweeps the terminator across
+  ;; the first two boundaries a byte at a time.
+  (let [payload "</script"
+        filler (fn [n] (apply str (repeat n "a")))]
+    (doseq [offset (concat (range 16100 16500) (range 32200 32400))]
+      (let [content (str (filler offset) payload
+                         (filler (- 40000 offset (count payload))))]
+        (is (true? (breakout-rejected? "script" content))
+            (str "a terminator at offset " offset " was not seen"))))
+    (testing "and content with no terminator at all is still clean at that size"
+      (is (false? (breakout-rejected? "script" (filler 40000)))))
+    (testing "content far beyond one window, terminator only at the very end"
+      (is (true? (breakout-rejected? "script" (str (filler 200000) "</SCRIPT>")))))
+    (testing "content far beyond one window with none"
+      (is (false? (breakout-rejected? "script" (filler 200000)))))))

@@ -1,0 +1,103 @@
+(ns kotoba.property.collector
+  "Collect minimized Companies House PSC records for named corporate owners.
+
+   The API key is supplied only through COMPANIES_HOUSE_API_KEY. The output is
+   local governed state, not a repository artifact."
+  (:require [kotoba.bytes :as kbytes] [kotoba.json :as json]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.property.ownership :as ownership])
+  (:import [java.net URI]
+           [java.net.http HttpClient HttpRequest HttpResponse$BodyHandlers]
+           [java.time Instant]))
+
+(def default-store "var/kotoba-property/gb-ubo.edn")
+
+(defn- usage []
+  (str "Usage: COMPANIES_HOUSE_API_KEY=... kbb -M:collect "
+       "--company COMPANY_NUMBER [--company COMPANY_NUMBER] [--store PATH]"))
+
+(defn- parse-args [args]
+  (loop [args args result {:companies [] :store default-store}]
+    (if-let [arg (first args)]
+      (case arg
+        "--company" (recur (nnext args) (update result :companies conj (second args)))
+        "--store" (recur (nnext args) (assoc result :store (second args)))
+        (throw (ex-info (str "Unknown argument: " arg) {:usage (usage)})))
+      result)))
+
+(defn- basic-auth [api-key]
+  (str "Basic " (kbytes/base64-encode
+                                  (kbytes/utf8-bytes (str api-key ":")))))
+
+(defn- fetch-json [api-key company-number]
+  (let [request (-> (HttpRequest/newBuilder)
+                    (.uri (URI/create
+                           (str "https://api.company-information.service.gov.uk/company/"
+                                company-number
+                                "/persons-with-significant-control?items_per_page=100&start_index=0")))
+                    (.header "Authorization" (basic-auth api-key))
+                    (.header "Accept" "application/json")
+                    (.GET)
+                    (.build))
+        response (.send (HttpClient/newHttpClient) request
+                        (HttpResponse$BodyHandlers/ofString))]
+    (when-not (= 200 (.statusCode response))
+      (throw (ex-info "Companies House PSC request failed"
+                      {:company-number company-number :status (.statusCode response)})))
+    (json/read-str (.body response) :key-fn keyword)))
+
+(defn normalize-psc
+  "Drops all fields except the minimized public UBO contract."
+  [company-number observed-at item]
+  (when (and (= "individual-person-with-significant-control" (:kind item))
+             (:name item))
+    (let [person-id (or (get-in item [:links :self])
+                        (str "companies-house-psc:" company-number ":" (:name item)))
+          ubo {:ubo/id (str "companies-house-psc:" company-number ":" person-id)
+               :ubo/company-id company-number
+               :ubo/person-id person-id
+               :ubo/person-name (:name item)
+               :ubo/control (set (map keyword (:natures_of_control item)))
+               :ubo/jurisdiction "GB"
+               :ubo/source "companies-house-psc"
+               :ubo/observed-at observed-at
+               :ubo/disclosure :public}]
+      (when (:ubo/valid? (ownership/validate-ubo ubo)) ubo))))
+
+(defn- read-store [path]
+  (if (io/exists? (io/file path))
+    (edn/read-string (slurp path))
+    {:ubo-records {} :source-state {}}))
+
+(defn- write-store! [path state]
+  (io/make-parents path)
+  (spit path (pr-str state)))
+
+(defn collect-company! [api-key state company-number]
+  (let [observed-at (str (Instant/now))
+        response (fetch-json api-key company-number)
+        records (keep #(normalize-psc company-number observed-at %) (:items response))
+        without-company (into {}
+                              (remove (fn [[_ ubo]]
+                                        (= company-number (:ubo/company-id ubo))))
+                              (:ubo-records state))]
+    (assoc state
+           :ubo-records (into without-company (map (juxt :ubo/id identity) records))
+           :source-state (assoc (:source-state state) company-number
+                                {:source "companies-house-psc"
+                                 :retrieved-at observed-at
+                                 :record-count (count records)}))))
+
+(defn -main [& args]
+  (let [{:keys [companies store]} (parse-args args)
+        api-key (System/getenv "COMPANIES_HOUSE_API_KEY")]
+    (when (or (str/blank? api-key) (empty? companies))
+      (binding [*out* *err*] (println (usage))
+      (System/exit 2)))
+    (let [state (reduce (partial collect-company! api-key) (read-store store) companies)]
+      (write-store! store state)
+      (println (pr-str {:store store
+                         :companies (count companies)
+                         :ubo-records (count (:ubo-records state))})))))

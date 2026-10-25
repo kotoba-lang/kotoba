@@ -1,0 +1,120 @@
+(ns kotoba.lang.kami-nv-compat.optix-test
+  "Coverage for optix.cljc. IMPORTANT: OptixModule holds :context, and the
+  context's :modules atom holds the module back — a genuine circular
+  reference (matches TS, where module.context === context and
+  context._modules includes the module). Never `=`/print a WHOLE
+  context/module/pipeline map in a failure-prone assertion (pr-str would
+  recurse into the atom's contents and blow up); always assert on specific
+  fields instead."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.kami-nv-compat.kami-rt.bvh :as bvh]
+            [kotoba.lang.kami-nv-compat.kami-rt.index :as rt]
+            [kotoba.lang.kami-nv-compat.optix :as ox]))
+
+(def one-tri [[[0.0 0.0 0.0] [1.0 0.0 0.0] [0.0 1.0 0.0]]])
+(def scene (rt/build-scene one-tri))
+(def cam (bvh/look-at [0.0 0.0 4.0] [0.0 0.0 0.0] [0.0 1.0 0.0] 45 1.0))
+
+(defn- raygen-pipeline [ctx]
+  (let [m   (ox/optix-module-create-from-wgsl ctx (ox/default-module-compile-options)
+                                               (ox/default-pipeline-compile-options) "wgsl-src")
+        pgs (ox/optix-program-group-create ctx [{:module m :kind :raygen}])]
+    (ox/optix-pipeline-create ctx (ox/default-pipeline-compile-options) pgs)))
+
+(deftest default-compile-options
+  (is (= {:max-register-count 0 :opt-level 3 :debug-level 0}
+         (ox/default-module-compile-options)))
+  (is (= {:uses-motion-blur false :traversable-graph-flags 0
+          :num-payload-values 2 :num-attribute-values 2 :exception-flags 0}
+         (ox/default-pipeline-compile-options))))
+
+(deftest device-context-create-defaults
+  (let [ctx (ox/optix-device-context-create)]
+    (is (nil? (:log-callback ctx)))
+    (is (zero? (:log-callback-level ctx)))
+    (is (zero? (count @(:modules ctx))))
+    (is (zero? (count @(:pipelines ctx))))))
+
+(deftest module-create-from-ptx-always-throws
+  (is (thrown? #?(:clj Exception :cljs :default) (ox/optix-module-create-from-ptx))))
+
+(deftest module-create-from-wgsl-registers-on-context
+  (let [ctx (ox/optix-device-context-create)
+        m   (ox/optix-module-create-from-wgsl ctx (ox/default-module-compile-options)
+                                               (ox/default-pipeline-compile-options) "my-wgsl")]
+    (is (= "my-wgsl" (:source-wgsl m)))
+    (is (= (ox/default-module-compile-options) (:compile-options m)))
+    (is (= 1 (count @(:modules ctx))))
+    (is (= "my-wgsl" (:source-wgsl (first @(:modules ctx)))))
+
+    (testing "a second module appends, doesn't replace"
+      (ox/optix-module-create-from-wgsl ctx (ox/default-module-compile-options)
+                                         (ox/default-pipeline-compile-options) "second")
+      (is (= 2 (count @(:modules ctx)))))))
+
+(deftest program-group-create-shape
+  (let [ctx (ox/optix-device-context-create)
+        m   (ox/optix-module-create-from-wgsl ctx (ox/default-module-compile-options)
+                                               (ox/default-pipeline-compile-options) "w")
+        pgs (ox/optix-program-group-create ctx [{:module m :kind :raygen} {:module m :kind :miss}])]
+    (is (= [:raygen :miss] (mapv :kind pgs)))))
+
+(deftest pipeline-create-registers-on-context
+  (let [ctx (ox/optix-device-context-create)
+        pl  (raygen-pipeline ctx)]
+    (is (= 1 (count (:program-groups pl))))
+    (is (= 1 (count @(:pipelines ctx))))))
+
+(deftest shader-binding-table-defaults-and-overrides
+  (is (= {:raygen-record 0 :miss-record-base 0 :hitgroup-record-base 0}
+         (ox/optix-shader-binding-table-create)))
+  (is (= 5 (:raygen-record (ox/optix-shader-binding-table-create {:raygen-record 5})))))
+
+(deftest launch-validates-pipeline-and-dims
+  (let [ctx (ox/optix-device-context-create)
+        sbt (ox/optix-shader-binding-table-create)]
+    (testing "empty program-groups -> invalid value, no throw"
+      (let [empty-pl (ox/optix-pipeline-create ctx (ox/default-pipeline-compile-options) [])
+            result   (ox/optix-launch empty-pl sbt {:scene scene :camera cam :width 4 :height 4})]
+        (is (= ox/optix-error-invalid-value (:result result)))))
+
+    (testing "no raygen program group -> invalid value"
+      (let [m         (ox/optix-module-create-from-wgsl ctx (ox/default-module-compile-options)
+                                                          (ox/default-pipeline-compile-options) "w")
+            miss-pgs  (ox/optix-program-group-create ctx [{:module m :kind :miss}])
+            miss-pl   (ox/optix-pipeline-create ctx (ox/default-pipeline-compile-options) miss-pgs)
+            result    (ox/optix-launch miss-pl sbt {:scene scene :camera cam :width 4 :height 4})]
+        (is (= ox/optix-error-invalid-value (:result result)))))
+
+    (testing "zero width/height -> invalid value"
+      (let [pl (raygen-pipeline ctx)]
+        (is (= ox/optix-error-invalid-value
+               (:result (ox/optix-launch pl sbt {:scene scene :camera cam :width 0 :height 4}))))
+        (is (= ox/optix-error-invalid-value
+               (:result (ox/optix-launch pl sbt {:scene scene :camera cam :width 4 :height 0}))))))))
+
+(deftest launch-success-traces-a-frame
+  (let [ctx (ox/optix-device-context-create)
+        pl  (raygen-pipeline ctx)
+        sbt (ox/optix-shader-binding-table-create)
+        res (ox/optix-launch pl sbt {:scene scene :camera cam :width 4 :height 4})]
+    (is (= ox/optix-success (:result res)))
+    (is (= (* 4 4 4) (count (:framebuffer res))))))   ; RGBA per pixel
+
+(deftest launch-async-falls-back-to-cpu-on-jvm
+  (let [ctx (ox/optix-device-context-create)
+        pl  (raygen-pipeline ctx)
+        sbt (ox/optix-shader-binding-table-create)
+        res (ox/optix-launch-async pl sbt {:scene scene :camera cam :width 4 :height 4})]
+    (is (= ox/optix-success (:result res)))
+    (is (= :cpu (:backend res)))
+    (is (= (* 4 4 4) (count (:framebuffer res))))))
+
+(deftest launch-async-validates-like-sync
+  (let [ctx (ox/optix-device-context-create)
+        sbt (ox/optix-shader-binding-table-create)
+        empty-pl (ox/optix-pipeline-create ctx (ox/default-pipeline-compile-options) [])
+        res (ox/optix-launch-async empty-pl sbt {:scene scene :camera cam :width 4 :height 4})]
+    (is (= ox/optix-error-invalid-value (:result res)))
+    (is (= :cpu (:backend res)))
+    (is (empty? (:framebuffer res)))))

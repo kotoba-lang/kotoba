@@ -1,0 +1,156 @@
+(ns ekyc.identity-intake-test
+  (:require [cljs.test :refer-macros [deftest is async]] [ekyc.identity-intake :as i]
+            [ekyc.researcher-profile :as profile]
+            [ekyc.identity-intake-service :as service] [ekyc.identity-vault :as v] [ekyc.identity-intake-host :as h]
+            [ekyc.identity-crypto :as c] [ekyc.identity-passport-test :refer [rejects]]))
+(def now 1789180000000)
+(def profile-none {:version profile/version :affiliation {:kind "independent"}
+                   :qualification-status "none" :qualifications []})
+(def review-none {:version profile/version :affiliation {:status "declared-none"} :qualifications []})
+(def start {:op :intake-start :id "case" :principal "alice" :authenticated true :consent true
+            :notice-version i/version :nonce "nonce" :holder-key-id "holder" :holder-jwk {:kty "OKP"}
+            :holder-proof-verified true :key-ref "kms:case" :purpose "Review owned code" :scope "owned-repo"
+            :expires-at (+ now 604800000) :researcher-profile profile-none})
+(def initial {:reviewers #{"reviewer" "alice"} :reviewer-keys {"reviewer" {:status :active :key-id "review-key" :key-thumbprint "thumb"}
+                                                             "alice" {:status :active}}})
+(def capturing (:state (i/transition initial start now)))
+(defn event [op] {:op op :id "case" :principal "alice" :authenticated true :nonce "nonce"})
+(defn evidence [slot] (assoc (event :intake-evidence) :slot slot :size 3 :cid "bafk-evidence" :digest (name slot)
+                            :media-type (if (= slot :document) "image/jpeg" "video/webm") :write-receipt "private:receipt" :stored-and-verified true))
+(def submitted
+  (reduce (fn [s e] (:state (i/transition s e now))) capturing
+          [(evidence :document) (evidence :live-video) (assoc (event :intake-submit) :holder-proof-verified true)]))
+(deftest authorization-and-workflow
+  (is (= :capturing (get-in capturing [:intake "case" :status])))
+  (is (false? (:ok (i/transition capturing (assoc start :id "other") now))))
+  (doseq [e [(assoc (evidence :document) :principal "mallory")
+             (assoc (evidence :document) :stored-and-verified false)
+             (assoc (evidence :document) :size 2097153)
+             (assoc (evidence :document) :media-type "image/svg+xml")
+             (assoc (event :intake-submit) :holder-proof-verified true)]]
+    (is (false? (:ok (i/transition capturing e now)))))
+  (is (false? (:ok (i/transition capturing (evidence :document) (+ now 900000)))))
+  (is (false? (:ok (i/transition submitted (event :intake-claim) now))))
+  (let [claimed (:state (i/transition submitted (assoc (event :intake-claim) :principal "reviewer") now))]
+    (is (i/access? claimed "case" "reviewer" now))
+    (is (not (i/access? claimed "case" "mallory" now)))
+    (is (not (i/access? (assoc-in claimed [:reviewer-keys "reviewer" :status] :revoked) "case" "reviewer" now)))
+    (is (false? (:ok (i/transition claimed (assoc (event :intake-reject) :principal "reviewer" :reason :document-unreadable) now))))
+    (is (not (contains? (i/public-record (get-in claimed [:intake "case"])) :key-ref)))))
+(deftest encrypted-storage-audit-and-deletion
+  (async done
+    (let [db (atom {:revision 0 :state capturing}) blocks (atom {}) key (atom nil) destroyed (atom false)
+          ports {:origin "https://kotobase.net" :visibility :private :cas-mode :authoritative
+                 :read! #(js/Promise.resolve @db)
+                 :cas! (fn [revision state]
+                         (let [current @db]
+                           (js/Promise.resolve
+                            (if (and (= revision (:revision current)) (compare-and-set! db current {:revision (inc revision) :state state}))
+                              {:status :committed :revision (inc revision) :receipt-ref "private:commit"} {:status :conflict}))))
+                 :put-block! (fn [cid bytes] (swap! blocks assoc cid bytes) (js/Promise.resolve {:status :stored :cid cid :receipt-ref "private:block"}))
+                 :get-block! #(js/Promise.resolve (get @blocks %))
+                 :key! (fn [_ _] (if @destroyed (js/Promise.reject (js/Error. "deleted")) (js/Promise.resolve @key)))
+                 :destroy-key! (fn [_ _] (reset! destroyed true) (js/Promise.resolve {:status :destroyed :receipt-ref "kms:destroyed"}))}
+          bytes (.encode (js/TextEncoder.) "synthetic document only")]
+      (-> (.generateKey (.-subtle js/crypto) #js {:name "AES-GCM" :length 256} false #js ["encrypt" "decrypt"])
+          (.then (fn [k] (reset! key k) (v/store-evidence! ports "case" "alice" :document "image/jpeg" bytes now)))
+          (.then (fn [_]
+                   (let [[cid sealed] (first @blocks)]
+                     (is (re-matches #"bafkrei[a-z2-7]{52}" cid))
+                     (is (not= (vec bytes) (vec sealed)))
+                     (is (= (+ 28 (.-length bytes)) (.-length sealed))))
+                   (v/read-evidence! ports "case" "alice" :document now)))
+          (.then (fn [r]
+                   (is (= "synthetic document only" (.decode (js/TextDecoder.) (:bytes r))))
+                   (is (= 1 (count (get-in @db [:state :intake-audit]))))
+                   (js/Promise.all #js [(rejects #(v/read-evidence! ports "case" "mallory" :document now))
+                                        (rejects #(v/unseal @key (c/utf8 "wrong case") (second (first @blocks))))
+                                        (rejects #(v/store-evidence! ports "case" "alice" :document "image/jpeg" bytes now))])))
+          (.then (fn [_] (h/dispatch! ports "profile" "alice" {:id "case"} now)))
+          (.then (fn [result]
+                   (is (= profile-none (:researcherProfile result)))
+                   (is (some #(= :profile-read (:action %)) (vals (get-in @db [:state :intake-audit]))))
+                   (rejects #(h/dispatch! ports "profile" "mallory" {:id "case"} now))))
+          (.then (fn [_] (v/delete-case! ports "case" "alice" now)))
+          (.then (fn [_]
+                   (is @destroyed)
+                   (is (= :deleted (get-in @db [:state :intake "case" :status])))
+                   (is (nil? (get-in @db [:state :intake "case" :evidence])))
+                   (is (nil? (get-in @db [:state :intake "case" :researcher-profile])))
+                   (rejects #(v/read-evidence! ports "case" "alice" :document now))))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest approval-is-independent-from-capture
+  (let [s (:state (i/transition submitted (assoc (event :intake-claim) :principal "reviewer") now))
+        approval (assoc (event :intake-approve) :principal "reviewer" :expected-revision (get-in s [:intake "case" :revision])
+                        :operator-signature-verified true :reviewer-key-id "review-key" :reviewer-key-thumbprint "thumb"
+                        :profile-review review-none
+                        :supervised-live-session true :live-session-ref "private:live-session"
+                        :holder-method :supervised-live-video-document-comparison :document-checked true
+                        :adult true :holder-match true :liveness true :document-tag "hmac:document"
+                        :review-evidence-ref "private:review" :expires-at (+ now 86400000) :document-expires-at (+ now 864000000)
+                        :screening {:status :clear :evidence-ref "private:screening" :coverage [:sanctions :pep :adverse-media]
+                                    :checked-at now :expires-at (+ now 86400000)}
+                        :scope {:status :approved :id "owned-repo" :issued-at now :expires-at (+ now 86400000)})
+        result (i/transition s approval now)]
+    (is (:ok result))
+    (is (= :approved (get-in result [:state :applications "case" :status])))
+    (is (= :approved (get-in result [:state :intake "case" :status])))
+    (is (= :issue-credential (get-in result [:effects 0 :type])))
+    (doseq [bad [(assoc approval :supervised-live-session false) (dissoc approval :screening)
+                 (assoc approval :expected-revision 0) (assoc approval :reviewer-key-thumbprint "rotated")
+                 (assoc approval :operator-signature-verified false) (assoc approval :adult false)
+                 (dissoc approval :profile-review)]]
+      (is (false? (:ok (i/transition s bad now)))))
+    (is (false? (:ok (i/transition (:state result) approval now))))))
+
+(deftest real-holder-proof-and-reviewer-signature
+  (async done
+    (let [db (atom {:revision 0 :state initial}) private-key (atom nil) public-jwk (atom nil)
+          ports {:origin "https://kotobase.net" :visibility :private :cas-mode :authoritative
+                 :intake-enabled? true :notice-approved? true
+                 :read! #(js/Promise.resolve @db)
+                 :cas! (fn [revision state] (reset! db {:revision (inc revision) :state state})
+                         (js/Promise.resolve {:status :committed :revision (inc revision) :receipt-ref "private:receipt"}))
+                 :create-key! (fn [_] (js/Promise.resolve "kms:new-case"))
+                 :put-block! (fn [& _]) :get-block! (fn [& _]) :key! (fn [& _]) :destroy-key! (fn [& _])}
+          claims {:principal "alice" :aud "https://kotoba.cloud" :action "start" :consent true
+                  :notice-version i/version :purpose "owned code" :scope "own-repo" :researcher-profile profile-none
+                  :iat (c/seconds now) :exp (+ (c/seconds now) 120)}]
+      (-> (.generateKey (.-subtle js/crypto) "Ed25519" true #js ["sign" "verify"])
+          (.then (fn [keys] (reset! private-key (.-privateKey keys)) (.exportKey (.-subtle js/crypto) "jwk" (.-publicKey keys))))
+          (.then (fn [jwk] (reset! public-jwk (select-keys (js->clj jwk :keywordize-keys true) [:kty :crv :x]))
+                   (c/sign @private-key "holder" "kotoba-intake+jwt" claims)))
+          (.then (fn [signed]
+                   (-> (rejects #(h/begin! ports "mallory" @public-jwk signed now))
+                       (.then (fn [_] (h/begin! ports "alice" @public-jwk signed now))))))
+          (.then (fn [receipt]
+                   (let [id (:id receipt) r (get-in @db [:state :intake id])]
+                     (is (= "alice" (:principal r)))
+                     (is (= (:nonce receipt) (:nonce r)))
+                     (is (= :capturing (:status r)))
+                     (is (= profile-none (:researcher-profile r)))
+                     (is (not (contains? receipt :key-ref)))
+                     (-> (c/holder-key-id @public-jwk)
+                         (.then (fn [thumb]
+                                  (swap! db update :state #(-> %
+                                      (assoc-in [:reviewer-keys "reviewer"] {:status :active :key-id "review-key" :key-thumbprint thumb :public-jwk @public-jwk})
+                                      (assoc-in [:intake id :status] :in-review)
+                                      (assoc-in [:intake id :reviewer] "reviewer")))
+                                  (c/sign @private-key "review-key" "kotoba-intake-review+jwt"
+                                          {:id id :actor "reviewer" :aud "https://kotoba.cloud" :action "reject"
+                                           :expected-revision (:revision r) :reason "document-unreadable"
+                                           :iat (c/seconds now) :exp (+ (c/seconds now) 120)})))
+                         (.then (fn [signed]
+                                  (-> (h/review! ports "reviewer" id signed now)
+                                      (.then (fn [_]
+                                               (is (= :rejected (get-in @db [:state :intake id :status])))
+                                               (rejects #(h/review! ports "reviewer" id signed now)))))))
+                         (.then (fn [_] (let [handle (service/handler ports (constantly now))]
+                                          (-> (handle (js/Request. "https://identity.internal/status"
+                                                                  #js {:method "POST" :headers #js {"x-kotoba-principal" "mallory"}
+                                                                       :body "{\"principal\":\"alice\"}"}))
+                                              (.then (fn [response] (is (= 200 (.-status response))) (.json response)))
+                                              (.then #(js->clj % :keywordize-keys true))))))))))
+          (.then (fn [r] (is (empty? (:cases r)))))
+          (.catch #(is false (str %))) (.finally done)))))

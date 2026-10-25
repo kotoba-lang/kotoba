@@ -1,0 +1,329 @@
+(ns kotobase.blocks-test
+  "Every negative case here asserts the REASON, not just that something went
+   wrong. A test that only checks `catch` fires counts a failure with an
+   unrelated cause as a discrimination it never made — the shape superproject
+   AGENTS.md names as the sixth question (`did this check ever refuse for the
+   reason it claims?`). So each rejection is pinned to its `:type`."
+  (:require [cljs.test :refer-macros [deftest is testing async]]
+            [sha2.core :as sha2]
+            [kotobase.cid :as cid]
+            [kotobase.blocks :as blocks]))
+
+;; A real block from the live plane: `ipfs.kotobase.net/ipfs/<cid>` returned
+;; 119,762 bytes on 2026-09-06 whose SHA-256 is exactly this CID's digest.
+;; Only the CID and digest are pinned here; the payload is not vendored.
+(def live-cid "bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
+(def live-digest-hex
+  "c7d01489080858c500065836c658f847a6ca67c4864619212be4f8200e4bbace")
+
+(defn- bytes->hex [bs]
+  (sha2/hex (if (vector? bs) bs (vec (js/Array.from bs)))))
+
+(defn- u8 [& xs] (js/Uint8Array.from (clj->js (vec xs))))
+
+(defn- cid-for
+  "Build the CIDv1/raw/sha2-256 string that `bytes` hashes to, using the
+   ENCODER already in this library. Deriving the expected address with the
+   inverse of the code under test is what keeps this suite from asserting
+   that `parse-cid` agrees with itself."
+  [^js bytes]
+  (let [digest (sha2/sha256 (vec (js/Array.from bytes)))
+        cid-bytes (js/Uint8Array. 36)]
+    (aset cid-bytes 0 0x01)                ; CIDv1
+    (aset cid-bytes 1 0x55)                ; raw
+    (aset cid-bytes 2 0x12)                ; sha2-256
+    (aset cid-bytes 3 0x20)                ; 32 bytes
+    (dotimes [i 32] (aset cid-bytes (+ 4 i) (nth digest i)))
+    (str "b" (cid/base32-lower-no-pad cid-bytes))))
+
+(defn- fetch-returning
+  "A `fetch` stand-in. `f` receives the URL and returns
+   `{:status n :body <Uint8Array>}`; the recorded URLs are visible to the
+   caller through the returned atom."
+  [f]
+  (let [seen (atom [])]
+    [seen
+     (fn [url _opts]
+       (swap! seen conj url)
+       (let [{:keys [status body]} (f url)]
+         (js/Promise.resolve
+          #js {:status status
+               :ok (and (>= status 200) (< status 300))
+               :arrayBuffer (fn [] (js/Promise.resolve (.-buffer (or body (u8)))))})))]))
+
+(defn error-type
+  "The `:type` the code under test attached, on either runtime.
+
+   nbb/SCI wraps a `throw` raised inside a `.then` callback: `ex-data`
+   becomes `{:type :sci/error :line … :sci.impl/callstack …}` and the
+   original moves to `ex-cause`. Measured 2026-09-06 — five assertions here
+   read `:sci/error` under nbb and the right keyword under shadow-cljs.
+
+   Reading `:type` directly would make the same assertion true on one
+   runtime and false on the other, so a fleet node running this suite would
+   report a runtime difference as a defect in the library. Unwrapping is
+   bounded rather than a `loop` on `ex-cause` alone: a cycle would hang the
+   gate instead of failing it."
+  [e]
+  (loop [e e depth 0]
+    (when (and e (< depth 8))
+      (let [t (:type (ex-data e))]
+        (if (and t (not= t :sci/error))
+          t
+          (recur (ex-cause e) (inc depth)))))))
+
+(defn- caught-type
+  "Run `p` and resolve with the `:type` of whatever it rejected with, or
+   `:kotobase.blocks-test/resolved` if it did not reject at all. Never
+   collapses a resolve into a pass."
+  [p]
+  (-> p
+      (.then (fn [_] ::resolved))
+      (.catch (fn [e] (or (error-type e) ::not-ex-info)))))
+
+;; ── multibase ───────────────────────────────────────────────────────────────
+
+(deftest base32-decode-inverts-the-encoder
+  (doseq [n [0 1 2 3 4 5 31 32 36 64]]
+    (let [bs (js/Uint8Array.from (clj->js (vec (range n))))
+          round (blocks/base32-lower-no-pad-decode (cid/base32-lower-no-pad bs))]
+      (is (= (vec (js/Array.from bs)) (vec (js/Array.from round)))
+          (str "round trip at length " n)))))
+
+(deftest base32-decode-rejects-a-character-outside-the-alphabet
+  ;; '1' and '0' are excluded from RFC4648 base32 precisely because they are
+  ;; confusable; accepting them would silently produce a different digest.
+  (is (thrown? js/Error (blocks/base32-lower-no-pad-decode "aaa1")))
+  (is (thrown? js/Error (blocks/base32-lower-no-pad-decode "AAAA"))))
+
+;; ── parse-cid ───────────────────────────────────────────────────────────────
+
+(deftest parse-cid-reads-a-real-cidv1-raw-block-address
+  (let [{:keys [version codec multihash-code digest]} (blocks/parse-cid live-cid)]
+    (is (= 1 version))
+    (is (= 0x55 codec) "raw")
+    (is (= 0x12 multihash-code) "sha2-256")
+    (is (= 32 (.-length digest)))
+    (is (= live-digest-hex (bytes->hex digest)))))
+
+(deftest parse-cid-refuses-what-it-cannot-read-instead-of-guessing
+  (testing "a multibase this code does not implement is named as such"
+    (is (= :kotobase.blocks/unsupported-multibase
+           (:type (ex-data (try (blocks/parse-cid "zQ3shokFTS3brHcDQrn82RUDfCZUaWtjBhq") (catch :default e e)))))))
+  (testing "an empty CID is not a valid one"
+    (is (= :kotobase.blocks/invalid-cid
+           (:type (ex-data (try (blocks/parse-cid "") (catch :default e e)))))))
+  (testing "a declared digest length that disagrees with the payload"
+    ;; CIDv1 / raw / sha2-256 / declared 32 bytes, but only 4 supplied.
+    (let [truncated (js/Uint8Array.from (clj->js [0x01 0x55 0x12 0x20 1 2 3 4]))]
+      (is (= :kotobase.blocks/invalid-cid
+             (:type (ex-data (try (blocks/parse-cid
+                                   (str "b" (cid/base32-lower-no-pad truncated)))
+                                  (catch :default e e)))))))))
+
+;; ── verify-block ────────────────────────────────────────────────────────────
+
+(deftest verify-block-accepts-only-the-bytes-the-cid-names
+  (let [body (u8 104 101 108 108 111)                    ; "hello"
+        c (cid-for body)]
+    (is (true? (blocks/verify-block c body)))
+    (testing "one flipped bit is not the same block"
+      (let [tampered (js/Uint8Array.from body)]
+        (aset tampered 0 (bit-xor (aget tampered 0) 1))
+        (is (false? (blocks/verify-block c tampered)))))
+    (testing "a truncated body is not the same block"
+      (is (false? (blocks/verify-block c (.slice body 0 4)))))))
+
+(deftest verify-block-refuses-a-hash-it-cannot-compute
+  ;; CIDv1 / raw / blake3 (0x1e) / 32 bytes. `false` here would read exactly
+  ;; like "the bytes were wrong", when in fact nothing was checked.
+  (let [b3 (js/Uint8Array. 36)]
+    (aset b3 0 0x01) (aset b3 1 0x55) (aset b3 2 0x1e) (aset b3 3 0x20)
+    (let [c (str "b" (cid/base32-lower-no-pad b3))
+          e (try (blocks/verify-block c (u8 1 2 3)) (catch :default e e))]
+      (is (instance? ExceptionInfo e) "must throw, not answer false")
+      (is (= :kotobase.blocks/unsupported-multihash (:type (ex-data e)))))))
+
+;; ── the transport ───────────────────────────────────────────────────────────
+
+(deftest get-block-returns-verified-bytes
+  (async done
+    (let [body (u8 1 2 3 4 5)
+          c (cid-for body)
+          [seen f] (fetch-returning (constantly {:status 200 :body body}))
+          {:keys [get-block]} (blocks/client {:endpoint "https://kotobase.net" :fetch-fn f})]
+      (-> (get-block c)
+          (.then (fn [bs]
+                   (is (= [1 2 3 4 5] (vec (js/Array.from bs))))
+                   (is (= [(str "https://kotobase.net/ipld/" c)] @seen)
+                       "one block, one GET, on the /ipld/ surface")
+                   (done)))
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))
+
+(deftest get-block-reports-an-absent-block-as-absent
+  (async done
+    (let [c (cid-for (u8 9))
+          [_ f] (fetch-returning (constantly {:status 404}))
+          {:keys [get-block]} (blocks/client {:fetch-fn f})]
+      (-> (get-block c)
+          (.then (fn [bs]
+                   (is (nil? bs) "404 is nil, not an error and not empty bytes")
+                   (done)))
+          (.catch (fn [e] (is false (str "404 must not reject: " e)) (done)))))))
+
+(deftest get-block-rejects-bytes-that-do-not-hash-to-the-cid
+  (async done
+    (let [asked (cid-for (u8 1 2 3))
+          [_ f] (fetch-returning (constantly {:status 200 :body (u8 4 5 6)}))
+          {:keys [get-block]} (blocks/client {:fetch-fn f})]
+      (-> (caught-type (get-block asked))
+          (.then (fn [t]
+                   (is (= :kotobase.blocks/corrupt t)
+                       "substituted bytes must be refused, and refused AS corruption")
+                   (done)))))))
+
+(deftest get-block-distinguishes-a-failed-read-from-an-absent-block
+  (async done
+    (let [c (cid-for (u8 7))
+          [_ f] (fetch-returning (constantly {:status 503}))
+          {:keys [get-block]} (blocks/client {:fetch-fn f})]
+      (-> (caught-type (get-block c))
+          (.then (fn [t]
+                   (is (= :kotobase.blocks/http t)
+                       "5xx is not 'no such block' — answering nil would let an outage read as an empty database")
+                   (done)))))))
+
+(deftest get-block-does-not-spend-a-round-trip-on-a-cid-it-could-never-verify
+  (let [b3 (js/Uint8Array. 36)]
+    (aset b3 0 0x01) (aset b3 1 0x55) (aset b3 2 0x1e) (aset b3 3 0x20)
+    (let [c (str "b" (cid/base32-lower-no-pad b3))
+          [seen f] (fetch-returning (constantly {:status 200 :body (u8 1)}))
+          {:keys [get-block]} (blocks/client {:fetch-fn f})
+          e (try (get-block c) (catch :default e e))]
+      (is (instance? ExceptionInfo e))
+      (is (= :kotobase.blocks/unsupported-multihash (:type (ex-data e))))
+      (is (= [] @seen) "refused before the fetch, not after"))))
+
+(deftest client-can-read-either-plane
+  (async done
+    (let [body (u8 42)
+          c (cid-for body)
+          [seen f] (fetch-returning (constantly {:status 200 :body body}))
+          {:keys [get-block]} (blocks/client {:endpoint "https://ipfs.kotobase.net"
+                                              :path-prefix "/ipfs/"
+                                              :fetch-fn f})]
+      (-> (get-block c)
+          (.then (fn [_]
+                   (is (= [(str "https://ipfs.kotobase.net/ipfs/" c)] @seen))
+                   (done)))))))
+
+(deftest endpoint-trailing-slash-does-not-produce-a-double-slash
+  (async done
+    (let [body (u8 3)
+          c (cid-for body)
+          [seen f] (fetch-returning (constantly {:status 200 :body body}))
+          {:keys [get-block]} (blocks/client {:endpoint "https://kotobase.net/" :fetch-fn f})]
+      (-> (get-block c)
+          (.then (fn [_]
+                   (is (= [(str "https://kotobase.net/ipld/" c)] @seen))
+                   (done)))))))
+
+;; ── contribution ────────────────────────────────────────────────────────────
+
+(defn- fetch-recording
+  "Like `fetch-returning`, but records the whole request so a test can assert
+   what was actually sent, not merely that something was."
+  [f]
+  (let [seen (atom [])]
+    [seen
+     (fn [url opts]
+       (swap! seen conj {:url url
+                         :method (.-method opts)
+                         :authorization (some-> (.-headers opts) (aget "authorization"))
+                         :body (.-body opts)})
+       (js/Promise.resolve
+        (let [status (f url)]
+          #js {:status status
+               :ok (and (>= status 200) (< status 300))
+               :arrayBuffer (fn [] (js/Promise.resolve (.-buffer (u8))))})))]))
+
+(deftest put-block-sends-the-caller-s-authorization-and-the-exact-bytes
+  (async done
+    (let [body (u8 10 20 30)
+          c (cid-for body)
+          [seen f] (fetch-recording (constantly 204))
+          {:keys [put-block!]} (blocks/client {:fetch-fn f})]
+      (-> (put-block! c body "CACAO deadbeef")
+          (.then (fn [returned]
+                   (is (= c returned))
+                   (let [req (first @seen)]
+                     (is (= "PUT" (:method req)))
+                     (is (= (str "https://kotobase.net/ipld/" c) (:url req)))
+                     (is (= "CACAO deadbeef" (:authorization req))
+                         "the credential is the caller's, passed through untouched")
+                     (is (= [10 20 30] (vec (js/Array.from (:body req))))))
+                   (done)))))))
+
+(deftest put-block-refuses-to-contribute-a-mis-addressed-block
+  (let [body (u8 1 2 3)
+        wrong (cid-for (u8 9 9 9))
+        [seen f] (fetch-recording (constantly 204))
+        {:keys [put-block!]} (blocks/client {:fetch-fn f})
+        e (try (put-block! wrong body "CACAO x") (catch :default e e))]
+    (is (= :kotobase.blocks/corrupt (:type (ex-data e))))
+    (is (= [] @seen) "and does not spend the round trip finding out")))
+
+(deftest put-block-will-not-invent-a-credential
+  (let [body (u8 1)
+        c (cid-for body)
+        [seen f] (fetch-recording (constantly 204))
+        {:keys [put-block!]} (blocks/client {:fetch-fn f})]
+    (doseq [missing [nil "" "   "]]
+      (let [e (try (put-block! c body missing) (catch :default e e))]
+        (is (= :kotobase.blocks/missing-authorization (:type (ex-data e)))
+            (str "for " (pr-str missing)))))
+    (is (= [] @seen))))
+
+(deftest put-block-names-each-refusal-by-its-own-cause
+  (async done
+    (let [body (u8 5)
+          c (cid-for body)
+          cases {401 :kotobase.blocks/unauthorized
+                 413 :kotobase.blocks/too-large
+                 400 :kotobase.blocks/rejected
+                 503 :kotobase.blocks/http}]
+      (-> (js/Promise.all
+           (clj->js
+            (for [[status expected] cases]
+              (let [[_ f] (fetch-recording (constantly status))
+                    {:keys [put-block!]} (blocks/client {:fetch-fn f})]
+                (-> (caught-type (put-block! c body "CACAO x"))
+                    (.then (fn [t]
+                             (is (= expected t) (str "HTTP " status))
+                             t)))))))
+          (.then (fn [_] (done)))))))
+
+(deftest put-block-satisfies-the-injected-client-contract-at-two-arguments
+  ;; `kotobase-storage-ipfs`'s `open` validates its client with `ifn?` and
+  ;; then calls `(put-block! cid bytes)`. A 3-arity-only function passes that
+  ;; validation and fails at the first write — wiring that looks green.
+  (async done
+    (let [body (u8 7 7)
+          c (cid-for body)
+          minted (atom 0)
+          [seen f] (fetch-recording (constantly 204))
+          {:keys [put-block!]} (blocks/client
+                                {:fetch-fn f
+                                 :authorization (fn [] (swap! minted inc)
+                                                  (str "CACAO minted-" @minted))})]
+      (-> (put-block! c body)
+          (.then (fn [returned]
+                   (is (= c returned))
+                   (is (= "CACAO minted-1" (:authorization (first @seen))))
+                   (-> (put-block! c body)
+                       (.then (fn [_]
+                                (is (= "CACAO minted-2" (:authorization (second @seen)))
+                                    "a thunk is re-invoked per write — a CACAO nonce is single-use")
+                                (is (= 2 @minted))
+                                (done))))))
+          (.catch (fn [e] (is false (str "unexpected rejection: " e)) (done)))))))

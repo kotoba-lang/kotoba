@@ -1,0 +1,120 @@
+(ns kotoba.security.release-evidence-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.security.release-evidence :as release-evidence]
+            [kotoba.security.signed-module :as signed-module]))
+
+(def component-bytes (kbytes/utf8-bytes "safe-component"))
+(def other-bytes (kbytes/utf8-bytes "other-component"))
+(def seed (byte-array (range 32)))
+
+;; Both ends of the validity window are pinned, and the fixture verifies at
+;; `evaluated-at`, inside it. `signed-module/sign` defaults :not-before to the
+;; wall clock, so a fixture that pins only the verification :now signs a module
+;; that is not-yet-valid the day after it is written: the test passed on
+;; 2026-08-15 and reported :signed-module/not-yet-valid every day after.
+;; Pin what is compared, on both sides.
+(def signed-not-before "2026-01-01")
+(def signed-expires "2099-01-01")
+(def evaluated-at "2026-08-15")
+
+(defn sign-opts
+  "Signing opts with an explicitly pinned validity window."
+  [not-before]
+  {:seed seed
+   :name "agent-program"
+   :version "1.0.0"
+   :exports ["run"]
+   :capabilities [:clock/read]
+   :not-before not-before
+   :expires signed-expires
+   :module-graph-digest "sha256:graph"})
+
+(defn packet
+  ([] (packet component-bytes))
+  ([bytes]
+   (let [envelope (signed-module/sign bytes (sign-opts signed-not-before))
+         signer (get-in envelope [:statement :signer])
+         cid (signed-module/component-cid component-bytes)]
+     {:package-receipt
+      {:kotoba.package/verified? true
+       :kotoba.package/problems []
+       :kotoba.package/entries
+       [{:package/id "agent-program"
+         :package/result :accepted
+         :package/component-cid cid}]}
+      :signed-module envelope
+      :component-bytes bytes
+      :trust {:trusted-signers #{signer} :revoked-signers #{}}
+      :key-register {:keys [{:key/id signer :key/status :active}]}
+      :sbom {:digest "sha256:sbom"}
+      :provenance {:digest "sha256:provenance"}
+      :now evaluated-at
+      :require-component-cid? true})))
+
+(deftest complete-release-identity-is-admitted
+  (is (:ok? (release-evidence/evaluate (packet)))))
+
+(deftest unrelated-component-cannot-inherit-receipt
+  (let [result (release-evidence/evaluate (packet other-bytes))]
+    (is (false? (:ok? result)))
+    (is (some #(= :release/component-not-in-receipt (:problem %))
+              (:problems result)))))
+
+(deftest trust-and-active-key-are-mandatory
+  (testing "empty trust fails closed"
+    (let [result (release-evidence/evaluate
+                  (assoc (packet) :trust {:trusted-signers #{}}))]
+      (is (false? (:ok? result)))
+      (is (some #(= :signed-module/trust-required (:problem %))
+                (:problems result)))))
+  (testing "missing active signer fails closed"
+    (let [result (release-evidence/evaluate
+                  (assoc (packet) :key-register {:keys []}))]
+      (is (false? (:ok? result)))
+      (is (some #(= :release/signer-not-active (:problem %))
+                (:problems result))))))
+
+(deftest module-authority-metadata-is-signed
+  (let [tampered (update-in (packet) [:signed-module :module :capabilities]
+                            conj :network/fetch)
+        result (release-evidence/evaluate tampered)]
+    (is (false? (:ok? result)))
+    (is (some #(= :signed-module/module-digest-mismatch (:problem %))
+              (:problems result)))))
+
+(deftest unsigned-exception-never-waives-required-evidence
+  (let [result (release-evidence/evaluate
+                (-> (packet)
+                    (dissoc :sbom)
+                    (assoc :exception-register
+                           {:exceptions [{:kind :sbom
+                                          :owner "self"
+                                          :expires "2099-01-01"}]})))]
+    (is (false? (:ok? result)))
+    (is (some #(and (= :release/missing-evidence (:problem %))
+                    (= :sbom (:kind %)))
+              (:problems result)))))
+
+(deftest fixture-signs-a-module-that-is-in-force-at-the-evaluation-instant
+  ;; Guards the regression that made this namespace fail from 2026-08-16 on:
+  ;; `signed-module/sign` defaults :not-before to the wall clock, so a fixture
+  ;; that pins only the verification :now signs a module whose window opens
+  ;; later than the instant it is verified at. Pin both, and prove the check
+  ;; that caught it is still live rather than merely quiet.
+  (testing "the pinned window brackets the evaluation instant"
+    (is (neg? (compare signed-not-before evaluated-at)))
+    (is (neg? (compare evaluated-at signed-expires)))
+    (is (= signed-not-before
+           (get-in (packet) [:signed-module :statement :not-before]))
+        "not-before must come from the fixture, not from the wall clock"))
+  (testing "as shipped, no validity problem is reported"
+    (is (not-any? #(= :signed-module/not-yet-valid (:problem %))
+                  (:problems (release-evidence/evaluate (packet))))))
+  (testing "a module signed into force after the evaluation instant is rejected"
+    (let [late (assoc (packet)
+                      :signed-module
+                      (signed-module/sign component-bytes (sign-opts "2098-01-01")))
+          result (release-evidence/evaluate late)]
+      (is (false? (:ok? result)))
+      (is (= [:signed-module/not-yet-valid] (mapv :problem (:problems result)))
+          "the late window must be the only thing that fails"))))

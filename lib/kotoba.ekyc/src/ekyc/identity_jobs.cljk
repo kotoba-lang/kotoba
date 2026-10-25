@@ -1,0 +1,146 @@
+(ns ekyc.identity-jobs
+  "Private durable research jobs. The host supplies qualified Kotobase read/CAS
+  ports and the existing verified identity command. Never expose this API directly
+  to a browser. Compatibility host implementation; not native/Q9 qualification."
+  (:refer-clojure :exclude [run!])
+  (:require [ekyc.identity-policy :as policy] [ekyc.identity-session :as session]))
+
+(def model "qwen3.8-flash-next-cybersecurity-nvfp4")
+(def queue-ttl-ms 900000)
+(def execution-ttl-ms 2100000)
+(def terminal #{:succeeded :cancelled :unknown})
+(defn fail! [reason] (throw (ex-info (name reason) {:reason reason})))
+(defn require! [condition reason] (when-not condition (fail! reason)))
+
+(defn validate-ports! [ports]
+  (require! (and (= "https://kotobase.net" (:origin ports))
+                 (= :private (:visibility ports)) (= true (:authoritative-cas? ports))
+                 (fn? (:read! ports)) (fn? (:cas! ports))) :private-job-storage-required))
+
+(defn transact! [ports transition now!]
+  (validate-ports! ports)
+  (letfn [(attempt [remaining]
+            (-> ((:read! ports))
+                (.then
+                 (fn [{:keys [revision state]}]
+                   (require! (and (integer? revision) (<= 0 revision) (map? state)) :job-state-unavailable)
+                   (let [{:keys [next value]} (transition state (now!))]
+                     (if-not next value
+                       (-> ((:cas! ports) revision next)
+                           (.then
+                            (fn [receipt]
+                              (cond
+                                (= :conflict (:status receipt))
+                                (if (pos? remaining) (attempt (dec remaining)) (fail! :job-contention))
+                                (and (= :committed (:status receipt)) (= (inc revision) (:revision receipt))
+                                     (policy/text? (:receipt-ref receipt)))
+                                (assoc value :receipt-ref (:receipt-ref receipt))
+                                :else (fail! :job-commit-unconfirmed)))))))))))]
+    (attempt 3)))
+
+(defn current-reason [state job now]
+  (let [command (:command job) record (get-in state [:applications (:id command)])]
+    (or (when (not= (:principal command) (:principal record)) :job-owner-mismatch)
+        (policy/eligibility record now)
+        (when (not= (:scope-id command) (get-in record [:scope :id])) :scope-mismatch)
+        (session/decision state (:session-id command) (:principal command)
+                          (:holder-key-id record) (:task command) now))))
+
+(defn enqueue!
+  "Fingerprint must be computed by the trusted host over the validated full input.
+  Free reservation and encrypted/private job state share one canonical CAS."
+  [ports command input fingerprint now!]
+  (require! (and (string? fingerprint) (re-matches #"[0-9a-f]{64}" fingerprint)
+                 (map? input) (= model (:model input))
+                 (integer? (:max_tokens input)) (<= 1 (:max_tokens input) 2048)
+                 (policy/text? (:request-id command))) :invalid-job)
+  (transact!
+   ports
+   (fn [state now]
+     (let [id (:request-id command) prior (get-in state [:research-jobs id])]
+       (if prior
+         (do (require! (and (= (:principal command) (get-in prior [:command :principal]))
+                            (= fingerprint (:fingerprint prior))) :idempotency-conflict)
+             {:value {:job-id id :status (:status prior)}})
+         (let [active (count (filter #(and (= (:principal command) (get-in % [:command :principal]))
+                                           (contains? #{:queued :running :unknown} (:status %)))
+                                     (vals (:research-jobs state))))
+               _ (require! (< active 1) :research-concurrency-limit)
+               reserved (policy/transition state (assoc command :op :reserve :utc-day (quot now 86400000)) now)]
+           (require! (:ok reserved) (or (:reason reserved) :reservation-denied))
+           {:next (assoc-in (:state reserved) [:research-jobs id]
+                            {:status :queued :command command :input input :fingerprint fingerprint
+                             :created-at now :expires-at (+ now queue-ttl-ms)})
+            :value {:job-id id :status :queued}})))) now!))
+
+(defn claim! [ports id now!]
+  (transact!
+   ports
+   (fn [state now]
+     (let [job (get-in state [:research-jobs id]) reason (when job (current-reason state job now))]
+       (require! job :job-not-found)
+       (cond
+         (not= :queued (:status job)) {:value {:dispatch? false :status (:status job)}}
+         (or reason (>= now (:expires-at job)))
+         {:next (assoc-in state [:research-jobs id] (-> job (assoc :status :cancelled :reason (or reason :queue-expired)) (dissoc :input)))
+          :value {:dispatch? false :status :cancelled}}
+         :else
+         {:next (assoc-in state [:research-jobs id] (assoc job :status :running :started-at now :deadline (+ now execution-ttl-ms)))
+          :value {:dispatch? true :input (:input job)}}))) now!))
+
+(defn finish! [ports id outcome now!]
+  (transact!
+   ports
+   (fn [state now]
+     (let [job (get-in state [:research-jobs id]) reason (when job (current-reason state job now))
+           content (:content outcome)
+           valid? (and (= model (:model outcome)) (string? content) (<= 1 (count content) 65536))]
+       (require! job :job-not-found)
+       (if (not= :running (:status job)) {:value {:status (:status job)}}
+         (let [status (cond reason :cancelled
+                            (or (>= now (:deadline job)) (not valid?)) :unknown
+                            :else :succeeded)
+               final (cond-> (-> job (assoc :status status :finished-at now) (dissoc :input))
+                       reason (assoc :reason reason)
+                       (= :succeeded status) (assoc :result {:model model :content content :billing :free}))]
+           {:next (assoc-in state [:research-jobs id] final) :value {:status status}})))) now!))
+
+(defn recover! [ports id now!]
+  (transact!
+   ports
+   (fn [state now]
+     (let [job (get-in state [:research-jobs id])]
+       (require! job :job-not-found)
+       (if (and (= :running (:status job)) (>= now (:deadline job)))
+         {:next (assoc-in state [:research-jobs id] (-> job (assoc :status :unknown :finished-at now) (dissoc :input)))
+          :value {:status :unknown}}
+         {:value {:status (:status job)}}))) now!))
+
+(defn run!
+  "Claim durably before exactly one attempt. Queue redelivery cannot dispatch a
+  running/unknown job. Unknown outcomes retain quota and require reconciliation.
+  The injected infer! must apply independent input/output policy and bound IO."
+  [ports id infer! now!]
+  (-> (claim! ports id now!)
+      (.then
+       (fn [claim]
+         (if-not (:dispatch? claim) claim
+           (-> (js/Promise.resolve nil)
+               (.then (fn [_] (infer! (:input claim))))
+               (.then (fn [outcome] (finish! ports id outcome now!))
+                      (fn [_] (finish! ports id {} now!)))))))))
+
+(defn result!
+  "Caller must have a fresh authenticated session. Recheck identity/scope and the
+  current session on every poll, including completed jobs. Never return prompts."
+  [ports principal session-id id now!]
+  (validate-ports! ports)
+  (-> ((:read! ports))
+      (.then
+       (fn [{:keys [state]}]
+         (let [job (get-in state [:research-jobs id])]
+           (require! (and job (= principal (get-in job [:command :principal]))) :job-not-found)
+           (let [reason (current-reason state (assoc-in job [:command :session-id] session-id) (now!))]
+             (require! (nil? reason) (or reason :job-not-authorized)))
+           (cond-> {:job-id id :status (:status job)}
+             (= :succeeded (:status job)) (assoc :result (:result job))))))))

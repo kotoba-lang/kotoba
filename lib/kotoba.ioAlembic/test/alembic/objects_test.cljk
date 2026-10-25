@@ -1,0 +1,139 @@
+(ns alembic.objects-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as string]
+            [ogawa.core :as ogawa]
+            [alembic.objects :as abc]))
+
+(defn- u32 [n] (mapv (fn [i] (mod (long (/ n (Math/pow 256 i))) 256)) (range 4)))
+(defn- s->b [s] (mapv #?(:clj int :cljs #(.charCodeAt % 0)) s))
+
+(def ^:private hash-bytes
+  "32 bytes standing in for the two 16-byte hashes the format appends.
+
+  They are deliberately bytes that WOULD decode as a valid header — a 4-byte
+  length, a name, an index byte — because zeros or 0xff would stop the parser
+  by accident and a reader that forgot to skip the hashes would still pass.
+  Measured: with zeros there, removing the skip changed no assertion."
+  (vec (take 32 (concat (u32 4) (s->b "hash") [0] (repeat 0x41)))))
+
+(defn- headers
+  "Packed object headers, followed by the 32 hash bytes the format puts there."
+  [entries]
+  (vec (concat (mapcat (fn [{:keys [name idx inline]}]
+                         (concat (u32 (count name)) (s->b name)
+                                 (if inline
+                                   (concat [0xff] (u32 (count inline)) (s->b inline))
+                                   [idx])))
+                       entries)
+               hash-bytes)))
+
+(defn- archive
+  "An Alembic archive in the shape ArImpl.cpp checks for."
+  [{:keys [ogawa-version archive-version metadata table top]
+    :or {ogawa-version 1 archive-version 10000 metadata "" table [] }}]
+  (ogawa/group (ogawa/data [ogawa-version 0 0 0])
+               (ogawa/data (u32 archive-version))
+               (or top (ogawa/group))
+               (ogawa/data (s->b metadata))
+               (ogawa/data [])
+               (ogawa/data table)))
+
+(defn- read-bytes [root]
+  (let [[_ bs] (ogawa/write-archive root)] (abc/read-archive bs)))
+
+(def ^:private schema "schema=AbcGeom_PolyMesh_v1")
+(def ^:private table (vec (concat [(count schema)] (s->b schema))))
+
+(deftest it-reads-an-archive-assembled-from-the-spec
+  (let [top (ogawa/group (ogawa/group)
+                         (ogawa/group (ogawa/group) (ogawa/data (headers [])))
+                         (ogawa/data (headers [{:name "mesh1" :idx 1}])))
+        [status a] (read-bytes (archive {:metadata "application=kotoba" :table table :top top}))]
+    (is (= :ok status))
+    (is (= 1 (:archive/ogawa-version a)))
+    (is (= 10000 (:archive/version a)))
+    (is (= "application=kotoba" (:archive/metadata a)))
+    (is (= {"application" "kotoba"} (abc/metadata-pairs (:archive/metadata a))))
+    (testing "the indexed table always begins with the empty string"
+      (is (= ["" schema] (:archive/indexed-metadata a))))
+    (is (= ["/mesh1"] (abc/object-paths a)))
+    (is (= schema (:object/metadata (first (:object/children (:archive/top a))))))
+    (is (= :indexed (:object/metadata-source (first (:object/children (:archive/top a))))))))
+
+(deftest metadata-can-be-inline-instead-of-indexed
+  ;; 0xff in the index byte means the string follows, length-prefixed. A reader
+  ;; that treats 0xff as an index reads whatever entry 255 happens to be, or
+  ;; nothing, and reports an object with the wrong schema — which downstream
+  ;; is an object of the wrong TYPE.
+  (let [top (ogawa/group (ogawa/group)
+                         (ogawa/group (ogawa/group) (ogawa/data (headers [])))
+                         (ogawa/data (headers [{:name "xf" :inline "schema=AbcGeom_Xform_v3"}])))
+        [status a] (read-bytes (archive {:table table :top top}))
+        child (first (:object/children (:archive/top a)))]
+    (is (= :ok status))
+    (is (= "schema=AbcGeom_Xform_v3" (:object/metadata child)))
+    (is (= :inline (:object/metadata-source child)))))
+
+(deftest objects-nest
+  (let [leaf (ogawa/group (ogawa/group) (ogawa/data (headers [])))
+        mid (ogawa/group (ogawa/group) leaf
+                         (ogawa/data (headers [{:name "child" :idx 1}])))
+        top (ogawa/group (ogawa/group) mid
+                         (ogawa/data (headers [{:name "parent" :idx 1}])))
+        [status a] (read-bytes (archive {:table table :top top}))]
+    (is (= :ok status))
+    (is (= ["/parent" "/parent/child"] (abc/object-paths a)))
+    (testing "and each level knows whether it has a property group"
+      (is (true? (:object/properties? (first (:object/children (:archive/top a)))))))))
+
+(deftest the-last-thirty-two-bytes-are-hashes
+  ;; A reader that does not skip them finds a name length inside a digest and
+  ;; either invents an object out of hash bytes or throws.
+  (testing "a header block of exactly 32 bytes is all hash and declares nothing"
+    (let [top (ogawa/group (ogawa/group) (ogawa/data hash-bytes))
+          [status a] (read-bytes (archive {:top top}))]
+      (is (= :ok status))
+      (is (= [] (abc/object-paths a)))))
+
+  (testing "and hash bytes after a real header do not become a second object"
+    (let [top (ogawa/group (ogawa/group)
+                           (ogawa/group (ogawa/group) (ogawa/data (headers [])))
+                           (ogawa/data (vec (concat (u32 3) (s->b "abc") [0] hash-bytes))))
+          [_ a] (read-bytes (archive {:top top}))]
+      (is (= ["/abc"] (abc/object-paths a))))))
+
+(deftest it-refuses-what-is-not-an-alembic-archive
+  (testing "an Ogawa tree with the wrong root shape"
+    (let [[status msg] (read-bytes (ogawa/group (ogawa/data [1 2 3])))]
+      (is (= :error status))
+      (is (string/includes? msg "more than 5 children"))))
+
+  (testing "six children of the wrong kinds"
+    (let [[status msg] (read-bytes (apply ogawa/group (repeat 6 (ogawa/data [0]))))]
+      (is (= :error status))
+      (is (string/includes? msg "ArImpl.cpp checks"))))
+
+  (testing "an archive version Alembic itself would refuse"
+    (let [[status msg] (read-bytes (archive {:archive-version 9998}))]
+      (is (= :error status))
+      (is (string/includes? msg "9999"))))
+
+  (testing "and bytes that are not Ogawa at all"
+    (let [[status msg] (abc/read-archive (vec (repeat 40 0)))]
+      (is (= :error status))
+      (is (string/includes? msg "Ogawa container")))))
+
+(deftest it-does-not-claim-to-read-geometry
+  ;; The object layer answers "what is in this file". Properties and samples
+  ;; are a separate layer that is not implemented, and nothing here should let
+  ;; a caller believe a PolyMesh's points are available.
+  (is (nil? (resolve 'alembic.objects/read-property)))
+  (is (nil? (resolve 'alembic.objects/samples)))
+  (let [top (ogawa/group (ogawa/group)
+                         (ogawa/group (ogawa/group) (ogawa/data (headers [])))
+                         (ogawa/data (headers [{:name "mesh1" :idx 1}])))
+        [_ a] (read-bytes (archive {:table table :top top}))
+        child (first (:object/children (:archive/top a)))]
+    (is (contains? child :object/properties?))
+    (is (not (contains? child :object/property-values))
+        "there is no key here that could be mistaken for geometry")))

@@ -1,0 +1,247 @@
+(ns collect-invoice-zenken
+  "Bulk ingest of the National Tax Agency invoice registry (適格請求書発行事業者)
+   全件データ into the portable EDN corpus this workspace queries.
+
+   The download is a plain GET per split — `/download/zenken/dlfile?
+   dlFilKanriNo=<id>&jinkakukbn=<kind>&type=01` — but the file ids change every
+   month, so the page is read each time and the ids are taken from it.
+   `jinkakukbn` is 1 個人 / 2 法人 / 3 人格のない社団等; `type` 01 is CSV.
+
+   ## Kinds, and why the default excludes 個人
+
+   `--kinds corporate` (the default) collects 法人 and 人格のない社団等: their
+   registration number is `T` + 法人番号, so every row joins to the 法人番号
+   registry and none of it is natural-person data.
+
+   `--kinds all` also collects 個人 — a natural person's name, and their trading
+   name and address where they asked for those to be published. Those rows are
+   *collectable* here because a corpus on a node answers a lookup, but
+   `kotoba.property.invoice-zenken/projectable?` refuses to let them into a
+   committed projection, so they cannot reach the shared query plane by
+   accident.
+
+   Coverage gate: goes through `coverage/assert-collectable!` on the
+   JP/NTA-Invoice authority entry.
+
+   Usage:
+     kbb --backend sci -cp src scripts/collect_invoice_zenken.cljk --download
+     kbb --backend sci -cp src scripts/collect_invoice_zenken.cljk --download --kinds all
+     kbb --backend sci -cp src scripts/collect_invoice_zenken.cljk --zip-dir ~/.cache/invoice --out <corpus.edn>"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.property.coverage-runtime :as coverage]
+            [kotoba.property.invoice-zenken :as inv]
+            ["child_process" :as cp]
+            ["crypto" :as crypto]
+            ["fs" :as fs]
+            ["path" :as path]
+            ["readline" :as readline]
+            ["stream" :as stream]))
+
+(def cache-dir
+  (.join path (or (.-HOME js/process.env) ".") ".cache" "invoice-kohyo"))
+
+(def default-out (.join path cache-dir "invoice-corpus.edn"))
+
+(def zenken-url "https://www.invoice-kohyo.nta.go.jp/download/zenken")
+(def dlfile-url "https://www.invoice-kohyo.nta.go.jp/download/zenken/dlfile")
+
+(defn- arg-value [args option default]
+  (or (second (drop-while #(not= option %) args)) default))
+
+(defn- flag? [args option] (boolean (some #(= option %) args)))
+
+(defn- sha256-file [p]
+  (-> (.createHash crypto "sha256") (.update (.readFileSync fs p)) (.digest "hex")))
+
+(defn- csv-entry-name [zip]
+  (->> (str/split-lines (.toString (.execFileSync cp "unzip" #js ["-Z1" zip])))
+       (map str/trim)
+       (filter #(str/ends-with? % ".csv"))
+       first))
+
+(defn- selection
+  "Which archives to fetch, and which rows to keep.
+
+   These are two different vocabularies and conflating them is easy: the page's
+   `jinkakukbn` (1 個人 / 2 法人 / 3 人格のない社団等) selects an *archive*, while
+   the CSV's `kind` column is only 1 個人 / 2 everything-else (or blank on a
+   superseded row). A filter written in one vocabulary and applied to the other
+   silently keeps or drops the wrong half."
+  [args]
+  (case (arg-value args "--kinds" "corporate")
+    "corporate" {:archives #{"2" "3"} :rows #{"2"}}
+    "all" {:archives #{"1" "2" "3"} :rows #{"1" "2"}}
+    "individual" {:archives #{"1"} :rows #{"1"}}
+    (throw (ex-info "unknown --kinds (corporate|all|individual)" {}))))
+
+(defn- page-entries
+  "[{:id :kind}] for the CSV section of the download page, in page order.
+   `kinds` here is the archive vocabulary (`jinkakukbn`)."
+  [html kinds]
+  (->> (re-seq #"doDownload\('(\d+)','(\d)','(\d+)'\)" html)
+       (keep (fn [[_ id kind type]]
+               (when (and (= "01" type) (contains? kinds kind))
+                 {:id id :kind kind})))
+       vec))
+
+(defn- download-one! [{:keys [id kind]} out-dir]
+  (js/Promise.
+   (fn [resolve* reject*]
+     (-> (js/fetch (str dlfile-url "?dlFilKanriNo=" id "&jinkakukbn=" kind "&type=01"))
+         (.then (fn [res]
+                  (let [disp (.get (.-headers res) "content-disposition")
+                        fname (some-> disp
+                                      (->> (re-find #"filename\*?=(?:[A-Za-z0-9-]+'[^']*')?\"?([^\";]+)"))
+                                      second str/trim)]
+                    ;; Fail closed on an unexpected name: the file ids move every
+                    ;; month, and a wrong one still returns 200 with a valid zip.
+                    ;; `j_all_20260731_csv.zip` for a single file,
+                    ;; `h_all_20260731_csv_001.zip` when it is split — the index
+                    ;; comes AFTER `_csv`, which cost one failed run to learn.
+                    (when-not (and fname (re-matches #"[hjk]_all_\d{8}_csv(_\d+)?\.zip" fname))
+                      (throw (ex-info (str "unexpected download filename — refusing: " (pr-str fname))
+                                      {:content-disposition disp})))
+                    (.mkdirSync fs out-dir #js {:recursive true})
+                    (let [dest (.join path out-dir fname)
+                          sink (.createWriteStream fs dest)]
+                      (-> (.-Readable stream) (.fromWeb (.-body res)) (.pipe sink))
+                      (.on sink "finish" (fn [] (resolve* dest)))
+                      (.on sink "error" reject*)))))
+         (.catch reject*)))))
+
+(defn- ingest-one!
+  "Stream one archive into an already-open sink. Returns a promise of counts."
+  [zip sink state {:keys [kinds]}]
+  (js/Promise.
+   (fn [resolve* _reject*]
+     (let [entry (csv-entry-name zip)
+           proc (.spawn cp "unzip" #js ["-p" zip entry]
+                        #js {:stdio #js ["ignore" "pipe" "inherit"]})
+           rl (.createInterface readline #js {:input (.-stdout proc) :crlfDelay ##Inf})
+           pending (atom nil)
+           emit!
+           (fn [line]
+             (let [rec (inv/row->record (inv/parse-line line))]
+               (swap! state update :rows inc)
+               (cond
+                 (nil? rec) (swap! state update :malformed inc)
+
+                 (contains? kinds (:invoice/kind rec))
+                 (do (.write sink (str (pr-str rec) "\n"))
+                     (swap! state update :written inc)
+                     (when (= "1" (:invoice/kind rec))
+                       (swap! state update :individuals inc)))
+
+                 ;; A blank kind is a superseded publication (name, address and
+                 ;; kind cleared, `latest` 0, an end date set), not a row of an
+                 ;; unwanted type. Counted separately so "we filtered these
+                 ;; out" and "the authority blanked these" stay distinguishable.
+                 (str/blank? (:invoice/kind rec)) (swap! state update :history inc)
+
+                 :else (swap! state update :filtered-out inc))))]
+       (.on rl "line"
+            (fn [line]
+              (cond
+                (inv/record-start? line)
+                (do (when-let [p @pending] (emit! p))
+                    (reset! pending line))
+                @pending (swap! pending #(str % "\n" line))
+                :else (swap! state update :malformed inc))))
+       (.on rl "close"
+            (fn []
+              (when-let [p @pending] (reset! pending nil) (emit! p))
+              (resolve* {:zip zip :entry entry})))))))
+(defn- ingest-all!
+  "Stream every archive into one corpus file. One manifest line, then one line
+   per record, in archive order."
+  [zips out kinds]
+  (let [zips (vec zips)
+        observed-at (.toISOString (js/Date.))
+        publish (inv/publish-id (csv-entry-name (first zips)))
+        sources (mapv (fn [z] {:archive (last (str/split z #"/"))
+                               :sha256 (sha256-file z)})
+                      zips)
+        tmp (str out ".partial")
+        state (atom {:rows 0 :written 0 :malformed 0 :history 0
+                     :filtered-out 0 :individuals 0})]
+    (.mkdirSync fs (.dirname path out) #js {:recursive true})
+    (let [sink (.createWriteStream fs tmp)]
+      (.write sink (str (pr-str (inv/corpus-manifest
+                                 {:publish publish
+                                  :observed-at observed-at
+                                  ;; One hash per archive: this corpus is cut
+                                  ;; from up to 11 files and a single hash
+                                  ;; could not name which one moved.
+                                  :content-sha256 (:sha256 (first sources))
+                                  :sources sources
+                                  :kinds-collected (sort kinds)}))
+                        "\n"))
+      (-> (reduce (fn [p z] (.then p (fn [_] (ingest-one! z sink state {:kinds kinds}))))
+                  (js/Promise.resolve nil)
+                  zips)
+          (.then
+           (fn [_]
+             (.end sink
+                   (fn []
+                     (.renameSync fs tmp out)
+                     (let [{:keys [rows written malformed history filtered-out individuals]} @state]
+                       (when (pos? individuals)
+                         (js/console.error
+                          (str "collect-invoice-zenken: NOTE " individuals
+                               " 個人 record(s) are in this corpus. They carry"
+                               " natural-person data and cannot be projected"
+                               " (invoice-zenken/projectable? refuses them).")))
+                       (println (pr-str {:corpus out
+                                         :publish publish
+                                         :archives (count zips)
+                                         :observed-at observed-at
+                                         :kinds (sort kinds)
+                                         :rows rows
+                                         :written written
+                                         :individuals individuals
+                                         :history history
+                                         :filtered-out filtered-out
+                                         :malformed malformed
+                                         :bytes (.-size (.statSync fs out))})))))))))))
+
+(defn- local-zips [zip-dir]
+  (->> (seq (.readdirSync fs zip-dir))
+       (filter #(str/ends-with? % ".zip"))
+       sort
+       (mapv #(.join path zip-dir %))))
+
+(defn- download-all! [kinds]
+  (-> (js/fetch zenken-url)
+      (.then (fn [res] (.text res)))
+      (.then (fn [html]
+               (let [entries (page-entries html kinds)]
+                 (when (empty? entries)
+                   (throw (ex-info "no CSV download entries found on the page" {})))
+                 (println (str "  " (count entries) " split(s) to fetch"))
+                 (reduce (fn [p e]
+                           (.then p (fn [acc]
+                                      (.then (download-one! e cache-dir)
+                                             (fn [dest]
+                                               (println (str "  downloaded " dest))
+                                               (conj acc dest))))))
+                         (js/Promise.resolve [])
+                         entries))))))
+
+(defn -main []
+  (let [args (vec *command-line-args*)
+        out (arg-value args "--out" default-out)
+        zip-dir (arg-value args "--zip-dir" nil)
+        {:keys [archives rows]} (selection args)]
+    (when-not (or zip-dir (flag? args "--download"))
+      (println "usage: collect_invoice_zenken.cljs (--download | --zip-dir <dir>) [--kinds corporate|all|individual] [--out <corpus.edn>]")
+      (.exit js/process 2))
+    (coverage/assert-collectable! inv/source-id)
+    (-> (if zip-dir
+          (js/Promise.resolve (local-zips zip-dir))
+          (download-all! archives))
+        (.then (fn [zips] (ingest-all! zips out rows)))
+        (.catch (fn [e]
+                  (js/console.error (str "collect-invoice-zenken failed: " (.-message e)))
+                  (.exit js/process 1))))))
+
+(-main)

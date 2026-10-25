@@ -1,0 +1,224 @@
+(ns audit-contact-forms
+  "問い合わせフォーム URL の列 -> **何件に実際に送れるか**。
+
+   判断は `kotoba.property.contact-form`（純 cljc）が持つ。ここは I/O だけ:
+   TSV を読み、robots.txt を見て、フォームのページを取りに行き、EDN を書く。
+
+   ⚠ **1 件も送信しない。** このスクリプトは GET しかしない —— `POST` も
+   `<form>` の submit も、CAPTCHA の回避も行わない。分類と計測までである。
+
+   ## 何を測るか
+
+   `contact-point` の収集は『200 が返って連絡点らしい』ところで止まっている。
+   それは到達可能性であって送信可能性ではない。ここは 7 分類に落とす:
+
+     :submittable :captcha :js-only :external :field-unfillable
+     :fetch-failed :robots-disallowed
+
+   **`:fetch-failed` と `:js-only` を混ぜない。** 前者は取りに行けなかった、
+   後者は取れたが HTML にフォームが無かった。混ぜると測れなかった分が
+   『JS フォーム』として数えられる。
+
+   usage:
+     kbb --backend sci -cp src scripts/audit_contact_forms.cljk \\
+       --out <f> --urls <tsv> --url-column 7 [--id-column 2] [--id-key houjin-bangou] \\
+       [--limit N] [--concurrency 6] [--delay-ms 400] [--eu] [--merge-into <edn>]
+
+   exit: 0 成功 / 2 答えられなかった（1 件も分類できなかった）/ 3 引数不足。"
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.edn :as edn]
+            [kotoba.property.contact-point :as cp]
+            [kotoba.property.contact-form :as cf]
+            [kotoba.property.eu-contact :as eu]
+            ["fs" :as fs]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+(defn- flag? [n] (boolean (some #{n} argv)))
+(defn- int-arg [n d] (let [v (arg n nil)] (if v (js/parseInt v 10) d)))
+
+(defn- die! [code msg]
+  ;; ⚠ `exitCode` を立ててから throw しない —— その throw は `-main` の同期部分から
+  ;; 外へ抜けるので nbb の既定 exit 1 になり、契約した 2/3 が一度も出ない。
+  (js/console.error msg)
+  (.exit js/process code))
+
+(defn- now [] (.toISOString (js/Date.)))
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+;; ---------------------------------------------------------------------------
+;; fetch
+
+(defn- fetch-text
+  "[status body final-url] を返す。取りに行けなかったときは [nil nil nil]。
+   **status 0 と status 404 を同じ nil に畳まない** —— 前者は測れなかった、
+   後者は測って無かった。"
+  [url ms]
+  (let [ctl (js/AbortController.)
+        t (js/setTimeout #(.abort ctl) ms)]
+    (-> (js/fetch url (clj->js {:signal (.-signal ctl)
+                                :redirect "follow"
+                                :headers {"user-agent" cp/user-agent
+                                          "accept" "text/html,application/xhtml+xml"
+                                          "accept-language" "ja,en;q=0.8,de;q=0.6,fr;q=0.6"}}))
+        (.then (fn [^js res]
+                 (-> (.text res)
+                     (.then (fn [body] [(.-status res) body (.-url res)]))
+                     (.catch (fn [_] [(.-status res) nil (.-url res)])))))
+        (.catch (fn [_] [nil nil nil]))
+        (.finally (fn [] (js/clearTimeout t))))))
+
+;; ---------------------------------------------------------------------------
+;; robots.txt — origin ごとに 1 回だけ引く
+
+(def robots-cache (atom {}))
+
+(defn- robots-for
+  "origin -> robots.txt 本文の Promise。**同じ origin を 2 度引かない**
+   （promise ごとキャッシュするので、同時に走った worker も 1 回で済む）。"
+  [org]
+  (or (get @robots-cache org)
+      (let [p (-> (fetch-text (str org "/robots.txt") 10000)
+                  (.then (fn [[status body]] (if (and (= 200 status) body) body ""))))]
+        (swap! robots-cache assoc org p)
+        p)))
+
+;; ---------------------------------------------------------------------------
+;; 1 URL
+
+(defn- path-of [url org]
+  (let [p (str/replace (str url) (re-pattern (str "^" (str/re-quote (str org)))) "")]
+    (if (str/blank? p) "/" p)))
+
+(defn- audit-one [url solicitation-re]
+  (let [org (cp/origin url)]
+    (if-not org
+      (js/Promise.resolve (cf/classify {:url url :http-status nil :observed-at (now)}))
+      (-> (robots-for org)
+          (.then (fn [robots]
+                   (if (cp/robots-disallows? robots cp/user-agent (path-of url org))
+                     (js/Promise.resolve (cf/classify {:url url :robots-disallowed? true
+                                                       :observed-at (now)}))
+                     (-> (fetch-text url 25000)
+                         (.then (fn [[status body final-url]]
+                                  (cf/classify {:url url
+                                                :final-url (not-empty (str final-url))
+                                                :http-status status
+                                                :body body
+                                                :solicitation-re solicitation-re
+                                                :observed-at (now)})))))))
+          (.catch (fn [e]
+                    ;; 1 件の失敗で run を落とさない。**ただし黙って消さない** ——
+                    ;; 行として残さないなら測れなかったことが分母から消える。
+                    (js/console.error (str "  worker error on " url ": " (.-message e)))
+                    (cf/classify {:url url :http-status nil :observed-at (now)})))))))
+
+(defn- audit-all [rows solicitation-re delay-ms n]
+  (let [pending (atom (vec rows))
+        out (atom [])
+        done (atom 0)
+        total (count rows)
+        take-one! (fn [] (let [[h & t] @pending] (when h (reset! pending (vec t)) h)))]
+    (letfn [(worker []
+              (if-let [{:keys [url extra]} (take-one!)]
+                (-> (sleep delay-ms)
+                    (.then (fn [] (audit-one url solicitation-re)))
+                    (.then (fn [rec]
+                             (swap! out conj (merge rec extra))
+                             (let [d (swap! done inc)]
+                               (when (zero? (mod d 25))
+                                 (js/console.error (str "  ... " d "/" total))))
+                             (worker))))
+                (js/Promise.resolve nil)))]
+      (-> (js/Promise.all (clj->js (vec (repeatedly (max 1 n) worker))))
+          (.then (fn [] @out))))))
+
+;; ---------------------------------------------------------------------------
+;; 入力
+
+(defn- read-rows
+  "TSV -> `[{:url .. :extra {..}}]`。コメント行とヘッダ行を落とし、URL 列が
+   `https?://` で始まる行だけを採る。**同じ URL を 2 度測らない**（重複は
+   台帳側の事情で、フォームの性質ではない）。"
+  [file url-col id-col id-key]
+  (->> (str/split-lines (str (fs/readFileSync file "utf8")))
+       (remove #(str/starts-with? (str %) "#"))
+       (remove str/blank?)
+       (keep (fn [line]
+               (let [cells (str/split line #"\t")
+                     url (str/trim (str (nth cells (dec url-col) "")))]
+                 (when (re-find #"^https?://" url)
+                   {:url url
+                    :extra (when (and id-col id-key)
+                             (let [v (str/trim (str (nth cells (dec id-col) "")))]
+                               (when-not (str/blank? v) {id-key v})))}))))
+       (reduce (fn [{:keys [seen acc]} r]
+                 (if (contains? seen (:url r))
+                   {:seen seen :acc acc}
+                   {:seen (conj seen (:url r)) :acc (conj acc r)}))
+               {:seen #{} :acc []})
+       :acc))
+
+;; ---------------------------------------------------------------------------
+;; main
+
+(defn -main []
+  (let [out (arg "--out" nil)
+        urls-file (arg "--urls" nil)
+        url-col (int-arg "--url-column" 0)
+        id-col (let [v (arg "--id-column" nil)] (when v (js/parseInt v 10)))
+        id-key (some-> (arg "--id-key" nil) keyword)
+        limit (int-arg "--limit" 100000)
+        concurrency (int-arg "--concurrency" 6)
+        delay-ms (int-arg "--delay-ms" 400)
+        eu? (flag? "--eu")
+        solicitation-re (when eu? eu/solicitation-forbidden-re)
+        merge-into (arg "--merge-into" nil)
+        existing (if (and merge-into (.existsSync fs merge-into))
+                   (vec (remove :coverage/scanned
+                                (edn/read-string (str (fs/readFileSync merge-into "utf8")))))
+                   [])
+        already (set (keep :form/url existing))]
+    (when-not out (die! 3 "--out is required"))
+    (when-not urls-file (die! 3 "--urls <tsv> is required"))
+    (when (zero? url-col) (die! 3 "--url-column <n> is required (1-indexed)"))
+    (when-not (.existsSync fs urls-file) (die! 3 (str "no such file: " urls-file)))
+    (let [rows (read-rows urls-file url-col id-col id-key)
+          rows (vec (remove #(contains? already (:url %)) rows))
+          rows (vec (take limit rows))]
+      (when (zero? (count rows))
+        (die! 2 (str "Refusing to report a pass: 0 URL(s) to audit in " urls-file
+                     " (column " url-col
+                     (when (seq already) (str ", " (count already) " already in " merge-into))
+                     "). Nothing was measured.")))
+      (js/console.error (str "auditing " (count rows) " form URL(s)"
+                             "  concurrency=" concurrency "  delay=" delay-ms "ms"
+                             (when eu? "  (EU solicitation vocabulary)")))
+      (-> (audit-all rows solicitation-re delay-ms concurrency)
+          (.then
+           (fn [records]
+             (if (zero? (count records))
+               (die! 2 "Refusing to report a pass: 0 URL(s) classified. Nothing was measured.")
+               (let [records (into existing records)
+                     cov (assoc (cf/coverage records)
+                                :coverage/collected-at (now)
+                                :coverage/source-file urls-file)]
+                 (fs/writeFileSync
+                  out (with-out-str
+                        (println ";; 生成物。手で編集しない。")
+                        (println ";; 再生成: kbb --backend sci -cp src scripts/audit_contact_forms.cljk")
+                        (println ";; 1 件も送信していない（GET のみ）。CAPTCHA は検出のみで回避しない。")
+                        (prn (into [cov] records))))
+                 (println (str "SCANNED\t" (count records)))
+                 (doseq [k [:submittable :field-unfillable :captcha :external
+                            :js-only :fetch-failed :robots-disallowed]]
+                   (println (str (str/upper (name k)) "\t"
+                                 (get (:coverage/by-class cov) k 0))))
+                 (println (str "SOLICITATION-FORBIDDEN\t" (:coverage/solicitation-forbidden cov)))
+                 (println (str "SENDABLE\t" (:coverage/sendable cov)))
+                 (println (str "OUT\t" out))))))
+          (.catch (fn [e]
+                    (js/console.error (str "audit failed: " (.-message e)))
+                    (.exit js/process 2)))))))
+
+(-main)

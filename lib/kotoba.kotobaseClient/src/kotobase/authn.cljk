@@ -1,0 +1,374 @@
+(ns kotobase.authn
+  "The Authn exchange: turn a key (or a service-account secret) an actor holds
+  into the short-lived Biscuit every service edge accepts
+  (superproject ADR-2609241800, step 4).
+
+  ## The rule this namespace exists to follow
+
+  A CACAO proves who signed; it authorizes nothing. It is presented at ONE
+  place — Authn (`auth.kotoba.cloud`) — and exchanged there for a session,
+  and the session for a Biscuit. Every other request carries
+  `authorization: Biscuit <b64url>` and nothing else. This namespace is the
+  only code in kotobase-client that sends a CACAO on the non-legacy path, and
+  it refuses, by name, to send one anywhere but an Authn host:
+
+    :kotobase.authn/cacao-not-for-this-host    a CACAO would leave for a
+                                               host outside `authn-hosts`
+    :kotobase.authn/bearer-not-for-this-host   the same for a kb_sa_ secret
+
+  Both are thrown synchronously by `exchanger` (the endpoint is checked when
+  the exchanger is built, before any request), and re-checked immediately
+  before each send.
+
+  ## The three ways in (all read from cloud-kotoba/kotobase-control-plane
+  ## authn/src/authn/worker.cljk at cloud-kotoba/main c8bc5569, 2026-09-24)
+
+  1. `:secret-key` (a 32-byte Ed25519 seed; the actor's did:key)
+       POST /v1/cacao/session  {\"cacao_b64\": …}
+     The CACAO is minted with `cacao.edge.mint` (kotoba-lang/
+     org-chainagnostic-cacao — never a local copy), `aud` = the Authn origin
+     (`https://auth.kotoba.cloud`; the Worker's `env-for-request` sets
+     AUTHN_AUDIENCE to `https://auth.<apex>` for that host), a fresh nonce
+     (Authn burns (iss, cacao) pairs) and a 5-minute window. Authn answers with
+     the viewer JSON and `Set-Cookie: gftd_session=…`; a first sign-in
+     creates the account.
+  2. `:agent-sign-fn` — the agent-registration ceremony
+       POST /v1/siwe/nonce  {}  -> {nonce domain uri chainId …}
+       POST /v1/agents/register  {\"message\": …, \"signature\": …}
+     ⚠ This route verifies an EIP-4361 message signed by an ETHEREUM key
+     (EOA via ERC-191, or a Base Account via ERC-6492 — `authn.siwe`,
+     `authn.agent-account`). An Ed25519 did:key cannot produce that
+     signature, so this namespace does not sign it: the caller's
+     `agent-sign-fn` receives the nonce response and returns
+     Promise<{:message :signature}>. It answers with the same session cookie,
+     and creates the account as kind `agent`.
+  3. `:service-account-token` (`kb_sa_…`, issued by a tenant admin)
+     No sign-in: `/v1/biscuit/token` is called with
+     `Authorization: Bearer kb_sa_…`.
+
+  Then, for 1 and 2:
+       POST /v1/biscuit/token   Cookie: gftd_session=…
+                                Origin: https://auth.kotoba.cloud
+                                Content-Type: application/json
+     (cookie-authenticated mutations are same-origin JSON only —
+     `safe-browser-mutation?`; a Bearer caller is exempt.)
+     body   {\"tenantId\": \"t_…\", \"dbName\"|\"graph\"|\"storage\": …,
+             \"permissions\": [\"data:read\" …]}   (permissions optional:
+             absent = everything the membership holds)
+     201    {token authorization tokenType expiresAt expiresIn tenantDid
+             graph|storage permissions}   — `authn.biscuit/mint` /
+             `mint-storage`; the token lives 15 minutes.
+     A Biscuit presented to /v1/biscuit/token is refused (\"may be
+     attenuated, not refreshed\"), so this never sends one there.
+
+  ⚠ The session resolves to a Biscuit only for a principal that is a MEMBER
+  of `tenantId` (`enterprise/human-context`). A did:key that has just signed
+  in for the first time has an account and no membership: Authn answers
+  401 until a tenant admin adds it. That is Authn's decision, not a client
+  defect, and `biscuit-token!` rejects with the status and body it got.
+
+  ## Re-minting
+
+  A Biscuit cannot be refreshed; a new one is minted. `biscuit-token!` caches
+  one token per requested resource and mints again once `now + refresh-skew`
+  reaches its `expiresAt` (default skew 60 s, so a token is never sent in its
+  last minute). A 401 from /v1/biscuit/token on a cookie session drops the
+  session and signs in once more, then gives up with the error.
+
+  ## Where it runs
+
+  Workers and Node — anything whose `fetch` exposes `Set-Cookie` on a
+  response. A browser page cannot read that header; a page signs in through
+  the Authn UI and relies on its own cookie instead."
+  (:require ["@noble/curves/ed25519.js" :refer [ed25519]]
+            [cacao.edge.mint :as cacao-mint]
+            [kotoba.lang.text :as str]))
+
+(def default-endpoint
+  "The Authn origin. `auth.kotoba.cloud`, not `auth.kotobase.net`: the two
+  hostnames route to the same Worker, but ADR-2609241800 names this one and
+  the CACAO audience follows the host that is asked."
+  "https://auth.kotoba.cloud")
+
+(def default-authn-hosts
+  "Hosts a CACAO or a kb_sa_ secret may be sent to. Deliberately one entry;
+  a test or a staging Authn extends it through `:authn-hosts`, explicitly."
+  #{"auth.kotoba.cloud"})
+
+(def session-cookie
+  "`authn.viewer/cookie-name`."
+  "gftd_session")
+
+(def default-refresh-skew-ms (* 60 1000))
+
+(def cacao-ttl-sec
+  "The sign-in CACAO is spent on arrival (Authn burns the nonce); five
+  minutes covers a cold Worker's frozen clock without making a captured one
+  useful for long."
+  300)
+
+(def ^:private user-agent
+  "kotobase-client/1 (+https://github.com/kotoba-lang/kotobase-client)")
+
+;; ── host discipline ─────────────────────────────────────────────────────────
+
+(defn- origin-of [url] (.-origin (js/URL. url)))
+(defn- host-of [url] (.-hostname (js/URL. url)))
+
+(defn assert-authn-host!
+  "Throw `ex-info` typed `refusal` unless `url`'s host is in `hosts`. Returns
+  `url`. Public so a caller with its own transport can apply the same rule."
+  [url hosts refusal]
+  (let [host (host-of url)]
+    (when-not (and (= "https:" (.-protocol (js/URL. url))) (contains? hosts host))
+      (throw (ex-info (str (name refusal) ": refusing to send an Authn credential to "
+                           host " (allowed: " (str/join ", " (sort hosts)) ")")
+                      {:type refusal :host host :allowed hosts})))
+    url))
+
+;; ── wire helpers ────────────────────────────────────────────────────────────
+
+(defn- utc-seconds [ms]
+  (str/replace (.toISOString (js/Date. ms)) #"\.\d{3}Z$" "Z"))
+
+(defn- random-nonce []
+  (let [bytes (.getRandomValues js/crypto (js/Uint8Array. 16))]
+    (apply str (map #(.padStart (.toString % 16) 2 "0") (array-seq bytes)))))
+
+(defn did-of
+  "did:key of a 32-byte Ed25519 seed, through org-chainagnostic-cacao."
+  [secret-key]
+  (cacao-mint/did-key-from-raw-ed25519-pub (.getPublicKey ed25519 secret-key)))
+
+(defn sign-in-cacao
+  "Promise<base64 CACAO> for POST /v1/cacao/session: issuer = the seed's
+  did:key, audience = the Authn origin, domain = its host, fresh nonce."
+  [{:keys [secret-key endpoint now-ms]}]
+  (let [iss (did-of secret-key)
+        now (or now-ms (js/Date.now))]
+    (-> (cacao-mint/mint iss
+                         (fn [msg] (js/Promise.resolve (.sign ed25519 msg secret-key)))
+                         {:domain (host-of endpoint)
+                          :aud (origin-of endpoint)
+                          :version "1"
+                          :nonce (random-nonce)
+                          :iat (utc-seconds now)
+                          :exp (utc-seconds (+ now (* cacao-ttl-sec 1000)))
+                          :resources []})
+        (.then #(:cacao-b64 %)))))
+
+(defn session-from-set-cookie
+  "The `gftd_session` value out of a Set-Cookie header (possibly several
+  cookies joined), or nil."
+  [set-cookie]
+  (when (string? set-cookie)
+    (second (re-find (re-pattern (str "(?:^|[,;\\s])" session-cookie "=([^;,\\s]+)"))
+                     set-cookie))))
+
+(defn- http-error [what ^js res text]
+  (let [e (js/Error. (str what " " (.-status res) ": " text))]
+    (set! (.-status e) (.-status res))
+    (set! (.-body e) text)
+    e))
+
+(defn- post-json
+  "POST JSON; Promise<{:res :text :json}>. Never rejects on status."
+  [fetch url headers body]
+  (-> (fetch url #js {:method "POST"
+                      :headers (clj->js (merge {"content-type" "application/json"
+                                                "user-agent" user-agent}
+                                               headers))
+                      :body (js/JSON.stringify (clj->js body))})
+      (.then (fn [^js res]
+               (.then (.text res)
+                      (fn [text]
+                        {:res res :text text
+                         :json (try (when (seq text) (js/JSON.parse text))
+                                    (catch :default _ nil))}))))))
+
+;; ── the exchanger ───────────────────────────────────────────────────────────
+
+(defn exchanger
+  "Build an Authn exchanger. opts:
+
+    :endpoint              Authn origin (default `default-endpoint`)
+    :tenant-id             `t_…` — required; the tenant the Biscuit is for
+    :permissions           vector of Authn permissions (\"data:read\" …);
+                           nil = everything the membership holds
+    :db-name               default db for a resource-less call (store-*)
+    exactly one credential:
+    :secret-key            32-byte Ed25519 seed -> /v1/cacao/session
+    :agent-sign-fn         (fn [nonce-json] Promise<{:message :signature}>)
+                           -> /v1/siwe/nonce + /v1/agents/register
+    :service-account-token \"kb_sa_…\" -> Bearer at /v1/biscuit/token
+    :fetch-fn              default js/fetch
+    :now-fn                default js/Date.now (tests)
+    :refresh-skew-ms       default 60 000
+    :authn-hosts           default `default-authn-hosts`
+
+  Returns a map. Hand it to `kotobase.client/make-client` as `:authn`; the
+  client reads only its `:biscuit-fn`. Throws, before any request, when the
+  endpoint is not an Authn host (see ns docstring) or the options are
+  incomplete."
+  [{:keys [endpoint tenant-id permissions db-name secret-key agent-sign-fn
+           service-account-token fetch-fn now-fn refresh-skew-ms authn-hosts]
+    :or {endpoint default-endpoint
+         refresh-skew-ms default-refresh-skew-ms
+         authn-hosts default-authn-hosts}}]
+  (let [endpoint (str/replace endpoint #"/+$" "")
+        credentials (filter some? [secret-key agent-sign-fn service-account-token])]
+    (when-not (and (string? tenant-id) (re-matches #"^t_[a-z0-9]{12,48}$" tenant-id))
+      (throw (ex-info "exchanger needs :tenant-id (t_…)" {:type ::tenant-id-required})))
+    (when-not (= 1 (count credentials))
+      (throw (ex-info "exchanger needs exactly one of :secret-key, :agent-sign-fn, :service-account-token"
+                      {:type ::credential-required})))
+    (when (and service-account-token
+               (not (and (string? service-account-token)
+                         (str/starts-with? service-account-token "kb_sa_"))))
+      (throw (ex-info "service-account token must start with kb_sa_"
+                      {:type ::service-account-token-shape})))
+    (assert-authn-host! endpoint authn-hosts
+                        (if service-account-token
+                          ::bearer-not-for-this-host
+                          ::cacao-not-for-this-host))
+    (let [state (atom {:session nil :tokens {} :mints 0 :sign-ins 0})
+          ex {:endpoint endpoint
+              :tenant-id tenant-id
+              :permissions permissions
+              :db-name db-name
+              :secret-key secret-key
+              :agent-sign-fn agent-sign-fn
+              :service-account-token service-account-token
+              :fetch (or fetch-fn js/fetch)
+              :now (or now-fn #(js/Date.now))
+              :refresh-skew-ms refresh-skew-ms
+              :authn-hosts authn-hosts
+              :did (some-> secret-key did-of)
+              :state state}]
+      ex)))
+
+(defn- sign-in!
+  "Promise<session-token>. Stores it in the exchanger's state."
+  [{:keys [endpoint fetch secret-key agent-sign-fn authn-hosts now state]}]
+  (let [finish (fn [what {:keys [res text]}]
+                 (if-not (.-ok ^js res)
+                   (throw (http-error what res text))
+                   (if-let [session (session-from-set-cookie
+                                     (.get (.-headers ^js res) "set-cookie"))]
+                     (do (swap! state #(-> % (assoc :session session) (update :sign-ins inc)))
+                         session)
+                     (throw (js/Error. (str what " " (.-status ^js res)
+                                            ": no " session-cookie " cookie in the answer"))))))]
+    (if secret-key
+      (let [url (assert-authn-host! (str endpoint "/v1/cacao/session") authn-hosts
+                                    ::cacao-not-for-this-host)]
+        (-> (sign-in-cacao {:secret-key secret-key :endpoint endpoint :now-ms (now)})
+            (.then (fn [cacao-b64] (post-json fetch url {} {:cacao_b64 cacao-b64})))
+            (.then #(finish "cacao/session" %))))
+      (let [nonce-url (assert-authn-host! (str endpoint "/v1/siwe/nonce") authn-hosts
+                                          ::cacao-not-for-this-host)
+            register-url (str endpoint "/v1/agents/register")]
+        (-> (post-json fetch nonce-url {} {})
+            (.then (fn [{:keys [res text json]}]
+                     (if-not (.-ok ^js res)
+                       (throw (http-error "siwe/nonce" res text))
+                       (agent-sign-fn json))))
+            (.then (fn [{:keys [message signature]}]
+                     (assert-authn-host! register-url authn-hosts ::cacao-not-for-this-host)
+                     (post-json fetch register-url {} {:message message :signature signature})))
+            (.then #(finish "agents/register" %)))))))
+
+(defn- ensure-session! [ex]
+  (if-let [s (:session @(:state ex))]
+    (js/Promise.resolve s)
+    (sign-in! ex)))
+
+(defn- request-body [{:keys [tenant-id permissions db-name]} resource]
+  (let [{r-db :db-name r-graph :graph r-storage :storage r-perms :permissions} resource
+        db (or r-db (when-not (or r-graph r-storage) db-name))
+        perms (or r-perms permissions)]
+    (when-not (or db r-graph r-storage)
+      (throw (ex-info "a Biscuit names one resource: pass :db-name, :graph or :storage"
+                      {:type ::resource-required})))
+    (cond-> {:tenantId tenant-id}
+      db (assoc :dbName db)
+      r-graph (assoc :graph r-graph)
+      r-storage (assoc :storage (vec r-storage))
+      perms (assoc :permissions (vec perms)))))
+
+(defn- mint-once!
+  "One POST /v1/biscuit/token. Promise<{:res :text :json}>."
+  [{:keys [endpoint fetch service-account-token authn-hosts]} body session]
+  (let [url (str endpoint "/v1/biscuit/token")]
+    (if service-account-token
+      (do (assert-authn-host! url authn-hosts ::bearer-not-for-this-host)
+          (post-json fetch url {"authorization" (str "Bearer " service-account-token)} body))
+      (do (assert-authn-host! url authn-hosts ::cacao-not-for-this-host)
+          (post-json fetch url {"cookie" (str session-cookie "=" session)
+                                "origin" (origin-of endpoint)}
+                     body)))))
+
+(defn- accept-token [{:keys [now state]} cache-key {:keys [res text json]}]
+  (let [token (some-> json (aget "token"))]
+    (when-not (and (.-ok ^js res) (string? token))
+      (throw (http-error "biscuit/token" res text)))
+    (let [expires-at (or (some-> json (aget "expiresAt") js/Date.parse
+                                 (as-> ms (when-not (js/isNaN ms) ms)))
+                         (+ (now) (* 1000 (or (some-> json (aget "expiresIn")) 0))))
+          entry {:token token :expires-at-ms expires-at
+                 :tenant-did (aget json "tenantDid")
+                 :permissions (some-> (aget json "permissions") array-seq vec)}]
+      (swap! state #(-> % (assoc-in [:tokens cache-key] entry) (update :mints inc)))
+      entry)))
+
+(defn biscuit-token!
+  "Promise<{:token :expires-at-ms :tenant-did :permissions}> for one resource
+  (`{:db-name …}` | `{:graph …}` | `{:storage [ns …]}`, optional
+  `:permissions`). Cached until `refresh-skew-ms` before expiry, then
+  re-minted."
+  ([ex] (biscuit-token! ex {}))
+  ([{:keys [now state refresh-skew-ms service-account-token] :as ex} resource]
+   (let [body (request-body ex resource)
+         cache-key body
+         cached (get-in @state [:tokens cache-key])]
+     (if (and cached (< (+ (now) refresh-skew-ms) (:expires-at-ms cached)))
+       (js/Promise.resolve cached)
+       (if service-account-token
+         (-> (mint-once! ex body nil) (.then #(accept-token ex cache-key %)))
+         (-> (ensure-session! ex)
+             (.then (fn [session] (mint-once! ex body session)))
+             (.then (fn [{:keys [res] :as answer}]
+                      (if (= 401 (.-status ^js res))
+                        ;; the session may have lapsed or been revoked:
+                        ;; sign in once more, then accept whatever answers.
+                        (do (swap! state assoc :session nil)
+                            (-> (sign-in! ex)
+                                (.then (fn [session] (mint-once! ex body session)))))
+                        answer)))
+             (.then #(accept-token ex cache-key %))))))))
+
+(defn biscuit-fn
+  "The `(fn [db-name] Promise<token>)` shape `kotobase.client` calls (its
+  existing `:biscuit-fn` contract). nil db-name falls back to the
+  exchanger's `:db-name`."
+  [ex]
+  (fn [db-name]
+    (-> (biscuit-token! ex (if db-name {:db-name db-name} {}))
+        (.then #(:token %)))))
+
+(defn with-biscuit-fn
+  "The exchanger with `:biscuit-fn` attached — what `make-client :authn`
+  reads. `exchanger` callers normally use `authn` below instead."
+  [ex]
+  (assoc ex :biscuit-fn (biscuit-fn ex)))
+
+(defn authn
+  "`exchanger` + `with-biscuit-fn`: the value for `make-client`'s `:authn`."
+  [opts]
+  (with-biscuit-fn (exchanger opts)))
+
+(defn stats
+  "{:mints n :sign-ins n} so far — for tests and for an operator counting
+  round trips."
+  [ex]
+  (select-keys @(:state ex) [:mints :sign-ins]))

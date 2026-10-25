@@ -1,0 +1,172 @@
+(ns kotoba.lang.kami-nv-compat.e7m-sim
+  "Clean-room Isaac Sim core engine (e7m-sim) — JVM port of
+  src/e7m-sim/index.ts. Reproduces the isaacsim.core.api surface (World
+  simulation context + Articulation + RigidPrim) over the Featherstone
+  articulated-dynamics module. Pure logic, no Isaac Sim source/USD/binaries.
+  Wave 19 of ADR-2607020130."
+  (:require [kotoba.lang.coll :as kcoll] [kotoba.lang.kami-nv-compat.dynamics.articulated-dynamics :as dyn]
+            [kotoba.lang.kami-nv-compat.dynamics.urdf-parser :as urdf]))
+
+(defn- pad-to
+  "Pad/truncate a to length n."
+  [a n]
+  (vec (for [i (range n)] (if (< i (count a)) (a i) 0))))
+
+;; ── Articulation ──────────────────────────────────────────────────────────
+
+(defn make-articulation
+  "Build a reduced-coordinate articulation view from a URDF system.
+  Returns an atom holding {:built :state :default-q :gains :pending-effort}."
+  ([name system]
+   (make-articulation name system nil))
+  ([name system default-q]
+   (let [built (dyn/build-articulation system)
+         n (:n built)
+         dq (or default-q (vec (repeat n 0.0)))
+         state (assoc (dyn/make-zero-state n) :q
+                      (vec (for [i (range n)] (double (or (dq i) 0)))))]
+     (atom {:name name :built built :state state :default-q dq
+            :gains {:kp 60.0 :kd 6.0} :pending-effort (vec (repeat n 0))}))))
+
+(defn articulation-num-dof [a] (:n (:built @a)))
+(defn articulation-joint-names [a] (:joint-names (:built @a)))
+(defn articulation-get-joint-positions [a] (vec (:q (:state @a))))
+(defn articulation-get-joint-velocities [a] (vec (:qdot (:state @a))))
+(defn articulation-get-joint-accelerations [a] (vec (:qddot (:state @a))))
+
+(defn articulation-set-pd-gains [a kp kd]
+  (swap! a assoc :gains {:kp kp :kd kd}))
+
+(defn articulation-apply-action [a action]
+  (let [n (:n (:built @a))]
+    (cond
+      (:joint-efforts action)
+      (swap! a assoc :pending-effort (pad-to (:joint-efforts action) n))
+      (:joint-positions action)
+      (let [target (pad-to (:joint-positions action) n)
+            {:keys [kp kd]} (:gains @a)
+            st (:state @a)]
+        (swap! a assoc :pending-effort
+               (vec (for [i (range n)]
+                      (- (* kp (- (target i) ((:q st) i))) (* kd ((:qdot st) i))))))))))
+
+(defn articulation-set-joint-efforts [a tau]
+  (swap! a assoc :pending-effort (pad-to tau (:n (:built @a)))))
+
+(defn articulation-step [a dt gravity]
+  (let [{:keys [built state pending-effort]} @a]
+    (let [new-state (dyn/articulated-step built state pending-effort dt gravity)]
+      (swap! a assoc :state new-state))))
+
+(defn articulation-reset [a]
+  (let [{:keys [built default-q]} @a
+        n (:n built)]
+    (swap! a assoc
+           :state {:q (vec (for [i (range n)] (double (or (default-q i) 0))))
+                   :qdot (vec (repeat n 0.0))
+                   :qddot (vec (repeat n 0.0))}
+           :pending-effort (vec (repeat n 0.0)))))
+
+(defn articulation-forward-kinematics [a]
+  (dyn/forward-kinematics (:built @a) (:q (:state @a))))
+
+(defn articulation-get-body-pose [a joint-name]
+  (let [idx (kcoll/index-of (:joint-names (:built @a)) joint-name)]
+    (when (>= idx 0)
+      (let [pose (nth (articulation-forward-kinematics a) idx)]
+        {:position (:p pose) :rotation (:R pose)}))))
+
+(defn articulation-from-urdf
+  ([name urdf-text]
+   (articulation-from-urdf name urdf-text nil))
+  ([name urdf-text default-q]
+   (make-articulation name (urdf/parse-urdf urdf-text) default-q)))
+
+;; ── RigidPrim ─────────────────────────────────────────────────────────────
+
+(defn make-rigid-prim
+  "A single rigid body integrated under gravity + applied force/torque.
+  Returns an atom holding the body state."
+  ([name] (make-rigid-prim name 1.0 [0 0 0] [0 0 0 1]))
+  ([name mass] (make-rigid-prim name mass [0 0 0] [0 0 0 1]))
+  ([name mass position] (make-rigid-prim name mass position [0 0 0 1]))
+  ([name mass position orientation]
+   (atom {:name name :mass mass
+          :position (vec position) :orientation (vec orientation)
+          :linear-velocity [0 0 0] :angular-velocity [0 0 0]
+          :force [0 0 0]
+          :initial-position (vec position) :initial-orientation (vec orientation)})))
+
+(defn rigid-prim-apply-force [r f]
+  (swap! r update :force #(vec (map + % f))))
+
+(defn rigid-prim-set-linear-velocity [r v]
+  (swap! r assoc :linear-velocity (vec v)))
+
+(defn rigid-prim-get-pose [r]
+  (select-keys @r [:position :orientation]))
+
+(defn rigid-prim-step [r dt gravity]
+  (let [{:keys [mass force linear-velocity position angular-velocity orientation]} @r
+        new-lv (vec (for [i (range 3)]
+                      (+ (linear-velocity i) (* (+ (/ (force i) mass) (gravity i)) dt))))
+        new-pos (vec (for [i (range 3)] (+ (position i) (* (new-lv i) dt))))
+        [wx wy wz] angular-velocity
+        [qx qy qz qw] orientation
+        dqx (* 0.5 (+ (* wx qw) (* wy qz) (- (* wz qy))))
+        dqy (* 0.5 (+ (- (* wx qz)) (* wy qw) (* wz qx)))
+        dqz (* 0.5 (+ (* wx qy) (- (* wy qx)) (* wz qw)))
+        dqw (* 0.5 (+ (- (* wx qx)) (- (* wy qy)) (- (* wz qz))))
+        nx (+ qx (* dqx dt)) ny (+ qy (* dqy dt)) nz (+ qz (* dqz dt)) nw (+ qw (* dqw dt))
+        len (let [l (Math/hypot nx (Math/hypot ny (Math/hypot nz nw)))] (if (zero? l) 1 l))]
+    (swap! r assoc :linear-velocity new-lv :position new-pos
+           :orientation [(/ nx len) (/ ny len) (/ nz len) (/ nw len)] :force [0 0 0])))
+
+(defn rigid-prim-reset [r]
+  (let [{:keys [initial-position initial-orientation]} @r]
+    (swap! r assoc :position initial-position :orientation initial-orientation
+           :linear-velocity [0 0 0] :angular-velocity [0 0 0] :force [0 0 0])))
+
+;; ── World ─────────────────────────────────────────────────────────────────
+
+(defn make-world
+  "Simulation context owning a scene of articulations + rigid prims."
+  ([] (make-world nil))
+  ([{:keys [physics-dt gravity] :or {physics-dt (/ 1.0 60) gravity [0 0 -9.81]}}]
+   (atom {:physics-dt physics-dt :gravity gravity
+          :articulations {} :rigid-prims {}
+          :time 0.0 :step-count 0})))
+
+(defn world-add-articulation [w a]
+  (swap! w assoc-in [:articulations (:name @a)] a)
+  a)
+
+(defn world-add-rigid-prim [w r]
+  (swap! w assoc-in [:rigid-prims (:name @r)] r)
+  r)
+
+(defn world-get-articulation [w name]
+  (get-in @w [:articulations name]))
+
+(defn world-get-rigid-prim [w name]
+  (get-in @w [:rigid-prims name]))
+
+(defn world-scene [w]
+  (let [{:keys [articulations rigid-prims]} @w]
+    {:articulations (keys articulations) :rigid-prims (keys rigid-prims)}))
+
+(defn world-step
+  ([w] (world-step w 1))
+  ([w substeps]
+   (let [{:keys [physics-dt gravity articulations rigid-prims]} @w]
+     (dotimes [_ substeps]
+       (doseq [a (vals articulations)] (articulation-step a physics-dt gravity))
+       (doseq [r (vals rigid-prims)] (rigid-prim-step r physics-dt gravity))
+       (swap! w #(-> % (update :time + physics-dt) (update :step-count inc)))))))
+
+
+(defn world-reset [w]
+  (let [{:keys [articulations rigid-prims]} @w]
+    (doseq [a (vals articulations)] (articulation-reset a))
+    (doseq [r (vals rigid-prims)] (rigid-prim-reset r))
+    (swap! w assoc :time 0.0 :step-count 0)))

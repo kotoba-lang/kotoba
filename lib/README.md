@@ -105,6 +105,24 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kamiNvCompat` | `kotoba.kamiNvCompat/src` | `kotoba.lang.kami-nv-compat.actions.action-term`, `kotoba.lang.kami-nv-compat.actions.articulated-env`, `kotoba.lang.kami-nv-compat.actions.task-space-actions`, `kotoba.lang.kami-nv-compat.alpamayo` (Kotoba project library) |
+| `kotoba.ioAlembic` | `kotoba.ioAlembic/src` | `alembic.objects`, `alembic.properties`, `ogawa.core` (Kotoba project library) |
+| `kotoba.arxiv` | `kotoba.arxiv/src` | `arxiv-kotoba.dialogue`, `arxiv-kotoba.manifest`, `arxiv-kotoba.ops`, `arxiv-kotoba.policy` (Kotoba project library) |
+| `kotoba.comWise` | `kotoba.comWise/src` | `wise.balances`, `wise.client`, `wise.profiles`, `wise.quotes` (Kotoba project library) |
+| `kotoba.comNvidiaIsaacLab` | `kotoba.comNvidiaIsaacLab/src` | `shugyo`, `shugyo.cartpole`, `shugyo.dr`, `shugyo.ee-reach` (Kotoba project library) |
+| `kotoba.comGmail` | `kotoba.comGmail/src` | `gmail.async-client`, `gmail.async-history`, `gmail.async-threads`, `gmail.attachments` (Kotoba project library) |
+| `kotoba.kotobaseClient` | `kotoba.kotobaseClient/src` | `kotobase.attenuate`, `kotobase.authn`, `kotobase.blocks`, `kotobase.cacao` (Kotoba project library) |
+| `kotoba.ekyc` | `kotoba.ekyc/src` | `ekyc.adapters.edn-provider`, `ekyc.adapters.identity-bridge`, `ekyc.adapters.kagi-custody`, `ekyc.adapters.production-provider` (Kotoba project library) |
+| `kotoba.contentAddress` | `kotoba.contentAddress/src` | `content-address.app-schema`, `content-address.archive`, `content-address.core`, `content-address.digest` (Kotoba project library) |
+| `kotoba.character` | `kotoba.character/src` | `character`, `character.anim-blueprint`, `character.base-mesh`, `character.bin` (Kotoba project library) |
+| `kotoba.machine` | `kotoba.machine/src` | `machine.core` (Kotoba project library) |
+| `kotoba.security` | `kotoba.security/src` | `kotoba.security.abac`, `kotoba.security.adoption`, `kotoba.security.aead`, `kotoba.security.alert-adapters` (Kotoba project library) |
+| `kotoba.journal` | `kotoba.journal/src` | `journal.core`, `journal.fs` (Kotoba project library) |
+| `kotoba.shitsuke` | `kotoba.shitsuke/src` | `kotoba.editor`, `shitsuke.components`, `shitsuke.hiccup`, `shitsuke.hig` (Kotoba project library) |
+| `kotoba.calendar` | `kotoba.calendar/src` | `calendar.kotoba-oracle`, `calendar.model`, `calendar.validate` (Kotoba project library) |
+| `kotoba.rtc` | `kotoba.rtc/src` | `rtc`, `rtc.media`, `rtc.peer`, `rtc.room` (Kotoba project library) |
+| `kotoba.property` | `kotoba.property/src` | `kotoba.property`, `kotoba.property.audit-runtime`, `kotoba.property.bulk-csv`, `kotoba.property.collector` (Kotoba project library) |
+| `kotoba.paillier` | `kotoba.paillier/src` | `paillier.core` (Kotoba project library) |
 | `kotoba.omise` | `kotoba.omise/src` | `kotoba.omise`, `kotoba.omise.export`, `kotoba.omise.ui` (Kotoba project library) |
 | `kotoba.mst` | `kotoba.mst/src` | `mst.core` (Kotoba project library) |
 | `kotoba.mangaViewer` | `kotoba.mangaViewer/src` | `manga-viewer.model`, `manga-viewer.pagination`, `manga-viewer.render`, `manga-viewer.style` (Kotoba project library) |

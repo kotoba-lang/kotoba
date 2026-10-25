@@ -1,0 +1,242 @@
+(ns collect-domain-facts
+  "会社のドメインについて、レジストリの登録内容と実測 DNS を集める。
+
+   入力は `company-web-presence` の `web-presence.datoms.edn`（`:web/url` を持つ
+   会社）。1 ドメインにつき WHOIS/RDAP を 1 回、DNS を 1 回だけ引く。
+
+   ## 誰に聞くか
+
+   - `*.jp` → **JPRS の WHOIS（port 43）**。RDAP は無い（実測 2026-08-19:
+     `rdap.jprs.jp` は接続不可、IANA の RDAP bootstrap 1,200 TLD に `jp` は無い）。
+     日本語で聞くと `[組織名]` が返る —— **`.co.jp` は登記法人にしか割り当てられない**
+     ので、これが法人番号への独立した経路になる。
+   - それ以外 → **RDAP**（IANA bootstrap で TLD → サービス URL を引く）。
+
+   ## 個人は取らない
+
+   パーサ側が allowlist（`domain-facts/parse-jprs-whois` は `Contact Information`
+   より前だけを、名指しした key だけ読む）。RDAP も role が registrar の entity しか
+   見ない。
+
+   ## 間隔と台帳
+
+   レジストリの内容は日々変わるものではない。`--attempts` に「いつ聞いたか」を残し、
+   `--retry-days`（既定 30）の間は聞き直さない。WHOIS には流量制限があり、
+   叩き続けると遮断される —— `--delay-ms` は縮めない。
+
+   usage:
+     kbb --backend sci -cp src scripts/collect_domain_facts.cljk --web-presence <file> --out <file>
+       [--attempts <ledger.edn>] [--retry-days 30] [--limit N] [--delay-ms 1500]"
+  (:require [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kotoba.property.domain-facts :as df]
+            ["dns/promises" :as dnsp]
+            ["fs" :as fs]
+            ["net" :as net]
+            ["path" :as path]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+
+(defn- sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+;; ---------- WHOIS (port 43) ----------
+
+(defn whois
+  "port 43 に 1 行投げて、返ってきたテキストを読む。TLS も認証も無いプロトコル。"
+  [server query timeout-ms]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [chunks (atom [])
+           sock (.createConnection net #js {:host server :port 43})
+           done (atom false)
+           finish! (fn [v] (when-not @done (reset! done true) (.destroy sock) (resolve v)))]
+       (.setTimeout sock timeout-ms)
+       (.on sock "connect" (fn [] (.write sock (str query "\r\n"))))
+       (.on sock "data" (fn [d] (swap! chunks conj (.toString d "utf8"))))
+       (.on sock "end" (fn [] (finish! (str/join "" @chunks))))
+       (.on sock "timeout" (fn [] (finish! nil)))
+       (.on sock "error" (fn [_] (finish! nil)))))))
+
+;; ---------- RDAP ----------
+
+(def bootstrap (atom nil))
+
+(defn- fetch-json [url ms]
+  (let [ctl (js/AbortController.)
+        t (js/setTimeout #(.abort ctl) ms)]
+    (-> (js/fetch url #js {:signal (.-signal ctl)
+                           :headers #js {"Accept" "application/rdap+json, application/json"
+                                         "User-Agent" "kotoba-domain-facts/1.0 (+https://github.com/kotoba-lang/property)"}})
+        (.then (fn [res] (js/clearTimeout t)
+                 (if (.-ok res) (.json res) nil)))
+        (.catch (fn [_] (js/clearTimeout t) nil)))))
+
+(defn load-bootstrap! []
+  (-> (fetch-json "https://data.iana.org/rdap/dns.json" 20000)
+      (.then (fn [j]
+               (when j
+                 (let [m (reduce (fn [acc svc]
+                                   (let [[tlds urls] (js->clj svc)]
+                                     (reduce #(assoc %1 %2 (first urls)) acc tlds)))
+                                 {}
+                                 (js->clj (aget j "services")))]
+                   (reset! bootstrap m)))
+               @bootstrap))))
+
+(defn rdap-lookup [domain ms]
+  (let [tld (last (str/split domain #"\."))
+        base (get @bootstrap tld)]
+    (if-not base
+      (js/Promise.resolve nil)
+      (-> (fetch-json (str (str/replace base #"/$" "") "/domain/" domain) ms)
+          (.then (fn [j] (when j (df/parse-rdap (js->clj j)))))))))
+
+;; ---------- DNS ----------
+
+(defn- resolve-kind [f domain]
+  (-> (f dnsp domain)
+      (.then (fn [r] (js->clj r)))
+      (.catch (fn [_] nil))))
+
+(defn dns-lookup [domain]
+  (-> (js/Promise.all
+       #js [(resolve-kind #(.resolveNs %1 %2) domain)
+            (resolve-kind #(.resolveMx %1 %2) domain)
+            (resolve-kind #(.resolveTxt %1 %2) domain)
+            (resolve-kind #(.resolveTxt %1 %2) (str "_dmarc." domain))])
+      (.then (fn [[ns mx txt dmarc]]
+               {:ns ns
+                :mx (map #(get % "exchange") mx)
+                :txt (map #(str/join "" %) txt)
+                :dmarc? (when dmarc
+                          (boolean (some #(str/starts-with? (str/lower (str/join "" %)) "v=dmarc1") dmarc)))
+                ;; NS も MX も TXT も全部 nil なら、引けていない（NXDOMAIN か遮断）。
+                :queried? (boolean (or (seq ns) (seq mx) (seq txt)))}))))
+
+;; ---------- 入力 ----------
+
+(defn companies-with-urls [file]
+  (->> (str/split (.readFileSync fs file "utf8") #"\n")
+       (remove str/blank?)
+       rest
+       (keep #(try (reader/read-string %) (catch :default _ nil)))
+       (keep (fn [r]
+               (when-let [host (df/url->host (:web/url r))]
+                 (when-let [domain (df/registrable-domain host)]
+                   {:host host :domain domain
+                    :houjin-bangou (:company/houjin-bangou r)
+                    :legal-name (:company/legal-name r)}))))
+       (reduce (fn [acc c] (if (contains? acc (:domain c)) acc (assoc acc (:domain c) c))) {})))
+
+(defn- read-edn [f] (when (and f (.existsSync fs f))
+                      (try (reader/read-string (.readFileSync fs f "utf8")) (catch :default _ nil))))
+
+(defn- days-since [iso now-ms]
+  (let [t (.parse js/Date (str iso))] (if (js/isNaN t) 1e9 (/ (- now-ms t) 86400000))))
+
+(defonce state (atom {:asked 0 :registry 0 :dns 0 :agree 0 :disagree 0}))
+(defonce results (atom {}))
+
+(defn- registry-lookup [domain]
+  (if (df/jp-domain? domain)
+    (-> (whois "whois.jprs.jp" domain 20000) (.then #(df/parse-jprs-whois %)))
+    (rdap-lookup domain 20000)))
+
+(defn- absorb! [domain c registry dns total]
+  (let [observed-at (.toISOString (js/Date.))
+        agrees (df/registrant-agrees? (:registry/registrant-name registry) (:legal-name c))
+        rec (cond-> (df/record {:host (:host c) :domain domain
+                                :houjin-bangou (:houjin-bangou c)
+                                :legal-name (:legal-name c)
+                                :registry registry
+                                :dns (df/dns-facts (assoc dns :observed-at observed-at))
+                                :dmarc? (:dmarc? dns)
+                                :observed-at observed-at})
+              (some? agrees) (assoc :registry/name-agrees? agrees))]
+    (swap! state update :asked inc)
+    (when registry (swap! state update :registry inc))
+    (when (:queried? dns) (swap! state update :dns inc))
+    (when (true? agrees) (swap! state update :agree inc))
+    (when (false? agrees) (swap! state update :disagree inc))
+    (swap! results assoc domain rec)
+    (when (zero? (mod (:asked @state) 25))
+      (println (pr-str (assoc @state :of total))))))
+
+(defn- query-one! [[domain c] total delay-ms]
+  (-> (sleep delay-ms)
+      (.then (fn [_] (js/Promise.all #js [(registry-lookup domain) (dns-lookup domain)])))
+      (.then (fn [pair] (absorb! domain c (first pair) (second pair) total)))
+      (.catch (fn [e] (println (str "  " domain ": " (.-message e)))))))
+
+(defn- run-batch! [picked delay-ms]
+  (reduce (fn [p entry] (.then p (fn [_] (query-one! entry (count picked) delay-ms))))
+          (js/Promise.resolve nil)
+          picked))
+
+(defn- finish! [{:keys [out attempts-file by-domain picked]}]
+  (let [{:keys [asked registry dns agree disagree]} @state
+        all (vec (vals @results))
+        observed-at (.toISOString (js/Date.))]
+    ;; 聞いたのに 1 件もレジストリが答えなかったのは、こちらの失敗（遮断・書式変更）
+    ;; であって「そんなドメインは無い」ではない。
+    (when (and (pos? asked) (zero? registry))
+      (js/console.error "collect-domain-facts: queried registries but parsed nothing at all — that is a failure here, not a fact about them")
+      (js/process.exit 2))
+    (.mkdirSync fs (.dirname path out) #js {:recursive true})
+    (.writeFileSync fs out
+                    (str (pr-str (df/corpus-manifest
+                                  {:observed-at observed-at
+                                   :record-count (count all)
+                                   :queried (count by-domain)
+                                   :resolved-registry (count (filter :registry/source all))
+                                   :queried-dns (count (filter :dns/queried? all))}))
+                         "\n" (str/join "\n" (map pr-str all)) "\n")
+                    "utf8")
+    (when attempts-file
+      (.writeFileSync fs attempts-file
+                      (pr-str (reduce #(assoc %1 (first %2) observed-at) (or (read-edn attempts-file) {}) picked))
+                      "utf8"))
+    (println (pr-str {:out out :domains (count all) :asked asked
+                      :registry-answered registry :dns-answered dns
+                      :name-agrees agree :name-differs disagree}))))
+
+(defn -main []
+  (let [wp (arg "--web-presence" nil)
+        out (arg "--out" nil)
+        attempts-file (arg "--attempts" nil)
+        retry-days (js/parseFloat (arg "--retry-days" "30"))
+        limit (js/parseInt (arg "--limit" "0") 10)
+        delay-ms (js/parseInt (arg "--delay-ms" "1500") 10)]
+    (when-not (and wp out)
+      (println "usage: collect_domain_facts.cljs --web-presence <file> --out <file> [--attempts f] [--retry-days 30] [--limit N] [--delay-ms 1500]")
+      (js/process.exit 2))
+    (let [by-domain (companies-with-urls wp)
+          existing (into {} (map (fn [r] [(:domain/name r) r]))
+                         (when (.existsSync fs out)
+                           (->> (str/split (.readFileSync fs out "utf8") #"\n")
+                                (remove str/blank?) rest
+                                (keep #(try (reader/read-string %) (catch :default _ nil))))))
+          attempts (or (read-edn attempts-file) {})
+          now-ms (.now js/Date)
+          due (remove (fn [pair] (when-let [at (get attempts (first pair))]
+                                   (< (days-since at now-ms) retry-days)))
+                      by-domain)
+          picked (vec (cond->> due (pos? limit) (take limit)))]
+      (reset! results existing)
+      (println (str "  " (count by-domain) " domain(s), " (- (count by-domain) (count due))
+                    " asked within " retry-days "d, querying " (count picked)))
+      (when (zero? (count by-domain))
+        (js/console.error "collect-domain-facts: no company had a URL — that is a failure here, not a fact about them")
+        (js/process.exit 2))
+      (-> (load-bootstrap!)
+          (.then (fn [b]
+                   (when-not b (println "  WARNING: RDAP bootstrap unavailable — gTLD registry data will be missing this run"))
+                   (run-batch! picked delay-ms)))
+          (.then (fn [_] (finish! {:out out :attempts-file attempts-file
+                                   :by-domain by-domain :picked picked})))
+          (.catch (fn [e]
+                    (js/console.error (str "collect-domain-facts failed: " (.-message e)))
+                    (js/process.exit 1)))))))
+
+(-main)

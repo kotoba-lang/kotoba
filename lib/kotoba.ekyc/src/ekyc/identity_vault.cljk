@@ -1,0 +1,121 @@
+(ns ekyc.identity-vault
+  "Explicit encrypted Kotobase ports. Keys never enter canonical case records.
+  Port implementations must enforce private CID access and authoritative CAS;
+  this module never substitutes public blocks or isolate memory on failure."
+  (:require [ekyc.passport :as p] [ekyc.identity-crypto :as crypto]
+            [ekyc.identity-intake :as intake]))
+
+(defn- base32 [bytes]
+  (let [alphabet "abcdefghijklmnopqrstuvwxyz234567"]
+    (loop [xs (seq (array-seq bytes)) bits 0 value 0 out ""]
+      (cond
+        (>= bits 5) (recur xs (- bits 5) value (str out (.charAt alphabet (bit-and 31 (unsigned-bit-shift-right value (- bits 5))))))
+        xs (recur (next xs) (+ bits 8) (bit-or (bit-shift-left value 8) (first xs)) out)
+        (pos? bits) (str out (.charAt alphabet (bit-and 31 (bit-shift-left value (- 5 bits)))))
+        :else out))))
+(defn cid [bytes]
+  (-> (.digest (.-subtle js/crypto) "SHA-256" bytes)
+      (.then (fn [hash]
+               (let [buf (js/Uint8Array. 36)]
+                 (.set buf #js [1 85 18 32]) (.set buf (js/Uint8Array. hash) 4)
+                 (str "b" (base32 buf)))))))
+(defn context [record slot]
+  (crypto/utf8 (js/JSON.stringify #js ["kotoba-identity-evidence-v1" (:id record) (:principal record) (name slot) (:nonce record)])))
+(defn- require-key! [key]
+  (p/require! (and key (= "secret" (.-type key)) (false? (.-extractable key))
+                   (= "AES-GCM" (.-name (.-algorithm key))) (= 256 (.-length (.-algorithm key)))) :invalid-vault-key))
+(defn seal [key aad bytes]
+  (require-key! key)
+  (let [iv (.getRandomValues js/crypto (js/Uint8Array. 12))]
+    (-> (.encrypt (.-subtle js/crypto) #js {:name "AES-GCM" :iv iv :additionalData aad :tagLength 128} key bytes)
+        (.then (fn [encrypted]
+                 (let [out (js/Uint8Array. (+ 12 (.-byteLength encrypted)))]
+                   (.set out iv) (.set out (js/Uint8Array. encrypted) 12) out))))))
+(defn unseal [key aad bytes]
+  (require-key! key)
+  (p/require! (<= 29 (.-byteLength bytes) (+ 6291456 28)) :invalid-sealed-block)
+  (.decrypt (.-subtle js/crypto) #js {:name "AES-GCM" :iv (.slice bytes 0 12) :additionalData aad :tagLength 128}
+            key (.slice bytes 12)))
+(defn validate-ports! [ports]
+  (p/require! (and (= "https://kotobase.net" (:origin ports)) (= :private (:visibility ports))
+                   (= :authoritative (:cas-mode ports))
+                   (every? #(fn? (get ports %)) [:read! :cas! :put-block! :get-block! :key! :destroy-key!]))
+              :private-canonical-storage-unavailable))
+(defn commit! [ports event now]
+  (validate-ports! ports)
+  (letfn [(attempt [left]
+            (-> ((:read! ports))
+                (.then (fn [{:keys [revision state]}]
+                         (p/require! (and (integer? revision) (<= 0 revision) (map? state)) :invalid-canonical-state)
+                         (let [result (intake/transition state event now)]
+                           (p/require! (:ok result) (or (:reason result) :intake-denied))
+                           (-> ((:cas! ports) revision (:state result))
+                               (.then (fn [receipt]
+                                        (cond
+                                          (and (= :conflict (:status receipt)) (pos? left)) (attempt (dec left))
+                                          (and (= :committed (:status receipt)) (= (inc revision) (:revision receipt))
+                                               (intake/text? (:receipt-ref receipt))) receipt
+                                          :else (p/reject! :canonical-commit-unconfirmed))))))))))]
+    (attempt 2)))
+(defn store-evidence! [ports id principal slot media-type bytes now]
+  (validate-ports! ports)
+  (p/require! (and (intake/slots slot) ((intake/media-types slot) media-type)
+                   (instance? js/Uint8Array bytes) (<= 1 (.-byteLength bytes) (intake/max-bytes slot))) :invalid-media)
+  (-> ((:read! ports))
+      (.then (fn [{:keys [state]}]
+               (let [r (get-in state [:intake id])]
+                 (p/require! (and (intake/owner? r principal) (= :capturing (:status r))
+                                  (intake/fresh? r now) (< now (:capture-expires-at r))
+                                  (nil? (get-in r [:evidence slot]))) :capture-not-authorized)
+                 (-> ((:key! ports) (:key-ref r) id)
+                     (.then #(seal % (context r slot) bytes))
+                     (.then (fn [sealed]
+                              (-> (cid sealed)
+                                  (.then (fn [block-cid]
+                                           (-> ((:put-block! ports) block-cid sealed)
+                                               (.then (fn [receipt]
+                                                        (p/require! (and (= :stored (:status receipt)) (= block-cid (:cid receipt))
+                                                                         (intake/text? (:receipt-ref receipt))) :block-write-unconfirmed)
+                                                        (-> ((:get-block! ports) block-cid)
+                                                            (.then cid)
+                                                            (.then (fn [readback]
+                                                                     (p/require! (= block-cid readback) :block-readback-mismatch)
+                                                                     (-> (p/sha256 bytes)
+                                                                         (.then (fn [digest]
+                                                                                  (commit! ports {:op :intake-evidence :id id :principal principal
+                                                                                                  :authenticated true :nonce (:nonce r) :slot slot
+                                                                                                  :media-type media-type :size (.-byteLength bytes)
+                                                                                                  :cid block-cid :digest digest :write-receipt (:receipt-ref receipt)
+                                                                                                  :stored-and-verified true} now)))))))))))))))))))))
+(defn read-evidence! [ports id principal slot now]
+  (validate-ports! ports)
+  ;; Audit is committed before any plaintext leaves the host.
+  (-> (commit! ports {:op :intake-audit-read :id id :principal principal :slot slot
+                      :authenticated true :audit-id (str (random-uuid))} now)
+      (.then #((:read! ports)))
+      (.then (fn [{:keys [state]}]
+               (p/require! (intake/access? state id principal now) :evidence-access-denied)
+               (let [r (get-in state [:intake id]) evidence (get-in r [:evidence slot])]
+                 (-> ((:get-block! ports) (:cid evidence))
+                     (.then (fn [sealed]
+                              (-> (cid sealed)
+                                  (.then (fn [actual]
+                                           (p/require! (= actual (:cid evidence)) :block-integrity-failed)
+                                           (-> ((:key! ports) (:key-ref r) id)
+                                               (.then #(unseal % (context r slot) sealed))))))))
+                     (.then (fn [bytes]
+                              (-> (p/sha256 bytes)
+                                  (.then (fn [digest]
+                                           (p/require! (= digest (:digest evidence)) :plaintext-integrity-failed)
+                                           {:bytes bytes :media-type (:media-type evidence)}))))))))))
+)
+(defn delete-case! [ports id principal now]
+  (-> (commit! ports {:op :intake-delete :id id :principal principal :authenticated true} now)
+      (.then #((:read! ports)))
+      (.then (fn [{:keys [state]}]
+               (let [r (get-in state [:intake id])]
+                 (-> ((:destroy-key! ports) (:key-ref r) id)
+                     (.then (fn [receipt]
+                              (p/require! (and (= :destroyed (:status receipt)) (intake/text? (:receipt-ref receipt))) :key-destruction-unconfirmed)
+                              (commit! ports {:op :intake-deleted :id id :principal principal :authenticated true
+                                              :key-destroyed true :destruction-receipt (:receipt-ref receipt)} now)))))))))

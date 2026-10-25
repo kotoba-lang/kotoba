@@ -1,0 +1,108 @@
+(ns shugyo.ee-reach-test
+  "Port of `ee_reach_env.rs`'s `#[cfg(test)] mod tests` (7 tests) 1:1."
+  (:require [kotoba.test :refer [deftest is]]
+            [shugyo.ee-reach :as ee]
+            [shugyo.reach :as reach]
+            [shugyo.traits :as t]))
+
+(def arm2-urdf
+  "<robot name=\"arm2\">
+<link name=\"base\"><inertial><mass value=\"1\"/><inertia ixx=\"0.01\" iyy=\"0.01\" izz=\"0.01\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial></link>
+<joint name=\"shoulder\" type=\"revolute\"><parent link=\"base\"/><child link=\"upper\"/><origin xyz=\"0 0 0\"/><axis xyz=\"0 1 0\"/><limit lower=\"-3.14\" upper=\"3.14\" effort=\"80\" velocity=\"10\"/><dynamics damping=\"0\"/></joint>
+<link name=\"upper\"><inertial><origin xyz=\"0 0 -0.5\"/><mass value=\"1\"/><inertia ixx=\"0.02\" iyy=\"0.02\" izz=\"0.001\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial></link>
+<joint name=\"elbow\" type=\"revolute\"><parent link=\"upper\"/><child link=\"fore\"/><origin xyz=\"0 0 -1\"/><axis xyz=\"0 1 0\"/><limit lower=\"-3.14\" upper=\"3.14\" effort=\"80\" velocity=\"10\"/><dynamics damping=\"0\"/></joint>
+<link name=\"fore\"><inertial><origin xyz=\"0 0 -0.5\"/><mass value=\"1\"/><inertia ixx=\"0.02\" iyy=\"0.02\" izz=\"0.001\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial></link>
+</robot>")
+
+(defn env [num-envs]
+  (ee/vectorized-ee-reach-env-new num-envs arm2-urdf "fore" (reach/reach-cfg-default)))
+
+(deftest shapes-and-unknown-ee-link-rejected
+  (let [e (env 4)]
+    (is (= (t/action-dim-per-env e) 2))
+    (is (= (t/observation-dim-per-env e) (+ (* 2 2) 6)))
+    (let [obs (t/reset-all! e 0)]
+      (is (= (count obs) (* 4 (+ (* 2 2) 6))))
+      (is (every? #(not (Double/isNaN %)) obs)))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (ee/vectorized-ee-reach-env-new 2 arm2-urdf "nope" (reach/reach-cfg-default))))))
+
+(deftest goals-are-reachable-and-seed-deterministic
+  (let [a (env 3) b (env 3)
+        oa (t/reset-all! a 11) ob (t/reset-all! b 11)]
+    (is (= oa ob) "same seed -> identical reset")
+    (dotimes [e (t/num-envs a)]
+      (let [g (subvec (ee/goals a) (* e 3) (* (inc e) 3))
+            r (Math/sqrt (reduce + 0.0 (map #(* % %) g)))]
+        (is (<= r (+ 2.0 1e-3)) (str "goal " r " outside reach"))))))
+
+(deftest touch-reach-adds-contact-obs-and-bonus-on-arrival
+  (let [cfg (assoc (reach/reach-cfg-default)
+                    :contact-radius 0.08 :contact-bonus 10.0 :observe-contact? true)
+        e (ee/vectorized-ee-reach-env-new 2 arm2-urdf "fore" cfg)]
+    (is (= (t/observation-dim-per-env e) (+ (* 2 2) 6 1)))
+    (t/reset-all! e 4)
+    (let [od (t/observation-dim-per-env e)
+          cmd (ee/reference-joint-solution e)
+          first-r (t/step-all! e cmd)]
+      (is (every? #(= (count (:observation %)) od) first-r))
+      (is (= (last (:observation (first first-r))) 0.0) "should not be touching at start")
+      (let [last-r (loop [i 0 last first-r]
+                     (if (= i 299) last (recur (inc i) (t/step-all! e cmd))))]
+        (doseq [s last-r]
+          (is (= (last (:observation s)) 1.0) "touch flag not set at goal")
+          (is (> (:reward s) 5.0) (str "contact bonus not applied: reward " (:reward s)))
+          (is (:terminated? s)))))))
+
+(deftest tool-offset-reach-controls-the-tip-via-ik
+  (let [cfg (assoc (reach/reach-cfg-default) :tool-offset [0.0 0.0 -0.5])
+        e (ee/vectorized-ee-reach-env-new 2 arm2-urdf "fore" cfg)
+        obs (t/reset-all! e 3)
+        od (t/observation-dim-per-env e)
+        ndof (t/action-dim-per-env e)]
+    (is (= (count obs) (* (t/num-envs e) od)))
+    (let [cmd (ee/solve-ik-to-goals e 300 0.01)
+          last-r (loop [i 0 last (t/step-all! e cmd)]
+                   (if (= i 299) last (recur (inc i) (t/step-all! e cmd))))]
+      (is (every? :terminated? last-r) "tool-point IK did not reach goal")
+      (let [fin (t/observations-flat e)]
+        (dotimes [ev (t/num-envs e)]
+          (let [b (+ (* ev od) (* 2 ndof))
+                dx (- (nth fin b) (nth (ee/goals e) (* ev 3)))
+                dz (- (nth fin (+ b 2)) (nth (ee/goals e) (+ (* ev 3) 2)))]
+            (is (< (Math/sqrt (+ (* dx dx) (* dz dz))) 0.05) "tool obs not at goal")))))))
+
+(deftest operational-space-control-reaches-user-cartesian-goal-via-ik
+  (let [e (ee/vectorized-ee-reach-env-new 2 arm2-urdf "fore" (reach/reach-cfg-default))]
+    (t/reset-all! e 0)
+    (let [g (ee/goals e)
+          goal [(nth g 0) (nth g 1) (nth g 2) (nth g 0) (nth g 1) (nth g 2)]]
+      (ee/set-cartesian-goals! e goal)
+      (let [cmd (ee/solve-ik-to-goals e 200 0.01)
+            last-r (loop [i 0 last (t/step-all! e cmd)]
+                     (if (= i 299) last (recur (inc i) (t/step-all! e cmd))))]
+        (is (every? :terminated? last-r) "IK control did not reach goal")))))
+
+(deftest action-noise-dr-is-reproducible-and-perturbs-the-ee-trajectory
+  (let [run (fn [std]
+              (let [cfg (assoc (reach/reach-cfg-default) :action-noise-std std)
+                    e (ee/vectorized-ee-reach-env-new 2 arm2-urdf "fore" cfg)]
+                (t/reset-all! e 8)
+                (let [cmd (vec (repeat (* (t/num-envs e) (t/action-dim-per-env e)) 0.3))]
+                  (dotimes [_ 50] (t/step-all! e cmd))
+                  (t/observations-flat e))))
+        a (run 0.2) b (run 0.2)]
+    (is (= a b) "EE action-noise DR not reproducible")
+    (is (not= a (run 0.0)) "action noise had no effect on the EE trajectory")
+    (is (every? #(not (Double/isNaN %)) a))))
+
+(deftest reference-policy-drives-ee-to-cartesian-goal
+  (let [e (env 4)]
+    (t/reset-all! e 2)
+    (let [cmd (ee/reference-joint-solution e)
+          first-r (t/step-all! e cmd)
+          r0 (reduce + 0.0 (map :reward first-r))
+          last-r (loop [i 0 last first-r]
+                   (if (= i 299) last (recur (inc i) (t/step-all! e cmd))))
+          r1 (reduce + 0.0 (map :reward last-r))]
+      (is (> r1 r0) (str "reward did not improve: " r0 " -> " r1))
+      (is (every? :terminated? last-r) "EE did not reach goal"))))

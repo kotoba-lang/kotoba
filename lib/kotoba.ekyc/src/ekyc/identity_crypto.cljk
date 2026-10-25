@@ -1,0 +1,90 @@
+(ns ekyc.identity-crypto
+  "WebCrypto host for first-party credentials and holder-bound presentations.
+  This is a versioned Kotoba JWS profile, not an SD-JWT/ZK or W3C certification.
+  The issuer host owns private keys; verifier keys/status are explicit trusted ports."
+  (:require [ekyc.passport :as passport] [ekyc.identity-policy :as policy]
+            [ekyc.identity-trust :as trust]))
+
+(defn seconds [milliseconds] (js/Math.floor (/ milliseconds 1000)))
+(defn fresh-claims? [claims now]
+  (and (integer? (:iat claims)) (integer? (:exp claims))
+       (policy/fresh? (:iat claims) (:exp claims) (seconds now))))
+
+(defn b64 [bytes]
+  (-> (js/btoa (apply str (map #(js/String.fromCharCode %) (array-seq (passport/bytes bytes)))))
+      (.replaceAll "+" "-") (.replaceAll "/" "_") (.replace #"=+$" "")))
+(defn unb64 [s]
+  (passport/require! (and (string? s) (<= 1 (count s) 16384) (re-matches #"[A-Za-z0-9_-]+" s)) :invalid-base64)
+  (let [out (js/Uint8Array.from (js/atob (-> s (.replaceAll "-" "+") (.replaceAll "_" "/"))) #( .charCodeAt % 0))]
+    (passport/require! (= s (b64 out)) :noncanonical-base64) out))
+(defn utf8 [s] (.encode (js/TextEncoder.) s))
+(defn json-part [m] (b64 (utf8 (js/JSON.stringify (clj->js m)))))
+(defn parse-part [s] (js->clj (js/JSON.parse (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) (unb64 s))) :keywordize-keys true))
+(defn sign [key kid type payload]
+  (let [message (str (json-part {:alg "EdDSA" :typ type :kid kid}) "." (json-part payload))]
+    (-> (.sign (.-subtle js/crypto) "Ed25519" key (utf8 message))
+        (.then #(str message "." (b64 %))))))
+(defn verify [key kid type token]
+  (passport/require! (and (string? token) (<= (count token) 16384)) :invalid-token)
+  (let [parts (.split token ".")]
+    (passport/require! (= 3 (.-length parts)) :invalid-token)
+    (let [head (parse-part (aget parts 0))]
+      (passport/require! (= {:alg "EdDSA" :typ type :kid kid} head) :invalid-token-header)
+      (-> (.verify (.-subtle js/crypto) "Ed25519" key (unb64 (aget parts 2)) (utf8 (str (aget parts 0) "." (aget parts 1))))
+          (.then (fn [valid] (passport/require! valid :invalid-signature) (parse-part (aget parts 1))))))))
+(defn document-tag [hmac-key scope private-document-key]
+  (-> (.sign (.-subtle js/crypto) "HMAC" hmac-key (utf8 (js/JSON.stringify #js ["kotoba-document-v1" scope private-document-key])))
+      (.then b64)))
+(defn holder-key-id [jwk]
+  (passport/sha256 (utf8 (js/JSON.stringify (clj->js (select-keys jwk [:kty :crv :x]))))))
+(defn issue [key issuer kid id record subject holder-jwk now]
+  (passport/require! (nil? (policy/eligibility record now)) :not-approved)
+  (passport/require! (and (policy/text? issuer) (policy/text? kid) (policy/text? id) (= id (:id record)) (policy/text? subject)
+                         (= "OKP" (:kty holder-jwk)) (= "Ed25519" (:crv holder-jwk))
+                         (policy/text? (:x holder-jwk)) (not (contains? holder-jwk :d))) :invalid-issuance)
+  (-> (holder-key-id holder-jwk)
+      (.then (fn [key-id]
+               (passport/require! (= key-id (:holder-key-id record)) :holder-key-mismatch)
+               (sign key kid "kotoba-identity+jwt"
+        {:iss issuer :sub subject :aud (:audience record) :jti id :iat (seconds now) :exp (seconds (:expires-at record))
+         :policy policy/version :adult true :assurance "reviewed-identity-v2" :trust-policy trust/version
+         :cnf {:jwk (select-keys holder-jwk [:kty :crv :x])}})))))
+(defn present [holder-key holder-kid credential audience nonce now]
+  (-> (passport/sha256 (utf8 credential))
+      (.then #(sign holder-key holder-kid "kotoba-presentation+jwt"
+                    {:credential-digest % :aud audience :nonce nonce :iat (seconds now) :exp (+ (seconds now) 120)}))))
+(defn verify-presentation [issuer-key issuer issuer-kid credential presentation expected status! now]
+  (-> (verify issuer-key issuer-kid "kotoba-identity+jwt" credential)
+      (.then
+       (fn [claims]
+         (passport/require! (and (= issuer (:iss claims)) (= policy/version (:policy claims))
+                                (= (:audience expected) (:aud claims)) (policy/text? (:sub claims))
+                                (policy/text? (:jti claims)) (= true (:adult claims))
+                                (= "reviewed-identity-v2" (:assurance claims)) (= trust/version (:trust-policy claims))
+                                (fresh-claims? claims now)
+                                (<= (- (:exp claims) (:iat claims)) (* 365 86400))
+                                (policy/text? (:nonce expected)) (= false (:consumed expected))
+                                (policy/fresh? (:created-at expected) (:expires-at expected) now)
+                                (<= (- (:expires-at expected) (:created-at expected)) 120000)) :invalid-credential-or-challenge)
+         (let [jwk (get-in claims [:cnf :jwk])]
+           (passport/require! (and (= "OKP" (:kty jwk)) (= "Ed25519" (:crv jwk))
+                                  (= #{:kty :crv :x} (set (keys jwk)))) :invalid-holder-key)
+           (-> (.importKey (.-subtle js/crypto) "jwk" (clj->js jwk) "Ed25519" false #js ["verify"])
+               (.then #(verify % (:holder-kid expected) "kotoba-presentation+jwt" presentation))
+               (.then
+                (fn [proof]
+                  (-> (passport/sha256 (utf8 credential))
+                      (.then
+                       (fn [digest]
+                         (passport/require! (and (= digest (:credential-digest proof))
+                                                (= (:audience expected) (:aud proof)) (= (:nonce expected) (:nonce proof))
+                                                (fresh-claims? proof now)
+                                                (<= (seconds (:created-at expected)) (:iat proof))
+                                                (<= (- (:exp proof) (:iat proof)) 120)) :invalid-holder-proof)
+                         (-> (status! (:jti claims))
+                             (.then (fn [status]
+                                      (passport/require! (and (= :active (:status status)) (= (:jti claims) (:id status))
+                                                             (policy/fresh? (:checked-at status) (:expires-at status) now)
+                                                             (<= (- now (:checked-at status)) 60000)) :credential-revoked-or-status-unavailable)
+                                      ;; Caller MUST atomically consume expected nonce before admitting research.
+                                      (select-keys claims [:sub :aud :adult :assurance :jti :exp])))))))))))))))

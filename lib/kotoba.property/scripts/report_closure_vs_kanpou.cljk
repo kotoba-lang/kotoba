@@ -1,0 +1,114 @@
+(ns report-closure-vs-kanpou
+  "官報の解散公告（入口）と登記記録の閉鎖（出口）を突き合わせる。
+
+   ## なぜ突き合わせるか
+
+   2 つは**独立した源泉**である: 官報は会社が出した公告、全件データは登記所の記録。
+   同じ会社が両方に出るとき、`:kaisan/resolved-on`（解散決議日）と
+   `:company/closed-at`（登記記録の閉鎖日）の差は**清算に要した期間**であり、
+   両方に出ない場合はどちらかの取りこぼしを示す。
+
+   片方だけでは検算できない: 官報の歩留まりは読めた頁の中の値でしかなく
+   （ADR 18 節）、全件の閉鎖は「いつ公告されたか」を持たない。
+
+   ## 出すのは分布であって名簿ではない
+
+   個社の一覧は既に committed projection に在るので、ここが返すのは**集計**だけ。
+   ついでに `close-cause` の対応付けの裏付け（承継先を持つ行の内訳）も出す ——
+   前回 60,753 件中 60,710 件が `11` で、**43 件の説明が付いていない**。
+
+   usage:
+     kbb --backend sci -cp src scripts/report_closure_vs_kanpou.cljk --corpus <c>
+       --kaisan <kanpou-kaisan.datoms.edn> [--out <summary.edn>]"
+  (:require [cljs.reader :as reader]
+            [kotoba.lang.text :as str]
+            [kotoba.property.houjin-bangou-zenken :as hb]
+            ["fs" :as fs]
+            ["readline" :as readline]))
+
+(def argv (vec *command-line-args*))
+(defn- arg [n d] (or (second (drop-while #(not= n %) argv)) d))
+
+(defn- days-between [a b]
+  (let [ta (.parse js/Date (str a)) tb (.parse js/Date (str b))]
+    (when-not (or (js/isNaN ta) (js/isNaN tb))
+      (js/Math.round (/ (- tb ta) 86400000)))))
+
+(defn- percentile [sorted p]
+  (when (seq sorted)
+    (nth sorted (min (dec (count sorted))
+                     (js/Math.floor (* p (count sorted)))))))
+
+(defn- read-kaisan [f]
+  (->> (str/split (.readFileSync fs f "utf8") #"\n")
+       (remove str/blank?)
+       (keep #(try (reader/read-string %) (catch :default _ nil)))
+       (remove :corpus/manifest)
+       (filter :company/houjin-bangou)
+       (reduce (fn [m r] (assoc m (:company/houjin-bangou r) r)) {})))
+
+(defn -main []
+  (let [corpus (arg "--corpus" nil)
+        kaisan-file (arg "--kaisan" nil)
+        out (arg "--out" nil)]
+    (when-not (and corpus kaisan-file)
+      (println "usage: report_closure_vs_kanpou.cljs --corpus <c> --kaisan <f> [--out <o>]")
+      (js/process.exit 2))
+    (let [kaisan (read-kaisan kaisan-file)
+          state (atom {:scanned 0 :closed 0 :successor-by-cause {}
+                       :matched 0 :matched-closed 0 :lags []})
+          rl (.createInterface readline #js {:input (.createReadStream fs corpus)
+                                             :crlfDelay js/Infinity})]
+      (when (zero? (count kaisan))
+        (js/console.error "report-closure-vs-kanpou: the 官報 file has no linked notice — nothing to cross-check")
+        (js/process.exit 2))
+      (.on rl "line"
+           (fn [line]
+             (when-not (str/blank? line)
+               (when-let [rec (try (reader/read-string line) (catch :default _ nil))]
+                 (when-not (:corpus/manifest rec)
+                   (swap! state update :scanned inc)
+                   (let [hb-no (:company/houjin-bangou rec)
+                         closed? (hb/closed? rec)]
+                     (when closed?
+                       (swap! state update :closed inc)
+                       ;; 承継先を持つ行の事由の内訳（label の裏付け）。
+                       (when (:company/successor-houjin-bangou rec)
+                         (swap! state update-in [:successor-by-cause (:company/close-cause rec)]
+                                (fnil inc 0))))
+                     (when-let [notice (get kaisan hb-no)]
+                       (swap! state update :matched inc)
+                       (when closed?
+                         (swap! state update :matched-closed inc)
+                         (when-let [d (days-between (or (:kaisan/resolved-on notice)
+                                                        (:kaisan/published-at notice))
+                                                    (:company/closed-at rec))]
+                           (swap! state update :lags conj d))))))))))
+      (.on rl "close"
+           (fn []
+             (let [{:keys [scanned closed matched matched-closed lags successor-by-cause]} @state
+                   sorted (vec (sort lags))
+                   summary {:source/observed-at (.toISOString (js/Date.))
+                            :registry/scanned scanned
+                            :registry/closed closed
+                            :kanpou/linked-notices (count kaisan)
+                            ;; 官報で解散公告を出した会社のうち、登記まで閉じている割合。
+                            :crosscheck/found-in-registry matched
+                            :crosscheck/also-closed matched-closed
+                            :crosscheck/still-open (- matched matched-closed)
+                            ;; 決議から登記閉鎖までの日数（負値 = 公告より前に閉じている）。
+                            :lag/n (count sorted)
+                            :lag/p10 (percentile sorted 0.10)
+                            :lag/median (percentile sorted 0.50)
+                            :lag/p90 (percentile sorted 0.90)
+                            :lag/negative (count (filter neg? sorted))
+                            :successor/by-cause (pr-str successor-by-cause)}]
+               (when (zero? matched)
+                 (js/console.error "report-closure-vs-kanpou: not one 官報 notice was found in the registry — that is a failure here, not a fact")
+                 (js/process.exit 2))
+               (println (pr-str summary))
+               (when out
+                 (.writeFileSync fs out (str (pr-str summary) "\n") "utf8")
+                 (println (str "wrote " out)))))))))
+
+(-main)

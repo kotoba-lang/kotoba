@@ -1,0 +1,264 @@
+(ns kotoba.property.gleif-golden-copy
+  "Portable parsing/normalisation for the GLEIF LEI-CDF v3.1 Golden Copy CSV.
+
+   Kept free of I/O so the row contract can be tested without a 474 MB
+   download: `scripts/collect_gleif_golden_copy.cljk` owns the streaming and
+   this namespace owns the meaning of a row.
+
+   The emitted attribute names are deliberately the ones the workspace query
+   plane already joins on (`:company/lei`, `:company/legal-name`,
+   `:company/jurisdiction`) so that a GLEIF record and a market-intel or
+   cloud-itonami-lei record unify on `:company/lei` without a translation
+   layer. See ADR-2607252000 (unified query plane, cross-repo company join).
+
+   Corpus shape: line 1 is a manifest map carrying the provenance that is
+   constant for the whole file (authority, licence, publish, source hash);
+   every later line is one company. Repeating those five values on 3.4M
+   records cost ~680 MB of the corpus and a measurable share of the ingest's
+   `pr-str` time, for information that cannot vary within a file."
+  (:require [kotoba.lang.text :as str]))
+
+(def source-id
+  "Collector-level source id, distinct from `gleif-level-2` (the paginated API
+   collector) because the two read different endpoints of the same authority
+   and their audit rows must not overwrite each other."
+  "gleif-golden-copy")
+
+(def authority-id "GLOBAL/GLEIF")
+
+(def dataset "gleif-lei")
+
+(def licence
+  "GLEIF publishes LEI data under CC0 1.0; the Golden Copy files carry the same
+   terms as the API this project already reviewed."
+  "CC0 1.0 (GLEIF)")
+
+(def ^:private record-start-re
+  ;; Every Golden Copy data row opens with the 20-character LEI as its first
+  ;; quoted field. A physical line that does not is the continuation of a
+  ;; value containing a newline (GLEIF address lines do this).
+  #"^\"[A-Z0-9]{20}\",")
+
+(defn record-start?
+  "Does this physical line begin a record?
+
+   Replaces a quote-parity scan of every line. Parity required walking all
+   ~2,000 characters of all 3.4M rows to answer a question that is decided by
+   the first 23; measured, that scan was the largest single cost in the
+   ingest. The residual risk — a wrapped fragment that itself begins with 20
+   uppercase alphanumerics followed by a quote and comma — is not reachable
+   from the address and name text these fields hold."
+  [line]
+  (boolean (re-find record-start-re line)))
+
+(defn quote-count
+  "Number of `\"` characters in the line. No longer on the ingest path (see
+   `record-start?`); kept because line-splitting behaviour is worth being able
+   to check directly."
+  [line]
+  (loop [i 0 n 0]
+    (if-let [q (str/index-of line "\"" i)]
+      (recur (inc q) (inc n))
+      n)))
+
+(defn parse-csv-line
+  "Full RFC-4180 line splitter: honours quoted fields, doubled quotes as a
+   literal quote, and commas inside quotes. Returns a vector of strings with
+   the surrounding quotes removed and empty cells as nil.
+
+   Used for the header row and for tests. Data rows go through `row->cells`,
+   which skips the 325 columns this ingest does not keep."
+  [line]
+  (let [n (count line)]
+    (loop [i 0 run-start 0 cell "" cells [] in-quotes? false]
+      (if (>= i n)
+        (mapv #(when-not (str/blank? %) %)
+              (conj cells (str cell (subs line run-start n))))
+        (let [c (nth line i)]
+          (cond
+            (and in-quotes? (= c \") (< (inc i) n) (= (nth line (inc i)) \"))
+            (recur (+ i 2) (+ i 2) (str cell (subs line run-start i) "\"") cells true)
+
+            (= c \")
+            (recur (inc i) (inc i) (str cell (subs line run-start i))
+                   cells (not in-quotes?))
+
+            (and (= c \,) (not in-quotes?))
+            (recur (inc i) (inc i) ""
+                   (conj cells (str cell (subs line run-start i))) false)
+
+            :else
+            (recur (inc i) run-start cell cells in-quotes?)))))))
+
+(defn header-index
+  "Column-name -> position. GLEIF has added and moved columns across CDF
+   revisions, so every lookup in this namespace goes through the header rather
+   than a fixed offset."
+  [cells]
+  (into {} (map-indexed (fn [i c] [(str/trim (or c "")) i]) cells)))
+
+(def wanted-columns
+  "The Golden Copy columns this ingest keeps, out of 338. Everything here is
+   either a join key, an identity attribute, or provenance that varies per
+   record."
+  ["LEI"
+   "Entity.LegalName"
+   "Entity.LegalJurisdiction"
+   "Entity.LegalAddress.Country"
+   "Entity.LegalAddress.City"
+   "Entity.LegalAddress.Region"
+   "Entity.EntityCategory"
+   "Entity.EntityStatus"
+   "Entity.LegalForm.EntityLegalFormCode"
+   "Entity.RegistrationAuthority.RegistrationAuthorityID"
+   "Entity.RegistrationAuthority.RegistrationAuthorityEntityID"
+   "Registration.RegistrationStatus"
+   "Registration.LastUpdateDate"])
+
+(def ^:private attr-of-column
+  {"LEI" :company/lei
+   "Entity.LegalName" :company/legal-name
+   ;; ISO 3166-1/-2 ("JP", "US-DE") — the same shape cloud-itonami-lei and
+   ;; repo-taxonomy already use, so jurisdiction filters work across datasets
+   ;; unchanged.
+   "Entity.LegalJurisdiction" :company/jurisdiction
+   "Entity.LegalAddress.Country" :company/country
+   "Entity.LegalAddress.City" :company/city
+   "Entity.LegalAddress.Region" :company/region
+   "Entity.EntityCategory" :company/entity-category
+   "Entity.EntityStatus" :company/entity-status
+   "Entity.LegalForm.EntityLegalFormCode" :company/legal-form
+   "Entity.RegistrationAuthority.RegistrationAuthorityID" :company/registration-authority
+   ;; The national business-registry number (houjin-bangou for JP registration
+   ;; authorities, company number for GB) — the join key from the global
+   ;; identifier down to a domestic registry.
+   "Entity.RegistrationAuthority.RegistrationAuthorityEntityID" :company/registration-no
+   "Registration.RegistrationStatus" :company/lei-registration-status
+   "Registration.LastUpdateDate" :company/lei-last-update})
+
+(defn selection
+  "Given the parsed header row: the index set to materialise, and the
+   index -> attribute map used to name the values."
+  [header]
+  (let [pairs (keep (fn [c] (when-let [i (get header c)] [i (attr-of-column c)]))
+                    wanted-columns)]
+    {:wanted (into #{} (map first) pairs)
+     :attrs (into {} pairs)
+     ;; Nothing after the last wanted column can change the record, so the
+     ;; scan stops there instead of walking the remaining columns of a
+     ;; 338-column row.
+     :max-col (reduce max -1 (map first pairs))}))
+
+(defn row->cells
+  "Sparse parse: column index -> value, for the columns in `wanted` only.
+   Blank cells are dropped rather than stored as empty strings.
+
+   Scans with `index-of` over whole fields instead of walking characters, and
+   writes the value through a volatile rather than returning a per-field
+   tuple: at 3.4M rows × 338 columns those two allocations were the ingest's
+   dominant cost."
+  [line wanted max-col]
+  (let [n (count line)
+        out (volatile! nil)]
+    (loop [i 0 col 0 acc {}]
+      (if (or (> i n) (> col max-col))
+        acc
+        (let [want? (contains? wanted col)
+              _ (vreset! out nil)
+              next-i
+              (if (and (< i n) (= \" (nth line i)))
+                (loop [j (inc i) start (inc i) parts nil]
+                  (let [q (str/index-of line "\"" j)]
+                    (cond
+                      ;; Unterminated quote: the caller re-joins with the next
+                      ;; physical line before we get here, so this is a
+                      ;; malformed final field.
+                      (nil? q)
+                      (do (when want?
+                            (vreset! out (apply str (conj (or parts []) (subs line start n)))))
+                          (inc n))
+
+                      ;; "" is a literal quote, not the end of the field.
+                      (and (< (inc q) n) (= \" (nth line (inc q))))
+                      (recur (+ q 2) (+ q 2)
+                             (if want? (conj (or parts []) (subs line start q) "\"") parts))
+
+                      :else
+                      (do (when want?
+                            (vreset! out (if parts
+                                           (apply str (conj parts (subs line start q)))
+                                           (subs line start q))))
+                          (+ q 2)))))
+                (let [end (or (str/index-of line "," i) n)]
+                  (when want? (vreset! out (subs line i end)))
+                  (inc end)))
+              v @out]
+          (recur next-i (inc col)
+                 (if (and want? (not (str/blank? v))) (assoc acc col v) acc)))))))
+
+(defn row->record
+  "One raw CSV line -> one portable company entity, or nil if the row has no
+   LEI (a malformed line we must not silently turn into a blank, unjoinable
+   entity)."
+  [line {:keys [wanted attrs max-col]}]
+  (let [rec (reduce-kv (fn [m i v] (assoc m (get attrs i) v))
+                       {}
+                       (row->cells line wanted max-col))]
+    (when-not (str/blank? (:company/lei rec))
+      rec)))
+
+(defn publish-id
+  "GLEIF names its members `20260801-0800-gleif-goldencopy-lei2-golden-copy.csv`;
+   keep the stamp so a corpus row can be traced to a publish."
+  [entry-name]
+  (when entry-name
+    (str/replace (str/replace entry-name #"\.csv$" "") #"-golden-copy$" "")))
+
+(def api-source-id
+  "The paginated API, used to fill a *bounded* LEI allowlist. Distinct from the
+   Golden Copy source id so the two never overwrite each other's audit rows."
+  "gleif-api-by-lei")
+
+(defn api-record->record
+  "One `api.gleif.org/api/v1/lei-records` datum -> the same portable company
+   entity `row->record` produces from a Golden Copy row.
+
+   Both paths must agree exactly, because a projection built from either has to
+   be interchangeable on the query plane — a company whose jurisdiction is
+   spelled one way from the bulk file and another way from the API would split
+   into two answers to the same question."
+  [datum]
+  (let [attrs (:attributes datum)
+        entity (:entity attrs)
+        addr (:legalAddress entity)
+        reg (:registration attrs)
+        lei (:lei attrs)
+        put (fn [m k v] (if (str/blank? v) m (assoc m k v)))]
+    (when-not (str/blank? lei)
+      (-> {:company/lei lei}
+          (put :company/legal-name (get-in entity [:legalName :name]))
+          (put :company/jurisdiction (:jurisdiction entity))
+          (put :company/country (:country addr))
+          (put :company/city (:city addr))
+          (put :company/region (:region addr))
+          (put :company/entity-category (:category entity))
+          (put :company/entity-status (:status entity))
+          (put :company/legal-form (get-in entity [:legalForm :id]))
+          (put :company/registration-authority (get-in entity [:registeredAt :id]))
+          (put :company/registration-no (:registeredAs entity))
+          (put :company/lei-registration-status (:status reg))
+          (put :company/lei-last-update (:lastUpdateDate reg))))))
+
+(defn corpus-manifest
+  "Line 1 of a corpus file: the provenance every record in it shares."
+  [{:keys [publish content-sha256 observed-at source-archive record-count]}]
+  (cond-> {:corpus/manifest true
+           :corpus/format :edn-lines
+           :source/dataset dataset
+           :source/authority authority-id
+           :source/licence licence
+           :source/publish publish
+           :source/content-sha256 content-sha256
+           :source/observed-at observed-at}
+    source-archive (assoc :source/archive source-archive)
+    record-count (assoc :corpus/record-count record-count)))

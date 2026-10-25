@@ -1,0 +1,143 @@
+(ns kotoba.security.crosswalk-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.coll :as set]
+            [kotoba.security.crosswalk :as cw]))
+
+(def crosswalk (edn/read-string (slurp (io/file "lib/kotoba.security/policy/control-crosswalk.edn"))))
+(def evidence  (edn/read-string (slurp (io/file "lib/kotoba.security/registers/evidence-index.edn"))))
+(def gaps      (edn/read-string (slurp (io/file "lib/kotoba.security/registers/remaining-operational-gaps.edn"))))
+
+;; ── 写像そのものが腐っていないか ────────────────────────────────────────
+;;
+;; crosswalk が要求する claim 名が evidence-index の語彙に存在しなければ、
+;; その統制は「証拠が無い」ではなく「写像が間違っている」。両者を
+;; 同じ未達として数えると、綴り間違いが永久に未達として居座る。
+
+(deftest every-required-claim-exists-in-the-evidence-vocabulary
+  (let [vocab (set (mapcat :evidence/claims (:evidence evidence)))
+        required (set (mapcat #(or (:control/requires-claims %) #{})
+                              (:crosswalk/controls crosswalk)))
+        unknown (set/set-difference required vocab)]
+    (is (empty? unknown)
+        (str "crosswalk が evidence-index に無い claim を要求している: " unknown))))
+
+(deftest every-required-claim-is-classified-by-strength
+  (let [classified (set (keys (:crosswalk/claim-strength crosswalk)))
+        required (set (mapcat #(or (:control/requires-claims %) #{})
+                              (:crosswalk/controls crosswalk)))
+        unclassified (set/set-difference required classified)]
+    (is (empty? unclassified)
+        (str "強さが分類されていない claim: " unclassified
+             " — 既定値で埋めると設計止まりの証拠が黙って数えられる"))))
+
+;; ── 不変条件: 設計の証拠は Type II の証拠にならない ────────────────────
+
+(deftest type-ii-is-not-ready-and-says-why
+  (let [rep (cw/framework-report crosswalk evidence :soc2-tsc-2017)
+        r (cw/type-ii-readiness rep gaps)]
+    (is (false? (:ready? r)))
+    (is (some? (:why r)))
+    (is (zero? (:operating r))
+        "operating 強度の統制が 1 つでもあるなら、その証拠を確かめてから期待値を変える")
+    (is (= :not-qualified (:operational-readiness r)))
+    (is (seq (:external-operation-required r)))))
+
+(deftest type-ii-refuses-even-when-the-crosswalk-alone-would-say-yes
+  ;; 写像側だけを埋めても ready にならないことを実際に見る。
+  ;; 全 claim を :operating に格上げした crosswalk を作り、証拠も全部与える。
+  (let [all-claims (set (keys (:crosswalk/claim-strength crosswalk)))
+        promoted (assoc crosswalk :crosswalk/claim-strength
+                        (zipmap all-claims (repeat :operating)))
+        ;; 未写像の統制は満たしようがないので、この対照では除く
+        mapped (update promoted :crosswalk/controls
+                       #(filterv (comp seq :control/requires-claims) %))
+        fake-evidence {:evidence [{:evidence/result :passing
+                                   :evidence/claims (vec all-claims)}]}
+        rep (cw/framework-report mapped fake-evidence :soc2-tsc-2017)]
+    (testing "写像と証拠だけを見れば全統制が operating まで届いている"
+      (is (pos? (:total rep)))
+      (is (= (:total rep) (get (:counts rep) :evidenced))))
+    (testing "それでも運用 register が :not-qualified なら ready? は false"
+      (let [r (cw/type-ii-readiness rep gaps)]
+        (is (= (:total rep) (:operating r)))
+        (is (false? (:ready? r)))
+        (is (re-find #"not-qualified" (:why r))
+            "拒否の理由は運用 register を名指しすること — 別の理由で false に
+             なったのを『拒否できた』として数えないため")))
+    (testing "運用 register が qualified になったときだけ ready? が true になる"
+      (let [r (cw/type-ii-readiness rep (assoc gaps :operational/readiness :qualified))]
+        (is (true? (:ready? r)))))))
+
+;; ── 3 種類の『未達』が畳まれていないか ──────────────────────────────────
+
+(deftest unmapped-and-unevidenced-are-distinguishable
+  (let [rep (cw/framework-report crosswalk evidence :soc2-tsc-2017)
+        ti (cw/type-i-readiness rep)]
+    (is (pos? (:not-mapped ti))
+        "未写像が 0 になったら、この期待値ではなく写像の増えたことを確かめる")
+    ;; ⚠ `:unevidenced` は 2026-08-23 時点で 0 だが、これは統制が満たされている
+    ;; ことの証拠**ではない**。初版の写像は「evidence-index に実在する claim」
+    ;; だけを書いたので、構造上 unevidenced が出ない。本当の穴は `:not-mapped`
+    ;; の側に寄っている。写像を増やすと unevidenced は増える —— それは劣化
+    ;; ではなく、可視化である。
+    (is (zero? (:unevidenced ti))
+        "0 でなくなったら、写像が増えて実際の穴が見えたということ。期待値を上げる")
+    (is (zero? (:stale-claim ti)))
+    (is (= (:total ti) (+ (:evidenced ti) (:unevidenced ti)
+                          (:not-mapped ti) (:stale-claim ti)))
+        "分母が status の総和に一致しない = どれかが黙って落ちている")))
+
+(deftest control-strength-is-the-minimum-not-the-maximum
+  (let [cwk {:crosswalk/claim-strength {:a :design :b :operating}
+             :crosswalk/controls [{:control/framework :f :control/id "X"
+                                   :control/requires-claims #{:a :b}}]}
+        r (cw/control-status cwk #{:a :b} (first (:crosswalk/controls cwk)))]
+    (is (= :evidenced (:control/status r)))
+    (is (= :design (:control/strength r))
+        "1 本が operating でも、設計止まりの claim が混じれば統制は設計止まり")))
+
+(deftest a-stale-claim-is-reported-as-stale-not-as-missing-evidence
+  (let [cwk {:crosswalk/claim-strength {:a :design}
+             :crosswalk/controls [{:control/framework :f :control/id "X"
+                                   :control/requires-claims #{:a :typo-claim}}]}
+        r (cw/control-status cwk #{:a} (first (:crosswalk/controls cwk)))]
+    (is (= :stale-claim (:control/status r)))
+    (is (= #{:typo-claim} (:control/stale-claims r)))
+    (is (nil? (:control/strength r)))))
+
+(deftest failed-evidence-is-not-evidence
+  (let [ev {:evidence [{:evidence/result :failing :evidence/claims [:a]}
+                       {:evidence/result :passing :evidence/claims [:b]}]}]
+    (is (= #{:b} (cw/evidence-claims ev)))))
+
+(deftest the-nine-unmapped-tsc-criteria-are-the-real-holes
+  ;; 未写像の 9 件は「写像を書き忘れた」のではなく、**割り当てられる証拠が
+  ;; この repo に 1 つも無い** 規準である。名前で固定しておき、証拠ができたら
+  ;; ここが落ちて写像を書くことを強制する。
+  (let [rep (cw/framework-report crosswalk evidence :soc2-tsc-2017)
+        unmapped (->> (:controls rep)
+                      (filter #(= :not-mapped (:control/status %)))
+                      (map :control/id) sort vec)]
+    (is (= ["CC1.1" "CC1.4" "CC2.3" "CC3.3" "CC6.2" "CC6.4" "CC6.5" "CC7.5" "CC9.1"]
+           unmapped)
+        (str "未写像の集合が変わった: " unmapped
+             " — 証拠が増えたなら写像を書き、規準が増えたなら期待値を更新する"))))
+
+;; ── 現在地の記録（数値が動いたら読み直させる） ─────────────────────────
+
+(deftest measured-position-2026-08-26
+  (let [tsc (cw/framework-report crosswalk evidence :soc2-tsc-2017)
+        iso (cw/framework-report crosswalk evidence :iso-27001-2022)]
+    (is (= 33 (:total tsc)))
+    ;; 14 since 2026-08-26: A.8.7 (protection against malware) was added.
+    ;; It arrives :not-mapped, so the register got *worse-looking* and truer —
+    ;; the control was previously absent, which is the one state in which a gap
+    ;; cannot be reported at all.
+    (is (= 14 (:total iso)))
+    (is (zero? (get (:strengths tsc) :operating 0)))
+    (is (zero? (get (:strengths iso) :operating 0)))
+    (is (= {:not-mapped 9 :evidenced 24} (:counts tsc)))
+    (is (= {:design 13 :implementation 11} (:strengths tsc)))
+    (is (= {:not-mapped 6 :evidenced 8} (:counts iso)))))

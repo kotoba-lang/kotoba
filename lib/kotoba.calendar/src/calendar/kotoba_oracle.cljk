@@ -1,0 +1,245 @@
+(ns calendar.kotoba-oracle
+  "Runs the shipped decision cores.
+
+  `src/calendar/*.kotoba` holds the decisions;
+  `resources/calendar/oracle/*.kir.edn` is what was compiled from them and
+  what ships. This namespace is the seam, and it is deliberately thin: it
+  resolves a resource, executes an export, and decides nothing.
+
+  ## Why this exists
+
+  `overlaps?` landed in both languages with `overlaps-parity-test` binding
+  them, and that test earned its place — it was written because the two
+  disagreed, and the one that ran in production was the wrong one. But two
+  implementations bound by a test are still two implementations, and the
+  measure of this migration is not how many host lines went away; it is
+  whether the AUTHORITY moved. Until now it had not: the `.kotoba` was a
+  checked replica and the `.cljc` was what ran. Now the `.kotoba` is what
+  runs, and `model.cljc` keeps the halves that are not decisions — reading two
+  maps, refusing an absent instant, and putting the instants into the guest's
+  domain.
+
+  ## No fallback
+
+  A missing or unreadable artifact throws. It does not quietly run a host
+  reimplementation, because there is no longer one to run, and because a
+  silent fallback is how a decision stops being the one that shipped.
+
+  ## What is delegated is written down, not remembered
+
+  `cores`, `delegated` and `host-answered` are data because the gates over
+  them are only as wide as their subject list. A gate that names one core is
+  a gate over one core: `kotoba-lang/com-cloudflare` had nine shipped
+  artifacts and a drift check over one of them, and a mutation of a
+  production artifact passed its whole suite. Here every core in `src/` has
+  to appear in `cores`, and every export of every core has to appear in
+  either `delegated` or `host-answered` — so an export cannot be added, or a
+  delegation dropped, without something failing."
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.kir :as ir]
+            #?(:clj [kotoba.io :as io])))
+
+(def cores
+  "Oracle id -> the .kotoba it was compiled from, under src/.
+
+  Every `.kotoba` under `src/` must be here; `kotoba-oracle-test` reads the
+  directory and says so. Shipping a core is not the same as calling it —
+  `:validate` ships both its exports and only one of them is delegated —
+  but a core that does not ship is a core the drift gate cannot see."
+  {:model "calendar/model.kotoba"
+   :validate "calendar/validate.kotoba"})
+
+(def delegated
+  "Oracle id -> the exports a host in this library actually calls.
+
+  This is the subject list of the delegation gate: for each entry, the test
+  substitutes a core that answers differently and requires the host to follow.
+  Adding a call without adding it here leaves that call ungated, which is why
+  the gate reads this map rather than a list somebody typed into a test."
+  {:model '#{overlaps?}
+   :validate '#{event-valid?}})
+
+(def host-answered
+  "Exports that ship but that no host calls, each with the reason it stays on
+  the host side. Prose in a commit message is not checkable; this is.
+
+  The measured line (ADR-2608112100) is not `collection or scalar`, it is
+  whether the value crossing the entry boundary grows with the domain. An
+  event is three scalars whatever the calendar does; a calendar's events map
+  is as large as the calendar.
+
+  Measured 2026-08-12 at the pinned interpreter, growing a calendar one event
+  at a time and handing it back across the boundary each time:
+
+      12 events -> 12
+      13 events -> ADT value exceeds node limit
+
+  Thirteen. The same number `kotoba-lang/mokuroku` measured for a file
+  catalogue, reached here by a calendar with a fortnight of meetings in it.
+  These are not deferred work; a calendar that stopped working at thirteen
+  events would not be a calendar."
+  {:model
+   {'new-calendar
+    "constructs the events map the other four hold; not a decision"
+    'new-event
+    "a positional constructor — `record` builds the same value without a
+     round trip through the interpreter, and there is no rule to get wrong"
+    'add-event
+    "holds [:map :keyword event] in the guest, and the map is the calendar,
+     so it grows with the domain: refused at 13 events (measured). `assoc-in`
+     decides nothing, so nothing is being kept from the core"
+    'event-by-id
+    "same map, same growth, same measured ceiling; get-in decides nothing"
+    'events-count
+    "same map, same growth, same measured ceiling; count decides nothing"}
+   :validate
+   {'valid?
+    "takes the whole calendar, so it inherits that ceiling — and answers
+     `false` for any calendar over 8 events by construction, which is a
+     narrower question than the one `validate.cljc/valid?` is asked (measured:
+     9 well-formed events -> false). Delegating it would silently narrow the
+     open-schema model to the bounded profile, which is the one thing that
+     profile promised not to do. The rule inside it, `event-valid?`, IS
+     delegated — that is where the decision was"}})
+
+(defn resource-path [id]
+  (str "calendar/oracle/" (name id) ".kir.edn"))
+
+(def ^:private registered
+  "Pre-parsed KIR, for runtimes with no classpath (a bundler injects here)."
+  (atom {}))
+
+(defn register-kir!
+  "Install a parsed KIR for `id`, bypassing the resource read."
+  [id kir]
+  (swap! registered assoc id kir)
+  kir)
+
+(defn deregister-kir!
+  "Drop a registration, so `id` reads the shipped artifact again."
+  [id]
+  (swap! registered dissoc id)
+  nil)
+
+(defn- read-artifact [id]
+  #?(:clj
+     (let [path (resource-path id)]
+       (if-let [url (io/resource path)]
+         (edn/read-string (slurp url))
+         (throw (ex-info "shipped decision core is missing — run `kbb -M:test:gen`"
+                         {:oracle id :path path}))))
+     :cljs
+     (throw (ex-info "no classpath on this runtime — register-kir! first"
+                     {:oracle id}))))
+
+(def ^:private cache (atom {}))
+
+(defn kir
+  "The shipped KIR for `id`, read once."
+  [id]
+  ;; A registration wins over the cache: it is an explicit instruction, and a
+  ;; caller that registers after something already read the artifact means the
+  ;; registration, not the read.
+  (or (get @registered id)
+      (get @cache id)
+      (let [loaded (read-artifact id)]
+        (swap! cache assoc id loaded)
+        loaded)))
+
+(defn call
+  "Execute an export of a shipped core. Args and result are guest ABI
+  values; see `record` for the one used here that is not a plain scalar."
+  [id export args]
+  (ir/execute (kir id) (if (symbol? export) export (symbol (name export))) (vec args)))
+
+(defn exports
+  "Every export the shipped core for `id` declares, as symbols.
+
+  The artifact's `:exports`, not its `:functions` — a core's internal helpers
+  are compiled and listed there too, and they are not a surface anything can
+  call across the entry boundary."
+  [id]
+  (set (:exports (kir id))))
+
+(defn signature
+  "The shipped declaration of `export`: `:name`, `:param-types`, `:result`.
+
+  Read out of the artifact rather than out of a host copy, so a rename or a
+  reordering in the `.kotoba` is answerable without asking the `.kotoba`."
+  [id export]
+  (let [export (symbol (name export))]
+    (or (first (filter #(= export (:name %)) (:functions (kir id))))
+        (throw (ex-info "shipped core does not declare that export"
+                        {:oracle id :export export})))))
+
+(defn param-types
+  "Declared parameter types of `export`, in order."
+  [id export]
+  (:param-types (signature id export)))
+
+(defn record
+  "Build a guest record argument: the descriptor, then fields in DECLARED
+  order. Declared order, not map order — a record whose fields are permuted
+  matches nothing and is refused, which is the behaviour you want, but only if
+  you know that is what a permutation costs."
+  [schema field-values]
+  (into [schema] field-values))
+
+(def event-type
+  "`:calendar/event` as BOTH cores declare it.
+
+  Spelled once here rather than once per host, because two hosts spelling it
+  are two places that can drift from the artifact independently. It is not
+  read out of the artifact — a host that derived the shape from the artifact
+  would follow a shape change silently, and this record is the interface, not
+  an internal. `kotoba-oracle-test` pins this literal against what each core
+  declares, in both directions, so a change in either `.kotoba` fails there."
+  [:record :calendar/event [[:id :keyword] [:start :i64] [:end :i64]]])
+
+(defn i64
+  "Host integer -> the guest's `:i64`.
+
+  Not a no-op, and the reason is measured. `kir/execute` coerces a TOP-LEVEL
+  `:i64` argument itself and accepts a plain host integer for it — but a
+  `:i64` FIELD INSIDE a record is checked by `value/bounded-typed-value!`,
+  which on ClojureScript requires a `js/BigInt` and rejects a `js/Number`
+  outright. Every argument this seam passes is a record field.
+
+  Measured 2026-08-12 at the pinned interpreter, under nbb:
+
+      overlaps? [0,10) vs [5,15)
+        -> THREW: value is not a signed i64 {:phase :value}
+
+  So `model.cljc/overlaps?` — delegated the day before — threw on every call
+  on ClojureScript, while the JVM suite was green. The JVM suite is
+  structurally unable to see this: `(long n)` and `n` are the same value
+  there. `scripts/cljs-boundary-check.cljk` is the reproduction, and it is
+  the only thing in this repository that can fail for this reason.
+
+  There is no inverse here because no export returns `:i64` — `overlaps?` and
+  `event-valid?` both return `:bool`, which `kir/execute` boxes to a host
+  boolean at the boundary. Add one with the first export that does."
+  [n]
+  #?(:clj (long n) :cljs (js/BigInt n)))
+
+(defn instant-ranks
+  "An order-preserving embedding of `instants` into the `:i64` the guest
+  speaks: each value's rank is how many of them compare strictly below it,
+  converted with `i64` so it is a guest value and not a host number.
+
+  Only `compare` is consulted, which is the ordering this library has always
+  used, and rank is monotone in it — `rank x < rank y` exactly when
+  `(neg? (compare x y))`. So a guest comparison gets the same answer it would
+  have got on the instants themselves, whether those are the ISO-8601 strings
+  this model stores or the integers a test hands it. This is not a rule; it is
+  putting a rule's inputs into its domain, which is why it lives in the seam
+  and why both hosts share the one copy.
+
+  One consequence worth naming: ranking asks `compare` about every pair, where
+  an inline conjunction would stop at the first guard that failed. Instants
+  that cannot be compared with each other now throw where a malformed event
+  could previously short-circuit to `false`. Both are refusals of the same
+  data; homogeneous instants — everything this model produces — are
+  unaffected."
+  [instants]
+  (mapv (fn [x] (i64 (count (filter #(neg? (compare % x)) instants)))) instants))

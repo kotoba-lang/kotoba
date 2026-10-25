@@ -1,0 +1,94 @@
+(ns ekyc.identity-session
+  "Private, event-sourced session evidence. Generalized Beta evidence with a
+  Subjective Logic projection; heuristic masses, not calibrated probabilities.
+  No event may be accepted from a browser without the signed observer host.")
+
+(def version "kotoba-session-evidence-2026-09-v1")
+(def kinds #{:authenticated :step-up :new-device :behavior-alert :resolve :revoke})
+(def research-actions #{:code-review :vulnerability-triage :remediation})
+(defn text? [x] (and (string? x) (<= 1 (count x) 512)))
+(defn fresh? [start end now] (and (number? start) (number? end) (<= 0 start now) (< now end)))
+(defn opinion [session now]
+  (let [auth (:controller session)
+        age (if (number? (:at auth)) (max 0 (- now (:at auth))) 0)
+        r (if (fresh? (:at auth) (:expires-at auth) now)
+            (* (case (:kind auth) :authenticated 18 :step-up 198 0) (js/Math.pow 2 (- (/ age 1800000)))) 0)
+        ;; Unresolved adverse evidence never decays itself away.
+        s (reduce + 0 (map #(get {:new-device 2 :behavior-alert 18} % 0) (keys (:alerts session))))
+        total (+ 2 r s)]
+    {:belief (/ r total) :disbelief (/ s total) :uncertainty (/ 2 total)
+     :base-rate 0.5 :projected-value (/ (+ r 1) total)
+     :alpha (+ r 1) :beta (+ s 1) :calibrated false
+     :interval-kind :none}))
+
+(defn decision [state session-id principal holder action now]
+  (let [session (get-in state [:sessions session-id]) controller (:controller session)
+        source (get-in state [:observers (:observer controller)])
+        {:keys [belief disbelief uncertainty]} (opinion session now)]
+    (cond
+      (not (and session (text? principal) (text? holder) (= principal (:principal session)) (= holder (:holder-key-id session)))) :session-mismatch
+      (= :revoked (:status session)) :session-revoked
+      (not= :active (:status session)) :session-not-active
+      (>= (count (:events session)) 1024) :session-event-limit
+      (not (fresh? (:created-at session) (:expires-at session) now)) :session-expired
+      (not (and (= :active (:status source)) (= (:key-id source) (:key-id controller))
+                (= (:key-thumbprint source) (:key-thumbprint controller))
+                (contains? (:kinds source) (:kind controller)))) :observer-reverification-required
+      (not (contains? research-actions action)) :action-not-supported
+      ;; Open alerts require explicit signed resolution, never countervailing points.
+      (seq (:alerts session)) :step-up-required
+      (or (< belief 0.85) (> disbelief 0.05) (> uncertainty 0.20)) :step-up-required
+      :else nil)))
+
+(defn projection [state session-id principal holder action now]
+  (let [session (get-in state [:sessions session-id]) reason (decision state session-id principal holder action now)]
+    {:policyVersion version :sessionRef (:id session) :action (name action)
+     :decision (if reason "deny" "allow") :reason (when reason (name reason))
+     :opinion (select-keys (opinion session now) [:belief :disbelief :uncertainty :projected-value :calibrated])
+     :evaluatedAt now
+     :expiresAt (if reason now (min (+ now 15000) (:expires-at session) (get-in session [:controller :expires-at])))}))
+
+(defn transition [state event now]
+  (let [{:keys [session-id principal holder-key-id kind event-id observer at]} event
+        registry (get-in state [:observers observer]) current (get-in state [:sessions session-id])
+        valid (and (= version (:policy-version event)) (text? session-id) (text? principal) (text? holder-key-id)
+                   (text? event-id) (text? (:evidence-ref event)) (true? (:observer-signature-verified event))
+                   (= :active (:status registry)) (contains? (:kinds registry) kind) (contains? kinds kind)
+                   (= (:key-id registry) (:observer-key-id event))
+                   (text? (:key-thumbprint registry)) (= (:key-thumbprint registry) (:observer-key-thumbprint event))
+                   (number? at) (<= 0 at now) (<= (- now at) 120000))
+        same? (and current (= principal (:principal current)) (= holder-key-id (:holder-key-id current)))
+        finish (fn [session]
+                 {:ok true :state (assoc-in state [:sessions session-id]
+                                           (-> session (assoc :last-at (max at (or (:last-at session) at)))
+                                               (assoc-in [:events event-id] {:kind kind :observer observer :at at :evidence-ref (:evidence-ref event)})))})]
+    (cond
+      (not valid) {:ok false :reason :observer-event-not-authorized}
+      (and current (not same?)) {:ok false :reason :session-binding-mismatch}
+      (get-in current [:events event-id]) {:ok false :reason :duplicate-session-event}
+      (and current (< at (:last-at current)) (not (#{:revoke :new-device :behavior-alert} kind)))
+      {:ok false :reason :out-of-order-session-event}
+      (>= (count (:events current)) 1024) {:ok false :reason :session-event-limit}
+      (= :revoked (:status current)) {:ok false :reason :session-revoked}
+      (and current (not (fresh? (:created-at current) (:expires-at current) now))) {:ok false :reason :session-expired}
+      (= kind :authenticated)
+      (if current {:ok false :reason :session-already-open}
+        (finish {:id session-id :principal principal :holder-key-id holder-key-id :status :active
+                 :created-at at :expires-at (+ at 1800000) :alerts {} :events {}
+                 :controller {:observer observer :key-id (:key-id registry) :key-thumbprint (:key-thumbprint registry) :kind kind :event-id event-id :at at :expires-at (+ at 1800000) :mass 18}}))
+      (not same?) {:ok false :reason :session-not-open}
+      (= kind :step-up)
+      ;; Replace the controller evidence; do not sum repeated authentication.
+      (finish (assoc current :controller {:observer observer :key-id (:key-id registry) :key-thumbprint (:key-thumbprint registry) :kind kind :event-id event-id :at at :expires-at (min (:expires-at current) (+ at 900000)) :mass 198}))
+      (#{:new-device :behavior-alert} kind)
+      ;; One bounded mass per detector category; retain the newest unresolved finding.
+      (finish (if (> (get-in current [:alerts kind :at] -1) at) current
+                  (assoc-in current [:alerts kind] {:event-id event-id :mass (if (= kind :new-device) 2 18)
+                                                   :at at :evidence-ref (:evidence-ref event)})))
+      (= kind :resolve)
+      (let [target (:target-event-id event) alert (first (filter #(= target (:event-id (val %))) (:alerts current)))]
+        (if (and alert (text? (:resolution-ref event)) (= true (:benign-confirmed event)))
+          (finish (update current :alerts dissoc (key alert)))
+          {:ok false :reason :unresolved-alert-reference}))
+      (= kind :revoke) (finish (assoc current :status :revoked :revoked-at at))
+      :else {:ok false :reason :unknown-session-event})))
