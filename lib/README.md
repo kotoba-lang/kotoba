@@ -104,6 +104,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `kotoba.kamiAppSarutahikoFactory` | `kotoba.kamiAppSarutahikoFactory/src` | `kotoba.sarutahiko-factory`, `kotoba.sarutahiko-factory.clashes`, `kotoba.sarutahiko-factory.construction-order`, `kotoba.sarutahiko-factory.factory` (Kotoba project library) |
 | `kotoba.ioStorj` | `kotoba.ioStorj/src` | `storj.core`, `storj.gateway`, `storj.linkshare`, `storj.protocols` (Kotoba project library) |
 | `kotoba.kotobaDatom` | `kotoba.kotobaDatom/src` | `kotoba.datom` (Kotoba project library) |
 | `kotoba.glyph` | `kotoba.glyph/src` | `kotoba.glyph`, `kotoba.glyph.atlas`, `kotoba.glyph.constants`, `kotoba.glyph.dynamic` (Kotoba project library) |
