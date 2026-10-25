@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.denrei` | `kotoba.denrei/src` | `denrei.cacao`, `denrei.channelport`, `denrei.cli`, `denrei.coordllm` (Kotoba project library) |
 | `kotoba.computerUse` | `kotoba.computerUse/src` | `computeruse.agent`, `computeruse.android`, `computeruse.backend`, `computeruse.backends` (Kotoba project library) |
 | `kotoba.comfyui` | `kotoba.comfyui/src` | `comfyui.clip.encoder`, `comfyui.clip.tokenizer`, `comfyui.diffusion.architecture`, `comfyui.diffusion.model` (Kotoba project library) |
 | `kotoba.browserAgent` | `kotoba.browserAgent/src` | `browseragent.browser.live`, `browseragent.browser.provider`, `browseragent.browser.session`, `browseragent.events` (Kotoba project library) |

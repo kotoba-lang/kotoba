@@ -1,0 +1,302 @@
+(ns denrei.governor-contract-test
+  "The propose→draft-only contract as executable tests — denrei's analog of
+  kekkai's/tayori's/koyomi's governor_contract_test.
+  Invariant: the actor never posts what the MembershipGovernor would reject;
+  drafting never auto-actuates; posting always routes to a human regardless
+  of phase; membership makes private channels structurally unreachable."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [kaisha.model :as k]
+            [denrei.store :as store]
+            [denrei.channelport :as channelport]
+            [denrei.coordllm :as coordllm]
+            [denrei.operation :as op]))
+
+(defn- fresh []
+  (let [s (store/seed-db) posted (atom {}) delivered (atom [])
+        cp (channelport/mock-channelport posted #(swap! delivered conj %))]
+    [s (op/build s {:channelport cp}) posted delivered]))
+
+(defn- ctx [phase] {:phase phase})
+(defn- run [actor tid req phase] (g/run* actor {:request req :context (ctx phase)} {:thread-id tid}))
+
+(defn- draft-req [message channel]
+  {:op :message/draft :activity "act-standup" :space "gftd" :channel channel :message message})
+(defn- post-req [message channel]
+  {:op :message/post :activity "act-standup" :space "gftd" :channel channel :message message})
+
+(defn- content
+  ([message body] (content message body {}))
+  ([message body attrs]
+   {:tenant "cloud-itonami" :space "gftd" :channel "general"
+    :message (k/message message (merge {:kaisha/author "denrei"
+                                        :kaisha/body body
+                                        :kaisha/at "2026-07-13T09:00:00Z"}
+                                       attrs))}))
+
+(defn- fixed-advisor
+  "Deterministic advisor: returns `c` for :message/draft, defers to the mock
+  for :message/post (pass-through over the committed draft)."
+  [c]
+  (reify coordllm/Advisor
+    (-advise [_ st req]
+      (if (= :message/draft (:op req))
+        {:recommendation :draft :content c :summary "x" :rationale "x"
+         :cites [] :redactions [] :effect :draft :confidence 0.9}
+        (coordllm/infer st req)))))
+
+(deftest ingest-always-records
+  (testing "observe path records a ground fact regardless of phase"
+    (let [[s actor] (fresh)
+          res (run actor "i" {:op :space/register :space "gftd2"
+                              :value (merge (k/space "gftd2") {:tenant "cloud-itonami"})} 0)]
+      (is (= :record (get-in res [:state :disposition])))
+      (is (= "cloud-itonami" (:tenant (store/space s "gftd2")))))))
+
+(deftest clean-draft-auto-commits-no-human-needed
+  (testing "phase 3: a clean+confident draft is data, not actuation — it commits without interrupting"
+    (let [[s actor] (fresh)
+          res (run actor "d" (draft-req "msg-standup" "general") 3)]
+      (is (not= :interrupted (:status res)) "drafting is not high-stakes when clean")
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= :proposed (:status (store/draft-of s "msg-standup"))))
+      (is (= "cloud-itonami" (:tenant (:content (store/draft-of s "msg-standup")))))
+      (is (= "denrei" (get-in (store/draft-of s "msg-standup") [:content :message :kaisha/author]))))))
+
+(deftest missing-phase-context-does-not-grant-max-autonomy
+  ;; default-phase is the fallback both when :phase is entirely absent
+  ;; from context (denrei.operation) and when an unrecognized phase
+  ;; number is passed (phase/gate). It used to be 3 -- where
+  ;; :message/draft can auto-commit -- so a caller that simply forgot to
+  ;; set :phase silently got MAXIMUM autonomy instead of the safe
+  ;; "start narrow" default.
+  (testing "omitting :phase from context still requires human approval on a clean draft"
+    (let [[s actor] (fresh)
+          res (g/run* actor {:request (draft-req "msg-standup" "general") :context {}}
+                      {:thread-id "mp"})]
+      (is (not= :commit (get-in res [:state :disposition]))
+          "a clean draft must not auto-commit when :phase is unset")
+      (is (nil? (store/draft-of s "msg-standup")) "SSoT untouched without explicit phase"))))
+
+(deftest no-actuation-invariant
+  (testing "a draft proposal that claims it already posted is held"
+    (let [[s _] (fresh)
+          bad-adv (reify coordllm/Advisor
+                    (-advise [_ _ _] {:recommendation :draft
+                                      :content (content "msg-standup" "standup")
+                                      :effect :post :summary "x" :rationale "x"
+                                      :cites [] :redactions [] :confidence 0.9}))
+          actor (op/build s {:advisor bad-adv})
+          res (g/run* actor {:request (draft-req "msg-standup" "general") :context (ctx 3)}
+                      {:thread-id "na"})]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:no-actuation} (-> (store/ledger s) last :basis))))))
+
+(deftest tenant-mismatch-is-held
+  (testing "a draft that claims a tenant other than the driving activity's repo is a hijack — HOLD"
+    (let [[s _] (fresh)
+          actor (op/build s {:advisor (fixed-advisor (assoc (content "msg-standup" "standup")
+                                                            :tenant "rogue-tenant"))})
+          res (g/run* actor {:request (draft-req "msg-standup" "general") :context (ctx 3)}
+                      {:thread-id "tm"})]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:tenant-mismatch} (-> (store/ledger s) last :basis))))))
+
+(deftest target-mismatch-is-held
+  (testing "the LLM silently switching the channel out from under the request is a hijack — HOLD"
+    (let [[s _] (fresh)
+          actor (op/build s {:advisor (fixed-advisor (assoc (content "msg-standup" "standup")
+                                                            :channel "ops"))})
+          res (g/run* actor {:request (draft-req "msg-standup" "general") :context (ctx 3)}
+                      {:thread-id "cm"})]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:target-mismatch} (-> (store/ledger s) last :basis))))))
+
+(deftest private-channel-without-membership-is-held
+  (testing "#ops excludes the actor's member identity → structurally unpostable, HOLD"
+    (let [[s actor] (fresh)
+          res (run actor "ops" (draft-req "msg-ops" "ops") 3)]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:not-a-member} (-> (store/ledger s) last :basis))))))
+
+(deftest orphan-reply-is-held-via-kaisha-validate
+  (testing "the surface model's own invariants are the governor's floor — a reply
+            whose thread parent doesn't exist in the channel is model-invalid"
+    (let [[s _] (fresh)
+          actor (op/build s {:advisor (fixed-advisor
+                                        (content "msg-reply" "on it"
+                                                 {:kaisha/thread "msg-nonexistent"}))})
+          res (g/run* actor {:request (draft-req "msg-reply" "general") :context (ctx 3)}
+                      {:thread-id "or"})]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:model-invalid} (-> (store/ledger s) last :basis))))))
+
+(deftest posting-always-requires-human-signoff
+  (testing "even a clean draft never auto-posts — it interrupts for a human"
+    (let [[s actor _posted delivered] (fresh)
+          _  (run actor "d2" (draft-req "msg-standup" "general") 3)
+          r1 (run actor "p2" (post-req "msg-standup" "general") 3)]
+      (is (= :interrupted (:status r1)) "posting is high-stakes → always human")
+      (is (empty? @delivered) "nothing delivered before sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "p2" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :posted (:status (store/draft-of s "msg-standup"))))
+        (is (= 1 (count @delivered)))))))
+
+(deftest consent-blocked-mention-post-is-held-and-unoverridable
+  (testing "a draft mentioning @blocked commits (drafting doesn't gate on consent)
+            but :message/post HOLDs — never reaches a human"
+    (let [[s _ _ delivered] (fresh)
+          actor (op/build s {:advisor (fixed-advisor (content "msg-blocked" "@blocked please review"))
+                             :channelport (channelport/mock-channelport (atom {}) #(swap! delivered conj %))})
+          _   (g/run* actor {:request (draft-req "msg-blocked" "general") :context (ctx 3)} {:thread-id "db"})
+          res (g/run* actor {:request (post-req "msg-blocked" "general") :context (ctx 3)} {:thread-id "pb"})
+          basis (-> (store/ledger s) last :basis)]
+      (is (= :proposed (:status (store/draft-of s "msg-blocked"))) "the draft itself committed")
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:consent-blocked} basis))
+      (is (empty? @delivered)))))
+
+(deftest phase0-disables-assessments
+  (let [[s actor] (fresh)
+        res (run actor "p0" (draft-req "msg-standup" "general") 0)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))))
+
+(deftest duplicate-body-escalates-but-does-not-hold
+  (testing "a body identical to an existing channel message is a SOFT escalate, not a HARD hold"
+    (let [[s _] (fresh)
+          actor (op/build s {:advisor (fixed-advisor (content "msg-dup" "standup: 進捗どうですか"))})
+          res (g/run* actor {:request (draft-req "msg-dup" "general") :context (ctx 3)}
+                      {:thread-id "dup"})]
+      (is (= :interrupted (:status res)) "duplicate-body escalates to a human, it doesn't auto-hold")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "dup" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition]))
+            "a human CAN approve past a duplicate body (unlike a hard violation)")
+        (is (= :proposed (:status (store/draft-of s "msg-dup"))))))))
+
+(deftest first-contact-mention-forces-escalate-even-at-draft-time
+  (testing "a first-contact mention is not a hard violation but IS high-stakes, even for :message/draft"
+    (let [[s _] (fresh)
+          actor (op/build s {:advisor (fixed-advisor (content "msg-newbiz" "@newbiz welcome aboard"))})
+          res (g/run* actor {:request (draft-req "msg-newbiz" "general") :context (ctx 3)}
+                      {:thread-id "nb"})]
+      (is (= :interrupted (:status res)))
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "nb" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= :proposed (:status (store/draft-of s "msg-newbiz"))))))))
+
+(deftest unrecognized-op-is-held
+  (testing "fail-closed: an op the governor doesn't recognize is a hard violation, not a silent pass"
+    (let [[s actor] (fresh)
+          res (run actor "uo" {:op :message/teleport :activity "act-standup"
+                               :space "gftd" :channel "general" :message "msg-standup"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:unrecognized-op} (-> (store/ledger s) last :basis))))))
+
+(deftest missing-activity-is-held-even-with-rogue-tenant
+  (testing "a nonexistent activity-id is a hard violation on its own — it must never silently
+            no-op tenant-isolation and let a rogue :tenant auto-commit"
+    (let [[s _] (fresh)
+          actor (op/build s {:advisor (fixed-advisor (assoc (content "msg-standup" "standup")
+                                                            :tenant "rogue-tenant"))})
+          res (g/run* actor {:request {:op :message/draft :activity "act-missing"
+                                       :space "gftd" :channel "general" :message "msg-standup"}
+                             :context (ctx 3)}
+                      {:thread-id "ma"})]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-activity} (-> (store/ledger s) last :basis))))))
+
+(deftest post-without-prior-draft-is-held-not-a-phantom-post
+  (testing ":message/post on a message that was never drafted must HOLD, not deliver a phantom
+            nil-content post + write a false :posted/:committed ledger fact"
+    (let [[s actor _posted delivered] (fresh)
+          res (run actor "nodraft" (post-req "msg-standup" "general") 3)
+          ledger (store/ledger s)]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-draft} (-> ledger last :basis)))
+      (is (nil? (:status (store/draft-of s "msg-standup"))) "no draft was ever fabricated")
+      (is (empty? @delivered) "the deliverer was never invoked for a phantom post")
+      (is (not-any? #{:committed} (map :t ledger)) "no false :committed ledger fact was written"))))
+
+(deftest post-uses-governed-content-not-a-stale-commit-time-store-read
+  (testing "TOCTOU: mutating the stored draft's body WHILE a post approval is pending
+            (e.g. a legitimate concurrent :message/draft revision on the same message) must
+            not let a since-injected @blocked mention slip into what actually gets posted —
+            the human approved the ORIGINALLY governed content, so that's what must be sent"
+    (let [[s actor posted delivered] (fresh)
+          _  (run actor "d5" (draft-req "msg-standup" "general") 3)
+          r1 (run actor "p5" (post-req "msg-standup" "general") 3)]
+      (is (= :interrupted (:status r1)) "posting always interrupts for human sign-off")
+      ;; Simulate a concurrent draft mutation landing on the SAME message while
+      ;; this post approval sits in the interrupt queue — inject a blocked mention.
+      (let [governed (store/draft-of s "msg-standup")]
+        (store/record-datom! s {:kind :draft :id "msg-standup"
+                                :value {:content (assoc-in (:content governed)
+                                                           [:message :kaisha/body]
+                                                           "@blocked leaked body")}}))
+      (is (= :blocked (:consent (store/contact s "blocked"))))
+      ;; Approve the ORIGINAL (pre-mutation) post request.
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "p5" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])) "approving a clean, already-governed post still commits")
+        (is (= 1 (count @delivered)) "post! ran exactly once")
+        (is (not (some #{"blocked"} (:mentions (get @posted "msg-standup"))))
+            "the since-injected blocked mention never appears in what was actually posted")
+        (is (not-any? #(some #{"blocked"} (:mentions %)) @delivered)
+            "the deliverer never received the blocked mention either")))))
+
+(deftest post-delivers-the-governed-store-draft-not-a-divergent-proposal
+  (testing "governor/check's :message/post recheck validates the STORE'S
+            draft (see governor.cljc content-of), never `proposal` -- so the
+            delivered content must come from that same checked draft, not
+            from a divergent proposal the recheck never actually validated.
+            A forged/buggy post-LLM proposal for :message/post (a different
+            body entirely) must never reach channelport/post! just because
+            the governor's membership/consent/tenant recheck passed on the
+            UNRELATED, already-clean store draft."
+    (let [[s actor posted delivered] (fresh)
+          _ (run actor "gov-draft" (draft-req "msg-standup" "general") 3)
+          governed-body (get-in (store/draft-of s "msg-standup") [:content :message :kaisha/body])
+          bad-adv (reify coordllm/Advisor
+                    (-advise [_ _ _]
+                      {:recommendation :post
+                       :content (content "msg-standup" "FORGED — never governed")
+                       :summary "x" :rationale "x" :cites [] :redactions []
+                       :effect :post :confidence 0.95}))
+          adversarial-actor (op/build s {:advisor bad-adv
+                                         :channelport (channelport/mock-channelport posted #(swap! delivered conj %))})
+          r1 (run adversarial-actor "gov-post" (post-req "msg-standup" "general") 3)]
+      (is (= :interrupted (:status r1)) "still requires human sign-off")
+      (let [r2 (g/run* adversarial-actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "gov-post" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= 1 (count @delivered)) "post! ran exactly once")
+        (is (= governed-body (get-in (get @posted "msg-standup") [:body]))
+            "delivered body is the GOVERNED store draft, not the adversarial proposal")
+        (is (not= "FORGED — never governed" (get-in (get @posted "msg-standup") [:body]))
+            "the proposal's forged body never reaches delivery")
+        (is (= "cloud-itonami" (:tenant (:content (store/draft-of s "msg-standup"))))
+            "the store's draft is unaffected by the adversarial proposal")))))
+
+(deftest reject-signoff-holds
+  (testing "a human rejection records a hold, not a post"
+    (let [[s actor _posted delivered] (fresh)
+          _  (run actor "d4" (draft-req "msg-standup" "general") 3)
+          _  (run actor "p4" (post-req "msg-standup" "general") 3)
+          r2 (g/run* actor {:approval {:status :rejected :by "alice"}}
+                     {:thread-id "p4" :resume? true})]
+      (is (= :hold (get-in r2 [:state :disposition])))
+      (is (= :proposed (:status (store/draft-of s "msg-standup"))) "draft stays proposed, never flips to posted")
+      (is (empty? @delivered)))))

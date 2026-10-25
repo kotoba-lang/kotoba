@@ -1,0 +1,117 @@
+(ns denrei.sim
+  "Demo: drive a channel post through one ChannelActor.
+
+    ingest             register a kaisha space (channels/members → facts)
+    draft msg-standup  clean draft into #general (denrei is a member, no
+                       blocked mentions) → phase 3 auto-commits
+    post msg-standup   posting is always high-stakes → human sign-off →
+                       mock-channelport builds the delivery record + calls
+                       the deliverer
+    draft msg-blocked  drafting doesn't gate on consent → commits
+    post msg-blocked   @blocked mention → HARD HOLD (un-overridable)
+    draft msg-ops      #ops is private and excludes denrei → HARD HOLD
+                       (not-a-member)
+    draft msg-dup      body identical to an existing #general message →
+                       SOFT duplicate-body escalate → human still approves
+    phase 0            draft in ingest-only phase → held (phase-disabled)
+
+  Run: kbb -M:dev:run"
+  (:require [langgraph.graph :as g]
+            [kaisha.model :as k]
+            [denrei.coordllm :as coordllm]
+            [denrei.store :as store]
+            [denrei.channelport :as channelport]
+            [denrei.operation :as op]))
+
+(defn- line [& xs] (println (apply str xs)))
+
+(defn- drive [actor tid req phase approve?]
+  (let [res (g/run* actor {:request req :context {:phase phase}} {:thread-id tid})]
+    (if (= :interrupted (:status res))
+      (do (line "   ⏸  human sign-off — review (reason: "
+                (-> res :state :audit last :reason) ")")
+          (let [r2 (g/run* actor {:approval {:status (if approve? :approved :rejected)
+                                             :by "alice"}}
+                           {:thread-id tid :resume? true})]
+            (line "   ▶  " (if approve? "承認" "却下") " → " (get-in r2 [:state :disposition]))
+            r2))
+      (do (line "   → " (get-in res [:state :disposition])
+                (when-let [pr (-> res :state :audit last :phase-reason)] (str " (" pr ")")))
+          res))))
+
+(defn- fixed-advisor
+  "A deterministic advisor that returns `content` for :message/draft and
+  defers to the mock for everything else — for driving specific bodies."
+  [content]
+  (reify coordllm/Advisor
+    (-advise [_ st req]
+      (if (= :message/draft (:op req))
+        {:recommendation :draft :content content
+         :summary "fixed" :rationale "fixed" :cites [] :redactions []
+         :effect :draft :confidence 0.9}
+        (coordllm/infer st req)))))
+
+(defn -main [& _]
+  (let [st        (store/seed-db)
+        posted    (atom {})
+        delivered (atom [])
+        cp        (channelport/mock-channelport posted #(swap! delivered conj %))
+        actor     (op/build st {:channelport cp})]
+
+    (line "── ingest (observe → ground facts) ──")
+    (drive actor "i1" {:op :space/register :space "gftd" :value (store/demo-space)} 3 true)
+    (line "  registered spaces: " (mapv :kaisha/id (store/all-spaces st)))
+
+    (line "\n── draft msg-standup (clean → phase 3 auto-commit) ──")
+    (drive actor "d-standup" {:op :message/draft :activity "act-standup"
+                              :space "gftd" :channel "general" :message "msg-standup"} 3 true)
+    (line "  draft status: " (:status (store/draft-of st "msg-standup")))
+
+    (line "\n── post msg-standup (posting is always high-stakes → human sign-off) ──")
+    (drive actor "p-standup" {:op :message/post :activity "act-standup"
+                              :space "gftd" :channel "general" :message "msg-standup"} 3 true)
+    (line "  draft status: " (:status (store/draft-of st "msg-standup")))
+    (line "  posted (mock-channelport): " (get @posted "msg-standup"))
+    (line "  delivered: " @delivered)
+
+    (line "\n── draft msg-blocked (@blocked 言及 — drafting doesn't gate on consent) ──")
+    (let [content {:tenant "cloud-itonami" :space "gftd" :channel "general"
+                   :message (k/message "msg-blocked"
+                                       {:kaisha/author "denrei"
+                                        :kaisha/body "@blocked please review"
+                                        :kaisha/at "2026-07-13T10:00:00Z"})}
+          a2 (op/build st {:channelport cp :advisor (fixed-advisor content)})]
+      (drive a2 "d-blocked" {:op :message/draft :activity "act-standup"
+                             :space "gftd" :channel "general" :message "msg-blocked"} 3 true)
+      (line "\n── post msg-blocked (@blocked 言及 → HARD HOLD) ──")
+      (drive a2 "p-blocked" {:op :message/post :activity "act-standup"
+                             :space "gftd" :channel "general" :message "msg-blocked"} 3 true)
+      (line "  draft status (unchanged): " (:status (store/draft-of st "msg-blocked"))))
+
+    (line "\n── draft msg-ops (#ops は private で denrei 非 member → HARD HOLD) ──")
+    (drive actor "d-ops" {:op :message/draft :activity "act-standup"
+                          :space "gftd" :channel "ops" :message "msg-ops"} 3 true)
+
+    (line "\n── draft msg-dup (既存 message と同一 body → SOFT duplicate-body escalate) ──")
+    (let [content {:tenant "cloud-itonami" :space "gftd" :channel "general"
+                   :message (k/message "msg-dup"
+                                       {:kaisha/author "denrei"
+                                        :kaisha/body "standup: 進捗どうですか"
+                                        :kaisha/at "2026-07-13T11:00:00Z"})}
+          a3 (op/build st {:channelport cp :advisor (fixed-advisor content)})]
+      (drive a3 "d-dup" {:op :message/draft :activity "act-standup"
+                         :space "gftd" :channel "general" :message "msg-dup"} 3 true))
+
+    (line "\n── 段階導入: draft を phase 0 (ingest-only) で ──")
+    (drive actor "d-p0" {:op :message/draft :activity "act-standup"
+                         :space "gftd" :channel "general" :message "msg-p0"} 0 true)
+
+    (line "\n── 投稿監査台帳 (append-only) ──")
+    (doseq [f (store/ledger st)] (line "  " (store/ledger-line f)))
+
+    (line "\n── バックエンド差し替え: DatomicStore でも同一契約 ──")
+    (let [ds (store/datomic-seed-db) da (op/build ds {:channelport cp})]
+      (drive da "d1" {:op :message/draft :activity "act-standup"
+                      :space "gftd" :channel "general" :message "msg-standup"} 3 true)
+      (line "  DatomicStore draft msg-standup: " (:status (store/draft-of ds "msg-standup"))))
+    (line "\ndone.")))

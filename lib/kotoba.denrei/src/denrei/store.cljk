@@ -1,0 +1,197 @@
+(ns denrei.store
+  "SSoT for denrei — a channel-posting control plane, behind a `Store`
+  protocol so the backend is a swap (MemStore default ‖ DatomicStore via
+  langchain.db, itself swappable to real Datomic Local / kotoba-server).
+
+  Domain = drafting and posting messages into a kaisha communication space.
+  The actor only ever writes :draft records (control-plane proposals, holding
+  a `kaisha.model` message EDN verbatim); actually posting into the space is
+  an EXTERNAL effect performed by a ChannelTarget port, and only after human
+  approval.
+
+    activity — an itonami activity driving a post request: id, repo (the
+               tenant it belongs to), due-at, kind.
+    contact  — a member's consent record keyed by @mention handle
+               (denrei.model/contact): handle, consent (:known/:blocked),
+               first-contact? (never addressed before).
+    space    — a durable ground fact: a `kaisha.model` space EDN
+               (:kaisha/members/channels) plus a :tenant denrei itself adds
+               (for tenant-isolation) — recorded by the ingest flow
+               (:space/register) mechanically, no LLM involved.
+    draft    — the committed/proposed post-LLM content for a message
+               (content, confidence, cites, redactions, status
+               :proposed/:posted).
+
+  Charter: the append-only **ledger is denrei's channel-posting audit trail**
+  (who drafted what, on what basis, who approved posting, when) — the
+  property a mutable chat app can't give you. There is intentionally no
+  raw-message-contents-at-rest requirement beyond the draft itself: the
+  ledger records dispositions and bases, not full message bodies (anti-
+  surveillance, same charter as kekkai's/tayori's/koyomi's ledgers)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [kaisha.model :as k]
+            [denrei.model :as model]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (activity [s id])
+  (contact [s handle])
+  (space [s id])
+  (all-spaces [s]           "every registered space across the tenant(s)")
+  (draft-of [s message-id]  "committed/proposed draft for a message, or nil")
+  (ledger [s])
+  (record-datom! [s record] "append/merge a denrei ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable channel-posting audit fact")
+  (seed! [s data]           "bulk-seed entity collections (idempotent upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+;; Deterministic fixtures (no wall clock): timestamps are fixed ISO-8601
+;; strings; kaisha.model only ever compares them lexically.
+
+(defn demo-space
+  "The gftd kaisha space, :tenant-tagged. mem-denrei (the actor's own member
+  identity) is a member of #general but NOT of the private #ops channel —
+  posting there must be structurally impossible. #general already carries
+  msg-standup-old (duplicate-body escalate fixture) as a committed fact."
+  []
+  (merge
+   (-> (k/space "gftd" {:kaisha/name "GFTD"})
+       (k/add-member (k/member "alice"))
+       (k/add-member (k/member "bob"))
+       (k/add-member (k/member "newbiz"))
+       (k/add-member (k/member "blocked"))
+       (k/add-member (k/member "denrei" {:kaisha/display-name "denrei 伝令"}))
+       (k/add-channel (k/channel "general"))
+       (k/add-channel (k/channel "ops" {:kaisha/visibility :private}))
+       (k/join "general" "alice")
+       (k/join "general" "bob")
+       (k/join "general" "denrei")
+       (k/join "ops" "alice")
+       (k/post "general" (k/message "msg-standup-old"
+                                    {:kaisha/author "alice"
+                                     :kaisha/body "standup: 進捗どうですか"
+                                     :kaisha/at "2026-07-06T09:00:00Z"})))
+   {:tenant "cloud-itonami"}))
+
+(defn demo-data
+  "cloud-itonami tenant: act-standup drives a clean post into #general →
+  phase 3 auto-commits at :message/draft. The 'blocked' contact is consent
+  :blocked — a draft mentioning @blocked must HOLD un-overridably at
+  :message/post. 'newbiz' is first-contact → mentioning them is high-stakes
+  even at draft time. #ops is private and excludes mem-denrei → membership
+  HOLD."
+  []
+  {:activities
+   {"act-standup" {:id "act-standup" :repo "cloud-itonami" :due-at "2026-07-13T09:00:00Z" :kind :standup}
+    "act-report"  {:id "act-report"  :repo "cloud-itonami" :due-at "2026-07-14T17:00:00Z" :kind :weekly-report}}
+   :contacts
+   {"alice"   (model/contact "alice")
+    "bob"     (model/contact "bob")
+    "newbiz"  (model/contact "newbiz" {:first-contact? true})
+    "blocked" (model/contact "blocked" {:consent :blocked})}
+   :spaces
+   {"gftd" (demo-space)}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (activity [_ id] (get-in @a [:activities id]))
+  (contact [_ handle] (get-in @a [:contacts handle]))
+  (space [_ id] (get-in @a [:spaces id]))
+  (all-spaces [_] (sort-by :kaisha/id (vals (:spaces @a))))
+  (draft-of [_ message-id] (get-in @a [:drafts message-id]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :activity (swap! a update-in [:activities id] merge value)
+      :contact  (swap! a update-in [:contacts id] merge value)
+      :space    (swap! a update-in [:spaces id] merge value)
+      :draft    (swap! a update-in [:drafts id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data] (swap! a merge (select-keys data [:activities :contacts :spaces])) s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :drafts {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:activity/id {:db/unique :db.unique/identity}
+   :contact/id  {:db/unique :db.unique/identity}
+   :space/id    {:db/unique :db.unique/identity}
+   :draft/id    {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (activity [this id]
+    (-> (pull* this [:activity/edn] [:activity/id id]) :activity/edn dec*))
+  (contact [this handle]
+    (-> (pull* this [:contact/edn] [:contact/id handle]) :contact/edn dec*))
+  (space [this id]
+    (-> (pull* this [:space/edn] [:space/id id]) :space/edn dec*))
+  (all-spaces [this]
+    (->> (q* this '[:find [?id ...] :where [?e :space/id ?id]])
+         (map #(space this %)) (sort-by :kaisha/id)))
+  (draft-of [this message-id]
+    (-> (pull* this [:draft/edn] [:draft/id message-id]) :draft/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :activity (tx* s [{:activity/id id :activity/edn (enc (merge (activity s id) value))}])
+      :contact  (tx* s [{:contact/id id :contact/edn (enc (merge (contact s id) value))}])
+      :space    (tx* s [{:space/id id :space/edn (enc (merge (space s id) value))}])
+      :draft    (tx* s [{:draft/id id :draft/edn (enc (merge (draft-of s id) value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id a] (:activities data)] (record-datom! s {:kind :activity :id id :value a}))
+    (doseq [[id c] (:contacts data)]   (record-datom! s {:kind :contact :id id :value c}))
+    (doseq [[id sp] (:spaces data)]    (record-datom! s {:kind :space :id id :value sp}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see denrei.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))
