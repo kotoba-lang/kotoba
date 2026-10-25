@@ -1,0 +1,189 @@
+(ns teian.deckport-test
+  "mock-deckport's publish!/distribute-fn contract, plus request-building
+  tests for the two real, opt-in Distributors that live alongside it:
+  teian.distribute/resend-distribute-fn (email, live-verified separately)
+  and teian.deckport/slack-deckport (Slack chat.postMessage, request-shape
+  tested only -- no live Slack call anywhere here, there is no bot token
+  to call with yet; see README's 'Slack Distributor (owner setup
+  required)' section). Every Slack assertion below drives slack-deckport's
+  returned distribute-fn with an injected fake :http-fn that just captures
+  the request map, the same fake-http-fn testing shape used across this
+  workspace's other real-binding-but-untested clients (e.g.
+  tayori.channel.slack)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [langgraph.graph :as g]
+            [teian.deckport :as deckport]
+            [teian.model :as model]
+            [teian.operation :as op]
+            [teian.store :as store]))
+
+;; ───────────────── mock-deckport: distribute-fn result thread-through ─────────────────
+;;
+;; When :distribute-fn returns a map (a real Distributor reporting a
+;; provider message-id), publish! merges :delivery/tool + :delivery/
+;; message-id onto the returned draft; the default no-op distribute-fn (and
+;; any distribute-fn returning something other than a map, e.g.
+;; governor_contract_test's `#(swap! atom conj %)` convention) keeps
+;; today's behavior unchanged.
+
+(deftest publish-with-default-noop-distribute-fn-returns-draft-unchanged
+  (let [dp (deckport/mock-deckport)
+        art (model/artifact "a1" "gftdcojp/cloud-itonami" "T")
+        draft (model/draft "a1" :deck nil {:status :published})
+        result (deckport/publish! dp art "board@example.com" draft)]
+    (is (= draft result))
+    (is (not (contains? result :delivery/tool)))))
+
+(deftest publish-threads-a-map-shaped-distribute-fn-result-onto-the-draft
+  (let [dp (deckport/mock-deckport (atom {}) (fn [_] {:delivery/tool "resend:abc123"
+                                                       :delivery/message-id "abc123"}))
+        art (model/artifact "a1" "gftdcojp/cloud-itonami" "T")
+        draft (model/draft "a1" :deck nil {:status :published})
+        result (deckport/publish! dp art "board@example.com" draft)]
+    (is (= "resend:abc123" (:delivery/tool result)))
+    (is (= "abc123" (:delivery/message-id result)))
+    (testing "every other draft field is untouched"
+      (is (= :published (:status result)))
+      (is (= "a1" (:activity-id result))))))
+
+(deftest publish-ignores-a-non-map-distribute-fn-result
+  ;; governor_contract_test's `distributed` convention -- #(swap! atom conj %)
+  ;; returns the atom's new value, a VECTOR, not a map -- publish! must not
+  ;; try to merge that onto the draft.
+  (let [distributed (atom [])
+        dp (deckport/mock-deckport (atom {}) #(swap! distributed conj %))
+        art (model/artifact "a1" "gftdcojp/cloud-itonami" "T")
+        draft (model/draft "a1" :deck nil {:status :published})
+        result (deckport/publish! dp art "board@example.com" draft)]
+    (is (= draft result))
+    (is (= 1 (count @distributed)))))
+
+(deftest publish-uses-only-an-explicitly-injected-export-capability
+  (let [seen (atom [])
+        exporter (fn [content] (swap! seen conj content) (kbytes/utf8-bytes "pptx"))
+        distributed (atom nil)
+        dp (deckport/mock-deckport (atom {}) #(reset! distributed %) exporter)
+        art (model/artifact "a1" "gftdcojp/cloud-itonami" "T")
+        content {:slides/kind :slides/deck :slides/title "Safe"}]
+    (deckport/publish! dp art "board@example.com"
+                       (model/draft "a1" :deck content {:status :published}))
+    (is (= [content] @seen))
+    (is (true? (:pptx-bytes? @distributed)))))
+
+(deftest publish-does-not-discover-an-exporter-ambiently
+  (let [distributed (atom nil)
+        dp (deckport/mock-deckport (atom {}) #(reset! distributed %))
+        art (model/artifact "a1" "gftdcojp/cloud-itonami" "T")]
+    (deckport/publish! dp art "board@example.com"
+                       (model/draft "a1" :deck {:slides/kind :slides/deck}
+                                    {:status :published}))
+    (is (false? (:pptx-bytes? @distributed)))))
+
+;; ───────────────── full pipeline: publish! -> ledger's :tool ─────────────────
+
+(defn- run [actor tid req phase]
+  (g/run* actor {:request req :context {:phase phase}} {:thread-id tid}))
+
+(deftest a-real-distributor-result-reaches-both-the-draft-and-the-committed-ledger-fact
+  (testing "teian.operation/commit-effects! carries a real Distributor's
+            :delivery/tool forward onto the draft record AND the :committed
+            ledger fact's :tool -- the same place cloud-itonami.mail/
+            send-via-resend! stashes a Resend id on its own effect"
+    (let [s (store/seed-db)
+          dp (deckport/mock-deckport (atom {})
+              (fn [_] {:delivery/tool "resend:live-msg-1" :delivery/message-id "live-msg-1"}))
+          actor (op/build s {:deckport dp})]
+      (run actor "d1" {:op :deck/draft :artifact "act-board"} 3)
+      (is (= :proposed (:status (store/draft-of s "act-board"))) "sanity: draft committed")
+      (let [r1 (run actor "p1" {:op :deck/publish :artifact "act-board"
+                                :target "board@example.com"} 3)]
+        (is (= :interrupted (:status r1)) "publish always interrupts for human sign-off")
+        (let [r2 (g/run* actor {:approval {:status :approved :by "cfo-alice"}}
+                         {:thread-id "p1" :resume? true})]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= :published (:status (store/draft-of s "act-board"))))
+          (is (= "resend:live-msg-1" (:delivery/tool (store/draft-of s "act-board")))
+              "the Resend delivery-tool fact lands on the draft record")
+          (is (= "resend:live-msg-1" (:tool (last (store/ledger s))))
+              "and on the :committed ledger fact -- teian's briefing audit trail"))))))
+
+;; ───────────────── slack-deckport: request-building only, never live ─────────────────
+
+(defn- capturing-http-fn [captured]
+  (fn [req]
+    (reset! captured req)
+    {:status 200 :body "{\"ok\":true}"}))
+
+(deftest slack-deckport-posts-chat-postMessage-with-bearer-auth
+  (testing "the right endpoint, method, bearer-token auth header, and channel"
+    (let [captured (atom nil)
+          distribute-fn (deckport/slack-deckport {:token "xoxb-test-token" :channel "C0123456"
+                                                   :http-fn (capturing-http-fn captured)})]
+      (distribute-fn {:activity "act-1" :target "board@example.com"
+                      :content {:slides/title "Q3 Board Deck"} :pptx-bytes? true})
+      (let [req @captured]
+        (is (= "https://slack.com/api/chat.postMessage" (:url req)))
+        (is (= :post (:method req)))
+        (is (= "Bearer xoxb-test-token" (get-in req [:headers "Authorization"]))
+            "the real Slack Web API bearer-token auth header shape, matching
+             tayori.channel.slack's already-implemented convention")
+        (is (str/starts-with? (get-in req [:headers "Content-Type"]) "application/json"))
+        (is (str/includes? (:body req) "\"channel\":\"C0123456\"")
+            "posts to the constructor-injected channel, never a hardcoded one")
+        (is (str/includes? (:body req) "Q3 Board Deck"))
+        (is (str/includes? (:body req) "pptx export attempted"))))))
+
+(deftest slack-deckport-notes-missing-pptx-export
+  (testing "pptx-bytes? false renders a distinct, honest note (no false claim of an attachment)"
+    (let [captured (atom nil)
+          distribute-fn (deckport/slack-deckport {:token "xoxb-test-token" :channel "C0123456"
+                                                   :http-fn (capturing-http-fn captured)})]
+      (distribute-fn {:activity "act-2" :target "board@example.com"
+                      :content {:slides/title "Narrative Doc"} :pptx-bytes? false})
+      (is (str/includes? (:body @captured) "no pptx export")))))
+
+(deftest slack-deckport-falls-back-to-activity-id-when-title-missing
+  (testing "a malformed/titleless content still produces a well-formed notification"
+    (let [captured (atom nil)
+          distribute-fn (deckport/slack-deckport {:token "xoxb-test-token" :channel "C0123456"
+                                                   :http-fn (capturing-http-fn captured)})]
+      (distribute-fn {:activity "act-3" :target "board@example.com" :content nil :pptx-bytes? false})
+      (is (str/includes? (:body @captured) "act-3")))))
+
+(deftest slack-deckport-accepts-injected-json-write
+  (testing "a caller-injected :json-write (e.g. for a richer payload) is honored instead of the built-in minimal encoder"
+    (let [captured (atom nil)
+          distribute-fn (deckport/slack-deckport {:token "xoxb-test-token" :channel "C0123456"
+                                                   :http-fn (capturing-http-fn captured)
+                                                   :json-write pr-str})]
+      (distribute-fn {:activity "act-4" :target "board@example.com"
+                      :content {:slides/title "Injected Encoder Deck"} :pptx-bytes? true})
+      (is (str/includes? (:body @captured) ":channel \"C0123456\"")
+          "pr-str's EDN-ish shape proves json-write really was swapped out"))))
+
+(deftest slack-deckport-does-not-mutate-mock-deckport-default-behavior
+  (testing "slack-deckport is just another distribute-fn — mock-deckport still records delivered content the same way with or without it"
+    (let [delivered (atom {})
+          captured (atom nil)
+          dt (deckport/mock-deckport delivered
+                                     (deckport/slack-deckport {:token "xoxb-t" :channel "C1"
+                                                               :http-fn (capturing-http-fn captured)}))]
+      (deckport/publish! dt {:id "act-5"} "board@example.com" {:content {:slides/title "Delivered Deck"}})
+      (is (= {:slides/title "Delivered Deck"} (get @delivered "act-5")))
+      (is (some? @captured) "the injected distribute-fn was actually called"))))
+
+(deftest slack-deckport-escapes-c0-control-chars-in-json-body
+  (testing "a title containing raw C0 control chars still produces a valid JSON body --
+            RFC 8259 requires escaping ALL of U+0000-U+001F, not just \\n/\\t"
+    (let [captured (atom nil)
+          distribute-fn (deckport/slack-deckport {:token "xoxb-test-token" :channel "C0123456"
+                                                   :http-fn (capturing-http-fn captured)})
+          title (str "Report " (char 7) " ready " (char 31) " now")]
+      (distribute-fn {:activity "act-6" :target "board@example.com"
+                      :content {:slides/title title} :pptx-bytes? true})
+      (let [body (:body @captured)]
+        (is (not (str/includes? body (str (char 7))))
+            "the raw bell character must not appear unescaped in the JSON body")
+        (is (str/includes? body "\\u0007"))
+        (is (str/includes? body "\\u001f"))))))

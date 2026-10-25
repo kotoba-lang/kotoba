@@ -1,0 +1,135 @@
+(ns kotoba.kessai.redirect-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.kessai :as kessai]
+            [kotoba.kessai.redirect :as rd]))
+
+(def ^:private s0
+  (rd/session "cs_1" 299800 "JPY"
+              :return-url "https://shop.example/return"
+              :cancel-url "https://shop.example/cancel"
+              :expires-at 1000
+              :metadata {:order "o-1"}))
+
+(defn- ok [r] (:ok r))
+
+(defn- succeed-event
+  ([] (succeed-event "evt_1"))
+  ([id] {:event/id id :event/session "cs_1" :event/outcome :succeeded
+         :event/amount 299800 :event/currency "JPY"}))
+
+(deftest session-construction-rejects-nonsense
+  (is (some? s0))
+  (is (= :created (rd/status s0)))
+  (is (nil? (rd/session "" 100 "JPY")))
+  (is (nil? (rd/session "cs_1" 0 "JPY")) "0 円のリダイレクト決済は合計計算のバグか別フロー")
+  (is (nil? (rd/session "cs_1" -1 "JPY")))
+  (is (nil? (rd/session "cs_1" 100.5 "JPY")) "最小単位の整数のみ")
+  (is (nil? (rd/session "cs_1" 100 ""))))
+
+;; ── この rail が存在する理由そのもの ────────────────────────────────────────
+
+(deftest returning-to-the-success-url-can-never-settle
+  (testing "**戻り URL は支払いの証拠ではない。** payer は URL を書き換えられるし、
+            払わずに到達もできる。ここが settle できてしまうと、決済ページの
+            ハンドラを書いた人が必ずそれを使う。"
+    (let [s (-> s0 (rd/mark-redirected "https://psp.example/pay/cs_1"))]
+      (doseq [hint [:success :succeeded "success" true nil :anything]]
+        (let [after (rd/observe-return s hint)]
+          (is (not (rd/succeeded? after))
+              (str "hint " (pr-str hint) " で settle してはならない"))
+          (is (= :redirected (rd/status after))
+              "status は webhook が決めたまま動かない")))
+      (testing "payer を見たことは記録される（UI は『確認中』と出せる）"
+        (is (true? (:redirect/payer-returned (rd/observe-return s :success))))))))
+
+(deftest cancel-return-is-the-one-thing-a-return-may-do
+  (let [s (-> s0 (rd/mark-redirected "u") (rd/observe-return :cancel))]
+    (is (= :cancelled (rd/status s))))
+  (testing "既に確定した session は戻り URL で覆らない"
+    (let [settled (ok (rd/confirm (rd/mark-redirected s0 "u") (succeed-event)))]
+      (is (= :succeeded (rd/status (rd/observe-return settled :cancel)))))))
+
+;; ── webhook が唯一の権威 ────────────────────────────────────────────────────
+
+(deftest confirm-settles-and-projects-onto-the-ledger
+  (let [s (rd/mark-redirected s0 "u")
+        r (rd/confirm s (succeed-event))]
+    (is (ok r))
+    (is (rd/succeeded? (ok r)))
+    (testing "settled session は PaymentRef に射影でき、既存の台帳結線が動く"
+      (let [pr (rd/->payment-ref (ok r))]
+        (is (= :redirect (:kessai/rail pr)))
+        (is (= :captured (:kessai/status pr))
+            "リダイレクト決済に merchant が呼べる capture は無い。:authorized に
+             すると誰も実装できない capture を台帳が待ち続ける")
+        (is (kessai/captured? pr))
+        (is (= 2 (count (kessai/settlement-entries pr "clearing" "merchant"))))))
+    (testing "未確定の session は射影されない"
+      (is (nil? (rd/->payment-ref s)))
+      (is (nil? (rd/->payment-ref s0))))))
+
+(deftest confirm-is-idempotent-because-psps-resend-by-design
+  (let [s (rd/mark-redirected s0 "u")
+        once (ok (rd/confirm s (succeed-event)))
+        twice (rd/confirm once (succeed-event))]
+    (is (= :already-applied (:error twice))
+        "同じ event id の再送は二重決済ではなく no-op として弾く")
+    (is (rd/succeeded? once))))
+
+(deftest confirm-verifies-the-amount-against-the-session
+  (let [s (rd/mark-redirected s0 "u")]
+    (testing "**金額・通貨が session と違う成功通知は成功ではない。**
+              改竄されたクライアント・使い回された session id・通貨換算の
+              取り違えを捕まえる唯一の場所で、happy path では一度も通らない
+              ので最も省略されやすい。"
+      (is (= :amount-mismatch
+             (:error (rd/confirm s (assoc (succeed-event) :event/amount 1)))))
+      (is (= :amount-mismatch
+             (:error (rd/confirm s (assoc (succeed-event) :event/currency "USD"))))))
+    (testing "失敗通知には金額照合を要求しない（払われていないので照合対象が無い）"
+      (is (ok (rd/confirm s (assoc (succeed-event) :event/outcome :failed
+                                                   :event/amount 0)))))))
+
+(deftest confirm-refuses-events-for-another-session
+  (let [s (rd/mark-redirected s0 "u")]
+    (is (= :unknown-session
+           (:error (rd/confirm s (assoc (succeed-event) :event/session "cs_2")))))))
+
+(deftest a-session-nobody-was-sent-to-cannot-have-been-paid
+  (is (= :not-transitionable (:error (rd/confirm s0 (succeed-event))))
+      ":created のまま succeeded にはできない"))
+
+(deftest terminal-sessions-do-not-resurrect
+  (testing "期限切れ後に遅れて届いた succeeded は、履行できる支払いではない
+            —— 商品は解放されたか価格が動いている"
+    (let [expired (rd/expire-if-due (rd/mark-redirected s0 "u") 1000)]
+      (is (= :expired (rd/status expired)))
+      (is (= :not-transitionable (:error (rd/confirm expired (succeed-event)))))))
+  (let [s (rd/mark-redirected s0 "u")
+        failed (ok (rd/confirm s (assoc (succeed-event) :event/outcome :failed)))]
+    (is (= :not-transitionable
+           (:error (rd/confirm failed (succeed-event "evt_2"))))
+        "失敗確定後に別 event で成功にはできない")))
+
+(deftest expiry-is-the-callers-judgement-not-a-hidden-clock
+  (testing "期限前は no-op（sweep helper なので nil を返してはならない）"
+    (let [s (rd/mark-redirected s0 "u")]
+      (is (= :redirected (rd/status (rd/expire-if-due s 999))))
+      (is (= :expired (rd/status (rd/expire-if-due s 1001))))))
+  (testing "期限を持たない session は期限切れにならない"
+    (let [s (rd/mark-redirected (rd/session "cs_9" 100 "JPY") "u")]
+      (is (= :redirected (rd/status (rd/expire-if-due s 99999))))))
+  (testing "確定済みは期限で覆らない"
+    (let [settled (ok (rd/confirm (rd/mark-redirected s0 "u") (succeed-event)))]
+      (is (= :succeeded (rd/status (rd/expire-if-due settled 99999))))))
+  (testing "ISO-8601 文字列でも既定の compare で正しく並ぶ"
+    (let [s (rd/mark-redirected (rd/session "cs_8" 100 "JPY"
+                                            :expires-at "2026-08-04T00:00:00Z") "u")]
+      (is (= :redirected (rd/status (rd/expire-if-due s "2026-08-03T23:59:59Z"))))
+      (is (= :expired (rd/status (rd/expire-if-due s "2026-08-04T00:00:01Z")))))))
+
+(deftest lifecycle-table-is-the-authority
+  (is (rd/can-transition? :redirected :succeeded))
+  (is (not (rd/can-transition? :created :succeeded)))
+  (doseq [t [:succeeded :failed :expired :cancelled]]
+    (is (empty? (get rd/transitions t)) (str t " は終端"))))

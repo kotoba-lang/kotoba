@@ -220,6 +220,19 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
+| `kotoba.toshokan` | `kotoba.toshokan/src` | `toshokan.kotobase-worker`, `toshokan.portable`, `toshokan.quad`, `toshokan.sources.bnf` (Kotoba project library) |
+| `kotoba.teian` | `kotoba.teian/src` | `teian.cacao`, `teian.cli`, `teian.deckllm`, `teian.deckport` (Kotoba project library) |
+| `kotoba.soko` | `kotoba.soko/src` | `soko.events`, `soko.fulfillment`, `soko.projection`, `soko.shipment` (Kotoba project library) |
+| `kotoba.senden` | `kotoba.senden/src` | `senden.attribution`, `senden.campaign`, `senden.channel`, `senden.events` (Kotoba project library) |
+| `kotoba.madoguchi` | `kotoba.madoguchi/src` | `madoguchi.customer`, `madoguchi.events`, `madoguchi.projection`, `madoguchi.ssr` (Kotoba project library) |
+| `kotoba.kobo` | `kotoba.kobo/src` | `kobo.editor`, `kobo.grant`, `kobo.host.node`, `kobo.host.stream-node` (Kotoba project library) |
+| `kotoba.kiyaku` | `kotoba.kiyaku/src` | `kiyaku.account`, `kiyaku.events`, `kiyaku.projection`, `kiyaku.return-analytics` (Kotoba project library) |
+| `kotoba.mise` | `kotoba.mise/src` | `mise.billing`, `mise.cart`, `mise.catalog`, `mise.checkout` (Kotoba project library) |
+| `kotoba.kessai` | `kotoba.kessai/src` | `kotoba.kessai`, `kotoba.kessai.card`, `kotoba.kessai.redirect`, `kotoba.kessai.wire` (Kotoba project library) |
+| `kotoba.kakeibo` | `kotoba.kakeibo/src` | `kakeibo.accounting`, `kakeibo.amount`, `kakeibo.category`, `kakeibo.core` (Kotoba project library) |
+| `kotoba.en` | `kotoba.en/src` | `en.core`, `en.finality` (Kotoba project library) |
+| `kotoba.datomicClientShim` | `kotoba.datomicClientShim/src` | `datomic.client.api`, `kotobase.protocols.datomic`, `kotobase.protocols.datomic.http` (Kotoba project library) |
 | `kotoba.statementFetch` | `kotoba.statementFetch/src` | `kotoba.statement-fetch`, `kotoba.statement-fetch.agent-browser`, `kotoba.statement-fetch.api`, `kotoba.statement-fetch.connector` (Kotoba project library) |
 | `kotoba.shohyo` | `kotoba.shohyo/src` | `kotoba.shohyo`, `kotoba.shohyo.genka`, `kotoba.shohyo.ifrs`, `kotoba.shohyo.jp` (Kotoba project library) |
 | `kotoba.sgp4` | `kotoba.sgp4/src` | `sgp4.core`, `sgp4.frames`, `sgp4.time`, `sgp4.tle` (Kotoba project library) |

@@ -1,0 +1,314 @@
+(ns returns-core
+  ;; `kiyaku.returns` in Kotoba: the returns/RMA state machine, the refund
+  ;; arithmetic and the restock filter.
+  ;;
+  ;; This is the decision content of the namespace -- what a return may become,
+  ;; what it is worth, and which of its lines go back on the shelf. It is a
+  ;; `.cljc` namespace's whole public surface EXCEPT `return-activity`, which
+  ;; is a projection onto `chobo.ledger` in another repository and crosses a
+  ;; module boundary rather than a language one.
+  ;;
+  ;; ## nil becomes a Result
+  ;;
+  ;; The `.cljc` says a refused transition is `nil`, and every caller has to
+  ;; remember that. Kotoba has no nil and `throw` is not how a refusal is
+  ;; spelled here, so `transition` answers `[:result :document :keyword]`: the
+  ;; ok arm carries the moved return, the err arm carries WHY. A caller that
+  ;; ignores the error arm does not compile, which is the point -- the `.cljc`
+  ;; version of that mistake is `(or (transition r to) r)`, and that idiom is
+  ;; in `kiyaku.events` today.
+  ;;
+  ;; ## Money is :i64
+  ;;
+  ;; Refunds are integer minor units. The `.cljc` accepts whatever number it is
+  ;; handed; this does not, and the parity test only compares the integer cases
+  ;; the two agree on. A decimal price is a value-shape question for the whole
+  ;; ledger, not something this port decides on its own.
+  (:export [main
+            status-of transition-allowed? transition
+            approve reject mark-shipped mark-received
+            total-return-qty line-refund-amount total-refund-amount
+            restockable? restock-items refund-with-restock
+            transition-text refund-text qty-text total-refund-text restock-text
+            test-transitions test-transition-result test-qty
+            test-line-refund test-total-refund test-restock test-refund-with-restock])
+  (:schemas {:ret/qty-fold [:record :ret/qty-fold
+                            [[:items :document] [:i :i64] [:n :i64] [:acc :i64]]]
+             :ret/item-fold [:record :ret/item-fold
+                             [[:items :document] [:i :i64] [:n :i64] [:acc :document]]]}))
+
+;; --- reading a document ---------------------------------------------------
+
+(defn dget [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn dat [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn dkw [d :document k :keyword fallback :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dget d k)) fallback))
+
+(defn di [d :document k :keyword fallback :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (dget d k)) fallback))
+
+(defn dbool [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dget d k)) false))
+
+;; --- the state machine ----------------------------------------------------
+;;
+;; The `.cljc` holds this as a map of sets. Here it is one `cond`, which is
+;; what a closed dispatch desugars to anyway -- and unlike the map, a status
+;; the machine does not know cannot be silently added by a caller.
+
+(defn status-of [r :document] :keyword
+  (dkw r :status :requested))
+
+(defn transition-allowed? [from :keyword to :keyword] :bool
+  (cond
+    (= from :requested) (or (= to :approved) (= to :rejected))
+    (= from :approved) (or (= to :shipped) (= to :rejected))
+    (= from :shipped) (= to :received)
+    (= from :received) (= to :refunded)
+    :else false))
+
+(defn transition [r :document to :keyword] [:result :document :keyword]
+  (if (transition-allowed? (status-of r) to)
+    (result-ok-of [:result :document :keyword] (document-assoc r :status (document-keyword to)))
+    (result-err-of [:result :document :keyword] :transition/not-allowed)))
+
+(defn approve [r :document] [:result :document :keyword]
+  (transition r :approved))
+
+(defn reject [r :document] [:result :document :keyword]
+  (transition r :rejected))
+
+(defn mark-shipped [r :document] [:result :document :keyword]
+  (transition r :shipped))
+
+(defn mark-received [r :document] [:result :document :keyword]
+  (transition r :received))
+
+;; --- quantities -----------------------------------------------------------
+
+(defn qty-of [line :document] :i64
+  (di line :qty 1))
+
+(defn qty-from [x [:ref :ret/qty-fold]] :i64
+  (let [items (record-get x :items)
+        i (record-get x :i)
+        n (record-get x :n)
+        acc (record-get x :acc)]
+    (if (>= i n)
+      acc
+      (qty-from (record-new [:ref :ret/qty-fold]
+                            items (+ i 1) n (+ acc (di (dat items i) :qty 0)))))))
+
+;; The `.cljc` sums `(map :qty items)`, so a line with no :qty contributes
+;; nothing there -- 0, not the 1 that `line-refund-amount` defaults to. The two
+;; defaults differ in the original and this port keeps both, because changing
+;; one to match the other would change what a real ledger totals.
+(defn total-return-qty [r :document] :i64
+  (let [items (dget r :items)]
+    (qty-from (record-new [:ref :ret/qty-fold] items 0 (document-count items) 0))))
+
+;; --- refunds --------------------------------------------------------------
+
+(defn unit-price-of [line :document] :i64
+  (if (document-contains line :unit-price)
+    (di line :unit-price 0)
+    (di line :price 0)))
+
+;; The .cljc writes this as `(max 0 (* unit qty))`. `max` is listed among the
+;; builtins but has no admitted lowering here ("operation has no admitted
+;; lowering", measured 2026-09-09), and the clamp is one comparison anyway.
+(defn line-refund-amount [line :document] :i64
+  (let [gross (* (unit-price-of line) (qty-of line))]
+    (if (> gross 0) gross 0)))
+
+(defn refund-from [x [:ref :ret/qty-fold]] :i64
+  (let [items (record-get x :items)
+        i (record-get x :i)
+        n (record-get x :n)
+        acc (record-get x :acc)]
+    (if (>= i n)
+      acc
+      (refund-from (record-new [:ref :ret/qty-fold]
+                               items (+ i 1) n (+ acc (line-refund-amount (dat items i))))))))
+
+(defn total-refund-amount [r :document] :i64
+  (let [items (dget r :items)]
+    (refund-from (record-new [:ref :ret/qty-fold] items 0 (document-count items) 0))))
+
+;; --- restock --------------------------------------------------------------
+
+(defn restockable? [line :document] :bool
+  (and (not (dbool line :damaged))
+       (not (dbool line :final-sale))
+       (> (di line :qty 0) 0)))
+
+(defn restock-from [x [:ref :ret/item-fold]] :document
+  (let [items (record-get x :items)
+        i (record-get x :i)
+        n (record-get x :n)
+        acc (record-get x :acc)]
+    (if (>= i n)
+      acc
+      (let [line (dat items i)]
+        (restock-from
+         (record-new [:ref :ret/item-fold]
+                     items (+ i 1) n
+                     (if (restockable? line)
+                       (document-vector-conj acc (document-map :sku (dget line :sku)
+                                                               :qty (document-i64 (di line :qty 0))))
+                       acc)))))))
+
+(defn restock-items [r :document] :document
+  (let [items (dget r :items)]
+    (restock-from (record-new [:ref :ret/item-fold] items 0 (document-count items)
+                              (document-vector)))))
+
+(defn refund-with-restock [r :document] [:result :document :keyword]
+  (if (transition-allowed? (status-of r) :refunded)
+    (result-ok-of [:result :document :keyword]
+                  (document-assoc
+                   (document-assoc
+                    (document-assoc r :status (document-keyword :refunded))
+                    :refund-amount (document-i64 (total-refund-amount r)))
+                   :restock-items (restock-items r)))
+    (result-err-of [:result :document :keyword] :transition/not-allowed)))
+
+;; --- the text boundary ----------------------------------------------------
+;;
+;; What a host calls. The error arm crosses as a document too, so a caller
+;; that reads the answer sees `{:error :transition/not-allowed}` rather than a
+;; missing value -- the shape `nil` could not carry.
+
+(defn transition-text [r-text :string to-text :string] :string
+  (let [r (document-edn-read r-text)
+        to (option-value-of [:option :keyword]
+                            (document-keyword-value (document-edn-read to-text))
+                            :none)
+        answer (transition r to)]
+    (document-edn-print
+     (if (result-ok?-of [:result :document :keyword] answer)
+       (result-value-of [:result :document :keyword] answer (document-null))
+       (document-map :error (document-keyword :transition/not-allowed))))))
+
+(defn qty-text [r-text :string] :string
+  (document-edn-print (document-i64 (total-return-qty (document-edn-read r-text)))))
+
+(defn total-refund-text [r-text :string] :string
+  (document-edn-print (document-i64 (total-refund-amount (document-edn-read r-text)))))
+
+(defn restock-text [r-text :string] :string
+  (document-edn-print (restock-items (document-edn-read r-text))))
+
+(defn refund-text [r-text :string] :string
+  (let [answer (refund-with-restock (document-edn-read r-text))]
+    (document-edn-print
+     (if (result-ok?-of [:result :document :keyword] answer)
+       (result-value-of [:result :document :keyword] answer (document-null))
+       (document-map :error (document-keyword :transition/not-allowed))))))
+
+;; --- tests ----------------------------------------------------------------
+
+(defn requested [] :document
+  (document-map :id (document-string "r1")
+                :status (document-keyword :requested)
+                :items (document-vector)))
+
+(defn at-status [s :keyword] :document
+  (document-assoc (requested) :status (document-keyword s)))
+
+(defn test-transitions [] :bool
+  (and (transition-allowed? :requested :approved)
+       (transition-allowed? :requested :rejected)
+       (transition-allowed? :approved :shipped)
+       (transition-allowed? :approved :rejected)
+       (transition-allowed? :shipped :received)
+       (transition-allowed? :received :refunded)
+       ;; the closed ends, and the two skips a caller would most likely try
+       (not (transition-allowed? :refunded :received))
+       (not (transition-allowed? :rejected :approved))
+       (not (transition-allowed? :requested :shipped))
+       (not (transition-allowed? :shipped :refunded))
+       ;; a status the machine does not know is not a start state
+       (not (transition-allowed? :invented :approved))))
+
+(defn test-transition-result [] :bool
+  (let [ok (approve (requested))
+        no (mark-shipped (requested))]
+    (and (result-ok?-of [:result :document :keyword] ok)
+         (= :approved (dkw (result-value-of [:result :document :keyword] ok (document-null))
+                           :status :none))
+         (not (result-ok?-of [:result :document :keyword] no))
+         ;; a default status: a return with no :status at all starts requested
+         (result-ok?-of [:result :document :keyword] (approve (document-map :id (document-string "r2")))))))
+
+(defn test-qty [] :bool
+  (let [r (document-assoc (requested) :items
+                          (document-vector (document-map :sku (document-string "a") :qty (document-i64 2))
+                                           (document-map :sku (document-string "b") :qty (document-i64 3))
+                                           ;; no :qty -- contributes 0 to the total
+                                           (document-map :sku (document-string "c"))))]
+    (and (= 5 (total-return-qty r))
+         (= 0 (total-return-qty (requested))))))
+
+(defn test-line-refund [] :bool
+  (and (= 200 (line-refund-amount (document-map :unit-price (document-i64 100) :qty (document-i64 2))))
+       ;; :price is the fallback the .cljc reads when :unit-price is absent
+       (= 150 (line-refund-amount (document-map :price (document-i64 50) :qty (document-i64 3))))
+       ;; a line with no :qty is ONE, not zero -- the other default
+       (= 40 (line-refund-amount (document-map :unit-price (document-i64 40))))
+       ;; clamped at zero, and the boundary itself
+       (= 0 (line-refund-amount (document-map :unit-price (document-i64 -5) :qty (document-i64 2))))
+       (= 0 (line-refund-amount (document-map :unit-price (document-i64 0) :qty (document-i64 9))))
+       (= 0 (line-refund-amount (document-map)))))
+
+(defn test-total-refund [] :bool
+  (let [r (document-assoc (requested) :items
+                          (document-vector (document-map :unit-price (document-i64 100) :qty (document-i64 2))
+                                           (document-map :unit-price (document-i64 50) :qty (document-i64 1))))]
+    (and (= 250 (total-refund-amount r))
+         (= 0 (total-refund-amount (requested))))))
+
+(defn test-restock [] :bool
+  (let [r (document-assoc (requested) :items
+                          (document-vector
+                           (document-map :sku (document-string "a") :qty (document-i64 2))
+                           (document-map :sku (document-string "b") :qty (document-i64 1)
+                                         :damaged (document-bool true))
+                           (document-map :sku (document-string "c") :qty (document-i64 1)
+                                         :final-sale (document-bool true))
+                           ;; zero quantity is dropped -- and one is the
+                           ;; boundary right beside it
+                           (document-map :sku (document-string "d") :qty (document-i64 0))
+                           (document-map :sku (document-string "e") :qty (document-i64 1))))
+        keep (restock-items r)]
+    (and (= 2 (document-count keep))
+         (string=? "a" (option-value-of [:option :string]
+                                        (document-string-value (dget (dat keep 0) :sku)) ""))
+         (string=? "e" (option-value-of [:option :string]
+                                        (document-string-value (dget (dat keep 1) :sku)) ""))
+         ;; the projection keeps exactly :sku and :qty
+         (= 2 (document-count (dat keep 0))))))
+
+(defn test-refund-with-restock [] :bool
+  (let [items (document-vector (document-map :sku (document-string "a")
+                                             :qty (document-i64 2) :unit-price (document-i64 100))
+                               (document-map :sku (document-string "b") :qty (document-i64 1)
+                                             :unit-price (document-i64 50)
+                                             :damaged (document-bool true)))
+        received (document-assoc (at-status :received) :items items)
+        answer (refund-with-restock received)
+        out (result-value-of [:result :document :keyword] answer (document-null))]
+    (and (result-ok?-of [:result :document :keyword] answer)
+         (= :refunded (dkw out :status :none))
+         ;; the refund counts the damaged line, the restock does not
+         (= 250 (di out :refund-amount 0))
+         (= 1 (document-count (dget out :restock-items)))
+         ;; and a return that is not at :received is refused
+         (not (result-ok?-of [:result :document :keyword] (refund-with-restock (document-assoc (at-status :shipped) :items items)))))))
+
+(defn main []
+  (total-refund-amount (requested)))

@@ -1,0 +1,71 @@
+(ns en.finality-test
+  (:require [kotoba.test :refer [deftest is]] [cljs.reader :as reader] [en.finality :as f]
+            [engi.core :as engi] [inga.consensus :as c] [inga.attest :as att]
+            ["node:crypto" :as nc]))
+(def witnesses ["w1" "w2" "w3" "w4"])
+(def actors ["did:key:fixture-sponsor" "did:key:fixture-bot" "did:key:fixture-provider"])
+(def keypairs (into {} (for [id (concat witnesses actors)]
+                         [id (nc/generateKeyPairSync "ed25519")])))
+(defn sign [id msg] (.toString (nc/sign nil (js/Buffer.from msg "utf8") (.-privateKey (get keypairs id))) "base64"))
+(defn verify [id msg sig]
+  (try (and (get keypairs id) (nc/verify nil (js/Buffer.from msg "utf8")
+                                     (.-publicKey (get keypairs id)) (js/Buffer.from sig "base64")))
+       (catch :default _ false)))
+(defn digest [s] (-> (nc/createHash "sha256") (.update s "utf8") (.digest "hex")))
+(defn hash-block [b] (digest (c/canonical-block b)))
+(def genesis (c/make-block {:height 0 :proposals [] :proposer "w1" :ts 0}))
+(def domain {:chain-id "signed-en-test" :genesis genesis :hash-fn hash-block
+             :verify-fn verify :witnesses witnesses :quorum 3 :max-blocks 64})
+(defn transfer-id [body] (str "fixture-cid:" (digest (engi/canonical-transfer-body body))))
+(defn envelope [from to amount nonce]
+  (let [b {:spender from :receiver to :amount amount :spender-prev "genesis" :nonce nonce :ts 1}
+        id (transfer-id b) p (f/signing-payload domain id)]
+    {:transfer-id id :transfer-body b :self-sig (sign from id) :counter-sig (sign to id)
+     :spender-domain-sig (sign from p) :receiver-domain-sig (sign to p)}))
+(def sponsor (first actors)) (def bot (second actors)) (def provider (last actors))
+(def opening (envelope sponsor bot 1 "opening"))
+(def payment (envelope bot provider 1 "payment"))
+(def reward (envelope sponsor bot 1 "reward"))
+(def corpus (into {} (map (juxt :transfer-id identity) [opening payment reward])))
+(def context (assoc domain :credit-limits {sponsor -2} :resolve-proposal corpus
+                          :transfer-id-fn transfer-id :verify-signature verify))
+(defn qc [block]
+  (let [h (:inga.block/height block)
+        votes (mapv #(att/sign-vote (c/make-vote % (hash-block block) h)
+                                    (:chain-id domain) h (partial sign %)) (take 3 witnesses))]
+    (att/certify (c/qc votes 4 h) votes)))
+(defn proof [batches]
+  (let [bs (reduce (fn [bs proposals]
+                     (let [p (peek bs) h (inc (:inga.block/height p))]
+                       (conj bs (c/make-block {:height h :parent-hash (hash-block p)
+                                              :proposals proposals :proposer (c/led-by witnesses h)
+                                              :ts h :justify (qc p) :round h})))) [genesis] batches)]
+    {:blocks bs :tip-qc (qc (peek bs))}))
+(def complete (proof [[(:transfer-id opening)] [(:transfer-id payment)] [(:transfer-id reward)] [] []]))
+(deftest signed-funded-payment-and-reward-replay
+  (let [r (f/project complete context)]
+    (is (= :finalized (:status r)))
+    (is (= {sponsor -2 bot 1 provider 1} (:balances r)))
+    (is (= 3 (count (:transfer-ids r))))
+    (is (:net-zero? r))
+    (is (= r (f/project (reader/read-string (pr-str complete)) context)))))
+(deftest uncertified-incomplete-forged-or-cross-chain-proof-refused
+  (doseq [p [(proof [[(:transfer-id opening)]])
+            (assoc-in complete [:tip-qc :inga.qc/sigs "w1"] "bad")
+            (assoc-in complete [:blocks 1 :inga.block/ts] 999)]]
+    (is (not= :finalized (:status (f/project p context)))))
+  (is (not= :finalized (:status (f/project complete (assoc context :chain-id "other")))))
+  (is (= :rejected (:status (f/project complete (assoc-in context [:credit-limits sponsor] 2))))))
+(deftest committed-cid-signature-credit-or-nonce-cannot-be-skipped
+  (doseq [ctx [(assoc context :resolve-proposal (dissoc corpus (:transfer-id payment)))
+               (assoc context :resolve-proposal (assoc-in corpus [(:transfer-id payment) :self-sig] "forged"))
+               (assoc context :resolve-proposal (assoc-in corpus [(:transfer-id payment) :transfer-body :amount] 100))
+               (assoc context :credit-limits {sponsor -1})]]
+    (is (= :rejected (:status (f/project complete ctx)))))
+  (let [same-nonce (envelope sponsor provider 1 "opening")
+        p (proof [[(:transfer-id opening) (:transfer-id same-nonce)] [] []])]
+    (is (= :rejected (:status (f/project p (assoc context :resolve-proposal (assoc corpus (:transfer-id same-nonce) same-nonce))))))))
+(deftest duplicate-and-rollback-controls
+  (is (= 1 (count (:transfer-ids (f/project (proof [[(:transfer-id opening) (:transfer-id opening)] [] []]) context)))))
+  (is (= :rollback-or-fork (:reason (f/project complete (assoc context :last-observed {:height 500 :hash "bad"})))))
+  (is (= :rollback-or-fork (:reason (f/project complete (assoc context :last-observed {:height 1 :hash "bad"}))))))

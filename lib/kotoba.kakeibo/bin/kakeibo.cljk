@@ -1,0 +1,131 @@
+#!/usr/bin/env kbb
+;; kakeibo CLI — a deterministic ingest tick.
+;;
+;;   kbb --backend sci --classpath "src:bin:resources:../banking/src" bin/kakeibo.cljk ingest \
+;;     --mapping resources/mappings/jp-rakuten-bank.transaction-detail-ja.edn \
+;;     --rules   resources/rules/example-categories.edn \
+;;     --rows    data/2026-07.rows.edn \
+;;     --existing data/ledgered.edn \
+;;     --out     out/2026-07.result.edn \
+;;     --budget  data/budget.edn --budget-period 2026-07
+;;
+;; No clock, no network, no model: the same inputs always produce the same
+;; output file. That is what makes it honest to register under
+;; `tamaki exec` — which records `submitted -> leased -> started ->
+;; succeeded|failed` with the real argv and exit code — rather than under
+;; `tamaki submit`, which would hand the goal to a model and claim an agent did
+;; work it did not do.
+;;
+;; Exit codes: 0 when the ingest is clean; 1 when any row was rejected, any
+;; transaction was unpostable, or the mapping did not validate; 2 on a usage or
+;; file error. A tick that partially failed must not look like a success.
+(ns kakeibo-cli
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]
+            [kakeibo.core :as kakeibo]))
+
+(def fs (js/require "fs"))
+(def path-mod (js/require "path"))
+
+(defn- die [code msg]
+  (binding [*print-fn* *print-err-fn*] (println msg))
+  (js/process.exit code))
+
+(defn- parse-args [args]
+  (loop [[a & more] args opts {} positional []]
+    (cond
+      (nil? a) (assoc opts :positional positional)
+      (str/starts-with? a "--")
+      (let [k (keyword (subs a 2))]
+        (if (or (nil? (first more)) (str/starts-with? (str (first more)) "--"))
+          (recur more (assoc opts k true) positional)
+          (recur (rest more) (assoc opts k (first more)) positional)))
+      :else (recur more opts (conj positional a)))))
+
+(defn- read-edn [label file]
+  (when file
+    (when-not (.existsSync fs file)
+      (die 2 (str "kakeibo: " label " file not found: " file)))
+    (try
+      (edn/read-string (.readFileSync fs file "utf8"))
+      (catch :default e
+        (die 2 (str "kakeibo: " label " file is not readable EDN: " file "\n  " (.-message e)))))))
+
+(defn- existing-txs
+  "Accept either a bare transaction vector or a whole previous `--out` result.
+
+  Feeding last run's output file straight back in is the obvious thing to
+  reach for, so requiring the caller to extract `:kakeibo/txs` by hand would
+  just be a footgun: a result map handed to `:existing` would silently
+  de-duplicate against nothing and re-post the entire history."
+  [value file]
+  (cond
+    (nil? value) []
+    (sequential? value) value
+    (and (map? value) (contains? value :kakeibo/txs)) (:kakeibo/txs value)
+    :else (die 2 (str "kakeibo: --existing must be a transaction vector or a"
+                      " previous --out result map: " file))))
+
+(defn- write-edn! [file value]
+  (let [dir (.dirname path-mod file)]
+    (when-not (.existsSync fs dir)
+      (.mkdirSync fs dir #js {:recursive true}))
+    (.writeFileSync fs file (with-out-str (pr value)) "utf8")))
+
+(defn- print-summary [summary result out]
+  (println "kakeibo ingest")
+  (doseq [k [:summary/read :summary/rejected :summary/suppressed :summary/txs
+             :summary/new :summary/postings :summary/unpostable
+             :summary/uncategorized]]
+    (println (str "  " (name k) ": " (get summary k))))
+  (when (seq (:summary/mapping-problems summary))
+    (println (str "  mapping-problems: " (pr-str (:summary/mapping-problems summary)))))
+  (when-let [unmatched (seq (get-in result [:kakeibo/category-coverage
+                                            :category/unmatched-descriptions]))]
+    (println "  uncategorized descriptions (rule candidates):")
+    (doseq [d (take 20 unmatched)] (println (str "    " d)))
+    (when (> (count unmatched) 20)
+      (println (str "    … and " (- (count unmatched) 20) " more"))))
+  (doseq [{:keys [kakeibo/problems kakeibo/row-index]} (take 20 (:kakeibo/rejected result))]
+    (println (str "  rejected row " row-index ": " (pr-str (mapv :problem problems)))))
+  (when out (println (str "  wrote: " out))))
+
+(defn- ingest! [opts]
+  (let [mapping (read-edn "mapping" (:mapping opts))
+        rows    (read-edn "rows" (:rows opts))
+        rules   (read-edn "rules" (:rules opts))
+        existing (existing-txs (read-edn "existing" (:existing opts)) (:existing opts))
+        budget  (read-edn "budget" (:budget opts))
+        out     (:out opts)]
+    (when-not mapping (die 2 "kakeibo: --mapping is required"))
+    (when-not rows (die 2 "kakeibo: --rows is required"))
+    (when-not (sequential? rows)
+      (die 2 "kakeibo: --rows must contain a sequence of row maps"))
+    (let [result (kakeibo/ingest {:mapping mapping
+                                 :rows rows
+                                 :rules (or rules [])
+                                 :existing (or existing [])
+                                 :budget budget
+                                 :budget-period (:budget-period opts)})
+          summary (kakeibo/summary result)]
+      (when out (write-edn! out result))
+      (print-summary summary result out)
+      (if (kakeibo/clean? result)
+        (js/process.exit 0)
+        (do (println "kakeibo: ingest was not clean (see rejected / unpostable above)")
+            (js/process.exit 1))))))
+
+(def usage
+  (str/join
+   "\n"
+   ["kakeibo — statement rows to a double-entry ledger, deterministically."
+    ""
+    "  ingest --mapping FILE --rows FILE [--rules FILE] [--existing FILE]"
+    "         [--out FILE] [--budget FILE] [--budget-period YYYY-MM]"
+    ""
+    "Exit 0 clean, 1 ingest had rejections, 2 usage or file error."]))
+
+(let [{:keys [positional] :as opts} (parse-args *command-line-args*)]
+  (case (first positional)
+    "ingest" (ingest! opts)
+    (die 2 usage)))

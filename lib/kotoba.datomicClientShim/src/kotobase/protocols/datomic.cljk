@@ -1,0 +1,182 @@
+(ns kotobase.protocols.datomic
+  "datomic.kotobase.net — a Datomic Client API-SHAPED (NOT wire-compatible)
+  HTTP+edn query surface over kotobase (ADR-2607172300, KRP addressing
+  contract unaffected — a query result set is not itself a new addressable
+  resource kind).
+
+  ============================================================================
+  READ THIS FIRST: this is shape-compatible with the Datomic Client API's
+  `d/q` request/response shape (`{:query ... :args [...]}` in, a result-set
+  `#{[...] ...}` out) — it is explicitly, deliberately NOT wire-compatible
+  with proprietary Datomic. There is no single open Datomic wire protocol to
+  conform to (the Datomic Client API is HTTP+transit but not an
+  independently-specified standard; the Peer/transactor protocol is
+  proprietary/undocumented) — this repo does not claim to speak either one.
+  It borrows the REQUEST/RESPONSE SHAPE only, because that shape is a
+  reasonable, familiar `:find`/`:where` Datalog convention, not because a
+  real Datomic client can point at this server. See README.md, first
+  paragraph, for the same statement in prose form.
+  ============================================================================
+
+  What actually answers the query: `kotoba-lang/kotobase-query`'s
+  `kotobase.query.bridge` materializes one or more `kotobase.store/IStore`
+  collections into an `arrangement.core` db (in-memory, v0.1 linear
+  materialization — see that repo's README for the accepted limitation) and
+  `arrangement.datalog/q` evaluates the real `:find`/`:where` Datalog query,
+  joins across materialized collections included. This namespace is the HTTP
+  surface over that bridge — it does not reimplement query evaluation.
+
+  Endpoint (v0.1, the only one):
+    POST /api/query    body: edn `{:query <datalog-query> :args [...]}`
+                        200: edn `#{[...] ...}` (the result-set tuples)
+
+  Request/response shape vs. the real Datomic Client API's `d/q` — read
+  carefully, this is the crux of \"shape-compatible not wire-compatible\":
+    - `:query` — same key, same `:find`/`:where`/`:in`/`:rules` Datalog map
+      shape.
+    - `:args` — same key name, but DIFFERENT semantics from real Datomic.
+      Real Datomic's `:args` vector conventionally starts with a `db`
+      value, then one positional value per `:in` binding after `db`. This
+      surface has no `db` value to hand over the wire — `ctx` already fixes
+      which `kotobase.store` collections are materialized (`:coll-keys`) and
+      how visibility is decided (`:visible?`) for every request this deploy
+      serves. So here `:args` is threaded directly as `kotobase.query.
+      bridge/q`'s `inputs` — positional values for whatever `:in` the query
+      declares (no db slot). Omit `:args` (or send `[]`) for a query with no
+      `:in` clause.
+    - the result is the same kind of value (a set of tuples), edn-encoded
+      rather than transit-encoded.
+    - there is no db/connection/transact endpoint here at all — this
+      surface is READ-ONLY (query only), matching ADR-2607172300's scope
+      (the four new repos are query-LANGUAGE surfaces, not write surfaces).
+
+  ctx (extends the `{:store IStore}` shape every kotobase-protocols-family
+  handler takes, per ADR-2607171700):
+    :store      kotobase.store/IStore (required) — the document store
+                `kotobase.query.bridge/materialize` reads from.
+    :coll-keys  seq of collection identifiers (required) — the default set
+                of `kotobase.store` collections materialized for a request
+                that doesn't specify its own `:coll-keys` in the body (see
+                below). Comes from THIS deploy's schema, not the client —
+                a client cannot materialize collections it wasn't given
+                access to by whoever built `ctx`.
+    :visible?   (fn [datom]) -> bool, REQUIRED, NOT DEFAULTED. Every datom
+                `kotobase.query.bridge/q` considers is `{:s :p :o}` — see
+                that repo's README/test suite for the exact shape
+                (`(fn [{:keys [s]}] ...)` is the common case, filtering by
+                entity). Passed straight through to `bridge/q`/`bridge/
+                query`, which themselves refuse to run (arity error) without
+                it — this handler adds one more layer of refusal on top: if
+                `ctx` has no `:visible?` at all, `handle` throws immediately
+                rather than silently falling back to \"see everything\"
+                (ADR-2607050500, \"query as first-class effect\" — no
+                permissive default anywhere in this call chain).
+
+                v0.1 HONESTY NOTE: a real multi-tenant deploy MUST supply a
+                real authorization-derived `:visible?` here (tenant/ACL
+                check per datom). This repo ships NO such policy — the only
+                predicate defined here, `always-visible?` (below), is
+                `(constantly true)` and is appropriate ONLY for a
+                single-tenant/trusted deploy where every materialized
+                collection is already meant to be fully readable by every
+                caller of this endpoint. It exists so a deploy shell has an
+                explicit, named, opt-IN choice to reach for — never a
+                silent fallback baked into `handle` itself.
+    :now        optional ISO string, carried through to the audit event
+                only (matches the `{:store :now :apex}` shape
+                `kotobase.protocols.s3`/`.atproto` etc. use, even though
+                this read-only surface has no `:last-modified` field of its
+                own to stamp).
+
+  Audit: this surface has no writes to audit in the
+  `kotobase.protocols.s3`/`.atproto` sense (no PUT/DELETE) — so, by
+  deliberate choice documented here rather than left as a silent gap, EVERY
+  successful query is audited instead, one event per request, on the same
+  `:kotobase.protocols/audit` collection those write surfaces use
+  (`{:surface :datomic :op :query :coll-keys ... :query ... :args-count ...
+  :result-count ...}`). This gives the same observability discipline
+  (\"every effect is visible in the audit log\") applied to a read surface: a
+  query is a first-class effect too (ADR-2607050500's own title), even
+  though it does not mutate `store`. Failed requests (parse error, missing
+  `:query`, disallowed method/path) are NOT audited — they never reached
+  `kotobase.query.bridge` at all."
+  (:require [kotobase.protocols.datomic.http :as http]
+            [kotobase.query.bridge :as bridge]
+            [kotobase.store :as st]
+            #?(:clj [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])))
+
+;; --------------------------------------------------------- visible? helpers
+
+(def always-visible?
+  "`(constantly true)` — an explicit, named, OPT-IN `:visible?` for a
+  single-tenant/trusted deploy where every materialized collection this
+  endpoint serves is meant to be fully readable by every caller. See the ns
+  docstring's \"v0.1 HONESTY NOTE\" — a real multi-tenant deploy must supply
+  its own authorization-derived predicate in `ctx` instead of this one."
+  (constantly true))
+
+;; ------------------------------------------------------------------- audit
+
+(defn- audit! [store {:keys [coll-keys query args result]}]
+  (st/-append store :kotobase.protocols/audit
+              {:surface :datomic
+               :op :query
+               :coll-keys (vec coll-keys)
+               :query query
+               :args-count (count args)
+               :result-count (count result)}))
+
+;; -------------------------------------------------------------- edn bodies
+
+(defn- edn-response [status x]
+  (http/response status {"content-type" "application/edn"} (pr-str x)))
+
+(defn- edn-error [status message]
+  (edn-response status {:error message}))
+
+;; ----------------------------------------------------------------- handler
+
+(defn handle
+  "Datomic Client `d/q`-shaped handler. See ns docstring for the full
+  request/response shape and the exact `:args` semantics deviation from
+  real Datomic. `ctx` per ns docstring; `req` is
+  `kotobase.protocols.datomic.http`-shaped (`{:method :post :path \"/api/query\"
+  :body <edn-string>}`).
+
+  Throws `ex-info` immediately (does not return an HTTP response) if `ctx`
+  has no `:visible?` — a missing visibility decision is a deploy-shell
+  configuration bug, not a client-facing 4xx (ADR-2607050500)."
+  [{:keys [store coll-keys visible?]} req]
+  (when (nil? visible?)
+    (throw (ex-info "kotobase.protocols.datomic/handle: ctx has no :visible? — a visibility predicate is required, never defaulted (ADR-2607050500). Pass kotobase.protocols.datomic/always-visible? explicitly if this is a trusted single-tenant deploy." {:ctx-missing :visible?})))
+  (cond
+    (not= :post (:method req))
+    (http/method-not-allowed)
+
+    (not= ["api" "query"] (http/segments (:path req)))
+    (http/not-found)
+
+    :else
+    (let [parsed (try
+                   {:ok (edn/read-string (or (:body req) ""))}
+                   #?(:clj (catch Exception e {:err (str "edn parse error: " (ex-message e))})
+                      :cljs (catch :default e {:err (str "edn parse error: " (ex-message e))})))]
+      (if (:err parsed)
+        (edn-error 400 (:err parsed))
+        (let [body (:ok parsed)]
+          (if-not (and (map? body) (contains? body :query))
+            (edn-error 400 "body must be an edn map with a :query key, e.g. {:query {:find [...] :where [...]} :args [...]}")
+            (let [query (:query body)
+                  args (:args body)
+                  colls (or (:coll-keys body) coll-keys)]
+              (if (empty? colls)
+                (edn-error 400 "no :coll-keys available — supply them in ctx or the request body")
+                (try
+                  (let [result (if (seq args)
+                                 (bridge/query store colls query visible? args)
+                                 (bridge/query store colls query visible?))]
+                    (audit! store {:coll-keys colls :query query :args args :result result})
+                    (edn-response 200 result))
+                  #?(:clj (catch Exception e (edn-error 400 (str "query error: " (ex-message e))))
+                     :cljs (catch :default e (edn-error 400 (str "query error: " (ex-message e))))))))))))))

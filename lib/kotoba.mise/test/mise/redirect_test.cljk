@@ -1,0 +1,103 @@
+(ns mise.redirect-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mise.cart :as cart]
+            [mise.checkout :as co]
+            [mise.pricing :as pricing]
+            [mise.redirect :as rdr]
+            [kotoba.kessai.redirect :as rd]))
+
+;; ── 単位換算 ────────────────────────────────────────────────────────────────
+
+(deftest minor-amount-does-not-guess-the-currency-precision
+  (testing "zero-decimal は素通し"
+    (is (= {:ok 299800} (rdr/minor-amount (pricing/price 299800 "JPY")))))
+  (testing "2 桁小数は ×100"
+    (is (= {:ok 1999} (rdr/minor-amount (pricing/price 19.99 "USD")))))
+  (testing "**3 桁小数通貨は拒否する。** ×100 だと 10 分の 1 の金額で session を
+            作ってしまい、しかも決済は通る（少なく請求されるだけ）ので誰も気付かない。"
+    (is (= :unsupported-currency-precision
+           (:error (rdr/minor-amount (pricing/price 19.99 "KWD")))))
+    (testing ":->minor を渡せば扱える"
+      (is (= {:ok 19990}
+             (rdr/minor-amount (pricing/price 19.99 "KWD")
+                               (fn [a _] (long (+ 0.5 (* 1000 a)))))))))
+  (testing "壊れた Price は通さない"
+    (is (= :malformed-price (:error (rdr/minor-amount {:currency "JPY"}))))
+    (is (= :missing-currency (:error (rdr/minor-amount {:amount 100}))))))
+
+;; ── begin: 支払いの前に注文がある ───────────────────────────────────────────
+
+(def ^:private c0
+  (-> (co/checkout (cart/add-line (cart/cart)
+                                  {:sku "n24" :name "Node 24" :qty 1
+                                   :unit-price (pricing/price 299800 "JPY")}))
+      (assoc :stage :review
+             :contact {:email "a@b.com" :name "A"}
+             :shipping {:address "1-1" :city "Tokyo" :postal "150-0001" :country "JP"})))
+
+(deftest begin-creates-a-pending-order-before-any-payment
+  (let [r (rdr/begin c0 {})]
+    (is (:ok r))
+    (let [{:keys [order amount currency]} (:ok r)]
+      (is (= :pending (:status order)))
+      (is (nil? (:payment-ref order)) "まだ何も支払われていない")
+      (is (= 299800 amount))
+      (is (= "JPY" currency))))
+  (testing ":review 以外からは始められない"
+    (is (= :not-at-review (:error (rdr/begin (assoc c0 :stage :payment) {}))))))
+
+;; ── confirm: webhook で確定した session だけが :paid にする ─────────────────
+
+(defn- session-for [ord & {:keys [amount currency oid]}]
+  (rd/session "cs_1" (or amount 299800) (or currency "JPY")
+              :metadata {:order (or oid (:id ord))}))
+
+(defn- settle [s]
+  (:ok (rd/confirm (rd/mark-redirected s "u")
+                   {:event/id "evt_1" :event/session (:redirect/id s)
+                    :event/outcome :succeeded
+                    :event/amount (:redirect/amount s)
+                    :event/currency (:redirect/currency s)})))
+
+(deftest confirm-settles-a-pending-order
+  (let [ord (get-in (rdr/begin c0 {}) [:ok :order])
+        s (settle (session-for ord))
+        r (rdr/confirm ord s)]
+    (is (:ok r))
+    (is (= :paid (:status (:ok r))))
+    (is (= :redirect (get-in r [:ok :payment-ref :kessai/rail])))
+    (is (= :captured (get-in r [:ok :payment-ref :kessai/status])))))
+
+(deftest an-unsettled-session-can-never-pay-for-an-order
+  (let [ord (get-in (rdr/begin c0 {}) [:ok :order])
+        s (session-for ord)]
+    (testing "作っただけ / 送っただけ / payer が戻っただけ —— どれも支払いではない"
+      (is (= :session-not-settled (:error (rdr/confirm ord s))))
+      (is (= :session-not-settled (:error (rdr/confirm ord (rd/mark-redirected s "u")))))
+      (is (= :session-not-settled
+             (:error (rdr/confirm ord (rd/observe-return (rd/mark-redirected s "u")
+                                                         :success))))
+          "**戻り URL に success で戻ってきても注文は :paid にならない**"))))
+
+(deftest confirm-refuses-a-session-that-belongs-to-another-order
+  (testing "kessai の金額照合は session 対 event。**注文対 session を見るのは
+            ここだけ** —— 正しい金額の session を別の注文に当てるのを止める。"
+    (let [ord (get-in (rdr/begin c0 {}) [:ok :order])
+          s (settle (session-for ord :oid "ord_someone_else"))]
+      (is (= :order-mismatch (:error (rdr/confirm ord s)))))))
+
+(deftest confirm-refuses-when-the-total-moved-after-the-session-was-made
+  (let [ord (get-in (rdr/begin c0 {}) [:ok :order])]
+    (testing "カート編集・価格改定・税率変更で合計がずれた場合"
+      (is (= :amount-mismatch (:error (rdr/confirm ord (settle (session-for ord :amount 1)))))))
+    (testing "通貨違い"
+      (is (= :amount-mismatch
+             (:error (rdr/confirm ord (settle (session-for ord :currency "USD")))))))))
+
+(deftest confirm-is-not-repeatable-so-a-webhook-retry-cannot-double-pay
+  (let [ord (get-in (rdr/begin c0 {}) [:ok :order])
+        s (settle (session-for ord))
+        once (:ok (rdr/confirm ord s))]
+    (is (= :paid (:status once)))
+    (is (= :not-pending (:error (rdr/confirm once s)))
+        "同じ session をもう一度当てても :paid から動かない")))

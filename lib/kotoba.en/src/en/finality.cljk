@@ -1,0 +1,81 @@
+(ns en.finality
+  "Resolve a complete Inga finalized prefix to native EN balances.
+  Context is pinned trusted host configuration, never request fields.
+  Does not approve grants, custody, topology or validator durability."
+  (:require [en.core :as en] [inga.prefix :as prefix]
+            [kotoba.lang.text :as str]))
+(def body-keys #{:spender :receiver :amount :spender-prev :nonce :ts})
+(defn- text? [x] (and (string? x) (seq x) (not (re-find #"[\r\n]" x))))
+(defn- did? [x] (and (text? x) (str/starts-with? x "did:key:")))
+(defn signing-payload [context transfer-id]
+  (str "en/finalized-transfer/v1\nchain=" (:chain-id context)
+       "\ngenesis=" ((:hash-fn context) (:genesis context))
+       "\ntransfer=" transfer-id "\n"))
+(defn- resolve-one [context proposal]
+  (let [{:keys [resolve-proposal transfer-id-fn verify-signature]} context
+        {:keys [transfer-body transfer-id self-sig counter-sig
+                spender-domain-sig receiver-domain-sig] :as envelope} (resolve-proposal proposal)
+        {:keys [spender receiver amount spender-prev nonce ts]} transfer-body]
+    (when-not (and (map? envelope) (= body-keys (set (keys transfer-body)))
+                   (did? spender) (did? receiver) (not= spender receiver)
+                   (integer? amount) (<= 1 amount 9007199254740991)
+                   (text? spender-prev) (text? nonce) (integer? ts) (<= 0 ts 9007199254740991)
+                   (= proposal transfer-id (transfer-id-fn transfer-body))
+                   (true? (verify-signature spender transfer-id self-sig))
+                   (true? (verify-signature receiver transfer-id counter-sig))
+                   (true? (verify-signature spender (signing-payload context transfer-id) spender-domain-sig))
+                   (true? (verify-signature receiver (signing-payload context transfer-id) receiver-domain-sig)))
+      (throw (ex-info "EN committed proposal cannot be resolved/authenticated" {})))
+    envelope))
+(defn project
+  "Verify full prefix and both parties' content/domain signatures before replay.
+  Invalid committed proposals refuse the view; never skip to a later winner.
+  last-observed must be a verified earlier committed hash/height when provided.
+  Complete bounded proofs are a qualification path, not scalable checkpointing."
+  [proof {:keys [credit-limits resolve-proposal transfer-id-fn verify-signature
+                last-observed] :as context}]
+  (try
+    (if-not (and (map? credit-limits)
+                 (every? (fn [[did limit]] (and (did? did) (integer? limit)
+                                               (<= -9007199254740991 limit 0))) credit-limits)
+                 (every? fn? [transfer-id-fn verify-signature])
+                 (ifn? resolve-proposal))
+      {:status :rejected :reason :invalid-en-context}
+      (let [verified (prefix/verify proof context)]
+        (if-not (= :finalized (:status verified))
+          verified
+          (let [blocks (:blocks verified)
+                h (:height verified)
+                prior (when last-observed
+                        (some #(when (= (:height last-observed) (:inga.block/height %)) %) blocks))]
+            (if (and last-observed (or (< h (:height last-observed))
+                                     (nil? prior)
+                                     (not= (:hash last-observed) ((:hash-fn context) prior))))
+              {:status :rejected :reason :rollback-or-fork}
+              (let [envelopes (mapv #(resolve-one context %)
+                                   (mapcat :inga.block/proposals blocks))
+                    ;; Exact duplicate submissions are idempotent. A repeated nonce
+                    ;; or transfer-id carrying a different body/signature refuses.
+                    unique (reduce (fn [m e]
+                                     (let [id (:transfer-id e) prior (get m id)]
+                                       (when (and prior (not= prior e)) (throw (ex-info "EN transfer collision" {})))
+                                       (assoc m id e))) {} envelopes)
+                    ordered (second (reduce (fn [[seen out] e]
+                                              (if (contains? seen (:transfer-id e)) [seen out]
+                                                [(conj seen (:transfer-id e)) (conj out e)])) [#{} []] envelopes))
+                    nonces (map #(select-keys (:transfer-body %) [:spender :nonce]) ordered)
+                    _ (when-not (= (count nonces) (count (set nonces))) (throw (ex-info "EN nonce reused" {})))
+                    replay (en/replay-balances
+                            (mapv #(assoc (:transfer-body %) :transfer-id (:transfer-id %)) ordered)
+                            credit-limits)
+                    _ (when (or (not (en/net-zero? replay))
+                                (some #(seq (:violations %)) (vals replay)))
+                        (throw (ex-info "EN credit invariants violated" {})))
+                    head (peek blocks)]
+                {:status :finalized :asset "native/engi/EN" :height h
+                 :checkpoint ((:hash-fn context) head) :chain-id (:chain-id context)
+                 :genesis ((:hash-fn context) (:genesis context))
+                 :balances (into {} (for [[did view] replay] [did (:balance view)]))
+                 :transfer-ids (mapv :transfer-id ordered) :net-zero? true}))))))
+    (catch #?(:clj Exception :cljs :default) _
+      {:status :rejected :reason :invalid-committed-en-history})))

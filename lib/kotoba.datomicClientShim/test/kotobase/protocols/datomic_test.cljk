@@ -1,0 +1,168 @@
+(ns kotobase.protocols.datomic-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.store :as st]
+            [kotobase.protocols.datomic :as datomic]
+            #?(:clj [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])))
+
+;; ------------------------------------------------------------------ fixture
+
+(defn- fixture-store
+  "Two collections: `users` (admins + a regular user, one with no
+  `:dept-key`) and `departments` (the cross-collection join target).
+  Mirrors kotobase-query's own README/test worked example."
+  []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :dept-key "d1"})
+    (st/-put s "users" "u2" {:name "Bob" :role "user" :dept-key "d2"})
+    (st/-put s "users" "u3" {:name "Carol" :role "admin" :dept-key "d1"})
+    (st/-put s "users" "u4" {:name "Dave" :role "user"}) ; no dept-key
+    (st/-put s "departments" "d1" {:name "Engineering"})
+    (st/-put s "departments" "d2" {:name "Sales"})
+    s))
+
+(defn- post-query [ctx query+args]
+  (datomic/handle ctx {:method :post :path "/api/query"
+                       :body (pr-str query+args)}))
+
+(defn- body-edn [resp] (edn/read-string (:body resp)))
+
+;; -------------------------------------------------------------- happy path
+
+(deftest equality-filter-single-var
+  (let [ctx {:store (fixture-store) :coll-keys ["users"]
+             :visible? datomic/always-visible?}
+        resp (post-query ctx '{:query {:find [?name] :where [[?u :role "admin"] [?u :name ?name]]}})]
+    (is (= 200 (:status resp)))
+    (is (= "application/edn" (get (:headers resp) "content-type")))
+    (is (= #{["Alice"] ["Carol"]} (body-edn resp))
+        "only admins come back, via a real equality filter run by
+        arrangement.datalog through kotobase-query's bridge")))
+
+(deftest multiple-find-vars
+  (let [ctx {:store (fixture-store) :coll-keys ["users"]
+             :visible? datomic/always-visible?}
+        resp (post-query ctx '{:query {:find [?u ?name] :where [[?u :role "admin"] [?u :name ?name]]}})]
+    (is (= #{[:users/u1 "Alice"] [:users/u3 "Carol"]} (body-edn resp))
+        "both the entity and the projected attribute come back when :find
+        lists more than one variable")))
+
+(deftest cross-collection-join
+  (testing "a user's :dept-key value joins against the department entity's
+    :kotobase/key attribute -- kotobase-query materializes BOTH collections
+    into one arrangement db and arrangement.datalog does the real join"
+    (let [ctx {:store (fixture-store) :coll-keys ["users" "departments"]
+               :visible? datomic/always-visible?}
+          resp (post-query ctx '{:query {:find [?uname ?dname]
+                                          :where [[?u :name ?uname]
+                                                  [?u :dept-key ?dk]
+                                                  [?d :kotobase/coll "departments"]
+                                                  [?d :kotobase/key ?dk]
+                                                  [?d :name ?dname]]}})]
+      (is (= #{["Alice" "Engineering"] ["Bob" "Sales"] ["Carol" "Engineering"]}
+             (body-edn resp))
+          "Dave (no :dept-key) correctly drops out of the join"))))
+
+(deftest args-thread-through-as-in-clause-inputs
+  (testing ":args is NOT a Datomic-style [db & in-values] vector here --
+    ctx already fixes the materialized collections, so :args maps directly
+    onto kotobase.query.bridge/q's positional `inputs` for the query's
+    :in clause (see ns docstring 'Request/response shape' section)"
+    (let [ctx {:store (fixture-store) :coll-keys ["users"]
+               :visible? datomic/always-visible?}
+          resp (post-query ctx '{:query {:find [?name] :in [?role] :where [[?u :role ?role] [?u :name ?name]]}
+                                  :args ["admin"]})]
+      (is (= #{["Alice"] ["Carol"]} (body-edn resp))))))
+
+(deftest empty-args-vector-same-as-omitted
+  (let [ctx {:store (fixture-store) :coll-keys ["users"]
+             :visible? datomic/always-visible?}
+        resp (post-query ctx '{:query {:find [?name] :where [[?u :role "admin"] [?u :name ?name]]}
+                                :args []})]
+    (is (= #{["Alice"] ["Carol"]} (body-edn resp)))))
+
+(deftest per-request-coll-keys-override-ctx-default
+  (testing "a request body may narrow :coll-keys below ctx's default set"
+    (let [ctx {:store (fixture-store) :coll-keys ["users" "departments"]
+               :visible? datomic/always-visible?}
+          resp (post-query ctx '{:query {:find [?dname] :where [[?d :name ?dname]]}
+                                  :coll-keys ["departments"]})]
+      (is (= #{["Engineering"] ["Sales"]} (body-edn resp))
+          "only departments materialized -- if users had also been
+          materialized, :name would also match users' :name attr and this
+          set would include Alice/Bob/Carol/Dave too"))))
+
+;; ------------------------------------------------------------- visible?
+
+(deftest visible-redacts-a-specific-entity
+  (testing "ctx's :visible? is actually wired through to kotobase-query's
+    bridge, not ignored -- a predicate that excludes Bob's entity means
+    Bob never appears in a result, even though his doc IS materialized"
+    (let [store (fixture-store)
+          no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+          ctx {:store store :coll-keys ["users"] :visible? no-bob?}
+          resp (post-query ctx '{:query {:find [?name] :where [[?u :name ?name]]}})
+          result (body-edn resp)]
+      (is (not (contains? result ["Bob"])) "Bob is redacted by :visible?")
+      (is (contains? result ["Alice"]) "everyone else still comes through"))))
+
+(deftest missing-visible-in-ctx-throws-not-silently-defaults
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (datomic/handle {:store (fixture-store) :coll-keys ["users"]}
+                                {:method :post :path "/api/query"
+                                 :body (pr-str '{:query {:find [?name] :where [[?u :name ?name]]}})}))
+      "handle refuses to run with no stated ctx :visible? decision --
+      ADR-2607050500 discipline, same as kotobase-query's own bridge/q"))
+
+(deftest always-visible-is-explicit-opt-in-not-a-hidden-default
+  (is (true? (datomic/always-visible? {:s :anything :p :whatever :o 1})))
+  (is (fn? datomic/always-visible?)))
+
+;; ------------------------------------------------------------- HTTP shape
+
+(deftest wrong-method-rejected
+  (let [ctx {:store (fixture-store) :coll-keys ["users"] :visible? datomic/always-visible?}
+        resp (datomic/handle ctx {:method :get :path "/api/query"})]
+    (is (= 405 (:status resp)))))
+
+(deftest wrong-path-not-found
+  (let [ctx {:store (fixture-store) :coll-keys ["users"] :visible? datomic/always-visible?}
+        resp (datomic/handle ctx {:method :post :path "/api/other"
+                                  :body (pr-str '{:query {:find [?x] :where []}})})]
+    (is (= 404 (:status resp)))))
+
+(deftest malformed-edn-body-is-400-not-a-crash
+  (let [ctx {:store (fixture-store) :coll-keys ["users"] :visible? datomic/always-visible?}
+        resp (datomic/handle ctx {:method :post :path "/api/query" :body "{:query "})]
+    (is (= 400 (:status resp)))
+    (is (contains? (body-edn resp) :error))))
+
+(deftest body-without-query-key-is-400
+  (let [ctx {:store (fixture-store) :coll-keys ["users"] :visible? datomic/always-visible?}
+        resp (post-query ctx '{:args []})]
+    (is (= 400 (:status resp)))))
+
+(deftest no-coll-keys-anywhere-is-400
+  (let [ctx {:store (fixture-store) :visible? datomic/always-visible?}
+        resp (post-query ctx '{:query {:find [?x] :where [[?x :kotobase/coll _]]}})]
+    (is (= 400 (:status resp)))))
+
+;; ----------------------------------------------------------------- audit
+
+(deftest successful-query-appends-one-audit-event
+  (let [store (fixture-store)
+        ctx {:store store :coll-keys ["users"] :visible? datomic/always-visible?}]
+    (post-query ctx '{:query {:find [?name] :where [[?u :role "admin"] [?u :name ?name]]}})
+    (let [events (st/-read store :kotobase.protocols/audit 0)]
+      (is (= 1 (count events)) "exactly one audit entry was appended")
+      (is (= :query (:op (first events))))
+      (is (= :datomic (:surface (first events)))))))
+
+(deftest failed-request-is-not-audited
+  (let [store (fixture-store)
+        ctx {:store store :coll-keys ["users"] :visible? datomic/always-visible?}]
+    (datomic/handle ctx {:method :get :path "/api/query"}) ; 405, never reaches bridge
+    (is (= 0 (count (st/-read store :kotobase.protocols/audit 0)))
+        "a rejected request (bad method/path/edn/shape) never appends an
+        audit event -- it never reached kotobase.query.bridge")))
