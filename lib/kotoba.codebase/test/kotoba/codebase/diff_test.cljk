@@ -1,0 +1,148 @@
+(ns kotoba.codebase.diff-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.authoring :as authoring]
+            [kotoba.codebase.diff :as diff]
+            [kotoba.codebase.evaluator :as evaluator]
+            [kotoba.codebase.store :as store]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-diff-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- with-store [body-fn]
+  (let [root (temp-store)]
+    (try (store/initialize! root) (body-fn root)
+         (finally (delete-tree root)))))
+
+(defn- commit! [root namespace forms]
+  (:head (authoring/update-namespace! root namespace forms)))
+
+(deftest an-authored-change-and-a-carried-one-are-not-the-same-change
+  (with-store
+    (fn [root]
+      (let [before (commit! root "demo" '[(defn double [x] (* x 2))
+                                          (defn quadruple [x] (double (double x)))])
+            after (commit! root "demo" '[(defn double [x] (* x 3))])
+            changes (diff/diff root before after)]
+        (is (= ["double"] (:authored changes)))
+        (is (= ["quadruple"] (:propagated changes))
+            "the dependent's CID moved and nothing about it was written")
+        (is (= :propagated (get-in changes [:changed "quadruple" :kind])))
+        (is (= :authored (get-in changes [:changed "double" :kind])))))))
+
+(deftest a-rename-is-reported-as-a-rename-not-an-add-and-a-remove
+  (with-store
+    (fn [root]
+      (let [before (commit! root "demo" '[(defn double [x] (* x 2))])
+            cid (get (:bindings (store/namespace-view root before)) "double")
+            after (:cid (store/commit-namespace! root "demo" {"twice" cid} before))
+            changes (diff/diff root before after)]
+        (is (= {"double" {:to "twice" :cid cid}} (:renamed changes)))
+        (is (empty? (:added changes)))
+        (is (empty? (:removed changes)))
+        (is (empty? (:changed changes)))))))
+
+(deftest an-interface-change-is-distinguished-from-a-body-change
+  (with-store
+    (fn [root]
+      (let [before (commit! root "demo" '[(defn f [x] (* x 2))])
+            body-only (commit! root "demo" '[(defn f [x] (* x 3))])
+            arity (commit! root "demo" '[(defn f [x y] (* x y))])]
+        (is (= :authored (get-in (diff/diff root before body-only) [:changed "f" :kind])))
+        (is (= :interface-changed
+               (get-in (diff/diff root body-only arity) [:changed "f" :kind]))
+            "callers need to know a break from a fix")))))
+
+(deftest additions-and-removals-are-reported
+  (with-store
+    (fn [root]
+      (let [before (commit! root "demo" '[(defn f [x] x)])
+            head (store/head root "demo")
+            after (:cid (store/commit-namespace! root "demo" {"g" (get (:bindings (store/namespace-view root before)) "f")} head))
+            changes (diff/diff root before after)]
+        (is (= {"f" {:to "g" :cid (get (:bindings (store/namespace-view root before)) "f")}}
+               (:renamed changes)))))))
+
+(deftest two-definitions-are-comparable-without-a-namespace
+  (with-store
+    (fn [root]
+      (let [before (commit! root "demo" '[(defn f [x] (* x 2))])
+            a (get (:bindings (store/namespace-view root before)) "f")
+            after (commit! root "demo" '[(defn f [x] (* x 3))])
+            b (get (:bindings (store/namespace-view root after)) "f")]
+        (is (true? (:identical? (diff/definition-diff root a a))))
+        (is (= :authored (:kind (diff/definition-diff root a b))))))))
+
+;; ---------------------------------------------------------------------------
+;; Conflicts
+
+(deftest a-conflict-is-returned-as-data-and-never-resolved-by-guessing
+  (with-store
+    (fn [root]
+      (let [base (commit! root "demo" '[(defn f [x] x)])
+            left (commit! root "demo" '[(defn f [x] (* x 2))])
+            right (commit! root "other" '[(defn f [x] (* x 3))])
+            found (diff/conflicts root base left right)]
+        (is (= 1 (count found)))
+        (is (= "f" (:name (first found))))
+        (testing "an unresolved conflict keeps the merge unresolved"
+          (is (false? (:resolved? (diff/resolve-conflicts root base left right {})))))))))
+
+(deftest an-explicit-choice-resolves-a-conflict
+  (with-store
+    (fn [root]
+      (let [base (commit! root "demo" '[(defn f [x] x)])
+            left (commit! root "demo" '[(defn f [x] (* x 2))])
+            right (commit! root "other" '[(defn f [x] (* x 3))])
+            left-cid (get (:bindings (store/namespace-view root left)) "f")
+            right-cid (get (:bindings (store/namespace-view root right)) "f")]
+        (is (= left-cid (get (:bindings (diff/resolve-conflicts root base left right
+                                                                {"f" :left}))
+                             "f")))
+        (is (= right-cid (get (:bindings (diff/resolve-conflicts root base left right
+                                                                 {"f" :right}))
+                              "f")))
+        (testing "deleting is a choice too"
+          (is (not (contains? (:bindings (diff/resolve-conflicts root base left right
+                                                                 {"f" :delete}))
+                              "f"))))
+        (testing "and a chosen CID must be one this store actually holds"
+          (is (thrown? kerror/ExceptionInfo
+                       (diff/resolve-conflicts
+                        root base left right
+                        {"f" "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}))))))))
+
+;; ---------------------------------------------------------------------------
+;; Rebase
+
+(deftest a-rebase-replays-what-a-branch-authored-and-re-derives-the-rest
+  (with-store
+    (fn [root]
+      ;; Base: double/quadruple. Branch: re-author `double` only.
+      (let [base (commit! root "base" '[(defn double [x] (* x 2))
+                                        (defn quadruple [x] (double (double x)))])
+            branch (commit! root "branch" '[(defn double [x] (* x 2))
+                                            (defn quadruple [x] (double (double x)))])
+            _ (store/commit-namespace!
+               root "branch"
+               (:bindings (store/namespace-view root branch))
+               (store/head root "branch"))
+            branch-head (:head (authoring/update-namespace!
+                                root "branch" '[(defn double [x] (* x 5))]))
+            ;; Meanwhile the base moved on its own.
+            moved (:head (authoring/update-namespace!
+                          root "base" '[(defn quadruple [x] (double (double (double x))))]))
+            plan (diff/rebase-plan root base branch-head authoring/propagate)
+            applied ((:apply plan) moved)]
+        (is (= ["double"] (vec (keys (:authored plan)))))
+        (is (= ["quadruple"] (:dropped plan))
+            "the branch's carried dependent is re-derived, not transplanted")
+        (doseq [[cid block] (:blocks applied)]
+          (store/put-block! root cid block))
+        (testing "the rebased namespace has the branch's edit and the base's own"
+          ;; base's quadruple is triple-application; branch's double is *5.
+          (is (= 125 (:value (evaluator/invoke root (get (:bindings applied) "quadruple")
+                                               [1])))))))))

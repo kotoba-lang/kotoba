@@ -1,0 +1,110 @@
+(ns kotoba.codebase.authoring-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.authoring :as authoring]
+            [kotoba.codebase.evaluator :as evaluator]
+            [kotoba.codebase.store :as store]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-authoring-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- with-store
+  "Run BODY-FN against a freshly initialized store that is deleted afterwards."
+  [body-fn]
+  (let [root (temp-store)]
+    (try (store/initialize! root) (body-fn root)
+         (finally (delete-tree root)))))
+
+(deftest adds-definitions-and-selects-them-by-name
+  (with-store
+   (fn [root]
+    (let [committed (authoring/update-namespace!
+                     root "scratch" '[(defn double [x] (* x 2))])]
+      (is (true? (:committed? committed)))
+      (is (= :added (get-in committed [:definitions "double" :status])))
+      (is (= 8 (:value (evaluator/invoke root (get-in committed [:bindings "double"])
+                                         [4]))))))))
+
+(deftest an-update-propagates-to-dependents-by-rewriting-their-dependency-cids
+  (with-store
+   (fn [root]
+    (authoring/update-namespace! root "scratch"
+                                 '[(defn double [x] (* x 2))
+                                   (defn quadruple [x] (double (double x)))])
+    (let [before (:bindings (store/namespace-view root (store/head root "scratch")))
+          ;; Only `double` is re-authored. `quadruple` is never recompiled from
+          ;; source -- there is no source for it in this scratch at all.
+          after (authoring/update-namespace! root "scratch"
+                                             '[(defn double [x] (* x 3))])]
+      (is (= :updated (get-in after [:definitions "double" :status])))
+      (is (= :propagated (get-in after [:propagated "quadruple" :status])))
+      (testing "the dependent got a new identity because its dependency did"
+        (is (not= (get before "quadruple") (get-in after [:bindings "quadruple"]))))
+      (testing "and the rewritten dependent evaluates through the new dependency"
+        (is (= 18 (:value (evaluator/invoke root (get-in after [:bindings "quadruple"])
+                                            [2])))))))))
+
+(deftest propagation-is-transitive
+  (with-store
+   (fn [root]
+    (authoring/update-namespace! root "scratch"
+                                 '[(defn base [x] (+ x 1))
+                                   (defn middle [x] (base (base x)))
+                                   (defn top [x] (middle (middle x)))])
+    (let [after (authoring/update-namespace! root "scratch"
+                                             '[(defn base [x] (+ x 10))])]
+      (is (= :propagated (get-in after [:propagated "middle" :status])))
+      (is (= :propagated (get-in after [:propagated "top" :status])))
+      (is (= 40 (:value (evaluator/invoke root (get-in after [:bindings "top"]) [0]))))))))
+
+(deftest an-unchanged-definition-keeps-its-identity
+  (with-store
+   (fn [root]
+    (let [first-commit (authoring/update-namespace!
+                        root "scratch" '[(defn double [x] (* x 2))])
+          second-commit (authoring/update-namespace!
+                         root "scratch" '[(defn double [x] (* x 2))])]
+      (is (= :unchanged (get-in second-commit [:definitions "double" :status])))
+      (is (= (get-in first-commit [:bindings "double"])
+             (get-in second-commit [:bindings "double"])))))))
+
+(deftest a-rename-changes-the-namespace-but-no-definition
+  (with-store
+   (fn [root]
+    (let [added (authoring/update-namespace! root "scratch"
+                                             '[(defn double [x] (* x 2))])
+          cid (get-in added [:bindings "double"])
+          head (store/head root "scratch")
+          renamed (store/commit-namespace! root "scratch" {"twice" cid} head)]
+      (is (not= head (:cid renamed)))
+      (is (= cid (:cid (store/resolve-name root "scratch" "twice"))))
+      (testing "the definition is still evaluable under its new name"
+        (is (= 6 (:value (evaluator/invoke root cid [3])))))))))
+
+(deftest a-plan-describes-the-update-without-writing-anything
+  (with-store
+   (fn [root]
+    (authoring/update-namespace! root "scratch" '[(defn double [x] (* x 2))])
+    (let [head (store/head root "scratch")
+          planned (authoring/plan root "scratch" '[(defn double [x] (* x 5))])]
+      (is (true? (:changed? planned)))
+      (is (= :updated (get-in planned [:definitions "double" :status])))
+      (is (= head (store/head root "scratch"))
+          "planning must not advance the head")
+      (is (= :codebase/block-not-found
+             (:problem (ex-data (try (store/get-block root (get-in planned [:definitions "double" :cid]))
+                                     (catch kerror/ExceptionInfo e e))))))
+      "planning must not persist blocks"))))
+
+(deftest a-stale-plan-cannot-overwrite-a-concurrent-commit
+  (with-store
+   (fn [root]
+    (authoring/update-namespace! root "scratch" '[(defn double [x] (* x 2))])
+    (let [stale (authoring/plan root "scratch" '[(defn double [x] (* x 5))])]
+      (authoring/update-namespace! root "scratch" '[(defn other [x] (+ x 1))])
+      (is (= :codebase/head-conflict
+             (:problem (ex-data (try (authoring/commit! root stale)
+                                     (catch kerror/ExceptionInfo e e))))))))))

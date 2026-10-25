@@ -1,0 +1,135 @@
+(ns kotoba.codebase.actor-test
+  "The loader half of superproject ADR-2608059000: an actor's `code` is a CID
+  that RUNS. What is under test is not that evaluation works — that is
+  `evaluator-test`'s job — but that the seam inga calls is TOTAL, DETERMINISTIC
+  and bounded to the actor's own state, because those are the three properties
+  a consensus machine cannot check for itself."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [ipld.core :as ipld]
+            [ipld.value :as value]
+            [kotoba.codebase.actor :as actor]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-actor-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- store-definitions! [root forms]
+  (let [compiled (semantic/compile-definitions forms)]
+    (into {}
+          (map (fn [[name {:keys [cid block type-cid type-block
+                                  group-cid group-block]}]]
+                 (when type-cid (store/put-block! root type-cid type-block))
+                 (when group-cid (store/put-block! root group-cid group-block))
+                 (store/put-block! root cid block)
+                 [(str name) cid]))
+          (:definitions compiled))))
+
+(def ^:private actor-forms
+  '[(defn credit [state message] (if state (+ state 1) 1))
+    (defn echoes [state message] (get message :method))
+    (defn spins [state message] (spins state message))
+    (def not-a-function 41)])
+
+(defn- with-actors [f]
+  (let [root (temp-store)
+        blocks (atom {})]
+    (try
+      (store/initialize! root)
+      (f {:cids (store-definitions! root actor-forms)
+          :blocks blocks
+          :invoke (actor/invoke-fn
+                   {:codebase root
+                    :get-fn (fn [cid] (get @blocks cid))
+                    :put! (fn [cid bytes] (swap! blocks assoc cid bytes))})})
+      (finally (delete-tree root)))))
+
+(defn- decoded [blocks cid]
+  (value/decode-value (get @blocks cid)))
+
+(deftest an-actor-advances-its-own-state-from-its-hash-alone
+  (with-actors
+    (fn [{:keys [cids blocks invoke]}]
+      (let [first-call (invoke {:address "alice" :caller "alice"
+                                :code (get cids "credit") :state nil
+                                :method "credit" :args []})
+            second-call (invoke {:address "alice" :caller "alice"
+                                 :code (get cids "credit") :state (:state first-call)
+                                 :method "credit" :args []})]
+        (is (= 1 (decoded blocks (:state first-call)))
+            "an actor that has never written a state sees nil and starts")
+        (is (= 2 (decoded blocks (:state second-call)))
+            "and the next call sees what the previous one wrote")
+        (is (re-find #"^b" (:state second-call))
+            "the answer is a CIDv1, which is what the machine stores")))))
+
+(deftest the-message-reaches-the-definition
+  (testing "method, args and caller are the only ambient input an actor gets"
+    (with-actors
+      (fn [{:keys [cids blocks invoke]}]
+        (let [r (invoke {:address "alice" :caller "bob" :code (get cids "echoes")
+                         :state nil :method "transfer" :args [1 2]})]
+          (is (= "transfer" (decoded blocks (:state r)))))))))
+
+(deftest the-same-call-produces-the-same-cid
+  (testing "two replicas running one block must agree, and this is why they can"
+    (with-actors
+      (fn [{:keys [cids invoke]}]
+        (is (= (:state (invoke {:address "alice" :caller "alice"
+                                :code (get cids "credit") :state nil :method "credit"}))
+               (:state (invoke {:address "alice" :caller "alice"
+                                :code (get cids "credit") :state nil :method "credit"})))
+            "canonical value encoding, so equal values are equal bytes are one CID")))))
+
+;; ── totality: every named problem becomes a refusal ─────────────────────────
+
+(deftest running-out-of-fuel-refuses-rather-than-throws
+  (with-actors
+    (fn [{:keys [cids invoke]}]
+      (is (= {:refused :fuel-exhausted}
+             (invoke {:address "alice" :caller "alice" :code (get cids "spins")
+                      :state nil :method "spin" :args [] :fuel 50}))
+          "unbounded recursion is bounded input, not a reason to leave the protocol"))))
+
+(deftest a-definition-that-is-not-a-function-is-refused
+  (with-actors
+    (fn [{:keys [cids invoke]}]
+      (is (= {:refused :not-callable}
+             (invoke {:address "alice" :caller "alice"
+                      :code (get cids "not-a-function")
+                      :state nil :method "anything" :args [:x]}))))))
+
+(deftest code-that-is-not-in-the-store-is-refused
+  (with-actors
+    (fn [{:keys [invoke]}]
+      (is (= {:refused :no-code}
+             (invoke {:address "alice" :caller "alice"
+                      :code (ipld/cid (ipld/encode {"absent" true}))
+                      :state nil :method "anything" :args []}))))))
+
+(deftest a-state-block-that-does-not-hash-to-its-cid-is-NOT-a-refusal
+  (testing "a corrupt store is a storage fault; reporting it as a misbehaving actor
+            would hide the one failure the CID exists to detect"
+    (let [root (temp-store)]
+      (try
+        (store/initialize! root)
+        (let [cids (store-definitions! root actor-forms)
+              honest (ipld/cid (value/encode-value 7))
+              invoke (actor/invoke-fn
+                      {:codebase root
+                       :get-fn (fn [_] (value/encode-value 8))   ; wrong bytes
+                       :put! (fn [_ _])})]
+          (is (thrown? kerror/ExceptionInfo
+                       (invoke {:address "alice" :caller "alice"
+                                :code (get cids "credit") :state honest
+                                :method "credit" :args []}))))
+        (finally (delete-tree root))))))
+
+(deftest the-seam-refuses-to-be-built-without-its-store
+  (is (thrown? kerror/ExceptionInfo (actor/invoke-fn {:codebase nil})))
+  (is (thrown? kerror/ExceptionInfo
+               (actor/invoke-fn {:codebase "x" :get-fn (fn [_])}))))

@@ -1,0 +1,143 @@
+(ns kotoba.codebase.evaluator-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.evaluator :as evaluator]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]))
+
+(defn- temp-store []
+  (kio/temp-dir
+            "kotoba-evaluator-"))
+
+(defn- delete-tree [root]
+  (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f)))
+
+(defn- store-definitions!
+  "Compile FORMS and persist every produced block, returning name -> CID."
+  [root forms]
+  (let [compiled (semantic/compile-definitions forms)]
+    (into {}
+          (map (fn [[name {:keys [cid block type-cid type-block
+                                  group-cid group-block]}]]
+                 (when type-cid (store/put-block! root type-cid type-block))
+                 (when group-cid (store/put-block! root group-cid group-block))
+                 (store/put-block! root cid block)
+                 [(str name) cid]))
+          (:definitions compiled))))
+
+(deftest evaluates-a-definition-from-its-cid-alone
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions! root '[(defn increment [x] (+ x 1))])
+            {:keys [value]} (evaluator/evaluate root (get cids "increment"))]
+        (is (fn? value))
+        (is (= 4 (value 3))))
+      (finally (delete-tree root)))))
+
+(deftest hydrates-transitive-dependencies-by-cid
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions! root '[(defn double [x] (* x 2))
+                                            (defn quadruple [x] (double (double x)))])
+            result (evaluator/invoke root (get cids "quadruple") [3])]
+        (is (= 12 (:value result)))
+        (testing "the dependency is reachable by hash with no name bound to it"
+          (is (nil? (store/head root "any-namespace")))))
+      (finally (delete-tree root)))))
+
+(deftest evaluates-a-self-recursive-group
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions!
+                  root '[(defn countdown [n] (if (zero? n) 0 (countdown (dec n))))])
+            result (evaluator/invoke root (get cids "countdown") [5])]
+        (is (= 0 (:value result))))
+      (finally (delete-tree root)))))
+
+(deftest evaluates-a-mutually-recursive-group
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions!
+                  root '[(defn even-n? [n] (if (zero? n) true (odd-n? (dec n))))
+                         (defn odd-n? [n] (if (zero? n) false (even-n? (dec n))))])]
+        (is (true? (:value (evaluator/invoke root (get cids "even-n?") [4]))))
+        (is (false? (:value (evaluator/invoke root (get cids "odd-n?") [4])))))
+      (finally (delete-tree root)))))
+
+(deftest evaluates-collections-let-and-closures
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions!
+                  root '[(defn tally [xs] (let [n (count xs) m {:n n}] (get m :n)))
+                         (defn adder [n] (fn [x] (+ x n)))
+                         (defn add-five [x] ((adder 5) x))])]
+        (is (= 3 (:value (evaluator/invoke root (get cids "tally") [[1 2 3]]))))
+        (is (= 11 (:value (evaluator/invoke root (get cids "add-five") [6])))))
+      (finally (delete-tree root)))))
+
+(deftest refuses-to-grant-capabilities-during-pure-evaluation
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions! root '[(defn peek-cap [] (has-capability? :log/write))]
+                                     )]
+        (is (= :codebase/effect-not-permitted
+               (:problem (ex-data (try (evaluator/invoke root (get cids "peek-cap") [])
+                                       (catch kerror/ExceptionInfo e e)))))))
+      (finally (delete-tree root)))))
+
+(deftest bounds-runaway-recursion-before-the-host-stack
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions!
+                  root '[(defn forever [n] (forever (inc n)))])]
+        (is (= :codebase/call-depth-exceeded
+               (:problem (ex-data (try (evaluator/invoke root (get cids "forever") [0])
+                                       (catch kerror/ExceptionInfo e e)))))))
+      (finally (delete-tree root)))))
+
+(deftest bounds-total-work-with-fuel
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions!
+                  root '[(defn countdown [n] (if (zero? n) 0 (countdown (dec n))))])]
+        (is (= :codebase/fuel-exhausted
+               (:problem (ex-data (try (evaluator/invoke root (get cids "countdown") [100]
+                                                         {:fuel 50})
+                                       (catch kerror/ExceptionInfo e e)))))))
+      (finally (delete-tree root)))))
+
+(deftest a-missing-dependency-fails-closed
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [compiled (semantic/compile-definitions
+                      '[(defn double [x] (* x 2))
+                        (defn quadruple [x] (double (double x)))])
+            {:keys [cid block type-cid type-block]} (get (:definitions compiled) 'quadruple)]
+        ;; Persist only the dependent: its dependency is named nowhere and
+        ;; therefore cannot be found by any fallback.
+        (store/put-block! root type-cid type-block)
+        (store/put-block! root cid block)
+        (is (= :codebase/block-not-found
+               (:problem (ex-data (try (evaluator/invoke root cid [2])
+                                       (catch kerror/ExceptionInfo e e)))))))
+      (finally (delete-tree root)))))
+
+(deftest reports-fuel-left-after-the-call-not-before-it
+  (let [root (temp-store)]
+    (try
+      (store/initialize! root)
+      (let [cids (store-definitions!
+                  root '[(defn countdown [n] (if (zero? n) 0 (countdown (dec n))))])
+            evaluated (evaluator/evaluate root (get cids "countdown"))
+            invoked (evaluator/invoke root (get cids "countdown") [20])]
+        ;; Evaluating a `defn` only builds the closure; the work is in the call.
+        (is (< (:fuel-remaining invoked) (:fuel-remaining evaluated))))
+      (finally (delete-tree root)))))

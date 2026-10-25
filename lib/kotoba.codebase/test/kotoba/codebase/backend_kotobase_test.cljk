@@ -1,0 +1,121 @@
+(ns kotoba.codebase.backend-kotobase-test
+  "A codebase that never touches a filesystem.
+
+  The claim S1 makes is narrow and worth testing exactly: the store is a value
+  now, so the SAME definition graph authored, hydrated by CID and evaluated
+  through the same public API works over a backend with no directory at all.
+  If any of `store`'s callers had kept reaching for a path, this suite would
+  not run."
+  (:require [kotoba.lang.error :as kerror] [kotoba.io :as kio] [kotoba.test :refer [deftest is testing]]
+            [kotoba.codebase.backend :as backend]
+            [kotoba.codebase.backend.kotobase :as kotobase-backend]
+            [kotoba.codebase.evaluator :as evaluator]
+            [kotoba.codebase.semantic-code :as semantic]
+            [kotoba.codebase.store :as store]
+            [kotobase.storage.memory :as memory]))
+
+(defn- memory-codebase []
+  (kotobase-backend/open (memory/memory-store)))
+
+(defn- store-definitions!
+  [root forms]
+  (let [compiled (semantic/compile-definitions forms)]
+    (into {}
+          (map (fn [[name {:keys [cid block type-cid type-block
+                                  group-cid group-block]}]]
+                 (when type-cid (store/put-block! root type-cid type-block))
+                 (when group-cid (store/put-block! root group-cid group-block))
+                 (store/put-block! root cid block)
+                 [(str name) cid]))
+          (:definitions compiled))))
+
+(deftest refuses-to-work-before-initialization
+  (let [root (memory-codebase)]
+    (is (= :codebase/not-initialized
+           (:problem (ex-data (try (store/block-cids root)
+                                   (catch kerror/ExceptionInfo e e))))))))
+
+(deftest evaluates-a-definition-from-its-cid-with-no-filesystem
+  (let [root (memory-codebase)]
+    (store/initialize! root)
+    (let [cids (store-definitions! root '[(defn double [x] (* x 2))
+                                          (defn quadruple [x] (double (double x)))])
+          result (evaluator/invoke root (get cids "quadruple") [3])]
+      (is (= 12 (:value result))
+          "a transitive dependency hydrated by CID out of a non-filesystem store"))))
+
+(deftest a-block-is-still-verified-by-the-caller-not-the-backend
+  (testing "the seam moves bytes; it does not get to decide they are right"
+    (let [root (memory-codebase)]
+      (store/initialize! root)
+      (let [{:keys [cid block]} (-> (semantic/compile-definitions
+                                     '[(defn increment [x] (+ x 1))])
+                                    :definitions first val)]
+        (store/put-block! root cid block)
+        (is (= :codebase/cid-mismatch
+               (:problem (ex-data (try (store/put-block! root cid {"schema" "lie"})
+                                       (catch kerror/ExceptionInfo e e))))))))))
+
+(defn- unrelated-cid []
+  ;; A well-formed CID that is not this namespace's head. It has to be real:
+  ;; a bogus string fails while ENCODING the commit's parent link, which would
+  ;; test the wrong thing entirely.
+  (:cid (semantic/namespace-commit {:parents [] :bindings {}})))
+
+(deftest head-compare-and-set-loses-honestly
+  (let [root (memory-codebase)
+        {:keys [cid block]} (-> (semantic/compile-definitions
+                                 '[(defn increment [x] (+ x 1))])
+                                :definitions first val)]
+    (store/initialize! root)
+    (store/put-block! root cid block)
+    (testing "an absent head is not a won race"
+      (is (nil? (store/head root "demo")))
+      (is (= :codebase/head-conflict
+             (:problem (ex-data (try (store/commit-namespace!
+                                      root "demo" {"f" cid} (unrelated-cid))
+                                     (catch kerror/ExceptionInfo e e)))))))
+    (testing "and a real commit moves it"
+      (let [commit (store/commit-namespace! root "demo" {"f" cid} nil)]
+        (is (= (:cid commit) (store/head root "demo")))
+        (testing "a stale expected-head loses against the head it just set"
+          (is (= :codebase/head-conflict
+                 (:problem (ex-data (try (store/commit-namespace!
+                                          root "demo" {"f" cid} nil)
+                                         (catch kerror/ExceptionInfo e e)))))))))))
+
+(deftest enumeration-is-refused-rather-than-answered-wrong
+  (testing "a store with no directory to read must not report an empty codebase"
+    (let [root (memory-codebase)]
+      (store/initialize! root)
+      (is (= :codebase/enumeration-unsupported
+             (:problem (ex-data (try (store/block-cids root)
+                                     (catch kerror/ExceptionInfo e e)))))))))
+
+(deftest the-cache-becomes-a-pointer-because-its-key-is-not-its-hash
+  (let [root (memory-codebase)
+        c (unrelated-cid)
+        descriptor {:code-closure-cid c :compiler-contract-cid c
+                    :target-abi "wasm32" :package-lock-cid c
+                    :policy-cid c :input-cids [] :effects []}]
+    (store/initialize! root)
+    (is (nil? (store/cache-get root descriptor)))
+    (let [key (store/cache-put! root descriptor {"artifact" c})]
+      (is (string? key))
+      (is (= {"artifact" c} (store/cache-get root descriptor)))
+      (testing "the same descriptor with a different result is a conflict, not a silent overwrite"
+        (is (= :codebase/cache-conflict
+               (:problem (ex-data (try (store/cache-put! root descriptor
+                                                         {"artifact" "other"})
+                                       (catch kerror/ExceptionInfo e e))))))))))
+
+(deftest a-path-still-means-the-filesystem-layout
+  (testing "coercion keeps every existing caller working unchanged"
+    (let [dir (kio/temp-dir
+                        "kotoba-backend-")]
+      (try
+        (is (not (backend/store? dir)) "a path is not yet a store")
+        (is (backend/store? (backend/coerce dir)) "coercion makes it one")
+        (store/initialize! dir)
+        (is (= [] (store/block-cids dir)))
+        (finally (doseq [f (reverse (file-seq dir))] (.delete ^java.io.File f)))))))
