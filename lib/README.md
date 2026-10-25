@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.kotobaTaskdag` | `kotoba.kotobaTaskdag/src` | `task-graph.core`, `task-graph.langgraph` (Kotoba project library) |
 | `kotoba.kotobaCode` | `kotoba.kotobaCode/src` | `kotoba-code.agent`, `kotoba-code.composer-input`, `kotoba-code.durable`, `kotoba-code.gate` (Kotoba project library) |
 | `kotoba.koe` | `kotoba.koe/src` | `koe.arrival`, `koe.bridge`, `koe.carrier`, `koe.media` (Kotoba project library) |
 | `kotoba.kekkai` | `kotoba.kekkai/src` | `kekkai.acl`, `kekkai.cacao`, `kekkai.cli`, `kekkai.coordllm` (Kotoba project library) |
