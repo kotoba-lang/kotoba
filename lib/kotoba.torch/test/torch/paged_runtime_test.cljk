@@ -1,0 +1,52 @@
+(ns torch.paged-runtime-test
+  (:require [kotoba.test :refer [deftest is]]
+            [torch.kv-cache :as kv]
+            [torch.paged-runtime :as paged]))
+
+(defn- recording-storage [events]
+  {:write! (fn [key value block offset]
+             (swap! events conj [:write key value block offset]))
+   :copy-block! (fn [source destination tokens]
+                  (swap! events conj [:copy source destination tokens]))
+   :attention (fn [query blocks length]
+                (swap! events conj [:attention query blocks length])
+                {:query query :blocks blocks :length length})})
+
+(deftest allocator-placements-drive-storage-in-queue-order
+  (let [events (atom [])
+        r0 (-> (paged/runtime (kv/pool 4 4) (recording-storage events))
+               (paged/allocate-sequence :parent))
+        first-write (paged/append-kv! r0 :parent :k0 :v0)
+        r1 (:runtime first-write)
+        r2 (paged/fork-sequence r1 :parent :child)
+        child-write (paged/append-kv! r2 :child :kc :vc)
+        r3 (:runtime child-write)]
+    (is (= {:block 0 :offset 0} (:placement first-write)))
+    (is (= {:block 1 :offset 1 :copy {:from 0 :to 1 :tokens 1}}
+           (:placement child-write)))
+    (is (= [[:write :k0 :v0 0 0]
+            [:copy 0 1 1]
+            [:write :kc :vc 1 1]]
+           @events)
+        "copy-on-write is dispatched before the divergent token write")
+    (is (= {:query :q :blocks [1] :length 2}
+           (paged/attention r3 :child :q)))
+    (is (= [:attention :q [1] 2] (last @events)))
+    (is (kv/valid? (:pool r3)))))
+
+(deftest released-blocks-are-reused-by-the-same-physical-storage
+  (let [events (atom [])
+        r0 (paged/runtime (kv/pool 1 2) (recording-storage events))
+        r1 (paged/allocate-sequence r0 :first)
+        r2 (:runtime (paged/append-kv! r1 :first :ka :va))
+        r3 (paged/release-sequence r2 :first)
+        r4 (paged/allocate-sequence r3 :second)
+        second-write (paged/append-kv! r4 :second :kb :vb)]
+    (is (= 0 (get-in second-write [:placement :block])))
+    (is (= [[:write :ka :va 0 0] [:write :kb :vb 0 0]] @events))
+    (is (kv/valid? (get-in second-write [:runtime :pool])))))
+
+(deftest invalid-storage-contract-is-rejected-up-front
+  (is (thrown-with-msg?
+       #?(:clj Exception :cljs js/Error) #"missing callbacks"
+       (paged/runtime (kv/pool 1 1) {:write! identity}))))

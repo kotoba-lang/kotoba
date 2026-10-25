@@ -1,0 +1,116 @@
+(ns torch.model-registry-test
+  (:require [kotoba.test :refer [deftest is]]
+            [torch.model-registry :as registry]))
+
+(defn- fixture [budget events]
+  (-> (registry/registry
+       budget
+       (fn [descriptor]
+         (let [resource {:handle (:name descriptor)}]
+           (swap! events conj [:load (:name descriptor)])
+           resource))
+       (fn [resource] (swap! events conj [:unload (:handle resource)])))
+      (registry/register {:name "a" :size 60 :digest "sha:a"})
+      (registry/register {:name "b" :size 40 :digest "sha:b"})
+      (registry/register {:name "c" :size 70 :digest "sha:c"})))
+
+(deftest lazy-load-refcount-keep-alive-and-expiry
+  (let [events (atom [])
+        r0 (fixture 100 events)
+        a1 (registry/acquire r0 "a" 10)
+        a2 (registry/acquire (:registry a1) "a" 11)
+        released1 (registry/release (:registry a2) "a" 20 100)
+        released2 (registry/release released1 "a" 21 100)
+        before (registry/expire released2 120)
+        after (registry/expire before 121)]
+    (is (:loaded? a1))
+    (is (false? (:loaded? a2)))
+    (is (identical? (:resource a1) (:resource a2)))
+    (is (= 2 (get-in (:registry a2) [:loaded "a" :active])))
+    (is (contains? (:loaded before) "a"))
+    (is (empty? (:loaded after)))
+    (is (= [[:load "a"] [:unload "a"]] @events))
+    (is (= {:loads 1 :unloads 1 :evictions 0 :acquires 2 :releases 2
+            :resident-bytes 0 :budget-bytes 100 :loaded-models 0
+            :catalog-models 3}
+           (registry/stats after)))))
+
+(deftest lru-eviction-frees-enough-inactive-models
+  (let [events (atom [])
+        r0 (fixture 100 events)
+        a (registry/acquire r0 "a" 1)
+        r1 (registry/release (:registry a) "a" 2 -1)
+        b (registry/acquire r1 "b" 3)
+        r2 (registry/release (:registry b) "b" 4 -1)
+        c (registry/acquire r2 "c" 5)]
+    (is (= ["a" "b"] (:evicted c)))
+    (is (= #{"c"} (set (keys (get-in c [:registry :loaded])))))
+    (is (= 70 (get-in c [:registry :resident-bytes])))
+    (is (= [[:load "a"] [:load "b"] [:load "c"]
+            [:unload "a"] [:unload "b"]]
+           @events))))
+
+(deftest active-models-are-never-evicted-and-explicit-unload-is-safe
+  (let [events (atom [])
+        r0 (fixture 100 events)
+        a (registry/acquire r0 "a" 1)]
+    (is (thrown-with-msg?
+         #?(:clj Exception :cljs js/Error) #"active models"
+         (registry/acquire (:registry a) "c" 2)))
+    (is (= #{"a"} (set (keys (get-in a [:registry :loaded]))))
+        "failed admission leaves the prior immutable ownership state valid")
+    (is (thrown-with-msg?
+         #?(:clj Exception :cljs js/Error) #"active model"
+         (registry/unload (:registry a) "a")))
+    (let [forced (registry/unload (:registry a) "a" true)]
+      (is (empty? (:loaded forced)))
+      (is (= [[:load "a"] [:load "c"] [:unload "c"] [:unload "a"]]
+             @events)))))
+
+(deftest catalog-tags-report-residency
+  (let [events (atom [])
+        r0 (fixture 100 events)
+        a (registry/acquire r0 "a" 1)
+        tags (registry/tags (:registry a))]
+    (is (= ["a" "b" "c"] (mapv :name tags)))
+    (is (= [true false false] (mapv :loaded tags)))
+    (is (= [1 0 0] (mapv :active tags)))))
+
+(deftest running-models-and-descriptions-reflect-live-state
+  (let [events (atom [])
+        registered (registry/register
+                    (fixture 100 events)
+                    {:name "meta" :size 10 :details {:format "gguf"}})
+        acquired (registry/acquire registered "meta" 10)
+        released (registry/release (:registry acquired) "meta" 20 50)]
+    (is (= {:format "gguf"} (:details (registry/describe released "meta"))))
+    (is (= [{:name "meta" :model "meta" :size 10 :size-vram 10
+             :details {:format "gguf"} :expires-at-ms 70}]
+           (registry/running-models released)))
+    (is (thrown-with-msg?
+         #?(:clj Exception :cljs js/Error) #"unknown model"
+         (registry/describe released "missing")))
+    (is (empty? (registry/running-models (registry/expire released 70))))))
+
+(deftest copy-and-delete-model-lifecycle
+  (let [events (atom [])
+        original (fixture 100 events)
+        copied (registry/copy-model original "a" "a-backup")]
+    (is (= ["a" "a-backup" "b" "c"]
+           (mapv :name (registry/tags copied))))
+    (is (= "sha:a" (:digest (registry/describe copied "a-backup"))))
+    (is (thrown-with-msg?
+         #?(:clj Exception :cljs js/Error) #"already exists"
+         (registry/copy-model copied "a" "a-backup")))
+    (let [acquired (registry/acquire copied "a-backup" 1)]
+      (is (thrown-with-msg?
+           #?(:clj Exception :cljs js/Error) #"active model"
+           (registry/delete-model (:registry acquired) "a-backup")))
+      (let [released (registry/release (:registry acquired) "a-backup" 2 -1)
+            deleted (registry/delete-model released "a-backup")]
+        (is (nil? (get-in deleted [:catalog "a-backup"])))
+        (is (nil? (get-in deleted [:loaded "a-backup"])))
+        (is (= [[:load "a-backup"] [:unload "a-backup"]] @events))))
+    (is (thrown-with-msg?
+         #?(:clj Exception :cljs js/Error) #"unknown model"
+         (registry/delete-model original "missing")))))

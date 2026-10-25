@@ -1,0 +1,62 @@
+(ns torch.registry-runtime-test
+  (:require [kotoba.test :refer [deftest is]]
+            [torch.gguf :as gguf]
+            [torch.gguf-resource :as resource]
+            [torch.model-registry :as registry]
+            [torch.num-backend :as nb]
+            [torch.registry-runtime :as runtime])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(deftest concurrent-acquire-release-runs-lifecycle-effects-once
+  (let [events (atom [])
+        registry* (-> (registry/registry
+                       100
+                       (fn [descriptor]
+                         (swap! events conj [:load (:name descriptor)])
+                         {:model (:name descriptor)})
+                       (fn [resource]
+                         (swap! events conj [:unload (:model resource)])))
+                      (registry/register {:name "shared" :size 80}))
+        runtime* (runtime/runtime registry*)
+        acquires (doall (map deref
+                             (repeatedly 24
+                                         #(future
+                                            (runtime/acquire! runtime* "shared" 10)))))
+        releases (doall (map deref
+                             (repeatedly 24
+                                         #(future
+                                            (runtime/release! runtime* "shared"
+                                                              20 0)))))]
+    (is (= 24 (count acquires)))
+    (is (= 24 (count releases)))
+    (is (= 0 (get-in (runtime/snapshot runtime*) [:loaded "shared" :active])))
+    (runtime/expire! runtime* 20)
+    (is (= [[:load "shared"] [:unload "shared"]] @events))
+    (is (= 24 (:acquires (runtime/stats runtime*))))
+    (is (= 24 (:releases (runtime/stats runtime*))))))
+
+(deftest gguf-resource-factory-bundles-and-releases-runtime-parts
+  (let [path (Files/createTempFile "torch-resource-" ".gguf"
+                                   (make-array FileAttribute 0))
+        released (atom nil)]
+    (try
+      (Files/write path (byte-array [1 2 3 4])
+                   (make-array java.nio.file.OpenOption 0))
+      (let [descriptor (resource/descriptor "tiny" path {:digest "sha:test"})]
+        (is (= 4 (:size descriptor)))
+        (with-redefs [gguf/load-file (fn [_] :file)
+                      gguf/llama-model (fn [_] :model)
+                      gguf/gguf-tokenizer (fn [_] :tokenizer)
+                      gguf/load-llama-weights (fn [_ backend]
+                                                [{:w [:weights backend]}])
+                      nb/release-weights! #(reset! released %)]
+          (let [loaded (resource/load-resource
+                        :backend descriptor #(assoc % :kind :engine))]
+            (is (= :model (:model loaded)))
+            (is (= :tokenizer (:tokenizer loaded)))
+            (is (= :engine (get-in loaded [:engine :kind])))
+            (is (= descriptor (get-in loaded [:engine :descriptor])))
+            (resource/unload-resource! loaded)
+            (is (= (:weights loaded) @released)))))
+      (finally (Files/deleteIfExists path)))))

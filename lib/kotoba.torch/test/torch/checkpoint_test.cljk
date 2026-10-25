@@ -1,0 +1,127 @@
+(ns torch.checkpoint-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [num.array :as arr]
+            [num.cpu :as cpu]
+            [torch.checkpoint :as checkpoint]
+            [torch.model :as model]
+            [torch.num-backend :as nb]
+            [torch.optim :as optim]
+            [torch.safetensors :as safe]
+            [torch.train :as train])
+  (:import [java.nio.file Files]
+           [java.nio.file.attribute FileAttribute]))
+
+(def backend (cpu/cpu-backend))
+
+(defn- temp-checkpoint []
+  (Files/createTempFile "torch-training-" ".safetensors"
+                        (make-array FileAttribute 0)))
+
+(defn- arrays [nested]
+  (for [layer nested :when layer [_ value] layer] value))
+
+(defn- same-arrays? [left right]
+  (and (= (mapv :shape (arrays left)) (mapv :shape (arrays right)))
+       (= (mapv arr/->vec (arrays left)) (mapv arr/->vec (arrays right)))))
+
+(defn- close-arrays? [left right]
+  (and (= (mapv :shape (arrays left)) (mapv :shape (arrays right)))
+       (every? #(< (Math/abs %) 1.0e-6)
+               (map - (mapcat arr/->vec (arrays left))
+                      (mapcat arr/->vec (arrays right))))))
+
+(defn- slot-values [state]
+  (mapv (fn [slot]
+          (when slot
+            (into (sorted-map)
+                  (map (fn [[key {:keys [moment variance]}]]
+                         [key [(arr/->vec moment) (arr/->vec variance)]]))
+                  slot)))
+        (:slots state)))
+
+(defn- train-steps [model* input target count state options]
+  (loop [remaining count
+         weights (:weights state)
+         optimizer-state (:optimizer-state state)
+         scaler (:scaler state)
+         losses []]
+    (if (zero? remaining)
+      {:weights weights :optimizer-state optimizer-state
+       :scaler scaler :losses losses}
+      (let [{:keys [loss gradients]}
+            (train/loss-and-gradients model* weights input target
+                                      {:loss-scale (:scale scaler)})
+            update (optim/scaled-adamw-step weights gradients optimizer-state
+                                             scaler options)]
+        (recur (dec remaining) (:weights update) (:optimizer-state update)
+               (:scaler update) (conj losses loss))))))
+
+(deftest writer-roundtrips-and-atomically-replaces
+  (let [model* (model/sequential (model/linear 2 3))
+        first-weights (nb/random-weights backend model* 10)
+        second-weights (nb/random-weights backend model* 11)
+        path (temp-checkpoint)]
+    (try
+      (safe/save-weights! path model* first-weights {"run" "first"})
+      (safe/save-weights! path model* second-weights {"run" "second"})
+      (with-open [file (safe/open-file path)]
+        (is (= "second" (get (:metadata file) "run")))
+        (is (= ["layers.0.bias" "layers.0.weight"]
+               (safe/tensor-names file))))
+      (is (close-arrays? second-weights
+                         (safe/load-weights path backend model*)))
+      (finally (Files/deleteIfExists path)))))
+
+(deftest nested-module-checkpoint-preserves-structural-tensor-names
+  (let [model* (model/sequential
+                (model/linear 2 3)
+                (model/sequential (model/relu) (model/linear 3 1)))
+        weights (nb/random-weights backend model* 12)
+        path (temp-checkpoint)]
+    (try
+      (safe/save-weights! path model* weights)
+      (with-open [file (safe/open-file path)]
+        (is (= ["layers.0.bias" "layers.0.weight"
+                "layers.1.layers.1.bias" "layers.1.layers.1.weight"]
+               (safe/tensor-names file))))
+      (is (close-arrays? weights (safe/load-weights path backend model*)))
+      (finally (Files/deleteIfExists path)))))
+
+(deftest resumed-adamw-gradscaler-trajectory-equals-continuous-training
+  (let [model* (model/sequential (model/linear 2 4)
+                                 (model/silu)
+                                 (model/linear 4 2))
+        input (arr/from-vec backend [1.0 0.0, 0.0 1.0, 1.0 1.0] [3 2])
+        target (arr/from-vec backend [0.8 0.1, 0.2 0.9, 0.9 0.2] [3 2])
+        initial {:weights (nb/random-weights backend model* 91)
+                 :optimizer-state nil
+                 :scaler (optim/grad-scaler {:initial-scale 16.0
+                                             :growth-interval 2})}
+        options {:learning-rate 0.01 :weight-decay 0.001}
+        continuous (train-steps model* input target 8 initial options)
+        prefix (train-steps model* input target 3 initial options)
+        path (temp-checkpoint)]
+    (try
+      (checkpoint/save-checkpoint!
+       path model* (:weights prefix)
+       {:optimizer-state (:optimizer-state prefix)
+        :optimizer-options options
+        :scaler (:scaler prefix)
+        :training-state {:epoch 2 :batch 7}})
+      (let [restored (checkpoint/load-checkpoint path backend model*)
+            suffix (train-steps model* input target 5 restored options)]
+        (testing "all restart-critical scalar state is restored"
+          (is (= {:epoch 2 :batch 7} (:training-state restored)))
+          (is (= options (:optimizer-options restored)))
+          (is (= (:scaler prefix) (:scaler restored)))
+          (is (= (:step (:optimizer-state prefix))
+                 (:step (:optimizer-state restored))))
+          (is (= (slot-values (:optimizer-state prefix))
+                 (slot-values (:optimizer-state restored)))))
+        (testing "checkpoint interruption does not alter the training trajectory"
+          (is (= (:losses continuous) (into (:losses prefix) (:losses suffix))))
+          (is (same-arrays? (:weights continuous) (:weights suffix)))
+          (is (= (slot-values (:optimizer-state continuous))
+                 (slot-values (:optimizer-state suffix))))
+          (is (= (:scaler continuous) (:scaler suffix)))))
+      (finally (Files/deleteIfExists path)))))

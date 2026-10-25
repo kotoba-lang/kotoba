@@ -1,0 +1,194 @@
+(ns torch.core-test
+  (:require [torch.model :as m]
+            [torch.shape :as shape]
+            [torch.ports :as ports]
+            [torch.validate :as v]
+            [torch.core :as core]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test    :refer-macros [deftest is testing]])))
+
+;; ---------------------------------------------------------------------------
+;; model: builders & normalization
+;; ---------------------------------------------------------------------------
+
+(deftest model-normalize
+  (testing "a bare vector of layers becomes an implicit sequential"
+    (let [norm (m/normalize [{:linear [784 256]} {:relu {}}])]
+      (is (= :sequential (:torch/module norm)))
+      (is (= 2 (count (:torch/layers norm))))))
+  (testing "builders produce one-key layer literals"
+    (is (= {:linear [784 256]} (m/linear 784 256)))
+    (is (= {:relu {}} (m/relu)))
+    (is (= {:silu {}} (m/silu)))
+    (is (= {:rmsnorm [16]} (m/rmsnorm 16)))
+    (is (= {:llama-block [16 4 32]} (m/llama-block 16 4 32)))
+    (is (= {:groupnorm [4 32]} (m/groupnorm 4 32)))
+    (is (= {:attention {}} (m/attention)))
+    (is (= {:multihead-attention [64 8]} (m/multihead-attention 64 8)))
+    (is (= {:multihead-attention [64 8 {:causal? true}]}
+           (m/multihead-attention 64 8 {:causal? true})))
+    (is (= {:conv2d [3 16 3 2 1]} (m/conv2d 3 16 3 2 1))))
+  (testing "layer-type / layer-args read a literal; model? distinguishes modules"
+    (is (= :linear (m/layer-type {:linear [10 20]})))
+    (is (= [10 20] (m/layer-args {:linear [10 20]})))
+    (is (m/model? (m/sequential (m/relu))))
+    (is (not (m/model? {:relu {}})))))
+
+;; ---------------------------------------------------------------------------
+;; shape: per-layer semantics
+;; ---------------------------------------------------------------------------
+
+(deftest shape-linear
+  (is (= [:ok [256]] (shape/layer-shape :linear [784 256] [784])))
+  (testing "rank>1: only the last dim changes"
+    (is (= [:ok [32 256]] (shape/layer-shape :linear [784 256] [32 784]))))
+  (testing "in-features mismatch is an error, not a throw"
+    (is (= :error (first (shape/layer-shape :linear [784 256] [100]))))))
+
+(deftest shape-conv-and-pool
+  (testing "conv2d over a CHW image, with stride/pad"
+    (is (= [:ok [16 32 32]] (shape/layer-shape :conv2d [3 16 3 1 1] [3 32 32])))
+    (is (= [:ok [16 30 30]] (shape/layer-shape :conv2d [3 16 3]     [3 32 32])))
+    (is (= [:ok [8 7 8]]
+           (shape/layer-shape :conv2d [4 8 [3 2] [2 2] [1 0] [2 1] 2]
+                              [4 16 16]))))
+  (testing "maxpool halves spatial dims"
+    (is (= [:ok [16 16 16]] (shape/layer-shape :maxpool2d [2] [16 32 32]))))
+  (testing "channel mismatch reported"
+    (is (= :error (first (shape/layer-shape :conv2d [8 16 3] [3 32 32]))))))
+
+(deftest shape-flatten-embedding
+  (is (= [:ok [3072]] (shape/layer-shape :flatten {} [3 32 32])))
+  (is (= [:ok [128 64]] (shape/layer-shape :embedding [1000 64] [128]))))
+
+(deftest shape-attention
+  (is (= [:ok [8 64]] (shape/layer-shape :attention {} [8 64])))
+  (is (= :error (first (shape/layer-shape :attention {} [2 8 64])))))
+
+(deftest shape-learned-multihead-attention
+  (is (= [:ok [8 64]]
+         (shape/layer-shape :multihead-attention [64 8] [8 64])))
+  (is (= [:ok [4 8 64]]
+         (shape/layer-shape :multihead-attention
+                            [64 8 {:causal? true}] [4 8 64])))
+  (is (= :error (first (shape/layer-shape
+                        :multihead-attention [64 7] [8 64]))))
+  (is (= (* 4 (+ (* 64 64) 64))
+         (shape/layer-params :multihead-attention [64 8]))))
+
+(deftest shape-groupnorm
+  (is (= [:ok [32 16 16]]
+         (shape/layer-shape :groupnorm [4 32] [32 16 16])))
+  (is (= :error (first (shape/layer-shape :groupnorm [3 32] [32 16 16])))))
+
+(deftest params-counts
+  (is (= (+ (* 784 256) 256) (shape/layer-params :linear [784 256])))
+  (is (= (+ (* 3 16 3 3) 16) (shape/layer-params :conv2d [3 16 3])))
+  (is (= (+ (* 8 2 3 2) 8)
+         (shape/layer-params :conv2d [4 8 [3 2] 1 0 1 2])))
+  (is (= 64 (shape/layer-params :groupnorm [4 32])))
+  (is (= (* 1000 64) (shape/layer-params :embedding [1000 64])))
+  (is (zero? (shape/layer-params :relu {}))))
+
+;; ---------------------------------------------------------------------------
+;; core: end-to-end summary on a small MLP and a small CNN
+;; ---------------------------------------------------------------------------
+
+(def mlp
+  (m/sequential
+   (m/linear 784 256) (m/relu)
+   (m/linear 256 10)  (m/softmax)))
+
+(deftest summary-mlp
+  (let [s (core/summary mlp [784])]
+    (is (nil? (:torch/error s)))
+    (is (= [10] (:torch/out-shape s)))
+    (is (= (+ (* 784 256) 256 (* 256 10) 10) (:torch/total-params s)))
+    (is (= 4 (count (:torch/layers s))))
+    (is (= [256] (:torch/out-shape (first (:torch/layers s)))))))
+
+(deftest nested-sequentials-have-canonical-leaf-order-and-paths
+  (let [nested (m/sequential
+                (m/linear 2 3)
+                (m/sequential (m/relu) (m/sequential (m/linear 3 1))))]
+    (is (= [:linear :relu :linear]
+           (mapv m/layer-type (m/execution-layers nested))))
+    (is (= [[0] [1 0] [1 1 0]]
+           (mapv :path (m/layer-entries nested))))
+    (is (= [1] (core/infer-shape nested [2])))))
+
+(def cnn
+  [{:conv2d [1 8 3 1 1]} {:relu {}} {:maxpool2d [2]}
+   {:flatten {}} {:linear [(* 8 14 14) 10]}])
+
+(deftest summary-cnn
+  (let [s (core/summary cnn [1 28 28])]
+    (is (nil? (:torch/error s)))
+    (is (= [10] (:torch/out-shape s)))))
+
+(deftest summary-shape-error-stops-propagation
+  (testing "a bad linear in-features yields an error and nil out-shape"
+    (let [s (core/summary [{:linear [784 256]} {:linear [999 10]}] [784])]
+      (is (some? (:torch/error s)))
+      (is (nil? (:torch/out-shape s))))))
+
+(deftest infer-shape-helper
+  (is (= [10] (core/infer-shape mlp [784])))
+  (is (= (core/total-params mlp) (core/total-params ports/default-ports mlp))))
+
+;; ---------------------------------------------------------------------------
+;; nested sub-models compose
+;; ---------------------------------------------------------------------------
+
+(deftest nested-sequential
+  (let [block (m/sequential (m/linear 64 64) (m/relu))
+        net   (m/sequential (m/linear 32 64) block (m/linear 64 10))
+        s     (core/summary net [32])]
+    (is (nil? (:torch/error s)))
+    (is (= [10] (:torch/out-shape s)))
+    (is (= (+ (* 32 64) 64 (* 64 64) 64 (* 64 10) 10)
+           (:torch/total-params s)))))
+
+;; ---------------------------------------------------------------------------
+;; validate
+;; ---------------------------------------------------------------------------
+
+(deftest validate-good-and-bad
+  (testing "a well-formed model is valid"
+    (is (v/valid? mlp))
+    (is (empty? (filterv #(= :error (:torch/severity %)) (v/problems mlp)))))
+  (testing "unknown layer type is an :error"
+    (let [ps (v/problems [{:frobnicate [1 2]}])]
+      (is (not (v/valid? [{:frobnicate [1 2]}])))
+      (is (some #(= :layer/unknown (:torch/code %)) ps))))
+  (testing "arity shortfall is an :error"
+    (is (some #(= :layer/arity (:torch/code %)) (v/problems [{:linear [10]}]))))
+  (testing "empty model warns but is still valid"
+    (let [ps (v/problems (m/sequential))]
+      (is (some #(= :module/empty (:torch/code %)) ps))
+      (is (v/valid? (m/sequential))))))
+
+;; ---------------------------------------------------------------------------
+;; ports: host-injected custom layer
+;; ---------------------------------------------------------------------------
+
+(def scale-ports
+  "A host that adds a :scale layer (shape-preserving, parameter-free)."
+  (ports/with-layers
+    (reify ports/ILayer
+      (custom-layer? [_ t] (= t :scale))
+      (shape-of  [_ _ _ in] [:ok in])
+      (params-of [_ _ _] 0))))
+
+(deftest custom-layer-via-ports
+  (testing "unknown to built-ins, known to the host"
+    (is (not (v/valid? [{:scale [2.0]}])))                 ; default vocabulary
+    (is (v/valid? scale-ports [{:scale [2.0]}]))           ; host vocabulary
+    (let [s (core/summary scale-ports
+                          [{:linear [10 20]} {:scale [2.0]}] [10])]
+      (is (nil? (:torch/error s)))
+      (is (= [20] (:torch/out-shape s))))))
+
+(deftest run-without-backend-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (core/run ports/default-ports mlp [1 2 3]))))
