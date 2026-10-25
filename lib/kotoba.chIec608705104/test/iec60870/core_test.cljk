@@ -1,0 +1,224 @@
+(ns iec60870.core-test
+  "Structural correctness over the IEC 60870-5-104 stack this repo
+  implements: APCI framing (§ start byte / length / I-S-U control field),
+  IEEE 754 float32 wire assembly, CP56Time2a, and ASDU object headers over
+  the point subset in `iec60870.asdu`.
+
+  IEEE 754 binary32's well-known constants (1.0 = 0x3F800000 etc.) are the
+  one set of vectors here independently verifiable from first principles —
+  they follow directly from the format's definition, not from a
+  recollection of IEC 60870-5-104's own text. The APCI/ASDU framing
+  mechanics (start byte, Length semantics, VSQ's SQ bit, 3-byte
+  little-endian IOA) are exercised for internal consistency and cited in
+  the source namespaces' `;; constructed` notes rather than presented as
+  verbatim quotations of the standard."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [iec60870.apci :as apci]
+            [iec60870.asdu :as asdu]
+            [iec60870.float32 :as float32]
+            [iec60870.time :as time]
+            [iec60870.frame :as frame]))
+
+(def q0 {:blocked false :substituted false :not-topical false :invalid false})
+
+;; ── IEEE 754 binary32 ────────────────────────────────────────────────────
+
+(deftest float32-well-known-constants
+  ;; IEEE 754-2008 binary32: sign(1) exponent(8, bias 127) mantissa(23).
+  ;; 1.0 = 0 01111111 000... = 0x3F800000. 2.0 has exponent 128 = 0x40000000.
+  ;; 0.5 has exponent 126 = 0x3F000000. These follow from the format's
+  ;; definition, not from a recollection of spec text.
+  (is (= [0x00 0x00 0x80 0x3F] (float32/write-float32-le 1.0)))
+  (is (= [0x00 0x00 0x80 0xBF] (float32/write-float32-le -1.0)))
+  (is (= [0x00 0x00 0x00 0x40] (float32/write-float32-le 2.0)))
+  (is (= [0x00 0x00 0x00 0x3F] (float32/write-float32-le 0.5)))
+  (is (= [0x00 0x00 0x00 0x00] (float32/write-float32-le 0.0))))
+
+(defn- round-to-float32
+  "The nearest binary32 value to `v` — `Float/floatToIntBits`'s truncation
+  on the JVM, `Math.fround`'s on JS — used only to state what a float32
+  round trip through this codec *should* produce, since float32 has ~7
+  significant decimal digits and neither platform's double literal for,
+  say, -12345.678 already sits exactly on a float32 value."
+  [v]
+  #?(:clj (float v)
+     :cljs (js/Math.fround v)))
+
+(deftest float32-roundtrip
+  (doseq [v [1.0 -1.0 0.0 100.5 -12345.678 3.14159 1.0e10 -1.0e-10]]
+    (let [bs (float32/write-float32-le v)]
+      (is (= 4 (count bs)))
+      (is (= (round-to-float32 v) (float32/read-float32-le bs 0))))))
+
+;; ── CP56Time2a ───────────────────────────────────────────────────────────
+
+(deftest cp56time2a-roundtrip
+  (let [ts {:milliseconds 12345 :minutes 30 :invalid false :hours 14 :summer-time true
+            :day-of-month 15 :day-of-week 3 :month 8 :year 26}
+        bs (time/encode-cp56time2a ts)
+        {:keys [point size]} (time/decode-cp56time2a bs 0)]
+    (is (= 7 (count bs)))
+    (is (= 7 size))
+    (is (= ts point))))
+
+(deftest cp56time2a-invalid-and-summer-time-flags-roundtrip
+  (let [ts {:milliseconds 0 :minutes 0 :invalid true :hours 0 :summer-time false
+            :day-of-month 1 :day-of-week 1 :month 1 :year 0}
+        {:keys [point]} (time/decode-cp56time2a (time/encode-cp56time2a ts) 0)]
+    (is (= ts point))))
+
+;; ── APCI framing ─────────────────────────────────────────────────────────
+
+(deftest apci-i-format-roundtrip
+  (let [enc (apci/encode-i {:send-seq 5 :recv-seq 12} [1 2 3 4 5])]
+    (is (= :ok (:status enc)))
+    (let [dec (apci/decode (:bytes enc))]
+      (is (= :ok (:status dec)))
+      (is (= (count (:bytes enc)) (:consumed dec)))
+      (is (= :i (get-in dec [:frame :format])))
+      (is (= 5 (get-in dec [:frame :send-seq])))
+      (is (= 12 (get-in dec [:frame :recv-seq])))
+      (is (= [1 2 3 4 5] (get-in dec [:frame :asdu-bytes]))))))
+
+(deftest apci-i-format-sequence-number-boundary
+  ;; 15-bit sequence numbers: 0 and the maximum, 32767.
+  (doseq [sq [0 1 32766 32767]]
+    (let [enc (apci/encode-i {:send-seq sq :recv-seq sq} [])
+          dec (apci/decode (:bytes enc))]
+      (is (= sq (get-in dec [:frame :send-seq])))
+      (is (= sq (get-in dec [:frame :recv-seq]))))))
+
+(deftest apci-s-format-roundtrip
+  (let [enc (apci/encode-s {:recv-seq 100})
+        dec (apci/decode (:bytes enc))]
+    (is (= :ok (:status enc)))
+    (is (= :s (get-in dec [:frame :format])))
+    (is (= 100 (get-in dec [:frame :recv-seq])))))
+
+(deftest apci-u-format-roundtrip-each-function
+  (doseq [fn-kw (keys apci/u-function-bits)]
+    (let [enc (apci/encode-u fn-kw)
+          dec (apci/decode (:bytes enc))]
+      (is (= :ok (:status enc)))
+      (is (= :u (get-in dec [:frame :format])))
+      (is (= #{fn-kw} (get-in dec [:frame :functions]))))))
+
+(deftest apci-rejects-bad-start-byte
+  (let [enc (apci/encode-s {:recv-seq 1})
+        bad (assoc (vec (:bytes enc)) 0 0x00)]
+    (is (= :bad-start-byte (:reason (apci/decode bad))))))
+
+(deftest apci-rejects-length-too-small
+  (let [enc (apci/encode-s {:recv-seq 1})
+        bad (assoc (vec (:bytes enc)) 1 2)]
+    (is (= :length-too-small (:reason (apci/decode bad))))))
+
+(deftest apci-rejects-length-too-large
+  (let [enc (apci/encode-s {:recv-seq 1})
+        bad (assoc (vec (:bytes enc)) 1 254)]
+    (is (= :length-too-large (:reason (apci/decode bad))))))
+
+(deftest apci-incomplete-buffer
+  (let [enc (apci/encode-i {:send-seq 1 :recv-seq 1} [1 2 3 4 5])]
+    (is (= :incomplete (:status (apci/decode (subvec (vec (:bytes enc)) 0 4)))))))
+
+(deftest apci-rejects-oversized-asdu
+  (is (= :asdu-too-long (:reason (apci/encode-i {:send-seq 0 :recv-seq 0} (vec (range 250)))))))
+
+;; ── ASDU: object payload codecs ──────────────────────────────────────────
+
+(deftest m-sp-na-1-binary-input-roundtrip
+  (let [a {:type-id 1 :sq false :cot {:cause :spontaneous :test false :negative false}
+           :common-address 1
+           :objects [{:ioa 100 :element {:spi true :quality q0}}
+                     {:ioa 101 :element {:spi false :quality (assoc q0 :invalid true)}}]}
+        enc (asdu/encode-asdu a)
+        dec (asdu/decode-asdu (:bytes enc))]
+    (is (= :ok (:status enc)))
+    (is (= :ok (:status dec)))
+    (is (= (:objects a) (get-in dec [:asdu :objects])))
+    (is (= :spontaneous (get-in dec [:asdu :cot :cause])))))
+
+(deftest m-me-na-1-analog-input-sq1-consecutive-addresses-roundtrip
+  (let [a {:type-id 9 :sq true :cot {:cause :periodic :test false :negative false}
+           :common-address 5
+           :objects [{:ioa 200 :element {:value 12345 :quality (assoc q0 :overflow false)}}
+                     {:ioa 201 :element {:value -100 :quality (assoc q0 :overflow true)}}
+                     {:ioa 202 :element {:value 0 :quality (assoc q0 :overflow false)}}]}
+        enc (asdu/encode-asdu a)
+        dec (asdu/decode-asdu (:bytes enc))]
+    (is (= :ok (:status enc)))
+    (is (= (:objects a) (get-in dec [:asdu :objects])))))
+
+(deftest c-sc-na-1-single-command-roundtrip
+  (let [a {:type-id 45 :sq false :cot {:cause :activation :test false :negative false}
+           :common-address 1
+           :objects [{:ioa 300 :element {:scs true :qu 1 :select-execute true}}]}
+        enc (asdu/encode-asdu a)
+        dec (asdu/decode-asdu (:bytes enc))]
+    (is (= (:objects a) (get-in dec [:asdu :objects])))))
+
+(deftest c-ic-na-1-interrogation-command-roundtrip
+  (let [a {:type-id 100 :sq false :cot {:cause :activation :test false :negative false}
+           :common-address 1 :objects [{:ioa 0 :element {:qoi asdu/qoi-station}}]}
+        enc (asdu/encode-asdu a)
+        dec (asdu/decode-asdu (:bytes enc))]
+    (is (= (:objects a) (get-in dec [:asdu :objects])))))
+
+(deftest m-me-tf-1-short-float-with-timestamp-roundtrip
+  (let [ts {:milliseconds 12345 :minutes 30 :invalid false :hours 14 :summer-time true
+            :day-of-month 15 :day-of-week 3 :month 8 :year 26}
+        a {:type-id 36 :sq false :cot {:cause :spontaneous :test false :negative false}
+           :common-address 1
+           :objects [{:ioa 400 :element {:value (round-to-float32 123.456) :quality q0 :timestamp ts}}]}
+        enc (asdu/encode-asdu a)
+        dec (asdu/decode-asdu (:bytes enc))]
+    (is (= (:objects a) (get-in dec [:asdu :objects])))))
+
+(deftest asdu-rejects-unknown-type-id
+  (let [enc (asdu/encode-asdu {:type-id 1 :sq false :cot {:cause :spontaneous}
+                                :common-address 1 :objects []})
+        corrupted (assoc (vec (:bytes enc)) 0 250)]
+    (is (= :unknown-type-id (:reason (asdu/decode-asdu corrupted))))))
+
+(deftest asdu-encode-rejects-unknown-type-id
+  (is (= :unknown-type-id
+         (:reason (asdu/encode-asdu {:type-id 250 :sq false :cot {:cause :spontaneous}
+                                      :common-address 1 :objects []})))))
+
+(deftest asdu-incomplete-buffer
+  (let [enc (asdu/encode-asdu {:type-id 9 :sq false :cot {:cause :periodic}
+                                :common-address 1
+                                :objects [{:ioa 1 :element {:value 1 :quality q0}}]})]
+    (is (= :incomplete (:status (asdu/decode-asdu (subvec (vec (:bytes enc)) 0 7)))))))
+
+;; ── full stack: APCI(I) + ASDU ───────────────────────────────────────────
+
+(deftest full-frame-roundtrip
+  (let [a {:type-id 1 :sq false :cot {:cause :spontaneous :test false :negative false}
+           :common-address 42
+           :objects [{:ioa 1 :element {:spi true :quality q0}}]}
+        enc (frame/encode-i-asdu {:send-seq 3 :recv-seq 0} a)
+        dec (frame/decode-i-frame (:bytes enc))]
+    (is (= :ok (:status enc)))
+    (is (= :ok (:status dec)))
+    (is (= :i (get-in dec [:frame :format])))
+    (is (= 3 (get-in dec [:frame :send-seq])))
+    (is (= 42 (get-in dec [:frame :asdu :common-address])))
+    (is (= (:objects a) (get-in dec [:frame :asdu :objects])))))
+
+(deftest full-frame-propagates-asdu-error
+  ;; A well-formed APCI wrapping a malformed ASDU (unknown type id) should
+  ;; surface the ASDU's own named error, not a generic parse failure.
+  (let [a {:type-id 1 :sq false :cot {:cause :spontaneous} :common-address 1 :objects []}
+        enc (frame/encode-i-asdu {:send-seq 0 :recv-seq 0} a)
+        corrupted (update (vec (:bytes enc)) 6 (constantly 250)) ;; type-id byte, inside the ASDU
+        dec (frame/decode-i-frame corrupted)]
+    (is (= :error (:status dec)))
+    (is (= :unknown-type-id (:reason dec)))))
+
+(deftest full-frame-s-and-u-have-no-asdu
+  (let [dec-s (frame/decode-i-frame (:bytes (apci/encode-s {:recv-seq 0})))
+        dec-u (frame/decode-i-frame (:bytes (apci/encode-u :testfr-act)))]
+    (is (not (contains? (:frame dec-s) :asdu)))
+    (is (not (contains? (:frame dec-u) :asdu)))))
