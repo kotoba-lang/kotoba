@@ -1,0 +1,333 @@
+(ns bitcoin.node.peer-pool-test
+  (:require [kotoba.lang.error :as kerror] [bitcoin.node.peer :as peer]
+            [bitcoin.node.peer-pool :as pool]
+            [bitcoin.consensus.storage :as storage]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]])
+  (:import [java.net InetAddress]
+           [java.nio.file Files Path]
+           [java.nio.file.attribute FileAttribute]))
+
+(defn- ipv4 [a b c d]
+  (InetAddress/getByAddress
+   (byte-array (map unchecked-byte [a b c d]))))
+
+(def selection-key (vec (repeat pool/selection-key-bytes 0)))
+
+(deftest dns-discovery-is-bounded-deduplicated-and-public-only
+  (let [resolved
+        {"seed-a"
+         [(ipv4 8 8 8 8)
+          (ipv4 10 0 0 1)
+          (ipv4 100 64 0 1)
+          (ipv4 127 0 0 1)
+          (ipv4 192 0 2 1)
+          (ipv4 198 18 0 1)
+          (ipv4 198 51 100 1)
+          (ipv4 203 0 113 1)
+          (ipv4 224 0 0 1)]
+         "seed-b"
+         [(ipv4 1 1 1 1) (ipv4 8 8 8 8)]}
+        peers
+        (pool/discover-dns!
+         :mainnet
+         {:seeds ["seed-a" "seed-b"]
+          :resolver #(get resolved %)
+          :timeout-ms 1000
+          :maximum-results 8})]
+    (is (= ["1.1.1.1" "8.8.8.8"] (mapv :host peers)))
+    (is (every? #(= 8333 (:port %)) peers))
+    (is (every? #(= :mainnet (:network %)) peers)))
+  (is (= [] (pool/discover-dns! :regtest)))
+  (is (= :bitcoin.node/peer-discovery-configuration
+         (:type
+          (ex-data
+           (try
+             (pool/discover-dns!
+              :mainnet {:seeds (repeat 17 "seed")})
+             (catch kerror/ExceptionInfo error error)))))))
+
+(deftest pool-rotates-healthy-peers-and-cools-down-failures
+  (let [initial
+        (pool/create
+         [{:host "a" :network :regtest}
+          {:host "b" :network :regtest}
+          {:host "c" :network :regtest}]
+         {:selection-key selection-key})
+        first-two (pool/candidates initial 100 2)
+        selected (pool/mark-selected initial first-two 100)
+        next-peer (first (pool/candidates selected 101 1))
+        failed
+        (pool/record-failure
+         selected next-peer 101 :bitcoin.node/peer-timeout 500)
+        eligible (pool/candidates failed 102 3)]
+    (is (= 2 (count (set (map :host first-two)))))
+    (is (not (contains? (set (map :host first-two)) (:host next-peer))))
+    (is (= (set (map :host first-two)) (set (map :host eligible))))
+    (is (= {:peers 3 :eligible 2 :cooling-down 1
+            :successful 0 :anchors 0 :eligible-network-groups 2
+            :next-retry-at 30101}
+           (pool/status failed 102)))
+    (let [healthy
+          (pool/record-success failed (first eligible) 103 40)]
+      (is (= 1 (get-in healthy
+                       [:peers (pool/peer-id (first eligible))
+                        :successes])))
+      (is (= 40.0 (get-in healthy
+                          [:peers (pool/peer-id (first eligible))
+                           :latency-ema-ms]))))))
+
+(deftest selection-prefers-network-diversity-and-operator-anchors
+  (let [configurations
+        [{:host "8.8.1.1" :network :mainnet}
+         {:host "8.8.2.2" :network :mainnet}
+         {:host "1.1.1.1" :network :mainnet}
+         {:host "9.9.9.9" :network :mainnet}]
+        initial (pool/create configurations {:selection-key selection-key})
+        diverse (pool/candidates initial 1 3)
+        promoted
+        (pool/add-peers
+         (pool/record-success initial (first configurations) 1 25 1)
+         [{:host "9.9.9.9" :network :mainnet
+           :anchor? true :source :operator
+           :required-services peer/node-network-service}])
+        anchored (pool/candidates promoted 2 1)]
+    (is (= [:ipv4 8 8] (pool/network-group (first configurations))))
+    (is (= 3 (count (set (map pool/network-group diverse)))))
+    (is (= #{"1.1.1.1" "9.9.9.9"}
+           (set (remove #(str/starts-with? % "8.8.")
+                        (map :host diverse)))))
+    (is (= "9.9.9.9" (:host (first anchored))))
+    (is (= peer/node-network-service
+           (:required-services (first anchored))))
+    (is (= 1 (:anchors (pool/status promoted 2))))
+    (is (= 1 (get-in promoted
+                     [:peers (pool/peer-id (first configurations))
+                      :successes])))))
+
+(deftest repeated-failures-use-bounded-exponential-backoff
+  (let [configuration {:host "a" :network :regtest}
+        once
+        (pool/record-failure
+         (pool/create [configuration]) configuration
+         1000 :bitcoin.node/peer-timeout 100)
+        twice
+        (pool/record-failure
+         once configuration 2000 :bitcoin.node/peer-timeout 100)
+        severe
+        (pool/record-failure
+         twice configuration 3000
+         :bitcoin.node/peer-network-mismatch 10)]
+    (is (= 31000
+           (get-in once [:peers (pool/peer-id configuration)
+                         :cooldown-until])))
+    (is (= 62000
+           (get-in twice [:peers (pool/peer-id configuration)
+                          :cooldown-until])))
+    (is (= (+ 3000 pool/maximum-cooldown-ms)
+           (get-in severe [:peers (pool/peer-id configuration)
+                           :cooldown-until])))))
+
+(deftest consensus-rejected-block-sources-enter-durable-severe-cooldown
+  (doseq [error-type [:bitcoin.node/peer-invalid-block
+                      :bitcoin.node/peer-mutated-block]]
+    (let [configuration {:host "bad-body" :network :regtest}
+          directory
+          (Files/createTempDirectory
+           "bitcoin-peer-feedback-" (make-array FileAttribute 0))
+          path (.resolve directory "pool.bin")
+          state (atom (pool/create [configuration]))]
+      (try
+        (let [status
+              (pool/report-block-validation-failure!
+               state configuration 1000 error-type {:pool-path path})
+              persisted (pool/load! path)
+              entry (get-in persisted
+                            [:peers (pool/peer-id configuration)])]
+          (is (= error-type (:last-error entry)))
+          (is (= (+ 1000 pool/maximum-cooldown-ms)
+                 (:cooldown-until entry)))
+          (is (= 1 (:cooling-down status))))
+        (finally
+          (Files/deleteIfExists path)
+          (Files/deleteIfExists directory))))))
+
+(deftest peer-service-masks-cover-exactly-the-wire-uint64-domain
+  (is (= peer/maximum-service-mask
+         (get-in
+          (pool/create
+           [{:host "8.8.8.8" :network :mainnet
+             :required-services peer/maximum-service-mask}])
+          [:peers [:mainnet "8.8.8.8" 8333]
+           :configuration :required-services])))
+  (is (= :bitcoin.node/peer-configuration
+         (:type
+          (ex-data
+           (try
+             (pool/create
+              [{:host "8.8.8.8" :network :mainnet
+                :required-services
+                (inc peer/maximum-service-mask)}])
+             (catch kerror/ExceptionInfo error error)))))))
+
+(deftest peer-pool-snapshot-is-checksummed-bounded-and-atomic
+  (let [directory
+        (Files/createTempDirectory
+         "bitcoin-peer-pool-" (make-array FileAttribute 0))
+        path (.resolve ^Path directory "peers.edn")
+        configuration {:host "8.8.8.8" :network :mainnet}
+        expected
+        (-> (pool/create [configuration])
+            (pool/record-success configuration 1000 25))]
+    (try
+      (is (= path (pool/save! path expected)))
+      (is (= expected (pool/load! path)))
+      (let [damaged (Files/readAllBytes path)]
+        (aset-byte damaged (dec (alength damaged))
+                   (unchecked-byte
+                    (bit-xor 1
+                             (bit-and
+                              0xff
+                              (aget damaged (dec (alength damaged)))))))
+        (is (= :bitcoin.consensus/chainstate-checksum-mismatch
+               (:type
+                (ex-data
+                 (try
+                   (pool/decode damaged)
+                   (catch kerror/ExceptionInfo error error)))))))
+      (is (= :bitcoin.node/peer-pool-corrupt
+             (:type
+              (ex-data
+               (try
+                 (pool/validate {:peers {[:mainnet "bad" 8333] {}}})
+                 (catch kerror/ExceptionInfo error error))))))
+      (finally
+        (Files/deleteIfExists path)
+        (Files/deleteIfExists directory)))))
+
+(deftest legacy-peer-pool-gains-a-bounded-selection-key
+  (let [current
+        (pool/create
+         [{:host "8.8.8.8" :network :mainnet}]
+         {:selection-key selection-key})
+        legacy-bytes
+        (storage/encode-value
+         {:format pool/legacy-pool-format
+          :pool (dissoc current :selection-key :selection-counter)})
+        migrated (pool/decode legacy-bytes)]
+    (is (= pool/selection-key-bytes (count (:selection-key migrated))))
+    (is (= 0 (:selection-counter migrated)))
+    (is (= (:peers current) (:peers migrated)))))
+
+(deftest managed-sync-updates-health-from-typed-peer-evidence
+  (let [pool-atom
+        (atom
+         (pool/create
+          [{:host "bad" :network :regtest}
+           {:host "good" :network :regtest}]))]
+    (with-redefs
+     [peer/sync-headers-from-peers!
+      (fn [configurations _ _ options]
+        (is (= #{"bad" "good"} (set (map :host configurations))))
+        (is (= {:max-batches 2} options))
+        {:status :synced
+         :successful-peers 1
+         :observations
+         [{:peer {:host "good" :port 18444 :network :regtest}
+           :elapsed-ms 25.0 :services 1}]
+         :failures
+         [{:peer {:host "bad" :port 18444 :network :regtest}
+           :type :bitcoin.node/peer-timeout :elapsed-ms 500.0}]})]
+     (let [result
+           (pool/sync-headers!
+            pool-atom (constantly []) (constantly nil)
+            {:now-ms 1000 :maximum-peers 2 :max-batches 2})]
+       (is (= :synced (:status result)))
+       (is (= 1 (get-in result [:pool :successful])))
+       (is (= 1 (get-in @pool-atom
+                        [:peers [:regtest "good" 18444]
+                         :last-services])))
+       (is (= ["good"]
+              (mapv :host (pool/candidates @pool-atom 1001 2))))))))
+
+(deftest managed-sync-retains-failures-when-all-peers-fail
+  (let [configuration {:host "bad" :network :regtest}
+        pool-atom (atom (pool/create [configuration]))]
+    (with-redefs
+     [peer/sync-headers-from-peers!
+      (fn [& _]
+        (throw
+         (ex-info
+          "failed"
+          {:type :bitcoin.node/peer-set-exhausted
+           :failures
+           [{:peer {:host "bad" :port 18444 :network :regtest}
+             :type :bitcoin.node/peer-eof :elapsed-ms 5.0}]})))]
+     (testing "typed evidence survives the orchestration exception"
+       (is (= :bitcoin.node/peer-set-exhausted
+              (:type
+               (ex-data
+                (try
+                  (pool/sync-headers!
+                   pool-atom (constantly []) (constantly nil)
+                   {:now-ms 100})
+                  (catch kerror/ExceptionInfo error error))))))
+       (is (= 1 (get-in @pool-atom
+                        [:peers (pool/peer-id configuration)
+                         :failures])))))))
+
+(deftest managed-block-download-updates-success-and-cooldown-evidence
+  (let [bad {:host "bad" :network :regtest}
+        good {:host "good" :network :regtest}
+        pool-atom (atom (pool/create [bad good]))
+        hash (vec (repeat 32 1))]
+    (with-redefs
+     [peer/download-blocks-from-peers!
+      (fn [configurations hashes options]
+        (is (= #{"bad" "good"} (set (map :host configurations))))
+        (is (= [hash] hashes))
+        (is (= {:parallel-peers 2} options))
+        {:status :downloaded
+         :downloaded 1
+         :blocks [[1 2 3]]
+         :observations
+         [{:peer {:host "good" :port 18444 :network :regtest}
+           :elapsed-ms 12.0 :services 1 :downloaded 1}]
+         :failures
+         [{:peer {:host "bad" :port 18444 :network :regtest}
+           :type :bitcoin.node/peer-timeout :elapsed-ms 500.0}]})]
+     (let [result
+           (pool/download-blocks!
+            pool-atom [hash]
+            {:now-ms 1000 :maximum-peers 2 :parallel-peers 2})]
+       (is (= [[1 2 3]] (:blocks result)))
+       (is (= 1 (get-in result [:pool :successful])))
+       (is (= 1 (get-in @pool-atom
+                        [:peers (pool/peer-id good) :successes])))
+       (is (= 1 (get-in @pool-atom
+                        [:peers (pool/peer-id bad) :failures])))
+       (is (= ["good"]
+              (mapv :host (pool/candidates @pool-atom 1001 2))))))))
+
+(deftest managed-sync-persists-selection-on-unexpected-failure
+  (let [directory
+        (Files/createTempDirectory
+         "bitcoin-peer-pool-failure-" (make-array FileAttribute 0))
+        path (.resolve ^Path directory "peers.edn")
+        configuration {:host "bad" :network :regtest}
+        pool-atom (atom (pool/create [configuration]))]
+    (try
+      (with-redefs
+       [peer/sync-headers-from-peers!
+        (fn [& _] (throw (IllegalStateException. "callback failed")))]
+       (is (thrown? IllegalStateException
+                    (pool/sync-headers!
+                     pool-atom (constantly []) (constantly nil)
+                     {:now-ms 42 :pool-path path}))))
+      (is (= 42
+             (get-in (pool/load! path)
+                     [:peers (pool/peer-id configuration)
+                      :last-selected-at])))
+      (finally
+        (Files/deleteIfExists path)
+        (Files/deleteIfExists directory)))))

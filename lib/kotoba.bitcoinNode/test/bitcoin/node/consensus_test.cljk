@@ -1,0 +1,201 @@
+(ns bitcoin.node.consensus-test
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.assumeutxo :as assumeutxo]
+            [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.chainstate :as chainstate]
+            [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.transaction :as transaction]
+            [bitcoin.consensus.utxo :as utxo]
+            [bitcoin.node.consensus :as consensus]
+            [kotoba.test :refer [deftest is]]
+            [kotobase.bitcoin.protocol :as header]))
+
+(def genesis
+  "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000")
+
+(def block-one
+  "010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e61bc6649ffff001d01e362990101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+
+(defn hex->bytes [hex]
+  (mapv #(Integer/parseInt (apply str %) 16) (partition 2 hex)))
+
+(def regtest-genesis
+  (str header/regtest-genesis-header-hex (subs genesis 160)))
+
+(defn regtest-coinbase [height]
+  (transaction/parse
+   (transaction/serialize
+    {:version 1
+     :inputs [{:txid-natural (vec (repeat 32 0))
+               :vout 0xffffffff
+               :script-sig
+               (conj (chainstate/coinbase-height-prefix height) 42)
+               :sequence 0xffffffff}]
+     :outputs [{:value (utxo/block-subsidy height 150)
+                :script-pubkey [81]}]
+     :witnesses nil :locktime 0 :segwit? false})))
+
+(defn mine-regtest-block [parent height]
+  (let [coinbase (regtest-coinbase height)
+        template {:version 4
+                  :prev-block (get-in parent [:header :hash])
+                  :merkle-root (:txid-natural coinbase)
+                  :timestamp (inc (get-in parent [:header :timestamp]))
+                  :bits 0x207fffff}]
+    (loop [nonce 0]
+      (let [header-bytes
+            (header/encode-block-header (assoc template :nonce nonce))
+            decoded (header/decode-block-header header-bytes)]
+        (if (header/hash-meets-target? (:hash decoded) (:bits decoded))
+          (block/parse
+           (vec (concat header-bytes [1] (:raw coinbase))))
+          (recur (inc nonce)))))))
+
+(defn core-varint [value]
+  (loop [value (long value) result []]
+    (let [byte (bit-or (bit-and value 0x7f)
+                       (if (seq result) 0x80 0))]
+      (if (<= value 0x7f)
+        (vec (cons byte result))
+        (recur (dec (quot value 128)) (cons byte result))))))
+
+(defn core-compress-amount [amount]
+  (if (zero? amount)
+    0
+    (loop [amount amount exponent 0]
+      (if (and (zero? (mod amount 10)) (< exponent 9))
+        (recur (quot amount 10) (inc exponent))
+        (if (< exponent 9)
+          (let [digit (mod amount 10)]
+            (+ 1 (* 10 (+ (* 9 (quot amount 10)) digit -1))
+               exponent))
+          (+ 1 (* 10 (dec amount)) 9))))))
+
+(defn core-snapshot [base-hash coins]
+  (let [groups (partition-by (comp first first)
+                             (sort-by first coins))
+        bytes
+        (vec
+         (concat
+          assumeutxo/snapshot-magic
+          (codec/uint-le assumeutxo/snapshot-version 2)
+          (assumeutxo/network-magic :regtest)
+          (reverse (hex->bytes base-hash))
+          (codec/uint-le (count coins) 8)
+          (mapcat
+           (fn [group]
+             (let [txid (first (ffirst group))]
+               (concat
+                txid
+                (codec/compact-size (count group))
+                (mapcat
+                 (fn [[[_ vout] coin]]
+                   (concat
+                    (codec/compact-size vout)
+                    (core-varint
+                     (+ (* 2 (:height coin))
+                        (if (:coinbase? coin) 1 0)))
+                    (core-varint
+                     (core-compress-amount (:value coin)))
+                    (core-varint
+                     (+ 6 (count (:script-pubkey coin))))
+                    (:script-pubkey coin)))
+                 group))))
+           groups)))]
+    (byte-array (map unchecked-byte bytes))))
+
+(deftest embedded-consensus-validates-before-publishing-state
+  (let [node (consensus/open {:network :mainnet
+                              :genesis-bytes (hex->bytes genesis)})
+        before (consensus/consensus-status node)
+        after (consensus/accept-block! node (hex->bytes block-one)
+                                       2000000000)]
+    (is (consensus/ready? node))
+    (is (= 0 (:height before)))
+    (is (= 1 (:height after)))
+    (is (= 1 (:utxo-count after)))
+    (is (:fully-validated? after))
+    (is (false? (:persistent? after)))))
+
+(deftest embedded-consensus-allows-an-explicit-differential-verifier
+  (let [calls (atom 0)
+        node (consensus/open
+              {:network :mainnet :genesis-bytes (hex->bytes genesis)
+               :verify-script
+               (fn [& _] (swap! calls inc) true)})]
+    (is (consensus/ready? node))
+    ;; Genesis and block one contain coinbase transactions only.
+    (consensus/accept-block! node (hex->bytes block-one) 2000000000)
+    (is (zero? @calls))))
+
+(deftest embedded-consensus-indexes-headers-before-block-activation
+  (let [node (consensus/open
+              {:network :mainnet
+               :genesis-bytes (hex->bytes genesis)})
+        header-status
+        (consensus/accept-header!
+         node (hex->bytes (subs block-one 0 160)) 2000000000)]
+    (is (= 0 (:height header-status)))
+    (is (= 1 (:best-header-height header-status)))
+    (is (not= (:best-block header-status)
+              (:best-header header-status)))
+    (let [block-status
+          (consensus/accept-block!
+           node (hex->bytes block-one) 2000000000)]
+      (is (= 1 (:height block-status)))
+      (is (= (:best-block block-status)
+             (:best-header block-status)))
+      (is (:fully-validated? block-status)))))
+
+(deftest assumeutxo-remains-assumed-until-background-chain-matches
+  (let [genesis-block (block/parse (hex->bytes regtest-genesis))
+        block-1 (mine-regtest-block genesis-block 1)
+        block-2 (mine-regtest-block block-1 2)
+        raw-1 (block/serialize block-1)
+        raw-2 (block/serialize block-2)
+        base-hash (get-in block-2 [:header :hash-hex])
+        full (consensus/open
+              {:network :regtest
+               :genesis-bytes (hex->bytes regtest-genesis)})
+        _ (consensus/accept-block! full raw-1 2000000000)
+        _ (consensus/accept-block! full raw-2 2000000000)
+        coins (get-in @(:state full) [:utxo :coins])
+        commitment (assumeutxo/hash-serialized coins)
+        snapshot (core-snapshot base-hash coins)
+        headers (consensus/open
+                 {:network :regtest
+                  :genesis-bytes (hex->bytes regtest-genesis)})
+        _ (consensus/accept-header!
+           headers (get-in block-1 [:header :bytes]) 2000000000)
+        _ (consensus/accept-header!
+           headers (get-in block-2 [:header :bytes]) 2000000000)
+        assumed
+        (consensus/load-assumeutxo!
+         headers snapshot
+         {:checkpoints
+          {2 {:blockhash base-hash
+              :hash-serialized commitment
+              :chain-tx-count 3}}})]
+    (is (= :assumed (:snapshot-status assumed)))
+    (is (= 2 (:height assumed)))
+    (is (= 0 (:background-height assumed)))
+    (is (false? (:fully-validated? assumed)))
+    (let [background-1
+          (consensus/accept-background-block!
+           headers raw-1 2000000000)
+          validated
+          (consensus/accept-background-block!
+           headers raw-2 2000000000)]
+      (is (= :assumed (:snapshot-status background-1)))
+      (is (= 1 (:background-height background-1)))
+      (is (= :validated (:snapshot-status validated)))
+      (is (nil? (:background-height validated)))
+      (is (:fully-validated? validated))
+      (is (consensus/ready? headers)))
+    (is (= :bitcoin.node/no-background-validation
+           (:type
+            (ex-data
+             (try
+               (consensus/accept-background-block!
+                headers raw-2 2000000000)
+               (catch kerror/ExceptionInfo exception
+                 exception))))))))

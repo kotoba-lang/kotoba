@@ -1,0 +1,1683 @@
+(ns bitcoin.node.disk-consensus
+  "A durable full-consensus host backed by the transactional SQLite UTXO set.
+
+  Header/fork-choice metadata, the active UTXO delta, and active-chain undo
+  journals share one commit boundary. Block bodies never enter the host
+  metadata blob. Validated side-branch bodies use bounded raw SQLite staging
+  until activation, when they are consumed by the same UTXO transaction."
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.assumeutxo :as assumeutxo]
+            [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.chainstate :as chainstate]
+            [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.sqlite-utxo :as sqlite]
+            [bitcoin.consensus.storage :as storage]
+            [bitcoin.consensus.utxo :as utxo]
+            [bitcoin.node.lazy-header-map :as lazy-header-map]
+            [bitcoin.node.peer :as peer]
+            [bitcoin.node.peer-pool :as peer-pool]
+            [kotobase.bitcoin.protocol :as header])
+  (:import [java.nio.channels FileChannel]
+           [java.nio.file AtomicMoveNotSupportedException Files OpenOption Path
+            StandardCopyOption StandardOpenOption]))
+
+(defrecord DiskConsensusNode
+  [state backend verify-script network background pending-limits
+   undo-retention-blocks ancestor-cache storage-id sealed?])
+
+(defrecord ReindexSession
+  [source target fork-height mode source-status target-storage
+   phase verification])
+
+(def ^:private disk-coins-key ::disk-backed)
+(def default-pending-block-limit 288)
+(def default-pending-byte-limit (* 512 1024 1024))
+(def minimum-undo-retention-blocks 288)
+(def default-undo-retention-blocks minimum-undo-retention-blocks)
+(def ^:private ancestor-cache-window 288)
+(def ^:private maximum-ancestor-cache-tips 8)
+(def ^:private reindex-pointer-format
+  "bitcoin.node.reindex-pointer.v1")
+
+(defn- storage-id [path datasource]
+  (if path
+    (let [resolved
+          (.normalize
+           (.toAbsolutePath
+            (Path/of (str path) (make-array String 0))))]
+      (str
+       (if (Files/exists
+            resolved (make-array java.nio.file.LinkOption 0))
+         (.toRealPath resolved (make-array java.nio.file.LinkOption 0))
+         resolved)))
+    datasource))
+
+(defn- same-storage? [left right]
+  (cond
+    (= left right) true
+    (and (string? left) (string? right))
+    (let [left-path (Path/of left (make-array String 0))
+          right-path (Path/of right (make-array String 0))]
+      (and (Files/exists left-path (make-array java.nio.file.LinkOption 0))
+           (Files/exists right-path (make-array java.nio.file.LinkOption 0))
+           (Files/isSameFile left-path right-path)))
+    :else false))
+
+(defn- disk-coins [coin-count]
+  {disk-coins-key true :coin-count coin-count})
+
+(declare overlay-or-all)
+
+(defn- strip-node-data
+  [state coin-count]
+  (-> state
+      (assoc-in [:utxo :coins] (disk-coins coin-count))
+      (update
+       :nodes
+       (fn [nodes]
+         ;; Block bodies are staged as bounded raw SQLite values. Undo is in
+         ;; the active journal. Neither belongs in checksummed host metadata.
+         (reduce-kv
+          (fn [result hash node]
+            (if (or (some? (:block node)) (some? (:undo node)))
+              (assoc result hash (assoc node :block nil :undo nil))
+              result))
+          nodes
+          (overlay-or-all nodes))))))
+
+(defn- fail! [type message data]
+  (codec/fail! type message data))
+
+(defn- ensure-writable! [node]
+  (when @(:sealed? node)
+    (fail! :bitcoin.node/reindex-storage-sealed
+           "This node is sealed after reindex pointer publication."
+           {:storage (:storage-id node)})))
+
+(defn- seal-node! [node]
+  (reset! (:sealed? node) true)
+  (when-let [background (:background node)]
+    (seal-node! background))
+  node)
+
+(def ^:private normalized-host-format
+  "bitcoin.node.disk-consensus.normalized.v3")
+
+(def ^:private previous-normalized-host-format
+  "bitcoin.node.disk-consensus.normalized.v2")
+
+(def ^:private legacy-normalized-host-format
+  "bitcoin.node.disk-consensus.normalized.v1")
+
+(def ^:private header-cache-size 8192)
+(def ^:private locator-key ::block-locator)
+
+(declare advance-locator computed-block-locator)
+
+(defn- overlay-or-all [nodes]
+  (if (lazy-header-map/lazy-header-map? nodes)
+    (lazy-header-map/overlay-entries nodes)
+    nodes))
+
+(defn- node-data [nodes]
+  (into {}
+        (keep
+         (fn [[hash node]]
+           (let [data (cond-> {}
+                        (some? (:block node)) (assoc :block (:block node))
+                        (some? (:undo node)) (assoc :undo (:undo node)))]
+             (when (seq data) [hash data]))))
+        (overlay-or-all nodes)))
+
+(defn- encode-host-state [state]
+  (let [state
+        (if (get state locator-key)
+          state
+          (assoc state locator-key (computed-block-locator state)))]
+    (storage/encode-value
+     {:format normalized-host-format
+      :state (dissoc state :nodes)
+      :node-data (node-data (:nodes state))})))
+
+(defn- selected-nodes [state hashes]
+  (mapv #(get-in state [:nodes %]) (distinct hashes)))
+
+(defn- lazy-nodes
+  [backend extras]
+  (let [overlay
+        (reduce-kv
+         (fn [result hash data]
+           (if-let [node (sqlite/header-node backend hash)]
+             (assoc result hash (merge node data))
+             (fail! :bitcoin.node/missing-normalized-header
+                    "Host node data references a missing normalized header."
+                    {:hash hash})))
+         {} extras)]
+    (lazy-header-map/create
+     #(when (string? %) (sqlite/header-node backend %))
+     #(sqlite/header-nodes backend)
+     {:cache-size header-cache-size :overlay overlay})))
+
+(defn- validate-normalized-state!
+  [state network]
+  (let [tip-hash (:active-tip state)
+        best-hash (:best-header state)
+        tip (get-in state [:nodes tip-hash])
+        best (get-in state [:nodes best-hash])
+        locator (get state locator-key)
+        tips (:header-tips state)
+        invalid (:invalid-blocks state)]
+    (when-not (= network (:network state))
+      (fail! :bitcoin.consensus/chainstate-network-mismatch
+             "Chainstate belongs to a different Bitcoin network."
+             {:expected network :actual (:network state)}))
+    (when-not (and (map? (:consensus state))
+                   (map? (:utxo state))
+                   (string? tip-hash)
+                   (string? best-hash)
+                   tip best
+                   (true? (:active? tip))
+                   (true? (:header-valid? best))
+                   (vector? locator)
+                   (<= 1 (count locator) 64)
+                   (every? #(and (vector? %) (= 32 (count %))) locator)
+                   (= (get-in best [:header :hash]) (first locator))
+                   (set? tips)
+                   (seq tips)
+                   (every? #(and (string? %) (get-in state [:nodes %])) tips)
+                   (map? invalid)
+                   (every?
+                    (fn [[hash {:keys [height reason]}]]
+                      (let [node (get-in state [:nodes hash])]
+                        (and node
+                             (not (true? (:active? node)))
+                             (not (true? (:block-valid? node)))
+                             (= height (:height node))
+                             (keyword? reason))))
+                    invalid)
+                   (nil? (chainstate/invalid-ancestor state tip-hash))
+                   (nil? (chainstate/invalid-ancestor state best-hash)))
+      (fail! :bitcoin.consensus/corrupt-chainstate
+             "Compact host metadata references invalid normalized headers."
+             {:active-tip tip-hash :best-header best-hash
+              :header-tips (when (set? tips) (count tips))
+              :invalid-blocks (when (map? invalid) (count invalid))}))
+    (when (pos? (compare (:chainwork tip) (:chainwork best)))
+      (fail! :bitcoin.consensus/corrupt-chainstate
+             "Best header has less work than the active tip."
+             {:active-tip tip-hash :best-header best-hash}))
+    (when-not (= (:height tip) (get-in state [:utxo :height]))
+      (fail! :bitcoin.consensus/corrupt-chainstate
+             "UTXO height differs from the active tip height."
+             {:tip-height (:height tip)
+              :utxo-height (get-in state [:utxo :height])}))
+    state))
+
+(defn- decode-normalized-host-state
+  [backend value network]
+  (let [extras (:node-data value)]
+    (when-not (map? extras)
+      (fail! :bitcoin.consensus/corrupt-chainstate
+             "Compact host node data is malformed." {}))
+    (validate-normalized-state!
+     (assoc (:state value) :nodes (lazy-nodes backend extras))
+     network)))
+
+(defn- migrate-previous-normalized-state!
+  [backend value network durable]
+  (let [extras (:node-data value)]
+    (when-not (map? extras)
+      (fail! :bitcoin.consensus/corrupt-chainstate
+             "Compact host node data is malformed." {}))
+    (let [upgraded
+          (validate-normalized-state!
+           (assoc (:state value)
+                  :header-tips (sqlite/header-tips backend)
+                  :invalid-blocks {}
+                  :nodes (lazy-nodes backend extras))
+           network)]
+      (sqlite/save-host-state!
+       backend (:tip durable) (:height durable)
+       (encode-host-state upgraded))
+      upgraded)))
+
+(defn- decode-legacy-normalized-state
+  [backend value network]
+  (let [nodes (sqlite/header-nodes backend)
+        extras (:node-data value)
+        merged
+        (reduce-kv
+         (fn [result hash data]
+           (when-not (contains? result hash)
+             (fail! :bitcoin.node/missing-normalized-header
+                    "Host node data references a missing normalized header."
+                    {:hash hash}))
+           (update result hash merge data))
+         nodes extras)]
+    (storage/validate!
+     (assoc (:state value)
+            :nodes merged
+            :format 2)
+     network)))
+
+(defn- compact-state [backend state]
+  (let [state
+        (if (get state locator-key)
+          state
+          (assoc state locator-key (computed-block-locator state)))
+        nodes (:nodes state)
+        extras (node-data nodes)]
+    (assoc
+     state :nodes
+     (if (lazy-header-map/lazy-header-map? nodes)
+       (lazy-header-map/rebase
+        nodes
+        (into {}
+              (map
+               (fn [[hash data]]
+                 [hash (merge (get nodes hash) data)]))
+              extras))
+       (lazy-nodes backend extras)))))
+
+(defn- raw-block-bytes [parsed]
+  (byte-array (map unchecked-byte (block/serialize parsed))))
+
+(defn- pending-options [pending-limits]
+  {:maximum-count (:maximum-count pending-limits)
+   :maximum-bytes (:maximum-bytes pending-limits)})
+
+(defn- migrate-host-block-data!
+  [backend state durable pending-limits]
+  (let [data (node-data (:nodes state))]
+    (if (empty? data)
+      state
+      (let [store
+            (into {}
+                  (keep
+                   (fn [[hash {:keys [block]}]]
+                     (when (and block
+                                (not (get-in state
+                                             [:nodes hash :active?])))
+                       [hash (raw-block-bytes block)])))
+                  data)
+            stripped
+            (strip-node-data state (:coin-count durable))]
+        (sqlite/save-host-headers-and-pending!
+         backend (:tip durable) (:height durable)
+         (encode-host-state stripped) []
+         (assoc (pending-options pending-limits) :store store))
+        stripped))))
+
+(defn- hydrate-pending-branch
+  [state backend parent-hash]
+  (loop [state state hash parent-hash]
+    (let [node (get-in state [:nodes hash])]
+      (cond
+        (or (nil? hash) (nil? node) (:active? node))
+        state
+
+        (:block node)
+        (recur state (:parent node))
+
+        :else
+        (if-let [raw (sqlite/pending-block backend hash)]
+          (let [parsed
+                (block/parse
+                 (mapv #(bit-and 0xff %) raw))
+                actual (get-in parsed [:header :hash-hex])]
+            (when-not (= hash actual)
+              (fail! :bitcoin.node/corrupt-pending-block
+                     "Staged block does not match its normalized header."
+                     {:expected hash :actual actual}))
+            (recur (assoc-in state [:nodes hash :block] parsed)
+                   (:parent node)))
+          state)))))
+
+(defn- load-or-migrate-host-state!
+  [backend bytes network durable]
+  (let [value (storage/decode-value bytes)]
+    (cond
+      (= normalized-host-format (:format value))
+      (decode-normalized-host-state backend value network)
+
+      (= previous-normalized-host-format (:format value))
+      (migrate-previous-normalized-state!
+       backend value network durable)
+
+      (= legacy-normalized-host-format (:format value))
+      (let [legacy (decode-legacy-normalized-state backend value network)
+            upgraded
+            (assoc legacy locator-key (computed-block-locator legacy))]
+        (sqlite/save-host-state!
+         backend (:tip durable) (:height durable)
+         (encode-host-state upgraded))
+        upgraded)
+
+      :else
+      (let [legacy (storage/validate! value network)
+            upgraded
+            (assoc legacy locator-key (computed-block-locator legacy))]
+        (sqlite/save-host-and-headers!
+         backend (:tip durable) (:height durable)
+         (encode-host-state upgraded) (vals (:nodes upgraded)))
+        upgraded))))
+
+(defn- validate-durable-tip!
+  [state durable]
+  (let [tip (:active-tip state)
+        height (chainstate/active-height state)]
+    (when-not (and (= tip (:tip durable))
+                   (= height (:height durable)))
+      (fail! :bitcoin.node/disk-consensus-tip-mismatch
+             "Checksummed chainstate and SQLite UTXO tip disagree."
+             {:state-tip tip :sqlite-tip (:tip durable)
+              :state-height height :sqlite-height (:height durable)}))
+    state))
+
+(defn- seed-genesis!
+  [backend initialized]
+  (let [view (sqlite/begin backend)
+        genesis-hash (:active-tip initialized)
+        genesis-node (get-in initialized [:nodes genesis-hash])]
+    (try
+      (let [seeded
+            (reduce
+             (fn [coins [key coin]]
+               (utxo/coin-assoc coins key coin))
+             view
+             (utxo/coin-entries (get-in initialized [:utxo :coins])))
+            coin-count (utxo/coin-count seeded)
+            durable (strip-node-data initialized coin-count)]
+        (sqlite/commit-transition!
+         seeded
+         {:expected-tip nil
+          :expected-height -1
+          :new-tip genesis-hash
+          :new-height 0
+          :detach []
+          :attach
+          [{:block-hash genesis-hash
+            :parent-hash nil
+            :height 0
+            :previous-height -1
+            :undo (:undo genesis-node)}]
+          :header-nodes [genesis-node]
+          :host-state-bytes (encode-host-state durable)})
+        durable)
+      (catch Throwable error
+        (sqlite/rollback! view)
+        (throw error)))))
+
+(defn- best-header-hash-at-height [state height]
+  (loop [hash (:best-header state)]
+    (let [node (get-in state [:nodes hash])]
+      (cond
+        (nil? node) nil
+        (= height (:height node)) hash
+        (< (:height node) height) nil
+        :else (recur (:parent node))))))
+
+(defn- seed-assumeutxo!
+  [backend network header-state header-backend
+   snapshot-source snapshot-options]
+  (when-not (= network (:network header-state))
+    (fail! :bitcoin.node/snapshot-header-network
+           "AssumeUTXO header state belongs to another network."
+           {:expected network :actual (:network header-state)}))
+  (when-not (zero? (chainstate/active-height header-state))
+    (fail! :bitcoin.node/snapshot-header-active-tip
+           "Snapshot initialization requires a headers-only state at genesis."
+           {:height (chainstate/active-height header-state)}))
+  (let [result (volatile! nil)
+        active-path (volatile! nil)]
+    (sqlite/import-snapshot!
+     backend snapshot-source
+     #(or (get-in snapshot-options [:checkpoints % :blockhash])
+          (best-header-hash-at-height header-state %))
+     (cond->
+      (assoc
+       snapshot-options
+       :host-state-fn
+       (fn [loaded]
+         (let [activation-options
+               (when header-backend
+                 {:ancestor-hash-at-height-fn
+                  (fn [_state tip height]
+                    (sqlite/header-ancestor-hash-at-height
+                     header-backend tip height))
+                  :ancestry-hashes-fn
+                  (fn [_state tip]
+                    (sqlite/header-ancestry-hashes
+                     header-backend tip))
+                  :activate-nodes-fn
+                  (fn [nodes path]
+                    (vreset! active-path path)
+                    nodes)})
+               activated
+               (assumeutxo/activate
+                header-state loaded (or activation-options {}))
+               coin-count (get-in loaded [:snapshot :coins-count])
+               durable (strip-node-data activated coin-count)]
+           (vreset! result durable)
+           (encode-host-state durable))))
+       header-backend
+       (assoc
+        :header-node-producer-fn
+        (fn [_loaded emit!]
+          (let [path @active-path]
+            (when-not (set? path)
+              (fail! :bitcoin.node/snapshot-active-path
+                     "Snapshot header activation path was not captured." {}))
+            (sqlite/consume-header-nodes!
+             header-backend
+             (fn [node]
+               (emit!
+                (assoc node :active?
+                       (contains? path (:hash node)))))))))
+       (nil? header-backend)
+       (assoc
+        :header-nodes-fn
+        (fn [_loaded]
+          (vals (:nodes @result))))))
+    (let [durable @result]
+      (if header-backend
+        (assoc durable :nodes
+               (lazy-nodes backend (node-data (:nodes durable))))
+        durable))))
+
+(defn- open-single
+  "Open or initialize an atomic disk-backed consensus node.
+
+  `genesis-bytes` is required only for a new database. A non-empty legacy UTXO
+  database without matching host metadata is rejected instead of guessing its
+  header or fork-choice state."
+  [{:keys [path datasource network genesis-bytes verify-script
+           busy-timeout-ms snapshot-source header-state snapshot-options
+           snapshot-header-backend
+           pending-block-limit pending-byte-limit undo-retention-blocks]
+    :or {busy-timeout-ms 5000
+         pending-block-limit default-pending-block-limit
+         pending-byte-limit default-pending-byte-limit
+         undo-retention-blocks default-undo-retention-blocks}}]
+  (when-not (contains? chainstate/consensus-parameters network)
+    (fail! :bitcoin.node/unsupported-consensus-network
+           "The disk consensus host has no parameters for this network."
+           {:network network}))
+  (when-not (and (integer? pending-block-limit)
+                 (<= 0 pending-block-limit
+                     sqlite/maximum-pending-block-count)
+                 (integer? pending-byte-limit)
+                 (<= 0 pending-byte-limit
+                     sqlite/maximum-pending-total-bytes))
+    (fail! :bitcoin.node/pending-block-configuration
+           "Pending side-branch staging bounds are invalid."
+           {:pending-block-limit pending-block-limit
+            :pending-byte-limit pending-byte-limit}))
+  (when-not (and (integer? undo-retention-blocks)
+                 (<= minimum-undo-retention-blocks
+                     undo-retention-blocks))
+    (fail! :bitcoin.node/undo-retention-configuration
+           "Undo retention must preserve at least 288 active blocks."
+           {:undo-retention-blocks undo-retention-blocks
+            :minimum minimum-undo-retention-blocks}))
+  (let [pending-limits
+        {:maximum-count pending-block-limit
+         :maximum-bytes pending-byte-limit}
+        backend
+        (sqlite/open {:path path :datasource datasource :network network
+                      :busy-timeout-ms busy-timeout-ms})
+        durable (sqlite/status backend)
+        bytes (sqlite/host-state backend)
+        initial
+        (cond
+          bytes
+          (validate-durable-tip!
+           (load-or-migrate-host-state!
+            backend bytes network durable)
+           durable)
+
+          (and (= -1 (:height durable)) snapshot-source)
+          (do
+            (when-not header-state
+              (fail! :bitcoin.node/missing-snapshot-headers
+                     "Snapshot initialization requires validated headers."
+                     {:network network}))
+            (seed-assumeutxo!
+             backend network header-state snapshot-header-backend
+             snapshot-source
+             (or snapshot-options {})))
+
+          (= -1 (:height durable))
+          (do
+            (when-not genesis-bytes
+              (fail! :bitcoin.node/missing-genesis
+                     "A new disk consensus database requires genesis bytes."
+                     {:network network}))
+            (seed-genesis!
+             backend
+             (chainstate/initialize
+              network (block/parse genesis-bytes) verify-script)))
+
+          :else
+          (fail! :bitcoin.node/missing-disk-consensus-state
+                 "A populated UTXO database lacks atomic consensus metadata."
+                 {:network network :height (:height durable)
+                  :tip (:tip durable)}))
+        migrated
+        (migrate-host-block-data!
+         backend initial durable pending-limits)]
+    (->DiskConsensusNode
+     (atom (if (lazy-header-map/lazy-header-map? (:nodes migrated))
+             migrated
+             (compact-state backend migrated)))
+     backend verify-script network nil pending-limits
+     undo-retention-blocks (atom {}) (storage-id path datasource)
+     (atom false))))
+
+(defn- header-genesis-bytes [header-state]
+  (when header-state
+    (some-> (get-in header-state
+                    [:nodes (:active-tip header-state) :block])
+            block/serialize)))
+
+(defn- cached-ancestor-node
+  [node state tip height]
+  (let [nodes (:nodes state)
+        overlay
+        (if (lazy-header-map/lazy-header-map? nodes)
+          (into {} (lazy-header-map/overlay-entries nodes))
+          nodes)]
+    (loop [hash tip]
+      (if-let [overlay-node (get overlay hash)]
+        (cond
+          (= height (:height overlay-node)) overlay-node
+          (< (:height overlay-node) height) nil
+          :else (recur (:parent overlay-node)))
+        (or (get-in @(:ancestor-cache node) [hash height])
+            (let [window
+                  (sqlite/header-ancestor-nodes-between
+                   (:backend node) hash height
+                   (+ height (dec ancestor-cache-window)))]
+              (swap!
+               (:ancestor-cache node)
+               (fn [cache]
+                 (let [updated (assoc cache hash window)]
+                   (if (> (count updated) maximum-ancestor-cache-tips)
+                     {hash window}
+                     updated))))
+              (get window height)))))))
+
+(defn open
+  "Open an atomic disk consensus node.
+
+  Snapshot nodes automatically maintain an independent genesis-started
+  background database at `<path>.background`. Custom DataSources must provide
+  `:background-datasource` or `:background-path`."
+  [{:keys [path network genesis-bytes verify-script
+           busy-timeout-ms header-state
+           background-path background-datasource
+           background-genesis-bytes
+           pending-block-limit pending-byte-limit undo-retention-blocks]
+    :as options}]
+  (let [node (open-single options)
+        assumed? (= :assumed (get-in @(:state node) [:snapshot :status]))]
+    (if-not assumed?
+      node
+      (let [derived-path (or background-path
+                             (when path (str path ".background")))
+            _ (when-not (or derived-path background-datasource)
+                (fail!
+                 :bitcoin.node/missing-background-storage
+                 "Snapshot consensus requires independent background storage."
+                 {:network network}))
+            background
+            (open-single
+             {:path derived-path
+              :datasource background-datasource
+              :network network
+              :genesis-bytes
+              (or background-genesis-bytes genesis-bytes
+                  (header-genesis-bytes header-state))
+              :verify-script verify-script
+              :busy-timeout-ms (or busy-timeout-ms 5000)
+              :pending-block-limit
+              (or pending-block-limit default-pending-block-limit)
+              :pending-byte-limit
+              (or pending-byte-limit default-pending-byte-limit)
+              :undo-retention-blocks
+              (or undo-retention-blocks default-undo-retention-blocks)})]
+        (assoc node :background background)))))
+
+(defn consensus-status [node]
+  (let [state @(:state node)
+        durable (sqlite/status (:backend node))
+        pending (sqlite/pending-status (:backend node))
+        undo (sqlite/undo-status (:backend node))
+        tip (:active-tip state)
+        best (:best-header state)
+        invalid (chainstate/invalid-blocks state)
+        invalid-roots
+        (->> invalid
+             (map (fn [[hash details]] (assoc details :hash hash)))
+             (sort-by (juxt :height :hash))
+             reverse
+             (take 16)
+             vec)
+        best-header-chainwork (get-in state [:nodes best :chainwork])
+        minimum-chainwork (get-in state [:consensus :minimum-chainwork])
+        assumed? (= :assumed (get-in state [:snapshot :status]))
+        background-status
+        (when (and assumed? (:background node))
+          (sqlite/status (get-in node [:background :backend])))]
+    {:status :connected
+     :backend :sqlite-consensus
+     :network (:network state)
+     :height (:height durable)
+     :best-block tip
+     :best-header best
+     :best-header-height (get-in state [:nodes best :height])
+     :best-header-chainwork best-header-chainwork
+     :minimum-chainwork minimum-chainwork
+     :headers-presync-required?
+     (header/better-chain? minimum-chainwork best-header-chainwork)
+     :chainwork (get-in state [:nodes tip :chainwork])
+     :utxo-count (:coin-count durable)
+     :pending-blocks (:pending-blocks pending)
+     :pending-bytes (:pending-bytes pending)
+     :invalid-blocks (count invalid)
+     :invalid-block-roots invalid-roots
+     :pending-block-limit
+     (get-in node [:pending-limits :maximum-count])
+     :pending-byte-limit
+     (get-in node [:pending-limits :maximum-bytes])
+     :undo-retention-blocks (:undo-retention-blocks node)
+     :retained-undo-blocks (:retained-undo-blocks undo)
+     :undo-pruned-through-height
+     (:undo-pruned-through-height undo)
+     :available-reorg-depth (:available-reorg-depth undo)
+     :fully-validated?
+     (and (not= :assumed (get-in state [:snapshot :status]))
+          (true? (get-in state [:nodes tip :block-valid?])))
+     :snapshot-status (get-in state [:snapshot :status])
+     :snapshot-base-height (get-in state [:snapshot :base-height])
+     :snapshot-base-block (get-in state [:snapshot :base-blockhash])
+     :background-height (:height background-status)
+     :background-tip (:tip background-status)
+     :sealed-for-reindex? @(:sealed? node)
+     :persistent? true}))
+
+(defn ready? [node]
+  (let [status (consensus-status node)]
+    (and (:fully-validated? status)
+         (nat-int? (:height status))
+         (string? (:best-block status))
+         (= (:height status)
+            (chainstate/active-height @(:state node))))))
+
+(defn active-block-hash-at-height
+  "Return the locally validated active-chain hash at `height`.
+
+  This is an ancestry proof against the currently opened durable chainstate,
+  not a network lookup. It is suitable for binding historical differential
+  evidence to the chain the application is actually serving."
+  [node height]
+  (locking node
+    (let [current-height (:height (sqlite/status (:backend node)))]
+      (when-not (and (integer? height) (<= 0 height current-height))
+        (fail! :bitcoin.node/active-chain-height
+               "Active-chain evidence height is outside the validated chain."
+               {:height height :current-height current-height}))
+      (let [state @(:state node)
+            ancestor
+            (cached-ancestor-node node state (:active-tip state) height)]
+        (or (:hash ancestor)
+            (fail! :bitcoin.node/missing-active-ancestor
+                   "Validated active-chain ancestry is unavailable."
+                   {:height height :current-height current-height}))))))
+
+(defn lookup [node outpoint]
+  (sqlite/lookup (:backend node) outpoint))
+
+(defn integrity-check! [node]
+  (sqlite/integrity-check! (:backend node)))
+
+(defn prune-undo!
+  "Apply the node's configured active-chain undo retention immediately."
+  [node]
+  (locking node
+    (ensure-writable! node)
+    (sqlite/prune-undo!
+     (:backend node) (:undo-retention-blocks node))))
+
+(defn recovery-plan
+  "Describe whether a fork can reorganize in place or needs chainstate reindex.
+
+  `fork-height` is the common ancestor height, not the competing tip height."
+  [node fork-height]
+  (let [status (consensus-status node)
+        current-height (:height status)
+        floor (:undo-pruned-through-height status)]
+    (when-not (and (integer? fork-height)
+                   (<= 0 fork-height current-height))
+      (fail! :bitcoin.node/recovery-height
+             "Recovery fork height is outside the validated chain."
+             {:fork-height fork-height
+              :current-height current-height}))
+    (if (>= fork-height floor)
+      {:required? false
+       :mode :in-place-reorganization
+       :fork-height fork-height
+       :current-height current-height
+       :detach-blocks (- current-height fork-height)
+       :available-reorg-depth (:available-reorg-depth status)
+       :undo-pruned-through-height floor}
+      {:required? true
+       :mode :reindex-required
+       :recovery :reindex-from-authenticated-history
+       :fork-height fork-height
+       :current-height current-height
+       :missing-undo-through-height floor
+       :preserve-normalized-headers? true
+       :acceptable-sources
+       [:fully-validated-genesis-replay
+        :authenticated-assumeutxo-with-background-validation]})))
+
+(declare accept-headers!)
+
+(defn accept-header!
+  "Validate and durably index one raw 80-byte header."
+  [node raw-header now]
+  (accept-headers! node [raw-header] now))
+
+(defn accept-headers!
+  "Validate a chronological header batch and persist it once, atomically.
+  No header in a failing batch becomes visible."
+  [node raw-headers now]
+  (locking node
+    (ensure-writable! node)
+    (let [before @(:state node)
+          parsed
+          (mapv #(header/decode-block-header (vec %)) raw-headers)
+          after
+          (advance-locator
+           before
+           (chainstate/accept-headers
+            before parsed now))
+          durable (sqlite/status (:backend node))
+          stripped (strip-node-data after (:coin-count durable))]
+      (validate-durable-tip! before durable)
+      (sqlite/save-host-and-headers!
+       (:backend node) (:tip durable) (:height durable)
+       (encode-host-state stripped)
+       (selected-nodes stripped (map :hash-hex parsed)))
+      (reset! (:state node) (compact-state (:backend node) stripped))
+      (consensus-status node))))
+
+(defn- computed-block-locator [state]
+  (loop [hash (:best-header state)
+         step 1
+         entries 0
+         locator []]
+    (when-not hash
+      (fail! :bitcoin.node/missing-best-header
+             "Cannot build a locator without a validated best header." {}))
+    (let [node (get-in state [:nodes hash])]
+      (when-not node
+        (fail! :bitcoin.node/missing-header-node
+               "Best-header ancestry is incomplete."
+               {:hash hash}))
+      (let [locator' (conj locator (get-in node [:header :hash]))
+            height (:height node)]
+        (if (zero? height)
+          locator'
+          (let [step' (if (>= entries 9) (* 2 step) step)
+                ancestor
+                (loop [current hash remaining (min step' height)]
+                  (if (zero? remaining)
+                    current
+                    (recur (get-in state [:nodes current :parent])
+                           (dec remaining))))]
+            (recur ancestor step' (inc entries) locator')))))))
+
+(defn- bounded-locator [values]
+  (loop [values (vec (distinct values))]
+    (if (<= (count values) 64)
+      values
+      (let [genesis (peek values)
+            reduced
+            (vec
+             (distinct
+              (concat (take 10 values)
+                      (take-nth 2 (drop 10 values))
+                      [genesis])))]
+        (recur reduced)))))
+
+(defn- advance-locator [before after]
+  (if (= (:best-header before) (:best-header after))
+    after
+    (let [recent
+          (loop [hash (:best-header after) remaining 10 result []]
+            (if (or (nil? hash) (zero? remaining))
+              result
+              (let [node (get-in after [:nodes hash])]
+                (when-not node
+                  (fail! :bitcoin.node/missing-header-node
+                         "Best-header ancestry is incomplete."
+                         {:hash hash}))
+                (recur (:parent node) (dec remaining)
+                       (conj result (get-in node [:header :hash]))))))
+          previous
+          (or (get before locator-key)
+              (computed-block-locator before))]
+      (assoc after locator-key
+             (bounded-locator (concat recent previous))))))
+
+(defn block-locator
+  "Return a bounded durable locator for the best validated header.
+
+  The initial migration computes the Core-style sparse ancestry once.
+  Subsequent batches prepend their ten newest hashes and exponentially age
+  older entries, preserving a restart-ready common-ancestor search without
+  walking the full chain."
+  [state]
+  (or (get state locator-key)
+      (computed-block-locator state)))
+
+(defn- headers-presync-context
+  "Capture the bounded, durable ancestry needed by two-phase header pre-sync."
+  [state now]
+  (let [tip (:best-header state)
+        tip-node (get-in state [:nodes tip])
+        context
+        (loop [hash tip remaining 2017 newest []]
+          (if (or (nil? hash) (zero? remaining))
+            (vec (reverse newest))
+            (let [node (get-in state [:nodes hash])]
+              (when-not node
+                (fail! :bitcoin.node/missing-header-node
+                       "Header pre-sync ancestry is incomplete."
+                       {:hash hash :tip tip}))
+              (recur (:parent node) (dec remaining)
+                     (conj newest (:header node))))))]
+    {:network (:network state)
+     :context context
+     :anchor-height (:height tip-node)
+     :anchor-chainwork (:chainwork tip-node)
+     :minimum-chainwork (get-in state [:consensus :minimum-chainwork])
+     :now now}))
+
+(defn sync-headers!
+  "Synchronize validated P2P header batches into this disk consensus node.
+
+  Below the network minimum-chainwork threshold, a peer must complete the
+  bounded commitment pre-sync/redownload protocol before any header is
+  durably indexed."
+  ([node connection now]
+   (sync-headers! node connection now {}))
+  ([node connection now options]
+   (let [state @(:state node)
+         locator (block-locator state)]
+     (peer/sync-headers!
+      connection locator
+      #(accept-headers! node (mapv :bytes %) now)
+      (assoc options :presync (headers-presync-context state now))))))
+
+(defn sync-headers-from-peers!
+  "Synchronize from a bounded peer set, resuming from every durable batch.
+
+  A failed or invalid peer cannot roll back accepted work. With
+  `:required-successes` greater than one, competing reports are retained for
+  operator visibility while consensus most-work selection remains local."
+  ([node peer-configurations now]
+   (sync-headers-from-peers! node peer-configurations now {}))
+  ([node peer-configurations now options]
+   (peer/sync-headers-from-peers!
+    peer-configurations
+    #(block-locator @(:state node))
+    #(accept-headers! node (mapv :bytes %) now)
+    (assoc options
+           :presync-fn
+           #(headers-presync-context @(:state node) now)))))
+
+(defn sync-headers-managed!
+  "Synchronize through a health-scored peer pool with cooldown and rotation."
+  ([node pool-atom now]
+   (sync-headers-managed! node pool-atom now {}))
+  ([node pool-atom now options]
+   (peer-pool/sync-headers!
+    pool-atom
+    #(block-locator @(:state node))
+    #(accept-headers! node (mapv :bytes %) now)
+    (assoc options
+           :presync-fn
+           #(headers-presync-context @(:state node) now)))))
+
+(declare accept-block!)
+
+(defn pending-best-chain-blocks
+  "Return natural-order hashes for unvalidated blocks on the best header chain.
+
+  Results are chronological and bounded, so a caller can resume after every
+  atomic block commit without maintaining a separate download cursor."
+  ([node]
+   (pending-best-chain-blocks node 128))
+  ([node limit]
+   (when-not (and (integer? limit) (<= 1 limit 1024))
+     (fail! :bitcoin.node/block-sync-limit
+            "Block synchronization limit must be between 1 and 1,024."
+            {:limit limit}))
+   (let [state @(:state node)
+         chain
+         (loop [hash (:best-header state) result []]
+           (if hash
+             (recur (get-in state [:nodes hash :parent])
+                    (conj result hash))
+             (reverse result)))]
+     (->> chain
+          (remove #(true? (get-in state [:nodes % :block-valid?])))
+          (take limit)
+          (mapv #(get-in state [:nodes % :header :hash]))))))
+
+(defn sync-blocks!
+  "Fetch and fully validate a bounded segment of the best header chain.
+
+  Every block is committed independently through `accept-block!`; interruption
+  therefore resumes from the first unvalidated header without replaying an
+  external cursor."
+  ([node connection now]
+   (sync-blocks! node connection now {}))
+  ([node connection now {:keys [max-blocks] :or {max-blocks 128}}]
+   (let [hashes (pending-best-chain-blocks node max-blocks)]
+     (doseq [hash hashes]
+       (accept-block! node (peer/get-block! connection hash) now))
+     (let [more? (boolean (seq (pending-best-chain-blocks node 1)))]
+       {:status (if more? :batch-limit :synced)
+        :downloaded (count hashes)
+        :more? more?
+        :consensus (consensus-status node)}))))
+
+(defn- accept-managed-block!
+  [node pool-atom source raw now options]
+  (try
+    (accept-block! node raw now)
+    (catch kerror/ExceptionInfo error
+      (let [feedback-type
+            (cond
+              (or (chainstate/invalid-block-error? error)
+                  (= :invalid
+                     (chainstate/block-validation-result error)))
+              :bitcoin.node/peer-invalid-block
+
+              (chainstate/mutated-block-error? error)
+              :bitcoin.node/peer-mutated-block
+
+              :else nil)]
+        (when (and feedback-type source)
+          (peer-pool/report-block-validation-failure!
+           pool-atom source
+           (or (:now-ms options) (System/currentTimeMillis))
+           feedback-type
+           {:pool-path (:pool-path options)}))
+        (if (and feedback-type source)
+          (throw
+           (ex-info
+            (.getMessage error)
+            (assoc (ex-data error)
+                   :source-peer source
+                   :peer-feedback feedback-type)
+            error))
+          (throw error))))))
+
+(defn- validation-failure-summary [error]
+  (let [data (ex-data error)]
+    {:peer (:source-peer data)
+     :type (:peer-feedback data)
+     :validation-type (:type data)
+     :block-validation-result (:block-validation-result data)
+     :block-hash (or (:invalid-block-hash data) (:block-hash data))
+     :message (.getMessage error)}))
+
+(defn- commit-managed-window!
+  [node pool-atom raws sources now options]
+  (loop [entries
+         (mapv vector raws (concat sources (repeat nil)))
+         committed 0]
+    (if-let [[raw source] (first entries)]
+      (let [attempt
+            (try
+              (accept-managed-block!
+               node pool-atom source raw now options)
+              {:accepted? true}
+              (catch kerror/ExceptionInfo error
+                {:error error}))]
+        (if-let [error (:error attempt)]
+          (if (:peer-feedback (ex-data error))
+            {:committed committed
+             :rejection (validation-failure-summary error)}
+            (throw error))
+          (recur (subvec entries 1) (inc committed))))
+      {:committed committed})))
+
+(defn sync-blocks-managed!
+  "Download and commit best-chain blocks through a managed multi-peer pool.
+
+  At most `bitcoin.consensus.sync/max-inflight` raw blocks are resident between
+  validation commits. Network retrieval is parallel and failover-aware, while
+  publication remains chronological through `accept-block!`; a later block can
+  never become durable before its parent. Invalid or mutated provider bodies
+  retain their committed prefix and retry another eligible peer in this same
+  cycle. A larger `:max-blocks` cycle is split into bounded windows."
+  ([node pool-atom now]
+   (sync-blocks-managed! node pool-atom now {}))
+  ([node pool-atom now
+    {:keys [max-blocks max-validation-retries]
+     :or {max-blocks 128 max-validation-retries 32}
+     :as options}]
+   (when-not (and (integer? max-blocks) (<= 1 max-blocks 1024))
+     (fail! :bitcoin.node/block-sync-limit
+            "Block synchronization limit must be between 1 and 1,024."
+            {:limit max-blocks}))
+   (when-not (and (integer? max-validation-retries)
+                  (<= 1 max-validation-retries 32))
+     (fail! :bitcoin.node/block-validation-retry-configuration
+            "Block validation retries must be between 1 and 32."
+            {:max-validation-retries max-validation-retries}))
+   (loop [remaining max-blocks
+          downloaded 0
+          windows 0
+          observations []
+          failures []
+          validation-failures []]
+     (let [limit (min remaining peer/maximum-block-download-batch)
+           hashes (pending-best-chain-blocks node limit)]
+       (if (empty? hashes)
+         {:status :synced
+          :downloaded downloaded
+          :more? false
+          :windows windows
+          :observations observations
+          :failures failures
+          :validation-failures validation-failures
+          :consensus (consensus-status node)}
+         (let [result
+               (try
+                 (peer-pool/download-blocks!
+                  pool-atom hashes
+                  (dissoc options :max-blocks :max-validation-retries))
+                 (catch kerror/ExceptionInfo error
+                   (if (seq validation-failures)
+                     (throw
+                      (ex-info
+                       (.getMessage error)
+                       (assoc (ex-data error)
+                              :validation-failures validation-failures)
+                       error))
+                     (throw error))))
+               raws (:blocks result)
+               sources (:block-sources result)
+               committed-window
+               (commit-managed-window!
+                node pool-atom raws sources now options)
+               rejection (:rejection committed-window)
+               count' (:committed committed-window)
+               downloaded' (+ downloaded count')
+               remaining' (- remaining count')
+               observations' (into observations (:observations result))
+               failures' (into failures (:failures result))
+               validation-failures'
+               (cond-> validation-failures
+                 rejection (conj rejection))
+               more?
+               (boolean (seq (pending-best-chain-blocks node 1)))]
+           (when (> (count validation-failures')
+                    max-validation-retries)
+             (fail! :bitcoin.node/block-validation-retry-limit
+                    "Block validation retry limit was exhausted."
+                    {:max-validation-retries max-validation-retries
+                     :validation-failures validation-failures'}))
+           (if (and (not rejection)
+                    (or (zero? remaining') (not more?)))
+             {:status (if more? :batch-limit :synced)
+              :downloaded downloaded'
+              :more? more?
+              :windows (inc windows)
+              :observations observations'
+              :failures failures'
+              :validation-failures validation-failures'
+              :pool (:pool result)
+              :consensus (consensus-status node)}
+             (recur remaining' downloaded' (inc windows)
+                    observations' failures'
+                    validation-failures'))))))))
+
+(defn- transition-paths [before after]
+  (loop [old-hash (:active-tip before)
+         new-hash (:active-tip after)
+         detach []
+         attach []]
+    (let [old-node (get-in before [:nodes old-hash])
+          new-node (get-in after [:nodes new-hash])]
+      (when-not (and old-node new-node)
+        (fail! :bitcoin.node/missing-header-node
+               "Cannot derive a reorganization across a missing header."
+               {:old old-hash :new new-hash}))
+      (cond
+        (> (:height old-node) (:height new-node))
+        (recur (:parent old-node) new-hash
+               (conj detach old-hash) attach)
+
+        (< (:height old-node) (:height new-node))
+        (recur old-hash (:parent new-node)
+               detach (conj attach new-hash))
+
+        (= old-hash new-hash)
+        {:detach detach :attach (vec (reverse attach))}
+
+        :else
+        (recur (:parent old-node) (:parent new-node)
+               (conj detach old-hash) (conj attach new-hash))))))
+
+(defn- attachment [state hash]
+  (let [node (get-in state [:nodes hash])]
+    {:block-hash hash
+     :parent-hash (:parent node)
+     :height (:height node)
+     :previous-height (dec (:height node))
+     :undo (:undo node)}))
+
+(defn- promote-background!
+  [node]
+  (let [state @(:state node)
+        snapshot (:snapshot state)
+        background (:background node)
+        background-status (sqlite/status (:backend background))
+        base-height (:base-height snapshot)]
+    (if (not= base-height (:height background-status))
+      state
+      (let [_ (sqlite/integrity-check! (:backend background))
+            commitment (sqlite/hash-serialized (:backend background))
+            validated
+            (assumeutxo/validate-background-commitment
+             state (:height background-status) (:tip background-status)
+             commitment)
+            base (:base-blockhash snapshot)
+            foreground-status (sqlite/status (:backend node))
+            promoted
+            (-> validated
+                (assoc-in [:nodes base :block-valid?] true)
+                (assoc-in [:nodes base :scripts-checked?] true)
+                (strip-node-data (:coin-count foreground-status)))]
+        (sqlite/save-host-and-headers!
+         (:backend node) (:tip foreground-status)
+         (:height foreground-status) (encode-host-state promoted)
+         (selected-nodes promoted [base]))
+        (let [compact (compact-state (:backend node) promoted)]
+          (reset! (:state node) compact)
+          compact)))))
+
+(defn accept-background-block!
+  "Fully validate one pre-snapshot block in the independent disk chainstate.
+  At the exact snapshot base, stream its UTXO commitment and atomically promote
+  the foreground trust state when height, tip, and commitment all match."
+  [node raw-block now]
+  (locking node
+    (ensure-writable! node)
+    (when-not (= :assumed (get-in @(:state node) [:snapshot :status]))
+      (fail! :bitcoin.node/no-background-validation
+             "No assumed snapshot is awaiting background validation." {}))
+    (when-not (:background node)
+      (fail! :bitcoin.node/missing-background-storage
+             "Assumed snapshot has no independent background chainstate." {}))
+    (let [base-height (get-in @(:state node) [:snapshot :base-height])
+          before-height
+          (:height (sqlite/status (get-in node [:background :backend])))]
+      (when (>= before-height base-height)
+        (fail! :bitcoin.node/background-complete
+               "Background chainstate already reached the snapshot base."
+               {:height before-height :base-height base-height}))
+      (accept-block! (:background node) raw-block now)
+      (promote-background! node)
+      (consensus-status node))))
+
+(defn verify-background!
+  "Retry integrity and commitment verification after the background database
+  has reached the snapshot base. This never advances either chainstate."
+  [node]
+  (locking node
+    (ensure-writable! node)
+    (when-not (= :assumed (get-in @(:state node) [:snapshot :status]))
+      (fail! :bitcoin.node/no-background-validation
+             "No assumed snapshot is awaiting background validation." {}))
+    (when-not (:background node)
+      (fail! :bitcoin.node/missing-background-storage
+             "Assumed snapshot has no independent background chainstate." {}))
+    (let [base-height (get-in @(:state node) [:snapshot :base-height])
+          actual-height
+          (:height (sqlite/status (get-in node [:background :backend])))]
+      (when-not (= base-height actual-height)
+        (fail! :bitcoin.node/background-incomplete
+               "Background chainstate has not reached the snapshot base."
+               {:height actual-height :base-height base-height}))
+      (promote-background! node)
+      (consensus-status node))))
+
+(defn- quarantine-invalid-error!
+  [node before durable-before error]
+  (let [backend (:backend node)
+        {:keys [invalid-block-hash type]} (ex-data error)]
+    (when (and (chainstate/invalid-block-error? error)
+               (get-in before [:nodes invalid-block-hash]))
+      (let [marked
+            (advance-locator
+             before
+             (chainstate/mark-block-invalid
+              before invalid-block-hash type))
+            pending-delete
+            (->> (sqlite/pending-block-hashes backend)
+                 (filter #(chainstate/block-invalid? marked %))
+                 vec)
+            stripped
+            (strip-node-data marked (:coin-count durable-before))]
+        (sqlite/save-host-headers-and-pending!
+         backend (:tip durable-before) (:height durable-before)
+         (encode-host-state stripped) []
+         (assoc (pending-options (:pending-limits node))
+                :delete pending-delete))
+        (reset! (:state node) (compact-state backend stripped))
+        true))))
+
+(defn accept-block!
+  "Validate one raw block and atomically publish its fork-choice, UTXO delta,
+  active undo journals, and checksummed restart state."
+  [node raw-block now]
+  (locking node
+    (ensure-writable! node)
+    (let [backend (:backend node)
+          durable-before (sqlite/status backend)
+          before @(:state node)
+          _ (validate-durable-tip! before durable-before)
+          raw-vector (vec raw-block)
+          parsed-header
+          (header/decode-block-header
+           (first (codec/read-bytes raw-vector 0 80)))
+          parsed-hash (:hash-hex parsed-header)
+          parsed
+          (try
+            (block/parse raw-vector)
+            (catch kerror/ExceptionInfo error
+              (let [annotated
+                    (chainstate/annotate-block-validation-error
+                     parsed-hash error)]
+                (quarantine-invalid-error!
+                 node before durable-before annotated)
+                (throw annotated))))
+          parent-hash
+          (header/natural-hash->hex
+           (get-in parsed [:header :prev-block]))
+          raw-bytes
+          (byte-array (map unchecked-byte raw-block))]
+      (if (true? (get-in before
+                         [:nodes parsed-hash :block-valid?]))
+        (consensus-status node)
+        (let [branch-state
+              (hydrate-pending-branch before backend parent-hash)
+              view (sqlite/begin backend)]
+          (try
+            (let [hydrated (assoc-in branch-state [:utxo :coins] view)
+                  after
+                  (advance-locator
+                   before
+                   (chainstate/accept-block
+                    hydrated parsed now (:verify-script node)
+                    {:undo-fn #(sqlite/undo backend %)
+                     :ancestor-node-at-height-fn
+                     (fn [state tip height]
+                       (cached-ancestor-node node state tip height))}))
+                  active-changed?
+                  (not= (:active-tip before) (:active-tip after))
+                  coin-count
+                  (utxo/coin-count (get-in after [:utxo :coins]))
+                  stripped (strip-node-data after coin-count)]
+              (if active-changed?
+                (let [{:keys [detach attach]}
+                      (transition-paths before after)]
+                  (sqlite/commit-transition!
+                   (get-in after [:utxo :coins])
+                   {:expected-tip (:tip durable-before)
+                    :expected-height (:height durable-before)
+                    :new-tip (:active-tip after)
+                    :new-height (chainstate/active-height after)
+                    :detach detach
+                    :attach (mapv #(attachment after %) attach)
+                    :header-nodes
+                    (selected-nodes
+                     stripped (concat [parsed-hash] detach attach))
+                    :pending-delete attach
+                    :retain-undo-blocks (:undo-retention-blocks node)
+                    :host-state-bytes (encode-host-state stripped)}))
+                (do
+                  (sqlite/rollback! view)
+                  (sqlite/save-host-headers-and-pending!
+                   backend (:tip durable-before) (:height durable-before)
+                   (encode-host-state stripped)
+                   (selected-nodes stripped [parsed-hash])
+                   (assoc (pending-options (:pending-limits node))
+                          :store {parsed-hash raw-bytes}))))
+              (reset! (:state node) (compact-state backend stripped))
+              (consensus-status node))
+            (catch Throwable error
+              (sqlite/rollback! view)
+              (quarantine-invalid-error!
+               node before durable-before error)
+              (throw error))))))))
+
+(defn begin-reindex!
+  "Open a non-destructive deep-reorganization rebuild target.
+
+  `mode` is `:fully-validated-genesis-replay` or
+  `:authenticated-assumeutxo-with-background-validation`. `target-options`
+  are passed to `open`; the resolved target storage must differ from the live
+  source. Existing target state is accepted so an interrupted rebuild can
+  resume."
+  [source fork-height {:keys [mode target-options]}]
+  (let [plan (recovery-plan source fork-height)
+        supported
+        #{:fully-validated-genesis-replay
+          :authenticated-assumeutxo-with-background-validation}]
+    (when-not (:required? plan)
+      (fail! :bitcoin.node/reindex-unnecessary
+             "The requested fork remains inside the retained undo window."
+             {:fork-height fork-height :plan plan}))
+    (when-not (and (contains? supported mode)
+                   (map? target-options))
+      (fail! :bitcoin.node/reindex-configuration
+             "Reindex mode or target options are invalid."
+             {:mode mode :supported supported}))
+    (let [target (open target-options)
+          source-status (consensus-status source)
+          target-status (consensus-status target)]
+      (when (same-storage? (:storage-id source) (:storage-id target))
+        (fail! :bitcoin.node/reindex-source-target-alias
+               "Reindex target resolves to the live source storage."
+               {:storage (:storage-id source)}))
+      (when-not (= (:network source) (:network target))
+        (fail! :bitcoin.node/reindex-network
+               "Reindex source and target belong to different networks."
+               {:source (:network source) :target (:network target)}))
+      (case mode
+        :fully-validated-genesis-replay
+        (when-not (and (nil? (:snapshot-status target-status))
+                       (:fully-validated? target-status))
+          (fail! :bitcoin.node/reindex-genesis-target
+                 "Genesis replay target must contain only fully validated blocks."
+                 {:status target-status}))
+
+        :authenticated-assumeutxo-with-background-validation
+        (when-not (contains? #{:assumed :validated}
+                             (:snapshot-status target-status))
+          (fail! :bitcoin.node/reindex-snapshot-target
+                 "Snapshot reindex target lacks authenticated snapshot state."
+                 {:status target-status})))
+      (->ReindexSession
+       source target fork-height mode source-status (:storage-id target)
+       (atom :replaying) (atom nil)))))
+
+(defn reindex-status
+  "Return source immutability, target progress, and verification state."
+  [session]
+  (let [source-now (consensus-status (:source session))
+        target-now (consensus-status (:target session))
+        source-before (:source-status session)
+        source-unchanged?
+        (= (select-keys source-before [:height :best-block :chainwork])
+           (select-keys source-now [:height :best-block :chainwork]))]
+    {:phase @(:phase session)
+     :mode (:mode session)
+     :fork-height (:fork-height session)
+     :source-unchanged? source-unchanged?
+     :source
+     (select-keys source-now
+                  [:height :best-block :undo-pruned-through-height])
+     :target
+     (select-keys target-now
+                  [:height :best-block :fully-validated?
+                   :snapshot-status :background-height])
+     :target-storage (:target-storage session)
+     :verification @(:verification session)}))
+
+(defn accept-reindex-block!
+  "Validate and commit one rebuild block without mutating the live source."
+  [session raw-block now]
+  (locking session
+    (accept-block! (:target session) raw-block now)
+    (reset! (:verification session) nil)
+    (reset! (:phase session) :replaying)
+    (reindex-status session)))
+
+(defn accept-reindex-background-block!
+  "Advance independent snapshot background validation on the rebuild target."
+  [session raw-block now]
+  (locking session
+    (when-not (= :authenticated-assumeutxo-with-background-validation
+                 (:mode session))
+      (fail! :bitcoin.node/reindex-background-mode
+             "Genesis replay has no snapshot background chainstate."
+             {:mode (:mode session)}))
+    (accept-background-block! (:target session) raw-block now)
+    (reset! (:verification session) nil)
+    (reset! (:phase session) :replaying)
+    (reindex-status session)))
+
+(defn- active-ancestor-node
+  [node height]
+  (let [state @(:state node)]
+    (cached-ancestor-node node state (:active-tip state) height)))
+
+(defn verify-reindex!
+  "Audit a completed target and prove it is the requested better-work fork.
+
+  Verification fails if the source changed, the target is not fully validated,
+  the declared common ancestor differs, or target work does not exceed source
+  work. The source database is read-only throughout this workflow."
+  [session]
+  (locking session
+    (let [source (:source session)
+          target (:target session)]
+      (locking source
+        (locking target
+          (let [status-before (reindex-status session)
+                source-state @(:state source)
+                target-state @(:state target)
+                fork-height (:fork-height session)
+                source-fork (active-ancestor-node source fork-height)
+                target-fork (active-ancestor-node target fork-height)
+                source-child (active-ancestor-node source (inc fork-height))
+                target-child (active-ancestor-node target (inc fork-height))
+                source-work
+                (get-in source-state
+                        [:nodes (:active-tip source-state) :chainwork])
+                target-work
+                (get-in target-state
+                        [:nodes (:active-tip target-state) :chainwork])]
+            (when-not (:source-unchanged? status-before)
+              (fail! :bitcoin.node/reindex-source-changed
+                     "Live source changed during reindex; restart verification."
+                     {:status status-before}))
+            (when-not (ready? target)
+              (fail! :bitcoin.node/reindex-target-unready
+                     "Reindex target is not fully validated."
+                     {:target (:target status-before)}))
+            (when-not (and source-fork target-fork
+                           (= (:hash source-fork) (:hash target-fork)))
+              (fail!
+               :bitcoin.node/reindex-fork-mismatch
+               "Reindex target does not share the declared common ancestor."
+               {:fork-height fork-height
+                :source (:hash source-fork)
+                :target (:hash target-fork)}))
+            (when (or (nil? source-child)
+                      (nil? target-child)
+                      (= (:hash source-child) (:hash target-child)))
+              (fail!
+               :bitcoin.node/reindex-fork-not-divergent
+               "Declared fork height is not the chains' actual divergence."
+               {:fork-height fork-height
+                :source-child (:hash source-child)
+                :target-child (:hash target-child)}))
+            (when-not (header/better-chain? target-work source-work)
+              (fail! :bitcoin.node/reindex-insufficient-work
+                     "Reindex target does not exceed live source chainwork."
+                     {:source-height
+                      (get-in status-before [:source :height])
+                      :target-height
+                      (get-in status-before [:target :height])}))
+            (let [integrity (integrity-check! target)
+                  verification
+                  {:verified? true
+                   :source-tip
+                   (get-in status-before [:source :best-block])
+                   :target-tip
+                   (get-in status-before [:target :best-block])
+                   :fork-height fork-height
+                   :fork-block (:hash source-fork)
+                   :integrity integrity}]
+              (reset! (:verification session) verification)
+              (reset! (:phase session) :verified)
+              (reindex-status session))))))))
+
+(defn reindex-handoff
+  "Return a cutover descriptor only while verified source/target tips remain
+  unchanged. The caller can atomically change its own storage pointer to
+  `:target-storage`; this function never renames or deletes either database."
+  [session]
+  (locking session
+    (locking (:source session)
+      (locking (:target session)
+        (let [status (reindex-status session)
+              verification (:verification status)]
+          (when-not (and (= :verified (:phase status))
+                         (:source-unchanged? status)
+                         (:verified? verification)
+                         (= (get-in status [:source :best-block])
+                            (:source-tip verification))
+                         (= (get-in status [:target :best-block])
+                            (:target-tip verification)))
+            (fail! :bitcoin.node/reindex-not-verified
+                   "Reindex handoff requires unchanged verified source and target."
+                   {:status status}))
+          {:mode :switch-storage-pointer
+           :source-tip (:source-tip verification)
+           :target-tip (:target-tip verification)
+           :target-storage (:target-storage session)
+           :retain-source-as-rollback? true
+           :verification verification})))))
+
+(defn publish-reindex-handoff!
+  "Atomically publish a checksummed storage pointer for a verified reindex.
+
+  Database files remain untouched. A supervising process can stop the live
+  node, load this pointer, and reopen `:target-storage`; the old source remains
+  available for rollback."
+  [session pointer-path]
+  (locking session
+    (locking (:source session)
+      (locking (:target session)
+        (let [handoff (reindex-handoff session)
+              target-storage (:target-storage handoff)]
+          (when-not (string? target-storage)
+            (fail! :bitcoin.node/reindex-pointer-storage
+                   "Atomic pointer publication requires a path-backed target."
+                   {:target-storage target-storage}))
+          ;; Both recorded tips and the pointer remain one immutable handoff
+          ;; fact. Cutover or rollback reopens the selected database.
+          (seal-node! (:source session))
+          (seal-node! (:target session))
+          (let [target
+                (.normalize
+                 (.toAbsolutePath
+                  (Path/of (str pointer-path) (make-array String 0))))
+                parent (.getParent target)
+                _ (Files/createDirectories
+                   parent
+                   (make-array java.nio.file.attribute.FileAttribute 0))
+                temporary
+                (Files/createTempFile
+                 parent ".bitcoin-reindex-pointer-" ".tmp"
+                 (make-array java.nio.file.attribute.FileAttribute 0))
+                value
+                {:format reindex-pointer-format
+                 :network (:network (:source session))
+                 :target-storage target-storage
+                 :source-tip (:source-tip handoff)
+                 :target-tip (:target-tip handoff)
+                 :fork-height (:fork-height session)
+                 :published-at (quot (System/currentTimeMillis) 1000)}
+                bytes (storage/encode-value value)]
+            (try
+              (Files/write
+               temporary bytes
+               (into-array
+                OpenOption
+                [StandardOpenOption/WRITE
+                 StandardOpenOption/TRUNCATE_EXISTING]))
+              (with-open
+               [channel
+                (FileChannel/open
+                 temporary
+                 (into-array OpenOption [StandardOpenOption/WRITE]))]
+                (.force channel true))
+              (try
+                (Files/move
+                 temporary target
+                 (into-array
+                  java.nio.file.CopyOption
+                  [StandardCopyOption/ATOMIC_MOVE
+                   StandardCopyOption/REPLACE_EXISTING]))
+                (catch AtomicMoveNotSupportedException error
+                  (fail!
+                   :bitcoin.node/reindex-pointer-atomic-move
+                   "The pointer filesystem does not support atomic replacement."
+                   {:path (str target)
+                    :cause (.getMessage error)})))
+              (with-open
+               [directory
+                (FileChannel/open
+                 parent
+                 (into-array OpenOption [StandardOpenOption/READ]))]
+                (.force directory true))
+              value
+              (finally
+                (Files/deleteIfExists temporary)))))))))
+
+(defn load-reindex-pointer
+  "Load and validate a published reindex storage pointer."
+  [pointer-path expected-network]
+  (let [path (Path/of (str pointer-path) (make-array String 0))]
+    (when-not (Files/isRegularFile
+               path (make-array java.nio.file.LinkOption 0))
+      (fail! :bitcoin.node/reindex-pointer-missing
+             "Reindex storage pointer does not exist."
+             {:path (str pointer-path)}))
+    (let [value (storage/decode-value (Files/readAllBytes path))
+          target (:target-storage value)
+          target-path
+          (when (string? target)
+            (Path/of target (make-array String 0)))]
+      (when-not (and (= reindex-pointer-format (:format value))
+                     (= expected-network (:network value))
+                     (string? target)
+                     (.isAbsolute target-path)
+                     (string? (:source-tip value))
+                     (string? (:target-tip value))
+                     (nat-int? (:fork-height value))
+                     (nat-int? (:published-at value)))
+        (fail! :bitcoin.node/reindex-pointer-invalid
+               "Reindex storage pointer is malformed or network-mismatched."
+               {:path (str pointer-path)
+                :expected-network expected-network}))
+      (when-not (Files/isRegularFile
+                 target-path (make-array java.nio.file.LinkOption 0))
+        (fail! :bitcoin.node/reindex-pointer-target-missing
+               "The published reindex target database does not exist."
+               {:path (str pointer-path)
+                :target-storage target}))
+      value)))

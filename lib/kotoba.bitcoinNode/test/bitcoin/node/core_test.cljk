@@ -1,0 +1,413 @@
+(ns bitcoin.node.core-test
+  (:require [kotoba.lang.error :as kerror] [bitcoin.node.core :as core]
+            [bitcoin.node.descriptor :as descriptor]
+            [bitcoin.node.protocol :as node]
+            [chain.observer.contract :as observation]
+            [chain.observer.protocol :as chain-observer]
+            [json.data-json :as json]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]])
+  (:import [java.io File]
+           [java.nio.file Files]
+           [java.nio.file.attribute PosixFilePermissions]))
+
+(defn- transport
+  [result]
+  (fn [{:keys [request]}]
+    {:status 200
+     :body (json/write-str
+            {:jsonrpc "2.0" :id (:id request) :result result})}))
+
+(defn- routed-transport [results]
+  (fn [{:keys [request]}]
+    {:status 200
+     :content-type "application/json; charset=utf-8"
+     :body
+     (json/write-str
+      {:jsonrpc "2.0" :id (:id request)
+       :result (get results [(:method request) (:params request)]
+                    (get results (:method request)))})}))
+
+(def config
+  {:url "http://127.0.0.1:8332"
+   :username "user" :password-env "BITCOIN_NODE_TEST_PASSWORD"})
+
+(deftest endpoint-is-loopback-by-default
+  (is (= "127.0.0.1" (.getHost (core/endpoint config))))
+  (is (thrown-with-msg?
+       kerror/ExceptionInfo #"not allowed"
+       (core/endpoint (assoc config :url "http://example.com:8332"))))
+  (is (= "example.com"
+         (.getHost
+          (core/endpoint
+           (assoc config :url "https://example.com:8332"
+                  :allow-remote? true)))))
+  (is (thrown?
+       kerror/ExceptionInfo
+       (core/endpoint
+        (assoc config :url "http://user:secret@127.0.0.1:8332"))))
+  (is (= :bitcoin.node/invalid-endpoint
+         (:type
+          (ex-data
+           (try
+             (core/endpoint (assoc config :url "://bad"))
+             (catch kerror/ExceptionInfo exception
+               exception)))))))
+
+(deftest cookie-authentication-rejects-broad-posix-permissions
+  (let [cookie (File/createTempFile "bitcoin-node-cookie" ".txt")]
+    (try
+      (spit cookie "__cookie__:secret")
+      (try
+        (Files/setPosixFilePermissions
+         (.toPath cookie) (PosixFilePermissions/fromString "rw-r--r--"))
+        (is (= :bitcoin.node/insecure-cookie
+               (:type
+                (ex-data
+                 (try
+                   (core/credential {:cookie-file (.getPath cookie)})
+                   (catch kerror/ExceptionInfo exception
+                     exception))))))
+        (Files/setPosixFilePermissions
+         (.toPath cookie) (PosixFilePermissions/fromString "rw-------"))
+        (is (= :cookie
+               (:source
+                (core/credential {:cookie-file (.getPath cookie)}))))
+        (catch UnsupportedOperationException _
+          (is (= :cookie
+                 (:source
+                  (core/credential
+                   {:cookie-file (.getPath cookie)
+                    :require-secure-cookie? false}))))))
+      (finally
+        (.delete cookie)))))
+
+(deftest descriptor-policy-rejects-private-and-unsupported-input
+  (let [valid {:descriptor
+               "tr(xpub/0/*,multi_a(2,xpub-a/0/*,xpub-b/0/*))#02345678"
+               :checksum "02345678" :isrange true :issolvable true
+               :hasprivatekeys false}]
+    (is (= :taproot-multisig (:kind (descriptor/validate-info valid))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"Private"
+         (descriptor/validate-info (assoc valid :hasprivatekeys true))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"not solvable"
+         (descriptor/validate-info (assoc valid :issolvable false))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"Only Taproot"
+         (descriptor/validate-info
+          (assoc valid :descriptor "wpkh(xpub/0/*)#02345678"))))))
+
+(deftest core-backend-correlates-and-normalizes-responses
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [status-backend
+          (core/backend
+           config
+           (transport {:chain "main" :blocks 10 :headers 12
+                       :verificationprogress 0.5
+                       :initialblockdownload true :pruned true
+                       :pruneheight 0 :size_on_disk 123}))
+          status (node/node-status status-backend)]
+      (is (= :connected (:status status)))
+      (is (= "main" (:chain status)))
+      (is (true? (:initial-block-download? status)))
+      (is (false? (node/ready? status)))
+      (is (false? (node/ready?
+                   {:status :connected :initial-block-download? false}))))
+    (let [scan-backend
+          (core/backend
+           config
+           (transport {:success true :height 100 :bestblock "abc"
+                       :total_amount 0.1 :unspents [{:txid "tx"}]}))
+          scan (node/scan-descriptors scan-backend ["tr(key)#02345678"])]
+      (is (true? (:success? scan)))
+      (is (= 1 (count (:unspents scan)))))
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo #"denied"
+         (core/rpc! (core/backend config (transport {}))
+                    "sendtoaddress" [])))))
+
+(deftest backend-bounds-expensive-operations
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [backend (core/backend config (transport []))]
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"range is invalid"
+           (node/derive-addresses
+            backend "tr(xpub-placeholder)#02345678" [100 1])))
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"range is invalid"
+           (node/derive-addresses
+            backend "tr(xpub-placeholder)#02345678" [0 1000])))
+      (is (thrown-with-msg?
+           kerror/ExceptionInfo #"scan request is invalid"
+           (node/scan-descriptors backend []))))))
+
+(deftest rpc-rejects-uncorrelated-and-invalid-responses
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [wrong-id
+          (core/backend
+           config
+           (fn [_]
+             {:status 200
+              :body (json/write-str
+                     {:jsonrpc "2.0" :id "wrong" :result {}})}))
+          invalid-json
+          (core/backend config (fn [_] {:status 200 :body "not-json"}))]
+      (is (= :bitcoin.node/rpc-failed
+             (:type (ex-data
+                     (try
+                       (core/rpc! wrong-id "getblockchaininfo" [])
+                       (catch kerror/ExceptionInfo exception
+                         exception))))))
+      (is (= :bitcoin.node/invalid-response
+             (:type (ex-data
+                     (try
+                       (core/rpc! invalid-json "getblockchaininfo" [])
+                       (catch kerror/ExceptionInfo exception
+                         exception)))))))))
+
+(deftest identity-is-bound-to-chain-and-genesis
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [genesis "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+          results {"getblockchaininfo" {:chain "main"}
+                   ["getblockhash" [0]] genesis
+                   "getnetworkinfo" {:version 310100
+                                     :subversion "/Satoshi:31.1.0/"
+                                     :protocolversion 70016}}
+          backend
+          (core/backend
+           (assoc config :expected-chain :main
+                  :expected-genesis-hash genesis)
+           (routed-transport results))]
+      (is (= {:backend :bitcoin-core :chain "main"
+              :genesis-hash genesis :core-version 310100
+              :subversion "/Satoshi:31.1.0/"
+              :protocol-version 70016}
+             (node/node-identity backend)))
+      (is (= :bitcoin.node/network-mismatch
+             (:type
+              (ex-data
+               (try
+                 (node/node-identity
+                  (core/backend
+                   (assoc config :expected-chain :regtest)
+                   (routed-transport results)))
+                 (catch kerror/ExceptionInfo exception
+                   exception))))))
+      (is (= :bitcoin.node/genesis-mismatch
+             (:type
+              (ex-data
+               (try
+                 (node/node-identity
+                  (core/backend
+                   (assoc config :expected-chain :main
+                          :expected-genesis-hash (apply str (repeat 64 "0")))
+                   (routed-transport results)))
+                 (catch kerror/ExceptionInfo exception
+                   exception)))))))))
+
+(deftest capabilities-are-discovered-not-assumed
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [network {:networkactive true :connections 8 :warnings []}
+          without-index
+          (node/capabilities
+           (core/backend
+            config
+            (routed-transport
+             {"getnetworkinfo" network "getindexinfo" {}})))
+          with-index
+          (node/capabilities
+           (core/backend
+            config
+            (routed-transport
+             {"getnetworkinfo" network
+              "getindexinfo"
+              {(keyword "basic block filter index")
+               {:synced true :best_block_height 100}}})))]
+      (is (false? (:history-scan? without-index)))
+      (is (true? (:history-scan? with-index)))
+      (is (true? (get-in with-index [:block-filter-index :synced?])))
+      (is (false? (:signing? with-index)))
+      (is (false? (:broadcast? with-index))))))
+
+(deftest core-backend-implements-the-common-chain-observer
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [genesis
+          "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+          backend
+          (core/backend
+           (assoc config :expected-chain :main
+                  :expected-genesis-hash genesis)
+           (routed-transport
+            {"getblockchaininfo"
+             {:chain "main" :blocks 900000 :headers 900000
+              :bestblockhash "best" :chainwork "work"
+              :verificationprogress 1.0 :initialblockdownload false
+              :pruned false :size_on_disk 1}
+             ["getblockhash" [0]] genesis
+             "getnetworkinfo"
+             {:version 310100 :subversion "/Satoshi:31.1.0/"
+              :protocolversion 70016 :networkactive true
+              :connections 8 :warnings []}
+             "getindexinfo"
+             {(keyword "basic block filter index")
+              {:synced true :best_block_height 900000}}}))
+          snapshot (chain-observer/snapshot backend)]
+      (is (= observation/schema (:schema snapshot)))
+      (is (= :bitcoin (:family snapshot)))
+      (is (= "bip122:000000000019d6689c085ae165831e93"
+             (:chain-id snapshot)))
+      (is (= :best (get-in snapshot [:tip :finality])))
+      (is (= :fully-validated (get-in snapshot [:trust :level])))
+      (is (contains? (:capabilities snapshot) :history/read))
+      (is (observation/ready? snapshot)))))
+
+(deftest descriptor-scans-are-locally-serialized
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [entered (promise)
+          release (promise)
+          backend
+          (core/backend
+           config
+           (fn [{:keys [request]}]
+             (when (= ["start"] (take 1 (:params request)))
+               (deliver entered true)
+               @release)
+             {:status 200
+              :body
+              (json/write-str
+               {:jsonrpc "2.0" :id (:id request)
+                :result {:success true :height 100 :bestblock "abc"
+                         :txouts 1 :total_amount 0
+                         :unspents []}})}))
+          first-scan
+          (future
+            (node/scan-descriptors
+             backend ["tr(xpub-placeholder)#02345678"]))]
+      @entered
+      (is (= :bitcoin.node/scan-busy
+             (:type
+              (ex-data
+               (try
+                 (node/scan-descriptors
+                  backend ["tr(xpub-placeholder)#02345678"])
+                 (catch kerror/ExceptionInfo exception
+                   exception))))))
+      (deliver release true)
+      (is (true? (:success? @first-scan)))
+      (is (= :completed (:status @(:scan-state backend)))))))
+
+(deftest history-scan-fails-closed-without-a-synced-index
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [backend
+          (core/backend
+           config
+           (routed-transport
+            {"getnetworkinfo" {:networkactive true :connections 1}
+             "getindexinfo" {}}))]
+      (is (= :bitcoin.node/capability-unavailable
+             (:type
+              (ex-data
+               (try
+                 (core/scan-blocks
+                  backend ["tr(xpub-placeholder)#02345678"]
+                  {:start-height 0})
+                 (catch kerror/ExceptionInfo exception
+                   exception)))))))))
+
+(deftest history-scan-runs-only-with-a-synced-index
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [calls (atom [])
+          backend
+          (core/backend
+           config
+           (fn [{:keys [request]}]
+             (swap! calls conj [(:method request) (:params request)])
+             {:status 200
+              :body
+              (json/write-str
+               {:jsonrpc "2.0" :id (:id request)
+                :result
+                (case (:method request)
+                  "getnetworkinfo"
+                  {:networkactive true :connections 1}
+                  "getindexinfo"
+                  {(keyword "basic block filter index")
+                   {:synced true :best_block_height 200}}
+                  "scanblocks"
+                  {:from_height 10 :to_height 20
+                   :relevant_blocks ["abc"] :completed true})})}))
+          result
+          (core/scan-blocks
+           backend ["tr(xpub-placeholder)#02345678"]
+           {:start-height 10 :stop-height 20})]
+      (is (= {:completed? true :from-height 10 :to-height 20
+              :relevant-blocks ["abc"]}
+             result))
+      (is (some #(= ["scanblocks"
+                     ["start" ["tr(xpub-placeholder)#02345678"] 10 20]]
+                    %)
+                @calls)))))
+
+(deftest observations-detect-tip-changes
+  (is (node/same-observation?
+       {:height 100 :best-block "abc"}
+       {:blocks 100 :best-block "abc"}))
+  (is (false?
+       (node/same-observation?
+        {:height 100 :best-block "abc"}
+        {:blocks 100 :best-block "def"}))))
+
+(deftest rpc-rejects-non-json-content-type
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [backend
+          (core/backend
+           config
+           (fn [_]
+             {:status 200 :content-type "text/html"
+              :body "<html>proxy error</html>"}))]
+      (is (= :bitcoin.node/invalid-response
+             (:type
+              (ex-data
+               (try
+                 (core/rpc! backend "getblockchaininfo" [])
+                 (catch kerror/ExceptionInfo exception
+                   exception)))))))))
+
+(deftest rpc-wraps-transport-failures-without-secret-data
+  (with-redefs [core/credential
+                (fn [_] {:username "user" :password "secret"
+                         :source :test})]
+    (let [backend
+          (core/backend
+           config
+           (fn [_] (throw (java.net.http.HttpTimeoutException. "timeout"))))
+          exception
+          (try
+            (core/rpc! backend "getblockchaininfo" [])
+            (catch kerror/ExceptionInfo caught
+              caught))]
+      (is (= :bitcoin.node/transport-failed
+             (:type (ex-data exception))))
+      (is (not (str/includes? (pr-str (ex-data exception)) "secret"))))))

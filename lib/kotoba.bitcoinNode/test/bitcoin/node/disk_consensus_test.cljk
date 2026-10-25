@@ -1,0 +1,1209 @@
+(ns bitcoin.node.disk-consensus-test
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.assumeutxo :as assumeutxo]
+            [bitcoin.consensus.block :as block]
+            [bitcoin.consensus.chainstate :as chainstate]
+            [bitcoin.consensus.codec :as codec]
+            [bitcoin.consensus.sqlite-utxo :as sqlite]
+            [bitcoin.consensus.storage :as storage]
+            [bitcoin.consensus.transaction :as transaction]
+            [bitcoin.consensus.utxo :as utxo]
+            [bitcoin.node.consensus :as consensus]
+            [bitcoin.node.consensus-test :as fixture]
+            [bitcoin.node.disk-consensus :as disk]
+            [bitcoin.node.disk-utxo :as disk-utxo]
+            [bitcoin.node.lazy-header-map :as lazy-header-map]
+            [bitcoin.node.peer :as peer]
+            [bitcoin.node.peer-pool :as peer-pool]
+            [kotoba.test :refer [deftest is]]
+            [kotobase.bitcoin.protocol :as header])
+  (:import [java.nio.file Files Path]
+           [java.nio.file.attribute FileAttribute]))
+
+(defn- with-store [run!]
+  (let [directory
+        (Files/createTempDirectory
+         "bitcoin-node-consensus-" (make-array FileAttribute 0))
+        path (.resolve directory "chainstate.sqlite")]
+    (try
+      (run! path)
+      (finally
+        (doseq [target [path
+                        (Path/of (str path ".background")
+                                 (make-array String 0))
+                        (Path/of (str path ".headers")
+                                 (make-array String 0))
+                        (Path/of (str path ".reindex")
+                                 (make-array String 0))
+                        (Path/of (str path ".reindex-pointer")
+                                 (make-array String 0))]
+                suffix ["-shm" "-wal" ""]]
+          (Files/deleteIfExists
+           (Path/of (str target suffix) (make-array String 0))))
+        (Files/deleteIfExists directory)))))
+
+(defn- coinbase [height marker]
+  (transaction/parse
+   (transaction/serialize
+    {:version 1
+     :inputs [{:txid-natural (vec (repeat 32 0))
+               :vout 0xffffffff
+               :script-sig
+               (conj
+                (get-in (fixture/regtest-coinbase height)
+                        [:inputs 0 :script-sig])
+                marker)
+               :sequence 0xffffffff}]
+     :outputs [{:value (utxo/block-subsidy height 150)
+                :script-pubkey [81]}]
+     :witnesses nil :locktime 0 :segwit? false})))
+
+(defn- mine-branch-block [parent height marker]
+  ;; The standard fixture is sufficient for independent branches because its
+  ;; timestamp and parent differ once the first branch block differs.
+  (if (zero? marker)
+    (fixture/mine-regtest-block parent height)
+    (let [candidate (fixture/mine-regtest-block parent height)
+          tx (coinbase height marker)]
+      (loop [nonce 0]
+        (let [template (-> (:header candidate)
+                           (assoc :merkle-root (:txid-natural tx)
+                                  :nonce nonce))
+              bytes
+              (header/encode-block-header template)
+              decoded
+              (header/decode-block-header bytes)]
+          (if (header/hash-meets-target? (:hash decoded) (:bits decoded))
+            (block/parse (vec (concat bytes [1] (:raw tx))))
+            (recur (inc nonce))))))))
+
+(defn- mine-block-with-coinbase [parent height tx]
+  (let [candidate (fixture/mine-regtest-block parent height)]
+    (loop [nonce 0]
+      (let [template
+            (assoc (:header candidate)
+                   :merkle-root (:txid-natural tx)
+                   :nonce nonce)
+            bytes (header/encode-block-header template)
+            decoded (header/decode-block-header bytes)]
+        (if (header/hash-meets-target? (:hash decoded) (:bits decoded))
+          (block/parse (vec (concat bytes [1] (:raw tx))))
+          (recur (inc nonce)))))))
+
+(defn- mine-raw-block [parent transactions]
+  (let [merkle-root
+        (:root (block/merkle-root (mapv :txid-natural transactions)))
+        template
+        {:version 4
+         :prev-block (get-in parent [:header :hash])
+         :merkle-root merkle-root
+         :timestamp (inc (get-in parent [:header :timestamp]))
+         :bits 0x207fffff}
+        body
+        (vec (concat (codec/compact-size (count transactions))
+                     (mapcat transaction/serialize transactions)))]
+    (loop [nonce 0]
+      (let [header-bytes
+            (header/encode-block-header (assoc template :nonce nonce))
+            decoded (header/decode-block-header header-bytes)]
+        (if (header/hash-meets-target? (:hash decoded) (:bits decoded))
+          {:header decoded :raw (vec (concat header-bytes body))}
+          (recur (inc nonce)))))))
+
+(deftest disk-consensus-persists-headers-blocks-and-restarts
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            block-2 (fixture/mine-regtest-block block-1 2)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})]
+        (is (disk/ready? node))
+        (is (= 2
+               (:best-header-height
+                (disk/accept-headers!
+                 node [(get-in block-1 [:header :bytes])
+                       (get-in block-2 [:header :bytes])]
+                 2000000000))))
+        (let [queries (atom 0)
+              resolver sqlite/header-ancestor-nodes-between]
+          (with-redefs
+           [sqlite/header-ancestor-nodes-between
+            (fn [& arguments]
+              (swap! queries inc)
+              (apply resolver arguments))]
+           (is (= 1
+                  (:height
+                   (disk/accept-block!
+                    node (block/serialize block-1) 2000000000))))
+           (is (= 2
+                  (:height
+                   (disk/accept-block!
+                    node (block/serialize block-2) 2000000000)))))
+          (is (= 1 @queries)
+              "the second sequential block reuses the ancestry window"))
+        (is (= :ok (:integrity (disk/integrity-check! node))))
+        (is (nil? (get-in @(:state node)
+                          [:nodes (:best-block
+                                   (disk/consensus-status node)) :block])))
+        (with-redefs
+         [sqlite/header-nodes
+          (fn [_]
+            (throw
+             (AssertionError.
+              "Normal restart must not materialize every header.")))]
+         (let [reopened (disk/open {:path path :network :regtest})]
+           (is (lazy-header-map/lazy-header-map?
+                (:nodes @(:state reopened))))
+           (is (= (disk/consensus-status node)
+                  (disk/consensus-status reopened)))
+           (is (disk/ready? reopened))))))))
+
+(deftest normalized-header-storage-keeps-host-state-compact-and-migrates
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            blocks (rest (reductions fixture/mine-regtest-block
+                                     genesis (range 1 26)))
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            _ (disk/accept-headers!
+               node (mapv #(get-in % [:header :bytes]) blocks)
+               2000000000)
+            backend (:backend node)
+            compact-bytes (sqlite/host-state backend)
+            compact (storage/decode-value compact-bytes)]
+        (is (= "bitcoin.node.disk-consensus.normalized.v3"
+               (:format compact)))
+        (is (nil? (get-in compact [:state :nodes])))
+        (is (= 26 (count (sqlite/header-nodes backend))))
+        (is (< (alength compact-bytes) 10000))
+        ;; Normalized v2 discovers exact leaves once without materializing the
+        ;; complete header graph, then persists the new quarantine fields.
+        (let [durable (sqlite/status backend)
+              v2
+              (-> compact
+                  (assoc :format
+                         "bitcoin.node.disk-consensus.normalized.v2")
+                  (update :state dissoc :header-tips :invalid-blocks))]
+          (sqlite/save-host-state!
+           backend (:tip durable) (:height durable)
+           (storage/encode-value v2))
+          (let [reopened (disk/open {:path path :network :regtest})
+                migrated
+                (storage/decode-value
+                 (sqlite/host-state (:backend reopened)))]
+            (is (= "bitcoin.node.disk-consensus.normalized.v3"
+                   (:format migrated)))
+            (is (= 1 (count (get-in migrated [:state :header-tips]))))
+            (is (= {} (get-in migrated [:state :invalid-blocks])))))
+        ;; The first lazy-index release upgrades normalized v1 metadata once.
+        (let [durable (sqlite/status backend)
+              v1
+              (-> compact
+                  (assoc :format
+                         "bitcoin.node.disk-consensus.normalized.v1")
+                  (update :state dissoc
+                          :bitcoin.node.disk-consensus/block-locator))]
+          (sqlite/save-host-state!
+           backend (:tip durable) (:height durable)
+           (storage/encode-value v1))
+          (let [reopened (disk/open {:path path :network :regtest})]
+            (is (= "bitcoin.node.disk-consensus.normalized.v3"
+                   (:format
+                    (storage/decode-value
+                     (sqlite/host-state (:backend reopened))))))))
+        ;; A v0.12-era database is upgraded transactionally on next open.
+        (let [state @(:state node)
+              durable (sqlite/status backend)]
+          (sqlite/save-host-state!
+           backend (:tip durable) (:height durable) (storage/encode state))
+          (let [reopened (disk/open {:path path :network :regtest})
+                migrated
+                (storage/decode-value
+                 (sqlite/host-state (:backend reopened)))]
+            (is (= (disk/consensus-status node)
+                   (disk/consensus-status reopened)))
+            (is (= "bitcoin.node.disk-consensus.normalized.v3"
+                   (:format migrated)))
+            (is (= 26
+                   (count (sqlite/header-nodes (:backend reopened)))))))))))
+
+(deftest node-retains-a-core-sized-reorg-window-and-plans-deep-recovery
+  (with-store
+    (fn [path]
+      (is (= :bitcoin.node/undo-retention-configuration
+             (:type
+              (ex-data
+               (try
+                 (disk/open
+                  {:path path :network :regtest
+                   :genesis-bytes
+                   (fixture/hex->bytes fixture/regtest-genesis)
+                   :undo-retention-blocks 287})
+                 (catch kerror/ExceptionInfo error error))))))
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})]
+        (loop [parent genesis height 1]
+          (when (<= height 290)
+            (let [next (fixture/mine-regtest-block parent height)]
+              (disk/accept-block!
+               node (block/serialize next) 2000000000)
+              (recur next (inc height)))))
+        (let [status (disk/consensus-status node)]
+          (is (= 290 (:height status)))
+          (is (= 288 (:undo-retention-blocks status)))
+          (is (= 288 (:retained-undo-blocks status)))
+          (is (= 2 (:undo-pruned-through-height status)))
+          (is (= 288 (:available-reorg-depth status))))
+        (is (= {:required? false
+                :mode :in-place-reorganization
+                :fork-height 2
+                :current-height 290
+                :detach-blocks 288
+                :available-reorg-depth 288
+                :undo-pruned-through-height 2}
+               (disk/recovery-plan node 2)))
+        (is (= {:required? true
+                :mode :reindex-required
+                :recovery :reindex-from-authenticated-history
+                :fork-height 1
+                :current-height 290
+                :missing-undo-through-height 2
+                :preserve-normalized-headers? true
+                :acceptable-sources
+                [:fully-validated-genesis-replay
+                 :authenticated-assumeutxo-with-background-validation]}
+               (disk/recovery-plan node 1)))
+        (is (= :bitcoin.node/recovery-height
+               (:type
+                (ex-data
+                 (try
+                   (disk/recovery-plan node -1)
+                   (catch kerror/ExceptionInfo error error))))))
+        (is (= 0 (:deleted-undo-blocks (disk/prune-undo! node))))
+        (is (= :ok (:undo-integrity (disk/integrity-check! node))))
+        (is (= :bitcoin.node/reindex-source-target-alias
+               (:type
+                (ex-data
+                 (try
+                   (disk/begin-reindex!
+                    node 1
+                    {:mode :fully-validated-genesis-replay
+                     :target-options {:path path :network :regtest}})
+                   (catch kerror/ExceptionInfo error error))))))
+        (let [target-path
+              (Path/of (str path ".reindex") (make-array String 0))
+              pointer-path
+              (Path/of (str path ".reindex-pointer")
+                       (make-array String 0))
+              session
+              (disk/begin-reindex!
+               node 1
+               {:mode :fully-validated-genesis-replay
+                :target-options
+                {:path target-path :network :regtest
+                 :genesis-bytes
+                 (fixture/hex->bytes fixture/regtest-genesis)}})
+              common (fixture/mine-regtest-block genesis 1)]
+          (is (= :bitcoin.node/reindex-background-mode
+                 (:type
+                  (ex-data
+                   (try
+                     (disk/accept-reindex-background-block!
+                      session (block/serialize common) 2000000000)
+                     (catch kerror/ExceptionInfo error error))))))
+          (disk/accept-reindex-block!
+           session (block/serialize common) 2000000000)
+          (is (= :bitcoin.node/reindex-fork-not-divergent
+                 (:type
+                  (ex-data
+                   (try
+                     (disk/verify-reindex! session)
+                     (catch kerror/ExceptionInfo error error))))))
+          (let [fork-2 (mine-branch-block common 2 1)]
+            (disk/accept-reindex-block!
+             session (block/serialize fork-2) 2000000000)
+            (is (= :bitcoin.node/reindex-insufficient-work
+                   (:type
+                    (ex-data
+                     (try
+                       (disk/verify-reindex! session)
+                       (catch kerror/ExceptionInfo error error))))))
+            (loop [parent fork-2 height 3]
+              (when (<= height 291)
+                (let [next (mine-branch-block parent height 1)]
+                  (disk/accept-reindex-block!
+                   session (block/serialize next) 2000000000)
+                  (recur next (inc height))))))
+          (let [before-verification (disk/reindex-status session)]
+            (is (= :replaying (:phase before-verification)))
+            (is (:source-unchanged? before-verification))
+            (is (= 290 (get-in before-verification [:source :height])))
+            (is (= 291 (get-in before-verification [:target :height]))))
+          (let [verified (disk/verify-reindex! session)
+                handoff (disk/reindex-handoff session)
+                published
+                (disk/publish-reindex-handoff!
+                 session pointer-path)
+                loaded
+                (disk/load-reindex-pointer pointer-path :regtest)]
+            (is (= :verified (:phase verified)))
+            (is (true? (get-in verified
+                               [:verification :verified?])))
+            (is (= :ok (get-in verified
+                               [:verification :integrity :integrity])))
+            (is (= :switch-storage-pointer (:mode handoff)))
+            (is (= (str (.toRealPath
+                         target-path
+                         (make-array java.nio.file.LinkOption 0)))
+                   (:target-storage handoff)))
+            (is (:retain-source-as-rollback? handoff))
+            (is (= (:target-storage handoff)
+                   (:target-storage published)
+                   (:target-storage loaded)))
+            (is (= (:target-tip handoff)
+                   (:target-tip loaded)))
+            (is (true?
+                 (:sealed-for-reindex?
+                  (disk/consensus-status node))))
+            (is (true?
+                 (:sealed-for-reindex?
+                  (disk/consensus-status (:target session)))))
+            (is (= :bitcoin.node/reindex-storage-sealed
+                   (:type
+                    (ex-data
+                     (try
+                       (disk/prune-undo! node)
+                       (catch kerror/ExceptionInfo error error))))))
+            (is (= :bitcoin.node/reindex-storage-sealed
+                   (:type
+                    (ex-data
+                     (try
+                       (disk/prune-undo! (:target session))
+                       (catch kerror/ExceptionInfo error error))))))
+            (is (= :bitcoin.node/reindex-storage-sealed
+                   (:type
+                    (ex-data
+                     (try
+                       (disk/accept-reindex-block!
+                        session [] 2000000000)
+                       (catch kerror/ExceptionInfo error error))))))
+            (is (= :verified (:phase (disk/reindex-status session))))
+            (Files/write
+             pointer-path
+             (storage/encode-value
+              (assoc published
+                     :target-storage
+                     (str target-path ".missing")))
+             (make-array java.nio.file.OpenOption 0))
+            (is (= :bitcoin.node/reindex-pointer-target-missing
+                   (:type
+                    (ex-data
+                     (try
+                       (disk/load-reindex-pointer
+                        pointer-path :regtest)
+                       (catch kerror/ExceptionInfo error error))))))
+            (let [damaged (Files/readAllBytes pointer-path)
+                  last-index (dec (alength damaged))]
+              (aset-byte
+               damaged last-index
+               (unchecked-byte
+                (bit-xor 1 (bit-and 0xff
+                                    (aget damaged last-index)))))
+              (Files/write
+               pointer-path damaged
+               (make-array java.nio.file.OpenOption 0))
+              (is (= :bitcoin.consensus/chainstate-checksum-mismatch
+                     (:type
+                      (ex-data
+                       (try
+                         (disk/load-reindex-pointer
+                          pointer-path :regtest)
+                         (catch kerror/ExceptionInfo error error)))))))
+            (is (= 290 (:height (disk/consensus-status node))))))
+        (let [reopened (disk/open {:path path :network :regtest})]
+          (is (false?
+               (:sealed-for-reindex?
+                (disk/consensus-status reopened))))
+          (is (=
+               (dissoc (disk/consensus-status node)
+                       :sealed-for-reindex?)
+               (dissoc (disk/consensus-status reopened)
+                       :sealed-for-reindex?))))))))
+
+(deftest durable-locator-stays-bounded-across-many-small-batches
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            blocks
+            (vec
+             (rest
+              (reductions fixture/mine-regtest-block
+                          genesis (range 1 81))))
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})]
+        (doseq [value blocks]
+          (disk/accept-header!
+           node (get-in value [:header :bytes]) 2000000000))
+        (let [locator (disk/block-locator @(:state node))
+              reopened (disk/open {:path path :network :regtest})]
+          (is (<= 1 (count locator) 64))
+          (is (= (get-in (peek blocks) [:header :hash])
+                 (first locator)))
+          (is (= (get-in genesis [:header :hash]) (peek locator)))
+          (is (= locator
+                 (disk/block-locator @(:state reopened)))))))))
+
+(deftest block-locator-is-dense-then-exponentially-backtracks-to-genesis
+  (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+        blocks (rest (reductions fixture/mine-regtest-block genesis
+                                 (range 1 26)))
+        state
+        (reduce
+         #(chainstate/accept-header %1 (:header %2) 2000000000)
+         (chainstate/initialize :regtest genesis)
+         blocks)
+        locator (disk/block-locator state)
+        heights
+        (mapv #(get-in state [:nodes (header/natural-hash->hex %) :height])
+              locator)]
+    (is (= [25 24 23 22 21 20 19 18 17 16 14 10 2 0] heights))
+    (is (= (get-in genesis [:header :hash]) (last locator)))))
+
+(deftest peer-header-sync-validates-persists-and-resumes-from-durable-tip
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            block-2 (fixture/mine-regtest-block block-1 2)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            result
+            (with-redefs
+             [peer/sync-headers!
+              (fn [_ locator accept-batch! options]
+                (is (= [(get-in genesis [:header :hash])] locator))
+                (is (= 3 (:max-batches options)))
+                (is (= :regtest (get-in options [:presync :network])))
+                (is (= 0 (get-in options [:presync :anchor-height])))
+                (is (= [(get-in genesis [:header :hash-hex])]
+                       (mapv :hash-hex
+                             (get-in options [:presync :context]))))
+                (accept-batch! [(:header block-1) (:header block-2)])
+                {:status :synced :batches 1 :accepted 2})]
+              (disk/sync-headers!
+               node ::connection 2000000000 {:max-batches 3}))]
+        (is (= {:status :synced :batches 1 :accepted 2} result))
+        (let [reopened (disk/open {:path path :network :regtest})
+              status (disk/consensus-status reopened)]
+          (is (= 2 (:best-header-height status)))
+          (is (= (get-in block-2 [:header :hash-hex])
+                 (:best-header status)))
+          (is (= [(get-in block-2 [:header :hash])
+                  (get-in block-1 [:header :hash])
+                  (get-in genesis [:header :hash])]
+                 (disk/block-locator @(:state reopened)))))))))
+
+(deftest disk-header-sync-keeps-presync-headers-out-of-sqlite
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            block-2 (fixture/mine-regtest-block block-1 2)
+            block-3 (fixture/mine-regtest-block block-2 3)
+            headers (mapv :header [block-1 block-2 block-3])
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            anchor-work
+            (get-in @(:state node)
+                    [:nodes (:best-header @(:state node)) :chainwork])
+            minimum-work
+            (reduce
+             (fn [work value]
+               (header/add-chainwork
+                work (header/header-work (:bits value))))
+             anchor-work headers)
+            calls (atom 0)]
+        ;; Regtest normally has no minimum-chainwork. Raise it only for this
+        ;; integration fixture so the production disk boundary exercises both
+        ;; phases without requiring a historical public-chain corpus.
+        (swap! (:state node) assoc-in
+               [:consensus :minimum-chainwork] minimum-work)
+        (is (true? (:headers-presync-required?
+                    (disk/consensus-status node))))
+        (with-redefs
+         [peer/get-headers!
+          (fn [_ _]
+            (let [call (swap! calls inc)]
+              (case call
+                1 headers
+                2 (do
+                    (is (= 0 (:best-header-height
+                              (disk/consensus-status node)))
+                        "first-download headers must not be in SQLite")
+                    headers)
+                [])))]
+         (let [result
+               (disk/sync-headers! node ::connection 2000000000
+                                   {:max-batches 4})]
+           (is (= :synced (:status result)))
+           (is (= 3 (:accepted result)))
+           (is (= 3 (get-in result [:headers-presync :presynced])))
+           (is (= 3 (:best-header-height
+                     (disk/consensus-status node))))
+           (is (false? (:headers-presync-required?
+                        (disk/consensus-status node))))))))))
+
+(deftest multi-peer-disagreement-is-validated-and-resolved-by-local-work
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            main-1 (mine-branch-block genesis 1 0)
+            main-2 (mine-branch-block main-1 2 0)
+            side-1 (mine-branch-block genesis 1 1)
+            side-2 (mine-branch-block side-1 2 2)
+            side-3 (mine-branch-block side-2 3 3)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            locators (atom [])]
+        (with-redefs
+         [peer/connect!
+          (fn [{:keys [host]}]
+            {:id host :peer-version {:start-height 3}})
+          peer/close! (constantly nil)
+          peer/sync-headers!
+          (fn [connection locator accept-batch! _]
+            (swap! locators conj locator)
+            (let [headers
+                  (if (= "main" (:id connection))
+                    [(:header main-1) (:header main-2)]
+                    [(:header side-1) (:header side-2) (:header side-3)])]
+              (accept-batch! headers)
+              {:status :synced :batches 1 :accepted (count headers)
+               :locator (get-in (last headers) [:hash])}))]
+         (let [result
+               (disk/sync-headers-from-peers!
+                node [{:host "main"} {:host "side"}] 2000000000
+                {:required-successes 2})]
+           (is (true? (:disagreement? result)))
+           (is (= 2 (:successful-peers result)))
+           (is (= (get-in side-3 [:header :hash-hex])
+                  (:best-header (disk/consensus-status node))))
+           (is (= 3 (:best-header-height
+                     (disk/consensus-status node))))
+           (is (= (get-in genesis [:header :hash])
+                  (first (first @locators))))
+           (is (= (get-in main-2 [:header :hash])
+                  (first (second @locators))))))))))
+
+(deftest peer-block-sync-is-bounded-fully-validating-and-resumable
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            block-2 (fixture/mine-regtest-block block-1 2)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            _ (disk/accept-headers!
+               node [(get-in block-1 [:header :bytes])
+                     (get-in block-2 [:header :bytes])]
+               2000000000)
+            blocks-by-hash
+            {(get-in block-1 [:header :hash]) (block/serialize block-1)
+             (get-in block-2 [:header :hash]) (block/serialize block-2)}
+            requested (atom [])]
+        (with-redefs
+         [peer/get-block!
+          (fn [_ hash]
+            (swap! requested conj hash)
+            (get blocks-by-hash hash))]
+          (let [first-batch
+                (disk/sync-blocks!
+                 node ::connection 2000000000 {:max-blocks 1})]
+            (is (= :batch-limit (:status first-batch)))
+            (is (= 1 (:downloaded first-batch)))
+            (is (true? (:more? first-batch)))))
+        (let [reopened (disk/open {:path path :network :regtest})]
+          (with-redefs [peer/get-block! (fn [_ hash]
+                                          (swap! requested conj hash)
+                                          (get blocks-by-hash hash))]
+            (let [completed
+                  (disk/sync-blocks!
+                   reopened ::connection 2000000000 {:max-blocks 2})]
+              (is (= :synced (:status completed)))
+              (is (= 1 (:downloaded completed)))
+              (is (false? (:more? completed)))
+              (is (= 2 (get-in completed [:consensus :height])))
+              (is (disk/ready? reopened)))))
+        (is (= [(get-in block-1 [:header :hash])
+                (get-in block-2 [:header :hash])]
+               @requested))))))
+
+(deftest managed-block-sync-downloads-in-parallel-but-commits-chronologically
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            blocks
+            (vec
+             (rest
+              (reductions fixture/mine-regtest-block genesis (range 1 4))))
+            hashes (mapv #(get-in % [:header :hash]) blocks)
+            raws (mapv block/serialize blocks)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            pool-atom (atom ::pool)]
+        (disk/accept-headers!
+         node (mapv #(get-in % [:header :bytes]) blocks) 2000000000)
+        (with-redefs
+         [peer-pool/download-blocks!
+          (fn [actual-pool requested options]
+            (is (= pool-atom actual-pool))
+            (is (= hashes requested))
+            (is (= {:maximum-peers 3 :parallel-peers 3} options))
+            {:status :downloaded
+             :downloaded 3
+             :blocks raws
+             :observations [{:peer {:host "a"} :downloaded 2}
+                            {:peer {:host "b"} :downloaded 1}]
+             :failures [{:peer {:host "stalled"}
+                         :type :bitcoin.node/peer-timeout}]
+             :pool {:successful 2}})]
+          (let [result
+                (disk/sync-blocks-managed!
+                 node pool-atom 2000000000
+                 {:max-blocks 3
+                  :maximum-peers 3
+                  :parallel-peers 3})]
+            (is (= :synced (:status result)))
+            (is (= 3 (:downloaded result)))
+            (is (= 1 (:windows result)))
+            (is (false? (:more? result)))
+            (is (= 3 (get-in result [:consensus :height])))
+            (is (= 2 (count (:observations result))))
+            (is (= 1 (count (:failures result))))
+            (is (disk/ready? node))))))))
+
+(deftest managed-sync-retries-a-merkle-mutated-copy-without-poisoning-header
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            value (fixture/mine-regtest-block genesis 1)
+            raw (block/serialize value)
+            bad-body (update raw (dec (count raw)) bit-xor 1)
+            source {:host "malleated-body" :network :regtest}
+            honest {:host "honest-body" :network :regtest}
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            feedback (atom nil)
+            attempts (atom 0)]
+        (disk/accept-headers!
+         node [(get-in value [:header :bytes])] 2000000000)
+        (with-redefs
+         [peer-pool/download-blocks!
+          (fn [& _]
+            (if (= 1 (swap! attempts inc))
+              {:blocks [bad-body] :block-sources [source]
+               :observations [] :failures [] :pool {}}
+              {:blocks [raw] :block-sources [honest]
+               :observations [] :failures [] :pool {}}))
+          peer-pool/report-block-validation-failure!
+          (fn [_ peer _ error-type _]
+            (reset! feedback [peer error-type]))]
+          (let [result
+                (disk/sync-blocks-managed!
+                 node (atom ::pool) 2000000000 {:max-blocks 1})
+                status (disk/consensus-status node)]
+            (is (= [source :bitcoin.node/peer-mutated-block] @feedback))
+            (is (= 2 @attempts))
+            (is (= :synced (:status result)))
+            (is (= 1 (:downloaded result)))
+            (is (= 2 (:windows result)))
+            (is (= :bitcoin.consensus/bad-merkle-root
+                   (get-in result
+                           [:validation-failures 0 :validation-type])))
+            (is (= :mutated
+                   (get-in result
+                           [:validation-failures 0
+                            :block-validation-result])))
+            (is (= 1 (:height status)))
+            (is (= 1 (:best-header-height status)))
+            (is (zero? (:invalid-blocks status)))))))))
+
+(deftest managed-sync-does-not-blame-or-retry-a-local-validation-failure
+  (doseq [failure-type
+          [:bitcoin.consensus/missing-script-verifier
+           :bitcoin.consensus/undo-pruned
+           :bitcoin.consensus/missing-block-data
+           :bitcoin.consensus/sqlite-header-ancestry
+           :bitcoin.consensus/pending-block-limit]]
+    (with-store
+      (fn [path]
+        (let [genesis
+              (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+              value (fixture/mine-regtest-block genesis 1)
+              node
+              (disk/open {:path path :network :regtest
+                          :genesis-bytes
+                          (fixture/hex->bytes fixture/regtest-genesis)})
+              attempts (atom 0)
+              feedback (atom false)]
+          (disk/accept-headers!
+           node [(get-in value [:header :bytes])] 2000000000)
+          (with-redefs
+           [peer-pool/download-blocks!
+            (fn [& _]
+              (swap! attempts inc)
+              {:blocks [(block/serialize value)]
+               :block-sources [{:host "innocent" :network :regtest}]
+               :observations [] :failures []})
+            disk/accept-block!
+            (fn [& _]
+              (throw
+               (ex-info "local consensus host failure"
+                        {:type failure-type})))
+            peer-pool/report-block-validation-failure!
+            (fn [& _] (reset! feedback true))]
+            (let [error
+                  (try
+                    (disk/sync-blocks-managed!
+                     node (atom ::pool) 2000000000 {:max-blocks 1})
+                    (catch kerror/ExceptionInfo value value))]
+              (is (= failure-type (:type (ex-data error))))
+              (is (= :local
+                     (chainstate/block-validation-result error)))
+              (is (nil? (:peer-feedback (ex-data error))))
+              (is (= 1 @attempts))
+              (is (false? @feedback)))))))))
+
+(deftest active-chain-height-lookup-binds-local-evidence-to-ancestry
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            block-2 (fixture/mine-regtest-block block-1 2)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})]
+        (disk/accept-block! node (block/serialize block-1) 2000000000)
+        (disk/accept-block! node (block/serialize block-2) 2000000000)
+        (is (= (get-in genesis [:header :hash-hex])
+               (disk/active-block-hash-at-height node 0)))
+        (is (= (get-in block-1 [:header :hash-hex])
+               (disk/active-block-hash-at-height node 1)))
+        (is (= (get-in block-2 [:header :hash-hex])
+               (disk/active-block-hash-at-height node 2)))
+        (doseq [height [-1 3 nil]]
+          (is (= :bitcoin.node/active-chain-height
+                 (:type
+                  (ex-data
+                   (try
+                     (disk/active-block-hash-at-height node height)
+                     (catch kerror/ExceptionInfo error error)))))))))))
+
+(deftest managed-sync-bounds-repeated-validation-rejections
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            value (fixture/mine-regtest-block genesis 1)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            attempts (atom 0)]
+        (disk/accept-headers!
+         node [(get-in value [:header :bytes])] 2000000000)
+        (with-redefs
+         [peer-pool/download-blocks!
+          (fn [& _]
+            (swap! attempts inc)
+            {:blocks [(block/serialize value)]
+             :block-sources [{:host "repeat-mutator" :network :regtest}]
+             :observations [] :failures []})
+          disk/accept-block!
+          (fn [& _]
+            (throw
+             (ex-info "mutated body"
+                      {:type :bitcoin.consensus/bad-merkle-root
+                       :block-hash "block"
+                       :block-validation-result :mutated
+                       :retryable? true})))
+          peer-pool/report-block-validation-failure! (fn [& _] nil)]
+          (let [error
+                (try
+                  (disk/sync-blocks-managed!
+                   node (atom ::pool) 2000000000
+                   {:max-blocks 1 :max-validation-retries 1})
+                  (catch kerror/ExceptionInfo value value))]
+            (is (= :bitcoin.node/block-validation-retry-limit
+                   (:type (ex-data error))))
+            (is (= 2 @attempts))
+            (is (= 2 (count (:validation-failures (ex-data error)))))))))))
+
+(deftest context-free-invalid-body-quarantines-its-indexed-header
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            invalid
+            (mine-raw-block genesis [(coinbase 1 1) (coinbase 1 2)])
+            source {:host "invalid-body" :network :regtest}
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})
+            feedback (atom nil)]
+        (is (= :bitcoin.consensus/multiple-coinbase
+               (:type
+                (ex-data
+                 (try
+                   (block/parse (:raw invalid))
+                   (catch kerror/ExceptionInfo error error))))))
+        (disk/accept-headers!
+         node [(get-in invalid [:header :bytes])] 2000000000)
+        (with-redefs
+         [peer-pool/download-blocks!
+          (fn [& _]
+            {:blocks [(:raw invalid)] :block-sources [source]
+             :observations [] :failures []})
+          peer-pool/report-block-validation-failure!
+          (fn [_ peer _ error-type _]
+            (reset! feedback [peer error-type]))]
+          (let [result
+                (disk/sync-blocks-managed!
+                 node (atom ::pool) 2000000000 {:max-blocks 1})
+                status (disk/consensus-status node)]
+            (is (= :synced (:status result)))
+            (is (zero? (:downloaded result)))
+            (is (= :bitcoin.consensus/multiple-coinbase
+                   (get-in result
+                           [:validation-failures 0 :validation-type])))
+            (is (= :invalid
+                   (get-in result
+                           [:validation-failures 0
+                            :block-validation-result])))
+            (is (= [source :bitcoin.node/peer-invalid-block] @feedback))
+            (is (= 0 (:height status)))
+            (is (= 0 (:best-header-height status)))
+            (is (= 1 (:invalid-blocks status)))))))))
+
+(deftest disk-consensus-reorganizes-with-durable-undo
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            main-1 (mine-branch-block genesis 1 0)
+            main-2 (mine-branch-block main-1 2 0)
+            side-1 (mine-branch-block genesis 1 1)
+            side-2 (mine-branch-block side-1 2 2)
+            side-3 (mine-branch-block side-2 3 3)
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})]
+        (doseq [value [main-1 main-2]]
+          (disk/accept-block! node (block/serialize value) 2000000000))
+        (disk/accept-block! node (block/serialize side-1) 2000000000)
+        (is (= 1 (:pending-blocks (disk/consensus-status node))))
+        (is (empty?
+             (:node-data
+              (storage/decode-value
+               (sqlite/host-state (:backend node))))))
+        (let [reopened (disk/open {:path path :network :regtest})]
+          (disk/accept-block!
+           reopened (block/serialize side-2) 2000000000)
+          (is (= 2 (:pending-blocks
+                    (disk/consensus-status reopened))))
+          (disk/accept-block!
+           reopened (block/serialize side-3) 2000000000)
+          (let [expected (get-in side-3 [:header :hash-hex])
+                status (disk/consensus-status reopened)]
+          (is (= 3 (:height status)))
+          (is (= expected (:best-block status)))
+          (is (= 3 (:utxo-count status)))
+            (is (= 0 (:pending-blocks status)))
+            (is (= 0 (:pending-bytes status)))
+          (is (nil? (get-in @(:state reopened)
+                            [:nodes expected :undo])))
+          (is (= expected
+                 (:best-block
+                  (disk/consensus-status
+                     (disk/open {:path path
+                                 :network :regtest})))))))))))
+
+(deftest invalid-high-work-branch-is-atomically-quarantined
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            main-1 (mine-branch-block genesis 1 0)
+            main-2 (mine-branch-block main-1 2 0)
+            invalid-coinbase
+            (transaction/parse
+             (transaction/serialize
+              (assoc-in
+               (coinbase 1 41) [:outputs 0 :value]
+               (inc (utxo/block-subsidy 1 150)))))
+            side-1
+            (mine-block-with-coinbase genesis 1 invalid-coinbase)
+            side-2 (mine-branch-block side-1 2 42)
+            side-3 (mine-branch-block side-2 3 43)
+            failed-hash (get-in side-1 [:header :hash-hex])
+            main-tip (get-in main-2 [:header :hash-hex])
+            node
+            (disk/open {:path path :network :regtest
+                        :genesis-bytes
+                        (fixture/hex->bytes fixture/regtest-genesis)})]
+        (doseq [value [main-1 main-2 side-1 side-2]]
+          (disk/accept-block!
+           node (block/serialize value) 2000000000))
+        (is (= 2 (:pending-blocks (disk/consensus-status node))))
+        (let [error
+              (try
+                (disk/accept-block!
+                 node (block/serialize side-3) 2000000000)
+                (catch kerror/ExceptionInfo value value))
+              status (disk/consensus-status node)]
+          (is (= :bitcoin.consensus/bad-coinbase-amount
+                 (:type (ex-data error))))
+          (is (= failed-hash
+                 (:invalid-block-hash (ex-data error))))
+          (is (= main-tip (:best-header status)))
+          (is (= main-tip (:best-block status)))
+          (is (= 1 (:invalid-blocks status)))
+          (is (= [{:hash failed-hash
+                   :height 1
+                   :reason :bitcoin.consensus/bad-coinbase-amount}]
+                 (:invalid-block-roots status)))
+          (is (= 0 (:pending-blocks status)))
+          (is (= [] (sqlite/pending-block-hashes (:backend node)))))
+        (let [reopened
+              (disk/open {:path path :network :regtest})
+              status (disk/consensus-status reopened)
+              header-error
+              (try
+                (disk/accept-header!
+                 reopened (get-in side-3 [:header :bytes]) 2000000000)
+                (catch kerror/ExceptionInfo value value))]
+          (is (= main-tip (:best-header status)))
+          (is (= 1 (:invalid-blocks status)))
+          (is (empty? (disk/pending-best-chain-blocks reopened)))
+          (is (= :bitcoin.consensus/invalid-ancestor
+                 (:type (ex-data header-error)))))))))
+
+(deftest pending-side-branch-limit-rolls-back-header-and-host-state
+  (with-store
+    (fn [path]
+      (let [genesis
+            (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            main-1 (mine-branch-block genesis 1 0)
+            side-1 (mine-branch-block genesis 1 1)
+            node
+            (disk/open
+             {:path path :network :regtest
+              :genesis-bytes
+              (fixture/hex->bytes fixture/regtest-genesis)
+              :pending-block-limit 0 :pending-byte-limit 0})
+            _ (disk/accept-block!
+               node (block/serialize main-1) 2000000000)
+            before (disk/consensus-status node)
+            error
+            (try
+              (disk/accept-block!
+               node (block/serialize side-1) 2000000000)
+              (catch kerror/ExceptionInfo value value))]
+        (is (= :bitcoin.consensus/pending-block-limit
+               (:type (ex-data error))))
+        (is (= before (disk/consensus-status node)))
+        (is (nil? (sqlite/header-node
+                   (:backend node)
+                   (get-in side-1 [:header :hash-hex]))))
+        (is (= {:pending-blocks 0 :pending-bytes 0}
+               (sqlite/pending-status (:backend node))))))))
+
+(deftest populated-utxo-without-host-state-fails-closed
+  (with-store
+    (fn [path]
+      (let [legacy
+            (disk-utxo/open {:path path :network :regtest})]
+        (disk-utxo/connect-block!
+         legacy (fixture/hex->bytes fixture/regtest-genesis))
+        (is (= :bitcoin.node/missing-disk-consensus-state
+               (:type
+                (ex-data
+                 (try
+                   (disk/open {:path path :network :regtest})
+                   (catch kerror/ExceptionInfo error error))))))))))
+
+(deftest assumeutxo-start-is-atomic-unready-and-restart-safe
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            block-2 (fixture/mine-regtest-block block-1 2)
+            block-3 (fixture/mine-regtest-block block-2 3)
+            full
+            (consensus/open
+             {:network :regtest
+              :genesis-bytes
+              (fixture/hex->bytes fixture/regtest-genesis)})
+            _ (consensus/accept-block!
+               full (block/serialize block-1) 2000000000)
+            _ (consensus/accept-block!
+               full (block/serialize block-2) 2000000000)
+            coins (get-in @(:state full) [:utxo :coins])
+            base-hash (get-in block-2 [:header :hash-hex])
+            snapshot (fixture/core-snapshot base-hash coins)
+            commitment
+            (assumeutxo/hash-serialized coins)
+            header-node
+            (disk/open
+             {:path (Path/of (str path ".headers")
+                             (make-array String 0))
+              :network :regtest
+              :genesis-bytes
+              (fixture/hex->bytes fixture/regtest-genesis)})
+            _ (disk/accept-headers!
+               header-node
+               [(get-in block-1 [:header :bytes])
+                (get-in block-2 [:header :bytes])
+                (get-in block-3 [:header :bytes])]
+               2000000000)
+            headers @(:state header-node)
+            options
+            {:checkpoints
+             {2 {:blockhash base-hash
+                 :hash-serialized commitment
+                 :chain-tx-count 3}}}
+            node
+            (disk/open
+             {:path path :network :regtest
+              :header-state headers
+              :snapshot-header-backend (:backend header-node)
+              :snapshot-source snapshot
+              :snapshot-options options
+              :background-genesis-bytes
+              (fixture/hex->bytes fixture/regtest-genesis)})]
+        (is (lazy-header-map/lazy-header-map?
+             (:nodes @(:state node))))
+        (is (= 4 (sqlite/header-node-count (:backend node))))
+        (is (true? (:active?
+                    (sqlite/header-node (:backend node) base-hash))))
+        (is (false?
+             (:active?
+              (sqlite/header-node
+               (:backend node) (get-in block-3 [:header :hash-hex])))))
+        (is (= :assumed (:snapshot-status
+                         (disk/consensus-status node))))
+        (is (= 0 (:background-height
+                  (disk/consensus-status node))))
+        (is (false? (disk/ready? node)))
+        (is (= :bitcoin.node/background-incomplete
+               (:type
+                (ex-data
+                 (try
+                   (disk/verify-background! node)
+                   (catch kerror/ExceptionInfo error error))))))
+        (is (= 3
+               (:height
+                (disk/accept-block!
+                 node (block/serialize block-3) 2000000000))))
+        (let [reopened (disk/open {:path path :network :regtest})]
+          (is (= :assumed
+                 (:snapshot-status (disk/consensus-status reopened))))
+          (is (false? (disk/ready? reopened)))
+          (is (= 1
+                 (:background-height
+                  (disk/accept-background-block!
+                   reopened (block/serialize block-1) 2000000000))))
+          (let [resumed (disk/open {:path path :network :regtest})
+                validated
+                (disk/accept-background-block!
+                 resumed (block/serialize block-2) 2000000000)]
+            (is (= :validated (:snapshot-status validated)))
+            (is (= 3 (:height validated)))
+            (is (nil? (:background-height validated)))
+            (is (:fully-validated? validated))
+            (is (disk/ready? resumed))
+            (is (= :bitcoin.node/no-background-validation
+                   (:type
+                    (ex-data
+                     (try
+                       (disk/accept-background-block!
+                        resumed (block/serialize block-2) 2000000000)
+                       (catch kerror/ExceptionInfo error error))))))
+            (is (= :validated
+                   (:snapshot-status
+                    (disk/consensus-status
+                     (disk/open {:path path :network :regtest})))))))))))
+
+(deftest background-commitment-mismatch-never-promotes-and-can-retry
+  (with-store
+    (fn [path]
+      (let [genesis (block/parse (fixture/hex->bytes fixture/regtest-genesis))
+            block-1 (fixture/mine-regtest-block genesis 1)
+            full
+            (consensus/open
+             {:network :regtest
+              :genesis-bytes
+              (fixture/hex->bytes fixture/regtest-genesis)})
+            _ (consensus/accept-block!
+               full (block/serialize block-1) 2000000000)
+            coins (get-in @(:state full) [:utxo :coins])
+            base-hash (get-in block-1 [:header :hash-hex])
+            snapshot (fixture/core-snapshot base-hash coins)
+            headers
+            (chainstate/accept-header
+             (chainstate/initialize :regtest genesis)
+             (:header block-1) 2000000000)
+            node
+            (disk/open
+             {:path path :network :regtest
+              :header-state headers :snapshot-source snapshot
+              :snapshot-options
+              {:checkpoints
+               {1 {:blockhash base-hash
+                   :hash-serialized (assumeutxo/hash-serialized coins)
+                   :chain-tx-count 2}}}})]
+        (is (= :bitcoin.consensus/snapshot-background-mismatch
+               (:type
+                (ex-data
+                 (with-redefs [sqlite/hash-serialized
+                               (constantly (apply str (repeat 64 "f")))]
+                   (try
+                     (disk/accept-background-block!
+                      node (block/serialize block-1) 2000000000)
+                     (catch kerror/ExceptionInfo error error)))))))
+        (is (= :assumed
+               (:snapshot-status (disk/consensus-status node))))
+        (is (= 1 (:background-height
+                  (disk/consensus-status node))))
+        (is (= :validated
+               (:snapshot-status (disk/verify-background! node))))
+        (is (disk/ready? node))))))

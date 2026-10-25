@@ -1,0 +1,219 @@
+(ns bitcoin.node.headers-sync-test
+  (:require [kotoba.lang.error :as kerror] [bitcoin.consensus.block :as block]
+            [bitcoin.node.consensus-test :as fixture]
+            [bitcoin.node.headers-sync :as headers-sync]
+            [bitcoin.node.peer :as peer]
+            [kotoba.test :refer [deftest is]]
+            [kotobase.bitcoin.protocol :as header]))
+
+(defn- error-type [run!]
+  (:type
+   (ex-data
+    (try
+      (run!)
+      (catch kerror/ExceptionInfo error error)))))
+
+(defn- mine-header [parent marker]
+  (loop [nonce 0]
+    (let [bytes
+          (header/encode-block-header
+           {:version 4
+            :prev-block (:hash parent)
+            :merkle-root (vec (repeat 32 marker))
+            :timestamp (inc (:timestamp parent))
+            :bits (:bits parent)
+            :nonce nonce})
+          candidate (header/decode-block-header bytes)]
+      (if (header/hash-meets-target? (:hash candidate) (:bits candidate))
+        candidate
+        (recur (inc nonce))))))
+
+(defn- branch [anchor markers]
+  (rest
+   (reductions
+    (fn [parent marker] (mine-header parent marker))
+    anchor markers)))
+
+(defn- add-work [chainwork headers]
+  (reduce
+   (fn [total value]
+     (header/add-chainwork total (header/header-work (:bits value))))
+   chainwork headers))
+
+(deftest low-work-headers-are-committed-only-after-protected-redownload
+  (let [genesis
+        (:header (block/parse (fixture/hex->bytes fixture/regtest-genesis)))
+        honest (vec (branch genesis [1 2 3]))
+        anchor-work (header/header-work (:bits genesis))
+        minimum-work (add-work anchor-work honest)
+        honest-hashes (set (map :hash honest))
+        commitment-fn
+        (fn [_ value] (if (contains? honest-hashes value) 0 1))
+        initial
+        (headers-sync/create
+         {:network :regtest
+          :context [genesis]
+          :anchor-height 0
+          :anchor-chainwork anchor-work
+          :minimum-chainwork minimum-work
+          :now (+ (:timestamp genesis) 100)
+          :commitment-period 1
+          :redownload-buffer-size 2
+          :commitment-offset 0
+          :commitment-key (vec (repeat 32 0))
+          :commitment-fn commitment-fn})
+        presync (headers-sync/process-batch initial honest)
+        redownload (:state presync)]
+    (is (= :redownload (:phase redownload)))
+    (is (empty? (:ready presync))
+        "The first download must never cross the durable storage boundary")
+    (is (= [(:hash genesis)] (headers-sync/locator redownload)))
+    (let [first-part
+          (headers-sync/process-batch redownload (subvec honest 0 2))
+          completed
+          (headers-sync/process-batch (:state first-part)
+                                      (subvec honest 2))]
+      (is (empty? (:ready first-part))
+          "The commitment lookahead buffer is not released early")
+      (is (= (mapv :hash honest) (mapv :hash (:ready completed))))
+      (is (= :complete (get-in completed [:state :phase])))
+      (is (= 3 (get-in completed [:state :presynced])))
+      (is (= 3 (get-in completed [:state :redownloaded]))))))
+
+(deftest redownload-equivocation-and-incomplete-work-fail-closed
+  (let [genesis
+        (:header (block/parse (fixture/hex->bytes fixture/regtest-genesis)))
+        honest (vec (branch genesis [1 2 3]))
+        alternate (vec (branch genesis [9 8 7]))
+        anchor-work (header/header-work (:bits genesis))
+        minimum-work (add-work anchor-work honest)
+        honest-hashes (set (map :hash honest))
+        initial
+        (headers-sync/create
+         {:network :regtest
+          :context [genesis]
+          :anchor-height 0
+          :anchor-chainwork anchor-work
+          :minimum-chainwork minimum-work
+          :now (+ (:timestamp genesis) 100)
+          :commitment-period 1
+          :redownload-buffer-size 2
+          :commitment-offset 0
+          :commitment-key (vec (repeat 32 0))
+          :commitment-fn
+          (fn [_ value] (if (contains? honest-hashes value) 0 1))})
+        redownload (:state (headers-sync/process-batch initial honest))]
+    (is (= :bitcoin.node/headers-presync-equivocation
+           (error-type
+            #(headers-sync/process-batch redownload alternate))))
+    (is (= :bitcoin.node/peer-insufficient-chainwork
+           (error-type #(headers-sync/require-complete! initial))))
+    (is (= :bitcoin.node/peer-insufficient-chainwork
+           (error-type #(headers-sync/require-complete! redownload))))))
+
+(deftest mtp-derived-chain-length-bound-prevents-unbounded-commitments
+  (let [genesis
+        (:header (block/parse (fixture/hex->bytes fixture/regtest-genesis)))
+        value (first (branch genesis [1]))
+        anchor-work (header/header-work (:bits genesis))
+        state
+        (headers-sync/create
+         {:network :regtest
+          :context [genesis]
+          :anchor-height 0
+          :anchor-chainwork anchor-work
+          :minimum-chainwork
+          (header/add-chainwork
+           anchor-work (header/header-work (:bits value)))
+          :now (:timestamp genesis)
+          :commitment-period 100000
+          :redownload-buffer-size 1
+          :commitment-offset 1
+          :commitment-key (vec (repeat 32 0))
+          :commitment-fn (constantly 0)})]
+    (is (= 0 (:max-commitments state)))
+    (is (= :bitcoin.node/headers-presync-length
+           (error-type #(headers-sync/process-batch state [value]))))))
+
+(deftest peer-sync-does-not-persist-the-first-low-work-download
+  (let [genesis
+        (:header (block/parse (fixture/hex->bytes fixture/regtest-genesis)))
+        honest (vec (branch genesis [1 2 3]))
+        anchor-work (header/header-work (:bits genesis))
+        minimum-work (add-work anchor-work honest)
+        responses (atom [honest honest []])
+        accepted (atom [])
+        options
+        {:max-batches 4
+         :presync
+         {:network :regtest
+          :context [genesis]
+          :anchor-height 0
+          :anchor-chainwork anchor-work
+          :minimum-chainwork minimum-work
+          :now (+ (:timestamp genesis) 100)
+          :commitment-period 1
+          :redownload-buffer-size 2
+          :commitment-offset 0
+          :commitment-key (vec (repeat 32 0))
+          :commitment-fn (constantly 0)}}]
+    (with-redefs
+     [peer/get-headers!
+      (fn [_ _]
+        (let [result (first @responses)]
+          (swap! responses subvec 1)
+          result))]
+     (let [result
+           (peer/sync-headers!
+            {} [(:hash genesis)] #(swap! accepted conj %) options)]
+       (is (= :synced (:status result)))
+       (is (= 3 (:accepted result)))
+       (is (= 3 (get-in result [:headers-presync :presynced])))
+       (is (= 3 (get-in result [:headers-presync :redownloaded])))
+       (is (= [(mapv :hash honest)]
+              (mapv #(mapv :hash %) @accepted)))
+       (is (empty? @responses))))))
+
+(deftest peer-sync-rejects-a-short-chain-below-minimum-work
+  (let [genesis
+        (:header (block/parse (fixture/hex->bytes fixture/regtest-genesis)))
+        honest (vec (branch genesis [1 2 3]))
+        anchor-work (header/header-work (:bits genesis))
+        responses (atom [(subvec honest 0 1)])
+        options
+        {:max-batches 2
+         :presync
+         {:network :regtest
+          :context [genesis]
+          :anchor-height 0
+          :anchor-chainwork anchor-work
+          :minimum-chainwork (add-work anchor-work honest)
+          :now (+ (:timestamp genesis) 100)
+          :commitment-period 1
+          :redownload-buffer-size 2
+          :commitment-offset 0
+          :commitment-key (vec (repeat 32 0))
+          :commitment-fn (constantly 0)}}]
+    (with-redefs
+     [peer/get-headers!
+      (fn [_ _]
+        (let [result (first @responses)]
+          (swap! responses subvec 1)
+          result))]
+     (is (= :bitcoin.node/peer-insufficient-chainwork
+            (error-type
+             #(peer/sync-headers! {} [(:hash genesis)]
+                                  (constantly nil) options)))))
+    (let [one-pass (atom [honest])]
+      (with-redefs
+       [peer/get-headers!
+        (fn [_ _]
+          (let [result (first @one-pass)]
+            (swap! one-pass subvec 1)
+            result))]
+       (is (= :bitcoin.node/peer-insufficient-chainwork
+              (error-type
+               #(peer/sync-headers!
+                 {} [(:hash genesis)] (constantly nil)
+                 (assoc options :max-batches 1))))
+           "the batch limit cannot bypass the mandatory redownload")))))
