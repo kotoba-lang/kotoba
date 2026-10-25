@@ -1,0 +1,187 @@
+(ns stripe-ops.stripeport
+  "StripePort -- the ONE place a real Stripe API call leaves the building.
+  `mock-stripeport` is the default: a deterministic in-memory target so the
+  actor is runnable and testable with no network/creds, same charter as
+  koyomi.scheduleport/shoko.archiveport.
+
+  `live-stripeport` is one opt-in real transport (Stripe's REST API,
+  mirroring cloud_itonami.edge.billing's own zero-SDK convention: `Authorization:
+  Bearer <key>`, application/x-www-form-urlencoded bodies for writes, plain
+  GET+query-string for reads -- no `stripe` npm/Maven SDK anywhere in this
+  repo). `:api-key` and `:http-fn` are constructor-injected -- NEVER
+  hardcoded or env-guessed here (mirrors koyomi.scheduleport/slack-
+  scheduleport's `:token`/`:channel` convention exactly). The `:api-key`
+  SHOULD be a Stripe Dashboard-created *restricted* key scoped to
+  Customers/Subscriptions/Products/Prices READ + Payment Links WRITE only
+  (ADR-2607242700) -- this port has no way to enforce that itself, so the
+  governor's own structural restriction (only :stripe/lookup and
+  :stripe/payment-link-create ever reach this port at all) is the enforced
+  boundary; the restricted key is defense-in-depth on top, not a substitute.
+
+  `:http-fn` contract: `{:url :method :headers :body} -> {:status :body}` --
+  the same shape koyomi.scheduleport/slack-jvm-http-fn and
+  cloud-itonami.agent's node-http curl-based :http-fn already use, so a
+  caller on either JVM or cljs/Node can inject a transport this port already
+  knows how to drive with zero new glue. No live Stripe call happens
+  anywhere in this repo's automated test suite -- stripeport_test.clj
+  exercises only request-building with a fake, injected :http-fn."
+  (:require [kotoba.lang.text :as str]))
+
+(defprotocol StripePort
+  (get-customer [port id])
+  (search-customers-by-email [port email])
+  (get-subscription [port id])
+  (list-subscriptions-for-customer [port customer-id])
+  (get-product [port id])
+  (get-price [port id])
+  (create-payment-link! [port price-id opts]
+    "opts: {:idempotency-key str :metadata {..}}. Always quantity 1 -- see
+    stripe-ops.governor's `custom-amount-attempted`/`quantity-not-one` HARD
+    checks; this port itself never accepts a caller-supplied amount/quantity
+    override, so even a bypass upstream of the governor still can't reach a
+    custom-priced Payment Link through this fn's own argument list."))
+
+;; ───────────────────────── mock (default, runnable offline) ─────────────────────────
+
+(defn- demo-customers []
+  {"cus_demo_alice" {:id "cus_demo_alice" :email "alice@example.com" :name "Alice Example"}
+   "cus_demo_bob"   {:id "cus_demo_bob" :email "bob@example.com" :name "Bob Example"}})
+
+(defn- demo-subscriptions []
+  {"sub_demo_alice_6399" {:id "sub_demo_alice_6399" :customer "cus_demo_alice"
+                          :status "active" :price "price_demo_isic6399_managed_starter"}})
+
+(defn- demo-products []
+  {"prod_demo_isic6399" {:id "prod_demo_isic6399" :name "Managed Job Board (Starter)"}
+   "prod_demo_isic6310" {:id "prod_demo_isic6310" :name "Managed Talent Board (Starter)"}
+   "prod_demo_isic7810" {:id "prod_demo_isic7810" :name "Managed Placement Desk (Starter)"}})
+
+(defn- demo-prices []
+  {"price_demo_isic6399_managed_starter"
+   {:id "price_demo_isic6399_managed_starter" :product "prod_demo_isic6399"
+    :unit_amount 80000 :currency "jpy" :recurring {:interval "month"}}
+   "price_demo_isic6310_managed_starter"
+   {:id "price_demo_isic6310_managed_starter" :product "prod_demo_isic6310"
+    :unit_amount 80000 :currency "jpy" :recurring {:interval "month"}}
+   "price_demo_isic7810_managed_starter"
+   {:id "price_demo_isic7810_managed_starter" :product "prod_demo_isic7810"
+    :unit_amount 80000 :currency "jpy" :recurring {:interval "month"}}})
+
+(defn mock-stripeport
+  "A deterministic in-memory StripePort. `created-links` is an atom of
+  {id -> record} so tests/sim can assert on what payment links were
+  actually created, without any network call. `id-seq` (an atom of int) so
+  repeated calls in one process get distinct mock ids -- not for real
+  uniqueness guarantees, just deterministic-enough for a demo/test run."
+  ([] (mock-stripeport (atom {}) (atom 0)))
+  ([created-links id-seq]
+   (reify StripePort
+     (get-customer [_ id] (get (demo-customers) id))
+     (search-customers-by-email [_ email]
+       (filterv #(= email (:email %)) (vals (demo-customers))))
+     (get-subscription [_ id] (get (demo-subscriptions) id))
+     (list-subscriptions-for-customer [_ customer-id]
+       (filterv #(= customer-id (:customer %)) (vals (demo-subscriptions))))
+     (get-product [_ id] (get (demo-products) id))
+     (get-price [_ id] (get (demo-prices) id))
+     (create-payment-link! [_ price-id {:keys [idempotency-key metadata]}]
+       (if-let [existing (some (fn [[_ v]] (when (= idempotency-key (:idempotency-key v)) v))
+                                @created-links)]
+         existing ; idempotent retry -- return the SAME record, never a second link
+         (let [n  (swap! id-seq inc)
+               id (str "plink_mock_" n)
+               rec {:id id :url (str "https://mock.stripe.example/pay/" id)
+                    :price-id price-id :quantity 1
+                    :idempotency-key idempotency-key :metadata (or metadata {})}]
+           (swap! created-links assoc id rec)
+           rec))))))
+
+;; ───────────────────────── live (opt-in, real Stripe REST API) ─────────────────────────
+
+#?(:clj
+(defn- jvm-http-fn
+  "Real java.net.http request -- {:url :method :headers :body} -> {:status
+  :body}, mirroring koyomi.scheduleport/slack-jvm-http-fn (JVM-only
+  default; a cljs/SCI/WASM host must inject its own :http-fn, e.g.
+  cloud-itonami.agent's node-http curl-based one)."
+  [{:keys [url method headers body]}]
+  (let [builder (reduce-kv (fn [^java.net.http.HttpRequest$Builder b k v] (.header b k v))
+                           (java.net.http.HttpRequest/newBuilder (java.net.URI/create url))
+                           headers)
+        request (-> (case (or method :get)
+                      :post (.POST builder (java.net.http.HttpRequest$BodyPublishers/ofString (or body "")))
+                      :get  (.GET builder))
+                    .build)
+        resp    (.send (java.net.http.HttpClient/newHttpClient) request
+                       (java.net.http.HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp) :body (.body resp)})))
+
+(defn- url-encode [s]
+  #?(:clj (java.net.URLEncoder/encode (str s) "UTF-8")
+     :cljs (js/encodeURIComponent (str s))))
+
+(defn- form-encode
+  "Stripe's application/x-www-form-urlencoded convention for nested maps:
+  a[b]=v (one level deep is all this port ever sends -- metadata and the
+  fixed quantity/price fields, never arbitrary nested line_items/price_data)."
+  [m]
+  (->> m
+       (mapcat (fn [[k v]]
+                 (if (map? v)
+                   (map (fn [[k2 v2]] (str (url-encode (name k)) "[" (url-encode (name k2)) "]=" (url-encode v2))) v)
+                   [(str (url-encode (name k)) "=" (url-encode v))])))
+       (str/join "&")))
+
+(defn- parse-json-id+url
+  "Minimal, dependency-free extraction of `\"id\"`/`\"url\"` string fields
+  from a Stripe JSON response body -- sufficient for this port's own
+  create-payment-link! result (Stripe's response is a flat-ish object with
+  top-level `id`/`url` strings); a caller needing the FULL response should
+  parse `:raw-body` itself with a real JSON lib."
+  [body]
+  {:id  (second (re-find #"\"id\"\s*:\s*\"([^\"]+)\"" (or body "")))
+   :url (second (re-find #"\"url\"\s*:\s*\"([^\"]+)\"" (or body "")))})
+
+(defn live-stripeport
+  "A real Stripe REST API StripePort. `:api-key` SHOULD be a restricted key
+  (see ns docstring) -- this fn does not and cannot verify that; the
+  governor's structural op-restriction is the enforced boundary.
+  `:base-url` defaults to `https://api.stripe.com/v1`. `:http-fn` defaults
+  to a real sync `java.net.http` call on `:clj`; on `:cljs` a caller MUST
+  inject one (e.g. cloud-itonami.agent's node-http curl-based :http-fn) --
+  there is no default cljs transport here, matching koyomi.scheduleport/
+  slack-scheduleport's own precedent for exactly this reason."
+  [{:keys [api-key base-url http-fn]}]
+  (let [base-url (or base-url "https://api.stripe.com/v1")
+        http-fn  (or http-fn
+                     #?(:clj jvm-http-fn
+                        :cljs (fn [_] (throw (ex-info "stripe-ops.stripeport/live-stripeport: no :http-fn injected and no default HTTP transport on this host" {})))))
+        auth     {"Authorization" (str "Bearer " api-key)}
+        get!     (fn [path] (http-fn {:url (str base-url path) :method :get :headers auth}))
+        post!    (fn [path form extra-headers]
+                   (http-fn {:url (str base-url path) :method :post
+                             :headers (merge auth {"Content-Type" "application/x-www-form-urlencoded"}
+                                             extra-headers)
+                             :body (form-encode form)}))]
+    (reify StripePort
+      (get-customer [_ id] (get! (str "/customers/" (url-encode id))))
+      (search-customers-by-email [_ email] (get! (str "/customers?email=" (url-encode email))))
+      (get-subscription [_ id] (get! (str "/subscriptions/" (url-encode id))))
+      (list-subscriptions-for-customer [_ customer-id]
+        (get! (str "/subscriptions?customer=" (url-encode customer-id))))
+      (get-product [_ id] (get! (str "/products/" (url-encode id))))
+      (get-price [_ id] (get! (str "/prices/" (url-encode id))))
+      (create-payment-link! [_ price-id {:keys [idempotency-key metadata]}]
+        ;; idempotency-key is Stripe's own `Idempotency-Key` REQUEST HEADER
+        ;; (not a body form field) -- Stripe's server dedupes retries with
+        ;; the same header value within its own retention window, so a
+        ;; retried call NEVER creates a second live Payment Link.
+        (let [resp (post! "/payment_links"
+                          (cond-> {"line_items[0][price]" price-id
+                                   "line_items[0][quantity]" 1}
+                            metadata (assoc :metadata metadata))
+                          (when idempotency-key {"Idempotency-Key" idempotency-key}))
+              {:keys [id url]} (parse-json-id+url (:body resp))]
+          {:id id :url url :price-id price-id :quantity 1
+           :idempotency-key idempotency-key :metadata (or metadata {})
+           :raw-status (:status resp) :raw-body (:body resp)})))))

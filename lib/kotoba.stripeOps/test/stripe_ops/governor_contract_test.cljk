@@ -1,0 +1,158 @@
+(ns stripe-ops.governor-contract-test
+  "The propose→govern-only, human-signoff-for-writes contract as executable
+  tests -- this fleet's analog of koyomi.governor-contract-test /
+  tosmonitor's governor_contract_test. Invariant: the actor never calls
+  stripeport/create-payment-link! for anything the governor would reject;
+  payment-link-create always routes to a human regardless of phase."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [stripe-ops.store :as store]
+            [stripe-ops.stripeport :as stripeport]
+            [stripe-ops.advisor :as advisor]
+            [stripe-ops.operation :as op]))
+
+(defn- fresh []
+  (let [s (store/seed-db) created (atom {}) id-seq (atom 0)
+        sp (stripeport/mock-stripeport created id-seq)]
+    [s (op/build s {:stripeport sp}) created sp]))
+
+(defn- ctx [phase] {:phase phase})
+(defn- run [actor tid req phase] (g/run* actor {:request req :context (ctx phase)} {:thread-id tid}))
+
+(deftest clean-lookup-auto-commits-at-lookup-auto-phase
+  (testing "phase 2: a clean, known-kind lookup is a read, not actuation -- it commits without interrupting"
+    (let [[_ actor] (fresh)
+          res (run actor "l" {:op :stripe/lookup :kind :price
+                              :query "price_demo_isic6399_managed_starter"} 2)]
+      (is (not= :interrupted (:status res)) "a read-only lookup is not high-stakes when clean")
+      (is (= :commit (get-in res [:state :disposition])))
+      (is (= 80000 (:unit_amount (get-in res [:state :record :result])))))))
+
+(deftest missing-phase-context-does-not-grant-max-autonomy
+  (testing "omitting :phase from context still requires human approval on a clean lookup"
+    (let [[_ actor] (fresh)
+          res (g/run* actor {:request {:op :stripe/lookup :kind :price
+                                       :query "price_demo_isic6399_managed_starter"}
+                             :context {}}
+                      {:thread-id "mp"})]
+      (is (not= :commit (get-in res [:state :disposition]))
+          "a clean lookup must not auto-commit when :phase is unset"))))
+
+(deftest unrecognized-lookup-kind-is-held
+  (testing "fail-closed: a lookup kind the governor doesn't recognize is a hard violation"
+    (let [[s actor] (fresh)
+          res (run actor "l2" {:op :stripe/lookup :kind :refund :query "re_123"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:unrecognized-lookup-kind} (-> (store/ledger s) last :basis))))))
+
+(deftest payment-link-create-always-requires-human-signoff
+  (testing "even a clean, known-price payment-link-create never auto-commits, at any phase"
+    (let [[_ actor created] (fresh)
+          res (run actor "p1" {:op :stripe/payment-link-create
+                               :price-id "price_demo_isic6399_managed_starter"
+                               :idempotency-key "lead-1"} 3)]
+      (is (= :interrupted (:status res)) "payment-link-create is high-stakes → always human")
+      (is (empty? @created) "nothing created before sign-off")
+      (let [r2 (g/run* actor {:approval {:status :approved :by "alice"}}
+                       {:thread-id "p1" :resume? true})]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= 1 (count @created)))
+        (is (= "price_demo_isic6399_managed_starter"
+               (:price-id (get-in r2 [:state :record :store-record :value]))))
+        (is (= 1 (get-in r2 [:state :record :store-record :value :quantity])))))))
+
+(deftest unknown-price-is-held-and-unoverridable
+  (testing "a price-id not in the known-prices whitelist is a hard violation -- no approval offered"
+    (let [[s actor created] (fresh)
+          res (run actor "p2" {:op :stripe/payment-link-create
+                               :price-id "price_invented_by_llm"
+                               :idempotency-key "lead-2"} 3)]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-known-price} (-> (store/ledger s) last :basis)))
+      (is (empty? @created)))))
+
+(deftest missing-idempotency-key-is-held
+  (testing "a payment-link-create with no idempotency key is a hard violation"
+    (let [[s actor created] (fresh)
+          res (run actor "p3" {:op :stripe/payment-link-create
+                               :price-id "price_demo_isic6399_managed_starter"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:missing-idempotency-key} (-> (store/ledger s) last :basis)))
+      (is (empty? @created)))))
+
+(deftest custom-amount-attempt-is-held
+  (testing "a proposal that tries to override the existing price's amount is a hard violation"
+    (let [[s _ created sp] (fresh)
+          bad-adv (reify advisor/Advisor
+                    (-advise [_ _ _] {:op :stripe/payment-link-create
+                                      :unit-amount 1
+                                      :summary "x" :rationale "x" :cites [] :redactions [] :confidence 0.9}))
+          actor2 (op/build s {:advisor bad-adv :stripeport sp})
+          req {:op :stripe/payment-link-create :price-id "price_demo_isic6399_managed_starter"
+               :idempotency-key "lead-3"}
+          res (g/run* actor2 {:request req :context (ctx 3)} {:thread-id "p4"})]
+      (is (not= :interrupted (:status res)) "hard violations hold directly, no approval offered")
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:custom-amount-attempted} (-> (store/ledger s) last :basis)))
+      (is (empty? @created)))))
+
+(deftest quantity-not-one-is-held
+  (testing "a proposal requesting quantity other than 1 is a hard violation (flat pricing only)"
+    (let [[s _] (fresh)
+          bad-adv (reify advisor/Advisor
+                    (-advise [_ _ _] {:op :stripe/payment-link-create
+                                      :quantity 5
+                                      :summary "x" :rationale "x" :cites [] :redactions [] :confidence 0.9}))
+          actor (op/build s {:advisor bad-adv})
+          req {:op :stripe/payment-link-create :price-id "price_demo_isic6399_managed_starter"
+               :idempotency-key "lead-4"}
+          res (g/run* actor {:request req :context (ctx 3)} {:thread-id "p5"})]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:quantity-not-one} (-> (store/ledger s) last :basis))))))
+
+(deftest unrecognized-op-is-held
+  (testing "fail-closed: an op the governor doesn't recognize is a hard violation, not a silent pass"
+    (let [[s actor] (fresh)
+          res (run actor "uo" {:op :stripe/refund :price-id "price_demo_isic6399_managed_starter"} 3)]
+      (is (not= :interrupted (:status res)))
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:unrecognized-op} (-> (store/ledger s) last :basis))))))
+
+(deftest phase0-disables-lookup
+  (let [[s actor] (fresh)
+        res (run actor "p0" {:op :stripe/lookup :kind :price
+                             :query "price_demo_isic6399_managed_starter"} 0)]
+    (is (= :hold (get-in res [:state :disposition])))
+    (is (= :phase-disabled (-> (store/ledger s) last :phase-reason)))))
+
+(deftest reject-signoff-holds
+  (testing "a human rejection records a hold, not a created Payment Link"
+    (let [[_ actor created] (fresh)
+          _  (run actor "p6" {:op :stripe/payment-link-create
+                              :price-id "price_demo_isic6399_managed_starter"
+                              :idempotency-key "lead-5"} 3)
+          r2 (g/run* actor {:approval {:status :rejected :by "alice"}}
+                     {:thread-id "p6" :resume? true})]
+      (is (= :hold (get-in r2 [:state :disposition])))
+      (is (empty? @created)))))
+
+(deftest idempotent-retry-never-creates-a-second-link
+  (testing "the SAME idempotency-key approved twice (e.g. a human double-clicking approve)
+            must return the SAME Payment Link, never a second live one"
+    (let [[_ actor created] (fresh)
+          run-once (fn [tid]
+                     (run actor tid {:op :stripe/payment-link-create
+                                    :price-id "price_demo_isic6399_managed_starter"
+                                    :idempotency-key "lead-dup"} 3)
+                     (g/run* actor {:approval {:status :approved :by "alice"}}
+                            {:thread-id tid :resume? true}))
+          r1 (run-once "dup1")
+          r2 (run-once "dup2")]
+      (is (= :commit (get-in r1 [:state :disposition])))
+      (is (= :commit (get-in r2 [:state :disposition])))
+      (is (= 1 (count @created)) "only one Payment Link ever exists for this idempotency-key")
+      (is (= (get-in r1 [:state :record :result :id]) (get-in r2 [:state :record :result :id]))))))

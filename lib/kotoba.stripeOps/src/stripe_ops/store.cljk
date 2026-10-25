@@ -1,0 +1,126 @@
+(ns stripe-ops.store
+  "SSoT for stripe-ops, behind a `Store` protocol so the backend is a swap
+  (MemStore default ‖ DatomicStore via langchain.db), same shape every prior
+  kotoba-lang actor in this fleet uses (closest templates: koyomi.store /
+  shoko.store).
+
+    known-price  -- a whitelist entry (stripe-ops.model/known-price) this
+                    actor is allowed to create a NEW Payment Link against.
+                    stripe-ops.governor's HARD `missing-known-price` check
+                    denies payment-link-create for any price-id not in this
+                    catalog -- so growing/shrinking what this actor can touch
+                    is a store-seed change, never a governor-logic change.
+    payment-link -- a durable record of a Payment Link this actor actually
+                    created (stripe-ops.model/payment-link), keyed by its own
+                    generated/returned id -- separate from the append-only
+                    ledger, same separation koyomi.store keeps between
+                    :drafts and :ledger.
+
+  IMPORTANT: `demo-known-prices` below are placeholder ids, NOT the real
+  Stripe Price ids ADR-2607161745 created for cloud-itonami-isic-6399/6310/
+  7810 -- those live in 1Password (`gftdcojp/cloud-itonami flagship
+  Managed-tier Stripe Payment Links`), never baked into this portable
+  library. A caller wiring up the real integration seeds the REAL price ids
+  via `seed!`/`with-known-prices`, exactly like every other actor in this
+  fleet keeps real data as an injected swap, never hardcoded demo content
+  (tosmonitor.store's own docstring convention)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (known-price [s price-id])
+  (all-known-prices [s])
+  (payment-link [s id])
+  (ledger [s])
+  (record-datom! [s record] "append/merge a stripe-ops ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable audit fact")
+  (seed! [s data]           "bulk-seed :known-prices (idempotent upsert)"))
+
+;; ───────────────────────── demo data (placeholder ids only) ─────────────────────────
+
+(defn demo-known-prices []
+  {"price_demo_isic6399_managed_starter"
+   {:price-id "price_demo_isic6399_managed_starter"
+    :product-name "Managed Job Board (Starter)" :vertical "cloud-itonami-isic-6399"}
+   "price_demo_isic6310_managed_starter"
+   {:price-id "price_demo_isic6310_managed_starter"
+    :product-name "Managed Talent Board (Starter)" :vertical "cloud-itonami-isic-6310"}
+   "price_demo_isic7810_managed_starter"
+   {:price-id "price_demo_isic7810_managed_starter"
+    :product-name "Managed Placement Desk (Starter)" :vertical "cloud-itonami-isic-7810"}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (known-price [_ price-id] (get-in @a [:known-prices price-id]))
+  (all-known-prices [_] (sort-by :price-id (vals (:known-prices @a))))
+  (payment-link [_ id] (get-in @a [:payment-links id]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :known-price  (swap! a update-in [:known-prices id] merge value)
+      :payment-link (swap! a update-in [:payment-links id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data] (swap! a update :known-prices merge (:known-prices data)) s))
+
+(defn seed-db []
+  (->MemStore (atom {:known-prices (demo-known-prices) :payment-links {} :ledger []})))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:known-price/id  {:db/unique :db.unique/identity}
+   :payment-link/id {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (known-price [this price-id]
+    (-> (pull* this [:known-price/edn] [:known-price/id price-id]) :known-price/edn dec*))
+  (all-known-prices [this]
+    (->> (q* this '[:find [?id ...] :where [?e :known-price/id ?id]])
+         (map #(known-price this %)) (sort-by :price-id)))
+  (payment-link [this id]
+    (-> (pull* this [:payment-link/edn] [:payment-link/id id]) :payment-link/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id, never a client-precomputed seq -- see koyomi.store's
+    ;; own docstring for why a caller-side count-then-write is a non-atomic
+    ;; read-modify-write that can silently drop a concurrent writer's fact.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :known-price  (tx* s [{:known-price/id id :known-price/edn (enc (merge (known-price s id) value))}])
+      :payment-link (tx* s [{:payment-link/id id :payment-link/edn (enc (merge (payment-link s id) value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id kp] (:known-prices data)] (record-datom! s {:kind :known-price :id id :value kp}))
+    s))
+
+(defn datomic-store
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store {:known-prices (demo-known-prices)}))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))
