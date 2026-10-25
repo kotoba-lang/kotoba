@@ -1,0 +1,87 @@
+(ns tiff.core
+  "TIFF decode. TIFF's IFD lives at a file offset and entry values may
+   themselves be offsets, so this is a small hand parser (byte order
+   auto-detected), not a linear grammar. R0 extracts IFD0 metadata
+   (dims/bps/compression/photometric); pixel strips are decoded for
+   none/lzw/packbits/deflate compression, left as blob pointers for
+   others (CCITT/JPEG-in-TIFF). Extracted from kotoba-lang/kasane
+   (kasane.tiff, ADR-2606272100) as `org-adobe-tiff` — TIFF 6.0 is
+   Adobe's published spec. Deflate support (2026-07-08) wired to
+   org-ietf-deflate — validated against a real Pillow-written
+   tiff_deflate strip (see test/tiff/deflate_test.cljk)."
+  (:require [tiff.bytes :as b]
+            [tiff.codec :as codec]
+            [deflate.core :as deflate]))
+
+(def ^:private tag-names
+  {256 :image-width 257 :image-height 258 :bits-per-sample 259 :compression
+   262 :photometric 273 :strip-offsets 277 :samples-per-pixel 278 :rows-per-strip
+   279 :strip-byte-counts 282 :x-resolution 283 :y-resolution 296 :resolution-unit})
+
+(def ^:private compressions
+  {1 :none 2 :ccitt-rle 3 :ccitt-g3 4 :ccitt-g4 5 :lzw 6 :jpeg-old 7 :jpeg
+   8 :deflate 32773 :packbits 32946 :deflate-old})
+
+(defn parse
+  "Parse TIFF `data` → {:byte-order :width :height :bits-per-sample
+   :compression :photometric :entries}."
+  [data]
+  (let [bv   (vec data)
+        big? (= [0x4D 0x4D] (subvec bv 0 2))              ; "MM"=big, "II"=little
+        u16  (fn [o] (b/uint! (b/cursor (subvec bv o (+ o 2))) 2 big?))
+        u32  (fn [o] (b/uint! (b/cursor (subvec bv o (+ o 4))) 4 big?))
+        ifd  (u32 4)
+        n    (u16 ifd)
+        entries (mapv (fn [i]
+                        (let [eo   (+ ifd 2 (* i 12))
+                              tag  (u16 eo)
+                              typ  (u16 (+ eo 2))
+                              cnt  (u32 (+ eo 4))
+                              val  (if (= typ 3) (u16 (+ eo 8)) (u32 (+ eo 8)))] ; SHORT vs LONG
+                          {:tag (tag-names tag tag) :type typ :count cnt :value val}))
+                      (range n))
+        byname (into {} (map (juxt :tag :value) entries))]
+    {:byte-order      (if big? :big :little)
+     :width           (:image-width byname)
+     :height          (:image-height byname)
+     :bits-per-sample (:bits-per-sample byname)
+     :compression     (compressions (:compression byname) (:compression byname))
+     :photometric     (:photometric byname)
+     :entries         entries}))
+
+(defn pixels
+  "Decode TIFF image samples = concatenated strips, decompressed per the
+   Compression tag (none/LZW/PackBits/Deflate). R0: predictor=1 (none)
+   only; single sample format; CCITT/JPEG-in-TIFF strips stay opaque.
+   Returns a vector of unsigned sample bytes."
+  [data]
+  (let [bv   (vec data)
+        big? (= [0x4D 0x4D] (subvec bv 0 2))
+        ifd  (b/uint! (b/cursor (subvec bv 4 8)) 4 big?)
+        n    (b/uint! (b/cursor (subvec bv ifd (+ ifd 2))) 2 big?)
+        u16  (fn [o] (b/uint! (b/cursor (subvec bv o (+ o 2))) 2 big?))
+        u32  (fn [o] (b/uint! (b/cursor (subvec bv o (+ o 4))) 4 big?))
+        ents (into {} (map (fn [i]
+                             (let [eo (+ ifd 2 (* i 12))]
+                               [(u16 eo) {:type (u16 (+ eo 2)) :count (u32 (+ eo 4)) :voff (+ eo 8)}]))
+                           (range n)))
+        rd-array (fn [tag]
+                   (when-let [e (get ents tag)]
+                     (let [sz (if (= (:type e) 3) 2 4)
+                           rd (if (= sz 2) u16 u32)]
+                       (if (= (:count e) 1)
+                         [(rd (:voff e))]
+                         (let [off (u32 (:voff e))]
+                           (mapv #(rd (+ off (* % sz))) (range (:count e))))))))
+        offs (rd-array 273)
+        lens (rd-array 279)
+        comp (u16 (:voff (get ents 259)))]
+    (vec (mapcat (fn [o l]
+                   (let [strip (subvec bv o (+ o l))]
+                     (case comp
+                       1           (vec strip)                                   ; none
+                       5           (codec/lzw strip)
+                       32773       (codec/packbits strip)
+                       (8 32946)   (deflate/inflate strip)                       ; zlib-wrapped (TIFF Adobe Deflate)
+                       (vec strip))))                                            ; other (CCITT/JPEG): opaque
+                 offs lens))))
