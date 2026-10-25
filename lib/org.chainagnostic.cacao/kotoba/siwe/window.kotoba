@@ -1,0 +1,276 @@
+;; The EIP-4361 validity window, as a Kotoba application (ADR-2608261100).
+;;
+;;   instant-ok?      (string)          -> bool
+;;   instant-seconds  (string)          -> i64     ; seconds since the epoch
+;;   problem          (fields, opts)    -> keyword ; :none when bound
+;;
+;; ## Where this decision lives today
+;;
+;; `siwe.core` is the portable half of this library and, by its own
+;; docstring, leaves time to "the runtime verifier". The runtime verifier is
+;; `siwe.edge`, which is `.cljs` -- so a JVM or nbb caller that parses with
+;; `siwe.core/parse-message` and binds with `siwe.core/expected-problem`
+;; gets NO temporal check at all. Measured: a message whose Expiration Time
+;; precedes its Issued At parses `{:ok? true}` with `:problem nil`.
+;;
+;; That is not a layering accident -- `siwe.edge` also carries secp256k1
+;; recovery and Keccak, which genuinely belong to the host. The window does
+;; not. Given two instants and a clock reading it is arithmetic, and it is
+;; the half a relying party is most likely to get wrong.
+;;
+;;   the guest owns   which instants are well formed, what they mean in
+;;                    seconds, and whether the window they describe contains
+;;                    the clock reading
+;;   the host owns    the clock, the signature, and the curve
+;;
+;; `now-sec` arrives as a number. Reading a clock is a capability; comparing
+;; to one is not.
+;;
+;; ## The check neither validator makes
+;;
+;; `siwe.edge/temporal-problem` compares Issued At, Expiration Time and Not
+;; Before each to the clock, and Expiration Time to Issued At. It never
+;; compares Not Before to Expiration Time. A message with
+;;
+;;   Not Before >= Expiration Time
+;;
+;; describes a window that never opens, and no arrangement of the clock can
+;; make it valid -- yet within the clock-skew tolerance it verifies, because
+;; `not-yet-valid` forgives up to `clock-skew-sec` on one end and `expired`
+;; forgives the same on the other. That is a 2*skew band, sixty seconds wide
+;; by default on each side, in which a message that is valid at no instant
+;; is accepted. `:window-never-opens` is the guest's own decision and is
+;; tested separately from parity.
+;;
+;; ## RFC 3339 by position, not by pattern
+;;
+;; The grammar is fixed-width up to the fraction, so the guest reads it by
+;; offset. That is the same design the SMTP reply-line slice landed on and
+;; it is not a workaround for the missing regex operators: a pattern that
+;; can match `YYYY-MM-DDTHH:MM:SS` can also match a great deal else, and the
+;; positions are the specification.
+;;
+;; Days come from the civil calendar by Hinnant's algorithm, which is exact
+;; for every proleptic Gregorian date and needs no table. `rem` has no
+;; admitted lowering, so remainders are `x - y*(quot x y)`.
+;;
+;; `.cljc` stays the oracle for the message grammar and is not required from
+;; here (require-graph). It did not grow a second copy of the window
+;; (ADR-2608261100).
+
+(ns siwe.window
+  (:export [main instant-ok? instant-seconds problem]))
+
+;; --- document accessors -----------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+;; --- characters -------------------------------------------------------------
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- digit? [s :string i :i64] :bool
+  (if (>= (cp s i) 48) (if (<= (cp s i) 57) true false) false))
+
+(defn- digits? [s :string a :i64 b :i64] :bool
+  (if (>= a b) true (if (digit? s a) (digits? s (+ a 1) b) false)))
+
+(defn- num [s :string a :i64 b :i64] :i64
+  (if (>= a b) 0 (+ (* (num s a (- b 1)) 10) (- (cp s (- b 1)) 48))))
+
+(defn- ch? [s :string i :i64 c :i64] :bool
+  (if (= (cp s i) c) true false))
+
+;; --- the fixed part: YYYY-MM-DDTHH:MM:SS ------------------------------------
+
+(defn- shape-ok? [s :string] :bool
+  (if (< (string-length s) 20) false
+      (if (digits? s 0 4)
+        (if (ch? s 4 45)                                    ; '-'
+          (if (digits? s 5 7)
+            (if (ch? s 7 45)
+              (if (digits? s 8 10)
+                (if (ch? s 10 84)                           ; 'T'
+                  (if (digits? s 11 13)
+                    (if (ch? s 13 58)                       ; ':'
+                      (if (digits? s 14 16)
+                        (if (ch? s 16 58)
+                          (if (digits? s 17 19) true false)
+                          false)
+                        false)
+                      false)
+                    false)
+                  false)
+                false)
+              false)
+            false)
+          false)
+        false)))
+
+;; --- the tail: an optional fraction, then Z or an offset ---------------------
+;; Returns the offset in seconds to SUBTRACT, or the sentinel when the tail
+;; is not a legal one. A local time with no designator is rejected: RFC 3339
+;; requires the offset, and guessing one is how a relying party ends up
+;; accepting a message an hour out of its window.
+
+(defn- bad [] :i64 -8888888888888)
+
+(defn- fraction-end [s :string i :i64] :i64
+  (if (>= i (string-length s)) i (if (digit? s i) (fraction-end s (+ i 1)) i)))
+
+(defn- offset-seconds [s :string i :i64] :i64
+  ;; i points at 'Z', '+' or '-'.
+  (if (>= i (string-length s)) (bad)
+      (if (ch? s i 90)                                      ; 'Z'
+        (if (= (string-length s) (+ i 1)) 0 (bad))
+        (if (= (string-length s) (+ i 6))
+          (if (digits? s (+ i 1) (+ i 3))
+            (if (ch? s (+ i 3) 58)
+              (if (digits? s (+ i 4) (+ i 6))
+                (let [mag (+ (* (num s (+ i 1) (+ i 3)) 3600)
+                             (* (num s (+ i 4) (+ i 6)) 60))]
+                  (if (ch? s i 43) mag                      ; '+' is ahead of UTC
+                      (if (ch? s i 45) (- 0 mag) (bad))))
+                (bad))
+              (bad))
+            (bad))
+          (bad)))))
+
+(defn- tail-seconds [s :string] :i64
+  (if (ch? s 19 46)                                         ; '.'
+    (let [e (fraction-end s 20)]
+      (if (= e 20) (bad) (offset-seconds s e)))
+    (offset-seconds s 19)))
+
+;; --- the civil calendar -----------------------------------------------------
+;; Hinnant's days_from_civil, exact for any proleptic Gregorian date. Every
+;; year this grammar can express is positive, so truncating division is
+;; floor division throughout.
+
+(defn- mod-of [x :i64 y :i64] :i64 (- x (* y (quot x y))))
+
+(defn- days-from-civil [y0 :i64 m :i64 d :i64] :i64
+  (let [y (if (<= m 2) (- y0 1) y0)
+        era (quot y 400)
+        yoe (- y (* era 400))
+        mp (if (> m 2) (- m 3) (+ m 9))
+        doy (+ (quot (+ (* 153 mp) 2) 5) (- d 1))
+        doe (+ (- (+ (* yoe 365) (quot yoe 4)) (quot yoe 100)) doy)]
+    (- (+ (* era 146097) doe) 719468)))
+
+(defn- days-in-month [y :i64 m :i64] :i64
+  (if (= m 2)
+    (if (= (mod-of y 4) 0)
+      (if (= (mod-of y 100) 0) (if (= (mod-of y 400) 0) 29 28) 29)
+      28)
+    (if (= m 1) 31 (if (= m 3) 31 (if (= m 5) 31 (if (= m 7) 31
+      (if (= m 8) 31 (if (= m 10) 31 (if (= m 12) 31 30)))))))))
+
+;; --- an instant --------------------------------------------------------------
+
+(defn- raw-seconds [s :string] :i64
+  (if (shape-ok? s)
+    (let [y (num s 0 4) mo (num s 5 7) d (num s 8 10)
+          h (num s 11 13) mi (num s 14 16) sec (num s 17 19)
+          off (tail-seconds s)]
+      (if (= off (bad)) (bad)
+          (if (< mo 1) (bad)
+              (if (> mo 12) (bad)
+                  (if (< d 1) (bad)
+                      (if (> d (days-in-month y mo)) (bad)
+                          (if (> h 23) (bad)
+                              (if (> mi 59) (bad)
+                                  ;; 60 is a leap second, which RFC 3339
+                                  ;; allows and which no epoch-second count
+                                  ;; can represent. Refusing beats folding
+                                  ;; it silently onto the next minute.
+                                  (if (> sec 59) (bad)
+                                      (- (+ (* (days-from-civil y mo d) 86400)
+                                            (+ (* h 3600) (+ (* mi 60) sec)))
+                                         off))))))))))
+    (bad)))
+
+(defn instant-ok? [s :string] :bool
+  (if (= (raw-seconds s) (bad)) false true))
+
+(defn instant-seconds [s :string] :i64 (raw-seconds s))
+
+;; --- the window --------------------------------------------------------------
+
+(defn- absent? [s :string] :bool (if (= (string-length s) 0) true false))
+
+(defn problem [fields :document opts :document] :keyword
+  (let [iat-s (ds fields :issued-at)
+        exp-s (ds fields :expiration-time)
+        nbf-s (ds fields :not-before)
+        now (di opts :now-sec)
+        skew (di opts :clock-skew-sec)
+        max-age (di opts :max-age-sec)
+        iat (raw-seconds iat-s)
+        exp (raw-seconds exp-s)
+        nbf (raw-seconds nbf-s)]
+    (cond
+      (= iat (bad)) :invalid-issued-at
+      (> iat (+ now skew)) :issued-in-future
+      (> (- now iat) (+ max-age skew)) :message-too-old
+
+      (if (db opts :require-expiration?) (absent? exp-s) false)
+      :expiration-required
+
+      (if (absent? exp-s) false (if (= exp (bad)) true false))
+      :invalid-expiration-time
+
+      (if (absent? exp-s) false (if (<= exp iat) true false))
+      :invalid-expiration-window
+
+      (if (absent? exp-s) false (if (>= now (+ exp skew)) true false))
+      :expired
+
+      (if (absent? nbf-s) false (if (= nbf (bad)) true false))
+      :invalid-not-before
+
+      ;; The one `siwe.edge` does not make. Not Before at or after
+      ;; Expiration Time is a window that never opens, and the clock cannot
+      ;; be arranged to make it valid -- but the skew tolerance on each end
+      ;; leaves a band in which it verifies anyway.
+      (if (absent? nbf-s) false
+          (if (absent? exp-s) false (if (>= nbf exp) true false)))
+      :window-never-opens
+
+      (if (absent? nbf-s) false (if (< (+ now skew) nbf) true false))
+      :not-yet-valid
+
+      :else :none)))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the instant reader back over three spellings and answers 0 only when
+;; each still decides the way this object was built to decide, so a COMPILED
+;; artifact can be asked whether it is itself by a host that knows nothing
+;; about EIP-4361.
+;;
+;; The document-taking `problem` is deliberately NOT here: `main` takes no
+;; arguments, so it would have to build the fields itself, and a module's
+;; fuel is a private global baked in at compile time (512 by default) spent
+;; over the life of an INSTANCE. The suite calls `problem` with documents
+;; the host builds, which is both cheaper and closer to how a relying party
+;; would.
+
+(defn main [] :i64
+  (cond
+    (if (instant-ok? "2026-08-31T12:34:56Z") false true) 1
+    (if (instant-ok? "2016-12-31T23:59:60Z") true false) 2
+    (if (instant-ok? "2100-02-29T00:00:00Z") true false) 3
+    :else 0))

@@ -1,0 +1,235 @@
+;; `kotoba/saml/acceptance.kotoba` -- the service provider's side of a Web
+;; SSO exchange.
+;;
+;; ## There is no oracle, and that is the finding
+;;
+;; `saml.core` emits. Its README puts XML-DSig and inbound parsing outside
+;; the library, and `parse-attributes` says the host hands back an EDN
+;; assertion "after it has parsed and VERIFIED" one. A signature says the
+;; IdP minted the assertion; it does not say the IdP minted it for THIS
+;; service provider, for THIS login attempt, to be delivered HERE, and that
+;; it is valid NOW.
+;;
+;; `the-acceptance-decision-has-no-home-in-the-library` enumerates the
+;; public API and shows that no function takes an assertion and an
+;; expectation. That is a measurement, not a claim: if such a function is
+;; added, the test fails and someone has to decide which one is the
+;; decision.
+;;
+;; ## The emitter cannot produce an assertion a correct SP would accept
+;;
+;; Web SSO Profile §4.1.4.2: a bearer assertion MUST carry a
+;; `<SubjectConfirmation Method="...bearer">` whose
+;; `<SubjectConfirmationData>` names `Recipient`, `NotOnOrAfter`, and
+;; `InResponseTo` for a solicited response. `saml.core/assertion` emits a
+;; `<Subject>` containing a `<NameID>` and nothing else --
+;; `an-emitted-assertion-carries-no-subject-confirmation` reads the hiccup
+;; the library itself produced and shows the element is absent. An IdP
+;; built on this library emits assertions that a service provider doing its
+;; job has to reject, and the guest is what does the rejecting.
+;;
+;; The positive cases are built with `saml.core/response` and
+;; `saml.core/assertion` and read back out of the hiccup, so the shape the
+;; guest is driven with is the shape this library actually emits, not one
+;; the test invented.
+
+(ns saml.acceptance-kotoba-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [saml.acceptance-guest-document :refer [->doc]]
+            [saml.core :as saml]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "saml" "acceptance.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'saml.acceptance (slurp guest-file)}
+                                         'saml.acceptance :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(def ^:private sp "https://sp.example")
+(def ^:private acs "https://sp.example/acs")
+(def ^:private idp "https://idp.example")
+(def ^:private request-id "_req1")
+
+;; --- what the library emits, read back --------------------------------------------
+
+(defn- tag= [t form] (and (vector? form) (= t (first form))))
+
+(defn- find-tag
+  "Depth-first search of a hiccup form for the first element with tag `t`."
+  [t form]
+  (cond
+    (tag= t form) form
+    (vector? form) (some #(find-tag t %) (rest form))
+    :else nil))
+
+(defn- text [form] (last form))
+
+(defn- emitted
+  "Build a Response with the library and read back the EDN a host would hand
+  over after parsing and verifying it. Nothing here is invented: every
+  value comes out of hiccup `saml.core` produced."
+  [{:keys [audience issuer destination status-code]
+    :or {audience sp issuer idp destination acs}}]
+  (let [a (saml/assertion {:id "_a1" :issue-instant "2026-07-05T00:00:00Z"
+                           :issuer issuer :subject-name-id "alice@example.com"
+                           :conditions-not-before "2026-07-05T00:00:00Z"
+                           :conditions-not-on-or-after "2026-07-05T00:10:00Z"
+                           :audience audience
+                           :attributes {"email" ["alice@example.com"]}})
+        r (cond-> {:id "_resp1" :issue-instant "2026-07-05T00:00:00Z"
+                   :destination destination :issuer issuer :assertion a}
+            status-code (assoc :status-code status-code))
+        resp (saml/response r)]
+    {:hiccup resp
+     :observed {:status-code (:Value (second (find-tag :samlp:StatusCode resp)))
+                :response-destination (:Destination (second resp))
+                :assertion-issuer (text (find-tag :saml:Issuer (find-tag :saml:Assertion resp)))
+                :audience (text (find-tag :saml:Audience resp))
+                :name-id (text (find-tag :saml:NameID resp))
+                :conditions-present? (some? (find-tag :saml:Conditions resp))
+                ;; The host's clock, and the host's XML-DSig.
+                :signed? true :not-yet-valid? false :expired? false
+                :subject-confirmation-expired? false
+                ;; The emitter produces neither of these -- see
+                ;; `an-emitted-assertion-carries-no-subject-confirmation`.
+                ;; A host parsing a real IdP's response would fill them.
+                :recipient acs :in-response-to request-id}}))
+
+(def ^:private expected
+  {:audience sp :acs-url acs :idp-issuer idp :request-id request-id})
+
+(defn- guest [observed expectation]
+  (call 'problem [(->doc observed) (->doc expectation)]))
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+;; --- the finding: nothing decides this today ----------------------------------------
+
+(deftest the-acceptance-decision-has-no-home-in-the-library
+  (let [api (set (keys (ns-publics 'saml.core)))]
+    (is (= '#{authn-request assertion response render parse-attributes
+              samlp-xmlns saml-xmlns status-success}
+           api)
+        "the whole public surface: four builders, a renderer, and a
+         normalizer -- no function takes an assertion and an expectation")
+    (testing "and `parse-attributes`, the one function that touches an
+              inbound assertion, only renames keys"
+      (let [inbound {:audience "https://other.example" :attributes {:email ["a@b"]}}]
+        (is (= {:audience "https://other.example" :attributes {"email" ["a@b"]}}
+               (saml/parse-attributes inbound))
+            "an assertion minted for another service provider passes through
+             unchanged, because nothing here compares an audience")))))
+
+(deftest an-emitted-assertion-carries-no-subject-confirmation
+  ;; Web SSO Profile §4.1.4.2.
+  (let [{:keys [hiccup]} (emitted {})
+        a (find-tag :saml:Assertion hiccup)
+        subject (find-tag :saml:Subject a)]
+    (is (some? subject) "there is a Subject")
+    (is (= [:saml:NameID {} "alice@example.com"] (find-tag :saml:NameID subject))
+        "carrying a NameID")
+    (is (nil? (find-tag :saml:SubjectConfirmation a))
+        "and no SubjectConfirmation, so no Recipient, no InResponseTo and no
+         bearer NotOnOrAfter -- the three fields a service provider must
+         check are the three the emitter does not produce")
+    (testing "so an SP given exactly what this library emits refuses it"
+      (let [without (dissoc (:observed (emitted {})) :recipient :in-response-to)]
+        (is (= :missing-recipient (guest without expected)))))))
+
+;; --- the decision ---------------------------------------------------------------------
+
+(deftest an-assertion-addressed-to-this-service-provider-is-accepted
+  (is (= :none (guest (:observed (emitted {})) expected))))
+
+(deftest an-assertion-minted-for-another-service-provider-is-refused
+  ;; The classic SAML failure: two SPs trust the same IdP, and one replays
+  ;; the other's assertion. It is correctly signed, its Conditions are in
+  ;; force, and its issuer is the expected one.
+  (let [{:keys [observed]} (emitted {:audience "https://other.example"})]
+    (is (= "https://other.example" (:audience observed)))
+    (is (= :audience-mismatch (guest observed expected)))))
+
+(deftest an-assertion-nobody-asked-for-is-refused-unless-the-sp-opted-in
+  (let [observed (assoc (:observed (emitted {})) :in-response-to "")]
+    (is (= :unsolicited-response (guest observed expected)))
+    (testing "IdP-initiated SSO is a real mode, and it is asked for"
+      (is (= :none (guest observed (assoc expected :allow-unsolicited?  true)))))
+    (testing "and an InResponseTo from a different attempt is not the same event"
+      (is (= :in-response-to-mismatch
+             (guest (assoc (:observed (emitted {})) :in-response-to "_someone-elses")
+                    expected))))))
+
+(deftest an-assertion-delivered-somewhere-else-is-refused
+  (is (= :recipient-mismatch
+         (guest (assoc (:observed (emitted {})) :recipient "https://sp.example/other")
+                expected)))
+  (is (= :destination-mismatch
+         (guest (:observed (emitted {:destination "https://elsewhere.example/acs"}))
+                expected)))
+  (testing "a Response with no Destination is not a mismatch -- the attribute
+            is optional and its absence is not a claim about where to deliver"
+    (is (= :none (guest (assoc (:observed (emitted {})) :response-destination "")
+                        expected)))))
+
+(deftest the-response-envelope-is-read-before-the-assertion
+  (let [{:keys [observed]} (emitted {:status-code "urn:oasis:names:tc:SAML:2.0:status:Requester"})]
+    (is (= :status-not-success (guest observed expected))
+        "a Response that failed still carries an assertion element"))
+  (is (= :unsigned (guest (assoc (:observed (emitted {})) :signed? false) expected))
+      "and an unsigned one is refused before anything is compared")
+  (is (= :issuer-mismatch
+         (guest (:observed (emitted {:issuer "https://other-idp.example"})) expected))))
+
+(deftest an-assertion-that-authenticates-nobody-is-refused
+  ;; Every other check can pass and the response still names no subject.
+  ;; The discrimination pass is what found this missing: breaking the
+  ;; `:missing-name-id` clause reddened nothing until this test existed.
+  (is (= :missing-name-id
+         (guest (assoc (:observed (emitted {})) :name-id "") expected))))
+
+(deftest an-assertion-with-no-conditions-is-a-bearer-token-with-no-scope
+  (is (= :missing-conditions
+         (guest (assoc (:observed (emitted {})) :conditions-present? false) expected))))
+
+(deftest the-window-arrives-decided-and-both-directions-are-honoured
+  ;; Stated plainly because it is a limit of the toolchain rather than of
+  ;; the decision: a single-file guest cannot reach a shared RFC 3339
+  ;; parser (ADR-2608302100), and writing a second one is how a check
+  ;; implemented twice begins.
+  (is (= :not-yet-valid (guest (assoc (:observed (emitted {})) :not-yet-valid? true) expected)))
+  (is (= :expired (guest (assoc (:observed (emitted {})) :expired? true) expected)))
+  (is (= :subject-confirmation-expired
+         (guest (assoc (:observed (emitted {})) :subject-confirmation-expired? true)
+                expected))))
+
+(deftest an-expectation-the-service-provider-did-not-supply-is-not-satisfied
+  (let [observed (:observed (emitted {}))]
+    (doseq [k [:audience :acs-url :idp-issuer :request-id]]
+      (is (= :expectation-missing (guest observed (dissoc expected k))) (str k)))
+    (testing "except that a request ID is not required once the SP has said
+              it accepts unsolicited responses"
+      (is (= :none (guest (assoc observed :in-response-to "")
+                          (-> expected (dissoc :request-id)
+                              (assoc :allow-unsolicited? true))))))
+    (testing "but an InResponseTo naming a request this SP has no record of is
+              still refused -- Web SSO Profile §4.1.4.3 requires the SP to
+              match it, and accepting unsolicited responses is not the same
+              as accepting an answer to somebody else's question"
+      (is (= :in-response-to-mismatch
+             (guest observed (-> expected (dissoc :request-id)
+                                 (assoc :allow-unsolicited? true))))))))
+
+(deftest the-default-budget-still-suffices
+  ;; Measured in both directions rather than guessed.
+  (is (= :none (guest (:observed (emitted {})) expected)))
+  (is (thrown? Exception
+               (call 'problem [(->doc (:observed (emitted {}))) (->doc expected)] 16))
+      "and sixteen is not enough, so the assertion above is not vacuous"))

@@ -1,0 +1,228 @@
+;; The OpenID Connect ID Token claim decision, as a Kotoba application
+;; (ADR-2608261100) — OIDC Core §3.1.3.7.
+;;
+;;   init         (config)        -> state
+;;   offer-now    (state, epoch)  -> state   ; the host read the clock
+;;   offer-claims (state, claims) -> state
+;;
+;; ## Time is a capability, so the guest is TOLD it
+;;
+;; `oidc.core/validate-id-token-claims` reads the system clock inline when
+;; the caller does not pass `:now`. A guest cannot and must not: a clock is
+;; ambient authority, and reading one is exactly the kind of thing the
+;; `:no-ambient-authority` invariant exists to prevent
+;; (adr-2608301500).
+;;
+;; That turns a convenience into a decision, and the decision goes the
+;; strict way: **a validator that was never told the time refuses.** It does
+;; not skip the expiry check and report the rest as valid. Reporting "valid"
+;; for a token whose expiry was never examined is the failure this whole
+;; workspace keeps finding — a check that could not run returning the same
+;; answer as a check that ran and passed (ADR-2608136000).
+;; `without-a-clock-the-answer-is-refusal` is the control.
+;;
+;;   the guest owns   every §3.1.3.7 claim rule, and what a missing input
+;;                    means
+;;   the host owns    the clock, the signature, base64url and JSON
+;;
+;; ## The rule this library does not have
+;;
+;; §3.1.3.7 steps 4 and 5:
+;;
+;;   4. If the ID Token contains multiple audiences, the Client SHOULD
+;;      verify that an `azp` Claim is present.
+;;   5. If an `azp` Claim is present, the Client SHOULD verify that its
+;;      client_id is the Claim Value.
+;;
+;; Measured on this repo at 97bd583: `azp` appears nowhere in `src/`,
+;; `test/` or the README. A token issued for several clients and presented
+;; to one of them passes `aud` and says nothing about who it was actually
+;; for — which is the case those two steps exist for, and the only case
+;; where they bite.
+;;
+;; So this guest checks them, and `oidc.core` did not grow a second copy: a
+;; security check implemented twice is one that will diverge once
+;; (ADR-2608261100).
+;;
+;; ## Errors accumulate
+;;
+;; Like the oracle, every rule is evaluated and every failure is reported,
+;; rather than stopping at the first. A caller debugging a broken
+;; integration wants all of them, and a caller enforcing wants only
+;; `valid?` — which is `no errors`, not `no errors I bothered to look for`.
+;;
+;; `.cljc` remains the oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/oidc/id_token.kotoba \
+;;     --target wasm32-browser --output id_token.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 5817-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns oidc.id-token
+  (:export [init offer-now offer-claims
+            phase valid? error-count error-at has-error?
+            audience-count now-seconds leeway]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- dv [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-vector)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-str [v :document i :i64] :string
+  (option-value-of [:option :string] (document-string-value (at v i)) ""))
+
+;; --- errors ---------------------------------------------------------------
+;; Accumulated, not short-circuited: `valid?` must mean "no errors", not
+;; "no errors I bothered to look for".
+
+(defn- has-error-from? [errors :document why :keyword i :i64] :bool
+  (cond
+    (>= i (document-count errors)) false
+    (= (option-value-of [:option :keyword]
+                        (document-keyword-value
+                         (option-value-of [:option :document]
+                                          (document-vector-at errors i)
+                                          (document-null)))
+                        :none)
+       why) true
+    :else (has-error-from? errors why (+ i 1))))
+
+(defn- add-error [state :document why :keyword] :document
+  (document-assoc state :errors
+                  (document-vector-conj (dv state :errors)
+                                        (document-keyword why))))
+
+;; --- state ----------------------------------------------------------------
+
+(defn init [config :document] :document
+  (let [l (di config :leeway)]
+    (document-map :phase (document-keyword :want-claims)
+                  :issuer (document-string (ds config :issuer))
+                  :audience (document-string (ds config :audience))
+                  :nonce (document-string (ds config :nonce))
+                  :leeway (document-i64 (if (>= l 0) l 60))
+                  :now (document-i64 -1)
+                  :has-now (document-bool false)
+                  :aud-count (document-i64 -1)
+                  :errors (document-vector))))
+
+;; The host read the clock and says what time it is. Seconds since the
+;; epoch, because that is what `exp` and `iat` are (§2).
+(defn offer-now [state :document epoch-seconds :i64] :document
+  (document-assoc
+   (document-assoc state :now (document-i64 epoch-seconds))
+   :has-now (document-bool true)))
+
+;; --- the claim rules (§3.1.3.7) -------------------------------------------
+
+(defn- audience-listed? [auds :document want :string i :i64] :bool
+  (cond
+    (>= i (document-count auds)) false
+    (string=? (at-str auds i) want) true
+    :else (audience-listed? auds want (+ i 1))))
+
+;; `claims`: `:iss`, `:aud` (a vector of strings -- the host normalises the
+;; single-string form, which is JSON shape and not a decision), `:azp`,
+;; `:exp`, `:iat`, `:nonce`.
+(defn offer-claims [state :document claims :document] :document
+  (if (not (= (dk state :phase) :want-claims))
+    state
+    (let [auds (dv claims :aud)
+          n (document-count auds)
+          azp (ds claims :azp)
+          exp (di claims :exp)
+          iat (di claims :iat)
+          leeway (di state :leeway)
+          now (di state :now)
+          expected-nonce (ds state :nonce)
+          s0 (document-assoc state :aud-count (document-i64 n))
+
+          ;; §3.1.3.7 step 2.
+          s1 (if (string=? (ds claims :iss) (ds state :issuer))
+               s0 (add-error s0 :iss-mismatch))
+
+          ;; step 3.
+          s2 (if (audience-listed? auds (ds state :audience) 0)
+               s1 (add-error s1 :aud-mismatch))
+
+          ;; step 4: multiple audiences require an azp. This is the rule the
+          ;; library does not have, and the only case it bites is the one it
+          ;; exists for -- a token minted for several clients.
+          s3 (if (and (> n 1) (string=? azp ""))
+               (add-error s2 :azp-required) s2)
+
+          ;; step 5: an azp that IS present must name us, however many
+          ;; audiences there are.
+          s4 (if (and (not (string=? azp ""))
+                      (not (string=? azp (ds state :audience))))
+               (add-error s3 :azp-mismatch) s3)
+
+          ;; steps 9 and 10 need a clock. Without one they cannot be
+          ;; evaluated, and an unevaluated expiry check must not read as a
+          ;; passed one.
+          s5 (cond
+               (not (db state :has-now)) (add-error s4 :time-unknown)
+               (< exp 0) (add-error s4 :expired)
+               (< (+ exp leeway) now) (add-error s4 :expired)
+               :else s4)
+
+          s6 (if (and (db state :has-now) (>= iat 0) (> iat (+ now leeway)))
+               (add-error s5 :iat-in-future) s5)
+
+          ;; step 11.
+          s7 (if (and (not (string=? expected-nonce ""))
+                      (not (string=? expected-nonce (ds claims :nonce))))
+               (add-error s6 :nonce-mismatch) s6)]
+      (document-assoc s7 :phase (document-keyword :decided)))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+;; No errors, and only after a decision was actually made. An undecided
+;; validator is not a passing one.
+(defn valid? [state :document] :bool
+  (and (= (dk state :phase) :decided)
+       (= (document-count (dv state :errors)) 0)))
+
+(defn error-count [state :document] :i64 (document-count (dv state :errors)))
+
+(defn error-at [state :document i :i64] :keyword
+  (option-value-of [:option :keyword]
+                   (document-keyword-value (at (dv state :errors) i))
+                   :none))
+
+(defn has-error? [state :document why :keyword] :bool
+  (has-error-from? (dv state :errors) why 0))
+
+(defn audience-count [state :document] :i64 (di state :aud-count))
+
+(defn now-seconds [state :document] :i64 (di state :now))
+
+(defn leeway [state :document] :i64 (di state :leeway))

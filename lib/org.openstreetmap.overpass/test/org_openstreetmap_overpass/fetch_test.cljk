@@ -1,0 +1,220 @@
+(ns org-openstreetmap-overpass.fetch-test
+  "`fetch.cljs` の検査。**ネットワークには一度も出ない。**
+
+  この ns が守っているのは、README と `fetch` の docstring が『共有インフラへの
+  節度』として名乗っている 3 つ —— 識別可能な User-Agent・呼び出し間隔・
+  『1 度だけ』の retry —— が、いま本当にそう動くか。
+
+  名乗りを実際に叩いて確かめる形にはできない: Overpass は無償の共有インフラで、
+  『連打しないことの検査』のために連打するのは本末転倒だからである。だから
+  送信そのもの（`:fetch-fn`）と retry の待ち（`:retry-delay-ms`）を差し替えて、
+  **記録された呼び出しの列**に対して主張する。"
+  (:require [kotoba.test :refer [deftest is testing async]]
+            [kotoba.lang.text :as str]
+            [org-openstreetmap-overpass.core :as core]
+            [org-openstreetmap-overpass.fetch :as f]))
+
+(def tokyo {:south 35.6800 :west 139.7650 :north 35.6830 :east 139.7690})
+
+(defn- res
+  "最小の Response 代役。`ok` は実物と同じく status から導く（手で渡せる形に
+  すると、200 なのに ok=false のような実在しない応答を検査できてしまう）。"
+  ([status] (res status {"elements" []}))
+  ([status body]
+   #js {:ok (< 199 status 300)
+        :status status
+        :json (fn [] (js/Promise.resolve (clj->js body)))}))
+
+(defn- recorder
+  "呼ばれた回数・引数・時刻を記録する fetch 代役。`responses` は 1 回目・
+  2 回目…に返す Response の列で、尽きたら最後のものを繰り返す。"
+  [responses]
+  (let [calls (atom [])]
+    {:calls calls
+     :fetch-fn (fn [url init]
+                 (let [n (count @calls)]
+                   (swap! calls conj {:url url :init init :at (.getTime (js/Date.))})
+                   (js/Promise.resolve (nth responses n (last responses)))))}))
+
+(defn- header [call h] (aget (.-headers (:init call)) h))
+(defn- body-of [r] (.-body (:init (first @(:calls r)))))
+
+(def ^:private quiet
+  "テスト同士が既定の 1200ms で待ち合わないための最小 opts。
+
+  **`:endpoint` を discard port に倒してあるのは、この ns の『ネットワークに
+  出ない』を偶然ではなく構造にするため。** `:fetch-fn` を渡しているので通常は
+  誰も dial しないが、`:fetch-fn` を落とす退行（mutation で実演済み）が入ると
+  本物の `js/fetch` が**既定の endpoint = 本番の Overpass** を叩く —— 連打
+  しないことの検査が連打になる。既定を潰しておけば、その退行は接続拒否で
+  即座に赤くなるだけで、共有インフラには届かない。"
+  {:min-interval-ms 0 :retry-delay-ms 0 :endpoint "http://127.0.0.1:9/overpass"})
+
+(defn- opts [r & {:as extra}]
+  (merge quiet {:fetch-fn (:fetch-fn r)} extra))
+
+(defn- err-data
+  "拒否された理由の ex-data。**cause の鎖を辿る。**
+
+  nbb(sci) は投げられた例外を包むので、rejection の `ex-data` は
+  `{:type :sci/error …}` になり、`ex-info` に渡した map は `:cause` の側に居る
+  （実測 2026-09-03）。`(ex-data e)` だけを見る形は sci の下でだけ nil を返し、
+  『status が違う』ではなく『status が無い』として落ちる —— 包み方は実行系の
+  都合なので、この検査がそれに縛られないように鎖を辿る。"
+  [e]
+  (loop [x e n 0]
+    (when (and x (< n 5))
+      (let [d (ex-data x)]
+        (if (contains? d :status) d (recur (ex-cause x) (inc n)))))))
+
+(defn- unexpected
+  "async テストの `.then` に reject 側を付けないと、想定外の rejection は
+  **どのテストのものとも分からないまま node を落とす**（実測 2026-09-03:
+  retry が `:fetch-fn` を落とす退行を当てたとき、本物の fetch が失敗して
+  プロセスが死に、`Ran N tests` の行ごと出力から消えた）。落ちること自体は
+  exit≠0 で分かるが、**どの検査が何を待っていたのかが消える**。だから全部の
+  async テストがこれを付けて、想定外を自分の名前で報告する。"
+  [done label]
+  (fn [e] (is false (str label " —— 想定外の rejection: " (or (ex-message e) e))) (done)))
+
+;; ── 名乗り（匿名の連打をしない）───────────────────────────────────────
+
+(deftest the-default-endpoint-is-the-real-one
+  (testing "上の quiet が既定を潰しているので、既定そのものはここで固定する"
+    (is (= "https://overpass-api.de/api/interpreter" core/default-endpoint))
+    (is (some #{core/default-endpoint} core/mirrors)
+        "既定は mirrors の 1 つでなければならない")))
+
+(deftest every-request-identifies-itself
+  (async done
+    (let [r (recorder [(res 200)])]
+      (-> (f/post-ql "[out:json];" (opts r))
+          (.then (fn [_]
+                   (let [c (first @(:calls r))]
+                     (is (= "POST" (.-method (:init c))))
+                     (is (= "[out:json];" (.-body (:init c))))
+                     (testing "User-Agent は空でなく、どの repo からの通信か分かる"
+                       (is (= f/default-user-agent (header c "User-Agent")))
+                       (is (str/includes? (str (header c "User-Agent"))
+                                          "org-openstreetmap-overpass")))
+                     (is (str/includes? (str (header c "Content-Type")) "text/plain"))
+                     (done)))
+                 (unexpected done "every-request-identifies-itself"))))))
+
+;; ── retry は「1 度だけ」──────────────────────────────────────────────
+
+(deftest a-retryable-status-is-retried-exactly-once
+  (testing "429 が続いても 2 回で諦める —— 無限 retry で叩き続けない"
+    (async done
+      (let [r (recorder [(res 429) (res 429) (res 429)])]
+        (-> (f/post-ql "[out:json];" (opts r))
+            (.then (fn [_] (is false "429 が 2 回続いたのに解決した") (done))
+                   (fn [e]
+                     (is (= 2 (count @(:calls r))))
+                     (is (= 429 (:status (err-data e))))
+                     (done))))))))
+
+(deftest a-non-retryable-status-is-not-retried
+  (testing "400 は待っても同じ答えが返る。2 度目を叩くだけ無作法"
+    (async done
+      (let [r (recorder [(res 400) (res 200)])]
+        (-> (f/post-ql "[out:json];" (opts r))
+            (.then (fn [_] (is false "400 が解決した") (done))
+                   (fn [e]
+                     (is (= 1 (count @(:calls r))))
+                     (is (= 400 (:status (err-data e))))
+                     (done))))))))
+
+(deftest a-server-error-that-will-not-heal-is-not-retried
+  (testing "500 は retryable の集合に入っていない（502/503/504 は過負荷、500 は不具合）"
+    (async done
+      (let [r (recorder [(res 500) (res 200)])]
+        (-> (f/post-ql "[out:json];" (opts r))
+            (.then (fn [_] (is false "500 が解決した") (done))
+                   (fn [_] (is (= 1 (count @(:calls r)))) (done))))))))
+
+(deftest the-retry-recovers-when-the-second-answer-is-good
+  (async done
+    (let [r (recorder [(res 503)
+                       (res 200 {"elements" [{"type" "node" "id" 1 "lat" 35.68 "lon" 139.77
+                                              "tags" {"power" "pole"}}]})])]
+      (-> (f/post-ql "[out:json];" (opts r))
+          (.then (fn [out]
+                   (is (= 2 (count @(:calls r))))
+                   (is (= 1 (count (:observations out))))
+                   (is (= :utility-pole (:obs/kind (first (:observations out)))))
+                   (done))
+                 (unexpected done "the-retry-recovers-when-the-second-answer-is-good"))))))
+
+(deftest the-retry-carries-the-options-it-was-given
+  ;; **この test の赤は「2 回目が別の呼び出しになった」を意味する。**
+  ;; retry 経路が opts を手で並べ直す形だと、新しい option を足した人がそこへの
+  ;; 追加を忘れ、1 回目と 2 回目で挙動の違う呼び出しになる —— 既定へ黙って
+  ;; 落ちるので、成功したように見える。
+  (async done
+    (let [classify (fn [tags] (when (= "billboard" (get tags "advertising")) :billboard))
+          r (recorder [(res 503)
+                       (res 200 {"elements" [{"type" "node" "id" 9 "lat" 35.68 "lon" 139.77
+                                              "tags" {"advertising" "billboard"}}]})])]
+      (-> (f/post-ql "[out:json];" (opts r :parse-opts {:classify classify :attr :obs/medium}))
+          (.then (fn [out]
+                   (is (= 2 (count @(:calls r))) "2 回目も差し替えた fetch を通った")
+                   (testing ":parse-opts が retry を越えて生きている"
+                     (is (= [:billboard] (mapv :obs/medium (:observations out)))))
+                   (done))
+                 (unexpected done "the-retry-carries-the-options-it-was-given"))))))
+
+;; ── 呼び出し間隔（節度）──────────────────────────────────────────────
+
+(deftest successive-calls-are-spaced-apart
+  (testing "間隔は主張ではなく、記録された 2 つの時刻の差として測る"
+    (async done
+      (let [gap 140
+            r (recorder [(res 200)])]
+        (-> (f/post-ql "[out:json];" (opts r :min-interval-ms gap))
+            (.then (fn [_] (f/post-ql "[out:json];" (opts r :min-interval-ms gap))))
+            (.then (fn [_]
+                     (let [[a b] @(:calls r)
+                           observed (- (:at b) (:at a))]
+                       (is (= 2 (count @(:calls r))))
+                       (is (>= observed 100)
+                           (str "2 回目が " observed "ms しか空けずに飛んだ（要求 " gap "ms）"))
+                       (done)))
+                   (unexpected done "successive-calls-are-spaced-apart")))))))
+
+;; ── 2 つの入口が QL に渡すもの ────────────────────────────────────────
+
+(deftest fetch-poles-is-the-narrow-entry-and-stays-narrow
+  (async done
+    (let [r (recorder [(res 200)])]
+      (-> (f/fetch-poles tokyo (opts r :timeout 9 :nwr? true :meta? true
+                                    :selectors [["advertising" "billboard"]]))
+          (.then (fn [_]
+                   (let [q (body-of r)]
+                     (is (str/includes? q "[out:json][timeout:9]") ":timeout は届く")
+                     (is (str/includes? q "node[\"power\"=\"pole\"]") "電柱の既定で引く")
+                     (testing "feature 専用の option はこの入口では QL に届かない"
+                       (is (not (str/includes? q "nwr[")))
+                       (is (not (str/includes? q "meta")))
+                       (is (not (str/includes? q "advertising"))))
+                     (done)))
+                 (unexpected done "fetch-poles-is-the-narrow-entry-and-stays-narrow"))))))
+
+(deftest fetch-features-forwards-the-feature-options
+  (async done
+    (let [r (recorder [(res 200)])]
+      (-> (f/fetch-features tokyo (opts r :selectors [["shop"]] :nwr? true :meta? true))
+          (.then (fn [_]
+                   (let [q (body-of r)]
+                     (is (str/includes? q "nwr[\"shop\"]"))
+                     (is (str/includes? q "out center meta;"))
+                     (testing "呼び出し側が選択子を渡したら電柱の既定は混ざらない"
+                       (is (not (str/includes? q "power"))))
+                     (done)))
+                 (unexpected done "fetch-features-forwards-the-feature-options"))))))
+
+(deftest an-invalid-bbox-never-reaches-the-network
+  (testing "拒否は core 側で起きる。壊れた bbox で共有インフラを叩かない"
+    (let [r (recorder [(res 200)])]
+      (is (thrown? js/Error (f/fetch-poles {:south 36 :west 139 :north 35 :east 140} (opts r))))
+      (is (= 0 (count @(:calls r)))))))

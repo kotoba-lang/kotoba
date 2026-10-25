@@ -1,0 +1,349 @@
+(ns xmile.kotoba-simulation-parity-test
+  "Parity gate for the STEP: `xmile.execute` against the Kotoba simulation core
+  in `kotoba/xmile_expr_core.kotoba`.
+
+  The two sibling gates cover the equation language -- the scalar operations,
+  then the walk over an expression tree. This one covers what a simulator does
+  with them: evaluate the non-stock variables in dependency order (clamping
+  each), take a stock's inflows minus its outflows, and advance by Euler or
+  classical RK4.
+
+  HOW IT IS CHECKED. Not step-by-step against a private function, and not
+  against numbers written down here. `run-through-the-port` below is
+  `xmile.execute/run`'s own loop with its four numeric operations replaced by
+  the port, and the assertion is that the whole trajectory comes out the same
+  as `xmile.execute/run` -- every recorded variable, at every recorded time.
+  A model simulated for 40 steps compares 40 rows, so a defect in the step
+  arithmetic cannot hide in a single row.
+
+  EXACT, FOR MOST OF IT. Models whose equations contain no transcendental are
+  compared with `=`, not a tolerance -- including the RK4 ones. That is only
+  possible because the port keeps the .cljc's floating-point association order
+  (`y + (dt/6)((k1 + 2k2) + 2k3 + k4)` built from four `scale-add`s), and it is
+  the strongest statement available here: 40 steps of RK4 over a stiff-ish
+  system agreeing bit-for-bit is not something a nearly-right implementation
+  does.
+
+  WHAT IS NOT PORTED, and so is used from `xmile.execute` here rather than
+  reimplemented: `desugar-delays`, `topo-order`, `constant-names`,
+  `constant-env`, `initial-stocks`, and the time loop and series accumulation.
+  Deriving the evaluation order is a graph colouring over the model that also
+  proves there is no algebraic loop -- a different kind of claim from anything
+  the port makes, and deliberately still `.cljc`."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [xmile.execute :as execute]
+            [xmile.expr :as expr]
+            [xmile.model :as m]))
+
+(def ^:private port-source (slurp "lib/org.oasisOpen.xmile/kotoba/xmile_expr_core.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source port-source :wasm32-kotoba-v1 {}))))
+
+(defn- port [f & args] (ir/execute @kir f (vec args)))
+
+(defn- unwrap
+  "A `[:result T :string]` from the port, or a failing assertion naming why."
+  [r context]
+  (if (first r)
+    (second r)
+    (throw (ex-info (str "port failed in " context ": " (second r)) {:context context}))))
+
+;; --- moving a model across ---------------------------------------------------
+
+(def ^:private binary-heads
+  #{:add :sub :mul :div :mod :pow :lt :le :gt :ge :eq :ne :and :or})
+
+(defn- ->tree [e]
+  (let [head (first e)]
+    (cond
+      (= head :num) (port 'num-of (double (second e)))
+      (= head :ref) (port 'var-of (second e))
+      (contains? #{:neg :not} head) (port 'app1-of (name head) (->tree (nth e 1)))
+      (contains? binary-heads head) (port 'app2-of (name head)
+                                          (->tree (nth e 1)) (->tree (nth e 2)))
+      (= head :if) (port 'app3-of "if" (->tree (nth e 1))
+                         (->tree (nth e 2)) (->tree (nth e 3)))
+      (= head :call)
+      (let [fn-name (second e) args (mapv ->tree (nth e 2))]
+        (case (count args)
+          0 (port 'app0-of fn-name)
+          1 (port 'app1-of fn-name (nth args 0))
+          2 (port 'app2-of fn-name (nth args 0) (nth args 1))
+          3 (port 'app3-of fn-name (nth args 0) (nth args 1) (nth args 2))
+          (throw (ex-info "arity outside the port's tree" {:fn fn-name}))))
+      :else (throw (ex-info "unknown expr head" {:expr e})))))
+
+(defn- ->env [env]
+  (reduce (fn [acc [k v]] (port 'env-put acc k (double v))) (port 'env-empty) env))
+
+(defn- <-env
+  "The port's environment back as {name -> double}, for comparison."
+  [names env]
+  (into {} (map (fn [n] [n (unwrap (port 'env-get env n) (str "env-get " n))]) names)))
+
+(defn- ->names
+  "A seq of names as the port's list. The ORDER is preserved deliberately: the
+  .cljc sums `(reduce + 0.0 (map #(get env %) inflows))` over the set's own
+  iteration order, and floating-point addition is not associative, so a
+  three-inflow stock only agrees bit-for-bit if both sides add in one order."
+  [names]
+  (reduce (fn [tail n] (port 'names-cons n tail)) (port 'names-end) (reverse names)))
+
+(defn- equation-of [v]
+  (let [eqn (:xmile/eqn v)] (if (string? eqn) (expr/parse eqn) eqn)))
+
+;; --- xmile.execute/run, with its numeric operations replaced -----------------
+;; This is `run`'s own loop. What changed is that every number in it now comes
+;; out of the port: the per-variable evaluation and clamp (`eval-into`), the
+;; inflow/outflow sums and their difference (`derivative-of`), the Euler and
+;; RK4 state updates (`advance`), the RK4 weighting (`rk4-weight`) and the
+;; end-of-step stock clamp (`clamp-non-negative`). What did not change is the
+;; iteration and the ordering, which are `.cljc` on purpose -- see the port's
+;; own header for the measured reason.
+
+(defn- run-through-the-port [model]
+  (let [{desugared :xmile/model} (execute/desugar-delays model)
+        ss (:xmile/sim-specs desugared)
+        start (:xmile/start ss) stop (:xmile/stop ss) dt (:xmile/dt ss 1.0)
+        method (:xmile/method ss :euler)
+        order (execute/topo-order desugared)
+        cnames (execute/constant-names desugared order)
+        cenv (execute/constant-env desugared order cnames)
+        dyn-order (vec (remove cnames order))
+        steps (long (Math/round (double (/ (- stop start) dt))))
+        var-names (m/variable-names model)
+        plan (mapv (fn [nm]
+                     (let [v (m/lookup desugared nm)]
+                       {:name nm
+                        :tree (->tree (equation-of v))
+                        :non-negative (boolean (:xmile/non-negative? v))}))
+                   dyn-order)
+        stocks (mapv (fn [s]
+                       {:name (:xmile/name s)
+                        :inflows (->names (seq (:xmile/inflows s)))
+                        :outflows (->names (seq (:xmile/outflows s)))
+                        :non-negative (boolean (:xmile/non-negative? s))})
+                     (m/stocks desugared))
+        stock-names (mapv :name stocks)
+        evaluate (fn [stock-vals t]
+                   (reduce (fn [env {:keys [name tree non-negative]}]
+                             (unwrap (port 'eval-into name tree non-negative env)
+                                     (str "eval-into " name)))
+                           (->env (merge {"TIME" t "DT" dt} cenv stock-vals))
+                           plan))
+        slopes (fn [env]
+                 (into {} (map (fn [{:keys [name inflows outflows]}]
+                                 [name (unwrap (port 'derivative-of inflows outflows env)
+                                               (str "derivative-of " name))])
+                               stocks)))
+        advance-all (fn [base k scale]
+                      (into {} (map (fn [nm]
+                                      [nm (port 'advance (get base nm)
+                                                (get k nm 0.0) (double scale))])
+                                    stock-names)))
+        step (fn [stock-vals t]
+               (let [k1 (slopes (evaluate stock-vals t))]
+                 (if (= method :euler)
+                   (advance-all stock-vals k1 dt)
+                   (let [y2 (advance-all stock-vals k1 (/ dt 2.0))
+                         k2 (slopes (evaluate y2 (+ t (/ dt 2.0))))
+                         y3 (advance-all stock-vals k2 (/ dt 2.0))
+                         k3 (slopes (evaluate y3 (+ t (/ dt 2.0))))
+                         y4 (advance-all stock-vals k3 dt)
+                         k4 (slopes (evaluate y4 (+ t dt)))
+                         weighted (into {} (map (fn [nm]
+                                                  [nm (port 'rk4-weight
+                                                            (get k1 nm 0.0) (get k2 nm 0.0)
+                                                            (get k3 nm 0.0) (get k4 nm 0.0))])
+                                                stock-names))]
+                     (advance-all stock-vals weighted (/ dt 6.0))))))
+        clamp (fn [stock-vals]
+                (into {} (map (fn [{:keys [name non-negative]}]
+                                [name (port 'clamp-non-negative non-negative
+                                            (get stock-vals name))])
+                              stocks)))]
+    (loop [i 0 stock-vals (execute/initial-stocks desugared) times [] rows []]
+      (let [t (+ start (* i dt))
+            env (<-env (concat var-names stock-names) (evaluate stock-vals t))]
+        (if (= i steps)
+          {:xmile/times (conj times t)
+           :xmile/series (into {} (for [nm var-names]
+                                    [nm (mapv #(get % nm) (conj rows env))]))}
+          (recur (inc i) (clamp (step stock-vals t)) (conj times t) (conj rows env)))))))
+
+;; --- models ------------------------------------------------------------------
+
+(def ^:private bathtub
+  (-> (m/model "bathtub" {:xmile/sim-specs (m/sim-specs 0.0 40.0 {:xmile/dt 1.0})})
+      (m/add-variable (m/stock "Inventory" "100"
+                               {:xmile/inflows #{"Production"}
+                                :xmile/outflows #{"Shipping"}}))
+      (m/add-variable (m/flow "Production" "10"))
+      (m/add-variable (m/flow "Shipping" "Inventory / 4"))))
+
+(def ^:private two-stock-rk4
+  (-> (m/model "predator-prey-ish"
+               {:xmile/sim-specs (m/sim-specs 0.0 20.0 {:xmile/dt 0.25
+                                                        :xmile/method :rk4})})
+      (m/add-variable (m/stock "Prey" "100" {:xmile/inflows #{"Births"}
+                                             :xmile/outflows #{"Predation"}}))
+      (m/add-variable (m/stock "Predators" "10" {:xmile/inflows #{"PredBirths"}
+                                                 :xmile/outflows #{"PredDeaths"}}))
+      (m/add-variable (m/aux "BirthRate" "0.5"))
+      (m/add-variable (m/aux "PredationRate" "0.02"))
+      (m/add-variable (m/flow "Births" "Prey * BirthRate"))
+      (m/add-variable (m/flow "Predation" "Prey * Predators * PredationRate"))
+      (m/add-variable (m/flow "PredBirths" "Predation * 0.1"))
+      (m/add-variable (m/flow "PredDeaths" "Predators * 0.3"))))
+
+(def ^:private three-inflow-clamped
+  ;; Three inflows into one stock exercises the summation ORDER. The clamps
+  ;; are exercised with values that are actually negative -- `Drain` is
+  ;; `Tank - 3` on a tank that starts at 1, so the clamp is the only reason it
+  ;; is not negative, and `Sink` is drained faster than it can supply, so the
+  ;; stock clamp is the only reason it does not go below zero. Without that,
+  ;; `max(0, x)` and `abs(x)` agree on every value the model produces and the
+  ;; gate cannot tell a correct clamp from a wrong one -- measured, by making
+  ;; exactly that substitution and watching this test stay green.
+  (-> (m/model "clamped" {:xmile/sim-specs (m/sim-specs 0.0 15.0 {:xmile/dt 0.5})})
+      (m/add-variable (m/stock "Tank" "1"
+                               {:xmile/inflows #{"A" "B" "C"}
+                                :xmile/outflows #{"Drain"}
+                                :xmile/non-negative? true}))
+      (m/add-variable (m/flow "A" "0.1"))
+      (m/add-variable (m/flow "B" "0.2"))
+      (m/add-variable (m/flow "C" "TIME * 0.03"))
+      (m/add-variable (m/flow "Drain" "Tank - 3" {:xmile/non-negative? true}))
+      ;; Drained faster than supplied: without the stock clamp this goes
+      ;; negative on the first step and stays there.
+      (m/add-variable (m/stock "Sink" "1" {:xmile/inflows #{"Trickle"}
+                                           :xmile/outflows #{"Gush"}
+                                           :xmile/non-negative? true}))
+      (m/add-variable (m/flow "Trickle" "0.05"))
+      (m/add-variable (m/flow "Gush" "4"))))
+
+(def ^:private with-step-and-smooth
+  ;; STEP reads TIME out of the environment; SMTH1 makes `desugar-delays` add a
+  ;; hidden stock, so the plan the port walks is not the one the model declares.
+  (-> (m/model "perceived" {:xmile/sim-specs (m/sim-specs 0.0 30.0
+                                                          {:xmile/dt 0.1
+                                                           :xmile/method :rk4})})
+      (m/add-variable (m/aux "Perceived_Rate" "SMTH1(STEP(10, 2), 3)"))
+      (m/add-variable (m/stock "Accumulated" "0" {:xmile/inflows #{"Inflow"}}))
+      (m/add-variable (m/flow "Inflow" "Perceived_Rate * 0.5"))))
+
+(def ^:private with-transcendentals
+  (-> (m/model "decay" {:xmile/sim-specs (m/sim-specs 0.0 10.0 {:xmile/dt 0.25
+                                                                :xmile/method :rk4})})
+      (m/add-variable (m/stock "Charge" "100" {:xmile/outflows #{"Leak"}}))
+      (m/add-variable (m/aux "Gate" "IF TIME > 3 THEN EXP(-TIME / 5) ELSE 1"))
+      (m/add-variable (m/flow "Leak" "Charge * 0.1 * Gate"))))
+
+;; --- the gate ----------------------------------------------------------------
+
+(defn- relative-error [a b]
+  (cond (= a b) 0.0
+        (or (nil? a) (nil? b)) Double/POSITIVE_INFINITY
+        :else (/ (Math/abs (- a b)) (max (Math/abs a) (Math/abs b) 1.0e-300))))
+
+(deftest trajectories-match-exactly-without-transcendentals
+  (doseq [[label model] [["bathtub (euler)" bathtub]
+                         ["two stocks (rk4)" two-stock-rk4]
+                         ["three inflows, both clamps (euler)" three-inflow-clamped]
+                         ["STEP + SMTH1 hidden stock (rk4)" with-step-and-smooth]]]
+    (testing label
+      (let [expected (execute/run model)
+            actual (run-through-the-port model)]
+        (is (= (:xmile/times expected) (:xmile/times actual)) (str label " -- times"))
+        (is (= (set (keys (:xmile/series expected))) (set (keys (:xmile/series actual))))
+            (str label " -- recorded variables"))
+        (doseq [[nm series] (:xmile/series expected)]
+          (is (= series (get-in actual [:xmile/series nm]))
+              (str label " -- series " nm)))))))
+
+(deftest a-trajectory-through-a-transcendental-agrees-within-tolerance
+  (let [expected (execute/run with-transcendentals)
+        actual (run-through-the-port with-transcendentals)
+        worst (reduce (fn [[err at] [nm series]]
+                        (reduce (fn [[err at] [i v]]
+                                  (let [x (relative-error v (get-in actual [:xmile/series nm i]))]
+                                    (if (> x err) [x [nm i]] [err at])))
+                                [err at]
+                                (map-indexed vector series)))
+                      [0.0 nil] (:xmile/series expected))]
+    (is (= (:xmile/times expected) (:xmile/times actual)))
+    (is (< (first worst) 1.0e-12)
+        (str "worst relative error " (first worst) " at " (pr-str (second worst))))
+    (println (format "  simulation parity, worst relative error %.3e at %s"
+                     (first worst) (pr-str (second worst))))))
+
+(deftest the-simulation-is-long-enough-to-be-a-test
+  ;; A trajectory that agrees for one row is not evidence. Pin the row counts
+  ;; so shortening a model cannot quietly weaken every assertion above.
+  (doseq [[label model expected-rows]
+          [["bathtub" bathtub 41] ["two stocks" two-stock-rk4 81]
+           ["three inflows" three-inflow-clamped 31]
+           ["STEP + SMTH1" with-step-and-smooth 301]
+           ["transcendental" with-transcendentals 41]]]
+    (let [series (:xmile/series (execute/run model))]
+      (is (= expected-rows (count (:xmile/times (execute/run model))))
+          (str label " -- recorded times"))
+      (is (every? #(= expected-rows (count %)) (vals series))
+          (str label " -- every series is that long")))))
+
+(deftest a-failure-in-a-variable-is-reported-and-not-swallowed
+  ;; The port returns `[:result … :string]` where the .cljc throws. A variable
+  ;; whose equation names something unbound must come back as a failure, not as
+  ;; an environment that binds it to zero and lets the simulation continue.
+  (let [r (port 'eval-into "Broken" (->tree (expr/parse "Missing + 1")) false
+                (->env {"TIME" 0.0 "DT" 1.0}))]
+    (is (false? (first r)))
+    (is (re-find #"unknown identifier" (str (second r)))))
+  (testing "and a stock whose flow was never bound fails the same way"
+    (let [r (port 'derivative-of (->names ["NeverBound"]) (->names [])
+                  (->env {"TIME" 0.0 "DT" 1.0}) )]
+      (is (false? (first r)))
+      (is (re-find #"unknown identifier" (str (second r)))))))
+
+(deftest the-boundary-budget-is-where-the-iteration-stopped
+  ;; The port takes one call per quantity rather than one call per step because
+  ;; a model-sized value does not cross this boundary. That is a measurement,
+  ;; so it is measured here rather than asserted in a comment -- and the shape
+  ;; of the failure matters as much as the number: the boundary REFUSES, it
+  ;; does not truncate and compute something.
+  (let [ceiling (first (drop-while (fn [n]
+                                     (try (port 'sum-of
+                                                (->names (map #(str "v" %) (range n)))
+                                                (->env {}) 0.0)
+                                          true
+                                          (catch Exception _ false)))
+                                   (range 1 64)))]
+    (is (some? ceiling) "a long enough name list must eventually be refused")
+    (println (format "  boundary ceiling: a name list of %d is refused" ceiling))
+    ;; Pinned exactly, and deliberately brittle. Six is tight -- a stock with
+    ;; six inflows cannot have them summed in one call -- and that number is
+    ;; the honest limit of what this port claims, so it should not drift
+    ;; silently. `adt-depth-limit` is 12 and each list link costs two levels
+    ;; (the variant, then its heterogeneous payload), which is where 6 comes
+    ;; from. If a compiler bump raises the budget, this test goes red and the
+    ;; claim in README/MATURITY.md gets updated with it.
+    (is (= 6 ceiling)
+        (str "the measured ceiling moved: name lists are now refused at "
+             ceiling " rather than 6 -- update the documented limit"))
+    (testing "the refusal names a budget rather than returning a number"
+      (let [e (try (port 'sum-of (->names (map #(str "v" %) (range ceiling)))
+                        (->env {}) 0.0)
+                   nil
+                   (catch Exception e e))]
+        (is (some? e))
+        (is (re-find #"limit" (str (ex-message e)))
+            (str "expected a budget refusal, got " (ex-message e)))))))
+
+(deftest the-gate-can-fail
+  (let [expected (execute/run bathtub)
+        other (execute/run three-inflow-clamped)]
+    (is (not= (:xmile/series expected) (:xmile/series other)))
+    (is (not= (:xmile/times expected) (:xmile/times other)))))

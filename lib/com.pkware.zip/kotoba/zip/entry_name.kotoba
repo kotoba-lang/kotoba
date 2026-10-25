@@ -1,0 +1,200 @@
+;; What a ZIP entry name is allowed to be, as a Kotoba application
+;; (ADR-2608261100) -- PKWARE APPNOTE.TXT §4.4.17.
+;;
+;;   name-problem (name) -> keyword   ; :none when it names a place inside
+;;   directory?   (name) -> bool
+;;
+;; ## The name is the only field an extractor obeys blindly
+;;
+;; `zip.core`'s docstring names three things it is "deliberately strict
+;; about, because the previous version was not and each is a
+;; silent-corruption path": unsupported methods, CRC-32, and encrypted
+;; members. The entry NAME is not among them, and `entries` hands it back
+;; exactly as it was written. Measured, round-tripping through this
+;; library's own `zip.write/build` and `zip.core/entries`:
+;;
+;;     "../../etc/passwd"      -> "../../etc/passwd"
+;;     "/etc/shadow"           -> "/etc/shadow"
+;;     "C:\windows\evil.dll"   -> "C:\windows\evil.dll"
+;;     "a\b.txt"               -> "a\b.txt"
+;;     "a//b.txt"              -> "a//b.txt"
+;;     "./x.txt"               -> "./x.txt"
+;;
+;; A caller that joins any of the first three to an extraction directory
+;; writes outside it. That is Zip Slip, and it is the most exploited thing
+;; about this format.
+;;
+;;   the guest owns   whether a name names a place inside the archive
+;;   the host owns    the bytes, the CRC, the codecs, and the filesystem
+;;
+;; ## §4.4.17.1, quoted rather than paraphrased
+;;
+;; "The name of the file, with optional relative path. The path stored MUST
+;; NOT contain a drive or device letter, or a leading slash. All slashes
+;; MUST be forward slashes '/' as opposed to backwards slashes '\' for
+;; compatibility with Amiga and UNIX file systems etc."
+;;
+;; So the drive letter, the leading slash and the backslash are the
+;; FORMAT's rules and not a policy this guest invented. `..` is not in that
+;; sentence -- the format allows a relative path and says nothing about
+;; where it may point -- so `:parent-traversal` is this guest's own
+;; decision, and it is the one an extractor most needs.
+;;
+;; ## A NUL is not a character in a name
+;;
+;; The name is a counted byte string, so it may contain any byte, including
+;; zero. Every consumer that hands it to a C API sees a name that ends
+;; there: `a.txt\0.exe` is `a.txt` to the scanner and `a.txt\0.exe` to the
+;; archive. Control bytes are refused for that reason, not for tidiness.
+;;
+;; ## Names above 0x7F are legal, and are not refused
+;;
+;; General-purpose bit 11 says the name is UTF-8, and `zip.core` reads it
+;; that way. So the walk steps by the width of the character it is standing
+;; on rather than refusing what it cannot step over -- `/`, `\`, `:` and the
+;; control bytes are all ASCII and cannot appear inside a multi-byte
+;; sequence, which is what makes stepping over one safe.
+;;
+;; ## What this does NOT answer
+;;
+;; Two entries may carry the same name; `zip.core/entry` returns the first
+;; and an extractor writes both, so a scanner reading one inspects content
+;; the filesystem will not keep. That is a decision about a SET of names and
+;; belongs to whatever holds the set. This answers one name.
+;;
+;; `.cljc` stays the oracle for the central directory, the codecs and the
+;; CRC, and is not required from here (require-graph). It did not grow a
+;; second copy of this check -- there was none to copy (ADR-2608261100).
+
+(ns zip.entry-name
+  (:export [main name-problem directory?]))
+
+;; --- bytes ------------------------------------------------------------------------
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- slash [] :i64 47)
+(defn- backslash [] :i64 92)
+(defn- colon [] :i64 58)
+(defn- dot [] :i64 46)
+
+;; --- the directory marker (§4.4.17.1: a trailing '/' and nothing else) ----------------
+
+(defn directory? [name :string] :bool
+  (let [n (string-length name)]
+    (if (= n 0) false (if (= (cp name (- n 1)) (slash)) true false))))
+
+(defn- content-end [name :string] :i64
+  (let [n (string-length name)]
+    (if (= n 0) 0 (if (= (cp name (- n 1)) (slash)) (- n 1) n))))
+
+;; --- scanning ------------------------------------------------------------------------
+
+(defn- first-control [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1
+      (let [c (cp s i)]
+        (if (< c 32) i (if (= c 127) i (first-control s (+ i (width c))))))))
+
+(defn- has-char? [s :string i :i64 c :i64] :bool
+  (if (>= i (string-length s)) false
+      (let [x (cp s i)]
+        (if (= x c) true (has-char? s (+ i (width x)) c)))))
+
+(defn- next-slash [s :string i :i64 end :i64] :i64
+  (if (>= i end) end
+      (let [c (cp s i)]
+        (if (= c (slash)) i (next-slash s (+ i (width c)) end)))))
+
+;; One segment at a time, left to right, over [0, end) where `end` excludes
+;; the trailing '/' that marks a directory.
+(defn- segments-problem [s :string i :i64 end :i64] :keyword
+  (if (>= i end) :none
+      (let [d (next-slash s i end)
+            n (- d i)]
+        (cond
+          ;; `a//b` names nothing between the slashes, and a consumer that
+          ;; normalises it away and one that does not disagree about the
+          ;; path.
+          (= n 0) :empty-segment
+
+          ;; The format allows a relative path and says nothing about where
+          ;; it may point. This is the guest's own decision, and it is the
+          ;; one an extractor most needs.
+          (if (= n 2)
+            (if (= (cp s i) (dot)) (if (= (cp s (+ i 1)) (dot)) true false) false)
+            false)
+          :parent-traversal
+
+          (if (= n 1) (if (= (cp s i) (dot)) true false) false) :current-directory
+
+          :else (segments-problem s (+ d 1) end)))))
+
+;; --- the decision -----------------------------------------------------------------------
+
+(defn name-problem [name :string] :keyword
+  (let [n (string-length name)
+        end (content-end name)]
+    (cond
+      (= n 0) :empty-name
+
+      ;; Answered first: a name is a counted byte string, so a zero byte is
+      ;; a byte and not a terminator -- but it is a terminator to every
+      ;; consumer that hands the name to a C API, which is two readings of
+      ;; one archive.
+      (>= (first-control name 0) 0) :control-character
+
+      ;; §4.4.17.1: "All slashes MUST be forward slashes '/' as opposed to
+      ;; backwards slashes '\'".
+      (has-char? name 0 (backslash)) :backslash-separator
+
+      ;; §4.4.17.1: "MUST NOT contain a drive or device letter". A colon
+      ;; anywhere is refused rather than only `X:` at the start: an
+      ;; alternate data stream (`a.txt:evil`) is the same hazard one
+      ;; platform later.
+      (has-char? name 0 (colon)) :drive-or-device-letter
+
+      ;; §4.4.17.1: "or a leading slash".
+      (= (cp name 0) (slash)) :absolute-path
+
+      ;; A name that is only the directory marker is `"/"`, which the
+      ;; leading-slash clause above already answered. An explicit
+      ;; `(= end 0) :empty-name` clause stood here until the discrimination
+      ;; pass showed it could be broken without reddening any test: `end` is
+      ;; zero only for the empty name or for `"/"`, and both are answered
+      ;; before this point.
+
+      ;; ONE trailing slash is the directory marker and `content-end`
+      ;; removed it. A second one is an empty segment, and the walk below
+      ;; cannot see it -- it stops at `end`, which is exactly where that
+      ;; segment would start. `a//` is the same normalisation hazard as
+      ;; `a//b` and gets the same answer.
+      (if (= end 0) false (if (= (cp name (- end 1)) (slash)) true false))
+      :empty-segment
+
+      :else (segments-problem name 0 end))))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs three names through the decisions above and answers 0 only when each
+;; still decides the way this object was built to decide, so a COMPILED
+;; artifact can be asked whether it is itself by a host that knows nothing
+;; about ZIP.
+;;
+;; Three, not ten, and that is measured. The native backends evaluate `main`
+;; as a compile-time oracle with a budget: ten of these calls is
+;; `native artifact oracle evaluation rejected` for `aarch64-macos`, three
+;; compiles, and the Wasm target accepts either. The wider check lives in
+;; the suite, which can afford it; this one is what survives to the native
+;; artifact.
+
+(defn main [] :i64
+  (cond
+    (if (= (name-problem "../../etc/passwd") :parent-traversal) false true) 1
+    (if (= (name-problem "a.txt:evil") :drive-or-device-letter) false true) 2
+    (if (= (name-problem "dir/a.txt") :none) false true) 3
+    :else 0))

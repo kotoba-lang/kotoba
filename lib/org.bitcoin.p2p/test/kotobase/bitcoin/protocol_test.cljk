@@ -1,0 +1,403 @@
+(ns kotobase.bitcoin.protocol-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.bitcoin.protocol :as proto]
+            [kotobase.bitcoin.fixtures :as fx]))
+
+;; ---------------------------------------------------------------------------
+;; byte-level primitives
+;; ---------------------------------------------------------------------------
+
+(deftest uint-le-round-trips
+  (doseq [[n bytelen] [[0 1] [1 1] [252 1] [255 1] [256 2] [65535 2]
+                       [65536 4] [4294967295 4] [4294967296 8]
+                       [1231006505 4] [2083236893 4]]]
+    (is (= n (proto/bytes->uint-le (proto/uint-le->bytes n bytelen)))
+        (str "round-trip failed for " n))))
+
+#?(:clj
+   (deftest uint64-decode-does-not-overflow-a-signed-long
+     (doseq [n [9223372036854775808N 18446744073709551615N]]
+       (is (= n (proto/bytes->uint-le (proto/uint-le->bytes n 8)))
+           (str "uint64 round-trip failed for " n)))))
+
+(deftest int32-round-trips
+  (doseq [v [0 1 -1 70015 -70015 2147483647 -2147483648 1231006505]]
+    (is (= v (proto/bytes->int32-le (proto/int32-le->bytes v))))))
+
+(deftest varint-round-trips-across-every-size-boundary
+  (doseq [n [0 1 100 252 253 254 255 256 65535 65536 4294967295 4294967296 5000000000]]
+    (let [enc (proto/encode-varint n)
+          [decoded new-offset] (proto/decode-varint enc 0)]
+      (is (= n decoded) (str "varint round-trip failed for " n))
+      (is (= (count enc) new-offset)))))
+
+(deftest varint-uses-the-correct-prefix-byte-per-spec
+  (is (= [100] (proto/encode-varint 100)))
+  (is (= 0xfd (first (proto/encode-varint 500))))
+  (is (= 0xfe (first (proto/encode-varint 100000))))
+  (is (= 0xff (first (proto/encode-varint 5000000000)))))
+
+(deftest var-string-round-trips
+  (doseq [s ["" "a" "/kotobase:bitcoin-p2p:0.1.0/" "Satoshi"]]
+    (let [enc (proto/encode-var-string s)
+          [decoded offset] (proto/decode-var-string enc 0)]
+      (is (= s decoded))
+      (is (= (count enc) offset)))))
+
+(deftest hex->bytes-basic
+  (is (= [0x00 0x1d 0xff 0xac] (proto/hex->bytes "001dffac")))
+  (is (= [0xde 0xad 0xbe 0xef] (proto/hex->bytes "DEADBEEF"))))
+
+(deftest net-addr-round-trips
+  (let [addr {:services 1 :ip "127.0.0.1" :port 18333}
+        enc (proto/encode-net-addr addr)
+        [decoded offset] (proto/decode-net-addr enc 0)]
+    (is (= 26 (count enc)))
+    (is (= [0x47 0x9d] (subvec enc 24 26))
+        "Bitcoin net_addr ports use network byte order")
+    (is (= addr decoded))
+    (is (= 26 offset))))
+
+;; ---------------------------------------------------------------------------
+;; message framing: header + payload, checksum
+;; ---------------------------------------------------------------------------
+
+(deftest verack-message-frames-correctly-with-known-checksum
+  ;; sha256d of the empty byte string, first 4 bytes -- a well-known
+  ;; constant (every real Bitcoin implementation's verack/getaddr framing
+  ;; checksum), independently recomputed here via sha256d.core rather
+  ;; than trusted from memory.
+  (let [payload (proto/encode-verack-payload)
+        msg (proto/encode-message proto/testnet-magic "verack" payload)]
+    (is (= [] payload))
+    (is (= 24 (count msg)) "verack has an empty payload -- message is exactly the 24-byte header")
+    (let [header (proto/decode-message-header msg)]
+      (is (= proto/testnet-magic (:magic header)))
+      (is (= "verack" (:command header)))
+      (is (= 0 (:length header)))
+      (is (proto/checksum-valid? header payload)))))
+
+(deftest ping-pong-payload-round-trips-through-full-message-framing
+  (let [nonce 1234567890123]
+    (doseq [[cmd encode decode] [["ping" proto/encode-ping-payload proto/decode-ping-payload]
+                                 ["pong" proto/encode-pong-payload proto/decode-pong-payload]]]
+      (let [payload (encode nonce)
+            msg (proto/encode-message proto/mainnet-magic cmd payload)
+            header (proto/decode-message-header (subvec msg 0 proto/header-size))
+            payload' (subvec msg proto/header-size (+ proto/header-size (:length header)))]
+        (is (= cmd (:command header)))
+        (is (= (count payload) (:length header)))
+        (is (proto/checksum-valid? header payload'))
+        (is (= nonce (decode payload')))))))
+
+(deftest message-with-tampered-payload-fails-checksum-check
+  (let [payload (proto/encode-ping-payload 42)
+        msg (proto/encode-message proto/testnet-magic "ping" payload)
+        header (proto/decode-message-header (subvec msg 0 proto/header-size))
+        tampered-payload (update (vec payload) 0 bit-xor 0xff)]
+    (is (proto/checksum-valid? header (vec payload)))
+    (is (not (proto/checksum-valid? header tampered-payload))
+        "a payload that doesn't match the header's own checksum must be rejected")))
+
+(deftest version-payload-round-trips
+  (let [v {:version proto/protocol-version :services 0 :timestamp 1752700000
+           :recv-addr {:services 0 :ip "1.2.3.4" :port 18333}
+           :from-addr {:services 1 :ip "5.6.7.8" :port 18333}
+           :nonce 9988776655 :user-agent "/kotobase:bitcoin-p2p:0.1.0/"
+           :start-height 42 :relay? true}
+        payload (proto/encode-version-payload v)
+        decoded (proto/decode-version-payload payload)]
+    (is (= v decoded))))
+
+(deftest version-payload-defaults-relay-true-when-byte-absent
+  ;; Pre-BIP-0037 compatibility: a version payload with no trailing relay
+  ;; byte at all must decode as :relay? true, per BIP-0037.
+  (let [full (proto/encode-version-payload {:version 60000 :timestamp 1 :nonce 1})
+        without-relay-byte (vec (butlast full))]
+    (is (true? (:relay? (proto/decode-version-payload without-relay-byte))))))
+
+(deftest getheaders-payload-round-trips
+  (let [locator [(vec (repeat 32 0xaa)) (vec (repeat 32 0xbb))]
+        payload (proto/encode-getheaders-payload
+                 {:version proto/protocol-version :locator-hashes locator})
+        decoded (proto/decode-getheaders-payload payload)]
+    (is (= proto/protocol-version (:version decoded)))
+    (is (= locator (:locator-hashes decoded)))
+    (is (= (vec (repeat 32 0)) (:hash-stop decoded)))))
+
+;; ---------------------------------------------------------------------------
+;; block header decode -- against REAL header data (kotobase.bitcoin.fixtures)
+;; ---------------------------------------------------------------------------
+
+(deftest genesis-block-header-decodes-to-known-fields-both-networks
+  (testing "mainnet genesis"
+    (let [h (first fx/mainnet-headers)]
+      (is (= 1 (:version h)))
+      (is (= (vec (repeat 32 0)) (:prev-block h)))
+      (is (= 1231006505 (:timestamp h)))
+      (is (= 0x1d00ffff (:bits h)))
+      (is (= 2083236893 (:nonce h)))
+      (is (= (first fx/mainnet-header-hash-hex) (:hash-hex h)))))
+  (testing "testnet3 genesis"
+    (let [h (first fx/testnet-headers)]
+      (is (= 1 (:version h)))
+      (is (= (vec (repeat 32 0)) (:prev-block h)))
+      (is (= 1296688602 (:timestamp h)))
+      (is (= 0x1d00ffff (:bits h)))
+      (is (= (first fx/testnet-header-hash-hex) (:hash-hex h))))))
+
+(deftest hardcoded-genesis-header-constants-match-the-real-fixture-genesis
+  (is (= (first fx/mainnet-header-hash-hex) (:hash-hex proto/mainnet-genesis-header)))
+  (is (= (first fx/testnet-header-hash-hex) (:hash-hex proto/testnet-genesis-header)))
+  (is (= proto/mainnet-genesis-header (proto/genesis-header :mainnet)))
+  (is (= proto/testnet-genesis-header (proto/genesis-header :testnet)))
+  (is (= "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+         (:hash-hex proto/testnet4-genesis-header)))
+  (is (= "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
+         (:hash-hex proto/signet-genesis-header)))
+  (is (= proto/testnet4-genesis-header (proto/genesis-header :testnet4)))
+  (is (= proto/signet-genesis-header (proto/genesis-header :signet)))
+  (is (= "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+         (:hash-hex proto/regtest-genesis-header)))
+  (is (= proto/regtest-genesis-header (proto/genesis-header :regtest))))
+
+(deftest every-real-fixture-header-hash-matches-blockstream-and-encode-round-trips
+  (doseq [[net headers expected-hashes]
+          [["mainnet" fx/mainnet-headers fx/mainnet-header-hash-hex]
+           ["testnet" fx/testnet-headers fx/testnet-header-hash-hex]]]
+    (doseq [[h expected] (map vector headers expected-hashes)]
+      (is (= expected (:hash-hex h)) (str net " hash mismatch"))
+      (is (= (:bytes h) (proto/encode-block-header h))
+          (str net " encode(decode(bytes)) != bytes")))))
+
+;; ---------------------------------------------------------------------------
+;; proof-of-work target check -- real chain data, and deliberately
+;; tampered/insufficient-work negative cases
+;; ---------------------------------------------------------------------------
+
+(deftest every-real-fixture-header-satisfies-its-own-claimed-difficulty-target
+  (doseq [h (concat fx/mainnet-headers fx/testnet-headers)]
+    (is (proto/hash-meets-target? (:hash h) (:bits h))
+        (str "real header " (:hash-hex h) " should satisfy its own PoW target"))))
+
+(deftest hash-meets-target-rejects-an-artificially-strict-target
+  ;; exponent=3, mantissa=1 -> target = 0x000001, an astronomically tiny
+  ;; target no real 32-byte hash will ever satisfy.
+  (let [h (first fx/mainnet-headers)
+        impossible-bits 0x03000001]
+    (is (not (proto/hash-meets-target? (:hash h) impossible-bits)))))
+
+(deftest bits->target-bytes-decodes-the-genesis-difficulty-correctly
+  ;; bits 0x1d00ffff -> exponent 0x1d=29, mantissa 0x00ffff -> target is
+  ;; 0x00ffff placed as the top 3 bytes of a 29-byte number, i.e. byte
+  ;; index (32-29)=3 holds 0x00, index 4 holds 0xff, index 5 holds 0xff,
+  ;; everything else zero.
+  (let [target (proto/bits->target-bytes 0x1d00ffff)]
+    (is (= 32 (count target)))
+    (is (= (vec (repeat 3 0)) (subvec target 0 3)))
+    (is (= [0x00 0xff 0xff] (subvec target 3 6)))
+    (is (= (vec (repeat 26 0)) (subvec target 6 32)))))
+
+(deftest compact-target-round-trips-canonical-bitcoin-examples
+  (is (= 0x01120000
+         (proto/target-bytes->bits
+          (proto/bits->target-bytes 0x01123456))))
+  (doseq [bits [0x02008000 0x05009234 0x04123456
+                0x1d00ffff 0x1b0404cb]]
+    (is (= bits
+           (proto/target-bytes->bits (proto/bits->target-bytes bits))))))
+
+(deftest compact-target-matches-core-setcompact-overflow-boundaries
+  (is (= (proto/bits->target-bytes 0x1f7f0000)
+         (proto/bits->target-bytes 0x2100007f))
+      "exponent 33 is valid when two leading mantissa bytes are zero")
+  (is (= (proto/bits->target-bytes 0x207f0000)
+         (proto/bits->target-bytes 0x2200007f))
+      "exponent 34 is valid when the mantissa fits one byte")
+  (doseq [overflow [0x23000001 0x22000100 0x21010000]]
+    (is (= (vec (repeat 32 0))
+           (proto/bits->target-bytes overflow))))
+  (is (= (vec (repeat 32 0))
+         (proto/bits->target-bytes 0x2280007f))
+      "negative compact targets remain invalid"))
+
+(deftest chainwork-is-exact-and-selects-only-the-more-work-chain
+  (let [one-block (proto/header-work 0x1d00ffff)
+        two-blocks (proto/accumulate-chainwork [0x1d00ffff 0x1d00ffff])]
+    (is (= [1 0 1 0 1] (subvec one-block 27 32)))
+    (is (proto/better-chain? two-blocks one-block))
+    (is (not (proto/better-chain? one-block two-blocks)))))
+
+(deftest flipping-a-nonce-bit-genuinely-breaks-either-pow-or-linkage-or-both
+  ;; Real tamper-evidence proof, not an assumption: mutate the genesis
+  ;; header's nonce by one bit, re-decode, and confirm the RESULTING
+  ;; header (a) has a different hash than the real one, and (b) the next
+  ;; real header in the chain no longer links to it.
+  (let [genesis (first fx/mainnet-headers)
+        second-real (second fx/mainnet-headers)
+        tampered-bytes (update (vec (:bytes genesis)) 76 bit-xor 0x01) ;; nonce's low byte
+        tampered (proto/decode-block-header tampered-bytes)]
+    (is (not= (:hash genesis) (:hash tampered))
+        "flipping a nonce bit must change the computed hash")
+    (is (not (proto/header-links-to? second-real tampered))
+        "the real next header must no longer link to the tampered header's (different) hash")))
+
+;; ---------------------------------------------------------------------------
+;; chain validation -- valid real chains accepted; tampered/broken chains
+;; rejected, for each of the three named failure modes
+;; ---------------------------------------------------------------------------
+
+(deftest real-4-header-chains-validate-clean-on-both-networks
+  (doseq [[net headers] [["mainnet" fx/mainnet-headers] ["testnet" fx/testnet-headers]]]
+    (let [result (proto/validate-chain headers)]
+      (is (:valid? result) (str net " real chain should validate: " (:errors result)))
+      (is (= [] (:errors result))))))
+
+(deftest chain-validation-rejects-broken-linkage
+  ;; Reorder headers 1 and 2 -- header at index 1 (originally height 2)
+  ;; no longer links to header at index 0 (still height 0, genesis).
+  (let [[h0 h1 h2 h3] fx/mainnet-headers
+        reordered [h0 h2 h1 h3]
+        result (proto/validate-chain reordered)]
+    (is (not (:valid? result)))
+    (is (some #(= :broken-linkage (:type %)) (:errors result)))))
+
+(deftest chain-validation-rejects-insufficient-work
+  ;; Swap in an artificially strict :bits on one real header -- its real
+  ;; hash (computed from its real, unmodified bytes) no longer satisfies
+  ;; that claimed target.
+  (let [headers fx/mainnet-headers
+        tampered (assoc-in (vec headers) [1 :bits] 0x03000001)
+        result (proto/validate-chain tampered)]
+    (is (not (:valid? result)))
+    (is (some #(= :insufficient-work (:type %)) (:errors result)))))
+
+(deftest chain-validation-rejects-a-tampered-header-that-invalidates-the-next-links
+  (let [[h0 h1 h2 h3] fx/mainnet-headers
+        tampered-h1-bytes (update (vec (:bytes h1)) 76 bit-xor 0x01)
+        tampered-h1 (proto/decode-block-header tampered-h1-bytes)
+        result (proto/validate-chain [h0 tampered-h1 h2 h3])]
+    (is (not (:valid? result)))
+    ;; h2's :prev-block still points at the REAL h1's hash, not the
+    ;; tampered one's (different) hash -- broken-linkage at index 2.
+    (is (some #(and (= 2 (:index %)) (= :broken-linkage (:type %))) (:errors result)))))
+
+(defn- synthetic-header [timestamp bits]
+  {:timestamp timestamp :bits bits
+   :hash (vec (repeat 32 0))
+   :hash-hex (apply str (repeat 64 "0"))
+   :prev-block (vec (repeat 32 0))})
+
+(deftest contextual-consensus-enforces-mainnet-retarget-schedule
+  (let [context
+        (mapv #(synthetic-header (* % 600) 0x1d00ffff)
+              (range 2017))
+        rejected
+        (proto/validate-header-consensus
+         context {:network :mainnet :start-height 0
+                  :validate-from-index 2016})
+        expected (->> (:errors rejected)
+                      (filter #(= :unexpected-difficulty (:type %)))
+                      first :expected)
+        corrected (assoc-in context [2016 :bits] expected)
+        accepted
+        (proto/validate-header-consensus
+         corrected {:network :mainnet :start-height 0
+                    :validate-from-index 2016})]
+    (is (= 0x1d00ffde expected))
+    (is (some #(= :unexpected-difficulty (:type %)) (:errors rejected)))
+    (is (:valid? accepted) (pr-str (:errors accepted)))))
+
+(deftest contextual-consensus-enforces-median-time-and-future-time
+  (let [headers
+        (vec
+         (concat (map #(synthetic-header % 0x1d00ffff) (range 11))
+                 [(synthetic-header 5 0x1d00ffff)
+                  (synthetic-header 20000 0x1d00ffff)]))
+        result
+        (proto/validate-header-consensus
+         headers {:network :mainnet :start-height 1
+                  :validate-from-index 11 :now 10000})]
+    (is (some #(= :time-too-old (:type %)) (:errors result)))
+    (is (some #(= :time-too-new (:type %)) (:errors result)))))
+
+(deftest testnet-minimum-difficulty-recovers-to-the-last-non-minimum-target
+  (let [harder 0x1c00ffff
+        headers [(synthetic-header 0 harder)
+                 (synthetic-header 1201 0x1d00ffff)
+                 (synthetic-header 1800 harder)]
+        result
+        (proto/validate-header-consensus
+         headers {:network :testnet :start-height 1
+                  :validate-from-index 1 :now 10000})]
+    (is (:valid? result) (pr-str (:errors result)))))
+
+(deftest testnet4-bip94-retargets-from-the-periods-first-real-target
+  (let [harder 0x1c00ffff
+        context
+        (vec
+         (concat
+          [(synthetic-header 0 harder)]
+          (map #(synthetic-header (* % 600) 0x1d00ffff)
+               (range 1 2017))))
+        rejected
+        (proto/validate-header-consensus
+         context {:network :testnet4 :start-height 0
+                  :validate-from-index 2016})
+        expected (->> (:errors rejected)
+                      (filter #(= :unexpected-difficulty (:type %)))
+                      first :expected)
+        corrected (assoc-in context [2016 :bits] expected)
+        accepted
+        (proto/validate-header-consensus
+         corrected {:network :testnet4 :start-height 0
+                    :validate-from-index 2016})]
+    (is (= 0x1c00ffde expected))
+    (is (:valid? accepted) (pr-str (:errors accepted)))))
+
+(deftest contextual-difficulty-fails-closed-without-required-ancestors
+  (let [mainnet
+        (proto/validate-header-consensus
+         [(synthetic-header 0 0x1d00ffff)
+          (synthetic-header 600 0x1d00ffff)]
+         {:network :mainnet :start-height 2015
+          :validate-from-index 1 :now 10000})
+        testnet
+        (proto/validate-header-consensus
+         [(synthetic-header 0 0x1d00ffff)
+          (synthetic-header 600 0x1d00ffff)]
+         {:network :testnet :start-height 100
+          :validate-from-index 1 :now 10000})]
+    (is (some #(= :insufficient-difficulty-context (:type %))
+              (:errors mainnet)))
+    (is (some #(= :insufficient-difficulty-context (:type %))
+              (:errors testnet)))))
+
+(deftest regtest-keeps-the-previous-target-without-retargeting
+  (let [headers [(synthetic-header 0 0x207fffff)
+                 (synthetic-header 600 0x207fffff)]
+        result
+        (proto/validate-header-consensus
+         headers {:network :regtest :start-height 2015
+                  :validate-from-index 1 :now 10000})]
+    (is (:valid? result) (pr-str (:errors result)))))
+
+;; ---------------------------------------------------------------------------
+;; headers message (multi-header payload) round-trip
+;; ---------------------------------------------------------------------------
+
+(deftest headers-message-round-trips-real-fixture-headers
+  (let [payload (proto/encode-headers-payload fx/mainnet-headers)
+        decoded (proto/decode-headers-payload payload)]
+    (is (= (count fx/mainnet-headers) (count decoded)))
+    (is (= (map :hash-hex fx/mainnet-headers) (map :hash-hex decoded)))
+    (is (proto/valid-header-chain? decoded))))
+
+(deftest malformed-headers-messages-fail-closed
+  (let [one (proto/encode-headers-payload [(first fx/mainnet-headers)])]
+    (doseq [payload [(proto/encode-varint 2001)
+                     (assoc one (dec (count one)) 1)
+                     (conj one 0)
+                     (vec (butlast (butlast one)))]]
+      (is (thrown? js/Error
+                   (proto/decode-headers-payload payload))))))

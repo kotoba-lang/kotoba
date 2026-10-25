@@ -1,0 +1,163 @@
+#!/usr/bin/env kbb
+;; dpp.uri against independent references.
+;;
+;; Two things are checked by a DIFFERENT code path than the one under test:
+;;   1. base64 decoding, against Node's Buffer;
+;;   2. the SubjectPublicKeyInfo, which this file BUILDS by hand from a real
+;;      P-256 point produced by Node's ECDH, so the bytes dpp.uri parses were
+;;      not produced by dpp.uri.
+;;
+;; Every negative control pins the REASON, not just the failure. A refusal test
+;; that only asserts "not ok" passes when the refusal came from somewhere else
+;; entirely -- which is how a check stops discriminating without saying so.
+
+(require '[dpp.uri :as uri]
+         '[clojure.string :as str])
+
+(def crypto (js/require "node:crypto"))
+(def Buffer (.-Buffer (js/require "node:buffer")))
+
+(def results (atom []))
+(defn- check! [name ok detail]
+  (swap! results conj [name ok])
+  (println (if ok "DPP_OK  " "DPP_FAIL") name (if ok "" (str "-- " detail))))
+
+(defn- b64 [bytes] (.toString (.from Buffer (js/Uint8Array. (clj->js bytes))) "base64"))
+
+;; ── an EC point from Node, and the SPKI built here by hand ────────────────
+
+(def ecdh (doto (.createECDH crypto "prime256v1") (.generateKeys)))
+(def point-compressed (vec (.getPublicKey ecdh nil "compressed")))
+(def point-uncompressed (vec (.getPublicKey ecdh nil "uncompressed")))
+
+(def oid-ec-pub [0x06 0x07 0x2A 0x86 0x48 0xCE 0x3D 0x02 0x01])
+(def oid-p256   [0x06 0x08 0x2A 0x86 0x48 0xCE 0x3D 0x03 0x01 0x07])
+(def oid-k256   [0x06 0x05 0x2B 0x81 0x04 0x00 0x0A])   ; secp256k1: real, not admitted
+
+(defn- der-seq [content] (into [0x30 (count content)] content))
+(defn- der-bitstring [point] (into [0x03 (inc (count point)) 0x00] point))
+
+(defn- spki
+  ([point] (spki point oid-p256))
+  ([point curve-oid]
+   (der-seq (concat (der-seq (concat oid-ec-pub curve-oid)) (der-bitstring point)))))
+
+(def key-compressed (b64 (spki point-compressed)))
+(def key-uncompressed (b64 (spki point-uncompressed)))
+
+;; ── 1. base64 against Node ────────────────────────────────────────────────
+
+(check! "base64-matches-node"
+        (= (vec (.from Buffer key-compressed "base64")) (uri/base64-decode key-compressed))
+        "decoder disagrees with Buffer")
+(check! "base64-rejects-base64url"
+        (nil? (uri/base64-decode "ab-_"))
+        "accepted base64url characters; DPP uses the standard alphabet")
+(check! "base64-rejects-ragged"
+        (nil? (uri/base64-decode "abcde"))
+        "accepted a length that is not a multiple of 4")
+
+;; ── 2. a real URI is admitted, and says what it holds ─────────────────────
+
+(def good (str "DPP:C:81/6,115/36;M:0123456789ab;K:" key-compressed ";;"))
+(def a (uri/admit good))
+
+(check! "admits-a-real-uri" (:ok? a) (pr-str a))
+(check! "reports-curve-and-form"
+        (and (= :p-256 (get-in a [:key :curve])) (= :compressed (get-in a [:key :form])))
+        (pr-str (:key a)))
+(check! "point-round-trips"
+        (= point-compressed (get-in a [:key :point]))
+        "the parsed point is not the one Node generated")
+(check! "channels-parsed"
+        (= [{:operating-class 81 :channel 6} {:operating-class 115 :channel 36}] (:channels a))
+        (pr-str (:channels a)))
+(check! "mac-kept" (= "0123456789ab" (:mac a)) (pr-str (:mac a)))
+(check! "admits-uncompressed"
+        (let [r (uri/admit (str "DPP:K:" key-uncompressed ";;"))]
+          (and (:ok? r) (= :uncompressed (get-in r [:key :form]))))
+        "uncompressed P-256 point refused")
+
+;; ── 3. generate -> admit round trip, and the generator holds itself to it ──
+
+(def g (uri/generate {:version 2 :mac "aabbccddeeff"
+                      :channels [{:operating-class 81 :channel 1}]
+                      :public-key key-compressed}))
+(check! "generates-canonical-shape"
+        (= g (str "DPP:V:2;M:aabbccddeeff;C:81/1;K:" key-compressed ";;"))
+        (pr-str g))
+(check! "generated-uri-is-admitted" (:ok? (uri/admit g)) (pr-str (uri/admit g)))
+(check! "generator-refuses-without-key"
+        (= :missing-public-key (:error (uri/generate {:mac "aabbccddeeff"})))
+        "generated a URI with no bootstrapping key")
+(check! "generator-refuses-semicolon"
+        (= :semicolon-in-value
+           (:error (uri/generate {:public-key key-compressed :information "a;b"})))
+        "let a separator into a value")
+
+;; ── 4. negative controls -- each pins its own reason ──────────────────────
+
+(def refusals
+  [["not-a-dpp-uri"          "WIFI:T:WPA;S:home;P:secret;;"                    :not-a-dpp-uri]
+   ["unterminated"           (str "DPP:K:" key-compressed)                     :unterminated]
+   ;; one `;` short: the field closed but the URI never terminated. Distinct
+   ;; from :unterminated, and the boundary the parser got wrong first time.
+   ["field-not-terminated"   (str "DPP:K:" key-compressed ";")                 :field-not-terminated]
+   ["empty-field"            (str "DPP:;K:" key-compressed ";;")               :empty-field]
+   ["field-without-tag"      (str "DPP:nope;K:" key-compressed ";;")           :field-without-tag]
+   ["duplicate-tag"          (str "DPP:M:0123456789ab;M:0123456789ab;K:" key-compressed ";;") :duplicate-tag]
+   ["unknown-tag"            (str "DPP:Z:1;K:" key-compressed ";;")            :unknown-tag]
+   ["missing-public-key"     "DPP:M:0123456789ab;;"                            :missing-public-key]
+   ["public-key-not-last"    (str "DPP:K:" key-compressed ";M:0123456789ab;;") :public-key-not-last]
+   ["public-key-not-base64"  "DPP:K:not-base64!!;;"                            :public-key-not-base64]
+   ["malformed-mac"          (str "DPP:M:01:23:45:67:89:ab;K:" key-compressed ";;") :malformed-mac]
+   ["malformed-channel-list" (str "DPP:C:81-6;K:" key-compressed ";;")         :malformed-channel-list]
+   ["malformed-version"      (str "DPP:V:two;K:" key-compressed ";;")          :malformed-version]])
+
+(doseq [[name u expected] refusals]
+  (let [r (uri/admit u)]
+    (check! (str "refuses/" name)
+            (and (not (:ok? r)) (= expected (:reason r)))
+            (str "expected " expected " got " (pr-str r)))))
+
+;; ── 5. the key itself: each malformation gets its own name ────────────────
+
+(def key-refusals
+  [["truncated-point"  (b64 (spki (subvec point-compressed 0 32)))        :point-length-mismatch]
+   ["unsupported-curve" (b64 (spki point-compressed oid-k256))            :unsupported-curve]
+   ;; a TLV whose length runs past the end -- truncated, so not DER at all
+   ["not-der"          (b64 [0x01 0x02 0x03])                             :not-der]
+   ;; well-formed DER (INTEGER 0) that simply is not a SubjectPublicKeyInfo.
+   ;; Kept separate from the truncated case: a parser that answered the same
+   ;; for both could not tell a corrupt key from a wrong one.
+   ["not-a-sequence"   (b64 [0x02 0x01 0x00])                             :spki-not-sequence]
+   ["trailing-bytes"   (b64 (conj (spki point-compressed) 0x00))          :trailing-bytes-after-spki]
+   ["bad-point-form"   (b64 (spki (assoc point-compressed 0 0x07)))       :unknown-point-form]])
+
+(doseq [[name k expected] key-refusals]
+  (let [r (uri/admit (str "DPP:K:" k ";;"))]
+    (check! (str "refuses-key/" name)
+            (and (not (:ok? r)) (= expected (:reason r)))
+            (str "expected " expected " got " (pr-str r)))))
+
+;; ── 6. the opt-in actually opens, and opens only what it says ─────────────
+
+(let [u (str "DPP:Z:1;K:" key-compressed ";;")
+      r (uri/admit u {:allow-unknown-tags? true})]
+  (check! "unknown-tag-opt-in-admits" (:ok? r) (pr-str r))
+  (check! "unknown-tag-opt-in-still-reports" (= ["Z"] (:unknown-tags r)) (pr-str r)))
+
+(let [u (str "DPP:K:" key-compressed ";M:0123456789ab;;")
+      r (uri/admit u {:require-key-last? false})]
+  (check! "key-last-opt-out-admits" (:ok? r) (pr-str r)))
+
+;; ── report: a count, not a boolean ────────────────────────────────────────
+;; A boolean cannot tell one regression from a broken build.
+
+(let [total (count @results)
+      failed (remove second @results)]
+  (println)
+  (println (str "checks=" total " failed=" (count failed)))
+  (when (seq failed) (println (str "failed: " (str/join ", " (map first failed)))))
+  (println (if (empty? failed) "DPP_URI_SUITE_OK" "DPP_URI_SUITE_FAIL"))
+  (js/process.exit (if (empty? failed) 0 1)))

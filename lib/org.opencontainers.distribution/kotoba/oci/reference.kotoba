@@ -1,0 +1,273 @@
+;; What an OCI repository name and reference may be, as a Kotoba
+;; application (ADR-2608261100) -- OCI Distribution Specification §4.1 and
+;; the image-spec digest grammar.
+;;
+;;   name-problem   (name)      -> keyword   ; :none when it names a repo
+;;   reference-kind (reference) -> keyword   ; :digest | :tag | why not
+;;
+;; ## A registry keyed by a name it never checks
+;;
+;; `kotobase.protocols.oci/handle` builds the repository name by joining
+;; every path segment before the route tail (`name-of`) and hands it
+;; straight to the store as part of a key. Nothing between the socket and
+;; the key looks at it. Measured against this repository's own handler and
+;; `kotobase.local` store:
+;;
+;;     PUT /v2/a/../b/manifests/latest   ->  201
+;;     GET /v2/b/manifests/latest        ->  404
+;;     GET /v2/a/../b/manifests/latest   ->  200
+;;
+;;     PUT /v2/MyApp/manifests/latest    ->  201
+;;     GET /v2/myapp/manifests/latest    ->  404
+;;
+;; §4.1 gives the grammar and it is lowercase-only, with no `.` or `..`
+;; component. Two things follow from ignoring it. A store that maps keys to
+;; paths -- which is what "a/../b" is written for -- resolves out of its own
+;; key space. And a client, a mirror and a scanner that each normalise
+;; differently are looking at different objects while believing they share
+;; one name.
+;;
+;;   the guest owns   whether a name names a repository and whether a
+;;                    reference is a tag or a digest
+;;   the host owns    the socket, the store, SHA-256, and the bytes
+;;
+;; ## A tag is not "anything without a colon"
+;;
+;; `digest-shaped?` is `^[a-zA-Z0-9_+.-]+:[0-9A-Fa-f]{32,}$`, and the
+;; registry uses it to decide whether to VERIFY a pushed reference against
+;; the computed digest, and to decide what is a tag when listing. It is
+;; wider than the digest grammar in both directions that matter:
+;;
+;;     "SHA256:" + 32 uppercase hex   ->  digest-shaped?  true
+;;
+;; The algorithm is lowercase in the spec and `sha256`'s encoded part is
+;; exactly 64 lowercase hex, so that string is not a digest -- and being
+;; treated as one is only safe because the equality check then refuses it.
+;; The other direction is the one to watch: anything the regex calls a tag
+;; is stored WITHOUT verification, and the tag grammar
+;; (`[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`) is much narrower than "has no
+;; colon". Measured: `-bad..tag` is accepted and listed as a tag.
+;;
+;; ## And `segments` does not decode
+;;
+;; `kotobase.protocols.http/segments` says "Path → vector of decoded,
+;; non-empty segments". It splits on `/` and removes blanks; it does not
+;; percent-decode, so `a%2Fb` stays one segment spelled `a%2Fb`. That is
+;; safer than decoding would be -- but the docstring promises the decoding,
+;; and a later reader who believes it will put a decoder in front and turn
+;; `%2F` into a separator this router never sees. `%` is not in the §4.1
+;; grammar, so `:invalid-character` answers it either way.
+;;
+;; `.cljc` stays the oracle for the routing, the store and the digest, and
+;; is not required from here (require-graph). It did not grow a second copy
+;; of these grammars -- there were none to copy (ADR-2608261100).
+
+(ns oci.reference
+  (:export [main name-problem reference-kind]))
+
+;; --- characters --------------------------------------------------------------------
+
+(defn- cp [s :string i :i64] :i64 (string-code-point-at s i))
+
+(defn- slash [] :i64 47)
+(defn- colon [] :i64 58)
+(defn- dot [] :i64 46)
+(defn- under [] :i64 95)
+(defn- hyphen [] :i64 45)
+
+(defn- lower-alnum? [c :i64] :bool
+  (if (>= c 97) (if (<= c 122) true false)
+      (if (>= c 48) (if (<= c 57) true false) false)))
+
+(defn- tag-char? [c :i64] :bool
+  (if (lower-alnum? c) true
+      (if (>= c 65) (if (<= c 90) true
+                        (if (= c (under)) true false))
+          (if (= c (dot)) true (if (= c (hyphen)) true false)))))
+
+(defn- hex-lower? [c :i64] :bool
+  (if (>= c 48) (if (<= c 57) true
+                    (if (>= c 97) (if (<= c 102) true false) false))
+      false))
+
+(defn- first-non-ascii [s :string i :i64] :i64
+  (if (>= i (string-length s)) -1
+      (if (> (cp s i) 127) i (first-non-ascii s (+ i 1)))))
+
+(defn- same? [a :string b :string] :bool
+  (if (= (string-length a) (string-length b))
+    (if (string-contains? a b) true false)
+    false))
+
+;; --- one path component of a repository name (§4.1) ------------------------------------
+;;
+;;   [a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*
+;;
+;; A separator run is one `.`, one or two `_`, or any number of `-`, and it
+;; must have an alphanumeric on both sides.
+
+(defn- alnum-end [s :string i :i64 end :i64] :i64
+  (if (>= i end) end
+      (if (lower-alnum? (cp s i)) (alnum-end s (+ i 1) end) i)))
+
+(defn- run-end [s :string i :i64 end :i64 c :i64] :i64
+  (if (>= i end) end (if (= (cp s i) c) (run-end s (+ i 1) end c) i)))
+
+(defn- comp-problem [s :string i :i64 end :i64] :keyword
+  (if (>= i end) :empty-component
+      (if (lower-alnum? (cp s i))
+        (let [ar (alnum-end s i end)]
+          (if (>= ar end) :none
+              (let [c (cp s ar)
+                    sr (run-end s ar end c)
+                    n (- sr ar)]
+                (cond
+                  ;; `.` once, `_` once or twice, `-` any number.
+                  (if (= c (dot)) (if (> n 1) true false) false) :bad-separator
+                  (if (= c (under)) (if (> n 2) true false) false) :bad-separator
+                  (if (= c (hyphen)) false (if (= c (dot)) false
+                                               (if (= c (under)) false true)))
+                  :invalid-character
+
+                  ;; A separator must have an alphanumeric on both sides, so
+                  ;; a component may not end with one.
+                  (>= sr end) :bad-separator
+
+                  :else (comp-problem s sr end)))))
+        :invalid-character)))
+
+;; --- the name ---------------------------------------------------------------------------
+
+(defn- next-slash [s :string i :i64 end :i64] :i64
+  (if (>= i end) end (if (= (cp s i) (slash)) i (next-slash s (+ i 1) end))))
+
+(defn- components-problem [s :string i :i64 end :i64] :keyword
+  (if (> i end) :none
+      (let [d (next-slash s i end)
+            n (- d i)]
+        (cond
+          ;; An explicit `(= n 0) :empty-component` clause stood here until
+          ;; the discrimination pass showed it could be broken without
+          ;; reddening any test: `comp-problem` answers the empty range the
+          ;; same way, so this decided nothing.
+
+          ;; Answered by name rather than as an invalid character, because
+          ;; it is the one a store that maps keys to paths obeys.
+          (if (= n 2)
+            (if (= (cp s i) (dot)) (if (= (cp s (+ i 1)) (dot)) true false) false)
+            false)
+          :parent-traversal
+
+          (if (= n 1) (if (= (cp s i) (dot)) true false) false) :current-directory
+
+          :else
+          (let [p (comp-problem s i d)]
+            (if (= p :none)
+              (if (>= d end) :none (components-problem s (+ d 1) end))
+              p))))))
+
+(defn name-problem [name :string] :keyword
+  (let [n (string-length name)]
+    (cond
+      (= n 0) :empty-name
+      ;; §4.1: "the total length of a repository name, including slashes,
+      ;; MUST be less than 256 characters".
+      (> n 255) :name-too-long
+      (>= (first-non-ascii name 0) 0) :invalid-character
+      :else (components-problem name 0 n))))
+
+;; --- a reference: a tag or a digest --------------------------------------------------------
+
+(defn- next-colon [s :string i :i64 end :i64] :i64
+  (if (>= i end) end (if (= (cp s i) (colon)) i (next-colon s (+ i 1) end))))
+
+(defn- tag-chars? [s :string i :i64] :bool
+  (if (>= i (string-length s)) true
+      (if (tag-char? (cp s i)) (tag-chars? s (+ i 1)) false)))
+
+(defn- hex-lower-run? [s :string i :i64 end :i64] :bool
+  (if (>= i end) true
+      (if (hex-lower? (cp s i)) (hex-lower-run? s (+ i 1) end) false)))
+
+;; The algorithm component: `[a-z0-9]+([+._-][a-z0-9]+)*`. `+` joins the
+;; parts of a multihash name; `run-end` is reused so `sha256++x` is refused
+;; the same way `a..b` is in a repository name.
+(defn- algorithm-ok? [s :string i :i64 end :i64] :bool
+  (if (>= i end) false
+      (if (lower-alnum? (cp s i))
+        (let [ar (alnum-end s i end)]
+          (if (>= ar end) true
+              (let [c (cp s ar)]
+                (if (if (= c 43) true                          ; '+'
+                        (if (= c (dot)) true
+                            (if (= c (under)) true
+                                (if (= c (hyphen)) true false))))
+                  (algorithm-ok? s (+ ar 1) end)
+                  false))))
+        false)))
+
+(defn reference-kind [reference :string] :keyword
+  (let [n (string-length reference)]
+    (cond
+      (= n 0) :empty-reference
+      (>= (first-non-ascii reference 0) 0) :invalid-tag
+
+      ;; A tag can never contain a colon, so the colon is what separates the
+      ;; two grammars -- that part of `digest-shaped?` is right.
+      (>= (next-colon reference 0 n) n)
+      (if (> n 128) :invalid-tag
+          (if (tag-chars? reference 0)
+            ;; §4.1: the first character may not be `.` or `-`.
+            (if (lower-alnum? (cp reference 0)) :tag
+                (if (= (cp reference 0) (under)) :tag
+                    (if (>= (cp reference 0) 65)
+                      (if (<= (cp reference 0) 90) :tag :invalid-tag)
+                      :invalid-tag)))
+            :invalid-tag))
+
+      :else
+      (let [c (next-colon reference 0 n)
+            algo (string-substring reference 0 c)
+            enc (string-substring reference (+ c 1) n)
+            elen (- n (+ c 1))]
+        (cond
+          (if (algorithm-ok? reference 0 c) false true) :invalid-digest
+
+          ;; The two algorithms the spec registers say exactly how long
+          ;; their encodings are, and in which case. Anything else is only
+          ;; required to be a non-empty encoded string.
+          (same? algo "sha256")
+          (if (= elen 64) (if (hex-lower-run? enc 0 elen) :digest :invalid-digest)
+              :invalid-digest)
+
+          (same? algo "sha512")
+          (if (= elen 128) (if (hex-lower-run? enc 0 elen) :digest :invalid-digest)
+              :invalid-digest)
+
+          (= elen 0) :invalid-digest
+          :else :digest)))))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the findings back through the decisions above and answers 0 only
+;; when each still decides the way this object was built to decide, so a
+;; COMPILED artifact can be asked whether it is itself by a host that knows
+;; nothing about registries.
+;;
+;; Three, not ten: the native backends evaluate `main` as a compile-time
+;; oracle with a budget, and ten calls of this shape is `native artifact
+;; oracle evaluation rejected`. The wider check lives in the suite.
+;;
+;; The strings here are short on purpose. A module's fuel is a private
+;; global baked in at compile time and the default is 512, which the suite
+;; measured is enough for an ordinary name and not for a full-length
+;; 128-character tag.
+
+(defn main [] :i64
+  (cond
+    (if (= (name-problem "a/../b") :parent-traversal) false true) 1
+    (if (= (name-problem "MyApp") :invalid-character) false true) 2
+    (if (= (reference-kind "-bad..tag") :invalid-tag) false true) 3
+    :else 0))

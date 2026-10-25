@@ -1,0 +1,207 @@
+;; `kotoba/tiff/header.kotoba` against `tiff.core/parse`.
+;;
+;; Parity covers what the library does read: the byte order of a real file,
+;; and where IFD0 sits. The fixtures are the repo's own `.tif` files —
+;; written by Pillow and by a real encoder, not by this test — so agreement
+;; is against something neither side made up.
+;;
+;; The REFUSALS have no oracle, because `parse` does not make them. Measured
+;; on this repo at e721594:
+;;
+;;   [0x58 0x59 …] ("XY")   -> {:byte-order :little}
+;;   [0x49 0x49 99 0 …]     -> {:byte-order :little}
+;;
+;; The first is not a TIFF and is read as a little-endian one; the second has
+;; magic 99 where §2 requires 42, and nothing reads that field. The repo's
+;; tests build only `II`+42 and `MM`+42 headers, so neither gap has anything
+;; looking at it. Those cases are asserted directly against the guest and
+;; against the recorded behaviour of the oracle, so the difference is visible
+;; rather than implied.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). It did not grow a second copy of the refusals.
+;;
+;; ## The negative controls
+;;
+;;   * `only-II-and-MM-are-byte-order-markers` — falling through to
+;;     little-endian is how a file that is not a TIFF becomes one;
+;;   * `the-magic-number-is-checked` — §2's whole purpose, and the cheapest
+;;     check in the format;
+;;   * `an-ifd-inside-the-header-is-refused` — an IFD overlapping the
+;;     8-byte header is not a smaller image;
+;;   * `an-entry-count-that-does-not-fit-is-refused` — refused BEFORE the
+;;     host reads a byte, because reading first and discovering later is the
+;;     out-of-range read.
+
+(ns tiff.header-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [tiff.core :as tiff]
+            [tiff.header-guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "tiff" "header.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'tiff.header (slurp guest-file)}
+                                         'tiff.header :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+;; --- the host: the bytes ------------------------------------------------------
+
+(defn- fixture-bytes [name]
+  (with-open [in (io/input-stream (io/resource (str "tiff/fixtures/" name)))]
+    (mapv #(bit-and % 0xff) (seq (.readAllBytes in)))))
+
+(defn- read-header
+  "What a decoder does: hand the guest the first eight bytes and the file
+  length, then the two bytes the guest points at."
+  [bytes]
+  (let [s0 (call 'offer-header [(call 'init [(->doc {:file-length (count bytes)})])
+                                (->doc (vec (take 8 bytes)))])]
+    (if (not= :want-entry-count (call 'phase [s0]))
+      {:state s0 :phase (call 'phase [s0]) :reason (call 'reason [s0])}
+      (let [ifd (call 'ifd-offset [s0])
+            s1 (call 'offer-entry-count-bytes
+                     [s0 (nth bytes ifd) (nth bytes (inc ifd))])]
+        {:state s1
+         :phase (call 'phase [s1])
+         :reason (call 'reason [s1])
+         :big? (call 'big-endian? [s1])
+         :ifd ifd
+         :entries (call 'entry-count [s1])}))))
+
+;; A header built by hand, the way a hostile file is.
+(defn- header
+  [{:keys [marker magic ifd big? trailing]
+    :or {marker [0x49 0x49] magic 42 ifd 8 big? false trailing 40}}]
+  (let [u16 (fn [v] (if big? [(quot v 256) (mod v 256)] [(mod v 256) (quot v 256)]))
+        u32 (fn [v] (if big?
+                      [(bit-and (bit-shift-right v 24) 0xff)
+                       (bit-and (bit-shift-right v 16) 0xff)
+                       (bit-and (bit-shift-right v 8) 0xff) (bit-and v 0xff)]
+                      [(bit-and v 0xff) (bit-and (bit-shift-right v 8) 0xff)
+                       (bit-and (bit-shift-right v 16) 0xff)
+                       (bit-and (bit-shift-right v 24) 0xff)]))]
+    (vec (concat marker (u16 magic) (u32 ifd) (repeat trailing 0)))))
+
+;; --- parity: real files --------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest the-byte-order-of-a-real-file-agrees-with-the-oracle
+  (doseq [name ["lzw_gray.tif" "lzw_big.tif" "pillow_deflate.tif"]]
+    (let [bytes (fixture-bytes name)
+          g (read-header bytes)
+          o (tiff/parse bytes)]
+      (is (= :ready (:phase g)) [name (:reason g)])
+      (is (= (= :big (:byte-order o)) (:big? g)) name)
+      (testing "and the guest found the same IFD the oracle walked"
+        (is (= (count (:entries o)) (:entries g)) name))
+      (testing "and every entry it offers is inside the file"
+        (doseq [i (range (:entries g))]
+          (let [off (call 'entry-offset-at [(:state g) i])]
+            (is (<= 0 off) [name i])
+            (is (<= (+ off 12) (count bytes)) [name i]))))
+      (testing "and asking past the count answers -1 rather than walking on"
+        (is (= -1 (call 'entry-offset-at [(:state g) (:entries g)])) name)
+        (is (= -1 (call 'entry-offset-at [(:state g) -1])) name)))))
+
+(deftest both-byte-orders-are-read
+  (doseq [[label h] [["II" (header {})]
+                     ["MM" (header {:marker [0x4D 0x4D] :big? true})]]]
+    (let [g (read-header h)]
+      (is (= :ready (:phase g)) [label (:reason g)])
+      (is (= (= "MM" label) (:big? g)) label)
+      (is (= 8 (:ifd g)) label))))
+
+;; --- the refusals: no oracle ---------------------------------------------------
+
+(deftest only-II-and-MM-are-byte-order-markers
+  (testing "falling through to little-endian is how a file that is not a
+            TIFF becomes one"
+    (doseq [marker [[0x58 0x59] [0x49 0x4D] [0x4D 0x49] [0x00 0x00]]]
+      (let [h (header {:marker marker})
+            g (read-header h)]
+        (is (= :refused (:phase g)) (pr-str marker))
+        (is (= :tiff/bad-byte-order (:reason g)) (pr-str marker))))
+    (testing "which the oracle reads as a little-endian TIFF"
+      (is (= :little (:byte-order (tiff/parse (header {:marker [0x58 0x59]}))))))))
+
+(deftest the-magic-number-is-checked
+  (testing "§2: 42 is what further identifies the file as a TIFF, and it is
+            the cheapest check in the format -- a decoder that skips it
+            interprets whatever follows as offsets and counts"
+    (doseq [m [0 41 43 99 65535]]
+      (let [g (read-header (header {:magic m}))]
+        (is (= :refused (:phase g)) m)
+        (is (= :tiff/bad-magic (:reason g)) m)))
+    (testing "and it is read in the order the first two bytes chose"
+      (is (= :ready (:phase (read-header (header {:marker [0x4D 0x4D] :big? true})))))
+      (testing "so a big-endian file carrying a little-endian 42 is refused"
+        ;; 42 written little-endian is [42 0]; read big-endian that is 10752.
+        (let [h (vec (concat [0x4D 0x4D] [42 0] [0 0 0 8] (repeat 40 0)))]
+          (is (= :tiff/bad-magic (:reason (read-header h)))))))
+    (testing "which the oracle accepts regardless"
+      (is (map? (tiff/parse (header {:magic 99})))))))
+
+(deftest an-ifd-inside-the-header-is-refused
+  (testing "an IFD overlapping the 8-byte header is not a smaller image, it
+            is a malformed file"
+    (doseq [o [0 1 7]]
+      (let [g (read-header (header {:ifd o}))]
+        (is (= :refused (:phase g)) o)
+        (is (= :tiff/ifd-inside-header (:reason g)) o)))
+    (testing "and 8 -- the first byte after the header -- is fine"
+      (is (= :ready (:phase (read-header (header {:ifd 8}))))))))
+
+(deftest an-ifd-past-the-end-is-refused
+  (let [g (read-header (header {:ifd 10000}))]
+    (is (= :refused (:phase g)))
+    (is (= :tiff/ifd-out-of-range (:reason g)))))
+
+(deftest an-entry-count-that-does-not-fit-is-refused
+  (testing "§2: two count bytes, twelve per entry, then a four-byte next-IFD
+            offset. A count that does not fit is a claim about a file this
+            is not -- and it is refused BEFORE the host reads a byte of it,
+            because reading first and discovering later is the out-of-range
+            read."
+    ;; 48 bytes total, IFD at 8: room for (48-8-2-4)/12 = 2 entries.
+    (let [h (vec (concat [0x49 0x49 42 0 8 0 0 0]
+                         [3 0]                       ; claims three entries
+                         (repeat 38 0)))]
+      (is (= 48 (count h)))
+      (let [g (read-header h)]
+        (is (= :refused (:phase g)))
+        (is (= :tiff/entry-count-out-of-range (:reason g)))
+        (is (= -1 (call 'entry-count [(:state g)])) "and it offers no entries")
+        (is (= -1 (call 'entry-offset-at [(:state g) 0])))))
+    (testing "while a count that does fit is accepted"
+      (let [h (vec (concat [0x49 0x49 42 0 8 0 0 0] [2 0] (repeat 38 0)))
+            g (read-header h)]
+        (is (= :ready (:phase g)))
+        (is (= 2 (:entries g)))
+        (is (= 10 (call 'entry-offset-at [(:state g) 0])))
+        (is (= 22 (call 'entry-offset-at [(:state g) 1])))
+        (is (= 34 (call 'next-ifd-offset-at [(:state g)]))
+            "and the next-IFD pointer sits after the entries")))))
+
+(deftest a-truncated-file-is-refused
+  (doseq [n [0 1 7]]
+    (let [g (read-header (vec (take n (header {}))))]
+      (is (= :refused (:phase g)) n)
+      (is (= :tiff/truncated-header (:reason g)) n))))
+
+(deftest a-refused-header-offers-no-offsets
+  (testing "these are the offsets a decoder would read from; handing them
+            back from a refusal would make the refusal decorative"
+    (doseq [h [(header {:marker [0x58 0x59]}) (header {:magic 99})
+               (header {:ifd 0}) (header {:ifd 10000})]]
+      (let [g (read-header h)]
+        (is (= :refused (:phase g)))
+        (is (= -1 (call 'entry-offset-at [(:state g) 0])))
+        (is (= -1 (call 'next-ifd-offset-at [(:state g)])))))))

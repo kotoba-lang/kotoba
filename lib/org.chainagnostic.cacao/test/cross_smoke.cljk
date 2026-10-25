@@ -1,0 +1,110 @@
+;; nbb smoke for the pair that had never been round-tripped: a CACAO minted by
+;; `cacao.core/mint` (the Clojure/Node minter every actor in this workspace
+;; uses) verified by `cacao.edge.verify` (the WebCrypto verifier a Cloudflare
+;; Worker runs).
+;;
+;;   kbb --backend sci --classpath src:test test/cross_smoke.cljk
+;;
+;; `edge_smoke.cljs` mints with cacao.edge.mint and verifies with
+;; cacao.edge.verify — edge against edge. That pairing is real and it is not
+;; the one production uses: the actor signs with core and the edge verifies.
+;; Nothing crossed the two, and two divergences had accumulated in the gap,
+;; both of which this file would have caught the day they appeared:
+;;
+;;   1. `statement` — core signs it and carries it in the CBOR payload; the
+;;      edge reconstruction did not read it, so a CACAO carrying one failed as
+;;      a BAD SIGNATURE, which is indistinguishable from a wrong key.
+;;   2. millisecond instants — core's verify compares instants as strings and
+;;      tolerates `…:34.567Z`; the edge parses strictly and answers
+;;      `invalid CACAO iat`, rejecting a token whose signature and scope were
+;;      both correct.
+;;
+;; Measured 2026-08-31 against com-junkawasaki/root's x402 bot payer: it hit
+;; BOTH at once, so every payment it would ever have made was refused.
+
+(require '[cacao.core :as core]
+         '[cacao.edge.verify :as verify]
+         '["node:crypto" :as node-crypto])
+
+(def failures (atom []))
+
+(defn check! [label ok?]
+  (if ok?
+    (js/console.log "ok  -" label)
+    (do (js/console.error "FAIL-" label)
+        (swap! failures conj label))))
+
+(def seed (.digest (doto (node-crypto/createHash "sha256") (.update "cross-smoke-seed"))))
+
+(def resource "murakumo:transfer?to=murakumo&credits=1")
+
+(defn mint! [opts]
+  (core/mint (merge {:seed seed
+                     :aud "did:web:api.murakumo.cloud"
+                     :iat "2026-08-31T10:00:00Z"
+                     :exp "2026-08-31T10:05:00Z"
+                     :nonce "cross-smoke-1"
+                     :resources [resource]}
+                    opts)))
+
+;; A fixed instant inside [iat, exp) so the suite does not depend on the clock.
+(def at-sec (js/Math.floor (/ (js/Date.parse "2026-08-31T10:01:00Z") 1000)))
+
+(defn verify! [b64] (verify/verify b64 at-sec))
+
+(defn payload-of
+  "The verified payload, or an empty object. A check that reads a field off an
+  INVALID result would throw and take the whole run with it — the suite would
+  report an exception where it meant to report one failed assertion."
+  [r]
+  (or (aget r "payload") #js {}))
+
+(-> (js/Promise.all
+     #js [(verify! (:cacao-b64 (mint! {})))
+          (verify! (:cacao-b64 (mint! {:statement "Pay 1 credits to murakumo."})))
+          (verify! (:cacao-b64 (mint! {:iat "2026-08-31T10:00:00.123Z"
+                                       :exp "2026-08-31T10:05:00.987Z"})))
+          (verify! (:cacao-b64 (mint! {:iat "2026-08-31T09:00:00Z"
+                                       :exp "2026-08-31T09:05:00Z"})))
+          ;; The conformance suite mints deliberately non-conforming vectors so
+          ;; a verifier can be PROVEN to refuse them. `:instants :raw` is how it
+          ;; still can, now that normalization is the default.
+          (verify! (:cacao-b64 (mint! {:iat "2026-08-31T10:00:00.123456789Z"
+                                       :instants :raw})))])
+    (.then
+     (fn [[plain with-statement ms expired raw]]
+       (check! "core-minted CACAO verifies at the edge" (aget plain "valid"))
+       (check! "…and reports the issuer core derived from the seed"
+               (= (aget plain "iss") (:iss (mint! {}))))
+       (check! "…with the resource it was minted for"
+               (= resource (aget (aget (payload-of plain) "resources") 0)))
+
+       (check! "a statement does not break the signature" (aget with-statement "valid"))
+       (check! "…and the statement itself round-trips"
+               (= "Pay 1 credits to murakumo."
+                  (aget (payload-of with-statement) "statement")))
+
+       (check! "a millisecond instant is normalized at mint, not refused at the edge"
+               (aget ms "valid"))
+       (check! "…and what was signed carries second precision"
+               (= "2026-08-31T10:00:00Z" (aget (payload-of ms) "iat")))
+
+       (check! "an expired CACAO is still refused, and says so"
+               (and (not (aget expired "valid"))
+                    (some? (aget expired "error"))))
+
+       (check! "an opted-out fractional instant still reaches the edge as one"
+               (and (not (aget raw "valid"))
+                    (= "invalid CACAO iat" (aget raw "error"))))
+
+       (check! "an instant no verifier can parse is refused at MINT"
+               (try (mint! {:iat "31/08/2026 10:00"}) false
+                    (catch :default _ true)))
+
+       (if (seq @failures)
+         (do (js/console.error "\ncross_smoke:" (count @failures) "failure(s)")
+             (set! (.-exitCode js/process) 1))
+         (js/console.log "\ncross_smoke: all checks passed"))))
+    (.catch (fn [e]
+              (js/console.error "cross_smoke threw:" (.-message e))
+              (set! (.-exitCode js/process) 1))))

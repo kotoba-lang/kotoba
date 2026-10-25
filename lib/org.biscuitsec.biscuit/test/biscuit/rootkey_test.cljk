@@ -1,0 +1,167 @@
+(ns biscuit.rootkey-test
+  (:require [biscuit.ed25519 :as e]
+            [biscuit.rootkey :as rk]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def subject "kotobase.net/graph/acme")
+
+(defn- digest-fn
+  "A stand-in content digest. What matters to the log is that publisher and
+  verifier use the SAME function; the pre-rotation property is about
+  commitment, not about which hash."
+  [pubkey]
+  (str "d:" (hash (vec pubkey))))
+
+(def k0 (e/keypair (vec (range 32))))
+(def k1 (e/keypair (vec (range 32 64))))
+(def k2 (e/keypair (vec (map #(+ 64 %) (range 32)))))
+(def evil (e/keypair (vec (map #(+ 200 %) (range 32)))))
+
+(defn- record-digest-fn [r] (str "r:" (hash (dissoc r "record-digest"))))
+
+(defn- signed [{:keys [seq keys next-key signer prev-digest]}]
+  (let [payload (rk/record {:subject subject :seq seq :keys keys
+                            :next-key-digest (digest-fn (:public next-key))
+                            :prev-digest prev-digest})]
+    (assoc payload
+           "signer" (:public signer)
+           "sig" (e/sign-fn (:private signer) (pr-str payload)))))
+
+(defn- verify-fn [pub payload sig] (e/verify-fn pub (pr-str payload) sig))
+
+(defn- with-digest [r] (assoc r "record-digest" (record-digest-fn r)))
+
+(def opts {:subject subject :genesis-key-digest (digest-fn (:public k0))
+           :digest-fn digest-fn :verify-fn verify-fn})
+
+(def genesis (signed {:seq 1 :keys [(:public k0)] :next-key k1 :signer k0
+                      :prev-digest nil}))
+
+(deftest a-single-record-log-yields-its-keys
+  (let [r (rk/verify-log [(with-digest genesis)] opts)]
+    (is (= [(vec (:public k0))] (rk/current-keys r)))
+    (is (= 1 (:seq r)))))
+
+(deftest rotation-is-verifiable-without-trusting-the-host
+  (testing "record 2 must be signed by the key record 1 committed to"
+    (let [r2 (signed {:seq 2 :keys [(:public k1)] :next-key k2 :signer k1
+                      :prev-digest (record-digest-fn genesis)})
+          r (rk/verify-log (mapv with-digest [genesis r2]) opts)]
+      (is (= [(vec (:public k1))] (rk/current-keys r)))
+      (is (= 2 (:records r))))))
+
+(deftest a-key-nobody-committed-to-is-refused
+  (testing "the attack: take over the publishing location and serve your own key"
+    (let [forged (signed {:seq 2 :keys [(:public evil)] :next-key evil :signer evil
+                          :prev-digest (record-digest-fn genesis)})
+          r (rk/verify-log (mapv with-digest [genesis forged]) opts)]
+      (is (= :signer-not-committed (:refused r)))
+      (is (= 1 (:at r)))
+      (is (nil? (rk/current-keys r))))))
+
+(deftest a-record-for-another-subject-is-refused
+  (testing "signed-head found this one the hard way: nothing was forged, and
+            it verified anyway"
+    (let [other (assoc genesis "subject" "kotobase.net/graph/other")
+          r (rk/verify-log [(with-digest other)] opts)]
+      (is (= :malformed-or-wrong-subject (:refused r))))))
+
+(deftest a-rollback-is-refused
+  (testing "replaying an earlier record is not new information"
+    (let [r2 (signed {:seq 2 :keys [(:public k1)] :next-key k2 :signer k1
+                      :prev-digest (record-digest-fn genesis)})
+          r (rk/verify-log (mapv with-digest [genesis r2 genesis]) opts)]
+      (is (= :sequence-not-increasing (:refused r))))))
+
+(deftest an-empty-log-is-refused-rather-than-defaulted
+  (testing "a fetch that answered nothing must not become an authority decision"
+    (is (= :empty-log (:refused (rk/verify-log [] opts))))
+    (is (nil? (rk/current-keys (rk/verify-log [] opts))))))
+
+(deftest a-tampered-key-set-breaks-the-signature
+  (let [tampered (assoc genesis "keys" [(vec (:public evil))])
+        r (rk/verify-log [(with-digest tampered)] opts)]
+    (is (= :signature-mismatch (:refused r)))))
+
+(deftest the-genesis-digest-is-pinned-by-the-caller
+  (testing "so the first record is not self-authorising either"
+    (let [r (rk/verify-log [(with-digest genesis)] (assoc opts :genesis-key-digest (digest-fn (:public evil))))]
+      (is (= :signer-not-committed (:refused r))))))
+
+(deftest a-log-that-stops-early-still-answers-what-it-proved
+  (testing "an attacker who takes the location can withhold, not invent"
+    (let [r (rk/verify-log [(with-digest genesis)] opts)]
+      (is (= [(vec (:public k0))] (rk/current-keys r)))
+      (testing "and the caller can see the sequence it reached"
+        (is (= 1 (:seq r)))))))
+
+;; ── publishing and resolving ────────────────────────────────────────────────
+
+(def r2 (signed {:seq 2 :keys [(:public k1)] :next-key k2 :signer k1
+                 :prev-digest (record-digest-fn genesis)}))
+
+(deftest publish-yields-immutable-objects-and-one-tip
+  (let [p (rk/publish [genesis r2] record-digest-fn)]
+    (is (= 2 (count (:objects p))))
+    (is (= (record-digest-fn r2) (:tip p)))
+    (is (= 2 (:seq p)))
+    (testing "and each object is addressed by its own content, so a reader
+              caches it forever and refetches only when the tip moves"
+      (is (every? (fn [[d r]] (= d (record-digest-fn r))) (:objects p))))))
+
+(deftest resolving-walks-back-from-the-tip-and-verifies-forward
+  (let [{:keys [objects tip]} (rk/publish [genesis r2] record-digest-fn)
+        chain (rk/resolve-log tip objects)
+        v (rk/verify-log chain opts)]
+    (is (vector? chain))
+    (is (= 2 (count chain)))
+    (is (= [(vec (:public k1))] (rk/current-keys v)))))
+
+(deftest a-withheld-record-is-refused-not-truncated
+  (testing "a host that serves the tip and hides its predecessor must not
+            leave the reader with a shorter, still-verifying chain"
+    (let [{:keys [objects tip]} (rk/publish [genesis r2] record-digest-fn)
+          partial-store (dissoc objects (record-digest-fn genesis))
+          r (rk/resolve-log tip partial-store)]
+      (is (= :record-not-found (:refused r))))))
+
+(deftest a-planted-tip-cannot-introduce-a-key
+  (testing "the reason the tip needs no signature"
+    (let [{:keys [objects]} (rk/publish [genesis r2] record-digest-fn)
+          rogue (signed {:seq 99 :keys [(:public evil)] :next-key evil :signer evil
+                         :prev-digest (record-digest-fn genesis)})
+          store (assoc objects (record-digest-fn rogue) rogue)
+          chain (rk/resolve-log (record-digest-fn rogue) store)]
+      (testing "it resolves — anyone can write the location"
+        (is (vector? chain)))
+      (testing "and then fails verification, which is where authority lives"
+        (is (= :signer-not-committed (:refused (rk/verify-log chain opts))))))))
+
+(deftest a-cycle-is-refused-rather-than-walked-forever
+  (let [a (signed {:seq 1 :keys [(:public k0)] :next-key k1 :signer k0 :prev-digest "loop"})
+        store {"loop" a (record-digest-fn a) a}]
+    (is (= :cycle (:refused (rk/resolve-log (record-digest-fn a) store))))))
+
+(deftest an-unbounded-chain-is-refused
+  (testing "a tip is fetched from a host that may be hostile"
+    ;; A chain that never repeats a digest, so cycle detection cannot catch
+    ;; it — the bound is the only thing that stops the walk.
+    (let [endless (fn [d] {"prev" (str d "x") "seq" 1})]
+      (is (= :chain-too-long (:refused (rk/resolve-log "start" endless 8)))))))
+
+(deftest a-regrafted-history-breaks-the-hash-link
+  (testing "a record naming a different predecessor is a different history"
+    (let [other-genesis (signed {:seq 1 :keys [(:public k0)] :next-key k1 :signer k0
+                                 :prev-digest "elsewhere"})
+          chain [(with-digest other-genesis) (with-digest r2)]]
+      ;; r2 names the ORIGINAL genesis, so following the other one breaks.
+      (is (= :broken-hash-link (:refused (rk/verify-log chain opts)))))))
+
+(deftest the-canonical-form-does-not-depend-on-key-order
+  (testing "publisher and verifier must read the same bytes for the same value"
+    (let [a genesis
+          b (into {} (reverse (seq genesis)))]
+      (is (= (rk/canonical a) (rk/canonical b)))))
+  (testing "and a record cannot contain its own address"
+    (is (= (rk/canonical genesis)
+           (rk/canonical (assoc genesis "record-digest" "anything"))))))

@@ -1,0 +1,181 @@
+;; The service provider's acceptance decision, as a Kotoba application
+;; (ADR-2608261100) -- SAML 2.0 Core §2.5 (Conditions), §2.4.1.2
+;; (SubjectConfirmationData), and Web SSO Profile §4.1.4.3.
+;;
+;;   problem (observed, expected) -> keyword   ; :none when acceptable
+;;
+;; ## A signed assertion is not an acceptable one
+;;
+;; This repo is an emitter. Its README says XML-DSig is host-owned -- "real
+;; signature verification before trusting an inbound one" -- and
+;; `parse-attributes` says it "documents the EDN shape a host hands back
+;; after it has parsed and VERIFIED a real `<saml:Assertion>`".
+;;
+;; That word carries more than it can. A signature says the IdP minted this
+;; assertion. It does not say the IdP minted it FOR THIS SERVICE PROVIDER,
+;; for THIS login attempt, to be delivered HERE, and that it is valid NOW.
+;; Those are six separate comparisons, none of them cryptographic, and none
+;; of them are in this library or named anywhere as missing. The failures
+;; they prevent are the ones SAML deployments actually suffer:
+;;
+;;   audience        an assertion minted for another SP that trusts the
+;;                   same IdP is replayed here
+;;   in-response-to  an assertion the user never asked for is posted to the
+;;                   ACS endpoint -- login CSRF, and the user ends up
+;;                   signed in as the attacker
+;;   recipient       an assertion delivered to the wrong endpoint is
+;;                   forwarded to the right one
+;;   destination     the Response says where it was meant to go, and it is
+;;                   not here
+;;   conditions      an assertion with no `<Conditions>` has no window and
+;;                   no audience restriction: a bearer token with no scope
+;;   status          a Response whose StatusCode is not Success still
+;;                   carries an assertion element
+;;
+;;   the guest owns   whether this assertion is addressed to this SP, for
+;;                    this attempt, at this endpoint, now
+;;   the host owns    the XML, the signature, the decryption, and the clock
+;;
+;; ## The window arrives as decided booleans, and that is a tooling hole
+;;
+;; `NotBefore` and `NotOnOrAfter` are xsd:dateTime, and comparing them is a
+;; decision, not a mechanism -- the SIWE slice in `org-chainagnostic-cacao`
+;; makes exactly that argument and implements the parser. It cannot be
+;; reused here: a Kotoba guest compiled on the JVM-free route is ONE FILE
+;; and cannot reach a shared stdlib (ADR-2608302100, where `--prelude` was
+;; measured to be silently ignored). Writing a second RFC 3339 parser is
+;; how "a check implemented twice" begins, so this guest takes
+;; `:not-yet-valid?` and `:expired?` already decided and says so here.
+;; When the project route runs JVM-free, the window moves in.
+;;
+;; ## An expectation the SP did not supply is not satisfied
+;;
+;; Answered first and on its own. A service provider that never configured
+;; its own entity ID has a bug in the service provider, and hearing
+;; `:audience-mismatch` sends its author to look at the IdP.
+;;
+;; `.cljc` stays the oracle for the emitter and is not required from here
+;; (require-graph). It did not grow a second copy of anything -- there was
+;; nothing here to copy (ADR-2608261100).
+
+(ns saml.acceptance
+  (:export [main problem status-success? unsolicited?]))
+
+;; --- document accessors -------------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- blank? [s :string] :bool
+  (if (= (string-length s) 0) true false))
+
+(defn- same? [a :string b :string] :bool
+  (if (= (string-length a) (string-length b))
+    (if (string-contains? a b) true false)
+    false))
+
+;; --- the Success URI (SAML 2.0 Core §3.2.2.2) -----------------------------------
+
+(defn status-success? [code :string] :bool
+  (same? code "urn:oasis:names:tc:SAML:2.0:status:Success"))
+
+;; An assertion carrying no InResponseTo was not produced for a request this
+;; SP sent. That is a legitimate SAML mode (IdP-initiated SSO) and it is
+;; also how an assertion gets posted to an ACS endpoint by someone else, so
+;; it is a mode the SP has to ask for rather than one it falls into.
+(defn unsolicited? [in-response-to :string] :bool (blank? in-response-to))
+
+;; --- the decision ---------------------------------------------------------------
+
+(defn problem [observed :document expected :document] :keyword
+  (let [want-audience (ds expected :audience)
+        want-acs (ds expected :acs-url)
+        want-issuer (ds expected :idp-issuer)
+        want-request (ds expected :request-id)]
+    (cond
+      ;; What the service provider failed to say.
+      (blank? want-audience) :expectation-missing
+      (blank? want-acs) :expectation-missing
+      (blank? want-issuer) :expectation-missing
+
+      ;; A request ID is required unless the SP has said it accepts
+      ;; unsolicited responses. Leaving it unset is not the same as opting
+      ;; in, and treating it as opt-in would make the safer configuration
+      ;; the one that takes an extra key.
+      (if (db expected :allow-unsolicited?) false (blank? want-request))
+      :expectation-missing
+
+      ;; The one thing the host was supposed to have done.
+      (if (db observed :signed?) false true) :unsigned
+
+      (if (status-success? (ds observed :status-code)) false true)
+      :status-not-success
+
+      (blank? (ds observed :assertion-issuer)) :missing-issuer
+      (if (same? (ds observed :assertion-issuer) want-issuer) false true)
+      :issuer-mismatch
+
+      ;; No `<Conditions>` means no window and no audience restriction.
+      (if (db observed :conditions-present?) false true) :missing-conditions
+
+      (blank? (ds observed :audience)) :missing-audience
+      (if (same? (ds observed :audience) want-audience) false true)
+      :audience-mismatch
+
+      (db observed :not-yet-valid?) :not-yet-valid
+      (db observed :expired?) :expired
+
+      ;; §2.4.1.2: the Recipient is where the IdP said to deliver this.
+      (blank? (ds observed :recipient)) :missing-recipient
+      (if (same? (ds observed :recipient) want-acs) false true) :recipient-mismatch
+      (db observed :subject-confirmation-expired?) :subject-confirmation-expired
+
+      ;; Web SSO Profile §4.1.4.3.
+      (if (unsolicited? (ds observed :in-response-to))
+        (if (db expected :allow-unsolicited?) false true)
+        false)
+      :unsolicited-response
+
+      (if (unsolicited? (ds observed :in-response-to)) false
+          (if (same? (ds observed :in-response-to) want-request) false true))
+      :in-response-to-mismatch
+
+      ;; The Response element's Destination, when the IdP set one.
+      (if (blank? (ds observed :response-destination)) false
+          (if (same? (ds observed :response-destination) want-acs) false true))
+      :destination-mismatch
+
+      ;; An assertion that authenticates nobody.
+      (blank? (ds observed :name-id)) :missing-name-id
+
+      :else :none)))
+
+;; --- the artifact's own conformance check ------------------------------------------
+;;
+;; `main` is the browser profile's entry point -- `runtime/browser-host.mjs`
+;; refuses to instantiate a module without one -- and it is not a stub. It
+;; runs the two decisions that need no document back through the code above
+;; and answers 0 only when each still decides the way this object was built
+;; to decide, so a COMPILED artifact can be asked whether it is itself by a
+;; host that knows nothing about SAML.
+;;
+;; The document-taking `problem` is deliberately NOT here: `main` takes no
+;; arguments, so it would have to build an assertion itself, and a module's
+;; fuel is a private global baked in at compile time (512 by default) spent
+;; over the life of an INSTANCE. The suite calls `problem` with documents
+;; the host builds, which is both cheaper and closer to how a service
+;; provider would.
+
+(defn main [] :i64
+  (cond
+    (if (status-success? "urn:oasis:names:tc:SAML:2.0:status:Success") false true) 1
+    (if (status-success? "urn:oasis:names:tc:SAML:2.0:status:Requester") true false) 2
+    (if (unsolicited? "") false true) 3
+    (if (unsolicited? "_req1") true false) 4
+    :else 0))

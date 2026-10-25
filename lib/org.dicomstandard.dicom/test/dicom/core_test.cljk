@@ -1,0 +1,511 @@
+(ns dicom.core-test
+  "Test vectors are cited to PS3.5/PS3.10 section next to each assertion
+  where the *rule* being tested is normative text; the specific *byte
+  sequences* used to exercise that rule are, unless said otherwise,
+  ;; constructed, not a published spec vector — DICOM's freely-published
+  standard describes the wire format precisely but (unlike e.g. Modbus's
+  V1.1b3 Annex worked examples) does not ship a byte-for-byte annotated
+  sample file in the normative text itself. Every rule cited here was
+  fetched from the current online edition of the standard
+  (dicom.nema.org) during development, quoted in the relevant
+  `src/dicom/*.cljc` docstring, and is re-quoted at point of use below."
+  (:require [kotoba.test :refer [deftest testing is are]]
+            [dicom.bytes :as b]
+            [dicom.tag :as tag]
+            [dicom.vr :as vr]
+            [dicom.numeric :as num]
+            [dicom.dictionary :as dict]
+            [dicom.element :as el]
+            [dicom.dataset :as ds]
+            [dicom.pixel-data :as pixel]
+            [dicom.file-meta :as fm]
+            [dicom.transfer-syntax :as ts]
+            [dicom.file :as file]))
+
+;; =========================================================================
+;; dicom.bytes — the byte-order primitives everything else is built on
+;; =========================================================================
+
+(deftest u16-round-trip
+  (testing "every 16-bit value round-trips through both byte orders"
+    (doseq [order [:little :big]
+            v (concat (range 0 260) [0x7FFF 0x8000 0xFFFF])]
+      (is (= v (first (b/read-u16 (b/write-u16 v order) 0 order)))
+          (str "u16 " v " " order)))))
+
+(deftest u16-endianness-is-actually-different
+  ;; The point of an endian test isn't round-trip (a bug that swaps bytes
+  ;; both ways round-trips too) — it's checking the two orders disagree
+  ;; on a value where they should.
+  (is (= [0x34 0x12] (b/write-u16 0x1234 :little)))
+  (is (= [0x12 0x34] (b/write-u16 0x1234 :big)))
+  (is (= 0x1234 (first (b/read-u16 [0x34 0x12] 0 :little))))
+  (is (= 0x1234 (first (b/read-u16 [0x12 0x34] 0 :big)))))
+
+(deftest u32-round-trip
+  (testing "u32 round-trips across the full range, including values needing
+            more than 31 bits (the classic ClojureScript ToInt32 trap)"
+    (doseq [order [:little :big]
+            v [0 1 255 256 65535 65536 0x7FFFFFFF 0x80000000
+               0xFFFFFFFE vr/undefined-length]]
+      (is (= v (first (b/read-u32 (b/write-u32 v order) 0 order)))
+          (str "u32 " v " " order)))))
+
+(deftest u32-undefined-length-sentinel-is-exact
+  ;; 0xFFFFFFFF is the "undefined length" sentinel (PS3.5 §7.1.1: "The
+  ;; Value (Item) Length Field shall contain the value FFFFFFFFH to
+  ;; indicate an Undefined Length"). If read-u32 produced a JS-signed
+  ;; -1 instead of the unsigned value on cljs, every `(= length
+  ;; vr/undefined-length)` comparison in dicom.dataset would silently
+  ;; fail on that runtime alone.
+  (is (= 4294967295 (first (b/read-u32 [0xFF 0xFF 0xFF 0xFF] 0 :little))))
+  (is (= 4294967295 vr/undefined-length)))
+
+(deftest ascii-round-trip
+  (is (= [:ok "HELLO"] (b/bytes->ascii (second (b/ascii->bytes "HELLO")))))
+  (is (= [:error :dicom/non-ascii-byte] (b/bytes->ascii [0x80])))
+  (is (= [:error :dicom/non-ascii-char] (b/ascii->bytes "café"))))
+
+;; =========================================================================
+;; dicom.vr — Table 6.2-1 / Table 7.1-1 / Table 7.1-2 (PS3.5 §7.1, §6.2)
+;; =========================================================================
+;; Fetched 2026-08-30 from https://dicom.nema.org/.../part05/chapter_7.html:
+;; "Explicit VR with Short Length ... For VRs like AE, AS, AT, CS, DA, DS,
+;; DT, FL, FD, IS, LO, LT, PN, SH, SL, SS, ST, TM, UI, UL, US" (Table 7.1-2)
+;; and "for VRs of OB, SQ and UN" (among others) the 32-bit long form
+;; applies (Table 7.1-1, §7.1.2).
+
+(deftest vr-table-matches-ps3.5-table-7.1
+  (is (= #{:AE :AS :AT :CS :DA :DS :DT :FL :FD :IS :LO :LT :PN :SH :SL :SS
+           :ST :TM :UI :UL :US}
+         vr/short-form-vrs))
+  (is (= #{:OB :OD :OF :OW :SQ :UN :UT} vr/long-form-vrs))
+  (is (= 28 (count vr/all-vrs)) "task scope: exactly the 28 named VRs"))
+
+(deftest vr-code-round-trip
+  (doseq [v vr/all-vrs]
+    (is (= [:ok v] (vr/code->vr (vr/vr->code v))) (str v))))
+
+(deftest unknown-vr-code-is-a-named-error
+  (is (= [:error :dicom/unknown-vr] (vr/code->vr [(b/char-code \Z) (b/char-code \Z)]))))
+
+;; =========================================================================
+;; dicom.tag
+;; =========================================================================
+
+(deftest tag-round-trip
+  (doseq [order [:little :big]
+          [g e] [[0 0] [2 16] [8 5] [0x7FE0 0x0010] [0xFFFE 0xE000] [0xFFFF 0xFFFF]]]
+    (is (= {:group g :element e}
+           (first (tag/read-tag (tag/write-tag {:group g :element e} order) 0 order))))))
+
+(deftest tag-group-element-are-two-separate-fields-not-one-u32
+  ;; PS3.5 §7.1: the tag is (group, element), each its own 2-byte field.
+  ;; A decoder that reads the 4 bytes as one big-endian u32 and splits it
+  ;; happens to agree with two big-endian u16 reads, but doing the same
+  ;; trick for little-endian would swap group and element. This asserts
+  ;; the little-endian case explicitly.
+  (is (= {:group 0x0008 :element 0x0010}
+         (first (tag/read-tag [0x08 0x00 0x10 0x00] 0 :little))))
+  (is (not= {:group 0x0008 :element 0x0010}
+            (first (tag/read-tag [0x08 0x00 0x10 0x00] 0 :big)))))
+
+(deftest private-tag-is-odd-group
+  (is (tag/private? {:group 0x0009 :element 0x0010}))
+  (is (not (tag/private? {:group 0x0008 :element 0x0010}))))
+
+;; =========================================================================
+;; dicom.numeric — signed conversion and IEEE-754 floats
+;; =========================================================================
+
+(deftest signed-16-32-round-trip
+  (doseq [v (range -32768 32768 137)]
+    (is (= v (num/u16->i16 (num/i16->u16 v)))))
+  (doseq [v [-2147483648 -1 0 1 2147483647 -100000 100000]]
+    (is (= v (num/u32->i32 (num/i32->u32 v))))))
+
+(deftest signed-conversion-not-bit-or-with-zero
+  ;; The trap this exists to avoid (see dicom.numeric docstring): on the
+  ;; JVM `(bit-or 0xFFFFFFFF 0)` is the *positive* 4294967295 because
+  ;; bit-or operates on 64-bit longs, not a 32-bit truncation. Asserting
+  ;; the actual two's-complement value here, on whichever runtime is
+  ;; running, is the check that would have caught reaching for that idiom.
+  (is (= -1 (num/u32->i32 0xFFFFFFFF)))
+  (is (= -32768 (num/u16->i16 0x8000))))
+
+(deftest float32-known-ieee754-bit-patterns
+  ;; Well-known IEEE 754 binary32 bit patterns, not DICOM-specific --
+  ;; https://en.wikipedia.org/wiki/Single-precision_floating-point_format
+  ;; 1.0 = 0x3F800000, -2.0 = 0xC0000000, 0.0 = 0x00000000
+  (are [bits v] (= v (num/bytes->f32 (b/write-u32 bits :big) :big))
+    0x3F800000 1.0
+    0xC0000000 -2.0
+    0x00000000 0.0)
+  (doseq [order [:little :big]
+          v [1.0 -2.0 0.0 3.140000104904175 -0.5]]
+    (is (< #?(:clj (Math/abs (double (- v (num/bytes->f32 (num/f32->bytes v order) order))))
+              :cljs (js/Math.abs (- v (num/bytes->f32 (num/f32->bytes v order) order))))
+           1e-6)
+        (str v " " order))))
+
+(deftest float64-round-trip
+  (doseq [order [:little :big]
+          v [1.0 -2.0 0.0 3.14159265358979 -123456.789]]
+    (is (= v (num/bytes->f64 (num/f64->bytes v order) order)) (str v " " order))))
+
+;; =========================================================================
+;; dicom.dictionary
+;; =========================================================================
+
+(deftest dictionary-resolves-known-tags
+  (is (= :PN (dict/resolve-vr {:group 0x0010 :element 0x0010})))
+  (is (= :UI (dict/resolve-vr {:group 0x0008 :element 0x0018}))))
+
+(deftest dictionary-falls-back-to-UN-per-ps3.5-6.2.2
+  ;; "If the VR of a data element is not known, ... Unknown (UN) shall be
+  ;; used." — PS3.5 §6.2.2.
+  (is (= :UN (dict/resolve-vr {:group 0x0009 :element 0x1234}))))
+
+;; =========================================================================
+;; dicom.element — header parse, padding, per-VR value encode/decode
+;; =========================================================================
+
+(deftest explicit-header-short-form
+  ;; (0010,0010) PN 'DOE^JOHN' -- 8 ASCII bytes, already even length.
+  ;; Wire: tag LE(4) + "PN"(2) + len16 LE(2) = 08 00 10 00 50 4E 08 00
+  (let [bs [0x08 0x00 0x10 0x00 (b/char-code \P) (b/char-code \N) 0x08 0x00]
+        [{:keys [tag vr length]} off] (el/read-explicit-header bs 0 :little)]
+    (is (= {:group 0x0008 :element 0x0010} tag))
+    (is (= :PN vr))
+    (is (= 8 length))
+    (is (= 8 off))))
+
+(deftest explicit-header-long-form-has-reserved-bytes
+  ;; (7FE0,0010) OB, reserved=0000, length32=4 -- an OB header is 12 bytes
+  ;; total (4 tag + 2 VR + 2 reserved + 4 length), not 8.
+  (let [bs [0xE0 0x7F 0x10 0x00 (b/char-code \O) (b/char-code \B) 0x00 0x00 0x04 0x00 0x00 0x00]
+        [{:keys [tag vr length]} off] (el/read-explicit-header bs 0 :little)]
+    (is (= tag/pixel-data tag))
+    (is (= :OB vr))
+    (is (= 4 length))
+    (is (= 12 off))))
+
+(deftest implicit-header-has-no-vr-field-and-always-4-byte-length
+  ;; Same (0010,0010) tag, implicit VR: tag(4) + length32(4) = 8 bytes,
+  ;; VR resolved from the dictionary rather than the wire.
+  (let [bs [0x10 0x00 0x10 0x00 0x08 0x00 0x00 0x00]
+        [{:keys [tag vr length]} off] (el/read-implicit-header bs 0 :little nil)]
+    (is (= {:group 0x0010 :element 0x0010} tag))
+    (is (= :PN vr))
+    (is (= 8 length))
+    (is (= 8 off))))
+
+(deftest text-padding-space-except-ui-and-binary-null
+  ;; PS3.5 §6.2 (fetched): "Values with VRs constructed of character
+  ;; strings, except in the case of the VR UI, shall be padded with
+  ;; SPACE characters (20H) ... Values with a VR of UI shall be padded
+  ;; with a single trailing NULL (00H) ... Values with a VR of OB shall
+  ;; be padded with a single trailing NULL byte value (00H)."
+  (is (= [:ok [(b/char-code \A) (b/char-code \B) (b/char-code \C) 0x20]] (el/encode-text "ABC" :SH)))
+  (is (= [:ok [(b/char-code \A) (b/char-code \B) (b/char-code \C) 0x00]] (el/encode-text "ABC" :UI)))
+  (is (= [:ok [1 2 3 0x00]] (el/encode-value [1 2 3] :OB :little))))
+
+(deftest even-length-values-are-not-padded
+  (is (= [:ok [(b/char-code \A) (b/char-code \B)]] (el/encode-text "AB" :SH))))
+
+(deftest multivalued-text-splits-on-backslash-single-valued-does-not
+  (is (= [:ok ["A" "BB" "CCC"]] (el/decode-text (mapv b/char-code "A\\BB\\CCC") :CS)))
+  (testing "LT/ST/UT are VM=1: a literal backslash in the text is not a delimiter"
+    (is (= [:ok "A\\BB\\CCC"] (el/decode-text (mapv b/char-code "A\\BB\\CCC") :LT)))))
+
+;; =========================================================================
+;; Property test: decode(encode(x)) == x, swept across every VR and both
+;; Explicit/Implicit VR x little/big endian transfer syntaxes.
+;; =========================================================================
+;; This is the conformance-floor requirement (#5): not "our own round trip
+;; agrees with itself for one VR", but every VR in the PS3.5 §6.2 table
+;; (bar SQ, which has its own nested-dataset test below because its value
+;; isn't a scalar) x all 4 header-shape/endian combinations = 108 cases.
+
+(def sweep-samples
+  "One representative value per non-SQ VR, chosen so a round trip through
+  `encode-value`/`decode-value` needs no lossy normalisation to compare
+  equal: multivalued text VRs get a vector (matching what decode always
+  returns for VM > 1 VRs — see `dicom.element` docstring), binary VRs get
+  an already-even-length byte vector (so the even-length pad byte never
+  gets appended, which would otherwise make encode(v) decode back to
+  v ++ [pad], not v)."
+  {:AE ["ECHOSCP"]        :AS ["032Y"]           :AT [{:group 0x0008 :element 0x0010}]
+   :CS ["ISO_IR 100"]     :DA ["20240102"]       :DS ["3.14" "-2.5"]
+   :DT ["20240102120000.000000+0000"] :FL [1.0 -2.5] :FD [3.14159265 -100.0]
+   :IS ["12" "34"]        :LO ["Some Long String"] :LT "A long text value with spaces."
+   :OB [1 2 3 4]          :OD [1 2 3 4 5 6 7 8]  :OF [1 2 3 4]
+   :OW [1 2 3 4]          :PN ["DOE^JOHN"]       :SH ["ID01"]
+   :SL [-2147483648 0 2147483647] :SS [-32768 0 32767] :ST "short text block"
+   :TM ["235959"]         :UI ["1.2.840.10008.1.2.1"] :UL [0 4294967295]
+   :UN [9 9 9 9]          :US [0 1 65535]        :UT "unlimited text value here"})
+
+(def sweep-dictionary
+  "One private tag per swept VR, so the Implicit-VR leg of the sweep can
+  resolve a VR without relying on the shipped `base-dictionary`."
+  (into {} (map-indexed (fn [i vr] [{:group 0x0009 :element i} vr])
+                         (keys sweep-samples))))
+
+(def sweep-tags
+  (into {} (map (fn [[t vr]] [vr t]) sweep-dictionary)))
+
+(deftest round-trip-property-every-vr-x-every-transfer-syntax
+  (doseq [[element-vr sample] sweep-samples
+          endian [:little :big]
+          vr-mode [:explicit :implicit]]
+    (let [syntax {:vr-mode vr-mode :endian endian :dictionary sweep-dictionary}
+          t (get sweep-tags element-vr)
+          el-map {:tag t :vr element-vr :value sample}
+          encoded (ds/encode-element-in-syntax el-map syntax)]
+      (testing (str element-vr " " vr-mode " " endian)
+        (is (vector? encoded) (str "encode failed: " (pr-str encoded)))
+        (when (vector? encoded)
+          (let [decoded (ds/decode-element encoded 0 syntax)]
+            (is (not= :error (first decoded)) (str "decode failed: " (pr-str decoded)))
+            (when (not= :error (first decoded))
+              (let [[decoded-el off] decoded]
+                (is (= (count encoded) off) "consumed exactly the encoded bytes")
+                (is (= t (:tag decoded-el)))
+                (is (= element-vr (:vr decoded-el)))
+                (is (= sample (:value decoded-el))
+                    (str "value mismatch: " (pr-str sample) " -> " (pr-str (:value decoded-el))))))))))))
+
+;; =========================================================================
+;; Sequences — PS3.5 §7.5 (fetched: "The VR identified 'SQ' shall be used
+;; for Data Elements with a Value consisting of a Sequence of zero or more
+;; Items, where each Item contains a set of Data Elements." Item/
+;; delimiter tags "shall be encoded as Implicit VR" -- i.e. no VR field,
+;; always tag+length32, in both Explicit and Implicit VR datasets.)
+;; =========================================================================
+
+(defn- name-element [s] {:tag {:group 0x0010 :element 0x0010} :vr :PN :value [s]})
+
+(deftest sequence-defined-length-round-trip
+  (doseq [vr-mode [:explicit :implicit] endian [:little :big]]
+    (let [syntax {:vr-mode vr-mode :endian endian}
+          sq-tag {:group 0x0040 :element 0x0100} ; Scheduled Procedure Step Sequence
+          items [{:dataset [(name-element "ONE^PATIENT")]}
+                 {:dataset [(name-element "TWO^PATIENT")]}]
+          el-map {:tag sq-tag :vr :SQ :value items}
+          encoded (ds/encode-element-in-syntax el-map (assoc syntax :dictionary (assoc dict/base-dictionary sq-tag :SQ)))
+          [decoded off] (ds/decode-element encoded 0 (assoc syntax :dictionary (assoc dict/base-dictionary sq-tag :SQ)))]
+      (testing (str vr-mode " " endian)
+        (is (= off (count encoded)))
+        (is (= :SQ (:vr decoded)))
+        (is (= 2 (count (:value decoded))))
+        (is (= ["ONE^PATIENT"] (:value (first (:dataset (first (:value decoded)))))))
+        (is (= ["TWO^PATIENT"] (:value (first (:dataset (second (:value decoded)))))))))))
+
+(deftest sequence-undefined-length-decode
+  ;; ;; constructed, not a published spec vector -- hand-built bytes
+  ;; exercising the *structural rule* PS3.5 §7.5 states: an SQ with
+  ;; length 0xFFFFFFFF is read as a run of Items (each itself either
+  ;; defined- or undefined-length) up to a Sequence Delimitation Item
+  ;; (FFFE,E0DD length=0). Here the SQ itself is undefined-length and
+  ;; contains exactly one item with a *defined* length, to isolate the
+  ;; SQ-level delimiter from the item-level one (covered separately
+  ;; below).
+  (let [order :little
+        sq-header (into (tag/write-tag {:group 0x0040 :element 0x0100} order)
+                         (into [(b/char-code \S) (b/char-code \Q) 0 0] (b/write-u32 vr/undefined-length order)))
+        item-content (ds/encode-dataset [(name-element "ONE^PATIENT")]
+                                          {:vr-mode :explicit :endian order})
+        item (into (into (tag/write-tag tag/item order) (b/write-u32 (count item-content) order))
+                    item-content)
+        seq-delim (into (tag/write-tag tag/sequence-delimitation order) (b/write-u32 0 order))
+        bs (into (into sq-header item) seq-delim)
+        [decoded off] (ds/decode-element bs 0 {:vr-mode :explicit :endian order})]
+    (is (= (count bs) off))
+    (is (= :SQ (:vr decoded)))
+    (is (= vr/undefined-length (:length decoded)))
+    (is (= 1 (count (:value decoded))))
+    (is (= ["ONE^PATIENT"] (:value (first (:dataset (first (:value decoded)))))))))
+
+(deftest item-undefined-length-decode
+  ;; ;; constructed, not a published spec vector -- an item whose own
+  ;; length is 0xFFFFFFFF, terminated by an Item Delimitation Item
+  ;; (FFFE,E00D length=0) rather than the item's byte count.
+  (let [order :little
+        item-content (ds/encode-dataset [(name-element "SOLO^PATIENT")]
+                                          {:vr-mode :explicit :endian order})
+        item (into (into (tag/write-tag tag/item order) (b/write-u32 vr/undefined-length order))
+                    (into item-content
+                          (into (tag/write-tag tag/item-delimitation order) (b/write-u32 0 order))))
+        seq-delim (into (tag/write-tag tag/sequence-delimitation order) (b/write-u32 0 order))
+        sq-header (into (tag/write-tag {:group 0x0040 :element 0x0100} order)
+                         (into [(b/char-code \S) (b/char-code \Q) 0 0] (b/write-u32 vr/undefined-length order)))
+        bs (into (into sq-header item) seq-delim)
+        [decoded off] (ds/decode-element bs 0 {:vr-mode :explicit :endian order})]
+    (is (= (count bs) off))
+    (is (= vr/undefined-length (:length (first (:value decoded)))))
+    (is (= ["SOLO^PATIENT"] (:value (first (:dataset (first (:value decoded)))))))))
+
+;; =========================================================================
+;; Encapsulated Pixel Data -- PS3.5 Annex A.4
+;; =========================================================================
+
+(deftest encapsulated-pixel-data-round-trip
+  (doseq [order [:little :big]]
+    (let [payload {:offset-table [] :fragments [[0xFF 0xD8 0x00 0x01] [0xAB 0xCD 0xEF 0x00]]}
+          el-map {:tag tag/pixel-data :vr :OB :value payload}
+          encoded (ds/encode-element-in-syntax el-map {:vr-mode :explicit :endian order})
+          [decoded off] (ds/decode-element encoded 0 {:vr-mode :explicit :endian order})]
+      (testing order
+        (is (= (count encoded) off))
+        (is (= :OB (:vr decoded)))
+        (is (= vr/undefined-length (:length decoded)))
+        (is (= [] (:offset-table (:value decoded))))
+        (is (= [[0xFF 0xD8 0x00 0x01] [0xAB 0xCD 0xEF 0x00]] (:fragments (:value decoded))))))))
+
+(deftest pixel-data-encapsulated-detection
+  (is (pixel/encapsulated? {:tag tag/pixel-data :vr :OB :length vr/undefined-length}))
+  (is (not (pixel/encapsulated? {:tag tag/pixel-data :vr :OB :length 100}))
+      "a defined length, even on the pixel data tag with a binary VR, is native form")
+  (is (pixel/encapsulated? {:tag tag/pixel-data :vr :OW :length vr/undefined-length})
+      "OW is also a legal encapsulated-form VR, not only OB")
+  (is (not (pixel/encapsulated? {:tag {:group 0x0009 :element 0x0001} :vr :OB :length vr/undefined-length}))
+      "the tag must actually be (7FE0,0010) -- an unrelated private OB element is not pixel data"))
+
+;; =========================================================================
+;; File Meta Information -- PS3.10 §7.1 (fetched: "The preamble ... is
+;; available for use as defined by Media Storage Application Profiles or
+;; specific implementations." / "The four byte DICOM Prefix shall
+;; contain the character string 'DICM'" / "Except for the 128 byte
+;; preamble and the 4 byte prefix, the File Meta Information shall be
+;; encoded using the Explicit VR Little Endian Transfer Syntax
+;; (UID=1.2.840.10008.1.2.1).")
+;; =========================================================================
+
+(defn- sample-file-meta-elements []
+  [{:tag tag/media-storage-sop-class-uid :vr :UI :value ["1.2.840.10008.5.1.4.1.1.7"]}
+   {:tag tag/media-storage-sop-instance-uid :vr :UI :value ["1.2.3.4.5.6.7.8.9"]}
+   {:tag tag/transfer-syntax-uid :vr :UI :value ["1.2.840.10008.1.2.1"]}])
+
+(deftest file-meta-header-round-trip
+  (let [elements (fm/with-group-length (sample-file-meta-elements))
+        encoded (fm/encode-header {:elements elements})
+        [status decoded off] (fm/decode-header encoded 0)]
+    (is (= :ok status))
+    (is (= (count encoded) off))
+    (is (= (repeat fm/preamble-length 0) (:preamble decoded)))
+    (is (= "1.2.840.10008.1.2.1" (fm/transfer-syntax-uid decoded)))
+    (is (= (:tag (first (:elements decoded))) tag/file-meta-information-group-length))))
+
+(deftest file-meta-bad-magic-is-a-named-error
+  (let [elements (fm/with-group-length (sample-file-meta-elements))
+        good (fm/encode-header {:elements elements})
+        ;; corrupt byte 128 (the first byte of "DICM") -- one changed
+        ;; byte, everything else untouched
+        corrupted (assoc (vec good) fm/preamble-length (inc (nth good fm/preamble-length)))]
+    (is (= [:error :dicom/bad-magic] (fm/decode-header corrupted 0)))))
+
+(deftest file-meta-truncated-file-is-a-named-error
+  (is (= [:error :dicom/truncated-file] (fm/decode-header [1 2 3] 0))))
+
+;; =========================================================================
+;; Transfer syntax negotiation and the full Part 10 file
+;; =========================================================================
+
+(deftest transfer-syntax-lookup
+  (is (= [:ok {:vr-mode :implicit :endian :little}] (ts/syntax-for "1.2.840.10008.1.2")))
+  (is (= [:ok {:vr-mode :explicit :endian :little}] (ts/syntax-for "1.2.840.10008.1.2.1")))
+  (is (= [:ok {:vr-mode :explicit :endian :big}] (ts/syntax-for "1.2.840.10008.1.2.2")))
+  (is (= [:error :dicom/unknown-transfer-syntax] (ts/syntax-for "9.9.9.9"))))
+
+(deftest full-file-round-trip-explicit-vr-little-endian
+  (let [file-meta (sample-file-meta-elements)
+        dataset [(name-element "DOE^JOHN")
+                 {:tag {:group 0x0010 :element 0x0020} :vr :LO :value ["PAT001"]}
+                 {:tag {:group 0x0028 :element 0x0010} :vr :US :value [512]}
+                 {:tag {:group 0x0028 :element 0x0030} :vr :DS :value ["0.5" "0.5"]}]
+        record {:file-meta file-meta :transfer-syntax-uid "1.2.840.10008.1.2.1" :dataset dataset}
+        encoded (file/encode record)
+        decoded (file/decode encoded)]
+    (is (vector? encoded) (str encoded))
+    (is (= :ok (first decoded)) (str decoded))
+    (let [[_ok result] decoded]
+      (is (= "1.2.840.10008.1.2.1" (:transfer-syntax-uid result)))
+      (is (= dataset (mapv #(dissoc % :length) (:dataset result)))))))
+
+(deftest full-file-round-trip-implicit-vr-little-endian
+  ;; Implicit VR needs every dataset tag to resolve via a dictionary --
+  ;; all four tags used here are in `dicom.dictionary/base-dictionary`.
+  (let [file-meta (assoc-in (vec (sample-file-meta-elements)) [2 :value] ["1.2.840.10008.1.2"])
+        dataset [(name-element "DOE^JOHN")
+                 {:tag {:group 0x0010 :element 0x0020} :vr :LO :value ["PAT001"]}
+                 {:tag {:group 0x0028 :element 0x0010} :vr :US :value [512]}]
+        record {:file-meta file-meta
+                :transfer-syntax-uid "1.2.840.10008.1.2"
+                :dataset dataset}
+        encoded (file/encode record)
+        decoded (file/decode encoded)]
+    (is (= :ok (first decoded)) (str decoded))
+    (is (= dataset (mapv #(dissoc % :length) (:dataset (second decoded)))))))
+
+(deftest full-file-round-trip-explicit-vr-big-endian
+  (let [file-meta (sample-file-meta-elements)
+        dataset [(name-element "DOE^JOHN")
+                 {:tag {:group 0x0028 :element 0x0010} :vr :US :value [512]}
+                 {:tag {:group 0x0028 :element 0x0102} :vr :SS :value [-1]}]
+        record {:file-meta (assoc-in (vec file-meta) [2 :value] ["1.2.840.10008.1.2.2"])
+                :transfer-syntax-uid "1.2.840.10008.1.2.2"
+                :dataset dataset}
+        encoded (file/encode record)
+        decoded (file/decode encoded)]
+    (is (= :ok (first decoded)) (str decoded))
+    (is (= dataset (mapv #(dissoc % :length) (:dataset (second decoded)))))))
+
+;; =========================================================================
+;; Negative tests -- named errors, never throw, never silent success.
+;; =========================================================================
+
+(deftest unknown-vr-is-a-named-error-not-a-throw
+  (is (= [:error :dicom/unknown-vr] (el/read-explicit-header [0x08 0x00 0x10 0x00 0x5A 0x5A 0x08 0x00] 0 :little))))
+
+(deftest unexpected-undefined-length-on-plain-vr-is-a-named-error
+  ;; A US element cannot legally have undefined length -- only SQ and
+  ;; encapsulated OB/OW Pixel Data may (PS3.5 §7.1.1/Annex A.4). US is a
+  ;; short-form VR (only a 16-bit length field exists in Explicit VR), so
+  ;; to reach the guarded branch at all we go through Implicit VR, where
+  ;; the length field is always 32-bit and can carry 0xFFFFFFFF for any
+  ;; VR, including one that isn't SQ or Pixel Data.
+  (let [order :little
+        t {:group 0x0028 :element 0x0010}
+        ibs (into (tag/write-tag t order) (b/write-u32 vr/undefined-length order))
+        result (ds/decode-element ibs 0 {:vr-mode :implicit :endian order
+                                          :dictionary {t :US}})]
+    (is (= [:error :dicom/unexpected-undefined-length] result))))
+
+(deftest expected-item-tag-mismatch-is-a-named-error
+  ;; An SQ item header whose tag isn't (FFFE,E000).
+  (let [order :little
+        bogus-item (into (tag/write-tag {:group 0x1234 :element 0x5678} order)
+                          (b/write-u32 0 order))]
+    (is (= [:error :dicom/expected-item-tag] (ds/decode-item bogus-item 0 {:vr-mode :explicit :endian order})))))
+
+(deftest element-overruns-container-is-a-named-error
+  ;; A dataset bounded to N bytes whose next element's header alone
+  ;; already claims to need more than N bytes remain -- e.g. a File Meta
+  ;; Group Length that promises 4 bytes to a single-byte-short buffer.
+  (let [order :little
+        el-bytes (ds/encode-dataset [(name-element "X")] {:vr-mode :explicit :endian order})
+        short-end (dec (count el-bytes))]
+    (is (= [:error :dicom/element-overruns-container]
+           (ds/decode-dataset-bounded el-bytes 0 short-end {:vr-mode :explicit :endian order})))))
+
+(deftest non-ascii-text-value-is-a-named-error
+  (is (= [:error :dicom/non-ascii-byte] (el/decode-text [0xE9] :SH))))
+
+;; =========================================================================
+;; Discrimination: negative tests were run against a deliberately broken
+;; build during development to confirm they fire for the *named* reason
+;; and not merely "an exception happened somewhere". See README, section
+;; "Proof these negative tests discriminate" for exactly what was broken,
+;; which assertion fired, and confirmation it was restored.
+;; =========================================================================
+

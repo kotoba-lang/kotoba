@@ -1,0 +1,241 @@
+;; The TIFF header decision, as a Kotoba application (ADR-2608261100) —
+;; TIFF 6.0 §2 "Image File Header".
+;;
+;;   init                    (config)          -> state
+;;   offer-header            (state, bytes)    -> state   ; the first 8
+;;   offer-entry-count-bytes (state, hi, lo)   -> state   ; the two at IFD0
+;;
+;; ## The file says how to read itself, which is the whole problem
+;;
+;; A TIFF opens with two bytes that choose the byte order for everything
+;; after them, and then a magic number that is only correct once you have
+;; read it in that order. Both come from the file, so both are
+;; attacker-controlled, and every offset after them is too:
+;;
+;;   the guest owns   whether this is a TIFF at all, in which byte order,
+;;                    where IFD0 begins, and whether what it claims fits in
+;;                    the file
+;;   the host owns    the bytes, which are an image and unbounded
+;;
+;; The guest is handed eight integers and a length. It hands back offsets.
+;;
+;; ## What `tiff.core/parse` does not check
+;;
+;; Measured on this repo at e721594:
+;;
+;;   [0x58 0x59 …] ("XY")   -> {:byte-order :little}
+;;   [0x49 0x49 99 0 …]     -> {:byte-order :little}
+;;
+;; The first is not a TIFF and is read as a little-endian one, because the
+;; test is `(= [0x4D 0x4D] …)` and everything that is not "MM" falls through
+;; to little. The second has magic 99 where §2 requires 42, and nothing
+;; reads that field at all. The repo's own tests build only `II`+42 and
+;; `MM`+42 headers, so neither gap has anything looking at it.
+;;
+;; Both matter for the same reason: a decoder that accepts a non-TIFF as a
+;; TIFF then interprets whatever follows as offsets and counts. The magic
+;; number is there to stop exactly that, and it is the cheapest check in the
+;; format.
+;;
+;; ## Offsets are claims, and a claim that does not fit is refused
+;;
+;; §2 puts IFD0 at a file offset the file itself supplies, and each of its
+;; entries is 12 bytes. So `ifd + 2 + 12n + 4` has to be inside the file,
+;; and `ifd` itself has to be past the 8-byte header — an IFD that overlaps
+;; the header is not a smaller image, it is a malformed file. Reading first
+;; and discovering that later is how a parser turns a bad file into an
+;; out-of-range read.
+;;
+;; `.cljc` remains the oracle for what it does check and is not required
+;; from here (require-graph). It did not grow a second copy of these
+;; refusals (ADR-2608261100).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/tiff/header.kotoba \
+;;     --target wasm32-browser --output header.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 5635-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns tiff.header
+  (:export [init offer-header offer-entry-count-bytes
+            phase reason
+            big-endian? ifd-offset entry-count
+            entry-offset-at next-ifd-offset-at file-length]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- dv [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-vector)))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-i64 [v :document i :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (at v i)) -1))
+
+;; --- the constants of the format (§2) --------------------------------------
+
+;; "II" — 0x49 0x49 — little-endian. "MM" — 0x4D 0x4D — big-endian. There is
+;; no third option: a marker that is neither does not select a default, it
+;; means the file is not a TIFF.
+(defn- ii [] :i64 73)
+(defn- mm [] :i64 77)
+
+;; §2: "an arbitrary but carefully chosen number (42) that further identifies
+;; the file as a TIFF file". Read in the order the first two bytes chose.
+(defn- magic [] :i64 42)
+
+(defn- header-bytes [] :i64 8)
+
+(defn- entry-bytes [] :i64 12)
+
+;; --- decoding, in the order the file asked for -----------------------------
+
+(defn- u16 [hi :i64 lo :i64 big :bool] :i64
+  (if big (+ (* hi 256) lo) (+ (* lo 256) hi)))
+
+(defn- u32-at [bytes :document o :i64 big :bool] :i64
+  (let [a (at-i64 bytes o)
+        b (at-i64 bytes (+ o 1))
+        c (at-i64 bytes (+ o 2))
+        d (at-i64 bytes (+ o 3))]
+    (if big
+      (+ (* a 16777216) (+ (* b 65536) (+ (* c 256) d)))
+      (+ (* d 16777216) (+ (* c 65536) (+ (* b 256) a))))))
+
+;; --- state ------------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-header)
+                :reason (document-keyword :none)
+                :length (document-i64 (di config :file-length))
+                :big (document-bool false)
+                :ifd (document-i64 -1)
+                :entries (document-i64 -1)))
+
+;; --- the header (§2) --------------------------------------------------------
+
+(defn offer-header [state :document bytes :document] :document
+  (if (not (= (dk state :phase) :want-header))
+    state
+    (let [n (di state :length)
+          b0 (at-i64 bytes 0)
+          b1 (at-i64 bytes 1)
+          ;; Folded to `if` all the way down: `=` in a branch position
+          ;; evaluates to i64, and a `document-bool` fed one passes
+          ;; `amu check` and traps when the export RUNS (AGENTS.md,
+          ;; 2026-08-31 -- and this file hit it on the MM path only,
+          ;; because the II path never reached the constructor).
+          little (if (= b0 (ii)) (if (= b1 (ii)) true false) false)
+          big (if (= b0 (mm)) (if (= b1 (mm)) true false) false)]
+      (cond
+        (< n (header-bytes)) (refuse state :tiff/truncated-header)
+
+        (< (document-count bytes) (header-bytes))
+        (refuse state :tiff/truncated-header)
+
+        ;; Neither "II" nor "MM". Falling through to little-endian here is
+        ;; how a file that is not a TIFF becomes one.
+        (if little false (not big)) (refuse state :tiff/bad-byte-order)
+
+        :else
+        (let [m (u16 (at-i64 bytes 2) (at-i64 bytes 3) big)
+              ifd (u32-at bytes 4 big)]
+          (cond
+            ;; The cheapest check in the format, and the one that stops a
+            ;; decoder from reading arbitrary bytes as offsets and counts.
+            (not (= m (magic))) (refuse state :tiff/bad-magic)
+
+            ;; An IFD overlapping the header is not a smaller image.
+            (< ifd (header-bytes)) (refuse state :tiff/ifd-inside-header)
+
+            ;; The count field itself must be readable, and the IFD must end
+            ;; with a next-IFD pointer.
+            (> (+ ifd 2) n) (refuse state :tiff/ifd-out-of-range)
+
+            :else
+            (document-assoc
+             (document-assoc
+              (document-assoc state :phase (document-keyword :want-entry-count))
+              :big (document-bool big))
+             :ifd (document-i64 ifd))))))))
+
+;; --- the entry count --------------------------------------------------------
+;; The host read the two bytes at `ifd-offset` and hands them over in FILE
+;; order; the guest applies the byte order it decided, because deciding it
+;; was the guest's job and applying it elsewhere would split one decision in
+;; two.
+
+(defn offer-entry-count-bytes [state :document hi :i64 lo :i64] :document
+  (if (not (= (dk state :phase) :want-entry-count))
+    state
+    (let [n (u16 hi lo (db state :big))
+          ifd (di state :ifd)
+          len (di state :length)]
+      (cond
+        ;; §2: 2 count bytes, then 12 per entry, then a 4-byte next-IFD
+        ;; offset. A count that does not fit is a claim about a file this is
+        ;; not -- refused before the host reads a byte of it, because
+        ;; reading first and discovering later is the out-of-range read.
+        (> (+ ifd (+ 2 (+ (* n (entry-bytes)) 4))) len)
+        (refuse state :tiff/entry-count-out-of-range)
+
+        :else
+        (document-assoc
+         (document-assoc state :phase (document-keyword :ready))
+         :entries (document-i64 n))))))
+
+;; --- projections ------------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; The order the FILE chose, for every multi-byte read after the header.
+(defn big-endian? [state :document] :bool (db state :big))
+
+(defn ifd-offset [state :document] :i64 (di state :ifd))
+
+(defn entry-count [state :document] :i64 (di state :entries))
+
+;; Where entry `i`'s 12 bytes begin. -1 for an entry this file does not
+;; have, so a caller cannot walk past the count by asking.
+(defn entry-offset-at [state :document i :i64] :i64
+  (if (not (= (dk state :phase) :ready))
+    -1
+    (if (if (< i 0) true (>= i (di state :entries)))
+      -1
+      (+ (di state :ifd) (+ 2 (* i (entry-bytes)))))))
+
+;; Where the 4-byte pointer to the next IFD sits. TIFF is a linked list of
+;; IFDs and a reader that stops at IFD0 is reading one page of a document
+;; that may have several.
+(defn next-ifd-offset-at [state :document] :i64
+  (if (not (= (dk state :phase) :ready))
+    -1
+    (+ (di state :ifd) (+ 2 (* (di state :entries) (entry-bytes))))))
+
+(defn file-length [state :document] :i64 (di state :length))

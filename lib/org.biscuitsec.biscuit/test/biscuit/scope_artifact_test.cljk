@@ -1,0 +1,186 @@
+;; The gate that was missing: does the COMPILED artifact decide the way the
+;; interpreter does?
+;;
+;; `scope_kotoba_test.clj` drives the guest through `kotoba.kir`, which is
+;; not what ships. Until this file existed, nothing here had asserted that
+;; `kotoba -M compile` produces something that answers the same way -- the
+;; shape this workspace keeps warning about, where a check that never ran
+;; looks exactly like a check that passed.
+;;
+;; This guest is a STREAM, so the comparison is over whole WALKS rather than
+;; single calls: `init`, a fact at a time, `end-block`, then `decide` and
+;; every projection. The probe hands the guest's own returned state document
+;; straight back in; a document the host introduces goes through the
+;; runtime's `typedValues.document` in the tagged form the KIR value plane
+;; uses, and building one any other way is refused as forged. The same walk
+;; is replayed here on the interpreter and the two are held against each
+;; other.
+;;
+;; ## Skipping is not passing
+;;
+;; The gate needs `kotoba`, `nbb` and an amu checkout. Each is measured by
+;; RUNNING it and reading the exit code, never by `which` -- a shim whose
+;; target is gone passes `which` and exits 126, which this migration has
+;; already been bitten by. When a tool is absent the probe exits 3, which is
+;; neither 0 nor 1, and this file reports the absence rather than asserting
+;; nothing.
+
+(ns biscuit.scope-artifact-test
+  (:require [biscuit.scope-guest-document :refer [->doc]]
+            [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private amu-root
+  (or (System/getenv "AMU_ROOT")
+      (str (System/getProperty "user.home")
+           "/github/com-junkawasaki/orgs/kotoba-lang/amu")))
+
+(defn- runs? [& command]
+  (try (zero? (:exit (apply shell/sh command))) (catch Exception _ false)))
+
+(def ^:private tools
+  (delay
+    {:kotoba (let [bin (str amu-root "/bin/kotoba")]
+               (when (runs? bin "--help") bin))
+     :nbb (when (runs? "nbb" "--version") "nbb")
+     :runtime (io/exists? (io/file amu-root "runtime/browser-host.mjs"))}))
+
+(def ^:private probe
+  (delay
+    (let [{:keys [kotoba nbb runtime]} @tools]
+      (if-not (and kotoba nbb runtime)
+        {:status :unavailable
+         :detail (str "kotoba=" (boolean kotoba) " nbb=" (boolean nbb)
+                      " runtime=" (boolean runtime) " AMU_ROOT=" amu-root)}
+        (let [r (shell/sh nbb "lib/org.biscuitsec.biscuit/test/biscuit/artifact_probe.cljk" kotoba amu-root)
+              parsed (try (edn/read-string (str/trim (:out r))) (catch Exception _ nil))]
+          (cond
+            (nil? parsed) {:status :probe-unreadable :detail (str (:out r) (:err r))}
+            (= 3 (:exit r)) (assoc parsed :status (or (:status parsed) :probe-refused))
+            :else parsed))))))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project
+                {'biscuit.scope (slurp (io/file (System/getProperty "user.dir")
+                                                "kotoba" "biscuit" "scope.kotoba"))}
+                'biscuit.scope :wasm32-kotoba-v1))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args) {:fuel 100000}))
+
+(def ^:private default-opts
+  {:policy-allows? true :policy-wildcard? false :expired? false
+   :require-holder? false :forbid-wildcard? false})
+
+;; The same walk the probe performs, on the interpreter. Deliberately the
+;; same shape rather than a tidier one: a comparison between two different
+;; walks would not be a comparison of the two runtimes.
+(defn- walk [request blocks opts]
+  (let [final (reduce (fn [state block]
+                        (call 'end-block
+                              (reduce (fn [s f] (call 'offer-fact s (->doc f))) state block)))
+                      (call 'init (->doc request))
+                      blocks)]
+    {:decision (str (call 'decide final (->doc (merge default-opts opts))))
+     :blocks (str (call 'blocks-seen final))
+     :holders (str (call 'holder-count final))
+     :authority (str (call 'authority-confers? final))
+     :granted (str (call 'still-granted? final))
+     :widening (str (call 'widening-attempted? final))}))
+
+;; The probe's own case table, by label, so the interpreter is asked the
+;; same question. Reading it out of the probe would be tidier and would also
+;; mean a typo in either file could never be caught.
+(def ^:private cases
+  {"widening" [{:kind ":net/connect" :resource "e" :holder ""}
+               [[{:pred "holder" :a "alice" :b ""}] [{:pred "cap" :a ":net/connect" :b "e"}]] {}]
+   "honest attenuation" [{:kind ":net/connect" :resource "a" :holder ""}
+                         [[{:pred "cap" :a ":net/connect" :b "a"}
+                           {:pred "cap" :a ":net/connect" :b "b"}]
+                          [{:pred "cap" :a ":net/connect" :b "a"}]] {}]
+   "narrowed away" [{:kind ":net/connect" :resource "a" :holder ""}
+                    [[{:pred "cap" :a ":net/connect" :b "a"}
+                      {:pred "cap" :a ":net/connect" :b "b"}]
+                     [{:pred "cap" :a ":net/connect" :b "b"}]] {}]
+   "missing grant" [{:kind ":net/connect" :resource "a" :holder ""}
+                    [[{:pred "cap" :a ":fs/read" :b "a"}]] {}]
+   "holder mismatch" [{:kind ":net/connect" :resource "a" :holder "mallory"}
+                      [[{:pred "holder" :a "alice" :b ""}
+                        {:pred "cap" :a ":net/connect" :b "a"}]] {:require-holder? true}]
+   "holder match" [{:kind ":net/connect" :resource "a" :holder "alice"}
+                   [[{:pred "holder" :a "alice" :b ""}
+                     {:pred "cap" :a ":net/connect" :b "a"}]] {:require-holder? true}]
+   "ambiguous holder" [{:kind ":net/connect" :resource "a" :holder "alice"}
+                       [[{:pred "holder" :a "alice" :b ""} {:pred "holder" :a "mallory" :b ""}
+                         {:pred "cap" :a ":net/connect" :b "a"}]] {:require-holder? true}]
+   "expired" [{:kind ":net/connect" :resource "a" :holder ""}
+              [[{:pred "cap" :a ":net/connect" :b "a"}]] {:expired? true}]
+   "local policy" [{:kind ":net/connect" :resource "a" :holder ""}
+                   [[{:pred "cap" :a ":net/connect" :b "a"}]] {:policy-allows? false}]
+   "wildcard" [{:kind ":net/connect" :resource "*" :holder ""}
+               [[{:pred "cap" :a ":net/connect" :b "*"}]] {:forbid-wildcard? true}]})
+
+(deftest the-compiled-artifact-answers-the-way-the-interpreter-does
+  (let [p @probe]
+    (if (not= :ok (:status p))
+      ;; Not a pass. The suite says out loud that it could not measure.
+      (is false (str "artifact gate could not run: " (:status p) " -- " (:detail p)))
+      (do
+        (is (= (set (keys cases)) (set (map first (:results p))))
+            "the probe and this file must ask the same questions")
+        (is (= "0" (:main p))
+            "the artifact's own conformance entry point answered non-zero")
+        (is (re-matches #"[0-9a-f]{64}" (:sha256 p))
+            "and the host measured the module it ran")
+        (testing "every walk agrees with the interpreter, decision and projections"
+          (doseq [[label got-edn] (:results p)]
+            (let [[request blocks opts] (get cases label)]
+              (is (= (walk request blocks opts) (edn/read-string got-edn)) label))))))))
+
+(deftest the-gate-would-notice-a-difference
+  ;; The comparison is only worth having if a wrong answer fails it.
+  (let [p @probe]
+    (when (= :ok (:status p))
+      (let [[label got-edn] (first (:results p))
+            [request blocks opts] (get cases label)]
+        (is (not= (assoc (edn/read-string got-edn) :decision ":something-else")
+                  (walk request blocks opts))
+            "a fabricated decision must not match the interpreter")))))
+
+;; --- the native target ------------------------------------------------------------------
+
+(deftest the-native-backend-refuses-this-guest-and-says-why
+  ;; This guest uses `:document` values, and that is what keeps it off the
+  ;; native backends today -- not Wasm, and not anything about biscuits.
+  ;; Measured across the eleven guests landed on 2026-08-31: six compiled to
+  ;; `aarch64-macos` and five did not, and the five were exactly the five
+  ;; that use documents. It is the USE and not the export list: making an
+  ;; export private leaves the refusal unchanged (measured in
+  ;; `org-w3-webauthn`), because the gate is over the whole lowered module.
+  ;;
+  ;; The refusal is asserted BY ITS REASON, not merely as a non-zero exit. A
+  ;; test that accepted any failure would stay green if the backend started
+  ;; refusing for another cause, and would stay green if the compiler broke.
+  ;; When native admits documents this test goes red, which is the point: a
+  ;; ratchet that notices the gap closing rather than a limitation nobody
+  ;; revisits. `:not-yet-implemented`, not a security constraint
+  ;; (ADR-2608650000).
+  (if-let [bin (:kotoba @tools)]
+    (let [out (str (System/getProperty "java.io.tmpdir") "/biscuit-scope-native.kexe")
+          r (shell/sh bin "-M" "compile"
+                      (str (io/file (System/getProperty "user.dir")
+                                    "kotoba" "biscuit" "scope.kotoba"))
+                      "--jvm-free" "--target" "aarch64-macos" "--output" out)
+          said (str (:out r) (:err r))]
+      (is (not (zero? (:exit r)))
+          "the native backend now admits a :document -- delete this test and
+           assert the compile instead")
+      (is (str/includes? said ":kotoba/target-rejected")
+          (str "refused, but not for the reason this test is about: " (str/trim said)))
+      (is (str/includes? said "typed values currently require")
+          (str "refused, but not for the reason this test is about: " (str/trim said))))
+    (is false (str "native gate could not run: no kotoba CLI at " amu-root))))

@@ -1,0 +1,194 @@
+;; `kotoba/oidc/id_token.kotoba` against `oidc.core/validate-id-token-claims`.
+;;
+;; Parity covers the five rules the library implements — iss, aud, exp, iat,
+;; nonce (OIDC Core §3.1.3.7 steps 2, 3, 9, 10, 11). The guest must agree
+;; with the oracle on every one, including which errors it reports.
+;;
+;; Two things have NO oracle, because the library does not do them, and the
+;; tests say so rather than dressing them up as parity:
+;;
+;;   * `azp` (steps 4 and 5). Measured on this repo at 97bd583: the string
+;;     appears nowhere in `src/`, `test/` or the README;
+;;   * refusing when the clock is unknown. The oracle reads the system clock
+;;     inline; a guest cannot, so being told the time becomes an input, and
+;;     a missing input is a refusal rather than a skipped check.
+;;
+;; `.cljc` stays the oracle and is not required from the guest
+;; (require-graph). It did not grow a second copy of either rule.
+;;
+;; ## The negative controls
+;;
+;;   * `multiple-audiences-require-an-azp` — steps 4 and 5. A token minted
+;;     for several clients and presented to one of them passes `aud` and
+;;     says nothing about who it was actually for;
+;;   * `an-azp-that-names-someone-else-is-refused` — step 5 applies however
+;;     many audiences there are;
+;;   * `without-a-clock-the-answer-is-refusal` — a validator that never
+;;     examined the expiry must not report valid. A check that could not run
+;;     returning the same answer as one that ran and passed is the failure
+;;     this workspace keeps finding;
+;;   * `errors-accumulate` — `valid?` must mean "no errors", not "no errors
+;;     I bothered to look for".
+
+(ns oidc.id-token-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [oidc.core :as oidc]
+            [oidc.id-token-guest-document :refer [->doc]]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "oidc" "id_token.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'oidc.id-token (slurp guest-file)}
+                                         'oidc.id-token :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+(def ^:private now 1700000000)
+
+(defn- decide
+  "The deployment: read the clock, then hand over the claims. `:clock?
+  false` models a caller that never established the time."
+  [claims config]
+  (let [s0 (call 'init [(->doc (dissoc config :clock?))])
+        s1 (if (false? (:clock? config)) s0 (call 'offer-now [s0 (:now config now)]))
+        s2 (call 'offer-claims [s1 (->doc claims)])]
+    {:state s2
+     :phase (call 'phase [s2])
+     :valid? (call 'valid? [s2])
+     :errors (set (map #(call 'error-at [s2 %])
+                       (range (call 'error-count [s2]))))}))
+
+(defn- oracle [claims config]
+  (let [r (oidc/validate-id-token-claims claims (assoc config :now (:now config now)))]
+    {:valid? (:valid? r) :errors (set (:errors r))}))
+
+;; The guest takes `aud` as a vector always -- normalising the single-string
+;; JSON form is shape, not a decision, and the host does it while decoding.
+(defn- guest-claims [c] (update c :aud #(if (sequential? %) (vec %) [%])))
+
+(def ^:private cfg {:issuer "https://issuer.example"
+                    :audience "client-1"})
+
+(defn- good-claims []
+  {:iss "https://issuer.example" :aud "client-1"
+   :exp (+ now 3600) :iat (- now 10)})
+
+;; --- parity: the five rules the library implements ---------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-good-token-is-valid-on-both-sides
+  (let [c (good-claims)
+        g (decide (guest-claims c) cfg)
+        o (oracle c cfg)]
+    (is (= :decided (:phase g)))
+    (is (true? (:valid? g)))
+    (is (= (:valid? o) (:valid? g)))
+    (is (= (:errors o) (:errors g)))))
+
+(deftest the-five-implemented-rules-agree-with-the-oracle
+  (doseq [[label claims]
+          [["issuer" (assoc (good-claims) :iss "https://evil.example")]
+           ["audience" (assoc (good-claims) :aud "someone-else")]
+           ["expired" (assoc (good-claims) :exp (- now 3600))]
+           ["exp missing" (dissoc (good-claims) :exp)]
+           ["iat in the future" (assoc (good-claims) :iat (+ now 3600))]]]
+    (let [g (decide (guest-claims claims) cfg)
+          o (oracle claims cfg)]
+      (is (= (:valid? o) (:valid? g)) label)
+      (is (= (:errors o) (:errors g)) label))))
+
+(deftest the-nonce-is-checked-when-one-was-sent
+  (let [c (assoc (good-claims) :nonce "n-1")
+        with {:issuer "https://issuer.example" :audience "client-1" :nonce "n-1"}
+        wrong (assoc with :nonce "n-2")]
+    (is (true? (:valid? (decide (guest-claims c) with))))
+    (is (= (:errors (oracle c with)) (:errors (decide (guest-claims c) with))))
+    (let [g (decide (guest-claims c) wrong)
+          o (oracle c wrong)]
+      (is (false? (:valid? g)))
+      (is (contains? (:errors g) :nonce-mismatch))
+      (is (= (:errors o) (:errors g))))))
+
+(deftest leeway-is-honoured-on-both-sides
+  (testing "a token that expired a moment ago is still inside the default
+            leeway; one that expired well outside it is not"
+    (let [just-expired (assoc (good-claims) :exp (- now 30))
+          long-expired (assoc (good-claims) :exp (- now 300))]
+      (is (true? (:valid? (decide (guest-claims just-expired) cfg))))
+      (is (= (:valid? (oracle just-expired cfg))
+             (:valid? (decide (guest-claims just-expired) cfg))))
+      (is (false? (:valid? (decide (guest-claims long-expired) cfg))))
+      (is (= (:valid? (oracle long-expired cfg))
+             (:valid? (decide (guest-claims long-expired) cfg)))))))
+
+(deftest errors-accumulate
+  (testing "`valid?` must mean \"no errors\", not \"no errors I bothered to
+            look for\" -- so every rule runs and every failure is reported"
+    (let [bad {:iss "https://evil.example" :aud "someone-else"
+               :exp (- now 3600) :iat (+ now 3600)}
+          g (decide (guest-claims bad) cfg)
+          o (oracle bad cfg)]
+      (is (= #{:iss-mismatch :aud-mismatch :expired :iat-in-future} (:errors g)))
+      (is (= (:errors o) (:errors g)))
+      (is (= 4 (call 'error-count [(:state g)]))))))
+
+;; --- no oracle: azp, and the clock -------------------------------------------
+
+(deftest multiple-audiences-require-an-azp
+  (testing "OIDC Core §3.1.3.7 step 4. Measured at 97bd583, `azp` appears
+            nowhere in this library -- so a token minted for several clients
+            and presented to one of them passes `aud` and says nothing about
+            who it was actually for."
+    (let [multi (assoc (good-claims) :aud ["client-1" "client-2"])
+          g (decide (guest-claims multi) cfg)]
+      (is (false? (:valid? g)))
+      (is (contains? (:errors g) :azp-required))
+      (is (= 2 (call 'audience-count [(:state g)])))
+      (testing "which the oracle accepts, because it does not have the rule"
+        (is (true? (:valid? (oracle multi cfg))))))
+    (testing "and with an azp naming us, it is fine"
+      (let [multi (assoc (good-claims) :aud ["client-1" "client-2"]
+                         :azp "client-1")]
+        (is (true? (:valid? (decide (guest-claims multi) cfg))))))))
+
+(deftest an-azp-that-names-someone-else-is-refused
+  (testing "step 5 applies however many audiences there are"
+    (doseq [aud [["client-1"] ["client-1" "client-2"]]]
+      (let [c (assoc (good-claims) :aud aud :azp "client-2")
+            g (decide (guest-claims c) cfg)]
+        (is (false? (:valid? g)) (pr-str aud))
+        (is (contains? (:errors g) :azp-mismatch) (pr-str aud))))))
+
+(deftest without-a-clock-the-answer-is-refusal
+  (testing "the oracle reads the system clock inline; a guest cannot, so
+            being told the time is an input -- and a missing input is a
+            refusal, not a skipped check. Reporting valid for a token whose
+            expiry was never examined is the failure this workspace keeps
+            finding."
+    (let [g (decide (guest-claims (good-claims)) (assoc cfg :clock? false))]
+      (is (false? (:valid? g)) "an unexamined expiry is not a passed one")
+      (is (contains? (:errors g) :time-unknown))
+      (is (not (contains? (:errors g) :expired))
+          "and it says the time is unknown, not that the token expired"))
+    (testing "while the same claims with a clock are valid"
+      (is (true? (:valid? (decide (guest-claims (good-claims)) cfg)))))))
+
+(deftest an-undecided-validator-is-not-a-passing-one
+  (testing "`valid?` is false before any claims have been offered"
+    (let [s (call 'offer-now [(call 'init [(->doc cfg)]) now])]
+      (is (= :want-claims (call 'phase [s])))
+      (is (false? (call 'valid? [s])))
+      (is (= 0 (call 'error-count [s]))
+          "no errors, and still not valid -- absence of failure is not success"))))
+
+(deftest has-error-answers-by-name
+  (let [g (decide (guest-claims (assoc (good-claims) :iss "https://evil.example"))
+                  cfg)]
+    (is (true? (call 'has-error? [(:state g) :iss-mismatch])))
+    (is (false? (call 'has-error? [(:state g) :aud-mismatch])))))

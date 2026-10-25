@@ -1,0 +1,508 @@
+(ns cacao.core-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [kotoba.lang.text] [kotoba.test :refer [deftest is testing]]
+            [cacao.core :as cacao]
+            [ed25519.core :as ed])
+  (:import (java.security KeyPairGenerator)))
+
+(defn- seed [] (byte-array (take-last 32 (seq (.getEncoded (.getPrivate
+                 (.generateKeyPair (KeyPairGenerator/getInstance "Ed25519"))))))))
+
+(def ^:private opts-for
+  (fn [s] {:seed s :aud "did:key:zAUD" :iat "2026-06-27T00:00:00Z"
+           :exp "2026-07-27T00:00:00Z" :nonce "n1"
+           :resources ["kotoba://can/kotobase:pin" "kotoba://graph/g"]}))
+
+(deftest mint-verify-roundtrip
+  (dotimes [_ 6]
+    (let [s (seed)
+          {:keys [cacao-b64 iss]} (cacao/mint (opts-for s))
+          v (cacao/verify cacao-b64)]
+      (is (= iss (ed/did-key-from-seed s)) "iss is derived from the seed (issuer binding)")
+      (is (true? (:valid? v)))
+      (is (= iss (:iss v)))
+      (is (= ["kotoba://can/kotobase:pin" "kotoba://graph/g"] (:resources (:payload v)))))))
+
+(deftest mint-requires-a-nonce
+  ;; mint's own docstring lists :nonce as "Required" -- this proves it's
+  ;; actually enforced: a CACAO minted without one has no replay protection
+  ;; at all (verify/verify-chain's `(or (nil? nonce) ...)` fallback treats a
+  ;; nonce-less payload as un-dedupeable, not as replay-safe), so silently
+  ;; allowing a nonce-less mint would be a footgun.
+  (is (thrown? kerror/ExceptionInfo
+               (cacao/mint (dissoc (opts-for (seed)) :nonce)))))
+
+(deftest tamper-is-rejected
+  (let [{:keys [cacao-b64]} (cacao/mint (opts-for (seed)))
+        m (cacao/verify cacao-b64)]
+    (is (true? (:valid? m)))
+    ;; flip a byte in the signature → invalid
+    (let [raw (kbytes/base64-decode-bytes cacao-b64)
+          _ (aset-byte raw (dec (count raw)) (unchecked-byte (bit-xor (aget raw (dec (count raw))) 1)))
+          tampered (kbytes/base64-encode raw)]
+      (is (false? (:valid? (cacao/verify tampered)))))))
+
+(deftest verify-without-now-does-not-check-expiry-unchanged-behavior
+  (let [{:keys [cacao-b64]} (cacao/mint (opts-for (seed)))]
+    (is (true? (:valid? (cacao/verify cacao-b64))) "1-arity call is unaffected by the :now feature")))
+
+(deftest verify-now-rejects-expired-and-not-yet-valid-cacaos
+  ;; CONFIRMED BUG regression: verify had no expiry-checking capability at
+  ;; all -- a CACAO with any :exp, however long past, verified true forever.
+  (let [s (seed)
+        {:keys [cacao-b64]} (cacao/mint {:seed s :aud "did:key:zAUD"
+                                         :iat "2026-06-27T00:00:00Z"
+                                         :exp "2026-07-27T00:00:00Z"
+                                         :nonce "n1" :resources ["r1"]})]
+    (testing "now within [iat, exp) verifies"
+      (is (true? (:valid? (cacao/verify cacao-b64 {:now "2026-07-01T00:00:00Z"})))))
+    (testing "now == exp is already expired (iat <= now < exp)"
+      (is (false? (:valid? (cacao/verify cacao-b64 {:now "2026-07-27T00:00:00Z"})))))
+    (testing "now well past exp is expired"
+      (is (false? (:valid? (cacao/verify cacao-b64 {:now "2030-01-01T00:00:00Z"})))))
+    (testing "before iat the CACAO is not yet valid"
+      (is (false? (:valid? (cacao/verify cacao-b64 {:now "2026-06-01T00:00:00Z"})))))
+    (testing "a tampered signature is still rejected even with a valid :now"
+      (let [raw (kbytes/base64-decode-bytes cacao-b64)
+            _ (aset-byte raw (dec (count raw)) (unchecked-byte (bit-xor (aget raw (dec (count raw))) 1)))
+            tampered (kbytes/base64-encode raw)]
+        (is (false? (:valid? (cacao/verify tampered {:now "2026-07-01T00:00:00Z"}))))))))
+
+;; ── nonce-replay protection ─────────────────────────────────────────────────
+
+(deftest fresh-nonce-never-seen-verifies-and-gets-recorded
+  (let [store (cacao/fresh-nonce-store)
+        {:keys [cacao-b64 iss]} (cacao/mint (opts-for (seed)))]
+    (is (true? (:valid? (cacao/verify cacao-b64 {:nonce-store store})))
+        "a never-before-seen nonce verifies")
+    (is (contains? @store [iss "n1"]) "and the [iss nonce] is now recorded")))
+
+(deftest replayed-cacao-is-rejected-by-same-store
+  (let [store (cacao/fresh-nonce-store)
+        {:keys [cacao-b64]} (cacao/mint (opts-for (seed)))]
+    (is (true? (:valid? (cacao/verify cacao-b64 {:nonce-store store})))
+        "first presentation succeeds")
+    (is (false? (:valid? (cacao/verify cacao-b64 {:nonce-store store})))
+        "SAME cacao-b64 presented again against the SAME store is a replay")
+    (is (false? (:valid? (cacao/verify cacao-b64 {:nonce-store store})))
+        "and stays rejected on a third presentation")))
+
+(deftest two-different-cacaos-both-succeed-against-same-store
+  (let [store (cacao/fresh-nonce-store)
+        s (seed)
+        c1 (cacao/mint (assoc (opts-for s) :nonce "nonce-1"))
+        c2 (cacao/mint (assoc (opts-for s) :nonce "nonce-2"))]
+    (is (true? (:valid? (cacao/verify (:cacao-b64 c1) {:nonce-store store})))
+        "first distinct-nonce CACAO verifies")
+    (is (true? (:valid? (cacao/verify (:cacao-b64 c2) {:nonce-store store})))
+        "second distinct-nonce CACAO ALSO verifies — not over-broadly rejected")
+    ;; and now replaying either of them against the same store fails
+    (is (false? (:valid? (cacao/verify (:cacao-b64 c1) {:nonce-store store}))))
+    (is (false? (:valid? (cacao/verify (:cacao-b64 c2) {:nonce-store store}))))))
+
+(deftest different-issuers-sharing-a-nonce-string-is-not-a-collision
+  ;; the replay key is [iss nonce], not the bare nonce — two independent
+  ;; issuers minting with the same nonce string coincidentally must not
+  ;; collide in the store.
+  (let [store (cacao/fresh-nonce-store)
+        c1 (cacao/mint (opts-for (seed)))
+        c2 (cacao/mint (opts-for (seed)))]
+    (is (true? (:valid? (cacao/verify (:cacao-b64 c1) {:nonce-store store}))))
+    (is (true? (:valid? (cacao/verify (:cacao-b64 c2) {:nonce-store store})))
+        "different iss, same literal nonce \"n1\" — not a replay")))
+
+(deftest tampered-cacao-does-not-burn-the-nonce
+  ;; a signature-invalid presentation must not consume the nonce store slot —
+  ;; otherwise an attacker forging a bogus CACAO with a guessed/observed
+  ;; nonce could pre-emptively burn a nonce the real holder hasn't used yet.
+  (let [store (cacao/fresh-nonce-store)
+        {:keys [cacao-b64]} (cacao/mint (opts-for (seed)))
+        raw (kbytes/base64-decode-bytes cacao-b64)
+        _ (aset-byte raw (dec (count raw)) (unchecked-byte (bit-xor (aget raw (dec (count raw))) 1)))
+        tampered (kbytes/base64-encode raw)]
+    (is (false? (:valid? (cacao/verify tampered {:nonce-store store}))) "tampered sig rejected")
+    (is (true? (:valid? (cacao/verify cacao-b64 {:nonce-store store})))
+        "the REAL cacao still verifies afterwards — the tamper attempt didn't burn the nonce")))
+
+(deftest default-fresh-store-per-call-does-not-crash-but-cannot-protect-across-calls
+  ;; documents the deliberate limitation: omitting :nonce-store synthesizes a
+  ;; THROWAWAY store for that single verify call, so it can never observe a
+  ;; nonce from a PRIOR call — this proves the fallback path is functional
+  ;; (no exception, still verifies true) and proves — by replaying the exact
+  ;; same cacao-b64 twice with no store supplied — that it does NOT protect
+  ;; across separate calls (both calls succeed, unlike the store-supplied
+  ;; replay test above where the second call is rejected).
+  (let [{:keys [cacao-b64]} (cacao/mint (opts-for (seed)))]
+    (is (true? (:valid? (cacao/verify cacao-b64))) "1-arity (no opts) still works")
+    (is (true? (:valid? (cacao/verify cacao-b64 {}))) "2-arity with no :nonce-store still works")
+    (is (true? (:valid? (cacao/verify cacao-b64 {})))
+        (str "replaying the SAME cacao-b64 a second time with no store ALSO verifies true — "
+             "proof the default fallback provides no cross-call replay protection"))))
+
+(deftest siwe-shape
+  (let [s (seed) iss (ed/did-key-from-seed s)
+        msg (cacao/siwe-message {:iss iss :aud "did:key:zAUD" :iat "T0" :exp "T1"
+                                 :nonce "n1" :domain "kotobase.net" :version "1"
+                                 :resources ["r1" "r2"]})]
+    (is (kotoba.lang.text/includes? msg "kotobase.net wants you to sign in"))
+    (is (kotoba.lang.text/includes? msg "Chain ID: 1"))
+    (is (kotoba.lang.text/includes? msg "Resources:\n- r1\n- r2"))))
+
+(deftest auth-header-shape
+  (let [b (cacao/mint (opts-for (seed)))
+        h (cacao/auth-header b)]
+    (is (kotoba.lang.text/starts-with? (:authorization h) "CACAO "))
+    (is (= (:iss b) (:x-kotoba-did h)))))
+
+;; ── delegation chains ─────────────────────────────────────────────────────────
+
+;; Deterministic seeds so the chain fixtures are reproducible run to run.
+(def ^:private seed-a (byte-array (range 0 32)))
+(def ^:private seed-b (byte-array (range 32 64)))
+(def ^:private seed-c (byte-array (range 64 96)))
+
+(def ^:private did-a (ed/did-key-from-seed seed-a))
+(def ^:private did-b (ed/did-key-from-seed seed-b))
+(def ^:private did-c (ed/did-key-from-seed seed-c))
+
+(defn- mint-link
+  [seed aud resources & [{:keys [iat exp nonce]}]]
+  (:cacao-b64 (cacao/mint {:seed seed :aud aud
+                           :iat (or iat "2026-06-27T00:00:00Z")
+                           :exp (or exp "2026-07-27T00:00:00Z")
+                           :nonce (or nonce "n1")
+                           :resources resources})))
+
+(def ^:private wildcard "kotoba://cap/host/ledger-append/*")
+(def ^:private ledger-main "kotoba://cap/host/ledger-append/ledger:main")
+(def ^:private ledger-aux "kotoba://cap/host/ledger-append/ledger:aux")
+
+(deftest covers?-wildcard-rule
+  (is (true? (cacao/covers? ledger-main ledger-main)) "exact match")
+  (is (false? (cacao/covers? ledger-main ledger-aux)) "exact means exact")
+  (is (true? (cacao/covers? wildcard ledger-main)) "trailing-* covers prefix")
+  (is (true? (cacao/covers? wildcard wildcard)) "wildcard covers itself")
+  (is (false? (cacao/covers? "kotoba://cap/graph-read/*"
+                             "kotoba://cap/graph-write/g1"))
+      "wildcard does not cross kinds")
+  (is (false? (cacao/covers? "kotoba://cap/*x" "kotoba://cap/anything"))
+      "* is only a wildcard in trailing position — here the parent literal prefix must match")
+  (is (false? (cacao/covers? nil ledger-main)))
+  (is (false? (cacao/covers? ledger-main 42))))
+
+(deftest covers?-does-not-confuse-a-prefix
+  ;; The case covers?-wildcard-rule above does not reach. It tests `*` in a
+  ;; MIDDLE position ("kotoba://cap/*x"); the hazard is a trailing `*` that is
+  ;; not preceded by `/`. Until authority.scope replaced the substring test,
+  ;; this assertion was false: covers? stripped the `*` and asked
+  ;; starts-with?, so "alice" is a prefix of "alice-evil".
+  (is (false? (cacao/covers? "kotoba://graph/alice*" "kotoba://graph/alice-evil"))
+      "a wildcard may not reach across a segment boundary")
+  (is (false? (cacao/covers? "kotoba://graph/alice" "kotoba://graph/alice-evil"))
+      "and neither may an exact grant")
+  ;; the direction that must keep working, so this is not a pair of assertions
+  ;; that passes by refusing everything
+  (is (true? (cacao/covers? "kotoba://graph/*" "kotoba://graph/alice-evil")))
+  (is (true? (cacao/covers? "kotoba://graph/alice" "kotoba://graph/alice"))))
+
+(deftest a-chain-cannot-escalate-through-a-prefix
+  ;; The end-to-end consequence, in the shape that actually triggered the bug:
+  ;; the PARENT carries a trailing `*` that is not preceded by `/`. Under the
+  ;; old substring test this chain verified -- "alice-evil" starts with
+  ;; "kotoba://graph/alice" -- so a delegate could re-issue itself a
+  ;; neighbouring graph and the escalation check said nothing.
+  ;;
+  ;; (A parent without the `*`, e.g. "kotoba://graph/alice", was caught by the
+  ;; old code too: it fell to the exact-match branch. Testing that shape looks
+  ;; like a regression test and discriminates nothing.)
+  (let [root (mint-link seed-a did-b ["kotoba://graph/alice*"])
+        leaf (mint-link seed-b did-c ["kotoba://graph/alice-evil"])
+        r (cacao/verify-chain [root leaf])]
+    (is (false? (:chain/valid? r)))
+    (is (= [:chain/resource-escalation] (mapv :problem (:chain/problems r)))))
+  ;; and a genuine narrowing under the same shape still verifies
+  (let [root (mint-link seed-a did-b ["kotoba://graph/*"])
+        leaf (mint-link seed-b did-c ["kotoba://graph/alice-evil"])
+        r (cacao/verify-chain [root leaf])]
+    (is (true? (:chain/valid? r)))
+    (is (= #{"kotoba://graph/alice-evil"} (:chain/resources r)))))
+
+(deftest two-link-chain-verifies
+  (let [root (mint-link seed-a did-b [wildcard ledger-aux])
+        leaf (mint-link seed-b did-c [ledger-main])
+        r (cacao/verify-chain [root leaf])]
+    (is (true? (:chain/valid? r)))
+    (is (= [] (:chain/problems r)))
+    (is (= did-a (:chain/root-iss r)))
+    (is (= did-c (:chain/holder r)))
+    (is (= #{ledger-main} (:chain/resources r)) "leaf's effective resource set")
+    (is (= "2026-07-27T00:00:00Z" (:chain/expires r)))
+    (is (= 2 (:chain/depth r)))))
+
+(deftest three-link-chain-verifies-and-takes-min-expiry
+  (let [root (mint-link seed-a did-b [wildcard])
+        mid (mint-link seed-b did-c [ledger-main ledger-aux]
+                       {:exp "2026-07-20T00:00:00Z"})
+        leaf (mint-link seed-c "did:key:zHOLDER" [ledger-main]
+                        {:exp "2026-07-10T00:00:00Z"})
+        r (cacao/verify-chain [root mid leaf])]
+    (is (true? (:chain/valid? r)))
+    (is (= did-a (:chain/root-iss r)))
+    (is (= "did:key:zHOLDER" (:chain/holder r)))
+    (is (= #{ledger-main} (:chain/resources r)))
+    (is (= "2026-07-10T00:00:00Z" (:chain/expires r)) "min exp across the chain")
+    (is (= 3 (:chain/depth r)))))
+
+(deftest single-link-chain-is-a-depth-1-chain
+  (let [r (cacao/verify-chain [(mint-link seed-a did-b [ledger-main])])]
+    (is (true? (:chain/valid? r)))
+    (is (= did-a (:chain/root-iss r)))
+    (is (= did-b (:chain/holder r)))
+    (is (= 1 (:chain/depth r)))))
+
+(deftest tampered-middle-link-rejects-chain
+  (let [root (mint-link seed-a did-b [wildcard])
+        mid (mint-link seed-b did-c [ledger-main])
+        leaf (mint-link seed-c "did:key:zHOLDER" [ledger-main])
+        raw (kbytes/base64-decode-bytes mid)
+        _ (aset-byte raw (dec (count raw))
+                     (unchecked-byte (bit-xor (aget raw (dec (count raw))) 1)))
+        tampered (kbytes/base64-encode raw)
+        r (cacao/verify-chain [root tampered leaf])]
+    (is (false? (:chain/valid? r)))
+    (is (some #(= {:problem :chain/invalid-signature :index 1} %)
+              (:chain/problems r)))))
+
+(deftest resource-escalation-rejects-chain
+  (let [root (mint-link seed-a did-b [ledger-main])
+        leaf (mint-link seed-b did-c [ledger-main ledger-aux])
+        r (cacao/verify-chain [root leaf])]
+    (is (false? (:chain/valid? r)))
+    (is (= [{:problem :chain/resource-escalation :index 1
+             :resources [ledger-aux]}]
+           (:chain/problems r)))))
+
+(deftest expiry-ordering-violation-rejects-chain
+  (let [root (mint-link seed-a did-b [wildcard] {:exp "2026-07-10T00:00:00Z"})
+        leaf (mint-link seed-b did-c [ledger-main] {:exp "2026-08-01T00:00:00Z"})
+        r (cacao/verify-chain [root leaf])]
+    (is (false? (:chain/valid? r)))
+    (is (= [{:problem :chain/expiry-extended :index 1
+             :parent-exp "2026-07-10T00:00:00Z"
+             :child-exp "2026-08-01T00:00:00Z"}]
+           (:chain/problems r)))))
+
+(deftest wrong-iss-aud-linkage-rejects-chain
+  (let [root (mint-link seed-a did-b [wildcard])
+        ;; minted by C, but the parent delegated to B → iss != parent aud
+        leaf (mint-link seed-c "did:key:zHOLDER" [ledger-main])
+        r (cacao/verify-chain [root leaf])]
+    (is (false? (:chain/valid? r)))
+    (is (= [{:problem :chain/broken-linkage :index 1
+             :expected did-b :got did-c}]
+           (:chain/problems r)))))
+
+(deftest now-rejects-expired-and-not-yet-valid-links
+  (let [root (mint-link seed-a did-b [wildcard])
+        leaf (mint-link seed-b did-c [ledger-main])
+        chain [root leaf]]
+    (is (true? (:chain/valid? (cacao/verify-chain chain {:now "2026-07-01T00:00:00Z"}))))
+    (testing "now == exp is already expired (iat <= now < exp)"
+      (let [r (cacao/verify-chain chain {:now "2026-07-27T00:00:00Z"})]
+        (is (false? (:chain/valid? r)))
+        (is (every? #(= :chain/expired (:problem %)) (:chain/problems r)))
+        (is (= [0 1] (mapv :index (:chain/problems r))))))
+    (testing "before iat the link is not yet valid"
+      (let [r (cacao/verify-chain chain {:now "2026-06-01T00:00:00Z"})]
+        (is (false? (:chain/valid? r)))
+        (is (every? #(= :chain/not-yet-valid (:problem %)) (:chain/problems r)))))
+    (testing "without :now no temporal check runs"
+      (is (true? (:chain/valid? (cacao/verify-chain chain)))))))
+
+;; ── chain-level nonce-replay protection ──────────────────────────────────────
+
+(deftest replayed-chain-is-rejected-by-same-store
+  (let [store (cacao/fresh-nonce-store)
+        root (mint-link seed-a did-b [wildcard])
+        leaf (mint-link seed-b did-c [ledger-main])
+        chain [root leaf]]
+    (is (true? (:chain/valid? (cacao/verify-chain chain {:nonce-store store})))
+        "first presentation of the whole chain verifies")
+    (let [r (cacao/verify-chain chain {:nonce-store store})]
+      (is (false? (:chain/valid? r)) "SAME chain presented again against the SAME store is a replay")
+      (is (every? #(= :chain/nonce-replay (:problem %)) (:chain/problems r)))
+      (is (= [0 1] (mapv :index (:chain/problems r))) "both links are flagged as replayed"))))
+
+(deftest two-different-chains-both-succeed-against-same-store
+  (let [store (cacao/fresh-nonce-store)
+        root1 (mint-link seed-a did-b [wildcard] {:nonce "root-nonce-1"})
+        leaf1 (mint-link seed-b did-c [ledger-main] {:nonce "leaf-nonce-1"})
+        root2 (mint-link seed-a did-b [wildcard] {:nonce "root-nonce-2"})
+        leaf2 (mint-link seed-b did-c [ledger-main] {:nonce "leaf-nonce-2"})]
+    (is (true? (:chain/valid? (cacao/verify-chain [root1 leaf1] {:nonce-store store}))))
+    (is (true? (:chain/valid? (cacao/verify-chain [root2 leaf2] {:nonce-store store})))
+        "a second chain with distinct nonces also verifies — not over-broadly rejected")))
+
+(deftest intra-chain-nonce-reuse-across-different-links-is-rejected
+  ;; two links of the SAME chain sharing an [iss nonce] — even with no
+  ;; caller-supplied store, the fresh-per-call default still catches this
+  ;; because it's the SAME store instance for every link within one call.
+  (let [root (mint-link seed-a did-b [wildcard] {:nonce "same-nonce"})
+        ;; re-issue from the SAME seed (root's own iss) so [iss nonce] collides
+        leaf (mint-link seed-a did-c [ledger-main] {:nonce "same-nonce"})
+        r (cacao/verify-chain [root leaf])]
+    (is (false? (:chain/valid? r)))
+    (is (some #(= :chain/nonce-replay (:problem %)) (:chain/problems r)))))
+
+(deftest default-fresh-store-per-chain-call-does-not-crash-but-cannot-protect-across-calls
+  ;; mirrors the single-verify fallback test: omitting :nonce-store still
+  ;; functions (no exception), but each verify-chain call gets its own
+  ;; throwaway store, so replaying the SAME chain across two SEPARATE calls
+  ;; (no store threaded through) is NOT caught.
+  (let [root (mint-link seed-a did-b [wildcard])
+        leaf (mint-link seed-b did-c [ledger-main])
+        chain [root leaf]]
+    (is (true? (:chain/valid? (cacao/verify-chain chain))))
+    (is (true? (:chain/valid? (cacao/verify-chain chain)))
+        (str "replaying the SAME chain a second time with no store ALSO verifies true — "
+             "proof the default fallback provides no cross-call replay protection"))))
+
+(deftest premature-or-stale-presentation-does-not-burn-the-nonce
+  ;; CONFIRMED BUG regression (independent review of this PR): nonce-problems
+  ;; used to gate recording ONLY on signature validity (links' :valid?, which
+  ;; never reflected temporal bounds since the per-link `verify` inside
+  ;; verify-chain is called with no :now) -- so a validly-signed but
+  ;; not-yet-valid or already-expired link still burned its nonce against
+  ;; the real persistent store, permanently locking out the legitimate
+  ;; holder from ever presenting that exact chain again once it actually
+  ;; became valid. This proves a not-yet-valid presentation is correctly
+  ;; rejected WITHOUT side-effecting the store, so the later, genuinely
+  ;; valid presentation still succeeds.
+  (let [store (cacao/fresh-nonce-store)
+        root (mint-link seed-a did-b [wildcard])
+        leaf (mint-link seed-b did-c [ledger-main])
+        chain [root leaf]]
+    (testing "presented before iat: rejected as not-yet-valid"
+      (let [r (cacao/verify-chain chain {:now "2026-06-01T00:00:00Z" :nonce-store store})]
+        (is (false? (:chain/valid? r)))
+        (is (every? #(= :chain/not-yet-valid (:problem %)) (:chain/problems r)))))
+    (testing "presented again later, now genuinely within the valid window: must succeed"
+      (let [r (cacao/verify-chain chain {:now "2026-07-01T00:00:00Z" :nonce-store store})]
+        (is (true? (:chain/valid? r))
+            "the earlier not-yet-valid presentation must not have burned the nonce")))))
+
+(deftest expired-presentation-also-does-not-burn-the-nonce
+  (let [store (cacao/fresh-nonce-store)
+        root (mint-link seed-a did-b [wildcard])
+        leaf (mint-link seed-b did-c [ledger-main])
+        chain [root leaf]]
+    (testing "presented after exp: rejected as expired"
+      (let [r (cacao/verify-chain chain {:now "2026-07-27T00:00:00Z" :nonce-store store})]
+        (is (false? (:chain/valid? r)))
+        (is (every? #(= :chain/expired (:problem %)) (:chain/problems r)))))
+    (testing "presented again within the (already past) valid window: must still succeed --
+              proves the expired presentation didn't burn the nonce either"
+      (let [r (cacao/verify-chain chain {:now "2026-07-01T00:00:00Z" :nonce-store store})]
+        (is (true? (:chain/valid? r)))))))
+
+(deftest malformed-chain-input-never-throws
+  (doseq [garbage [nil 42 "b64" {} [] [nil] [42] ["not-b64!!!"] ["" ""]]]
+    (let [r (cacao/verify-chain garbage)]
+      (is (false? (:chain/valid? r)) (pr-str garbage))
+      (is (seq (:chain/problems r)) (pr-str garbage)))))
+
+;; ── kotobase.net apex profile ────────────────────────────────────────────────
+;; Each of these corresponds to a check in net-kotobase's
+;; `kotobase.edge-cacao/validate-cacao`. They exist because three separate
+;; hand-rolled copies of this mint drifted from that file and every drift
+;; surfaced as the same opaque 401 (ADR-2607275000).
+
+(def ^:private apex-seed (byte-array (repeat 32 (byte 7))))
+
+(defn- apex-mint [& [over]]
+  (cacao/mint-kotobase-apex (merge {:seed apex-seed
+                                    :nonce "n-apex-1"
+                                    :iat "2026-07-27T10:15:30Z"
+                                    :exp "2026-07-27T10:20:30Z"}
+                                   over)))
+
+(deftest apex-mint-carries-pin-and-an-issuer-did-graph-scope
+  (let [{:keys [cacao-b64 iss]} (apex-mint)
+        rs (:resources (:payload (cacao/verify cacao-b64)))]
+    (is (some #{"kotoba://can/kotobase:pin"} rs))
+    (is (some #{(str "kotoba://graph/" iss)} rs)
+        "the scope is the ISSUER DID -- a graph-CID scope is rejected by the apex")))
+
+(deftest apex-op-caps-ride-along-without-displacing-the-required-two
+  (let [{:keys [cacao-b64 iss]} (apex-mint {:op-caps ["datom:read" "tx:create"]})
+        rs (:resources (:payload (cacao/verify cacao-b64)))]
+    (is (= ["kotoba://can/kotobase:pin"
+            "kotoba://can/datom:read"
+            "kotoba://can/tx:create"
+            (str "kotoba://graph/" iss)]
+           (vec rs)))))
+
+(deftest apex-mint-refuses-a-timestamp-the-apex-cannot-parse
+  (testing "THE bug this profile exists for. `(str (Instant/now))` renders
+            nanoseconds when they are non-zero, so most mints were rejected and
+            the ones landing on a whole second passed -- an intermittent auth
+            failure that reads as a flaky network. Refusing at mint time turns
+            an opaque 401 into a message naming the field."
+    (is (thrown? kerror/ExceptionInfo (apex-mint {:iat "2026-07-27T10:15:30.123456789Z"})))
+    (is (thrown? kerror/ExceptionInfo (apex-mint {:iat "1785140000"})))
+    (is (thrown? kerror/ExceptionInfo (apex-mint {:exp "2026-07-27T10:20:30.5Z"})))
+    (is (some? (:cacao-b64 (apex-mint))) "seconds precision passes")))
+
+(deftest apex-instant-predicate-matches-only-the-apex-format
+  (is (cacao/apex-instant-ok? "2026-07-27T10:15:30Z"))
+  (is (not (cacao/apex-instant-ok? "2026-07-27T10:15:30.1Z")))
+  (is (not (cacao/apex-instant-ok? "2026-07-27T10:15:30+09:00")))
+  (is (not (cacao/apex-instant-ok? "1785140000")))
+  (is (not (cacao/apex-instant-ok? nil))))
+
+(deftest apex-mint-refuses-a-missing-nonce
+  (testing "the edge records nonces for replay protection; a mint without one
+            is not replay-safe, it is un-dedupeable"
+    (is (thrown? kerror/ExceptionInfo (apex-mint {:nonce ""})))
+    (is (thrown? kerror/ExceptionInfo (apex-mint {:nonce nil})))))
+
+(deftest apex-envelope-header-is-caip122
+  (testing "a comment in one of the drifted copies asserted the apex wanted NO
+            `h` field at all; that was true of the pre-cutover pod"
+    (let [{:keys [cacao-b64]} (apex-mint)]
+      (is (:valid? (cacao/verify cacao-b64)))
+      (is (= "caip122" (get (cacao/envelope-header cacao-b64) "t"))))))
+
+(deftest a-generic-mint-still-says-eip4361
+  (testing "the profile is additive; existing callers are untouched"
+    (let [{:keys [cacao-b64]} (cacao/mint {:seed apex-seed :aud "did:web:x"
+                                           :nonce "n" :iat "2026-07-27T10:15:30Z"
+                                           :exp "2026-07-27T10:20:30Z"
+                                           :resources ["kotoba://can/x"]})]
+      (is (= "eip4361" (get (cacao/envelope-header cacao-b64) "t"))))))
+
+(deftest a-cacao-minted-with-a-statement-verifies
+  ;; It did not, from the day the option existed: `siwe-message` puts the
+  ;; statement in the signed text and the payload dropped it, so `verify`
+  ;; reconstructed a different string and rejected what `mint` had just made.
+  (let [seed (byte-array 32)
+        _ (.nextBytes (java.security.SecureRandom.) seed)
+        base {:seed seed :aud "did:key:zBob" :iat "2026-01-01T00:00:00Z"
+              :exp "2027-01-01T00:00:00Z" :nonce "n1"
+              :resources ["drive:d#write"]}
+        with-statement (cacao/mint (assoc base :statement "grants write on d"))]
+    (is (:valid? (cacao/verify (:cacao-b64 with-statement) {})))
+    (is (= "grants write on d"
+           (:statement (:payload (cacao/verify (:cacao-b64 with-statement) {})))))
+    (is (:valid? (cacao/verify (:cacao-b64 with-statement)
+                               {:now "2026-06-01T00:00:00Z"})))))
+
+(deftest a-statement-less-cacao-is-byte-for-byte-what-it-was
+  ;; The field is appended rather than placed in SIWE order so that every
+  ;; token already issued still verifies.
+  (let [seed (byte-array 32)
+        _ (.nextBytes (java.security.SecureRandom.) seed)
+        m (cacao/mint {:seed seed :aud "did:key:zBob" :iat "2026-01-01T00:00:00Z"
+                       :exp "2027-01-01T00:00:00Z" :nonce "n1"
+                       :resources ["drive:d#write"]})]
+    (is (:valid? (cacao/verify (:cacao-b64 m) {})))
+    (is (nil? (:statement (:payload (cacao/verify (:cacao-b64 m) {})))))))

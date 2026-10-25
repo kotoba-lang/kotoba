@@ -1,0 +1,150 @@
+;; Compile `kotoba/biscuit/scope.kotoba` and run the COMPILED artifact.
+;;
+;; The JVM suite drives the guest through the KIR interpreter, which is not
+;; the thing that ships. This runs the `.wasm` the public CLI produces, on
+;; real `WebAssembly`, through amu's own `runtime/browser-host.mjs`, and
+;; prints what it answered so `scope_artifact_test.clj` can hold it against
+;; the interpreter.
+;;
+;; nbb rather than a `.mjs`: this workspace does not add raw JavaScript
+;; harnesses (AGENTS.md, runtime priority).
+;;
+;; This guest is a STREAM -- `init` then a fact at a time then `end-block`,
+;; each returning the next state -- so the probe passes the guest's own
+;; returned document straight back in. That works because the value is
+;; already trusted by the runtime; a document the host wants to INTRODUCE
+;; has to go through `typedValues.document` in the tagged form the KIR value
+;; plane uses, and building one any other way is refused as forged. Both
+;; directions are exercised here.
+;;
+;; A whole walk shares ONE instance on purpose: the state has to survive
+;; across the calls. That is the one place the per-call-instance rule does
+;; not apply, and it is why the tokens here are small -- a module's fuel is
+;; a private global baked in at compile time (512 by default) and is spent
+;; over the life of an instance.
+
+(ns biscuit.artifact-probe
+  (:require ["node:fs" :as fs]
+            ["node:child_process" :as cp]
+            ["node:path" :as path]
+            [kotoba.lang.text :as str]))
+
+(defn ->doc [x]
+  (cond
+    (string? x) #js ["string" x]
+    (keyword? x) #js ["keyword" (str x)]
+    (boolean? x) #js ["bool" x]
+    (int? x) #js ["i64" (js/BigInt x)]
+    (map? x) #js ["map" (clj->js (mapv (fn [[k v]] #js [#js ["keyword" (str k)] (->doc v)])
+                                       (sort-by key x)))]
+    :else #js ["null" nil]))
+
+(def default-opts
+  {:policy-allows? true :policy-wildcard? false :expired? false
+   :require-holder? false :forbid-wildcard? false})
+
+;; [label request blocks opts]. A block is a vector of facts.
+(def cases
+  [["widening" {:kind ":net/connect" :resource "e" :holder ""}
+    [[{:pred "holder" :a "alice" :b ""}] [{:pred "cap" :a ":net/connect" :b "e"}]]
+    {}]
+   ["honest attenuation" {:kind ":net/connect" :resource "a" :holder ""}
+    [[{:pred "cap" :a ":net/connect" :b "a"} {:pred "cap" :a ":net/connect" :b "b"}]
+     [{:pred "cap" :a ":net/connect" :b "a"}]]
+    {}]
+   ["narrowed away" {:kind ":net/connect" :resource "a" :holder ""}
+    [[{:pred "cap" :a ":net/connect" :b "a"} {:pred "cap" :a ":net/connect" :b "b"}]
+     [{:pred "cap" :a ":net/connect" :b "b"}]]
+    {}]
+   ["missing grant" {:kind ":net/connect" :resource "a" :holder ""}
+    [[{:pred "cap" :a ":fs/read" :b "a"}]]
+    {}]
+   ["holder mismatch" {:kind ":net/connect" :resource "a" :holder "mallory"}
+    [[{:pred "holder" :a "alice" :b ""} {:pred "cap" :a ":net/connect" :b "a"}]]
+    {:require-holder? true}]
+   ["holder match" {:kind ":net/connect" :resource "a" :holder "alice"}
+    [[{:pred "holder" :a "alice" :b ""} {:pred "cap" :a ":net/connect" :b "a"}]]
+    {:require-holder? true}]
+   ["ambiguous holder" {:kind ":net/connect" :resource "a" :holder "alice"}
+    [[{:pred "holder" :a "alice" :b ""} {:pred "holder" :a "mallory" :b ""}
+      {:pred "cap" :a ":net/connect" :b "a"}]]
+    {:require-holder? true}]
+   ["expired" {:kind ":net/connect" :resource "a" :holder ""}
+    [[{:pred "cap" :a ":net/connect" :b "a"}]] {:expired? true}]
+   ["local policy" {:kind ":net/connect" :resource "a" :holder ""}
+    [[{:pred "cap" :a ":net/connect" :b "a"}]] {:policy-allows? false}]
+   ["wildcard" {:kind ":net/connect" :resource "*" :holder ""}
+    [[{:pred "cap" :a ":net/connect" :b "*"}]] {:forbid-wildcard? true}]])
+
+(def amu-bin (or (first *command-line-args*) "kotoba"))
+(def guest (path/resolve "lib/org.biscuitsec.biscuit/kotoba/biscuit/scope.kotoba"))
+(def host-url
+  (some-> (second *command-line-args*)
+          (as-> root (str "file://" root "/runtime/browser-host.mjs"))))
+
+(defn- emit [m] (println (pr-str m)))
+
+(defn- walk [m request blocks opts]
+  (let [e (.. m -instance -exports)
+        D (.-document (.-typedValues m))
+        final (reduce (fn [state block]
+                        ;; The guest's own state document, handed straight
+                        ;; back. A fact is introduced by the host and has to
+                        ;; be admitted through `typedValues.document`.
+                        ((aget e "end-block")
+                         (reduce (fn [s f] ((aget e "offer-fact") s (D (->doc f))))
+                                 state block)))
+                      ((aget e "init") (D (->doc request)))
+                      blocks)]
+    {:decision (str ((aget e "decide") final (D (->doc (merge default-opts opts)))))
+     :blocks (str ((aget e "blocks-seen") final))
+     :holders (str ((aget e "holder-count") final))
+     :authority (str ((aget e "authority-confers?") final))
+     :granted (str ((aget e "still-granted?") final))
+     :widening (str ((aget e "widening-attempted?") final))}))
+
+(defn- run []
+  (let [wasm (path/join (or (.-TMPDIR js/process.env) "/tmp") "biscuit-scope-gate.wasm")
+        r (cp/spawnSync amu-bin
+                        #js ["-M" "compile" guest "--target" "wasm32-browser"
+                             "--output" wasm]
+                        #js {:encoding "utf8"})]
+    (if-not (zero? (.-status r))
+      ;; A gate that could not compile has not verified anything. Exit 3 --
+      ;; not 0 and not 1 -- so "could not measure" never reads as "measured
+      ;; and clean".
+      (do (emit {:status :compile-failed
+                 :detail (str/trim (str (.-stdout r) (.-stderr r)))})
+          (js/process.exit 3))
+      (-> (js/import host-url)
+          (.then
+           (fn [host]
+             (let [bytes (js/Uint8Array. (fs/readFileSync wasm))
+                   instantiate (.-instantiateKotoba host)]
+               (-> (js/Promise.all
+                    (clj->js
+                     (for [[label request blocks opts] cases]
+                       ;; One instance per walk: the state has to survive
+                       ;; across the calls, and fuel is spent over the life
+                       ;; of the instance.
+                       (-> (instantiate bytes)
+                           (.then (fn [m] (clj->js [label (pr-str (walk m request blocks opts))])))
+                           (.catch (fn [e]
+                                     (clj->js [label (pr-str {:threw (str (or (.-code e)
+                                                                             (.-message e)))})])))))))
+                   (.then (fn [results]
+                            (-> (instantiate bytes)
+                                (.then (fn [m]
+                                         (emit {:status :ok
+                                                :sha256 (.-sha256 m)
+                                                :main (str ((.. m -instance -exports -main)))
+                                                :results (mapv #(vec (js->clj %)) results)}))))))
+                   (.catch (fn [e]
+                             (emit {:status :host-failed
+                                    :detail (str (or (.-code e) "") " " (.-message e))})
+                             (js/process.exit 3)))))))
+          (.catch (fn [e]
+                    (emit {:status :host-import-failed :detail (str e)})
+                    (js/process.exit 3)))))))
+
+(run)

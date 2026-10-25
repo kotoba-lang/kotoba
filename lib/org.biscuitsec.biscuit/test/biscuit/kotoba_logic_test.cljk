@@ -1,0 +1,132 @@
+(ns biscuit.kotoba-logic-test
+  (:require [biscuit.keys :as keys]
+            [biscuit.kotoba-logic :as logic]
+            [biscuit.token :as token]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def cid "bafkreihteekkh5xzrg6bat5mjthbtylimi36nifl62c2ladfyftplijcke")
+(def root (keys/keypair "root"))
+(def next-key (keys/keypair "next"))
+(def actor "did:key:zAlice")
+(def resource "https://notify.example/messages")
+
+(def semantics
+  {:kinds #{:http/post}
+   :rules {:only-local-authorizer-may-allow true
+           :biscuit-role :delegated-grant-only}})
+
+(def compiler-evidence
+  {:format :kotoba.compiler-facts/v1
+   :manifest-cid cid
+   :manifest-sha256 (apply str (repeat 64 "a"))
+   :facts [["amu:definition" cid]
+           ["amu:requires" cid :http/post]
+           ["amu:world" cid cid]]})
+
+(def request {:actor actor :definition-cid cid :kind :http/post :resource resource})
+(def local-policy {:policy/id "policy:notify-v1"
+                   :policy/allow #{[actor :http/post resource]}})
+(def runtime {:runtime/world cid :runtime/epoch 7
+              :runtime/available #{[:http/post resource]}})
+
+(defn biscuit [extra-facts]
+  (token/authority
+   {:facts (into [['holder actor] ['cap "http/post" resource]] extra-facts)
+    :next-public-key (:public next-key)
+    :root-private-key (:private root)
+    :sign-fn keys/sign-fn}))
+
+(defn call
+  ([] (call {}))
+  ([overrides]
+   (logic/authorize
+    (merge {:semantics semantics
+            :token (biscuit [])
+            :root-public-key (:public root)
+            :verify-fn keys/verify-fn
+            :compiler-evidence compiler-evidence
+            :request request
+            :local-policy local-policy
+            :runtime runtime
+            :now "2026-08-30T00:00:00Z"
+            :call "http/post"}
+           overrides))))
+
+(deftest all-five-origins-join-to-one-concrete-capability
+  (let [decision (call)]
+    (is (true? (:allowed? decision)))
+    (is (= :amu+biscuit+local-policy+runtime
+           (get-in decision [:capability :cap/provenance])))
+    (is (= cid (get-in decision [:receipt :receipt/compiler-manifest])))
+    (is (= 1 (count (get-in decision [:receipt :receipt/grants]))))
+    (is (= 7 (get-in decision [:receipt :receipt/epoch])))
+    (is (= :allowed (get-in decision [:receipt :receipt/outcome])))))
+
+(deftest every-origin-is-mandatory
+  (doseq [[label overrides expected]
+          [["static effect"
+            {:compiler-evidence (assoc compiler-evidence
+                                       :facts [["amu:definition" cid]
+                                               ["amu:world" cid cid]])}
+            :missing-static-effect]
+           ["delegation"
+            {:token (token/authority
+                     {:facts [['holder actor]]
+                      :next-public-key (:public next-key)
+                      :root-private-key (:private root)
+                      :sign-fn keys/sign-fn})}
+            :missing-grant]
+           ["local policy"
+            {:local-policy {:policy/id "policy:deny" :policy/allow #{}}}
+            :empty-intersection]
+           ["runtime availability"
+            {:runtime (assoc runtime :runtime/available #{})}
+            :runtime-unavailable]]]
+    (testing label
+      (let [decision (call overrides)]
+        (is (false? (:allowed? decision)))
+        (is (= expected (:reason decision)))
+        (is (nil? (:capability decision)))
+        (is (= :denied (get-in decision [:receipt :receipt/outcome])))))))
+
+(deftest token-cannot-impersonate-local-policy-or-runtime
+  (let [malicious (biscuit [['policy:allows actor :http/post resource]
+                            ['runtime:available :http/post resource]])
+        decision (call {:token malicious
+                        :local-policy {:policy/id "policy:deny" :policy/allow #{}}
+                        :runtime (assoc runtime :runtime/available #{})})]
+    (is (false? (:allowed? decision)))
+    (is (= :empty-intersection (:reason decision)))))
+
+(deftest token-is-bound-to-the-actor-and-never-enters-the-receipt
+  (let [other (assoc request :actor "did:key:zMallory")
+        decision (call {:request other})]
+    (is (= :wrong-holder (:reason decision)))
+    (is (every? #(contains? (:receipt decision) %) logic/receipt-keys))
+    (is (not (contains? (:receipt decision) :token)))
+    (is (not (re-find #"block/signature" (pr-str (:receipt decision)))))))
+
+(deftest forged-token-is-denied-and-receipted
+  (let [forged (assoc-in (biscuit []) [:biscuit/blocks 0 :block/facts]
+                         [['holder actor] ['cap "http/post" "https://evil.example"]])
+        decision (call {:token forged})]
+    (is (= :signature-mismatch (:reason decision)))
+    (is (= :denied (get-in decision [:receipt :receipt/outcome])))))
+
+(deftest a-trusted-clock-is-mandatory
+  (let [decision (call {:now nil})]
+    (is (= :invalid-runtime-context (:reason decision)))
+    (is (= :denied (get-in decision [:receipt :receipt/outcome])))))
+
+(deftest a-re-addressed-token-is-refused-by-name
+  (testing "a later block naming a different holder confers nothing, and the
+            refusal says so rather than reading as :wrong-holder"
+    (let [t (token/append (biscuit [])
+                          {:facts [['holder "did:key:zMallory"]]
+                           :next-public-key (:public next-key)
+                           :private-key (:private next-key)
+                           :sign-fn keys/sign-fn})
+          d (call {:token t})]
+      (is (false? (:allowed? d)))
+      (is (= :holder-readdressed (:reason d)))
+      (is (nil? (:capability d))))))

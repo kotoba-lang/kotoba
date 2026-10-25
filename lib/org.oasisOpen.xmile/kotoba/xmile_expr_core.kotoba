@@ -1,0 +1,594 @@
+(ns xmile-expr-core
+  (:schemas
+   {;; The XMILE expression tree (sec 3.3), as a sealed recursive value.
+    ;;
+    ;; The .cljc tree is `[:num n] [:ref "Name"] [:add a b] [:call "MAX" [a b]]
+    ;; ...`: operators are keywords in head position, calls carry a name string.
+    ;; Here BOTH are an application carrying a name, because they are the same
+    ;; thing -- `[:add a b]` and `MAX(a, b)` differ in surface syntax, not in
+    ;; what the evaluator does with them. Operators keep the lower-case spelling
+    ;; the .cljc keyword has (`"add"`, `"lt"`, `"if"`); XMILE function names are
+    ;; upper-case per sec 3.5, so the two namespaces cannot collide.
+    ;;
+    ;; Arity is structural -- `:app1` and `:app2` are different cases -- so an
+    ;; arity error cannot be represented rather than being caught, and
+    ;; `ABS(1, 2)` reaches the evaluator as an unknown 2-argument application.
+    :xmile/expr
+    [:variant :xmile/expr
+     [[:num :f64]
+      [:var :string]
+      [:app0 :string]
+      [:app1 [:vector [:string [:ref :xmile/expr]]]]
+      [:app2 [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]]]
+      [:app3 [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                       [:ref :xmile/expr]]]]]]
+
+    ;; A list of variable names -- a stock's inflows or its outflows.
+    :xmile/names
+    [:variant :xmile/names
+     [[:end :i64]
+      [:cons [:vector [:string [:ref :xmile/names]]]]]]})
+  (:export [abs sqrt exp ln log10 sin cos tan arcsin arccos arctan
+            floor int-part pow xmile-mod min-2 max-2 pi inf
+            truthy bool-num not-num and-num or-num
+            lt-num le-num gt-num ge-num eq-num ne-num
+            step-value ramp-value pulse-value
+            num-of var-of app0-of app1-of app2-of app3-of
+            env-empty env-put env-get
+            call-refusal apply0 apply1 apply2 eval-expr
+            names-end names-cons clamp-non-negative
+            eval-into sum-of derivative-of advance rk4-weight]))
+
+;; The scalar decision core of `xmile.expr` (OASIS XMILE 1.0 sec 3.3/3.5),
+;; written in Kotoba. `kotoba/pure`: no capabilities, no ambient authority,
+;; f64 in and f64 out.
+;;
+;; WHY THIS FILE EXISTS. `src/xmile/expr.cljk` binds every one of XMILE's
+;; sec 3.5.1 math built-ins to a HOST function -- `Math/exp` on the JVM,
+;; `js/Math.exp` on ClojureScript, sixteen reader conditionals in all. That is
+;; the whole of XMILE's numeric semantics resting on an interop call. This
+;; module carries the same semantics with no host math library underneath it:
+;; the kernels are fixed polynomials in the compiler's own f64 intrinsics
+;; (amu docs/adr/0009 wide-angle trigonometry, 0012 wide exp/log), which is
+;; why the two agree to ~1e-15 rather than bit-for-bit -- see the parity gate.
+;;
+;; WHAT IS NOT HERE, AND WHY. Expression-TREE walking and the `{"Name" value}`
+;; environment stay in `.cljc`. This is the decision-core shape the workspace
+;; rule prescribes (root AGENTS.md, "移行の単位は決定核"): scalars and records
+;; cross, collection assembly does not. `xmile.expr/eval-expr` dispatches on a
+;; recursive tree and looks names up in a map; every ARM of that dispatch that
+;; carries real XMILE semantics -- rather than plain IEEE arithmetic -- is a
+;; function below.
+;;
+;; AUTHORITY. `src/xmile/expr.cljk` remains the authority and the load path,
+;; unchanged and unremoved. This file proves the logic is expressible; it does
+;; not replace it. Root ADR-2608130900 records what happens when a `.kotoba`
+;; migration removes the `.cljc` a consumer loads: this repository was one of
+;; the twelve left without a load path for 23 days, so the css shape (two
+;; files, one parity gate) is the one followed here.
+;;
+;; BACKENDS. Qualified on `:kotoba-wasm` and `:kotoba-script` today, which is
+;; where the f64 transcendental intrinsics are emitted. The two native
+;; backends emit f64 arithmetic (add/sub/mul/div/min/max/sqrt/abs/neg, and
+;; vector-f64) but no exp/log/sin/cos/atan2 -- measured 2026-08-18 by reading
+;; the op tables in `kotoba-native/src/kotoba/native/{x86_64,aarch64}.cljc`.
+;; That is an implementation gap in a backend, NOT a ceiling of this language
+;; (`amu/resources/kotoba/lang/application-language.edn`, `:backend-
+;; qualification :rule`), so nothing below is shaped around avoiding it.
+;;
+;; DOMAINS. Every function here is total on the domain named in its own
+;; comment and TRAPS outside it -- fail-closed, rather than returning a number
+;; nobody should trust. Where that domain is narrower than the host `Math/*`
+;; call it replaces, the difference is stated at the function and pinned by a
+;; test. Errors are traps, not exceptions: this profile has no `throw`, and
+;; the domains below are the intrinsics' own, so a `[:result :f64 :string]`
+;; return would re-wrap a decision the intrinsic already makes.
+
+;; --- constants ------------------------------------------------------------
+
+(defn pi [] :f64 3.141592653589793)
+
+;; XMILE's INF (sec 3.5.1). `f64-div` follows IEEE-754 here exactly as the
+;; host does, so this is +Inf and not a trap.
+(defn inf [] :f64 (f64-div 1.0 0.0))
+
+(defn ln-10 [] :f64 2.302585092994046)
+
+;; --- sec 3.5.1 math built-ins ---------------------------------------------
+
+(defn abs [x :f64] :f64 (f64-abs x))
+
+;; Matches `Math/sqrt`, including NaN for a negative argument.
+(defn sqrt [x :f64] :f64 (f64-sqrt x))
+
+;; Domain |x| <= 512*ln(2) ~= 354.891. Outside it this traps where the host
+;; `Math/exp` would saturate to 0 or +Inf.
+(defn exp [x :f64] :f64 (f64-exp-bounded x))
+
+;; Domain [2^-512, 2^512]. `Math/log` returns -Inf at 0 and NaN below it;
+;; here both trap.
+(defn ln [x :f64] :f64 (f64-log-bounded x))
+
+(defn log10 [x :f64] :f64 (f64-div (f64-log-bounded x) (ln-10)))
+
+;; Domain |x| <= 8192*pi. Beyond that the host reduces the angle with a
+;; precision nobody can defend, so this refuses instead.
+(defn sin [x :f64] :f64 (f64-sin-bounded x))
+
+(defn cos [x :f64] :f64 (f64-cos-bounded x))
+
+;; sin/cos rather than a separate kernel: at a pole cos is +-0.0 and the
+;; quotient is +-Inf, which is what `Math/tan` returns for the same input
+;; (it never returns exactly +-Inf, but both are numerically meaningless
+;; there and neither is trusted by a model).
+(defn tan [x :f64] :f64 (f64-div (f64-sin-bounded x) (f64-cos-bounded x)))
+
+(defn arctan [x :f64] :f64 (f64-atan2-bounded x 1.0))
+
+;; arcsin/arccos through atan2 on the unit circle. For |x| > 1 the half-chord
+;; is sqrt of a negative, i.e. NaN, and `f64-atan2-bounded` traps on NaN --
+;; where `Math/asin` would hand back a NaN that flows on into the model.
+(defn arcsin [x :f64] :f64
+  (f64-atan2-bounded x (f64-sqrt (f64-sub 1.0 (f64-mul x x)))))
+
+(defn arccos [x :f64] :f64
+  (f64-atan2-bounded (f64-sqrt (f64-sub 1.0 (f64-mul x x))) x))
+
+;; Floored, matching `Math/floor`. Defined for |x| < 2^63: the truncation
+;; intrinsic traps on NaN, the infinities and anything out of i64 range.
+(defn floor [x :f64] :f64
+  (let [truncated (i64-to-f64-rounded (f64-to-i64-truncating x))]
+    (if (f64-lt x truncated) (f64-sub truncated 1.0) truncated)))
+
+;; XMILE INT (sec 3.5.1) is `Math/floor` in the .cljc original, not truncation.
+(defn int-part [x :f64] :f64 (floor x))
+
+(defn min-2 [a :f64 b :f64] :f64 (f64-min a b))
+(defn max-2 [a :f64 b :f64] :f64 (f64-max a b))
+
+;; FLOORED modulus, matching `clojure.core/mod` (which is what the .cljc uses)
+;; and not `rem`: (xmile-mod -1.0 3.0) is 2.0, not -1.0. XMILE's MOD is an
+;; operator, not a call (sec 3.3.1).
+(defn xmile-mod [a :f64 n :f64] :f64
+  (f64-sub a (f64-mul n (floor (f64-div a n)))))
+
+;; `^` (sec 3.3.1). Reconstructed from exp/log rather than a host `pow`, so
+;; the three cases the host handles by convention are handled explicitly:
+;;   base > 0  exp(e * ln base), inside the exp/log domains above
+;;   base = 0  0^e is 0 for e>0, 1 for e=0, +Inf for e<0 (as `Math/pow`)
+;;   base < 0  defined only for integral e (as `Math/pow`); NaN otherwise
+(defn pow [base :f64 e :f64] :f64
+  (if (f64-gt base 0.0)
+    (f64-exp-bounded (f64-mul e (f64-log-bounded base)))
+    (if (f64-eq base 0.0)
+      (if (f64-gt e 0.0)
+        0.0
+        (if (f64-eq e 0.0) 1.0 (f64-div 1.0 0.0)))
+      (if (f64-eq e (floor e))
+        (let [magnitude (f64-exp-bounded (f64-mul e (f64-log-bounded (f64-neg base))))]
+          (if (f64-eq (xmile-mod e 2.0) 0.0) magnitude (f64-neg magnitude)))
+        (f64-div 0.0 0.0)))))
+
+;; --- sec 3.3 node semantics -----------------------------------------------
+;; XMILE has no boolean type: conditions and relational operators are numbers,
+;; zero is false and every other value -- NaN included, matching `zero?` --
+;; is true. These are the arms of `eval-expr` that are XMILE semantics rather
+;; than plain IEEE arithmetic, which is why `+`/`-`/`*`/`/` have no wrapper
+;; here and these do.
+
+(defn truthy [x :f64] :bool (bool-not (f64-eq x 0.0)))
+
+(defn bool-num [b :bool] :f64 (if b 1.0 0.0))
+
+(defn not-num [x :f64] :f64 (bool-num (bool-not (truthy x))))
+(defn and-num [a :f64 b :f64] :f64 (bool-num (if (truthy a) (truthy b) false)))
+(defn or-num  [a :f64 b :f64] :f64 (bool-num (if (truthy a) true (truthy b))))
+
+(defn lt-num [a :f64 b :f64] :f64 (bool-num (f64-lt a b)))
+(defn le-num [a :f64 b :f64] :f64 (bool-num (f64-le a b)))
+(defn gt-num [a :f64 b :f64] :f64 (bool-num (f64-gt a b)))
+(defn ge-num [a :f64 b :f64] :f64 (bool-num (f64-ge a b)))
+(defn eq-num [a :f64 b :f64] :f64 (bool-num (f64-eq a b)))
+(defn ne-num [a :f64 b :f64] :f64 (bool-num (bool-not (f64-eq a b))))
+
+;; --- sec 3.5.4 test inputs ------------------------------------------------
+;; The .cljc reads TIME and DT out of the environment map; here they are
+;; ordinary parameters, which is the whole difference between a map lookup
+;; and a decision core.
+
+(defn step-value [height :f64 start :f64 t :f64] :f64
+  (if (f64-ge t start) height 0.0))
+
+(defn ramp-value [slope :f64 start :f64 t :f64] :f64
+  (if (f64-lt t start) 0.0 (f64-mul slope (f64-sub t start))))
+
+;; PULSE(magnitude, first-time[, interval]): one DT wide, magnitude/DT high,
+;; at first-time and every interval thereafter. A non-positive interval fires
+;; once -- the .cljc caller passes 0.0 for the two-argument form.
+(defn pulse-value [magnitude :f64 first-time :f64 interval :f64
+                   t :f64 dt :f64] :f64
+  (if (f64-lt t (f64-sub first-time (f64-div dt 2.0)))
+    0.0
+    (if (f64-le interval 0.0)
+      (if (f64-lt (f64-sub t first-time) dt) (f64-div magnitude dt) 0.0)
+      (if (f64-lt (xmile-mod (f64-sub t first-time) interval) dt)
+        (f64-div magnitude dt)
+        0.0))))
+
+;; ==========================================================================
+;; The evaluator (sec 3.3 / 3.5), over the recursive `:xmile/expr` value.
+;; ==========================================================================
+;;
+;; The scalar half above says what each XMILE operation MEANS. This half says
+;; how a tree of them is walked -- which is the other thing `xmile.expr/
+;; eval-expr` does, and the part that needed a recursive value to express at
+;; all (W4, ADR-2607279200 Delivery 4; qualified on :compiler / :kotoba-wasm /
+;; :kotoba-cljs).
+;;
+;; ERRORS ARE VALUES. `eval-expr` returns `[:result :f64 :string]` where the
+;; .cljc throws `ex-info`. That is this language's stated idiom and one of the
+;; two constraints it holds as permanent rather than provisional (`kotoba-lang/
+;; lang/surface-status.edn`, `:invariants :explicit-errors`
+;; = `:intentional-security-constraint`) -- it is not a native-backend
+;; workaround. Every arm therefore threads the failure of a subexpression out
+;; rather than unwinding past it.
+;;
+;; THE ENVIRONMENT CARRIES BIT PATTERNS, NOT DOUBLES. `[:map :string :f64]` is
+;; rejected today -- `direct floating map keys or values are outside the
+;; structured scalar ABI` -- so the map is `[:map :string :i64]` holding
+;; `f64-to-bits`. `f64-to-bits`/`f64-from-bits` are exact and total in both
+;; directions, so no value is lost and no rounding is introduced; NaN payloads
+;; and signed zero survive. **This is a current-state constraint of the ABI,
+;; not a design choice, and not a shape to imitate once maps admit f64.**
+;; `env-put` and `env-get` are the only two places that know it, so widening
+;; the ABI is a two-function change here.
+;;
+;; LAZINESS IS SEMANTICS, NOT OPTIMISATION. `IF` evaluates only the taken
+;; branch and `and`/`or` short-circuit, because `xmile.expr/eval-expr` does
+;; (Clojure's `and`/`or` are macros and its `:if` arm calls `go` on one branch).
+;; Evaluating eagerly would be observably different the moment the untaken side
+;; refers to an unbound identifier -- so those three are handled in the walk,
+;; where the operand trees are still trees, and not in `apply2`, which only
+;; ever sees numbers. There is a test for exactly this.
+
+(defn num-of [x :f64] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :num x))
+
+(defn var-of [name :string] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :var name))
+
+(defn app0-of [f :string] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app0 f))
+
+(defn app1-of [f :string a [:ref :xmile/expr]] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app1
+               (hetero-vector [:vector [:string [:ref :xmile/expr]]] f a)))
+
+(defn app2-of [f :string a [:ref :xmile/expr] b [:ref :xmile/expr]] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app2
+               (hetero-vector [:vector [:string [:ref :xmile/expr]
+                                        [:ref :xmile/expr]]] f a b)))
+
+(defn app3-of [f :string a [:ref :xmile/expr] b [:ref :xmile/expr]
+               c [:ref :xmile/expr]] [:ref :xmile/expr]
+  (variant-new [:ref :xmile/expr] :app3
+               (hetero-vector [:vector [:string [:ref :xmile/expr]
+                                        [:ref :xmile/expr]
+                                        [:ref :xmile/expr]]] f a b c)))
+
+;; --- results and the environment ------------------------------------------
+
+(defn ok [x :f64] [:result :f64 :string]
+  (result-ok-of [:result :f64 :string] x))
+
+(defn err [message :string] [:result :f64 :string]
+  (result-err-of [:result :f64 :string] message))
+
+(defn ok? [r [:result :f64 :string]] :bool
+  (result-ok?-of [:result :f64 :string] r))
+
+(defn value-of [r [:result :f64 :string]] :f64
+  (result-value-of [:result :f64 :string] r 0.0))
+
+(defn env-empty [] [:map :string :i64]
+  (typed-map-new [:map :string :i64]))
+
+(defn env-put [env [:map :string :i64] name :string value :f64] [:map :string :i64]
+  (typed-map-assoc [:map :string :i64] env name (f64-to-bits value)))
+
+;; `xmile.expr/resolve-ref`: the environment first, then the reserved constants
+;; PI and INF, then a failure naming the identifier. The order matters -- a
+;; model MAY bind a variable called PI, and then it wins.
+(defn env-get [env [:map :string :i64] name :string] [:result :f64 :string]
+  (if (typed-map-contains [:map :string :i64] env name)
+    (ok (f64-from-bits
+         (if-some [bits (typed-map-get [:map :string :i64] env name)] bits 0)))
+    (if (string=? name "PI")
+      (ok (pi))
+      (if (string=? name "INF")
+        (ok (inf))
+        (err (string-concat "xmile.expr: unknown identifier: " name))))))
+
+;; --- built-ins this evaluator refuses before looking at its arguments ------
+;; `xmile.expr/eval-expr` checks these two sets BEFORE evaluating the argument
+;; trees, so a bad argument inside `DELAY1(...)` is reported as DELAY1 and not
+;; as the argument. Reproduced here for the same reason: the refusal is about
+;; the call, so it must not depend on whether the arguments happen to evaluate.
+;; Returns "" when the name is not refused.
+
+(defn call-refusal [f :string] :string
+  (if (if (string=? f "RANDOM") true
+        (if (string=? f "NORMAL") true
+          (if (string=? f "EXPRND") true
+            (if (string=? f "LOGNORMAL") true
+              (if (string=? f "POISSON") true
+                (if (string=? f "DELAY") true
+                  (if (string=? f "DELAYN") true
+                    (if (string=? f "SMTHN") true
+                      (string=? f "FORCST")))))))))
+    (string-concat (string-concat "xmile.expr: " f)
+                   " is not yet implemented (v2 scope-out)")
+    (if (if (string=? f "DELAY1") true
+          (if (string=? f "DELAY3") true
+            (if (string=? f "SMTH1") true
+              (if (string=? f "SMTH3") true
+                (string=? f "TREND")))))
+      (string-concat (string-concat "xmile.expr: " f)
+                     (string-concat " requires model-level hidden-stock "
+                                    "desugaring (xmile.execute/desugar-delays)"))
+      "")))
+
+;; --- application ----------------------------------------------------------
+
+(defn apply0 [f :string] [:result :f64 :string]
+  (if (string=? f "PI") (ok (pi))
+    (if (string=? f "INF") (ok (inf))
+      (err (string-concat "xmile.expr: unknown function " f)))))
+
+(defn apply1 [f :string x :f64] [:result :f64 :string]
+  ;; sec 3.3 unary operators first, then the sec 3.5.1 one-argument built-ins.
+  (if (string=? f "neg") (ok (f64-neg x))
+    (if (string=? f "not") (ok (not-num x))
+      (if (string=? f "ABS") (ok (abs x))
+        (if (string=? f "SQRT") (ok (sqrt x))
+          (if (string=? f "EXP") (ok (exp x))
+            (if (string=? f "LN") (ok (ln x))
+              (if (string=? f "LOG10") (ok (log10 x))
+                (if (string=? f "SIN") (ok (sin x))
+                  (if (string=? f "COS") (ok (cos x))
+                    (if (string=? f "TAN") (ok (tan x))
+                      (if (string=? f "ARCSIN") (ok (arcsin x))
+                        (if (string=? f "ARCCOS") (ok (arccos x))
+                          (if (string=? f "ARCTAN") (ok (arctan x))
+                            (if (string=? f "INT") (ok (int-part x))
+                              (err (string-concat
+                                    "xmile.expr: unknown function " f)))))))))))))))))
+
+;; `and` / `or` are NOT here: they short-circuit, so they never reach a place
+;; where both operands are already numbers. See the walk.
+(defn apply2 [f :string a :f64 b :f64 env [:map :string :i64]] [:result :f64 :string]
+  (if (string=? f "add") (ok (f64-add a b))
+    (if (string=? f "sub") (ok (f64-sub a b))
+      (if (string=? f "mul") (ok (f64-mul a b))
+        (if (string=? f "div") (ok (f64-div a b))
+          (if (string=? f "mod") (ok (xmile-mod a b))
+            (if (string=? f "pow") (ok (pow a b))
+              (if (string=? f "lt") (ok (lt-num a b))
+                (if (string=? f "le") (ok (le-num a b))
+                  (if (string=? f "gt") (ok (gt-num a b))
+                    (if (string=? f "ge") (ok (ge-num a b))
+                      (if (string=? f "eq") (ok (eq-num a b))
+                        (if (string=? f "ne") (ok (ne-num a b))
+                          (if (string=? f "MIN") (ok (min-2 a b))
+                            (if (string=? f "MAX") (ok (max-2 a b))
+                              ;; sec 3.5.4 test inputs read the reserved
+                              ;; simulation-time bindings out of the same
+                              ;; environment the .cljc reads them from.
+                              (if (string=? f "STEP")
+                                (let [t (env-get env "TIME")]
+                                  (if (ok? t) (ok (step-value a b (value-of t))) t))
+                                (if (string=? f "RAMP")
+                                  (let [t (env-get env "TIME")]
+                                    (if (ok? t) (ok (ramp-value a b (value-of t))) t))
+                                  (if (string=? f "PULSE")
+                                    ;; Two-argument PULSE: interval 0 = fire once.
+                                    (let [t (env-get env "TIME")]
+                                      (if (ok? t)
+                                        (let [dt (env-get env "DT")]
+                                          (if (ok? dt)
+                                            (ok (pulse-value a b 0.0 (value-of t)
+                                                             (value-of dt)))
+                                            dt))
+                                        t))
+                                    (err (string-concat
+                                          "xmile.expr: unknown function "
+                                          f))))))))))))))))))))
+
+;; --- the walk -------------------------------------------------------------
+
+(defn eval-expr [e [:ref :xmile/expr] env [:map :string :i64]] [:result :f64 :string]
+  (match-variant e [:ref :xmile/expr]
+    (:num x (ok x))
+    (:var name (env-get env name))
+    (:app0 f (let [refusal (call-refusal f)]
+               (if (string=? refusal "") (apply0 f) (err refusal))))
+    (:app1 p
+     (let [f (hetero-vector-at [:vector [:string [:ref :xmile/expr]]] p 0)
+           refusal (call-refusal f)]
+       (if (string=? refusal "")
+         (let [a (eval-expr
+                  (hetero-vector-at [:vector [:string [:ref :xmile/expr]]] p 1) env)]
+           (if (ok? a) (apply1 f (value-of a)) a))
+         (err refusal))))
+    (:app2 p
+     (let [f (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]] p 0)
+           left (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]] p 1)
+           right (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]]] p 2)
+           refusal (call-refusal f)]
+       (if (string=? refusal "")
+         ;; `and` and `or` short-circuit on the LEFT operand's truthiness and
+         ;; never evaluate the right one when the answer is already fixed.
+         (if (string=? f "and")
+           (let [a (eval-expr left env)]
+             (if (ok? a)
+               (if (truthy (value-of a))
+                 (let [b (eval-expr right env)]
+                   (if (ok? b) (ok (bool-num (truthy (value-of b)))) b))
+                 (ok 0.0))
+               a))
+           (if (string=? f "or")
+             (let [a (eval-expr left env)]
+               (if (ok? a)
+                 (if (truthy (value-of a))
+                   (ok 1.0)
+                   (let [b (eval-expr right env)]
+                     (if (ok? b) (ok (bool-num (truthy (value-of b)))) b)))
+                 a))
+             (let [a (eval-expr left env)]
+               (if (ok? a)
+                 (let [b (eval-expr right env)]
+                   (if (ok? b) (apply2 f (value-of a) (value-of b) env) b))
+                 a))))
+         (err refusal))))
+    (:app3 p
+     (let [f (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 0)
+           first-arg (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 1)
+           second-arg (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 2)
+           third-arg (hetero-vector-at [:vector [:string [:ref :xmile/expr] [:ref :xmile/expr]
+                        [:ref :xmile/expr]]] p 3)
+           refusal (call-refusal f)]
+       (if (string=? refusal "")
+         ;; `IF cond THEN a ELSE b` (sec 3.3.3) evaluates one branch, not both.
+         (if (string=? f "if")
+           (let [c (eval-expr first-arg env)]
+             (if (ok? c)
+               (if (truthy (value-of c))
+                 (eval-expr second-arg env)
+                 (eval-expr third-arg env))
+               c))
+           (if (string=? f "PULSE")
+             (let [a (eval-expr first-arg env)]
+               (if (ok? a)
+                 (let [b (eval-expr second-arg env)]
+                   (if (ok? b)
+                     (let [c (eval-expr third-arg env)]
+                       (if (ok? c)
+                         (let [t (env-get env "TIME")]
+                           (if (ok? t)
+                             (let [dt (env-get env "DT")]
+                               (if (ok? dt)
+                                 (ok (pulse-value (value-of a) (value-of b)
+                                                  (value-of c) (value-of t)
+                                                  (value-of dt)))
+                                 dt))
+                             t))
+                         c))
+                     b))
+                 a))
+             (err (string-concat "xmile.expr: unknown function " f))))
+         (err refusal))))))
+
+
+;; ==========================================================================
+;; One simulation step (sec 3.7.1 Euler / RK4), over the same values.
+;; ==========================================================================
+;;
+;; `xmile.execute` does five things. Three of them are XMILE decisions and are
+;; here; two are bookkeeping about the model and stay in `.cljc`.
+;;
+;;   here   bind one non-stock variable's value into the environment, clamped
+;;          (sec 3.1.2); take a stock's inflows minus its outflows (sec 3.1.1);
+;;          advance a stock by Euler or classical RK4.
+;;
+;;   .cljc  DERIVING the evaluation order (`topo-order` is a graph colouring
+;;          over the model, and it is what proves there is no algebraic loop --
+;;          a different kind of claim from anything below), `desugar-delays`,
+;;          `constant-names`, `assert-executable!`, the time loop, and the
+;;          ITERATION over variables and over stocks.
+;;
+;; WHY THE ITERATION IS NOT HERE -- MEASURED, NOT ASSUMED. The first version of
+;; this section took the whole evaluation plan and the whole stock table as
+;; recursive values, one call per step. It does not fit. A value crossing this
+;; boundary is validated against fixed budgets in `kotoba.kir.value` --
+;; `adt-node-limit` 64, `adt-depth-limit` 12, `typed-map-entry-limit` 31 -- and
+;; a linked list of N variables is N deep, so a model of any size is rejected
+;; outright (`ADT value exceeds node limit`). The failure is clean: the
+;; boundary refuses and nothing computes a wrong number. But it is a real
+;; ceiling, so the shape here is one call per quantity, whose arguments are
+;; bounded by the PROBLEM -- one variable, one stock's flow list -- rather than
+;; by how large the model is.
+;;
+;; That is a current-state constraint, not a design principle. `adt-depth-limit`
+;; has already been raised once (8 -> 12, kotoba-kir ADR 0025); nothing here is
+;; an argument that model-sized values are the wrong shape.
+;;
+;; Every function that can fail returns `[:result … :string]` for the same
+;; reason `eval-expr` does, and threads a subexpression's failure out.
+
+(defn names-end [] [:ref :xmile/names]
+  (variant-new [:ref :xmile/names] :end 0))
+
+(defn names-cons [name :string rest [:ref :xmile/names]] [:ref :xmile/names]
+  (variant-new [:ref :xmile/names] :cons
+               (hetero-vector [:vector [:string [:ref :xmile/names]]] name rest)))
+
+;; sec 3.1.2: a variable declared non-negative never reports a negative value.
+(defn clamp-non-negative [non-negative :bool x :f64] :f64
+  (if non-negative (f64-max 0.0 x) x))
+
+;; The body of `xmile.execute/eval-non-stocks`' fold: evaluate one variable's
+;; equation against the environment built so far, clamp it, bind it. The order
+;; is the caller's input -- nothing here can or should guess one.
+(defn eval-into [name :string equation [:ref :xmile/expr] non-negative :bool
+                 env [:map :string :i64]]
+  [:result [:map :string :i64] :string]
+  (let [value (eval-expr equation env)]
+    (if (ok? value)
+      (result-ok-of [:result [:map :string :i64] :string]
+                    (env-put env name
+                             (clamp-non-negative non-negative (value-of value))))
+      (result-err-of [:result [:map :string :i64] :string]
+                     (result-error-of [:result :f64 :string] value "")))))
+
+;; The .cljc sums `(reduce + 0.0 (map #(get env %) inflows))` in the set's own
+;; iteration order. Floating-point addition is not associative, so the caller
+;; passes the names in that order and this adds them in it -- which is why a
+;; three-inflow stock agrees bit-for-bit and not merely closely.
+(defn sum-of [names [:ref :xmile/names] env [:map :string :i64] acc :f64]
+  [:result :f64 :string]
+  (match-variant names [:ref :xmile/names]
+    (:end z (ok acc))
+    (:cons p
+     (let [name (hetero-vector-at [:vector [:string [:ref :xmile/names]]] p 0)
+           value (env-get env name)]
+       (if (ok? value)
+         (sum-of (hetero-vector-at [:vector [:string [:ref :xmile/names]]] p 1)
+                 env (f64-add acc (value-of value)))
+         value)))))
+
+;; sec 3.1.1: d(stock)/dt is the sum of a stock's inflows minus the sum of its
+;; outflows, each already clamped by `eval-into`.
+(defn derivative-of [inflows [:ref :xmile/names] outflows [:ref :xmile/names]
+                     env [:map :string :i64]] [:result :f64 :string]
+  (let [in (sum-of inflows env 0.0)]
+    (if (ok? in)
+      (let [out (sum-of outflows env 0.0)]
+        (if (ok? out) (ok (f64-sub (value-of in) (value-of out))) out))
+      in)))
+
+;; `xmile.execute/vec+`, for one stock: y + scale*k. Euler is this once at
+;; scale = dt; RK4 uses it for its three intermediate states (dt/2, dt/2, dt)
+;; and once more at dt/6 for the combination. One operation, five uses.
+(defn advance [y :f64 k :f64 scale :f64] :f64
+  (f64-add y (f64-mul scale k)))
+
+;; Classical RK4's weighting, ((k1 + 2k2) + 2k3) + k4, in the .cljc's own
+;; left-to-right association order so that `advance y (rk4-weight …) (dt/6)`
+;; is bit-identical to `(+ y (* (/ dt 6.0) (+ k1 (* 2 k2) (* 2 k3) k4)))` and
+;; not merely close. The parity gate asserts equality over whole RK4
+;; trajectories, and a reassociated sum would not survive that.
+(defn rk4-weight [k1 :f64 k2 :f64 k3 :f64 k4 :f64] :f64
+  (f64-add (f64-add (f64-add k1 (f64-mul 2.0 k2)) (f64-mul 2.0 k3)) k4))

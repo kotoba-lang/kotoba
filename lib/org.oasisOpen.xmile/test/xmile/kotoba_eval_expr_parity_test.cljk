@@ -1,0 +1,236 @@
+(ns xmile.kotoba-eval-expr-parity-test
+  "Parity gate for the WALK: `xmile.expr/eval-expr` against the Kotoba
+  evaluator in `kotoba/xmile_expr_core.kotoba`.
+
+  The sibling gate (`kotoba-expr-core-parity-test`) covers the scalar
+  operations one at a time. This one covers the recursive value they hang off:
+  every case here starts from an equation STRING, runs the real
+  `xmile.expr/parse` over it, and evaluates the resulting tree twice -- once
+  through `xmile.expr/eval-expr`, once through the port. Nothing in this file
+  hand-builds a tree, so the trees under test are exactly the ones the parser
+  produces.
+
+  WHAT MAKES THIS MORE THAN THE SCALAR GATE. Three properties only appear once
+  there is a tree:
+
+    laziness      `IF` evaluates one branch; `and`/`or` short-circuit. An
+                  eager port passes every arithmetic case and still fails
+                  `IF 1 THEN 2 ELSE Missing`.
+    refusal order `xmile.expr` rejects DELAY1/RANDOM BEFORE evaluating their
+                  arguments, so `DELAY1(Missing, 5)` reports DELAY1 and not
+                  the unbound identifier.
+    failure       the .cljc throws and the port returns `[:result :f64
+                  :string]`. Both directions are compared: same number when
+                  it succeeds, both failing when it does not, and the port's
+                  message classified against the .cljc's.
+
+  EXACT vs TOLERANT is inherited from the scalar gate and for the same reason:
+  an equation with no transcendental in it must agree bit-for-bit."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [xmile.expr :as expr]))
+
+(def ^:private port-source (slurp "lib/org.oasisOpen.xmile/kotoba/xmile_expr_core.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source port-source :wasm32-kotoba-v1 {}))))
+
+(defn- port [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private tolerance 1.0e-12)
+
+;; --- moving a parsed tree across --------------------------------------------
+;; The .cljc tree puts operators in head position as keywords and calls in a
+;; `[:call name args]` node; the port makes both an application carrying a
+;; name. This is the whole of the difference, and it is mechanical.
+
+(def ^:private binary-heads
+  #{:add :sub :mul :div :mod :pow :lt :le :gt :ge :eq :ne :and :or})
+
+(defn- ->tree
+  "An `xmile.expr/parse` tree as the port's `:xmile/expr` value."
+  [e]
+  (let [head (first e)]
+    (cond
+      (= head :num) (port 'num-of (double (second e)))
+      (= head :ref) (port 'var-of (second e))
+      (contains? #{:neg :not} head) (port 'app1-of (name head) (->tree (nth e 1)))
+      (contains? binary-heads head) (port 'app2-of (name head)
+                                          (->tree (nth e 1)) (->tree (nth e 2)))
+      (= head :if) (port 'app3-of "if" (->tree (nth e 1))
+                         (->tree (nth e 2)) (->tree (nth e 3)))
+      (= head :call)
+      (let [fn-name (second e) args (mapv ->tree (nth e 2))]
+        (case (count args)
+          0 (port 'app0-of fn-name)
+          1 (port 'app1-of fn-name (nth args 0))
+          2 (port 'app2-of fn-name (nth args 0) (nth args 1))
+          3 (port 'app3-of fn-name (nth args 0) (nth args 1) (nth args 2))
+          (throw (ex-info "the port's tree has no case for this arity"
+                          {:fn fn-name :arity (count args)}))))
+      :else (throw (ex-info "unknown expr head" {:expr e})))))
+
+(defn- ->env [env]
+  (reduce (fn [acc [k v]] (port 'env-put acc k (double v)))
+          (port 'env-empty)
+          env))
+
+;; --- running both sides -----------------------------------------------------
+
+(defn- host [eqn env]
+  (try {:value (expr/eval-expr (expr/parse eqn) env)}
+       (catch Exception e {:failed (ex-message e)})))
+
+(defn- ported [eqn env]
+  (try (let [r (port 'eval-expr (->tree (expr/parse eqn)) (->env env))]
+         (if (first r) {:value (second r)} {:failed (second r)}))
+       (catch Exception e {:trapped (or (:trap (ex-data e)) (ex-message e))})))
+
+(defn- relative-error [a b]
+  (cond
+    (and (Double/isNaN a) (Double/isNaN b)) 0.0
+    (= a b) 0.0
+    (or (Double/isNaN a) (Double/isNaN b)) Double/POSITIVE_INFINITY
+    (or (Double/isInfinite a) (Double/isInfinite b)) Double/POSITIVE_INFINITY
+    :else (/ (Math/abs (- a b)) (max (Math/abs a) (Math/abs b) 1.0e-300))))
+
+;; --- corpora ----------------------------------------------------------------
+
+(def ^:private base-env
+  {"Inventory" 100.0 "Production" 10.0 "Shipping" 25.0
+   "Rate" -2.5 "Zero" 0.0 "One" 1.0
+   "TIME" 4.0 "DT" 0.25})
+
+(def ^:private exact-equations
+  ["1" "0" "-3.5" "2 + 3" "2 - 3" "2 * 3" "7 / 2" "7 MOD 3" "-7 MOD 3"
+   "Inventory" "Inventory / 4" "Inventory - Shipping + Production"
+   "Rate * -1" "-Rate" "-(2 + 3)"
+   "1 < 2" "2 < 1" "1 <= 1" "2 > 1" "2 >= 3" "1 = 1" "1 <> 1"
+   "Rate < 0" "Inventory >= 100"
+   "1 AND 1" "1 AND 0" "0 AND 1" "0 AND 0" "1 OR 0" "0 OR 0" "NOT 0" "NOT 5"
+   "IF 1 THEN 2 ELSE 3" "IF 0 THEN 2 ELSE 3"
+   "IF Inventory > 50 THEN Production ELSE Shipping"
+   "IF Inventory > 50 THEN IF Rate < 0 THEN 1 ELSE 2 ELSE 3"
+   "ABS(Rate)" "ABS(-0)" "SQRT(16)" "INT(2.7)" "INT(-2.7)" "INT(Rate)"
+   "MIN(Production, Shipping)" "MAX(Production, Shipping)"
+   "MIN(Rate, 0)" "MAX(-1, -2)"
+   "STEP(10, 2)" "STEP(10, 4)" "STEP(10, 5)" "RAMP(2, 1)" "RAMP(2, 10)"
+   "PULSE(10, 4)" "PULSE(10, 2)" "PULSE(10, 0, 2)" "PULSE(10, 0, 3)"
+   "TIME" "DT" "TIME * 2 + DT"
+   "PI" "INF" "PI()" "INF()"
+   "((1 + 2) * (3 - 4)) / 5"
+   "2 + 3 * 4" "(2 + 3) * 4" "2 * 3 < 7 AND 1"
+   "Zero AND Inventory" "One OR Inventory"])
+
+(def ^:private tolerant-equations
+  ["EXP(1)" "EXP(0)" "EXP(-2.5)" "LN(10)" "LN(1)" "LOG10(1000)" "LOG10(7.5)"
+   "SIN(1)" "COS(1)" "TAN(0.5)" "SIN(0)" "COS(0)"
+   "ARCSIN(0.5)" "ARCCOS(0.5)" "ARCTAN(1)" "ARCTAN(Rate)"
+   "2 ^ 10" "2 ^ 0.5" "Inventory ^ 0.5" "(-2) ^ 3" "0 ^ 2"
+   "EXP(LN(7))" "SQRT(EXP(2))"
+   "IF Inventory > 50 THEN EXP(1) ELSE LN(10)"
+   "MAX(EXP(1), LN(10))"])
+
+(def ^:private failing-equations
+  ;; [equation, how the .cljc failure should be classified]
+  [["Missing"                    "unknown identifier"]
+   ["Missing + 1"                "unknown identifier"]
+   ["1 + Missing"                "unknown identifier"]
+   ["NOSUCHFN(1)"                "unknown function"]
+   ["RANDOM(0, 1)"               "not yet implemented"]
+   ["NORMAL(0, 1)"               "not yet implemented"]
+   ["DELAY1(Production, 5)"      "hidden-stock"]
+   ["SMTH3(Production, 5)"       "hidden-stock"]
+   ["TREND(Production, 5)"       "hidden-stock"]])
+
+;; --- the gate ---------------------------------------------------------------
+
+(deftest exact-equations-evaluate-identically
+  (doseq [eqn exact-equations]
+    (let [a (host eqn base-env) b (ported eqn base-env)]
+      (is (= a b) (str eqn " -- host " (pr-str a) " port " (pr-str b))))))
+
+(deftest transcendental-equations-agree-within-tolerance
+  (let [worst (reduce (fn [[err case] eqn]
+                        (let [a (host eqn base-env) b (ported eqn base-env)]
+                          (is (contains? a :value) (str eqn ": host failed " (pr-str a)))
+                          (is (contains? b :value) (str eqn ": port failed " (pr-str b)))
+                          (let [x (if (and (:value a) (:value b))
+                                    (relative-error (:value a) (:value b))
+                                    Double/POSITIVE_INFINITY)]
+                            (if (> x err) [x eqn] [err case]))))
+                      [0.0 nil] tolerant-equations)]
+    (is (< (first worst) tolerance)
+        (str "worst relative error " (first worst) " at " (pr-str (second worst))))
+    (println (format "  walk parity, worst relative error %.3e at %s"
+                     (first worst) (pr-str (second worst))))))
+
+(deftest failures-happen-on-both-sides-and-classify-the-same
+  (doseq [[eqn classification] failing-equations]
+    (let [a (host eqn base-env) b (ported eqn base-env)]
+      (is (contains? a :failed) (str eqn ": expected the .cljc to fail, got " (pr-str a)))
+      (is (contains? b :failed) (str eqn ": expected the port to fail, got " (pr-str b)))
+      (is (str/includes? (str (:failed a)) classification)
+          (str eqn ": .cljc message did not classify as " classification
+               " -- " (pr-str (:failed a))))
+      (is (str/includes? (str (:failed b)) classification)
+          (str eqn ": port message did not classify as " classification
+               " -- " (pr-str (:failed b)))))))
+
+(deftest evaluation-is-lazy-exactly-where-the-cljc-is
+  ;; Each of these succeeds ONLY because the unbound identifier is never
+  ;; evaluated. An eager port returns a failure for every one of them while
+  ;; passing every other test in this file.
+  (doseq [[eqn expected] [["IF 1 THEN 2 ELSE Missing"      2.0]
+                          ["IF 0 THEN Missing ELSE 3"      3.0]
+                          ["0 AND Missing"                 0.0]
+                          ["1 OR Missing"                  1.0]
+                          ["Zero AND Missing"              0.0]
+                          ["One OR Missing"                1.0]
+                          ["IF Zero THEN Missing ELSE One"  1.0]]]
+    (let [a (host eqn base-env) b (ported eqn base-env)]
+      (is (= {:value expected} a) (str eqn ": .cljc -- " (pr-str a)))
+      (is (= a b) (str eqn " -- host " (pr-str a) " port " (pr-str b))))))
+
+(deftest a-refused-call-is-refused-before-its-arguments-are-evaluated
+  ;; `DELAY1(Missing, 5)` has BOTH problems. `xmile.expr` reports the DELAY1
+  ;; one because it checks the name first; a port that evaluated arguments
+  ;; first would report the identifier and look just as "correct".
+  (doseq [eqn ["DELAY1(Missing, 5)" "RANDOM(Missing, 1)" "SMTH1(Missing, Missing)"]]
+    (let [a (host eqn base-env) b (ported eqn base-env)]
+      (is (not (str/includes? (str (:failed a)) "unknown identifier"))
+          (str eqn ": .cljc reported the argument, not the call -- " (pr-str a)))
+      (is (contains? b :failed) (str eqn ": port did not fail -- " (pr-str b)))
+      (is (not (str/includes? (str (:failed b)) "unknown identifier"))
+          (str eqn ": port reported the argument, not the call -- " (pr-str b))))))
+
+(deftest a-bound-name-shadows-a-reserved-constant
+  ;; `resolve-ref` looks in the environment BEFORE the PI/INF table, so a model
+  ;; that binds PI gets its own value. Order, not lookup, is what is asserted.
+  (let [env (assoc base-env "PI" 3.0)]
+    (is (= {:value 3.0} (host "PI" env)))
+    (is (= (host "PI" env) (ported "PI" env)))
+    (is (= (host "PI" base-env) (ported "PI" base-env)))))
+
+(deftest the-environment-round-trips-every-double-exactly
+  ;; The port's environment holds `f64-to-bits`, not doubles, because
+  ;; `[:map :string :f64]` is outside the structured scalar ABI today. That is
+  ;; only acceptable if it loses nothing -- including the two values whose bit
+  ;; pattern is the only thing that distinguishes them.
+  (doseq [v [0.0 -0.0 1.0 -1.0 1.0e-300 1.7976931348623157E308
+             4.9E-324 3.141592653589793 ##Inf ##-Inf]]
+    (let [env {"x" v}]
+      (is (= (host "x" env) (ported "x" env)) (str "round trip of " v))))
+  (testing "negative zero is not silently normalised to zero"
+    (let [[ok? v] (port 'eval-expr (->tree (expr/parse "x")) (->env {"x" -0.0}))]
+      (is (true? ok?))
+      (is (= (Double/doubleToRawLongBits -0.0) (Double/doubleToRawLongBits v))))))
+
+(deftest the-gate-can-fail
+  ;; The two comparisons the halves above rest on, driven to red.
+  (is (not= (host "2 + 3" base-env) (ported "2 + 4" base-env)))
+  (is (> (relative-error (:value (host "EXP(1)" base-env))
+                         (:value (ported "EXP(2)" base-env)))
+         tolerance)))

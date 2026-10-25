@@ -1,0 +1,448 @@
+(ns kotobase.bitcoin.transport
+  "Real TCP transport for the Bitcoin P2P protocol
+  (`kotobase.bitcoin.protocol`'s pure encode/decode) -- Node's `node:net`
+  core module, zero npm dependencies (besides `promesa`, which nbb
+  bundles), matching the `kotoba-lang/dtn` / `kotoba-lang/io-libp2p` /
+  `kotoba-lang/org-ietf-sftp` transport-layer precedent (ADR-2607161817 /
+  ADR-2607162135 in `com-junkawasaki/root`). `.cljs`-only: this can never
+  be loaded by the JVM `kbb -M:test` compat suite (see this repo's
+  deps.edn), so it can never regress `kotobase.bitcoin.protocol`'s pure
+  `.cljc` test suite.
+
+  SCOPE: connect to ONE configured peer, perform the real version/verack
+  handshake, respond to inbound `ping` with `pong` (and offer an explicit
+  `ping!` for caller-initiated liveness checks), and one round of
+  `getheaders`/`headers` sync -- every header that comes back is run
+  through `kotobase.bitcoin.protocol/validate-chain` against the store's
+  current tip BEFORE being persisted, and only committed to
+  `kotobase.store` (via `IStore`) if the whole batch validates. No peer
+  discovery, no multi-peer management, no relay, no automatic re-sync
+  loop -- a caller drives `get-headers!` again for the next batch.
+
+  Testnet3 is this library's default network (`:network :testnet`,
+  ADR-2607172600) -- mainnet is an explicit opt-in
+  (`:network :mainnet`), never the default, to keep any live-network
+  exercise of this code unambiguously in \"protocol implementation\"
+  territory.
+
+  PERMANENT SAFETY BOUNDARY -- same as `kotobase.bitcoin.protocol`: this
+  is a READ-ONLY OBSERVER. It never sends `tx`/`block`/`inv`-for-
+  relay/`mempool`/`sendcmpct` or any transaction/mining/relay message --
+  those commands are not implemented anywhere in this namespace. No
+  private key ever exists in this code path."
+  (:require ["node:net" :as net]
+            [kotobase.bitcoin.protocol :as proto]
+            [kotobase.store :as store]))
+
+;; ---------------------------------------------------------------------------
+;; Byte <-> Node Buffer conversion. kotobase.bitcoin.protocol works over
+;; plain vectors of byte-values (ints 0-255), matching sha256d.core's own
+;; convention; this namespace is the one seam that has to talk to a real
+;; socket's Buffers.
+;; ---------------------------------------------------------------------------
+
+(defn- buf->bytes [buf] (vec (js/Array.from buf)))
+(defn- bytes->buf [bs] (js/Buffer.from (clj->js (vec bs))))
+
+;; ---------------------------------------------------------------------------
+;; Inbound byte-stream framing -- Node delivers arbitrary chunk
+;; boundaries on 'data', not aligned to message boundaries. reader-state
+;; accumulates a Buffer and peels off as many complete
+;; header+payload messages as are available on every feed!.
+;; ---------------------------------------------------------------------------
+
+(defn- new-reader [] (atom {:buf (js/Buffer.alloc 0)}))
+
+(defn- feed!
+  "Accumulate `chunk` (a Buffer) into reader-state-atom, then call
+  on-message with {:command :payload-bytes} for every complete message
+  now available (checksum-verified -- a message whose checksum doesn't
+  match its own payload is dropped and logged, never handed to
+  on-message, since it cannot be trusted to decode correctly)."
+  [reader-state-atom chunk expected-magic on-message invalid! log!]
+  (swap! reader-state-atom update :buf
+         (fn [buf] (js/Buffer.concat #js [buf chunk])))
+  (try
+    (loop []
+      (let [buf (:buf (deref reader-state-atom))]
+        (when (> (.-length buf)
+                 (+ proto/header-size proto/max-protocol-payload-bytes))
+          (throw (ex-info "Bitcoin peer exceeded the receive buffer limit."
+                          {:type :bitcoin/oversized-message})))
+        (when (>= (.-length buf) proto/header-size)
+          (let [header
+                (proto/decode-message-header
+                 (buf->bytes (.subarray buf 0 proto/header-size)))
+                _ (when-not (= expected-magic (:magic header))
+                    (throw (ex-info "Bitcoin peer used the wrong network magic."
+                                    {:type :bitcoin/network-mismatch})))
+                _ (when (> (:length header)
+                           proto/max-protocol-payload-bytes)
+                    (throw (ex-info "Bitcoin peer declared an oversized message."
+                                    {:type :bitcoin/oversized-message})))
+                total (+ proto/header-size (:length header))]
+            (when (>= (.-length buf) total)
+              (let [payload-buf (.subarray buf proto/header-size total)
+                    payload (buf->bytes payload-buf)]
+                (swap! reader-state-atom assoc :buf (.subarray buf total))
+                (if (proto/checksum-valid? header payload)
+                  (on-message {:command (:command header) :payload payload})
+                  (log! (str "DROPPED message with invalid checksum, command="
+                             (:command header))))
+                (recur)))))))
+    (catch :default error
+      (reset! reader-state-atom {:buf (js/Buffer.alloc 0)})
+      (invalid! error))))
+
+;; ---------------------------------------------------------------------------
+;; kotobase.store persistence -- collections + stream this transport uses
+;; ---------------------------------------------------------------------------
+
+(def headers-coll
+  "IStore collection: block-hash-hex -> decoded header map (decode-block-
+  header shape). Every field is plain EDN data (numbers/strings/byte-
+  vectors), directly IStore-`-put`-able with no extra serialization."
+  [:kotobase.bitcoin/headers])
+
+(def meta-coll
+  "IStore collection: a single doc key \"tip\" -> {:height :hash-hex} --
+  this transport's notion of the best header chain it has validated and
+  persisted so far. Absent until the first successful get-headers!."
+  [:kotobase.bitcoin/meta])
+
+(def header-stream :kotobase.bitcoin/header-stream)
+
+(defn- audit! [store event]
+  (when store (store/-append store header-stream event)))
+
+(defn tip
+  "The store's current {:height :hash-hex} tip doc, or nil if this store
+  has never successfully persisted a header via this namespace."
+  [store]
+  (when store (store/-get store meta-coll "tip")))
+
+(defn stored-header
+  "The full decoded header map previously persisted under hash-hex, or
+  nil."
+  [store hash-hex]
+  (when store (store/-get store headers-coll hash-hex)))
+
+(defn- persist-headers!
+  "Commit `headers` (already validate-chain'd against the store's prior
+  tip by the caller) into store: one -put per header keyed by its
+  :hash-hex, one audit event per header, and finally advance the \"tip\"
+  doc to the last header in the batch. Returns the new tip map."
+  [store headers base-height initial-chainwork]
+  (let [states
+        (rest
+         (reductions
+          (fn [{:keys [chainwork work-cache]} h]
+            (let [bits (:bits h)
+                  work (or (get work-cache bits)
+                           (proto/header-work bits))]
+              {:header h
+               :chainwork (proto/add-chainwork chainwork work)
+               :work-cache (assoc work-cache bits work)}))
+          {:chainwork (or initial-chainwork proto/zero-chainwork)
+           :work-cache {}}
+          headers))]
+    (doseq [[i {:keys [header chainwork]}] (map-indexed vector states)]
+      (store/-put store headers-coll (:hash-hex header)
+                  (assoc header :height (+ base-height i 1)
+                         :chainwork chainwork))
+      (audit! store {:op :header-synced :hash-hex (:hash-hex header)
+                     :height (+ base-height i 1) :bits (:bits header)}))
+    (let [{:keys [header chainwork]} (last states)
+          new-tip {:height (+ base-height (count headers))
+                   :hash-hex (:hash-hex header)
+                   :chainwork chainwork}]
+      (store/-put store meta-coll "tip" new-tip)
+      new-tip)))
+
+(defn- consensus-context
+  "Return up to one retarget interval of chronological ancestors ending at
+  base-header. Stored headers are hash-addressed, so this also works with data
+  written before :height was embedded in each header."
+  [store network base-header base-height]
+  (loop [header base-header height base-height remaining 2017
+         newest-first []]
+    (let [next-acc (conj newest-first header)]
+      (if (or (zero? height) (= remaining 1))
+        (vec (reverse next-acc))
+        (let [previous-height (dec height)
+              previous
+              (if (zero? previous-height)
+                (proto/genesis-header network)
+                (stored-header store
+                               (proto/natural-hash->hex
+                                (:prev-block header))))]
+          (if previous
+            (recur previous previous-height (dec remaining) next-acc)
+            (vec (reverse next-acc))))))))
+
+;; ---------------------------------------------------------------------------
+;; nonces -- random, kept well within JS's exact-integer range (2^53);
+;; these are liveness/self-connection-detection values, not cryptographic
+;; secrets, so plain js/Math.random() is an appropriate source (nothing
+;; in this repo's PERMANENT SAFETY BOUNDARY requires CSPRNG nonces here --
+;; no key material is ever generated by this repo at all)."
+;; ---------------------------------------------------------------------------
+
+(defn- rand-nonce []
+  (+ (* (js/Date.now) 1000) (js/Math.floor (* (js/Math.random) 1000))))
+
+;; ---------------------------------------------------------------------------
+;; Connection lifecycle
+;; ---------------------------------------------------------------------------
+
+(def default-port {:mainnet 8333 :testnet 18333 :regtest 18444})
+
+(defn- magic-for [network]
+  (case network
+    :mainnet proto/mainnet-magic
+    :testnet proto/testnet-magic
+    :regtest proto/regtest-magic))
+
+(defn- send-message!
+  [conn-atom command payload-bytes]
+  (let [{:keys [socket magic log!]} (deref conn-atom)
+        msg (proto/encode-message magic command payload-bytes)]
+    (log! (str "-> " command " (" (count payload-bytes) " byte payload)"))
+    (.write socket (bytes->buf msg))))
+
+(defn- handle-message!
+  "Every command this transport understands. Anything else (real peers
+  send plenty this repo doesn't need -- addr, inv, feefilter, sendheaders,
+  sendcmpct, ...) is logged and ignored, never processed -- see the
+  namespace docstring's exhaustive safety boundary: no tx/block/mempool
+  command is ever acted on here even if a peer sends one."
+  [conn-atom {:keys [command payload]}]
+  (let [{:keys [log!]} (deref conn-atom)]
+    (case command
+      "version"
+      (let [v (proto/decode-version-payload payload)]
+        (swap! conn-atom assoc :peer-version v :peer-version-received? true)
+        (log! (str "<- version peer user-agent=" (:user-agent v)
+                    " start-height=" (:start-height v)))
+        (send-message! conn-atom "verack" (proto/encode-verack-payload))
+        (log! "-> verack (in response to peer's version)"))
+
+      "verack"
+      (do (swap! conn-atom assoc :verack-received? true)
+          (log! "<- verack"))
+
+      "ping"
+      (let [nonce (proto/decode-ping-payload payload)]
+        (log! (str "<- ping nonce=" nonce))
+        (send-message! conn-atom "pong" (proto/encode-pong-payload nonce)))
+
+      "pong"
+      (let [nonce (proto/decode-pong-payload payload)]
+        (log! (str "<- pong nonce=" nonce))
+        (when-let [resolve (get (:pending-pongs (deref conn-atom)) nonce)]
+          (swap! conn-atom update :pending-pongs dissoc nonce)
+          (resolve true)))
+
+      "headers"
+      (let [headers (proto/decode-headers-payload payload)]
+        (log! (str "<- headers count=" (count headers)))
+        (when-let [resolve (:pending-headers (deref conn-atom))]
+          (swap! conn-atom assoc :pending-headers nil)
+          (resolve headers)))
+
+      (log! (str "<- " command " (ignored -- not in this repo's supported command set;"
+                  " no tx/block/mempool/relay message is ever acted on)")))))
+
+(defn connect!
+  "opts: {:host :port (default per :network) :network (:testnet default |
+  :mainnet) :store (an IStore, optional -- when omitted, get-headers!
+  still validates but has nothing to persist to) :user-agent
+  :start-height :handshake-timeout-ms (default 10000) :on-log (fn [line])}
+
+  Opens a real TCP socket to host:port, sends our `version` immediately
+  on connect, and resolves once the FULL real handshake has completed in
+  both directions (we've received the peer's `version` and sent our
+  `verack` in reply, AND we've received the peer's `verack` in reply to
+  our own `version`) -- or rejects on a connection error or handshake
+  timeout. Returns a Promise<conn-atom>."
+  [{:keys [host port network store user-agent start-height handshake-timeout-ms on-log]
+    :or {network :testnet start-height 0 handshake-timeout-ms 10000
+         user-agent "/kotobase:bitcoin-p2p:0.2.0/"
+         on-log (fn [line] (println line))}}]
+  (let [port (or port (get default-port network))
+        magic (magic-for network)
+        log! (fn [line] (on-log (str "[bitcoin-p2p " host ":" port "] " line)))
+        conn-atom (atom {:host host :port port :network network :magic magic
+                          :store store :log! log!
+                          :peer-version-received? false :verack-received? false
+                          :pending-pongs {} :pending-headers nil})]
+    (js/Promise.
+     (fn [resolve reject]
+       (let [settled? (atom false)
+             socket (net/createConnection #js {:host host :port port})
+             reader (new-reader)
+             timer (js/setTimeout
+                    (fn []
+                      (when-not @settled?
+                        (reset! settled? true)
+                        (.destroy socket)
+                        (reject (ex-info "handshake timeout" {:host host :port port}))))
+                    handshake-timeout-ms)
+             maybe-settle!
+             (fn []
+               (let [{:keys [peer-version-received? verack-received?]} (deref conn-atom)]
+                 (when (and peer-version-received? verack-received? (not @settled?))
+                   (reset! settled? true)
+                   (js/clearTimeout timer)
+                   (log! "handshake complete (peer version received, mutual verack exchanged)")
+                   (resolve conn-atom))))]
+         (swap! conn-atom assoc :socket socket)
+         (.on socket "connect"
+              (fn []
+                (log! "TCP connected")
+                (send-message! conn-atom "version"
+                                (proto/encode-version-payload
+                                 {:timestamp (quot (js/Date.now) 1000)
+                                  :recv-addr {:ip "0.0.0.0" :port port}
+                                  :from-addr {:ip "0.0.0.0" :port 0}
+                                  :nonce (rand-nonce) :user-agent user-agent
+                                  :start-height start-height :relay? false}))))
+         (.on socket "data"
+              (fn [chunk]
+                (feed! reader chunk magic
+                       (fn [m]
+                         (handle-message! conn-atom m)
+                         (maybe-settle!))
+                       (fn [error]
+                         (log! (str "DISCONNECT invalid peer message: "
+                                    (or (some-> error ex-data :type)
+                                        (.-message error))))
+                         (.destroy socket))
+                       log!)))
+         (.on socket "error"
+              (fn [err]
+                (when-not @settled?
+                  (reset! settled? true)
+                  (js/clearTimeout timer)
+                  (reject (ex-info "socket error" {:host host :port port} err)))))
+         (.on socket "close" (fn [] (log! "TCP closed"))))))))
+
+(defn close! [conn-atom]
+  (.destroy (:socket (deref conn-atom))))
+
+;; ---------------------------------------------------------------------------
+;; ping!
+;; ---------------------------------------------------------------------------
+
+(defn ping!
+  "Send a real `ping` with a fresh nonce and return a Promise<boolean>
+  resolving true once the matching `pong` arrives, or false if
+  timeout-ms elapses first -- an explicit, caller-driven liveness check
+  complementing the always-on inbound-ping->pong auto-reply
+  (handle-message!) every connection performs regardless."
+  [conn-atom & {:keys [timeout-ms] :or {timeout-ms 8000}}]
+  (let [nonce (rand-nonce)]
+    (js/Promise.
+     (fn [resolve _reject]
+       (let [settled? (atom false)
+             finish! (fn [v] (when-not @settled? (reset! settled? true) (resolve v)))]
+         (swap! conn-atom update :pending-pongs assoc nonce finish!)
+         (js/setTimeout (fn []
+                           (swap! conn-atom update :pending-pongs dissoc nonce)
+                           (finish! false))
+                         timeout-ms)
+         (send-message! conn-atom "ping" (proto/encode-ping-payload nonce)))))))
+
+;; ---------------------------------------------------------------------------
+;; get-headers!
+;; ---------------------------------------------------------------------------
+
+(defn get-headers!
+  "Send `getheaders` (locator = the store's current tip hash in NATURAL
+  byte order, or this network's hardcoded genesis header's hash when the
+  store has no tip yet -- see kotobase.bitcoin.protocol/genesis-header
+  and kotobase.bitcoin.protocol/encode-getheaders-payload), wait up to
+  timeout-ms for the peer's `headers` reply, run the whole batch through
+  kotobase.bitcoin.protocol/validate-chain PREPENDED with the real base
+  header (the stored tip, or genesis on a fresh store) so headers[0]'s
+  linkage is checked too, BEFORE persisting anything -- and only if the
+  batch validates cleanly, persist every header (persist-headers!) and
+  advance the store's tip.
+
+  Returns a Promise<{:ok? bool :count n :tip {...} :errors [...]}>.
+  :ok? false with :errors set means either the peer never replied within
+  timeout-ms (a real, honest network-timing outcome, not a bug) or the
+  reply DID arrive but failed validate-chain (a peer sent something that
+  doesn't actually check out -- nothing from that batch is ever
+  persisted in that case, all-or-nothing)."
+  [conn-atom & {:keys [timeout-ms] :or {timeout-ms 15000}}]
+  (let [{:keys [store network]} (deref conn-atom)
+        prior-tip (tip store)
+        base-header (if prior-tip
+                      (stored-header store (:hash-hex prior-tip))
+                      (proto/genesis-header network))
+        base-height (or (:height prior-tip) 0)
+        locator [(:hash base-header)]
+        base-chainwork
+        (if prior-tip
+          (:chainwork prior-tip)
+          (proto/header-work (:bits base-header)))]
+    (js/Promise.
+     (fn [resolve _reject]
+       (let [settled? (atom false)
+             finish! (fn [v] (when-not @settled? (reset! settled? true) (resolve v)))]
+         (swap! conn-atom assoc :pending-headers
+                (fn [headers]
+                  (cond
+                    (empty? headers)
+                    ;; Peer had nothing new -- we're already caught up to
+                    ;; its tip. Not an error; the store's tip is
+                    ;; unchanged (guards against persist-headers!
+                    ;; computing a bogus nil-hash "tip" from an empty
+                    ;; batch, see (last []) => nil).
+                    (finish! {:ok? true :count 0
+                              :tip (or prior-tip {:height base-height :hash-hex (:hash-hex base-header)})
+                              :errors []})
+
+                    :else
+                    (let [context (consensus-context store network
+                                                     base-header base-height)
+                          all-headers (into context headers)
+                          context-start-height
+                          (- base-height (dec (count context)))
+                          result
+                          (proto/validate-header-consensus
+                           all-headers
+                           {:network network
+                            :start-height context-start-height
+                            :validate-from-index (count context)
+                            :now (quot (js/Date.now) 1000)})]
+                      (if (:valid? result)
+                        (if store
+                          (if base-chainwork
+                            (let [new-tip
+                                  (persist-headers!
+                                   store headers base-height base-chainwork)]
+                              (finish! {:ok? true :count (count headers)
+                                        :tip new-tip :errors []}))
+                            (finish!
+                             {:ok? false :count (count headers) :tip prior-tip
+                              :errors [{:type
+                                        :chainwork-migration-required}]}))
+                          (finish! {:ok? true :count (count headers)
+                                    :tip {:height (+ base-height (count headers))
+                                          :hash-hex (:hash-hex (last headers))
+                                          :chainwork
+                                          (proto/accumulate-chainwork
+                                           base-chainwork
+                                           (map :bits headers))}
+                                    :errors []}))
+                        (finish! {:ok? false :count (count headers) :tip prior-tip
+                                  :errors (:errors result)}))))))
+         (js/setTimeout (fn []
+                           (swap! conn-atom assoc :pending-headers nil)
+                           (finish! {:ok? false :count 0 :tip prior-tip
+                                     :errors [{:type :timeout}]}))
+                         timeout-ms)
+         (send-message! conn-atom "getheaders"
+                         (proto/encode-getheaders-payload {:locator-hashes locator})))))))

@@ -1,0 +1,122 @@
+;; Does `header_core.kotoba` RUN, and does it answer correctly?
+;;
+;; The parity suite next door answers "does the KIR interpreter agree with
+;; nameserver.wire". This one signs the artifact, measures the runtime, builds
+;; a loader and executes machine code on this CPU.
+;;
+;; What it asks about is `accept-reply?`, because that is the decision with a
+;; consequence: a resolver that skips the id or the QR bit believes any UDP
+;; datagram reaching its port, which is off-path cache poisoning with nothing
+;; forged. All three of its conditions are exercised -- one accepting case and
+;; one rejecting case per condition -- so a native build that dropped any of
+;; them changes the number.
+;;
+;; It FAILS rather than skips when it cannot run. A native-execution test that
+;; passes where nothing executed reports the strongest claim in the repository
+;; on the strength of having done nothing.
+;;
+;; The packing multiplies rather than shifting. This module already contains
+;; shifts, so introducing a :bool parameter or another shift-family operation
+;; in the entry point risks the pair the native target refuses (amu#611);
+;; multiplication by powers of two is the same packing without it.
+
+(ns nameserver.header-native-execution-test
+  (:require [clojure.java.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.atomic-output :as atomic-output]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.artifact.runtime-identity :as runtime-identity]
+            [kotoba.verifier.signing :as signing]
+            [kototama.native.executor :as executor]
+            [nameserver.wire :as wire]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "nameserver" "header_core.kotoba"))
+
+(defn- loader-source-dir
+  "tools/kexe_loader.c lives in the compiler's repository and is not on the
+  classpath (amu#614), so this finds the repository through a resource that is
+  and walks up. Needs the dependency to be an exploded git checkout."
+  []
+  (when-let [r (io/resource "kotoba/compiler/core.clj")]
+    (when (= "file" (.getProtocol r))
+      (let [root (->> (io/file (.getPath r))
+                      (iterate #(.getParentFile ^java.io.File %))
+                      (take 5) last)
+            dir (io/file root "tools")]
+        (when (.isFile (io/file dir "kexe_loader.c")) (.getPath dir))))))
+
+(def ^:private cljc-encode-flags (var-get #'nameserver.wire/encode-flags))
+
+;; A response with opcode 0, and a query with the same, are the two flag bytes
+;; every case below uses.
+(def ^:private response-b1
+  (first (cljc-encode-flags {:qr :response :opcode 0 :aa? false :tc? false
+                             :rd? true :ra? false :rcode :noerror})))
+(def ^:private query-b1
+  (first (cljc-encode-flags {:qr :query :opcode 0 :aa? false :tc? false
+                             :rd? true :ra? false :rcode :noerror})))
+(def ^:private other-opcode-b1
+  (first (cljc-encode-flags {:qr :response :opcode 1 :aa? false :tc? false
+                             :rd? true :ra? false :rcode :noerror})))
+
+(def ^:private entry
+  (str "\n(defn main [] :i64\n"
+       "  (+ (if (accept-reply? 4660 4660 " response-b1 " 0) 1 0)\n"
+       "     (+ (if (accept-reply? 4661 4660 " response-b1 " 0) 2 0)\n"
+       "        (+ (if (accept-reply? 4660 4660 " query-b1 " 0) 4 0)\n"
+       "           (+ (if (accept-reply? 4660 4660 " other-opcode-b1 " 0) 8 0)\n"
+       "              (if (rcode-is-error? 3) 16 0))))))\n"))
+
+(defn- oracle
+  "Only the first case may be accepted; the other three each violate one
+  condition, and NXDOMAIN is an answer rather than an error."
+  []
+  1)
+
+(defn- probe-source []
+  (let [src (slurp source-file)
+        open (str/index-of src "(ns nameserver.header-core")
+        close (str/index-of src "]))" open)]
+    (is (and open close)
+        "header_core.kotoba's ns form is not in the shape this test flattens")
+    (str (subs src 0 open) "(ns probe (:export [main]))" (subs src (+ close 3))
+         entry)))
+
+(def ^:private target
+  (if (contains? #{"aarch64" "arm64"} (.toLowerCase (System/getProperty "os.arch")))
+    :aarch64-kotoba-v1
+    :x86_64-kotoba-v1))
+
+(deftest header-core-runs-as-machine-code-and-agrees
+  (is (.exists source-file) (str "kotoba object not found at " source-file))
+  (let [dir (loader-source-dir)]
+    (is dir "the reviewed loader source was not found (see amu#614)")
+    (when (and dir (.exists source-file))
+      (let [artifact (:artifact (compiler/compile-source (probe-source) target
+                                                         {:allow #{}}))
+            k (signing/generate-keypair)
+            envelope (signing/sign artifact k {:not-before 1000 :expires 2000})
+            measured (executor/measure-runtime {:loader-source-dir dir})
+            loader (doto (java.io.File/createTempFile "kotoba-loader-" "")
+                     (.deleteOnExit))
+            _ (atomic-output/write-bytes! (.getPath loader) (:loader-bytes measured)
+                                          {:executable? true})
+            trust {:format :kotoba.trust/v1 :trusted-signers #{(:signer k)}
+                   :revoked-signers #{} :revoked-artifacts #{}
+                   :trusted-runtime-sha256
+                   #{(runtime-identity/identity-sha256 (:runtime measured))}}
+            {:keys [evidence]} (executor/execute envelope trust {:allow #{}}
+                                                 {:args []}
+                                                 {:now 1500 :entry 'main
+                                                  :runtime (:runtime measured)
+                                                  :loader-path (.getPath loader)})]
+        (is (= :native (get-in evidence [:runtime :target-profile :execution]))
+            "the artifact must have executed as machine code, not been interpreted")
+        (is (= :ok (:status evidence))
+            (str "native execution did not succeed: " (pr-str (:status evidence))))
+        (is (= (oracle) (:result evidence))
+            (str "machine code returned " (:result evidence)
+                 " and only the well-formed reply may be accepted, so it must "
+                 "be " (oracle)))))))

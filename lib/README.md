@@ -126,6 +126,33 @@ The bundled standard libraries live in this repository:
 | `org.w3.epub` | `org.w3.epub/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.turtle` | `org.w3.turtle/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.vc` | `org.w3.vc/src` | `` (an external specification, publisher w3.org) |
+| `org.opencontainers.distribution` | `org.opencontainers.distribution/src` | `kotobase.protocols.http`, `kotobase.protocols.oci`, `kotobase.protocols.oci.digest` (an external specification, publisher opencontainers.org) |
+| `org.xiph.ogg` | `org.xiph.ogg/src` | `ogg.core`, `ogg.crc`, `ogg.page`, `ogg.stream` (an external specification, publisher xiph.org) |
+| `org.xiph.flac` | `org.xiph.flac/src` | `flac.bits`, `flac.core`, `flac.crc`, `flac.encode` (an external specification, publisher xiph.org) |
+| `org.wiFi.easyConnect` | `org.wiFi.easyConnect/src` | `dpp.uri` (an external specification, publisher wiFi.org) |
+| `org.tukaani.xz` | `org.tukaani.xz/src` | `xz.buffer`, `xz.core`, `xz.crc64`, `xz.lzma` (an external specification, publisher tukaani.org) |
+| `org.sourceware.bzip2` | `org.sourceware.bzip2/src` | `bzip2.bits`, `bzip2.bwt`, `bzip2.core`, `bzip2.crc` (an external specification, publisher sourceware.org) |
+| `org.oasisOpen.saml` | `org.oasisOpen.saml/src` | `saml.core` (an external specification, publisher oasisOpen.org) |
+| `org.oasisOpen.xmile` | `org.oasisOpen.xmile/src` | `xmile.conformance`, `xmile.execute`, `xmile.expr`, `xmile.model` (an external specification, publisher oasisOpen.org) |
+| `org.iso.std6983` | `org.iso.std6983/src` | `kotoba.cam`, `kotoba.cam.gcode`, `kotoba.cam.stock`, `kotoba.cam.tool` (an external specification, publisher iso.org) |
+| `org.ietf.dns` | `org.ietf.dns/src` | `nameserver.amano`, `nameserver.custom-tld`, `nameserver.delegate`, `nameserver.domain-verification` (an external specification, publisher ietf.org) |
+| `org.chainagnostic.cacao` | `org.chainagnostic.cacao/src` | `cacao.cli`, `cacao.conformance`, `cacao.core`, `cacao.edge.base58` (an external specification, publisher chainagnostic.org) |
+| `org.canCia.canopen` | `org.canCia.canopen/src` | `canopen.cob-id`, `canopen.emcy`, `canopen.nmt`, `canopen.pdo` (an external specification, publisher canCia.org) |
+| `org.biscuitsec.biscuit` | `org.biscuitsec.biscuit/src` | `biscuit.authority`, `biscuit.authorizer`, `biscuit.datalog`, `biscuit.effective` (an external specification, publisher biscuitsec.org) |
+| `org.sevenZip.sevenZ` | `org.sevenZip.sevenZ/src` | `sevenz.core` (an external specification, publisher sevenZip.org) |
+| `org.iso.std10303` | `org.iso.std10303/src` | `brep`, `brep.assembly`, `brep.config`, `brep.config-loader` (an external specification, publisher iso.org) |
+| `org.csaIot.matter` | `org.csaIot.matter/src` | `matter.message`, `matter.protocol`, `matter.tlv` (an external specification, publisher csaIot.org) |
+| `org.bitcoin.p2p` | `org.bitcoin.p2p/src` | `kotobase.bitcoin.protocol`, `kotobase.bitcoin.transport` (an external specification, publisher bitcoin.org) |
+| `org.dicomstandard.dicom` | `org.dicomstandard.dicom/src` | `dicom.bytes`, `dicom.dataset`, `dicom.dictionary`, `dicom.element` (an external specification, publisher dicomstandard.org) |
+| `org.w3.webcodecs` | `org.w3.webcodecs/src` | `w3.webcodecs`, `w3.webcodecs.codec-string` (an external specification, publisher w3.org) |
+| `org.openstreetmap.overpass` | `org.openstreetmap.overpass/src` | `org-openstreetmap-overpass.core`, `org-openstreetmap-overpass.fetch` (an external specification, publisher openstreetmap.org) |
+| `org.si2.def` | `org.si2.def/src` | `def-format.component`, `def-format.design`, `def-format.net`, `def-format.parser` (an external specification, publisher si2.org) |
+| `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
+| `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |
+| `com.adobe.tiff` | `com.adobe.tiff/src` | `tiff.bytes`, `tiff.codec`, `tiff.core` (Kotoba project library) |
+| `app.bsky.atproto` | `app.bsky.atproto/src` | `atproto.core`, `atproto.sdk` (Kotoba project library) |
+| `com.microsoft.riff` | `com.microsoft.riff/src` | `riff.bytes`, `riff.core` (Kotoba project library) |
+| `com.pkware.zip` | `com.pkware.zip/src` | `zip.bytes`, `zip.core`, `zip.write` (Kotoba project library) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
 | `kotoba.x` | `kotoba.x/src` | `` (Kotoba project library) |
 | `kotoba.tsukasa` | `kotoba.tsukasa/src` | `` (Kotoba project library) |

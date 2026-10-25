@@ -1,0 +1,116 @@
+(ns sevenz.portable-test
+  "Runtime-agnostic suite: builds and reads .7z with no shell and no host codec.
+   Runs under `kbb -M:test` and `kbb --backend sci run-tests.cljk`.
+
+   Conformance against real 7-Zip archives — LZMA1/LZMA2/Copy, solid and
+   non-solid, plain and compressed headers — lives in `sevenz.oracle-test`. A
+   round-trip through our own Copy-coder writer exercises the header machinery
+   but not the coders, which is where the difficulty is."
+  (:require [sevenz.core :as sevenz]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- char-code [c] #?(:clj (int c) :cljs (.charCodeAt c 0)))
+(defn- ->bytes [s] (mapv char-code (seq s)))
+(defn- text [e] (apply str (map char (:bytes e))))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(def ^:private sample
+  [{:name "dir" :dir? true}
+   {:name "a.txt" :bytes (->bytes "hello")}
+   {:name "dir/b.bin" :bytes (vec (range 256))}
+   {:name "empty.txt" :bytes []}])
+
+;; ---------------------------------------------------------------------------
+;; Round-trips
+;; ---------------------------------------------------------------------------
+
+(deftest builds-and-reads-back
+  (let [archive (sevenz/build sample)
+        parsed  (sevenz/parse archive)]
+    (is (= [0x37 0x7a 0xbc 0xaf 0x27 0x1c] (subvec archive 0 6)) "signature")
+    (is (= ["dir" "a.txt" "dir/b.bin" "empty.txt"] (sevenz/names parsed)))
+    (is (= "hello" (text (sevenz/entry parsed "a.txt"))))
+    (is (= (vec (range 256)) (:bytes (sevenz/entry parsed "dir/b.bin"))))
+    (testing "a directory and an empty file are distinguishable"
+      (is (:dir? (sevenz/entry parsed "dir")))
+      (is (not (:dir? (sevenz/entry parsed "empty.txt"))))
+      (is (= [] (:bytes (sevenz/entry parsed "empty.txt")))))))
+
+(deftest listing-does-not-decompress
+  (let [archive (sevenz/build sample)
+        listed  (sevenz/entries archive)]
+    (is (= 4 (count listed)))
+    (is (every? #(not (contains? % :bytes)) listed))
+    (is (= 5 (:size (sevenz/entry listed "a.txt"))))
+    (is (every? :crc32 (remove :dir? (remove :empty? listed))))))
+
+(deftest one-folder-per-member
+  (let [listed (remove :empty? (sevenz/entries (sevenz/build sample)))]
+    (is (= (count listed) (count (distinct (map :folder listed))))
+        "members stay individually addressable")
+    (is (every? zero? (map :folder-offset listed)))))
+
+(deftest output-is-deterministic
+  (is (= (sevenz/build sample) (sevenz/build sample))))
+
+(deftest unicode-names-round-trip
+  (let [parsed (sevenz/parse (sevenz/build [{:name "日本語/ファイル.txt" :bytes (->bytes "x")}
+                                            {:name "emoji-🗜.bin" :bytes [1 2 3]}]))]
+    (is (= ["日本語/ファイル.txt" "emoji-🗜.bin"] (sevenz/names parsed)))
+    (is (= [1 2 3] (:bytes (sevenz/entry parsed "emoji-🗜.bin"))))))
+
+(deftest empty-archive
+  (let [archive (sevenz/build [])]
+    (is (= [] (sevenz/entries archive)))
+    (is (= [] (sevenz/parse archive)))))
+
+(deftest large-members-cross-the-number-encoding-boundaries
+  ;; 7z's variable-length numbers change shape at 128, 16384, 2097152 …; a size
+  ;; that lands either side of a boundary is where an encoder/decoder pair
+  ;; disagrees.
+  (doseq [size [1 127 128 129 16383 16384 16385 70000]]
+    (let [data   (vec (repeat size 65))
+          parsed (sevenz/parse (sevenz/build [{:name "f" :bytes data}]))]
+      (is (= data (:bytes (first parsed))) (str "size " size)))))
+
+;; ---------------------------------------------------------------------------
+;; Strictness
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-non-archives
+  (is (= :not-7z (reason-of #(sevenz/entries (vec (repeat 64 0x41))))))
+  (is (= :not-7z (reason-of #(sevenz/entries [0x37 0x7a]))))
+  (is (= :not-7z (reason-of #(sevenz/entries (assoc (sevenz/build sample) 2 0x00))))))
+
+(deftest verifies-the-start-header-crc
+  (let [archive (sevenz/build sample)]
+    (is (= :checksum-mismatch
+           (reason-of #(sevenz/entries (assoc archive 20 (bit-xor (nth archive 20) 0xff)))))
+        "the start header CRC covers the offset/size/CRC triple")))
+
+(deftest verifies-the-header-crc
+  (let [archive (sevenz/build sample)]
+    ;; the header sits at the very end; its last byte is kEnd
+    (is (= :checksum-mismatch
+           (reason-of #(sevenz/entries (assoc archive (dec (count archive)) 0x42)))))))
+
+(deftest verifies-member-crcs
+  (let [archive (sevenz/build [{:name "a.txt" :bytes (->bytes "hello")}])
+        ;; member data begins immediately after the 32-byte signature header
+        broken  (assoc archive 32 (bit-xor (nth archive 32) 0xff))]
+    (is (= :checksum-mismatch (reason-of #(sevenz/parse broken))))
+    (testing "opt-out is available for recovery — the corrupt byte comes through as-is"
+      (let [salvaged (:bytes (first (sevenz/parse broken {:verify-crc false})))]
+        (is (= 5 (count salvaged)))
+        (is (not= (->bytes "hello") salvaged))
+        (is (= (->bytes "ello") (subvec salvaged 1)))))))
+
+(deftest rejects-a-truncated-archive
+  (let [archive (sevenz/build sample)]
+    (is (contains? #{:truncated :not-7z :checksum-mismatch}
+                   (reason-of #(sevenz/entries (subvec archive 0 (- (count archive) 20))))))))

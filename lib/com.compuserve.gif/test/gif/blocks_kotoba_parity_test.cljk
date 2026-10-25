@@ -1,0 +1,247 @@
+;; `kotoba/gif/blocks.kotoba` against `gif.core/parse`.
+;;
+;; Parity covers the header fields the library reads correctly: dimensions,
+;; version, and whether a global colour table is present. The fixtures are
+;; the repo's own `.gif` files, so agreement is against something neither
+;; side made up.
+;;
+;; The FRAME COUNT is where they part, and the test says so rather than
+;; picking a winner quietly. `parse` reports
+;;
+;;   :frames (count (filter #(= % 0x2C) bv))
+;;
+;; and 0x2C is the Image Separator AND the ASCII comma.
+;; `a-comma-in-a-comment-is-not-a-frame` inserts one legal GIF89a Comment
+;; Extension containing a comma and shows the oracle answering two for a
+;; file with one image descriptor.
+;;
+;; `.cljc` stays the oracle for the header and is not required from the
+;; guest (require-graph). It did not grow a second copy of the walk.
+;;
+;; ## The negative controls
+;;
+;;   * `a-comma-in-a-comment-is-not-a-frame` — the defect, demonstrated
+;;     rather than described;
+;;   * `a-frame-count-is-not-offered-mid-walk` — a count taken before the
+;;     trailer is a lower bound presented as an answer;
+;;   * `a-truncated-file-is-refused-before-the-read` — a colour-table size
+;;     and a sub-block length both come from the file, and asking for a
+;;     range that runs past the end is the out-of-range read;
+;;   * `an-unknown-block-is-not-a-truncated-file` — losing sync and running
+;;     out of bytes are different facts and get different reasons.
+
+(ns gif.blocks-kotoba-parity-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.edn :as edn]
+            [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [gif.blocks-guest-document :refer [->doc]]
+            [gif.core :as gif]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "gif" "blocks.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'gif.blocks (slurp guest-file)}
+                                         'gif.blocks :wasm32-kotoba-v1))))
+
+;; The interpreter default (512) is enough. That was not assumed: this file
+;; was written with a `test-fuel` of 50000 and a bracket test, and the
+;; bracket failed. That is the fourth time in this migration the
+;; two-directional form has caught a budget nobody needed, against one time
+;; it was warranted (org-ietf-ers).
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(def ^:private grammar
+  (delay (edn/read-string (slurp (io/resource "gif/grammar.edn")))))
+
+(defn- fixture [name]
+  (with-open [in (io/input-stream (io/resource (str "gif/fixtures/" name)))]
+    (mapv #(bit-and % 0xff) (seq (.readAllBytes in)))))
+
+;; --- the host: the bytes ------------------------------------------------------
+
+(defn- walk
+  "What a decoder does: hand over the first thirteen bytes, then whatever
+  range the guest names, until it stops asking."
+  ([bytes] (walk bytes 10000))
+  ([bytes max-steps]
+   (let [s0 (call 'offer-header
+                  [(call 'init [(->doc {:file-length (count bytes)})])
+                   (->doc (vec (take 13 bytes)))])]
+     (loop [state s0 steps 0]
+       (let [at (call 'needs-at [state])
+             n (call 'needs-count [state])]
+         (if (or (neg? at) (>= steps max-steps))
+           {:state state
+            :phase (call 'phase [state])
+            :reason (call 'reason [state])
+            :frames (call 'frame-count [state])
+            :first-frame (call 'first-frame-offset [state])
+            :width (call 'width [state])
+            :height (call 'height [state])
+            :gct? (call 'global-color-table? [state])
+            :v89a? (call 'version-89a? [state])
+            :steps steps}
+           (recur (call 'offer-bytes
+                        [state (->doc (subvec bytes at (+ at n)))])
+                  (inc steps))))))))
+
+;; One legal GIF89a Comment Extension (0x21 0xFE, one sub-block, terminator)
+;; carrying a comma. TWO things about where and how it goes in, both learned
+;; the hard way:
+;;
+;;   * it goes after the GLOBAL COLOUR TABLE, not after the 13-byte header.
+;;     The table follows the Logical Screen Descriptor immediately, so
+;;     splicing at 13 lands inside it and produces a file that is not a GIF
+;;     at all -- which the guest correctly refuses, and which would have
+;;     made this a demonstration of nothing;
+;;   * Comment Extensions are a GIF89a block. The fixtures are GIF87a
+;;     (measured), so the version is set to 89a as well. Otherwise the
+;;     "legal file" being pointed at is not legal.
+;;
+;; `insert-at` is the offset the guest itself names as the first block
+;; label, which is also where a real encoder would put a comment.
+(defn- with-comma-comment [bytes insert-at]
+  (vec (concat (take 4 bytes) [(int \8) (int \9) (int \a)]
+               (subvec bytes 7 insert-at)
+               [0x21 0xFE 0x03 (int \h) (int \,) (int \i) 0x00]
+               (drop insert-at bytes))))
+
+(defn- first-block-offset
+  "Where the guest says the first block label is -- after the header and the
+  global colour table."
+  [bytes]
+  (call 'needs-at [(call 'offer-header
+                         [(call 'init [(->doc {:file-length (count bytes)})])
+                          (->doc (vec (take 13 bytes)))])]))
+
+;; --- the tests -----------------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest the-header-fields-agree-with-the-oracle
+  (doseq [name ["lzw_idx.gif" "lzw_big.gif"]]
+    (let [bytes (fixture name)
+          g (walk bytes)
+          o (gif/parse @grammar bytes)]
+      (is (= :done (:phase g)) [name (:reason g)])
+      (is (= (:width o) (:width g)) name)
+      (is (= (:height o) (:height g)) name)
+      (is (= (:global-color-table? o) (:gct? g)) name)
+      (testing "and the walk found the first frame inside the file"
+        (is (<= 13 (:first-frame g)) name)
+        (is (< (:first-frame g) (count bytes)) name)
+        (is (= 0x2C (nth bytes (:first-frame g)))
+            (str name " -- which really is an Image Separator"))))))
+
+(deftest a-comma-in-a-comment-is-not-a-frame
+  (testing "0x2C is the Image Separator and the ASCII comma. `parse` counts
+            every occurrence in the file, so one legal Comment Extension
+            carrying a comma turns a one-frame GIF into a two-frame one."
+    (let [one (fixture "lzw_idx.gif")
+          commented (with-comma-comment one (first-block-offset one))
+          g-one (walk one)
+          g-commented (walk commented)]
+      (testing "the guest walks the structure and counts one, both times"
+        (is (= :done (:phase g-one)) (:reason g-one))
+        (is (= :done (:phase g-commented)) (:reason g-commented))
+        (is (= (:frames g-one) (:frames g-commented))
+            "a comment does not add a frame"))
+      (testing "while the oracle's answer changes"
+        (is (= (inc (:frames (gif/parse @grammar one)))
+               (:frames (gif/parse @grammar commented)))
+            "one more 0x2C byte, one more reported frame"))
+      (testing "and the guest agrees with the oracle on the file that has
+                no stray comma"
+        (is (= (:frames (gif/parse @grammar one)) (:frames g-one)))))))
+
+(deftest a-frame-count-is-not-offered-mid-walk
+  (testing "a count taken before the trailer is a lower bound presented as
+            an answer"
+    (let [bytes (fixture "lzw_big.gif")
+          partial (walk bytes 2)]
+      (is (not= :done (:phase partial)) "the walk was stopped early")
+      (is (= -1 (:frames partial)))
+      (is (= -1 (:first-frame partial))))))
+
+(deftest a-truncated-file-is-refused-before-the-read
+  (testing "a colour-table size and a sub-block length both come from the
+            file; asking the host for a range that runs past the end is how
+            a parser turns a truncated file into an out-of-range read"
+    (doseq [n [13 20 30 40]]
+      (let [g (walk (vec (take n (fixture "lzw_big.gif"))))]
+        (is (= :refused (:phase g)) n)
+        (is (= :gif/truncated (:reason g)) n)
+        (is (= -1 (:frames g)) n)))
+    (testing "and a header shorter than 13 bytes too"
+      (let [g (walk (vec (take 6 (fixture "lzw_idx.gif"))))]
+        (is (= :refused (:phase g)))
+        (is (= :gif/truncated (:reason g)))))))
+
+(deftest an-unknown-block-is-not-a-truncated-file
+  (testing "losing sync and running out of bytes are different facts"
+    (let [bytes (fixture "lzw_idx.gif")
+          ;; Replace the first block label with one §20 does not admit.
+          ;; The header says whether there is a global colour table; for
+          ;; this fixture the first label sits right after it.
+          g0 (call 'offer-header
+                   [(call 'init [(->doc {:file-length (count bytes)})])
+                    (->doc (vec (take 13 bytes)))])
+          label-at (call 'needs-at [g0])
+          broken (assoc bytes label-at 0x99)
+          g (walk broken)]
+      (is (= :refused (:phase g)))
+      (is (= :gif/unknown-block (:reason g)))
+      (is (= -1 (:frames g))))))
+
+(deftest a-file-that-does-not-say-GIF-is-refused
+  (let [bytes (fixture "lzw_idx.gif")
+        g (walk (assoc bytes 0 0x50))]
+    (is (= :refused (:phase g)))
+    (is (= :gif/bad-signature (:reason g)))
+    (is (= -1 (:width g)) "and no dimensions come back out")))
+
+(deftest the-version-is-read-but-both-are-walked
+  (testing "87a and 89a differ in which extensions exist, not in how blocks
+            are framed, so the walk is the same and the version is reported
+            rather than enforced. Both fixtures are 87a -- measured, not
+            assumed; the first version of this test asserted 89a and was
+            simply wrong about the files."
+    (let [bytes (fixture "lzw_idx.gif")
+          as-89a (assoc bytes 4 (int \9))]
+      (is (false? (:v89a? (walk bytes))) "the fixture is GIF87a")
+      (is (= "GIF87a" (:version (gif/parse @grammar bytes)))
+          "which the oracle agrees about")
+      (is (true? (:v89a? (walk as-89a))))
+      (is (= :done (:phase (walk as-89a))) "and it still walks"))))
+
+;; --- the budget ------------------------------------------------------------------
+
+(defn- completes-within? [fuel]
+  (try
+    (let [bytes (fixture "lzw_big.gif")
+          s0 (call 'offer-header
+                   [(call 'init [(->doc {:file-length (count bytes)})] fuel)
+                    (->doc (vec (take 13 bytes)))] fuel)]
+      (loop [state s0 steps 0]
+        (let [at (call 'needs-at [state] fuel)]
+          (if (or (neg? at) (> steps 10000))
+            (= :done (call 'phase [state] fuel))
+            (recur (call 'offer-bytes
+                         [state (->doc (subvec bytes at
+                                               (+ at (call 'needs-count [state] fuel))))]
+                         fuel)
+                   (inc steps))))))
+    (catch kerror/ExceptionInfo e
+      (if (str/includes? (str (ex-message e)) "fuel") false (throw e)))))
+
+(deftest the-default-budget-still-suffices
+  (testing "no `:fuel` option is passed anywhere in this file, so this is
+            the assertion that keeps that honest"
+    (is (true? (completes-within? 512)))))

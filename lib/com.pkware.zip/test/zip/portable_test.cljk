@@ -1,0 +1,241 @@
+(ns zip.portable-test
+  "Runtime-agnostic suite: builds and reads archives with no `java.util.zip`
+   anywhere. Runs under `kbb -M:test` and `kbb --backend sci run-tests.cljk`.
+
+   Conformance against a real ZIP implementation is in
+   `zip.jvm-interop-test` — round-tripping against yourself would not notice a
+   mis-placed header field that both halves agree on."
+  (:require [zip.bytes :as b]
+            [zip.core :as zip]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- ->bytes [s] (b/str->utf8 s))
+(defn- text [entry] (b/utf8->str (:bytes entry)))
+
+(defn- lcg [n seed]
+  (loop [i 0 s seed out (transient [])]
+    (if (= i n)
+      (persistent! out)
+      (let [s (mod (+ (* 1664525 s) 1013904223) 4294967296)]
+        (recur (inc i) s (conj! out (bit-and (quot s 65536) 0xff)))))))
+
+(def ^:private sample
+  [{:name "a.txt" :bytes (->bytes "hello")}
+   {:name "b.json" :bytes (->bytes (apply str (repeat 40 "{\"k\":\"vvvvvvvv\"}")))}
+   {:name "nested/dir/" :bytes []}
+   {:name "nested/dir/c.bin" :bytes (lcg 3000 7)}
+   {:name "empty.txt" :bytes []}])
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(defn- find-central-sig
+  "Offset of the first central-directory record in `bv` — used by the corruption
+   tests to patch a field."
+  [bv]
+  (first (filter #(= 0x02014b50 (b/u32 bv %)) (range (- (count bv) 4)))))
+
+;; ---------------------------------------------------------------------------
+;; Round-trips
+;; ---------------------------------------------------------------------------
+
+(deftest builds-and-reads-back
+  (let [archive (zip/build sample)
+        parsed  (zip/parse archive)]
+    (is (= ["a.txt" "b.json" "nested/dir/" "nested/dir/c.bin" "empty.txt"]
+           (zip/names parsed)))
+    (is (= "hello" (text (zip/entry parsed "a.txt"))))
+    (is (= (:bytes (nth sample 3)) (:bytes (zip/entry parsed "nested/dir/c.bin"))))
+    (is (= [] (:bytes (zip/entry parsed "empty.txt"))))
+    (testing "directories carry no data and are flagged"
+      (let [d (zip/entry parsed "nested/dir/")]
+        (is (:dir? d))
+        (is (= [] (:bytes d)))
+        (is (zero? (:size d)))))
+    (testing "sizes and CRCs come from the directory and are checked on read"
+      (doseq [e parsed]
+        (is (= (count (:bytes e)) (:size e)))))))
+
+(deftest listing-does-not-decompress
+  (let [archive (zip/build sample)
+        listed  (zip/entries archive)]
+    (is (= 5 (count listed)))
+    (is (every? #(not (contains? % :bytes)) listed))
+    (testing "one member can be extracted without touching the others"
+      (let [e (zip/entry listed "a.txt")]
+        (is (= "hello" (text (zip/read-entry archive e))))))))
+
+(deftest chooses-a-method-per-member
+  (let [archive (zip/build [{:name "compressible" :bytes (vec (repeat 5000 97))}
+                            {:name "random" :bytes (lcg 5000 3)}
+                            {:name "forced" :bytes (vec (repeat 5000 97)) :method :stored}])
+        listed  (zip/entries archive)]
+    (is (= 8 (:method (zip/entry listed "compressible"))) "deflate")
+    (is (= 0 (:method (zip/entry listed "forced"))) "explicitly stored")
+    (is (< (:compressed-size (zip/entry listed "compressible")) 200))
+    (testing "a member that would grow is stored instead"
+      (let [r (zip/entry listed "random")]
+        (is (<= (:compressed-size r) (+ (:size r) 16)))))
+    (is (= (vec (repeat 5000 97)) (:bytes (zip/read-entry archive (zip/entry listed "forced")))))))
+
+(deftest names-and-comments-are-utf8
+  (let [archive (zip/build [{:name "日本語/ファイル名.txt" :bytes (->bytes "中身")
+                             :comment "メモ"}
+                            {:name "emoji-🗜.bin" :bytes [1 2 3]}]
+                           {:comment "アーカイブ全体のコメント"})
+        listed  (zip/entries archive)]
+    (is (= ["日本語/ファイル名.txt" "emoji-🗜.bin"] (zip/names listed)))
+    (is (= "メモ" (:comment (first listed))))
+    (is (pos? (bit-and (:flags (first listed)) 0x0800)) "the UTF-8 flag is set")
+    (is (= "中身" (text (zip/read-entry archive (first listed)))))
+    (testing "non-BMP names survive the surrogate round-trip"
+      (is (= [1 2 3] (:bytes (zip/read-entry archive (second listed))))))))
+
+(deftest timestamps-are-reproducible-by-default
+  (let [a (zip/build sample)
+        b (zip/build sample)]
+    (is (= a b) "the same entries produce the same bytes")
+    (is (= {:year 1980 :month 1 :day 1 :hour 0 :minute 0 :second 0}
+           (:mtime (first (zip/entries a))))))
+  (testing "an explicit timestamp round-trips through the MS-DOS fields"
+    (let [mt {:year 2026 :month 7 :day 30 :hour 13 :minute 45 :second 20}
+          e  (first (zip/entries (zip/build [{:name "t" :bytes [1] :mtime mt}])))]
+      (is (= mt (:mtime e))))))
+
+(deftest empty-archive
+  (let [archive (zip/build [])]
+    (is (= 22 (count archive)) "just an end-of-central-directory record")
+    (is (= [] (zip/entries archive)))
+    (is (= [] (zip/parse archive)))))
+
+;; ---------------------------------------------------------------------------
+;; ZIP64
+;; ---------------------------------------------------------------------------
+
+(deftest zip64-structures
+  (let [archive (zip/build sample {:zip64 true})
+        listed  (zip/entries archive)]
+    (testing "the 32-bit slots are saturated and the real values come from the extra field"
+      (is (every? :zip64? listed))
+      (is (= (zip/names (zip/entries (zip/build sample))) (zip/names listed)))
+      (is (= "hello" (text (zip/read-entry archive (zip/entry listed "a.txt")))))
+      (is (= (:bytes (nth sample 3))
+             (:bytes (zip/read-entry archive (zip/entry listed "nested/dir/c.bin"))))))
+    (testing "the end-of-central-directory record carries the sentinels"
+      ;; no archive comment, so the record is exactly the last 22 bytes
+      (let [eocd (- (count archive) 22)]
+        (is (= 0x06054b50 (b/u32 archive eocd)))
+        (is (= 65535 (b/u16 archive (+ eocd 10))))
+        (is (= 4294967295 (b/u32 archive (+ eocd 16))))))
+    (testing "a ZIP64 locator and record precede it"
+      (is (some #(= 0x07064b50 (b/u32 archive %)) (range (- (count archive) 64) (count archive))))
+      (is (some #(= 0x06064b50 (b/u32 archive %)) (range (- (count archive) 128) (count archive)))))))
+
+(deftest zip64-can-be-declined
+  (let [archive (zip/build sample {:zip64 false})]
+    (is (not-any? :zip64? (zip/entries archive)))
+    (is (= (zip/names (zip/parse (zip/build sample))) (zip/names (zip/parse archive)))))
+  ;; The `:zip64-required` refusal only fires past 65535 entries or 4 GiB, which
+  ;; needs a multi-megabyte archive — that case is in the JVM suite, not here,
+  ;; because nbb interprets and would take minutes over it.
+  )
+
+;; ---------------------------------------------------------------------------
+;; Strictness
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-non-archives
+  (is (= :not-a-zip (reason-of #(zip/entries []))))
+  (is (= :not-a-zip (reason-of #(zip/entries (vec (repeat 100 0))))))
+  (is (= :not-a-zip (reason-of #(zip/entries (->bytes "PK not really"))))))
+
+(deftest bzip2-members-round-trip
+  ;; Method 12 used to be refused by name. It is implemented now that
+  ;; org-sourceware-bzip2 exists — the format does not care which codec you have,
+  ;; so the fix was a codec rather than a special case in the reader.
+  (let [text (vec (mapcat identity (repeat 60 (->bytes "a line that repeats in a member\n"))))
+        archive (zip/build [{:name "bz.txt" :bytes text :method :bzip2}
+                            {:name "df.txt" :bytes text}
+                            {:name "st.bin" :bytes (->bytes "raw") :method :stored}])
+        by-name (into {} (for [e (zip/parse archive)] [(:name e) e]))]
+    (testing "each member carries the method it was asked for"
+      (is (= 12 (:method (get by-name "bz.txt"))))
+      (is (= "bzip2" (:method-name (get by-name "bz.txt"))))
+      (is (= 8 (:method (get by-name "df.txt"))))
+      (is (= 0 (:method (get by-name "st.bin")))))
+    (testing "and decompresses to what went in"
+      (is (= text (:bytes (get by-name "bz.txt"))))
+      (is (= text (:bytes (get by-name "df.txt")))))
+    (testing "bzip2 actually compressed it"
+      (is (< (:compressed-size (get by-name "bz.txt")) (count text))))
+    (testing "a member that bzip2 would grow is stored instead, as with deflate"
+      (let [tiny (zip/parse (zip/build [{:name "t" :bytes (->bytes "x") :method :bzip2}]))]
+        (is (= 0 (:method (first tiny))))
+        (is (= (->bytes "x") (:bytes (first tiny))))))))
+
+(deftest rejects-unsupported-methods
+  (let [archive (zip/build [{:name "a.txt" :bytes (->bytes "hello")}])
+        cd      (find-central-sig archive)
+        zstd    (assoc archive (+ cd 10) 93)                ; method 93 = zstd
+        listed  (zip/entries zstd)]
+    (is (= "zstd" (:method-name (first listed))))
+    (is (= :unsupported-method (reason-of #(zip/read-entry zstd (first listed)))))
+    (testing "the old behaviour — returning compressed bytes as content — is gone"
+      (is (not= (:bytes (try (zip/read-entry zstd (first listed)) (catch #?(:clj Exception :cljs :default) _ nil)))
+                (->bytes "hello"))))))
+
+(deftest rejects-encrypted-members
+  (let [archive (zip/build [{:name "a.txt" :bytes (->bytes "hello")}])
+        cd      (find-central-sig archive)
+        enc     (assoc archive (+ cd 8) 1)                  ; general-purpose bit 0
+        listed  (zip/entries enc)]
+    (is (:encrypted? (first listed)))
+    (is (= :encrypted (reason-of #(zip/read-entry enc (first listed)))))))
+
+(deftest verifies-member-crc32
+  (let [archive (zip/build [{:name "a.txt" :bytes (->bytes "hello")}])
+        cd      (find-central-sig archive)
+        bad     (assoc archive (+ cd 16) (bit-xor (b/u8 archive (+ cd 16)) 0xff))
+        listed  (zip/entries bad)]
+    (is (= :checksum-mismatch (reason-of #(zip/read-entry bad (first listed)))))
+    (is (= "hello" (text (zip/read-entry bad (first listed) {:verify-crc false})))
+        "opt-out is available for recovery")))
+
+(deftest rejects-a-clobbered-local-header
+  (let [archive (zip/build [{:name "a.txt" :bytes (->bytes "hello")}])
+        listed  (zip/entries archive)
+        broken  (assoc archive 0 0x00)]
+    (is (= :bad-local-header (reason-of #(zip/read-entry broken (first listed)))))))
+
+(deftest rejects-a-truncated-archive
+  (testing "a lost end-of-central-directory record"
+    (let [archive (zip/build sample)]
+      (is (= :not-a-zip (reason-of #(zip/entries (subvec archive 0 (- (count archive) 10))))))))
+  (testing "a member whose data runs past the end"
+    (let [archive (zip/build sample)
+          cd      (find-central-sig archive)
+          ;; saturate the compressed size without providing a ZIP64 extra field
+          huge    (reduce (fn [a i] (assoc a (+ cd 20 i) 0xff)) archive (range 4))
+          listed  (zip/entries huge)]
+      (is (= :truncated (reason-of #(zip/read-entry huge (first listed))))))))
+
+;; ---------------------------------------------------------------------------
+;; Byte helpers
+;; ---------------------------------------------------------------------------
+
+(deftest utf8-round-trip
+  (doseq [s ["" "ascii" "日本語" "emoji 🗜 and ✓" "mixed 混在 text"]]
+    (is (= s (b/utf8->str (b/str->utf8 s))))))
+
+(deftest dos-time-round-trip
+  (doseq [m [{:year 1980 :month 1 :day 1 :hour 0 :minute 0 :second 0}
+             {:year 2026 :month 12 :day 31 :hour 23 :minute 59 :second 58}
+             {:year 2000 :month 6 :day 15 :hour 12 :minute 30 :second 0}]]
+    (let [{:keys [date time]} (b/map->dos m)]
+      (is (= m (b/dos->map date time))))))
+
+(deftest zip64-fields-refuse-inexact-integers
+  (is (= :too-large (reason-of #(b/u64 [0 0 0 0 0xff 0xff 0xff 0xff] 0)))))

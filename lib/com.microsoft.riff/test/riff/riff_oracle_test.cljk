@@ -1,0 +1,170 @@
+(ns riff.riff-oracle-test
+  "Conformance against ffmpeg, in both directions.
+
+   The portable suite reads recorded reference files. What only a shell can add is
+   the other direction — **ffmpeg decoding a file we wrote** — and the check that
+   matters most for a PCM writer: converting both the reference file and ours to
+   the same raw format and comparing the bytes. A header field at the wrong offset
+   survives our own reader and fails in every other tool.
+
+   Skipped loudly when ffmpeg is missing."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [riff.core :as riff])
+  (:import [java.io File]))
+
+(defn- have-ffmpeg? []
+  (try (zero? (:exit (shell/sh "bash" "-c" "command -v ffmpeg")))
+       (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir
+            "org-microsoft-riff-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+(defn- ->bytes ^bytes [v] (byte-array (map unchecked-byte v)))
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+
+(defn- ffmpeg! [dir & args]
+  (let [{:keys [exit err]} (apply shell/sh "ffmpeg" "-hide_banner" "-v" "error"
+                                  (concat args [:dir dir]))]
+    (is (zero? exit) (str "ffmpeg failed: " err))
+    exit))
+
+(defn- encode! [dir codec channels rate name]
+  (ffmpeg! dir "-f" "lavfi" "-i" (str "sine=frequency=440:duration=0.1:sample_rate=" rate)
+           "-ac" (str channels) "-c:a" codec name "-y")
+  (read-ubytes (io/file dir name)))
+
+(defn- write! [dir bytes name]
+  (with-open [o (io/output-stream (io/file dir name))] (.write o (->bytes bytes)))
+  name)
+
+(defn- to-raw!
+  "Convert `name` to 32-bit raw PCM so two files can be compared byte for byte
+   regardless of their own sample width."
+  [dir name out]
+  (ffmpeg! dir "-i" name "-f" "s32le" "-acodec" "pcm_s32le" out "-y")
+  (read-ubytes (io/file dir out)))
+
+(def ^:private codecs
+  ;; codec, channels, sample rate, what ffprobe calls it back
+  [["pcm_u8" 1 8000 "pcm_u8"]
+   ["pcm_s16le" 2 44100 "pcm_s16le"]
+   ["pcm_s24le" 2 48000 "pcm_s24le"]
+   ["pcm_s32le" 2 22050 "pcm_s32le"]
+   ["pcm_f32le" 2 44100 "pcm_f32le"]
+   ["pcm_f64le" 1 8000 "pcm_f64le"]])
+
+(defn- probe [dir name]
+  (let [{:keys [out]} (shell/sh "ffprobe" "-hide_banner" "-v" "error"
+                                "-show_entries" "stream=codec_name,channels,sample_rate"
+                                "-of" "csv=p=0" name :dir dir)]
+    (str/trim out)))
+
+(deftest we-read-what-ffmpeg-writes
+  (if-not (have-ffmpeg?)
+    (println "SKIP riff.riff-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (doseq [[codec channels rate] codecs]
+          (testing codec
+            (let [wav (encode! dir codec channels rate (str "ref-" codec ".wav"))
+                  p (riff/parse wav)
+                  s (riff/samples wav)]
+              (is (= channels (:channels p)))
+              (is (= rate (:sample-rate p)))
+              (is (= channels (count s)))
+              (is (= (:frames p) (count (first s))))
+              (is (pos? (:frames p))))))
+        (finally (rm-rf dir))))))
+
+(deftest ffmpeg-reads-what-we-write
+  (if-not (have-ffmpeg?)
+    (println "SKIP riff.riff-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (doseq [[codec channels rate probe-name] codecs]
+          (testing codec
+            (let [ref-name (str "in-" codec ".wav")
+                  wav (encode! dir codec channels rate ref-name)
+                  p (riff/parse wav)
+                  ours (riff/build {:channels (riff/samples wav)
+                                    :sample-rate (:sample-rate p)
+                                    :bits (:bits p)
+                                    :format (:format p)})
+                  our-name (write! dir ours (str "ours-" codec ".wav"))]
+              (testing "ffprobe sees the same stream"
+                (is (= (str probe-name "," rate "," channels) (probe dir our-name))))
+              (testing "and ffmpeg's decode of our file is byte-identical to its decode of the original"
+                ;; the assertion that catches a field at the wrong offset
+                (is (= (to-raw! dir ref-name (str "ref-" codec ".raw"))
+                       (to-raw! dir our-name (str "ours-" codec ".raw"))))))))
+        (finally (rm-rf dir))))))
+
+(deftest ffmpeg-reads-our-extensible-files
+  ;; A plain fmt chunk is what most readers want, but WAVE_FORMAT_EXTENSIBLE is
+  ;; what ffmpeg itself writes above 16 bits, so both must be emitted correctly.
+  (if-not (have-ffmpeg?)
+    (println "SKIP riff.riff-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (doseq [[bits format probe-name] [[16 :pcm "pcm_s16le"]
+                                          [24 :pcm "pcm_s24le"]
+                                          [32 :float "pcm_f32le"]]]
+          (testing (str bits "-bit " (name format) " extensible")
+            (let [samples (if (= format :float)
+                            ;; 32-bit float holds k/256 exactly; k/100 does not,
+                            ;; so a decimal-looking test value would fail on the
+                            ;; format's own rounding rather than on a bug
+                            [(mapv #(/ (double %) 256.0) (range -50 50))
+                             (mapv #(/ (double %) 512.0) (range -50 50))]
+                            [(vec (range -50 50)) (vec (range 50 150))])
+                  ours (riff/build {:channels samples :sample-rate 32000
+                                    :bits bits :format format :extensible? true})
+                  name (write! dir ours (str "ext-" bits "-" (clojure.core/name format) ".wav"))]
+              (is (= 0xfffe (:format-tag (riff/parse ours))))
+              (is (= (str probe-name ",32000,2") (probe dir name)))
+              (testing "and the samples survive the round trip through us"
+                (is (= samples (riff/samples ours)))))))
+        (finally (rm-rf dir))))))
+
+(deftest a-longer-file-in-both-directions
+  (if-not (have-ffmpeg?)
+    (println "SKIP riff.riff-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [wav (do (ffmpeg! dir "-f" "lavfi"
+                               "-i" "sine=frequency=440:duration=2:sample_rate=44100"
+                               "-ac" "2" "-c:a" "pcm_s16le" "long.wav" "-y")
+                      (read-ubytes (io/file dir "long.wav")))
+              p (riff/parse wav)
+              s (riff/samples wav)]
+          (is (= 88200 (:frames p)) "two seconds at 44.1 kHz")
+          (is (= 2 (count s)))
+          (let [ours (riff/build {:channels s :sample-rate 44100 :bits 16})
+                name (write! dir ours "long-ours.wav")]
+            (is (= (to-raw! dir "long.wav" "long-ref.raw")
+                   (to-raw! dir name "long-ours.raw")))))
+        (finally (rm-rf dir))))))
+
+(deftest we-refuse-a-compressed-wav-ffmpeg-can-make
+  ;; mu-law is a real WAVE codec ffmpeg will happily produce. Refusing it by name
+  ;; is the point: returning its bytes as samples would be silent garbage.
+  (if-not (have-ffmpeg?)
+    (println "SKIP riff.riff-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [wav (encode! dir "pcm_mulaw" 1 8000 "mulaw.wav")]
+          (is (= :unsupported-format
+                 (try (riff/parse wav) nil
+                      (catch Exception e (:reason (ex-data e))))))
+          (is (= :mu-law
+                 (try (riff/parse wav) nil
+                      (catch Exception e (:format (ex-data e))))))
+          (testing "but its chunks still walk, which is what a container reader owes you"
+            (is (= "WAVE" (:form (riff/chunks wav))))
+            (is (some #(= "data" (:id %)) (:chunks (riff/chunks wav))))))
+        (finally (rm-rf dir))))))

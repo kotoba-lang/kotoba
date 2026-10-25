@@ -1,0 +1,171 @@
+(ns xz.portable-test
+  "Runtime-agnostic suite: no shell, no python, no host codec. Runs under
+   `kbb -M:test` and `kbb --backend sci run-tests.cljk`.
+
+   Conformance against liblzma across presets, dictionary sizes, check types,
+   filter chains and both container formats lives in `xz.oracle-test` — a
+   round-trip through our own uncompressed-chunk writer would not exercise the
+   LZMA decoder at all, which is the part that has to be exact."
+  (:require [xz.core :as xz]
+            [xz.crc64 :as crc64]
+            [xz.lzma :as lzma]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- char-code [c]
+  #?(:clj (int c) :cljs (.charCodeAt c 0)))
+
+(defn- ->bytes
+  "ASCII string → byte vector. `(map int (seq s))` is not portable: on
+   ClojureScript `int` numerically coerces the one-character string, so \"1\"
+   becomes 1 instead of 49."
+  [s]
+  (mapv char-code (seq s)))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e
+         (:reason (ex-data e)))))
+
+(defn- lcg [n seed]
+  (loop [i 0 s seed out (transient [])]
+    (if (= i n)
+      (persistent! out)
+      (let [s (mod (+ (* 1664525 s) 1013904223) 4294967296)]
+        (recur (inc i) s (conj! out (bit-and (quot s 65536) 0xff)))))))
+
+(def ^:private samples
+  {:empty      []
+   :tiny       [72 105]
+   :allbytes   (vec (range 256))
+   :runs       (vec (repeat 40000 97))
+   :text       (vec (mapcat (fn [_] (->bytes "the quick brown fox jumps over the lazy dog. "))
+                            (range 100)))
+   :random     (lcg 20000 4242)
+   :big-chunk  (lcg 70000 7)})                             ; crosses the 64 KiB chunk limit
+
+;; ---------------------------------------------------------------------------
+;; CRC-64
+;; ---------------------------------------------------------------------------
+
+(deftest crc64-known-vectors
+  ;; The CRC-64/XZ check value for "123456789" (the standard check string).
+  (is (= [0x995dc9bb 0xdf1939fa] (crc64/crc64 (->bytes "123456789"))))
+  (is (= [0 0] (crc64/crc64 [])))
+  (testing "both halves stay unsigned"
+    (doseq [[_ data] samples]
+      (let [[hi lo] (crc64/crc64 data)]
+        (is (and (<= 0 hi) (< hi 4294967296)))
+        (is (and (<= 0 lo) (< lo 4294967296)))))))
+
+(deftest crc64-serialises-little-endian
+  (is (= [0xfa 0x39 0x19 0xdf 0xbb 0xc9 0x5d 0x99]
+         (crc64/->le-bytes (crc64/crc64 (->bytes "123456789"))))))
+
+;; ---------------------------------------------------------------------------
+;; LZMA2 uncompressed chunks
+;; ---------------------------------------------------------------------------
+
+(deftest lzma2-uncompressed-chunks-round-trip
+  (doseq [[name data] samples]
+    (testing name
+      (let [stream (xz/lzma2-uncompressed data)]
+        (is (= 0x00 (peek stream)) "terminated")
+        (is (= data (:bytes (lzma/decompress-lzma2 stream 0 {}))))))))
+
+(deftest chunks-are-capped-at-64-kib
+  (let [data   (:big-chunk samples)
+        stream (xz/lzma2-uncompressed data)]
+    (is (= 0x01 (first stream)) "the first chunk also resets the dictionary")
+    (is (= 0x02 (nth stream (+ 3 65536))) "the second chunk does not")
+    (is (= data (:bytes (lzma/decompress-lzma2 stream 0 {}))))))
+
+;; ---------------------------------------------------------------------------
+;; The .xz container we write
+;; ---------------------------------------------------------------------------
+
+(deftest xz-round-trip
+  (doseq [check [:crc64 :crc32 :none]
+          [name data] samples]
+    (testing (str check " / " name)
+      (let [f (xz/compress data {:check check})]
+        (is (= [0xfd 0x37 0x7a 0x58 0x5a 0x00] (subvec f 0 6)) "stream magic")
+        (is (= [0x59 0x5a] (subvec f (- (count f) 2))) "footer magic")
+        (is (= data (xz/decompress f)))))))
+
+(deftest xz-metadata-is-consistent
+  (let [data (:text samples)
+        f    (xz/compress data)
+        [s]  (xz/streams f)]
+    (is (= :crc64 (:check s)))
+    (is (= 1 (count (:blocks s))))
+    (is (= (count data) (:uncompressed-size (first (:blocks s)))))
+    (is (= [:lzma2] (:filters (first (:blocks s)))))
+    (testing "the index agrees with the block it describes"
+      (is (= (:unpadded (first (:blocks s))) (:unpadded (first (:records s)))))
+      (is (= (count data) (:uncompressed (first (:records s))))))))
+
+(deftest xz-output-is-deterministic
+  (is (= (xz/compress (:text samples)) (xz/compress (:text samples)))))
+
+(deftest concatenated-streams-are-read
+  (let [a (xz/compress (:tiny samples))
+        b (xz/compress (:allbytes samples))]
+    (is (= (into (:tiny samples) (:allbytes samples)) (xz/decompress (into a b))))
+    (is (= 2 (count (xz/streams (into a b)))))
+    (testing "stream padding between them is skipped"
+      (is (= (into (:tiny samples) (:allbytes samples))
+             (xz/decompress (into (into a [0 0 0 0]) b)))))))
+
+;; ---------------------------------------------------------------------------
+;; Strictness
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-non-xz-input
+  (is (= :not-xz (reason-of #(xz/decompress (vec (repeat 64 0x41))))))
+  (is (= :truncated (reason-of #(xz/decompress [0xfd 0x37 0x7a]))))
+  (is (= :not-xz (reason-of #(xz/decompress (assoc (xz/compress [1 2 3]) 1 0x38))))))
+
+(deftest verifies-every-crc-in-the-container
+  (let [f (xz/compress (:text samples))]
+    (testing "stream flags"
+      (is (= :checksum-mismatch (reason-of #(xz/decompress (assoc f 8 (bit-xor (nth f 8) 0xff)))))))
+    (testing "block data check"
+      ;; the CRC-64 sits at the end of the block, just before the index
+      (let [idx (first (keep-indexed (fn [i b] (when (and (> i 12) (zero? b)
+                                                          (= 1 (nth f (inc i))))
+                                                 i))
+                                     f))]
+        (is (some? idx))))
+    (testing "footer"
+      (is (= :checksum-mismatch
+             (reason-of #(xz/decompress (assoc f (- (count f) 3) 0xff))))))
+    (testing "a corrupted payload byte is caught by the block check"
+      ;; byte 30 is inside the uncompressed LZMA2 chunk payload
+      (is (= :checksum-mismatch (reason-of #(xz/decompress (assoc f 30 (bit-xor (nth f 30) 0xff))))))
+      (is (vector? (xz/decompress (assoc f 30 (bit-xor (nth f 30) 0xff)) {:verify-check false}))
+          "and skippable for salvage"))))
+
+(deftest rejects-a-truncated-stream
+  (let [f (xz/compress (:text samples))]
+    (is (contains? #{:truncated :bad-footer :checksum-mismatch}
+                   (reason-of #(xz/decompress (subvec f 0 (- (count f) 8))))))))
+
+(deftest enforces-an-output-ceiling
+  (let [f (xz/compress (:runs samples))]
+    (is (= 40000 (count (xz/decompress f))))
+    (is (= :output-limit (reason-of #(xz/decompress f {:max-output 100}))))))
+
+(deftest rejects-bad-lzma-properties
+  (is (= :bad-properties (reason-of #(lzma/props->lclppb 225))))
+  (is (= :bad-properties (reason-of #(lzma/props->lclppb 250))))
+  (testing "lc + lp above 4 would need a literal table this decoder does not build"
+    (is (= :bad-properties (reason-of #(lzma/props->lclppb (+ 4 (* 9 4))))))))
+
+(deftest rejects-a-bad-lzma2-control-byte
+  (is (= :bad-chunk (reason-of #(lzma/decompress-lzma2 [0x7f 0 0 0] 0 {}))))
+  (testing "a chunk that needs properties it never received"
+    (is (= :bad-chunk (reason-of #(lzma/decompress-lzma2 [0x80 0 0 0 0] 0 {}))))))
+
+(deftest alone-format-header-is-validated
+  (is (= :truncated (reason-of #(xz/decompress-alone [0x5d 0 0])))))

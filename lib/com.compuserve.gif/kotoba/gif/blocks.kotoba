@@ -1,0 +1,278 @@
+;; The GIF block walk, as a Kotoba application (ADR-2608261100) — GIF89a
+;; §17-§24.
+;;
+;;   init         (config)        -> state
+;;   offer-header (state, bytes)  -> state   ; the first 13
+;;   offer-bytes  (state, bytes)  -> state   ; the ones the guest asked for
+;;
+;; ## Counting frames by scanning for a byte is counting commas
+;;
+;; `gif.core/parse` reports:
+;;
+;;   :frames (count (filter #(= % 0x2C) bv))
+;;
+;; 0x2C is the Image Separator, and it is also the ASCII comma. A GIF is a
+;; sequence of blocks — image descriptors, extensions, colour tables, LZW
+;; sub-blocks — and 0x2C occurs freely inside all of them. Demonstrated
+;; (2026-08-31) by inserting one legal GIF89a Comment Extension containing a
+;; comma into `lzw_idx.gif`: the file still has exactly one image
+;; descriptor, and `parse` reports two frames.
+;;
+;; The fix is not a better heuristic. It is to walk the structure:
+;;
+;;   the guest owns   the block grammar — which byte introduces what, how
+;;                    long each header is, how sub-block chains end, and how
+;;                    big a colour table the flags declare
+;;   the host owns    the bytes, which are an image and unbounded
+;;
+;; `needs-at` / `needs-count` name a range; `offer-bytes` takes exactly it.
+;; The guest never holds pixel data.
+;;
+;; ## Frames are counted, not collected
+;;
+;; A `:document` vector holds 32 items and an animation can have hundreds,
+;; so the guest keeps a COUNT (an i64) and the first frame's offset, which
+;; is what `first-frame-indices` needs. Collecting every offset would put a
+;; 32-frame ceiling on a format that has none, and a ceiling that silently
+;; truncated would be worse than the byte scan it replaces.
+;;
+;; ## Every read is bounds-checked before it is asked for
+;;
+;; A colour-table size, a sub-block length and a descriptor width all come
+;; from the file. Asking the host for a range that runs past the end is how
+;; a parser turns a truncated file into an out-of-range read, so the range
+;; is checked before it is named — `:gif/truncated`, not an exception from
+;; the reader.
+;;
+;; `.cljc` remains the oracle for the header fields and is not required from
+;; here (require-graph). It did not grow a second copy of the walk
+;; (ADR-2608261100).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/gif/blocks.kotoba \
+;;     --target wasm32-browser --output blocks.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 6291-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns gif.blocks
+  (:export [init offer-header offer-bytes
+            phase reason
+            needs-at needs-count
+            width height version-89a? global-color-table?
+            frame-count first-frame-offset cursor]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- di [d :document k :keyword] :i64
+  (option-value-of [:option :i64] (document-i64-value (dg d k)) -1))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+(defn- at [v :document i :i64] :document
+  (option-value-of [:option :document] (document-vector-at v i) (document-null)))
+
+(defn- at-i64 [v :document i :i64] :i64
+  (option-value-of [:option :i64] (document-i64-value (at v i)) -1))
+
+;; --- the format's constants (§17-§24) --------------------------------------
+
+(defn- image-separator [] :i64 44)      ; 0x2C -- and the ASCII comma
+(defn- extension-introducer [] :i64 33) ; 0x21
+(defn- trailer [] :i64 59)              ; 0x3B
+(defn- header-bytes [] :i64 13)         ; signature 6 + Logical Screen Descriptor 7
+(defn- descriptor-bytes [] :i64 9)      ; Image Descriptor after the separator
+
+(defn- pow2 [n :i64] :i64 (if (<= n 0) 1 (* 2 (pow2 (- n 1)))))
+
+;; §18: a colour table's size is 3 * 2^(N+1) where N is the low three bits of
+;; the flags byte -- so the smallest is 6 bytes and the largest 768.
+(defn- table-bytes [flags :i64] :i64
+  (let [n (- flags (* (quot flags 8) 8))]
+    (* 3 (pow2 (+ n 1)))))
+
+;; Bit 7 of a flags byte: is there a colour table.
+(defn- table-present? [flags :i64] :bool
+  (if (>= (quot flags 128) 1) true false))
+
+;; --- state ------------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc state :phase (document-keyword :refused))
+    :reason (document-keyword why))
+   :count (document-i64 0)))
+
+(defn init [config :document] :document
+  (document-map :phase (document-keyword :want-header)
+                :reason (document-keyword :none)
+                :length (document-i64 (di config :file-length))
+                :at (document-i64 0)
+                :count (document-i64 (header-bytes))
+                :cursor (document-i64 0)
+                :width (document-i64 -1)
+                :height (document-i64 -1)
+                :v89a (document-bool false)
+                :gct (document-bool false)
+                :frames (document-i64 0)
+                :first-frame (document-i64 -1)
+                :skip (document-i64 0)))
+
+;; Name the next range, refusing rather than naming one that runs past the
+;; end: asking for it and finding out afterwards is the out-of-range read.
+(defn- want [state :document next-phase :keyword from :i64 n :i64] :document
+  (if (> (+ from n) (di state :length))
+    (refuse state :gif/truncated)
+    (document-assoc
+     (document-assoc
+      (document-assoc
+       (document-assoc state :phase (document-keyword next-phase))
+       :at (document-i64 from))
+      :count (document-i64 n))
+     :cursor (document-i64 from))))
+
+;; --- the header (§17-§18) ---------------------------------------------------
+
+(defn offer-header [state :document bytes :document] :document
+  (if (not (= (dk state :phase) :want-header))
+    state
+    (let [b0 (at-i64 bytes 0)
+          b1 (at-i64 bytes 1)
+          b2 (at-i64 bytes 2)
+          sig (if (= b0 71) (if (= b1 73) (if (= b2 70) true false) false) false)
+          v89 (if (= (at-i64 bytes 4) 57) true false)
+          flags (at-i64 bytes 10)
+          after (+ (header-bytes)
+                   (if (table-present? flags) (table-bytes flags) 0))]
+      (cond
+        (< (di state :length) (header-bytes)) (refuse state :gif/truncated)
+
+        ;; "GIF" -- §17. A file that does not say so is not one, and reading
+        ;; on would interpret whatever follows as a screen descriptor.
+        (not sig) (refuse state :gif/bad-signature)
+
+        :else
+        (want (document-assoc
+               (document-assoc
+                (document-assoc
+                 (document-assoc state :width
+                                 (document-i64 (+ (at-i64 bytes 6)
+                                                  (* 256 (at-i64 bytes 7)))))
+                 :height (document-i64 (+ (at-i64 bytes 8)
+                                          (* 256 (at-i64 bytes 9)))))
+                :v89a (document-bool v89))
+               :gct (document-bool (table-present? flags)))
+              :want-label after 1)))))
+
+;; --- the walk (§20-§24) -----------------------------------------------------
+
+(defn- want-label [state :document from :i64] :document
+  (want state :want-label from 1))
+
+;; A sub-block chain is length-prefixed runs ending in a zero length (§15).
+;; Every extension and every image's pixel data uses it, which is why one
+;; state serves both.
+(defn- want-subblock-len [state :document from :i64] :document
+  (want state :want-subblock-len from 1))
+
+(defn- on-label [state :document b :i64] :document
+  (let [pos (di state :cursor)]
+    (cond
+      (= b (image-separator))
+      ;; A real frame. Counted here rather than by looking for this byte
+      ;; anywhere, which is the difference this module exists for.
+      (let [n (+ (di state :frames) 1)
+            first-at (if (< (di state :first-frame) 0) pos (di state :first-frame))]
+        (want (document-assoc
+               (document-assoc state :frames (document-i64 n))
+               :first-frame (document-i64 first-at))
+              :want-image-descriptor (+ pos 1) (descriptor-bytes)))
+
+      (= b (extension-introducer))
+      ;; 0x21, then a one-byte label, then a sub-block chain (§23-§26). The
+      ;; label is skipped: which extension it is does not change the walk.
+      (want-subblock-len state (+ pos 2))
+
+      (= b (trailer))
+      (document-assoc
+       (document-assoc state :phase (document-keyword :done))
+       :count (document-i64 0))
+
+      ;; §20 admits exactly these three at this position. Anything else and
+      ;; the walk has lost sync, which is a different fact from a truncated
+      ;; file and is reported as one.
+      :else (refuse state :gif/unknown-block))))
+
+(defn- on-image-descriptor [state :document bytes :document] :document
+  (let [flags (at-i64 bytes 8)
+        after (+ (+ (di state :cursor) (descriptor-bytes))
+                 (if (table-present? flags) (table-bytes flags) 0))]
+    ;; Then the LZW minimum code size, then the pixel sub-block chain.
+    (want state :want-lzw-min after 1)))
+
+(defn offer-bytes [state :document bytes :document] :document
+  (let [p (dk state :phase)
+        pos (di state :cursor)]
+    (cond
+      (= p :want-label) (on-label state (at-i64 bytes 0))
+
+      (= p :want-image-descriptor) (on-image-descriptor state bytes)
+
+      (= p :want-lzw-min) (want-subblock-len state (+ pos 1))
+
+      (= p :want-subblock-len)
+      (let [n (at-i64 bytes 0)]
+        (if (= n 0)
+          ;; The chain ended; the next byte is another block label.
+          (want-label state (+ pos 1))
+          ;; Skip the run and read the next length. The data itself never
+          ;; reaches the guest -- only its length does.
+          (want-subblock-len state (+ (+ pos 1) n))))
+
+      :else state)))
+
+;; --- projections ------------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; The byte range the host must read next, and hand to `offer-bytes`.
+(defn needs-at [state :document] :i64
+  (if (= (dk state :phase) :done) -1
+      (if (= (dk state :phase) :refused) -1 (di state :at))))
+
+(defn needs-count [state :document] :i64 (di state :count))
+
+(defn cursor [state :document] :i64 (di state :cursor))
+
+(defn width [state :document] :i64 (di state :width))
+
+(defn height [state :document] :i64 (di state :height))
+
+(defn version-89a? [state :document] :bool (db state :v89a))
+
+(defn global-color-table? [state :document] :bool (db state :gct))
+
+;; Counted from the block structure. Only once the trailer has been reached:
+;; a count taken mid-walk is a lower bound presented as an answer.
+(defn frame-count [state :document] :i64
+  (if (= (dk state :phase) :done) (di state :frames) -1))
+
+;; Where the first Image Descriptor's separator sits -- what a decoder needs
+;; to read frame one. -1 for a file with no frames at all.
+(defn first-frame-offset [state :document] :i64
+  (if (= (dk state :phase) :done) (di state :first-frame) -1))

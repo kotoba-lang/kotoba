@@ -1,0 +1,285 @@
+(ns xmile.kotoba-expr-core-parity-test
+  "Parity gate between `xmile.expr` -- the authority, unchanged -- and its
+  Kotoba decision core, `kotoba/xmile_expr_core.kotoba`.
+
+  The port is compiled here and executed through the KIR interpreter in this
+  same JVM, so no value crosses a runtime boundary: an f64 parameter is an
+  ordinary Clojure double going in and coming back out.
+
+  WHAT IS COMPARED. Not `Math/exp` against `f64-exp-bounded` -- that would be
+  a test of two kernels. Every case below drives the REAL evaluator, through
+  `xmile.expr/eval-expr` on the expr tree the parser would have produced, and
+  asserts the port reproduces the number that evaluator returns.
+
+  EXACT vs TOLERANT. The two halves of this gate are deliberately different
+  and must not be merged:
+
+    exact    floor INT MOD MIN MAX ABS SQRT, all six relational operators, the
+             three logical ones, PI, INF, STEP, RAMP, PULSE. These are IEEE
+             operations or selections on both sides; a difference of one ulp
+             here is a defect, not rounding.
+
+    tolerant EXP LN LOG10 SIN COS TAN ARCSIN ARCCOS ARCTAN and `^`. The
+             .cljc calls the host math library; the port evaluates fixed
+             polynomial kernels (amu docs/adr/0009, 0012) that import no host
+             transcendental. Bit equality is therefore not available and
+             claiming it would be a lie. The bound asserted is `tolerance`
+             below; the max error actually observed is printed on every run,
+             so drift toward the bound is visible before it crosses.
+
+  DOMAINS. `stated-domain-differences` pins the places the port is NARROWER
+  than the host on purpose: it traps where the host would hand back NaN or an
+  infinity. That direction is checked too -- a gate that only ever shows
+  agreement has not shown that it can disagree."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [xmile.expr :as expr]))
+
+(def ^:private port-source (slurp "lib/org.oasisOpen.xmile/kotoba/xmile_expr_core.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source port-source :wasm32-kotoba-v1 {}))))
+
+(defn- port
+  "Call an exported function of the port."
+  [f & args]
+  (ir/execute @kir f (vec args)))
+
+(defn- port-trap
+  "The trap keyword the port raises for these arguments, or ::returned."
+  [f & args]
+  (try (apply port f args) ::returned
+       (catch Exception e (or (:trap (ex-data e)) ::no-trap-key))))
+
+;; --- the corpus -----------------------------------------------------------
+;; Chosen inside the intersection of XMILE's domain and the bounded intrinsics'
+;; (|angle| <= 8192*pi, exp |x| <= 512*ln 2, log [2^-512, 2^512]).
+
+(def ^:private unit-values
+  [-1.0 -0.9375 -0.5 -0.125 0.0 0.125 0.5 0.9375 1.0])
+
+(def ^:private angles
+  [-6.5 -3.25 -1.5 -0.75 -0.25 0.0 0.25 0.75 1.5 3.25 6.5 12.75 100.5 1000.25])
+
+(def ^:private positives
+  [1.0e-6 0.001 0.125 0.5 1.0 2.0 7.5 10.0 100.0 1000.0 6.0221408e5])
+
+(def ^:private reals
+  [-1000.25 -7.5 -2.0 -0.5 -0.125 0.0 0.125 0.5 2.0 7.5 1000.25])
+
+(def ^:private exp-arguments
+  "Inside |x| <= 512*ln 2. The saturating arguments outside it are asserted
+  separately, in `stated-domain-differences`."
+  [-300.0 -50.0 -7.5 -1.0 -0.125 0.0 0.125 1.0 7.5 50.0 300.0])
+
+(def ^:private exponents
+  [-3.0 -2.0 -1.0 -0.5 0.0 0.5 1.0 2.0 3.0 4.0 7.0])
+
+(def ^:private tolerance
+  "Relative error allowed between a host math call and a polynomial kernel.
+
+  Set from measurement, not from the kernels' advertised bounds. Worst case
+  observed across this corpus on 2026-08-18, JDK 24, amu 29e8386:
+
+      TAN     1.276e-13  at 1000.25   <- the worst, and it is a quotient:
+      COS     1.129e-13  at 1000.25      the wide-angle reduction error in
+      EXP     2.158e-14  at -300.0       sin and cos compounds through it
+      SIN     1.476e-14  at 1000.25
+      LOG10   2.537e-16  at 7.5
+      ARCCOS  2.120e-16  at 0.5
+      LN      1.929e-16  at 10.0
+      ARCTAN  1.414e-16  at -1000.25
+      ARCSIN  0.000e+00  (exact across the whole unit corpus)
+      ^       9.375e-15  at 100.0^7.0
+
+  1e-12 leaves roughly eight times the worst observed error -- enough that
+  ordinary kernel retuning upstream does not turn this gate red, tight enough
+  that losing a term in a polynomial does. Every run prints the table above,
+  so drift toward the bound is visible before it crosses."
+  1.0e-12)
+
+(defn- relative-error [a b]
+  (cond
+    (and (Double/isNaN a) (Double/isNaN b)) 0.0
+    (= a b) 0.0
+    (or (Double/isNaN a) (Double/isNaN b)) Double/POSITIVE_INFINITY
+    (or (Double/isInfinite a) (Double/isInfinite b)) Double/POSITIVE_INFINITY
+    :else (let [scale (max (Math/abs a) (Math/abs b) 1.0e-300)]
+            (/ (Math/abs (- a b)) scale))))
+
+(defn- host-call [fn-name args]
+  (expr/eval-expr [:call fn-name (mapv (fn [x] [:num x]) args)] {}))
+
+(defn- host-op [op args]
+  (expr/eval-expr (into [op] (mapv (fn [x] [:num x]) args)) {}))
+
+;; --- exact half -----------------------------------------------------------
+
+(deftest selection-and-ieee-builtins-are-exact
+  (doseq [[fn-name port-fn values]
+          [["ABS"  'abs      reals]
+           ["SQRT" 'sqrt     positives]
+           ["INT"  'int-part reals]]]
+    (testing fn-name
+      (doseq [x values]
+        (is (= (host-call fn-name [x]) (apply port port-fn [x]))
+            (str fn-name "(" x ")"))))))
+
+(deftest two-argument-selection-is-exact
+  (doseq [[fn-name port-fn] [["MIN" 'min-2] ["MAX" 'max-2]]]
+    (testing fn-name
+      (doseq [a reals b reals]
+        (is (= (host-call fn-name [a b]) (port port-fn a b))
+            (str fn-name "(" a ", " b ")"))))))
+
+(deftest floored-modulus-is-exact
+  ;; clojure.core/mod, not rem: the sign follows the divisor.
+  (doseq [a reals
+          n [-7.5 -3.0 -0.5 0.5 3.0 7.5]]
+    (is (= (host-op :mod [a n]) (port 'xmile-mod a n))
+        (str a " MOD " n))))
+
+(deftest relational-and-logical-operators-are-exact
+  (doseq [[op port-fn] [[:lt 'lt-num] [:le 'le-num] [:gt 'gt-num] [:ge 'ge-num]
+                        [:eq 'eq-num] [:ne 'ne-num]
+                        [:and 'and-num] [:or 'or-num]]]
+    (testing (name op)
+      (doseq [a reals b reals]
+        (is (= (host-op op [a b]) (port port-fn a b))
+            (str (name op) "(" a ", " b ")")))))
+  (testing "not"
+    (doseq [x reals]
+      (is (= (host-op :not [x]) (port 'not-num x)) (str "NOT(" x ")")))))
+
+(deftest truthiness-follows-zero-not-sign
+  ;; XMILE has no boolean type; every non-zero value is true, NaN included
+  ;; (clojure.core/zero? is false for NaN, so the .cljc agrees).
+  (doseq [[x expected] [[0.0 false] [-0.0 false] [1.0 true] [-1.0 true]
+                        [1.0e-300 true] [##NaN true] [##Inf true]]]
+    (is (= expected (port 'truthy x)) (str "truthy(" x ")"))))
+
+(deftest reserved-constants-are-exact
+  (is (= (host-call "PI" []) (port 'pi)))
+  (is (= (host-call "INF" []) (port 'inf))))
+
+(deftest test-inputs-are-exact
+  (testing "STEP"
+    (doseq [height [0.0 2.5 -2.5] start [0.0 3.0] t [-1.0 0.0 2.999 3.0 10.0]]
+      (is (= (expr/eval-expr [:call "STEP" [[:num height] [:num start]]] {"TIME" t "DT" 0.25})
+             (port 'step-value height start t))
+          (str "STEP(" height ", " start ") @ " t))))
+  (testing "RAMP"
+    (doseq [slope [0.0 2.5 -2.5] start [0.0 3.0] t [-1.0 0.0 3.0 10.0]]
+      (is (= (expr/eval-expr [:call "RAMP" [[:num slope] [:num start]]] {"TIME" t "DT" 0.25})
+             (port 'ramp-value slope start t))
+          (str "RAMP(" slope ", " start ") @ " t))))
+  (testing "PULSE, both the one-shot and the repeating form"
+    (doseq [magnitude [1.0 10.0]
+            first-time [0.0 2.0]
+            interval [0.0 5.0]
+            dt [0.25 1.0]
+            t [-1.0 0.0 1.75 2.0 2.5 7.0 12.0]]
+      (let [args (if (zero? interval)
+                   [[:num magnitude] [:num first-time]]
+                   [[:num magnitude] [:num first-time] [:num interval]])]
+        (is (= (expr/eval-expr [:call "PULSE" args] {"TIME" t "DT" dt})
+               (port 'pulse-value magnitude first-time interval t dt))
+            (str "PULSE(" magnitude ", " first-time ", " interval ") @ " t " dt " dt))))))
+
+;; --- tolerant half --------------------------------------------------------
+
+(defn- worst
+  "Largest relative error between host and port over `values`, plus the case."
+  [fn-name port-fn values]
+  (reduce (fn [[worst-err worst-case] args]
+            (let [err (relative-error (host-call fn-name args)
+                                      (apply port port-fn args))]
+              (if (> err worst-err) [err args] [worst-err worst-case])))
+          [0.0 nil]
+          values))
+
+(deftest transcendental-builtins-agree-within-tolerance
+  (let [cases {"EXP"    ['exp    (mapv vector exp-arguments)]
+               "LN"     ['ln     (mapv vector positives)]
+               "LOG10"  ['log10  (mapv vector positives)]
+               "SIN"    ['sin    (mapv vector angles)]
+               "COS"    ['cos    (mapv vector angles)]
+               "TAN"    ['tan    (mapv vector angles)]
+               "ARCSIN" ['arcsin (mapv vector unit-values)]
+               "ARCCOS" ['arccos (mapv vector unit-values)]
+               "ARCTAN" ['arctan (mapv vector reals)]}
+        report (into (sorted-map)
+                     (map (fn [[fn-name [port-fn values]]]
+                            [fn-name (worst fn-name port-fn values)]))
+                     cases)]
+    (doseq [[fn-name [err case-args]] report]
+      (is (< err tolerance)
+          (str fn-name ": worst relative error " err " at " (pr-str case-args))))
+    (println "  transcendental parity, worst relative error per built-in:")
+    (doseq [[fn-name [err case-args]] report]
+      (println (format "    %-7s %.3e  at %s" fn-name err (pr-str case-args))))))
+
+(deftest power-operator-agrees-within-tolerance
+  ;; `^` is reconstructed from exp/log rather than a host pow, so an integral
+  ;; result is near-exact rather than exact: 2^10 comes back 1023.9999999999998.
+  (let [cases (concat (for [b positives e exponents] [b e])
+                      ;; negative base, integral exponent only -- the host is
+                      ;; NaN elsewhere and so is the port (asserted below).
+                      (for [b [-7.5 -2.0 -0.5] e [-3.0 -2.0 -1.0 0.0 1.0 2.0 3.0]] [b e])
+                      ;; zero base: 0^e is 0 / 1 / +Inf by convention.
+                      [[0.0 2.0] [0.0 0.0]])
+        [err case-args] (reduce (fn [[worst-err worst-case] [b e]]
+                                  (let [x (relative-error (host-op :pow [b e])
+                                                          (port 'pow b e))]
+                                    (if (> x worst-err) [x [b e]] [worst-err worst-case])))
+                                [0.0 nil] cases)]
+    (is (< err tolerance)
+        (str "^ : worst relative error " err " at " (pr-str case-args)))
+    (println (format "  ^ parity, worst relative error %.3e at %s" err (pr-str case-args)))))
+
+(deftest power-reproduces-the-hosts-non-finite-conventions
+  (is (= Double/POSITIVE_INFINITY (host-op :pow [0.0 -1.0])))
+  (is (= Double/POSITIVE_INFINITY (port 'pow 0.0 -1.0)))
+  (is (Double/isNaN (host-op :pow [-2.0 0.5])))
+  (is (Double/isNaN (port 'pow -2.0 0.5))))
+
+;; --- the direction where they differ, on purpose --------------------------
+;; Two different things, kept apart because conflating them would flatter the
+;; port. In the first group the host produces a non-finite or saturated value
+;; and the port refuses -- fail-closed, and better. In the second the host
+;; produces a perfectly good number and the port still refuses -- a narrower
+;; domain, which is a gap in the port and is recorded as one.
+
+(deftest port-refuses-where-the-host-goes-non-finite
+  (doseq [[label host-value port-fn args expected-trap]
+          [["LN(0)"      (host-call "LN" [0.0])      'ln     [0.0]     :f64-log-bounded-domain]
+           ["LN(-1)"     (host-call "LN" [-1.0])     'ln     [-1.0]    :f64-log-bounded-domain]
+           ["EXP(1000)"  (host-call "EXP" [1000.0])  'exp    [1000.0]  :f64-exp-bounded-domain]
+           ["EXP(-1000)" (host-call "EXP" [-1000.0]) 'exp    [-1000.0] :f64-exp-bounded-domain]
+           ["ARCSIN(2)"  (host-call "ARCSIN" [2.0])  'arcsin [2.0]     :f64-atan2-bounded-domain]
+           ["ARCCOS(2)"  (host-call "ARCCOS" [2.0])  'arccos [2.0]     :f64-atan2-bounded-domain]]]
+    (is (or (Double/isNaN host-value) (Double/isInfinite host-value) (zero? host-value))
+        (str label ": the host value should be non-finite or a saturation, was " host-value))
+    (is (= expected-trap (apply port-trap port-fn args))
+        (str label ": expected the port to trap"))))
+
+(deftest port-is-narrower-than-the-host-on-wide-angles
+  ;; NOT a virtue. `Math/sin` performs full-range argument reduction and is
+  ;; accurate for every finite double; `f64-sin-bounded` reduces only inside
+  ;; |x| <= 8192*pi and refuses beyond it rather than reducing badly (amu
+  ;; docs/adr/0009). A model whose TIME reaches ~25736 radians of phase is
+  ;; outside what this port can evaluate. Pinned here so that closing the gap
+  ;; -- or discovering a model that needs it -- shows up as this test changing.
+  (let [beyond 1.0e9]
+    (doseq [[label fn-name port-fn] [["SIN" "SIN" 'sin] ["COS" "COS" 'cos]]]
+      (is (Double/isFinite (host-call fn-name [beyond]))
+          (str label ": the host evaluates this fine, which is the point"))
+      (is (= :f64-bounded-angle-domain (port-trap port-fn beyond))
+          (str label ": expected the port to refuse the wide angle")))))
+
+(deftest the-gate-can-fail
+  ;; A parity gate that has only ever agreed has not shown it can disagree.
+  ;; These are the two comparisons the halves above rest on, driven to red.
+  (is (not= (host-call "SQRT" [2.0]) (port 'sqrt 3.0)))
+  (is (> (relative-error (host-call "EXP" [2.0]) (port 'exp 2.5)) tolerance)))

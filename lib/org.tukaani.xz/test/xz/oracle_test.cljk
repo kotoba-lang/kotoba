@@ -1,0 +1,277 @@
+(ns xz.oracle-test
+  "Conformance against real LZMA implementations: python3's `lzma` module (which
+   is liblzma) and the `xz` CLI.
+
+   The decoder is the part that has to be exactly right — LZMA has no byte
+   alignment, no Huffman tables and no resynchronisation, so a probability index
+   off by one produces plausible output for a while and then diverges. Every
+   fixture here is therefore produced by liblzma across presets, dictionary
+   sizes, check types, filter chains and formats, and compared byte-for-byte.
+
+   Skipped loudly when python3 or xz is missing rather than passing silently."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [xz.core :as xz])
+  (:import [java.io File]))
+
+(defn- have? [cmd]
+  (try (zero? (:exit (shell/sh cmd "--version"))) (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir "org-tukaani-xz-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+
+(defn- py [cwd script]
+  (let [{:keys [exit out err]} (shell/sh "python3" "-" :in script :dir cwd)]
+    (when-not (zero? exit)
+      (throw (ex-info (str "python3 fixture failed: " err) {})))
+    out))
+
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+(defn- write-bytes [^File f bs]
+  (with-open [o (io/output-stream f)] (.write o (byte-array (map unchecked-byte bs)))))
+
+;; A corpus with the shapes that exercise different parts of the coder: runs
+;; (rep matches), structure (short distances), text (literal contexts), random
+;; (incompressible, so literals dominate).
+(def ^:private corpus-py "
+import os
+data = {}
+data['text'] = (b'the quick brown fox jumps over the lazy dog. ' * 400)
+data['runs'] = b'a' * 50000
+data['structured'] = bytes(bytearray([i % 251, i % 7, 0, 0, i % 13][j] for i in range(4000) for j in range(5)))
+data['random'] = bytes(bytearray(os.urandom(20000)))
+data['mixed'] = b'x' * 3000 + bytes(bytearray(os.urandom(3000))) + b'x' * 30000
+data['tiny'] = b'hi'
+data['empty'] = b''
+data['allbytes'] = bytes(bytearray(range(256))) * 20
+")
+
+(defn- fixture!
+  "Ask python for one fixture; returns [original-bytes compressed-bytes]."
+  [dir tag script]
+  (py dir (str corpus-py script))
+  [(read-ubytes (io/file dir (str tag ".raw")))
+   (read-ubytes (io/file dir (str tag ".xz")))])
+
+;; ---------------------------------------------------------------------------
+;; liblzma → us
+;; ---------------------------------------------------------------------------
+
+(deftest we-read-liblzma-across-presets
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (doseq [preset [0 1 6 9]
+            name   ["text" "runs" "structured" "random" "mixed" "tiny" "empty" "allbytes"]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str "preset " preset " / " name)
+            (let [[raw comp] (fixture! dir "f" (str "
+import lzma
+d = data['" name "']
+open('f.raw','wb').write(d)
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, preset=" preset "))
+"))]
+              (is (= raw (xz/decompress comp)))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-every-check-type
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (doseq [check ["CHECK_NONE" "CHECK_CRC32" "CHECK_CRC64" "CHECK_SHA256"]]
+      (let [dir (temp-dir)]
+        (try
+          (testing check
+            (let [[raw comp] (fixture! dir "f" (str "
+import lzma
+d = data['text']
+open('f.raw','wb').write(d)
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, check=lzma." check "))
+"))]
+              (if (= check "CHECK_SHA256")
+                (do
+                  (testing "verified with the bundled SHA-256 (org-nist-sha2)"
+                    ;; this used to be a refusal: there was no portable SHA-256 in
+                    ;; the workspace, so the only options were injecting a host
+                    ;; hash or declining the file
+                    (is (= raw (xz/decompress comp))))
+                  (testing "and the bundled hash agrees with the JVM's"
+                    (let [sha (fn [bs]
+                                (vec (map #(bit-and (int %) 0xff)
+                                          (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                                                   (byte-array (map unchecked-byte bs))))))]
+                      (is (= raw (xz/decompress comp {:sha256 sha})))))
+                  (testing "an injected hash that disagrees is caught, not ignored"
+                    (is (= :checksum-mismatch
+                           (try (xz/decompress comp {:sha256 (fn [_] (vec (repeat 32 0)))}) nil
+                                (catch Exception e (:reason (ex-data e)))))))
+                  (testing "or skipped explicitly"
+                    (is (= raw (xz/decompress comp {:verify-check false})))))
+                (is (= raw (xz/decompress comp))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-small-and-large-dictionaries
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (doseq [dict ["4096" "65536" "1 << 20" "1 << 24"]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str "dict " dict)
+            (let [[raw comp] (fixture! dir "f" (str "
+import lzma
+d = data['mixed']
+open('f.raw','wb').write(d)
+filt = [{'id': lzma.FILTER_LZMA2, 'preset': 6, 'dict_size': " dict "}]
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, filters=filt))
+"))]
+              (is (= raw (xz/decompress comp)))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-non-default-lc-lp-pb
+  ;; lc/lp/pb change the literal context and position masks — the part of the
+  ;; model most likely to be hard-coded by accident.
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (doseq [[lc lp pb] [[0 0 0] [3 0 2] [1 2 0] [0 2 2] [4 0 0]]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str "lc=" lc " lp=" lp " pb=" pb)
+            (let [[raw comp] (fixture! dir "f" (str "
+import lzma
+d = data['text']
+open('f.raw','wb').write(d)
+filt = [{'id': lzma.FILTER_LZMA2, 'preset': 6, 'lc': " lc ", 'lp': " lp ", 'pb': " pb "}]
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, filters=filt))
+"))]
+              (is (= raw (xz/decompress comp)))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-the-delta-filter
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [[raw comp] (fixture! dir "f" "
+import lzma
+d = bytes(bytearray([(i * 3) % 256 for i in range(20000)]))
+open('f.raw','wb').write(d)
+filt = [{'id': lzma.FILTER_DELTA, 'dist': 1}, {'id': lzma.FILTER_LZMA2, 'preset': 6}]
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, filters=filt))
+")]
+          (is (= raw (xz/decompress comp))))
+        (finally (rm-rf dir))))))
+
+(deftest we-refuse-bcj-filters-by-name
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [[_ comp] (fixture! dir "f" "
+import lzma
+d = data['text']
+open('f.raw','wb').write(d)
+filt = [{'id': lzma.FILTER_X86}, {'id': lzma.FILTER_LZMA2, 'preset': 6}]
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, filters=filt))
+")]
+          (is (= :unsupported-filter
+                 (try (xz/decompress comp) nil
+                      (catch Exception e (:reason (ex-data e))))))
+          (is (= :bcj-x86
+                 (try (xz/decompress comp) nil
+                      (catch Exception e (:filter (ex-data e)))))))
+        (finally (rm-rf dir))))))
+
+(deftest we-read-multi-block-and-multi-stream-files
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (testing "several streams concatenated (what `cat a.xz b.xz` produces)"
+          (let [[raw comp] (fixture! dir "f" "
+import lzma
+a = data['text']; b = data['runs']
+open('f.raw','wb').write(a + b)
+open('f.xz','wb').write(lzma.compress(a, format=lzma.FORMAT_XZ) + lzma.compress(b, format=lzma.FORMAT_XZ))
+")]
+            (is (= raw (xz/decompress comp)))
+            (is (= 2 (count (xz/streams comp))))))
+        (testing "multi-block streams from `xz --block-size`"
+          (if-not (have? "xz")
+            (println "SKIP: xz CLI not available")
+            (let [_ (py dir "
+import os
+open('big.raw','wb').write((b'block boundary test ' * 5000))
+print('ok')")
+                  _ (shell/sh "xz" "-k" "-6" "--block-size=16384" "big.raw" :dir dir)]
+              (is (= (read-ubytes (io/file dir "big.raw"))
+                     (xz/decompress (read-ubytes (io/file dir "big.raw.xz")))))
+              (is (> (count (:blocks (first (xz/streams (read-ubytes (io/file dir "big.raw.xz")))))) 1)
+                  "the fixture really is multi-block"))))
+        (finally (rm-rf dir))))))
+
+(deftest we-read-the-legacy-alone-format
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (doseq [preset [0 6 9]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str ".lzma preset " preset)
+            (py dir (str corpus-py "
+import lzma
+d = data['text']
+open('f.raw','wb').write(d)
+open('f.lzma','wb').write(lzma.compress(d, format=lzma.FORMAT_ALONE, preset=" preset "))
+"))
+            (is (= (read-ubytes (io/file dir "f.raw"))
+                   (xz/decompress-alone (read-ubytes (io/file dir "f.lzma"))))))
+          (finally (rm-rf dir)))))))
+
+(deftest we-read-a-megabyte
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [[raw comp] (fixture! dir "f" "
+import lzma
+d = (b'line %d of a log file with repeated shape\\n' % 0) * 1
+d = b''.join((b'line %d of a log file with repeated shape\\n' % i) for i in range(25000))
+open('f.raw','wb').write(d)
+open('f.xz','wb').write(lzma.compress(d, format=lzma.FORMAT_XZ, preset=6))
+")]
+          (is (> (count raw) 1000000))
+          (is (= raw (xz/decompress comp))))
+        (finally (rm-rf dir))))))
+
+;; ---------------------------------------------------------------------------
+;; us → liblzma
+;; ---------------------------------------------------------------------------
+
+(deftest our-xz-is-read-by-liblzma-and-the-cli
+  (if-not (have? "python3")
+    (println "SKIP xz.oracle-test: python3 not available")
+    (doseq [check [:crc64 :crc32 :none]]
+      (let [dir (temp-dir)]
+        (try
+          (testing (str "check " check)
+            (let [payload (vec (mapcat (fn [i] (map int (seq (str "row " i " of our own xz\n"))))
+                                       (range 3000)))]
+              (write-bytes (io/file dir "ours.xz") (xz/compress payload {:check check}))
+              (testing "python's lzma reads it"
+                (let [out (py dir "
+import lzma, hashlib
+d = lzma.decompress(open('ours.xz','rb').read())
+print('%d %s' % (len(d), hashlib.sha256(d).hexdigest()))")]
+                  (is (str/starts-with? (str/trim out) (str (count payload) " ")))))
+              (when (have? "xz")
+                (testing "`xz -t` accepts it and `xz -d` reproduces the input"
+                  (let [{:keys [exit err]} (shell/sh "xz" "-t" "ours.xz" :dir dir)]
+                    (is (zero? exit) err))
+                  (let [{:keys [exit err]} (shell/sh "xz" "-dk" "ours.xz" :dir dir)]
+                    (is (zero? exit) err))
+                  (is (= payload (read-ubytes (io/file dir "ours"))))))
+              (testing "and we read it back ourselves"
+                (is (= payload (xz/decompress (read-ubytes (io/file dir "ours.xz"))))))))
+          (finally (rm-rf dir)))))))

@@ -1,0 +1,122 @@
+;; `kotoba/nameserver/header_core.kotoba` against `nameserver.wire`.
+;;
+;; The object exists so a machine resolving its own names -- an aiueos node
+;; with no JVM and no Node -- decides for itself whether to believe a reply.
+;; It cannot call this namespace, so nothing but this notices them drifting.
+;;
+;; `accept-reply?` is the part that matters. A resolver that skips the id or
+;; the QR bit believes any UDP datagram that reaches its port, which is
+;; off-path cache poisoning with nothing forged. So the suite drives all three
+;; of its conditions independently rather than only the case where everything
+;; is right, and each one is separately broken in the discrimination pass.
+
+(ns nameserver.header-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [nameserver.wire :as wire]))
+
+(def ^:private source-file
+  (io/file (System/getProperty "user.dir") "kotoba" "nameserver" "header_core.kotoba"))
+
+(defn- source-available? []
+  (let [present? (io/exists? source-file)]
+    (is present? (str "kotoba object not found at " source-file))
+    present?))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-source (slurp source-file) :wasm32-kotoba-v1 {}))))
+
+(defn- call [f & args] (ir/execute @kir f (vec args)))
+
+(def ^:private cljc-encode-flags (var-get #'nameserver.wire/encode-flags))
+
+(def ^:private rcode-code
+  {:noerror 0 :formerr 1 :servfail 2 :nxdomain 3 :notimp 4 :refused 5})
+
+(defn- pack
+  "The header flags as one integer, in the layout header_core reads:
+  bit 0 RD, 1 TC, 2 AA, 3-6 opcode, 7 QR, 8 RA, 12-15 rcode."
+  [{:keys [qr opcode aa? tc? rd? ra? rcode]}]
+  (bit-or (if rd? 1 0)
+          (bit-or (bit-shift-left (if tc? 1 0) 1)
+                  (bit-or (bit-shift-left (if aa? 1 0) 2)
+                          (bit-or (bit-shift-left (bit-and opcode 0xF) 3)
+                                  (bit-or (bit-shift-left (if (= qr :response) 1 0) 7)
+                                          (bit-or (bit-shift-left (if ra? 1 0) 8)
+                                                  (bit-shift-left (rcode-code rcode) 12))))))))
+
+(def ^:private flag-sets
+  (for [qr [:query :response], opcode [0 1 2 15]
+        aa? [false true], tc? [false true], rd? [false true], ra? [false true]
+        rcode (keys rcode-code)]
+    {:qr qr :opcode opcode :aa? aa? :tc? tc? :rd? rd? :ra? ra? :rcode rcode}))
+
+(deftest kotoba-object-is-present
+  (source-available?))
+
+(deftest flag-bytes-agree
+  (when (source-available?)
+    (doseq [f flag-sets]
+      (let [[b1 b2] (cljc-encode-flags f)
+            p (pack f)]
+        (is (= b1 (call 'flags-b1 p)) (str "b1 for " f))
+        (is (= b2 (call 'flags-b2 p)) (str "b2 for " f))))))
+
+(deftest readers-agree
+  (when (source-available?)
+    (doseq [f flag-sets]
+      (let [[b1 b2] (cljc-encode-flags f)]
+        (is (= (= :response (:qr f)) (call 'qr-response? b1)) (str "qr " f))
+        (is (= (bit-and (:opcode f) 0xF) (call 'opcode-of b1)) (str "opcode " f))
+        (is (= (:aa? f) (call 'authoritative? b1)) (str "aa " f))
+        (is (= (:tc? f) (call 'truncated? b1)) (str "tc " f))
+        (is (= (:rd? f) (call 'recursion-desired? b1)) (str "rd " f))
+        (is (= (:ra? f) (call 'recursion-available? b2)) (str "ra " f))
+        (is (= (rcode-code (:rcode f)) (call 'rcode-of b2)) (str "rcode " f))))))
+
+(deftest readers-agree-with-the-real-decoder
+  (when (source-available?)
+    ;; Not just against encode-flags: a full encode/decode round trip, so the
+    ;; byte positions are checked and not only the bit layout.
+    (doseq [f (take 32 flag-sets)]
+      (let [msg (merge {:dns/id 4660
+                        :dns/questions [{:dns/qname "example.com." :dns/qtype "A"
+                                         :dns/qclass "IN"}]}
+                       {:dns/qr (:qr f) :dns/opcode (:opcode f)
+                        :dns/aa? (:aa? f) :dns/tc? (:tc? f)
+                        :dns/rd? (:rd? f) :dns/ra? (:ra? f)
+                        :dns/rcode (:rcode f)})
+            bytes (wire/encode-message msg)
+            b1 (nth bytes 2), b2 (nth bytes 3)
+            back (wire/decode-message bytes)]
+        (is (= (= :response (:dns/qr back)) (call 'qr-response? b1))
+            (str "round-trip qr " f))
+        (is (= (:dns/tc? back) (call 'truncated? b1)) (str "round-trip tc " f))
+        (is (= (rcode-code (:dns/rcode back)) (call 'rcode-of b2))
+            (str "round-trip rcode " f))))))
+
+(deftest accept-reply-needs-all-three
+  (when (source-available?)
+    (doseq [id [0 4660 65535]
+            reply-id [0 4660 65535]
+            qr [:query :response]
+            opcode [0 1]
+            query-opcode [0 1]]
+      (let [[b1 _] (cljc-encode-flags {:qr qr :opcode opcode :aa? false :tc? false
+                                       :rd? true :ra? false :rcode :noerror})
+            expected (and (= reply-id id) (= qr :response) (= opcode query-opcode))]
+        (is (= expected (call 'accept-reply? reply-id id b1 query-opcode))
+            (str "accept-reply? id " reply-id "/" id " qr " qr
+                 " opcode " opcode "/" query-opcode
+                 " -- skipping any one of these lets anything that reaches "
+                 "the port supply the answer"))))))
+
+(deftest nxdomain-is-an-answer
+  (when (source-available?)
+    (doseq [[k v] rcode-code]
+      (is (= (not (contains? #{:noerror :nxdomain} k)) (call 'rcode-is-error? v))
+          (str "rcode-is-error? " k
+               " -- NXDOMAIN is the fact the caller asked for; retrying on it "
+               "walks the whole server list for every typo")))))

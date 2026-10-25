@@ -1,0 +1,384 @@
+;; Clojure-shaped twin of core.kotoba (:clj-kotoba / .cljk).
+;;
+;; The same code with the type annotations removed from the EXPORTED functions --
+;; the frontend infers a parameter's type from what its body requires and a
+;; result's from what the body returns. The private helpers keep theirs: strip
+;; those and an unconstrained parameter falls back to `:i64`, which surfaces as a
+;; type mismatch AT THE CALL SITE naming the caller rather than the helper.
+;;
+;; `.cljk` is :clj-kotoba, not a JVM target.
+;;
+;; This file exists to be COMPARED, not read. `atproto_core_kotoba_parity_test`
+;; runs both through KIR on the same inputs, and the two are also compiled and
+;; their artifacts diffed -- which is the only thing that catches inference
+;; picking a different TYPE for the same code. Measured in org-ietf-smtp:
+;; `creds-code`'s two booleans came out `assertI64` in the twin and `assertBool`
+;; in the annotated build, and every value test passed on both.
+;;
+;; atproto.core as a Kotoba component -- the AT Protocol identifier syntax,
+;; the at:// URI, and the profile record shapes (ADR-q9-whole-component-
+;; build-migration, `:migration-unit :whole-component`).
+;;
+;; The whole namespace moves: three validators, the URI builder and parser, the
+;; did:web handle derivation, both profile document shapes and the XRPC URL.
+;; Nothing of `atproto.core` is left behind -- there is no host mechanism in it
+;; to leave. `atproto.sdk` is a separate component (a coverage table over
+;; `resources/`) and is not touched here.
+;;
+;; ## Three design changes, each with the reason
+;;
+;; 1. NO REGEX. `did?`, `collection?` and the URI parse are `re-matches` in the
+;;    oracle. ADR-2608650000 decision 6: a design that depends on a regular
+;;    expression gets the design change BEFORE the migration rather than
+;;    waiting for regex to be admitted. Every pattern here is anchored and
+;;    fixed-shape, so there was nothing to search for -- `did:` is a prefix, a
+;;    method is the run up to the next colon, an NSID is dot-separated
+;;    segments. The scans below are one pass each over a short identifier.
+;;
+;; 2. NO THROW. The oracle throws `ex-info` naming WHICH input was invalid.
+;;    That distinction is the value, so it becomes data: `repo-uri-status`
+;;    answers `:ok` / `:bad-repo` / `:bad-collection` / `:bad-rkey`, and
+;;    `repo-uri` answers "" when the status is not `:ok`. Same for the parser:
+;;    `uri-valid?` plus three accessors that answer "" on an invalid URI. A
+;;    caller that ignored the status used to get an exception and now gets an
+;;    empty string, which is why the status is exported rather than internal.
+;;
+;; 3. NO MAP RETURN. A map cannot be a Kotoba return type, but a DOCUMENT can,
+;;    and the two profile shapes are documents in the oracle too. So
+;;    `profile-record` / `profile-write` keep their shape and take and return
+;;    `:document`; only the URI parse goes positional, because its result is
+;;    three strings and a document there would be shape for its own sake.
+;;
+;; ## Fuel
+;;
+;; The emitted artifact charges one unit per function entry against 512 per
+;; module instance, so a character scan costs its input length. Everything here
+;; scans identifiers: a DID is tens of characters, an NSID likewise, and
+;; `valid-rkey?` does not scan at all -- three `string-contains?` and a length,
+;; four units for any rkey up to the 512-character limit the oracle imposes.
+;;
+;; ## What was verified, and the one thing that was not
+;;
+;;   kotoba -M test              7 tests GREEN on jvm-kir, js AND wasm, for this
+;;                               file and for the .cljk twin
+;;   kbb -M:test             15 tests / 214 assertions / 0 failures --
+;;                               `atproto.core-kotoba-parity-test` against the
+;;                               oracle over 11 DIDs, 14 NSIDs, 10 rkeys, 11
+;;                               at:// URIs, both profile documents, the
+;;                               512-character rkey boundary, and a mutation
+;;                               control that accepts a dotless NSID
+;;   artifact diff               both sources emit byte-identical js apart from
+;;                               the filename and the two provenance digests
+;;
+;; NOT verified: the js and wasm ARTIFACTS are exercised only by the seven
+;; in-language tests, because the harness runs the whole suite in one 512-unit
+;; instance. The exhaustive table runs through KIR on the JVM, so a divergence
+;; between jvm-kir and the other two would show up as a compiler bug rather than
+;; here. `org-ietf-smtp`'s `bin/protocol_behaviour.cljs` is the pattern for
+;; closing that, and it is not written for this component.
+;;
+;; `.cljc` remains the oracle. Clojure-shaped twin: core.cljk.
+;;
+;; Compile / run (the CLI needs -M and an ABSOLUTE path):
+;;   kotoba -M test /abs/kotoba/atproto/core.kotoba --json
+
+(ns atproto.core
+  (:export [profile-collection post-collection follow-collection
+            did? collection? valid-rkey?
+            repo-uri-status repo-uri
+            uri-valid? uri-repo uri-collection uri-rkey
+            handle-from-did profile-record profile-write xrpc-url
+            test-did test-collection test-rkey test-uri-build
+            test-handle test-xrpc-url test-profile]))
+
+;; --- the collections the oracle names -------------------------------------
+
+(defn profile-collection [] :string "app.bsky.actor.profile")
+(defn post-collection [] "app.bsky.feed.post")
+(defn follow-collection [] "app.bsky.graph.follow")
+
+;; --- character classes ----------------------------------------------------
+;;
+;; There is no character type and no regex, so a class is a range test on a
+;; one-character substring. `string-code-point-at` gives the ordinal, which is
+;; what makes these ranges rather than 62-way `cond`s.
+
+(defn- code [s :string i :i64] :i64
+  (string-code-point-at s i))
+
+(defn- lower-alpha? [c :i64] :bool (and (>= c 97) (<= c 122)))
+(defn- upper-alpha? [c :i64] :bool (and (>= c 65) (<= c 90)))
+(defn- digit? [c :i64] :bool (and (>= c 48) (<= c 57)))
+(defn- alpha? [c :i64] :bool (or (lower-alpha? c) (upper-alpha? c)))
+(defn- lower-alnum? [c :i64] :bool (or (lower-alpha? c) (digit? c)))
+(defn- nsid-char? [c :i64] :bool (or (alpha? c) (or (digit? c) (= c 45))))
+
+;; --- did? -----------------------------------------------------------------
+;;
+;; The oracle: `^did:[a-z0-9]+:.+`. Prefix, a non-empty lower-case alphanumeric
+;; method, a colon, and at least one character of method-specific id. The `.+`
+;; is one or more of ANY character, so the id is not validated beyond being
+;; non-empty -- reproduced rather than tightened.
+
+(defn- method-end [s :string i :i64] :i64
+  (cond
+    (>= i (string-length s)) -1
+    (= (code s i) 58) i
+    (lower-alnum? (code s i)) (method-end s (+ i 1))
+    :else -1))
+
+(defn did? [s]
+  (and (>= (string-length s) 6)
+       (and (string=? (string-substring s 0 4) "did:")
+            (let [end (method-end s 4)]
+              (and (> end 4) (< (+ end 1) (string-length s)))))))
+
+;; --- collection? (NSID) ---------------------------------------------------
+;;
+;; The oracle: `^[a-zA-Z][a-zA-Z0-9-]*(\.[a-zA-Z0-9-]+)+$`. One alpha, then
+;; NSID characters, then AT LEAST ONE dot-separated non-empty segment. So
+;; "post" is invalid and "app.bsky.feed.post" is valid, which is exactly the
+;; pair the oracle test pins.
+
+(defn- segments-ok? [s :string i :i64 seg :i64 dots :i64] :bool
+  (cond
+    (>= i (string-length s)) (and (> dots 0) (> seg 0))
+    (= (code s i) 46) (and (> seg 0) (segments-ok? s (+ i 1) 0 (+ dots 1)))
+    (nsid-char? (code s i)) (segments-ok? s (+ i 1) (+ seg 1) dots)
+    :else false))
+
+(defn collection? [s]
+  (and (>= (string-length s) 1)
+       (and (alpha? (code s 0))
+            (segments-ok? s 1 1 0))))
+
+;; --- valid-rkey? ----------------------------------------------------------
+;;
+;; No scan: the oracle is a length bound and three substring tests, and
+;; `string-contains?` is a builtin that costs one unit at any length.
+
+(defn valid-rkey? [s]
+  (and (> (string-length s) 0)
+       (and (<= (string-length s) 512)
+            (and (not (string-contains? s "/"))
+                 (and (not (string-contains? s "#"))
+                      (not (string-contains? s "?")))))))
+
+;; --- repo-uri -------------------------------------------------------------
+;;
+;; The oracle throws three different `ex-info`s. The keyword carries the same
+;; three distinctions as data, and `repo-uri` answers "" unless every input
+;; passed -- a caller that ignores the status gets an empty string where it used
+;; to get an exception, which is a real behaviour change and the reason the
+;; status is exported.
+
+(defn repo-uri-status [repo collection rkey]
+  (cond
+    (not (did? repo)) :bad-repo
+    (not (collection? collection)) :bad-collection
+    (not (valid-rkey? rkey)) :bad-rkey
+    :else :ok))
+
+(defn repo-uri [repo collection rkey]
+  (if (= (repo-uri-status repo collection rkey) :ok)
+    (string-concat
+      (string-concat "at://" repo)
+      (string-concat (string-concat "/" collection) (string-concat "/" rkey)))
+    ""))
+
+;; --- parse-uri ------------------------------------------------------------
+;;
+;; The oracle: `^at://([^/]+)/([^/]+)/([^/?#]+)$`. Three fields, each non-empty,
+;; the last also free of `?` and `#`. Positional because the result is three
+;; strings; a document would be shape for its own sake.
+
+(defn- field-end [s :string i :i64] :i64
+  (cond
+    (>= i (string-length s)) (string-length s)
+    (= (code s i) 47) i
+    :else (field-end s (+ i 1))))
+
+(defn- after-scheme [s :string] :i64
+  (if (and (>= (string-length s) 5) (string=? (string-substring s 0 5) "at://"))
+    5
+    -1))
+
+(defn uri-repo [uri]
+  (let [from (after-scheme uri)]
+    (if (< from 0)
+      ""
+      (string-substring uri from (field-end uri from)))))
+
+(defn uri-collection [uri]
+  (let [from (after-scheme uri)]
+    (if (< from 0)
+      ""
+      (let [a (+ (field-end uri from) 1)]
+        (if (>= a (string-length uri))
+          ""
+          (string-substring uri a (field-end uri a)))))))
+
+(defn uri-rkey [uri]
+  (let [from (after-scheme uri)]
+    (if (< from 0)
+      ""
+      (let [a (+ (field-end uri from) 1)]
+        (if (>= a (string-length uri))
+          ""
+          (let [b (+ (field-end uri a) 1)]
+            (if (>= b (string-length uri))
+              ""
+              (string-substring uri b (string-length uri)))))))))
+
+;; The rkey field is `[^/?#]+`: a slash ENDS it in the oracle too, so a fourth
+;; segment makes the whole URI invalid rather than being ignored.
+;;
+;; ONE pass, not three accessor calls. Measured: asking `uri-repo`,
+;; `uri-collection` and `uri-rkey` each re-scanned from the start, and with the
+;; builder's own validation in the same test the suite passed 512 fuel units and
+;; died at `test-uri-roundtrip`. The accessors still recompute -- a function
+;; cannot return three strings -- but the predicate no longer pays for them.
+(defn- fields-ok? [s :string i :i64 seg :i64 slashes :i64] :bool
+  (cond
+    (>= i (string-length s)) (and (= slashes 2) (> seg 0))
+    (= (code s i) 47) (and (> seg 0)
+                           (and (< slashes 2) (fields-ok? s (+ i 1) 0 (+ slashes 1))))
+    (and (= slashes 2) (or (= (code s i) 63) (= (code s i) 35))) false
+    :else (fields-ok? s (+ i 1) (+ seg 1) slashes)))
+
+(defn uri-valid? [uri]
+  (let [from (after-scheme uri)]
+    (and (>= from 0) (fields-ok? uri from 0 0))))
+
+;; --- handle-from-did ------------------------------------------------------
+;;
+;; `did:web:` encodes a host with colons where the dots go. Anything else is
+;; returned unchanged, including a `did:plc:` -- the oracle does the same, and a
+;; plc DID is not a handle.
+
+(defn handle-from-did [did]
+  (if (and (>= (string-length did) 8)
+           (string=? (string-substring did 0 8) "did:web:"))
+    (string-replace-all (string-substring did 8 (string-length did)) ":" ".")
+    did))
+
+;; --- documents ------------------------------------------------------------
+;;
+;; Both profile shapes are documents on both sides. The oracle accepts
+;; `:displayName` OR `:display-name` and omits a key it was not given, which is
+;; what `present?` reproduces: an absent key and an empty string are different,
+;; and only the absent one is omitted.
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- present? [d :document k :keyword] :bool
+  (= (document-kind (dg d k)) :string))
+
+(defn- display-name [d :document] :string
+  (if (present? d :displayName) (ds d :displayName) (ds d :display-name)))
+
+(defn- has-display-name? [d :document] :bool
+  (or (present? d :displayName) (present? d :display-name)))
+
+(defn profile-record [profile]
+  (let [base (document-map :$type (document-string (profile-collection)))
+        with-name (if (has-display-name? profile)
+                    (document-assoc base :displayName
+                                    (document-string (display-name profile)))
+                    base)
+        with-desc (if (present? profile :description)
+                    (document-assoc with-name :description
+                                    (document-string (ds profile :description)))
+                    with-name)]
+    (if (present? profile :avatar)
+      (document-assoc with-desc :avatar (document-string (ds profile :avatar)))
+      with-desc)))
+
+(defn profile-write [repo profile]
+  (document-map :repo (document-string repo)
+                :collection (document-string (profile-collection))
+                :rkey (document-string "self")
+                :record (profile-record profile)))
+
+;; --- xrpc-url -------------------------------------------------------------
+;;
+;; The oracle strips a trailing slash with `#"/$"`, which replaces ONE. So
+;; "https://h//" keeps one slash on both sides.
+
+(defn xrpc-url [base nsid]
+  (let [trimmed (if (and (> (string-length base) 0)
+                         (= (code base (- (string-length base) 1)) 47))
+                  (string-substring base 0 (- (string-length base) 1))
+                  base)]
+    (string-concat trimmed (string-concat "/xrpc/" nsid))))
+
+;; --- tests ----------------------------------------------------------------
+;;
+;; `test-*` returns i64 1 on pass (the T9.3 harness contract) and these run on
+;; jvm-kir, js AND wasm. They are the three-target evidence that the component
+;; RUNS; the oracle comparison over a table is the JVM parity test, and it is
+;; where the parser and the status table are exercised.
+;;
+;; The split is a budget, measured. The harness runs the whole suite in ONE module
+;; instance with 512 fuel units charged per function entry, and a first version of
+;; this suite came to about 1522: `test-uri-status` alone cost 512 (five status
+;; calls, each running all three validators), `test-collection`, `test-uri-parse`
+;; and `test-uri-valid` 256 each. Every one of them returned 1 when run alone. So
+;; four moved out and `test-collection` kept two calls of five, leaving roughly
+;; 342 with headroom.
+
+(defn test-did []
+  (if (and (did? "did:web:aozora.app")
+           (and (did? "did:plc:abc123")
+                (and (not (did? "aozora.app"))
+                     (and (not (did? "did::x"))
+                          (not (did? "did:web:"))))))
+    1 0))
+
+(defn test-collection []
+  ;; Two calls: the pair the oracle's own test pins. Each NSID scan is a
+  ;; character pass, five of them cost 256 of the 512 units an instance has, and
+  ;; the full table (empty segment, leading digit, trailing dot) is in the JVM
+  ;; parity test where there is no such budget.
+  (if (and (collection? "app.bsky.feed.post") (not (collection? "post")))
+    1 0))
+
+(defn test-rkey []
+  (if (and (valid-rkey? "self")
+           (and (not (valid-rkey? "a/b"))
+                (and (not (valid-rkey? ""))
+                     (and (not (valid-rkey? "a#b")) (not (valid-rkey? "a?b"))))))
+    1 0))
+
+(defn test-uri-build []
+  (if (string=? (repo-uri "did:web:aozora.app" (post-collection) "abc")
+                "at://did:web:aozora.app/app.bsky.feed.post/abc")
+    1 0))
+
+(defn test-handle []
+  (if (and (string=? (handle-from-did "did:web:ooyake.etzhayyim.com")
+                     "ooyake.etzhayyim.com")
+           (and (string=? (handle-from-did "did:web:host:8443") "host.8443")
+                (string=? (handle-from-did "did:plc:abc") "did:plc:abc")))
+    1 0))
+
+(defn test-xrpc-url []
+  (if (and (string=? (xrpc-url "https://h" "a.b.c") "https://h/xrpc/a.b.c")
+           (and (string=? (xrpc-url "https://h/" "a.b.c") "https://h/xrpc/a.b.c")
+                (string=? (xrpc-url "" "a.b") "/xrpc/a.b")))
+    1 0))
+
+(defn test-profile []
+  (let [p (document-map :displayName (document-string "ooyake")
+                        :description (document-string "agent"))
+        w (profile-write "did:web:o.example" p)]
+    (if (and (string=? (ds w :rkey) "self")
+             (and (string=? (ds w :collection) (profile-collection))
+                  (and (string=? (ds (dg w :record) :displayName) "ooyake")
+                       (and (string=? (ds (dg w :record) :$type) (profile-collection))
+                            (not (present? (dg w :record) :avatar))))))
+      1 0)))

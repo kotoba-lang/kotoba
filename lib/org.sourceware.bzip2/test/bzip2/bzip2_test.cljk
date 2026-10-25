@@ -1,0 +1,242 @@
+(ns bzip2.bzip2-test
+  "Runtime-agnostic bzip2 suite: runs identically on the JVM and under nbb, with
+   no shell and no filesystem.
+
+   Real conformance lives here rather than only in the oracle suite, because the
+   recorded reference streams (`bzip2.fixtures`, produced by the `bzip2` binary)
+   let ClojureScript assert the same thing the JVM does. The oracle suite adds
+   what a recording cannot: our *output* fed back to the reference, swept across
+   every level."
+  (:require [kotoba.bytes :as kbytes] [bzip2.bits :as bits]
+            [bzip2.bwt :as bwt]
+            [bzip2.core :as bzip2]
+            [bzip2.crc :as crc]
+            [bzip2.fixtures :as fixtures]
+            [bzip2.huffman :as huff]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- b64->bytes [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff)
+                (kbytes/base64-decode-bytes ^String s))
+     :cljs (let [d (js/atob s)]
+             (mapv #(.charCodeAt d %) (range (.-length d))))))
+
+(defn- ascii [s]
+  #?(:clj (mapv int s)
+     ;; `(int "a")` is 0 in ClojureScript — `int` is `(bit-or x 0)` and a string
+     ;; coerces to 0. Compressing a vector of zeros while believing it to be text
+     ;; is a silent way to make a codec suite prove nothing.
+     :cljs (mapv #(.charCodeAt % 0) (seq s))))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))
+
+;; ---------------------------------------------------------------------------
+;; CRC-32/BZIP2 — not the CRC-32 in gzip or ZIP
+;; ---------------------------------------------------------------------------
+
+(deftest crc-matches-the-published-check-value
+  (testing "the CRC catalogue's check value for CRC-32/BZIP2"
+    (is (= 0xfc891918 (crc/crc32 (ascii "123456789")))))
+  (testing "and it is a different function from the reflected CRC-32"
+    ;; the reflected (gzip/ZIP/PNG) CRC-32 of the same input is 0xcbf43926
+    (is (not= 0xcbf43926 (crc/crc32 (ascii "123456789")))))
+  (testing "the combined CRC rotates, so block order matters"
+    (is (not= (crc/combine (crc/combine 0 111) 222)
+              (crc/combine (crc/combine 0 222) 111)))))
+
+;; ---------------------------------------------------------------------------
+;; Bit I/O — MSB-first, unlike DEFLATE
+;; ---------------------------------------------------------------------------
+
+(deftest bits-are-most-significant-first
+  (testing "a single byte is read from the top bit down"
+    (let [r (bits/reader [0x80])]
+      (is (= 1 (bits/read-bit r)))
+      (is (= 0 (bits/read-bit r)))))
+  (testing "multi-bit fields are big-endian"
+    (is (= 0x314 (bits/read-bits (bits/reader [0x31 0x40]) 12))))
+  (testing "write then read is a round trip, including the wide fields"
+    (let [w (bits/writer)]
+      (bits/write-bits! w 3 5)
+      (bits/write-u48! w 0x314159265359)
+      (bits/write-u32! w 4294967295)
+      (bits/write-bits! w 24 16777215)
+      (let [r (bits/reader (bits/finish! w))]
+        (is (= 5 (bits/read-bits r 3)))
+        (is (= 0x314159265359 (bits/read-u48 r)))
+        (is (= 4294967295 (bits/read-u32 r)))
+        (is (= 16777215 (bits/read-bits r 24))))))
+  (testing "reading past the end is :truncated, not garbage"
+    (is (= :truncated (reason-of #(bits/read-bits (bits/reader [0x00]) 9))))))
+
+;; ---------------------------------------------------------------------------
+;; Huffman
+;; ---------------------------------------------------------------------------
+
+(deftest huffman-round-trips-and-respects-the-ceiling
+  (testing "generated lengths stay inside the format's limit"
+    (let [skewed (into [1000000] (repeat 20 1))
+          lens (huff/code-lengths skewed 17)]
+      (is (<= (reduce max lens) 17))
+      (is (>= (reduce min lens) 1))
+      (testing "and the shortest code goes to the most frequent symbol"
+        (is (= (first lens) (reduce min lens))))))
+  (testing "codes are prefix-free"
+    (let [lens (huff/code-lengths [8 6 5 4 3 2 1 1] 17)
+          codes (huff/codes lens)
+          bitstrings (mapv (fn [c l] (loop [i (dec l) s ""]
+                                       (if (neg? i)
+                                         s
+                                         (recur (dec i)
+                                                (str s (bit-and (bit-shift-right c i) 1))))))
+                           codes lens)]
+      (doseq [a bitstrings b bitstrings
+              :when (and (not= a b) (<= (count a) (count b)))]
+        (is (not= a (subs b 0 (count a))) (str a " prefixes " b)))))
+  (testing "the delta-walk table encoding round-trips"
+    (let [lens [3 3 4 4 5 9 9 2 2 17]
+          w (bits/writer)]
+      (huff/write-lengths! w lens)
+      (is (= lens (huff/read-lengths (bits/reader (bits/finish! w)) (count lens))))))
+  (testing "a length outside 1..20 is rejected rather than mis-decoded"
+    (let [w (bits/writer)]
+      ;; start at 1 then walk down: 1 0 = increment, 1 1 = decrement
+      (bits/write-bits! w 5 1)
+      (bits/write-bits! w 2 3)
+      (is (= :bad-code-length
+             (reason-of #(huff/read-lengths (bits/reader (bits/finish! w)) 1)))))))
+
+;; ---------------------------------------------------------------------------
+;; Burrows-Wheeler
+;; ---------------------------------------------------------------------------
+
+(deftest bwt-round-trips-the-hard-shapes
+  (doseq [[name block]
+          {"empty" []
+           "single" [7]
+           "all-equal" (vec (repeat 40 3))
+           "period-two" (vec (take 41 (cycle [1 2])))
+           ;; the case that caught a real bug: fewer bytes than the byte values,
+           ;; which breaks a rank packing seeded with raw byte values
+           "short-with-spread-values" [7 7 7 7 251 9 9 9 9 41 251 7]
+           "sorted" (vec (range 60))
+           "reverse" (vec (reverse (range 60)))
+           "text" (ascii "the quick brown fox jumps over the lazy dog")}]
+    (testing name
+      (let [{:keys [last-column orig-ptr]} (bwt/forward block)]
+        (is (= (count block) (count last-column)))
+        (is (= block (bwt/inverse last-column orig-ptr))))))
+  (testing "a pointer outside the block is rejected"
+    (is (= :bad-orig-ptr (reason-of #(bwt/inverse [1 2 3] 3))))
+    (is (= :bad-orig-ptr (reason-of #(bwt/inverse [1 2 3] -1))))))
+
+;; ---------------------------------------------------------------------------
+;; Reading what the reference wrote
+;; ---------------------------------------------------------------------------
+
+(deftest decodes-reference-streams
+  (doseq [[name {:keys [data bz2]}] (sort fixtures/streams)]
+    (testing name
+      (is (= (b64->bytes data) (bzip2/decompress (b64->bytes bz2)))))))
+
+(deftest decodes-a-multi-block-reference-stream
+  (let [{:keys [unit times bz2]} (get fixtures/repeated "multiblock-1")
+        expected (vec (mapcat identity (repeat times (ascii unit))))]
+    (is (= 250000 (count expected)))
+    (testing "level 1 means 100,000-byte blocks, so this is three blocks"
+      (is (= expected (bzip2/decompress (b64->bytes bz2)))))))
+
+(deftest decodes-concatenated-streams
+  ;; `cat a.bz2 b.bz2 | bunzip2` works; stopping at the first end-of-stream
+  ;; magic would truncate silently
+  (let [{:keys [data bz2]} (get fixtures/streams "concat")]
+    (is (= (ascii "first\nsecond\n") (b64->bytes data)))
+    (is (= (b64->bytes data) (bzip2/decompress (b64->bytes bz2))))))
+
+;; ---------------------------------------------------------------------------
+;; Writing what the reference can read (size proxy; the oracle suite feeds it back)
+;; ---------------------------------------------------------------------------
+
+(deftest our-output-round-trips-and-is-not-bigger-than-the-reference
+  (doseq [[name {:keys [data bz2]}] (sort fixtures/streams)
+          :when (not= name "concat")
+          :let [plain (b64->bytes data)
+                level (#?(:clj Integer/parseInt :cljs js/parseInt) (subs name (inc (.lastIndexOf name "-"))))
+                ours (bzip2/compress plain {:level level})]]
+    (testing name
+      (is (= plain (bzip2/decompress ours)))
+      (testing "within 10% of what the reference produced for the same input"
+        (is (<= (count ours) (* 1.1 (count (b64->bytes bz2))))
+            (str name " ours=" (count ours) " reference=" (count (b64->bytes bz2))))))))
+
+(deftest round-trips-the-shapes-that-break-encoders
+  (doseq [level [1 9]
+          [name data]
+          {"empty" []
+           "one" [0]
+           "quad" [65 65 65 65]
+           "run-255" (vec (repeat 255 3))
+           "run-256" (vec (repeat 256 3))
+           "run-259" (vec (repeat 259 3))
+           "two-runs-across-the-255-split" (into (vec (repeat 300 7)) (vec (repeat 5 9)))
+           "every-byte-value" (vec (range 256))
+           "one-value-only" (vec (repeat 5000 42))
+           "two-values" (vec (map #(if (even? (quot % 7)) 1 254) (range 3000)))
+           "text" (vec (mapcat identity (repeat 60 (ascii "the quick brown fox. "))))
+           "pseudo-random" (vec (map #(mod (* 1103515245 (inc %)) 251) (range 3000)))}]
+    (testing (str name " at level " level)
+      (let [ours (bzip2/compress data {:level level})]
+        (is (bzip2/bzip2? ours))
+        (is (= (vec data) (bzip2/decompress ours)))))))
+
+;; ---------------------------------------------------------------------------
+;; Refusals
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-what-it-cannot-honestly-read
+  (testing "not a bzip2 stream"
+    (is (= :not-bzip2 (reason-of #(bzip2/decompress (ascii "not a stream at all")))))
+    (is (false? (bzip2/bzip2? (ascii "nope")))))
+  (testing "a level digit outside 1..9"
+    (is (= :bad-level (reason-of #(bzip2/decompress (into (ascii "BZh") [0x30]))))))
+  (testing "truncated input"
+    (is (= :truncated (reason-of #(bzip2/decompress []))))
+    (let [full (b64->bytes (:bz2 (get fixtures/streams "text-1")))]
+      (is (contains? #{:truncated :bad-huffman-code :bad-block-magic}
+                     (reason-of #(bzip2/decompress (subvec full 0 20)))))))
+  (testing "a randomised block is refused by name rather than decoded wrongly"
+    ;; The flag sits at bit 112: 32 bits of BZh<level>, a 48-bit block magic and
+    ;; a 32-bit CRC — exactly byte 14, bit 7.
+    (let [full (b64->bytes (:bz2 (get fixtures/streams "text-1")))
+          flipped (assoc full 14 (bit-or (nth full 14) 0x80))]
+      (is (= :randomised-block (reason-of #(bzip2/decompress flipped))))))
+  (testing "a corrupt payload is detected rather than returning wrong bytes"
+    ;; Which check fires depends on where the flipped bit lands — a CRC
+    ;; mismatch, an unmatchable code, a pointer past the block, or a mangled
+    ;; end-of-stream magic. What must never happen is a clean return of
+    ;; something other than the original bytes, so every byte position is tried.
+    (let [full (b64->bytes (:bz2 (get fixtures/streams "text-9")))
+          plain (b64->bytes (:data (get fixtures/streams "text-9")))
+          detected #{:bad-crc :bad-huffman-code :bad-symbol :truncated :bad-orig-ptr
+                     :bad-code-length :bad-selector :block-overflow :bad-block-magic
+                     :bad-run-length :empty-symbol-map :bad-group-count :randomised-block
+                     :not-bzip2 :bad-level :output-too-large}]
+      (doseq [i (range 8 (count full))
+              :let [corrupt (assoc full i (bit-xor (nth full i) 0x40))
+                    r (try {:bytes (bzip2/decompress corrupt)}
+                           (catch #?(:clj Exception :cljs :default) e
+                             {:reason (:reason (ex-data e))}))]]
+        (is (if (contains? r :reason)
+              (contains? detected (:reason r))
+              (= plain (:bytes r)))
+            (str "flipping bit 6 of byte " i " was neither detected nor harmless")))))
+  (testing "an output ceiling bounds a hostile input"
+    (let [{:keys [bz2]} (get fixtures/repeated "multiblock-1")]
+      (is (= :output-too-large
+             (reason-of #(bzip2/decompress (b64->bytes bz2) {:max-output 1000}))))))
+  (testing "a level outside 1..9 is refused on the way in too"
+    (is (= :bad-level (reason-of #(bzip2/compress [1 2 3] {:level 0}))))
+    (is (= :bad-level (reason-of #(bzip2/compress [1 2 3] {:level 10}))))))

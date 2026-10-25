@@ -1,0 +1,287 @@
+(ns biscuit.kotoba-test
+  (:require [authority.scope :as scope]
+            [biscuit.authority :as ba]
+            [biscuit.keys :as k]
+            [biscuit.kotoba :as bk]
+            [biscuit.token :as bt]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def root (k/keypair "root"))
+(def k1 (k/keypair "one"))
+(def kinds #{:graph-read :graph-write :host/http :infer})
+
+(defn- tok [facts] (bt/authority {:facts facts :next-public-key (:public k1)
+                                  :root-private-key (:private root) :sign-fn k/sign-fn}))
+
+(deftest facts-become-grants-not-capabilities
+  (let [d (bk/->delegated (tok '[[cap "graph-read" "kotoba://graph/acme"]
+                                 [cap "graph-read" "kotoba://graph/beta"]
+                                 [before "2026-09-01T00:00:00Z"]])
+                          kinds)
+        g (first (:grants d))]
+    (is (= 1 (count (:grants d))))
+    (is (= :graph-read (:grant/kind g)))
+    (is (= ["kotoba://graph/acme" "kotoba://graph/beta"] (:grant/resources g)))
+    (is (= "2026-09-01T00:00:00Z" (:grant/expires g)))
+    (testing "grants, never :cap/* — the intersection step is not optional"
+      (is (nil? (:cap/kind g))))))
+
+(deftest the-authority-block-binds-the-holder
+  (let [d (bk/->delegated (tok '[[holder "did:key:zAlice"]
+                                 [cap "graph-read" "kotoba://graph/acme"]])
+                          kinds)]
+    (is (= "did:key:zAlice" (:grant/holder d)))))
+
+(deftest a-kind-outside-the-closed-set-is-rejected-not-ignored
+  (let [d (bk/->delegated (tok '[[cap "graph-read" "kotoba://graph/acme"]
+                                 [cap "kernel/format-disk" "/dev/sda"]])
+                          kinds)]
+    (is (= 1 (count (:grants d))))
+    (is (= [{:kind :kernel/format-disk :resource "/dev/sda"}] (:grant/rejected d)))
+    (testing "the failure is toward LESS authority, and it is visible"
+      (is (not-any? #(= :kernel/format-disk (:grant/kind %)) (:grants d))))))
+
+(deftest a-later-block-cannot-introduce-a-kind
+  (let [t (-> (tok '[[cap "graph-read" "kotoba://graph/acme"]])
+              (bt/append {:facts '[[cap "graph-write" "kotoba://graph/acme"]
+                                   [cap "graph-read" "kotoba://graph/acme"]]
+                          :next-public-key (:public k1)
+                          :private-key (:private k1) :sign-fn k/sign-fn}))
+        d (bk/->delegated t kinds)]
+    (testing ":scope-attenuation-only is the only thing this can express"
+      (is (= [:graph-read] (mapv :grant/kind (:grants d)))))))
+
+(deftest a-later-block-narrows-resources
+  (let [t (-> (tok '[[cap "graph-read" "kotoba://graph/acme"]
+                     [cap "graph-read" "kotoba://graph/beta"]])
+              (bt/append {:facts '[[cap "graph-read" "kotoba://graph/acme"]]
+                          :next-public-key (:public k1)
+                          :private-key (:private k1) :sign-fn k/sign-fn}))]
+    (is (= ["kotoba://graph/acme"] (:grant/resources (first (:grants (bk/->delegated t kinds))))))))
+
+(deftest a-block-that-drops-a-kind-drops-it
+  (let [t (-> (tok '[[cap "graph-read" "kotoba://graph/acme"]
+                     [cap "host/http" "https://example.com"]])
+              (bt/append {:facts '[[cap "graph-read" "kotoba://graph/acme"]]
+                          :next-public-key (:public k1)
+                          :private-key (:private k1) :sign-fn k/sign-fn}))]
+    (is (= [:graph-read] (mapv :grant/kind (:grants (bk/->delegated t kinds)))))))
+
+(deftest delegating-nothing-denies-everything
+  (testing ":missing-grant :deny, through the ordinary path"
+    (is (true? (bk/missing-grant? (bk/->delegated (tok '[[user "alice"]]) kinds))))
+    (is (false? (bk/missing-grant? (bk/->delegated (tok '[[cap "infer" "murakumo-main"]]) kinds))))))
+
+(deftest the-tightest-expiry-wins-across-blocks
+  (let [t (-> (tok '[[cap "infer" "murakumo-main"] [before "2026-09-01T00:00:00Z"]])
+              (bt/append {:facts '[[cap "infer" "murakumo-main"] [before "2027-01-01T00:00:00Z"]]
+                          :next-public-key (:public k1)
+                          :private-key (:private k1) :sign-fn k/sign-fn}))]
+    (is (= "2026-09-01T00:00:00Z" (:grant/expires (first (:grants (bk/->delegated t kinds))))))))
+
+;; ── narrowing is the lattice's, not string identity's ────────────────────────
+
+(defn- append [t facts]
+  (bt/append t {:facts facts :next-public-key (:public k1)
+                :private-key (:private k1) :sign-fn k/sign-fn}))
+
+(defn- resources [t] (:grant/resources (first (:grants (bk/->delegated t kinds)))))
+
+(deftest a-wildcard-narrowed-to-a-member-is-that-member
+  (testing "the act Biscuit is chosen for, which set/intersection destroyed"
+    ;; "kotoba://graph/*" INTERSECT "kotoba://graph/g1" is the empty set, so
+    ;; the previous fold turned an ordinary attenuation into a token reaching
+    ;; nothing. Found 2026-08-31 by a consumer that had to fold per block
+    ;; against authority.chain to get a correct answer out of this namespace.
+    (let [t (-> (tok '[[cap "graph-read" "kotoba://graph/*"]])
+                (append '[[cap "graph-read" "kotoba://graph/g1"]]))]
+      (is (= ["kotoba://graph/g1"] (resources t)))))
+  (testing "and it still cannot widen"
+    (let [t (-> (tok '[[cap "graph-read" "kotoba://graph/g1"]])
+                (append '[[cap "graph-read" "kotoba://graph/*"]]))]
+      (is (= ["kotoba://graph/g1"] (resources t))
+          "a later block asking for the namespace gets only what it was given")))
+  (testing "and a sibling it was never granted is not reachable"
+    (let [t (-> (tok '[[cap "graph-read" "kotoba://graph/g1"]])
+                (append '[[cap "graph-read" "kotoba://graph/g2"]]))]
+      (is (nil? (resources t))
+          "two incomparable scopes have no common lower bound, so the kind drops"))))
+
+(deftest an-opaque-resource-still-narrows-by-identity
+  (testing "`:cap/resource` is not always a scope — a model alias has only identity"
+    (let [t (-> (tok '[[cap "infer" "murakumo-main"] [cap "infer" "other-model"]])
+                (append '[[cap "infer" "murakumo-main"]]))]
+      (is (= ["murakumo-main"] (resources t)))))
+  (testing "and a name that parses on only one side relates to nothing"
+    (let [t (-> (tok '[[cap "infer" "kotoba://model/x"]])
+                (append '[[cap "infer" "murakumo-main"]]))]
+      (is (nil? (resources t))
+          "dropping is the safe direction; it must not fall back to string equality"))))
+
+(deftest this-library-holds-one-answer-to-what-two-blocks-confer
+  (testing "->delegated and ->grant narrow the same scopes the same way"
+    ;; biscuit.authority/->grant has always folded with authority.grant/meet.
+    ;; When ->delegated intersected strings instead, this library carried TWO
+    ;; answers to `what do two blocks jointly confer` and only one of them was
+    ;; the lattice -- the exact duplication `authority` exists to prevent.
+    (doseq [[outer inner] [["kotoba://graph/*" "kotoba://graph/g1"]
+                           ["kotoba://graph/g1" "kotoba://graph/*"]
+                           ["kotoba://graph/g1" "kotoba://graph/g1"]
+                           ["kotoba://graph/g1" "kotoba://graph/g2"]]]
+      (let [delegated (-> (tok [['cap "graph-read" outer]])
+                          (append [['cap "graph-read" inner]]))
+            ;; ->grant folds the token's blocks onto a BASE, so `outer` is the
+            ;; base and the single block carries `inner`. Handing it an empty
+            ;; base would meet everything down to nothing and the comparison
+            ;; would pass for the wrong reason.
+            scoped (tok [['scope inner]])
+            via-delegated (set (resources delegated))
+            via-grant (set (keep scope/render
+                                 (:grant/scopes (ba/->grant scoped {:scopes [outer]}))))]
+        (is (= via-grant via-delegated)
+            (str "the two folds disagree on " outer " then " inner))))))
+
+;; ── one scope decision, for every consumer ──────────────────────────────────
+
+(def ^:private read-kinds #{:graph-read})
+(def ^:private g1 "kotoba://graph/g1")
+(def ^:private g2 "kotoba://graph/g2")
+(def ^:private star "kotoba://graph/*")
+
+(defn- model
+  "A token model in the shape `biscuit.wire/token->model` produces. No crypto:
+  these cases are about what facts MEAN once a signature is off them, which is
+  why `authorize` takes `:verified?` separately."
+  [& blocks]
+  {:biscuit/blocks (vec (for [facts blocks] {:block/facts (vec facts)}))})
+
+(defn- decide [t requested now & {:keys [verified?] :or {verified? true}}]
+  (bk/authorize {:token-model t :kinds read-kinds :verified? verified?
+                 :requested requested :now now}))
+
+(def ^:private whole
+  (model [['cap "graph-read" star] ['before "2026-09-01T00:00:00Z"]
+          ['holder "did:key:zBuyer"]]))
+
+(deftest authorize-grants-what-the-token-covers
+  (let [d (decide whole g1 "2026-08-31T00:00:00Z")]
+    (is (true? (:pass/allowed? d)))
+    (is (= :pass/granted (:pass/reason d)))
+    (is (= "did:key:zBuyer" (:pass/holder d)))
+    (is (true? (:pass/allowed? (decide whole g2 "2026-08-31T00:00:00Z")))
+        "the wildcard reaches a second member too")))
+
+(deftest unverified-is-neither-a-grant-nor-an-ordinary-denial
+  (testing "the same facts, differing only in whether a signature was checked"
+    (let [ok (decide whole g1 "2026-08-31T00:00:00Z" :verified? true)
+          no (decide whole g1 "2026-08-31T00:00:00Z" :verified? false)]
+      (is (true? (:pass/allowed? ok)))
+      (is (false? (:pass/allowed? no)))
+      (is (= :pass/unverified (:pass/reason no)))
+      (is (not= (:pass/reason ok) (:pass/reason no)))))
+  (testing "required, not defaulted, and only the literal true"
+    (is (= :pass/unverified (:pass/reason (bk/authorize {:token-model whole
+                                                         :kinds read-kinds
+                                                         :requested g1
+                                                         :now "2026-08-31T00:00:00Z"}))))
+    (is (= :pass/unverified (:pass/reason (decide whole g1 "2026-08-31T00:00:00Z"
+                                                  :verified? "yes"))))))
+
+(deftest authorize-distinguishes-why-it-refused
+  (testing "expired: the token is real, the window is not"
+    (let [d (decide whole g1 "2026-09-02T00:00:00Z")]
+      (is (= :expired-or-no-trusted-time (:pass/reason d)))
+      (is (true? (bk/retry-with-payment? (:pass/reason d))))))
+  (testing "out of scope: real, and does not reach this"
+    (let [narrow (model [['cap "graph-read" g1] ['before "2026-09-01T00:00:00Z"]])
+          d (decide narrow g2 "2026-08-31T00:00:00Z")]
+      (is (= :out-of-scope (:pass/reason d)))
+      (is (true? (bk/retry-with-payment? (:pass/reason d))))))
+  (testing "a kind this caller does not accept confers nothing, visibly, and a
+            new grant would not help"
+    (let [wrong (model [['cap "graph-write" star] ['before "2026-09-01T00:00:00Z"]])
+          d (decide wrong g1 "2026-08-31T00:00:00Z")]
+      (is (= :pass/no-grant (:pass/reason d)))
+      (is (= [{:kind :graph-write :resource star}] (:pass/rejected d)))
+      (is (false? (bk/retry-with-payment? (:pass/reason d)))))))
+
+(deftest authorize-folds-through-the-lattice-not-string-identity
+  (testing "narrowing a wildcard is the ordinary act and must not fold to nothing"
+    (let [narrowed (model [['cap "graph-read" star] ['before "2026-09-01T00:00:00Z"]]
+                          [['cap "graph-read" g1]])]
+      (is (true? (:pass/allowed? (decide narrowed g1 "2026-08-31T00:00:00Z"))))
+      (is (false? (:pass/allowed? (decide narrowed g2 "2026-08-31T00:00:00Z"))))))
+  (testing "and a later block cannot widen"
+    (let [widened (model [['cap "graph-read" g1] ['before "2026-09-01T00:00:00Z"]]
+                         [['cap "graph-read" star]])]
+      (is (false? (:pass/allowed? (decide widened g2 "2026-08-31T00:00:00Z"))))))
+  (testing "a later block may shorten the bound, and the shorter one binds"
+    (let [short (model [['cap "graph-read" star] ['before "2026-09-01T00:00:00Z"]]
+                       [['before "2026-08-31T00:00:00Z"]])]
+      (is (true? (:pass/allowed? (decide short g1 "2026-08-30T00:00:00Z"))))
+      (is (false? (:pass/allowed? (decide short g1 "2026-08-31T12:00:00Z")))))))
+
+(deftest an-unparseable-resource-grants-nothing-including-itself
+  (let [junk (model [['cap "graph-read" "not-a-scope"] ['before "2026-09-01T00:00:00Z"]])]
+    (is (false? (:pass/allowed? (decide junk g1 "2026-08-31T00:00:00Z"))))
+    (is (false? (:pass/allowed? (decide junk "not-a-scope" "2026-08-31T00:00:00Z"))))))
+
+;; ── holder across blocks: attenuation may only narrow ─────────────────────────
+;;
+;; Until 2026-09-24 `->delegated` read `holder` from the authority block only.
+;; That was wrong in both directions: a bearer token narrowed to one holder by a
+;; later block stayed a bearer token, and a token addressed to alice that a later
+;; block re-addressed to mallory stayed alice's -- so the parent could keep using
+;; what it delegated. The consumer that found it (cloud-kotoba
+;; kotoba-cloud-storage) had to refuse every later holder fact by name.
+
+(defn- attenuate [t facts]
+  (bt/append t {:facts facts :next-public-key (:public k1)
+                :private-key (:private k1) :sign-fn k/sign-fn}))
+
+(deftest a-later-block-may-address-a-bearer-token
+  (testing "adding a holder to a token that named none is narrowing"
+    (let [d (bk/->delegated (attenuate (tok '[[cap "graph-read" "kotoba://graph/acme"]])
+                                       '[[holder "did:key:zBob"]])
+                            kinds)]
+      (is (= "did:key:zBob" (:grant/holder d)))
+      (is (= 1 (count (:grants d))) "and the grant it narrows survives")
+      (is (nil? (:grant/refused d))))))
+
+(deftest repeating-the-same-holder-keeps-the-binding
+  (let [d (bk/->delegated (attenuate (tok '[[holder "did:key:zAlice"]
+                                            [cap "graph-read" "kotoba://graph/acme"]])
+                                     '[[holder "did:key:zAlice"]])
+                          kinds)]
+    (is (= "did:key:zAlice" (:grant/holder d)))
+    (is (= 1 (count (:grants d))))
+    (is (nil? (:grant/refused d)))))
+
+(deftest a-later-block-cannot-re-address-a-token
+  (testing "a different later holder is refused by name, and confers nothing --
+            never the later holder, and never the earlier one either"
+    (let [d (bk/->delegated (attenuate (tok '[[holder "did:key:zAlice"]
+                                              [cap "graph-read" "kotoba://graph/acme"]])
+                                       '[[holder "did:key:zMallory"]])
+                            kinds)]
+      (is (= :holder-readdressed (:grant/refused d)))
+      (is (nil? (:grant/holder d)))
+      (is (= [] (:grants d)))
+      (is (bk/missing-grant? d)))))
+
+(deftest one-block-naming-two-holders-binds-no-one
+  (let [d (bk/->delegated (tok '[[holder "did:key:zAlice"] [holder "did:key:zMallory"]
+                                 [cap "graph-read" "kotoba://graph/acme"]])
+                          kinds)]
+    (is (= :holder-ambiguous (:grant/refused d)))
+    (is (nil? (:grant/holder d)))
+    (is (= [] (:grants d)))))
+
+(deftest authorize-names-a-re-addressed-token
+  (let [t (attenuate (tok '[[holder "did:key:zAlice"]
+                            [cap "graph-read" "kotoba://graph/acme"]])
+                     '[[holder "did:key:zMallory"]])]
+    (is (= :holder-readdressed
+           (:pass/reason (bk/authorize {:token-model t :kinds kinds :verified? true
+                                        :requested "kotoba://graph/acme"
+                                        :now "2026-08-19T00:00:00Z"}))))))
