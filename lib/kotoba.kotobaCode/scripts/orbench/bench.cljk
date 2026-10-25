@@ -1,0 +1,726 @@
+#!/usr/bin/env -S npx --no-install nbb
+;; orbench — can a free OpenRouter model port a Clojure decision core to .kotoba?
+;;
+;; The grade is not a judge model. It is the real compiler:
+;;   1. `kotoba -M check`   — does it compile at all
+;;   2. `kotoba -M inspect` — are the exports/param-types the requested interface
+;;   3. `kotoba -M test`    — does the battery pass on :jvm-kir AND :js AND :wasm
+;;   4. `kotoba -M compile --target aarch64-macos` — is it native-qualified
+;;
+;; `validate` proves the gate discriminates in both directions before any model
+;; is called: every battery must pass on the landed reference and must fail on a
+;; one-token mutation of it. A battery that cannot fail is not measuring.
+
+(ns orbench
+  (:require ["node:child_process" :as cp]
+            ["node:fs" :as fs]
+            ["node:path" :as path]
+            [kotoba.lang.edn :as edn]
+            [kotoba.lang.text :as str]))
+
+;; Every path is injected. A harness that only runs on the machine that wrote it
+;; has not been landed, it has been filed.
+(def root (or js/process.env.ORBENCH_ROOT
+              (throw (js/Error. "set ORBENCH_ROOT to the west superproject root"))))
+(def kotoba-bin (or js/process.env.KOTOBA_BIN
+                    (str root "/orgs/kotoba-lang/compiler/bin/kotoba")))
+;; Where `:reference` paths in tasks.edn resolve from. The held-out ports live in
+;; kotoba-lang/murakumo; a different corpus only has to set this.
+(def fixtures (or js/process.env.ORBENCH_FIXTURES
+                  (str root "/orgs/kotoba-lang/murakumo")))
+;; argv[1] is the nbb binary under npx, not this script — take the dir from the
+;; environment or the cwd instead of guessing it from argv.
+(def here (or js/process.env.ORBENCH_DIR (js/process.cwd)))
+(def work (path/join here "work"))
+(def tasks (edn/read-string (fs/readFileSync (path/join here "tasks.edn") "utf8")))
+(def brief (fs/readFileSync (path/join here "brief.md") "utf8"))
+
+(defn slug [s] (str/replace s #"[^a-zA-Z0-9]+" "-"))
+
+(defn sh
+  "Run the kotoba CLI. Absolute paths only — bin/kotoba chdirs to its own repo
+  root, so a relative path silently becomes `input could not be read`."
+  [args]
+  (let [r (cp/spawnSync kotoba-bin (clj->js args)
+                        #js {:encoding "utf8" :maxBuffer 64000000})]
+    {:code (.-status r) :out (or (.-stdout r) "") :err (or (.-stderr r) "")}))
+
+(defn last-edn
+  "The CLI prints one EDN map. Success goes to stdout, but `:kotoba.cli-error/v1`
+  goes to STDERR — reading only stdout turned every rejected file into a silent
+  nil, which the gate then scored the same as a passing one."
+  [s]
+  (some->> (str/split-lines (str/trim (or s "")))
+           (filter #(str/starts-with? (str/trim %) "{"))
+           last
+           (#(try (edn/read-string %) (catch :default _ nil)))))
+
+(defn cli
+  "One CLI call -> its EDN report, reading both streams. `::unreadable` when the
+  CLI produced no parseable report at all, so that 'could not measure' can never
+  be scored as 'measured and false'."
+  [args]
+  (let [r (sh args)]
+    (or (last-edn (str (:out r) "\n" (:err r)))
+        {:ok false :error ::unreadable
+         :message (str/join " " (take-last 3 (str/split-lines (str/trim (:err r)))))})))
+
+;; ── gate ────────────────────────────────────────────────────────────────
+
+(defn battery-names [battery]
+  (map second (re-seq #"\(defn\s+(test-[^\s\[]+)" battery)))
+
+(defn splice
+  "Append the battery and widen the :export vector to cover it."
+  [src battery]
+  (let [names (str/join " " (battery-names battery))]
+    (if-let [m (re-find #"\(:export\s+\[([^\]]*)\]\)" src)]
+      (str (str/replace-first src (first m)
+                              (str "(:export [" (str/trim (second m)) " " names "])"))
+           "\n\n" battery "\n")
+      (str src "\n\n" battery "\n"))))
+
+(defn write-tmp [name src]
+  (fs/mkdirSync work #js {:recursive true})
+  (let [p (path/join work name)] (fs/writeFileSync p src) p))
+
+(defn iface-diff
+  "Exports must be exactly the requested set, with the requested arities and
+  result types. A module that merely *defines* a name has not exported it — the
+  battery calls it from inside the module and cannot tell the difference, so
+  this is the only gate that can."
+  [inspect want]
+  (let [got (into {} (map (juxt :name (juxt :arity :result)) (:exports inspect)))]
+    (vec (keep (fn [[n arity result]]
+                 (when-not (= [arity result] (get got n))
+                   (if-let [g (get got n)]
+                     (str n ": exported as arity " (first g) " -> " (second g)
+                          ", the interface asks for arity " arity " -> " result)
+                     (str n ": not exported"))))
+               want))))
+
+(defn iface-ok? [inspect want] (empty? (iface-diff inspect want)))
+
+(defn quick-grade
+  "The two gates the agent loop iterates against: does it compile, and does the
+  battery pass. `inspect`/native are deferred to `final-grade` so that a failing
+  round costs one CLI call, not four."
+  [task src]
+  (let [id (name (:id task))
+        p (write-tmp (str id ".kotoba") src)
+        ;; `inspect` has to compile before it can report an interface, so it
+        ;; subsumes `check` — running both cost a whole JVM start per round for
+        ;; an answer already in hand.
+        insp (cli ["-M" "inspect" p])]
+    (if-not (= :kotoba.interface/v1 (:format insp))
+      {:compiles false
+       :diag (or (get-in insp [:diagnostic :code]) (:error insp))
+       :message (:message insp)
+       :span (get-in insp [:diagnostic :span])
+       :path p}
+      (let [tp (write-tmp (str id "-test.kotoba") (splice src (:battery task)))
+            tst (cli ["-M" "test" tp "--json"])]
+        {:compiles true
+         :path p
+         :iface-diff (iface-diff insp (:want task))
+         :interface (iface-ok? insp (:want task))
+         :exports (mapv (juxt :name :arity :result) (:exports insp))
+         ;; the battery only counts when the runner actually produced a report
+         :tests-ok (if (= ::unreadable (:error tst)) ::unmeasured (boolean (:ok tst)))
+         :test-diag (or (get-in tst [:diagnostic :code]) (:error tst))
+         :test-message (:message tst)
+         :failed (mapv (comp str :test) (:failed tst))
+         :per-target (into {} (map (fn [[k v]] [k (count (remove :ok v))]) (:results tst)))}))))
+
+(defn final-grade [task g]
+  (if-not (:compiles g)
+    g
+    (let [nat (cli ["-M" "compile" (:path g) "--target" "aarch64-macos"
+                    "--output" (str (:path g) ".kexe")])]
+      (assoc g :native (boolean (:ok nat))))))
+
+(defn grade [task src] (final-grade task (quick-grade task src)))
+
+;; ── agent loop ─────────────────────────────────────────────────────────
+
+(declare prompt-for extract call-model sleep)
+
+(defn source-line [src span]
+  (when-let [l (:line span)]
+    (nth (str/split-lines src) (dec l) nil)))
+
+(defn form-at
+  "The whole `(defn <name> ...)` form, paren-balanced and string-aware. Selecting
+  by line instead cut every multi-line assertion down to its signature, which is
+  not something a model can act on."
+  [src name]
+  (when-let [start (str/index-of src (str "(defn " name " "))]
+    (loop [i start depth 0 in-str? false esc? false]
+      (if (>= i (count src))
+        (subs src start)
+        (let [c (nth src i)]
+          (cond
+            esc? (recur (inc i) depth in-str? false)
+            (and in-str? (= c \\)) (recur (inc i) depth true true)
+            (= c \") (recur (inc i) depth (not in-str?) false)
+            in-str? (recur (inc i) depth true false)
+            (= c \() (recur (inc i) (inc depth) false false)
+            (= c \)) (if (= 1 depth)
+                       (subs src start (inc i))
+                       (recur (inc i) (dec depth) false false))
+            :else (recur (inc i) depth false false)))))))
+
+(defn feedback
+  "What a developer would actually see after running the toolchain: the
+  compiler's own diagnostic, or the assertions that failed. Nothing about the
+  held-out reference is disclosed."
+  [task src g]
+  (cond
+    (not (:compiles g))
+    (str "`kotoba -M check` rejected it.\n\n"
+         "  " (:message g) "\n"
+         (when-let [c (:diag g)] (str "  code: " c "\n"))
+         (when-let [l (source-line src (:span g))]
+           (str "  at line " (:line (:span g)) ": " (str/trim l) "\n"))
+         "\nFix that and reply with the whole corrected file in one ```clojure block.")
+
+    (seq (:iface-diff g))
+    (str "It compiled, but the module does not expose the interface that was asked for.\n"
+         "Defining a name is not exporting it — everything in the `(:export [...])`\n"
+         "vector is part of the contract:\n\n  "
+         (str/join "\n  " (:iface-diff g))
+         "\n\nFix that and reply with the whole corrected file in one ```clojure block.")
+
+    (= ::unmeasured (:tests-ok g))
+    "The test runner produced no report at all. Reply with the whole file again in one ```clojure block."
+
+    (not (:tests-ok g))
+    (let [names (distinct (:failed g))
+          lines (keep #(form-at (:battery task) %) names)]
+      (str "It compiled, but " (count names) " assertion(s) failed"
+           (when-let [d (:test-diag g)] (str " (" d ")"))
+           ":\n\n" (str/join "\n" lines)
+           "\n\nThese are run on :jvm-kir, :js and :wasm. "
+           "Fix the logic and reply with the whole corrected file in one ```clojure block."))))
+
+(defn budget
+  "Requests are the scarce resource on the free tier, not tokens. One shared
+  counter across the whole run; when it runs out the run stops and says so
+  rather than quietly shortening every loop."
+  [n] (atom {:left n :spent 0}))
+
+(defn agent-run
+  "One (model, task) episode: up to `max-rounds` model calls, each one fed the
+  real toolchain output from the previous."
+  [model t max-rounds b]
+  (letfn [(step [round history src]
+            (if (or (> round max-rounds) (<= (:left @b) 0))
+              (js/Promise.resolve
+               {:model model :task (:id t) :rounds (dec round) :history history
+                :stopped (if (<= (:left @b) 0) :request-budget :max-rounds)})
+              (let [msgs (if (seq history)
+                           history
+                           [{:role "user" :content (prompt-for t)}])]
+                (swap! b #(-> % (update :left dec) (update :spent inc)))
+                (.then (call-model model msgs)
+                       (fn [{:keys [status ms body headers error]}]
+                         (if (not= 200 status)
+                           (js/Promise.resolve
+                            {:model model :task (:id t) :rounds (dec round) :history history
+                             ;; a turn never granted is not a capability result
+                             :stopped (if (= 429 status) :rate-limited :http)
+                             :http status :ms ms :headers headers
+                             :error (or error (subs (or body "") 0 300))})
+                           (let [j (js/JSON.parse body)
+                                 choice (some-> j .-choices (aget 0))
+                                 text (or (some-> choice .-message .-content) "")
+                                 finish (some-> choice .-finish_reason)
+                                 usage (js->clj (.-usage j) :keywordize-keys true)
+                                 code (extract text)
+                                 g (if (str/blank? code)
+                                     {:compiles false
+                                      :diag (if (= "length" finish) :truncated :no-code)
+                                      :message (if (= "length" finish)
+                                                 "your previous reply was cut off before any code appeared — answer with the file directly, without thinking out loud first"
+                                                 "your previous reply contained no ```clojure block")}
+                                     (quick-grade (assoc t :id (str (slug model) "--" (name (:id t)))) code))
+                                 round* {:round round :ms ms :finish finish
+                                         :usage (select-keys usage [:prompt_tokens :completion_tokens :total_tokens])
+                                         :grade (dissoc g :path)}
+                                 ;; An empty assistant turn is rejected outright
+                                 ;; by some providers (Cohere 400), so a blank
+                                 ;; reply must not enter the history at all.
+                                 hist (if (str/blank? text)
+                                        (vec msgs)
+                                        (conj (vec msgs) {:role "assistant" :content text}))]
+                             (fs/writeFileSync
+                              (path/join work (str (slug model) "--" (name (:id t)) ".r" round ".txt")) text)
+                             ;; green means the whole contract, not two thirds
+                             ;; of it: a module that passes the battery while
+                             ;; withholding an export is not done.
+                             (if (and (:compiles g) (:interface g) (true? (:tests-ok g)))
+                               (js/Promise.resolve
+                                {:model model :task (:id t) :rounds round
+                                 :history hist :rounds-log [round*] :stopped :green :src code :grade g})
+                               (.then (sleep 3200)
+                                      (fn [_]
+                                        (.then (step (inc round)
+                                                     (conj hist {:role "user" :content (feedback t code g)})
+                                                     code)
+                                               (fn [r] (update r :rounds-log #(vec (cons round* %)))))))))))))))]
+    (step 1 [] nil)))
+
+;; ── validate: the gate must fail on a mutant ───────────────────────────
+
+(defn validate []
+  (doseq [t tasks]
+    (let [ref (fs/readFileSync (path/join fixtures (:reference t)) "utf8")
+          [from to] (:mutation t)
+          mutant (str/replace-first ref from to)
+          g (grade t ref)
+          m (grade (assoc t :id (str (name (:id t)) "-mutant")) mutant)]
+      (println (name (:id t))
+               "\n  reference:" (pr-str (dissoc g :exports))
+               "\n  mutant   :" (pr-str (dissoc m :exports)))
+      (when (= mutant ref) (println "  !! mutation did not apply — battery unproven"))
+      (when-not (:tests-ok g) (println "  !! battery FAILS on the reference"))
+      (when (:tests-ok m) (println "  !! battery PASSES on the mutant — it discriminates nothing")))))
+
+;; ── model calls ────────────────────────────────────────────────────────
+
+(defn kagi-get
+  "Targeted read of one known item from the live vault (~/.kagi, not the stale
+  repo-local one). Never enumerates."
+  [item]
+  (let [r (cp/spawnSync (str root "/orgs/kotoba-lang/kagi/bin/kagi")
+                        #js ["get" item]
+                        #js {:encoding "utf8"
+                             :env (js/Object.assign #js {} js/process.env
+                                                    #js {"KAGI_HOME" (str js/process.env.HOME "/.kagi")})})
+        out (str/trim (or (.-stdout r) ""))]
+    (when-not (or (str/blank? out) (str/starts-with? out "no such item")) out)))
+
+(def api-key
+  (memoize
+   (fn []
+     (or (some-> js/process.env.OPENROUTER_API_KEY str/trim not-empty)
+         (kagi-get "OPENROUTER_API_KEY")
+         (throw (js/Error. "no OPENROUTER_API_KEY (env, or kagi item OPENROUTER_API_KEY)"))))))
+
+(defn prompt-for [t]
+  (str "You are porting one Clojure namespace's decision core to Kotoba.\n\n"
+       brief
+       "\n\n## The Clojure source\n\n```clojure\n" (:source t) "\n```\n\n"
+       "## The exact module you must produce\n\n```clojure\n" (:interface t) "\n```\n\n"
+       "Write the complete `.kotoba` file. Keep the same names, parameter types "
+       "and result types. Reply with ONE ```clojure code block and nothing else."))
+
+(defn extract
+  "Take the last fenced block; fall back to the first (ns ...) form onward."
+  [text]
+  (let [blocks (map second (re-seq #"(?s)```(?:clojure|kotoba|clj|edn)?\n(.*?)```" text))]
+    (or (last blocks)
+        (when-let [i (str/index-of text "(ns ")] (subs text i))
+        "")))
+
+(def ^:private next-slot (atom 0))
+
+(defn rate-slot!
+  "One global 20rpm bucket. Episodes now run concurrently, so per-episode
+  spacing no longer bounds the account-wide request rate; this does."
+  [spacing]
+  (let [now (js/Date.now)
+        mine (atom now)]
+    (swap! next-slot (fn [prev] (let [s (max prev now)] (reset! mine s) (+ s spacing))))
+    (sleep (max 0 (- @mine (js/Date.now))))))
+
+(defn sse->completion
+  "Fold an SSE stream back into the one non-streaming shape the rest of this
+  file expects.
+
+  Streaming is not a preference here. `infer.murakumo.cloud` sits behind
+  Cloudflare, which cuts a response that takes over 100s with a 524 — and a
+  reasoning model asked to port a namespace takes longer than that. Measured:
+  both benchmark tasks came back 524 with zero rounds, so the model's ability
+  was never even sampled.
+
+  `reasoning_content` deltas are DROPPED. They are not the answer, and keeping
+  them would let `extract` pull a code block out of the model's thinking."
+  [raw]
+  (let [chunks (->> (str/split-lines raw)
+                    (keep #(when (str/starts-with? % "data: ") (subs % 6)))
+                    (remove #(= "[DONE]" (str/trim %)))
+                    (keep #(try (js/JSON.parse %) (catch :default _ nil))))
+        content (->> chunks
+                     (keep #(some-> % .-choices (aget 0) .-delta .-content))
+                     (str/join ""))
+        finish (->> chunks
+                    (keep #(some-> % .-choices (aget 0) .-finish_reason))
+                    last)
+        usage (some #(some-> % .-usage) (reverse chunks))]
+    (js/JSON.stringify
+     (clj->js {:choices [{:message {:content content} :finish_reason finish}]
+               :usage (if usage (js->clj usage :keywordize-keys true) {})}))))
+
+(defn call-once [model msgs]
+  (let [t0 (js/Date.now)]
+    (-> (js/fetch (or js/process.env.ORBENCH_ENDPOINT
+                      "https://openrouter.ai/api/v1/chat/completions")
+                  #js {:method "POST"
+                       :headers (if js/process.env.ORBENCH_ENDPOINT
+                                  ;; a self-hosted OpenAI-compatible endpoint
+                                  ;; (murakumo) takes no bearer token
+                                  #js {"Content-Type" "application/json"}
+                                  #js {"Authorization" (str "Bearer " (api-key))
+                                       "Content-Type" "application/json"
+                                       "HTTP-Referer" "https://junkawasaki.com"
+                                       "X-Title" "orbench clj->kotoba"})
+                       :body (js/JSON.stringify
+                              (clj->js {:model model
+                                        ;; see sse->completion: Cloudflare 524s
+                                        ;; a >100s non-streaming reply
+                                        :stream (boolean js/process.env.ORBENCH_ENDPOINT)
+                                        :temperature 0
+                                        ;; Reasoning tokens are billed against
+                                        ;; this too. At 4000, then again at
+                                        ;; 16000, models spent the whole budget
+                                        ;; thinking and returned empty content —
+                                        ;; recorded as a failure to write Kotoba
+                                        ;; when it was a failure to let them
+                                        ;; finish. The ceiling is now stated in
+                                        ;; the results rather than assumed away.
+                                        :max_tokens (js/parseInt
+                                                     (or js/process.env.ORBENCH_MAX_TOKENS "16000"))
+                                        :messages msgs}))})
+        (.then (fn [r]
+                 (-> (.text r)
+                     (.then (fn [raw]
+                              (let [body (if (and js/process.env.ORBENCH_ENDPOINT
+                                                  (str/includes? raw "data:"))
+                                           (sse->completion raw)
+                                           raw)]
+                                {:status (.-status r)
+                                 :ms (- (js/Date.now) t0)
+                                 :headers (into {} (for [k ["x-ratelimit-limit" "x-ratelimit-remaining"
+                                                            "x-ratelimit-reset" "retry-after"]
+                                                         :let [v (.get (.-headers r) k)]
+                                                         :when v] [k v]))
+                                 :body body}))))))
+        (.catch (fn [e] {:status 0 :ms (- (js/Date.now) t0) :error (.-message e)})))))
+
+(defn call-model
+  "Every `:free` id sits behind an upstream provider's SHARED free pool, which
+  429s on its own schedule — `limit_source: upstream_provider_shared_pool`, not
+  the account's 20rpm/1000rpd. Without this retry a model that never got a turn
+  scored identically to one that answered and got it wrong."
+  ([model msgs] (call-model model msgs 0))
+  ([model msgs attempt]
+   (.then (.then (rate-slot! 3100) (fn [_] (call-once model msgs)))
+          (fn [r]
+            (if (and (#{429 502 503 504 0} (:status r)) (< attempt 3))
+              (let [ra (some-> (get-in r [:headers "retry-after"]) js/parseInt)
+                    wait (if (and ra (pos? ra)) (* 1000 (min ra 60))
+                             (nth [12000 35000 70000] attempt))]
+                (println (str "    " model " " (:status r) " — waiting " (quot wait 1000)
+                              "s (attempt " (inc attempt) "/3)"))
+                (.then (sleep wait)
+                       (fn [_] (.then (call-model model msgs (inc attempt))
+                                      #(update % :retries (fnil inc 0))))))
+              (assoc r :retries attempt))))))
+
+(defn sleep [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+
+(defn summarise [r]
+  (let [g (:grade r)
+        ms (reduce + 0 (map :ms (:rounds-log r)))
+        out (reduce + 0 (map (comp #(or % 0) :completion_tokens :usage) (:rounds-log r)))
+        in (reduce + 0 (map (comp #(or % 0) :prompt_tokens :usage) (:rounds-log r)))]
+    (assoc r :model-ms ms :in-tokens in :out-tokens out
+           ;; An episode whose every round died at the token ceiling produced no
+           ;; code to judge. Reporting that beside a model that answered and got
+           ;; it wrong would be reporting two different things in one column.
+           :stopped (if (and (not= :green (:stopped r))
+                             (seq (:rounds-log r))
+                             (every? #(= "length" (:finish %)) (:rounds-log r)))
+                      :truncated
+                      (:stopped r))
+           :max-tokens (js/parseInt (or js/process.env.ORBENCH_MAX_TOKENS "16000"))
+           :green (= :green (:stopped r))
+           :compiles (boolean (:compiles g))
+           :tests-ok (true? (:tests-ok g))
+           :interface (boolean (:interface g))
+           :native (boolean (:native g)))))
+
+(defn pool
+  "Bounded concurrency: `n` workers pulling from one queue. Results keep the
+  input order regardless of completion order."
+  [n items f]
+  (let [items (vec items)
+        idx (atom 0)
+        out (atom {})]
+    (letfn [(worker []
+              (let [i (dec (swap! idx inc))]
+                (if (>= i (count items))
+                  (js/Promise.resolve nil)
+                  (.then (f (nth items i))
+                         (fn [r] (swap! out assoc i r) (worker))))))]
+      (.then (js/Promise.all (clj->js (mapv (fn [_] (worker))
+                                            (range (min n (count items))))))
+             (fn [_] (mapv @out (range (count items))))))))
+
+(defn run-agent [models max-rounds n-budget concurrency]
+  (fs/mkdirSync work #js {:recursive true})
+  (let [b (budget n-budget)
+        pairs (vec (for [m models t tasks] [m t]))
+        t0 (js/Date.now)]
+    (println "episodes:" (count pairs) " concurrency:" concurrency)
+    (.then
+     (pool concurrency pairs
+           (fn [[m t]]
+             (.then (agent-run m t max-rounds b)
+                    (fn [r0]
+                      (let [r (summarise (if (:src r0)
+                                           (assoc r0 :grade (final-grade t (:grade r0)))
+                                           r0))]
+                        (println (str (:model r) " " (name (:task r))
+                                      " -> " (name (or (:stopped r) :?))
+                                      " rounds=" (:rounds r)
+                                      " compiles=" (:compiles r)
+                                      " tests=" (:tests-ok r)
+                                      " iface=" (:interface r)
+                                      " native=" (:native r)
+                                      " model-ms=" (:model-ms r)
+                                      " out-tok=" (:out-tokens r)
+                                      " | requests left " (:left @b)))
+                        r)))))
+     (fn [results]
+       (fs/writeFileSync (path/join here "results.edn")
+                         (with-out-str (pr (mapv #(dissoc % :history) results))))
+       (println "\nrequests spent:" (:spent @b) " wall-clock ms:" (- (js/Date.now) t0))
+       (when (<= (:left @b) 0)
+         (println "!! request budget exhausted — later (model,task) pairs were NOT run"))
+       (println "wrote" (path/join here "results.edn"))))))
+
+;; ── entry ──────────────────────────────────────────────────────────────
+
+(def argv (vec *command-line-args*))
+
+(defn quota
+  "GET /api/v1/key — the only proactive view of the shared free bucket;
+  successful inference responses carry no X-RateLimit-* headers."
+  []
+  (-> (js/fetch "https://openrouter.ai/api/v1/key"
+                #js {:headers #js {"Authorization" (str "Bearer " (api-key))}})
+      (.then #(.text %))
+      (.then #(println %))))
+
+(def paid-price
+  "What the same tokens would have cost on the model's own paid listing. The
+  free tier's real price is not zero — it is the request, out of 50 or 1000 a
+  day — but this is the number people mean by `cost`."
+  (delay
+   (let [f (or js/process.env.ORBENCH_MODELS_JSON (path/join here "or-models.json"))]
+     (when (fs/existsSync f)
+       (into {} (for [m (:data (js->clj (js/JSON.parse (fs/readFileSync f "utf8"))
+                                        :keywordize-keys true))]
+                  [(:id m) (:pricing m)]))))))
+
+(defn usd [model in out]
+  (when-let [p (get @paid-price (str/replace model #":free$" ""))]
+    (let [n (+ (* (js/parseFloat (:prompt p)) (or in 0))
+               (* (js/parseFloat (:completion p)) (or out 0)))]
+      (when (pos? n) n))))
+
+(defn report []
+  (when-not (seq @paid-price)
+    ;; An empty price column has to say why. Silently printing "—" would read as
+    ;; "measured, and it was free" for every row.
+    (println "NOTE: no model catalogue on disk — run `bench.cljs models` first;"
+             "the `eq. paid` column is UNAVAILABLE, not zero.\n"))
+  (let [rs (edn/read-string (fs/readFileSync (path/join here "results.edn") "utf8"))
+        score (fn [r] (+ (if (:compiles r) 1 0) (if (:interface r) 1 0)
+                         (if (:tests-ok r) 1 0) (if (:native r) 1 0)))]
+    (println "| model | task | outcome | rounds | compiles | iface | tests | native | model s | in/out tok | eq. paid |")
+    (println "|---|---|---|---|---|---|---|---|---|---|---|")
+    (doseq [r (sort-by (juxt :task (comp - score) :rounds) rs)]
+      (let [c (usd (:model r) (:in-tokens r) (:out-tokens r))]
+        (println (str "| `" (:model r) "` | " (name (:task r)) " | "
+                      (name (or (:stopped r) :?)) " | " (:rounds r) " | "
+                      (if (:compiles r) "✅" "❌") " | "
+                      (if (:interface r) "✅" "❌") " | "
+                      (if (:tests-ok r) "✅" "❌") " | "
+                      (if (:native r) "✅" "—") " | "
+                      (.toFixed (/ (or (:model-ms r) 0) 1000) 1) " | "
+                      (:in-tokens r) "/" (:out-tokens r) " | "
+                      (if c (str "$" (.toFixed c 5)) "—") " |"))))))
+
+(defn feedback-demo
+  "Prove the loop's feedback path is not vacuous before spending model calls on
+  it: a syntactically broken port and a semantically wrong one must each come
+  back with something a model could act on."
+  []
+  (doseq [t tasks
+          [label mutate]
+          [["type error" #(str/replace-first % "(defn " "(defn broken [x :i64] :bool x)\n\n(defn ")]
+           ["wrong logic" #(str/replace-first % (first (:mutation t)) (second (:mutation t)))]]]
+    (let [ref (fs/readFileSync (path/join fixtures (:reference t)) "utf8")
+          src (mutate ref)
+          g (quick-grade (assoc t :id (str (name (:id t)) "-fb")) src)]
+      (println (str "── " (name (:id t)) " / " label " ──"))
+      (println (feedback t src g))
+      (println))))
+
+;; ── quality: what passing tests does not tell you ──────────────────────
+
+(defn js-fuel
+  "Charges consumed per call, not nanoseconds.
+
+  A Kotoba js artifact carries a bounded instruction budget (`let fuel=512` per
+  instantiation, decremented by `charge()`), so a hot loop cannot be timed — it
+  dies with `fuel-exhausted` partway through the warm-up. That is the language
+  working as designed, and it hands back a better metric than wall-clock:
+  charges/call is deterministic, independent of machine load, and is exactly the
+  quantity a wasteful implementation inflates."
+  [kotoba-path {:keys [fn args]}]
+  (let [out (str kotoba-path ".perf.mjs")
+        c (cli ["-M" "compile" kotoba-path "--target" "js" "--output" out])]
+    (when (:ok c)
+      (let [script (str "import {instantiateKotoba} from '" out "';"
+                        "const m=instantiateKotoba({});const f=m['" fn "'];"
+                        "const a=[" (str/join "," (map #(str % "n") args)) "];"
+                        "let n=0;try{for(;;){f(...a);n++;}}catch(e){"
+                        "if(e.message!=='fuel-exhausted'){console.error(e.message);process.exit(3);}}"
+                        "console.log(512/n);")
+            r (cp/spawnSync "node" #js ["--input-type=module" "-e" script]
+                            #js {:encoding "utf8"})]
+        (some-> (.-stdout r) str/trim not-empty js/parseFloat)))))
+
+(defn quality
+  "Post-processes the candidates already on disk. No model calls."
+  []
+  (let [rs (edn/read-string (fs/readFileSync (path/join here "results.edn") "utf8"))
+        by-task (into {} (map (juxt :id identity) tasks))
+        ref-perf (into {} (for [t tasks :when (:perf t)]
+                            [(:id t) (js-fuel (path/join fixtures (:reference t)) (:perf t))]))
+        ref-lines (into {} (for [t tasks]
+                             [(:id t) (count (str/split-lines
+                                              (fs/readFileSync (path/join fixtures (:reference t)) "utf8")))]))]
+    (println "| model | task | lines (ref) | extra exports | duplicated truth | charges/call (ref) |")
+    (println "|---|---|---|---|---|---|")
+    (doseq [r (sort-by (juxt :task :model) rs)
+            :when (:compiles r)
+            :let [t (by-task (:task r))
+                  p (path/join work (str (slug (:model r)) "--" (name (:task r)) ".kotoba"))]
+            :when (fs/existsSync p)]
+      (let [src (fs/readFileSync p "utf8")
+            want (set (map first (:want t)))
+            extra (remove #(want (first %)) (:exports r))
+            dups (for [[label lit maxn] (:quality t)
+                       :let [n (count (re-seq (re-pattern lit) src))]
+                       :when (> n maxn)]
+                   (str label " (×" n ")"))
+            ns-op (when (:perf t) (js-fuel p (:perf t)))
+            rp (ref-perf (:task r))]
+        (println (str "| `" (:model r) "` | " (name (:task r)) " | "
+                      (count (str/split-lines src)) " (" (ref-lines (:task r)) ") | "
+                      (if (seq extra) (str/join ", " (map first extra)) "—") " | "
+                      (if (seq dups) (str/join "; " dups) "—") " | "
+                      (if (and ns-op rp)
+                        (str (.toFixed ns-op 2) " (" (.toFixed rp 2) ")")
+                        "—")
+                      " |"))))))
+
+
+;; ── mutate: does the battery notice when the answer is wrong? ───────────
+;;
+;; `validate` can only run where a landed reference exists. Real ports have no
+;; reference — and there the battery's discriminating power was being checked by
+;; hand, three times in one day. Once the hand-applied mutation silently failed
+;; to match and the green run read as "the battery does not discriminate", which
+;; is the same shape as every other defect in this file: a check that could not
+;; run, reporting the same value as a check that ran and found nothing.
+;;
+;; So: apply each mutation, ASSERT THE FILE ACTUALLY CHANGED, then run the
+;; battery. A surviving mutant is a hole in the battery, not a passing grade.
+
+(defn mutations
+  "One-token edits, each targeting a different way the port can be wrong."
+  [src]
+  (concat
+   ;; every string literal, made wrong by one character
+   (for [[whole lit] (distinct (re-seq #"\"([^\"\n]{1,60})\"" src))
+         :when (seq lit)]
+     {:label (str "string " (pr-str lit) " -> " (pr-str (str lit "X")))
+      :from whole :to (str "\"" lit "X\"")})
+   ;; every integer literal, off by one
+   (for [[whole n] (distinct (re-seq #"(?:\s|\()(-?\d+)(?:\s|\))" src))
+         :let [t (str/replace whole n (str (inc (js/parseInt n))))]]
+     {:label (str "integer " n " -> " (inc (js/parseInt n)))
+      :from whole :to t})
+   ;; comparison and boolean operators, weakened or flipped
+   (for [[from to] [["(> " "(>= "] ["(< " "(<= "] ["(>= " "(> "] ["(<= " "(< "]
+                    ["(and " "(or "] ["(or " "(and "] ["(not " "(identity "]]
+         :when (str/includes? src from)]
+     {:label (str "operator " (str/trim from) " -> " (str/trim to))
+      :from from :to to})))
+
+(defn mutate
+  "Mutation-test one .kotoba file against a task's battery."
+  [task-id path]
+  (let [t (first (filter #(= (keyword task-id) (:id %)) tasks))
+        _ (when-not t (throw (js/Error. (str "no task " task-id " in tasks.edn"))))
+        src (fs/readFileSync path "utf8")
+        base (quick-grade (assoc t :id (str (name (:id t)) "-mutbase")) src)]
+    (when-not (and (:compiles base) (true? (:tests-ok base)))
+      (throw (js/Error. "the unmutated file is not green — fix that before mutating")))
+    (println "baseline: green\n")
+    (let [results
+          (doall
+           (for [[i m] (map-indexed vector (mutations src))
+                 :let [mutated (str/replace-first src (:from m) (:to m))]]
+             (if (= mutated src)
+               ;; A backstop, not an expected path: every mutation above is
+               ;; derived from the file's own text, so a no-op means the
+               ;; generator is broken. It is reported rather than counted
+               ;; because the alternative — counting it as a kill — is exactly
+               ;; the failure this command exists to prevent.
+               {:label (:label m) :outcome :not-applied}
+               (let [g (quick-grade (assoc t :id (str (name (:id t)) "-mut" i)) mutated)
+                     killed? (not (and (:compiles g) (true? (:tests-ok g))))]
+                 (println (if killed? "  killed  " "  SURVIVED") (:label m))
+                 {:label (:label m)
+                  :outcome (if killed? :killed :survived)
+                  :by (if (:compiles g) (:failed g) [(str (:diag g))])}))))
+          survived (filter #(= :survived (:outcome %)) results)
+          skipped (filter #(= :not-applied (:outcome %)) results)]
+      (println (str "\n" (count results) " mutants, "
+                    (count (filter #(= :killed (:outcome %)) results)) " killed, "
+                    (count survived) " survived, "
+                    (count skipped) " could not be applied"))
+      (when (seq skipped)
+        (println "!! mutations that did not change the file are NOT evidence of anything:")
+        (doseq [m skipped] (println "   " (:label m))))
+      (doseq [m survived]
+        (println "HOLE:" (:label m) "— the battery cannot see this"))
+      (when (and (empty? survived) (empty? skipped))
+        (println "every mutant died: the battery constrains every literal and operator in the file")))))
+
+(case (first argv)
+  "validate" (validate)
+  "models" (-> (js/fetch "https://openrouter.ai/api/v1/models")
+               (.then #(.text %))
+               (.then (fn [t]
+                        (fs/writeFileSync (path/join here "or-models.json") t)
+                        (println "wrote" (path/join here "or-models.json")))))
+  "feedback" (feedback-demo)
+  "quality" (quality)
+  "mutate" (mutate (second argv) (nth argv 2))
+  "quota" (quota)
+  "report" (report)
+  "agent" (run-agent (drop 4 argv)
+                     (js/parseInt (second argv))
+                     (js/parseInt (nth argv 2))
+                     (js/parseInt (nth argv 3)))
+  (println "usage: bench.cljs validate | models | feedback | quality | quota | report"
+           "| mutate <task-id> <file.kotoba>"
+           "| agent <max-rounds> <request-budget> <concurrency> <model> ..."))

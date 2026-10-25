@@ -1,0 +1,300 @@
+(ns kotoba-code.host-test
+  (:require [kotoba.lang.error :as kerror] [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
+            [clojure.test :refer [deftest is]]
+            [kotoba-code.host :as host]
+            [kotoba-code.tools :as tools]))
+
+(defn- temp-dir []
+  (.toFile (java.nio.file.Files/createTempDirectory
+            "kotoba-code-host-test"
+            (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(defn- git! [dir & args]
+  (let [{:keys [exit out err]} (apply sh/sh "git" (concat args [:dir (.getPath dir)]))]
+    (when-not (zero? exit)
+      (throw (ex-info "git failed" {:args args :out out :err err})))
+    (str out err)))
+
+(defn- init-repo! [dir]
+  (git! dir "init" "-q")
+  (git! dir "-c" "user.name=test" "-c" "user.email=test@example.invalid"
+        "commit" "--allow-empty" "-q" "-m" "init"))
+
+(defn- symlink! [target link]
+  (java.nio.file.Files/createSymbolicLink
+   (.toPath (io/file link))
+   (.toPath (io/file target))
+   (make-array java.nio.file.attribute.FileAttribute 0)))
+
+(deftest published-tool-limits-match-host-enforced-limits
+  (let [catalog-by-name (into {} (map (juxt :name identity)) (tools/tool-catalog))
+        host-limits host/tool-limits]
+    (is (= (:max-read-bytes host-limits)
+           (get-in catalog-by-name ["read_file" :limits :max-read-bytes])))
+    (is (= (:max-read-lines host-limits)
+           (get-in catalog-by-name ["read_file_numbered" :limits :max-lines])))
+    (is (= (:max-write-bytes host-limits)
+           (get-in catalog-by-name ["write_file" :limits :max-write-bytes])))
+    (is (= (:max-patch-bytes host-limits)
+           (get-in catalog-by-name ["apply_patch" :limits :max-patch-bytes])))
+    (is (= (:max-write-bytes host-limits)
+           (get-in catalog-by-name ["replace_text" :limits :max-replacement-bytes])))
+    (is (= (:max-write-bytes host-limits)
+           (get-in catalog-by-name ["replace_range" :limits :max-replacement-bytes])))
+    (is (= (:max-list-entries host-limits)
+           (get-in catalog-by-name ["list_dir" :limits :max-entries])))
+    (is (= (:max-search-pattern-bytes host-limits)
+           (get-in catalog-by-name ["search" :limits :max-pattern-bytes])))))
+
+(deftest apply-patch-and-rollback-are-project-confined
+  (let [dir (temp-dir)
+        src (io/file dir "src/x.clj")
+        _ (do (io/make-parents src)
+              (spit src "(ns x)\n(def x 1)\n")
+              (init-repo! dir)
+              (git! dir "add" ".")
+              (git! dir "-c" "user.name=test" "-c" "user.email=test@example.invalid"
+                    "commit" "-q" "-m" "fixture"))
+        h (host/fs-host dir)
+        patch "diff --git a/src/x.clj b/src/x.clj\n--- a/src/x.clj\n+++ b/src/x.clj\n@@ -1,2 +1,2 @@\n (ns x)\n-(def x 1)\n+(def x 2)\n"]
+    (is (re-find #"patch applied" ((:apply-patch h) patch)))
+    (is (= "(ns x)\n(def x 2)\n" (slurp src)))
+    (is (re-find #"M src/x.clj" ((:git-status h))))
+    ((:rollback h))
+    (is (= "(ns x)\n(def x 1)\n" (slurp src)))
+    (is (re-find #"DENIED" ((:apply-patch h) "diff --git a/../x b/../x\n--- a/../x\n+++ b/../x\n@@ -1 +1 @@\n-a\n+b\n")))))
+
+(deftest writes-and-patches-deny-symlink-escape
+  (let [dir (temp-dir)
+        outside (temp-dir)
+        outside-file (io/file outside "secret.clj")
+        link (io/file dir "linked.clj")
+        link-dir (io/file dir "linked-dir")
+        _ (do
+            (spit outside-file "(ns secret)\n(def secret 1)\n")
+            (symlink! outside-file link)
+            (symlink! outside link-dir)
+            (init-repo! dir))
+        h (host/fs-host dir)
+        patch "diff --git a/linked-dir/secret.clj b/linked-dir/secret.clj\n--- a/linked-dir/secret.clj\n+++ b/linked-dir/secret.clj\n@@ -1,2 +1,2 @@\n (ns secret)\n-(def secret 1)\n+(def secret 2)\n"]
+    (is (re-find #"DENIED" ((:write-file h) "linked.clj" "(ns pwned)\n")))
+    (is (re-find #"DENIED" ((:replace-text h) "linked.clj" "(def secret 1)" "(def secret 2)")))
+    (is (re-find #"DENIED" ((:replace-range h) "linked.clj" 2 2 "(def secret 2)")))
+    (is (re-find #"DENIED: patch resolves outside project root"
+                 ((:apply-patch h) patch)))
+    (is (= "(ns secret)\n(def secret 1)\n" (slurp outside-file)))))
+
+(deftest replace-text-is-exact-and-rollbackable
+  (let [dir (temp-dir)
+        src (io/file dir "src/x.clj")
+        _ (do (io/make-parents src)
+              (spit src "(ns x)\n(def x 1)\n")
+              (init-repo! dir)
+              (git! dir "add" ".")
+              (git! dir "-c" "user.name=test" "-c" "user.email=test@example.invalid"
+                    "commit" "-q" "-m" "fixture"))
+        h (host/fs-host dir)]
+    (is (re-find #"replaced 1 occurrence" ((:replace-text h) "src/x.clj" "(def x 1)" "(def x 2)")))
+    (is (= "(ns x)\n(def x 2)\n" (slurp src)))
+    ((:rollback h))
+    (is (= "(ns x)\n(def x 1)\n" (slurp src)))
+    (is (re-find #"not found" ((:replace-text h) "src/x.clj" "(def y 1)" "(def y 2)")))))
+
+(deftest read-file-numbered-supports-ranges
+  (let [dir (temp-dir)
+        src (io/file dir "src/x.clj")
+        _ (do (io/make-parents src)
+              (spit src "(ns x)\n(def x 1)\n(def y 2)\n")
+              (init-repo! dir))
+        h (host/fs-host dir)]
+    (is (= "    2 | (def x 1)\n    3 | (def y 2)"
+           ((:read-file-numbered h) "src/x.clj" 2 3)))
+    (is (re-find #"invalid line range" ((:read-file-numbered h) "src/x.clj" 3 2)))
+    (is (re-find #"exceeds" ((:read-file-numbered h) "src/x.clj" 99 nil)))))
+
+(deftest read-tools-deny-oversized-output
+  (let [dir (temp-dir)
+        big-file (io/file dir "src/big.clj")
+        big-lines (io/file dir "src/big_lines.clj")
+        many-lines (io/file dir "src/many.clj")
+        _ (do (io/make-parents big-file)
+              (spit big-file (apply str (repeat 200001 "x")))
+              (spit big-lines (apply str (map (fn [i]
+                                                (str "(def line-" i " \""
+                                                     (apply str (repeat 500 "x"))
+                                                     "\")\n"))
+                                              (range 1 501))))
+              (spit many-lines (str (apply str (repeat 401 "(def x 1)\n"))))
+              (init-repo! dir))
+        h (host/fs-host dir)]
+    (is (re-find #"file exceeds" ((:read-file h) "src/big.clj")))
+    (is (re-find #"file exceeds" ((:read-file h) "src/big_lines.clj")))
+    (is (re-find #"read range exceeds" ((:read-file-numbered h) "src/many.clj" 1 401)))
+    (is (re-find #"\s+400 \| \(def x 1\)"
+                 ((:read-file-numbered h) "src/many.clj" 1 400)))
+    (is (re-find #"\s+500 \| \(def line-500"
+                 ((:read-file-numbered h) "src/big_lines.clj" 499 500)))))
+
+(deftest read-only-tools-bound-agent-supplied-output
+  (let [dir (temp-dir)
+        small-file (io/file dir "src/small.clj")
+        big-file (io/file dir "src/big.clj")
+        many-dir (io/file dir "many")
+        _ (do (io/make-parents small-file)
+              (spit small-file "(ns small)\n(def needle 1)\n")
+              (spit big-file (str "(ns big)\n(def giant-needle \""
+                                  (apply str (repeat 200001 "x"))
+                                  "\")\n"))
+              (doseq [i (range 401)]
+                (let [f (io/file many-dir (format "f%03d.clj" i))]
+                  (io/make-parents f)
+                  (spit f "(ns f)\n")))
+              (init-repo! dir))
+        h (host/fs-host dir)]
+    (is (re-find #"invalid search regex" ((:search h) "[")))
+    (is (re-find #"search pattern exceeds" ((:search h) (apply str (repeat 1001 "x")))))
+    (is (= "src/small.clj:2: (def needle 1)" ((:search h) "needle")))
+    (is (not (re-find #"big.clj" ((:search h) "giant-needle"))))
+    (let [listed ((:list-dir h) "many")]
+      (is (re-find #"f000.clj" listed))
+      (is (re-find #"truncated 1 more entry" listed))
+      (is (not (re-find #"f400.clj" listed))))))
+
+(deftest directory-listing-nil-is-treated-as-unlistable
+  (is (nil? (#'host/directory-listing nil))))
+
+(deftest replace-range-is-line-scoped-and-rollbackable
+  (let [dir (temp-dir)
+        src (io/file dir "src/x.clj")
+        _ (do (io/make-parents src)
+              (spit src "(ns x)\n(def x 1)\n(def y 2)\n")
+              (init-repo! dir)
+              (git! dir "add" ".")
+              (git! dir "-c" "user.name=test" "-c" "user.email=test@example.invalid"
+                    "commit" "-q" "-m" "fixture"))
+        h (host/fs-host dir)]
+    (is (re-find #"replaced lines 2-2"
+                 ((:replace-range h) "src/x.clj" 2 2 "(def x 42)")))
+    (is (= "(ns x)\n(def x 42)\n(def y 2)\n" (slurp src)))
+    ((:rollback h))
+    (is (= "(ns x)\n(def x 1)\n(def y 2)\n" (slurp src)))
+    (is (re-find #"invalid line range" ((:replace-range h) "src/x.clj" 3 2 "")))
+    (is (re-find #"exceeds" ((:replace-range h) "src/x.clj" 2 99 "")))))
+
+(deftest rollback-removes-created-empty-parent-directories
+  (let [dir (temp-dir)
+        write-file (io/file dir "src/generated/deep/x.clj")
+        patch-file (io/file dir "src/patched/deep/y.clj")
+        _ (init-repo! dir)
+        h (host/fs-host dir)
+        patch "diff --git a/src/patched/deep/y.clj b/src/patched/deep/y.clj\nnew file mode 100644\n--- /dev/null\n+++ b/src/patched/deep/y.clj\n@@ -0,0 +1,2 @@\n+(ns y)\n+(def y 1)\n"]
+    (is (re-find #"written" ((:write-file h) "src/generated/deep/x.clj" "(ns x)\n")))
+    (is (.exists write-file))
+    ((:rollback h))
+    (is (not (.exists write-file)))
+    (is (not (.exists (io/file dir "src/generated"))))
+
+    (is (re-find #"patch applied" ((:apply-patch h) patch)))
+    (is (.exists patch-file))
+    ((:rollback h))
+    (is (not (.exists patch-file)))
+    (is (not (.exists (io/file dir "src/patched"))))))
+
+(deftest rollback-clears-journal-after-use
+  (let [dir (temp-dir)
+        generated (io/file dir "src/generated/x.clj")
+        _ (init-repo! dir)
+        h (host/fs-host dir)]
+    (is (re-find #"written" ((:write-file h) "src/generated/x.clj" "(ns x)\n")))
+    (is (seq @(:touched h)))
+    ((:rollback h))
+    (is (empty? @(:touched h)))
+    (io/make-parents generated)
+    (spit generated "(ns user-created)\n")
+    ((:rollback h))
+    (is (.exists generated))
+    (is (= "(ns user-created)\n" (slurp generated)))))
+
+(deftest rollback-failure-preserves-journal
+  (let [dir (temp-dir)
+        src (io/file dir "src/x.clj")
+        git-dir (io/file dir ".git")
+        git-dir-hidden (io/file dir ".git.hidden")
+        _ (do (io/make-parents src)
+              (spit src "(ns x)\n(def x 1)\n")
+              (init-repo! dir)
+              (git! dir "add" ".")
+              (git! dir "-c" "user.name=test" "-c" "user.email=test@example.invalid"
+                    "commit" "-q" "-m" "fixture"))
+        h (host/fs-host dir)]
+    (is (re-find #"replaced 1 occurrence"
+                 ((:replace-text h) "src/x.clj" "(def x 1)" "(def x 2)")))
+    (is (.renameTo git-dir git-dir-hidden))
+    (try
+      ((:rollback h))
+      (is false "expected rollback failure")
+      (catch kerror/ExceptionInfo e
+        (is (re-find #"rollback git checkout failed" (ex-message e)))
+        (is (seq @(:touched h)))))
+    (is (.renameTo git-dir-hidden git-dir))
+    ((:rollback h))
+    (is (empty? @(:touched h)))
+    (is (= "(ns x)\n(def x 1)\n" (slurp src)))))
+
+(deftest edit-tools-deny-oversized-inputs
+  (let [dir (temp-dir)
+        src (io/file dir "src/x.clj")
+        huge (apply str (repeat 200001 "x"))
+        _ (do (io/make-parents src)
+              (spit src "(ns x)\n(def x 1)\n")
+              (init-repo! dir))
+        h (host/fs-host dir)
+        huge-patch (str "diff --git a/src/x.clj b/src/x.clj\n--- a/src/x.clj\n+++ b/src/x.clj\n@@ -1,2 +1,2 @@\n"
+                        huge)]
+    (is (re-find #"content exceeds" ((:write-file h) "src/big.clj" huge)))
+    (is (re-find #"patch exceeds" ((:apply-patch h) huge-patch)))
+    (is (re-find #"replacement exceeds" ((:replace-text h) "src/x.clj" "(def x 1)" huge)))
+    (is (re-find #"replacement exceeds" ((:replace-range h) "src/x.clj" 2 2 huge)))))
+
+(deftest shell-is-allowlisted
+  (let [dir (temp-dir)
+        outside (temp-dir)
+        outside-file (io/file outside "secret.txt")
+        link (io/file dir "linked-secret.txt")
+        _ (do
+            (spit outside-file "SECRET\n")
+            (symlink! outside-file link)
+            (init-repo! dir))
+        h (host/fs-host dir)]
+    (is (re-find #"DENIED" ((:shell h) "rm -rf .")))
+    (is (re-find #"DENIED" ((:shell h) "rg foo; rm -rf .")))
+    (is (re-find #"DENIED" ((:shell h) "cat ../secret")))
+    (is (re-find #"DENIED" ((:shell h) "cat /etc/passwd")))
+    (is (re-find #"DENIED" ((:shell h) "ls /")))
+    (is (re-find #"DENIED" ((:shell h) "cat ~/.ssh/config")))
+    (is (re-find #"DENIED" ((:shell h) "cat linked-secret.txt")))
+    (is (re-find #"DENIED" ((:shell h) "sed -n 1,2p linked-secret.txt")))
+    (is (re-find #"DENIED" ((:shell h) "rg -L SECRET .")))
+    (is (re-find #"DENIED" ((:shell h) "rg --follow SECRET .")))
+    ;; nbb is allowlisted as a script host, but only for scripts reached by a
+    ;; relative path inside the project: the traversal, absolute-path and
+    ;; metacharacter guards still apply to it.
+    (is (re-find #"DENIED" ((:shell h) "nbb ../escape.cljs")))
+    (is (re-find #"DENIED" ((:shell h) "nbb /tmp/escape.cljs")))
+    (is (re-find #"DENIED" ((:shell h) "nbb x.cljs; rm -rf .")))
+    (is (string? ((:shell h) "nbb --version")))
+    (is (string? ((:shell h) "pwd")))))
+
+(deftest git-tools-report-failures-as-tool-results
+  (let [dir (temp-dir)
+        h (host/fs-host dir)]
+    (is (re-find #"^ERROR: git command failed" ((:git-status h))))
+    (is (re-find #"^ERROR: git command failed" ((:git-diff h))))))
+
+(deftest process-tools-time-out
+  (let [dir (temp-dir)
+        _ (init-repo! dir)
+        h (host/fs-host dir :process-timeout-ms 1)]
+    (is (re-find #"TIMEOUT"
+                 ((:shell h) "kbb -M:test")))))

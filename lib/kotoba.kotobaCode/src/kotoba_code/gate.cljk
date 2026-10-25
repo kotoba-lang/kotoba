@@ -1,0 +1,95 @@
+(ns kotoba-code.gate
+  "The test gate + rollback — the safety net the prototype harness proved necessary:
+  a run is only a success if the suite is green afterwards; otherwise the agent's
+  edits are reverted so a broken tree is never left behind."
+  (:require [kotoba-code.agent :as agent]))
+
+(defn green?
+  "Whether a test-runner output reports a fully green suite. Captures the
+  failure/error COUNTS as digit groups and compares them to \"0\" exactly --
+  a literal \"0 failures,\\s*0 errors\" substring match (the previous
+  implementation) is unanchored, so it matches inside any larger count
+  ending in that digit sequence: \"10 failures, 0 errors\" contains the
+  substring \"0 failures, 0 errors\" and was misreported as green, silently
+  disabling the rollback safety net for any run that broke exactly 10, 20,
+  30, ... tests. Same exact-digit-group pattern qa-governor's
+  clojure-project collector already uses correctly for the same output
+  shape."
+  [test-output]
+  (boolean
+   (when test-output
+     (when-let [[_ failures errors] (re-find #"(\d+) failures?,\s*(\d+) errors?" test-output)]
+       (and (= "0" failures) (= "0" errors))))))
+
+(defn- retry-task
+  "Augment the task with the still-red test output so the next round can fix it.
+  The agent's prior edits are still on disk, so it continues from there."
+  [task round test-out]
+  (str task
+       "\n\n[gate round " round " FAILED — `kbb -X:test` is still RED.]\n"
+       "Your previous edits are still on disk. Read them, diagnose the failures below,"
+       " and fix until the suite is fully green.\n--- test output (tail) ---\n"
+       (subs test-out (max 0 (- (count test-out) 1800)))))
+
+(defn- rollback-result [host]
+  (if-let [rollback (:rollback host)]
+    (try
+      (rollback)
+      {:rolled-back? true}
+      (catch #?(:clj Throwable :cljs :default) e
+        {:rolled-back? true
+         :rollback-error (ex-message e)}))
+    {:rolled-back? false}))
+
+(def ^:private edit-tool-names
+  #{"write_file" "apply_patch" "replace_text" "replace_range"})
+
+(defn edited?
+  "Whether an agent result contains a project-mutating tool call."
+  [final]
+  (boolean
+   (some (fn [message]
+           (some #(contains? edit-tool-names (:name %))
+                 (:tool-calls message)))
+         (:messages final))))
+
+(defn run-gated
+  "Run the agent on `task`, then enforce the gate against the host's own test run.
+  If the suite is RED and `:rounds` > 1, the failure is fed back to the agent and it
+  continues (its edits persist on disk between rounds) — premature DONEs no longer
+  throw away the work. Rolls back (`(:rollback host)`) only when still RED after the
+  last round, AND on ANY thrown error during a run (a crash must never leak edits).
+  Returns {:green? bool :test-out string :final state :answer string :rounds int :error str?}."
+  [agent-graph task host {:keys [session-id rounds] :or {rounds 1} :as opts}]
+  (try
+    (loop [round 1
+           cur   task]
+      (let [final (agent/run-task agent-graph cur (select-keys opts [:session-id]))]
+        (cond
+          (not (edited? final))
+          {:green? true :gate-skipped? true :test-out "" :final final
+           :answer (agent/answer final) :rounds round :rolled-back? false}
+
+          :else
+          (let [test-out ((:run-tests host))
+                ok (green? test-out)]
+            (cond
+          ok
+          {:green? true :test-out test-out :final final :answer (agent/answer final)
+           :rounds round :rolled-back? false}
+
+          (< round rounds)
+          (recur (inc round) (retry-task task round test-out))
+
+          :else
+          (merge {:green? false :test-out test-out :final final
+                  :answer (agent/answer final) :rounds round}
+                 (rollback-result host)))))))
+    (catch #?(:clj Throwable :cljs :default) e
+      (merge {:green?   false
+              :error    (ex-message e)
+              :exception e
+              :test-out ""
+              :final    nil
+              :answer   nil}
+             (rollback-result host)))))

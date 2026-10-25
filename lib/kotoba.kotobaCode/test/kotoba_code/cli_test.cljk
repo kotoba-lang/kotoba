@@ -1,0 +1,1016 @@
+(ns kotoba-code.cli-test
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [json.data-json :as json]
+            [kotoba.lang.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
+            [kotoba.lang.text :as str]
+            [clojure.test :refer [deftest is]])
+  (:import [com.sun.net.httpserver HttpServer]
+           [java.net InetSocketAddress]
+           [java.util.concurrent Executors TimeUnit]))
+
+(defn- temp-dir [prefix]
+  (kio/temp-dir
+            prefix))
+
+(defn- git! [dir & args]
+  (let [{:keys [exit out err]} (apply sh/sh "git" (concat args [:dir (.getPath dir)]))]
+    (when-not (zero? exit)
+      (throw (ex-info "git failed" {:args args :out out :err err})))
+    (str out err)))
+
+(defn- git-root! []
+  (let [dir (temp-dir "kotoba-code-cli-root")]
+    (git! dir "init" "-q")
+    dir))
+
+(defn- fixture-project! []
+  (let [dir (git-root!)
+        src (io/file dir "src/demo/math.clj")
+        tst (io/file dir "test/demo/math_test.clj")]
+    (io/make-parents src)
+    (io/make-parents tst)
+    (spit (io/file dir "deps.edn")
+          "{:paths [\"src\" \"test\"]}\n")
+    (spit src "(ns demo.math)\n(defn add [a b]\n  (- a b))\n")
+    (spit tst "(ns demo.math-test\n  (:require [clojure.test :refer [deftest is]]\n            [demo.math :as math]))\n\n(deftest add-test\n  (is (= 5 (math/add 2 3))))\n")
+    (git! dir "add" ".")
+    (git! dir "-c" "user.name=test" "-c" "user.email=test@example.invalid"
+          "commit" "-q" "-m" "fixture")
+    dir))
+
+(defn- read-stream [s]
+  (let [out (java.io.ByteArrayOutputStream.)]
+    (io/copy s out)
+    (.toString out "UTF-8")))
+
+(defn- run-cli [args & {:keys [env timeout-ms stdin]
+                        :or {timeout-ms 20000}}]
+  (let [pb (ProcessBuilder. ^java.util.List (vec (concat ["kbb" "-M" "-m" "kotoba-code.main"] args)))
+        env-map (.environment pb)]
+    (doseq [k ["OR_KEY" "OPENROUTER_API_KEY"
+               "KOTOBA_URL" "KOTOBA_GRAPH" "KOTOBA_TOKEN"
+               "KC_MURAKUMO_URL"
+               "KC_LOCAL_LOG" "KC_LOCAL_LOG_DIR" "KC_LOOP_ID" "KC_SESSION" "KC_WORKER_ID"
+               "KC_TEST_CMD" "KC_TOOL_TRANSCRIPT" "KC_LIVE_TOOLS"
+               "KC_RUN_TIMEOUT_MS" "KC_HTTP_TIMEOUT_MS" "KC_PROCESS_TIMEOUT_MS"
+               "KC_GATE_ROUNDS" "KC_LOOP_ROUNDS" "KC_LEASE_TTL_MS"
+               "KC_RECURSION_LIMIT" "KC_MAX_TOKENS"]]
+      (.remove env-map k))
+    (.put env-map "KC_LOCAL_LOG_DIR" (.getPath (temp-dir "kotoba-code-cli-log")))
+    (.put env-map "KC_LOOP_ID" (str "cli-test-" (System/nanoTime)))
+    (doseq [[k v] env]
+      (.put env-map k v))
+    (.directory pb (io/file "."))
+    (let [p (.start pb)
+          out-f (future (read-stream (.getInputStream p)))
+          err-f (future (read-stream (.getErrorStream p)))
+          in-f (future
+                 (with-open [w (io/writer (.getOutputStream p))]
+                   (when stdin
+                     (.write w stdin))))
+            finished? (.waitFor p timeout-ms TimeUnit/MILLISECONDS)]
+      (if finished?
+        (do
+          @in-f
+          {:exit (.exitValue p)
+           :out @out-f
+           :err @err-f
+           :timeout? false})
+        (do
+          (.destroyForcibly p)
+          (future-cancel out-f)
+          (future-cancel err-f)
+          (future-cancel in-f)
+          {:exit nil
+           :out ""
+	           :err (str "timeout after " timeout-ms "ms")
+	           :timeout? true})))))
+
+(defn- edn-out [result]
+  (edn/read-string (:out result)))
+
+(defn- catalog-command-args [root {:keys [name args requires-root?]}]
+  (into [name]
+        (keep (fn [arg]
+                (case arg
+                  "project-root" (.getPath root)
+                  "model-id?" "murakumo:test-model"
+                  "N?" "3"
+                  nil))
+              (if requires-root? args []))))
+
+(defn- json-response [exchange status body]
+  (let [bytes (kbytes/utf8-bytes (json/write-str body))
+        headers (.getResponseHeaders exchange)]
+    (.add headers "Content-Type" "application/json")
+    (.sendResponseHeaders exchange status (count bytes))
+    (with-open [out (.getResponseBody exchange)]
+      (.write out bytes))))
+
+(defn- request-json [exchange]
+  (json/read-str (slurp (io/reader (.getRequestBody exchange))) :key-fn keyword))
+
+(defn- start-fake-gateway! []
+  (let [calls (atom [])
+        server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+        pool (Executors/newSingleThreadExecutor)]
+    (.createContext
+     server
+     "/v1/messages"
+     (reify com.sun.net.httpserver.HttpHandler
+       (handle [_ exchange]
+         (let [req (request-json exchange)
+               messages (:messages req)
+               saw-tool? (some #(= "tool" (:role %)) messages)
+               n (swap! calls conj req)
+               tool-call? (and (not saw-tool?) (= 1 (count n)))]
+           (json-response
+            exchange
+            200
+            {:content
+             (if tool-call?
+               [{:type "tool_use"
+                 :id "call-replace"
+                 :name "replace_text"
+                 :input {:path "src/demo/math.clj"
+                         :old "  (- a b)"
+                         :new "  (+ a b)"}}]
+               [{:type "text" :text "DONE"}])
+             :stop_reason (if tool-call? "tool_use" "end_turn")
+             :usage {:input_tokens 1 :output_tokens 1}})))))
+    (.setExecutor server pool)
+    (.start server)
+    {:url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/v1/messages")
+     :calls calls
+     :stop (fn []
+             (.stop server 0)
+             (.shutdownNow pool))}))
+
+(defn- start-timeout-gateway! []
+  (let [calls (atom [])
+        server (HttpServer/create (InetSocketAddress. "127.0.0.1" 0) 0)
+        pool (Executors/newCachedThreadPool)]
+    (.createContext
+     server
+     "/v1/messages"
+     (reify com.sun.net.httpserver.HttpHandler
+       (handle [_ exchange]
+         (let [req (request-json exchange)
+               n (count (swap! calls conj req))]
+           (if (= 1 n)
+             (json-response
+              exchange
+              200
+              {:content
+               [{:type "tool_use"
+                 :id "call-replace-timeout"
+                 :name "replace_text"
+                 :input {:path "src/demo/math.clj"
+                         :old "  (- a b)"
+                         :new "  (+ a b)"}}]
+               :stop_reason "tool_use"
+               :usage {:input_tokens 1 :output_tokens 1}})
+             (do
+               (Thread/sleep 5000)
+               (json-response
+                exchange
+                200
+                {:content [{:type "text" :text "DONE"}]
+                 :stop_reason "end_turn"
+                 :usage {:input_tokens 1 :output_tokens 1}})))))))
+    (.setExecutor server pool)
+    (.start server)
+    {:url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/v1/messages")
+     :calls calls
+     :stop (fn []
+             (.stop server 0)
+             (.shutdownNow pool))}))
+
+(deftest doctor-does-not-require-openrouter-key
+  (let [root (git-root!)
+        {:keys [exit out err timeout?]} (run-cli ["--doctor" (.getPath root)
+                                                  "moonshotai/kimi-k2.7-code"])]
+    (is (false? timeout?) err)
+    (is (= 0 exit) (str out err))
+    (is (str/includes? out "WARN model credentials - missing OR_KEY/OPENROUTER_API_KEY"))))
+
+(deftest check-edn-reports-bad-config-as-readiness-failure
+  (let [root (git-root!)
+        {:keys [exit out err timeout?]} (run-cli ["--check-edn" (.getPath root)
+                                                  "murakumo:gemma3:4b"]
+                                                 :env {"KC_RUN_TIMEOUT_MS" "soon"})]
+    (is (false? timeout?) err)
+    (is (= 1 exit) (str out err))
+    (is (= :fix-configuration (get-in (edn/read-string out) [:next-action :action])))
+    (is (str/includes? out ":ready? false"))
+    (is (str/includes? out ":next-action {:action :fix-configuration"))
+    (is (str/includes? out "KC_RUN_TIMEOUT_MS=\\\"soon\\\""))))
+
+(deftest check-edn-reports-bad-murakumo-url-as-readiness-failure
+  (let [root (git-root!)
+        {:keys [exit out err timeout?]} (run-cli ["--check-edn" (.getPath root)
+                                                  "murakumo:gemma3:4b"]
+                                                 :env {"KC_MURAKUMO_URL" "127.0.0.1:4000/v1"})]
+    (is (false? timeout?) err)
+    (is (= 1 exit) (str out err))
+    (is (= :fix-configuration (get-in (edn/read-string out) [:next-action :action])))
+    (is (str/includes? out ":ready? false"))
+    (is (str/includes? out ":next-action {:action :fix-configuration"))
+    (is (str/includes? out "KC_MURAKUMO_URL=\\\"127.0.0.1:4000/v1\\\""))))
+
+(deftest check-edn-reports-bad-boolean-config-as-readiness-failure
+  (let [root (git-root!)
+        {:keys [exit out err timeout?]} (run-cli ["--check-edn" (.getPath root)
+                                                  "murakumo:gemma3:4b"]
+                                                 :env {"KC_LIVE_TOOLS" "maybe"})]
+    (is (false? timeout?) err)
+    (is (= 1 exit) (str out err))
+    (is (= :fix-configuration (get-in (edn/read-string out) [:next-action :action])))
+    (is (str/includes? out ":ready? false"))
+    (is (str/includes? out ":next-action {:action :fix-configuration"))
+    (is (str/includes? out "KC_LIVE_TOOLS=\\\"maybe\\\""))
+    (is (str/includes? out "expected true or false"))))
+
+(deftest check-edn-requires-durable-persistence
+  (let [root (git-root!)
+        doctor (run-cli ["--doctor-edn" (.getPath root)
+                         "murakumo:gemma3:4b"]
+                        :env {"KC_LOCAL_LOG" "false"})
+        check (run-cli ["--check-edn" (.getPath root)
+                        "murakumo:gemma3:4b"]
+                       :env {"KC_LOCAL_LOG" "false"})
+        next-action (run-cli ["--next-action-edn" (.getPath root)
+                              "murakumo:gemma3:4b"]
+                             :env {"KC_LOCAL_LOG" "false"})]
+    (is (= 0 (:exit doctor)) (str (:out doctor) (:err doctor)))
+    (is (false? (:ready? (edn-out doctor))))
+    (is (str/includes? (:out doctor) ":ready? false"))
+    (is (str/includes? (:out doctor) ":detail \"disabled\""))
+    (is (= 1 (:exit check)) (str (:out check) (:err check)))
+    (is (= :repair-local-log (get-in (edn-out check) [:next-action :action])))
+    (is (str/includes? (:out check) ":ready? false"))
+    (is (str/includes? (:out check) ":detail \"disabled\""))
+    (is (str/includes? (:out check) ":next-action {:action :repair-local-log"))
+    (is (str/includes? (:out check) ":path nil"))
+    (is (= 0 (:exit next-action)) (str (:out next-action) (:err next-action)))
+    (is (= :repair-local-log (:action (edn-out next-action))))
+    (is (str/includes? (:out next-action) "{:action :repair-local-log"))
+    (is (str/includes? (:out next-action) ":path nil"))
+    (is (str/includes? (:out next-action) ":corrupt-lines 0"))))
+
+(deftest task-rejects-bad-config-before-model-call
+  (let [root (git-root!)
+        {:keys [exit out err timeout?]} (run-cli ["noop" (.getPath root)
+                                                  "murakumo:gemma3:4b"]
+                                                 :env {"KC_RUN_TIMEOUT_MS" "soon"})]
+    (is (false? timeout?) err)
+    (is (= 2 exit) (str out err))
+    (is (str/includes? out "ERROR: invalid configuration"))
+    (is (str/includes? out "KC_RUN_TIMEOUT_MS=\"soon\""))))
+
+(deftest control-commands-preserve-reason-when-model-id-is-omitted
+  (let [root (git-root!)
+        log-dir (temp-dir "kotoba-code-cli-control-reason-log")
+        loop-id (str "cli-control-reason-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        stopped (run-cli ["--stop" (.getPath root) "operator" "stop" "for" "review"]
+                         :env env)
+        secret-stopped (run-cli ["--stop" (.getPath root) "--" "token=abc123" "password=hunter2"]
+                                :env env)
+        history-edn (run-cli ["--history-edn" (.getPath root) "5"]
+                             :env env)]
+    (is (= 0 (:exit stopped)) (str (:out stopped) (:err stopped)))
+    (is (str/includes? (:out stopped) "status=stopped"))
+    (is (= 0 (:exit secret-stopped)) (str (:out secret-stopped) (:err secret-stopped)))
+    (is (= 0 (:exit history-edn)) (str (:out history-edn) (:err history-edn)))
+    (is (str/includes? (:out history-edn) ":action :stop"))
+    (is (str/includes? (:out history-edn) ":reason \"operator stop for review\""))
+    (is (str/includes? (:out history-edn) "[REDACTED]"))
+    (is (not (re-find #"abc123|hunter2" (:out history-edn))))))
+
+(deftest machine-readable-history-keeps-corrupt-log-warnings-on-stderr
+  (let [root (git-root!)
+        log-dir (temp-dir "kotoba-code-cli-corrupt-history-log")
+        loop-id (str "cli-corrupt-history-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        stopped (run-cli ["--stop" (.getPath root) "--" "operator" "stop"]
+                         :env env)
+        log-file (io/file log-dir (str loop-id ".edn"))]
+    (is (= 0 (:exit stopped)) (str (:out stopped) (:err stopped)))
+    (spit log-file "{:broken token=abc123\n" :append true)
+    (let [history-edn (run-cli ["--history-edn" (.getPath root) "5"] :env env)
+          last-edn (run-cli ["--last-edn" (.getPath root)] :env env)
+          history (edn/read-string (:out history-edn))
+          last-entry (edn/read-string (:out last-edn))]
+      (is (= 0 (:exit history-edn)) (str (:out history-edn) (:err history-edn)))
+      (is (vector? history))
+      (is (= :control (get-in (first history) [:events 0 :agent.event/type])))
+      (is (not (str/includes? (:out history-edn) "WARN")))
+      (is (str/includes? (:err history-edn) "WARN local supervisor history has corrupt-lines=1"))
+      (is (not (re-find #"abc123" (str (:out history-edn) (:err history-edn)))))
+      (is (= 0 (:exit last-edn)) (str (:out last-edn) (:err last-edn)))
+      (is (= :control (get-in last-entry [:events 0 :agent.event/type])))
+      (is (not (str/includes? (:out last-edn) "WARN")))
+      (is (str/includes? (:err last-edn) "WARN local supervisor history has corrupt-lines=1"))
+      (is (not (re-find #"abc123" (str (:out last-edn) (:err last-edn))))))))
+
+(deftest unexpected-cli-errors-are-redacted-without-stacktrace
+  (let [root (git-root!)
+        dir (temp-dir "kotoba-code-cli-error-log")
+        bad-log-parent (io/file dir "token=abc123")
+        _ (spit bad-log-parent "not a directory")
+        result (run-cli ["--stop" (.getPath root) "--" "operator" "stop"]
+                        :env {"KC_LOCAL_LOG_DIR" (.getPath bad-log-parent)
+                              "KC_LOOP_ID" "cli-unexpected-error"})]
+    (is (= 1 (:exit result)) (str (:out result) (:err result)))
+    (is (str/includes? (:out result) "ERROR: unexpected failure:"))
+    (is (str/includes? (:out result) "[REDACTED]"))
+    (is (not (re-find #"abc123|Exception|at kotoba_code|clojure\\.lang" (str (:out result) (:err result)))))))
+
+(deftest control-stop-refuses-task-until-resume
+  (let [root (git-root!)
+        log-dir (temp-dir "kotoba-code-cli-control-log")
+        loop-id (str "cli-control-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        stopped (run-cli ["--stop" (.getPath root) "murakumo:test-model" "operator" "stop" "for" "review"]
+                         :env env)
+        refused (run-cli ["noop" (.getPath root) "murakumo:test-model"]
+                         :env env)
+        history (run-cli ["--history" (.getPath root) "murakumo:test-model" "5"]
+                         :env env)
+        history-count-only (run-cli ["--history" (.getPath root) "1"]
+                                    :env env)
+        history-edn (run-cli ["--history-edn" (.getPath root) "murakumo:test-model" "5"]
+                             :env env)
+        history-edn-count-only (run-cli ["--history-edn" (.getPath root) "1"]
+                                        :env env)
+        bad-history-count (run-cli ["--history" (.getPath root) "murakumo:test-model" "nope"]
+                                   :env env)
+        huge-history-count (run-cli ["--history-edn" (.getPath root) "murakumo:test-model" "10001"]
+                                    :env env)
+        last (run-cli ["--last" (.getPath root) "murakumo:test-model"]
+                      :env env)
+        last-edn (run-cli ["--last-edn" (.getPath root) "murakumo:test-model"]
+                          :env env)
+        state-edn (run-cli ["--state-edn" (.getPath root) "murakumo:test-model"]
+                           :env env)
+        next-action-edn (run-cli ["--next-action-edn" (.getPath root) "murakumo:test-model"]
+                                 :env env)
+        resumed (run-cli ["--resume" (.getPath root) "murakumo:test-model"]
+                         :env env)
+        budget (run-cli ["--budget" (.getPath root) "murakumo:test-model"]
+                        :env env)
+        budget-edn (run-cli ["--budget-edn" (.getPath root) "murakumo:test-model"]
+                            :env env)
+        check (run-cli ["--check" (.getPath root) "murakumo:test-model"]
+                       :env env)]
+    (is (= 0 (:exit stopped)) (str (:out stopped) (:err stopped)))
+    (is (str/includes? (:out stopped) "status=stopped"))
+    (is (= 1 (:exit refused)) (str (:out refused) (:err refused)))
+    (is (str/includes? (:out refused) "refusing task: loop status is stopped"))
+    (is (str/includes? (:out refused) "Use :resume to continue"))
+    (is (= 0 (:exit history)) (str (:out history) (:err history)))
+    (is (str/includes? (:out history) "control stop"))
+    (is (str/includes? (:out history) "refusal stopped"))
+    (is (= 0 (:exit history-count-only)) (str (:out history-count-only) (:err history-count-only)))
+    (is (str/includes? (:out history-count-only) "refusal stopped"))
+    (is (= 0 (:exit history-edn)) (str (:out history-edn) (:err history-edn)))
+    (is (vector? (edn-out history-edn)))
+    (is (str/includes? (:out history-edn) ":type :control"))
+    (is (str/includes? (:out history-edn) ":action :stop"))
+    (is (str/includes? (:out history-edn) ":reason \"operator stop for review\""))
+    (is (str/includes? (:out history-edn) ":type :refusal"))
+    (is (str/includes? (:out history-edn) ":task \"noop\""))
+    (is (= 0 (:exit history-edn-count-only)) (str (:out history-edn-count-only) (:err history-edn-count-only)))
+    (is (vector? (edn-out history-edn-count-only)))
+    (is (str/includes? (:out history-edn-count-only) ":type :refusal"))
+    (is (= 2 (:exit bad-history-count)) (str (:out bad-history-count) (:err bad-history-count)))
+    (is (str/includes? (:out bad-history-count) "history count must be an integer"))
+    (is (= 2 (:exit huge-history-count)) (str (:out huge-history-count) (:err huge-history-count)))
+    (is (str/includes? (:out huge-history-count) "history count must be <= 10000"))
+    (is (= 0 (:exit last)) (str (:out last) (:err last)))
+    (is (str/includes? (:out last) "refusal stopped"))
+    (is (not (str/includes? (:out last) "control stop")))
+    (is (= 0 (:exit last-edn)) (str (:out last-edn) (:err last-edn)))
+    (is (map? (edn-out last-edn)))
+    (is (str/includes? (:out last-edn) ":status :stopped"))
+    (is (= 0 (:exit state-edn)) (str (:out state-edn) (:err state-edn)))
+    (is (= :resume (get-in (edn-out state-edn) [:next-action :action])))
+    (is (str/includes? (:out state-edn) ":ready? false"))
+    (is (str/includes? (:out state-edn) ":next-action {:action :resume"))
+    (is (str/includes? (:out state-edn) ":reason :status-stopped"))
+    (is (str/includes? (:out state-edn) ":budget {:loop"))
+    (is (str/includes? (:out state-edn) ":metrics {"))
+    (is (str/includes? (:out state-edn) ":ticks 2"))
+    (is (str/includes? (:out state-edn) ":latest-tool-error nil"))
+    (is (str/includes? (:out state-edn) ":by-status"))
+    (is (str/includes? (:out state-edn) ":latest-refusal"))
+    (is (str/includes? (:out state-edn) ":latest {:at-ms"))
+    (is (str/includes? (:out state-edn) ":lease #:agent.lease{:loop"))
+    (is (str/includes? (:out state-edn) ":lease-status {:present? true"))
+    (is (str/includes? (:out state-edn) ":conflict? false"))
+    (is (str/includes? (:out state-edn) ":takeover? false"))
+    (is (str/includes? (:out state-edn) ":type :refusal"))
+    (is (= 0 (:exit next-action-edn)) (str (:out next-action-edn) (:err next-action-edn)))
+    (is (= :resume (:action (edn-out next-action-edn))))
+    (is (str/includes? (:out next-action-edn) "{:action :resume"))
+    (is (str/includes? (:out next-action-edn) ":reason :status-stopped"))
+    (is (str/includes? (:out next-action-edn) ":interactive \":resume\""))
+    (is (= 0 (:exit resumed)) (str (:out resumed) (:err resumed)))
+    (is (str/includes? (:out resumed) "status=active"))
+    (is (= 0 (:exit budget)) (str (:out budget) (:err budget)))
+    (is (str/includes? (:out budget) "status=active"))
+    (is (str/includes? (:out budget) "budget={:tokens 12000"))
+    (is (= 0 (:exit budget-edn)) (str (:out budget-edn) (:err budget-edn)))
+    (is (= :active (:status (edn-out budget-edn))))
+    (is (str/includes? (:out budget-edn) ":status :active"))
+    (is (str/includes? (:out budget-edn) ":budget {:tokens 12000"))
+    (is (= 0 (:exit check)) (str (:out check) (:err check)))
+    (is (str/includes? (:out check) "READY true"))))
+
+(deftest one-shot-inspection-commands-work-without-provider-key
+  (let [root (fixture-project!)
+        log-dir (temp-dir "kotoba-code-cli-inspect-log")
+        loop-id (str "cli-inspect-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        help (run-cli ["--help"] :env env)
+        short-help (run-cli ["-h"] :env env)
+        version (run-cli ["--version"] :env env)
+        version-edn (run-cli ["--version-edn"] :env env)
+        tools (run-cli ["--tools"] :env env)
+        tools-edn (run-cli ["--tools-edn"] :env env)
+        commands-edn (run-cli ["--commands-edn"] :env env)
+        interactive-commands-edn (run-cli ["--interactive-commands-edn"] :env env)
+        capabilities-edn (run-cli ["--capabilities-edn"] :env env)
+        unknown-command (run-cli ["--histroy" (.getPath root) "murakumo:test-model"]
+                                 :env env)
+        next-action-edn (run-cli ["--next-action-edn" (.getPath root) "murakumo:test-model"]
+                                 :env env)
+	log (run-cli ["--log" (.getPath root)] :env env)
+        log-edn (run-cli ["--log-edn" (.getPath root)] :env env)
+	read (run-cli ["--read" (.getPath root) "src/demo/math.clj" "1" "2"] :env env)
+        read-missing-path (run-cli ["--read" (.getPath root)] :env env)
+        read-bad-start (run-cli ["--read" (.getPath root) "src/demo/math.clj" "nope"] :env env)
+        read-bad-range (run-cli ["--read" (.getPath root) "src/demo/math.clj" "10" "3"] :env env)
+        read-extra (run-cli ["--read" (.getPath root) "src/demo/math.clj" "1" "2" "extra"] :env env)
+	red-test (run-cli ["--test" (.getPath root)]
+			  :env (assoc env
+				      "KC_TEST_CMD"
+				      "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""))
+        _ (spit (io/file root "src/demo/math.clj")
+	        "(ns demo.math)\n(defn add [a b]\n  (+ a b))\n")
+	status (run-cli ["--status" (.getPath root)] :env env)
+        status-extra (run-cli ["--status" (.getPath root) "extra"] :env env)
+	diff (run-cli ["--diff" (.getPath root)] :env env)
+        green-test (run-cli ["--test" (.getPath root)]
+                            :env (assoc env
+                                        "KC_TEST_CMD"
+                                        "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""))]
+    (is (= 0 (:exit help)) (str (:out help) (:err help)))
+    (is (str/includes? (:out help) "usage: clojure -M -m kotoba-code.main \"<task>\" <project-root> [model-id]"))
+    (is (str/includes? (:out help) "or: usage: clojure -M -m kotoba-code.main --interactive <project-root> [model-id]"))
+    (is (str/includes? (:out help) "or: usage: clojure -M -m kotoba-code.main --version-edn"))
+    (is (str/includes? (:out help) "or: usage: clojure -M -m kotoba-code.main --capabilities-edn"))
+    (is (str/includes? (:out help) "or: usage: clojure -M -m kotoba-code.main --stop <project-root> [model-id] [reason]"))
+    (is (= 0 (:exit short-help)) (str (:out short-help) (:err short-help)))
+    (is (= (:out help) (:out short-help)))
+    (is (= 0 (:exit version)) (str (:out version) (:err version)))
+    (is (str/includes? (:out version) "kotoba-code dev schema-version=10"))
+    (is (= 0 (:exit version-edn)) (str (:out version-edn) (:err version-edn)))
+    (is (= {:agent "kotoba-code"
+            :version "dev"
+            :schema-version 10
+            :default-model "z-ai/glm-5.2"}
+           (edn/read-string (:out version-edn))))
+    (is (= 0 (:exit tools)) (str (:out tools) (:err tools)))
+    (is (str/includes? (:out tools) "replace_text"))
+    (is (= 0 (:exit tools-edn)) (str (:out tools-edn) (:err tools-edn)))
+    (is (vector? (edn-out tools-edn)))
+    (is (str/includes? (:out tools-edn) "{:name \"replace_text\", :kind :edit, :description"))
+    (is (str/includes? (:out tools-edn) ":schema {:type \"object\""))
+    (is (str/includes? (:out tools-edn) ":required [\"path\" \"old\" \"new\"]"))
+    (is (str/includes? (:out tools-edn) ":limits {:max-replacement-bytes 200000, :exactly-one-occurrence? true}"))
+    (is (str/includes? (:out tools-edn) ":limits {:max-lines 400}"))
+    (is (str/includes? (:out tools-edn) "{:name \"shell\", :kind :execute, :description"))
+    (is (str/includes? (:out tools-edn) ":rejects [:shell-metacharacters :parent-traversal :absolute-paths :home-paths :symlink-following-search]"))
+    (is (str/includes? (:out tools-edn) ":restricted? true"))
+    (is (= 0 (:exit commands-edn)) (str (:out commands-edn) (:err commands-edn)))
+    (is (vector? (edn-out commands-edn)))
+    (is (str/includes? (:out commands-edn) "{:name \"--version\", :kind :catalog, :args []"))
+    (is (str/includes? (:out commands-edn) "{:name \"--version-edn\", :kind :catalog, :args [], :machine-readable? true"))
+    (is (str/includes? (:out commands-edn) ":name \"--state-edn\""))
+    (is (str/includes? (:out commands-edn) ":name \"--next-action-edn\""))
+    (is (str/includes? (:out commands-edn) ":name \"--log-edn\""))
+    (is (str/includes? (:out commands-edn) ":name \"--reset-budget\""))
+    (is (str/includes? (:out commands-edn) ":kind :diagnostic"))
+    (is (str/includes? (:out commands-edn) ":kind :control"))
+    (is (str/includes? (:out commands-edn) "{:name \"--commands-edn\", :kind :catalog, :args [], :machine-readable? true"))
+    (is (str/includes? (:out commands-edn) "{:name \"--interactive-commands-edn\", :kind :catalog, :args [], :machine-readable? true"))
+    (is (str/includes? (:out commands-edn) ":usage \"usage: clojure -M -m kotoba-code.main --interactive <project-root> [model-id]\""))
+    (is (str/includes? (:out commands-edn) ":suggestion {:enabled? true, :max-distance 4, :prefix \"--\", :prefix-isolated? true}"))
+    (is (str/includes? (:out commands-edn) ":usage \"usage: clojure -M -m kotoba-code.main --stop <project-root> [model-id] [reason]\""))
+    (is (str/includes? (:out commands-edn) ":side-effect :control-log-write"))
+    (is (str/includes? (:out commands-edn) ":exit-codes [0 1 2]"))
+    (is (= 0 (:exit interactive-commands-edn)) (str (:out interactive-commands-edn) (:err interactive-commands-edn)))
+    (is (vector? (edn-out interactive-commands-edn)))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":version\", :kind :catalog, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":version-edn\", :kind :catalog, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":tools-edn\", :kind :catalog, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":commands\", :kind :catalog, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":capabilities\", :kind :catalog, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":budget-edn\", :kind :supervisor, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":doctor-edn\", :kind :diagnostic, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":check-edn\", :kind :diagnostic, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":state\", :kind :diagnostic, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":next-action\", :kind :diagnostic, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":log-edn\", :kind :supervisor, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":history\", :kind :supervisor, :args [\"N?\"], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":history-edn\", :kind :supervisor, :args [\"N?\"], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":last-edn\", :kind :supervisor, :args [], :side-effect :read-only, :matching :exact-token"))
+    (is (str/includes? (:out interactive-commands-edn) ":usage \"usage: :history [N]\""))
+    (is (str/includes? (:out interactive-commands-edn) ":suggestion {:enabled? true, :max-distance 4, :prefix \":\", :prefix-isolated? true}"))
+    (is (str/includes? (:out interactive-commands-edn) ":usage \"usage: :read PATH [START] [END]\""))
+    (is (str/includes? (:out interactive-commands-edn) "{:name \":quit\", :aliases [\":q\"], :kind :exit"))
+    (is (= 0 (:exit capabilities-edn)) (str (:out capabilities-edn) (:err capabilities-edn)))
+    (is (= 10 (:schema-version (edn-out capabilities-edn))))
+    (is (str/includes? (:out capabilities-edn) ":schema-version 10"))
+    (is (str/includes? (:out capabilities-edn) ":version \"dev\""))
+    (is (str/includes? (:out capabilities-edn) ":default-model \"z-ai/glm-5.2\""))
+    (is (str/includes? (:out capabilities-edn) ":tools [{:name \"read_file\", :kind :read, :description"))
+    (is (str/includes? (:out capabilities-edn) ":usage \"usage: clojure -M -m kotoba-code.main --check-edn <project-root> [model-id]\""))
+    (is (str/includes? (:out capabilities-edn) ":interactive-commands [{:name \":help\", :aliases [\":h\" \"/help\"]"))
+    (is (str/includes? (:out capabilities-edn) ":usage \"usage: :reset-budget [REASON]\""))
+    (is (str/includes? (:out capabilities-edn) ":next-actions [{:action :run-task, :kind :ready"))
+    (is (str/includes? (:out capabilities-edn) ":fields [:action :reason :command :interactive]"))
+    (is (str/includes? (:out capabilities-edn) ":fields [:action :reason :detail :path :corrupt-lines :errors :env :command]"))
+    (is (str/includes? (:out capabilities-edn) "{:action :inspect-worktree, :kind :repository"))
+    (is (str/includes? (:out capabilities-edn) ":fields [:action :reason :detail :command :interactive :then]"))
+    (is (str/includes? (:out capabilities-edn) "{:action :inspect-history, :kind :diagnostic"))
+    (is (str/includes? (:out capabilities-edn) ":state-report {:sections [:root :model :runtime :ready? :doctor :budget :next-action :log :metrics :lease :lease-status :latest]"))
+    (is (str/includes? (:out capabilities-edn) ":latest [:latest-run-summary :latest-tool-error :latest-error :latest-refusal :latest-control]"))
+    (is (str/includes? (:out capabilities-edn) ":latest-tool-error [:id :name :error? :result-tail]"))
+    (is (str/includes? (:out capabilities-edn) ":run-summary [:status :green? :elapsed-ms :task :tool-calls :tool-errors :rounds :timeout? :exception? :rolled-back? :rollback-error? :git-dirty? :git-status-error? :git-status-tail]"))
+    (is (str/includes? (:out capabilities-edn) ":history-entry {:container {:history-edn :vector, :last-edn :entry-or-nil}"))
+    (is (str/includes? (:out capabilities-edn) ":log-report {:commands [\"--log-edn\" \":log-edn\"]"))
+    (is (str/includes? (:out capabilities-edn) ":metrics {:counters [:ticks], :maps [:by-status :events], :latest [:latest-run-summary :latest-tool-error :latest-error :latest-refusal :latest-control]}"))
+    (is (str/includes? (:out capabilities-edn) ":entry [:at-ms :decision :loop :tick :lease :events :governor]"))
+    (is (str/includes? (:out capabilities-edn) ":tool-call [:id :name :input :result-tail :error?]"))
+    (is (str/includes? (:out capabilities-edn) ":readiness-report {:commands [\"--doctor-edn\" \"--check-edn\"]"))
+    (is (str/includes? (:out capabilities-edn) ":next-action :map-when-check-edn"))
+    (is (str/includes? (:out capabilities-edn) ":check [:label :ok? :detail]"))
+    (is (str/includes? (:out capabilities-edn) ":labels [\"root\" \"model\" \"configuration\" \"model credentials\" \"loop\" \"local log\" \"lease\" \"kotoba datom\" \"git\" \"timeouts\" \"test command\"]"))
+    (is (str/includes? (:out capabilities-edn) ":capabilities-report {:top-level [:schema-version :agent :version :default-model :catalogs"))
+    (is (str/includes? (:out capabilities-edn) ":catalogs [:tools :commands :interactive-commands :next-actions :state-report :history-entry :readiness-report :log-report :capabilities-report]"))
+    (is (str/includes? (:out capabilities-edn) "{:name \":reset-budget\", :kind :control, :args [\"reason?\"], :side-effect :control-log-write, :matching :exact-token"))
+    (is (str/includes? (:out capabilities-edn) ":interactive {:unknown-colon-input :reject, :unknown-dash-input :reject, :non-command-input :agent-task}"))
+    (is (str/includes? (:out capabilities-edn) ":schema {:type \"object\", :properties {:path"))
+    (is (str/includes? (:out capabilities-edn) "{:name \"--capabilities-edn\", :kind :catalog"))
+    (is (str/includes? (:out capabilities-edn) ":exit-codes {:ok 0, :not-ready-or-not-green 1, :unexpected-failure 1, :usage-or-configuration-error 2}"))
+    (is (str/includes? (:out capabilities-edn) ":exit-code-policy {:doctor {:commands [\"--doctor\" \"--doctor-edn\"], :ready 0, :not-ready 0"))
+    (is (str/includes? (:out capabilities-edn) ":agent-run {:commands [\"<task>\" \"--interactive\" \"--tui\"]"))
+    (is (str/includes? (:out capabilities-edn) ":verify {:commands [\"--test\"], :green 0, :not-green 1"))
+    (is (str/includes? (:out capabilities-edn) ":check {:commands [\"--check\" \"--check-edn\"], :ready 0, :not-ready 1"))
+    (is (str/includes? (:out capabilities-edn) ":limits {:tools {:max-write-bytes 200000"))
+    (is (str/includes? (:out capabilities-edn) ":max-read-lines 400"))
+    (is (str/includes? (:out capabilities-edn) ":max-list-entries 400"))
+    (is (str/includes? (:out capabilities-edn) ":transcript {:max-input-string 240, :max-input-items 20, :max-result-tail-chars 240}"))
+    (is (str/includes? (:out capabilities-edn) ":local-log {:max-line-chars 1048576}"))
+    (is (str/includes? (:out capabilities-edn) ":model-retry-attempts 4"))
+    (is (str/includes? (:out capabilities-edn) ":model-retry [\"KC_MODEL_RETRY_ATTEMPTS\" \"KC_MODEL_RETRY_BACKOFF_MS\"]"))
+    (is (str/includes? (:out capabilities-edn) ":provider-keys [\"OR_KEY\" \"OPENROUTER_API_KEY\"]"))
+    (is (str/includes? (:out capabilities-edn) ":boolean-toggles [\"KC_LOCAL_LOG\" \"KC_TOOL_TRANSCRIPT\" \"KC_LIVE_TOOLS\"]"))
+    (is (str/includes? (:out capabilities-edn) ":boolean-values [\"true\" \"false\"]"))
+    (is (= 2 (:exit unknown-command)) (str (:out unknown-command) (:err unknown-command)))
+    (is (str/includes? (:out unknown-command) "ERROR: unknown command --histroy"))
+    (is (str/includes? (:out unknown-command) "Did you mean --history?"))
+    (is (str/includes? (:out unknown-command) "Use --help to list commands."))
+    (is (= 0 (:exit next-action-edn)) (str (:out next-action-edn) (:err next-action-edn)))
+    (is (= :run-task (:action (edn-out next-action-edn))))
+    (is (str/includes? (:out next-action-edn) "{:action :run-task"))
+    (is (str/includes? (:out next-action-edn) ":interactive \"<task>\""))
+    (is (= 0 (:exit log)) (str (:out log) (:err log)))
+    (is (str/includes? (:out log) loop-id))
+    (is (= 0 (:exit log-edn)) (str (:out log-edn) (:err log-edn)))
+    (is (str/includes? (:path (edn-out log-edn)) loop-id))
+    (is (str/includes? (:out log-edn) ":enabled? true"))
+    (is (str/includes? (:out log-edn) loop-id))
+    (is (= 0 (:exit read)) (str (:out read) (:err read)))
+    (is (str/includes? (:out read) "1 | (ns demo.math)"))
+    (is (str/includes? (:out read) "2 | (defn add [a b]"))
+    (is (= 2 (:exit read-missing-path)) (str (:out read-missing-path) (:err read-missing-path)))
+    (is (str/includes? (:out read-missing-path) "usage: clojure -M -m kotoba-code.main --read <project-root> <path> [start] [end]"))
+    (is (= 2 (:exit read-bad-start)) (str (:out read-bad-start) (:err read-bad-start)))
+    (is (str/includes? (:out read-bad-start) "start line must be an integer: nope"))
+    (is (= 2 (:exit read-bad-range)) (str (:out read-bad-range) (:err read-bad-range)))
+    (is (str/includes? (:out read-bad-range) "end line must be >= start line"))
+    (is (= 2 (:exit read-extra)) (str (:out read-extra) (:err read-extra)))
+    (is (str/includes? (:out read-extra) "too many arguments for --read"))
+    (is (= 1 (:exit red-test)) (str (:out red-test) (:err red-test)))
+    (is (str/includes? (:out red-test) "1 failures, 0 errors"))
+    (is (= 0 (:exit status)) (str (:out status) (:err status)))
+    (is (str/includes? (:out status) "M src/demo/math.clj"))
+    (is (= 2 (:exit status-extra)) (str (:out status-extra) (:err status-extra)))
+    (is (str/includes? (:out status-extra) "too many arguments for --status"))
+    (is (= 0 (:exit diff)) (str (:out diff) (:err diff)))
+    (is (str/includes? (:out diff) "-  (- a b)"))
+    (is (str/includes? (:out diff) "+  (+ a b)"))
+    (is (= 0 (:exit green-test)) (str (:out green-test) (:err green-test)))
+    (is (str/includes? (:out green-test) "0 failures, 0 errors"))))
+
+(deftest machine-readable-command-catalog-is-executable-edn
+  (let [root (fixture-project!)
+        log-dir (temp-dir "kotoba-code-cli-machine-readable-log")
+        loop-id (str "cli-machine-readable-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        commands-result (run-cli ["--commands-edn"] :env env)
+        commands (edn-out commands-result)
+        machine-readable-commands (filter :machine-readable? commands)]
+    (is (= 0 (:exit commands-result)) (str (:out commands-result) (:err commands-result)))
+    (is (seq machine-readable-commands))
+    (doseq [{:keys [name] :as command} machine-readable-commands
+            :let [result (run-cli (catalog-command-args root command) :env env)]]
+      (is (= 0 (:exit result))
+          (str name " should exit 0\nOUT:\n" (:out result) "\nERR:\n" (:err result)))
+      (is (not (:timeout? result))
+          (str name " should not time out"))
+      (is (try
+            (edn/read-string (:out result))
+            true
+            (catch Exception _
+              false))
+          (str name " should print parseable EDN")))))
+
+(deftest interactive-smoke-runs-terminal-commands-from-stdin
+  (let [root (fixture-project!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-log")
+        loop-id (str "cli-interactive-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        {:keys [exit out err timeout?]}
+        (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                 :env env
+                 :stdin (str ":help\n"
+                             ":histroy\n"
+                             ":read src/demo/math.clj 1 1 extra\n"
+                             ":read src/demo/math.clj 1 1\n"
+                             ":history nope\n"
+                             ":history-edn 1\n"
+                             ":last\n"
+                             ":last-edn\n"
+                             ":tools-edn\n"
+                             ":commands\n"
+                             ":capabilities\n"
+                             ":budget-edn\n"
+                             ":doctor-edn\n"
+                             ":check-edn\n"
+                             ":next-action\n"
+                             ":log-edn\n"
+                             ":state\n"
+                             ":quit\n")
+                 :timeout-ms 20000)]
+    (is (false? timeout?) err)
+    (is (= 0 exit) (str out err))
+    (is (str/includes? out "-- kotoba-code interactive --"))
+    (is (str/includes? out "kotoba-code>"))
+    (is (str/includes? out "usage: :history [N] [supervisor]"))
+    (is (str/includes? out "usage: :read PATH [START] [END] [inspect]"))
+    (is (str/includes? out "ERROR: unknown interactive command \":histroy\""))
+    (is (str/includes? out "Did you mean :history?"))
+    (is (str/includes? out "ERROR: too many arguments for :read; usage: :read PATH [START] [END]"))
+    (is (str/includes? out "1 | (ns demo.math)"))
+    (is (str/includes? out "ERROR: history count must be an integer: nope"))
+    (is (str/includes? out "kotoba-code> []"))
+    (is (str/includes? out "no local supervisor history"))
+    (is (str/includes? out "kotoba-code> nil"))
+    (is (str/includes? out "{:name \"read_file\", :kind :read, :description"))
+    (is (str/includes? out "{:name \"replace_text\", :kind :edit, :description"))
+    (is (str/includes? out "{:name \":commands\", :kind :catalog"))
+    (is (str/includes? out "{:name \":history-edn\", :kind :supervisor"))
+    (is (str/includes? out "{:name \":last-edn\", :kind :supervisor"))
+    (is (str/includes? out ":schema-version 10"))
+    (is (str/includes? out ":interactive {:unknown-colon-input :reject, :unknown-dash-input :reject, :non-command-input :agent-task}"))
+    (is (str/includes? out ":decision :continue"))
+    (is (str/includes? out "{:action :run-task"))
+    (is (str/includes? out ":interactive \"<task>\""))
+    (is (str/includes? out ":ready? true"))
+    (is (str/includes? out ":writable? true"))
+    (is (str/includes? out ":corrupt-lines 0"))
+    (is (str/includes? out ":latest-summary nil"))
+    (is (str/includes? out ":ready? true"))
+    (is (str/includes? out ":runtime {:loop-id"))
+    (is (str/includes? out ":lease-status {:present? false"))
+    (is (str/includes? out "bye"))))
+
+(deftest interactive-restart-restores-stopped-loop-from-local-log
+  (let [root (fixture-project!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-restart-log")
+        loop-id (str "cli-interactive-restart-" (System/nanoTime))
+        env {"KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}
+        stopped (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                         :env env
+                         :stdin (str ":stop operator restart smoke\n"
+                                     ":quit\n")
+                         :timeout-ms 20000)
+        restarted (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                           :env env
+                           :stdin (str "noop after restart\n"
+                                       ":quit\n")
+                           :timeout-ms 20000)
+        history (run-cli ["--history" (.getPath root) "murakumo:test-model" "5"]
+                         :env env)]
+    (is (= 0 (:exit stopped)) (str (:out stopped) (:err stopped)))
+    (is (str/includes? (:out stopped) "status=stopped"))
+    (is (= 0 (:exit restarted)) (str (:out restarted) (:err restarted)))
+    (is (str/includes? (:out restarted) "refusing task: loop status is stopped"))
+    (is (str/includes? (:out restarted) "Use :resume to continue"))
+    (is (= 0 (:exit history)) (str (:out history) (:err history)))
+    (is (str/includes? (:out history) "control stop"))
+    (is (str/includes? (:out history) "refusal stopped"))))
+
+(deftest interactive-restart-restores-exhausted-budget-from-local-log
+  (let [root (fixture-project!)
+        gateway (start-fake-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-budget-restart-log")
+        loop-id (str "cli-interactive-budget-restart-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id
+             "KC_LOOP_ROUNDS" "1"}]
+    (try
+      (let [first-run (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                               :env env
+                               :stdin (str "fix the failing add test\n"
+                                           ":quit\n")
+                               :timeout-ms 45000)
+            calls-after-first (count @(:calls gateway))
+            restarted (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                               :env env
+                               :stdin (str "noop after budget restart\n"
+                                           ":quit\n")
+                               :timeout-ms 20000)
+            history (run-cli ["--history" (.getPath root) "murakumo:test-model" "5"]
+                             :env env)]
+        (is (= 0 (:exit first-run)) (str (:out first-run) (:err first-run)))
+        (is (str/includes? (:out first-run) "-- gate -- GREEN"))
+        (is (= 2 calls-after-first))
+        (is (= 0 (:exit restarted)) (str (:out restarted) (:err restarted)))
+        (is (str/includes? (:out restarted) "decision=hold reason=budget-exhausted"))
+        (is (str/includes? (:out restarted) "Start a new KC_LOOP_ID"))
+        (is (= calls-after-first (count @(:calls gateway))) "restart refusal must not call the model")
+        (is (= 0 (:exit history)) (str (:out history) (:err history)))
+        (is (str/includes? (:out history) "refusal active")))
+      (finally
+        ((:stop gateway))))))
+
+(deftest interactive-restart-reset-budget-allows-later-task
+  (let [root (fixture-project!)
+        gateway (start-fake-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-budget-recovery-log")
+        loop-id (str "cli-interactive-budget-recovery-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id
+             "KC_LOOP_ROUNDS" "1"}]
+    (try
+      (let [first-run (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                               :env env
+                               :stdin (str "fix the failing add test\n"
+                                           ":quit\n")
+                               :timeout-ms 45000)
+            calls-after-first (count @(:calls gateway))
+            recovered (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                               :env env
+                               :stdin (str ":reset-budget operator restart recovery\n"
+                                           "verify after restart reset\n"
+                                           ":quit\n")
+                               :timeout-ms 45000)
+            history (run-cli ["--history-edn" (.getPath root) "murakumo:test-model" "8"]
+                             :env env)]
+        (is (= 0 (:exit first-run)) (str (:out first-run) (:err first-run)))
+        (is (str/includes? (:out first-run) "-- gate -- GREEN"))
+        (is (= 2 calls-after-first))
+        (is (= 0 (:exit recovered)) (str (:out recovered) (:err recovered)))
+        (is (str/includes? (:out recovered) "-- supervisor -- reset-budget"))
+        (is (str/includes? (:out recovered) "decision=continue"))
+        (is (str/includes? (:out recovered) "-- gate -- GREEN"))
+        (is (= 3 (count @(:calls gateway))) "restart reset follow-up should call the model exactly once")
+        (is (= 0 (:exit history)) (str (:out history) (:err history)))
+        (is (str/includes? (:out history) ":action :reset-budget")))
+      (finally
+        ((:stop gateway))))))
+
+(deftest interactive-smoke-runs-agent-task-from-stdin
+  (let [root (fixture-project!)
+        gateway (start-fake-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-task-log")
+        loop-id (str "cli-interactive-task-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id
+             "KC_LOOP_ROUNDS" "2"}]
+    (try
+      (let [{:keys [exit out err timeout?]}
+            (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                     :env env
+                     :stdin (str "fix the failing add test\n"
+                                 ":quit\n")
+                     :timeout-ms 45000)
+            source (slurp (io/file root "src/demo/math.clj"))]
+        (is (false? timeout?) err)
+        (is (= 0 exit) (str out err))
+        (is (str/includes? source "(+ a b)"))
+        (is (str/includes? out "-- kotoba-code interactive --"))
+        (is (str/includes? out "-- run -- start"))
+        (is (str/includes? out "replace_text"))
+        (is (str/includes? out "-- gate -- GREEN"))
+        (is (str/includes? out "bye"))
+        (is (<= 2 (count @(:calls gateway)))))
+      (finally
+        ((:stop gateway))))))
+
+(deftest interactive-refuses-second-task-after-budget-exhausted
+  (let [root (fixture-project!)
+        gateway (start-fake-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-budget-log")
+        loop-id (str "cli-interactive-budget-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id
+             "KC_LOOP_ROUNDS" "1"}]
+    (try
+      (let [{:keys [exit out err timeout?]}
+            (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                     :env env
+                     :stdin (str "fix the failing add test\n"
+                                 "try another task after budget is exhausted\n"
+                                 ":quit\n")
+                     :timeout-ms 45000)
+            source (slurp (io/file root "src/demo/math.clj"))]
+        (is (false? timeout?) err)
+        (is (= 0 exit) (str out err))
+        (is (str/includes? source "(+ a b)"))
+        (is (str/includes? out "-- gate -- GREEN"))
+        (is (str/includes? out "refusing task: loop status is active decision=hold reason=budget-exhausted"))
+        (is (str/includes? out "Start a new KC_LOOP_ID"))
+        (is (str/includes? out "bye"))
+        (is (= 2 (count @(:calls gateway))) "second interactive task must not call the model"))
+      (finally
+        ((:stop gateway))))))
+
+(deftest interactive-reset-budget-allows-later-task
+  (let [root (fixture-project!)
+        gateway (start-fake-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-interactive-reset-log")
+        loop-id (str "cli-interactive-reset-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id
+             "KC_LOOP_ROUNDS" "1"}]
+    (try
+      (let [{:keys [exit out err timeout?]}
+            (run-cli ["--interactive" (.getPath root) "murakumo:test-model"]
+                     :env env
+                     :stdin (str "fix the failing add test\n"
+                                 "try another task after budget is exhausted\n"
+                                 ":reset-budget operator extends budget\n"
+                                 "verify after reset\n"
+                                 ":quit\n")
+                     :timeout-ms 45000)
+            source (slurp (io/file root "src/demo/math.clj"))]
+        (is (false? timeout?) err)
+        (is (= 0 exit) (str out err))
+        (is (str/includes? source "(+ a b)"))
+        (is (str/includes? out "reason=budget-exhausted"))
+        (is (str/includes? out "-- supervisor -- reset-budget"))
+        (is (str/includes? out "decision=continue"))
+        (is (= 2 (count (re-seq #"-- gate -- GREEN" out))))
+        (is (str/includes? out "bye"))
+        (is (= 3 (count @(:calls gateway))) "reset follow-up task should call the model exactly once"))
+      (finally
+        ((:stop gateway))))))
+
+(deftest task-drives-openai-compatible-tool-loop-and-gate
+  (let [root (fixture-project!)
+        gateway (start-fake-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-budget-log")
+        loop-id (str "cli-budget-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id
+             "KC_LOOP_ROUNDS" "1"}]
+    (try
+      (let [{:keys [exit out err timeout?]}
+            (run-cli ["fix the failing add test" (.getPath root) "murakumo:test-model"]
+                     :env env
+                     :timeout-ms 45000)
+            source (slurp (io/file root "src/demo/math.clj"))
+            calls-after-green (count @(:calls gateway))
+            refused (run-cli ["try another task after budget is exhausted" (.getPath root) "murakumo:test-model"]
+                             :env env
+                             :timeout-ms 20000)
+            reset-budget (run-cli ["--reset-budget" (.getPath root) "murakumo:test-model" "operator" "extends" "budget"]
+                                  :env env)
+            budget-edn (run-cli ["--budget-edn" (.getPath root) "murakumo:test-model"]
+                                :env env)
+            history-edn (run-cli ["--history-edn" (.getPath root) "murakumo:test-model" "5"]
+                                  :env env)]
+        (is (false? timeout?) err)
+        (is (= 0 exit) (str out err))
+        (is (str/includes? source "(+ a b)"))
+        (is (str/includes? out "-- gate -- GREEN"))
+        (is (str/includes? out "replace_text"))
+        (is (<= 2 calls-after-green))
+        (is (= 1 (:exit refused)) (str (:out refused) (:err refused)))
+        (is (str/includes? (:out refused) "reason=budget-exhausted"))
+        (is (str/includes? (:out refused) "Start a new KC_LOOP_ID"))
+        (is (= calls-after-green (count @(:calls gateway))) "budget refusal must not call the model")
+        (is (= 0 (:exit reset-budget)) (str (:out reset-budget) (:err reset-budget)))
+        (is (str/includes? (:out reset-budget) "reset-budget"))
+        (is (str/includes? (:out reset-budget) "decision=continue"))
+        (is (= 0 (:exit budget-edn)) (str (:out budget-edn) (:err budget-edn)))
+        (is (str/includes? (:out budget-edn) ":decision :continue"))
+        (is (str/includes? (:out budget-edn) ":reason :ok"))
+        (is (= 0 (:exit history-edn)) (str (:out history-edn) (:err history-edn)))
+        (is (str/includes? (:out history-edn) ":type :run-summary"))
+        (is (str/includes? (:out history-edn) ":elapsed-ms"))
+        (is (str/includes? (:out history-edn) ":tool-errors 0"))
+        (is (str/includes? (:out history-edn) ":task \"fix the failing add test\""))
+        (is (str/includes? (:out history-edn) ":rolled-back? false"))
+        (is (str/includes? (:out history-edn) ":rollback-error? false"))
+        (is (str/includes? (:out history-edn) ":git-dirty? true"))
+        (is (str/includes? (:out history-edn) "M src/demo/math.clj"))
+        (is (str/includes? (:out history-edn) ":type :refusal"))
+        (is (str/includes? (:out history-edn) ":reason :budget-exhausted"))
+        (is (str/includes? (:out history-edn) ":action :reset-budget"))
+        (is (str/includes? (:out history-edn) ":reason \"operator extends budget\"")))
+      (finally
+        ((:stop gateway))))))
+
+(deftest timeout-rolls-back-partial-edit-and-records-history
+  (let [root (fixture-project!)
+        gateway (start-timeout-gateway!)
+        log-dir (temp-dir "kotoba-code-cli-timeout-log")
+        loop-id (str "cli-timeout-" (System/nanoTime))
+        env {"KC_TOOL_TRANSCRIPT" "true"
+             "KC_LIVE_TOOLS" "false"
+             "KC_MURAKUMO_URL" (:url gateway)
+             "KC_RUN_TIMEOUT_MS" "900"
+             "KC_HTTP_TIMEOUT_MS" "10000"
+             "KC_PROCESS_TIMEOUT_MS" "20000"
+             "KC_TEST_CMD" "kbb -M -e \"(require 'demo.math-test 'clojure.test) (clojure.test/run-tests 'demo.math-test)\""
+             "KC_LOCAL_LOG_DIR" (.getPath log-dir)
+             "KC_LOOP_ID" loop-id}]
+    (try
+      (let [{:keys [exit out err timeout?]}
+            (run-cli ["trigger a timeout after editing" (.getPath root) "murakumo:test-model"]
+                     :env env
+                     :timeout-ms 12000)
+            source (slurp (io/file root "src/demo/math.clj"))
+            history (run-cli ["--history" (.getPath root) "murakumo:test-model" "5"]
+                             :env env)]
+        (is (false? timeout?) err)
+        (is (= 1 exit) (str out err))
+        (is (str/includes? out "run timed out after 900ms"))
+        (is (str/includes? out "-- gate -- NOT GREEN"))
+        (is (str/includes? source "(- a b)") "partial edit was rolled back")
+        (is (= 0 (:exit history)) (str (:out history) (:err history)))
+        (is (str/includes? (:out history) "status=error"))
+        (is (str/includes? (:out history) "timeout?=true"))
+        (is (str/includes? (:out history) "exception?=false"))
+        (is (str/includes? (:out history) "rolled-back?=true"))
+        (is (str/includes? (:out history) "rollback-error?="))
+        (is (str/includes? (:out history) "error run timed out after 900ms"))
+        (is (<= 2 (count @(:calls gateway)))))
+      (finally
+        ((:stop gateway))))))

@@ -1,0 +1,547 @@
+(ns kotoba-code.host
+  "Leftover JVM host I/O (HTTP, fs, git) — host-listen HOLD, not operator start.
+  Do not wrap Datalevin/LMDB JNI or --enable-native-access leftovers as a C .so.
+
+  JVM host capabilities — the real I/O behind the injected tool/model seams.
+  Filesystem access is sandboxed to a project root (+ optional read roots); writes
+  are recorded so a failed gate can roll the working tree back via git."
+  (:require [clojure.java.io :as io]
+            [kotoba.process :as sh]
+            [kotoba.lang.text :as str]
+            [json.data-json :as json])
+  (:import [java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
+            HttpResponse$BodyHandlers]
+           [java.net URI]
+           [java.time Duration]
+           [java.io File]
+           [java.util.concurrent TimeUnit]))
+
+;; ── HTTP + JSON host-caps (for ChatModel + kotoba-db) ───────────────────────
+
+(def ^:private client (delay (HttpClient/newHttpClient)))
+
+(defn- positive-long-env [k default]
+  (let [raw (System/getenv k)]
+    (if (str/blank? raw)
+      default
+      (try
+        (let [n (Long/parseLong raw)]
+          (if (pos? n) n default))
+        (catch NumberFormatException _
+          default)))))
+
+(defn http-fn
+  "host :http-fn — a real HTTP client over java.net.http."
+  [{:keys [url method headers body]}]
+  (let [timeout-ms (positive-long-env "KC_HTTP_TIMEOUT_MS" 120000)
+        b (doto (HttpRequest/newBuilder (URI/create url))
+            (.timeout (Duration/ofMillis timeout-ms)))]
+    (doseq [[k v] headers] (.header b (name k) (str v)))
+    (.method b (str/upper (name (or method :post)))
+             (HttpRequest$BodyPublishers/ofString (or body "")))
+    (let [resp (.send @client (.build b) (HttpResponse$BodyHandlers/ofString))]
+      {:status (.statusCode resp) :body (.body resp)})))
+
+(def json-caps
+  {:json-write json/write-str
+   :json-read  (fn [s] (json/read-str s :key-fn keyword))})
+
+(def http+json (assoc json-caps :http-fn http-fn))
+
+;; ── sandboxed filesystem ────────────────────────────────────────────────────
+
+(defn- canon ^File [f] (.getCanonicalFile (io/file f)))
+
+(defn- resolve-in
+  "Canonical File for `path` if it falls within any of `roots`, else nil."
+  [roots path]
+  (let [f (io/file path)
+        roots* (map canon roots)
+        cand (if (.isAbsolute f) (canon f) (canon (io/file (first roots*) path)))
+        cp   (.getPath cand)]
+    (when (some (fn [r] (let [rp (.getPath r)]
+                          (or (= cp rp) (str/starts-with? cp (str rp File/separator)))))
+                roots*)
+      cand)))
+
+(defn- rel-path [^File root* ^File f]
+  (str (.relativize (.toPath root*) (.toPath f))))
+
+(defn- patch-paths [patch]
+  (let [lines (str/split-lines (or patch ""))
+        raw   (mapcat (fn [line]
+                        (cond
+                          (str/starts-with? line "diff --git ")
+                          (let [[_ a b] (re-matches #"diff --git a/(.+) b/(.+)" line)]
+                            [a b])
+
+                          (str/starts-with? line "+++ b/")
+                          [(subs line 6)]
+
+                          (str/starts-with? line "--- a/")
+                          [(subs line 6)]
+
+                          :else []))
+                      lines)]
+    (->> raw
+         (remove #(or (nil? %) (= "/dev/null" %)))
+         distinct
+         vec)))
+
+(defn- safe-rel-path? [path]
+  (and (string? path)
+       (not (str/blank? path))
+       (not (.isAbsolute (io/file path)))
+       (not (some #{".."} (str/split path #"/+")))))
+
+(defn- remember! [touched root* path]
+  (let [f (resolve-in [root*] path)]
+    (when f
+      (swap! touched assoc (rel-path root* f) {:existed? (.exists f)}))))
+
+(defn- empty-dir? [^File f]
+  (and (.isDirectory f)
+       (empty? (seq (.list f)))))
+
+(defn- delete-empty-parents! [^File root* ^File f]
+  (let [root-path (.getPath root*)]
+    (loop [p (.getParentFile f)]
+      (when p
+        (let [p* (canon p)
+              p-path (.getPath p*)]
+          (when (and (not= root-path p-path)
+                     (str/starts-with? p-path (str root-path File/separator))
+                     (empty-dir? p*))
+            (io/delete-file p* true)
+            (recur (.getParentFile p*))))))))
+
+(defn- allowed-shell? [command]
+  (boolean
+   (and (string? command)
+        (not (str/blank? command))
+        (not (re-find #"[;&|`$<>]" command))
+        (not (re-find #"(^|[\s/])\.\.(/|$)" command))
+        (not (re-find #"(^|\s)/" command))
+        (not (re-find #"(^|\s)~" command))
+        (not (re-find #"(^|\s)(-L|--follow)(\s|$)" command))
+        (some #(str/starts-with? command %)
+	      ;; nbb is the workspace's script host (CLAUDE.md; kbb -M:retired as a
+	      ;; script host by ADR-2607173000), so repos whose verification
+	      ;; entry points are .cljs could not be checked at all: an actor
+	      ;; asked to run its own integrity check got DENIED and stalled.
+	      ;; The guards above still apply — no metacharacters, no absolute
+	      ;; paths, no .. traversal — so this admits `nbb <script-in-repo>`
+	      ;; and nothing outside the project root.
+	      ["kbb -M:test" "kbb -X:test" "kbb -M:test" "kbb -M:test"
+	       "nbb "
+	       "git status" "git diff" "git show" "rg " "ls" "pwd"
+	       "find ."]))))
+
+(defn- longish [x]
+  (cond
+    (integer? x) (long x)
+    (string? x) (try
+                  (Long/parseLong x)
+                  (catch NumberFormatException _ nil))
+    :else nil))
+
+(defn- process-timeout-ms []
+  (positive-long-env "KC_PROCESS_TIMEOUT_MS" 120000))
+
+(defn- bytes->str [baos]
+  (.toString baos "UTF-8"))
+
+(defn- run-proc
+  "Run a process with timeout and captured stdout/stderr.
+  Returns {:exit int|nil :out string :err string :timeout? bool}."
+  [cmd & {:keys [dir in timeout-ms]
+          :or {timeout-ms (process-timeout-ms)}}]
+  (let [pb (ProcessBuilder. ^java.util.List (vec cmd))]
+    (when dir (.directory pb (io/file dir)))
+    (let [p (.start pb)
+          out (java.io.ByteArrayOutputStream.)
+          err (java.io.ByteArrayOutputStream.)
+          pump-out (future (io/copy (.getInputStream p) out))
+          pump-err (future (io/copy (.getErrorStream p) err))]
+      (when in
+        (with-open [w (io/writer (.getOutputStream p))]
+          (.write w (str in))))
+      (when-not in
+        (.close (.getOutputStream p)))
+      (let [finished? (.waitFor p timeout-ms TimeUnit/MILLISECONDS)]
+        (if finished?
+          (do
+            @pump-out
+            @pump-err
+            {:exit (.exitValue p)
+             :out (bytes->str out)
+             :err (bytes->str err)
+             :timeout? false})
+          (do
+            (.destroyForcibly p)
+            (future-cancel pump-out)
+            (future-cancel pump-err)
+            {:exit nil
+             :out (bytes->str out)
+             :err (str (bytes->str err)
+                       "\nTIMEOUT: process exceeded " timeout-ms "ms")
+             :timeout? true}))))))
+
+(defn- trim-output [s n]
+  (subs (or s "") 0 (min n (count (or s "")))))
+
+(def ^:private max-write-bytes 200000)
+(def ^:private max-patch-bytes 200000)
+(def ^:private max-read-bytes 200000)
+(def ^:private max-read-lines 400)
+(def ^:private max-list-entries 400)
+(def ^:private max-search-pattern-bytes 1000)
+
+(def tool-limits
+  "Host-enforced limits for supervisor/catalog consumers.
+  Keep this in sync with the checks in `fs-host`; values are intentionally
+  stable data so wrappers can preflight tasks before entering a durable loop."
+  {:max-write-bytes max-write-bytes
+   :max-patch-bytes max-patch-bytes
+   :max-read-bytes max-read-bytes
+   :max-read-lines max-read-lines
+   :max-list-entries max-list-entries
+   :max-search-pattern-bytes max-search-pattern-bytes})
+
+(defn- oversized? [s n]
+  (> (count (str s)) n))
+
+(defn- read-numbered-range [^File f start-line end-line]
+  (let [start-line (or (longish start-line) 1)
+        end-line* (longish end-line)]
+    (cond
+      (or (< start-line 1) (and end-line* (< end-line* start-line)))
+      "DENIED: invalid line range"
+
+      (and end-line* (> (inc (- end-line* start-line)) max-read-lines))
+      (str "DENIED: read range exceeds " max-read-lines
+           " lines; request a smaller explicit range")
+
+      :else
+      (with-open [r (io/reader f)]
+        (loop [line-no 1
+               acc []]
+          (let [line (.readLine r)
+                too-many? (and (nil? end-line*) (> (count acc) max-read-lines))]
+            (cond
+              too-many?
+              (str "DENIED: read range exceeds " max-read-lines
+                   " lines; request a smaller explicit range")
+
+              (nil? line)
+              (if (and (empty? acc) (> start-line (dec line-no)))
+                (str "read failed: start line " start-line " exceeds " (dec line-no) " lines")
+                (str/join "\n" acc))
+
+              (and end-line* (> line-no end-line*))
+              (str/join "\n" acc)
+
+              (< line-no start-line)
+              (recur (inc line-no) acc)
+
+              :else
+              (recur (inc line-no)
+                     (conj acc (format "%5d | %s" line-no line))))))))))
+
+(defn- rollback-tracked! [^File root* paths timeout-ms]
+  (when (seq paths)
+    (let [{:keys [exit out err timeout?]} (run-proc (into ["git" "checkout" "--"] paths)
+                                                   :dir (.getPath root*)
+                                                   :timeout-ms timeout-ms)]
+      (when-not (zero? exit)
+        (throw (ex-info (str (if timeout?
+                               "rollback git checkout timed out"
+                               "rollback git checkout failed")
+                             ": "
+                             (str/trim (str out err)))
+                        {:exit exit
+                         :timeout? timeout?
+                         :paths (vec paths)}))))))
+
+(defn- directory-listing [^File d]
+  (when-let [files (some-> d .listFiles)]
+    (let [entries (->> files
+                       (map #(str (.getName ^File %)
+                                  (when (.isDirectory ^File %) "/")))
+                       sort)
+          visible (take max-list-entries entries)
+          more (- (count entries) (count visible))]
+      (str (str/join "\n" visible)
+           (when (pos? more)
+             (str "\n... truncated " more " more entr"
+                  (if (= 1 more) "y" "ies")))))))
+
+(defn- safe-file-lines [^File f]
+  (try
+    (str/split-lines (slurp f))
+    (catch Exception _
+      nil)))
+
+(defn- git-output [cmd root* timeout-ms max-bytes]
+  (let [{:keys [exit out err timeout?]} (run-proc cmd
+                                                 :dir (.getPath ^File root*)
+                                                 :timeout-ms timeout-ms)
+        s (str out err)]
+    (trim-output
+     (if (zero? exit)
+       s
+       (str "ERROR: " (if timeout? "git command timed out" "git command failed")
+            " exit=" (or exit "timeout")
+            (when (seq (str/trim s))
+              (str " " s))))
+     max-bytes)))
+
+(defn fs-host
+  "I/O host bound to `root` (the project the agent edits).
+   :read-roots — extra directories the agent may READ (e.g. sibling libs).
+   :process-timeout-ms — timeout for external process tools.
+   write-file is confined to `root` and records touched paths for rollback."
+  [root & {:keys [read-roots] :as opts}]
+  (let [root*    (canon root)
+        read-set (into [root*] (map canon read-roots))
+        proc-timeout-ms (or (:process-timeout-ms opts) (process-timeout-ms))
+        touched  (atom {})]
+    {:read-file
+     (fn [path]
+       (if-let [f (resolve-in read-set path)]
+         (cond
+           (not (.isFile f))
+           (str "NOT A FILE: " path)
+
+           (> (.length f) max-read-bytes)
+           (str "DENIED: file exceeds " max-read-bytes
+                " bytes; use read_file_numbered with an explicit line range")
+
+           :else
+           (slurp f))
+         (str "DENIED (outside read roots): " path)))
+
+     :read-file-numbered
+     (fn [path start-line end-line]
+       (if-let [f (resolve-in read-set path)]
+         (if-not (.isFile f)
+           (str "NOT A FILE: " path)
+           (read-numbered-range f start-line end-line))
+         (str "DENIED (outside read roots): " path)))
+
+     :write-file
+     (fn [path content]
+       (cond
+         (oversized? content max-write-bytes)
+         (str "DENIED: content exceeds " max-write-bytes " bytes")
+
+         :else
+         (if-let [f (resolve-in [root*] path)]
+         (do (remember! touched root* path)
+             (io/make-parents f)
+             (spit f content)
+             (str "written " path " (" (count content) " bytes)"))
+           (str "DENIED (writes confined to project root): " path))))
+
+     :apply-patch
+     (fn [patch]
+       (let [paths (patch-paths patch)]
+         (cond
+           (str/blank? (or patch ""))
+           "DENIED: empty patch"
+
+           (oversized? patch max-patch-bytes)
+           (str "DENIED: patch exceeds " max-patch-bytes " bytes")
+
+           (empty? paths)
+           "DENIED: patch has no project file paths"
+
+           (not-every? safe-rel-path? paths)
+           (str "DENIED: patch contains unsafe paths " (pr-str (remove safe-rel-path? paths)))
+
+           (not-every? #(resolve-in [root*] %) paths)
+           (str "DENIED: patch resolves outside project root "
+                (pr-str (remove #(resolve-in [root*] %) paths)))
+
+           :else
+           (do
+             (doseq [p paths] (remember! touched root* p))
+             (let [{:keys [exit out err timeout?]} (run-proc ["git" "apply" "--whitespace=nowarn" "-"]
+                                                             :in patch
+                                                             :dir (.getPath root*)
+                                                             :timeout-ms proc-timeout-ms)]
+               (if (zero? exit)
+                 (str "patch applied\n" out err)
+                 (str (if timeout? "patch timed out\n" "patch failed\n") out err)))))))
+
+     :replace-text
+     (fn [path old new]
+       (cond
+         (str/blank? (or old ""))
+         "DENIED: old text is blank"
+
+         (oversized? new max-write-bytes)
+         (str "DENIED: replacement exceeds " max-write-bytes " bytes")
+
+         :else
+         (if-let [f (resolve-in [root*] path)]
+           (if-not (.isFile f)
+             (str "NOT A FILE: " path)
+             (let [s (slurp f)
+                   n (count (re-seq (java.util.regex.Pattern/compile
+                                     (java.util.regex.Pattern/quote old))
+                                    s))]
+               (cond
+                 (zero? n)
+                 "replace failed: old text not found"
+
+                 (> n 1)
+                 (str "replace failed: old text appears " n " times")
+
+                 :else
+                 (do (remember! touched root* path)
+                     (spit f (str/replace-first s old new))
+                     (str "replaced 1 occurrence in " path)))))
+           (str "DENIED (writes confined to project root): " path))))
+
+     :replace-range
+     (fn [path start-line end-line replacement]
+       (let [start-line (longish start-line)
+             end-line (longish end-line)]
+         (cond
+           (or (nil? start-line) (nil? end-line) (< start-line 1) (< end-line start-line))
+           "DENIED: invalid line range"
+
+           (oversized? replacement max-write-bytes)
+           (str "DENIED: replacement exceeds " max-write-bytes " bytes")
+
+           :else
+           (if-let [f (resolve-in [root*] path)]
+             (if-not (.isFile f)
+               (str "NOT A FILE: " path)
+               (let [s (slurp f)
+                     had-newline? (str/ends-with? s "\n")
+                     lines (str/split-lines s)
+                     line-count (count lines)]
+                 (cond
+                   (> end-line line-count)
+                   (str "replace failed: range " start-line "-" end-line
+                        " exceeds " line-count " lines")
+
+                   :else
+                   (let [before (take (dec start-line) lines)
+                         after (drop end-line lines)
+                         repl-lines (if (str/blank? (or replacement ""))
+                                      []
+                                      (str/split-lines replacement))
+                         out (str (str/join "\n" (concat before repl-lines after))
+                                  (when had-newline? "\n"))]
+                     (remember! touched root* path)
+                     (spit f out)
+                     (str "replaced lines " start-line "-" end-line " in " path)))))
+             (str "DENIED (writes confined to project root): " path)))))
+
+     :run-clojure
+     (fn [forms]
+       (let [{:keys [out err]} (run-proc ["kbb" "-M" "-e" forms]
+                                         :dir (.getPath root*)
+                                         :timeout-ms proc-timeout-ms)]
+         (trim-output (str out err) 6000)))
+
+     :run-tests
+     (fn []
+       ;; KC_TEST_CMD env override — run an arbitrary test command in the project root
+       ;; (e.g. a babashka sweep for bb-based projects). Default: kbb -X:test.
+       (let [cmd (System/getenv "KC_TEST_CMD")
+             {:keys [out err]} (if (and cmd (not (str/blank? cmd)))
+                                 (run-proc ["bash" "-lc" cmd]
+                                           :dir (.getPath root*)
+                                           :timeout-ms proc-timeout-ms)
+                                 (run-proc ["kbb" "-X:test"]
+                                           :dir (.getPath root*)
+                                           :timeout-ms proc-timeout-ms))]
+         (str out err)))
+
+     :list-dir
+     (fn [path]
+       (if-let [d (resolve-in read-set path)]
+         (if (.isDirectory d)
+           (or (directory-listing d)
+               (str "DENIED: directory cannot be listed: " path))
+           (str "NOT A DIRECTORY: " path))
+         (str "DENIED (outside read roots): " path)))
+
+     :search
+     (fn [pattern]
+       (cond
+         (oversized? pattern max-search-pattern-bytes)
+         (str "DENIED: search pattern exceeds " max-search-pattern-bytes " bytes")
+
+         :else
+         (try
+           (let [re (re-pattern pattern)
+                 src? #(re-find #"\.(clj|cljc|cljs|edn)$" (.getName ^File %))
+                 searchable? #(and (.isFile ^File %)
+                                   (src? %)
+                                   (<= (.length ^File %) max-read-bytes))
+                 hits (for [^File f (file-seq root*)
+                            :when (searchable? f)
+                            :let  [rel (str (.relativize (.toPath root*) (.toPath f)))
+                                   lines (safe-file-lines f)]
+                            :when lines
+                            [i line] (map-indexed vector lines)
+                            :when (re-find re line)]
+                        (str rel ":" (inc i) ": " (str/trim line)))]
+             (if (seq hits)
+               (str/join "\n" (take 100 hits))
+               "(no matches)"))
+           (catch java.util.regex.PatternSyntaxException e
+             (str "DENIED: invalid search regex: " (.getDescription e))))))
+
+     :git-status
+     (fn []
+       (git-output ["git" "status" "--short" "--" "."]
+                   root*
+                   proc-timeout-ms
+                   12000))
+
+     :git-diff
+     (fn []
+       (git-output ["git" "diff" "--" "."]
+                   root*
+                   proc-timeout-ms
+                   12000))
+
+     :shell
+     (fn [command]
+       (if-not (allowed-shell? command)
+         (str "DENIED: command is not allowlisted: " command)
+         (let [{:keys [out err]} (run-proc ["bash" "-lc" command]
+                                           :dir (.getPath root*)
+                                           :timeout-ms proc-timeout-ms)
+               s (str out err)]
+           (trim-output s 12000))))
+
+     :rollback
+     (fn []
+	     (let [t @touched]
+	       (when (seq t)
+		 (let [paths (keys t)
+		       tracked (filter #(get-in t [% :existed?]) paths)
+		       created (remove #(get-in t [% :existed?]) paths)]
+		   (rollback-tracked! root* tracked proc-timeout-ms)
+		   (doseq [p created
+			   :let [f (resolve-in [root*] p)]
+			   :when (and f (.exists f))]
+		     (io/delete-file f true)
+               (delete-empty-parents! root* f))))
+         (reset! touched {})
+         t))
+
+     :clear-rollback-journal
+     (fn []
+       (let [t @touched]
+         (reset! touched {})
+         t))
+
+     :touched touched}))

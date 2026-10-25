@@ -1,0 +1,280 @@
+(ns kotoba-code.tools
+  "The coding-agent tool surface, shaped for langchain.tool / create-react-agent.
+  Pure + portable (.cljc): all real I/O is injected via a `host` capability map,
+  so the same tools run on the JVM, in the browser, or against a mock in tests.
+
+  host = {:read-file   (fn [path] -> string)
+          :read-file-numbered (fn [path start-line end-line] -> string)
+          :write-file  (fn [path content] -> string)   ; records touched paths for rollback
+          :apply-patch (fn [patch] -> string)           ; unified diff, project-confined
+          :replace-text (fn [path old new] -> string)   ; exact single replacement
+          :replace-range (fn [path start-line end-line replacement] -> string)
+          :run-clojure (fn [forms] -> string)            ; stdout+stderr of `kbb -M -e <forms>`
+          :run-tests   (fn [] -> string)                 ; stdout+stderr of the test runner
+          :list-dir    (fn [path] -> string)             ; names under a project dir
+          :search      (fn [pattern] -> string)          ; regex grep across the project
+          :git-status  (fn [] -> string)
+          :git-diff    (fn [] -> string)
+          :shell       (fn [command] -> string)}")       ; allowlisted by host
+
+(def tool-kinds
+  {"read_file" :read
+   "read_file_numbered" :read
+   "list_dir" :read
+   "search" :read
+   "replace_text" :edit
+   "replace_range" :edit
+   "apply_patch" :edit
+   "write_file" :edit
+   "run_clojure" :execute
+   "run_tests" :execute
+   "git_status" :inspect
+   "git_diff" :inspect
+   "shell" :execute})
+
+(def ^:private max-write-bytes 200000)
+(def ^:private max-patch-bytes 200000)
+(def ^:private max-search-pattern-bytes 1000)
+(def ^:private max-read-bytes 200000)
+(def ^:private max-read-lines 400)
+(def ^:private max-list-entries 400)
+
+(def tool-limits
+  {"read_file" {:max-read-bytes max-read-bytes}
+   "read_file_numbered" {:max-lines max-read-lines}
+   "write_file" {:max-write-bytes max-write-bytes}
+   "apply_patch" {:max-patch-bytes max-patch-bytes}
+   "replace_text" {:max-replacement-bytes max-write-bytes
+                   :exactly-one-occurrence? true}
+   "replace_range" {:max-replacement-bytes max-write-bytes
+                    :line-range :inclusive-1-based}
+   "list_dir" {:max-entries max-list-entries}
+   "search" {:max-pattern-bytes max-search-pattern-bytes
+             :skips-oversized-files? true}
+   "shell" {:restricted? true
+            :rejects [:shell-metacharacters
+                      :parent-traversal
+                      :absolute-paths
+                      :home-paths
+                      :symlink-following-search]}})
+
+(def tool-notes
+  {"read_file" ["Refuses files above the host read limit; use read_file_numbered for explicit windows."]
+   "read_file_numbered" ["Streams explicit line windows and refuses ranges above the line cap."]
+   "write_file" ["Overwrites complete file content and records the path for rollback."]
+   "apply_patch" ["Patch paths are project-confined and recorded for rollback."]
+   "replace_text" ["Fails unless the old text appears exactly once."]
+   "replace_range" ["Use read_file_numbered first to verify 1-based inclusive line numbers."]
+   "list_dir" ["Returns a sorted listing truncated at the host entry cap."]
+   "search" ["Regex search is bounded by pattern size and source-file size."]
+   "shell" ["Allowlisted command prefixes only; dedicated tools are preferred for reads and edits."]})
+
+(def ^:private catalog-host
+  {:read-file identity
+   :read-file-numbered (fn [& _] nil)
+   :write-file (fn [& _] nil)
+   :apply-patch (fn [& _] nil)
+   :replace-text (fn [& _] nil)
+   :replace-range (fn [& _] nil)
+   :run-clojure (fn [& _] nil)
+   :run-tests (fn [& _] nil)
+   :list-dir (fn [& _] nil)
+   :search (fn [& _] nil)
+   :git-status (fn [& _] nil)
+   :git-diff (fn [& _] nil)
+   :shell (fn [& _] nil)})
+
+(defn- normalize-tool-input [input]
+  (into {}
+        (map (fn [[k v]]
+               [(if (string? k) (keyword k) k) v]))
+        (or input {})))
+
+(defn- missing-required-args [schema input]
+  (let [input* (normalize-tool-input input)]
+    (->> (:required schema)
+         (remove (fn [k]
+                   (let [k* (keyword k)]
+                     (and (contains? input* k*)
+                          (some? (get input* k*)))))))))
+
+(defn- unknown-tool-args [schema input]
+  (let [allowed (set (keys (:properties schema)))
+        input* (normalize-tool-input input)]
+    (->> (keys input*)
+         (remove allowed)
+         (map name))))
+
+(defn- type-mismatch? [expected value]
+  (case expected
+    "string" (not (string? value))
+    "integer" (not (integer? value))
+    false))
+
+(defn- invalid-tool-args [schema input]
+  (let [input* (normalize-tool-input input)]
+    (->> (:properties schema)
+         (keep (fn [[k {expected-type :type minimum :minimum max-length :maxLength}]]
+                 (let [v (get input* k)]
+                   (when (some? v)
+                     (cond
+                       (type-mismatch? expected-type v)
+                       {:arg (name k) :expected expected-type :actual (type v)}
+
+                       (and minimum (number? v) (< v minimum))
+                       {:arg (name k) :minimum minimum :actual v}
+
+                       (and max-length (string? v) (> (count v) max-length))
+                       {:arg (name k) :maxLength max-length :actual (count v)}))))))))
+
+(defn- validate-tool-input! [tool-name schema input]
+  (let [input* (normalize-tool-input input)
+        missing (vec (missing-required-args schema input*))
+        unknown (vec (unknown-tool-args schema input*))
+        invalid (vec (invalid-tool-args schema input*))]
+    (when (seq missing)
+      (throw (ex-info (str "tool " tool-name " missing required argument(s): "
+                           (pr-str missing))
+                      {:tool tool-name
+                       :missing missing
+                       :schema schema})))
+    (when (seq unknown)
+      (throw (ex-info (str "tool " tool-name " unknown argument(s): "
+                           (pr-str unknown))
+                      {:tool tool-name
+                       :unknown unknown
+                       :schema schema})))
+    (when (seq invalid)
+      (throw (ex-info (str "tool " tool-name " invalid argument(s): "
+                           (pr-str invalid))
+                      {:tool tool-name
+                       :invalid invalid
+                       :schema schema})))
+    input*))
+
+(defn- tool-error [tool-name ^Throwable e]
+  (str "TOOL_ERROR: " tool-name ": " (ex-message e)))
+
+(defn- validated-tool [{:keys [name schema] tool-fn :fn :as tool}]
+  (assoc tool :fn (fn [input]
+                    (try
+                      (tool-fn (validate-tool-input! name schema input))
+                      (catch #?(:clj Throwable :cljs :default) e
+                        (tool-error name e))))))
+
+(defn coding-tools
+  "The ReAct coding tools bound to `host`.
+  Returns a vector of langchain tool maps {:name :description :schema :fn}."
+  [host]
+  (mapv
+   validated-tool
+   [{:name "read_file"
+     :description "Read a source file from the project (or an allowed read root)."
+     :schema {:type "object"
+              :properties {:path {:type "string" :description "project-relative or absolute path"}}
+              :required ["path"]}
+     :fn (fn [{:keys [path]}] ((:read-file host) path))}
+
+   {:name "read_file_numbered"
+    :description "Read a source file with 1-based line numbers. Use before replace_range."
+    :schema {:type "object"
+             :properties {:path {:type "string" :description "project-relative or absolute path"}
+                          :start_line {:type "integer" :minimum 1}
+                          :end_line {:type "integer" :minimum 1}}
+             :required ["path"]}
+    :fn (fn [{:keys [path start_line end_line]}]
+          ((:read-file-numbered host) path start_line end_line))}
+
+   {:name "write_file"
+    :description "Overwrite a file with the COMPLETE new content (always send the whole file)."
+    :schema {:type "object"
+             :properties {:path    {:type "string"}
+                          :content {:type "string" :maxLength max-write-bytes}}
+             :required ["path" "content"]}
+    :fn (fn [{:keys [path content]}] ((:write-file host) path content))}
+
+   {:name "apply_patch"
+    :description "Apply a unified diff patch to project files. Prefer this over write_file for small edits."
+    :schema {:type "object"
+             :properties {:patch {:type "string"
+                                  :maxLength max-patch-bytes
+                                  :description "Unified diff, e.g. diff --git a/path b/path ..."}}
+             :required ["patch"]}
+    :fn (fn [{:keys [patch]}] ((:apply-patch host) patch))}
+
+   {:name "replace_text"
+    :description "Replace exactly one occurrence of old text in a project file. Safer than write_file for small edits."
+    :schema {:type "object"
+             :properties {:path {:type "string"}
+                          :old {:type "string"}
+                          :new {:type "string" :maxLength max-write-bytes}}
+             :required ["path" "old" "new"]}
+    :fn (fn [{:keys [path old new]}] ((:replace-text host) path old new))}
+
+   {:name "replace_range"
+    :description "Replace a 1-based inclusive line range in a project file. Safer than write_file for localized edits."
+    :schema {:type "object"
+             :properties {:path {:type "string"}
+                          :start_line {:type "integer" :minimum 1}
+                          :end_line {:type "integer" :minimum 1}
+                          :replacement {:type "string" :maxLength max-write-bytes}}
+             :required ["path" "start_line" "end_line" "replacement"]}
+    :fn (fn [{:keys [path start_line end_line replacement]}]
+          ((:replace-range host) path start_line end_line replacement))}
+
+   {:name "run_clojure"
+    :description "Evaluate Clojure forms in the project via `kbb -M -e <forms>`; returns stdout+stderr."
+    :schema {:type "object"
+             :properties {:forms {:type "string"}}
+             :required ["forms"]}
+    :fn (fn [{:keys [forms]}] ((:run-clojure host) forms))}
+
+   {:name "run_tests"
+    :description "Run the project test suite; returns the runner output (look for '0 failures, 0 errors')."
+    :schema {:type "object" :properties {} :required []}
+    :fn (fn [_] ((:run-tests host)))}
+
+   {:name "list_dir"
+    :description "List the entries under a project-relative directory (defaults to the project root)."
+    :schema {:type "object"
+             :properties {:path {:type "string"}}
+             :required []}
+    :fn (fn [{:keys [path]}] ((:list-dir host) (or path ".")))}
+
+   {:name "search"
+    :description "Regex-search the project's source files; returns matching path:line snippets (capped)."
+    :schema {:type "object"
+             :properties {:pattern {:type "string" :maxLength max-search-pattern-bytes}}
+             :required ["pattern"]}
+    :fn (fn [{:keys [pattern]}] ((:search host) pattern))}
+
+   {:name "git_status"
+    :description "Show `git status --short` for the project."
+    :schema {:type "object" :properties {} :required []}
+    :fn (fn [_] ((:git-status host)))}
+
+   {:name "git_diff"
+    :description "Show the current project diff."
+    :schema {:type "object" :properties {} :required []}
+    :fn (fn [_] ((:git-diff host)))}
+
+   {:name "shell"
+    :description "Run a host-allowlisted read-only or build command in the project. Prefer dedicated tools when available."
+    :schema {:type "object"
+             :properties {:command {:type "string"}}
+             :required ["command"]}
+    :fn (fn [{:keys [command]}] ((:shell host) command))}]))
+
+(defn tool-catalog-entry [{:keys [name description schema]}]
+  (cond-> {:name name
+           :kind (get tool-kinds name)
+           :description description
+           :schema schema}
+    (contains? tool-limits name) (assoc :limits (get tool-limits name))
+    (contains? tool-notes name) (assoc :notes (get tool-notes name))
+    (= name "shell") (assoc :restricted? true)))
+
+(defn tool-catalog
+  "Machine-readable tool catalog without executable functions."
+  []
+  (mapv tool-catalog-entry (coding-tools catalog-host)))
