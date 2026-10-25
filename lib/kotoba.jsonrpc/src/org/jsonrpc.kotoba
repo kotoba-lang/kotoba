@@ -1,0 +1,505 @@
+(ns org.jsonrpc
+  (:export [json-encode json-parse-ok? json-parse-value
+            encode decode
+            request request-no-params notification notification-no-params
+            success error-response
+            parse-error invalid-request method-not-found invalid-params internal-error
+            err-parse err-invalid-request err-method-not-found err-invalid-params err-internal
+            message-kind notification? request? success-message? error-message?
+            ids-match? encode-response-batch
+            ndjson-encode ndjson-decode-line ndjson-line-count ndjson-nth-line]))
+
+;; org.jsonrpc — JSON-RPC 2.0 codec + NDJSON framing in Kotoba.
+;; Transport-agnostic: strings in, strings out. The host owns sockets.
+;; Default policy is empty; this module requests no network or fs capabilities.
+
+(defrecord Parse [ok :i64 i :i64 value :document])
+
+(defn err-parse [] :i64 -32700)
+(defn err-invalid-request [] :i64 -32600)
+(defn err-method-not-found [] :i64 -32601)
+(defn err-invalid-params [] :i64 -32602)
+(defn err-internal [] :i64 -32603)
+
+(defn kind-name [d :document] :string
+  (keyword-name (document-kind d)))
+
+(defn is-kind? [d :document k :string] :bool
+  (string=? (kind-name d) k))
+
+(defn doc=? [a :document b :document] :bool
+  (string=? (document-edn-print a) (document-edn-print b)))
+
+(defn option-document-some? [v [:option :document]] :bool
+  (if-some [x v]
+    true
+    false))
+
+(defn has-member? [m :document k :keyword] :bool
+  (option-document-some? (document-get m k)))
+
+(defn doc-get [m :document k :keyword] :document
+  (option-or (document-get m k) (document nil)))
+
+(defn box-i64 [n :i64] :document
+  (document-edn-read (string-from-i64 n)))
+
+(defn cp-width [cp :i64] :i64
+  (cond
+    (< cp 128) 1
+    (< cp 2048) 2
+    (< cp 65536) 3
+    :else 4))
+
+(defn peek [s :string i :i64] :i64
+  (if (>= i (string-length s))
+    0
+    (string-code-point-at s i)))
+
+(defn is-ws? [cp :i64] :bool
+  (or (= cp 32) (or (= cp 9) (or (= cp 10) (= cp 13)))))
+
+(defn skip-ws [s :string i :i64] :i64
+  (if (>= i (string-length s))
+    i
+    (if (is-ws? (peek s i))
+      (skip-ws s (+ i 1))
+      i)))
+
+(defn escape-edn [s :string i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    acc
+    (let [c (peek s i)
+          w (cp-width c)
+          ch (string-substring s i (+ i w))
+          piece (cond
+                  (= c 92) "\\\\"
+                  (= c 34) "\\\""
+                  :else ch)]
+      (escape-edn s (+ i w) n (string-concat acc piece)))))
+
+(defn box-str [s :string] :document
+  (document-edn-read
+   (string-join "" "\"" (escape-edn s 0 (string-length s) "") "\"")))
+
+(defn doc-string [d :document] :string
+  (if (is-kind? d "string")
+    (let [p (document-edn-print d)
+          n (string-length p)]
+      (if (< n 2)
+        ""
+        (string-substring p 1 (- n 1))))
+    ""))
+
+(defn p-ok [i :i64 value :document] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (->Parse 1 i value))
+
+(defn p-fail [i :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (->Parse 0 i (document nil)))
+
+(defn parse-lit [s :string i :i64 lit :string value :document] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [n (string-length lit)
+        end (+ i n)]
+    (if (> end (string-length s))
+      (p-fail i)
+      (if (string=? (string-substring s i end) lit)
+        (p-ok end value)
+        (p-fail i)))))
+
+(defn parse-digits [s :string i :i64] :i64
+  (if (>= i (string-length s))
+    i
+    (let [c (peek s i)]
+      (if (and (>= c 48) (<= c 57))
+        (parse-digits s (+ i 1))
+        i))))
+
+(defn parse-number [s :string i :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [start i
+        j (if (= (peek s i) 45) (+ i 1) i)]
+    (if (>= j (string-length s))
+      (p-fail i)
+      (let [c (peek s j)]
+        (if (or (< c 48) (> c 57))
+          (p-fail i)
+          (let [k (parse-digits s (+ j 1))
+                next (peek s k)]
+            (if (and (= c 48) (> k (+ j 1)))
+              (p-fail i)
+              (if (or (= next 46) (or (= next 101) (= next 69)))
+                (p-fail k)
+                (p-ok k (document-edn-read (string-substring s start k)))))))))))
+
+(defn parse-string-escape [s :string i :i64 start :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (if (>= i (string-length s))
+    (p-fail i)
+    (let [c (peek s i)]
+      (if (or (= c 34) (or (= c 92) (or (= c 110) (or (= c 116) (= c 114)))))
+        (parse-string s (+ i 1) start)
+        (p-fail i)))))
+
+(defn parse-string [s :string i :i64 start :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (if (>= i (string-length s))
+    (p-fail i)
+    (let [c (peek s i)]
+      (cond
+        (= c 34) (p-ok (+ i 1) (document-edn-read (string-substring s start (+ i 1))))
+        (= c 92) (parse-string-escape s (+ i 1) start)
+        :else (parse-string s (+ i (cp-width c)) start)))))
+
+(defn parse-value [s :string i :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [j (skip-ws s i)
+        c (peek s j)]
+    (cond
+      (= c 123) (parse-object s (+ j 1))
+      (= c 91) (parse-array s (+ j 1))
+      (= c 34) (parse-string s (+ j 1) j)
+      (= c 116) (parse-lit s j "true" (document true))
+      (= c 102) (parse-lit s j "false" (document false))
+      (= c 110) (parse-lit s j "null" (document nil))
+      (= c 45) (parse-number s j)
+      (and (>= c 48) (<= c 57)) (parse-number s j)
+      :else (p-fail j))))
+
+(defn parse-object-pairs [s :string i :i64 acc :document] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [j (skip-ws s i)]
+    (if (not (= (peek s j) 34))
+      (p-fail j)
+      (let [kp (parse-string s (+ j 1) j)]
+        (if (= (:ok kp) 0)
+          kp
+          (let [colon (skip-ws s (:i kp))]
+            (if (not (= (peek s colon) 58))
+              (p-fail colon)
+              (let [vp (parse-value s (+ colon 1))]
+                (if (= (:ok vp) 0)
+                  vp
+                  (let [acc2 (document-assoc acc (keyword-from-string (doc-string (:value kp))) (:value vp))
+                        n (skip-ws s (:i vp))
+                        c (peek s n)]
+                    (cond
+                      (= c 125) (p-ok (+ n 1) acc2)
+                      (= c 44) (parse-object-pairs s (+ n 1) acc2)
+                      :else (p-fail n))))))))))))
+
+(defn parse-object [s :string i :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [j (skip-ws s i)]
+    (if (= (peek s j) 125)
+      (p-ok (+ j 1) (document {}))
+      (parse-object-pairs s j (document {})))))
+
+(defn parse-array-items [s :string i :i64 acc :document] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [vp (parse-value s i)]
+    (if (= (:ok vp) 0)
+      vp
+      (let [acc2 (document-vector-conj acc (:value vp))
+            n (skip-ws s (:i vp))
+            c (peek s n)]
+        (cond
+          (= c 93) (p-ok (+ n 1) acc2)
+          (= c 44) (parse-array-items s (+ n 1) acc2)
+          :else (p-fail n))))))
+
+(defn parse-array [s :string i :i64] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [j (skip-ws s i)]
+    (if (= (peek s j) 93)
+      (p-ok (+ j 1) (document []))
+      (parse-array-items s j (document [])))))
+
+(defn json-parse [s :string] [:record :org.jsonrpc/Parse [[:ok :i64] [:i :i64] [:value :document]]]
+  (let [p (parse-value s 0)]
+    (if (= (:ok p) 0)
+      p
+      (let [j (skip-ws s (:i p))]
+        (if (>= j (string-length s))
+          (p-ok j (:value p))
+          (p-fail j))))))
+
+(defn json-parse-ok? [s :string] :bool
+  (= (:ok (json-parse s)) 1))
+
+(defn json-parse-value [s :string] :document
+  (:value (json-parse s)))
+
+(defn encode-key [k :document] :string
+  (if (= (document-kind k) :keyword)
+    (let [p (document-edn-print k)]
+      (string-join "" "\"" (string-substring p 1 (string-length p)) "\""))
+    (json-encode k)))
+
+(defn encode-array [d :document i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    (string-concat acc "]")
+    (let [v (option-or (document-vector-at d i) (document nil))
+          vs (json-encode v)
+          sep (if (= i 0) "" ",")
+          piece (string-concat sep vs)]
+      (encode-array d (+ i 1) n (string-concat acc piece)))))
+
+(defn encode-object [d :document i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    (string-concat acc "}")
+    (let [e (option-or (document-map-entry-at d i) (document []))
+          k (option-or (document-vector-at e 0) (document nil))
+          v (option-or (document-vector-at e 1) (document nil))
+          ks (encode-key k)
+          vs (json-encode v)
+          sep (if (= i 0) "" ",")
+          piece (string-join "" sep ks ":" vs)]
+      (encode-object d (+ i 1) n (string-concat acc piece)))))
+
+(defn json-encode [d :document] :string
+  (let [k (kind-name d)]
+    (cond
+      (string=? k "null") "null"
+      (string=? k "bool") (document-edn-print d)
+      (string=? k "i64") (document-edn-print d)
+      (string=? k "string") (document-edn-print d)
+      (string=? k "vector") (encode-array d 0 (document-count d) "[")
+      (string=? k "map") (encode-object d 0 (document-count d) "{")
+      :else "null")))
+
+(defn encode [d :document] :string
+  (json-encode d))
+
+(defn valid-id? [id :document] :bool
+  (or (is-kind? id "string") (or (is-kind? id "i64") (is-kind? id "null"))))
+
+(defn valid-params? [m :document] :bool
+  (if (has-member? m :params)
+    (let [p (doc-get m :params)]
+      (or (is-kind? p "vector") (is-kind? p "map")))
+    true))
+
+(defn is-jsonrpc-2? [m :document] :bool
+  (and (has-member? m :jsonrpc)
+       (string=? (document-edn-print (doc-get m :jsonrpc)) "\"2.0\"")))
+
+(defn extracted-id [m :document] :document
+  (if (has-member? m :id)
+    (let [id (doc-get m :id)]
+      (if (valid-id? id)
+        id
+        (document nil)))
+    (document nil)))
+
+(defn error-object [code :i64 message :string] :document
+  (document-assoc
+   (document-assoc (document {}) :code (box-i64 code))
+   :message (box-str message)))
+
+(defn error-response [code :i64 message :string id :document] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc (document {}) :jsonrpc (document "2.0"))
+    :error (error-object code message))
+   :id id))
+
+(defn parse-error [] :document
+  (error-response -32700 "Parse error" (document nil)))
+
+(defn invalid-request [] :document
+  (error-response -32600 "Invalid Request" (document nil)))
+
+(defn method-not-found [id :document] :document
+  (error-response -32601 "Method not found" id))
+
+(defn invalid-params [id :document] :document
+  (error-response -32602 "Invalid params" id))
+
+(defn internal-error [id :document] :document
+  (error-response -32603 "Internal error" id))
+
+(defn request [method :string params :document id :document] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc
+     (document-assoc (document {}) :jsonrpc (document "2.0"))
+     :method (box-str method))
+    :params params)
+   :id id))
+
+(defn request-no-params [method :string id :document] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc (document {}) :jsonrpc (document "2.0"))
+    :method (box-str method))
+   :id id))
+
+(defn notification [method :string params :document] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc (document {}) :jsonrpc (document "2.0"))
+    :method (box-str method))
+   :params params))
+
+(defn notification-no-params [method :string] :document
+  (document-assoc
+   (document-assoc (document {}) :jsonrpc (document "2.0"))
+   :method (box-str method)))
+
+(defn success [result :document id :document] :document
+  (document-assoc
+   (document-assoc
+    (document-assoc (document {}) :jsonrpc (document "2.0"))
+    :result result)
+   :id id))
+
+(defn valid-error-object? [err :document] :bool
+  (and (is-kind? err "map")
+       (and (has-member? err :code)
+            (and (is-kind? (doc-get err :code) "i64")
+                 (and (has-member? err :message)
+                      (is-kind? (doc-get err :message) "string"))))))
+
+(defn valid-request? [m :document] :bool
+  (and (is-jsonrpc-2? m)
+       (and (has-member? m :method)
+            (and (is-kind? (doc-get m :method) "string")
+                 (and (valid-params? m)
+                      (if (has-member? m :id)
+                        (valid-id? (doc-get m :id))
+                        true))))))
+
+(defn valid-success? [m :document] :bool
+  (and (is-jsonrpc-2? m)
+       (and (has-member? m :result)
+            (and (not (has-member? m :error))
+                 (and (has-member? m :id)
+                      (valid-id? (doc-get m :id)))))))
+
+(defn valid-error? [m :document] :bool
+  (and (is-jsonrpc-2? m)
+       (and (has-member? m :error)
+            (and (not (has-member? m :result))
+                 (and (has-member? m :id)
+                      (and (valid-id? (doc-get m :id))
+                           (valid-error-object? (doc-get m :error))))))))
+
+(defn decode-object [m :document] :document
+  (cond
+    (valid-success? m) m
+    (valid-error? m) m
+    (valid-request? m) m
+    :else (error-response -32600 "Invalid Request" (extracted-id m))))
+
+(defn decode-batch-items [arr :document i :i64 n :i64 acc :document] :document
+  (if (>= i n)
+    acc
+    (let [item (option-or (document-vector-at arr i) (document nil))
+          out (if (is-kind? item "map")
+                (decode-object item)
+                (error-response -32600 "Invalid Request" (document nil)))]
+      (decode-batch-items arr (+ i 1) n (document-vector-conj acc out)))))
+
+(defn decode-batch [arr :document] :document
+  (let [n (document-count arr)]
+    (if (= n 0)
+      (invalid-request)
+      (decode-batch-items arr 0 n (document [])))))
+
+(defn decode [s :string] :document
+  (let [p (json-parse s)]
+    (if (= (:ok p) 0)
+      (parse-error)
+      (let [v (:value p)]
+        (cond
+          (is-kind? v "vector") (decode-batch v)
+          (is-kind? v "map") (decode-object v)
+          :else (invalid-request))))))
+
+(defn message-kind [d :document] :keyword
+  (if (is-kind? d "vector")
+    :batch
+    (if (is-kind? d "map")
+      (cond
+        (and (has-member? d :error) (not (has-member? d :result))) :error
+        (and (has-member? d :result) (not (has-member? d :error))) :success
+        (and (has-member? d :method) (has-member? d :id)) :request
+        (and (has-member? d :method) (not (has-member? d :id))) :notification
+        :else :invalid)
+      :invalid)))
+
+(defn notification? [d :document] :bool
+  (= (message-kind d) :notification))
+
+(defn request? [d :document] :bool
+  (= (message-kind d) :request))
+
+(defn success-message? [d :document] :bool
+  (= (message-kind d) :success))
+
+(defn error-message? [d :document] :bool
+  (= (message-kind d) :error))
+
+(defn ids-match? [request-doc :document response-doc :document] :bool
+  (and (has-member? request-doc :id)
+       (and (has-member? response-doc :id)
+            (doc=? (doc-get request-doc :id) (doc-get response-doc :id)))))
+
+(defn filter-notifications [arr :document i :i64 n :i64 acc :document] :document
+  (if (>= i n)
+    acc
+    (let [m (option-or (document-vector-at arr i) (document {}))
+          next (if (notification? m)
+                 acc
+                 (document-vector-conj acc m))]
+      (filter-notifications arr (+ i 1) n next))))
+
+(defn encode-response-batch [arr :document] :string
+  (if (is-kind? arr "vector")
+    (let [out (filter-notifications arr 0 (document-count arr) (document []))]
+      (if (= (document-count out) 0)
+        ""
+        (json-encode out)))
+    (json-encode arr)))
+
+(defn ndjson-encode [d :document] :string
+  (string-concat (json-encode d) "\n"))
+
+(defn strip-cr [s :string] :string
+  (let [n (string-length s)]
+    (if (and (> n 0) (= (peek s (- n 1)) 13))
+      (string-substring s 0 (- n 1))
+      s)))
+
+(defn ndjson-decode-line [s :string] :document
+  (decode (strip-cr s)))
+
+(defn count-lines [s :string i :i64 acc :i64] :i64
+  (let [n (string-length s)]
+    (if (>= i n)
+      (if (= acc 0)
+        0
+        (if (= (peek s (- n 1)) 10)
+          acc
+          (+ acc 1)))
+      (if (= (peek s i) 10)
+        (count-lines s (+ i 1) (+ acc 1))
+        (count-lines s (+ i 1) acc)))))
+
+(defn ndjson-line-count [s :string] :i64
+  (if (string=? s "")
+    0
+    (count-lines s 0 0)))
+
+(defn find-line-start [s :string want :i64 i :i64 cur :i64] :i64
+  (if (= cur want)
+    i
+    (if (>= i (string-length s))
+      i
+      (if (= (peek s i) 10)
+        (find-line-start s want (+ i 1) (+ cur 1))
+        (find-line-start s want (+ i 1) cur)))))
+
+(defn find-nl [s :string i :i64 n :i64] :i64
+  (if (>= i n)
+    n
+    (if (= (peek s i) 10)
+      i
+      (find-nl s (+ i 1) n))))
+
+(defn ndjson-nth-line [s :string n :i64] :string
+  (let [start (find-line-start s n 0 0)
+        end (find-nl s start (string-length s))]
+    (strip-cr (string-substring s start end))))
