@@ -1,30 +1,27 @@
-# Kotoba native migration
+# Native-only CDCI and shared text (JUN-93 / JUN-290)
 
-Use the Kotoba Labs Linear workspace. This migration is tracked by AWAI-24,
-AWAI-43, AWAI-48 and JUN-290. Workspace architecture and authority rules apply.
+Follow the workspace architecture and native-only CI contract. The canonical
+text owner is `lib/kotoba.text`; the old kotoba-lang/text repository is archived.
+Keep immutable import snapshots and update explicit local-changes provenance
+for maintained sources. Do not change independent profile/credential stores.
 
-## CDCI
+The old CI workflow has been deleted: it started JVM/Clojure/SCI/nbb/Node for
+launcher, library, security, qualification, provenance and lint checks. Its
+other job compiled `adopted-loader-20261012.c` with clang and used that C loader
+for old native selfbuild/runtime/library fixtures. Neither is an accepted
+native fallback. Their source fixtures remain, but those checks are uncovered
+until a real Amu-produced loaderless route is qualified. Do not silently
+reclassify historical C-supervisor receipts as current native passes.
 
-Use Amu selfhost and canonical Kotoba only. Do not restore CLJK/CLJC, NBB,
-KBB, Clojure, JVM/Java, GraalVM, Node or a C compiler/loader as a CI prerequisite
-or fallback. Python scripts may stage/hash bytes and observe native processes;
-they must not implement language resolution, compilation or verdicts.
+The replacement shared component gate uses the Amu native root/public compiler,
+exact source locks and `kotoba-lang/browser/scripts/check-shared-native.py`.
+Its bounded text/DOM/text-edit goldens do not qualify this repository's whole
+CLI, full library catalog, security or Q9 behavior. Record ARM and x86 native
+execution separately, and keep broader closure checks blocked.
 
-The 2026-10-24 replacement removes the JVM/Node launcher job and the macOS C
-loader toolchain. Original definitions/scripts are byte-preserved as inert
-text under `docs/retired/native-ci-20261024/` with their hashes. Do not execute
-these archives. The static documentation Pages workflow remains separate.
-
-Current native CI checks the pinned loaderless Amu root, combined selfhost,
-all12 CLI request parsing with all declared flags/aliases and refusals, and
-the Amu/Kotoba native controller on an actual x86 Linux runner. The controller
-qualifies its declared complete24 Kotoba corpus, not this product's whole CLI.
-All native guests run without a hosted language executable in their PATH.
-
-The public launcher still contains retired host routes. Do not run them.
-All12 command execution, package/signature admission, general FS fault/race
-parity, public target parity and the old library/runtime-value oracle corpus
-remain open until ported and qualified. A green request-parser or controller
-job must not mark these acceptance criteria Done. Legacy JVM/JS lint, Q9,
-runtime-values, SDK packaging, library and package admission jobs no longer
-run in CI; preserve their fixtures while porting their checks to native code.
+Native text keeps host names and contracts for the typed string profile:
+Unicode whitespace excludes U+00A0/U+2007/U+202F; ascii-lower preserves non-ASCII;
+includes? accepts an empty needle. The ASCII bounded-text whitespace/index
+helpers have different contracts and cannot replace full text APIs silently.
+CSSOM capture regex, index-of/join and full Unicode case APIs remain separate
+qualification requirements. Preserve every declaration in selected graphs.
