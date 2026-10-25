@@ -1,0 +1,85 @@
+;; test/which_test.cljk -- build the command and compare it with the system
+;; which, byte for byte, under a PATH the suite controls.
+;;
+;;   AMU_HOME=<amu checkout> kbb --backend sci test/which_test.cljk
+(ns which-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args env-path]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      #js {:encoding "buffer"
+                           :env (js/Object.assign #js {} (.-env js/process) #js {:PATH env-path})})]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-which "/usr/bin/which")
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs system-which) (refuse (str "no " system-which)))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-which-"))
+        src (.resolve path (.cwd js/process) "which" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "which.kexe")
+        blob (.join path tmp "which.bin")
+        exe (.join path tmp "which")
+        ;; Two PATH directories the suite owns, plus /usr/bin. `tool` is in
+        ;; both (so -a lists two and plain lists the first); `later` only in
+        ;; the second; `noexec` has no execute bit; `adir` is a directory.
+        d1 (.join path tmp "bin1")
+        d2 (.join path tmp "bin2")
+        mk (fn [dir name mode] (let [f (.join path dir name)] (.writeFileSync fs f "#!/bin/sh\n" "utf8") (.chmodSync fs f mode)))]
+    (.mkdirSync fs d1) (.mkdirSync fs d2)
+    (mk d1 "tool" 0755) (mk d2 "tool" 0755) (mk d2 "later" 0755) (mk d1 "noexec" 0644) (mk d1 "groupx" 0710)
+    (.mkdirSync fs (.join path d1 "adir"))
+    (.writeFileSync fs policy "{:allow #{[:cap/call 33] [:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free" "--policy" policy "--output" kexe] (.-PATH (.-env js/process)))]
+      (when (not= 0 (:status c)) (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] (.-PATH (.-env js/process)))
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          offset (second (re-find #":offset (\d+)" (str (:out e))))]
+      (when-not offset (refuse "no :offset in the extract report"))
+      ;; The scope is `$PATH` alone: which reads nothing but what PATH names.
+      (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                           "--allow" "33,35,37,38,39" "--fs-scope" "$PATH" "--output" exe] (.-PATH (.-env js/process)))]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+    (let [r1 (.realpathSync fs d1) r2 (.realpathSync fs d2)
+          p12 (str r1 ":" r2 ":/usr/bin")
+          p21 (str r2 ":" r1 ":/usr/bin")
+          cases [[["tool"] p12] [["tool"] p21] [["later"] p12] [["noexec"] p12] [["groupx"] p12] [["adir"] p12]
+                 [["nope"] p12] [["tool" "nope" "later"] p12] [["-s" "tool"] p12] [["-s" "nope"] p12]
+                 [["-a" "tool"] p12] [["-a" "tool"] p21] [["-a" "later"] p12] [["-as" "tool"] p12]
+                 [["true"] p12] [["/usr/bin/true"] p12] [[(str r1 "/tool")] p12] [[(str r1 "/noexec")] p12]
+                 [["tool"] (str "/usr/bin:" r1)] [["tool"] "/usr/bin"] [["tool"] (str "::" r1)]
+                 [[] p12] [["-a"] p12]]
+          b64 (fn [buf] (.toString buf "base64"))
+          results
+          (for [[argv env-path] cases]
+            (let [k (run exe argv env-path)
+                  s (run system-which argv env-path)
+                  same? (and (= (b64 (:out k)) (b64 (:out s))) (= (b64 (:err k)) (b64 (:err s)))
+                             (= (:status k) (:status s)))]
+              {:argv [argv (str/replace env-path tmp "<tmp>")] :ok same?
+               :kotoba (.toString (:out k) "utf8") :system (.toString (:out s) "utf8")
+               :kotoba-err (.toString (:err k) "utf8") :system-err (.toString (:err s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r)) " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r) (str " but " system-which " says " (pr-str (:system r))
+                                             " exits " (pr-str (:exit r)) " stderr " (pr-str (:kotoba-err r)) " vs " (pr-str (:system-err r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))
