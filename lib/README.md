@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.cron` | `kotoba.cron/src` | `cron.execute`, `cron.model`, `cron.validate` (Kotoba project library) |
 | `kotoba.crm` | `kotoba.crm/src` | `kotoba.crm.funnel`, `kotoba.crm.leadscore`, `kotoba.crm.pipeline`, `kotoba.crm.revrec` (Kotoba project library) |
 | `kotoba.crdt` | `kotoba.crdt/src` | `kotoba.crdt.clock`, `kotoba.crdt.doc`, `kotoba.crdt.kotoba-oracle`, `kotoba.crdt.orset` (Kotoba project library) |
 | `kotoba.contacts` | `kotoba.contacts/src` | `contacts.model`, `contacts.validate` (Kotoba project library) |
