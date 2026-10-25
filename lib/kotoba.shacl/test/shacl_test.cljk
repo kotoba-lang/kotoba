@@ -1,0 +1,121 @@
+(ns shacl-test
+  (:require [kotoba.lang.error :as kerror] [kotoba.bytes :as kbytes] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]))
+
+(def source (slurp "lib/kotoba.shacl/src/shacl.kotoba"))
+(defn call [kir function & args] (ir/execute kir function (vec args)))
+(defn dnull [] ["null"])
+(defn dbool [value] ["bool" value])
+(defn di64 [value] ["i64" value])
+(defn df64 [value] ["f64" value])
+(defn dstr [value] ["string" value])
+(defn dkw [value] ["keyword" value])
+(defn dvec [& values] ["vector" (vec values)])
+(defn dmap [entries]
+  ["map" (->> entries (sort-by (comp str key))
+              (mapv (fn [[key value]] [(dkw key) value])))])
+(defn dget [document key]
+  (some (fn [[candidate value]] (when (= candidate (dkw key)) value)) (second document)))
+
+(defn property [path & entries]
+  (dmap (into {:path path} (map vec (partition 2 entries)))))
+
+(deftest reference-preserves-bounded-shacl-contract
+  (let [kir (:kir (compiler/compile-source source :js-kotoba-v1))
+        iri (dmap {:rdf/type (dkw :iri) :value (dstr "https://example.test/alice")})
+        allowed (dvec (dmap {:code (dstr "A")}) (dmap {:code (dstr "B")}))
+        properties
+        (dvec
+          (property (dkw :id) :min-count (di64 1) :datatype (dkw :string))
+          (property (dkw :type) :in (dvec (dstr "Person") (dstr "Organization")))
+          (property (dvec (dkw :profile) (dkw :name)) :datatype (dkw :string))
+          (property (dkw :friend) :node-kind (dkw :iri))
+          (property (dkw :choice) :in allowed))
+        shape (call kir 'node-shape properties)
+        valid-node
+        (dmap {:id (dstr "alice") :type (dstr "Person")
+               :profile (dmap {:name (dstr "Alice")})
+               :friend iri :choice (dmap {:code (dstr "B")})})
+        valid (call kir 'validate shape valid-node)
+        invalid-node
+        (dmap {:type (dstr "Unknown") :profile (dmap {:name (di64 7)})
+               :friend (dmap {:rdf/type (dkw :literal)})
+               :choice (dmap {:code (dstr "C")})})
+        invalid (call kir 'validate shape invalid-node)
+        errors (dget invalid :errors)]
+    (is (= (dkw :node-shape) (dget shape :shacl/type)))
+    (is (= (dvec (dstr "Alice"))
+           (call kir 'values-at valid-node (dvec (dkw :profile) (dkw :name)))))
+    (is (= (dvec) (call kir 'values-at valid-node (dkw :missing))))
+    (is (= (dvec (dstr "Person") (dstr "Organization"))
+           (call kir 'values-at (dmap {:items (dvec (dstr "Person") (dstr "Organization"))})
+                 (dkw :items))))
+    (is (true? (call kir 'datatype-match? :number (di64 1))))
+    (is (true? (call kir 'datatype-match? :number (df64 1.5))))
+    (is (true? (call kir 'datatype-match? :boolean (dbool false))))
+    (is (true? (call kir 'datatype-match? :keyword (dkw :value))))
+    (is (true? (call kir 'datatype-match? :map (dmap {}))))
+    (is (true? (call kir 'datatype-match? :vector (dvec))))
+    (is (true? (call kir 'datatype-match? :unknown (dnull))))
+    (is (= (dbool true) (dget valid :valid?)))
+    (is (= (dvec) (dget valid :errors)))
+    (is (= (dbool false) (dget invalid :valid?)))
+    (is (= [:shacl/min-count :shacl/in :shacl/datatype
+            :shacl/node-kind :shacl/in]
+           (mapv #(second (dget % :error)) (second errors))))
+    (is (= allowed (dget (last (second errors)) :allowed)))
+    (is (= :shacl/max-count
+           (-> (call kir 'property-errors
+                     (dmap {:tags (dvec (dstr "a") (dstr "b"))})
+                     (property (dkw :tags) :max-count (di64 1)))
+               second first (dget :error) second)))
+    (is (= (dvec)
+           (call kir 'property-errors
+                 (dmap {:term (dmap {:rdf/type (dkw :literal)})})
+                 (property (dkw :term) :node-kind (dkw :literal)))))
+    (is (= #{} (set (:effects kir))))
+    (testing "property-shape remains an identity constructor"
+      (is (= (dvec) (call kir 'property-shape (dvec)))))
+    (testing "error output cannot exceed the canonical document budget"
+      (is (thrown? kerror/ExceptionInfo
+                   (call kir 'property-errors
+                         (dmap {:items (apply dvec (repeat 32 (di64 1)))})
+                         (property (dkw :items) :max-count (di64 0)
+                                   :datatype (dkw :string))))))))
+
+(defn compiler-root []
+  (nth (iterate #(.getParent ^java.nio.file.Path %)
+                (java.nio.file.Path/of (.toURI (io/resource "kotoba/compiler/core.clj")))) 4))
+(defn base64 [value] (kbytes/base64-encode value))
+
+(deftest restricted-javascript-and-typed-wasm-conform-semantically
+  (let [javascript (compiler/compile-source source :js-kotoba-v1)
+        wasm (compiler/compile-source source :wasm32-browser-kotoba-v1)
+        js64 (base64 (kbytes/utf8-bytes ^String (:source javascript)))
+        wasm64 (base64 ^bytes (:bytes wasm))
+        probe
+        (shell/sh
+          "node" "--input-type=module" "-e"
+          (str "import(process.argv[1]).then(async host=>{"
+               "const j=await import('data:text/javascript;base64," js64 "');"
+               "const w=await host.instantiateKotoba(Buffer.from(process.argv[2],'base64'));"
+               "const run=(x,doc)=>{"
+               "const kw=x=>['keyword',x],str=x=>['string',x],i=x=>['i64',BigInt(x)];"
+               "const map=e=>doc(['map',e.map(([k,v])=>[['keyword',k],v]).sort((a,b)=>a[0][1]<b[0][1]?-1:a[0][1]>b[0][1]?1:0)]),vec=e=>doc(['vector',e]);"
+               "const p=map([[':path',kw(':choice')],[':in',vec([map([[':code',str('A')]]),map([[':code',str('B')]])])]]);"
+               "const shape=x['node-shape'](vec([x['property-shape'](p)]));"
+               "const good=x.validate(shape,map([[':choice',map([[':code',str('B')]])]]));"
+               "const bad=x.validate(shape,map([[':choice',map([[':code',str('C')]])]]));"
+               "if(good[1].find(e=>e[0][0]==='keyword'&&e[0][1]===':valid?')[1][1]!==true||bad[1].find(e=>e[0][0]==='keyword'&&e[0][1]===':errors')[1][1].length!==1)throw Error('meaning');"
+               "let rejected=false;try{x.validate(shape,{})}catch(e){rejected=true}if(!rejected)throw Error('reject');};"
+               "run(j.instantiateKotoba({}),x=>x);run(w.instance.exports,w.typedValues.document);"
+               "}).catch(e=>{console.error(e);process.exit(99)})")
+          (.toString (.toUri (.resolve (compiler-root) "runtime/browser-host.mjs"))) wasm64)]
+    (is (zero? (:exit probe)) (:err probe))))
+
+(deftest production-source-authority
+  (is (= ["lib/kotoba.shacl/src/shacl.kotoba"]
+         (->> (file-seq (io/file "src")) (filter #(.isFile %)) (map str) sort vec))))
