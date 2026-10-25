@@ -1,0 +1,144 @@
+;; test/rm_test.cljk -- build the command and compare it with /bin/rm on
+;; stdout, stderr, exit status AND the resulting directory tree.
+;;
+;; mkdir writes nothing to stdout when it succeeds, so an output-only
+;; comparison would pass an implementation that created nothing at all. The
+;; tree is what carries the weight, exactly as in org-ieee-cp.
+;;
+;; Both implementations run in the SAME directory, one after the other, with
+;; the fixtures rebuilt in between: the diagnostics contain absolute paths, so
+;; two parallel trees would differ in stderr for reasons unrelated to the
+;; behaviour under test.
+
+(ns rm-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp-mod (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp-mod cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer"} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-rm "/bin/rm")
+
+;; The tree before each run: one existing directory and one existing FILE, so
+;; "already exists" can be tested both ways.
+(defn- reset! [data]
+  (.rmSync fs data #js {:recursive true :force true})
+  (.mkdirSync fs data #js {:recursive true})
+  (.writeFileSync fs (.join path data "f1") "one\n" "utf8")
+  (.writeFileSync fs (.join path data "f2") "two\n" "utf8")
+  ;; An empty directory and a NESTED one, so -r has something to descend.
+  (.mkdirSync fs (.join path data "empty"))
+  (.mkdirSync fs (.join path data "tree/sub") #js {:recursive true})
+  (.writeFileSync fs (.join path data "tree/a") "a\n" "utf8")
+  (.writeFileSync fs (.join path data "tree/sub/b") "b\n" "utf8"))
+
+;; relative path -> "<dir>" or a content hash, for the whole tree.
+(defn- snapshot [root]
+  (letfn [(walk [dir prefix acc]
+            (reduce (fn [a e]
+                      (let [full (.join path dir e)
+                            rel (if (= prefix "") e (str prefix "/" e))]
+                        (if (.isDirectory (.statSync fs full))
+                          (walk full rel (assoc a (str rel "/") "<dir>"))
+                          (assoc a rel (.toString (.readFileSync fs full) "utf8")))))
+                    acc
+                    (sort (.readdirSync fs dir))))]
+    (walk root "" {})))
+
+(def cases
+  [["f1"]
+   ;; a name that is not there, with and without -f
+   ["nope"] ["-f" "nope"]
+   ;; a DIRECTORY without -r: rm refuses, in its own lower-case wording
+   ["empty"] ["tree"]
+   ;; several operands: the good ones go, the bad one is reported, exit 1
+   ["f1" "nope" "f2"] ["f1" "f2"]
+   ;; -f is silent about the missing one but still removes the others
+   ["-f" "f1" "nope" "f2"]
+   ;; -r over an EMPTY directory and over a NESTED one
+   ["-r" "empty"] ["-r" "tree"]
+   ;; -r over a plain file is allowed
+   ["-r" "f1"]
+   ;; -r over several
+   ["-r" "tree" "empty"]
+   ;; the same operand twice: the second is already gone
+   ["f1" "f1"] ["-f" "f1" "f1"]
+   ;; no operand at all
+   [] ["-f"]])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-rm) (refuse (str "no " system-rm)))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-rm-"))
+        src (.resolve path (.cwd js/process) "rm" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "rm.kexe")
+        blob (.join path tmp "rm.bin")
+        exe (.join path tmp "rm")
+        data (.join path tmp "data")]
+    (.writeFileSync fs policy
+                    "{:allow #{[:cap/call 34] [:cap/call 35] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.mkdirSync fs data)
+    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      (let [real (.realpathSync fs data)
+            p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                          "--allow" "34,35,38,39"
+                          "--fs-scope" real
+                          "--browse-scope" real
+                          "--string-pool" "4000000" "--fuel" "50000000"
+                          "--pairs" "200000" "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+
+    (let [real (.realpathSync fs data)
+          abs (fn [n] (if (str/starts-with? n "-") n (.join path real n)))
+          b64 (fn [b] (if b (.toString b "base64") ""))
+          once (fn [cmd argv]
+                 (reset! real)
+                 (let [r (run cmd (mapv abs argv) {:cwd real})]
+                   (assoc r :tree (snapshot real))))
+          results
+          (for [argv cases]
+            (let [k (once exe argv)
+                  s (once system-rm argv)
+                  same? (and (= (b64 (:out k)) (b64 (:out s)))
+                             (= (b64 (:err k)) (b64 (:err s)))
+                             (= (:status k) (:status s))
+                             (= (:tree k) (:tree s)))]
+              {:argv argv :ok same? :exit [(:status k) (:status s)]
+               :tree-same (= (:tree k) (:tree s))
+               :err [(.toString (:err k) "utf8") (.toString (:err s) "utf8")]}))
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))
+                      " exit " (pr-str (:exit r))
+                      (when-not (:ok r)
+                        (str " tree-same=" (:tree-same r) " err=" (pr-str (:err r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))
