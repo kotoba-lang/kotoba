@@ -1,0 +1,173 @@
+(ns webauthn.assurance-test
+  "The rule that decides whether an authenticator may approve a payment.
+
+  The decision was a Secure Enclave key requiring Touch ID, so that an agent
+  cannot approve on the owner's behalf. The property under test is therefore not
+  'does a platform credential pass' -- it is **does a credential that merely SAYS
+  platform fail to reach the level that a signed AAGUID reaches**. If those two
+  graded the same, the whole distinction would be decorative and a browser's
+  virtual authenticator would clear the same bar as the Secure Enclave."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [webauthn.assurance :as ca]))
+
+(def touch-id-aaguid "adce0002-35bc-c60a-648b-0b25f1f05503")
+(def icloud-aaguid "fbfc3007-154e-4ecc-8c0b-6e020557d7bd")
+(def windows-software-aaguid "6028b017-b1d4-4c02-b4b3-afcdafc96bb2")
+
+(defn- cred [& {:as overrides}]
+  (merge {:credential-id "cred-1" :user-verified? true} overrides))
+
+;; ---------------------------------------------------------------------------
+;; the ladder
+;; ---------------------------------------------------------------------------
+
+(deftest a-trusted-attestation-chain-is-the-only-hardware-proof
+  (let [g (ca/assurance (cred :attestation-trusted? true
+                              :attestation-type "BASIC"
+                              :aaguid touch-id-aaguid
+                              :attachment "platform"))]
+    (is (= :hardware-attested (:passkey/assurance g)))
+    (is (re-find #"attestation chain" (:passkey/basis g)))))
+
+(deftest a-known-aaguid-is-signed-evidence-and-outranks-the-clients-word
+  (doseq [[aaguid label] [[touch-id-aaguid "Touch ID"] [icloud-aaguid "iCloud"]]]
+    (let [g (ca/assurance (cred :aaguid aaguid :attachment "platform"))]
+      (is (= :platform-attested (:passkey/assurance g)) label)
+      (is (seq (:passkey/aaguid-label g)) label)))
+  (testing "and case does not matter -- an uppercase AAGUID is the same device"
+    (is (= :platform-attested
+           (:passkey/assurance
+            (ca/assurance (cred :aaguid (str/upper touch-id-aaguid)
+                                :attachment "platform")))))))
+
+(deftest the-clients-own-word-is-recorded-and-ranked-below-anything-signed
+  (testing "THE test that matters: a client saying `platform` with no signed
+            AAGUID must NOT reach the level a signed AAGUID reaches. This is
+            exactly what a browser's virtual authenticator looks like."
+    (let [claimed (ca/assurance (cred :attachment "platform"
+                                      :aaguid ca/zero-aaguid))
+          attested (ca/assurance (cred :attachment "platform"
+                                       :aaguid touch-id-aaguid))]
+      (is (= :platform-claimed (:passkey/assurance claimed)))
+      (is (= :platform-attested (:passkey/assurance attested)))
+      (is (not (ca/at-least? (:passkey/assurance claimed) :platform-attested))
+          "if these graded the same, the distinction would be decorative")
+      (is (re-find #"UNSIGNED" (:passkey/basis claimed))
+          "the basis must say so in words, not only in the level name"))))
+
+(deftest a-zeroed-aaguid-is-privacy-not-suspicion
+  (testing "browsers zero the AAGUID under `none` attestation, so it must drop a
+            level rather than be refused outright"
+    (let [g (ca/assurance (cred :attachment "platform" :aaguid ca/zero-aaguid))]
+      (is (= :platform-claimed (:passkey/assurance g)))
+      (is (re-find #"withheld" (:passkey/basis g))))))
+
+(deftest a-cross-platform-or-unrecorded-authenticator-is-unknown
+  (is (= :unknown (:passkey/assurance (ca/assurance (cred :attachment "cross-platform")))))
+  (is (= :unknown (:passkey/assurance (ca/assurance (cred))))
+      "a credential enrolled before assurance was captured grades as unknown,
+       which fails closed at any real floor")
+  (is (= :unknown (:passkey/assurance (ca/assurance {})))))
+
+(deftest windows-hello-software-is-a-platform-authenticator-and-not-hardware
+  (testing "the exclusion that gives the AAGUID list its point: `platform` and
+            `hardware-backed` are different properties"
+    (is (not (contains? ca/platform-aaguids windows-software-aaguid)))
+    (is (= :platform-claimed
+           (:passkey/assurance (ca/assurance (cred :attachment "platform"
+                                                   :aaguid windows-software-aaguid))))
+        "reported as platform, so it is claimed -- but not attested")))
+
+;; ---------------------------------------------------------------------------
+;; ordering
+;; ---------------------------------------------------------------------------
+
+(deftest the-ladder-is-ordered-and-an-unknown-rung-ranks-lowest
+  (is (= [:unknown :platform-claimed :platform-attested :hardware-attested]
+         ca/levels))
+  (is (ca/at-least? :hardware-attested :platform-claimed))
+  (is (ca/at-least? :platform-claimed :platform-claimed))
+  (is (not (ca/at-least? :platform-claimed :platform-attested)))
+  (testing "a typo must not satisfy a floor by accident, in EITHER position"
+    (is (not (ca/at-least? :platfrom-attested :platform-claimed))
+        "a misspelt level clears nothing")
+    (is (not (ca/at-least? :hardware-attested :hardware-attestd))
+        "and a misspelt FLOOR is unsatisfiable rather than permissive -- a typo
+         that silently disables a gate is the failure this namespace is for")))
+
+;; ---------------------------------------------------------------------------
+;; policy
+;; ---------------------------------------------------------------------------
+
+(deftest the-shipped-floor-admits-touch-id-and-rejects-nothing-recorded
+  (let [policy ca/default-policy]
+    (is (empty? (ca/policy-issues (cred :attachment "platform"
+                                        :aaguid touch-id-aaguid) policy)))
+    (is (empty? (ca/policy-issues (cred :attachment "platform"
+                                        :aaguid ca/zero-aaguid) policy))
+        "the shipped floor is :platform-claimed, chosen because it is the
+         strongest one known to be reachable before measuring real hardware")
+    (is (seq (ca/policy-issues (cred :attachment "cross-platform") policy))
+        "a USB or phone authenticator does not clear it")
+    (is (= :credential/assurance-too-low
+           (:passkey/issue (first (ca/policy-issues (cred) policy)))))))
+
+(deftest raising-the-floor-excludes-the-virtual-authenticator-shape
+  (let [strict {:min-assurance :platform-attested}]
+    (is (empty? (ca/policy-issues (cred :attachment "platform"
+                                        :aaguid touch-id-aaguid) strict)))
+    (is (seq (ca/policy-issues (cred :attachment "platform"
+                                     :aaguid ca/zero-aaguid) strict))
+        "this is the point of the whole namespace")
+    (testing "and the refusal says what was required and what was found, so a
+              human can act on it"
+      (let [issue (first (ca/policy-issues (cred :attachment "platform") strict))]
+        (is (= :platform-claimed (:passkey/actual issue)))
+        (is (= :platform-attested (:passkey/required issue)))
+        (is (seq (:passkey/basis issue)))))))
+
+(deftest user-verification-is-required-separately-from-assurance
+  (testing "a credential enrolled without UV can be signed with without a
+            finger, forever -- so it is checked even at a high assurance level"
+    (let [issues (ca/policy-issues (cred :attestation-trusted? true
+                                         :aaguid touch-id-aaguid
+                                         :attachment "platform"
+                                         :user-verified? false)
+                                   ca/default-policy)]
+      (is (= [:credential/user-verification-not-established]
+             (mapv :passkey/issue issues)))))
+  (testing "and it can be waived deliberately, which is different from
+            forgetting to check it"
+    (is (empty? (ca/policy-issues (cred :aaguid touch-id-aaguid
+                                        :attachment "platform"
+                                        :user-verified? false)
+                                  {:require-user-verification? false})))))
+
+(deftest a-policy-overrides-the-default-without-replacing-it
+  (is (= ca/default-policy (ca/policy-for nil)))
+  (is (= ca/default-policy (ca/policy-for {})))
+  (is (= :platform-attested
+         (:min-assurance (ca/policy-for {:min-assurance :platform-attested})))
+      "a partial policy merges over the default rather than replacing it")
+  (is (true? (:require-user-verification?
+              (ca/policy-for {:min-assurance :platform-attested})))
+      "so omitting a key does not silently switch its check off"))
+
+;; ---------------------------------------------------------------------------
+;; the report
+;; ---------------------------------------------------------------------------
+
+(deftest the-report-surfaces-what-a-human-needs-to-raise-the-floor
+  (let [r (ca/report (cred :attachment "platform" :aaguid touch-id-aaguid
+                           :attestation-type "BASIC" :backup-eligible? false
+                           :backed-up? false :discoverable? true
+                           :created-at "2026-07-30T00:00:00Z"))]
+    (is (= :platform-attested (:passkey/assurance r)))
+    (is (= touch-id-aaguid (:aaguid r)))
+    (is (false? (:attestation-trusted? r)) "no trust source configured today")
+    (is (false? (:backed-up? r)))
+    (testing "a synced credential is surfaced rather than buried -- it exists on
+              more than this device by design, so 'this Mac's Secure Enclave' is
+              no longer the claim"
+      (is (true? (:backed-up? (ca/report (cred :backed-up? true))))))))
