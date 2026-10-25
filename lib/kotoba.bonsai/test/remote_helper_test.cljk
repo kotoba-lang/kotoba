@@ -1,0 +1,313 @@
+(ns remote-helper-test
+  "Real Git helper/adapters on kbb; unchanged JVM compatibility cases retained."
+  (:require [kotoba.test :refer [deftest is]]
+            #?(:cljs ["node:fs" :as fs] :clj [kotoba.io :as kio])
+            #?(:cljs ["node:os" :as os] :clj [clojure.java.shell :as shell])
+            #?(:cljs ["node:path" :as path])
+            #?(:cljs ["node:child_process" :as cp])
+            #?(:cljs ["node:crypto" :as crypto])))
+
+#?(:cljs
+   (do
+(def bin-dir (fs/realpathSync "bin"))
+
+(defn- temp-dir [prefix] (fs/mkdtempSync (path/join (os/tmpdir) prefix)))
+
+(defn- runner [extra-env]
+  (let [env (js/Object.assign #js {} (.-env js/process)
+                              #js {:PATH (str bin-dir ":" (.. js/process -env -PATH))}
+                              (clj->js extra-env))]
+    (fn [& argv]
+      (let [r (cp/spawnSync (first argv) (clj->js (rest argv))
+                            #js {:env env :stdio #js ["ignore" "pipe" "pipe"]})]
+        {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))))
+
+(defn- seed-repo! [run root file content]
+  (let [seed (path/join root "seed")]
+    (is (zero? (:exit (run "git" "init" "-q" seed))))
+    (fs/writeFileSync (path/join seed file) content)
+    (is (zero? (:exit (run "git" "-C" seed "add" file))))
+    (is (zero? (:exit (run "git" "-C" seed "-c" "user.name=Bonsai"
+                           "-c" "user.email=bonsai@example.test" "commit" "-q" "-m" "seed"))))
+    (is (zero? (:exit (run "git" "-C" seed "branch" "-M" "main"))))
+    seed))
+
+(defn- rm-rf! [p] (fs/rmSync p #js {:recursive true :force true}))
+
+(deftest remote-helper-clone-fetch-push
+  (let [root (temp-dir "bonsai-remote-")
+        origin (path/join root "origin.git")
+        clone (path/join root "clone")
+        run (runner {})]
+    (try
+      (is (zero? (:exit (run "git" "init" "-q" "--bare" origin))))
+      (let [seed (seed-repo! run root "README.md" "bonsai\n")]
+        (is (zero? (:exit (run "git" "-C" seed "push" "-q" (str "kotoba::" origin) "main")))))
+      (is (zero? (:exit (run "git" "clone" "-q" "--branch" "main" (str "kotoba::" origin) clone))))
+      (is (= "bonsai\n" (str (fs/readFileSync (path/join clone "README.md") "utf8"))))
+      (let [seed (path/join root "seed")
+            payload (js/Buffer.alloc (* 1024 1024) 42)]
+        (fs/writeFileSync (path/join seed "payload.bin") payload)
+        (is (= 0 (:exit (run "git" "-C" seed "add" "payload.bin"))))
+        (is (= 0 (:exit (run "git" "-C" seed "-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test"
+                                "commit" "-q" "-m" "incremental"))))
+        (is (= 0 (:exit (run "git" "-C" seed "push" "-q" (str "kotoba::" origin) "main"))))
+        (is (= 0 (:exit (run "git" "-C" clone "fetch" "-q" "origin"))))
+        (is (= (:out (run "git" "-C" seed "rev-parse" "HEAD"))
+               (:out (run "git" "-C" clone "rev-parse" "origin/main"))))
+        (is (= (* 1024 1024) (count (:out (run "git" "-C" clone "show" "origin/main:payload.bin"))))))
+      (finally (rm-rf! root)))))
+
+(deftest unsupported-helper-command-fails-closed
+  (let [r (cp/spawnSync (path/join bin-dir "git-remote-kotoba") #js ["origin" "kotoba::/nowhere"]
+                        #js {:input "list\n" :stdio #js ["pipe" "pipe" "pipe"]})]
+    (is (= 1 (.-status r)))
+    (is (re-find #"unsupported command: list" (str (.-stderr r))))))
+
+(deftest network-adapter-materializes-and-publishes
+  (let [root (temp-dir "bonsai-network-")
+        cache-root (path/join root "cache")
+        clone (path/join root "clone")
+        run (runner {"KOTOBA_GIT_CACHE" cache-root
+                     "KOTOBA_GIT_ADAPTER" (path/join bin-dir "kotoba-git-reference-adapter")
+                     "KOTOBA_GIT_REFERENCE_ROOT" (path/join root "remote")})
+        remote "kotoba://example.test/team/repo"]
+    (try
+      (let [seed (seed-repo! run root "README.md" "network adapter\n")]
+        (is (zero? (:exit (run "git" "-C" seed "push" "-q" remote "main")))))
+      (is (zero? (:exit (run "git" "clone" "-q" "--branch" "main" remote clone))))
+      (is (= "network adapter\n" (str (fs/readFileSync (path/join clone "README.md") "utf8"))))
+      (is (= 1 (count (filter #(.isDirectory (fs/statSync (path/join cache-root %)))
+                              (fs/readdirSync cache-root)))))
+      (finally (rm-rf! root)))))
+
+;; The test server: GET serves the last PUT body (404 before any), PUT stores
+;; the body and the three request headers the contract names.
+(def ^:private server-js
+  "const http=require('http'),fs=require('fs'),dir=process.argv[1];
+   const s=http.createServer((q,r)=>{
+     if(q.method==='GET'){const f=dir+'/body';
+       if(fs.existsSync(f)){r.writeHead(200);r.end(fs.readFileSync(f));}else{r.writeHead(404);r.end();}}
+     else if(q.method==='PUT'){const c=[];q.on('data',d=>c.push(d));q.on('end',()=>{
+       fs.writeFileSync(dir+'/body',Buffer.concat(c));
+       fs.writeFileSync(dir+'/meta.json',JSON.stringify({authorization:q.headers['authorization'],
+         url:q.url,digest:q.headers['x-kotoba-bundle-sha256'],refs:q.headers['x-kotoba-refs-edn-b64']}));
+       r.writeHead(200);r.end();});}
+     else{r.writeHead(405);r.end();}});
+   s.listen(0,'127.0.0.1',()=>fs.writeFileSync(dir+'/port',String(s.address().port)));")
+
+(defn- wait-for-file [f]
+  (let [deadline (+ (js/Date.now) 10000)
+        cell (js/Int32Array. (js/SharedArrayBuffer. 4))]
+    (while (and (not (fs/existsSync f)) (< (js/Date.now) deadline))
+      (js/Atomics.wait cell 0 0 20))
+    (str (fs/readFileSync f "utf8"))))
+
+(deftest http-adapter-publishes-bundle-and-ref-projection
+  (let [root (temp-dir "bonsai-http-")
+        server-dir (path/join root "server")
+        _ (fs/mkdirSync server-dir)
+        server (cp/spawn (.-execPath js/process) #js ["-e" server-js server-dir]
+                         #js {:stdio "ignore"})
+        port (wait-for-file (path/join server-dir "port"))
+        clone (path/join root "clone")
+        run (runner {"KOTOBA_GIT_CACHE" (path/join root "cache")
+                     "KOTOBA_GIT_ADAPTER" (path/join bin-dir "kotobase-http-git-adapter")
+                     "KOTOBA_GIT_AUTHORIZATION" "Bearer test-only-token"
+                     "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK" "1"})
+        remote (str "kotoba://127.0.0.1:" port "/team/%E6%97%A5%E6%9C%AC%E8%AA%9E%20!%27()~*")]
+    (try
+      (let [seed (seed-repo! run root "data.txt" "http adapter\n")]
+        (fs/writeFileSync (path/join seed "payload.bin") (crypto/randomBytes (* 256 1024)))
+        (is (= 0 (:exit (run "git" "-C" seed "add" "payload.bin"))))
+        (is (= 0 (:exit (run "git" "-C" seed "-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test"
+                                "commit" "-q" "-m" "binary bundle"))))
+        (is (zero? (:exit (run "git" "-C" seed "push" "-q" remote "main")))))
+      (let [meta (js->clj (js/JSON.parse (str (fs/readFileSync (path/join server-dir "meta.json")))))]
+        (is (> (.-size (fs/statSync (path/join server-dir "body"))) 131072))
+        (is (= "Bearer test-only-token" (get meta "authorization")))
+        (is (= "/git/v1/repos/team%2F%E6%97%A5%E6%9C%AC%E8%AA%9E+%21%27%28%29%7E*/bundle" (get meta "url")))
+        (is (= (get meta "refs")
+               (-> (.toString (js/Buffer.from (get meta "refs") "base64") "base64")
+                   (.replace (js/RegExp. "\\+" "g") "-") (.replace (js/RegExp. "/" "g") "_"))))
+        (is (= (-> (crypto/createHash "sha256")
+                   (.update (fs/readFileSync (path/join server-dir "body"))) (.digest "hex"))
+               (get meta "digest")))
+        (is (re-find #"refs/heads/main [0-9a-f]{40}"
+                     (str (js/Buffer.from (get meta "refs") "base64")))))
+      (is (zero? (:exit (run "git" "clone" "-q" "--branch" "main" remote clone))))
+      (is (= "http adapter\n" (str (fs/readFileSync (path/join clone "data.txt") "utf8"))))
+      (finally (.kill server) (rm-rf! root)))))
+
+(deftest a-signalled-git-service-never-reports-success
+  (let [root (temp-dir "bonsai-signal-")
+        service (path/join root "git-upload-pack")]
+    (try
+      (fs/writeFileSync service "#!/usr/bin/env node\nprocess.kill(process.pid,'SIGTERM');\n" #js {:mode 0755})
+      (let [env (js/Object.assign #js {} (.-env js/process)
+                                 #js {:PATH (str root ":" bin-dir ":" (.. js/process -env -PATH))})
+            r (cp/spawnSync (path/join bin-dir "git-remote-kotoba") #js ["origin" "kotoba::/ignored"]
+                            #js {:env env :input "connect git-upload-pack\n" :stdio #js ["pipe" "pipe" "pipe"]})]
+        (is (not= 0 (.-status r)) "child signal must propagate as failure"))
+      (finally (rm-rf! root)))))
+
+(deftest unsupported-service-is-refused-before-connect-is-acknowledged
+  (let [r (cp/spawnSync (path/join bin-dir "git-remote-kotoba") #js ["origin" "kotoba::/ignored"]
+                        #js {:input "connect git-unsafe-service\n" :stdio #js ["pipe" "pipe" "pipe"]})]
+    (is (= 1 (.-status r)))
+    (is (= "" (str (.-stdout r))) "no connect handshake for an unsupported service")))
+
+(defn- with-http-server [f]
+  (let [root (temp-dir "bonsai-http-review-") dir (path/join root "server")
+        _ (fs/mkdirSync dir)
+        server (cp/spawn (.-execPath js/process) #js ["-e" server-js dir] #js {:stdio "ignore"})]
+    (try (f root dir (wait-for-file (path/join dir "port")))
+         (finally (.kill server) (rm-rf! root)))))
+
+(deftest a-remote-404-never-serves-stale-cached-refs
+  (with-http-server
+    (fn [root server-dir port]
+      (let [remote (str "kotoba://127.0.0.1:" port "/rid-test")
+            run (runner {"KOTOBA_GIT_CACHE" (path/join root "cache")
+                         "KOTOBA_GIT_ADAPTER" (path/join bin-dir "kotobase-http-git-adapter")
+                         "KOTOBA_GIT_AUTHORIZATION" "Bearer test-only-token" "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK" "1"})
+            seed (seed-repo! run root "data.txt" "not publicly available\n")]
+        (is (= 0 (:exit (run "git" "-C" seed "push" "-q" remote "main"))))
+        (fs/unlinkSync (path/join server-dir "body"))
+        (let [result (run "git" "ls-remote" remote)]
+          (is (not= 0 (:exit result)) "a missing/hidden remote must not fall back to old cached contents")
+          (is (= "" (:out result))))))))
+
+(deftest unsafe-auth-config-is-refused-and-its-temporary-files-are-removed
+  (let [root (temp-dir "bonsai-auth-review-")]
+    (try
+      (doseq [value ["Bearer test\\nInjected" "Bearer test\tInjected" "Bearer test\"Injected"]]
+        (let [env (js/Object.assign #js {} (.-env js/process)
+                                   (clj->js {"TMPDIR" root "KOTOBA_GIT_AUTHORIZATION" value}))
+              result (cp/spawnSync (path/join bin-dir "kotobase-http-git-adapter")
+                                  #js ["fetch" "kotoba://127.0.0.1:1/rid" "/unused"]
+                                  #js {:env env :stdio #js ["ignore" "pipe" "pipe"]})]
+          (is (= 1 (.-status result)))
+          (is (re-find #"one safe header value" (str (.-stderr result))))
+          (is (empty? (filter #(.startsWith % "kotobase-git-") (fs/readdirSync root))))))
+      (finally (rm-rf! root)))))
+
+))
+
+#?(:clj
+   (do
+(deftest remote-helper-clone-fetch-push
+  (let [root (kio/temp-dir
+                       "bonsai-remote-")
+        origin (java.io.File. root "origin.git")
+        seed (java.io.File. root "seed")
+        clone (java.io.File. root "clone")
+        helper-dir (.getCanonicalPath (java.io.File. "bin"))
+        env (assoc (into {} (System/getenv)) "PATH" (str helper-dir ":" (System/getenv "PATH")))
+        run (fn [& args] (apply shell/sh (concat args [:env env])))]
+    (try
+      (is (zero? (:exit (run "git" "init" "--bare" (.getPath origin)))))
+      (is (zero? (:exit (run "git" "init" (.getPath seed)))))
+      (spit (java.io.File. seed "README.md") "bonsai\n")
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "add" "README.md"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed)
+                             "-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test"
+                             "commit" "-m" "initial"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "branch" "-M" "main"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "push"
+                             (str "kotoba::" (.getPath origin)) "main"))))
+      (is (zero? (:exit (run "git" "clone" "--branch" "main"
+                             (str "kotoba::" (.getPath origin)) (.getPath clone)))))
+      (is (= "bonsai\n" (slurp (java.io.File. clone "README.md"))))
+      (finally (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f))))))
+
+(deftest network-adapter-materializes-and-publishes
+  (let [root (kio/temp-dir
+                       "bonsai-network-")
+        remote-root (java.io.File. root "remote")
+        cache-root (java.io.File. root "cache")
+        seed (java.io.File. root "seed") clone (java.io.File. root "clone")
+        helper-dir (.getCanonicalPath (java.io.File. "bin"))
+        adapter (.getCanonicalPath (java.io.File. "lib/kotoba.bonsai/bin/kotoba-git-reference-adapter"))
+        env (assoc (into {} (System/getenv))
+                   "PATH" (str helper-dir ":" (System/getenv "PATH"))
+                   "KOTOBA_GIT_CACHE" (.getPath cache-root)
+                   "KOTOBA_GIT_ADAPTER" adapter
+                   "KOTOBA_GIT_REFERENCE_ROOT" (.getPath remote-root))
+        run (fn [& args] (apply shell/sh (concat args [:env env])))
+        remote "kotoba://example.test/team/repo"]
+    (try
+      (is (zero? (:exit (run "git" "init" (.getPath seed)))))
+      (spit (java.io.File. seed "README.md") "network adapter\n")
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "add" "README.md"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed)
+                             "-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test"
+                             "commit" "-m" "network"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "branch" "-M" "main"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "push" remote "main"))))
+      (is (zero? (:exit (run "git" "clone" "--branch" "main" remote (.getPath clone)))))
+      (is (= "network adapter\n" (slurp (java.io.File. clone "README.md"))))
+      (is (= 1 (count (filter #(.isDirectory ^java.io.File %)
+                              (or (seq (.listFiles cache-root)) [])))))
+      (finally (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f))))))
+
+(deftest http-adapter-publishes-bundle-and-ref-projection
+  (let [stored (atom nil) request-meta (atom nil)
+        server (com.sun.net.httpserver.HttpServer/create
+                (java.net.InetSocketAddress. "127.0.0.1" 0) 0)
+        handler (reify com.sun.net.httpserver.HttpHandler
+                  (handle [_ exchange]
+                    (let [method (.getRequestMethod exchange)]
+                      (cond
+                        (= method "GET")
+                        (if-let [body @stored]
+                          (do (.getResponseHeaders exchange)
+                              (.sendResponseHeaders exchange 200 (alength ^bytes body))
+                              (with-open [out (.getResponseBody exchange)] (.write out ^bytes body)))
+                          (.sendResponseHeaders exchange 404 -1))
+
+                        (= method "PUT")
+                        (let [body (with-open [in (.getRequestBody exchange)] (.readAllBytes in))
+                              headers (.getRequestHeaders exchange)]
+                          (reset! stored body)
+                          (reset! request-meta
+                                  {:authorization (.getFirst headers "Authorization")
+                                   :digest (.getFirst headers "X-Kotoba-Bundle-SHA256")
+                                   :refs (.getFirst headers "X-Kotoba-Refs-EDN-B64")})
+                          (.sendResponseHeaders exchange 200 -1))
+                        :else (.sendResponseHeaders exchange 405 -1)))))
+        _ (.createContext server "/" handler)
+        _ (.start server)
+        port (.getPort (.getAddress server))
+        root (kio/temp-dir
+                       "bonsai-http-")
+        cache-root (java.io.File. root "cache") seed (java.io.File. root "seed")
+        clone (java.io.File. root "clone") helper-dir (.getCanonicalPath (java.io.File. "bin"))
+        adapter (.getCanonicalPath (java.io.File. "lib/kotoba.bonsai/bin/kotobase-http-git-adapter"))
+        env (assoc (into {} (System/getenv))
+                   "PATH" (str helper-dir ":" (System/getenv "PATH"))
+                   "KOTOBA_GIT_CACHE" (.getPath cache-root)
+                   "KOTOBA_GIT_ADAPTER" adapter
+                   "KOTOBA_GIT_AUTHORIZATION" "Bearer test-only-token"
+                   "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK" "1")
+        run (fn [& args] (apply shell/sh (concat args [:env env])))
+        remote (str "kotoba://127.0.0.1:" port "/rid-test")]
+    (try
+      (is (zero? (:exit (run "git" "init" (.getPath seed)))))
+      (spit (java.io.File. seed "data.txt") "http adapter\n")
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "add" "data.txt"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed)
+                             "-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test"
+                             "commit" "-m" "http"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "branch" "-M" "main"))))
+      (is (zero? (:exit (run "git" "-C" (.getPath seed) "push" remote "main"))))
+      (is (bytes? @stored))
+      (is (= "Bearer test-only-token" (:authorization @request-meta)))
+      (is (re-matches #"[0-9a-f]{64}" (:digest @request-meta)))
+      (is (seq (:refs @request-meta)))
+      (is (zero? (:exit (run "git" "clone" "--branch" "main" remote (.getPath clone)))))
+      (is (= "http adapter\n" (slurp (java.io.File. clone "data.txt"))))
+      (finally (.stop server 0)
+               (doseq [f (reverse (file-seq root))] (.delete ^java.io.File f))))))
+
+))

@@ -1,0 +1,220 @@
+;; A local stand-in for kotobase.net's /git/v1/repos/:rid/private/{blocks,head}
+;; (kotobase-api-gateway-cljs `kotobase.git-private-snapshot`), for
+;; test/private_git_adapter_test.cljk. Run as a child process:
+;;
+;;   kbb test/private_git_stub.cljk <state-dir>
+;;
+;; It writes the port it listens on to <state-dir>/port. It is a stub of the
+;; CONTRACT, not of the deployment: no Biscuit signature (the token must equal
+;; <state-dir>/token byte for byte), no tenants, no IPNI/IPNS, push only. What
+;; it does do the gateway's way, with the same library the gateway imports
+;; (bonsai.private-wire): CID and codec and content-type of every block,
+;; descriptor shape and repository, the descriptor+ciphertext closure before a
+;; head is accepted, `expected_heads` against the whole frontier, the
+;; parent/epoch transition, and re-verification of every stored block on
+;; read (502 if storage was tampered with).
+;;
+;; Two test-only switches, each a file in <state-dir>:
+;;   race              accept a push whose expected_heads is a real but stale
+;;                     tip -- the outcome of two pushes racing past the
+;;                     gateway's frontier check, which the gateway then keeps
+;;                     as two tips rather than ordering.
+;;   serve-unverified  return stored blocks without re-verifying them -- a
+;;                     compromised or buggy server, so the CLIENT's own
+;;                     verification is what is under test.
+(ns private-git-stub
+  (:require ["node:fs" :as fs]
+            ["node:http" :as http]
+            ["node:path" :as path]
+            [bonsai.private-remote :as remote]
+            [bonsai.private-wire :as wire]
+            [ipld.core :as ipld]
+            [multiformats.core :as mf]))
+
+(def dir (first *command-line-args*))
+
+;; node:crypto under the CID digest, proved equal to the portable one by the
+;; seam (bonsai.sha256-seam-test). The deployed gateway does not install it,
+;; which changes how long verification takes there, not what it decides.
+(remote/install-sha256!)
+(defn- f [& parts] (apply path/join dir parts))
+
+;; Storage is per repository, as the gateway's R2 keys are
+;; (<tenant>/<rid>/blocks/<cid>, <tenant>/<rid>/events/…).
+(defn- repo-dir [rid kind]
+  (let [d (f "repos" (js/encodeURIComponent rid) kind)]
+    (fs/mkdirSync d #js {:recursive true})
+    d))
+
+(defn- json! [res status body]
+  (.writeHead res status #js {"content-type" "application/json" "cache-control" "private, no-store"})
+  (.end res (js/JSON.stringify (clj->js body))))
+
+(defn- log! [entry] (fs/appendFileSync (f "requests.edn") (str (pr-str entry) "\n")))
+
+(defn- authorized? [req]
+  (= (str "Biscuit " (.trim (fs/readFileSync (f "token") "utf8")))
+     (aget (.-headers req) "authorization")))
+
+(defn- codec-of [cid]
+  (cond (.startsWith cid "bafyrei") :dag-cbor
+        (.startsWith cid "bafkrei") :raw))
+
+(defn- verify-block [rid cid content-type bytes]
+  (let [codec (codec-of cid)]
+    (cond
+      (nil? codec) {:status 400 :error "unsupported CID"}
+      (and (= codec :dag-cbor) (not= content-type wire/descriptor-content-type))
+      {:status 415 :error "DAG-CBOR private blocks require application/vnd.ipld.dag-cbor"}
+      (and (= codec :raw) (not= content-type wire/ciphertext-content-type))
+      {:status 415 :error "raw private blocks require application/vnd.ipld.raw"}
+      (> (.-length bytes) (if (= codec :dag-cbor) (* 256 1024) (* 64 1024 1024)))
+      {:status 413 :error "private repository block too large"}
+      :else
+      (try
+        (if (= codec :dag-cbor)
+          (let [info (wire/descriptor-info bytes)]
+            (cond (not= cid (:snapshot/cid info)) {:status 422 :error "descriptor CID mismatch"}
+                  (not= rid (:snapshot/rid info)) {:status 422 :error "descriptor repository mismatch"}
+                  :else {:ok true}))
+          (if (= cid (str (mf/cidv1-raw bytes)))
+            {:ok true}
+            {:status 422 :error "ciphertext CID mismatch"}))
+        (catch :default _ {:status 422 :error "invalid private repository block"})))))
+
+(defn- events [rid]
+  (vec (for [n (fs/readdirSync (repo-dir rid "events"))]
+         (let [m (ipld/decode (js/Uint8Array. (fs/readFileSync (path/join (repo-dir rid "events") n))))]
+           (into {} (map (fn [[k v]] [(keyword k) v])) m)))))
+
+(defn- frontier [evs]
+  (let [parents (set (mapcat :parents evs))]
+    (vec (sort-by :snapshot_cid (remove #(contains? parents (:snapshot_cid %)) evs)))))
+
+(defn- body [req]
+  (js/Promise.
+   (fn [ok _]
+     (let [chunks #js []]
+       (.on req "data" #(.push chunks %))
+       (.on req "end" #(ok (js/Uint8Array. (js/Buffer.concat chunks))))))))
+
+(defn- stored [rid cid]
+  (let [p (path/join (repo-dir rid "blocks") cid)] (when (fs/existsSync p) (js/Uint8Array. (fs/readFileSync p)))))
+
+(defn- put-head [rid command res]
+  (let [op (get command "operation")
+        expected (get command "expected_heads")
+        cid (get command "snapshot_cid")
+        descriptor (stored rid cid)]
+    (cond
+      (not (and (map? command) (string? cid) (vector? expected)
+                (every? string? expected)
+                (every? #{"snapshot_cid" "operation" "expected_heads"} (keys command))))
+      (json! res 400 {:ok false :error "invalid private repository head command"})
+      (not= "push" op) (json! res 400 {:ok false :error "stub supports push only"})
+      (nil? descriptor) (json! res 409 {:ok false :error "snapshot descriptor is not stored"})
+      :else
+      (let [info (wire/descriptor-info descriptor)
+            ciphertext (stored rid (:snapshot/ciphertext-cid info))]
+        (if-not ciphertext
+          (json! res 409 {:ok false :error "snapshot ciphertext is not stored"})
+          (let [candidate (wire/verify-snapshot descriptor ciphertext)
+                evs (events rid)
+                tips (frontier evs)
+                by-cid (into {} (map (juxt :snapshot_cid identity)) evs)
+                race? (fs/existsSync (f "race"))
+                frontier-ok? (if race?
+                               (every? #(contains? by-cid %) expected)
+                               (= (set (map :snapshot_cid tips)) (set expected)))
+                parent (:snapshot/parent candidate)
+                current (some-> (get by-cid parent)
+                                (#(hash-map :snapshot/cid (:snapshot_cid %)
+                                            :snapshot/ciphertext-cid (:ciphertext_cid %)
+                                            :snapshot/epoch (:epoch %))))]
+            (cond
+              (not= rid (:snapshot/rid candidate))
+              (json! res 422 {:ok false :error "snapshot descriptor is invalid"})
+              (contains? by-cid cid) (json! res 200 {:ok true :snapshot_cid cid :idempotent true})
+              (not frontier-ok?) (json! res 409 {:ok false :error "snapshot-frontier-conflict"})
+              (and (seq expected) (nil? current))
+              (json! res 409 {:ok false :error "descriptor-parent-not-in-frontier"})
+              :else
+              (let [t (wire/transition current candidate op)]
+                (if-not (:ok? t)
+                  (json! res 409 {:ok false :error (name (:reason t))})
+                  (let [event {"version" 1 "rid" rid "snapshot_cid" cid
+                               "ciphertext_cid" (:snapshot/ciphertext-cid candidate)
+                               "epoch" (:snapshot/epoch candidate)
+                               "descriptor_parent" parent
+                               "parents" (vec (sort expected))}
+                        bytes (ipld/encode event)
+                        event-cid (ipld/cid bytes)]
+                    (fs/writeFileSync (path/join (repo-dir rid "events") event-cid) bytes)
+                    (json! res 201 {:ok true :snapshot_cid cid :event_cid event-cid
+                                    :parents (vec (sort expected))})))))))))))
+
+(defn- handle [req res]
+  (let [url (js/URL. (.-url req) "http://stub")
+        [_ rid-enc resource cid] (re-matches #"^/git/v1/repos/([^/]+)/private/(head|blocks)(?:/([^/]+))?$"
+                                             (.-pathname url))
+        rid (some-> rid-enc js/decodeURIComponent)
+        method (.-method req)
+        op (aget (.-headers req) "x-kotoba-git-operation")]
+    (log! {:method method :path (.-pathname url) :operation op
+           :auth? (authorized? req)})
+    (cond
+      (not (and rid (wire/valid-rid? rid))) (json! res 404 {:ok false :error "Not Found"})
+      (not (authorized? req)) (json! res 401 {:ok false :error "Biscuit authorization is required"})
+
+      (and (= resource "blocks") (= method "PUT"))
+      (if (not= "push" op)
+        (json! res 400 {:ok false :error "unsupported private repository operation"})
+        (-> (body req)
+            (.then (fn [bytes]
+                     (let [ct (some-> (aget (.-headers req) "content-type") (.split ";") first .trim)
+                           v (verify-block rid cid ct bytes)]
+                       (if (:ok v)
+                         (do (fs/writeFileSync (path/join (repo-dir rid "blocks") cid) bytes)
+                             (json! res 201 {:ok true :cid cid}))
+                         (json! res (:status v) {:ok false :error (:error v)})))))))
+
+      (and (= resource "blocks") (= method "GET"))
+      (if-let [bytes (stored rid cid)]
+        (let [ct (if (= :dag-cbor (codec-of cid)) wire/descriptor-content-type wire/ciphertext-content-type)]
+          (if (or (fs/existsSync (f "serve-unverified")) (:ok (verify-block rid cid ct bytes)))
+            (do (.writeHead res 200 #js {"content-type" ct}) (.end res bytes))
+            (json! res 502 {:ok false :error "stored private repository block failed verification"})))
+        (json! res 404 {:ok false :error "private repository block not found"}))
+
+      (and (= resource "head") (= method "GET"))
+      (let [evs (events rid)]
+        (if (empty? evs)
+          (json! res 404 {:ok false :error "private repository not found"})
+          (let [tips (frontier evs)]
+            (json! res 200 {:ok true :frontier tips :forked (> (count tips) 1)}))))
+
+      (and (= resource "head") (= method "PUT"))
+      (-> (body req)
+          ;; race mode holds every head append for 3 s, so two pushes started
+          ;; together both read the old tip before either appends.
+          (.then (fn [b] (if (fs/existsSync (f "race"))
+                           (js/Promise. (fn [ok _] (js/setTimeout #(ok b) 3000)))
+                           b)))
+          (.then (fn [bytes]
+                   (let [command (try (js->clj (js/JSON.parse (.decode (js/TextDecoder.) bytes)))
+                                      (catch :default _ nil))]
+                     (try (put-head rid command res)
+                          (catch :default e
+                            (json! res 422 {:ok false :error (str "invalid snapshot: " (ex-message e))})))))))
+
+      :else (json! res 405 {:ok false :error "Method Not Allowed"}))))
+
+;; Exit once the state directory is removed: the test that owns it is done,
+;; whether or not it got to kill this process.
+(js/setInterval #(when-not (fs/existsSync dir) (js/process.exit 0)) 1000)
+
+(let [server (http/createServer (fn [req res]
+                                  (try (handle req res)
+                                       (catch :default e (json! res 500 {:ok false :error (str e)})))))]
+  (.listen server 0 "127.0.0.1"
+           (fn [] (fs/writeFileSync (f "port") (str (.-port (.address server)))))))

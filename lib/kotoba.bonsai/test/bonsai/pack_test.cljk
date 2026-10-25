@@ -1,0 +1,128 @@
+(ns bonsai.pack-test
+  "Real git is the oracle in both directions: `git verify-pack` must accept
+   what bonsai.pack writes, and bonsai.pack must read what `git pack-objects`
+   writes -- deltas included, which a pack this namespace encodes never
+   contains, so the second test is the only one that reaches apply-delta
+   through the pack reader. Files go through kotoba.io and git through
+   kotoba.process, both of which run on the JVM and on kbb alike."
+  (:require [kotoba.bytes :as kbytes] [kotoba.io :as kio] [bonsai.pack :as pack]
+            [bonsai.loose-object :as loose]
+            #?(:cljs [kotoba.bytes.sha1 :as sha1])
+            [kotoba.lang.text :as str]
+            [kotoba.process :as shell]
+            [kotoba.test :refer [deftest is]])
+  #?(:clj (:import (java.security MessageDigest))))
+
+(defn utf8 [s] (kbytes/utf8-bytes ^String s))
+
+(defn- rm-rf [dir]
+  (doseq [f (reverse (kio/file-seq dir))] (kio/delete f)))
+
+(defn- git [dir & args]
+  (apply shell/sh "git" (concat args [:dir (kio/path dir)])))
+
+(defn- bytes [xs]
+  #?(:clj (byte-array (map unchecked-byte xs))
+     :cljs (js/Uint8Array.from (clj->js (vec xs)))))
+
+(defn- signed-pack [count payload]
+  (let [prefix (vec (concat [80 65 67 75 0 0 0 2 0 0 0 count] payload))]
+    (bytes (concat prefix
+                 (map #(bit-and (int %) 255)
+                      #?(:clj (.digest (MessageDigest/getInstance "SHA-1")
+                                       (byte-array (map unchecked-byte prefix)))
+                         :cljs (sha1/sha1-bytes prefix)))))))
+
+(defn- reason [f]
+  (try (f) :accepted
+       (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))
+
+(deftest malformed-pack-boundaries
+  (is (= :pack-size (reason #(pack/decode
+                             (signed-pack 1 (concat [0xb0 0x80 0x80 0x80 0x80 1]
+                                                    (loose/deflate (utf8 "x"))))))))
+  (is (= :pack-trailing (reason #(pack/decode (signed-pack 0 [1 2 3])))))
+  (is (= :truncated-pack (reason #(pack/decode [80 65 67 75]))))
+  (is (= :truncated-pack (reason #(pack/decode (signed-pack 1 [0xb0])))))
+  (is (= :pack-type (reason #(pack/decode (signed-pack 1 [0])))))
+  (is (= [] (pack/decode (signed-pack 0 []))))
+  (is (= :truncated-pack (reason #(pack/decode (signed-pack 1 [0x71 0])))))
+  (is (= :delta-base (reason #(pack/decode (signed-pack 1 [0x61 0])))))
+  (is (= :pack-size (reason #(pack/decode (signed-pack 1 (concat [0xb0]
+                                                                               (repeat 9 0xff))))))))
+
+(deftest git-also-rejects-size-alias-and-trailing-pack-data
+  (let [dir (kio/temp-dir "bonsai-invalid-pack-")]
+    (try
+      (doseq [[name payload n] [["size" (concat [0xb0 0x80 0x80 0x80 0x80 1]
+                                               (loose/deflate (utf8 "x"))) 1]
+                               ["trailing" [1 2 3] 0]]]
+        (let [file (kio/file dir (str name ".pack"))]
+          (kio/write-bytes file (signed-pack n payload))
+          (is (not (zero? (:exit (shell/sh "git" "index-pack" "--strict" (kio/path file))))))))
+      (finally (rm-rf dir)))))
+
+(deftest offset-delta-with-zero-first-group
+  ;; A stored zlib block makes the base entry exactly 128 bytes on every
+  ;; runtime. Git encodes that backward distance as 0x80 0x00, not 0x81 0x00.
+  (let [base-entry (concat [0xb3 7 0x78 1 1 115 0 140 255]
+                           (repeat 115 120) [55 183 53 233])
+        packed (signed-pack 2 (concat base-entry [0x64 0x80 0]
+                                      (loose/deflate (bytes [115 1 1 120]))))
+        objects (pack/decode packed)]
+    (is (= 128 (count base-entry)))
+    (is (= [120] (vec (:body (second objects)))))
+    (is (= [12 140] (mapv :offset objects)))))
+
+(deftest pack-and-index-are-accepted-by-git
+  (let [bytes (pack/encode [{:type "blob" :body (utf8 "hello\n")}
+                            {:type "blob" :body (utf8 "world\n")}])
+        objects (pack/decode bytes)
+        idx (pack/encode-index-v2 objects bytes)
+        dir (kio/temp-dir "bonsai-pack-")
+        pack-file (kio/file dir "objects.pack") idx-file (kio/file dir "objects.idx")]
+    (try
+      (kio/write-bytes pack-file bytes)
+      (kio/write-bytes idx-file idx)
+      (let [{:keys [exit err]} (shell/sh "git" "verify-pack" "-v" (kio/path idx-file))]
+        (is (zero? exit) err))
+      (is (= ["blob" "blob"] (mapv :type objects)))
+      (is (= ["ce013625030ba8dba906f756967f9e9ca394464a"
+              "cc628ccd10742baea8241c5924df992b5c019f71"]
+             (mapv :oid objects)))
+      (finally (rm-rf dir)))))
+
+(deftest git-written-pack-with-deltas-decodes-to-git-oids
+  (let [dir (kio/temp-dir "bonsai-pack-git-")
+        ;; Two large, nearly identical blobs: exercise REF_DELTA (default)
+        ;; and OFS_DELTA (--delta-base-offset), checking the actual type byte.
+        base (apply str (map #(str "line " % " of a blob git will deltify\n") (range 200)))
+        edited (str base "one more line\n")]
+    (try
+      (is (zero? (:exit (git dir "init" "-q" "."))))
+      (kio/write-string (kio/file dir "a.txt") base)
+      (kio/write-string (kio/file dir "b.txt") edited)
+      (let [oids (mapv #(str/trim (:out (git dir "hash-object" "-w" %))) ["a.txt" "b.txt"])]
+        (doseq [[name flags code] [["ref" [] 7] ["ofs" ["--delta-base-offset"] 6]]]
+          (let [{:keys [exit out err]} (apply shell/sh "git" "pack-objects" "-q" "--window=10"
+                                             (concat flags [name :dir (kio/path dir)
+                                              :in (str (str/join "\n" oids) "\n")]))
+            pack-file (kio/file dir (str name "-" (str/trim out) ".pack"))
+            verify (:out (shell/sh "git" "verify-pack" "-v"
+                                   (str/replace (kio/path pack-file) #"\.pack$" ".idx")))
+            packed (kio/read-all-bytes pack-file)
+            objects (pack/decode packed)
+            idx (kio/file dir (str name "-bonsai.idx"))
+            repacked (kio/file dir (str name "-bonsai.pack"))]
+        (is (zero? exit) err)
+        (is (re-find #"chain length = 1: 1 object" verify)
+            "the fixture must really contain a delta, or this test proves nothing")
+        (is (= (set oids) (set (map :oid objects))))
+        (is (= #{"blob"} (set (map :type objects))))
+        (is (some #(= code (bit-and 7 (bit-shift-right (nth (vec packed) (:offset %)) 4))) objects))
+        (is (= #{base edited}
+               (set (map #(kbytes/utf8-string (:body %)) objects))))
+        (kio/write-bytes repacked packed)
+        (kio/write-bytes idx (pack/encode-index-v2 objects packed))
+        (is (zero? (:exit (shell/sh "git" "verify-pack" "-v" (kio/path idx))))))))
+      (finally (rm-rf dir)))))

@@ -1,0 +1,125 @@
+(ns bonsai.recipient-store
+  "The local key store behind the private-Git adapter: one hybrid recipient
+  (X25519 + ML-KEM-768) per file, the keys `bonsai.private-repo` seals a
+  snapshot to and opens it with.
+
+  The file is EDN at `~/.config/kotoba/rad/recipient.edn` unless
+  `KOTOBA_GIT_RECIPIENT_FILE` names another, created mode 0600 in a directory
+  created mode 0700, and never overwritten: `generate!` links a fully
+  written temporary file into place, which fails if the name exists, so a
+  second `init` cannot silently replace the only key that opens every
+  snapshot sealed so far.
+
+  Loading fails closed on a file that group or other can read, on an id that
+  is not what the public keys hash to (a relabelled or edited file), and on a
+  missing field. Nothing here prints or returns private material except
+  `load-keys`, whose caller is the opener; `public-descriptor` is what may be
+  shown and shared.
+
+  The recipient id is derived, not chosen:
+  `kotoba-recipient:` + base64url(SHA-256(x25519-pub || ml-kem-pub)). Two
+  stores never collide, and an id cannot be pointed at someone else's keys
+  without the hash disagreeing."
+  (:require #?@(:cljs [["node:fs" :as fs]
+                       ["node:os" :as os]
+                       ["node:path" :as path]
+                       ["node:crypto" :as crypto]
+                       [clojure.edn :as edn]
+                       [envelope.seal-sync :as seal]])))
+
+#?(:cljs
+   (do
+     (def format-version 1)
+     (def kem "x25519+ml-kem-768")
+     (def ^:private fields [:kotoba.git/recipient :id :kem :pub :pq-pub :priv :pq-priv])
+
+     (defn default-path []
+       (path/join (os/homedir) ".config" "kotoba" "rad" "recipient.edn"))
+
+     (defn store-path
+       "The key file: `KOTOBA_GIT_RECIPIENT_FILE`, else the default."
+       [env]
+       (let [p (aget env "KOTOBA_GIT_RECIPIENT_FILE")]
+         (if (and p (not= "" p)) p (default-path))))
+
+     (defn recipient-id [pub pq-pub]
+       (str "kotoba-recipient:"
+            (-> (crypto/createHash "sha256")
+                (.update (js/Buffer.concat #js [(js/Buffer.from (seal/unb64url pub))
+                                                (js/Buffer.from (seal/unb64url pq-pub))]))
+                (.digest "base64url"))))
+
+     (defn public-descriptor
+       "What the adapter seals to, and all that may be printed or shared."
+       [record]
+       {:id (:id record) :kem kem :pub (:pub record) :pq-pub (:pq-pub record)})
+
+     (defn- ensure-dir! [dir]
+       (when-not (fs/existsSync dir)
+         (fs/mkdirSync dir #js {:recursive true :mode 448})
+         ;; mkdir's mode is masked by the umask; the store's own directory is
+         ;; set explicitly. Parents that already existed are left alone.
+         (fs/chmodSync dir 448)))                   ; 448 = 0700
+
+     (defn generate!
+       "Create a new store at `file`. Throws if one exists. Returns the public
+        descriptor."
+       [file]
+       (when (fs/existsSync file)
+         (throw (ex-info (str "a recipient key already exists at " file
+                              "; refusing to replace it (every snapshot sealed to it would stop opening)")
+                         {:reason :exists :file file})))
+       (ensure-dir! (path/dirname file))
+       (let [{:keys [priv pub pq-priv pq-pub]} (seal/generate-hybrid-recipient)
+             pub (seal/b64url pub) pq-pub (seal/b64url pq-pub)
+             record {:kotoba.git/recipient format-version
+                     :id (recipient-id pub pq-pub)
+                     :kem kem
+                     :pub pub :pq-pub pq-pub
+                     :priv (seal/b64url priv) :pq-priv (seal/b64url pq-priv)}
+             tmp (str file ".tmp-" (.toString (crypto/randomBytes 6) "hex"))
+             fd (fs/openSync tmp "wx" 384)]                ; 384 = 0600
+         (try
+           (fs/writeSync fd (str (pr-str record) "\n"))
+           (fs/fsyncSync fd)
+           (finally (fs/closeSync fd)))
+         (try
+           ;; link, not rename: link fails with EEXIST where rename would
+           ;; replace, which is the race `init` must lose rather than win.
+           (fs/linkSync tmp file)
+           (finally (fs/rmSync tmp #js {:force true})))
+         (public-descriptor record)))
+
+     (defn load-record
+       "Read and check the store. Throws with :reason on anything unexpected."
+       [file]
+       (when-not (fs/existsSync file)
+         (throw (ex-info (str "no recipient key at " file
+                              " (create one with: kotoba-git-recipient init)")
+                         {:reason :missing :file file})))
+       (let [mode (bit-and (.-mode (fs/statSync file)) 511)]
+         (when-not (zero? (bit-and mode 63))
+           (throw (ex-info (str "recipient key " file " is readable by group or other (mode "
+                                (.toString mode 8) "); chmod 600 it")
+                           {:reason :permissions :file file}))))
+       (let [record (try (edn/read-string (fs/readFileSync file "utf8"))
+                         (catch :default _ nil))]
+         (when-not (and (map? record)
+                        (= format-version (:kotoba.git/recipient record))
+                        (= kem (:kem record))
+                        (every? #(and (string? (get record %)) (seq (get record %)))
+                                (remove #{:kotoba.git/recipient} fields)))
+           (throw (ex-info (str "recipient key " file " is not a version-1 hybrid recipient")
+                           {:reason :malformed :file file})))
+         (when-not (= (:id record) (recipient-id (:pub record) (:pq-pub record)))
+           (throw (ex-info (str "recipient key " file " has an id its public keys do not hash to")
+                           {:reason :id-mismatch :file file})))
+         record))
+
+     (defn load-keys
+       "`{:id :descriptor :keys {:priv :pq-priv}}` -- the opener's view."
+       [file]
+       (let [r (load-record file)]
+         {:id (:id r)
+          :descriptor (public-descriptor r)
+          :keys {:priv (seal/unb64url (:priv r)) :pq-priv (seal/unb64url (:pq-priv r))}}))))

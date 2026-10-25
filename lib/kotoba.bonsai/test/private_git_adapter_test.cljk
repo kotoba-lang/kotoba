@@ -1,0 +1,306 @@
+(ns private-git-adapter-test
+  "End to end under kbb with real `git`: git-remote-kotoba driving
+   bin/kotobase-private-git-adapter against test/private_git_stub.cljk, a
+   local stand-in for kotobase.net's /git/v1/repos/:rid/private/{blocks,head}
+   that validates blocks and heads with bonsai.private-wire, the library the
+   gateway itself uses. Nothing here leaves 127.0.0.1.
+
+   Synchronous like remote_helper_test: every git and adapter run is
+   spawnSync, so the stub runs in its own process."
+  (:require ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            ["node:child_process" :as cp]
+            ["node:crypto" :as crypto]
+            [kotoba.test :refer [deftest is testing]]))
+
+(def bin-dir (fs/realpathSync "bin"))
+(def adapter (path/join bin-dir "kotobase-private-git-adapter"))
+
+(defn- temp-dir [prefix] (fs/mkdtempSync (path/join (os/tmpdir) prefix)))
+(defn- rm-rf! [p] (fs/rmSync p #js {:recursive true :force true}))
+(defn- slurp [p] (str (fs/readFileSync p "utf8")))
+
+(defn- sleep-ms [ms]
+  (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 ms))
+
+(defn- wait-for-file [f]
+  (let [deadline (+ (js/Date.now) 60000)]
+    (while (and (not (fs/existsSync f)) (< (js/Date.now) deadline)) (sleep-ms 50))
+    (slurp f)))
+
+(defn- runner
+  "argv -> {:exit :out :err}, with PATH carrying bin/ and `extra` env."
+  [extra]
+  (let [env (js/Object.assign #js {} (.-env js/process)
+                              #js {:PATH (str bin-dir ":" (.. js/process -env -PATH))}
+                              (clj->js extra))]
+    (fn [& argv]
+      (let [r (cp/spawnSync (first argv) (clj->js (rest argv))
+                            #js {:env env :stdio #js ["ignore" "pipe" "pipe"]})]
+        {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))))
+
+;; ── one stub for the namespace ──────────────────────────────────────────
+
+(def ^:private root (temp-dir "bonsai-private-git-"))
+(def ^:private stub-dir (doto (path/join root "stub") fs/mkdirSync))
+(def ^:private token (.toString (crypto/randomBytes 96) "base64url"))
+(fs/writeFileSync (path/join stub-dir "token") token)
+(def ^:private biscuit-file (path/join root "biscuit"))
+(fs/writeFileSync biscuit-file (str token "\n") #js {:mode 384})
+;; Its own process group: kbb runs the engine as a CHILD process, so killing
+;; the pid alone would orphan the server. The stub also exits by itself once
+;; its state directory is gone, in case this namespace never reaches the end.
+(def ^:private stub (cp/spawn "kbb" #js [(fs/realpathSync "lib/kotoba.bonsai/test/private_git_stub.cljk") stub-dir]
+                              #js {:stdio "ignore" :detached true}))
+(def ^:private port (wait-for-file (path/join stub-dir "port")))
+
+(defn- remote [rid] (str "kotoba://127.0.0.1:" port "/" rid))
+
+(defn- machine
+  "A git environment with its own cache and its own key store."
+  [nm & [{:keys [key-file biscuit]}]]
+  (let [home (path/join root nm)
+        key-file (or key-file (path/join home "keys" "recipient.edn"))
+        run (runner {"KOTOBA_GIT_CACHE" (path/join home "cache")
+                     "KOTOBA_GIT_ADAPTER" adapter
+                     "KOTOBA_GIT_BISCUIT_FILE" (or biscuit biscuit-file)
+                     "KOTOBA_GIT_RECIPIENT_FILE" key-file
+                     "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK" "1"})]
+    (when-not (fs/existsSync key-file) (run "kotoba-git-recipient" "init"))
+    {:home home :run run :key-file key-file}))
+
+(defn- commit! [run dir file content msg]
+  (fs/writeFileSync (path/join dir file) content)
+  (is (zero? (:exit (run "git" "-C" dir "add" file))))
+  (is (zero? (:exit (run "git" "-C" dir "-c" "user.name=Bonsai" "-c" "user.email=bonsai@example.test"
+                         "commit" "-q" "-m" msg)))))
+
+(defn- seed! [{:keys [home run]} file content]
+  (let [seed (path/join home "seed")]
+    (is (zero? (:exit (run "git" "init" "-q" "-b" "main" seed))))
+    (commit! run seed file content "seed")
+    seed))
+
+(defn- head [rid]
+  (let [r (cp/spawnSync "curl" #js ["-s" "-H" (str "Authorization: Biscuit " token)
+                                    (str "http://127.0.0.1:" port "/git/v1/repos/"
+                                         (js/encodeURIComponent rid) "/private/head")])]
+    (js->clj (js/JSON.parse (str (.-stdout r))) :keywordize-keys true)))
+
+(defn- flag! [nm on?]
+  (let [f (path/join stub-dir nm)]
+    (if on? (fs/writeFileSync f "") (rm-rf! f))))
+
+;; ── the tests ───────────────────────────────────────────────────────────
+
+(deftest push-clone-and-incremental-push
+  (let [alice (machine "alice")
+        bob (machine "bob" {:key-file (:key-file alice)}) ; the same key on a second machine
+        run (:run alice)
+        seed (seed! alice "README.md" "private bonsai\n")
+        clone (path/join (:home bob) "clone")
+        rid "rad:private-e2e"]
+    (testing "push seals and uploads; the stub accepted both blocks and one head"
+      (let [r (run "git" "-C" seed "push" "-q" (remote rid) "main")]
+        (is (zero? (:exit r)) (:err r)))
+      (is (= 1 (count (:frontier (head rid)))))
+      (let [log (slurp (path/join stub-dir "requests.edn"))]
+        (is (re-find #":method \"PUT\", :path \"[^\"]*rad%3Aprivate-e2e/private/blocks/bafyrei[^\"]*\", :operation \"push\", :auth\? true" log)
+            "the descriptor went up with X-Kotoba-Git-Operation: push and the Biscuit")
+        (is (re-find #"rad%3Aprivate-e2e/private/blocks/bafkrei[^\"]*\", :operation \"push\", :auth\? true" log)
+            "and so did the ciphertext")))
+    (testing "a clone with an empty cache downloads, verifies and opens it"
+      (let [r ((:run bob) "git" "clone" "-q" "--branch" "main" (remote rid) clone)]
+        (is (zero? (:exit r)) (:err r)))
+      (is (= "private bonsai\n" (slurp (path/join clone "README.md")))))
+    (testing "an incremental push is a child of the first snapshot"
+      (let [first-tip (:snapshot_cid (first (:frontier (head rid))))]
+        (commit! run seed "CHANGES" "second\n" "second")
+        (let [r (run "git" "-C" seed "push" "-q" (remote rid) "main")]
+          (is (zero? (:exit r)) (:err r)))
+        (let [[tip :as frontier] (:frontier (head rid))]
+          (is (= 1 (count frontier)))
+          (is (= first-tip (:descriptor_parent tip)))
+          (is (= [first-tip] (:parents tip))))))
+    (testing "and the clone pulls it"
+      (let [r ((:run bob) "git" "-C" clone "pull" "-q" "origin" "main")]
+        (is (zero? (:exit r)) (:err r)))
+      (is (= "second\n" (slurp (path/join clone "CHANGES")))))
+    (testing "a wrong Biscuit is refused by the service and the push fails"
+      (let [bad (path/join root "bad-biscuit")
+            _ (fs/writeFileSync bad (.toString (crypto/randomBytes 96) "base64url") #js {:mode 384})
+            mallory (machine "mallory" {:key-file (:key-file alice) :biscuit bad})
+            r ((:run mallory) "git" "clone" "-q" (remote rid) (path/join (:home mallory) "clone"))]
+        (is (not (zero? (:exit r))))
+        (is (re-find #"HTTP 401" (:err r)))))))
+
+(deftest a-key-that-was-not-sealed-to-cannot-open
+  (let [alice (machine "alice2")
+        eve (machine "eve")
+        seed (seed! alice "secret.txt" "for alice only\n")
+        rid "rad:private-wrong-key"]
+    (let [r ((:run alice) "git" "-C" seed "push" "-q" (remote rid) "main")]
+      (is (zero? (:exit r)) (:err r)))
+    (let [r ((:run eve) "git" "clone" "-q" (remote rid) (path/join (:home eve) "clone"))]
+      (is (not (zero? (:exit r))))
+      (is (re-find #"cannot open the remote snapshot with recipient kotoba-recipient:" (:err r)))
+      (is (re-find #"no grant" (:err r))))))
+
+(deftest a-tampered-block-is-rejected
+  (let [alice (machine "alice3")
+        bob (machine "bob3" {:key-file (:key-file alice)})
+        seed (seed! alice "a.txt" "intact\n")
+        rid "rad:private-tamper"]
+    (is (zero? (:exit ((:run alice) "git" "-C" seed "push" "-q" (remote rid) "main"))))
+    (let [ciphertext (path/join stub-dir "repos" (js/encodeURIComponent rid) "blocks"
+                              (:ciphertext_cid (first (:frontier (head rid)))))
+          original (fs/readFileSync ciphertext)
+          tampered (doto (js/Buffer.from original) (aset 40 (bit-xor 1 (aget original 40))))]
+      (fs/writeFileSync ciphertext tampered)
+      (try
+        (testing "the service's own re-verification refuses to serve it"
+          (let [r ((:run bob) "git" "clone" "-q" (remote rid) (path/join (:home bob) "c1"))]
+            (is (not (zero? (:exit r))))
+            (is (re-find #"HTTP 502 stored private repository block failed verification" (:err r)))))
+        (testing "and a server that serves it anyway is caught by the client"
+          (flag! "serve-unverified" true)
+          (let [r ((:run bob) "git" "clone" "-q" (remote rid) (path/join (:home bob) "c2"))]
+            (is (not (zero? (:exit r))))
+            (is (re-find #"remote snapshot failed verification: private snapshot ciphertext CID mismatch"
+                         (:err r)))))
+        (finally (flag! "serve-unverified" false) (fs/writeFileSync ciphertext original))))
+    (let [r ((:run bob) "git" "clone" "-q" (remote rid) (path/join (:home bob) "c3"))]
+      (is (zero? (:exit r)) "restored, it clones again"))))
+
+(deftest racing-pushes-fail-closed
+  (let [alice (machine "alice4")
+        seed (seed! alice "a.txt" "base\n")
+        rid "rad:private-race"
+        url (remote rid)
+        run (:run alice)
+        work (fn [nm]
+               ;; a bare cache fetched at the current tip, plus a commit in it
+               (let [cache (path/join (:home alice) (str nm ".git"))
+                     wt (path/join (:home alice) nm)]
+                 (is (zero? (:exit (run adapter "fetch" url cache))))
+                 (is (zero? (:exit (run "git" "clone" "-q" cache wt))))
+                 (commit! run wt (str nm ".txt") (str nm "\n") nm)
+                 (is (zero? (:exit (run "git" "-C" wt "push" "-q" "origin" "main"))))
+                 cache))]
+    (is (zero? (:exit (run "git" "-C" seed "push" "-q" url "main"))))
+    (testing "a push based on a tip that has since moved is refused, not stacked"
+      (let [a (work "a") b (work "b")]
+        (is (zero? (:exit (run adapter "push" url a))))
+        (let [r (run adapter "push" url b)]
+          (is (= 1 (:exit r)))
+          (is (re-find #"the remote moved since this cache was fetched" (:err r))))
+        (is (= 1 (count (:frontier (head rid)))))))
+    (testing "two pushes that race past the frontier check leave two tips, and the adapter picks neither"
+      (let [c (work "c") d (work "d")]
+        ;; The stub's race mode: accept a stale-but-real expected tip and
+        ;; hold each head append for 3 s, so both pushes read the same tip.
+        (flag! "race" true)
+        (try
+          ;; Both pushes in one spawnSync, concurrently, under sh -- this
+          ;; process is synchronous and must not need its event loop here.
+          (run "sh" "-c" "\"$0\" push \"$1\" \"$2\" & \"$0\" push \"$1\" \"$3\" & wait"
+               adapter url c d)
+          (finally (flag! "race" false)))
+        (is (= 2 (count (:frontier (head rid)))) "the stub kept both")
+        (is (true? (:forked (head rid))))
+        (doseq [r [(run adapter "fetch" url (path/join (:home alice) "fresh.git"))
+                   (run adapter "push" url c)
+                   (run "git" "clone" "-q" url (path/join (:home alice) "fresh-clone"))]]
+          (is (not (zero? (:exit r))))
+          (is (re-find #"has 2 tips \(concurrent pushes were kept apart, not ordered\)" (:err r))))))))
+
+(deftest recipient-store-keeps-private-keys-private
+  (let [dir (path/join root "store")
+        file (path/join dir "rad" "recipient.edn")
+        run (runner {"KOTOBA_GIT_RECIPIENT_FILE" file})
+        init (run "kotoba-git-recipient" "init")]
+    (is (zero? (:exit init)) (:err init))
+    (is (= 448 (bit-and 511 (.-mode (fs/statSync (path/join dir "rad"))))) "directory 0700")
+    (is (= 384 (bit-and 511 (.-mode (fs/statSync file)))) "file 0600")
+    (let [show (run "kotoba-git-recipient" "show")
+          printed (str (:out init) (:err init) (:out show) (:err show))]
+      (is (zero? (:exit show)))
+      (is (re-find #":pq-pub" (:out show)))
+      (is (not (re-find #":priv|:pq-priv" printed)) "no private key is ever printed"))
+    (let [r (run "kotoba-git-recipient" "init")]
+      (is (= 1 (:exit r)))
+      (is (re-find #"refusing to replace it" (:err r))))
+    (fs/chmodSync file 420)                                    ; 0644
+    (let [r (run "kotoba-git-recipient" "show")]
+      (is (= 1 (:exit r)))
+      (is (re-find #"readable by group or other" (:err r))))
+    (fs/chmodSync file 384)
+    (fs/writeFileSync file (.replace (slurp file) (js/RegExp. ":pub \"(.)") ":pub \"Z"))
+    (let [r (run "kotoba-git-recipient" "show")]
+      (is (= 1 (:exit r)))
+      (is (re-find #"id its public keys do not hash to" (:err r))))))
+
+(def ^:private authn-js
+  "const http=require('http'),fs=require('fs'),dir=process.argv[1];
+   const s=http.createServer((q,r)=>{const c=[];q.on('data',d=>c.push(d));q.on('end',()=>{
+     fs.writeFileSync(dir+'/request.json',JSON.stringify({method:q.method,url:q.url,
+       authorization:q.headers['authorization'],contentType:q.headers['content-type'],
+       origin:q.headers['origin']||null,body:Buffer.concat(c).toString()}));
+     const ok=q.headers['authorization']==='Bearer '+fs.readFileSync(dir+'/service','utf8');
+     r.writeHead(ok?201:401,{'content-type':'application/json'});
+     r.end(JSON.stringify(ok?{token:fs.readFileSync(dir+'/minted','utf8'),authorization:'Biscuit x',
+       tokenType:'Biscuit',expiresAt:'2026-10-07T00:15:00.000Z',expiresIn:900}:{error:'not authorized'}));});});
+   s.listen(0,'127.0.0.1',()=>fs.writeFileSync(dir+'/port',String(s.address().port)));")
+
+(deftest biscuit-mint-exchanges-a-service-token-against-a-local-stub
+  (let [dir (path/join root "authn")
+        _ (fs/mkdirSync dir)
+        service (str "kb_sa_" (.toString (crypto/randomBytes 32) "base64url"))
+        minted (.toString (crypto/randomBytes 96) "base64url")
+        _ (fs/writeFileSync (path/join dir "service") service)
+        _ (fs/writeFileSync (path/join dir "minted") minted)
+        service-file (path/join dir "service-token")
+        _ (fs/writeFileSync service-file service #js {:mode 384})
+        server (cp/spawn (.-execPath js/process) #js ["-e" authn-js dir] #js {:stdio "ignore"})
+        port (wait-for-file (path/join dir "port"))
+        out (path/join dir "repo.biscuit")
+        run (runner {"KOTOBA_AUTHN_URL" (str "http://127.0.0.1:" port)
+                     "KOTOBA_SERVICE_TOKEN_FILE" service-file
+                     "KOTOBA_TENANT_ID" "tenant-1234"
+                     "KOTOBA_GIT_REPOSITORY" "rad:cloud-murakumo"
+                     "KOTOBA_GIT_BISCUIT_FILE" out
+                     "KOTOBA_GIT_ALLOW_HTTP_LOOPBACK" "1"})]
+    (try
+      (let [r (run "kotoba-biscuit-mint")
+            req (js->clj (js/JSON.parse (slurp (path/join dir "request.json"))))]
+        (is (zero? (:exit r)) (:err r))
+        (is (= "POST" (get req "method")))
+        (is (= "/v1/biscuit/token" (get req "url")))
+        (is (= (str "Bearer " service) (get req "authorization")))
+        (is (= "application/json" (get req "contentType")))
+        (is (nil? (get req "origin")) "a non-browser caller, no Origin")
+        (is (= {"tenantId" "tenant-1234" "repository" "rad:cloud-murakumo"
+                "permissions" ["git:fetch" "git:push"]}
+               (js->clj (js/JSON.parse (get req "body")))))
+        (is (= (str minted "\n") (slurp out)))
+        (is (= 384 (bit-and 511 (.-mode (fs/statSync out)))) "written 0600")
+        (is (not (re-find (js/RegExp. minted) (str (:out r) (:err r)))) "the token is not printed")
+        (is (not (re-find (js/RegExp. service) (str (:out r) (:err r))))))
+      (testing "a refused exchange fails and leaves the old token in place"
+        (fs/writeFileSync (path/join dir "service") "kb_sa_something_else_entirely_0123456789")
+        (let [r (run "kotoba-biscuit-mint")]
+          (is (= 1 (:exit r)))
+          (is (re-find #"HTTP 401" (:err r)))
+          (is (= (str minted "\n") (slurp out)))))
+      (testing "the service token never comes from argv"
+        (let [r (run "kotoba-biscuit-mint" service)]
+          (is (= 1 (:exit r)))
+          (is (re-find #"takes no arguments" (:err r)))))
+      (finally (.kill server)))))
+
+(deftest zz-stop-the-stub
+  ;; Last by name: the stub process is this namespace's, so it goes with it.
+  (try (js/process.kill (- (.-pid stub)) "SIGTERM") (catch :default _ nil))
+  (rm-rf! root)
+  (is true))

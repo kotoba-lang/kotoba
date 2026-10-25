@@ -1,0 +1,594 @@
+(ns bonsai.b2-git
+  "Git-compatible, object-addressed B2 storage. Git control files stay on
+   APFS. Bonsai owns the exact OID/CID bridge; Nekko owns signed ref events.
+   rclone is an argv-only B2 API transport, never a mounted database.
+
+   Version 1 admits one owner identity, serializes local receive sessions,
+   and refuses remote publication forks. B2 is not a cross-host CAS lock."
+  (:require ["node:fs" :as fs]
+            ["node:path" :as path]
+            ["node:os" :as os]
+            ["node:crypto" :as crypto]
+            ["node:child_process" :as cp]
+            [kotoba.lang.text :as str]
+            [bonsai.git-object :as object]
+            [bonsai.git-codec :as codec]
+            [bonsai.pack :as pack]
+            [bonsai.remote-helper :as helper]
+            [arrangement.core :as arr]
+            [nekko.identity :as identity]
+            [nekko.ref-event :as ref-event]
+            [ed25519.core :as ed]
+            [ipld.core :as ipld]
+            [multiformats.core :as mf]))
+
+(def zero-oid (apply str (repeat 40 "0")))
+(def ^:dynamic *quarantine* false)
+(defn env [k] (aget (.-env js/process) k))
+(defn buffer [b] (js/Buffer.from (if (sequential? b) (clj->js b) b)))
+(defn fail! [message data] (throw (ex-info message data)))
+(defn require! [ok message] (when-not ok (fail! message {})))
+(defn private-dir! [p]
+  (fs/mkdirSync p #js {:recursive true :mode 448})
+  (require! (not (.isSymbolicLink (fs/lstatSync p))) "Refusing a symlink control directory")
+  (fs/chmodSync p 448) p)
+(defn atomic! [p bytes]
+  (private-dir! (path/dirname p))
+  (let [tmp (str p "." (.toString (crypto/randomBytes 8) "hex") ".tmp")]
+    (try (fs/writeFileSync tmp bytes #js {:mode 384 :flag "wx"})
+         (let [fd (fs/openSync tmp "r")] (try (fs/fsyncSync fd) (finally (fs/closeSync fd))))
+         (fs/renameSync tmp p)
+         (finally (when (fs/existsSync tmp) (fs/unlinkSync tmp))))))
+(defn json-read [p] (js->clj (js/JSON.parse (fs/readFileSync p "utf8"))))
+(defn json-write! [p value] (atomic! p (str (js/JSON.stringify (clj->js value)) "\n")))
+(defn state-root []
+  (or (env "KOTOBA_B2_STATE") (path/join (os/homedir) "Library/Application Support/Kotoba/b2-git")))
+(defn cache-root []
+  (or (env "KOTOBA_B2_CACHE") (path/join (os/homedir) "Library/Caches/kotoba/b2-git")))
+(defn install-hash! []
+  (when-not (= :installed (mf/sha256-provider))
+    (mf/install-sha256! (fn [b] (js/Uint8Array. (.digest (.update (crypto/createHash "sha256") (buffer b))))))))
+(defn clean-env []
+  (let [e (js/Object.assign #js {} (.-env js/process))]
+    (doseq [k ["GIT_DIR" "GIT_WORK_TREE" "GIT_COMMON_DIR" "GIT_INDEX_FILE"]] (js-delete e k))
+    (when-not *quarantine*
+      (doseq [k ["GIT_OBJECT_DIRECTORY" "GIT_ALTERNATE_OBJECT_DIRECTORIES" "GIT_QUARANTINE_PATH"]]
+        (js-delete e k))) e))
+(defn run! [exe args & [options]]
+  (let [r (cp/spawnSync exe (clj->js args)
+                        (js/Object.assign #js {:stdio #js ["pipe" "pipe" "pipe"]
+                                               :env (clean-env) :maxBuffer (* 256 1024 1024)
+                                               :timeout 300000} (or options #js {})))]
+    (when-not (= 0 (.-status r))
+      ;; Commands never contain credentials. Do not echo config/environment.
+      (fail! (str exe " " (first args) " failed: " (.trim (str (.-stderr r))))
+             {:exit (.-status r)}))
+    (.-stdout r)))
+(defn git! [gd args & [options]] (run! "git" (into ["--git-dir" gd] args) options))
+(defn text-git [gd args] (.trim (str (git! gd args))))
+(defn lines [s] (remove str/blank? (str/split (str s) #"\n")))
+(defn cid? [s] (boolean (and (string? s) (re-matches #"b[a-z2-7]{20,120}" s))))
+(defn oid? [s] (boolean (and (string? s) (re-matches #"[0-9a-f]{40}" s))))
+(defn endpoint [url]
+  (let [u (js/URL. url)
+        parts (str/split (.replace (.-pathname u) #"^/" "") #"/")
+        [bucket rid] (if (= "kotoba-b2:" (.-protocol u))
+                       [(.-hostname u) (first parts)] parts)]
+    (require! (and (or (= "kotoba-b2:" (.-protocol u))
+                       (and (= "kotoba:" (.-protocol u)) (= "b2" (.-hostname u))))
+                   (= "" (.-username u)) (= "" (.-password u))
+                   (= "" (.-search u)) (= "" (.-hash u)) (= "" (.-port u))
+                   (= (count parts) (if (= "kotoba-b2:" (.-protocol u)) 1 2))
+                   (re-matches #"[a-z0-9][a-z0-9-]{4,62}" bucket) (cid? rid))
+              "Expected kotoba-b2://BUCKET/GENESIS-CID")
+    (let [profile (json-read (path/join (state-root) "profile.json"))]
+      (require! (= bucket (get profile "bucket")) "Bucket is outside this installation's configured scope")
+      (require! (re-matches #"[A-Za-z0-9_-]+" (get profile "remote" "")) "Invalid rclone remote")
+      {:url (str "kotoba://b2/" bucket "/" rid) :bucket bucket :rid rid :profile profile
+       :root (str (get profile "remote") ":" bucket "/.kotoba/git/" rid)})))
+(defn rc! [args & [options]]
+  (run! (or (env "KOTOBA_RCLONE") "/opt/homebrew/bin/rclone")
+        (into args ["--log-level" "ERROR"]) options))
+(defn fetch-many! [source destination cids]
+  (private-dir! destination)
+  (let [missing (vec (distinct (remove #(fs/existsSync (path/join destination %)) cids)))]
+    (doseq [cid missing] (require! (cid? cid) "Invalid requested block name"))
+    (when (seq missing)
+      (let [list-file (path/join (private-dir! (path/join (cache-root) "staging"))
+                                 (str "fetch-" (.toString (crypto/randomBytes 8) "hex"))) ]
+        (try
+          (fs/writeFileSync list-file (str (str/join "\n" missing) "\n") #js {:mode 384 :flag "wx"})
+          (rc! ["copy" source destination "--files-from" list-file "--transfers" "8" "--checkers" "8"])
+          (finally (fs/unlinkSync list-file)))))))
+(defn block-path [ep cid] (path/join (cache-root) "blocks" (get ep :rid) cid))
+(defn verify-block [cid bytes raw?]
+  (require! (= cid (str (if raw? (mf/cidv1-raw bytes) (ipld/cid bytes)))) "B2 block CID mismatch") bytes)
+(defn get-block [ep cid raw?]
+  (require! (cid? cid) "Invalid block CID")
+  (let [p (block-path ep cid)
+        bytes (if (fs/existsSync p) (fs/readFileSync p)
+                  (rc! ["cat" (str (:root ep) "/blocks/" cid)]))]
+    (verify-block cid bytes raw?)
+    (when-not (fs/existsSync p) (atomic! p bytes)) bytes))
+(defn put-block! [ep cid bytes raw?]
+  (verify-block cid bytes raw?)
+  (atomic! (block-path ep cid) bytes)
+  (rc! ["rcat" (str (:root ep) "/blocks/" cid)] #js {:input (buffer bytes)}) cid)
+(defn read-node [ep cid] (ipld/decode (get-block ep cid false)))
+(defn put-node! [ep node]
+  (let [bytes (ipld/encode node) cid (str (ipld/cid bytes))]
+    (put-block! ep cid bytes false)))
+(defn signing-key []
+  (let [p (path/join (state-root) "owner-seed")]
+    (require! (not (.isSymbolicLink (fs/lstatSync p))) "Refusing a symlink signing key")
+    (require! (zero? (bit-and (.-mode (fs/statSync p)) 63)) "Signing key must be mode 0600")
+    (let [seed (fs/readFileSync p)] (require! (= 32 (.-length seed)) "Invalid signing key") seed)))
+(defn base-path [gd] (path/join gd "kotoba-b2-base.json"))
+(defn base [gd] (when (fs/existsSync (base-path gd)) (json-read (base-path gd))))
+(defn client-base-path [gd url] (path/join gd "kotoba-b2" (str (helper/cache-key url) ".json")))
+(defn object-base [gd url]
+  (let [b (base gd) p (client-base-path gd url)]
+    (if (= url (get b "remote")) b (when (fs/existsSync p) (json-read p)))))
+(defn genesis-owner [ep]
+  (let [id (identity/read-identity #(get-block ep % false) (:rid ep))]
+    (require! (string? (:did id)) "Invalid Nekko repository identity") (:did id)))
+
+(defn publication-list [ep]
+  (let [entries (js->clj (js/JSON.parse (str (rc! ["lsjson" (str (:root ep) "/events") "--files-only"]))))]
+    (fetch-many! (str (:root ep) "/events") (path/join (cache-root) "events" (:rid ep)) (map #(get % "Name") entries))
+    (mapv (fn [e]
+            (let [cid (get e "Name")]
+              (require! (cid? cid) "Unexpected publication entry")
+              (let [bytes (fs/readFileSync (path/join (cache-root) "events" (:rid ep) cid))]
+                (verify-block cid bytes false)
+                [cid (ipld/decode bytes)]))) entries)))
+(defn publications [ep]
+  (let [pairs (publication-list ep) nodes (into {} pairs)
+        parents (set (keep #(get (second %) "parent") pairs))
+        tips (remove parents (keys nodes))]
+    (require! (<= (count tips) 1) "Concurrent B2 publications detected; refusing to choose a history")
+    (loop [cid (first tips) seen #{} chain []]
+      (if-not cid
+        (do (require! (= (count seen) (count nodes)) "Unreachable/cyclic B2 publication") (vec (reverse chain)))
+        (let [p (get nodes cid)]
+          (require! (and p (not (seen cid))) "Missing/cyclic B2 publication parent")
+          (recur (get p "parent") (conj seen cid) (conj chain [cid p])))))))
+(defn validate-manifest! [ep m]
+  (require! (and (= 1 (get m "version")) (= (:rid ep) (get m "rid"))
+                 (map? (get m "refs")) (map? (get m "objects"))) "Unsupported B2 manifest")
+  (doseq [[ref oid] (get m "refs")]
+    (require! (and (string? ref)
+                   (zero? (.-status (cp/spawnSync "git" (clj->js ["check-ref-format" ref]))))
+                   (or (str/starts-with? ref "refs/heads/") (str/starts-with? ref "refs/tags/"))
+                   (oid? oid) (contains? (get m "objects") oid)
+                   (or (not (str/starts-with? ref "refs/heads/")) (= "commit" (get-in m ["objects" oid "type"]))))
+              "Invalid manifest ref"))
+  (doseq [[oid entry] (get m "objects")]
+    (require! (and (oid? oid) (cid? (get entry "cid"))
+                   (contains? object/object-types (get entry "type"))
+                   (nat-int? (get entry "size"))) "Invalid OID/CID manifest entry")) m)
+(declare object-bytes)
+(defn object-edges
+  "Read structural Git edges without decoding opaque names or commit messages
+   as UTF-8. Each edge carries its required target type; gitlinks are external."
+  [type body]
+  (let [b (buffer body)]
+    (case type
+      "tree"
+      (loop [offset 0 edges []]
+        (if (= offset (.-length b)) edges
+            (let [space (.indexOf b 32 offset) nul (.indexOf b 0 offset)]
+              (require! (and (<= offset space) (< space nul) (<= (+ nul 21) (.-length b)))
+                        "Truncated Git tree entry")
+              (let [mode (.toString b "latin1" offset space)
+                    name (.subarray b (inc space) nul)
+                    target (case mode "40000" "tree" "040000" "tree"
+                                 "100644" "blob" "100755" "blob" "120000" "blob"
+                                 "160000" "gitlink" nil)]
+                (require! (and target (pos? (.-length name)) (= -1 (.indexOf name 47))
+                               (not (contains? #{"." ".."} (.toString name "latin1"))))
+                          "Invalid Git tree entry")
+                (recur (+ nul 21) (if (= "gitlink" target) edges
+                                      (conj edges [(.toString b "hex" (inc nul) (+ nul 21)) target])))))))
+      ("commit" "tag")
+      (let [end (.indexOf b (js/Buffer.from "\n\n"))]
+        (require! (not (neg? end)) "Git metadata lacks a header/message separator")
+        (let [headers (str/split (.toString b "latin1" 0 end) #"\n")
+              values (fn [key] (map #(subs % (inc (count key)))
+                                    (filter #(str/starts-with? % (str key " ")) headers)))
+              single (fn [key] (let [vs (vec (values key))]
+                                 (require! (= 1 (count vs)) "Missing/duplicate Git metadata header") (first vs)))]
+          (if (= "commit" type)
+            (into [[(single "tree") "tree"]] (map #(vector % "commit") (values "parent")))
+            (let [target-type (single "type")]
+              (require! (contains? object/object-types target-type) "Invalid annotated tag type")
+              [[(single "object") target-type]]))))
+      [])))
+(defn closure-valid? [ep m]
+  (let [objects (get m "objects")]
+    (fetch-many! (str (:root ep) "/blocks") (path/join (cache-root) "blocks" (:rid ep))
+                 (for [[_ e] objects :when (not= "blob" (get e "type"))] (get e "cid")))
+    (loop [todo (mapv #(vector % nil) (vals (get m "refs"))) seen #{}]
+      (if (empty? todo) true
+          (let [[oid expected-type] (peek todo) todo (pop todo) entry (get objects oid)]
+            (require! entry "Git closure contains an object absent from the manifest")
+            (require! (or (nil? expected-type) (= expected-type (get entry "type")))
+                      "Git closure target has the wrong object type")
+            (if (or (seen oid) (= "blob" (get entry "type")))
+              (recur todo (conj seen oid))
+              (let [{:keys [type body]} (object-bytes ep oid entry)
+                    children (object-edges type body)]
+                (require! (every? #(oid? (first %)) children) "Invalid Git closure edge")
+                (recur (into todo children) (conj seen oid)))))))))
+(defn remote-state [ep]
+  (let [owner (genesis-owner ep) chain (publications ep)
+        receipts (private-dir! (path/join (state-root) "observed-heads" (:rid ep)))
+        cids (set (map first chain))
+        _ (doseq [known (array-seq (fs/readdirSync receipts))]
+            (require! (contains? cids known) "B2 history dropped a previously verified publication; refusing rollback"))
+        state (reduce
+     (fn [{:keys [db manifest head]} [cid publication]]
+       (let [mcid (get publication "manifest")
+             m (validate-manifest! ep (read-node ep mcid))
+             old-refs (get manifest "refs" {}) new-refs (get m "refs")
+             changed (set (filter #(not= (get old-refs %) (get new-refs %))
+                                  (into (set (keys old-refs)) (keys new-refs))))
+             events (get publication "events")]
+         (require! (and (= 1 (get publication "version")) (= head (get publication "parent"))
+                        (= (:rid ep) (get publication "rid"))
+                        (= changed (set (map #(get % "ref") events)))
+                        (= (count changed) (count events)) (seq events)) "Invalid publication changes")
+         (let [db' (reduce (fn [db event]
+                             (require! (and (= (:rid ep) (get event "rid")) (= mcid (get event "manifest"))
+                                            (= (get old-refs (get event "ref")
+                                                    (when (ref-event/current-event db (:rid ep) owner (get event "ref")) zero-oid))
+                                               (get event "old"))
+                                            (= (get new-refs (get event "ref") zero-oid) (get event "new")))
+                                       "Signed event disagrees with manifest")
+                             (first (ref-event/admit db #{owner} #(closure-valid? ep m) event))) db events)]
+           {:db db' :manifest m :head cid :manifest-cid mcid :owner owner})))
+     {:db (arr/empty-db) :manifest {"refs" {} "objects" {}} :head nil :owner owner}
+     chain)]
+    (when-let [head (:head state)]
+      (let [p (path/join receipts head)]
+        (when-not (fs/existsSync p)
+          (try (fs/writeFileSync p "verified\n" #js {:mode 384 :flag "wx"})
+               (catch :default e (when-not (= "EEXIST" (.-code e)) (throw e)))))))
+    state))
+(defn object-bytes [ep oid entry]
+  (let [bytes (get-block ep (get entry "cid") true)
+        parsed (object/parse-frame bytes)]
+    (require! (and (= oid (object/oid bytes)) (= (:type parsed) (get entry "type"))
+                   (= (:size parsed) (get entry "size"))) "Git object does not match its OID/CID manifest") parsed))
+(defn config! [gd k v] (git! gd ["config" k v]))
+(defn install-promise-pack! [gd objects]
+  ;; Git 2.50.1 check_connected() returns early for refs in a promisor pack
+  ;; without closing receive-pack's sideband error fd. A push of an existing
+  ;; commit can then hang. Keep REAL metadata in ordinary packs and declare
+  ;; missing blobs with disjoint, cache-only promise trees instead.
+  (let [blobs (sort (for [[oid e] objects :when (= "blob" (get e "type"))] oid))
+        trees (mapv (fn [chunk]
+                      (loop [salt 0]
+                        (let [body (codec/encode-tree
+                                    (mapv (fn [oid] {:mode "100644" :name (str "promise-" salt "-" oid) :oid oid}) chunk))]
+                          (if (contains? objects (object/object-oid "tree" body))
+                            (recur (inc salt)) {:type "tree" :body body}))))
+                    (partition-all 512 blobs))
+        current (when (seq trees)
+                  (let [bytes (pack/encode trees)
+                        name (str "pack-" (mf/hexify (.subarray bytes (- (.-length bytes) 20))))]
+                    (git! gd ["index-pack" "--stdin" "--promisor" "--keep=kotoba-b2-promises"]
+                          #js {:input (buffer bytes)}) name))
+        dir (path/join gd "objects/pack")]
+    (when (fs/existsSync dir)
+      (doseq [name (array-seq (fs/readdirSync dir)) :when (.endsWith name ".keep")]
+        (let [message (fs/readFileSync (path/join dir name) "utf8")
+              stem (subs name 0 (- (count name) 5)) marker (path/join dir (str stem ".promisor"))]
+          (when (and (fs/existsSync marker)
+                     (or (.includes message "kotoba-b2-metadata")
+                         (and (.includes message "kotoba-b2-promises") (not= stem current))))
+            (fs/unlinkSync marker)))))
+    current))
+(defn materialize! [ep gd state]
+  (private-dir! gd)
+  (when-not (fs/existsSync (path/join gd "HEAD")) (run! "git" ["init" "--bare" "--initial-branch=main" gd]))
+  (let [old (base gd) m (:manifest state)]
+    (when-not (and (= 2 (get old "layout")) (= (:head state) (get old "head")) (= (:url ep) (get old "remote")))
+      (install-promise-pack! gd (get m "objects"))
+      ;; Real metadata never belongs to a server-side promisor pack; see the
+      ;; Git 2.50 receive-pack fd workaround above. Clients still receive
+      ;; ordinary native filtered-clone promisor packs.
+      (let [objects (vec (for [[oid e] (sort-by key (get m "objects")) :when (not= "blob" (get e "type"))]
+                           (object-bytes ep oid e)))]
+        (when (seq objects)
+          (git! gd ["index-pack" "--stdin" "--keep=kotoba-b2-metadata"]
+                #js {:input (buffer (pack/encode objects))}))))
+    ;; A previous receive may have published durably and then failed its
+    ;; local ref transaction. Always repair the cache projection from B2.
+    (let [current (lines (text-git gd ["for-each-ref" "--format=%(refname)"]))]
+      (doseq [ref current :when (not (contains? (get m "refs") ref))] (git! gd ["update-ref" "-d" ref]))
+      (doseq [[ref oid] (get m "refs")] (git! gd ["update-ref" ref oid])))
+    (json-write! (base-path gd) {"layout" 2 "head" (:head state) "manifest" (:manifest-cid state)
+                                "remote" (:url ep) "objects" (get m "objects") "refs" (get m "refs")}))
+  (doseq [[k v] {"gc.auto" "0" "receive.denyNonFastForwards" "true" "uploadpack.allowFilter" "true"
+                 "receive.denyDeletes" "false" "receive.denyDeleteCurrent" "false"
+                 "uploadpack.allowAnySHA1InWant" "true" "remote.b2-objects.promisor" "true"
+                 "remote.b2-objects.partialclonefilter" "blob:none"
+                 "remote.b2-objects.url" (str "kotoba-b2-object::" (:url ep))}]
+    (config! gd k v))
+  gd)
+(defn shell-quote [s] (str "'" (str/replace s "'" "'\"'\"'") "'"))
+(defn install-hook! [ep gd adapter]
+  (let [p (path/join gd "hooks/pre-receive")]
+    (atomic! p (str "#!/bin/sh\nexec " (shell-quote adapter) " receive "
+                     (shell-quote (:url ep)) " " (shell-quote gd) "\n"))
+    (fs/chmodSync p 448)
+    ;; A user's global core.hooksPath must not bypass B2 durability before ACK.
+    (config! gd "core.hooksPath" (path/join gd "hooks"))))
+(defn configure-client! [ep state]
+  (when-let [client (or (env "KOTOBA_B2_CLIENT_GIT_DIR") (env "GIT_DIR"))]
+    (let [gd (path/resolve client) name (str "kotoba-b2-" (subs (helper/cache-key (:url ep)) 0 16))]
+      (require! (.isDirectory (fs/statSync gd)) "Client Git control path is not a directory")
+      (require! (not (.startsWith (fs/realpathSync gd) (str (get (:profile ep) "mount") "/")))
+                "Put Git control files on APFS: use git kotoba-b2 init/clone or --separate-git-dir")
+      ;; A direct fetch-capability promisor helper avoids re-materializing
+      ;; transport metadata for each later blob-only read. During initial
+      ;; clone Git may have cached only origin, so the controlled server also
+      ;; permits lazy fetch from its fixed B2 object helper.
+      (json-write! (client-base-path gd (:url ep))
+                   {"remote" (:url ep) "head" (:head state) "manifest" (:manifest-cid state)
+                    "objects" (get (:manifest state) "objects") "refs" (get (:manifest state) "refs")})
+      (config! gd (str "remote." name ".url") (str "kotoba-b2-object::" (:url ep)))
+      (config! gd (str "remote." name ".promisor") "true")
+      (config! gd (str "remote." name ".partialclonefilter") "blob:none")
+      ;; Git tries the extensions.partialClone remote last. Put the native
+      ;; connect transport there so direct object fetches run first.
+      (config! gd "core.repositoryformatversion" "1")
+      (config! gd "extensions.partialClone" "origin"))))
+(defn fetch! [url gd adapter]
+  (let [ep (endpoint url) state (remote-state ep)]
+    (materialize! ep gd state) (install-hook! ep gd adapter) (configure-client! ep state) state))
+
+(defn read-git-object [gd oid]
+  (let [raw (git! gd ["cat-file" "--batch"] #js {:input (str oid "\n")})
+        pos (.indexOf raw 10)
+        [got type size] (str/split (.toString (.subarray raw 0 pos) "utf8") #" ")
+        n (js/Number size) body (.subarray raw (inc pos) (+ (inc pos) n))]
+    (require! (and (= oid got) (contains? object/object-types type) (= n (.-length body))) "Missing/truncated Git object")
+    {:type type :body body}))
+(defn upload-objects! [ep gd old-objects refs]
+  (let [oids (if (seq refs)
+               (map #(.replace % #"^\?" "")
+                    (lines (text-git gd (into ["rev-list" "--objects" "--no-object-names" "--missing=print"] (vals refs))))) [])
+        stage (fs/mkdtempSync (path/join (private-dir! (path/join (cache-root) "staging")) "push-"))]
+    (try
+      (let [objects (reduce (fn [objects oid]
+                              (if (contains? objects oid) objects
+                                  (let [{:keys [type body]} (read-git-object gd oid)
+                                        framed (object/frame type body) cid (str (mf/cidv1-raw framed))]
+                                    (require! (= oid (object/oid framed)) "Git source object identity mismatch")
+                                    (fs/writeFileSync (path/join stage cid) (buffer framed) #js {:mode 384})
+                                    (atomic! (block-path ep cid) (buffer framed))
+                                    (assoc objects oid {"cid" cid "type" type "size" (.-length body)}))))
+                            old-objects oids)]
+        (when (pos? (.-length (fs/readdirSync stage)))
+          (rc! ["copy" stage (str (:root ep) "/blocks") "--immutable" "--checksum" "--transfers" "8" "--checkers" "8"]))
+        objects)
+      (finally (fs/rmSync stage #js {:recursive true :force true})))))
+(defn receive! [url gd input]
+  (binding [*quarantine* true]
+    (let [ep (endpoint url) previous (base gd) state (remote-state ep)
+          seed (signing-key) signer (ed/did-key-from-seed seed)
+          updates (mapv #(str/split % #" ") (lines input))
+          old-refs (get (:manifest state) "refs")]
+      (require! (= signer (:owner state)) "This repository permits only its Nekko owner to publish")
+      (require! (and (= (:url ep) (get previous "remote")) (= (:head state) (get previous "head")))
+                "B2 head moved since fetch; fetch and retry")
+      (require! (seq updates) "No receive updates")
+      (require! (= (count updates) (count (set (map #(nth % 2 nil) updates)))) "Duplicate receive ref")
+      (doseq [[old new ref :as update] updates]
+        (require! (and (= 3 (count update)) (oid? old) (oid? new) (not= old new)
+                       (= old (get old-refs ref zero-oid))
+                       (zero? (.-status (cp/spawnSync "git" #js ["check-ref-format" ref])))
+                       (or (str/starts-with? ref "refs/heads/") (str/starts-with? ref "refs/tags/")))
+                  "Invalid/stale receive update")
+        (when (and (not= zero-oid old) (not= zero-oid new))
+          (require! (and (str/starts-with? ref "refs/heads/")
+                         (= 0 (.-status (cp/spawnSync "git" (clj->js ["--git-dir" gd "merge-base" "--is-ancestor" old new])
+                                                     #js {:env (clean-env)})))) "Non-fast-forward updates are refused")))
+      (let [refs (reduce (fn [refs [_ new ref]] (if (= zero-oid new) (dissoc refs ref) (assoc refs ref new))) old-refs updates)
+            objects (upload-objects! ep gd (get (:manifest state) "objects") refs)
+            manifest {"version" 1 "rid" (:rid ep) "refs" refs "objects" objects}
+            _ (validate-manifest! ep manifest)
+            _ (closure-valid? ep manifest)
+            mcid (put-node! ep manifest)
+            [db events] (reduce (fn [[db events] [_ new ref]]
+                                  (let [prev (ref-event/current-event db (:rid ep) signer ref)
+                                        event (ref-event/sign seed {:rid (:rid ep) :ref ref :old (get prev "new")
+                                                                   :new new :manifest mcid
+                                                                   :prev (ref-event/current-event-cid db (:rid ep) signer ref)
+                                                                   :seq (inc (or (get prev "seq") 0))})
+                                        [db' _] (ref-event/admit db #{signer}
+                                                                 #(or (= zero-oid (get % "new")) (contains? objects (get % "new"))) event)]
+                                    [db' (conj events event)])) [(:db state) []] updates)
+            publication {"version" 1 "rid" (:rid ep) "parent" (:head state) "manifest" mcid "events" events}
+            bytes (ipld/encode publication) cid (str (ipld/cid bytes))]
+        ;; Recheck just before publishing. Cross-host same-parent races are
+        ;; retained as two immutable tips and are refused on the next read.
+        (require! (= (:head state) (:head (remote-state ep))) "B2 head moved during upload; retry after fetch")
+        (rc! ["rcat" (str (:root ep) "/events/" cid)] #js {:input (buffer bytes)})
+        (let [verified (remote-state ep)]
+          (require! (= cid (:head verified)) "Publication readback did not find the unique new head"))
+        ;; pre-receive returns success only after B2 durability/readback.
+        (json-write! (base-path gd) {"layout" 1 "head" cid "manifest" mcid "remote" (:url ep) "objects" objects "refs" refs})
+        (fs/writeSync 2 (str "Bonsai/Nekko B2 snapshot " cid "\n"))))))
+
+(defn fetch-object! [url gd oid]
+  (let [ep (endpoint url) b (object-base gd (:url ep)) entry (get-in b ["objects" oid])]
+    (require! (and (= (:url ep) (get b "remote")) entry) "Requested object is outside the verified snapshot")
+    (let [{:keys [type body]} (object-bytes ep oid entry)
+          actual (.trim (str (git! gd ["hash-object" "-w" "-t" type "--stdin"] #js {:input (buffer body)})))]
+      (require! (= oid actual) "Git rejected the restored object identity"))))
+
+(defn owner-init! []
+  (private-dir! (state-root))
+  (let [p (path/join (state-root) "owner-seed")]
+    (when-not (fs/existsSync p)
+      (fs/writeFileSync p (crypto/randomBytes 32) #js {:mode 384 :flag "wx"})))
+  (ed/did-key-from-seed (signing-key)))
+(defn create! [bucket]
+  (let [owner (owner-init!) blocks (atom {})
+        rid (str (identity/genesis! (fn [cid bytes] (swap! blocks assoc (str cid) bytes) cid) owner (.now js/Date)))
+        ep (endpoint (str "kotoba-b2://" bucket "/" rid))]
+    (doseq [[cid bytes] @blocks] (put-block! ep cid bytes false))
+    ;; A marker gives B2 an events prefix without depending on empty dirs.
+    ;; Listing is filtered to CID filenames, so no placeholder is needed:
+    ;; rclone lsjson on a nonexistent B2 prefix returns [].
+    (str "kotoba-b2://" bucket "/" rid)))
+
+(defn with-remote-lock [url f]
+  (let [p (path/join (private-dir! (path/join (cache-root) "locks")) (helper/cache-key url))
+        fd (try (fs/openSync p "wx" 384)
+                (catch :default _ (fail! "A B2 Git session holds this repository lock; inspect it before retrying" {:lock p})))]
+    (try (fs/writeSync fd (str (.-pid js/process) "\n"))
+         (f)
+         (finally (fs/closeSync fd) (fs/unlinkSync p)))))
+(defn remote-main! [[remote-name url] adapter]
+  (let [ep (endpoint url)
+        client (env "GIT_DIR")
+        process-env (.-env js/process)]
+    ;; Client command-line configuration and Git object/worktree environment
+    ;; belong to the client, never to our generated upload/receive repository.
+    (if client (aset process-env "KOTOBA_B2_CLIENT_GIT_DIR" (path/resolve client))
+        (js-delete process-env "KOTOBA_B2_CLIENT_GIT_DIR"))
+    (doseq [k ["GIT_DIR" "GIT_WORK_TREE" "GIT_COMMON_DIR" "GIT_INDEX_FILE"
+               "GIT_OBJECT_DIRECTORY" "GIT_ALTERNATE_OBJECT_DIRECTORIES" "GIT_QUARANTINE_PATH"
+               "GIT_CONFIG_PARAMETERS" "GIT_CONFIG_COUNT"]]
+      (js-delete process-env k))
+    (let [e (js/Object.assign #js {} process-env)]
+      (aset e "KOTOBA_GIT_CACHE" (private-dir! (path/join (cache-root) "mirrors")))
+      (aset e "KOTOBA_GIT_ADAPTER" adapter)
+      ;; upload-pack normally disables lazy fetching from untrusted repos.
+      ;; This server is our private, verified, generated cache with a fixed
+      ;; object helper; allow it to hydrate a requested missing blob before
+      ;; validating the want. This affects only this helper process tree.
+      (aset process-env "GIT_NO_LAZY_FETCH" "0")
+      (with-remote-lock (:url ep) #(helper/main! [remote-name (:url ep)] e)))))
+(defn object-main! [[_remote-name url]]
+  (let [out! #(fs/writeSync 1 %) gd (path/resolve (or (env "GIT_DIR") "."))]
+    (loop [requests []]
+      (let [line (helper/read-line!)]
+        (cond
+          (nil? line) 0
+          (= "capabilities" line) (do (out! "fetch\noption\n\n") (recur requests))
+          (str/starts-with? line "option ") (do (out! "unsupported\n") (recur requests))
+          (str/starts-with? line "list") (do (out! "\n") (recur requests))
+          (str/starts-with? line "fetch ") (recur (conj requests (second (str/split line #" "))))
+          (= "" line) (if (seq requests)
+                         (do (let [ep (endpoint url) b (object-base gd (:url ep))]
+                               (fetch-many! (str (:root ep) "/blocks") (path/join (cache-root) "blocks" (:rid ep))
+                                            (map #(get-in b ["objects" % "cid"]) requests)))
+                             (doseq [oid requests] (fetch-object! url gd oid)) (out! "\n") (recur [])) 0)
+          :else (fail! "Unsupported object-helper command" {}))))))
+
+(defn configure! [bucket remote mount controller]
+  (require! (and (re-matches #"[a-z0-9][a-z0-9-]{4,62}" bucket)
+                 (re-matches #"[A-Za-z0-9_-]+" remote) (path/isAbsolute mount)
+                 (path/isAbsolute controller) (fs/existsSync controller)) "Invalid B2 Git installation profile")
+  (let [p (path/join (state-root) "profile.json")
+        profile {"bucket" bucket "remote" remote "mount" (path/resolve mount)
+                 "controller" controller "python" "/opt/homebrew/opt/python@3.15/bin/python3.15"}]
+    (when (fs/existsSync p) (require! (= profile (json-read p)) "Existing B2 profile differs; preserve it and configure another state root"))
+    (json-write! p profile)
+    (fs/writeSync 1 (str "Configured bucket " bucket "; owner " (owner-init!) "\n"))))
+(defn workspace-gitdir [worktree]
+  (path/join (private-dir! (path/join (state-root) "repositories"))
+             (str (helper/cache-key (path/resolve worktree)) ".git")))
+(defn init-workspace! [name worktree]
+  (require! (and (re-matches #"[A-Za-z0-9][A-Za-z0-9._-]{0,100}" name) worktree) "Usage: git kotoba-b2 init NAME WORKTREE")
+  (let [w (path/resolve worktree) gd (workspace-gitdir w)
+        profile (json-read (path/join (state-root) "profile.json"))]
+    (require! (not (fs/existsSync gd)) "Git control directory already exists")
+    (require! (not (fs/existsSync (path/join w ".git"))) "Existing Git workspace was preserved")
+    (let [url (create! (get profile "bucket"))]
+      (run! "git" ["init" "--initial-branch=main" "--separate-git-dir" gd w])
+      (config! gd "remote.origin.url" url)
+      (config! gd "remote.origin.fetch" "+refs/heads/*:refs/remotes/origin/*")
+      (config! gd "kotoba.b2.name" name)
+      (fs/writeSync 1 (str "Initialized " w "\nGit control files: " gd "\norigin: " url "\n")))))
+(defn clone-workspace! [url worktree]
+  (endpoint url)
+  (let [w (path/resolve worktree) gd (workspace-gitdir w)]
+    (require! (not (fs/existsSync gd)) "Git control directory already exists")
+    (fs/writeSync 1 (run! "git" ["clone" "--filter=blob:none" "--separate-git-dir" gd url w]))
+    (fs/writeSync 1 (str "Git control files: " gd "\n"))))
+(defn current-workspace
+  ([] (current-workspace nil))
+  ([where]
+   (let [prefix (if where ["-C" (path/resolve where)] [])
+         w (.trim (str (run! "git" (into prefix ["rev-parse" "--show-toplevel"]))))
+         gd (.trim (str (run! "git" (into prefix ["rev-parse" "--absolute-git-dir"]))))]
+     {:worktree w :gitdir gd :url (text-git gd ["config" "--get" "remote.origin.url"])})))
+(defn evict! [names]
+  (require! (seq names) "Usage: git kotoba-b2 evict FILE...")
+  (let [explicit? (= "--repo" (first names))
+        where (when explicit? (second names))
+        names (if explicit? (vec (drop 2 names)) names)
+        _ (require! (and (seq names) (or (not explicit?) where)) "Usage: git kotoba-b2 evict --repo WORKTREE FILE...")
+        {:keys [worktree gitdir url]} (current-workspace where)
+        ep (endpoint url) profile (:profile ep) mount (get profile "mount")
+        head (text-git gitdir ["rev-parse" "--verify" "HEAD"])
+        state (remote-state ep)
+        paths (mapv #(path/resolve (if explicit? worktree (.cwd js/process)) %) names)]
+    (require! (some #{head} (vals (get (:manifest state) "refs")))
+              "Push the current commit before evicting its files")
+    (doseq [p paths]
+      (require! (and (.startsWith p (str worktree "/")) (.startsWith p (str mount "/"))
+                     (not (.startsWith (path/relative worktree p) ".git/"))
+                     (not= (path/relative worktree p) ".git") (.isFile (fs/lstatSync p)))
+                "Eviction accepts regular files inside this mounted workspace")
+      (let [relative (path/relative worktree p) spec (str ":(literal)" relative)
+            tracked (text-git gitdir ["ls-files" "--stage" "--error-unmatch" "--" spec])
+            expected (second (str/split tracked #" "))
+            actual (text-git gitdir ["--work-tree" worktree "hash-object" "--path" relative p])]
+        (require! (and (= expected actual)
+                       (= 0 (.-length (git! gitdir ["--work-tree" worktree "status" "--porcelain=v1" "--untracked-files=all"
+                                                    "--" spec]))))
+                  "Uncommitted/untracked files must be preserved; commit and push first")))
+    ;; A shell whose cwd is in the mount may still hold it busy. The existing
+    ;; controller refuses a busy normal unmount and preserves all cache data.
+    (.chdir js/process (state-root))
+    (fs/writeSync 1 (run! (get profile "python")
+                          (into [(get profile "controller") "evict"] (map #(path/relative mount %) paths))))))
+(defn evict-history-cache! []
+  (let [{:keys [url]} (current-workspace) ep (endpoint url)
+        mirror (helper/materialized-path (:url ep) (path/join (cache-root) "mirrors"))]
+    (with-remote-lock (:url ep)
+      (fn []
+        (remote-state ep)
+        (doseq [p [mirror (path/join (cache-root) "blocks" (:rid ep)) (path/join (cache-root) "events" (:rid ep))]]
+          (when (fs/existsSync p)
+            (require! (not (.isSymbolicLink (fs/lstatSync p))) "Refusing a symlink cache entry")
+            (fs/rmSync p #js {:recursive true :force true})))
+        (fs/writeSync 1 "Removed only the disposable B2 transport cache. Workspace, local Git history and B2 data were preserved.\n")))))
+(defn status! []
+  (let [{:keys [worktree gitdir url]} (current-workspace) ep (endpoint url) s (remote-state ep)]
+    (fs/writeSync 1 (str (js/JSON.stringify
+                         (clj->js {"worktree" worktree "gitdir" gitdir "remote" url
+                                   "publication" (:head s) "refs" (get (:manifest s) "refs")
+                                   "objects" (count (get (:manifest s) "objects"))}) nil 2) "\n"))))
+(defn cli-main! [[command & args]]
+  (case command
+    "configure" (apply configure! args)
+    "init" (apply init-workspace! args)
+    "clone" (apply clone-workspace! args)
+    "evict" (if (= ["--history-cache"] args) (evict-history-cache!) (evict! args))
+    "status" (status!)
+    (fs/writeSync 1 (str "git kotoba-b2 configure BUCKET RCLONE_REMOTE MOUNT CONTROLLER\n"
+                         "git kotoba-b2 init NAME WORKTREE\n"
+                         "git kotoba-b2 clone URL WORKTREE\n"
+                         "git kotoba-b2 status\n"
+                         "git kotoba-b2 evict FILE...\n"
+                         "git kotoba-b2 evict --repo WORKTREE FILE...  (run outside the mount)\n"
+                         "git kotoba-b2 evict --history-cache\n"
+                         "Use native git add/commit/diff/log/restore/push/fetch afterward.\n"))))
