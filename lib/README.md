@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.appkit` | `kotoba.appkit/src` | `appkit.core` (Kotoba project library) |
 | `kotoba.kotobaUi` | `kotoba.kotobaUi/src` | `kotoba-ui.core`, `kotoba-ui.product`, `kotoba-ui.shell`, `kotoba-ui.shell.style` (Kotoba project library) |
 | `kotoba.liquidGlassUi` | `kotoba.liquidGlassUi/src` | `liquid-glass.components`, `liquid-glass.demo`, `liquid-glass.style`, `liquid-glass.tokens` (Kotoba project library) |
 | `kotoba.marketplace` | `kotoba.marketplace/src` | `marketplace.acceptance`, `marketplace.buyer`, `marketplace.catalog`, `marketplace.crossborder` (Kotoba project library) |
