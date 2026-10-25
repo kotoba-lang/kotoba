@@ -1,0 +1,245 @@
+(ns h264.decode-p-slice-subpartition-test
+  "Golden-vector tests for `h264.decode`'s P-slice sub-partitioned inter
+   prediction support — ADR-2607122000 Migration step 7's sub-partition
+   increment: P_16x8/P_8x16 (mb_type 1/2, two 16x8 or 8x16 partitions, each
+   with its own motion vector) and P_8x8 (mb_type 3, four 8x8 partitions,
+   but ONLY sub_mb_type P_L0_8x8 — no further split within an 8x8 partition;
+   `mb_type` 4/P_8x8ref0 and sub_mb_type 1/2/3 remain out of scope, both
+   throwing explicitly). See `h264.decode`'s namespace docstring and
+   `decode-macroblock-p!`/`decode-inter-16x8-macroblock!`/
+   `decode-inter-8x16-macroblock!`/`decode-inter-8x8-macroblock!` for the
+   exact scope.
+
+   ALL 3 fixtures below are HAND-AUTHORED using this repo's OWN
+   already-bit-exact-tested encode-side primitives — `h264.encode`'s
+   `encode-idr-luma-frame` for the reference IDR frame; `h264.expgolomb`'s
+   writer + `h264.cavlc/encode-residual-block!` for a hand-built P-slice
+   NAL, following `h264.slice/parse-header!`'s exact P-slice syntax order —
+   the SAME methodology `p-16x16-mb0-realac.h264`/`p-subpel-diagonal32.h264`
+   already use (see `decode_p_slice_test.clj`'s namespace docstring for the
+   full rationale: real encoders were not found to reliably emit these
+   specific mb_types/sub_mb_type combinations on demand, and even when they
+   do, there is no way to CONTROL which one comes out for a targeted
+   regression test like fixture 3 below). The independent correctness check
+   is the SAME bit-exact-vs-real-ffmpeg discipline this repo's whole decode
+   side uses: real `ffmpeg 8.1.1` decodes THESE EXACT bytes to the SAME
+   pixels this repo's own `h264.decode` produces — ffmpeg did not see or
+   trust anything about how the bytes were constructed, only the bytes
+   themselves. Critically, this is NOT a self-consistency tautology even
+   though the SAME hand-authored `mvd_l0` values feed both decoders: each
+   decoder independently derives its OWN motion-vector PREDICTOR from the
+   declared bitstream neighbor state per §8.4.1.3, adds the shared `mvd_l0`,
+   motion-compensates, and reconstructs — if this repo's predictor/
+   reconstruction logic were spec-non-compliant, its output would differ
+   from ffmpeg's independent (correct) reconstruction of the SAME bytes.
+
+   `p-16x8-mb0.h264` — single 16x16 MB, `mb_type`=1 (`P_L0_L0_16x8`), zero
+   residual: top partition mvd=(8,0), bottom partition mvd=(-8,8). Since
+   there is no left/top/topright/topleft neighbor at all (a single-MB
+   picture), the bottom partition's own §8.4.1.3 predictor is derived
+   entirely from the TOP partition's OWN already-decided motion vector
+   (`neighbor-abc`'s `:self` slot lookup — the top partition sets BOTH the
+   TL and TR quadrants of this MB's `:mv-field`, so the bottom partition's
+   B-neighbor lookup, which lands on quadrant TL, finds it) — this is the
+   most basic exercise of the NEW same-macroblock quadrant-lookup machinery
+   `mv-predict-partition`/`neighbor-abc` add.
+
+   `p-8x16-mb0-realac.h264` — single 16x16 MB, `mb_type`=2
+   (`P_L0_L0_8x16`), REAL nonzero luma AC residual in the top-left 8x8 luma
+   quadrant only (mirrors `p-16x16-mb0-realac.h264`'s own single-nonzero-
+   block recipe exactly — one coefficient, level 2, at luma block 0):
+   left partition mvd=(4,4), right partition mvd=(-4,-4). The right
+   partition's own predictor exercises BOTH the 8x16-specific 'use C
+   directly if its ref matches' special case's FALLBACK path (C is
+   unavailable here — no topright macroblock exists — so it falls through
+   to the general median, per §8.4.1.3.1) AND, within that fallback, the
+   same same-macroblock quadrant lookup as fixture 1 (median's own A reads
+   the left partition's already-decided TL quadrant).
+
+   `p-8x8-cross-mb-multimb.h264` — 32x16 (2 macroblocks): MB0 = P_8x8
+   (`mb_type`=3, `sub_mb_type` P_L0_8x8 x4 — the only supported sub_mb_type)
+   with 4 DIFFERENT integer-pel motion vectors, one per 8x8 quadrant
+   (TL=(4,0), TR=(-4,0), BL=(0,4), BR=(0,-4)), plus real residual in the TL
+   quadrant only; MB1 = P_L0_16x16 with mvd=(0,0). This is the DIRECT
+   regression test for the neighbor-derivation fix this increment required:
+   MB1's own §8.4.1.3 motion-vector predictor (its 'A' neighbor) must read
+   MB0's TR quadrant SPECIFICALLY (`mb-quadrant-mv`, quadrant idx 1) — NOT
+   MB0's TL/BL/BR (all of which carry DIFFERENT motion vectors) and NOT
+   some flattened 'the whole neighbor macroblock's motion vector' the way
+   this repo's P-slice code read neighbors BEFORE this increment (when
+   every previously-supported inter mb_type happened to have a single
+   uniform motion vector across the whole macroblock, so a flat per-MB
+   read was indistinguishable from a quadrant-specific one — see
+   `h264.decode/mb-quadrant-mv`'s docstring). If MB1's predictor
+   incorrectly read MB0's TL quadrant (4,0) instead of the correct TR
+   quadrant (0,0), MB1's final motion vector would be (4,0) instead of
+   (0,0), and its reconstructed pixels would NOT match real ffmpeg's
+   independent (spec-correct) decode of these same bytes — so the
+   bit-exact match asserted below is a genuine, discriminating proof this
+   fix is exercised and correct, not an incidental pass. The IDR reference
+   frame also carries a REAL 2-D Cb/Cr gradient (not flat) so the 4x4-
+   per-quadrant chroma motion-compensated placement
+   (`h264.decode/mc-predict-quadrants`) is genuinely exercised too, not
+   just luma."
+  (:require [kotoba.test :refer [deftest is testing]]
+            #?(:clj [kotoba.io :as io])
+            [h264.decode :as decode]
+            [h264.expgolomb :as eg]
+            [h264.slice :as slice]
+            [h264.sps :as sps]
+            [h264.pps :as pps]
+            [h264.rbsp :as rbsp]
+            [h264.bitstream :as bs]
+            [h264.encode :as encode]))
+
+(defn- rd [p] (mapv #(bit-and (int %) 0xff)
+                    #?(:clj (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))
+                       :cljs (js->clj (.readFileSync (js/require "fs") (str "lib/org.iso.h264/resources/" p))))))
+
+(defn- frame-planes
+  [yuv offset width height]
+  (let [luma-size (* width height)
+        chroma-size (* (quot width 2) (quot height 2))
+        v (vec yuv)]
+    {:luma (subvec v offset (+ offset luma-size))
+     :cb (subvec v (+ offset luma-size) (+ offset luma-size chroma-size))
+     :cr (subvec v (+ offset luma-size chroma-size) (+ offset luma-size (* 2 chroma-size)))}))
+
+(deftest p-16x8-mb0-golden-vector
+  (testing "p-16x8-mb0.h264 — hand-authored, single 16x16 MB, mb_type=1
+   (P_L0_L0_16x8), zero residual, distinct top/bottom partition motion
+   vectors (see namespace docstring)"
+    (let [bytes (rd "h264/fixtures/p-16x8-mb0.h264")
+          frames (decode/decode-gop bytes)
+          ref (rd "h264/fixtures/p-16x8-mb0.ref.yuv")
+          frame-size (+ 256 64 64)]
+      (testing "decodes exactly 2 pictures (IDR + P), in bitstream order"
+        (is (= 2 (count frames)))
+        (is (= :i (:slice-type-class (first frames))))
+        (is (= :p (:slice-type-class (second frames)))))
+      (testing "the P-frame's single macroblock is P_16x8 with 2 DIFFERENT partition motion vectors"
+        (is (= [:p-16x8] (:mb-sub-types (second frames))))
+        (let [[q0 q1 q2 q3] (first (:mb-mv-fields (second frames)))]
+          (is (= (:mv q0) (:mv q1)) "top partition (TL/TR quadrants) shares one mv")
+          (is (= (:mv q2) (:mv q3)) "bottom partition (BL/BR quadrants) shares one mv")
+          (is (not= (:mv q0) (:mv q2)) "top and bottom partitions have DIFFERENT motion vectors")))
+      (doseq [[idx frame] (map-indexed vector frames)]
+        (let [planes (frame-planes ref (* idx frame-size) 16 16)]
+          (testing (str "frame " idx " reconstructed luma/Cb/Cr are bit-exact vs. real ffmpeg's INDEPENDENT decode of these same hand-authored bytes")
+            (is (= (:luma planes) (:luma frame)))
+            (is (= (:cb planes) (:cb frame)))
+            (is (= (:cr planes) (:cr frame)))))))))
+
+(deftest p-8x16-mb0-realac-golden-vector
+  (testing "p-8x16-mb0-realac.h264 — hand-authored, single 16x16 MB,
+   mb_type=2 (P_L0_L0_8x16), real nonzero luma AC residual in one 8x8
+   quadrant, distinct left/right partition motion vectors"
+    (let [bytes (rd "h264/fixtures/p-8x16-mb0-realac.h264")
+          frames (decode/decode-gop bytes)
+          ref (rd "h264/fixtures/p-8x16-mb0-realac.ref.yuv")
+          frame-size (+ 256 64 64)]
+      (testing "decodes exactly 2 pictures (IDR + P), in bitstream order"
+        (is (= 2 (count frames)))
+        (is (= :i (:slice-type-class (first frames))))
+        (is (= :p (:slice-type-class (second frames)))))
+      (testing "the P-frame's single macroblock is P_8x16 with 2 DIFFERENT partition motion vectors"
+        (is (= [:p-8x16] (:mb-sub-types (second frames))))
+        (let [[q0 q1 q2 q3] (first (:mb-mv-fields (second frames)))]
+          (is (= (:mv q0) (:mv q2)) "left partition (TL/BL quadrants) shares one mv")
+          (is (= (:mv q1) (:mv q3)) "right partition (TR/BR quadrants) shares one mv")
+          (is (not= (:mv q0) (:mv q1)) "left and right partitions have DIFFERENT motion vectors")))
+      (testing "the hand-built residual actually changed pixels (sanity: this isn't accidentally an all-zero/skip-equivalent reconstruction)"
+        (is (> (count (distinct (:luma (second frames)))) 1)))
+      (doseq [[idx frame] (map-indexed vector frames)]
+        (let [planes (frame-planes ref (* idx frame-size) 16 16)]
+          (testing (str "frame " idx " reconstructed luma/Cb/Cr are bit-exact vs. real ffmpeg's INDEPENDENT decode of these same hand-authored bytes")
+            (is (= (:luma planes) (:luma frame)))
+            (is (= (:cb planes) (:cb frame)))
+            (is (= (:cr planes) (:cr frame)))))))))
+
+(deftest p-8x8-cross-mb-multimb-golden-vector
+  (testing "p-8x8-cross-mb-multimb.h264 — hand-authored, 32x16 (2 MBs): MB0
+   = P_8x8 (sub_mb_type P_L0_8x8 x4) with 4 DIFFERENT per-quadrant motion
+   vectors + real residual; MB1 = P_L0_16x16 whose own motion-vector
+   predictor MUST read MB0's TR quadrant specifically — the direct
+   regression test for the neighbor-derivation fix this increment required
+   (see namespace docstring for the full discriminating-proof argument).
+   Real 2-D Cb/Cr gradient IDR reference exercises per-quadrant CHROMA
+   motion compensation too."
+    (let [bytes (rd "h264/fixtures/p-8x8-cross-mb-multimb.h264")
+          frames (decode/decode-gop bytes)
+          ref (rd "h264/fixtures/p-8x8-cross-mb-multimb.ref.yuv")
+          frame-size (+ 512 128 128)]
+      (testing "decodes exactly 2 pictures (IDR + P), in bitstream order"
+        (is (= 2 (count frames)))
+        (is (= :i (:slice-type-class (first frames))))
+        (is (= :p (:slice-type-class (second frames)))))
+      (testing "MB0 is P_8x8 with 4 DIFFERENT quadrant motion vectors; MB1 is plain P_L0_16x16"
+        (is (= [:p-8x8 :p-l0-16x16] (:mb-sub-types (second frames))))
+        (let [[q0 q1 q2 q3] (first (:mb-mv-fields (second frames)))]
+          (is (= [4 0] (:mv q0)) "TL: predictor (0,0, no neighbors) + mvd (4,0)")
+          (is (= [0 0] (:mv q1)) "TR: predictor = TL's OWN already-decided mv (4,0), the single ref-matching neighbor (§8.4.1.3.1 exact-match rule; B/C unavailable) + mvd (-4,0)")
+          (is (= [0 4] (:mv q2)))
+          (is (= [0 -4] (:mv q3)))))
+      (testing "MB1's motion-vector predictor read MB0's TR quadrant (0,0 after mvd) — NOT its TL/BL/BR quadrants (each a DIFFERENT value)"
+        (let [mb1-field (second (:mb-mv-fields (second frames)))]
+          (is (every? #(= [0 0] (:mv %)) mb1-field)
+              "P_L0_16x16 MB1's uniform mv must equal MB0's TR quadrant (0,0) — a wrong quadrant read (TL=[4 0]/BL=[0 4]/BR=[0 -4]) would produce a visibly different (and ffmpeg-mismatching) motion vector here")))
+      (doseq [[idx frame] (map-indexed vector frames)]
+        (let [planes (frame-planes ref (* idx frame-size) 32 16)]
+          (testing (str "frame " idx " reconstructed luma/Cb/Cr are bit-exact vs. real ffmpeg's INDEPENDENT decode of these same hand-authored bytes")
+            (is (= (:luma planes) (:luma frame)))
+            (is (= (:cb planes) (:cb frame)))
+            (is (= (:cr planes) (:cr frame)))))))))
+
+;; --- Out-of-scope mb_type/sub_mb_type throw tests — mirrors this repo's
+;;     existing throw-on-unsupported discipline (see
+;;     `h264.decode-test`'s `i16x16-mb-info` throw tests). Built inline
+;;     (no separate fixture file needed — these only need to prove a
+;;     specific exception fires, not a golden pixel comparison), using the
+;;     SAME `h264.expgolomb`/`h264.slice/encode-p-header!` primitives the
+;;     golden-vector fixtures above were hand-authored with. ---
+
+(defn- flat-idr-and-p-header
+  "Build a flat 16x16 IDR frame (`h264.encode/encode-idr-luma-frame`) plus a
+   started (but not yet macroblock-populated) P-slice bit WRITER whose
+   header is already written — returns {:idr-bytes :writer :sps-map
+   :pps-map} so a test can append whatever out-of-scope mb_type/sub_mb_type
+   syntax it wants and assert `decode/decode-gop` throws."
+  [qp]
+  (let [luma (vec (repeat (* 16 16) 128))
+        idr (encode/encode-idr-luma-frame {:width 16 :height 16 :qp qp :luma luma})
+        sps-rbsp (sps/encode {:profile-idc 66 :level-idc 30 :seq-parameter-set-id 0 :width 16 :height 16})
+        pps-rbsp (pps/encode {:pic-init-qp qp})
+        sps-map (sps/parse (rbsp/unescape sps-rbsp))
+        pps-map (pps/parse (rbsp/unescape pps-rbsp))
+        w (eg/writer)]
+    (eg/write-bits! w 8 (bit-or (bit-shift-left 2 5) 1))
+    (slice/encode-p-header! w sps-map pps-map {:frame-num 1 :slice-qp qp :nal-ref-idc 2})
+    {:idr-bytes (:bytes idr) :writer w}))
+
+(defn- finish-p-nal [idr-bytes w]
+  (eg/rbsp-trailing-bits! w)
+  (vec (concat idr-bytes (bs/write-nal-unit (eg/bytes! w)))))
+
+(deftest p-8x8ref0-mb-type-throws
+  (testing "mb_type=4 (P_8x8ref0) is explicitly out of scope and throws rather than being silently mis-decoded"
+    (let [{:keys [idr-bytes writer]} (flat-idr-and-p-header 26)
+          _ (eg/write-ue! writer 0)  ; mb_skip_run
+          _ (eg/write-ue! writer 4) ; mb_type = 4 (P_8x8ref0)
+          bytes (finish-p-nal idr-bytes writer)]
+      (is (thrown-with-msg? js/Error #"P_8x8ref0"
+                            (decode/decode-gop bytes))))))
+
+(deftest p-8x8-unsupported-sub-mb-type-throws
+  (testing "P_8x8 (mb_type=3) with any sub_mb_type other than P_L0_8x8 (0) is explicitly out of scope and throws"
+    (let [{:keys [idr-bytes writer]} (flat-idr-and-p-header 26)
+          _ (eg/write-ue! writer 0) ; mb_skip_run
+          _ (eg/write-ue! writer 3) ; mb_type = 3 (P_8x8)
+          _ (eg/write-ue! writer 1) ; sub_mb_type[0] = P_L0_8x4 (unsupported)
+          _ (eg/write-ue! writer 0) ; sub_mb_type[1]
+          _ (eg/write-ue! writer 0) ; sub_mb_type[2]
+          _ (eg/write-ue! writer 0) ; sub_mb_type[3]
+          bytes (finish-p-nal idr-bytes writer)]
+      (is (thrown-with-msg? js/Error #"sub_mb_type P_L0_8x8"
+                            (decode/decode-gop bytes))))))

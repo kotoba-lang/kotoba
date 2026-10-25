@@ -1,0 +1,144 @@
+(ns h264.sps
+  "H.264 Sequence Parameter Set (SPS, NAL type 7) parsing — profile/level and
+   picture dimensions (H.264 §7.3.2.1.1 seq_parameter_set_data, §7.4.2.1.1
+   frame-cropping → width/height). Reads the *unescaped* RBSP (see
+   h264.rbsp) via Exp-Golomb (see h264.expgolomb). High-profile scaling
+   lists are skipped correctly (bits consumed, values discarded) so the
+   reader stays aligned for the fields that follow, but their content isn't
+   surfaced. Validated against a real libx264-encoded (baseline profile)
+   NAL — see test/h264/sps_test.cljk.
+
+   New implementation as part of the kotoba-lang reverse-domain
+   media/graphics standards-substrate split (com-junkawasaki/root)."
+  (:require [h264.expgolomb :as eg]))
+
+(def high-profile-family
+  "profile_idc values whose SPS carries the High-Profile-family extension
+   fields (chroma_format_idc, bit_depth_*, scaling lists) AND whose PPS may
+   carry the trailing `transform_8x8_mode_flag`. Public because
+   `h264.decode` needs the second half of that: `transform_8x8_mode_flag`
+   is what decides whether an I_NxN macroblock means Intra_4x4 or
+   Intra_8x8, and `h264.pps` documents itself as not parsing it, so
+   Intra_4x4 decode has to refuse a stream where the flag COULD be present
+   rather than assume it is absent."
+  #{100 110 122 244 44 83 86 118 128 138 139 134 135})
+
+(defn- skip-scaling-list! [r size]
+  (loop [j 0 last-scale 8 next-scale 8]
+    (when (< j size)
+      (if (zero? next-scale)
+        (recur (inc j) last-scale next-scale)
+        (let [delta (eg/se! r)
+              ns2   (mod (+ last-scale delta 256) 256)]
+          (recur (inc j) (if (zero? ns2) last-scale ns2) ns2))))))
+
+(defn parse
+  "Parse an SPS RBSP (already emulation-unescaped, header byte INCLUDED at
+   index 0 — see h264.rbsp/unescape) → {:profile-idc :level-idc :width
+   :height :frame-mbs-only? :chroma-format-idc}."
+  [rbsp]
+  (let [r (eg/reader rbsp)
+        _ (eg/bits! r 8)                                   ; NAL header byte (already validated by caller)
+        profile-idc (eg/bits! r 8)
+        _constraint (eg/bits! r 8)                          ; constraint_set0..5_flag + reserved_zero_2bits
+        level-idc   (eg/bits! r 8)
+        _sps-id     (eg/ue! r)
+        chroma-format-idc
+        (if (contains? high-profile-family profile-idc)
+          (let [cfi (eg/ue! r)]
+            (when (= cfi 3) (eg/flag! r))                   ; separate_colour_plane_flag
+            (eg/ue! r)                                       ; bit_depth_luma_minus8
+            (eg/ue! r)                                       ; bit_depth_chroma_minus8
+            (eg/flag! r)                                     ; qpprime_y_zero_transform_bypass_flag
+            (when (= 1 (eg/flag! r))                         ; seq_scaling_matrix_present_flag
+              (let [n (if (= cfi 3) 12 8)]
+                (dotimes [i n]
+                  (when (= 1 (eg/flag! r))                    ; seq_scaling_list_present_flag[i]
+                    (skip-scaling-list! r (if (< i 6) 16 64))))))
+            cfi)
+          1)                                                  ; default 4:2:0 when not signaled
+        log2-max-frame-num-minus4 (eg/ue! r)
+        poc-type (eg/ue! r)
+        log2-max-poc-lsb-minus4
+        (case poc-type
+            0 (eg/ue! r)                                      ; log2_max_pic_order_cnt_lsb_minus4
+            1 (do (eg/flag! r) (eg/se! r) (eg/se! r)
+                  (let [n (eg/ue! r)] (dotimes [_ n] (eg/se! r)))
+                  nil)
+            nil)
+        _max-num-ref-frames (eg/ue! r)
+        _gaps-allowed (eg/flag! r)
+        pic-width-in-mbs-minus1 (eg/ue! r)
+        pic-height-in-map-units-minus1 (eg/ue! r)
+        frame-mbs-only? (= 1 (eg/flag! r))
+        _mb-adaptive (when-not frame-mbs-only? (eg/flag! r))
+        _direct-8x8-inference (eg/flag! r)
+        crop? (= 1 (eg/flag! r))
+        [crop-l crop-r crop-t crop-b] (if crop?
+                                         [(eg/ue! r) (eg/ue! r) (eg/ue! r) (eg/ue! r)]
+                                         [0 0 0 0])
+        sub-width-c  (if (= chroma-format-idc 3) 1 2)
+        sub-height-c (if (= chroma-format-idc 1) 2 (if (= chroma-format-idc 3) 1 1))
+        crop-unit-x  sub-width-c
+        crop-unit-y  (* sub-height-c (if frame-mbs-only? 1 2))
+        width  (- (* (inc pic-width-in-mbs-minus1) 16) (* crop-unit-x (+ crop-l crop-r)))
+        height (- (* (if frame-mbs-only? 1 2) (inc pic-height-in-map-units-minus1) 16)
+                  (* crop-unit-y (+ crop-t crop-b)))]
+    {:profile-idc profile-idc
+     :level-idc   level-idc
+     :chroma-format-idc chroma-format-idc
+     :frame-mbs-only? frame-mbs-only?
+     :width  width
+     :height height
+     :log2-max-frame-num-minus4 log2-max-frame-num-minus4
+     :pic-order-cnt-type poc-type
+     :log2-max-pic-order-cnt-lsb-minus4 log2-max-poc-lsb-minus4}))
+
+;; --- encode side (Wave 2 addition, kotoba-lang/root ADR-2607121400) ---
+
+(defn encode
+  "Encode a minimal non-high-profile SPS RBSP (NAL header byte included at
+   index 0, matching `parse`'s convention) from {:profile-idc :level-idc
+   :seq-parameter-set-id :width :height}. Scope, deliberately narrow:
+   - `profile-idc` must NOT be in `high-profile-family` (throws otherwise —
+     chroma_format_idc/scaling-list signaling isn't implemented on encode).
+   - `frame_mbs_only_flag` is always written 1 (progressive only).
+   - No frame cropping: `width`/`height` must both be exact multiples of 16
+     (throws otherwise) — they become `pic_width_in_mbs_minus1`/
+     `pic_height_in_map_units_minus1` directly, with
+     `frame_cropping_flag` = 0.
+   - `pic_order_cnt_type` is always 0 with
+     `log2_max_pic_order_cnt_lsb_minus4` = 0.
+   - `vui_parameters_present_flag` is written 0 (present and correct per
+     spec, even though `parse` above doesn't read that far).
+   Round-trip verified against `parse` in sps_test.clj: `(parse (encode m))`
+   reproduces `:profile-idc`/`:level-idc`/`:width`/`:height`."
+  [{:keys [profile-idc level-idc seq-parameter-set-id width height]
+    :or {seq-parameter-set-id 0}}]
+  (when (contains? high-profile-family profile-idc)
+    (throw (ex-info "h264.sps/encode: high-profile SPS encode not implemented"
+                     {:profile-idc profile-idc})))
+  (when-not (and (zero? (mod width 16)) (zero? (mod height 16)))
+    (throw (ex-info "h264.sps/encode: width/height must be multiples of 16 (no frame_cropping support)"
+                     {:width width :height height})))
+  (let [w (eg/writer)
+        nal-header (bit-or (bit-shift-left 3 5) 7)]          ; nal_ref_idc=3, nal_unit_type=7 (SPS)
+    (eg/write-bits! w 8 nal-header)
+    (eg/write-bits! w 8 profile-idc)
+    (eg/write-bits! w 8 0)                                    ; constraint_set0..5_flag + reserved_zero_2bits
+    (eg/write-bits! w 8 level-idc)
+    (eg/write-ue! w seq-parameter-set-id)
+    ;; chroma_format_idc et al. only signaled for high-profile family — skipped
+    (eg/write-ue! w 0)                                        ; log2_max_frame_num_minus4
+    (eg/write-ue! w 0)                                        ; pic_order_cnt_type = 0
+    (eg/write-ue! w 0)                                        ; log2_max_pic_order_cnt_lsb_minus4
+    (eg/write-ue! w 0)                                        ; max_num_ref_frames
+    (eg/write-flag! w false)                                  ; gaps_in_frame_num_value_allowed_flag
+    (eg/write-ue! w (dec (quot width 16)))                    ; pic_width_in_mbs_minus1
+    (eg/write-ue! w (dec (quot height 16)))                   ; pic_height_in_map_units_minus1
+    (eg/write-flag! w true)                                   ; frame_mbs_only_flag
+    (eg/write-flag! w true)                                   ; direct_8x8_inference_flag
+    (eg/write-flag! w false)                                  ; frame_cropping_flag
+    (eg/write-flag! w false)                                  ; vui_parameters_present_flag
+    (eg/rbsp-trailing-bits! w)
+    (eg/bytes! w)))

@@ -1,0 +1,2065 @@
+(ns h264.decode
+  "H.264 baseline-profile reference pixel decoder — NAL → SPS/PPS → IDR
+   I-slice → macroblock loop → (Intra_16x16 prediction + CAVLC residual +
+   dequant + inverse transform) → reconstructed luma plane. Pure cljc,
+   NON-REALTIME reference implementation (ADR-2607122000 \"R0.5\": a
+   correctness-first golden model, not a claim of realtime decode
+   performance — see `com-junkawasaki/root` ADR-2607122000 and the R0
+   opaque / R1 capability-gated-native-host-word phases it doesn't
+   replace).
+
+   ## Scope (read before assuming this decodes arbitrary H.264)
+
+   - **Single IDR I-slice per picture, one slice per picture** — no
+     multi-slice, no P/B slices, no multiple reference frames, no
+     multi-frame GOP structure.
+   - **Baseline profile, CAVLC only** (no CABAC).
+   - **mb_type: Intra_16x16 (1..24) and `I_NxN`/Intra_4x4 (0)**. Intra_4x4
+     is CAVLC-I-slice only (`decode-intra-4x4-macroblock-body!`, all nine
+     §8.3.1.2 modes + the §8.3.1.1 neighbour-derived predicted mode); the
+     CABAC path and a P-slice's intra macroblocks still refuse mb_type 0.
+     **Intra_8x8** — the other thing mb_type 0 can mean, needing the 8x8
+     transform and the §8.3.2.2 reference-sample filter — and 25 (`I_PCM`)
+     THROW rather than being silently mis-decoded.
+   - **Intra_16x16 luma prediction modes: DC/Vertical/Horizontal (0/1/2)
+     only** — mode 3 (Plane) throws.
+   - **Chroma (Cb/Cr): ChromaArrayType 1 (4:2:0) only, DC/Horizontal/
+     Vertical Intra_Chroma prediction (modes 0/1/2 per Table 8-5's OWN
+     numbering — a different permutation than luma's, see
+     `h264.intra-pred`) — mode 3 (Plane) throws.** Chroma DC (nC==-1
+     special CAVLC table) and chroma AC (regular neighbor-derived 4x4
+     blocks, reusing the luma AC path with QPc instead of QPy) are both
+     implemented — this is new as of the chroma-decode follow-up to Phase 1
+     (see \"Pixel decode\" below); any other `chroma_format_idc` throws.
+   - **No deblocking filter** — `h264.slice` reads and discards the
+     deblocking-control fields; the reconstructed picture is the raw
+     (pre-deblock) reconstruction. This only matters at block boundaries
+     with real pixel discontinuities; it does not affect this repo's own
+     flat/gradient golden vectors (see `test/h264/decode_test.cljk`).
+   - **No POC/reference-picture-buffer bookkeeping beyond what's needed to
+     parse a single slice header.**
+
+   Given these constraints, `decode-idr-frame` returns decoded luma AND
+   chroma planes ({:luma :cb :cr}, each a flat byte vector, row-major,
+   values 0..255 — luma is width*height, Cb/Cr are each (width/2)*(height/2)
+   per 4:2:0 subsampling) for a picture whose width/height (from SPS) are
+   exact multiples of 16 (no frame cropping — matches `h264.sps/encode`'s
+   own encode-side limitation elsewhere in this repo).
+
+   New implementation as part of the kotoba-lang reverse-domain
+   media/graphics standards-substrate split (com-junkawasaki/root),
+   ADR-2607122000 Phase 1 (\"R0.5\") + a chroma-decode / multi-macroblock
+   V/H-prediction follow-up."
+  (:require [h264.bitstream :as bs]
+            [h264.rbsp :as rbsp]
+            [h264.sps :as sps]
+            [h264.pps :as pps]
+            [h264.slice :as slice]
+            [h264.expgolomb :as eg]
+            [h264.cavlc :as cavlc]
+            [h264.cabac :as cabac]
+            [h264.quant :as quant]
+            [h264.transform :as transform]
+            [h264.intra-pred :as intra-pred]
+            [h264.interp :as interp]
+            [codec-primitives.scan :as scan]))
+
+(def zigzag scan/zigzag-4x4)
+
+(def blk->col-row
+  "H.264 4x4 luma block index (0..15, CAVLC/residual decode order — the
+   spec's `luma4x4BlkIdx`, Figure 6-10) → [col row] (both 0..3) within the
+   macroblock's 4x4-block grid.
+
+   The four 4x4 blocks 0..15 group into FOUR 8x8 quadrants in raster order
+   (TL=0-3, TR=4-7, BL=8-11, BR=12-15 — GLOBAL quadrant positions [0,0]
+   [2,0] [0,2] [2,2] respectively), and WITHIN each quadrant the four 4x4
+   sub-blocks are ALSO in plain raster order (TL,TR,BL,BR — col varies
+   fastest, matching `h264.decode/chroma-blk->col-row`'s 2x2 raster
+   convention, NOT a column-major/Z-order variant).
+
+   PREVIOUSLY (through the chroma-decode/multi-MB-V/H-prediction
+   development session) this table used an INCORRECT column-major variant
+   (`{0 [0 0], 1 [0 1], 2 [1 0], ...}` — row and col swapped relative to
+   the mapping above, i.e. a transpose of the correct table) that was
+   believed \"empirically validated\" by the single-macroblock
+   `gradient16-ac.h264` fixture and the multi-macroblock
+   `chroma-multimb32.h264` fixture. Both fixtures' LUMA content is
+   direction-degenerate in a way that can't distinguish a transposed block
+   mapping from the correct one (a single-MB horizontal gradient has no
+   cross-MB neighbor to expose it; the multimb32 fixture's luma is flat).
+   The bug was only exposed by a genuinely cross-macroblock, row-varying
+   (not column-varying) multi-MB luma test — where libx264 selected
+   Intra_16x16 Horizontal prediction — via a real desync/wrong-pixel
+   investigation (see README \"Pixel decode\" and ADR history around the
+   Horizontal-prediction multi-macroblock golden vector). The correct
+   mapping was independently re-derived (and cross-checked three ways) from
+   FFmpeg's OWN source: (1) `scan8[]`'s neighbor-addressing formula
+   (`libavcodec/h264dec.h`/callers), (2) the `ref_index`/`scan8[0|4|8|12]`
+   8x8-partition assignment in `ff_h264_slice_context_init`
+   (`libavcodec/h264dec.c`), and (3) the explicit `dc_mapping[16]` table in
+   `hl_decode_mb_idct_luma` (`libavcodec/h264_mb.c`, the
+   `transform_bypass`/lossless path, which spells out DC-raster-position →
+   block-index numerically) — all three agree exactly on the mapping below.
+   `h264.transform/luma-dc-hadamard`'s own arithmetic (`x_offset`/`stride`,
+   kept as a byte-for-byte port of `ff_h264_luma_dc_dequant_idct`) already
+   produces its 16-element output correctly indexed by this SAME true
+   block numbering (verified: `out[16*k]` for k=0..15 lines up exactly with
+   `stride*R+offset` for the (loop-i, R) combination that
+   `ff_h264_luma_dc_dequant_idct`'s caller — `sl->mb + p*256` — treats as
+   block-major storage). It ALSO needs its OWN input transposed first
+   (see `h264.transform/luma-dc-hadamard`'s docstring) — the two bugs
+   compound: without the input transpose, the DC-Hadamard-derived values
+   vary along the wrong screen axis (column instead of row for row-varying
+   content) regardless of which `blk->col-row` is used; fixing only one of
+   the two still fails."
+  {0 [0 0], 1 [1 0], 2 [0 1], 3 [1 1]
+   4 [2 0], 5 [3 0], 6 [2 1], 7 [3 1]
+   8 [0 2], 9 [1 2], 10 [0 3], 11 [1 3]
+   12 [2 2], 13 [3 2], 14 [2 3], 15 [3 3]})
+
+(def col-row->blk
+  (into {} (map (fn [[k v]] [v k]) blk->col-row)))
+
+(def chroma-blk->col-row
+  "ChromaArrayType 1 (4:2:0) 4x4 chroma sub-block index (0..3, CAVLC/
+   residual decode order) → [col row] (both 0..1) within the 8x8 chroma
+   block's 2x2 grid. Plain RASTER order (0=[0,0] TL, 1=[1,0] TR, 2=[0,1]
+   BL, 3=[1,1] BR) — NOT the same as luma's `blk->col-row` first-4-entry
+   pattern (which is a column-major/Z-order convention: 0=[0,0] 1=[0,1]
+   2=[1,0] 3=[1,1]). This was assumed to be the SAME building block as
+   luma's (reasonable-looking given ffmpeg shares the `16 + 16*chroma_idx
+   + i4x4` index arithmetic with luma's own i4x4 sub-index) but that
+   assumption was WRONG and was caught empirically: a real multi-macroblock
+   x264-encoded color-gradient chroma golden vector decoded to a
+   right-shaped, WRONG-valued picture (AC coefficients swapped between the
+   TR and BL quadrants — i.e. transposed) until this raster convention was
+   substituted. Do not re-derive this from luma's convention by analogy."
+  {0 [0 0], 1 [1 0], 2 [0 1], 3 [1 1]})
+
+(def chroma-col-row->blk
+  (into {} (map (fn [[k v]] [v k]) chroma-blk->col-row)))
+
+(defn- i16x16-mb-info
+  "mb_type (1..24, I_16x16_*) → {:pred-mode :cbp-luma :cbp-chroma} per
+   Table 7-11. Throws for mb_type 0 (I_NxN) / 25 (I_PCM) / anything else.
+
+   mb_type 0 reaching THIS function is not the general 'I_NxN is
+   unsupported' case any more — Intra_4x4 is implemented, in
+   `decode-intra-4x4-macroblock-body!`, and the CAVLC I-slice entry point
+   (`decode-macroblock!`) dispatches mb_type 0 there before ever calling
+   this. What still lands here is the two paths that have NOT been wired
+   up: the CABAC I-slice path (`decode-intra-macroblock-body-cabac!`,
+   whose §9.3.3.1.1.x context models for the pred-mode flags and the intra
+   `coded_block_pattern` are not implemented) and a P-slice's intra
+   macroblocks (`decode-macroblock-p!`, Table 7-13's `p_mb_type - 5`). The
+   reason literal says so rather than claiming Intra_4x4 does not exist."
+  [mb-type]
+  (when (or (zero? mb-type) (= mb-type 25) (> mb-type 25))
+    (throw (ex-info "h264.decode: only Intra_16x16 mb_type (1..24) is supported on this path"
+                     {:mb-type mb-type
+                      :reason (cond (zero? mb-type) "I_NxN (Intra_4x4) is implemented for CAVLC I-slices only; not for CABAC or P-slice intra macroblocks"
+                                    (= mb-type 25) "I_PCM not implemented"
+                                    :else "not a valid I-slice mb_type")})))
+  (let [m (dec mb-type)]
+    {:pred-mode (mod m 4)
+     :cbp-chroma (mod (quot m 4) 3)
+     :cbp-luma (if (>= m 12) 15 0)}))
+
+(defn- neighbor-nc
+  [nA nB]
+  (cond (and (nil? nA) (nil? nB)) 0
+        (nil? nA) nB
+        (nil? nB) nA
+        :else (quot (+ nA nB 1) 2)))
+
+(defn- unscan-raster
+  "Place `scanned` (vector, scan-order, length = (count scan-order)) into
+   a 16-element row-major (idx=row*4+col) vector using `scan-order` — a
+   permutation vector of raster indices — starting at raster position 0."
+  [scan-order scanned]
+  (reduce (fn [acc [pos v]] (assoc acc pos v))
+          (vec (repeat 16 0))
+          (map vector scan-order scanned)))
+
+(defn- dc-coeffs->per-block
+  "Entropy-method-agnostic (§8.5.10) post-processing shared by CAVLC's and
+   CABAC's Intra16x16 luma-DC decode: `coeffs` (16-elem SCAN-order vector,
+   RAW/not-yet-dequantized levels — the Hadamard transform below applies
+   its own qmul) -> unscan to raster -> luma DC Hadamard transform."
+  [coeffs qp]
+  (let [raster (unscan-raster zigzag coeffs)]
+    (transform/luma-dc-hadamard raster (quant/dc-qmul qp))))
+
+(defn- ac-coeffs->raster
+  "Entropy-method-agnostic (§8.5.9) post-processing shared by CAVLC's and
+   CABAC's AC-block decode: `coeffs` (15-elem SCAN-order vector, scan
+   positions 1..15) -> unscan to raster -> per-position dequant. Returns a
+   16-elem vector (position 0 always 0 — the caller overlays the DC value)."
+  [coeffs qp]
+  (let [ac-zigzag (subvec zigzag 1)
+        positions (unscan-raster ac-zigzag coeffs)]
+    (mapv (fn [pos]
+            (let [level (nth positions pos)]
+              ;; matches ffmpeg's `((int)(level*qmul+32))>>6` — MUST be an
+              ;; arithmetic (floor) shift, not truncating division, since
+              ;; level can be negative and the two differ whenever the
+              ;; numerator isn't an exact multiple of 64.
+              (if (zero? level) 0 (bit-shift-right (+ (* level (quant/ac-qmul qp (quot pos 4) (mod pos 4))) 32) 6))))
+          (range 16))))
+
+(defn- decode-luma-dc!
+  [r nc qp]
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 16)]
+    {:dc-per-block (dc-coeffs->per-block coeffs qp) :total-coeff total-coeff}))
+
+(defn- decode-luma-dc-cabac!
+  "CABAC counterpart of `decode-luma-dc!` — see `h264.cabac/residual-block!`
+   for the entropy decode, `dc-coeffs->per-block` for the shared dequant/
+   transform (identical to the CAVLC path once scan-order levels are known).
+   `nA`/`nB` are the already-derived `coded_block_flag` neighbor booleans
+   (§9.3.3.1.1.9 — see `h264.decode`'s CABAC macroblock decode)."
+  [eng ctxs nA nB qp]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs :luma-dc nA nB)]
+    {:dc-per-block (dc-coeffs->per-block coeffs qp) :total-coeff total-coeff}))
+
+(defn- decode-ac-block!
+  "Decode one regular AC 4x4 block (scan positions 1..15, maxNumCoeff 15).
+   Shared by Intra16x16 luma AC blocks AND chroma AC blocks (§8.5.9's
+   per-position dequant formula is identical for both — only the `qp`
+   value passed in differs: QPy for luma, QPc — `h264.quant/chroma-qp` —
+   for chroma). Returns {:ac-raster (16-elem vector, position 0 always 0 —
+   the caller overlays the DC value) :total-coeff int} with dequantized
+   levels, ready to overlay onto a block's coefficient array at positions
+   1..15 (position 0 is the DC value, handled separately)."
+  [r nc qp]
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 15)]
+    {:ac-raster (ac-coeffs->raster coeffs qp) :total-coeff total-coeff}))
+
+(defn- decode-ac-block-cabac!
+  "CABAC counterpart of `decode-ac-block!` — `cat` is `:luma-ac` or
+   `:chroma-ac` (see `h264.cabac/residual-block!`); `nA`/`nB` are the
+   already-derived `coded_block_flag` neighbor booleans."
+  [eng ctxs cat nA nB qp]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs cat nA nB)]
+    {:ac-raster (ac-coeffs->raster coeffs qp) :total-coeff total-coeff}))
+
+(defn- decode-regular-block!
+  "Decode one FULL 4x4 residual block (ALL 16 scan positions, maxNumCoeff
+   16 — including position [0,0], dequantized via the SAME per-position
+   `h264.quant/ac-qmul` formula as every other position). This is the
+   residual shape used by mb_types that have NO separate macroblock-level
+   luma-DC/Hadamard block — i.e. P-slice inter macroblocks (P_L0_16x16 etc.)
+   and I_NxN — as opposed to `decode-ac-block!`, which is Intra16x16-
+   luma-ONLY (maxNumCoeff 15, position 0 supplied externally from the
+   Hadamard-transformed macroblock-level DC). Returns {:raster (16-elem
+   row-major vector, dequantized) :total-coeff int}."
+  [r nc qp]
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r nc 16)
+        positions (unscan-raster zigzag coeffs)]
+    {:raster (mapv (fn [pos]
+                      (let [level (nth positions pos)]
+                        (if (zero? level) 0 (bit-shift-right (+ (* level (quant/ac-qmul qp (quot pos 4) (mod pos 4))) 32) 6))))
+                    (range 16))
+     :total-coeff total-coeff}))
+
+(defn- decode-regular-block-cabac!
+  "CABAC counterpart of `decode-regular-block!` — the FULL 16-coefficient
+   \"regular\" 4x4 residual block (position 0 included, no separate
+   macroblock-level DC/Hadamard split) used by P_L0_16x16 inter macroblocks,
+   via `h264.cabac`'s `:luma-regular` block category (see that namespace's
+   `cat-params`). `nA`/`nB` are the already-derived `coded_block_flag`
+   neighbor booleans (§9.3.3.1.1.9 — same convention as
+   `decode-ac-block-cabac!`)."
+  [eng ctxs nA nB qp]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs :luma-regular nA nB)
+        positions (unscan-raster zigzag coeffs)]
+    {:raster (mapv (fn [pos]
+                      (let [level (nth positions pos)]
+                        (if (zero? level) 0 (bit-shift-right (+ (* level (quant/ac-qmul qp (quot pos 4) (mod pos 4))) 32) 6))))
+                    (range 16))
+     :total-coeff total-coeff}))
+
+;; --- coded_block_pattern (§9.1.2 Table 9-4, ME(v) mapping) — the codeNum
+;;     read via a plain ue(v) is mapped through this fixed table to the
+;;     actual CodedBlockPattern value (CodedBlockPatternChroma*16 +
+;;     CodedBlockPatternLuma). Only the INTER column is needed — this
+;;     repo's decoder never reaches the Intra_4x4/Intra_8x8 CBP-mapping
+;;     case (mb_type 0/I_NxN throws, see `i16x16-mb-info`; Intra16x16
+;;     mb_types infer their CBP from mb_type directly, no ME(v) read at
+;;     all). Transcribed from FFmpeg's `ff_h264_golomb_to_inter_cbp`
+;;     (`libavcodec/h264data.c`, https://github.com/FFmpeg/FFmpeg) — a
+;;     direct transcription of ITU-T H.264 Table 9-4's Inter column for
+;;     ChromaArrayType 1/2 — cross-checked to be a full permutation of
+;;     0..47 (`(= (sort golomb-to-inter-cbp) (range 48))`)."
+(def golomb-to-inter-cbp
+  [0 16 1 2 4 8 32 3 5 10 12 15 47 7 11 13
+   14 6 9 31 35 37 42 44 33 34 36 40 39 43 45 46
+   17 18 20 24 19 21 26 28 23 27 29 30 22 25 38 41])
+
+(defn- read-coded-block-pattern-inter!
+  "Read `coded_block_pattern` (§7.3.5.1, `me(v)`) for an INTER macroblock:
+   a plain ue(v) codeNum, mapped via `golomb-to-inter-cbp`. Returns
+   {:cbp-luma (0..15, one bit per 8x8 luma quadrant — NOT inferred from
+   mb_type the way Intra16x16's is, see `i16x16-mb-info`) :cbp-chroma
+   (0..2)}."
+  [r]
+  (let [cbp (nth golomb-to-inter-cbp (eg/ue! r))]
+    {:cbp-luma (mod cbp 16) :cbp-chroma (quot cbp 16)}))
+
+;; --- coded_block_pattern, INTRA column (§9.1.2 Table 9-4's
+;;     Intra_4x4/Intra_8x8 column for ChromaArrayType 1/2) — a DIFFERENT
+;;     permutation than `golomb-to-inter-cbp` above. Reading the inter
+;;     table for an I_NxN macroblock does not throw and does not desync
+;;     immediately: it yields a WRONG but structurally valid cbp, so the
+;;     decoder reads the wrong NUMBER of residual blocks and the bit reader
+;;     desyncs a few blocks later with plausible-looking garbage. This
+;;     table is only reachable from `read-coded-block-pattern-intra!`
+;;     (I_NxN); Intra_16x16 mb_types still infer their cbp from mb_type
+;;     itself (`i16x16-mb-info`) and read no me(v) at all. Transcribed from
+;;     FFmpeg's `ff_h264_golomb_to_intra4x4_cbp` (`libavcodec/h264data.c`),
+;;     a direct transcription of Table 9-4's Intra column; like the inter
+;;     table it is cross-checked at load time to be a full permutation of
+;;     0..47 (see `cbp-tables-are-permutations`, asserted in
+;;     test/h264/decode_test.cljk) — a transcription typo that duplicated or
+;;     dropped a value would otherwise only show up as a decode mismatch.
+(def golomb-to-intra-cbp
+  [47 31 15  0 23 27 29 30  7 11 13 14 39 43 45 46
+   16  3  5 10 12 19 21 26 28 35 37 42 44  1  2  4
+    8 17 18 20 24  6  9 22 25 32 33 34 36 40 38 41])
+
+(defn- read-coded-block-pattern-intra!
+  "Read `coded_block_pattern` (§7.3.5.1, `me(v)`) for an I_NxN (Intra_4x4)
+   macroblock: a plain ue(v) codeNum mapped via `golomb-to-intra-cbp`.
+   Returns the same {:cbp-luma :cbp-chroma} shape as
+   `read-coded-block-pattern-inter!`."
+  [r]
+  (let [cbp (nth golomb-to-intra-cbp (eg/ue! r))]
+    {:cbp-luma (mod cbp 16) :cbp-chroma (quot cbp 16)}))
+
+(defn- decode-chroma-dc!
+  "Decode one ChromaArrayType 1 (4:2:0) chroma DC block (nC==-1, maxNumCoeff
+   4). Returns {:dc-quad (4-elem vector, RASTER order idx=row*2+col — see
+   `h264.transform/chroma-dc-hadamard`) :total-coeff int}."
+  [r qpc]
+  (let [{:keys [coeffs total-coeff]} (cavlc/residual-block! r :chroma-dc 4)
+        dc-quad (transform/chroma-dc-hadamard coeffs (quant/dc-qmul qpc))]
+    {:dc-quad dc-quad :total-coeff total-coeff}))
+
+(defn- decode-chroma-dc-cabac!
+  "CABAC counterpart of `decode-chroma-dc!`. `nA`/`nB` are the already-
+   derived per-COMPONENT (Cb or Cr — coded_block_flag context OFFSET is
+   shared between Cb/Cr, see `h264.cabac/cat-params`, but the neighbor
+   lookup is per-component) `coded_block_flag` neighbor booleans."
+  [eng ctxs nA nB qpc]
+  (let [{:keys [coeffs total-coeff]} (cabac/residual-block! eng ctxs :chroma-dc nA nB)
+        dc-quad (transform/chroma-dc-hadamard coeffs (quant/dc-qmul qpc))]
+    {:dc-quad dc-quad :total-coeff total-coeff}))
+
+(defn- clip8 [v] (max 0 (min 255 v)))
+
+(defn- decode-chroma-ac-blocks!
+  "Read the 4 chroma AC 4x4 blocks (`cbp-chroma` == 2) for ONE component
+   from reader `r`, given that component's already-decoded `dc-quad`
+   (RASTER order, see `decode-chroma-dc!`/`h264.transform/chroma-dc-hadamard`).
+   If `cbp-chroma` < 2, no bits are read and `block-coeffs` is just the DC
+   values overlaid onto otherwise-zero 4x4 arrays.
+
+   IMPORTANT bitstream-order note (§7.3.5.3.3 `residual_block_cavlc`/
+   ffmpeg's `ff_h264_decode_mb_cavlc`): the actual NAL bit order for an
+   Intra_16x16 macroblock's chroma residual is [Cb DC, Cr DC, Cb AC x4, Cr
+   AC x4] — ALL DC blocks (both components) before ANY AC blocks, NOT
+   [Cb DC, Cb AC x4, Cr DC, Cr AC x4] (i.e. NOT fully decoding one
+   component before starting the other). This fn intentionally does ONLY
+   the AC read for a single component — callers (`h264.decode/decode-macroblock!`)
+   MUST call `decode-chroma-dc!` for BOTH components first, THEN call this
+   fn for both components, to match that order. Getting this wrong
+   silently desyncs the bit reader partway through the FIRST macroblock
+   that has real chroma AC residual (`cbp-chroma` == 2) — caught via a real
+   multi-macroblock color-gradient golden vector during development (DC-
+   only fixtures don't exercise this order at all).
+
+   The 4 chroma 4x4 sub-blocks use `chroma-blk->col-row` (plain raster
+   order — NOT the same block-index convention as luma's `blk->col-row`,
+   see that def's docstring for the empirical mismatch this caused).
+   `dc-quad` is ALSO raster order (idx = row*2+col), so with
+   `chroma-blk->col-row` the two indices coincide (`b == row*2+col`) —
+   overlaying a block's DC value is a direct `(nth dc-quad b)`, no
+   remapping needed.
+
+   Returns {:block-coeffs (4-elem vector of 16-elem row-major coefficient
+   arrays) :ac-nnz (4-elem vec, this component's per-block total_coeff —
+   feeds neighbor `nC` derivation for MBs to the right/below)}."
+  [r qpc cbp-chroma dc-quad left-c top-c]
+  (let [ac-nnz (atom (vec (repeat 4 0)))
+        block-coeffs
+        (if (< cbp-chroma 2)
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-quad b)))
+                (range 4))
+          (mapv
+           (fn [b]
+             (let [[col row] (chroma-blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @ac-nnz (chroma-col-row->blk [(dec col) row]))
+                        (when left-c (nth (:ac-nnz left-c) (chroma-col-row->blk [1 row]))))
+                   nB (if (pos? row)
+                        (nth @ac-nnz (chroma-col-row->blk [col (dec row)]))
+                        (when top-c (nth (:ac-nnz top-c) (chroma-col-row->blk [col 1]))))
+                   nc (neighbor-nc nA nB)
+                   {:keys [ac-raster total-coeff]} (decode-ac-block! r nc qpc)]
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-quad b))))
+           (range 4)))]
+    {:block-coeffs block-coeffs :ac-nnz @ac-nnz}))
+
+(defn- decode-chroma-ac-blocks-cabac!
+  "CABAC counterpart of `decode-chroma-ac-blocks!`. Unlike CAVLC's nC
+   (an average of neighbor total_coeff), CABAC's `coded_block_flag` neighbor
+   term is a plain boolean (`total_coeff > 0`), with a DIFFERENT
+   unavailable-neighbor default — NOT unconditionally `true`: per
+   OpenH264's `ParseCbfInfoCabac` (`nA = nB =
+   !!IS_INTRA(pMbType[iCurrBlkXy])` — the CURRENT macroblock's OWN
+   intra/inter-ness, not the neighbor's), the default is `true` ONLY when
+   THIS macroblock is intra, `false` when THIS macroblock is inter — this
+   fn is shared by BOTH `decode-intra-macroblock-body-cabac!` (always
+   passes `intra?` true) and `decode-inter-16x16-macroblock-cabac!`
+   (always passes `intra?` false), so it CANNOT hardcode the old
+   intra-only-scope default the way this fn's I-slice-only predecessor
+   could (see ADR-2607122000 P-slice CABAC increment's own root-cause
+   note: an earlier version of this fn — and the analogous luma-block
+   unavailable-default in `decode-inter-16x16-macroblock-cabac!` — DID
+   hardcode `true` unconditionally, copied from the intra-only path
+   without adjusting for the inter case, causing real multi-macroblock
+   content to decode a wrong `coded_block_flag` context state whenever an
+   inter macroblock had an unavailable neighbor — caught via a real
+   libx264 CABAC P-slice fixture whose reconstructed pixels were
+   plausible-shaped but numerically wrong compared to ffmpeg's own
+   decode). Mirrors `decode-chroma-ac-blocks!`'s cross-block-boundary
+   neighbor-derivation STRUCTURE exactly (same `chroma-blk->col-row`/
+   `chroma-col-row->blk` traversal) but cannot reuse `neighbor-nc`
+   (CAVLC-specific nil-means-0 default)."
+  [eng ctxs intra? qpc cbp-chroma dc-quad left-c top-c]
+  (let [ac-nnz (atom (vec (repeat 4 0)))
+        cbf-cache (atom (vec (repeat 4 false)))
+        block-coeffs
+        (if (< cbp-chroma 2)
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-quad b)))
+                (range 4))
+          (mapv
+           (fn [b]
+             (let [[col row] (chroma-blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @cbf-cache (chroma-col-row->blk [(dec col) row]))
+                        (if left-c (pos? (nth (:ac-nnz left-c) (chroma-col-row->blk [1 row]))) intra?))
+                   nB (if (pos? row)
+                        (nth @cbf-cache (chroma-col-row->blk [col (dec row)]))
+                        (if top-c (pos? (nth (:ac-nnz top-c) (chroma-col-row->blk [col 1]))) intra?))
+                   {:keys [ac-raster total-coeff]} (decode-ac-block-cabac! eng ctxs :chroma-ac nA nB qpc)]
+               (swap! cbf-cache assoc b (pos? total-coeff))
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-quad b))))
+           (range 4)))]
+    {:block-coeffs block-coeffs :ac-nnz @ac-nnz}))
+
+(defn- add-residual-16x16
+  "Pure (no bit reads) residual reconstruction for a 16x16 luma macroblock:
+   overlay each of the 16 `block-coeffs` 4x4 blocks' inverse-transformed
+   residual onto the corresponding 4x4 region of `pred-16x16` (a 16x16
+   row-vector grid — from Intra_16x16 prediction for intra macroblocks, OR
+   from motion-compensated reference-frame pixels for inter macroblocks —
+   this fn doesn't care which, it's pure pixel-domain reconstruction).
+   Shared by `decode-intra-macroblock-body!` and the P-slice inter
+   macroblock path (`decode-inter-16x16-macroblock!`)."
+  [pred-16x16 block-coeffs]
+  (reduce
+   (fn [recon b]
+     (let [[col row] (blk->col-row b)
+           pred4x4 (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in pred-16x16 [(+ (* row 4) ry) (+ (* col 4) rx)])))))
+           residual (transform/inverse-4x4 (nth block-coeffs b))]
+       (reduce
+        (fn [recon ry]
+          (reduce
+           (fn [recon rx]
+             (let [v (clip8 (+ (get-in pred4x4 [ry rx]) (get-in residual [ry rx])))]
+               (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)] v)))
+           recon (range 4)))
+        recon (range 4))))
+   (vec (repeat 16 (vec (repeat 16 0))))
+   (range 16)))
+
+(defn- add-residual-8x8
+  "Pure (no bit reads) residual reconstruction for an 8x8 chroma component:
+   the SAME overlay as `add-residual-16x16`, just 4 blocks over an 8x8 grid
+   (chroma's `chroma-blk->col-row` raster convention) instead of 16 over a
+   16x16 grid. Shared by `reconstruct-chroma-plane` (intra) and the
+   P-slice inter macroblock path."
+  [pred-8x8 block-coeffs]
+  (reduce
+   (fn [recon b]
+     (let [[col row] (chroma-blk->col-row b)
+           pred4x4 (vec (for [ry (range 4)] (vec (for [rx (range 4)] (get-in pred-8x8 [(+ (* row 4) ry) (+ (* col 4) rx)])))))
+           residual (transform/inverse-4x4 (nth block-coeffs b))]
+       (reduce
+        (fn [recon ry]
+          (reduce
+           (fn [recon rx]
+             (let [v (clip8 (+ (get-in pred4x4 [ry rx]) (get-in residual [ry rx])))]
+               (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)] v)))
+           recon (range 4)))
+        recon (range 4))))
+   (vec (repeat 8 (vec (repeat 8 0))))
+   (range 4)))
+
+(defn- reconstruct-chroma-plane
+  "Pure (no bit reads) Intra_Chroma prediction + residual reconstruction
+   for ONE 8x8 chroma component, given its already-decoded `block-coeffs`
+   (from `decode-chroma-ac-blocks!`). `pred-mode` is per
+   `h264.intra-pred/predict-chroma-8x8`'s mode numbering. `left-c`/`top-c`
+   are the neighbor MB's SAME-component chroma state (nil at picture
+   edges) — {:top-row (8-elem vec) :left-col (8-elem vec)}; `corner` is
+   the diagonal top-left MB's bottom-right pixel of this SAME component
+   (only used/required for Plane mode, `pred-mode` 3).
+
+   Returns {:recon (8x8 row-vector grid) :top-row (8-elem vec, this MB's
+   bottom row) :left-col (8-elem vec, this MB's right col)}."
+  [block-coeffs pred-mode left-c top-c corner]
+  (let [top-row (:top-row top-c)
+        left-col (:left-col left-c)
+        pred-8x8 (intra-pred/predict-chroma-8x8 pred-mode
+                                                 {:top-available? (some? top-c)
+                                                  :left-available? (some? left-c)
+                                                  :top-row top-row
+                                                  :left-col left-col
+                                                  :corner corner})
+        recon (add-residual-8x8 pred-8x8 block-coeffs)]
+    {:recon recon
+     :top-row (nth recon 7)
+     :left-col (mapv #(nth % 7) recon)}))
+
+(defn- decode-intra-macroblock-body!
+  "Decode one Intra_16x16 macroblock (luma + chroma) from reader `r`, given
+   an ALREADY-READ `mb-type` (this fn does NOT itself read the mb_type
+   ue(v) — callers differ in how mb_type is obtained/numbered: an I-slice
+   reads it directly (`decode-macroblock!` below), a P-slice reads a
+   P-mb_type first and derives the intra mb_type as `p-mb-type - 5`
+   per Table 7-13, see `decode-macroblock-p!` in the P-slice section
+   below). `qp` is this MB's QPy (already resolved by the caller from
+   slice_qp + running mb_qp_delta). `chroma-qp-index-offset` is PPS
+   `chroma_qp_index_offset` (see `h264.quant/chroma-qp`; applied to BOTH
+   Cb and Cr, see that fn's docstring for why). `left-mb`/`top-mb` are the
+   neighbor MB states (or nil if unavailable — picture edge), carrying
+   BOTH luma (`:dc-nnz`/`:ac-nnz`/`:top-row`/`:left-col`) and per-component
+   chroma (`:cb`/`:cr`, each {:ac-nnz :top-row :left-col}) neighbor state —
+   this works identically whether a neighbor MB was itself intra or inter,
+   see `add-residual-16x16`/`add-residual-8x8`'s shared-reconstruction
+   design note. `topleft-mb` is the diagonal top-left neighbor MB state
+   (or nil), used ONLY for chroma Plane mode's corner sample (raster-scan
+   single-slice decode guarantees it's already reconstructed whenever both
+   `left-mb` and `top-mb` are available, see
+   `h264.intra-pred/chroma-plane-grid`). Returns {:recon (16x16 luma
+   row-vector grid) :cb :cr (8x8 chroma row-vector grids) :dc-nnz :ac-nnz
+   (luma) :inter? false :mv nil ...}."
+  [r mb-type qp chroma-qp-index-offset left-mb top-mb topleft-mb]
+  (let [{:keys [pred-mode cbp-luma cbp-chroma]} (i16x16-mb-info mb-type)
+        intra-chroma-pred-mode (eg/ue! r)
+        mb-qp-delta (eg/se! r)
+        ;; §7.4.5: QPy = ((QPy,PREV + mb_qp_delta + 52 + 2*QpBdOffsetY) %
+        ;; (52 + QpBdOffsetY)) - QpBdOffsetY — modulo-52 WRAP, not plain
+        ;; addition (QpBdOffsetY=0 for this repo's 8-bit-only scope). A
+        ;; large negative mb_qp_delta (legal per spec, range -26..+25 for
+        ;; 8-bit) can otherwise push qp' negative or >51, which doesn't
+        ;; desync the bitstream (QP doesn't gate any CAVLC read) but DOES
+        ;; silently produce a wrong dequant scale.
+        qp' (mod (+ qp mb-qp-delta 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        ;; §9.2.1 nC derivation for the Intra16x16 luma DC block: per
+        ;; ffmpeg's `decode_residual`/`pred_non_zero_count` (and the spec's
+        ;; §6.4.11.4 neighbouring-4x4-luma-block process), the DC block is
+        ;; positioned at 4x4 luma block index 0 for NEIGHBOR-DERIVATION
+        ;; purposes — its nC uses the SAME neighbor cells as luma AC block 0
+        ;; (left neighbor MB's block [3,0], top neighbor MB's block [0,3]),
+        ;; i.e. `:ac-nnz`, NOT a separate DC-total-coeff channel. This is
+        ;; NOT obvious from a naive reading (there being both a per-MB
+        ;; :dc-nnz already in this state map invites reusing it directly),
+        ;; but ffmpeg explicitly stores the DC block's own total_coeff into
+        ;; a dedicated cache slot that NO neighbor-derivation read ever
+        ;; consults — and when cbp_luma is 0 (DC-only, no AC), ffmpeg
+        ;; explicitly zero-fills the AC nnz cache for the WHOLE macroblock
+        ;; (`decode_luma_residual`'s `else` branch), so a neighbor MB's
+        ;; contribution to nC is 0 in that case regardless of how many
+        ;; nonzero DC coefficients that neighbor actually had. Using
+        ;; `:dc-nnz` here (the DC block's own total-coeff) instead of
+        ;; `:ac-nnz` at block [3,0]/[0,3] silently selects the WRONG
+        ;; coeff_token VLC nC-class and desyncs the CAVLC bit reader on the
+        ;; very next macroblock that has any real neighbor-derived DC nC —
+        ;; caught via a real multi-macroblock x264 stream where MB0 had
+        ;; cbp_luma=15 (dc-total-coeff=4, ac-nnz[3,0]=0) and MB1 read the
+        ;; DC block with the wrong nc (4, i.e. VLC class 2) instead of the
+        ;; correct nc (0, class 0).
+        dc-nc (neighbor-nc (when left-mb (nth (:ac-nnz left-mb) (col-row->blk [3 0])))
+                            (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [0 3]))))
+        dc-decoded (decode-luma-dc! r dc-nc qp')
+        dc-per-block (:dc-per-block dc-decoded)
+        dc-total-coeff (:total-coeff dc-decoded)
+        ac-nnz (atom (vec (repeat 16 0)))
+        block-coeffs
+        (if (zero? cbp-luma)
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-per-block b))) (range 16))
+          (mapv
+           (fn [b]
+             (let [[col row] (blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @ac-nnz (col-row->blk [(dec col) row]))
+                        (when left-mb (nth (:ac-nnz left-mb) (col-row->blk [3 row]))))
+                   nB (if (pos? row)
+                        (nth @ac-nnz (col-row->blk [col (dec row)]))
+                        (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [col 3]))))
+                   nc (neighbor-nc nA nB)
+                   {:keys [ac-raster total-coeff]} (decode-ac-block! r nc qp')]
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-per-block b))))
+           (range 16)))
+        top-row (:top-row top-mb)
+        left-col (:left-col left-mb)
+        pred-16x16 (intra-pred/predict-16x16 pred-mode
+                                              {:top-available? (some? top-mb)
+                                               :left-available? (some? left-mb)
+                                               :top-row top-row
+                                               :left-col left-col})
+        recon (add-residual-16x16 pred-16x16 block-coeffs)
+        ;; Bitstream order (§7.3.5.3.3 / ffmpeg `ff_h264_decode_mb_cavlc`):
+        ;; Cb DC, Cr DC, Cb AC x4, Cr AC x4 — NOT Cb(DC+AC) then Cr(DC+AC).
+        ;; See `decode-chroma-ac-blocks!`'s docstring for why this matters.
+        cb-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        cr-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-corner (get-in topleft-mb [:cb :recon 7 7])
+        cr-corner (get-in topleft-mb [:cr :recon 7 7])
+        cb-recon (reconstruct-chroma-plane cb-block-coeffs intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr-recon (reconstruct-chroma-plane cr-block-coeffs intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)
+        cb (assoc cb-recon :ac-nnz cb-ac-nnz)
+        cr (assoc cr-recon :ac-nnz cr-ac-nnz)]
+    {:recon recon
+     :qp qp'
+     :pred-mode pred-mode
+     :intra-chroma-pred-mode intra-chroma-pred-mode
+     :dc-nnz dc-total-coeff
+     :ac-nnz @ac-nnz
+     :inter? false
+     :mv nil
+     :top-row (nth recon 15)
+     :left-col (mapv #(nth % 15) recon)
+     :cb cb
+     :cr cr}))
+
+;; --- CABAC intra macroblock decode (ADR-2607122000 CABAC increment,
+;;     main/high-profile entropy coding — I-slice/Intra_16x16 ONLY, see
+;;     `h264.cabac`'s namespace docstring for exact scope). Mirrors
+;;     `decode-intra-macroblock-body!` structure exactly (same intra
+;;     prediction / inverse-transform / reconstruction calls — ONLY the
+;;     entropy decode + neighbor-derivation differ, since CABAC's
+;;     `coded_block_flag` neighbor term is a plain boolean with a DIFFERENT
+;;     unavailable-neighbor default than CAVLC's nC, see `h264.cabac`). ---
+
+(defn- decode-intra-macroblock-body-cabac!
+  "Decode one Intra_16x16 macroblock (luma + chroma) via CABAC from engine
+   `eng`/context vector `ctxs` (see `h264.cabac/init-engine!`/
+   `init-contexts`). `qp` is this MB's INCOMING QPy (running qp, same
+   convention as `decode-intra-macroblock-body!`); `last-dqp` is the
+   PREVIOUS macroblock's `mb_qp_delta` (slice-level running state,
+   §9.3.3.1.1.5's ctxIdxInc for `mb_qp_delta`'s own first bin — reset to 0
+   at slice start). `left-mb`/`top-mb`/`topleft-mb` are the SAME neighbor
+   MB-state shape `decode-intra-macroblock-body!` produces/consumes (this
+   repo's CABAC scope never mixes CAVLC/CABAC neighbors within one picture,
+   since entropy mode is a whole-PPS/whole-stream choice, but the STATE
+   SHAPE is intentionally identical so `add-residual-16x16`/
+   `reconstruct-chroma-plane`/plane assembly are shared unchanged).
+
+   Returns {:state (same shape `decode-intra-macroblock-body!` returns, plus
+   `:dc-nnz` on the `:cb`/`:cr` submaps for this fn's OWN chroma-DC
+   `coded_block_flag` neighbor derivation) :dqp (this MB's own mb_qp_delta,
+   for the NEXT macroblock's ctxIdxInc)}."
+  [eng ctxs qp last-dqp chroma-qp-index-offset left-mb top-mb topleft-mb]
+  (let [left-avail? (some? left-mb)
+        top-avail? (some? top-mb)
+        mb-type (cabac/read-mb-type-i! eng ctxs left-avail? top-avail?)
+        {:keys [pred-mode cbp-luma cbp-chroma]} (i16x16-mb-info mb-type)
+        cipr-nA (boolean (and left-mb (pos? (:intra-chroma-pred-mode left-mb)) (<= (:intra-chroma-pred-mode left-mb) 3)))
+        cipr-nB (boolean (and top-mb (pos? (:intra-chroma-pred-mode top-mb)) (<= (:intra-chroma-pred-mode top-mb) 3)))
+        intra-chroma-pred-mode (cabac/read-intra-chroma-pred-mode! eng ctxs cipr-nA cipr-nB)
+        dqp (cabac/read-mb-qp-delta! eng ctxs (not (zero? last-dqp)))
+        ;; §7.4.5 modulo-52 QP wrap — same as the CAVLC path, see that fn's
+        ;; own comment for why plain addition is wrong.
+        qp' (mod (+ qp dqp 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        dc-nA (if left-mb (pos? (:dc-nnz left-mb)) true)
+        dc-nB (if top-mb (pos? (:dc-nnz top-mb)) true)
+        dc-decoded (decode-luma-dc-cabac! eng ctxs dc-nA dc-nB qp')
+        dc-per-block (:dc-per-block dc-decoded)
+        dc-total-coeff (:total-coeff dc-decoded)
+        ac-nnz (atom (vec (repeat 16 0)))
+        cbf-cache (atom (vec (repeat 16 false)))
+        block-coeffs
+        (if (zero? cbp-luma)
+          (mapv (fn [b] (assoc (vec (repeat 16 0)) 0 (nth dc-per-block b))) (range 16))
+          (mapv
+           (fn [b]
+             (let [[col row] (blk->col-row b)
+                   nA (if (pos? col)
+                        (nth @cbf-cache (col-row->blk [(dec col) row]))
+                        (if left-mb (pos? (nth (:ac-nnz left-mb) (col-row->blk [3 row]))) true))
+                   nB (if (pos? row)
+                        (nth @cbf-cache (col-row->blk [col (dec row)]))
+                        (if top-mb (pos? (nth (:ac-nnz top-mb) (col-row->blk [col 3]))) true))
+                   {:keys [ac-raster total-coeff]} (decode-ac-block-cabac! eng ctxs :luma-ac nA nB qp')]
+               (swap! cbf-cache assoc b (pos? total-coeff))
+               (swap! ac-nnz assoc b total-coeff)
+               (assoc ac-raster 0 (nth dc-per-block b))))
+           (range 16)))
+        top-row (:top-row top-mb)
+        left-col (:left-col left-mb)
+        pred-16x16 (intra-pred/predict-16x16 pred-mode
+                                              {:top-available? (some? top-mb)
+                                               :left-available? (some? left-mb)
+                                               :top-row top-row
+                                               :left-col left-col})
+        recon (add-residual-16x16 pred-16x16 block-coeffs)
+        cb-dc-nA (if left-mb (pos? (get-in left-mb [:cb :dc-nnz] 0)) true)
+        cb-dc-nB (if top-mb (pos? (get-in top-mb [:cb :dc-nnz] 0)) true)
+        cr-dc-nA (if left-mb (pos? (get-in left-mb [:cr :dc-nnz] 0)) true)
+        cr-dc-nB (if top-mb (pos? (get-in top-mb [:cr :dc-nnz] 0)) true)
+        cb-dc-decoded (when (pos? cbp-chroma) (decode-chroma-dc-cabac! eng ctxs cb-dc-nA cb-dc-nB qpc))
+        cr-dc-decoded (when (pos? cbp-chroma) (decode-chroma-dc-cabac! eng ctxs cr-dc-nA cr-dc-nB qpc))
+        cb-dc-quad (if cb-dc-decoded (:dc-quad cb-dc-decoded) [0 0 0 0])
+        cr-dc-quad (if cr-dc-decoded (:dc-quad cr-dc-decoded) [0 0 0 0])
+        cb-dc-total (if cb-dc-decoded (:total-coeff cb-dc-decoded) 0)
+        cr-dc-total (if cr-dc-decoded (:total-coeff cr-dc-decoded) 0)
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks-cabac! eng ctxs true qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks-cabac! eng ctxs true qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-corner (get-in topleft-mb [:cb :recon 7 7])
+        cr-corner (get-in topleft-mb [:cr :recon 7 7])
+        cb-recon (reconstruct-chroma-plane cb-block-coeffs intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr-recon (reconstruct-chroma-plane cr-block-coeffs intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)
+        cb (assoc cb-recon :ac-nnz cb-ac-nnz :dc-nnz cb-dc-total)
+        cr (assoc cr-recon :ac-nnz cr-ac-nnz :dc-nnz cr-dc-total)]
+    {:state {:recon recon
+             :qp qp'
+             :pred-mode pred-mode
+             :intra-chroma-pred-mode intra-chroma-pred-mode
+             :dc-nnz dc-total-coeff
+             :ac-nnz @ac-nnz
+             :inter? false
+             :mv nil
+             :top-row (nth recon 15)
+             :left-col (mapv #(nth % 15) recon)
+             :cb cb
+             :cr cr}
+     :dqp dqp}))
+
+(defn- decode-i-slice-mbs-cabac!
+  "Decode all macroblocks of a single CABAC I-slice covering the whole
+   picture (§7.3.4 `slice_data()`'s `entropy_coding_mode_flag` branch,
+   specialized to this repo's single-slice-per-picture / I-slice-only CABAC
+   scope). Byte-aligns `r` (`cabac_alignment_one_bit`) and initializes the
+   arithmetic engine + context models (from SliceQPY, §9.3.1.1.1) ONCE for
+   the whole slice, then decodes macroblocks in raster order, each followed
+   by a `decode_terminate!` (`end_of_slice_flag`) — REQUIRED after every
+   macroblock regardless of this repo's own `num-mb` bookkeeping, since
+   DecodeTerminate mutates the engine's `codIRange`/`codIOffset` (§9.3.3.2.4)
+   and skipping it would desync the NEXT macroblock's first bin. Asserts
+   (throws) that `end_of_slice_flag` fires EXACTLY at the picture's last
+   macroblock, not before or after — a real bitstream/implementation bug
+   would otherwise silently produce a truncated or overrun picture."
+  [r slice-qp chroma-qp-index-offset mb-width mb-height]
+  (cabac/byte-align! r)
+  (let [eng (cabac/init-engine! r)
+        ctxs (cabac/init-contexts slice-qp)
+        num-mb (* mb-width mb-height)]
+    (loop [addr 0 qp slice-qp last-dqp 0 states []]
+      (if (= addr num-mb)
+        states
+        (let [mb-x (mod addr mb-width)
+              mb-y (quot addr mb-width)
+              left-mb (when (pos? mb-x) (nth states (dec addr)))
+              top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+              topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+              {:keys [state dqp]} (decode-intra-macroblock-body-cabac! eng ctxs qp last-dqp chroma-qp-index-offset left-mb top-mb topleft-mb)
+              eos (cabac/decode-terminate! eng)
+              next-addr (inc addr)]
+          (when (and (= eos 1) (not= next-addr num-mb))
+            (throw (ex-info "h264.decode: CABAC end_of_slice_flag fired before the picture's macroblock count was reached (desync?)"
+                             {:addr addr :num-mb num-mb})))
+          (when (and (zero? eos) (= next-addr num-mb))
+            (throw (ex-info "h264.decode: CABAC end_of_slice_flag did not fire at the picture's last macroblock (desync?)"
+                             {:addr addr :num-mb num-mb})))
+          (recur next-addr (:qp state) dqp (conj states state)))))))
+
+;; --- Intra_4x4 (mb_type 0 = I_NxN with transform_size_8x8_flag 0) —
+;;     §7.3.5.1/§7.4.5 syntax, §8.3.1 decoding process. CAVLC only (see
+;;     `decode-intra-4x4-macroblock-body!`'s docstring for exactly what is
+;;     in and out of scope). ---
+
+(defn- i4x4-topright-available?
+  "§6.4.11.4 / Figure 6-10: is the 4x4 luma block ABOVE-RIGHT of block
+   index `b` (grid position [col row]) available as a prediction-sample
+   source at the moment block `b` is reconstructed?
+
+   The answer depends on THREE different things and collapsing any two of
+   them is the classic Intra_4x4 bug:
+   - `row` 0, `col` < 3 → the above-right samples come from the TOP
+     macroblock's bottom row, one 4x4 to the right: available iff a top
+     macroblock exists.
+   - `row` 0, `col` 3 → they come from the ABOVE-RIGHT macroblock
+     (mbAddrC), a fourth neighbour this repo's Intra_16x16 path never
+     needed: available iff that macroblock exists (`mb-y` > 0 AND `mb-x` <
+     mb-width-1 in raster-scan single-slice decode).
+   - `row` > 0 → they come from THIS macroblock, from the block at
+     [col+1, row-1] — available iff that block has ALREADY been
+     reconstructed, i.e. its block index is less than `b` in the Figure
+     6-10 Z-order decode order (`blk->col-row`). For `col` 3 the position
+     is past the macroblock's own right edge and the macroblock to the
+     right does not exist yet in raster order, so it is never available.
+
+   Working this out from the Z-order gives exactly the well-known
+   permanently-unavailable set #{3 7 11 13 15} for the `row` > 0 case,
+   which is a useful cross-check but NOT a substitute for the derivation:
+   the `row` == 0 cases are availability-dependent, not constant."
+  [b col row top-mb topright-mb]
+  (cond
+    (and (zero? row) (< col 3)) (some? top-mb)
+    (zero? row) (some? topright-mb)
+    (= col 3) false
+    :else (< (col-row->blk [(inc col) (dec row)]) b)))
+
+(defn- i4x4-neighbour-block
+  "The 13 §8.3.1.2 neighbouring luma samples for the 4x4 block at grid
+   position [col row] of the macroblock currently being reconstructed into
+   `recon` (a 16x16 row-major grid, positions belonging to not-yet-decoded
+   blocks still zero — never read, by construction of the availability
+   rules). Neighbour macroblock state maps carry `:top-row` (their bottom
+   16 luma pixels) and `:left-col` (their rightmost 16), the SAME keys the
+   Intra_16x16 path already produces, so nothing new is stored per
+   macroblock for this.
+
+   Returns the argument map `h264.intra-pred/predict-4x4` consumes; the
+   unavailable channels are nil so a mode that reads them fails loudly
+   instead of silently predicting from zeros."
+  [recon b col row left-mb top-mb topleft-mb topright-mb]
+  (let [x0 (* col 4) y0 (* row 4)
+        left-av? (or (pos? col) (some? left-mb))
+        top-av? (or (pos? row) (some? top-mb))
+        tl-av? (cond (and (pos? col) (pos? row)) true
+                     (pos? row) (some? left-mb)
+                     (pos? col) (some? top-mb)
+                     :else (some? topleft-mb))
+        tr-av? (i4x4-topright-available? b col row top-mb topright-mb)]
+    {:top-available? top-av?
+     :left-available? left-av?
+     :topleft-available? (boolean tl-av?)
+     :top-right-available? (boolean tr-av?)
+     :top (when top-av?
+            (if (pos? row)
+              (mapv #(get-in recon [(dec y0) (+ x0 %)]) (range 4))
+              (mapv #(nth (:top-row top-mb) (+ x0 %)) (range 4))))
+     :top-right (when tr-av?
+                  (cond
+                    (pos? row) (mapv #(get-in recon [(dec y0) (+ x0 4 %)]) (range 4))
+                    (< col 3) (mapv #(nth (:top-row top-mb) (+ x0 4 %)) (range 4))
+                    :else (mapv #(nth (:top-row topright-mb) %) (range 4))))
+     :left (when left-av?
+             (if (pos? col)
+               (mapv #(get-in recon [(+ y0 %) (dec x0)]) (range 4))
+               (mapv #(nth (:left-col left-mb) (+ y0 %)) (range 4))))
+     :topleft (when tl-av?
+                (cond (and (pos? col) (pos? row)) (get-in recon [(dec y0) (dec x0)])
+                      (pos? row) (nth (:left-col left-mb) (dec y0))
+                      (pos? col) (nth (:top-row top-mb) (dec x0))
+                      :else (get-in topleft-mb [:recon 15 15])))}))
+
+(defn- neighbour-i4x4-mode
+  "§8.3.1.1's `intraMxMPredModeN` for ONE neighbour (A = left 4x4 block, B =
+   above 4x4 block) of the block at grid position [col row].
+
+   The two ways this goes wrong, both of which produce a decodable-but-wrong
+   picture rather than a desync (the pred-mode syntax elements are
+   fixed-length, so a wrong DERIVED mode does not move the bit reader — it
+   only mis-predicts pixels, which is why this needs a real ffmpeg
+   comparison and not a round-trip test):
+   1. Returning the neighbour's stored mode when the neighbour macroblock
+      is NOT I_NxN. A macroblock coded Intra_16x16 (or inter) has no
+      Intra4x4PredMode at all and the spec substitutes DC (2). Storing
+      `nil` for those and letting `min` see it would be a different bug
+      again, so `:i4x4-modes` being absent is mapped to 2 explicitly here.
+   2. Applying `dcPredModePredictedFlag` per-neighbour. It is a SINGLE
+      flag: if EITHER neighbouring macroblock is unavailable, BOTH
+      intraMxMPredModeA and intraMxMPredModeB become 2 — not just the
+      missing one. `predIntra4x4PredMode` is `min` of the two, so getting
+      this wrong changes the result whenever the available neighbour's own
+      mode is below 2.
+
+   `constrained-intra-pred?` (PPS) additionally makes an INTER-coded
+   neighbour count as unavailable here. In this repo's scope I_NxN only
+   occurs in I-slices, where every macroblock is intra, so that clause is
+   currently unreachable; it is implemented rather than asserted-away
+   because it costs one `and` and its absence would be a silent wrong
+   answer the day I_NxN is wired into the P-slice path."
+  [own-modes col row left-mb top-mb constrained-intra-pred?]
+  (let [usable? (fn [mb] (and (some? mb)
+                              (not (and constrained-intra-pred? (:inter? mb)))))
+        a-mb-avail? (or (pos? col) (usable? left-mb))
+        b-mb-avail? (or (pos? row) (usable? top-mb))
+        dc-predicted? (or (not a-mb-avail?) (not b-mb-avail?))
+        mode-of (fn [mb blk]
+                  (if-let [modes (:i4x4-modes mb)] (nth modes blk) 2))]
+    (if dc-predicted?
+      2
+      (min (if (pos? col)
+             (nth own-modes (col-row->blk [(dec col) row]))
+             (mode-of left-mb (col-row->blk [3 row])))
+           (if (pos? row)
+             (nth own-modes (col-row->blk [col (dec row)]))
+             (mode-of top-mb (col-row->blk [col 3])))))))
+
+(defn- read-i4x4-pred-modes!
+  "Read the 16 `prev_intra4x4_pred_mode_flag` / `rem_intra4x4_pred_mode`
+   pairs of §7.3.5.1's `mb_pred()` and resolve each into a final
+   Intra4x4PredMode (§8.3.1.1's `Intra4x4PredMode[luma4x4BlkIdx]`).
+
+   These are read for ALL 16 blocks up front, in Figure 6-10 block order,
+   BEFORE `intra_chroma_pred_mode` and before `coded_block_pattern` — the
+   per-block reconstruction that consumes them happens much later
+   (`reconstruct-i4x4-luma`). Resolution cannot be deferred though: block
+   b's `predIntra4x4PredMode` depends on blocks b-1 and b-4's already
+   RESOLVED modes, so the fold has to carry them.
+
+   Returns a 16-element vector indexed by luma4x4BlkIdx."
+  [r left-mb top-mb constrained-intra-pred?]
+  (reduce
+   (fn [modes b]
+     (let [[col row] (blk->col-row b)
+           predicted (neighbour-i4x4-mode modes col row left-mb top-mb constrained-intra-pred?)
+           prev-flag (eg/bit! r)
+           mode (if (= 1 prev-flag)
+                  predicted
+                  (let [rem (eg/bits! r 3)]
+                    (if (< rem predicted) rem (inc rem))))]
+       (assoc modes b mode)))
+   (vec (repeat 16 2))
+   (range 16)))
+
+(defn- reconstruct-i4x4-luma
+  "§8.3.1's per-block reconstruction loop: for luma4x4BlkIdx 0..15 IN BLOCK
+   ORDER, predict the 4x4 block from the samples already reconstructed
+   (`i4x4-neighbour-block`), add its inverse-transformed residual, and
+   write it back before moving on.
+
+   This sequencing is the whole difference from `add-residual-16x16`, which
+   predicts the entire macroblock once and can therefore add its 16 residual
+   blocks in any order. Here block 1 predicts from block 0's RECONSTRUCTED
+   pixels, so the loop is genuinely sequential and cannot be reordered or
+   parallelised across the 16 blocks."
+  [modes block-coeffs left-mb top-mb topleft-mb topright-mb]
+  (reduce
+   (fn [recon b]
+     (let [[col row] (blk->col-row b)
+           nb (i4x4-neighbour-block recon b col row left-mb top-mb topleft-mb topright-mb)
+           pred (intra-pred/predict-4x4 (nth modes b) nb)
+           residual (transform/inverse-4x4 (nth block-coeffs b))]
+       (reduce
+        (fn [recon ry]
+          (reduce
+           (fn [recon rx]
+             (assoc-in recon [(+ (* row 4) ry) (+ (* col 4) rx)]
+                       (clip8 (+ (get-in pred [ry rx]) (get-in residual [ry rx])))))
+           recon (range 4)))
+        recon (range 4))))
+   (vec (repeat 16 (vec (repeat 16 0))))
+   (range 16)))
+
+(defn- reject-intra-8x8!
+  "Refuse an I_NxN macroblock that MIGHT be Intra_8x8 (§8.3.2) rather than
+   Intra_4x4 (§8.3.1).
+
+   The two share one mb_type (0, I_NxN) and are told apart by
+   `transform_size_8x8_flag`, present in `macroblock_layer()` only when the
+   PPS carries `transform_8x8_mode_flag`. That PPS field sits after
+   `more_rbsp_data()` and `h264.pps` documents itself as not parsing it, so
+   for a stream where it COULD be set this decoder cannot see which of the
+   two an I_NxN macroblock is. It only exists in the High-Profile family, so
+   the refusal is keyed on the SPS `profile_idc`: Baseline/Main streams
+   cannot carry the flag at all and their I_NxN unambiguously means
+   Intra_4x4.
+
+   Intra_8x8 is deliberately not half-implemented — it needs the 8x8 integer
+   transform and the §8.3.2.2 reference-sample low-pass filter, neither of
+   which exists in this repo — so this is a refusal with a pinned reason,
+   not a fallback to the 4x4 modes (which would decode an Intra_8x8
+   macroblock into plausible-looking garbage)."
+  [profile-idc]
+  (when (contains? sps/high-profile-family profile-idc)
+    (throw (ex-info "h264.decode: I_NxN in a High-Profile-family stream is not supported (transform_size_8x8_flag / Intra_8x8 cannot be ruled out)"
+                    {:profile-idc profile-idc
+                     :reason "Intra_8x8 (transform_size_8x8_flag) not implemented"}))))
+
+(defn- decode-intra-4x4-macroblock-body!
+  "Decode one I_NxN / Intra_4x4 macroblock (mb_type 0 in an I-slice) from
+   CAVLC reader `r`, given an already-read mb_type.
+
+   ## In scope
+   All nine §8.3.1.2 Intra_4x4 luma prediction modes, the §8.3.1.1
+   neighbour-derived `predIntra4x4PredMode`, the §7.3.5.1
+   `prev_intra4x4_pred_mode_flag`/`rem_intra4x4_pred_mode` syntax, Table
+   9-4's INTRA `coded_block_pattern` mapping, and 16 full 4x4 residual
+   blocks (`decode-regular-block!`, maxNumCoeff 16 — I_NxN has NO
+   macroblock-level luma DC/Hadamard block, exactly like an inter
+   macroblock and unlike Intra_16x16). Chroma is UNCHANGED — I_NxN affects
+   the luma prediction structure only, so `decode-chroma-dc!`/
+   `decode-chroma-ac-blocks!`/`reconstruct-chroma-plane` are reused
+   verbatim.
+
+   ## Out of scope, and rejected rather than approximated
+   - **Intra_8x8 (§8.3.2)** — the OTHER thing mb_type 0 can mean. It needs
+     the 8x8 integer transform and the §8.3.2.2 reference-sample low-pass
+     filter, i.e. a genuinely separate feature, not a variation on this
+     one. It is signalled by `transform_size_8x8_flag`, which is only
+     present when the PPS carries `transform_8x8_mode_flag` — a High
+     Profile field that `h264.pps` documents itself as not parsing (it sits
+     after `more_rbsp_data()`). This function therefore rejects I_NxN
+     up-front for any High-Profile-family stream, where that flag COULD be
+     set and we cannot see it, rather than assuming Intra_4x4 and
+     mis-decoding an Intra_8x8 macroblock into plausible garbage. For a
+     Baseline/Main stream the flag cannot be present at all and I_NxN
+     unambiguously means Intra_4x4.
+   - **CABAC-coded I_NxN** — `mb_type`, the pred-mode flags and
+     `coded_block_pattern` all have their own CABAC context models
+     (§9.3.3.1.1.x) that `h264.cabac` does not implement; the CABAC I-slice
+     path still rejects mb_type 0 via `i16x16-mb-info`. Stated follow-up,
+     not a silent gap.
+
+   `topright-mb` is the ABOVE-RIGHT neighbour macroblock state — a fourth
+   neighbour the Intra_16x16 path never needed (see
+   `i4x4-topright-available?`).
+
+   Returns the same state shape `decode-intra-macroblock-body!` returns,
+   plus `:i4x4-modes` (16-element vector of Intra4x4PredMode, consumed by
+   the NEXT macroblock's `neighbour-i4x4-mode`) and `:pred-mode` nil (an
+   I_NxN macroblock has no Intra_16x16 prediction mode — nil rather than a
+   plausible 2, so `:mb-pred-modes` cannot be misread as 'DC everywhere')."
+  [r qp chroma-qp-index-offset profile-idc constrained-intra-pred?
+   left-mb top-mb topleft-mb topright-mb]
+  (reject-intra-8x8! profile-idc)
+  (let [modes (read-i4x4-pred-modes! r left-mb top-mb constrained-intra-pred?)
+        intra-chroma-pred-mode (eg/ue! r)
+        {:keys [cbp-luma cbp-chroma]} (read-coded-block-pattern-intra! r)
+        ;; §7.3.5: for I_NxN, mb_qp_delta and residual() are present ONLY
+        ;; when the cbp is non-zero (unlike Intra_16x16, whose mb_qp_delta
+        ;; is unconditional because it always carries a luma DC block).
+        any-residual? (or (pos? cbp-luma) (pos? cbp-chroma))
+        mb-qp-delta (if any-residual? (eg/se! r) 0)
+        qp' (mod (+ qp mb-qp-delta 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        ac-nnz (atom (vec (repeat 16 0)))
+        block-coeffs
+        (mapv
+         (fn [b]
+           (let [[col row] (blk->col-row b)]
+             (if-not (bit-test cbp-luma (quot b 4))
+               (vec (repeat 16 0))
+               (let [nA (if (pos? col)
+                          (nth @ac-nnz (col-row->blk [(dec col) row]))
+                          (when left-mb (nth (:ac-nnz left-mb) (col-row->blk [3 row]))))
+                     nB (if (pos? row)
+                          (nth @ac-nnz (col-row->blk [col (dec row)]))
+                          (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [col 3]))))
+                     nc (neighbor-nc nA nB)
+                     {:keys [raster total-coeff]} (decode-regular-block! r nc qp')]
+                 (swap! ac-nnz assoc b total-coeff)
+                 raster))))
+         (range 16))
+        recon (reconstruct-i4x4-luma modes block-coeffs left-mb top-mb topleft-mb topright-mb)
+        cb-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        cr-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-corner (get-in topleft-mb [:cb :recon 7 7])
+        cr-corner (get-in topleft-mb [:cr :recon 7 7])
+        cb-recon (reconstruct-chroma-plane cb-block-coeffs intra-chroma-pred-mode (:cb left-mb) (:cb top-mb) cb-corner)
+        cr-recon (reconstruct-chroma-plane cr-block-coeffs intra-chroma-pred-mode (:cr left-mb) (:cr top-mb) cr-corner)]
+    {:recon recon
+     :qp qp'
+     :pred-mode nil
+     :i4x4? true
+     :i4x4-modes modes
+     :intra-chroma-pred-mode intra-chroma-pred-mode
+     :dc-nnz 0
+     :ac-nnz @ac-nnz
+     :inter? false
+     :mv nil
+     :top-row (nth recon 15)
+     :left-col (mapv #(nth % 15) recon)
+     :cb (assoc cb-recon :ac-nnz cb-ac-nnz)
+     :cr (assoc cr-recon :ac-nnz cr-ac-nnz)}))
+
+(defn- decode-macroblock!
+  "I-slice entry point: read `mb_type` directly (I-slice numbering per Table
+   7-11 — 0 = I_NxN, 1..24 = Intra_16x16, 25 = I_PCM) and dispatch on it.
+
+   mb_type 0 (I_NxN) is the Intra_4x4 path (`decode-intra-4x4-macroblock-body!`);
+   1..24 keep the Intra_16x16 path unchanged. 25 (I_PCM) still throws, via
+   `i16x16-mb-info`. The two paths differ in almost every syntax element
+   after mb_type — pred modes, `coded_block_pattern`'s me(v) table, whether
+   `mb_qp_delta` is unconditional, and whether there is a macroblock-level
+   luma DC block at all — so the dispatch is here rather than inside a
+   shared body."
+  [r qp chroma-qp-index-offset profile-idc constrained-intra-pred?
+   left-mb top-mb topleft-mb topright-mb]
+  (let [mb-type (eg/ue! r)]
+    (if (zero? mb-type)
+      (decode-intra-4x4-macroblock-body! r qp chroma-qp-index-offset profile-idc
+                                          constrained-intra-pred?
+                                          left-mb top-mb topleft-mb topright-mb)
+      (decode-intra-macroblock-body! r mb-type qp chroma-qp-index-offset left-mb top-mb topleft-mb))))
+
+;; --- P-slice inter prediction (ADR-2607122000 Migration step 7:
+;;     P_Skip + P_L0_16x16, with real sub-pel/non-zero motion compensation
+;;     via h264.interp (§8.4.2.2.1/8.4.2.2.2); Migration step 7's
+;;     sub-partition increment adds P_16x8/P_8x16/P_8x8 (sub_mb_type
+;;     P_L0_8x8 only) below — see namespace docstring's "Pixel decode:
+;;     P-slice (inter)" section below for full scope). ---
+
+(defn- mvf [mv ref-idx] {:mv mv :ref-idx ref-idx})
+
+(defn- uniform-mv-field
+  "A 4-quadrant `:mv-field` (TL/TR/BL/BR, quadrant idx = qcol + 2*qrow) where
+   every quadrant shares the SAME `mv`/ref-idx 0 — the shape every
+   whole-16x16-partition inter mb_type (`P_Skip`/`P_L0_16x16`) carries, so
+   sub-partition-aware neighbor derivation (`mb-quadrant-mv` below) can treat
+   ALL inter macroblocks uniformly regardless of whether they're actually
+   sub-partitioned."
+  [mv]
+  (vec (repeat 4 (mvf mv 0))))
+
+(defn- mv-field->vec
+  "Convert a fully-decided `own-mv-field` map (quadrant-idx -> {:mv
+   :ref-idx}, built up by `read-partition-mv!` across a macroblock's
+   partitions — see `decode-inter-16x8-macroblock!`/
+   `decode-inter-8x16-macroblock!`/`decode-inter-8x8-macroblock!`) into the
+   4-element VECTOR shape (index = quadrant-idx) every macroblock state's
+   `:mv-field` key uses (matching `uniform-mv-field`'s own return shape, so
+   `mb-quadrant-mv`'s `(nth (:mv-field mb) q)` works identically regardless
+   of whether the neighbor was a whole-16x16 partition or sub-partitioned)."
+  [m]
+  (mapv #(get m %) (range 4)))
+
+(defn- median3 [a b c] (- (+ a b c) (min a b c) (max a b c)))
+
+(defn- mb-quadrant-mv
+  "{:mv :ref-idx} for neighbor macroblock state `mb` (nil = unavailable) at
+   8x8-quadrant index `q` (0=TL,1=TR,2=BL,3=BR = qcol + 2*qrow), per
+   §8.4.1.3.2's neighbouring-partition availability rule: an unavailable
+   MB address, an intra-coded MB, or (this repo's single-reference/no-
+   B-slice scope) any non-predFlag partition all uniformly contribute
+   ref-idx -1 / mv [0 0] — intra macroblocks are NOT motion-compensated
+   candidates, spec-mandated. Cross-checked against FFmpeg's
+   `mb-quadrant-mv`-equivalent neighbour reads in `pred_motion`/
+   `pred_pskip_motion` (`libavcodec/h264_mvpred.h`), which likewise always
+   address a SPECIFIC 4x4/8x8 sub-position of a neighbor MB rather than
+   treating the whole neighbor as one value — this only produces a
+   DIFFERENT result than reading a flat per-MB `:mv` once a neighbor is
+   itself sub-partitioned (`P_16x8`/`P_8x16`/`P_8x8`, see below), since
+   every mb_type this repo supported BEFORE this increment has a uniform
+   `:mv-field` (`uniform-mv-field`) where every quadrant already agrees."
+  [mb q]
+  (if (and mb (:inter? mb)) (nth (:mv-field mb) q) (mvf [0 0] -1)))
+
+(defn- classify-4x4
+  "(bx4,by4) — 4x4-luma-block-unit offsets relative to the CURRENT
+   macroblock's top-left corner, each in -1..4 — -> [slot quadrant-idx],
+   where slot is :self/:left/:top/:topleft/:topright/:none. :none means the
+   target macroblock address does NOT exist yet in raster-scan decode
+   order: the ONLY case reachable in this repo's scope is (4,by) with
+   by in 0..3 (same picture ROW, one macroblock to the right of current —
+   raster order hasn't decoded it yet). This must be distinguished from a
+   neighbor that EXISTS but is intra-coded (which contributes ref-idx -1
+   directly via `mb-quadrant-mv`, WITHOUT the §8.4.1.3.1 mbAddrC->mbAddrD
+   substitution `neighbor-abc` performs only for :none) — cross-checked
+   against FFmpeg's `fetch_diagonal_mv` (`libavcodec/h264_mvpred.h`), whose
+   `topright_ref != PART_NOT_AVAILABLE` substitution guard is keyed on
+   MACROBLOCK-ADDRESS availability, not on the neighbor's intra/inter-ness."
+  [bx4 by4]
+  (cond
+    (and (<= 0 bx4 3) (<= 0 by4 3)) [:self (+ (quot bx4 2) (* 2 (quot by4 2)))]
+    (and (= bx4 -1) (<= 0 by4 3)) [:left (+ 1 (* 2 (quot by4 2)))]
+    (and (<= 0 bx4 3) (= by4 -1)) [:top (+ (quot bx4 2) 2)]
+    (and (= bx4 -1) (= by4 -1)) [:topleft 3]
+    (and (= bx4 4) (= by4 -1)) [:topright 2]
+    :else [:none -1]))
+
+(defn- slot-value
+  [slot q own-mv-field left-mb top-mb topleft-mb topright-mb]
+  (case slot
+    :self (get own-mv-field q (mvf [0 0] -1))
+    :none (mvf [0 0] -1)
+    :left (mb-quadrant-mv left-mb q)
+    :top (mb-quadrant-mv top-mb q)
+    :topleft (mb-quadrant-mv topleft-mb q)
+    :topright (mb-quadrant-mv topright-mb q)))
+
+(defn- slot-addr-exists?
+  [slot left-mb top-mb topleft-mb topright-mb]
+  (case slot
+    :self true
+    :none false
+    :left (some? left-mb)
+    :top (some? top-mb)
+    :topleft (some? topleft-mb)
+    :topright (some? topright-mb)))
+
+(defn- neighbor-abc
+  "General §8.4.1.3.1 A/B/C derivation (with the mbAddrC -> mbAddrD
+   substitution) for a partition at 4x4-luma-block-unit position (x4,y4)
+   size (w4,h4) — x4,y4 in #{0,2}, w4,h4 in #{2,4} for every partition
+   shape this repo supports (16x16/16x8/8x16/8x8). `own-mv-field` is a
+   PARTIAL map (quadrant-idx -> {:mv :ref-idx}) of THIS macroblock's own
+   already-decided partitions (earlier in the fixed TL/TR/BL/BR decode
+   order §7.3.5.2's `sub_mb_pred`/§7.4.5.2's mbPartIdx order both use) —
+   always sufficient for any A/B/C that lands inside the CURRENT macroblock
+   given these 4 shapes: A and B, when internal, always reference an
+   EARLIER quadrant in that order; the one same-row 'C would need a
+   not-yet-decided same-MB quadrant' case (BR's C) instead lands ONE COLUMN
+   PAST the macroblock's own right edge — i.e. :none, not :self, via
+   `classify-4x4` — never a genuine same-MB forward reference. `_h4` (the
+   partition's own height) is accepted for call-site symmetry with
+   `mv-predict-partition` but genuinely unused here — A/B/C's positions
+   only ever depend on a partition's TOP-LEFT corner and WIDTH (never its
+   height), matching FFmpeg's own `pred_motion`/`fetch_diagonal_mv`, whose
+   analogous helpers likewise take no height parameter."
+  [own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 _h4]
+  (let [[slotA qA] (classify-4x4 (dec x4) y4)
+        [slotB qB] (classify-4x4 x4 (dec y4))
+        [slotC0 qC0] (classify-4x4 (+ x4 w4) (dec y4))
+        c-exists? (slot-addr-exists? slotC0 left-mb top-mb topleft-mb topright-mb)
+        [slotC qC] (if c-exists? [slotC0 qC0] (classify-4x4 (dec x4) (dec y4)))]
+    {:A (slot-value slotA qA own-mv-field left-mb top-mb topleft-mb topright-mb)
+     :B (slot-value slotB qB own-mv-field left-mb top-mb topleft-mb topright-mb)
+     :C (slot-value slotC qC own-mv-field left-mb top-mb topleft-mb topright-mb)}))
+
+(defn- median-mv-predict
+  "General §8.4.1.3.1 median motion-vector predictor over an already-derived
+   {:A :B :C} neighbor map (`neighbor-abc`), given this repo's single-
+   reference-frame simplification (`cur-ref-idx` is always 0). NOTE: this
+   intentionally omits the spec's additional 'B and C both address-
+   unavailable, A available -> B=C=A' substitution — in this repo's
+   single-reference-frame scope (every real inter neighbor's ref-idx is
+   ALWAYS 0, so 'available' and 'ref-idx matches' are the same condition)
+   that substitution is PROVABLY REDUNDANT: without it, an available-but-
+   unmatched-neighbor-starved A still ends up the sole `exact-matches` hit
+   below whenever B and C are both unavailable, producing the IDENTICAL
+   [mvA] result the substitution would have forced via median(A,A,A)=A —
+   verified against FFmpeg's `pred_motion` (`libavcodec/h264_mvpred.h`),
+   whose OWN analogous `match_count==0` special case is similarly
+   unreachable outside multi-reference-frame streams."
+  [{:keys [A B C]} cur-ref-idx]
+  (let [cands [A B C]
+        exact-matches (filter #(= cur-ref-idx (:ref-idx %)) cands)]
+    (if (= 1 (count exact-matches))
+      (:mv (first exact-matches))
+      [(median3 (get-in A [:mv 0]) (get-in B [:mv 0]) (get-in C [:mv 0]))
+       (median3 (get-in A [:mv 1]) (get-in B [:mv 1]) (get-in C [:mv 1]))])))
+
+(defn- mv-predict-partition
+  "General §8.4.1.3 luma motion-vector predictor for a partition at
+   4x4-luma-block-unit position (x4,y4) size (w4,h4). Dispatches to the
+   16x8/8x16 directional special cases (§8.4.1.3's own mbPartIdx-conditioned
+   bullet list: use ONE named neighbor directly when its ref-idx matches,
+   else fall through) before falling back to the general median process
+   (§8.4.1.3.1, `median-mv-predict`) shared by whole-16x16 partitions AND
+   every 8x8 sub-partition alike. Cross-checked against FFmpeg's
+   `pred_16x8_motion`/`pred_8x16_motion`/`pred_motion`
+   (`libavcodec/h264_mvpred.h`)."
+  [own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4 cur-ref-idx]
+  (let [abc (neighbor-abc own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4)]
+    (cond
+      (and (= w4 4) (= h4 2) (zero? y4)) ; P_16x8 top partition
+      (if (= cur-ref-idx (:ref-idx (:B abc))) (:mv (:B abc)) (median-mv-predict abc cur-ref-idx))
+
+      (and (= w4 4) (= h4 2) (= y4 2)) ; P_16x8 bottom partition
+      (if (= cur-ref-idx (:ref-idx (:A abc))) (:mv (:A abc)) (median-mv-predict abc cur-ref-idx))
+
+      (and (= w4 2) (= h4 4) (zero? x4)) ; P_8x16 left partition
+      (if (= cur-ref-idx (:ref-idx (:A abc))) (:mv (:A abc)) (median-mv-predict abc cur-ref-idx))
+
+      (and (= w4 2) (= h4 4) (= x4 2)) ; P_8x16 right partition
+      (if (= cur-ref-idx (:ref-idx (:C abc))) (:mv (:C abc)) (median-mv-predict abc cur-ref-idx))
+
+      :else (median-mv-predict abc cur-ref-idx)))) ; 16x16 whole MB, or any 8x8 sub-partition
+
+(defn- mv-predict-16x16
+  "Median luma motion vector prediction (§8.4.1.3) for a whole-macroblock
+   16x16 partition — the degenerate case of `mv-predict-partition` at
+   (x4=0,y4=0,w4=4,h4=4), which always dispatches straight to
+   `median-mv-predict` (16x8/8x16's special cases never match a full-width-
+   and-height partition). `left-mb`/`top-mb` are the A/B neighbor MB states
+   (nil if unavailable); `topleft-mb`/`topright-mb` are the D/C neighbors.
+   Returns [mvx mvy] (quarter-luma-sample units)."
+  [left-mb top-mb topleft-mb topright-mb cur-ref-idx]
+  (mv-predict-partition {} left-mb top-mb topleft-mb topright-mb 0 0 4 4 cur-ref-idx))
+
+(defn- p-skip-mv
+  "Predicted (and, for P_Skip, FINAL — no mvd is ever coded for P_Skip)
+   motion vector for a P_Skip macroblock, per §8.4.1.1: [0 0] if the left
+   or top neighbor is unavailable, or if either has ref-idx 0 and mv
+   [0 0] already; otherwise the general median predictor (§8.4.1.3)
+   applies. Reads the SAME quadrants (`mb-quadrant-mv`, TR-of-left/BL-of-top)
+   the general predictor's own A/B would use for a 16x16 partition — cross-
+   checked against FFmpeg's `pred_pskip_motion` (`libavcodec/h264_mvpred.h`),
+   which likewise addresses those specific quadrants rather than a flat
+   per-MB value."
+  [left-mb top-mb topleft-mb topright-mb]
+  (let [{mvA :mv refA :ref-idx} (mb-quadrant-mv left-mb 1)
+        {mvB :mv refB :ref-idx} (mb-quadrant-mv top-mb 2)]
+    (if (or (nil? left-mb) (nil? top-mb)
+            (and (= refA 0) (= mvA [0 0]))
+            (and (= refB 0) (= mvB [0 0])))
+      [0 0]
+      (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0))))
+
+(defn- place-subgrid
+  "Place a `size`x`size` sub-grid `sub` into a larger row-vector grid `acc`
+   at quadrant-unit offset (`qc`,`qr`) — i.e. pixel offset (`qc`*size,
+   `qr`*size)."
+  [acc qr qc size sub]
+  (reduce (fn [acc ry]
+            (reduce (fn [acc rx]
+                      (assoc-in acc [(+ (* qr size) ry) (+ (* qc size) rx)] (get-in sub [ry rx])))
+                    acc (range size)))
+          acc (range size)))
+
+(defn- mc-predict-quadrants
+  "Motion-compensated prediction for the macroblock at (`mb-x`,`mb-y`),
+   given a per-8x8-quadrant motion vector via `quad-mv` (a fn of [qcol qrow]
+   -> mv, quadrant coords each 0/1). Generalizes the single-mv 16x16 case to
+   `P_16x8`/`P_8x16`/`P_8x8` macroblocks, whose 4 8x8 quadrants may each
+   carry a DIFFERENT motion vector — built from 4 independent 8x8-luma/
+   4x4-chroma `h264.interp` calls. Motion compensation is a PURE per-pixel
+   function of (position, that pixel's own partition's mv) — decomposing
+   ANY of the 4 supported partition shapes into 4 uniform 8x8-quadrant calls
+   (even when 2 or 4 of them happen to share the SAME mv, as for
+   `P_16x8`/`P_8x16`/`P_L0_16x16`) produces PIXEL-IDENTICAL results to a
+   single larger-block call — no `h264.interp` changes needed, and this is
+   also how the plain 16x16 case is implemented now (`mc-predict` below)."
+  [ref-frame mb-x mb-y quad-mv]
+  (let [w (:width ref-frame) h (:height ref-frame) cw (quot w 2) ch (quot h 2)
+        lx (* mb-x 16) ly (* mb-y 16)
+        cx (* mb-x 8) cy (* mb-y 8)
+        quads (for [qr [0 1] qc [0 1]] [qc qr])
+        luma (reduce (fn [g [qc qr]]
+                       (place-subgrid g qr qc 8
+                                      (interp/mc-luma-block (:luma ref-frame) w h (+ lx (* qc 8)) (+ ly (* qr 8)) (quad-mv qc qr) 8)))
+                     (vec (repeat 16 (vec (repeat 16 0)))) quads)
+        cb (reduce (fn [g [qc qr]]
+                     (place-subgrid g qr qc 4
+                                    (interp/mc-chroma-block (:cb ref-frame) cw ch (+ cx (* qc 4)) (+ cy (* qr 4)) (quad-mv qc qr) 4)))
+                   (vec (repeat 8 (vec (repeat 8 0)))) quads)
+        cr (reduce (fn [g [qc qr]]
+                     (place-subgrid g qr qc 4
+                                    (interp/mc-chroma-block (:cr ref-frame) cw ch (+ cx (* qc 4)) (+ cy (* qr 4)) (quad-mv qc qr) 4)))
+                   (vec (repeat 8 (vec (repeat 8 0)))) quads)]
+    {:luma-pred luma :cb-pred cb :cr-pred cr}))
+
+(defn- mc-predict
+  "Motion-compensated prediction for the macroblock at (`mb-x`,`mb-y`) given
+   the ALREADY-DERIVED final motion vector `mv` (quarter-luma-sample units —
+   predictor + mvd for P_L0_16x16, or the P_Skip predictor alone; see
+   `mv-predict-16x16`/`p-skip-mv`). The single-mv degenerate case of
+   `mc-predict-quadrants` (see that fn's docstring for why decomposing into
+   4 uniform-mv 8x8 quadrant calls is pixel-identical to one 16x16 call).
+   `ref-frame` is this repo's OWN previously-decoded-picture return shape
+   ({:width :height :luma :cb :cr}). Returns {:luma-pred :cb-pred :cr-pred}
+   (row-vector grids)."
+  [ref-frame mb-x mb-y mv]
+  (mc-predict-quadrants ref-frame mb-x mb-y (fn [_ _] mv)))
+
+(defn- decode-p-skip-macroblock!
+  "Materialize one P_Skip macroblock (no bits read at all beyond the
+   `mb_skip_run` the caller already consumed — see `decode-p-slice-mbs!`):
+   derive its motion vector (`p-skip-mv`), motion-compensate via
+   `mc-predict` (sub-pel-capable — see that fn's docstring, real non-(0,0)
+   motion vectors are supported) with NO residual (a defining property of
+   P_Skip). `qp` is UNCHANGED from the previous macroblock (P_Skip never
+   reads `mb_qp_delta`)."
+  [qp mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [mv (p-skip-mv left-mb top-mb topleft-mb topright-mb)
+        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)]
+    {:recon luma-pred
+     :qp qp
+     :inter? true
+     :mv mv
+     :mv-field (uniform-mv-field mv)
+     :sub-type :p-skip
+     :ac-nnz (vec (repeat 16 0))
+     :top-row (nth luma-pred 15)
+     :left-col (mapv #(nth % 15) luma-pred)
+     :cb {:recon cb-pred :ac-nnz (vec (repeat 4 0))
+          :top-row (nth cb-pred 7) :left-col (mapv #(nth % 7) cb-pred)}
+     :cr {:recon cr-pred :ac-nnz (vec (repeat 4 0))
+          :top-row (nth cr-pred 7) :left-col (mapv #(nth % 7) cr-pred)}}))
+
+(defn- decode-inter-residual-and-reconstruct!
+  "Shared §7.3.5.1 macroblock_layer() TAIL — `coded_block_pattern` (me(v),
+   `read-coded-block-pattern-inter!`) → (if any residual is signaled)
+   `mb_qp_delta` → luma residual (16 FULL 4x4 blocks, `decode-regular-block!`,
+   maxNumCoeff 16, NOT the Intra16x16 DC/AC split — gated per-8x8-quadrant
+   by `cbp-luma`'s 4 bits, see `golomb-to-inter-cbp`) → chroma residual
+   (`decode-chroma-dc!`/`decode-chroma-ac-blocks!`, UNCHANGED — chroma's
+   DC/AC residual structure doesn't depend on the luma macroblock type OR
+   its partitioning, see README) → pixel reconstruction — for EVERY inter
+   mb_type this repo supports: `P_L0_16x16`/`P_16x8`/`P_8x16`/`P_8x8` all
+   share this EXACT syntax and semantics, since `coded_block_pattern` and
+   `residual()` don't depend on the partition structure above them at all,
+   only on the already-fully-derived per-8x8-quadrant motion-compensated
+   prediction `mc` (see `mc-predict`/`mc-predict-quadrants`). `mv-field` is
+   this MB's own already-fully-decided per-quadrant `{:mv :ref-idx}` vector
+   (returned verbatim as this state's `:mv-field`, consumed by the NEXT
+   macroblock's own `mv-predict-partition` neighbor derivation, see
+   `mb-quadrant-mv`)."
+  [r qp chroma-qp-index-offset left-mb top-mb mv-field mc]
+  (let [{:keys [luma-pred cb-pred cr-pred]} mc
+        {:keys [cbp-luma cbp-chroma]} (read-coded-block-pattern-inter! r)
+        mb-qp-delta (if (or (pos? cbp-luma) (pos? cbp-chroma)) (eg/se! r) 0)
+        qp' (mod (+ qp mb-qp-delta 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        ac-nnz (atom (vec (repeat 16 0)))
+        block-coeffs
+        (mapv
+         (fn [b]
+           (let [[col row] (blk->col-row b)
+                 quadrant (quot b 4)]
+             (if-not (bit-test cbp-luma quadrant)
+               (vec (repeat 16 0))
+               (let [nA (if (pos? col)
+                          (nth @ac-nnz (col-row->blk [(dec col) row]))
+                          (when left-mb (nth (:ac-nnz left-mb) (col-row->blk [3 row]))))
+                     nB (if (pos? row)
+                          (nth @ac-nnz (col-row->blk [col (dec row)]))
+                          (when top-mb (nth (:ac-nnz top-mb) (col-row->blk [col 3]))))
+                     nc (neighbor-nc nA nB)
+                     {:keys [raster total-coeff]} (decode-regular-block! r nc qp')]
+                 (swap! ac-nnz assoc b total-coeff)
+                 raster))))
+         (range 16))
+        recon (add-residual-16x16 luma-pred block-coeffs)
+        cb-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        cr-dc-quad (if (pos? cbp-chroma) (:dc-quad (decode-chroma-dc! r qpc)) [0 0 0 0])
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks! r qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-recon (add-residual-8x8 cb-pred cb-block-coeffs)
+        cr-recon (add-residual-8x8 cr-pred cr-block-coeffs)]
+    {:recon recon
+     :qp qp'
+     :inter? true
+     :mv-field mv-field
+     ;; Legacy single-mv reporting key — the TL quadrant's mv for a
+     ;; sub-partitioned mb_type (P_16x8/P_8x16/P_8x8 may carry DIFFERENT
+     ;; mvs per quadrant; see `:mv-field`/`:sub-type` for the real
+     ;; per-partition data, exposed via `decode-picture`'s `:mb-mv-fields`/
+     ;; `:mb-sub-types`) — identical to the whole-MB mv for P_L0_16x16.
+     :mv (:mv (nth mv-field 0))
+     :ac-nnz @ac-nnz
+     :top-row (nth recon 15)
+     :left-col (mapv #(nth % 15) recon)
+     :cb {:recon cb-recon :ac-nnz cb-ac-nnz :top-row (nth cb-recon 7) :left-col (mapv #(nth % 7) cb-recon)}
+     :cr {:recon cr-recon :ac-nnz cr-ac-nnz :top-row (nth cr-recon 7) :left-col (mapv #(nth % 7) cr-recon)}}))
+
+(defn- decode-inter-16x16-macroblock!
+  "Decode one P_L0_16x16 macroblock (§7.3.5.1's `mb_pred`/`macroblock_layer`
+   for `mb_type` 0 in a P-slice): mvd_l0 (2 se(v)) → final mv = predictor
+   (`mv-predict-16x16`) + mvd (real, possibly non-zero and/or sub-pel — see
+   `mc-predict`) → shared residual/reconstruction tail
+   (`decode-inter-residual-and-reconstruct!`). Reference-frame ref_idx is
+   implicitly 0 (this repo requires num_ref_idx_l0_active == 1, see
+   `h264.slice`), so no ref_idx is read (matches spec's
+   `if (num_ref_idx_l0_active_minus1 > 0) ...` gate)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [mvp (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0)
+        mvd-x (eg/se! r)
+        mvd-y (eg/se! r)
+        mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
+        mc (mc-predict ref-frame mb-x mb-y mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (uniform-mv-field mv) mc)]
+    (assoc state :sub-type :p-l0-16x16)))
+
+;; --- P-slice sub-partitioned inter prediction (ADR-2607122000 Migration
+;;     step 7's sub-partition increment): P_16x8/P_8x16 (mb_type 1/2, two
+;;     16x8 or 8x16 partitions, each with its own motion vector) and P_8x8
+;;     (mb_type 3, four 8x8 partitions) — but, for P_8x8, ONLY sub_mb_type
+;;     P_L0_8x8 (no further split within an 8x8 partition; sub_mb_type
+;;     1/2/3 = P_L0_8x4/P_L0_4x8/P_L0_4x4 throw explicitly, matching this
+;;     repo's throw-on-unsupported discipline). `mb_type` 4 (P_8x8ref0)
+;;     ALSO throws — this repo's single-reference-frame scope
+;;     (num_ref_idx_l0_active == 1) makes P_8x8ref0's bitstream syntax
+;;     IDENTICAL to plain P_8x8's (ref_idx_l0 is never present in the
+;;     bitstream either way, since it's only signaled when
+;;     num_ref_idx_l0_active_minus1 > 0), but it's excluded from THIS
+;;     increment's scope regardless, per the calling task's own scope
+;;     decision — see README for the exact narrative. ---
+
+(defn- read-partition-mv!
+  "Read one partition's `mvd_l0` (2 se(v)) and derive its final motion
+   vector (`mv-predict-partition` + mvd), threading `own-mv-field` forward:
+   this partition's OWN quadrants (`quadrants`, a seq of quadrant indices it
+   covers) are assoc'd into the returned map, ready for a LATER same-MB
+   partition's own A/B/C neighbor derivation (`neighbor-abc`). Returns
+   [mv own-mv-field']."
+  [r own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4 quadrants]
+  (let [mvp (mv-predict-partition own-mv-field left-mb top-mb topleft-mb topright-mb x4 y4 w4 h4 0)
+        mvd-x (eg/se! r)
+        mvd-y (eg/se! r)
+        mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
+        own-mv-field' (reduce (fn [m q] (assoc m q (mvf mv 0))) own-mv-field quadrants)]
+    [mv own-mv-field']))
+
+(defn- decode-inter-16x8-macroblock!
+  "Decode one P_L0_L0_16x8 macroblock (`mb_type` 1 in a P-slice): 2
+   horizontal 16x8 partitions (top = quadrants TL+TR, bottom = quadrants
+   BL+BR), each with its own `mvd_l0` — read in mbPartIdx order (top then
+   bottom, §7.3.5.1's `mb_pred` loop order) — then the SAME
+   `coded_block_pattern`/residual/reconstruction tail every inter mb_type
+   uses (`decode-inter-residual-and-reconstruct!`)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [[mv-top f1] (read-partition-mv! r {} left-mb top-mb topleft-mb topright-mb 0 0 4 2 [0 1])
+        [mv-bot mv-field] (read-partition-mv! r f1 left-mb top-mb topleft-mb topright-mb 0 2 4 2 [2 3])
+        quad-mv (fn [_qc qr] (if (zero? qr) mv-top mv-bot))
+        mc (mc-predict-quadrants ref-frame mb-x mb-y quad-mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (mv-field->vec mv-field) mc)]
+    (assoc state :sub-type :p-16x8)))
+
+(defn- decode-inter-8x16-macroblock!
+  "Decode one P_L0_L0_8x16 macroblock (`mb_type` 2 in a P-slice): 2 vertical
+   8x16 partitions (left = quadrants TL+BL, right = quadrants TR+BR), each
+   with its own `mvd_l0` — read in mbPartIdx order (left then right) — then
+   the shared residual/reconstruction tail
+   (`decode-inter-residual-and-reconstruct!`)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [[mv-left f1] (read-partition-mv! r {} left-mb top-mb topleft-mb topright-mb 0 0 2 4 [0 2])
+        [mv-right mv-field] (read-partition-mv! r f1 left-mb top-mb topleft-mb topright-mb 2 0 2 4 [1 3])
+        quad-mv (fn [qc _qr] (if (zero? qc) mv-left mv-right))
+        mc (mc-predict-quadrants ref-frame mb-x mb-y quad-mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (mv-field->vec mv-field) mc)]
+    (assoc state :sub-type :p-8x16)))
+
+(defn- decode-inter-8x8-macroblock!
+  "Decode one P_8x8 macroblock (`mb_type` 3 in a P-slice): §7.3.5.2
+   `sub_mb_pred` reads all 4 `sub_mb_type` values FIRST (mbPartIdx 0..3,
+   TL/TR/BL/BR raster order — matching this repo's quadrant convention
+   throughout), THEN (since this repo's `num_ref_idx_l0_active == 1`
+   requirement means `ref_idx_l0` is NEVER present in the bitstream — the
+   SAME simplification `P_L0_16x16`/`P_16x8`/`P_8x16` already rely on)
+   loops `mvd_l0` per sub-macroblock-partition. ONLY `sub_mb_type`
+   P_L0_8x8 (value 0 — one 8x8 partition per quadrant, no further split)
+   is supported: any OTHER sub_mb_type (P_L0_8x4/P_L0_4x8/P_L0_4x4 — 1/2/
+   3) throws explicitly rather than being silently mis-decoded, matching
+   this repo's existing throw-on-unsupported discipline. Given that
+   constraint, each of the 4 quadrants has exactly ONE sub-partition MV,
+   read in the SAME TL/TR/BL/BR order the residual/mv-field machinery
+   already assumes throughout this namespace."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [sub-mb-types (mapv (fn [_] (eg/ue! r)) (range 4))
+        _ (when (some #(not= 0 %) sub-mb-types)
+            (throw (ex-info "h264.decode: only sub_mb_type P_L0_8x8 (0) is supported for P_8x8 macroblocks — P_L0_8x4/P_L0_4x8/P_L0_4x4 (further-subdivided 8x8 partitions) are out of scope"
+                             {:sub-mb-types sub-mb-types})))
+        [mv0 f1] (read-partition-mv! r {} left-mb top-mb topleft-mb topright-mb 0 0 2 2 [0])
+        [mv1 f2] (read-partition-mv! r f1 left-mb top-mb topleft-mb topright-mb 2 0 2 2 [1])
+        [mv2 f3] (read-partition-mv! r f2 left-mb top-mb topleft-mb topright-mb 0 2 2 2 [2])
+        [mv3 mv-field] (read-partition-mv! r f3 left-mb top-mb topleft-mb topright-mb 2 2 2 2 [3])
+        mvs [mv0 mv1 mv2 mv3]
+        quad-mv (fn [qc qr] (nth mvs (+ qc (* 2 qr))))
+        mc (mc-predict-quadrants ref-frame mb-x mb-y quad-mv)
+        state (decode-inter-residual-and-reconstruct! r qp chroma-qp-index-offset left-mb top-mb (mv-field->vec mv-field) mc)]
+    (assoc state :sub-type :p-8x8)))
+
+(defn- decode-macroblock-p!
+  "Decode one macroblock from a P-slice (`macroblock_layer()` after the
+   caller has already handled `mb_skip_run` — see `decode-p-slice-mbs!`).
+   Reads `mb_type` (P-slice numbering, Table 7-13): 0 = P_L0_16x16
+   (`decode-inter-16x16-macroblock!`); 1 = P_L0_L0_16x8
+   (`decode-inter-16x8-macroblock!`); 2 = P_L0_L0_8x16
+   (`decode-inter-8x16-macroblock!`); 3 = P_8x8, sub_mb_type P_L0_8x8 ONLY
+   (`decode-inter-8x8-macroblock!` — throws for any OTHER sub_mb_type); 4 =
+   P_8x8ref0 — OUT OF SCOPE, throws explicitly (this repo's
+   single-reference-frame requirement makes its bitstream syntax identical
+   to plain P_8x8's, but it's excluded from this increment's scope
+   regardless, matching this repo's existing throw-on-unsupported-mb_type
+   discipline, see `i16x16-mb-info`); >=5 = intra macroblock,
+   `intra_mb_type = p_mb_type - 5` (Table 7-13's own offset), delegated to
+   `decode-intra-macroblock-body!` (same intra decode path an I-slice would
+   use — a P-slice's intra-coded macroblocks are pixel-identical to an
+   I-slice's, see that fn's docstring)."
+  [r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [p-mb-type (eg/ue! r)]
+    (cond
+      (zero? p-mb-type)
+      (decode-inter-16x16-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 1 p-mb-type)
+      (decode-inter-16x8-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 2 p-mb-type)
+      (decode-inter-8x16-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 3 p-mb-type)
+      (decode-inter-8x8-macroblock! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+      (= 4 p-mb-type)
+      (throw (ex-info "h264.decode: P_8x8ref0 (mb_type 4) is out of scope — plain P_8x8 (mb_type 3, sub_mb_type P_L0_8x8) is supported"
+                       {:p-mb-type p-mb-type}))
+
+      :else
+      (decode-intra-macroblock-body! r (- p-mb-type 5) qp chroma-qp-index-offset left-mb top-mb topleft-mb))))
+
+(defn- decode-p-slice-mbs!
+  "Decode all macroblocks of a single P-slice covering the whole picture
+   (§7.3.4 `slice_data()`'s CAVLC/`!entropy_coding_mode_flag` branch,
+   specialized to this repo's single-slice-per-picture scope — see
+   namespace docstring). Because the slice is known in advance to cover
+   EXACTLY `mb-width * mb-height` macroblock addresses (no FMO, no
+   multi-slice), this loop doesn't need general `more_rbsp_data()` bit-
+   position tracking to know when to stop reading `mb_skip_run` vs.
+   decoding a `macroblock_layer()`: after consuming one `mb_skip_run`
+   worth of P_Skip macroblocks, either the picture is exactly full (done,
+   no trailing macroblock_layer — this happens when the LAST run of
+   macroblocks in the picture are all skipped) or it isn't (there MUST be
+   exactly one more coded macroblock_layer() at the next address, per
+   spec's `do { mb_skip_run; ...; if (moreDataFlag) macroblock_layer(); }
+   while (moreDataFlag)` structure)."
+  [r slice-qp chroma-qp-index-offset mb-width mb-height ref-frame]
+  (let [num-mb (* mb-width mb-height)]
+    (loop [addr 0 qp slice-qp states []]
+      (if (= addr num-mb)
+        states
+        (let [mb-skip-run (eg/ue! r)
+              {:keys [addr states]}
+              (loop [i 0 addr addr states states]
+                (if (= i mb-skip-run)
+                  {:addr addr :states states}
+                  (let [mb-x (mod addr mb-width) mb-y (quot addr mb-width)
+                        left-mb (when (pos? mb-x) (nth states (dec addr)))
+                        top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+                        topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+                        topright-mb (when (and (pos? mb-y) (< (inc mb-x) mb-width)) (nth states (+ (- addr mb-width) 1)))
+                        state (decode-p-skip-macroblock! qp mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)]
+                    (recur (inc i) (inc addr) (conj states state)))))]
+          (if (= addr num-mb)
+            states
+            (let [mb-x (mod addr mb-width) mb-y (quot addr mb-width)
+                  left-mb (when (pos? mb-x) (nth states (dec addr)))
+                  top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+                  topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+                  topright-mb (when (and (pos? mb-y) (< (inc mb-x) mb-width)) (nth states (+ (- addr mb-width) 1)))
+                  state (decode-macroblock-p! r qp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)]
+              (recur (inc addr) (:qp state) (conj states state)))))))))
+
+;; --- P-slice CABAC decode (ADR-2607122000 CABAC+P-slice increment) —
+;;     P_Skip + P_L0_16x16 only, mirroring the CAVLC P-slice scope directly
+;;     above (sub-partitioned inter mb_type 1..4 throw, same as CAVLC;
+;;     intra-coded macroblocks WITHIN a CABAC P-slice also throw here — a
+;;     narrower scope than the CAVLC P-slice path, which DOES decode those,
+;;     see `decode-macroblock-p!` — since this increment's own real-encoder
+;;     validation fixtures are P_Skip/P_L0_16x16-only content and adding
+;;     CABAC intra-in-P decode is a separate, not-yet-validated increment;
+;;     see README "Pixel decode: CABAC" for the precise, honest scope this
+;;     leaves out). Reuses the SAME pure motion-vector-prediction/motion-
+;;     compensation/residual-reconstruction helpers the CAVLC P-slice path
+;;     uses above (`mv-predict-16x16`/`p-skip-mv`/`mc-predict`/
+;;     `add-residual-16x16`/`add-residual-8x8`) — P_Skip's own reconstruction
+;;     has NO entropy-method dependence at all (it reads no residual bits
+;;     beyond `mb_skip_flag` itself, so `decode-p-skip-macroblock!` is called
+;;     UNCHANGED) — and the entropy-agnostic CABAC chroma residual helpers
+;;     already shared with the CABAC I-slice path above
+;;     (`decode-chroma-dc-cabac!`/`decode-chroma-ac-blocks-cabac!`). ---
+
+(defn- iabs [x] (if (neg? x) (- x) x))
+
+(defn- decode-inter-16x16-macroblock-cabac!
+  "CABAC counterpart of `decode-inter-16x16-macroblock!` (P_L0_16x16).
+   `left-mb`/`top-mb`/`topleft-mb`/`topright-mb` carry this CABAC P-slice
+   loop's OWN state shape (`decode-p-slice-mbs-cabac!`'s docstring) — the
+   SAME base shape `mv-predict-16x16`/`mc-predict` already consume
+   (`:inter?`/`:mv`/`:ac-nnz`/...), PLUS `:mvd` (this MB's own 2-component
+   `mvd_l0`, [0 0] for P_Skip/unavailable neighbors — §9.3.2.3's neighbor
+   abs-sum term is over `mvd_l0` ITSELF, not the final predicted+mvd motion
+   vector) and `:cbp-luma`/`:cbp-chroma` (this MB's own CodedBlockPattern,
+   0/0 for P_Skip — §9.3.3.1.1.4-ish's CBP context term is over the
+   NEIGHBOR's raw CBP bits, not whether it has residual in some other
+   derived sense)."
+  [eng ctxs qp last-dqp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (let [mvp (mv-predict-16x16 left-mb top-mb topleft-mb topright-mb 0)
+        nbr-abs-sum (fn [comp]
+                      (+ (if left-mb (iabs (nth (:mvd left-mb) comp)) 0)
+                         (if top-mb (iabs (nth (:mvd top-mb) comp)) 0)))
+        mvd-x (cabac/read-mvd! eng ctxs 0 (nbr-abs-sum 0))
+        mvd-y (cabac/read-mvd! eng ctxs 1 (nbr-abs-sum 1))
+        mv [(+ (first mvp) mvd-x) (+ (second mvp) mvd-y)]
+        {:keys [cbp-luma cbp-chroma]}
+        (cabac/read-coded-block-pattern-inter-cabac!
+         eng ctxs
+         (when left-mb (:cbp-luma left-mb)) (when top-mb (:cbp-luma top-mb))
+         (when left-mb (:cbp-chroma left-mb)) (when top-mb (:cbp-chroma top-mb)))
+        mb-qp-delta (if (or (pos? cbp-luma) (pos? cbp-chroma))
+                      (cabac/read-mb-qp-delta! eng ctxs (not (zero? last-dqp)))
+                      0)
+        qp' (mod (+ qp mb-qp-delta 52) 52)
+        qpc (quant/chroma-qp qp' chroma-qp-index-offset)
+        {:keys [luma-pred cb-pred cr-pred]} (mc-predict ref-frame mb-x mb-y mv)
+        cbf-cache (atom (vec (repeat 16 false)))
+        ac-nnz (atom (vec (repeat 16 0)))
+        block-coeffs
+        (mapv
+         (fn [b]
+           (let [[col row] (blk->col-row b)
+                 quadrant (quot b 4)]
+             (if-not (bit-test cbp-luma quadrant)
+               (do (swap! cbf-cache assoc b false) (vec (repeat 16 0)))
+               (let [;; §9.3.3.1.1.9's coded_block_flag unavailable-neighbor
+                     ;; default is `!!IS_INTRA(CURRENT mb)`, NOT the
+                     ;; neighbor's — this macroblock is INTER, so the
+                     ;; default is `false` here (see
+                     ;; `decode-chroma-ac-blocks-cabac!`'s docstring for the
+                     ;; real bug this fixes: an earlier version of this fn
+                     ;; hardcoded `true`, copied from the intra-only CABAC
+                     ;; path without adjusting for the inter case).
+                     nA (if (pos? col)
+                          (nth @cbf-cache (col-row->blk [(dec col) row]))
+                          (if left-mb (pos? (nth (:ac-nnz left-mb) (col-row->blk [3 row]))) false))
+                     nB (if (pos? row)
+                          (nth @cbf-cache (col-row->blk [col (dec row)]))
+                          (if top-mb (pos? (nth (:ac-nnz top-mb) (col-row->blk [col 3]))) false))
+                     {:keys [raster total-coeff]} (decode-regular-block-cabac! eng ctxs nA nB qp')]
+                 (swap! cbf-cache assoc b (pos? total-coeff))
+                 (swap! ac-nnz assoc b total-coeff)
+                 raster))))
+         (range 16))
+        recon (add-residual-16x16 luma-pred block-coeffs)
+        ;; Same current-mb-is-inter → `false` unavailable-neighbor default
+        ;; for chroma DC's own coded_block_flag (see above).
+        cb-dc-nA (if left-mb (pos? (get-in left-mb [:cb :dc-nnz] 0)) false)
+        cb-dc-nB (if top-mb (pos? (get-in top-mb [:cb :dc-nnz] 0)) false)
+        cr-dc-nA (if left-mb (pos? (get-in left-mb [:cr :dc-nnz] 0)) false)
+        cr-dc-nB (if top-mb (pos? (get-in top-mb [:cr :dc-nnz] 0)) false)
+        cb-dc-decoded (when (pos? cbp-chroma) (decode-chroma-dc-cabac! eng ctxs cb-dc-nA cb-dc-nB qpc))
+        cr-dc-decoded (when (pos? cbp-chroma) (decode-chroma-dc-cabac! eng ctxs cr-dc-nA cr-dc-nB qpc))
+        cb-dc-quad (if cb-dc-decoded (:dc-quad cb-dc-decoded) [0 0 0 0])
+        cr-dc-quad (if cr-dc-decoded (:dc-quad cr-dc-decoded) [0 0 0 0])
+        cb-dc-total (if cb-dc-decoded (:total-coeff cb-dc-decoded) 0)
+        cr-dc-total (if cr-dc-decoded (:total-coeff cr-dc-decoded) 0)
+        {cb-block-coeffs :block-coeffs cb-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks-cabac! eng ctxs false qpc cbp-chroma cb-dc-quad (:cb left-mb) (:cb top-mb))
+        {cr-block-coeffs :block-coeffs cr-ac-nnz :ac-nnz}
+        (decode-chroma-ac-blocks-cabac! eng ctxs false qpc cbp-chroma cr-dc-quad (:cr left-mb) (:cr top-mb))
+        cb-recon (add-residual-8x8 cb-pred cb-block-coeffs)
+        cr-recon (add-residual-8x8 cr-pred cr-block-coeffs)]
+    {:recon recon
+     :qp qp'
+     :inter? true
+     :skip? false
+     :mv mv
+     :mv-field (uniform-mv-field mv)
+     :mvd [mvd-x mvd-y]
+     :cbp-luma cbp-luma
+     :cbp-chroma cbp-chroma
+     :dqp mb-qp-delta
+     :ac-nnz @ac-nnz
+     :top-row (nth recon 15)
+     :left-col (mapv #(nth % 15) recon)
+     :cb {:recon cb-recon :ac-nnz cb-ac-nnz :dc-nnz cb-dc-total
+          :top-row (nth cb-recon 7) :left-col (mapv #(nth % 7) cb-recon)}
+     :cr {:recon cr-recon :ac-nnz cr-ac-nnz :dc-nnz cr-dc-total
+          :top-row (nth cr-recon 7) :left-col (mapv #(nth % 7) cr-recon)}}))
+
+(defn- decode-p-skip-macroblock-cabac!
+  "Wraps `decode-p-skip-macroblock!` (entropy-method-agnostic — a P_Skip
+   macroblock reads NO residual bits at all, only this loop's own
+   `mb_skip_flag`) with this CABAC P-slice loop's extra neighbor-context
+   bookkeeping keys: `:skip?` true, `:mvd` [0 0] (P_Skip never signals an
+   `mvd_l0`, regardless of its own — possibly nonzero — PREDICTED motion
+   vector, see `h264.cabac/read-mvd!`'s docstring), `:cbp-luma`/
+   `:cbp-chroma` 0 (a skipped macroblock has no residual by definition,
+   matching CAVLC's own equivalent convention for `read-coded-block-pattern-inter!`-
+   style neighbor derivation), `:dqp` 0 (P_Skip never reads `mb_qp_delta`;
+   OpenH264's own skip-macroblock handling explicitly resets
+   `iLastDeltaQp` to 0, not merely leaves it unchanged — see
+   `decode-p-slice-mbs-cabac!`'s docstring)."
+  [qp mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame]
+  (assoc (decode-p-skip-macroblock! qp mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+         :skip? true :mvd [0 0] :cbp-luma 0 :cbp-chroma 0 :dqp 0))
+
+(defn- decode-p-slice-mbs-cabac!
+  "Decode all macroblocks of a single CABAC-coded P-slice covering the
+   whole picture (§7.3.4 `slice_data()`'s `entropy_coding_mode_flag`
+   branch, P/SP-slice case). UNLIKE CAVLC's run-length `mb_skip_run`, CABAC
+   reads one context-coded `mb_skip_flag` bin PER macroblock address (see
+   `h264.cabac/read-mb-skip-flag!`), then (if not skipped) a full
+   `macroblock_layer()`; `end_of_slice_flag` (`decode_terminate!`) is read
+   after EVERY address regardless of skip/not-skip — same
+   asserted-exactly-at-the-last-address discipline as
+   `decode-i-slice-mbs-cabac!` above. Byte-aligns `r`
+   (`cabac_alignment_one_bit`) and initializes the arithmetic engine +
+   context models from `slice-qp`/`cabac-init-idc` (§9.3.1.1.1 — P-slice
+   uses ONE of 3 `cabac_init_idc`-selected columns, unlike I-slice's single
+   fixed column, see `h264.cabac/init-contexts`) ONCE for the whole slice.
+
+   Threads `last-dqp` (the running \"previous macroblock's own
+   `mb_qp_delta`\" state `mb_qp_delta`'s OWN ctxIdxInc depends on) forward
+   from EVERY macroblock's `:dqp` — 0 for P_Skip and zero-CBP P_L0_16x16
+   (matching OpenH264's `decode_slice.cpp`'s explicit `iLastDeltaQp =
+   uiCbp==0 ? 0 : iLastDeltaQp` / skip-branch `iLastDeltaQp = 0` resets),
+   the actual decoded delta otherwise.
+
+   Only `P_Skip` and `P_L0_16x16` (mb_type 0) are supported — sub-
+   partitioned inter (mb_type 1..4) throws (matching the CAVLC P-slice
+   path's own scope); intra-coded macroblocks within this CABAC P-slice
+   ALSO throw (a narrower scope than the CAVLC P-slice path, which does
+   decode those — see this fn's own \"what's NOT implemented\" note in the
+   preceding comment block)."
+  [r slice-qp cabac-init-idc chroma-qp-index-offset mb-width mb-height ref-frame]
+  (cabac/byte-align! r)
+  (let [eng (cabac/init-engine! r)
+        ctxs (cabac/init-contexts slice-qp :p cabac-init-idc)
+        num-mb (* mb-width mb-height)]
+    (loop [addr 0 qp slice-qp last-dqp 0 states []]
+      (if (= addr num-mb)
+        states
+        (let [mb-x (mod addr mb-width)
+              mb-y (quot addr mb-width)
+              left-mb (when (pos? mb-x) (nth states (dec addr)))
+              top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+              topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+              topright-mb (when (and (pos? mb-y) (< (inc mb-x) mb-width)) (nth states (+ (- addr mb-width) 1)))
+              left-coded? (boolean (and left-mb (not (:skip? left-mb))))
+              top-coded? (boolean (and top-mb (not (:skip? top-mb))))
+              skip? (= 1 (cabac/read-mb-skip-flag! eng ctxs left-coded? top-coded?))
+              state (if skip?
+                      (decode-p-skip-macroblock-cabac! qp mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+                      (let [p-mb-type (cabac/read-mb-type-p! eng ctxs)]
+                        (cond
+                          (zero? p-mb-type)
+                          (decode-inter-16x16-macroblock-cabac! eng ctxs qp last-dqp chroma-qp-index-offset mb-x mb-y left-mb top-mb topleft-mb topright-mb ref-frame)
+
+                          (contains? #{1 2 3 4} p-mb-type)
+                          (throw (ex-info "h264.decode: only P_L0_16x16 (mb_type 0) is supported for CABAC P-slice inter macroblocks — P_L0_L0_16x8/P_L0_L0_8x16/P_8x8/P_8x8ref0 (sub-partitioned motion) are out of scope"
+                                           {:p-mb-type p-mb-type :addr addr}))
+
+                          :else
+                          (throw (ex-info "h264.decode: intra-coded macroblocks within a CABAC P-slice are not yet supported (CAVLC P-slices DO support this — see decode-macroblock-p!)"
+                                           {:p-mb-type p-mb-type :addr addr})))))
+              eos (cabac/decode-terminate! eng)
+              next-addr (inc addr)]
+          (when (and (= eos 1) (not= next-addr num-mb))
+            (throw (ex-info "h264.decode: CABAC end_of_slice_flag fired before the picture's macroblock count was reached (desync?)"
+                             {:addr addr :num-mb num-mb})))
+          (when (and (zero? eos) (= next-addr num-mb))
+            (throw (ex-info "h264.decode: CABAC end_of_slice_flag did not fire at the picture's last macroblock (desync?)"
+                             {:addr addr :num-mb num-mb})))
+          (recur next-addr (:qp state) (:dqp state) (conj states state)))))))
+
+(defn- decode-picture
+  "Shared per-picture decode body — parses ONE slice header + macroblock
+   loop + luma/Cb/Cr plane assembly — for BOTH I-slice pictures
+   (`decode-idr-frame`) and P-slice pictures (`decode-gop`), added as part
+   of the P-slice/inter-prediction increment (ADR-2607122000 Migration
+   step 7). `ref-frame` is the IMMEDIATELY PRECEDING decoded picture (this
+   fn's OWN return shape, {:width :height :luma :cb :cr, ...} — reused
+   directly as the single reference frame for a P-slice's motion
+   compensation); REQUIRED (non-nil) for P-slices, ignored for I-slices."
+  [sps-map pps-map slice-u ref-frame]
+  (let [_ (when (pos? (mod (:width sps-map) 16))
+            (throw (ex-info "h264.decode: width must be a multiple of 16 (no frame-cropping support)" {:width (:width sps-map)})))
+        _ (when (pos? (mod (:height sps-map) 16))
+            (throw (ex-info "h264.decode: height must be a multiple of 16 (no frame-cropping support)" {:height (:height sps-map)})))
+        _ (when (not= 1 (:chroma-format-idc sps-map))
+            (throw (ex-info "h264.decode: only chroma_format_idc=1 (4:2:0) chroma decode is supported"
+                             {:chroma-format-idc (:chroma-format-idc sps-map)})))
+        mb-width (quot (:width sps-map) 16)
+        mb-height (quot (:height sps-map) 16)
+        slice-rbsp (rbsp/unescape (:bytes slice-u))
+        r (eg/reader slice-rbsp)
+        _ (eg/bits! r 8) ; NAL header
+        header (slice/parse-header! r sps-map pps-map (:nal-unit-type slice-u) (:nal-ref-idc slice-u))
+        slice-class (:slice-type-class header)
+        _ (when-not (contains? #{:i :p} slice-class)
+            (throw (ex-info "h264.decode: only I-slice or P-slice supported (B/SP/SI are out of scope)"
+                             {:slice-type (:slice-type header) :slice-type-class slice-class})))
+        _ (when (and (= slice-class :p) (nil? ref-frame))
+            (throw (ex-info "h264.decode: a P-slice requires a previously-decoded reference frame" {})))
+        _ (when-not (zero? (:first-mb-in-slice header))
+            (throw (ex-info "h264.decode: only a single slice covering the whole picture (first_mb_in_slice=0) is supported"
+                             {:first-mb-in-slice (:first-mb-in-slice header)})))
+        entropy-mode (:entropy-coding-mode pps-map)
+        num-mb (* mb-width mb-height)
+        chroma-qp-index-offset (:chroma-qp-index-offset pps-map)
+        mb-states
+        (case entropy-mode
+          :cabac
+          (case slice-class
+            :i (decode-i-slice-mbs-cabac! r (:slice-qp header) chroma-qp-index-offset mb-width mb-height)
+            ;; ADR-2607122000 CABAC+P-slice increment (P_Skip/P_L0_16x16
+            ;; only, see decode-p-slice-mbs-cabac!'s docstring for exactly
+            ;; what's covered/what still throws).
+            :p (decode-p-slice-mbs-cabac! r (:slice-qp header) (:cabac-init-idc header) chroma-qp-index-offset mb-width mb-height ref-frame))
+          :cavlc
+          (case slice-class
+            :i (loop [addr 0 qp (:slice-qp header) states []]
+                 (if (= addr num-mb)
+                   states
+                   (let [mb-x (mod addr mb-width)
+                         mb-y (quot addr mb-width)
+                         left-mb (when (pos? mb-x) (nth states (dec addr)))
+                         top-mb (when (pos? mb-y) (nth states (- addr mb-width)))
+                         topleft-mb (when (and (pos? mb-x) (pos? mb-y)) (nth states (- addr mb-width 1)))
+                         ;; mbAddrC (above-right) — needed ONLY by Intra_4x4,
+                         ;; whose blocks at grid row 0 / col 3 read p[4..7,-1]
+                         ;; out of this macroblock (see
+                         ;; `i4x4-topright-available?`). The Intra_16x16 path
+                         ;; never referenced it.
+                         topright-mb (when (and (pos? mb-y) (< mb-x (dec mb-width)))
+                                       (nth states (- addr mb-width -1)))
+                         state (decode-macroblock! r qp chroma-qp-index-offset
+                                                   (:profile-idc sps-map)
+                                                   (:constrained-intra-pred? pps-map)
+                                                   left-mb top-mb topleft-mb topright-mb)]
+                     (recur (inc addr) (:qp state) (conj states state)))))
+            :p (decode-p-slice-mbs! r (:slice-qp header) chroma-qp-index-offset mb-width mb-height ref-frame)))
+        w (:width sps-map) h (:height sps-map)
+        cw (quot w 2) ch (quot h 2)
+        assemble (fn [blk-size plane-w plane-h recon-fn]
+                   (reduce
+                    (fn [plane addr]
+                      (let [mb-x (mod addr mb-width)
+                            mb-y (quot addr mb-width)
+                            recon (recon-fn (nth mb-states addr))]
+                        (reduce
+                         (fn [plane ry]
+                           (reduce
+                            (fn [plane rx]
+                              (assoc plane (+ (* (+ (* mb-y blk-size) ry) plane-w) (* mb-x blk-size) rx)
+                                     (get-in recon [ry rx])))
+                            plane (range blk-size)))
+                         plane (range blk-size))))
+                    (vec (repeat (* plane-w plane-h) 0))
+                    (range num-mb)))
+        luma (assemble 16 w h #(:recon %))
+        cb (assemble 8 cw ch #(:recon (:cb %)))
+        cr (assemble 8 cw ch #(:recon (:cr %)))]
+    {:width w :height h :luma luma :cb cb :cr cr
+     :slice-type-class slice-class
+     ;; per-MB Intra16x16 luma pred mode (0=Vertical/1=Horizontal/2=DC) and
+     ;; Intra_Chroma pred mode (0=DC/1=Horizontal/2=Vertical, Table 8-5's
+     ;; OWN numbering — see `h264.intra-pred`), raster order, one entry per
+     ;; macroblock — exposed so callers/tests can assert WHICH prediction
+     ;; mode a real encoder actually chose (see test/h264/decode_test.cljk's
+     ;; multi-macroblock golden vector, which asserts this is non-DC for at
+     ;; least one MB rather than just trusting the reconstructed pixels).
+     ;; nil for inter (P_Skip/P_L0_16x16) macroblocks — see :mb-inter?/:mb-mvs
+     ;; below for those.
+     :mb-pred-modes (mapv :pred-mode mb-states)
+     :mb-intra-chroma-pred-modes (mapv :intra-chroma-pred-mode mb-states)
+     ;; per-MB I_NxN (Intra_4x4) flag and, for those macroblocks, the 16
+     ;; resolved Intra4x4PredModes in luma4x4BlkIdx order (nil for every
+     ;; other mb_type). Exposed for the SAME reason `:mb-pred-modes` is:
+     ;; so a test can assert WHICH macroblock types and prediction modes a
+     ;; real encoder actually emitted, BEFORE comparing pixels — a fixture
+     ;; that silently encoded as all-Intra_16x16 would otherwise let a
+     ;; pixel-comparison test pass without executing the Intra_4x4 path at
+     ;; all. Note `:mb-pred-modes` is nil at exactly the positions
+     ;; `:mb-i4x4?` is true (an I_NxN macroblock has no Intra_16x16
+     ;; prediction mode).
+     :mb-i4x4? (mapv #(boolean (:i4x4? %)) mb-states)
+     :mb-i4x4-modes (mapv :i4x4-modes mb-states)
+     ;; per-MB inter/intra flag + final motion vector (nil for intra MBs) —
+     ;; new as of the P-slice addition; always all-false/all-nil for an
+     ;; I-slice picture.
+     :mb-inter? (mapv #(boolean (:inter? %)) mb-states)
+     :mb-mvs (mapv :mv mb-states)
+     ;; per-MB per-8x8-quadrant motion field (TL/TR/BL/BR, quadrant idx =
+     ;; qcol + 2*qrow — see `uniform-mv-field`/`mv-field`), nil for intra —
+     ;; new as of the P_16x8/P_8x16/P_8x8 sub-partition addition. For
+     ;; P_L0_16x16/P_Skip all 4 entries are identical (`:mb-mvs` above is
+     ;; enough for those); for P_16x8/P_8x16/P_8x8 this is the ONLY way to
+     ;; observe each partition's own motion vector.
+     :mb-mv-fields (mapv :mv-field mb-states)
+     ;; per-MB inter sub_type — :p-skip/:p-l0-16x16/:p-16x8/:p-8x16/:p-8x8,
+     ;; nil for intra — new as of the P_16x8/P_8x16/P_8x8 sub-partition
+     ;; addition, so tests can assert WHICH inter mb_type/partitioning a
+     ;; (real or hand-authored) bitstream actually used.
+     :mb-sub-types (mapv :sub-type mb-states)}))
+
+(defn decode-idr-frame
+  "Decode a single-IDR-I-slice Annex B H.264 elementary stream `annexb-bytes`
+   (a byte vector — see `h264.bitstream/nal-units`). Returns {:width
+   :height :luma (flat row-major byte vector, width*height, 0..255) :cb
+   :cr (flat row-major byte vectors, (width/2)*(height/2), 0..255 —
+   ChromaArrayType 1 / 4:2:0 only, see namespace docstring)}.
+
+   Only the FIRST IDR slice NAL in `annexb-bytes` is decoded — any
+   subsequent (e.g. P-slice) NALs are ignored, preserving this fn's
+   original single-IDR-frame behavior unchanged even when called on a
+   multi-picture stream (use `decode-gop` to decode a whole GOP, IDR +
+   P-frames, in sequence).
+
+   See namespace docstring for the (deliberately narrow) supported scope."
+  [annexb-bytes]
+  (let [units (bs/nal-units annexb-bytes)
+        sps-u (first (filter #(= :sps (:kind %)) units))
+        pps-u (first (filter #(= :pps (:kind %)) units))
+        slice-u (first (filter #(= :slice-idr (:kind %)) units))
+        _ (when-not sps-u (throw (ex-info "h264.decode: no SPS NAL found" {})))
+        _ (when-not pps-u (throw (ex-info "h264.decode: no PPS NAL found" {})))
+        _ (when-not slice-u (throw (ex-info "h264.decode: no IDR slice NAL found" {})))
+        sps-map (sps/parse (rbsp/unescape (:bytes sps-u)))
+        pps-map (pps/parse (rbsp/unescape (:bytes pps-u)))]
+    (decode-picture sps-map pps-map slice-u nil)))
+
+(defn decode-gop
+  "Decode ALL pictures in `annexb-bytes` (an Annex B elementary stream,
+   e.g. a whole GOP: one IDR I-frame followed by zero or more P-frames) in
+   bitstream order — ADR-2607122000 Migration step 7 (P_Skip + P_L0_16x16
+   inter prediction, REAL sub-pel/non-zero motion compensation via
+   `h264.interp`, single reference frame — see namespace docstring's
+   \"Pixel decode: P-slice (inter)\" section). Each P-frame's inter
+   prediction references the IMMEDIATELY PRECEDING decoded picture as its
+   single reference frame (`h264.slice` requires `num_ref_idx_l0_active ==
+   1`, throwing otherwise — a real multi-frame reference-picture buffer/DPB
+   is out of scope).
+
+   A single SPS/PPS pair (the first of each found in the whole stream) is
+   assumed to apply to every picture — matches real encoders, which
+   typically emit SPS/PPS once before the IDR frame and don't repeat them
+   per P-frame (this repo doesn't handle mid-stream SPS/PPS changes).
+
+   Returns a vector of frame maps, one per decoded picture in bitstream
+   order, each the SAME shape `decode-idr-frame` returns (see
+   `decode-picture`)."
+  [annexb-bytes]
+  (let [units (bs/nal-units annexb-bytes)
+        sps-u (first (filter #(= :sps (:kind %)) units))
+        pps-u (first (filter #(= :pps (:kind %)) units))
+        slice-us (filterv #(contains? #{:slice-idr :slice-non-idr} (:kind %)) units)
+        _ (when-not sps-u (throw (ex-info "h264.decode: no SPS NAL found" {})))
+        _ (when-not pps-u (throw (ex-info "h264.decode: no PPS NAL found" {})))
+        _ (when (empty? slice-us) (throw (ex-info "h264.decode: no slice NAL found" {})))
+        sps-map (sps/parse (rbsp/unescape (:bytes sps-u)))
+        pps-map (pps/parse (rbsp/unescape (:bytes pps-u)))]
+    (loop [remaining slice-us ref-frame nil frames []]
+      (if (empty? remaining)
+        frames
+        (let [frame (decode-picture sps-map pps-map (first remaining) ref-frame)]
+          (recur (rest remaining) frame (conj frames frame)))))))

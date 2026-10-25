@@ -1,0 +1,107 @@
+(ns kotoba-kernel-common
+  "Shared vector loading and 2-D composition for the JVM-free kernel
+  verifiers. Both `verify-kotoba-kernel.cljs` (wasm + native) and
+  `kotoba-kernel-reference.cljs` (kotoba.kir interpreter) drive the SAME
+  composition here, so the three executions differ only in how a single
+  1-D call is dispatched."
+  (:require [kotoba.lang.edn :as edn]
+            ["node:fs" :as fs]))
+
+(def vectors-format :h264.kotoba-kernel-vectors/v1)
+
+(defn load-vectors [path]
+  (let [data (edn/read-string (fs/readFileSync path "utf8"))]
+    (when-not (= vectors-format (:format data))
+      (throw (ex-info "unexpected vector format" {:format (:format data)})))
+    data))
+
+(def quant-plan
+  "Exported quant function names, paired with the vector key that holds the
+  `.cljc` oracle's answers for them."
+  [[:group-idx "group-idx"] [:level-scale "level-scale"] [:ac-qmul "ac-qmul"]
+   [:dc-qmul "dc-qmul"] [:dequant-ac "dequant-ac"] [:chroma-qp "chroma-qp"]])
+
+(defn inverse-4x4
+  "Compose H.264 §8.5.12's 2-D inverse transform from the guest's 1-D
+  exports. `call` takes [module fname args] and returns a number. The host
+  performs index permutation only: the +32 DC bias lives in `idct4-1d-dc`
+  and the final >>6 in `idct4-1d-scaled`, so no arithmetic happens here."
+  [call coeffs]
+  (let [pass1 (reduce
+               (fn [acc i]
+                 (let [a (mapv #(nth coeffs (+ (* 4 i) %)) (range 4))
+                       f (if (zero? i) "idct4-1d-dc" "idct4-1d")]
+                   (reduce (fn [acc p]
+                             (assoc acc (+ i (* 4 p))
+                                    (call :transform f (conj a p))))
+                           acc (range 4))))
+               (vec (repeat 16 0)) (range 4))
+        pass2 (reduce
+               (fn [acc i]
+                 (let [t (mapv #(nth pass1 (+ (* 4 i) %)) (range 4))]
+                   (reduce (fn [acc p]
+                             (assoc acc (+ i (* 4 p))
+                                    (call :transform "idct4-1d-scaled" (conj t p))))
+                           acc (range 4))))
+               (vec (repeat 16 0)) (range 4))]
+    (mapv (fn [r] (mapv #(nth pass2 (+ (* 4 r) %)) (range 4))) (range 4))))
+
+(defn evenly
+  "`n` cases spread across `coll` rather than its first `n`. The native path
+  spawns a process per call and so cannot run every quant case; taking the
+  head of each group would have sampled QP 0 only, and for chroma-qp the first
+  six offsets all clip to the same answer, so the subset would have looked
+  like coverage while testing one point."
+  [coll n]
+  (let [c (count coll)]
+    (if (or (nil? n) (>= n c)) (vec coll)
+      (mapv #(nth coll (quot (* % (dec c)) (max 1 (dec n)))) (range n)))))
+
+(defn check
+  "Runs `call` over the given inverse-transform cases and over the quant
+  cases, either all of them (`quant-limit` nil) or `quant-limit` spread evenly
+  across each group. Returns {:checked n :failures [...]}; `:checked` counts
+  individual compared values, so it can serve as an evidence floor."
+  [call data idct-cases quant-limit]
+  (let [failures (volatile! [])
+        checked (volatile! 0)]
+    (doseq [{:keys [coeffs expected]} idct-cases]
+      (let [got (inverse-4x4 call coeffs)]
+        (vswap! checked + 16)
+        (when-not (= got (mapv vec expected))
+          (vswap! failures conj {:kind :idct :coeffs coeffs
+                                 :expected expected :got got})))
+      ;; `dc-only-sample` is the .cljc's fast path for a block whose only
+      ;; non-zero coefficient is the DC one. It is exported, so it has to be
+      ;; checked; an exported function nothing calls is an untested claim.
+      ;; It is compared against the SAME .cljc expectation the full two-pass
+      ;; composition is compared against, so the two paths are held to one
+      ;; answer rather than to each other.
+      (when (every? zero? (rest coeffs))
+        (let [got (call :transform "dc-only-sample" [(first coeffs)])
+              want (first (first expected))]
+          (vswap! checked inc)
+          (when-not (= got want)
+            (vswap! failures conj {:kind :dc-only-sample :coeffs coeffs
+                                   :expected want :got got})))))
+    (doseq [[k fname] quant-plan
+            {:keys [in expected]} (evenly (get-in data [:quant k]) quant-limit)]
+      (let [got (call :quant fname in)]
+        (vswap! checked inc)
+        (when-not (= got expected)
+          (vswap! failures conj {:kind k :in in :expected expected :got got}))))
+    {:checked @checked :failures @failures}))
+
+(defn native-subset
+  "A bounded but deliberately chosen subset of the real fixture corpus for
+  the process-per-call native path: the extremes (largest magnitude, most
+  negative coefficients, DC-only, all-zero) plus the head of the list, so
+  the subset is not simply whatever happens to be first."
+  [cases n]
+  (let [magnitude (fn [c] (apply max (map #(js/Math.abs %) (:coeffs c))))
+        negatives (fn [c] (count (filter neg? (:coeffs c))))]
+    (->> (concat (take 2 (sort-by (comp - magnitude) cases))
+                 (take 2 (sort-by (comp - negatives) cases))
+                 (take 2 (filter #(every? zero? (rest (:coeffs %))) cases))
+                 (take n cases))
+         distinct (take n) vec)))
