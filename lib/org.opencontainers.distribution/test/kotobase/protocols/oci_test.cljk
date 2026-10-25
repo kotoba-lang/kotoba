@@ -1,0 +1,129 @@
+(ns kotobase.protocols.oci-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.protocols.oci :as oci]
+            [kotobase.protocols.oci.digest :as digest]
+            [kotobase.store :as st]))
+
+(defn- ctx [] {:store (local/local-store) :apex "kotobase.net"})
+
+(def auth {"authorization" "Bearer test-token"})
+
+(deftest ping
+  (let [c (ctx)
+        res (oci/handle c {:method :get :path "/v2/"})]
+    (is (= 200 (:status res)))
+    (is (= "" (:body res)))
+    (is (= "registry/2.0" (get-in res [:headers "docker-distribution-api-version"])))))
+
+(deftest manifest-put-get-head-round-trip
+  (let [c (ctx)
+        body "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\"}"
+        want-digest (digest/digest-of body)
+        put (oci/handle c {:method :put :path "/v2/myorg/myapp/manifests/latest"
+                           :headers (assoc auth "content-type" "application/vnd.oci.image.manifest.v1+json")
+                           :body body})]
+    (testing "PUT stores and returns the computed digest"
+      (is (= 201 (:status put)))
+      (is (= want-digest (get-in put [:headers "docker-content-digest"]))))
+    (testing "GET by tag returns body + matching digest header"
+      (let [got (oci/handle c {:method :get :path "/v2/myorg/myapp/manifests/latest"})]
+        (is (= 200 (:status got)))
+        (is (= body (:body got)))
+        (is (= want-digest (get-in got [:headers "docker-content-digest"])))
+        (is (= "application/vnd.oci.image.manifest.v1+json" (get-in got [:headers "content-type"])))))
+    (testing "GET by digest also resolves (tag push is digest-addressable too)"
+      (let [got (oci/handle c {:method :get :path (str "/v2/myorg/myapp/manifests/" want-digest)})]
+        (is (= 200 (:status got)))
+        (is (= body (:body got)))))
+    (testing "HEAD has headers, no body"
+      (let [head (oci/handle c {:method :head :path "/v2/myorg/myapp/manifests/latest"})]
+        (is (= 200 (:status head)))
+        (is (nil? (:body head)))
+        (is (= want-digest (get-in head [:headers "docker-content-digest"])))))))
+
+(deftest manifest-put-digest-mismatch-rejected
+  (let [c (ctx)
+        res (oci/handle c {:method :put :path "/v2/o/a/manifests/sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                           :headers auth :body "not matching"})]
+    (is (= 400 (:status res)))
+    (is (str/includes? (:body res) "DIGEST_INVALID"))))
+
+(deftest manifest-put-requires-auth-header
+  (let [c (ctx)
+        res (oci/handle c {:method :put :path "/v2/o/a/manifests/latest" :body "x"})]
+    (is (= 401 (:status res)))
+    (let [challenge (get-in res [:headers "www-authenticate"])]
+      (is (str/starts-with? challenge "Bearer "))
+      (is (str/includes? challenge "realm=\""))
+      (is (str/includes? challenge "service=\""))
+      (is (str/includes? challenge "scope=\"repository:o/a:pull,push\"")))))
+
+(deftest blob-upload-get-head-round-trip
+  (let [c (ctx)
+        body "binary-ish-layer-bytes"
+        d (digest/digest-of body)
+        up (oci/handle c {:method :post :path "/v2/myorg/myapp/blobs/uploads/"
+                          :query {"digest" d} :headers auth :body body})]
+    (testing "POST monolithic upload"
+      (is (= 201 (:status up)))
+      (is (= d (get-in up [:headers "docker-content-digest"]))))
+    (testing "GET blob by digest"
+      (let [got (oci/handle c {:method :get :path (str "/v2/myorg/myapp/blobs/" d)})]
+        (is (= 200 (:status got)))
+        (is (= body (:body got)))))
+    (testing "HEAD blob by digest"
+      (let [head (oci/handle c {:method :head :path (str "/v2/myorg/myapp/blobs/" d)})]
+        (is (= 200 (:status head)))
+        (is (nil? (:body head)))
+        (is (= d (get-in head [:headers "docker-content-digest"])))))))
+
+(deftest blob-upload-digest-mismatch-rejected
+  (let [c (ctx)
+        res (oci/handle c {:method :post :path "/v2/o/a/blobs/uploads/"
+                           :query {"digest" "sha256:deadbeef"} :headers auth :body "hello"})]
+    (is (= 400 (:status res)))
+    (is (str/includes? (:body res) "DIGEST_INVALID"))))
+
+(deftest tags-list
+  (let [c (ctx)]
+    (oci/handle c {:method :put :path "/v2/o/a/manifests/v1" :headers auth :body "one"})
+    (oci/handle c {:method :put :path "/v2/o/a/manifests/v2" :headers auth :body "two"})
+    (let [res (oci/handle c {:method :get :path "/v2/o/a/tags/list"})]
+      (is (= 200 (:status res)))
+      (is (str/includes? (:body res) "\"name\":\"o/a\""))
+      (is (str/includes? (:body res) "\"v1\""))
+      (is (str/includes? (:body res) "\"v2\""))
+      ;; digest-shaped keys (auto-indexed alongside each tag) must not
+      ;; leak into tags/list.
+      (is (not (str/includes? (:body res) "sha256:"))))))
+
+(deftest not-found-cases
+  (let [c (ctx)]
+    (testing "unknown name on tags/list"
+      (is (= 404 (:status (oci/handle c {:method :get :path "/v2/no/such/tags/list"})))))
+    (testing "unknown reference on manifest GET"
+      (is (= 404 (:status (oci/handle c {:method :get :path "/v2/o/a/manifests/nope"})))))
+    (testing "unknown digest on blob GET"
+      (is (= 404 (:status (oci/handle c {:method :get :path "/v2/o/a/blobs/sha256:absent00000000000000000000000000000000000000000000000000000000"})))))))
+
+(deftest audit-trail
+  (let [{:keys [store] :as c} (ctx)
+        body "m"
+        d (digest/digest-of "b")]
+    (oci/handle c {:method :put :path "/v2/o/a/manifests/latest" :headers auth :body body})
+    (oci/handle c {:method :post :path "/v2/o/a/blobs/uploads/" :query {"digest" d} :headers auth :body "b"})
+    (let [events (st/-read store :kotobase.protocols/audit 0)]
+      (is (= [:put-manifest :put-blob] (map :op events)))
+      (is (every? #(= :oci (:surface %)) events)))))
+
+(deftest repository-name-may-contain-slash
+  (let [c (ctx)
+        body "nested"
+        put (oci/handle c {:method :put :path "/v2/gftdcojp/kami-engine/manifests/v1"
+                           :headers auth :body body})]
+    (is (= 201 (:status put)))
+    (let [got (oci/handle c {:method :get :path "/v2/gftdcojp/kami-engine/manifests/v1"})]
+      (is (= 200 (:status got)))
+      (is (= body (:body got))))))

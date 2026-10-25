@@ -1,0 +1,218 @@
+;; What an itonami app release must look like in OCI, as Kotoba decisions
+;; (JUN-288; network-awai-apex ADR 0010 §2.2–§2.4).
+;;
+;;   index-problem            (media-type artifact-type) -> reason
+;;   class-annotation-problem (annotated declared)       -> reason
+;;   digest-problem           (digest)                   -> reason
+;;   digest-cid               (digest codec)             -> CIDv1, or ""
+;;   cid-digest               (cid)                      -> digest, or ""
+;;   cid-codec                (cid)                      -> 85 raw, 113 dag-cbor, or 0
+;;
+;; A release is one OCI image index whose artifactType is
+;; application/vnd.itonami.app.v1. Its org.itonami.runtime-class annotation
+;; only mirrors the class the L5 manifest declares; a mismatch is refused.
+;; Only sha256 digests are admitted. A digest and the CIDv1 of the same bytes
+;; share one sha2-256 multihash, so they map one to one: CIDv1 = 0x01, the
+;; codec (raw 0x55 for blobs, dag-cbor 0x71 for the L5 manifest), 0x12 0x20
+;; and the 32 digest bytes, written as multibase base32 ("b", lowercase, no
+;; padding). cid-digest accepts only the canonical spelling: it re-encodes
+;; what it decoded and refuses anything that differs.
+;;
+;;   the guest owns   whether a release, a class, a digest or a CID is
+;;                    admissible, and the digest <-> CID mapping
+;;   the host owns    the socket, the store, SHA-256 over the bytes
+;;
+;; Written in the Amu selfhost seed subset (no ns docstring, no fn literal,
+;; declared result types); see README "Kotoba decisions" for the gate.
+(ns oci.itonami-artifact
+  (:export [index-problem class-annotation-problem runtime-class-code
+            digest-problem digest-cid cid-digest cid-codec
+            test-index test-classes test-digests test-digest-cid
+            test-round-trip]))
+
+;; ---------------------------------------------------------------------------
+;; Reason literals. Pinned contract: callers match on these exact strings.
+
+(defn index-problem [media-type :string artifact-type :string] :string
+  (if (= media-type "application/vnd.oci.image.index.v1+json")
+    (if (= artifact-type "application/vnd.itonami.app.v1") "oci/ok" "itonami/not-an-itonami-app")
+    "itonami/not-an-image-index"))
+
+;; the tsukasa mask bits: wasm = 1, container = 2 (named fune); 0 = unknown.
+;; Owner 2026-10-22 "hako = fune": a Linux OCI image is one class, and
+;; container vs microVM is the node's choice, so "microvm" is not a class.
+(defn runtime-class-code [cls :string] :i64
+  (if (= cls "wasm") 1
+    (if (= cls "container") 2 0)))
+
+;; ANNOTATED is the OCI annotation, DECLARED the L5 manifest's class.
+(defn class-annotation-problem [annotated :string declared :string] :string
+  (cond (= (runtime-class-code declared) 0) "itonami/unknown-runtime-class"
+        (= (runtime-class-code annotated) 0) "itonami/unknown-runtime-class"
+        (= annotated declared) "oci/ok"
+        :else "itonami/runtime-class-mismatch"))
+
+;; ---------------------------------------------------------------------------
+;; Digests. Every scan walks bytes from the start and stops at the first one
+;; it does not admit, so it never reads into a multibyte character.
+
+(defn hex-value [c :i64] :i64
+  (cond (and (>= c 48) (<= c 57)) (- c 48)
+        (and (>= c 97) (<= c 102)) (- c 87)
+        :else -1))
+
+(defn hex-from? [s :string i :i64 n :i64] :bool
+  (cond (>= i n) true
+        (< (hex-value (string-code-point-at s i)) 0) false
+        :else (recur s (inc i) n)))
+
+;; s begins with p (p ASCII, s at least as long)
+(defn same-from? [s :string p :string i :i64] :bool
+  (cond (>= i (string-length p)) true
+        (= (string-code-point-at s i) (string-code-point-at p i)) (recur s p (inc i))
+        :else false))
+
+(defn digest-problem [d :string] :string
+  (let [n (string-length d)]
+    (cond (and (>= n 7) (same-from? d "sha256:" 0))
+            (if (= n 71) (if (hex-from? d 7 71) "oci/ok" "oci/bad-digest") "oci/bad-digest")
+          (> (string-index-of d ":") 0) "itonami/unsupported-digest"
+          :else "oci/bad-digest")))
+
+;; ---------------------------------------------------------------------------
+;; digest -> CIDv1 (multibase base32)
+
+(defn b32-char [v :i64] :string (string-substring "abcdefghijklmnopqrstuvwxyz234567" v (inc v)))
+
+;; byte I of the binary CID: 0x01, codec, 0x12, 0x20, then the digest's bytes
+(defn cid-byte [d :string codec :i64 i :i64] :i64
+  (cond (= i 0) 1
+        (= i 1) codec
+        (= i 2) 18
+        (= i 3) 32
+        :else (let [k (+ 7 (* 2 (- i 4)))]
+                (+ (* 16 (hex-value (string-code-point-at d k))) (hex-value (string-code-point-at d (inc k)))))))
+
+;; 36 bytes, 5 bits at a time; ACC holds the NBITS not yet written
+(defn b32-from [d :string codec :i64 i :i64 acc :i64 nbits :i64 out :string] :string
+  (cond (>= nbits 5)
+          (let [m (- nbits 5) v (bit-and (u64-shift-right acc m) 31)]
+            (recur d codec i (bit-and acc (dec (i64-shift-left 1 m))) m (string-concat out (b32-char v))))
+        (< i 36)
+          (recur d codec (inc i) (bit-or (i64-shift-left acc 8) (cid-byte d codec i)) (+ nbits 8) out)
+        (> nbits 0) (string-concat out (b32-char (bit-and (i64-shift-left acc (- 5 nbits)) 31)))
+        :else out))
+
+(defn digest-cid [d :string codec :i64] :string
+  (cond (not (= (digest-problem d) "oci/ok")) ""
+        (= codec 85) (b32-from d codec 0 0 0 "b")
+        (= codec 113) (b32-from d codec 0 0 0 "b")
+        :else ""))
+
+;; ---------------------------------------------------------------------------
+;; CIDv1 -> digest
+
+(defn b32-value [c :i64] :i64
+  (cond (and (>= c 97) (<= c 122)) (- c 97)
+        (and (>= c 50) (<= c 55)) (+ 26 (- c 50))
+        :else -1))
+
+;; the bytes of s from offset i; [-1] at the first character that is not
+;; base32
+(defn b32-decode [s :string i :i64 acc :i64 nbits :i64 out :vector-i64] :vector-i64
+  (cond (>= nbits 8)
+          (let [m (- nbits 8)]
+            (recur s i (bit-and acc (dec (i64-shift-left 1 m))) m (vector-conj out (bit-and (u64-shift-right acc m) 255))))
+        (>= i (string-length s)) out
+        :else (let [v (b32-value (string-code-point-at s i))]
+                (if (< v 0) [-1] (recur s (inc i) (bit-or (i64-shift-left acc 5) v) (+ nbits 5) out)))))
+
+;; "b" and 58 base32 characters: 36 bytes
+(defn cid-bytes [cid :string] :vector-i64
+  (if (= (string-length cid) 59)
+    (if (= (string-code-point-at cid 0) 98) (b32-decode cid 1 0 0 []) [-1])
+    [-1]))
+
+(defn cid-codec [cid :string] :i64
+  (let [b (cid-bytes cid)]
+    (if (= (count b) 36)
+      (let [c (vector-at b 1)]
+        (if (and (= (vector-at b 0) 1) (= (vector-at b 2) 18) (= (vector-at b 3) 32))
+          (if (= c 85) c (if (= c 113) c 0))
+          0))
+      0)))
+
+(defn hex-char [v :i64] :string (string-substring "0123456789abcdef" v (inc v)))
+
+(defn hex-of [b :vector-i64 i :i64 out :string] :string
+  (if (>= i 36) out
+    (recur b (inc i) (string-concat out (string-concat (hex-char (quot (vector-at b i) 16)) (hex-char (bit-and (vector-at b i) 15)))))))
+
+;; the digest, only when CID is the canonical spelling of it
+(defn cid-digest [cid :string] :string
+  (let [c (cid-codec cid)]
+    (if (= c 0) ""
+      (let [d (hex-of (cid-bytes cid) 4 "sha256:")]
+        (if (= (digest-cid d c) cid) d "")))))
+
+;; ---------------------------------------------------------------------------
+;; test-* : zero-arity, true when every assertion holds. Vectors: sha256 of
+;; "" and of "itonami", their CIDs computed independently.
+
+(defn test-index [] :bool
+  (if (and (= (index-problem "application/vnd.oci.image.index.v1+json" "application/vnd.itonami.app.v1") "oci/ok")
+           (= (index-problem "application/vnd.oci.image.manifest.v1+json" "application/vnd.itonami.app.v1") "itonami/not-an-image-index")
+           (= (index-problem "application/vnd.oci.image.index.v1+json" "") "itonami/not-an-itonami-app")
+           (= (index-problem "application/vnd.oci.image.index.v1+json" "application/vnd.itonami.app.v2") "itonami/not-an-itonami-app")
+           (= (index-problem "" "") "itonami/not-an-image-index")) true false))
+
+(defn test-classes [] :bool
+  (if (and (= (runtime-class-code "wasm") 1)
+           (= (runtime-class-code "container") 2)
+           (= (runtime-class-code "microvm") 0)
+           (= (runtime-class-code "hako") 0)
+           (= (class-annotation-problem "wasm" "wasm") "oci/ok")
+           (= (class-annotation-problem "container" "container") "oci/ok")
+           (= (class-annotation-problem "microvm" "microvm") "itonami/unknown-runtime-class")
+           (= (class-annotation-problem "container" "wasm") "itonami/runtime-class-mismatch")
+           (= (class-annotation-problem "oci" "wasm") "itonami/unknown-runtime-class")
+           (= (class-annotation-problem "wasm" "fune") "itonami/unknown-runtime-class")) true false))
+
+(defn test-digests [] :bool
+  (if (and (= (digest-problem "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") "oci/ok")
+           (= (digest-problem "sha256:E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855") "oci/bad-digest")
+           (= (digest-problem "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85") "oci/bad-digest")
+           (= (digest-problem "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b8555") "oci/bad-digest")
+           (= (digest-problem "sha256:g3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") "oci/bad-digest")
+           (= (digest-problem "sha512:cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce") "itonami/unsupported-digest")
+           (= (digest-problem "sha256") "oci/bad-digest")
+           (= (digest-problem ":abc") "oci/bad-digest")
+           (= (digest-problem "") "oci/bad-digest")) true false))
+
+(defn test-digest-cid [] :bool
+  (if (and (= (digest-cid "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" 85)
+              "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+           (= (digest-cid "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" 113)
+              "bafyreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+           (= (digest-cid "sha256:10b899caa9d789b7d21475312dfcf3cc7f79570dc3b4654b515e368c9c19be75" 85)
+              "bafkreiaqxcm4vkoxrg35efdvgew7z46mp54vododwrsuwuk6g2gjygn6ou")
+           (= (digest-cid "sha256:10b899caa9d789b7d21475312dfcf3cc7f79570dc3b4654b515e368c9c19be75" 113)
+              "bafyreiaqxcm4vkoxrg35efdvgew7z46mp54vododwrsuwuk6g2gjygn6ou")
+           (= (digest-cid "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" 112) "")
+           (= (digest-cid "sha256:e3b0" 85) "")) true false))
+
+(defn test-round-trip [] :bool
+  (if (and (= (cid-digest "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku")
+              "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+           (= (cid-codec "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku") 85)
+           (= (cid-codec "bafyreiaqxcm4vkoxrg35efdvgew7z46mp54vododwrsuwuk6g2gjygn6ou") 113)
+           (= (cid-digest "bafyreiaqxcm4vkoxrg35efdvgew7z46mp54vododwrsuwuk6g2gjygn6ou")
+              "sha256:10b899caa9d789b7d21475312dfcf3cc7f79570dc3b4654b515e368c9c19be75")
+           ;; dag-pb (0x70) is not an itonami codec
+           (= (cid-codec "bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku") 0)
+           (= (cid-digest "bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku") "")
+           ;; same bytes, non-canonical trailing bit: refused
+           (= (cid-digest "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvykv") "")
+           (= (cid-digest "Bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku") "")
+           (= (cid-digest "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyk") "")
+           (= (cid-digest "") "")) true false))

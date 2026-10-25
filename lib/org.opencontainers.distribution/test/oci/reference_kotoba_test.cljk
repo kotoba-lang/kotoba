@@ -1,0 +1,195 @@
+;; `kotoba/oci/reference.kotoba` against the registry in
+;; `kotobase.protocols.oci`.
+;;
+;; Every claim about the library is driven through its own `handle` and its
+;; own `kotobase.local` store, so what is measured is what a client would
+;; get.
+;;
+;; ## Findings
+;;
+;;   * `a-repository-name-is-never-checked` -- `handle` joins the path
+;;     segments before the route tail and hands the result to the store as
+;;     part of a key. `a/../b` pushes, `b` does not resolve it, and
+;;     `a/../b` does; `MyApp` pushes and `myapp` does not resolve it. §4.1
+;;     gives a lowercase-only grammar with no `.` or `..` component, and a
+;;     store that maps keys to paths -- which is what `a/../b` is written
+;;     for -- resolves out of its own key space.
+;;
+;;   * `a-tag-is-not-anything-without-a-colon` -- `digest-shaped?` decides
+;;     whether a pushed reference is VERIFIED against the computed digest,
+;;     so everything it calls a tag is stored unverified. Its notion of a
+;;     tag is "no colon", and the §4.1 tag grammar is far narrower:
+;;     `-bad..tag` is accepted and listed.
+;;
+;;   * `the-digest-shape-is-wider-than-the-digest-grammar` -- `SHA256:` and
+;;     32 uppercase hex satisfies it, though the algorithm is lowercase in
+;;     the spec and `sha256`'s encoding is exactly 64 lowercase hex.
+;;
+;;   * `segments-does-not-decode-what-its-docstring-says-it-decodes` --
+;;     recorded, and NOT treated as a bug to fix in that direction:
+;;     decoding would turn `%2F` into a separator the router never sees.
+;;     The docstring is what is wrong.
+
+(ns oci.reference-kotoba-test
+  (:require [kotoba.io :as io]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [kotobase.local :as local]
+            [kotobase.protocols.http :as http]
+            [kotobase.protocols.oci :as oci]
+            [kotobase.protocols.oci.digest :as digest]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "oci" "reference.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'oci.reference (slurp guest-file)}
+                                         'oci.reference :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+;; The walk is one character at a time. Names run on the interpreter
+;; default -- the 255-character case short-circuits on length before it
+;; walks -- and only the 128-character tag, which is walked to its end,
+;; needs more. Measured; both directions are asserted at the end of the file.
+(def ^:private tag-fuel 2048)
+(defn- name-problem [n] (call 'name-problem [n]))
+(defn- ref-kind [r] (call 'reference-kind [r] tag-fuel))
+
+(def ^:private auth
+  {"authorization" "Bearer test-token"
+   "content-type" "application/vnd.oci.image.manifest.v1+json"})
+
+(defn- registry [] {:store (local/local-store) :apex "kotobase.net"})
+(defn- push [c path body]
+  (:status (oci/handle c {:method :put :path path :headers auth :body body})))
+(defn- pull [c path] (oci/handle c {:method :get :path path}))
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+;; --- finding one: the name -----------------------------------------------------------
+
+(deftest a-repository-name-is-never-checked
+  (testing "a name with a parent component pushes, and is its own repository"
+    (let [c (registry)]
+      (is (= 201 (push c "/v2/a/../b/manifests/latest" "X")))
+      (is (= 404 (:status (pull c "/v2/b/manifests/latest")))
+          "so `a/../b` and `b` are two objects a client would call one name")
+      (is (= 200 (:status (pull c "/v2/a/../b/manifests/latest"))))))
+  (testing "and an uppercase name pushes, and is its own repository"
+    (let [c (registry)]
+      (is (= 201 (push c "/v2/MyApp/manifests/latest" "Y")))
+      (is (= 404 (:status (pull c "/v2/myapp/manifests/latest")))
+          "§4.1 is lowercase-only, so a registry that normalises and this one
+           disagree about which repository was written")))
+  (testing "the guest names each refusal"
+    (is (= :parent-traversal (name-problem "a/../b")))
+    (is (= :current-directory (name-problem "a/./b")))
+    (is (= :invalid-character (name-problem "MyApp")))
+    (is (= :invalid-character (name-problem "a%2Fb")))
+    (is (= :empty-component (name-problem "a//b")))
+    (is (= :empty-name (name-problem "")))
+    (is (= :name-too-long (name-problem (str/join "/" (repeat 64 "abcd")))))))
+
+(deftest the-names-section-4-1-allows
+  (doseq [n ["myorg/myapp" "a" "a1" "org/sub/app" "a.b" "a_b" "a__b" "a-b"
+             "a---b" "0/1/2" "x.y-z_w/app"]]
+    (is (= :none (name-problem n)) n))
+  (testing "and each of them really is a working repository name here"
+    (doseq [n ["myorg/myapp" "a" "a.b" "a__b" "x.y-z_w/app"]]
+      (let [c (registry)]
+        (is (= 201 (push c (str "/v2/" n "/manifests/latest") "B")) n)
+        (is (= 200 (:status (pull c (str "/v2/" n "/manifests/latest")))) n)))))
+
+(deftest the-separator-rules-are-the-grammars-own
+  ;; §4.1: `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`.
+  (doseq [[n expected why]
+          [["a..b" :bad-separator "a dot may appear once"]
+           ["a___b" :bad-separator "one underscore or two, not three"]
+           ["a-" :bad-separator "a separator needs an alphanumeric on both sides"]
+           ["-a" :invalid-character "and a component starts with one"]
+           ["a+b" :invalid-character "`+` is in the digest algorithm grammar, not this one"]
+           ["a b" :invalid-character "no spaces"]]]
+    (testing why (is (= expected (name-problem n)) n))))
+
+;; --- finding two: the tag ---------------------------------------------------------------
+
+(deftest a-tag-is-not-anything-without-a-colon
+  (let [c (registry)]
+    (is (= 201 (push c "/v2/ok/manifests/-bad..tag" "Z"))
+        "everything `digest-shaped?` calls a tag is stored unverified")
+    (is (str/includes? (:body (pull c "/v2/ok/tags/list")) "-bad..tag")
+        "and listed as one"))
+  (testing "§4.1: `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`"
+    (is (= :invalid-tag (ref-kind "-bad..tag")) "may not begin with `-`")
+    (is (= :invalid-tag (ref-kind ".hidden")) "nor with `.`")
+    (is (= :invalid-tag (ref-kind "tag with space")))
+    (is (= :invalid-tag (ref-kind (apply str (repeat 129 "a")))) "128 characters at most")
+    (is (= :empty-reference (ref-kind "")))
+    (doseq [t ["latest" "v1.2.3" "_x" "A" "a-b_c.d" (apply str (repeat 128 "a"))]]
+      (is (= :tag (ref-kind t)) t))))
+
+;; --- finding three: the digest ------------------------------------------------------------
+
+(def ^:private hex64 (apply str (repeat 64 \a)))
+
+(deftest the-digest-shape-is-wider-than-the-digest-grammar
+  (testing "the library's shape"
+    (is (true? (digest/digest-shaped? (str "SHA256:" (apply str (repeat 32 \A)))))
+        "uppercase algorithm, uppercase hex, and thirty-two of them")
+    (is (true? (digest/digest-shaped? (str "sha256:" hex64))) "and the real thing too"))
+  (testing "the guest reads the grammar the spec writes"
+    (is (= :digest (ref-kind (str "sha256:" hex64))))
+    (is (= :invalid-digest (ref-kind (str "SHA256:" (apply str (repeat 32 \A)))))
+        "the algorithm is lowercase and sha256's encoding is 64 lowercase hex")
+    (is (= :invalid-digest (ref-kind (str "sha256:" (apply str (repeat 63 \a)))))
+        "sixty-three is not sixty-four")
+    (is (= :invalid-digest (ref-kind (str "sha256:" (str/upper hex64))))
+        "nor is uppercase hex")
+    (is (= :digest (ref-kind (str "sha512:" (apply str (repeat 128 \a))))))
+    (is (= :invalid-digest (ref-kind (str "sha512:" hex64))) "sha512 is 128")
+    (testing "an unregistered algorithm is only required to be well formed"
+      (is (= :digest (ref-kind "multihash+base58:QmSomething")))
+      (is (= :invalid-digest (ref-kind "Multihash:QmSomething")) "lowercase")
+      (is (= :invalid-digest (ref-kind "sha256+:abcd")) "a separator needs both sides")
+      (is (= :invalid-digest (ref-kind "sha256:")) "an empty encoding names nothing")
+      (is (= :invalid-digest (ref-kind "multihash:"))
+          "including for an algorithm with no registered length -- the
+           discrimination pass is what found this missing, since `sha256:`
+           was already refused by the length rule and never reached the
+           general one"))))
+
+;; --- recorded, not fixed -------------------------------------------------------------------
+
+(deftest segments-does-not-decode-what-its-docstring-says-it-decodes
+  ;; "Path → vector of decoded, non-empty segments". It splits and removes
+  ;; blanks. NOT decoding is the safer half of the two, so this is recorded
+  ;; against the docstring rather than the code.
+  (is (= ["v2" "a%2Fb" "manifests" "latest"]
+         (http/segments "/v2/a%2Fb/manifests/latest")))
+  (is (= :invalid-character (name-problem "a%2Fb"))
+      "and `%` is not in the §4.1 grammar, so the name is refused either way"))
+
+(deftest the-fuel-budgets-are-measured-in-both-directions
+  ;; 20000 was written here first, for everything. The bracket says names
+  ;; run on the interpreter default, and only the 128-character tag needs
+  ;; more -- so the constant is scoped to the one call that needs it rather
+  ;; than being one number for the file.
+  (testing "names run on the default"
+    (is (= :none (call 'name-problem ["myorg/myapp"])))
+    (is (= :name-too-long (call 'name-problem [(str/join "/" (repeat 64 "abcd"))]))
+        "the long one short-circuits on length before it walks")
+    (is (thrown? Exception (call 'name-problem ["myorg/myapp"] 64))
+        "and sixty-four is not enough, so the assertions above are not vacuous"))
+  (testing "a full-length tag does not"
+    (let [t (apply str (repeat 128 "a"))]
+      (is (= :tag (call 'reference-kind [t] tag-fuel)))
+      (is (thrown? Exception (call 'reference-kind [t] 1024))
+          "1024 is not enough for it, which is why the constant exists")
+      (is (= :tag (call 'reference-kind ["latest"]))
+          "while an ordinary tag never needed the constant at all"))))

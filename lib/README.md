@@ -126,6 +126,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.epub` | `org.w3.epub/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.turtle` | `org.w3.turtle/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.vc` | `org.w3.vc/src` | `` (an external specification, publisher w3.org) |
+| `org.opencontainers.distribution` | `org.opencontainers.distribution/src` | `kotobase.protocols.http`, `kotobase.protocols.oci`, `kotobase.protocols.oci.digest` (an external specification, publisher opencontainers.org) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
 | `kotoba.x` | `kotoba.x/src` | `` (Kotoba project library) |
 | `kotoba.tsukasa` | `kotoba.tsukasa/src` | `` (Kotoba project library) |
