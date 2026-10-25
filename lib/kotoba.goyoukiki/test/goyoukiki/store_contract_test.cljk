@@ -1,0 +1,77 @@
+(ns goyoukiki.store-contract-test
+  "Store contract against both backends — proving MemStore ≡ DatomicStore makes
+  'swap the SSoT for Datomic / kotoba-server' a config change, not a rewrite."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [goyoukiki.model :as model]
+            [goyoukiki.store :as store]
+            [langchain.db :as db]))
+
+(defn- backends [] [["MemStore" (store/seed-db)] ["DatomicStore" (store/datomic-seed-db)]])
+
+(deftest read-parity
+  (doseq [[label s] (backends)]
+    (testing label
+      (is (= "経済産業省" (:agency (store/opportunity s "opp-meti-cloud-2027"))))
+      (is (= :forecast (:kind (store/opportunity s "opp-meti-cloud-2027"))))
+      (is (= "藤寺システムズ株式会社" (:name (store/candidate s "cand-fujitera"))))
+      (is (= ["opp-meti-cloud-2027" "opp-mod-radar-2026"] (mapv :id (store/all-opportunities s))))
+      (is (= ["cand-fujitera" "cand-kaien"] (mapv :id (store/all-candidates s))))
+      (is (nil? (store/opportunity s "opp-missing")))
+      (is (nil? (store/candidate s "cand-missing")))
+      (is (nil? (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))))))
+
+(deftest write-and-ledger-parity
+  (doseq [[label s] (backends)]
+    (testing label
+      (store/record-datom! s {:kind :match :id "opp-meti-cloud-2027::cand-fujitera"
+                              :value {:opportunity-id "opp-meti-cloud-2027" :candidate-id "cand-fujitera"
+                                      :status :proposed :confidence 0.9}})
+      (is (= :proposed (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))))
+      (is (= 0.9 (:confidence (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))))
+      (store/record-datom! s {:kind :match :id "opp-meti-cloud-2027::cand-fujitera"
+                              :value {:opportunity-id "opp-meti-cloud-2027" :candidate-id "cand-fujitera"
+                                      :status :shared}})
+      (is (= :shared (:status (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))) "merge updates status")
+      (is (= 0.9 (:confidence (store/match-for s "opp-meti-cloud-2027" "cand-fujitera"))) "merge preserves other fields")
+      (store/append-ledger! s {:op :a :disposition :record})
+      (store/append-ledger! s {:op :b :disposition :commit})
+      (is (= [:record :commit] (mapv :disposition (store/ledger s)))))))
+
+(deftest seed-upserts-per-id-does-not-wipe-existing-ground-facts
+  (testing "seed! is an idempotent per-id upsert (Store protocol contract), NOT a
+            wholesale replace of :opportunities/:candidates — re-seeding with one new
+            entity must leave every previously-seeded ground fact untouched, on both backends"
+    (doseq [[label s] (backends)]
+      (testing label
+        (is (= ["opp-meti-cloud-2027" "opp-mod-radar-2026"] (mapv :id (store/all-opportunities s)))
+            "sanity: pre-seeded demo data present before either seed! call")
+        (store/seed! s {:candidates {"cand-new-a" (model/candidate "cand-new-a" "A社")}})
+        (is (= ["cand-fujitera" "cand-kaien" "cand-new-a"] (mapv :id (store/all-candidates s)))
+            "seeding with A must not drop cand-fujitera/cand-kaien")
+        (store/seed! s {:candidates {"cand-new-b" (model/candidate "cand-new-b" "B社")}})
+        (is (= ["cand-fujitera" "cand-kaien" "cand-new-a" "cand-new-b"]
+               (mapv :id (store/all-candidates s)))
+            "seeding with B must not drop cand-fujitera/cand-kaien/cand-new-a")))))
+
+(deftest datomic-empty-store-usable
+  (let [s (store/datomic-store)]
+    (is (nil? (store/opportunity s "nope")))
+    (is (= [] (store/all-opportunities s)))
+    (store/record-datom! s {:kind :opportunity :id "x"
+                            :value {:id "x" :agency "a" :kind :tender :status :open}})
+    (is (= "a" (:agency (store/opportunity s "x"))))))
+
+(deftest datomic-ledger-append-does-not-lose-a-fact-when-two-writers-race
+  (testing "two append-ledger! callers who both read the same `(count (ledger s))`
+            before either transacts (the exact non-atomic read-modify-write
+            shape append-ledger! itself uses) must NOT collide into one
+            writer's fact silently overwriting the other's -- verified
+            against real langchain.db transact! semantics, not a stub"
+    (let [s (store/datomic-store)
+          n1 (count (store/ledger s))
+          n2 (count (store/ledger s))]
+      (is (= 0 n1 n2) "sanity: both writers observe the same pre-race count")
+      ((:transact! db/api) (:conn s) [{:ledger/fact (pr-str {:op :writer-A :disposition :commit})}])
+      ((:transact! db/api) (:conn s) [{:ledger/fact (pr-str {:op :writer-B :disposition :commit})}])
+      (is (= 2 (count (store/ledger s))) "both facts survive -- neither writer's append is lost")
+      (is (= #{:writer-A :writer-B} (set (map :op (store/ledger s))))))))

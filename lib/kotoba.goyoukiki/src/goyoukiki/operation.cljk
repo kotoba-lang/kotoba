@@ -1,0 +1,232 @@
+(ns goyoukiki.operation
+  "MatchActor — one opportunity-registration or match-propose/share operation
+  = one supervised actor run, a langgraph-clj StateGraph. Two flows share one
+  auditable graph:
+
+    ingest (record-op):  intake → record → END
+        `:opportunity/register` (a forecast OR a published tender — the same
+        ground-fact kind, distinguished by :kind) and `:candidate/register`
+        become durable ground facts. Always on, never an LLM call, never a
+        notification. This is where 先回り (anticipatory) tracking lives:
+        registering a :forecast is exactly as unprivileged as registering a
+        :tender — the actor observes whatever an agency has ALREADY publicly
+        disclosed (advance procurement-forecast filings or a live tender),
+        never anything non-public.
+
+    assess (assess-op):  intake → advise → govern → decide → commit|hold|approval
+        match-LLM (sealed) proposes a `:match/propose` (nominates a
+        registered, eligible candidate + confidence + cites + redactions), or
+        (for `:match/share`) a pass-through recommendation over the already-
+        committed match; ProcurementGovernor enforces no-actuation/
+        nomination/eligibility/redaction/silence-period; the phase gate adds
+        caution; sharing (`:match/share`) ALWAYS routes to a human
+        (interrupt-before :request-approval), at every phase.
+
+  Single invariant (the goyoukiki analog of teian's no-direct-delivery /
+  tayori's no-actuation):
+    the actor never notifies a candidate the ProcurementGovernor would
+    reject, and match-LLM never actuates directly — committing a match is
+    data (a 'casual commit'); only a human approval turns it into an outbound
+    notification (the 'reach out to them' call)."
+  (:require [langgraph.graph :as g]
+            [langgraph.checkpoint :as cp]
+            [goyoukiki.model :as model]
+            [goyoukiki.matchllm :as matchllm]
+            [goyoukiki.governor :as gov]
+            [goyoukiki.phase :as phase]
+            [goyoukiki.matchport :as matchport]
+            [goyoukiki.store :as store]))
+
+(defn- request->record
+  "Map an ingest request to a store ground-fact record."
+  [{:keys [op opportunity candidate value]}]
+  (case op
+    :opportunity/register {:kind :opportunity :id opportunity :value value}
+    :candidate/register   {:kind :candidate :id candidate :value value}))
+
+(defn- ingest-subject [{:keys [op opportunity candidate]}]
+  (case op :opportunity/register opportunity :candidate/register candidate))
+
+(defn register!
+  "Directly record an ingest ground fact (`:opportunity/register` or
+  `:candidate/register`) + append its ledger entry, WITHOUT spinning up a
+  StateGraph run. The ingest side is always-on/no-LLM regardless of how it's
+  invoked (the graph's own `:record` node below calls this exact function),
+  so this is the right entrypoint for BULK loads — e.g. goyoukiki.jp.kkj /
+  goyoukiki.jp.geps registering hundreds-to-thousands of real ground facts
+  from a live government feed, where spinning up a checkpointer thread per
+  item (the interactive `g/run*` path) would be pure overhead."
+  [store request]
+  (let [rec (request->record request)
+        f   {:t :recorded :op (:op request) :subject (ingest-subject request)
+             :disposition :record :basis (:kind rec)}]
+    (store/record-datom! store rec)
+    (store/append-ledger! store f)
+    f))
+
+(defn- subject
+  "For assess ops the ledger subject is the opportunity — :match/propose only
+  ever has one, :match/share carries both but the opportunity is primary."
+  [{:keys [opportunity]}] opportunity)
+
+(defn- pending-record
+  "The store record a clean/approved assess op commits. `:match/propose`
+  stores the proposal itself — crucially, the CANDIDATE it nominates, which
+  the caller's request never supplied (this is the 'discover who could
+  propose' step, matchllm's own job); `:match/share` only flips the
+  already-stored match's :status (the notification is the EFFECT, tracked
+  separately by commit-effects!, not new match content)."
+  [op request proposal]
+  (case op
+    :match/propose
+    (let [opp-id (:opportunity request) cand-id (:candidate proposal)]
+      {:kind :match :id (model/match-id opp-id cand-id)
+       :value (model/match opp-id cand-id
+                {:score (:score proposal 0.0)
+                 :rationale (:rationale proposal)
+                 :confidence (:confidence proposal)
+                 :cites (:cites proposal)
+                 :redactions (:redactions proposal)
+                 :status :proposed})})
+    :match/share
+    {:kind :match :id (model/match-id (:opportunity request) (:candidate request))
+     :value {:status :shared}}))
+
+(defn- commit-effects!
+  "Perform the op-specific EXTERNAL effect BEFORE anything is written to the
+  store — if the MatchTarget call throws (network error, notify failure, …),
+  no store mutation and no :committed ledger fact happen, so the store never
+  durably claims a notification that didn't actually occur.
+
+  `:match/propose` reads its nominated candidate-id from `record` (the commit
+  about to be written), NOT from the store — the store doesn't have this
+  match yet at this point. `:match/share` reads the match to share from the
+  store, which is safe: that content was already committed in an EARLIER run
+  (`:match/propose`), not this one.
+
+  Returns a map of extra store facts to merge in on success (currently just
+  `:match/propose`'s returned :receipt), or nil."
+  [matchport store {:keys [op opportunity candidate]} record]
+  (case op
+    :match/propose
+    (let [opp (store/opportunity store opportunity)
+          cand-id (get-in record [:value :candidate-id])
+          cand (store/candidate store cand-id)
+          {:keys [receipt]} (matchport/propose-match! matchport opp cand (get-in record [:value :rationale]))]
+      (when receipt {:kind :match :id (:id record) :value {:receipt receipt}}))
+    :match/share
+    (let [opp (store/opportunity store opportunity)
+          cand (store/candidate store candidate)
+          m   (store/match-for store opportunity candidate)]
+      (matchport/share! matchport opp cand m)
+      nil)
+    nil))
+
+(defn build
+  "Compiles a MatchActor bound to `store` (any goyoukiki.store/Store).
+  opts: :advisor (default mock), :matchport (default mock), :checkpointer
+  (default in-mem)."
+  [store & [{:keys [advisor matchport checkpointer]
+             :or   {advisor      (matchllm/mock-advisor)
+                    matchport    (goyoukiki.matchport/mock-matchport)
+                    checkpointer (cp/mem-checkpointer)}}]]
+  (-> (g/state-graph
+       {:channels
+        {:request     {:default nil}
+         :context     {:default nil}   ; :phase + (future) authn
+         :proposal    {:default nil}
+         :verdict     {:default nil}
+         :disposition {:default nil}
+         :record      {:default nil}
+         :approval    {:default nil}
+         :audit       {:reducer into :default []}}})
+
+      (g/add-node :intake (fn [s] s))
+
+      ;; ── ingest path: record a ground fact (observe), no LLM/governor ──
+      (g/add-node :record
+        (fn [{:keys [request]}]
+          (let [f (register! store request)]
+            {:disposition :record :audit [f]})))
+
+      ;; ── assess path ──
+      (g/add-node :advise
+        (fn [{:keys [request]}]
+          (let [p (matchllm/-advise advisor store request)]
+            {:proposal p :audit [(matchllm/trace request p)]})))
+
+      (g/add-node :govern
+        (fn [{:keys [request proposal]}]
+          {:verdict (gov/check request proposal store)}))
+
+      (g/add-node :decide
+        (fn [{:keys [request context proposal verdict]}]
+          (let [base (phase/verdict->disposition verdict)
+                ph   (:phase context phase/default-phase)
+                {:keys [disposition reason]} (phase/gate ph request base)
+                subj (subject request)]
+            (case disposition
+              :hold
+              {:disposition :hold
+               :audit [(cond-> (gov/hold-fact request verdict)
+                         reason (assoc :phase-reason reason :phase ph))]}
+              :escalate
+              {:disposition :escalate
+               :audit [{:t :approval-requested :op (:op request) :subject subj
+                        :reason (or reason (if (:high-stakes? verdict) :human-signoff
+                                               :low-confidence))
+                        :recommendation (:recommendation proposal)
+                        :phase ph :confidence (:confidence verdict)}]}
+              :commit
+              {:disposition :commit :record (pending-record (:op request) request proposal)}))))
+
+      (g/add-node :request-approval
+        (fn [{:keys [request proposal approval]}]
+          (let [subj (subject request)]
+            (if (= :approved (:status approval))
+              {:disposition :commit
+               :record (update (pending-record (:op request) request proposal)
+                               :value assoc :approved-by (:by approval))
+               :audit [{:t :human-signoff :op (:op request) :subject subj
+                        :by (:by approval) :recommendation (:recommendation proposal)}]}
+              {:disposition :hold
+               :audit [{:t :signoff-rejected :op (:op request) :subject subj
+                        :disposition :hold :basis [:human-rejected]}]}))))
+
+      ;; op-specific EXTERNAL effect FIRST, then the record + ledger — a
+      ;; thrown effect leaves no trace of a notification that never happened.
+      (g/add-node :commit
+        (fn [{:keys [request record]}]
+          (let [extra (commit-effects! matchport store request record)]
+            (store/record-datom! store record)
+            (when extra (store/record-datom! store extra))
+            (let [f {:t :committed :op (:op request) :subject (subject request)
+                     :disposition :commit :basis (get-in record [:value :status] :proposed)}]
+              (store/append-ledger! store f)
+              {:audit [f]}))))
+
+      (g/add-node :hold
+        (fn [{:keys [audit]}]
+          (when-let [hf (last (filter #(#{:goyoukiki-hold :signoff-rejected} (:t %)) audit))]
+            (store/append-ledger! store (assoc hf :disposition :hold)))
+          {}))
+
+      (g/set-entry-point :intake)
+      ;; intake routes ingest vs assess.
+      (g/add-conditional-edges :intake
+        (fn [{:keys [request]}]
+          (if (phase/record-op? (:op request)) :record :advise)))
+      (g/add-edge :advise :govern)
+      (g/add-edge :govern :decide)
+      (g/add-conditional-edges :decide
+        (fn [{:keys [disposition]}]
+          (case disposition :commit :commit, :escalate :request-approval, :hold)))
+      (g/add-conditional-edges :request-approval
+        (fn [{:keys [disposition]}] (if (= :commit disposition) :commit :hold)))
+
+      (g/set-finish-point :record)
+      (g/set-finish-point :commit)
+      (g/set-finish-point :hold)
+
+      (g/compile-graph
+       {:checkpointer checkpointer :interrupt-before #{:request-approval}})))

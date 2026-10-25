@@ -1,0 +1,184 @@
+(ns goyoukiki.store
+  "SSoT for goyoukiki — a procurement-signal + bidder-matching control plane,
+  behind a `Store` protocol so the backend is a swap (MemStore default ‖
+  DatomicStore via langchain.db, itself swappable to real Datomic Local /
+  kotoba-server).
+
+  Domain = the propose/share lifecycle for opportunity⟷candidate matches. The
+  actor only ever writes `:match` records (control-plane proposals); notifying
+  a candidate that a match exists is an EXTERNAL effect performed by a
+  MatchTarget port, and only after human sign-off.
+
+    opportunity — a 調達 ground fact (:forecast 調達予定 | :tender 入札公告)
+    candidate   — a 団体 ground fact (全省庁統一資格 registrant)
+    match       — the committed/proposed opportunity⟷candidate pairing
+                  (score, rationale, confidence, cites, redactions, status
+                  :proposed/:shared)
+
+  Charter: the append-only **ledger is goyoukiki's matching audit trail**
+  (which candidate was matched to which opportunity, on what basis, who
+  approved sharing it, when)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [langchain.db :as d]
+            [goyoukiki.model :as model]))
+
+(defprotocol Store
+  (opportunity [s id])
+  (all-opportunities [s])
+  (candidate [s id])
+  (all-candidates [s])
+  (match-for [s opportunity-id candidate-id] "committed/proposed match for a pairing, or nil")
+  (matches-for-opportunity [s opportunity-id])
+  (ledger [s])
+  (record-datom! [s record] "append/merge a goyoukiki ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable matching-audit fact")
+  (seed! [s data]           "bulk-seed entity collections (idempotent upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+
+(defn demo-data
+  "A JP demo procurement book: one advance forecast (経産省クラウド基盤
+  整備・調達予定) and one live tender (防衛省レーダー保守役務入札公告), plus
+  two 全省庁統一資格 candidates, one eligible for each."
+  []
+  {:opportunities
+   {"opp-meti-cloud-2027"
+    (model/opportunity "opp-meti-cloud-2027" "経済産業省" :forecast
+      {:title "クラウド基盤整備(調達予定)" :cofog "04.5" :unspsc "81112000"
+       :required-categories #{:役務} :min-rank :B})
+    "opp-mod-radar-2026"
+    (model/opportunity "opp-mod-radar-2026" "防衛省" :tender
+      {:title "レーダー保守役務入札公告" :cofog "02.2" :unspsc "81101500"
+       :required-categories #{:役務} :min-rank :A
+       :deadline "2026-08-15" :status :open})}
+   :candidates
+   {"cand-fujitera"
+    (model/candidate "cand-fujitera" "藤寺システムズ株式会社"
+      {:categories #{:役務 :物品の製造} :rank :A :unspsc-tags #{"81112000" "81101500"}
+       :contact "biz@fujitera.example.jp"})
+    "cand-kaien"
+    (model/candidate "cand-kaien" "海燕テクノロジーズ株式会社"
+      {:categories #{:役務} :rank :C :unspsc-tags #{"81101500"}
+       :contact "biz@kaien.example.jp"})}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (opportunity [_ id] (get-in @a [:opportunities id]))
+  (all-opportunities [_] (sort-by :id (vals (:opportunities @a))))
+  (candidate [_ id] (get-in @a [:candidates id]))
+  (all-candidates [_] (sort-by :id (vals (:candidates @a))))
+  (match-for [_ opportunity-id candidate-id]
+    (get-in @a [:matches (model/match-id opportunity-id candidate-id)]))
+  (matches-for-opportunity [_ opportunity-id]
+    (->> (:matches @a) vals (filter #(= opportunity-id (:opportunity-id %))) (sort-by :candidate-id)))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :opportunity (swap! a update-in [:opportunities id] merge value)
+      :candidate   (swap! a update-in [:candidates id] merge value)
+      :match       (swap! a update-in [:matches id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data]
+    ;; per-id upsert — mirrors DatomicStore.seed! exactly, so seeding again
+    ;; with a new id never wipes out unrelated already-seeded ground facts.
+    (doseq [[id opp] (:opportunities data)] (record-datom! s {:kind :opportunity :id id :value opp}))
+    (doseq [[id c] (:candidates data)] (record-datom! s {:kind :candidate :id id :value c}))
+    s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :matches {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:opportunity/id {:db/unique :db.unique/identity}
+   :candidate/id   {:db/unique :db.unique/identity}
+   :match/id       {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (opportunity [this id]
+    (-> (pull* this [:opportunity/edn] [:opportunity/id id]) :opportunity/edn dec*))
+  (all-opportunities [this]
+    (->> (q* this '[:find [?id ...] :where [?e :opportunity/id ?id]])
+         (map #(opportunity this %)) (sort-by :id)))
+  (candidate [this id]
+    (-> (pull* this [:candidate/edn] [:candidate/id id]) :candidate/edn dec*))
+  (all-candidates [this]
+    (->> (q* this '[:find [?id ...] :where [?e :candidate/id ?id]])
+         (map #(candidate this %)) (sort-by :id)))
+  (match-for [this opportunity-id candidate-id]
+    (-> (pull* this [:match/edn] [:match/id (model/match-id opportunity-id candidate-id)]) :match/edn dec*))
+  (matches-for-opportunity [this opportunity-id]
+    (->> (q* this '[:find [?id ...] :where [?e :match/id ?id]])
+         (map #(-> (pull* this [:match/edn] [:match/id %]) :match/edn dec*))
+         (filter #(= opportunity-id (:opportunity-id %)))
+         (sort-by :candidate-id)))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :opportunity (tx* s [{:opportunity/id id :opportunity/edn (enc (merge (opportunity s id) value))}])
+      :candidate   (tx* s [{:candidate/id id :candidate/edn (enc (merge (candidate s id) value))}])
+      ;; look up the CURRENT value straight by the composite `id` (mirroring
+      ;; how :opportunity/:candidate above merge onto `(opportunity s id)`/
+      ;; `(candidate s id)`) — NOT by re-deriving opportunity-id/candidate-id
+      ;; from `value`, which would silently drop prior fields whenever a
+      ;; caller writes a partial update (e.g. just a :status flip) without
+      ;; repeating them.
+      :match       (tx* s [{:match/id id
+                            :match/edn (enc (merge (-> (pull* s [:match/edn] [:match/id id]) :match/edn dec*)
+                                                    value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id opp] (:opportunities data)] (record-datom! s {:kind :opportunity :id id :value opp}))
+    (doseq [[id c] (:candidates data)] (record-datom! s {:kind :candidate :id id :value c}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see goyoukiki.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))
