@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `kotoba.chainObserver` | `kotoba.chainObserver/src` | `chain.observer`, `chain.observer.contract`, `chain.observer.cosmos`, `chain.observer.evm` (Kotoba project library) |
 | `kotoba.chain` | `kotoba.chain/src` | `chain.authorized`, `chain.core` (Kotoba project library) |
 | `kotoba.chIec608705104` | `kotoba.chIec608705104/src` | `iec60870.apci`, `iec60870.asdu`, `iec60870.float32`, `iec60870.frame` (Kotoba project library) |
 | `kotoba.kotobaseStorage` | `kotoba.kotobaseStorage/src` | `kotobase.storage.async-contract`, `kotobase.storage.contract`, `kotobase.storage.core`, `kotobase.storage.memory` (Kotoba project library) |
