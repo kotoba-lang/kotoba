@@ -223,6 +223,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.jsonrpc` | `org.ethereum.jsonrpc/src` | `kotobase.ethereum.client`, `kotobase.ethereum.rpc` (an external specification, publisher ethereum.org) |
 | `org.ietf.hpke` | `org.ietf.hpke/src` | `hpke.core`, `hpke.dhkem`, `hpke.kdf` (an external specification, publisher ietf.org) |
 | `org.ietf.srtp` | `org.ietf.srtp/src` | `srtp.aes-cm`, `srtp.index`, `srtp.kdf`, `srtp.packet` (an external specification, publisher ietf.org) |
+| `kotoba.outlook` | `kotoba.outlook/src` | `` (Kotoba project library) |
 | `kotoba.openWellbecoming` | `kotoba.openWellbecoming/src` | `` (Kotoba project library) |
 | `kotoba.music` | `kotoba.music/src` | `` (Kotoba project library) |
 | `kotoba.kotobaIso20022` | `kotoba.kotobaIso20022/src` | `` (Kotoba project library) |
