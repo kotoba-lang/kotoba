@@ -1,0 +1,137 @@
+(ns noise.session-test
+  "The transport phase over a lossy, reordering, replaying datagram network —
+  i.e. the conditions Noise's own transport model explicitly does not cover."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.bytes :as b]
+            [noise.cipher-state :as cipher-state]
+            [noise.core :as noise]
+            [noise.session :as session]
+            #?(:clj [noise.provider.jvm :as provider]
+               :cljs [noise.provider.noble :as provider])))
+
+(def st (noise/suite (provider/ports)))
+
+(defn- established
+  "A pair of live sessions from a completed IK handshake."
+  ([] (established 0))
+  ([now]
+   (let [alice (noise/keypair st) bob (noise/keypair st)
+         i (noise/initiator {:suite st :s alice :rs (:pub bob)})
+         r (noise/responder {:suite st :s bob})
+         [i m1] (noise/write-message i [])
+         [r _p1] (noise/read-message r m1)
+         [r m2] (noise/write-message r [])
+         [i _p2] (noise/read-message i m2)]
+     [(noise/session i {:now now :peer-id "bob"})
+      (noise/session r {:now now :peer-id "alice"})])))
+
+(deftest data-round-trip-both-directions
+  (let [[a b] (established)
+        [a f1] (noise/encrypt a (b/utf8-encode "ping"))
+        [b p1] (noise/decrypt b f1)
+        [_b f2] (noise/encrypt b (b/utf8-encode "pong"))
+        [_ p2] (noise/decrypt a f2)]
+    (is (= "ping" (apply str (map char p1))))
+    (is (= "pong" (apply str (map char p2))))
+    (testing "each frame carries its counter, so the receiver never has to
+              guess which nonce a packet was sealed under"
+      (is (= [0 0 0 0 0 0 0 0] (vec (take 8 f1)))))))
+
+(deftest out-of-order-delivery-is-accepted
+  (testing "the whole reason for the explicit counter: UDP reorders, and a
+            strictly-sequential reader would drop everything after the first gap"
+    (let [[a b] (established)
+          frames (reduce (fn [[a fs] i]
+                           (let [[a f] (noise/encrypt a (b/utf8-encode (str "m" i)))]
+                             [a (conj fs f)]))
+                         [a []] (range 5))
+          [_ fs] frames]
+      (loop [b b order [4 0 3 1 2] seen []]
+        (if (empty? order)
+          (is (= #{"m0" "m1" "m2" "m3" "m4"} (set seen)))
+          (let [[b' pt] (noise/decrypt b (nth fs (first order)))]
+            (recur b' (rest order) (conj seen (apply str (map char pt))))))))))
+
+(deftest packet-loss-does-not-desynchronize
+  (let [[a b] (established)
+        [a _dropped] (noise/encrypt a (b/utf8-encode "lost"))
+        [_ f2] (noise/encrypt a (b/utf8-encode "arrives"))
+        [_ pt] (noise/decrypt b f2)]
+    (is (= "arrives" (apply str (map char pt))))))
+
+(deftest replay-is-rejected
+  (let [[a b] (established)
+        [_ f] (noise/encrypt a (b/utf8-encode "once"))
+        [b _] (noise/decrypt b f)]
+    (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"replay"
+                          (noise/decrypt b f))
+        "the same authenticated frame must not be accepted twice")))
+
+(deftest counter-outside-the-window-is-rejected
+  (let [[a b] (established)
+        window (get-in b [:policy :replay-window])
+        ;; deliver a far-future counter first, which slides the window forward
+        far (reduce (fn [a _] (first (noise/encrypt a [1]))) a (range (+ window 10)))
+        [_ f-far] (noise/encrypt far [0x41])
+        [b _] (noise/decrypt b f-far)
+        [_ f-old] (noise/encrypt a [0x42])] ; counter 0, now long behind
+    (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"replay"
+                          (noise/decrypt b f-old)))))
+
+(deftest forged-frame-is-rejected-and-does-not-consume-the-counter
+  (let [[a b] (established)
+        [_ f] (noise/encrypt a (b/utf8-encode "authentic"))
+        forged (update (vec f) 12 bit-xor 0x01)]
+    (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"authentication"
+                          (noise/decrypt b forged)))
+    (testing "the genuine frame with the same counter still verifies afterwards —
+              a forgery must not be able to poison the replay state"
+      (let [[_ pt] (noise/decrypt b f)]
+        (is (= "authentic" (apply str (map char pt))))))))
+
+(deftest rewriting-the-counter-header-fails
+  (testing "the header is associated data, so moving a frame to another counter
+            is a forgery, not a replay"
+    (let [[a b] (established)
+          [_ f] (noise/encrypt a (b/utf8-encode "x"))
+          moved (assoc (vec f) 0 9)]
+      (is (thrown-with-msg? #?(:clj Exception :cljs :default) #"authentication"
+                            (noise/decrypt b moved))))))
+
+;; ── lifetime policy ─────────────────────────────────────────────────────────
+
+(deftest rekey-and-expiry-are-time-driven
+  (let [[a b] (established 1000)]
+    (is (empty? (noise/advice a 1000)))
+    (testing "the initiator rekeys after rekey-after-time; the responder waits,
+              so both sides do not start handshakes at once"
+      (is (contains? (noise/advice a 1121) :rekey))
+      (is (not (contains? (noise/advice b 1121) :rekey))))
+    (testing "and both sides expire the session after reject-after-time"
+      (is (contains? (noise/advice a 1181) :expire))
+      (is (contains? (noise/advice b 1181) :expire))
+      (is (noise/expired? b 1181)))))
+
+(deftest keepalive-follows-received-traffic
+  (let [[a b] (established 0)
+        [_ f] (noise/encrypt a (b/utf8-encode "hi") {:now 0})
+        [b _] (noise/decrypt b f {:now 0})]
+    (is (not (noise/needs-keepalive? b 5)))
+    (is (noise/needs-keepalive? b 10)
+        "having received data and sent nothing for keepalive-timeout, send an
+         empty frame to hold the NAT mapping open")))
+
+(deftest handshake-retry-plan
+  (let [p session/default-policy]
+    (is (= :send (noise/handshake-plan nil 0 p)))
+    (is (= :wait (noise/handshake-plan {:attempts 1 :last-at 100 :started-at 100} 102 p)))
+    (is (= :send (noise/handshake-plan {:attempts 1 :last-at 100 :started-at 100} 105 p)))
+    (is (= :give-up (noise/handshake-plan {:attempts 5 :last-at 180 :started-at 100} 190 p)))))
+
+(deftest rekey-derives-a-new-key
+  (testing "REKEY replaces the transport key without a new handshake"
+    (let [[a _] (established)
+          k (get-in a [:send-cs :k])
+          k' (:k (cipher-state/rekey (:send-cs a)))]
+      (is (= 32 (count k')))
+      (is (not= (vec k) (vec k'))))))
