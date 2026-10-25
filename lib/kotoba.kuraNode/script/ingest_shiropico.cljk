@@ -1,0 +1,291 @@
+(ns ingest-shiropico
+  "The first real workload: SHIRO & PICO production assets onto the live fleet.
+
+  Why this data and not a synthetic object. Everything kura has proved so far
+  was proved with bytes generated for the purpose, and a probe that writes its
+  own input tells you the code works, not that the system does. Repair events,
+  audit outcomes, egress patterns and cost only appear once something is stored
+  that somebody would be upset to lose.
+
+  Why it is safe to be the first. These assets already have TWO copies — the
+  source bucket `ai-gftd-datasets` and a git-annex trusted copy in
+  `gftdcojp-m365-annex`. **Both are Backblaze B2.** Different buckets, one
+  provider, therefore one failure domain by `kura.node.store/domain-key`'s own
+  reading. So kura failing costs nothing here, and kura succeeding genuinely
+  improves this data's durability rather than merely demonstrating something:
+  four domains across two providers and two of the owner's own sites, replacing
+  redundancy that is currently provider-correlated.
+
+  Excludes `episode/` — 82 objects, 10 GB of the 10.4 GB total. This run is the
+  other 206, about 294 MB: scene stills, bgm, panels, op cuts, motion comic. A
+  coherent set that finishes, rather than a number that looks bigger."
+  (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            [kotoba.lang.text :as str]
+            [erasure.lrc :as lrc]
+            [kura.manifest :as manifest]
+            [kura.node.async :as async]
+            [kura.node.crypto-noble :as nc]
+            [kura.node.http-fetch :as hf]
+            [kura.node.http-node :as hn]
+            [kura.node.object :as obj]
+            [kura.node.s3-async :as s3a]
+            [kura.node.store :as store]
+            [kura.placement :as pl]))
+
+(def layout
+  "The launch layout — n=32, 2.0x. Not the target: at four domains the target
+  code's margin after a domain loss is zero, and a first real workload is
+  exactly the wrong place to spend the last shard of headroom. Launch carries 5."
+  (lrc/layout {:k 16 :r 4 :g 12}))
+
+(def ^:private src-prefix "ghosthacker-shiropico/")
+(def ^:private receipts-path "/tmp/shiropico-receipts.json")
+
+(defn- env [k] (aget (.-env js/process) k))
+
+(defn- with-retry>
+  "Retry `f>` on transport failure, with linear backoff.
+
+  A first real ingest lost 26 of 68 objects to `fetch failed` — transient
+  socket failures against remote backends, one of which is enough to abandon an
+  object under a no-retry policy. Retry is the caller's policy rather than the
+  store's, because how long to keep trying depends on whether a human is
+  watching, and the store cannot know."
+  [attempts f>]
+  (letfn [(go [n]
+            (-> (f>)
+                (.catch (fn [e]
+                          (if (>= n attempts)
+                            (throw e)
+                            (js/Promise.
+                             (fn [res] (js/setTimeout #(res (go (inc n)) ) (* 400 n)))))))))]
+    (go 1)))
+(defn- digest [b] (-> (.createHash crypto "sha256") (.update b) (.digest "hex")))
+
+;; --- the fleet -------------------------------------------------------------
+
+(defn- source-store []
+  (s3a/open {:node-id "src" :http (hf/fetch-http) :crypto (nc/noble-crypto)
+             :key-id (env "SRC_KEY_ID") :secret (env "SRC_APP_KEY")
+             :endpoint "https://s3.us-west-004.backblazeb2.com"
+             :host "s3.us-west-004.backblazeb2.com"
+             :bucket "ai-gftd-datasets" :region "us-west-004"
+             :prefix "" :now-fn hf/now-iso
+             :independence :shared-provider :availability :always-on
+             :failure-domain {:provider "backblaze-b2" :account "datasets"}}))
+
+(defn- fleet> []
+  (let [http (hf/fetch-http)
+        b2 (s3a/open {:node-id "b2" :http http :crypto (nc/noble-crypto)
+                      :key-id (env "B2_KEY_ID") :secret (env "B2_APP_KEY")
+                      :endpoint "https://s3.us-west-004.backblazeb2.com"
+                      :host "s3.us-west-004.backblazeb2.com"
+                      :bucket "kura-phase0-b2" :region "us-west-004"
+                      :prefix "kura" :now-fn hf/now-iso
+                      :independence :shared-provider :availability :always-on
+                      :failure-domain {:provider "backblaze-b2" :account "kura-phase0"}})
+        remotes [["judah" "http://100.113.200.45:8410" {}]
+                 ["air-ssd" "http://127.0.0.1:8411" {}]
+                 ["gad" "http://100.82.98.110:8410" {}]
+                 ["r2" "https://kura-r2-node.04-feasts-minded.workers.dev"
+                  {"authorization" (str "Bearer " (env "KURA_NODE_TOKEN"))}]]]
+    (-> (js/Promise.all
+         (clj->js (map (fn [[nm base hdrs]]
+                         (-> (hn/descriptor> http base hdrs)
+                             (.then (fn [d] [nm (hn/open {:http http :base base
+                                                          :descriptor d :headers hdrs})]))))
+                       remotes)))
+        (.then (fn [pairs] (into {"b2" b2} (vec pairs)))))))
+
+(defn- assign
+  "shard index -> store, chosen by kura.placement under a per-domain cap.
+
+  Placement decides, not this script. That is the difference between a
+  demonstration and a system: the same function that will place a customer's
+  shards places these.
+
+  **Backends are expanded into slots first.** `select` picks n DISTINCT nodes,
+  and there are 5 backends for 32 shards — so a backend has to hold several,
+  and each slot carries its backend's domain so the cap counts the domain rather
+  than the box. Skipping this is how the first attempt asked for 32 nodes, got
+  5, and correctly refused to place.
+
+  The cap is the even spread, ceil(n / domains) = 8, not the code's tolerance of
+  13. Both are survivable; 8 leaves 5 shards of margin after losing a domain and
+  13 leaves none, and there is no reason to spend margin that costs nothing to
+  keep."
+  [stores]
+  (let [tol (lrc/max-tolerated-erasures layout)
+        domain-of (fn [s] (let [d (store/-descriptor s)]
+                            (str/join "/" (map str (vals (:failure-domain d))))))
+        domains (into #{} (map (fn [[_ s]] (domain-of s))) stores)
+        cap (js/Math.ceil (/ (:n layout) (count domains)))
+        slots (vec (for [[nm s] stores i (range (:n layout))]
+                     (pl/node {:id (str nm "#" i)
+                               :availability (:availability (store/-descriptor s))
+                               :domains {:site (domain-of s)}})))
+        pol (pl/policy {:caps {:site cap} :max-intermittent tol})
+        picked (:nodes (pl/select "pg-shiropico" slots (:n layout) pol))]
+    (assert (<= cap tol) (str "cap " cap " exceeds tolerance " tol))
+    (when (< (count picked) (:n layout))
+      (throw (js/Error. (str "placement short: " (count picked) " of " (:n layout)
+                             " under cap " cap " across " (count domains) " domains"))))
+    (println (str "placement: cap " cap "/domain (tolerance " tol
+                  ", margin after a domain loss " (- tol cap) ")"))
+    (mapv (fn [n] (get stores (first (str/split (:id n) #"#")))) picked)))
+
+;; --- source listing --------------------------------------------------------
+
+(defn- object-id
+  "A source key flattened into something `store/valid-shard-id?` accepts.
+
+  Its regex is `[^/]+/\\d+/\\d+` — the object part may not contain a slash,
+  because a shard id IS `<object>/<stripe>/<index>` and a slash in the object
+  would make the split ambiguous. Source keys are full of slashes, so they are
+  flattened rather than hashed: the id stays readable on the node, which matters
+  the first time somebody has to look at a disk and work out what is on it. The
+  receipts file holds the mapping back."
+  [k]
+  (str "shiropico_" (str/replace k "/" "_")))
+
+(defn- already-stored
+  "Keys already in the receipts file, so a re-run resumes instead of restarting.
+
+  Not an optimisation. An ingest that cannot resume has to be run in one
+  uninterrupted go, which for a few hundred objects over four backends means it
+  can never be interrupted for a fix — and every fix so far came from watching it
+  fail partway. Re-writing what is already stored would also churn shards that
+  repair has just brought back to full redundancy."
+  []
+  (if-not (.existsSync fs receipts-path)
+    #{}
+    (try (into #{} (map :key)
+               (js->clj (js/JSON.parse (.readFileSync fs receipts-path "utf8"))
+                        :keywordize-keys true))
+         (catch :default _ #{}))))
+
+(defn -main []
+  ;; NOTE on reading the source through -get-shard>: kura.node.s3-async has no
+  ;; plain object-get, only the shard-store contract, and GET does not validate
+  ;; the id the way PUT does. That is what makes this work and it is a shortcut,
+  ;; not a pattern — a foreign bucket is not a shard store. Fine for a one-off
+  ;; ingest; if this becomes routine the right fix is a small object-read seam
+  ;; rather than more scripts leaning on the gap.
+  (doseq [v ["SRC_KEY_ID" "SRC_APP_KEY" "B2_KEY_ID" "B2_APP_KEY" "KURA_NODE_TOKEN"]]
+    (assert (seq (or (env v) "")) (str v " is required")))
+  (let [src (source-store)]
+    (-> (fleet> )
+        (.then (fn [stores]
+                 (let [ring (assign stores)
+                       store-for (fn [_stripe i] (nth ring i))
+                       descs (mapv #(store/-descriptor %) ring)
+                       a (store/audit descs (lrc/max-tolerated-erasures layout))]
+                   (println "fleet   :" (:effective-domains a) "domains · largest"
+                            (:largest-domain a) "/" (:tolerated a)
+                            "· survivable" (:survivable? a))
+                   (doseq [[d ns] (:domains a)] (println "   " d "->" (count ns) "shards"))
+                   (println "layout  :" (select-keys layout [:k :n]) "multiplier"
+                            (/ (:n layout) (:k layout)))
+                   (println)
+                   {:src src :store-for store-for})))
+        (.then (fn [ctx]
+                 (println "listing source objects…")
+                 (-> (async/-list-shards> (:src ctx) src-prefix)
+                     (.then (fn [keys] (assoc ctx :keys (vec keys)))))))
+        (.then (fn [{:keys [keys] :as ctx}]
+                 (let [done (already-stored)
+                       selected (->> keys (remove #(str/includes? % "/episode/")) vec)
+                       wanted (vec (remove done selected))]
+                   (println (str "  " (count keys) " total, " (count selected)
+                                 " selected (episode/ excluded), " (count done)
+                                 " already stored, " (count wanted) " to do"))
+                   (assoc ctx :wanted wanted))))
+        (.then (fn [{:keys [src wanted store-for]}]
+                 (println)
+                 (println "storing…")
+                 (reduce
+                  (fn [p k]
+                    (.then p (fn [acc]
+                      (-> (with-retry> 4 #(async/-get-shard> src k))
+                          (.then (fn [body]
+                            (if (or (nil? body) (zero? (.-length body)))
+                              (do (println "  skip (empty):" k) (update acc :skipped inc))
+                              (let [size (.-length body)
+                                    ;; stripe-bytes must divide by k. Small
+                                    ;; objects get a small stripe so a 100 KB
+                                    ;; file does not pay for a 1 MiB one — the
+                                    ;; amplification stays 2.0x either way.
+                                    sb (max 16 (* 16 (js/Math.ceil (/ (min size (* 1024 1024)) 16))))
+                                    plan (manifest/plan {:object-id (object-id k)
+                                                         :size size :stripe-bytes sb}
+                                                        layout)]
+                                (-> (with-retry> 4 #(obj/put-object!> {:plan plan :store-for store-for
+                                                                       :digest digest :bytes body
+                                                                       ;; B2 drops a whole batch of 8
+                                                                       ;; when it closes its keep-alive
+                                                                       ;; socket, and 8 of 32 is well
+                                                                       ;; inside a tolerance of 13. All
+                                                                       ;; or nothing would fail every
+                                                                       ;; multi-megabyte object to a
+                                                                       ;; loss the code exists to absorb.
+                                                                       :allow-degraded true}))
+                                    (.then (fn [r]
+                                             (-> acc
+                                                 (update :stored inc)
+                                                 (update :logical-bytes + size)
+                                                 (update :physical-bytes + (:physical-bytes r))
+                                                 (update :receipts conj
+                                                         {:key k :size size :stripe-bytes sb
+                                                          :stripes (:stripes r)
+                                                          :digest (:digest r)
+                                                          :degraded? (:degraded? r)
+                                                          :missing (:missing-shards r)
+                                                          ;; The reasons, not only the indices. Added
+                                                          ;; second because I put them in the object
+                                                          ;; layer and forgot the receipt that carries
+                                                          ;; them out — the diagnosis was one field
+                                                          ;; short of being readable.
+                                                          :missing-reasons (:missing-reasons r)})
+                                                 (as-> acc2
+                                                       (do
+                                                         ;; Written after EVERY object, not at the
+                                                         ;; end. The first run stored 42 objects and
+                                                         ;; then died before its final report, so
+                                                         ;; there were no receipts and therefore
+                                                         ;; nothing verifiable — 42 successful writes
+                                                         ;; made worthless by where the file got
+                                                         ;; flushed.
+                                                         (.writeFileSync fs receipts-path
+                                                                         (js/JSON.stringify
+                                                                          (clj->js (:receipts acc2)) nil 2))
+                                                         acc2))))))))))
+                          (.catch (fn [e]
+                                    (println "  ERROR" k "-" (.-message e))
+                                    (update acc :failed inc)))))))
+                  ;; Seeded with what is already on disk so a resumed run does
+                  ;; not truncate the receipts of the objects it is skipping —
+                  ;; which would strand them: stored, and unverifiable.
+                  (js/Promise.resolve {:stored 0 :skipped 0 :failed 0
+                                       :logical-bytes 0 :physical-bytes 0
+                                       :receipts (if (.existsSync fs receipts-path)
+                                                   (vec (js->clj (js/JSON.parse
+                                                                  (.readFileSync fs receipts-path "utf8"))
+                                                                 :keywordize-keys true))
+                                                   [])})
+                  wanted)))
+        (.then (fn [r]
+                 (println)
+                 (println "stored  :" (:stored r) "objects · skipped" (:skipped r)
+                          "· failed" (:failed r))
+                 (println "degraded:" (count (filter :degraded? (:receipts r)))
+                          "objects wrote short of full redundancy (readable, repair pending)")
+                 (println "logical :" (.toFixed (/ (:logical-bytes r) 1e6) 1) "MB")
+                 (println "physical:" (.toFixed (/ (:physical-bytes r) 1e6) 1) "MB"
+                          (str "(" (.toFixed (/ (:physical-bytes r) (max 1 (:logical-bytes r))) 3) "x)"))
+                 (println "receipts:" receipts-path
+                          (count (:receipts r)) "entries")
+                 (when (pos? (:failed r)) (set! (.-exitCode js/process) 1))))
+        (.catch (fn [e] (println "FATAL" (.-message e)) (set! (.-exitCode js/process) 1))))))
+
+(-main)

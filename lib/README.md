@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kuraNode` | `kotoba.kuraNode/src` | `kura.node.accounting`, `kura.node.async`, `kura.node.audit`, `kura.node.contract` (Kotoba project library) |
 | `kotoba.kuraBugyo` | `kotoba.kuraBugyo/src` | `kura.bugyo.budget`, `kura.bugyo.collateral`, `kura.bugyo.epoch`, `kura.bugyo.plane` (Kotoba project library) |
 | `kotoba.kura` | `kotoba.kura/src` | `kura.audit`, `kura.hash`, `kura.kotoba-oracle`, `kura.manifest` (Kotoba project library) |
 | `kotoba.kotobaseProtocolCore` | `kotoba.kotobaseProtocolCore/src` | `kotobase.protocols.blocks`, `kotobase.protocols.cid`, `kotobase.protocols.hash`, `kotobase.protocols.http` (Kotoba project library) |

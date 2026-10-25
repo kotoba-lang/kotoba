@@ -1,0 +1,105 @@
+(ns kura.node.gf-test
+  "The gate that makes the fast path legitimate.
+
+  ADR-2607299200 section 5 designates `erasure.gf/scale-add` as the one piece
+  of *mechanism* a host provider may replace, on the condition that it proves
+  byte-equality against the definition. This namespace is that condition. It is
+  not a sample of convenient inputs: the coefficient sweep is exhaustive over
+  all 256 field elements, and the encode comparison runs the real k=16/r=4/g=6
+  layout."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [erasure.codec :as codec]
+            [erasure.gf :as ref-gf]
+            [erasure.lrc :as lrc]
+            [erasure.matrix :as matrix]
+            [kura.node.gf :as gf]))
+
+(defn- shard [seed len]
+  (mapv #(mod (+ (* seed 131) (* % 37) (* seed % 7) 11) 256) (range len)))
+
+(deftest tables-agree-with-the-definition
+  (testing "all 65,536 products, against the table-free Russian-peasant
+            definition rather than against erasure's own tables — a fast path
+            derived from the slow path's tables could share its bugs"
+    (is (every? (fn [c]
+                  (let [t (gf/mul-table c)]
+                    (every? (fn [x] (= (ref-gf/mul-def c x) (nth t x))) (range 256))))
+                (range 256)))))
+
+(deftest byte-equality-with-the-reference
+  (testing "every coefficient in the field, on a shard containing every byte"
+    (let [acc (vec (range 256))
+          xs (mapv #(mod (* 7 %) 256) (range 256))
+          acc-buf (gf/->bytes acc)
+          xs-buf (gf/->bytes xs)]
+      (doseq [c (range 256)]
+        (is (= (ref-gf/scale-add acc c xs)
+               (gf/->vec (gf/scale-add acc-buf c xs-buf)))
+            (str "scale-add with c=" c))))))
+
+(deftest signed-bytes-do-not-leak
+  (testing "the JVM hazard this namespace exists to contain: 200 reads back as
+            -56 from a byte[], and -56 is not a table index"
+    (let [high (mapv (fn [_] 200) (range 16))
+          buf (gf/->bytes high)]
+      (is (= high (gf/->vec buf)) "round-trip is unsigned")
+      (is (every? #(<= 0 % 255) (gf/->vec (gf/scale-add buf 3 buf))))
+      (is (= (ref-gf/scale-add high 3 high)
+             (gf/->vec (gf/scale-add buf 3 (gf/->bytes high))))
+          "and the product matches the reference"))))
+
+(deftest in-place-and-copying-forms-agree
+  (let [acc (shard 1 64)
+        xs (shard 2 64)]
+    (doseq [c [0 1 2 7 128 255]]
+      (let [copied (gf/scale-add (gf/->bytes acc) c (gf/->bytes xs))
+            in-place (gf/scale-add! (gf/->bytes acc) c (gf/->bytes xs))]
+        (is (= (gf/->vec copied) (gf/->vec in-place)) (str "c=" c))
+        (is (= (ref-gf/scale-add acc c xs) (gf/->vec in-place)))))))
+
+(deftest zero-coefficient-is-a-no-op
+  (let [acc (gf/->bytes (shard 3 32))]
+    (is (= (gf/->vec acc) (gf/->vec (gf/scale-add acc 0 (gf/->bytes (shard 4 32))))))))
+
+(deftest xor-path-does-no-multiplies
+  (testing "local parity is a plain xor — the path a single-shard repair runs"
+    (let [a (shard 5 48) b (shard 6 48) c (shard 7 48)]
+      (is (= (ref-gf/xor-shards [a b c] 48)
+             (gf/->vec (gf/xor-shards (map gf/->bytes [a b c]) 48)))))))
+
+(deftest apply-row-matches-the-reference
+  (let [lay (lrc/layout {:k 16 :r 4 :g 6})
+        data (mapv #(shard % 96) (range 16))
+        rows (matrix/cauchy-rows 16 6)]
+    (doseq [[i row] (map-indexed vector rows)]
+      (is (= (matrix/apply-row row data 96)
+             (gf/->vec (gf/apply-row row (mapv gf/->bytes data) 96)))
+          (str "global parity row " i)))
+    (testing "and the whole encode, shard for shard"
+      (let [encoded (codec/encode lay data)
+            fast (into (vec (map gf/->bytes data))
+                       (concat
+                        (map (fn [q]
+                               (gf/xor-shards
+                                (map #(gf/->bytes (nth data %)) (lrc/group-members lay q))
+                                96))
+                             (range (:l lay)))
+                        (map #(gf/apply-row % (mapv gf/->bytes data) 96) rows)))]
+        (is (= 26 (count fast)))
+        (doseq [i (range 26)]
+          (is (= (nth encoded i) (gf/->vec (nth fast i)))
+              (str "shard " i " byte-identical to the reference encode")))))))
+
+(deftest provider-surfaces-are-interchangeable
+  (testing "a conformance run must be able to swap the two without either side
+            knowing which it got — the property section 5 asks for"
+    (let [fast (gf/provider)
+          slow gf/reference-provider
+          acc (gf/->bytes (shard 8 40))
+          xs (gf/->bytes (shard 9 40))]
+      (doseq [c [1 3 17 200 255]]
+        (is (= (gf/->vec ((:scale-add slow) acc c xs))
+               (gf/->vec ((:scale-add fast) acc c xs)))
+            (str "providers agree at c=" c)))
+      (is (= ::gf/table-driven (:name fast)))
+      (is (= ::gf/reference (:name slow))))))

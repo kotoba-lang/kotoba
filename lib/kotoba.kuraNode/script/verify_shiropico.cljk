@@ -1,0 +1,113 @@
+(ns verify-shiropico
+  "Read every stored object back and check it against the digest the ingest
+  recorded.
+
+  Storing is not the claim. The claim is that it comes back, and the only way to
+  make that checkable later is the receipt: `put-object!>` returned a digest and
+  the ingest wrote it down, so this can be run at any time — after a node
+  reboots, after a repair, a month from now — without the original bytes being
+  anywhere nearby. That is the difference between a receipt and a log message.
+
+  Verification goes through the same placement the ingest used, and repairs on
+  read if shards are missing. A run that reports `repaired > 0` is not a failure;
+  it is the code doing what it exists for, and worth reporting separately from a
+  digest mismatch, which is."
+  (:require ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
+            [kotoba.lang.text :as str]
+            [erasure.lrc :as lrc]
+            [kura.manifest :as manifest]
+            [kura.node.crypto-noble :as nc]
+            [kura.node.gf :as gf]
+            [kura.node.http-fetch :as hf]
+            [kura.node.http-node :as hn]
+            [kura.node.object :as obj]
+            [kura.node.s3-async :as s3a]
+            [kura.node.store :as store]
+            [kura.placement :as pl]))
+
+(def layout (lrc/layout {:k 16 :r 4 :g 12}))
+(defn- env [k] (aget (.-env js/process) k))
+(defn- digest [b] (-> (.createHash crypto "sha256") (.update b) (.digest "hex")))
+(defn- object-id [k] (str "shiropico_" (str/replace k "/" "_")))
+
+(defn- fleet> []
+  (let [http (hf/fetch-http)
+        b2 (s3a/open {:node-id "b2" :http http :crypto (nc/noble-crypto)
+                      :key-id (env "B2_KEY_ID") :secret (env "B2_APP_KEY")
+                      :endpoint "https://s3.us-west-004.backblazeb2.com"
+                      :host "s3.us-west-004.backblazeb2.com"
+                      :bucket "kura-phase0-b2" :region "us-west-004"
+                      :prefix "kura" :now-fn hf/now-iso
+                      :independence :shared-provider :availability :always-on
+                      :failure-domain {:provider "backblaze-b2" :account "kura-phase0"}})]
+    (-> (js/Promise.all
+         (clj->js (map (fn [[nm base hdrs]]
+                         (-> (hn/descriptor> http base hdrs)
+                             (.then (fn [d] [nm (hn/open {:http http :base base
+                                                          :descriptor d :headers hdrs})]))))
+                       [["judah" "http://100.113.200.45:8410" {}]
+                        ["air-ssd" "http://127.0.0.1:8411" {}]
+                        ["gad" "http://100.82.98.110:8410" {}]
+                        ["r2" "https://kura-r2-node.04-feasts-minded.workers.dev"
+                         {"authorization" (str "Bearer " (env "KURA_NODE_TOKEN"))}]])))
+        (.then (fn [pairs] (into {"b2" b2} (vec pairs)))))))
+
+(defn- assign
+  "The SAME placement the ingest used — same group name, same policy. If this
+  drifted from the ingest the reads would look for shards where nothing was
+  written, so it is deliberately a copy of one function rather than two
+  independently-written ones that happen to agree today."
+  [stores]
+  (let [tol (lrc/max-tolerated-erasures layout)
+        domain-of (fn [s] (let [d (store/-descriptor s)]
+                            (str/join "/" (map str (vals (:failure-domain d))))))
+        domains (into #{} (map (fn [[_ s]] (domain-of s))) stores)
+        cap (js/Math.ceil (/ (:n layout) (count domains)))
+        slots (vec (for [[nm s] stores i (range (:n layout))]
+                     (pl/node {:id (str nm "#" i)
+                               :availability (:availability (store/-descriptor s))
+                               :domains {:site (domain-of s)}})))
+        picked (:nodes (pl/select "pg-shiropico" slots (:n layout)
+                                  (pl/policy {:caps {:site cap} :max-intermittent tol})))]
+    (mapv (fn [n] (get stores (first (str/split (:id n) #"#")))) picked)))
+
+(defn -main []
+  (let [receipts (js->clj (js/JSON.parse (.readFileSync fs "/tmp/shiropico-receipts.json" "utf8"))
+                          :keywordize-keys true)]
+    (println "receipts:" (count receipts))
+    (-> (fleet>)
+        (.then (fn [stores]
+                 (let [ring (assign stores)
+                       store-for (fn [_s i] (nth ring i))]
+                   (reduce
+                    (fn [p {:keys [key size stripe-bytes digest] :as r}]
+                      (.then p (fn [acc]
+                        (let [plan (manifest/plan {:object-id (object-id key)
+                                                   :size size :stripe-bytes stripe-bytes}
+                                                  layout)]
+                          (-> (obj/get-object> {:plan plan :store-for store-for
+                                                :digest verify-shiropico/digest
+                                                :expect-digest digest})
+                              (.then (fn [g]
+                                       (-> acc
+                                           (update :ok inc)
+                                           (update :bytes + (gf/blength (:bytes g)))
+                                           (update :repaired + (:repaired g))
+                                           (update :unreachable + (:unreachable g)))))
+                              (.catch (fn [e]
+                                        (println "  FAIL" key "-" (.-message e))
+                                        (update acc :failed inc))))))))
+                    (js/Promise.resolve {:ok 0 :failed 0 :repaired 0 :unreachable 0 :bytes 0})
+                    receipts))))
+        (.then (fn [r]
+                 (println)
+                 (println "verified:" (:ok r) "· failed" (:failed r))
+                 (println "repaired on read:" (:repaired r) "shards"
+                          "· of which unreachable rather than absent:" (:unreachable r))
+                 (if (zero? (:failed r))
+                   (println "every object came back byte-identical to its receipt")
+                   (set! (.-exitCode js/process) 1))))
+        (.catch (fn [e] (println "FATAL" (.-message e)) (set! (.-exitCode js/process) 1))))))
+
+(-main)
