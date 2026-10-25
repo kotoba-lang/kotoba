@@ -1,0 +1,406 @@
+(ns matter.tlv
+  "Matter's own Tag-Length-Value encoding — the wire format every Matter
+  application payload (attribute reports, command fields, cluster data)
+  is carried in. Structurally CBOR-adjacent (a control byte naming a
+  type, then a type-dependent value shape) but genuinely its own format:
+  where CBOR's major-type byte names one of 8 major types with 5 length
+  bits, TLV's control byte splits 3 bits of **Tag Control** (how the
+  element's tag — its 'key', absent for array elements — is encoded) from
+  5 bits of **Element Type** (fixed-width scalars, length-prefixed
+  strings, containers), and a TLV tag can be a bare 8-bit context number,
+  a 16/32-bit 'common profile' number, or a fully-qualified
+  vendor-id+profile+number triple — CBOR has no equivalent to any of
+  that. `kotoba-lang/org-ietf-cbor` is worth reading before this file for
+  the *shape* of a self-describing tagged codec (its control-byte-then-
+  payload structure, its byte-sink/source plumbing), not for anything
+  reusable byte-for-byte.
+
+  ## Provenance
+
+  The Matter specification is a CSA member document; nothing here is a
+  spec quotation. The control-byte split (Tag Control high 3 bits /
+  Element Type low 5 bits), the Element Type code table, and the six Tag
+  Control forms are reconstructed from the open-source (Apache-2.0)
+  `connectedhomeip` reference implementation's TLV layer
+  (`src/lib/core/TLVTags.h`, `TLVCommon.h`, `TLVWriter.cpp`/
+  `TLVReader.cpp`), the same public source this workspace's other
+  spec-mirror repos (e.g. `org-lora-alliance-lorawan`) point to when the
+  standard itself is not freely available. **Every concrete byte
+  sequence in this library's tests is `;; constructed, not a published
+  spec vector`.**
+
+  ## Control byte (1 byte, always first):
+
+    bits 7-5   Tag Control  — which tag form follows (0 = none)
+    bits 4-0   Element Type — value shape (see `element-types`)
+
+  ## Tag Control (3 bits), and the bytes (little-endian) that follow:
+
+    0  Anonymous               0 bytes    (array elements; a bare value)
+    1  Context-specific        1 byte     8-bit tag number
+    2  Common Profile, 2-byte  2 bytes    16-bit tag number
+    3  Common Profile, 4-byte  4 bytes    32-bit tag number
+    4  Implicit Profile, 2-byte 2 bytes   16-bit tag number
+    5  Implicit Profile, 4-byte 4 bytes   32-bit tag number
+    6  Fully Qualified, 6-byte  6 bytes   vendor-id u16, profile-num u16,
+                                          tag-num u16
+    7  Fully Qualified, 8-byte  8 bytes   vendor-id u16, profile-num u16,
+                                          tag-num u32
+
+  ## Element Type (5 bits) — every multi-byte value LITTLE-ENDIAN:
+
+    0x00-0x03 Signed Int    1/2/4/8 bytes (two's complement)
+    0x04-0x07 Unsigned Int  1/2/4/8 bytes
+    0x08/0x09 Boolean False/True — **the value IS the type code; zero
+              value bytes on the wire**, the one place this format packs
+              a value into the control byte's own type field rather than
+              writing it after
+    0x0A/0x0B Floating Point 4/8 bytes (IEEE 754 binary32/binary64)
+    0x0C-0x0F UTF-8 String, length field 1/2/4/8 bytes, then that many
+              content bytes
+    0x10-0x13 Byte String, same length-field shapes
+    0x14      Null — zero value bytes
+    0x15      Structure — a container of tagged children
+    0x16      Array — a container of anonymously-tagged children
+    0x17      List — a container that (unlike Structure/Array) MAY mix
+              anonymous and tagged children; this library imposes no
+              extra rule and passes whatever tags children carry through
+    0x18      End of Container — terminates 0x15/0x16/0x17; **MUST
+              itself carry an Anonymous tag** (RFC 6282 has nothing to
+              do with this file, but the same discipline the mesh-header
+              dispatch bytes elsewhere in this task's trio need applies:
+              a decoder that didn't check this would silently accept a
+              malformed close marker)
+
+  ## Least confident value in this repository
+
+  The **exact bit split direction** — Tag Control in the *high* 3 bits,
+  Element Type in the *low* 5 bits, rather than the reverse. The
+  existence of exactly these two fields packed into one control byte is
+  corroborated across every public description of Matter TLV this
+  library's knowledge draws on; which end of the byte each field
+  occupies is the one specific fact taken furthest from independent
+  reconfirmation."
+  #?(:clj (:import (java.nio ByteBuffer ByteOrder)))
+  (:require [kotoba.bytes :as kbytes]))
+
+;; ── little-endian integer helpers, floor-division based so a NEGATIVE
+;;    signed value's two's-complement bytes come out right on both
+;;    runtimes (ordinary `quot`/`mod` on a negative JVM Long already do
+;;    the right thing per-byte; ClojureScript has no distinction to get
+;;    wrong here since every number is already a plain double) ─────────
+
+(defn- pow256 [n] (loop [n n acc 1] (if (zero? n) acc (recur (dec n) #?(:clj (*' acc 256) :cljs (* acc 256))))))
+
+(defn- int-n-le
+  "n little-endian bytes of `x` (may be negative — two's complement)."
+  [x n]
+  (loop [x x i 0 acc []]
+    (if (= i n)
+      acc
+      (let [b (mod x 256)
+            b' (int b)]
+        (recur #?(:clj (quot (-' x b) 256) :cljs (quot (- x b) 256)) (inc i) (conj acc b'))))))
+
+(defn- rd-uint-n-le
+  "The n-byte little-endian sequence at `off` as a nonnegative integer."
+  [bs off n]
+  (reduce (fn [acc b] #?(:clj (+' (*' acc 256) b) :cljs (+ (* acc 256) b)))
+          0 (reverse (subvec (vec bs) off (+ off n)))))
+
+(defn- rd-int-n-le
+  "Same, but reinterpreted as n-byte two's complement.
+
+  Deliberately NOT implemented as 'read the unsigned magnitude, then
+  subtract 2^(8n) if it's in the upper half' — that was this function's
+  first draft, and it was wrong on ClojureScript for every negative
+  value, not merely huge ones. For `n=8` a negative value's unsigned
+  magnitude sits near 2^64, which the +'/*' accumulation in
+  `rd-uint-n-le` builds exactly on the JVM but ClojureScript's plain
+  `+`/`*` (doubles, 53 bits of exact mantissa) round to the nearest
+  representable double along the way — for `-1` specifically, the
+  64-bit unsigned magnitude 2^64-1 rounds UP to exactly 2^64, which then
+  reads as `>= half` and produces `2^64 - 2^64 = 0` instead of `-1`.
+  That is not a precision boundary, it is `-1` coming back as `0`.
+
+  This version instead sign-extends from the most-significant byte
+  FIRST, then accumulates the remaining bytes onto that already-signed
+  seed (`(((top * 256) + b_{n-2}) * 256 + ...) + b_0`) — the intermediate
+  values this builds stay proportional to the actual (small, for a
+  realistic negative value) magnitude of `x`, never anywhere near 2^(8n),
+  so `-1`/`-300`/`-1000000` etc. are exact on both runtimes. The
+  unavoidable, honestly-bounded gap is now confined to where it belongs:
+  values whose true magnitude itself exceeds 2^53 — see
+  `int64-precision-boundary-is-documented-not-silent`."
+  [bs off n]
+  (let [bytes (subvec (vec bs) off (+ off n))
+        top (last bytes)
+        signed-top (if (> top 127) (- top 256) top)]
+    (reduce (fn [acc b] #?(:clj (+' (*' acc 256) b) :cljs (+ (* acc 256) b)))
+            signed-top
+            (reverse (butlast bytes)))))
+
+;; ── IEEE 754, little-endian (RFC 6282 land uses big-endian for
+;;    everything; Matter, like LoRaWAN/BLE/802.15.4, is little-endian
+;;    throughout — do not assume one 'the' byte order for this whole
+;;    task's three repositories) ─────────────────────────────────────────
+
+(defn- float-bytes [x n]
+  #?(:clj (let [bb (doto (ByteBuffer/allocate n) (.order ByteOrder/LITTLE_ENDIAN))]
+            (if (= n 4) (.putFloat bb (float x)) (.putDouble bb (double x)))
+            (vec (map #(bit-and (int %) 0xFF) (.array bb))))
+     :cljs (let [buf (js/ArrayBuffer. n) view (js/DataView. buf)]
+             (if (= n 4) (.setFloat32 view 0 x true) (.setFloat64 view 0 x true))
+             (vec (js/Array.from (js/Uint8Array. buf))))))
+
+(defn- rd-float [bs off n]
+  #?(:clj (let [signed (map #(if (> % 127) (- % 256) %) (subvec (vec bs) off (+ off n)))
+                bb (doto (ByteBuffer/wrap (byte-array signed)) (.order ByteOrder/LITTLE_ENDIAN))]
+            (if (= n 4) (.getFloat bb) (.getDouble bb)))
+     :cljs (let [arr (js/Uint8Array. (clj->js (subvec (vec bs) off (+ off n))))
+                 view (js/DataView. (.-buffer arr))]
+             (if (= n 4) (.getFloat32 view 0 true) (.getFloat64 view 0 true)))))
+
+;; ── vocabulary ──────────────────────────────────────────────────────────
+
+(def tag-controls {:anonymous 0 :context 1 :common-profile-2 2 :common-profile-4 3
+                    :implicit-profile-2 4 :implicit-profile-4 5
+                    :fully-qualified-6 6 :fully-qualified-8 7})
+(def tag-control-by-code (into {} (map (fn [[k v]] [v k]) tag-controls)))
+
+(def element-types
+  {:int8 0x00 :int16 0x01 :int32 0x02 :int64 0x03
+   :uint8 0x04 :uint16 0x05 :uint32 0x06 :uint64 0x07
+   :bool-false 0x08 :bool-true 0x09
+   :float32 0x0A :float64 0x0B
+   :utf8-1 0x0C :utf8-2 0x0D :utf8-4 0x0E :utf8-8 0x0F
+   :bytes-1 0x10 :bytes-2 0x11 :bytes-4 0x12 :bytes-8 0x13
+   :null 0x14 :structure 0x15 :array 0x16 :list 0x17 :end-of-container 0x18})
+(def element-type-by-code (into {} (map (fn [[k v]] [v k]) element-types)))
+
+(def signed-int-width {:int8 1 :int16 2 :int32 4 :int64 8})
+(def unsigned-int-width {:uint8 1 :uint16 2 :uint32 4 :uint64 8})
+(def float-width {:float32 4 :float64 8})
+(def length-field-width {:utf8-1 1 :utf8-2 2 :utf8-4 4 :utf8-8 8
+                          :bytes-1 1 :bytes-2 2 :bytes-4 4 :bytes-8 8})
+(def utf8-types #{:utf8-1 :utf8-2 :utf8-4 :utf8-8})
+(def bytes-types #{:bytes-1 :bytes-2 :bytes-4 :bytes-8})
+(def container-types #{:structure :array :list})
+(def no-value-types #{:bool-true :bool-false :null :end-of-container})
+
+;; ── tag ─────────────────────────────────────────────────────────────────
+
+(defn pack-tag
+  "`{:kind :anonymous}` | `{:kind :context :number u8}` |
+  `{:kind :common-profile :width 2|4 :number uN}` |
+  `{:kind :implicit-profile :width 2|4 :number uN}` |
+  `{:kind :fully-qualified :width 6|8 :vendor-id u16 :profile-num u16
+  :number uN}` -> `[:ok tag-control-code bytes]` | `[:error reason ...]`."
+  [{:keys [kind width number vendor-id profile-num]}]
+  (case kind
+    :anonymous [:ok (tag-controls :anonymous) []]
+
+    :context
+    (if (<= 0 number 0xFF) [:ok (tag-controls :context) [number]]
+        [:error :matter.tlv/tag-number-out-of-range number])
+
+    :common-profile
+    (cond
+      (and (= width 2) (<= 0 number 0xFFFF)) [:ok (tag-controls :common-profile-2) (int-n-le number 2)]
+      (and (= width 4) (<= 0 number 0xFFFFFFFF)) [:ok (tag-controls :common-profile-4) (int-n-le number 4)]
+      :else [:error :matter.tlv/tag-number-out-of-range number])
+
+    :implicit-profile
+    (cond
+      (and (= width 2) (<= 0 number 0xFFFF)) [:ok (tag-controls :implicit-profile-2) (int-n-le number 2)]
+      (and (= width 4) (<= 0 number 0xFFFFFFFF)) [:ok (tag-controls :implicit-profile-4) (int-n-le number 4)]
+      :else [:error :matter.tlv/tag-number-out-of-range number])
+
+    :fully-qualified
+    (cond
+      (not (<= 0 vendor-id 0xFFFF)) [:error :matter.tlv/vendor-id-out-of-range vendor-id]
+      (not (<= 0 profile-num 0xFFFF)) [:error :matter.tlv/profile-number-out-of-range profile-num]
+      (and (= width 6) (<= 0 number 0xFFFF))
+      [:ok (tag-controls :fully-qualified-6) (vec (concat (int-n-le vendor-id 2) (int-n-le profile-num 2) (int-n-le number 2)))]
+      (and (= width 8) (<= 0 number 0xFFFFFFFF))
+      [:ok (tag-controls :fully-qualified-8) (vec (concat (int-n-le vendor-id 2) (int-n-le profile-num 2) (int-n-le number 4)))]
+      :else [:error :matter.tlv/tag-number-out-of-range number])
+
+    [:error :matter.tlv/reserved-tag-kind kind]))
+
+(defn unpack-tag
+  "control-code bytes off -> `[:ok tag-map consumed]` | `[:error reason
+  ...]`."
+  [control-code bs off]
+  (if-not (contains? tag-control-by-code control-code)
+    [:error :matter.tlv/reserved-tag-control control-code]
+    (case (tag-control-by-code control-code)
+      :anonymous [:ok {:kind :anonymous} 0]
+      :context [:ok {:kind :context :number (nth bs off)} 1]
+      :common-profile-2 [:ok {:kind :common-profile :width 2 :number (rd-uint-n-le bs off 2)} 2]
+      :common-profile-4 [:ok {:kind :common-profile :width 4 :number (rd-uint-n-le bs off 4)} 4]
+      :implicit-profile-2 [:ok {:kind :implicit-profile :width 2 :number (rd-uint-n-le bs off 2)} 2]
+      :implicit-profile-4 [:ok {:kind :implicit-profile :width 4 :number (rd-uint-n-le bs off 4)} 4]
+      :fully-qualified-6 [:ok {:kind :fully-qualified :width 6
+                                :vendor-id (rd-uint-n-le bs off 2)
+                                :profile-num (rd-uint-n-le bs (+ off 2) 2)
+                                :number (rd-uint-n-le bs (+ off 4) 2)} 6]
+      :fully-qualified-8 [:ok {:kind :fully-qualified :width 8
+                                :vendor-id (rd-uint-n-le bs off 2)
+                                :profile-num (rd-uint-n-le bs (+ off 2) 2)
+                                :number (rd-uint-n-le bs (+ off 4) 4)} 8])))
+
+;; ── single element (scalar or the head of a container) ─────────────────
+
+(declare encode-elements decode-elements)
+
+(defn encode-element
+  "`{:tag tag-map :type type-kw :value v}` (`:value` is a sequence of
+  child element maps when `:type` is a container) -> `[:ok bytes]` |
+  `[:error reason ...]`."
+  [{:keys [tag type value]}]
+  (if-not (contains? element-types type)
+    [:error :matter.tlv/reserved-element-type type]
+    (let [[tst tag-code tag-bytes] (pack-tag tag)]
+      (if (= tst :error)
+        [tst tag-code tag-bytes]
+        (let [control (bit-or (bit-shift-left tag-code 5) (element-types type))]
+          (cond
+            (contains? signed-int-width type)
+            (let [w (signed-int-width type) full (pow256 w) half (quot full 2)]
+              (if (not (<= (- half) value (dec half)))
+                [:error :matter.tlv/value-out-of-range value]
+                [:ok (vec (concat [control] tag-bytes (int-n-le value w)))]))
+
+            (contains? unsigned-int-width type)
+            (let [w (unsigned-int-width type) full (pow256 w)]
+              (if (not (<= 0 value (dec full)))
+                [:error :matter.tlv/value-out-of-range value]
+                [:ok (vec (concat [control] tag-bytes (int-n-le value w)))]))
+
+            (contains? float-width type)
+            [:ok (vec (concat [control] tag-bytes (float-bytes value (float-width type))))]
+
+            (= type :end-of-container)
+            (if (not= (:kind tag) :anonymous)
+              [:error :matter.tlv/end-of-container-must-be-anonymous tag]
+              [:ok (vec (concat [control] tag-bytes))])
+
+            (contains? no-value-types type) [:ok (vec (concat [control] tag-bytes))]
+
+            (contains? utf8-types type)
+            (let [lw (length-field-width type) content #?(:clj (vec (map #(bit-and (int %) 0xFF) (kbytes/utf8-bytes ^String value)))
+                                                            :cljs (vec (.encode (js/TextEncoder.) value)))
+                  full (pow256 lw)]
+              (if (>= (count content) full)
+                [:error :matter.tlv/string-too-long (count content)]
+                [:ok (vec (concat [control] tag-bytes (int-n-le (count content) lw) content))]))
+
+            (contains? bytes-types type)
+            (let [lw (length-field-width type) full (pow256 lw)]
+              (if (>= (count value) full)
+                [:error :matter.tlv/string-too-long (count value)]
+                [:ok (vec (concat [control] tag-bytes (int-n-le (count value) lw) (vec value)))]))
+
+            (contains? container-types type)
+            (let [[cst child-bytes] (encode-elements value)
+                  [est end-bytes] (encode-element {:tag {:kind :anonymous} :type :end-of-container :value nil})]
+              (if (= cst :error)
+                [cst child-bytes]
+                [:ok (vec (concat [control] tag-bytes child-bytes end-bytes))]))
+
+            :else [:error :matter.tlv/reserved-element-type type]))))))
+
+(defn encode-elements
+  "A sequence of element maps, concatenated in order -> `[:ok bytes]` |
+  `[:error reason ...]`."
+  [els]
+  (reduce (fn [[st acc] el]
+            (if (= st :error) (reduced [st acc])
+                (let [[est bs] (encode-element el)]
+                  (if (= est :error) (reduced [est bs]) [:ok (into acc bs)]))))
+          [:ok []]
+          els))
+
+(defn decode-element
+  "bytes off -> `[:ok element-map consumed]` | `[:error reason ...]`."
+  [bs off]
+  (let [bs (vec bs) n (count bs)]
+    (if (>= off n)
+      [:error :matter.tlv/element-too-short off]
+      (let [control (nth bs off)
+            tag-code (bit-and (unsigned-bit-shift-right control 5) 0x07)
+            type-code (bit-and control 0x1F)]
+        (if-not (contains? element-type-by-code type-code)
+          [:error :matter.tlv/reserved-element-type type-code]
+          (let [[tst tag tag-len] (unpack-tag tag-code bs (inc off))]
+            (if (= tst :error)
+              [tst tag tag-len]
+              (let [type (element-type-by-code type-code)
+                    voff (+ off 1 tag-len)]
+                (cond
+                  (contains? signed-int-width type)
+                  (let [w (signed-int-width type)]
+                    (if (< n (+ voff w)) [:error :matter.tlv/element-too-short n]
+                        [:ok {:tag tag :type type :value (rd-int-n-le bs voff w)} (+ 1 tag-len w)]))
+
+                  (contains? unsigned-int-width type)
+                  (let [w (unsigned-int-width type)]
+                    (if (< n (+ voff w)) [:error :matter.tlv/element-too-short n]
+                        [:ok {:tag tag :type type :value (rd-uint-n-le bs voff w)} (+ 1 tag-len w)]))
+
+                  (contains? float-width type)
+                  (let [w (float-width type)]
+                    (if (< n (+ voff w)) [:error :matter.tlv/element-too-short n]
+                        [:ok {:tag tag :type type :value (rd-float bs voff w)} (+ 1 tag-len w)]))
+
+                  (= type :bool-true) [:ok {:tag tag :type type :value true} (+ 1 tag-len)]
+                  (= type :bool-false) [:ok {:tag tag :type type :value false} (+ 1 tag-len)]
+                  (= type :null) [:ok {:tag tag :type type :value nil} (+ 1 tag-len)]
+
+                  (contains? utf8-types type)
+                  (let [lw (length-field-width type)]
+                    (if (< n (+ voff lw)) [:error :matter.tlv/element-too-short n]
+                        (let [len (rd-uint-n-le bs voff lw) coff (+ voff lw)]
+                          (if (< n (+ coff len)) [:error :matter.tlv/element-too-short n]
+                              [:ok {:tag tag :type type
+                                    :value #?(:clj (kbytes/utf8-string (byte-array (map #(if (> % 127) (- % 256) %) (subvec bs coff (+ coff len)))))
+                                              :cljs (.decode (js/TextDecoder.) (js/Uint8Array. (clj->js (subvec bs coff (+ coff len))))))}
+                               (+ 1 tag-len lw len)]))))
+
+                  (contains? bytes-types type)
+                  (let [lw (length-field-width type)]
+                    (if (< n (+ voff lw)) [:error :matter.tlv/element-too-short n]
+                        (let [len (rd-uint-n-le bs voff lw) coff (+ voff lw)]
+                          (if (< n (+ coff len)) [:error :matter.tlv/element-too-short n]
+                              [:ok {:tag tag :type type :value (subvec bs coff (+ coff len))} (+ 1 tag-len lw len)]))))
+
+                  (contains? container-types type)
+                  (let [[cst children clen] (decode-elements bs voff)]
+                    (if (= cst :error) [cst children clen]
+                        [:ok {:tag tag :type type :value children} (+ 1 tag-len clen)]))
+
+                  (= type :end-of-container)
+                  (if (not= (:kind tag) :anonymous)
+                    [:error :matter.tlv/end-of-container-must-be-anonymous tag]
+                    [:ok {:tag tag :type type :value nil} (+ 1 tag-len)])
+
+                  :else [:error :matter.tlv/reserved-element-type type])))))))))
+
+(defn decode-elements
+  "bytes off -> `[:ok children-vec total-consumed]` | `[:error reason
+  ...]`. Reads elements starting at `off` until an End-of-Container
+  element is seen (consumed as part of `total-consumed`, but not
+  included in the returned vector) — never past the end of `bs` without
+  one, which is reported as `:matter.tlv/missing-end-of-container` rather
+  than silently returning whatever children were read so far."
+  [bs off]
+  (let [bs (vec bs) n (count bs)]
+    (loop [pos off acc []]
+      (if (>= pos n)
+        [:error :matter.tlv/missing-end-of-container pos]
+        (let [[st el consumed] (decode-element bs pos)]
+          (cond
+            (= st :error) [st el consumed]
+            (= (:type el) :end-of-container) [:ok acc (+ (- pos off) consumed)]
+            :else (recur (+ pos consumed) (conj acc el))))))))
