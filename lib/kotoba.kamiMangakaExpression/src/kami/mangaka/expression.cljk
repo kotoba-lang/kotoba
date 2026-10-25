@@ -1,0 +1,372 @@
+(ns kami.mangaka.expression
+  "Work-agnostic manga EXPRESSION patterns (ADR-2607012100, Tier-1 mangaka).
+
+  漫画的表現 — 「キャラクターごとに、表情・姿勢・吹き出しの形・文字の薄さ・大きさ・
+  背景トーンを変える」— を DATA から決める純粋レイヤ。HUNTER×HUNTER 王位継承戦編の
+  コマ観察を出典にしたパターン (`resources/mangaka_expression_patterns.edn`) を、
+
+    archetype(キャラ類型) ← register(セリフ種別) ← expression-cue(感情) ← intensity(強度)
+
+  の順に merge して 1 行分のスタイル (`resolve-style`) を出す。`analyze-line` /
+  `analyze-panel` / `analyze-page` はそれを storyboard に当てる (langgraph の
+  ai.gftd.mangaka.analyzeExpression がこれを呼ぶ)。
+
+  ここは SEMANTIC タグだけを吐く純 cljc — 見た目への写像 (opacity/font-size/screentone)
+  は renderer 側 (kami.mangaka.text の hiccup+CSS / kami.mangaka.page の Java2D) が持つ。
+  babashka-safe / JVM・cljs・WASM 可搬 (host interop は reader-conditional のみ)。"
+  (:require [kotoba.lang.text :as str]
+            #?(:clj [clojure.edn :as edn])
+            #?(:clj [kotoba.io :as io])))
+
+;; ---------------------------------------------------------------------------
+;; Vocabulary — the edn :vocab の canonical 版 (test で edn と lock-step)
+;; ---------------------------------------------------------------------------
+
+(def registers
+  "セリフ/文字レジスタ。text.cljc の :kind を包含し、群衆ざわめき/名札を足す。"
+  #{:speech :shout :whisper :thought :monologue :narration :chatter :nameplate :sfx})
+
+(def bubbles
+  "吹き出しの形。kami.mangaka.text/bubbles ∪ {:spike(叫び) :burst(放射)}。"
+  #{:oval :jagged :cloud :square :wavy :spike :burst})
+
+(def expressions
+  "表情。kami.mangaka.scene の Rust Expression variant と一致。"
+  #{"Neutral" "Happy" "Angry" "Sad" "Surprised" "Determined" "Pained" "Smirk"})
+
+(def font-roles
+  "写植ロール。ai-gftd-mangaka の manga-font-palette (fontRole) に対応。"
+  #{:antigochi :gothic :mincho :bold-mincho :maru :kyokasho :brush :handwritten :digital :horror})
+
+(def weights
+  "文字の薄さ↔太さ。薄→濃 の順序ベクタ (index が段数)。"
+  [:faint :light :regular :bold :heavy])
+
+(def tones
+  "背景トーン (screentone / 集中線 / フラッシュ / 群衆シルエット など)。"
+  #{:none :flat-white :dot :gradient :focus-lines :radial-burst :flash
+    :vignette-dark :hatching :crowd-silhouette})
+
+(def postures
+  #{:upright :lean-in :arm-raised :recoil :slump :point :cross-arms :turn-away})
+
+(def marks
+  #{:sweat :anger-vein :shock :tear :sparkle :question :exclaim})
+
+(def dramatic-tones
+  "強度が要る演出トーン (低 intensity では減衰させる対象)。"
+  #{:flash :focus-lines :radial-burst :vignette-dark})
+
+;; ---------------------------------------------------------------------------
+;; Pattern library load (clj — resource; cljs は analyze に patterns を渡す)
+;; ---------------------------------------------------------------------------
+
+(def default-patterns-resource "mangaka_expression_patterns.edn")
+(def default-face-taxonomy-resource "hume_manga_face_taxonomy.edn")
+
+(declare clamp)
+
+;; mangaka_expression_patterns.edn was datomic/datascript-ized by
+;; edn-datomize.bb (wrap-map, ns="resources.mangaka-expression-patterns"):
+;; top level is now `[{:db/id -1 :resources.mangaka-expression-patterns/version
+;; ... :resources.mangaka-expression-patterns/archetypes "..." ...}]` tx-data,
+;; with non-scalar values (:vocab :archetypes :registers :expression-cues
+;; :intensity :observations) pr-str'd into blob string attrs. This
+;; reconstitutes the original raw {:version :context :source :vocab
+;; :archetypes :default-archetype :registers :default-register
+;; :expression-cues :intensity :observations} map so resolve-style /
+;; analyze-line / analyze-panel / analyze-page keep working unchanged.
+#?(:clj
+   (defn- unblob [v]
+     (if (string? v)
+       (try (let [parsed (edn/read-string v)] (if (coll? parsed) parsed v))
+            (catch Exception _ v))
+       v)))
+
+#?(:clj
+   (defn- reconstitute-patterns [content]
+     (if (and (vector? content) (seq content) (map? (first content)) (contains? (first content) :db/id))
+       (into {} (map (fn [[k v]]
+                       [(if (= "resources.mangaka-expression-patterns" (namespace k)) (keyword (name k)) k)
+                        (unblob v)]))
+             (dissoc (first content) :db/id))
+       content)))
+
+#?(:clj
+   (defn load-patterns
+     "Load the bundled pattern library from the classpath (or an override name)."
+     ([] (load-patterns default-patterns-resource))
+     ([resource]
+      (with-open [r (io/reader (io/resource resource))]
+        (reconstitute-patterns (edn/read (java.io.PushbackReader. r)))))))
+
+#?(:clj
+   (defn load-face-taxonomy
+     "Load the Hume-grounded manga face/eye taxonomy. Values from Hume are
+     observer-interpretation confidences, never inferred inner emotion or
+     manga exaggeration intensity."
+     ([] (load-face-taxonomy default-face-taxonomy-resource))
+     ([resource]
+      (with-open [r (io/reader (io/resource resource))]
+        (edn/read (java.io.PushbackReader. r))))))
+
+;; ---------------------------------------------------------------------------
+;; Hume profile -> manga face. Keep measurement confidence and authored manga
+;; intensity separate: a 0.9 Hume score is not "90% intense emotion".
+;; ---------------------------------------------------------------------------
+
+(defn- dimension-index [taxonomy]
+  (into {} (map (fn [label] [(str/lower label) label]))
+        (keys (:dimensions taxonomy))))
+
+(defn normalize-hume-profile
+  "Normalize a Hume-style {label confidence} map to canonical labels and
+  finite [0,1] confidences. Unknown labels and non-numeric values are ignored."
+  [taxonomy profile]
+  (let [index (dimension-index taxonomy)]
+    (into {}
+          (keep (fn [[label confidence]]
+                  (let [canonical (get index (str/lower (name label)))]
+                    (when (and canonical (number? confidence)
+                               #?(:clj (Double/isFinite (double confidence))
+                                  :cljs (js/Number.isFinite confidence)))
+                      [canonical (clamp 0.0 1.0 (double confidence))]))))
+          profile)))
+
+(defn classify-hume-profile
+  "Return a loss-minimizing classification of a Hume expression profile.
+  `:dimensions` preserves the top N dimensions; `:families` aggregates all
+  supplied dimensions. Confidence is explicitly not treated as intensity."
+  ([taxonomy profile] (classify-hume-profile taxonomy profile 3))
+  ([taxonomy profile top-n]
+   (let [p       (normalize-hume-profile taxonomy profile)
+         ranked  (sort-by (comp - val) p)
+         dims    (mapv (fn [[label confidence]]
+                         (merge {:label label :confidence confidence}
+                                (get-in taxonomy [:dimensions label])))
+                       (take (max 1 (long top-n)) ranked))
+         sums    (reduce (fn [acc [label confidence]]
+                           (update acc (get-in taxonomy [:dimensions label :family])
+                                   (fnil + 0.0) confidence))
+                         {} p)
+         total   (reduce + 0.0 (vals sums))
+         families (if (pos? total)
+                    (into {} (map (fn [[k v]] [k (/ v total)])) sums)
+                    {})
+         first-confidence (or (:confidence (first dims)) 0.0)
+         second-confidence (or (:confidence (second dims)) 0.0)]
+     {:measurement :observer-interpretation-confidence
+      :dimensions dims
+      :families families
+      :dominant-rig (:rig (first dims))
+      :ambiguity (- first-confidence second-confidence)})))
+
+(defn- exaggerate
+  "Move a normalized control away from neutral by authored intensity."
+  [neutral value intensity]
+  (clamp 0.0 1.25 (+ neutral (* intensity (- value neutral)))))
+
+(defn resolve-face
+  "Resolve a Hume profile into renderer-independent manga face controls.
+
+  opts: {:profile {Hume-label confidence}
+         :intensity 0..1       ; authored exaggeration, NOT Hume confidence
+         :gaze keyword         ; optional staging override
+         :top-n 1..48}
+
+  The dominant rig provides categorical construction; the top dimensions and
+  normalized family mixture remain attached so a renderer/editor can expose
+  nuance instead of pretending there is a one-to-one emotion/face mapping."
+  [taxonomy {:keys [profile intensity gaze top-n]
+             :or {profile {} intensity 0.5 top-n 3}}]
+  (let [classification (classify-hume-profile taxonomy profile top-n)
+        rig-k (or (:dominant-rig classification) :neutral-soft)
+        rig   (or (get-in taxonomy [:rigs rig-k])
+                  (get-in taxonomy [:rigs :neutral-soft]))
+        neutral (get-in taxonomy [:rigs :neutral-soft :eyes])
+        i (clamp 0.0 1.0 (double intensity))
+        eyes (cond-> (:eyes rig)
+               true (assoc :open (exaggerate (:open neutral) (get-in rig [:eyes :open]) i)
+                           :pupil (exaggerate (:pupil neutral) (get-in rig [:eyes :pupil]) i)
+                           :iris (exaggerate (:iris neutral) (get-in rig [:eyes :iris]) i)
+                           :asymmetry (exaggerate (:asymmetry neutral)
+                                                  (get-in rig [:eyes :asymmetry]) i))
+               gaze (assoc :gaze gaze))]
+    (merge classification
+           {:rig rig-k
+            :scene-expression (:scene-expression rig)
+            :eyes eyes
+            :mouth (:mouth rig)
+            :intensity i})))
+
+;; ---------------------------------------------------------------------------
+;; Emotion → Expression (kami.mangaka.scene/expression-of と同表; scene は JVM の
+;; ため cljc からは require せず複製。両者が乖離しないよう test で照合する。)
+;; ---------------------------------------------------------------------------
+
+(defn expression-of
+  "感情語を Expression variant に正規化。未知は \"Neutral\"。"
+  [name]
+  (if (expressions name)
+    name
+    (case (str/lower (str name))
+      ("happy" "joy" "smile" "喜" "笑")        "Happy"
+      ("angry" "rage" "怒" "激昂")             "Angry"
+      ("sad" "sorrow" "grief" "哀" "悲")       "Sad"
+      ("surprised" "surprise" "shock" "驚")    "Surprised"
+      ("determined" "resolve" "focus" "決意")  "Determined"
+      ("pained" "pain" "hurt" "苦")            "Pained"
+      ("smirk" "smug" "冷笑" "不敵")           "Smirk"
+      "Neutral")))
+
+;; ---------------------------------------------------------------------------
+;; helpers
+;; ---------------------------------------------------------------------------
+
+(defn- clamp [lo hi x] (max lo (min hi x)))
+
+(defn weight-index [w] (or (first (keep-indexed #(when (= %2 w) %1) weights)) 2))
+
+(defn weight-bump
+  "Advance a weight `n` steps toward :heavy (clamped)."
+  [w n]
+  (get weights (clamp 0 (dec (count weights)) (+ (weight-index w) n)) w))
+
+(defn- prune [m] (into {} (remove (comp nil? val) m)))
+
+(defn infer-register
+  "Guess a register from an authored line when none is given. JA/EN heuristics:
+  kind wins; then bracketed → whisper, 2+ bang/interrobang → shout, else speech."
+  [{:keys [kind text]}]
+  (let [s (str (if (map? text) (or (:ja text) (first (vals text))) text))]
+    (cond
+      (contains? #{:narration :monologue :thought :sfx :chatter :nameplate :whisper :shout} kind) kind
+      (re-find #"（.*）|\(.*\)|〈.*〉" s)                    :whisper
+      (or (re-find #"[!！][!！]|[?？][!！]|[!！][?？]" s)
+          (re-find #"[!！]\s*$" s))                          :shout
+      :else                                                 :speech)))
+
+;; ---------------------------------------------------------------------------
+;; resolve-style — archetype ← register ← expression-cue ← intensity
+;; ---------------------------------------------------------------------------
+
+(defn resolve-style
+  "一行分の漫画表現スタイルを解決する。返り値:
+   {:expression :register :bubble :font-role :weight :scale :tone :posture
+    :marks :fx? :dashed? :invert? :rotate?}.
+   `opts` = {:archetype kw :register kw :expression str :intensity double}."
+  [patterns {:keys [archetype register expression intensity] :or {intensity 0.0}}]
+  (let [arch-k (or archetype (:default-archetype patterns) :stoic)
+        reg-k  (or register (:default-register patterns) :speech)
+        arch   (or (get-in patterns [:archetypes arch-k])
+                   (get-in patterns [:archetypes (:default-archetype patterns)])
+                   {})
+        reg    (or (get-in patterns [:registers reg-k])
+                   (get-in patterns [:registers (:default-register patterns)])
+                   {})
+        expr   (expression-of (or expression (:expression arch) "Neutral"))
+        cue    (get-in patterns [:expression-cues expr] {})
+        ;; register が archetype に勝つ (吹き出し/太さ/大きさ/書体/トーンの主因)
+        base   (merge arch reg)
+        ;; 感情 → 姿勢/マーク/トーン傾向 の補正
+        base   (cond-> base
+                 (:posture cue)     (assoc :posture (:posture cue))
+                 (seq (:marks cue)) (assoc :marks (vec (distinct (concat (:marks base) (:marks cue)))))
+                 ;; トーンは register 指定 > archetype 指定 > 感情 tone-bias
+                 (and (not (:tone reg)) (:tone-bias cue) (not= :none (:tone-bias cue)))
+                 (assoc :tone (:tone-bias cue)))
+        base   (assoc base :expression expr :register reg-k)
+        ;; intensity 増幅
+        {:keys [scale-gain scale-max weight-steps tone-threshold subtle-tone]
+         :or   {scale-gain 0.0 scale-max 3.0 weight-steps [] tone-threshold 0.0 subtle-tone :dot}}
+        (:intensity patterns)
+        i      (clamp 0.0 1.0 (double intensity))
+        scale  (clamp 0.1 scale-max (* (double (or (:scale base) 1.0)) (+ 1.0 (* scale-gain i))))
+        bump   (reduce (fn [acc [thr n]] (if (>= i (double thr)) (max acc (long n)) acc)) 0 weight-steps)
+        wt     (weight-bump (or (:weight base) :regular) bump)
+        tone   (if (and (< i (double tone-threshold)) (dramatic-tones (:tone base)))
+                 subtle-tone (:tone base))]
+    (prune (assoc base :scale scale :weight wt :tone tone))))
+
+;; ---------------------------------------------------------------------------
+;; analyze — apply resolve-style to authored storyboard shapes
+;; ---------------------------------------------------------------------------
+
+(defn resolve-archetype
+  "speaker (string|keyword) → archetype keyword via the cast map, else default."
+  [char->archetype speaker patterns]
+  (or (get char->archetype speaker)
+      (get char->archetype (some-> speaker name))
+      (get char->archetype (when speaker (keyword (name speaker))))
+      (:default-archetype patterns)
+      :stoic))
+
+(defn analyze-line
+  "Enrich one authored line (`{:speaker :text :bubble? :register? :emotion?
+  :expression? :intensity? :kind?}`) with expression style. Explicit keys win;
+  missing ones are filled from the resolved style. `char->archetype` maps a
+  speaker to an archetype keyword."
+  [patterns char->archetype {:keys [speaker register emotion expression intensity] :as line}]
+  (let [reg   (or register (infer-register line))
+        arch  (resolve-archetype char->archetype speaker patterns)
+        style (resolve-style patterns {:archetype arch :register reg
+                                       :expression (or expression emotion)
+                                       :intensity (or intensity 0.0)})]
+    (prune
+     (merge
+      ;; style-derived semantic tags
+      (select-keys style [:posture :font-role :tone :marks :fx :dashed :invert :rotate])
+      {:archetype arch
+       :register reg
+       :expression (:expression style)}
+      ;; the authored line (explicit values win over style defaults) — but a key
+      ;; carried as an *explicit nil* (e.g. an adapter that emits :register nil for
+      ;; "unset") must NOT clobber the resolved default, so drop nils first.
+      (prune line)
+      ;; …and fill bubble/weight/scale from style when the line didn't set them
+      {:bubble (or (:bubble line) (:bubble style))
+       :weight (or (:weight line) (:weight style))
+       :scale  (or (:scale line)  (:scale style))}))))
+
+(def tone-salience
+  "背景としての支配度。パネルは最も salient な行トーンを採る (叫び>群衆>網掛/グラデ>平)。"
+  {:flash 6 :radial-burst 6 :focus-lines 5 :vignette-dark 5
+   :crowd-silhouette 4 :hatching 3 :gradient 3 :dot 2 :flat-white 1 :none 0})
+
+(defn- panel-tone
+  "Panel background tone = the most salient tone among the panel's lines, its
+  authored :tone, and the focal character's archetype tone (nil-safe)."
+  [patterns char->archetype panel lines]
+  (let [foc  (first (:characters panel))
+        cand (->> (concat (map :tone lines)
+                          [(:tone panel)
+                           (get-in patterns [:archetypes
+                                             (resolve-archetype char->archetype foc patterns) :tone])])
+                  (filter tones))]
+    (when (seq cand)
+      (apply max-key #(get tone-salience % 0) cand))))
+
+(defn analyze-panel
+  "Enrich a storyboard panel. Analyzes each `:dialogue` line (and `:narration` /
+  `:sfx` when present), then sets the panel's dominant `:tone` and any `:fx`."
+  [patterns char->archetype panel]
+  (let [dlg   (mapv #(analyze-line patterns char->archetype %) (:dialogue panel))
+        narr  (when-let [n (:narration panel)]
+                (analyze-line patterns char->archetype
+                              (if (map? n) (assoc n :kind :narration) {:kind :narration :text n})))
+        sfx   (mapv #(analyze-line patterns char->archetype (assoc % :kind :sfx)) (:sfx panel))
+        lines (into (vec (concat dlg (when narr [narr]))) sfx)
+        tone  (panel-tone patterns char->archetype panel lines)
+        fx    (vec (distinct (mapcat :fx lines)))]
+    (cond-> (assoc panel :dialogue dlg)
+      narr      (assoc :narration (:text narr) :narration-style (dissoc narr :text))
+      (seq sfx) (assoc :sfx sfx)
+      tone      (assoc :tone tone)
+      (seq fx)  (assoc :fx fx))))
+
+(defn analyze-page
+  "Enrich every panel of a page/storyboard. `page` = {:panels [...]}; `cast` maps
+  speaker → archetype keyword (e.g. {\"ガター\" :hot-blooded})."
+  ([patterns page] (analyze-page patterns {} page))
+  ([patterns cast page]
+   (update page :panels (fn [ps] (mapv #(analyze-panel patterns cast %) ps)))))

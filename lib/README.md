@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kamiMangakaExpression` | `kotoba.kamiMangakaExpression/src` | `kami.mangaka.expression` (Kotoba project library) |
 | `kotoba.kamiEngineSdk` | `kotoba.kamiEngineSdk/src` | `kami.avatar`, `kami.backend.browser`, `kami.backend.host`, `kami.benchmark` (Kotoba project library) |
 | `kotoba.kamiEngineCfd` | `kotoba.kamiEngineCfd/src` | `kami-cfd`, `kami-cfd.d3`, `kami-cfd.duct`, `kami-cfd.mesh` (Kotoba project library) |
 | `kotoba.kamiContracts` | `kotoba.kamiContracts/src` | `kami.app-fixtures`, `kami.app-state-machines`, `kami.component`, `kami.contracts.gpu` (Kotoba project library) |
