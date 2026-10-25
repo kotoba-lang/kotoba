@@ -1,0 +1,114 @@
+;; CLJ-side unit tests for the .cljc domain interpreters — the *same* source the web (CLJS)
+;; and native (kotoba-clj→WASM) run. Verifies cross-platform correctness on the JVM via
+;; babashka:  kbb --classpath src test/domains_bb_test.cljk
+(require '[kami.fsm :as fsm]
+         '[kami.physics :as phys]
+         '[kami.netsync :as net]
+         '[kami.level :as level]
+         '[kami.webgpu.ir :as ir]
+         '[kotoba.test :refer [deftest is testing run-tests]])
+
+(deftest fsm-advance
+  (is (= :move (fsm/advance fsm/default-player-fsm :idle #{:moving})))
+  (is (= :idle (fsm/advance fsm/default-player-fsm :move #{:still})))
+  (is (= :jump (fsm/advance fsm/default-player-fsm :idle #{:jumping})))
+  (is (= :idle (fsm/advance fsm/default-player-fsm :idle #{}))  "no event → stay"))
+
+(deftest physics-collides
+  (is (phys/collides? phys/default-layers :player :bot))
+  (is (phys/collides? phys/default-layers :bot :bot))
+  (is (not (phys/collides? phys/default-layers :player :pickup)))
+  (let [d (phys/separate phys/default-layers
+                         [{:id 1 :layer :bot :x 0 :y 0} {:id 2 :layer :bot :x 10 :y 0}])]
+    (is (pos? (count d)) "overlapping bots produce separation deltas")))
+
+(deftest netsync-snapshot+interp
+  (let [snap (net/snapshot net/default-schema
+                           {:x 1 :y 2 :z 3 :rx 0 :ry 0 :hp 9 :tag "bot" :secret 42})]
+    (is (= #{:x :y :z :rx :ry :hp} (set (keys snap))) "only synced fields")
+    (is (not (contains? snap :secret)) "unsynced dropped"))
+  (let [r (net/interp net/default-schema {:x 0 :hp 100} {:x 10 :hp 50} 0.5)]
+    (is (= 5.0 (double (:x r))) ":lerp tweens x")
+    (is (= 50 (:hp r)) ":snap jumps hp")))
+
+(deftest level-zone
+  (is (= 3000.0 (double (level/zone-radius level/default-level 0))) "full radius at t=0")
+  (is (< (level/zone-radius level/default-level 5000) 3000) "storm shrinks")
+  (is (level/in-zone? level/default-level [0 0] 0) "centre inside")
+  (is (not (level/in-zone? level/default-level [2900 0] 5000)) "edge outside shrunk zone")
+  (is (= [0 0] (level/spawn-points level/default-level :player))))
+
+(deftest camera-rig
+  (let [{:keys [eye target]} (ir/rig->camera {:distance 70 :height 48 :azimuth 0 :look-height 1} [0 0])]
+    (is (< (Math/abs (- (double (eye 0)) 70.0)) 0.01) "eye.x = distance*cos(azimuth)")
+    (is (= 48 (eye 1)) "eye.y = height")
+    (is (= 1 (target 1)) "target.y = look-height")))
+
+(deftest camera-rig-follows-altitude
+  (let [rig {:distance 70 :height 48 :azimuth 0 :look-height 1}]
+    (testing "a 3-element follow point with no :follow-height still pins the height —
+              every game that never set an altitude is untouched"
+      (let [{:keys [eye target]} (ir/rig->camera rig [0 12 0])]
+        (is (= 48 (eye 1)))
+        (is (= 1 (target 1)))))
+    (testing "with :follow-height the rig rises by that fraction of the subject's altitude"
+      (let [{:keys [eye target]} (ir/rig->camera (assoc rig :follow-height 0.75) [0 12 0])]
+        (is (= 57.0 (double (eye 1))) "48 + 0.75*12")
+        (is (= 10.0 (double (target 1))) "1 + 0.75*12")))
+    (testing "diving below the ground plane lowers the rig the same way"
+      (let [{:keys [eye]} (ir/rig->camera (assoc rig :follow-height 1.0) [0 -4 0])]
+        (is (= 44.0 (double (eye 1))))))
+    (testing "the ground track is unaffected by altitude"
+      (let [{:keys [target]} (ir/rig->camera (assoc rig :follow-height 1.0) [3 12 5])]
+        (is (= [3 5] [(target 0) (target 2)]))))))
+
+(deftest ir-helpers
+  (is (ir/valid? (ir/render-ir (ir/sky [0.7 0.8 0.9] [-0.4 -0.85 -0.35] [1 1 1])
+                               [(ir/instance [0 0 0] [1 0 0] [2 5])])))
+  (is (not (ir/valid? {:globals {} :instances [{:bad true}]}))))
+
+(deftest edge-cases
+  ;; fsm: jump state has both exits
+  (is (= :move (fsm/advance fsm/default-player-fsm :jump #{:moving})))
+  (is (= :idle (fsm/advance fsm/default-player-fsm :jump #{:still})))
+  ;; physics: non-colliding layers produce no separation
+  (is (empty? (phys/separate phys/default-layers
+                             [{:id 1 :layer :player :x 0 :y 0} {:id 2 :layer :pickup :x 5 :y 0}]))
+      "player+pickup don't collide → no deltas")
+  (is (= 34.0 (phys/radius phys/default-layers :player)))
+  ;; netsync: apply-snapshot merges only synced fields
+  (let [merged (net/apply-snapshot net/default-schema {:x 0 :hp 1 :keep 7} {:x 9 :hp 2 :tag "x"})]
+    (is (= 9 (:x merged)) "synced field overwritten")
+    (is (= 7 (:keep merged)) "non-schema local field preserved")
+    (is (not (contains? merged :tag)) "non-synced incoming dropped"))
+  ;; level: radius floors at :min-radius; bots spawn list
+  (is (= 200.0 (double (level/zone-radius level/default-level 100000))) "floors at min-radius")
+  (is (= 6 (count (level/spawn-points level/default-level :bots))))
+  ;; ir: frame-ir carries globals + instances
+  (let [f (ir/render-ir (ir/sky [0.1 0.2 0.3] [0 -1 0] [1 1 1]) [(ir/instance [0 0 0] [1 0 0] [1 1])])]
+    (is (= [0.1 0.2 0.3] (get-in f [:globals :sky :horizon])))
+    (is (= 1 (count (:instances f))))))
+
+(deftest properties
+  ;; collides? is symmetric in its arguments
+  (doseq [[a b] [[:player :bot] [:bot :player] [:player :pickup] [:bot :prop]]]
+    (is (= (phys/collides? phys/default-layers a b)
+           (phys/collides? phys/default-layers b a))
+        (str "collides? symmetric for " a "/" b)))
+  ;; interp endpoints: t=0 → source value, t=1 → target value (lerp field)
+  (let [e {:x 0 :y 0 :z 0 :rx 0 :ry 0 :hp 0} t {:x 9 :y 0 :z 0 :rx 0 :ry 0 :hp 0}]
+    (is (= 0.0 (double (:x (net/interp net/default-schema e t 0.0)))) "t=0 → source")
+    (is (= 9.0 (double (:x (net/interp net/default-schema e t 1.0)))) "t=1 → target"))
+  ;; advance is identity when no transition's event matches
+  (is (= :idle (fsm/advance fsm/default-player-fsm :idle #{:nonexistent})))
+  ;; snapshot is idempotent (snapshot of a snapshot keeps the same synced keys)
+  (let [s1 (net/snapshot net/default-schema {:x 1 :y 2 :z 3 :rx 0 :ry 0 :hp 9 :extra 1})]
+    (is (= s1 (net/snapshot net/default-schema s1))))
+  ;; the storm radius is monotonically non-increasing over ticks
+  (is (apply >= (map #(level/zone-radius level/default-level %) [0 100 1000 10000 100000]))))
+
+;; throw (don't System/exit) on failure so this file composes as a bb-task dependency
+;; (`kbb -M:verify` runs this first, then the native suites — System/exit would abort that).
+(let [{:keys [fail error]} (run-tests)]
+  (when (pos? (+ fail error))
+    (throw (ex-info "domain interpreter tests failed" {:fail fail :error error}))))

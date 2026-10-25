@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.webgpu` | `kotoba.webgpu/src` | `kami.webgpu`, `kami.webgpu.geometry`, `kami.webgpu.ir`, `kami.webgpu.mesh` (Kotoba project library) |
 | `kotoba.webauthn` | `kotoba.webauthn/src` | `webauthn.adapters.ceremony`, `webauthn.adapters.edge`, `webauthn.adapters.hmac-ceremony`, `webauthn.adapters.production` (Kotoba project library) |
 | `kotoba.teleop` | `kotoba.teleop/src` | `kotoba.teleop`, `kotoba.teleop.dualsense`, `kotoba.teleop.governor`, `kotoba.teleop.ros` (Kotoba project library) |
 | `kotoba.swap` | `kotoba.swap/src` | `swap.aggregator`, `swap.chains`, `swap.core`, `swap.fee` (Kotoba project library) |
