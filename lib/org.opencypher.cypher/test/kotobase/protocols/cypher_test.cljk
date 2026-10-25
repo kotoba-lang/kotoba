@@ -1,0 +1,661 @@
+(ns kotobase.protocols.cypher-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotobase.local :as local]
+            [kotobase.protocols.cypher :as cypher]
+            [kotobase.protocols.cypher.json :as json]
+            [kotobase.store :as st]))
+
+(def everything (constantly true))
+
+(defn- fixture-store
+  "users (label \"users\") + departments (label \"departments\"), a
+  relationship convention fixture: users carry a :works_at attribute
+  matching the DEPT->attribute convention (rel-type \"WORKS_AT\" ->
+  attribute :works_at) whose value is a department's :kotobase/key."
+  []
+  (let [s (local/local-store)]
+    (st/-put s "users" "u1" {:name "Alice" :role "admin" :works_at "d1"})
+    (st/-put s "users" "u2" {:name "Bob" :role "user" :works_at "d2"})
+    (st/-put s "users" "u3" {:name "Carol" :role "admin" :works_at "d1"})
+    (st/-put s "users" "u4" {:name "Dave" :role "user"}) ; no :works_at
+    (st/-put s "departments" "d1" {:name "Engineering" :budget 900000})
+    (st/-put s "departments" "d2" {:name "Sales" :budget 400000})
+    s))
+
+(defn- ctx
+  ([store] {:store store :visible? everything :now "2026-07-17T00:00:00Z"})
+  ([store visible?] {:store store :visible? visible? :now "2026-07-17T00:00:00Z"}))
+
+(defn- commit! [c statements]
+  (cypher/handle c {:method :post :path "/db/data/transaction/commit"
+                    :body (json/encode {"statements" statements})}))
+
+(defn- single [c statement & [parameters]]
+  (commit! c [(cond-> {"statement" statement} parameters (assoc "parameters" parameters))]))
+
+;; ------------------------------------------------------------- parse
+
+(deftest parse-basic-match-where-return
+  (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name, n.role")]
+    (is (= [{:var "n" :label "users"}] (:nodes (:pattern ast))))
+    (is (= [{:kind :cmp :var "n" :prop "role" :value "admin"}] (cypher/where-leaves (:where ast))))
+    (is (= [{:var "n" :prop "name"} {:var "n" :prop "role"}] (:return ast)))))
+
+(deftest parse-return-only-no-where
+  (let [ast (cypher/parse "MATCH (n:users) RETURN n.name")]
+    (is (= [] (cypher/where-leaves (:where ast))))
+    (is (= [{:var "n" :prop "name"}] (:return ast)))))
+
+(deftest parse-multiple-and-predicates
+  (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' AND n.name = 'Alice' RETURN n.name")]
+    (is (= 2 (count (cypher/where-leaves (:where ast)))))))
+
+(deftest parse-numeric-boolean-null-and-negative-values
+  (is (= 900000 (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (d:departments) WHERE d.budget = 900000 RETURN d.name")))))))
+  (is (= true (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:users) WHERE n.active = true RETURN n.name")))))))
+  (is (= nil (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:users) WHERE n.deleted = null RETURN n.name")))))))
+  (is (= -5 (:value (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:users) WHERE n.score = -5 RETURN n.name"))))))))
+
+(deftest parse-relationship-pattern
+  (let [ast (cypher/parse "MATCH (u:users)-[:WORKS_AT]->(d:departments) RETURN u.name, d.name")]
+    (is (= ["u" "d"] (map :var (:nodes (:pattern ast)))))
+    (is (= ["WORKS_AT"] (:rels (:pattern ast))))))
+
+(deftest parse-parameter-value
+  (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = $role RETURN n.name")]
+    (is (= {:cypher/param "role"} (:value (first (cypher/where-leaves (:where ast))))))))
+
+;; ----------------------------------------------------- parse rejections
+
+(deftest reject-create-merge-delete-with-clear-message
+  (doseq [kw ["CREATE" "MERGE" "DELETE" "SET" "REMOVE"]]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          (re-pattern (str kw ".*not supported"))
+                          (cypher/parse (str kw " (n:users) RETURN n.name"))))))
+
+(deftest reject-unlabeled-node
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"has no label"
+                        (cypher/parse "MATCH (n) RETURN n.name"))))
+
+(deftest reject-variable-length-relationship
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"variable-length"
+                        (cypher/parse "MATCH (a:users)-[:KNOWS*1..3]->(b:users) RETURN a.name"))))
+
+(deftest multi-hop-patterns-chain
+  ;; This used to assert multi-hop was REFUSED. `:rels` has one fewer entry than
+  ;; `:nodes`, so hop i joins node i to node i+1 and a pattern is a chain of any
+  ;; length rather than a special case for two.
+  (let [ast (cypher/parse "MATCH (a:users)-[:KNOWS]->(b:users)-[:WORKS_AT]->(c:departments) RETURN a.name")]
+    (is (= ["a" "b" "c"] (map :var (:nodes (:pattern ast)))))
+    (is (= ["KNOWS" "WORKS_AT"] (:rels (:pattern ast)))))
+  (testing "each hop gets its own foreign-key lvar, so a chain cannot collide with itself"
+    (let [t (cypher/translate (cypher/parse "MATCH (a:users)-[:KNOWS]->(b:users)-[:KNOWS]->(c:users) RETURN a.name") {})
+          fks (distinct (filter #(and (symbol? %) (re-find #"__fk" (name %))) (flatten (:where (:query t)))))]
+      (is (= 2 (count fks)) (pr-str fks)))))
+
+(deftest reject-undirected-and-reverse-relationships
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"directed rightward"
+                        (cypher/parse "MATCH (a:users)-[:KNOWS]-(b:users) RETURN a.name"))))
+
+(deftest reject-unknown-variable-in-return
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"unknown variable"
+                        (cypher/parse "MATCH (n:users) RETURN x.name"))))
+
+(deftest reject-unknown-variable-in-where
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"unknown variable"
+                        (cypher/parse "MATCH (n:users) WHERE x.role = 'admin' RETURN n.name"))))
+
+(deftest reject-empty-return
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"at least one"
+                        (cypher/parse "MATCH (n:users) RETURN"))))
+
+(deftest reject-trailing-garbage
+  ;; This used to use "... RETURN n.name ORDER BY n.name" as the garbage, which
+  ;; pinned ORDER BY's absence as the contract. ORDER BY parses now, so the test
+  ;; needs input that is actually trailing garbage.
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"unexpected trailing"
+                        (cypher/parse "MATCH (n:users) RETURN n.name FOO BAR"))))
+
+;; --------------------------------------------------------- end-to-end
+
+(deftest end-to-end-equality-filter
+  (let [c (ctx (fixture-store))
+        res (single c "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name, n.role")
+        body (json/parse (:body res))]
+    (is (= 200 (:status res)))
+    (is (= [] (get body "errors")))
+    (is (= 1 (count (get body "results"))))
+    (let [r (first (get body "results"))]
+      (is (= ["n.name" "n.role"] (get r "columns")))
+      (is (= #{["Alice" "admin"] ["Carol" "admin"]}
+             (into #{} (map #(get % "row") (get r "data")))))
+      (is (every? #(= [nil nil] (get % "meta")) (get r "data"))))))
+
+(deftest end-to-end-no-where-returns-everyone
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (single c "MATCH (n:users) RETURN n.name")))
+        r (first (get body "results"))]
+    (is (= #{["Alice"] ["Bob"] ["Carol"] ["Dave"]}
+           (into #{} (map #(get % "row") (get r "data")))))))
+
+(deftest end-to-end-multiple-and-predicates
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (single c "MATCH (n:users) WHERE n.role = 'admin' AND n.name = 'Alice' RETURN n.name")))
+        r (first (get body "results"))]
+    (is (= [["Alice"]] (map #(get % "row") (get r "data"))))))
+
+(deftest end-to-end-parameter-substitution
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (single c "MATCH (n:users) WHERE n.role = $role RETURN n.name"
+                                        {"role" "user"})))
+        r (first (get body "results"))]
+    (is (= #{["Bob"] ["Dave"]} (into #{} (map #(get % "row") (get r "data")))))))
+
+(deftest end-to-end-missing-parameter-errors
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (single c "MATCH (n:users) WHERE n.role = $role RETURN n.name")))]
+    (is (= [] (get body "results")))
+    (is (= 1 (count (get body "errors"))))
+    (is (re-find #"missing parameter" (get (first (get body "errors")) "message")))))
+
+(deftest end-to-end-numeric-equality
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (single c "MATCH (d:departments) WHERE d.budget = 900000 RETURN d.name")))
+        r (first (get body "results"))]
+    (is (= [["Engineering"]] (map #(get % "row") (get r "data"))))))
+
+;; ---------------------------------------------- relationship join (bonus)
+
+(deftest end-to-end-relationship-join
+  (testing "-[:WORKS_AT]-> joins users.works_at against departments.:kotobase/key
+    -- a real cross-collection join through kotobase-query's bridge, exercising
+    a genuine capability, not a stub"
+    (let [c (ctx (fixture-store))
+          body (json/parse (:body (single c "MATCH (u:users)-[:WORKS_AT]->(d:departments) RETURN u.name, d.name")))
+          r (first (get body "results"))]
+      (is (= #{["Alice" "Engineering"] ["Bob" "Sales"] ["Carol" "Engineering"]}
+             (into #{} (map #(get % "row") (get r "data"))))
+          "Dave (no :works_at) correctly drops out of the join, same as the
+          underlying bridge's own join semantics"))))
+
+;; -------------------------------------------------------- transaction
+
+(deftest end-to-end-second-statement-fails-aborts-transaction
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (commit! c [{"statement" "MATCH (n:users) RETURN n.name"}
+                                             {"statement" "CREATE (n:users) RETURN n"}
+                                             {"statement" "MATCH (n:users) RETURN n.role"}])))]
+    (is (= 1 (count (get body "results"))) "first statement ran and is kept")
+    (is (= 1 (count (get body "errors"))) "second statement's error is reported")
+    (is (re-find #"CREATE" (get (first (get body "errors")) "message")))
+    (is (nil? (second (get body "results"))) "third statement never ran")))
+
+(deftest end-to-end-all-statements-succeed
+  (let [c (ctx (fixture-store))
+        body (json/parse (:body (commit! c [{"statement" "MATCH (n:users) RETURN n.name"}
+                                             {"statement" "MATCH (d:departments) RETURN d.name"}])))]
+    (is (= 2 (count (get body "results"))))
+    (is (= [] (get body "errors")))))
+
+;; -------------------------------------------------------------- HTTP
+
+(deftest wrong-method-is-405
+  (let [c (ctx (fixture-store))]
+    (is (= 405 (:status (cypher/handle c {:method :get :path "/db/data/transaction/commit"}))))))
+
+(deftest wrong-path-is-404
+  (let [c (ctx (fixture-store))]
+    (is (= 404 (:status (cypher/handle c {:method :post :path "/not/cypher"}))))))
+
+(def ^:private bad-json "{oops")
+
+(deftest malformed-json-body-is-400
+  (let [c (ctx (fixture-store))
+        req {:method :post :path "/db/data/transaction/commit" :body bad-json}
+        res (cypher/handle c req)]
+    (is (= 400 (:status res)))
+    (is (= 1 (count (get (json/parse (:body res)) "errors"))))))
+
+(deftest missing-statements-field-is-400
+  (let [c (ctx (fixture-store))
+        res (cypher/handle c {:method :post :path "/db/data/transaction/commit" :body "{}"})]
+    (is (= 400 (:status res)))))
+
+(deftest ctx-without-visible-throws
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (cypher/handle {:store (fixture-store)}
+                              {:method :post :path "/db/data/transaction/commit"
+                               :body (json/encode {"statements" []})}))
+      "handle refuses to run with no stated visibility decision (ADR-2607050500),
+      same discipline kotobase.query.bridge enforces"))
+
+;; ---------------------------------------------------- visible? redaction
+
+(deftest visible-redacts-entities
+  (let [store (fixture-store)
+        no-bob? (fn [{:keys [s]}] (not= s :users/u2))
+        c (ctx store no-bob?)
+        body (json/parse (:body (single c "MATCH (n:users) RETURN n.name")))
+        r (first (get body "results"))]
+    (is (not (contains? (into #{} (map #(get % "row") (get r "data"))) ["Bob"])))
+    (is (contains? (into #{} (map #(get % "row") (get r "data"))) ["Alice"]))))
+
+;; ------------------------------------------------------------- audit
+
+(deftest audit-trail-records-success-and-error
+  (let [store (fixture-store)
+        c (ctx store)]
+    (single c "MATCH (n:users) RETURN n.name")
+    (commit! c [{"statement" "CREATE (n:users) RETURN n"}])
+    (let [events (->> (st/-read store :kotobase.protocols/audit 0)
+                      (filter #(= :cypher (:surface %))))]
+      (is (= [:query :query-error] (map :op events)))
+      (is (= "MATCH (n:users) RETURN n.name" (:statement (first events))))
+      (is (= 4 (:row-count (first events))))
+      (is (string? (:error (second events)))))))
+
+;; --- ORDER BY / SKIP / LIMIT / DISTINCT ------------------------------------
+
+(deftest order-by-skip-limit-distinct-parse
+  (let [ast (cypher/parse
+             "MATCH (n:users) RETURN DISTINCT n.name, n.role ORDER BY n.role DESC, n.name SKIP 1 LIMIT 2")]
+    (is (true? (:distinct? ast)))
+    (is (= [{:var "n" :prop "role" :desc? true}
+            {:var "n" :prop "name" :desc? false}]
+           (:order-by ast)))
+    (is (= 1 (:skip ast)))
+    (is (= 2 (:limit ast)))))
+
+(deftest plain-return-keeps-its-old-shape
+  (testing "no new clause means no behaviour change for existing callers"
+    (let [ast (cypher/parse "MATCH (n:users) RETURN n.name")]
+      (is (false? (:distinct? ast)))
+      (is (empty? (:order-by ast)))
+      (is (nil? (:skip ast)))
+      (is (nil? (:limit ast))))))
+
+(deftest order-by-must-name-something-returned
+  (testing "Cypher allows ordering by an unreturned expression; that needs the
+            sort key carried through the result set and dropped again, so it is
+            rejected by name rather than silently ignored"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"not in the RETURN list"
+                          (cypher/parse "MATCH (n:users) RETURN n.name ORDER BY n.role")))))
+
+(deftest skip-and-limit-reject-nonsense-counts
+  (doseq [q ["MATCH (n:users) RETURN n.name LIMIT -1"
+             "MATCH (n:users) RETURN n.name LIMIT 1.5"
+             "MATCH (n:users) RETURN n.name LIMIT n"]]
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (cypher/parse q)) q)))
+
+(deftest clause-keywords-are-still-usable-as-property-names
+  (testing "matched on identifier text rather than tokenized, so a document
+            with an `order` or `limit` property stays queryable"
+    (doseq [prop ["order" "skip" "limit" "distinct" "by" "asc" "desc"]]
+      (let [ast (cypher/parse (str "MATCH (n:users) RETURN n." prop))]
+        (is (= [{:var "n" :prop prop}] (:return ast)) prop)))))
+
+(deftest order-by-and-limit-run-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (testing "descending, and the whole point: it is not the ascending order"
+      (is (= [["Dave"] ["Carol"] ["Bob"] ["Alice"]]
+             (run "MATCH (n:users) RETURN n.name ORDER BY n.name DESC")))
+      (is (= [["Alice"] ["Bob"] ["Carol"] ["Dave"]]
+             (run "MATCH (n:users) RETURN n.name ORDER BY n.name"))))
+    (testing "SKIP then LIMIT, applied in Cypher's clause order"
+      (is (= [["Bob"] ["Carol"]]
+             (run "MATCH (n:users) RETURN n.name ORDER BY n.name SKIP 1 LIMIT 2"))))
+    (testing "DISTINCT collapses before LIMIT, so LIMIT still returns what was asked"
+      (is (= [["admin"] ["user"]]
+             (run "MATCH (n:users) RETURN DISTINCT n.role ORDER BY n.role"))))))
+
+;; --- comparison operators in WHERE -----------------------------------------
+
+(defn- numeric-store []
+  (let [s (local/local-store)]
+    (st/-put s "people" "p1" {:name "Alice" :age 30})
+    (st/-put s "people" "p2" {:name "Bob" :age 17})
+    (st/-put s "people" "p3" {:name "Carol" :age 45})
+    s))
+
+(deftest comparisons-parse-into-an-op
+  (doseq [[text op] [["=" nil] ["<" '<] [">" '>] ["<=" '<=] [">=" '>=] ["<>" 'not=]]]
+    (let [ast (cypher/parse (str "MATCH (n:people) WHERE n.age " text " 18 RETURN n.name"))]
+      (is (= op (:op (first (cypher/where-leaves (:where ast))))) text)
+      (is (= 18 (:value (first (cypher/where-leaves (:where ast)))))))))
+
+(deftest equality-stays-a-triple-and-comparison-becomes-a-predicate
+  (testing "same operator family, two very different plans: `=` puts the
+            literal IN the triple so the index can probe it, a comparison has
+            to bind and then constrain"
+    (let [eq (cypher/translate (cypher/parse "MATCH (n:people) WHERE n.age = 30 RETURN n.name") {})
+          gt (cypher/translate (cypher/parse "MATCH (n:people) WHERE n.age > 18 RETURN n.name") {})]
+      (is (some #(= 30 (last %)) (:where (:query eq))) "literal is in the triple")
+      (is (not-any? seq? (map first (:where (:query eq)))) "no predicate clause for =")
+      (let [ws (:where (:query gt))
+            pred (first (filter #(seq? (first %)) ws))]
+        (is (some? pred) "comparison produced a predicate clause")
+        (is (= '> (first (first pred))))
+        (is (= 18 (last (first pred))))
+        (testing "and the binding triple comes BEFORE it -- datalog rejects a
+                  predicate whose args are not already bound, and that check is
+                  what stops an unbound variable matching everything"
+          (let [cmp-var (second (first pred))
+                triple-idx (first (keep-indexed (fn [i c] (when (and (vector? c) (= cmp-var (last c))) i)) ws))
+                pred-idx (first (keep-indexed (fn [i c] (when (seq? (first c)) i)) ws))]
+            (is (< triple-idx pred-idx))))))))
+
+(deftest comparisons-run-end-to-end
+  (let [s (numeric-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Carol"]] (run "MATCH (n:people) WHERE n.age > 18 RETURN n.name")))
+    (is (= [["Bob"]]             (run "MATCH (n:people) WHERE n.age < 18 RETURN n.name")))
+    (is (= [["Alice"] ["Carol"]] (run "MATCH (n:people) WHERE n.age >= 30 RETURN n.name")))
+    (is (= [["Bob"]]             (run "MATCH (n:people) WHERE n.age <= 17 RETURN n.name")))
+    (is (= [["Bob"] ["Carol"]]   (run "MATCH (n:people) WHERE n.age <> 30 RETURN n.name")))
+    (is (= [["Alice"]]           (run "MATCH (n:people) WHERE n.age = 30 RETURN n.name")))))
+
+(deftest comparisons-compose-with-and-and-with-order-limit
+  (let [s (numeric-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"]]
+           (run "MATCH (n:people) WHERE n.age > 18 AND n.age < 40 RETURN n.name")))
+    (is (= [["Carol" 45] ["Alice" 30]]
+           (run "MATCH (n:people) WHERE n.age > 18 RETURN n.name, n.age ORDER BY n.age DESC LIMIT 2"))
+        "two comparisons' worth of rows, then ordered and cut")))
+
+(deftest a-missing-operator-is-a-named-error
+  (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                        #"expected a comparison operator"
+                        (cypher/parse "MATCH (n:people) WHERE n.age 18 RETURN n.name"))))
+
+(deftest two-char-operators-are-not-scanned-as-two-tokens
+  (testing "<= must not scan as < then =, and <> must not scan as < then >"
+    (is (= '<= (:op (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:people) WHERE n.age <= 1 RETURN n.name")))))))
+    (is (= 'not= (:op (first (cypher/where-leaves (:where (cypher/parse "MATCH (n:people) WHERE n.age <> 1 RETURN n.name")))))))))
+
+;; --- OR / NOT in WHERE -----------------------------------------------------
+
+(deftest or-and-not-run-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"]]
+           (run "MATCH (n:users) WHERE n.role = 'admin' OR n.works_at = 'd2' RETURN n.name")))
+    (is (= [["Bob"] ["Dave"]]
+           (run "MATCH (n:users) WHERE NOT n.role = 'admin' RETURN n.name")))
+    (is (= [["Alice"] ["Carol"]]
+           (run "MATCH (n:users) WHERE NOT n.role = 'user' RETURN n.name")))))
+
+(deftest or-binds-looser-than-and
+  (testing "Cypher's precedence: `a OR b AND c` is `a OR (b AND c)`. Parsing
+            both at one level would make it `(a OR b) AND c` — a wrong answer,
+            not a rejected query"
+    (let [ast (cypher/parse "MATCH (n:users) WHERE n.role = 'x' OR n.role = 'y' AND n.works_at = 'd1' RETURN n.name")
+          e (:where ast)]
+      (is (= :or (:kind e)))
+      (is (= 2 (count (:args e))))
+      (is (= :cmp (:kind (first (:args e)))))
+      (is (= :and (:kind (second (:args e)))) "the AND stayed on the right of the OR"))))
+
+(deftest parentheses-override-precedence
+  (let [e (:where (cypher/parse "MATCH (n:users) WHERE (n.role = 'x' OR n.role = 'y') AND n.works_at = 'd1' RETURN n.name"))]
+    (is (= :and (:kind e)))
+    (is (= :or (:kind (first (:args e)))))))
+
+(deftest or-becomes-a-datalog-or-and-not-becomes-operator-negation
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'a' OR n.role = 'b' RETURN n.name") {})
+        ors (filter #(and (seq? %) (= 'or (first %))) (:where (:query t)))]
+    (is (= 1 (count ors)))
+    (is (= 2 (count (rest (first ors)))) "one branch per alternative"))
+  (testing "NOT does NOT become a datalog `not` clause — it is pushed to the
+            leaves and negates the operator, because Cypher's logic is
+            three-valued: `NOT n.role = 'a'` on a node with no role is NOT NULL,
+            which is NULL, which does not match. A `(not [e a v])` would INCLUDE
+            those rows, which is a different query"
+    (let [t (cypher/translate (cypher/parse "MATCH (n:users) WHERE NOT n.role = 'a' RETURN n.name") {})
+          ws (:where (:query t))
+          nots (filter #(and (seq? %) (= 'not (first %))) ws)
+          preds (filter #(seq? (first %)) ws)]
+      (is (empty? nots))
+      (is (= 1 (count preds)))
+      (is (= 'not= (first (first (first preds))))))))
+
+(deftest not-over-an-unnegatable-predicate-is-refused-by-name
+  (testing "CONTAINS has no negated form in the whitelist, and guessing one
+            would change which rows come back"
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                          #"no negated form"
+                          (cypher/parse-and-translate-probe
+                           "MATCH (n:users) WHERE NOT n.name CONTAINS 'x' RETURN n.name")))))
+
+(deftest comparisons-inside-or-and-not-now-work
+  ;; These used to assert a REFUSAL: a datalog or/not branch was one clause and
+  ;; bound nothing, so a comparison could not be a branch. The `(and ...)`
+  ;; branch form landed in kotoba-lang/arrangement#13, so the refusal is
+  ;; DELETED rather than relaxed.
+  (let [s (numeric-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"]]
+           (run "MATCH (n:people) WHERE n.age > 18 OR n.age < 18 RETURN n.name")))
+    (is (= [["Carol"]]
+           (run "MATCH (n:people) WHERE n.age > 40 OR n.name = 'zzz' RETURN n.name")))
+    (is (= [["Bob"]]
+           (run "MATCH (n:people) WHERE NOT n.age > 18 RETURN n.name")))))
+
+(deftest a-nested-group-inside-or-now-works
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"]]
+           (run "MATCH (n:users) WHERE n.role = 'admin' OR (n.role = 'user' AND n.works_at = 'd2') RETURN n.name")))))
+
+(deftest a-comparison-branch-becomes-an-and-clause
+  (testing "the branch is a conjunction: bind the property, then constrain it"
+    (let [t (cypher/translate (cypher/parse "MATCH (n:people) WHERE n.age > 18 OR n.name = 'x' RETURN n.name") {})
+          or-clause (first (filter #(and (seq? %) (= 'or (first %))) (:where (:query t))))
+          branches (rest or-clause)]
+      (is (= 2 (count branches)))
+      (is (= 'and (first (first branches))) "the comparison branch is an (and ...)")
+      (is (= 2 (count (rest (first branches)))) "bind + constrain"))))
+
+;; --- IS NULL / CONTAINS / multi-hop ----------------------------------------
+
+(deftest is-null-asks-about-absence
+  (testing "Dave has no :works_at. Cypher does not distinguish a missing
+            property from a null one and neither can this store — doc->datoms
+            emits no datom for a nil"
+    (let [s (fixture-store)
+          run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+      (is (= [["Dave"]] (run "MATCH (n:users) WHERE n.works_at IS NULL RETURN n.name")))
+      (is (= [["Alice"] ["Bob"] ["Carol"]]
+             (run "MATCH (n:users) WHERE n.works_at IS NOT NULL RETURN n.name"))))))
+
+(deftest contains-maps-onto-the-whitelisted-string-predicate
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Carol"]] (run "MATCH (n:users) WHERE n.name CONTAINS 'l' RETURN n.name")))
+    (is (= [["Bob"]] (run "MATCH (n:users) WHERE n.name CONTAINS 'ob' RETURN n.name")))))
+
+(deftest multi-hop-runs-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Engineering"]]
+           (run "MATCH (u:users)-[:WORKS_AT]->(d:departments) WHERE u.name = 'Alice' RETURN d.name")))))
+
+(deftest is-null-inside-or-is-a-branch-too
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Carol"] ["Dave"]]
+           (run "MATCH (n:users) WHERE n.works_at IS NULL OR n.role = 'admin' RETURN n.name")))))
+
+;; --- AS aliases and count() ------------------------------------------------
+
+(deftest alias-and-aggregate-columns
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.name AS who") {})]
+    (is (= ["who"] (:columns t))))
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.role, count(*)") {})]
+    (is (= ["n.role" "count(*)"] (:columns t))))
+  (let [t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.role, count(*) AS total") {})]
+    (is (= ["n.role" "total"] (:columns t)))))
+
+(deftest count-groups-by-the-non-aggregate-columns
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["admin" 2] ["user" 2]]
+           (run "MATCH (n:users) RETURN n.role, count(*) AS total ORDER BY n.role")))
+    (is (= [[4]] (run "MATCH (n:users) RETURN count(*)"))
+        "no grouping column means one group")))
+
+(deftest count-of-a-property-skips-the-rows-missing-it
+  (testing "Dave has no :works_at, so count(n.works_at) is 3 while count(*) is 4"
+    (let [s (fixture-store)
+          run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+      (is (= [[4]] (run "MATCH (n:users) RETURN count(*)")))
+      (is (= [[3]] (run "MATCH (n:users) RETURN count(n.works_at)")))
+      (testing "the entity vars in :find are what make these counts per-NODE.
+                Four users hold only two distinct roles; datalog has set
+                semantics, so without the entity bound this would collapse to 2"
+        (is (= [[4]] (run "MATCH (n:users) RETURN count(n.role)"))
+            "four users, two distinct roles — counting nodes, not values")))))
+
+(deftest aliases-run-end-to-end
+  (let [s (fixture-store)
+        run (fn [q] (cypher/execute s (cypher/translate (cypher/parse q) {}) everything))]
+    (is (= [["Alice"] ["Bob"] ["Carol"] ["Dave"]]
+           (run "MATCH (n:users) RETURN n.name AS who ORDER BY n.name")))))
+
+;; --- label -> collection resolution ----------------------------------------
+;; The gap this closes was found in deployment, not in review: net-kotobase
+;; serves this surface beside kotobase.protocols.s3, whose collection keys are
+;; [:kotobase.s3/objects bucket]. A document PUT to /s3/users/u1 round-tripped
+;; through GET and was invisible to MATCH (n:users), because the label was
+;; used verbatim as a collection name and no collection is called "users".
+
+(defn- vector-keyed-store
+  "What kotobase.protocols.s3 actually writes: one bucket, vector-keyed."
+  []
+  (let [s (local/local-store)]
+    (st/-put s [:kotobase.s3/objects "users"] "u1" {:name "Alice" :role "admin"})
+    (st/-put s [:kotobase.s3/objects "users"] "u2" {:name "Bob" :role "user"})
+    s))
+
+(deftest leaf-name-of-each-key-shape
+  (is (= "users" (cypher/leaf-name "users")))
+  (is (= "users" (cypher/leaf-name :users)))
+  (is (= "users" (cypher/leaf-name [:kotobase.s3/objects "users"])))
+  (is (= "users" (cypher/leaf-name [:kotobase.at/records "did:x" :users]))))
+
+(deftest label-resolves-to-a-vector-keyed-collection
+  (is (= [:kotobase.s3/objects "users"]
+         (cypher/resolve-label [[:kotobase.s3/objects "users"]] "users"))))
+
+(deftest an-exact-key-wins-over-a-leaf-match
+  (is (= "users"
+         (cypher/resolve-label ["users" [:kotobase.s3/objects "users"]] "users"))))
+
+(deftest an-unmatched-label-is-left-alone
+  (is (= "absent" (cypher/resolve-label [[:kotobase.s3/objects "users"]] "absent"))))
+
+(deftest no-available-collections-means-no-resolution
+  (is (= "users" (cypher/resolve-label nil "users")))
+  (is (= "users" (cypher/resolve-label [] "users"))))
+
+(deftest an-ambiguous-leaf-refuses-rather-than-picks
+  (let [avail [[:kotobase.s3/objects "users"] [:kotobase.at/records "did:x" "users"]]
+        e (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                       (cypher/resolve-label avail "users")))]
+    (is (= 2 (count (:candidates (ex-data e)))))
+    (is (= "Neo.ClientError.Statement.SemanticError" (:cypher/code (ex-data e))))))
+
+(deftest resolution-moves-coll-keys-and-clauses-together
+  ;; A translation whose :coll-keys were rewritten but whose :kotobase/coll
+  ;; clauses were not would materialize the right documents and then match
+  ;; none of them -- an empty result, not an error.
+  (let [avail [[:kotobase.s3/objects "users"]]
+        t (cypher/translate (cypher/parse "MATCH (n:users) RETURN n.name") {})
+        r (cypher/resolve-collections avail t)]
+    (is (= [[:kotobase.s3/objects "users"]] (:coll-keys r)))
+    ;; The clause carries the STRINGIFIED key, because that is what
+    ;; bridge/materialize asserts as :kotobase/coll. The two sides of the
+    ;; substitution are deliberately not the same value.
+    (is (some (fn [c] (= (str [:kotobase.s3/objects "users"]) (nth c 2)))
+              (filter (fn [c] (and (vector? c) (= 3 (count c))
+                                   (= :kotobase/coll (nth c 1))))
+                      (get-in r [:query :where]))))))
+
+(deftest a-vector-keyed-collection-is-queryable-end-to-end
+  (let [s (vector-keyed-store)
+        t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name") {})]
+    (is (= [] (cypher/execute s t everything))
+        "verbatim: no collection is named \"users\"")
+    (is (= [["Alice"]]
+           (cypher/execute {:coll-keys [[:kotobase.s3/objects "users"]]} s t everything)))))
+
+(deftest resolution-does-not-disturb-string-keyed-collections
+  (let [s (fixture-store)
+        t (cypher/translate (cypher/parse "MATCH (n:users) WHERE n.role = 'admin' RETURN n.name") {})]
+    (is (= (cypher/execute s t everything)
+           (cypher/execute {:coll-keys ["users" "departments"]} s t everything)))))
+
+;; --- backtick-quoted identifiers -------------------------------------------
+;; The collections this surface is deployed beside are keyed
+;; [:kotobase.s3/objects bucket] and [:kotobase.at/records did nsid]. Resolving
+;; a label to them (above) is necessary and was not sufficient: their leaf
+;; names are bucket names and nsids, and a hyphen scans as :dash and a dot as
+;; :dot, so "my-bucket" and "app.bsky.feed.post" could not be written at all.
+
+(defn- nsid-store []
+  (let [s (local/local-store)]
+    (st/-put s [:kotobase.at/records "did:x" "app.bsky.feed.post"] "p1"
+             {:text "hello" :lang "en"})
+    (st/-put s [:kotobase.at/records "did:x" "app.bsky.feed.post"] "p2"
+             {:text "bonjour" :lang "fr"})
+    s))
+
+(deftest a-dotted-label-parses-when-quoted
+  (is (= [{:var "n" :label "app.bsky.feed.post"}]
+         (:nodes (:pattern (cypher/parse "MATCH (n:`app.bsky.feed.post`) RETURN n.text"))))))
+
+(deftest a-hyphenated-label-parses-when-quoted
+  (is (= [{:var "n" :label "my-bucket"}]
+         (:nodes (:pattern (cypher/parse "MATCH (n:`my-bucket`) RETURN n.k"))))))
+
+(deftest the-same-label-unquoted-is-still-a-syntax-error
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (cypher/parse "MATCH (n:my-bucket) RETURN n.k"))))
+
+(deftest quoting-escapes-keyword-ness
+  ;; `count` is a property named count, not the COUNT token -- otherwise a
+  ;; document with a "count" field would be unreadable.
+  (is (= ["n.count"] (:columns (cypher/translate
+                                (cypher/parse "MATCH (n:users) RETURN n.`count`")
+                                {})))))
+
+(deftest a-doubled-backtick-is-a-literal-one
+  (is (= [{:var "n" :label "we`ird"}]
+         (:nodes (:pattern (cypher/parse "MATCH (n:`we``ird`) RETURN n.k"))))))
+
+(deftest unterminated-and-empty-backticks-are-errors
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (cypher/parse "MATCH (n:`unclosed) RETURN n.k")))
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (cypher/parse "MATCH (n:``) RETURN n.k"))))
+
+(deftest an-nsid-collection-is-queryable-end-to-end
+  ;; The whole point: this is what atproto putRecord writes, and before this
+  ;; there was no way to write the query at all.
+  (let [s (nsid-store)
+        t (cypher/translate
+           (cypher/parse (str "MATCH (n:`app.bsky.feed.post`) WHERE n.lang = 'en' "
+                              "RETURN n.text"))
+           {})]
+    (is (= [["hello"]]
+           (cypher/execute {:coll-keys [[:kotobase.at/records "did:x" "app.bsky.feed.post"]]}
+                           s t everything)))))

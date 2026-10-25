@@ -215,6 +215,7 @@ The bundled standard libraries live in this repository:
 | `org.vrmC.vrm` | `org.vrmC.vrm/src` | `vrm`, `vrm.compat`, `vrm.compose`, `vrm.constraint` (an external specification, publisher vrmC.org) |
 | `org.signal.protocol` | `org.signal.protocol/src` | `kotoba.signal.group`, `kotoba.signal.hkdf`, `kotoba.signal.ratchet`, `kotoba.signal.sealed` (an external specification, publisher signal.org) |
 | `org.graphql.http` | `org.graphql.http/src` | `kotobase.protocols.graphql`, `kotobase.protocols.graphql.http`, `kotobase.protocols.graphql.json` (an external specification, publisher graphql.org) |
+| `org.opencypher.cypher` | `org.opencypher.cypher/src` | `kotobase.protocols.cypher`, `kotobase.protocols.cypher.http`, `kotobase.protocols.cypher.json` (an external specification, publisher opencypher.org) |
 | `kotoba.ayatori` | `kotoba.ayatori/src` | `ayatori.agent`, `ayatori.disclosure`, `ayatori.disclosure-open`, `ayatori.discovery` (Kotoba project library) |
 | `kotoba.envelope` | `kotoba.envelope/src` | `envelope.kem`, `envelope.keystore`, `envelope.model`, `envelope.passkey` (Kotoba project library) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
