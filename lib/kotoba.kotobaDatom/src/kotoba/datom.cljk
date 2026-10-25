@@ -1,0 +1,165 @@
+(ns kotoba.datom
+  "kotoba Datom-log writer/reader — content-addressed append-only commit-DAG.
+  ADR-2606112300 + ADR-2605312345 (kotoba Datom log = first-class canonical state).
+
+  Clojure port of the shionome/mimamori pattern (`methods/kotoba.py`): each
+  transaction is content-addressed (sha256 over its canonical datoms + the
+  previous tx's CID → a commit-DAG); a tamper of any earlier tx breaks every
+  later CID. CIDs are byte-compatible with the Python implementation (canonical
+  JSON: sorted keys, compact separators, ensure_ascii=false) so a log written by
+  either implementation verifies under the other.
+
+  EAVT = [\":db/add\" entity attribute value] — :db/add only (no retract; exit is
+  itself an appended state datom). Portable .cljc: the only host dependency is
+  sha-256 (JVM/babashka MessageDigest; other hosts bind *sha256-hex*) and the
+  file I/O at the append/read edge (kotoba-clj WASM hosts route these through
+  kqe-assert!/kqe-get-objects instead)."
+  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+            #?(:clj [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            #?(:clj [kotoba.io :as io])))
+
+;; ─── sha-256 (host seam) ──────────────────────────────────────────
+
+(def ^:dynamic *sha256-hex*
+  "String → lowercase hex sha-256 digest. Rebind on hosts without MessageDigest."
+  #?(:clj (fn [^String s]
+            (let [d (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                             (kbytes/utf8-bytes s))]
+              (str/join (map #(let [h (Integer/toHexString (bit-and % 0xff))]
+                                (if (= 1 (count h)) (str "0" h) h))
+                             d))))
+     :default (fn [_] (throw (ex-info "bind kotoba.datom/*sha256-hex* on this host" {})))))
+
+;; ─── canonical JSON (Python json.dumps parity) ────────────────────
+;; sort_keys=True, separators=(",",":"), ensure_ascii=False — the CID preimage.
+
+(defn- json-escape ^String [^String s]
+  (str/join
+   (map (fn [c]
+          (let [i #?(:clj (int c) :cljs (.charCodeAt c 0))]
+            (cond
+              (= c \") "\\\""
+              (= c \\) "\\\\"
+              (= c \backspace) "\\b"
+              (= c \tab) "\\t"
+              (= c \newline) "\\n"
+              (= c \formfeed) "\\f"
+              (= c \return) "\\r"
+              (< i 0x20) (let [h #?(:clj (Integer/toHexString i) :cljs (.toString i 16))]
+                           (str "\\u" (subs "0000" 0 (- 4 (count h))) h))
+              :else c)))
+        s)))
+
+(defn canonical-json
+  "Deterministic JSON for the CID preimage. Maps must have string keys."
+  ^String [v]
+  (cond
+    (string? v)     (str "\"" (json-escape v) "\"")
+    (boolean? v)    (if v "true" "false")
+    (integer? v)    (str v)
+    (number? v)     (str v)   ;; floats (e.g. :health/eco-maturity) — Python json.dumps repr parity
+    (map? v)        (str "{" (str/join "," (map (fn [k] (str "\"" (json-escape k) "\":"
+                                                              (canonical-json (get v k))))
+                                                (sort (keys v)))) "}")
+    (sequential? v) (str "[" (str/join "," (map canonical-json v)) "]")
+    :else (throw (ex-info "canonical-json: unsupported value" {:value v}))))
+
+;; ─── datoms ───────────────────────────────────────────────────────
+
+(defn add
+  "One EAVT assertion: [\":db/add\" entity attribute value]."
+  [entity attr value]
+  [":db/add" entity attr value])
+
+(defn- kw->str
+  "EDN reads `:db/add` back as a keyword; the CID preimage uses its \":…\" string."
+  [x]
+  (if (keyword? x)
+    (str x)
+    x))
+
+(defn normalize-datoms [datoms]
+  (mapv #(mapv kw->str %) datoms))
+
+;; ─── content-addressed transactions ──────────────────────────────
+
+(defn tx-cid
+  ([datoms] (tx-cid datoms ""))
+  ([datoms prev-cid]
+   (str "b" (*sha256-hex* (canonical-json {"prev" prev-cid
+                                           "datoms" (normalize-datoms datoms)})))))
+
+(defn make-tx [datoms {:keys [tx-id as-of prev-cid] :or {prev-cid ""}}]
+  {:tx/id tx-id
+   :tx/as-of as-of
+   :tx/prev prev-cid
+   :tx/cid (tx-cid datoms prev-cid)
+   :tx/count (count datoms)
+   :tx/datoms (normalize-datoms datoms)})
+
+;; ─── EDN log lines (Python `_tx_to_edn` shape) ────────────────────
+
+(defn- edn-val ^String [v]
+  (cond
+    (true? v)  "true"
+    (false? v) "false"
+    (number? v) (str v)
+    (string? v) (if (str/starts-with? v ":") v (pr-str v))
+    (sequential? v) (str "[" (str/join " " (map edn-val v)) "]")
+    :else (pr-str (str v))))
+
+(defn tx->edn-line ^String [tx]
+  (str "{:tx/id " (:tx/id tx)
+       " :tx/as-of " (:tx/as-of tx)
+       " :tx/prev " (pr-str (:tx/prev tx))
+       " :tx/cid " (pr-str (:tx/cid tx))
+       " :tx/count " (:tx/count tx)
+       " :tx/datoms [" (str/join " " (map edn-val (:tx/datoms tx))) "]}"))
+
+(def log-header
+  ";; kotoba Datom log — append-only EAVT transactions (content-addressed DAG). DO NOT hand-edit.\n")
+
+;; ─── append / read / verify (file-backed edge) ────────────────────
+
+#?(:clj
+   (defn append-tx!
+     "Append ONE transaction line (the log only ever grows — 永久記憶). Returns the CID."
+     [tx log-path]
+     (let [f (io/file log-path)]
+       (when-let [p (io/parent-file f)] (io/mkdirs p))
+       (when-not (io/exists? f) (spit f log-header))
+       (spit f (str (tx->edn-line tx) "\n") :append true)
+       (:tx/cid tx))))
+
+#?(:clj
+   (defn read-log
+     "Parsed transactions, oldest first. Datoms are normalized to \":…\" strings."
+     [log-path]
+     (let [f (io/file log-path)]
+       (if-not (io/exists? f)
+         []
+         (into []
+               (comp (map str/trim)
+                     (remove #(or (str/blank? %) (str/starts-with? % ";")))
+                     (map edn/read-string)
+                     (map #(update % :tx/datoms normalize-datoms)))
+               (str/split-lines (slurp f)))))))
+
+#?(:clj
+   (defn head-cid [log-path]
+     (or (:tx/cid (peek (read-log log-path))) "")))
+
+#?(:clj
+   (defn verify-chain
+     "Recompute every CID from (datoms, prev) — {:ok :length :broken-at}."
+     [log-path]
+     (let [txs (read-log log-path)]
+       (loop [i 0 prev ""]
+         (if (= i (count txs))
+           {:ok true :length (count txs) :broken-at -1}
+           (let [tx (nth txs i)]
+             (if (or (not= (:tx/cid tx) (tx-cid (:tx/datoms tx) prev))
+                     (not= (:tx/prev tx) prev))
+               {:ok false :length (count txs) :broken-at i}
+               (recur (inc i) (:tx/cid tx)))))))))

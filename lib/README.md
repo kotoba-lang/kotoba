@@ -104,6 +104,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `kotoba.kotobaDatom` | `kotoba.kotobaDatom/src` | `kotoba.datom` (Kotoba project library) |
 | `kotoba.glyph` | `kotoba.glyph/src` | `kotoba.glyph`, `kotoba.glyph.atlas`, `kotoba.glyph.constants`, `kotoba.glyph.dynamic` (Kotoba project library) |
 | `kotoba.game` | `kotoba.game/src` | `game`, `game.addons`, `game.analytics`, `game.animation` (Kotoba project library) |
 | `kotoba.drive` | `kotoba.drive/src` | `drive.model`, `drive.object`, `drive.store.fs`, `drive.store.memory` (Kotoba project library) |
