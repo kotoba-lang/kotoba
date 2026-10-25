@@ -1,0 +1,323 @@
+(ns mqtt.core-test
+  "Where a vector is drawn from the OASIS text (the Remaining Length size
+  table, MQTT-3.1.1 §2.2.3 Table 2.4, and the fixed field layouts in
+  §2.2/§2.2.1/§2.2.2/§3.1.2/§3.8.3/§3.9.3), the test comment cites the
+  section. Everything else — full packet byte dumps — is built from those
+  same field-encoding rules rather than copied from a worked example the
+  spec text does not, in fact, print byte-for-byte; those vectors are
+  marked `constructed, not a published spec vector` at the point they are
+  used, per this workspace's honesty requirement for test data."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mqtt.varint :as varint]
+            [mqtt.utf8 :as utf8]
+            [mqtt.fixed-header :as fh]
+            [mqtt.properties :as props]
+            [mqtt.packet :as pkt]))
+
+;; ── Variable Byte Integer — MQTT-3.1.1 §2.2.3 Table 2.4, published ─────────
+
+(deftest varint-size-table
+  ;; The published boundary values and their exact byte counts/encodings.
+  (doseq [[n bytes] [[0 [0x00]]
+                     [127 [0x7F]]
+                     [128 [0x80 0x01]]
+                     [16383 [0xFF 0x7F]]
+                     [16384 [0x80 0x80 0x01]]
+                     [2097151 [0xFF 0xFF 0x7F]]
+                     [2097152 [0x80 0x80 0x80 0x01]]
+                     [268435455 [0xFF 0xFF 0xFF 0x7F]]]]
+    (is (= bytes (varint/encode n)) (str "encode " n))
+    (is (= {:status :ok :value n :next-index (count bytes)}
+           (varint/decode bytes 0))
+        (str "decode " bytes))))
+
+(deftest varint-round-trip
+  (doseq [n (concat (range 0 300) [16383 16384 65535 2097151 2097152 268435455])]
+    (is (= n (:value (varint/decode (varint/encode n) 0))))))
+
+(deftest varint-malformed
+  (testing "a fifth continuation byte is refused by name, not merely rejected"
+    (is (= :malformed-variable-byte-integer
+           (:reason (varint/decode [0xFF 0xFF 0xFF 0xFF 0x7F] 0)))))
+  (testing "a truncated integer is :incomplete, not :error"
+    (is (= :incomplete (:status (varint/decode [0x80 0x80] 0))))))
+
+;; ── UTF-8 field ──────────────────────────────────────────────────────────────
+
+(deftest utf8-round-trip
+  (doseq [s ["" "a" "MQTT" "topic/with/slashes" (apply str (repeat 300 "x"))]]
+    (let [e (utf8/encode (utf8/ascii->bytes s))]
+      (is (= :ok (:status e)))
+      (let [d (utf8/decode (:bytes e) 0)]
+        (is (= :ok (:status d)))
+        (is (= s (utf8/bytes->ascii (:bytes d))))))))
+
+(deftest utf8-embedded-null
+  (is (= :embedded-null (:reason (utf8/decode [0x00 0x01 0x00] 0)))))
+
+(deftest utf8-incomplete
+  (is (= :incomplete (:status (utf8/decode [0x00 0x05 0x41 0x42] 0)))
+      "declared length longer than what's present"))
+
+;; ── fixed header ─────────────────────────────────────────────────────────────
+
+(deftest fixed-header-round-trip
+  (doseq [type [:connect :connack :puback :pubrec :pubrel :pubcomp :subscribe
+               :suback :unsubscribe :unsuback :pingreq :pingresp :disconnect :auth]]
+    (let [e (fh/encode {:type type :remaining-length 42})]
+      (is (= :ok (:status e)) type)
+      (let [d (fh/decode (:bytes e))]
+        (is (= :ok (:status d)) type)
+        (is (= type (get-in d [:header :type])))
+        (is (= 42 (get-in d [:header :remaining-length])))))))
+
+(deftest fixed-header-publish-flags-are-data-not-reserved
+  ;; DUP=1 QoS=2 RETAIN=1 -> flags 0b1101 = 0x0D. Constructed from
+  ;; MQTT-3.1.1 §2.2.2's bit layout, not copied from a worked example.
+  (let [e (fh/encode {:type :publish :flags 0x0D :remaining-length 0})]
+    (is (= [0x3D 0x00] (:bytes e)))))
+
+(deftest fixed-header-malformed-reserved-flags
+  ;; MQTT-3.1.1 §2.2.2: CONNECT's low nibble MUST be 0000. Byte 0x11 is
+  ;; CONNECT (type 1) with flags 0001.
+  (is (= :malformed-reserved-flags (:reason (fh/decode [0x11 0x00])))))
+
+(deftest fixed-header-unknown-type
+  ;; Type 0 is reserved and unused (MQTT-3.1.1 §2.2.1 Table 2.1).
+  (is (= :unknown-packet-type (:reason (fh/decode [0x00 0x00])))))
+
+;; ── properties (MQTT 5.0 only) ──────────────────────────────────────────────
+
+(deftest properties-round-trip
+  (let [ps [[:session-expiry-interval 3600]
+           [:receive-maximum 20]
+           [:maximum-qos 1]
+           [:user-property ["k" "v"]]
+           [:reason-string "because"]]
+        e (props/encode ps)]
+    (is (= :ok (:status e)))
+    (let [d (props/decode (:bytes e) 0)]
+      (is (= :ok (:status d)))
+      (is (= ps (:properties d))))))
+
+(deftest properties-empty
+  (let [e (props/encode [])]
+    (is (= [0x00] (:bytes e)) "Property Length 0, zero property bytes")))
+
+(deftest properties-unknown-identifier
+  ;; Identifier 200 is not assigned by MQTT-5.0 §2.2.2.2.
+  (is (= :unknown-property-identifier
+         (:reason (props/decode [0x02 200 0x01] 0)))))
+
+;; ── CONNECT / CONNACK ────────────────────────────────────────────────────────
+
+(deftest connect-round-trip-v4
+  (let [e (pkt/encode-connect {:version 4 :client-id "sensor-01"
+                               :clean-session? true :keep-alive 60})]
+    (is (= :ok (:status e)))
+    ;; constructed, not a published spec vector: protocol name/level/flags/
+    ;; keep-alive per MQTT-3.1.1 §3.1.2, client id per §3.1.3.1.
+    (is (= [0x10] [(first (:bytes e))]) "CONNECT type nibble, reserved flags 0")
+    (let [d (pkt/decode-connect (:bytes e))]
+      (is (= :ok (:status d)))
+      (is (= {:version 4 :client-id "sensor-01" :clean-session? true
+             :keep-alive 60 :properties []}
+             (:packet d))))))
+
+(deftest connect-round-trip-v5-with-will-and-credentials
+  (let [e (pkt/encode-connect
+           {:version 5 :client-id "dev-42" :clean-session? false :keep-alive 30
+            :properties [[:session-expiry-interval 7200]]
+            :will {:topic "devices/dev-42/status" :payload (utf8/ascii->bytes "offline")
+                   :qos 1 :retain? true :properties [[:will-delay-interval 10]]}
+            :username "alice" :password (utf8/ascii->bytes "s3cret")})]
+    (is (= :ok (:status e)))
+    (let [d (pkt/decode-connect (:bytes e))]
+      (is (= :ok (:status d)))
+      (is (= 5 (get-in d [:packet :version])))
+      (is (= "dev-42" (get-in d [:packet :client-id])))
+      (is (= false (get-in d [:packet :clean-session?])))
+      (is (= [[:session-expiry-interval 7200]] (get-in d [:packet :properties])))
+      (is (= "devices/dev-42/status" (get-in d [:packet :will :topic])))
+      (is (= 1 (get-in d [:packet :will :qos])))
+      (is (true? (get-in d [:packet :will :retain?])))
+      (is (= (utf8/ascii->bytes "offline") (get-in d [:packet :will :payload])))
+      (is (= "alice" (get-in d [:packet :username])))
+      (is (= (utf8/ascii->bytes "s3cret") (get-in d [:packet :password]))))))
+
+(deftest connect-malformed-protocol-name
+  ;; constructed, not a published spec vector: a well-formed CONNECT fixed
+  ;; header (0x10, remaining length 12) wrapped around the pre-3.1.1 wire
+  ;; name "MQIsdp" instead of "MQTT".
+  (let [body (into (:bytes (utf8/encode (utf8/ascii->bytes "MQIsdp"))) [3 0 0 60])
+        bs (into [0x10 (count body)] body)]
+    (is (= :unrecognised-protocol-name (:reason (pkt/decode-connect bs)))
+        "the pre-3.1.1 wire name is not accepted implicitly")))
+
+(deftest connect-malformed-reserved-bit
+  ;; MQTT-3.1.1 §3.1.2.3: bit 0 of Connect Flags is reserved and MUST be 0.
+  (let [e (pkt/encode-connect {:version 4 :client-id "x" :keep-alive 0})
+        bs (:bytes e)
+        bad (update bs 9 bit-or 0x01)] ; the Connect Flags byte
+    (is (= :malformed-connect-flags-reserved-bit-set (:reason (pkt/decode-connect bad))))))
+
+(deftest connack-round-trip
+  (doseq [rc (keys pkt/return-code->connack)]
+    (let [e (pkt/encode-connack {:version 4 :session-present? (= rc :accepted) :return-code rc})]
+      (is (= :ok (:status e)))
+      (let [d (pkt/decode-connack (subvec (:bytes e) 2))]
+        (is (= rc (get-in d [:packet :return-code])) rc)))))
+
+(deftest connack-v5-with-properties
+  (let [e (pkt/encode-connack {:version 5 :reason-code 0x80
+                               :properties [[:reason-string "nope"]]})
+        d (pkt/decode-connack (subvec (:bytes e) 2))]
+    (is (= 0x80 (get-in d [:packet :reason-code])))
+    (is (= [[:reason-string "nope"]] (get-in d [:packet :properties])))))
+
+;; ── PUBLISH ──────────────────────────────────────────────────────────────────
+
+(deftest publish-round-trip-all-qos
+  (doseq [qos [0 1 2] version [4 5]]
+    (let [e (pkt/encode-publish (cond-> {:version version :qos qos :topic "a/b"
+                                         :payload (utf8/ascii->bytes "hello")}
+                                  (pos? qos) (assoc :packet-id 7)))]
+      (is (= :ok (:status e)) [qos version])
+      (let [d (pkt/decode (:bytes e) version)]
+        (is (= :ok (:status d)) [qos version])
+        (is (= :publish (:type d)))
+        (is (= "a/b" (get-in d [:packet :topic])))
+        (is (= (utf8/ascii->bytes "hello") (get-in d [:packet :payload])))
+        (is (= qos (get-in d [:packet :qos])))
+        (is (= (when (pos? qos) 7) (get-in d [:packet :packet-id])))))))
+
+(deftest publish-packet-id-discipline
+  (is (= :packet-identifier-required-for-qos-above-zero
+         (:reason (pkt/encode-publish {:qos 1 :topic "t" :payload []}))))
+  (is (= :packet-identifier-forbidden-at-qos-zero
+         (:reason (pkt/encode-publish {:qos 0 :packet-id 1 :topic "t" :payload []})))))
+
+(deftest publish-invalid-qos-on-wire
+  ;; QoS bits 11 (3) are invalid at the protocol level (MQTT-3.1.1 §3.3.1.2).
+  (let [e (pkt/encode-publish {:qos 1 :packet-id 1 :topic "t" :payload []})
+        bad (update (:bytes e) 0 bit-or 0x06)] ; force flag bits to 0b110x -> QoS 3
+    (is (= :invalid-qos (:reason (pkt/decode bad 4))))))
+
+;; ── PUBACK family ────────────────────────────────────────────────────────────
+
+(deftest ack-round-trip-short-form
+  (doseq [type [:puback :pubrec :pubrel :pubcomp] version [4 5]]
+    (let [e (pkt/encode-ack {:type type :version version :packet-id 99})]
+      (is (= 4 (count (:bytes e))) "2-byte fixed header prefix + 2-byte packet id")
+      (let [d (pkt/decode (:bytes e) version)]
+        (is (= 99 (get-in d [:packet :packet-id])) [type version])
+        (is (= 0 (get-in d [:packet :reason-code])))))))
+
+(deftest ack-round-trip-v5-long-form
+  (let [e (pkt/encode-ack {:type :puback :version 5 :packet-id 5 :reason-code 0x10
+                           :properties [[:reason-string "no matching subscribers"]]})
+        d (pkt/decode (:bytes e) 5)]
+    (is (= 0x10 (get-in d [:packet :reason-code])))
+    (is (= [[:reason-string "no matching subscribers"]] (get-in d [:packet :properties])))))
+
+(deftest ack-v4-cannot-carry-a-reason-code
+  ;; A v4 peer sent 3 bytes of remaining length — malformed, not "extra data
+  ;; ignored", because 3.1.1 defines no meaning for a third byte here.
+  (is (= :malformed-remaining-length
+         (:reason (pkt/decode-ack :puback [0x00 0x01 0x00] 4)))))
+
+;; ── SUBSCRIBE / SUBACK ───────────────────────────────────────────────────────
+
+(deftest subscribe-round-trip
+  (doseq [version [4 5]]
+    (let [e (pkt/encode-subscribe
+             {:version version :packet-id 10
+              :topics [{:filter "a/#" :qos 1} {:filter "b/+/c" :qos 2 :no-local? true}]})
+          d (pkt/decode (:bytes e) version)]
+      (is (= :ok (:status d)) version)
+      (is (= 10 (get-in d [:packet :packet-id])))
+      (is (= ["a/#" "b/+/c"] (mapv :filter (get-in d [:packet :topics]))))
+      (is (= [1 2] (mapv :qos (get-in d [:packet :topics]))))
+      (when (= version 5)
+        (is (true? (:no-local? (second (get-in d [:packet :topics])))))))))
+
+(deftest subscribe-no-topics
+  (is (= :no-topics (:reason (pkt/encode-subscribe {:packet-id 1 :topics []})))))
+
+(deftest suback-round-trip
+  ;; encode-suback takes raw wire bytes for :codes (granted QoS or 0x80
+  ;; failure, MQTT-3.1.1 §3.9.3), not the keyword table — that table is for
+  ;; naming a decoded code, not for building the request.
+  (let [e (pkt/encode-suback {:version 4 :packet-id 10 :codes [1 0x80]})
+        d (pkt/decode (:bytes e) 4)]
+    (is (= [1 0x80] (get-in d [:packet :codes])))
+    (is (= :granted-qos-1 (pkt/suback-return-codes 1)))
+    (is (= :failure (pkt/suback-return-codes 0x80)))))
+
+;; ── UNSUBSCRIBE / UNSUBACK ───────────────────────────────────────────────────
+
+(deftest unsubscribe-round-trip
+  (let [e (pkt/encode-unsubscribe {:version 4 :packet-id 11 :filters ["a/#" "b/c"]})
+        d (pkt/decode (:bytes e) 4)]
+    (is (= ["a/#" "b/c"] (get-in d [:packet :filters])))))
+
+(deftest unsuback-round-trip-v4-no-payload
+  (let [e (pkt/encode-unsuback {:version 4 :packet-id 11})
+        d (pkt/decode (:bytes e) 4)]
+    (is (= :ok (:status d)))
+    (is (= 11 (get-in d [:packet :packet-id])))
+    (is (= [] (get-in d [:packet :codes])))))
+
+(deftest unsuback-round-trip-v5-with-codes
+  (let [e (pkt/encode-unsuback {:version 5 :packet-id 11 :codes [0x00 0x11]})
+        d (pkt/decode (:bytes e) 5)]
+    (is (= [0x00 0x11] (get-in d [:packet :codes])))))
+
+;; ── PINGREQ / PINGRESP / DISCONNECT ──────────────────────────────────────────
+
+(deftest ping-round-trip
+  (is (= [0xC0 0x00] (:bytes (pkt/encode-pingreq))))
+  (is (= [0xD0 0x00] (:bytes (pkt/encode-pingresp))))
+  (is (= :ok (:status (pkt/decode (:bytes (pkt/encode-pingreq)) 4))))
+  (is (= :ok (:status (pkt/decode (:bytes (pkt/encode-pingresp)) 4)))))
+
+(deftest disconnect-v4-is-always-empty
+  (is (= [0xE0 0x00] (:bytes (pkt/encode-disconnect {:version 4})))))
+
+(deftest disconnect-v5-short-and-long-form
+  (is (= [0xE0 0x00] (:bytes (pkt/encode-disconnect {:version 5}))))
+  (let [e (pkt/encode-disconnect {:version 5 :reason-code 0x04
+                                  :properties [[:reason-string "bye"]]})
+        d (pkt/decode (subvec (:bytes e) 2) 5)]
+    ;; decode-disconnect takes the body only, per decode-empty's convention;
+    ;; use the whole-packet dispatcher instead for symmetry with the rest.
+    (let [d2 (pkt/decode (:bytes e) 5)]
+      (is (= 0x04 (get-in d2 [:packet :reason-code])))
+      (is (= [[:reason-string "bye"]] (get-in d2 [:packet :properties]))))))
+
+;; ── round-trip corpus across the whole-packet dispatcher ────────────────────
+
+(deftest whole-packet-corpus-round-trip
+  (doseq [[version bytes]
+          (for [version [4 5]]
+            [version
+             [(:bytes (pkt/encode-connect {:version version :client-id "c" :keep-alive 5}))
+              (:bytes (pkt/encode-connack {:version version :reason-code 0 :return-code :accepted}))
+              (:bytes (pkt/encode-publish {:version version :qos 0 :topic "t" :payload [1 2 3]}))
+              (:bytes (pkt/encode-publish {:version version :qos 1 :packet-id 1 :topic "t" :payload []}))
+              (:bytes (pkt/encode-ack {:type :puback :version version :packet-id 2}))
+              (:bytes (pkt/encode-ack {:type :pubrec :version version :packet-id 3}))
+              (:bytes (pkt/encode-ack {:type :pubrel :version version :packet-id 4}))
+              (:bytes (pkt/encode-ack {:type :pubcomp :version version :packet-id 5}))
+              (:bytes (pkt/encode-subscribe {:version version :packet-id 6
+                                             :topics [{:filter "x" :qos 0}]}))
+              (:bytes (pkt/encode-suback {:version version :packet-id 6 :codes [0]}))
+              (:bytes (pkt/encode-unsubscribe {:version version :packet-id 7 :filters ["x"]}))
+              (:bytes (pkt/encode-unsuback {:version version :packet-id 7}))
+              (:bytes (pkt/encode-pingreq))
+              (:bytes (pkt/encode-pingresp))
+              (:bytes (pkt/encode-disconnect {:version version}))]])]
+    (doseq [b bytes]
+      (let [d (pkt/decode b version)]
+        (is (= :ok (:status d)) [version b])
+        (is (= (count b) (:next-index d)) "consumes exactly the frame, no more, no less")))))

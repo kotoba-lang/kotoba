@@ -176,6 +176,7 @@ The bundled standard libraries live in this repository:
 | `org.ansi.iges` | `org.ansi.iges/src` | `iges.core` (an external specification, publisher ansi.org) |
 | `org.si2.lef` | `org.si2.lef/src` | `lef.core` (an external specification, publisher si2.org) |
 | `org.openehr.adl` | `org.openehr.adl/src` | `adl.archetype`, `adl.cadl`, `adl.dadl`, `adl.lexer` (an external specification, publisher openehr.org) |
+| `org.oasisOpen.mqtt` | `org.oasisOpen.mqtt/src` | `mqtt.fixed-header`, `mqtt.packet`, `mqtt.properties`, `mqtt.utf8` (an external specification, publisher oasisOpen.org) |
 | `com.synopsys.liberty` | `com.synopsys.liberty/src` | `liberty.core` (Kotoba project library) |
 | `io.toml.core` | `io.toml.core/src` | `toml.reader` (Kotoba project library) |
 | `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
