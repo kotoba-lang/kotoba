@@ -40,5 +40,6 @@ catalog, public CLI execution or the P4 desktop.
 Native text keeps Unicode whitespace excluding U+00A0/U+2007/U+202F, ASCII
 lower preserving non-ASCII, and an empty needle matching every string.
 Do not alias the differently named ASCII whitespace/UTF-8 byte-index kernels
-to full text APIs. CSSOM capture regex, index-of/join and full Unicode case
-remain distinct qualification requirements. Preserve all graph declarations.
+to full text APIs. Native index-of retains UTF-16/option semantics and both arities; join takes
+typed string lists and preserves empty fields. CSSOM capture regex and full
+Unicode case remain distinct qualification requirements. Preserve all graph declarations.
