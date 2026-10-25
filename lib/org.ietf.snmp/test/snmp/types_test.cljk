@@ -1,0 +1,111 @@
+(ns snmp.types-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [asn1.core :as asn1]
+            [snmp.types :as types]))
+
+;; ── IP address bit ops — genuinely SNMP's own, not asn1's ──────────────────
+
+(deftest ip-int-round-trip
+  (testing "192.168.1.1 packed/unpacked with real shifts, not string math"
+    (is (= [192 168 1 1] (types/ip-int->bytes (types/bytes->ip-int [192 168 1 1]))))
+    (is (= 0xC0A80101 (types/bytes->ip-int [0xC0 0xA8 0x01 0x01])))
+    ;; the classic way to get this wrong: shift amounts backwards, which
+    ;; would turn 192.168.1.1 into 1.1.168.192.
+    (is (not= (types/bytes->ip-int [192 168 1 1]) (types/bytes->ip-int [1 1 168 192])))))
+
+(deftest dotted-quad-round-trip
+  (is (= [10 0 0 1] (types/dotted->bytes "10.0.0.1")))
+  (is (= "10.0.0.1" (types/bytes->dotted [10 0 0 1])))
+  (is (nil? (types/dotted->bytes "10.0.0.256")))   ; octet out of range
+  (is (nil? (types/dotted->bytes "10.0.0"))))       ; too few parts
+
+;; ── application-tagged types (RFC 1155-SMI, RFC 2578 §7.1.6) ───────────────
+
+(deftest ip-address-round-trip
+  (let [el (types/ip-address [192 168 1 1])]
+    (is (= :application (:asn1/class el)))
+    (is (= 0 (:asn1/tag el)))
+    (is (= [:ok {:snmp/type :ip-address :snmp/bytes [192 168 1 1]}]
+           (types/decode-value el)))))
+
+(deftest counter32-round-trip
+  ;; RFC 1155-SMI: Counter32 ::= [APPLICATION 1] IMPLICIT INTEGER (0..2^32-1).
+  ;; The top value needs the DER leading 0x00 even though it is "unsigned" —
+  ;; that is the asn1.core behavior this reuses, asserted directly here.
+  (let [el (types/counter32 4294967295)]
+    (is (= [0x00 0xff 0xff 0xff 0xff] (:asn1/content el)))
+    (is (= [:ok {:snmp/type :counter32 :snmp/int 4294967295}] (types/decode-value el))))
+  (is (= [:ok {:snmp/type :counter32 :snmp/int 0}] (types/decode-value (types/counter32 0)))))
+
+(deftest gauge32-and-time-ticks-round-trip
+  (is (= [:ok {:snmp/type :gauge32 :snmp/int 42}] (types/decode-value (types/gauge32 42))))
+  (is (= [:ok {:snmp/type :time-ticks :snmp/int 360000}]
+         (types/decode-value (types/time-ticks 360000)))))
+
+(deftest opaque-round-trip
+  (is (= [:ok {:snmp/type :opaque :snmp/bytes [1 2 3]}]
+         (types/decode-value (types/opaque [1 2 3])))))
+
+(deftest counter64-small-value-round-trip
+  (is (= [:ok {:snmp/type :counter64 :snmp/int 1000000000000}]
+         (types/decode-value (types/counter64 1000000000000)))))
+
+(deftest counter64-hex-round-trip-no-leading-zero
+  ;; top bit of the top octet clear, so no DER leading 0x00 gets added and
+  ;; the hex is exactly what went in.
+  (let [el (types/counter64-from-hex "7fffffffffffffff")]
+    (is (= "7fffffffffffffff" (asn1/integer-hex el)))
+    (is (= [:ok {:snmp/type :counter64 :snmp/hex "7fffffffffffffff"}]
+           (types/decode-value el)))))
+
+(deftest counter64-hex-top-bit-set-gets-der-leading-zero
+  ;; 2^64-1: top bit set, so the content DER requires is 9 octets, not 8 —
+  ;; this is the encoding, not the number (asn1.core's own framing, see
+  ;; `integer-hex`'s docstring) — asserted explicitly so it is documented
+  ;; behavior, not a surprise.
+  (let [el (types/counter64-from-hex "ffffffffffffffff")]
+    (is (= "00ffffffffffffffff" (asn1/integer-hex el)))))
+
+;; ── exception markers (RFC 3416 §3) ─────────────────────────────────────────
+
+(deftest exception-markers-round-trip
+  (doseq [kind [:no-such-object :no-such-instance :end-of-mib-view]]
+    (let [el (types/exception-marker kind)]
+      (is (= :context (:asn1/class el)))
+      (is (= [:ok {:snmp/type kind}] (types/decode-value el))))))
+
+;; ── generic SimpleSyntax passthrough (INTEGER/OCTET STRING/NULL/OID) ────────
+
+(deftest simple-syntax-round-trip
+  (is (= [:ok {:snmp/type :integer :snmp/int -1}]
+         (types/decode-value (types/encode-value {:snmp/type :integer :snmp/int -1}))))
+  (is (= [:ok {:snmp/type :octet-string :snmp/bytes [104 105]}]
+         (types/decode-value (types/encode-value {:snmp/type :octet-string :snmp/bytes [104 105]}))))
+  (is (= [:ok {:snmp/type :null}]
+         (types/decode-value (types/encode-value {:snmp/type :null}))))
+  (is (= [:ok {:snmp/type :oid :snmp/oid "1.3.6.1.2.1.1.1.0"}]
+         (types/decode-value (types/encode-value {:snmp/type :oid :snmp/oid "1.3.6.1.2.1.1.1.0"})))))
+
+;; ── negative paths: named errors, never a throw, never a silent success ────
+
+(deftest negative-decode-paths
+  (testing "IpAddress content must be exactly 4 octets"
+    (is (= [:error :snmp/bad-ip-address]
+           (types/decode-value (asn1/retag (asn1/octet-string [1 2 3]) :application 0)))))
+  (testing "unrecognized class/tag combination"
+    (is (= [:error :snmp/unknown-value-type]
+           (types/decode-value (asn1/retag (asn1/octet-string []) :private 9)))))
+  (testing "a Counter32 whose top bit is set with no DER leading zero decodes negative — refused"
+    ;; 0x80000000 with no leading 0x00 is legitimate (and minimal — DER's
+    ;; non-minimal-INTEGER check only fires on a redundant 0x00/0xff pair,
+    ;; which this is not) two's-complement -2147483648, which is not a
+    ;; valid unsigned counter value.
+    (is (= [:error :snmp/negative-counter]
+           (types/decode-value (asn1/retag (asn1/integer-from-hex "80000000") :application 1))))))
+
+;; ── prove the negative test discriminates (CONFORMANCE FLOOR #6) ───────────
+;;
+;; Not asserted in a `deftest` (it is a manual, reported check per the task
+;; instructions) — see the PR/report for what was broken and restored, and
+;; that `:snmp/negative-counter` specifically stopped firing, not some other
+;; keyword, when the "negative" input was changed to a valid one.
