@@ -104,6 +104,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `kotoba.katex` | `kotoba.katex/src` | `kotoba.lang.katex.mathml`, `kotoba.lang.katex.parse` (Kotoba project library) |
 | `kotoba.kamiOngakuNotation` | `kotoba.kamiOngakuNotation/src` | `kami.ongaku.notation`, `kami.ongaku.notation.duration`, `kami.ongaku.notation.musicxml`, `kami.ongaku.notation.pitch` (Kotoba project library) |
 | `kotoba.sdf` | `kotoba.sdf/src` | `sdf` (Kotoba project library) |
 | `kotoba.kamiEngineCad` | `kotoba.kamiEngineCad/src` | `kami.cad` (Kotoba project library) |
