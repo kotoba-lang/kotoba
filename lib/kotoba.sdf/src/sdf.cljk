@@ -1,0 +1,524 @@
+(ns sdf
+  "Zero-dep portable CLJC. Restored from the legacy kami-engine/kami-sdf Rust crate
+  (`kami-sdf/src/lib.rs`, 528 lines), deleted from kotoba-lang/kami-engine in PR #82
+  (\"Remove Rust workspace from kami-engine\") as part of the clj-wgsl migration
+  (ADR-2607010930, com-junkawasaki/root).
+
+  Purpose: signed-distance-function (SDF) primitives (sphere / box / cylinder /
+  capsule / torus), a CSG tree (union / difference / intersection / smooth-union /
+  density-field) that evaluates to a distance+color sample at any point, a minimal
+  local dense-voxel rasterizer that walks the tree into a filled-voxel map (replacing
+  the deleted crate's `kami_voxel::VoxelVolume` dependency with an in-namespace data
+  structure, keeping this ns zero-dep), and a tiny hand-rolled JSON-LD parser (no
+  external JSON library — `#?(:clj ... :cljs ...)` only used for host-numeric
+  primitives) that builds CSG trees from a small declarative JSON dialect
+  (`@type`/`pos`/`rot`/`scale`/`color`/`$ref`+`defs`).
+
+  Conventions: `Vec3` -> plain `[x y z]` CLJC vector; `Mat4` (always used as an affine
+  transform built from `Mat4::IDENTITY` / `Mat4::from_translation` /
+  `Mat4::from_scale_rotation_translation` in the original) -> `{:mat3 [[..][..][..]]
+  :translation [x y z]}` representing `p -> mat3*p + translation`, which is sufficient
+  for every transform this crate ever constructs and lets 4x4 inversion collapse to a
+  cheap 3x3 cofactor inverse. `SdfPrimitive`/`SdfNode` enums -> plain maps tagged with
+  a `:type` keyword; `def foo-types #{...}` sets document valid tags. Rotation
+  (`rot` degrees, XYZ Euler) is parsed but exercised by none of the original test
+  suite; the convention chosen here is R = Rz * Ry * Rx (extrinsic X then Y then Z)."
+  (:require [kotoba.lang.text :as str]))
+
+;; ── portable host-math shims ─────────────────────────────────────────────────
+
+(defn abs*
+  "Portable absolute value for doubles."
+  [x]
+  #?(:clj (Math/abs (double x))
+     :cljs (js/Math.abs x)))
+
+(defn sqrt*
+  "Portable square root."
+  [x]
+  #?(:clj (Math/sqrt (double x))
+     :cljs (js/Math.sqrt x)))
+
+(defn floor*
+  "Portable floor."
+  [x]
+  #?(:clj (Math/floor (double x))
+     :cljs (js/Math.floor x)))
+
+(defn to-radians*
+  "Portable degrees->radians."
+  [deg]
+  #?(:clj (Math/toRadians (double deg))
+     :cljs (* deg (/ js/Math.PI 180.0))))
+
+(defn sin* [x] #?(:clj (Math/sin (double x)) :cljs (js/Math.sin x)))
+(defn cos* [x] #?(:clj (Math/cos (double x)) :cljs (js/Math.cos x)))
+
+(defn parse-double*
+  "Portable string->double."
+  [s]
+  #?(:clj (Double/parseDouble s)
+     :cljs (js/parseFloat s)))
+
+(defn parse-hex-byte*
+  "Portable 2-hex-digit -> integer (0-255)."
+  [s]
+  #?(:clj (Integer/parseInt s 16)
+     :cljs (js/parseInt s 16)))
+
+;; ── Vec3 math ─────────────────────────────────────────────────────────────────
+
+(def v3-zero [0.0 0.0 0.0])
+(def v3-one [1.0 1.0 1.0])
+
+(defn v3 [x y z] [(double x) (double y) (double z)])
+
+(defn v3+ [a b] (mapv + a b))
+(defn v3- [a b] (mapv - a b))
+(defn v3-scale [a s] (mapv #(* % s) a))
+(defn v3-mul [a b] (mapv * a b))
+(defn v3-abs [a] (mapv abs* a))
+(defn v3-max [a b] (mapv max a b))
+(defn v3-min [a b] (mapv min a b))
+(defn v3-dot [a b] (reduce + (map * a b)))
+(defn v3-length [a] (sqrt* (v3-dot a a)))
+(defn clamp-scalar [x lo hi] (max lo (min hi x)))
+
+;; ── affine transform (3x3 + translation) ────────────────────────────────────
+
+(def mat3-identity [[1.0 0.0 0.0] [0.0 1.0 0.0] [0.0 0.0 1.0]])
+
+(def identity-transform {:mat3 mat3-identity :translation v3-zero})
+
+(defn mat3-from-scale [[sx sy sz]]
+  [[sx 0.0 0.0] [0.0 sy 0.0] [0.0 0.0 sz]])
+
+(defn mat3-mul
+  "3x3 * 3x3 matrix multiply."
+  [a b]
+  (vec (for [i (range 3)]
+         (vec (for [j (range 3)]
+                (reduce + (for [k (range 3)]
+                            (* (get-in a [i k]) (get-in b [k j])))))))))
+
+(defn mat3-mul-vec3 [m v]
+  (let [[r0 r1 r2] m]
+    [(v3-dot r0 v) (v3-dot r1 v) (v3-dot r2 v)]))
+
+(defn mat3-from-euler-xyz
+  "Rotation matrix for Euler angles (radians), applied as R = Rz * Ry * Rx."
+  [rx ry rz]
+  (let [cx (cos* rx) sx (sin* rx)
+        cy (cos* ry) sy (sin* ry)
+        cz (cos* rz) sz (sin* rz)
+        rx-m [[1.0 0.0 0.0] [0.0 cx (- sx)] [0.0 sx cx]]
+        ry-m [[cy 0.0 sy] [0.0 1.0 0.0] [(- sy) 0.0 cy]]
+        rz-m [[cz (- sz) 0.0] [sz cz 0.0] [0.0 0.0 1.0]]]
+    (mat3-mul rz-m (mat3-mul ry-m rx-m))))
+
+(defn mat3-inverse
+  "3x3 inverse via adjugate / determinant (cofactor expansion)."
+  [[[a b c] [d e f] [g h i]]]
+  (let [A (- (* e i) (* f h))
+        B (- (- (* d i) (* f g)))
+        C (- (* d h) (* e g))
+        D (- (- (* b i) (* c h)))
+        E (- (* a i) (* c g))
+        F (- (- (* a h) (* b g)))
+        G (- (* b f) (* c e))
+        H (- (- (* a f) (* c d)))
+        I (- (* a e) (* b d))
+        det (+ (* a A) (* b B) (* c C))
+        inv-det (/ 1.0 det)]
+    [[(* A inv-det) (* D inv-det) (* G inv-det)]
+     [(* B inv-det) (* E inv-det) (* H inv-det)]
+     [(* C inv-det) (* F inv-det) (* I inv-det)]]))
+
+(defn transform-point3
+  "p -> M*p + t"
+  [{:keys [mat3 translation]} p]
+  (v3+ (mat3-mul-vec3 mat3 p) translation))
+
+(defn inverse-transform-point3
+  "p -> M^-1 * (p - t)"
+  [{:keys [mat3 translation]} p]
+  (mat3-mul-vec3 (mat3-inverse mat3) (v3- p translation)))
+
+(defn transform-from-translation [t]
+  {:mat3 mat3-identity :translation t})
+
+(defn transform-from-scale-rotation-translation
+  "Mirrors `Mat4::from_scale_rotation_translation(scale, rot-radians-xyz, pos)`."
+  [scale [rx ry rz] pos]
+  {:mat3 (mat3-mul (mat3-from-euler-xyz rx ry rz) (mat3-from-scale scale))
+   :translation pos})
+
+;; ── SDF primitives ───────────────────────────────────────────────────────────
+
+(def primitive-types #{:sphere :box :cylinder :capsule :torus})
+
+(defn sd-sphere [radius p]
+  (- (v3-length p) radius))
+
+(defn sd-box [half-extents p]
+  (let [q (v3- (v3-abs p) half-extents)
+        [qx qy qz] q]
+    (+ (v3-length (v3-max q v3-zero))
+       (min 0.0 (max qx (max qy qz))))))
+
+(defn sd-cylinder [h r p]
+  (let [[px py pz] p
+        dx (- (v3-length [px 0.0 pz]) r)
+        dy (- (abs* py) (/ h 2.0))]
+    (+ (min (max dx dy) 0.0)
+       (v3-length [(max dx 0.0) (max dy 0.0) 0.0]))))
+
+(defn sd-capsule [h r p]
+  (let [[_ py _] p
+        py' (clamp-scalar py (- (/ h 2.0)) (/ h 2.0))]
+    (- (v3-length (v3- p [0.0 py' 0.0])) r)))
+
+(defn sd-torus [major-r minor-r p]
+  (let [[px py pz] p
+        qx (- (v3-length [px 0.0 pz]) major-r)]
+    (- (v3-length [qx py 0.0]) minor-r)))
+
+(defn sdf-primitive-distance
+  "Signed distance from point `p` to primitive map `prim` (`{:type :sphere :radius r}` etc)."
+  [prim p]
+  (case (:type prim)
+    :sphere (sd-sphere (:radius prim) p)
+    :box (sd-box (:half-extents prim) p)
+    :cylinder (sd-cylinder (:h prim) (:r prim) p)
+    :capsule (sd-capsule (:h prim) (:r prim) p)
+    :torus (sd-torus (:major-r prim) (:minor-r prim) p)))
+
+;; ── SDF CSG tree ─────────────────────────────────────────────────────────────
+
+(def node-types #{:primitive :union :difference :intersection :smooth-union :density-field})
+
+(def default-color [0.5 0.5 0.5 0.5])
+
+;; Larger than any distance seen in practice; mirrors Rust's `f32::MAX` sentinel
+;; used to seed the running-minimum fold over Union/SmoothUnion children.
+(def ^:const max-distance 1.0e30)
+
+(defn- sample-density-field [{:keys [data dims threshold color]} p]
+  (let [[dx dy dz] dims
+        [px py pz] p
+        gx (clamp-scalar (* (+ px 1.0) 0.5 (double (dec dx))) 0.0 (double (dec dx)))
+        gy (clamp-scalar (* (+ py 1.0) 0.5 (double (dec dy))) 0.0 (double (dec dy)))
+        gz (clamp-scalar (* (+ pz 1.0) 0.5 (double (dec dz))) 0.0 (double (dec dz)))
+        ix (long (floor* gx))
+        iy (long (floor* gy))
+        iz (long (floor* gz))
+        idx (fn [x y z]
+              (let [x (min x (dec dx)) y (min y (dec dy)) z (min z (dec dz))]
+                (nth data (+ (* z dy dx) (* y dx) x))))
+        fx (- gx (floor* gx))
+        fy (- gy (floor* gy))
+        fz (- gz (floor* gz))
+        c000 (idx ix iy iz)
+        c100 (idx (inc ix) iy iz)
+        c010 (idx ix (inc iy) iz)
+        c110 (idx (inc ix) (inc iy) iz)
+        c001 (idx ix iy (inc iz))
+        c101 (idx (inc ix) iy (inc iz))
+        c011 (idx ix (inc iy) (inc iz))
+        c111 (idx (inc ix) (inc iy) (inc iz))
+        density (+ (* c000 (- 1.0 fx) (- 1.0 fy) (- 1.0 fz))
+                   (* c100 fx (- 1.0 fy) (- 1.0 fz))
+                   (* c010 (- 1.0 fx) fy (- 1.0 fz))
+                   (* c110 fx fy (- 1.0 fz))
+                   (* c001 (- 1.0 fx) (- 1.0 fy) fz)
+                   (* c101 fx (- 1.0 fy) fz)
+                   (* c011 (- 1.0 fx) fy fz)
+                   (* c111 fx fy fz))]
+    {:distance (- threshold density) :color color}))
+
+(declare sdf-sample)
+
+(defn- sample-running-min [children p]
+  (reduce
+   (fn [best child]
+     (let [s (sdf-sample child p)]
+       (if (< (:distance s) (:distance best)) s best)))
+   {:distance max-distance :color default-color}
+   children))
+
+(defn- sample-smooth-union [children k p]
+  (reduce
+   (fn [best child]
+     (let [s (sdf-sample child p)]
+       (if (< (:distance s) (:distance best))
+         (let [h (clamp-scalar (+ 0.5 (* 0.5 (/ (- (:distance best) (:distance s)) k))) 0.0 1.0)
+               new-dist (- (+ (* (:distance best) (- 1.0 h)) (* (:distance s) h))
+                           (* k h (- 1.0 h)))]
+           {:distance new-dist :color (:color s)})
+         best)))
+   {:distance max-distance :color default-color}
+   children))
+
+(defn sdf-sample
+  "Evaluate `node` (an SdfNode map) at point `p`, returning `{:distance d :color [r g b a]}`."
+  [node p]
+  (case (:type node)
+    :primitive
+    (let [local-p (inverse-transform-point3 (:transform node) p)]
+      {:distance (sdf-primitive-distance (:prim node) local-p) :color (:color node)})
+
+    :union
+    (sample-running-min (:children node) p)
+
+    :difference
+    (let [a (sdf-sample (:base node) p)
+          b (sdf-sample (:subtract node) p)]
+      {:distance (max (:distance a) (- (:distance b))) :color (:color a)})
+
+    :intersection
+    (let [sa (sdf-sample (:a node) p)
+          sb (sdf-sample (:b node) p)]
+      (if (> (:distance sa) (:distance sb)) sa sb))
+
+    :smooth-union
+    (sample-smooth-union (:children node) (:k node) p)
+
+    :density-field
+    (sample-density-field node p)))
+
+;; ── minimal local voxel rasterizer (replaces the deleted crate's kami_voxel dep) ─
+
+(defn sample-sdf
+  "Rasterize `node` into a sparse dense-voxel map over a cube `[-bounds,bounds]^3`
+  split into `resolution^3` cells. Returns `{[x y z] {:material m :color c} ...}`
+  containing only the voxels whose sample distance is <= 0 (i.e. filled)."
+  [node resolution bounds]
+  (let [step (/ (* bounds 2.0) resolution)]
+    (reduce
+     (fn [volume [x y z]]
+       (let [px (+ (- bounds) (* (+ x 0.5) step))
+             py (+ (- bounds) (* (+ y 0.5) step))
+             pz (+ (- bounds) (* (+ z 0.5) step))
+             s (sdf-sample node [px py pz])]
+         (if (<= (:distance s) 0.0)
+           (assoc volume [x y z] {:material 1 :color (:color s)})
+           volume)))
+     {}
+     (for [z (range resolution) y (range resolution) x (range resolution)] [x y z]))))
+
+(defn volume-count-filled [volume] (count volume))
+
+;; ── SDF JSON-LD parser (hand-rolled, zero-dep) ──────────────────────────────
+;;
+;; Supports: Sphere, Box, Cylinder, Capsule, Torus, Union, SmoothUnion,
+;; Difference, Intersection. Features: named colors (#hex / "white"),
+;; pos/rot/scale shorthand, $ref + defs.
+
+(defn- ws-char? [c] (or (= c \space) (= c \tab) (= c \newline) (= c \return)))
+(defn- digit-char? [c] (and (<= (int \0) (int c)) (<= (int c) (int \9))))
+
+(defn- skip-ws [s i]
+  (let [n (count s)]
+    (loop [i i]
+      (if (and (< i n) (ws-char? (nth s i)))
+        (recur (inc i))
+        i))))
+
+(declare parse-json-value)
+
+(defn- parse-json-string [s i]
+  (loop [i (inc i) acc []]
+    (let [c (nth s i)]
+      (cond
+        (= c \") [(apply str acc) (inc i)]
+        (= c \\)
+        (let [nc (nth s (inc i))
+              ch (case nc
+                   \" \"
+                   \\ \\
+                   \/ \/
+                   \n \newline
+                   \t \tab
+                   \r \return
+                   \b \backspace
+                   \f \formfeed
+                   nc)]
+          (recur (+ i 2) (conj acc ch)))
+        :else (recur (inc i) (conj acc c))))))
+
+(defn- parse-json-number [s i]
+  (let [n (count s)
+        number-char? (fn [c] (or (digit-char? c) (#{\- \+ \. \e \E} c)))]
+    (loop [j i]
+      (if (and (< j n) (number-char? (nth s j)))
+        (recur (inc j))
+        [(parse-double* (subs s i j)) j]))))
+
+(defn- parse-json-array [s i]
+  (let [i (skip-ws s (inc i))]
+    (if (= (nth s i) \])
+      [[] (inc i)]
+      (loop [i i acc []]
+        (let [i (skip-ws s i)
+              [v i] (parse-json-value s i)
+              acc (conj acc v)
+              i (skip-ws s i)
+              c (nth s i)]
+          (cond
+            (= c \,) (recur (inc i) acc)
+            (= c \]) [acc (inc i)]
+            :else (throw (ex-info "invalid json array" {:pos i}))))))))
+
+(defn- parse-json-object [s i]
+  (let [i (skip-ws s (inc i))]
+    (if (= (nth s i) \})
+      [{} (inc i)]
+      (loop [i i acc {}]
+        (let [i (skip-ws s i)
+              [k i] (parse-json-string s i)
+              i (skip-ws s i)
+              i (inc i) ;; skip ':'
+              [v i] (parse-json-value s i)
+              acc (assoc acc k v)
+              i (skip-ws s i)
+              c (nth s i)]
+          (cond
+            (= c \,) (recur (inc i) acc)
+            (= c \}) [acc (inc i)]
+            :else (throw (ex-info "invalid json object" {:pos i}))))))))
+
+(defn- parse-json-value [s i]
+  (let [i (skip-ws s i)
+        n (count s)
+        c (nth s i)]
+    (cond
+      (= c \{) (parse-json-object s i)
+      (= c \[) (parse-json-array s i)
+      (= c \") (parse-json-string s i)
+      (or (= c \-) (digit-char? c)) (parse-json-number s i)
+      (and (<= (+ i 4) n) (= (subs s i (+ i 4)) "true")) [true (+ i 4)]
+      (and (<= (+ i 5) n) (= (subs s i (+ i 5)) "false")) [false (+ i 5)]
+      (and (<= (+ i 4) n) (= (subs s i (+ i 4)) "null")) [nil (+ i 4)]
+      :else (throw (ex-info "invalid json" {:pos i :char c})))))
+
+(defn parse-json
+  "Minimal recursive-descent JSON parser (objects -> string-keyed maps, arrays ->
+  vectors, numbers -> doubles). No external JSON dependency."
+  [s]
+  (first (parse-json-value s 0)))
+
+(defn- parse-vec3-field [v key]
+  (when-let [arr (get v key)]
+    [(double (nth arr 0 0.0)) (double (nth arr 1 0.0)) (double (nth arr 2 0.0))]))
+
+(defn- parse-color-str [s]
+  (if (and (str/starts-with? s "#") (>= (count s) 7))
+    [(/ (parse-hex-byte* (subs s 1 3)) 255.0)
+     (/ (parse-hex-byte* (subs s 3 5)) 255.0)
+     (/ (parse-hex-byte* (subs s 5 7)) 255.0)
+     1.0]
+    (case (str/lower s)
+      "white" [1.0 1.0 1.0 1.0]
+      "black" [0.0 0.0 0.0 1.0]
+      "red" [1.0 0.0 0.0 1.0]
+      "green" [0.0 1.0 0.0 1.0]
+      "blue" [0.0 0.0 1.0 1.0]
+      [0.5 0.5 0.5 1.0])))
+
+(defn- parse-color-field [v]
+  (let [c (get v "color")]
+    (cond
+      (string? c) (parse-color-str c)
+      (vector? c) [(double (nth c 0 0.5)) (double (nth c 1 0.5))
+                   (double (nth c 2 0.5)) (double (nth c 3 1.0))]
+      :else [0.5 0.5 0.5 1.0])))
+
+(defn- parse-transform-field [v]
+  (let [pos (or (parse-vec3-field v "pos") v3-zero)
+        scale (or (parse-vec3-field v "scale") v3-one)
+        [rx ry rz] (or (parse-vec3-field v "rot") v3-zero)]
+    (transform-from-scale-rotation-translation
+     scale
+     [(to-radians* rx) (to-radians* ry) (to-radians* rz)]
+     pos)))
+
+(declare parse-sdf-value)
+
+(defn- parse-children [v defs]
+  (if-let [arr (get v "children")]
+    (vec (keep (fn [child]
+                 (try
+                   (parse-sdf-value child defs)
+                   (catch #?(:clj Exception :cljs :default) _ nil)))
+               arr))
+    []))
+
+(defn- parse-sdf-value [v defs]
+  (if-let [ref-name (get v "$ref")]
+    (let [def (get defs ref-name)]
+      (when (nil? def)
+        (throw (ex-info (str "undefined $ref: " ref-name) {})))
+      (parse-sdf-value (merge def (dissoc v "$ref")) defs))
+    (let [ty (get v "@type" "")
+          color (parse-color-field v)
+          transform (parse-transform-field v)
+          local-defs (get v "defs")
+          all-defs (if local-defs (merge defs local-defs) defs)]
+      (case ty
+        "Sphere"
+        {:type :primitive
+         :prim {:type :sphere :radius (double (get v "r" 0.5))}
+         :transform transform :color color}
+
+        "Box"
+        (let [size (or (parse-vec3-field v "size") v3-one)]
+          {:type :primitive
+           :prim {:type :box :half-extents (v3-scale size 0.5)}
+           :transform transform :color color})
+
+        "Cylinder"
+        {:type :primitive
+         :prim {:type :cylinder :h (double (get v "h" 1.0)) :r (double (get v "r" 0.5))}
+         :transform transform :color color}
+
+        "Capsule"
+        {:type :primitive
+         :prim {:type :capsule :h (double (get v "h" 1.0)) :r (double (get v "r" 0.25))}
+         :transform transform :color color}
+
+        "Torus"
+        {:type :primitive
+         :prim {:type :torus :major-r (double (get v "R" 1.0)) :minor-r (double (get v "r" 0.25))}
+         :transform transform :color color}
+
+        "Union"
+        {:type :union :children (parse-children v all-defs)}
+
+        "SmoothUnion"
+        {:type :smooth-union :children (parse-children v all-defs) :k (double (get v "k" 0.1))}
+
+        "Difference"
+        (let [children (parse-children v all-defs)]
+          (when (< (count children) 2)
+            (throw (ex-info "Difference needs ≥2 children" {})))
+          {:type :difference :base (first children) :subtract (second children)})
+
+        "Intersection"
+        (let [children (parse-children v all-defs)]
+          (when (< (count children) 2)
+            (throw (ex-info "Intersection needs ≥2 children" {})))
+          {:type :intersection :a (first children) :b (second children)})
+
+        (throw (ex-info (str "unknown SDF type: " ty) {}))))))
+
+(defn parse-sdf-jsonld
+  "Parse SDF JSON-LD (a JSON string) into an SdfNode tree. Returns `{:ok node}` on
+  success or `{:error msg}` on failure, mirroring the original Rust
+  `Result<SdfNode, String>`."
+  [json-str]
+  (try
+    (let [v (parse-json json-str)
+          defs (or (get v "defs") {})]
+      {:ok (parse-sdf-value v defs)})
+    (catch #?(:clj Exception :cljs :default) e
+      {:error #?(:clj (or (ex-message e) (str e)) :cljs (str e))})))
