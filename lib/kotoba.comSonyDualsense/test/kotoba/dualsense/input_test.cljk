@@ -1,0 +1,182 @@
+(ns kotoba.dualsense.input-test
+  (:require [kotoba.test :refer [deftest testing is]]
+            [kotoba.dualsense.crc32 :as crc32]
+            [kotoba.dualsense.input :as input]))
+
+(defn- close? [a b] (< (Math/abs (- (double a) (double b))) 1.0e-6))
+
+;; A neutral 64-byte USB report: report ID 0x01, both sticks centered
+;; (128), both touch-point contact bytes at bit7=1 (idle/no-finger, per
+;; the spec: bit7=1 means NOT touching), everything else 0.
+(defn- base-usb []
+  (assoc (vec (repeat 64 0)) 0 0x01 1 128 2 128 3 128 4 128 33 0x80 37 0x80))
+
+(defn- usb-with [base & kvs]
+  (apply assoc base kvs))
+
+;; ---------------------------------------------------------------------------
+;; Report shape
+;; ---------------------------------------------------------------------------
+
+(deftest connection-tag
+  (is (= :usb (:connection (input/decode-usb-report (base-usb))))))
+
+;; ---------------------------------------------------------------------------
+;; Sticks — high confidence
+;; ---------------------------------------------------------------------------
+
+(deftest stick-full-deflection-and-center
+  (testing "left stick X: 255 = full right, 0 = full left, 128 = center (dead-zoned to exactly 0)"
+    (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 1 255)) [:sticks :lx])))
+    (is (close? -1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 1 0)) [:sticks :lx])))
+    (is (= 0.0 (get-in (input/decode-usb-report (usb-with (base-usb) 1 128)) [:sticks :lx]))))
+  (testing "left stick Y: raw HID Y increases downward, decoded Y is flipped so 'up' is positive"
+    (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 2 0)) [:sticks :ly])))
+    (is (close? -1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 2 255)) [:sticks :ly]))))
+  (testing "right stick mirrors left stick's axes/offsets"
+    (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 3 255)) [:sticks :rx])))
+    (is (close? -1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 3 0)) [:sticks :rx])))
+    (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 4 0)) [:sticks :ry])))
+    (is (close? -1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 4 255)) [:sticks :ry])))))
+
+(deftest stick-deadzone-rescales-not-clips
+  (testing "just past the default 8% deadzone is close to 0, not identical to the raw fraction"
+    (let [;; raw value whose normalized magnitude is ~0.09 (just past 0.08 deadzone)
+          raw (int (+ 127.5 (* 0.09 127.5)))
+          v (get-in (input/decode-usb-report (usb-with (base-usb) 1 raw)) [:sticks :lx])]
+      (is (pos? v))
+      (is (< v 0.09))))
+  (testing "full deflection still reaches exactly +/-1.0 despite the deadzone rescale"
+    (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 1 255)) [:sticks :lx])))))
+
+;; ---------------------------------------------------------------------------
+;; Triggers — high confidence
+;; ---------------------------------------------------------------------------
+
+(deftest trigger-normalization
+  (is (close? 0.0 (get-in (input/decode-usb-report (usb-with (base-usb) 5 0)) [:triggers :l2])))
+  (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 5 255)) [:triggers :l2])))
+  (is (close? 0.0 (get-in (input/decode-usb-report (usb-with (base-usb) 6 0)) [:triggers :r2])))
+  (is (close? 1.0 (get-in (input/decode-usb-report (usb-with (base-usb) 6 255)) [:triggers :r2]))))
+
+;; ---------------------------------------------------------------------------
+;; Buttons — high confidence
+;; ---------------------------------------------------------------------------
+
+(def ^:private button-bits
+  ;; [usb byte-index bit-mask expected-button]
+  [[8 0x10 :square] [8 0x20 :cross] [8 0x40 :circle] [8 0x80 :triangle]
+   [9 0x01 :l1] [9 0x02 :r1] [9 0x04 :l2] [9 0x08 :r2]
+   [9 0x10 :create] [9 0x20 :options] [9 0x40 :l3] [9 0x80 :r3]
+   [10 0x01 :ps] [10 0x02 :touchpad] [10 0x04 :mute]])
+
+(deftest each-button-bit-decodes-in-isolation
+  (doseq [[byte-idx mask expected] button-bits]
+    (let [report (usb-with (base-usb) byte-idx mask)
+          buttons (:buttons (input/decode-usb-report report))]
+      (is (= #{expected} buttons)
+          (str "byte " byte-idx " mask " mask " should decode to exactly #{" expected "}")))))
+
+(deftest no-buttons-when-all-zero
+  (is (= #{} (:buttons (input/decode-usb-report (base-usb))))))
+
+;; ---------------------------------------------------------------------------
+;; D-pad — high confidence
+;; ---------------------------------------------------------------------------
+
+(deftest dpad-hat-switch
+  (let [expect [:n :ne :e :se :s :sw :w :nw]]
+    (doseq [nibble (range 8)]
+      (is (= (nth expect nibble)
+             (:dpad (input/decode-usb-report (usb-with (base-usb) 8 nibble)))))))
+  (testing "8-15 all mean neutral"
+    (doseq [nibble (range 8 16)]
+      (is (= :neutral (:dpad (input/decode-usb-report (usb-with (base-usb) 8 nibble))))))))
+
+;; ---------------------------------------------------------------------------
+;; Bluetooth report + CRC-32 — algorithm/seed is high confidence, field
+;; content beyond sticks/triggers/buttons is best-effort (see namespace
+;; docstring)
+;; ---------------------------------------------------------------------------
+
+(defn- bt-frame-with-valid-crc
+  "A 78-byte BT report: report ID 0x31, byte 1 an arbitrary BT header
+  byte, sticks centered (BT bytes 2-5), a correctly-computed trailing
+  CRC-32 over bytes[0..73] seeded with 0xA1."
+  []
+  (let [body (-> (vec (repeat 74 0))
+                 (assoc 0 0x31 1 0x00 2 128 3 128 4 128 5 128))
+        crc (crc32/crc32 (cons 0xA1 body))
+        crc-bytes [(bit-and crc 0xFF)
+                   (bit-and (unsigned-bit-shift-right crc 8) 0xFF)
+                   (bit-and (unsigned-bit-shift-right crc 16) 0xFF)
+                   (bit-and (unsigned-bit-shift-right crc 24) 0xFF)]]
+    (vec (concat body crc-bytes))))
+
+(deftest bt-report-length
+  (is (= 78 (count (bt-frame-with-valid-crc)))))
+
+(deftest bt-crc-validates-correct-frame
+  (is (true? (:crc-valid? (input/decode-bt-report (bt-frame-with-valid-crc))))))
+
+(deftest bt-crc-rejects-corrupted-frame
+  (let [good (bt-frame-with-valid-crc)
+        corrupt (update good 10 #(bit-xor % 0x01))]
+    (is (false? (:crc-valid? (input/decode-bt-report corrupt))))
+    (testing "fields are still decoded best-effort even when the CRC fails"
+      (is (map? (input/decode-bt-report corrupt)))
+      (is (= :bluetooth (:connection (input/decode-bt-report corrupt)))))))
+
+(deftest bt-connection-tag
+  (is (= :bluetooth (:connection (input/decode-bt-report (bt-frame-with-valid-crc))))))
+
+;; ---------------------------------------------------------------------------
+;; Touch / gyro / accel / battery — best-effort fields: verify decode
+;; *shape* and the documented bit-packing, not real hardware truth.
+;; ---------------------------------------------------------------------------
+
+(deftest touch-not-touching-by-default
+  (let [touch (:touch (input/decode-usb-report (base-usb)))]
+    (is (= 2 (count touch)))
+    (doseq [t touch]
+      (is (false? (:contact? t))))))
+
+(deftest touch-contact-and-coordinate-packing
+  ;; USB byte 33 = touch point 0's contact byte (bit7 clear = touching, id=5).
+  ;; bytes 34/35/36 pack a 12-bit X and a 12-bit Y: byte35's low nibble is
+  ;; X's high 4 bits, its high nibble is Y's low 4 bits (per the kernel's
+  ;; `x_hi:4, y_lo:4` bitfield sharing one byte).
+  (let [report (usb-with (base-usb)
+                          33 0x05         ; contact? true, id 5
+                          34 0xCD         ; x low byte
+                          35 0xA3         ; x high nibble (0x3) | y low nibble (0xA)
+                          36 0x0F)        ; y high byte
+        touch0 (first (:touch (input/decode-usb-report report)))]
+    (is (true? (:contact? touch0)))
+    (is (= 5 (:id touch0)))
+    (is (= 0x3CD (:x touch0)))
+    (is (= 0xFA (:y touch0)))))
+
+(deftest gyro-and-accel-signed-int16-le
+  ;; USB bytes 16-17 = gyro X (little-endian signed int16): 0xFFFF = -1.
+  (let [report (usb-with (base-usb) 16 0xFF 17 0xFF)]
+    (is (= -1 (get-in (input/decode-usb-report report) [:gyro :x]))))
+  (let [report (usb-with (base-usb) 16 0x01 17 0x00)]
+    (is (= 1 (get-in (input/decode-usb-report report) [:gyro :x]))))
+  ;; USB bytes 22-23 = accel Y.
+  (let [report (usb-with (base-usb) 24 0x02 25 0x00)]
+    (is (= 2 (get-in (input/decode-usb-report report) [:accel :y])))))
+
+(deftest battery-level-and-charging
+  (testing "charging-status 0 = discharging, level from low nibble"
+    (let [report (usb-with (base-usb) 53 0x07)] ; level 7, charging-status 0
+      (is (= {:level 7 :charging? false :usb? false}
+             (:battery (input/decode-usb-report report))))))
+  (testing "charging-status 1 = actively charging (implies USB power present)"
+    (let [report (usb-with (base-usb) 53 (bit-or 0x03 0x10))] ; level 3, charging-status 1
+      (is (= {:level 3 :charging? true :usb? true}
+             (:battery (input/decode-usb-report report))))))
+  (testing "charging-status 2 = full (implies USB power present, not actively charging)"
+    (let [report (usb-with (base-usb) 53 (bit-or 0x0A 0x20))] ; level 10, charging-status 2
+      (is (= {:level 10 :charging? false :usb? true}
+             (:battery (input/decode-usb-report report)))))))
