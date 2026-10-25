@@ -173,6 +173,7 @@ The bundled standard libraries live in this repository:
 | `org.ethereum.abi` | `org.ethereum.abi/src` | `ethereum.abi`, `ethereum.abi.word` (an external specification, publisher ethereum.org) |
 | `org.csaIot.zigbee` | `org.csaIot.zigbee/src` | `ieee802154.mac`, `zigbee.aps`, `zigbee.nwk` (an external specification, publisher csaIot.org) |
 | `org.ashrae.bacnet` | `org.ashrae.bacnet/src` | `bacnet.apdu`, `bacnet.bvlc`, `bacnet.npdu`, `bacnet.services` (an external specification, publisher ashrae.org) |
+| `org.ansi.iges` | `org.ansi.iges/src` | `iges.core` (an external specification, publisher ansi.org) |
 | `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |

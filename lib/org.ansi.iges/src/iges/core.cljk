@@ -1,0 +1,267 @@
+(ns iges.core
+  "IGES 5.3 (ANSI/USPRO/IPO-100-1996) — read and write.
+
+  IGES is the exchange format CAD systems that predate STEP still emit, and the
+  one a shop's 20-year-old fixture library is in. It is a fixed 80-column card
+  format in five sections — Start, Global, Directory Entry, Parameter Data,
+  Terminate — where column 73 names the section and columns 74-80 carry a
+  sequence number.
+
+  Two things about it are easy to get wrong in a way that produces a file other
+  systems reject while your own reader accepts it, so both are tested here:
+
+  - **The delimiters are declared IN the file.** The first two Global fields are
+    Hollerith strings giving the parameter and record delimiters. They are
+    usually `,` and `;`, and a reader that assumes so will silently mis-split
+    every file from a system that chose otherwise. Reading them requires
+    decoding a Hollerith string before you know the delimiter — resolvable
+    because the count precedes the `H`.
+  - **Every line is exactly 80 columns**, and Directory Entry records are
+    exactly two of them, which is why DE pointers are always odd.
+
+  What is NOT here: surfaces (128), trimmed surfaces (144), and the entity
+  types built on them. `parse` reports every type it does not decode, by number
+  and count, in `:iges/unsupported` — a reader that drops what it does not know
+  turns someone else's model into a subset of itself and says nothing."
+  (:require [kotoba.lang.text :as string]))
+
+(def entity-names
+  "Type number -> name, for the types this library decodes. Registering a type
+  here IS the claim that it is decoded; `supported-types` reads this map."
+  {100 "Circular arc" 106 "Copious data" 110 "Line" 116 "Point"
+   124 "Transformation matrix"})
+
+(defn supported-types [] (set (keys entity-names)))
+
+;; ---------------------------------------------------------------------------
+;; Cards
+;; ---------------------------------------------------------------------------
+
+(defn- pad-right [s n] (str s (apply str (repeat (max 0 (- n (count s))) " "))))
+(defn- pad-left [s n] (str (apply str (repeat (max 0 (- n (count s))) " ")) s))
+
+(defn card
+  "One 80-column IGES record: `body` in columns 1-72, `section` in 73, the
+  sequence number right-justified in 74-80."
+  [body section seq-no]
+  (when (> (count body) 72)
+    (throw (ex-info "IGES card body exceeds 72 columns" {:body body :width (count body)})))
+  (str (pad-right body 72) section (pad-left (str seq-no) 7)))
+
+(defn- section-of [line] (when (>= (count line) 73) (subs line 72 73)))
+(defn- body-of [line] (string/trimr (subs line 0 (min 72 (count line)))))
+
+;; ---------------------------------------------------------------------------
+;; Hollerith and free-format fields
+;; ---------------------------------------------------------------------------
+
+(defn hollerith [s] (str (count s) "H" s))
+
+(defn- read-hollerith
+  "Read `<n>H<chars>` at the head of `s`; returns [value rest] or nil."
+  [s]
+  (when-let [[m digits] (re-find #"^(\d+)H" s)]
+    (let [len (#?(:clj Long/parseLong :cljs js/parseInt) digits)
+          head (count m)]
+      [(subs s head (+ head len)) (subs s (+ head len))])))
+
+(defn- split-on
+  "Split `text` on the literal `sep`, keeping empty fields. Not a regex split:
+  the delimiter comes out of the file and may be any character, including one
+  a regex would read as syntax."
+  [text sep]
+  (loop [s text out []]
+    (if-let [i (string/index-of s sep)]
+      (recur (subs s (+ i (count sep))) (conj out (subs s 0 i)))
+      (conj out s))))
+
+(defn- split-fields
+  "Split free-format parameter text on `pd`, stopping at `rd`."
+  [text pd rd]
+  (let [stop (string/index-of text rd)
+        body (if stop (subs text 0 stop) text)]
+    (mapv string/trim (split-on body pd))))
+
+(defn- as-number [s]
+  (when (seq s)
+    (let [t (string/replace (string/trim s) #"[Dd]" "E")]
+      (when (re-matches #"[-+]?(\d+\.?\d*|\.\d+)([Ee][-+]?\d+)?" t)
+        (#?(:clj Double/parseDouble :cljs js/parseFloat) t)))))
+
+(defn- as-int [s]
+  (let [t (string/trim (or s ""))]
+    (when (re-matches #"[-+]?\d+" t) (#?(:clj Long/parseLong :cljs js/parseInt) t))))
+
+;; ---------------------------------------------------------------------------
+;; Reading
+;; ---------------------------------------------------------------------------
+
+(defn- global-delimiters
+  "The parameter and record delimiters, read out of the Global section itself."
+  [g]
+  (let [[pd rest1] (or (read-hollerith g) [nil nil])]
+    (if-not pd
+      [", " ";"]                                   ; not Hollerith: unusable
+      (let [after (if (string/starts-with? rest1 pd) (subs rest1 (count pd)) rest1)
+            [rd _] (or (read-hollerith after) [";" nil])]
+        [pd rd]))))
+
+(defn- decode-entity [type-no form params]
+  (let [n #(as-number (nth params % nil))]
+    (merge
+     {:iges/type type-no :iges/form form :iges/name (get entity-names type-no)}
+     (case type-no
+       110 {:line/start [(n 1) (n 2) (n 3)] :line/end [(n 4) (n 5) (n 6)]}
+       116 {:point/at [(n 1) (n 2) (n 3)]}
+       100 {:arc/plane-z (n 1)
+            :arc/center [(n 2) (n 3)]
+            :arc/start [(n 4) (n 5)]
+            :arc/end [(n 6) (n 7)]}
+       106 (let [ip (as-int (nth params 1 nil)) cnt (as-int (nth params 2 nil))
+                 stride (case ip 1 2, 2 3, 3 3, 3)]
+             {:copious/interpretation ip
+              :copious/points (mapv (fn [i]
+                                      (let [b (+ 3 (* i stride))]
+                                        (case ip
+                                          1 [(n b) (n (+ b 1))]
+                                          [(n b) (n (+ b 1)) (n (+ b 2))])))
+                                    (range (or cnt 0)))})
+       124 {:transform/rows (mapv (fn [r] (mapv #(n (+ 1 (* r 4) %)) (range 4)))
+                                  (range 3))}
+       {:iges/params (vec (rest params))}))))
+
+(defn parse
+  "Parse IGES text.
+
+  Returns `{:iges/start :iges/global :iges/delimiters :iges/entities
+  :iges/counts :iges/unsupported}`. Entities of types this library decodes come
+  back as maps with named keys; every other type is counted by number in
+  `:iges/unsupported` — never dropped in silence."
+  [text]
+  (let [lines (remove string/blank? (string/split-lines text))
+        by-section (group-by section-of lines)
+        start (string/join "\n" (map body-of (get by-section "S")))
+        global-text (apply str (map body-of (get by-section "G")))
+        [pd rd] (global-delimiters global-text)
+        de-lines (vec (get by-section "D"))
+        pd-lines (vec (get by-section "P"))
+        ;; Parameter records: columns 1-64 hold data, 66-72 the DE pointer.
+        pd-by-de (reduce (fn [m l]
+                           (let [ptr (as-int (subs l 64 (min 72 (count l))))
+                                 body (string/trimr (subs l 0 (min 64 (count l))))]
+                             (update m ptr (fnil str "") body)))
+                         {} pd-lines)
+        field (fn [line i] (string/trim (subs line (* i 8) (min (count line) (* (inc i) 8)))))
+        entities (keep (fn [i]
+                         (let [l1 (nth de-lines (* 2 i) nil)
+                               l2 (nth de-lines (inc (* 2 i)) nil)]
+                           (when (and l1 l2)
+                             (let [type-no (as-int (field l1 0))
+                                   de-ptr (inc (* 2 i))
+                                   form (as-int (field l2 4))
+                                   params (split-fields (get pd-by-de de-ptr "") pd rd)]
+                               [type-no form params]))))
+                       (range (quot (count de-lines) 2)))
+        known (filter #(contains? entity-names (first %)) entities)
+        unknown (remove #(contains? entity-names (first %)) entities)
+        decoded (mapv (fn [[t f p]] (decode-entity t f p)) known)]
+    {:iges/start start
+     :iges/global global-text
+     :iges/delimiters [pd rd]
+     :iges/entities decoded
+     :iges/counts (frequencies (map :iges/type decoded))
+     :iges/unsupported (frequencies (map first unknown))}))
+
+;; ---------------------------------------------------------------------------
+;; Writing
+;; ---------------------------------------------------------------------------
+
+(defn- fmt [x]
+  (cond (nil? x) ""
+        (integer? x) (str x)
+        :else (let [d (double x)]
+                (if (== d (double (long d))) (str (long d) ".") (str d)))))
+
+(defn- entity-params [{:iges/keys [type] :as e}]
+  (case type
+    110 (into [110] (map fmt (concat (:line/start e) (:line/end e))))
+    116 (into [116] (conj (mapv fmt (:point/at e)) "0"))
+    100 (into [100] (map fmt (concat [(:arc/plane-z e)] (:arc/center e)
+                                     (:arc/start e) (:arc/end e))))
+    106 (let [ip (:copious/interpretation e 2) pts (:copious/points e)]
+          (into [106 ip (count pts)] (map fmt (apply concat pts))))
+    124 (into [124] (map fmt (apply concat (:transform/rows e))))
+    (throw (ex-info (str "iges.core cannot write entity type " type
+                         ". Writable: " (string/join ", " (sort (supported-types))))
+                    {:type type}))))
+
+(defn- wrap-params
+  "Parameter data for one entity as 64-column bodies, terminated by `rd`."
+  [params pd rd]
+  (let [text (str (string/join pd (map str params)) rd)]
+    (loop [s text out []]
+      (if (<= (count s) 64)
+        (conj out s)
+        (let [cut (or (string/last-index-of (subs s 0 64) pd) 63)]
+          (recur (subs s (inc cut)) (conj out (subs s 0 (inc cut)))))))))
+
+(defn write
+  "Write entities as an IGES file.
+
+  `opts` may carry `:delimiters [pd rd]`, `:sender`, `:file-name`, `:author`,
+  `:organisation`, `:units` (a name like \"MM\") and `:unit-flag`. The
+  delimiters are written into the Global section as Hollerith strings, so a
+  file produced with non-default ones is still readable — by this library and
+  by anything else that reads the declaration rather than assuming it."
+  ([entities] (write entities {}))
+  ([entities opts]
+   (let [[pd rd] (:delimiters opts [", " ";"])
+         pd (string/trim pd)
+         h hollerith
+         globals [(h pd) (h rd) (h (:sender opts "kotoba"))
+                  (h (:file-name opts "out.igs")) (h "kotoba-lang/org-ansi-iges")
+                  (h "1.0") "32" "38" "6" "308" "15"
+                  (h (:receiver opts "")) "1.0" (str (:unit-flag opts 2))
+                  (h (:units opts "MM")) "1" "0.0"
+                  (h (:timestamp opts "20260822.000000")) "1.0E-7" "0.0"
+                  (h (:author opts "")) (h (:organisation opts "")) "11" "0"
+                  (h (:timestamp opts "20260822.000000"))]
+         global-text (str (string/join pd globals) rd)
+         global-cards (loop [s global-text out []]
+                        (if (<= (count s) 72)
+                          (conj out s)
+                          (let [cut (or (string/last-index-of (subs s 0 72) pd) 71)]
+                            (recur (subs s (inc cut)) (conj out (subs s 0 (inc cut)))))))
+         start-lines [(str "Written by kotoba-lang/org-ansi-iges")]
+         ;; Parameter bodies first: a DE record has to point at the P line the
+         ;; entity's data starts on, so the P layout decides the D content.
+         p-bodies (mapv #(wrap-params (entity-params %) pd rd) entities)
+         p-starts (reductions + 1 (map count p-bodies))
+         de-cards (vec (mapcat
+                        (fn [i e]
+                          (let [t (:iges/type e)
+                                f (:iges/form e 0)
+                                de-seq (inc (* 2 i))
+                                l1 (apply str (map #(pad-left (str %) 8)
+                                                   [t (nth p-starts i) 0 0 0 0 0 0 "00000000"]))
+                                l2 (apply str (map #(pad-left (str %) 8)
+                                                   [t 0 0 (count (nth p-bodies i)) f "" "" "" 0]))]
+                            [(card l1 "D" de-seq) (card l2 "D" (inc de-seq))]))
+                        (range (count entities)) entities))
+         p-cards (vec (mapcat (fn [i bodies]
+                                (map-indexed
+                                 (fn [j b]
+                                   (str (pad-right b 64) " "
+                                        (pad-left (str (inc (* 2 i))) 7)
+                                        "P" (pad-left (str (+ (nth p-starts i) j)) 7)))
+                                 bodies))
+                              (range (count entities)) p-bodies))
+         s-cards (map-indexed (fn [i l] (card l "S" (inc i))) start-lines)
+         g-cards (map-indexed (fn [i l] (card l "G" (inc i))) global-cards)
+         terminate (str (pad-left (str "S" (pad-left (str (count s-cards)) 7)) 8)
+                        (pad-left (str "G" (pad-left (str (count g-cards)) 7)) 8)
+                        (pad-left (str "D" (pad-left (str (count de-cards)) 7)) 8)
+                        (pad-left (str "P" (pad-left (str (count p-cards)) 7)) 8))]
+     (str (string/join "\n" (concat s-cards g-cards de-cards p-cards
+                                    [(card terminate "T" 1)]))
+          "\n"))))
