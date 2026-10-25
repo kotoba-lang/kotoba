@@ -1,0 +1,216 @@
+(ns hl7-v2.parser
+  "ER7 — the pipe-delimited encoding HL7 v2.x messages actually ride on
+  (v2.x §2.6). A message is segments separated by a carriage return; a
+  segment is a three-letter ID followed by fields separated by MSH-1; a
+  field is repetitions separated by MSH-2's repetition character; a
+  repetition is components separated by the component character; a
+  component is subcomponents separated by the subcomponent character.
+
+  Every level of that nesting is optional in practice — almost every field
+  in a real message is a plain scalar with one repetition, one component
+  and one subcomponent — so a field value here is either:
+
+  * a plain string, when it has exactly one repetition/component/
+    subcomponent (the common case, and also how callers hand-build a
+    scalar field), or
+  * `[[[sub sub] [sub]] [[sub]]]` — a vector of repetitions, each a vector
+    of components, each a vector of unescaped subcomponent strings — when
+    it does not.
+
+  `encode-field` collapses back to the plain-string form wherever the
+  structure allows it, so round-tripping a message parsed from real bytes
+  produces the same field shape it started with: a scalar field stays a
+  scalar field, not the four levels of singleton vectors that would also
+  be a technically-correct encoding of the same wire bytes."
+  (:require [kotoba.lang.text :as str]
+            [hl7-v2.delimiters :as delimiters]
+            [hl7-v2.escape :as escape]))
+
+(defn split-on-char
+  "Split `s` on literal character `ch`. Unlike `str/split`,
+  trailing empty fields are kept — `\"A|B||\"` is four fields, the last two
+  empty, and HL7 v2 uses that to mean \"field present, value omitted\" as
+  distinct from \"field absent\", which callers of a wire codec need to be
+  able to tell apart."
+  [s ch]
+  (if (empty? s)
+    [""]
+    (let [n (count s)]
+      (loop [i 0 start 0 acc []]
+        (cond
+          (= i n) (conj acc (subs s start i))
+          (= (nth s i) ch) (recur (inc i) (inc i) (conj acc (subs s start i)))
+          :else (recur (inc i) start acc))))))
+
+;; ---------------------------------------------------------------------
+;; Fields
+
+(defn parse-field
+  "Parse one already-delimiter-split field's raw text into the nested
+  repetition/component/subcomponent structure, unescaping each leaf. When
+  the text has exactly one repetition, one component and one
+  subcomponent — the common case, most fields in a real message — the
+  result collapses to a plain unescaped string rather than three layers
+  of singleton vectors; `encode-field` accepts (and prefers) that same
+  plain-string shape. Empty text is the empty string — HL7 v2 does not
+  distinguish \"empty field\" from \"field with one empty subcomponent\",
+  and collapsing both to `\"\"` matches what real messages and real
+  receivers expect."
+  [text delims]
+  (if (empty? text)
+    ""
+    (let [reps (mapv (fn [rep-text]
+                        (mapv (fn [comp-text]
+                                (mapv #(escape/unescape % delims)
+                                      (split-on-char comp-text (:subcomponent delims))))
+                              (split-on-char rep-text (:component delims))))
+                      (split-on-char text (:repetition delims)))]
+      (if (and (= 1 (count reps))
+               (= 1 (count (first reps)))
+               (= 1 (count (first (first reps)))))
+        (first (first (first reps)))
+        reps))))
+
+(defn encode-field
+  "Inverse of `parse-field`. A plain string is escaped and emitted as-is —
+  this is also the form callers use to hand-build a scalar field without
+  wrapping it in three layers of singleton vectors. A nested field is
+  rendered with separators only where more than one repetition/component/
+  subcomponent is actually present, which is what makes `encode-field`
+  the exact inverse of `parse-field` rather than merely *a* correct
+  encoding of the same value."
+  [field delims]
+  (cond
+    (nil? field) ""
+    (string? field) (escape/escape field delims)
+    :else
+    (str/join (:repetition delims)
+              (map (fn [rep]
+                     (str/join (:component delims)
+                                (map (fn [comp]
+                                       (str/join (:subcomponent delims)
+                                                  (map #(escape/escape % delims) comp)))
+                                     rep)))
+                   field))))
+
+(defn field
+  "Build a one-repetition field from components. Each component is either
+  a plain string (one subcomponent) or a sequence of subcomponent
+  strings. Convenience for hand-building messages and ACKs without writing
+  out the full nested vector-of-vectors-of-vectors shape by hand."
+  [& components]
+  [(mapv (fn [c] (if (sequential? c) (vec c) [c])) components)])
+
+(defn repeated
+  "Concatenate fields built by `field` (or parsed field values) into a
+  single multi-repetition field."
+  [& fields]
+  (vec (mapcat (fn [f] (if (string? f) [[[f]]] f)) fields)))
+
+(defn field->string
+  "The first subcomponent of the first component of the first repetition
+  — the plain-scalar reading of a field, for the common case where a
+  caller wants \"the value\" of PID-3 or OBX-3 without walking the nesting
+  by hand. A plain string is returned unchanged."
+  [field]
+  (cond
+    (nil? field) nil
+    (string? field) field
+    :else (get-in field [0 0 0])))
+
+;; ---------------------------------------------------------------------
+;; Segments
+
+(defn- msh2-string [delims]
+  (str (:component delims) (:repetition delims) (:escape delims) (:subcomponent delims)))
+
+(defn parse-segment
+  "Parse one segment's raw ER7 text (no terminator) into
+  `{:id \"PID\" :fields {1 ... 2 ... ...}}`. For MSH, field 1 is
+  synthesised as the literal field-separator character (it never appears
+  as delimited text — it *is* the delimiter, per MSH-1's self-declaring
+  role) and field 2 (the encoding characters) is kept as a raw,
+  un-parsed string rather than run through `parse-field` — parsing
+  `^~\\&` with itself as the delimiter set would shred it."
+  [text delims]
+  (cond
+    (< (count text) 3)
+    [:error :hl7/segment-too-short]
+
+    (= (subs text 0 3) "MSH")
+    (let [tokens (split-on-char text (:field delims))]
+      (if (< (count tokens) 2)
+        [:error :hl7/msh-too-short]
+        {:id "MSH"
+         :fields (into {1 (str (:field delims)) 2 (nth tokens 1)}
+                       (map-indexed (fn [idx t] [(+ idx 3) (parse-field t delims)])
+                                    (drop 2 tokens)))}))
+
+    :else
+    (let [tokens (split-on-char text (:field delims))]
+      {:id (first tokens)
+       :fields (into {} (map-indexed (fn [idx t] [(inc idx) (parse-field t delims)])
+                                      (rest tokens)))})))
+
+(defn encode-segment
+  "Inverse of `parse-segment`."
+  [{:keys [id fields]} delims]
+  (let [max-f (if (seq fields) (apply max (keys fields)) 0)]
+    (if (= id "MSH")
+      (let [field2 (get fields 2 (msh2-string delims))
+            top (max max-f 2)]
+        (str "MSH" (:field delims) field2
+             (when (> top 2)
+               (str (:field delims)
+                    (str/join (:field delims)
+                               (map (fn [n] (encode-field (get fields n "") delims))
+                                    (range 3 (inc top))))))))
+      (str id
+           (when (pos? max-f)
+             (str (:field delims)
+                  (str/join (:field delims)
+                             (map (fn [n] (encode-field (get fields n "") delims))
+                                  (range 1 (inc max-f))))))))))
+
+;; ---------------------------------------------------------------------
+;; Messages
+
+(defn split-segments
+  "Split raw message text on segment terminators. The wire standard is a
+  bare carriage return (v2.x §2.6); `\\r\\n` and bare `\\n` are also
+  accepted, because that is what messages that have been through a
+  text-mode file transfer or an editor actually contain. Blank segments
+  (a doubled terminator, or one at the very start/end) are dropped — an
+  empty string is never a well-formed segment, so there is nothing to
+  preserve by keeping it."
+  [text]
+  (->> (str/split (str text) #"\r\n|\r|\n")
+       (remove str/blank?)
+       vec))
+
+(defn parse-message
+  "Parse a raw ER7 message. Reads MSH-1/MSH-2 from the first segment to
+  get the delimiters, then parses every segment with them. Returns
+  `{:delimiters {...} :segments [{:id ... :fields {...}} ...]}` or
+  `[:error <reason>]` — `:hl7/empty-message`, `:hl7/not-msh-segment`,
+  `:hl7/msh-too-short`, or `:hl7/segment-too-short` from whichever
+  segment failed."
+  [text]
+  (let [seg-texts (split-segments text)]
+    (if (empty? seg-texts)
+      [:error :hl7/empty-message]
+      (let [delims (delimiters/parse (first seg-texts))]
+        (if (delimiters/error? delims)
+          delims
+          (let [segments (mapv #(parse-segment % delims) seg-texts)
+                bad (first (filter #(and (vector? %) (= :error (first %))) segments))]
+            (if bad
+              bad
+              {:delimiters delims :segments segments})))))))
+
+(defn encode-message
+  "Inverse of `parse-message`: `{:delimiters ... :segments [...]}` back to
+  ER7 text, one segment per line, each terminated by `\\r` — including the
+  last, which is the wire convention MLLP framing expects."
+  [{:keys [delimiters segments]}]
+  (str (str/join "\r" (map #(encode-segment % delimiters) segments)) "\r"))

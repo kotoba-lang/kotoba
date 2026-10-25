@@ -1,0 +1,141 @@
+(ns amqp.frame
+  "AMQP 1.0 framing — OASIS AMQP Version 1.0 Part 2 (Transport), §2.2
+  \"Version Negotiation\" and §2.3 \"Framing\", spec text confirmed
+  2026-08-30 against
+  docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html.
+
+  ## Protocol header (§2.2, Figure 2.11)
+
+  Eight bytes precede every AMQP connection: the ASCII letters `AMQP`, a
+  protocol id of zero, then major/minor/revision — `1 0 0` for this
+  version.
+
+  ## Frame layout (§2.3.1, Figure 2.15 / §2.3.2, Figure 2.16)
+
+  ```
+  +0        +1    +2      +3
+  +---------------------------+
+  0 | SIZE (uint32, big-endian) |          8-byte frame header
+  4 | DOFF | TYPE | CHANNEL     |
+  +---------------------------+
+  8 | extended header            |  (DOFF*4 - 8) bytes
+  +---------------------------+
+  4*DOFF | performative | payload  |  (SIZE - DOFF*4) bytes, AMQP frames only
+  +---------------------------+
+  ```
+
+  `SIZE` is the *total* frame size — header, extended header and body — and
+  the spec calls a frame malformed if it is under 8. `DOFF` counts 4-byte
+  words from the start of the frame to the body, and is malformed under 2
+  (the mandatory 8-byte header, which is exactly two words). `TYPE` is 0x00
+  for an AMQP frame and 0x01 for SASL (§5.3, out of scope here — see the
+  README); `CHANNEL` is defined only for AMQP frames.
+
+  For an AMQP frame the body is a performative (a described-type value from
+  `amqp.types`, decoded further by `amqp.performative`) followed by an
+  opaque payload — the message bytes on a `transfer` frame, empty for every
+  other performative. This namespace does not know what a performative
+  contains; it only knows where the body starts and how many bytes it is.")
+
+(defn- u32-bytes [n]
+  [(bit-and (unsigned-bit-shift-right n 24) 0xFF)
+   (bit-and (unsigned-bit-shift-right n 16) 0xFF)
+   (bit-and (unsigned-bit-shift-right n 8) 0xFF)
+   (bit-and n 0xFF)])
+
+(defn- u32-from-bytes [b0 b1 b2 b3]
+  (unsigned-bit-shift-right
+   (bit-or (bit-shift-left (bit-and b0 0xFF) 24)
+           (bit-shift-left (bit-and b1 0xFF) 16)
+           (bit-shift-left (bit-and b2 0xFF) 8)
+           (bit-and b3 0xFF))
+   0))
+
+(defn- u16-bytes [n] [(bit-and (unsigned-bit-shift-right n 8) 0xFF) (bit-and n 0xFF)])
+(defn- u16-from-bytes [b0 b1] (bit-or (bit-shift-left (bit-and b0 0xFF) 8) (bit-and b1 0xFF)))
+
+(def protocol-id-amqp 0x00)
+(def protocol-id-sasl 0x03)
+;; ^ §5.3.2, Figure 5.2: the SASL protocol header uses id 3, not the frame
+;;   TYPE byte's 0x01 — two different "SASL means something else" numbers
+;;   living eight bytes apart in the spec, and the classic way to confuse
+;;   them is to reuse the frame-type constant for the protocol header.
+
+(def magic-amqp
+  "The literal ASCII bytes 'A' 'M' 'Q' 'P' — written as decimal integers,
+  not `(int \\A)`/`(map int \"AMQP\")`. `org-modbus`'s own README documents
+  the exact trap: a character is a one-character string in ClojureScript,
+  and `int` of one is not a code point there the way it is on the JVM —
+  `(int \\A)` is 65 on the JVM and 0 on ClojureScript, silently. An
+  earlier version of this file used exactly that idiom in both
+  `encode-protocol-header` and `decode-protocol-header`, which meant the
+  ClojureScript build sent `[0 0 0 0 …]` instead of `AMQP` as its
+  connection preamble and accepted any four-byte prefix as a valid one —
+  found only because this codec's own `verify-cljs.cljs` run (not the JVM
+  `kbb -M:test` run, which never exercises the ClojureScript reader's
+  char semantics at all) failed on it."
+  [65 77 81 80])
+
+(defn encode-protocol-header
+  "§2.2, Figure 2.11. `major`/`minor`/`revision` default to `1 0 0`, the
+  only version this codec (or, as of 2026, any deployed AMQP 1.0 peer)
+  speaks."
+  ([] (encode-protocol-header protocol-id-amqp 1 0 0))
+  ([protocol-id major minor revision]
+   (conj magic-amqp protocol-id major minor revision)))
+
+(defn decode-protocol-header
+  "Returns `{:status :ok :protocol-id :major :minor :revision :next 8}` or a
+  named error. `:amqp/bad-magic` covers anything that is not literally
+  `AMQP` in the first four octets — the one byte sequence every AMQP peer
+  MUST send before anything else, so getting it wrong is diagnostic rather
+  than a generic parse failure."
+  [bs]
+  (if (< (count bs) 8)
+    {:status :error :reason :amqp/buffer-underrun :need 8 :have (count bs)}
+    (if (not= magic-amqp (vec (take 4 bs)))
+      {:status :error :reason :amqp/bad-magic :got (vec (take 4 bs))}
+      {:status :ok
+       :protocol-id (nth bs 4) :major (nth bs 5) :minor (nth bs 6) :revision (nth bs 7)
+       :next 8})))
+
+(defn encode-frame
+  "Wraps `body-bytes` (already-encoded performative, optionally followed by
+  payload) in the 8-byte fixed header. No extended header — `DOFF` is
+  always the minimum, 2 — because nothing in this codec produces one; a
+  caller decoding a frame with a larger `DOFF` still gets those bytes back
+  from `decode-frame` untouched, as `:extended-header`."
+  ([channel body-bytes] (encode-frame 0x00 channel body-bytes))
+  ([type channel body-bytes]
+   (let [size (+ 8 (count body-bytes))]
+     (-> (u32-bytes size)
+         (into [2 (bit-and type 0xFF)])
+         (into (u16-bytes channel))
+         (into body-bytes)))))
+
+(defn decode-frame
+  "§2.3.1/§2.3.2. Returns `{:status :ok :size :doff :type :channel
+  :extended-header :body :next}` or one of two named malformed-frame
+  errors from the spec text itself: `:amqp/frame-too-short` (SIZE < 8) and
+  `:amqp/bad-data-offset` (DOFF < 2). `:channel` is `nil` for a SASL frame
+  (`:type` 0x01) — the spec defines bytes 6-7 only for AMQP frames, and a
+  decoder that always read them as channel would be inventing a value the
+  wire never promised."
+  [bs off]
+  (if (< (- (count bs) off) 8)
+    {:status :error :reason :amqp/buffer-underrun :offset off :need 8 :have (- (count bs) off)}
+    (let [size (apply u32-from-bytes (subvec (vec bs) off (+ off 4)))
+          doff (nth bs (+ off 4))
+          type (nth bs (+ off 5))]
+      (cond
+        (< size 8) {:status :error :reason :amqp/frame-too-short :size size}
+        (< doff 2) {:status :error :reason :amqp/bad-data-offset :doff doff}
+        (> (+ off size) (count bs))
+        {:status :error :reason :amqp/buffer-underrun :offset off :need size :have (- (count bs) off)}
+        :else
+        (let [channel (when (= type 0x00) (u16-from-bytes (nth bs (+ off 6)) (nth bs (+ off 7))))
+              body-start (+ off (* 4 doff))
+              ext-header (vec (subvec (vec bs) (+ off 8) body-start))
+              body (vec (subvec (vec bs) body-start (+ off size)))]
+          {:status :ok :size size :doff doff :type type :channel channel
+           :extended-header ext-header :body body :next (+ off size)})))))

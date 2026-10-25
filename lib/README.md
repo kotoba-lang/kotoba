@@ -147,6 +147,33 @@ The bundled standard libraries live in this repository:
 | `org.w3.webcodecs` | `org.w3.webcodecs/src` | `w3.webcodecs`, `w3.webcodecs.codec-string` (an external specification, publisher w3.org) |
 | `org.openstreetmap.overpass` | `org.openstreetmap.overpass/src` | `org-openstreetmap-overpass.core`, `org-openstreetmap-overpass.fetch` (an external specification, publisher openstreetmap.org) |
 | `org.si2.def` | `org.si2.def/src` | `def-format.component`, `def-format.design`, `def-format.net`, `def-format.parser` (an external specification, publisher si2.org) |
+| `org.etsi.pades` | `org.etsi.pades/src` | `pades.core` (an external specification, publisher etsi.org) |
+| `org.ros.urdf` | `org.ros.urdf/src` | `articulated_scene` (an external specification, publisher ros.org) |
+| `org.materialx.core` | `org.materialx.core/src` | `kotoba.materialx`, `materialx.core` (an external specification, publisher materialx.org) |
+| `org.sbml.core` | `org.sbml.core/src` | `sbml.execute`, `sbml.mathml`, `sbml.model`, `sbml.validate` (an external specification, publisher sbml.org) |
+| `org.iso.std8583` | `org.iso.std8583/src` | `iso-8583.bcd`, `iso-8583.bitmap`, `iso-8583.charcode`, `iso-8583.codec` (an external specification, publisher iso.org) |
+| `org.si2.openaccess` | `org.si2.openaccess/src` | `openaccess.design`, `openaccess.library`, `openaccess.query`, `openaccess.shape` (an external specification, publisher si2.org) |
+| `org.sae.j1939` | `org.sae.j1939/src` | `j1939.identifier`, `j1939.spn`, `j1939.tp` (an external specification, publisher sae.org) |
+| `org.msgpack.core` | `org.msgpack.core/src` | `msgpack.bytes`, `msgpack.core` (an external specification, publisher msgpack.org) |
+| `org.khronos.glb` | `org.khronos.glb/src` | `glb`, `glb.json` (an external specification, publisher khronos.org) |
+| `org.ros.core` | `org.ros.core/src` | `kotoba.ros.cdr`, `kotoba.ros.msgs`, `kotoba.ros.qos`, `kotoba.ros.rosbridge` (an external specification, publisher ros.org) |
+| `org.modbus.core` | `org.modbus.core/src` | `modbus.crc`, `modbus.pdu`, `modbus.rtu`, `modbus.tcp` (an external specification, publisher modbus.org) |
+| `org.loinc.core` | `org.loinc.core/src` | `loinc.check-digit`, `loinc.code`, `loinc.parts`, `loinc.release-csv` (an external specification, publisher loinc.org) |
+| `org.hl7.v2` | `org.hl7.v2/src` | `hl7-v2.ack`, `hl7-v2.delimiters`, `hl7-v2.escape`, `hl7-v2.mllp` (an external specification, publisher hl7.org) |
+| `org.farama.gymnasium` | `org.farama.gymnasium/src` | `cartpole-wasm` (an external specification, publisher farama.org) |
+| `org.ethercat.core` | `org.ethercat.core/src` | `ethercat.datagram`, `ethercat.ethernet`, `ethercat.frame`, `ethercat.wkc` (an external specification, publisher ethercat.org) |
+| `org.oasisOpen.amqp` | `org.oasisOpen.amqp/src` | `amqp.frame`, `amqp.performative`, `amqp.types` (an external specification, publisher oasisOpen.org) |
+| `org.ibis.core` | `org.ibis.core/src` | `ibis.component`, `ibis.model`, `ibis.parser` (an external specification, publisher ibis.org) |
+| `org.freedesktop.wayland` | `org.freedesktop.wayland/src` | `wayland.model`, `wayland.objects`, `wayland.wire` (an external specification, publisher freedesktop.org) |
+| `org.unicode.core` | `org.unicode.core/src` | `unicode.normalize`, `unicode.ucd`, `unicode.utf8` (an external specification, publisher unicode.org) |
+| `org.thorchain.core` | `org.thorchain.core/src` | `thorchain.asset`, `thorchain.memo`, `thorchain.quote` (an external specification, publisher thorchain.org) |
+| `org.opcfoundation.ua` | `org.opcfoundation.ua/src` | `opcua.builtin`, `opcua.nodeid`, `opcua.transport`, `opcua.variant` (an external specification, publisher opcfoundation.org) |
+| `org.iso.std15118` | `org.iso.std15118/src` | `v2gtp.bits`, `v2gtp.frame`, `v2gtp.payload-type` (an external specification, publisher iso.org) |
+| `org.fixtrading.fix` | `org.fixtrading.fix/src` | `fix.bytes`, `fix.checksum`, `fix.codec`, `fix.dictionary` (an external specification, publisher fixtrading.org) |
+| `com.anthropic.mcp` | `com.anthropic.mcp/src` | `mcp.execute`, `mcp.json`, `mcp.model`, `mcp.ports` (Kotoba project library) |
+| `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
+| `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
+| `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |
 | `com.compuserve.gif` | `com.compuserve.gif/src` | `gif.bytes`, `gif.codec`, `gif.core`, `gif.decode` (Kotoba project library) |
 | `com.adobe.tiff` | `com.adobe.tiff/src` | `tiff.bytes`, `tiff.codec`, `tiff.core` (Kotoba project library) |

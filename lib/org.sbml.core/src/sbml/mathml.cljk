@@ -1,0 +1,372 @@
+(ns sbml.mathml
+  "The Content MathML subset SBML Level 3 Version 2 Core uses as its
+  equation micro-language (spec sec 3.4, 'Mathematical formulas in SBML
+  Level 3'; the allowed element subset is enumerated in sec 3.4.1). Unlike
+  OASIS XMILE's infix `<eqn>` STRING (see the sibling xmile.expr for that
+  design), SBML's `<math>` payload is *already an XML tree* -- MathML is
+  Content MathML, e.g. `k * S` is written `<apply><times/><ci>k</ci>
+  <ci>S</ci></apply>`. So this namespace's job is not tokenize+parse text;
+  it converts between an *already-parsed* generic XML element
+  (`{:tag :apply :attrs {} :content [...]}`, exactly what
+  `clojure.data.xml`/`cljs.xml` produce -- the host parses XML text, this
+  library never does, mirroring `xmile.xml`'s boundary) and a small EDN expr
+  tree, plus a pure evaluator over that tree. Zero third-party deps --
+  portable .cljc.
+
+  Expr tree node shapes:
+    [:cn n]                    -- <cn> number literal (sec 3.4.2)
+    [:ci \"name\"]              -- <ci> identifier reference (sec 3.4.3)
+    [:const kw]                 -- a nullary MathML constant token, kw in
+                                    #{:true :false :notanumber :pi :infinity
+                                      :exponentiale} (sec 3.4.1)
+    [:csymbol url args]         -- <csymbol definitionURL=url> (sec 3.4.6).
+                                    args is [] when csymbol appears standalone
+                                    (e.g. the `time` symbol, used like a `ci`);
+                                    non-empty when csymbol is itself the
+                                    operator of an <apply> (e.g. `delay`,
+                                    `rateOf`). eval-expr only ever resolves
+                                    the `time` symbol (against env \"time\");
+                                    all other csymbols parse (so a model
+                                    round-trips/validates) but throw on eval
+                                    -- a v2 scope-out, see README.
+    [:apply op args]            -- <apply><op/> args...</apply>, op a keyword
+                                    named after the MathML operator element.
+                                    args is variadic (a plain vector) for the
+                                    N-ary MathML operators (`plus` `times`
+                                    `and` `or` `max` `min`); the rest are
+                                    fixed-arity (`minus` is 1 or 2; `divide`
+                                    `power` `eq` `neq` `gt` `lt` `geq` `leq`
+                                    are exactly 2; `abs` `exp` `ln` `floor`
+                                    `ceiling` `sin` `cos` `tan` `arcsin`
+                                    `arccos` `arctan` `not` are exactly 1).
+                                    `root`/`log`'s optional <degree>/<logbase>
+                                    qualifier (sec 3.4.1 'qualifiers') is
+                                    normalized into args[0], defaulting to
+                                    [:cn 2.0]/[:cn 10.0] when the qualifier
+                                    is absent, so args is always exactly
+                                    [qualifier value].
+    [:apply-unsupported name args] -- an <apply> whose operator is a valid
+                                    sec 3.4.1 MathML token this namespace
+                                    does not evaluate (`factorial` `quotient`
+                                    `rem` `sec` `csc` `cot` and the
+                                    hyperbolic/inverse-hyperbolic trig family,
+                                    `xor` `implies`) -- parses/round-trips as
+                                    data, throws a clear error on eval (v2
+                                    scope-out, see README).
+    [:piecewise pieces otherwise] -- <piecewise> (sec 3.4.1); pieces is a
+                                    vector of [value-expr cond-expr] pairs
+                                    (one per <piece>), otherwise is an expr
+                                    or nil (from <otherwise>, if present).
+
+  NOT covered at all (not even parsed -- throws immediately, see README):
+  <lambda> (function definitions -- no FunctionDefinition/InitialAssignment
+  classes in this v1), <semantics>/<annotation>/<annotation-xml> wrappers,
+  vectors/matrices (not part of SBML core anyway)."
+  (:refer-clojure :exclude [parse-double])
+  (:require [kotoba.lang.text :as str]))
+
+;; --- portable math shims ---
+
+(defn- m-abs   [x] #?(:clj (Math/abs (double x)) :cljs (js/Math.abs x)))
+(defn- m-exp   [x] #?(:clj (Math/exp x)          :cljs (js/Math.exp x)))
+(defn- m-log   [x] #?(:clj (Math/log x)          :cljs (js/Math.log x)))
+(defn- m-floor [x] #?(:clj (Math/floor x)        :cljs (js/Math.floor x)))
+(defn- m-ceil  [x] #?(:clj (Math/ceil x)         :cljs (js/Math.ceil x)))
+(defn- m-sin   [x] #?(:clj (Math/sin x)          :cljs (js/Math.sin x)))
+(defn- m-cos   [x] #?(:clj (Math/cos x)          :cljs (js/Math.cos x)))
+(defn- m-tan   [x] #?(:clj (Math/tan x)          :cljs (js/Math.tan x)))
+(defn- m-asin  [x] #?(:clj (Math/asin x)         :cljs (js/Math.asin x)))
+(defn- m-acos  [x] #?(:clj (Math/acos x)         :cljs (js/Math.acos x)))
+(defn- m-atan  [x] #?(:clj (Math/atan x)         :cljs (js/Math.atan x)))
+(defn- m-pow   [a b] #?(:clj (Math/pow a b)      :cljs (js/Math.pow a b)))
+(def ^:private m-pi  #?(:clj Math/PI :cljs js/Math.PI))
+(def ^:private m-e   #?(:clj Math/E  :cljs js/Math.E))
+(def ^:private m-inf #?(:clj Double/POSITIVE_INFINITY :cljs js/Infinity))
+(def ^:private m-nan #?(:clj Double/NaN :cljs js/NaN))
+
+(defn- parse-double [s] #?(:clj (Double/parseDouble s) :cljs (js/parseFloat s)))
+(defn- num->str [n] (str (double n)))
+
+;; --- generic parsed-XML element accessors (same shape/boundary as xmile.xml) ---
+
+(defn- tag-kw [t] (keyword (name t)))
+(defn- elem? [x] (map? x))
+(defn- tag= [e t] (and (elem? e) (= (tag-kw (:tag e)) t)))
+(defn- elem-children [e] (filter elem? (:content e)))
+(defn- by-tag [e t] (filter #(tag= % t) (elem-children e)))
+(defn- first-child [e t] (first (by-tag e t)))
+(defn- text-of [e] (str/trim (apply str (filter string? (:content e)))))
+(defn- attr [e k] (get (:attrs e) k))
+(defn- elem [tag attrs content] (cond-> {:tag tag} (seq attrs) (assoc :attrs attrs) true (assoc :content (vec content))))
+
+;; --- parse: element -> expr tree ---
+
+(declare parse emit)
+
+(defn- split-on-sep
+  "content is a mixed seq of strings/elements containing exactly one <sep/>
+  element (sec 3.4.2 e-notation/rational cn); returns [before-text after-text]."
+  [content]
+  [(str/trim (apply str (take-while (complement elem?) content)))
+   (str/trim (apply str (rest (drop-while (complement elem?) content))))])
+
+(defn- parse-cn
+  "sec 3.4.2: the type attribute defaults to \"real\"; \"integer\" and
+  \"real\" are plain text; \"e-notation\" and \"rational\" split around a
+  <sep/> element (MathML's mantissa/exponent or numerator/denominator
+  separator, which cannot use XML-attribute e-notation like \"2e-5\")."
+  [e]
+  (let [ty (attr e :type)]
+    (case ty
+      "e-notation" (let [[mantissa exp] (split-on-sep (:content e))]
+                     [:cn (parse-double (str mantissa "E" exp))])
+      "rational" (let [[num denom] (split-on-sep (:content e))]
+                   [:cn (/ (parse-double num) (parse-double denom))])
+      [:cn (parse-double (text-of e))])))
+
+(def ^:private nullary-constants
+  "sec 3.4.1 'constants': true, false, notanumber, pi, infinity, exponentiale."
+  #{:true :false :notanumber :pi :infinity :exponentiale})
+
+(defn- time-symbol-url? [url] (boolean (and url (str/ends-with? url "time"))))
+
+(defn- parse-csymbol
+  [e args]
+  [:csymbol (attr e :definitionURL) args])
+
+(def ^:private n-ary-ops #{:plus :times :and :or :max :min})
+(def ^:private unary-ops #{:abs :exp :ln :floor :ceiling :sin :cos :tan :arcsin :arccos :arctan :not})
+(def ^:private binary-ops #{:divide :power :eq :neq :gt :lt :geq :leq})
+
+(defn- require-arity [op-name n args]
+  (when (not= n (count args))
+    (throw (ex-info (str "sbml.mathml: " op-name " takes exactly " n " operand(s)")
+                     {:op op-name :args args}))))
+
+(defn- parse-qualified-apply
+  "root/log (sec 3.4.1 qualifiers: degree, logbase) -- an optional leading
+  qualifier element wrapping one sub-expression, then the base/value
+  expression. Normalizes to args = [qualifier-expr value-expr] always,
+  defaulting the qualifier to `default-n` when absent."
+  [op qualifier-tag default-n operand-elems]
+  (if (and (seq operand-elems) (tag= (first operand-elems) qualifier-tag))
+    (let [q-expr (parse (first (elem-children (first operand-elems))))
+          val-expr (parse (second operand-elems))]
+      [:apply op [q-expr val-expr]])
+    (do (require-arity op 1 operand-elems)
+        [:apply op [[:cn default-n] (parse (first operand-elems))]])))
+
+(defn- parse-apply [e]
+  (let [[op-elem & operand-elems] (elem-children e)
+        op (tag-kw (:tag op-elem))]
+    (cond
+      (= op :csymbol) (parse-csymbol op-elem (mapv parse operand-elems))
+      (= op :root) (parse-qualified-apply :root :degree 2.0 operand-elems)
+      (= op :log) (parse-qualified-apply :log :logbase 10.0 operand-elems)
+      (= op :minus)
+      (let [args (mapv parse operand-elems)]
+        (when-not (contains? #{1 2} (count args))
+          (throw (ex-info "sbml.mathml: minus takes 1 or 2 operand(s)" {:args args})))
+        [:apply :minus args])
+      (contains? n-ary-ops op) [:apply op (mapv parse operand-elems)]
+      (contains? unary-ops op) (let [args (mapv parse operand-elems)]
+                                  (require-arity op 1 args)
+                                  [:apply op args])
+      (contains? binary-ops op) (let [args (mapv parse operand-elems)]
+                                   (require-arity op 2 args)
+                                   [:apply op args])
+      :else [:apply-unsupported (name op) (mapv parse operand-elems)])))
+
+(defn- parse-piece [e]
+  (let [[val-e cond-e] (elem-children e)]
+    [(parse val-e) (parse cond-e)]))
+
+(defn- parse-piecewise [e]
+  [:piecewise
+   (mapv parse-piece (by-tag e :piece))
+   (when-let [oth (first-child e :otherwise)]
+     (parse (first (elem-children oth))))])
+
+(defn parse
+  "Parse a single already-parsed MathML element (e.g. the child of <math>,
+  or a sub-expression) into an EDN expr tree. See namespace docstring for
+  node shapes. Throws a clear ex-info for elements outside the sec 3.4.1
+  subset (`lambda`, `semantics`/`annotation*`, ...)."
+  [e]
+  (let [t (tag-kw (:tag e))]
+    (cond
+      (= t :cn) (parse-cn e)
+      (= t :ci) [:ci (text-of e)]
+      (contains? nullary-constants t) [:const t]
+      (= t :csymbol) (parse-csymbol e [])
+      (= t :apply) (parse-apply e)
+      (= t :piecewise) (parse-piecewise e)
+      :else (throw (ex-info "sbml.mathml: unsupported MathML element (outside sec 3.4.1 subset, or lambda/semantics)"
+                             {:tag (:tag e)})))))
+
+(defn parse-math
+  "Parse a <math> wrapper element (sec 3.4) into an expr tree -- unwraps the
+  xmlns-bearing <math> and parses its single element child."
+  [math-elem]
+  (parse (first (elem-children math-elem))))
+
+;; --- emit: expr tree -> element ---
+
+(defn- csymbol-label [url] (if url (last (str/split url #"/")) ""))
+
+(defn- emit-apply [[_ op args]]
+  (case op
+    :root (let [[deg val] args]
+            (elem :apply {}
+                  (concat [(elem :root {} [])]
+                          (when-not (= deg [:cn 2.0]) [(elem :degree {} [(emit deg)])])
+                          [(emit val)])))
+    :log (let [[base val] args]
+           (elem :apply {}
+                 (concat [(elem :log {} [])]
+                         (when-not (= base [:cn 10.0]) [(elem :logbase {} [(emit base)])])
+                         [(emit val)])))
+    (elem :apply {} (cons (elem op {} []) (map emit args)))))
+
+(defn emit
+  "Emit an expr tree back into the generic parsed-XML-element shape (the
+  inverse of `parse`)."
+  [expr]
+  (case (first expr)
+    :cn (elem :cn {:type "real"} [(num->str (second expr))])
+    :ci (elem :ci {} [(second expr)])
+    :const (elem (second expr) {} [])
+    :csymbol (let [[_ url args] expr
+                   csym (elem :csymbol {:definitionURL url} [(csymbol-label url)])]
+               (if (seq args)
+                 (elem :apply {} (cons csym (map emit args)))
+                 csym))
+    :apply-unsupported (let [[_ nm args] expr]
+                          (elem :apply {} (cons (elem (keyword nm) {} []) (map emit args))))
+    :apply (emit-apply expr)
+    :piecewise (let [[_ pieces otherwise] expr]
+                 (elem :piecewise {}
+                       (concat (map (fn [[val-e cond-e]] (elem :piece {} [(emit val-e) (emit cond-e)])) pieces)
+                               (when otherwise [(elem :otherwise {} [(emit otherwise)])]))))
+    (throw (ex-info "sbml.mathml: cannot emit unknown expr node" {:expr expr}))))
+
+(defn emit-math
+  "Wrap an expr tree in a <math> element with the MathML xmlns (sec 3.4)."
+  [expr]
+  (elem :math {:xmlns "http://www.w3.org/1998/Math/MathML"} [(emit expr)]))
+
+;; --- evaluator ---
+
+(def ^:private constants
+  {:true 1.0 :false 0.0 :notanumber m-nan :pi m-pi :infinity m-inf :exponentiale m-e})
+
+(defn- truthy? [x] (not (zero? x)))
+(defn- bool->num [b] (if b 1.0 0.0))
+
+(defn- resolve-ci [nm env]
+  (if (contains? env nm)
+    (get env nm)
+    (throw (ex-info "sbml.mathml: unknown identifier" {:ref nm}))))
+
+(defn- eval-apply [op args go]
+  (case op
+    :plus (reduce + 0.0 (map go args))
+    :times (reduce * 1.0 (map go args))
+    :minus (case (count args)
+             1 (- (go (first args)))
+             2 (- (go (first args)) (go (second args))))
+    :divide (/ (go (first args)) (go (second args)))
+    :power (m-pow (go (first args)) (go (second args)))
+    :root (let [deg (go (first args)) val (go (second args))] (m-pow val (/ 1.0 deg)))
+    :log (let [base (go (first args)) val (go (second args))] (/ (m-log val) (m-log base)))
+    :abs (m-abs (go (first args)))
+    :exp (m-exp (go (first args)))
+    :ln (m-log (go (first args)))
+    :floor (m-floor (go (first args)))
+    :ceiling (m-ceil (go (first args)))
+    :sin (m-sin (go (first args)))
+    :cos (m-cos (go (first args)))
+    :tan (m-tan (go (first args)))
+    :arcsin (m-asin (go (first args)))
+    :arccos (m-acos (go (first args)))
+    :arctan (m-atan (go (first args)))
+    :not (bool->num (not (truthy? (go (first args)))))
+    :and (bool->num (every? #(truthy? (go %)) args))
+    :or (bool->num (boolean (some #(truthy? (go %)) args)))
+    :max (reduce max (map go args))
+    :min (reduce min (map go args))
+    :eq (bool->num (== (go (first args)) (go (second args))))
+    :neq (bool->num (not (== (go (first args)) (go (second args)))))
+    :gt (bool->num (> (go (first args)) (go (second args))))
+    :lt (bool->num (< (go (first args)) (go (second args))))
+    :geq (bool->num (>= (go (first args)) (go (second args))))
+    :leq (bool->num (<= (go (first args)) (go (second args))))
+    (throw (ex-info "sbml.mathml: unknown apply operator" {:op op}))))
+
+(defn- eval-piecewise [pieces otherwise go]
+  (if-let [hit (first (filter (fn [[_ cond-e]] (truthy? (go cond-e))) pieces))]
+    (go (first hit))
+    (if otherwise
+      (go otherwise)
+      (throw (ex-info "sbml.mathml: piecewise matched no piece and has no otherwise" {})))))
+
+(defn eval-expr
+  "Evaluate an expr tree (from `parse`/`parse-math`) against `env`, a map of
+  {\"id\" number}. `env` must include \"time\" (SBML's reserved simulation
+  time, analogous to XMILE's TIME) if the expression uses the MathML `time`
+  csymbol."
+  [expr env]
+  (let [go #(eval-expr % env)]
+    (case (first expr)
+      :cn (second expr)
+      :ci (resolve-ci (second expr) env)
+      :const (get constants (second expr))
+      :csymbol (let [[_ url args] expr]
+                 (if (and (empty? args) (time-symbol-url? url))
+                   (resolve-ci "time" env)
+                   (throw (ex-info "sbml.mathml: csymbol not implemented by eval-expr (v2 scope-out)" {:url url}))))
+      :apply-unsupported (throw (ex-info (str "sbml.mathml: <" (second expr) "/> is not implemented by eval-expr (v2 scope-out)")
+                                          {:op (second expr)}))
+      :apply (let [[_ op args] expr] (eval-apply op args go))
+      :piecewise (let [[_ pieces otherwise] expr] (eval-piecewise pieces otherwise go))
+      (throw (ex-info "sbml.mathml: unknown expr node" {:expr expr})))))
+
+;; --- static analysis (mirrors xmile.expr's free-vars) ---
+
+(defn free-vars
+  "All :ci identifiers referenced anywhere in an expr tree, as a set of
+  strings. Used by sbml.validate (dangling references) and sbml.execute
+  (dependency ordering)."
+  [expr]
+  (letfn [(walk [e]
+            (case (first e)
+              :cn #{}
+              :const #{}
+              :ci #{(second e)}
+              :csymbol (reduce into #{} (map walk (nth e 2)))
+              :apply-unsupported (reduce into #{} (map walk (nth e 2)))
+              :apply (reduce into #{} (map walk (nth e 2)))
+              :piecewise (let [[_ pieces otherwise] e]
+                           (into (reduce into #{} (map (fn [[v c]] (into (walk v) (walk c))) pieces))
+                                 (if otherwise (walk otherwise) #{})))
+              #{}))]
+    (walk expr)))
+
+(defn unsupported-forms
+  "All not-yet-evaluable constructs appearing anywhere in an expr tree: a
+  set of strings, each either an :apply-unsupported operator name or a
+  non-`time` csymbol definitionURL. Empty means `eval-expr` can fully
+  evaluate this expr. Used by sbml.validate to emit :warn (not :error)
+  problems -- see README Follow-ups."
+  [expr]
+  (letfn [(walk [e]
+            (case (first e)
+              :apply-unsupported (into #{(second e)} (reduce into #{} (map walk (nth e 2))))
+              :csymbol (let [[_ url args] e]
+                         (into (if (time-symbol-url? url) #{} #{url}) (reduce into #{} (map walk args))))
+              :apply (reduce into #{} (map walk (nth e 2)))
+              :piecewise (let [[_ pieces otherwise] e]
+                           (into (reduce into #{} (map (fn [[v c]] (into (walk v) (walk c))) pieces))
+                                 (if otherwise (walk otherwise) #{})))
+              #{}))]
+    (walk expr)))

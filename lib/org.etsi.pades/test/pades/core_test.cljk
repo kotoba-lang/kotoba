@@ -1,0 +1,168 @@
+(ns pades.core-test
+  "The arithmetic first, the cryptography second.
+
+  A signed PDF fails in two silent ways — a `/ByteRange` that leaves signature
+  bytes inside the signed region, or one that leaves document bytes outside it —
+  and neither shows up in a test that only asks whether the signature verifies
+  against the range the same code computed. So the range is checked against the
+  FILE: every byte is either signed or inside the placeholder, and nothing is
+  both or neither."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [asn1.core :as asn1]
+            [asn1.oid :as oid]
+            [cms.core :as cms]
+            [cms.jvm :as jvm]
+            [pades.core :as pades]
+            [pdf.core :as pdf]
+            [x509.core :as x509]))
+
+(def ^:private original
+  (pdf/write-document
+   [{:width 595 :height 842
+     :content (str (pdf/text-command {:x 72 :y 760 :size 16 :text "Gyomu Itaku Keiyakusho"})
+                   (pdf/text-command {:x 72 :y 720 :text "Amount: 1,650,000 JPY"})
+                   (pdf/line-command {:from [72 700] :to [523 700]}))}]))
+
+(def leaf-der (asn1/unhex "308201f83082019ea003020102021459b29c4d07173c1b16871d7129d6213e51e1f25f300a06082a8648ce3d0403023041310b3009060355040613024a5031173015060355040a0c0e4b6f746f626120546573742043413119301706035504030c104b6f746f6261205465737420526f6f74301e170d3236303733303133313233335a170d3336303732373133313233335a303d310b3009060355040613024a5031143012060355040a0c0b4b6f746f626120546573743118301606035504030c0f4b6f746f62612054657374205453413059301306072a8648ce3d020106082a8648ce3d030107034200047d5f6c637af986a8847f6f23755d24a192e348c86f9ff35468f4b5592de6fbd447a02e8139feee9baff1ef0c79179e0746293bc7dafba0a0e7f9d69e1d3a032da3783076300c0603551d130101ff04023000300e0603551d0f0101ff0404030206c030160603551d250101ff040c300a06082b06010505070308301d0603551d0e04160414817bdc5258db8e6f9e32edcd1d046f30cdaf8f31301f0603551d230418301680148033d385f87b532fc1a9fb42fee110ffe73040c3300a06082a8648ce3d04030203480030450221009300639acf8fd27cdb85761a9ccd298ee89cd549b964cb78b29b489b08671adb02203111acf98ca2aaa0b9d227a29ce1d9ddc8a63b802ecda444528885c1c23d4178"))
+(def leaf (x509/parse leaf-der))
+
+(defn- keypair []
+  (.generateKeyPair (doto (java.security.KeyPairGenerator/getInstance "EC")
+                      (.initialize (java.security.spec.ECGenParameterSpec. "secp256r1")))))
+
+(defn- latin1 [ints]
+  (String. (byte-array (map unchecked-byte ints)) "ISO-8859-1"))
+
+(deftest reads-what-an-incremental-update-needs
+  (let [facts (pades/document-facts original)]
+    (is (= (count original) (:length facts)))
+    (is (pos? (:startxref facts)))
+    (is (= 1 (:root-object facts)))
+    (is (> (:next-object facts) 1))
+    (testing "and it found the page, so the field can name one"
+      (is (some? (:page-object facts))))))
+
+(deftest the-original-bytes-are-untouched
+  ;; The whole reason a signature over a PDF means anything: the file the author
+  ;; saw is a prefix of the file that was signed.
+  (let [prepared (:pades/prepared (pades/prepare original {}))]
+    (is (= (vec original) (subvec (vec prepared) 0 (count original))))
+    (is (> (count prepared) (count original)))))
+
+(deftest byte-range-covers-the-file-exactly-once
+  (let [{:pades/keys [prepared byte-range gap]} (pades/prepare original {})
+        [a b c d] byte-range
+        [gap-start gap-end] gap]
+    (testing "the two ranges start at 0 and end at the last byte"
+      (is (= 0 a))
+      (is (= (count prepared) (+ c d))))
+
+    (testing "and the hole between them is exactly the placeholder, brackets included"
+      (is (= b gap-start))
+      (is (= c gap-end))
+      (is (= \< (nth (latin1 prepared) gap-start)))
+      (is (= \> (nth (latin1 prepared) (dec gap-end)))))
+
+    (testing "so every byte is signed or in the hole, and none is both"
+      (is (= (count prepared) (+ b d (- c b)))))
+
+    (testing "the hole contains only the placeholder's zeros"
+      (is (re-matches #"<0+>" (subs (latin1 prepared) gap-start gap-end))))))
+
+(deftest byte-range-numbers-keep-their-width
+  ;; If patching the real numbers in changed their width, every byte after them
+  ;; moved and the range describes a file that does not exist. `prepare` asserts
+  ;; this; the test is here so the assertion itself is exercised.
+  (let [text (latin1 (:pades/prepared (pades/prepare original {})))
+        [_ nums] (re-find #"/ByteRange \[([^\]]+)\]" text)]
+    (is (= 4 (count (str/split nums #"\s+"))))
+    (doseq [n (str/split nums #"\s+")]
+      (is (= 10 (count n)) (str "fixed width lost: " n)))))
+
+(deftest a-real-signature-verifies-over-the-byte-range
+  (let [pair (keypair)
+        signed (pades/sign original
+                           {:name "Kotoba Test TSA"
+                            :reason "本契約に署名します"
+                            :signing-time-pdf (pades/pdf-date "2026-07-30T13:49:55Z")
+                            :sign-cms
+                            (fn [bytes]
+                              (cms/build-signed-data
+                               {:content bytes
+                                :detached? true
+                                :certificates [leaf]
+                                :digest-algorithm :sha256
+                                :signature-algorithm :ecdsa-with-sha256
+                                :digest-fn jvm/digest
+                                :sign-fn (jvm/signer (.getPrivate pair)
+                                                     :ecdsa-with-sha256)}))})
+        text (latin1 signed)
+        [_ nums] (re-find #"/ByteRange \[([^\]]+)\]" text)
+        [a b c d] (map parse-long (str/split nums #"\s+"))
+        covered (into (subvec (vec signed) a (+ a b)) (subvec (vec signed) c (+ c d)))
+        contents-hex (second (re-find #"/Contents <([0-9a-fA-F]+)>" text))
+        cms-der (asn1/unhex (str/replace contents-hex #"(00)+$" ""))
+        parsed (cms/parse-signed-data cms-der)]
+
+    (testing "the file kept its length and the original bytes"
+      (is (= (vec original) (subvec (vec signed) 0 (count original)))))
+
+    (testing "the embedded blob is a detached SignedData"
+      (is (:cms/detached? parsed))
+      (is (= :data (oid/named (:cms/econtent-type parsed)))))
+
+    (testing "and it verifies over exactly the bytes /ByteRange selects"
+      (let [public {:algorithm (asn1/oid-value
+                                (asn1/path (asn1/decode (.getEncoded (.getPublic pair))) 0 0))
+                    :spki-der (asn1/->ints (.getEncoded (.getPublic pair)))}]
+        (is (:verified (cms/verify parsed {:content covered
+                                           :digest-fn jvm/digest
+                                           :verify-fn #(jvm/verify (assoc % :public-key public))})))
+
+        (testing "and NOT over the whole file, which is the mistake that reads as working"
+          (is (not (:verified (cms/verify parsed {:content (vec signed)
+                                                  :digest-fn jvm/digest
+                                                  :verify-fn #(jvm/verify (assoc % :public-key public))})))))
+
+        (testing "nor over the file with one document byte changed"
+          (let [tampered (assoc (vec signed) 300 (bit-xor (nth signed 300) 0xff))
+                re-covered (into (subvec tampered a (+ a b)) (subvec tampered c (+ c d)))]
+            (is (not (:verified (cms/verify parsed {:content re-covered
+                                                    :digest-fn jvm/digest
+                                                    :verify-fn #(jvm/verify (assoc % :public-key public))}))))))))))
+
+(deftest the-appended-section-is-a-well-formed-incremental-update
+  (let [text (latin1 (pades/sign original {:sign-cms (constantly (asn1/unhex "3000"))}))]
+    (testing "a second xref, a /Prev back to the first, and a second %%EOF"
+      (is (= 2 (count (re-seq #"(?m)^xref$" text))))
+      (is (= 2 (count (re-seq #"%%EOF" text))))
+      (is (re-find #"/Prev \d+" text)))
+    (testing "the catalog is replaced rather than edited, and gains /AcroForm"
+      (is (re-find #"/Type /Catalog[^>]*/AcroForm \d+ 0 R" text)))
+    (testing "the signature field is a widget with /FT /Sig and /SigFlags 3"
+      (is (re-find #"/FT /Sig" text))
+      (is (re-find #"/SigFlags 3" text)))
+    (testing "and the SubFilter is the PAdES one, not the legacy PKCS#7"
+      (is (str/includes? text "/SubFilter /ETSI.CAdES.detached")))))
+
+(deftest a-cms-that-does-not-fit-is-refused-not-truncated
+  ;; A truncated signature is a file that looks signed and verifies nowhere,
+  ;; which is strictly worse than a failure at signing time.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"予約領域を超えました"
+                        (pades/sign original
+                                    {:signature-bytes 64
+                                     :sign-cms (constantly (asn1/unhex
+                                                            (apply str (repeat 200 "ab"))))}))))
+
+(deftest the-level-is-reported-and-not-claimed
+  (is (= :b-b (pades/profile {})))
+  (is (= :b-t (pades/profile {:signature-timestamp? true})))
+  (is (= :b-lt (pades/profile {:dss? true})))
+  (is (= :b-lta (pades/profile {:dss? true :document-timestamp? true})))
+  (testing "what this namespace builds today is B-B"
+    (is (= :b-b (pades/profile {:signature-timestamp? false})))))
+
+(deftest a-file-that-is-not-a-pdf-is-refused-with-a-reason
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"startxref"
+                        (pades/document-facts (asn1/unhex "48656c6c6f")))))

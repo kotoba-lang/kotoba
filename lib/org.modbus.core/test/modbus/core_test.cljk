@@ -1,0 +1,218 @@
+(ns modbus.core-test
+  "The frames are MODBUS Application Protocol Specification V1.1b3 §6
+  verbatim — the specification's own worked examples, which is the only
+  place both sides of a Modbus exchange are written out. A codec that agrees
+  with itself would pass a round-trip suite and fail against a device."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [modbus.crc :as crc]
+            [modbus.pdu :as pdu]
+            [modbus.rtu :as rtu]
+            [modbus.tcp :as tcp]))
+
+(defn- enc-req [m] (:bytes (pdu/encode-request m)))
+(defn- enc-resp [m] (:bytes (pdu/encode-response m)))
+
+;; ── §6, the specification's worked examples ──────────────────────────────────
+
+(deftest read-coils
+  ;; §6.1 — coils 20..38: address 19 (0x0013), quantity 19 (0x0013)
+  (is (= [0x01 0x00 0x13 0x00 0x13]
+         (enc-req {:function :read-coils :address 0x13 :quantity 0x13})))
+  (let [r (pdu/decode-response [0x01 0x03 0xCD 0x6B 0x05] 19)]
+    (is (= :ok (:status r)))
+    (is (= 19 (count (get-in r [:pdu :bits]))))
+    ;; 0xCD is 1100 1101 and coil 20 is the LEAST significant bit, so the
+    ;; sequence reads backwards from how the byte is written.
+    (is (= [true false true true false false true true]
+           (subvec (get-in r [:pdu :bits]) 0 8))))
+  (testing "and the response round-trips back to the same bytes"
+    (let [bits (get-in (pdu/decode-response [0x01 0x03 0xCD 0x6B 0x05] 19) [:pdu :bits])]
+      (is (= [0x01 0x03 0xCD 0x6B 0x05]
+             (enc-resp {:function :read-coils :bits bits}))))))
+
+(deftest read-holding-registers
+  ;; §6.3 — registers 108..110: address 107 (0x006B), quantity 3
+  (is (= [0x03 0x00 0x6B 0x00 0x03]
+         (enc-req {:function :read-holding-registers :address 0x6B :quantity 3})))
+  (let [r (pdu/decode-response [0x03 0x06 0x02 0x2B 0x00 0x00 0x00 0x64])]
+    (is (= [0x022B 0x0000 0x0064] (get-in r [:pdu :registers]))))
+  (is (= [0x03 0x06 0x02 0x2B 0x00 0x00 0x00 0x64]
+         (enc-resp {:function :read-holding-registers
+                    :registers [0x022B 0x0000 0x0064]}))))
+
+(deftest write-single-coil
+  ;; §6.5 — coil 173 (0x00AC) ON. 0xFF00 is on; nothing else is legal.
+  (is (= [0x05 0x00 0xAC 0xFF 0x00]
+         (enc-req {:function :write-single-coil :address 0xAC :value true})))
+  (is (= [0x05 0x00 0xAC 0x00 0x00]
+         (enc-req {:function :write-single-coil :address 0xAC :value false})))
+  (is (true? (get-in (pdu/decode-request [0x05 0x00 0xAC 0xFF 0x00]) [:pdu :value])))
+  (testing "a value that is neither 0x0000 nor 0xFF00 is refused, not coerced"
+    (is (= :illegal-coil-value
+           (:reason (pdu/decode-request [0x05 0x00 0xAC 0x00 0x01]))))))
+
+(deftest write-single-register
+  ;; §6.6 — register 2 (address 1) = 0x0003
+  (is (= [0x06 0x00 0x01 0x00 0x03]
+         (enc-req {:function :write-single-register :address 1 :value 3})))
+  (is (= {:function :write-single-register :address 1 :value 3}
+         (:pdu (pdu/decode-request [0x06 0x00 0x01 0x00 0x03])))))
+
+(deftest write-multiple-coils
+  ;; §6.11 — coils 20..29: address 19, quantity 10, values 0xCD 0x01
+  (let [bits [true false true true false false true true true false]]
+    (is (= [0x0F 0x00 0x13 0x00 0x0A 0x02 0xCD 0x01]
+           (enc-req {:function :write-multiple-coils :address 0x13 :values bits})))
+    (is (= bits (get-in (pdu/decode-request [0x0F 0x00 0x13 0x00 0x0A 0x02 0xCD 0x01])
+                        [:pdu :values]))
+        "the trailing six bits of the last byte are padding and must be dropped"))
+  (is (= [0x0F 0x00 0x13 0x00 0x0A]
+         (enc-resp {:function :write-multiple-coils :address 0x13 :quantity 10}))))
+
+(deftest write-multiple-registers
+  ;; §6.12 — registers 2..3: address 1, quantity 2, values 0x000A 0x0102
+  (is (= [0x10 0x00 0x01 0x00 0x02 0x04 0x00 0x0A 0x01 0x02]
+         (enc-req {:function :write-multiple-registers :address 1 :values [0x000A 0x0102]})))
+  (is (= [0x000A 0x0102]
+         (get-in (pdu/decode-request [0x10 0x00 0x01 0x00 0x02 0x04 0x00 0x0A 0x01 0x02])
+                 [:pdu :values])))
+  (is (= [0x10 0x00 0x01 0x00 0x02]
+         (enc-resp {:function :write-multiple-registers :address 1 :quantity 2}))))
+
+(deftest exception-responses
+  ;; §7 — the function code with its high bit set, then the exception code.
+  (is (= [0x83 0x02]
+         (enc-resp {:function :read-holding-registers :exception :illegal-data-address})))
+  (let [r (pdu/decode-response [0x83 0x02])]
+    (is (= :ok (:status r))
+        "a device saying no is a well-formed message, not a decode failure")
+    (is (= {:function :read-holding-registers :exception :illegal-data-address}
+           (:pdu r))))
+  (testing "every exception code in §7 round-trips"
+    (doseq [[code kw] pdu/exception-codes]
+      (is (= {:function :read-coils :exception kw}
+             (:pdu (pdu/decode-response [0x81 code])))))))
+
+;; ── limits ───────────────────────────────────────────────────────────────────
+
+(deftest quantity-limits-are-enforced-here-not-by-the-device
+  (is (= :ok (:status (pdu/encode-request {:function :read-coils :address 0 :quantity 2000}))))
+  (is (= :quantity-out-of-range
+         (:reason (pdu/encode-request {:function :read-coils :address 0 :quantity 2001}))))
+  (is (= :ok (:status (pdu/encode-request {:function :read-holding-registers :address 0 :quantity 125}))))
+  (is (= :quantity-out-of-range
+         (:reason (pdu/encode-request {:function :read-holding-registers :address 0 :quantity 126}))))
+  (is (= :quantity-out-of-range
+         (:reason (pdu/encode-request {:function :write-multiple-registers :address 0
+                                       :values (vec (repeat 124 0))}))))
+  (is (= :address-out-of-range
+         (:reason (pdu/encode-request {:function :read-coils :address 0x10000 :quantity 1}))))
+  (is (= :unknown-function (:reason (pdu/encode-request {:function :not-a-function})))))
+
+;; ── CRC ──────────────────────────────────────────────────────────────────────
+
+(deftest crc16-modbus
+  (testing "the CRC RevEng catalogue check value"
+    ;; CRC-16/MODBUS of the ASCII string "123456789" is 0x4B37.
+    ;;
+    ;; The bytes are written out rather than derived with `(map int
+    ;; "123456789")`, which gives code points on the JVM and a vector of
+    ;; ZEROS under ClojureScript, where a character is a one-character string
+    ;; and `int` of one is not a code point. That idiom has now produced a
+    ;; wrong-and-plausible answer in three libraries in this workspace; here
+    ;; it turned the catalogue check into a CRC of nine zero bytes, which the
+    ;; JVM run reported as green.
+    (is (= 0x4B37 (crc/crc16 [0x31 0x32 0x33 0x34 0x35 0x36 0x37 0x38 0x39])))
+    (is (not= (crc/crc16 [0x31 0x32 0x33 0x34 0x35 0x36 0x37 0x38 0x39])
+              (crc/crc16 (vec (repeat 9 0))))
+        "and the two are different, which is what the JVM run could not see"))
+  (testing "the table form and the definition agree on every two-byte input"
+    ;; 65,536 cases. This is the assertion that makes the table trustworthy
+    ;; without appealing to a constant anyone remembered.
+    (is (every? (fn [n]
+                  (let [bs [(quot n 256) (mod n 256)]]
+                    (= (crc/crc16 bs) (crc/crc16-bitwise bs))))
+                (range 65536))))
+  (testing "the CRC goes on the wire low byte first, unlike everything else"
+    (let [c (crc/crc16 [0x01 0x03])]
+      (is (= [(bit-and c 0xFF) (unsigned-bit-shift-right c 8)] (crc/crc16-bytes [0x01 0x03])))))
+  (testing "appending the CRC bytes makes the whole frame check to zero-difference"
+    (doseq [body [[0x01] [0x11 0x03 0x00 0x6B 0x00 0x03] (vec (range 250))]]
+      (let [framed (into body (crc/crc16-bytes body))
+            n (count framed)]
+        (is (= (crc/crc16 body)
+               (+ (nth framed (- n 2)) (* 256 (nth framed (dec n))))))))))
+
+;; ── framing ──────────────────────────────────────────────────────────────────
+
+(deftest tcp-mbap
+  (let [p (enc-req {:function :read-holding-registers :address 0x6B :quantity 3})
+        f (:bytes (tcp/encode {:transaction-id 1 :unit-id 0x11} p))]
+    ;; length is 1 + pdu, because it counts the unit id
+    (is (= [0x00 0x01 0x00 0x00 0x00 0x06 0x11] (subvec f 0 7)))
+    (is (= 12 (count f)))
+    (let [r (tcp/decode f)]
+      (is (= :ok (:status r)))
+      (is (= 1 (get-in r [:frame :transaction-id])))
+      (is (= 0x11 (get-in r [:frame :unit-id])))
+      (is (= p (get-in r [:frame :pdu-bytes])))))
+  (testing "a partial frame is :incomplete at every prefix, never an error"
+    (let [f (:bytes (tcp/encode {} (enc-req {:function :read-coils :address 0 :quantity 1})))]
+      (doseq [n (range 0 (count f))]
+        (is (= :incomplete (:status (tcp/decode (subvec f 0 n)))) (str n " bytes")))
+      (is (= :ok (:status (tcp/decode f))))))
+  (testing "a non-zero protocol id is not Modbus"
+    (is (= :not-modbus-protocol
+           (:reason (tcp/decode [0 1 0 1 0 2 0x11 0x03])))))
+  (testing "a length of zero cannot be a message, since it counts the unit id"
+    (is (= :zero-length (:reason (tcp/decode [0 1 0 0 0 0 0x11])))))
+  (testing "decode-all drains and keeps the tail"
+    (let [f (:bytes (tcp/encode {} (enc-req {:function :read-coils :address 0 :quantity 1})))
+          {:keys [frames rest]} (tcp/decode-all (into (into f f) (subvec f 0 3)))]
+      (is (= 2 (count frames)))
+      (is (= 3 (count rest))))))
+
+(deftest rtu-framing
+  (let [p (enc-req {:function :read-holding-registers :address 0x6B :quantity 3})
+        f (:bytes (rtu/encode 0x11 p))]
+    (is (= 0x11 (first f)))
+    (is (= (+ 3 (count p)) (count f)))
+    (let [r (rtu/decode f)]
+      (is (= :ok (:status r)))
+      (is (= 0x11 (get-in r [:frame :address])))
+      (is (= p (get-in r [:frame :pdu-bytes])))))
+  (testing "a corrupted byte is caught, and the report names both values"
+    (let [f (:bytes (rtu/encode 0x11 (enc-req {:function :read-coils :address 0 :quantity 1})))
+          bad (assoc f 2 (bit-xor (nth f 2) 0x01))
+          r (rtu/decode bad)]
+      (is (= :crc-mismatch (:reason r)))
+      (is (not= (:received r) (:computed r)))))
+  (testing "every single-bit error in a frame is caught"
+    (let [f (:bytes (rtu/encode 0x11 (enc-req {:function :read-holding-registers
+                                               :address 0x6B :quantity 3})))]
+      (doseq [i (range (count f)) bit (range 8)]
+        (let [bad (assoc f i (bit-xor (nth f i) (bit-shift-left 1 bit)))]
+          (is (= :error (:status (rtu/decode bad)))
+              (str "byte " i " bit " bit))))))
+  (testing "a frame shorter than address + function + CRC is refused"
+    (is (= :frame-too-short (:reason (rtu/decode [1 2 3]))))))
+
+(deftest rtu-ascii
+  (let [p (enc-req {:function :read-holding-registers :address 0x6B :quantity 3})
+        t (:text (rtu/encode-ascii 0x11 p))]
+    (is (str/starts-with? t ":"))
+    (is (str/ends-with? t "\r\n"))
+    (is (= t (str/upper t)) "hex digits are uppercase")
+    (let [r (rtu/decode-ascii t)]
+      (is (= :ok (:status r)))
+      (is (= 0x11 (get-in r [:frame :address])))
+      (is (= p (get-in r [:frame :pdu-bytes])))))
+  (testing "the LRC is checked"
+    (let [t (:text (rtu/encode-ascii 0x11 [0x03 0x00 0x6B 0x00 0x03]))
+          bad (str (subs t 0 (- (count t) 4)) "00\r\n")]
+      (is (= :lrc-mismatch (:reason (rtu/decode-ascii bad))))))
+  (testing "malformed input is refused by name"
+    (is (= :missing-start-delimiter (:reason (rtu/decode-ascii "1103\r\n"))))
+    (is (= :odd-hex-length (:reason (rtu/decode-ascii ":110\r\n"))))
+    (is (= :non-hex-character (:reason (rtu/decode-ascii ":11ZZ0300\r\n"))))))
