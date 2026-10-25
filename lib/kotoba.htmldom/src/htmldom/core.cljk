@@ -1,0 +1,2114 @@
+(ns htmldom.core
+  "Small trusted HTML subset parser for the kotoba-only browser R0.
+
+   This intentionally does not claim WHATWG HTML compatibility. It only bridges
+   simple HTML-like documents into kotoba.wasm.dom.
+
+   Split out of kotoba-lang/browser (ADR-2607051140). Not to be confused with
+   kotoba-lang/html, an unrelated Hiccup-compatible EDN HTML renderer (data ->
+   HTML text); this namespace goes the other direction: parses HTML text into
+   a kotoba.wasm.dom document."
+  (:require [kotoba.lang.text :as str]
+            [cssom.core :as css]
+            [kotoba.wasm.dom :as dom]))
+
+(def void-tags
+  #{"area" "base" "br" "col" "embed" "hr" "img" "input" "link" "meta"
+    "param" "source" "track" "wbr"})
+
+;; ---- inline style="..." -- parsed by cssom, not here ----
+;;
+;; An inline `style="..."` attribute IS a CSS declaration block, so it is
+;; parsed by the CSS parser: `cssom.core/parse-declarations-with-importance`,
+;; the same entry point a `<style>` rule body goes through. This namespace
+;; only decides WHERE a declaration block comes from (an attribute on an
+;; element), never what one means.
+;;
+;; It used to mean both. This file carried its own ~330-line copy of that
+;; parser -- the calc() pipeline, five shorthand expanders, the numeric/px
+;; coercion, the `!important` regex -- justified (in the comments now
+;; deleted) as "consistent with this codebase's existing convention of
+;; independently re-implementing a handful of small, identically-scoped
+;; helpers across repos rather than introducing a cross-repo dependency for
+;; them, e.g. each repo's own `parse-number`/`truthy-attr?`". That
+;; justification stopped being true as the copy grew, and the two copies
+;; then drifted exactly the way two copies do: cssom taught its parser to
+;; expand `margin`/`padding` into per-side longhands, this copy was never
+;; told, and so a stylesheet's `padding: 12px` produced five keys while an
+;; inline `style="padding: 12px"` produced one -- while `margin: 4px 8px`
+;; inline produced the raw STRING "4px 8px", which the per-side box model
+;; cannot read at all. Measured through the real pipeline by
+;; kotoba-lang/cssom's conformance harness against a headless Blink: it was
+;; the single largest cascade-attributed cause on the computed-style axis
+;; (`:box/nested-padding`, `:box/border-box-sizing`,
+;; `:box/padding-shifts-content`, `:box/border-and-padding-together`,
+;; `:page/card`, `:inline/inline-block-with-padding`, ...).
+;;
+;; The drift was not limited to margin/padding either: cssom's parser gives
+;; `content`/`counter-reset`/`counter-increment` their own parsing (and
+;; drops an unparseable one rather than storing an unusable value), which
+;; this copy never did, so those three properties also meant different
+;; things inline than in a rule.
+;;
+;; The direction of the new dependency is the one a real browser has: the
+;; HTML parser hands the style attribute's text to the CSS parser. cssom
+;; does not depend on htmldom (only its conformance harness reads this
+;; namespace, off the classpath), so there is no cycle -- and both repos'
+;; CI already checked the other out as a sibling.
+
+(defn parse-style
+  "Parses a raw inline `style=\"...\"` attribute's text into a `{property
+   value}` map, identically to a `<style>` rule body with the same text.
+
+   Shorthands expand into their longhands (`padding: 12px` gives
+   `:padding` plus the four `:padding-*` sides; likewise `border`,
+   `text-shadow`, `box-shadow`, `outline`, `font`), values are coerced
+   (`12px` -> 12, `calc(2 * 8px)` -> 16, a unitless `line-height` stays a
+   ratio string), and a trailing `!important` is stripped from the value --
+   all of it by `cssom.core`, see this section's own header comment for why
+   none of it lives here any more. `style-importance` is the companion that
+   reports WHICH properties were marked `!important` (needed so
+   `cssom.core` can rank them against `!important` rule-based declarations
+   -- real CSS's importance/cascade-origin step)."
+  [style-text]
+  (css/parse-declarations style-text))
+
+(defn style-importance
+  "The set of property keywords whose declaration in `style-text` (a raw
+   inline `style=\"...\"` attribute's text) ended in `!important`.
+
+   A shorthand marked `!important` marks every longhand it expands into --
+   `style=\"padding: 4px !important\"` reports all five padding keys, not
+   just `:padding` -- because those longhands are what the cascade actually
+   ranks, and real CSS applies the shorthand's importance to each of them.
+
+   Deliberately a SEPARATE function/attr (`:style-inline-important`, see
+   `apply-attrs`) rather than changing `parse-style`'s own `{property
+   value}` return shape to also carry importance inline -- `:style-inline`
+   has real consumers elsewhere (kotoba-lang/browser's `dom_bridge.cljc`,
+   and several of that repo's own tests) that expect a plain value map."
+  [style-text]
+  (into #{}
+        (keep (fn [[k {:keys [important?]}]] (when important? k)))
+        (css/parse-declarations-with-importance style-text)))
+
+(def ^:private named-char-refs
+  "A small, pragmatic subset of HTML5 named character references: the five
+   XML-predefined entities (universally supported, unambiguous, no lookup
+   table strictly needed) plus a handful of the other named entities most
+   likely to show up in real-world text content. This is deliberately NOT the
+   full ~2000-entry HTML5 named character reference table -- implementing
+   that would be wildly out of scope for a trusted-HTML-subset parser. Any
+   named entity not in this table is left as literal text (`&foo;` stays
+   `&foo;`) rather than guessed at, matching this project's existing
+   degrade-don't-guess convention (the same one `cssom.core`'s own value
+   parsing applies to unsupported CSS values)."
+  {"amp" "&" "lt" "<" "gt" ">" "quot" "\"" "apos" "'"
+   "nbsp" "\u00A0" "copy" "\u00A9" "reg" "\u00AE" "trade" "\u2122"
+   "mdash" "\u2014" "ndash" "\u2013" "hellip" "\u2026"
+   ;; Added after a real page shape in kotoba-lang/cssom's conformance
+   ;; corpus (a footer reading `&copy; 2026 <a>Privacy</a> &middot;
+   ;; <a>Terms</a>`) rendered the literal text "&middot;" on screen: the
+   ;; separator dot, the typographic quotes, the arrows and the primes are
+   ;; the entities that actually appear in ordinary page furniture, and a
+   ;; missing one is not a subtle degradation -- it paints the source text.
+   "middot" "\u00B7" "bull" "\u2022" "dagger" "\u2020" "sect" "\u00A7"
+   "para" "\u00B6" "deg" "\u00B0" "plusmn" "\u00B1" "times" "\u00D7"
+   "divide" "\u00F7" "frac12" "\u00BD" "sup2" "\u00B2" "sup3" "\u00B3"
+   "laquo" "\u00AB" "raquo" "\u00BB" "lsquo" "\u2018" "rsquo" "\u2019"
+   "ldquo" "\u201C" "rdquo" "\u201D" "prime" "\u2032" "Prime" "\u2033"
+   "larr" "\u2190" "uarr" "\u2191" "rarr" "\u2192" "darr" "\u2193"
+   "harr" "\u2194" "check" "\u2713" "cross" "\u2717" "star" "\u2606"
+   "euro" "\u20AC" "pound" "\u00A3" "yen" "\u00A5" "cent" "\u00A2"
+   "shy" "\u00AD" "ensp" "\u2002" "emsp" "\u2003" "thinsp" "\u2009"
+   "minus" "\u2212" "ne" "\u2260" "le" "\u2264" "ge" "\u2265"
+   "infin" "\u221E" "asymp" "\u2248" "micro" "\u00B5" "ordm" "\u00BA"
+   ;; A breadcrumb (`Home &rsaquo; Docs &rsaquo; Page`) painted the literal
+   ;; text "&rsaquo;" -- found by kotoba-lang/cssom's conformance corpus the
+   ;; first time it contained one. The angle quotes and the remaining
+   ;; typographic separators complete the page-furniture set.
+   "rsaquo" "\u203A" "lsaquo" "\u2039" "sbquo" "\u201A" "bdquo" "\u201E"
+   "Dagger" "\u2021" "permil" "\u2030" "oline" "\u203E" "frasl" "\u2044"
+   "lowast" "\u2217" "loz" "\u25CA" "spades" "\u2660" "clubs" "\u2663"
+   "hearts" "\u2665" "diams" "\u2666" "not" "\u00AC" "sup1" "\u00B9"
+   "frac14" "\u00BC" "frac34" "\u00BE" "iquest" "\u00BF" "iexcl" "\u00A1"
+   "brvbar" "\u00A6" "uml" "\u00A8" "macr" "\u00AF" "acute" "\u00B4"
+   "cedil" "\u00B8" "curren" "\u00A4" "szlig" "\u00DF"})
+
+(defn- codepoint->str
+  "A Unicode codepoint (possibly outside the BMP, e.g. an emoji) as a string,
+   correctly emitted as a surrogate pair where needed."
+  [cp]
+  #?(:clj (String. (Character/toChars (int cp)))
+     :cljs (js/String.fromCodePoint cp)))
+
+(def ^:private windows-1252-c1-remap
+  "WHATWG spec's 'numeric character reference end state' table: a numeric
+   character reference naming a codepoint in the C1 control range
+   (0x80-0x9F) is NOT emitted as that raw control character -- it is
+   reinterpreted through this fixed Windows-1252 remap instead. This is
+   the textbook 'smart quotes turn into garbage' bug: real-world HTML
+   authored against (or exported from apps that assume) Windows-1252 --
+   Word documents, legacy CMSes -- commonly emits e.g. `&#146;` meaning a
+   right single quote, never the invisible C1 control character 0x92 it
+   names literally. Five codepoints in this range (0x81/0x8D/0x8F/0x90/
+   0x9D) have no Windows-1252 mapping and are deliberately absent here,
+   matching the spec exactly -- those five fall through to this fn's
+   caller's default (raw codepoint) unchanged."
+  {0x80 0x20AC, 0x82 0x201A, 0x83 0x0192, 0x84 0x201E, 0x85 0x2026,
+   0x86 0x2020, 0x87 0x2021, 0x88 0x02C6, 0x89 0x2030, 0x8A 0x0160,
+   0x8B 0x2039, 0x8C 0x0152, 0x8E 0x017D,
+   0x91 0x2018, 0x92 0x2019, 0x93 0x201C, 0x94 0x201D, 0x95 0x2022,
+   0x96 0x2013, 0x97 0x2014, 0x98 0x02DC, 0x99 0x2122, 0x9A 0x0161,
+   0x9B 0x203A, 0x9C 0x0153, 0x9E 0x017E, 0x9F 0x0178})
+
+(defn- numeric-char-ref->str
+  "Decode the digits of a numeric character reference (`radix` 10 or 16) to
+   the corresponding Unicode codepoint's string, or nil if the digits don't
+   parse or name a codepoint outside the valid Unicode range (including the
+   surrogate-only range, which is never a valid scalar value) -- callers fall
+   back to leaving the reference as literal text, same as an unrecognized
+   named entity. A codepoint in the C1 control range (0x80-0x9F) is
+   reinterpreted through `windows-1252-c1-remap` first (see its own
+   docstring); codepoint 0 becomes U+FFFD REPLACEMENT CHARACTER, matching
+   the same spec algorithm's explicit null-character rule."
+  [digits radix]
+  (try
+    (let [cp #?(:clj (Long/parseLong digits radix) :cljs (js/parseInt digits radix))]
+      (when (and (<= 0 cp 0x10FFFF) (not (<= 0xD800 cp 0xDFFF)))
+        (codepoint->str (cond
+                          (zero? cp) 0xFFFD
+                          (contains? windows-1252-c1-remap cp) (get windows-1252-c1-remap cp)
+                          :else cp))))
+    (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(def ^:private legacy-char-refs
+  "The named references HTML5 resolves WITHOUT a trailing semicolon.
+
+   The general rule really is ambiguous without the full table, and this
+   parser deliberately carries only a subset -- but the semicolon-less
+   forms are not part of that ambiguity: the spec fixes a CLOSED list of
+   ~106 legacy names (every one predating HTML5's named-reference table),
+   and resolves an unterminated reference by taking the LONGEST match from
+   that list alone. `&notit;` is therefore not undecidable; it is `not`
+   (U+00AC) followed by the literal text `it;`, because `notin` and
+   `notit` are not on the list.
+
+   This map holds the legacy names that are also in `named-char-refs`, so
+   nothing here can resolve to a character the terminated form would not.
+   A name NOT on this list still requires its semicolon -- `&middot`
+   without one stays literal, exactly as a browser leaves it.
+
+   Measured in Brave before implementing: `<p>a&ampb</p>` is `a&b`, and
+   `<a href=\"?x=1&ampy=2\">` keeps `&ampy=2` literal -- see
+   `decode-entities`' `in-attribute?` for that second half."
+  (select-keys named-char-refs
+               ["amp" "lt" "gt" "quot" "nbsp" "copy" "reg" "not" "deg"
+                "para" "sect" "micro" "middot" "pound" "yen" "cent"
+                "plusmn" "times" "divide" "frac12" "sup2" "sup3"
+                "laquo" "raquo" "ordm" "shy"]))
+
+(def ^:private legacy-max-len
+  (reduce max 0 (map count (keys legacy-char-refs))))
+
+(def ^:private char-ref-pattern
+  ;; Named references require the trailing `;` (see decode-entities'
+  ;; docstring for why). Numeric references' trailing `;` is optional: unlike
+  ;; named entities, a numeric reference is self-delimiting by digit class,
+  ;; so no lookup table is needed to know where it ends, and real browsers
+  ;; accept it either way.
+  #"&(?:([a-zA-Z][a-zA-Z0-9]*);|#(\d+);?|#[xX]([0-9a-fA-F]+);?)")
+
+(defn decode-entities
+  "Decode HTML character references in `s`: named entities (a pragmatic
+   subset, see `named-char-refs`) and numeric character references
+   (`&#65;` decimal, `&#x41;`/`&#X41;` hex) to their Unicode codepoint.
+
+   Simplification (documented, deliberate): a named reference's trailing `;`
+   is required -- omitting it is genuinely ambiguous without the full
+   ~2000-entry HTML5 named character reference table this project doesn't
+   implement (e.g. is `&notit` a truncated `&not;it` or literally `&notit`?).
+   A numeric reference's trailing `;` is optional, since digits are
+   self-delimiting (no ambiguity, so no reason to be stricter than browsers
+   are). Anything not recognized -- an unknown named entity, or numeric
+   digits naming an invalid codepoint -- is left as literal, unmodified text
+   rather than guessed at, matching this project's degrade-don't-guess
+   convention."
+  ([s] (decode-entities s false))
+  ([s in-attribute?]
+   (if (or (nil? s) (not (str/index-of s "&")))
+     s
+     (let [terminated (str/replace
+                       s
+                       char-ref-pattern
+                       (fn [[whole named decimal hex]]
+                         (or (cond
+                               named (get named-char-refs named)
+                               decimal (numeric-char-ref->str decimal 10)
+                               hex (numeric-char-ref->str hex 16))
+                             whole)))]
+       ;; Then the semicolon-less LEGACY forms, longest match first (see
+       ;; legacy-char-refs). Run second so a terminated reference is never
+       ;; shortened: `&amp;` is already `&` by now and cannot be re-read.
+       ;;
+       ;; In an ATTRIBUTE the same input is left alone when the character
+       ;; after the match is alphanumeric or `=`. That is a real rule with
+       ;; a real purpose -- it is why `?x=1&ampy=2` survives in a URL --
+       ;; and it is why this takes an `in-attribute?` flag rather than
+       ;; being applied uniformly.
+       (str/replace
+        terminated
+        #"&([a-zA-Z][a-zA-Z0-9]*)"
+        (fn [[whole name]]
+          (or (loop [n (min legacy-max-len (count name))]
+                (when (pos? n)
+                  (let [head (subs name 0 n)
+                        rest-of (subs name n)]
+                    (if-let [ch (get legacy-char-refs head)]
+                      (when-not (and in-attribute?
+                                     (or (str/starts-with? rest-of "=")
+                                         (re-find #"^[a-zA-Z0-9]" rest-of)))
+                        (str ch rest-of))
+                      (recur (dec n))))))
+              whole)))))))
+
+(defn- attrs
+  [s]
+  (->> (re-seq #"([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'>]+)))?" s)
+       (map (fn [[_ k dq sq bare]]
+              [(keyword (str/lower k))
+               (if-let [v (or dq sq bare)]
+                 (decode-entities v true)
+                 ;; Real WHATWG HTML tokenization: a valueless/bare
+                 ;; attribute (`<input checked>`, no `=value` at all) has
+                 ;; its value set to the empty string "" -- that's what
+                 ;; Element.getAttribute() is spec-required to return.
+                 ;; Previously this stored the Clojure boolean `true`
+                 ;; instead, which survives UNMODIFIED all the way out to
+                 ;; real page JS through dom-gpu's set-attribute (verbatim
+                 ;; assoc) and browser's quickjs_wasm.cljc snapshot/
+                 ;; JSON.stringify bridge, so
+                 ;; `getAttribute('checked')` returned the literal string
+                 ;; "true" instead of "" -- confirmed via direct REPL
+                 ;; reproduction before touching source. Every
+                 ;; `truthy-attr?` copy in this codebase (htmldom.core,
+                 ;; browser/document_input.cljc, cssom/core.cljc) already
+                 ;; has an explicit `(= "" v)` case alongside `(= true
+                 ;; v)`, confirming "" was already the intended/expected
+                 ;; internal representation everywhere this value is
+                 ;; actually consumed -- `true` was simply never the
+                 ;; correct value to produce here in the first place.
+                 "")]))
+       ;; Real HTML5 tokenization: the FIRST occurrence of a duplicate
+       ;; attribute wins and every later one is a parse error, dropped --
+       ;; `into {}` would instead let the LAST occurrence silently
+       ;; overwrite it, since `assoc` on a repeated key always keeps the
+       ;; newest value.
+       (reduce (fn [acc [k v]] (if (contains? acc k) acc (assoc acc k v))) {})))
+
+(defn- unquoted-value-tail?
+  "True if the end of `s` (tag name + attribute text, no wrapping <, >, or
+   leading '/') is inside an in-progress UNQUOTED attribute value -- i.e.
+   per real HTML5 tokenization, a trailing '/' at this position is
+   literal value content, not a self-closing marker. `/` is ONLY a
+   self-closing marker while in the tag-name, before-attribute-name,
+   attribute-name, or after-attribute-value-quoted states; inside an
+   unquoted value it has no special meaning at all and is simply
+   appended, exactly like any other character, until whitespace or the
+   tag's own '>' ends the value. Scans left-to-right with the same
+   quote-tracking shape as tag-close-index above: whitespace always
+   exits value/after-= position (back to \"before attribute name\"); a
+   quote right after '=' opens a quoted value (its own contents are
+   never \"unquoted\"); any other character right after '=' begins an
+   unquoted value that continues until the next whitespace/quote/=."
+  [s]
+  (let [len (count s)]
+    (loop [pos 0 quote nil after-eq? false unquoted? false]
+      (if (>= pos len)
+        unquoted?
+        (let [c (subs s pos (inc pos))]
+          (cond
+            quote (recur (inc pos) (when-not (= c quote) quote) false false)
+            (re-matches #"[ \t\n\r]" c) (recur (inc pos) nil false false)
+            (= c "=") (recur (inc pos) nil true false)
+            (and after-eq? (or (= c "\"") (= c "'"))) (recur (inc pos) c false false)
+            after-eq? (recur (inc pos) nil false true)
+            unquoted? (recur (inc pos) nil false true)
+            :else (recur (inc pos) nil false false)))))))
+
+(defn- token
+  [raw]
+  (if (str/starts-with? raw "<")
+    (let [body (subs raw 1 (dec (count raw)))
+          closing? (str/starts-with? body "/")
+          body (str/trim (if closing? (subs body 1) body))
+          ;; A trailing `/` right before the tag's `>` is stripped from the
+          ;; tag/attribute text (matching real HTML5, which ignores a stray
+          ;; trailing slash on any start tag) -- but ONLY when it is genuinely
+          ;; a self-closing marker, not when it directly continues an
+          ;; UNQUOTED attribute value that happens to end right at the `>`
+          ;; (a real, common pattern for URLs, e.g. `href=http://example.com/`
+          ;; or `src=http://example.com/img/`). Per real HTML5 tokenization,
+          ;; `/` has no special meaning inside an unquoted value at all --
+          ;; unconditionally stripping it here silently truncated the value
+          ;; by one character, confirmed via direct REPL reproduction before
+          ;; this fix. This must happen BEFORE the tag name is extracted, and
+          ;; self-closing status is determined SOLELY by void-tag membership,
+          ;; not by the presence of this slash: real HTML5 only treats actual
+          ;; void elements (`<br/>`, `<img/>`, ...) as self-closing. A
+          ;; trailing `/` on an ordinary element like `<div/>` is ignored --
+          ;; the element still needs, and will be matched against, a real
+          ;; closing tag later.
+          slash? (and (str/ends-with? body "/")
+                      (not (unquoted-value-tail? (subs body 0 (dec (count body))))))
+          body (str/trim (if slash? (subs body 0 (dec (count body))) body))
+          [tag attr-text] (str/split body #"\s+" 2)
+          tag (str/lower (or tag ""))
+          self? (contains? void-tags tag)]
+      (if closing?
+        {:type :end :tag tag}
+        ;; `:slash?` is kept separately from `:self?`: in HTML a trailing
+        ;; slash on a non-void tag is IGNORED (`<div/>` opens a div), but in
+        ;; FOREIGN content (inside <svg>/<math>) it really does close the
+        ;; element. The tokenizer cannot know which context it is in, so it
+        ;; reports the fact and the tree builder decides.
+        (cond-> {:type :start :tag tag :attrs (attrs (or attr-text "")) :self? self?}
+          ;; only when present: a trailing slash is exceptional information,
+          ;; and several tests legitimately compare whole token maps.
+          slash? (assoc :slash? true))))
+    ;; Whitespace COLLAPSING is deliberately NOT done here anymore -- it
+    ;; depends on whether a <pre> ancestor is currently open, which this
+    ;; stateless, stack-free tokenizing pass has no way to know (unlike
+    ;; parse-into-document, which already tracks the open-element stack for
+    ;; auto-closing). This fn keeps the ORIGINAL, uncollapsed text in the
+    ;; token; parse-into-document's own `:text` case now does the
+    ;; collapsing, conditionally, once it can actually check the stack. The
+    ;; blank-check stays here unconditionally, though: a run of ONLY
+    ;; whitespace between tags is dropped the same way regardless of <pre>
+    ;; context either way (collapsing an all-whitespace string never changes
+    ;; whether it's blank), so this filtering doesn't need to move.
+    ;; Whitespace-only runs are KEPT. They are the space between inline
+    ;; elements -- `<a>one</a>\n  <a>two</a>` renders as `one two` in every
+    ;; browser, and dropping the run here made the words touch, with no way
+    ;; for layout to recover the gap. Layout is where a whitespace-only text
+    ;; child gets discarded when it would form a stray row of its own
+    ;; between blocks (cssom.layout's inline-runs), because that decision
+    ;; needs the box tree this tokenizer cannot see.
+    (when-not (empty? raw)
+      {:type :text :text (decode-entities raw)})))
+
+(def ^:private raw-text-tags
+  "Elements whose content real HTML parsers scan as literal raw text rather
+   than markup: `<`/`>`/quotes inside them are not interpreted, and only the
+   first matching end tag terminates them.
+
+   `script`/`style` are true \"raw text\" elements per the WHATWG spec.
+   `title`/`textarea` are technically \"RCDATA\" -- the one difference being
+   that character references (e.g. `&amp;`) are still decoded inside RCDATA
+   even though tags aren't parsed there either. See `rcdata-tags` for where
+   that distinction is now applied (tokenize decodes entities in the raw text
+   it captures only for the tags in that subset)."
+  #{"script" "style" "title" "textarea"})
+
+(def ^:private rcdata-tags
+  "The subset of `raw-text-tags` that are \"RCDATA\" rather than true \"raw
+   text\" per the WHATWG spec: `title`/`textarea`. Tags are not parsed inside
+   either kind of element (both are scanned literally up to their real
+   closing tag), but character references ARE decoded inside RCDATA and are
+   NOT decoded inside true raw text. `script`/`style` are true raw text: a JS
+   string literal or CSS content containing `&amp;` is genuinely raw and must
+   not become `&`."
+  #{"title" "textarea"})
+
+(defn- tag-close-index
+  "Index of the real closing '>' for a start/end tag beginning at `lt` (the
+   index of the tag's own '<'), scanned from `lt`. A naive index-of the next
+   '>' breaks on a real, common, valid pattern: a literal, UNESCAPED '>'
+   inside a single- or double-quoted attribute value (e.g. `title=\"a > b\"`,
+   or the extremely common inline `onclick=\"if (a>b) foo()\"`) is real
+   HTML5 -- quoted attribute values are scanned verbatim up to their own
+   matching quote, `>` has no special meaning inside them at all. A naive
+   scan truncates the tag at that inner '>', corrupting `:attrs` (losing
+   every attribute after it) and leaking the quoted value's own remainder as
+   a stray text node, confirmed via direct REPL reproduction before this
+   fix. This tracks whether the scan is currently inside an open quote span
+   and only treats a '>' outside of one as the tag's real terminator.
+   Returns nil if no real closing '>' exists in the rest of the input
+   (matches the old naive index-of's own nil-for-unmatched contract,
+   including an unterminated quote -- the loop then never exits the quote
+   state before reaching the end of input)."
+  [html lt]
+  (let [len (count html)]
+    (loop [pos (inc lt) quote nil]
+      (if (>= pos len)
+        nil
+        (let [c (subs html pos (inc pos))]
+          (cond
+            quote (recur (inc pos) (when-not (= c quote) quote))
+            (or (= c "\"") (= c "'")) (recur (inc pos) c)
+            (= c ">") pos
+            :else (recur (inc pos) quote)))))))
+
+(defn- raw-text-tag-name
+  "If html[lt..gt] (inclusive angle brackets, gt = index of the tag's '>')
+   opens a raw-text element, return its lower-cased tag name. Returns nil for
+   closing tags, comments/doctypes/PIs, and any ordinary element."
+  [html lt gt]
+  (let [body (str/trim (subs html (inc lt) gt))]
+    (when-not (or (str/starts-with? body "/")
+                  (str/starts-with? body "!")
+                  (str/starts-with? body "?"))
+      (raw-text-tags (str/lower (first (str/split body #"[\s/>]" 2)))))))
+
+(defn- raw-text-close-index
+  "Index of the '<' beginning the literal, case-insensitive closing tag
+   `</tag` for `tag`, scanned from `from` in `html`. Matches real raw-text
+   parsing: any '<'/'>' or nested same-name start tag in between is ignored,
+   only the first end-tag boundary terminates the element. Returns
+   (count html) if unterminated (rest of input becomes the element's text,
+   as browsers do for an unterminated <script>/<style> at EOF)."
+  [html tag from]
+  (let [lower (str/lower html)
+        len (count html)
+        needle (str "</" (str/lower tag))
+        needle-len (count needle)
+        boundary-chars #{" " "\t" "\n" "\r" ">" "/"}]
+    (loop [pos from]
+      (if-let [idx (str/index-of lower needle pos)]
+        (let [after (+ idx needle-len)]
+          (if (or (>= after len)
+                  (contains? boundary-chars (subs lower after (inc after))))
+            idx
+            (recur (inc idx))))
+        len))))
+
+(defn- char-at
+  "The single character at `i` as a one-character string, or nil past the
+   end. `subs`-based rather than `nth`/`get` because those return a
+   java.lang.Character on the JVM and a one-character string in
+   ClojureScript, which cannot be compared the same way in `.cljc`."
+  [s i]
+  (when (< i (count s)) (subs s i (inc i))))
+
+(defn- markup-start?
+  "Whether the `<` at `lt` actually OPENS markup, per real HTML5's tag-open
+   state (WHATWG 13.2.5.6): only ASCII alpha (start tag), `/` followed by
+   ASCII alpha (end tag), `!` (markup declaration / comment / doctype) and
+   `?` (bogus comment) do. For ANY other next character the spec emits the
+   `<` as an ordinary character and reconsumes in the data state -- a `<`
+   in running prose is literal text, not a broken tag.
+
+   Measured before this existed, via the conformance harness (see
+   conformance/README.md, `eof/unmatched-lt`): `<p>1 < 2 and 3 > 4</p>`
+   tokenized to a start tag named `2` with an attribute `and`, and the text
+   `2 and 3 >` vanished from the document entirely -- because the scan took
+   the `<` before ` 2` as a tag open and then found the `>` after `3` as its
+   terminator. A real browser produces one text node, `1 < 2 and 3 > 4`.
+   Bare `<` in prose (code snippets, arithmetic, `a < b`) is common enough
+   that this was silent content loss, not an exotic edge case."
+  [html lt]
+  (let [c (char-at html (inc lt))]
+    (boolean
+     (and c (or (some? (re-matches #"[A-Za-z!?]" c))
+                (and (= "/" c)
+                     (when-let [d (char-at html (+ lt 2))]
+                       (some? (re-matches #"[A-Za-z]" d)))))))))
+
+(defn- normalize-newlines
+  "WHATWG 13.2.3.5, the input stream preprocessor: a U+000D CARRIAGE RETURN
+   followed by U+000A LINE FEED is replaced by a single LINE FEED, and any
+   remaining lone CARRIAGE RETURN is replaced by a LINE FEED.
+
+   This runs on the WHOLE source, before tokenizing, which is what the spec
+   says and also what makes it right inside `<pre>` and the raw-text
+   elements -- their content never passes through the tree builder's text
+   path, so a rule applied there would miss them. Measured in Brave 151,
+   2026-08-06 (conformance/ws_probe.cljk, cases `pre with CRLF` / `pre with
+   CR` / `div with CR`): `<pre>a\\r\\nb</pre>`, `<pre>a\\rb</pre>` and
+   `<div>a\\rb</div>` all produce the codepoints `a LF b`, and the two
+   `<pre>` shapes render 40px tall -- a real line break, not a stray
+   control character.
+
+   Before this, a CR outside a preserving context was folded into the
+   whitespace-collapsing class (becoming a SPACE, so `a\\rb` was `a b`), and
+   inside one it survived verbatim as a U+000D no consumer could render.
+   Neither is what a browser builds, and the difference only became
+   reachable once collapsing moved out of the parser."
+  [html]
+  (str/replace html #"\r\n?" "\n"))
+
+(defn tokenize
+  [html]
+  (let [html (normalize-newlines (or html ""))
+        len (count html)
+        ;; Text accumulates from `pos` and is only flushed when real markup
+        ;; is reached, so a literal `<` (see `markup-start?`) stays INSIDE
+        ;; the surrounding run and produces one text node rather than
+        ;; splitting it -- which is also what a browser builds, since it
+        ;; appends characters to the text node already at the insertion
+        ;; point.
+        flush (fn [acc end pos]
+                (if (> end pos)
+                  (if-let [t (token (subs html pos end))] (conj acc t) acc)
+                  acc))]
+    ;; `scan` is where the search for the next `<` resumes; `pos` is where
+    ;; the pending text run began. They differ exactly when a `<` turned out
+    ;; to be literal text.
+    (loop [pos 0
+           scan 0
+           acc []]
+      (let [lt (or (str/index-of html "<" scan) len)]
+        (cond
+          (>= lt len)
+          (flush acc len pos)
+
+          ;; Not a tag open at all (see `markup-start?`): the `<` is an
+          ;; ordinary character. Keep it in the pending text run and carry
+          ;; on looking for the next `<`.
+          (not (markup-start? html lt))
+          (recur pos (inc lt) acc)
+
+          ;; HTML comment: scanned literally for its real `-->` terminator so
+          ;; a `>` inside the comment body can't truncate it and corrupt the
+          ;; rest of the token stream, and emitted as a real `:comment`
+          ;; token.
+          ;;
+          ;; It used to be discarded, for the honest reason that there was
+          ;; nowhere to put it: `kotoba.wasm.dom` had no comment node type
+          ;; at all until 2026-08-04. Discarding is not neutral -- it MERGES
+          ;; the text on either side into one node where a browser keeps two
+          ;; (`a<!--c-->b` gave a single "ab"), so three conformance cases
+          ;; failed on text structure as well as on the missing node.
+          ;;
+          ;; Real HTML5's two "abrupt-closing-of-empty-comment" forms --
+          ;; `<!-->` and `<!--->` -- are complete, empty, immediately-
+          ;; terminated comments (their own named parse error in the spec),
+          ;; reusing the marker's OWN trailing `--` as the closing marker's
+          ;; leading `--`. Searching from `lt + 4` (strictly after those two
+          ;; dashes) can never see that overlap, so it always missed both
+          ;; forms and searched for the NEXT literal `-->` anywhere later in
+          ;; the document instead -- silently swallowing everything up to
+          ;; (or, if none exists, all the way to end-of-input) as comment
+          ;; content, discarding real markup wholesale. Confirmed via direct
+          ;; REPL reproduction: `<main><p>before</p><!--><p>after</p></main>`
+          ;; parsed to a `<main>` with only ONE child -- `<p>after</p>` and
+          ;; its text node never existed in the tree at all. Searching from
+          ;; `lt + 2` instead (right after the bare `<!`) lets the marker's
+          ;; own `--` double as the closer for the two abrupt-closing forms,
+          ;; while an ordinary `<!--content-->` is unaffected: the search
+          ;; only matches early if the very next character really is `>`,
+          ;; otherwise it keeps scanning forward to the real terminator
+          ;; exactly as before.
+          (str/starts-with? (subs html lt) "<!--")
+          (let [acc (flush acc lt pos)
+                end (str/index-of html "-->" (+ lt 2))
+                next-pos (if end (+ end 3) len)
+                ;; the comment's DATA: everything between the `<!--` and the
+                ;; terminator. The two abrupt-closing forms (`<!-->` and
+                ;; `<!--->`, which reuse the marker's own dashes as the
+                ;; closer) yield empty data, which is exactly what a browser
+                ;; reports for them.
+                data (if (and end (> end (+ lt 4)))
+                       (subs html (+ lt 4) end)
+                       "")]
+            (recur next-pos next-pos (conj acc {:type :comment :data data})))
+
+          :else
+          (let [acc (flush acc lt pos)
+                gt (tag-close-index html lt)]
+            (if (nil? gt)
+              ;; A real tag open with no terminating '>' anywhere in the rest
+              ;; of the input (including an attribute quote that never
+              ;; closes). WHATWG's eof-in-tag parse error DROPS the partial
+              ;; tag and everything the tokenizer had consumed into it, so
+              ;; the input simply ends here. Measured (conformance case
+              ;; `eof/unterminated-tag`): `<p>a</p><div class="x` produced a
+              ;; visible text node reading `div class="x` -- raw markup
+              ;; leaking into the rendered document -- where a browser shows
+              ;; nothing at all.
+              acc
+              (let [raw (subs html lt (inc gt))]
+                (if (or (str/starts-with? raw "<!") (str/starts-with? raw "<?"))
+                  ;; doctype / processing instruction: discarded, as before.
+                  (recur (inc gt) (inc gt) acc)
+                  (let [raw-tag (raw-text-tag-name html lt gt)
+                        open-tok (token raw)]
+                    (if (and raw-tag (not (:self? open-tok)))
+                      ;; Raw-text element: emit its real opening tag, then the
+                      ;; verbatim (whitespace-preserving) text up to the real
+                      ;; closing tag, then the real closing tag itself.
+                      (let [close-idx (raw-text-close-index html raw-tag (inc gt))
+                            text (subs html (inc gt) close-idx)
+                            ;; WHATWG spec: if a <textarea>'s content begins
+                            ;; with a single U+000A LINE FEED, that one
+                            ;; character is silently dropped -- authoring
+                            ;; convenience for the extremely common
+                            ;; "<textarea>\nvalue" source-formatting habit
+                            ;; (immediately newlining after the open tag).
+                            ;; Scoped to `textarea` only, matching the spec --
+                            ;; `title`/`script`/`style` get no such treatment.
+                            text (if (and (= raw-tag "textarea") (str/starts-with? text "\n"))
+                                   (subs text 1)
+                                   text)
+                            ;; RCDATA (title/textarea): entities decode even
+                            ;; though tags don't parse. True raw text
+                            ;; (script/style): verbatim, no decoding -- a JS
+                            ;; string literal containing `&amp;` must stay
+                            ;; `&amp;`, not become `&`.
+                            text (if (contains? rcdata-tags raw-tag)
+                                   (decode-entities text)
+                                   text)
+                            acc (cond-> acc open-tok (conj open-tok))
+                            acc (if (seq text) (conj acc {:type :text :text text}) acc)]
+                        (if (< close-idx len)
+                          (let [close-gt (or (str/index-of html ">" close-idx) len)
+                                next-pos (if (< close-gt len) (inc close-gt) len)]
+                            (recur next-pos next-pos
+                                   (conj acc {:type :end :tag raw-tag})))
+                          (recur len len acc)))
+                      (recur (inc gt) (inc gt)
+                             (if open-tok (conj acc open-tok) acc)))))))))))))
+
+(defn- apply-attrs
+  [document id attrs]
+  (reduce-kv
+   (fn [document k v]
+     (if (= k :style)
+       (let [style (parse-style v)]
+         (-> document
+             (dom/set-attribute id :style-inline style)
+             (dom/set-attribute id :style-inline-important (style-importance v))
+             (dom/set-style id style)))
+       (dom/set-attribute document id k v)))
+   document
+   attrs))
+
+(defn- truthy-attr? [v]
+  (or (= true v)
+      (= "true" v)
+      (= "" v)
+      (and (string? v)
+           (not (str/blank? v))
+           (not= "false" (str/lower v)))))
+
+(defn- set-attribute-if-missing
+  [document id k v]
+  (if (contains? (get-in document [:nodes id :attrs]) k)
+    document
+    (dom/set-attribute document id k v)))
+
+(defn- text-content
+  [document id]
+  (let [node (get-in document [:nodes id])]
+    (case (:node/type node)
+      :text (:text node)
+      :element (str/join "" (map #(text-content document %) (:children node)))
+      "")))
+
+(defn- descendant-node-ids
+  ([document id]
+   (descendant-node-ids document id #{}))
+  ([document id visited]
+   (when-not (contains? visited id)
+     (let [visited (conj visited id)]
+       (mapcat (fn [child-id]
+                 (cons child-id (descendant-node-ids document child-id visited)))
+               (get-in document [:nodes id :children]))))))
+
+(defn- parent-node-id
+  [document child-id]
+  (some (fn [[node-id node]]
+          (when (some #{child-id} (:children node))
+            node-id))
+        (:nodes document)))
+
+(defn- option-value
+  [document option-id]
+  (let [attrs (get-in document [:nodes option-id :attrs])]
+    (str (if (contains? attrs :value)
+           (:value attrs)
+           (text-content document option-id)))))
+
+(defn- select-option-ids
+  [document select-id]
+  (->> (descendant-node-ids document select-id)
+       (filter #(= :option (get-in document [:nodes % :tag])))
+       vec))
+
+(defn- option-disabled?
+  [document option-id]
+  (or (truthy-attr? (get-in document [:nodes option-id :attrs :disabled]))
+      (loop [parent-id (parent-node-id document option-id)]
+        (when parent-id
+          (let [parent (get-in document [:nodes parent-id])]
+            (if (= :optgroup (:tag parent))
+              (truthy-attr? (get-in parent [:attrs :disabled]))
+              (recur (parent-node-id document parent-id))))))))
+
+(defn- initialize-select-state
+  "Real HTML5 selectedness/`.value`, confirmed against real Chrome before
+   touching source (a naive 'disabled never matters' read of the spec
+   text is WRONG -- an initial attempt learned this the hard way): an
+   EXPLICIT `selected` attr wins outright regardless of `disabled` (a
+   `<select>` whose ONLY selected option is `disabled` -- the extremely
+   common `<option value=\"x\" disabled selected>` placeholder-with-a-
+   real-value idiom -- previously reported `.value` as `\"\"` instead of
+   that option's own value, since the old code re-filtered ALL of
+   `selected-ids` down to non-disabled options before computing `:value`,
+   even when an explicit selection existed). But absent any explicit
+   `selected` at all, the DEFAULT falls back to the first NON-disabled
+   option, skipping disabled ones entirely (confirmed live: a disabled
+   first option with no `selected` anywhere defaults to the next,
+   enabled option, not the disabled one) -- and if EVERY option is
+   disabled, nothing is selected at all (`selectedIndex -1`, `value \"\"`
+   in real Chrome), not a fallback to the plain first option regardless."
+  [document select-id]
+  (let [options (select-option-ids document select-id)
+        multiple? (truthy-attr? (get-in document [:nodes select-id :attrs :multiple]))
+        selected-options (filter #(truthy-attr? (get-in document [:nodes % :attrs :selected]))
+                                 options)
+        selected-ids (if multiple?
+                       (vec selected-options)
+                       (if-let [selected-id (or (first selected-options)
+                                                (first (remove #(option-disabled? document %) options)))]
+                         [selected-id]
+                         []))
+        document (reduce (fn [document option-id]
+                           (let [selected? (boolean (some #{option-id} selected-ids))]
+                             (-> document
+                                 (dom/set-attribute option-id :selected selected?)
+                                 (set-attribute-if-missing option-id :default-selected selected?))))
+                         document
+                         options)]
+    (dom/set-attribute document select-id :value
+                       (if-let [selected-id (first selected-ids)]
+                         (option-value document selected-id)
+                         ""))))
+
+(defn- initialize-form-node
+  [document id]
+  (let [node (get-in document [:nodes id])
+        attrs (:attrs node)
+        tag (:tag node)
+        input-type (str/lower (str (or (:type attrs) "")))]
+    (case tag
+      :input
+      (cond-> document
+        (not (contains? attrs :default-value))
+        (dom/set-attribute id :default-value (str (get attrs :value "")))
+
+        (contains? #{"checkbox" "radio"} input-type)
+        (set-attribute-if-missing id :default-checked (truthy-attr? (:checked attrs))))
+
+      :textarea
+      (let [value (str (if (contains? attrs :value)
+                         (:value attrs)
+                         (text-content document id)))]
+        (-> document
+            (set-attribute-if-missing id :value value)
+            (set-attribute-if-missing id :default-value value)))
+
+      :option
+      (set-attribute-if-missing document id :default-selected (truthy-attr? (:selected attrs)))
+
+      :select
+      (initialize-select-state document id)
+
+      document)))
+
+(defn- initialize-form-defaults
+  [document]
+  (reduce initialize-form-node
+          document
+          (sort (keys (:nodes document)))))
+
+(defn- find-top-match-index
+  "Index within `stack` (a vector of open element ids, index 0 = root) of the
+   nearest (topmost) element whose tag is `tag`, searching from the top of
+   the stack downward but never matching the root at index 0. Returns nil if
+   no open element with that tag exists (a stray/mismatched closing tag)."
+  [document stack tag]
+  (loop [i (dec (count stack))]
+    (when (pos? i)
+      (if (= tag (get-in document [:nodes (nth stack i) :tag]))
+        i
+        (recur (dec i))))))
+
+(def ^:private auto-close-tags
+  "HTML5 elements whose end tag is allowed to be OMITTED because the spec
+   defines an implicit close: when a new element starts while a matching
+   element still sits at the TOP of the stack of open elements (i.e. it is
+   the innermost, most-recently-opened element -- nothing else has opened
+   inside it since), the browser implicitly closes that open element first,
+   exactly as if a real closing tag for it had appeared, instead of nesting
+   the new element inside it. Keys are the tag that may be implicitly
+   closed; values are the set of new START tags that trigger the close.
+
+   This is a deliberately SCOPED subset of HTML5's much larger \"omitting
+   tags\" table -- only the highest-frequency, most tightly-bounded cases,
+   not full spec coverage (see the `:not()`/`:is()`/`:where()`/`:has()`
+   scoped-limitation convention in the sibling cssom repo for the shape of
+   this kind of documented, honest cut):
+
+     :li     a new <li> closes a currently open <li>. Real HTML5's rule is
+             \"may be omitted if the li element is immediately followed by
+             another li element, or if there is no more content in its
+             parent element\" -- the \"no more content in parent\" half
+             needs no extra code here: it already falls out of this
+             parser's general behavior of closing every still-open element
+             above a matched tag when that ancestor's own end tag arrives
+             (see the `:end` case below, and `find-top-match-index`). Only
+             the \"immediately followed by another li\" half needs this
+             table.
+     :option a new <option> OR a new <optgroup> closes a currently open
+             <option>. Real HTML5: an <option>'s end tag \"may be omitted
+             if the option element is immediately followed by another
+             option element, or if it is immediately followed by an
+             optgroup element, or if there is no more content in its
+             parent element\" -- the \"no more content in parent\" half is
+             likewise covered for free by the `:end` case; only the two
+             \"immediately followed by\" halves need this table.
+     :optgroup a new <optgroup> closes a currently open <optgroup>. Real
+             HTML5: an <optgroup>'s end tag \"may be omitted if the
+             optgroup element is immediately followed by another optgroup
+             element, or if there is no more content in the parent
+             element\" -- same shape as <li>/<tr>, \"no more content\"
+             covered for free. Combined with :option's own entry above,
+             this is the SAME two-level cascading pattern as :td/:th->:tr
+             below: a new <optgroup> first closes a currently open
+             <option> (exposing the enclosing <optgroup> as the new stack
+             top), then that SAME incoming <optgroup> tag is re-examined
+             against the now-exposed <optgroup>'s own entry, closing that
+             too -- so a grouped <select> with no explicit </option>/
+             </optgroup> anywhere (the single most common way authors
+             write <optgroup>, and a genuinely severe gap before this
+             entry existed: every subsequent <optgroup> nested inside the
+             previous option instead of becoming its sibling, confirmed
+             by direct reproduction before this fix) gets the correct,
+             flat sibling tree shape.
+     :p      the real HTML5 rule: a <p>'s end tag may be omitted \"if the p
+             element is immediately followed by an address, article, aside,
+             blockquote, details, div, dl, fieldset, figcaption, figure,
+             footer, form, h1, h2, h3, h4, h5, h6, header, hgroup, hr, main,
+             menu, nav, ol, p, pre, section, table, or ul element\" -- the
+             full ~29-element block-level list, not just another <p>.
+     :dt/:dd definition-list items CROSS-close each other, unlike the
+             same-tag-only entries above. Real HTML5: a <dt>'s end tag \"may
+             be omitted if the dt element is immediately followed by another
+             dt element or a dd element\"; a <dd>'s end tag \"may be omitted
+             if the dd element is immediately followed by another dd element
+             or a dt element, or if there is no more content in its parent
+             element\". So a new <dt> closes a currently open <dt> OR <dd>,
+             and a new <dd> closes a currently open <dd> OR <dt> -- hence
+             both values below are `#{:dt :dd}`, not a single-tag set. As
+             with <li>/<option>, the \"no more content in parent\" half of
+             the <dd> rule needs no extra code here: it already falls out of
+             the `:end` case closing every still-open descendant above a
+             matched ancestor tag. This is the single most common real-world
+             definition-list pattern (`<dl><dt>term<dd>def<dt>term<dd>def</dl>`,
+             no explicit </dt>/</dd>); nothing broader (e.g. <dt>/<dd> mixed
+             with unrelated flow content) is in scope.
+     :tr     a new <tr> closes a currently open <tr>. Real HTML5's rule is
+             \"may be omitted if the tr element is immediately followed by
+             another tr element, or if there is no more content in the
+             parent element\" -- same shape as <li>, and the \"no more
+             content in parent\" half is likewise free via the `:end` case.
+     :td/:th table CELLS cross-close each other, same shape as <dt>/<dd>,
+             PLUS a new <tr> also closes a currently open cell -- real
+             HTML5: a <td>'s end tag \"may be omitted if the td element is
+             immediately followed by a td or th element, __or if there is
+             no more content in the parent tr element__\"; a <th>'s end tag
+             has the identical shape. This engine has no explicit
+             \"no more content in parent\" check the way the `:end` case
+             gives that for free elsewhere (a new <tr> is itself a START
+             tag, not the parent's end tag) -- so unlike every other entry
+             in this table, a new <tr> is included in <td>/<th>'s own
+             trigger sets below (`#{:td :th :tr}`) specifically to cover
+             that \"no more content\" half via the CASCADING pop this
+             table's consumer (`parse-into-document`'s `:start` case) now
+             performs: closing the open cell first exposes the enclosing
+             <tr> as the new stack top, which <tr>'s OWN entry then also
+             matches against the same incoming <tr> tag, closing that too.
+             This is the single most common real-world table pattern
+             (`<table><tr><td>A<td>B<tr><td>C</table>`, no explicit
+             </td>/</tr>) -- a genuinely severe gap before this entry
+             existed: without it, every cell after the first nested one
+             INSIDE the previous cell, and every row after the first nested
+             one inside the previous row's last cell, corrupting the whole
+             table's tree shape (confirmed by direct reproduction before
+             this fix, including the specific two-level cascading failure
+             mode: closing just the cell without also cascading into the
+             row left every row after the first still wrongly nested inside
+             the previous row's last cell). Implicit <tbody>/<thead>/<tfoot>
+             insertion and their own optional end tags are NOT in scope -- a
+             real, further gap, but a materially rarer real-world omission
+             than bare <tr>/<td>/<th>.
+
+   Deliberately NOT scanned up the stack in a single check: only the TOP of
+   the stack is ever examined at each step, matching the \"immediately
+   followed by\"/\"most recent\" framing above -- but `parse-into-document`
+   now REPEATS that single-top check in a loop, re-examining whatever new
+   tag is exposed after each pop, so a chain of matches (like <td>/<th> then
+   <tr>) can cascade while a chain that stops matching (like <td>/<th> then
+   whatever <tr>'s own PARENT is) correctly halts after the first pop. This
+   still matters for correctness, not just simplicity -- e.g. a new <li>
+   that opens inside a nested <ul> which itself sits inside an outer,
+   still-open <li> (a normal nested list) must NOT reach past the nested
+   <ul> to close the outer <li>. It doesn't: the nested <ul> is never a key
+   in this table at all, so the loop halts there regardless of how many
+   iterations it's allowed. Same reasoning applies to the cross-closing
+   <dt>/<dd> and <td>/<th> pairs, and to the new <td>/<th>->cascading-into-
+   <tr> chain: a <td> opening inside a NESTED <table> (itself inside an
+   outer, still-open <td>/<th> -- a real, if unusual, shape) must not reach
+   past the nested <table> to cross-close the outer cell/row. It doesn't,
+   for the same reason -- <table> is never a key here, so the loop halts
+   the moment the nested <table> is exposed as the new top, regardless of
+   how many cascading pops preceded it."
+  {:li #{:li}
+   :option #{:option :optgroup}
+   :optgroup #{:optgroup}
+   :p #{:address :article :aside :blockquote :details :div :dl :fieldset
+        :figcaption :figure :footer :form :h1 :h2 :h3 :h4 :h5 :h6 :header
+        :hgroup :hr :main :menu :nav :ol :p :pre :section :table :ul}
+   :dt #{:dt :dd}
+   :dd #{:dt :dd}
+   :tr #{:tr}
+   :td #{:td :th :tr}
+   :th #{:td :th :tr}})
+
+(def ^:private special-tags
+  "WHATWG's \"special\" category (13.2.4.2), minus the SVG/MathML members
+   this parser has no notion of.
+
+   It is what bounds a downward search of the stack of open elements. The
+   spec's own `<li>` loop reads: \"if node is in the special category, but
+   is not an address, div, or p element, then jump to the done step\" --
+   so the walk passes through FORMATTING and phrasing elements (`span`,
+   `em`, `b`, `code`) and through those three, and stops at everything
+   else.
+
+   Getting this wrong is not theoretical: a first attempt bounded the walk
+   by button SCOPE instead, which is the right bound for closing a `<p>`
+   but far too permissive for `<li>` -- `<ul><li>one<ul><li>inner` then
+   closed the OUTER `<li>` from inside the nested list, because a `<ul>`
+   is not a scope boundary. Two existing tests
+   (`li-auto-close-does-not-reach-past-a-nested-list`,
+   `dt-dd-auto-close-does-not-reach-past-a-nested-dl`) caught it
+   immediately, which is what they were written for."
+  #{:address :applet :area :article :aside :base :basefont :bgsound
+    :blockquote :body :br :button :caption :center :col :colgroup :dd
+    :details :dir :div :dl :dt :embed :fieldset :figcaption :figure
+    :footer :form :frame :frameset :h1 :h2 :h3 :h4 :h5 :h6 :head :header
+    :hgroup :hr :html :iframe :img :input :keygen :li :link :listing :main
+    :marquee :menu :meta :nav :noembed :noframes :noscript :object :ol :p
+    :param :plaintext :pre :script :section :select :source :style
+    :summary :table :tbody :td :template :textarea :tfoot :th :thead
+    :title :tr :track :ul :wbr :xmp})
+
+(def ^:private walk-through-tags
+  "The three special elements the spec's tag-omission walks pass THROUGH
+   rather than stop at."
+  #{:address :div :p})
+
+(defn- closeable-index-in-scope
+  "Index in `stack` of the innermost element the incoming `tag-kw` closes,
+   or nil if there is none within scope.
+
+   This is the half of the tag-omission rules that a stack-TOP-only check
+   cannot express. `<p>text <span>a <div>` has a `<p>` open, but `<span>`
+   is on top, so a top-only check sees nothing closeable and nests the
+   `<div>` inside the `<p>` -- which no browser does, and which was the
+   single reason `:block/nested-block-in-inline` sat in the sibling cssom
+   repo's GEOMETRY residual.
+
+   Measured in Brave 151 rather than derived from the prose: for
+   `<p>text <span>a <div>b</div> c</span> end</p>` the browser produces a
+   `<p>` holding `text ` and a `<span>` holding `a `, then a SIBLING
+   `<div>` -- the still-open `<span>` is popped along with the `<p>`, and
+   its remaining text lands outside both. That is what \"close a p
+   element\" does: generate implied end tags, then pop until the p itself
+   has been popped, taking every open element above it with it."
+  [document stack tag-kw]
+  (loop [i (dec (count stack))]
+    (when (pos? i)
+      (let [tag (get-in document [:nodes (nth stack i) :tag])]
+        (cond
+          (contains? (auto-close-tags tag) tag-kw) i
+          (and (contains? special-tags tag)
+               (not (contains? walk-through-tags tag))) nil
+          :else (recur (dec i)))))))
+
+(def ^:private foreign-root-tags
+  "Elements whose subtree is parsed as FOREIGN content (SVG or MathML)
+   rather than HTML."
+  #{:svg :math})
+
+(def ^:private html-integration-tags
+  "Foreign elements whose children are parsed as ordinary HTML again --
+   the spec's HTML integration points (plus the MathML text integration
+   points, which behave the same way for this parser's purposes).
+
+   Measured in Brave: `<svg><foreignObject><div>html</div></foreignObject>`
+   keeps the <div> INSIDE, in the HTML namespace, where the same <div>
+   directly inside <svg> breaks out."
+  #{:foreignobject :desc :title :mi :mo :mn :ms :mtext :annotation-xml})
+
+(def ^:private foreign-breakout-tags
+  "HTML start tags that terminate foreign content: the spec's list for
+   'any other start tag' in the in-foreign-content insertion mode. Seeing
+   one pops every open foreign element and re-processes the tag as HTML.
+
+   Measured in Brave rather than taken from memory -- and the measurement
+   corrected an assumption: `span` IS on this list, so
+   `<svg><circle></circle><span>in</span></svg>` puts the span OUTSIDE the
+   svg, not inside it as a foreign element. `<svg><g><div>x</div></g>tail`
+   pops the <g> as well, so the trailing text lands at top level rather
+   than back inside the svg."
+  #{:b :big :blockquote :body :br :center :code :dd :div :dl :dt :em :embed
+    :h1 :h2 :h3 :h4 :h5 :h6 :head :hr :i :img :li :listing :menu :meta
+    :nobr :ol :p :pre :ruby :s :small :span :strong :strike :sub :sup
+    :table :tt :u :ul :var})
+
+(defn- foreign-context?
+  "Whether the current insertion point is inside foreign content: the
+   nearest enclosing foreign root (<svg>/<math>) is not shadowed by an
+   HTML integration point."
+  [document stack]
+  (loop [i (dec (count stack))]
+    (when (pos? i)
+      (let [tag (get-in document [:nodes (nth stack i) :tag])]
+        (cond
+          (contains? html-integration-tags tag) false
+          (contains? foreign-root-tags tag) true
+          :else (recur (dec i)))))))
+
+(defn- pop-out-of-foreign
+  "Pops the stack until the insertion point is no longer foreign, for the
+   breakout rule. Never pops the root."
+  [document stack]
+  (loop [stack stack]
+    (if (and (> (count stack) 1) (foreign-context? document stack))
+      (recur (pop stack))
+      stack)))
+
+(defn- auto-close-stack
+  "Repeatedly pops `stack` while the incoming `tag-kw` closes something
+   open -- first the CURRENT top (see `auto-close-tags` for why a single
+   check isn't enough for the <td>/<th>->cascading-into-<tr> chain), then,
+   when the top itself is not closeable, the innermost closeable element
+   still within scope (see `closeable-index-in-scope`), popping everything
+   above it as a browser does. Never pops the root (index 0)."
+  [document stack tag-kw]
+  (loop [stack stack]
+    (cond
+      (and (> (count stack) 1)
+           (contains? (auto-close-tags (get-in document [:nodes (peek stack) :tag])) tag-kw))
+      (recur (pop stack))
+
+      :else
+      (if-let [i (closeable-index-in-scope document stack tag-kw)]
+        (recur (subvec stack 0 i))
+        stack))))
+
+;; ============================================================
+;; "In table" insertion: implied row structure + foster parenting
+;; (WHATWG §13.2.6.4.9-11 and §13.2.6.1)
+;;
+;; The spec expresses all of this through the insertion-mode state machine
+;; ("in table" / "in table body" / "in row" / "in cell", plus a foster
+;; parenting FLAG that those modes set before delegating to "in body").
+;; This parser has no insertion modes -- see the L2/L3 commentary further
+;; down -- so it reads the same information off the STACK OF OPEN ELEMENTS
+;; instead: the insertion point is "inside table structure" exactly when
+;; the current node (stack top) is one of `table`/`tbody`/`thead`/`tfoot`/
+;; `tr`, which is the same set the spec's own "appropriate place for
+;; inserting a node" tests for. That equivalence is what makes a stackful
+;; approximation honest here rather than a guess; where it stops being
+;; equivalent is written down at `table-cell-formatting-gap` below.
+
+(def ^:private table-context-tags
+  "The elements that, as the CURRENT NODE, mean the insertion point is
+   inside a table's own structure. Identical to the set WHATWG
+   §13.2.6.1 names when deciding whether foster parenting applies.
+
+   `td`/`th`/`caption` are deliberately absent: a cell (or a caption) is
+   an ordinary flow-content insertion point -- `<td><div>` nests, it does
+   not foster-parent -- which is why the spec gives cells their own
+   insertion mode rather than treating them as table structure."
+  #{:table :tbody :thead :tfoot :tr})
+
+(def ^:private table-content-tags
+  "Start tags that are ALLOWED to be inserted while the current node is one
+   of `table-context-tags`, so they nest normally instead of being
+   foster-parented out. Everything else -- every ordinary flow, phrasing
+   and formatting element -- is not allowed in table structure and gets
+   moved before the table (see `foster-parent-place`).
+
+   Measured in Brave 151 rather than read off the prose, one shape per
+   entry (`<table>X<tr><td>x</td></tr></table>`, X being the tag under
+   test): `caption`, `colgroup`, `col`, `tbody`, `thead`, `tfoot`, `tr`,
+   `td`, `th`, `style`, `script`, `template` and `form` all stayed inside
+   the `<table>`; `div`, `p`, `li`, `b`, `a`, `br` and a typed `<input>`
+   all came back out in front of it.
+
+   `:table` is NOT here on purpose, and is not foster-parented either --
+   it has its own rule, see `close-open-table-for-nested-table`."
+  #{:caption :colgroup :col :tbody :thead :tfoot :tr :td :th
+    :style :script :template :form})
+
+(defn- hidden-input?
+  "The one attribute-dependent member of `table-content-tags`. WHATWG's
+   \"in table\" mode keeps an `<input type=hidden>` inside the table (it
+   renders nothing, so its position is immaterial) and foster-parents
+   every other input. Measured: `<table><input type=\"hidden\" name=\"h\">
+   <tr>...` left the input as a child of the `<table>`, while
+   `<table><input type=\"text\">...` put it before the table."
+  [tag-kw attrs]
+  (and (= :input tag-kw)
+       (= "hidden" (some-> (:type attrs) str/lower))))
+
+(defn- innermost-index
+  "Index in `stack` of the innermost (topmost) open element whose tag is in
+   `tags`, or nil. Never matches the root at index 0."
+  [document stack tags]
+  (loop [i (dec (count stack))]
+    (when (pos? i)
+      (if (contains? tags (get-in document [:nodes (nth stack i) :tag]))
+        i
+        (recur (dec i))))))
+
+(defn- open-table-index [document stack] (innermost-index document stack #{:table}))
+
+(defn- in-table-context?
+  "Whether the current node is table structure, i.e. whether an insertion
+   here is subject to the allowed/foster-parented split above."
+  [document stack]
+  (contains? table-context-tags (get-in document [:nodes (peek stack) :tag])))
+
+(defn- child-holder-id
+  "The element that actually holds `child-id` as a child. Checks the open
+   elements from the top down first (O(depth), and the answer for every
+   node inserted at the current insertion point), falling back to a scan of
+   the whole document only for a node that was itself foster-parented and
+   therefore does NOT live under the element below it on the stack."
+  [document stack child-id]
+  (or (some (fn [id]
+              (when (some #{child-id} (get-in document [:nodes id :children])) id))
+            (reverse stack))
+      (parent-node-id document child-id)))
+
+(defn- foster-parent-place
+  "WHATWG §13.2.6.1, \"the rules for inserting a node into a foster
+   parent\": `[parent-id before-id]`, i.e. immediately BEFORE the innermost
+   open `<table>` inside that table's own parent. nil when no table is
+   open (nothing to foster out of).
+
+   Measured, and it is the part the prose makes easy to get wrong: the
+   foster parent is the TABLE'S parent, not the document root and not the
+   nearest non-table ancestor on the stack. `<div><table>stray<tr><td>x`
+   puts `stray` inside the `<div>`, before the `<table>`; `<td><table>inner
+   <tr><td>y` puts `inner` inside the enclosing outer `<td>`. Both come
+   out wrong if the fostered node is simply appended somewhere higher."
+  [document stack]
+  (when-let [i (open-table-index document stack)]
+    (let [table-id (nth stack i)]
+      [(child-holder-id document stack table-id) table-id])))
+
+(defn- insert-node
+  "Append `node-id` at the current insertion point, or -- when `foster?` --
+   at the foster parent instead. The single place this file turns \"where
+   does this node go\" into a DOM mutation, so text nodes, elements and
+   reconstructed formatting elements cannot disagree about it."
+  [document stack node-id foster?]
+  (let [parent (peek stack)]
+    (cond
+      ;; A <template>'s contents are not its children: they go into its
+      ;; content fragment (kotoba.wasm.dom/append-content-child). Measured
+      ;; in Brave across four shapes -- a plain template, one inside a
+      ;; table, a nested template, bare text -- `template.childNodes.length`
+      ;; is 0 in every one.
+      ;;
+      ;; Checked BEFORE foster parenting on purpose: a template is allowed
+      ;; inside a table, and its contents stay in it. `<table><template>
+      ;; <td>x</td></template></table>` keeps the <td> in the fragment
+      ;; rather than fostering it out in front of the table.
+      (= :template (get-in document [:nodes parent :tag]))
+      (dom/append-content-child document parent node-id)
+
+      :else
+      (if-let [[parent-id before-id] (and foster? (foster-parent-place document stack))]
+        (dom/insert-before document parent-id node-id before-id)
+        (dom/append-child document parent node-id)))))
+
+(def ^:private ascii-whitespace-only
+  "A text run made ENTIRELY of HTML's own ASCII whitespace, which \"in
+   table\" keeps inside the table instead of foster-parenting it.
+
+   Spelled out rather than `\\s` or `str/blank?` for the same reason the
+   collapsing class in `parse-into-document` is: both of those also match
+   U+00A0 NO-BREAK SPACE, and a `&nbsp;` is NOT whitespace to this rule.
+   Measured: `<table>\\n<tr><td>a</td></tr>\\n</table>` leaves both newlines
+   inside the table (the first as a child of `<table>`, the second of the
+   implied `<tbody>`), while `<table>&nbsp;<tr>...` foster-parents the
+   no-break space out in front of the table. A run that is only PARTLY
+   whitespace goes out whole: `<table> x <tr>` fosters `\" x \"`, spaces
+   included -- which falls out for free here, because this parser's
+   tokenizer emits one text token per contiguous run, the same granularity
+   as the spec's \"pending table character tokens\" buffer."
+  #"[ \t\n\f\r]*")
+
+(defn- foster-parented-text?
+  [document stack text]
+  (and (in-table-context? document stack)
+       (not (re-matches ascii-whitespace-only text))))
+
+(defn- foster-parented-element?
+  [document stack tag-kw attrs]
+  (and (in-table-context? document stack)
+       (not (contains? table-content-tags tag-kw))
+       (not= :table tag-kw)
+       (not (hidden-input? tag-kw attrs))))
+
+(def ^:private table-clear-targets
+  "Where an incoming table-structure start tag pops the stack back to,
+   before it is inserted -- WHATWG's three \"clear the stack back to a
+   table X context\" steps, as the set of tags each one stops at.
+
+   Without this, foster parenting alone is not enough: a foster-parented
+   element stays ON the stack of open elements (foster parenting moves
+   where a node is inserted, never whether it is open), so
+   `<table><div>d<tr><td>x` would try to open the row inside the still-open
+   `<div>`. Measured -- `<b>bold</b>` comes out in front of the table and
+   the row structure is built inside it regardless of the unclosed `<b>`.
+
+   Only consulted when a `<table>` is actually open (see
+   `clear-to-table-context`): a stray `<tr>`/`<td>` outside any table is a
+   different spec rule (in-body ignores it) that this parser does not
+   implement, and popping the stack for one would be a behaviour change
+   with no table anywhere to justify it."
+  {:caption  #{:table}
+   :colgroup #{:table}
+   ;; A `<col>` is the one table-structure tag that can arrive with its own
+   ;; wrapper already open, so `:colgroup` is a stop as well as `:table`:
+   ;; consecutive bare `<col>`s must share ONE synthesised colgroup, and
+   ;; popping to the table between them would give each its own. Measured
+   ;; in Brave 151 (2026-08-05), `<table><col><col><col><tr><td>a` is one
+   ;; `colgroup` holding three `col`s. The `:table` stop is what puts a
+   ;; `<col>` that arrives AFTER a row back at table level:
+   ;; `<table><tr><td>a</td></tr><col>` gives `tbody` then a SIBLING
+   ;; `colgroup`, and `<table><thead>...</thead><col><tbody>...` gives
+   ;; thead, colgroup, tbody -- both measured.
+   :col      #{:colgroup :table}
+   :tbody    #{:table}
+   :thead    #{:table}
+   :tfoot    #{:table}
+   ;; "clear the stack back to a table body context"
+   :tr       #{:tbody :thead :tfoot :table}
+   ;; "clear the stack back to a table row context" -- with the row-group
+   ;; and table stops folded in, because a cell arriving in either of those
+   ;; contexts is defined by the spec as "act as if a <tr> start tag had
+   ;; been seen, then reprocess", which lands on the same place.
+   :td       #{:tr :tbody :thead :tfoot :table}
+   :th       #{:tr :tbody :thead :tfoot :table}})
+
+(defn- clear-to-table-context
+  [document stack tag-kw]
+  (if-let [targets (get table-clear-targets tag-kw)]
+    ;; A <template> is a BARRIER: its contents are parsed in their own
+    ;; insertion mode, so a table-structure tag inside one neither pops the
+    ;; template nor reaches the table around it. Without this the template
+    ;; was popped before its own <td> arrived, and the table then
+    ;; scaffolded tbody/tr/td as a SIBLING of the template -- measured, and
+    ;; the reason `:template/in-a-table` still failed after the content
+    ;; fragment itself worked.
+    (if (and (open-table-index document stack)
+             (not (contains? (set (map #(get-in document [:nodes % :tag]) stack))
+                             :template)))
+      (if-let [i (innermost-index document stack targets)]
+        (subvec stack 0 (inc i))
+        stack)
+      stack)
+    stack))
+
+(defn- close-open-table-for-nested-table
+  "A `<table>` start tag while the insertion point is inside table
+   structure closes the open table rather than nesting inside it (WHATWG
+   \"in table\": parse error, act as if a `</table>` end tag had been
+   seen, then reprocess).
+
+   Measured: `<table><table><tr><td>x</td></tr></table>` gives a browser
+   TWO sibling tables -- the first empty, the second holding the row --
+   not one inside the other. A `<table>` inside a CELL is untouched by
+   this, because a cell is not `table-context-tags`, which is what makes
+   ordinary nested tables (`<td><table>...`) still nest.
+
+   Guarded on an open table actually EXISTING, not just on the current
+   node looking like table structure: `<tr><table>x</table>` (a stray
+   `<tr>` at top level with no table anywhere -- rubbish, but reachable
+   input) leaves a `tr` as the current node with nothing to close, and
+   without this guard the index lookup returns nil and the subvec throws.
+   Nothing else in this block has the same hole: `clear-to-table-context`
+   carries the same guard for its own reason, and `foster-parent-place`
+   returns nil, which `insert-node` reads as \"append normally\"."
+  [document stack tag-kw]
+  (if-let [i (and (= :table tag-kw)
+                  (in-table-context? document stack)
+                  (open-table-index document stack))]
+    (subvec stack 0 i)
+    stack))
+
+(defn- maybe-insert-implied-table-structure
+  "Real HTML5's table insertion modes synthesise the row structure an
+   author left out: a `<tbody>` for a `<tr>` that has none, and both a
+   `<tbody>` and a `<tr>` for a bare `<td>`/`<th>`.
+
+   The `<tbody>` half is the single most common real-world table shape,
+   rows with no row-group wrapper at all (`<table><tr>...</tr><tr>...</tr>
+   </table>`). Without it every `<tr>` nests directly under `<table>`,
+   which is a genuinely visible, reachable bug rather than a DOM-purity
+   nicety: a `table > tr` CSS child-combinator selector wrongly MATCHED
+   (confirmed by direct reproduction), when real HTML5/CSS never lets it
+   -- a real tr's parent is always a row group -- while the equally common
+   `tbody > tr` selector wrongly never matched a bare table's own rows.
+
+   The `<tr>` half covers `<table><td>x</td></table>` and
+   `<table><tbody><td>x</td></tbody></table>`, both of which a browser
+   completes into `tbody`/`tr`/`td` (measured); it was called out as a
+   deliberate omission here until the conformance harness sized it.
+
+   A second, third, etc. `<tr>` correctly reuses the SAME already-open
+   row group instead of inserting another one, because
+   `clear-to-table-context` pops a `<tr>` back to its row group and stops
+   there -- so the stack top is that group, not the table, and neither
+   branch below fires."
+  [document stack tag-kw]
+  (letfn [(open [document stack tag]
+            (let [[id document] (dom/create-element document tag)]
+              [(dom/append-child document (peek stack) id) (conj stack id)]))
+          (top [document stack] (get-in document [:nodes (peek stack) :tag]))]
+    (cond
+      ;; Inside a <template>, nothing is scaffolded. A template's contents
+      ;; are parsed in their own insertion mode and land in its content
+      ;; fragment, so a bare <td> there stays a bare <td>. Measured in
+      ;; Brave: `<table><template><td>x</td></template></table>` gives a
+      ;; template whose content is a single <td> -- no tbody, no tr, and
+      ;; the template itself is not foster-parented out of the table.
+      (= :template (top document stack))
+      [document stack]
+      (and (= tag-kw :tr) (= :table (top document stack)))
+      (open document stack :tbody)
+
+      ;; A bare `<col>` gets the `<colgroup>` real HTML5 inserts around it
+      ;; ("in table" mode: insert a colgroup with no attributes, switch to
+      ;; "in column group", reprocess). Measured in Brave 151 (2026-08-05),
+      ;; `<table><col style="width:200px"><col><tr><td>a</td><td>b</td>` is
+      ;; table > colgroup > col,col + tbody > tr > td,td -- this parser had
+      ;; the two `col`s directly under the `table` and no colgroup at all,
+      ;; which cssom's conformance corpus scored as one box the browser has
+      ;; and this side has not, plus 14 computed-style values it could not
+      ;; zip against anything.
+      ;;
+      ;; No `<colgroup>` is opened when one already IS open -- see
+      ;; table-clear-targets, which stops there for a `:col` so the second
+      ;; and third bare `<col>` land in the first one's group. An explicit
+      ;; `<colgroup></colgroup>` followed by a bare `<col>` gets TWO
+      ;; colgroups (measured), which falls out of the same rule: the
+      ;; explicit one was popped by its own end tag.
+      (and (= tag-kw :col) (= :table (top document stack)))
+      (open document stack :colgroup)
+
+      (contains? #{:td :th} tag-kw)
+      (let [[document stack] (if (= :table (top document stack))
+                               (open document stack :tbody)
+                               [document stack])]
+        (if (contains? #{:tbody :thead :tfoot} (top document stack))
+          (open document stack :tr)
+          [document stack]))
+
+      :else [document stack])))
+
+(defn- inserted-by-table-mode?
+  "Whether this start tag is being inserted by the TABLE insertion modes
+   rather than by \"in body\" -- which is what decides whether the
+   \"reconstruct the active formatting elements\" step runs at all.
+
+   None of \"in table\", \"in table body\" or \"in row\" reconstructs;
+   only \"in body\" (and \"in cell\", which delegates to it) does. Getting
+   this wrong is not subtle. Measured, before this predicate existed and
+   with foster parenting already in: `<table><b>bold<tr><td>x</td></tr>
+   </table>` put the entire `<tr>` -- row, cell and text -- inside a
+   freshly reconstructed `<b>` in FRONT of the table, and left the
+   `<table>` holding nothing but an empty `<tbody>`. The reconstruction
+   fired because `clear-to-table-context` had just popped the still-open
+   `<b>` off the stack, which is exactly what makes the list of active
+   formatting elements look like it needs rebuilding."
+  [document stack tag-kw]
+  (and (in-table-context? document stack)
+       (contains? table-content-tags tag-kw)))
+
+;; ------------------------------------------------------------
+;; Formatting still open when a table cell is entered WAS the scope cut
+;; written at this boundary: `<table><b>bold<tr><td>x` put a `<b>` around
+;; the cell's text where a browser leaves a bare `#text "x"`, because
+;; there were no scope markers in the list of active formatting elements
+;; and the still-listed `<b>` was reconstructed on entry to the cell.
+;; Foster parenting is what made it reachable, which is why it was written
+;; down here.
+;;
+;; It is closed. The markers are implemented as `afe-marker-tags` /
+;; `afe-marker` / `prune-cleared-markers` in the formatting section below,
+;; which is where the change belonged -- it is a change to the formatting
+;; algorithms, not to table handling, and nothing in THIS block moved.
+
+;; `preserve-whitespace-context?` USED TO LIVE HERE and is deliberately
+;; gone. It answered "is the current stack one where text must stay
+;; verbatim" -- a raw-text tag, or anywhere inside a `<pre>` -- and it was
+;; the switch that decided whether the tree builder's :text branch
+;; collapsed runs of spaces.
+;;
+;; It is dead because that branch no longer collapses anything in any
+;; context (see the :text case in `parse-into-document` for the browser
+;; measurements that removed it), so every context is now the preserving
+;; one and there is nothing left to ask.
+;;
+;; Worth naming what its removal does NOT change: `<pre>` is still special,
+;; and so are the raw-text tags. `<pre>`'s single leading newline is still
+;; dropped in the :start branch, `<textarea>`'s in `tokenize`, and raw text
+;; still bypasses tag scanning entirely. What is no longer true is that
+;; `<pre>` is the only place a space run survives -- it survives
+;; everywhere, and `white-space` decides what is done with it.
+
+;; ============================================================
+;; Active formatting elements + adoption agency (WHATWG §13.2.4.3, §13.2.6.4.7)
+;;
+;; L2: the real WHATWG algorithms for mis-nested formatting elements, layered
+;; on the existing subset tokenizer + auto-closing tree builder. They operate
+;; within the engine's :document-root document model -- NO html/head/body
+;; synthesis (that is an L3 architectural change requiring downstream
+;; coordination in cssom/layout/dom-bridge, which all assume content nests
+;; directly under :document). They activate only on mis-nested input;
+;; well-formed HTML parses byte-identically to before, so the existing 133-
+;; test suite is a regression gate.
+;;
+;; In scope (L2): the list of active formatting elements with the Noah's Ark
+;; clause; reconstruct active formatting elements; the adoption agency
+;; algorithm's no-furthest-block path (steps 1-8 + the any-other-end-tag
+;; fallback), which correctly handles the common mis-nested formatting shapes
+;; real browsers fix (<b>p<i>s</b>e</i> -> <b>p<i>s</i></b><i>e</i>;
+;; <b>x<i>y</b>z -> <b>x<i>y</i></b><i>z</i>; <div><b>x</div>y reopens b).
+;;
+;; Deliberately deferred to L3 (documented honest cuts, same convention as
+;; `auto-close-tags`): the adoption agency's furthest-block reparenting path
+;; (steps 9-19 -- rare block-in-inline like <b><p>x</b>, falls back to naive
+;; nesting here, no crash); the full 23-mode insertion-mode state machine;
+;; html/head/body synthesis; template/select/frameset modes; the `a`/`nobr`
+;; in-scope special cases; "generate implied end tags" for the
+;; any-other-end-tag path.
+;;
+;; Foster parenting (in-table) WAS on this list and no longer is: it is
+;; implemented above, against measured browser behaviour rather than the
+;; prose, without the insertion-mode machine -- the stack of open elements
+;; carries the same information for this one decision, and the block says
+;; where that equivalence stops.
+;;
+;; Scope MARKERS were on it too, and are likewise implemented -- see
+;; `afe-marker-tags` -- by the same move: a marker stays live exactly as
+;; long as its element is on the stack of open elements, so "clear the list
+;; up to the last marker" needs no insertion modes and no threading of the
+;; afe list through the four places a cell can be popped. What is NOT
+;; implemented is the marker for `applet`/`marquee`/`object`/`template`,
+;; and that set's docstring says why (no probe distinguishes them).
+
+(def ^:private ignored-structure-tags
+  "Start and end tags dropped outright in FRAGMENT parsing, with their
+   contents continuing in the current parent.
+
+   `parse-into-document` parses a fragment (this file has no html/head/body
+   synthesis at all -- a documented scope cut), and in a fragment these tags
+   name a structure that already exists. Measured in Brave:
+   `<div><body>x</body></div>` is a `<div>` holding the text, with no body
+   element anywhere and the attributes on it discarded, and
+   `<div><head><title>t</title></head>y</div>` drops the `<head>` while
+   KEEPING the `<title>` -- i.e. the tag is ignored, its content is not."
+  #{:html :head :body})
+
+(defn- close-open-anchor
+  "An `<a>` start tag while another `<a>` is open closes it (WHATWG in-body:
+   parse error, run the adoption agency for `a`, then remove that element
+   from the afe list and the stack).
+
+   Measured in Brave: `<a href=/1>1<a href=/2>2</a>` gives two SIBLING
+   anchors, not a nested pair -- and with intervening markup,
+   `<a>one<b>bold</b><a>two</a>tail` keeps `<b>bold</b>` inside the first
+   anchor while the second is its sibling.
+
+   This is the narrow, stack-top-and-below form of the rule rather than the
+   full adoption agency run: the anchor is popped along with anything still
+   open inside it, which is what the measured shapes show. A case where an
+   anchor is mis-nested with a still-open formatting element that must be
+   reconstructed AFTER it is not covered -- the general algorithm is
+   `adoption-agency`, and this predates a reason to route `a` through it."
+  [document stack afe]
+  (if-let [i (loop [i (dec (count stack))]
+               (when (pos? i)
+                 (if (= :a (get-in document [:nodes (nth stack i) :tag]))
+                   i
+                   (recur (dec i)))))]
+    (let [closed (set (subvec stack i))]
+      [(subvec stack 0 i)
+       (vec (remove #(contains? closed %) afe))])
+    [stack afe]))
+
+(defn- normalize-structure-tokens
+  "Two token-level rules from WHATWG's in-body insertion mode, applied
+   before the tree builder sees the stream because neither depends on the
+   stack:
+
+   1. **`</br>` is a START tag.** The spec says an end tag for `br` is a
+      parse error handled by acting as if a `<br>` START tag had been seen.
+      Measured in Brave: `<p>a<br></br>b</p>` produces TWO `<br>`s, and
+      `<p>x</br>y</p>` produces one. It is specific to `br` -- `</img>` is
+      ignored (measured: `<p>a<img></img>b</p>` has a single `<img>`).
+
+   2. **`html`/`head`/`body` tags are dropped in a fragment**, start and
+      end alike, while their contents continue in the current parent (see
+      `ignored-structure-tags`)."
+  [tokens]
+  (keep (fn [{:keys [type tag] :as token}]
+          (let [tag-kw (keyword tag)]
+            (cond
+              (contains? ignored-structure-tags tag-kw) nil
+              (and (= :end type) (= :br tag-kw)) {:type :start :tag "br" :attrs {} :self? true}
+              :else token)))
+        tokens))
+
+(def ^:private formatting-tags
+  "WHATWG §13.2.4.2 'Formatting' category -- start tags that push onto the
+  list of active formatting elements; end tags that run the adoption agency
+  algorithm."
+  #{:a :b :big :code :em :font :i :nobr :s :small :strike :strong :tt :u})
+
+(def ^:private scope-tags
+  "Default scope boundaries (WHATWG §13.2.4.2 'has an element in scope'), HTML
+  namespace only. The :document root (stack index 0) acts as the scope ceiling
+  in lieu of an html element."
+  #{:applet :caption :html :table :td :th :marquee :object :select :template})
+
+(defn- tag-of [document id] (get-in document [:nodes id :tag]))
+
+(def ^:private afe-marker-tags
+  "Start tags that push a MARKER onto the list of active formatting
+   elements (WHATWG §13.2.4.3). A marker is a floor: \"reconstruct the
+   active formatting elements\" never walks back past one, the adoption
+   agency never looks for its formatting element past one, and closing the
+   element that pushed it clears the list back to it.
+
+   That is what keeps formatting out of table cells. Measured in Brave 151:
+   `<table><b>bold<tr><td>x` gives the cell a bare `#text \"x\"` -- the `<b>`
+   is still open, and is still foster-parented out in front of the table,
+   but it does not come back inside the cell. And the marker is what makes
+   the CLEARING observable in the other direction:
+   `<b>a<table><tr><td><i>b</td><td>c</table>d` puts `<i>b</i>` in the first
+   cell, a bare `#text \"c\"` in the second (the `<i>` was cleared when the
+   first cell closed) and `#text \"d\"` inside the `<b>` but NOT inside an
+   `<i>` (the `<b>`, pushed BEFORE the marker, survives). One rule explains
+   all three.
+
+   The spec's list also has `applet`, `marquee`, `object` and `template`,
+   and they are deliberately NOT here. Each of those four RECONSTRUCTS
+   before it inserts itself (measured -- `<div><em>x</div><applet>y</applet>`
+   puts the `<applet>` inside a reopened `<em>`), which puts the formatting
+   element back on the stack of open elements, at which point every later
+   reconstruction inside the element is a no-op whether a marker exists or
+   not. So no probe distinguishes them, and adding them on the strength of
+   the prose alone would be an unmeasured claim in a set whose whole value
+   is that it is measured. `template` has a second reason: its content
+   belongs in a separate document fragment, which this parser does not
+   model at all (a browser reports `<template>` with no children; this
+   parser nests them), so its marker is not the interesting difference
+   there."
+  #{:td :th :caption})
+
+(defn- afe-marker
+  "A marker, tagged with the id of the element that pushed it.
+
+   Carrying the id is what lets the marker be REMOVED without threading the
+   afe list through every place a cell can be popped -- and a cell can be
+   popped from four of them (`auto-close-stack` on a sibling cell,
+   `clear-to-table-context`, `close-open-table-for-nested-table`, and the
+   `:end` case), none of which sees the afe list today. Instead the marker
+   stays live exactly as long as its element is on the stack of open
+   elements, and `prune-cleared-markers` does the spec's \"clear the list of
+   active formatting elements up to the last marker\" when it is not. Same
+   move as the rest of the table handling in this file: read the answer off
+   the stack of open elements rather than off insertion modes this parser
+   does not have."
+  [id]
+  [::marker id])
+
+(defn- marker? [e] (and (vector? e) (= ::marker (first e))))
+
+(defn- prune-cleared-markers
+  "WHATWG's \"clear the list of active formatting elements up to the last
+   marker\", applied lazily: a marker whose element is no longer on the
+   stack of open elements has had its element closed, so it and everything
+   pushed after it are dropped.
+
+   Called before the afe list is read and before it is extended, which
+   keeps the invariant that a dead marker is always the LAST marker -- so
+   cutting at the first dead one cannot discard a live marker pushed after
+   it. (A cell only opens through the `:start` case, which prunes first.)
+
+   Takes only the stack: unlike the other afe helpers this needs no
+   `document`, because a marker carries its element's id directly and the
+   only question is whether that id is still open."
+  [stack afe]
+  (let [afe (vec afe)
+        on-stack? (fn [id] (some #(= % id) stack))
+        dead (first (keep-indexed (fn [i e]
+                                    (when (and (marker? e) (not (on-stack? (second e))))
+                                      i))
+                                  afe))]
+    (if dead (subvec afe 0 dead) afe)))
+
+(defn- afe-segment-start
+  "Index just past the last marker -- the start of the segment the spec's
+   afe operations are scoped to (\"between the end of the list and the last
+   marker in the list, if any, or the start of the list otherwise\")."
+  [afe]
+  (or (some (fn [i] (when (marker? (nth afe i)) (inc i)))
+            (range (dec (count afe)) -1 -1))
+      0))
+
+(defn- push-afe
+  "Push `id` onto the afe list with the Noah's Ark clause (WHATWG §13.2.4.3):
+  if there are already three entries with the same tag, remove the earliest
+  before adding. The clause counts only the entries AFTER the last marker,
+  which is what the spec means by 'in the list' there."
+  [document afe id]
+  (let [afe (vec afe)
+        tag (tag-of document id)
+        same-tag (filter #(= (tag-of document %) tag)
+                         (subvec afe (afe-segment-start afe)))]
+    (if (>= (count same-tag) 3)
+      (conj (vec (remove #(= % (first same-tag)) afe)) id)
+      (conj afe id))))
+
+(defn- in-scope?
+  "WHATWG 'has an element in scope' (default scope): scan the stack from the
+  current node (top) toward the root; match if `target-tag` is found before
+  any scope boundary. The :document root (index 0) is the scope ceiling."
+  [document stack target-tag]
+  (loop [i (dec (count stack))]
+    (when (>= i 0)
+      (let [t (tag-of document (nth stack i))]
+        (cond
+          (= t target-tag) true
+          (= i 0) false
+          (contains? scope-tags t) false
+          :else (recur (dec i)))))))
+
+(defn- insert-element-for-token
+  "Create a new element with `src-id`'s tag and attrs ('an element for the
+  token for which src-id was created'), insert it at the appropriate place
+  for the current `stack`, return [new-id document]. Used by
+  reconstruct-active-formatting.
+
+  Goes through `insert-node` rather than appending directly, so a
+  formatting element reopened while the insertion point is inside table
+  structure is foster-parented like any other -- `<table>a<b>c</b>d<tr>`
+  puts `a`, `<b>c</b>` and `d` all in front of the table, and reopening
+  the `<b>` inside the table would have put it back in."
+  [document stack src-id]
+  (let [tag (tag-of document src-id)
+        [new-id document] (dom/create-element document tag)
+        document (insert-node document stack new-id (in-table-context? document stack))
+        document (apply-attrs document new-id (get-in document [:nodes src-id :attrs]))]
+    [new-id document]))
+
+(defn- reconstruct-active-formatting
+  "WHATWG §13.2.4.3. Reopens formatting elements that are in the afe list but
+  no longer on the stack of open elements (they were implicitly closed by an
+  end tag for an ancestor), so subsequent text/elements inherit the active
+  formatting. No-op when the list is empty, when the last entry is a marker
+  (the spec's step 2), or when the last entry is already on the stack.
+
+  Prunes markers whose element has closed first, so the pruned list is what
+  every caller gets back -- this is the one place the spec's 'clear the list
+  up to the last marker' actually happens (see `afe-marker`). Returns
+  [document stack afe]."
+  [document stack afe]
+  (let [v (prune-cleared-markers stack afe)
+        n (count v)]
+    (if (or (zero? n)
+            (marker? (peek v))
+            (some #(= % (peek v)) stack))
+      [document stack v]
+      (let [in-stack? (fn [e] (some #(= % e) stack))
+            ;; rewind: largest index < n-1 whose entry is in the stack OR is
+            ;; a marker (reconstruction never walks back past one); entries
+            ;; after it need reconstruction. -1 if none (reconstruct from 0).
+            boundary (loop [i (- n 2)]
+                       (cond
+                         (< i 0) -1
+                         (marker? (nth v i)) i
+                         (in-stack? (nth v i)) i
+                         :else (recur (dec i))))
+            from (inc boundary)]
+        (loop [document document stack stack v v i from]
+          (if (>= i n)
+            [document stack v]
+            (let [old-id (nth v i)
+                  [new-id document] (insert-element-for-token document stack old-id)]
+              (recur document (conj stack new-id) (assoc v i new-id) (inc i)))))))))
+
+(def ^:private no-reconstruct-start-tags
+  "Start tags whose \"in body\" rule does NOT include the \"reconstruct the
+   active formatting elements\" step.
+
+   Reconstruction is the default -- character tokens take it, and so does
+   the \"any other start tag\" rule that catches everything unrecognised --
+   but a large minority of start tags carry their own in-body rule, and
+   those rules simply do not list the step. Taking it anyway nests the new
+   element inside a formatting element the browser leaves closed:
+   `<p>lead <em>emph <ul>` reopened the `<em>` and put the `<ul>` inside
+   it, where a browser makes the `<ul>` a sibling at depth 0 and reopens
+   the `<em>` only for the TEXT inside the list -- which is a character
+   token, so it reconstructs, and the `:text` case above still does.
+
+   MEASURED tag by tag in Brave 151, not read off the prose, with
+   `<div><em>x</div><TAG>`: after the `</div>` the `<em>` is in the list of
+   active formatting elements but off the stack of open elements, so
+   whether the next start tag reconstructs is directly visible -- a
+   reconstructing tag lands INSIDE a freshly reopened `<em>`, a
+   non-reconstructing one stays a sibling at depth 0. 93 tags were probed:
+   58 came back as siblings and are below (`h3`/`h4`/`h5` are folded in
+   with the `h1`/`h2`/`h6` that were probed, sharing one spec rule, which
+   is what makes the set 61); 25 came back nested and are deliberately
+   absent; 10 produced an empty tree, which is the next paragraph.
+
+   The rule is NOT \"the tags that close an open `<p>`\", in BOTH
+   directions -- which is why this is its own set rather than a reuse of
+   `auto-close-tags`' `:p` entry:
+
+     - WIDER. `li`/`dd`/`dt` do close a p, but through their own rules
+       rather than that entry. And `textarea`, `iframe`,
+       `noembed`/`noframes`/`noscript`, `plaintext`,
+       `param`/`source`/`track`, `rb`/`rt`/`rp`/`rtc` and the head-ish
+       elements (`base`, `basefont`, `bgsound`, `link`, `meta`, `script`,
+       `style`, `template`, `title`) do not close a p at all, and not one
+       of them reconstructs.
+     - NARROWER. `xmp` closes a p AND reconstructs -- measured, and the
+       spec agrees: its rule lists the step explicitly, unlike the
+       `pre`/`listing` rule right next to it. `button` is the same shape
+       for the button it closes. Both are absent below, so both keep the
+       reconstruction they are supposed to have, and both already matched
+       the browser before this set existed.
+
+   Deliberately NOT here, though a browser never reconstructs for them
+   either: the table-structure tags (`caption`, `colgroup`, `col`,
+   `tbody`/`thead`/`tfoot`, `tr`, `td`, `th`) and the document-structure
+   tags (`html`, `head`, `body`, `frameset`, `frame`). In table context the
+   first group is already exempt via `inserted-by-table-mode?`, which
+   carries its own measured evidence. OUTSIDE table context a browser
+   IGNORES both groups entirely -- the probe returned an empty tree, which
+   measures \"the token was dropped\", not \"reconstruction was skipped\" --
+   so there is no oracle for what this parser, which does insert them,
+   should do instead. That is a separate and still unmeasured gap
+   (`:misc/body-tag-in-flow` is its corpus witness); it is left alone
+   rather than guessed at.
+
+   `noscript` is measured with scripting ENABLED, which is what the oracle
+   runs. With scripting disabled its in-body rule is \"any other start
+   tag\", which does reconstruct. This parser has no scripting flag, so it
+   follows the oracle."
+  #{:address :article :aside :base :basefont :bgsound :blockquote :center
+    :dd :details :dialog :dir :div :dl :dt :fieldset :figcaption :figure
+    :footer :form :h1 :h2 :h3 :h4 :h5 :h6 :header :hgroup :hr :iframe :li
+    :link :listing :main :menu :meta :nav :noembed :noframes :noscript :ol
+    :p :param :plaintext :pre :rb :rp :rt :rtc :script :search :section
+    :source :style :summary :table :template :textarea :title :track :ul})
+
+(defn- start-tag-reconstructs?
+  "Whether the \"reconstruct the active formatting elements\" step runs
+   before this start tag is inserted. It is the default, and both
+   exemptions this parser carries are subtracted here:
+
+     - a CONTEXT rule -- the table insertion modes never take the step
+       (`inserted-by-table-mode?`);
+     - a TAG rule -- neither do the in-body start tags with their own
+       non-reconstructing rule (`no-reconstruct-start-tags`).
+
+   The two overlap on `form`/`script`/`style`/`template` and are kept
+   separate anyway: they answer different questions, they were measured
+   independently, and folding them together would put table-structure tags
+   under a rule whose evidence does not cover them (see the second set's
+   docstring)."
+  [document stack tag-kw]
+  (not (or (inserted-by-table-mode? document stack tag-kw)
+           (contains? no-reconstruct-start-tags tag-kw))))
+
+(defn- adoption-agency
+  "WHATWG §13.2.6.4.7 adoption agency algorithm for an end tag whose tag name
+  is `subject` (a formatting element). Handles mis-nested formatting.
+
+  L2 implements steps 1-8 (the no-furthest-block path) + the any-other-end-tag
+  fallback (step 4.3): this correctly handles every case where no special
+  (block) element sits between the formatting element and the current node --
+  i.e. the common real-world mis-nesting. When a furthest block IS present
+  (rare block-in-inline like <b><p>x</b>), L2 falls back to the no-furthest-
+  block behavior (pop to the formatting element, remove it from the afe list)
+  rather than the full reparenting path (steps 9-19, deferred to L3): the
+  result is naive L1 nesting for that rare shape, never a crash. (The full
+  AAA's 8-iteration outer loop is unnecessary here because both L2 paths
+  return after a single pass; it returns with the reparenting path at L3.)
+  Returns [document stack afe]."
+  [document stack afe subject]
+  (let [stack (vec stack)
+        afe (prune-cleared-markers stack afe)
+        current (peek stack)]
+    (if (and (= (tag-of document current) subject)
+             (not (some #(= % current) afe)))
+      ;; step 2: current node is subject and not in afe -> pop, return.
+      [document (pop stack) afe]
+      (let [;; step 4.3: formattingElement = the last entry with tag subject
+            ;; "between the end of the list and the last marker in the list,
+            ;; if any" -- so formatting opened before a cell was entered is
+            ;; invisible to an end tag inside that cell, and falls through to
+            ;; the any-other-end-tag path below exactly as the spec says.
+            fmt (last (filter #(= (tag-of document %) subject)
+                              (subvec afe (afe-segment-start afe))))]
+        (if (nil? fmt)
+          ;; no formatting element -> any-other-end-tag: pop to subject.
+          (let [match-idx (find-top-match-index document stack subject)]
+            [document (if match-idx (subvec stack 0 match-idx) stack) afe])
+          (let [fmt-idx (.indexOf stack fmt)]
+            (cond
+              ;; step 4: fmt not in stack -> remove from afe, return.
+              (neg? fmt-idx)
+              [document stack (vec (remove #(= % fmt) afe))]
+              ;; step 5: fmt not in scope -> return.
+              (not (in-scope? document stack subject))
+              [document stack afe]
+              ;; L2: step 7's furthestBlock search + step 8 (no furthest block)
+              ;; and the furthest-block fallback (full reparenting steps 9-19,
+              ;; deferred to L3) all collapse to the same action here -- pop to
+              ;; fmt and remove fmt from the afe list.
+              :else
+              [document (subvec stack 0 fmt-idx)
+               (vec (remove #(= % fmt) afe))])))))))
+
+(defn parse-into-document
+  [html]
+  (let [[root-id document] (dom/create-element dom/empty-document :document)
+        document (dom/set-root document root-id)]
+    (loop [document document
+           stack [root-id]
+           afe []
+           tokens (seq (normalize-structure-tokens (tokenize html)))]
+      (if-let [{:keys [type tag attrs self? text data]} (first tokens)]
+        (case type
+          ;; A comment is inserted at the current insertion point and
+          ;; changes nothing else: it does not close anything, does not
+          ;; reconstruct active formatting, and carries no layout. Its one
+          ;; observable effect on structure is that the text before and
+          ;; after it stay SEPARATE nodes, which is what discarding it used
+          ;; to destroy.
+          :comment
+          (let [[id document] (dom/create-comment-node document data)
+                document (dom/append-child document (peek stack) id)]
+            (recur document stack afe (next tokens)))
+
+          :text
+          ;; TEXT IS VERBATIM. No whitespace is collapsed here, in any
+          ;; context, because a real HTML parser collapses none of it: the
+          ;; question 'how many of these spaces are rendered' is
+          ;; `white-space`'s, and `white-space` is CSS, which a parser
+          ;; cannot see.
+          ;;
+          ;; This used to collapse runs of spaces/tabs (keeping newlines,
+          ;; which an earlier round had already recognised as a CSS
+          ;; decision) on the reasoning that space collapsing was
+          ;; HTML-STRUCTURAL. Measured in Brave 151, 2026-08-06
+          ;; (conformance/ws_probe.cljk, round A), it is not -- the browser's
+          ;; own DOM keeps every character:
+          ;;
+          ;;   <div>   a   b   </div>          SP SP SP a SP SP SP b SP SP SP
+          ;;   <div>a\tb</div>                 a TAB b
+          ;;   <p>a&nbsp;&nbsp;b</p>           a NBSP NBSP b
+          ;;   <div>\n  <p>a</p>\n</div>       #text "\n  " between the blocks
+          ;;
+          ;; The parser drops whitespace in exactly TWO places, and both are
+          ;; implemented elsewhere in this file rather than here:
+          ;;
+          ;;   1. the single leading U+000A after a `<pre>`/`<textarea>`
+          ;;      start tag (the `remaining` rebinding in the :start branch,
+          ;;      and `tokenize`'s raw-text branch). Measured: `<pre>\nx` is
+          ;;      `x` but `<pre>\n\nx` is `LF x` and `<pre> \nx` is `SP LF x`
+          ;;      -- one newline, only when it is the very first character.
+          ;;   2. nothing else. Whitespace-only runs survive even where the
+          ;;      tree builder is moving nodes around: `<table>\n<tr>` keeps
+          ;;      its newlines INSIDE the table (`foster-parented-text?`
+          ;;      already encodes exactly this), and `<table> x <tr>` fosters
+          ;;      the whole run out because it is not whitespace-only.
+          ;;
+          ;; What collapsing here cost was everything downstream that needs
+          ;; the characters: `white-space: pre` on an element that is not a
+          ;; `<pre>` saw `" indented"` where the source said `"   indented"`,
+          ;; and a tab arrived as a space, so `pre`/`pre-wrap`/`break-spaces`
+          ;; could not be implemented correctly at all no matter what
+          ;; cssom.layout did.
+          ;;
+          ;; The safety property that lets this be deleted rather than
+          ;; conditionalised: for `white-space: normal`/`nowrap`, cssom.layout
+          ;; collapses every whitespace run to one space itself, and
+          ;; collapsing a run that was already partly collapsed gives the same
+          ;; single space -- so the text every ordinary corpus case sees is
+          ;; byte-identical either way. `&nbsp;` is safe for the same reason
+          ;; it was safe before: U+00A0 is not in anyone's collapsible set,
+          ;; and now it is not in a class this file applies at all.
+          (let [[document stack afe] (reconstruct-active-formatting document stack afe)
+                [id document] (dom/create-text-node document text)]
+            ;; Asked AFTER reconstructing, deliberately: reconstructing is
+            ;; itself an insertion, so a formatting element reopened in
+            ;; table context has already been foster-parented and is now
+            ;; the current node -- at which point this run belongs INSIDE
+            ;; it (`<table>a<b>c` puts `c` in the `<b>`, not a second time
+            ;; in front of the table), and `in-table-context?` says so.
+            (recur (insert-node document stack id
+                                (foster-parented-text? document stack text))
+                   stack afe (next tokens)))
+
+          :start
+          (let [tag-kw (keyword tag)
+                ;; FOREIGN CONTENT (inside <svg>/<math>), two rules, both
+                ;; measured in Brave before implementing:
+                ;;
+                ;; 1. an HTML tag on the breakout list terminates foreign
+                ;;    content entirely -- every open foreign element is
+                ;;    popped and the tag is then processed as ordinary HTML
+                ;;    (`<svg><g><div>x</div></g>tail` leaves `tail` at top
+                ;;    level, not back inside the <svg>);
+                ;; 2. a trailing slash really closes the element, unlike in
+                ;;    HTML where `<div/>` opens a div.
+                foreign? (foreign-context? document stack)
+                stack (if (and foreign? (contains? foreign-breakout-tags tag-kw))
+                        (pop-out-of-foreign document stack)
+                        stack)
+                foreign? (and foreign? (not (contains? foreign-breakout-tags tag-kw)))
+                ;; <a> inside <a>: the new one closes the open one.
+                [stack afe] (if (= :a tag-kw)
+                              (close-open-anchor document stack afe)
+                              [stack afe])
+                ;; Optional-end-tag auto-closing (see `auto-close-tags`/
+                ;; `auto-close-stack`): if the innermost currently-open
+                ;; element (top of the stack) is one this new start tag
+                ;; implicitly closes -- e.g. a new <li> while an <li> is
+                ;; already open -- pop it first, as if a real closing tag
+                ;; for it had just appeared, cascading through further pops
+                ;; when the newly-exposed top ALSO matches (e.g. a new <tr>
+                ;; closing an open <td> then also the enclosing <tr>).
+                stack (auto-close-stack document stack tag-kw)
+                ;; The three "in table" steps, in the order the spec runs
+                ;; them: a nested <table> closes the open one; a table
+                ;; structure tag pops back to the context it belongs in
+                ;; (which is also what un-nests it from a foster-parented
+                ;; element left open inside the table); then the row
+                ;; structure the author omitted is synthesised.
+                stack (close-open-table-for-nested-table document stack tag-kw)
+                stack (clear-to-table-context document stack tag-kw)
+                [document stack] (maybe-insert-implied-table-structure document stack tag-kw)
+                ;; Now that the stack has settled, retire any marker whose
+                ;; element those pops just closed (WHATWG "clear the list of
+                ;; active formatting elements up to the last marker", see
+                ;; `afe-marker`). Done HERE, before either the reconstruct
+                ;; below or the push at the bottom, so both see a list with
+                ;; no dead markers in it -- which is the invariant that lets
+                ;; `prune-cleared-markers` cut at the first dead marker.
+                ;; It matters on this token, not the next one: a sibling
+                ;; `<td>` closes the previous cell and opens the next in one
+                ;; step, and without this the new cell's marker would be
+                ;; pushed behind the old cell's dead one.
+                afe (prune-cleared-markers stack afe)
+                ;; Reconstruct active formatting elements before inserting any
+                ;; new element (WHATWG in-body), so mis-nested formatting that
+                ;; was implicitly closed reopens around the new element --
+                ;; unless this start tag is one of the ones that never take
+                ;; that step, either because the table insertion modes own it
+                ;; or because its own in-body rule omits it (see
+                ;; `start-tag-reconstructs?`).
+                [document stack afe] (if (start-tag-reconstructs? document stack tag-kw)
+                                       (reconstruct-active-formatting document stack afe)
+                                       [document stack afe])
+                [id document] (dom/create-element document tag)
+                document (-> document
+                             (apply-attrs id attrs)
+                             ;; Asked after reconstructing, for the reason
+                             ;; spelled out in the `:text` case above.
+                             (insert-node stack id
+                                          (foster-parented-element? document stack tag-kw attrs)))
+                afe (cond
+                      (contains? formatting-tags tag-kw) (push-afe document afe id)
+                      ;; A cell (or caption) pushes a marker, so formatting
+                      ;; left open outside the table is not recreated inside
+                      ;; it (see `afe-marker-tags`).
+                      (contains? afe-marker-tags tag-kw) (conj (vec afe) (afe-marker id))
+                      :else afe)
+                remaining (next tokens)
+                ;; WHATWG spec: if a <pre>'s content begins with a single
+                ;; U+000A LINE FEED, that one character is silently dropped
+                ;; -- the same authoring-convenience rule textarea gets
+                ;; above, but <pre> allows real nested markup so it can't be
+                ;; handled at tokenize time; only the token IMMEDIATELY
+                ;; following <pre>'s own start tag is eligible (a nested
+                ;; child's own leading newline, e.g. <pre><span>\nx</span>
+                ;; </pre>, is untouched -- that <span>'s first token here is
+                ;; a :start, not :text, so this check simply doesn't match).
+                remaining (if (and (= :pre tag-kw) (not self?)
+                                   (= :text (:type (first remaining)))
+                                   (str/starts-with? (:text (first remaining)) "\n"))
+                            (let [stripped (subs (:text (first remaining)) 1)]
+                              (if (seq stripped)
+                                (cons (assoc (first remaining) :text stripped) (next remaining))
+                                (next remaining)))
+                            remaining)]
+            (recur document
+                   (if (or self? (and foreign? (:slash? (first tokens))))
+                     stack
+                     (conj stack id))
+                   afe remaining))
+
+          :end
+          (let [tag-kw (keyword tag)]
+            (if (contains? formatting-tags tag-kw)
+              ;; Formatting end tag -> adoption agency algorithm.
+              (let [[document stack afe] (adoption-agency document stack afe tag-kw)]
+                (recur document stack afe (next tokens)))
+              ;; Any other end tag -> pop to the nearest matching open element.
+              (let [match-idx (find-top-match-index document stack tag-kw)]
+                (if (and (nil? match-idx) (= :p tag-kw))
+                  ;; A stray `</p>` is not ignored. WHATWG's "in body" end
+                  ;; tag rule for `p`: if the stack has no p element in
+                  ;; button scope, this is a parse error -- "insert an HTML
+                  ;; element for a p start tag token with no attributes",
+                  ;; then close it. So the browser materialises an EMPTY
+                  ;; <p> where the stray tag was.
+                  ;;
+                  ;; Measured in Brave rather than assumed: `<p>a</p></p>b`
+                  ;; produces <p>a</p>, an empty <p>, then the text "b" --
+                  ;; and the same empty <p> appears at the end of
+                  ;; `<p>x <span>y <div>z</div> w</span> v</p>`, where the
+                  ;; block element already closed the paragraph and left
+                  ;; the author's own `</p>` with nothing to close. Three
+                  ;; corpus cases turned on this one rule.
+                  (let [[p-id document] (dom/create-element document :p)
+                        document (insert-node document stack p-id
+                                              (in-table-context? document stack))]
+                    (recur document stack afe (next tokens)))
+                  (recur document
+                         (if match-idx (subvec stack 0 match-idx) stack)
+                         afe
+                         (next tokens))))))
+
+          (recur document stack afe (next tokens)))
+        (initialize-form-defaults document)))))

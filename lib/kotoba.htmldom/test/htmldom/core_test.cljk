@@ -1,0 +1,2200 @@
+(ns htmldom.core-test
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [htmldom.core :as html]
+            [kotoba.wasm.dom :as dom]))
+
+(deftest parses-simple-element-tree
+  (let [document (html/parse-into-document "<main id=\"app\"><p class=\"lead\">Hi</p></main>")
+        root (dom/node document (:root document))
+        main (dom/node document (first (:children root)))
+        p (dom/node document (first (:children main)))]
+    (is (= :main (:tag main)))
+    (is (= "app" (get-in main [:attrs :id])))
+    (is (= :p (:tag p)))
+    (is (= "lead" (get-in p [:attrs :class])))
+    (is (= "Hi" (dom/text-content document)))))
+
+(deftest void-tags-do-not-consume-a-closing-tag
+  (let [document (html/parse-into-document "<main><br><img src=\"x.png\">tail</main>")
+        root (dom/node document (:root document))
+        main (dom/node document (first (:children root)))
+        tags (mapv #(:tag (dom/node document %)) (:children main))]
+    (is (= [:br :img nil] tags))))
+
+(deftest inline-style-is-parsed-into-style-attrs
+  (let [document (html/parse-into-document "<main><p style=\"color: red; padding: 4px\">Hi</p></main>")
+        root (dom/node document (:root document))
+        main (dom/node document (first (:children root)))
+        p (dom/node document (first (:children main)))]
+    (is (= "red" (get-in p [:attrs :style/color])))
+    (is (= 4 (get-in p [:attrs :style/padding])))))
+
+(deftest inline-style-important-is-stripped-from-the-value-not-left-corrupting-it
+  ;; The confirmed repro from the bug report: before this fix, a trailing
+  ;; `!important` was never stripped from an inline declaration's value at
+  ;; all -- the literal suffix stayed IN the value (`"red !important"`),
+  ;; which no downstream color/length parser recognizes as `"red"`. This is
+  ;; not merely "importance ignored", it's a genuinely corrupted value that
+  ;; silently fails to parse and falls back to that property's own
+  ;; unstyled/transparent default -- a real, visible rendering bug.
+  ;; The `padding` half of the expected map gained its four per-side
+  ;; longhands when inline-style parsing moved to `cssom.core` (this test
+  ;; had only ever pinned "one key in, one key out" incidentally -- it is
+  ;; about `!important` stripping, not about shorthand expansion). A
+  ;; stylesheet's `padding: 4px` had produced all five keys for some time;
+  ;; an inline one produced only `:padding`, and this engine's box model
+  ;; reads the longhands, which is why the difference was visible against a
+  ;; real browser.
+  (is (= {:color "red" :padding 4
+          :padding-top 4 :padding-right 4 :padding-bottom 4 :padding-left 4}
+         (html/parse-style "color: red !important; padding: 4px")))
+  (is (= {:color "red"} (html/parse-style "color: red!important"))
+      "no space before !important must still strip cleanly")
+  (is (= {:color "red"} (html/parse-style "color: red !IMPORTANT"))
+      "!important is case-insensitive"))
+
+(deftest style-importance-reports-which-properties-were-marked-important
+  (is (= #{:color} (html/style-importance "color: red !important; padding: 4px")))
+  ;; An `!important` shorthand marks every longhand it expands into, which
+  ;; is both what real CSS does and what this engine needs: the cascade
+  ;; ranks the longhands, so marking only `:padding` would let an ordinary
+  ;; rule-based `padding-left` beat an `!important` inline `padding`.
+  (is (= #{:color :padding :padding-top :padding-right :padding-bottom :padding-left}
+         (html/style-importance "color: red !important; padding: 4px !important")))
+  (is (= #{} (html/style-importance "color: red; padding: 4px"))
+      "no !important anywhere -> empty set, not nil"))
+
+(deftest parsed-document-carries-both-corrected-value-and-importance-attrs
+  (let [document (html/parse-into-document
+                  "<main><p style=\"color: red !important; padding: 4px\">Hi</p></main>")
+        root (dom/node document (:root document))
+        main (dom/node document (first (:children root)))
+        p (dom/node document (first (:children main)))]
+    (is (= {:color "red" :padding 4
+            :padding-top 4 :padding-right 4 :padding-bottom 4 :padding-left 4}
+           (get-in p [:attrs :style-inline]))
+        "the real value, not the corrupted \"red !important\" string (the
+         four per-side padding longhands arrived with the move to cssom's
+         declaration parser -- see the sibling !important test)")
+    (is (= #{:color} (get-in p [:attrs :style-inline-important])))
+    (is (= "red" (get-in p [:attrs :style/color]))
+        "the resolved :style/* attr real paint code reads must also be uncorrupted")))
+
+(deftest inline-style-without-important-gets-an-empty-importance-set-not-a-missing-attr
+  (let [document (html/parse-into-document "<main><p style=\"color: red\">Hi</p></main>")
+        root (dom/node document (:root document))
+        main (dom/node document (first (:children root)))
+        p (dom/node document (first (:children main)))]
+    (is (= #{} (get-in p [:attrs :style-inline-important])))))
+
+;; ---- inline style `border` shorthand expansion ----
+;;
+;; An inline `style="..."` IS a CSS declaration block, so all of this is
+;; `cssom.core/parse-declarations-with-importance` -- these tests exist to
+;; hold that delegation in place, not to test a second parser. Since
+;; cssom 2026-08-06 a `border` shorthand also writes the twelve PER-SIDE
+;; longhands, which is what real CSS's `border` sets and how declaration
+;; order resolves against a per-side `border-top`; see
+;; `expand-border-shorthand-with-sides` there.
+
+(defn- border-longhands
+  "The twelve per-side border longhands a `border` shorthand writes."
+  [w st c]
+  (into {} (for [side ["top" "right" "bottom" "left"]
+                 [sub v] [["width" w] ["style" st] ["color" c]]]
+             [(keyword (str "border-" side "-" sub)) v])))
+
+(deftest inline-style-border-shorthand-expands-into-its-three-longhands
+  ;; The confirmed repro from the bug report: before this, style="border:
+  ;; 2px solid red" was stored verbatim as a single, unrecognized :border
+  ;; key, which cssom.layout's border-ops never reads -- a real, common
+  ;; inline-style border pattern silently painted nothing at all.
+  (is (= (merge {:background "red" :border-width 2 :border-style "solid"
+                 :border-color "#00ff00"}
+                (border-longhands 2 "solid" "#00ff00"))
+         (html/parse-style "background: red; border: 2px solid #00ff00"))))
+
+(deftest inline-style-border-shorthand-is-order-independent
+  (is (= (merge {:border-color "red" :border-width 3 :border-style "dashed"}
+                (border-longhands 3 "dashed" "red"))
+         (html/parse-style "border: red 3px dashed"))))
+
+(deftest inline-style-border-shorthand-omits-whichever-longhands-it-does-not-specify
+  (is (= (merge {:border-style "solid" :border-color "red"}
+                ;; the UNIFORM keys record only what was written -- but
+                ;; each SIDE gets all three, because a shorthand resets the
+                ;; components it omits to their initial values. Measured in
+                ;; Brave 151 on 2026-08-06: `border: solid` on a 300px
+                ;; block is 306 wide with its <p> at (3,3), i.e. the
+                ;; omitted width IS `medium` = 3px, not 0.
+                (border-longhands "medium" "solid" "red"))
+         (html/parse-style "border: solid red"))
+      "a real, legal border shorthand may omit the width entirely"))
+
+(deftest inline-style-per-side-border-shorthand-expands-into-that-sides-longhands
+  ;; `border-top` used to fall through to the generic path and be stored as
+  ;; the raw string "10px solid", which nothing reads. Brave 151: a 300px
+  ;; block with `border-top: 10px solid` is 26.797 tall with its <p> at
+  ;; y=10.
+  (is (= {:border-top-width 10 :border-top-style "solid" :border-top-color "#000"}
+         (html/parse-style "border-top: 10px solid #000")))
+  ;; and `border-width`/`border-style`/`border-color` are 1-to-4
+  ;; shorthands, like `margin`/`padding`
+  (is (= {:border-width 10 :border-top-width 10 :border-right-width 5
+          :border-bottom-width 10 :border-left-width 5}
+         (html/parse-style "border-width: 10px 5px"))))
+
+(deftest inline-style-border-shorthand-importance-applies-to-every-expanded-longhand
+  (is (= (into #{:border-width :border-style :border-color}
+               (keys (border-longhands 2 "solid" "red")))
+         (html/style-importance "border: 2px solid red !important"))))
+
+(deftest inline-style-border-longhands-declared-separately-are-unaffected
+  (is (= {:border-width 2 :border-top-width 2 :border-right-width 2
+          :border-bottom-width 2 :border-left-width 2
+          :border-color "#00ff00" :border-top-color "#00ff00"
+          :border-right-color "#00ff00" :border-bottom-color "#00ff00"
+          :border-left-color "#00ff00"}
+         (html/parse-style "border-width: 2px; border-color: #00ff00"))))
+
+;; ---- inline style `margin`/`padding` shorthand expansion ----
+;;
+;; The drift that motivated moving inline-style parsing to cssom.core: a
+;; stylesheet's `padding: 12px` had expanded into the four per-side
+;; longhands this engine's box model actually reads for some time, while an
+;; inline `style="padding: 12px"` -- parsed by this repo's own separate copy
+;; of the declaration parser -- produced only the uniform `:padding` key,
+;; and `style="margin: 4px 8px"` produced the raw STRING "4px 8px", which
+;; the per-side box model cannot read at all. Reproduced through the real
+;; pipeline and measured against a headless Blink by kotoba-lang/cssom's
+;; conformance harness before the fix.
+
+(deftest inline-style-padding-shorthand-expands-into-its-four-side-longhands
+  (is (= {:padding 12 :padding-top 12 :padding-right 12
+          :padding-bottom 12 :padding-left 12}
+         (html/parse-style "padding: 12px"))))
+
+(deftest inline-style-margin-shorthand-follows-real-css-one-to-four-value-rule
+  (is (= {:margin 4 :margin-top 4 :margin-right 8 :margin-bottom 4 :margin-left 8}
+         (html/parse-style "margin: 4px 8px"))
+      "two values are vertical/horizontal -- never a raw \"4px 8px\" string")
+  (is (= {:margin 1 :margin-top 1 :margin-right 2 :margin-bottom 3 :margin-left 2}
+         (html/parse-style "margin: 1px 2px 3px"))
+      "three values are top/horizontal/bottom")
+  (is (= {:margin 1 :margin-top 1 :margin-right 2 :margin-bottom 3 :margin-left 4}
+         (html/parse-style "margin: 1px 2px 3px 4px"))
+      "four values are clockwise from the top"))
+
+(deftest inline-style-box-shorthand-carries-a-non-length-into-its-longhands
+  ;; RENAMED from `...-this-engine-cannot-resolve-stays-unexpanded` on
+  ;; 2026-08-06, because nothing is left in it that stays unexpanded --
+  ;; and both halves changed for the same reason, which is worth stating
+  ;; once rather than twice.
+  ;;
+  ;; `margin: 0 auto` USED to stay unexpanded here, on the reasoning that
+  ;; `auto` needs real layout against the container so the parser should
+  ;; degrade rather than guess a number. The guess was never the only
+  ;; option: `auto` is a keyword, and expanding to longhands that CARRY the
+  ;; keyword loses nothing and lets layout do the resolving.
+  ;;
+  ;; A PERCENTAGE is the same shape of value and used to be the half that
+  ;; still degraded ("10% of WHAT is not knowable at parse time" -- true,
+  ;; and equally true of `auto`). kotoba-lang/cssom now admits it for the
+  ;; same reason, having taught cssom.layout to resolve one against the
+  ;; containing block's inline size; measured in Brave 151, `padding: 10%
+  ;; 20%` inside a 300x100 block is 30px top/bottom and 60px left/right --
+  ;; BOTH axes of the width -- so per-side expansion is exactly as well
+  ;; defined for a percentage as for a px length, and each side carries the
+  ;; raw "10%" through to layout exactly as `auto` already did.
+  ;;
+  ;; This parser delegates all style parsing to `cssom.core`, so both
+  ;; behaviours arrive here rather than being implemented here. Measured
+  ;; consequences in the layout engine: a `margin: 0 auto` block is
+  ;; centred, and `padding-bottom: 50%` makes the 300x150 aspect-ratio box
+  ;; a browser makes.
+  (is (= {:margin 0 :margin-top 0 :margin-right "auto"
+          :margin-bottom 0 :margin-left "auto"}
+         (html/parse-style "margin: 0 auto"))
+      "auto survives as a keyword in the longhands, for layout to resolve")
+  (is (= {:padding "10%" :padding-top "10%" :padding-right "10%"
+          :padding-bottom "10%" :padding-left "10%"}
+         (html/parse-style "padding: 10%"))
+      "a percentage survives the same way, for layout to resolve")
+  ;; Genuinely unresolvable input still degrades rather than guessing.
+  (is (= {:margin "1px solid 3px dashed"}
+         (html/parse-style "margin: 1px solid 3px dashed"))))
+
+(deftest inline-style-padding-shorthand-through-the-full-document-parse
+  ;; The end-to-end shape the box model actually reads, not just
+  ;; parse-style in isolation.
+  (let [document (html/parse-into-document "<div style=\"padding: 12px\">x</div>")
+        div (first (filter #(= :div (:tag %)) (vals (:nodes document))))]
+    (is (= 12 (get-in div [:attrs :style/padding-left])))
+    (is (= 12 (get-in div [:attrs :style/padding-top])))))
+
+;; ---- inline style `text-shadow` shorthand expansion ----
+
+(deftest inline-style-text-shadow-shorthand-expands-into-its-four-longhands
+  ;; The confirmed repro from the bug report: before this, style="text-
+  ;; shadow: 2px 2px 4px #000000" was stored verbatim as a single,
+  ;; unrecognized :text-shadow key, which cssom.layout's layout-text
+  ;; never reads -- a real, common inline-style text-shadow pattern
+  ;; silently painted no shadow at all.
+  (is (= {:text-shadow-x 2 :text-shadow-y 3 :text-shadow-blur 4 :text-shadow-color "#000000"}
+         (html/parse-style "text-shadow: 2px 3px 4px #000000"))))
+
+(deftest inline-style-text-shadow-shorthand-is-order-independent
+  (is (= {:text-shadow-color "red" :text-shadow-x 2 :text-shadow-y 3}
+         (html/parse-style "text-shadow: red 2px 3px"))))
+
+(deftest inline-style-text-shadow-shorthand-omits-whichever-longhands-it-does-not-specify
+  (is (= {:text-shadow-x 2 :text-shadow-y 3 :text-shadow-color "red"}
+         (html/parse-style "text-shadow: 2px 3px red"))
+      "a real, legal text-shadow shorthand may omit the blur radius entirely"))
+
+(deftest inline-style-text-shadow-none-expands-to-a-real-sentinel-not-an-empty-declaration
+  (is (= {:text-shadow-color "none"}
+         (html/parse-style "text-shadow: none"))))
+
+(deftest inline-style-text-shadow-shorthand-importance-applies-to-every-expanded-longhand
+  (is (= #{:text-shadow-x :text-shadow-y :text-shadow-blur :text-shadow-color}
+         (html/style-importance "text-shadow: 2px 3px 4px red !important"))))
+
+;; ---- inline style `box-shadow` shorthand expansion ----
+
+(deftest inline-style-box-shadow-shorthand-expands-into-its-four-longhands
+  ;; The confirmed repro from the bug report: before this, style="box-
+  ;; shadow: 4px 5px 8px #000000" was stored verbatim as a single,
+  ;; unrecognized :box-shadow key, which cssom.layout never reads -- a
+  ;; real, common inline-style box-shadow pattern silently painted no
+  ;; shadow at all.
+  (is (= {:box-shadow-x 4 :box-shadow-y 5 :box-shadow-blur 8 :box-shadow-color "#000000"}
+         (html/parse-style "box-shadow: 4px 5px 8px #000000"))))
+
+(deftest inline-style-box-shadow-shorthand-is-order-independent
+  (is (= {:box-shadow-color "red" :box-shadow-x 2 :box-shadow-y 3}
+         (html/parse-style "box-shadow: red 2px 3px"))))
+
+(deftest inline-style-box-shadow-shorthand-omits-whichever-longhands-it-does-not-specify
+  (is (= {:box-shadow-x 2 :box-shadow-y 3 :box-shadow-color "red"}
+         (html/parse-style "box-shadow: 2px 3px red"))
+      "a real, legal box-shadow shorthand may omit the blur radius entirely"))
+
+(deftest inline-style-box-shadow-none-expands-to-an-empty-declaration-unlike-text-shadow
+  ;; Unlike text-shadow, box-shadow is NOT inherited -- no ancestor value
+  ;; to cancel, so an empty declaration (not a sentinel) is correct here.
+  (is (= {} (html/parse-style "box-shadow: none"))))
+
+(deftest inline-style-box-shadow-shorthand-importance-applies-to-every-expanded-longhand
+  (is (= #{:box-shadow-x :box-shadow-y :box-shadow-blur :box-shadow-color}
+         (html/style-importance "box-shadow: 2px 3px 4px red !important"))))
+
+(deftest inline-style-box-shadow-shorthand-fifth-token-is-spread-radius-not-color
+  ;; The real bug this fixes: before this, a 4th length-shaped token (the
+  ;; extremely common real-world 5-token box-shadow: 0 1px 2px 0 rgba(...)
+  ;; shape) fell through into :box-shadow-color, and the REAL trailing
+  ;; color token was then silently DROPPED entirely.
+  (is (= {:box-shadow-x 0 :box-shadow-y 1 :box-shadow-blur 2 :box-shadow-spread 0
+          :box-shadow-color "rgba(0,0,0,0.1)"}
+         (html/parse-style "box-shadow: 0 1px 2px 0 rgba(0,0,0,0.1)"))
+      "the 4th length token must become spread-radius, and the real color must survive"))
+
+;; ---- inline style `outline` shorthand expansion ----
+
+(deftest inline-style-outline-shorthand-expands-into-its-three-longhands
+  ;; The confirmed repro from the bug report: before this, style="outline:
+  ;; 2px solid red" was stored verbatim as a single, unrecognized :outline
+  ;; key, which cssom.layout never reads -- a real, common inline-style
+  ;; outline pattern silently painted no outline at all.
+  (is (= {:outline-width 2 :outline-style "solid" :outline-color "#ff0000"}
+         (html/parse-style "outline: 2px solid #ff0000"))))
+
+(deftest inline-style-outline-shorthand-is-order-independent
+  (is (= {:outline-color "red" :outline-width 3 :outline-style "dashed"}
+         (html/parse-style "outline: red 3px dashed"))))
+
+(deftest inline-style-outline-shorthand-omits-whichever-longhands-it-does-not-specify
+  (is (= {:outline-style "solid" :outline-color "red"}
+         (html/parse-style "outline: solid red"))
+      "a real, legal outline shorthand may omit the width entirely"))
+
+(deftest inline-style-outline-shorthand-recognizes-the-auto-keyword
+  (is (= {:outline-style "auto"} (html/parse-style "outline: auto"))))
+
+(deftest inline-style-outline-shorthand-importance-applies-to-every-expanded-longhand
+  (is (= #{:outline-width :outline-style :outline-color}
+         (html/style-importance "outline: 2px solid red !important"))))
+
+(deftest inline-style-font-shorthand-expands-into-its-five-longhands
+  ;; The confirmed repro: before this, style="font: italic bold 14px/1.5
+  ;; sans-serif" was stored verbatim as a single, unrecognized :font key,
+  ;; which cssom.layout never reads -- none of the 5 real longhands this
+  ;; shorthand expands to were ever actually set.
+  (is (= {:font-style "italic" :font-weight "bold" :font-size 14
+          :line-height "1.5" :font-family "sans-serif"}
+         (html/parse-style "font: italic bold 14px/1.5 sans-serif"))))
+
+(deftest inline-style-font-shorthand-omits-whichever-leading-longhands-it-does-not-specify
+  (is (= {:font-size 12 :font-family "Arial, sans-serif"}
+         (html/parse-style "font: 12px Arial, sans-serif"))
+      "a real, legal font shorthand may omit style/weight/line-height entirely"))
+
+(deftest inline-style-font-shorthand-recognizes-a-numeric-font-weight
+  (is (= {:font-weight 700 :font-size 16 :font-family "monospace"}
+         (html/parse-style "font: 700 16px monospace"))))
+
+(deftest inline-style-font-shorthand-missing-a-mandatory-font-size-degrades-to-no-op
+  (is (= {} (html/parse-style "font: sans-serif"))
+      "a real font shorthand missing its mandatory font-size is entirely invalid -- dropped, not partially applied"))
+
+(deftest inline-style-font-shorthand-importance-applies-to-every-expanded-longhand
+  (is (= #{:font-style :font-weight :font-size :line-height :font-family}
+         (html/style-importance "font: italic bold 14px/1.5 sans-serif !important"))))
+
+(deftest select-initializes-value-from-selected-option
+  (let [document (html/parse-into-document
+                  "<select><option value=\"a\">A</option><option value=\"b\" selected>B</option></select>")
+        root (dom/node document (:root document))
+        select (dom/node document (first (:children root)))]
+    (is (= "b" (get-in select [:attrs :value])))))
+
+(deftest select-value-reflects-a-disabled-but-explicitly-selected-option
+  ;; Real HTML5 (confirmed against real Chrome before touching source):
+  ;; disabled on an <option> only blocks USER interaction, it does not
+  ;; affect selectedness/.value -- an explicit selected attr wins outright
+  ;; even when that option is disabled (the extremely common
+  ;; <option value="x" disabled selected> placeholder-with-a-real-value
+  ;; idiom). Previously re-filtered the selected option out entirely
+  ;; whenever it was disabled, reporting "" instead of its own value.
+  (let [document (html/parse-into-document
+                  "<select><option value=\"x\" disabled selected>X</option><option value=\"y\">Y</option></select>")
+        root (dom/node document (:root document))
+        select (dom/node document (first (:children root)))]
+    (is (= "x" (get-in select [:attrs :value])))))
+
+(deftest select-value-with-no-explicit-selection-skips-a-disabled-first-option
+  ;; A naive "disabled never matters for selectedness" fix would ALSO be
+  ;; wrong here: confirmed against real Chrome that the DEFAULT selection
+  ;; (no option explicitly selected) correctly skips a disabled first
+  ;; option and lands on the next, enabled one -- this behavior is
+  ;; unaffected by (and predates) the fix above.
+  (let [document (html/parse-into-document
+                  "<select><option value=\"x\" disabled>X</option><option value=\"y\">Y</option></select>")
+        root (dom/node document (:root document))
+        select (dom/node document (first (:children root)))]
+    (is (= "y" (get-in select [:attrs :value])))))
+
+(deftest select-value-with-every-option-disabled-and-none-selected-is-blank
+  ;; Confirmed against real Chrome: an all-disabled select with nothing
+  ;; explicitly selected selects NOTHING at all (real selectedIndex -1),
+  ;; not a fallback to the plain first option regardless of disabled.
+  (let [document (html/parse-into-document
+                  "<select><option value=\"x\" disabled>X</option><option value=\"y\" disabled>Y</option></select>")
+        root (dom/node document (:root document))
+        select (dom/node document (first (:children root)))]
+    (is (= "" (get-in select [:attrs :value])))))
+
+(deftest select-value-explicit-selected-disabled-option-wins-even-when-not-first
+  (let [document (html/parse-into-document
+                  (str "<select><option value=\"a\">A</option>"
+                       "<option value=\"x\" disabled selected>X</option>"
+                       "<option value=\"y\">Y</option></select>"))
+        root (dom/node document (:root document))
+        select (dom/node document (first (:children root)))]
+    (is (= "x" (get-in select [:attrs :value])))))
+
+(deftest script-content-is-raw-text-not-markup
+  ;; A `<script>` body containing `<`/`>`/quotes must not be interpreted as
+  ;; markup: the browser scans it literally up to the real `</script>`.
+  (let [document (html/parse-into-document
+                  "<script>if (1 < 2) { x(); }</script><p>after</p>")
+        tree (dom/tree document)
+        [script p] (:children tree)]
+    (is (= :script (:tag script)))
+    (is (= ["if (1 < 2) { x(); }"] (:children script)))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest script-content-with-embedded-quotes-and-fake-closing-tag
+  ;; A JS string literal that spells out a fake `</script...>` must not
+  ;; terminate the element early; only a genuine end-tag boundary does.
+  (let [document (html/parse-into-document
+                  "<script>var s = \"</scriptTAG>\"; if (a<b && c>d) {}</script><p>after</p>")
+        tree (dom/tree document)
+        [script p] (:children tree)]
+    (is (= :script (:tag script)))
+    (is (= ["var s = \"</scriptTAG>\"; if (a<b && c>d) {}"] (:children script)))
+    (is (= :p (:tag p)))))
+
+(deftest style-content-is-raw-text-not-markup
+  ;; Same raw-text handling applies to `<style>`, and whitespace inside it
+  ;; must be preserved verbatim (unlike ordinary text nodes).
+  (let [document (html/parse-into-document
+                  "<style>.a[data-x=\">\"]  {  color: red;  }</style><p>after</p>")
+        tree (dom/tree document)
+        [style p] (:children tree)]
+    (is (= :style (:tag style)))
+    (is (= [".a[data-x=\">\"]  {  color: red;  }"] (:children style)))
+    (is (= :p (:tag p)))))
+
+(deftest comment-containing-greater-than-does-not-corrupt-parsing
+  ;; `>` inside an HTML comment must not truncate the comment; the comment is
+  ;; discarded (no node) and parsing resumes correctly after its real `-->`.
+  (let [document (html/parse-into-document
+                  "<p>before</p><!-- if (a>b) then... --><p>after</p>")
+        tree (dom/tree document)
+        [p1 p2] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :p (:tag p1)))
+    (is (= ["before"] (:children p1)))
+    (is (= :p (:tag p2)))
+    (is (= ["after"] (:children p2)))))
+
+(deftest abrupt-closing-empty-comment-does-not-swallow-the-rest-of-the-document
+  ;; Real HTML5's "abrupt-closing-of-empty-comment" parse error: `<!-->`
+  ;; (5 chars) is a complete, empty, immediately-terminated comment, reusing
+  ;; its own trailing `--` as the closing marker's leading `--` -- previously
+  ;; the comment-terminator search started strictly AFTER those two dashes,
+  ;; so it could never see the overlap and instead searched for the NEXT
+  ;; literal `-->` anywhere later in the document, silently discarding
+  ;; everything up to (or, since none existed here, all the way to
+  ;; end-of-input) as comment content -- confirmed via direct REPL
+  ;; reproduction before touching source: `<p>after</p>` never existed in
+  ;; the parsed tree at all.
+  (let [document (html/parse-into-document "<p>before</p><!--><p>after</p>")
+        tree (dom/tree document)
+        [p1 p2] (:children tree)]
+    (is (= 2 (count (:children tree)))
+        "the corrupted-parse symptom: <p>after</p> used to be entirely missing")
+    (is (= :p (:tag p1)))
+    (is (= ["before"] (:children p1)))
+    (is (= :p (:tag p2)))
+    (is (= ["after"] (:children p2)))))
+
+(deftest abrupt-closing-empty-comment-six-char-variant-does-not-swallow-the-rest
+  ;; The OTHER real HTML5 abrupt-closing form: `<!--->` (6 chars, one more
+  ;; dash than the 5-char form above) -- also a complete, empty comment.
+  (let [document (html/parse-into-document "<p>before</p><!---><p>after</p>")
+        tree (dom/tree document)
+        [p1 p2] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :p (:tag p1)))
+    (is (= ["before"] (:children p1)))
+    (is (= :p (:tag p2)))
+    (is (= ["after"] (:children p2)))))
+
+(deftest ordinary-comment-with-content-starting-in-a-dash-is-unaffected
+  ;; Guards the fix's own boundary: searching from right after the bare
+  ;; `<!` (not the marker's full `<!--`) must only match early when the
+  ;; very next character really is `>` -- an ordinary comment whose content
+  ;; happens to start with a literal `-` (a real, legal comment shape) must
+  ;; still scan all the way to its own real `-->` terminator, not stop short.
+  (let [document (html/parse-into-document "<p>before</p><!--- note --><p>after</p>")
+        tree (dom/tree document)
+        [p1 p2] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :p (:tag p1)))
+    (is (= ["before"] (:children p1)))
+    (is (= :p (:tag p2)))
+    (is (= ["after"] (:children p2)))))
+
+(deftest unterminated-comment-still-consumes-to-end-of-document
+  ;; The fix must not accidentally make an EVERY comment terminate early --
+  ;; a genuinely unterminated comment (no closing `-->` anywhere) still
+  ;; correctly consumes to end-of-input, matching real HTML5 behavior and
+  ;; this file's own pre-existing convention for unterminated constructs.
+  (let [document (html/parse-into-document "<p>before</p><!-- never closes")
+        tree (dom/tree document)]
+    (is (= 1 (count (:children tree)))
+        "no real content can follow an unterminated comment")
+    (is (= :p (:tag (first (:children tree)))))))
+
+(deftest quoted-attribute-value-containing-greater-than-does-not-corrupt-parsing
+  ;; The confirmed repro: a literal, UNESCAPED `>` inside a quoted attribute
+  ;; value is real, common, valid HTML5 (quoted attribute values are scanned
+  ;; verbatim up to their own matching quote -- `>` has no special meaning
+  ;; inside them at all) -- e.g. a title/alt containing a comparison, or the
+  ;; extremely common inline `onclick="if (a>b) foo()"`. A naive index-of
+  ;; scan for the tag's closing `>` previously truncated the tag at the
+  ;; INNER `>`, corrupting :attrs (losing every attribute after it) and
+  ;; leaking the quoted value's own remainder as a stray text node,
+  ;; confirmed via direct REPL reproduction before this fix.
+  (let [document (html/parse-into-document
+                  "<p>before</p><input title=\"a > b\" id=\"x\"><p>after</p>")
+        tree (dom/tree document)
+        [p1 input p2] (:children tree)]
+    (is (= 3 (count (:children tree)))
+        "the corrupted-parse symptom: this used to be more/fewer than 3 real children")
+    (is (= :input (:tag input)))
+    (is (= "a > b" (get-in input [:attrs :title]))
+        "the quoted value survives intact, including its own inner >")
+    (is (= "x" (get-in input [:attrs :id]))
+        "every attribute AFTER the inner > must survive too, not just before it")
+    (is (= :p (:tag p2)))
+    (is (= ["after"] (:children p2))
+        "parsing resumes correctly after the tag's REAL closing >, not the inner one")))
+
+(deftest onclick-attribute-with-a-real-comparison-operator-does-not-corrupt-parsing
+  ;; The single most common real-world trigger for this bug class: an inline
+  ;; event handler attribute containing a `>` comparison.
+  (let [document (html/parse-into-document
+                  "<a onclick=\"if (a>b) foo()\">text</a><p>after</p>")
+        tree (dom/tree document)
+        [a p] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :a (:tag a)))
+    (is (= "if (a>b) foo()" (get-in a [:attrs :onclick])))
+    (is (= ["text"] (:children a)))
+    (is (= :p (:tag p)))))
+
+(deftest single-quoted-attribute-value-containing-greater-than-does-not-corrupt-parsing
+  (let [document (html/parse-into-document "<div title='a > b'>ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "a > b" (get-in div [:attrs :title])))
+    (is (= ["ok"] (:children div)))))
+
+(deftest multiple-greater-than-characters-inside-one-quoted-value-all-survive
+  (let [document (html/parse-into-document "<div title=\"a > b > c\">ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "a > b > c" (get-in div [:attrs :title])))))
+
+(deftest ordinary-unquoted-attribute-with-no-greater-than-is-unaffected
+  (let [document (html/parse-into-document "<div class=box>ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "box" (get-in div [:attrs :class])))
+    (is (= ["ok"] (:children div)))))
+
+;; ---- duplicate attributes: real HTML5 tokenization keeps the FIRST
+;;      occurrence, dropping every later one -- `into {}` over the
+;;      attribute-pair seq previously let the LAST occurrence silently
+;;      overwrite it instead ----
+
+(deftest duplicate-attribute-keeps-the-first-occurrence-not-the-last
+  (let [document (html/parse-into-document "<div id=\"first\" id=\"second\">ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "first" (get-in div [:attrs :id])))))
+
+(deftest duplicate-attribute-with-three-occurrences-still-keeps-the-first
+  (let [document (html/parse-into-document "<div data-x=\"1\" data-x=\"2\" data-x=\"3\">ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "1" (get-in div [:attrs :data-x])))))
+
+(deftest duplicate-boolean-attribute-keeps-the-first-bare-form
+  ;; The bare form's value is the spec-mandated "" (see attrs' own
+  ;; docstring for why "true" would be wrong) -- this test is really
+  ;; about "first duplicate wins," not boolean-attribute value
+  ;; semantics, so it's updated alongside that fix rather than left
+  ;; pinning the old, incorrect value.
+  (let [document (html/parse-into-document "<input disabled disabled=\"disabled\">")
+        tree (dom/tree document)
+        input (first (:children tree))]
+    (is (= "" (get-in input [:attrs :disabled])))))
+
+;; ---- valueless/bare boolean attributes now store the spec-mandated ""
+;; instead of the Clojure boolean `true` (previously stored verbatim,
+;; surviving unmodified out to real page JS as the literal string "true"
+;; via getAttribute() -- confirmed via direct REPL reproduction before
+;; touching source) ----
+
+(deftest bare-boolean-attribute-value-is-the-empty-string-not-clojure-true
+  (let [document (html/parse-into-document "<input checked>")
+        tree (dom/tree document)
+        input (first (:children tree))]
+    (is (= "" (get-in input [:attrs :checked])))))
+
+(deftest multiple-bare-boolean-attributes-on-the-same-element-are-all-empty-strings
+  (let [document (html/parse-into-document "<option selected disabled>")
+        tree (dom/tree document)
+        option (first (:children tree))]
+    (is (= "" (get-in option [:attrs :selected])))
+    (is (= "" (get-in option [:attrs :disabled])))))
+
+(deftest a-quoted-attribute-value-is-unaffected-by-the-bare-attribute-fix
+  (let [document (html/parse-into-document "<input value=\"hello\">")
+        tree (dom/tree document)
+        input (first (:children tree))]
+    (is (= "hello" (get-in input [:attrs :value])))))
+
+(deftest an-explicit-empty-string-attribute-value-behaves-identically-to-a-bare-one
+  ;; Real HTML5: `disabled` and `disabled=""` are the exact same thing --
+  ;; this fix makes both forms produce byte-identical internal values.
+  (let [document (html/parse-into-document "<input disabled=\"\">")
+        tree (dom/tree document)
+        input (first (:children tree))]
+    (is (= "" (get-in input [:attrs :disabled])))))
+
+(deftest duplicate-attribute-case-insensitive-key-still-keeps-the-first
+  ;; Real HTML attribute names are case-insensitive, and this parser
+  ;; already lower-cases every key -- ID="upper" and id="lower" are the
+  ;; SAME attribute, so the first (by source order) must win.
+  (let [document (html/parse-into-document "<div ID=\"upper\" id=\"lower\">ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "upper" (get-in div [:attrs :id])))))
+
+(deftest non-duplicate-attributes-are-unaffected-by-the-first-wins-fix
+  (let [document (html/parse-into-document "<div id=\"only\" class=\"box\">ok</div>")
+        tree (dom/tree document)
+        div (first (:children tree))]
+    (is (= "only" (get-in div [:attrs :id])))
+    (is (= "box" (get-in div [:attrs :class])))))
+
+(deftest back-to-back-comments-do-not-corrupt-parsing
+  (let [document (html/parse-into-document "<!-- x --><!-- y --><p>after</p>")
+        tree (dom/tree document)]
+    (is (= 1 (count (:children tree))))
+    (is (= :p (:tag (first (:children tree)))))))
+
+(deftest mismatched-closing-tag-recovers-by-closing-intervening-elements
+  ;; `<div><span>text</div>` -- the unclosed `<span>` must be implicitly
+  ;; closed when `</div>` arrives, and a following sibling must land as a
+  ;; sibling of `<div>`, not get nested inside a still-open `<div>`.
+  (let [document (html/parse-into-document "<div><span>text</div><p>after</p>")
+        tree (dom/tree document)
+        [div p] (:children tree)
+        span (first (:children div))]
+    (is (= 2 (count (:children tree))))
+    (is (= :div (:tag div)))
+    (is (= :span (:tag span)))
+    (is (= ["text"] (:children span)))
+    (is (= 1 (count (:children div))))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest stray-closing-tag-with-no-open-match-leaves-stack-untouched
+  ;; `</span>` has no matching open `<span>` on the stack, so it must not pop
+  ;; anything (in particular, must not silently close the still-open `<div>`).
+  (let [document (html/parse-into-document "<div>a</span><p>after</p></div>")
+        tree (dom/tree document)
+        div (first (:children tree))
+        [text p] (:children div)]
+    (is (= 1 (count (:children tree))))
+    (is (= :div (:tag div)))
+    (is (= "a" text))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest title-content-is-raw-text-not-markup
+  ;; A `<title>` body containing `<`/`>` must not be interpreted as markup:
+  ;; only the real closing `</title>` terminates it, and `<p>` lands as a
+  ;; genuine following sibling, not nested inside a still-open `<title>`.
+  (let [document (html/parse-into-document "<title>A < B</title><p>after</p>")
+        tree (dom/tree document)
+        [title p] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :title (:tag title)))
+    (is (= ["A < B"] (:children title)))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest textarea-content-is-raw-text-not-markup
+  ;; Same raw-text handling applies to `<textarea>`: code-like default text
+  ;; containing `<`/`>` must not corrupt the rest of the document.
+  (let [document (html/parse-into-document
+                  "<textarea>if (1 < 2) { x(); }</textarea><p>after</p>")
+        tree (dom/tree document)
+        [textarea p] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :textarea (:tag textarea)))
+    (is (= ["if (1 < 2) { x(); }"] (:children textarea)))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest textarea-content-that-looks-like-a-tag-is-one-literal-text-child
+  ;; A textarea's content is never real markup, no matter what it looks
+  ;; like: a substring that resembles a `<b>...</b>` element must become a
+  ;; single literal text child, not a parsed `<b>` element.
+  (let [document (html/parse-into-document
+                  "<textarea><b>not a real tag</b></textarea>")
+        tree (dom/tree document)
+        textarea (first (:children tree))]
+    (is (= :textarea (:tag textarea)))
+    (is (= 1 (count (:children textarea))))
+    (is (= "<b>not a real tag</b>" (first (:children textarea))))))
+
+(deftest textarea-default-value-reflects-full-raw-text-content
+  ;; The form-default-value projection (`initialize-form-node`'s `:textarea`
+  ;; case) must see the full, unmangled raw text as the textarea's content
+  ;; -- not a fragment truncated by a `<`/`>` inside it.
+  (let [document (html/parse-into-document
+                  "<textarea>if (1 < 2) { x(); }</textarea>")
+        root (dom/node document (:root document))
+        textarea (dom/node document (first (:children root)))]
+    (is (= "if (1 < 2) { x(); }" (get-in textarea [:attrs :value])))
+    (is (= "if (1 < 2) { x(); }" (get-in textarea [:attrs :default-value])))))
+
+(deftest xml-predefined-entities-decode-in-ordinary-text
+  ;; The five XML-predefined entities (universally supported, unambiguous)
+  ;; must decode in ordinary text content.
+  (let [document (html/parse-into-document
+                  "<p>Ben &amp; Jerry&apos;s &lt;3&gt; say &quot;hi&quot;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= :p (:tag p)))
+    (is (= ["Ben & Jerry's <3> say \"hi\""] (:children p)))))
+
+(deftest numeric-decimal-entities-decode-correctly
+  (let [document (html/parse-into-document "<p>&#65;&#66;&#67;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= :p (:tag p)))
+    (is (= ["ABC"] (:children p)))))
+
+(deftest numeric-hex-entities-decode-including-non-ascii-codepoints
+  ;; Hex numeric references decode, including a codepoint outside the BMP
+  ;; (an emoji, which must come out as a correct surrogate pair) and an
+  ;; accented Latin-1 codepoint.
+  (let [document (html/parse-into-document "<p>caf&#xE9; &#x1F600;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= :p (:tag p)))
+    (is (= ["caf\u00e9 \ud83d\ude00"] (:children p)))))
+
+(deftest numeric-entities-in-the-c1-control-range-decode-through-the-windows-1252-remap
+  ;; WHATWG spec's "numeric character reference end state": a numeric
+  ;; character reference naming a codepoint in the C1 control range
+  ;; (0x80-0x9F) is reinterpreted through a fixed Windows-1252 table
+  ;; instead of being emitted as that (invisible, meaningless in real
+  ;; content) raw control character. This is the textbook "smart quotes
+  ;; from Word/legacy CMS content turn into garbage" bug -- previously
+  ;; `&#146;` decoded to the raw C1 control character U+0092 instead of
+  ;; the real single right quote U+2019 authors actually intended.
+  (let [document (html/parse-into-document
+                  "<p>&#145;a&#146; &#147;b&#148; &#150;&#151; &#128;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= :p (:tag p)))
+    (is (= ["‘a’ “b” –— €"] (:children p))
+        "left/right single quotes, left/right double quotes, en-dash, em-dash, and the euro sign all resolve to their real Windows-1252-intended characters")))
+
+(deftest numeric-entity-for-null-codepoint-decodes-to-the-replacement-character
+  ;; Same spec algorithm, a sibling rule right next to the C1 remap: a
+  ;; numeric reference naming codepoint 0 must become U+FFFD REPLACEMENT
+  ;; CHARACTER, never a literal embedded NUL.
+  (let [document (html/parse-into-document "<p>a&#0;b</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= ["a�b"] (:children p)))))
+
+(deftest numeric-entities-for-the-five-unmapped-c1-codepoints-stay-unchanged
+  ;; Five codepoints in the C1 range (0x81/0x8D/0x8F/0x90/0x9D) have NO
+  ;; Windows-1252 mapping at all -- the spec table deliberately omits
+  ;; them, so they fall through unchanged as their own raw codepoint,
+  ;; same as before this fix. Confirms the remap is a precise, bounded
+  ;; 27-entry table, not an over-eager "every C1 codepoint changes"
+  ;; blanket rule.
+  (let [document (html/parse-into-document "<p>&#129;&#141;&#143;&#144;&#157;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= [(str (char 0x81) (char 0x8D) (char 0x8F) (char 0x90) (char 0x9D))]
+           (:children p)))))
+
+(deftest numeric-entities-naming-surrogates-or-out-of-range-codepoints-stay-unchanged
+  ;; A numeric reference naming a UTF-16 surrogate codepoint (0xD800-0xDFFF,
+  ;; never a valid scalar value on its own) or a codepoint beyond Unicode's
+  ;; max (0x10FFFF) fails numeric-char-ref->str's validity guard and falls
+  ;; back to literal unmodified text, same as an unrecognized named entity.
+  (let [document (html/parse-into-document "<p>&#xD800;&#xDFFF;&#1114112;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= ["&#xD800;&#xDFFF;&#1114112;"] (:children p)))))
+
+(deftest pragmatic-named-entity-subset-decodes-correctly
+  (let [document (html/parse-into-document
+                  "<p>&nbsp;&copy;&reg;&trade;&mdash;&ndash;&hellip;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= :p (:tag p)))
+    (is (= ["\u00A0\u00A9\u00AE\u2122\u2014\u2013\u2026"] (:children p)))))
+
+(deftest unrecognized-named-entity-is-left-as-literal-text
+  ;; `&foo;` and `&eacute;` are not in the pragmatic named-entity table (the
+  ;; full ~2000-entry HTML5 table is deliberately out of scope) and must be
+  ;; left alone rather than guessed at or dropped.
+  (let [document (html/parse-into-document "<p>&foo; &eacute;</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= :p (:tag p)))
+    (is (= ["&foo; &eacute;"] (:children p)))))
+
+(deftest script-content-is-not-entity-decoded
+  ;; script is true raw text, not RCDATA: a JS string literal containing
+  ;; `&amp;` must stay `&amp;`, not become `&`.
+  (let [document (html/parse-into-document
+                  "<script>var s = \"Ben &amp; Jerry&#39;s\";</script>")
+        tree (dom/tree document)
+        script (first (:children tree))]
+    (is (= :script (:tag script)))
+    (is (= ["var s = \"Ben &amp; Jerry&#39;s\";"] (:children script)))))
+
+(deftest style-content-is-not-entity-decoded
+  (let [document (html/parse-into-document
+                  "<style>.a::before { content: \"&amp;\"; }</style>")
+        tree (dom/tree document)
+        style (first (:children tree))]
+    (is (= :style (:tag style)))
+    (is (= [".a::before { content: \"&amp;\"; }"] (:children style)))))
+
+(deftest title-content-is-entity-decoded-but-tags-stay-literal
+  ;; title is RCDATA: character references decode, but `<`/`>` inside it are
+  ;; still never parsed as markup -- the decoded "<3>"-looking substring
+  ;; stays literal text, and `<p>` after `</title>` lands as a real sibling.
+  (let [document (html/parse-into-document
+                  "<title>Ben &amp; Jerry&#39;s &lt;3&gt;</title><p>after</p>")
+        tree (dom/tree document)
+        [title p] (:children tree)]
+    (is (= :title (:tag title)))
+    (is (= ["Ben & Jerry's <3>"] (:children title)))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest textarea-content-is-entity-decoded-but-tags-stay-literal
+  ;; Same RCDATA distinction as title: entities decode, but a decoded
+  ;; `<b>...</b>`-looking substring is still one literal text child, not a
+  ;; parsed element.
+  (let [document (html/parse-into-document
+                  "<textarea>Ben &amp; Jerry&#39;s &lt;b&gt;not real&lt;/b&gt;</textarea>")
+        tree (dom/tree document)
+        textarea (first (:children tree))]
+    (is (= :textarea (:tag textarea)))
+    (is (= 1 (count (:children textarea))))
+    (is (= "Ben & Jerry's <b>not real</b>" (first (:children textarea))))))
+
+(deftest attribute-values-are-entity-decoded
+  ;; Entity decoding also applies to attribute values, not just text nodes.
+  (let [document (html/parse-into-document
+                  "<p title=\"Ben &amp; Jerry&#39;s\">Hi</p>")
+        root (dom/node document (:root document))
+        p (dom/node document (first (:children root)))]
+    (is (= "Ben & Jerry's" (get-in p [:attrs :title])))))
+
+(deftest void-element-with-trailing-slash-still-self-closes
+  ;; `<br/>` (a real HTML5 void element) must still be treated as
+  ;; self-closing when written with the optional trailing `/>`, exactly like
+  ;; plain `<br>` -- self-closing status comes from void-tag membership, not
+  ;; from the presence of the slash.
+  (let [document (html/parse-into-document "<main><br/>tail</main>")
+        tree (dom/tree document)
+        main (first (:children tree))
+        [br tail] (:children main)]
+    (is (= 2 (count (:children main))))
+    (is (= :br (:tag br)))
+    (is (= [] (:children br)))
+    (is (= "tail" tail))))
+
+(deftest trailing-slash-on-non-void-element-is-not-self-closing
+  ;; Real HTML5 only treats actual void elements as self-closing on a
+  ;; trailing `/>` -- an ordinary element like `<div/>` ignores the stray
+  ;; slash and still needs (and gets matched against) a real closing tag.
+  ;; `foo` must land as `div`'s child, not as a sibling of a bogus
+  ;; already-closed `div`.
+  (let [document (html/parse-into-document "<main><div/>foo</div></main>")
+        tree (dom/tree document)
+        main (first (:children tree))
+        div (first (:children main))]
+    (is (= 1 (count (:children main))))
+    (is (= :div (:tag div)))
+    (is (= ["foo"] (:children div)))))
+
+(deftest self-closing-slash-false-positive-on-script-no-longer-corrupts-parsing
+  ;; Regression test for the severe cascading-corruption bug: a trailing `/`
+  ;; on `<script/>` used to be wrongly treated as self-closing, which
+  ;; defeated the raw-text scanning (`tokenize` only raw-text-scans a
+  ;; non-self-closing raw-text opening tag) and caused the script's own JS
+  ;; body to be re-parsed as bogus markup, corrupting everything after it.
+  ;; `<script>` is not a void element, so it must never self-close, and its
+  ;; body must be captured as raw text up to the real `</script>`.
+  (let [document (html/parse-into-document
+                  "<script/>if (1 < 2) { x(); }</script><p>after</p>")
+        tree (dom/tree document)
+        [script p] (:children tree)]
+    (is (= 2 (count (:children tree))))
+    (is (= :script (:tag script)))
+    (is (= ["if (1 < 2) { x(); }"] (:children script)))
+    (is (= :p (:tag p)))
+    (is (= ["after"] (:children p)))))
+
+(deftest unquoted-attribute-value-containing-slash-parses-completely
+  ;; A `/` is common in real unquoted `href`/`src` URL values and must not
+  ;; truncate the value: the whole URL is one attribute value, not split
+  ;; into the value plus spurious boolean attributes for the remainder.
+  (let [document (html/parse-into-document
+                  "<a href=http://example.com/path class=btn>link</a>")
+        tree (dom/tree document)
+        a (first (:children tree))]
+    (is (= :a (:tag a)))
+    (is (= "http://example.com/path" (get-in a [:attrs :href])))
+    (is (= "btn" (get-in a [:attrs :class])))
+    (is (= ["link"] (:children a)))))
+
+(deftest quoted-attribute-value-containing-slash-still-parses-correctly
+  ;; No-regression check: a quoted attribute value containing `/` already
+  ;; worked before the unquoted-value fix and must keep working afterward.
+  (let [document (html/parse-into-document
+                  "<a href=\"http://example.com/path\" class=\"btn\">link</a>")
+        tree (dom/tree document)
+        a (first (:children tree))]
+    (is (= :a (:tag a)))
+    (is (= "http://example.com/path" (get-in a [:attrs :href])))
+    (is (= "btn" (get-in a [:attrs :class])))
+    (is (= ["link"] (:children a)))))
+
+;; ---- unquoted attribute value ENDING in a trailing slash right before
+;; the tag's own '>' -- distinct from the slash-in-the-middle case above ----
+;;
+;; Real bug this guards: `token` unconditionally stripped a trailing `/`
+;; from the whole tag body before splitting into tag/attribute text, on
+;; the theory that it's always an optional self-closing marker. But per
+;; real HTML5 tokenization, `/` has no special meaning at all inside an
+;; UNQUOTED attribute value -- it is only a self-closing marker in the
+;; tag-name/before-attribute-name/attribute-name/after-quoted-value
+;; states. When an unquoted attribute's value legitimately ends in `/`
+;; right before `>` (extremely common for URLs, e.g.
+;; href=http://example.com/), this silently truncated the value by one
+;; character. Confirmed via direct REPL reproduction before touching
+;; source.
+
+(deftest unquoted-attribute-value-ending-in-slash-keeps-the-slash
+  (let [document (html/parse-into-document
+                  "<a href=http://example.com/>link</a>")
+        tree (dom/tree document)
+        a (first (:children tree))]
+    (is (= "http://example.com/" (get-in a [:attrs :href]))
+        "the trailing / is real URL content, not a self-closing marker -- it must not be dropped")))
+
+(deftest unquoted-attribute-value-ending-in-slash-on-a-void-element-keeps-the-slash
+  (let [document (html/parse-into-document
+                  "<main><img src=http://example.com/img/></main>")
+        tree (dom/tree document)
+        main (first (:children tree))
+        img (first (:children main))]
+    (is (= :img (:tag img)))
+    (is (= "http://example.com/img/" (get-in img [:attrs :src]))
+        "same bug, but on a genuinely void element -- self-closing status (from void-tag membership) must be unaffected by keeping the trailing slash")))
+
+(deftest genuine-self-closing-slash-after-a-quoted-value-is-still-stripped
+  ;; Regression guard: this fix must not stop stripping the self-closing
+  ;; marker in the cases that were already correct -- right after a
+  ;; CLOSING quote (with or without a space before the /), the trailing
+  ;; slash is genuinely a self-closing marker and must still be dropped
+  ;; from the attribute text (not leak in as a stray attribute).
+  (let [document (html/parse-into-document "<main><input value=\"ok\"/></main>")
+        tree (dom/tree document)
+        main (first (:children tree))
+        input (first (:children main))]
+    (is (= "ok" (get-in input [:attrs :value]))
+        "the self-closing / directly after the closing quote must still be stripped, not appended to the value")))
+
+(deftest genuine-self-closing-slash-with-no-attributes-is-still-stripped
+  ;; Regression guard mirroring void-element-with-trailing-slash-still-
+  ;; self-closes above, but through THIS fix's own new code path (the
+  ;; unquoted-value-tail? scan on an empty/whitespace-free body).
+  (let [document (html/parse-into-document "<main><br/>tail</main>")
+        tree (dom/tree document)
+        main (first (:children tree))
+        [br tail] (:children main)]
+    (is (= :br (:tag br)))
+    (is (= [] (:children br)))
+    (is (= "tail" tail))))
+
+(deftest tokenize-mixed-recognized-and-unrecognized-entities
+  ;; Exercises htmldom.core/tokenize directly (rather than through
+  ;; parse-into-document): an XML entity (&amp;), a numeric decimal
+  ;; reference (&#39;), a pragmatic named entity (&copy;), and a named
+  ;; entity NOT in the pragmatic table (&eacute;) all in one text run --
+  ;; the first three decode, &eacute; is left as literal text.
+  (let [tokens (html/tokenize "<p>Ben &amp; Jerry&#39;s &copy; caf&eacute;</p>")
+        text-tok (second tokens)]
+    (is (= :text (:type text-tok)))
+    (is (= "Ben & Jerry's \u00A9 caf&eacute;" (:text text-tok)))))
+
+;; Optional-end-tag auto-closing (see `auto-close-tags` in htmldom.core).
+;; Real HTML5 implicitly closes certain still-open elements when a new
+;; matching (or, for <p>, identical) element starts, rather than nesting the
+;; new one inside the still-open one. This repo previously did not
+;; implement that at all, which silently produced wrongly-NESTED trees for
+;; extremely common markup like `<li>`-only lists and `<option>`-only
+;; selects -- and for `<option>`, the wrong nesting went on to corrupt a
+;; computed value (`initialize-select-state`'s default `:value` for the
+;; `<select>`, via `text-content` walking all descendants of the first
+;; option instead of just its own text).
+
+(deftest li-auto-closing-produces-siblings-not-nesting
+  ;; The confirmed repro from the bug report: three <li>s with no explicit
+  ;; closing tags must land as three SIBLINGS under <ul>, not nested three
+  ;; deep.
+  (let [document (html/parse-into-document "<ul><li>one<li>two<li>three</ul>")
+        tree (dom/tree document)
+        ul (first (:children tree))
+        [li1 li2 li3] (:children ul)]
+    (is (= 1 (count (:children tree))))
+    (is (= :ul (:tag ul)))
+    (is (= 3 (count (:children ul))))
+    (is (= :li (:tag li1))) (is (= ["one"] (:children li1)))
+    (is (= :li (:tag li2))) (is (= ["two"] (:children li2)))
+    (is (= :li (:tag li3))) (is (= ["three"] (:children li3)))))
+
+(deftest block-start-tag-closes-a-p-through-an-open-inline
+  ;; The half of the tag-omission rules a stack-TOP-only check cannot
+  ;; express. HTML5: "if the stack of open elements has a p element in
+  ;; button scope, close a p element" -- the <p> need not be innermost, and
+  ;; closing it pops every element opened above it.
+  ;;
+  ;; Measured in Brave 151 before this was implemented:
+  ;; `<p>text <span>a <div>b</div> c</span> end</p>` gives a <p> holding
+  ;; "text " and a <span> holding "a ", then a SIBLING <div>, then the rest
+  ;; of the text at top level. Before the fix the <div> nested inside the
+  ;; <p>, which no browser does -- and which was the whole of the sibling
+  ;; cssom repo's `:block/nested-block-in-inline` geometry failure.
+  (let [document (html/parse-into-document "<p>text <span>a <div>b</div> c</span> end</p>")
+        tree (dom/tree document)
+        [p div] (:children tree)]
+    (is (= :p (:tag p)))
+    (is (= :div (:tag div)) "the <div> is a SIBLING of the <p>, not a child")
+    (let [[text span] (:children p)]
+      (is (= "text " text))
+      (is (= :span (:tag span)) "the still-open <span> stays inside the <p>")
+      (is (= ["a "] (:children span)) "and keeps only the text it had opened with"))))
+
+(deftest a-stray-p-end-tag-materialises-an-empty-p
+  ;; WHATWG's "in body" rule for a `</p>` with no p element in button
+  ;; scope: insert an HTML element for a p start tag with no attributes,
+  ;; then close it. The browser does not ignore the tag -- it creates an
+  ;; empty paragraph where it appeared. Measured in Brave: `<p>a</p></p>b`
+  ;; produces <p>a</p>, an EMPTY <p>, then "b".
+  (let [tree (dom/tree (html/parse-into-document "<p>a</p></p>b"))
+        [first-p empty-p text] (:children tree)]
+    (is (= :p (:tag first-p)))
+    (is (= ["a"] (:children first-p)))
+    (is (= :p (:tag empty-p)))
+    (is (empty? (:children empty-p)))
+    (is (= "b" text))))
+
+(deftest li-auto-close-does-not-reach-past-a-nested-list
+  ;; The auto-close check only looks at the TOP of the stack (the innermost
+  ;; open element), never scanning down past it. A new <li> that opens
+  ;; inside a nested <ul> which itself sits inside a still-open outer <li>
+  ;; must NOT reach past the nested <ul> to close the outer <li> -- the
+  ;; outer <li> should still contain the whole nested list.
+  (let [document (html/parse-into-document
+                  "<ul><li>outer<ul><li>inner-one<li>inner-two</ul></ul>")
+        tree (dom/tree document)
+        outer-ul (first (:children tree))
+        outer-li (first (:children outer-ul))
+        [text inner-ul] (:children outer-li)
+        [inner-li1 inner-li2] (:children inner-ul)]
+    (is (= 1 (count (:children outer-ul))))
+    (is (= :li (:tag outer-li)))
+    (is (= "outer" text))
+    (is (= :ul (:tag inner-ul)))
+    (is (= 2 (count (:children inner-ul))))
+    (is (= :li (:tag inner-li1))) (is (= ["inner-one"] (:children inner-li1)))
+    (is (= :li (:tag inner-li2))) (is (= ["inner-two"] (:children inner-li2)))))
+
+(deftest explicit-li-closing-tags-still-work-without-auto-close
+  ;; No-regression check: ordinary, fully-explicit closing tags must keep
+  ;; producing the same correct sibling structure, with or without the new
+  ;; auto-close mechanism ever kicking in.
+  (let [document (html/parse-into-document "<ul><li>one</li><li>two</li></ul>")
+        tree (dom/tree document)
+        ul (first (:children tree))
+        [li1 li2] (:children ul)]
+    (is (= 2 (count (:children ul))))
+    (is (= :li (:tag li1))) (is (= ["one"] (:children li1)))
+    (is (= :li (:tag li2))) (is (= ["two"] (:children li2)))))
+
+(deftest option-auto-closing-produces-siblings-not-nesting
+  ;; The other confirmed repro: a second <option> with no explicit closing
+  ;; tag for the first must land as a SIBLING, not nested inside the first.
+  (let [document (html/parse-into-document
+                  "<select><option>A<option value=\"b\">B</select>")
+        tree (dom/tree document)
+        select (first (:children tree))
+        [opt1 opt2] (:children select)]
+    (is (= 2 (count (:children select))))
+    (is (= :option (:tag opt1))) (is (= ["A"] (:children opt1)))
+    (is (= :option (:tag opt2))) (is (= ["B"] (:children opt2)))
+    (is (= "b" (get-in opt2 [:attrs :value])))))
+
+(deftest option-auto-closing-fixes-select-default-value-computation
+  ;; Regression check for the corrupted-computed-value consequence called
+  ;; out in the bug report: before this fix, option "b" ended up nested
+  ;; inside option "A", so `initialize-select-state`'s `text-content` walk
+  ;; of the first option's own text picked up BOTH options' text
+  ;; concatenated ("AB") when computing the <select>'s default :value.
+  ;; With option "A" and option "b" now correct siblings, the <select>'s
+  ;; default :value must be just "A" (the first option's own text, since
+  ;; neither option has an explicit `selected` attribute and option "A" has
+  ;; no `value` attribute of its own).
+  (let [document (html/parse-into-document
+                  "<select><option>A<option value=\"b\">B</select>")
+        root (dom/node document (:root document))
+        select (dom/node document (first (:children root)))]
+    (is (= "A" (get-in select [:attrs :value])))))
+
+;; ---- <optgroup> auto-closing -- previously entirely out of scope (this
+;; file's own auto-close-tags docstring explicitly flagged it: "a
+;; following <optgroup> is out of scope"). A grouped <select> with no
+;; explicit </option>/</optgroup> anywhere (the single most common way
+;; authors write <optgroup>) corrupted its tree shape: every subsequent
+;; <optgroup> nested inside the still-open previous <option> instead of
+;; becoming a sibling of the previous <optgroup>. Confirmed via direct
+;; REPL reproduction before this fix. ----
+
+(deftest optgroup-auto-closing-produces-siblings-not-nesting
+  (let [document (html/parse-into-document
+                  "<select><optgroup label=\"A\"><option>1<optgroup label=\"B\"><option>2</optgroup></select>")
+        tree (dom/tree document)
+        select (first (:children tree))
+        [group-a group-b] (:children select)]
+    (is (= 2 (count (:children select)))
+        "the two <optgroup>s must be siblings of each other under <select>, not nested")
+    (is (= :optgroup (:tag group-a))) (is (= "A" (get-in group-a [:attrs :label])))
+    (is (= :optgroup (:tag group-b))) (is (= "B" (get-in group-b [:attrs :label])))
+    (is (= 1 (count (:children group-a)))
+        "group A's own <option> must not still be holding group B as a nested child")
+    (is (= :option (:tag (first (:children group-a)))))
+    (is (= ["1"] (:children (first (:children group-a)))))
+    (is (= ["2"] (:children (first (:children group-b)))))))
+
+(deftest optgroup-auto-closing-cascades-across-three-groups
+  ;; The same two-level cascade already proven for :td/:th->:tr: a new
+  ;; <optgroup> must first close the open <option> (exposing the
+  ;; enclosing <optgroup> as the new stack top), then that SAME incoming
+  ;; <optgroup> tag closes THAT too, so a real, common chain of several
+  ;; groups in a row still comes out flat.
+  (let [document (html/parse-into-document
+                  (str "<select>"
+                       "<optgroup label=\"A\"><option>1"
+                       "<optgroup label=\"B\"><option>2"
+                       "<optgroup label=\"C\"><option>3"
+                       "</optgroup></select>"))
+        tree (dom/tree document)
+        select (first (:children tree))
+        groups (:children select)]
+    (is (= 3 (count groups)))
+    (is (= ["A" "B" "C"] (mapv #(get-in % [:attrs :label]) groups)))
+    (is (every? #(= 1 (count (:children %))) groups)
+        "each group holds exactly its own one <option>, no cross-nesting")))
+
+(deftest optgroup-auto-closing-does-not-affect-a-lone-explicitly-closed-group
+  ;; Regression guard: a single <optgroup> with a real, explicit closing
+  ;; tag (the ordinary, fully-explicit authoring shape) must keep
+  ;; producing the same correct structure regardless of the new entries.
+  (let [document (html/parse-into-document
+                  "<select><optgroup label=\"Only\"><option>1</option></optgroup></select>")
+        tree (dom/tree document)
+        select (first (:children tree))]
+    (is (= 1 (count (:children select))))
+    (is (= :optgroup (:tag (first (:children select)))))
+    (is (= 1 (count (:children (first (:children select))))))))
+
+(deftest p-auto-closing-closes-open-p-when-new-p-starts
+  ;; The <p> rule this parser implements: a new <p> closes a currently open
+  ;; <p>, so `<p>one<p>two` produces two SIBLING <p>s, not "two" nested
+  ;; inside "one".
+  (let [document (html/parse-into-document "<div><p>one<p>two</div>")
+        tree (dom/tree document)
+        div (first (:children tree))
+        [p1 p2] (:children div)]
+    (is (= 2 (count (:children div))))
+    (is (= :p (:tag p1))) (is (= ["one"] (:children p1)))
+    (is (= :p (:tag p2))) (is (= ["two"] (:children p2)))))
+
+(deftest p-auto-closing-closes-open-p-when-a-block-level-sibling-starts
+  ;; Real HTML5's full <p> rule: an open <p>'s end tag may be omitted when
+  ;; immediately followed by any of a specific ~29-element block-level
+  ;; list (see `auto-close-tags`'s docstring in htmldom.core), not just
+  ;; another <p>. Each of these must become <p>'s SIBLING, not nest inside
+  ;; it -- sampling across the list rather than exhaustively enumerating
+  ;; all ~29 entries.
+  (doseq [[tag html] [[:div "<p>one<div>two</div>"]
+                      [:ul "<p>one<ul><li>two</li></ul>"]
+                      [:h1 "<p>one<h1>two</h1>"]
+                      [:table "<p>one<table></table>"]
+                      [:hr "<p>one<hr>"]
+                      [:section "<p>one<section>two</section>"]
+                      [:blockquote "<p>one<blockquote>two</blockquote>"]
+                      [:form "<p>one<form></form>"]]]
+    (let [document (html/parse-into-document html)
+          tree (dom/tree document)
+          [p sibling] (:children tree)]
+      (is (= 2 (count (:children tree))) (str tag " must close the open <p>"))
+      (is (= :p (:tag p)) (str tag " case"))
+      (is (= ["one"] (:children p)) (str tag " case"))
+      (is (= tag (:tag sibling)) (str tag " must be <p>'s sibling, not its child")))))
+
+(deftest p-auto-closing-does-not-trigger-for-inline-elements
+  ;; The block-level list is specific -- an INLINE element (e.g. <span>)
+  ;; immediately following an open <p> is not in it, so it still nests
+  ;; inside the <p> exactly as real HTML5 requires (only the closing list
+  ;; of block-level elements gets the implicit close).
+  (let [document (html/parse-into-document "<p>one<span>two</span></p>")
+        tree (dom/tree document)
+        p (first (:children tree))
+        [text span] (:children p)]
+    (is (= 1 (count (:children tree))))
+    (is (= :p (:tag p)))
+    (is (= "one" text))
+    (is (= :span (:tag span)))
+    (is (= ["two"] (:children span)))))
+
+(deftest explicit-p-closing-tag-still-works-without-auto-close
+  ;; No-regression check for <p>, mirroring the <li> one above.
+  (let [document (html/parse-into-document "<div><p>one</p><p>two</p></div>")
+        tree (dom/tree document)
+        div (first (:children tree))
+        [p1 p2] (:children div)]
+    (is (= 2 (count (:children div))))
+    (is (= :p (:tag p1))) (is (= ["one"] (:children p1)))
+    (is (= :p (:tag p2))) (is (= ["two"] (:children p2)))))
+
+;; <dt>/<dd> CROSS-closing auto-closing (see `auto-close-tags` in
+;; htmldom.core). Unlike <li>/<option>/<p> above, which only close on
+;; ANOTHER INSTANCE OF THE SAME TAG, <dt>/<dd> close each other: a new <dt>
+;; implicitly closes a currently open <dt> OR <dd>, and a new <dd> implicitly
+;; closes a currently open <dd> OR <dt>. Before this fix, definition lists
+;; written without explicit closing tags -- a common, real-world pattern --
+;; silently produced a wrongly-nested tree: `<dl>` ended up with only ONE
+;; child (the first <dt>), with every subsequent <dd>/<dt> nested deeper and
+;; deeper inside it instead of landing as flat siblings.
+
+(deftest dt-dd-alternating-without-closing-tags-produces-flat-siblings
+  ;; The confirmed repro from the bug report: <dt>/<dd> alternating with no
+  ;; explicit closing tags must land as FOUR flat SIBLINGS under <dl>, not
+  ;; nested four deep.
+  (let [document (html/parse-into-document
+                  "<dl><dt>Term 1<dd>Def 1<dt>Term 2<dd>Def 2</dl>")
+        tree (dom/tree document)
+        dl (first (:children tree))
+        [dt1 dd1 dt2 dd2] (:children dl)]
+    (is (= 1 (count (:children tree))))
+    (is (= :dl (:tag dl)))
+    (is (= 4 (count (:children dl))))
+    (is (= :dt (:tag dt1))) (is (= ["Term 1"] (:children dt1)))
+    (is (= :dd (:tag dd1))) (is (= ["Def 1"] (:children dd1)))
+    (is (= :dt (:tag dt2))) (is (= ["Term 2"] (:children dt2)))
+    (is (= :dd (:tag dd2))) (is (= ["Def 2"] (:children dd2)))))
+
+(deftest dt-followed-by-dt-closes-correctly
+  ;; Same-tag case: a new <dt> closes a currently open <dt>.
+  (let [document (html/parse-into-document "<dl><dt>one<dt>two</dl>")
+        tree (dom/tree document)
+        dl (first (:children tree))
+        [dt1 dt2] (:children dl)]
+    (is (= 2 (count (:children dl))))
+    (is (= :dt (:tag dt1))) (is (= ["one"] (:children dt1)))
+    (is (= :dt (:tag dt2))) (is (= ["two"] (:children dt2)))))
+
+(deftest dd-followed-by-dt-closes-correctly
+  ;; Proves the CROSS-tag closing, not just same-tag: a <dd> is implicitly
+  ;; closed by a following <dt>, even though they're different tags.
+  (let [document (html/parse-into-document "<dl><dd>one<dt>two</dl>")
+        tree (dom/tree document)
+        dl (first (:children tree))
+        [dd1 dt1] (:children dl)]
+    (is (= 2 (count (:children dl))))
+    (is (= :dd (:tag dd1))) (is (= ["one"] (:children dd1)))
+    (is (= :dt (:tag dt1))) (is (= ["two"] (:children dt1)))))
+
+(deftest dd-followed-by-dd-closes-correctly
+  ;; Same-tag case: a new <dd> closes a currently open <dd>.
+  (let [document (html/parse-into-document "<dl><dd>one<dd>two</dl>")
+        tree (dom/tree document)
+        dl (first (:children tree))
+        [dd1 dd2] (:children dl)]
+    (is (= 2 (count (:children dl))))
+    (is (= :dd (:tag dd1))) (is (= ["one"] (:children dd1)))
+    (is (= :dd (:tag dd2))) (is (= ["two"] (:children dd2)))))
+
+(deftest dt-dd-auto-close-does-not-reach-past-a-nested-dl
+  ;; Mirrors `li-auto-close-does-not-reach-past-a-nested-list`: the
+  ;; auto-close check only looks at the TOP of the stack (the innermost open
+  ;; element), never scanning down past it. A new <dt> that opens inside a
+  ;; nested <dl> which itself sits inside a still-open outer <dd> must NOT
+  ;; reach past the nested <dl> to cross-close the outer <dd> it doesn't
+  ;; actually follow -- the outer <dd> should still contain the whole nested
+  ;; definition list.
+  (let [document (html/parse-into-document
+                  "<dl><dd>outer<dl><dt>inner-one<dt>inner-two</dl></dl>")
+        tree (dom/tree document)
+        outer-dl (first (:children tree))
+        outer-dd (first (:children outer-dl))
+        [text inner-dl] (:children outer-dd)
+        [inner-dt1 inner-dt2] (:children inner-dl)]
+    (is (= 1 (count (:children outer-dl))))
+    (is (= :dd (:tag outer-dd)))
+    (is (= "outer" text))
+    (is (= :dl (:tag inner-dl)))
+    (is (= 2 (count (:children inner-dl))))
+    (is (= :dt (:tag inner-dt1))) (is (= ["inner-one"] (:children inner-dt1)))
+    (is (= :dt (:tag inner-dt2))) (is (= ["inner-two"] (:children inner-dt2)))))
+
+(deftest explicit-dt-dd-closing-tags-still-work-without-auto-close
+  ;; No-regression check: ordinary, fully-explicit closing tags must keep
+  ;; producing the same correct sibling structure, with or without the new
+  ;; cross-closing auto-close mechanism ever kicking in.
+  (let [document (html/parse-into-document
+                  "<dl><dt>term</dt><dd>def</dd></dl>")
+        tree (dom/tree document)
+        dl (first (:children tree))
+        [dt dd] (:children dl)]
+    (is (= 2 (count (:children dl))))
+    (is (= :dt (:tag dt))) (is (= ["term"] (:children dt)))
+    (is (= :dd (:tag dd))) (is (= ["def"] (:children dd)))))
+
+(deftest table-rows-and-cells-without-closing-tags-produce-flat-siblings
+  ;; The confirmed repro from the bug report: without this fix, every cell
+  ;; after the first nested INSIDE the previous cell, and every row after
+  ;; the first nested inside the previous row's last cell. A real <tr>
+  ;; auto-close needs to CASCADE through a still-open <td>/<th> first (the
+  ;; single-pop mechanism dt/dd/li/option/p use isn't enough on its own).
+  (let [document (html/parse-into-document
+                  "<table><tr><td>A<td>B<tr><td>C</table>")
+        tree (dom/tree document)
+        table (first (:children tree))
+        tbody (first (:children table))
+        [tr1 tr2] (:children tbody)]
+    (is (= 1 (count (:children table)))
+        "bare rows get wrapped in a single implicit tbody")
+    (is (= :tbody (:tag tbody)))
+    (is (= 2 (count (:children tbody))))
+    (is (= :tr (:tag tr1)))
+    (is (= 2 (count (:children tr1))))
+    (is (= :td (:tag (first (:children tr1)))))
+    (is (= ["A"] (:children (first (:children tr1)))))
+    (is (= :td (:tag (second (:children tr1)))))
+    (is (= ["B"] (:children (second (:children tr1)))))
+    (is (= :tr (:tag tr2)))
+    (is (= 1 (count (:children tr2))))
+    (is (= :td (:tag (first (:children tr2)))))
+    (is (= ["C"] (:children (first (:children tr2)))))))
+
+(deftest th-and-td-cross-close-each-other-across-rows
+  ;; Proves the CROSS-tag cell closing (th closed by td and vice versa),
+  ;; not just same-tag, mirroring dd-followed-by-dt-closes-correctly, plus
+  ;; the tr-cascading behavior across three rows in a row (a header row of
+  ;; <th>s followed by two data rows of <td>s, none explicitly closed).
+  (let [document (html/parse-into-document
+                  "<table><tr><th>H1<th>H2<tr><td>A<td>B<tr><td>C<td>D</table>")
+        tree (dom/tree document)
+        table (first (:children tree))
+        tbody (first (:children table))
+        [tr1 tr2 tr3] (:children tbody)]
+    (is (= 1 (count (:children table)))
+        "bare rows get wrapped in a single implicit tbody")
+    (is (= 3 (count (:children tbody))))
+    (is (every? #(= :th (:tag %)) (:children tr1)))
+    (is (= ["H1"] (:children (first (:children tr1)))))
+    (is (= ["H2"] (:children (second (:children tr1)))))
+    (is (every? #(= :td (:tag %)) (:children tr2)))
+    (is (= ["A"] (:children (first (:children tr2)))))
+    (is (= ["B"] (:children (second (:children tr2)))))
+    (is (every? #(= :td (:tag %)) (:children tr3)))
+    (is (= ["C"] (:children (first (:children tr3)))))
+    (is (= ["D"] (:children (second (:children tr3)))))))
+
+(deftest table-auto-close-does-not-reach-past-a-nested-table
+  ;; Mirrors `dt-dd-auto-close-does-not-reach-past-a-nested-dl`: a <tr>/<td>
+  ;; that opens inside a NESTED <table> (itself inside an outer, still-open
+  ;; <td>) must not reach past the nested table to cross-close the outer
+  ;; cell/row, even though the cascading pop now walks through more than
+  ;; one level for ordinary same-table auto-closing.
+  (let [document (html/parse-into-document
+                  (str "<table><tr><td>outer<table><tr><td>inner"
+                       "<tr><td>inner2</table>still-outer"
+                       "<tr><td>after</table>"))
+        tree (dom/tree document)
+        outer-table (first (:children tree))
+        outer-tbody (first (:children outer-table))
+        [outer-tr1 outer-tr2] (:children outer-tbody)
+        outer-td (first (:children outer-tr1))
+        [text inner-table trailing-text] (:children outer-td)
+        inner-tbody (first (:children inner-table))
+        [inner-tr1 inner-tr2] (:children inner-tbody)]
+    (is (= 1 (count (:children outer-table)))
+        "the outer table wraps its bare rows in a single implicit tbody, independent of the nested table's own")
+    (is (= 2 (count (:children outer-tbody)))
+        "the outer table's tbody must have exactly 2 rows (the <tr><td>after</td> must not have nested inside the inner table)")
+    (is (= "outer" text))
+    (is (= :table (:tag inner-table)))
+    (is (= 1 (count (:children inner-table)))
+        "the nested table gets its OWN independent implicit tbody, not reusing the outer table's")
+    (is (= 2 (count (:children inner-tbody))))
+    (is (= ["inner"] (:children (first (:children inner-tr1)))))
+    (is (= ["inner2"] (:children (first (:children inner-tr2)))))
+    (is (= "still-outer" trailing-text)
+        "text after the nested table must still be a sibling inside the OUTER td, not swallowed by the inner table's own auto-close cascade")
+    (is (= ["after"] (:children (first (:children outer-tr2)))))))
+
+(deftest explicit-table-closing-tags-still-work-without-auto-close
+  ;; No-regression check: ordinary, fully-explicit closing tags must keep
+  ;; producing the same correct sibling structure, with or without the new
+  ;; cascading auto-close mechanism ever kicking in.
+  (let [document (html/parse-into-document
+                  "<table><tr><td>A</td><td>B</td></tr><tr><td>C</td></tr></table>")
+        tree (dom/tree document)
+        table (first (:children tree))
+        tbody (first (:children table))
+        [tr1 tr2] (:children tbody)]
+    (is (= 1 (count (:children table)))
+        "even fully-explicit rows get wrapped in a single implicit tbody, same as bare rows")
+    (is (= 2 (count (:children tbody))))
+    (is (= 2 (count (:children tr1))))
+    (is (= ["A"] (:children (first (:children tr1)))))
+    (is (= ["B"] (:children (second (:children tr1)))))
+    (is (= 1 (count (:children tr2))))
+    (is (= ["C"] (:children (first (:children tr2)))))))
+
+(deftest bare-table-rows-get-wrapped-in-a-single-implicit-tbody
+  ;; The confirmed repro from the bug report: a <table> with rows but no
+  ;; explicit <thead>/<tbody>/<tfoot> at all -- the single most common
+  ;; real-world table shape -- nested every <tr> DIRECTLY under <table>,
+  ;; with no row-group wrapper. This is a genuinely visible, reachable bug,
+  ;; not just a DOM-purity nicety: confirmed separately that it makes a
+  ;; `table > tr` CSS child-combinator selector wrongly MATCH (real
+  ;; HTML5/CSS never lets it -- a real tr's parent is always a row group)
+  ;; while the equally common `tbody > tr` selector wrongly never matches.
+  (let [document (html/parse-into-document
+                  "<table><tr><td>A</td></tr><tr><td>B</td></tr></table>")
+        tree (dom/tree document)
+        table (first (:children tree))
+        tbody (first (:children table))]
+    (is (= 1 (count (:children table))) "exactly one implicit tbody, not one per row")
+    (is (= :tbody (:tag tbody)))
+    (is (= 2 (count (:children tbody))) "both rows land inside the SAME implicit tbody")
+    (is (every? #(= :tr (:tag %)) (:children tbody)))))
+
+(deftest explicit-thead-tbody-tfoot-are-unaffected-by-implicit-tbody
+  ;; No-regression check: a table that already spells out its own row
+  ;; groups explicitly must not get an extra, redundant implicit tbody
+  ;; inserted anywhere -- the implicit-insertion rule only ever fires when
+  ;; the current stack top is bare <table> itself.
+  (let [document (html/parse-into-document
+                  (str "<table><thead><tr><th>H</th></tr></thead>"
+                       "<tbody><tr><td>A</td></tr></tbody>"
+                       "<tfoot><tr><td>F</td></tr></tfoot></table>"))
+        tree (dom/tree document)
+        table (first (:children tree))
+        [thead tbody tfoot] (:children table)]
+    (is (= 3 (count (:children table))) "no extra row group inserted")
+    (is (= [:thead :tbody :tfoot] (map :tag (:children table))))
+    (is (= ["H"] (:children (first (:children (first (:children thead)))))))
+    (is (= ["A"] (:children (first (:children (first (:children tbody)))))))
+    (is (= ["F"] (:children (first (:children (first (:children tfoot)))))))))
+
+(deftest nested-table-gets-its-own-independent-implicit-tbody
+  ;; A <table> nested inside a bare row's cell must get its OWN implicit
+  ;; tbody, entirely independent of the outer table's -- the stack-top
+  ;; check that triggers insertion only ever sees the INNERMOST open
+  ;; <table>, never reaching past it to the outer one.
+  (let [document (html/parse-into-document
+                  "<table><tr><td><table><tr><td>inner</td></tr></table></td></tr></table>")
+        tree (dom/tree document)
+        outer-table (first (:children tree))
+        outer-tbody (first (:children outer-table))
+        outer-td (first (:children (first (:children outer-tbody))))
+        inner-table (first (:children outer-td))
+        inner-tbody (first (:children inner-table))]
+    (is (= 1 (count (:children outer-table))))
+    (is (= :table (:tag inner-table)))
+    (is (= 1 (count (:children inner-table)))
+        "the nested table gets its own implicit tbody, not the outer one's")
+    (is (= :tbody (:tag inner-tbody)))
+    (is (= ["inner"] (:children (first (:children (first (:children inner-tbody)))))))))
+
+(deftest pre-content-preserves-internal-whitespace-and-newlines
+  ;; The confirmed repro from the bug report: real <pre> elements must
+  ;; preserve their text content's exact whitespace/newlines -- unlike
+  ;; every other element, whose text gets runs of whitespace collapsed to
+  ;; a single space. Before this fix, <pre>'s content went through the
+  ;; SAME generic collapsing as everything else, silently destroying any
+  ;; code block/ASCII-art formatting.
+  (let [document (html/parse-into-document
+                  "<pre>line one\n  line two\n    line three</pre>")
+        tree (dom/tree document)
+        pre (first (:children tree))]
+    (is (= :pre (:tag pre)))
+    (is (= ["line one\n  line two\n    line three"] (:children pre)))))
+
+(deftest pre-preserves-whitespace-in-nested-elements-too
+  ;; <pre>, unlike raw-text tags, allows real nested markup (e.g. a
+  ;; <span> for syntax highlighting) -- text inside such a nested element
+  ;; must ALSO keep its whitespace verbatim, not just <pre>'s own direct
+  ;; text children. Proves the ancestor scan isn't limited to the
+  ;; immediate parent.
+  (let [document (html/parse-into-document "<pre>a\n<span>b\n  c</span>\nd</pre>")
+        tree (dom/tree document)
+        pre (first (:children tree))
+        [text-a span text-d] (:children pre)]
+    (is (= "a\n" text-a))
+    (is (= :span (:tag span)))
+    (is (= ["b\n  c"] (:children span)))
+    (is (= "\nd" text-d))))
+
+(deftest ordinary-elements-keep-every-whitespace-character
+  ;; This test used to assert `["Hello\n world \n again"]` -- newlines kept
+  ;; (an earlier round had already recognised those as a CSS decision) and
+  ;; space/tab RUNS collapsed to one space, on the reasoning that space
+  ;; collapsing was HTML-structural where newline handling was not.
+  ;;
+  ;; Measured, that reasoning was wrong about its own half. Brave 151,
+  ;; 2026-08-06, `<div>   a   b   </div>` through the HTML fragment parsing
+  ;; algorithm gives the text node the codepoints
+  ;; `SP SP SP a SP SP SP b SP SP SP` -- the parser collapses NOTHING. A
+  ;; browser reaches the same rendered result by collapsing at layout time,
+  ;; from `white-space`, which is CSS and which a parser cannot see.
+  ;;
+  ;; So the number here changed because the browser was asked, not because
+  ;; a convention changed: the assertion is now the source string itself.
+  (let [document (html/parse-into-document "<p>Hello\n   world  \n  again</p>")
+        tree (dom/tree document)
+        p (first (:children tree))]
+    (is (= ["Hello\n   world  \n  again"] (:children p)))))
+
+(deftest carriage-returns-normalize-to-line-feeds
+  ;; WHATWG 13.2.3.5 input stream preprocessing, and the one whitespace
+  ;; rewrite this parser DOES perform. Measured in Brave 151, 2026-08-06:
+  ;; `<div>a\r\nb</div>`, `<pre>a\r\nb</pre>` and `<pre>a\rb</pre>` all give
+  ;; the codepoints `a LF b`, and both `<pre>` shapes render 40px tall --
+  ;; a real line break rather than a stray control character.
+  ;;
+  ;; Both halves are load-bearing and neither was right before. Outside a
+  ;; preserving context a CR was folded into the collapsing class and came
+  ;; out a SPACE; inside one it survived as a literal U+000D. It is now the
+  ;; same LINE FEED in both, because the rewrite happens on the source
+  ;; before tokenizing rather than in the tree builder's text path -- which
+  ;; is also the only place that can reach `<pre>` and raw-text content.
+  (let [text-of (fn [html]
+                  (->> (vals (:nodes (html/parse-into-document html)))
+                       (filter #(= :text (:node/type %)))
+                       (map :text)
+                       (str/join "")))]
+    (is (= "a\nb" (text-of "<div>a\r\nb</div>")) "CRLF is one LINE FEED")
+    (is (= "a\nb" (text-of "<div>a\rb</div>")) "a lone CR is a LINE FEED")
+    (is (= "a\nb" (text-of "<pre>a\r\nb</pre>")) "and inside <pre> too")
+    ;; The `<pre>` leading-newline drop is applied to the NORMALISED text,
+    ;; so a source that opens with CRLF loses that one line feed exactly as
+    ;; one written with a bare LF does.
+    (is (= "x" (text-of "<pre>\r\nx</pre>")))))
+
+(deftest script-and-textarea-content-stay-verbatim-without-regression
+  ;; No-regression check, the one genuinely at risk from this fix: moving
+  ;; the collapse decision into parse-into-document's generic `:text`
+  ;; case (which now runs for EVERY :text token, regardless of origin)
+  ;; must not start collapsing whitespace inside raw-text/RCDATA elements
+  ;; (<script>/<style>/<title>/<textarea>) -- their content was already,
+  ;; correctly, verbatim before this fix via a completely separate
+  ;; tokenizing path, and must stay that way.
+  (let [script-doc (html/parse-into-document
+                    "<script>function f() {\n  return 1;\n}</script>")
+        script (first (:children (dom/tree script-doc)))
+        textarea-doc (html/parse-into-document "<textarea>line1\n  line2</textarea>")
+        textarea (first (:children (dom/tree textarea-doc)))]
+    (is (= ["function f() {\n  return 1;\n}"] (:children script)))
+    (is (= ["line1\n  line2"] (:children textarea)))))
+
+(deftest pre-drops-exactly-one-leading-line-feed
+  ;; WHATWG spec: if a <pre>'s content begins with a single U+000A LINE
+  ;; FEED, that one character is silently dropped -- authoring
+  ;; convenience for the extremely common "<pre>\ncode..." source-
+  ;; formatting habit. Previously entirely unhandled -- neither the
+  ;; tokenizer nor parse-into-document had any leading-newline logic at
+  ;; all, so this LF survived into the pre's own text content verbatim.
+  (let [pre (fn [html] (first (:children (dom/tree (html/parse-into-document html)))))]
+    (is (= ["foo"] (:children (pre "<pre>\nfoo</pre>")))
+        "the single leading LF is dropped, not just any leading whitespace run")
+    (is (= ["\nfoo"] (:children (pre "<pre>\n\nfoo</pre>")))
+        "exactly ONE leading LF is dropped -- a second one immediately after stays, proving this isn't a trim-all")
+    (is (= ["foo"] (:children (pre "<pre>foo</pre>")))
+        "no regression: content with no leading LF at all is untouched")
+    (is (= [] (:children (pre "<pre>\n</pre>")))
+        "a pre whose only content is the single leading LF ends up with zero children, not a stray empty text node")))
+
+(deftest pre-leading-lf-strip-only-applies-to-pres-own-immediate-text-not-nested-elements
+  ;; <pre>, unlike <textarea>, allows real nested markup -- the leading-LF
+  ;; rule must only ever apply to the token IMMEDIATELY following <pre>'s
+  ;; own start tag, never to a nested descendant's own separate leading
+  ;; newline (e.g. a <span> for syntax highlighting starting a new line).
+  (let [document (html/parse-into-document "<pre><span>\nx</span></pre>")
+        tree (dom/tree document)
+        pre (first (:children tree))
+        span (first (:children pre))]
+    (is (= :span (:tag span)))
+    (is (= ["\nx"] (:children span))
+        "the nested span's own leading newline is untouched -- only pre's OWN immediate first token is eligible")))
+
+(deftest textarea-drops-exactly-one-leading-line-feed
+  ;; The same WHATWG spec rule as <pre> above, but scoped to `textarea`
+  ;; specifically -- `title`/`script`/`style` (this file's other
+  ;; raw-text/RCDATA tags) do NOT get this treatment, only pre/textarea/
+  ;; listing per spec.
+  (let [textarea (fn [html] (first (:children (dom/tree (html/parse-into-document html)))))]
+    (is (= ["foo"] (:children (textarea "<textarea>\nfoo</textarea>")))
+        "the single leading LF is dropped from the textarea's own raw text content")
+    (is (= ["\nfoo"] (:children (textarea "<textarea>\n\nfoo</textarea>")))
+        "exactly ONE leading LF is dropped, a second one immediately after stays")
+    (is (= ["foo"] (:children (textarea "<textarea>foo</textarea>")))
+        "no regression: content with no leading LF at all is untouched")
+    (is (= [] (:children (textarea "<textarea>\n</textarea>")))
+        "a textarea whose only content is the single leading LF ends up with zero children, not a stray empty text node")))
+
+(deftest title-and-script-do-not-drop-a-leading-line-feed-unlike-pre-and-textarea
+  ;; Confirms the leading-LF-drop rule is correctly scoped to pre/
+  ;; textarea only -- <title> and <script> (this file's other raw-text/
+  ;; RCDATA tags) must NOT silently drop a real leading newline the
+  ;; author's own source genuinely contains.
+  (let [title-doc (html/parse-into-document "<title>\nPage Title</title>")
+        title (first (:children (dom/tree title-doc)))
+        script-doc (html/parse-into-document "<script>\nconsole.log(1)</script>")
+        script (first (:children (dom/tree script-doc)))]
+    (is (= ["\nPage Title"] (:children title)))
+    (is (= ["\nconsole.log(1)"] (:children script)))))
+
+;; ---- inline style calc() ----
+;;
+;; Before this fix, an inline `style="width: calc(100px + 20px)"` attribute
+;; never resolved its calc() at all -- cssom's own cascade (rule-based CSS,
+;; e.g. `.box { width: calc(100px + 20px) }`) already resolved constant
+;; calc() correctly via cssom.core's own calc pipeline, but this namespace's
+;; `parse-style-value` (the coercion step behind every *inline* style=""
+;; attribute, which never goes through cssom's cascade at all) had no calc()
+;; support of its own, so the raw string passed through untouched and
+;; downstream numeric coercion silently read the wrong number (the first
+;; digit run it found) instead of the correct arithmetic result -- confirmed
+;; end-to-end via browser.core/load-html before this fix: the same
+;; calc(100px + 20px) rendered width 100 via an inline style= attribute but
+;; the correct 120 via an equivalent CSS rule.
+
+(defn- calc-probe
+  [prop value]
+  (get (html/parse-style (str prop ": " value)) (keyword prop)))
+
+(deftest inline-style-calc-constant-expression-resolves-to-a-plain-number
+  (is (= 120 (calc-probe "width" "calc(100px + 20px)"))
+      "two px lengths added together")
+  (is (= 16 (calc-probe "padding" "calc(2 * 8px)"))
+      "a plain number times a px length")
+  (is (= 25 (calc-probe "gap" "calc(100px / 4)"))
+      "a px length divided by a plain number")
+  (is (= 120 (calc-probe "width" "calc( 100px + 20px )"))
+      "whitespace immediately inside the parens is insignificant"))
+
+(deftest inline-style-calc-multiplication-and-division-bind-tighter-than-addition-and-subtraction
+  (is (= 116 (calc-probe "width" "calc(100px + 2 * 8px)"))
+      "* must bind before + -- 100px + (2 * 8px) = 116, not (100 + 2) * 8 = 816"))
+
+(deftest inline-style-calc-nested-parens-override-default-precedence
+  (is (= 32 (calc-probe "width" "calc((10px + 6px) * 2)"))))
+
+(deftest inline-style-calc-supports-negative-numbers
+  (is (= 15 (calc-probe "width" "calc(-5px + 20px)"))))
+
+(deftest inline-style-calc-keyword-is-case-insensitive-like-real-css
+  (is (= 120 (calc-probe "width" "CALC(100px + 20px)"))))
+
+(deftest inline-style-calc-division-by-zero-does-not-resolve
+  (is (= "calc(100px / 0)" (calc-probe "width" "calc(100px / 0)"))
+      "real CSS: division by the number zero is invalid calc(), not
+       Infinity/NaN -- falls through as the same raw unparsed string"))
+
+(deftest inline-style-calc-with-a-percentage-stays-unresolved
+  (is (= "calc(100% - 20px)" (calc-probe "width" "calc(100% - 20px)"))
+      "a percentage inside calc() needs real layout against the
+       container's own actual size -- out of this engine's bounded
+       constant-calc() subset -- so the whole declaration falls through as
+       the same raw, unparsed string, never a guessed number"))
+
+(deftest inline-style-malformed-calc-does-not-crash-and-stays-unresolved
+  (is (= "calc(100px +)" (calc-probe "width" "calc(100px +)"))
+      "a dangling operator with no right-hand operand")
+  (is (= "calc(100px 20px)" (calc-probe "height" "calc(100px 20px)"))
+      "two operands with no operator between them"))
+
+(deftest inline-style-calc-resolves-through-the-full-inline-attribute-parse
+  ;; The exact confirmed repro: a real <div style="..."> attribute, parsed
+  ;; through the full parse-into-document path (not just parse-style in
+  ;; isolation), ends up with the resolved plain number on the node's own
+  ;; :attrs, exactly like a bare `<n>px` value already did.
+  (let [document (html/parse-into-document
+                   "<main><div style=\"width: calc(100px + 20px)\">x</div></main>")
+        root (dom/node document (:root document))
+        main (dom/node document (first (:children root)))
+        div (dom/node document (first (:children main)))]
+    (is (= 120 (get-in div [:attrs :style/width])))))
+
+(deftest unitless-line-height-in-an-inline-style-stays-a-ratio
+  ;; Found by kotoba-lang/cssom's differential conformance harness against
+  ;; a real Blink browser: `line-height: 2` was coerced to the NUMBER 2 by
+  ;; the generic integer coercion, which cssom.layout can only read as an
+  ;; absolute 2px, so every wrapped line stacked almost exactly on top of
+  ;; the one before it. Real CSS reads a unitless line-height as a ratio of
+  ;; the element's own font-size.
+  (let [doc (html/parse-into-document "<p style=\"line-height: 2\">x</p>")
+        p (first (filter #(= :p (:tag %)) (vals (:nodes doc))))]
+    (is (= "2" (get-in p [:attrs :style-inline :line-height]))
+        "kept as a string, which is what routes it down cssom.layout's
+         multiplier branch"))
+  (let [doc (html/parse-into-document "<p style=\"line-height: 2px\">x</p>")
+        p (first (filter #(= :p (:tag %)) (vals (:nodes doc))))]
+    (is (= 2 (get-in p [:attrs :style-inline :line-height]))
+        "a real px length still coerces to a number and stays absolute"))
+  (let [doc (html/parse-into-document "<p style=\"line-height: 1.5\">x</p>")
+        p (first (filter #(= :p (:tag %)) (vals (:nodes doc))))]
+    (is (= "1.5" (get-in p [:attrs :style-inline :line-height]))
+        "the decimal form was never affected and is unchanged"))
+  (let [doc (html/parse-into-document "<p style=\"width: 2\">x</p>")
+        p (first (filter #(= :p (:tag %)) (vals (:nodes doc))))]
+    (is (= 2 (get-in p [:attrs :style-inline :width]))
+        "no other property changes: a bare integer still coerces")))
+
+(deftest common-page-furniture-entities-decode
+  ;; `&middot;` between footer links rendered as the literal text
+  ;; "&middot;" -- found by kotoba-lang/cssom's conformance corpus on a
+  ;; real footer shape. A missing named entity here is not a subtle
+  ;; degradation: the source text is painted on screen.
+  (let [doc (html/parse-into-document
+             "<p>&copy; 2026 &middot; &rsquo; &rarr; &euro; &bull;</p>")
+        text (->> (vals (:nodes doc))
+                  (filter #(= :text (:node/type %)))
+                  (map :text)
+                  (str/join ""))]
+    (is (str/includes? text "·"))
+    (is (str/includes? text "’"))
+    (is (str/includes? text "→"))
+    (is (str/includes? text "€"))
+    (is (str/includes? text "•"))
+    (is (not (str/includes? text "&middot;"))
+        "and the source form is gone, not merely accompanied"))
+  (let [doc (html/parse-into-document "<p>&notarealentity;</p>")
+        text (->> (vals (:nodes doc))
+                  (filter #(= :text (:node/type %)))
+                  (map :text)
+                  (str/join ""))]
+    ;; This assertion used to require the whole string to survive as
+    ;; literal text, on the reasoning that an unknown entity should be left
+    ;; alone rather than guessed at. Measured in Brave, that is not what a
+    ;; browser does: `&notarealentity;` becomes U+00AC followed by
+    ;; "arealentity;", because `not` is one of the ~106 LEGACY named
+    ;; references that resolve without a trailing semicolon, and the spec
+    ;; takes the longest match from that closed list.
+    ;;
+    ;; So the old expectation was not conservative, it was wrong -- and
+    ;; being wrong the same way for `&ampb` is what made `a&ampb` render as
+    ;; source text. What is still left alone is a name that is NOT on the
+    ;; legacy list: see the `&middot` case below and
+    ;; `:entity/no-semicolon-in-attribute` in the corpus.
+    (is (str/starts-with? text "\u00ACarealentity;")
+        "the longest LEGACY name (`not`) resolves; the rest stays literal")
+    (is (not (str/includes? text "&not"))
+        "the source form of the resolved part is gone")))
+
+(deftest bare-lt-in-prose-is-literal-text
+  ;; Found by conformance/ (case `eof/lt-gt-in-prose`): `<p>1 < 2 and 3 >
+  ;; 4</p>` tokenized to a start tag named "2" with an attribute "and", and
+  ;; `2 and 3 >` vanished from the document -- the scan took the `<` before
+  ;; ` 2` as a tag open and found the `>` after `3` as its terminator. Real
+  ;; HTML5's tag-open state only enters markup for ASCII alpha, `/` + alpha,
+  ;; `!` or `?`; anything else emits the `<` as an ordinary character.
+  (is (= [{:type :start :tag "p" :attrs {} :self? false}
+          {:type :text :text "1 < 2 and 3 > 4"}
+          {:type :end :tag "p"}]
+         (html/tokenize "<p>1 < 2 and 3 > 4</p>"))
+      "and it stays in ONE text node, as a browser builds it")
+  (is (= [{:type :start :tag "p" :attrs {} :self? false}
+          {:type :text :text "a < b"}
+          {:type :end :tag "p"}]
+         (html/tokenize "<p>a < b</p>")))
+  (is (= [{:type :start :tag "p" :attrs {} :self? false}
+          {:type :text :text "a<1b"}
+          {:type :end :tag "p"}]
+         (html/tokenize "<p>a<1b</p>"))
+      "a digit is not an ASCII alpha either")
+  (is (= [{:type :start :tag "p" :attrs {} :self? false}
+          {:type :text :text "x"}
+          {:type :end :tag "p"}]
+         (html/tokenize "<p>x</p>"))
+      "and ordinary markup is untouched"))
+
+(deftest unterminated-tag-at-eof-drops-the-partial-tag
+  ;; Found by conformance/ (case `eof/unterminated-tag`): `<div class="x`
+  ;; with no closing `>` leaked the raw markup `div class="x` into the
+  ;; document as a visible text node. WHATWG's eof-in-tag parse error drops
+  ;; the partial tag and everything consumed into it.
+  (is (= [{:type :start :tag "p" :attrs {} :self? false}
+          {:type :text :text "a"}
+          {:type :end :tag "p"}]
+         (html/tokenize "<p>a</p><div class=\"x")))
+  (is (= [{:type :text :text "a"}]
+         (html/tokenize "a<div"))))
+
+(deftest nbsp-survives-whitespace-collapsing
+  ;; Found by conformance/ (case `entity/nbsp-is-not-collapsible`): the
+  ;; browser reported codepoints 97/160/98 for `<p>a&nbsp;b</p>` and this
+  ;; parser 97/32/98. Collapsing used `[^\S\n]`, and `\s` also matches
+  ;; U+00A0 -- so the entity was decoded correctly and then immediately
+  ;; rewritten back into a collapsible ordinary space, destroying the one
+  ;; thing `&nbsp;` exists to do.
+  ;;
+  ;; The class that did that is gone entirely now (nothing in this file
+  ;; collapses whitespace any more), so this reads as the regression gate it
+  ;; always was: a decoded U+00A0 must arrive as U+00A0.
+  (let [doc (html/parse-into-document "<p>a&nbsp;b</p>")
+        text (->> (vals (:nodes doc))
+                  (filter #(= :text (:node/type %)))
+                  (map :text)
+                  (str/join ""))]
+    (is (= [97 160 98] (mapv int text))))
+  ;; This half used to assert `"a b"` -- "ordinary spaces and tabs still
+  ;; collapse" -- and it is the assertion that changed, because the
+  ;; behaviour it named was measured and found not to be a parser
+  ;; behaviour at all. Brave 151, 2026-08-06: `<div>a\tb</div>` gives the
+  ;; codepoints `a TAB b`, not `a SP b`. The tab reaching layout intact is
+  ;; the whole point -- in a `white-space: pre` box `a<tab>b` is 63px (nine
+  ;; columns to the next `tab-size: 8` stop) where one space would be 21.
+  (let [doc (html/parse-into-document "<p>a  \t b</p>")
+        text (->> (vals (:nodes doc))
+                  (filter #(= :text (:node/type %)))
+                  (map :text)
+                  (str/join ""))]
+    (is (= "a  \t b" text)
+        "spaces and tabs arrive verbatim; `white-space` decides what happens to them")))
+
+;; ---- foster parenting + implied row structure (WHATWG 13.2.6.1) --------
+;;
+;; Every assertion below records what a real Brave 151 built for the same
+;; markup, read through conformance/cdp_dump.cljk (innerHTML on a detached
+;; <div>, i.e. the HTML fragment parsing algorithm). Four of these shapes
+;; are also conformance corpus cases; the rest are shapes the corpus does
+;; not carry, measured the same way while working out how far the stack-
+;; based approximation of the table insertion modes actually reaches.
+
+(defn- shape
+  "A tree as nested vectors -- `[:tag child ...]`, text nodes as strings --
+   so a whole measured browser tree fits in one readable literal."
+  [node]
+  (into [(:tag node)]
+        (map #(if (string? %) % (shape %)))
+        (:children node)))
+
+(defn- parsed-shape [html]
+  (vec (rest (shape (dom/tree (html/parse-into-document html))))))
+
+(deftest text-in-a-table-is-foster-parented-in-front-of-it
+  ;; Brave: #text "stray", then <table><tbody><tr><td>x. Content that is
+  ;; not allowed in a table does not stay inside it -- it is inserted
+  ;; BEFORE the table, in the table's own parent.
+  (is (= ["stray" [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table>stray<tr><td>x</td></tr></table>")))
+  ;; ... and the foster parent is the TABLE's parent, not the document
+  ;; root: Brave puts `stray` inside the <div>, before the <table>.
+  (is (= [[:div "stray" [:table [:tbody [:tr [:td "x"]]]]]]
+         (parsed-shape "<div><table>stray<tr><td>x</td></tr></table></div>")))
+  ;; A table in a CELL fosters into that cell, for the same reason.
+  (is (= [[:table [:tbody [:tr [:td "inner"
+                                [:table [:tbody [:tr [:td "y"]]]]]]]]]
+         (parsed-shape
+          "<table><tr><td><table>inner<tr><td>y</td></tr></table></td></tr></table>"))))
+
+(deftest elements-in-a-table-are-foster-parented-in-document-order
+  ;; Brave: <div>d</div> then <table>...; and with two of them, both come
+  ;; out in front of the table in source order.
+  (is (= [[:div "d"] [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><div>d</div><tr><td>x</td></tr></table>")))
+  (is (= [[:div "a"] [:div "b"] [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><div>a</div><div>b</div><tr><td>x</td></tr></table>")))
+  ;; Mixed text and formatting keeps its order too (Brave: "a", <b>c</b>,
+  ;; "d", table). The text nodes are separate here and merged in Brave --
+  ;; a node-boundary difference this parser has everywhere, not a shape
+  ;; one; conformance/run.cljk coalesces both sides before comparing.
+  (is (= ["a" [:b "c"] "d" [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table>a<b>c</b>d<tr><td>x</td></tr></table>"))))
+
+(deftest foster-parenting-applies-in-row-and-row-group-contexts-too
+  ;; Brave fosters from all three of "in table", "in table body" and
+  ;; "in row" -- the current node being tbody or tr is no more a legal
+  ;; place for flow content than the table itself.
+  (is (= ["stray" [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><tr>stray<td>x</td></tr></table>")))
+  (is (= ["stray" [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><tbody>stray<tr><td>x</td></tr></tbody></table>")))
+  (is (= ["after" [:table [:tbody [:tr [:td "ok"]]]]]
+         (parsed-shape "<table><tr><td>ok</td></tr>after</table>")))
+  (is (= [[:div "d"] [:table [:tbody [:tr [:td "c"]]]]]
+         (parsed-shape "<table><tr><td>c</td></tr><div>d</div></table>"))))
+
+(deftest whitespace-only-runs-stay-inside-the-table
+  ;; Brave keeps both newlines INSIDE the table -- the first as a child of
+  ;; <table>, the second of the implied <tbody>, since that is the open
+  ;; element when it arrives. Only a run containing something other than
+  ;; ASCII whitespace is foster-parented.
+  (is (= [[:table "\n" [:tbody [:tr [:td "a"]] "\n"]]]
+         (parsed-shape "<table>\n<tr><td>a</td></tr>\n</table>")))
+  ;; A partly-whitespace run goes out WHOLE, spaces included.
+  (is (= [" x " [:table [:tbody [:tr [:td "a"]]]]]
+         (parsed-shape "<table> x <tr><td>a</td></tr></table>")))
+  ;; U+00A0 is not ASCII whitespace and not collapsible, so `&nbsp;` in a
+  ;; table is fostered like any other text -- measured in Brave, and the
+  ;; reason the whitespace test here is a spelled-out character class
+  ;; rather than `\s` or `str/blank?`, both of which match U+00A0.
+  (is (= [" " [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table>&nbsp;<tr><td>x</td></tr></table>"))))
+
+(deftest table-structure-and-head-elements-are-not-foster-parented
+  ;; Measured one shape per tag: these stayed inside the <table> in Brave.
+  (is (= [[:table [:caption "c"] [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><caption>c</caption><tr><td>x</td></tr></table>")))
+  (is (= [[:table [:colgroup [:col]] [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><colgroup><col></colgroup><tr><td>x</td></tr></table>")))
+  (is (= [[:table [:style "s"] [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><style>s</style><tr><td>x</td></tr></table>")))
+  (is (= [[:table [:form] [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><form action=\"/\"><tr><td>x</td></tr></form></table>")))
+  ;; <input type=hidden> is the one attribute-dependent member: Brave keeps
+  ;; it in the table (it renders nothing) and fosters every other input.
+  (is (= [[:table [:input] [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><input type=\"hidden\"><tr><td>x</td></tr></table>")))
+  (is (= [[:input] [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><input type=\"text\"><tr><td>x</td></tr></table>"))))
+
+(deftest a-bare-cell-gets-an-implied-row-as-well-as-an-implied-row-group
+  ;; Brave completes <table><td>x</td></table> into tbody/tr/td. Only the
+  ;; tbody half of this existed before; the docstring of what is now
+  ;; `maybe-insert-implied-table-structure` said the tr half was out of
+  ;; scope, and the conformance corpus (:table/td-without-tr) sized it.
+  (is (= [[:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><td>x</td></table>")))
+  (is (= [[:table [:tbody [:tr [:th "x"]]]]]
+         (parsed-shape "<table><th>x</th></table>")))
+  ;; Consecutive bare cells share the one implied row (Brave), and a cell
+  ;; inside an EXPLICIT row group gets the implied row there.
+  (is (= [[:table [:tbody [:tr [:td "a"] [:td "b"]]]]]
+         (parsed-shape "<table><td>a</td><td>b</td></table>")))
+  (is (= [[:table [:thead [:tr [:td "x"]]]]]
+         (parsed-shape "<table><thead><td>x</td></thead></table>")))
+  ;; A cell arriving after a row has closed opens a NEW row, not a second
+  ;; row group (Brave).
+  (is (= [[:table [:tbody [:tr [:td "a"]] [:tr [:td "b"]]]]]
+         (parsed-shape "<table><tr><td>a</td></tr><td>b</td></table>"))))
+
+(deftest a-foster-parented-element-left-open-does-not-swallow-the-rows
+  ;; Foster parenting moves where a node is INSERTED, never whether it is
+  ;; open -- so the still-open <b> would be the insertion point when <tr>
+  ;; arrives if nothing popped it. Brave: <b>bold</b>, then the table with
+  ;; its rows, then a fresh <b> around the trailing text.
+  ;;
+  ;; The cell's own "x" is now a bare text node, which is Brave's answer.
+  ;; It used to be `[:td [:b "x"]]` here, asserted as this parser's
+  ;; documented scope cut rather than as correct behaviour: with no scope
+  ;; MARKERS in the list of active formatting elements, formatting still
+  ;; open when the table started was reconstructed on entry to the first
+  ;; cell. `afe-marker-tags` closed that -- the <td> now pushes a marker
+  ;; and reconstruction stops there -- so the expectation moves to the
+  ;; measurement it was always compared against, and the SCOPE CUT comment
+  ;; it referred to is gone from htmldom.core.
+  (is (= [[:b "bold"]
+          [:table [:tbody [:tr [:td "x"]]]]
+          [:b "y"]]
+         (parsed-shape "<table><b>bold<tr><td>x</td></tr></table>y")))
+  ;; The same shape with the element closed matches Brave exactly, because
+  ;; the adoption agency drops it from the list at `</b>`.
+  (is (= [[:b "bold"] [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><b>bold</b><tr><td>x</td></tr></table>"))))
+
+(deftest a-nested-table-in-table-context-closes-the-open-one
+  ;; Brave gives TWO sibling tables here -- the first empty, the second
+  ;; holding the row -- not one inside the other.
+  (is (= [[:table] [:table [:tbody [:tr [:td "x"]]]]]
+         (parsed-shape "<table><table><tr><td>x</td></tr></table>")))
+  ;; A table inside a CELL still nests, because a cell is an ordinary
+  ;; insertion point rather than table structure.
+  (is (= [[:table [:tbody [:tr [:td [:table [:tbody [:tr [:td "y"]]]]]]]]]
+         (parsed-shape
+          "<table><tr><td><table><tr><td>y</td></tr></table></td></tr></table>"))))
+
+(deftest stray-table-structure-tags-outside-any-table-do-not-throw
+  ;; Rubbish input, but reachable: a `<tr>`/`<td>`/`<tbody>` at top level
+  ;; makes the current node LOOK like table structure with no table
+  ;; anywhere to foster out of or to close. Every branch of the in-table
+  ;; block has to tolerate that -- `close-open-table-for-nested-table` did
+  ;; not, and threw on the subvec.
+  ;;
+  ;; These assertions are about NOT THROWING, not about matching Brave.
+  ;; Brave drops the stray tags outright (`<tr><table>x</table>` gives it
+  ;; `#text "x"` then an empty `<table>`; `<td>x</td>` gives it a bare
+  ;; `#text "x"`), because "in body" has no rule that keeps them and this
+  ;; parser has no insertion modes to know that. That is the same
+  ;; pre-existing gap `:misc/body-tag-in-flow` measures, and is out of
+  ;; scope here -- what matters is that the shapes below are stable and
+  ;; internally consistent rather than an exception.
+  (is (= [[:tr "x" [:table]]] (parsed-shape "<tr><table>x</table>"))
+      "the text still fosters in front of the table, inside the stray row")
+  (is (= [[:tbody [:div "d"]]] (parsed-shape "<tbody><div>d</div></tbody>"))
+      "no open table means nowhere to foster to, so the div is appended")
+  (is (= [[:tr "t"]] (parsed-shape "<tr>t")))
+  (is (= [[:td "x"]] (parsed-shape "<td>x</td>"))
+      "no implied tbody/tr without a table to put them in"))
+
+(deftest comments-become-real-nodes-and-keep-the-text-around-them-separate
+  ;; Comments used to be discarded by the tokenizer, for the honest reason
+  ;; that there was nowhere to put one: kotoba.wasm.dom had no comment node
+  ;; type until 2026-08-04.
+  ;;
+  ;; Discarding is not neutral. The text on either side becomes ONE node
+  ;; where a browser keeps two -- so the bug was a corrupted text structure,
+  ;; not just a missing node, and both halves are asserted here.
+  (let [doc (html/parse-into-document "<p>a<!-- note -->b</p>")
+        p (first (:children (dom/comment-tree doc)))]
+    (is (= ["a" {:node/type :comment :text " note "} "b"] (:children p)))
+    (is (= ["a" "b"] (:children (first (:children (dom/tree doc)))))
+        "the LAYOUT view drops the comment and still keeps the text separate")
+    (is (= "ab" (dom/text-content doc)) "textContent ignores it, as in a real DOM")))
+
+(deftest an-abrupt-closing-comment-is-empty-not-a-swallowed-document
+  ;; `<!-->` and `<!--->` reuse the marker's own dashes as the closer, so
+  ;; they are complete EMPTY comments. Measured in Brave. The tokenizer
+  ;; already handled the scanning; this pins the emitted data as empty
+  ;; rather than as whatever followed.
+  (let [doc (html/parse-into-document "<p>before</p><!--><p>after</p>")
+        kids (:children (dom/comment-tree doc))]
+    (is (= [:p :comment :p] (mapv #(or (:tag %) (:node/type %)) kids)))
+    (is (= "" (:text (second kids))))))
+
+(deftest foreign-content-self-closes-and-breaks-out
+  ;; Two rules that only apply inside <svg>/<math>, both measured in Brave
+  ;; before implementing.
+  (testing "a trailing slash really closes the element in foreign content"
+    ;; In HTML it is ignored: <div/> opens a div. In SVG it does not.
+    (let [tree (dom/tree (html/parse-into-document "<svg><rect/><circle/></svg>after"))
+          [svg text] (:children tree)]
+      (is (= :svg (:tag svg)))
+      (is (= [:rect :circle] (mapv :tag (:children svg)))
+          "siblings, not nested")
+      (is (= "after" text))))
+  (testing "an HTML tag on the breakout list terminates foreign content"
+    ;; Measured: the <g> is popped too, so the trailing text lands at top
+    ;; level rather than back inside the <svg>.
+    (let [tree (dom/tree (html/parse-into-document "<svg><g><div>x</div></g>tail</svg>"))
+          [svg div text] (:children tree)]
+      (is (= :svg (:tag svg)))
+      (is (= [:g] (mapv :tag (:children svg))))
+      (is (= :div (:tag div)) "the div is a SIBLING of the svg")
+      (is (= "tail" text))))
+  (testing "span is on the breakout list, which is not obvious"
+    ;; This corrected an assumption while probing: `span` looks like a
+    ;; harmless inline and is nonetheless a breakout tag, so it leaves the
+    ;; svg rather than becoming a foreign element inside it.
+    (let [tree (dom/tree (html/parse-into-document "<svg><circle></circle><span>in</span></svg>"))]
+      (is (= [:svg :span] (mapv :tag (:children tree))))))
+  (testing "an HTML integration point keeps HTML inside"
+    (let [tree (dom/tree (html/parse-into-document
+                          "<svg><foreignObject><div>html</div></foreignObject></svg>"))
+          svg (first (:children tree))
+          fo (first (:children svg))]
+      (is (= :foreignobject (:tag fo)))
+      (is (= [:div] (mapv :tag (:children fo)))
+          "the div stays inside, where the same div directly in <svg> breaks out"))))
+
+(deftest template-contents-go-into-the-content-fragment
+  ;; A <template>'s contents are not its children. Measured in Brave for
+  ;; four shapes -- plain, in a table, nested, bare text --
+  ;; `template.childNodes.length` is 0 in every one.
+  (testing "the element renders empty and the fragment holds the tree"
+    (let [doc (html/parse-into-document "<div><template><p>inside</p></template><p>after</p></div>")
+          div (first (:children (dom/tree doc)))
+          [tpl after] (:children div)]
+      (is (= :template (:tag tpl)))
+      (is (empty? (:children tpl)))
+      (is (= :p (:tag after)))
+      (is (= [:p] (mapv :tag (dom/content-tree doc (:node/id tpl)))))))
+  (testing "a template in a table is not foster-parented, and nothing is scaffolded"
+    ;; Two separate barriers had to hold for this: the table's
+    ;; "clear back to table context" step must not pop the template (it did,
+    ;; which is why the <td> arrived after the template had been closed),
+    ;; and the implied tbody/tr scaffolding must not fire inside one.
+    ;; Brave gives a template whose content is a single <td> -- no tbody,
+    ;; no tr.
+    (let [doc (html/parse-into-document "<table><template><td>x</td></template></table>")
+          table (first (:children (dom/tree doc)))
+          [tpl] (:children table)]
+      (is (= [:template] (mapv :tag (:children table)))
+          "the template is the table's only child: no synthesized row group")
+      (is (= [:td] (mapv :tag (dom/content-tree doc (:node/id tpl))))))))
+
+(deftest in-body-token-rules-measured-in-brave
+  (testing "an <a> inside an <a> closes the open one"
+    ;; Brave: two SIBLING anchors, not a nested pair.
+    (let [tree (dom/tree (html/parse-into-document "<a href=\"/1\">1<a href=\"/2\">2</a>"))]
+      (is (= [:a :a] (mapv :tag (:children tree))))
+      (is (= [["1"] ["2"]] (mapv :children (:children tree))))))
+  (testing "and it keeps markup that was already inside the first"
+    (let [tree (dom/tree (html/parse-into-document
+                          "<a href=\"/1\">one<b>bold</b><a href=\"/2\">two</a>tail"))
+          [a1 a2 tail] (:children tree)]
+      (is (= :a (:tag a1)))
+      (is (= ["one" :b] (mapv #(if (string? %) % (:tag %)) (:children a1))))
+      (is (= ["two"] (:children a2)))
+      (is (= "tail" tail))))
+  (testing "</br> is a START tag, and only br behaves that way"
+    ;; Brave: `<p>a<br></br>b</p>` has TWO <br>s. `</img>` is ignored, so
+    ;; `<p>a<img></img>b</p>` has one <img> -- the rule is specific to br.
+    (let [p (first (:children (dom/tree (html/parse-into-document "<p>a<br></br>b</p>"))))]
+      (is (= ["a" :br :br "b"] (mapv #(if (string? %) % (:tag %)) (:children p)))))
+    (let [p (first (:children (dom/tree (html/parse-into-document "<p>a<img></img>b</p>"))))]
+      (is (= ["a" :img "b"] (mapv #(if (string? %) % (:tag %)) (:children p))))))
+  (testing "html/head/body tags are dropped in a fragment, their contents are not"
+    ;; The tag names a structure a fragment already has. Brave keeps the
+    ;; text and drops the element, attributes and all -- and keeps a
+    ;; <title> that was inside a dropped <head>.
+    (let [tree (dom/tree (html/parse-into-document "<div><body class=\"c\">x</body></div>"))
+          div (first (:children tree))]
+      (is (= ["x"] (:children div))))
+    (let [tree (dom/tree (html/parse-into-document "<div><head><title>t</title></head>y</div>"))
+          div (first (:children tree))]
+      (is (= [:title "y"] (mapv #(if (string? %) % (:tag %)) (:children div)))))))
+
+(deftest a-bare-col-gets-the-implied-colgroup-a-real-parser-inserts
+  ;; Every shape below was measured in headless Brave 151 on 2026-08-05, by
+  ;; assigning the markup to `innerHTML` and walking the resulting tree.
+  ;;
+  ;; This is where the divergence was FOUND rather than where it was
+  ;; visible: cssom's conformance corpus reported one `colgroup` box the
+  ;; browser has and that side had not (`:table/col-width-sizes-a-column`),
+  ;; plus 14 computed-style values it could not zip against anything --
+  ;; and the cause was here, in the parser, not in the layout engine.
+
+  ;; The corpus's own shape: two bare `<col>`s share ONE synthesised group.
+  (is (= [[:table [:colgroup [:col] [:col]] [:tbody [:tr [:td "a"] [:td "b"]]]]]
+         (parsed-shape (str "<table><col style=\"width:200px\"><col>"
+                            "<tr><td>a</td><td>b</td></tr></table>"))))
+  ;; Three of them, still one group -- the group is opened once and the
+  ;; later `<col>`s find it already open.
+  (is (= [[:table [:colgroup [:col] [:col] [:col]] [:tbody [:tr [:td "a"]]]]]
+         (parsed-shape "<table><col><col><col><tr><td>a</td></tr></table>")))
+  ;; An EXPLICIT `<colgroup>` is left exactly as it was: nothing is
+  ;; synthesised around a `<col>` that already has a group.
+  (is (= [[:table [:colgroup [:col]] [:tbody [:tr [:td "a"]]]]]
+         (parsed-shape "<table><colgroup><col></colgroup><tr><td>a</td></tr></table>")))
+  ;; ... but an explicit EMPTY one, already closed by its own end tag, does
+  ;; not adopt a following bare `<col>`: Brave reports two colgroups.
+  (is (= [[:table [:colgroup] [:colgroup [:col]] [:tbody [:tr [:td "a"]]]]]
+         (parsed-shape "<table><colgroup></colgroup><col><tr><td>a</td></tr></table>")))
+  ;; A `<col>` that arrives after a ROW pops back to the table and gets its
+  ;; group there, as a SIBLING of the row group rather than inside it.
+  (is (= [[:table [:tbody [:tr [:td "a"]]] [:colgroup [:col]]]]
+         (parsed-shape "<table><tr><td>a</td></tr><col></table>")))
+  ;; Same rule between two row groups, which is what makes the `:table`
+  ;; stop necessary as well as the `:colgroup` one.
+  (is (= [[:table [:thead [:tr [:td "h"]]] [:colgroup [:col]]
+           [:tbody [:tr [:td "a"]]]]]
+         (parsed-shape (str "<table><thead><tr><td>h</td></tr></thead><col>"
+                            "<tbody><tr><td>a</td></tr></tbody></table>"))))
+  ;; and after a `<caption>`, which is popped the same way.
+  (is (= [[:table [:caption "c"] [:colgroup [:col]] [:tbody [:tr [:td "a"]]]]]
+         (parsed-shape "<table><caption>c</caption><col><tr><td>a</td></tr></table>"))))

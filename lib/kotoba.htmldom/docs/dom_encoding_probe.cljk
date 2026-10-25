@@ -1,0 +1,139 @@
+#!/usr/bin/env kbb
+;; Which shape can a Kotoba `:document` actually hold a DOM in?
+;;
+;; This repo is the next whole-component migration to Kotoba, and the obvious
+;; move -- mirror the DOM as a nested `:document`, the way `todo-app` builds a
+;; view -- does not survive contact with the bounds. This measures the three
+;; candidate encodings against all three limits, so the choice is a
+;; measurement rather than a preference, and so it can be re-measured when a
+;; limit moves (one already did: `document-node-limit` went 256 -> 4096 on
+;; 2026-09-10, osaho#88).
+;;
+;; The counting mirrors `kotoba.kir.value/bounded-document!`: every tagged node
+;; counts one, a map charges its keys as nodes too, and the root sits at depth
+;; 0 with the walk refusing above `document-depth-limit`.
+;;
+;;   kbb --backend sci docs/dom_encoding_probe.cljk
+
+(ns dom-encoding-probe
+  (:require ["node:fs" :as fs]))
+
+(def node-limit 4096)      ; osaho document-node-limit, since 2026-09-10
+(def depth-limit 8)        ; document-depth-limit -- 9 levels, root at 0
+(def byte-limit 65536)     ; document-utf8-byte-limit, charges text only
+(def container-limit 32)   ; document-container-item-limit
+
+(defn- n-map [pairs] (inc (reduce + 0 (map (fn [[k v]] (+ k v)) pairs))))
+(defn- n-vec [items] (inc (reduce + 0 items)))
+(defn- d-map [pairs] (inc (reduce max 0 (map (fn [[k v]] (max k v)) pairs))))
+(defn- d-vec [items] (inc (reduce max 0 items)))
+
+;; An element's own payload: :tag plus a one-entry :attrs map.
+(defn- elem-fields [extra]
+  (let [attrs-n (n-map [[1 1]])]
+    (into [[1 1] [1 attrs-n]] (repeat extra [1 1]))))
+
+;; 1. nested tree -- children hold elements, so tree depth IS document depth
+(defn nested [levels]
+  (if (zero? levels)
+    [(n-map (elem-fields 0)) (d-map [[1 1]])]
+    (let [[kn kd] (nested (dec levels))
+          children (n-vec [kn])]
+      [(n-map (conj (elem-fields 0) [1 children])) (d-map [[1 (d-vec [kd])]])])))
+
+;; 2. flat chunked table -- {:nodes [[node ...] ...] :count n}, parent pointers
+(defn flat [total]
+  (let [node-n (n-map (elem-fields 3))              ; parent, first-child, next-sibling
+        node-d (d-map [[1 2]])
+        chunks (quot (+ total (dec container-limit)) container-limit)
+        per-chunk (n-vec (repeat (min container-limit total) node-n))
+        nodes-vec (n-vec (repeat chunks per-chunk))]
+    [(n-map [[1 nodes-vec] [1 1]])
+     (d-map [[1 (d-vec [(d-vec [node-d])])]])
+     0]))
+
+;; 3. string table -- the whole structure in one `:string`, as `pattern-vm`
+;;    carries its program. 24 hex chars per node: parent, first-child,
+;;    next-sibling, tag id.
+(defn stringy [total] [2 2 (* total 24)])
+
+(defn- pad [x w]
+  (let [t (str x)] (str (apply str (repeat (max 0 (- w (count t))) " ")) t)))
+
+(defn- verdict [n d b]
+  (cond (> d depth-limit) "DEPTH" (> n node-limit) "NODES"
+        (> b byte-limit) "BYTES" :else "ok"))
+
+;; The corpus's own nesting, measured rather than asserted -- the claim below
+;; is that a nested tree cannot hold what this repo already tests against.
+;;
+;; ⚠ The case COUNT depends on how the scrape treats escaped strings -- this
+;; one finds 96, a separately-written Python scrape found 139 -- but both give
+;; the same distribution (median 2, p90 4, max 6), which is what the conclusion
+;; rests on. If those ever disagree, the depths are what matter, not the count.
+;;
+;; ⚠ Count PER CASE. `cases.edn` holds many html strings, and a counter that
+;; runs across the whole file accumulates unclosed tags and answers 102 instead
+;; of 6. That was measured too, on 2026-09-10, by getting it wrong first.
+(def ^:private void-tags
+  #{"area" "base" "br" "col" "embed" "hr" "img" "input" "link" "meta"
+    "param" "source" "track" "wbr"})
+
+(defn- case-depth [html]
+  (loop [ms (re-seq #"<(/?)([a-zA-Z][a-zA-Z0-9]*)\b[^>]*?(/?)>" html) d 0 mx 0]
+    (if-let [[_ closing name selfclose] (first ms)]
+      (let [lower (.toLowerCase name)]
+        (cond
+          (= closing "/") (recur (rest ms) (max 0 (dec d)) mx)
+          (or (= selfclose "/") (contains? void-tags lower)) (recur (rest ms) d mx)
+          :else (recur (rest ms) (inc d) (max mx (inc d)))))
+      mx)))
+
+(defn- corpus-depths []
+  (let [text (try (fs/readFileSync "conformance/cases.edn" "utf8") (catch :default _ nil))]
+    (when text
+      (->> (re-seq #"\"((?:[^\"\\\\]|\\\\.)*)\"" text)
+           (map second)
+           (filter (fn [h] (and (.includes h "<") (.includes h ">"))))
+           (map case-depth)
+           sort vec))))
+
+(defn -main []
+  (println "limits: nodes" node-limit " depth" depth-limit " bytes" byte-limit)
+  (println)
+  (println "encoding                     nodes  depth   bytes  verdict")
+  (doseq [levels [4 6 8]]
+    (let [[n d] (nested levels)]
+      (println (str "nested tree, " levels " levels     "
+                    (pad n 8) (pad d 7) (pad "-" 8) "  " (verdict n d 0)))))
+  (println)
+  (doseq [total [32 256 1024]]
+    (let [[n d b] (flat total)]
+      (println (str "flat table, " (pad total 4) " DOM nodes"
+                    (pad n 8) (pad d 7) (pad "-" 8) "  " (verdict n d b)))))
+  (println)
+  (doseq [total [256 1024 2730]]
+    (let [[n d b] (stringy total)]
+      (println (str "string table, " (pad total 4) " nodes"
+                    (pad n 8) (pad d 7) (pad b 8) "  " (verdict n d b)))))
+  (println)
+  (if-let [ds (seq (corpus-depths))]
+    (let [v (vec ds) n (count v)]
+      (println (str "this repo's conformance corpus: " n " html cases, "
+                    "median " (nth v (quot n 2)) "  p90 " (nth v (int (* n 0.9)))
+                    "  max " (peek v)))
+      (println (str "  cases whose element nesting exceeds " depth-limit ": "
+                    (count (filter #(> % depth-limit) v))
+                    "   -- but each element level costs about 2.2 document levels"))
+      (println))
+    (println "(conformance/cases.edn not readable from here -- run from the repo root)\n"))
+  (println "A nested tree fails on DEPTH at four element levels -- and the corpus")
+  (println "above reaches six. A flat document table is depth-proof")
+  (println "but spends ~13 document nodes per DOM node. The string table is what")
+  (println "pattern-vm already does with its program, and holds ~9x more.")
+  (println)
+  (println "What it costs: parsing on every access. That is denominated in FUEL,")
+  (println "which the caller chooses -- `{:budgets {:fuel n}}` -- and is the one")
+  (println "budget here that is not a compiled-in constant."))
+
+(-main)
