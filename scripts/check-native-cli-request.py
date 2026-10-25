@@ -20,12 +20,15 @@ def pin(path):
 
 
 def main(amu, contract, compiler, out):
-    assert platform.system() == "Linux" and platform.machine() in ("aarch64", "arm64"), "native ARM Linux required"
+    assert platform.system() == "Linux" and platform.machine() in ("aarch64", "arm64", "x86_64"), "native Linux required"
+    arm = platform.machine() in ("aarch64", "arm64")
     inputs = json.loads((ROOT / "scripts/native-ci-inputs.json").read_text())
     for name, identity in inputs["amu"]["files"].items():
         assert pin(amu / name) == identity, ("Amu source drift", name)
     assert pin(contract) == inputs["contract"]["identity"], "contract drift"
-    assert pin(compiler) == inputs["amu"]["files"]["seed/bootstrap/aarch64-linux-static-root.elf"], "unqualified compiler generation"
+    expected_compiler = (inputs["amu"]["files"]["seed/bootstrap/aarch64-linux-static-root.elf"]
+                         if arm else json.loads((amu / "native-product.json").read_text())["image"])
+    assert pin(compiler) == expected_compiler, "unqualified compiler generation"
     out.mkdir(parents=True, exist_ok=False)
     calls = []
     # All .kotoba sources retain their namespaces. No host concatenation or
@@ -59,7 +62,7 @@ def main(amu, contract, compiler, out):
     run("compile", [compiler, "compile", entry, "--target", "aarch64-macos", "--output", out / "request.kseed",
                     *[part for p in roots for part in ("--source-path", p)], "--source-lock", lock,
                     "--source-lock-sha256", pin(lock)["sha256"]])
-    run("pack", [compiler, "compile", amu / "seed/x86_64-kx64-runner.kotoba", "--target", "aarch64-linux",
+    run("pack", [compiler, "compile", amu / "seed/x86_64-kx64-runner.kotoba", "--target", "aarch64-linux" if arm else "x86_64-linux",
                  "--output", out / "request.elf", "--format", "packed", "--payload", out / "request.kseed"])
     (out / "request.elf").chmod(0o755)
     # The contract is opaque argv data. Its Kotoba reader and all assertions
@@ -115,7 +118,8 @@ def main(amu, contract, compiler, out):
                       KEXE_CAP_RESOURCES_35=str(ROOT / "src")), expected=1)
     assert b":module-lock/reader" in scoped.stdout, "FS scope denial reached an accepted lock"
     assert not any(p.name.startswith("kotoba-output-") for p in out.iterdir()), "stage leaked"
-    report = dict(status="PASS_NATIVE_ALL12_CLI_REQUEST", inputs=inputs, compiler=pin(compiler),
+    report = dict(status="PASS_NATIVE_ALL12_CLI_REQUEST", host=[platform.system(), platform.machine()],
+                  inputs=inputs, compiler=pin(compiler),
                   sources={str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else "amu/" + str(p.relative_to(amu)): pin(p) for p in sources},
                   contract=pin(contract), lock=pin(lock), image=pin(out / "request.elf"),
                   lockFixtures=dict(valid=pin(valid_lock), invalid=pin(invalid_lock), unpinned=pin(unpinned_lock),
