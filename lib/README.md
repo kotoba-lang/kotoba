@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.route` | `kotoba.route/src` | `route.browser`, `route.core`, `route.reagent` (Kotoba project library) |
 | `kotoba.release` | `kotoba.release/src` | `kotoba.release.admission`, `kotoba.release.cli`, `kotoba.release.tag` (Kotoba project library) |
 | `kotoba.providerTransport` | `kotoba.providerTransport/src` | `provider.tls-channel`, `provider.transport` (Kotoba project library) |
 | `kotoba.provider` | `kotoba.provider/src` | `provider.clock`, `provider.clock-transport`, `provider.conformance`, `provider.dataspace` (Kotoba project library) |
