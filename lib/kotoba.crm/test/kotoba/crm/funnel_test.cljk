@@ -1,0 +1,122 @@
+(ns kotoba.crm.funnel-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.crm.funnel :as funnel]))
+
+;; A marketing/sales-style lifecycle funnel: subscriber -> lead -> mql ->
+;; sql -> customer, with :churned as a flat exit stage reachable from any
+;; non-terminal stage (per kotoba.crm.pipeline's model, exit stages are
+;; not part of ordered-stages itself).
+(def stages [:subscriber :lead :mql :sql :customer])
+
+(def entities
+  (vec
+   (concat
+    (repeat 5 {:id :s :stage :subscriber})
+    (repeat 3 {:id :l :stage :lead})
+    (repeat 2 {:id :m :stage :mql})
+    (repeat 1 {:id :sq :stage :sql})
+    (repeat 1 {:id :c :stage :customer})
+    ;; one churned entity that recorded which ordered stage it reached
+    ;; before exiting
+    [{:id :churned-with-history :stage :churned :reached-stage :mql}]
+    ;; one churned entity with no such record -- a genuine ambiguity
+    [{:id :churned-no-history :stage :churned}])))
+
+(deftest stage-counts-includes-zero-stages-and-non-ordered-stages
+  (let [counts (funnel/stage-counts entities stages)]
+    (testing "every ordered stage present, non-zero counts correct"
+      (is (= 5 (:subscriber counts)))
+      (is (= 3 (:lead counts)))
+      (is (= 2 (:mql counts)))
+      (is (= 1 (:sql counts)))
+      (is (= 1 (:customer counts))))
+    (testing "a stage with zero entities is still present, not omitted"
+      (is (= 0 (:onboarding (funnel/stage-counts entities [:onboarding])))))
+    (testing "entities in a non-ordered (exit) stage are still counted, not dropped"
+      (is (= 2 (:churned counts))))
+    (testing "empty/nil entities zero-fill every ordered stage"
+      (is (= {:subscriber 0 :lead 0 :mql 0 :sql 0 :customer 0}
+             (funnel/stage-counts [] stages)))
+      (is (= {:subscriber 0 :lead 0 :mql 0 :sql 0 :customer 0}
+             (funnel/stage-counts nil stages))))))
+
+(deftest reached-counts-is-cumulative-by-rank
+  (let [reached (funnel/reached-counts entities stages)]
+    (testing "reached counts are non-increasing along the funnel"
+      (is (= 13 (:subscriber reached))) ; all 12 in-pipeline + 1 churned-with-history (mql >= subscriber)
+      (is (= 8  (:lead reached)))       ; 3+2+1+1 + churned-with-history (mql >= lead)
+      (is (= 5  (:mql reached)))        ; 2+1+1 + churned-with-history (mql >= mql)
+      (is (= 2  (:sql reached)))        ; 1+1
+      (is (= 1  (:customer reached)))))
+  (testing "exit-stage policy: entity with no :reached-stage is excluded entirely"
+    (let [only-unrecorded-churn [{:stage :churned}]
+          reached (funnel/reached-counts only-unrecorded-churn stages)]
+      (is (= {:subscriber 0 :lead 0 :mql 0 :sql 0 :customer 0} reached))))
+  (testing "exit-stage policy: entity WITH :reached-stage is credited up to that rank only"
+    (let [only-recorded-churn [{:stage :churned :reached-stage :lead}]
+          reached (funnel/reached-counts only-recorded-churn stages)]
+      (is (= 1 (:subscriber reached)))
+      (is (= 1 (:lead reached)))
+      (is (= 0 (:mql reached)))
+      (is (= 0 (:sql reached)))
+      (is (= 0 (:customer reached)))))
+  (testing "empty/nil entities all reach zero"
+    (is (= {:subscriber 0 :lead 0 :mql 0 :sql 0 :customer 0}
+           (funnel/reached-counts [] stages)))
+    (is (= {:subscriber 0 :lead 0 :mql 0 :sql 0 :customer 0}
+           (funnel/reached-counts nil stages)))))
+
+(deftest conversion-rate-computes-consecutive-pairs
+  (let [rates (funnel/conversion-rate entities stages)]
+    (is (= (/ 8.0 13) (get rates [:subscriber :lead])))
+    (is (= (/ 5.0 8)  (get rates [:lead :mql])))
+    (is (= (/ 2.0 5)  (get rates [:mql :sql])))
+    (is (= (/ 1.0 2)  (get rates [:sql :customer])))
+    (testing "accepts a pre-computed reached-counts map too"
+      (is (= rates (funnel/conversion-rate (funnel/reached-counts entities stages) stages))))))
+
+(deftest conversion-rate-guards-division-by-zero
+  (testing "a from-stage nobody reached yields nil, not a crash or Infinity"
+    (let [reached {:a 0 :b 3 :c 1}
+          rates (funnel/conversion-rate reached [:a :b :c])]
+      (is (nil? (get rates [:a :b])))
+      (is (= (/ 1.0 3) (get rates [:b :c])))))
+  (testing "an entirely empty entity collection yields nil for every pair"
+    (let [rates (funnel/conversion-rate [] stages)]
+      (is (every? nil? (vals rates)))
+      (is (= #{[:subscriber :lead] [:lead :mql] [:mql :sql] [:sql :customer]}
+             (set (keys rates)))))))
+
+(deftest coverage-is-honest-not-aspirational
+  (let [c (funnel/coverage)]
+    (is (= :point-in-time-snapshot-funnel (:model c)))
+    (is (string? (:note c)))
+    (is (re-find #"EXIT-STAGE" (:note c)))
+    (is (re-find #"time-in-stage" (:note c)))
+    (is (re-find #"cohort-over-time" (:note c)))
+    (is (re-find #"multi-touch attribution" (:note c)))))
+
+(deftest reached-counts-prefers-the-current-stage-over-a-recorded-reached-stage
+  ;; No entity in the fixture above carries BOTH an ordered :stage and a
+  ;; :reached-stage, so which of the two wins is unpinned: swap them and
+  ;; every assertion above stays green. :stage is the newer fact -- an
+  ;; entity still in the pipeline is where it is now; :reached-stage is
+  ;; only the caller's record of where it stood when it exited. Reading
+  ;; them in the wrong order credits an entity backwards, which shows up
+  ;; on a dashboard as a funnel that lost people it did not lose.
+  (let [advanced [{:stage :sql :reached-stage :lead}]
+        reached  (funnel/reached-counts advanced stages)]
+    (is (= 1 (:sql reached)) "the current stage is the truth")
+    (is (= 1 (:mql reached)) "and so is every rank below it")
+    (is (= 0 (:customer reached)))))
+
+(deftest reached-counts-excludes-an-unrecognized-reached-stage-rather-than-guessing
+  ;; The docstring says an entity whose :reached-stage is not itself a valid
+  ;; ordered stage is excluded "rather than guessed". The existing exclusion
+  ;; test omits :reached-stage entirely, which short-circuits before the
+  ;; rank lookup ever happens -- so a PRESENT but unrecognized value is
+  ;; never covered, and defaulting it to rank 0 keeps the suite green while
+  ;; inventing a funnel entry out of a typo.
+  (is (= {:subscriber 0 :lead 0 :mql 0 :sql 0 :customer 0}
+         (funnel/reached-counts [{:stage :churned :reached-stage :not-a-stage}]
+                                stages))))
