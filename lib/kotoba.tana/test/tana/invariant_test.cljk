@@ -1,0 +1,108 @@
+(ns tana.invariant-test
+  "Sharding changes what a query costs. It must not change what it fetches.
+
+  `tana.shard` exists because a flat root is O(members × chunks × columns)
+  bytes. That is a cost argument, and cost arguments are where correctness
+  quietly goes: a two-level prune that rules out a manifest whose chunks the
+  flat plan would have read returns fewer rows and no error.
+
+  So the invariant is checked over generated tables rather than argued:
+  **plan(root) and plan(merge(fetched manifests)) name the same ranges.**
+  Deterministic pseudo-randomness, so a failure is reproducible from the seed
+  printed with it."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [tana.aggregate :as agg]
+            [tana.plan :as plan]
+            [tana.shard :as shard]
+            [tana.table :as table]))
+
+(defn- lcg [seed] (let [s (atom seed)]
+                    (fn [n] (swap! s (fn [x] (mod (+ (* 1103515245 x) 12345) 2147483648)))
+                      (mod (quot @s 65536) n))))
+
+(defn- gen-table
+  "A table whose members have overlapping ranges, some unbounded chunks, and
+  a column one member does not have."
+  [seed]
+  (let [r (lcg seed)
+        members
+        (vec (for [i (range (+ 3 (r 8)))]
+               (let [chunks
+                     (vec (for [j (range (+ 1 (r 3)))]
+                            (let [lo (* 10 (r 40))
+                                  hi (+ lo 5 (r 30))
+                                  bounded? (pos? (r 4))]     ; ~75% bounded
+                              {:rows (+ 1 (r 5))
+                               :columns
+                               {"price" (cond-> {:range [(* 100 j) (+ 100 (* 100 j))]
+                                                 :stats {:rows (+ 1 (r 5)) :nulls 0}
+                                                 :codec :uncompressed :type :int64}
+                                          bounded? (update :stats assoc :min lo :max hi))}})))]
+                 {:object (str "obj:" seed "-" i) :size 4096
+                  :rows (reduce + 0 (map :rows chunks))
+                  :chunks chunks})))]
+    (table/table {:table "gen" :columns ["price"] :bounds-authority :from-footers
+                  :members members})))
+
+(defn- sharded-fetch [root per query]
+  (let [{:keys [top manifests]} (shard/split (fn [s] (str "h" (hash s))) root per)
+        sel (plan/select-manifests top query)
+        fetched (mapv manifests (:fetch sel))
+        merged (table/table (assoc root :members (vec (mapcat :members fetched))))
+        p (plan/plan merged query)]
+    {:ranges (set (map (juxt :object :range) (:fetch p)))
+     :manifests-read (count fetched)
+     :manifests-total (count (:manifests top))}))
+
+(deftest sharding-never-changes-what-is-fetched
+  (doseq [seed (range 1 41)
+          per [1 2 3 7]
+          v [5 55 105 305]]
+    (let [root (gen-table seed)
+          query {:columns ["price"] :predicates [[:= "price" v]] :trust :local}
+          flat (set (map (juxt :object :range) (:fetch (plan/plan root query))))
+          {:keys [ranges]} (sharded-fetch root per query)]
+      (is (= flat ranges)
+          (str "seed=" seed " per=" per " v=" v)))))
+
+(deftest sharding-does-reduce-what-is-read
+  (testing "the invariant would also hold for a shard layer that pruned nothing"
+    ;; So the suite must show the layer is doing something, or it is proving
+    ;; a tautology. Disjoint members, one manifest each: all but one is ruled
+    ;; out without being fetched.
+    (let [members (vec (for [i (range 8)]
+                         {:object (str "obj:" i) :size 99 :rows 3
+                          :chunks [{:rows 3 :columns
+                                    {"price" {:range [4 104]
+                                              :stats {:rows 3 :nulls 0
+                                                      :min (* i 1000) :max (+ 999 (* i 1000))}
+                                              :codec :uncompressed :type :int64}}}]}))
+          root (table/table {:table "t" :columns ["price"]
+                             :bounds-authority :from-footers :members members})
+          q {:columns ["price"] :predicates [[:= "price" 3500]] :trust :local}
+          s (sharded-fetch root 1 q)]
+      (is (= 8 (:manifests-total s)))
+      (is (= 1 (:manifests-read s)))
+      (is (= 1 (count (:ranges s)))))))
+
+(deftest aggregates-from-the-top-agree-with-aggregates-from-the-root
+  (doseq [seed (range 1 41) per [1 3 7]]
+    (let [root (gen-table seed)
+          {:keys [top]} (shard/split (fn [s] (str "h" (hash s))) root per)
+          from-root (agg/aggregate root {:agg :max :column "price" :trust :local})
+          from-top (agg/aggregate-top top {:agg :max :column "price" :trust :local})]
+      (testing (str "seed=" seed " per=" per)
+        ;; Either both answer with the same value, or both refuse. A top that
+        ;; answers where the root refused would be folding bounds the data
+        ;; never reported.
+        (is (= (:from from-root) (:from from-top)))
+        (is (= (:value from-root) (:value from-top))))
+      (is (= (:value (agg/aggregate root {:agg :count :trust :local}))
+             (:value (agg/aggregate-top top {:agg :count :trust :local})))))))
+
+(deftest the-top-refuses-count-non-null-rather-than-answering-count
+  (let [root (gen-table 7)
+        {:keys [top]} (shard/split (fn [s] (str "h" (hash s))) root 3)]
+    (is (= :null-counts-not-in-top
+           (:reason (agg/aggregate-top top {:agg :count-non-null :column "price"
+                                            :trust :local}))))))

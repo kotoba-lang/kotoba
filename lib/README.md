@@ -112,6 +112,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sftp` | `org.ietf.sftp/src` | `kotobase.sftp.fs`, `kotobase.sftp.transport.sftp-subsystem`, `kotobase.sftp.transport.ssh`, `kotobase.sftp.transport.wire` (an external specification, publisher ietf.org) |
 | `org.ietf.smtp` | `org.ietf.smtp/src` | `smtp.client`, `smtp.protocol`, `smtp.transport` (an external specification, publisher ietf.org) |
 | `org.ietf.webdav` | `org.ietf.webdav/src` | `kotobase.protocols.http`, `kotobase.protocols.webdav` (an external specification, publisher ietf.org) |
+| `kotoba.tana` | `kotoba.tana/src` | `tana.aggregate`, `tana.member`, `tana.plan`, `tana.shard` (Kotoba project library) |
 | `kotoba.saifu` | `kotoba.saifu/src` | `saifu.address`, `saifu.policy`, `saifu.sign`, `saifu.tx` (Kotoba project library) |
 | `kotoba.wallet` | `kotoba.wallet/src` | `wallet.chain`, `wallet.chains`, `wallet.keystore`, `wallet.signer` (Kotoba project library) |
 | `kotoba.route` | `kotoba.route/src` | `route.browser`, `route.core`, `route.reagent` (Kotoba project library) |

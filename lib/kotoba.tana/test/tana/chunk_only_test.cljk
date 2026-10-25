@@ -1,0 +1,108 @@
+(ns tana.chunk-only-test
+  "Decoding a column chunk with nothing but its bytes and the root's
+  descriptor.
+
+  This is the claim the round-trip count depends on. If a reader still has to
+  fetch the footer to learn a chunk's physical type, its codec, or where its
+  data pages start, then the plan saved one request and spent three, and the
+  table root is an index with extra steps.
+
+  The decoder here calls `parquet.decode` directly rather than
+  `parquet.source/open`, because `open` parses a footer by construction. That
+  is a statement about the reader's entry point, not about the format: the
+  bytes of a column chunk are self-contained once you know four things, and
+  those four things are exactly what `tana.member` writes down."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [columnar.bytes :as cbytes]
+            [columnar.vector :as cvec]
+            [parquet.decode :as decode]
+            [parquet.footer :as footer]
+            [parquet.write :as pw]
+            [tana.member :as member]
+            [tana.plan :as plan]
+            [tana.table :as table]))
+
+(defn decode-chunk
+  "A column chunk from `bytes` alone, using only `descriptor`.
+
+  `descriptor` is what the root recorded: `{:codec :type :def-level :data-at
+  :dictionary?}`. Nothing here reads a footer."
+  [bytes {:keys [codec type def-level data-at dictionary?]}]
+  (let [window (vec bytes)
+        dictionary
+        (when dictionary?
+          (let [[dh dbody] (footer/page-header window 0)]
+            (decode/dictionary-page
+             (decode/decompress codec window dbody (+ dbody (:compressed-size dh))
+                                (:uncompressed-size dh))
+             0 dh type)))
+        [header body] (footer/page-header window data-at)
+        page (decode/decompress codec window body (+ body (:compressed-size header))
+                                (:uncompressed-size header))
+        {:keys [values valid]} (decode/data-page page 0 header type def-level dictionary)]
+    (cvec/of type values valid)))
+
+(defn- table-of [objects]
+  (let [built (mapv (fn [[object rows]]
+                      (let [bs (pw/file {:fields (pw/fields-of
+                                                  (pw/columns-of-rows [["price" :int64]] rows))
+                                         :batches (mapv (fn [b]
+                                                          (mapv second (pw/columns-of-rows
+                                                                        [["price" :int64]] b)))
+                                                        (partition-all 3 rows))})]
+                        {:bytes bs
+                         :member (member/from-parquet-footer
+                                  {:object object :size (count bs)} (footer/parse bs))}))
+                    objects)]
+    {:bytes (into {} (map (juxt (comp :object :member) :bytes)) built)
+     :root (table/table {:table "prices" :columns ["price"]
+                         :bounds-authority :from-footers
+                         :members (mapv :member built)})}))
+
+(deftest a-plan-is-executable-with-no-footer-fetch
+  (let [{:keys [bytes root]}
+        (table-of [["obj:low"  (mapv (fn [i] {"price" (+ 10 i)}) (range 9))]
+                   ["obj:mid"  (mapv (fn [i] {"price" (+ 100 i)}) (range 9))]
+                   ["obj:high" (mapv (fn [i] {"price" (+ 500 i)}) (range 9))]])
+        p (plan/plan root {:columns ["price"] :predicates [[:= "price" 104]]
+                           :trust :local})
+        fetch (first (:fetch p))
+        [s e] (:range fetch)
+        ;; The one request the plan asked for. Nothing else of any object is
+        ;; reachable from here.
+        fetched (subvec (vec (get bytes (:object fetch))) s e)
+        descriptor (let [{:keys [object column]} (first (:covers fetch))
+                         member (first (filter #(= object (:object %)) (:members root)))]
+                     (->> (:chunks member)
+                          (keep #(let [c (get-in % [:columns column])]
+                                   (when (= (:range c) [s e]) c)))
+                          first))
+        col (decode-chunk fetched descriptor)]
+    (testing "one root plus one ranged GET"
+      (is (= 2 (:rounds p))))
+    (testing "and the bytes decode without ever reading a footer"
+      (is (= [103 104 105] (mapv #(cvec/value-at col %) (range (cvec/count col))))))
+    (testing "pruning still does not decide what matches"
+      (is (= 1 (count (filter #(= 104 (cvec/value-at col %)) (range (cvec/count col)))))))))
+
+(deftest the-descriptor-is-what-makes-it-decodable
+  (testing "drop the physical type and the same bytes decode to nonsense or throw"
+    (let [{:keys [bytes root]}
+          (table-of [["obj:mid" (mapv (fn [i] {"price" (+ 100 i)}) (range 9))]])
+          p (plan/plan root {:columns ["price"] :predicates [[:= "price" 104]]
+                             :trust :local})
+          [s e] (:range (first (:fetch p)))
+          fetched (subvec (vec (get bytes "obj:mid")) s e)
+          member (first (:members root))
+          descriptor (->> (:chunks member)
+                          (keep #(let [c (get-in % [:columns "price"])]
+                                   (when (= (:range c) [s e]) c)))
+                          first)
+          right (decode-chunk fetched descriptor)
+          wrong (decode-chunk fetched (assoc descriptor :type :int32))]
+      (is (= [103 104 105] (mapv #(cvec/value-at right %) (range 3))))
+      ;; int32 over int64 bytes reads twice as many values, each half a
+      ;; number. It does not throw. That is why the type is recorded rather
+      ;; than assumed.
+      (is (not= (mapv #(cvec/value-at right %) (range 3))
+                (mapv #(cvec/value-at wrong %) (range 3)))))))

@@ -1,0 +1,118 @@
+(ns tana.parquet-range-test
+  "The claim this repo exists for, checked against a real Parquet reader.
+
+  A table root is only useful if the range it recorded is **the range the
+  reader would have asked for**. If it is not, the plan fetches bytes that
+  parse as a different page — a failure that does not look like a failure,
+  because a page header is valid wherever a varint happens to land.
+
+  So the check is not `range looks plausible`; it is: read the column through
+  `parquet.source` with a source that records every range it was asked for,
+  and require the recorded read to be exactly what `tana.member` wrote down
+  without opening anything."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [columnar.bytes :as cbytes]
+            [columnar.vector :as cvec]
+            [parquet.footer :as footer]
+            [columnar.source :as csrc]
+            [parquet.source :as psrc]
+            [parquet.write :as pw]
+            [tana.member :as member]
+            [tana.plan :as plan]
+            [tana.table :as table]))
+
+(defn recording
+  "An `IByteSource` that records every range asked for."
+  [v]
+  (let [log (atom [])
+        inner (cbytes/of-vector v)]
+    {:log log
+     :src (reify cbytes/IByteSource
+            (-size [_] (cbytes/-size inner))
+            (-read-range [_ s e]
+              (swap! log conj [s e])
+              (cbytes/-read-range inner s e)))}))
+
+(defn- file-of [rows]
+  (pw/file {:fields (pw/fields-of (pw/columns-of-rows [["price" :int64]] rows))
+            :batches (mapv (fn [batch]
+                             (mapv second (pw/columns-of-rows [["price" :int64]] batch)))
+                           (partition-all 3 rows))}))
+
+(def ^:private lows  (mapv (fn [i] {"price" (+ 10 i)}) (range 9)))
+(def ^:private mids  (mapv (fn [i] {"price" (+ 100 i)}) (range 9)))
+(def ^:private highs (mapv (fn [i] {"price" (+ 500 i)}) (range 9)))
+
+(defn- member-for [object rows]
+  (let [bs (file-of rows)]
+    [bs (member/from-parquet-footer {:object object :size (count bs)}
+                                    (footer/parse bs))]))
+
+(deftest recorded-range-is-the-range-the-reader-asks-for
+  (let [[bs m] (member-for "obj:mid" mids)
+        {:keys [log src]} (recording bs)
+        ;; A real read of one column chunk, through the real reader.
+        col (csrc/-read-column (psrc/open src) 1 "price")
+        _ (is (= 3 (cvec/count col)))
+        reads @log
+        ;; The footer costs two ranges; the column chunk is the one after.
+        chunk-read (last reads)
+        recorded (get-in m [:chunks 1 :columns "price" :range])]
+    (testing "tana wrote down exactly what the reader went and fetched"
+      (is (= recorded chunk-read)))
+    (testing "and the reader needed the object's own metadata to know it"
+      ;; leading magic, the 8-byte tail, the footer it points at, then the
+      ;; chunk. Three of the four are what a table root replaces.
+      (is (= 4 (count reads)))
+      (is (= 3 (count (butlast reads)))))))
+
+(deftest a-table-of-three-objects-answers-in-one-round-per-surviving-object
+  (let [members (mapv (fn [[o rows]] (second (member-for o rows)))
+                      [["obj:low" lows] ["obj:mid" mids] ["obj:high" highs]])
+        root (table/table {:table "prices" :columns ["price"]
+                           :bounds-authority :from-footers :members members})
+        p (plan/plan root {:columns ["price"] :predicates [[:= "price" 104]]
+                           :trust :local})]
+    (testing "9 chunks across 3 objects; one survives"
+      (is (= 9 (get-in p [:chunks :total])))
+      (is (= 8 (get-in p [:chunks :pruned])))
+      (is (= 1 (get-in p [:chunks :read])))
+      (is (= 0 (get-in p [:chunks :undecidable]))))
+    (testing "the root, then one ranged GET"
+      (is (= 2 (:rounds p)))
+      (is (= "obj:mid" (:object (first (:fetch p))))))))
+
+(deftest the-bytes-the-plan-names-decode-to-the-right-rows
+  (let [[bs m] (member-for "obj:mid" mids)
+        root (table/table {:table "prices" :columns ["price"]
+                           :bounds-authority :from-footers :members [m]})
+        p (plan/plan root {:columns ["price"] :predicates [[:= "price" 104]]
+                           :trust :local})
+        ;; not `range`: shadowing clojure.core/range here turned a later
+        ;; (range 3) into a vector lookup and cost a debugging session.
+        [s e] (:range (first (:fetch p)))
+        ;; Exactly the bytes the plan named, and the footer — which is what a
+        ;; host would fetch. Nothing else of the object is available.
+        fetched (cbytes/prefetched
+                 (count bs)
+                 [[s (subvec (vec bs) s e)]
+                  (let [[fs len] (footer/footer-span (cbytes/of-vector bs))]
+                    [fs (subvec (vec bs) fs (+ fs len))])
+                  [(- (count bs) 8) (subvec (vec bs) (- (count bs) 8))]
+                  [0 (subvec (vec bs) 0 4)]])
+        col (csrc/-read-column (psrc/open fetched) 1 "price")]
+    (is (= [103 104 105] (mapv #(cvec/value-at col %) (range 3))))))
+
+(deftest bounds-wider-than-the-data-still-answer-correctly
+  (testing "pruning decides what to read; it never decides what matches"
+    (let [[_ m] (member-for "obj:mid" mids)
+          widened (assoc-in m [:chunks 1 :columns "price" :stats :max] 999999)
+          root (table/table {:table "prices" :columns ["price"]
+                             :bounds-authority :from-footers :members [widened]})
+          p (plan/plan root {:columns ["price"] :predicates [[:= "price" 900000]]
+                             :trust :local})]
+      ;; The widened chunk survives pruning — it must, the bound permits it —
+      ;; and the engine that decodes it finds no matching row. Over-reading is
+      ;; a cost. Under-reading would be a wrong answer.
+      (is (= 1 (get-in p [:chunks :read])))
+      (is (= 2 (get-in p [:chunks :pruned]))))))
