@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.kamiAppIsekai` | `kotoba.kamiAppIsekai/src` | `kami-app-isekai`, `kami-app-isekai.heightmap-color`, `kami-app-isekai.omniverse`, `kami-app-isekai.pipelines` (Kotoba project library) |
 | `kotoba.kamiAppFixtures` | `kotoba.kamiAppFixtures/src` | `kami.app-fixtures`, `kami.provider.contract` (Kotoba project library) |
 | `kotoba.kagitaba` | `kotoba.kagitaba/src` | `kagitaba.capability`, `kagitaba.category`, `kagitaba.contract`, `kagitaba.field` (Kotoba project library) |
 | `kotoba.kagami` | `kotoba.kagami/src` | `kagami.ci`, `kagami.db`, `kagami.did`, `kagami.governor-bridge` (Kotoba project library) |
