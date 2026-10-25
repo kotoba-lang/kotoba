@@ -1,0 +1,213 @@
+;; etzhayyim.kotoba.schema — load + apply the .kotoba.edn vocabularies.
+;;
+;; Schemas are the existing 00-contracts/schemas/*.kotoba.edn maps:
+;;   {:schema/id "..." :schema/version "..." :schema/adr "..."
+;;    :attributes [{:db/ident :ns/attr
+;;                  :db/valueType :db.type/string
+;;                  :db/cardinality :db.cardinality/one   ; default one
+;;                  :db/unique :db.unique/identity}       ; optional
+;;                 ...]}
+;;
+;; This layer is what makes the root-side store schema-aware without putting any
+;; vocabulary INTO the kotoba subrepo: schemas stay in 00-contracts, data in
+;; 80-data, this loader on the bb classpath.
+
+(ns etzhayyim.kotoba.schema
+  (:require [kotoba.lang.edn :as edn]
+            [kotoba.lang.coll :as set]
+            [etzhayyim.kotoba.datom :as d]))
+
+(declare type-ok?)
+
+(defn- attr-pairs
+  "Normalize an :attributes / :schema value into a seq of [ident spec] pairs.
+   Accepts a vector of {:db/ident … :db/valueType …} maps OR a map of
+   {ident -> #:db{:valueType …}} (both dialects appear in 00-contracts)."
+  [coll]
+  (cond
+    (map? coll) (seq coll)
+    (sequential? coll) (for [m coll :when (:db/ident m)] [(:db/ident m) m])
+    :else nil))
+
+(defn load-schema
+  "Read a single .kotoba.edn schema file into {:db/ident -> attr-map}.
+   Handles all Datomic-style dialects: attrs under :attributes or :schema, as a
+   vector of {:db/ident …} maps OR a map of {ident -> spec}."
+  [path]
+  (let [m (edn/read-string (slurp path))]
+    (into {} (for [[ident spec] (concat (attr-pairs (:attributes m)) (attr-pairs (:schema m)))]
+               [ident (assoc spec :db/ident ident)]))))
+
+(defn merge-schemas
+  "Combine several loaded schema maps into one attribute registry."
+  [& schema-maps]
+  (apply merge schema-maps))
+
+;; ── universal vocabulary (handles every ontology dialect in this repo) ──
+;; Datomic-style          : {:attributes [{:db/ident :ns/a ...} ...]}
+;; Datomic-under-:schema   : {:schema     [{:db/ident :ns/a ...} ...]}  (e.g. government-relations)
+;; vocab-style            : {:node/attrs [{:attr :ns/a}] :edge/attrs [...] :derived/attrs [...]}
+
+(defn declared-attrs
+  "The SET of attribute idents a schema declares, across all dialects."
+  [schema-map]
+  (into #{}
+        (concat
+         (map first (attr-pairs (:attributes schema-map)))
+         (map first (attr-pairs (:schema schema-map)))
+         (keep :attr (:node/attrs schema-map))
+         (keep :attr (:edge/attrs schema-map))
+         (keep :attr (:derived/attrs schema-map)))))
+
+(defn load-vocabulary
+  "Read a .kotoba.edn schema and return its declared-attribute set."
+  [path]
+  (declared-attrs (edn/read-string (slurp path))))
+
+(defn used-attrs
+  "All attribute keywords appearing across a seq of entity maps (sans :db/id).
+   Non-map elements are ignored (crash-safe over heterogeneous seeds)."
+  [entity-maps]
+  (disj (into #{} (mapcat keys (filter map? entity-maps))) :db/id))
+
+(defn undeclared-attrs
+  "Attributes used by `entity-maps` but NOT declared in `vocab` (a set).
+   Empty => the data conforms to the declared vocabulary (no drift/typos)."
+  [vocab entity-maps]
+  (set/difference (used-attrs entity-maps) vocab))
+
+;; ── value-level conformance (typed dialects only) ──
+
+(defn attr-registry
+  "ident -> {:valueType :cardinality :allowed :unique}. Datomic-style attrs
+   (under :attributes or :schema) carry types/enums; vocab-style attrs carry
+   none ({}). Reading a schema-map (already edn-parsed)."
+  [schema-map]
+  (into {}
+        (concat
+         (for [[ident spec] (concat (attr-pairs (:attributes schema-map))
+                                    (attr-pairs (:schema schema-map)))]
+           [ident {:valueType (:db/valueType spec)
+                   :cardinality (:db/cardinality spec)
+                   :allowed (some-> (:db/allowed spec) set)
+                   :unique (:db/unique spec)}])
+         (for [a (concat (:node/attrs schema-map) (:edge/attrs schema-map)
+                         (:derived/attrs schema-map))]
+           [(:attr a) {}]))))
+
+(defn load-registry [path] (attr-registry (edn/read-string (slurp path))))
+
+(defn- value-ok?
+  [{:keys [valueType cardinality allowed]} v]
+  (let [vals (if (and (= :db.cardinality/many cardinality) (sequential? v)) v [v])]
+    (every? (fn [x]
+              (and (or (nil? valueType) (type-ok? valueType x))
+                   (or (nil? allowed) (contains? allowed x))))
+            vals)))
+
+(defn value-violations
+  "Seq of violations where a seed value breaks its attribute's declared
+   :db/valueType or :db/allowed enum. Attrs with no declared type are skipped,
+   so this is a no-op on vocab-style schemas. Cardinality-many values are
+   checked elementwise."
+  [registry entity-maps]
+  (for [m entity-maps
+        [a v] m
+        :let [reg (get registry a)]
+        :when (and reg (or (:valueType reg) (:allowed reg)))
+        :when (not (value-ok? reg v))]
+    {:attr a :value v
+     :expected (or (some-> (:allowed reg) sort vec) (:valueType reg))}))
+
+(defn unique-attrs
+  "Set of attribute idents declared :db.unique/identity or :db.unique/value."
+  [attrs]
+  (into #{} (for [[ident spec] attrs
+                  :when (#{:db.unique/identity :db.unique/value} (:db/unique spec))]
+              ident)))
+
+(defn unique-conflicts
+  "Conflicts where a unique attribute's value would be held by >1 entity.
+   `live` = current set of [e a v]; `adds` = seq of {:e :a :v} (pre-expansion).
+   Re-asserting the SAME (attr,value) for the SAME entity is fine; a DIFFERENT
+   entity claiming an already-held unique value is a conflict. In-tx collisions
+   (two distinct entities, same unique value) are caught too."
+  [attrs live adds]
+  (let [uattrs (unique-attrs attrs)
+        held (reduce (fn [m [e a v]] (if (uattrs a) (assoc-in m [a v] e) m)) {} live)]
+    (loop [seen held, confs [], xs (seq adds)]
+      (if-let [{:keys [e a v]} (first xs)]
+        (if (uattrs a)
+          (let [owner (get-in seen [a v])]
+            (if (and owner (not= owner e))
+              (recur seen (conj confs {:attr a :value v :entity e :conflicts-with owner}) (rest xs))
+              (recur (assoc-in seen [a v] e) confs (rest xs))))
+          (recur seen confs (rest xs)))
+        confs))))
+
+(defn check-datom-value
+  "nil if datom `d`'s value conforms to `attrs`'s declared :db/valueType /
+   :db/allowed for its attribute, else a violation map. Untyped/unknown attrs
+   pass (open-world). Used by the engine's transact-time validation hook."
+  [attrs d]
+  (let [a (d/d-a d) v (d/d-v d) spec (get attrs a)]
+    (when spec
+      (let [reg {:valueType (:db/valueType spec)
+                 :cardinality (:db/cardinality spec)
+                 :allowed (some-> (:db/allowed spec) set)}]
+        (when (and (or (:valueType reg) (:allowed reg)) (not (value-ok? reg v)))
+          {:attr a :value v
+           :expected (or (some-> (:allowed reg) sort vec) (:valueType reg))})))))
+
+(defn cardinality [attrs a]
+  (get-in attrs [a :db/cardinality] :db.cardinality/one))
+
+(defn one? [attrs a] (= :db.cardinality/one (cardinality attrs a)))
+
+(defn identity-attr? [attrs a]
+  (= :db.unique/identity (get-in attrs [a :db/unique])))
+
+(defn- type-ok?
+  [vt v]
+  (case vt
+    :db.type/string  (string? v)
+    :db.type/keyword (keyword? v)
+    :db.type/long    (integer? v)
+    :db.type/bigint  (integer? v)
+    :db.type/double  (number? v)
+    :db.type/float   (number? v)
+    :db.type/boolean (boolean? v)
+    :db.type/instant true
+    :db.type/uuid    true
+    :db.type/ref     (or (keyword? v) (string? v) (integer? v))
+    ;; unknown / unconstrained type => accept
+    true))
+
+(defn validate-datom
+  "Return nil if `d` conforms to `attrs`, else an error map. Unknown attributes
+   are permitted (open-world) but flagged via :unknown-attr so callers can warn."
+  [attrs d]
+  (let [a (d/d-a d) v (d/d-v d)
+        spec (get attrs a)]
+    (cond
+      (nil? spec) {:kind :unknown-attr :attr a :datom d}
+      (not (type-ok? (:db/valueType spec) v))
+      {:kind :type-mismatch :attr a :expected (:db/valueType spec) :value v :datom d}
+      :else nil)))
+
+(defn expand-tx
+  "Apply cardinality-one auto-retraction over a known live triple set.
+   Given the current `live` set, an `attrs` registry, and a seq of incoming
+   :add datoms, return the full datom seq to append: each cardinality-one
+   assertion that changes [e a] first emits a :retract of the prior value."
+  [attrs live tx adds]
+  (let [by-ea (reduce (fn [m [e a v]] (update m [e a] (fnil conj #{}) v)) {} live)]
+    (mapcat
+     (fn [dm]
+       (let [{:keys [e a v]} dm
+             retracts (when (one? attrs a)
+                        (for [old (get by-ea [e a])
+                              :when (not= old v)]
+                          (d/datom e a old tx :retract)))]
+         (concat retracts [(d/datom e a v tx :add)])))
+     adds)))
