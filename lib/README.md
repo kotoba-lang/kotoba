@@ -203,6 +203,7 @@ The bundled standard libraries live in this repository:
 | `org.ieee.sed` | `org.ieee.sed/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.shasum` | `org.ieee.shasum/src` | `` (an external specification, publisher ieee.org) |
 | `org.ieee.sort` | `org.ieee.sort/src` | `` (an external specification, publisher ieee.org) |
+| `org.ieee.stat` | `org.ieee.stat/src` | `` (an external specification, publisher ieee.org) |
 | `kotoba.webgl` | `kotoba.webgl/src` | `kami.webgl`, `kami.webgl.glsl`, `kotoba.webgl`, `kotoba.webgl.glsl` (Kotoba project library) |
 | `kotoba.step` | `kotoba.step/src` | `kotoba.step`, `step.core` (Kotoba project library) |
 | `kotoba.sky` | `kotoba.sky/src` | `kami.sky`, `kotoba.sky` (Kotoba project library) |
