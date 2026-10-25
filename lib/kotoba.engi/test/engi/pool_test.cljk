@@ -1,0 +1,172 @@
+(ns engi.pool-test
+  "The deployment resolver, which `engi.chain` left as a seam and this closes.
+
+  What is worth proving is not that a map can hold entries. It is that the
+  pool answers the three questions block application cannot answer for
+  itself — can I resolve this, what am I missing, and is this body really the
+  one this id names — and that a real `inga.state` machine driven by
+  `pool/resolver` reaches the same committed head as one driven by a hand-fed
+  lookup."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [engi.chain :as chain]
+            [engi.core :as engi]
+            [engi.pool :as pool]
+            [inga.chain :as inga-chain]
+            [inga.state :as state]))
+
+(def alice "did:key:zAlice")
+(def mallory "did:key:zMallory")
+
+(defn- entries []
+  (let [e0 (engi/next-entry {:seq -1} nil
+                            {:id "tx0" :kind "credit" :counterparty "did:key:zBob"
+                             :amount 10 :transfer-id "cid-body-0" :ts 1})
+        e1 (engi/next-entry {:seq 0} (chain/entry-cid e0)
+                            {:id "tx1" :kind "debit" :counterparty "did:key:zCarol"
+                             :amount 4 :transfer-id "cid-body-1" :ts 2})]
+    [e0 e1]))
+
+;; A verifier that accepts what alice authored and nothing else. Standing in
+;; for `engi.crypto/verify-self-sig` — cljs-only, which is exactly why the
+;; seam is injected.
+(defn- signed-by-alice [author _entry] (= alice author))
+
+(defn- p [] (pool/pool {:verify-fn signed-by-alice}))
+
+;; ── the seam refuses to be built wrong ─────────────────────────────────────
+
+(deftest a-pool-without-a-verifier-is-a-deployment-error
+  (testing "it would admit anyone's entry under anyone's name, and every
+            replica downstream would agree about it"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (pool/pool {})))
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                 (pool/resolver nil)))))
+
+;; ── admission ──────────────────────────────────────────────────────────────
+
+(deftest an-entry-is-held-under-the-id-that-addresses-it
+  (let [[e0] (entries)
+        {:keys [pool]} (pool/admit (p) alice e0)]
+    (is (= {:author alice :entry e0} (pool/lookup pool (chain/entry-cid e0)))
+        "the id IS the CID, so no id can name a body it does not address")
+    (is (pool/known? pool (chain/entry-cid e0)))
+    (is (nil? (pool/lookup pool "bafyabsent")))))
+
+(deftest admitting-the-same-entry-twice-changes-nothing
+  (testing "the network delivers twice; a pool that counted arrivals would
+            hold state nobody agreed on"
+    (let [[e0] (entries)
+          once (:pool (pool/admit (p) alice e0))
+          twice (:pool (pool/admit once alice e0))]
+      (is (= once twice))
+      (is (= 1 (pool/size twice))))))
+
+(deftest what-admission-refuses
+  (let [[e0] (entries)]
+    (testing "an unsigned entry, which is the whole reason verify-fn is required"
+      (is (= {:refused :bad-signature} (pool/admit (p) mallory e0))))
+    (testing "an entry that could never become an advance"
+      (is (= {:refused :invalid-advance}
+             (pool/admit (p) alice (assoc e0 :engi/seq 3)))
+          "seq 3 from \"genesis\" — inga.chain/valid-advance? says no, and this
+           is the point where saying no is free")
+      (is (= {:refused :invalid-advance}
+             (pool/admit (p) alice (dissoc e0 :engi/seq)))))
+    (testing "and the shapes that are not entries at all"
+      (is (= {:refused :not-an-entry} (pool/admit (p) alice nil)))
+      (is (= {:refused :not-an-entry} (pool/admit (p) alice "an entry")))
+      (is (= {:refused :author-missing} (pool/admit (p) "" e0)))
+      (is (= {:refused :author-missing} (pool/admit (p) nil e0))))
+    (testing "every reason it can name is in the closed set"
+      (is (every? pool/refusal-reasons
+                  (keep :refused [(pool/admit (p) mallory e0)
+                                  (pool/admit (p) alice nil)
+                                  (pool/admit (p) "" e0)
+                                  (pool/admit (p) alice (assoc e0 :engi/seq 3))]))))))
+
+(deftest a-refused-entry-leaves-the-pool-alone
+  (let [[e0] (entries)
+        before (p)]
+    (is (= before (pool/admit! before mallory e0))
+        "admit! drops the reason, not the refusal")))
+
+;; ── the vote path, and the answer to a halt ────────────────────────────────
+
+(deftest a-replica-knows-what-it-cannot-resolve
+  (testing "inga.chain halts on an unresolvable proposal; this is the list
+            that answers it, so syncing is a list and not a hunt"
+    (let [[e0 e1] (entries)
+          pl (-> (p) (pool/admit! alice e0))
+          ids [(chain/entry-cid e0) (chain/entry-cid e1) (chain/entry-cid e1)]]
+      (is (= [(chain/entry-cid e1)] (pool/missing pl ids))
+          "de-duplicated, and in the order they appeared")
+      (is (= [] (pool/missing (pool/admit! pl alice e1) ids))
+          "and empty once the body has arrived — the replica may vote now"))))
+
+;; ── a fork is admitted on purpose ──────────────────────────────────────────
+
+(deftest both-halves-of-a-fork-are-held
+  (testing "refusing the second would hide from consensus the one thing
+            consensus is there to catch"
+    (let [[e0 e1] (entries)
+          fork (engi/next-entry {:seq 0} (chain/entry-cid e0)
+                                {:id "tx1-fork" :kind "debit" :counterparty mallory
+                                 :amount 99 :transfer-id "cid-body-fork" :ts 2})
+          pl (-> (p) (pool/admit! alice e0) (pool/admit! alice e1) (pool/admit! alice fork))]
+      (is (= 3 (pool/size pl)))
+      (is (= [0 1 1] (mapv :engi/seq (pool/authored pl alice))))
+      (is (seq (engi/detect-fork (pool/authored pl alice)))
+          "and engi.core/detect-fork has both entries to work with, which is
+           what it always needed and never had a source for")
+      (is (= [] (pool/authored pl mallory))))))
+
+;; ── end to end: the resolver drives a real machine ─────────────────────────
+
+(defn- committed [resolve-fn block-groups]
+  (let [store (atom {})
+        m (state/machine
+           {:decode-block (inga-chain/decode-block resolve-fn)
+            :put! (fn [cid bytes] (swap! store assoc cid bytes))
+            :get-fn (fn [cid] (get @store cid))
+            :blind-fn pr-str :encrypt-fn identity
+            :authority {} :height-fn :height})]
+    (reduce (:apply-fn m) ((:init-fn m))
+            (map-indexed (fn [i ids] {:height (inc i) :inga.block/proposals ids})
+                         block-groups))))
+
+(deftest the-pool-resolves-a-block-into-a-committed-head
+  (let [[e0 e1] (entries)
+        pl (atom (-> (p) (pool/admit! alice e0) (pool/admit! alice e1)))
+        blocks [[(chain/entry-cid e0)] [(chain/entry-cid e1)]]
+        st (committed (pool/resolver #(deref pl)) blocks)]
+    (is (= {:entry (chain/entry-cid e1) :seq 1}
+           (inga-chain/head (state/actors st) alice)))
+    (testing "and it agrees with a hand-fed lookup, which is the claim: the
+              pool adds admission, not a second interpretation"
+      (let [by-cid {(chain/entry-cid e0) {:author alice :entry e0}
+                    (chain/entry-cid e1) {:author alice :entry e1}}]
+        (is (= (state/actors (committed (chain/resolver by-cid) blocks))
+               (state/actors st)))))))
+
+(deftest the-resolver-sees-entries-that-arrive-after-the-machine-is-built
+  (testing "a snapshot would resolve only what had arrived at construction —
+            the reason resolver takes a function and not a pool"
+    (let [[e0 e1] (entries)
+          pl (atom (pool/admit! (p) alice e0))
+          resolve-fn (pool/resolver #(deref pl))
+          _ (swap! pl pool/admit! alice e1)
+          st (committed resolve-fn [[(chain/entry-cid e0)] [(chain/entry-cid e1)]])]
+      (is (= 1 (:seq (inga-chain/head (state/actors st) alice)))))))
+
+(deftest an-entry-that-never-arrived-halts-instead-of-being-skipped
+  (let [[e0 e1] (entries)
+        pl (atom (pool/admit! (p) alice e0))
+        thrown (try (committed (pool/resolver #(deref pl))
+                               [[(chain/entry-cid e0)] [(chain/entry-cid e1)]])
+                    nil
+                    (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e
+                      (ex-data e)))]
+    (is (= :inga.chain/unresolved-proposal (:type thrown)))
+    (is (= (chain/entry-cid e1) (:proposal thrown))
+        "naming the id is what makes `missing` actionable")))

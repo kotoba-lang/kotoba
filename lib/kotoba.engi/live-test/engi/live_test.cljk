@@ -1,0 +1,202 @@
+(ns engi.live-test
+  "LIVE integration test against PRODUCTION kotobase.net (ADR-2607101100 task
+  step 3). NOT run by CI (see .github/workflows/ci.yml) — run manually with
+  `npm run test:live` / `kbb -M:test-live`.
+
+  Mints two FRESH throwaway did:key agents (nothing pre-registered, nothing
+  reused across runs — every run gets brand-new keys, so this never
+  collides with real user data or a previous run's state) and drives one
+  full real propose -> validate -> counter-commit -> finalize cycle against
+  the actual server, then re-fetches BOTH parties fresh (new reader clients,
+  not reusing any in-process state) and folds — proving the whole write/read
+  round trip works against the real backend, not just the in-memory fake
+  (`engi.fake-kotobase`) the other tests use.
+
+  Prints the exact HTTP status + body for every step, verbatim, per the task
+  spec — this is deliberately noisy stdout, not terse `cljs.test` output,
+  because the report needs to show real wire evidence.
+
+  ── real limitation discovered by this test (2026-07-09) ──────────────────
+  `engi.store/reader-client` (`:public-reads? true`, no CACAO) gets a bare
+  `401 {\"ok\":false,\"error\":\"Unauthorized\"}` from the live kotobase.net
+  apex when targeting a graph it doesn't own — the apex requires SOME CACAO
+  on every datomic.* call (not just writes), and only the graph's own key
+  can mint one that satisfies \"graph scope == issuer DID\". So a THIRD
+  PARTY (e.g. the receiver reading the SPENDER's graph for
+  `validate-proposal!`, or an independent auditor) cannot read an ordinary
+  tenant graph today unless it's separately registered \"Public\"
+  server-side (kotobase.client's own docstring alludes to this registration
+  existing for the operator's yoro-social db; no such toggle is exposed to
+  an ordinary tenant agent as of this test). This test therefore has EACH
+  PARTY validate/audit its OWN graph with its OWN owner-client (self-check)
+  rather than the cross-agent read the ADR's `validate-proposal!` design
+  calls for — `engi.protocol-test` still exercises the FULL cross-agent
+  design against the fake client, where this restriction doesn't apply.
+  See the README \"Known limitations\" section."
+  (:require [cljs.test :refer-macros [deftest is async]]
+            [kotobase.client :as client]
+            [engi.core :as core]
+            [engi.crypto :as crypto]
+            [engi.store :as store]
+            [engi.protocol :as protocol]
+            [engi.metrics :as metrics]))
+
+;; ── verbatim HTTP logging (wraps js/fetch, does not change behavior) ──────
+
+(defn- logging-fetch [^string url ^js opts]
+  (-> (js/fetch url opts)
+      (.then (fn [^js res]
+               (-> (.clone res) .text
+                   (.then (fn [text]
+                            (println (str "\n>>> " (.-method opts) " " url))
+                            (println (str "<<< HTTP " (.-status res) "\n" text)))))
+               res))))
+
+(defn- owner-client [identity]
+  (client/make-client {:endpoint store/default-endpoint
+                       :operator-did store/default-operator-did
+                       :secret-key (:secret-key identity)
+                       :fetch-fn logging-fetch}))
+
+(deftest live-engi-transfer-round-trip
+  (async done
+    (let [alice (crypto/generate-identity)
+          bob (crypto/generate-identity)
+          alice-owner (owner-client alice)
+          bob-owner (owner-client bob)]
+      (println "\n=== engi live integration test (production kotobase.net) ===")
+      (println "alice (spender)  did:" (:did alice))
+      (println "bob   (receiver) did:" (:did bob))
+      (-> (js/Promise.all
+           #js [(store/write-genesis! alice-owner (core/genesis {:credit-limit -1000 :created-at (js/Date.now)}))
+                (store/write-genesis! bob-owner (core/genesis {:credit-limit -1000 :created-at (js/Date.now)}))])
+          (.then (fn [_]
+                   (println "\n--- both genesis entries written ---")
+                   (protocol/propose-transfer! alice-owner (:secret-key alice) (:did bob) 15
+                                                {:memo "engi live-test transfer"})))
+          (.then (fn [proposal]
+                   (println "\n--- proposal ---" (pr-str proposal))
+                   ;; alice-owner, NOT a cross-agent reader — see ns docstring
+                   ;; "real limitation discovered by this test".
+                   (-> (protocol/validate-proposal! alice-owner proposal)
+                       (.then (fn [validation]
+                                (println "\n--- validation ---" (pr-str validation))
+                                (is (true? (:valid? validation))
+                                    (str "live validate-proposal! must accept a clean proposal: " (pr-str validation)))
+                                (protocol/counter-commit! bob-owner (:secret-key bob) proposal)))
+                       (.then (fn [counter-commit]
+                                (println "\n--- counter-commit ---" (pr-str counter-commit))
+                                (protocol/finalize! alice-owner (:secret-key alice) proposal (:counter-sig counter-commit)))))))
+          (.then (fn [finalize-result]
+                   (println "\n--- finalize ---" (pr-str finalize-result))
+                   (is (true? (:finalized? finalize-result)) "live finalize! must succeed")
+                   ;; re-fetch with BRAND NEW client instances (fresh HTTP round trip,
+                   ;; not reusing any in-process promise/state) to prove this actually
+                   ;; round-tripped through the server, not just local memory. Each
+                   ;; party audits its OWN graph with its OWN key (see ns docstring).
+                   (js/Promise.all #js [(protocol/audit-agent! (owner-client alice))
+                                        (protocol/audit-agent! (owner-client bob))])))
+          (.then (fn [^js audits]
+                   (let [[alice-audit bob-audit] (array-seq audits)]
+                     (println "\n--- fresh re-fetch + fold: alice ---" (pr-str alice-audit))
+                     (println "--- fresh re-fetch + fold: bob   ---" (pr-str bob-audit))
+                     (is (= -15 (:balance alice-audit)) "alice's balance, read FRESH from the server, must be -15")
+                     (is (= 15 (:balance bob-audit)) "bob's balance, read FRESH from the server, must be +15")
+                     (is (empty? (:violations alice-audit)))
+                     (is (empty? (:violations bob-audit)))
+                     (is (empty? (:forks alice-audit)))
+                     (is (empty? (:forks bob-audit)))
+                     (println "\n=== live round trip PASSED ===")
+                     (done))))
+          (.catch (fn [^js e]
+                    (println "\n!!! live test FAILED:" (.-message e))
+                    (when (.-status e) (println "    HTTP status:" (.-status e)))
+                    (when (.-body e) (println "    body:" (js/JSON.stringify (.-body e))))
+                    (is false (str "live test threw: " (.-message e)))
+                    (done)))))))
+
+;; ── funnel instrumentation against PRODUCTION (adr-ledger seq 66) ─────────
+;;
+;; The point of `engi.metrics` is that the durable half of the funnel is
+;; recoverable from the ledger by anyone with read access, with no trust in
+;; whoever emitted the counters. That claim is only worth anything if it holds
+;; against the REAL server, so this drives one real transfer with an emitter
+;; attached and then checks the emitted counts against the counts recomputed
+;; from freshly re-fetched production graphs.
+
+(deftest live-en-funnel-emitted-matches-persisted
+  (async done
+    (let [seen (atom [])
+          on-event (fn [ev] (swap! seen conj ev))
+          alice (crypto/generate-identity)
+          bob (crypto/generate-identity)
+          alice-owner (owner-client alice)
+          bob-owner (owner-client bob)]
+      (println "\n=== live EN funnel test ===")
+      (println "alice:" (:did alice))
+      (println "bob:  " (:did bob))
+      (-> (js/Promise.all
+           #js [(store/write-genesis! alice-owner (core/genesis {:credit-limit -1000 :created-at 0}))
+                (store/write-genesis! bob-owner (core/genesis {:credit-limit -1000 :created-at 0}))])
+          (.then (fn [_]
+                   (protocol/propose-transfer! alice-owner (:secret-key alice) (:did bob) 7
+                                                {:memo "funnel probe" :on-event on-event})))
+          (.then (fn [proposal]
+                   (-> (protocol/validate-proposal! alice-owner proposal {:on-event on-event})
+                       (.then (fn [v]
+                                (is (:valid? v) "live validate must pass")
+                                proposal)))))
+          (.then (fn [proposal]
+                   (-> (protocol/counter-commit! bob-owner (:secret-key bob) proposal
+                                                  {:on-event on-event})
+                       (.then (fn [cc] [proposal cc])))))
+          (.then (fn [[proposal cc]]
+                   (protocol/finalize! alice-owner (:secret-key alice) proposal
+                                       (:counter-sig cc) {:on-event on-event})))
+          (.then (fn [fin]
+                   (is (:finalized? fin) "live finalize must succeed")
+                   ;; brand-new clients -- prove the counts survive a real round trip
+                   (js/Promise.all #js [(store/fetch-entities! (owner-client alice))
+                                        (store/fetch-entities! (owner-client bob))])))
+          (.then (fn [^js graphs]
+                   (let [[alice-entities bob-entities] (array-seq graphs)
+                         alice-f (metrics/funnel-from-entities
+                                  alice-entities {:affiliated-dids #{(:did alice) (:did bob)}})
+                         bob-f (metrics/funnel-from-entities
+                                bob-entities {:affiliated-dids #{(:did alice) (:did bob)}})
+                         emitted (frequencies (map :stage @seen))]
+                     (println "\n--- emitted (in-process) ---" (pr-str emitted))
+                     (println "--- persisted alice ---" (pr-str alice-f))
+                     (println "--- persisted bob   ---" (pr-str bob-f))
+                     (is (= [:proposal :validation :counter-commit :finalization]
+                            (mapv :event @seen))
+                         "the live path emits all four stages in protocol order")
+                     (is (= 1 (:finalizations alice-f))
+                         "alice's PRODUCTION graph carries exactly one finalized debit")
+                     (is (= 1 (:counter-commits bob-f))
+                         "bob's PRODUCTION graph carries exactly one counter-commit")
+                     (is (= (get emitted :finalizations) (:finalizations alice-f))
+                         "emitted and persisted must agree against the real server -- if
+                          they ever disagree, either the emitter lied or a write silently
+                          failed, and both are things this funnel exists to catch")
+                     (is (= (get emitted :counter-commits) (:counter-commits bob-f)))
+                     ;; THE POINT OF THIS ASSERTION (corrected 2026-07-25):
+                     ;; alice and bob are both throwaway agents THIS TEST minted,
+                     ;; so neither is independent of the operator -- and the
+                     ;; first version of the metric, which excluded only the
+                     ;; operator DID, would have reported bob as an external
+                     ;; counterparty and tripped engi.stake's :ordering
+                     ;; bond-floor trigger on this test run. Declaring both as
+                     ;; affiliated is what makes the measurement honest, and an
+                     ;; EMPTY external set is the correct answer here.
+                     (is (empty? (:external-counterparties alice-f))
+                         "a transfer between two keys this test itself holds is
+                          not evidence of an independent counterparty")
+                     (is (false? (metrics/trigger-fired? alice-f))
+                         "and the bond-floor trigger must NOT fire on it")
+                     (println "\n=== live EN funnel test PASSED ===")
+                     (done))))
+          (.catch (fn [^js e]
+                    (println "\n!!! live funnel test FAILED:" (.-message e))
+                    (is false (str "live funnel test threw: " (.-message e)))
+                    (done)))))))
