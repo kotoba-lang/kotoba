@@ -1,0 +1,170 @@
+(ns browseruse.cloud
+  "Portable Browser Use Cloud v3 client. HTTP and sleeping are injected so the
+  client works in Clojure/CLJS and can be tested without credentials."
+  (:refer-clojure :exclude [run!])
+  (:require [kotoba.lang.text :as str]
+            [kotoba.lang.coll :as walk]))
+
+(def default-base-url "https://api.browser-use.com/api/v3")
+(def terminal-statuses #{"idle" "stopped" "timed_out" "error" :idle :stopped :timed-out :error})
+(def retry-statuses #{408 425 429 500 502 503 504})
+
+(defrecord CloudClient [api-key base-url request! sleep! timeout-ms max-retries])
+
+(defn client
+  [{:keys [api-key base-url request! sleep! timeout-ms max-retries]
+    :or {base-url default-base-url sleep! (fn [_]) timeout-ms 30000 max-retries 2}}]
+  (when-not (and (string? api-key) (seq api-key))
+    (throw (ex-info "Cloud API key is required" {:type :cloud/invalid-config})))
+  (when-not (fn? request!)
+    (throw (ex-info "Cloud request! transport is required" {:type :cloud/invalid-config})))
+  (->CloudClient api-key base-url request! sleep! timeout-ms max-retries))
+
+(defn- retryable? [request response attempt max-retries]
+  (and (< attempt max-retries)
+       (contains? retry-statuses (:status response))
+       (or (contains? #{:get :delete} (:method request))
+           (get-in request [:headers "Idempotency-Key"]))))
+
+(defn- redact-secret [value secret]
+  (walk/postwalk (fn [x]
+                   (if (string? x) (str/replace x secret "[REDACTED]") x))
+                 value))
+
+(defn- invoke! [client request]
+  (let [request (-> (merge {:timeout-ms (:timeout-ms client)} request)
+                    (assoc :headers (merge {"X-Browser-Use-API-Key" (:api-key client)
+                                            "Content-Type" "application/json"}
+                                           (:headers request))))]
+    (loop [attempt 0]
+      (let [response ((:request! client) request)]
+        (cond
+          (and (integer? (:status response)) (<= 200 (:status response) 299)) (:body response)
+          (retryable? request response attempt (:max-retries client))
+          (do ((:sleep! client) (* 250 (bit-shift-left 1 attempt)))
+              (recur (inc attempt)))
+          :else
+          (throw (ex-info "Browser Use Cloud request failed"
+                          {:type :cloud/http-error
+                           :status (:status response)
+                           :method (:method request)
+                           :path (:path request)
+                           :attempts (inc attempt)
+                           :response (redact-secret (:body response) (:api-key client))})))))))
+
+(defn create-session!
+  "Create an idle session, run a task, or dispatch a follow-up with :sessionId.
+  Supply :idempotency-key to safely retry a POST."
+  [client opts]
+  (let [key (:idempotency-key opts)]
+    (invoke! client {:method :post :path "/sessions"
+                     :headers (cond-> {} key (assoc "Idempotency-Key" key))
+                     :body (dissoc opts :idempotency-key)})))
+
+(defn follow-up! [client session-id task opts]
+  (create-session! client (merge opts {:sessionId session-id :task task :keepAlive true})))
+
+(defn get-session [client session-id]
+  (invoke! client {:method :get :path (str "/sessions/" session-id)}))
+
+(defn list-sessions
+  ([client] (list-sessions client {}))
+  ([client {:keys [page page-size] :or {page 1 page-size 20}}]
+   (invoke! client {:method :get :path "/sessions"
+                    :query-params {:page page :page_size page-size}})))
+
+(defn delete-session! [client session-id]
+  (invoke! client {:method :delete :path (str "/sessions/" session-id)}))
+
+(defn stop-session!
+  ([client session-id] (stop-session! client session-id :session))
+  ([client session-id strategy]
+   (when-not (contains? #{:session :task "session" "task"} strategy)
+     (throw (ex-info "Stop strategy must be session or task" {:type :cloud/invalid-argument})))
+   (invoke! client {:method :post :path (str "/sessions/" session-id "/stop")
+                    :body {:strategy (name (keyword strategy))}})))
+
+(defn list-messages
+  ([client session-id] (list-messages client session-id {}))
+  ([client session-id {:keys [after before limit] :or {limit 10}}]
+   (invoke! client {:method :get :path (str "/sessions/" session-id "/messages")
+                    :query-params (cond-> {:limit limit} after (assoc :after after) before (assoc :before before))})))
+
+(defn create-browser!
+  "Create a standalone raw Browser-as-a-Service session. This is distinct from
+  an agent session and returns a CDP URL rather than running an agent task."
+  [client opts]
+  (let [key (:idempotency-key opts)]
+    (invoke! client {:method :post :path "/browsers"
+                     :headers (cond-> {} key (assoc "Idempotency-Key" key))
+                     :body (dissoc opts :idempotency-key)})))
+
+(defn get-browser [client browser-id]
+  (invoke! client {:method :get :path (str "/browsers/" browser-id)}))
+
+(defn list-browsers
+  ([client] (list-browsers client {}))
+  ([client {:keys [page-number page-size filter-by]
+            :or {page-number 1 page-size 10}}]
+   (invoke! client {:method :get :path "/browsers"
+                    :query-params (cond-> {:pageNumber page-number :pageSize page-size}
+                                    filter-by (assoc :filterBy (name (keyword filter-by))))})))
+
+(defn stop-browser! [client browser-id]
+  (invoke! client {:method :patch :path (str "/browsers/" browser-id)
+                   :body {:action "stop"}}))
+
+(defn list-browser-downloads
+  ([client browser-id] (list-browser-downloads client browser-id {}))
+  ([client browser-id {:keys [limit cursor include-urls?] :or {limit 50 include-urls? false}}]
+   (invoke! client {:method :get :path (str "/browsers/" browser-id "/downloads")
+                    :query-params (cond-> {:limit limit :includeUrls include-urls?}
+                                    cursor (assoc :cursor cursor))})))
+
+(def list-downloads "Deprecated; use list-browser-downloads." list-browser-downloads)
+
+(defn create-profile! [client opts]
+  (let [key (:idempotency-key opts)]
+    (invoke! client {:method :post :path "/profiles"
+                     :headers (cond-> {} key (assoc "Idempotency-Key" key))
+                     :body (dissoc opts :idempotency-key)})))
+
+(defn get-profile [client profile-id]
+  (invoke! client {:method :get :path (str "/profiles/" profile-id)}))
+
+(defn list-profiles
+  ([client] (list-profiles client {}))
+  ([client {:keys [page-number page-size query] :or {page-number 1 page-size 10}}]
+   (invoke! client {:method :get :path "/profiles"
+                    :query-params (cond-> {:pageNumber page-number :pageSize page-size}
+                                    query (assoc :query query))})))
+
+(defn update-profile! [client profile-id opts]
+  (invoke! client {:method :patch :path (str "/profiles/" profile-id) :body opts}))
+
+(defn delete-profile! [client profile-id]
+  (invoke! client {:method :delete :path (str "/profiles/" profile-id)}))
+
+(defn live-url [session] (or (:liveUrl session) (:live-url session)))
+(defn recording-urls [session] (or (:recordingUrls session) (:recording-urls session) []))
+
+(defn await-session
+  "Poll until the task becomes idle/stopped/error or max polls is reached."
+  ([client session-id] (await-session client session-id {}))
+  ([client session-id {:keys [poll-ms max-polls] :or {poll-ms 2000 max-polls 7200}}]
+   (loop [poll 0]
+     (when (>= poll max-polls)
+       (throw (ex-info "Cloud session poll limit exceeded"
+                       {:type :cloud/poll-timeout :session-id session-id :polls poll})))
+     (let [session (get-session client session-id)]
+       (if (contains? terminal-statuses (:status session))
+         session
+         (do ((:sleep! client) poll-ms) (recur (inc poll))))))))
+
+(defn run!
+  "Dispatch a task and poll it to completion. The returned value is the final
+  session map, retaining liveUrl, recordingUrls, screenshotUrl and output."
+  ([client task] (run! client task {}))
+  ([client task opts]
+   (let [created (create-session! client (assoc opts :task task))]
+     (await-session client (:id created) opts))))

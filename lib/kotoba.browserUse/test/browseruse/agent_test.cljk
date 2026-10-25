@@ -1,0 +1,137 @@
+(ns browseruse.agent-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [browseruse.browser :as b]
+            [browseruse.actions :as actions]
+            [browseruse.agent :as agent]
+            [browseruse.session :as session]
+            [langchain.model :as model]
+            [langchain.message :as msg]
+            [langchain.db :as db]))
+
+(def site
+  {"https://example.com"
+   {:title "Example Shop"
+    :elements [{:tag "a" :text "Pricing" :nav "https://example.com/pricing"}
+               {:tag "input" :attrs {:name "q"}}
+               {:tag "button" :text "Search"
+                :nav-fn (fn [{:keys [inputs url]}]
+                          (str url "/search?q=" (get inputs [url 1])))}]}
+   "https://example.com/pricing"
+   {:title "Pricing"
+    :elements [{:tag "a" :text "Home" :nav "https://example.com"}]}
+   "https://example.com/search?q=clojure"
+   {:title "Results for clojure"
+    :elements []}})
+
+(deftest mock-browser-behaviour
+  (let [br (b/mock-browser site "https://example.com")]
+    (testing "indexed element state + prompt rendering"
+      (let [st (b/-state br)]
+        (is (= "Example Shop" (:title st)))
+        (is (= [0 1 2] (mapv :index (:elements st))))
+        (is (str/includes? (b/state->prompt st) "[0]<a>Pricing</a>"))))
+    (testing "click navigates via :nav"
+      (is (= "https://example.com/pricing" (:url (b/-click! br 0)))))
+    (testing "back"
+      (is (= "https://example.com" (:url (b/-back! br)))))
+    (testing "typed text + nav-fn computed navigation"
+      (b/-input-text! br 1 "clojure")
+      (is (str/includes? (b/state->prompt (b/-state br)) "value=\"clojure\""))
+      (is (= "Results for clojure" (:title (b/-click! br 2)))))
+    (testing "unknown index throws"
+      (is (thrown? #?(:clj Exception :cljs js/Error) (b/-click! br 9))))))
+
+(deftest actions-embed-state
+  (let [br (b/mock-browser site "https://example.com")
+        tools (actions/default-actions br)
+        click (some #(when (= "click_element" (:name %)) %) tools)]
+    (is (str/includes? ((:fn click) {:index 0}) "Current page: Pricing"))))
+
+(defn- scripted-model
+  "Mock model: navigate to pricing → read → done."
+  []
+  (model/mock-model
+   [(msg/ai "" {:tool-calls [{:id "c1" :name "click_element" :input {:index 0}}]})
+    (msg/ai "" {:tool-calls [{:id "c2" :name "done"
+                              :input {:text "Pricing is on https://example.com/pricing"
+                                      :success true}}]})]))
+
+(deftest agent-loop-with-action-log
+  (let [br (b/mock-browser site "https://example.com")
+        conn (db/create-conn agent/log-schema)
+        {:keys [result done messages]}
+        (agent/run {:model (scripted-model)
+                    :browser br
+                    :task "Find the pricing page URL"
+                    :history-conn conn
+                    :session-id "s1"})]
+    (is done)
+    (is (= "Pricing is on https://example.com/pricing" result))
+    (is (= "https://example.com/pricing" (:url (b/-state br))))
+    (testing "conversation shape"
+      (is (= [:user :assistant :tool :assistant :tool] (mapv :role messages))))
+    (testing "action log is queryable datoms"
+      (is (= #{["click_element" "https://example.com/pricing"]
+               ["done" "https://example.com/pricing"]}
+             (db/q '[:find ?name ?url
+                     :in $ ?sid
+                     :where [?s :session/id ?sid]
+                            [?a :action/session ?s]
+                            [?a :action/name ?name]
+                            [?a :action/url ?url]]
+                   (db/db conn) "s1"))))))
+
+(deftest max-steps-limits-loop
+  (let [br (b/mock-browser site "https://example.com")
+        ;; model that scrolls forever
+        m (model/mock-model
+           [(msg/ai "" {:tool-calls [{:id "x" :name "scroll"
+                                      :input {:direction "down"}}]})])]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (agent/run {:model m :browser br :task "loop" :max-steps 4})))))
+
+(deftest structured-agent-settings-and-actions-per-step
+  (is (= 3 (:max-actions-per-step
+            (agent/agent-settings {:max-actions-per-step 3
+                                   :planner {:enabled? true}
+                                   :vision {:enabled? true}}))))
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (agent/agent-settings {:max-actions-per-step 0})))
+  (let [br (b/mock-browser site "https://example.com")
+        m (model/mock-model
+           [(msg/ai "" {:tool-calls [{:id "1" :name "scroll" :input {:direction "down"}}
+                                      {:id "2" :name "scroll" :input {:direction "down"}}]})])]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error) #"max actions per step"
+                          (agent/run {:model m :browser br :task "bounded"
+                                      :settings {:max-actions-per-step 1}})))))
+
+(deftest agent-detects-captcha-pauses-solves-and-resumes-before-model
+  (let [captcha-site {"https://example.com/verify"
+                      {:title "Verify"
+                       :elements [{:tag "iframe"
+                                   :attrs {:title "reCAPTCHA"
+                                           :src "https://google.com/recaptcha/api2/anchor"}}]}}
+        br (b/mock-browser captcha-site "https://example.com/verify")
+        seen-status (atom nil)
+        s (session/create-session {:id "captcha-agent"})
+        m (model/mock-model
+           [(msg/ai "" {:tool-calls [{:id "done" :name "done"
+                                      :input {:text "verified" :success true}}]})])
+        result (agent/run
+                {:model m :browser br :task "Continue after verification" :session s
+                 :settings {:captcha
+                            {:mode :human
+                             :human-handler
+                             (fn [challenge]
+                               (reset! seen-status (session/status s))
+                               (is (= :recaptcha (:type challenge)))
+                               true)}}})]
+    (is (= :paused @seen-status) "operator is called only after session pause")
+    (is (= :running (session/status s)) "solved challenge resumes before model call")
+    (is (:done result))
+    (is (= "verified" (:result result)))
+    (is (= {:mode :human :timeout-ms 120000 :poll-interval-ms 1000
+            :max-polls 120 :detect? true}
+           (get-in result [:history :settings :captcha]))
+        "runtime handler is excluded from durable history")))

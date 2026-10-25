@@ -1,0 +1,132 @@
+(ns browseruse.cloud.live-probe
+  "Bounded, opt-in Browser Use Cloud v3 connectivity probe."
+  (:require [browseruse.cloud :as cloud]
+            [browseruse.cloud.http :as http]
+            [kotoba.lang.text :as str]
+            [kotoba.lang.coll :as walk]))
+
+(def defaults
+  {:execute? false
+   :task "Open https://example.com and return only the page title."
+   :model "bu-mini"
+   :max-cost-usd 0.05M
+   :timeout-seconds 120
+   :poll-ms 2000
+   :proxy-country-code nil
+   :enable-recording false})
+
+(defn- parse-decimal [flag value]
+  (try (bigdec value)
+       (catch Exception _
+         (throw (ex-info (str flag " must be a decimal") {:type :probe/invalid-argument :flag flag})))))
+
+(defn- parse-integer [flag value]
+  (try (Long/parseLong value)
+       (catch Exception _
+         (throw (ex-info (str flag " must be an integer") {:type :probe/invalid-argument :flag flag})))))
+
+(defn parse-args [args]
+  (loop [opts defaults, args (seq args)]
+    (if-not args
+      opts
+      (let [[flag value & more] args]
+        (case flag
+          "--execute" (recur (assoc opts :execute? true) (next args))
+          "--record" (recur (assoc opts :enable-recording true) (next args))
+          "--task" (recur (assoc opts :task value) more)
+          "--model" (recur (assoc opts :model value) more)
+          "--proxy-country" (recur (assoc opts :proxy-country-code (some-> value str/lower)) more)
+          "--max-cost-usd" (recur (assoc opts :max-cost-usd (parse-decimal flag value)) more)
+          "--timeout-seconds" (recur (assoc opts :timeout-seconds (parse-integer flag value)) more)
+          "--poll-ms" (recur (assoc opts :poll-ms (parse-integer flag value)) more)
+          (throw (ex-info (str "Unknown option: " flag) {:type :probe/invalid-argument :flag flag})))))))
+
+(defn validate! [{:keys [task max-cost-usd timeout-seconds poll-ms]}]
+  (when (str/blank? task)
+    (throw (ex-info "Task must not be blank" {:type :probe/invalid-argument})))
+  (when-not (and (pos? max-cost-usd) (<= max-cost-usd 1.00M))
+    (throw (ex-info "max-cost-usd must be greater than 0 and at most 1.00"
+                    {:type :probe/cost-limit})))
+  (when-not (<= 10 timeout-seconds 600)
+    (throw (ex-info "timeout-seconds must be between 10 and 600"
+                    {:type :probe/timeout-limit})))
+  (when-not (<= 250 poll-ms 30000)
+    (throw (ex-info "poll-ms must be between 250 and 30000"
+                    {:type :probe/invalid-argument})))
+  true)
+
+(defn plan
+  "Credential-free description of the one billable create and cleanup policy."
+  [opts]
+  {:mode (if (:execute? opts) :execute :dry-run)
+   :endpoint cloud/default-base-url
+   :task (:task opts)
+   :model (:model opts)
+   :max-cost-usd (:max-cost-usd opts)
+   :timeout-seconds (:timeout-seconds opts)
+   :keep-alive false
+   :cleanup :stop-session-in-finally})
+
+(defn- safe-summary [session api-key]
+  (walk/postwalk
+   (fn [value]
+     (if (string? value)
+       (-> value
+           (str/replace api-key "[REDACTED]")
+           ;; Signed query parameters are credentials too. Preserve the origin
+           ;; and path when an output happens to contain such a URL.
+           (str/replace #"(https?://[^\s?]+)\?[^\s]+" "$1?[QUERY REDACTED]"))
+       value))
+   (select-keys session [:id :status :model :stepCount :isTaskSuccessful
+                         :output :maxCostUsd :totalCostUsd :llmCostUsd
+                         :proxyCostUsd :browserCostUsd])))
+
+(defn execute!
+  "Execute exactly one bounded Agent Session. `stop-session!` runs in finally
+  whenever creation returned an id, including polling failures."
+  [opts api-key]
+  (validate! opts)
+  (when (str/blank? api-key)
+    (throw (ex-info "BROWSER_USE_API_KEY is required with --execute"
+                    {:type :probe/missing-credential})))
+  (let [base-url cloud/default-base-url
+        timeout-ms (* 1000 (:timeout-seconds opts))
+        client (cloud/client {:api-key api-key
+                              :base-url base-url
+                              :request! (http/transport {:base-url base-url})
+                              :sleep! #(Thread/sleep (long %))
+                              :timeout-ms timeout-ms
+                              :max-retries 2})
+        session-id (atom nil)]
+    (try
+      (let [created (cloud/create-session!
+                     client
+                     (cond-> {:task (:task opts)
+                              :model (:model opts)
+                              :keepAlive false
+                              :maxCostUsd (:max-cost-usd opts)
+                              :enableRecording (:enable-recording opts)
+                              :idempotency-key (str (random-uuid))}
+                       (:proxy-country-code opts)
+                       (assoc :proxyCountryCode (:proxy-country-code opts))))
+            _ (reset! session-id (:id created))
+            max-polls (max 1 (long (Math/ceil (/ (double timeout-ms) (:poll-ms opts)))))
+            final (cloud/await-session client @session-id
+                                       {:poll-ms (:poll-ms opts) :max-polls max-polls})]
+        (safe-summary final api-key))
+      (finally
+        (when @session-id
+          (try
+            (cloud/stop-session! client @session-id :session)
+            (catch Exception cleanup-error
+              (binding [*out* *err*]
+                (println "Cloud session cleanup failed for session"
+                         @session-id "-" (.getMessage cleanup-error))))))))))
+
+(defn -main [& args]
+  (let [opts (parse-args args)]
+    (validate! opts)
+    (if-not (:execute? opts)
+      (prn (plan opts))
+      ;; getenv is deliberately delayed until explicit execution. Never print it.
+      (prn (execute! opts (System/getenv "BROWSER_USE_API_KEY"))))))

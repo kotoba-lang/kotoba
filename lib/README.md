@@ -220,6 +220,7 @@ The bundled standard libraries live in this repository:
 | `org.postgresql.wire` | `org.postgresql.wire/src` | `kotobase.pg.sql`, `kotobase.pg.wire` (an external specification, publisher postgresql.org) |
 | `org.w3.sparqlProtocol` | `org.w3.sparqlProtocol/src` | `kotobase.protocols.sparql`, `kotobase.protocols.sparql.json`, `kotobase.protocols.sparql.ntriples`, `kotobase.protocols.sparql.parser` (an external specification, publisher w3.org) |
 | `org.iso.std16739` | `org.iso.std16739/src` | `ifc.core`, `ifc.ids`, `ifc.ids.xml`, `ifc.mvd` (an external specification, publisher iso.org) |
+| `kotoba.browserUse` | `kotoba.browserUse/src` | `browseruse.actions`, `browseruse.agent`, `browseruse.browser`, `browseruse.browser-profile` (Kotoba project library) |
 | `kotoba.langgraph` | `kotoba.langgraph/src` | `langgraph.agent-loop`, `langgraph.checkpoint`, `langgraph.graph`, `langgraph.kg-checkpoint` (Kotoba project library) |
 | `kotoba.authorization` | `kotoba.authorization/src` | `authorization.adapters.cacao-policy`, `authorization.adapters.decision-ledger`, `authorization.adapters.journal-ledger`, `authorization.adapters.policy` (Kotoba project library) |
 | `kotoba.authenticator` | `kotoba.authenticator/src` | `auth.adapters.webcrypto`, `auth.base32`, `auth.cli`, `auth.clock` (Kotoba project library) |
