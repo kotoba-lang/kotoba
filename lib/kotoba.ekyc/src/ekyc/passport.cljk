@@ -1,0 +1,147 @@
+(ns ekyc.passport
+  "WebCrypto host: ICAO TD3 passive authentication. No NFC or personhood claim.
+  Explicit deployment trust/CRL policy is mandatory; request certificates never
+  become roots. All raw passport bytes stay in memory in this adapter."
+  (:refer-clojure :exclude [bytes])
+  (:require ["pkijs" :as pki] ["asn1js" :as asn]))
+
+(defn reject! [code] (throw (ex-info "Passport evidence rejected" {:code code})))
+(defn require! [condition code] (when-not condition (reject! code)))
+(defn bytes [x] (if (instance? js/Uint8Array x) x (js/Uint8Array. x)))
+(defn buffer [x] (let [b (bytes x)] (.slice (.-buffer b) (.-byteOffset b) (+ (.-byteOffset b) (.-byteLength b)))))
+(defn hex [x] (apply str (map #(.padStart (.toString % 16) 2 "0") (array-seq (bytes x)))))
+(defn digest [algorithm x] (.digest (.-subtle js/crypto) algorithm (buffer x)))
+(defn sha256 [x] (-> (digest "SHA-256" x) (.then hex)))
+
+(defn unwrap-tlv [input expected-tag]
+  (let [b (bytes input) n (count expected-tag) marker (aget b n)
+        long? (>= marker 128) k (if long? (- marker 128) 0)
+        offset (+ n 1 k)
+        length (if long? (reduce #(+ (* %1 256) (aget b %2)) 0 (range (inc n) offset)) marker)]
+    (require! (and (> (.-length b) n) (= expected-tag (mapv #(aget b %) (range n)))) :tlv-tag)
+    (require! (and (or (not long?) (<= 1 k 3))
+                   (or (not long?) (>= length 128))
+                   (= (+ offset length) (.-length b))) :tlv-length)
+    (.slice b offset)))
+
+(defn checksum [s]
+  (mod (reduce + (map-indexed
+                  (fn [i c] (* (nth [7 3 1] (mod i 3))
+                               (cond (= c "<") 0 (re-matches #"[0-9]" c) (js/parseInt c 10)
+                                     :else (- (.charCodeAt c 0) 55)))) (vec s))) 10))
+(defn checked! [s c] (require! (= (str (checksum s)) c) :mrz-checksum))
+(defn date! [yyMMdd reference-year kind]
+  (require! (boolean (re-matches #"[0-9]{6}" yyMMdd)) :mrz-date)
+  (let [yy (js/parseInt (subs yyMMdd 0 2) 10) m (js/parseInt (subs yyMMdd 2 4) 10)
+        d (js/parseInt (subs yyMMdd 4 6) 10) candidate (+ (* 100 (js/Math.floor (/ reference-year 100))) yy)
+        year (if (= kind :birth) (if (> candidate reference-year) (- candidate 100) candidate)
+                 (cond (> (- candidate reference-year) 50) (- candidate 100)
+                       (> (- reference-year candidate) 50) (+ candidate 100) :else candidate))
+        date (js/Date. (js/Date.UTC year (dec m) d))]
+    (require! (and (= year (.getUTCFullYear date)) (= (dec m) (.getUTCMonth date)) (= d (.getUTCDate date))) :mrz-date)
+    date))
+(defn parse-td3 [dg1 now]
+  (let [mrz (.decode (js/TextDecoder. "utf-8" #js {:fatal true}) (unwrap-tlv (unwrap-tlv dg1 [97]) [95 31]))]
+    (require! (and (= 88 (count mrz)) (re-matches #"P[A-Z<][A-Z<]{3}[A-Z<]{39}[A-Z0-9<]{44}" mrz)) :unsupported-mrz)
+    (let [line (subs mrz 44) year (.getUTCFullYear (js/Date. now))
+          birth (date! (subs line 13 19) year :birth) expiry (date! (subs line 21 27) year :expiry)
+          adult-date (js/Date. (.getTime birth))]
+      (checked! (subs line 0 9) (subs line 9 10))
+      (checked! (subs line 13 19) (subs line 19 20))
+      (checked! (subs line 21 27) (subs line 27 28))
+      (when-not (and (re-matches #"<+" (subs line 28 42)) (= "<" (subs line 42 43)))
+        (checked! (subs line 28 42) (subs line 42 43)))
+      (checked! (str (subs line 0 10) (subs line 13 20) (subs line 21 43)) (subs line 43 44))
+      (require! (and (<= (.getTime birth) now) (< now (+ (.getTime expiry) 86400000))
+                     (< (- (.getTime expiry) now) (* 16 366 86400000))) :document-expired-or-date-range)
+      (.setUTCFullYear adult-date (+ (.getUTCFullYear birth) 18))
+      {:issuer (subs mrz 2 5) :document-number (subs line 0 9)
+       :birth-date (subs line 13 19) :adult (<= (.getTime adult-date) now)
+       :expires-at (+ (.getTime expiry) 86400000)})))
+
+(defn parse-ber! [raw]
+  (let [b (buffer raw) parsed (asn/fromBER b)]
+    (require! (= (.-offset parsed) (.-byteLength b)) :invalid-asn1)
+    (.-result parsed)))
+(defn values [^js node] (array-seq (.. node -valueBlock -value)))
+(def hash-oids {"2.16.840.1.101.3.4.2.1" "SHA-256" "2.16.840.1.101.3.4.2.2" "SHA-384" "2.16.840.1.101.3.4.2.3" "SHA-512"})
+(defn signed-hashes [content]
+  (let [^js root (parse-ber! content) [^js version ^js algorithm ^js groups] (values root)
+        ^js identifier (first (values algorithm))
+        oid (.toString (.-valueBlock identifier)) hashes (values groups)]
+    (require! (and (instance? asn/Sequence root) (= 3 (count (values root)))
+                   (instance? asn/Integer version) (= 0 (.. version -valueBlock -valueDec))
+                   (contains? hash-oids oid) (<= 2 (count hashes) 16)) :unsupported-lds)
+    (let [entries (mapv (fn [item]
+                          (let [[^js number ^js hash] (values item)]
+                            (require! (and (= 2 (count (values item))) (instance? asn/Integer number)
+                                           (instance? asn/OctetString hash)
+                                           (<= 1 (.. number -valueBlock -valueDec) 16)) :invalid-data-group)
+                            [(.. number -valueBlock -valueDec) (hex (.getValue hash))])) hashes)]
+      (require! (= (count entries) (count (set (map first entries)))) :duplicate-data-group)
+      {:algorithm (get hash-oids oid) :hashes (into {} entries)})))
+
+(defn signed-attributes! [^js signed]
+  (let [^js signer (aget (.-signerInfos signed) 0)
+        attributes (some-> signer .-signedAttrs .-attributes array-seq)
+        types (filter #(= "1.2.840.113549.1.9.3" (.-type ^js %)) attributes)
+        digests (filter #(= "1.2.840.113549.1.9.4" (.-type ^js %)) attributes)]
+    (require! (and (= 3 (.-version signed)) (<= 2 (count attributes) 16)
+                   (= 1 (count types)) (= 1 (count digests))) :invalid-signed-attributes)
+    (let [^js content-type (first types) ^js message-digest (first digests)
+          ^js oid (aget (.-values content-type) 0)]
+      (require! (and (= 1 (.-length (.-values content-type))) (= 1 (.-length (.-values message-digest)))
+                     (instance? asn/ObjectIdentifier oid)
+                     (= "2.23.136.1.1.1" (.toString (.-valueBlock oid)))
+                     (instance? asn/OctetString (aget (.-values message-digest) 0))) :invalid-signed-content-type))))
+
+(defn verify-passport
+  "Only document authenticity. Caller must obtain holder binding, human review,
+  fresh screening and a canonical issuance reservation separately. `policy` is
+  operator configuration, never user-supplied JSON. Narrow SHA-2/TD3 profile."
+  [policy evidence now]
+  (let [roots (:trusted-cscas policy) crls (:crls policy)
+        sod (:sod evidence) dg1 (:dg1 evidence) dg2 (:dg2 evidence)]
+    (require! (and (seq roots) (<= (count roots) 1024) (seq crls) (<= (count crls) 1024)
+                   (string? (:trust-version policy)) (not-empty (:trust-version policy))
+                   (number? (:trust-expires-at policy)) (< now (:trust-expires-at policy))) :trust-policy-unavailable)
+    (require! (and (<= 1 (.-byteLength (bytes sod)) 131072) (<= 1 (.-byteLength (bytes dg1)) 256)
+                   (<= 1 (.-byteLength (bytes dg2)) 2097152)) :document-size)
+    (let [raw (if (= 119 (aget (bytes sod) 0)) (unwrap-tlv sod [119]) (bytes sod))
+          cms (pki/ContentInfo. #js {:schema (parse-ber! raw)})
+          _ (require! (= "1.2.840.113549.1.7.2" (.-contentType cms)) :not-cms-signed-data)
+          signed (pki/SignedData. #js {:schema (.-content cms)})
+          anchors (mapv #(pki/Certificate. #js {:schema (parse-ber! %)}) roots)
+          lists (mapv #(pki/CertificateRevocationList. #js {:schema (parse-ber! %)}) crls)]
+      (require! (and (= 1 (count (array-seq (.-signerInfos signed))))
+                     (<= 1 (count (array-seq (.-certificates signed))) 8)
+                     (contains? hash-oids (.. signed -signerInfos (at 0) -digestAlgorithm -algorithmId))
+                     (= "2.23.136.1.1.1" (.. signed -encapContentInfo -eContentType))) :unsupported-sod)
+      (signed-attributes! signed)
+      (doseq [^js crl lists]
+        (require! (and (.-nextUpdate crl) (<= (.getTime (.. crl -thisUpdate -value)) now)
+                       (< now (.getTime (.. crl -nextUpdate -value)))) :stale-crl))
+      ;; Discard untrusted embedded revocation material and forbid network lookup.
+      (set! (.-crls signed) (into-array lists))
+      (set! (.-ocsps signed) #js [])
+      (-> (.verify signed #js {:signer 0 :checkChain true :checkDate (js/Date. now)
+                              :trustedCerts (into-array anchors) :passedWhenNotRevValues false})
+          (.then (fn [valid]
+                   (require! (true? valid) :invalid-document-signature)
+                   (let [content (.getValue (.. signed -encapContentInfo -eContent))
+                         {:keys [algorithm hashes]} (signed-hashes content)
+                         fields (parse-td3 dg1 now)]
+                     (-> (js/Promise.all #js [(digest algorithm dg1) (digest algorithm dg2) (sha256 raw) (sha256 dg1) (sha256 dg2)])
+                         (.then (fn [results]
+                                  (require! (and (= (get hashes 1) (hex (aget results 0)))
+                                                 (= (get hashes 2) (hex (aget results 1)))) :data-group-hash-mismatch)
+                                  {:status :document-authentic :holder-status :review-required
+                                   :adult (:adult fields) :document-expires-at (:expires-at fields)
+                                   :trust-version (:trust-version policy) :observed-at now
+                                   ;; Raw identity fields remain private to the host; never put these in a public VC.
+                                   :private-document-key (str (:issuer fields) ":" (:document-number fields) ":" (:birth-date fields))
+                                   :sod-digest (aget results 2) :dg1-digest (aget results 3) :dg2-digest (aget results 4)}))))))))))
+
+(defn verify-js [policy evidence now]
+  (-> (verify-passport (js->clj policy :keywordize-keys true) (js->clj evidence :keywordize-keys true) now)
+      (.then clj->js)))

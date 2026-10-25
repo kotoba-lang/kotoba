@@ -105,6 +105,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
 | `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
 | `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.ekyc` | `kotoba.ekyc/src` | `ekyc.adapters.edn-provider`, `ekyc.adapters.identity-bridge`, `ekyc.adapters.kagi-custody`, `ekyc.adapters.production-provider` (Kotoba project library) |
 | `kotoba.contentAddress` | `kotoba.contentAddress/src` | `content-address.app-schema`, `content-address.archive`, `content-address.core`, `content-address.digest` (Kotoba project library) |
 | `kotoba.character` | `kotoba.character/src` | `character`, `character.anim-blueprint`, `character.base-mesh`, `character.bin` (Kotoba project library) |
 | `kotoba.machine` | `kotoba.machine/src` | `machine.core` (Kotoba project library) |

@@ -1,0 +1,92 @@
+(ns ekyc.identity-jobs-test
+  (:require [cljs.test :refer-macros [deftest is async]]
+            [ekyc.identity-jobs :as jobs] [ekyc.identity-policy-test :as f]))
+(def command {:id "app" :principal "alice" :session-verified true :session-id "session-a"
+              :scope-id "scope" :task :code-review :request-id "job-1"})
+(def input {:model jobs/model :max_tokens 96 :messages [{:role "user" :content "Review owned code"}]})
+(def fingerprint (apply str (repeat 64 "a")))
+(defn fixture []
+  (let [db (atom {:revision 0 :state f/approved})]
+    {:db db :origin "https://kotobase.net" :visibility :private :authoritative-cas? true
+     :read! #(js/Promise.resolve @db)
+     :cas! (fn [revision state]
+             (js/Promise.resolve
+              (if (= revision (:revision @db))
+                (do (reset! db {:revision (inc revision) :state state})
+                    {:status :committed :revision (inc revision) :receipt-ref (str "private:commit-" (inc revision))})
+                {:status :conflict})))}))
+(defn rejected [promise reason]
+  (.then promise (fn [_] (is false (str "Expected " reason)))
+         (fn [e] (is (= (name reason) (ex-message e))))))
+
+(deftest reserve-once-and-single-dispatch
+  (async done
+    (let [ports (fixture) calls (atom 0) infer! (fn [_] (swap! calls inc) (js/Promise.resolve {:model jobs/model :content "Use server-side authorization."}))]
+      (-> (js/Promise.all #js [(jobs/enqueue! ports command input fingerprint (constantly f/now))
+                              (jobs/enqueue! ports command input fingerprint (constantly f/now))])
+          (.then (fn [_]
+                   (is (= 1 (get-in @(:db ports) [:state :usage ["alice" (quot f/now 86400000)]])))
+                   (js/Promise.all #js [(jobs/run! ports "job-1" infer! (constantly f/now))
+                                       (jobs/run! ports "job-1" infer! (constantly f/now))])))
+          (.then (fn [_] (is (= 1 @calls)) (jobs/result! ports "alice" "session-a" "job-1" (constantly f/now))))
+          (.then (fn [r]
+                   (is (= :succeeded (:status r))) (is (= :free (get-in r [:result :billing])))
+                   (is (not (contains? r :input)))
+                   (rejected (jobs/result! ports "bob" "session-a" "job-1" (constantly f/now)) :job-not-found)))
+          (.then (fn [_] (swap! (:db ports) assoc-in [:state :sessions "session-a" :status] :revoked)
+                   (rejected (jobs/result! ports "alice" "session-a" "job-1" (constantly f/now)) :session-revoked)))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest ambiguity-never-retries-or-refunds
+  (async done
+    (let [ports (fixture) calls (atom 0) infer! (fn [_] (swap! calls inc) (js/Promise.reject (js/Error. "lost response")))]
+      (-> (jobs/enqueue! ports command input fingerprint (constantly f/now))
+          (.then (fn [_] (jobs/run! ports "job-1" infer! (constantly f/now))))
+          (.then (fn [r] (is (= :unknown (:status r))) (jobs/run! ports "job-1" infer! (constantly f/now))))
+          (.then (fn [_]
+                   (is (= 1 @calls))
+                   (is (= 1 (get-in @(:db ports) [:state :usage ["alice" (quot f/now 86400000)]])))
+                   (rejected (jobs/enqueue! ports (assoc command :request-id "job-2") input fingerprint (constantly f/now)) :research-concurrency-limit)))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest revocation-before-dispatch-and-idempotency-conflict
+  (async done
+    (let [ports (fixture) calls (atom 0)]
+      (-> (jobs/enqueue! ports command input fingerprint (constantly f/now))
+          (.then (fn [_] (rejected (jobs/enqueue! ports command input (apply str (repeat 64 "b")) (constantly f/now)) :idempotency-conflict)))
+          (.then (fn [_] (swap! (:db ports) assoc-in [:state :applications "app" :status] :revoked)
+                   (jobs/run! ports "job-1" (fn [_] (swap! calls inc)) (constantly f/now))))
+          (.then (fn [r] (is (= :cancelled (:status r))) (is (zero? @calls))))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest no-dispatch-with-unconfirmed-commit
+  (async done
+    (let [ports (fixture) calls (atom 0)]
+      (-> (jobs/enqueue! ports command input fingerprint (constantly f/now))
+          (.then (fn [_]
+                   (rejected (jobs/run! (assoc ports :cas! (fn [_ _] (js/Promise.resolve {:status :committed :revision 99})))
+                                        "job-1" (fn [_] (swap! calls inc)) (constantly f/now)) :job-commit-unconfirmed)))
+          (.then (fn [_] (is (zero? @calls))))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest crash-recovery-does-not-reexecute
+  (async done
+    (let [ports (fixture) later (constantly (+ f/now jobs/execution-ttl-ms)) calls (atom 0)]
+      (-> (jobs/enqueue! ports command input fingerprint (constantly f/now))
+          (.then (fn [_] (jobs/claim! ports "job-1" (constantly f/now))))
+          (.then (fn [_] (jobs/recover! ports "job-1" later)))
+          (.then (fn [r] (is (= :unknown (:status r))) (jobs/run! ports "job-1" (fn [_] (swap! calls inc)) later)))
+          (.then (fn [_] (is (zero? @calls))))
+          (.catch #(is false (str %))) (.finally done)))))
+
+(deftest longer-than-edge-timeout-and-daily-limit
+  (async done
+    (let [ports (fixture) clock (atom f/now)]
+      (-> (jobs/enqueue! ports command input fingerprint #(deref clock))
+          (.then (fn [_] (jobs/run! ports "job-1"
+                                   (fn [_] (swap! clock + 70000)
+                                     (js/Promise.resolve {:model jobs/model :content "Completed after 70 seconds."})) #(deref clock))))
+          (.then (fn [r] (is (= :succeeded (:status r)))
+                   (swap! (:db ports) assoc-in [:state :usage ["alice" (quot @clock 86400000)]] 50)
+                   (rejected (jobs/enqueue! ports (assoc command :request-id "job-2") input fingerprint #(deref clock)) :free-quota-exhausted)))
+          (.catch #(is false (str %))) (.finally done)))))
