@@ -1,0 +1,288 @@
+(ns descriptor-table-test
+  "Content assertions on the descriptor table an artifact carries.
+
+  `.cljc` since 2026-09-10. `kotoba.artifact.descriptor-table` is `.cljc` and
+  this was its only test, so the source was verified on one host -- and on the
+  other host it cannot do its job at all: `contract-entry?` requires
+  `nat-int?` of every capability id, and `(nat-int? (js/BigInt 7))` is FALSE,
+  so `validate!` refuses a table carrying the ids a compiler actually holds on
+  ClojureScript. Nothing feeds it those ids today, because nothing outside
+  this repository requires this namespace at all (measured below).
+
+  These are written against HAND-BUILT expected byte vectors, not against a
+  decoder in this repo. A decoder here would be checked only against the encoder
+  it was written beside, and the two would then be free to agree on the same
+  mistake -- which is the exact failure the single-encoding rule exists to
+  prevent. Expected text bytes come from `ascii` below, which is
+  `clojure.core/int` over the characters and shares nothing with the encoder."
+  (:require [kotoba.lang.error :as kerror] [kotoba.lang.text :as string]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing] :include-macros true])
+            [kotoba.artifact.core :as artifact]
+            [kotoba.artifact.descriptor-table :as table]
+            [kotoba.kir.descriptor :as descriptor]))
+
+
+(defn- index-of
+  "Position of X in COLL, or nil. `(.indexOf ^java.util.List v x)` was a Java
+  interop call on a vector; ClojureScript's `.indexOf` is an Array method and a
+  PersistentVector is not one, so the interop had to go rather than be
+  reader-conditionalised."
+  [coll x]
+  (first (keep-indexed #(when (= %2 x) %1) coll)))
+
+(defn- ascii
+  "Bytes of an ASCII string, computed without touching the encoder.
+
+  `(mapv int (seq text))` was correct on the JVM and silently wrong on
+  ClojureScript, which is how this helper survived being read: there `(seq
+  \"ab\")` yields one-character STRINGS rather than characters, and `(int
+  \"a\")` is 0, so every name came back as its length followed by that many
+  zeros. Measured when this file became `.cljc`: `(text \":message\")`
+  answered [8 0 0 0 0 0 0 0 0 1]. The expected bytes were the broken side --
+  the encoder under test was right."
+  [text]
+  #?(:clj  (mapv int (seq text))
+     :cljs (mapv #(.charCodeAt % 0) (seq text))))
+
+(defn- text
+  "A length-prefixed name as the format specifies it: one ULEB length byte for
+  these short names, then the bytes."
+  [name]
+  (into [(count name)] (ascii name)))
+
+(defn- section [descriptors contracts]
+  (let [base {:format table/format-tag :descriptors descriptors :contracts contracts}]
+    (assoc base :bytes-sha256 (artifact/sha256 (table/section-bytes base)))))
+
+(defn- contains-run?
+  "True when `run` appears contiguously inside `whole`."
+  [whole run]
+  (let [whole (vec whole) run (vec run)]
+    (boolean (some #(= run (subvec whole % (+ % (count run))))
+                   (range 0 (inc (- (count whole) (count run))))))))
+
+;; ---------------------------------------------------------------------------
+;; The shapes below are transcribed from
+;; provider/resources/kotoba/lang/capability-kits/clock-v1.edn. Nothing in this
+;; repo reads that file and nothing here changes it; clock-v1 stays
+;; :native-aot :pending. It is used because it is the smallest real kit that
+;; today's four-shape boundary cannot carry.
+
+(def clock-request
+  [:variant :kotoba.clock/request [[:wall :bool] [:monotonic :bool]]])
+
+(def clock-wall
+  [:record :kotoba.clock/wall [[:unix-millis :i64] [:observation-sequence :i64]]])
+
+(def clock-monotonic
+  [:record :kotoba.clock/monotonic [[:nanos :i64] [:observation-sequence :i64]]])
+
+(def clock-error
+  [:record :kotoba.clock/error [[:code :keyword] [:message :string]]])
+
+(def clock-result
+  [:variant :kotoba.clock/result
+   [[:wall clock-wall] [:monotonic clock-monotonic] [:error clock-error]]])
+
+;; ---------------------------------------------------------------------------
+
+(deftest names-are-carried-not-just-shapes
+  ;; Would catch an encoder that carried arity and member types but dropped the
+  ;; names -- which reads as correct until a loader has to say WHICH field a
+  ;; provider got wrong, or has to match a provider's fields to a guest's by
+  ;; anything other than position.
+  (let [encoded (vec (descriptor/encode-descriptor clock-wall))
+        expected (vec (concat [9]
+                              (text ":kotoba.clock/wall")
+                              [2]
+                              (text ":unix-millis") [0]
+                              (text ":observation-sequence") [0]))]
+    (is (= expected encoded))
+    (is (= 18 (count ":kotoba.clock/wall")))
+    (is (contains-run? encoded (ascii ":unix-millis")))
+    (is (contains-run? encoded (ascii ":observation-sequence")))
+    (is (contains-run? encoded (ascii ":kotoba.clock/wall")))))
+
+(deftest member-order-is-carried
+  ;; Would catch an encoder that normalised or sorted members -- for instance by
+  ;; building them through a hash map. Order is load-bearing: a record's fields
+  ;; are laid out positionally at the boundary, so a reordered descriptor makes
+  ;; the loader read field b where the guest wrote a. Both sides stay
+  ;; self-consistent and the values are silently swapped.
+  (let [ab [:record :r [[:a :i64] [:b :string]]]
+        ba [:record :r [[:b :string] [:a :i64]]]
+        encoded-ab (vec (descriptor/encode-descriptor ab))
+        encoded-ba (vec (descriptor/encode-descriptor ba))]
+    (is (= [9 2 58 114 2 2 58 97 0 2 58 98 1] encoded-ab))
+    (is (= [9 2 58 114 2 2 58 98 1 2 58 97 0] encoded-ba))
+    (is (not= encoded-ab encoded-ba))
+    (is (< (index-of encoded-ab 97) (index-of encoded-ab 98))
+        ":a must be carried before :b")
+    ;; Same members, opposite order, therefore two distinct table entries.
+    (is (= 2 (count (distinct [encoded-ab encoded-ba]))))))
+
+(deftest alias-encodes-identically-to-its-expansion
+  ;; Would catch an alias acquiring a tag of its own. If it did, one type would
+  ;; have two descriptors -- the spelled-out one on a target that expanded it and
+  ;; the alias on a target that did not -- and the four shapes the native
+  ;; boundary already carries would fail to unify with the general encoding they
+  ;; are supposed to become special cases of.
+  (is (= [4 0] (vec (descriptor/encode-descriptor :option-i64))))
+  (is (= [4 0] (vec (descriptor/encode-descriptor [:option :i64]))))
+  (is (= [5 0 0] (vec (descriptor/encode-descriptor :result-i64))))
+  (is (= [5 0 0] (vec (descriptor/encode-descriptor [:result :i64 :i64]))))
+  (testing "and identically at the table level, not only per descriptor"
+    (is (= (table/section-bytes (section [:option-i64] []))
+           (table/section-bytes (section [[:option :i64]] []))))
+    (is (= (table/section-bytes (section [:result-i64] []))
+           (table/section-bytes (section [[:result :i64 :i64]] []))))))
+
+(deftest clock-v1-shapes-encode-through-the-generic-path
+  ;; Would catch the four-shape special-casing surviving underneath a descriptor
+  ;; API: a variant of records must come out as tag 6 composed of tag 9s, with no
+  ;; branch that recognises "clock" or any other kit.
+  (let [request (vec (descriptor/encode-descriptor clock-request))
+        result (vec (descriptor/encode-descriptor clock-result))]
+    (is (= (vec (concat [6]
+                        (text ":kotoba.clock/request")
+                        [2]
+                        (text ":wall") [3]
+                        (text ":monotonic") [3]))
+           request))
+    (is (= (vec (concat [6]
+                        (text ":kotoba.clock/result")
+                        [3]
+                        (text ":wall") (descriptor/encode-descriptor clock-wall)
+                        (text ":monotonic") (descriptor/encode-descriptor clock-monotonic)
+                        (text ":error") (descriptor/encode-descriptor clock-error)))
+           result))
+    (testing "each nested record appears verbatim, i.e. it is composed not rewritten"
+      (is (contains-run? result (descriptor/encode-descriptor clock-wall)))
+      (is (contains-run? result (descriptor/encode-descriptor clock-monotonic)))
+      (is (contains-run? result (descriptor/encode-descriptor clock-error))))
+    (testing "the leaf types inside the records survive"
+      (is (contains-run? result (concat (text ":code") [2])) ":code is :keyword (tag 2)")
+      (is (contains-run? result (concat (text ":message") [1])) ":message is :string (tag 1)"))
+    (testing "and this is a shape today's boundary cannot carry"
+      ;; kexe_loader.c's enum: string=1, option-i64=2, result-i64=3, plus raw
+      ;; i64. Neither clock shape is any of them. Asserted so that a later claim
+      ;; that clock-v1 crosses the boundary has to move this line deliberately.
+      (is (not (contains? #{:i64 :string :option-i64 :result-i64} clock-request)))
+      (is (not (contains? #{:i64 :string :option-i64 :result-i64} clock-result))))))
+
+(deftest wire-frame-is-versioned-and-counted
+  (let [bytes (table/section-bytes (section [:i64 :string] []))]
+    (is (= 1 (first bytes)) "leading byte versions the frame")
+    (is (= [1 2 0 1 0] bytes)
+        "version, descriptor count 2, :i64, :string, contract count 0")))
+
+(deftest contracts-are-carried-by-index-into-the-same-table
+  (let [kir {:format :kotoba.kir/v4
+             :functions [{:name 'now :param-types [] :result :i64
+                          :body (list 'typed-cap-call 7 clock-request clock-result 'x)}]}
+        built (table/table kir)
+        indices (descriptor/descriptor-indices kir)]
+    (is (= table/format-tag (:format built)))
+    (is (= [{:capability 7
+             :request-index (get indices clock-request)
+             :result-index (get indices clock-result)}]
+           (:contracts built)))
+    (testing "indices resolve back to the descriptors the guest declared"
+      (is (= clock-request (table/descriptor-at built (get indices clock-request))))
+      (is (= clock-result (table/descriptor-at built (get indices clock-result))))
+      (is (= {:capability 7 :request clock-request :result clock-result}
+             (table/contract built 7)))
+      (is (nil? (table/contract built 8))))
+    (testing "the table is the shared one, so index N means the same type as it
+              does in a wasm custom section built from the same KIR"
+      (is (= (descriptor/descriptor-table kir) (:descriptors built)))
+      (is (every? (fn [[descriptor index]]
+                    (= descriptor (table/descriptor-at built index)))
+                  indices)))
+    (testing "the contract region is the tail of the wire bytes"
+      (let [bytes (table/section-bytes built)
+            {:keys [request-index result-index]} (first (:contracts built))]
+        (is (= [1 7 request-index result-index] (vec (take-last 4 bytes)))
+            "contract count 1, then capability, request index, result index")))
+    (is (= built (table/validate! built)))))
+
+(deftest seal-covers-the-carried-table
+  ;; Would catch the table being carried beside the digest instead of inside it,
+  ;; which would let a descriptor be swapped after the fact without the artifact
+  ;; failing verification.
+  (let [kir {:format :kotoba.kir/v4
+             :functions [{:name 'now :param-types [] :result :i64
+                          :body (list 'typed-cap-call 7 clock-request clock-result 'x)}]}
+        sealed (table/attach {:format :kotoba.kexe/v1 :target :x86_64} kir)]
+    (is (artifact/valid-seal? sealed))
+    (is (= table/format-tag (:format (table/carried sealed))))
+    ;; :f64 appears nowhere in this KIR, so this is a real substitution rather
+    ;; than a rewrite to the value already there.
+    (let [tampered (assoc-in sealed [:descriptor-table :descriptors 0] :f64)]
+      (is (not= sealed tampered))
+      (is (false? (artifact/valid-seal? tampered))))
+    (let [tampered (assoc-in sealed [:descriptor-table :contracts 0 :capability] 8)]
+      (is (not= sealed tampered))
+      (is (false? (artifact/valid-seal? tampered))))))
+
+(deftest validate-rejects-inconsistent-tables
+  (let [good (section [:i64 :string] [{:capability 7 :request-index 0 :result-index 1}])]
+    (is (= good (table/validate! good)))
+    (testing "index outside the table"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate!
+                    (section [:i64] [{:capability 7 :request-index 0 :result-index 4}])))))
+    (testing "one capability with two contracts"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate!
+                    (section [:i64 :string]
+                             [{:capability 7 :request-index 0 :result-index 0}
+                              {:capability 7 :request-index 1 :result-index 1}])))))
+    (testing "contracts out of capability order -- the same rule one level up,
+              and until 2026-09-10 nothing asserted it: deleting the check
+              left this whole suite green, which is how it was found"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate!
+                    (section [:i64 :string]
+                             [{:capability 9 :request-index 0 :result-index 1}
+                              {:capability 7 :request-index 0 :result-index 1}])))))
+    (testing "descriptors out of canonical order -- two artifacts would otherwise
+              carry the same types under different indices"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate! (section [:string :i64] [])))))
+    (testing "duplicate descriptors"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate! (section [:i64 :i64] [])))))
+    (testing "a descriptor edited without re-encoding: the drift detector"
+      ;; Also the shape an encoder mismatch takes -- a verifier whose
+      ;; encode-descriptor differs from the producer's recomputes a different
+      ;; digest for an untouched artifact.
+      ;;
+      ;; [:f64 :string] is deliberately still canonically ordered, still two
+      ;; entries, still within every index in `good`'s contract. Every other
+      ;; check in validate! passes, so only the re-encode can reject it. An
+      ;; earlier version of this test used [:i64 :bool], which is out of order
+      ;; and was therefore caught by the ordering check -- it passed while the
+      ;; re-encode was deleted.
+      (let [drifted (assoc good :descriptors [:f64 :string])]
+        (is (= (:descriptors drifted) (vec (sort-by pr-str (:descriptors drifted)))))
+        (is (= (count (:descriptors good)) (count (:descriptors drifted))))
+        (is (thrown? kerror/ExceptionInfo (table/validate! drifted)))))
+    (testing "not a descriptor at all -- rejected before the re-encode, so an
+              unencodable entry is refused rather than thrown out of the encoder"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate! {:format table/format-tag
+                                     :descriptors [:i64 :not-a-type]
+                                     :contracts []
+                                     :bytes-sha256 (artifact/sha256 [])}))))
+    (testing "unknown key"
+      (is (thrown? kerror/ExceptionInfo
+                   (table/validate! (assoc good :extra 1)))))))
+
+(deftest capability-kit-qualification-is-untouched
+  ;; This landing carries descriptors. It does not move a value across a
+  ;; boundary, so it qualifies nothing. Stated as a test so that a later change
+  ;; claiming otherwise has to say so out loud.
+  (is (string/includes? (:doc (meta (find-ns 'kotoba.artifact.descriptor-table)))
+                        ":native-aot :pending")))
