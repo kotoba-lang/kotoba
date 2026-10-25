@@ -1,0 +1,327 @@
+(ns run-e2e
+  "Real-browser E2E proof for kami-ongaku-notation: proves the repo's real,
+   unit-tested score/notation data (pitch, exact-rational duration,
+   dynamics) -- AFTER a genuine MusicXML export/import round trip through
+   this repo's own kami.ongaku.notation.musicxml -- correctly drives real
+   audio output once combined with kotoba-lang/audio's real oscillator +
+   ADSR DSP via kotoba-lang/org-w3-webaudio's proven AudioWorkletProcessor
+   path (org-w3-webaudio commit e554d853d640, reused verbatim per
+   kami-ongaku-sampler's own precedent -- not rediscovered).
+
+   The phrase (test/e2e/src/kami/ongaku/notation/e2e/fixture.cljk, required
+   UNMODIFIED here and by the worklet bundle): C4 quarter (pp), E4 eighth
+   (mf), G4 eighth (mf), C5 half (ff), one 4/4 measure at 120 BPM -- 4
+   distinct pitches, 3 distinct duration values, dynamics spanning pp..ff.
+
+   This script:
+     1. requires kami.ongaku.notation.e2e.fixture directly (nbb, no browser) and
+        checks `measure-valid?` (the phrase's own durations really do sum
+        to the 4/4 capacity, via this repo's real validate/validate-part).
+     2. round-trips the score through this repo's REAL MusicXML export
+        (`score->musicxml`) and import (`musicxml->score`) and asserts the
+        result is structurally identical to the original (a genuine XML
+        codec exercise, not skipped).
+     3. computes playback params (freq/gain/onset/dur-samples) BOTH from
+        the pre-round-trip notes and the post-round-trip notes (same
+        fixture functions) and asserts they're identical -- proving the
+        round trip didn't corrupt the data that drives audio.
+     4. computes an offline reference PCM buffer directly from
+        kotoba-lang/audio's audio.synth (same DSP the worklet uses), here,
+        with NO browser involved, as ground truth.
+     5. compiles+runs (via test/e2e/src/kami/ongaku/notation/e2e/{worklet_dsp,
+        main_driver}.cljs, scripts/build-e2e-bundles.sh) a real headless
+        Chromium (Playwright) rendering the WHOLE phrase in ONE
+        OfflineAudioContext / AudioWorkletProcessor pass (not 4 separate
+        single-note renders), and captures the actual PCM.
+     6. diffs captured vs. offline-reference PCM over the WHOLE buffer
+        (the strongest, least-forgeable correctness signal: any wrong
+        onset/frequency/gain anywhere shows up as a large diff somewhere).
+     7. for each note, MEASURES (from the captured PCM, not merely
+        asserting the inputs were correct):
+          a. actual onset sample position (first sample, scanning forward
+             from the note's expected onset, whose magnitude crosses 5% of
+             that note's own expected gain -- normalizes the threshold
+             across pp/mf/ff so it isn't biased toward louder notes)
+             against the expected (rational-duration-derived) onset;
+          b. actual frequency via interpolated positive-going zero-crossing
+             timing over the note's steady-state window (attack+decay
+             done, release not yet started) -- the same technique
+             kami-ongaku-sampler's own run_e2e.cljs uses;
+          c. peak |amplitude| in that note's steady-state window -- to
+             show, numerically, that the ff note's peak is clearly greater
+             than the pp note's (not merely that a gain number was
+             computed).
+
+   Requires: `bash scripts/build-e2e-bundles.sh` run first, `npm install`
+   inside test/e2e/ for the Playwright dependency, and this repo's own src/
+   plus a checkout of kotoba-lang/audio on the nbb classpath:
+
+     kbb --backend sci -cp \"src:test/e2e/src:$AUDIO_SRC_PATH\" test/e2e/run_e2e.cljk"
+  (:require ["playwright" :refer [chromium]]
+            ["http" :as http]
+            ["fs" :as fs]
+            ["path" :as path]
+            [audio.synth :as synth]
+            [kami.ongaku.notation.e2e.fixture :as fixture]))
+
+(def site-dir (path/join (js/process.cwd) "test" "e2e" "page"))
+(def port 8942)
+
+(def content-types
+  {".html" "text/html" ".js" "application/javascript"})
+
+(defn start-server []
+  (js/Promise.
+    (fn [resolve _reject]
+      (let [server (http/createServer
+                     (fn [req res]
+                       (let [url (if (= (.-url req) "/") "/index.html" (.-url req))
+                             fpath (path/join site-dir url)
+                             ext (path/extname fpath)
+                             ctype (get content-types ext "application/octet-stream")]
+                         (if (fs/existsSync fpath)
+                           (do (.writeHead res 200 #js {"Content-Type" ctype})
+                               (.end res (fs/readFileSync fpath)))
+                           (do (.writeHead res 404) (.end res "not found"))))))]
+        (.listen server port (fn [] (resolve server)))))))
+
+;; --- shared ADSR envelope shape constants (this E2E harness's own choice,
+;;     not part of kami-ongaku-notation's data model) -----------------------
+
+(def ATTACK 0.005)
+(def DECAY 0.005)
+(def SUSTAIN 1.0)
+(def RELEASE 0.01)
+
+;; --- step 1/2/3: fixture-side checks (no browser) --------------------------
+
+(def measure-valid (fixture/measure-valid?))
+(def round-trip-identical? (= (fixture/round-trip-score) fixture/score))
+(def round-trip-notes-identical? (= (fixture/round-trip-notes) fixture/phrase-notes))
+
+(def pre-params (fixture/notes->playback-params fixture/phrase-notes))
+(def post-params (fixture/notes->playback-params (fixture/round-trip-notes)))
+(def params-preserved-by-round-trip? (= pre-params post-params))
+
+;; --- step 4: offline (nbb) reference PCM, direct from audio.synth, no
+;;     browser and no worklet involved -- ground truth ----------------------
+
+(defn synthesize-note [{:keys [freq gain dur-samples]} sr]
+  (let [gate-off (- dur-samples (synth/seconds->samples RELEASE sr))
+        osc (synth/sine-wave freq sr dur-samples)
+        env (synth/adsr {:attack ATTACK :decay DECAY :sustain SUSTAIN
+                          :release RELEASE :gate-off gate-off :sample-rate sr}
+                         dur-samples)]
+    (mapv #(* gain %) (synth/apply-envelope osc env))))
+
+(defn offline-reference [params total-samples sr]
+  (let [buf (js/Float64Array. total-samples)]
+    (doseq [{:keys [onset dur-samples] :as p} params]
+      (let [note-samples (synthesize-note p sr)]
+        (dotimes [i dur-samples]
+          (aset buf (+ onset i) (double (nth note-samples i))))))
+    (vec buf)))
+
+;; --- diffing --------------------------------------------------------------
+
+(defn max-abs-diff [a b]
+  (reduce max 0.0 (map (fn [x y] (js/Math.abs (- x y))) a b)))
+
+(defn max-abs-in [samples start end]
+  (reduce (fn [acc i] (max acc (js/Math.abs (nth samples i)))) 0.0 (range start end)))
+
+;; --- measured onset: first sample (scanning forward from the note's
+;;     expected onset out to its own attack+decay window) whose magnitude
+;;     crosses 5% of THAT note's own expected gain (normalizes the
+;;     threshold across pp/mf/ff so a quiet note isn't penalized relative
+;;     to a loud one). --------------------------------------------------
+
+(defn measured-onset [samples expected-onset gain sr]
+  (let [threshold (* 0.05 gain)
+        search-end (min (count samples) (+ expected-onset (synth/seconds->samples (+ ATTACK DECAY) sr) 200))]
+    (loop [i expected-onset]
+      (cond
+        (>= i search-end) nil
+        (>= (js/Math.abs (nth samples i)) threshold) i
+        :else (recur (inc i))))))
+
+;; --- frequency measurement: interpolated positive-going zero-crossing
+;;     timing over the steady-state window (post attack+decay, pre
+;;     release) -- same technique kami-ongaku-sampler's own run_e2e.cljs
+;;     uses. This measures what the CAPTURED waveform actually contains,
+;;     not merely that the decided freq was passed in. ----------------------
+
+(defn positive-zero-crossings [samples start end]
+  (loop [i (inc start) acc (transient [])]
+    (if (>= i end)
+      (persistent! acc)
+      (let [prev (nth samples (dec i))
+            cur (nth samples i)]
+        (recur (inc i)
+               (if (and (<= prev 0.0) (> cur 0.0))
+                 (conj! acc (+ (dec i) (/ (- 0.0 prev) (- cur prev))))
+                 acc))))))
+
+(defn measure-frequency [samples sr start end]
+  (let [crossings (positive-zero-crossings samples start end)]
+    (when (>= (count crossings) 2)
+      (let [n-periods (dec (count crossings))
+            span-samples (- (last crossings) (first crossings))]
+        (/ (* n-periods sr) span-samples)))))
+
+(defn steady-window [{:keys [onset dur-samples]} sr]
+  (let [attack-samples (synth/seconds->samples ATTACK sr)
+        decay-samples (synth/seconds->samples DECAY sr)
+        release-samples (synth/seconds->samples RELEASE sr)]
+    [(+ onset attack-samples decay-samples)
+     (+ onset (- dur-samples release-samples))]))
+
+;; --- browser call -----------------------------------------------------------
+
+(defn run-in-page [total-samples sr notes-js]
+  ;; pageFunction is a plain JS source string, not a Function value, and the
+  ;; params are inlined into the string rather than passed via .evaluate's
+  ;; separate `arg` -- both deliberate, matching org-w3-webaudio's and
+  ;; kami-ongaku-sampler's own run_e2e.cljs (Playwright's
+  ;; page.evaluate(pageFunction, arg) silently drops `arg` and resolves
+  ;; undefined when pageFunction is a source string; verified there with
+  ;; plain Node + Playwright, no cljs/nbb involved -- not re-verified here,
+  ;; reusing that finding).
+  (fn [page]
+    (.evaluate page
+      (str "window.runE2E("
+           (js/JSON.stringify
+             #js {:workletUrl "/worklet-processor.js"
+                  :processorName "kami-phrase-processor"
+                  :notes notes-js
+                  :totalSamples total-samples
+                  :sr sr :attack ATTACK :decay DECAY :sustain SUSTAIN :release RELEASE})
+           ")"))))
+
+;; --- report -----------------------------------------------------------------
+
+(def PCM-TOL 1e-6)
+(def FREQ-REL-TOL 0.005) ;; 0.5%
+(def ONSET-TOL-SAMPLES 30)
+
+(defn evaluate-note [idx spec p captured reference sr]
+  (let [[s-start s-end] (steady-window p sr)
+        measured-freq (measure-frequency captured sr s-start s-end)
+        expected-freq (:freq p)
+        freq-ok (and (some? measured-freq)
+                     (< (js/Math.abs (/ (- measured-freq expected-freq) expected-freq)) FREQ-REL-TOL))
+        peak (max-abs-in captured s-start s-end)
+        onset-measured (measured-onset captured (:onset p) (:gain p) sr)
+        onset-ok (and (some? onset-measured)
+                       (<= (js/Math.abs (- onset-measured (:onset p))) ONSET-TOL-SAMPLES))
+        note-diff (max-abs-diff (subvec captured (:onset p) (+ (:onset p) (:dur-samples p)))
+                                 (subvec reference (:onset p) (+ (:onset p) (:dur-samples p))))]
+    {:idx idx :spec spec :params p
+     :expected-onset (:onset p) :measured-onset onset-measured :onset-ok onset-ok
+     :expected-freq expected-freq :measured-freq measured-freq :freq-ok freq-ok
+     :peak peak :note-pcm-diff note-diff}))
+
+(defn print-report [rows whole-buffer-diff whole-buffer-ok]
+  (println "\n=== kami-ongaku-notation real-browser AudioWorklet phrase E2E result ===\n")
+  (println "phrase measure-valid? (durations sum to 4/4 capacity):" measure-valid)
+  (println "MusicXML round trip: score -> musicxml -> score identical to original?" round-trip-identical?)
+  (println "MusicXML round trip: notes vector identical to original?" round-trip-notes-identical?)
+  (println "playback params (freq/gain/onset/dur-samples) IDENTICAL before vs. after round trip?" params-preserved-by-round-trip?)
+  (println)
+  (doseq [{:keys [idx spec params expected-onset measured-onset onset-ok
+                  expected-freq measured-freq freq-ok peak note-pcm-diff]} rows]
+    (println (str "note " (inc idx) ": " (name (:step spec))
+                  (if (not= 0 (or (:alter spec) 0)) "#" "") (:octave spec)
+                  "  type=" (name (:type spec)) " dynamic=" (name (:dynamic spec))))
+    (println "  expected onset (rational-duration-derived, exact sample):" expected-onset)
+    (println "  measured onset (captured PCM, 5%-of-gain threshold crossing):" measured-onset
+             (str "diff=" (some-> measured-onset (- expected-onset)) " tol=" ONSET-TOL-SAMPLES "samples ok=" onset-ok))
+    (println "  expected frequency (pitch -> equal-temperament, this repo's pitch->midi):"
+             (.toFixed expected-freq 4) "Hz")
+    (println "  measured frequency (captured PCM, zero-crossing):"
+             (some-> measured-freq (.toFixed 4)) "Hz"
+             (str "rel-diff=" (some-> measured-freq (- expected-freq) (/ expected-freq) js/Math.abs (.toFixed 6))
+                  " tol=" FREQ-REL-TOL " ok=" freq-ok))
+    (println "  measured peak |amplitude| in steady-state window:" (.toFixed peak 6)
+             (str "(expected gain=" (.toFixed (:gain params) 6) ")"))
+    (println "  note-window captured-vs-offline-reference max-abs-diff:" note-pcm-diff
+             (str "(tol " PCM-TOL ")"))
+    (println))
+  (println "whole-buffer captured-vs-offline-reference max-abs-diff:" whole-buffer-diff
+           (str "(tol " PCM-TOL ") ok=" whole-buffer-ok))
+  (let [pp-row (first (filter #(= :pp (get-in % [:spec :dynamic])) rows))
+        ff-row (first (filter #(= :ff (get-in % [:spec :dynamic])) rows))
+        pp-peak (:peak pp-row)
+        ff-peak (:peak ff-row)
+        dynamics-ok (> ff-peak pp-peak)]
+    (println "pp note measured peak amplitude:" (.toFixed pp-peak 6))
+    (println "ff note measured peak amplitude:" (.toFixed ff-peak 6))
+    (println "ff peak > pp peak (dynamics measurably affect output)?" dynamics-ok
+             (str "(ratio " (.toFixed (/ ff-peak pp-peak) 3) "x)"))
+    (let [all-onset-ok (every? :onset-ok rows)
+          all-freq-ok (every? :freq-ok rows)
+          all-note-pcm-ok (every? #(< (:note-pcm-diff %) PCM-TOL) rows)
+          pass (and measure-valid round-trip-identical? round-trip-notes-identical?
+                    params-preserved-by-round-trip?
+                    whole-buffer-ok all-onset-ok all-freq-ok all-note-pcm-ok dynamics-ok)]
+      (println)
+      (println "all onset checks ok:" all-onset-ok)
+      (println "all frequency checks ok:" all-freq-ok)
+      (println "all per-note PCM diff checks ok:" all-note-pcm-ok)
+      (println "PASS:" pass)
+      pass)))
+
+(defn report-and-exit [server browser result total-samples sr]
+  (let [captured (vec (.-pcm result))
+        reference (offline-reference pre-params total-samples sr)
+        n (min (count captured) (count reference))
+        whole-buffer-diff (max-abs-diff (subvec captured 0 n) (subvec reference 0 n))
+        whole-buffer-ok (and (= (count captured) (count reference)) (< whole-buffer-diff PCM-TOL))
+        rows (mapv (fn [idx spec p] (evaluate-note idx spec p captured reference sr))
+                    (range) fixture/phrase-specs pre-params)
+        pass (print-report rows whole-buffer-diff whole-buffer-ok)]
+    (.close browser)
+    (.close server)
+    (if pass (js/process.exit 0) (js/process.exit 1))))
+
+(defn report-error [server browser e]
+  (println "ERROR:" (or (.-stack e) (.-message e) (str e)))
+  (.close browser)
+  (.close server)
+  (js/process.exit 1))
+
+(defn drive-page [server browser page total-samples sr notes-js]
+  (.on page "console" (fn [msg] (println "[console]" (.text msg))))
+  (.on page "pageerror" (fn [err] (println "[pageerror]" (str err))))
+  (-> (.goto page (str "http://localhost:" port "/"))
+      (.then (fn [_] ((run-in-page total-samples sr notes-js) page)))
+      (.then (fn [result] (report-and-exit server browser result total-samples sr)))
+      (.catch (fn [e] (report-error server browser e)))))
+
+(defn -main []
+  (when-not (fs/existsSync (path/join site-dir "worklet-processor.js"))
+    (println "ERROR: test/e2e/page/worklet-processor.js not found.")
+    (println "Run scripts/build-e2e-bundles.sh first.")
+    (js/process.exit 1))
+  (println "measure-valid?" measure-valid)
+  (println "round-trip identical (score)?" round-trip-identical?)
+  (println "round-trip identical (notes)?" round-trip-notes-identical?)
+  (println "params preserved by round trip?" params-preserved-by-round-trip?)
+  (when-not (and measure-valid round-trip-identical? round-trip-notes-identical?
+                 params-preserved-by-round-trip?)
+    (println "FATAL: fixture-side (no-browser) checks failed, aborting before touching the browser.")
+    (js/process.exit 1))
+  (let [total-samples (fixture/total-samples fixture/phrase-notes)
+        sr fixture/SR
+        notes-js (clj->js pre-params)]
+    (-> (start-server)
+        (.then
+          (fn [server]
+            (-> (.launch chromium)
+                (.then
+                  (fn [browser]
+                    (-> (.newPage browser)
+                        (.then (fn [page] (drive-page server browser page total-samples sr notes-js)))))))))
+        (.catch (fn [e] (println "SETUP ERROR:" (or (.-stack e) (.-message e) (str e))) (js/process.exit 1))))))
+
+(-main)

@@ -1,0 +1,133 @@
+(ns storj.core-test
+  "End-to-end request composition against a recording transport.
+
+  The expected signatures below were produced by an independent implementation
+  (Node's `crypto`, driven straight from the SigV4 spec) rather than by this
+  library, so they are a real cross-check and not a snapshot of our own output.
+
+  SigV4 itself is covered by `kotoba-lang/sigv4`; what is tested here is the S3
+  object surface composed over it.
+
+  JVM-only, because `storj.core/then` is identity-application here and the whole
+  pipeline reads synchronously. The ClojureScript/Promise path is covered by
+  `scripts/verify-cljs.cljk`."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [sigv4.crypto :as crypto]
+            [storj.core :as storj]
+            [storj.protocols :as p]))
+
+(def now "2026-07-25T12:00:00.000Z")
+
+(defrecord RecordingHttp [sent response]
+  p/IHttp
+  (-request [_ req] (reset! sent req) response))
+
+(defn- client
+  ([] (client {:status 200 :headers {} :body ""}))
+  ([response]
+   (let [sent (atom nil)]
+     [(storj/client {:bucket "my-bucket" :access-key "jwtest" :secret-key "supersecret"}
+                    {:crypto (crypto/crypto) :http (->RecordingHttp sent response)})
+      sent])))
+
+(defn- signature-of [req]
+  (second (re-find #"Signature=([0-9a-f]+)" (get-in req [:headers "authorization"]))))
+
+(deftest signed-get-matches-independent-implementation
+  (let [[c sent] (client)]
+    (storj/get-object c {:key "docs/readme.txt" :now now})
+    (let [req @sent]
+      (is (= "GET" (:method req)))
+      (is (= "https://gateway.storjshare.io/my-bucket/docs/readme.txt" (:url req)))
+      (is (= "gateway.storjshare.io" (get-in req [:headers "host"])))
+      (is (= "20260725T120000Z" (get-in req [:headers "x-amz-date"])))
+      (is (str/starts-with? (get-in req [:headers "authorization"])
+                            "AWS4-HMAC-SHA256 Credential=jwtest/20260725/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, "))
+      (is (= "2f164e6a8b8805003436d9150ca22b2ed89f4bdcfa505bb0bcfe36d42d2ca528"
+             (signature-of req))))))
+
+(deftest signed-put-hashes-the-body
+  (let [[c sent] (client)]
+    (storj/put-object c {:key "docs/readme.txt" :body "hello storj"
+                         :content-type "text/plain" :now now})
+    (let [req @sent]
+      (is (= "PUT" (:method req)))
+      (is (= "hello storj" (:body req)))
+      (testing "x-amz-content-sha256 is the digest of the body, not of the empty string"
+        (is (= "275a8f4e11cbf657431976aba8402192cd60919fede551e0a9bc59ea001a43bf"
+               (get-in req [:headers "x-amz-content-sha256"]))))
+      (testing "content-type participates in the signature"
+        (is (str/includes? (get-in req [:headers "authorization"])
+                           "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date")))
+      (is (= "b1433226d0b4bd5f58abdba0d533a353997dca3ab90bf3fdee6aa43c7527cf6b"
+             (signature-of req))))))
+
+(deftest range-requests-sign-the-range-header
+  (let [[c sent] (client {:status 206 :headers {} :body "hel"})]
+    (is (= 206 (:status (storj/get-object c {:key "a.txt" :now now :range "bytes=0-2"}))))
+    (is (= "bytes=0-2" (get-in @sent [:headers "range"])))
+    (is (str/includes? (get-in @sent [:headers "authorization"]) "SignedHeaders=host;range;"))))
+
+(deftest missing-objects-are-nil-not-errors
+  (let [[c _] (client {:status 404 :headers {} :body ""})]
+    (is (nil? (storj/get-object c {:key "nope.txt" :now now})))
+    (is (nil? (storj/head-object c {:key "nope.txt" :now now})))))
+
+(deftest other-failures-throw-with-status-and-no-credentials
+  (let [[c _] (client {:status 403 :headers {} :body "AccessDenied"})]
+    (try
+      (storj/get-object c {:key "a.txt" :now now})
+      (is false "should have thrown")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= 403 (:status (ex-data e))))
+        (is (str/includes? (ex-message e) "403"))
+        (is (not (str/includes? (ex-message e) "supersecret"))
+            "an error message must never carry the secret key")))))
+
+(deftest list-objects-builds-the-v2-query
+  (let [[c sent] (client {:status 200 :headers {} :body "<ListBucketResult/>"})]
+    (storj/list-objects c {:prefix "docs/" :max-keys 100 :delimiter "/" :now now})
+    (testing "the bucket path, no object key"
+      (is (str/starts-with? (:url @sent) "https://gateway.storjshare.io/my-bucket?")))
+    (testing "parameters are canonically ordered and encoded"
+      (is (str/ends-with? (:url @sent)
+                          "?delimiter=%2F&list-type=2&max-keys=100&prefix=docs%2F")))))
+
+(deftest presigned-url-matches-independent-implementation
+  (let [[c _] (client)]
+    (is (= (str "https://gateway.storjshare.io/my-bucket/docs/readme.txt"
+                "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                "&X-Amz-Credential=jwtest%2F20260725%2Fus-east-1%2Fs3%2Faws4_request"
+                "&X-Amz-Date=20260725T120000Z"
+                "&X-Amz-Expires=3600"
+                "&X-Amz-SignedHeaders=host"
+                "&X-Amz-Signature=8890b75c4127c944b41ade4dcacb46afd437ab9ce89678bf3d9139c9e1b78fb9")
+           (storj/presign c {:key "docs/readme.txt" :now now})))))
+
+(deftest parse-list-result-extracts-keys-and-pagination
+  (let [xml (str "<?xml version=\"1.0\"?><ListBucketResult>"
+                 "<IsTruncated>true</IsTruncated>"
+                 "<NextContinuationToken>tok123</NextContinuationToken>"
+                 "<Contents><Key>docs/a.txt</Key><Size>12</Size></Contents>"
+                 "<Contents><Key>docs/b &amp; c.txt</Key><Size>3</Size></Contents>"
+                 "<CommonPrefixes><Prefix>docs/sub/</Prefix></CommonPrefixes>"
+                 "</ListBucketResult>")
+        r (storj/parse-list-result xml)]
+    (is (= ["docs/a.txt" "docs/b & c.txt"] (:keys r)))
+    (is (= ["docs/sub/"] (:common-prefixes r)))
+    (is (true? (:truncated? r)))
+    (is (= "tok123" (:next-continuation-token r)))))
+
+(deftest parse-list-result-unescapes-in-the-right-order
+  (testing "&amp;lt; is the literal text &lt;, not a nested <"
+    (is (= ["a&lt;b"]
+           (:keys (storj/parse-list-result "<Contents><Key>a&amp;lt;b</Key></Contents>")))))
+  (testing "numeric character references"
+    (is (= ["日"] (:keys (storj/parse-list-result "<Contents><Key>&#x65E5;</Key></Contents>"))))))
+
+(deftest parse-list-result-on-an-empty-page
+  (let [r (storj/parse-list-result "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")]
+    (is (empty? (:keys r)))
+    (is (false? (:truncated? r)))
+    (is (nil? (:next-continuation-token r)))))

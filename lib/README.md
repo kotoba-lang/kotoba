@@ -100,6 +100,32 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
 | `org.w3.png` | `org.w3.png/src` | `png.bytes`, `png.core`, `png.decode`, `png.encode` (an external specification, publisher w3.org) |
+| `org.ietf.dnssec` | `org.ietf.dnssec/src` | `dnssec.canonical`, `dnssec.nsec3`, `dnssec.provider`, `dnssec.sign` (an external specification, publisher ietf.org) |
+| `org.ietf.radius` | `org.ietf.radius/src` | `radius.attribute`, `radius.auth`, `radius.bytes`, `radius.md5` (an external specification, publisher ietf.org) |
+| `org.ietf.snmp` | `org.ietf.snmp/src` | `snmp.message`, `snmp.pdu`, `snmp.types` (an external specification, publisher ietf.org) |
+| `org.apache.arrow` | `org.apache.arrow/src` | `arrow.build`, `arrow.decode`, `arrow.flatbuffers`, `arrow.ipc` (an external specification, publisher apache.org) |
+| `org.ietf.oauth2` | `org.ietf.oauth2/src` | `oauth2.core`, `oauth2.pkce` (an external specification, publisher ietf.org) |
+| `kotoba.omise` | `kotoba.omise/src` | `kotoba.omise`, `kotoba.omise.export`, `kotoba.omise.ui` (Kotoba project library) |
+| `kotoba.mst` | `kotoba.mst/src` | `mst.core` (Kotoba project library) |
+| `kotoba.mangaViewer` | `kotoba.mangaViewer/src` | `manga-viewer.model`, `manga-viewer.pagination`, `manga-viewer.render`, `manga-viewer.style` (Kotoba project library) |
+| `kotoba.live` | `kotoba.live/src` | `kotoba.live`, `kotoba.live.audio`, `kotoba.live.avatar`, `kotoba.live.beat` (Kotoba project library) |
+| `kotoba.kotobaActors` | `kotoba.kotobaActors/src` | `kotoba-actors.asobi`, `kotoba-actors.config`, `kotoba-actors.datomic`, `kotoba-actors.hokorobi` (Kotoba project library) |
+| `kotoba.katex` | `kotoba.katex/src` | `kotoba.lang.katex.mathml`, `kotoba.lang.katex.parse` (Kotoba project library) |
+| `kotoba.kamiOngakuNotation` | `kotoba.kamiOngakuNotation/src` | `kami.ongaku.notation`, `kami.ongaku.notation.duration`, `kami.ongaku.notation.musicxml`, `kami.ongaku.notation.pitch` (Kotoba project library) |
+| `kotoba.sdf` | `kotoba.sdf/src` | `sdf` (Kotoba project library) |
+| `kotoba.kamiEngineCad` | `kotoba.kamiEngineCad/src` | `kami.cad` (Kotoba project library) |
+| `kotoba.kamiEngineAppSdk` | `kotoba.kamiEngineAppSdk/src` | `kami-ui-sdk`, `kami-ui-sdk.effect`, `kami-ui-sdk.engine-audio`, `kami-ui-sdk.motion` (Kotoba project library) |
+| `kotoba.kamiAppTatekata` | `kotoba.kamiAppTatekata/src` | `kotoba.tatekata`, `kotoba.tatekata.deposit-field`, `kotoba.tatekata.process`, `kotoba.tatekata.thermal` (Kotoba project library) |
+| `kotoba.kamiAppSarutahikoFactory` | `kotoba.kamiAppSarutahikoFactory/src` | `kotoba.sarutahiko-factory`, `kotoba.sarutahiko-factory.clashes`, `kotoba.sarutahiko-factory.construction-order`, `kotoba.sarutahiko-factory.factory` (Kotoba project library) |
+| `kotoba.ioStorj` | `kotoba.ioStorj/src` | `storj.core`, `storj.gateway`, `storj.linkshare`, `storj.protocols` (Kotoba project library) |
+| `kotoba.kotobaDatom` | `kotoba.kotobaDatom/src` | `kotoba.datom` (Kotoba project library) |
+| `kotoba.glyph` | `kotoba.glyph/src` | `kotoba.glyph`, `kotoba.glyph.atlas`, `kotoba.glyph.constants`, `kotoba.glyph.dynamic` (Kotoba project library) |
+| `kotoba.game` | `kotoba.game/src` | `game`, `game.addons`, `game.analytics`, `game.animation` (Kotoba project library) |
+| `kotoba.drive` | `kotoba.drive/src` | `drive.model`, `drive.object`, `drive.store.fs`, `drive.store.memory` (Kotoba project library) |
+| `kotoba.srs` | `kotoba.srs/src` | `srs.core`, `srs.host`, `srs.lifecycle`, `srs.status` (Kotoba project library) |
+| `kotoba.okaimono` | `kotoba.okaimono/src` | `kotoba.okaimono`, `kotoba.okaimono.export`, `kotoba.okaimono.ui` (Kotoba project library) |
+| `kotoba.comSonyDualsense` | `kotoba.comSonyDualsense/src` | `kotoba.dualsense.crc32`, `kotoba.dualsense.input`, `kotoba.dualsense.output` (Kotoba project library) |
+| `kotoba.chIec61850` | `kotoba.chIec61850/src` | `iec61850.appdu`, `iec61850.data`, `iec61850.goose`, `iec61850.utctime` (Kotoba project library) |
 | `kotoba.oidc` | `kotoba.oidc/src` | `oidc.adapters.discovery`, `oidc.adapters.identity-bridge`, `oidc.adapters.jwks`, `oidc.adapters.jwt-claims` (Kotoba project library) |
 | `kotoba.codebase` | `kotoba.codebase/src` | `kotoba.codebase.actor`, `kotoba.codebase.authoring`, `kotoba.codebase.backend`, `kotoba.codebase.backend.kotobase` (Kotoba project library) |
 | `kotoba.arrangement` | `kotoba.arrangement/src` | `arrangement.core`, `arrangement.datalog`, `arrangement.partitioned`, `arrangement.query` (Kotoba project library) |

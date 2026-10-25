@@ -1,0 +1,140 @@
+(ns radius.attribute
+  "RFC 2865 §5 Attribute TLVs, and §5.26 Vendor-Specific (type 26).
+
+  ```
+       0                   1                   2
+       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
+      |     Type      |    Length     |  Value ...
+      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
+  ```
+
+  `Length` is the RFC's own field — it counts Type+Length+Value, so it is
+  never less than 2, and a decoder that forgets to subtract 2 before
+  reading `Value` reads two bytes too many from every attribute after the
+  first."
+  (:require [radius.bytes :as b]))
+
+(defn fail!
+  [code message data]
+  (throw (ex-info message (assoc data :type code))))
+
+;; ── generic TLV ──────────────────────────────────────────────────────────
+
+(defn encode-attribute
+  "`{:radius/type t :radius/value bytes}` → the TLV as a vector of ints.
+  Throws on a value that cannot be represented — the Length octet is 1
+  byte, so Type+Length+Value cannot exceed 255 total."
+  [{:radius/keys [type value]}]
+  (let [value (b/->ints value)
+        length (+ 2 (count value))]
+    (when (> length 255)
+      (fail! :radius/attribute-too-long
+             "an attribute's Type+Length+Value cannot exceed 255 octets"
+             {:type type :value-length (count value)}))
+    (into [(bit-and type 0xff) length] value)))
+
+(defn- decode-tlv-at
+  "One Type/Length/Value at `pos` in `bs` → `[:ok type value next-pos]` or
+  `[:error kw]`. Shared by the top-level attribute list and the
+  Vendor-Specific sub-attribute list, which are the same TLV shape at two
+  different nesting depths."
+  [bs pos too-short-kw truncated-kw]
+  (cond
+    ;; not even the 2-byte Type/Length header is present — a structural
+    ;; truncation, distinct from a Length octet whose VALUE is invalid.
+    (> (+ pos 2) (count bs)) [:error truncated-kw]
+    :else
+    (let [type (nth bs pos) length (nth bs (inc pos))]
+      (cond
+        (< length 2) [:error too-short-kw]
+        (> (+ pos length) (count bs)) [:error truncated-kw]
+        :else [:ok type (subvec bs (+ pos 2) (+ pos length)) (+ pos length)]))))
+
+(defn decode-attribute-at
+  [bs pos]
+  (let [result (decode-tlv-at bs pos :radius/bad-attribute-length :radius/truncated-attribute)]
+    (if (= :error (first result))
+      result
+      (let [[_ type value next-pos] result]
+        [:ok {:radius/type type :radius/value value} next-pos]))))
+
+(defn encode-attributes [attrs]
+  (vec (mapcat encode-attribute attrs)))
+
+(defn decode-attributes
+  "Every attribute in `bs`, in order → `[:ok [attr ...]]` or the first
+  `[:error kw]` — fail-fast, same rationale as `snmp.pdu/decode-varbind-list`
+  in the sibling library: a packet with one malformed attribute is a
+  malformed packet, not N-1 good ones and a hole."
+  [bs]
+  (loop [pos 0 out []]
+    (if (>= pos (count bs))
+      [:ok out]
+      (let [[status a next-pos] (decode-attribute-at bs pos)]
+        (if (= :error status)
+          [:error a]
+          (recur next-pos (conj out a)))))))
+
+;; ── Vendor-Specific (type 26, RFC 2865 §5.26) ───────────────────────────────
+;;
+;; ```
+;;      0                   1                   2                   3
+;;      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+;;     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;;     |     Type      |  Length       |            Vendor-Id
+;;     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+;;          Vendor-Id (cont)           |  String...
+;;     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-
+;; ```
+;;
+;; §5.26: "Length >= 7" (2 header + 4 Vendor-Id + at least 1 octet of
+;; String) and "the high-order octet [of Vendor-Id] is 0 and the low-order
+;; 3 octets are the Vendor ID as specified in RFC 1700". The RFC leaves the
+;; String field's internal format vendor-defined, but the near-universal
+;; convention — used by every RADIUS dictionary this codec has been tested
+;; against in spirit, e.g. Cisco/Microsoft VSAs — is a nested vendor-type
+;; (1 octet) / vendor-length (1 octet, header-inclusive like the outer TLV)
+;; / value TLV, which is what `decode-vendor-specific`/`encode-vendor-specific`
+;; implement. A vendor whose String is NOT this convention should just use
+;; `encode-attribute`/`decode-attribute-at` on type 26 directly and treat
+;; `:radius/value` as an opaque blob.
+
+(def vendor-specific-type 26)
+
+(defn encode-vendor-specific
+  [vendor-id sub-attrs]
+  (let [subs (vec (mapcat (fn [{:radius/keys [vendor-type value]}]
+                             (let [value (b/->ints value)
+                                   length (+ 2 (count value))]
+                               (when (> length 255)
+                                 (fail! :radius/attribute-too-long
+                                        "a vendor sub-attribute cannot exceed 255 octets"
+                                        {:vendor-type vendor-type}))
+                               (into [(bit-and vendor-type 0xff) length] value)))
+                          sub-attrs))]
+    (encode-attribute {:radius/type vendor-specific-type
+                        :radius/value (into (b/uint32->bytes vendor-id) subs)})))
+
+(defn decode-vendor-specific
+  "`{:radius/type 26 :radius/value bytes}` (as produced by
+  `decode-attribute-at`) → `[:ok {:radius/vendor-id n :radius/sub-attributes
+  [...]}]` or `[:error kw]`."
+  [{:radius/keys [type value]}]
+  (cond
+    (not= vendor-specific-type type) [:error :radius/not-vendor-specific]
+    (< (count value) 5) [:error :radius/truncated-vendor-attribute]
+    :else
+    (let [vendor-id (b/bytes->uint32 (subvec value 0 4))
+          subs-bytes (subvec value 4)]
+      (loop [pos 0 out []]
+        (if (>= pos (count subs-bytes))
+          [:ok {:radius/vendor-id vendor-id :radius/sub-attributes out}]
+          (let [result (decode-tlv-at subs-bytes pos
+                                       :radius/bad-attribute-length
+                                       :radius/truncated-vendor-attribute)]
+            (if (= :error (first result))
+              result
+              (let [[_ vtype value next-pos] result]
+                (recur next-pos
+                       (conj out {:radius/vendor-type vtype :radius/value value}))))))))))

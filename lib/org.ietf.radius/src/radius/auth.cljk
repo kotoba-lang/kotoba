@@ -1,0 +1,134 @@
+(ns radius.auth
+  "RFC 2865 §3 Response Authenticator, RFC 2866 §3 Accounting Request
+  Authenticator, and RFC 2865 §5.2 User-Password hiding — the three places
+  RADIUS uses MD5.
+
+  All three follow the same shape: MD5 over some fixed header bytes,
+  concatenated with a shared secret the two RADIUS peers already know, with
+  NO key-exchange or asymmetric crypto involved — the security of the
+  whole scheme rests entirely on the secret staying secret, which is why
+  RFC 2865 §3 itself warns it \"is not, by itself, a satisfactory security
+  mechanism\" (a passive attacker who captures one Access-Request and knows
+  the plaintext can build a dictionary attack on the secret from the
+  Response Authenticator alone). This is implemented for wire compatibility
+  with the deployed protocol, not held up as a good design."
+  (:require [radius.attribute :as attr]
+            [radius.md5 :as md5]
+            [radius.packet :as packet]
+            [radius.bytes :as b]))
+
+(defn- utf8-ints
+  "A string as UTF-8 octets — how RFC 2865 says to treat the shared secret
+  and User-Password (§5.2's \"S\" and the password `String`), both of which
+  are just octet strings on the wire, not necessarily ASCII."
+  [s]
+  #?(:clj (vec (.getBytes (str s) "UTF-8"))
+     :cljs (vec (.encode (js/TextEncoder.) (str s)))))
+
+(defn- utf8-decode
+  "The inverse of `utf8-ints` — actual UTF-8 decoding, not a byte-per-char
+  guess, so a non-ASCII password round-trips correctly and not just an
+  ASCII one."
+  [ints]
+  #?(:clj (String. (byte-array (map unchecked-byte ints)) "UTF-8")
+     :cljs (.decode (js/TextDecoder.) (b/ints->bytes ints))))
+
+;; ── Response / Accounting-Request Authenticator ─────────────────────────
+
+(defn response-authenticator
+  "RFC 2865 §3: `ResponseAuth = MD5(Code+ID+Length+RequestAuth+Attributes+
+  Secret)`. `response-packet` is the OUTGOING response (Access-Accept/
+  -Reject/-Challenge, or per RFC 2866 §3 an Accounting-Response) with its
+  `:radius/authenticator` set to the REQUEST's Authenticator — that
+  substitution, not the response's own (not-yet-known) Authenticator, is
+  exactly what the formula calls `RequestAuth`. The 16 bytes returned are
+  what actually goes into the outgoing packet's Authenticator field.
+
+  Reuses `packet/encode-packet` for the Code+ID+Length+Authenticator+
+  Attributes framing rather than re-serializing those fields by hand — the
+  header layout is not this namespace's to duplicate."
+  [response-packet request-authenticator secret]
+  (let [header+attrs (packet/encode-packet
+                       (assoc response-packet :radius/authenticator request-authenticator))]
+    (md5/md5-ints (into header+attrs (utf8-ints secret)))))
+
+(defn verify-response-authenticator
+  "Whether `response-packet` (as actually received, `:radius/authenticator`
+  = what was on the wire) is the correct response to `request-authenticator`
+  under `secret`."
+  [response-packet request-authenticator secret]
+  (= (:radius/authenticator response-packet)
+     (response-authenticator response-packet request-authenticator secret)))
+
+(defn accounting-request-authenticator
+  "RFC 2866 §3: the Accounting-Request's own Authenticator is `MD5(Code+ID+
+  Length+16-zero-octets+Attributes+Secret)` — there is no separate request
+  to borrow an Authenticator from, so the placeholder is 16 zero octets
+  instead."
+  [request-packet secret]
+  (let [header+attrs (packet/encode-packet
+                       (assoc request-packet :radius/authenticator (vec (repeat 16 0))))]
+    (md5/md5-ints (into header+attrs (utf8-ints secret)))))
+
+;; ── User-Password hiding (RFC 2865 §5.2) ────────────────────────────────
+;;
+;;   b1 = MD5(S + RA)       c(1) = p1 xor b1
+;;   b2 = MD5(S + c(1))     c(2) = p2 xor b2
+;;   ...
+;;   bi = MD5(S + c(i-1))   c(i) = pi xor bi
+;;
+;; padded to a 16-octet boundary with trailing nulls, "at least one byte
+;; and at most 128" per §5.2 — cap enforced here.
+
+(def max-password-bytes 128)
+
+(defn- xor-block [a b]
+  (mapv bit-xor a b))
+
+(defn hide-password
+  "`password` (a string) → the User-Password attribute's `Value` octets,
+  hidden under `request-authenticator` (16 octets, the SAME Authenticator
+  going out in this Access-Request's header) and `secret`."
+  [password request-authenticator secret]
+  (let [pwd-bytes (utf8-ints password)]
+    (when (> (count pwd-bytes) max-password-bytes)
+      (attr/fail! :radius/password-too-long
+                   (str "RFC 2865 §5.2: User-Password is at most " max-password-bytes " octets")
+                   {:length (count pwd-bytes)}))
+    (let [;; integer ceil-to-16, portable (no Math/ceil, which is not the
+          ;; same call on :clj vs :cljs)
+          nblocks (max 1 (quot (+ (count pwd-bytes) 15) 16))
+          pad-to (* 16 nblocks)
+          padded (into pwd-bytes (repeat (- pad-to (count pwd-bytes)) 0))
+          secret-bytes (utf8-ints secret)
+          blocks (partition 16 padded)]
+      (loop [prev (b/->ints request-authenticator) blocks blocks out []]
+        (if (empty? blocks)
+          out
+          (let [bi (md5/md5-ints (into secret-bytes prev))
+                ci (xor-block (first blocks) bi)]
+            (recur ci (rest blocks) (into out ci))))))))
+
+(defn unhide-password
+  "The inverse of `hide-password`: `cipher` (the User-Password attribute's
+  `Value` octets, a multiple of 16) → the original password string, with
+  trailing null padding stripped.
+
+  That stripping is a documented limitation, not an oversight: RFC 2865
+  §5.2 pads with nulls and gives no length field, so a password that itself
+  ends in a real NUL byte round-trips one byte shorter than it started —
+  the same ambiguity every implementation of this scheme has."
+  [cipher request-authenticator secret]
+  (let [cipher (b/->ints cipher)]
+    (if (or (zero? (count cipher)) (not (zero? (mod (count cipher) 16))))
+      [:error :radius/bad-password-length]
+      (let [secret-bytes (utf8-ints secret)
+            blocks (partition 16 cipher)
+            plain (loop [prev (b/->ints request-authenticator) blocks blocks out []]
+                    (if (empty? blocks)
+                      out
+                      (let [bi (md5/md5-ints (into secret-bytes prev))
+                            pi (xor-block (first blocks) bi)]
+                        (recur (vec (first blocks)) (rest blocks) (into out pi)))))
+            trimmed (vec (reverse (drop-while zero? (reverse plain))))]
+        [:ok (utf8-decode trimmed)]))))

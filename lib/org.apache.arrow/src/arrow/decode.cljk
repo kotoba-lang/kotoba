@@ -1,0 +1,181 @@
+(ns arrow.decode
+  "Buffers to values.
+
+  Arrow's flat layouts are the simplest thing a columnar format does: a
+  validity bitmap beside a values buffer, with a third offsets buffer for the
+  variable-width types. There is no encoding layer and no compression by
+  default, which is exactly why this format is the right second one to plug
+  into `columnar` — the pressure it puts on the seam comes from a different
+  direction than Parquet's pages and dictionaries.
+
+  ## The validity bitmap is LSB-first, and may be absent
+
+  Bit `i` of the mask lives in bit `i mod 8` of byte `i / 8`, counting from
+  the **least** significant. A writer that recorded no nulls is allowed to
+  emit a zero-length validity buffer, and that means *all valid* — not *all
+  null*. Reading it the other way produces a column of nulls from a file with
+  no nulls in it, and every aggregate over that column still returns a number.
+
+  ## Refusals name what they refuse
+
+  Body compression and dictionary encoding are refused by name, before any
+  buffer is fetched. Both are properties of the buffers and neither touches
+  the metadata, so a file this namespace refuses still answers `count`,
+  `count-non-null` and all-null pruning out of `arrow.ipc/batch-header`."
+  (:require [kotoba.bytes :as kbytes] [arrow.flatbuffers :as fb]
+            [columnar.vector :as cvec]
+            [zstd.core :as zstd]))
+
+(def decodable-compression
+  "Body compressions this namespace can undo.
+
+  LZ4_FRAME stays refused: there is no portable .cljc LZ4 decoder in this
+  workspace, and the refusal is by name so a caller learns which codec it
+  met rather than that something unspecified went wrong."
+  #{:zstd})
+
+(defn decompress-buffer
+  "One body buffer, undone if the batch declared a compression.
+
+  Arrow compresses **per buffer**, not per body, and prefixes each with an
+  int64 little-endian uncompressed length. Two cases that are easy to miss and
+  silent when missed:
+
+  - **A length of -1 means the buffer is stored RAW.** Writers emit this when
+    compressing would have made the buffer bigger, so it is the normal state
+    for small buffers -- a validity bitmap of one byte, an offsets buffer of a
+    handful of entries -- and a decoder that always decompresses fails on
+    exactly the files that compress well.
+  - **A zero-length buffer carries no prefix at all** and stays empty. Reading
+    8 bytes of length from it would consume the next buffer's bytes."
+  [compression bs]
+  (if (or (nil? compression) (zero? (count bs)))
+    bs
+    (let [declared (fb/i64 bs 0)
+          body (subvec (vec bs) 8)]
+      (cond
+        (neg? declared) body
+        (zero? declared) []
+        :else
+        (let [out (vec (zstd/decompress body))]
+          (when-not (= (long declared) (count out))
+            (throw (ex-info "decompressed buffer is not the declared length"
+                            {:type :arrow/codec-length-mismatch
+                             :declared declared :actual (count out)})))
+          out)))))
+
+(defn valid-mask
+  "`n` validity flags from a bitmap buffer.
+
+  An empty buffer means the writer recorded no nulls, so every row is valid."
+  [bs n]
+  (if (zero? (count bs))
+    (vec (repeat n true))
+    (mapv (fn [i]
+            (let [b (nth bs (quot i 8) 0)]
+              (pos? (bit-and b (bit-shift-left 1 (mod i 8))))))
+          (range n))))
+
+(defn- fixed-width
+  "Values of a fixed-width type, read `stride` bytes apart."
+  [bs n stride read-fn]
+  (mapv (fn [i] (read-fn bs (* i stride))) (range n)))
+
+(defn- var-width
+  "Values of a variable-width type: `n` slices of `data` delimited by `n+1`
+  offsets.
+
+  The offsets buffer has one more entry than there are rows — the last is the
+  total length — which is what lets the final value's end be read the same way
+  as every other one."
+  [offsets data n wide? decode-slice]
+  (let [stride (if wide? 8 4)
+        at (if wide? fb/i64 fb/u32)]
+    (mapv (fn [i]
+            (let [s (at offsets (* i stride))
+                  e (at offsets (* (inc i) stride))]
+              (decode-slice (subvec (vec data) s e))))
+          (range n))))
+
+(defn- bytes->string [raw]
+  (if (every? #(< % 0x80) raw)
+    (apply str (map char raw))
+    #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte raw)))
+       :cljs (.decode (js/TextDecoder. "utf-8") (js/Uint8Array. (clj->js raw))))))
+
+(defn- bit-values [bs n]
+  (mapv (fn [i]
+          (let [b (nth bs (quot i 8) 0)]
+            (pos? (bit-and b (bit-shift-left 1 (mod i 8))))))
+        (range n)))
+
+(defn check-readable!
+  "Throw unless this batch's buffers can be decoded for `field`.
+
+  Called before a byte of the body is fetched: a refusal must not cost a
+  download."
+  [{:keys [name logical dictionary?]} compression]
+  (when (and compression (not (contains? decodable-compression compression)))
+    (throw (ex-info (str "arrow: body compression " (pr-str compression)
+                         " is not implemented"
+                         " — batch metadata is still readable from this file")
+                    {:type :arrow/unsupported-compression
+                     :compression compression :column name
+                     :decodable (vec decodable-compression)})))
+  (when dictionary?
+    (throw (ex-info (str "arrow: column " (pr-str name)
+                         " is dictionary-encoded; its buffers hold indices"
+                         " and the dictionary batches are not decoded")
+                    {:type :arrow/unsupported-encoding :column name})))
+  (let [t (:type logical)]
+    (when-not (contains? #{:bool :int8 :int16 :int32 :int64
+                           :uint8 :uint16 :uint32 :uint64
+                           :float :double :utf8 :large-utf8
+                           :binary :large-binary :null}
+                         t)
+      (throw (ex-info (str "arrow: decoding " (pr-str t) " is not implemented")
+                      {:type :arrow/unsupported-type :column name :logical t})))))
+
+(defn column
+  "A `columnar.vector` column from this field's buffers.
+
+  `buffers` are the raw byte vectors this field's layout calls for, already
+  fetched: `[validity values]` for the fixed-width and boolean types,
+  `[validity offsets data]` for the variable-width ones, and `[]` for null."
+  [{:keys [logical]} rows buffers]
+  (let [t (:type logical)]
+    (if (= t :null)
+      (cvec/of t (vec (repeat rows nil)) (vec (repeat rows false)))
+      (let [[validity & rest-bufs] buffers
+            valid (valid-mask validity rows)
+            values
+            (case t
+              :bool (bit-values (first rest-bufs) rows)
+              (:int8 :uint8) (fixed-width (first rest-bufs) rows 1
+                                          (if (= t :int8)
+                                            (fn [b i] (let [v (fb/u8 b i)]
+                                                        (if (>= v 128) (- v 256) v)))
+                                            fb/u8))
+              (:int16 :uint16) (fixed-width (first rest-bufs) rows 2
+                                            (if (= t :int16) fb/i16 fb/u16))
+              (:int32 :uint32) (fixed-width (first rest-bufs) rows 4
+                                            (if (= t :int32) fb/i32 fb/u32))
+              ;; uint64 is read with the signed reader on purpose: values
+              ;; above 2^63 would need a representation neither runtime has,
+              ;; and `fb/i64` refuses rather than rounds.
+              (:int64 :uint64) (fixed-width (first rest-bufs) rows 8 fb/i64)
+              :float (fixed-width (first rest-bufs) rows 4 fb/f32)
+              :double (fixed-width (first rest-bufs) rows 8 fb/f64)
+              (:utf8 :large-utf8)
+              (var-width (first rest-bufs) (second rest-bufs) rows
+                         (= t :large-utf8) bytes->string)
+              (:binary :large-binary)
+              (var-width (first rest-bufs) (second rest-bufs) rows
+                         (= t :large-binary) vec))]
+        ;; A null row's slot in the values buffer holds whatever the writer
+        ;; left there, so it is blanked rather than carried: the mask is the
+        ;; truth, and a caller reading `:values` directly should not find
+        ;; padding that looks like data.
+        (cvec/of t
+                 (mapv (fn [v ok?] (when ok? v)) values valid)
+                 valid)))))

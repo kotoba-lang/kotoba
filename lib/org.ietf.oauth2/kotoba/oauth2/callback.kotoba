@@ -1,0 +1,187 @@
+;; The OAuth 2.0 authorization callback decision, as a Kotoba application
+;; (ADR-2608261100) — RFC 6749 §4.1.2 / §10.12.
+;;
+;;   init          (config)  -> state
+;;   offer-params  (state, params) -> state
+;;
+;; ## This slice adds a check the library does not have
+;;
+;; Measured on this repo at 7729252: nothing in `src/` or `test/` compares
+;; the `state` parameter. `oauth2.core/parse-authorization-response` returns
+;; it and leaves the comparison to the caller.
+;;
+;; RFC 6749 §10.12 is not optional about it: *"The client MUST implement
+;; CSRF protection"*, and the mechanism the RFC gives is binding the
+;; callback to the request with `state`. A caller who forgets accepts an
+;; authorization code that arrived from somewhere it did not ask — which is
+;; authorization-code injection, and it looks exactly like a successful
+;; login.
+;;
+;; So this is not a port of an existing decision; it is the decision itself,
+;; and it lives in the guest:
+;;
+;;   the guest owns   whether this callback may be acted on at all
+;;   the host owns    the redirect URL, its query parsing, the code once it
+;;                    is usable, and the token exchange that follows
+;;
+;; `oauth2.core` keeps extraction and does NOT grow a second copy of this
+;; decision — a mirror is what ADR-2608261100 forbids, and a security check
+;; implemented twice is a security check that will diverge once.
+;;
+;; ## The order is the design
+;;
+;; `state` is verified FIRST, before `error` and before `code`. The state is
+;; what says this response belongs to this client's request; deciding
+;; anything about a response that has not been bound to your own request is
+;; the failure mode, not a step on the way to it. An implementation that
+;; reads `error` first reports an authorization failure for a response it
+;; never established was answering it.
+;;
+;; Then `error` before `code` (§4.1.2.1): a response carrying both is a
+;; failure, and treating it as a success because a code is present is how a
+;; refusal becomes a login.
+;;
+;; ## A handler with nothing to bind with is refused at construction
+;;
+;; `init` refuses when the client sent neither a `state` nor used PKCE. The
+;; OAuth 2.0 Security BCP requires one or the other; a handler with neither
+;; has no way to tell its own callback from someone else's, and the only
+;; place left for that decision to come from is the callback. Same shape as
+;; `org-ietf-jws`'s refusal of a verifier with no named algorithms.
+;;
+;; ## What does not pass through the guest
+;;
+;; No secret does. The code is a bearer credential for exactly one exchange,
+;; and the guest reports it only once the callback has been accepted — the
+;; host holds the client secret and the code verifier and makes the token
+;; request. The guest sees four strings from a query it did not fetch.
+;;
+;; No regular expressions; no byte scanning at all in this one. The
+;; decisions are string equality and presence.
+;;
+;; `.cljc` remains the extraction oracle and is not required from here
+;; (require-graph).
+;;
+;; Compile (the CLI needs -M, an ABSOLUTE path and `--output`;
+;; ADR-2608262000):
+;;   kotoba -M compile /ABS/kotoba/oauth2/callback.kotoba \
+;;     --target wasm32-browser --output callback.wasm
+;;
+;; Measured 2026-08-31 on amu 88ae83e, without a JDK on PATH:
+;;   amu check   … --jvm-free                     -> :ok true, :effects #{}
+;;   amu compile … --jvm-free --target wasm32-browser
+;;                                                -> 4934-byte .wasm
+;; Observations of one build, not a contract; re-measure rather than
+;; quoting them.
+
+(ns oauth2.callback
+  (:export [init offer-params
+            phase reason
+            code state-received error-code error-description
+            expected-state pkce?]))
+
+;; --- document accessors ---------------------------------------------------
+
+(defn- dg [d :document k :keyword] :document
+  (option-value-of [:option :document] (document-get d k) (document-null)))
+
+(defn- ds [d :document k :keyword] :string
+  (option-value-of [:option :string] (document-string-value (dg d k)) ""))
+
+(defn- dk [d :document k :keyword] :keyword
+  (option-value-of [:option :keyword] (document-keyword-value (dg d k)) :none))
+
+(defn- db [d :document k :keyword] :bool
+  (option-value-of [:option :bool] (document-bool-value (dg d k)) false))
+
+;; --- state ----------------------------------------------------------------
+
+(defn- refuse [state :document why :keyword] :document
+  (document-assoc
+   (document-assoc state :phase (document-keyword :refused))
+   :reason (document-keyword why)))
+
+;; RFC 6749 §10.12 and the OAuth 2.0 Security BCP: a client MUST bind the
+;; callback to its own request, with `state` or with PKCE. A handler that
+;; has neither cannot tell its own callback from someone else's, so this is
+;; refused before a callback is ever offered to it.
+(defn init [config :document] :document
+  (let [expected (ds config :expected-state)
+        pkce (db config :pkce?)
+        base (document-map :phase (document-keyword :want-params)
+                           :reason (document-keyword :none)
+                           :expected (document-string expected)
+                           :pkce (document-bool pkce)
+                           :code (document-string "")
+                           :state-received (document-string "")
+                           :error (document-string "")
+                           :error-description (document-string ""))]
+    (if (and (string=? expected "") (not pkce))
+      (refuse base :oauth2/no-request-binding)
+      base)))
+
+;; --- the decision ---------------------------------------------------------
+
+;; The host parsed the redirect's query into `:code`, `:state`, `:error` and
+;; `:error_description` (§4.1.2 / §4.1.2.1). Percent-decoding and query
+;; splitting are mechanism the host is already doing to serve the redirect.
+(defn offer-params [state :document params :document] :document
+  (if (not (= (dk state :phase) :want-params))
+    state
+    (let [got (ds params :state)
+          err (ds params :error)
+          c (ds params :code)
+          expected (ds state :expected)
+          kept (document-assoc
+                (document-assoc
+                 (document-assoc
+                  (document-assoc state :state-received (document-string got))
+                  :error (document-string err))
+                 :error-description (document-string (ds params :error_description)))
+                :code (document-string c))]
+      (cond
+        ;; First, and not as a courtesy. Until the response is bound to this
+        ;; client's request, nothing else in it is worth reading.
+        ;;
+        ;; A handler that sent no state is one that used PKCE instead; its
+        ;; binding is the code verifier the host holds, and the callback
+        ;; carries no state to check.
+        (and (not (string=? expected "")) (string=? got ""))
+        (refuse kept :oauth2/state-missing)
+
+        ;; Two empty strings are not a match. `expected` is non-empty on
+        ;; this branch, so this compares two real values -- but the guard
+        ;; above is what makes that true, and removing it turns a missing
+        ;; state into a silent pass.
+        (and (not (string=? expected "")) (not (string=? got expected)))
+        (refuse kept :oauth2/state-mismatch)
+
+        ;; §4.1.2.1. Before the code: a response carrying both is a failure,
+        ;; and reading the code first is how a refusal becomes a login.
+        (not (string=? err "")) (refuse kept :oauth2/authorization-error)
+
+        (string=? c "") (refuse kept :oauth2/no-code)
+
+        :else (document-assoc kept :phase (document-keyword :usable))))))
+
+;; --- projections ----------------------------------------------------------
+
+(defn phase [state :document] :keyword (dk state :phase))
+
+(defn reason [state :document] :keyword (dk state :reason))
+
+;; The authorization code, and only once the callback has been accepted. It
+;; is a bearer credential for exactly one exchange; handing it back from a
+;; callback that was refused would make the refusal decorative.
+(defn code [state :document] :string
+  (if (= (dk state :phase) :usable) (ds state :code) ""))
+
+(defn state-received [state :document] :string (ds state :state-received))
+
+(defn error-code [state :document] :string (ds state :error))
+
+(defn error-description [state :document] :string (ds state :error-description))
+
+(defn expected-state [state :document] :string (ds state :expected))
+
+(defn pkce? [state :document] :bool (db state :pkce))

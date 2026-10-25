@@ -1,0 +1,193 @@
+;; `kotoba/oauth2/callback.kotoba`.
+;;
+;; Two different things are being tested here, and the file keeps them
+;; apart on purpose.
+;;
+;; **Parity** covers extraction: what `code`, `state`, `error` and
+;; `error_description` the callback carried. That has an oracle —
+;; `oauth2.core/parse-authorization-response` — and the guest must agree
+;; with it.
+;;
+;; **The decision has no oracle**, because the library does not make it.
+;; Measured on this repo at 7729252: nothing in `src/` or `test/` compares
+;; `state`. RFC 6749 §10.12 says the client MUST implement CSRF protection
+;; and gives `state` as the mechanism; `parse-authorization-response`
+;; returns the value and leaves the comparison to whoever calls it. So the
+;; tests below assert the decision directly, and say so rather than
+;; dressing a new rule up as parity.
+;;
+;; `.cljc` is not required from the guest (require-graph), and it did not
+;; grow a second copy of the decision: a security check implemented twice is
+;; a security check that will diverge once (ADR-2608261100).
+;;
+;; ## The negative controls
+;;
+;; Every one of these passes on a naive implementation that reads the
+;; callback in the order the RFC prints it:
+;;
+;;   * `an-error-response-is-not-a-success-even-when-it-carries-a-code` —
+;;     §4.1.2.1. Reading the code first is how a refusal becomes a login;
+;;   * `state-is-checked-before-anything-else-is-believed` — an injected
+;;     error response with the wrong state must be refused as unbound, not
+;;     reported as the authorization server's answer;
+;;   * `two-empty-states-are-not-a-match` — the naive
+;;     `(= expected received)` passes when both are absent, which is the
+;;     shape a client gets when it forgot to send one;
+;;   * `a-handler-with-neither-state-nor-pkce-is-refused` — a client that
+;;     bound its request to nothing cannot tell its own callback from
+;;     someone else's;
+;;   * `a-refused-callback-yields-no-code` — the code is a bearer
+;;     credential for one exchange; handing it back from a refusal would
+;;     make the refusal decorative.
+
+(ns oauth2.callback-kotoba-parity-test
+  (:require [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir]
+            [oauth2.callback-guest-document :refer [->doc]]
+            [oauth2.core :as oauth2]))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "oauth2" "callback.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'oauth2.callback (slurp guest-file)}
+                                         'oauth2.callback
+                                         :wasm32-kotoba-v1))))
+
+(defn- call [f args] (ir/execute @kir f args))
+
+(defn- handle
+  "What a redirect handler does: the host has already parsed the query, and
+  the guest decides whether the callback may be acted on."
+  [config params]
+  (let [state (call 'offer-params [(call 'init [(->doc config)]) (->doc params)])]
+    {:state state
+     :phase (call 'phase [state])
+     :reason (call 'reason [state])
+     :code (call 'code [state])
+     :state-received (call 'state-received [state])
+     :error (call 'error-code [state])
+     :error-description (call 'error-description [state])}))
+
+(def ^:private sent {:expected-state "xyz"})
+
+;; --- parity: extraction ------------------------------------------------------
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+(deftest a-successful-callback-extracts-what-the-oracle-extracts
+  (let [params {:code "SplxlOBeZQQYbYS6WxSbIA" :state "xyz"}
+        g (handle sent params)
+        o (oauth2/parse-authorization-response params)]
+    (is (= :usable (:phase g)) (:reason g))
+    (is (= (:code o) (:code g)))
+    (is (= (:state o) (:state-received g)))))
+
+(deftest an-error-callback-extracts-what-the-oracle-extracts
+  (let [params {:error "access_denied"
+                :error_description "The user denied the request"
+                :state "xyz"}
+        g (handle sent params)
+        o (oauth2/parse-authorization-response params)]
+    (is (= (:error o) (:error g)))
+    (is (= (:error-description o) (:error-description g)))
+    (testing "and the guest refuses it, which the oracle does not decide"
+      (is (= :refused (:phase g)))
+      (is (= :oauth2/authorization-error (:reason g))))))
+
+;; --- the decision: no oracle, asserted directly ------------------------------
+
+(deftest an-error-response-is-not-a-success-even-when-it-carries-a-code
+  (testing "RFC 6749 §4.1.2.1. A response carrying both is a failure, and
+            reading the code first is how a refusal becomes a login."
+    (let [g (handle sent {:error "access_denied"
+                          :code "SplxlOBeZQQYbYS6WxSbIA"
+                          :state "xyz"})]
+      (is (= :refused (:phase g)))
+      (is (= :oauth2/authorization-error (:reason g)))
+      (is (= "" (:code g)) "and no code comes back out")
+      (testing "the oracle, which does not decide, reports the error branch"
+        (is (= "access_denied"
+               (:error (oauth2/parse-authorization-response
+                        {:error "access_denied"
+                         :code "SplxlOBeZQQYbYS6WxSbIA"
+                         :state "xyz"}))))))))
+
+(deftest state-is-checked-before-anything-else-is-believed
+  (testing "the state is what says this response belongs to this client's
+            request. An implementation that reads `error` first reports an
+            authorization failure for a response it never established was
+            answering it."
+    (let [g (handle sent {:error "access_denied" :state "not-xyz"})]
+      (is (= :refused (:phase g)))
+      (is (= :oauth2/state-mismatch (:reason g))
+          "unbound, not `the server said access_denied`"))
+    (testing "and the same for an injected success"
+      (let [g (handle sent {:code "attacker-code" :state "not-xyz"})]
+        (is (= :refused (:phase g)))
+        (is (= :oauth2/state-mismatch (:reason g)))
+        (is (= "" (:code g)))))))
+
+(deftest two-empty-states-are-not-a-match
+  (testing "the naive `(= expected received)` passes when both are absent,
+            which is exactly the shape a client gets when it forgot to send
+            one -- so the absence is refused by name"
+    (let [g (handle sent {:code "SplxlOBeZQQYbYS6WxSbIA"})]
+      (is (= :refused (:phase g)))
+      (is (= :oauth2/state-missing (:reason g)))
+      (is (= "" (:code g))))))
+
+(deftest a-handler-with-neither-state-nor-pkce-is-refused
+  (testing "RFC 6749 §10.12 and the OAuth 2.0 Security BCP: a client MUST
+            bind the callback to its own request. A handler with neither
+            binding cannot tell its own callback from someone else's, so it
+            is refused before a callback is offered to it."
+    (let [state (call 'init [(->doc {})])]
+      (is (= :refused (call 'phase [state])))
+      (is (= :oauth2/no-request-binding (call 'reason [state])))
+      (testing "and offering it a perfectly good callback changes nothing"
+        (let [after (call 'offer-params
+                          [state (->doc {:code "SplxlOBeZQQYbYS6WxSbIA"
+                                         :state "xyz"})])]
+          (is (= :refused (call 'phase [after])))
+          (is (= "" (call 'code [after]))))))))
+
+(deftest pkce-alone-is-a-binding
+  (testing "a client that used PKCE bound its request with the code
+            verifier the host holds, and its callback carries no state to
+            check"
+    (let [g (handle {:pkce? true} {:code "SplxlOBeZQQYbYS6WxSbIA"})]
+      (is (= :usable (:phase g)) (:reason g))
+      (is (= "SplxlOBeZQQYbYS6WxSbIA" (:code g))))
+    (testing "and PKCE plus a state still checks the state"
+      (let [g (handle {:pkce? true :expected-state "xyz"}
+                      {:code "c" :state "not-xyz"})]
+        (is (= :refused (:phase g)))
+        (is (= :oauth2/state-mismatch (:reason g)))))))
+
+(deftest a-callback-with-neither-code-nor-error-is-refused
+  (let [g (handle sent {:state "xyz"})]
+    (is (= :refused (:phase g)))
+    (is (= :oauth2/no-code (:reason g)))))
+
+(deftest a-refused-callback-yields-no-code
+  (testing "the code is a bearer credential for exactly one exchange;
+            handing it back from a refusal would make the refusal
+            decorative"
+    (doseq [[label params] [["mismatched state" {:code "c" :state "wrong"}]
+                            ["missing state" {:code "c"}]
+                            ["error present" {:code "c" :error "access_denied"
+                                              :state "xyz"}]]]
+      (let [g (handle sent params)]
+        (is (= :refused (:phase g)) label)
+        (is (= "" (:code g)) label)))))
+
+(deftest a-matching-state-is-reported-back
+  (let [g (handle sent {:code "c" :state "xyz"})]
+    (is (= :usable (:phase g)))
+    (is (= "xyz" (:state-received g)))
+    (is (= "xyz" (call 'expected-state [(:state g)])))
+    (is (false? (call 'pkce? [(:state g)])))))

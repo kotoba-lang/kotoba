@@ -1,0 +1,191 @@
+#!/usr/bin/env kbb
+;; scripts/edn-datomize.cljk — EDN → Datomic/Datascript tx-data 変換ツール
+;; (kami-app-tatekata 用に com-junkawasaki/root superproject の
+;; manifest/edn-datomize.cljs から移植・簡略化。schema-path はこのリポジトリの
+;; root に固定。superproject の scripts/nbb-compat 依存を切り、node:fs を直接
+;; 使う自己完結スクリプトにしてある)。
+;;
+;; 「datomic/datascript query 可能」の定義: ファイルのトップレベルが
+;; (d/transact conn (edn/read-string (slurp file))) にそのまま渡せる
+;; tx-data ベクタ（entity-map のベクタ、各 map は :db/id を持つ）であること。
+;;
+;; モード:
+;;   wrap-map    <path> <ns>  — トップレベルが単一 map のファイルを
+;;                              [{...ns-prefixed keys... :db/id -1}] に包む。
+;;   preserve-ns <path>       — トップレベルが「既に名前空間付きキーの map の
+;;                              ベクタ」のファイル用。キー名は変更せず、各 map に
+;;                              :db/id が無ければ振り、schema.edn に属性を登録する
+;;                              だけ（idiomatic な既存名前空間を壊さない）。
+
+(require '[kotoba.lang.edn :as edn]
+         '[kotoba.lang.text :as str])
+
+(def fs (js/require "node:fs"))
+(def path (js/require "node:path"))
+(def cp (js/require "node:child_process"))
+
+(defn- sh1 [& args]
+  (str/trim (.-stdout (.spawnSync cp (first args) (to-array (rest args)) #js {:encoding "utf8"}))))
+
+(def root (sh1 "git" "rev-parse" "--show-toplevel"))
+
+(defn schema-path [] (.join path root "schema.edn"))
+
+(defn slurp [f] (.readFileSync fs f "utf8"))
+(defn spit [f s] (.writeFileSync fs f (str s)))
+(defn slurp-edn [f] (edn/read-string (slurp f)))
+
+(defn already-tx-data?
+  [content]
+  (and (vector? content) (seq content) (map? (first content)) (contains? (first content) :db/id)))
+
+(defn classify
+  [v]
+  (cond
+    (string? v)  {:type :db.type/string  :card :db.cardinality/one}
+    (boolean? v) {:type :db.type/boolean :card :db.cardinality/one}
+    (integer? v) {:type :db.type/long    :card :db.cardinality/one}
+    (double? v)  {:type :db.type/double  :card :db.cardinality/one}
+    (keyword? v) {:type :db.type/keyword :card :db.cardinality/one}
+    (nil? v)     {:type :db.type/string  :card :db.cardinality/one}
+    (and (coll? v) (empty? v))
+    {:type :db.type/string :card :db.cardinality/many}
+    (and (coll? v) (every? string? v))  {:type :db.type/string  :card :db.cardinality/many}
+    (and (coll? v) (every? keyword? v)) {:type :db.type/keyword :card :db.cardinality/many}
+    (and (coll? v) (every? integer? v)) {:type :db.type/long    :card :db.cardinality/many}
+    :else {:type :db.type/string :card :db.cardinality/one :blob true}))
+
+(defn attr-value [v]
+  (let [{:keys [blob]} (classify v)]
+    (if blob (pr-str v) v)))
+
+(defn namespaced-key [ns-name k]
+  (keyword ns-name (name k)))
+
+(defn entity-from-map [content ns-name]
+  (into {:db/id -1}
+        (map (fn [[k v]] [(namespaced-key ns-name k) (attr-value v)]))
+        content))
+
+(defn schema-attrs [content ns-name]
+  (for [[k v] content]
+    (let [{:keys [type card]} (classify v)]
+      {:db/ident (namespaced-key ns-name k)
+       :db/valueType type
+       :db/cardinality card})))
+
+(defn load-schema []
+  (if (.existsSync fs (schema-path)) (slurp-edn (schema-path)) []))
+
+(defn merge-schema! [new-attrs]
+  (let [existing (load-schema)
+        by-ident (into {} (map (juxt :db/ident identity)) existing)
+        merged-by-ident (reduce (fn [acc {:keys [db/ident] :as attr}]
+                                   (if (contains? acc ident) acc (assoc acc ident attr)))
+                                 by-ident
+                                 new-attrs)
+        merged (vec (sort-by (comp str :db/ident) (vals merged-by-ident)))]
+    (spit (schema-path)
+          (str ";; schema.edn — Datomic/Datascript 互換スキーマ定義（自動生成 by scripts/edn-datomize.cljk）\n"
+               ";; :db/ident 属性定義のリスト。Datomic 固有キー(:db.install/_attribute 等)は使わない。\n"
+               ";; 手編集禁止 — 再生成すると上書きされる。\n\n"
+               (pr-str merged)
+               "\n"))
+    merged))
+
+(defn wrap-map! [rel-path ns-name]
+  (let [f (.join path root rel-path)
+        content (slurp-edn f)]
+    (if (already-tx-data? content)
+      (println "skip (already tx-data):" rel-path)
+      (let [entity (entity-from-map content ns-name)
+            attrs (schema-attrs content ns-name)]
+        (spit f (pr-str [entity]))
+        (merge-schema! attrs)
+        (println "wrapped" rel-path "->" (count entity) "attrs, ns=" ns-name)))))
+
+(defn- double-keys-from-raw
+  "cljs の edn reader は 5.0 と 5 を同じ js/Number として読むため
+   (integer?/double? がどちらも true になり type を復元できない)、
+   元ソーステキストを正規表現で走査して「小数点付きで書かれている
+   キー」の集合を求め、後段の型判定/出力フォーマットに使う
+   （valueType 判定と emit の両方でこの集合を見て桁を復元する）。"
+  [raw]
+  (into #{}
+        (map (fn [[_ k]] (keyword (subs k 1))))
+        (re-seq #"(:[A-Za-z0-9_.\-/]+)\s+-?\d+\.\d+" raw)))
+
+(defn- classify-with-raw [v k double-keys]
+  (let [c (classify v)]
+    (if (and (contains? double-keys k) (= (:type c) :db.type/long))
+      {:type :db.type/double :card :db.cardinality/one}
+      c)))
+
+(defn- print-attr-val [k v double-keys]
+  (if (and (contains? double-keys k) (number? v) (= v (js/Math.trunc v)))
+    (str v ".0")
+    (pr-str v)))
+
+(defn- print-entity [entity double-keys]
+  (let [ordered (cons [:db/id (:db/id entity)]
+                       (sort-by (comp name first) (dissoc entity :db/id)))]
+    (str "{" (str/join " " (map (fn [[k v]] (str (pr-str k) " " (print-attr-val k v double-keys))) ordered)) "}")))
+
+(defn- leading-comment-header
+  "ファイル先頭のトップレベル `;;` コメント行（元データの由来ドキュメント）を
+   保持するため、最初の `[`/`{` 行より前の行だけを抜き出す。"
+  [raw]
+  (let [lines (str/split-lines raw)
+        header-lines (take-while (fn [l] (let [t (str/trim l)]
+                                            (or (str/blank? t) (str/starts-with? t ";"))))
+                                  lines)]
+    (when (seq header-lines) (str (str/join "\n" header-lines) "\n"))))
+
+(defn preserve-ns!
+  "content は既に [{:ns/key v ...} ...] 形式のベクタ。キー名は変えず :db/id
+   だけ振り、schema.edn に既存属性を登録する。数値の long/double 復元は
+   `double-keys-from-raw` で元テキストの小数点有無から推定する（cljs の
+   reader は 5.0 と 5 を区別できないため）。先頭の `;;` コメントヘッダは
+   保持する。"
+  [rel-path]
+  (let [f (.join path root rel-path)
+        raw (slurp f)
+        header (leading-comment-header raw)
+        content (edn/read-string raw)]
+    (cond
+      (already-tx-data? content)
+      (println "skip (already tx-data):" rel-path)
+
+      (not (and (vector? content) (seq content) (every? map? content)))
+      (println "skip (not a vector-of-maps):" rel-path)
+
+      :else
+      (let [double-keys (double-keys-from-raw raw)
+            entities (into [] (map-indexed (fn [i m] (assoc m :db/id (- (inc i)))) content))
+            attr-schema (->> content
+                             (mapcat (fn [m] (for [[k v] m] [k v])))
+                             (reduce (fn [acc [k v]]
+                                       (if (contains? acc k) acc
+                                           (assoc acc k (let [{:keys [type card]} (classify-with-raw v k double-keys)]
+                                                          {:db/ident k :db/valueType type :db/cardinality card}))))
+                                     {})
+                             vals)
+            note (str ";; NOTE (scripts/edn-datomize.cljk preserve-ns): each entity gained a :db/id\n"
+                       ";; tempid (-1..-N, positional) so this vector is valid Datomic/Datascript\n"
+                       ";; tx-data as-is `(d/transact conn (edn/read-string (slurp f)))`. Existing\n"
+                       ";; :op/* namespaced keys are unchanged. Attribute schema: schema.edn (repo root).\n\n")
+            out (str header note "[" (str/join "\n " (map #(print-entity % double-keys) entities)) "]\n")]
+        (spit f out)
+        (merge-schema! attr-schema)
+        (println "preserve-ns'd" rel-path "->" (count entities) "entities,"
+                  (count attr-schema) "attrs (existing namespaces kept)")))))
+
+(defn -main [& args]
+  (let [[mode a b] args]
+    (case mode
+      "wrap-map"    (wrap-map! a b)
+      "preserve-ns" (preserve-ns! a)
+      (do (println "usage: kbb --backend sci scripts/edn-datomize.cljk [wrap-map <path> <ns> | preserve-ns <path>]")
+          (js/process.exit 1)))))
+
+(apply -main *command-line-args*)

@@ -1,0 +1,359 @@
+(ns game.quality
+  "Game Quality Evaluator — Nintendo-grade quality scoring for KAMI Engine
+  games. Restored from the legacy kami-engine/kami-game Rust crate's
+  `src/quality.rs` (583 lines), deleted in kotoba-lang/kami-engine PR #82
+  \"Remove Rust workspace from kami-engine\", as part of the clj-wgsl
+  migration (ADR-2607010930, com-junkawasaki/root), restoration cluster G
+  (quality/wire-protocol) of the 7-cluster `kotoba-lang/game` restoration.
+
+  Evaluates game scenes against the 7 Design Principles (AGENTS.md) and
+  produces a letter grade (S/A/B/C/D/F) with actionable feedback. Pure data
+  + pure functions throughout; no IO/GPU. Original doc: run via `cargo test
+  -p kami-game --lib quality`; integrate via `gftd build` post-build gate.")
+
+;; --- Grade ------------------------------------------------------------
+;; Rust: `#[repr(...)] pub enum Grade { F=0, D=1, C=2, B=3, A=4, S=5 }`
+;; (Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)
+;; Quality grade: S (Nintendo-level) through F (unshippable).
+(def grade-values
+  "Valid Grade keywords."
+  #{:f :d :c :b :a :s})
+
+(def grade-rank
+  "Grade keyword -> ordinal rank, preserved for the original enum's
+  `#[repr]` discriminant / derived `Ord` (F=0 .. S=5)."
+  {:f 0, :d 1, :c 2, :b 3, :a 4, :s 5})
+
+(defn grade>=
+  "Ordinal comparison mirroring Rust's derived `PartialOrd`/`Ord` on Grade
+  (e.g. `report.grade >= Grade::A`)."
+  [g1 g2]
+  (>= (grade-rank g1) (grade-rank g2)))
+
+(defn grade-from-score
+  "Mirrors Rust `Grade::from_score(score: f32) -> Self`. Note: the original
+  `match score as u32 { 90..=100 => S, 75..=89 => A, 60..=74 => B,
+  45..=59 => C, 25..=44 => D, _ => F }` only matches scores in [0, 100];
+  scores above 100 fall through to the catch-all `_ => F` arm. That
+  (likely unintended) behavior is preserved here for a faithful 1:1 port.
+  `score as u32` truncates toward zero, mirrored here via `int`."
+  [score]
+  (let [s (int score)]
+    (cond
+      (<= 90 s 100) :s
+      (<= 75 s 89) :a
+      (<= 60 s 74) :b
+      (<= 45 s 59) :c
+      (<= 25 s 44) :d
+      :else :f)))
+
+(defn grade-label
+  "Mirrors Rust `Grade::label(&self) -> &'static str`."
+  [grade]
+  (case grade
+    :s "S (Nintendo Quality)"
+    :a "A (Polished)"
+    :b "B (Good)"
+    :c "C (Needs Work)"
+    :d "D (Incomplete)"
+    :f "F (Unshippable)"))
+
+;; --- AxisResult ---------------------------------------------------------
+;; Rust: `pub struct AxisResult { name, weight, score, max, issues,
+;;         suggestions }`. Individual axis evaluation result.
+(defn make-axis-result
+  "Construct an AxisResult map. Mirrors the Rust `AxisResult` struct
+  literal."
+  [{:keys [name weight score max issues suggestions]}]
+  {:name name
+   :weight weight
+   :score score
+   :max max
+   :issues (vec issues)
+   :suggestions (vec suggestions)})
+
+;; --- QualityReport --------------------------------------------------------
+;; Rust: `pub struct QualityReport { game_name, overall_score, grade, axes,
+;;         blocking_issues }`. Full game quality report.
+(defn make-quality-report
+  "Construct a QualityReport map. Mirrors the Rust `QualityReport` struct
+  literal."
+  [{:keys [game-name overall-score grade axes blocking-issues]}]
+  {:game-name game-name
+   :overall-score overall-score
+   :grade grade
+   :axes (vec axes)
+   :blocking-issues (vec blocking-issues)})
+
+;; --- GameSceneMeta --------------------------------------------------------
+;; Rust: `#[derive(Debug, Clone, Default)] pub struct GameSceneMeta { ... }`
+;; Game scene metadata extracted for quality evaluation.
+(def default-game-scene-meta
+  "Mirrors Rust `GameSceneMeta::default()` (derived `Default`): numeric
+  fields 0, bool fields false, String fields \"\", Vec fields []."
+  {:name ""
+   :entity-count 0
+   :sfx-count 0
+   :has-bgm false
+   :character-count 0
+   :zone-count 0
+   :has-spawn false
+   :has-ambient false
+   :has-sun false
+   :genre ""
+
+   ;; feedback density
+   :sfx-triggers []
+   :has-combo-sfx false
+   :has-clear-sfx false
+   :has-fail-sfx false
+
+   ;; haptic
+   :has-haptic-light false
+   :has-haptic-medium false
+   :has-haptic-heavy false
+   :has-haptic-combo false
+
+   ;; sound categories
+   :has-ui-sounds false
+   :has-action-sounds false
+   :has-reward-sounds false
+   :has-ambient-sounds false
+
+   ;; visual effects
+   :has-particles false
+   :has-screen-shake false
+   :has-flash-effect false
+   :has-sparkle-effect false
+   :has-float-text false
+   :has-confetti false
+
+   ;; game design
+   :has-difficulty-curve false
+   :has-combo-system false
+   :has-score-system false
+   :has-leaderboard false
+   :has-tutorial-hint false
+   :has-time-pressure false
+   :difficulty-levels 0
+   :item-variety 0
+
+   ;; input
+   :has-touch-input false
+   :has-keyboard-input false
+   :has-mouse-input false
+   :fullscreen-canvas false
+   :responsive-scaling false})
+
+(defn- round0
+  "Round to nearest integer, portable across clj/cljs. Used for the
+  `{:.0}` float formatting in Rust's blocking-issue message."
+  [x]
+  #?(:clj (Math/round (double x))
+     :cljs (js/Math.round x)))
+
+;; --- evaluate -----------------------------------------------------------
+;; Rust: `pub fn evaluate(meta: &GameSceneMeta) -> QualityReport`
+;; Evaluate game quality against Nintendo-grade standards.
+
+(defn- eval-engagement
+  "Axis 1: Engagement (30%) — Tension curve, feedback density, BGM/SFX."
+  [meta]
+  (let [max 30.0
+        sfx-score (* (min (double (:sfx-count meta)) 10.0) 0.8)
+        [score1 issues1 suggestions1]
+        (if (< (:sfx-count meta) 5)
+          [sfx-score
+           ["Fewer than 5 sound effects — game feels silent"]
+           ["Add: spray-hit, zone-clear, combo, item-complete, fail sounds"]]
+          [sfx-score [] []])
+        [score2 issues2 suggestions2]
+        (if (:has-bgm meta)
+          [(+ score1 3.0) issues1 suggestions1]
+          [score1
+           (conj issues1 "No background music")
+           (conj suggestions1 "Add looping BGM (lo-fi, workshop ambiance, etc.)")])
+        [score2b issues2b suggestions2b]
+        (if (:has-ui-sounds meta)
+          [(+ score2 1.0) issues2 suggestions2]
+          [score2 issues2 (conj suggestions2 "Add UI sounds (hover, click, select)")])
+        [score2c issues2c suggestions2c]
+        (if (:has-action-sounds meta)
+          [(+ score2b 1.0) issues2b suggestions2b]
+          [score2b (conj issues2b "No action sounds") suggestions2b])
+        [score2d issues2d suggestions2d]
+        (if (:has-reward-sounds meta)
+          [(+ score2c 1.0) issues2c suggestions2c]
+          [score2c issues2c (conj suggestions2c "Add reward sounds (coin, success, fanfare)")])
+        [score3 issues3 suggestions3]
+        (if (:has-ambient-sounds meta)
+          [(+ score2d 1.0) issues2d suggestions2d]
+          [score2d issues2d suggestions2d])
+        [score4 issues4 suggestions4]
+        (if (:has-combo-sfx meta)
+          [(+ score3 2.0) issues3 suggestions3]
+          [score3 issues3 (conj suggestions3 "Add rising-pitch combo sound effect")])
+        vfx [(:has-particles meta) (:has-screen-shake meta) (:has-flash-effect meta)
+             (:has-sparkle-effect meta) (:has-float-text meta) (:has-confetti meta)]
+        vfx-count (count (filter true? vfx))
+        score5 (+ score4 vfx-count)
+        [issues5 suggestions5]
+        (if (< vfx-count 3)
+          [(conj issues4 (str "Only " vfx-count "/6 visual effect types — low juice"))
+           (conj suggestions4 "Add: particles, screen shake, flash, sparkle, float text, confetti")]
+          [issues4 suggestions4])
+        haptics [(:has-haptic-light meta) (:has-haptic-medium meta)
+                  (:has-haptic-heavy meta) (:has-haptic-combo meta)]
+        haptic-count (count (filter true? haptics))
+        score6 (+ score5 haptic-count)
+        [issues6 suggestions6]
+        (if (zero? haptic-count)
+          [(conj issues5 "No haptic vibration — mobile feels dead")
+           (conj suggestions5 "Add navigator.vibrate() for light/medium/heavy/combo feedback")]
+          [issues5 suggestions5])]
+    (make-axis-result {:name "Engagement" :weight 0.30 :score (min score6 max)
+                        :max max :issues issues6 :suggestions suggestions6})))
+
+(defn- eval-competence
+  "Axis 2: Competence (20%) — Tutorial, difficulty curve, mastery depth."
+  [meta]
+  (let [max 20.0
+        [score1 issues1 suggestions1]
+        (if (:has-tutorial-hint meta)
+          [4.0 [] []]
+          [0.0 ["No tutorial or control hints"] ["Show control hints on title screen"]])
+        [score2 issues2 suggestions2]
+        (if (:has-difficulty-curve meta)
+          [(+ score1 5.0) issues1 suggestions1]
+          [score1
+           (conj issues1 "No difficulty progression")
+           (conj suggestions1 "Items should increase in difficulty (more zones, harder rust types)")])
+        [score3 suggestions3]
+        (cond
+          (>= (:difficulty-levels meta) 3) [(+ score2 3.0) suggestions2]
+          (>= (:difficulty-levels meta) 2) [(+ score2 2.0) suggestions2]
+          :else [score2 (conj suggestions2 "Add at least 3 difficulty selections (Easy/Normal/Hard)")])
+        [score4 suggestions4]
+        (if (:has-combo-system meta)
+          [(+ score3 4.0) suggestions3]
+          [score3 (conj suggestions3 "Add combo system for mastery depth")])
+        [score5 suggestions5]
+        (cond
+          (>= (:item-variety meta) 6) [(+ score4 4.0) suggestions4]
+          (>= (:item-variety meta) 4) [(+ score4 3.0) suggestions4]
+          :else [score4 (conj suggestions4 "Add more item variety (target: 6+)")])]
+    (make-axis-result {:name "Competence" :weight 0.20 :score (min score5 max)
+                        :max max :issues issues2 :suggestions suggestions5})))
+
+(defn- eval-contribution
+  "Axis 3: Contribution (15%) — Leaderboard, social share."
+  [meta]
+  (let [max 15.0
+        [score1 suggestions1]
+        (if (:has-leaderboard meta)
+          [5.0 []]
+          [0.0 ["Add leaderboard (XRPC submit + query)"]])
+        [score2 issues2]
+        (if (:has-score-system meta)
+          [(+ score1 5.0) []]
+          [score1 ["No scoring system"]])
+        score3 (+ score2 3.0)          ; assume grade display exists in result screen
+        score4 (+ score3 2.0)]         ; AT Protocol social post on clear
+    (make-axis-result {:name "Contribution" :weight 0.15 :score (min score4 max)
+                        :max max :issues issues2 :suggestions suggestions1})))
+
+(defn- eval-growth
+  "Axis 4: Growth (20%) — Progression, replay value."
+  [meta]
+  (let [max 20.0
+        [score1 suggestions1]
+        (if (:has-time-pressure meta)
+          [4.0 []]
+          [0.0 ["Add time pressure for urgency"]])
+        [score2 suggestions2]
+        (cond
+          (>= (:item-variety meta) 8) [(+ score1 5.0) suggestions1]
+          (>= (:item-variety meta) 5) [(+ score1 3.0) suggestions1]
+          :else [score1 (conj suggestions1 "More items = more replay value")])
+        score3 (if (:has-difficulty-curve meta) (+ score2 4.0) score2)
+        score4 (if (:has-combo-system meta) (+ score3 3.0) score3)
+        score5 (+ score4 4.0)]          ; perfect bonus system
+    (make-axis-result {:name "Growth" :weight 0.20 :score (min score5 max)
+                        :max max :issues [] :suggestions suggestions2})))
+
+(defn- eval-resilience
+  "Axis 5: Resilience (15%) — Input quality, responsiveness."
+  [meta]
+  (let [max 15.0
+        [score1 issues1]
+        (if (:has-touch-input meta)
+          [3.0 []]
+          [0.0 ["No touch input — unplayable on mobile"]])
+        score2 (if (:has-keyboard-input meta) (+ score1 2.0) score1)
+        score3 (if (:has-mouse-input meta) (+ score2 2.0) score2)
+        [score4 issues4 suggestions4]
+        (if (:fullscreen-canvas meta)
+          [(+ score3 4.0) issues1 []]
+          [score3
+           (conj issues1 "Canvas is not fullscreen — wasted screen space")
+           ["Use window.innerWidth/Height with devicePixelRatio scaling"]])
+        [score5 issues5 suggestions5]
+        (if (:responsive-scaling meta)
+          [(+ score4 4.0) issues4 suggestions4]
+          [score4
+           (conj issues4 "No responsive scaling")
+           (conj suggestions4 "Scale all coordinates by Math.min(W/800, H/600)")])]
+    (make-axis-result {:name "Resilience" :weight 0.15 :score (min score5 max)
+                        :max max :issues issues5 :suggestions suggestions5})))
+
+(defn evaluate
+  "Evaluate game quality against Nintendo-grade standards. Mirrors Rust
+  `evaluate(meta: &GameSceneMeta) -> QualityReport`."
+  [meta]
+  (let [axes [(eval-engagement meta) (eval-competence meta) (eval-contribution meta)
+              (eval-growth meta) (eval-resilience meta)]
+        overall (reduce + 0.0
+                        (map (fn [a] (* (/ (:score a) (:max a)) (:weight a) 100.0)) axes))
+        grade (grade-from-score overall)
+        blocking-issues (->> axes
+                              (filter (fn [a] (< (/ (:score a) (:max a)) 0.3)))
+                              (mapv (fn [a]
+                                      (str (:name a) ": score "
+                                           (round0 (:score a)) "/" (round0 (:max a))
+                                           " — BLOCKING"))))]
+    (make-quality-report {:game-name (:name meta)
+                           :overall-score overall
+                           :grade grade
+                           :axes axes
+                           :blocking-issues blocking-issues})))
+
+;; --- Display --------------------------------------------------------------
+;; Rust: `impl std::fmt::Display for QualityReport`. Rendered as a plain
+;; multi-line summary string (the original's box-drawing table is
+;; presentation detail, not load-bearing for the 1:1 data port).
+(defn report->string
+  "Human-readable rendering of a QualityReport. Mirrors Rust
+  `impl Display for QualityReport`, simplified from the original's
+  fixed-width box-drawing table to a plain multi-line summary (no terminal
+  width assumptions in a portable CLJC context)."
+  [report]
+  (let [header (str "KAMI Game Quality Report\n"
+                     "Game: " (:game-name report) "\n"
+                     "Grade: " (grade-label (:grade report)) "\n"
+                     "Score: " (:overall-score report) "/100\n")
+        axes-str (apply str
+                        (for [axis (:axes report)]
+                          (let [pct (if (pos? (:max axis))
+                                      (* (/ (:score axis) (:max axis)) 100.0)
+                                      0.0)]
+                            (apply str
+                                   (str (:name axis) " " (:score axis) "/" (:max axis)
+                                        " (" pct "%)\n")
+                                   (for [issue (:issues axis)]
+                                     (str "  x " issue "\n"))))))
+        blocking-str (if (seq (:blocking-issues report))
+                       (apply str "BLOCKING ISSUES:\n"
+                              (for [b (:blocking-issues report)]
+                                (str "  ! " b "\n")))
+                       "")]
+    (str header axes-str blocking-str)))

@@ -1,0 +1,112 @@
+(ns srs.host-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [srs.host :as host]))
+
+(def t0 1767225600000)
+
+(defn- created [& {:keys [name zone addresses] :or {name "ns1.example.net"
+                                                    zone "example.com"
+                                                    addresses []}}]
+  (:host (host/create nil {:name name :zone zone :registrar "reg-a"
+                           :addresses addresses} t0)))
+
+;; ── the distinction everything else rests on ──────────────────────────────
+
+(deftest in-zone-is-a-strict-subdomain
+  (is (host/in-zone? "ns1.example.com" "example.com"))
+  (is (host/in-zone? "a.b.example.com" "example.com"))
+  (is (not (host/in-zone? "example.com" "example.com")) "the apex is not inside itself")
+  (is (not (host/in-zone? "ns1.example.net" "example.com")))
+  (is (not (host/in-zone? "notexample.com" "example.com"))
+      "suffix matching without the dot would call this in-zone")
+  (testing "case and trailing dots do not change the answer"
+    (is (host/in-zone? "NS1.Example.COM." "example.com."))))
+
+(deftest an-in-zone-host-must-carry-glue
+  (let [r (host/create nil {:name "ns1.example.com" :zone "example.com"
+                            :registrar "reg-a" :addresses []} t0)]
+    (is (false? (:ok? r)))
+    (is (= 2306 (get-in r [:error :error/code])))
+    (is (re-find #"cannot be resolved" (get-in r [:error :error/message]))))
+  (is (:ok? (host/create nil {:name "ns1.example.com" :zone "example.com"
+                              :registrar "reg-a" :addresses ["192.0.2.1"]} t0))))
+
+(deftest an-out-of-zone-host-must-not
+  ;; The half everyone implements is the first one. This is the half that gets
+  ;; skipped, and skipping it makes the registry an unreliable authority for a
+  ;; name it does not own.
+  (let [r (host/create nil {:name "ns1.example.net" :zone "example.com"
+                            :registrar "reg-a" :addresses ["192.0.2.1"]} t0)]
+    (is (false? (:ok? r)))
+    (is (= 2306 (get-in r [:error :error/code])))
+    (is (re-find #"not authoritative" (get-in r [:error :error/message]))))
+  (is (:ok? (host/create nil {:name "ns1.example.net" :zone "example.com"
+                              :registrar "reg-a" :addresses []} t0))))
+
+(deftest addresses-must-be-addresses
+  (doseq [bad ["999.0.0.1" "example.com" "" "192.0.2"]]
+    (is (= 2005 (get-in (host/create nil {:name "ns1.example.com" :zone "example.com"
+                                          :registrar "r" :addresses [bad]} t0)
+                        [:error :error/code]))
+        (str bad " is not an address")))
+  (testing "both families are accepted"
+    (is (:ok? (host/create nil {:name "ns1.example.com" :zone "example.com"
+                                :registrar "r" :addresses ["192.0.2.1" "2001:db8::1"]} t0)))))
+
+;; ── associations ──────────────────────────────────────────────────────────
+
+(deftest a-host-in-use-cannot-be-deleted
+  (let [h (-> (created) (host/link "example.com" t0) :host)
+        r (host/delete h t0)]
+    (is (false? (:ok? r)))
+    (is (= 2305 (get-in r [:error :error/code]))
+        "object association prohibits operation — the code's actual meaning, so a registrar knows to look for associations rather than a lock")
+    (is (= ["example.com"] (get-in r [:error :error/linked]))))
+  (testing "and can once nothing uses it"
+    (let [h (-> (created) (host/link "example.com" t0) :host
+                (host/unlink "example.com" t0) :host)]
+      (is (:ok? (host/delete h t0))))))
+
+(deftest associations-are-a-set-so-a-double-link-cannot-leak
+  ;; A counter would go to 2 here and 1 after one unlink, leaving a host that
+  ;; nothing uses permanently undeletable — or, with the arithmetic the other
+  ;; way, one in use that can be deleted.
+  (let [h (-> (created)
+              (host/link "example.com" t0) :host
+              (host/link "example.com" t0) :host
+              (host/unlink "example.com" t0) :host)]
+    (is (empty? (:host/linked h)))
+    (is (:ok? (host/delete h t0)))))
+
+(deftest linked-is-derived-not-stored
+  (let [h (created)]
+    (is (= #{:ok} (host/effective-statuses h)))
+    (is (= #{:linked} (host/effective-statuses (:host (host/link h "example.com" t0)))))
+    (testing "a stored copy could disagree with the associations it summarizes"
+      (is (not (contains? (:host/statuses h) :linked))))))
+
+(deftest a-status-lock-also-blocks-delete
+  (let [h (assoc (created) :host/statuses #{:clientDeleteProhibited})]
+    (is (= 2304 (get-in (host/delete h t0) [:error :error/code])))))
+
+;; ── updates ───────────────────────────────────────────────────────────────
+
+(deftest updating-addresses-re-checks-the-in-zone-rule
+  (let [h (created :name "ns1.example.com" :zone "example.com" :addresses ["192.0.2.1"])]
+    (is (:ok? (host/update-addresses h ["192.0.2.2"] t0)))
+    (is (= 2306 (get-in (host/update-addresses h [] t0) [:error :error/code]))
+        "an in-zone host cannot drop its last address"))
+  (let [h (created)]                                   ; out-of-zone
+    (is (= 2306 (get-in (host/update-addresses h ["192.0.2.1"] t0) [:error :error/code]))
+        "and an out-of-zone host cannot gain one")))
+
+;; ── the public view ───────────────────────────────────────────────────────
+
+(deftest info-reports-the-count-not-the-list
+  (let [h (-> (created) (host/link "a.example.com" t0) :host
+              (host/link "b.example.com" t0) :host)
+        i (host/info h)]
+    (is (= 2 (:host/linked-count i)))
+    (is (not (contains? i :host/linked))
+        "which domains use a nameserver is not something a public info response should enumerate")
+    (is (= #{:linked} (:host/statuses i)))))

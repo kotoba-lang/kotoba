@@ -1,0 +1,205 @@
+;; `kotoba/dnssec/canonical.kotoba` against `dnssec.canonical`.
+;;
+;; Canonical order is what the NSEC and NSEC3 chains are built on --
+;; `compare-names`' own docstring says "every place it disagrees produces an
+;; NSEC chain that proves the nonexistence of names that do exist". So the
+;; parity here is over the ordering itself, on names chosen to hit the
+;; places string order and canonical order disagree, and it is checked as a
+;; total order rather than pairwise: the guest and the library must sort the
+;; same list the same way.
+;;
+;; Three findings, each measured.
+;;
+;;   * `the-fold-is-locale-aware-in-a-function-that-forbids-it` --
+;;     `canonical-name`'s docstring says only ASCII `A`-`Z` is folded and
+;;     that "a locale-aware or Unicode-aware lower-casing would change
+;;     octets the spec requires to be left alone". It calls
+;;     `kotoba.lang.text/lower`. With the default locale set to tr-TR,
+;;     `IETF.example` folds to `ıetf.example.` and `encode-name` emits 305,
+;;     which is not an octet. The same zone signed on two machines is two
+;;     different zones.
+;;
+;;   * `a-long-label-emits-the-compression-marker` -- `encode-name`'s
+;;     docstring is "Never compressed", and it writes `(count l)` as the
+;;     length octet with no bound. RFC 1035 §4.1.4 gives the top two bits of
+;;     that octet to the pointer form: a 192-character label emits `0xC0`.
+;;
+;;   * `a-dot-is-not-always-a-separator` -- `labels` splits on every `.`, so
+;;     `a\.b.example` (one label containing a dot, §5.1) becomes three
+;;     labels, and `a..com` becomes a name with an empty label, whose wire
+;;     form carries a zero octet where a name ends.
+;;
+;; `.cljc` stays the oracle for the wire encoding and the chains and is not
+;; required from the guest (require-graph). It did not grow a second copy of
+;; the ordering (ADR-2608261100).
+
+(ns dnssec.canonical-kotoba-test
+  (:require [kotoba.lang.text] [kotoba.io :as io]
+            [kotoba.test :refer [deftest is testing]]
+            [dnssec.canonical :as c]
+            [kotoba.compiler.core :as compiler]
+            [kotoba.kir :as ir])
+  (:import (java.util Locale)))
+
+(def ^:private guest-file
+  (io/file (System/getProperty "user.dir") "kotoba" "dnssec" "canonical.kotoba"))
+
+(def ^:private kir
+  (delay (:kir (compiler/compile-project {'dnssec.canonical (slurp guest-file)}
+                                         'dnssec.canonical :wasm32-kotoba-v1))))
+
+(defn- call
+  ([f args] (ir/execute @kir f args))
+  ([f args fuel] (ir/execute @kir f args {:fuel fuel})))
+
+(defn- gcmp [a b] (call 'compare-names [a b]))
+(defn- gproblem [s] (call 'name-problem [s]))
+
+;; The walk is one byte at a time, so the budget scales with the name. The
+;; interpreter default carries every ordinary name in this file; the two
+;; oversized ones -- a 192-character label and a name past the 255-octet
+;; limit -- are what needs more, and 2048 is where the second of them starts
+;; answering. Both directions are asserted below.
+(def ^:private long-name-fuel 2048)
+(defn- gproblem* [s] (call 'name-problem [s] long-name-fuel))
+
+(deftest guest-source-is-present
+  (is (io/exists? guest-file) (str "kotoba object not found at " guest-file)))
+
+;; --- parity on the ordering ---------------------------------------------------------
+
+(def ^:private names
+  ;; RFC 4034 §6.1's own example set, plus the pairs where string order and
+  ;; canonical order part company.
+  ["example." "a.example." "yljkjljk.a.example." "Z.a.example." "zABC.a.EXAMPLE."
+   "z.example." "l.example." "ra.example." "z.a.example." "a.b.example."
+   "b.example." "com." "."])
+
+(deftest the-guest-and-the-library-sort-the-same-way
+  (let [lib (vec (sort c/compare-names names))
+        guest (vec (sort #(gcmp %1 %2) names))]
+    (is (= lib guest))
+    (testing "and the order is the canonical one, not the string one"
+      (is (not= (vec (sort names)) guest)
+          "if these agreed the test would be measuring nothing"))))
+
+(deftest the-pairs-where-string-order-is-wrong
+  (doseq [[a b why]
+          [["example.com" "a.example.com" "a suffix sorts before what extends it"]
+           ["z.a.example.com" "a.b.example.com"
+            "the rightmost labels tie, then `a` beats `b`, and the leftmost
+             label never gets a say"]
+           ["." "com." "the root is a suffix of everything"]]]
+    (testing why
+      (is (neg? (c/compare-names a b)) "the library")
+      (is (neg? (gcmp a b)) "and the guest"))))
+
+(deftest a-trailing-dot-does-not-make-a-different-name
+  (doseq [[a b] [["example.com" "example.com."] ["EXAMPLE.COM" "example.com."]
+                 ["." ""]]]
+    (is (= 0 (gcmp a b)) (str a " / " b))
+    (is (true? (call 'same-name? [a b])))
+    (is (= (c/canonical-name a) (c/canonical-name b)) "and the library agrees")))
+
+;; --- finding one: the fold ------------------------------------------------------------
+
+(deftest the-fold-is-locale-aware-in-a-function-that-forbids-it
+  (let [old (Locale/getDefault)]
+    (try
+      (is (= "ietf.example." (c/canonical-name "IETF.example"))
+          "with this machine's locale it is right")
+      (Locale/setDefault (Locale. "tr" "TR"))
+      (is (= "ıetf.example." (c/canonical-name "IETF.example"))
+          "and with tr-TR the capital I folds to a dotless one")
+      (let [wire (c/encode-name "IETF.example")]
+        (is (= 305 (nth wire 1))
+            "which `encode-name` puts on the wire as 305 -- not an octet")
+        (is (not-every? #(<= 0 % 255) wire)
+            "so the encoded name is not a sequence of octets at all"))
+      (finally (Locale/setDefault old))))
+  (testing "the guest folds A-Z and nothing else, so the locale cannot reach it"
+    (let [old (Locale/getDefault)]
+      (try
+        (Locale/setDefault (Locale. "tr" "TR"))
+        (is (= 0 (gcmp "IETF.example" "ietf.example."))
+            "the same name under any locale")
+        (finally (Locale/setDefault old)))))
+  (testing "and the name the library produced is one the guest declines to read"
+    (is (= :non-ascii-presentation (gproblem "ıetf.example"))
+        "a Kotoba string is UTF-8 and a DNS label is arbitrary octets; above
+         0x7F they do not line up, and there is no faithful reading")
+    (is (= :non-ascii-presentation (gproblem "Ä.example")))
+    (is (= -2 (gcmp "Ä.example" "ä.example"))
+        "and the order is a value outside {-1, 0, 1}, which a caller cannot
+         mistake for one")
+    (is (= (c/canonical-name "Ä.example") (c/canonical-name "ä.example"))
+        "while the library folds them together, which §6.1 does not ask for")))
+
+;; --- finding two: the length octet -------------------------------------------------------
+
+(deftest a-long-label-emits-the-compression-marker
+  (let [label-192 (apply str (repeat 192 \a))
+        label-64 (apply str (repeat 64 \a))]
+    (testing "the library writes the label's length with no bound"
+      (is (= 192 (first (c/encode-name (str label-192 ".example"))))
+          "0xC0 is the compression-pointer marker (RFC 1035 §4.1.4), in a
+           function whose docstring is \"Never compressed\"")
+      (is (= 64 (first (c/encode-name (str label-64 ".example"))))
+          "and 0x40 is the other reserved pattern"))
+    (testing "the guest refuses both before anything is encoded"
+      (is (= :label-too-long (gproblem* (str label-192 ".example"))))
+      (is (= :label-too-long (gproblem (str label-64 ".example"))))
+      (is (= :none (gproblem (str (apply str (repeat 63 \a)) ".example")))
+          "63 is the bound, and it is inclusive")))
+  (testing "and a name too long to encode is refused too (§2.3.4)"
+    (let [long-name (str (apply str (repeat 5 (str (apply str (repeat 50 \a)) ".")))
+                         "example")]
+      (is (< 255 (count (c/encode-name long-name)))
+          "the library encodes it anyway, past the 255-octet limit")
+      (is (= :name-too-long (gproblem* long-name))))))
+
+;; --- finding three: the separator ----------------------------------------------------------
+
+(deftest a-dot-is-not-always-a-separator
+  (testing "an escaped dot is one label in presentation format (§5.1)"
+    (is (= ["a\\" "b" "example"] (c/labels "a\\.b.example"))
+        "the library makes it three, and the backslash survives into a label")
+    (is (= :escape-unsupported (gproblem "a\\.b.example"))
+        "the guest declines rather than mis-splitting, because a
+         canonicaliser that guesses wrong is worse than one that says so"))
+  (testing "an empty label truncates the name it is part of"
+    (is (= ["a" "" "com"] (c/labels "a..com")))
+    (is (= "a..com." (c/canonical-name "a..com")))
+    (is (= 0 (nth (c/encode-name "a..com") 2))
+        "the encoded form carries a zero octet in the middle, which is where
+         a name ends")
+    (is (= :empty-label (gproblem "a..com")))
+    (is (= :empty-label (gproblem "example.com.."))
+        "including a second trailing dot, since one is the root terminator")))
+
+;; --- the shape of a name ---------------------------------------------------------------------
+
+(deftest the-projections-agree-with-the-library-where-the-library-is-right
+  (doseq [n ["example.com" "example.com." "a.b.c.example.com" "." ""]]
+    (testing n
+      (is (= (count (c/encode-name n)) (call 'wire-length [n])))
+      (is (= (count (c/labels n)) (call 'label-count [n]))))))
+
+(deftest the-fuel-budget-is-measured-in-both-directions
+  ;; The walk is per byte over both names, so the budget scales with the
+  ;; input rather than being one number for the file. Measured rather than
+  ;; guessed: 60000 was written here first, and the interpreter default
+  ;; carries every ordinary name.
+  (testing "an ordinary comparison runs on the default budget"
+    (is (= -1 (gcmp "z.a.example.com" "a.b.example.com")))
+    (is (thrown? Exception
+                 (call 'compare-names ["z.a.example.com" "a.b.example.com"] 64))
+        "and sixty-four does not, so the assertion above is not vacuous"))
+  (testing "the two oversized names are what needs more, and only just"
+    (let [long-name (str (apply str (repeat 5 (str (apply str (repeat 50 \a)) ".")))
+                         "example")]
+      (is (= :name-too-long (call 'name-problem [long-name] long-name-fuel)))
+      (is (thrown? Exception (call 'name-problem [long-name] 1024))
+          "1024 is not enough for it, which is why the constant exists")
+      (is (= :none (gproblem "example.com"))
+          "while an ordinary name never needed the constant at all"))))

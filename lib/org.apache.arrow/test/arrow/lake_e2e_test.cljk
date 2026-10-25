@@ -1,0 +1,156 @@
+(ns arrow.lake-e2e-test
+  "The whole chain, over a real Arrow IPC file: catalog → authorization →
+  triple pattern → buffer range.
+
+  The same test `org-apache-parquet` runs, against the same lake, with the
+  format swapped. That is the point of it. `kotobase.lake.reader/register-scan`
+  was written with one `:scan` format plugged into it, and until a second one
+  arrived, \"the seam is format-agnostic\" was a claim about code that had never
+  been asked. **Nothing in `kotobase-lake` changed to accept this file.**
+
+  Two things it inherits for free, and one it does not:
+
+  - the catalog already classified Arrow — `kotobase.lake.sniff` has carried
+    the `ARROW1` magic and `application/vnd.apache.arrow.file` since before
+    there was a reader for it, because admission never parsed
+  - the authorization gate is the same gate, and it stands in front of a real
+    file here rather than a fixture stub
+  - **pruning is not inherited.** Parquet's run of this test skips two of three
+    row groups on footer statistics. Arrow records no bounds, so the identical
+    query reads all three, and this test asserts that difference rather than
+    hiding it.
+
+  A `.clj` rather than a `.cljc`: JVM-only on purpose, matching the sibling
+  repo — the fixture is read with `clojure.java.io`, and the point here is the
+  composition rather than a platform conditional."
+  (:require [arrow.source :as asrc]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing]]
+            [columnar.aggregate :as agg]
+            [columnar.bytes :as bytes]
+            [columnar.plan :as plan]
+            [columnar.source :as csrc]
+            [datom.source :as dsrc]
+            [kotobase.lake.acquire :as acq]
+            [kotobase.lake.catalog :as cat]
+            [kotobase.lake.columnar :as lcol]
+            [kotobase.lake.reader :as reader]
+            [kotobase.lake.sniff :as sniff]))
+
+(def ^:private arrow-type "application/vnd.apache.arrow.file")
+
+(defn- fixture-bytes [name]
+  (with-open [in (io/input-stream (io/file "lib/org.apache.arrow/test/fixtures" name))]
+    (let [out (java.io.ByteArrayOutputStream.)]
+      (io/copy in out)
+      (mapv #(bit-and % 0xff) (.toByteArray out)))))
+
+(def file (delay (fixture-bytes "plain.arrow")))
+(def cid "bafkreihhtkudt4mva67dp5y7abgdn7ev4edjkqtjcfglvgukaz4uisa5fa")
+
+(defn- catalogued []
+  (:quads (cat/admit {:cid cid :size (count @file) :tenant "acme"
+                      :ingested-at "2026-08-05T09:00:00Z"
+                      :filename "sales.arrow"
+                      :declared-media-type arrow-type})))
+
+(defn- registry+meter
+  "A registry whose Arrow reader records every byte range it pulls.
+
+  The meter sits at the transport, below everything: whatever the query layers
+  decide, this is what actually moved."
+  []
+  (let [meter (atom nil)]
+    {:meter meter
+     :registry
+     (reader/register-scan
+      (reader/registry) arrow-type
+      (lcol/scan-reader
+       (fn [{:keys [read-range size-bytes]}]
+         (let [c (bytes/counting (bytes/of-fn size-bytes read-range))]
+           (reset! meter c)
+           (asrc/open (:source c))))))}))
+
+(defn- range-fn [] (fn [s e] (subvec @file s e)))
+
+(defn- open-for [registry tenant]
+  (acq/source-for registry (catalogued)
+                  {:cid cid :tenant tenant
+                   :size-bytes (count @file)
+                   :read-range (range-fn)}))
+
+;; ── the catalog classified this before a reader existed ─────────────────────
+
+(deftest admission-never-parsed-so-arrow-was-already-catalogued
+  (let [{:keys [format media-type]} (sniff/classify (vec (take 64 @file)))]
+    (is (= :arrow format))
+    (is (= arrow-type media-type)))
+  (testing "and admission records it without a decoder being involved"
+    (is (seq (catalogued)))))
+
+;; ── the chain ───────────────────────────────────────────────────────────────
+
+(deftest a-triple-pattern-becomes-a-buffer-range
+  (let [{:keys [registry meter]} (registry+meter)
+        {:keys [ok? source via]} (open-for registry "acme")
+        oid (cat/object-id cid)]
+    (is ok?)
+    (is (= arrow-type via))
+    (let [answer (dsrc/scan-set source [nil "price" 120])]
+      (testing "the answer is a datom pointing back at the object it came from"
+        (is (= #{{:s (str oid "#row4") :p "price" :o 120}} answer)))
+      (testing "and the reader moved less than the whole file to get it"
+        (let [{:keys [bytes]} (bytes/read-counts @meter)]
+          (is (< bytes (count @file))
+              "footer, three batch headers and one column's buffers per
+               batch — not the file"))))))
+
+(deftest arrow-reads-every-chunk-where-parquet-would-skip-two
+  ;; The honest difference, asserted rather than glossed. `columnar.stats`
+  ;; refuses to prune without bounds, and Arrow records none, so the identical
+  ;; query that touches one row group in the Parquet run touches all three
+  ;; record batches here.
+  (let [s (asrc/open @file)
+        {:keys [rows chunks-read chunks-skipped]}
+        (plan/scan s {:columns ["price"] :predicates [[:= "price" 120]]})]
+    (is (= 1 (count rows)) "the same one row comes back either way")
+    (is (= 3 chunks-read))
+    (is (= 0 chunks-skipped)
+        "the cost of a format that records no min/max, paid visibly")))
+
+(deftest an-aggregate-crosses-the-whole-stack-without-touching-a-buffer
+  (let [{:keys [registry]} (registry+meter)
+        {:keys [source]} (open-for registry "acme")]
+    (is (some? source))
+    ;; Reach past the pattern surface to the engine underneath — the aggregate
+    ;; path, which a triple pattern has no way to express.
+    (let [c (bytes/counting (bytes/of-vector @file))
+          col (asrc/open (:source c))
+          _ (dotimes [i 3] (csrc/-chunk-rows col i))
+          after-metadata (:bytes (bytes/read-counts c))]
+      (is (= {:value 9 :from :statistics :read 0}
+             (agg/aggregate col {:agg :count})))
+      (is (= after-metadata (:bytes (bytes/read-counts c)))
+          "count came out of the batch headers; not one buffer byte moved")
+      (testing "max cannot — Arrow records no bounds — and says so"
+        (is (= {:value 230 :from :scan :read 3}
+               (agg/aggregate col {:agg :max :column "price"})))))))
+
+;; ── the gate, against a file that really exists ─────────────────────────────
+
+(deftest the-gate-stands-between-a-query-and-a-real-file
+  (let [{:keys [registry meter]} (registry+meter)
+        quads (catalogued)
+        mine (open-for registry "acme")
+        theirs (open-for registry "globex")]
+    (is (:ok? mine))
+    (is (false? (:ok? theirs)))
+    (is (= theirs (acq/source-for registry quads
+                                  {:cid "bafkreibpugzxpp3hgcpwlzphxsozeq2fzjsi33comandtcu4wsl5zorxmu"
+                                   :tenant "globex"}))
+        "a real object the caller does not hold, and one that does not exist,
+         are the same answer")
+    (testing "and the refused caller moved no bytes of a file that is right there"
+      (reset! meter nil)
+      (open-for registry "globex")
+      (is (nil? @meter) "the reader was never constructed, so nothing opened"))))

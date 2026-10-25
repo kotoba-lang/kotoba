@@ -1,0 +1,222 @@
+(ns arrow.flatbuffers
+  "FlatBuffers access — the encoding Arrow writes its metadata in.
+
+  Its own namespace for the same reason `parquet.thrift` is: this is a
+  self-contained byte grammar with nothing to do with columns, and keeping it
+  separate is what lets it be tested against byte sequences from the
+  FlatBuffers spec rather than against this repo's idea of an Arrow file.
+
+  ## Why this is a reader and not a generated binding
+
+  The usual way to consume FlatBuffers is to run `flatc` over the schema and
+  compile the output. That would put a generated-code step, a toolchain, and a
+  language target between this library and its input — for a format whose
+  access pattern is four arithmetic operations. Arrow's metadata uses tables,
+  structs, strings, vectors and unions and nothing else, so the whole grammar
+  is the hundred lines below.
+
+  ## The one thing that is easy to get backwards
+
+  A table's first field is a **signed** offset that is SUBTRACTED to find the
+  vtable, while every other offset in the format is unsigned and ADDED. Both
+  are int32 at a position, so a decoder that reads them the same way works on
+  every buffer it is first tested against — vtables are usually emitted after
+  the tables that point at them, making the soffset positive — and then fails
+  on a buffer where the writer shared a vtable backwards. It is spelled out in
+  `table-vtable` rather than left as a subtraction to notice.
+
+  ## Absent is not zero
+
+  A field whose vtable slot is 0, or whose id is past the end of the vtable,
+  is **absent**, and absent means the schema's default rather than the value
+  0. `field-offset` returns nil for both cases so a caller has to decide;
+  every reader here that has a default states it at the call site."
+  (:refer-clojure :exclude [bytes])
+  (:require [kotoba.bytes :as kbytes]))
+
+;; ── little-endian scalars ───────────────────────────────────────────────────
+
+(defn u8 [bs i] (nth bs i))
+
+(defn u16 [bs i]
+  (+ (nth bs i) (* 256 (nth bs (+ i 1)))))
+
+(defn u32
+  "Unsigned 32-bit. Exact on both runtimes: 2^32 is well inside a double."
+  [bs i]
+  (+ (nth bs i)
+     (* 256 (nth bs (+ i 1)))
+     (* 65536 (nth bs (+ i 2)))
+     (* 16777216 (nth bs (+ i 3)))))
+
+(defn i32
+  "Signed 32-bit, for the one place the format uses it: a table's soffset."
+  [bs i]
+  (let [v (u32 bs i)]
+    (if (>= v 2147483648) (- v 4294967296) v)))
+
+(defn i16 [bs i]
+  (let [v (u16 bs i)]
+    (if (>= v 32768) (- v 65536) v)))
+
+(defn i64
+  "Signed 64-bit, EXACTLY or not at all.
+
+  The same rule `parquet.thrift/le-uint` states, and for the same reason: the
+  obvious accumulation with `Math/pow` puts the top two bytes of a 64-bit
+  value past double precision and returns a quietly rounded answer, on the JVM
+  as well as in ClojureScript. So the JVM path is exact integer arithmetic
+  (where `bit-shift-left` on a long wraps to a negative for a value with the
+  high bit set, which is the correct signed answer), and the ClojureScript
+  path REFUSES a magnitude it cannot represent rather than rounding it.
+
+  A reader that returns a plausible wrong number is worse than one that says
+  it cannot represent this value, because nothing downstream can tell."
+  [bs i]
+  #?(:clj (loop [k 0 acc 0]
+            (if (= k 8)
+              acc
+              (recur (inc k) (bit-or acc (bit-shift-left (long (nth bs (+ i k)))
+                                                         (* 8 k))))))
+     :cljs (let [hi (u32 bs (+ i 4))
+                 lo (u32 bs i)
+                 neg? (>= hi 2147483648)
+                 mag (if neg?
+                       ;; two's complement magnitude, computed on the halves so
+                       ;; the intermediate never exceeds what a double holds
+                       ;; any better than the result does
+                       (+ (* (- 4294967295 hi) 4294967296) (- 4294967296 lo))
+                       (+ (* hi 4294967296) lo))]
+             (if (> mag js/Number.MAX_SAFE_INTEGER)
+               (throw (ex-info "integer exceeds this runtime's exact range"
+                               {:type :arrow/precision-unavailable :approx mag}))
+               (if neg? (- mag) mag)))))
+
+(defn f64 [bs i]
+  #?(:clj (Double/longBitsToDouble
+           (loop [k 0 acc 0]
+             (if (= k 8)
+               acc
+               (recur (inc k) (bit-or acc (bit-shift-left (long (nth bs (+ i k)))
+                                                          (* 8 k)))))))
+     :cljs (let [buf (js/ArrayBuffer. 8)
+                 u8a (js/Uint8Array. buf)]
+             (dotimes [k 8] (aset u8a k (nth bs (+ i k))))
+             (aget (js/Float64Array. buf) 0))))
+
+(defn f32 [bs i]
+  #?(:clj (Float/intBitsToFloat (unchecked-int (u32 bs i)))
+     :cljs (let [buf (js/ArrayBuffer. 4)
+                 u8a (js/Uint8Array. buf)]
+             (dotimes [k 4] (aset u8a k (nth bs (+ i k))))
+             (aget (js/Float32Array. buf) 0))))
+
+;; ── the grammar ─────────────────────────────────────────────────────────────
+
+(defn root
+  "Position of the root table in a buffer whose byte 0 is the buffer's start.
+
+  Every flatbuffer this library reads is handed to it as its own vector — the
+  footer is one range, each message's metadata is another — so positions are
+  buffer-relative and this is always read at 0."
+  [bs]
+  (u32 bs 0))
+
+(defn- table-vtable
+  "The vtable position for the table at `t`.
+
+  SUBTRACTED, not added: the field is a signed soffset, and a writer that
+  shares one vtable between tables emits it before some of them."
+  [bs t]
+  (- t (i32 bs t)))
+
+(defn field-offset
+  "Byte offset of field `id` within the table at `t`, or **nil** when the field
+  is absent.
+
+  Absent has two spellings and both mean the schema default: a vtable too
+  short to have a slot for this id (a buffer written by an older schema), and
+  a slot holding 0."
+  [bs t id]
+  (let [vt (table-vtable bs t)
+        vt-bytes (u16 bs vt)
+        slot (+ 4 (* 2 id))]
+    (when (< slot vt-bytes)
+      (let [off (u16 bs (+ vt slot))]
+        (when-not (zero? off) off)))))
+
+(defn scalar
+  "Field `id` of the table at `t` read with `read-fn`, or `default` when absent."
+  [read-fn bs t id default]
+  (if-let [off (field-offset bs t id)] (read-fn bs (+ t off)) default))
+
+(defn ref-at
+  "Position a uoffset field points at, or nil when the field is absent.
+
+  The offset is relative to its own location, which is why this adds the
+  field's position rather than the table's."
+  [bs t id]
+  (when-let [off (field-offset bs t id)]
+    (let [p (+ t off)]
+      (+ p (u32 bs p)))))
+
+(defn inline-at
+  "Position of an inline STRUCT field, or nil when absent.
+
+  Unlike a table or a vector, a struct lives *in* its parent with no
+  indirection, so this is the one field kind where the position is the answer
+  and there is no offset to follow."
+  [bs t id]
+  (when-let [off (field-offset bs t id)] (+ t off)))
+
+(defn string-at
+  "The UTF-8 string at position `p`.
+
+  Decodes ASCII directly and multi-byte sequences through the platform, which
+  is what Arrow column names and this repo's fixtures exercise."
+  [bs p]
+  (let [n (u32 bs p)
+        start (+ p 4)
+        raw (subvec (vec bs) start (+ start n))]
+    (if (every? #(< % 0x80) raw)
+      (apply str (map char raw))
+      #?(:clj (kbytes/utf8-string (byte-array (map unchecked-byte raw)))
+         :cljs (.decode (js/TextDecoder. "utf-8")
+                        (js/Uint8Array. (clj->js raw)))))))
+
+(defn string-field [bs t id]
+  (when-let [p (ref-at bs t id)] (string-at bs p)))
+
+(defn vector-count [bs p] (u32 bs p))
+
+(defn vector-element
+  "Position of element `k` of the vector at `p`, whose elements are `stride`
+  bytes wide.
+
+  Takes no bytes: a vector's elements are evenly spaced after its length, so
+  this is arithmetic. For a vector of structs the answer is the element
+  itself; for a vector of tables or strings it is the position holding that
+  element's uoffset, and the caller follows it with `follow`."
+  [p k stride]
+  (+ p 4 (* k stride)))
+
+(defn follow
+  "Resolve the uoffset stored at `p`."
+  [bs p]
+  (+ p (u32 bs p)))
+
+(defn table-vector
+  "Positions of every element of the table/string vector in field `id` of the
+  table at `t`. Empty when the field is absent."
+  [bs t id]
+  (if-let [p (ref-at bs t id)]
+    (mapv #(follow bs (vector-element p % 4)) (range (vector-count bs p)))
+    []))
+
+(defn struct-vector
+  "Positions of every element of the struct vector in field `id` of the table
+  at `t`, whose elements are `stride` bytes wide."
+  [bs t id stride]
+  (if-let [p (ref-at bs t id)]
+    (mapv #(vector-element p % stride) (range (vector-count bs p)))
+    []))

@@ -1,0 +1,503 @@
+(ns drive.object-test
+  "Who may move which bytes.
+
+  Every test here is a way the seam could be filled that reads correctly and
+  hands out someone else's file. That is why the seam is in this library
+  rather than in each consumer: the rules only work if there is one of them."
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is testing]]
+            [kotoba.bytes :as b]
+            [drive.object :as object]
+            [drive.store.memory :as mem]
+            [drive.workspace :as ws]))
+
+(def ^:private bytes-a [1 2 3 4 5 6])
+(def ^:private bytes-b [9 9 9])
+
+(defn- fixture
+  "A workspace owned by alice with one file, and a store holding its bytes."
+  []
+  (let [store (mem/store)
+        w     (-> (ws/workspace "acme" "alice" 1000)
+                  (ws/create-file "plan" "root" {:drive/title "plan"} "alice"))
+        r     (object/write-item w store "plan" "alice" bytes-a {:object-ref "obj-1"})]
+    {:ws (:workspace r) :store store}))
+
+;; ── reading ─────────────────────────────────────────────────────────────────
+
+(deftest an-owner-reads-their-own-file
+  (let [{:keys [ws store]} (fixture)
+        r (object/read-item ws store "plan" "alice")]
+    (is (:ok? r))
+    (is (= bytes-a (:bytes r)))
+    (is (= "obj-1" (:object-ref r)))))
+
+(deftest a-stranger-reads-nothing
+  (let [{:keys [ws store]} (fixture)
+        r (object/read-item ws store "plan" "mallory")]
+    (is (not (:ok? r)))
+    (is (= :not-permitted (:reason r)))
+    (is (nil? (:bytes r)) "and is not handed the bytes alongside the refusal")))
+
+(deftest a-viewer-may-read
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/grant ws "plan" "bob" :viewer)]
+    (is (:ok? (object/read-item ws store "plan" "bob")))))
+
+(deftest trashed-bytes-are-not-readable
+  ;; can-read? says nothing about trash — visible-items filters it separately —
+  ;; so a caller composing can-read? with a store hands out deleted content
+  (let [{:keys [ws store]} (fixture)
+        trashed (ws/trash ws "plan")]
+    (is (ws/can-read? trashed "plan" "alice") "the ACL still says yes")
+    (let [r (object/read-item trashed store "plan" "alice")]
+      (is (not (:ok? r)))
+      (is (= :item-is-trashed (:reason r))))
+    (testing "and restoring makes them readable again, because trash is not deletion"
+      (is (:ok? (object/read-item (ws/restore trashed "plan") store "plan" "alice"))))))
+
+(deftest readable?-agrees-with-read-item
+  (let [{:keys [ws store]} (fixture)]
+    (is (object/readable? ws "plan" "alice"))
+    (is (not (object/readable? ws "plan" "mallory")))
+    (is (not (object/readable? (ws/trash ws "plan") "plan" "alice")))
+    (is (not (object/readable? ws "nope" "alice")))
+    (doseq [[who trashed?] [["alice" false] ["mallory" false] ["alice" true]]]
+      (let [w (cond-> ws trashed? (ws/trash "plan"))]
+        (is (= (object/readable? w "plan" who)
+               (:ok? (object/read-item w store "plan" who)))
+            (str who " trashed=" trashed?))))))
+
+(deftest a-file-with-no-content-is-not-an-error-about-permission
+  (let [store (mem/store)
+        w (-> (ws/workspace "acme" "alice" 1000)
+              (ws/create-file "empty" "root" {:drive/title "empty"} "alice"))
+        r (object/read-item w store "empty" "alice")]
+    (is (not (:ok? r)))
+    (is (= :no-content (:reason r)))))
+
+(deftest bytes-the-model-claims-and-the-store-does-not-have
+  ;; a broken node, not a permission answer
+  (let [{:keys [ws]} (fixture)
+        empty-store (mem/store)
+        r (object/read-item ws empty-store "plan" "alice")]
+    (is (= :object-missing-from-store (:reason r)))))
+
+(deftest folders-have-no-bytes
+  (let [{:keys [ws store]} (fixture)]
+    (is (= :folders-have-no-bytes (:reason (object/read-item ws store "root" "alice"))))))
+
+;; ── share links ─────────────────────────────────────────────────────────────
+
+(deftest a-share-link-reads-without-an-acl-entry
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/create-share-link ws "tok" "plan" :viewer 100)
+        r  (object/read-via-share-link ws store "tok" 50)]
+    (is (:ok? r))
+    (is (= bytes-a (:bytes r)))
+    (is (= :viewer (:role r)))
+    (is (not (ws/can-read? ws "plan" "anyone")) "and the ACL still says no")))
+
+(deftest an-expired-link-is-a-link-that-never-existed
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/create-share-link ws "tok" "plan" :viewer 100)]
+    (is (= :no-such-link (:reason (object/read-via-share-link ws store "tok" 100))))
+    (is (= :no-such-link (:reason (object/read-via-share-link ws store "tok" 999))))
+    (testing "as is a revoked one"
+      (is (= :no-such-link
+             (:reason (object/read-via-share-link (ws/revoke-share-link ws "tok")
+                                                  store "tok" 50)))))))
+
+(deftest a-link-to-something-trashed-reads-nothing
+  (let [{:keys [ws store]} (fixture)
+        ws (-> ws (ws/create-share-link "tok" "plan" :viewer 100) (ws/trash "plan"))]
+    (is (= :item-is-trashed (:reason (object/read-via-share-link ws store "tok" 50))))))
+
+;; ── writing ─────────────────────────────────────────────────────────────────
+
+(deftest writing-records-a-version-and-spends-quota
+  (let [{:keys [ws]} (fixture)]
+    (is (= (count bytes-a) (:drive.workspace/used-bytes ws)))
+    (is (= 1 (count (:drive/versions (ws/item ws "plan")))))
+    (is (= "obj-1" (:drive/object-ref (ws/item ws "plan"))))))
+
+(deftest a-version-records-who-wrote-it
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/grant ws "plan" "bob" :editor)
+        ws (:workspace (object/write-item ws store "plan" "bob" bytes-b
+                                          {:object-ref "obj-2"}))
+        versions (:drive/versions (ws/item ws "plan"))]
+    (is (= ["alice" "bob"] (mapv :drive.version/author versions))
+        "the history says which of the two writers made each version")))
+
+(deftest the-author-is-the-principal-that-was-permitted
+  ;; Not a value the caller supplies. `opts` is ignored here on purpose: an
+  ;; author the caller can name is a history the caller can write.
+  (let [{:keys [ws store]} (fixture)
+        r (object/write-item ws store "plan" "alice" bytes-b
+                             {:object-ref "obj-2" :drive.version/author "mallory"})]
+    (is (= "alice" (:drive.version/author
+                    (peek (:drive/versions (ws/item (:workspace r) "plan"))))))))
+
+(deftest a-refused-write-records-no-author
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/grant ws "plan" "bob" :viewer)
+        r  (object/write-item ws store "plan" "bob" bytes-b {:object-ref "obj-2"})]
+    (is (= :not-permitted (:reason r)))
+    (is (nil? (:workspace r)))))
+
+(deftest a-commenter-may-not-write
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/grant ws "plan" "bob" :commenter)
+        r  (object/write-item ws store "plan" "bob" bytes-b {:object-ref "obj-2"})]
+    (is (= :not-permitted (:reason r)))
+    (is (nil? (object/-get-object store "obj-2"))
+        "and nothing was stored on the way to finding out")))
+
+(deftest a-new-version-must-have-a-new-reference
+  ;; reusing one silently replaces the bytes of an earlier version, and the
+  ;; history that says otherwise is still sitting in :drive/versions
+  (let [{:keys [ws store]} (fixture)
+        r (object/write-item ws store "plan" "alice" bytes-b {:object-ref "obj-1"})]
+    (is (= :object-ref-already-used (:reason r)))
+    (is (= bytes-a (object/-get-object store "obj-1")) "the first version survives")))
+
+(deftest quota-is-checked-before-the-bytes-move
+  ;; add-version throws on this too, and by then the upload has happened
+  (let [store (mem/store)
+        w (-> (ws/workspace "acme" "alice" 4)
+              (ws/create-file "plan" "root" {} "alice"))
+        r (object/write-item w store "plan" "alice" [1 2 3 4 5] {:object-ref "big"})]
+    (is (= :quota-exceeded (:reason r)))
+    (is (nil? (object/-get-object store "big"))
+        "nothing was uploaded before the refusal")))
+
+(deftest a-write-without-a-reference-is-refused
+  (let [{:keys [ws store]} (fixture)]
+    (is (= :no-object-ref (:reason (object/write-item ws store "plan" "alice" bytes-b {}))))))
+
+(deftest a-second-version-reads-back-as-the-second
+  (let [{:keys [ws store]} (fixture)
+        r  (object/write-item ws store "plan" "alice" bytes-b {:object-ref "obj-2"})
+        ws (:workspace r)]
+    (is (:ok? r))
+    (is (= bytes-b (:bytes (object/read-item ws store "plan" "alice"))))
+    (is (= 2 (count (:drive/versions (ws/item ws "plan")))))
+    (is (= (+ (count bytes-a) (count bytes-b)) (:drive.workspace/used-bytes ws)))
+    (testing "and the first version's bytes are still addressable"
+      (is (= bytes-a (object/-get-object store "obj-1"))))))
+
+;; ── forgetting ──────────────────────────────────────────────────────────────
+
+(deftest forgetting-removes-every-version-and-returns-the-quota
+  (let [{:keys [ws store]} (fixture)
+        ws (:workspace (object/write-item ws store "plan" "alice" bytes-b {:object-ref "obj-2"}))
+        r  (object/forget-item ws store "plan" "alice")]
+    (is (:ok? r))
+    (is (= 2 (:deleted r)))
+    (is (nil? (object/-get-object store "obj-1")))
+    (is (nil? (object/-get-object store "obj-2")))
+    (is (= 0 (:drive.workspace/used-bytes (:workspace r)))
+        "a workspace that counts bytes nobody can reach fills up for no visible reason")
+    (is (= :no-content (:reason (object/read-item (:workspace r) store "plan" "alice"))))))
+
+(deftest forgetting-needs-write-permission
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/grant ws "plan" "bob" :viewer)
+        r  (object/forget-item ws store "plan" "bob")]
+    (is (= :not-permitted (:reason r)))
+    (is (= bytes-a (object/-get-object store "obj-1")))))
+
+;; ── the adapter ─────────────────────────────────────────────────────────────
+
+(deftest store-of-wraps-four-functions
+  ;; how a backend attaches without either library depending on the other
+  (let [held (atom {})
+        store (object/store-of {:get-object    #(get @held %)
+                                :put-object    #(swap! held assoc %1 (vec %2))
+                                :delete-object #(swap! held dissoc %)})
+        w (-> (ws/workspace "acme" "alice" 100)
+              (ws/create-file "plan" "root" {} "alice"))
+        r (object/write-item w store "plan" "alice" bytes-a {:object-ref "k"})]
+    (is (:ok? r))
+    (is (= bytes-a (get @held "k")))
+    (is (= bytes-a (:bytes (object/read-item (:workspace r) store "plan" "alice"))))
+    (testing "exists? falls back to a get when it is not supplied"
+      (is (object/-object-exists? store "k"))
+      (is (not (object/-object-exists? store "nope"))))))
+
+;; ── the byte contract ───────────────────────────────────────────────────────
+
+(deftest a-backend-that-speaks-arrays-still-fits
+  ;; found by a second implementation appearing: cloud-itonami-app's
+  ;; Filecoin store returns byte[] where drive.store.memory returns vectors.
+  ;; Both are reasonable; the protocol not saying which was not.
+  (let [held (atom {})
+        store (object/store-of
+               {:get-object    (fn [ref] (get @held ref))
+                :put-object    (fn [ref bs] (swap! held assoc ref bs))
+                :delete-object (fn [ref] (swap! held dissoc ref))
+                ;; a backend that wants arrays says so here
+                :bytes-out     (fn [v] #?(:clj  (byte-array (map unchecked-byte v))
+                                          :cljs (js/Uint8Array.from (into-array v))))})
+        w (-> (ws/workspace "acme" "alice" 100)
+              (ws/create-file "plan" "root" {} "alice"))
+        r (object/write-item w store "plan" "alice" [1 2 250] {:object-ref "k"})]
+    (is (:ok? r))
+    (is (= 3 (count (get @held "k"))))
+    (testing "and the consumer still sees a vector"
+      (let [got (object/read-item (:workspace r) store "plan" "alice")]
+        (is (vector? (:bytes got)))
+        (is (= [1 2 250] (:bytes got))
+            "including the byte above 127, which a signed array would report negative")))))
+
+(deftest drive-defers-to-kotoba-bytes-rather-than-deciding
+  ;; The coercion is tested where it lives (kotoba.bytes). What this pins is
+  ;; that drive calls it: a private copy lived in drive.object for a day and
+  ;; had already drifted — it passed strings through unchanged, so a value
+  ;; that was not a byte vector could leave a seam that says everything
+  ;; crossing it is one.
+  (let [held  (atom {"k" #?(:clj (byte-array [7 8 -56]) :cljs #js [7 8 200])})
+        store (object/store-of {:get-object    #(get @held %)
+                                :put-object    #(swap! held assoc %1 %2)
+                                :delete-object #(swap! held dissoc %)})]
+    (is (= (b/->bytes (get @held "k")) (object/-get-object store "k"))
+        "what drive hands back is what kotoba.bytes says it is")
+    (is (nil? (object/-get-object store "absent"))
+        "and absent is still not empty")))
+
+(deftest quota-counts-bytes-not-characters
+  ;; `count` on a string is characters. Charging 3 for a value that occupies 9
+  ;; lets a workspace past a limit it is still reporting as enforced, so the
+  ;; write side normalises before it measures, not only before it stores.
+  (let [store (mem/store)
+        w (-> (ws/workspace "acme" "alice" 100)
+              (ws/create-file "plan" "root" {} "alice"))
+        r (object/write-item w store "plan" "alice" "日本語" {:object-ref "k"})]
+    (is (:ok? r))
+    (is (= 9 (:drive.workspace/used-bytes (:workspace r)))
+        "three 3-byte codepoints, not three characters")
+    (is (= (b/utf8-encode "日本語")
+           (:bytes (object/read-item (:workspace r) store "plan" "alice")))))
+  (testing "and a write that only fits when miscounted is refused"
+    (let [store (mem/store)
+          w (-> (ws/workspace "acme" "alice" 5)
+                (ws/create-file "plan" "root" {} "alice"))
+          r (object/write-item w store "plan" "alice" "日本語" {:object-ref "k"})]
+      (is (= :quota-exceeded (:reason r)))
+      (is (= 9 (:size r))))))
+
+(deftest store-of-refuses-a-store-it-cannot-build
+  ;; A misspelled key otherwise yields a store that answers nil to every read,
+  ;; which at the call site is indistinguishable from an empty backend.
+  (testing "a missing operation"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"needs a function for each operation"
+         (object/store-of {:get-object identity :put-object identity}))))
+  (testing "a non-function under a key it needs"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"needs a function for each operation"
+         (object/store-of {:get-object identity :put-object identity
+                           :delete-object "not a function"}))))
+  (testing "a key it does not use — the typo case"
+    (is (thrown-with-msg?
+         kerror/ExceptionInfo
+         #"a key it does not use"
+         (object/store-of {:get-object identity :put-object identity
+                           :delete-object identity :get-objects identity}))))
+  (testing "and the complete set is accepted"
+    (is (some? (object/store-of {:get-object identity :put-object identity
+                                 :delete-object identity})))))
+
+(defn- raw-array-store
+  "A store written by hand rather than through `store-of`.
+
+  This is the case `store-of`'s normalisation cannot cover, and the reason
+  `read-item` normalises too: a consumer may `reify IObjectStore` directly,
+  and the shape drive hands back must not depend on which way it was built.
+  Two controls passed before this existed, because every other test here went
+  through `store-of` and was normalised on the way in."
+  [held]
+  (reify object/IObjectStore
+    (-get-object [_ ref] (get @held ref))
+    (-put-object [_ ref bytes]
+      (swap! held assoc ref #?(:clj (byte-array (map unchecked-byte bytes))
+                               :cljs (js/Uint8Array.from (into-array bytes)))))
+    (-delete-object [_ ref] (swap! held dissoc ref))
+    (-object-exists? [_ ref] (contains? @held ref))))
+
+(deftest a-hand-written-store-is-normalised-by-read-item
+  (let [held  (atom {})
+        store (raw-array-store held)
+        w (-> (ws/workspace "acme" "alice" 100)
+              (ws/create-file "plan" "root" {} "alice"))
+        w (:workspace (object/write-item w store "plan" "alice" [7 8 200] {:object-ref "k"}))
+        r (object/read-item w store "plan" "alice")]
+    (is (not (vector? (object/-get-object store "k")))
+        "the store really does hand back something other than a vector")
+    (is (vector? (:bytes r)))
+    (is (= [7 8 200] (:bytes r))
+        "including the byte above 127, which a signed array reports negative")))
+
+(deftest share-link-reads-are-normalised-too
+  (let [held  (atom {})
+        store (raw-array-store held)
+        w (-> (ws/workspace "acme" "alice" 100)
+              (ws/create-file "plan" "root" {} "alice"))
+        w (:workspace (object/write-item w store "plan" "alice" [7 8 200] {:object-ref "k"}))
+        w (ws/create-share-link w "tok" "plan" :viewer 100)
+        r (object/read-via-share-link w store "tok" 50)]
+    (is (:ok? r))
+    (is (vector? (:bytes r)))
+    (is (= [7 8 200] (:bytes r)))))
+
+(deftest store-of-honours-the-contract-it-was-built-to-satisfy
+  ;; the contract is on the protocol, so a store built by `store-of` must meet
+  ;; it whether or not anything in this namespace is the caller. Without this,
+  ;; removing the normalisation there passes every other test, because
+  ;; read-item normalises again on the way out.
+  (let [held  (atom {"k" #?(:clj (byte-array [7 8 -56]) :cljs #js [7 8 200])})
+        store (object/store-of {:get-object    #(get @held %)
+                                :put-object    #(swap! held assoc %1 %2)
+                                :delete-object #(swap! held dissoc %)})]
+    (is (vector? (object/-get-object store "k")))
+    (is (= [7 8 200] (object/-get-object store "k")))
+    (is (nil? (object/-get-object store "absent"))
+        "and a missing object is still nil rather than an empty vector")))
+
+(deftest pruning-keeps-the-newest-and-returns-the-rest-to-the-quota
+  (let [{:keys [ws store]} (fixture)
+        ws (:workspace (object/write-item ws store "plan" "alice" bytes-b
+                                          {:object-ref "obj-2"}))
+        ws (:workspace (object/write-item ws store "plan" "alice" bytes-a
+                                          {:object-ref "obj-3"}))
+        before (:drive.workspace/used-bytes ws)
+        r (object/prune-versions ws store "plan" "alice" 1)]
+    (is (:ok? r))
+    (is (= 2 (:deleted r)))
+    (is (= 1 (:kept r)))
+    (is (= (+ (count bytes-a) (count bytes-b)) (:freed-bytes r)))
+    (is (= (- before (:freed-bytes r))
+           (:drive.workspace/used-bytes (:workspace r))))
+    ;; The bytes are gone from the store, and the newest are not.
+    (is (nil? (object/-get-object store "obj-1")))
+    (is (nil? (object/-get-object store "obj-2")))
+    (is (some? (object/-get-object store "obj-3")))
+    ;; And the document still reads.
+    (is (:ok? (object/read-item (:workspace r) store "plan" "alice")))))
+
+(deftest pruning-never-takes-the-current-version
+  (let [{:keys [ws store]} (fixture)]
+    (is (= :keep-count-too-low (:reason (object/prune-versions ws store "plan" "alice" 0))))
+    (is (= :keep-count-too-low (:reason (object/prune-versions ws store "plan" "alice" -1))))
+    ;; The newest version IS the document; a prune that could take it is a
+    ;; delete wearing another name, and forget-item is the one that says so.
+    (is (some? (object/-get-object store "obj-1")))))
+
+(deftest pruning-with-nothing-to-prune-frees-nothing-and-succeeds
+  (let [{:keys [ws store]} (fixture)
+        r (object/prune-versions ws store "plan" "alice" 5)]
+    (is (:ok? r))
+    (is (zero? (:deleted r)))
+    (is (zero? (:freed-bytes r)))
+    (is (= (:drive.workspace/used-bytes ws)
+           (:drive.workspace/used-bytes (:workspace r))))))
+
+(deftest pruning-needs-write-access
+  (let [{:keys [ws store]} (fixture)
+        ws (ws/grant ws "plan" "bob" :commenter)
+        r (object/prune-versions ws store "plan" "bob" 1)]
+    (is (= :not-permitted (:reason r)))
+    (is (some? (object/-get-object store "obj-1")) "and nothing was deleted on the way")))
+
+;; ── content addressing: two items, one object ───────────────────────────────
+
+(deftest a-shared-reference-is-not-deleted-with-one-of-its-holders
+  ;; When a reference is derived from the bytes — a hash, a CID — two items
+  ;; holding identical content hold the same reference. Deleting it for one
+  ;; destroys the other, and nothing in this namespace can see that: it is
+  ;; given one item, and the other may be in a different workspace.
+  (let [store (mem/store)
+        w (-> (ws/workspace "acme" "alice" 100000)
+              (ws/create-file "a" "root" {:drive/title "A"} "alice")
+              (ws/create-file "b" "root" {:drive/title "B"} "alice"))
+        w (:workspace (object/write-item w store "a" "alice" bytes-a
+                                         {:object-ref "cid-same"}))
+        w (:workspace (object/write-item w store "b" "alice" bytes-a
+                                         {:object-ref "cid-same"}))
+        ;; Purging A while B still points at the same object.
+        r (object/forget-item w store "a" "alice" {:keep-ref? #{"cid-same"}})]
+    (is (:ok? r))
+    (is (= 0 (:deleted r)))
+    (is (= 1 (:kept r)) "left alone, and said so")
+    ;; A lost its reference and its quota came back…
+    (is (nil? (:drive/object-ref (ws/item (:workspace r) "a"))))
+    (is (pos? (:freed-bytes r)))
+    ;; …and B can still be read, which is the whole point.
+    (is (:ok? (object/read-item (:workspace r) store "b" "alice")))
+    (is (= bytes-a (:bytes (object/read-item (:workspace r) store "b" "alice"))))))
+
+(deftest without-the-predicate-nothing-changes
+  ;; Documents use uuid references, where no two items ever share one. The
+  ;; default has to stay exactly what it was.
+  (let [{:keys [ws store]} (fixture)
+        r (object/forget-item ws store "plan" "alice")]
+    (is (= 1 (:deleted r)))
+    (is (= 0 (:kept r)))
+    (is (not (:ok? (object/read-item (:workspace r) store "plan" "alice"))))))
+
+(deftest the-predicate-is-asked-per-reference
+  ;; A document with several versions may share some objects and not others.
+  (let [store (mem/store)
+        w (-> (ws/workspace "acme" "alice" 100000)
+              (ws/create-file "a" "root" {:drive/title "A"} "alice"))
+        w (:workspace (object/write-item w store "a" "alice" bytes-a
+                                         {:object-ref "cid-shared"}))
+        w (:workspace (object/write-item w store "a" "alice" bytes-b
+                                         {:object-ref "cid-mine"}))
+        r (object/forget-item w store "a" "alice" {:keep-ref? #{"cid-shared"}})]
+    (is (= 1 (:deleted r)))
+    (is (= 1 (:kept r)))))
+
+(deftest identical-bytes-may-share-a-reference
+  ;; What content addressing means: two items holding one PDF hold one
+  ;; reference. Refusing that would make it impossible rather than safe.
+  (let [store (mem/store)
+        w (-> (ws/workspace "acme" "alice" 100000)
+              (ws/create-file "a" "root" {:drive/title "A"} "alice")
+              (ws/create-file "b" "root" {:drive/title "B"} "alice"))
+        w (:workspace (object/write-item w store "a" "alice" bytes-a
+                                         {:object-ref "cid-same"}))
+        r (object/write-item w store "b" "alice" bytes-a {:object-ref "cid-same"})]
+    (is (:ok? r))
+    (is (= bytes-a (:bytes (object/read-item (:workspace r) store "b" "alice"))))
+    ;; Both items still read, which is the thing that would break.
+    (is (= bytes-a (:bytes (object/read-item (:workspace r) store "a" "alice"))))))
+
+(deftest different-bytes-may-not-take-a-reference-that-is-in-use
+  ;; The guard this relaxes still has to hold. Filing new content under an
+  ;; existing reference replaces an earlier version's bytes while the
+  ;; history saying otherwise sits in :drive/versions — and it is checked
+  ;; against what is stored rather than taken on the caller's word, because
+  ;; a caller trusted to say "this is content-addressed" is trusted with
+  ;; exactly what the guard exists to not trust.
+  (let [{:keys [ws store]} (fixture)
+        w (ws/create-file ws "other" "root" {:drive/title "other"} "alice")
+        r (object/write-item w store "other" "alice" bytes-b {:object-ref "obj-1"})]
+    (is (not (:ok? r)))
+    (is (= :object-ref-already-used (:reason r)))
+    ;; And the original bytes are untouched.
+    (is (= bytes-a (:bytes (object/read-item ws store "plan" "alice"))))))
+
+(deftest a-reference-whose-object-is-gone-is-still-refused
+  ;; `same-bytes?` answers false when either side is missing, so a reference
+  ;; recorded in the history whose bytes have been pruned away cannot be
+  ;; quietly reused for something else.
+  (let [{:keys [ws store]} (fixture)
+        pruned (object/forget-item ws store "plan" "alice")
+        w (ws/create-file ws "other" "root" {:drive/title "other"} "alice")
+        r (object/write-item w store "other" "alice" bytes-b {:object-ref "obj-1"})]
+    (is (some? pruned))
+    (is (not (:ok? r)))
+    (is (= :object-ref-already-used (:reason r)))))
