@@ -1,0 +1,135 @@
+;; nbb smoke for the edge CACAO factor verifier — the Worker-side production
+;; auth path, which `kbb -M:test` cannot reach (cacao.edge.* is CLJS-only:
+;; js/crypto.subtle, js/Uint8Array, js/btoa).
+;;
+;;   kbb --backend sci --classpath "src:test:<cacao>/src" test/authentication/cacao_edge_smoke.cljk
+;;
+;; where <cacao> is a checkout of kotoba-lang/org-chainagnostic-cacao. Requires
+;; Node >= 20 (Ed25519 in WebCrypto). Exits nonzero on any failure.
+;;
+;; Every CACAO below is really minted and really signed, so a break in the
+;; policy layer (audience / required-resources / per-DID issuer binding) is
+;; distinguishable from a break in the crypto layer: the crypto stays valid
+;; and only the policy verdict flips.
+(ns authentication.cacao-edge-smoke
+  (:require [authentication.async :as async]
+            [authentication.model :as m]
+            [authentication.ports :as p]
+            [authentication.adapters.cacao-edge :as cacao-edge]
+            [cacao.edge.mint :as mint]))
+
+(def domain "authn.kotobase.net")
+(def audience "https://kotobase.net")
+(def pin-cap "kotoba://can/kotobase:pin")
+(def now 1800000000)
+
+(def failures (atom []))
+
+(defn check! [label ok?]
+  (if ok?
+    (js/console.log "ok  -" label)
+    (do (js/console.error "FAIL-" label) (swap! failures conj label))))
+
+(defn- iso [sec] (.replace (.toISOString (js/Date. (* 1000 sec))) #"\.\d{3}Z$" "Z"))
+
+(defn- keypair []
+  (.generateKey js/crypto.subtle #js {:name "Ed25519"} true #js ["sign" "verify"]))
+
+(defn- did-of [kp]
+  (-> (.exportKey js/crypto.subtle "raw" (.-publicKey kp))
+      (.then (fn [raw] (mint/did-key-from-raw-ed25519-pub (js/Uint8Array. raw))))))
+
+(defn- mint-for [kp did {:keys [aud resources nonce]}]
+  (mint/mint did (fn [msg] (.sign js/crypto.subtle "Ed25519" (.-privateKey kp) msg))
+             {:domain domain
+              :aud (or aud audience)
+              :nonce (or nonce "n1")
+              :iat (iso now)
+              :exp (iso (+ now 3600))
+              :resources (or resources [pin-cap])}))
+
+(defn- verifier []
+  (cacao-edge/cacao-factor-verifier {:audience audience
+                                     :required-resources [pin-cap]
+                                     :at-sec (+ now 60)}))
+
+(defn- decide-with [subject cacao-b64]
+  (async/authenticate! {:cacao (verifier)}
+                       (m/request "req-1" subject {:required-level :single-factor})
+                       [(m/factor-request "fr-1" :cacao {:subject subject})]
+                       [{:authn.factor-response/request-id "fr-1"
+                         :cacao/cacao-b64 cacao-b64}]))
+
+(defn- mixed-decision
+  "A CACAO factor and a sync platform-biometric factor in ONE decision —
+  the reason IFactorVerifier and IAsyncFactorVerifier stay separate."
+  [did cacao-b64]
+  (async/authenticate!
+   {:cacao (verifier)
+    :touchid (reify p/IFactorVerifier
+               (verify-factor! [_ fr _]
+                 (m/factor (:authn.factor-request/id fr) :touchid true {:subject did})))}
+   (m/request "req-2" did {:required-level :phishing-resistant})
+   [(m/factor-request "fr-a" :cacao {:subject did})
+    (m/factor-request "fr-b" :touchid {:subject did})]
+   [{:authn.factor-response/request-id "fr-a" :cacao/cacao-b64 cacao-b64}
+    {:authn.factor-response/request-id "fr-b"}]))
+
+(defn- assert-decisions!
+  [alice-did [ok bad-aud bad-cap bobs anon missing mixed]]
+  (check! "alice's CACAO authenticates alice"
+          (= :authenticated (:authn.decision/decision ok)))
+  (check! "a CACAO factor is single-factor, never phishing-resistant"
+          (= :single-factor (:authn.decision/level ok)))
+  (check! "the decided subject is the issuer DID"
+          (= alice-did (-> ok :authn.decision/factors first :authn.factor/subject)))
+  (check! "wrong audience is rejected"
+          (= :challenge (:authn.decision/decision bad-aud)))
+  (check! "missing required capability is rejected"
+          (= :challenge (:authn.decision/decision bad-cap)))
+  (check! "bob's crypto-valid CACAO cannot authenticate alice"
+          (= :challenge (:authn.decision/decision bobs)))
+  (check! "with no claimed subject, the issuer is learned instead of checked"
+          (= :authenticated (:authn.decision/decision anon)))
+  (check! "an absent CACAO denies instead of throwing"
+          (= :challenge (:authn.decision/decision missing)))
+  (check! "async and sync verifiers mix in one decision"
+          (and (= :authenticated (:authn.decision/decision mixed))
+               (= :phishing-resistant (:authn.decision/level mixed))
+               (= 2 (count (:authn.decision/factors mixed))))))
+
+(defn run []
+  (-> (js/Promise.all #js [(keypair) (keypair)])
+      (.then (fn [[alice bob]]
+               (-> (js/Promise.all #js [(did-of alice) (did-of bob)])
+                   (.then (fn [[alice-did bob-did]]
+                            (-> (js/Promise.all
+                                 #js [(mint-for alice alice-did {})
+                                      (mint-for alice alice-did {:aud "https://elsewhere.example" :nonce "n2"})
+                                      (mint-for alice alice-did {:resources ["kotoba://can/something-else"] :nonce "n3"})
+                                      (mint-for bob bob-did {:nonce "n4"})])
+                                (.then (fn [[good wrong-aud wrong-cap bobs]]
+                                         (-> (js/Promise.all
+                                              #js [(decide-with alice-did (:cacao-b64 good))
+                                                   (decide-with alice-did (:cacao-b64 wrong-aud))
+                                                   (decide-with alice-did (:cacao-b64 wrong-cap))
+                                                   ;; crypto-valid, wrong DID: the per-DID
+                                                   ;; structural check (ADR-2607177000) --
+                                                   ;; a caller only authenticates as itself
+                                                   (decide-with alice-did (:cacao-b64 bobs))
+                                                   ;; discovery: no subject to check against
+                                                   (decide-with nil (:cacao-b64 bobs))
+                                                   (decide-with alice-did nil)
+                                                   (mixed-decision alice-did (:cacao-b64 good))])
+                                             (.then (fn [results]
+                                                      (assert-decisions! alice-did (vec results)))))))))))))
+      (.then (fn [_]
+               (if (seq @failures)
+                 (do (js/console.error "\nFAILED:" (count @failures) (pr-str @failures))
+                     (set! (.-exitCode js/process) 1))
+                 (js/console.log "\ncacao-edge factor verifier smoke: all checks passed"))))
+      (.catch (fn [error]
+                (js/console.error "threw:" error)
+                (set! (.-exitCode js/process) 1)))))
+
+(run)
