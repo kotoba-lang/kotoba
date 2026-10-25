@@ -1,0 +1,204 @@
+(ns koyomi.store
+  "SSoT for koyomi — a schedule-sharing control plane, behind a `Store`
+  protocol so the backend is a swap (MemStore default ‖ DatomicStore via
+  langchain.db, itself swappable to real Datomic Local / kotoba-server).
+
+  Domain = drafting and sharing calendar events across attendees. The actor
+  only ever writes :draft records (control-plane proposals, holding a
+  `calendar.model` event EDN verbatim); actually sharing/inviting is an
+  EXTERNAL effect performed by a ScheduleTarget port, and only after human
+  approval.
+
+    activity — an itonami activity driving a schedule request: id, repo (the
+               tenant it belongs to), due-at, kind.
+    contact  — an attendee's consent record (koyomi.model/contact): attendee,
+               consent (:known/:blocked), first-contact? (never invited before).
+    event    — a durable ground fact: a `calendar.model` event EDN
+               (:calendar/id/title/start/end/attendees/links) plus a :tenant
+               koyomi itself adds (for tenant-isolation) — recorded by the
+               ingest flow (:event/register) mechanically from an activity's
+               due-at, no LLM involved.
+    draft    — the committed/proposed schedule-LLM content for an event
+               (content, confidence, cites, redactions, status
+               :proposed/:shared).
+
+  Charter: the append-only **ledger is koyomi's schedule-sharing audit trail**
+  (who drafted what, on what basis, who approved sharing, when) — the
+  property a mutable calendar app can't give you. There is intentionally no
+  raw-invitee-contents-at-rest requirement beyond the event itself: the
+  ledger records dispositions and bases, not full invite bodies (anti-
+  surveillance, same charter as kekkai's/tayori's ledgers)."
+  (:require #?(:clj  [kotoba.lang.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [kotoba.lang.text :as str]
+            [calendar.model :as cal]
+            [koyomi.model :as model]
+            [langchain.db :as d]))
+
+(defprotocol Store
+  (activity [s id])
+  (contact [s id])
+  (event [s id])
+  (all-events [s]           "every registered event across the tenant(s)")
+  (draft-of [s event-id]    "committed/proposed draft for an event, or nil")
+  (ledger [s])
+  (record-datom! [s record] "append/merge a koyomi ground fact to the SSoT")
+  (append-ledger! [s fact]  "append one immutable schedule-sharing audit fact")
+  (seed! [s data]           "bulk-seed entity collections (idempotent upsert)"))
+
+;; ───────────────────────── demo data ─────────────────────────
+;; A fixed clock so drafts/tests are deterministic and offline-verifiable
+;; (koyomi doesn't gate on wall-clock time itself — calendar.model/overlaps?
+;; only compares the events' own ISO-8601 start/end strings).
+(def demo-now 1751000000) ; ~2025-06-27Z, epoch seconds
+
+(defn demo-data
+  "alice's cloud-itonami tenant: ev-board is a clean board-meeting draft
+  target (known, non-first-contact attendees, no conflicts) → phase 3 auto-
+  commits at :event/draft. ev-blocked carries an attendee whose consent is
+  :blocked — :event/share must HOLD un-overridably. ev-conflict-existing /
+  ev-conflict-new share an attendee AND overlap in time → a SOFT double-
+  booking escalate (not hard: concurrent events across shared attendees can
+  be entirely legitimate)."
+  []
+  {:activities
+   {"act-board"    {:id "act-board"    :repo "cloud-itonami" :due-at "2026-07-10T09:00:00Z" :kind :board-meeting}
+    "act-conflict" {:id "act-conflict" :repo "cloud-itonami" :due-at "2026-08-01T09:30:00Z" :kind :standup}}
+   :contacts
+   {"att-alice"   (model/contact "att-alice")
+    "att-bob"     (model/contact "att-bob")
+    "att-newbiz"  (model/contact "att-newbiz" {:first-contact? true})
+    "att-blocked" (model/contact "att-blocked" {:consent :blocked})}
+   :events
+   {"ev-board"
+    (merge (cal/event "ev-board" {:calendar/title "Board meeting"
+                                  :calendar/start "2026-07-10T09:00:00Z"
+                                  :calendar/end   "2026-07-10T10:00:00Z"
+                                  :calendar/attendees ["att-alice" "att-bob"]})
+           {:tenant "cloud-itonami"})
+    "ev-blocked"
+    (merge (cal/event "ev-blocked" {:calendar/title "1:1 sync"
+                                    :calendar/start "2026-07-15T09:00:00Z"
+                                    :calendar/end   "2026-07-15T09:30:00Z"
+                                    :calendar/attendees ["att-blocked"]})
+           {:tenant "cloud-itonami"})
+    "ev-conflict-existing"
+    (merge (cal/event "ev-conflict-existing" {:calendar/title "Existing standup"
+                                              :calendar/start "2026-08-01T09:00:00Z"
+                                              :calendar/end   "2026-08-01T10:00:00Z"
+                                              :calendar/attendees ["att-bob"]})
+           {:tenant "cloud-itonami"})
+    "ev-conflict-new"
+    (merge (cal/event "ev-conflict-new" {:calendar/title "New standup"
+                                         :calendar/start "2026-08-01T09:30:00Z"
+                                         :calendar/end   "2026-08-01T09:45:00Z"
+                                         :calendar/attendees ["att-bob"]})
+           {:tenant "cloud-itonami"})
+    "ev-newbiz"
+    (merge (cal/event "ev-newbiz" {:calendar/title "Intro call"
+                                   :calendar/start "2026-07-20T09:00:00Z"
+                                   :calendar/end   "2026-07-20T09:30:00Z"
+                                   :calendar/attendees ["att-newbiz"]})
+           {:tenant "cloud-itonami"})}})
+
+;; ───────────────────────── MemStore (default) ─────────────────────────
+
+(defrecord MemStore [a]
+  Store
+  (activity [_ id] (get-in @a [:activities id]))
+  (contact [_ id] (get-in @a [:contacts id]))
+  (event [_ id] (get-in @a [:events id]))
+  (all-events [_] (sort-by :calendar/id (vals (:events @a))))
+  (draft-of [_ event-id] (get-in @a [:drafts event-id]))
+  (ledger [_] (:ledger @a))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :activity (swap! a update-in [:activities id] merge value)
+      :contact  (swap! a update-in [:contacts id] merge value)
+      :event    (swap! a update-in [:events id] merge value)
+      :draft    (swap! a update-in [:drafts id] merge value)
+      nil)
+    s)
+  (append-ledger! [_ fact] (swap! a update :ledger conj fact) fact)
+  (seed! [s data] (swap! a merge (select-keys data [:activities :contacts :events])) s))
+
+(defn seed-db []
+  (->MemStore (atom (assoc (demo-data) :drafts {} :ledger []))))
+
+;; ───────────────────────── DatomicStore (langchain.db) ─────────────────────────
+
+(def ^:private schema
+  {:activity/id {:db/unique :db.unique/identity}
+   :contact/id  {:db/unique :db.unique/identity}
+   :event/id    {:db/unique :db.unique/identity}
+   :draft/id    {:db/unique :db.unique/identity}})
+
+(defn- enc [v] (pr-str v))
+(defn- dec* [s] (when s (edn/read-string s)))
+
+;; The store talks to its backend ONLY through the langchain.db `:db-api` map
+;; {:q :transact! :db :pull :entid}. langchain.db/api (in-process EAVT) and
+;; langchain.kotoba-db/kotoba-api (kotoba-server XRPC, e.g. kotobase.net) both
+;; implement it, so the same record runs on either by construction.
+
+(defn- q* [{:keys [api conn]} query & inputs]
+  (apply (:q api) query ((:db api) conn) inputs))
+(defn- pull* [{:keys [api conn]} pattern eid] ((:pull api) ((:db api) conn) pattern eid))
+(defn- tx* [{:keys [api conn]} txd] ((:transact! api) conn txd))
+
+(defrecord DatomicStore [api conn]
+  Store
+  (activity [this id]
+    (-> (pull* this [:activity/edn] [:activity/id id]) :activity/edn dec*))
+  (contact [this id]
+    (-> (pull* this [:contact/edn] [:contact/id id]) :contact/edn dec*))
+  (event [this id]
+    (-> (pull* this [:event/edn] [:event/id id]) :event/edn dec*))
+  (all-events [this]
+    (->> (q* this '[:find [?id ...] :where [?e :event/id ?id]])
+         (map #(event this %)) (sort-by :calendar/id)))
+  (draft-of [this event-id]
+    (-> (pull* this [:draft/edn] [:draft/id event-id]) :draft/edn dec*))
+  (ledger [this]
+    ;; ordered by entity id (?e), never a client-precomputed :ledger/seq -- a
+    ;; caller-side `(count (ledger s))` read followed by a separate `tx*` write
+    ;; is a non-atomic read-modify-write; two concurrent append-ledger! calls
+    ;; can compute the SAME seq, and since :ledger/seq was a :db.unique/identity
+    ;; attr, the second transact! silently upserted onto (retracted +
+    ;; replaced) the first call's entity -- verified data loss against the
+    ;; real langchain.db transact! semantics. :db/id is allocated fresh per
+    ;; entity map with no unique attr to collide on, so ordering by it can
+    ;; never lose a fact this way.
+    (->> (q* this '[:find ?e ?f :where [?e :ledger/fact ?f]])
+         (sort-by first) (mapv (comp dec* second))))
+  (record-datom! [s {:keys [kind id value]}]
+    (case kind
+      :activity (tx* s [{:activity/id id :activity/edn (enc (merge (activity s id) value))}])
+      :contact  (tx* s [{:contact/id id :contact/edn (enc (merge (contact s id) value))}])
+      :event    (tx* s [{:event/id id :event/edn (enc (merge (event s id) value))}])
+      :draft    (tx* s [{:draft/id id :draft/edn (enc (merge (draft-of s id) value))}])
+      nil)
+    s)
+  (append-ledger! [s fact]
+    (tx* s [{:ledger/fact (enc fact)}]) fact)
+  (seed! [s data]
+    (doseq [[id a] (:activities data)] (record-datom! s {:kind :activity :id id :value a}))
+    (doseq [[id c] (:contacts data)]   (record-datom! s {:kind :contact :id id :value c}))
+    (doseq [[id e] (:events data)]     (record-datom! s {:kind :event :id id :value e}))
+    s))
+
+(defn datomic-store
+  "DatomicStore on the in-process langchain.db EAVT backend (default Datomic-
+  shaped store; verifiable offline). For the kotoba-server pod (kotobase.net),
+  see koyomi.kotoba/kotoba-store — same record, different :db-api."
+  ([] (datomic-store nil))
+  ([data] (let [s (->DatomicStore d/api (d/create-conn schema))]
+            (when data (seed! s data)) s)))
+
+(defn datomic-seed-db [] (datomic-store (demo-data)))
+
+;; ───────────────────────── ledger formatting ─────────────────────────
+
+(defn ledger-line [{:keys [op subject disposition basis]}]
+  (str/join " · " [(name (or disposition :record)) (str "op=" op)
+                   (str "subject=" subject) (str "basis=" (pr-str basis))]))

@@ -1,0 +1,169 @@
+(ns koyomi.scheduleport-test
+  "ICS generation is the only place koyomi touches RFC 5545 text — an
+  unescaped free-text field (e.g. an LLM-proposed event title) is a line-
+  injection vector the governor never sees, since koyomi.governor/
+  consent-violations only inspects the structured :calendar/attendees
+  vector, never rendered ICS text."
+  (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
+            [json.data-json :as json]
+            [koyomi.scheduleport :as scheduleport]))
+
+(deftest adversarial-title-cannot-inject-a-forged-attendee-line
+  (testing "a title carrying an embedded CRLF + a fake ATTENDEE line renders as
+            one inert, escaped SUMMARY value — no new ATTENDEE line appears"
+    (let [evil-title "Q3 Planning\r\nATTENDEE:mailto:attacker@evil.example"
+          event {:calendar/id "ev-inject" :calendar/title evil-title
+                 :calendar/start "2026-07-10T09:00:00Z" :calendar/end "2026-07-10T10:00:00Z"
+                 :calendar/attendees ["att-alice" "att-bob"]}
+          ics (scheduleport/ics-string event)
+          lines (str/split ics #"\r\n")]
+      (is (not (str/includes? ics "\r\nATTENDEE:mailto:attacker"))
+          "the injected CRLF+ATTENDEE text must not survive as a raw, parser-visible line break")
+      (let [attendee-lines (filter #(str/starts-with? % "ATTENDEE:") lines)]
+        (is (= 2 (count attendee-lines))
+            "exactly the 2 real attendees are rendered as ATTENDEE lines — none fabricated from the title")
+        (is (not-any? #(str/includes? % "attacker@evil.example") attendee-lines)
+            "no ATTENDEE line named the attacker at all — the injection attempt only ever
+             shows up inertly inside the escaped SUMMARY value, never as its own property"))
+      (let [summary-line (first (filter #(str/starts-with? % "SUMMARY:") lines))]
+        (is (some? summary-line))
+        (is (str/includes? summary-line "\\nATTENDEE:mailto:attacker@evil.example")
+            "the malicious text survives only as an inert, backslash-escaped literal inside SUMMARY")))))
+
+(deftest text-escaping-is-rfc5545-compliant
+  (testing "backslash, comma, semicolon, and embedded newlines are escaped per RFC 5545 §3.3.11"
+    (let [event {:calendar/id "ev-esc" :calendar/title "Budget, Q3; \"final\" review\\draft"
+                 :calendar/start "2026-07-10T09:00:00Z" :calendar/end "2026-07-10T10:00:00Z"
+                 :calendar/attendees ["att-alice"]}
+          ics (scheduleport/ics-string event)
+          lines (str/split ics #"\r\n")
+          summary-line (first (filter #(str/starts-with? % "SUMMARY:") lines))]
+      (is (= "SUMMARY:Budget\\, Q3\\; \"final\" review\\\\draft" summary-line)))))
+
+(deftest clean-title-is-unaffected
+  (testing "a plain title with no reserved characters renders unchanged"
+    (let [event {:calendar/id "ev-clean" :calendar/title "Board meeting"
+                 :calendar/start "2026-07-10T09:00:00Z" :calendar/end "2026-07-10T10:00:00Z"
+                 :calendar/attendees ["att-alice" "att-bob"]}
+          ics (scheduleport/ics-string event)
+          lines (str/split ics #"\r\n")]
+      (is (= "SUMMARY:Board meeting" (first (filter #(str/starts-with? % "SUMMARY:") lines))))
+      (is (= 2 (count (filter #(str/starts-with? % "ATTENDEE:") lines)))))))
+
+;; ───────────────────────── slack-scheduleport — request-building only ─────────────────────────
+;;
+;; No live Slack call anywhere here (there is no bot token to call with
+;; yet; see README's 'Slack Distributor (owner setup required)' section).
+;; Every assertion below drives slack-scheduleport's returned distributor
+;; fn with an injected fake :http-fn that just captures the request map.
+
+(defn- capturing-http-fn [captured]
+  (fn [req]
+    (reset! captured req)
+    {:status 200 :body "{\"ok\":true}"}))
+
+(deftest slack-scheduleport-posts-chat-postMessage-with-bearer-auth
+  (testing "the right endpoint, method, bearer-token auth header, and channel"
+    (let [captured (atom nil)
+          distributor (scheduleport/slack-scheduleport
+                        {:token "xoxb-test-token" :channel "C0123456"
+                         :http-fn (capturing-http-fn captured)})
+          event {:calendar/id "ev-1" :calendar/title "Board meeting"
+                 :calendar/start "2026-07-10T09:00:00Z" :calendar/end "2026-07-10T10:00:00Z"
+                 :calendar/attendees ["att-alice" "att-bob"]}]
+      (distributor {:event-id "ev-1" :ics (scheduleport/ics-string event)
+                    :attendees (:calendar/attendees event)})
+      (let [req @captured]
+        (is (= "https://slack.com/api/chat.postMessage" (:url req)))
+        (is (= :post (:method req)))
+        (is (= "Bearer xoxb-test-token" (get-in req [:headers "Authorization"]))
+            "the real Slack Web API bearer-token auth header shape, matching
+             tayori.channel.slack's already-implemented convention")
+        (is (str/starts-with? (get-in req [:headers "Content-Type"]) "application/json"))
+        (is (str/includes? (:body req) "\"channel\":\"C0123456\"")
+            "posts to the constructor-injected channel, never a hardcoded one")
+        (is (str/includes? (:body req) "Board meeting")
+            "the title, recovered from the ICS SUMMARY line, appears in the notification text")
+        (is (str/includes? (:body req) "2 attendees"))))))
+
+(deftest slack-scheduleport-singular-attendee-count
+  (testing "exactly one attendee renders the singular form"
+    (let [captured (atom nil)
+          distributor (scheduleport/slack-scheduleport
+                        {:token "xoxb-test-token" :channel "C0123456"
+                         :http-fn (capturing-http-fn captured)})]
+      (distributor {:event-id "ev-2" :ics "BEGIN:VEVENT\r\nSUMMARY:Solo sync\r\nEND:VEVENT\r\n"
+                    :attendees ["att-alice"]})
+      (is (str/includes? (:body @captured) "1 attendee)")))))
+
+(deftest slack-scheduleport-falls-back-to-event-id-when-summary-missing
+  (testing "an ICS string with no parseable SUMMARY line still produces a well-formed notification"
+    (let [captured (atom nil)
+          distributor (scheduleport/slack-scheduleport
+                        {:token "xoxb-test-token" :channel "C0123456"
+                         :http-fn (capturing-http-fn captured)})]
+      (distributor {:event-id "ev-3" :ics "BEGIN:VEVENT\r\nEND:VEVENT\r\n" :attendees []})
+      (is (str/includes? (:body @captured) "ev-3")))))
+
+(deftest slack-scheduleport-accepts-injected-json-write
+  (testing "a caller-injected :json-write (e.g. for a richer payload) is honored instead of the built-in minimal encoder"
+    (let [captured (atom nil)
+          distributor (scheduleport/slack-scheduleport
+                        {:token "xoxb-test-token" :channel "C0123456"
+                         :http-fn (capturing-http-fn captured)
+                         :json-write pr-str})]
+      (distributor {:event-id "ev-4" :ics "BEGIN:VEVENT\r\nSUMMARY:Injected Encoder Event\r\nEND:VEVENT\r\n"
+                    :attendees ["att-alice"]})
+      (is (str/includes? (:body @captured) ":channel \"C0123456\"")
+          "pr-str's EDN-ish shape proves json-write really was swapped out"))))
+
+(deftest slack-scheduleport-does-not-mutate-mock-scheduleport-default-behavior
+  (testing "slack-scheduleport is just another distributor — mock-scheduleport still records shared events the same way with or without it"
+    (let [shared (atom {})
+          captured (atom nil)
+          st (scheduleport/mock-scheduleport
+               shared
+               (scheduleport/slack-scheduleport {:token "xoxb-t" :channel "C1"
+                                                 :http-fn (capturing-http-fn captured)}))
+          event {:calendar/id "ev-5" :calendar/title "Delivered Event"
+                 :calendar/start "2026-07-10T09:00:00Z" :calendar/end "2026-07-10T10:00:00Z"
+                 :calendar/attendees ["att-alice"]}]
+      (scheduleport/share! st "ev-5" event)
+      (is (= "ev-5" (:event-id (get @shared "ev-5"))))
+      (is (some? @captured) "the injected distributor was actually called"))))
+
+(deftest slack-scheduleport-escapes-c0-control-chars-in-json-body
+  (testing "a title containing raw C0 control chars still produces a valid JSON body --
+            RFC 8259 requires escaping ALL of U+0000-U+001F, not just \\n/\\t"
+    (let [captured (atom nil)
+          distributor (scheduleport/slack-scheduleport
+                        {:token "xoxb-test-token" :channel "C0123456"
+                         :http-fn (capturing-http-fn captured)})
+          title (str "Report " (char 7) " ready " (char 31) " now")]
+      (distributor {:event-id "ev-6" :ics (str "BEGIN:VEVENT\r\nSUMMARY:" title "\r\nEND:VEVENT\r\n")
+                    :attendees []})
+      (let [body (:body @captured)
+            decoded (json/read-str body)]
+        (is (not (str/includes? body (str (char 7))))
+            "the raw bell character must not appear unescaped in the JSON body")
+        (is (str/includes? body "\\u0007"))
+        (is (str/includes? body "\\u001f"))
+        (is (str/includes? (get decoded "text") title)
+            "a real JSON parser round-trips the escaped control chars back to the originals")))))
+
+(deftest slack-scheduleport-json-body-round-trips-through-a-real-json-parser
+  (testing "the whole body is well-formed JSON regardless of tabs, backslashes, quotes, or
+            other control chars in the title (kept single-line: the SUMMARY line recovery
+            regex only ever sees a real ics-escape-text'd -- so raw CR/LF-free -- title)"
+    (let [captured (atom nil)
+          distributor (scheduleport/slack-scheduleport
+                        {:token "xoxb-test-token" :channel "C0123456"
+                         :http-fn (capturing-http-fn captured)})
+          title (str "Line1" (char 9) "tabbed" (char 92) "backslash" (char 34) "quote" (char 1) "soh")]
+      (distributor {:event-id "ev-7" :ics (str "BEGIN:VEVENT\r\nSUMMARY:" title "\r\nEND:VEVENT\r\n")
+                    :attendees []})
+      (let [decoded (json/read-str (:body @captured))]
+        (is (= "C0123456" (get decoded "channel")))
+        (is (str/includes? (get decoded "text") "tabbed\\backslash\"quote")
+            "read-str itself un-escaping back to the raw chars is the proof the body was valid JSON")))))
