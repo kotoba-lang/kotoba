@@ -1,0 +1,170 @@
+(ns rtl.eda-adapter
+  "Adapts rtl.synthesis's gate-level netlist into
+  kotoba.eda.core/analyze-timing's node/edge timing-graph job shape,
+  closing the RTL synthesis -> static-timing-analysis signoff loop.
+
+  Connectivity finding (read rtl.synthesis in full before designing this
+  adapter -- see rtl/src/rtl/synthesis.cljk): a `rtl.synthesis/gate` DOES
+  carry real connectivity -- `{:gate-type t :inputs [net-name ...]
+  :output net-name}` -- and a `rtl.synthesis/gate-netlist`'s
+  :primary-inputs/:primary-outputs are net names drawn from the same
+  namespace. So this adapter builds a REAL per-gate delay-annotated
+  timing graph from the netlist's actual net-name connectivity -- every
+  :eda.timing/edges entry below is a genuine (driver-input net ->
+  gate-output net) connection read straight from a gate's
+  :inputs/:output, NOT a fabricated graph and NOT a serial
+  worst-case-chain approximation (that fallback was only needed if
+  gate-netlist turned out to be a flat, connectivity-free bag of gates;
+  it isn't).
+
+  Delay model: rtl.synthesis carries no physical delay data (no
+  liberty/LEF timing arcs) -- that would come from a later
+  org-synopsys-liberty / org-si2-lef integration, out of scope here.
+  Instead this adapter uses a flat per-gate-type constant
+  (`default-delay-model`, nanoseconds) as a documented stand-in, not a
+  claim of real cell timing.
+
+  Sequential (:dff) boundary: rtl.synthesis/estimate-depth already
+  establishes this repo's own convention for :dff gates -- `depth-of`
+  hardcodes a DFF's depth at 0 regardless of its data input, i.e. a
+  register launches a fresh combinational stage every clock edge rather
+  than combinationally forwarding its D input's arrival time into Q
+  within the same period. This adapter mirrors that convention: a DFF's
+  Q net gets a single clock-launch edge (delay = the :dff entry in the
+  delay model, modelling clock-to-Q delay) instead of an edge from its D
+  input, and the DFF's D input net is added to :eda.timing/endpoints (a
+  register's data input must settle within the clock period -- the
+  classic STA setup-check endpoint) alongside the netlist's
+  :primary-outputs. This is a single-cycle, single-clock-domain
+  approximation -- it does not unroll multi-cycle register-to-register
+  paths -- consistent with analyze-timing's single
+  :eda.timing/clock-period-ns input and with rtl.synthesis/stats' own
+  naive per-stage max-frequency estimate.
+
+  Same alpha/prototype-grade maturity level as kotoba.eda.core -- see
+  eda/README.md's coverage table."
+  (:require [kotoba.eda.core :as eda-core]))
+
+(def clock-launch
+  "Synthetic zero-arrival timing-graph node standing in for 'the active
+  clock edge, time 0 within the analysis period'. Added to the node set
+  only when the netlist has at least one :dff gate. It is not a net name
+  from the netlist -- it is a modelling anchor for register clock-to-Q
+  delay, the standard way to represent a register launch in a graph
+  shape (kotoba.eda.core/analyze-timing) that has no explicit clock
+  node of its own."
+  ::clock-launch)
+
+(def default-delay-model
+  "Per-gate-type combinational/launch delay in nanoseconds. Flat
+  constants, NOT real liberty/LEF cell timing -- see namespace
+  docstring. :dff is the clock-to-Q delay applied on the synthetic
+  `clock-launch` -> Q edge (see `clock-launch`'s docstring), not a D->Q
+  combinational edge (see namespace docstring's sequential-boundary
+  note). `:default` is used as the fallback for any gate-type not
+  present in the map (rtl.synthesis/gate-types is closed today, but a
+  caller can pass a custom delay-model with fewer keys)."
+  {:and 0.1 :or 0.1 :nand 0.1 :nor 0.1
+   :xor 0.12 :xnor 0.12
+   :not 0.05 :buf 0.05
+   :mux 0.15
+   :dff 0.2
+   :default 0.15})
+
+(defn- gate-delay [delay-model gate-type]
+  (get delay-model gate-type (get delay-model :default 0.15)))
+
+(defn netlist->timing-nodes
+  "One :eda.timing/nodes entry per distinct net referenced anywhere in
+  `netlist` (:primary-inputs, :primary-outputs, and every gate's
+  :inputs/:output), plus the synthetic `clock-launch` node when the
+  netlist has at least one :dff gate.
+
+  Nodes are the netlist's own net-name strings -- exactly the values
+  already used as gate :inputs/:output -- not invented ids, matching
+  analyze-timing's node shape (a flat vector of opaque ids used
+  directly as edge :from/:to keys, see kotoba.eda.core/analyze-timing's
+  docstring: `:eda.timing/nodes [:in :u1 :out]`)."
+  [{:keys [gates primary-inputs primary-outputs]}]
+  (let [nets (distinct (concat primary-inputs
+                                (mapcat :inputs gates)
+                                (map :output gates)
+                                primary-outputs))
+        has-dff? (boolean (some #(= :dff (:gate-type %)) gates))]
+    (vec (concat nets (when has-dff? [clock-launch])))))
+
+(defn netlist->timing-edges
+  "One or more {:from :to :delay-ns} edges per gate in `netlist`, using
+  `delay-model` (defaults to `default-delay-model`) for the
+  per-gate-type delay.
+
+  Combinational gates (anything but :dff) get one edge per input net,
+  from that input net to the gate's output net -- a real edge read
+  straight from the gate's own :inputs/:output, not fabricated. Because
+  analyze-timing computes a node's arrival as
+  `max(over incoming edges)(arrival(from) + delay-ns)`, and every edge
+  generated for a given gate instance carries that gate's single delay,
+  this correctly reduces to
+  `arrival(output) = max(arrival(inputs)) + gate-delay`
+  for multi-input gates -- exactly the desired combinational semantics,
+  with no special-casing needed for gate arity.
+
+  :dff gates instead get exactly one edge, from the synthetic
+  `clock-launch` node (arrival 0) to the gate's output net, using the
+  :dff entry of `delay-model` as a clock-to-Q constant -- see the
+  namespace docstring's sequential-boundary note for why a DFF's D
+  input does NOT get a combinational edge into its Q output here."
+  ([netlist] (netlist->timing-edges netlist default-delay-model))
+  ([{:keys [gates]} delay-model]
+   (vec
+    (mapcat
+     (fn [{:keys [gate-type inputs output]}]
+       (if (= gate-type :dff)
+         [{:from clock-launch :to output :delay-ns (gate-delay delay-model :dff)}]
+         (let [delay (gate-delay delay-model gate-type)]
+           (map (fn [in] {:from in :to output :delay-ns delay}) inputs))))
+     gates))))
+
+(defn netlist->timing-endpoints
+  "Timing-graph sinks checked for slack against the clock period: the
+  netlist's :primary-outputs (chip-boundary checks) plus the data
+  (:inputs) net of every :dff gate (register setup checks -- a net
+  feeding a register's D pin must settle within the clock period)."
+  [{:keys [gates primary-outputs]}]
+  (vec (distinct (concat primary-outputs
+                          (mapcat :inputs (filter #(= :dff (:gate-type %)) gates))))))
+
+(def default-corners
+  "Single typical-typical corner at unit delay scale, used when
+  `netlist->timing-job` isn't given an explicit :corners option."
+  [{:corner/id :tt :corner/scale 1.0}])
+
+(defn netlist->timing-job
+  "Assembles a full kotoba.eda.core/analyze-timing-ready job from
+  `netlist` (an rtl.synthesis gate-netlist).
+
+  Options (all optional):
+  - :clock-period-ns -- defaults to 10.0ns (100MHz)
+  - :delay-model -- defaults to `default-delay-model`
+  - :corners -- defaults to `default-corners` (single :tt corner)"
+  ([netlist] (netlist->timing-job netlist {}))
+  ([netlist {:keys [clock-period-ns delay-model corners]
+             :or {clock-period-ns 10.0
+                  delay-model default-delay-model
+                  corners default-corners}}]
+   {:eda.job/tool :sw/opensta
+    :eda.job/operation :op/analyze-timing
+    :eda.timing/clock-period-ns clock-period-ns
+    :eda.timing/corners corners
+    :eda.timing/nodes (netlist->timing-nodes netlist)
+    :eda.timing/edges (netlist->timing-edges netlist delay-model)
+    :eda.timing/endpoints (netlist->timing-endpoints netlist)}))
+
+(defn analyze-netlist-timing
+  "Convenience wrapper: synthesizes `netlist` into an analyze-timing job
+  (`netlist->timing-job`, same `opts`) and runs
+  kotoba.eda.core/analyze-timing on it, returning :eda.signoff/*
+  evidence."
+  ([netlist] (analyze-netlist-timing netlist {}))
+  ([netlist opts]
+   (eda-core/analyze-timing (netlist->timing-job netlist opts))))
