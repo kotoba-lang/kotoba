@@ -99,6 +99,7 @@ The bundled standard libraries live in this repository:
 | `org.ietf.sdJwt` | `org.ietf.sdJwt/src` | `sd-jwt.core` (an external specification, publisher ietf.org) |
 | `org.ietf.sdJwtVc` | `org.ietf.sdJwtVc/src` | `sd-jwt-vc.core` (an external specification, publisher ietf.org) |
 | `org.w3.webauthn` | `org.w3.webauthn/src` | `webauthn.core` (an external specification, publisher w3.org) |
+| `org.w3.png` | `org.w3.png/src` | `png.bytes`, `png.core`, `png.decode`, `png.encode` (an external specification, publisher w3.org) |
 | `kotoba.atprotocol` | `kotoba.atprotocol/src` | `atprotocol.app-record`, `atprotocol.boundary`, `atprotocol.profile`, `atprotocol.projection` (Kotoba project library) |
 | `kotoba.artifact` | `kotoba.artifact/src` | `kotoba.artifact.content-identity`, `kotoba.artifact.core`, `kotoba.artifact.descriptor-table`, `kotoba.artifact.execution` (Kotoba project library) |
 | `kotoba.productParty` | `kotoba.productParty/src` | `kotoba.product-party` (Kotoba project library) |
