@@ -165,6 +165,7 @@ The bundled standard libraries live in this repository:
 | `org.oasisOpen.amqp` | `org.oasisOpen.amqp/src` | `amqp.frame`, `amqp.performative`, `amqp.types` (an external specification, publisher oasisOpen.org) |
 | `org.ibis.core` | `org.ibis.core/src` | `ibis.component`, `ibis.model`, `ibis.parser` (an external specification, publisher ibis.org) |
 | `org.freedesktop.wayland` | `org.freedesktop.wayland/src` | `wayland.model`, `wayland.objects`, `wayland.wire` (an external specification, publisher freedesktop.org) |
+| `org.unicode.core` | `org.unicode.core/src` | `unicode.normalize`, `unicode.ucd`, `unicode.utf8` (an external specification, publisher unicode.org) |
 | `com.synopsys.sdc` | `com.synopsys.sdc/src` | `sdc.clock`, `sdc.io-delay`, `sdc.parser`, `sdc.path-exception` (Kotoba project library) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
