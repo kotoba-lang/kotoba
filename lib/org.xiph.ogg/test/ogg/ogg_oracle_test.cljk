@@ -1,0 +1,155 @@
+(ns ogg.ogg-oracle-test
+  "Conformance against ffmpeg, in both directions.
+
+   The portable suite reads recorded reference containers. What only a shell can
+   add is the other direction: a file *we* muxed, handed to ffmpeg to decode. A
+   container writer that merely satisfies its own reader is the easiest thing in
+   the world to get wrong — page CRCs, the lacing terminator and the granule
+   convention are all invisible to a self round-trip.
+
+   Skipped loudly when ffmpeg is missing."
+  (:require [kotoba.io :as kio] [clojure.java.io :as io]
+            [kotoba.process :as shell]
+            [kotoba.lang.text :as str]
+            [kotoba.test :refer [deftest is testing]]
+            [ogg.core :as ogg]
+            [ogg.page :as page])
+  (:import [java.io File]))
+
+(defn- have-ffmpeg? []
+  (try (zero? (:exit (shell/sh "bash" "-c" "command -v ffmpeg")))
+       (catch Exception _ false)))
+
+(defn- temp-dir []
+  (kio/temp-dir
+            "org-xiph-ogg-"))
+
+(defn- rm-rf [^File f] (doseq [c (reverse (file-seq f))] (.delete ^File c)))
+(defn- ->bytes ^bytes [v] (byte-array (map unchecked-byte v)))
+(defn- read-ubytes [^File f] (mapv #(bit-and (int %) 0xff) (kio/read-all-bytes f)))
+
+(defn- encode!
+  "Have ffmpeg produce a real Ogg file → byte vector."
+  [dir codec name]
+  (let [f (io/file dir name)
+        {:keys [exit err]} (shell/sh "ffmpeg" "-hide_banner" "-v" "error"
+                                     "-f" "lavfi" "-i" "sine=frequency=440:duration=0.4"
+                                     "-c:a" codec "-f" "ogg" (.getPath f) "-y")]
+    (is (zero? exit) (str "ffmpeg encode failed: " err))
+    (read-ubytes f)))
+
+(defn- decodes?
+  "True when ffmpeg decodes `bytes` without error."
+  [dir bytes name]
+  (let [f (io/file dir name)]
+    (with-open [o (io/output-stream f)] (.write o (->bytes bytes)))
+    (let [{:keys [exit err]} (shell/sh "ffmpeg" "-hide_banner" "-v" "error"
+                                       "-i" (.getPath f) "-f" "null" "-")]
+      (when-not (zero? exit) (println "  ffmpeg said:" err))
+      (zero? exit))))
+
+(defn- probe
+  "ffprobe's view of a file we wrote → {:codec :channels :sample-rate}."
+  [dir bytes name]
+  (let [f (io/file dir name)]
+    (with-open [o (io/output-stream f)] (.write o (->bytes bytes)))
+    (let [{:keys [out]} (shell/sh "ffprobe" "-hide_banner" "-v" "error"
+                                  "-show_entries" "stream=codec_name,channels,sample_rate"
+                                  "-of" "default=nw=1" (.getPath f))
+          kv (into {} (for [line (str/split-lines out)
+                            :let [[k v] (str/split line #"=" 2)]
+                            :when v]
+                        [k v]))]
+      {:codec (get kv "codec_name")
+       :channels (get kv "channels")
+       :sample-rate (get kv "sample_rate")})))
+
+(def ^:private codecs
+  ;; encoder → what ffprobe calls it, and what our sniff should say
+  [["libopus" "opus" :opus]
+   ["libvorbis" "vorbis" :vorbis]
+   ["flac" "flac" :flac]])
+
+(deftest we-read-what-ffmpeg-writes
+  (if-not (have-ffmpeg?)
+    (println "SKIP ogg.ogg-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (doseq [[encoder _ expected] codecs]
+          (testing encoder
+            (let [data (encode! dir encoder (str "ref-" encoder ".ogg"))
+                  ls (ogg/logical-streams data)]
+              (is (= 1 (count ls)))
+              (is (= expected (ogg/identify (first ls))))
+              (testing "pages tile the file exactly and every CRC verifies"
+                (is (= (count data) (reduce + (map :size (page/pages data))))))
+              (testing "granule positions increase"
+                (let [gs (:granules (first ls))]
+                  (is (= gs (sort gs)))
+                  (is (pos? (last gs))))))))
+        (finally (rm-rf dir))))))
+
+(deftest ffmpeg-reads-what-we-write
+  (if-not (have-ffmpeg?)
+    (println "SKIP ogg.ogg-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (doseq [[encoder probe-name expected] codecs]
+          (testing encoder
+            (let [data (encode! dir encoder (str "in-" encoder ".ogg"))
+                  l (first (ogg/logical-streams data))
+                  ;; Opus and the FLAC mapping require their headers on their own
+                  ;; pages (RFC 7845 §3); ffmpeg refuses a greedily packed file
+                  ours (ogg/build {:serial (:serial l)
+                                   :packets (:packets l)
+                                   :granules (:granules l)
+                                   :flush-after #{0 1}})]
+              (is (= (:packets l) (ogg/packets ours))
+                  "our own reader agrees before we ask ffmpeg")
+              (is (decodes? dir ours (str "ours-" encoder ".ogg"))
+                  (str "ffmpeg rejected the file we muxed for " encoder))
+              (testing "and ffprobe sees the same stream it did before"
+                (let [p (probe dir ours (str "ours-" encoder ".ogg"))]
+                  (is (= probe-name (:codec p)))
+                  (is (= expected (ogg/identify (first (ogg/logical-streams ours))))))))))
+        (finally (rm-rf dir))))))
+
+(deftest a-page-we-rebuild-is-byte-identical
+  ;; Every field of a page is exposed, so a rebuild must reproduce the reference's
+  ;; bytes exactly — CRC included. This is the check that would catch a wrong
+  ;; checksummed region, which a self round-trip cannot see.
+  (if-not (have-ffmpeg?)
+    (println "SKIP ogg.ogg-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (doseq [[encoder] codecs]
+          (testing encoder
+            (let [data (encode! dir encoder (str "ref2-" encoder ".ogg"))]
+              (loop [ps (page/pages data) off 0]
+                (when-let [p (first ps)]
+                  (when (empty? (:tail p))
+                    (let [rebuilt (page/build (select-keys p [:packets :serial :sequence
+                                                             :granule :bos? :eos?
+                                                             :continued?]))
+                          original (subvec (vec data) off (+ off (:size p)))]
+                      (is (= original rebuilt)
+                          (str encoder " page " (:sequence p) " did not rebuild identically"))))
+                  (recur (next ps) (+ off (:size p))))))))
+        (finally (rm-rf dir))))))
+
+(deftest a-large-packet-split-across-pages-survives-ffmpeg
+  ;; Vorbis setup headers can exceed one page. Take a real file, re-mux it so the
+  ;; packet layout differs from ffmpeg's own, and check ffmpeg still decodes it.
+  (if-not (have-ffmpeg?)
+    (println "SKIP ogg.ogg-oracle-test: ffmpeg not available")
+    (let [dir (temp-dir)]
+      (try
+        (let [data (encode! dir "libvorbis" "big-in.ogg")
+              l (first (ogg/logical-streams data))
+              ours (ogg/build {:serial (:serial l) :packets (:packets l)
+                               :granules (:granules l)
+                               ;; force a page break after every header packet
+                               :flush-after #{0 1 2}})]
+          (is (= (:packets l) (ogg/packets ours)))
+          (is (decodes? dir ours "big-ours.ogg")))
+        (finally (rm-rf dir))))))

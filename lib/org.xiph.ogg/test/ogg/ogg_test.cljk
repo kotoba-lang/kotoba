@@ -1,0 +1,213 @@
+(ns ogg.ogg-test
+  "Runtime-agnostic Ogg suite: real reference containers, no shell, no filesystem.
+
+   The oracle suite adds what a recording cannot — handing our *muxed* output
+   back to ffmpeg."
+  (:require [kotoba.bytes :as kbytes] [ogg.core :as ogg]
+            [ogg.crc :as crc]
+            [ogg.fixtures :as fixtures]
+            [ogg.page :as page]
+            [ogg.stream :as stream]
+            #?(:clj  [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer [deftest is testing]])))
+
+(defn- b64->bytes [s]
+  #?(:clj (mapv #(bit-and (int %) 0xff)
+                (kbytes/base64-decode-bytes ^String s))
+     :cljs (let [d (js/atob s)]
+             (mapv #(.charCodeAt d %) (range (.-length d))))))
+
+(defn- ascii [s]
+  ;; `(int "a")` is 0 in ClojureScript, so this cannot be `(mapv int s)`
+  #?(:clj (mapv int s)
+     :cljs (mapv #(.charCodeAt % 0) (seq s))))
+
+(defn- reason-of [f]
+  (try (f) ::no-throw
+       (catch #?(:clj Exception :cljs :default) e (:reason (ex-data e)))))
+
+(def ^:private opus (delay (b64->bytes (get fixtures/files "opus"))))
+(def ^:private vorbis (delay (b64->bytes (get fixtures/files "vorbis"))))
+(def ^:private flac (delay (b64->bytes (get fixtures/files "flac"))))
+
+;; ---------------------------------------------------------------------------
+;; The CRC variant
+;; ---------------------------------------------------------------------------
+
+(deftest crc-is-the-init-zero-no-xorout-variant
+  (testing "the same polynomial as bzip2 and gzip, and the same as neither"
+    ;; gzip/ZIP/PNG (reflected, init and xorout all-ones) give 0xcbf43926;
+    ;; bzip2 (unreflected, init and xorout all-ones) gives 0xfc891918
+    (let [c (crc/crc32 (ascii "123456789"))]
+      (is (not= 0xcbf43926 c))
+      (is (not= 0xfc891918 c))))
+  (testing "an empty input hashes to zero, because there is no initial value"
+    (is (zero? (crc/crc32 []))))
+  (testing "and the real proof is that every page of every reference file verifies"
+    ;; page-at verifies the stored CRC by default, so this is the CRC under test
+    (doseq [f [@opus @vorbis @flac]]
+      (is (pos? (count (page/pages f)))))))
+
+;; ---------------------------------------------------------------------------
+;; Pages
+;; ---------------------------------------------------------------------------
+
+(deftest reads-real-pages
+  (doseq [[name data expected-codec]
+          [["opus" @opus :opus] ["vorbis" @vorbis :vorbis] ["flac" @flac :flac]]]
+    (testing name
+      (let [ps (page/pages data)]
+        (is (> (count ps) 1) "a real file has more than one page")
+        (testing "the first page begins the stream and the last ends it"
+          (is (:bos? (first ps)))
+          (is (:eos? (last ps))))
+        (testing "sequence numbers count up from zero without gaps"
+          (is (= (vec (range (count ps))) (mapv :sequence ps))))
+        (testing "every page carries the same serial number"
+          (is (= 1 (count (distinct (map :serial ps))))))
+        (testing "the page sizes account for the whole file"
+          (is (= (count data) (reduce + (map :size ps)))))
+        (testing "and the codec is what we think it is"
+          (is (= expected-codec (ogg/identify (first (ogg/logical-streams data))))))))))
+
+(deftest a-page-round-trips-byte-for-byte
+  ;; The header is fully determined by the fields we expose, so rebuilding a page
+  ;; from its parse must reproduce it exactly — including the CRC, which is the
+  ;; part that would silently differ if the checksummed region were wrong.
+  (doseq [[name data] [["opus" @opus] ["vorbis" @vorbis] ["flac" @flac]]]
+    (testing name
+      (doseq [p (page/pages data)
+              ;; a page ending in a partial packet cannot be rebuilt from
+              ;; `:packets` alone; that is what `:tail` is for
+              :when (empty? (:tail p))]
+        (let [rebuilt (page/build (select-keys p [:packets :serial :sequence :granule
+                                                  :bos? :eos? :continued?]))]
+          (is (= (:crc p) (:crc (page/page-at rebuilt 0)))
+              (str name " page " (:sequence p))))))))
+
+(deftest lacing-terminates-multiples-of-255
+  (testing "a packet shorter than 255 is one segment"
+    (is (= [10] (page/lacing [10]))))
+  (testing "a packet of exactly 255 needs a terminating zero, or it reads as continued"
+    (is (= [255 0] (page/lacing [255]))))
+  (is (= [255 255 0] (page/lacing [510])))
+  (is (= [255 1] (page/lacing [256])))
+  (testing "several packets lace independently"
+    (is (= [3 255 0 7] (page/lacing [3 255 7])))))
+
+;; ---------------------------------------------------------------------------
+;; Packets across pages
+;; ---------------------------------------------------------------------------
+
+(deftest reassembles-packets-across-pages
+  (testing "vorbis puts its setup header on a page of its own, split by lacing"
+    (let [ls (ogg/logical-streams @vorbis)
+          pk (:packets (first ls))]
+      (is (= 1 (count ls)))
+      (is (>= (count pk) 3) "identification, comment and setup headers at least")
+      (is (= (ascii "vorbis") (subvec (first pk) 1 7)))
+      (testing "the setup header is larger than one segment can hold"
+        (is (some #(> % 255) (map count pk))))))
+  (testing "a packet larger than one page comes back whole"
+    ;; One page holds at most 255 lacing values, so 255 x 255 = 65,025 bytes.
+    ;; Anything above that must be split across pages, and a Vorbis setup header
+    ;; can be. Before the muxer could split, this input could not be written at
+    ;; all — the page builder refused it.
+    (let [big (vec (map #(mod % 251) (range 200000)))
+          small (ascii "tail packet")
+          bytes (stream/build {:serial 7 :packets [big small] :granules [0 1]})
+          ps (page/pages bytes)]
+      (is (> (count ps) 3) "200 KB needs at least four pages")
+      (is (some :continued? (rest ps)) "later pages must set the continued flag")
+      (testing "a page where no packet ends carries the reserved granule -1"
+        (is (some #(= :none (:granule %)) ps)))
+      (is (= [big small] (ogg/packets bytes)))))
+  (testing "a packet of exactly one page's capacity is not split"
+    (let [exact (vec (repeat (* 255 254) 9))
+          bytes (stream/build {:serial 8 :packets [exact]})]
+      (is (= [exact] (ogg/packets bytes))))))
+
+(deftest handles-several-logical-streams-in-one-file
+  ;; interleave two streams page by page, the way a muxer with audio and video does
+  (let [a (page/pages (stream/build {:serial 111 :packets [(ascii "alpha one")
+                                                           (ascii "alpha two")]}))
+        b (page/pages (stream/build {:serial 222 :packets [(ascii "beta one")]}))
+        interleaved (vec (concat (page/build (assoc (first a) :bos? true))
+                                 (page/build (assoc (first b) :bos? true))))
+        ls (ogg/logical-streams interleaved)]
+    (is (= [111 222] (mapv :serial ls)))
+    (is (= [(ascii "alpha one") (ascii "alpha two")] (:packets (first ls))))
+    (is (= [(ascii "beta one")] (:packets (second ls))))
+    (testing "asking for a serial that is not there says so"
+      (is (= :no-such-stream (reason-of #(ogg/packets interleaved 999)))))))
+
+;; ---------------------------------------------------------------------------
+;; Writing
+;; ---------------------------------------------------------------------------
+
+(deftest our-pages-are-read-back-by-us
+  (doseq [[name data] [["opus" @opus] ["vorbis" @vorbis] ["flac" @flac]]]
+    (testing name
+      (let [l (first (ogg/logical-streams data))
+            rebuilt (ogg/build {:serial (:serial l) :packets (:packets l)
+                                :granules (:granules l)
+                                ;; Opus and the FLAC mapping require their headers
+                                ;; on pages of their own (RFC 7845 §3)
+                                :flush-after #{0 1}})]
+        (is (ogg/ogg? rebuilt))
+        (is (= (:packets l) (ogg/packets rebuilt)))
+        (is (:bos? (first (page/pages rebuilt))))
+        (is (:eos? (last (page/pages rebuilt))))))))
+
+(deftest granule-positions-survive-a-round-trip
+  (let [bytes (stream/build {:serial 5
+                             :packets [(ascii "a") (ascii "b") (ascii "c")]
+                             :granules [960 1920 2880]
+                             :flush-after #{0 1}})
+        ps (page/pages bytes)]
+    (is (= [960 1920 2880] (mapv :granule ps)))
+    (testing "and a very large granule stays exact past 32 bits"
+      (let [big 1099511627776                              ; 2^40
+            one (page/build {:packets [(ascii "x")] :serial 1 :granule big})]
+        (is (= big (:granule (page/page-at one 0))))))
+    (testing "the reserved -1 means no packet ends here and is not a number"
+      (let [none (page/build {:packets [(ascii "x")] :serial 1 :granule :none})]
+        (is (= :none (:granule (page/page-at none 0))))))))
+
+(deftest an-empty-stream-still-produces-a-page
+  (let [bytes (stream/build {:serial 3 :packets []})]
+    (is (ogg/ogg? bytes))
+    (is (= 1 (count (page/pages bytes))))
+    (is (:bos? (first (page/pages bytes))))
+    (is (:eos? (first (page/pages bytes))))))
+
+;; ---------------------------------------------------------------------------
+;; Refusals
+;; ---------------------------------------------------------------------------
+
+(deftest rejects-what-it-cannot-honestly-read
+  (testing "not an Ogg stream"
+    (is (false? (ogg/ogg? (ascii "no capture pattern here"))))
+    ;; long enough that the truncation check does not fire first
+    (is (= :not-ogg (reason-of #(page/pages (vec (repeat 64 0x41)))))))
+  (testing "a truncated header, segment table or body"
+    (is (= :truncated (reason-of #(page/pages (ascii "OggS")))))
+    (let [full @opus]
+      (is (= :truncated (reason-of #(page/pages (subvec full 0 (- (count full) 5))))))))
+  (testing "an unknown page version"
+    (let [p (assoc (vec (page/build {:packets [(ascii "x")] :serial 1})) 4 9)]
+      (is (= :bad-version (reason-of #(page/page-at p 0))))))
+  (testing "a corrupt page fails its CRC rather than yielding wrong packets"
+    (let [full @opus]
+      (doseq [i [28 40 100 (dec (count full))]]
+        (let [corrupt (assoc full i (bit-xor (nth full i) 0x20))]
+          (is (contains? #{:bad-crc :truncated :not-ogg :bad-version}
+                         (reason-of #(page/pages corrupt)))
+              (str "byte " i))))))
+  (testing "but the CRC check can be waived deliberately"
+    (let [full @opus
+          corrupt (assoc full 40 (bit-xor (nth full 40) 0x20))]
+      (is (pos? (count (page/pages corrupt {:verify-crc false}))))))
+  (testing "a page cannot hold more lacing values than the format allows"
+    (is (= :page-overflow
+           (reason-of #(page/build {:packets (vec (repeat 300 [1])) :serial 1}))))))

@@ -127,6 +127,7 @@ The bundled standard libraries live in this repository:
 | `org.w3.turtle` | `org.w3.turtle/src` | `` (an external specification, publisher w3.org) |
 | `org.w3.vc` | `org.w3.vc/src` | `` (an external specification, publisher w3.org) |
 | `org.opencontainers.distribution` | `org.opencontainers.distribution/src` | `kotobase.protocols.http`, `kotobase.protocols.oci`, `kotobase.protocols.oci.digest` (an external specification, publisher opencontainers.org) |
+| `org.xiph.ogg` | `org.xiph.ogg/src` | `ogg.core`, `ogg.crc`, `ogg.page`, `ogg.stream` (an external specification, publisher xiph.org) |
 | `kotoba.yotei` | `kotoba.yotei/src` | `` (Kotoba project library) |
 | `kotoba.x` | `kotoba.x/src` | `` (Kotoba project library) |
 | `kotoba.tsukasa` | `kotoba.tsukasa/src` | `` (Kotoba project library) |
