@@ -1,0 +1,360 @@
+;; test/sed_test.cljk -- build the command and compare it with the system sed,
+;; byte for byte, on stdout, stderr AND exit status.
+;;
+;; Every script here uses a LITERAL pattern. That is not a convenience: this
+;; has no regular expression engine, so a pattern containing a metacharacter
+;; means something different to the two implementations and comparing them
+;; would be comparing two different questions. `s/^/>/` is in the README as
+;; a named divergence rather than in this file as a case.
+
+(ns sed-test
+  (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
+
+(def cp (js/require "node:child_process"))
+
+(defn- run [cmd args opts]
+  (let [r (.spawnSync cp cmd (clj->js args)
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
+    {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
+
+(defn- refuse [message]
+  (println (pr-str {:ok false :phase :setup :message message}))
+  (.exit js/process 2))
+
+(def amu-home
+  (or (.-AMU_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." ".." "kotoba-lang" "amu")]
+        (when (.existsSync fs (.join path guess "bin" "amu")) guess))))
+
+(def system-sed "/usr/bin/sed")
+
+;; The regex engine this links: org-ieee-regex, a sibling checkout by default.
+(def regex-home
+  (or (.-REGEX_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." "org-ieee-regex")]
+        (when (.existsSync fs (.join path guess "regex" "core.kotoba")) guess))))
+
+(def fixtures
+  {"plain"  "aXbXc\nnope\nXstart\n"
+   "five"   "1\n2\n3\n4\n5"
+   "two"    "a\nb\n"
+   ;; Two occurrences on one line, so `g` and the default differ visibly.
+   "twice"  "XX\n"
+   ;; A replacement that CONTAINS the pattern, which is how a `g` that
+   ;; rescanned from the start instead of after the match would hang.
+   "loop"   "a\n"
+   "empty"  ""
+   ;; No trailing newline: sed keeps it that way.
+   "nonl"   "aXb"
+   ;; Multi-byte on both sides of the match.
+   "utf8"   "日X本\n"
+   ;; A line that is only the pattern.
+   "bare"   "X\n"
+   ;; A MULTI-character pattern, repeated. Every other fixture's pattern is
+   ;; one byte, which makes "advance past the match" and "advance one byte"
+   ;; the same thing -- so without this the scan-advance is untested, and a
+   ;; control that broke it passed all 29 other cases.
+   "runs"   "aaaa\n"
+   ;; --- regular expressions and addresses (2026-09-17) ---
+   "text"   "alpha 1\nbeta 22\n## A\nx\n## B\ny\n## A\nz\n"
+   "abc"    "abc\n"
+   "aaa"    "aaa\n"
+   "ab"     "ab\n"
+   "slash"  "a/b\nc\n"
+   "ansi"   "a\u001b[31mb\n"
+   "pad"    "  ab  \n"
+   "words"  "foo bar\n"
+   "abab"   "A\nB\nA\nB\nA\n"
+   "six"    "1\n2\n3\n4\n5\n6\n"
+   "tab"    "a\tb\n"
+   "html"   "<b>x</b> y\n"
+   "key"    "sk_live_abcdef123 x\n"
+   "diff"   "+added\n-removed\n+\n"
+   "uni"    "h\u00e9llo \u65e5\u672c\n"
+   "abcd"   "abcd\n" "xyz" "xyz\n" "a b" "a b\n" "aaab" "aaab\n"
+   "quoted" "foo \"bar\" baz\n" "offset" ":offset 42 x\nno\n" "fail" "FAIL in (x) (f:1) rest\n"
+   "keys"   "sk_live_abcdef123 and sk_test_zz9\n" "camel" "fooBarBaz\n" "uni2" "x\u65e5\u672cy\n"
+   "version" "v1.2.3\n"})
+
+(def cases
+  [["s/X/-/" "plain"] ["s/X/-/g" "plain"]
+   ["s/X/-/" "twice"] ["s/X/-/g" "twice"]
+   ;; No match anywhere: every line unchanged.
+   ["s/zz/-/" "plain"] ["s/zz/-/g" "plain"]
+   ;; An empty replacement deletes.
+   ["s/X//" "plain"] ["s/X//g" "plain"]
+   ;; The replacement contains the pattern. Under `g` the scan must continue
+   ;; AFTER the replacement, or this does not terminate.
+   ["s/a/aa/g" "loop"] ["s/a/aa/" "loop"]
+   ;; An empty file produces nothing.
+   ["s/X/-/" "empty"]
+   ;; The last line has no newline, and must still have none.
+   ["s/X/-/" "nonl"] ["s/X/-/g" "nonl"]
+   ;; Multi-byte either side of the match.
+   ["s/X/-/" "utf8"] ["s/日/Z/" "utf8"]
+   ;; A line that is exactly the pattern, replaced and deleted.
+   ["s/X/-/" "bare"] ["s/X//" "bare"]
+   ;; A delimiter that is not `/`.
+   ["s|X|-|" "plain"] ["s|X|-|g" "plain"]
+   ;; An empty pattern is refused, not treated as matching everywhere.
+   ["s//-/" "plain"]
+   ;; A missing operand.
+   ["s/X/-/" "missing"]
+   ;; Several operands: concatenated, and the unterminated one keeps its
+   ;; termination wherever it sits.
+   ["s/X/-/" "plain" "twice"] ["s/X/-/" "nonl" "plain"]
+   ["s/X/-/" "plain" "nonl"]
+   ;; A missing operand among readable ones: the readable ones are still
+   ;; written and the exit status is 1.
+   ["s/X/-/" "plain" "missing"] ["s/X/-/" "missing" "plain"]
+   ;; THE pair that distinguishes "another OPERAND follows" from "another
+   ;; LINE follows". An unterminated last line is closed only when a real
+   ;; line comes after it -- a missing or empty follower does not count, so
+   ;; both of these must stay unterminated. An implementation keying off the
+   ;; operand index passes every other multi-operand case and fails these.
+   ["s/X/-/" "nonl" "missing"] ["s/X/-/" "nonl" "empty"]
+   ;; And the empty operand in the middle, where a real line does follow.
+   ["s/X/-/" "nonl" "empty" "plain"]
+   ;; A two-character pattern over four repeats: `aa` twice, not `aa` then a
+   ;; leftover. This is the case that pins the scan advancing PAST the match
+   ;; rather than by one byte.
+   ["s/aa/X/g" "runs"] ["s/aa/X/" "runs"] ["s/aa/aab/g" "runs"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 52% of sed's invocations in agent tool use are a later pipeline
+   ;; segment (6,355 of 12,267 measured); `grep | sed` alone is 1,163.
+   {:argv ["s/X/-/"] :stdin "plain"}
+   {:argv ["s/X/-/g"] :stdin "plain"}
+   {:argv ["s/X/-/g"] :stdin "twice"}
+   {:argv ["s/X/-/"] :stdin "nonl"}
+   {:argv ["s/X/-/"] :stdin "empty"}
+   {:argv ["s/日/Z/"] :stdin "utf8"}
+   {:argv ["s/aa/aab/g"] :stdin "runs"}
+   {:argv ["s//-/"] :stdin "plain"}
+   ;; --- -n with line addresses (2026-09-17) --------------------------------
+   ;; `sed -n 'N,Mp'` is at least 12,700 of the 14,786 measured `sed -n`
+   ;; calls. Each semantics measured on /usr/bin/sed and compared here.
+   ["-n" "2,3p" "five"] ["-n" "4,$p" "five"] ["-n" "$p" "five"] ["-n" "2p" "five"] ["-n" "1p" "five"]
+   ["-n" "2p;4p" "five"] ["-n" "1,2p;2,3p" "five"] ["-n" "3,2p" "five"] ["-n" "9,12p" "five"]
+   ["-n" "0,2p" "five"] ["-n" "1, 3p" "five"] ["-n" "2,3 p" "five"] ["-n" "2,3p; 5p" "five"]
+   ["-n" "p" "two"] ["-n" "1,$p" "two"] ["-n" "2,3p" "five" "two"] ["-n" "5,6p" "five" "two"]
+   ["-n" "1p" "two" "five"] ["-n" "2,3p" "missing"] ["-n" "2,3p" "five" "missing"] ["-n" "6p" "five" "missing" "two"]
+   ["2,3p" "two"] ["2p;2p" "five"] ["-n" "$p" "empty"] ["-n" "1,3p" "empty"] ["-n" "2p" "nonl"]
+   {:argv ["-n" "2,3p"] :stdin "five"} {:argv ["-n" "$p"] :stdin "plain"} {:argv ["-n" "1,2p;2,3p"] :stdin "five"}
+   {:argv ["2,3p"] :stdin "two"} {:argv ["-n" "1,200p"] :stdin "plain"}
+   ;; --- regular expressions, /re/ addresses, d, p flag (2026-09-17) ---------
+   ;; Measured over 15,968 single-quoted agent sed scripts: `s` with a
+   ;; metacharacter 3,217 (+139 g, +102 -E, ~380 joined by `;`), `-n
+   ;; '/re/,/re/p'` 817, `/re/p` 59, `/re/d` 109, `-n 's/../p'` 113.
+   ;; Each semantics measured on /usr/bin/sed and compared here.
+   {:argv ["s/x*/-/g"] :stdin "abc"} {:argv ["s/b*/-/g"] :stdin "abc"} {:argv ["s/b*/-/"] :stdin "abc"}
+   {:argv ["s/^a/X/g"] :stdin "aaa"} {:argv ["s/a$/X/g"] :stdin "aaa"} {:argv ["s/./-/g"] :stdin "uni"}
+   {:argv ["s/b/[&]\\&/"] :stdin "ab"} {:argv ["s/a\\/b/X/"] :stdin "slash"} {:argv ["s|a/b|X|"] :stdin "slash"}
+   {:argv ["-E" "s/foo|bar/X/g"] :stdin "words"} {:argv ["s/foo|bar/X/g"] :stdin "words"}
+   {:argv ["s/\\x1b\\[[0-9;]*m//g"] :stdin "ansi"} {:argv ["s/^[[:space:]]*//;s/[[:space:]]*$//"] :stdin "pad"}
+   {:argv ["s/a/1/; s/b/2/"] :stdin "ab"} {:argv ["s/,/\\n/"] :stdin "abc"} {:argv ["s/b/\\n/"] :stdin "abc"}
+   {:argv ["s/\\t/T/"] :stdin "tab"} {:argv ["s/a/\\t/"] :stdin "ab"} {:argv ["-n" "/\\t/p"] :stdin "tab"}
+   {:argv ["s/<[^>]*>/ /g"] :stdin "html"} {:argv ["-E" "s/(sk_live_|sk_test_)[A-Za-z0-9_]+/<R>/g"] :stdin "key"}
+   {:argv ["s/^+//"] :stdin "diff"} {:argv ["/^-/d"] :stdin "diff"} {:argv ["-n" "/^+/p"] :stdin "diff"}
+   {:argv ["s//-/"] :stdin "abc"} {:argv ["-n" "//p"] :stdin "abc"}
+   {:argv ["-n" "s/a/X/gp"] :stdin "aaa"} {:argv ["s/a/b/p"] :stdin "ab"} {:argv ["-n" "s/z/b/p"] :stdin "ab"}
+   {:argv ["-n" "s/^[a-z]* \\([0-9]*\\)$/N/p"] :stdin "text"}
+   {:argv ["2s/a/X/"] :stdin "text"} {:argv ["/beta/s/a/X/g"] :stdin "text"} {:argv ["$d"] :stdin "text"}
+   {:argv ["-n" "/## A/,/## B/p"] :stdin "text"} {:argv ["-n" "/## A/,+1p"] :stdin "text"} {:argv ["-n" "2,/## B/p"] :stdin "text"}
+   {:argv ["-n" "/## A/,2p"] :stdin "text"} {:argv ["/^## /d"] :stdin "text"} {:argv ["-n" "/A/,/A/p"] :stdin "abab"}
+   {:argv ["-n" "/A/,/B/p"] :stdin "abab"} {:argv ["/A/,/B/s/^/> /"] :stdin "abab"} {:argv ["/A/,/B/d"] :stdin "abab"}
+   {:argv ["-n" "/1/p;/1/d;p"] :stdin "six"} {:argv ["/1/d;s/1/X/"] :stdin "six"} {:argv ["-n" "/2/,+2p"] :stdin "six"}
+   {:argv ["-n" "/2/,+0p"] :stdin "six"} {:argv ["-n" "/5/,+9p"] :stdin "six"} {:argv ["-n" "0,/2/p"] :stdin "six"}
+   {:argv ["-n" "/3/,1p"] :stdin "six"} {:argv ["-n" "2d;p"] :stdin "six"} {:argv ["-n" "2,3d"] :stdin "five"}
+   {:argv ["-n" "$p;1p"] :stdin "six"} {:argv ["-n" "/a\\/b/p"] :stdin "slash"}
+   {:argv ["-E" "-n" "/^ab+$/p"] :stdin "ab"} {:argv ["-nE" "/b+/p"] :stdin "ab"} {:argv ["-En" "/b+/p"] :stdin "ab"}
+   {:argv ["-e" "s/a/1/"] :stdin "ab"} {:argv ["s/*b/X/"] :stdin "abc"} {:argv ["s/a^b/X/"] :stdin "abc"}
+   {:argv ["s/X/-/"] :stdin "nonl"} {:argv ["p"] :stdin "nonl"} {:argv ["-n" "s/X/-/p"] :stdin "nonl"}
+   ;; --- back-references (2026-09-17, rx/captures): 387 measured uses --------
+   ;; The groups are macOS libc regex's greedy-first answers ((a|ab)(c|bcd)
+   ;; over abcd is [a][bcd]), measured on /usr/bin/sed and compared here.
+   {:argv ["-E" "s/(a|ab)(c|bcd)/[\\1][\\2]/"] :stdin "abcd"} {:argv ["-E" "s/(x*)(.*)/[\\1][\\2]/"] :stdin "xyz"}
+   {:argv ["-E" "s/(a*)(a*)/[\\1][\\2]/"] :stdin "aaa"} {:argv ["-E" "s/(a)|(b)/[\\1][\\2]/g"] :stdin "ab"}
+   {:argv ["s/.*\"\\(.*\\)\"/\\1/"] :stdin "quoted"} {:argv ["-n" "s/.*:offset \\([0-9]*\\).*/\\1/p"] :stdin "offset"}
+   {:argv ["-E" "s/^(FAIL|ERROR) in \\(([^)]*)\\) \\(([^:]*):.*/\\1 \\3 \\2/"] :stdin "fail"}
+   {:argv ["-E" "s/(sk_live_|sk_test_)[A-Za-z0-9_]+/\\1<R>/g"] :stdin "keys"} {:argv ["-E" "s/([a-z0-9])([A-Z])/\\1-\\2/g"] :stdin "camel"}
+   {:argv ["-E" "s/(a)(b)?/[\\1][\\2]/"] :stdin "ab"} {:argv ["-E" "s/(ab)*/[\\1]/"] :stdin "abab"} {:argv ["-E" "s/((a)b)/[\\1][\\2]/"] :stdin "ab"}
+   {:argv ["-E" "s/(a)+/[\\1]/"] :stdin "aaa"} {:argv ["-E" "s/(a) (b)/\\2 \\1 & \\\\1/"] :stdin "a b"} {:argv ["-E" "s/(日)(本)/[\\2\\1]/"] :stdin "uni2"}
+   {:argv ["s/\\(a\\)\\(b\\)/\\2\\1/"] :stdin "ab"} {:argv ["-E" "s/^v([0-9]+)\\.([0-9]+)\\.([0-9]+)$/\\1 \\2 \\3/"] :stdin "version"}
+   {:argv ["-E" "s/(a*)*b/[\\1]/"] :stdin "aaab"} {:argv ["-E" "s/(x)/\\1\\1\\1/g"] :stdin "ab"} {:argv ["-E" "s/a(b)?c?/[\\1]/"] :stdin "ab"}
+   {:argv ["s/a/\\1/"] :stdin "ab"} {:argv ["-E" "s/(a)/\\2/"] :stdin "ab"} {:argv ["s/\\(a\\)/\\1/p"] :stdin "ab"}
+   ["-n" "/X/p" "plain" "nonl"] ["/X/d" "plain" "two"] ["s/^/> /" "nonl" "empty" "plain"]
+   ["-n" "/a/,/b/p" "two" "five"] ["s/[0-9]/N/g" "five" "missing" "two"]])
+
+;; A behaviour this deliberately does NOT share byte for byte: a bad
+;; substitute flag. /usr/bin/sed names the script and the flag (`sed: 1:
+;; "s/X/-/q\n": bad flag in substitute command: 'q'`); this refuses with its
+;; generic "unsupported script", exit 1 -- the same exit, nothing on stdout.
+;; Written out rather than compared, and here because until 2026-09-16 the
+;; flag was not checked at all and `s/X/-/q` substituted as if unflagged.
+(def divergences
+  [{:argv ["s/X/-/q"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
+   {:argv ["s/X/-/gg"] :stdin "plain" :out "" :err "sed: unsupported script\n" :exit 1}
+   ;; Another command letter is refused, where /usr/bin/sed would run it.
+   {:argv ["-n" "2,3x"] :stdin "five" :out "" :err "sed: unsupported script\n" :exit 1}
+   ;; A bad pattern: the exit and the shape are /usr/bin/sed's, the message
+   ;; after `RE error:` is the engine's own.
+   {:argv ["s/a\\{/b/"] :stdin "ab" :out "" :err "sed: 1: \"s/a\\{/b/\n\": RE error: braces { } not balanced\n" :exit 1}
+   ;; Two `+N` ranges: one countdown is kept.
+   {:argv ["-n" "/1/,+1p;/4/,+0p"] :stdin "six" :out "" :err "sed: unsupported script: two +N addresses\n" :exit 1}
+   ;; BRE `\+` is one-or-more here, as /usr/bin/grep reads it; /usr/bin/sed
+   ;; reads a literal `+` (17 measured uses, every one written for the GNU
+   ;; meaning and silently a no-op on macOS).
+   {:argv ["s/a\\+/X/"] :stdin "aaa" :out "X\n" :err "" :exit 0}
+   ;; Likewise BRE `\|`: alternation here and in /usr/bin/grep, a literal
+   ;; `|` in /usr/bin/sed (the measured `/A\|B\|C/,+18p` wants alternation).
+   {:argv ["s/foo\\|bar/X/g"] :stdin "words" :out "X X\n" :err "" :exit 0}])
+
+;; --- in place (2026-09-17) --------------------------------------------------
+;; `sed -i ''` is 1,029 of the 15,968 measured scripts (`-i.bak` once).
+;; Each case runs in a FRESH copy of the fixtures, with the working
+;; directory inside it and the operands RELATIVE -- the way agents write
+;; them (99,826 relative to 17,104 absolute file operands measured), which
+;; the loader resolves against the start directory since amu #1023. Both
+;; binaries run the same argv; then stdout, stderr, the exit status and
+;; every fixture's bytes and mode are compared. Semantics measured on
+;; /usr/bin/sed: each operand is its own stream (`$` and line numbers
+;; restart), the mode is kept, nothing reaches stdout, a missing operand or
+;; a directory STOPS the run after the operands before it were edited,
+;; `-i` with no operand is refused, the argument after `-i` is the backup
+;; suffix (`sed -i 's/a/b/' f` takes the script as the suffix).
+(def in-place-cases
+  [["-i" "" "s/X/-/" "plain"] ["-i" "" "s/X/-/g" "plain" "twice"] ["-i" "" "s/X/-/" "nonl"]
+   ["-i" "" "s/X/-/" "utf8" "bare"] ["-i" "" "s/X/-/" "empty"] ["-i" "" "s/X/-/" "missing" "plain"]
+   ["-i" "" "s/X/-/" "plain" "missing" "twice"] ["-i" "" "s/X/-/" "plain" "dir" "twice"]
+   ["-n" "-i" "" "2p" "five"] ["-i" "" "-n" "$p" "five" "two"] ["-i" "" "/^#/d" "text"]
+   ["-i" "" "-e" "s/2/8/" "five"] ["-i.bak" "s/2/6/" "five"] ["-i" "" "s/X/-/" "./plain"]
+   ["-E" "-i" "" "s/[0-9]+/N/g" "five"] ["-i" "" "s/^/> /" "two" "nonl"]
+   ["-i" "" "s/x/y/"] ["-i" "" "1,2d" "text"] ["-i" "" "s/a/b/" "dir"]])
+
+;; `sed -i 's/1/9/' five` (no suffix argument) takes the script as the suffix
+;; and `five` as the script: both refuse, exit 1, /usr/bin/sed naming the
+;; command code and this saying "unsupported script" -- the generic message
+;; divergence above, so it is written out here rather than compared.
+(def in-place-divergences
+  [{:argv ["-i" "s/1/9/" "five"] :err "sed: unsupported script\n" :exit 1}])
+
+(when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
+(let [amu (.join path amu-home "bin" "amu")
+      ;; `.cljk`, run through amu's own kbb: the `.cljs` spelling this named
+      ;; until 2026-09-15 no longer exists (the cljk rename), so the suite
+      ;; could not have run since.
+      packager (.join path amu-home "scripts" "package-command.cljk")
+      kbb (.join path amu-home "bin" "kbb")]
+  (when-not (.existsSync fs amu) (refuse (str "no amu at " amu)))
+  (when-not (.existsSync fs packager) (refuse (str "no packager at " packager)))
+  (when-not (.existsSync fs system-sed) (refuse (str "no " system-sed " to compare against")))
+  (let [tmp (.mkdtempSync fs (.join path (.tmpdir os) "org-ieee-sed-"))
+        src (.resolve path (.cwd js/process) "sed" "core.kotoba")
+        policy (.join path tmp "policy.edn")
+        kexe (.join path tmp "sed.kexe")
+        blob (.join path tmp "sed.bin")
+        exe (.join path tmp "sed")
+        data (.join path tmp "data")]
+    (.writeFileSync fs policy
+                    "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
+    (.mkdirSync fs data)
+    (doseq [[name content] fixtures]
+      (.writeFileSync fs (.join path data name) content "utf8"))
+    (when-not regex-home (refuse "set REGEX_HOME to an org-ieee-regex checkout"))
+    (let [c (run "node" [amu "compile" src "--source-path" (.resolve path (.cwd js/process))
+                         "--source-path" regex-home "--target" "aarch64-macos" "--jvm-free"
+                         "--policy" policy "--output" kexe] {})]
+      (when (not= 0 (:status c))
+        (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
+    (let [e (run "node" [amu "extract-native" kexe "--symbol" "main" "--output" blob] {})
+          _ (when (not= 0 (:status e)) (refuse (str "extract failed: " (str (:err e)))))
+          report (str (:out e))
+          offset (second (re-find #":offset (\d+)" report))]
+      (when-not offset (refuse (str "no :offset in the extract report: " report)))
+      (let [p (run "node" [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
+                          "--allow" "35,37,38,39,41"
+                          "--fs-scope" (.realpathSync fs tmp)
+                          "--string-pool" "4000000" "--fuel" "50000000"
+                          "--pairs" "200000" "--output" exe] {})]
+        (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))))
+
+    (let [real (.realpathSync fs data)
+          results
+          (for [case cases]
+            ;; The first element is the SCRIPT and every one after it a path.
+            ;; A map case {:argv [SCRIPT] :stdin FIXTURE} feeds the fixture as
+            ;; standard input to BOTH binaries (a Buffer: spawnSync applies
+            ;; :encoding "buffer" to a string input and node refuses it).
+            (let [names (if (map? case) (:argv case) case)
+                  input (when (map? case)
+                          (let [v (get fixtures (:stdin case))]
+                            (if (string? v) v (refuse (str "no fixture " (:stdin case))))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  ;; `[-n|-E|-e]... SCRIPT FILE...`: the options and the
+                  ;; script pass through, the rest are paths.
+                  nhead (inc (count (take-while #(str/starts-with? % "-") names)))
+                  argv (into (vec (take nhead names))
+                             (mapv #(.join path real %) (drop nhead names)))
+                  k (run exe argv opts)
+                  s (run system-sed argv opts)
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s)))]
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
+               :system (.toString (:out s) "utf8")
+               :exit [(:status k) (:status s)]}))
+          div-results
+          (for [d divergences]
+            (let [k (run exe (:argv d) {:input (js/Buffer.from (get fixtures (:stdin d)) "utf8")})
+                  ok? (and (= (.toString (:out k) "utf8") (:out d))
+                           (= (.toString (:err k) "utf8") (:err d))
+                           (= (:status k) (:exit d)))]
+              {:argv [(:argv d) :divergence] :ok ok? :kotoba (.toString (:out k) "utf8")
+               :system (str "(not compared; expected stderr " (pr-str (:err d)) ")")
+               :exit [(:status k) (:exit d)]}))
+          ;; Each in-place case: two fresh fixture trees, the same argv run
+          ;; with the working directory inside each, then everything compared.
+          in-place-results
+          (for [argv in-place-cases]
+            (let [tree (fn [tag]
+                         (let [d (.mkdtempSync fs (.join path tmp (str "inplace-" tag "-")))]
+                           (doseq [[name content] fixtures]
+                             (.writeFileSync fs (.join path d name) content "utf8"))
+                           (.chmodSync fs (.join path d "five") 0640)
+                           (.mkdirSync fs (.join path d "dir"))
+                           d))
+                  snapshot (fn [d]
+                             (into (sorted-map)
+                                   (for [n (.readdirSync fs d)]
+                                     (let [st (.statSync fs (.join path d n))]
+                                       [n (if (.isDirectory st) "<dir>"
+                                            [(.toString (.readFileSync fs (.join path d n)) "base64")
+                                             (bit-and (.-mode st) 0777)])]))))
+                  dk (tree "k") ds (tree "s")
+                  k (run exe argv {:cwd dk})
+                  s (run system-sed argv {:cwd ds})
+                  same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
+                             (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
+                             (= (:status k) (:status s))
+                             (= (snapshot dk) (snapshot ds)))]
+              {:argv (into [:in-place] argv) :ok same?
+               :kotoba (str (.toString (:err k) "utf8") (pr-str (snapshot dk)))
+               :system (str (.toString (:err s) "utf8") (pr-str (snapshot ds)))
+               :exit [(:status k) (:status s)]}))
+          in-place-div-results
+          (for [d in-place-divergences]
+            (let [k (run exe (:argv d) {:cwd tmp})
+                  ok? (and (= "" (.toString (:out k) "utf8")) (= (:err d) (.toString (:err k) "utf8")) (= (:exit d) (:status k)))]
+              {:argv (into [:in-place (:argv d)] [:divergence]) :ok ok? :kotoba (.toString (:err k) "utf8")
+               :system (str "(not compared; expected stderr " (pr-str (:err d)) ")") :exit [(:status k) (:exit d)]}))
+          results (concat results div-results in-place-results in-place-div-results)
+          bad (remove :ok results)]
+      (doseq [r results]
+        (println (str (if (:ok r) "  ok   " "  FAIL ") (pr-str (:argv r))
+                      " -> " (pr-str (:kotoba r))
+                      (when-not (:ok r)
+                        (str " but " system-sed " says " (pr-str (:system r))
+                             " exits " (pr-str (:exit r)))))))
+      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (.exit js/process (if (seq bad) 1 0)))))
