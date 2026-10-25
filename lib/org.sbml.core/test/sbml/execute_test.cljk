@@ -1,0 +1,111 @@
+(ns sbml.execute-test
+  (:require #?(:clj [kotoba.test :refer [deftest is testing]]
+               :cljs [cljs.test :refer-macros [deftest is testing]])
+            [sbml.model :as m]
+            [sbml.execute :as ex]))
+
+(defn- close? [a b tol] (< (Math/abs (- a b)) tol))
+
+;; A -> B, mass-action kinetics rate = k*[A] (k=0.1, hasOnlySubstanceUnits so
+;; species values ARE amounts, no compartment-size conversion needed):
+;; dA/dt = -k*A, dB/dt = +k*A. Closed form: A(t) = A0 * e^(-k*t), B(t) = A0 - A(t).
+(defn- decay-model []
+  (-> (m/model "decay")
+      (m/add-compartment (m/compartment "cell" {:sbml/size 1.0}))
+      (m/add-species (m/species "A" "cell" {:sbml/initial-amount 100.0 :sbml/has-only-substance-units? true}))
+      (m/add-species (m/species "B" "cell" {:sbml/initial-amount 0.0 :sbml/has-only-substance-units? true}))
+      (m/add-parameter (m/parameter "k" {:sbml/value 0.1}))
+      (m/add-reaction (-> (m/reaction "r1")
+                          (assoc :sbml/reactants [(m/species-ref "A")]
+                                 :sbml/products [(m/species-ref "B")]
+                                 :sbml/kinetic-law (m/kinetic-law [:apply :times [[:ci "k"] [:ci "A"]]]))))))
+
+(deftest exponential-decay-matches-analytic-solution
+  (testing "rk4 (dt=0.01) is much closer to the analytic solution than euler, sec 4.11.7 mass-action rate"
+    (let [k 0.1 a0 100.0 t 10.0
+          exact-a (* a0 (Math/exp (- (* k t))))
+          rk4-a (last (get-in (ex/run (decay-model) {:start 0.0 :stop t :dt 0.01 :method :rk4})
+                               [:sbml/series "A"]))
+          euler-a (last (get-in (ex/run (decay-model) {:start 0.0 :stop t :dt 0.01 :method :euler})
+                                 [:sbml/series "A"]))]
+      (is (close? exact-a rk4-a (* exact-a 1.0e-6)) (str "rk4 A(10)=" rk4-a " exact=" exact-a))
+      (is (close? exact-a euler-a (* exact-a 1.0e-2)) (str "euler A(10)=" euler-a " exact=" exact-a))
+      (is (< (Math/abs (- exact-a rk4-a)) (Math/abs (- exact-a euler-a)))
+          "rk4 must be strictly closer to the analytic solution than euler"))))
+
+(deftest mass-balance-holds
+  (testing "A + B is conserved (no source/sink other than the A->B reaction)"
+    (let [result (ex/run (decay-model) {:start 0.0 :stop 10.0 :dt 0.1 :method :rk4})
+          a (get-in result [:sbml/series "A"])
+          b (get-in result [:sbml/series "B"])]
+      (doseq [[av bv] (map vector a b)]
+        (is (close? 100.0 (+ av bv) 1.0e-6))))))
+
+(deftest concentration-conversion
+  (testing "sec 4.6.4/4.6.5: a species with hasOnlySubstanceUnits=false is tracked as amount but
+            exposed to math (and to :sbml/series here) as amount/compartment-size"
+    (let [model (-> (m/model "conc")
+                    (m/add-compartment (m/compartment "c" {:sbml/size 2.0}))
+                    (m/add-species (m/species "A" "c" {:sbml/initial-concentration 50.0}))
+                    (m/add-species (m/species "B" "c" {:sbml/initial-amount 0.0}))
+                    (m/add-parameter (m/parameter "k" {:sbml/value 0.0}))
+                    (m/add-reaction (-> (m/reaction "r")
+                                        (assoc :sbml/reactants [(m/species-ref "A")]
+                                               :sbml/products [(m/species-ref "B")]
+                                               :sbml/kinetic-law (m/kinetic-law [:apply :times [[:ci "k"] [:ci "A"]]])))))
+          result (ex/run model {:start 0.0 :stop 1.0 :dt 1.0 :method :euler})]
+      (is (= 50.0 (first (get-in result [:sbml/series "A"])))
+          "initial-concentration 50 with size 2 => amount 100, but series reports concentration (=amount/size=50)"))))
+
+(deftest rate-rule-linear-ramp
+  (testing "sec 4.9.4: RateRule integrates a parameter's value directly"
+    (let [model (-> (m/model "ramp")
+                    (m/add-parameter (m/parameter "P" {:sbml/value 0.0 :sbml/constant false}))
+                    (m/add-rule (m/rate-rule "P" [:cn 2.0])))
+          result (ex/run model {:start 0.0 :stop 5.0 :dt 0.5 :method :rk4})]
+      (is (close? 10.0 (last (get-in result [:sbml/series "P"])) 1.0e-9)))))
+
+(deftest assignment-rule-is-algebraic-each-tick
+  (testing "sec 4.9.3: AssignmentRule recomputes a variable's value from current state every tick"
+    (let [model (-> (m/model "algebraic")
+                    (m/add-parameter (m/parameter "P" {:sbml/value 0.0 :sbml/constant false}))
+                    (m/add-parameter (m/parameter "Q" {:sbml/value 0.0 :sbml/constant false}))
+                    (m/add-rule (m/rate-rule "P" [:cn 1.0]))
+                    (m/add-rule (m/assignment-rule "Q" [:apply :times [[:cn 3.0] [:ci "P"]]])))
+          result (ex/run model {:start 0.0 :stop 4.0 :dt 1.0 :method :rk4})
+          p (get-in result [:sbml/series "P"])
+          q (get-in result [:sbml/series "Q"])]
+      (doseq [[pv qv] (map vector p q)]
+        (is (close? (* 3.0 pv) qv 1.0e-9))))))
+
+(deftest fixed-species-never-changes
+  (let [model (-> (m/model "fixed")
+                  (m/add-compartment (m/compartment "c" {:sbml/size 1.0}))
+                  (m/add-species (m/species "A" "c" {:sbml/initial-amount 5.0 :sbml/constant true})))
+        result (ex/run model {:start 0.0 :stop 3.0 :dt 1.0 :method :euler})]
+    (is (every? #(= 5.0 %) (get-in result [:sbml/series "A"])))))
+
+(deftest reaction-with-no-kinetic-law-throws
+  (let [model (-> (m/model "m")
+                  (m/add-compartment (m/compartment "c" {:sbml/size 1.0}))
+                  (m/add-species (m/species "A" "c" {:sbml/initial-amount 1.0}))
+                  (m/add-reaction (-> (m/reaction "r") (assoc :sbml/reactants [(m/species-ref "A")]))))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (ex/run model {:start 0.0 :stop 1.0 :dt 1.0})))))
+
+(deftest algebraic-rule-not-yet-executable-throws
+  (let [model (-> (m/model "m") (m/add-rule (m/algebraic-rule [:cn 0.0])))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (ex/run model {:start 0.0 :stop 1.0 :dt 1.0})))))
+
+(deftest event-not-yet-executable-throws
+  (let [model (-> (m/model "m") (m/add-event {:sbml/use-values-from-trigger-time? true}))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (ex/run model {:start 0.0 :stop 1.0 :dt 1.0})))))
+
+(deftest compartment-governed-by-rule-throws
+  (let [model (-> (m/model "m")
+                  (m/add-compartment (m/compartment "c" {:sbml/size 1.0 :sbml/constant false}))
+                  (m/add-rule (m/rate-rule "c" [:cn 1.0])))]
+    (is (thrown? #?(:clj Exception :cljs js/Error)
+                 (ex/run model {:start 0.0 :stop 1.0 :dt 1.0})))))

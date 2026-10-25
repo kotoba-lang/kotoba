@@ -1,0 +1,307 @@
+(ns sbml.execute
+  "A pure fixed-step simulator for sbml.model reaction networks: Euler or
+  classical RK4 integration of the species-amount ODE system implied by a
+  model's reactions (sec 4.11.7's mass-action-style extent equations),
+  AssignmentRule/RateRule-governed variables (sec 4.9.3/4.9.4), evaluated via
+  sbml.mathml. Assumes the model has already passed sbml.validate/validate
+  with no :error problems -- a model with dangling refs or algebraic loops
+  will throw here rather than silently produce wrong numbers.
+
+  Unlike OASIS XMILE, an SBML <model> carries no embedded start/stop/dt/
+  method -- that is a SED-ML concern, out of scope here -- so `run` takes
+  those as an explicit options map.
+
+  Variable classification (see also README Follow-ups for what's out of
+  scope):
+    - A species with an AssignmentRule/RateRule is governed by it (sec
+      4.9.3/4.9.4); otherwise, if it is not :sbml/constant and not
+      :sbml/boundary-condition?, its amount is governed by the net
+      stoichiometry-weighted sum of the KineticLaw rates of every reaction
+      it participates in as reactant/product (sec 4.11.7) -- exactly the
+      ODE-integration role XMILE's stocks play, and the code structure below
+      (topo-sort + Euler/RK4) is a direct transplant of xmile.execute's.
+    - A RateRule-governed species/parameter's state IS its `ci`-visible
+      value directly (concentration or amount, whichever
+      :sbml/has-only-substance-units? dictates for species, sec 4.9.4) --
+      integrated directly, no stoichiometry involved.
+    - An AssignmentRule-governed species/parameter is algebraic (recomputed
+      every tick in dependency order, exactly like XMILE flows/auxs) --
+      never has its own persistent integration state.
+    - Everything else (:sbml/constant, or :sbml/boundary-condition? with no
+      rule, or a parameter with no rule) is fixed at its initial value for
+      the whole run.
+    - Compartment sizes are ALWAYS fixed at :sbml/size in this v1 (every
+      compartment referenced by a converted species must have one) -- a
+      compartment targeted by an AssignmentRule/RateRule is a v2 scope-out
+      (see README); `run` throws rather than ignore it.
+
+  Species amount<->concentration conversion (sec 4.6.4/4.6.5/4.6.8) uses
+  the compartment's *fixed* size; a dynamically-resized compartment's
+  effect on species concentration (sec 4.6.8) is therefore not modeled --
+  documented v2 scope-out, consistent with the compartment-fixed-size
+  decision above."
+  (:require [kotoba.lang.coll :as set]
+            [sbml.model :as m]
+            [sbml.mathml :as mathml]))
+
+(defn- m-round [x] #?(:clj (Math/round (double x)) :cljs (js/Math.round x)))
+
+;; --- classification ---
+
+(defn assignment-governed-ids [model] (set (map :sbml/variable (m/assignment-rules model))))
+(defn rate-governed-ids [model] (set (map :sbml/variable (m/rate-rules model))))
+
+(defn reaction-driven-species-ids
+  "Species whose amount is governed by reactions (sec 4.11.7): not
+  :sbml/constant, not :sbml/boundary-condition?, and not claimed by an
+  Assignment/RateRule."
+  [model]
+  (let [governed (into (assignment-governed-ids model) (rate-governed-ids model))]
+    (set (for [s (m/all-species model)
+               :let [id (:sbml/id s)]
+               :when (and (not (:sbml/constant s)) (not (:sbml/boundary-condition? s))
+                          (not (contains? governed id)))]
+           id))))
+
+(defn- fixed-ids [ids governed reaction-driven]
+  (set/difference ids governed reaction-driven))
+
+(defn- rate-rule-for [model id] (some #(when (= id (:sbml/variable %)) %) (m/rate-rules model)))
+(defn- assignment-rule-for [model id] (some #(when (= id (:sbml/variable %)) %) (m/assignment-rules model)))
+
+;; --- compartment size (always fixed in v1, see namespace docstring) ---
+
+(defn- compartment-size [model comp-id]
+  (let [c (m/lookup-compartment model comp-id)]
+    (if (and c (contains? c :sbml/size))
+      (:sbml/size c)
+      (throw (ex-info "sbml.execute: compartment has no :sbml/size (required to convert species amount<->concentration)"
+                       {:compartment comp-id})))))
+
+(defn- ci-value-of-amount [model species amount]
+  (if (:sbml/has-only-substance-units? species)
+    amount
+    (/ amount (compartment-size model (:sbml/compartment species)))))
+
+;; --- initial values (mirrors xmile.execute/initial-stocks in spirit) ---
+
+(defn- species-initial-ci-value
+  "sec 4.6.4: initial-amount/initial-concentration are mutually exclusive;
+  converts whichever is given into the `ci`-visible value (amount or
+  concentration, per :sbml/has-only-substance-units?)."
+  [model s]
+  (cond
+    (contains? s :sbml/initial-amount)
+    (if (:sbml/has-only-substance-units? s)
+      (:sbml/initial-amount s)
+      (/ (:sbml/initial-amount s) (compartment-size model (:sbml/compartment s))))
+    (contains? s :sbml/initial-concentration)
+    (if (:sbml/has-only-substance-units? s)
+      (* (:sbml/initial-concentration s) (compartment-size model (:sbml/compartment s)))
+      (:sbml/initial-concentration s))
+    :else (throw (ex-info "sbml.execute: species has neither :sbml/initial-amount nor :sbml/initial-concentration"
+                           {:species (:sbml/id s)}))))
+
+(defn- species-initial-amount [model s]
+  (cond
+    (contains? s :sbml/initial-amount) (:sbml/initial-amount s)
+    (contains? s :sbml/initial-concentration) (* (:sbml/initial-concentration s) (compartment-size model (:sbml/compartment s)))
+    :else (throw (ex-info "sbml.execute: species has neither :sbml/initial-amount nor :sbml/initial-concentration"
+                           {:species (:sbml/id s)}))))
+
+(defn- parameter-value [p]
+  (if (contains? p :sbml/value)
+    (:sbml/value p)
+    (throw (ex-info "sbml.execute: parameter has no :sbml/value" {:parameter (:sbml/id p)}))))
+
+(defn initial-state
+  "{id -> number}: reaction-driven species tracked as AMOUNT; RateRule-
+  governed species/parameters and fixed species/parameters tracked as their
+  `ci`-visible value directly (see namespace docstring)."
+  [model]
+  (let [rate-driven (rate-governed-ids model)
+        reaction-driven (reaction-driven-species-ids model)
+        assign (assignment-governed-ids model)
+        fixed-species (fixed-ids (m/species-ids model) assign (into rate-driven reaction-driven))
+        fixed-params (fixed-ids (m/parameter-ids model) assign rate-driven)]
+    (into {}
+          (concat
+           (for [id reaction-driven] [id (species-initial-amount model (m/lookup-species model id))])
+           (for [id (set/intersection rate-driven (m/species-ids model))]
+             [id (species-initial-ci-value model (m/lookup-species model id))])
+           (for [id (set/intersection rate-driven (m/parameter-ids model))]
+             [id (parameter-value (m/lookup-parameter model id))])
+           (for [id fixed-species] [id (species-initial-ci-value model (m/lookup-species model id))])
+           (for [id fixed-params] [id (parameter-value (m/lookup-parameter model id))])))))
+
+;; --- per-step environment ---
+
+(defn- state->known-env
+  "Everything except assignment-governed variables: reserved \"time\",
+  every compartment's fixed size, and `state` converted to `ci`-values
+  (reaction-driven species amounts are converted; everything else in
+  `state` already IS a `ci`-value)."
+  [model state t reaction-driven]
+  (merge {"time" t}
+         (into {} (for [c (m/compartments model)] [(:sbml/id c) (compartment-size model (:sbml/id c))]))
+         (into {} (for [[id v] state]
+                    [id (if (contains? reaction-driven id)
+                          (ci-value-of-amount model (m/lookup-species model id) v)
+                          v)]))))
+
+(defn assign-topo-order
+  "Dependency order among AssignmentRule variables (species/parameters),
+  exactly xmile.execute/topo-order transplanted onto sbml.model: edges are
+  an assignment rule's math free-vars restricted to other assignment-
+  governed ids (refs to species/compartments/parameters/local-parameters
+  that are NOT themselves assignment-governed are already-known leaves, no
+  ordering hazard). Throws on a cycle -- sbml.validate should already have
+  caught this; execute never guesses an order."
+  [model]
+  (let [governed (assignment-governed-ids model)
+        deps (into {} (for [r (m/assignment-rules model)]
+                        [(:sbml/variable r) (set/intersection governed (mathml/free-vars (:sbml/math r)))]))
+        order (atom []) color (atom {})]
+    (letfn [(visit [n]
+              (case (get @color n :white)
+                :black nil
+                :gray (throw (ex-info "sbml.execute: cyclic AssignmentRule dependency" {:at n}))
+                :white (do (swap! color assoc n :gray)
+                           (doseq [d (get deps n)] (visit d))
+                           (swap! color assoc n :black)
+                           (swap! order conj n))))]
+      (doseq [n (keys deps)] (visit n))
+      @order)))
+
+(defn eval-assignment-vars
+  "Extend `known-env` with every AssignmentRule variable's value, evaluated
+  in `assign-order` (mirrors xmile.execute/eval-non-stocks)."
+  [model assign-order known-env]
+  (reduce (fn [env variable]
+            (let [rule (assignment-rule-for model variable)]
+              (assoc env variable (mathml/eval-expr (:sbml/math rule) env))))
+          known-env
+          assign-order))
+
+(defn- local-env [r env]
+  (reduce (fn [e lp] (assoc e (:sbml/id lp) (parameter-value lp))) env (m/local-parameters-of r)))
+
+(defn reaction-rate
+  "Evaluate a reaction's KineticLaw math (sec 4.11.5) against `env` (with
+  that reaction's own LocalParameters, sec 4.11.6, shadowing any identical
+  global identifier). Throws if the reaction has no KineticLaw -- an
+  SBML-valid but undefined-rate reaction cannot be simulated (sec 4.11.1
+  explicitly declines to standardize a fallback)."
+  [r env]
+  (if-let [kl (m/kinetic-law-of r)]
+    (mathml/eval-expr (:sbml/math kl) (local-env r env))
+    (throw (ex-info "sbml.execute: reaction has no kineticLaw math -- rate is undefined"
+                     {:reaction (:sbml/id r)}))))
+
+(defn- stoich-of [sr] (:sbml/stoichiometry sr 1.0))
+
+(defn- net-stoichiometry
+  "products minus reactants (sec 4.11.3 'effective stoichiometry'); a
+  species repeated across entries sums."
+  [species-id r]
+  (- (reduce + 0.0 (keep #(when (= species-id (:sbml/species %)) (stoich-of %)) (m/products r)))
+     (reduce + 0.0 (keep #(when (= species-id (:sbml/species %)) (stoich-of %)) (m/reactants r)))))
+
+(defn full-env
+  "The complete {id -> ci-value} environment at (t, state): known-env plus
+  every AssignmentRule variable's current value. This is what
+  sbml.execute/run records per-tick and what KineticLaw/RateRule math is
+  evaluated against."
+  [model state t]
+  (eval-assignment-vars model (assign-topo-order model)
+                         (state->known-env model state t (reaction-driven-species-ids model))))
+
+(defn derivatives
+  "{id -> d(id)/dt} at (t, state): RateRule-governed species/parameters
+  evaluate their rule's math directly; reaction-driven species sum
+  net-stoichiometry * reaction-rate over every reaction they participate in.
+  Fixed variables have no entry (integration leaves them unchanged, exactly
+  xmile.execute/vec+'s `(get b k 0.0)` default)."
+  [model state t]
+  (let [env (full-env model state t)
+        reaction-driven (reaction-driven-species-ids model)
+        rate-driven (rate-governed-ids model)
+        rates (into {} (for [r (m/reactions model)] [(:sbml/id r) (reaction-rate r env)]))]
+    (into {}
+          (concat
+           (for [id rate-driven]
+             [id (mathml/eval-expr (:sbml/math (rate-rule-for model id)) env)])
+           (for [sid reaction-driven]
+             [sid (reduce + 0.0
+                          (for [r (m/reactions model)
+                                :let [net (net-stoichiometry sid r)]
+                                :when (not (zero? net))]
+                            (* net (get rates (:sbml/id r)))))])))))
+
+;; --- integration (transplanted from xmile.execute) ---
+
+(defn- vec+ [a b scale] (into {} (for [[k v] a] [k (+ v (* scale (get b k 0.0)))])))
+
+(defn- euler-step [model state t dt]
+  (vec+ state (derivatives model state t) dt))
+
+(defn- rk4-step [model state t dt]
+  (let [k1 (derivatives model state t)
+        y2 (vec+ state k1 (/ dt 2.0))
+        k2 (derivatives model y2 (+ t (/ dt 2.0)))
+        y3 (vec+ state k2 (/ dt 2.0))
+        k3 (derivatives model y3 (+ t (/ dt 2.0)))
+        y4 (vec+ state k3 dt)
+        k4 (derivatives model y4 (+ t dt))]
+    (into {} (for [[nm y] state]
+               [nm (+ y (* (/ dt 6.0)
+                           (+ (get k1 nm 0.0) (* 2 (get k2 nm 0.0))
+                              (* 2 (get k3 nm 0.0)) (get k4 nm 0.0))))]))))
+
+(defn- assert-executable! [model]
+  (let [governed (into (assignment-governed-ids model) (rate-governed-ids model))]
+    (doseq [cid (m/compartment-ids model)]
+      (when (contains? governed cid)
+        (throw (ex-info "sbml.execute: compartment governed by a Rule -- dynamic compartment size not yet simulated (v2)"
+                         {:compartment cid}))))
+    (doseq [v (concat (m/assignment-rules model) (m/rate-rules model))]
+      (let [variable (:sbml/variable v)]
+        (when-not (or (contains? (m/species-ids model) variable) (contains? (m/parameter-ids model) variable))
+          (throw (ex-info "sbml.execute: rule variable is not a species or parameter -- not yet simulated (v2)"
+                           {:variable variable}))))))
+  (when (seq (m/algebraic-rules model))
+    (throw (ex-info "sbml.execute: AlgebraicRule present -- full DAE solving not implemented (v2)" {})))
+  (when (seq (m/events model))
+    (throw (ex-info "sbml.execute: Event(s) present -- not yet simulated (v2)" {})))
+  (doseq [r (m/reactions model)]
+    (when-not (m/has-kinetic-law? r)
+      (throw (ex-info "sbml.execute: reaction has no kineticLaw -- rate is undefined" {:reaction (:sbml/id r)})))))
+
+(defn run
+  "Simulate `model` from `:start` to `:stop` by `:dt` using `:method`
+  (:euler default, or :rk4). Returns {:sbml/times [t0 t1 ...]
+  :sbml/series {id -> [v0 v1 ...]}} covering every species/parameter/
+  reaction (species/parameter values are `ci`-values: amount or
+  concentration per :sbml/has-only-substance-units?; reaction values are
+  their KineticLaw rate), one row per recorded time (inclusive of both
+  endpoints). Unlike xmile.execute/run, options are passed explicitly
+  because SBML models carry no embedded sim_specs equivalent."
+  [model {:keys [start stop dt method] :or {method :euler}}]
+  (assert-executable! model)
+  (when-not (contains? #{:euler :rk4} method)
+    (throw (ex-info "sbml.execute: unsupported :method" {:method method})))
+  (let [order (assign-topo-order model)
+        n (long (m-round (/ (- stop start) dt)))
+        reaction-ids (m/reaction-ids model)
+        var-ids (into (into (m/species-ids model) (m/parameter-ids model)) reaction-ids)
+        step-fn (case method :euler euler-step :rk4 rk4-step)]
+    (loop [i 0 state (initial-state model) times [] rows []]
+      (let [t (+ start (* i dt))
+            reaction-driven (reaction-driven-species-ids model)
+            known (state->known-env model state t reaction-driven)
+            env (eval-assignment-vars model order known)
+            row (into env (for [r (m/reactions model)] [(:sbml/id r) (reaction-rate r env)]))]
+        (if (= i n)
+          {:sbml/times (conj times t)
+           :sbml/series (into {} (for [id var-ids] [id (mapv #(get % id) (conj rows row))]))}
+          (recur (inc i) (step-fn model state t dt) (conj times t) (conj rows row)))))))

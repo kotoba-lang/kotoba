@@ -150,6 +150,7 @@ The bundled standard libraries live in this repository:
 | `org.etsi.pades` | `org.etsi.pades/src` | `pades.core` (an external specification, publisher etsi.org) |
 | `org.ros.urdf` | `org.ros.urdf/src` | `articulated_scene` (an external specification, publisher ros.org) |
 | `org.materialx.core` | `org.materialx.core/src` | `kotoba.materialx`, `materialx.core` (an external specification, publisher materialx.org) |
+| `org.sbml.core` | `org.sbml.core/src` | `sbml.execute`, `sbml.mathml`, `sbml.model`, `sbml.validate` (an external specification, publisher sbml.org) |
 | `net.openid.oid4vp` | `net.openid.oid4vp/src` | `oid4vp.core` (Kotoba project library) |
 | `jp.go.jLis.jpki` | `jp.go.jLis.jpki/src` | `jpki.core` (Kotoba project library) |
 | `net.openid.oidc` | `net.openid.oidc/src` | `oidc.core` (Kotoba project library) |

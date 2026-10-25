@@ -1,0 +1,227 @@
+(ns sbml.validate
+  "Structural validation for sbml.model models, returning
+  kotoba.dsl.problem-shaped problems (:sbml/severity :error|:warn).
+
+  :error means the model is not valid SBML Level 3 Version 2 Core
+  (dangling reference, duplicate identifier in the shared SId namespace
+  sec 3.3.1, a reaction with no reactant/product, conflicting species
+  initial-value attributes, ...). :warn means the model IS valid SBML but
+  exercises a feature sbml.execute v1 does not yet simulate (AlgebraicRule,
+  Event, a dynamically-sized Compartment, a reaction identifier used as a
+  math value, or a sbml.mathml construct outside its supported subset) --
+  see README Follow-ups. A model with only :warn problems is spec-valid but
+  sbml.execute/run will throw if you actually try to run it."
+  (:require [kotoba.lang.text :as str]
+            [kotoba.dsl.problem :as problem]
+            [sbml.model :as m]
+            [sbml.mathml :as mathml]))
+
+(def domain :sbml)
+
+(defn- err [code subject msg] (problem/problem domain :error code subject msg))
+(defn- warn [code subject msg] (problem/problem domain :warn code subject msg))
+
+;; --- shared SId namespace (sec 3.3.1): duplicate-id ---
+
+(defn duplicate-id-problems
+  "Every SBase-derived identifier (except UnitDefinition ids and
+  LocalParameter ids, which sec 3.3.1 explicitly carves into separate
+  namespaces) must be unique across the whole model."
+  [model]
+  (let [buckets (concat
+                 (map (fn [c] [(:sbml/id c) :compartment]) (m/compartments model))
+                 (map (fn [s] [(:sbml/id s) :species]) (m/all-species model))
+                 (map (fn [p] [(:sbml/id p) :parameter]) (m/parameters model))
+                 (map (fn [r] [(:sbml/id r) :reaction]) (m/reactions model))
+                 (mapcat (fn [r] (map (fn [id] [id :species-reference]) (m/species-reference-ids r)))
+                         (m/reactions model)))]
+    (->> (group-by first buckets)
+         (filter (fn [[_ entries]] (> (count entries) 1)))
+         (map (fn [[id entries]]
+                (err :sbml/duplicate-id id
+                     (str "identifier " id " is used by more than one object (sec 3.3.1: SId must be"
+                          " unique across the model): " (str/join ", " (map (comp name second) entries)))))))))
+
+;; --- mandatory attributes with no spec default (sec 4.5.5/4.6.5/4.6.6/4.7.4/4.11.1/4.11.3) ---
+
+(defn mandatory-attr-problems [model]
+  (concat
+   (keep (fn [c] (when-not (contains? c :sbml/constant)
+                   (err :sbml/missing-mandatory-attr (:sbml/id c)
+                        (str "compartment " (:sbml/id c) " is missing mandatory :sbml/constant (sec 4.5.5)"))))
+         (m/compartments model))
+   (mapcat (fn [s]
+             (keep identity
+                   [(when-not (contains? s :sbml/constant)
+                      (err :sbml/missing-mandatory-attr (:sbml/id s)
+                           (str "species " (:sbml/id s) " is missing mandatory :sbml/constant (sec 4.6.6)")))
+                    (when-not (contains? s :sbml/boundary-condition?)
+                      (err :sbml/missing-mandatory-attr (:sbml/id s)
+                           (str "species " (:sbml/id s) " is missing mandatory :sbml/boundary-condition? (sec 4.6.6)")))
+                    (when-not (contains? s :sbml/has-only-substance-units?)
+                      (err :sbml/missing-mandatory-attr (:sbml/id s)
+                           (str "species " (:sbml/id s) " is missing mandatory :sbml/has-only-substance-units? (sec 4.6.5)")))]))
+           (m/all-species model))
+   (keep (fn [p] (when-not (contains? p :sbml/constant)
+                   (err :sbml/missing-mandatory-attr (:sbml/id p)
+                        (str "parameter " (:sbml/id p) " is missing mandatory :sbml/constant (sec 4.7.4)"))))
+         (m/parameters model))
+   (mapcat (fn [r]
+             (concat
+              (when-not (contains? r :sbml/reversible)
+                [(err :sbml/missing-mandatory-attr (:sbml/id r)
+                      (str "reaction " (:sbml/id r) " is missing mandatory :sbml/reversible (sec 4.11.1)"))])
+              (keep (fn [sr]
+                      (when-not (contains? sr :sbml/constant)
+                        (err :sbml/missing-mandatory-attr [(:sbml/id r) (:sbml/species sr)]
+                             (str "speciesReference for " (:sbml/species sr) " in reaction " (:sbml/id r)
+                                  " is missing mandatory :sbml/constant (sec 4.11.3)"))))
+                    (concat (m/reactants r) (m/products r)))))
+           (m/reactions model))))
+
+;; --- species (sec 4.6) ---
+
+(defn species-problems [model]
+  (mapcat
+   (fn [s]
+     (let [nm (:sbml/id s)]
+       (keep identity
+             [(when (and (contains? s :sbml/initial-amount) (contains? s :sbml/initial-concentration))
+                (err :sbml/conflicting-initial-value nm
+                     (str "species " nm " sets both :sbml/initial-amount and :sbml/initial-concentration"
+                          " (sec 4.6.4: setting both is an error)")))
+              (when-not (contains? (m/compartment-ids model) (:sbml/compartment s))
+                (err :sbml/unknown-compartment-ref nm
+                     (str "species " nm " references unknown compartment " (:sbml/compartment s))))])))
+   (m/all-species model)))
+
+;; --- reactions (sec 4.11) ---
+
+(defn reaction-structural-problems [model]
+  (let [species-ids (m/species-ids model)]
+    (mapcat
+     (fn [r]
+       (let [nm (:sbml/id r)]
+         (concat
+          (when (and (empty? (m/reactants r)) (empty? (m/products r)))
+            [(err :sbml/empty-reaction nm
+                  (str "reaction " nm " has no reactants or products (sec 4.11.1: at least one is required)"))])
+          (keep (fn [sr]
+                  (when-not (contains? species-ids (:sbml/species sr))
+                    (err :sbml/unknown-species-ref [nm (:sbml/species sr)]
+                         (str "reaction " nm " references unknown species " (:sbml/species sr)))))
+                (concat (m/reactants r) (m/products r) (m/modifiers r))))))
+     (m/reactions model))))
+
+(defn- reaction-id-warnings [model subject free]
+  (map #(warn :sbml/reaction-id-as-value [subject %]
+              (str subject " references reaction identifier " % " as a math value (sec 4.11.8)"
+                   " -- not supported by sbml.execute (v2 scope-out)"))
+       (filter (m/reaction-ids model) free)))
+
+(defn kinetic-law-problems
+  "Sec 4.11.5: KineticLaw math may only reference global model identifiers,
+  this reaction's own LocalParameters/SpeciesReference ids, and -- among
+  species -- only those declared in this SAME reaction's reactant/product/
+  modifier lists (a species from elsewhere in the model is a real SBML
+  error here, not just a style issue)."
+  [model]
+  (mapcat
+   (fn [r]
+     (let [nm (:sbml/id r)
+           kl (m/kinetic-law-of r)]
+       (cond
+         (nil? kl) []
+         (nil? (:sbml/math kl))
+         [(warn :sbml/not-yet-executable nm
+                (str "reaction " nm " has a kineticLaw with no math (sec 4.11.5 permits this,"
+                     " but the rate is then undefined) -- not simulated by sbml.execute"))]
+         :else
+         (let [math (:sbml/math kl)
+               known (into (m/known-ids model) (into (m/local-parameter-ids r) (m/species-reference-ids r)))
+               reaction-species (into (set (map :sbml/species (concat (m/reactants r) (m/products r))))
+                                      (set (map :sbml/species (m/modifiers r))))
+               free (mathml/free-vars math)
+               dangling (remove known free)
+               species-out-of-scope (filter #(and (contains? (m/species-ids model) %)
+                                                   (not (contains? reaction-species %)))
+                                             free)
+               unsupported (mathml/unsupported-forms math)]
+           (concat
+            (map #(err :sbml/dangling-ref [nm %] (str "reaction " nm "'s kineticLaw references unknown identifier " %))
+                 dangling)
+            (map #(err :sbml/species-not-in-reaction [nm %]
+                       (str "reaction " nm "'s kineticLaw references species " % " not declared in its own"
+                            " reactant/product/modifier lists (sec 4.11.5)"))
+                 species-out-of-scope)
+            (reaction-id-warnings model nm free)
+            (map #(warn :sbml/unsupported-math-construct [nm %]
+                        (str "reaction " nm "'s kineticLaw uses " % ", not implemented by sbml.mathml/eval-expr (v2 scope-out)"))
+                 unsupported))))))
+   (m/reactions model)))
+
+;; --- rules (sec 4.9) ---
+
+(defn rule-problems [model]
+  (let [assignable (into (into (m/species-ids model) (m/compartment-ids model))
+                         (into (m/parameter-ids model)
+                               (reduce into #{} (map m/species-reference-ids (m/reactions model)))))
+        rule-known (into (m/known-ids model) (reduce into #{} (map m/species-reference-ids (m/reactions model))))
+        variable-counts (frequencies (keep :sbml/variable (concat (m/assignment-rules model) (m/rate-rules model))))]
+    (mapcat
+     (fn [rule]
+       (let [variable (:sbml/variable rule)
+             subject (or variable "<algebraic>")
+             math (:sbml/math rule)
+             free (mathml/free-vars math)
+             dangling (remove rule-known free)
+             unsupported (mathml/unsupported-forms math)]
+         (concat
+          (when (and variable (not (contains? assignable variable)))
+            [(err :sbml/unknown-rule-variable variable
+                  (str "rule variable " variable " is not a known species/compartment/parameter/speciesReference"
+                       " (sec 4.9.3/4.9.4)"))])
+          (when (and variable (> (get variable-counts variable 0) 1))
+            [(err :sbml/duplicate-rule-variable variable
+                  (str "more than one AssignmentRule/RateRule targets " variable " (sec 4.9.3: illegal)"))])
+          (map #(err :sbml/dangling-ref [subject %] (str "rule for " subject " references unknown identifier " %))
+               dangling)
+          (reaction-id-warnings model subject free)
+          (map #(warn :sbml/unsupported-math-construct [subject %]
+                      (str "rule for " subject " uses " % ", not implemented by sbml.mathml/eval-expr (v2 scope-out)"))
+               unsupported))))
+     (m/rules model))))
+
+;; --- not-yet-executable (v2 scope-out) features that are nonetheless valid SBML ---
+
+(defn not-yet-executable-problems [model]
+  (concat
+   (when (seq (m/algebraic-rules model))
+     [(warn :sbml/not-yet-executable :algebraic-rules
+            "model has AlgebraicRule(s) -- full DAE solving not implemented by sbml.execute (v2)")])
+   (when (seq (m/events model))
+     [(warn :sbml/not-yet-executable :events
+            "model has Event(s) -- not simulated by sbml.execute (v2)")])
+   (let [governed (into (set (map :sbml/variable (m/assignment-rules model)))
+                        (set (map :sbml/variable (m/rate-rules model))))]
+     (keep (fn [cid]
+             (when (contains? governed cid)
+               (warn :sbml/not-yet-executable cid
+                     (str "compartment " cid " is governed by a Rule -- dynamic compartment size"
+                          " not simulated by sbml.execute (v2)"))))
+           (m/compartment-ids model)))))
+
+(defn validate
+  "All problems for `model`, most structural first."
+  [model]
+  (vec (concat (duplicate-id-problems model)
+               (mandatory-attr-problems model)
+               (species-problems model)
+               (reaction-structural-problems model)
+               (kinetic-law-problems model)
+               (rule-problems model)
+               (not-yet-executable-problems model))))
+
+(defn errors [problems] (problem/errors domain problems))
+(defn warnings [problems] (problem/warnings domain problems))
+(defn valid? [problems] (problem/valid? domain problems))
